@@ -46,6 +46,7 @@ import {
 } from '../../shared/peer-audit.js';
 import { TIMELINE_EVENT_FILE_CHANGE, type FileChangePatch } from '../../shared/file-change.js';
 import { peerAuditService } from './peer-audit-service.js';
+import type { SupervisionAuditDepth } from './supervision-broker.js';
 import { emitPeerAuditResult } from './peer-audit-result.js';
 import { isWorkingSessionState } from '../../shared/session-activity-types.js';
 import { sanitizeMcpErrorMessage } from '../../shared/mcp-error-sanitize.js';
@@ -136,6 +137,8 @@ interface ActiveTaskRunState {
   auditTargetRecoveryTimer?: NodeJS.Timeout;
   /** Safety net for a parked run whose awaited reply never arrives. */
   waitingTimeoutTimer?: NodeJS.Timeout;
+  /** How much audit this run's change is worth; scopes the delegated brief. */
+  auditDepth?: SupervisionAuditDepth;
   // When a reply-backed audit settles from the assistant-text fallback (that
   // is, before the provider emits the trailing idle for the audit turn), the
   // deferred finalization/rework prompt may already be dispatched by the time
@@ -1341,6 +1344,9 @@ class SupervisionAutomation {
     // re-arms it when the decision is still `waiting`.
     this.clearWaitingTimeout(latest);
     latest.requiresAudit = latest.freshAuditRequiredAfterRework || decision.requiresAudit !== false;
+    // A rework round re-opens the full surface: the previous verdict already
+    // said the narrow read was not enough.
+    latest.auditDepth = latest.freshAuditRequiredAfterRework ? 'standard' : decision.auditDepth ?? 'standard';
 
     switch (decision.decision) {
       case 'complete': {
@@ -1533,6 +1539,9 @@ class SupervisionAutomation {
 
     const auditTask = [
       buildQuickAgentDelegationTask('audit'),
+      ...(current.auditDepth === 'narrow'
+        ? ['Scope: this change is NARROW — small, self-contained, blast radius visible in the diff. Instruct the delegate to audit the change and what it directly touches rather than re-reviewing unrelated subsystems or running the full matrix. A proportionate check is the correct outcome, not a thin version of a full one; still require executable evidence where a relevant check exists.']
+        : []),
       'This is the configured automatic supervision audit. You—not the daemon—must prepare the audit background from your real current-session context and send it to the selected delegate with reply enabled.',
       `Automatic audit attempt ID: ${current.auditAttemptId}. Include this exact attempt ID in the delegated audit brief. The route is fixed: send exactly one reply-enabled audit request to ${targetName}. Do not choose another session or send a second audit while this attempt is pending.`,
       `When send_message is available, set reply=true and audit=${JSON.stringify({

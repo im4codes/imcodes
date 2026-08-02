@@ -63,11 +63,22 @@ export type SupervisionDecisionKind = 'complete' | 'continue' | 'waiting' | 'ask
  *    verbatim to callers that want richer metadata without another schema
  *    bump.
  */
+/**
+ * How much audit a change is worth.
+ *
+ * `requiresAudit` alone is a yes/no, so a two-line stylesheet tweak and a
+ * cross-layer state-machine change were billed the same full audit. That is the
+ * main reason supervised sessions feel audited constantly. `narrow` keeps the
+ * independent check but scopes it to the diff and its direct blast radius.
+ */
+export type SupervisionAuditDepth = 'standard' | 'narrow';
+
 export interface SupervisionDecision {
   decision: SupervisionDecisionKind;
   reason: string;
   confidence: number;
   requiresAudit?: boolean;
+  auditDepth?: SupervisionAuditDepth;
   gap?: string;
   nextAction?: string;
   extra?: Record<string, unknown>;
@@ -100,6 +111,7 @@ export interface SupervisionBrokerDeps {
 }
 
 const DECISIONS = new Set<SupervisionDecisionKind>(['complete', 'continue', 'waiting', 'ask_human']);
+const AUDIT_DEPTHS = new Set<SupervisionAuditDepth>(['standard', 'narrow']);
 const MIN_SUPERVISION_EXECUTION_BUDGET_MS = 5;
 const MAX_RECOVERABLE_PROVIDER_RETRIES = 2;
 const PROVIDER_RETRY_DELAYS_MS = [250, 750] as const;
@@ -276,6 +288,7 @@ export function parseSupervisionDecision(text: string): SupervisionDecision | nu
   if (typeof record.reason !== 'string' || !record.reason.trim()) return null;
   if (typeof record.confidence !== 'number' || !Number.isFinite(record.confidence) || record.confidence < 0 || record.confidence > 1) return null;
   if (record.requiresAudit !== undefined && typeof record.requiresAudit !== 'boolean') return null;
+  if (record.auditDepth !== undefined && !AUDIT_DEPTHS.has(record.auditDepth as SupervisionAuditDepth)) return null;
   // gap / nextAction / extra are all optional at parse time — the guardrail
   // below is where "continue without nextAction" gets downgraded to
   // ask_human. Keeping the parser permissive means a still-correct
@@ -291,6 +304,9 @@ export function parseSupervisionDecision(text: string): SupervisionDecision | nu
     reason: record.reason.trim(),
     confidence: record.confidence,
     ...(typeof record.requiresAudit === 'boolean' ? { requiresAudit: record.requiresAudit } : {}),
+    ...(AUDIT_DEPTHS.has(record.auditDepth as SupervisionAuditDepth)
+      ? { auditDepth: record.auditDepth as SupervisionAuditDepth }
+      : {}),
     ...(gap ? { gap } : {}),
     ...(nextAction ? { nextAction } : {}),
     ...(extra ? { extra } : {}),

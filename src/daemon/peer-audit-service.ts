@@ -94,6 +94,8 @@ export interface StartAutomaticPeerAuditInput {
   changePath?: string;
   changedPaths?: readonly string[];
   validations?: readonly PeerAuditValidationItem[];
+  /** Scope the audit to the diff when the change is small and self-contained. */
+  narrowScope?: boolean;
   isStillValid: () => boolean;
   onTerminal: (terminal: PeerAuditTerminalRecord) => void;
 }
@@ -516,6 +518,7 @@ export class PeerAuditService {
         changePath: input.changePath,
         changedPaths: input.changedPaths,
         validations: input.validations,
+        narrowScope: input.narrowScope,
       }),
       auditorSessionName: candidate.name,
       auditorLabel: candidate.label,
@@ -701,6 +704,7 @@ export class PeerAuditService {
       changePath?: string;
       changedPaths?: readonly string[];
       validations?: readonly PeerAuditValidationItem[];
+      narrowScope?: boolean;
     } = {},
   ): string {
     return buildPeerAuditBriefV1({
@@ -717,6 +721,7 @@ export class PeerAuditService {
       changePath: context.changePath,
       changedPaths: context.changedPaths,
       validations: context.validations,
+      ...(context.narrowScope ? { narrowScope: true } : {}),
       supervisorRationale: baseline.supervisorRationale,
       ...(this.#lastReworkFindings.get(record.name)
         ? { priorReworkFindings: this.#lastReworkFindings.get(record.name) }

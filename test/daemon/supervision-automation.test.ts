@@ -2633,4 +2633,84 @@ describe('SupervisionAutomation', () => {
       vi.useRealTimers();
     }
   });
+  it('scopes the delegated audit when the broker calls the change narrow', async () => {
+    // requiresAudit is a yes/no, so a two-line stylesheet tweak was billed the
+    // same full audit as a cross-layer state-machine change. That is the main
+    // reason supervised sessions feel audited constantly.
+    const snapshot = await seedSession('supervised_audit');
+    supervisionAutomation.cancelSession('deck_supervision_brain');
+    mockSupervisionDecide.mockResolvedValueOnce({
+      decision: 'complete',
+      reason: 'presentational tweak only',
+      confidence: 0.95,
+      requiresAudit: true,
+      auditDepth: 'narrow',
+    });
+
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-narrow', 'tweak the spacing', snapshot);
+    beginRun('cmd-narrow', 'tweak the spacing');
+    completeTurn('Adjusted one CSS rule.');
+
+    await vi.waitFor(() => {
+      expect(mockTransportRuntime.send).toHaveBeenCalled();
+    }, { timeout: 4_000 });
+    const auditPrompt = String(mockTransportRuntime.send.mock.calls.at(-1)?.[0]);
+    expect(auditPrompt).toContain('this change is NARROW');
+    // Proportionate, not lax: evidence is still required.
+    expect(auditPrompt).toContain('executable evidence');
+  });
+
+  it('does not scope the audit for a standard change', async () => {
+    const snapshot = await seedSession('supervised_audit');
+    supervisionAutomation.cancelSession('deck_supervision_brain');
+    mockSupervisionDecide.mockResolvedValueOnce({
+      decision: 'complete',
+      reason: 'cross-layer state machine change',
+      confidence: 0.95,
+      requiresAudit: true,
+      auditDepth: 'standard',
+    });
+
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-standard', 'rework the queue', snapshot);
+    beginRun('cmd-standard', 'rework the queue');
+    completeTurn('Reworked the transport queue.');
+
+    await vi.waitFor(() => {
+      expect(mockTransportRuntime.send).toHaveBeenCalled();
+    }, { timeout: 4_000 });
+    expect(String(mockTransportRuntime.send.mock.calls.at(-1)?.[0])).not.toContain('this change is NARROW');
+  });
+  it('re-opens the full surface after a REWORK even if the broker still says narrow', async () => {
+    // The previous verdict already said a narrow read was not enough; letting
+    // the re-audit stay narrow would re-run the same insufficient check.
+    const snapshot = await seedSession('supervised_audit');
+    supervisionAutomation.cancelSession('deck_supervision_brain');
+    mockSupervisionDecide.mockResolvedValue({
+      decision: 'complete',
+      reason: 'small change',
+      confidence: 0.95,
+      requiresAudit: true,
+      auditDepth: 'narrow',
+    });
+
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-narrow-rework', 'tweak it', snapshot);
+    beginRun('cmd-narrow-rework', 'tweak it');
+    completeTurn('Adjusted one rule.');
+    await waitForRunPhase('auditing');
+
+    completeDelegatedAudit('REWORK', 'Blocking: the tweak breaks an adjacent case.');
+    await waitForRunPhase('execution');
+
+    mockTransportRuntime.send.mockClear();
+    completeTurn('Fixed the adjacent case.');
+    await vi.waitFor(() => {
+      expect(mockTransportRuntime.send).toHaveBeenCalled();
+    }, { timeout: 4_000 });
+
+    // Broker still says narrow, but the rework must force the full surface.
+    expect(String(mockTransportRuntime.send.mock.calls.at(-1)?.[0])).not.toContain('this change is NARROW');
+  });
 });
