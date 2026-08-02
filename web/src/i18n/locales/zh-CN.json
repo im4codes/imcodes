@@ -783,7 +783,8 @@
       "body": "SDK 会话支持实时流式输出，比 CLI/tmux 会话更稳定。",
       "warn_title": "CLI（进程）模式：维护已降级。",
       "warn_body": "该后端已降为低优先级，修复与更新会减少。建议在上方改用 SDK 选项，获得实时流式输出与更稳定的体验。"
-    }
+    },
+    "history_step_empty_hint": "本设备尚未缓存这个会话，所以只能等拉取完成后才有内容可显示。"
   },
   "server": {
     "upgrade_daemon": "↑ 升级 Daemon",
@@ -1564,7 +1565,12 @@
     "uploading": "上传中...",
     "upload_failed": "上传失败",
     "direct_required_large": "此文件需要直连；服务器中转回退最大为 {{max}}MB",
-    "transport": { "connecting": "P2P 连接中", "direct": "P2P 直连上传中", "falling_back": "正在切换中转", "relay": "中转上传中" },
+    "transport": {
+      "connecting": "P2P 连接中",
+      "direct": "P2P 直连上传中",
+      "falling_back": "正在切换中转",
+      "relay": "中转上传中"
+    },
     "progress_aria": "{{name}}：{{transport}}，进度 {{progress}}%",
     "insufficient_capacity": "服务器磁盘空间不足",
     "file_too_large": "文件过大（最大 {{max}}MB）",

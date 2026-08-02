@@ -783,7 +783,8 @@
       "body": "SDK 세션은 출력을 실시간으로 스트리밍하며 CLI/tmux 세션보다 안정적입니다.",
       "warn_title": "CLI(프로세스) 모드: 유지 관리 축소.",
       "warn_body": "이 백엔드는 이제 우선순위가 낮아 수정과 업데이트가 줄어듭니다. 실시간 스트리밍과 더 나은 안정성을 위해 위에서 SDK 옵션을 선택하세요."
-    }
+    },
+    "history_step_empty_hint": "이 기기에는 아직 이 대화의 사본이 없어, 가져오기가 끝나야 표시할 수 있습니다."
   },
   "server": {
     "upgrade_daemon": "↑ Daemon 업그레이드",
@@ -1563,7 +1564,12 @@
     "uploading": "업로드 중...",
     "upload_failed": "업로드 실패",
     "direct_required_large": "이 파일은 직접 연결이 필요합니다. 서버 릴레이는 최대 {{max}}MB입니다",
-    "transport": { "connecting": "P2P 연결 중", "direct": "P2P 직접 업로드 중", "falling_back": "릴레이로 전환 중", "relay": "릴레이 업로드 중" },
+    "transport": {
+      "connecting": "P2P 연결 중",
+      "direct": "P2P 직접 업로드 중",
+      "falling_back": "릴레이로 전환 중",
+      "relay": "릴레이 업로드 중"
+    },
     "progress_aria": "{{name}}: {{transport}}, 진행률 {{progress}}%",
     "insufficient_capacity": "서버의 디스크 공간이 부족합니다",
     "file_too_large": "파일이 너무 큽니다 (최대 {{max}}MB)",

@@ -783,7 +783,8 @@
       "body": "SDK セッションは出力をリアルタイムでストリーミングし、CLI/tmux セッションより安定しています。",
       "warn_title": "CLI（プロセス）モード：メンテナンス縮小。",
       "warn_body": "このバックエンドは優先度が下がり、修正や更新が少なくなります。リアルタイムのストリーミングと安定性のため、上の SDK オプションを選んでください。"
-    }
+    },
+    "history_step_empty_hint": "この端末にはこの会話のコピーがまだ保存されていないため、取得が完了するまで表示できません。"
   },
   "server": {
     "upgrade_daemon": "↑ Daemonをアップグレード",
@@ -1563,7 +1564,12 @@
     "uploading": "アップロード中...",
     "upload_failed": "アップロード失敗",
     "direct_required_large": "このファイルには直接接続が必要です。サーバー中継は最大 {{max}}MB です",
-    "transport": { "connecting": "P2P 接続中", "direct": "P2P 直接アップロード中", "falling_back": "中継へ切替中", "relay": "中継アップロード中" },
+    "transport": {
+      "connecting": "P2P 接続中",
+      "direct": "P2P 直接アップロード中",
+      "falling_back": "中継へ切替中",
+      "relay": "中継アップロード中"
+    },
     "progress_aria": "{{name}}：{{transport}}、進捗 {{progress}}%",
     "insufficient_capacity": "サーバーのディスク容量が不足しています",
     "file_too_large": "ファイルが大きすぎます（最大 {{max}}MB）",

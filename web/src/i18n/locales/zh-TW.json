@@ -783,7 +783,8 @@
       "body": "SDK 工作階段支援即時串流輸出，比 CLI/tmux 工作階段更穩定。",
       "warn_title": "CLI（行程）模式：維護已降級。",
       "warn_body": "此後端已降為低優先級，修復與更新會減少。建議在上方改用 SDK 選項，獲得即時串流輸出與更穩定的體驗。"
-    }
+    },
+    "history_step_empty_hint": "本裝置尚未快取這個工作階段，因此必須等擷取完成才有內容可顯示。"
   },
   "server": {
     "upgrade_daemon": "↑ 升級 Daemon",
@@ -1564,7 +1565,12 @@
     "uploading": "上傳中...",
     "upload_failed": "上傳失敗",
     "direct_required_large": "此檔案需要直連；伺服器中轉回退上限為 {{max}}MB",
-    "transport": { "connecting": "P2P 連線中", "direct": "P2P 直連上傳中", "falling_back": "正在切換中轉", "relay": "中轉上傳中" },
+    "transport": {
+      "connecting": "P2P 連線中",
+      "direct": "P2P 直連上傳中",
+      "falling_back": "正在切換中轉",
+      "relay": "中轉上傳中"
+    },
     "progress_aria": "{{name}}：{{transport}}，進度 {{progress}}%",
     "insufficient_capacity": "伺服器磁碟空間不足",
     "file_too_large": "檔案過大（最大 {{max}}MB）",

@@ -1150,7 +1150,13 @@ export interface UseTimelineOptions {
 }
 
 export type TimelineHistoryPhase = 'idle' | 'bootstrap' | 'refresh' | 'older';
-export type TimelineHistoryStepState = 'pending' | 'running' | 'done' | 'skipped';
+/**
+ * `empty` is distinct from `done`: the local-cache step finishing tells you
+ * nothing about whether it produced anything. Reporting a bare "done" for a
+ * cold device rendered a ✓ next to a blank chat, which reads as "your history
+ * is cached but we refuse to show it" instead of "this device has no copy yet".
+ */
+export type TimelineHistoryStepState = 'pending' | 'running' | 'done' | 'empty' | 'skipped';
 export type TimelineHistoryStepKey = 'cache' | 'textTail' | 'daemon' | 'http' | 'older';
 export type TimelineHistoryResponseState = 'ok' | 'empty' | 'partial' | 'deferred' | 'canceled' | 'error' | 'detail';
 
@@ -1170,6 +1176,15 @@ export interface TimelineHistoryResponseNotice {
 export interface TimelineHistoryStatus {
   phase: TimelineHistoryPhase;
   steps: Record<TimelineHistoryStepKey, TimelineHistoryStepState>;
+  /**
+   * How many events each step actually produced.
+   *
+   * A bare ✓ only says the step ran. When the local cache reports success next
+   * to an empty chat, the count is the difference between "there is nothing
+   * stored on this device" and "something is stored but is not reaching the
+   * view" — which is otherwise indistinguishable from the UI.
+   */
+  counts: Partial<Record<TimelineHistoryStepKey, number>>;
   response: TimelineHistoryResponseNotice | null;
 }
 
@@ -1183,6 +1198,7 @@ export function createIdleHistoryStatus(): TimelineHistoryStatus {
       http: 'skipped',
       older: 'skipped',
     },
+    counts: {},
     response: null,
   };
 }
@@ -1202,6 +1218,7 @@ function createBootstrapHistoryStatus(opts: {
       http: opts.canHttp ? 'pending' : 'skipped',
       older: 'skipped',
     },
+      counts: {},
     response: null,
   };
 }
@@ -1572,6 +1589,7 @@ export function useTimeline(
     step: TimelineHistoryStepKey,
     state: TimelineHistoryStepState,
     phase?: Exclude<TimelineHistoryPhase, 'idle'>,
+    count?: number,
   ) => {
     setHistoryStatus((prev) => ({
       ...prev,
@@ -1580,6 +1598,7 @@ export function useTimeline(
         ...prev.steps,
         [step]: state,
       },
+      counts: count === undefined ? prev.counts : { ...prev.counts, [step]: count },
     }));
   }, []);
 
@@ -1773,7 +1792,7 @@ export function useTimeline(
     // 1. Module-level memory cache — instant restore (e.g. window reopen)
     const memCached = getCachedEvents(cacheKey!);
     if (memCached && memCached.length > 0) {
-      updateHistoryStep('cache', 'done', 'bootstrap');
+      updateHistoryStep('cache', 'done', 'bootstrap', memCached.length);
       setEvents(memCached);
       setLoading(false);
       requestDaemonHistory(false, MAX_MEMORY_EVENTS, memCached);
@@ -1804,7 +1823,7 @@ export function useTimeline(
     // hook's first-paint seed; the global cache is written by IDB/daemon/HTTP.
     const localSnapshot = loadPersistedTimelineSnapshotWithFallback(cacheKey!, rawSessionIdForFallback);
     if (localSnapshot.length > 0) {
-      updateHistoryStep('cache', 'done', 'bootstrap');
+      updateHistoryStep('cache', 'done', 'bootstrap', localSnapshot.length);
       setEvents((prev) => (prev === localSnapshot ? prev : localSnapshot));
       setLoading(false);
       requestDaemonHistory(false, MAX_MEMORY_EVENTS, localSnapshot);
@@ -1900,7 +1919,15 @@ export function useTimeline(
         epochRef.current = 0;
         seqRef.current = 0;
       }
-      updateHistoryStep('cache', 'done', 'bootstrap');
+      // Only claim a local restore when something was actually restored — the
+      // seed paths above may already have painted, in which case `events` is
+      // non-empty and this genuinely was a hit.
+      updateHistoryStep(
+        'cache',
+        stored.length > 0 || eventsRef.current.length > 0 ? 'done' : 'empty',
+        'bootstrap',
+        stored.length,
+      );
       if (stored.length > 0) {
         const existing = getSharedTimelineBase(cacheKey!, eventsRef.current, MAX_MEMORY_EVENTS);
         const restored = mergeTimelineEvents(existing, stored, retainedTimelineMergeLimit(existing));
@@ -2586,6 +2613,7 @@ export function useTimeline(
         http: 'skipped',
         older: 'running',
       },
+        counts: {},
       response: null,
     });
     setLoadingOlder(true);
@@ -3678,6 +3706,7 @@ export function useTimeline(
               http: serverId ? 'pending' : 'skipped',
               older: 'skipped',
             },
+              counts: {},
             response: null,
           });
           setRefreshing(true);
@@ -3740,6 +3769,7 @@ export function useTimeline(
               http: 'skipped',
               older: 'skipped',
             },
+              counts: {},
             response: null,
           });
           const current = eventsRef.current;

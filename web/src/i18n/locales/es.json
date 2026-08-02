@@ -783,7 +783,8 @@
       "body": "Las sesiones SDK transmiten la salida en tiempo real y son más estables que las sesiones CLI/tmux.",
       "warn_title": "Modo CLI (proceso): mantenimiento reducido.",
       "warn_body": "Este backend ahora tiene menor prioridad y recibe menos correcciones y actualizaciones. Elige una opción SDK arriba para streaming en tiempo real y mayor estabilidad."
-    }
+    },
+    "history_step_empty_hint": "Este dispositivo aún no tiene una copia de esta conversación, así que hay que descargarla antes de poder mostrar algo."
   },
   "server": {
     "upgrade_daemon": "↑ Actualizar Daemon",
@@ -1564,7 +1565,12 @@
     "uploading": "Subiendo...",
     "upload_failed": "Error al subir",
     "direct_required_large": "Este archivo requiere conexión directa; el relevo del servidor está limitado a {{max}}MB",
-    "transport": { "connecting": "Conectando P2P", "direct": "Subida directa P2P", "falling_back": "Cambiando a relevo", "relay": "Subida por relevo" },
+    "transport": {
+      "connecting": "Conectando P2P",
+      "direct": "Subida directa P2P",
+      "falling_back": "Cambiando a relevo",
+      "relay": "Subida por relevo"
+    },
     "progress_aria": "{{name}}: {{transport}}, {{progress}}% completado",
     "insufficient_capacity": "Espacio en disco insuficiente en el servidor",
     "file_too_large": "Archivo demasiado grande (máx. {{max}}MB)",

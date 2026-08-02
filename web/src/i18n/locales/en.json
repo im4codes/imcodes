@@ -783,7 +783,8 @@
       "body": "SDK sessions stream output in real time and are more stable than CLI/tmux sessions.",
       "warn_title": "CLI (process) mode: reduced maintenance.",
       "warn_body": "This backend is now lower priority and gets fewer fixes and updates. Pick an SDK option above for real-time streaming and better stability."
-    }
+    },
+    "history_step_empty_hint": "No copy of this conversation is stored on this device yet, so it has to be fetched before anything can be shown."
   },
   "server": {
     "upgrade_daemon": "↑ Upgrade Daemon",
@@ -1564,7 +1565,12 @@
     "uploading": "Uploading...",
     "upload_failed": "Upload failed",
     "direct_required_large": "This file requires a direct connection; relay fallback is limited to {{max}}MB",
-    "transport": { "connecting": "Connecting P2P", "direct": "P2P direct upload", "falling_back": "Switching to relay", "relay": "Relay upload" },
+    "transport": {
+      "connecting": "Connecting P2P",
+      "direct": "P2P direct upload",
+      "falling_back": "Switching to relay",
+      "relay": "Relay upload"
+    },
     "progress_aria": "{{name}}: {{transport}}, {{progress}}% complete",
     "insufficient_capacity": "Insufficient disk space on the server",
     "file_too_large": "File too large (max {{max}}MB)",

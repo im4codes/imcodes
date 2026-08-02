@@ -2974,4 +2974,69 @@ describe('useTimeline global cache bounds', () => {
     expect(sendTimelineHistoryRequest).toHaveBeenCalledTimes(1);
     expect(sendTimelineHistoryRequest).toHaveBeenCalledWith(sessionName, 300, 4999);
   });
+  it('reports the cache step as empty, not done, when this device has no copy', async () => {
+    // A bare "done" rendered a ✓ next to a blank chat, which reads as "your
+    // history is cached but we refuse to show it" rather than "this device has
+    // no copy yet". `empty` is terminal but distinguishable.
+    const sessionName = `deck_cold_${Date.now()}`;
+    const serverId = `srv-cold-${Date.now()}`;
+
+    vi.spyOn(TimelineDB.prototype, 'open').mockResolvedValue();
+    vi.spyOn(TimelineDB.prototype, 'getLastSeqAndEpoch').mockResolvedValue(null);
+    vi.spyOn(TimelineDB.prototype, 'getRecentEvents').mockResolvedValue([]);
+
+    let seenCacheStep: string | undefined;
+    let seenCount = -1;
+    let seenCacheCount: number | undefined;
+    function Probe() {
+      const { historyStatus, events } = useTimeline(sessionName, null, serverId);
+      seenCacheStep = historyStatus?.steps.cache;
+      seenCount = events.length;
+      seenCacheCount = historyStatus?.counts.cache;
+      return h('div', { 'data-testid': 'probe-cold' }, String(historyStatus?.steps.cache ?? ''));
+    }
+    render(h(Probe));
+
+    await waitFor(() => {
+      expect(screen.getByTestId('probe-cold').textContent).toBe('empty');
+    });
+    // Nothing was restored, which is exactly why it must not claim success.
+    expect(seenCount).toBe(0);
+    expect(seenCacheStep).not.toBe('done');
+    // The count is what makes "nothing stored" distinguishable from "stored but
+    // not shown" without attaching a debugger.
+    expect(seenCacheCount).toBe(0);
+  });
+
+  it('reports how many events the local read actually produced', async () => {
+    const sessionName = `deck_counted_${Date.now()}`;
+    const serverId = `srv-counted-${Date.now()}`;
+    const stored: TimelineEvent[] = [1, 2, 3].map((n) => ({
+      eventId: `${sessionName}-${n}`,
+      sessionId: `${serverId}:${sessionName}`,
+      ts: n, epoch: 1, seq: n,
+      source: 'daemon', confidence: 'high',
+      type: 'assistant.text',
+      payload: { text: `local ${n}` },
+    }));
+
+    vi.spyOn(TimelineDB.prototype, 'open').mockResolvedValue();
+    vi.spyOn(TimelineDB.prototype, 'getLastSeqAndEpoch').mockResolvedValue({ seq: 3, epoch: 1 });
+    vi.spyOn(TimelineDB.prototype, 'getRecentEvents').mockImplementation(async (key: string) => (
+      key === `${serverId}:${sessionName}` ? stored : []
+    ));
+
+    let cacheCount: number | undefined;
+    function Probe() {
+      const { historyStatus } = useTimeline(sessionName, null, serverId);
+      cacheCount = historyStatus?.counts.cache;
+      return h('div', { 'data-testid': 'probe-count' }, String(historyStatus?.counts.cache ?? ''));
+    }
+    render(h(Probe));
+
+    await waitFor(() => {
+      expect(screen.getByTestId('probe-count').textContent).toBe('3');
+    });
+    expect(cacheCount).toBe(3);
+  });
 });

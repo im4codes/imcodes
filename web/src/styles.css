@@ -3691,6 +3691,10 @@ html.native-ios-mac .chat-dl-btn {
 .chat-history-overlay-steps { display: flex; align-items: center; gap: 6px; min-width: 0; overflow: hidden; }
 .chat-history-step { display: inline-flex; align-items: center; gap: 3px; min-width: 0; font-size: 10px; line-height: 1.2; color: #64748b; white-space: nowrap; }
 .chat-history-step-icon { display: inline-block; width: 10px; text-align: center; color: inherit; opacity: 0.9; }
+/* How many events the step actually produced — a ✓ alone cannot distinguish
+   "nothing is stored locally" from "stored but not reaching the view". */
+.chat-history-step-count { margin-left: 1px; font-variant-numeric: tabular-nums; color: #7dd3fc; opacity: 0.95; }
+.chat-history-step.empty .chat-history-step-count { color: #f59e0b; }
 .chat-history-step.running { color: #60a5fa; }
 .chat-history-step.pending { color: #94a3b8; }
 .chat-history-step.done { color: #34d399; }

@@ -2660,7 +2660,10 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
     if (!historyStatus || historyStatus.phase === 'idle') return [];
     const order: TimelineHistoryStepKey[] = ['cache', 'textTail', 'daemon', 'http', 'older'];
     return order
-      .map((key) => ({ key, state: historyStatus.steps[key] }))
+      // `counts` is optional on the wire: a status built by an older caller (or
+      // restored from a previous shape) has no such field, and indexing it
+      // unguarded crashes the whole chat view rather than losing one number.
+      .map((key) => ({ key, state: historyStatus.steps[key], count: historyStatus.counts?.[key] }))
       .filter((step) => step.state !== 'skipped')
       .map((step) => ({
         ...step,
@@ -2675,6 +2678,7 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
                 : t('session.history_step_older'),
       }));
   }, [historyStatus, t]);
+  // `empty` is terminal like `done` — a cold local cache is not still working.
   const showHistoryProgress = !preview && historySteps.some((step) => step.state === 'pending' || step.state === 'running');
   const showRefreshOverlay = !preview && (showHistoryProgress || refreshing);
   return (
@@ -2768,11 +2772,18 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
                 <span class="chat-history-overlay-label">{t('session.history_loading_label')}</span>
                 <span class="chat-history-overlay-steps">
                   {historySteps.map((step) => (
-                    <span key={step.key} class={`chat-history-step ${step.state}`}>
+                    <span
+                      key={step.key}
+                      class={`chat-history-step ${step.state}`}
+                      title={step.state === 'empty' ? t('session.history_step_empty_hint') : undefined}
+                    >
                       <span class="chat-history-step-icon" aria-hidden="true">
-                        {step.state === 'done' ? '✓' : step.state === 'running' ? '…' : '○'}
+                        {step.state === 'done' ? '✓' : step.state === 'empty' ? '∅' : step.state === 'running' ? '…' : '○'}
                       </span>
                       {step.label}
+                      {step.count !== undefined && (
+                        <span class="chat-history-step-count">{step.count}</span>
+                      )}
                     </span>
                   ))}
                 </span>
