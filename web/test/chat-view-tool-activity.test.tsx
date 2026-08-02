@@ -318,4 +318,95 @@ describe('ChatView compact tool activity', () => {
     expect(input).toContain('set -e');
     expect(input).not.toContain('npm test');
   });
+  it('pairs concurrent tools by correlation id, not by adjacency', async () => {
+    // Real interleaving is callA, callB, resultA, resultB. The adjacency scan
+    // stopped at the next call, so A never merged (counted "running" forever,
+    // holding the 1s ticker) and B was merged with A's result — wrong args,
+    // wrong duration, wrong finish time.
+    const callA = makeEvent('a-call', 'tool.call', {
+      tool: 'Bash', toolCallId: 'call-a', input: { command: 'slow-a' },
+    }, 1);
+    const callB = makeEvent('b-call', 'tool.call', {
+      tool: 'Grep', toolCallId: 'call-b', input: { pattern: 'fast-b' },
+    }, 2);
+    const resultA = makeEvent('a-result', 'tool.result', {
+      toolCallId: 'call-a', output: 'A done',
+    }, 3);
+    const resultB = makeEvent('b-result', 'tool.result', {
+      toolCallId: 'call-b', output: 'B done',
+    }, 4);
+
+    const { container } = render(
+      <ChatView events={[callA, callB, resultA, resultB]} loading={false} />,
+    );
+
+    // Both tools finished: nothing may be left counted as running.
+    expect(container.querySelector('.chat-tool-activity-stat.is-running')).toBeNull();
+    expect(container.querySelector('.chat-tool-activity-stat.is-complete')?.textContent).toBe('✓2');
+
+    // The newest tool is B, and it must show B's own arguments.
+    const label = container.querySelector('.chat-tool-activity-last')?.textContent ?? '';
+    expect(label).toContain('Grep');
+    expect(label).toContain('fast-b');
+    expect(label).not.toContain('slow-a');
+  });
+
+  it('still pairs by adjacency when no correlation id is present', async () => {
+    // Older events and providers that omit the id must keep the previous
+    // behaviour rather than silently stop merging.
+    const call = makeEvent('legacy-call', 'tool.call', { tool: 'Bash', input: { command: 'ls' } }, 1);
+    const result = makeEvent('legacy-result', 'tool.result', { output: 'ok' }, 2);
+
+    const { container } = render(<ChatView events={[call, result]} loading={false} />);
+
+    expect(container.querySelector('.chat-tool-activity-stat.is-running')).toBeNull();
+    expect(container.querySelector('.chat-tool-activity-stat.is-complete')?.textContent).toBe('✓1');
+  });
+  it('separates a call and result more than ten events apart, given ids', async () => {
+    // The old scan gave up after ten events. With a correlation id that window
+    // is meaningless — a slow tool's result legitimately lands much later.
+    const call = makeEvent('far-call', 'tool.call', {
+      tool: 'Bash', toolCallId: 'call-far', input: { command: 'slow' },
+    }, 1);
+    const filler = Array.from({ length: 14 }, (_, n) => makeEvent(
+      `filler-${n}`, 'assistant.text', { text: `chatter ${n}` }, n + 2,
+    ));
+    const result = makeEvent('far-result', 'tool.result', {
+      toolCallId: 'call-far', output: 'finally',
+    }, 20);
+
+    const { container } = render(<ChatView events={[call, ...filler, result]} loading={false} />);
+
+    expect(container.querySelector('.chat-tool-activity-stat.is-running')).toBeNull();
+  });
+
+  it('does not let two calls consume the same result when an id repeats', async () => {
+    // A reused id must not merge twice; the second call stays unmerged rather
+    // than stealing the first call's result.
+    const callA = makeEvent('dup-a', 'tool.call', { tool: 'Bash', toolCallId: 'dup', input: { command: 'a' } }, 1);
+    const callB = makeEvent('dup-b', 'tool.call', { tool: 'Bash', toolCallId: 'dup', input: { command: 'b' } }, 2);
+    const only = makeEvent('dup-r', 'tool.result', { toolCallId: 'dup', output: 'one' }, 3);
+
+    const { container } = render(<ChatView events={[callA, callB, only]} loading={false} />);
+
+    // Exactly one completed, exactly one still running — never two completions
+    // from a single result.
+    expect(container.querySelector('.chat-tool-activity-stat.is-complete')?.textContent).toBe('✓1');
+    expect(container.querySelector('.chat-tool-activity-stat.is-running')?.textContent).toBe('●1');
+  });
+
+  it('still mispairs nothing when NO ids are present and tools run in parallel', async () => {
+    // The fallback is adjacency, which cannot pair callA/resultA across callB.
+    // Locking current behaviour so the producers that now emit ids are the fix,
+    // not a silent change here.
+    const callA = makeEvent('nid-a', 'tool.call', { tool: 'Bash', input: { command: 'a' } }, 1);
+    const callB = makeEvent('nid-b', 'tool.call', { tool: 'Grep', input: { pattern: 'b' } }, 2);
+    const resultA = makeEvent('nid-ra', 'tool.result', { output: 'A' }, 3);
+    const resultB = makeEvent('nid-rb', 'tool.result', { output: 'B' }, 4);
+
+    const { container } = render(<ChatView events={[callA, callB, resultA, resultB]} loading={false} />);
+
+    // Documents the known limit of the id-less path: one call cannot pair.
+    expect(container.querySelector('.chat-tool-activity-stat.is-running')?.textContent).toBe('●1');
+  });
 });

@@ -740,6 +740,22 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
     lastByEventId.set(visible[i].eventId, i);
   }
 
+  // toolCallId -> result indices, in order. Built once over the WHOLE list:
+  // a correlation id makes the ten-event adjacency window meaningless, and a
+  // result can legitimately arrive far later than its call. Each index is
+  // handed out at most once, so a reused/duplicate id cannot let two calls
+  // consume the same result.
+  const resultsByToolCallId = new Map<string, number[]>();
+  for (let i = 0; i < visible.length; i++) {
+    const candidate = visible[i];
+    if (candidate.type !== 'tool.result') continue;
+    const id = typeof candidate.payload.toolCallId === 'string' ? candidate.payload.toolCallId : '';
+    if (!id) continue;
+    const bucket = resultsByToolCallId.get(id);
+    if (bucket) bucket.push(i);
+    else resultsByToolCallId.set(id, [i]);
+  }
+
   for (let i = 0; i < visible.length; i++) {
     const ev = visible[i];
 
@@ -754,9 +770,33 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
     // command.ack etc. can land between them during a long-running tool.
     if (ev.type === 'tool.call') {
       let resultIdx = -1;
-      for (let j = i + 1; j <= Math.min(i + 10, visible.length - 1); j++) {
-        if (visible[j].type === 'tool.result') { resultIdx = j; break; }
-        if (visible[j].type === 'tool.call') break; // another call started, stop
+      const callId = typeof ev.payload.toolCallId === 'string' ? ev.payload.toolCallId : '';
+      // Prefer the correlation id. Concurrent tools interleave as
+      // callA, callB, resultA, resultB — the adjacency scan below stops at the
+      // next call, so A never merged and B took A's result, giving the wrong
+      // arguments, the wrong duration, and a call stuck "running" forever.
+      if (callId) {
+        const bucket = resultsByToolCallId.get(callId);
+        while (bucket && bucket.length > 0) {
+          const next = bucket.shift()!;
+          // Only results AFTER this call. Anything an earlier adjacency merge
+          // consumed necessarily sits before it, so this also covers the
+          // double-consume case without a separate `consumedIds` check —
+          // verified by mutation: adding one changed no test.
+          if (next <= i) continue;
+          // Skip indices dropped by the streaming-delta dedup above.
+          if (lastByEventId.get(visible[next].eventId) !== next) continue;
+          resultIdx = next;
+          break;
+        }
+      }
+      // No id on either side (older events, providers that omit it): keep the
+      // original adjacency heuristic exactly as it was.
+      if (resultIdx === -1 && !callId) {
+        for (let j = i + 1; j <= Math.min(i + 10, visible.length - 1); j++) {
+          if (visible[j].type === 'tool.result') { resultIdx = j; break; }
+          if (visible[j].type === 'tool.call') break; // another call started, stop
+        }
       }
       if (resultIdx !== -1) {
         const next = visible[resultIdx];

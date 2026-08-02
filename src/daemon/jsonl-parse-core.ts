@@ -279,6 +279,10 @@ function emitClaudeToolCallBlock(
   const summaryInput = extractToolInput(block.name, input);
   pushEmit(out, sessionName, 'tool.call', {
     tool: block.name,
+    // Correlation id for call/result pairing. The id was already known here
+    // (it builds the eventId) but stayed off the payload, so the web view had
+    // to guess by adjacency — which mispairs concurrent tools.
+    ...(toolUseId ? { toolCallId: toolUseId } : {}),
     ...(summaryInput ? { input: summaryInput } : (input ? { input } : {})),
   }, {
     source: 'daemon',
@@ -326,6 +330,7 @@ function emitClaudeToolResultBlock(
 
   if (normalized && pending) {
     pushEmit(out, sessionName, 'tool.result', {
+      toolCallId: pending.id,
       ...(block.is_error ? { error: String(block.content ?? 'error') } : {}),
       ...(toolUseResult?.content ? { output: toolUseResult.content } : {}),
     }, {
@@ -342,6 +347,7 @@ function emitClaudeToolResultBlock(
   const error = block.is_error ? String(block.content ?? 'error') : undefined;
   const output = !error ? extractToolResultOutput(block) : undefined;
   pushEmit(out, sessionName, 'tool.result', {
+    ...(toolUseId ? { toolCallId: toolUseId } : {}),
     ...(error ? { error } : {}),
     ...(output ? { output } : {}),
   }, {

@@ -1420,6 +1420,9 @@ async function drainTransportResendQueueIntoRuntime(
               pendingMessageVersion: observeTransportQueueRevision(sessionName, runtime.pendingVersion),
               ...(attachments.length > 0 ? { attachments } : {}),
               ...(entry.sharedActor ? { sharedActor: entry.sharedActor } : {}),
+              // Resend delivers the expanded copy to the provider, so this
+              // user.message is the only place the anchor can land.
+              ...(entry.aliasAudit ? { aliasAudit: entry.aliasAudit } : {}),
             },
             { source: 'daemon', confidence: 'high', eventId: `transport-user:${clientMessageId}` },
           );

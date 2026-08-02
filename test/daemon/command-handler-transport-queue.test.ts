@@ -3061,6 +3061,82 @@ describe('handleWebCommand transport queue behavior', () => {
     );
   });
 
+  it('carries the alias audit anchor into the offline resend queue', async () => {
+    // The offline branch enqueued the expanded providerText (the SECRET) but no
+    // anchor, so on reconnect the provider received the alias value while the
+    // timeline recorded nothing about what had been delivered.
+    const { clearAllResend, getResendEntries } = await import('../../src/daemon/transport-resend-queue.js');
+    clearAllResend();
+
+    getSessionMock.mockReturnValue({
+      name: 'deck_transport_brain',
+      projectName: 'transport',
+      role: 'brain',
+      agentType: 'claude-code-sdk',
+      runtimeType: 'transport',
+      providerId: 'claude-code-sdk',
+      state: 'idle',
+    });
+    getTransportRuntimeMock.mockReturnValue(undefined);
+
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_transport_brain',
+      text: 'offline ;;(host)',
+      commandId: 'cmd-offline-alias',
+      resolvedAliases: { host: 'prod.example.com' },
+      resolvedAliasNotes: { host: 'read replica only' },
+    }, serverLink as any);
+    await flushAsync();
+
+    const entry = getResendEntries('deck_transport_brain')
+      .find((e) => e.commandId === 'cmd-offline-alias');
+    expect(entry).toBeDefined();
+    // The expanded copy rides for delivery …
+    expect(entry?.providerText).toContain('prod.example.com');
+    // … and so does the anchor that makes that delivery auditable.
+    expect(entry?.aliasAudit?.names).toEqual(['host']);
+    expect(entry?.aliasAudit?.resolvedHash).toMatch(/^[0-9a-f]{64}$/);
+    // Anchor stays plaintext-free.
+    expect(JSON.stringify(entry?.aliasAudit)).not.toContain('prod.example.com');
+    expect(JSON.stringify(entry?.aliasAudit)).not.toContain('read replica only');
+  });
+
+  it('carries the anchor on the missing-providerSessionId branch too', async () => {
+    // The no-runtime branch had a test; this one did not, so deleting its
+    // anchor wiring would not have gone red.
+    const { clearAllResend, getResendEntries } = await import('../../src/daemon/transport-resend-queue.js');
+    clearAllResend();
+
+    getSessionMock.mockReturnValue({
+      name: 'deck_transport_brain',
+      projectName: 'transport',
+      role: 'brain',
+      agentType: 'claude-code-sdk',
+      runtimeType: 'transport',
+      providerId: 'claude-code-sdk',
+      state: 'idle',
+    });
+    // Runtime exists but has no provider session id yet.
+    getTransportRuntimeMock.mockReturnValue({ providerSessionId: undefined, send: vi.fn(() => 'sent') });
+
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_transport_brain',
+      text: 'no-sid ;;(host)',
+      commandId: 'cmd-missing-sid-alias',
+      resolvedAliases: { host: 'prod.example.com' },
+    }, serverLink as any);
+    await flushAsync();
+
+    const entry = getResendEntries('deck_transport_brain')
+      .find((e) => e.commandId === 'cmd-missing-sid-alias');
+    expect(entry).toBeDefined();
+    expect(entry?.providerText).toContain('prod.example.com');
+    expect(entry?.aliasAudit?.names).toEqual(['host']);
+    expect(JSON.stringify(entry?.aliasAudit)).not.toContain('prod.example.com');
+  });
+
   it('queues sends for resend when the transport runtime has not connected yet', async () => {
     // Reset module state between tests — the queue lives in module scope.
     const { clearAllResend, getResendEntries } = await import('../../src/daemon/transport-resend-queue.js');
@@ -3787,6 +3863,54 @@ describe('handleWebCommand transport queue behavior', () => {
     expect(expansion.providerText).toContain('— note: read replica only');
     // The edited delivery is auditable too.
     expect(expansion.aliasAudit?.names).toEqual(['host']);
+  });
+
+  it('persists the fresh expansion through BOTH edit writes, so a restart still delivers it', async () => {
+    // `store.edit` clears the previous expansion and restores only what it is
+    // handed. The handler wrote once via the runtime (with the fresh expansion)
+    // and once directly (without), so the second call silently undid the first
+    // and a restart before drain rehydrated a bare marker with no anchor.
+    getTransportQueueStore().enqueue({
+      sessionName: 'deck_transport_brain',
+      clientMessageId: 'cmd-edit-persist',
+      commandId: 'cmd-edit-persist',
+      text: 'old ;;(host)',
+      privateMaterialJson: JSON.stringify({
+        clientMessageId: 'cmd-edit-persist',
+        text: 'old ;;(host)',
+        providerText: 'old stale-value',
+      }),
+    });
+
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'route-transport',
+      editPendingMessage: vi.fn(() => true),
+      sending: true,
+      pendingCount: 1,
+      pendingMessages: ['deploy ;;(host)'],
+      pendingEntries: [{ clientMessageId: 'cmd-edit-persist', text: 'deploy ;;(host)' }],
+    });
+
+    handleWebCommand({
+      type: 'session.edit_queued_message',
+      sessionName: 'deck_transport_brain',
+      clientMessageId: 'cmd-edit-persist',
+      text: 'deploy ;;(host)',
+      commandId: 'cmd-edit-persist-cmd',
+      resolvedAliases: { host: 'prod.example.com' },
+    }, serverLink as any);
+    await flushAsync();
+
+    const raw = getTransportQueueStore()
+      .readPrivateDispatchMaterial('deck_transport_brain', 'cmd-edit-persist');
+    expect(raw).toBeDefined();
+    const material = JSON.parse(raw!) as { text?: string; providerText?: string; aliasAudit?: { names?: string[] } };
+    expect(material.text).toBe('deploy ;;(host)');
+    // The NEW expansion survived both writes …
+    expect(material.providerText).toContain('prod.example.com');
+    expect(material.aliasAudit?.names).toEqual(['host']);
+    // … and the expansion belonging to the OLD text is gone.
+    expect(material.providerText).not.toContain('stale-value');
   });
 
   it('edits a queued transport message by clientMessageId', async () => {

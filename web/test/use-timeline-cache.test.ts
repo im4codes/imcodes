@@ -3039,4 +3039,179 @@ describe('useTimeline global cache bounds', () => {
     });
     expect(cacheCount).toBe(3);
   });
+  // Both regressions below come from deriving the local-cache verdict from the
+  // rendered timeline instead of from what the local sources actually returned.
+  it('keeps the localStorage count when IndexedDB then returns nothing', async () => {
+    // Previously the IDB completion overwrote the step with `stored.length`,
+    // rendering "✓ 本地缓存 0" while four locally restored messages were on
+    // screen — the number contradicting the view it was meant to explain.
+    const events = makeEvents('deck_sub_seed_then_empty', 4);
+    localStorage.setItem(
+      'rcc_timeline_snapshot:srv:deck_sub_seed_then_empty',
+      JSON.stringify(events),
+    );
+    vi.spyOn(TimelineDB.prototype, 'open').mockResolvedValue();
+    vi.spyOn(TimelineDB.prototype, 'getLastSeqAndEpoch').mockResolvedValue(null);
+    vi.spyOn(TimelineDB.prototype, 'getRecentEvents').mockResolvedValue([]);
+
+    function Probe() {
+      const { historyStatus } = useTimeline('deck_sub_seed_then_empty', null, 'srv');
+      return h(
+        'div',
+        { 'data-testid': 'probe-seed', 'data-state': historyStatus?.steps.cache ?? '' },
+        String(historyStatus?.counts.cache ?? ''),
+      );
+    }
+    render(h(Probe));
+
+    // The IDB read settles asynchronously; the point is what it must NOT do to
+    // the already-restored local count when it comes back empty.
+    await waitFor(() => {
+      expect(screen.getByTestId('probe-seed').getAttribute('data-state')).toBe('done');
+    });
+    const probe = screen.getByTestId('probe-seed');
+    expect(probe.textContent).toBe('4');
+    expect(probe.textContent).not.toBe('0');
+  });
+
+  it('does not let a live event promote an empty local store to a hit', async () => {
+    // The failure this number exists to expose is "nothing is stored on this
+    // device". A realtime event landing WHILE the IDB read is still in flight
+    // used to make that report as `done`, hiding the write-side bug.
+    const sessionName = `deck_live_${Date.now()}`;
+    const serverId = 'srv-live';
+    const cacheKey = `${serverId}:${sessionName}`;
+
+    // Hold the IDB read open so the live event provably lands first.
+    // The read is issued once per key (scoped + bare fallback), so every
+    // pending resolver has to be released, not just the first.
+    const pendingReads: Array<(value: TimelineEvent[]) => void> = [];
+    vi.spyOn(TimelineDB.prototype, 'open').mockResolvedValue();
+    vi.spyOn(TimelineDB.prototype, 'getLastSeqAndEpoch').mockResolvedValue(null);
+    vi.spyOn(TimelineDB.prototype, 'getRecentEvents').mockImplementation(
+      () => new Promise<TimelineEvent[]>((resolve) => { pendingReads.push(resolve); }),
+    );
+
+    function Probe() {
+      const { historyStatus, events: seen } = useTimeline(sessionName, null, serverId);
+      return h('div', {
+        'data-testid': 'probe-live',
+        'data-state': historyStatus?.steps.cache ?? '',
+        'data-count': String(historyStatus?.counts.cache ?? ''),
+      }, String(seen.length));
+    }
+    render(h(Probe));
+    await waitFor(() => expect(pendingReads.length).toBeGreaterThan(0));
+
+    // A live event reaches the SAME `events` state the broken check inspected,
+    // via the module cache subscription — not through any local-restore path.
+    act(() => {
+      __setTimelineCacheForTests(cacheKey, [{
+        eventId: `${sessionName}-live-1`,
+        sessionId: cacheKey,
+        ts: 1, epoch: 1, seq: 1,
+        source: 'daemon', confidence: 'high',
+        type: 'assistant.text',
+        payload: { text: 'live, not restored from disk' },
+      } as TimelineEvent]);
+    });
+    // Precondition: the event really is in the rendered timeline before the
+    // read settles — otherwise this test could not detect the regression.
+    await waitFor(() => expect(screen.getByTestId('probe-live').textContent).toBe('1'));
+
+    act(() => { for (const resolve of pendingReads.splice(0)) resolve([]); });
+    // A fallback read may be issued only after the first resolves.
+    await waitFor(() => {
+      if (pendingReads.length > 0) {
+        act(() => { for (const resolve of pendingReads.splice(0)) resolve([]); });
+      }
+      expect(screen.getByTestId('probe-live').getAttribute('data-state')).not.toBe('running');
+    });
+
+    // The event is real and on screen — but it did not come from the local
+    // store, so the local verdict must stay "nothing here".
+    expect(screen.getByTestId('probe-live').getAttribute('data-state')).toBe('empty');
+    expect(screen.getByTestId('probe-live').getAttribute('data-count')).toBe('0');
+  });
+  it('re-accounts the local snapshot when the hook switches sessions', async () => {
+    // On a session switch the mount-time seed no longer applies, so the
+    // localStorage path is the ONLY thing that can register a local hit for the
+    // new key. Without it an empty IDB read reports the new session as having
+    // no local copy when it does.
+    const seeded = makeEvents('deck_switch_target', 5);
+    localStorage.setItem('rcc_timeline_snapshot:srv:deck_switch_target', JSON.stringify(seeded));
+    vi.spyOn(TimelineDB.prototype, 'open').mockResolvedValue();
+    vi.spyOn(TimelineDB.prototype, 'getLastSeqAndEpoch').mockResolvedValue(null);
+    vi.spyOn(TimelineDB.prototype, 'getRecentEvents').mockResolvedValue([]);
+
+    function Probe({ session }: { session: string }) {
+      const { historyStatus } = useTimeline(session, null, 'srv');
+      return h('div', {
+        'data-testid': 'probe-switch',
+        'data-state': historyStatus?.steps.cache ?? '',
+      }, String(historyStatus?.counts.cache ?? ''));
+    }
+
+    // Start on a session with nothing stored, then switch to the seeded one.
+    const view = render(h(Probe, { session: 'deck_switch_origin' }));
+    await waitFor(() => {
+      expect(screen.getByTestId('probe-switch').getAttribute('data-state')).toBe('empty');
+    });
+
+    view.rerender(h(Probe, { session: 'deck_switch_target' }));
+
+    // Let the async IDB completion land too — asserting the FIRST 'done' would
+    // pass even if the empty read later degraded it back to 'empty'/0.
+    await waitFor(() => {
+      expect(screen.getByTestId('probe-switch').getAttribute('data-state')).toBe('done');
+    });
+    await act(async () => { await new Promise((resolve) => { setTimeout(resolve, 0); }); });
+
+    expect(screen.getByTestId('probe-switch').getAttribute('data-state')).toBe('done');
+    expect(screen.getByTestId('probe-switch').textContent).toBe('5');
+  });
+  it('does not carry one session\'s local count into the next', async () => {
+    // Switching from a session WITH a local copy to one without must not
+    // inherit the previous ledger — that would report a cold session as a
+    // healthy local hit: the same false positive this ledger exists to stop,
+    // across sessions instead of across sources.
+    //
+    // A connected ws stub is required, not decoration: with `ws: null` the
+    // switched-to session settles into `idle`/`skipped` (no daemon path exists
+    // to drive it), so the cache verdict never resolves and nothing is assertable.
+    const seeded = makeEvents('deck_carry_from', 5);
+    localStorage.setItem('rcc_timeline_snapshot:srv:deck_carry_from', JSON.stringify(seeded));
+    vi.spyOn(TimelineDB.prototype, 'open').mockResolvedValue();
+    vi.spyOn(TimelineDB.prototype, 'getLastSeqAndEpoch').mockResolvedValue(null);
+    vi.spyOn(TimelineDB.prototype, 'getRecentEvents').mockResolvedValue([]);
+
+    const ws: WsClient = {
+      get connected() { return true; },
+      onMessage: () => () => { /* noop */ },
+      sendTimelineHistoryRequest: () => 'history-carry',
+    } as unknown as WsClient;
+
+    function Probe({ session }: { session: string }) {
+      const { historyStatus } = useTimeline(session, ws, 'srv');
+      return h('div', {
+        'data-testid': 'probe-carry',
+        'data-state': historyStatus?.steps.cache ?? '',
+      }, String(historyStatus?.counts.cache ?? ''));
+    }
+
+    const view = render(h(Probe, { session: 'deck_carry_from' }));
+    await waitFor(() => {
+      expect(screen.getByTestId('probe-carry').textContent).toBe('5');
+    });
+
+    view.rerender(h(Probe, { session: 'deck_carry_to' }));
+    await waitFor(() => {
+      expect(screen.getByTestId('probe-carry').getAttribute('data-state')).not.toBe('running');
+    });
+    await act(async () => { await new Promise((resolve) => { setTimeout(resolve, 0); }); });
+
+    // The new session has nothing stored; the previous 5 must not follow it.
+    expect(screen.getByTestId('probe-carry').getAttribute('data-state')).toBe('empty');
+    expect(screen.getByTestId('probe-carry').textContent).toBe('0');
+  });
 });

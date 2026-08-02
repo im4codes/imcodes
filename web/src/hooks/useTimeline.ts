@@ -1208,6 +1208,14 @@ function createBootstrapHistoryStatus(opts: {
   canHttp: boolean;
   /** True when mount-time seed already populated `events`; flips `cache` to 'done'. */
   cacheSeeded?: boolean;
+  /**
+   * Local-restore count for this status, when known.
+   *
+   * Set by the bootstrap effect only. The mount-time seed deliberately does NOT
+   * pass it: an idle reset lands between that first status and settle, so the
+   * value was never observable and no test could hold it.
+   */
+  cacheCount?: number;
 }): TimelineHistoryStatus {
   return {
     phase: 'bootstrap',
@@ -1218,7 +1226,7 @@ function createBootstrapHistoryStatus(opts: {
       http: opts.canHttp ? 'pending' : 'skipped',
       older: 'skipped',
     },
-      counts: {},
+    counts: opts.cacheCount === undefined ? {} : { cache: opts.cacheCount },
     response: null,
   };
 }
@@ -1540,6 +1548,32 @@ export function useTimeline(
   });
   const eventsRef = useRef(events);
   eventsRef.current = events;
+  /**
+   * Distinct events produced by LOCAL sources (memory cache / localStorage tail
+   * / IndexedDB) for the current cacheKey.
+   *
+   * Deliberately NOT derived from `events`: that state also receives live WS
+   * traffic and daemon/HTTP history, so inferring "did the local cache have
+   * anything" from it let a single realtime event arriving mid-IDB-read report
+   * an empty local store as a healthy hit — masking exactly the cold-cache
+   * failure this number exists to expose. Seeded from the mount-time
+   * synchronous restore above, which is local by construction.
+   */
+  const localRestoredIdsRef = useRef<Set<string>>(new Set(events.map((event) => event.eventId)));
+  /**
+   * Which cacheKey the ledger above describes.
+   *
+   * Its own ref, NOT `cacheKeyRef`: that one is assigned during render, so by
+   * the time the bootstrap effect runs it already equals the new key and a
+   * comparison against it can never fire. Initialized to the mount key so the
+   * first bootstrap keeps the synchronous seed it was built from.
+   */
+  const localRestoredKeyRef = useRef<string | null>(cacheKey ?? null);
+  /** Union in a local restore and return the running distinct total. */
+  const recordLocalRestore = useCallback((restored: readonly TimelineEvent[]): number => {
+    for (const event of restored) localRestoredIdsRef.current.add(event.eventId);
+    return localRestoredIdsRef.current.size;
+  }, []);
   const transportQueueStateRef = useRef<TransportQueueReducerState>(
     createTransportQueueReducerState(sessionId ?? undefined),
   );
@@ -1727,13 +1761,25 @@ export function useTimeline(
 
     setRefreshing(false);
     setHttpRefreshing(false);
+    // A new cacheKey means a new local store to account for, so the ledger must
+    // not carry the previous session's hits into it — otherwise switching from
+    // a cached session to a cold one reports the cold one as a healthy local
+    // hit: the same false positive this ledger exists to stop, across sessions
+    // instead of across sources.
+    if (localRestoredKeyRef.current !== cacheKey) {
+      localRestoredKeyRef.current = cacheKey ?? null;
+      localRestoredIdsRef.current = new Set();
+    }
     // If the synchronous mount-time seed already populated `events`, mark
     // the cache step done immediately so the bootstrap overlay never flashes
     // "本地缓存…" alongside the just-painted messages.
     setHistoryStatus(createBootstrapHistoryStatus({
       canDaemon: wsConnected,
       canHttp: false,
-      cacheSeeded: eventsRef.current.length > 0,
+      cacheSeeded: localRestoredIdsRef.current.size > 0,
+      // Show the number at first paint too — a bare ✓ with no count is the
+      // ambiguity this whole change exists to remove.
+      cacheCount: localRestoredIdsRef.current.size > 0 ? localRestoredIdsRef.current.size : undefined,
     }));
     httpBackfillInFlightRef.current = createHttpBackfillCountState();
     clearHttpBackfillTimer();
@@ -1792,7 +1838,7 @@ export function useTimeline(
     // 1. Module-level memory cache — instant restore (e.g. window reopen)
     const memCached = getCachedEvents(cacheKey!);
     if (memCached && memCached.length > 0) {
-      updateHistoryStep('cache', 'done', 'bootstrap', memCached.length);
+      updateHistoryStep('cache', 'done', 'bootstrap', recordLocalRestore(memCached));
       setEvents(memCached);
       setLoading(false);
       requestDaemonHistory(false, MAX_MEMORY_EVENTS, memCached);
@@ -1823,7 +1869,7 @@ export function useTimeline(
     // hook's first-paint seed; the global cache is written by IDB/daemon/HTTP.
     const localSnapshot = loadPersistedTimelineSnapshotWithFallback(cacheKey!, rawSessionIdForFallback);
     if (localSnapshot.length > 0) {
-      updateHistoryStep('cache', 'done', 'bootstrap', localSnapshot.length);
+      updateHistoryStep('cache', 'done', 'bootstrap', recordLocalRestore(localSnapshot));
       setEvents((prev) => (prev === localSnapshot ? prev : localSnapshot));
       setLoading(false);
       requestDaemonHistory(false, MAX_MEMORY_EVENTS, localSnapshot);
@@ -1919,14 +1965,16 @@ export function useTimeline(
         epochRef.current = 0;
         seqRef.current = 0;
       }
-      // Only claim a local restore when something was actually restored — the
-      // seed paths above may already have painted, in which case `events` is
-      // non-empty and this genuinely was a hit.
+      // State AND count both come from the local-restore ledger, never from
+      // `events`. Using two different populations previously rendered
+      // "✓ 本地缓存 0" next to locally restored messages, and let one live WS
+      // event turn a genuinely empty local store into a reported hit.
+      const localRestored = recordLocalRestore(stored);
       updateHistoryStep(
         'cache',
-        stored.length > 0 || eventsRef.current.length > 0 ? 'done' : 'empty',
+        localRestored > 0 ? 'done' : 'empty',
         'bootstrap',
-        stored.length,
+        localRestored,
       );
       if (stored.length > 0) {
         const existing = getSharedTimelineBase(cacheKey!, eventsRef.current, MAX_MEMORY_EVENTS);
@@ -2671,12 +2719,17 @@ export function useTimeline(
     void readRawSegment(db, rawSessionId, key, MAX_MEMORY_EVENTS).then((raw) => {
       if (cacheKeyRef.current !== key || raw.rawStored.length === 0) return;
       mergeEvents(raw.rawRestamped);
+      // The bare segment is a LOCAL restore like any other, so it must enter the
+      // ledger. Without this the strip reported only the scoped count while the
+      // view showed both segments — the number contradicting what is on screen,
+      // which is exactly what the ledger exists to prevent.
+      updateHistoryStep('cache', 'done', undefined, recordLocalRestore(raw.rawRestamped));
       const bumped = maxLocalCursor({ epoch: epochRef.current, seq: seqRef.current }, raw.cursor);
       if (bumped) { epochRef.current = bumped.epoch; seqRef.current = bumped.seq; }
       setLoading(false);
       db.migrateRawToScoped(rawSessionId, key, raw.rawStored).catch(() => { /* best-effort */ });
     }).catch(() => { /* best-effort */ });
-  }, [mergeEvents]);
+  }, [mergeEvents, recordLocalRestore, updateHistoryStep]);
   const mergeRawSegmentLaterRef = useRef(mergeRawSegmentLater);
   mergeRawSegmentLaterRef.current = mergeRawSegmentLater;
 

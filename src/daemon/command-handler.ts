@@ -3774,6 +3774,10 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     const enqueueResult = enqueueResend(sessionName, {
       text: displayText,
       ...(aliasProviderText ? { providerText: aliasProviderText } : {}),
+      // The anchor travels with the expansion it describes. Without it an
+      // offline-queued send still delivers the alias VALUE to the provider on
+      // reconnect while the timeline records nothing about what was delivered.
+      ...(aliasAudit ? { aliasAudit } : {}),
       ...(preferenceMessagePreamble ? { messagePreamble: preferenceMessagePreamble } : {}),
       ...(sharedActor ? { sharedActor } : {}),
       commandId: effectiveId,
@@ -3861,6 +3865,9 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     const enqueueResultMissingSid = enqueueResend(sessionName, {
       text: displayText,
       ...(aliasProviderText ? { providerText: aliasProviderText } : {}),
+      // Same reason as the no-runtime branch above: the anchor must accompany
+      // the expansion, or this delivery lands unauditable.
+      ...(aliasAudit ? { aliasAudit } : {}),
       ...(preferenceMessagePreamble ? { messagePreamble: preferenceMessagePreamble } : {}),
       ...(sharedActor ? { sharedActor } : {}),
       commandId: effectiveId,
@@ -4640,10 +4647,15 @@ async function handleEditQueuedTransportMessage(cmd: Record<string, unknown>, se
       editNotes,
     );
     const editAudit = buildAliasSendAudit(text, editResolved, editNotes);
-    const edited = runtime.editPendingMessage(clientMessageId, text, {
+    // One replacement value, used by BOTH store writes below. `store.edit`
+    // clears the previous expansion and only restores what it is handed, so a
+    // second call without this would silently undo the runtime's write and a
+    // restart before drain would deliver a bare marker with no anchor.
+    const editReplacement = {
       ...(editExpansion.deliver && editExpansion.text !== text ? { providerText: editExpansion.text } : {}),
       ...(editAudit ? { aliasAudit: editAudit } : {}),
-    });
+    };
+    const edited = runtime.editPendingMessage(clientMessageId, text, editReplacement);
     if (!edited) {
       timelineEmitter.emit(sessionName, 'command.ack', { commandId, status: 'error', error: 'Queued message not found' });
       emitCommandAckReliable(serverLink, { commandId, sessionName, status: 'error', error: 'Queued message not found' });
@@ -4653,7 +4665,7 @@ async function handleEditQueuedTransportMessage(cmd: Record<string, unknown>, se
     peerAuditService.invalidateQueuedEdit(sessionName);
     let queueSnapshot = getTransportQueueStore().readSnapshotSafely(sessionName, 'edit_queued_message_before');
     try {
-      queueSnapshot = getTransportQueueStore().edit(sessionName, clientMessageId, text);
+      queueSnapshot = getTransportQueueStore().edit(sessionName, clientMessageId, text, undefined, editReplacement);
     } catch (err) {
       logger.warn({ err, sessionName, clientMessageId }, 'transport queue sqlite edit failed for queued message');
     }
