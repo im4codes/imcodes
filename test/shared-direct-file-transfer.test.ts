@@ -13,6 +13,7 @@ import {
   validateDirectFileTransferDaemonCommand,
   validateDirectFileTransferDaemonMessage,
   validateDirectFileTransferDataMessage,
+  isDirectFileTransferIceServerConfig,
 } from '../shared/direct-file-transfer.js';
 
 const requestId = '123e4567-e89b-12d3-a456-426614174000';
@@ -55,6 +56,57 @@ describe('direct file transfer protocol', () => {
       loaded: 51,
       total: 50,
     })).toMatchObject({ ok: false });
+  });
+
+  it('accepts strict authenticated TURN entries while preserving legacy STUN strings', () => {
+    const authority = {
+      type: DIRECT_FILE_TRANSFER_MSG.PREPARE,
+      requestId,
+      clientUploadId,
+      filename: 'archive.bin',
+      size: 100,
+      capability,
+      expiresAt: Date.now() + 60_000,
+      iceServers: [
+        'stun:stun.cloudflare.com:3478',
+        {
+          urls: ['turn:im.example.com:3479?transport=udp'],
+          username: '1780000000:subject',
+          credential: 'temporary-credential',
+        },
+      ],
+    };
+    expect(validateDirectFileTransferDaemonCommand(authority)).toMatchObject({ ok: true });
+    expect(isDirectFileTransferIceServerConfig(authority.iceServers[0])).toBe(true);
+    expect(isDirectFileTransferIceServerConfig(authority.iceServers[1])).toBe(true);
+  });
+
+  it('rejects malformed TURN schemes, partial credentials, mixed entries, and extra keys', () => {
+    expect(isDirectFileTransferIceServerConfig({
+      urls: ['turn:im.example.com:3479?transport=udp'],
+      username: '1780000000:subject',
+    })).toBe(false);
+    expect(isDirectFileTransferIceServerConfig({
+      urls: ['https://im.example.com/turn'],
+      username: 'user',
+      credential: 'credential',
+    })).toBe(false);
+    expect(isDirectFileTransferIceServerConfig({
+      urls: ['stun:stun.cloudflare.com:3478', 'turn:im.example.com:3479'],
+      username: 'user',
+      credential: 'credential',
+    })).toBe(false);
+    expect(isDirectFileTransferIceServerConfig({
+      urls: ['turn:im.example.com:3479'],
+      username: 'user',
+      credential: 'credential',
+      secret: 'must-not-pass',
+    })).toBe(false);
+    expect(isDirectFileTransferIceServerConfig({
+      urls: ['stun:stun.cloudflare.com:3478'],
+      username: 'must-not-be-accepted',
+      credential: 'must-not-be-accepted',
+    })).toBe(false);
   });
 
   it('requires exact control messages on the data channel', () => {

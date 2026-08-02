@@ -17,6 +17,7 @@ import {
   validateDirectFileTransferDataMessage,
   type DirectFileTransferDaemonCommand,
   type DirectFileTransferError,
+  type DirectFileTransferIceServerConfig,
   type DirectFileTransferPrepare,
   type DirectConnectivityRuntimeError,
   type DirectConnectivityRuntimeStatus,
@@ -36,6 +37,7 @@ import {
 type NodeDataChannel = typeof import('node-datachannel');
 type PeerConnection = import('node-datachannel').PeerConnection;
 type DataChannel = import('node-datachannel').DataChannel;
+type NodeDataChannelIceServer = string | import('node-datachannel').IceServer;
 
 interface ActiveDirectTransfer {
   authority: DirectFileTransferPrepare;
@@ -62,6 +64,43 @@ let rtc: NodeDataChannel | null = null;
 let loadAttempted = false;
 let rtcLoadError: DirectConnectivityRuntimeError | undefined;
 const active = new Map<string, ActiveDirectTransfer>();
+
+const TURN_URL_RE = /^(turn|turns):(\[[^\]]+\]|[^:?]+)(?::(\d{1,5}))?(?:\?transport=(udp|tcp))?$/i;
+
+export function toNodeDataChannelIceServers(
+  iceServers: readonly DirectFileTransferIceServerConfig[],
+): NodeDataChannelIceServer[] {
+  const resolved: NodeDataChannelIceServer[] = [];
+  for (const entry of iceServers) {
+    if (typeof entry === 'string') {
+      resolved.push(entry);
+      continue;
+    }
+    for (const url of entry.urls) {
+      if (/^stuns?:/i.test(url)) {
+        resolved.push(url);
+        continue;
+      }
+      const match = TURN_URL_RE.exec(url);
+      if (!match || !entry.username || !entry.credential) {
+        throw new Error('Invalid authenticated TURN server configuration');
+      }
+      const secure = match[1].toLowerCase() === 'turns';
+      const port = Number(match[3] ?? (secure ? 5349 : 3478));
+      if (!Number.isInteger(port) || port < 1 || port > 65_535) {
+        throw new Error('Invalid TURN server port');
+      }
+      resolved.push({
+        hostname: match[2].replace(/^\[|\]$/g, ''),
+        port,
+        username: entry.username,
+        password: entry.credential,
+        relayType: secure ? 'TurnTls' : match[4]?.toLowerCase() === 'tcp' ? 'TurnTcp' : 'TurnUdp',
+      });
+    }
+  }
+  return resolved;
+}
 
 export async function initializeDirectFileTransfer(): Promise<boolean> {
   if (loadAttempted) return rtc !== null;
@@ -410,7 +449,7 @@ async function prepareTransfer(authority: DirectFileTransferPrepare, sender: Fil
   let peer: PeerConnection;
   try {
     peer = new rtc.PeerConnection(`imcodes-upload-${authority.requestId}`, {
-      iceServers: authority.iceServers,
+      iceServers: toNodeDataChannelIceServers(authority.iceServers),
       maxMessageSize: DIRECT_FILE_TRANSFER_LIMITS.DATA_CHUNK_BYTES,
     });
   } catch (error) {

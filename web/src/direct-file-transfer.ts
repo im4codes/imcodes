@@ -15,6 +15,7 @@ import {
   type DirectConnectivityCandidateType,
   type DirectConnectivityProbeDiagnostics,
   type DirectConnectivityProbeResult,
+  type DirectFileTransferIceServerConfig,
   type DirectFileTransferServerMessage,
 } from '@shared/direct-file-transfer.js';
 import { FILE_TRANSFER_LIMITS } from '@shared/transport/file-transfer.js';
@@ -36,6 +37,18 @@ export class DirectFileTransferFailure extends Error {
     super(message);
     this.name = 'DirectFileTransferFailure';
   }
+}
+
+export function toBrowserIceServers(
+  iceServers: readonly DirectFileTransferIceServerConfig[],
+): RTCIceServer[] {
+  return iceServers.map((entry) => typeof entry === 'string'
+    ? { urls: entry }
+    : {
+        urls: [...entry.urls],
+        ...(entry.username ? { username: entry.username } : {}),
+        ...(entry.credential ? { credential: entry.credential } : {}),
+      });
 }
 
 function isDirectMessage(message: ServerMessage, requestId: string): message is DirectFileTransferServerMessage {
@@ -207,7 +220,7 @@ async function runDirectOperation(ws: WsClient, operation: DirectOperation): Pro
       capability = parsed.value.capability;
       emitProbeDiagnostics(DIRECT_CONNECTIVITY_PROBE_STAGE.CREATING_OFFER);
       peer = new RTCPeerConnection({
-        iceServers: parsed.value.iceServers.map((urls) => ({ urls })),
+        iceServers: toBrowserIceServers(parsed.value.iceServers),
       });
       channel = peer.createDataChannel(probe ? 'imcodes-connectivity-probe' : 'imcodes-file-upload', { ordered: true });
       channel.binaryType = 'arraybuffer';

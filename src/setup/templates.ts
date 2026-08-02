@@ -1,7 +1,37 @@
 /** Embedded deployment templates for `imcodes setup`. */
 
-export function dockerComposeTemplate(opts?: { ghcrPrefix?: string }): string {
+import {
+  TURN_SERVICE_DEFAULTS,
+  TURN_SERVICE_DENIED_PEER_RANGES,
+} from '../../shared/turn-service.js';
+
+export interface TurnDeploymentTemplateConfig {
+  enabled: boolean;
+  host?: string;
+  port?: number;
+  externalIp?: string;
+  relayMinPort?: number;
+  relayMaxPort?: number;
+  sharedSecret?: string;
+  credentialTtlSeconds?: number;
+}
+
+export function dockerComposeTemplate(opts?: { ghcrPrefix?: string; turn?: TurnDeploymentTemplateConfig }): string {
   const ghcr = opts?.ghcrPrefix ?? 'ghcr.io';
+  const turnService = opts?.turn?.enabled ? `
+  turn:
+    image: ${TURN_SERVICE_DEFAULTS.IMAGE}
+    restart: unless-stopped
+    ports:
+      - "\${TURN_PORT}:\${TURN_PORT}/udp"
+      - "\${TURN_PORT}:\${TURN_PORT}/tcp"
+      - "\${TURN_RELAY_MIN_PORT}-\${TURN_RELAY_MAX_PORT}:\${TURN_RELAY_MIN_PORT}-\${TURN_RELAY_MAX_PORT}/udp"
+    volumes:
+      - ./turnserver.conf:/etc/coturn/turnserver.conf:ro
+    command: ["-c", "/etc/coturn/turnserver.conf"]
+    labels:
+      - com.centurylinklabs.watchtower.scope=imcodes
+` : '';
   return `services:
   postgres:
     image: pgvector/pgvector:pg18
@@ -33,6 +63,14 @@ export function dockerComposeTemplate(opts?: { ghcrPrefix?: string }): string {
       WEBAUTHN_RP_ID: "\${WEBAUTHN_RP_ID:-\${DOMAIN}}"
       DEFAULT_ADMIN_PASSWORD: "\${DEFAULT_ADMIN_PASSWORD:-}"
       TRUSTED_PROXIES: "127.0.0.1,172.16.0.0/12,10.0.0.0/8,192.168.0.0/16"
+      TURN_ENABLED: "\${TURN_ENABLED:-false}"
+      TURN_HOST: "\${TURN_HOST:-}"
+      TURN_PORT: "\${TURN_PORT:-}"
+      TURN_EXTERNAL_IP: "\${TURN_EXTERNAL_IP:-}"
+      TURN_SHARED_SECRET: "\${TURN_SHARED_SECRET:-}"
+      TURN_CREDENTIAL_TTL_SECONDS: "\${TURN_CREDENTIAL_TTL_SECONDS:-}"
+      TURN_RELAY_MIN_PORT: "\${TURN_RELAY_MIN_PORT:-}"
+      TURN_RELAY_MAX_PORT: "\${TURN_RELAY_MAX_PORT:-}"
     labels:
       - com.centurylinklabs.watchtower.scope=imcodes
     depends_on:
@@ -52,6 +90,7 @@ export function dockerComposeTemplate(opts?: { ghcrPrefix?: string }): string {
       - caddy_config:/config
     depends_on:
       - server
+${turnService}
 
   watchtower:
     image: nickfedor/watchtower
@@ -88,10 +127,48 @@ export function envTemplate(vars: {
   postgresPassword: string;
   jwtSigningKey: string;
   adminPassword: string;
+  turn?: TurnDeploymentTemplateConfig;
 }): string {
+  const turn = vars.turn?.enabled ? `TURN_ENABLED=true
+TURN_HOST=${vars.turn.host}
+TURN_PORT=${vars.turn.port}
+TURN_EXTERNAL_IP=${vars.turn.externalIp}
+TURN_SHARED_SECRET=${vars.turn.sharedSecret}
+TURN_CREDENTIAL_TTL_SECONDS=${vars.turn.credentialTtlSeconds}
+TURN_RELAY_MIN_PORT=${vars.turn.relayMinPort}
+TURN_RELAY_MAX_PORT=${vars.turn.relayMaxPort}
+` : 'TURN_ENABLED=false\n';
   return `DOMAIN=${vars.domain}
 POSTGRES_PASSWORD=${vars.postgresPassword}
 JWT_SIGNING_KEY=${vars.jwtSigningKey}
 DEFAULT_ADMIN_PASSWORD=${vars.adminPassword}
+${turn}
+`;
+}
+
+export function turnserverConfigTemplate(turn: Required<Omit<TurnDeploymentTemplateConfig, 'enabled'>>): string {
+  const deniedPeers = TURN_SERVICE_DENIED_PEER_RANGES
+    .map((range) => `denied-peer-ip=${range}`)
+    .join('\n');
+  // coturn 4.15 keeps its CLI disabled by default. Do not emit the deprecated
+  // no-cli alias, which the pinned image logs as an error.
+  return `listening-port=${turn.port}
+fingerprint
+use-auth-secret
+static-auth-secret=${turn.sharedSecret}
+realm=${turn.host}
+server-name=${turn.host}
+external-ip=${turn.externalIp}
+min-port=${turn.relayMinPort}
+max-port=${turn.relayMaxPort}
+stale-nonce=600
+user-quota=32
+total-quota=64
+no-tls
+no-dtls
+no-tcp-relay
+no-multicast-peers
+${deniedPeers}
+denied-peer-ip=${turn.externalIp}-${turn.externalIp}
 `;
 }

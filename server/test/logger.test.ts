@@ -13,13 +13,20 @@ describe('server logger redaction', () => {
       api_key: 'secret-key',
       nested: {
         authorization: 'Bearer abc',
+        credential: 'temporary-turn-password',
+        sharedSecret: 'coturn-rest-secret',
         ok: 'visible',
       },
     }, 'msg');
 
     const payload = JSON.parse(spy.mock.calls[0][0] as string) as Record<string, unknown>;
     expect(payload.api_key).toBe('[REDACTED]');
-    expect(payload.nested).toEqual({ authorization: '[REDACTED]', ok: 'visible' });
+    expect(payload.nested).toEqual({
+      authorization: '[REDACTED]',
+      credential: '[REDACTED]',
+      sharedSecret: '[REDACTED]',
+      ok: 'visible',
+    });
   });
 
   it('redacts deck-style sensitive values inside arrays', () => {

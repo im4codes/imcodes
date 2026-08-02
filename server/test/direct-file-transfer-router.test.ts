@@ -3,6 +3,7 @@ import type WebSocket from 'ws';
 import { DirectFileTransferRouter } from '../src/ws/direct-file-transfer-router.js';
 import { stringifyForServerSend } from '../../src/daemon/latency-tracer.js';
 import {
+  DIRECT_FILE_TRANSFER_AUTHENTICATED_ICE_CAPABILITY,
   DIRECT_FILE_TRANSFER_CAPABILITY,
   DIRECT_FILE_TRANSFER_LIMITS,
   DIRECT_FILE_TRANSFER_MSG,
@@ -17,7 +18,13 @@ const init = {
   size: 6 * 1024 * 1024 * 1024,
 };
 
-function fixture() {
+function fixture(options: {
+  authenticatedIceSupported?: boolean;
+  iceServers?: (userId: string) => {
+    iceServers: Array<string | { urls: string[]; username?: string; credential?: string }>;
+    credentialExpiresAt?: number;
+  };
+} = {}) {
   const browserA = {} as WebSocket;
   const browserB = {} as WebSocket;
   const browserMessages = new Map<WebSocket, Array<Record<string, unknown>>>();
@@ -29,7 +36,9 @@ function fixture() {
     serverId: () => 'server-1',
     daemonAvailable: () => available,
     daemonSupportsDirect: () => supported,
+    daemonSupportsAuthenticatedIce: () => options.authenticatedIceSupported ?? false,
     daemonGeneration: () => generation,
+    ...(options.iceServers ? { iceServers: options.iceServers } : {}),
     sendDaemon: vi.fn((message, expected) => {
       if (!available || expected !== generation) return false;
       daemonMessages.push(message);
@@ -193,6 +202,109 @@ describe('DirectFileTransferRouter', () => {
 
   it('advertises the negotiated capability constant without changing relay support', () => {
     expect(DIRECT_FILE_TRANSFER_CAPABILITY).toBe('file.transfer.direct.v1');
+    expect(DIRECT_FILE_TRANSFER_AUTHENTICATED_ICE_CAPABILITY).toBe('file.transfer.direct.authenticated_ice.v1');
+  });
+
+  it('singlecasts the same requester-bound TURN credential to the browser and daemon', () => {
+    const f = fixture({
+      authenticatedIceSupported: true,
+      iceServers: (userId) => ({
+        iceServers: [{
+          urls: ['turn:im.example.com:3479?transport=udp'],
+          username: `1780003600:${userId}`,
+          credential: 'temporary-password',
+        }],
+      }),
+    });
+    f.router.handleBrowser(f.browserA, 'user-a', init);
+    expect(f.messages(f.browserA)[0]).toMatchObject({
+      iceServers: [{ username: '1780003600:user-a', credential: 'temporary-password' }],
+    });
+    expect(f.daemonMessages[0]).toMatchObject({
+      iceServers: [{ username: '1780003600:user-a', credential: 'temporary-password' }],
+    });
+    expect(f.messages(f.browserB)).toHaveLength(0);
+  });
+
+  it('sends only legacy STUN strings to a daemon without authenticated ICE capability', () => {
+    const iceServers = vi.fn(() => ({
+      iceServers: [{
+        urls: ['turn:im.example.com:3479?transport=udp'],
+        username: 'temporary-user',
+        credential: 'temporary-password',
+      }],
+    }));
+    const f = fixture({ iceServers });
+    f.router.handleBrowser(f.browserA, 'user-a', init);
+
+    expect(iceServers).not.toHaveBeenCalled();
+    expect(f.messages(f.browserA)[0]).toMatchObject({
+      iceServers: ['stun:stun.cloudflare.com:3478'],
+    });
+    expect(f.daemonMessages[0]).toMatchObject({
+      iceServers: ['stun:stun.cloudflare.com:3478'],
+    });
+  });
+
+  it('slides active authority within a longer TURN credential lifetime but never beyond its absolute expiry', () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(1_780_000_000_000);
+      const startedAt = Date.now();
+      const credentialExpiresAt = startedAt + 2 * DIRECT_FILE_TRANSFER_LIMITS.AUTHORITY_TTL_MS;
+      const f = fixture({
+        authenticatedIceSupported: true,
+        iceServers: () => ({
+          credentialExpiresAt,
+          iceServers: [{
+            urls: ['turn:im.example.com:3479?transport=udp'],
+            username: 'temporary-user',
+            credential: 'temporary-password',
+          }],
+        }),
+      });
+      f.router.handleBrowser(f.browserA, 'user-a', init);
+      const authorized = f.messages(f.browserA)[0];
+      const hardExpiresAt = credentialExpiresAt - 60_000;
+      expect(authorized.expiresAt).toBe(startedAt + DIRECT_FILE_TRANSFER_LIMITS.AUTHORITY_TTL_MS);
+
+      vi.advanceTimersByTime(DIRECT_FILE_TRANSFER_LIMITS.AUTHORITY_TTL_MS / 2);
+      f.router.handleDaemon({
+        type: DIRECT_FILE_TRANSFER_MSG.PROGRESS,
+        requestId: init.requestId,
+        capability: authorized.capability,
+        loaded: 1024,
+        total: init.size,
+      }, 3);
+      const route = (f.router as unknown as {
+        routes: Map<string, { expiresAt: number }>;
+      }).routes.get(init.requestId);
+      expect(route?.expiresAt).toBe(startedAt + DIRECT_FILE_TRANSFER_LIMITS.AUTHORITY_TTL_MS * 1.5);
+
+      vi.advanceTimersByTime(DIRECT_FILE_TRANSFER_LIMITS.AUTHORITY_TTL_MS / 2 + 1);
+      expect(f.messages(f.browserA).at(-1)).not.toMatchObject({
+        type: DIRECT_FILE_TRANSFER_MSG.ERROR,
+        error: 'authority_expired',
+      });
+
+      f.router.handleDaemon({
+        type: DIRECT_FILE_TRANSFER_MSG.PROGRESS,
+        requestId: init.requestId,
+        capability: authorized.capability,
+        loaded: 2048,
+        total: init.size,
+      }, 3);
+      expect(route?.expiresAt).toBe(hardExpiresAt);
+      vi.advanceTimersByTime(hardExpiresAt - Date.now() + 1);
+      expect(f.messages(f.browserA).at(-1)).toMatchObject({
+        type: DIRECT_FILE_TRANSFER_MSG.ERROR,
+        error: 'authority_expired',
+        retryable: true,
+        detail: expect.stringContaining('absolute expiry'),
+      });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('reuses the exact-socket authority path for probes and rejects arbitrary IP targets', () => {

@@ -24,7 +24,12 @@ vi.mock('../../src/util/daemon-status.js', () => ({
   recordDaemonServerLinkStatus: vi.fn(),
 }));
 
-import { ServerLink, __setServerLinkDataPlaneQueueConfigForTests, setServerLinkReconnectResyncHandler } from '../../src/daemon/server-link.js';
+import {
+  ServerLink,
+  __setServerLinkDataPlaneQueueConfigForTests,
+  directFileTransferDaemonCapabilities,
+  setServerLinkReconnectResyncHandler,
+} from '../../src/daemon/server-link.js';
 import { TIMELINE_DELIVERY_METRICS } from '../../shared/timeline-delivery-telemetry.js';
 import { getCounter, resetMetricsForTests } from '../../src/util/metrics.js';
 import { recordDaemonServerLinkStatus } from '../../src/util/daemon-status.js';
@@ -32,6 +37,10 @@ import { TIMELINE_MESSAGES, TIMELINE_PROTOCOL_CAPABILITY } from '../../shared/ti
 import { TRANSPORT_EVENT } from '../../shared/transport-events.js';
 import { FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY } from '../../shared/transport/file-transfer.js';
 import { DAEMON_MSG } from '../../shared/daemon-events.js';
+import {
+  DIRECT_FILE_TRANSFER_AUTHENTICATED_ICE_CAPABILITY,
+  DIRECT_FILE_TRANSFER_CAPABILITY,
+} from '../../shared/direct-file-transfer.js';
 import {
   DAEMON_UPGRADE_BLOCKED_ACK_DISPOSITION,
   DAEMON_UPGRADE_BLOCKED_SYNC_PROTOCOL,
@@ -170,6 +179,14 @@ describe('ServerLink', () => {
 
   it('advertises relay upload fetch capability for server-side compatibility gating', () => {
     expect(link.getDaemonCapabilities()).toContain(FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY);
+  });
+
+  it('advertises authenticated ICE only together with an available direct-transfer runtime', () => {
+    expect(directFileTransferDaemonCapabilities(false)).toEqual([]);
+    expect(directFileTransferDaemonCapabilities(true)).toEqual([
+      DIRECT_FILE_TRANSFER_CAPABILITY,
+      DIRECT_FILE_TRANSFER_AUTHENTICATED_ICE_CAPABILITY,
+    ]);
   });
 
   it('send() adds monotonic seq counter', () => {

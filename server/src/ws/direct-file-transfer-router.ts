@@ -9,7 +9,14 @@ import {
   validateDirectFileTransferBrowserMessage,
   validateDirectFileTransferDaemonMessage,
   type DirectFileTransferInit,
+  type DirectFileTransferIceServerConfig,
 } from '../../../shared/direct-file-transfer.js';
+import { TURN_SERVICE_DEFAULTS } from '../../../shared/turn-service.js';
+
+export interface DirectFileTransferIceServerAuthority {
+  iceServers: DirectFileTransferIceServerConfig[];
+  credentialExpiresAt?: number;
+}
 
 interface DirectFileTransferRoute {
   requestId: string;
@@ -19,6 +26,7 @@ interface DirectFileTransferRoute {
   daemonGeneration: number;
   capabilityHash: Buffer;
   expiresAt: number;
+  hardExpiresAt?: number;
   timer: ReturnType<typeof setTimeout>;
 }
 
@@ -26,7 +34,9 @@ export interface DirectFileTransferRouterHooks {
   serverId(): string;
   daemonAvailable(): boolean;
   daemonSupportsDirect(): boolean;
+  daemonSupportsAuthenticatedIce?(): boolean;
   daemonGeneration(): number;
+  iceServers?(userId: string): DirectFileTransferIceServerAuthority;
   sendDaemon(message: Record<string, unknown>, generation: number): boolean;
   sendBrowser(socket: WebSocket, message: Record<string, unknown>): void;
 }
@@ -127,7 +137,14 @@ export class DirectFileTransferRouter {
       return true;
     }
     if (route.expiresAt <= Date.now()) {
-      this.failRoute(route, DIRECT_FILE_TRANSFER_ERROR.AUTHORITY_EXPIRED, true);
+      this.failRoute(
+        route,
+        DIRECT_FILE_TRANSFER_ERROR.AUTHORITY_EXPIRED,
+        true,
+        route.hardExpiresAt !== undefined && route.expiresAt >= route.hardExpiresAt
+          ? 'TURN credentials reached their absolute expiry; retry to obtain fresh credentials'
+          : undefined,
+      );
       return true;
     }
     if (parsed.value.type === DIRECT_FILE_TRANSFER_MSG.PROGRESS) {
@@ -190,8 +207,21 @@ export class DirectFileTransferRouter {
 
     const generation = this.hooks.daemonGeneration();
     const capability = mintOpaque();
-    const expiresAt = Date.now() + DIRECT_FILE_TRANSFER_LIMITS.AUTHORITY_TTL_MS;
-    const timer = this.scheduleRouteExpiry(init.requestId);
+    const now = Date.now();
+    const resolvedIce = this.resolveIceServers(userId);
+    const hardExpiresAt = resolvedIce.credentialExpiresAt === undefined
+      ? undefined
+      : resolvedIce.credentialExpiresAt - TURN_SERVICE_DEFAULTS.CREDENTIAL_EXPIRY_SAFETY_MS;
+    const expiresAt = Math.min(
+      now + DIRECT_FILE_TRANSFER_LIMITS.AUTHORITY_TTL_MS,
+      hardExpiresAt ?? Number.MAX_SAFE_INTEGER,
+    );
+    if (expiresAt <= now) {
+      this.sendError(socket, init.requestId, DIRECT_FILE_TRANSFER_ERROR.AUTHORITY_EXPIRED, true,
+        'TURN credentials expired before the transfer could start; retry to obtain fresh credentials');
+      return;
+    }
+    const timer = this.scheduleRouteExpiry(init.requestId, expiresAt);
     const route: DirectFileTransferRoute = {
       requestId: init.requestId,
       clientUploadId: init.clientUploadId,
@@ -200,6 +230,7 @@ export class DirectFileTransferRouter {
       daemonGeneration: generation,
       capabilityHash: hashCapability(capability),
       expiresAt,
+      ...(hardExpiresAt === undefined ? {} : { hardExpiresAt }),
       timer,
     };
     this.routes.set(route.requestId, route);
@@ -209,7 +240,7 @@ export class DirectFileTransferRouter {
       ...init,
       capability,
       expiresAt,
-      iceServers: [...DIRECT_FILE_TRANSFER_ICE_SERVERS],
+      iceServers: resolvedIce.iceServers,
     };
     const prepare = { ...authority, type: DIRECT_FILE_TRANSFER_MSG.PREPARE };
     if (!this.hooks.sendDaemon(prepare, generation)) {
@@ -235,26 +266,51 @@ export class DirectFileTransferRouter {
     });
   }
 
-  private failRoute(route: DirectFileTransferRoute, error: string, retryable: boolean): void {
-    this.sendError(route.socket, route.requestId, error, retryable);
+  private resolveIceServers(userId: string): DirectFileTransferIceServerAuthority {
+    if (!this.hooks.daemonSupportsAuthenticatedIce?.()) {
+      return { iceServers: [...DIRECT_FILE_TRANSFER_ICE_SERVERS] };
+    }
+    try {
+      const configured = this.hooks.iceServers?.(userId);
+      return configured && configured.iceServers.length > 0
+        ? configured
+        : { iceServers: [...DIRECT_FILE_TRANSFER_ICE_SERVERS] };
+    } catch {
+      return { iceServers: [...DIRECT_FILE_TRANSFER_ICE_SERVERS] };
+    }
+  }
+
+  private failRoute(route: DirectFileTransferRoute, error: string, retryable: boolean, detail?: string): void {
+    this.sendError(route.socket, route.requestId, error, retryable, detail);
     this.deleteRoute(route);
   }
 
-  private scheduleRouteExpiry(requestId: string): ReturnType<typeof setTimeout> {
+  private scheduleRouteExpiry(requestId: string, expiresAt: number): ReturnType<typeof setTimeout> {
     const timer = setTimeout(() => {
       const route = this.routes.get(requestId);
       if (route && route.expiresAt <= Date.now()) {
-        this.failRoute(route, DIRECT_FILE_TRANSFER_ERROR.AUTHORITY_EXPIRED, true);
+        const turnCredentialExpired = route.hardExpiresAt !== undefined && route.expiresAt >= route.hardExpiresAt;
+        this.failRoute(
+          route,
+          DIRECT_FILE_TRANSFER_ERROR.AUTHORITY_EXPIRED,
+          true,
+          turnCredentialExpired
+            ? 'TURN credentials reached their absolute expiry; retry to obtain fresh credentials'
+            : undefined,
+        );
       }
-    }, DIRECT_FILE_TRANSFER_LIMITS.AUTHORITY_TTL_MS);
+    }, Math.max(0, expiresAt - Date.now()));
     timer.unref?.();
     return timer;
   }
 
   private renewRouteAuthority(route: DirectFileTransferRoute): void {
     clearTimeout(route.timer);
-    route.expiresAt = Date.now() + DIRECT_FILE_TRANSFER_LIMITS.AUTHORITY_TTL_MS;
-    route.timer = this.scheduleRouteExpiry(route.requestId);
+    route.expiresAt = Math.min(
+      Date.now() + DIRECT_FILE_TRANSFER_LIMITS.AUTHORITY_TTL_MS,
+      route.hardExpiresAt ?? Number.MAX_SAFE_INTEGER,
+    );
+    route.timer = this.scheduleRouteExpiry(route.requestId, route.expiresAt);
   }
 
   private deleteRoute(route: DirectFileTransferRoute): void {

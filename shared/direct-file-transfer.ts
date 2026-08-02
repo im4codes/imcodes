@@ -2,6 +2,7 @@ import type { AttachmentRef } from './transport/file-transfer.js';
 import { validateAttachmentRef } from './transport/file-transfer.js';
 
 export const DIRECT_FILE_TRANSFER_CAPABILITY = 'file.transfer.direct.v1' as const;
+export const DIRECT_FILE_TRANSFER_AUTHENTICATED_ICE_CAPABILITY = 'file.transfer.direct.authenticated_ice.v1' as const;
 export const DIRECT_FILE_TRANSFER_PROTOCOL_VERSION = 1;
 
 export const DIRECT_FILE_TRANSFER_PURPOSE = {
@@ -137,6 +138,11 @@ export const DIRECT_FILE_TRANSFER_LIMITS = {
   SDP_BYTES: 256 * 1024,
   ICE_CANDIDATE_BYTES: 16 * 1024,
   ICE_MID_BYTES: 256,
+  ICE_SERVER_URL_BYTES: 2048,
+  ICE_SERVER_USERNAME_BYTES: 256,
+  ICE_SERVER_CREDENTIAL_BYTES: 512,
+  ICE_SERVER_URLS_PER_ENTRY: 4,
+  ICE_SERVER_ENTRIES: 8,
   ERROR_DETAIL_BYTES: 512,
   DATA_CHUNK_BYTES: 64 * 1024,
   DATA_BUFFER_HIGH_WATER_BYTES: 8 * 1024 * 1024,
@@ -160,6 +166,14 @@ export const DIRECT_FILE_TRANSFER_ICE_SERVERS = [
   'stun:stun.cloudflare.com:3478',
 ] as const;
 
+export interface DirectFileTransferIceServer {
+  urls: string[];
+  username?: string;
+  credential?: string;
+}
+
+export type DirectFileTransferIceServerConfig = string | DirectFileTransferIceServer;
+
 export interface DirectFileTransferInit {
   type: typeof DIRECT_FILE_TRANSFER_MSG.INIT;
   purpose?: DirectFileTransferPurpose;
@@ -174,7 +188,7 @@ export interface DirectFileTransferInit {
 export interface DirectFileTransferAuthority extends Omit<DirectFileTransferInit, 'type'> {
   capability: string;
   expiresAt: number;
-  iceServers: string[];
+  iceServers: DirectFileTransferIceServerConfig[];
 }
 
 export interface DirectFileTransferAuthorized extends DirectFileTransferAuthority {
@@ -419,6 +433,31 @@ function validateMetadata(value: Record<string, unknown>): boolean {
     && (value.sha256 === undefined || (typeof value.sha256 === 'string' && SHA256_RE.test(value.sha256)));
 }
 
+function directIceUrlKind(value: unknown): 'stun' | 'turn' | undefined {
+  if (!isBoundedString(value, DIRECT_FILE_TRANSFER_LIMITS.ICE_SERVER_URL_BYTES) || /\s/.test(value)) return undefined;
+  if (/^stuns?:[^:]/i.test(value)) return 'stun';
+  if (/^turns?:[^:]/i.test(value)) return 'turn';
+  return undefined;
+}
+
+export function isDirectFileTransferIceServerConfig(value: unknown): value is DirectFileTransferIceServerConfig {
+  if (typeof value === 'string') return directIceUrlKind(value) !== undefined;
+  if (!isRecord(value) || !hasExactKeys(value, ['urls'], ['username', 'credential'])) return false;
+  if (!Array.isArray(value.urls)
+    || value.urls.length === 0
+    || value.urls.length > DIRECT_FILE_TRANSFER_LIMITS.ICE_SERVER_URLS_PER_ENTRY) return false;
+  const kinds = value.urls.map(directIceUrlKind);
+  if (kinds.some((kind) => kind === undefined)) return false;
+  const hasTurn = kinds.includes('turn');
+  const hasStun = kinds.includes('stun');
+  if (hasTurn && hasStun) return false;
+  if (hasTurn) {
+    return isBoundedString(value.username, DIRECT_FILE_TRANSFER_LIMITS.ICE_SERVER_USERNAME_BYTES)
+      && isBoundedString(value.credential, DIRECT_FILE_TRANSFER_LIMITS.ICE_SERVER_CREDENTIAL_BYTES);
+  }
+  return value.username === undefined && value.credential === undefined;
+}
+
 function isDirectConnectivityCandidateInfo(value: unknown): value is DirectConnectivityCandidateInfo {
   if (!isRecord(value) || !hasExactKeys(value, ['address', 'port', 'type', 'transportType'])) return false;
   return isBoundedString(value.address, DIRECT_FILE_TRANSFER_LIMITS.PROBE_CANDIDATE_ADDRESS_BYTES)
@@ -506,8 +545,8 @@ function validateAuthorityFields(value: Record<string, unknown>): boolean {
     && Number.isSafeInteger(value.expiresAt)
     && value.expiresAt > 0
     && Array.isArray(value.iceServers)
-    && value.iceServers.length <= 8
-    && value.iceServers.every((entry) => isBoundedString(entry, 2048));
+    && value.iceServers.length <= DIRECT_FILE_TRANSFER_LIMITS.ICE_SERVER_ENTRIES
+    && value.iceServers.every(isDirectFileTransferIceServerConfig);
 }
 
 export function validateDirectFileTransferBrowserMessage(value: unknown): ValidationResult<DirectFileTransferBrowserMessage> {

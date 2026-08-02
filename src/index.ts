@@ -871,9 +871,36 @@ program
   .description('Deploy IM.codes server + daemon on this machine (Docker required)')
   .requiredOption('--domain <domain>', 'Domain name for HTTPS (e.g. imc.example.com)')
   .option('--force', 'Overwrite existing setup')
-  .action(async (opts: { domain: string; force?: boolean }) => {
+  .option('--turn', 'Enable an authenticated coturn relay for WebRTC file transfer')
+  .option('--no-turn', 'Disable a previously configured TURN relay')
+  .option('--turn-host <host>', 'Separate DNS-only TURN hostname (default: turn.<domain>; never orange-cloud proxied)')
+  .option('--turn-port <port>', 'TURN UDP/TCP listener port (default: 3479)')
+  .option('--turn-external-ip <ipv4>', 'Public IPv4 advertised by coturn')
+  .option('--turn-relay-min-port <port>', 'First TURN relay UDP port (default: 49160)')
+  .option('--turn-relay-max-port <port>', 'Last TURN relay UDP port (default: 49200)')
+  .option('--turn-dns-only', 'Confirm the TURN hostname is not proxied by Cloudflare or another HTTP proxy')
+  .action(async (opts: {
+    domain: string;
+    force?: boolean;
+    turn?: boolean;
+    turnHost?: string;
+    turnPort?: string;
+    turnExternalIp?: string;
+    turnRelayMinPort?: string;
+    turnRelayMaxPort?: string;
+    turnDnsOnly?: boolean;
+  }) => {
     const { setupFlow } = await import('./setup/setup-flow.js');
-    await setupFlow(opts.domain, { force: opts.force });
+    await setupFlow(opts.domain, {
+      force: opts.force,
+      turn: opts.turn,
+      turnHost: opts.turnHost,
+      turnPort: opts.turnPort,
+      turnExternalIp: opts.turnExternalIp,
+      turnRelayMinPort: opts.turnRelayMinPort,
+      turnRelayMaxPort: opts.turnRelayMaxPort,
+      turnDnsOnly: opts.turnDnsOnly,
+    });
   });
 
 program

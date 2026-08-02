@@ -36,7 +36,9 @@ import { DAEMON_COMMAND_TYPES } from '../../../shared/daemon-command-types.js';
 import { PEER_AUDIT_COMMAND_ERRORS, PEER_AUDIT_MESSAGES } from '../../../shared/peer-audit.js';
 import { PeerAuditUnicastRouter } from './peer-audit-unicast-router.js';
 import { DirectFileTransferRouter } from './direct-file-transfer-router.js';
+import { createTurnIceServerAuthority } from './turn-credentials.js';
 import {
+  DIRECT_FILE_TRANSFER_AUTHENTICATED_ICE_CAPABILITY,
   DIRECT_FILE_TRANSFER_CAPABILITY,
   isDirectConnectivityRuntimeStatus,
 } from '../../../shared/direct-file-transfer.js';
@@ -1245,7 +1247,11 @@ export class WsBridge {
     daemonSupportsDirect: () => this.daemonP2pWorkflowCapabilities?.capabilities.includes(
       DIRECT_FILE_TRANSFER_CAPABILITY,
     ) ?? false,
+    daemonSupportsAuthenticatedIce: () => this.daemonP2pWorkflowCapabilities?.capabilities.includes(
+      DIRECT_FILE_TRANSFER_AUTHENTICATED_ICE_CAPABILITY,
+    ) ?? false,
     daemonGeneration: () => this.daemonGeneration,
+    iceServers: (userId) => createTurnIceServerAuthority(userId),
     sendDaemon: (message, generation) => this.trySendDirectFileTransfer(message, generation),
     sendBrowser: (socket, message) => { safeSend(socket, JSON.stringify(message)); },
   });
