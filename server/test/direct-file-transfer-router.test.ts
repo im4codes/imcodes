@@ -252,4 +252,90 @@ describe('DirectFileTransferRouter', () => {
       vi.useRealTimers();
     }
   });
+
+  it('keeps an authenticated active transfer authorized while progress continues', () => {
+    vi.useFakeTimers();
+    try {
+      const f = fixture();
+      f.router.handleBrowser(f.browserA, 'user-a', init);
+      const capability = f.messages(f.browserA)[0].capability;
+
+      vi.advanceTimersByTime(DIRECT_FILE_TRANSFER_LIMITS.AUTHORITY_TTL_MS - 1_000);
+      f.router.handleDaemon({
+        type: DIRECT_FILE_TRANSFER_MSG.PROGRESS,
+        requestId: init.requestId,
+        capability,
+        loaded: 1024,
+        total: init.size,
+      }, 3);
+
+      vi.advanceTimersByTime(2_000);
+      expect(f.messages(f.browserA).at(-1)).toMatchObject({
+        type: DIRECT_FILE_TRANSFER_MSG.PROGRESS,
+        loaded: 1024,
+      });
+
+      vi.advanceTimersByTime(DIRECT_FILE_TRANSFER_LIMITS.AUTHORITY_TTL_MS - 2_001);
+      expect(f.messages(f.browserA).at(-1)).toMatchObject({
+        type: DIRECT_FILE_TRANSFER_MSG.PROGRESS,
+        loaded: 1024,
+      });
+
+      vi.advanceTimersByTime(2);
+      expect(f.messages(f.browserA).at(-1)).toMatchObject({
+        type: DIRECT_FILE_TRANSFER_MSG.ERROR,
+        error: 'authority_expired',
+        retryable: true,
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not renew authority for stale generations, forged capabilities, or already-expired routes', () => {
+    vi.useFakeTimers();
+    try {
+      const stale = fixture();
+      stale.router.handleBrowser(stale.browserA, 'user-a', init);
+      const staleCapability = stale.messages(stale.browserA)[0].capability;
+
+      const forged = fixture();
+      forged.router.handleBrowser(forged.browserA, 'user-a', init);
+
+      vi.advanceTimersByTime(DIRECT_FILE_TRANSFER_LIMITS.AUTHORITY_TTL_MS - 1_000);
+      stale.router.handleDaemon({
+        type: DIRECT_FILE_TRANSFER_MSG.PROGRESS,
+        requestId: init.requestId,
+        capability: staleCapability,
+        loaded: 1024,
+        total: init.size,
+      }, 2);
+      forged.router.handleDaemon({
+        type: DIRECT_FILE_TRANSFER_MSG.PROGRESS,
+        requestId: init.requestId,
+        capability: 'forged-capability-value-that-is-long-enough',
+        loaded: 1024,
+        total: init.size,
+      }, 3);
+
+      vi.advanceTimersByTime(1_001);
+      expect(stale.messages(stale.browserA).at(-1)).toMatchObject({ error: 'authority_expired' });
+      expect(forged.messages(forged.browserA).at(-1)).toMatchObject({ error: 'authority_expired' });
+
+      const late = fixture();
+      late.router.handleBrowser(late.browserA, 'user-a', init);
+      const lateCapability = late.messages(late.browserA)[0].capability;
+      vi.setSystemTime(Date.now() + DIRECT_FILE_TRANSFER_LIMITS.AUTHORITY_TTL_MS + 1);
+      late.router.handleDaemon({
+        type: DIRECT_FILE_TRANSFER_MSG.PROGRESS,
+        requestId: init.requestId,
+        capability: lateCapability,
+        loaded: 1024,
+        total: init.size,
+      }, 3);
+      expect(late.messages(late.browserA).at(-1)).toMatchObject({ error: 'authority_expired' });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

@@ -126,6 +126,13 @@ export class DirectFileTransferRouter {
     if (!route || route.daemonGeneration !== daemonGeneration || !capability || !capabilityMatches(route, capability)) {
       return true;
     }
+    if (route.expiresAt <= Date.now()) {
+      this.failRoute(route, DIRECT_FILE_TRANSFER_ERROR.AUTHORITY_EXPIRED, true);
+      return true;
+    }
+    if (parsed.value.type === DIRECT_FILE_TRANSFER_MSG.PROGRESS) {
+      this.renewRouteAuthority(route);
+    }
     const routed = parsed.value.type === DIRECT_FILE_TRANSFER_MSG.DONE
       ? { ...parsed.value, attachment: { ...parsed.value.attachment, serverId: this.hooks.serverId() } }
       : parsed.value.type === DIRECT_FILE_TRANSFER_MSG.STATUS && parsed.value.attachment
@@ -184,11 +191,7 @@ export class DirectFileTransferRouter {
     const generation = this.hooks.daemonGeneration();
     const capability = mintOpaque();
     const expiresAt = Date.now() + DIRECT_FILE_TRANSFER_LIMITS.AUTHORITY_TTL_MS;
-    const timer = setTimeout(() => {
-      const route = this.routes.get(init.requestId);
-      if (route) this.failRoute(route, DIRECT_FILE_TRANSFER_ERROR.AUTHORITY_EXPIRED, true);
-    }, DIRECT_FILE_TRANSFER_LIMITS.AUTHORITY_TTL_MS);
-    timer.unref?.();
+    const timer = this.scheduleRouteExpiry(init.requestId);
     const route: DirectFileTransferRoute = {
       requestId: init.requestId,
       clientUploadId: init.clientUploadId,
@@ -235,6 +238,23 @@ export class DirectFileTransferRouter {
   private failRoute(route: DirectFileTransferRoute, error: string, retryable: boolean): void {
     this.sendError(route.socket, route.requestId, error, retryable);
     this.deleteRoute(route);
+  }
+
+  private scheduleRouteExpiry(requestId: string): ReturnType<typeof setTimeout> {
+    const timer = setTimeout(() => {
+      const route = this.routes.get(requestId);
+      if (route && route.expiresAt <= Date.now()) {
+        this.failRoute(route, DIRECT_FILE_TRANSFER_ERROR.AUTHORITY_EXPIRED, true);
+      }
+    }, DIRECT_FILE_TRANSFER_LIMITS.AUTHORITY_TTL_MS);
+    timer.unref?.();
+    return timer;
+  }
+
+  private renewRouteAuthority(route: DirectFileTransferRoute): void {
+    clearTimeout(route.timer);
+    route.expiresAt = Date.now() + DIRECT_FILE_TRANSFER_LIMITS.AUTHORITY_TTL_MS;
+    route.timer = this.scheduleRouteExpiry(route.requestId);
   }
 
   private deleteRoute(route: DirectFileTransferRoute): void {
