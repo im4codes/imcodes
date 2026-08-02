@@ -3490,11 +3490,11 @@ html.native-ios-mac .chat-dl-btn {
   overflow: hidden;
   border: 1px solid rgba(56, 189, 248, 0.19);
   border-radius: 7px;
-  background:
-    linear-gradient(rgba(56, 189, 248, 0.025) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(56, 189, 248, 0.025) 1px, transparent 1px),
-    linear-gradient(115deg, rgba(8, 47, 73, 0.42), rgba(2, 6, 23, 0.9) 62%, rgba(30, 41, 59, 0.64));
-  background-size: 12px 12px, 12px 12px, auto;
+  /* No graph-paper grid here. The first of those layers drew a horizontal rule
+     every 12px, and a collapsed fold whose content is shorter than its box left
+     that texture bare — which reads as stray separator lines between the
+     messages around it, not as decoration. Plain gradient only. */
+  background: linear-gradient(115deg, rgba(8, 47, 73, 0.42), rgba(2, 6, 23, 0.9) 62%, rgba(30, 41, 59, 0.64));
   box-shadow: inset 0 1px 0 rgba(125, 211, 252, 0.06), 0 2px 8px rgba(0, 0, 0, 0.12);
   transition: border-color 0.16s, box-shadow 0.16s;
 }

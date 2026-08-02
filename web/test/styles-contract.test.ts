@@ -632,4 +632,17 @@ describe('styles.css regression contracts', () => {
     expect(rule).toMatch(/width:\s*100%/);
     expect(rule).not.toMatch(/width:\s*fit-content/);
   });
+  it('the collapsed tool fold must not carry a grid texture', () => {
+    // User reported "多余的线" between messages twice. Root cause: the fold's
+    // background stacked a 12x12 grid, whose first layer is a horizontal rule
+    // every 12px. When the collapsed content is shorter than the box, the bare
+    // texture reads as separator lines between the surrounding messages.
+    const rule = cssWithoutComments.match(/\.chat-tool-block-fold\s*\{[^}]*\}/)?.[0];
+    expect(rule, '.chat-tool-block-fold rule missing').toBeTruthy();
+    // A `1px, transparent 1px` stop is what draws the repeating line.
+    expect(rule).not.toMatch(/1px,\s*transparent\s*1px/);
+    expect(rule).not.toMatch(/background-size:[^;]*12px/);
+    // The card keeps its own gradient — this is about the texture, not the fill.
+    expect(rule).toMatch(/linear-gradient\(115deg/);
+  });
 });
