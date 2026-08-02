@@ -16,11 +16,20 @@ export interface TurnDeploymentTemplateConfig {
   credentialTtlSeconds?: number;
 }
 
-export function dockerComposeTemplate(opts?: { ghcrPrefix?: string; turn?: TurnDeploymentTemplateConfig }): string {
+export function dockerComposeTemplate(opts?: {
+  ghcrPrefix?: string;
+  turn?: TurnDeploymentTemplateConfig;
+  turnImage?: string;
+}): string {
   const ghcr = opts?.ghcrPrefix ?? 'ghcr.io';
+  const turnImage = opts?.turnImage ?? TURN_SERVICE_DEFAULTS.IMAGE;
   const turnService = opts?.turn?.enabled ? `
   turn:
-    image: ${TURN_SERVICE_DEFAULTS.IMAGE}
+    image: ${turnImage}
+    # The pinned image runs as nobody by default, but the REST secret config is
+    # deliberately 0600. Start as root only long enough for coturn to read it;
+    # proc-user/proc-group in turnserver.conf drop the daemon back to nobody.
+    user: "0:0"
     restart: unless-stopped
     ports:
       - "\${TURN_PORT}:\${TURN_PORT}/udp"
@@ -156,6 +165,8 @@ export function turnserverConfigTemplate(turn: Required<Omit<TurnDeploymentTempl
 fingerprint
 use-auth-secret
 static-auth-secret=${turn.sharedSecret}
+proc-user=nobody
+proc-group=nogroup
 realm=${turn.host}
 server-name=${turn.host}
 external-ip=${turn.externalIp}

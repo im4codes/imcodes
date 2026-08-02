@@ -151,12 +151,15 @@ describe('setupFlow contracts', () => {
     expect(sharedSecret).toMatch(/^[a-f0-9]{64}$/);
     expect(compose).toContain('\n  turn:\n');
     expect(compose).toContain('coturn/coturn:4.15.0-alpine');
+    expect(compose).toContain('user: "0:0"');
     expect(compose).toContain('${TURN_PORT}:${TURN_PORT}/udp');
     expect(compose).toContain('${TURN_PORT}:${TURN_PORT}/tcp');
     expect(compose).toContain('${TURN_RELAY_MIN_PORT}-${TURN_RELAY_MAX_PORT}');
     expect(compose).not.toContain(String(sharedSecret));
     expect(setupSecrets).not.toContain(String(sharedSecret));
     expect(turnConfig).toContain(`static-auth-secret=${sharedSecret}`);
+    expect(turnConfig).toContain('proc-user=nobody');
+    expect(turnConfig).toContain('proc-group=nogroup');
     expect(turnConfig).toContain('realm=turn.example.com');
     expect(turnConfig).toContain('external-ip=203.0.113.10');
     expect(turnConfig).toContain('denied-peer-ip=10.0.0.0-10.255.255.255');
@@ -178,6 +181,20 @@ describe('setupFlow contracts', () => {
     expect(statSync(join(projectDir, '.env')).mode & 0o777).toBe(0o600);
     expect(statSync(join(projectDir, '.setup-secrets.json')).mode & 0o777).toBe(0o600);
     expect(statSync(join(projectDir, 'turnserver.conf')).mode & 0o777).toBe(0o600);
+  });
+
+  it('uses the same reachable registry proxy for coturn in mirror mode', async () => {
+    const { dockerComposeTemplate } = await import('../../src/setup/templates.js');
+
+    const compose = dockerComposeTemplate({
+      ghcrPrefix: 'ghcr.nju.edu.cn',
+      turnImage: 'ghcr.nju.edu.cn/coturn/coturn:4.15.0-alpine',
+      turn: { enabled: true },
+    });
+
+    expect(compose).toContain('image: ghcr.nju.edu.cn/im4codes/imcodes:latest');
+    expect(compose).toContain('image: ghcr.nju.edu.cn/coturn/coturn:4.15.0-alpine');
+    expect(compose).not.toContain('\n    image: coturn/coturn:4.15.0-alpine');
   });
 
   it('defaults TURN to a separate DNS-only hostname instead of the proxied application hostname', async () => {

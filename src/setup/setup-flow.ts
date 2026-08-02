@@ -528,7 +528,13 @@ async function writeConfigs(
   await chmod(join(dir, '.env'), 0o600);
 
   await writeFile(join(dir, 'docker-compose.yml'), dockerComposeTemplate(
-    { ...(mirrorMode ? { ghcrPrefix: GHCR_MIRROR_PREFIX } : {}), turn },
+    {
+      ...(mirrorMode ? {
+        ghcrPrefix: GHCR_MIRROR_PREFIX,
+        turnImage: TURN_SERVICE_DEFAULTS.MIRROR_IMAGE,
+      } : {}),
+      turn,
+    },
   ));
   await writeFile(join(dir, 'Caddyfile'), caddyfileTemplate(domain));
   const turnConfigPath = join(dir, 'turnserver.conf');

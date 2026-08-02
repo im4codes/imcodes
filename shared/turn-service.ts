@@ -11,6 +11,7 @@ export const TURN_SERVICE_ENV = {
 
 export const TURN_SERVICE_DEFAULTS = {
   IMAGE: 'coturn/coturn:4.15.0-alpine',
+  MIRROR_IMAGE: 'ghcr.nju.edu.cn/coturn/coturn:4.15.0-alpine',
   PORT: 3479,
   RELAY_MIN_PORT: 49_160,
   RELAY_MAX_PORT: 49_200,
