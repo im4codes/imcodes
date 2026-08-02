@@ -1769,6 +1769,14 @@ html.native-ios-mac .chat-dl-btn {
   }
   .shortcuts-meta-scroll::-webkit-scrollbar { display: none; }
   .shortcuts-meta-scroll.has-open-menu { overflow: visible; }
+  /* Desktop right-aligns these controls because `.shortcuts` (flex: 1) eats the
+     free space and `display: contents` leaves them as direct row children. On
+     mobile the scroller itself is the growing box, so its children would pack
+     to the left of the leftover space instead. Push them back with an auto
+     start margin rather than `justify-content: flex-end`: on an overflowing
+     scroll container flex-end can make the leading items unreachable, whereas
+     the auto margin collapses to 0 once content overflows. */
+  .shortcuts-meta-scroll > :first-child { margin-inline-start: auto; }
   /* Bigger stop tap-target on mobile. Extra height comes from padding that is
      cancelled by equal negative vertical margins, so the button's margin-box
      (which drives the toolbar row height) is unchanged — the toolbar does not

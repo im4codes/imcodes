@@ -295,6 +295,15 @@ describe('styles.css regression contracts', () => {
     expect(mobileMetaScrollerRule![0]).toMatch(/scrollbar-width:\s*none/);
     expect(css).toMatch(/\.shortcuts-meta-scroll::-webkit-scrollbar\s*\{\s*display:\s*none/);
 
+    // The mobile scroller is the flex item that grows, so without an explicit
+    // push its children pack to the left of the leftover space and the meta
+    // controls stop hugging the right edge. An auto start margin restores that
+    // and, unlike justify-content: flex-end, still lets an overflowing scroller
+    // reach its leading items.
+    expect(css).toMatch(
+      /\.shortcuts-meta-scroll\s*>\s*:first-child\s*\{\s*margin-inline-start:\s*auto;\s*\}/,
+    );
+
     const subcardStopRule = css.match(/\.subcard-stop-btn\s*\{[^}]*\}/);
     expect(subcardStopRule).not.toBeNull();
     expect(subcardStopRule![0]).toMatch(/width:\s*40px/);
