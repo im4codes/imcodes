@@ -5,6 +5,7 @@ import {
   MACHINE_DIRECT_FILE_TRANSFER_MSG,
   isValidMachineDirectEncryptedFrameLength,
   isPrivateMachineDirectAddress,
+  refreshMachineDirectUploadAuthority,
   validateMachineDirectSourceHello,
   validateMachineDirectTargetHello,
   validateMachineDirectUploadRequest,
@@ -27,6 +28,15 @@ function request() {
 }
 
 describe('machine direct file-transfer trust boundary', () => {
+  it('refreshes authority from the receiving hop clock regardless of sender clock skew', () => {
+    const receivedAt = Date.parse('2026-08-03T12:00:00.000Z');
+    for (const expiresAt of [receivedAt - 30 * 86_400_000, receivedAt + 30 * 86_400_000]) {
+      expect(refreshMachineDirectUploadAuthority({ ...request(), expiresAt }, receivedAt).expiresAt).toBe(
+        receivedAt + MACHINE_DIRECT_FILE_TRANSFER_LIMITS.AUTHORITY_TTL_MS,
+      );
+    }
+  });
+
   it('accepts routed private candidates but rejects public, loopback, hostnames, and extra keys', () => {
     expect(isPrivateMachineDirectAddress('192.168.2.145')).toBe(true);
     expect(isPrivateMachineDirectAddress('172.16.253.211')).toBe(true);

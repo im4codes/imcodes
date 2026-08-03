@@ -28,6 +28,7 @@ import {
   MACHINE_DIRECT_FILE_TRANSFER_ERROR,
   MACHINE_DIRECT_FILE_TRANSFER_LIMITS,
   MACHINE_DIRECT_FILE_TRANSFER_MSG,
+  refreshMachineDirectUploadAuthority,
   validateMachineDirectUploadRequest,
 } from '../../shared/machine-direct-file-transfer.js';
 import { receiveMachineDirectUpload } from '../daemon/machine-direct-transfer.js';
@@ -181,7 +182,10 @@ export function createControlledNodeRuntime(
         }
         activeMachineDirectUploads.add(parsed.value.requestId);
         try {
-          client.send(await receiveMachineDirectUpload(parsed.value));
+          // This authenticated Server message is fresh. Re-mint the deadline
+          // from the controlled node's clock so Server/target skew cannot turn
+          // a valid direct request into an EXPIRED fallback.
+          client.send(await receiveMachineDirectUpload(refreshMachineDirectUploadAuthority(parsed.value)));
         } finally {
           activeMachineDirectUploads.delete(parsed.value.requestId);
         }

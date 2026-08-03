@@ -48,7 +48,10 @@ export const MACHINE_DIRECT_FILE_TRANSFER_LIMITS = {
   CONNECT_TIMEOUT_MS: 4_000,
   HANDSHAKE_TIMEOUT_MS: 4_000,
   TRANSFER_TIMEOUT_MS: 300_000,
-  AUTHORITY_TTL_MS: 15_000,
+  // This is only the window to begin an authenticated direct connection. Each
+  // control hop re-mints it from its own clock, so it can be generous without
+  // relying on synchronized machines or extending an in-flight transfer.
+  AUTHORITY_TTL_MS: 10 * 60_000,
   MAX_ACCEPT_ATTEMPTS: 4,
   MAX_CONCURRENT_RECEIVERS: 2,
 } as const;
@@ -68,6 +71,22 @@ export interface MachineDirectUploadRequest {
   mime?: string;
   size: number;
   expiresAt: number;
+}
+
+/**
+ * Mint a fresh hop-local authority deadline after an authenticated control hop.
+ * Absolute wall clocks on the Full daemon, Server, and controlled node are not
+ * assumed to be synchronized; each receiver enforces the same short TTL using
+ * its own clock instead of trusting the sender's timestamp.
+ */
+export function refreshMachineDirectUploadAuthority(
+  request: MachineDirectUploadRequest,
+  now = Date.now(),
+): MachineDirectUploadRequest {
+  return {
+    ...request,
+    expiresAt: now + MACHINE_DIRECT_FILE_TRANSFER_LIMITS.AUTHORITY_TTL_MS,
+  };
 }
 
 export interface MachineDirectUploadDone {

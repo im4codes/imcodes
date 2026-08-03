@@ -20,8 +20,17 @@ import type { AuthenticatedWebSocketLike } from '../../src/transport/authenticat
 import {
   MACHINE_DIRECT_FILE_TRANSFER_CAPABILITY,
   MACHINE_DIRECT_FILE_TRANSFER_ERROR,
+  MACHINE_DIRECT_FILE_TRANSFER_LIMITS,
   MACHINE_DIRECT_FILE_TRANSFER_MSG,
 } from '../../shared/machine-direct-file-transfer.js';
+
+const { receiveMachineDirectUploadMock } = vi.hoisted(() => ({
+  receiveMachineDirectUploadMock: vi.fn(),
+}));
+
+vi.mock('../../src/daemon/machine-direct-transfer.js', () => ({
+  receiveMachineDirectUpload: receiveMachineDirectUploadMock,
+}));
 
 class MockSocket extends EventEmitter implements AuthenticatedWebSocketLike {
   readyState = 0;
@@ -33,6 +42,8 @@ class MockSocket extends EventEmitter implements AuthenticatedWebSocketLike {
 
 const temporaryDirs: string[] = [];
 afterEach(async () => {
+  vi.restoreAllMocks();
+  receiveMachineDirectUploadMock.mockReset();
   await Promise.all(temporaryDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
 });
 
@@ -129,7 +140,14 @@ describe('controlled node enrollment and runtime', () => {
     runtime.stop();
   });
 
-  it('strictly validates machine-direct control and returns a bounded terminal error', async () => {
+  it('strictly validates machine-direct control and refreshes authority from the controlled-node clock', async () => {
+    const receivedAt = Date.parse('2026-08-03T12:00:00.000Z');
+    vi.spyOn(Date, 'now').mockReturnValue(receivedAt);
+    receiveMachineDirectUploadMock.mockResolvedValue({
+      type: MACHINE_DIRECT_FILE_TRANSFER_MSG.ERROR,
+      requestId: 'r'.repeat(32),
+      error: MACHINE_DIRECT_FILE_TRANSFER_ERROR.CONNECT_FAILED,
+    });
     const socket = new MockSocket();
     const runtime = createControlledNodeRuntime({
       serverUrl: 'https://im.example',
@@ -145,9 +163,9 @@ describe('controlled node enrollment and runtime', () => {
       clientUploadId: 'c'.repeat(32),
       capability: 'A'.repeat(43),
       candidates: [{ host: '192.168.2.145', port: 45123 }],
-      originalName: 'expired.txt',
+      originalName: 'clock-skewed.txt',
       size: 1,
-      expiresAt: Date.now() - 1,
+      expiresAt: receivedAt - 30 * 86_400_000,
     };
     const before = socket.sent.length;
     socket.emit('message', JSON.stringify({ ...request, injected: true }));
@@ -155,11 +173,16 @@ describe('controlled node enrollment and runtime', () => {
     expect(socket.sent).toHaveLength(before);
 
     socket.emit('message', JSON.stringify(request));
-    await vi.waitFor(() => expect(socket.sent.slice(before).map((raw) => JSON.parse(raw))).toContainEqual({
+    await vi.waitFor(() => expect(receiveMachineDirectUploadMock).toHaveBeenCalledOnce());
+    expect(receiveMachineDirectUploadMock).toHaveBeenCalledWith(expect.objectContaining({
+      requestId: request.requestId,
+      expiresAt: receivedAt + MACHINE_DIRECT_FILE_TRANSFER_LIMITS.AUTHORITY_TTL_MS,
+    }));
+    expect(socket.sent.slice(before).map((raw) => JSON.parse(raw))).toContainEqual({
       type: MACHINE_DIRECT_FILE_TRANSFER_MSG.ERROR,
       requestId: request.requestId,
-      error: MACHINE_DIRECT_FILE_TRANSFER_ERROR.EXPIRED,
-    }));
+      error: MACHINE_DIRECT_FILE_TRANSFER_ERROR.CONNECT_FAILED,
+    });
     runtime.stop();
   });
 

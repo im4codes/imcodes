@@ -172,6 +172,7 @@ describe('file-transfer upload route', () => {
         originalName: 'report.txt', size: 5, createdAt: new Date().toISOString(), downloadable: true,
       },
     });
+    const beforeDispatch = Date.now();
     const res = await makeApp().request('/api/server/controlled-1/machine-direct-upload', {
       method: 'POST',
       headers: { Authorization: 'Bearer source', 'X-Server-Id': 'full-1', 'Content-Type': 'application/json' },
@@ -185,9 +186,13 @@ describe('file-transfer upload route', () => {
     expect(hasDaemonCapabilityMock).toHaveBeenCalledWith(MACHINE_DIRECT_FILE_TRANSFER_CAPABILITY);
     expect(sendFileTransferRequestMock).toHaveBeenCalledWith(
       request.requestId,
-      request,
+      expect.objectContaining({ ...request, expiresAt: expect.any(Number) }),
       MACHINE_DIRECT_FILE_TRANSFER_LIMITS.TRANSFER_TIMEOUT_MS,
     );
+    const forwarded = sendFileTransferRequestMock.mock.calls[0]?.[1] as { expiresAt: number };
+    expect(forwarded.expiresAt).toBeGreaterThanOrEqual(beforeDispatch + MACHINE_DIRECT_FILE_TRANSFER_LIMITS.AUTHORITY_TTL_MS);
+    expect(forwarded.expiresAt).toBeLessThanOrEqual(Date.now() + MACHINE_DIRECT_FILE_TRANSFER_LIMITS.AUTHORITY_TTL_MS);
+    expect(forwarded.expiresAt).not.toBe(request.expiresAt);
     expect(JSON.stringify(sendFileTransferRequestMock.mock.calls[0]?.[1])).not.toContain('content');
   });
 
@@ -222,23 +227,35 @@ describe('file-transfer upload route', () => {
   });
 
   it.each([
-    ['expired', -1],
-    ['beyond authority ttl', MACHINE_DIRECT_FILE_TRANSFER_LIMITS.AUTHORITY_TTL_MS + 1_000],
-  ])('rejects %s machine-direct authority before dispatch', async (_label, offset) => {
+    ['slow by 30 days', -30 * 86_400_000],
+    ['fast by 30 days', 30 * 86_400_000],
+  ])('accepts a source clock that is %s and forwards a Server-local authority', async (_label, offset) => {
     queryOneMock.mockResolvedValue({ user_id: 'user-1', node_role: 'controlled', exec_enabled: true, revoked_at: null });
+    const requestId = 'r'.repeat(32);
+    sendFileTransferRequestMock.mockResolvedValueOnce({
+      type: MACHINE_DIRECT_FILE_TRANSFER_MSG.DONE,
+      requestId,
+      attachment: {
+        id: 'b'.repeat(32), source: 'upload', serverId: '', daemonPath: '/uploads/x',
+        originalName: 'x', size: 1, createdAt: new Date().toISOString(), downloadable: true,
+      },
+    });
+    const beforeDispatch = Date.now();
     const res = await makeApp().request('/api/server/controlled-1/machine-direct-upload', {
       method: 'POST',
       headers: { Authorization: 'Bearer source', 'X-Server-Id': 'full-1', 'Content-Type': 'application/json' },
       body: JSON.stringify({
         type: MACHINE_DIRECT_FILE_TRANSFER_MSG.REQUEST,
-        requestId: 'r'.repeat(32), clientUploadId: 'c'.repeat(32), capability: 'A'.repeat(43),
+        requestId, clientUploadId: 'c'.repeat(32), capability: 'A'.repeat(43),
         candidates: [{ host: '192.168.2.145', port: 1234 }], originalName: 'x', size: 1,
         expiresAt: Date.now() + offset,
       }),
     });
-    expect(res.status).toBe(400);
-    await expect(res.json()).resolves.toEqual({ error: 'invalid_expiry' });
-    expect(sendFileTransferRequestMock).not.toHaveBeenCalled();
+    expect(res.status).toBe(200);
+    const forwarded = sendFileTransferRequestMock.mock.calls[0]?.[1] as { expiresAt: number };
+    expect(forwarded.expiresAt).toBeGreaterThanOrEqual(beforeDispatch + MACHINE_DIRECT_FILE_TRANSFER_LIMITS.AUTHORITY_TTL_MS);
+    expect(forwarded.expiresAt).toBeLessThanOrEqual(Date.now() + MACHINE_DIRECT_FILE_TRANSFER_LIMITS.AUTHORITY_TTL_MS);
+    expect(forwarded.expiresAt).not.toBe(beforeDispatch + offset);
   });
 
   it('denies controlled-node file access from browser-style auth before dispatch', async () => {
