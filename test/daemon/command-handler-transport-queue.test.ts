@@ -57,6 +57,7 @@ const {
   terminalRequestSnapshotMock,
   supervisionDecideMock,
   queueTaskIntentMock,
+  cancelForUserStopMock,
   registerTaskIntentMock,
   applySnapshotUpdateMock,
   updateQueuedTaskIntentMock,
@@ -92,6 +93,7 @@ const {
   terminalRequestSnapshotMock: vi.fn(),
   supervisionDecideMock: vi.fn(async () => ({ decision: 'complete', reason: 'ok', confidence: 0.9 })),
   queueTaskIntentMock: vi.fn(),
+  cancelForUserStopMock: vi.fn(),
   registerTaskIntentMock: vi.fn(),
   applySnapshotUpdateMock: vi.fn(),
   updateQueuedTaskIntentMock: vi.fn(),
@@ -337,6 +339,7 @@ vi.mock('../../src/daemon/supervision-automation.js', () => ({
     init: vi.fn(),
     setServerLink: vi.fn(),
     cancelSession: vi.fn(),
+    cancelForUserStop: cancelForUserStopMock,
     queueTaskIntent: queueTaskIntentMock,
     registerTaskIntent: registerTaskIntentMock,
     applySnapshotUpdate: applySnapshotUpdateMock,
@@ -1454,6 +1457,27 @@ describe('handleWebCommand transport queue behavior', () => {
     expect(launchTransportSessionMock.mock.calls.at(-1)?.[0]).not.toHaveProperty('bindExistingKey');
     expect(launchTransportSessionMock.mock.calls.at(-1)?.[0]).not.toHaveProperty('codexSessionId');
     expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'command.ack', { commandId: 'cmd-clear-codex', status: 'accepted' });
+  });
+
+  it('stands supervision down on stop even when the session has no transport runtime', async () => {
+    // The supervision stand-down used to sit after two early returns that a
+    // process/tmux agent — and a transport session whose runtime had already
+    // gone — both fell out of, so STOP left the automation armed and it kept
+    // sending continue prompts.
+    cancelForUserStopMock.mockClear();
+    getTransportRuntimeMock.mockReturnValue(undefined);
+    getSessionMock.mockReturnValue({
+      name: 'deck_tmux_worker',
+      agentType: 'claude-code',
+      runtimeType: 'process',
+    });
+
+    handleWebCommand(
+      { type: 'session.cancel', session: 'deck_tmux_worker', commandId: 'cmd-stop-process' },
+      serverLink as any,
+    );
+
+    expect(cancelForUserStopMock).toHaveBeenCalledWith('deck_tmux_worker');
   });
 
   it('dispatches direct session.cancel immediately for transport sessions without emitting /stop text', async () => {

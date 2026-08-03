@@ -2293,6 +2293,20 @@ function cancelTransportTurnNow(
 ): boolean {
   const stopRuntime = getTransportRuntime(sessionName);
   const stopRecord = getSession(sessionName);
+  // Stand supervision down FIRST, before any early return.
+  //
+  // This used to live inside the async block far below, which is only reached
+  // when the session is a transport session AND its runtime is still live. Every
+  // other stop fell out at one of the two returns underneath and left the
+  // supervision state machine fully armed, so STOP visibly did not stop the
+  // automatic "continue" prompts: process/tmux agents bailed at the
+  // `isTransportStop` check, and transport sessions whose runtime had already
+  // gone bailed at the `!stopRuntime` check.
+  //
+  // It is safe to run for a session this function then declines to handle: both
+  // calls are idempotent no-ops when nothing is armed.
+  supervisionAutomation.cancelForUserStop(sessionName);
+  peerAuditService.invalidateCancel(sessionName);
   const isTransportStop = !!stopRuntime
     || stopRecord?.runtimeType === 'transport'
     || (typeof stopRecord?.agentType === 'string' && isTransportAgent(stopRecord.agentType));
@@ -2320,8 +2334,6 @@ function cancelTransportTurnNow(
   // - web/test/components/SessionControls.test.tsx
   void (async () => {
     try {
-      supervisionAutomation.cancelSession(sessionName);
-      peerAuditService.invalidateCancel(sessionName);
       await stopRuntime.cancel();
       // Mark session for fresh start so daemon restart doesn't resume the
       // stuck conversation.

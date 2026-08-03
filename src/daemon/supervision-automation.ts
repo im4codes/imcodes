@@ -672,6 +672,37 @@ class SupervisionAutomation {
     this.clearStatus(sessionName);
   }
 
+  /**
+   * Stand supervision down because the user pressed STOP on `sessionName`.
+   *
+   * STOP has to mean "everything driving this session stops", not just "this
+   * session's own run stops". A supervised-audit run lives on the *supervisor*
+   * session and drives its `auditTargetSessionName`, so cancelling only the
+   * stopped session left the driver armed: it kept waking on its deadline and
+   * re-sending continue prompts at the session the user had just stopped.
+   * Sweep the drivers too — their awaited reply can never arrive now, so the
+   * honest outcome is a cancelled audit rather than a timeout much later.
+   */
+  cancelForUserStop(sessionName: string): void {
+    this.cancelSession(sessionName);
+    for (const run of [...this.activeRuns.values()]) {
+      if (run.sessionName === sessionName) continue;
+      if (run.snapshot.auditTargetSessionName !== sessionName) continue;
+      if (run.phase === 'auditing' && run.auditAttemptId) {
+        this.clearAuditDeadline(run);
+        this.clearAuditTargetRecovery(run);
+        this.emitOrchestratedAuditResult(run, 'cancelled', 'audit_target_user_stopped');
+      }
+      this.clearWaitingTimeout(run);
+      this.activeRuns.delete(run.sessionName);
+      this.clearStatus(run.sessionName);
+      this.emitWarning(
+        run.sessionName,
+        `Supervision stopped: ${sessionName} was stopped by the user, so its audit cannot complete.`,
+      );
+    }
+  }
+
   applySnapshotUpdate(sessionName: string, snapshot: SessionSupervisionSnapshot | null | undefined): void {
     peerAuditService.applyAutomaticConfiguration(
       sessionName,

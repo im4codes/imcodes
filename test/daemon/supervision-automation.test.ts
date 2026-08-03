@@ -2497,6 +2497,53 @@ describe('SupervisionAutomation', () => {
     if (after) expect(after.generation).toBe(parkedGeneration);
   });
 
+  it('stops the supervisor that drives a session the user stopped', async () => {
+    // STOP on the audit TARGET used to leave the driving run on the supervisor
+    // session armed, so it woke on its deadline and kept re-sending continue
+    // prompts at the session the user had just stopped.
+    const snapshot = await seedSession('supervised_audit');
+    mockSupervisionDecide.mockResolvedValue({
+      decision: 'waiting',
+      reason: 'blocked awaiting the delegated audit verdict',
+      confidence: 0.9,
+    });
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-stop-target', 'task', snapshot);
+    beginRun('cmd-stop-target', 'task');
+    completeTurn('Blocked on the audit reply.');
+    await vi.waitFor(async () => {
+      expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeDefined();
+    }, { timeout: 4_000 });
+
+    // The user stops the TARGET, not the supervisor.
+    supervisionAutomation.cancelForUserStop('deck_sub_reviewer');
+
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
+    // Never leave teardown to the behaviour under test.
+    supervisionAutomation.cancelSession('deck_supervision_brain');
+  });
+
+  it('cancels the stopped session\'s own run as well', async () => {
+    const snapshot = await seedSession('supervised_audit');
+    mockSupervisionDecide.mockResolvedValue({
+      decision: 'waiting',
+      reason: 'blocked awaiting the delegated audit verdict',
+      confidence: 0.9,
+    });
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-stop-self', 'task', snapshot);
+    beginRun('cmd-stop-self', 'task');
+    completeTurn('Blocked on the audit reply.');
+    await vi.waitFor(async () => {
+      expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeDefined();
+    }, { timeout: 4_000 });
+
+    supervisionAutomation.cancelForUserStop('deck_supervision_brain');
+
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
+    supervisionAutomation.cancelSession('deck_supervision_brain');
+  });
+
   it('does not let a cancelled run\'s park timer terminate a later run', async () => {
     // `generation` restarts at 1 when a run is cancelled rather than replaced,
     // so a surviving timer from run A matched run B on generation+phase and
