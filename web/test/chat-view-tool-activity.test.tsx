@@ -18,6 +18,12 @@ vi.mock('react-i18next', () => ({
       }
       if (key === 'chat.tool_activity_expand') return 'Expand tool details';
       if (key === 'chat.tool_activity_collapse') return 'Collapse tool details';
+      if (key === 'chat.tool_peek_command') return 'Command';
+      if (key === 'chat.tool_peek_output') return 'Output';
+      if (key === 'chat.tool_peek_running') return 'Running';
+      if (key === 'chat.tool_peek_done') return 'Done';
+      if (key === 'chat.tool_peek_failed') return 'Failed';
+      if (key === 'chat.tool_peek_waiting') return 'Waiting for output…';
       return key.split('.').pop() ?? key;
     },
   }),
@@ -68,8 +74,27 @@ function makeEvent(
   } as TimelineEvent;
 }
 
+/** jsdom has no matchMedia; the peek is gated on a real hover pointer. */
+function stubHover(hover: boolean) {
+  const impl = ((query: string) => ({
+    matches: query.includes('hover: hover') ? hover : false,
+    media: query,
+    addEventListener: () => undefined,
+    removeEventListener: () => undefined,
+    addListener: () => undefined,
+    removeListener: () => undefined,
+    onchange: null,
+    dispatchEvent: () => false,
+  })) as unknown as typeof window.matchMedia;
+  vi.stubGlobal('matchMedia', impl);
+  window.matchMedia = impl;
+}
+
 describe('ChatView compact tool activity', () => {
-  afterEach(() => cleanup());
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+  });
 
   it('shows live aggregate counts and expands exact tool details on demand', () => {
     const readCall = makeEvent('read-call', 'tool.call', {
@@ -408,5 +433,93 @@ describe('ChatView compact tool activity', () => {
 
     // Documents the known limit of the id-less path: one call cannot pair.
     expect(container.querySelector('.chat-tool-activity-stat.is-running')?.textContent).toBe('●1');
+  });
+
+  it('reveals the whole last command and its output on hover, not the one-line preview', () => {
+    stubHover(true);
+    const call = makeEvent('peek-call', 'tool.call', {
+      tool: 'Bash',
+      input: { command: 'npm run build \\\n  --workspace web' },
+    }, 1);
+    const result = makeEvent('peek-result', 'tool.result', {
+      output: 'built in 4.2s\n  dist/index.js  120kb',
+    }, 2);
+
+    const { container } = render(<ChatView events={[call, result]} loading={false} />);
+
+    // The chip itself stays one line — the peek is what carries the detail.
+    expect(container.querySelector('.chat-tool-activity-last-input')?.textContent)
+      .toBe('npm run build \\');
+    expect(document.querySelector('.chat-tool-peek')).toBeNull();
+
+    fireEvent.mouseEnter(container.querySelector('.chat-tool-activity') as HTMLElement);
+
+    const peek = document.querySelector('.chat-tool-peek');
+    expect(peek).not.toBeNull();
+    expect(peek?.textContent).toContain('Bash');
+    expect(peek?.textContent).toContain('Done');
+    // Both lines of the command, and the real output — neither is truncated.
+    expect(peek?.textContent).toContain('npm run build \\\n  --workspace web');
+    expect(peek?.textContent).toContain('built in 4.2s\n  dist/index.js  120kb');
+
+    fireEvent.mouseLeave(container.querySelector('.chat-tool-activity') as HTMLElement);
+    expect(document.querySelector('.chat-tool-peek')).toBeNull();
+  });
+
+  it('updates an open peek when the running tool produces its result', () => {
+    stubHover(true);
+    const call = makeEvent('live-call', 'tool.call', {
+      tool: 'Bash',
+      input: { command: 'sleep 1' },
+    }, 1);
+
+    const { container, rerender } = render(<ChatView events={[call]} loading={false} />);
+    fireEvent.mouseEnter(container.querySelector('.chat-tool-activity') as HTMLElement);
+
+    expect(document.querySelector('.chat-tool-peek')?.classList.contains('is-running')).toBe(true);
+    expect(document.querySelector('.chat-tool-peek')?.textContent).toContain('Waiting for output…');
+    expect(document.querySelector('.chat-tool-peek-pending')).not.toBeNull();
+
+    const result = makeEvent('live-result', 'tool.result', { output: 'slept' }, 2);
+    rerender(<ChatView events={[call, result]} loading={false} />);
+
+    // Same hover, no re-enter: the panel tracks the live event stream.
+    const peek = document.querySelector('.chat-tool-peek');
+    expect(peek?.classList.contains('is-running')).toBe(false);
+    expect(document.querySelector('.chat-tool-peek-pending')).toBeNull();
+    expect(peek?.textContent).toContain('slept');
+  });
+
+  it('surfaces the failure text instead of an empty output block', () => {
+    stubHover(true);
+    const call = makeEvent('fail-call', 'tool.call', {
+      tool: 'Write',
+      input: { file_path: 'locked.txt' },
+    }, 1);
+    const result = makeEvent('fail-result', 'tool.result', { error: 'EACCES: permission denied' }, 2);
+
+    const { container } = render(<ChatView events={[call, result]} loading={false} />);
+    fireEvent.mouseEnter(container.querySelector('.chat-tool-activity') as HTMLElement);
+
+    const peek = document.querySelector('.chat-tool-peek');
+    expect(peek?.classList.contains('is-failed')).toBe(true);
+    expect(peek?.textContent).toContain('Failed');
+    expect(peek?.textContent).toContain('EACCES: permission denied');
+  });
+
+  it('stays closed on touch clients, where hover would fight the expand tap', () => {
+    stubHover(false);
+    const call = makeEvent('touch-call', 'tool.call', { tool: 'Bash', input: { command: 'ls' } }, 1);
+    const result = makeEvent('touch-result', 'tool.result', { output: 'a b c' }, 2);
+
+    const { container } = render(<ChatView events={[call, result]} loading={false} />);
+    const chip = container.querySelector('.chat-tool-activity') as HTMLElement;
+
+    fireEvent.mouseEnter(chip);
+    expect(document.querySelector('.chat-tool-peek')).toBeNull();
+
+    // The tap still toggles the existing details, unchanged.
+    fireEvent.click(chip);
+    expect(container.querySelector('.chat-tool-activity-details')).not.toBeNull();
   });
 });

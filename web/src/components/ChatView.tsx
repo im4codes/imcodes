@@ -5,7 +5,7 @@
  */
 import { h } from 'preact';
 import { useEffect, useLayoutEffect, useRef, useState, useMemo, useCallback } from 'preact/hooks';
-import { memo } from 'preact/compat';
+import { memo, createPortal } from 'preact/compat';
 import { useTranslation } from 'react-i18next';
 import type {
   TimelineEvent,
@@ -819,6 +819,10 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
             input: `${input} ${status}`.trim(),
             _merged: true,
             _toolFailed: Boolean(next.payload.error),
+            // The failure text only survived inside the composed `input` string
+            // (as "✗ <error>"), so anything wanting the real reason had to parse
+            // it back out. Keep it verbatim for the hover peek.
+            ...(next.payload.error ? { _toolError: String(next.payload.error) } : {}),
             // The merged event keeps the CALL's ts (so ordering is unchanged);
             // the result's ts is the only record of when the tool finished, and
             // without it a completed tool has no computable duration.
@@ -3303,9 +3307,14 @@ function getToolActivityCounts(events: TimelineEvent[]) {
  */
 function getLastToolActivity(events: TimelineEvent[], nowMs: number): {
   running: boolean;
+  failed: boolean;
   durationMs: number | null;
   toolName: string;
   toolInput: string;
+  /** Untruncated output of the finished call — null while it is still running. */
+  toolOutput: string | null;
+  /** Failure text when the call ended in an error. */
+  toolError: string | null;
 } | null {
   // Walk back to the newest `tool.call`. The last event in a group is often a
   // standalone `tool.result` (its call fell outside the merge window), and a
@@ -3335,7 +3344,109 @@ function getLastToolActivity(events: TimelineEvent[], nowMs: number): {
     else if (finishedAt !== null) durationMs = Math.max(0, finishedAt - startedAt);
   }
 
-  return { running, durationMs, toolName, toolInput };
+  // The hover peek shows the real result, so read the untruncated output the
+  // merge step stashed rather than the one-line chip preview. `_output` is the
+  // already-formatted string; fall back to the raw payload for events that were
+  // merged before it existed (or whose output only became non-empty later).
+  const failed = call.payload._toolFailed === true || Boolean(call.payload.error);
+  const toolError = failed
+    ? String(call.payload._toolError ?? call.payload.error ?? '') || null
+    : null;
+  const toolOutput = running
+    ? null
+    : (typeof call.payload._output === 'string' && call.payload._output)
+      || formatToolOutputPreview(call.payload._resultPayloadOutput)
+      || null;
+
+  return { running, failed, durationMs, toolName, toolInput, toolOutput, toolError };
+}
+
+/**
+ * Hover peek for the Simple-view tool chip: the last full command and the
+ * output it produced. Portalled to `document.body` because the chat scroller
+ * clips overflow, and anchored to the chip's viewport rect so it survives the
+ * timeline scrolling underneath it.
+ */
+function ToolActivityPeek({
+  anchor,
+  toolName,
+  command,
+  output,
+  error,
+  running,
+  failed,
+  duration,
+}: {
+  anchor: DOMRect;
+  toolName: string;
+  command: string;
+  output: string | null;
+  error: string | null;
+  running: boolean;
+  failed: boolean;
+  duration: string | null;
+}) {
+  const { t } = useTranslation();
+  if (typeof document === 'undefined') return null;
+
+  const margin = 8;
+  const width = Math.min(560, Math.max(280, window.innerWidth - margin * 2));
+  // Prefer above the chip (the chip sits under the reply text, so upward keeps
+  // the message readable); flip below only when there is not enough room.
+  const spaceAbove = anchor.top;
+  const placeBelow = spaceAbove < 220 && window.innerHeight - anchor.bottom > spaceAbove;
+  const left = Math.min(
+    Math.max(margin, anchor.left),
+    Math.max(margin, window.innerWidth - width - margin),
+  );
+  const maxHeight = Math.max(
+    140,
+    (placeBelow ? window.innerHeight - anchor.bottom : anchor.top) - margin * 2,
+  );
+  const position = placeBelow
+    ? { top: `${anchor.bottom + margin}px` }
+    : { bottom: `${window.innerHeight - anchor.top + margin}px` };
+
+  const status = running
+    ? t('chat.tool_peek_running')
+    : failed
+      ? t('chat.tool_peek_failed')
+      : t('chat.tool_peek_done');
+
+  return createPortal((
+    <div
+      class={`chat-tool-peek${running ? ' is-running' : ''}${failed ? ' is-failed' : ''}`}
+      style={{ left: `${left}px`, width: `${width}px`, maxHeight: `${maxHeight}px`, ...position }}
+      role="tooltip"
+    >
+      <div class="chat-tool-peek-frame" aria-hidden="true" />
+      <div class="chat-tool-peek-head">
+        <span class="chat-tool-peek-dot" aria-hidden="true" />
+        <span class="chat-tool-peek-tool">{toolName}</span>
+        <span class="chat-tool-peek-status">{status}</span>
+        {duration && <span class="chat-tool-peek-duration">{duration}</span>}
+      </div>
+      <div class="chat-tool-peek-body">
+        <div class="chat-tool-peek-section">
+          <span class="chat-tool-peek-label">{t('chat.tool_peek_command')}</span>
+          <pre class="chat-tool-peek-pre">{command || t('chat.tool_peek_empty')}</pre>
+        </div>
+        <div class="chat-tool-peek-section">
+          <span class="chat-tool-peek-label">{t('chat.tool_peek_output')}</span>
+          {running ? (
+            <div class="chat-tool-peek-pending">
+              <span class="chat-tool-peek-pending-bar" aria-hidden="true" />
+              {t('chat.tool_peek_waiting')}
+            </div>
+          ) : (
+            <pre class={`chat-tool-peek-pre${failed ? ' is-failed' : ''}`}>
+              {error || output || t('chat.tool_peek_empty')}
+            </pre>
+          )}
+        </div>
+      </div>
+    </div>
+  ), document.body);
 }
 
 /** One-line live tool telemetry for Simple view; expands details on demand. */
@@ -3358,6 +3469,10 @@ function ToolActivitySummary({
 }) {
   const { t } = useTranslation();
   const [expanded, setExpanded] = useState(false);
+  // Anchor rect, not a boolean: the peek is portalled out of the scroller, so it
+  // needs the chip's viewport position. Re-measured on every open so scrolling
+  // between hovers cannot leave it stranded.
+  const [peekAnchor, setPeekAnchor] = useState<DOMRect | null>(null);
   const counts = getToolActivityCounts(events);
   // Tick only while something is actually running: a settled group must not keep
   // a timer alive, and the shared ticker stops once its last listener leaves.
@@ -3371,6 +3486,14 @@ function ToolActivitySummary({
   const action = expanded
     ? t('chat.tool_activity_collapse')
     : t('chat.tool_activity_expand');
+  // Touch clients have no hover; opening the peek on a tap would fight the
+  // expand toggle, so it stays a pointer/keyboard affordance.
+  const openPeek = (element: HTMLElement | null) => {
+    if (!last || !element) return;
+    if (typeof window !== 'undefined' && window.matchMedia
+      && !window.matchMedia('(hover: hover)').matches) return;
+    setPeekAnchor(element.getBoundingClientRect());
+  };
 
   if (counts.total === 0) return null;
 
@@ -3381,8 +3504,11 @@ function ToolActivitySummary({
         class={`chat-tool-activity${counts.running > 0 ? ' is-running' : ''}${counts.failed > 0 ? ' has-error' : ''}`}
         aria-expanded={expanded}
         aria-label={`${summary}. ${action}`}
-        title={[summary, last && [last.toolName, last.toolInput].filter(Boolean).join(' '), lastDuration].filter(Boolean).join(' · ')}
-        onClick={() => setExpanded((value) => !value)}
+        onMouseEnter={(e) => openPeek(e.currentTarget as HTMLElement)}
+        onMouseLeave={() => setPeekAnchor(null)}
+        onFocus={(e) => openPeek(e.currentTarget as HTMLElement)}
+        onBlur={() => setPeekAnchor(null)}
+        onClick={() => { setPeekAnchor(null); setExpanded((value) => !value); }}
       >
         <span class="chat-tool-activity-core" aria-hidden="true" />
         <span class="chat-tool-activity-label">{t('chat.tool_activity_label')}</span>
@@ -3421,6 +3547,18 @@ function ToolActivitySummary({
         </span>
         <span class="chat-tool-activity-chevron" aria-hidden="true">⌄</span>
       </button>
+      {peekAnchor && last && (
+        <ToolActivityPeek
+          anchor={peekAnchor}
+          toolName={last.toolName}
+          command={last.toolInput}
+          output={last.toolOutput}
+          error={last.toolError}
+          running={last.running}
+          failed={last.failed}
+          duration={lastDuration}
+        />
+      )}
       <span class="chat-tool-activity-live" role="status" aria-live="polite" aria-atomic="true">{summary}</span>
       {expanded && (
         <div class="chat-tool-activity-details">
