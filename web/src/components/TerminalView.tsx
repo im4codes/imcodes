@@ -38,6 +38,25 @@ const PREVIEW_DIFF_SUPPRESS_AFTER_RAW_MS = 1000;
  * they did not, a frame with rows=1 and lines=[[1000, …]] dropped the line from
  * the array but still emitted `\x1b[1001;1H` to the terminal.
  */
+/**
+ * Resolves the row bounds for one diff frame.
+ *
+ * `declaredRows` is what the frame actually claims, or `null` when it claims
+ * nothing usable; `rows` is the bound to test line indices against. They differ
+ * on purpose: a frame with no usable `rows` must still paint its lines, because
+ * the original code sized the buffer with `lines.slice(0, diff.rows)` and
+ * `slice(0, undefined)` keeps everything. Collapsing an absent `rows` to 0 made
+ * every line fail the bounds test and blanked the buffer, so incremental frames
+ * stopped rendering and output only appeared when the next full frame redrew
+ * the whole screen at once.
+ */
+export function resolveDiffRows(rawRows: unknown): { declaredRows: number | null; rows: number } {
+  const declaredRows = Number.isFinite(rawRows)
+    ? Math.max(0, Math.min(Math.floor(rawRows as number), TERMINAL_MAX_ROWS))
+    : null;
+  return { declaredRows, rows: declaredRows ?? TERMINAL_MAX_ROWS };
+}
+
 export function isRenderableLineIndex(lineIdx: unknown, rows: number): lineIdx is number {
   return Number.isInteger(lineIdx)
     && (lineIdx as number) >= 0
@@ -407,17 +426,22 @@ export function TerminalView({ sessionName, ws, connected, active = true, previe
     // `rows` and every `lineIdx` arrive over the wire. Clamp before growing the
     // array: the loops below are synchronous, so a single bad value would lock
     // the main thread hard enough that the tab cannot even process a reload.
-    const rows = Number.isFinite(diff.rows)
-      ? Math.max(0, Math.min(Math.floor(diff.rows), TERMINAL_MAX_ROWS))
-      : 0;
+    //
+    // See resolveDiffRows: an absent `rows` bounds allocation but must not be
+    // read as "zero rows", or incremental frames stop painting entirely.
+    const { declaredRows, rows } = resolveDiffRows(diff.rows);
     const lines = linesRef.current;
     for (const [lineIdx, content] of diff.lines) {
       if (!isRenderableLineIndex(lineIdx, rows)) continue;
       while (lines.length <= lineIdx) lines.push('');
       lines[lineIdx] = content;
     }
-    while (lines.length < rows) lines.push('');
-    linesRef.current = lines.slice(0, rows);
+    if (declaredRows !== null) {
+      while (lines.length < declaredRows) lines.push('');
+      linesRef.current = lines.slice(0, declaredRows);
+    } else {
+      linesRef.current = lines;
+    }
 
     if (diff.fullFrame) {
       // Full frame: rewrite entire screen from cursor home

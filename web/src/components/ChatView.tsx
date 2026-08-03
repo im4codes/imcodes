@@ -756,28 +756,43 @@ function getFinalVisibleEventIds(events: TimelineEvent[], showToolCalls: boolean
  * producing only 3 DOM mutations — the output was identical, so the DOM was
  * spared, but the JS cost was paid in full and saturated a slow CPU.
  *
- * Keyed by the two source events' identity (plus the streaming-dedup index) so
- * the same inputs always yield the same object back. Bounded, and keyed by
- * eventId pairs which are stable across renders.
+ * Keyed on the two source OBJECTS, not on their eventIds.
+ *
+ * An eventId-keyed cache is wrong here, and wrong in the direction that silently
+ * stops output from updating: a tool result keeps its eventId while its payload
+ * changes — streaming output grows under the same id, and the detail-hydration
+ * path replaces a truncated payload with the full one under the same id. Keyed
+ * by id, the first (shortest) merge wins forever and the real output never
+ * reaches the screen.
+ *
+ * `useTimeline` updates events immutably (`{ ...existing, payload }`), so a new
+ * object IS the signal that content changed. Keying on identity therefore gives
+ * both properties at once: unchanged inputs return the same merged object (the
+ * memo holds), and any payload change misses the cache (no staleness). A WeakMap
+ * pair also needs no size cap or eviction — entries die with their events.
  */
-const mergedToolEventCache = new Map<string, TimelineEvent>();
-const MERGED_TOOL_EVENT_CACHE_LIMIT = 2000;
+const mergedToolEventCache = new WeakMap<TimelineEvent, WeakMap<TimelineEvent, TimelineEvent>>();
 
-function cacheMergedToolEvent(key: string, build: () => TimelineEvent): TimelineEvent {
-  const hit = mergedToolEventCache.get(key);
+function cacheMergedToolEvent(
+  call: TimelineEvent,
+  result: TimelineEvent,
+  build: () => TimelineEvent,
+): TimelineEvent {
+  let byResult = mergedToolEventCache.get(call);
+  if (!byResult) {
+    byResult = new WeakMap<TimelineEvent, TimelineEvent>();
+    mergedToolEventCache.set(call, byResult);
+  }
+  const hit = byResult.get(result);
   if (hit) return hit;
   const built = build();
-  mergedToolEventCache.set(key, built);
-  if (mergedToolEventCache.size > MERGED_TOOL_EVENT_CACHE_LIMIT) {
-    // Oldest-first eviction; insertion order is Map's iteration order.
-    const oldest = mergedToolEventCache.keys().next().value;
-    if (oldest !== undefined) mergedToolEventCache.delete(oldest);
-  }
+  byResult.set(result, built);
   return built;
 }
 
 export function __resetMergedToolEventCacheForTests(): void {
-  mergedToolEventCache.clear();
+  // Identity-keyed entries cannot outlive their events, so there is nothing to
+  // clear; kept as a no-op so tests read the same either way.
 }
 
 /**
@@ -902,7 +917,7 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
         const output = !next.payload.error ? formatToolOutputPreview(next.payload.output) ?? undefined : undefined;
         // Same two source events must yield the SAME object every render, or the
         // whole visible list loses its memo on every incoming token.
-        consolidated.push(cacheMergedToolEvent(`${ev.eventId}\u0000${next.eventId}`, () => ({
+        consolidated.push(cacheMergedToolEvent(ev, next, () => ({
           ...ev,
           type: 'tool.call',
           payload: {

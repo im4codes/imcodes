@@ -109,6 +109,33 @@ describe('merged tool event identity', () => {
     }
   });
 
+  it('reflects a payload change that keeps the same eventId', () => {
+    // The case an eventId-keyed cache gets wrong, and the one that actually
+    // happens: streaming tool output grows under a stable eventId, and detail
+    // hydration swaps a truncated payload for the full one under that same id.
+    // `useTimeline` rebuilds the event object each time, so the merge must
+    // follow the object, not the id — otherwise the first short output is
+    // pinned forever and the real output never reaches the screen.
+    const [call, result] = toolPair(0);
+    const pickMerged = (items: ReturnType<typeof __buildViewItemsForTests>) => items
+      .flatMap((item) => [...(item.toolEvents ?? []), ...(item.event ? [item.event] : [])])
+      .find((event) => event.payload?._merged === true);
+
+    const truncated = pickMerged(__buildViewItemsForTests([call, result], true));
+    expect(truncated?.payload._resultPayloadOutput).toBe('ok 0');
+
+    const hydrated = {
+      ...result,
+      payload: { ...result.payload, output: 'FULL OUTPUT AFTER HYDRATION' },
+    } as TimelineEvent;
+    expect(hydrated.eventId).toBe(result.eventId);
+
+    const remerged = pickMerged(__buildViewItemsForTests([call, hydrated], true));
+    expect(remerged?.payload._resultPayloadOutput).toBe('FULL OUTPUT AFTER HYDRATION');
+    expect(remerged?.payload._output).toContain('FULL OUTPUT AFTER HYDRATION');
+    expect(remerged).not.toBe(truncated);
+  });
+
   it('does not hand back a stale merge when the pairing changes', () => {
     const [call, result] = toolPair(0);
     const pickMerged = (items: ReturnType<typeof __buildViewItemsForTests>) => items
