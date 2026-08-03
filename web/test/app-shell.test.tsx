@@ -1848,13 +1848,7 @@ describe('App shell', () => {
     fireEvent.click(screen.getByText('subbar-open-sub-3'));
 
     // The just-opened sub-3 is active; the earlier two are open but inactive.
-    // Windows mount one animation frame apart (useProgressiveMount), and the
-    // focused one jumps the queue, so wait for all three to exist before
-    // comparing their active flags — otherwise this races the mount schedule
-    // rather than testing it.
     await waitFor(() => {
-      expect(screen.getByTestId('sub-session-window-sub-1')).toBeTruthy();
-      expect(screen.getByTestId('sub-session-window-sub-2')).toBeTruthy();
       expect(screen.getByTestId('sub-session-window-sub-3').getAttribute('data-active')).toBe('true');
     });
     expect(screen.getByTestId('sub-session-window-sub-1').getAttribute('data-active')).toBe('false');

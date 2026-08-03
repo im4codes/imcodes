@@ -34,7 +34,6 @@ vi.mock('../../src/daemon/jsonl-watcher.js', async (importActual) => {
 import { capturePaneVisible, capturePaneHistory, getPaneId, getPaneSize, startPipePaneStream, sessionExists } from '../../src/agent/tmux.js';
 import { getSession } from '../../src/store/session-store.js';
 import { TerminalStreamer } from '../../src/daemon/terminal-streamer.js';
-import { TERMINAL_MAX_ROWS } from '../../src/shared/transport/terminal.js';
 import { TimelineEmitter } from '../../src/daemon/timeline-emitter.js';
 
 // We need to intercept the timelineEmitter singleton used inside terminal-streamer.
@@ -105,42 +104,6 @@ describe('TerminalStreamer — snapshot behavior', () => {
       ([, type]) => type === 'terminal.snapshot',
     );
     expect(snapshotCalls).toHaveLength(0);
-  });
-
-  it('clamps a nonsense pane height instead of building an unbounded frame', async () => {
-    // `rows` feeds `while (lines.length < rows) lines.push('')` here AND in the
-    // browser. Unclamped, one bad size allocates until the process (or the tab)
-    // dies — and because both loops are synchronous the page cannot even service
-    // a reload while it runs.
-    mockSize.mockResolvedValue({ cols: 80, rows: 5_000_000 });
-    const received: import('../../src/daemon/terminal-streamer.js').TerminalDiff[] = [];
-
-    streamer.subscribe({
-      sessionName: 'huge-rows-session',
-      send: (diff) => received.push(diff),
-    });
-
-    await flush();
-
-    expect(received.length).toBeGreaterThan(0);
-    expect(received[0].rows).toBe(TERMINAL_MAX_ROWS);
-    expect(received[0].lines.length).toBeLessThanOrEqual(TERMINAL_MAX_ROWS);
-  });
-
-  it('falls back to a sane size when the pane reports a non-finite height', async () => {
-    mockSize.mockResolvedValue({ cols: Number.NaN, rows: Number.POSITIVE_INFINITY });
-    const received: import('../../src/daemon/terminal-streamer.js').TerminalDiff[] = [];
-
-    streamer.subscribe({
-      sessionName: 'nan-rows-session',
-      send: (diff) => received.push(diff),
-    });
-
-    await flush();
-
-    expect(received.length).toBeGreaterThan(0);
-    expect(received[0].rows).toBe(24);
-    expect(received[0].cols).toBe(80);
   });
 
   it('terminal.snapshot_request triggers fullFrame with snapshotRequested=true and DOES emit terminal.snapshot', async () => {

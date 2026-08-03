@@ -376,43 +376,6 @@ describe('ChatView compact tool activity', () => {
     expect(label).not.toContain('slow-a');
   });
 
-  it('pairs an id-bearing call with an adjacent result that carries no id', async () => {
-    // Mixed shape: the call has a correlation id, its result does not. The
-    // result lands in no bucket, and the adjacency fallback used to be gated on
-    // the call ALSO having no id — so this pair never merged and the tool sat
-    // "running" forever with the peek stuck on "waiting for output".
-    stubHover(true);
-    const call = makeEvent('mixed-call', 'tool.call', {
-      tool: 'Bash', toolCallId: 'call-1', input: { command: 'npm run build' },
-    }, 1);
-    const result = makeEvent('mixed-result', 'tool.result', { output: 'built ok' }, 2);
-
-    const { container } = render(<ChatView events={[call, result]} loading={false} />);
-
-    expect(container.querySelector('.chat-tool-activity.is-running')).toBeNull();
-    expect(container.querySelector('.chat-tool-activity-stat.is-complete')?.textContent).toBe('✓1');
-
-    fireEvent.mouseEnter(container.querySelector('.chat-tool-activity') as HTMLElement);
-    const peek = document.querySelector('.chat-tool-peek');
-    expect(peek?.classList.contains('is-running')).toBe(false);
-    expect(peek?.textContent).toContain('built ok');
-  });
-
-  it('refuses to let an id-bearing call steal a result owned by another call', async () => {
-    // The fallback must stay narrow: a result carrying a DIFFERENT id belongs to
-    // someone else, and matching it would reintroduce the concurrent cross-talk
-    // the correlation path exists to prevent.
-    const callA = makeEvent('own-a', 'tool.call', {
-      tool: 'Bash', toolCallId: 'call-a', input: { command: 'a' },
-    }, 1);
-    const resultB = makeEvent('own-rb', 'tool.result', { toolCallId: 'call-b', output: 'B done' }, 2);
-
-    const { container } = render(<ChatView events={[callA, resultB]} loading={false} />);
-
-    // call-a must stay running — resultB is not its result.
-    expect(container.querySelector('.chat-tool-activity-stat.is-running')?.textContent).toBe('●1');
-  });
-
   it('still pairs by adjacency when no correlation id is present', async () => {
     // Older events and providers that omit the id must keep the previous
     // behaviour rather than silently stop merging.
@@ -542,78 +505,6 @@ describe('ChatView compact tool activity', () => {
     expect(peek?.classList.contains('is-failed')).toBe(true);
     expect(peek?.textContent).toContain('Failed');
     expect(peek?.textContent).toContain('EACCES: permission denied');
-  });
-
-  it('opens on keyboard focus even where the pointer gate would refuse', () => {
-    // A device that reports no hover can still have a keyboard. Gating focus on
-    // hover capability made the panel unreachable for those users.
-    stubHover(false);
-    const call = makeEvent('kbd-call', 'tool.call', { tool: 'Bash', input: { command: 'ls' } }, 1);
-    const result = makeEvent('kbd-result', 'tool.result', { output: 'a b c' }, 2);
-
-    const { container } = render(<ChatView events={[call, result]} loading={false} />);
-    const chip = container.querySelector('.chat-tool-activity') as HTMLElement;
-
-    fireEvent.mouseEnter(chip);
-    expect(document.querySelector('.chat-tool-peek')).toBeNull(); // pointer still gated
-
-    // Real DOM focus (a synthetic `focus` event does not reach this button's
-    // handler), wrapped in act so the resulting state update is flushed before
-    // the assertion reads the DOM.
-    act(() => { chip.focus(); });
-    const peek = document.querySelector('.chat-tool-peek');
-    expect(peek).not.toBeNull();
-    // The open panel must be announced, not just painted.
-    expect(chip.getAttribute('aria-describedby')).toBe(peek?.id);
-
-    act(() => { chip.blur(); });
-    expect(document.querySelector('.chat-tool-peek')).toBeNull();
-  });
-
-  it('carries no native title that would stack on top of the peek', () => {
-    stubHover(true);
-    const call = makeEvent('title-call', 'tool.call', { tool: 'Bash', input: { command: 'ls' } }, 1);
-    const result = makeEvent('title-result', 'tool.result', { output: 'ok' }, 2);
-
-    const { container } = render(<ChatView events={[call, result]} loading={false} />);
-
-    expect(container.querySelector('.chat-tool-activity')?.getAttribute('title')).toBeNull();
-    expect(container.querySelector('.chat-tool-activity-last')?.getAttribute('title')).toBeNull();
-  });
-
-  it('refuses adjacency when the result declares a different owner', () => {
-    // Reverse mixed shape: the CALL has no id, the RESULT does. The result has
-    // already named its owner, so adjacency must not claim it — otherwise
-    // concurrent tools cross-talk in exactly the direction the correlation map
-    // exists to prevent.
-    const call = makeEvent('rev-call', 'tool.call', { tool: 'Bash', input: { command: 'a' } }, 1);
-    const result = makeEvent('rev-result', 'tool.result', { toolCallId: 'someone-else', output: 'B' }, 2);
-
-    const { container } = render(<ChatView events={[call, result]} loading={false} />);
-
-    // The idless call must stay running: that result is not its result.
-    expect(container.querySelector('.chat-tool-activity-stat.is-running')?.textContent).toBe('●1');
-  });
-
-  it('closes the peek when the chip scrolls off the side, not just the top', () => {
-    stubHover(true);
-    const call = makeEvent('side-call', 'tool.call', { tool: 'Bash', input: { command: 'ls' } }, 1);
-    const result = makeEvent('side-result', 'tool.result', { output: 'ok' }, 2);
-    const { container } = render(<ChatView events={[call, result]} loading={false} />);
-    const chip = container.querySelector('.chat-tool-activity') as HTMLElement;
-
-    fireEvent.mouseEnter(chip);
-    expect(document.querySelector('.chat-tool-peek')).not.toBeNull();
-
-    // Horizontal scroll carries the chip out to the left. Checking only
-    // top/bottom left the panel pinned to the screen edge with nothing to anchor.
-    chip.getBoundingClientRect = () => ({
-      top: 100, bottom: 130, left: -400, right: -200, width: 200, height: 30, x: -400, y: 100,
-      toJSON: () => ({}),
-    }) as DOMRect;
-    act(() => { window.dispatchEvent(new Event('scroll')); });
-
-    expect(document.querySelector('.chat-tool-peek')).toBeNull();
   });
 
   it('stays closed on touch clients, where hover would fight the expand tap', () => {

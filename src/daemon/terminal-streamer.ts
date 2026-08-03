@@ -27,7 +27,6 @@ import logger from '../util/logger.js';
 import { timelineEmitter } from './timeline-emitter.js';
 import { emitSessionInlineError } from './session-error.js';
 import type { TerminalDiff, TerminalHistory } from '../shared/transport/terminal.js';
-import { TERMINAL_MAX_COLS, TERMINAL_MAX_ROWS } from '../shared/transport/terminal.js';
 
 const IDLE_THRESHOLD_MS = 5_000; // 5s without raw bytes → idle (Stop hook fires immediately; this is fallback)
 const MAX_RAW_BUFFER = 256 * 1024; // 256KB per-subscriber snapshot-pending buffer
@@ -910,17 +909,8 @@ export class TerminalStreamer {
     }
     try {
       const size = await getPaneSize(sessionName);
-      // Both frame builders grow a line array with `while (lines.length < rows)`,
-      // and the browser does the same on receipt. A nonsense pane size (parse
-      // slip, a resize race, a hostile value) would spin those loops allocating
-      // until the process or the tab dies. Clamp once here — the only source of
-      // `rows` for every frame — rather than guarding each loop separately.
-      const bounded = {
-        cols: Number.isFinite(size.cols) ? Math.max(1, Math.min(Math.floor(size.cols), TERMINAL_MAX_COLS)) : 80,
-        rows: Number.isFinite(size.rows) ? Math.max(1, Math.min(Math.floor(size.rows), TERMINAL_MAX_ROWS)) : 24,
-      };
-      this.sizeCache.set(sessionName, { ...bounded, ts: Date.now() });
-      return bounded;
+      this.sizeCache.set(sessionName, { ...size, ts: Date.now() });
+      return size;
     } catch {
       return { cols: 80, rows: 24 };
     }
