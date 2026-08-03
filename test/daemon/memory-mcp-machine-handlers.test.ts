@@ -43,7 +43,9 @@ describe('exec_remote / list_machines handlers (10.12)', () => {
     expect(fetch).not.toHaveBeenCalled();
 
     expect(await handlers[sendFile]({ machine: '^^(win)', sourcePath: '/tmp/a' })).toMatchObject({ status: 'ok', machine: 'win', remotePath: '/staging/a.txt', size: 5, transport: 'direct' });
-    expect(await handlers[fetchFile]({ machine: '^^(win)', sourcePath: '/remote/a', destinationPath: '/tmp/a', overwrite: true })).toMatchObject({ status: 'ok', machine: 'win', destinationPath: '/tmp/a', size: 7 });
+    expect(await handlers[fetchFile]({ machine: '^^(win)', sourcePath: '/remote/a', destinationPath: '/tmp/a', overwrite: true })).toMatchObject({
+      status: 'ok', machine: 'win', destinationPath: '/tmp/a', size: 7, transport: 'relay',
+    });
     expect(send).toHaveBeenCalledWith(expect.objectContaining({ machine: 'win' }));
     expect(fetch).toHaveBeenCalledWith(expect.objectContaining({ machine: 'win' }));
     expect(fetch).toHaveBeenCalledWith(expect.objectContaining({ overwrite: true }));

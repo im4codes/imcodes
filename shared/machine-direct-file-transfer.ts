@@ -1,7 +1,12 @@
 import { isIP } from 'node:net';
-import type { AttachmentRef, FileTransferValidationResult } from './transport/file-transfer.js';
+import {
+  FILE_TRANSFER_PATH_MAX_BYTES,
+  type AttachmentRef,
+  type FileTransferValidationResult,
+} from './transport/file-transfer.js';
 
 export const MACHINE_DIRECT_FILE_TRANSFER_CAPABILITY = 'file.transfer.machine_direct.v1' as const;
+export const MACHINE_DIRECT_FILE_FETCH_CAPABILITY = 'file.transfer.machine_direct_fetch.v1' as const;
 
 export const MACHINE_FILE_TRANSFER_TRANSPORT = {
   DIRECT: 'direct',
@@ -14,6 +19,9 @@ export const MACHINE_DIRECT_FILE_TRANSFER_MSG = {
   REQUEST: 'file.machine_direct.request',
   DONE: 'file.machine_direct.done',
   ERROR: 'file.machine_direct.error',
+  FETCH_REQUEST: 'file.machine_direct.fetch_request',
+  FETCH_DONE: 'file.machine_direct.fetch_done',
+  FETCH_ERROR: 'file.machine_direct.fetch_error',
 } as const;
 
 export const MACHINE_DIRECT_HANDSHAKE_MSG = {
@@ -24,6 +32,7 @@ export const MACHINE_DIRECT_HANDSHAKE_MSG = {
 export const MACHINE_DIRECT_FRAME_TYPE = {
   DATA: 1,
   FINISH: 2,
+  START: 3,
 } as const;
 
 export const MACHINE_DIRECT_FILE_TRANSFER_ERROR = {
@@ -33,6 +42,7 @@ export const MACHINE_DIRECT_FILE_TRANSFER_ERROR = {
   TRANSFER_FAILED: 'transfer_failed',
   SIZE_MISMATCH: 'size_mismatch',
   EXPIRED: 'expired',
+  SOURCE_INVALID: 'source_invalid',
 } as const;
 
 export const MACHINE_DIRECT_FILE_TRANSFER_LIMITS = {
@@ -43,6 +53,7 @@ export const MACHINE_DIRECT_FILE_TRANSFER_LIMITS = {
   FRAME_LENGTH_HEADER_BYTES: 4,
   FRAME_AUTH_TAG_BYTES: 16,
   FINISH_FRAME_PLAINTEXT_BYTES: 9,
+  MAX_START_METADATA_BYTES: 2 * 1024,
   HANDSHAKE_LINE_MAX_BYTES: 2 * 1024,
   NONCE_BYTES: 18,
   CONNECT_TIMEOUT_MS: 4_000,
@@ -73,6 +84,20 @@ export interface MachineDirectUploadRequest {
   expiresAt: number;
 }
 
+export interface MachineDirectFetchRequest {
+  type: typeof MACHINE_DIRECT_FILE_TRANSFER_MSG.FETCH_REQUEST;
+  requestId: string;
+  capability: string;
+  candidates: MachineDirectCandidate[];
+  sourcePath: string;
+  expiresAt: number;
+}
+
+export interface MachineDirectFetchStart {
+  size: number;
+  originalName: string;
+}
+
 /**
  * Mint a fresh hop-local authority deadline after an authenticated control hop.
  * Absolute wall clocks on the Full daemon, Server, and controlled node are not
@@ -83,6 +108,16 @@ export function refreshMachineDirectUploadAuthority(
   request: MachineDirectUploadRequest,
   now = Date.now(),
 ): MachineDirectUploadRequest {
+  return {
+    ...request,
+    expiresAt: now + MACHINE_DIRECT_FILE_TRANSFER_LIMITS.AUTHORITY_TTL_MS,
+  };
+}
+
+export function refreshMachineDirectFetchAuthority(
+  request: MachineDirectFetchRequest,
+  now = Date.now(),
+): MachineDirectFetchRequest {
   return {
     ...request,
     expiresAt: now + MACHINE_DIRECT_FILE_TRANSFER_LIMITS.AUTHORITY_TTL_MS,
@@ -102,6 +137,20 @@ export interface MachineDirectUploadError {
 }
 
 export type MachineDirectUploadResponse = MachineDirectUploadDone | MachineDirectUploadError;
+
+export interface MachineDirectFetchDone {
+  type: typeof MACHINE_DIRECT_FILE_TRANSFER_MSG.FETCH_DONE;
+  requestId: string;
+  size: number;
+}
+
+export interface MachineDirectFetchError {
+  type: typeof MACHINE_DIRECT_FILE_TRANSFER_MSG.FETCH_ERROR;
+  requestId: string;
+  error: typeof MACHINE_DIRECT_FILE_TRANSFER_ERROR[keyof typeof MACHINE_DIRECT_FILE_TRANSFER_ERROR];
+}
+
+export type MachineDirectFetchResponse = MachineDirectFetchDone | MachineDirectFetchError;
 
 export interface MachineDirectTargetHello {
   type: typeof MACHINE_DIRECT_HANDSHAKE_MSG.TARGET_HELLO;
@@ -153,6 +202,21 @@ export function isPrivateMachineDirectAddress(host: string): boolean {
       || normalized.startsWith('fe9') || normalized.startsWith('fea') || normalized.startsWith('feb');
   }
   return false;
+}
+
+/**
+ * Return whether a private candidate can be dialed without receiver-local
+ * interface scope. The v1 wire validator intentionally remains broader for
+ * rolling compatibility with senders that included link-local candidates.
+ */
+export function isRoutableMachineDirectAddress(host: string): boolean {
+  if (!isPrivateMachineDirectAddress(host)) return false;
+  if (isIP(host) === 4) {
+    const [a, b] = host.split('.').map(Number);
+    return !(a === 169 && b === 254);
+  }
+  const normalized = host.toLowerCase();
+  return normalized.startsWith('fc') || normalized.startsWith('fd');
 }
 
 export function validateMachineDirectCandidate(value: unknown): MachineDirectCandidate | null {
@@ -223,6 +287,33 @@ export function validateMachineDirectUploadRequest(value: unknown): FileTransfer
   return { ok: true, value: { ...value, candidates: candidates as MachineDirectCandidate[] } as MachineDirectUploadRequest };
 }
 
+export function validateMachineDirectFetchRequest(value: unknown): FileTransferValidationResult<MachineDirectFetchRequest> {
+  if (!isObject(value) || !hasExactKeys(
+    value,
+    ['type', 'requestId', 'capability', 'candidates', 'sourcePath', 'expiresAt'],
+  )) return { ok: false, error: 'invalid_object' };
+  if (value.type !== MACHINE_DIRECT_FILE_TRANSFER_MSG.FETCH_REQUEST) return { ok: false, error: 'invalid_type' };
+  if (!isMachineDirectId(value.requestId)) return { ok: false, error: 'invalid_request_id' };
+  if (typeof value.capability !== 'string' || !CAPABILITY_RE.test(value.capability)) return { ok: false, error: 'invalid_capability' };
+  if (!Array.isArray(value.candidates) || value.candidates.length < 1 || value.candidates.length > MACHINE_DIRECT_FILE_TRANSFER_LIMITS.MAX_CANDIDATES) {
+    return { ok: false, error: 'invalid_candidates' };
+  }
+  const candidates = value.candidates.map(validateMachineDirectCandidate);
+  if (candidates.some((candidate) => !candidate)) return { ok: false, error: 'invalid_candidate' };
+  if (typeof value.sourcePath !== 'string' || value.sourcePath.length < 1 || utf8Bytes(value.sourcePath) > FILE_TRANSFER_PATH_MAX_BYTES) {
+    return { ok: false, error: 'invalid_source_path' };
+  }
+  if (typeof value.expiresAt !== 'number' || !Number.isSafeInteger(value.expiresAt) || value.expiresAt <= 0) return { ok: false, error: 'invalid_expiry' };
+  return { ok: true, value: { ...value, candidates: candidates as MachineDirectCandidate[] } as MachineDirectFetchRequest };
+}
+
+export function validateMachineDirectFetchStart(value: unknown): MachineDirectFetchStart | null {
+  if (!isObject(value) || !hasExactKeys(value, ['size', 'originalName'])) return null;
+  if (typeof value.size !== 'number' || !Number.isSafeInteger(value.size) || value.size < 0) return null;
+  if (typeof value.originalName !== 'string' || value.originalName.length < 1 || utf8Bytes(value.originalName) > 1024) return null;
+  return value as unknown as MachineDirectFetchStart;
+}
+
 export function validateMachineDirectUploadResponse(
   value: unknown,
   validateAttachment: (value: unknown, options?: { maxSize?: number }) => AttachmentRef | null,
@@ -243,6 +334,27 @@ export function validateMachineDirectUploadResponse(
       return { ok: false, error: 'invalid_error' };
     }
     return { ok: true, value: value as unknown as MachineDirectUploadError };
+  }
+  return { ok: false, error: 'invalid_type' };
+}
+
+export function validateMachineDirectFetchResponse(value: unknown): FileTransferValidationResult<MachineDirectFetchResponse> {
+  if (!isObject(value) || typeof value.type !== 'string') return { ok: false, error: 'invalid_object' };
+  if (value.type === MACHINE_DIRECT_FILE_TRANSFER_MSG.FETCH_DONE) {
+    if (!hasExactKeys(value, ['type', 'requestId', 'size'])
+      || !isMachineDirectId(value.requestId)
+      || typeof value.size !== 'number' || !Number.isSafeInteger(value.size) || value.size < 0) {
+      return { ok: false, error: 'invalid_done' };
+    }
+    return { ok: true, value: value as unknown as MachineDirectFetchDone };
+  }
+  if (value.type === MACHINE_DIRECT_FILE_TRANSFER_MSG.FETCH_ERROR) {
+    if (!hasExactKeys(value, ['type', 'requestId', 'error'])
+      || !isMachineDirectId(value.requestId)
+      || typeof value.error !== 'string' || !ERROR_SET.has(value.error as MachineDirectFetchError['error'])) {
+      return { ok: false, error: 'invalid_error' };
+    }
+    return { ok: true, value: value as unknown as MachineDirectFetchError };
   }
   return { ok: false, error: 'invalid_type' };
 }

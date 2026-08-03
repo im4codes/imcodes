@@ -27,7 +27,7 @@ import {
   COMPUTER_USE_OUTCOMES,
   COMPUTER_USE_TOOLS,
 } from './computer-use.js';
-import { FILE_TRANSFER_LIMITS, FILE_TRANSFER_PATH_MAX_BYTES } from './transport/file-transfer.js';
+import { FILE_TRANSFER_PATH_MAX_BYTES } from './transport/file-transfer.js';
 import { MACHINE_FILE_TRANSFER_TRANSPORT } from './machine-direct-file-transfer.js';
 import {
   MACHINE_NAME_PATTERN,
@@ -633,7 +633,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   },
   [MEMORY_MCP_TOOL_NAMES.FETCH_FILE_FROM_MACHINE]: {
     name: MEMORY_MCP_TOOL_NAMES.FETCH_FILE_FROM_MACHINE,
-    description: 'Fetch one regular file from a controlled machine. Pass either its bare ref_name or complete ^^(ref_name) marker without list_machines. Destination commit is atomic; overwrite defaults false. FULL nodes only.',
+    description: 'Direct-first controlled file fetch, then relay. Pass ref_name or ^^(ref_name) without list_machines. Reports mode; atomic commit; overwrite=false; FULL only.',
     inputSchema: objectSchema({
       machine: stringSchema('Bare stable ref_name or complete ^^(ref_name) marker.', { minLength: 1, maxLength: MACHINE_TARGET_MAX, pattern: MACHINE_TARGET_PATTERN.source }),
       sourcePath: stringSchema(`Explicit controlled-node regular-file path, up to ${FILE_TRANSFER_PATH_MAX_BYTES} UTF-8 bytes.`),
@@ -644,9 +644,10 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
       status: stringSchema('Always ok for a successful transfer.', { enum: ['ok'] }),
       machine: stringSchema('Resolved machine ref_name.'),
       destinationPath: stringSchema('Exact committed local destination path.'),
-      attachmentId: stringSchema('Short-lived source attachment id.'),
-      size: numberSchema('Transferred byte count.', { minimum: 0, maximum: FILE_TRANSFER_LIMITS.MAX_FILE_SIZE }),
-    }, ['status', 'machine', 'destinationPath', 'attachmentId', 'size']),
+      attachmentId: stringSchema('Relay attachment id or direct transfer id.'),
+      size: numberSchema('Transferred byte count.', { minimum: 0, maximum: Number.MAX_SAFE_INTEGER }),
+      transport: stringSchema('Actual mode.', { enum: Object.values(MACHINE_FILE_TRANSFER_TRANSPORT) }),
+    }, ['status', 'machine', 'destinationPath', 'attachmentId', 'size', 'transport']),
   },
   [MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_DOCS]: {
     name: MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_DOCS,

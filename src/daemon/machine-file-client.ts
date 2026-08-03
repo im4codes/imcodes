@@ -4,6 +4,7 @@ import { link, lstat, open, realpath, rename, unlink } from 'node:fs/promises';
 import { basename, dirname, join, resolve } from 'node:path';
 import {
   FILE_TRANSFER_LIMITS,
+  FILE_PATH_HANDLE_ERROR,
   validateAttachmentRef,
   type AttachmentRef,
 } from '../../shared/transport/file-transfer.js';
@@ -13,11 +14,12 @@ import {
   MACHINE_FILE_TRANSFER_TRANSPORT,
   MACHINE_DIRECT_FILE_TRANSFER_LIMITS,
   MACHINE_DIRECT_FILE_TRANSFER_MSG,
+  validateMachineDirectFetchResponse,
   validateMachineDirectUploadResponse,
   type MachineFileTransferTransport,
   type MachineDirectUploadRequest,
 } from '../../shared/machine-direct-file-transfer.js';
-import { startMachineDirectSender } from './machine-direct-transfer.js';
+import { startMachineDirectFetchReceiver, startMachineDirectSender } from './machine-direct-transfer.js';
 
 const MAX_CONTROL_RESPONSE_BYTES = 64 * 1024;
 
@@ -234,6 +236,51 @@ export async function fetchFileFromMachine(options: FetchFileFromMachineOptions)
   const doFetch = options.fetchImpl ?? fetch;
   const base = options.serverUrl.replace(/\/+$/, '');
   const headers = authHeaders(options.sourceServerId, options.sourceToken);
+  const prepared = await prepareDestination(options.destinationPath, options.overwrite === true);
+
+  {
+    const requestId = randomBytes(24).toString('base64url');
+    const requestBase = {
+      type: MACHINE_DIRECT_FILE_TRANSFER_MSG.FETCH_REQUEST,
+      requestId,
+      capability: randomBytes(32).toString('base64url'),
+      expiresAt: Date.now() + MACHINE_DIRECT_FILE_TRANSFER_LIMITS.AUTHORITY_TTL_MS,
+    } as const;
+    const receiver = await startMachineDirectFetchReceiver({ tempPath: prepared.temp, request: requestBase }).catch(() => null);
+    if (receiver) {
+      try {
+        const response = await doFetch(`${base}/api/server/${encodeURIComponent(options.targetServerId)}/machine-direct-fetch`, {
+          method: 'POST',
+          headers: { ...headers, 'content-type': 'application/json' },
+          body: JSON.stringify({ ...requestBase, sourcePath: options.sourcePath, candidates: receiver.candidates }),
+          signal: boundedTransferSignal(options.signal, MACHINE_DIRECT_FILE_TRANSFER_LIMITS.TRANSFER_TIMEOUT_MS),
+        });
+        const body = await readBoundedJson(response);
+        const terminal = validateMachineDirectFetchResponse(body);
+        if (response.ok
+          && terminal.ok
+          && terminal.value.type === MACHINE_DIRECT_FILE_TRANSFER_MSG.FETCH_DONE
+          && terminal.value.requestId === requestId) {
+          const start = await receiver.completion;
+          if (start.size !== terminal.value.size) throw new MachineControlPlaneError('malformed', 'direct fetch size mismatch');
+          await commitDownloadedFile(prepared.temp, prepared.destination, options.overwrite === true);
+          return {
+            size: start.size,
+            attachmentId: requestId,
+            transport: MACHINE_FILE_TRANSFER_TRANSPORT.DIRECT,
+            destinationPath: prepared.destination,
+          };
+        }
+      } catch {
+        // Capability, control, connection, authentication, and pre-commit
+        // failures all enter the existing bounded Server download below.
+      } finally {
+        receiver.close();
+      }
+      await unlink(prepared.temp).catch(() => {});
+    }
+  }
+
   let handleResponse: Response;
   try {
     handleResponse = await doFetch(`${base}/api/server/${encodeURIComponent(options.targetServerId)}/machine-file-handle`, {
@@ -246,9 +293,14 @@ export async function fetchFileFromMachine(options: FetchFileFromMachineOptions)
     throw new MachineControlPlaneError('transport', 'file handle transport failed');
   }
   const handleBody = await readBoundedJson(handleResponse);
-  if (!handleResponse.ok) throw new MachineControlPlaneError('http_status', typeof handleBody.error === 'string' ? handleBody.error : `http_${handleResponse.status}`);
+  if (!handleResponse.ok) {
+    const reason = typeof handleBody.error === 'string' ? handleBody.error : `http_${handleResponse.status}`;
+    if (reason === FILE_PATH_HANDLE_ERROR.FILE_TOO_LARGE) {
+      throw new MachineControlPlaneError('malformed', 'source file is too large for Server relay fallback');
+    }
+    throw new MachineControlPlaneError('http_status', reason);
+  }
   const attachment = parseAttachmentResponse(handleBody);
-  const prepared = await prepareDestination(options.destinationPath, options.overwrite === true);
 
   let file;
   try {

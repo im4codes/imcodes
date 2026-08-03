@@ -53,7 +53,9 @@ import {
 } from '../../../shared/transport/file-transfer.js';
 import {
   MACHINE_DIRECT_FILE_TRANSFER_CAPABILITY,
+  MACHINE_DIRECT_FILE_FETCH_CAPABILITY,
   MACHINE_DIRECT_FILE_TRANSFER_MSG,
+  validateMachineDirectFetchResponse,
   validateMachineDirectUploadResponse,
 } from '../../../shared/machine-direct-file-transfer.js';
 import { REPO_MSG, REPO_RELAY_TYPES } from '../../../shared/repo-types.js';
@@ -2615,7 +2617,8 @@ export class WsBridge {
                   capability === FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY
                   || capability === FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY
                   || capability === FILE_TRANSFER_PATH_HANDLE_CAPABILITY
-                  || capability === MACHINE_DIRECT_FILE_TRANSFER_CAPABILITY),
+                  || capability === MACHINE_DIRECT_FILE_TRANSFER_CAPABILITY
+                  || capability === MACHINE_DIRECT_FILE_FETCH_CAPABILITY),
             )
           : new Set();
         this.authenticated = true;
@@ -2808,6 +2811,12 @@ export class WsBridge {
         }
         if (msg.type === MACHINE_DIRECT_FILE_TRANSFER_MSG.DONE || msg.type === MACHINE_DIRECT_FILE_TRANSFER_MSG.ERROR) {
           const direct = validateMachineDirectUploadResponse(msg, validateAttachmentRef);
+          const resolved = direct.ok ? this.resolveFileTransfer(direct.value.requestId, direct.value as unknown as Record<string, unknown>) : false;
+          if (!resolved) WsBridge.controlledInboundDropped++;
+          return;
+        }
+        if (msg.type === MACHINE_DIRECT_FILE_TRANSFER_MSG.FETCH_DONE || msg.type === MACHINE_DIRECT_FILE_TRANSFER_MSG.FETCH_ERROR) {
+          const direct = validateMachineDirectFetchResponse(msg);
           const resolved = direct.ok ? this.resolveFileTransfer(direct.value.requestId, direct.value as unknown as Record<string, unknown>) : false;
           if (!resolved) WsBridge.controlledInboundDropped++;
           return;
@@ -6425,6 +6434,7 @@ export class WsBridge {
       || parsedType === FILE_TRANSFER_MSG.PATH_HANDLE
       || parsedType === FILE_TRANSFER_MSG.DELETE
       || parsedType === MACHINE_DIRECT_FILE_TRANSFER_MSG.REQUEST
+      || parsedType === MACHINE_DIRECT_FILE_TRANSFER_MSG.FETCH_REQUEST
     ) {
       logger.warn({ serverId: this.serverId, type: parsedType }, 'Dropped control command sent via generic sendToDaemon');
       return;
@@ -6761,11 +6771,15 @@ export class WsBridge {
     message: Record<string, unknown>,
     timeoutMs: number,
     onProgress?: (msg: Record<string, unknown>) => void,
+    expectedGeneration?: number,
   ): Promise<Record<string, unknown>> {
     const socket = this.daemonWs;
     const generation = this.daemonGeneration;
     if (!socket || !this.authenticated || socket.readyState !== WebSocket.OPEN) {
       return Promise.reject(new Error('daemon_offline'));
+    }
+    if (expectedGeneration !== undefined && generation !== expectedGeneration) {
+      return Promise.reject(new Error('daemon_generation_changed'));
     }
     if (this.pendingFileTransfers.has(requestId)) {
       return Promise.reject(new Error('request_id_conflict'));
@@ -6782,6 +6796,7 @@ export class WsBridge {
         if (
           this.daemonWs !== socket
           || this.daemonGeneration !== generation
+          || (expectedGeneration !== undefined && generation !== expectedGeneration)
           || !this.authenticated
           || socket.readyState !== WebSocket.OPEN
         ) {

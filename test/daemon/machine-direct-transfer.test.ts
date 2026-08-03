@@ -2,7 +2,7 @@ import { randomBytes } from 'node:crypto';
 import { mkdtemp, readFile, readdir, rm, unlink, writeFile } from 'node:fs/promises';
 import { homedir, networkInterfaces, tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createServer, type Server, type Socket } from 'node:net';
+import { connect, createServer, type Server, type Socket } from 'node:net';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   MACHINE_DIRECT_FILE_TRANSFER_ERROR,
@@ -10,7 +10,7 @@ import {
   MACHINE_DIRECT_FILE_TRANSFER_MSG,
   MACHINE_DIRECT_FRAME_TYPE,
   MACHINE_DIRECT_HANDSHAKE_MSG,
-  isPrivateMachineDirectAddress,
+  isRoutableMachineDirectAddress,
   validateMachineDirectTargetHello,
   type MachineDirectUploadRequest,
 } from '../../shared/machine-direct-file-transfer.js';
@@ -19,6 +19,8 @@ import {
   deriveMachineDirectTransferKey,
   encryptMachineDirectFrame,
   receiveMachineDirectUpload,
+  sendMachineDirectFetch,
+  startMachineDirectFetchReceiver,
   startMachineDirectSender,
 } from '../../src/daemon/machine-direct-transfer.js';
 
@@ -32,7 +34,7 @@ afterEach(async () => {
 function privateIpv4Host(): string {
   for (const addresses of Object.values(networkInterfaces())) {
     for (const address of addresses ?? []) {
-      if (address.family === 'IPv4' && !address.internal && isPrivateMachineDirectAddress(address.address)) return address.address;
+      if (address.family === 'IPv4' && !address.internal && isRoutableMachineDirectAddress(address.address)) return address.address;
     }
   }
   throw new Error('private IPv4 test interface unavailable');
@@ -106,6 +108,130 @@ function requestBase(size: number): Omit<MachineDirectUploadRequest, 'candidates
 }
 
 describe('machine direct encrypted TCP transfer', () => {
+  it('reuses the encrypted sender to stream from a controlled source into a Full receiver temp file', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'imcodes-machine-fetch-direct-'));
+    cleanup.push(dir);
+    const sourcePath = join(dir, 'controlled-source.bin');
+    const tempPath = join(dir, '.full-destination.part');
+    const content = Buffer.from(`reverse-direct-${'r'.repeat(180_000)}`);
+    await writeFile(sourcePath, content);
+    const request = {
+      type: MACHINE_DIRECT_FILE_TRANSFER_MSG.FETCH_REQUEST,
+      requestId: randomBytes(24).toString('base64url'),
+      capability: randomBytes(32).toString('base64url'),
+      expiresAt: Date.now() + MACHINE_DIRECT_FILE_TRANSFER_LIMITS.AUTHORITY_TTL_MS,
+    } as const;
+    const receiver = await startMachineDirectFetchReceiver({ tempPath, request });
+    expect(receiver).not.toBeNull();
+    const response = await sendMachineDirectFetch({
+      ...request,
+      sourcePath,
+      candidates: [{ host: 'fe80::1', port: receiver!.candidates[0]!.port }, ...receiver!.candidates],
+    });
+    const start = await receiver!.completion;
+    expect(response).toEqual({
+      type: MACHINE_DIRECT_FILE_TRANSFER_MSG.FETCH_DONE,
+      requestId: request.requestId,
+      size: content.length,
+    });
+    expect(start).toEqual({ size: content.length, originalName: 'controlled-source.bin' });
+    await expect(readFile(tempPath)).resolves.toEqual(content);
+    receiver!.close();
+  });
+
+  it('returns a correlated connect failure immediately when every legacy candidate is link-local', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'imcodes-machine-fetch-link-local-'));
+    cleanup.push(dir);
+    const sourcePath = join(dir, 'controlled-source.bin');
+    await writeFile(sourcePath, 'link-local-only');
+    const request = {
+      type: MACHINE_DIRECT_FILE_TRANSFER_MSG.FETCH_REQUEST,
+      requestId: randomBytes(24).toString('base64url'),
+      capability: randomBytes(32).toString('base64url'),
+      candidates: [
+        { host: '169.254.10.20', port: 45125 },
+        { host: 'fe80::1', port: 45125 },
+      ],
+      sourcePath,
+      expiresAt: Date.now() + MACHINE_DIRECT_FILE_TRANSFER_LIMITS.AUTHORITY_TTL_MS,
+    } as const;
+
+    await expect(sendMachineDirectFetch(request)).resolves.toEqual({
+      type: MACHINE_DIRECT_FILE_TRANSFER_MSG.FETCH_ERROR,
+      requestId: request.requestId,
+      error: MACHINE_DIRECT_FILE_TRANSFER_ERROR.CONNECT_FAILED,
+    });
+  });
+
+  it('rejects a non-regular reverse source before opening a data connection', async () => {
+    const request = {
+      type: MACHINE_DIRECT_FILE_TRANSFER_MSG.FETCH_REQUEST,
+      requestId: randomBytes(24).toString('base64url'),
+      capability: randomBytes(32).toString('base64url'),
+      candidates: [{ host: '192.168.2.145', port: 9 }],
+      sourcePath: tmpdir(),
+      expiresAt: Date.now() + MACHINE_DIRECT_FILE_TRANSFER_LIMITS.AUTHORITY_TTL_MS,
+    } as const;
+    await expect(sendMachineDirectFetch(request)).resolves.toEqual({
+      type: MACHINE_DIRECT_FILE_TRANSFER_MSG.FETCH_ERROR,
+      requestId: request.requestId,
+      error: MACHINE_DIRECT_FILE_TRANSFER_ERROR.SOURCE_INVALID,
+    });
+  });
+
+  it.each(['tamper', 'size-mismatch'] as const)('rejects reverse %s and removes the Full temp file', async (failure) => {
+    const dir = await mkdtemp(join(tmpdir(), 'imcodes-machine-fetch-adversarial-'));
+    cleanup.push(dir);
+    const tempPath = join(dir, '.destination.part');
+    const request = {
+      type: MACHINE_DIRECT_FILE_TRANSFER_MSG.FETCH_REQUEST,
+      requestId: randomBytes(24).toString('base64url'),
+      capability: randomBytes(32).toString('base64url'),
+      expiresAt: Date.now() + MACHINE_DIRECT_FILE_TRANSFER_LIMITS.AUTHORITY_TTL_MS,
+    } as const;
+    const receiver = await startMachineDirectFetchReceiver({ tempPath, request, transferTimeoutMs: 1_000 });
+    expect(receiver).not.toBeNull();
+    const candidate = receiver!.candidates[0]!;
+    const socket = connect({ host: candidate.host, port: candidate.port });
+    await new Promise<void>((resolve, reject) => {
+      socket.once('connect', resolve);
+      socket.once('error', reject);
+    });
+    const targetHello = validateMachineDirectTargetHello(await readJsonLine(socket));
+    expect(targetHello).not.toBeNull();
+    const sourceNonce = randomBytes(MACHINE_DIRECT_FILE_TRANSFER_LIMITS.NONCE_BYTES).toString('base64url');
+    socket.write(`${JSON.stringify({
+      type: MACHINE_DIRECT_HANDSHAKE_MSG.SOURCE_HELLO,
+      requestId: request.requestId,
+      nonce: sourceNonce,
+      proof: createMachineDirectProof(request.capability, 'source', request.requestId, targetHello!.nonce, sourceNonce),
+    })}\n`);
+    const key = deriveMachineDirectTransferKey(request.capability, targetHello!.nonce, sourceNonce, request.requestId);
+    const start = Buffer.concat([
+      Buffer.from([MACHINE_DIRECT_FRAME_TYPE.START]),
+      Buffer.from(JSON.stringify({ size: failure === 'size-mismatch' ? 4 : 3, originalName: 'bad.bin' })),
+    ]);
+    socket.write(encryptMachineDirectFrame(key, request.requestId, 0n, start));
+    const data = encryptMachineDirectFrame(
+      key,
+      request.requestId,
+      1n,
+      Buffer.concat([Buffer.from([MACHINE_DIRECT_FRAME_TYPE.DATA]), Buffer.from('abc')]),
+    );
+    if (failure === 'tamper') data[data.length - 1] ^= 0xff;
+    socket.write(data);
+    if (failure === 'size-mismatch') {
+      const finish = Buffer.alloc(MACHINE_DIRECT_FILE_TRANSFER_LIMITS.FINISH_FRAME_PLAINTEXT_BYTES);
+      finish[0] = MACHINE_DIRECT_FRAME_TYPE.FINISH;
+      finish.writeBigUInt64BE(3n, 1);
+      socket.write(encryptMachineDirectFrame(key, request.requestId, 2n, finish));
+    }
+    socket.end();
+    await expect(receiver!.completion).rejects.toThrow();
+    await expect(readFile(tempPath)).rejects.toThrow();
+    receiver!.close();
+  });
+
   it('streams a file over a routed-private candidate and commits a normal attachment', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'imcodes-machine-direct-'));
     cleanup.push(dir);

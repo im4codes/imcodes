@@ -1560,7 +1560,15 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       });
       if (!result.ok) return error(result.reason, result.error);
       if (!result.destinationPath) return error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, 'machine file transfer returned no destination path');
-      return { status: 'ok', machine, destinationPath: result.destinationPath, attachmentId: result.attachmentId, size: result.size };
+      if (!result.transport) return error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, 'machine file transfer returned no transport mode');
+      return {
+        status: 'ok',
+        machine,
+        destinationPath: result.destinationPath,
+        attachmentId: result.attachmentId,
+        size: result.size,
+        transport: result.transport,
+      };
     },
     [MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_DOCS]: async (input) => {
       const args = pickAllowedMcpArgs(input, ['topic']);
@@ -1929,7 +1937,8 @@ const machineToolOutputSchemas: Partial<Record<MemoryMcpToolName, z.ZodTypeAny>>
     machine: z.string().min(1),
     destinationPath: boundedUtf8String(FILE_TRANSFER_PATH_MAX_BYTES),
     attachmentId: z.string().min(1).max(128),
-    size: z.number().int().min(0).max(FILE_TRANSFER_LIMITS.MAX_FILE_SIZE),
+    size: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+    transport: z.enum([MACHINE_FILE_TRANSFER_TRANSPORT.DIRECT, MACHINE_FILE_TRANSFER_TRANSPORT.RELAY]),
   }),
   [MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_DOCS]: z.strictObject({
     status: z.literal('ok'),
