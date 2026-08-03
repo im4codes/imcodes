@@ -22,7 +22,11 @@ const scriptDir = dirname(fileURLToPath(import.meta.url));
 const root = resolve(scriptDir, '..');
 const require = createRequire(import.meta.url);
 const arch = process.arch === 'arm64' ? 'arm64' : 'x64';
-const platformKey = `${process.platform}-${arch}`;
+const targetArch = process.env.IMCODES_COMPUTER_USE_HELPER_TARGET_ARCH?.trim() || arch;
+if (targetArch !== 'x64' && targetArch !== 'arm64' && !(process.platform === 'darwin' && targetArch === 'universal')) {
+  throw new Error(`copy-computer-use-helper: unsupported target architecture ${targetArch}`);
+}
+const platformKey = `${process.platform}-${targetArch}`;
 const isWin = process.platform === 'win32';
 const helperBinaryName = isWin ? 'open-computer-use.exe' : 'open-computer-use';
 const macosAppName = 'Open Computer Use.app';
@@ -69,6 +73,14 @@ function findSource() {
 function verifyMacosAppBundle(appPath) {
   try {
     execFileSync('/usr/bin/codesign', ['--verify', '--deep', '--strict', appPath], { stdio: 'pipe' });
+    if (targetArch === 'universal') {
+      execFileSync('/usr/bin/lipo', [
+        join(appPath, 'Contents', 'MacOS', 'OpenComputerUse'),
+        '-verify_arch',
+        'x86_64',
+        'arm64',
+      ], { stdio: 'pipe' });
+    }
     const inspected = spawnSync('/usr/bin/codesign', ['-dv', '--verbose=4', appPath], {
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'pipe'],

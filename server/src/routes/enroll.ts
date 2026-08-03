@@ -16,9 +16,13 @@ import {
   CONTROLLED_NODE_ARTIFACT_ASSETS,
   CONTROLLED_NODE_ARTIFACT_HEADERS,
   controlledNodeComputerUseHelperFilename,
+  isControlledNodeArtifactArch,
+  isControlledNodeArtifactCompatibleWithRuntime,
   isControlledNodeArch,
+  isControlledNodeRuntimePair,
   isControlledNodeOs,
-  type ControlledNodeArch,
+  normalizeControlledNodeArtifactPair,
+  type ControlledNodeArtifactArch,
   type ControlledNodeOs,
 } from '../../../shared/controlled-node-artifacts.js';
 import {
@@ -89,7 +93,7 @@ enrollRoutes.post('/v2/ticket', requireAuth(), async (c) => {
   const parsed = TICKET_BODY.safeParse(body);
   if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
   const { os, arch } = parsed.data;
-  if (!isControlledNodeOs(os) || !isControlledNodeArch(arch) || !isCanonicalControlledNodePair(os, arch)) {
+  if (!isControlledNodeOs(os) || !isControlledNodeArtifactArch(arch) || !isCanonicalControlledNodePair(os, arch)) {
     return c.json({ error: 'invalid_body' }, 400);
   }
 
@@ -447,14 +451,13 @@ async function consumeAndStream(c: Context, rawTicket: string): Promise<Response
     await releaseAttempt(c.env.DB as Database, reservation.attemptId, reservation.ticketId, ip, now);
     return c.json({ error: 'executable_dir_not_configured' }, 503);
   }
-  if (!isControlledNodeOs(reservation.os)
-    || !isControlledNodeArch(reservation.arch)
-    || !isCanonicalControlledNodePair(reservation.os, reservation.arch)) {
+  const downloadTarget = normalizeControlledNodeArtifactPair(reservation.os, reservation.arch);
+  if (!downloadTarget) {
     await releaseAttempt(c.env.DB as Database, reservation.attemptId, reservation.ticketId, ip, now);
     return c.json({ error: 'unsupported_artifact' }, 500);
   }
-  const downloadOs: ControlledNodeOs = reservation.os;
-  const downloadArch: ControlledNodeArch = reservation.arch;
+  const downloadOs: ControlledNodeOs = downloadTarget.os;
+  const downloadArch: ControlledNodeArtifactArch = downloadTarget.arch;
   const v = await artifactCatalog.ensureVerified(dir, downloadOs, downloadArch);
   if (!v.ok) {
     await releaseAttempt(c.env.DB as Database, reservation.attemptId, reservation.ticketId, ip, now);
@@ -592,7 +595,7 @@ function controlledNodeRuntimePlatform(os: ControlledNodeOs): 'win32' | 'darwin'
 async function openComputerUseHelperArtifact(
   dir: string,
   os: ControlledNodeOs,
-  arch: ControlledNodeArch,
+  arch: ControlledNodeArtifactArch,
 ): Promise<{
   handle: FileHandle;
   close: () => Promise<void>;
@@ -664,7 +667,8 @@ enrollRoutes.get('/v2/node-artifact', async (c) => {
   });
   if (!parsed.success) return c.json({ error: 'invalid_query' }, 400);
   const { serverId, os, arch, asset } = parsed.data;
-  if (!isControlledNodeOs(os) || !isControlledNodeArch(arch) || !isCanonicalControlledNodePair(os, arch)) {
+  const artifactTarget = normalizeControlledNodeArtifactPair(os, arch);
+  if (!artifactTarget) {
     return c.json({ error: 'invalid_query' }, 400);
   }
 
@@ -683,15 +687,18 @@ enrollRoutes.get('/v2/node-artifact', async (c) => {
   if (!server || server.token_hash !== tokenHash) return c.json({ error: 'unauthorized' }, 401);
   if (server.revoked_at != null) return c.json({ error: 'revoked' }, 403);
   if (server.node_role !== NODE_ROLE.CONTROLLED) return c.json({ error: 'forbidden' }, 403);
-  if ((server.os && server.os !== os) || (server.arch && server.arch !== arch)) {
+  if ((server.os && server.arch
+      && !isControlledNodeArtifactCompatibleWithRuntime(artifactTarget.os, artifactTarget.arch, server.os, server.arch))
+    || (server.os && !server.arch && server.os !== artifactTarget.os)
+    || (!server.os && server.arch)) {
     return c.json({ error: 'platform_mismatch' }, 403);
   }
 
   const dir = process.env.IMCODES_NODE_EXE_DIR;
   if (!dir) return c.json({ error: 'executable_dir_not_configured' }, 503);
   if (asset === CONTROLLED_NODE_ARTIFACT_ASSETS.COMPUTER_USE_HELPER) {
-    const openedHelper = await openComputerUseHelperArtifact(dir, os, arch);
-    if (!openedHelper) return c.json({ error: 'computer_use_helper_not_built', os, arch }, 503);
+    const openedHelper = await openComputerUseHelperArtifact(dir, artifactTarget.os, artifactTarget.arch);
+    if (!openedHelper) return c.json({ error: 'computer_use_helper_not_built', os: artifactTarget.os, arch: artifactTarget.arch }, 503);
     c.header('Content-Length', String(openedHelper.sizeBytes));
     c.header('Content-Type', 'application/octet-stream');
     c.header('Content-Disposition', `attachment; filename="${openedHelper.filename}"`);
@@ -704,12 +711,12 @@ enrollRoutes.get('/v2/node-artifact', async (c) => {
     c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.FILENAME, openedHelper.filename);
     return c.body(buildBareArtifactStream(openedHelper.handle, openedHelper.sizeBytes, openedHelper.close) as unknown as ReadableStream, 200);
   }
-  const v = await artifactCatalog.ensureVerified(dir, os, arch);
-  if (!v.ok) return c.json({ error: 'executable_not_built', os, arch }, 503);
+  const v = await artifactCatalog.ensureVerified(dir, artifactTarget.os, artifactTarget.arch);
+  if (!v.ok) return c.json({ error: 'executable_not_built', os: artifactTarget.os, arch: artifactTarget.arch }, 503);
   await artifactCatalog.persistDescriptor(c.env.DB as Database, v.descriptor).catch(() => {});
   const opened = await artifactCatalog.openPinned(dir, v.descriptor);
   if (!opened) {
-    artifactCatalog.invalidate(dir, os, arch);
+    artifactCatalog.invalidate(dir, artifactTarget.os, artifactTarget.arch);
     return c.json({ error: 'artifact_digest_mismatch' }, 503);
   }
 
@@ -822,7 +829,7 @@ enrollRoutes.post('/v2/redeem', async (c) => {
   const parsed = REDEEM_BODY.safeParse(body);
   if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
   const { enrollToken, installId, nodeTokenHash, hostname, os, arch } = parsed.data;
-  if (!isControlledNodeOs(os) || !isControlledNodeArch(arch) || !isCanonicalControlledNodePair(os, arch)) {
+  if (!isControlledNodeOs(os) || !isControlledNodeArch(arch) || !isControlledNodeRuntimePair(os, arch)) {
     return c.json({ error: 'invalid_body' }, 400);
   }
   const codeHash = sha256Hex(enrollToken);
@@ -857,7 +864,7 @@ enrollRoutes.post('/v2/redeem', async (c) => {
       if (!row.reusable && (row.expires_at == null || Number(row.expires_at) <= now)) {
         return { kind: 'denied' as const };
       }
-      if (row.os !== os || row.arch !== arch) {
+      if (!isControlledNodeArtifactCompatibleWithRuntime(row.os, row.arch, os, arch)) {
         return { kind: 'mismatch' as const, ticketId: row.id };
       }
 

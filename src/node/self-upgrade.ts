@@ -4,8 +4,8 @@ import { chmod, mkdir, mkdtemp, readFile, stat, writeFile } from 'node:fs/promis
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import {
-  CONTROLLED_NODE_ARCH_ARM64,
   CONTROLLED_NODE_ARCH_X64,
+  CONTROLLED_NODE_ARTIFACT_ARCH_UNIVERSAL,
   CONTROLLED_NODE_ARTIFACT_ASSETS,
   CONTROLLED_NODE_ARTIFACT_HEADERS,
   CONTROLLED_NODE_ARTIFACT_UPGRADE_PATH,
@@ -13,7 +13,7 @@ import {
   CONTROLLED_NODE_OS_LINUX,
   CONTROLLED_NODE_OS_MAC,
   CONTROLLED_NODE_OS_WIN,
-  type ControlledNodeArch,
+  type ControlledNodeArtifactArch,
   type ControlledNodeOs,
 } from '../../shared/controlled-node-artifacts.js';
 import { DAEMON_UPGRADE_TARGET_LATEST, normalizeDaemonUpgradeTargetVersion } from '../../shared/daemon-upgrade.js';
@@ -28,7 +28,7 @@ import { loadInstallJournal, INSTALL_JOURNAL_VERSION } from './install-journal.j
 
 export interface ControlledNodeArtifactTarget {
   os: ControlledNodeOs;
-  arch: ControlledNodeArch;
+  arch: ControlledNodeArtifactArch;
 }
 
 export interface ControlledNodeSelfUpgradeDeps {
@@ -65,7 +65,9 @@ export function controlledNodeArtifactTarget(
   arch: NodeJS.Architecture = process.arch,
 ): ControlledNodeArtifactTarget | null {
   if (platform === 'win32' && arch === 'x64') return { os: CONTROLLED_NODE_OS_WIN, arch: CONTROLLED_NODE_ARCH_X64 };
-  if (platform === 'darwin' && arch === 'arm64') return { os: CONTROLLED_NODE_OS_MAC, arch: CONTROLLED_NODE_ARCH_ARM64 };
+  if (platform === 'darwin' && (arch === 'arm64' || arch === 'x64')) {
+    return { os: CONTROLLED_NODE_OS_MAC, arch: CONTROLLED_NODE_ARTIFACT_ARCH_UNIVERSAL };
+  }
   if (platform === 'linux' && arch === 'x64') return { os: CONTROLLED_NODE_OS_LINUX, arch: CONTROLLED_NODE_ARCH_X64 };
   return null;
 }

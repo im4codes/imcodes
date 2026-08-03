@@ -1,8 +1,7 @@
 // Canonical controlled-node installer artifacts shared by web (and server tests).
 //
-// The 7.5 product gate requires exactly three platform pairs. On-disk layout
-// today uses one manifest per OS filename, so this list is the explicit product
-// contract — do not assume an arbitrary OS×arch matrix without changing disk layout.
+// The product ships one downloadable artifact per OS. macOS is a Universal 2
+// binary while the enrolled machine still reports its real runtime architecture.
 
 export const CONTROLLED_NODE_OS_WIN = 'win' as const;
 export const CONTROLLED_NODE_OS_MAC = 'mac' as const;
@@ -10,6 +9,7 @@ export const CONTROLLED_NODE_OS_LINUX = 'linux' as const;
 
 export const CONTROLLED_NODE_ARCH_X64 = 'x64' as const;
 export const CONTROLLED_NODE_ARCH_ARM64 = 'arm64' as const;
+export const CONTROLLED_NODE_ARTIFACT_ARCH_UNIVERSAL = 'universal' as const;
 
 export type ControlledNodeOs =
   | typeof CONTROLLED_NODE_OS_WIN
@@ -20,15 +20,19 @@ export type ControlledNodeArch =
   | typeof CONTROLLED_NODE_ARCH_X64
   | typeof CONTROLLED_NODE_ARCH_ARM64;
 
+export type ControlledNodeArtifactArch =
+  | ControlledNodeArch
+  | typeof CONTROLLED_NODE_ARTIFACT_ARCH_UNIVERSAL;
+
 export interface ControlledNodeArtifactPair {
   os: ControlledNodeOs;
-  arch: ControlledNodeArch;
+  arch: ControlledNodeArtifactArch;
 }
 
-/** Fixed triple for Win x64 / macOS arm64 / Linux x64 (7.5 gate). */
+/** Fixed triple for Win x64 / macOS Universal 2 / Linux x64. */
 export const CONTROLLED_NODE_CANONICAL_ARTIFACTS: readonly ControlledNodeArtifactPair[] = [
   { os: CONTROLLED_NODE_OS_WIN, arch: CONTROLLED_NODE_ARCH_X64 },
-  { os: CONTROLLED_NODE_OS_MAC, arch: CONTROLLED_NODE_ARCH_ARM64 },
+  { os: CONTROLLED_NODE_OS_MAC, arch: CONTROLLED_NODE_ARTIFACT_ARCH_UNIVERSAL },
   { os: CONTROLLED_NODE_OS_LINUX, arch: CONTROLLED_NODE_ARCH_X64 },
 ] as const;
 
@@ -38,19 +42,27 @@ export const CONTROLLED_NODE_OS_ORDER: readonly ControlledNodeOs[] = [
   CONTROLLED_NODE_OS_LINUX,
 ] as const;
 
-export const CONTROLLED_NODE_ARCH_ORDER: readonly ControlledNodeArch[] = [
+export const CONTROLLED_NODE_ARCH_ORDER: readonly ControlledNodeArtifactArch[] = [
   CONTROLLED_NODE_ARCH_X64,
   CONTROLLED_NODE_ARCH_ARM64,
+  CONTROLLED_NODE_ARTIFACT_ARCH_UNIVERSAL,
 ] as const;
 
 /** All known OS values for wire/manifest guards. */
 export const CONTROLLED_NODE_OS_VALUES: readonly ControlledNodeOs[] = CONTROLLED_NODE_OS_ORDER;
 
-/** All known arch values for wire/manifest guards. */
-export const CONTROLLED_NODE_ARCH_VALUES: readonly ControlledNodeArch[] = CONTROLLED_NODE_ARCH_ORDER;
+/** Runtime architectures reported by an enrolled machine. */
+export const CONTROLLED_NODE_ARCH_VALUES: readonly ControlledNodeArch[] = [
+  CONTROLLED_NODE_ARCH_X64,
+  CONTROLLED_NODE_ARCH_ARM64,
+] as const;
+
+/** Architectures exposed by downloadable artifacts. */
+export const CONTROLLED_NODE_ARTIFACT_ARCH_VALUES: readonly ControlledNodeArtifactArch[] = CONTROLLED_NODE_ARCH_ORDER;
 
 const CONTROLLED_NODE_OS_SET = new Set<string>(CONTROLLED_NODE_OS_VALUES);
 const CONTROLLED_NODE_ARCH_SET = new Set<string>(CONTROLLED_NODE_ARCH_VALUES);
+const CONTROLLED_NODE_ARTIFACT_ARCH_SET = new Set<string>(CONTROLLED_NODE_ARTIFACT_ARCH_VALUES);
 
 /** Availability manifest sha256: non-empty 64-char lowercase/uppercase hex. */
 export const CONTROLLED_NODE_ARTIFACT_SHA256_PATTERN = /^[0-9a-f]{64}$/i;
@@ -61,6 +73,10 @@ export function isControlledNodeOs(value: string): value is ControlledNodeOs {
 
 export function isControlledNodeArch(value: string): value is ControlledNodeArch {
   return CONTROLLED_NODE_ARCH_SET.has(value);
+}
+
+export function isControlledNodeArtifactArch(value: string): value is ControlledNodeArtifactArch {
+  return CONTROLLED_NODE_ARTIFACT_ARCH_SET.has(value);
 }
 
 export function isControlledNodeArtifactSha256(value: string): boolean {
@@ -101,12 +117,44 @@ export const CONTROLLED_NODE_ARTIFACT_HEADERS = {
   VERSION: 'x-imcodes-node-artifact-version',
 } as const;
 
-export function controlledNodeArtifactKey(os: ControlledNodeOs, arch: ControlledNodeArch): string {
+export function controlledNodeArtifactKey(os: ControlledNodeOs, arch: ControlledNodeArtifactArch): string {
   return `${os}:${arch}`;
 }
 
 export function isCanonicalControlledNodePair(os: string, arch: string): boolean {
   return CONTROLLED_NODE_CANONICAL_ARTIFACTS.some((pair) => pair.os === os && pair.arch === arch);
+}
+
+/** Normalize a current artifact target or a legacy macOS runtime target. */
+export function normalizeControlledNodeArtifactPair(os: string, arch: string): ControlledNodeArtifactPair | null {
+  const canonical = CONTROLLED_NODE_CANONICAL_ARTIFACTS.find((pair) => pair.os === os && pair.arch === arch);
+  if (canonical) return canonical;
+  if (os === CONTROLLED_NODE_OS_MAC
+    && (arch === CONTROLLED_NODE_ARCH_X64 || arch === CONTROLLED_NODE_ARCH_ARM64)) {
+    return { os: CONTROLLED_NODE_OS_MAC, arch: CONTROLLED_NODE_ARTIFACT_ARCH_UNIVERSAL };
+  }
+  return null;
+}
+
+export function isControlledNodeRuntimePair(os: string, arch: string): boolean {
+  return (os === CONTROLLED_NODE_OS_WIN && arch === CONTROLLED_NODE_ARCH_X64)
+    || (os === CONTROLLED_NODE_OS_MAC
+      && (arch === CONTROLLED_NODE_ARCH_X64 || arch === CONTROLLED_NODE_ARCH_ARM64))
+    || (os === CONTROLLED_NODE_OS_LINUX && arch === CONTROLLED_NODE_ARCH_X64);
+}
+
+export function isControlledNodeArtifactCompatibleWithRuntime(
+  artifactOs: string,
+  artifactArch: string,
+  runtimeOs: string,
+  runtimeArch: string,
+): boolean {
+  if (!isControlledNodeRuntimePair(runtimeOs, runtimeArch) || artifactOs !== runtimeOs) return false;
+  // Preserve redemption of already-downloaded legacy per-architecture packages.
+  if (artifactArch === runtimeArch) return true;
+  return artifactOs === CONTROLLED_NODE_OS_MAC
+    && artifactArch === CONTROLLED_NODE_ARTIFACT_ARCH_UNIVERSAL
+    && isCanonicalControlledNodePair(artifactOs, artifactArch);
 }
 
 export function compareControlledNodeArtifactPairs(

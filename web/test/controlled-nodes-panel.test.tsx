@@ -31,7 +31,7 @@ const listAvailableExecutables = vi.fn(async (): Promise<ControlledNodeAvailabil
   available: ['win', 'mac', 'linux'],
   artifacts: [
     { os: 'win', filename: 'imcodes-node.exe', sizeBytes: 12_345_678, sha256: 'abc', arch: 'x64' },
-    { os: 'mac', filename: 'imcodes-node-macos', sizeBytes: 11_000_000, sha256: 'abd', arch: 'arm64' },
+    { os: 'mac', filename: 'imcodes-node-macos', sizeBytes: 22_000_000, sha256: 'abd', arch: 'universal' },
     { os: 'linux', filename: 'imcodes-node-linux', sizeBytes: 9_876_543, sha256: 'def', arch: 'x64' },
   ],
 }));
@@ -102,8 +102,8 @@ describe('ControlledNodesPanel (12.3)', () => {
     const { container } = render(<ControlledNodesPanel />);
     await waitFor(() => expect(container.textContent).toContain('controlled_nodes.download_target'));
     const downloadBtns = Array.from(container.querySelectorAll('.controlled-nodes-download-btn'));
-    expect(downloadBtns).toHaveLength(3); // win x64, mac arm64, linux x64
-    expect(container.textContent).toContain('arm64');
+    expect(downloadBtns).toHaveLength(3); // win x64, mac Universal 2, linux x64
+    expect(container.textContent).toContain('universal');
     expect(container.querySelector('.controlled-nodes-download-item.is-win')).toBeTruthy();
     expect(container.querySelector('.controlled-nodes-download-item.is-mac')).toBeTruthy();
     expect(container.querySelector('.controlled-nodes-download-item.is-linux')).toBeTruthy();
@@ -112,8 +112,8 @@ describe('ControlledNodesPanel (12.3)', () => {
   it('shows artifact metadata (arch + size) when present', async () => {
     const { container } = render(<ControlledNodesPanel />);
     await waitFor(() => expect(container.textContent).toContain('x64'));
-    expect(container.textContent).toContain('arm64');
-    expect(container.textContent).toContain('11.8 MB');
+    expect(container.textContent).toContain('universal');
+    expect(container.textContent).toContain('21.0 MB');
     expect(container.textContent).toContain('9.4 MB');
   });
 

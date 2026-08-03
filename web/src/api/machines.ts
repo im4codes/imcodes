@@ -12,17 +12,17 @@ import {
   compareControlledNodeArtifactPairs,
   controlledNodeArtifactKey,
   isCanonicalControlledNodePair,
-  isControlledNodeArch,
+  isControlledNodeArtifactArch,
   isControlledNodeArtifactSha256,
   isControlledNodeOs,
-  type ControlledNodeArch,
+  type ControlledNodeArtifactArch,
   type ControlledNodeArtifactPair,
   type ControlledNodeOs,
 } from '@shared/controlled-node-artifacts.js';
 import { MACHINE_API_PATH } from '@shared/machine-reference.js';
 import { apiFetch, getApiBaseUrl } from '../api.js';
 
-export type { ControlledNodeArch, ControlledNodeOs };
+export type { ControlledNodeArtifactArch, ControlledNodeOs };
 
 /** One controllable machine as shown in the composer picker. */
 export interface MachineListItem {
@@ -40,7 +40,7 @@ export interface ControlledNodeArtifactSelection extends ControlledNodeArtifactP
 /** Per-artifact metadata returned by GET /api/enroll/v2/availability. */
 export interface ControlledNodeArtifactMetadata {
   os: ControlledNodeOs;
-  arch: ControlledNodeArch;
+  arch: ControlledNodeArtifactArch;
   filename: string;
   sizeBytes: number;
   sha256: string;
@@ -58,7 +58,7 @@ export interface ControlledNodeExecutableTicket {
   ticket: string;
   ticketId: string;
   os: ControlledNodeOs;
-  arch: ControlledNodeArch;
+  arch: ControlledNodeArtifactArch;
   filename: string;
   sizeBytes: number;
   sha256: string;
@@ -80,7 +80,7 @@ function isRecord(v: unknown): v is Record<string, unknown> {
 function normalizeArtifact(raw: unknown): ControlledNodeArtifactMetadata | null {
   if (!isRecord(raw)) return null;
   const os = typeof raw.os === 'string' && isControlledNodeOs(raw.os) ? raw.os : null;
-  const arch = typeof raw.arch === 'string' && isControlledNodeArch(raw.arch) ? raw.arch : null;
+  const arch = typeof raw.arch === 'string' && isControlledNodeArtifactArch(raw.arch) ? raw.arch : null;
   const filename = typeof raw.filename === 'string' ? raw.filename : '';
   const sizeBytes = typeof raw.sizeBytes === 'number' && Number.isFinite(raw.sizeBytes) ? raw.sizeBytes : null;
   const sha256 = typeof raw.sha256 === 'string' && isControlledNodeArtifactSha256(raw.sha256) ? raw.sha256 : null;
@@ -110,7 +110,7 @@ function normalizeTicket(res: unknown): ControlledNodeExecutableTicket {
       ? res.id
       : '';
   const os = typeof res.os === 'string' && isControlledNodeOs(res.os) ? res.os : null;
-  const arch = typeof res.arch === 'string' && isControlledNodeArch(res.arch) ? res.arch : null;
+  const arch = typeof res.arch === 'string' && isControlledNodeArtifactArch(res.arch) ? res.arch : null;
   const filename = typeof res.filename === 'string' ? res.filename : '';
   const sizeBytes = typeof res.sizeBytes === 'number' && Number.isFinite(res.sizeBytes) ? res.sizeBytes : null;
   const sha256 = typeof res.sha256 === 'string' && isControlledNodeArtifactSha256(res.sha256) ? res.sha256 : null;

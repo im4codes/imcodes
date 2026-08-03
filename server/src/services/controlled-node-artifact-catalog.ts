@@ -14,14 +14,14 @@ import { lstat, open, type FileHandle } from 'node:fs/promises';
 import { join } from 'node:path';
 import {
   CONTROLLED_NODE_CANONICAL_ARTIFACTS,
-  type ControlledNodeArch,
+  type ControlledNodeArtifactArch,
   type ControlledNodeOs,
 } from '../../../shared/controlled-node-artifacts.js';
 import { DAEMON_UPGRADE_TARGET_LATEST, normalizeDaemonUpgradeTargetVersion } from '../../../shared/daemon-upgrade.js';
 import type { Database } from '../db/client.js';
 
 export type SupportedOs = ControlledNodeOs;
-export type SupportedArch = ControlledNodeArch;
+export type SupportedArch = ControlledNodeArtifactArch;
 
 interface ArtifactIdentity {
   dev?: number;
@@ -73,11 +73,11 @@ interface CacheEntry {
 const NEGATIVE_TTL_MS = 30_000;
 const HASH_BUFFER_BYTES = 64 * 1024;
 
-const NODE_EXE_FILENAMES: Record<SupportedOs, string> = {
-  win: 'imcodes-node.exe',
-  mac: 'imcodes-node-macos',
-  linux: 'imcodes-node-linux',
-};
+const NODE_EXE_FILENAMES = new Map<string, string>([
+  ['win:x64', 'imcodes-node.exe'],
+  ['mac:universal', 'imcodes-node-macos'],
+  ['linux:x64', 'imcodes-node-linux'],
+]);
 
 function cacheKey(dir: string, os: SupportedOs, arch: SupportedArch): string {
   return `${dir}::${os}::${arch}`;
@@ -117,7 +117,8 @@ async function probeArtifact(
   os: SupportedOs,
   arch: SupportedArch,
 ): Promise<ArtifactProbe | null> {
-  const filename = NODE_EXE_FILENAMES[os];
+  const filename = NODE_EXE_FILENAMES.get(`${os}:${arch}`);
+  if (!filename) return null;
   const manifestPath = join(dir, `${filename}.manifest.json`);
   const artifactPath = join(dir, filename);
   let manifestHandle: FileHandle | null = null;

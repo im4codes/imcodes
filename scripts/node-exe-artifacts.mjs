@@ -12,15 +12,15 @@ export const NODE_EXE_MANIFEST_SUFFIX = '.manifest.json';
 
 const SHA256_RE = /^[a-f0-9]{64}$/;
 const SUPPORTED_PLATFORMS = new Set(['linux', 'darwin', 'win32']);
-const SUPPORTED_ARCHES = new Set(['x64', 'arm64']);
-const EXPECTED_OS_BY_ARTIFACT = new Map([
-  ['imcodes-node-linux', 'linux'],
-  ['imcodes-node-macos', 'darwin'],
-  ['imcodes-node.exe', 'win32'],
+const SUPPORTED_ARCHES = new Set(['x64', 'arm64', 'universal']);
+const EXPECTED_TARGET_BY_ARTIFACT = new Map([
+  ['imcodes-node-linux', { os: 'linux', arch: 'x64' }],
+  ['imcodes-node-macos', { os: 'darwin', arch: 'universal' }],
+  ['imcodes-node.exe', { os: 'win32', arch: 'x64' }],
 ]);
 const EXPECTED_HELPER_BY_ARTIFACT = new Map([
   ['imcodes-node-linux', ['computer-use-helper', 'linux-x64', 'open-computer-use']],
-  ['imcodes-node-macos', ['computer-use-helper', 'darwin-arm64', 'open-computer-use.app.zip']],
+  ['imcodes-node-macos', ['computer-use-helper', 'darwin-universal', 'open-computer-use.app.zip']],
   ['imcodes-node.exe', ['computer-use-helper', 'win32-x64', 'open-computer-use.exe']],
 ]);
 const BUILD_VERSION_RE = /^[0-9]+(?:\.[0-9]+){1,3}(?:-[0-9A-Za-z]+(?:\.[0-9A-Za-z]+)*)?$/;
@@ -61,6 +61,32 @@ export async function verifyOfficialNodeArtifact(artifactPath, artifactName, sha
   return actual;
 }
 
+function assertUniversalNodeArchives(value, context) {
+  if (!Array.isArray(value) || value.length !== 2) {
+    throw new Error(`${context}: toolchain.nodeArchives must contain x64 and arm64 entries`);
+  }
+  const seen = new Set();
+  for (const entry of value) {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+      throw new Error(`${context}: invalid universal Node archive entry`);
+    }
+    if ((entry.arch !== 'x64' && entry.arch !== 'arm64') || seen.has(entry.arch)) {
+      throw new Error(`${context}: invalid or duplicate universal Node archive architecture`);
+    }
+    if (typeof entry.nodeArchive !== 'string'
+      || basename(entry.nodeArchive) !== entry.nodeArchive
+      || entry.nodeArchive.length === 0
+      || typeof entry.nodeArchiveSha256 !== 'string'
+      || !SHA256_RE.test(entry.nodeArchiveSha256)) {
+      throw new Error(`${context}: invalid universal Node archive provenance`);
+    }
+    seen.add(entry.arch);
+  }
+  if (!seen.has('x64') || !seen.has('arm64')) {
+    throw new Error(`${context}: universal Node archive architectures are incomplete`);
+  }
+}
+
 export async function createNodeExeManifest({
   artifactPath,
   os,
@@ -71,12 +97,14 @@ export async function createNodeExeManifest({
   postjectVersion,
   buildCommit,
   buildVersion,
+  nodeArchives,
 }) {
   if (!SUPPORTED_PLATFORMS.has(os)) throw new Error(`unsupported manifest os: ${os}`);
   if (!SUPPORTED_ARCHES.has(arch)) throw new Error(`unsupported manifest arch: ${arch}`);
   if (typeof nodeVersion !== 'string' || !/^v\d+\.\d+\.\d+$/.test(nodeVersion)) throw new Error('invalid Node version');
   if (typeof nodeArchive !== 'string' || basename(nodeArchive) !== nodeArchive || nodeArchive.length === 0) throw new Error('invalid Node archive');
   if (typeof nodeArchiveSha256 !== 'string' || !SHA256_RE.test(nodeArchiveSha256)) throw new Error('invalid Node archive SHA-256');
+  if (arch === 'universal') assertUniversalNodeArchives(nodeArchives, 'universal manifest');
   if (typeof postjectVersion !== 'string' || postjectVersion.length === 0) throw new Error('invalid postject version');
   if (typeof buildCommit !== 'string' || !/^[a-f0-9]{7,64}$/.test(buildCommit.trim())) throw new Error('invalid build commit');
   const normalizedBuildVersion = normalizeNodeExeBuildVersion(buildVersion);
@@ -97,6 +125,7 @@ export async function createNodeExeManifest({
       nodeArchive,
       nodeArchiveSha256,
       postjectVersion,
+      ...(arch === 'universal' ? { nodeArchives } : {}),
     },
     build: {
       commit: buildCommit.trim(),
@@ -127,6 +156,13 @@ function assertManifestShape(value, manifestPath) {
   if (typeof toolchain.nodeArchive !== 'string' || basename(toolchain.nodeArchive) !== toolchain.nodeArchive || toolchain.nodeArchive.length === 0) fail('toolchain.nodeArchive is invalid');
   if (typeof toolchain.nodeArchiveSha256 !== 'string' || !SHA256_RE.test(toolchain.nodeArchiveSha256)) fail('toolchain.nodeArchiveSha256 is invalid');
   if (typeof toolchain.postjectVersion !== 'string' || toolchain.postjectVersion.length === 0) fail('toolchain.postjectVersion is invalid');
+  if (artifact.arch === 'universal') {
+    try {
+      assertUniversalNodeArchives(toolchain.nodeArchives, manifestPath);
+    } catch (error) {
+      fail(error instanceof Error ? error.message : String(error));
+    }
+  }
   if (!build || typeof build !== 'object' || Array.isArray(build) || typeof build.commit !== 'string' || !/^[a-f0-9]{7,64}$/.test(build.commit.trim())) fail('build.commit is invalid');
   if (typeof build.version !== 'string' || !BUILD_VERSION_RE.test(build.version.trim())) fail('build.version is invalid');
   return value;
@@ -166,8 +202,9 @@ export async function verifyNodeExeManifestSet(artifactDirectory, expectedFileNa
     const manifestPath = join(artifactDirectory, `${fileName}${NODE_EXE_MANIFEST_SUFFIX}`);
     const manifest = await verifyNodeExeManifest(manifestPath, artifactDirectory);
     if (manifest.artifact.fileName !== fileName) throw new Error(`manifest ${manifestPath} describes ${manifest.artifact.fileName}, expected ${fileName}`);
-    const expectedOs = EXPECTED_OS_BY_ARTIFACT.get(fileName);
-    if (expectedOs && manifest.artifact.os !== expectedOs) throw new Error(`controlled-node artifact OS mismatch for ${fileName}: expected ${expectedOs}, got ${manifest.artifact.os}`);
+    const expectedTarget = EXPECTED_TARGET_BY_ARTIFACT.get(fileName);
+    if (expectedTarget && manifest.artifact.os !== expectedTarget.os) throw new Error(`controlled-node artifact OS mismatch for ${fileName}: expected ${expectedTarget.os}, got ${manifest.artifact.os}`);
+    if (expectedTarget && manifest.artifact.arch !== expectedTarget.arch) throw new Error(`controlled-node artifact architecture mismatch for ${fileName}: expected ${expectedTarget.arch}, got ${manifest.artifact.arch}`);
     const toolchainKey = JSON.stringify({
       nodeVersion: manifest.toolchain.nodeVersion,
       postjectVersion: manifest.toolchain.postjectVersion,

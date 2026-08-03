@@ -40,7 +40,7 @@ const TEST_ENCRYPTION_KEY = 'test-bot-encryption-key-do-not-use-in-prod';
 async function writeManifest(
   fileName: 'imcodes-node-linux' | 'imcodes-node.exe' | 'imcodes-node-macos',
   os: 'linux' | 'win32' | 'darwin',
-  arch: 'x64' | 'arm64',
+  arch: 'x64' | 'arm64' | 'universal',
   bytes: Buffer = FAKE_BINARY,
 ): Promise<void> {
   await writeFile(join(exeDir, `${fileName}.manifest.json`), JSON.stringify({
@@ -1201,10 +1201,10 @@ describe('GET /api/enroll/v2/availability + retention', () => {
     expect(artifactCatalog.getDiagnostics().fullHashCount).toBe(2);
   });
 
-  it('covers the canonical macOS arm64 ticket, bootstrap, download and redeem proxy path', async () => {
+  it('covers one canonical macOS Universal 2 artifact redeeming on an Intel runtime', async () => {
     await rm(join(exeDir, 'imcodes-node-macos'), { recursive: true, force: true });
     await writeFile(join(exeDir, 'imcodes-node-macos'), FAKE_BINARY);
-    await writeManifest('imcodes-node-macos', 'darwin', 'arm64');
+    await writeManifest('imcodes-node-macos', 'darwin', 'universal');
     artifactCatalog = createArtifactCatalog();
 
     const app = buildApp();
@@ -1214,12 +1214,12 @@ describe('GET /api/enroll/v2/availability + retention', () => {
     const headers = { 'X-Server-Id': o.serverId, authorization: `Bearer ${o.token}` };
     const available = await app.request('/api/enroll/v2/availability', { headers });
     const catalog = await available.json() as { artifacts: Array<{ os: string; arch: string }> };
-    expect(catalog.artifacts).toContainEqual(expect.objectContaining({ os: 'mac', arch: 'arm64' }));
+    expect(catalog.artifacts).toContainEqual(expect.objectContaining({ os: 'mac', arch: 'universal' }));
 
     const mint = await app.request('/api/enroll/v2/ticket', {
       method: 'POST',
       headers: { ...headers, 'content-type': 'application/json' },
-      body: JSON.stringify({ version: 2, os: 'mac', arch: 'arm64' }),
+      body: JSON.stringify({ version: 2, os: 'mac', arch: 'universal' }),
     });
     expect(mint.status).toBe(200);
     const { ticket } = await mint.json() as { ticket: string };
@@ -1244,12 +1244,27 @@ describe('GET /api/enroll/v2/availability + retention', () => {
         enrollToken: enrollment!.enrollToken,
         installId: `install-${hex(8)}`,
         nodeTokenHash: sha256(`node-${hex(8)}`),
-        hostname: 'mac-arm64-proxy',
+        hostname: 'mac-intel-proxy',
+        os: 'mac',
+        arch: 'x64',
+      }),
+    });
+    expect(redeem.status).toBe(200);
+
+    const armRedeem = await app.request('/api/enroll/v2/redeem', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        version: 2,
+        enrollToken: enrollment!.enrollToken,
+        installId: `install-${hex(8)}`,
+        nodeTokenHash: sha256(`node-${hex(8)}`),
+        hostname: 'mac-apple-silicon-proxy',
         os: 'mac',
         arch: 'arm64',
       }),
     });
-    expect(redeem.status).toBe(200);
+    expect(armRedeem.status).toBe(200);
   });
 
   it('discovers and returns verified artifact metadata before any ticket is minted', async () => {
@@ -1417,23 +1432,30 @@ describe('GET /api/enroll/v2/node-artifact (controlled-node self-upgrade)', () =
     const macServerId = hex(8);
     await db.execute(
       `INSERT INTO servers (id, user_id, name, token_hash, status, created_at, node_role, exec_enabled, os, arch)
-       VALUES ($1, $2, 'controlled-mac', $3, 'online', $4, $5, TRUE, 'mac', 'arm64')`,
+       VALUES ($1, $2, 'controlled-mac-arm', $3, 'online', $4, $5, TRUE, 'mac', 'arm64')`,
       [macServerId, userId, sha256(macToken), Date.now(), NODE_ROLE.CONTROLLED],
     );
     const macArchiveBytes = Buffer.from('SIGNED_OPEN_COMPUTER_USE_APP_ARCHIVE');
-    await mkdir(join(exeDir, 'computer-use-helper', 'darwin-arm64'), { recursive: true });
+    await mkdir(join(exeDir, 'computer-use-helper', 'darwin-universal'), { recursive: true });
     await writeFile(
-      join(exeDir, 'computer-use-helper', 'darwin-arm64', 'open-computer-use.app.zip'),
+      join(exeDir, 'computer-use-helper', 'darwin-universal', 'open-computer-use.app.zip'),
       macArchiveBytes,
     );
     const macHelperResponse = await app.request(
-      `/api/enroll/v2/node-artifact?serverId=${macServerId}&os=mac&arch=arm64&asset=computer-use-helper`,
+      `/api/enroll/v2/node-artifact?serverId=${macServerId}&os=mac&arch=universal&asset=computer-use-helper`,
       { headers: { authorization: `Bearer ${macToken}` } },
     );
     expect(macHelperResponse.status).toBe(200);
     expect(macHelperResponse.headers.get('x-imcodes-node-artifact-filename')).toBe('open-computer-use.app.zip');
     expect(macHelperResponse.headers.get('x-imcodes-node-artifact-sha256')).toBe(sha256(macArchiveBytes));
     expect(Buffer.from(await macHelperResponse.arrayBuffer())).toEqual(macArchiveBytes);
+
+    const legacyMacHelperResponse = await app.request(
+      `/api/enroll/v2/node-artifact?serverId=${macServerId}&os=mac&arch=arm64&asset=computer-use-helper`,
+      { headers: { authorization: `Bearer ${macToken}` } },
+    );
+    expect(legacyMacHelperResponse.status).toBe(200);
+    expect(Buffer.from(await legacyMacHelperResponse.arrayBuffer())).toEqual(macArchiveBytes);
   });
 
   it('rejects full daemon tokens and platform mismatches', async () => {

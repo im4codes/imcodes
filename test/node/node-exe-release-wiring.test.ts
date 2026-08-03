@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 
 describe('controlled-node executable release wiring', () => {
-  it('gates the production image on all three native artifacts', () => {
+  it('gates the production image on all three native artifacts including macOS Universal 2', () => {
     const workflow = readFileSync('.github/workflows/ci.yml', 'utf8');
 
     expect(workflow).toContain('controlled-node-executables:');
@@ -15,6 +15,7 @@ describe('controlled-node executable release wiring', () => {
     expect(workflow).toContain("IMCODES_REQUIRE_COMPUTER_USE_HELPER: '1'");
     expect(workflow).toContain('IMCODES_BUILD_VERSION: ${{ needs.release_version.outputs.app_version }}');
     expect(workflow).toContain('APP_VERSION=${{ needs.release_version.outputs.app_version }}');
+    expect(workflow).toContain('runner: macos-15');
   });
 
   it('exposes the embedded runtime version without bootstrapping or installing', () => {
@@ -55,6 +56,9 @@ describe('controlled-node executable release wiring', () => {
     expect(buildScript).not.toContain("'process.env.IMCODES_BUILD_VERSION': JSON.stringify(packageVersion)");
     expect(buildScript).not.toContain("sh('npx', ['-y', 'postject'");
     expect(packageJson.devDependencies?.postject).toBe('1.0.0-alpha.6');
+    expect(buildScript).toContain("await Promise.all(['arm64', 'x64'].map");
+    expect(buildScript).toContain("sh('lipo', ['-create'");
+    expect(buildScript).toContain("const artifactArch = platform === 'darwin' ? 'universal' : arch");
   });
 
   it('self-hosts the Computer Use helper from a pinned npm package during CI builds', () => {
@@ -67,6 +71,9 @@ describe('controlled-node executable release wiring', () => {
     expect(copyScript).toContain('Open Computer Use.app');
     expect(copyScript).toContain('open-computer-use.app.zip');
     expect(copyScript).toContain("['--verify', '--deep', '--strict', appPath]");
+    expect(copyScript).toContain("'-verify_arch'");
+    expect(copyScript).toContain("'x86_64'");
+    expect(copyScript).toContain("'arm64'");
     expect(copyScript).not.toContain("'--force', '--sign', '-'");
     expect(workflow).toContain("IMCODES_REQUIRE_COMPUTER_USE_HELPER: '1'");
     expect(workflow).toContain('echo "IMCODES_BUILD_VERSION=$VERSION" >> "$GITHUB_ENV"');

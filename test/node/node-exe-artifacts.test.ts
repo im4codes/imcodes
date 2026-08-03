@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 // The production build script is plain ESM so it can run before TypeScript is built.
 // @ts-expect-error No declaration file is emitted for this build-time helper.
-import { verifyOfficialNodeArtifact } from '../../scripts/node-exe-artifacts.mjs';
+import { createNodeExeManifest, verifyOfficialNodeArtifact } from '../../scripts/node-exe-artifacts.mjs';
 
 const verifier = join(process.cwd(), 'scripts', 'node-exe-artifacts.mjs');
 const dirs: string[] = [];
@@ -57,6 +57,38 @@ function writeLinuxHelperFixture(dir: string): void {
   writeFileSync(join(helperDir, 'open-computer-use'), 'helper');
 }
 
+function writeMacosUniversalFixture(dir: string, arch = 'universal'): string {
+  const fileName = 'imcodes-node-macos';
+  const artifact = Buffer.from('universal-controlled-node-artifact');
+  writeFileSync(join(dir, fileName), artifact);
+  const manifestPath = join(dir, `${fileName}.manifest.json`);
+  writeFileSync(manifestPath, `${JSON.stringify({
+    schemaVersion: 1,
+    artifact: {
+      fileName,
+      os: 'darwin',
+      arch,
+      size: artifact.length,
+      sha256: sha256(artifact),
+    },
+    toolchain: {
+      nodeVersion: 'v22.11.0',
+      nodeArchive: 'node-v22.11.0-darwin-arm64.tar.gz',
+      nodeArchiveSha256: 'b'.repeat(64),
+      postjectVersion: '1.0.0-alpha.6',
+      nodeArchives: [
+        { arch: 'arm64', nodeArchive: 'node-v22.11.0-darwin-arm64.tar.gz', nodeArchiveSha256: 'b'.repeat(64) },
+        { arch: 'x64', nodeArchive: 'node-v22.11.0-darwin-x64.tar.gz', nodeArchiveSha256: 'c'.repeat(64) },
+      ],
+    },
+    build: { commit: 'a'.repeat(40), version: '2026.7.1234-dev.5' },
+  })}\n`);
+  const helperDir = join(dir, 'computer-use-helper', 'darwin-universal');
+  mkdirSync(helperDir, { recursive: true });
+  writeFileSync(join(helperDir, 'open-computer-use.app.zip'), 'universal-helper');
+  return manifestPath;
+}
+
 function verify(manifestPath: string, dir: string): void {
   execFileSync(process.execPath, [verifier, 'verify', manifestPath, dir], { stdio: 'pipe' });
 }
@@ -91,6 +123,34 @@ describe('controlled-node executable artifact verification', () => {
     const dir = tempDir();
     const { manifestPath } = writeFixture(dir);
     expect(() => verify(manifestPath, dir)).not.toThrow();
+  });
+
+  it('requires provenance for both official Node slices in a universal manifest', async () => {
+    const dir = tempDir();
+    const artifactPath = join(dir, 'imcodes-node-macos');
+    writeFileSync(artifactPath, 'universal');
+    const base = {
+      artifactPath,
+      os: 'darwin',
+      arch: 'universal',
+      nodeVersion: 'v22.11.0',
+      nodeArchive: 'node-v22.11.0-darwin-arm64.tar.gz',
+      nodeArchiveSha256: 'b'.repeat(64),
+      postjectVersion: '1.0.0-alpha.6',
+      buildCommit: 'a'.repeat(40),
+      buildVersion: '2026.7.1234-dev.5',
+    };
+    await expect(createNodeExeManifest(base)).rejects.toThrow(/x64 and arm64/);
+    await expect(createNodeExeManifest({
+      ...base,
+      nodeArchives: [
+        { arch: 'arm64', nodeArchive: 'node-v22.11.0-darwin-arm64.tar.gz', nodeArchiveSha256: 'b'.repeat(64) },
+        { arch: 'x64', nodeArchive: 'node-v22.11.0-darwin-x64.tar.gz', nodeArchiveSha256: 'c'.repeat(64) },
+      ],
+    })).resolves.toMatchObject({
+      artifact: { fileName: 'imcodes-node-macos', os: 'darwin', arch: 'universal' },
+      toolchain: { nodeArchives: [{ arch: 'arm64' }, { arch: 'x64' }] },
+    });
   });
 
   it('rejects an artifact altered after the manifest was produced', () => {
@@ -143,6 +203,26 @@ describe('controlled-node executable artifact verification', () => {
       [verifier, 'verify-set', dir, 'imcodes-node-linux'],
       { stdio: 'pipe', env: { ...process.env, GITHUB_SHA: 'a'.repeat(40) } },
     )).not.toThrow();
+  });
+
+  it('accepts one macOS Universal 2 artifact with both official Node slice provenances', () => {
+    const dir = tempDir();
+    writeMacosUniversalFixture(dir);
+    expect(() => execFileSync(
+      process.execPath,
+      [verifier, 'verify-set', dir, 'imcodes-node-macos'],
+      { stdio: 'pipe', env: { ...process.env, GITHUB_SHA: 'a'.repeat(40) } },
+    )).not.toThrow();
+  });
+
+  it('rejects a macOS release artifact that is not declared universal', () => {
+    const dir = tempDir();
+    writeMacosUniversalFixture(dir, 'arm64');
+    expect(() => execFileSync(
+      process.execPath,
+      [verifier, 'verify-set', dir, 'imcodes-node-macos'],
+      { stdio: 'pipe', env: { ...process.env, GITHUB_SHA: 'a'.repeat(40) } },
+    )).toThrow(/architecture mismatch/);
   });
 
   it('rejects a release set whose runtime version differs from the server version', () => {
