@@ -176,6 +176,9 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
   const forceRefresh = 'forceRefresh' in timeline ? timeline.forceRefresh : undefined;
   const termScrollRef = useRef<(() => void) | null>(null);
   const chatScrollRef = useRef<(() => void) | null>(null);
+  // Stable identity: an inline arrow here changed on every render and defeated
+  // ChatView's memo, which is the whole reason an idle card costs nothing.
+  const setChatScrollFn = useCallback((fn: () => void) => { chatScrollRef.current = fn; }, []);
   const cardInputRef = useRef<HTMLInputElement>(null);
   const previewRef = useRef<HTMLDivElement>(null);
   const agentTag = isShell ? (sub.shellBin?.split(/[/\\]/).pop() ?? 'shell') : sub.type;
@@ -451,7 +454,7 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
               refreshing={refreshing}
               sessionId={sub.sessionName}
               onForceSync={forceRefresh}
-              onScrollBottomFn={(fn) => { chatScrollRef.current = fn; }}
+              onScrollBottomFn={setChatScrollFn}
               preview
               agentType={sub.type}
               onResendFailed={handleResendFailed}

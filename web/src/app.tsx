@@ -124,6 +124,7 @@ import {
 import { resolveInitialServerId, resolveInitialSessionName, writeHashState } from './hooks/useHashState.js';
 import { useSubSessions, type SubSession } from './hooks/useSubSessions.js';
 import { useProviderStatus } from './hooks/useProviderStatus.js';
+import { useProgressiveMount } from './hooks/useProgressiveMount.js';
 import {
   DEFAULT_NEW_USER_GUIDE_PREF,
   DEFAULT_TEAM_DISCUSSION_GUIDE_PREF,
@@ -2837,6 +2838,22 @@ export function App() {
   const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
   isMobileRef.current = isMobile;
   const desktopLayoutCapable = !isMobile;
+
+  // Open sub-session windows are restored from localStorage, so a reload
+  // re-mounts all of them in one render pass — which is why reloading to escape
+  // a frozen tab just freezes it again. Mount them one frame at a time instead;
+  // the work is the same, but it becomes interruptible (see useProgressiveMount
+  // for the measurements). Window stacking comes from explicit z-index values,
+  // never DOM order, so the focused window can safely jump the queue and paint
+  // in the first frame.
+  const openWindowSubs = useMemo(() => {
+    const open = visibleSubSessions.filter((sub) => openSubIds.has(sub.id)
+      && (isMobile || !pinnedPanels.some((p) => p.type === 'subsession' && p.props?.sessionName === sub.sessionName)));
+    const focusedIndex = open.findIndex((sub) => sub.id === focusedSubId);
+    if (focusedIndex <= 0) return open;
+    return [open[focusedIndex], ...open.slice(0, focusedIndex), ...open.slice(focusedIndex + 1)];
+  }, [visibleSubSessions, openSubIds, isMobile, pinnedPanels, focusedSubId]);
+  const mountedWindowCount = useProgressiveMount(openWindowSubs.length);
   const defaultViewMode: ViewMode = isMobile ? 'chat' : 'terminal';
   // Per-session view mode: Record<sessionName, ViewMode>
   const [viewModes, setViewModes] = useState<Record<string, ViewMode>>(() => {
@@ -6036,9 +6053,7 @@ export function App() {
       )}
 
       {/* Sub-session windows (floating) — only show if not pinned */}
-      {visibleSubSessions.filter((sub) => isMobile || !pinnedPanels.some((p) => p.type === 'subsession' && p.props?.sessionName === sub.sessionName)).map((sub) => {
-        const isOpen = openSubIds.has(sub.id);
-        if (!isOpen) return null;
+      {openWindowSubs.slice(0, mountedWindowCount).map((sub) => {
         return (
           <div key={sub.id} style={{ display: 'contents' }}>
             <SubSessionWindow
