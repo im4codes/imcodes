@@ -4708,7 +4708,23 @@ export class WsBridge {
       // Bypass TerminalForwardQueue: timeline events are control-plane and
       // must never queue behind PTY data. Critical for cancel/stop UX —
       // session.state(idle) used to arrive seconds after the push notification.
-      const timelineRecipients = this.sendJsonToSessionSubscribers(sessionId, JSON.stringify(msg));
+      // Timeline is the shared chat state for every browser viewing this
+      // server, not an exclusive transport stream. The web client normally
+      // keeps passive subscriptions for every known session, but those
+      // subscriptions are intentionally asynchronous (ownership checks,
+      // reconnect replay, runtime-type correction). Tying live timeline
+      // delivery to that transient map creates a multi-device split-brain:
+      // one device can receive every streaming assistant.text update while a
+      // second connected device misses them and only catches the persisted
+      // final event through history/backfill.
+      //
+      // Fan out to the subscribed viewer plus that same user's companion
+      // devices. Different users remain isolated by the session subscription
+      // boundary, and share-scoped sockets still pass through
+      // filterShareOutgoingJson(). PTY/raw frames, transport deltas, and
+      // request/response data remain on their existing subscription/unicast
+      // paths.
+      const timelineRecipients = this.sendJsonToSessionUserDevices(sessionId, JSON.stringify(msg));
       this.recordTimelineFanout(sessionId, rawEvent, timelineRecipients);
       return;
     }
@@ -5384,6 +5400,47 @@ export class WsBridge {
       if (!outgoing) continue;
       sent.add(ws);
       safeSend(ws, outgoing);
+    }
+    return sent.size;
+  }
+
+  /**
+   * Deliver a live timeline event to current subscribers and to every other
+   * browser connection owned by those same users.
+   *
+   * Subscription state is still the authorization/routing anchor: a user with
+   * no socket subscribed to `sessionName` receives nothing. Once one of their
+   * devices is subscribed, companion devices must see the same chat stream
+   * even while their own reconnect/ownership/runtime-classification subscribe
+   * is still settling. This preserves cross-user session isolation while
+   * preventing the mobile-live / desktop-final-only split.
+   */
+  private sendJsonToSessionUserDevices(sessionName: string, json: string): number {
+    const msg = this.tryParseJsonRecord(json);
+    const sent = new Set<WebSocket>();
+    const viewerUserIds = new Set<string>();
+
+    const send = (ws: WebSocket, anchorViewer: boolean): void => {
+      if (sent.has(ws)) return;
+      const outgoing = msg ? this.filterShareOutgoingJson(ws, msg, json) : json;
+      if (!outgoing || !safeSend(ws, outgoing)) return;
+      sent.add(ws);
+      if (!anchorViewer) return;
+      const userId = this.browserUserIds.get(ws);
+      if (userId) viewerUserIds.add(userId);
+    };
+
+    for (const [ws, sessions] of this.browserSubscriptions) {
+      if (sessions.has(sessionName)) send(ws, true);
+    }
+    for (const [ws, sessions] of this.transportSubscriptions) {
+      if (sessions.has(sessionName)) send(ws, true);
+    }
+
+    if (viewerUserIds.size === 0) return sent.size;
+    for (const ws of this.browserSockets) {
+      const userId = this.browserUserIds.get(ws);
+      if (userId && viewerUserIds.has(userId)) send(ws, false);
     }
     return sent.size;
   }

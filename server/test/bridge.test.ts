@@ -5429,6 +5429,60 @@ describe('WsBridge', () => {
       expect(timelineEvents[0].event.payload.text).toBe('live repair works');
     });
 
+    it('streams the same assistant timeline updates to mobile and desktop even if only mobile has subscribed', async () => {
+      const bridge = WsBridge.get(serverId);
+      const db = makeDb('valid-hash');
+      const daemonWs = new MockWs();
+      bridge.handleDaemonConnection(daemonWs as never, db, {} as never);
+      daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+
+      const desktop = new MockWs();
+      const mobile = new MockWs();
+      bridge.handleBrowserConnection(desktop as never, 'same-user', db, false);
+      bridge.handleBrowserConnection(mobile as never, 'same-user', db, true);
+      mobile.emit('message', JSON.stringify({
+        type: 'chat.subscribe',
+        sessionId: 'multi-device-stream',
+        forceHistory: false,
+      }));
+      await flushAsync();
+      desktop.sent.length = 0;
+      mobile.sent.length = 0;
+
+      for (const [seq, text, streaming] of [
+        [1, 'one', true],
+        [2, 'one two', true],
+        [3, 'one two three', false],
+      ] as const) {
+        daemonWs.emit('message', JSON.stringify({
+          type: TIMELINE_MESSAGES.EVENT,
+          event: {
+            eventId: 'transport:multi-device-stream:message-1',
+            sessionId: 'multi-device-stream',
+            ts: 1_000,
+            seq,
+            epoch: 1,
+            type: 'assistant.text',
+            payload: { text, streaming },
+          },
+        }));
+      }
+      await flushAsync();
+
+      for (const browser of [mobile, desktop]) {
+        const updates = browser.sentStrings
+          .map((raw) => JSON.parse(raw))
+          .filter((msg) => msg.type === TIMELINE_MESSAGES.EVENT)
+          .map((msg) => msg.event.payload);
+        expect(updates).toEqual([
+          { text: 'one', streaming: true },
+          { text: 'one two', streaming: true },
+          { text: 'one two three', streaming: false },
+        ]);
+      }
+    });
+
     it('retries live transport subscription ownership for newly created sub-sessions', async () => {
       const bridge = WsBridge.get(serverId);
       const db = makeSubSessionOwnershipRaceDb({ subId: 'race-live' });

@@ -1,11 +1,10 @@
 /**
  * Bridge-level observability for timeline events that never reach a browser.
  *
- * `sendJsonToSessionSubscribers` writes only to sockets currently subscribed to
- * that session. With no subscriber both loops execute zero bodies, so the event
- * is discarded with no queue and no replay. That is the NORMAL state of a
- * backgrounded app — which is why "the push notification arrived but the chat was
- * empty until I hit force-refresh" reproduced so reliably.
+ * Timeline events fan out from a subscribed viewer to that user's companion
+ * browser connections. A companion's transient subscription state must not
+ * make one device stream while another only catches the persisted final event;
+ * users with no subscribed viewer remain isolated.
  *
  * The client now heals that automatically (activation/reconnect request the full
  * newest window with no lower bound), so the drop itself has to be counted or a
@@ -106,8 +105,7 @@ describe('WsBridge timeline drop telemetry', () => {
     return { bridge, daemon };
   }
 
-  it('counts a content-bearing timeline event discarded because nobody is subscribed', async () => {
-    // Exactly the backgrounded-app case: daemon relays, zero viewers subscribed.
+  it('counts a content-bearing timeline event discarded because no browser is connected', async () => {
     const { daemon } = await setupAuthedDaemon();
 
     daemon.emit('message', timelineEvent('assistant.text', 'answer nobody saw'));
@@ -116,6 +114,37 @@ describe('WsBridge timeline drop telemetry', () => {
     expect(getCounter(TIMELINE_DELIVERY_METRICS.SERVER_NO_SUBSCRIBER_DROPPED, { eventType: 'assistant.text' }))
       .toBe(1);
     expect(getCounter(TIMELINE_DELIVERY_METRICS.SERVER_DELIVERED, { eventType: 'assistant.text' }))
+      .toBe(0);
+  });
+
+  it('delivers live timeline events to a same-user companion without its own transient session subscription', async () => {
+    const { bridge, daemon } = await setupAuthedDaemon();
+    const subscribed = new MockWs();
+    const companion = new MockWs();
+    bridge.handleBrowserConnection(subscribed as never, 'user-1', makeDb());
+    bridge.handleBrowserConnection(companion as never, 'user-1', makeDb());
+    subscribed.emit('message', JSON.stringify({
+      type: 'terminal.subscribe',
+      session: SESSION,
+      raw: false,
+    }));
+    await flushAsync();
+    subscribed.sent.length = 0;
+    companion.sent.length = 0;
+
+    daemon.emit('message', timelineEvent('assistant.text', 'streaming on every device'));
+    await flushAsync();
+
+    for (const browser of [subscribed, companion]) {
+      const events = browser.sentStrings
+        .map((raw) => JSON.parse(raw) as { type: string; event?: { payload?: { text?: string } } })
+        .filter((msg) => msg.type === TIMELINE_MESSAGES.EVENT);
+      expect(events).toHaveLength(1);
+      expect(events[0]?.event?.payload?.text).toBe('streaming on every device');
+    }
+    expect(getCounter(TIMELINE_DELIVERY_METRICS.SERVER_DELIVERED, { eventType: 'assistant.text' }))
+      .toBe(1);
+    expect(getCounter(TIMELINE_DELIVERY_METRICS.SERVER_NO_SUBSCRIBER_DROPPED, { eventType: 'assistant.text' }))
       .toBe(0);
   });
 
