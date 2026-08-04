@@ -51,7 +51,7 @@ describe('ZoomedTextDialog', () => {
       }),
     });
 
-    const { container } = render(
+    render(
       <>
         <div>attachment and sidebar chrome</div>
         <ZoomedTextDialog text={'Only this message\nwith two lines'} onClose={vi.fn()} />
@@ -68,17 +68,18 @@ describe('ZoomedTextDialog', () => {
       expect(screen.getByText('common.copied')).toBeTruthy();
     });
     expect(document.execCommand).toHaveBeenCalledWith('copy');
-    expect(container.querySelector('textarea')).toBeNull();
+    // Portalled to <body>, so the fallback textarea (if any) would live there.
+    expect(document.querySelector('textarea')).toBeNull();
   });
 
   it('shows Copy and Quote actions for selected text', async () => {
     const onQuote = vi.fn();
     const onClose = vi.fn();
-    const { container } = render(
+    render(
       <ZoomedTextDialog text="Alpha beta gamma" onClose={onClose} onQuote={onQuote} />,
     );
 
-    const content = container.querySelector('.zoom-text-content')!;
+    const content = document.querySelector('.zoom-text-content')!;
     await act(async () => {
       await Promise.resolve();
     });
@@ -95,5 +96,21 @@ describe('ZoomedTextDialog', () => {
 
     expect(onQuote).toHaveBeenCalledWith('beta');
     expect(onClose).toHaveBeenCalledOnce();
+  });
+  it('renders into <body> so the app bar cannot cover it', () => {
+    // The overlay is `position: fixed; z-index: 9999`, but rendered inside the
+    // chat subtree that number only ranks it among its own siblings.
+    // `.mobile-server-bar` sits at z-index 6500 much higher up the tree, so the
+    // dialog — its header and close button included — ended up underneath the
+    // app bar. Only a body-level portal puts the 9999 where it can win.
+    const { container } = render(
+      <ZoomedTextDialog text="hello" onClose={vi.fn()} />,
+    );
+
+    expect(container.querySelector('.zoom-text-dialog')).toBeNull();
+    const overlay = document.querySelector('.zoom-text-overlay');
+    expect(overlay).toBeTruthy();
+    expect(overlay?.parentElement).toBe(document.body);
+    expect(document.querySelector('.zoom-text-close')).toBeTruthy();
   });
 });

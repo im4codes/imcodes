@@ -12,6 +12,7 @@
  * carries the right paragraph/list/code-block structure.
  */
 import { useEffect, useRef, useState } from 'preact/hooks';
+import { createPortal } from 'preact/compat';
 import { useTranslation } from 'react-i18next';
 import { positionChatActionMenu } from '../chat-action-menu-position.js';
 import { copyToClipboard } from '../util/clipboard.js';
@@ -121,7 +122,14 @@ export function ZoomedTextDialog({ text, onClose, onQuote }: Props) {
     onClose();
   };
 
-  return (
+  // Portal to <body>. The overlay is `position: fixed; z-index: 9999`, but it
+  // renders inside ChatView, so that number only ranks it against its siblings
+  // within whatever stacking context an ancestor established. `.mobile-server-bar`
+  // is `position: relative; z-index: 6500` much higher up the tree, which puts
+  // the entire chat subtree — this dialog included — beneath it: the dialog's
+  // header, and the close button in it, disappeared under the app bar. At the
+  // body level the 9999 finally competes where it was meant to.
+  return createPortal((
     <div
       class="dialog-overlay zoom-text-overlay"
       onClick={onClose}
@@ -185,5 +193,5 @@ export function ZoomedTextDialog({ text, onClose, onQuote }: Props) {
         </div>
       </div>
     </div>
-  );
+  ), document.body);
 }
