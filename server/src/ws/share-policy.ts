@@ -621,31 +621,47 @@ function subsessionRemovedTarget(msg: Record<string, unknown>): ShareTarget | nu
 }
 
 /**
- * Host-side fields on a session row that a share recipient has no business
- * seeing. They describe the machine and the provider account, not the
- * conversation: `projectDir` is an absolute filesystem path, `transportConfig`
- * is an opaque provider blob that can carry env and endpoint settings, and the
- * rest identify the provider session or the owner's plan and quota.
+ * The only session-row fields a share recipient sees: enough to identify and
+ * follow the conversation, and nothing describing the host machine or the
+ * owner's account.
  *
- * Row filtering alone never removed these — it only chose which rows to send —
- * so every covered row shipped them in full, to server-scoped shares as well.
+ * An allowlist, not a denylist. The first version of this listed fields to
+ * strip and still leaked `planLabel`, `permissionLabel` and the per-provider
+ * `*AvailableModels` arrays, because `session-list.ts` emits more account
+ * metadata than the list named. On a struct that grows, a denylist leaks every
+ * field added after it — the failure is silent and belongs to whoever adds the
+ * field, not to whoever reads this. Adding a field to the session list now
+ * keeps it hidden from shares until someone deliberately names it here.
+ *
+ * Deliberately absent: `projectDir` (absolute host path), `transportConfig`
+ * (provider blob that can carry env and endpoints), `providerId` /
+ * `providerSessionId`, every `*AuthType` / `*AuthLimit` / `*AvailableModels`,
+ * `planLabel`, `permissionLabel`, `quota*`, `contextNamespace*`, `effort`,
+ * `ccPreset`, `requestedModel`.
  */
-const SHARE_REDACTED_SESSION_FIELDS = [
-  'projectDir',
-  'transportConfig',
-  'providerSessionId',
-  'qwenAuthType',
-  'qwenAuthLimit',
-  'qwenAvailableModels',
-  'quotaMeta',
-  'quotaLabel',
-  'quotaUsageLabel',
-  'contextNamespace',
-] as const;
+const SHARE_VISIBLE_SESSION_FIELDS = new Set([
+  'name',
+  'sessionInstanceId',
+  'runtimeEpoch',
+  'project',
+  'role',
+  'agentType',
+  'agentVersion',
+  'runtimeType',
+  'label',
+  'description',
+  'state',
+  'parentSession',
+  'error',
+  'activeModel',
+  'modelDisplay',
+]);
 
 function redactSessionRow(row: Record<string, unknown>): Record<string, unknown> {
-  const redacted = { ...row };
-  for (const field of SHARE_REDACTED_SESSION_FIELDS) delete redacted[field];
+  const redacted: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(row)) {
+    if (SHARE_VISIBLE_SESSION_FIELDS.has(key)) redacted[key] = value;
+  }
   return redacted;
 }
 

@@ -1,5 +1,5 @@
 import type { ShareDenialReason, ShareTarget } from '../../../shared/tab-sharing.js';
-import { collectP2pRoutedSessionNames } from '../../../shared/p2p-routing-fields.js';
+import { collectP2pRoutedSessionNames, extractInTextRoutingTargets } from '../../../shared/p2p-routing-fields.js';
 
 export interface P2pSendTargets {
   hasP2pRouting: boolean;
@@ -68,10 +68,18 @@ export function evaluateP2pSendTargetScope(params: {
   // the shared field list, so a new routing field is covered on both sides at
   // once instead of silently only on the daemon's.
   const sweptSessions = collectP2pRoutedSessionNames(params.msg);
-  if (!targets.hasP2pRouting && sweptSessions.length === 0) return null;
+  // Routing also lives in the message text. The daemon parses
+  // `@@discuss(<session>, <mode>)` and `@@all(<mode>)` out of it and fans the
+  // turn out, so a structured-fields-only check let a participant sharing one
+  // tab name any session — or the whole domain — in plain prose.
+  const inText = extractInTextRoutingTargets(params.msg.text);
+  if (!targets.hasP2pRouting && sweptSessions.length === 0
+    && inText.sessions.length === 0 && !inText.expandsAll) {
+    return null;
+  }
   if (params.target.kind === 'server') return null;
-  if (targets.hasUnboundedExpansion) return 'share-direct-surface-denied';
-  const routed = new Set([...targets.sessions, ...sweptSessions]);
+  if (targets.hasUnboundedExpansion || inText.expandsAll) return 'share-direct-surface-denied';
+  const routed = new Set([...targets.sessions, ...sweptSessions, ...inText.sessions]);
   for (const name of routed) {
     if (!params.coversSession(name)) return 'share-direct-surface-denied';
   }

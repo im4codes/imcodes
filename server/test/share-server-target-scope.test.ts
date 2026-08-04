@@ -106,10 +106,24 @@ describe('session_list row redaction', () => {
     state: 'idle',
     projectDir: '/Users/host/private/project',
     transportConfig: { apiBase: 'https://internal.example', env: { TOKEN: 'x' } },
+    providerId: 'claude-code-sdk',
     providerSessionId: 'provider-session-abc',
     qwenAuthType: 'oauth',
+    qwenAuthLimit: 100,
+    qwenAvailableModels: ['qwen-max'],
+    copilotAvailableModels: ['gpt-5'],
+    cursorAvailableModels: ['cursor-fast'],
+    codexAvailableModels: ['o3'],
+    planLabel: 'Max 5x',
+    permissionLabel: 'all',
+    quotaLabel: '80%',
+    quotaUsageLabel: '4/5',
     quotaMeta: { plan: 'enterprise' },
     contextNamespace: 'host-namespace',
+    contextNamespaceDiagnostics: { note: 'host detail' },
+    effort: 'high',
+    ccPreset: 'preset-host',
+    requestedModel: 'claude-opus-5',
   };
 
   it.each([
@@ -126,15 +140,12 @@ describe('session_list row redaction', () => {
     const [out] = delivered?.sessions as Array<Record<string, unknown>>;
     expect(out.name).toBe('deck_proj_brain');
     expect(out.state).toBe('idle');
-    for (const field of [
-      'projectDir',
-      'transportConfig',
-      'providerSessionId',
-      'qwenAuthType',
-      'quotaMeta',
-      'contextNamespace',
-    ]) {
-      expect(out, `${field} must not reach a share recipient`).not.toHaveProperty(field);
+    // Allowlist, so assert the complement: nothing outside the visible set may
+    // survive. A denylist version of this test passed while planLabel,
+    // permissionLabel and the *AvailableModels arrays still went out.
+    const allowed = new Set(['name', 'state']);
+    for (const key of Object.keys(out)) {
+      expect(allowed.has(key), `${key} must not reach a share recipient`).toBe(true);
     }
   });
 });

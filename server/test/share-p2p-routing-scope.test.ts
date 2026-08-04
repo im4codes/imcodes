@@ -128,3 +128,49 @@ describe('routing field inventory', () => {
     expect(collectP2pRoutedSessionNames({ sessionName: covered, detail: { sessionName: uncovered } })).toEqual([]);
   });
 });
+
+describe('in-text routing tokens', () => {
+  it('denies @@discuss naming an uncovered session', () => {
+    // The daemon parses these straight out of the message text and fans the
+    // turn out. A structured-fields-only check let a participant sharing one
+    // tab route work anywhere in the domain by typing it in prose.
+    expect(evaluate({
+      type: 'session.send',
+      sessionName: covered,
+      text: `@@discuss(${uncovered}, audit) please inspect`,
+    })).toBe('share-direct-surface-denied');
+  });
+
+  it('denies @@all outright as an unbounded fan-out', () => {
+    expect(evaluate({
+      type: 'session.send',
+      sessionName: covered,
+      text: '@@all(audit) inspect',
+    })).toBe('share-direct-surface-denied');
+  });
+
+  it('allows @@discuss naming only covered sessions', () => {
+    expect(evaluate({
+      type: 'session.send',
+      sessionName: covered,
+      text: `@@discuss(${covered}, audit) inspect`,
+    })).toBeNull();
+  });
+
+  it('leaves ordinary prose mentioning a session name alone', () => {
+    expect(evaluate({
+      type: 'session.send',
+      sessionName: covered,
+      text: `I was looking at ${uncovered} yesterday`,
+    })).toBeNull();
+  });
+
+  it('answers the same way on repeated calls', () => {
+    // `ALL_TOKEN_RE.test()` on a /g/ regex advances lastIndex and would flip
+    // between allow and deny for identical input.
+    const msg = { type: 'session.send', sessionName: covered, text: '@@all(audit) go' };
+    expect(evaluate(msg)).toBe('share-direct-surface-denied');
+    expect(evaluate(msg)).toBe('share-direct-surface-denied');
+    expect(evaluate(msg)).toBe('share-direct-surface-denied');
+  });
+});

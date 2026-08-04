@@ -84,6 +84,47 @@ export function collectRoutedSessionNames(value: unknown, out: Set<string> = new
 }
 
 /**
+ * Legacy in-text routing control tokens, kept byte-identical to the daemon's
+ * own regexes in `command-handler.ts` (`DISCUSS_TOKEN_RE` / `ALL_TOKEN_RE`).
+ *
+ * `session.send` routing does not only live in structured fields: the daemon
+ * still parses `@@discuss(<session>, <mode>)` and `@@all(<mode>)` straight out
+ * of the message text and fans the turn out accordingly. The share scope check
+ * inspected structured fields only, so a participant sharing a single tab
+ * could name any session in the store — or every session in the domain — in
+ * plain text and have it run. Both forms must be scoped here.
+ */
+const DISCUSS_TOKEN_RE = /@@discuss\(([^,]+),\s*([^)]+)\)/g;
+// Non-global on purpose: `.test()` on a /g/ regex advances lastIndex and would
+// return alternating answers across calls for the same input.
+const ALL_TOKEN_RE = /@@all\(([^)]+)\)/;
+
+export interface InTextRoutingTargets {
+  /** Sessions named by `@@discuss(...)`. */
+  sessions: string[];
+  /** True when `@@all(...)` appears — an unbounded fan-out across the domain. */
+  expandsAll: boolean;
+}
+
+/**
+ * Extract routing targets from a message's text.
+ *
+ * Deliberately does not validate modes or session existence: this is an
+ * authorization input, so anything that *looks* like a target must be treated
+ * as one. The daemon drops tokens naming unknown sessions; a share check that
+ * did the same would let an attacker probe which sessions exist.
+ */
+export function extractInTextRoutingTargets(text: unknown): InTextRoutingTargets {
+  if (typeof text !== 'string' || !text) return { sessions: [], expandsAll: false };
+  const sessions = new Set<string>();
+  for (const match of text.matchAll(DISCUSS_TOKEN_RE)) {
+    const session = (match[1] ?? '').trim();
+    if (isRoutableSessionName(session)) sessions.add(session);
+  }
+  return { sessions: [...sessions], expandsAll: ALL_TOKEN_RE.test(text) };
+}
+
+/**
  * Session names a payload routes to, swept out of the routing fields only.
  *
  * Scoped to those fields on purpose: sweeping the whole payload would pick up
