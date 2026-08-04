@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { createHash } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { appendFile, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -10,6 +11,13 @@ import { PassThrough, Writable } from 'node:stream';
 // chance to complete while virtual provider timers are advanced.
 const realSetImmediate = setImmediate;
 const realSetTimeout = setTimeout;
+
+const loggerMock = vi.hoisted(() => ({
+  info: vi.fn(),
+  warn: vi.fn(),
+  error: vi.fn(),
+  debug: vi.fn(),
+}));
 
 const childProcessMock = vi.hoisted(() => {
   type Request = { id?: number; method?: string; params?: Record<string, any> };
@@ -89,6 +97,8 @@ const childProcessMock = vi.hoisted(() => {
                   message: 'failed to read thread: thread-store internal error: failed to load thread history: stream did not contain valid UTF-8',
                 },
               });
+            } else if (msg.params?.threadId === 'thread-malformed') {
+              childRecord.child.stdout.write(`{"id":${msg.id},"result":{"thread":{"id":"${'x'.repeat(100_000)}\n`);
             } else {
               childRecord.emits({
                 id: msg.id,
@@ -219,7 +229,7 @@ vi.mock('node:child_process', () => ({
 }));
 
 vi.mock('../../src/util/logger.js', () => ({
-  default: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+  default: loggerMock,
 }));
 
 // Mock the codex runtime config so tests can pretend specific models are
@@ -419,6 +429,10 @@ describe('CodexSdkProvider', () => {
     childProcessMock.setHoldTurnInterrupt(false);
     childProcessMock.clearThreadReadResults();
     childProcessMock.clearTurnStartErrors();
+    loggerMock.info.mockClear();
+    loggerMock.warn.mockClear();
+    loggerMock.error.mockClear();
+    loggerMock.debug.mockClear();
     childProcessMock.releaseHeldInitializes();
     childProcessMock.releaseHeldThreadStarts();
     childProcessMock.releaseHeldTurnStarts();
@@ -3574,6 +3588,49 @@ describe('CodexSdkProvider', () => {
     expect(turnReq?.params?.threadId).toBe('thread-1');
     expect(errors).toEqual([]);
     expect(sessionInfo).toContainEqual({ resumeId: 'thread-1' });
+  });
+
+  it('rejects a malformed thread/resume response immediately, replaces the thread, and logs only bounded metadata', async () => {
+    const provider = createCodexProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-malformed', cwd: '/tmp/project', resumeId: 'thread-malformed' });
+
+    let settleTimeout: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        provider.send('route-malformed', 'hello after malformed history'),
+        new Promise<never>((_resolve, reject) => {
+          settleTimeout = realSetTimeout(() => reject(new Error('Malformed thread/resume response did not settle promptly')), 500);
+        }),
+      ]);
+    } finally {
+      if (settleTimeout) clearTimeout(settleTimeout);
+    }
+
+    const child = childProcessMock.children[0];
+    const resumeReq = child.requests.find((req) => req.method === 'thread/resume');
+    const startReq = child.requests.find((req) => req.method === 'thread/start');
+    const turnReq = child.requests.find((req) => req.method === 'turn/start');
+    expect(resumeReq?.params?.threadId).toBe('thread-malformed');
+    expect(startReq?.params?.cwd).toBe('/tmp/project');
+    expect(turnReq?.params?.threadId).toBe('thread-1');
+
+    const malformedLine = `{"id":${resumeReq?.id},"result":{"thread":{"id":"${'x'.repeat(100_000)}`;
+    const parseWarning = loggerMock.warn.mock.calls.find(([, message]) => message === 'Failed to parse Codex app-server line');
+    expect(parseWarning).toBeDefined();
+    expect(parseWarning?.[0]).toMatchObject({
+      provider: 'codex-sdk',
+      lineSummary: 'malformed JSON-RPC response with numeric request id',
+      lineChars: malformedLine.length,
+      lineUtf8Bytes: Buffer.byteLength(malformedLine, 'utf8'),
+      lineSha256: createHash('sha256').update(malformedLine, 'utf8').digest('hex'),
+      requestId: resumeReq?.id,
+      pendingMethod: 'thread/resume',
+      parseError: expect.stringMatching(/^SyntaxError(?: at position \d+)?$/),
+    });
+    expect(parseWarning?.[0]).not.toHaveProperty('line');
+    expect(JSON.stringify(parseWarning?.[0]).length).toBeLessThan(2_000);
+    expect(JSON.stringify(parseWarning?.[0])).not.toContain('x'.repeat(1_000));
   });
 
   // ── baseInstructions sourcing ──────────────────────────────────────────
