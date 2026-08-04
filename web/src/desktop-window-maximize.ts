@@ -94,8 +94,14 @@ export function resolveSessionTabsBottom(doc: Document | null = typeof document 
     .filter((bottom) => bottom > 0);
   if (tabButtonBottoms.length > 0) return Math.max(...tabButtonBottoms);
 
+  // A present-but-unmeasured tab bar reports bottom 0 (pre-layout, or hidden).
+  // Returning that is the same failure as having no tab bar at all, so only
+  // accept a positive measurement and otherwise fall through to the floor
+  // below. The previous version returned the 0 and pinned the window to the
+  // top of the viewport, under the app header.
   const tabBar = doc.querySelector<HTMLElement>(SESSION_TAB_BAR_SELECTOR);
-  if (tabBar) return Math.max(0, finiteOr(tabBar.getBoundingClientRect().bottom, 0));
+  const tabBarBottom = tabBar ? Math.max(0, finiteOr(tabBar.getBoundingClientRect().bottom, 0)) : 0;
+  if (tabBarBottom > 0) return tabBarBottom;
 
   // Falling through to 0 pins a window to the very top of the viewport, which
   // slides its own title bar — and the close button in it — underneath the app

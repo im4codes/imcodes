@@ -1104,8 +1104,22 @@ export class WsClient {
     //
     // `rebuildSubSessions` on the daemon upserts per item and prunes nothing,
     // so splitting the list is equivalent to sending it whole.
+    // One undeliverable batch must not starve the ones behind it. A single
+    // entry can exceed the cap on its own — `chunkSubSessionRebuildBatches`
+    // gives it its own batch rather than dropping it silently — and `send`
+    // rejects that locally, before the socket. In a bare loop that throw ends
+    // the loop, so every later batch is lost too and nothing retries until the
+    // next connection. Isolate each batch and keep going.
     for (const batch of chunkSubSessionRebuildBatches(subSessions)) {
-      this.send({ type: 'subsession.rebuild_all', subSessions: batch });
+      try {
+        this.send({ type: 'subsession.rebuild_all', subSessions: batch });
+      } catch (err) {
+        console.warn(
+          '[ws] subsession.rebuild_all batch dropped',
+          { size: batch.length, ids: batch.slice(0, 3).map((sub) => sub.id) },
+          err,
+        );
+      }
     }
   }
 

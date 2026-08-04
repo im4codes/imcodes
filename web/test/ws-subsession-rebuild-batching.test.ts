@@ -153,6 +153,32 @@ describe('WsClient.subSessionRebuildAll', () => {
     expect(payloads.flatMap((m) => m.subSessions ?? [])).toEqual(subs);
   });
 
+  it('keeps sending after an entry that cannot fit in any message', async () => {
+    // One entry can exceed the cap alone, and `send` rejects it locally. In a
+    // bare loop that throw ends the loop, so every batch behind the bad entry
+    // is lost and nothing retries until the next connection.
+    const { client, socket } = await connected();
+    socket.send.mockClear();
+
+    const before = Array.from({ length: 40 }, (_, i) => makeSub(i, 300));
+    const oversized = makeSub(998, 90_000);
+    const after = Array.from({ length: 40 }, (_, i) => makeSub(100 + i, 300));
+
+    expect(() => client.subSessionRebuildAll([...before, oversized, ...after] as never)).not.toThrow();
+
+    const delivered = socket.send.mock.calls
+      .map(([raw]) => JSON.parse(raw as string) as { type: string; subSessions?: Array<{ id: string }> })
+      .filter((m) => m.type === 'subsession.rebuild_all')
+      .flatMap((m) => m.subSessions ?? []);
+    const deliveredIds = new Set(delivered.map((sub) => sub.id));
+
+    // The undeliverable entry is dropped; everything on both sides of it is not.
+    expect(deliveredIds.has('sub-998')).toBe(false);
+    for (const sub of [...before, ...after]) {
+      expect(deliveredIds.has(sub.id)).toBe(true);
+    }
+  });
+
   it('still sends a small list as exactly one message', async () => {
     const { client, socket } = await connected();
     socket.send.mockClear();

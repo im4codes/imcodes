@@ -75,6 +75,42 @@ describe('useProgressiveMount', () => {
     expect(Math.max(...seen)).toBeLessThanOrEqual(3);
   });
 
+  it('staggers again after the list is emptied and restored in one go', () => {
+    // The toolbar closes every window and restores them all in a single state
+    // update, so this is a button press, not a corner case. A budget that only
+    // grows reports the full count on the first frame after the restore and
+    // remounts everything in one task — the exact freeze this hook prevents.
+    const { rerender, getByTestId } = render(<Probe count={4} seen={[]} />);
+    flushFrame();
+    flushFrame();
+    flushFrame();
+    expect(getByTestId('budget').textContent).toBe('4');
+
+    rerender(<Probe count={0} seen={[]} />);
+    expect(getByTestId('budget').textContent).toBe('0');
+
+    rerender(<Probe count={4} seen={[]} />);
+    expect(getByTestId('budget').textContent).toBe('1');
+    flushFrame();
+    expect(getByTestId('budget').textContent).toBe('2');
+  });
+
+  it('staggers again after a partial shrink', () => {
+    const { rerender, getByTestId } = render(<Probe count={4} seen={[]} />);
+    flushFrame();
+    flushFrame();
+    flushFrame();
+    expect(getByTestId('budget').textContent).toBe('4');
+
+    rerender(<Probe count={1} seen={[]} />);
+    expect(getByTestId('budget').textContent).toBe('1');
+
+    rerender(<Probe count={4} seen={[]} />);
+    expect(getByTestId('budget').textContent).toBe('1');
+    flushFrame();
+    expect(getByTestId('budget').textContent).toBe('2');
+  });
+
   it('catches up within one frame when a single item is added later', () => {
     const { rerender, getByTestId } = render(<Probe count={1} seen={[]} />);
     expect(getByTestId('budget').textContent).toBe('1');

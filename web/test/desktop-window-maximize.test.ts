@@ -61,6 +61,18 @@ describe('desktop-window-maximize helpers', () => {
     }).y).toBe(96);
   });
 
+  it('falls through to the content column when the tab bar measures zero', () => {
+    // Present but unmeasured — pre-layout, or hidden by the current layout.
+    // Returning that 0 is the same failure as having no tab bar at all.
+    addMainContent(96);
+    const tabBar = document.createElement('div');
+    tabBar.className = 'tab-bar';
+    tabBar.getBoundingClientRect = () => rectWithBottom(0);
+    document.body.appendChild(tabBar);
+
+    expect(resolveSessionTabsBottom()).toBe(96);
+  });
+
   it('prefers a measurable tab bar over the content column', () => {
     addMainContent(96);
     const tabBar = document.createElement('div');
