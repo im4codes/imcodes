@@ -438,6 +438,12 @@ export function setupWebSocketUpgrade(server: import('node:http').Server, env: E
           socket.destroy();
           return;
         }
+        // Deliberately NOT single-use, unlike the member ticket below. A share
+        // recipient on a flaky connection must be able to reconnect without a
+        // round trip to mint a new ticket; `share-ws-ticket-upgrade.test.ts`
+        // pins that asymmetry. An audit read the missing `consumeJti` as a
+        // replay defect — it is a design decision, and the coverage re-read on
+        // every upgrade is what actually bounds a stale ticket.
         wss.handleUpgrade(req, socket, head, (ws) => {
           WsBridge.get(serverId).handleShareBrowserConnection(ws, shareTicket.sub, env.DB, {
             ticketId: shareTicket.jti,

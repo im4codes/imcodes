@@ -231,6 +231,7 @@ import {
   writeShareAuditEvent,
   type ShareAuditActionType,
   type ShareTargetInput,
+  revokeSharesForSubSession,
 } from '../db/tab-sharing.js';
 import { evaluateSharedCommandRateLimit } from '../share/share-rate-limit.js';
 import {
@@ -1113,6 +1114,12 @@ export function __setShareBridgeClockForTests(clock: (() => number) | null): voi
 }
 
 // ── WsBridge ─────────────────────────────────────────────────────────────────
+
+/**
+ * Hard ceiling on how long a share socket may run on a cached coverage
+ * snapshot. Shares without an expiry produce no recheck deadline of their own.
+ */
+const SHARE_COVERAGE_MAX_STALENESS_MS = 60_000;
 
 export class WsBridge {
   private static instances = new Map<string, WsBridge>();
@@ -3877,6 +3884,7 @@ export class WsBridge {
         target: coverage.target,
       }));
     }
+    next.coverageCheckedAt = shareClockNow();
     this.browserShareStates.set(ws, next);
     return next;
   }
@@ -3931,7 +3939,18 @@ export class WsBridge {
   private async revalidateShareSocket(ws: WebSocket): Promise<void> {
     const state = this.browserShareStates.get(ws);
     if (!state) return;
-    const coverage = await this.resolveLiveShareCoverage(state);
+    // Every caller is fire-and-forget (`void ...`), and nothing below used to
+    // catch: a transient DB error during a revoke became an unobserved
+    // rejection while the revoke route still answered 200. Swallow it here and
+    // let the staleness bound in sweepShareSockets retry within a minute,
+    // rather than leaving the socket un-revalidated with no second chance.
+    let coverage: EffectiveCoverage | null;
+    try {
+      coverage = await this.resolveLiveShareCoverage(state);
+    } catch (err) {
+      logger.warn({ err, serverId: this.serverId, userId: state.userId }, 'Share coverage revalidation failed; will retry on sweep');
+      return;
+    }
     if (!coverage) {
       this.teardownShareSocket(ws, this.shareStateLooksExpired(state) ? SHARE_REASONS.EXPIRED : SHARE_REASONS.REVOKED);
       return;
@@ -3941,8 +3960,20 @@ export class WsBridge {
 
   private async sweepShareSockets(): Promise<void> {
     const now = shareClockNow();
-    const candidates = [...this.browserShareStates]
-      .filter(([, state]) => typeof state.snapshot.nextCoverageRecheckAt === 'number' && state.snapshot.nextCoverageRecheckAt <= now);
+    // Two reasons to re-check, not one. `nextCoverageRecheckAt` is derived from
+    // the grant's expiry, and a share created without one — the default — leaves
+    // it null, so this filter used to skip those sockets forever: the sweep was
+    // an expiry sweep, never a revocation backstop. A viewer that subscribes and
+    // then stays silent never reaches `applyShareCoverage` either, so its
+    // connect-time snapshot was its only authorization for the life of the
+    // socket, and the single fire-and-forget push on revoke was the only thing
+    // that could end it. Bound the staleness instead.
+    const candidates = [...this.browserShareStates].filter(([, state]) => {
+      const dueAt = state.snapshot.nextCoverageRecheckAt;
+      if (typeof dueAt === 'number' && dueAt <= now) return true;
+      const lastCheckedAt = state.coverageCheckedAt ?? state.connectedAt;
+      return now - lastCheckedAt >= SHARE_COVERAGE_MAX_STALENESS_MS;
+    });
     await Promise.all(candidates.map(([ws]) => this.revalidateShareSocket(ws)));
   }
 
@@ -4980,6 +5011,13 @@ export class WsBridge {
             this.recentTextBySession.delete(sessionName);
             this.activeSubSessions.delete(sessionName);
             this.broadcastToBrowsers(JSON.stringify({ type: 'subsession.removed', id, sessionName: msg.sessionName }));
+            // Revoke the grants as well, not just the live sockets. Closing
+            // masks coverage (`targetExists` needs `closed_at IS NULL`) but the
+            // rows survive, and the daemon's upsert clears `closed_at` on
+            // re-open — so the same id coming back restored the recipient's
+            // access with no fresh authorization. See revokeSharesForSubSession.
+            void revokeSharesForSubSession(this.db!, { serverId: this.serverId, subSessionId: id, now: Date.now() })
+              .catch((err: unknown) => logger.warn({ err, serverId: this.serverId, subSessionId: id }, 'Failed to revoke shares for closed sub-session'));
             void this.revalidateShareSocketsForTarget({ kind: 'subsession', serverId: this.serverId, subSessionId: id });
           })
           .catch((err) => {

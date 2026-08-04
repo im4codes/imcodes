@@ -44,6 +44,8 @@ export type ShareScopedSocketState = {
   snapshot: ShareAuthorizationSnapshot;
   connectedAt: number;
   coveredSessionNames?: readonly string[];
+  /** When coverage was last re-resolved from the DB; bounds snapshot staleness. */
+  coverageCheckedAt?: number;
 };
 
 export type ShareCoverageResolver = (input: {

@@ -215,6 +215,31 @@ export async function revokeShare(db: Database, params: { shareId: string; serve
   return getShareById(db, params.serverId, params.shareId);
 }
 
+/**
+ * Revoke every active share pointing at a sub-session.
+ *
+ * Closing a shared sub-session already tears the recipient's socket down —
+ * `targetExists` requires `closed_at IS NULL`, so coverage resolves to null and
+ * `revalidateShareSocketsForTarget` closes the socket. From the owner's side
+ * that looks like revocation. It was not: the grant row survived, and the
+ * daemon's sub-session upsert sets `closed_at = NULL` again
+ * (`queries.ts` ON CONFLICT ... closed_at = NULL), so reopening the same id
+ * silently restored the recipient's access with no new authorization event.
+ *
+ * Revoking here makes the observed behaviour the real one. Re-opening the tab
+ * now requires re-sharing it, which matches what the owner already saw happen.
+ */
+export async function revokeSharesForSubSession(
+  db: Database,
+  params: { serverId: string; subSessionId: string; now: number },
+): Promise<number> {
+  const result = await db.execute(
+    'UPDATE sub_session_shares SET revoked_at = $1, updated_at = $1 WHERE sub_session_id = $2 AND server_id = $3 AND revoked_at IS NULL',
+    [params.now, params.subSessionId, params.serverId],
+  );
+  return result?.changes ?? 0;
+}
+
 export async function listManagedShares(db: Database, serverId: string): Promise<ShareRow[]> {
   return mapShareRows(await db.query<DbShareRow>(allSharesSql('WHERE server_id = $1 ORDER BY created_at DESC'), [serverId]));
 }
