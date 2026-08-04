@@ -234,7 +234,16 @@ export function useSubSessions(
     if (loadedServerId !== serverId) return;
     if (loadedGenRef.current !== loadGenRef.current) return;
     rebuiltRef.current = true;
-    ws.subSessionRebuildAll(buildSubSessionRebuildInputs(subSessions));
+    // An effect that throws takes the rest of the flush with it, and the
+    // effects that open transport chat subscriptions for these same
+    // sub-sessions run right after this one. A rebuild that fails to send is a
+    // degraded daemon-side view; letting it cancel those subscriptions is a
+    // dead chat stream. Never trade the second for the first.
+    try {
+      ws.subSessionRebuildAll(buildSubSessionRebuildInputs(subSessions));
+    } catch (err) {
+      console.warn('[sub-sessions] rebuild_all send failed', err);
+    }
   }, [connected, ws, subSessions, disableHttpLoad, loadedServerId, serverId]);
 
   // Reset rebuild flag when disconnected
