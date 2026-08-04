@@ -115,14 +115,41 @@ function supplementUsageSnapshot(
 }
 
 function choosePreferredTimelineEvent(existing: TimelineEvent, incoming: TimelineEvent): TimelineEvent {
-  const completenessCmp = compareCompleteness(existing, incoming);
-  if (completenessCmp !== 0) return completenessCmp > 0 ? incoming : existing;
-
   const existingStreaming = isStreaming(existing);
   const incomingStreaming = isStreaming(incoming);
+
+  // Lifecycle first: a terminal (non-streaming) version of an event always wins
+  // over a streaming one. The turn is over; nothing about the payload can
+  // outrank that. This used to sit BELOW completeness, so a hydrated streaming
+  // snapshot outranked the very event that settled it.
   if (existingStreaming !== incomingStreaming) {
     return incomingStreaming ? existing : incoming;
   }
+
+  // Then freshness, but only while the message is still in flight.
+  //
+  // Completeness ranks a hydrated payload above a truncated one, which is right
+  // for a settled event: a later preview must not downgrade text already
+  // fetched in full. Mid-stream it is backwards. Hydration rebuilds the event
+  // as `{ ...existing, payload }`, so the hydrated copy inherits the seq of the
+  // snapshot it hydrated — an OLDER generation than the deltas still arriving.
+  // Ranking it first pinned that snapshot: every later delta for the same
+  // eventId lost the merge, `mergeTimelineEvents` reported no change, and the
+  // view froze until the terminal event replaced it, so the reply landed in one
+  // block. That reads as "streaming stopped working".
+  //
+  // Both sides streaming means both are generations of one in-flight message,
+  // so a higher seq is simply the longer text. Same-generation pairs have no
+  // freshness signal and fall through to completeness below.
+  if (existingStreaming && incomingStreaming) {
+    const streamingEpochCmp = compareNumbers(incoming.epoch, existing.epoch);
+    if (streamingEpochCmp !== 0) return streamingEpochCmp > 0 ? incoming : existing;
+    const streamingSeqCmp = compareNumbers(incoming.seq, existing.seq);
+    if (streamingSeqCmp !== 0) return streamingSeqCmp > 0 ? incoming : existing;
+  }
+
+  const completenessCmp = compareCompleteness(existing, incoming);
+  if (completenessCmp !== 0) return completenessCmp > 0 ? incoming : existing;
 
   const epochCmp = compareNumbers(incoming.epoch, existing.epoch);
   if (epochCmp !== 0) return epochCmp > 0 ? incoming : existing;
