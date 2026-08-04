@@ -51,6 +51,7 @@ import { loadLegacyCodexModelPreferenceForModelessSession } from '../codex-model
 import { DEFAULT_SUBSESSION_ACCENT_COLOR } from '../subsession-accent-colors.js';
 import { EXECUTION_CLONE_KIND } from '@shared/execution-clone.js';
 import type { SessionSettingsOpenIntent } from '../session-settings-open-intent.js';
+import { useStableCallback } from '../hooks/useStableCallback.js';
 
 function isExecutionCloneTemplateLike(sub: { executionCloneKind?: string | null; parentRunId?: string | null }): boolean {
   return sub.executionCloneKind === EXECUTION_CLONE_KIND || typeof sub.parentRunId === 'string';
@@ -513,6 +514,11 @@ export function SubSessionWindow({
   // an open-but-unfocused shell window.) Ref-counted hold — see useTerminalRawHold.
   useTerminalRawHold(ws, connected, isShell && !isTransport, sub.sessionName);
 
+  // These arrive from app.tsx as inline arrows and would otherwise change
+  // identity on every timeline event, defeating ChatView's memo boundary.
+  const stableOnViewRepo = useStableCallback(onViewRepo);
+  const stableOnPreviewFile = useStableCallback(onPreviewFile);
+
   // Non-shell window: subscribe raw only while focused (full-fidelity view); when
   // unfocused it falls back to the passive (non-raw) subscription app.tsx keeps.
   // Re-subscribe on mount so the server sends a fresh snapshot (the window
@@ -954,8 +960,8 @@ export function SubSessionWindow({
             onScrollBottomFn={onChatScrollBottomFn}
             ws={ws}
             workdir={sub.cwd ?? null}
-            onViewRepo={onViewRepo}
-            onPreviewFile={onPreviewFile}
+            onViewRepo={stableOnViewRepo}
+            onPreviewFile={stableOnPreviewFile}
             serverId={serverId}
             onQuote={addQuote}
             agentType={sessionInfo?.agentType ?? sub.type}

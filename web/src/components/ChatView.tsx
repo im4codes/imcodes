@@ -223,20 +223,47 @@ function formatMemoryContextTimestamp(ts: number | undefined, locale?: string): 
   return new Date(ts).toLocaleString(locale, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
 }
 
+// `toLocaleTimeString` / `toLocaleString` construct a fresh Intl.DateTimeFormat
+// on every single call. Every rendered bubble stamps a timestamp, so first paint
+// of a long history pays that construction once per message: measured at ~15% of
+// a 4.9s mount task with 250 rendered items on a 20x-CPU-throttled browser.
+// The formatter depends only on (locale, shape), so build each one once.
+//
+// Output is identical to the toLocale* calls this replaces: those differ from
+// Intl.DateTimeFormat only in the defaults they inject when NO relevant field is
+// requested, and both shapes below request their fields explicitly.
+const CHAT_TIME_FORMAT_OPTIONS: Intl.DateTimeFormatOptions = {
+  hour: '2-digit',
+  minute: '2-digit',
+  second: '2-digit',
+};
+const CHAT_DATE_TIME_FORMAT_OPTIONS: Intl.DateTimeFormatOptions = {
+  month: 'short',
+  day: 'numeric',
+  ...CHAT_TIME_FORMAT_OPTIONS,
+};
+// Bounded in practice by the supported locale count (7) x 2 shapes.
+const chatDateTimeFormatterCache = new Map<string, Intl.DateTimeFormat>();
+
+function chatDateTimeFormatter(locale: string | undefined, withDate: boolean): Intl.DateTimeFormat {
+  const key = `${withDate ? 'd' : 't'}:${locale ?? ''}`;
+  const cached = chatDateTimeFormatterCache.get(key);
+  if (cached) return cached;
+  const formatter = new Intl.DateTimeFormat(
+    locale,
+    withDate ? CHAT_DATE_TIME_FORMAT_OPTIONS : CHAT_TIME_FORMAT_OPTIONS,
+  );
+  chatDateTimeFormatterCache.set(key, formatter);
+  return formatter;
+}
+
 export function formatChatDateTime(ts: number, now = Date.now(), locale?: string): string {
   const date = new Date(ts);
   const today = new Date(now);
-  const timeOptions: Intl.DateTimeFormatOptions = {
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-  };
   const isToday = date.getFullYear() === today.getFullYear()
     && date.getMonth() === today.getMonth()
     && date.getDate() === today.getDate();
-  return isToday
-    ? date.toLocaleTimeString(locale, timeOptions)
-    : date.toLocaleString(locale, { month: 'short', day: 'numeric', ...timeOptions });
+  return chatDateTimeFormatter(locale, !isToday).format(date);
 }
 
 type MemoryContextSection =
@@ -718,6 +745,65 @@ function getFinalVisibleEventIds(events: TimelineEvent[], showToolCalls: boolean
   return ids;
 }
 
+/**
+ * Reference cache for merged call+result events.
+ *
+ * `buildViewItems` re-runs on every incoming event, and the merge below built a
+ * fresh object each time (`{ ...ev, payload: { ... } }`). Every already-merged
+ * tool call in the history therefore got a NEW identity on every streamed token,
+ * which defeated the `ChatEvent` memo for the entire visible list. Measured in a
+ * throttled browser: one incoming event re-executed ~120 ChatEvent bodies while
+ * producing only 3 DOM mutations — the output was identical, so the DOM was
+ * spared, but the JS cost was paid in full and saturated a slow CPU.
+ *
+ * Keyed on the two source OBJECTS, not on their eventIds.
+ *
+ * An eventId-keyed cache is wrong here, and wrong in the direction that silently
+ * stops output from updating: a tool result keeps its eventId while its payload
+ * changes — streaming output grows under the same id, and the detail-hydration
+ * path replaces a truncated payload with the full one under the same id. Keyed
+ * by id, the first (shortest) merge wins forever and the real output never
+ * reaches the screen.
+ *
+ * `useTimeline` updates events immutably (`{ ...existing, payload }`), so a new
+ * object IS the signal that content changed. Keying on identity therefore gives
+ * both properties at once: unchanged inputs return the same merged object (the
+ * memo holds), and any payload change misses the cache (no staleness). A WeakMap
+ * pair also needs no size cap or eviction — entries die with their events.
+ */
+const mergedToolEventCache = new WeakMap<TimelineEvent, WeakMap<TimelineEvent, TimelineEvent>>();
+
+function cacheMergedToolEvent(
+  call: TimelineEvent,
+  result: TimelineEvent,
+  build: () => TimelineEvent,
+): TimelineEvent {
+  let byResult = mergedToolEventCache.get(call);
+  if (!byResult) {
+    byResult = new WeakMap<TimelineEvent, TimelineEvent>();
+    mergedToolEventCache.set(call, byResult);
+  }
+  const hit = byResult.get(result);
+  if (hit) return hit;
+  const built = build();
+  byResult.set(result, built);
+  return built;
+}
+
+export function __resetMergedToolEventCacheForTests(): void {
+  // Identity-keyed entries cannot outlive their events, so there is nothing to
+  // clear; kept as a no-op so tests read the same either way.
+}
+
+/**
+ * Test seam for the identity invariant. Render-count proxies turned out to be
+ * unreliable here (the count moves for unrelated reasons and stays flat when the
+ * memo does miss), so the property is asserted directly on the objects.
+ */
+export function __buildViewItemsForTests(events: TimelineEvent[], showToolCalls: boolean): ViewItem[] {
+  return buildViewItems(events, showToolCalls);
+}
+
 function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewItem[] {
   // Simple view still needs tool call/result events to build its compact live
   // activity rail. Other developer details remain fully filtered.
@@ -790,11 +876,30 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
           break;
         }
       }
-      // No id on either side (older events, providers that omit it): keep the
-      // original adjacency heuristic exactly as it was.
-      if (resultIdx === -1 && !callId) {
+      // Adjacency fallback. Runs when the call has no id (older events, providers
+      // that omit it) AND when the call HAS an id but the correlation lookup came
+      // up empty — a result that carries no id of its own lands in no bucket, so
+      // an id-bearing call could never pair with it and stayed "running" forever
+      // with the peek stuck on "waiting for output".
+      //
+      // When the call is id-bearing the fallback is deliberately narrower: only a
+      // result with NO id may match. A result carrying a DIFFERENT non-empty id
+      // belongs to another call, and accepting it would reintroduce exactly the
+      // concurrent-tool cross-talk the correlation path above exists to prevent.
+      if (resultIdx === -1) {
         for (let j = i + 1; j <= Math.min(i + 10, visible.length - 1); j++) {
-          if (visible[j].type === 'tool.result') { resultIdx = j; break; }
+          if (visible[j].type === 'tool.result') {
+            const resultId = typeof visible[j].payload.toolCallId === 'string'
+              ? visible[j].payload.toolCallId
+              : '';
+            // Fail closed on either side carrying an id: an id-bearing result
+            // has declared which call owns it, and an id-bearing call must only
+            // pair through the correlation map. Adjacency is the fallback for
+            // events that carry no identity at all.
+            if (resultId) break;
+            resultIdx = j;
+            break;
+          }
           if (visible[j].type === 'tool.call') break; // another call started, stop
         }
       }
@@ -810,7 +915,9 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
         const input = inputText ? ` ${inputText}` : '';
         const status = next.payload.error ? `✗ ${String(next.payload.error)}` : '✓';
         const output = !next.payload.error ? formatToolOutputPreview(next.payload.output) ?? undefined : undefined;
-        consolidated.push({
+        // Same two source events must yield the SAME object every render, or the
+        // whole visible list loses its memo on every incoming token.
+        consolidated.push(cacheMergedToolEvent(ev, next, () => ({
           ...ev,
           type: 'tool.call',
           payload: {
@@ -833,7 +940,7 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
             ...(ev.payload.detail ? { _callDetail: ev.payload.detail } : {}),
             ...(next.payload.detail ? { _resultDetail: next.payload.detail } : {}),
           },
-        });
+        })));
         continue;
       }
     }
@@ -1454,7 +1561,7 @@ function SdkAgentsDiagnosticRow({ diagnostic }: { diagnostic: SdkSubagentDiagnos
   );
 }
 
-export function ChatView({ events, loading, refreshing = false, historyStatus, loadingOlder, hasOlderHistory = true, onLoadOlder, sessionState, sessionId, onScrollBottomFn, preview, onPreviewFile, ws, onInsertPath, workdir, onViewRepo, serverId, onQuote, agentType: _agentType, onResendFailed, onForceSync }: Props) {
+function ChatViewImpl({ events, loading, refreshing = false, historyStatus, loadingOlder, hasOlderHistory = true, onLoadOlder, sessionState, sessionId, onScrollBottomFn, preview, onPreviewFile, ws, onInsertPath, workdir, onViewRepo, serverId, onQuote, agentType: _agentType, onResendFailed, onForceSync }: Props) {
   const { t, i18n } = useTranslation();
   const locale = resolveI18nLocale(i18n);
   const [syncDisabled, setSyncDisabled] = useState(false);
@@ -1935,6 +2042,7 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
 
   useEffect(() => () => {
     if (revealingOlderTimerRef.current) clearTimeout(revealingOlderTimerRef.current);
+    if (pendingScrollFrameRef.current !== null) cancelAnimationFrame(pendingScrollFrameRef.current);
   }, []);
 
   const markProgrammaticScroll = () => {
@@ -1971,6 +2079,24 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
   // public contract used by `onScrollBottomFn` parents (SessionPane,
   // SubSessionWindow), which intentionally call this after the user sends a
   // message and expect "force jump + re-engage".
+  // Six independent effects call this (session change, mount, first-content,
+  // new events, the resize observer, the height observer) and they all target
+  // the same place: the bottom. Each call used to read `scrollHeight`, which
+  // forces a synchronous layout of the entire message list.
+  //
+  // Measured on a 20x-CPU-throttled browser, 300 history events, no streaming:
+  //
+  //   1 window     5 calls   1.3s   inside a 4.9s  mount task
+  //   4 windows   20 calls   3.8s   inside a 12.2s mount task
+  //
+  // It scales with window count because the windows mount in the same task, so
+  // opening several sub-sessions on a slow machine produces one multi-second
+  // block during which the tab cannot even process a reload. The redundant
+  // flushes buy nothing — coalesce the DOM measure+write to one per frame. The
+  // follow/suppress policy stays synchronous so ordering against callers that
+  // set state right after is unchanged.
+  const pendingScrollFrameRef = useRef<number | null>(null);
+
   const scrollToBottom = (engageFollow: boolean = true) => {
     const el = scrollRef.current;
     if (!el) return;
@@ -1981,9 +2107,17 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
       countedFinalEventIdsRef.current = new Set(finalVisibleEventIds);
     }
     suppressLoadOlder();
-    markProgrammaticScroll();
-    el.scrollTop = el.scrollHeight;
-    lastScrollTopRef.current = el.scrollTop;
+    if (pendingScrollFrameRef.current !== null) return;
+    pendingScrollFrameRef.current = requestAnimationFrame(() => {
+      pendingScrollFrameRef.current = null;
+      const node = scrollRef.current;
+      if (!node) return;
+      // Armed here rather than at call time: it is a 200ms one-shot guard
+      // against the synthetic scroll event fired by the write below.
+      markProgrammaticScroll();
+      node.scrollTop = node.scrollHeight;
+      lastScrollTopRef.current = node.scrollTop;
+    });
   };
 
   // (No `followIfEngaged` helper: the two callsites that need it are also
@@ -3222,6 +3356,26 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
   );
 }
 
+/**
+ * Memoized so an open window costs nothing when its own session is quiet.
+ *
+ * Every mounted ChatView used to re-render on every timeline event, whatever
+ * session that event belonged to, because the owner of the events state
+ * re-renders and ChatView had no memo boundary. Measured over real components:
+ * a window on an idle session re-rendered once per event delivered to a
+ * DIFFERENT session, so per-event work scaled with the number of open windows.
+ * The inner `ChatEvent` / `AssistantBlock` memos kept the DOM stable, which is
+ * why this stayed invisible on fast machines — but the reconciliation still ran
+ * N times, and on a low-spec machine with many sub-session windows and a live
+ * token stream the queue stopped draining and the whole tab wedged.
+ *
+ * Default shallow prop comparison is what we want: `events` gets a new array
+ * identity precisely when that session's timeline changed. It follows that the
+ * CALLBACK props must be referentially stable at every call site — an inline
+ * closure would defeat this entirely and silently restore the old cost.
+ */
+export const ChatView = memo(ChatViewImpl);
+
 /** Full-fidelity tool shell: one-line preview, bounded scrollable expansion. */
 function ToolBlockFold({
   children,
@@ -3361,14 +3515,20 @@ function getLastToolActivity(events: TimelineEvent[], nowMs: number): {
   return { running, failed, durationMs, toolName, toolInput, toolOutput, toolError };
 }
 
+let toolPeekIdCounter = 0;
+
 /**
  * Hover peek for the Simple-view tool chip: the last full command and the
  * output it produced. Portalled to `document.body` because the chat scroller
- * clips overflow, and anchored to the chip's viewport rect so it survives the
- * timeline scrolling underneath it.
+ * clips overflow, so it is positioned from the chip's viewport rect. That rect
+ * goes stale the moment anything scrolls, so the owner re-measures it on scroll
+ * and resize — with a pointer the chip slides out from under the cursor and
+ * `mouseleave` closes the panel anyway, but a keyboard-focused peek has no such
+ * escape hatch and would otherwise sit stranded mid-screen.
  */
 function ToolActivityPeek({
   anchor,
+  peekId,
   toolName,
   command,
   output,
@@ -3378,6 +3538,7 @@ function ToolActivityPeek({
   duration,
 }: {
   anchor: DOMRect;
+  peekId: string;
   toolName: string;
   command: string;
   output: string | null;
@@ -3415,6 +3576,7 @@ function ToolActivityPeek({
 
   return createPortal((
     <div
+      id={peekId}
       class={`chat-tool-peek${running ? ' is-running' : ''}${failed ? ' is-failed' : ''}`}
       style={{ left: `${left}px`, width: `${width}px`, maxHeight: `${maxHeight}px`, ...position }}
       role="tooltip"
@@ -3473,6 +3635,14 @@ function ToolActivitySummary({
   // needs the chip's viewport position. Re-measured on every open so scrolling
   // between hovers cannot leave it stranded.
   const [peekAnchor, setPeekAnchor] = useState<DOMRect | null>(null);
+  // The element the peek is anchored to, kept so scroll/resize can re-measure it
+  // rather than leaving the panel at a rect that is now wrong.
+  const peekTriggerRef = useRef<HTMLElement | null>(null);
+  // Stable per-instance id for `aria-describedby`. A plain counter rather than
+  // `useId` so this does not depend on the Preact hooks version.
+  const peekIdRef = useRef<string | null>(null);
+  if (peekIdRef.current === null) peekIdRef.current = `chat-tool-peek-${++toolPeekIdCounter}`;
+  const peekId = peekIdRef.current;
   const counts = getToolActivityCounts(events);
   // Tick only while something is actually running: a settled group must not keep
   // a timer alive, and the shared ticker stops once its last listener leaves.
@@ -3486,14 +3656,49 @@ function ToolActivitySummary({
   const action = expanded
     ? t('chat.tool_activity_collapse')
     : t('chat.tool_activity_expand');
-  // Touch clients have no hover; opening the peek on a tap would fight the
-  // expand toggle, so it stays a pointer/keyboard affordance.
   const openPeek = (element: HTMLElement | null) => {
     if (!last || !element) return;
-    if (typeof window !== 'undefined' && window.matchMedia
-      && !window.matchMedia('(hover: hover)').matches) return;
+    peekTriggerRef.current = element;
     setPeekAnchor(element.getBoundingClientRect());
   };
+  const closePeek = () => {
+    peekTriggerRef.current = null;
+    setPeekAnchor(null);
+  };
+  // Pointer only. Touch clients report no hover, and opening the peek on a tap
+  // would fight the expand toggle. Keyboard focus deliberately does NOT go
+  // through this gate: a no-hover device can still have a keyboard, and gating
+  // focus on hover capability made the panel unreachable for those users.
+  const openPeekFromPointer = (element: HTMLElement | null) => {
+    if (typeof window !== 'undefined' && window.matchMedia
+      && !window.matchMedia('(hover: hover)').matches) return;
+    openPeek(element);
+  };
+
+  // The anchor is a viewport rect and the panel is `position: fixed`, so any
+  // scroll invalidates it. Re-measure instead of drifting; drop the peek if the
+  // chip has left the viewport entirely.
+  useEffect(() => {
+    if (!peekAnchor) return;
+    const sync = () => {
+      const element = peekTriggerRef.current;
+      if (!element) return;
+      const rect = element.getBoundingClientRect();
+      const offscreen = rect.bottom < 0 || rect.top > window.innerHeight
+        || rect.right < 0 || rect.left > window.innerWidth;
+      if (offscreen) { closePeek(); return; }
+      setPeekAnchor(rect);
+    };
+    // Capture phase so nested scrollers (the chat list itself) are observed too;
+    // `scroll` does not bubble.
+    window.addEventListener('scroll', sync, true);
+    window.addEventListener('resize', sync);
+    return () => {
+      window.removeEventListener('scroll', sync, true);
+      window.removeEventListener('resize', sync);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [!peekAnchor]);
 
   if (counts.total === 0) return null;
 
@@ -3504,11 +3709,12 @@ function ToolActivitySummary({
         class={`chat-tool-activity${counts.running > 0 ? ' is-running' : ''}${counts.failed > 0 ? ' has-error' : ''}`}
         aria-expanded={expanded}
         aria-label={`${summary}. ${action}`}
-        onMouseEnter={(e) => openPeek(e.currentTarget as HTMLElement)}
-        onMouseLeave={() => setPeekAnchor(null)}
+        {...(peekAnchor && last ? { 'aria-describedby': peekId } : {})}
+        onMouseEnter={(e) => openPeekFromPointer(e.currentTarget as HTMLElement)}
+        onMouseLeave={closePeek}
         onFocus={(e) => openPeek(e.currentTarget as HTMLElement)}
-        onBlur={() => setPeekAnchor(null)}
-        onClick={() => { setPeekAnchor(null); setExpanded((value) => !value); }}
+        onBlur={closePeek}
+        onClick={() => { closePeek(); setExpanded((value) => !value); }}
       >
         <span class="chat-tool-activity-core" aria-hidden="true" />
         <span class="chat-tool-activity-label">{t('chat.tool_activity_label')}</span>
@@ -3523,7 +3729,9 @@ function ToolActivitySummary({
             regardless of screen size; the chip goes full width and this ellipses
             rather than being dropped. */}
         {last && (
-          <span class="chat-tool-activity-last" aria-hidden="true" title={[last.toolName, last.toolInput].filter(Boolean).join(' ')}>
+          // No `title` on this span: the hover peek supersedes it, and a native
+          // tooltip would render on top of the panel.
+          <span class="chat-tool-activity-last" aria-hidden="true">
             <span class="chat-tool-activity-last-name">{last.toolName}</span>
             {lastInput && <span class="chat-tool-activity-last-input">{lastInput}</span>}
           </span>
@@ -3550,6 +3758,7 @@ function ToolActivitySummary({
       {peekAnchor && last && (
         <ToolActivityPeek
           anchor={peekAnchor}
+          peekId={peekId}
           toolName={last.toolName}
           command={last.toolInput}
           output={last.toolOutput}

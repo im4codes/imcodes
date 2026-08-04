@@ -4,6 +4,7 @@ import { FitAddon } from '@xterm/addon-fit';
 import 'xterm/css/xterm.css';
 import type { WsClient } from '../ws-client.js';
 import type { TerminalDiff } from '../types.js';
+import { TERMINAL_MAX_ROWS } from '@shared/terminal-limits.js';
 import { IOS_MAC_TERMINAL_FONT_SIZE, shouldUseIosMacTextScale } from '../native-platform.js';
 
 interface Props {
@@ -29,6 +30,39 @@ interface Props {
 const PREVIEW_RAW_FLUSH_MS = 32;
 const PREVIEW_RAW_MAX_BYTES = 16 * 1024;
 const PREVIEW_DIFF_SUPPRESS_AFTER_RAW_MS = 1000;
+
+/**
+ * Resolves the row bounds for one diff frame.
+ *
+ * `declaredRows` is what the frame actually claims, or `null` when it claims
+ * nothing usable; `rows` is the bound to test line indices against. They differ
+ * on purpose: a frame with no usable `rows` must still paint its lines, because
+ * the original code sized the buffer with `lines.slice(0, diff.rows)` and
+ * `slice(0, undefined)` keeps everything. Collapsing an absent `rows` to 0 made
+ * every line fail the bounds test and blanked the buffer, so incremental frames
+ * stopped rendering and output only appeared when the next full frame redrew
+ * the whole screen at once.
+ */
+export function resolveDiffRows(rawRows: unknown): { declaredRows: number | null; rows: number } {
+  const declaredRows = Number.isFinite(rawRows)
+    ? Math.max(0, Math.min(Math.floor(rawRows as number), TERMINAL_MAX_ROWS))
+    : null;
+  return { declaredRows, rows: declaredRows ?? TERMINAL_MAX_ROWS };
+}
+
+/**
+ * The single rule for "is this a row this frame may describe".
+ *
+ * Both the line-array path and the ANSI cursor-addressing path must agree; when
+ * they did not, a frame with rows=1 and lines=[[1000, …]] dropped the line from
+ * the array but still emitted `\x1b[1001;1H` to the terminal.
+ */
+export function isRenderableLineIndex(lineIdx: unknown, rows: number): lineIdx is number {
+  return Number.isInteger(lineIdx)
+    && (lineIdx as number) >= 0
+    && (lineIdx as number) < rows
+    && (lineIdx as number) < TERMINAL_MAX_ROWS;
+}
 
 function requestFrame(callback: FrameRequestCallback): number | ReturnType<typeof setTimeout> {
   const raf = globalThis.requestAnimationFrame;
@@ -389,13 +423,25 @@ export function TerminalView({ sessionName, ws, connected, active = true, previe
       return;
     }
 
+    // `rows` and every `lineIdx` arrive over the wire. Clamp before growing the
+    // array: the loops below are synchronous, so a single bad value would lock
+    // the main thread hard enough that the tab cannot even process a reload.
+    //
+    // See resolveDiffRows: an absent `rows` bounds allocation but must not be
+    // read as "zero rows", or incremental frames stop painting entirely.
+    const { declaredRows, rows } = resolveDiffRows(diff.rows);
     const lines = linesRef.current;
     for (const [lineIdx, content] of diff.lines) {
+      if (!isRenderableLineIndex(lineIdx, rows)) continue;
       while (lines.length <= lineIdx) lines.push('');
       lines[lineIdx] = content;
     }
-    while (lines.length < diff.rows) lines.push('');
-    linesRef.current = lines.slice(0, diff.rows);
+    if (declaredRows !== null) {
+      while (lines.length < declaredRows) lines.push('');
+      linesRef.current = lines.slice(0, declaredRows);
+    } else {
+      linesRef.current = lines;
+    }
 
     if (diff.fullFrame) {
       // Full frame: rewrite entire screen from cursor home
@@ -415,6 +461,12 @@ export function TerminalView({ sessionName, ws, connected, active = true, previe
       // Partial update: only write changed lines using cursor addressing
       let buf = '';
       for (const [lineIdx, content] of diff.lines) {
+        // Same predicate as the line-array path above. Bounding only by
+        // TERMINAL_MAX_ROWS was not enough: the array path additionally slices
+        // to `rows`, so a lineIdx between rows and the max was dropped from the
+        // array yet still written to xterm — the two disagreed about which rows
+        // exist, and the write addressed a row outside the declared screen.
+        if (!isRenderableLineIndex(lineIdx, rows)) continue;
         // CSI row;col H — 1-based row addressing
         buf += `\x1b[${lineIdx + 1};1H${content}\x1b[K`;
       }
