@@ -1,13 +1,22 @@
 /**
- * `evaluateP2pSendTargetScope` hand-parsed four routing fields while the daemon
- * honoured sixteen. The gap that mattered was `p2pWorkflowLaunchEnvelope`,
- * whose targets sit at `participants[].sessionName`: with none of the four
- * fields present the checker reported "no P2P routing" and let the send through
- * unscoped, so a share recipient could fan work out to sessions their share
- * does not cover.
+ * `evaluateP2pSendTargetScope` inspected four structured routing fields while
+ * the daemon honours sixteen — and, more importantly, also routes on control
+ * tokens parsed out of the message TEXT.
  *
- * The sweep is now driven by the shared routing-field list, so these also serve
- * as the regression for the two lists drifting apart again.
+ * The reachable bypass was the text one: `@@discuss(<session>, <mode>)` and
+ * `@@all(<mode>)` let a participant sharing a single tab name any session in
+ * the store, or the whole domain, in plain prose. That is what the `in-text
+ * routing tokens` block covers.
+ *
+ * The launch-envelope field is a forward guard, not a reproduction: the shipped
+ * `P2pWorkflowLaunchEnvelope` carries no routing targets — participants are
+ * bound daemon-side. An earlier version of this file asserted against an
+ * invented `participants` array on the envelope, which read as if it
+ * reproduced a live bypass. The envelope cases are now written against the real
+ * type and labelled for what they are.
+ *
+ * The sweep is driven by the shared routing-field list, so these also serve as
+ * the regression for the daemon's list and the share checker's drifting apart.
  */
 import { describe, expect, it } from 'vitest';
 import { evaluateP2pSendTargetScope } from '../src/share/p2p-send-scope.js';
@@ -22,44 +31,65 @@ const coversSession = (name: string) => name === covered;
 
 const evaluate = (msg: Record<string, unknown>) => evaluateP2pSendTargetScope({ msg, target, coversSession });
 
-describe('P2P send scope', () => {
-  it('denies a workflow envelope naming an uncovered participant', () => {
+describe('P2P send scope — launch envelope', () => {
+  // The real `P2pWorkflowLaunchEnvelope` (shared/p2p-workflow-types.ts:41-73)
+  // carries no routing targets today: it holds `legacy` / `advancedDraft` /
+  // `oldAdvanced` / `launchContext`, and the daemon binds participants itself
+  // from the session store. An earlier version of these tests invented a
+  // `participants` array on the envelope, which made them look like they
+  // reproduced a live bypass when the shape does not occur. They are kept as
+  // forward guards, described as such — the real reachable text path is
+  // covered in the `in-text routing tokens` block below.
+
+  it('denies an envelope whose launchContext names an uncovered session', () => {
+    // `launchContext.sessionName` is the originating session and is normally
+    // covered. Naming another one is not a legitimate shape, so failing closed
+    // here is the intended answer rather than a false positive.
     expect(evaluate({
       type: 'session.send',
       sessionName: covered,
       p2pWorkflowLaunchEnvelope: {
+        workflowSchemaVersion: 1,
         workflowKind: 'advanced',
-        participants: [{ sessionName: covered }, { sessionName: uncovered }],
+        launchContext: { sessionName: uncovered, requestId: 'req-1' },
       },
     })).toBe('share-direct-surface-denied');
   });
 
-  it('denies the legacy envelope field too', () => {
+  it('allows a real envelope that names no session at all', () => {
+    // The common case. Denying this would break shared advanced launches.
     expect(evaluate({
       type: 'session.send',
       sessionName: covered,
-      workflowLaunchEnvelope: { participants: [{ sessionName: uncovered }] },
-    })).toBe('share-direct-surface-denied');
-  });
-
-  it('denies a target buried in launchScope rather than participants', () => {
-    // Key-driven, not shape-driven: a new envelope layout that still calls its
-    // target `sessionName` is caught without touching the checker.
-    expect(evaluate({
-      type: 'session.send',
-      sessionName: covered,
-      p2pWorkflowLaunchEnvelope: { launchScope: { serverId, sessionName: uncovered } },
-    })).toBe('share-direct-surface-denied');
-  });
-
-  it('allows an envelope whose participants are all covered', () => {
-    expect(evaluate({
-      type: 'session.send',
-      sessionName: covered,
-      p2pWorkflowLaunchEnvelope: { participants: [{ sessionName: covered }] },
+      p2pWorkflowLaunchEnvelope: {
+        workflowSchemaVersion: 1,
+        workflowKind: 'advanced',
+        oldAdvanced: {
+          advancedPresetKey: 'preset-alpha',
+          advancedRounds: [{ id: 'r1', title: 'review', preset: 'review' }],
+        },
+        launchContext: { sessionName: covered, requestId: 'req-1' },
+      },
     })).toBeNull();
   });
 
+  it('would catch a future envelope shape that nests a target session', () => {
+    // Forward guard only — no shipped envelope has this shape. Key-driven, so
+    // a new layout that still calls its target `sessionName` is scoped without
+    // this file changing.
+    expect(evaluate({
+      type: 'session.send',
+      sessionName: covered,
+      p2pWorkflowLaunchEnvelope: {
+        workflowSchemaVersion: 1,
+        workflowKind: 'advanced',
+        advancedDraft: { nodes: [{ id: 'n1', sessionName: uncovered }] },
+      },
+    })).toBe('share-direct-surface-denied');
+  });
+});
+
+describe('P2P send scope', () => {
   it('leaves an ordinary send alone', () => {
     expect(evaluate({ type: 'session.send', sessionName: covered, text: 'hello' })).toBeNull();
   });
