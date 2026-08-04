@@ -244,9 +244,12 @@ function parseMessage(sessionName: string, msg: any, hist?: any, streaming = fal
         if (normalized) {
           rememberCompletedGeminiFileTool(toolKey);
           const effectiveInput = extractToolInput(tc.name, effectiveArgs);
-          timelineEmitter.emit(sessionName, 'tool.call', { tool: tc.name, ...(effectiveInput ? { input: effectiveInput } : {}) }, { source: 'daemon', confidence: 'high', eventId: stableId('tc'), ts: pending?.ts ?? stableTs, hidden: true });
+          // Correlation id for call/result pairing — without it the web view
+          // falls back to adjacency and mispairs concurrent tools.
+          timelineEmitter.emit(sessionName, 'tool.call', { tool: tc.name, ...(tc.id ? { toolCallId: tc.id } : {}), ...(effectiveInput ? { input: effectiveInput } : {}) }, { source: 'daemon', confidence: 'high', eventId: stableId('tc'), ts: pending?.ts ?? stableTs, hidden: true });
           const rawOutput = tc.result?.[0]?.functionResponse?.response?.output;
           timelineEmitter.emit(sessionName, 'tool.result', {
+            ...(tc.id ? { toolCallId: tc.id } : {}),
             ...(tc.status === 'error' ? { error: rawOutput ?? 'error' } : {}),
             ...(typeof rawOutput === 'string' && rawOutput.trim() ? { output: rawOutput } : {}),
           }, { source: 'daemon', confidence: 'high', eventId: stableId('tr'), ts: stableTs, hidden: true });

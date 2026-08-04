@@ -181,7 +181,10 @@ describe('transport runtime — background subagent parent wake', () => {
     harness.emitTool(backgroundSubagentTool('complete', 'codex:route:runtime:child-1', false));
     expect((harness.runtime as any)._pendingBackgroundSubagentWake.size).toBe(1);
 
-    await vi.waitFor(() => expect(harness.sends).toHaveLength(1), { timeout: 4_000 });
+    // The runtime deliberately schedules this wake through a delayed idle
+    // handoff. Allow extra headroom when the full daemon/server/web workspace
+    // is saturating the 211 validation host.
+    await vi.waitFor(() => expect(harness.sends).toHaveLength(1), { timeout: 12_000 });
     expect(harness.sends[0]).toContain(SDK_SUBAGENT_WAKE_PROMPT_HEADER);
     expect(harness.sends[0]).toContain('codex:route:runtime:child-1');
     expect(harness.sends[0]).not.toContain('untrusted terminal summary');

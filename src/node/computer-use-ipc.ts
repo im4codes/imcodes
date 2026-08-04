@@ -237,6 +237,7 @@ export interface ComputerUseIpcHostOptions {
   platform?: NodeJS.Platform;
   arch?: NodeJS.Architecture;
   execPath?: string;
+  macosComputerUseRuntimeRoot?: string;
   fetchImpl?: typeof fetch;
   downloadMacosComputerUseHelper?: typeof downloadControlledNodeComputerUseHelper;
   resolveMacosConsoleUser?: () => Promise<MacosConsoleUser>;
@@ -368,20 +369,22 @@ export class ComputerUseIpcHost {
     const user = await resolveConsoleUser();
     await authorizeSocket(this.path, user);
     const archiveName = controlledNodeComputerUseHelperFilename(CONTROLLED_NODE_OS_MAC);
+    const target = controlledNodeArtifactTarget(
+      'darwin',
+      this.options.arch ?? process.arch,
+    );
     const candidates = [
-      join(MACOS_COMPUTER_USE_RUNTIME_ROOT, archiveName),
+      join(this.options.macosComputerUseRuntimeRoot ?? MACOS_COMPUTER_USE_RUNTIME_ROOT, archiveName),
       join(dirname(execPath), 'computer-use-helper', archiveName),
-      join(dirname(execPath), 'computer-use-helper', 'darwin-arm64', archiveName),
+      ...(target
+        ? [join(dirname(execPath), 'computer-use-helper', `darwin-${target.arch}`, archiveName)]
+        : []),
     ];
     let sourceOpenComputerUseArchive = candidates.find((candidate) => existsSync(candidate));
     let downloadDir: string | undefined;
     try {
       if (!sourceOpenComputerUseArchive) {
         const credential = this.options.credential;
-        const target = controlledNodeArtifactTarget(
-          'darwin',
-          this.options.arch ?? process.arch,
-        );
         if (!credential || !target) throw new Error('computer_use_helper_not_installed');
         downloadDir = await mkdtemp(join(tmpdir(), 'imcodes-computer-use-download-'));
         const downloadHelper = this.options.downloadMacosComputerUseHelper

@@ -35,6 +35,12 @@ import {
   FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY,
 } from '../../shared/transport/file-transfer.js';
 import {
+  DIRECT_FILE_TRANSFER_AUTHENTICATED_ICE_CAPABILITY,
+  DIRECT_FILE_TRANSFER_CAPABILITY,
+  type DirectConnectivityRuntimeStatus,
+} from '../../shared/direct-file-transfer.js';
+import { getDirectConnectivityRuntimeStatus, isDirectFileTransferAvailable } from './direct-file-transfer.js';
+import {
   classifyServerSendPlane,
   recordServerLinkDataPlaneBackpressure,
   recordServerLinkDataPlaneStaleDropped,
@@ -67,6 +73,8 @@ interface SystemStats {
    *  heartbeat because the counter and the daemon log both stay on the machine
    *  whose disk is usually what failed. */
   shortRefHealth?: MemoryShortRefHealth;
+  /** Optional WebRTC addon state; distinct from ICE/network reachability. */
+  directConnectivity: DirectConnectivityRuntimeStatus;
 }
 
 /** Collect lightweight system stats for daemon.stats messages. */
@@ -88,6 +96,7 @@ function collectSystemStats(): SystemStats {
     uptime: os.uptime(),
     embedding: getEmbeddingStatus(),
     disks: getDiskUsage(),
+    directConnectivity: getDirectConnectivityRuntimeStatus(),
     ...(shortRefHealth ? { shortRefHealth } : {}),
   };
 }
@@ -209,6 +218,12 @@ const DAEMON_STATIC_CAPABILITIES = [
   FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY,
   FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY,
 ] as const;
+
+export function directFileTransferDaemonCapabilities(available: boolean): readonly string[] {
+  return available
+    ? [DIRECT_FILE_TRANSFER_CAPABILITY, DIRECT_FILE_TRANSFER_AUTHENTICATED_ICE_CAPABILITY]
+    : [];
+}
 
 /**
  * Whether `cap` is part of the daemon's static capability advertisement
@@ -824,6 +839,7 @@ export class ServerLink {
     return [...new Set([
       ...this.p2pWorkflowCapabilities,
       ...DAEMON_STATIC_CAPABILITIES,
+      ...directFileTransferDaemonCapabilities(isDirectFileTransferAvailable()),
     ])];
   }
 

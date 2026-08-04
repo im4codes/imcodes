@@ -48,12 +48,12 @@ describe('buildControlledNodeDownloadTargets', () => {
       artifacts: [
         { os: 'linux', arch: 'x64', filename: 'imcodes-node-linux', sizeBytes: 1, sha256: VALID_SHA256 },
         { os: 'win', arch: 'x64', filename: 'imcodes-node.exe', sizeBytes: 1, sha256: VALID_SHA256 },
-        { os: 'mac', arch: 'arm64', filename: 'imcodes-node-macos', sizeBytes: 1, sha256: VALID_SHA256 },
+        { os: 'mac', arch: 'universal', filename: 'imcodes-node-macos', sizeBytes: 1, sha256: VALID_SHA256 },
       ],
     });
     expect(targets).toEqual([
       { os: 'win', arch: 'x64' },
-      { os: 'mac', arch: 'arm64' },
+      { os: 'mac', arch: 'universal' },
       { os: 'linux', arch: 'x64' },
     ]);
   });

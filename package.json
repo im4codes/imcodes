@@ -97,6 +97,7 @@
     "**/*": "grep -qvE 'API_KEY|SECRET|PASSWORD|TOKEN|PRIVATE_KEY' || (echo 'Error: Potential sensitive information detected in your commit!' && exit 1)"
   },
   "optionalDependencies": {
+    "node-datachannel": "^0.32.3",
     "node-pty": "^1.1.0"
   },
   "overrides": {

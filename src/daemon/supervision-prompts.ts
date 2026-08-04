@@ -89,12 +89,24 @@ export interface PeerAuditBriefV1Input {
   validations?: readonly PeerAuditValidationItem[];
   /** Optional broker context; explicitly non-authoritative in the brief. */
   supervisorRationale?: string;
+  /** When true, scope the audit to the diff and its direct blast radius. */
+  narrowScope?: boolean;
+  /**
+   * Findings from the PREVIOUS REWORK round on this same work, if any.
+   *
+   * Without it every re-audit restarts from zero: the auditor re-derives what
+   * the last round already cleared, and tends to surface a fresh crop of
+   * incidental findings each pass, so repeat audits diverge instead of
+   * converging on the items that actually blocked.
+   */
+  priorReworkFindings?: string;
 }
 
 const PEER_AUDIT_ACCEPTANCE_TOTAL_BYTES = 4 * 1024;
 const PEER_AUDIT_PATHS_TOTAL_BYTES = 3 * 1024;
 const PEER_AUDIT_VALIDATIONS_TOTAL_BYTES = 4 * 1024;
 const PEER_AUDIT_RATIONALE_BYTES = 1024;
+const PEER_AUDIT_PRIOR_FINDINGS_BYTES = 3 * 1024;
 
 function truncatePeerAuditUtf8(value: string, maxBytes: number): string {
   if (peerAuditByteLength(value) <= maxBytes) return value;
@@ -167,6 +179,9 @@ export function buildPeerAuditBriefV1(input: PeerAuditBriefV1Input): string {
   const rationale = input.supervisorRationale
     ? sanitizePeerAuditText(input.supervisorRationale, PEER_AUDIT_RATIONALE_BYTES)
     : '';
+  const priorFindings = input.priorReworkFindings
+    ? sanitizePeerAuditText(input.priorReworkFindings, PEER_AUDIT_PRIOR_FINDINGS_BYTES)
+    : '';
 
   const brief = [
     `[Contract: ${PEER_AUDIT_PROMPT_VERSION}]`,
@@ -189,6 +204,17 @@ export function buildPeerAuditBriefV1(input: PeerAuditBriefV1Input): string {
     ...(paths.length ? ['', 'Relevant paths (names only; inspect selectively):', ...paths.map((item) => `- ${item}`)] : []),
     ...(validationLines.length ? ['', 'Existing validation summary (claims to verify):', ...validationLines.map((item) => `- ${item}`)] : []),
     ...(rationale ? ['', 'Non-authoritative broker rationale:', rationale] : []),
+    ...(input.narrowScope ? ['',
+      'SCOPE: this is a NARROW change — small, self-contained, blast radius visible in the diff.',
+      'Audit the change and what it directly touches. Do not re-review unrelated subsystems or run the full matrix; a proportionate check is the correct outcome here, not a thin version of a full one.',
+      'Still refuse to PASS on static reading alone if a relevant executable check exists — narrow means less surface, not less evidence.'] : []),
+    ...(priorFindings ? ['',
+      'THIS IS A RE-AUDIT. The previous round returned REWORK with the findings below.',
+      'Spend your effort on: (1) whether each of these is now actually closed, and (2) what the new changes introduced.',
+      'Do NOT re-derive areas the previous round already cleared unless the new changes touch them — repeat audits are supposed to converge, and re-litigating settled ground buries the items that still block.',
+      'If a listed item is still open, say so explicitly rather than replacing it with a newly-noticed unrelated one.',
+      'Previous REWORK findings:',
+      priorFindings] : []),
     '',
     'Submit exactly one structured reply. PASS requires at least one observed passed validation when an executable relevant check exists; otherwise list each unavailable check specifically. Empty/static-only PASS is rejected.',
     'Prefer the available peer_audit_reply MCP tool with these exact fields:',
@@ -216,9 +242,10 @@ export function buildSupervisionDecisionPrompt(
     'You are a supervision arbiter for a coding session.',
     'Judge the most recent assistant turn for the current task.',
     'Return exactly one JSON object and nothing else.',
-    '{"decision":"complete|continue|ask_human","reason":"...","confidence":0.0,"requiresAudit":true,"gap":"...","nextAction":"...","extra":{}}',
+    '{"decision":"complete|continue|waiting|ask_human","reason":"...","confidence":0.0,"requiresAudit":true,"auditDepth":"standard|narrow","gap":"...","nextAction":"...","extra":{}}',
     'Field contract:',
-    '- decision: complete when the task is sufficiently done for the current request; continue only when you can identify a SPECIFIC next step the agent should execute autonomously; ask_human when you need the user to decide, approve, or clarify.',
+    '- decision: complete when the task is sufficiently done for the current request; continue only when you can identify a SPECIFIC next step the agent should execute autonomously; waiting when the agent is correctly parked on an external result it must not act ahead of — it already dispatched a peer audit or delegation and is barred from touching the repository until the verdict arrives, or it is otherwise blocked on a reply it cannot poll for; ask_human when you need the user to decide, approve, or clarify.',
+    '- Choose waiting, NOT continue, when the agent says it is blocked awaiting an audit/delegation reply and the remaining work is genuinely gated on that reply. Re-prompting such an agent cannot advance anything: it will restate that it is waiting, and the loop repeats. waiting needs no nextAction.',
     '- reason: short human-readable explanation of the decision.',
     '- confidence: number in [0,1].',
     '- requiresAudit: boolean meaning "must automation start a NEW peer audit now?" Decide this in the SAME judgment; do not request another model call. Set true for substantive engineering work such as implementation/development, source or configuration changes, bug fixes, complex debugging/root-cause investigation, deployment/runtime mutation, or repository finalization that has not yet been audited. Set false for ordinary read-only checks, status queries, lookups, explanations, simple verification, and read-only review/audit. Also set false when the current task already delegated a matching audit and is waiting for PASS/REWORK, or when that audit already passed; never recursively audit an audit-status turn. A task that starts as a check but proceeds to modify/fix something requires audit unless its matching audit is already pending or passed.',
@@ -233,6 +260,9 @@ export function buildSupervisionDecisionPrompt(
     '- Prefer ask_human over a vague continue. If you cannot articulate a concrete nextAction, returning ask_human is the correct move — do not stall by emitting filler continues (they are downgraded to ask_human automatically and just waste a round-trip).',
     '- A factual answer to a user question (e.g. "yes, there are 3 uncommitted files") is typically complete for that turn IF no user-set rule applies. If a user rule applies (see authoritative clause above), return continue and enforce the rule. Do not otherwise treat state reports as proposed work.',
     '- When the assistant itself says remaining implementation work (tests, fixes, commit/push) is still pending, choose continue AND spell out what to do in nextAction.',
+'- auditDepth: how much audit the change is worth, used only when requiresAudit is true. Use "narrow" for a small, self-contained change whose blast radius is visible in the diff — a presentational tweak, copy/i18n wording, a comment, a test-only edit, a single-file fix with no cross-layer or runtime/security surface. Use "standard" for anything touching protocol/schema/persistence, auth or secrets, concurrency or state machines, multiple layers (daemon/server/web), or behaviour that other code depends on. Default to "standard" when genuinely unsure — but do not bill a two-line stylesheet change as if it were a state-machine rewrite; that is why supervised sessions feel audited constantly.',
+    '- requiresAudit false is CORRECT for a change with no behavioural surface at all: pure formatting, a comment, a doc file, or a rename with no call-site semantics. Auditing those spends a full independent round to confirm nothing.',
+    '- EXCEPTION that outranks BOTH the authoritative-user-rule clause and the pending-work rule above: if the agent already dispatched a peer audit or delegation and is waiting for its PASS/REWORK, or is otherwise blocked on a reply it cannot poll for, return `waiting` — NOT continue. Pending tests/fixes/commit/push do not make it continue while the work is gated on that reply, and a rule such as "always commit and push" is satisfied once the verdict arrives, not by re-prompting a blocked agent. Re-prompting cannot advance anything: the agent restates that it is waiting and the loop repeats.',
     buildAuditBeforeFinalizationRule(request),
     buildImcodesWorkflowBackgroundSection(),
     buildCustomInstructionsSection(resolveSupervisionCustomInstructionsDetail(request.snapshot)),
@@ -253,11 +283,12 @@ export function buildSupervisionDecisionRepairPrompt(
     `[Contract: ${contractId}]`,
     'Your previous response was invalid.',
     'Return exactly one valid JSON object and nothing else.',
-    '{"decision":"complete|continue|ask_human","reason":"...","confidence":0.0,"requiresAudit":true,"gap":"...","nextAction":"...","extra":{}}',
+    '{"decision":"complete|continue|waiting|ask_human","reason":"...","confidence":0.0,"requiresAudit":true,"auditDepth":"standard|narrow","gap":"...","nextAction":"...","extra":{}}',
     'requiresAudit is REQUIRED and means whether automation must start a NEW peer audit now: true for substantive implementation/modification/fixes/complex debugging/deployment or repository finalization not yet audited; false for ordinary read-only checks and when a matching audit is already delegated, awaiting PASS/REWORK, or has passed.',
     'When decision is continue, BOTH gap and nextAction are required; nextAction must be a concrete imperative instruction, not a filler like "keep going" / "继续完成任务". If you cannot name a concrete next action, return ask_human instead — a vague continue is always downgraded to ask_human anyway.',
     'If the assistant response mentions remaining implementation work like tests, fixes, verification, commit/push, or another concrete next engineering step, return continue with a nextAction that names the exact command or deliverable.',
     'USER-SET SUPERVISION RULES in the block below are AUTHORITATIVE and override the generic heuristics above. If a user rule uses blanket wording ("always", "每次", "必须", "绝不") or applies conditionally to the current topic (a rule like "Always commit and push if asked!" applies whenever the conversation is about committing / pushing / uncommitted changes, even if the user just asked a status question), return `continue` with a nextAction that enforces the rule. Do not treat a factual answer as `complete` when it violates a user-set rule.',
+    '- EXCEPTION that outranks the two rules above: if the agent already dispatched a peer audit or delegation and is waiting for its PASS/REWORK, or is otherwise blocked on a reply it cannot poll for, return `waiting` — NOT continue. Pending tests/fixes/commit/push do not make it continue while the work is gated on that reply, and a user rule such as "always commit and push" is satisfied after the verdict arrives, not by re-prompting a blocked agent. Re-prompting cannot advance anything: the agent will restate that it is waiting, and the loop repeats.',
     buildAuditBeforeFinalizationRule(request),
     buildImcodesWorkflowBackgroundSection(),
     buildCustomInstructionsSection(resolveSupervisionCustomInstructionsDetail(request.snapshot)),

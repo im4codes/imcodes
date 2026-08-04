@@ -20,8 +20,21 @@ import {
   handleFileDownloadStream,
   handleFilePathHandle,
   handleFileUploadFetch,
+  handleFileDelete,
   type FileTransferSender,
 } from '../daemon/file-transfer-handler.js';
+import {
+  MACHINE_DIRECT_FILE_TRANSFER_CAPABILITY,
+  MACHINE_DIRECT_FILE_FETCH_CAPABILITY,
+  MACHINE_DIRECT_FILE_TRANSFER_ERROR,
+  MACHINE_DIRECT_FILE_TRANSFER_LIMITS,
+  MACHINE_DIRECT_FILE_TRANSFER_MSG,
+  refreshMachineDirectUploadAuthority,
+  refreshMachineDirectFetchAuthority,
+  validateMachineDirectFetchRequest,
+  validateMachineDirectUploadRequest,
+} from '../../shared/machine-direct-file-transfer.js';
+import { receiveMachineDirectUpload, sendMachineDirectFetch } from '../daemon/machine-direct-transfer.js';
 
 /** Server → controlled node: auth succeeded; connection is live (bridge.ts heartbeat path). */
 const CONTROLLED_NODE_AUTH_ACK_TYPE = 'heartbeat_ack' as const;
@@ -51,6 +64,7 @@ export function createControlledNodeRuntime(
   let upgradeInFlight = false;
   let authenticationPersisted = false;
   let authenticationPersistenceInFlight = false;
+  const activeMachineDirectTransfers = new Set<string>();
   const reportAuthenticationError = (error: unknown) => {
     try {
       options.onAuthenticationError?.(error);
@@ -104,6 +118,8 @@ export function createControlledNodeRuntime(
         FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY,
         FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY,
         FILE_TRANSFER_PATH_HANDLE_CAPABILITY,
+        MACHINE_DIRECT_FILE_TRANSFER_CAPABILITY,
+        MACHINE_DIRECT_FILE_FETCH_CAPABILITY,
       ],
     },
     heartbeatMessage: { type: 'heartbeat', daemonVersion: DAEMON_VERSION },
@@ -156,10 +172,54 @@ export function createControlledNodeRuntime(
         if (reply) client.send({ type: DAEMON_MSG.COMPUTER_USE_RESULT, ...reply });
         return;
       }
+      if (message.type === MACHINE_DIRECT_FILE_TRANSFER_MSG.REQUEST) {
+        const parsed = validateMachineDirectUploadRequest(message);
+        if (!parsed.ok) return;
+        if (activeMachineDirectTransfers.size >= MACHINE_DIRECT_FILE_TRANSFER_LIMITS.MAX_CONCURRENT_RECEIVERS
+          || activeMachineDirectTransfers.has(parsed.value.requestId)) {
+          client.send({
+            type: MACHINE_DIRECT_FILE_TRANSFER_MSG.ERROR,
+            requestId: parsed.value.requestId,
+            error: MACHINE_DIRECT_FILE_TRANSFER_ERROR.TRANSFER_FAILED,
+          });
+          return;
+        }
+        activeMachineDirectTransfers.add(parsed.value.requestId);
+        try {
+          // This authenticated Server message is fresh. Re-mint the deadline
+          // from the controlled node's clock so Server/target skew cannot turn
+          // a valid direct request into an EXPIRED fallback.
+          client.send(await receiveMachineDirectUpload(refreshMachineDirectUploadAuthority(parsed.value)));
+        } finally {
+          activeMachineDirectTransfers.delete(parsed.value.requestId);
+        }
+        return;
+      }
+      if (message.type === MACHINE_DIRECT_FILE_TRANSFER_MSG.FETCH_REQUEST) {
+        const parsed = validateMachineDirectFetchRequest(message);
+        if (!parsed.ok) return;
+        if (activeMachineDirectTransfers.size >= MACHINE_DIRECT_FILE_TRANSFER_LIMITS.MAX_CONCURRENT_RECEIVERS
+          || activeMachineDirectTransfers.has(parsed.value.requestId)) {
+          client.send({
+            type: MACHINE_DIRECT_FILE_TRANSFER_MSG.FETCH_ERROR,
+            requestId: parsed.value.requestId,
+            error: MACHINE_DIRECT_FILE_TRANSFER_ERROR.TRANSFER_FAILED,
+          });
+          return;
+        }
+        activeMachineDirectTransfers.add(parsed.value.requestId);
+        try {
+          client.send(await sendMachineDirectFetch(refreshMachineDirectFetchAuthority(parsed.value)));
+        } finally {
+          activeMachineDirectTransfers.delete(parsed.value.requestId);
+        }
+        return;
+      }
       if (message.type === 'file.upload_fetch'
         || message.type === 'file.download'
         || message.type === FILE_TRANSFER_MSG.DOWNLOAD_STREAM
-        || message.type === FILE_TRANSFER_MSG.PATH_HANDLE) {
+        || message.type === FILE_TRANSFER_MSG.PATH_HANDLE
+        || message.type === FILE_TRANSFER_MSG.DELETE) {
         const parsed = validateControlledFileTransferRequest(message);
         if (!parsed.ok) return;
         const relayUrl = parsed.value.type === 'file.upload_fetch'
@@ -180,6 +240,8 @@ export function createControlledNodeRuntime(
           await handleFileDownload(parsed.value as unknown as Record<string, unknown>, fileSender);
         } else if (parsed.value.type === FILE_TRANSFER_MSG.DOWNLOAD_STREAM) {
           await handleFileDownloadStream(parsed.value as unknown as Record<string, unknown>, fileSender);
+        } else if (parsed.value.type === FILE_TRANSFER_MSG.DELETE) {
+          await handleFileDelete(parsed.value as unknown as Record<string, unknown>, fileSender);
         } else {
           await handleFilePathHandle(parsed.value as unknown as Record<string, unknown>, fileSender);
         }

@@ -29,6 +29,7 @@ function blobResponse(body = 'file', headers: Record<string, string> = {}): Resp
 
 class MockXmlHttpRequest {
   static instances: MockXmlHttpRequest[] = [];
+  static autoComplete = true;
 
   method = '';
   url = '';
@@ -51,6 +52,8 @@ class MockXmlHttpRequest {
   onprogress: (() => void) | null = null;
   onload: (() => void) | null = null;
   onerror: (() => void) | null = null;
+  onabort: (() => void) | null = null;
+  aborted = false;
 
   constructor() {
     MockXmlHttpRequest.instances.push(this);
@@ -67,6 +70,7 @@ class MockXmlHttpRequest {
 
   send(body: unknown) {
     this.body = body;
+    if (!MockXmlHttpRequest.autoComplete) return;
     this.upload.onprogress?.({ lengthComputable: true, loaded: 6, total: 12 } as ProgressEvent);
     this.upload.onprogress?.({ lengthComputable: true, loaded: 12, total: 12 } as ProgressEvent);
     this.responseText = JSON.stringify({
@@ -91,6 +95,11 @@ class MockXmlHttpRequest {
     }) + '\n';
     this.onload?.();
   }
+
+  abort() {
+    this.aborted = true;
+    this.onabort?.();
+  }
 }
 
 describe('shared-context and file API contracts', () => {
@@ -100,6 +109,7 @@ describe('shared-context and file API contracts', () => {
     vi.stubGlobal('XMLHttpRequest', MockXmlHttpRequest);
     browserOpenMock.mockReset();
     MockXmlHttpRequest.instances = [];
+    MockXmlHttpRequest.autoComplete = true;
     document.body.innerHTML = '';
     document.cookie = 'rcc_csrf=csrf-token';
   });
@@ -241,6 +251,32 @@ describe('shared-context and file API contracts', () => {
     const nativeUpload = MockXmlHttpRequest.instances[1];
     expect(nativeUpload.headers.get('Authorization')).toBe('Bearer native-key');
     expect(nativeUpload.withCredentials).toBe(false);
+  });
+
+  it('aborts an in-flight XHR upload through AbortSignal', async () => {
+    MockXmlHttpRequest.autoComplete = false;
+    const { uploadFile } = await import('../src/api.js');
+    const controller = new AbortController();
+    const pending = uploadFile('srv-1', new File(['hello'], 'cancel.txt'), undefined, 'client-upload', controller.signal);
+
+    controller.abort();
+
+    await expect(pending).rejects.toMatchObject({ name: 'AbortError', message: 'upload_canceled' });
+    expect(MockXmlHttpRequest.instances[0].aborted).toBe(true);
+  });
+
+  it('deletes uploaded attachments through the dedicated server route', async () => {
+    const fetchMock = vi.mocked(fetch);
+    fetchMock.mockResolvedValueOnce(jsonResponse({ ok: true }));
+    const { configure, deleteAttachment } = await import('../src/api.js');
+    configure('https://api.example/');
+
+    await deleteAttachment('srv/one', 'abc123.txt');
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      'https://api.example/api/server/srv%2Fone/uploads/abc123.txt',
+      expect.objectContaining({ method: 'DELETE' }),
+    );
   });
 
   it('downloads and previews attachments through desktop and native paths', async () => {

@@ -1,12 +1,10 @@
 # Build the self-contained controlled-node executable on a per-OS matrix and
 # publish the binaries as artifacts (controlled-node-remote-exec 7.3).
 #
-# Node SEA produces a binary for the HOST platform only, so each OS gets its own
-# matrix job (win/macos/linux). `scripts/build-node-exe.mjs` downloads the
-# OFFICIAL static node for the target and injects the SEA blob; the runner's node
-# only runs esbuild + the build script. The produced binaries are uploaded as
-# workflow artifacts (the "hosting" for a deploy step that populates the server's
-# IMCODES_NODE_EXE_DIR, which the /api/enroll/executable route streams from).
+# Each OS gets its own matrix job (win/macos/linux). The macOS job combines
+# official arm64 and x64 Node slices into one Universal 2 executable. The
+# produced binaries are uploaded as workflow artifacts (the "hosting" for a
+# deploy step that populates the server's IMCODES_NODE_EXE_DIR).
 name: build-node-exe
 
 on:
@@ -37,7 +35,7 @@ jobs:
         include:
           - os: ubuntu-latest
             artifact: imcodes-node-linux
-          - os: macos-latest
+          - os: macos-15
             artifact: imcodes-node-macos
           - os: windows-latest
             artifact: imcodes-node.exe

@@ -3,8 +3,10 @@ import {
   OpenCodeSdkProvider,
   openCodeSdkRuntimeHooks,
 } from '../../src/agent/providers/opencode-sdk.js';
+import type { ProviderContextPayload } from '../../shared/context-types.js';
 import { MEMORY_MCP_STATUS } from '../../shared/memory-ws.js';
 import { PROVIDER_ERROR_CODES } from '../../src/agent/transport-provider.js';
+import { AGENT_DELEGATION_NOTIFICATION_RESULTS } from '../../shared/agent-delegation.js';
 
 vi.mock('../../src/util/logger.js', () => ({
   default: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
@@ -50,10 +52,15 @@ function result<T>(data: T) {
   return Promise.resolve({ data, response: { status: 200 } });
 }
 
+function notFoundError(message = '404 message not found') {
+  return new Error(message, { cause: { status: 404 } });
+}
+
 function createHarness() {
   const queue = createAsyncQueue<Record<string, unknown>>();
   const prompt = deferred<{ data: Record<string, unknown> }>();
   const sessions = new Map<string, Record<string, any>>();
+  const messages = new Map<string, Record<string, any>>();
   const startOptions: Array<Record<string, unknown>> = [];
   let nextSession = 1;
   const client = {
@@ -70,7 +77,14 @@ function createHarness() {
         return result(session);
       }),
       list: vi.fn(() => result([...sessions.values()])),
+      message: vi.fn((options: any) => {
+        const message = messages.get(options.path.messageID);
+        if (!message) return Promise.reject(notFoundError());
+        return result(message);
+      }),
+      messages: vi.fn(() => result([...messages.values()])),
       prompt: vi.fn(() => prompt.promise),
+      promptAsync: vi.fn(() => result(undefined)),
       abort: vi.fn(() => result(true)),
     },
     provider: {
@@ -92,13 +106,16 @@ function createHarness() {
       })),
     },
     event: { subscribe: vi.fn(() => Promise.resolve({ stream: queue.stream })) },
+    notificationSession: {
+      prompt: vi.fn(() => result({ accepted: true })),
+    },
     permission: {
       reply: vi.fn(() => result(true)),
     },
     postSessionIdPermissionsPermissionId: vi.fn(() => result(true)),
   };
   const server = { url: 'http://127.0.0.1:45678', close: vi.fn() };
-  return { queue, prompt, sessions, client, server, startOptions };
+  return { queue, prompt, sessions, messages, client, server, startOptions };
 }
 
 describe('OpenCodeSdkProvider', () => {
@@ -109,7 +126,42 @@ describe('OpenCodeSdkProvider', () => {
   });
 
   afterEach(() => {
+    vi.useRealTimers();
     openCodeSdkRuntimeHooks.start = originalStart;
+  });
+
+  it('steers a correlated delegation completion through the OpenCode v2 session client', async () => {
+    const harness = createHarness();
+    openCodeSdkRuntimeHooks.start = vi.fn(async (options) => {
+      options.signal.addEventListener('abort', harness.queue.close, { once: true });
+      return { client: harness.client as any, server: harness.server };
+    });
+    const provider = new OpenCodeSdkProvider();
+    await provider.connect({});
+    const routeId = await provider.createSession({
+      sessionKey: 'route-delegation-notify',
+      sessionName: 'deck_project_brain',
+      cwd: '/tmp/project',
+    });
+    await provider.send(routeId, 'foreground work');
+
+    const result = await provider.notifyActiveDelegation?.(routeId, {
+      notificationId: 'notification_identity',
+      delegationId: 'delegation_identity',
+      sourceSessionName: 'deck_sub_auditor',
+      text: 'delegated audit finished',
+    });
+
+    expect(result).toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    expect(harness.client.notificationSession.prompt).toHaveBeenCalledWith({
+      sessionID: 'oc-session-1',
+      id: 'notification_identity',
+      prompt: { text: 'delegated audit finished' },
+      delivery: 'steer',
+      resume: true,
+    }, { throwOnError: true });
+    expect(harness.client.session.abort).not.toHaveBeenCalled();
+    await provider.disconnect();
   });
 
   it('starts the official server on loopback and exposes connected status', async () => {
@@ -293,7 +345,7 @@ describe('OpenCodeSdkProvider', () => {
       supportClass: 'full-normalized-context-injection',
       diagnostics: [],
     });
-    expect(harness.client.session.prompt).toHaveBeenCalledWith(expect.objectContaining({
+    expect(harness.client.session.promptAsync).toHaveBeenCalledWith(expect.objectContaining({
       path: { id: 'oc-session-1' },
       query: { directory: '/tmp/project' },
       body: expect.objectContaining({
@@ -356,14 +408,229 @@ describe('OpenCodeSdkProvider', () => {
       path: { id: 'oc-session-1', permissionID: 'perm-1' }, body: { response: 'once' },
     }));
 
-    harness.prompt.resolve({
-      data: {
-        info: { id: 'msg-1', sessionID: 'oc-session-1', role: 'assistant', providerID: 'anthropic', modelID: 'claude-sonnet-4-5', cost: 0.02, tokens: { input: 10, output: 5, cache: { read: 3, write: 2 } } },
-        parts: [{ id: 'part-1', sessionID: 'oc-session-1', messageID: 'msg-1', type: 'text', text: 'Hello' }],
-      },
-    });
-    await Promise.resolve();
+    expect(harness.client.session.prompt).not.toHaveBeenCalled();
     expect(completions).toHaveLength(1);
+    await provider.disconnect();
+  });
+
+  it('submits normal turns through prompt_async instead of holding a prompt response open', async () => {
+    const harness = createHarness();
+    openCodeSdkRuntimeHooks.start = vi.fn(async (options) => {
+      options.signal.addEventListener('abort', harness.queue.close, { once: true });
+      return { client: harness.client as any, server: harness.server };
+    });
+    const provider = new OpenCodeSdkProvider();
+    await provider.connect({});
+    const routeId = await provider.createSession({
+      sessionKey: 'route-prompt-async',
+      cwd: '/tmp/project',
+      agentId: 'anthropic/claude-sonnet-4-5',
+    });
+
+    await provider.send(routeId, {
+      userMessage: 'run the monitor',
+      assembledMessage: 'run the monitor',
+      deliveryId: 'cron-command-1',
+      context: {
+        requiredAuthoredContext: [],
+        advisoryAuthoredContext: [],
+        appliedDocumentVersionIds: [],
+        diagnostics: [],
+      },
+      authority: {
+        namespace: { scope: 'personal', projectId: 'p' },
+        authoritySource: 'none',
+        freshness: 'fresh',
+        fallbackAllowed: true,
+        retryScheduled: false,
+        providerPolicyOutcome: 'allowed',
+        diagnostics: [],
+      },
+      supportClass: 'full-normalized-context-injection',
+      diagnostics: [],
+    } satisfies ProviderContextPayload);
+
+    expect(harness.client.session.promptAsync).toHaveBeenCalledOnce();
+    expect(harness.client.session.promptAsync).toHaveBeenCalledWith(expect.objectContaining({
+      path: { id: 'oc-session-1' },
+      query: { directory: '/tmp/project' },
+      body: expect.objectContaining({
+        messageID: expect.stringMatching(/^msg_[0-9a-f]{26}$/),
+        parts: [{ type: 'text', text: 'run the monitor' }],
+      }),
+      throwOnError: true,
+    }));
+    expect(harness.client.session.prompt).not.toHaveBeenCalled();
+    await provider.disconnect();
+  });
+
+  it('does not submit a second prompt when a failed prompt_async request was already accepted', async () => {
+    const harness = createHarness();
+    harness.client.session.promptAsync.mockImplementationOnce((options: any) => {
+      harness.messages.set(options.body.messageID, {
+        info: {
+          id: options.body.messageID,
+          sessionID: options.path.id,
+          role: 'user',
+        },
+        parts: options.body.parts,
+      });
+      return Promise.reject(new TypeError('fetch failed'));
+    });
+    openCodeSdkRuntimeHooks.start = vi.fn(async (options) => {
+      options.signal.addEventListener('abort', harness.queue.close, { once: true });
+      return { client: harness.client as any, server: harness.server };
+    });
+    const provider = new OpenCodeSdkProvider();
+    await provider.connect({});
+    const routeId = await provider.createSession({
+      sessionKey: 'route-prompt-accepted',
+      cwd: '/tmp/project',
+    });
+    const payload = {
+      userMessage: 'inspect the service',
+      assembledMessage: 'inspect the service',
+      deliveryId: 'cron-command-accepted',
+      context: {
+        requiredAuthoredContext: [],
+        advisoryAuthoredContext: [],
+        appliedDocumentVersionIds: [],
+        diagnostics: [],
+      },
+      authority: {
+        namespace: { scope: 'personal', projectId: 'p' },
+        authoritySource: 'none',
+        freshness: 'fresh',
+        fallbackAllowed: true,
+        retryScheduled: false,
+        providerPolicyOutcome: 'allowed',
+        diagnostics: [],
+      },
+      supportClass: 'full-normalized-context-injection',
+      diagnostics: [],
+    } satisfies ProviderContextPayload;
+
+    await expect(provider.send(routeId, payload)).resolves.toBeUndefined();
+    await expect(provider.send(routeId, payload)).rejects.toMatchObject({
+      code: PROVIDER_ERROR_CODES.PROVIDER_ERROR,
+      message: 'OpenCode session is already busy',
+    });
+
+    expect(harness.client.session.promptAsync).toHaveBeenCalledOnce();
+    expect(harness.client.session.message).toHaveBeenCalled();
+    await provider.disconnect();
+  });
+
+  it('surfaces a missing prompt_async delivery as recoverable and reuses its message ID on retry', async () => {
+    vi.useFakeTimers();
+    const harness = createHarness();
+    harness.client.session.promptAsync
+      .mockRejectedValueOnce(new TypeError('fetch failed', { cause: { code: 'ECONNRESET' } }))
+      .mockImplementationOnce(() => result(undefined));
+    openCodeSdkRuntimeHooks.start = vi.fn(async (options) => {
+      options.signal.addEventListener('abort', harness.queue.close, { once: true });
+      return { client: harness.client as any, server: harness.server };
+    });
+    const provider = new OpenCodeSdkProvider();
+    await provider.connect({});
+    const routeId = await provider.createSession({
+      sessionKey: 'route-prompt-retry',
+      cwd: '/tmp/project',
+    });
+    const payload = {
+      userMessage: 'inspect the service',
+      assembledMessage: 'inspect the service',
+      deliveryId: 'cron-command-retry',
+      context: {
+        requiredAuthoredContext: [],
+        advisoryAuthoredContext: [],
+        appliedDocumentVersionIds: [],
+        diagnostics: [],
+      },
+      authority: {
+        namespace: { scope: 'personal', projectId: 'p' },
+        authoritySource: 'none',
+        freshness: 'fresh',
+        fallbackAllowed: true,
+        retryScheduled: false,
+        providerPolicyOutcome: 'allowed',
+        diagnostics: [],
+      },
+      supportClass: 'full-normalized-context-injection',
+      diagnostics: [],
+    } satisfies ProviderContextPayload;
+
+    const firstSend = provider.send(routeId, payload).then(
+      () => ({ error: undefined }),
+      (error: unknown) => ({ error }),
+    );
+    await vi.advanceTimersByTimeAsync(2_000);
+    await expect(firstSend).resolves.toMatchObject({ error: {
+      code: PROVIDER_ERROR_CODES.CONNECTION_LOST,
+      recoverable: true,
+      message: expect.stringContaining('fetch failed'),
+    } });
+    await expect(provider.send(routeId, payload)).resolves.toBeUndefined();
+
+    expect(harness.client.session.promptAsync).toHaveBeenCalledTimes(2);
+    const firstMessageId = harness.client.session.promptAsync.mock.calls[0]?.[0].body.messageID;
+    const secondMessageId = harness.client.session.promptAsync.mock.calls[1]?.[0].body.messageID;
+    expect(firstMessageId).toMatch(/^msg_[0-9a-f]{26}$/);
+    expect(secondMessageId).toBe(firstMessageId);
+    await provider.disconnect();
+  });
+
+  it('keeps an unobservable prompt_async delivery recoverable without calling it absent', async () => {
+    vi.useFakeTimers();
+    const harness = createHarness();
+    harness.client.session.message
+      .mockRejectedValueOnce(notFoundError())
+      .mockRejectedValue(new TypeError('fetch failed'));
+    harness.client.session.promptAsync.mockRejectedValueOnce(new TypeError('fetch failed'));
+    openCodeSdkRuntimeHooks.start = vi.fn(async (options) => {
+      options.signal.addEventListener('abort', harness.queue.close, { once: true });
+      return { client: harness.client as any, server: harness.server };
+    });
+    const provider = new OpenCodeSdkProvider();
+    await provider.connect({});
+    const routeId = await provider.createSession({
+      sessionKey: 'route-prompt-unknown',
+      cwd: '/tmp/project',
+    });
+    const send = provider.send(routeId, {
+      userMessage: 'inspect the service',
+      assembledMessage: 'inspect the service',
+      deliveryId: 'cron-command-unknown',
+      context: {
+        requiredAuthoredContext: [],
+        advisoryAuthoredContext: [],
+        appliedDocumentVersionIds: [],
+        diagnostics: [],
+      },
+      authority: {
+        namespace: { scope: 'personal', projectId: 'p' },
+        authoritySource: 'none',
+        freshness: 'fresh',
+        fallbackAllowed: true,
+        retryScheduled: false,
+        providerPolicyOutcome: 'allowed',
+        diagnostics: [],
+      },
+      supportClass: 'full-normalized-context-injection',
+      diagnostics: [],
+    } satisfies ProviderContextPayload).then(
+      () => ({ error: undefined }),
+      (error: unknown) => ({ error }),
+    );
+
+    await vi.advanceTimersByTimeAsync(2_000);
+    await expect(send).resolves.toMatchObject({ error: {
+      code: PROVIDER_ERROR_CODES.CONNECTION_LOST,
+      recoverable: true,
+      message: expect.stringContaining('fetch failed'),
+    } });
+    expect(harness.client.session.promptAsync).toHaveBeenCalledOnce();
+    expect(harness.client.session.message).toHaveBeenCalledTimes(6);
     await provider.disconnect();
   });
 
@@ -715,8 +982,9 @@ describe('OpenCodeSdkProvider', () => {
     });
     await provider.send(routeId, 'hello');
 
-    harness.prompt.resolve({
-      data: {
+    harness.queue.push({
+      type: 'message.updated',
+      properties: {
         info: {
           id: 'msg-placeholder',
           sessionID: 'oc-session-1',
@@ -725,7 +993,6 @@ describe('OpenCodeSdkProvider', () => {
           modelID: 'claude-sonnet-4-5',
           tokens: { input: 0, output: 0, cache: { read: 0, write: 0 } },
         },
-        parts: [],
       },
     });
     await vi.waitFor(() => expect(usage).toHaveLength(1));
@@ -825,8 +1092,9 @@ describe('OpenCodeSdkProvider', () => {
     });
     await provider.send(routeId, 'inspect presets');
 
-    harness.prompt.resolve({
-      data: {
+    harness.queue.push({
+      type: 'message.updated',
+      properties: {
         info: {
           id: 'msg-tool-step',
           sessionID: 'oc-session-1',
@@ -837,7 +1105,12 @@ describe('OpenCodeSdkProvider', () => {
           time: { completed: 100 },
           tokens: { input: 10, output: 5, cache: { read: 0, write: 0 } },
         },
-        parts: [{
+      },
+    });
+    harness.queue.push({
+      type: 'message.part.updated',
+      properties: {
+        part: {
           id: 'part-tool-step',
           callID: 'call-tool-step',
           sessionID: 'oc-session-1',
@@ -845,7 +1118,7 @@ describe('OpenCodeSdkProvider', () => {
           type: 'tool',
           tool: 'grep',
           state: { status: 'completed', input: { pattern: 'preset' }, output: 'match' },
-        }],
+        },
       },
     });
     await vi.waitFor(() => expect(tools).toHaveLength(1));
@@ -903,11 +1176,173 @@ describe('OpenCodeSdkProvider', () => {
     await provider.disconnect();
   });
 
+  it('treats a self-managed cron SILENT tool result as terminal and stops speculative tools', async () => {
+    const harness = createHarness();
+    openCodeSdkRuntimeHooks.start = vi.fn(async (options) => {
+      options.signal.addEventListener('abort', harness.queue.close, { once: true });
+      return { client: harness.client as any, server: harness.server };
+    });
+    const provider = new OpenCodeSdkProvider();
+    const tools: any[] = [];
+    const completions: any[] = [];
+    provider.onToolCall((sessionId, tool) => tools.push({ sessionId, ...tool }));
+    provider.onComplete((sessionId, message) => completions.push({ sessionId, ...message }));
+
+    await provider.connect({});
+    const routeId = await provider.createSession({
+      sessionKey: 'route-cron-silent',
+      cwd: '/tmp/project',
+      agentId: 'opencode/deepseek-v4-flash-free',
+    });
+    await provider.send(routeId, 'run monitor\n\n<imcodes-cron-control id="cron-1">');
+    harness.queue.push({
+      type: 'message.updated',
+      properties: {
+        info: {
+          id: 'msg-cron-tool',
+          sessionID: 'oc-session-1',
+          role: 'assistant',
+          providerID: 'opencode',
+          modelID: 'deepseek-v4-flash-free',
+          finish: 'tool-calls',
+        },
+      },
+    });
+    harness.queue.push({
+      type: 'message.part.updated',
+      properties: {
+        part: {
+          id: 'part-cron-tool',
+          callID: 'call-cron-tool',
+          sessionID: 'oc-session-1',
+          messageID: 'msg-cron-tool',
+          type: 'tool',
+          tool: 'bash',
+          state: { status: 'completed', input: { command: 'python monitor.py' }, output: 'SILENT\n' },
+        },
+      },
+    });
+
+    await vi.waitFor(() => expect(completions).toHaveLength(1));
+    expect(completions[0]).toMatchObject({
+      sessionId: routeId,
+      content: 'SILENT',
+      status: 'complete',
+      metadata: { source: 'cron.tool.silent' },
+    });
+    expect(tools).toHaveLength(1);
+    expect(harness.client.session.abort).not.toHaveBeenCalled();
+    expect(harness.client.session.prompt).not.toHaveBeenCalled();
+
+    harness.queue.push({
+      type: 'message.part.updated',
+      properties: {
+        part: {
+          id: 'part-unrequested-fetch',
+          callID: 'call-unrequested-fetch',
+          sessionID: 'oc-session-1',
+          messageID: 'msg-cron-tool',
+          type: 'tool',
+          tool: 'webfetch',
+          state: { status: 'completed', output: 'should be ignored' },
+        },
+      },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(tools).toHaveLength(1);
+    await provider.disconnect();
+  });
+
+  it('does not treat a SILENT tool result as terminal outside a self-managed cron turn', async () => {
+    const harness = createHarness();
+    openCodeSdkRuntimeHooks.start = vi.fn(async (options) => {
+      options.signal.addEventListener('abort', harness.queue.close, { once: true });
+      return { client: harness.client as any, server: harness.server };
+    });
+    const provider = new OpenCodeSdkProvider();
+    const tools: any[] = [];
+    const completions: any[] = [];
+    provider.onToolCall((sessionId, tool) => tools.push({ sessionId, ...tool }));
+    provider.onComplete((sessionId, message) => completions.push({ sessionId, ...message }));
+
+    await provider.connect({});
+    const routeId = await provider.createSession({
+      sessionKey: 'route-ordinary-silent-tool',
+      cwd: '/tmp/project',
+      agentId: 'opencode/deepseek-v4-flash-free',
+    });
+    await provider.send(routeId, 'run a normal command');
+    harness.queue.push({
+      type: 'message.updated',
+      properties: {
+        info: {
+          id: 'msg-ordinary-tool',
+          sessionID: 'oc-session-1',
+          role: 'assistant',
+          providerID: 'opencode',
+          modelID: 'deepseek-v4-flash-free',
+          finish: 'tool-calls',
+        },
+      },
+    });
+    harness.queue.push({
+      type: 'message.part.updated',
+      properties: {
+        part: {
+          id: 'part-ordinary-tool',
+          callID: 'call-ordinary-tool',
+          sessionID: 'oc-session-1',
+          messageID: 'msg-ordinary-tool',
+          type: 'tool',
+          tool: 'bash',
+          state: { status: 'completed', output: 'SILENT\n' },
+        },
+      },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(tools).toHaveLength(1);
+    expect(completions).toHaveLength(0);
+    expect(harness.client.session.prompt).not.toHaveBeenCalled();
+
+    harness.queue.push({
+      type: 'message.part.updated',
+      properties: {
+        part: {
+          id: 'part-ordinary-final',
+          sessionID: 'oc-session-1',
+          messageID: 'msg-ordinary-final',
+          type: 'text',
+          text: 'Normal final response.',
+        },
+      },
+    });
+    harness.queue.push({
+      type: 'message.updated',
+      properties: {
+        info: {
+          id: 'msg-ordinary-final',
+          sessionID: 'oc-session-1',
+          role: 'assistant',
+          providerID: 'opencode',
+          modelID: 'deepseek-v4-flash-free',
+          finish: 'stop',
+        },
+      },
+    });
+
+    await vi.waitFor(() => expect(completions).toHaveLength(1));
+    expect(completions[0]).toMatchObject({
+      sessionId: routeId,
+      content: 'Normal final response.',
+      metadata: { source: 'message.updated' },
+    });
+    await provider.disconnect();
+  });
+
   it('recovers once when OpenCode becomes idle after tools without a final response', async () => {
     const harness = createHarness();
     const recoveryPrompt = deferred<{ data: Record<string, unknown> }>();
     harness.client.session.prompt
-      .mockImplementationOnce(() => harness.prompt.promise)
       .mockImplementationOnce(() => recoveryPrompt.promise);
     openCodeSdkRuntimeHooks.start = vi.fn(async (options) => {
       options.signal.addEventListener('abort', harness.queue.close, { once: true });
@@ -927,8 +1362,9 @@ describe('OpenCodeSdkProvider', () => {
     });
     await provider.send(routeId, 'inspect presets');
 
-    harness.prompt.resolve({
-      data: {
+    harness.queue.push({
+      type: 'message.updated',
+      properties: {
         info: {
           id: 'msg-tool-step',
           sessionID: 'oc-session-1',
@@ -939,13 +1375,18 @@ describe('OpenCodeSdkProvider', () => {
           time: { completed: 100 },
           tokens: { input: 10, output: 5, cache: { read: 0, write: 0 } },
         },
-        parts: [{
+      },
+    });
+    harness.queue.push({
+      type: 'message.part.updated',
+      properties: {
+        part: {
           id: 'part-whitespace',
           sessionID: 'oc-session-1',
           messageID: 'msg-tool-step',
           type: 'text',
           text: '\n\n',
-        }],
+        },
       },
     });
     await Promise.resolve();
@@ -972,10 +1413,10 @@ describe('OpenCodeSdkProvider', () => {
     expect(errors).toHaveLength(0);
 
     harness.queue.push({ type: 'session.idle', properties: { sessionID: 'oc-session-1' } });
-    await vi.waitFor(() => expect(harness.client.session.prompt).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect(harness.client.session.prompt).toHaveBeenCalledTimes(1));
     expect(completions).toHaveLength(0);
     expect(errors).toHaveLength(0);
-    expect(harness.client.session.prompt.mock.calls[1]?.[0]).toMatchObject({
+    expect(harness.client.session.prompt.mock.calls[0]?.[0]).toMatchObject({
       path: { id: 'oc-session-1' },
       query: { directory: '/tmp/project' },
       body: {
@@ -993,7 +1434,7 @@ describe('OpenCodeSdkProvider', () => {
     });
     harness.queue.push({ type: 'session.idle', properties: { sessionID: 'oc-session-1' } });
     await new Promise((resolve) => setTimeout(resolve, 0));
-    expect(harness.client.session.prompt).toHaveBeenCalledTimes(2);
+    expect(harness.client.session.prompt).toHaveBeenCalledTimes(1);
 
     recoveryPrompt.resolve({
       data: {
@@ -1025,7 +1466,7 @@ describe('OpenCodeSdkProvider', () => {
       status: 'complete',
     });
     expect(errors).toHaveLength(0);
-    expect(harness.client.session.prompt).toHaveBeenCalledTimes(2);
+    expect(harness.client.session.prompt).toHaveBeenCalledTimes(1);
     await provider.disconnect();
   });
 
@@ -1064,7 +1505,8 @@ describe('OpenCodeSdkProvider', () => {
       },
     });
     await new Promise((resolve) => setTimeout(resolve, 0));
-    expect(harness.client.session.prompt).toHaveBeenCalledTimes(1);
+    expect(harness.client.session.promptAsync).toHaveBeenCalledTimes(1);
+    expect(harness.client.session.prompt).not.toHaveBeenCalled();
     expect(completions).toHaveLength(0);
     expect(errors).toHaveLength(0);
 
@@ -1090,16 +1532,31 @@ describe('OpenCodeSdkProvider', () => {
       status: 'complete',
     });
     expect(errors).toHaveLength(0);
-    expect(harness.client.session.prompt).toHaveBeenCalledTimes(1);
+    expect(harness.client.session.promptAsync).toHaveBeenCalledTimes(1);
+    expect(harness.client.session.prompt).not.toHaveBeenCalled();
     await provider.disconnect();
   });
 
-  it('reports an explicit failure when the one-shot missing-final recovery is also empty', async () => {
+  it('reports an explicit failure when bounded missing-final recovery remains empty', async () => {
     const harness = createHarness();
     const recoveryPrompt = deferred<{ data: Record<string, unknown> }>();
+    const emptyRecovery = {
+      data: {
+        info: {
+          id: 'msg-empty-recovery',
+          sessionID: 'oc-session-1',
+          role: 'assistant',
+          providerID: 'opencode',
+          modelID: 'deepseek-v4-flash-free',
+          finish: 'unknown',
+          time: { completed: 200 },
+        },
+        parts: [],
+      },
+    };
     harness.client.session.prompt
-      .mockImplementationOnce(() => harness.prompt.promise)
-      .mockImplementationOnce(() => recoveryPrompt.promise);
+      .mockImplementationOnce(() => recoveryPrompt.promise)
+      .mockImplementation(() => Promise.resolve(emptyRecovery));
     openCodeSdkRuntimeHooks.start = vi.fn(async (options) => {
       options.signal.addEventListener('abort', harness.queue.close, { once: true });
       return { client: harness.client as any, server: harness.server };
@@ -1118,8 +1575,9 @@ describe('OpenCodeSdkProvider', () => {
     });
     await provider.send(routeId, 'inspect presets');
 
-    harness.prompt.resolve({
-      data: {
+    harness.queue.push({
+      type: 'message.updated',
+      properties: {
         info: {
           id: 'msg-tool-step',
           sessionID: 'oc-session-1',
@@ -1129,39 +1587,68 @@ describe('OpenCodeSdkProvider', () => {
           finish: 'tool-calls',
           time: { completed: 100 },
         },
-        parts: [],
       },
     });
     harness.queue.push({ type: 'session.idle', properties: { sessionID: 'oc-session-1' } });
-    await vi.waitFor(() => expect(harness.client.session.prompt).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect(harness.client.session.prompt).toHaveBeenCalledTimes(1));
 
-    recoveryPrompt.resolve({
-      data: {
-        info: {
-          id: 'msg-empty-recovery',
-          sessionID: 'oc-session-1',
-          role: 'assistant',
-          providerID: 'opencode',
-          modelID: 'deepseek-v4-flash-free',
-          finish: 'unknown',
-          time: { completed: 200 },
-        },
-        parts: [],
-      },
-    });
-    await vi.waitFor(() => expect(harness.client.session.prompt).toHaveBeenCalledTimes(2));
-    harness.queue.push({ type: 'session.idle', properties: { sessionID: 'oc-session-1' } });
+    recoveryPrompt.resolve(emptyRecovery);
 
-    await vi.waitFor(() => expect(errors).toHaveLength(1));
+    await vi.waitFor(() => expect(errors).toHaveLength(1), { timeout: 4_000 });
     expect(completions).toHaveLength(0);
     expect(errors[0]).toMatchObject({
       sessionId: routeId,
       code: PROVIDER_ERROR_CODES.PROVIDER_ERROR,
-      message: 'OpenCode ended the turn without a final response.',
+      message: 'OpenCode ended the turn without a final response after bounded recovery.',
       recoverable: false,
-      details: { source: 'session.idle' },
+      details: { recoveryMessageId: expect.stringMatching(/^msg_/) },
     });
     expect(harness.client.session.prompt).toHaveBeenCalledTimes(2);
+    await provider.disconnect();
+  });
+
+  it('does not attach a replacement OpenCode runtime after cancellation wins the reconnect race', async () => {
+    const harness = createHarness();
+    const replacementStart = deferred<any>();
+    const replacementQueue = createAsyncQueue<Record<string, unknown>>();
+    const replacementServer = { url: harness.server.url, close: vi.fn() };
+    harness.client.session.prompt.mockRejectedValue(new TypeError('fetch failed'));
+    let startCount = 0;
+    openCodeSdkRuntimeHooks.start = vi.fn(async (options) => {
+      startCount += 1;
+      if (startCount === 3) return replacementStart.promise;
+      options.signal.addEventListener('abort', harness.queue.close, { once: true });
+      return { client: harness.client as any, server: harness.server };
+    });
+    const provider = new OpenCodeSdkProvider();
+    const errors: any[] = [];
+    provider.onError((sessionId, error) => errors.push({ sessionId, ...error }));
+
+    await provider.connect({});
+    const routeId = await provider.createSession({
+      sessionKey: 'route-cancel-reconnect',
+      cwd: '/tmp/project',
+      agentId: 'opencode/deepseek-v4-flash-free',
+    });
+    await provider.send(routeId, 'inspect presets');
+    harness.queue.push({ type: 'session.idle', properties: { sessionID: 'oc-session-1' } });
+    await vi.waitFor(() => expect(openCodeSdkRuntimeHooks.start).toHaveBeenCalledTimes(3), { timeout: 4_000 });
+
+    await provider.cancel(routeId);
+    replacementStart.resolve({
+      client: {
+        ...harness.client,
+        event: { subscribe: vi.fn(async () => ({ stream: replacementQueue.stream })) },
+      },
+      server: replacementServer,
+    });
+
+    await vi.waitFor(() => expect(replacementServer.close).toHaveBeenCalledOnce());
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toMatchObject({
+      sessionId: routeId,
+      code: PROVIDER_ERROR_CODES.CANCELLED,
+    });
     await provider.disconnect();
   });
 
@@ -1300,7 +1787,10 @@ describe('OpenCodeSdkProvider', () => {
       type: 'session.error',
       properties: { sessionID: 'oc-session-1', error: { name: 'ProviderAuthError', message: 'upstream failed' } },
     });
-    harness.prompt.reject(new Error('upstream failed again'));
+    harness.queue.push({
+      type: 'session.error',
+      properties: { sessionID: 'oc-session-1', error: { name: 'ProviderAuthError', message: 'upstream failed again' } },
+    });
 
     await vi.waitFor(() => expect(errors).toHaveLength(1));
     expect(completions).toHaveLength(0);

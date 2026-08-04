@@ -7,7 +7,7 @@ import { buildTransportResumeLaunchOpts } from '../agent/transport-resume-opts.j
 import { isTransportAgent, type AgentType } from '../agent/detect.js';
 import { aliasExpansionModeFor, expandForAgent } from '../../shared/alias-expand.js';
 import { ALIAS_REASONS } from '../../shared/alias-types.js';
-import type { AliasSendAudit, SendAliasResolution } from '../../shared/alias-types.js';
+import type { AliasSendAudit, SendAliasNotes, SendAliasResolution } from '../../shared/alias-types.js';
 import { buildAliasSendAudit } from './alias-audit.js';
 import { sendKeys, sendKeysDelayedEnter, sendRawInput, resizeSession, sendKey, getPaneStartCommand, preparePrivateInputWriter } from '../agent/tmux.js';
 import { listSessions, getSession, upsertSession, removeSession, type SessionRecord } from '../store/session-store.js';
@@ -56,6 +56,7 @@ import { getDefaultAckOutbox } from './ack-outbox.js';
 import { COMMAND_ACK_ERROR_DUPLICATE_COMMAND_ID, MSG_COMMAND_ACK } from '../../shared/ack-protocol.js';
 import {
   AGENT_DELEGATION_ERROR_CODES,
+  AGENT_DELEGATION_REPLY_TIMELINE_EVENT,
   AGENT_DELEGATION_TARGET_FIELD,
   findForbiddenAgentDelegationCommandFields,
   findMixedAgentDelegationP2pFields,
@@ -129,6 +130,7 @@ import {
   resolveWindowsUpgradeRunnerPath,
 } from '../util/windows-upgrade-script.js';
 import { buildBashSharpRepair } from '../util/sharp-repair-script.js';
+import { buildBashNodeDatachannelRepair } from '../util/node-datachannel-repair-script.js';
 import {
   buildPosixUpgradeLayoutRecoveryScript,
   parsePosixUpgradeFailureStatus,
@@ -954,6 +956,7 @@ import {
   handleFileUploadFetch,
   handleFileDownload,
   handleFileDownloadStream,
+  handleFileDelete,
   tryCreateProjectFileHandle,
   lookupAttachment,
 } from './file-transfer-handler.js';
@@ -964,6 +967,8 @@ import { FS_READ_ERROR_CODES } from '../../shared/fs-read-error-codes.js';
 import { FS_TRANSPORT_MSG } from '../../shared/fs-transport-messages.js';
 import { FS_WRITE_MAX_BYTES } from '../../shared/fs-write-limits.js';
 import { FILE_TRANSFER_MSG } from '../../shared/transport/file-transfer.js';
+import { isDirectFileTransferMessageType } from '../../shared/direct-file-transfer.js';
+import { handleDirectFileTransferCommand } from './direct-file-transfer.js';
 import { REPO_MSG } from '../shared/repo-types.js';
 import { handlePreviewCommand } from './preview-relay.js';
 import { PREVIEW_MSG } from '../../shared/preview-types.js';
@@ -1392,6 +1397,11 @@ export function handleWebCommand(msg: unknown, serverLink: ServerLink): void {
   const cmd = msg as Record<string, unknown>;
   traceWebCommandReceived(cmd);
 
+  if (isDirectFileTransferMessageType(cmd.type)) {
+    void handleDirectFileTransferCommand(cmd, serverLink);
+    return;
+  }
+
   // Top-level isolation: any synchronous throw inside a handler — e.g.
   // a TypeError from `cmd.foo.bar` when `foo` is undefined, or a
   // validation throw before the first await of an async function —
@@ -1797,6 +1807,9 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
       break;
     case FILE_TRANSFER_MSG.DOWNLOAD_STREAM:
       void handleFileDownloadStream(cmd, serverLink);
+      break;
+    case FILE_TRANSFER_MSG.DELETE:
+      void handleFileDelete(cmd, serverLink);
       break;
     case TRANSPORT_MSG.LIST_SESSIONS:
       void handleListProviderSessions(cmd, serverLink);
@@ -2280,6 +2293,20 @@ function cancelTransportTurnNow(
 ): boolean {
   const stopRuntime = getTransportRuntime(sessionName);
   const stopRecord = getSession(sessionName);
+  // Stand supervision down FIRST, before any early return.
+  //
+  // This used to live inside the async block far below, which is only reached
+  // when the session is a transport session AND its runtime is still live. Every
+  // other stop fell out at one of the two returns underneath and left the
+  // supervision state machine fully armed, so STOP visibly did not stop the
+  // automatic "continue" prompts: process/tmux agents bailed at the
+  // `isTransportStop` check, and transport sessions whose runtime had already
+  // gone bailed at the `!stopRuntime` check.
+  //
+  // It is safe to run for a session this function then declines to handle: both
+  // calls are idempotent no-ops when nothing is armed.
+  supervisionAutomation.cancelForUserStop(sessionName);
+  peerAuditService.invalidateCancel(sessionName);
   const isTransportStop = !!stopRuntime
     || stopRecord?.runtimeType === 'transport'
     || (typeof stopRecord?.agentType === 'string' && isTransportAgent(stopRecord.agentType));
@@ -2307,8 +2334,6 @@ function cancelTransportTurnNow(
   // - web/test/components/SessionControls.test.tsx
   void (async () => {
     try {
-      supervisionAutomation.cancelSession(sessionName);
-      peerAuditService.invalidateCancel(sessionName);
       await stopRuntime.cancel();
       // Mark session for fresh start so daemon restart doesn't resume the
       // stuck conversation.
@@ -3044,6 +3069,11 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   const resolvedAliases: SendAliasResolution = cmd.resolvedAliases && typeof cmd.resolvedAliases === 'object' && !Array.isArray(cmd.resolvedAliases)
     ? cmd.resolvedAliases as SendAliasResolution
     : {};
+  // Sibling note map (optional). Older clients omit it entirely; the legend then
+  // renders exactly as before.
+  const resolvedAliasNotes: SendAliasNotes = cmd.resolvedAliasNotes && typeof cmd.resolvedAliasNotes === 'object' && !Array.isArray(cmd.resolvedAliasNotes)
+    ? cmd.resolvedAliasNotes as SendAliasNotes
+    : {};
 
   if (!sessionName || typeof text !== 'string') {
     logger.warn('session.send: missing sessionName or text');
@@ -3659,7 +3689,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   // `aliasProviderText` is set only when the agent-bound text actually differs, so
   // the no-alias path stays byte-identical. Values are never logged.
   const aliasMode = aliasExpansionModeFor(record.agentType ?? '');
-  const aliasExpansion = expandForAgent(displayText, resolvedAliases, aliasMode);
+  const aliasExpansion = expandForAgent(displayText, resolvedAliases, aliasMode, resolvedAliasNotes);
   // ── Alias fail-closed guard (A′, CRITICAL) ─────────────────────────────────
   // `deliver === false` ONLY for a raw executor (inline mode: shell/script, or an
   // unknown agent type that defaults to inline) with an UNRESOLVED `;;(name)`
@@ -3716,7 +3746,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   // plaintext) to the human-facing `user.message` so "what did `;;(name)`
   // actually deliver" is auditable. `undefined` when no marker resolved, so the
   // no-alias path stays byte-identical. Values are never logged or emitted.
-  const aliasAudit: AliasSendAudit | undefined = buildAliasSendAudit(displayText, resolvedAliases);
+  const aliasAudit: AliasSendAudit | undefined = buildAliasSendAudit(displayText, resolvedAliases, resolvedAliasNotes);
   const aliasAuditExtra: Record<string, unknown> = aliasAudit ? { aliasAudit } : {};
   const preferenceMessagePreamble = await loadPreferenceProviderContext({
     enabled: preferenceFeatureEnabled,
@@ -3760,6 +3790,10 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     const enqueueResult = enqueueResend(sessionName, {
       text: displayText,
       ...(aliasProviderText ? { providerText: aliasProviderText } : {}),
+      // The anchor travels with the expansion it describes. Without it an
+      // offline-queued send still delivers the alias VALUE to the provider on
+      // reconnect while the timeline records nothing about what was delivered.
+      ...(aliasAudit ? { aliasAudit } : {}),
       ...(preferenceMessagePreamble ? { messagePreamble: preferenceMessagePreamble } : {}),
       ...(sharedActor ? { sharedActor } : {}),
       commandId: effectiveId,
@@ -3847,6 +3881,9 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     const enqueueResultMissingSid = enqueueResend(sessionName, {
       text: displayText,
       ...(aliasProviderText ? { providerText: aliasProviderText } : {}),
+      // Same reason as the no-runtime branch above: the anchor must accompany
+      // the expansion, or this delivery lands unauditable.
+      ...(aliasAudit ? { aliasAudit } : {}),
       ...(preferenceMessagePreamble ? { messagePreamble: preferenceMessagePreamble } : {}),
       ...(sharedActor ? { sharedActor } : {}),
       commandId: effectiveId,
@@ -4229,10 +4266,14 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       // (the expanded agent-bound copy) rides the send metadata and only exists
       // when alias expansion actually changed the text — otherwise the metadata
       // shape stays exactly as before (byte-identical no-alias path).
-      const sendMetadata = (sharedActor || aliasProviderText)
+      // `aliasAudit` must ride the metadata, not just the immediate emit: a
+      // queued/resent message emits its user.message later from session-manager,
+      // which can only anchor what the entry carries.
+      const sendMetadata = (sharedActor || aliasProviderText || aliasAudit)
         ? {
             ...(sharedActor ? { sharedActor } : {}),
             ...(aliasProviderText ? { providerText: aliasProviderText } : {}),
+            ...(aliasAudit ? { aliasAudit } : {}),
           }
         : undefined;
       const result = preferenceMessagePreamble
@@ -4606,7 +4647,31 @@ async function handleEditQueuedTransportMessage(cmd: Record<string, unknown>, se
   }
   const release = await getMutex(sessionName).acquire();
   try {
-    const edited = runtime.editPendingMessage(clientMessageId, text);
+    // Re-resolve aliases for the EDITED text. The edit may introduce or keep
+    // `;;(name)` markers; without this the provider receives the literal marker
+    // (legend agents) or the send fails closed (shell/script).
+    const editResolved: SendAliasResolution = cmd.resolvedAliases && typeof cmd.resolvedAliases === 'object' && !Array.isArray(cmd.resolvedAliases)
+      ? cmd.resolvedAliases as SendAliasResolution
+      : {};
+    const editNotes: SendAliasNotes = cmd.resolvedAliasNotes && typeof cmd.resolvedAliasNotes === 'object' && !Array.isArray(cmd.resolvedAliasNotes)
+      ? cmd.resolvedAliasNotes as SendAliasNotes
+      : {};
+    const editExpansion = expandForAgent(
+      text,
+      editResolved,
+      aliasExpansionModeFor(String(record?.agentType ?? '')),
+      editNotes,
+    );
+    const editAudit = buildAliasSendAudit(text, editResolved, editNotes);
+    // One replacement value, used by BOTH store writes below. `store.edit`
+    // clears the previous expansion and only restores what it is handed, so a
+    // second call without this would silently undo the runtime's write and a
+    // restart before drain would deliver a bare marker with no anchor.
+    const editReplacement = {
+      ...(editExpansion.deliver && editExpansion.text !== text ? { providerText: editExpansion.text } : {}),
+      ...(editAudit ? { aliasAudit: editAudit } : {}),
+    };
+    const edited = runtime.editPendingMessage(clientMessageId, text, editReplacement);
     if (!edited) {
       timelineEmitter.emit(sessionName, 'command.ack', { commandId, status: 'error', error: 'Queued message not found' });
       emitCommandAckReliable(serverLink, { commandId, sessionName, status: 'error', error: 'Queued message not found' });
@@ -4616,7 +4681,7 @@ async function handleEditQueuedTransportMessage(cmd: Record<string, unknown>, se
     peerAuditService.invalidateQueuedEdit(sessionName);
     let queueSnapshot = getTransportQueueStore().readSnapshotSafely(sessionName, 'edit_queued_message_before');
     try {
-      queueSnapshot = getTransportQueueStore().edit(sessionName, clientMessageId, text);
+      queueSnapshot = getTransportQueueStore().edit(sessionName, clientMessageId, text, undefined, editReplacement);
     } catch (err) {
       logger.warn({ err, sessionName, clientMessageId }, 'transport queue sqlite edit failed for queued message');
     }
@@ -5413,6 +5478,7 @@ export function hasSubstantiveTimelineHistory(events: Array<{ type: string }>): 
     || event.type === 'tool.call'
     || event.type === 'tool.result'
     || event.type === 'ask.question'
+    || event.type === AGENT_DELEGATION_REPLY_TIMELINE_EVENT
   ));
 }
 
@@ -5424,6 +5490,7 @@ export function countSubstantiveTimelineEvents(events: Array<{ type: string }>):
     || event.type === 'tool.call'
     || event.type === 'tool.result'
     || event.type === 'ask.question'
+    || event.type === AGENT_DELEGATION_REPLY_TIMELINE_EVENT
   )).length;
 }
 
@@ -5600,13 +5667,15 @@ async function buildTimelineHistoryOnMain(params: TimelineHistoryRequestParams):
   }
 
   const record = await recoverOpenCodeSessionRecord(getSession(params.sessionName));
-  let opencodeInitialDeferred = false;
   let opencodeSynthesized = false;
   if (record?.agentType === 'opencode' && record.projectDir && record.opencodeSessionId) {
     const initialHistoryRequest = params.afterTs === undefined && params.beforeTs === undefined;
-    if (initialHistoryRequest) {
-      opencodeInitialDeferred = !hasSubstantiveTimelineHistory(trimmed);
-    } else {
+    // An empty initial OpenCode projection must be recovered here. Returning a
+    // terminal `deferred` response without scheduling any work leaves manual
+    // refresh stuck forever; only a later live message would create a cursor
+    // that happens to enter the incremental synthesis path. Keep the common
+    // initial path cheap when SQLite already has substantive history.
+    if (!initialHistoryRequest || !hasSubstantiveTimelineHistory(trimmed)) {
       const tSyn0 = Date.now();
       try {
         const { exportOpenCodeSession, buildTimelineEventsFromOpenCodeExport } = await import('./opencode-history.js');
@@ -5637,9 +5706,7 @@ async function buildTimelineHistoryOnMain(params: TimelineHistoryRequestParams):
     maxResponseBytes: params.maxResponseBytes,
     detailSink: getDefaultTimelineDetailStore(),
   });
-  const status = opencodeInitialDeferred
-    ? TIMELINE_RESPONSE_STATUS.DEFERRED
-    : timelineStatusFromPayload(sanitized.droppedEvents, sanitized.truncatedEvents);
+  const status = timelineStatusFromPayload(sanitized.droppedEvents, sanitized.truncatedEvents);
   return {
     events: sanitized.events,
     eventsRead: events.length,
@@ -5650,13 +5717,10 @@ async function buildTimelineHistoryOnMain(params: TimelineHistoryRequestParams):
     readMs,
     synthesizeMs,
     sanitizeMs: Date.now() - tSanitize,
-    source: opencodeInitialDeferred
-      ? TIMELINE_RESPONSE_SOURCES.DEFERRED
-      : opencodeSynthesized
+    source: opencodeSynthesized
       ? TIMELINE_RESPONSE_SOURCES.OPENCODE_EXPORT
       : TIMELINE_RESPONSE_SOURCES.MAIN_SQLITE,
     status,
-    errorReason: opencodeInitialDeferred ? TIMELINE_HISTORY_ERROR_REASONS.PROJECTION_UNAVAILABLE : undefined,
     detailRefs: sanitized.detailRefs,
   };
 }
@@ -7746,6 +7810,8 @@ fi
 log "[step 2] install succeeded after $ATTEMPT attempt(s)"
 
 ${buildBashSharpRepair()}
+
+${buildBashNodeDatachannelRepair()}
 
 # Read installed version directly from package.json — bypasses the
 # freshly-installed imcodes shebang (which can fail under the same

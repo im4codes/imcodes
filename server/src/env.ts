@@ -52,6 +52,16 @@ export interface EnvConfig {
   /** Port to listen on. Default: 19138 */
   PORT?: string;
 
+  // Optional authenticated TURN relay
+  TURN_ENABLED?: string;
+  TURN_HOST?: string;
+  TURN_PORT?: string;
+  TURN_EXTERNAL_IP?: string;
+  TURN_SHARED_SECRET?: string;
+  TURN_CREDENTIAL_TTL_SECONDS?: string;
+  TURN_RELAY_MIN_PORT?: string;
+  TURN_RELAY_MAX_PORT?: string;
+
   // APNs push notifications (iOS)
   /** APNs auth key (.p8 file content, base64 encoded) */
   APNS_KEY?: string;
@@ -118,6 +128,14 @@ export function loadEnv(): EnvConfig {
     WEBAUTHN_RP_ID: process.env.WEBAUTHN_RP_ID,
     BIND_HOST: process.env.BIND_HOST,
     PORT: process.env.PORT,
+    TURN_ENABLED: process.env.TURN_ENABLED,
+    TURN_HOST: process.env.TURN_HOST,
+    TURN_PORT: process.env.TURN_PORT,
+    TURN_EXTERNAL_IP: process.env.TURN_EXTERNAL_IP,
+    TURN_SHARED_SECRET: process.env.TURN_SHARED_SECRET,
+    TURN_CREDENTIAL_TTL_SECONDS: process.env.TURN_CREDENTIAL_TTL_SECONDS,
+    TURN_RELAY_MIN_PORT: process.env.TURN_RELAY_MIN_PORT,
+    TURN_RELAY_MAX_PORT: process.env.TURN_RELAY_MAX_PORT,
     APNS_KEY: process.env.APNS_KEY,
     APNS_KEY_ID: process.env.APNS_KEY_ID,
     APNS_TEAM_ID: process.env.APNS_TEAM_ID,

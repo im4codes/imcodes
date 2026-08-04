@@ -13,13 +13,20 @@ describe('server logger redaction', () => {
       api_key: 'secret-key',
       nested: {
         authorization: 'Bearer abc',
+        credential: 'temporary-turn-password',
+        sharedSecret: 'coturn-rest-secret',
         ok: 'visible',
       },
     }, 'msg');
 
     const payload = JSON.parse(spy.mock.calls[0][0] as string) as Record<string, unknown>;
     expect(payload.api_key).toBe('[REDACTED]');
-    expect(payload.nested).toEqual({ authorization: '[REDACTED]', ok: 'visible' });
+    expect(payload.nested).toEqual({
+      authorization: '[REDACTED]',
+      credential: '[REDACTED]',
+      sharedSecret: '[REDACTED]',
+      ok: 'visible',
+    });
   });
 
   it('redacts deck-style sensitive values inside arrays', () => {
@@ -131,5 +138,31 @@ describe('server logger redaction', () => {
     expect(payload.items[0].resolvedAliases).toBe('[REDACTED]');
     expect(payload.items[0].id).toBe(1);       // sibling field intact
     expect(payload.items[1]).toBe('plain');    // other elements intact
+  });
+  // The note map is a sibling of resolvedAliases and is private user-authored
+  // text that routinely describes what the secret is for, so it is scrubbed on
+  // the same terms rather than logged verbatim.
+  it('redacts resolvedAliasNotes, including when nested inside a payload', () => {
+    const spy = vi.spyOn(console, 'log').mockImplementation(() => {});
+
+    logger.info(
+      {
+        type: 'session.send',
+        payload: {
+          resolvedAliases: { prod: 'ssh secret-host' },
+          resolvedAliasNotes: { prod: 'prod read replica, revoke token after use' },
+        },
+      },
+      'relaying send',
+    );
+
+    const raw = spy.mock.calls[0]![0] as string;
+    expect(raw).not.toContain('revoke token after use');
+    expect(raw).not.toContain('ssh secret-host');
+    const payload = JSON.parse(raw) as { payload: Record<string, unknown> };
+    expect(payload.payload.resolvedAliasNotes).toBe('[REDACTED]');
+    expect(payload.payload.resolvedAliases).toBe('[REDACTED]');
+
+    spy.mockRestore();
   });
 });

@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { access, copyFile, open, readFile, readdir, stat, writeFile } from 'node:fs/promises';
 import { constants as fsConstants, watch, type FSWatcher } from 'node:fs';
 import { homedir } from 'node:os';
@@ -20,6 +21,7 @@ import type {
   ProviderUsageUpdate,
   ToolCallEvent,
   SdkTurnLostRecoveryMetadata,
+  ProviderDelegationNotification,
 } from '../transport-provider.js';
 import {
   BACKGROUND_SUBAGENT_WAKE_MODES,
@@ -62,6 +64,11 @@ import { composeProviderSystemText, getProviderSystemTextParts } from '../provid
 import { getDefaultCodexMcpArgs } from './getDefaultCodexMcpArgs.js';
 import { getDefaultMcpServers } from './getDefaultMcpServers.js';
 import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../../shared/memory-mcp-server-name.js';
+import {
+  AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES,
+  AGENT_DELEGATION_NOTIFICATION_RESULTS,
+  type AgentDelegationNotificationResult,
+} from '../../../shared/agent-delegation.js';
 import { MEMORY_MCP_STATUS, type MemoryMcpProviderStatusView } from '../../../shared/memory-ws.js';
 import {
   SDK_SUBAGENT_DETAIL_KIND,
@@ -506,7 +513,18 @@ async function readCodexAuthFingerprint(env: Record<string, string | undefined>)
   }
 }
 
+class CodexMalformedRpcResponseError extends Error {
+  constructor(
+    readonly requestId: number,
+    readonly method: string,
+  ) {
+    super(`Codex app-server returned malformed JSON for request ${method} (id ${requestId})`);
+    this.name = 'CodexMalformedRpcResponseError';
+  }
+}
+
 function isCodexThreadHistoryUnreadableError(err: unknown): boolean {
+  if (err instanceof CodexMalformedRpcResponseError && err.method === 'thread/resume') return true;
   const message = errorMessage(err).toLowerCase();
   return (
     message.includes('failed to read thread')
@@ -516,6 +534,19 @@ function isCodexThreadHistoryUnreadableError(err: unknown): boolean {
       || message.includes('valid utf-8')
     )
   );
+}
+
+function extractMalformedJsonRpcRequestId(line: string): number | null {
+  const match = /^\{\s*"id"\s*:\s*(0|[1-9]\d*)\s*(?:,|\})/.exec(line);
+  if (!match) return null;
+  const requestId = Number(match[1]);
+  return Number.isSafeInteger(requestId) ? requestId : null;
+}
+
+function summarizeJsonParseError(err: unknown): string {
+  const name = err instanceof Error && err.name ? err.name : 'Error';
+  const position = /\bposition\s+(\d+)\b/i.exec(errorMessage(err))?.[1];
+  return position ? `${name} at position ${position}` : name;
 }
 
 function extractCodexJsonlPath(message: string): string | null {
@@ -672,6 +703,7 @@ type JsonRpcResponse = {
 };
 
 type PendingRequest = {
+  method: string;
   resolve: (value: any) => void;
   reject: (error: Error) => void;
 };
@@ -2276,6 +2308,7 @@ export class CodexSdkProvider implements TransportProvider {
     supportedEffortLevels: CODEX_SDK_EFFORT_LEVELS,
     contextSupport: 'degraded-message-side-context-mapping',
     backgroundSubagentWake: BACKGROUND_SUBAGENT_WAKE_MODES.RUNTIME,
+    activeDelegationNotification: AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE,
     compact: {
       execution: 'sdk-rpc',
       verified: true,
@@ -2634,6 +2667,32 @@ export class CodexSdkProvider implements TransportProvider {
       turnDispatchGeneration,
       CODEX_AUTH_RECOVERY_RETRY_LIMIT,
     );
+  }
+
+  async notifyActiveDelegation(
+    sessionId: string,
+    notification: ProviderDelegationNotification,
+  ): Promise<AgentDelegationNotificationResult> {
+    const state = this.sessions.get(sessionId);
+    const turnId = state?.runningTurnId;
+    if (!state || !turnId || state.cancelled) {
+      return AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE;
+    }
+    try {
+      await this.request('turn/steer', {
+        threadId: state.threadId,
+        expectedTurnId: turnId,
+        clientUserMessageId: notification.notificationId,
+        input: [{ type: 'text', text: notification.text }],
+      });
+    } catch (error) {
+      const latest = this.sessions.get(sessionId);
+      if (!latest || latest.runningTurnId !== turnId || latest.cancelled) {
+        return AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE;
+      }
+      throw error;
+    }
+    return AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED;
   }
 
   private clearActiveItemEvidence(state: CodexSdkSessionState): void {
@@ -3441,7 +3500,24 @@ export class CodexSdkProvider implements TransportProvider {
         this.emitRuntimeSubagentNotification(runtimeSubagentPayload);
         return;
       }
-      logger.warn({ provider: this.id, line: trimmed, err }, 'Failed to parse Codex app-server line');
+      const requestId = extractMalformedJsonRpcRequestId(trimmed);
+      const pending = requestId === null ? undefined : this.pendingRequests.get(requestId);
+      if (pending && requestId !== null) {
+        this.pendingRequests.delete(requestId);
+        pending.reject(new CodexMalformedRpcResponseError(requestId, pending.method));
+      }
+      logger.warn({
+        provider: this.id,
+        lineSummary: requestId === null
+          ? (trimmed.startsWith('{') ? 'malformed JSON object' : 'non-JSON app-server output')
+          : 'malformed JSON-RPC response with numeric request id',
+        lineChars: trimmed.length,
+        lineUtf8Bytes: Buffer.byteLength(trimmed, 'utf8'),
+        lineSha256: createHash('sha256').update(trimmed, 'utf8').digest('hex'),
+        requestId: requestId ?? undefined,
+        pendingMethod: pending?.method,
+        parseError: summarizeJsonParseError(err),
+      }, 'Failed to parse Codex app-server line');
       return;
     }
 
@@ -5421,6 +5497,7 @@ export class CodexSdkProvider implements TransportProvider {
         timer.unref?.();
       }
       this.pendingRequests.set(id, {
+        method,
         resolve: (value) => {
           if (timer) clearTimeout(timer);
           resolve(value);

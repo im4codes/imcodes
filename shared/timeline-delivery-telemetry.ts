@@ -1,3 +1,5 @@
+import { AGENT_DELEGATION_REPLY_TIMELINE_EVENT } from './agent-delegation.js';
+
 /**
  * Observability for timeline events that are DROPPED before reaching a browser.
  *
@@ -47,6 +49,7 @@ const CONTENT_BEARING_TIMELINE_EVENT_TYPES: ReadonlySet<string> = new Set([
   'file.change',
   'ask.question',
   'peer_audit.result',
+  AGENT_DELEGATION_REPLY_TIMELINE_EVENT,
 ]);
 
 /**

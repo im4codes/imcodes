@@ -3,6 +3,7 @@
  * Uses the full SessionControls for input (same as the main session).
  */
 import { useState, useRef, useCallback, useEffect, useLayoutEffect, useMemo } from 'preact/hooks';
+import { createPortal } from 'preact/compat';
 import { useTranslation } from 'react-i18next';
 import { getActiveThinkingTs, getActiveStatusText, getTailSessionStateInfo, hasActiveToolCall } from '../thinking-utils.js';
 import { recordCost } from '../cost-tracker.js';
@@ -50,6 +51,7 @@ import { loadLegacyCodexModelPreferenceForModelessSession } from '../codex-model
 import { DEFAULT_SUBSESSION_ACCENT_COLOR } from '../subsession-accent-colors.js';
 import { EXECUTION_CLONE_KIND } from '@shared/execution-clone.js';
 import type { SessionSettingsOpenIntent } from '../session-settings-open-intent.js';
+import { useStableCallback } from '../hooks/useStableCallback.js';
 
 function isExecutionCloneTemplateLike(sub: { executionCloneKind?: string | null; parentRunId?: string | null }): boolean {
   return sub.executionCloneKind === EXECUTION_CLONE_KIND || typeof sub.parentRunId === 'string';
@@ -324,13 +326,13 @@ export function SubSessionWindow({
 
   // Dedicated per-sub-session file browser state. Each sub-session has its own
   // cwd, so opening 📁 here should browse THIS sub-session's working directory
-  // (not the parent main session's). The overlay/panel is rendered locally so
-  // it layers above this sub-session window instead of being hidden behind it.
+  // (not the parent main session's). The mobile overlay is portaled to body so
+  // the sub-session's lower stacking context cannot trap it below app chrome.
   const [showFileBrowser, setShowFileBrowser] = useState(false);
 
   // Sync the desktop child file-browser open/close into the shared window
   // stack via the parent-supplied callbacks. Mobile is a no-op (it renders
-  // an inline overlay, not a managed floating window).
+  // a portaled full-screen overlay, not a managed floating window).
   useEffect(() => {
     if (isMobile) return;
     if (showFileBrowser) {
@@ -511,6 +513,11 @@ export function SubSessionWindow({
   // `if (isShell && !active) return` and unsubscribed on focus loss, which froze
   // an open-but-unfocused shell window.) Ref-counted hold — see useTerminalRawHold.
   useTerminalRawHold(ws, connected, isShell && !isTransport, sub.sessionName);
+
+  // These arrive from app.tsx as inline arrows and would otherwise change
+  // identity on every timeline event, defeating ChatView's memo boundary.
+  const stableOnViewRepo = useStableCallback(onViewRepo);
+  const stableOnPreviewFile = useStableCallback(onPreviewFile);
 
   // Non-shell window: subscribe raw only while focused (full-fidelity view); when
   // unfocused it falls back to the passive (non-raw) subscription app.tsx keeps.
@@ -953,8 +960,8 @@ export function SubSessionWindow({
             onScrollBottomFn={onChatScrollBottomFn}
             ws={ws}
             workdir={sub.cwd ?? null}
-            onViewRepo={onViewRepo}
-            onPreviewFile={onPreviewFile}
+            onViewRepo={stableOnViewRepo}
+            onPreviewFile={stableOnPreviewFile}
             serverId={serverId}
             onQuote={addQuote}
             agentType={sessionInfo?.agentType ?? sub.type}
@@ -1069,8 +1076,8 @@ export function SubSessionWindow({
           `zIndex` within the band, while a newer unrelated peer can still
           sit above the entire owner-child group. */}
       {showFileBrowser && ws && (
-        isMobile ? (
-          <div class="mobile-fb-overlay" style={{ zIndex: zIndex + 1 }}>
+        isMobile ? createPortal(
+          <div class="mobile-fb-overlay">
             <div class="mobile-fb-header">
               <span style={{ fontSize: 13, fontWeight: 600 }}>📁 {t('picker.files')}</span>
               <button class="fb-close" onClick={() => setShowFileBrowser(false)}>✕</button>
@@ -1099,7 +1106,8 @@ export function SubSessionWindow({
               }}
               onClose={() => setShowFileBrowser(false)}
             />
-          </div>
+          </div>,
+          document.body,
         ) : (
           <FloatingPanel
             id={DESKTOP_WINDOW_IDS.subsessionFileBrowser(sub.id)}

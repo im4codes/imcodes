@@ -113,6 +113,18 @@ vi.mock('react-i18next', () => ({
       }
       if (key === 'upload.drop_overlay_title') return 'Drop files to upload';
       if (key === 'upload.drop_overlay_hint') return 'Release anywhere in this session window';
+      if (key === 'upload.transferred') return `${String(opts?.transferred ?? '')} / ${String(opts?.total ?? '')}`;
+      if (key === 'upload.speed') return `${String(opts?.speed ?? '')}/s`;
+      if (key === 'upload.speed_calculating') return 'Measuring speed';
+      if (key === 'upload.elapsed') return `Elapsed ${String(opts?.time ?? '')}`;
+      if (key === 'upload.eta') return `ETA ${String(opts?.time ?? '')}`;
+      if (key === 'upload.eta_calculating') return 'Calculating ETA';
+      if (key === 'upload.eta_done') return 'Complete';
+      if (key === 'upload.cancel') return 'Stop';
+      if (key === 'upload.cancel_named') return `Stop uploading ${String(opts?.name ?? '')}`;
+      if (key === 'upload.cancel_confirm') return `Stop uploading ${String(opts?.name ?? '')}?`;
+      if (key === 'upload.delete_failed') return 'Could not delete the uploaded file';
+      if (key === 'upload.deleting') return 'Deleting uploaded file';
       if (key === 'upload.file_too_large') {
         return `File too large (max ${String(opts?.max ?? '')}MB)`;
       }
@@ -230,6 +242,7 @@ vi.mock('../../src/components/file-browser-lazy.js', () => ({
 }));
 
 const uploadFileMock = vi.fn();
+const deleteAttachmentMock = vi.fn();
 const execCommandMock = vi.fn(() => true);
 const getUserPrefMock = vi.fn().mockResolvedValue(null);
 const saveUserPrefMock = vi.fn().mockResolvedValue(undefined);
@@ -248,6 +261,7 @@ const onUserPrefChangedMock = vi.fn((cb: (key: string, value: unknown) => void) 
 });
 vi.mock('../../src/api.js', () => ({
   uploadFile: (...args: unknown[]) => uploadFileMock(...args),
+  deleteAttachment: (...args: unknown[]) => deleteAttachmentMock(...args),
   getUserPref: async (key: string) => {
     if (key === 'supervision.user_default') {
       try {
@@ -460,6 +474,7 @@ afterEach(() => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    deleteAttachmentMock.mockResolvedValue(undefined);
     execCommandMock.mockImplementation((_command: string, _ui?: boolean, value?: string) => {
       const active = document.activeElement as HTMLDivElement | null;
       if (active && typeof active.textContent === 'string') {
@@ -815,6 +830,24 @@ afterEach(() => {
     mobileInput.textContent = 'status';
     fireEvent.input(mobileInput);
     expect(document.querySelector('.controls-target-bubble')).toBeNull();
+  });
+
+  it('keeps the desktop target bubble in the Stop toolbar instead of over the upload list', () => {
+    render(
+      <SessionControls
+        ws={makeWs() as any}
+        activeSession={makeTransportSession({ name: 'deck_project_brain', label: 'Main workspace' })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    act(() => input.focus());
+
+    const target = screen.getByRole('status', { name: 'Message target: Main workspace' });
+    const stop = screen.getByRole('button', { name: 'Stop' });
+    expect(target.parentElement).toBe(stop.parentElement);
+    expect(target.parentElement?.classList.contains('shortcuts')).toBe(true);
+    expect(target.closest('.controls-composer')).toBeNull();
   });
 
 
@@ -4894,6 +4927,33 @@ afterEach(() => {
     }));
   });
 
+  it('keeps the mobile transport Stop outside the scrollable metadata controls', () => {
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 390 });
+    const ws = makeWs();
+    const { container } = render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({
+          name: 'codex-sdk-session',
+          agentType: 'codex-sdk',
+          runtimeType: 'transport',
+          state: 'running',
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    const stopButton = screen.getByRole('button', { name: /^stop$/i });
+    const transportShortcuts = stopButton.closest('.shortcuts-transport');
+    const metadataScroller = container.querySelector('.shortcuts-meta-scroll');
+
+    expect(transportShortcuts).toBeTruthy();
+    expect(metadataScroller).toBeTruthy();
+    expect(transportShortcuts?.nextElementSibling).toBe(metadataScroller);
+    expect(metadataScroller?.contains(stopButton)).toBe(false);
+    expect(metadataScroller?.querySelector('.shortcuts-model')).toBeTruthy();
+  });
+
   it('shows a compact Auto dropdown for supported transport sessions and enables supervised mode from saved defaults', async () => {
     const ws = makeWs();
     fetchSupervisorDefaultsMock.mockResolvedValue({
@@ -6476,18 +6536,38 @@ afterEach(() => {
     await waitFor(() => expect(uploadFileMock).toHaveBeenCalledTimes(2));
     expect(pendingUploads.map((entry) => entry.file.name)).toEqual(['alpha.txt', 'beta.txt']);
 
+    await new Promise((resolve) => setTimeout(resolve, 300));
     await act(async () => {
       pendingUploads[0].onProgress?.(24);
       pendingUploads[1].onProgress?.(68);
+      pendingUploads[0].onProgress?.(12);
     });
 
     const rows = screen.getAllByTestId('composer-upload-row');
     expect(rows).toHaveLength(2);
     expect(within(rows[0]).getByText('alpha.txt')).toBeDefined();
     expect(within(rows[1]).getByText('beta.txt')).toBeDefined();
+    const transportBadges = screen.getAllByTestId('composer-upload-transport');
+    expect(transportBadges.map((node) => node.textContent)).toEqual([
+      'relay',
+      'relay',
+    ]);
+    expect(transportBadges.every((node) => (
+      node.getAttribute('data-transport') === 'relay'
+      && node.classList.contains('composer-upload-transport-relay')
+    ))).toBe(true);
+    expect(rows.every((row) => (
+      row.getAttribute('data-transport') === 'relay'
+      && row.classList.contains('composer-upload-row-relay')
+    ))).toBe(true);
     const progressBars = screen.getAllByRole('progressbar');
     expect(progressBars.map((bar) => bar.getAttribute('aria-valuenow'))).toEqual(['24', '68']);
-    expect(progressBars.every((bar) => (bar as HTMLElement).style.gridColumn === '1 / -1')).toBe(true);
+    expect(progressBars.every((bar) => bar.classList.contains('composer-upload-progress-track'))).toBe(true);
+    const stats = screen.getAllByTestId('composer-upload-stats');
+    expect(stats).toHaveLength(2);
+    expect(stats[0].textContent).toContain('/s');
+    expect(stats[0].textContent).toContain('Elapsed');
+    expect(stats[0].textContent).toContain('ETA');
 
     await act(async () => {
       pendingUploads[1].resolve({ attachment: { daemonPath: '/tmp/beta.txt' } });
@@ -6496,6 +6576,8 @@ afterEach(() => {
     await waitFor(() => {
       expect(screen.getAllByRole('progressbar').map((bar) => bar.getAttribute('aria-valuenow'))).toEqual(['24', '100']);
     });
+    expect(screen.getByRole('button', { name: 'Stop uploading alpha.txt' })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'Stop uploading beta.txt' })).toBeNull();
 
     await act(async () => {
       pendingUploads[0].resolve({ attachment: { daemonPath: '/tmp/alpha.txt' } });
@@ -6554,6 +6636,118 @@ afterEach(() => {
       sessionName: 'my-session',
       text: '#1:(/tmp/pending.txt) send after upload',
     });
+  });
+
+  it('requires confirmation before stopping an upload and aborts without showing a failure', async () => {
+    let observedSignal: AbortSignal | undefined;
+    uploadFileMock.mockImplementation((_serverId, _file, _onProgress, _clientUploadId, signal: AbortSignal) => {
+      observedSignal = signal;
+      return new Promise((_resolve, reject) => {
+        signal.addEventListener('abort', () => {
+          const error = new Error('upload_canceled');
+          error.name = 'AbortError';
+          reject(error);
+        }, { once: true });
+      });
+    });
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(false);
+    render(
+      <SessionControls
+        ws={makeWs() as any}
+        activeSession={makeSession({ name: 'my-session' })}
+        quickData={makeQuickData() as any}
+        serverId="srv-1"
+      />,
+    );
+
+    const input = screen.getByRole('textbox');
+    fireEvent.paste(input, {
+      clipboardData: {
+        files: [new File(['pending'], 'pending.txt', { type: 'text/plain' })],
+        getData: () => '',
+      },
+    });
+
+    const stop = await screen.findByRole('button', { name: 'Stop uploading pending.txt' });
+    fireEvent.click(stop);
+    expect(confirmSpy).toHaveBeenCalledWith('Stop uploading pending.txt?');
+    expect(observedSignal?.aborted).toBe(false);
+
+    confirmSpy.mockReturnValue(true);
+    fireEvent.click(stop);
+    await waitFor(() => expect(document.querySelector('[data-testid="composer-upload-row"]')).toBeNull());
+    expect(observedSignal?.aborted).toBe(true);
+    expect(screen.queryByText('Upload failed')).toBeNull();
+  });
+
+  it('deletes the daemon upload when the existing attachment x is clicked without confirmation', async () => {
+    uploadFileMock.mockResolvedValue({
+      attachment: {
+        id: 'abc123.txt',
+        serverId: 'srv-1',
+        daemonPath: '/tmp/abc123.txt',
+      },
+    });
+    const confirmSpy = vi.spyOn(window, 'confirm');
+    render(
+      <SessionControls
+        ws={makeWs() as any}
+        activeSession={makeSession({ name: 'my-session' })}
+        quickData={makeQuickData() as any}
+        serverId="srv-1"
+      />,
+    );
+
+    fireEvent.paste(screen.getByRole('textbox'), {
+      clipboardData: {
+        files: [new File(['done'], 'done.txt', { type: 'text/plain' })],
+        getData: () => '',
+      },
+    });
+    await waitFor(() => expect(document.querySelector('.attachment-badge-name')?.textContent).toBe('done.txt'));
+
+    fireEvent.click(document.querySelector('.attachment-badge-remove') as HTMLButtonElement);
+
+    await waitFor(() => expect(deleteAttachmentMock).toHaveBeenCalledWith('srv-1', 'abc123.txt'));
+    await waitFor(() => expect(document.querySelector('.attachment-badge')).toBeNull());
+    expect(confirmSpy).not.toHaveBeenCalled();
+  });
+
+  it('keeps the completed attachment and draft when daemon deletion fails', async () => {
+    uploadFileMock.mockResolvedValue({
+      attachment: {
+        id: 'keep-on-failure.txt',
+        serverId: 'srv-1',
+        daemonPath: '/tmp/keep-on-failure.txt',
+      },
+    });
+    deleteAttachmentMock.mockRejectedValueOnce(new Error('delete failed'));
+    render(
+      <SessionControls
+        ws={makeWs() as any}
+        activeSession={makeSession({ name: 'my-session' })}
+        quickData={makeQuickData() as any}
+        serverId="srv-1"
+      />,
+    );
+
+    fireEvent.paste(screen.getByRole('textbox'), {
+      clipboardData: {
+        files: [new File(['keep'], 'keep.txt', { type: 'text/plain' })],
+        getData: () => '',
+      },
+    });
+    await waitFor(() => expect(document.querySelector('.attachment-badge-name')?.textContent).toBe('keep.txt'));
+    const draftKey = 'rcc_draft_attachments_session:my-session';
+    await waitFor(() => expect(sessionStorage.getItem(draftKey)).toContain('keep-on-failure.txt'));
+    const savedDraft = sessionStorage.getItem(draftKey);
+
+    fireEvent.click(document.querySelector('.attachment-badge-remove') as HTMLButtonElement);
+
+    await waitFor(() => expect(deleteAttachmentMock).toHaveBeenCalledWith('srv-1', 'keep-on-failure.txt'));
+    expect(await screen.findByText('Could not delete the uploaded file')).toBeTruthy();
+    expect(document.querySelector('.attachment-badge-name')?.textContent).toBe('keep.txt');
+    expect(sessionStorage.getItem(draftKey)).toBe(savedDraft);
   });
 
   it('R3 v2 PR-ρ — removing a middle attachment renumbers the remaining tags consecutively', async () => {

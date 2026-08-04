@@ -240,7 +240,11 @@ function createOpenCodeRestoreHarness() {
         )),
       })),
       abort: vi.fn(async () => ({ data: true })),
+      message: vi.fn(async () => {
+        throw new Error('404 message not found', { cause: { status: 404 } });
+      }),
       prompt: vi.fn(),
+      promptAsync: vi.fn(async () => ({ data: undefined, response: { status: 204 } })),
     },
     provider: {
       list: vi.fn(async () => ({

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdir, mkdtemp, realpath, rm, symlink, unlink, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, realpath, rm, stat, symlink, unlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { FS_GENERIC_ERROR_CODES } from '../../shared/fs-error-codes.js';
@@ -369,6 +369,152 @@ describe('file-transfer local handle hardening', () => {
         downloadable: true,
       }),
     }));
+  });
+
+  it('deletes a completed upload and its metadata while refusing local project handles', async () => {
+    const transfer = await loadFileTransferHandler(fakeHome);
+    const uploaded = createServerLinkMock();
+    await transfer.handleFileUpload({
+      type: 'file.upload',
+      uploadId: 'upload-delete',
+      filename: 'delete-me.txt',
+      originalName: 'delete-me.txt',
+      size: 5,
+      content: Buffer.from('hello').toString('base64'),
+    }, uploaded.serverLink as never);
+
+    const uploadPath = path.join(fakeHome, '.imcodes', 'uploads', 'delete-me.txt');
+    await expect(stat(uploadPath)).resolves.toMatchObject({ size: 5 });
+    await expect(stat(`${uploadPath}.meta.json`)).resolves.toBeDefined();
+
+    const deleted = createServerLinkMock();
+    await transfer.handleFileDelete({
+      type: FILE_TRANSFER_MSG.DELETE,
+      requestId: 'delete-request',
+      attachmentId: 'delete-me.txt',
+    }, deleted.serverLink as never);
+    expect(deleted.sent).toEqual([{ type: FILE_TRANSFER_MSG.DELETE_DONE, requestId: 'delete-request' }]);
+    await expect(stat(uploadPath)).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(stat(`${uploadPath}.meta.json`)).rejects.toMatchObject({ code: 'ENOENT' });
+
+    const projectPath = path.join(rootDir, 'project-file.txt');
+    await writeFile(projectPath, 'keep');
+    const validated = await transfer.validateProjectFilePath(projectPath);
+    const local = transfer.createProjectFileHandleFromValidatedPath(validated, 'project-file.txt', 'text/plain', 4);
+    const refused = createServerLinkMock();
+    await transfer.handleFileDelete({
+      type: FILE_TRANSFER_MSG.DELETE,
+      requestId: 'delete-local',
+      attachmentId: local.id,
+    }, refused.serverLink as never);
+    expect(refused.sent).toEqual([{
+      type: FILE_TRANSFER_MSG.DELETE_ERROR,
+      requestId: 'delete-local',
+      error: 'forbidden',
+    }]);
+    await expect(stat(projectPath)).resolves.toMatchObject({ size: 4 });
+  });
+
+  it('refuses a local registry entry even when its path is inside the upload root', async () => {
+    const transfer = await loadFileTransferHandler(fakeHome);
+    const uploaded = createServerLinkMock();
+    await transfer.handleFileUpload({
+      type: 'file.upload',
+      uploadId: 'upload-source-guard',
+      filename: 'source-guard.txt',
+      originalName: 'source-guard.txt',
+      size: 4,
+      content: Buffer.from('keep').toString('base64'),
+    }, uploaded.serverLink as never);
+
+    const uploadPath = path.join(fakeHome, '.imcodes', 'uploads', 'source-guard.txt');
+    const entry = transfer.lookupAttachmentById('source-guard.txt');
+    expect(entry).toBeDefined();
+    entry!.source = 'local';
+
+    const refused = createServerLinkMock();
+    await transfer.handleFileDelete({
+      type: FILE_TRANSFER_MSG.DELETE,
+      requestId: 'delete-source-guard',
+      attachmentId: 'source-guard.txt',
+    }, refused.serverLink as never);
+
+    expect(refused.sent).toEqual([{
+      type: FILE_TRANSFER_MSG.DELETE_ERROR,
+      requestId: 'delete-source-guard',
+      error: 'forbidden',
+    }]);
+    await expect(stat(uploadPath)).resolves.toMatchObject({ size: 4 });
+  });
+
+  it('refuses an upload-labeled registry entry whose path is outside the upload root', async () => {
+    const transfer = await loadFileTransferHandler(fakeHome);
+    const projectPath = path.join(rootDir, 'outside-upload-root.txt');
+    await writeFile(projectPath, 'keep');
+    const validated = await transfer.validateProjectFilePath(projectPath);
+    const handle = transfer.createProjectFileHandleFromValidatedPath(
+      validated,
+      'outside-upload-root.txt',
+      'text/plain',
+      4,
+    );
+    const entry = transfer.lookupAttachmentById(handle.id);
+    expect(entry).toBeDefined();
+    entry!.source = 'upload';
+
+    const refused = createServerLinkMock();
+    await transfer.handleFileDelete({
+      type: FILE_TRANSFER_MSG.DELETE,
+      requestId: 'delete-path-guard',
+      attachmentId: handle.id,
+    }, refused.serverLink as never);
+
+    expect(refused.sent).toEqual([{
+      type: FILE_TRANSFER_MSG.DELETE_ERROR,
+      requestId: 'delete-path-guard',
+      error: 'forbidden',
+    }]);
+    await expect(stat(projectPath)).resolves.toMatchObject({ size: 4 });
+  });
+
+  it('waits for an ambiguous direct attempt and reuses its committed attachment instead of uploading twice', async () => {
+    const transfer = await loadFileTransferHandler(fakeHome);
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+    const done = createServerLinkMock();
+    const clientUploadId = 'client_upload_ambiguous_1234';
+    const claim = transfer.tryClaimClientUpload(clientUploadId);
+    expect(claim).not.toBeNull();
+
+    const relay = transfer.handleFileUploadFetch({
+      type: 'file.upload_fetch',
+      uploadId: 'upload-fallback',
+      clientUploadId,
+      filename: 'relay.txt',
+      originalName: 'source.txt',
+      size: 5,
+      downloadUrl: 'https://relay.example/upload-staged/upload-fallback?token=reusable',
+    }, done.serverLink as never);
+
+    await vi.waitFor(() => expect(transfer.waitForClientUploadClaim(clientUploadId)).not.toBeNull());
+    expect(fetchMock).not.toHaveBeenCalled();
+    const directPath = path.join(fakeHome, '.imcodes', 'uploads', 'direct.txt');
+    await transfer.finalizeDirectUploadedFile({
+      clientUploadId,
+      filename: 'direct.txt',
+      originalName: 'source.txt',
+      resolved: directPath,
+      size: 5,
+    });
+    transfer.releaseClientUploadClaim(clientUploadId, claim!);
+    await relay;
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(done.sent).toEqual([expect.objectContaining({
+      type: 'file.upload_done',
+      uploadId: 'upload-fallback',
+      attachment: expect.objectContaining({ id: 'direct.txt', size: 5 }),
+    })]);
   });
 
   it('retries relay-staged upload downloads with the same URL before failing', async () => {

@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { TransportSessionRuntime, type PendingTransportMessage } from '../../src/agent/transport-session-runtime.js';
 import { RUNTIME_TYPES } from '../../src/agent/session-runtime.js';
-import { PROVIDER_ERROR_CODES, SDK_TURN_LOST_RECOVERY_STATUS, type TransportProvider, type ProviderError, type SessionConfig, type ProviderStatusUpdate, type ProviderUsageUpdate, type ToolCallEvent } from '../../src/agent/transport-provider.js';
+import { PROVIDER_CANCEL_ORIGINS, PROVIDER_ERROR_CODES, SDK_TURN_LOST_RECOVERY_STATUS, type TransportProvider, type ProviderError, type SessionConfig, type ProviderStatusUpdate, type ProviderUsageUpdate, type ToolCallEvent } from '../../src/agent/transport-provider.js';
 import type { AgentMessage, MessageDelta } from '../../shared/agent-message.js';
 import type { MemorySearchResult, MemorySearchResultItem } from '../../src/context/memory-search.js';
 import { PREFERENCE_CONTEXT_END, PREFERENCE_CONTEXT_START } from '../../shared/preference-ingest.js';
@@ -32,6 +32,10 @@ import { resetContextStoreClientForTests } from '../../src/store/context-store-w
 import { resetAllSummarySyncHistories } from '../../src/context/summary-sync-history.js';
 import { fingerprintRecentSummary } from '../../src/context/summary-sync.js';
 import { MCP_MEMORY_SEARCH_SYSTEM_GUIDANCE } from '../../src/agent/transport-runtime-assembly.js';
+import {
+  AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES,
+  AGENT_DELEGATION_NOTIFICATION_RESULTS,
+} from '../../shared/agent-delegation.js';
 
 const timelineEmitterEmitMock = vi.hoisted(() => vi.fn());
 const searchLocalMemoryMock = vi.hoisted(() => vi.fn());
@@ -353,6 +357,73 @@ describe('TransportSessionRuntime', () => {
     ]);
     // provider.send called only once (for first message)
     expect(mock.provider.send).toHaveBeenCalledTimes(1);
+  });
+
+  it('delivers a delegation reply into an active provider turn without joining the ordinary queue', async () => {
+    const mock = makeMockProvider();
+    mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
+    mock.provider.notifyActiveDelegation = vi.fn().mockResolvedValue(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    const runtime = new TransportSessionRuntime(mock.provider, 'deck_test_brain');
+    await runtime.initialize(defaultConfig);
+    runtime.send('foreground work', 'foreground-1');
+    await flushDispatch();
+
+    const result = await runtime.deliverDelegationNotification({
+      notificationId: 'notify-1',
+      delegationId: 'delegation-1',
+      sourceSessionName: 'deck_sub_auditor',
+      text: 'audit complete',
+    });
+
+    expect(result).toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    expect(mock.provider.notifyActiveDelegation).toHaveBeenCalledWith('sess-1', expect.objectContaining({
+      notificationId: 'notify-1',
+      delegationId: 'delegation-1',
+      text: 'audit complete',
+    }));
+    expect(runtime.pendingEntries).toEqual([]);
+  });
+
+  it('fails closed instead of queueing when a busy provider has no native delegation notification', async () => {
+    const mock = makeMockProvider();
+    mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.UNSUPPORTED;
+    const runtime = new TransportSessionRuntime(mock.provider, 'deck_test_brain');
+    await runtime.initialize(defaultConfig);
+    runtime.send('foreground work', 'foreground-2');
+    await flushDispatch();
+
+    const result = await runtime.deliverDelegationNotification({
+      notificationId: 'notify-2',
+      delegationId: 'delegation-2',
+      sourceSessionName: 'deck_sub_auditor',
+      text: 'audit complete',
+    });
+
+    expect(result).toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.UNSUPPORTED);
+    expect(runtime.pendingEntries).toEqual([]);
+    expect(mock.provider.send).toHaveBeenCalledTimes(1);
+  });
+
+  it('starts a private continuation immediately when the origin runtime is idle', async () => {
+    const mock = makeMockProvider();
+    const runtime = new TransportSessionRuntime(mock.provider, 'deck_test_brain');
+    await runtime.initialize(defaultConfig);
+
+    const result = await runtime.deliverDelegationNotification({
+      notificationId: 'notify-idle',
+      delegationId: 'delegation-idle',
+      sourceSessionName: 'deck_sub_auditor',
+      text: 'audit complete while idle',
+    });
+    await flushDispatch();
+
+    expect(result).toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    expect(mock.provider.send).toHaveBeenCalledOnce();
+    expect(mock.provider.send).toHaveBeenCalledWith(
+      'sess-1',
+      expect.objectContaining({ userMessage: 'audit complete while idle' }),
+    );
+    expect(runtime.pendingEntries).toEqual([]);
   });
 
   // Stability: the transport queue is persisted to transport-queue.sqlite, but a
@@ -1368,9 +1439,50 @@ describe('TransportSessionRuntime', () => {
     await waitForProviderSendCount(mock.provider, 2);
     expect(mock.provider.send).toHaveBeenNthCalledWith(2, 'sess-1', expect.objectContaining({
       userMessage: 'deliver me',
+      deliveryId: 'msg-retry',
     }));
+    expect((mock.provider.send as ReturnType<typeof vi.fn>).mock.calls[0]?.[1]).toMatchObject({
+      deliveryId: 'msg-retry',
+    });
     expect(runtime.pendingCount).toBe(0);
     expect(runtime.sending).toBe(true);
+  });
+
+  it('keeps a recoverable retry isolated from messages queued during backoff', async () => {
+    (mock.provider.send as ReturnType<typeof vi.fn>).mockRejectedValueOnce({
+      code: PROVIDER_ERROR_CODES.CONNECTION_LOST,
+      message: 'fetch failed',
+      recoverable: true,
+    });
+
+    expect(runtime.send('first message', 'msg-A')).toBe('sent');
+    await flushDispatch();
+    expect(mock.provider.send).toHaveBeenCalledTimes(1);
+    expect(runtime.pendingEntries).toEqual([
+      { clientMessageId: 'msg-A', text: 'first message' },
+    ]);
+
+    expect(runtime.send('second message', 'msg-B')).toBe('queued');
+    await waitForProviderSendCount(mock.provider, 2);
+
+    expect(mock.provider.send).toHaveBeenNthCalledWith(1, 'sess-1', expect.objectContaining({
+      userMessage: 'first message',
+      deliveryId: 'msg-A',
+    }));
+    expect(mock.provider.send).toHaveBeenNthCalledWith(2, 'sess-1', expect.objectContaining({
+      userMessage: 'first message',
+      deliveryId: 'msg-A',
+    }));
+    expect(runtime.pendingEntries).toEqual([
+      { clientMessageId: 'msg-B', text: 'second message' },
+    ]);
+
+    mock.fireComplete('sess-1');
+    await waitForProviderSendCount(mock.provider, 3);
+    expect(mock.provider.send).toHaveBeenNthCalledWith(3, 'sess-1', expect.objectContaining({
+      userMessage: 'second message',
+      deliveryId: 'msg-B',
+    }));
   });
 
   it('auto-retry of a direct send does not duplicate timeline drain or runtime history', async () => {
@@ -1822,7 +1934,10 @@ describe('TransportSessionRuntime', () => {
 
     expect(runtime.settleActiveDispatchFromExternalCompletion('marker-complete-but-provider-tool-stale')).toBe(true);
 
-    expect(mock.provider.cancel).toHaveBeenCalledWith('sess-1');
+    expect(mock.provider.cancel).toHaveBeenCalledWith('sess-1', {
+      origin: PROVIDER_CANCEL_ORIGINS.EXTERNAL_COMPLETION,
+      reason: 'marker-complete-but-provider-tool-stale',
+    });
     expect(runtime.pendingCount).toBe(0);
     expect(runtime.getStatus()).toBe('idle');
     expect(runtime.getDiagnosticSnapshot().busyReasons).not.toContain('provider_tool_item');
@@ -3480,7 +3595,10 @@ ${PREFERENCE_CONTEXT_END}`;
     expect(runtime.settleActiveDispatchFromExternalCompletion('test-marker-completed')).toBe(true);
     await waitForProviderSendCount(mock.provider, 2);
 
-    expect(mock.provider.cancel).toHaveBeenCalledWith('sess-1');
+    expect(mock.provider.cancel).toHaveBeenCalledWith('sess-1', {
+      origin: PROVIDER_CANCEL_ORIGINS.EXTERNAL_COMPLETION,
+      reason: 'test-marker-completed',
+    });
     expect(runtime.pendingCount).toBe(0);
     expect(runtime.sending).toBe(true);
     expect(mock.provider.send).toHaveBeenCalledTimes(2);
@@ -3535,7 +3653,10 @@ ${PREFERENCE_CONTEXT_END}`;
     expect(runtime.settleActiveDispatchFromExternalCompletion('health-poll-stale-active-turn')).toBe(true);
     await waitForProviderSendCount(mock.provider, 2);
 
-    expect(mock.provider.cancel).toHaveBeenCalledWith('sess-1');
+    expect(mock.provider.cancel).toHaveBeenCalledWith('sess-1', {
+      origin: PROVIDER_CANCEL_ORIGINS.STALE_WATCHDOG,
+      reason: 'health-poll-stale-active-turn',
+    });
     expect(mock.provider.send).toHaveBeenCalledTimes(2);
     expect(mock.provider.send).toHaveBeenNthCalledWith(2, 'sess-1', expect.objectContaining({
       userMessage: 'queued after stuck compact',
@@ -3888,7 +4009,7 @@ ${PREFERENCE_CONTEXT_END}`;
     // Truly stale (provider silent past the last-resort no-tool threshold) +
     // empty queue → settle to idle. This covers memory-compression/finalize
     // misses where no queued prompt exists to trigger queue-visible recovery.
-    expect(runtime.recoverSilentActiveTurn({ nowMs: 1_000 + 5 * 60_000 + 1, staleMs: 10_000 })).toBe(true);
+    expect(runtime.recoverSilentActiveTurn({ nowMs: 1_000 + 12 * 60_000 + 1, staleMs: 10_000 })).toBe(true);
     expect(runtime.getStatus()).toBe('idle');
     expect(runtime.sending).toBe(false);
     expect(runtime.activeDispatchEntries).toEqual([]);
@@ -4316,6 +4437,70 @@ ${PREFERENCE_CONTEXT_END}`;
       expect(mock.provider.send).toHaveBeenLastCalledWith('sess-1', expect.objectContaining({
         userMessage: EXPANDED,
       }));
+    });
+
+    it('queued entry carries its audit anchor to onDrain, so the deferred timeline emit can anchor it', async () => {
+      const AUDIT = { names: ['host'], resolvedHash: 'a'.repeat(64) };
+      runtime.send('first turn');
+      await waitForProviderSendCount(mock.provider, 1);
+
+      const onDrainEntries: PendingTransportMessage[][] = [];
+      runtime.onDrain = (entries) => { onDrainEntries.push(entries); };
+      expect(runtime.send(ORIGINAL, 'alias-audit-1', undefined, undefined, {
+        providerText: EXPANDED,
+        aliasAudit: AUDIT,
+      })).toBe('queued');
+
+      // Unlike providerText, the anchor SURVIVES the public projection: it holds
+      // only names + a hash, and onDrain is the consumer that needs it.
+      expect(runtime.pendingEntries[0]).not.toHaveProperty('providerText');
+      expect(runtime.pendingEntries[0].aliasAudit).toEqual(AUDIT);
+
+      mock.fireComplete('sess-1');
+      await waitForProviderSendCount(mock.provider, 2);
+
+      const drained = onDrainEntries.flat().find((e) => e.clientMessageId === 'alias-audit-1');
+      expect(drained?.aliasAudit).toEqual(AUDIT);
+    });
+
+    it('the audit anchor survives a daemon restart with the queued entry', async () => {
+      const AUDIT = { names: ['host'], resolvedHash: 'b'.repeat(64) };
+      runtime.send('first turn');
+      await waitForProviderSendCount(mock.provider, 1);
+      expect(runtime.send(ORIGINAL, 'alias-audit-restart', undefined, undefined, {
+        providerText: EXPANDED,
+        aliasAudit: AUDIT,
+      })).toBe('queued');
+
+      const restartMock = makeMockProvider();
+      const restarted = new TransportSessionRuntime(restartMock.provider, 'deck_test_brain');
+      await restarted.initialize(defaultConfig);
+
+      expect(restarted.rehydratePendingFromStore()).toBe(1);
+
+      const rehydrated = restarted.pendingEntriesForResend.find((e) => e.clientMessageId === 'alias-audit-restart');
+      expect(rehydrated?.aliasAudit).toEqual(AUDIT);
+      // Still delivered privately, never on the public projection.
+      expect(rehydrated?.providerText).toBe(EXPANDED);
+    });
+
+    it('editing a queued message drops the anchor along with the stale expansion', async () => {
+      const AUDIT = { names: ['host'], resolvedHash: 'c'.repeat(64) };
+      runtime.send('first turn');
+      await waitForProviderSendCount(mock.provider, 1);
+      expect(runtime.send(ORIGINAL, 'alias-audit-edit', undefined, undefined, {
+        providerText: EXPANDED,
+        aliasAudit: AUDIT,
+      })).toBe('queued');
+
+      runtime.editPendingMessage('alias-audit-edit', 'totally different text');
+
+      // The anchor attested to the OLD aliases; keeping it would claim a
+      // delivery that no longer happens.
+      const edited = runtime.pendingEntriesForResend.find((e) => e.clientMessageId === 'alias-audit-edit');
+      expect(edited?.text).toBe('totally different text');
+      expect(edited?.providerText).toBeUndefined();
+      expect(edited?.aliasAudit).toBeUndefined();
     });
 
     it('SQLite rehydrate after restart: providerText survives; provider gets expanded, timeline entry stays the marker', async () => {

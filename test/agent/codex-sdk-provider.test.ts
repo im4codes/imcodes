@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { createHash } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { appendFile, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -10,6 +11,13 @@ import { PassThrough, Writable } from 'node:stream';
 // chance to complete while virtual provider timers are advanced.
 const realSetImmediate = setImmediate;
 const realSetTimeout = setTimeout;
+
+const loggerMock = vi.hoisted(() => ({
+  info: vi.fn(),
+  warn: vi.fn(),
+  error: vi.fn(),
+  debug: vi.fn(),
+}));
 
 const childProcessMock = vi.hoisted(() => {
   type Request = { id?: number; method?: string; params?: Record<string, any> };
@@ -89,6 +97,8 @@ const childProcessMock = vi.hoisted(() => {
                   message: 'failed to read thread: thread-store internal error: failed to load thread history: stream did not contain valid UTF-8',
                 },
               });
+            } else if (msg.params?.threadId === 'thread-malformed') {
+              childRecord.child.stdout.write(`{"id":${msg.id},"result":{"thread":{"id":"${'x'.repeat(100_000)}\n`);
             } else {
               childRecord.emits({
                 id: msg.id,
@@ -122,6 +132,9 @@ const childProcessMock = vi.hoisted(() => {
             } else {
               emitTurnInterruptResult(childRecord, msg);
             }
+          }
+          if (msg.method === 'turn/steer' && typeof msg.id === 'number') {
+            childRecord.emits({ id: msg.id, result: { turnId: msg.params?.expectedTurnId } });
           }
           if (msg.method === 'thread/unsubscribe' && typeof msg.id === 'number') {
             childRecord.emits({ id: msg.id, result: { status: 'unsubscribed' } });
@@ -216,7 +229,7 @@ vi.mock('node:child_process', () => ({
 }));
 
 vi.mock('../../src/util/logger.js', () => ({
-  default: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+  default: loggerMock,
 }));
 
 // Mock the codex runtime config so tests can pretend specific models are
@@ -272,6 +285,7 @@ import {
 } from '../../shared/memory-mcp-env.js';
 import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../shared/memory-mcp-server-name.js';
 import { MEMORY_MCP_STATUS } from '../../shared/memory-ws.js';
+import { AGENT_DELEGATION_NOTIFICATION_RESULTS } from '../../shared/agent-delegation.js';
 import {
   SDK_SUBAGENT_DETAIL_KIND,
   SDK_SUBAGENT_DIAGNOSTIC,
@@ -415,6 +429,10 @@ describe('CodexSdkProvider', () => {
     childProcessMock.setHoldTurnInterrupt(false);
     childProcessMock.clearThreadReadResults();
     childProcessMock.clearTurnStartErrors();
+    loggerMock.info.mockClear();
+    loggerMock.warn.mockClear();
+    loggerMock.error.mockClear();
+    loggerMock.debug.mockClear();
     childProcessMock.releaseHeldInitializes();
     childProcessMock.releaseHeldThreadStarts();
     childProcessMock.releaseHeldTurnStarts();
@@ -445,6 +463,32 @@ describe('CodexSdkProvider', () => {
       connected: true,
       degradedReasons: [],
     });
+  });
+
+  it('steers a correlated delegation completion into the exact active Codex turn', async () => {
+    const provider = createCodexProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-delegation-notify', cwd: '/tmp/project' });
+    await provider.send('route-delegation-notify', 'foreground work');
+    const child = childProcessMock.children[0]!;
+
+    const result = await provider.notifyActiveDelegation?.('route-delegation-notify', {
+      notificationId: 'notification_identity',
+      delegationId: 'delegation_identity',
+      sourceSessionName: 'deck_sub_auditor',
+      text: 'delegated audit finished',
+    });
+
+    expect(result).toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    expect(child.requests.find((request) => request.method === 'turn/steer')).toMatchObject({
+      params: {
+        threadId: 'thread-1',
+        expectedTurnId: 'turn-1',
+        clientUserMessageId: 'notification_identity',
+        input: [{ type: 'text', text: 'delegated audit finished' }],
+      },
+    });
+    expect(child.requests.some((request) => request.method === 'turn/interrupt')).toBe(false);
   });
 
   it('restarts the app-server before creating a session when Codex auth changes', async () => {
@@ -3544,6 +3588,49 @@ describe('CodexSdkProvider', () => {
     expect(turnReq?.params?.threadId).toBe('thread-1');
     expect(errors).toEqual([]);
     expect(sessionInfo).toContainEqual({ resumeId: 'thread-1' });
+  });
+
+  it('rejects a malformed thread/resume response immediately, replaces the thread, and logs only bounded metadata', async () => {
+    const provider = createCodexProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-malformed', cwd: '/tmp/project', resumeId: 'thread-malformed' });
+
+    let settleTimeout: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        provider.send('route-malformed', 'hello after malformed history'),
+        new Promise<never>((_resolve, reject) => {
+          settleTimeout = realSetTimeout(() => reject(new Error('Malformed thread/resume response did not settle promptly')), 500);
+        }),
+      ]);
+    } finally {
+      if (settleTimeout) clearTimeout(settleTimeout);
+    }
+
+    const child = childProcessMock.children[0];
+    const resumeReq = child.requests.find((req) => req.method === 'thread/resume');
+    const startReq = child.requests.find((req) => req.method === 'thread/start');
+    const turnReq = child.requests.find((req) => req.method === 'turn/start');
+    expect(resumeReq?.params?.threadId).toBe('thread-malformed');
+    expect(startReq?.params?.cwd).toBe('/tmp/project');
+    expect(turnReq?.params?.threadId).toBe('thread-1');
+
+    const malformedLine = `{"id":${resumeReq?.id},"result":{"thread":{"id":"${'x'.repeat(100_000)}`;
+    const parseWarning = loggerMock.warn.mock.calls.find(([, message]) => message === 'Failed to parse Codex app-server line');
+    expect(parseWarning).toBeDefined();
+    expect(parseWarning?.[0]).toMatchObject({
+      provider: 'codex-sdk',
+      lineSummary: 'malformed JSON-RPC response with numeric request id',
+      lineChars: malformedLine.length,
+      lineUtf8Bytes: Buffer.byteLength(malformedLine, 'utf8'),
+      lineSha256: createHash('sha256').update(malformedLine, 'utf8').digest('hex'),
+      requestId: resumeReq?.id,
+      pendingMethod: 'thread/resume',
+      parseError: expect.stringMatching(/^SyntaxError(?: at position \d+)?$/),
+    });
+    expect(parseWarning?.[0]).not.toHaveProperty('line');
+    expect(JSON.stringify(parseWarning?.[0]).length).toBeLessThan(2_000);
+    expect(JSON.stringify(parseWarning?.[0])).not.toContain('x'.repeat(1_000));
   });
 
   // ── baseInstructions sourcing ──────────────────────────────────────────

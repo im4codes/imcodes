@@ -1394,9 +1394,12 @@ export async function uploadFile(
   serverId: string,
   file: File,
   onProgress?: (pct: number) => void,
+  clientUploadId?: string,
+  signal?: AbortSignal,
 ): Promise<{ ok: boolean; attachment: AttachmentRefResponse }> {
   const form = new FormData();
   form.append('file', file);
+  if (clientUploadId) form.append('clientUploadId', clientUploadId);
   const browserUploadWeight = 50;
   const daemonDownloadWeight = 50;
 
@@ -1426,6 +1429,13 @@ export async function uploadFile(
     let finalPayload: { ok: boolean; attachment: AttachmentRefResponse } | null = null;
     let streamError: ApiError | null = null;
     let highestProgress = 0;
+    const abortError = () => {
+      const error = new Error('upload_canceled');
+      error.name = 'AbortError';
+      return error;
+    };
+    const onSignalAbort = () => xhr.abort();
+    const cleanupAbortListener = () => signal?.removeEventListener('abort', onSignalAbort);
 
     const emitProgress = (pct: number) => {
       const next = Math.max(highestProgress, Math.min(100, Math.round(pct)));
@@ -1479,6 +1489,7 @@ export async function uploadFile(
     xhr.onprogress = () => consumeProgressLines(false);
 
     xhr.onload = () => {
+      cleanupAbortListener();
       if (xhr.status >= 200 && xhr.status < 300) {
         try {
           consumeProgressLines(true);
@@ -1500,8 +1511,26 @@ export async function uploadFile(
       }
     };
 
-    xhr.onerror = () => reject(new ApiError(0, 'Network error'));
+    xhr.onerror = () => {
+      cleanupAbortListener();
+      reject(new ApiError(0, 'Network error'));
+    };
+    xhr.onabort = () => {
+      cleanupAbortListener();
+      reject(abortError());
+    };
+    if (signal?.aborted) {
+      reject(abortError());
+      return;
+    }
+    signal?.addEventListener('abort', onSignalAbort, { once: true });
     xhr.send(form);
+  });
+}
+
+export async function deleteAttachment(serverId: string, attachmentId: string): Promise<void> {
+  await apiFetch(`/api/server/${encodeURIComponent(serverId)}/uploads/${encodeURIComponent(attachmentId)}`, {
+    method: 'DELETE',
   });
 }
 

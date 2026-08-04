@@ -5,7 +5,7 @@
  */
 import { h } from 'preact';
 import { useEffect, useLayoutEffect, useRef, useState, useMemo, useCallback } from 'preact/hooks';
-import { memo } from 'preact/compat';
+import { memo, createPortal } from 'preact/compat';
 import { useTranslation } from 'react-i18next';
 import type {
   TimelineEvent,
@@ -17,6 +17,8 @@ import type {
 import type { FileChangeBatch, FileChangePatch } from '@shared/file-change.js';
 import { FS_READ_ERROR_CODES } from '@shared/fs-read-error-codes.js';
 import { isInsufficientCapacityError } from '../upload-error.js';
+import { useNowTicker } from '../hooks/useNowTicker.js';
+import { formatToolDuration } from '../util/tool-duration.js';
 import {
   SDK_SUBAGENT_DETAIL_KIND,
   SDK_SUBAGENT_DIAGNOSTIC,
@@ -59,6 +61,7 @@ import { formatSharedActorLabel } from '../tab-sharing-ui.js';
 import { deriveSessionLiveStatus } from '../session-live-status.js';
 import { isWorkingSessionState } from '@shared/session-activity-types.js';
 import { isPeerAuditRuntimeDisposition } from '@shared/peer-audit.js';
+import { AGENT_DELEGATION_REPLY_TIMELINE_EVENT } from '@shared/agent-delegation.js';
 import { parseTimelineDisplayText } from '../timeline-display-text.js';
 import {
   deriveSdkSubagentStatusRows,
@@ -220,20 +223,47 @@ function formatMemoryContextTimestamp(ts: number | undefined, locale?: string): 
   return new Date(ts).toLocaleString(locale, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
 }
 
+// `toLocaleTimeString` / `toLocaleString` construct a fresh Intl.DateTimeFormat
+// on every single call. Every rendered bubble stamps a timestamp, so first paint
+// of a long history pays that construction once per message: measured at ~15% of
+// a 4.9s mount task with 250 rendered items on a 20x-CPU-throttled browser.
+// The formatter depends only on (locale, shape), so build each one once.
+//
+// Output is identical to the toLocale* calls this replaces: those differ from
+// Intl.DateTimeFormat only in the defaults they inject when NO relevant field is
+// requested, and both shapes below request their fields explicitly.
+const CHAT_TIME_FORMAT_OPTIONS: Intl.DateTimeFormatOptions = {
+  hour: '2-digit',
+  minute: '2-digit',
+  second: '2-digit',
+};
+const CHAT_DATE_TIME_FORMAT_OPTIONS: Intl.DateTimeFormatOptions = {
+  month: 'short',
+  day: 'numeric',
+  ...CHAT_TIME_FORMAT_OPTIONS,
+};
+// Bounded in practice by the supported locale count (7) x 2 shapes.
+const chatDateTimeFormatterCache = new Map<string, Intl.DateTimeFormat>();
+
+function chatDateTimeFormatter(locale: string | undefined, withDate: boolean): Intl.DateTimeFormat {
+  const key = `${withDate ? 'd' : 't'}:${locale ?? ''}`;
+  const cached = chatDateTimeFormatterCache.get(key);
+  if (cached) return cached;
+  const formatter = new Intl.DateTimeFormat(
+    locale,
+    withDate ? CHAT_DATE_TIME_FORMAT_OPTIONS : CHAT_TIME_FORMAT_OPTIONS,
+  );
+  chatDateTimeFormatterCache.set(key, formatter);
+  return formatter;
+}
+
 export function formatChatDateTime(ts: number, now = Date.now(), locale?: string): string {
   const date = new Date(ts);
   const today = new Date(now);
-  const timeOptions: Intl.DateTimeFormatOptions = {
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-  };
   const isToday = date.getFullYear() === today.getFullYear()
     && date.getMonth() === today.getMonth()
     && date.getDate() === today.getDate();
-  return isToday
-    ? date.toLocaleTimeString(locale, timeOptions)
-    : date.toLocaleString(locale, { month: 'short', day: 'numeric', ...timeOptions });
+  return chatDateTimeFormatter(locale, !isToday).format(date);
 }
 
 type MemoryContextSection =
@@ -715,6 +745,65 @@ function getFinalVisibleEventIds(events: TimelineEvent[], showToolCalls: boolean
   return ids;
 }
 
+/**
+ * Reference cache for merged call+result events.
+ *
+ * `buildViewItems` re-runs on every incoming event, and the merge below built a
+ * fresh object each time (`{ ...ev, payload: { ... } }`). Every already-merged
+ * tool call in the history therefore got a NEW identity on every streamed token,
+ * which defeated the `ChatEvent` memo for the entire visible list. Measured in a
+ * throttled browser: one incoming event re-executed ~120 ChatEvent bodies while
+ * producing only 3 DOM mutations — the output was identical, so the DOM was
+ * spared, but the JS cost was paid in full and saturated a slow CPU.
+ *
+ * Keyed on the two source OBJECTS, not on their eventIds.
+ *
+ * An eventId-keyed cache is wrong here, and wrong in the direction that silently
+ * stops output from updating: a tool result keeps its eventId while its payload
+ * changes — streaming output grows under the same id, and the detail-hydration
+ * path replaces a truncated payload with the full one under the same id. Keyed
+ * by id, the first (shortest) merge wins forever and the real output never
+ * reaches the screen.
+ *
+ * `useTimeline` updates events immutably (`{ ...existing, payload }`), so a new
+ * object IS the signal that content changed. Keying on identity therefore gives
+ * both properties at once: unchanged inputs return the same merged object (the
+ * memo holds), and any payload change misses the cache (no staleness). A WeakMap
+ * pair also needs no size cap or eviction — entries die with their events.
+ */
+const mergedToolEventCache = new WeakMap<TimelineEvent, WeakMap<TimelineEvent, TimelineEvent>>();
+
+function cacheMergedToolEvent(
+  call: TimelineEvent,
+  result: TimelineEvent,
+  build: () => TimelineEvent,
+): TimelineEvent {
+  let byResult = mergedToolEventCache.get(call);
+  if (!byResult) {
+    byResult = new WeakMap<TimelineEvent, TimelineEvent>();
+    mergedToolEventCache.set(call, byResult);
+  }
+  const hit = byResult.get(result);
+  if (hit) return hit;
+  const built = build();
+  byResult.set(result, built);
+  return built;
+}
+
+export function __resetMergedToolEventCacheForTests(): void {
+  // Identity-keyed entries cannot outlive their events, so there is nothing to
+  // clear; kept as a no-op so tests read the same either way.
+}
+
+/**
+ * Test seam for the identity invariant. Render-count proxies turned out to be
+ * unreliable here (the count moves for unrelated reasons and stays flat when the
+ * memo does miss), so the property is asserted directly on the objects.
+ */
+export function __buildViewItemsForTests(events: TimelineEvent[], showToolCalls: boolean): ViewItem[] {
+  return buildViewItems(events, showToolCalls);
+}
+
 function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewItem[] {
   // Simple view still needs tool call/result events to build its compact live
   // activity rail. Other developer details remain fully filtered.
@@ -737,6 +826,22 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
     lastByEventId.set(visible[i].eventId, i);
   }
 
+  // toolCallId -> result indices, in order. Built once over the WHOLE list:
+  // a correlation id makes the ten-event adjacency window meaningless, and a
+  // result can legitimately arrive far later than its call. Each index is
+  // handed out at most once, so a reused/duplicate id cannot let two calls
+  // consume the same result.
+  const resultsByToolCallId = new Map<string, number[]>();
+  for (let i = 0; i < visible.length; i++) {
+    const candidate = visible[i];
+    if (candidate.type !== 'tool.result') continue;
+    const id = typeof candidate.payload.toolCallId === 'string' ? candidate.payload.toolCallId : '';
+    if (!id) continue;
+    const bucket = resultsByToolCallId.get(id);
+    if (bucket) bucket.push(i);
+    else resultsByToolCallId.set(id, [i]);
+  }
+
   for (let i = 0; i < visible.length; i++) {
     const ev = visible[i];
 
@@ -751,9 +856,52 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
     // command.ack etc. can land between them during a long-running tool.
     if (ev.type === 'tool.call') {
       let resultIdx = -1;
-      for (let j = i + 1; j <= Math.min(i + 10, visible.length - 1); j++) {
-        if (visible[j].type === 'tool.result') { resultIdx = j; break; }
-        if (visible[j].type === 'tool.call') break; // another call started, stop
+      const callId = typeof ev.payload.toolCallId === 'string' ? ev.payload.toolCallId : '';
+      // Prefer the correlation id. Concurrent tools interleave as
+      // callA, callB, resultA, resultB — the adjacency scan below stops at the
+      // next call, so A never merged and B took A's result, giving the wrong
+      // arguments, the wrong duration, and a call stuck "running" forever.
+      if (callId) {
+        const bucket = resultsByToolCallId.get(callId);
+        while (bucket && bucket.length > 0) {
+          const next = bucket.shift()!;
+          // Only results AFTER this call. Anything an earlier adjacency merge
+          // consumed necessarily sits before it, so this also covers the
+          // double-consume case without a separate `consumedIds` check —
+          // verified by mutation: adding one changed no test.
+          if (next <= i) continue;
+          // Skip indices dropped by the streaming-delta dedup above.
+          if (lastByEventId.get(visible[next].eventId) !== next) continue;
+          resultIdx = next;
+          break;
+        }
+      }
+      // Adjacency fallback. Runs when the call has no id (older events, providers
+      // that omit it) AND when the call HAS an id but the correlation lookup came
+      // up empty — a result that carries no id of its own lands in no bucket, so
+      // an id-bearing call could never pair with it and stayed "running" forever
+      // with the peek stuck on "waiting for output".
+      //
+      // When the call is id-bearing the fallback is deliberately narrower: only a
+      // result with NO id may match. A result carrying a DIFFERENT non-empty id
+      // belongs to another call, and accepting it would reintroduce exactly the
+      // concurrent-tool cross-talk the correlation path above exists to prevent.
+      if (resultIdx === -1) {
+        for (let j = i + 1; j <= Math.min(i + 10, visible.length - 1); j++) {
+          if (visible[j].type === 'tool.result') {
+            const resultId = typeof visible[j].payload.toolCallId === 'string'
+              ? visible[j].payload.toolCallId
+              : '';
+            // Fail closed on either side carrying an id: an id-bearing result
+            // has declared which call owns it, and an id-bearing call must only
+            // pair through the correlation map. Adjacency is the fallback for
+            // events that carry no identity at all.
+            if (resultId) break;
+            resultIdx = j;
+            break;
+          }
+          if (visible[j].type === 'tool.call') break; // another call started, stop
+        }
       }
       if (resultIdx !== -1) {
         const next = visible[resultIdx];
@@ -767,7 +915,9 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
         const input = inputText ? ` ${inputText}` : '';
         const status = next.payload.error ? `✗ ${String(next.payload.error)}` : '✓';
         const output = !next.payload.error ? formatToolOutputPreview(next.payload.output) ?? undefined : undefined;
-        consolidated.push({
+        // Same two source events must yield the SAME object every render, or the
+        // whole visible list loses its memo on every incoming token.
+        consolidated.push(cacheMergedToolEvent(ev, next, () => ({
           ...ev,
           type: 'tool.call',
           payload: {
@@ -776,13 +926,21 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
             input: `${input} ${status}`.trim(),
             _merged: true,
             _toolFailed: Boolean(next.payload.error),
+            // The failure text only survived inside the composed `input` string
+            // (as "✗ <error>"), so anything wanting the real reason had to parse
+            // it back out. Keep it verbatim for the hover peek.
+            ...(next.payload.error ? { _toolError: String(next.payload.error) } : {}),
+            // The merged event keeps the CALL's ts (so ordering is unchanged);
+            // the result's ts is the only record of when the tool finished, and
+            // without it a completed tool has no computable duration.
+            ...(typeof next.ts === 'number' ? { _resultTs: next.ts } : {}),
             _callPayloadInput: ev.payload.input,
             _resultPayloadOutput: next.payload.output,
             ...(output ? { _output: output } : {}),
             ...(ev.payload.detail ? { _callDetail: ev.payload.detail } : {}),
             ...(next.payload.detail ? { _resultDetail: next.payload.detail } : {}),
           },
-        });
+        })));
         continue;
       }
     }
@@ -1403,7 +1561,7 @@ function SdkAgentsDiagnosticRow({ diagnostic }: { diagnostic: SdkSubagentDiagnos
   );
 }
 
-export function ChatView({ events, loading, refreshing = false, historyStatus, loadingOlder, hasOlderHistory = true, onLoadOlder, sessionState, sessionId, onScrollBottomFn, preview, onPreviewFile, ws, onInsertPath, workdir, onViewRepo, serverId, onQuote, agentType: _agentType, onResendFailed, onForceSync }: Props) {
+function ChatViewImpl({ events, loading, refreshing = false, historyStatus, loadingOlder, hasOlderHistory = true, onLoadOlder, sessionState, sessionId, onScrollBottomFn, preview, onPreviewFile, ws, onInsertPath, workdir, onViewRepo, serverId, onQuote, agentType: _agentType, onResendFailed, onForceSync }: Props) {
   const { t, i18n } = useTranslation();
   const locale = resolveI18nLocale(i18n);
   const [syncDisabled, setSyncDisabled] = useState(false);
@@ -1884,6 +2042,7 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
 
   useEffect(() => () => {
     if (revealingOlderTimerRef.current) clearTimeout(revealingOlderTimerRef.current);
+    if (pendingScrollFrameRef.current !== null) cancelAnimationFrame(pendingScrollFrameRef.current);
   }, []);
 
   const markProgrammaticScroll = () => {
@@ -1920,6 +2079,24 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
   // public contract used by `onScrollBottomFn` parents (SessionPane,
   // SubSessionWindow), which intentionally call this after the user sends a
   // message and expect "force jump + re-engage".
+  // Six independent effects call this (session change, mount, first-content,
+  // new events, the resize observer, the height observer) and they all target
+  // the same place: the bottom. Each call used to read `scrollHeight`, which
+  // forces a synchronous layout of the entire message list.
+  //
+  // Measured on a 20x-CPU-throttled browser, 300 history events, no streaming:
+  //
+  //   1 window     5 calls   1.3s   inside a 4.9s  mount task
+  //   4 windows   20 calls   3.8s   inside a 12.2s mount task
+  //
+  // It scales with window count because the windows mount in the same task, so
+  // opening several sub-sessions on a slow machine produces one multi-second
+  // block during which the tab cannot even process a reload. The redundant
+  // flushes buy nothing — coalesce the DOM measure+write to one per frame. The
+  // follow/suppress policy stays synchronous so ordering against callers that
+  // set state right after is unchanged.
+  const pendingScrollFrameRef = useRef<number | null>(null);
+
   const scrollToBottom = (engageFollow: boolean = true) => {
     const el = scrollRef.current;
     if (!el) return;
@@ -1930,9 +2107,17 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
       countedFinalEventIdsRef.current = new Set(finalVisibleEventIds);
     }
     suppressLoadOlder();
-    markProgrammaticScroll();
-    el.scrollTop = el.scrollHeight;
-    lastScrollTopRef.current = el.scrollTop;
+    if (pendingScrollFrameRef.current !== null) return;
+    pendingScrollFrameRef.current = requestAnimationFrame(() => {
+      pendingScrollFrameRef.current = null;
+      const node = scrollRef.current;
+      if (!node) return;
+      // Armed here rather than at call time: it is a 200ms one-shot guard
+      // against the synthetic scroll event fired by the write below.
+      markProgrammaticScroll();
+      node.scrollTop = node.scrollHeight;
+      lastScrollTopRef.current = node.scrollTop;
+    });
   };
 
   // (No `followIfEngaged` helper: the two callsites that need it are also
@@ -2653,7 +2838,10 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
     if (!historyStatus || historyStatus.phase === 'idle') return [];
     const order: TimelineHistoryStepKey[] = ['cache', 'textTail', 'daemon', 'http', 'older'];
     return order
-      .map((key) => ({ key, state: historyStatus.steps[key] }))
+      // `counts` is optional on the wire: a status built by an older caller (or
+      // restored from a previous shape) has no such field, and indexing it
+      // unguarded crashes the whole chat view rather than losing one number.
+      .map((key) => ({ key, state: historyStatus.steps[key], count: historyStatus.counts?.[key] }))
       .filter((step) => step.state !== 'skipped')
       .map((step) => ({
         ...step,
@@ -2668,6 +2856,7 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
                 : t('session.history_step_older'),
       }));
   }, [historyStatus, t]);
+  // `empty` is terminal like `done` — a cold local cache is not still working.
   const showHistoryProgress = !preview && historySteps.some((step) => step.state === 'pending' || step.state === 'running');
   const showRefreshOverlay = !preview && (showHistoryProgress || refreshing);
   return (
@@ -2761,11 +2950,18 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
                 <span class="chat-history-overlay-label">{t('session.history_loading_label')}</span>
                 <span class="chat-history-overlay-steps">
                   {historySteps.map((step) => (
-                    <span key={step.key} class={`chat-history-step ${step.state}`}>
+                    <span
+                      key={step.key}
+                      class={`chat-history-step ${step.state}`}
+                      title={step.state === 'empty' ? t('session.history_step_empty_hint') : undefined}
+                    >
                       <span class="chat-history-step-icon" aria-hidden="true">
-                        {step.state === 'done' ? '✓' : step.state === 'running' ? '…' : '○'}
+                        {step.state === 'done' ? '✓' : step.state === 'empty' ? '∅' : step.state === 'running' ? '…' : '○'}
                       </span>
                       {step.label}
+                      {step.count !== undefined && (
+                        <span class="chat-history-step-count">{step.count}</span>
+                      )}
                     </span>
                   ))}
                 </span>
@@ -3160,6 +3356,26 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
   );
 }
 
+/**
+ * Memoized so an open window costs nothing when its own session is quiet.
+ *
+ * Every mounted ChatView used to re-render on every timeline event, whatever
+ * session that event belonged to, because the owner of the events state
+ * re-renders and ChatView had no memo boundary. Measured over real components:
+ * a window on an idle session re-rendered once per event delivered to a
+ * DIFFERENT session, so per-event work scaled with the number of open windows.
+ * The inner `ChatEvent` / `AssistantBlock` memos kept the DOM stable, which is
+ * why this stayed invisible on fast machines — but the reconciliation still ran
+ * N times, and on a low-spec machine with many sub-session windows and a live
+ * token stream the queue stopped draining and the whole tab wedged.
+ *
+ * Default shallow prop comparison is what we want: `events` gets a new array
+ * identity precisely when that session's timeline changed. It follows that the
+ * CALLBACK props must be referentially stable at every call site — an inline
+ * closure would defeat this entirely and silently restore the old cost.
+ */
+export const ChatView = memo(ChatViewImpl);
+
 /** Full-fidelity tool shell: one-line preview, bounded scrollable expansion. */
 function ToolBlockFold({
   children,
@@ -3198,6 +3414,27 @@ function toggleToolFoldFromHeader(
   toggleExpanded();
 }
 
+/**
+ * Name + input for a `tool.call`, exactly as the full tool row derives them.
+ *
+ * Shared so the Simple-view chip really is a miniature of the detailed row: it
+ * needs `pickMergedToolInput` (which prefers the result's complete args when a
+ * streamed call arrived without input) rather than the raw payload, or a tool
+ * like TodoWrite renders as a wall of JSON.
+ */
+function deriveToolCallDisplay(event: TimelineEvent): { toolName: string; toolInput: string } {
+  const toolName = String(event.payload.tool ?? 'tool');
+  const callDetail = event.payload._callDetail ?? event.payload.detail;
+  const resultDetail = event.payload._resultDetail;
+  const callPayloadInput = Object.prototype.hasOwnProperty.call(event.payload, '_callPayloadInput')
+    ? event.payload._callPayloadInput
+    : event.payload.input;
+  // Fall back to result detail for input — transport SDK tool.call may arrive without input.
+  const callInput = summarizeToolInput(callPayloadInput, callDetail);
+  const resultInput = summarizeToolInput((resultDetail as any)?.input, resultDetail);
+  return { toolName, toolInput: pickMergedToolInput(toolName, callInput, resultInput) };
+}
+
 function getToolActivityCounts(events: TimelineEvent[]) {
   let terminal = 0;
   let failed = 0;
@@ -3213,6 +3450,165 @@ function getToolActivityCounts(events: TimelineEvent[]) {
     failed,
     running: Math.max(0, events.length - terminal),
   };
+}
+
+/**
+ * What the newest tool in the group is doing, for the Simple-view chip.
+ *
+ * The counters alone answer "how many", not "what is it stuck on" — which is
+ * the question during a long wait. A running tool reports live elapsed time; a
+ * finished one reports how long it took.
+ */
+function getLastToolActivity(events: TimelineEvent[], nowMs: number): {
+  running: boolean;
+  failed: boolean;
+  durationMs: number | null;
+  toolName: string;
+  toolInput: string;
+  /** Untruncated output of the finished call — null while it is still running. */
+  toolOutput: string | null;
+  /** Failure text when the call ended in an error. */
+  toolError: string | null;
+} | null {
+  // Walk back to the newest `tool.call`. The last event in a group is often a
+  // standalone `tool.result` (its call fell outside the merge window), and a
+  // result carries no tool name and no start time — reading it directly is why
+  // the chip showed a bare input dump with no name and no duration.
+  let index = events.length - 1;
+  while (index >= 0 && events[index].type !== 'tool.call') index -= 1;
+  if (index < 0) return null;
+  const call = events[index];
+
+  const { toolName, toolInput } = deriveToolCallDisplay(call);
+
+  const startedAt = typeof call.ts === 'number' ? call.ts : null;
+  // Merging is what pairs a call with its result, so a merged event is finished
+  // and carries the result's timestamp; anything unmerged is still in flight.
+  // (An explicit "look for a trailing result" branch was tried here and removed:
+  // the merge window scans forward by array position, so a result adjacent to
+  // its call always merges, and no test could reach the branch.)
+  const finishedAt = typeof call.payload._resultTs === 'number' ? call.payload._resultTs : null;
+  const running = call.payload._merged !== true;
+
+  let durationMs: number | null = null;
+  if (startedAt !== null) {
+    // Clock skew or a rehydrated event can put the start in the future; clamp
+    // rather than render a negative age.
+    if (running) durationMs = Math.max(0, nowMs - startedAt);
+    else if (finishedAt !== null) durationMs = Math.max(0, finishedAt - startedAt);
+  }
+
+  // The hover peek shows the real result, so read the untruncated output the
+  // merge step stashed rather than the one-line chip preview. `_output` is the
+  // already-formatted string; fall back to the raw payload for events that were
+  // merged before it existed (or whose output only became non-empty later).
+  const failed = call.payload._toolFailed === true || Boolean(call.payload.error);
+  const toolError = failed
+    ? String(call.payload._toolError ?? call.payload.error ?? '') || null
+    : null;
+  const toolOutput = running
+    ? null
+    : (typeof call.payload._output === 'string' && call.payload._output)
+      || formatToolOutputPreview(call.payload._resultPayloadOutput)
+      || null;
+
+  return { running, failed, durationMs, toolName, toolInput, toolOutput, toolError };
+}
+
+let toolPeekIdCounter = 0;
+
+/**
+ * Hover peek for the Simple-view tool chip: the last full command and the
+ * output it produced. Portalled to `document.body` because the chat scroller
+ * clips overflow, so it is positioned from the chip's viewport rect. That rect
+ * goes stale the moment anything scrolls, so the owner re-measures it on scroll
+ * and resize — with a pointer the chip slides out from under the cursor and
+ * `mouseleave` closes the panel anyway, but a keyboard-focused peek has no such
+ * escape hatch and would otherwise sit stranded mid-screen.
+ */
+function ToolActivityPeek({
+  anchor,
+  peekId,
+  toolName,
+  command,
+  output,
+  error,
+  running,
+  failed,
+  duration,
+}: {
+  anchor: DOMRect;
+  peekId: string;
+  toolName: string;
+  command: string;
+  output: string | null;
+  error: string | null;
+  running: boolean;
+  failed: boolean;
+  duration: string | null;
+}) {
+  const { t } = useTranslation();
+  if (typeof document === 'undefined') return null;
+
+  const margin = 8;
+  const width = Math.min(560, Math.max(280, window.innerWidth - margin * 2));
+  // Prefer above the chip (the chip sits under the reply text, so upward keeps
+  // the message readable); flip below only when there is not enough room.
+  const spaceAbove = anchor.top;
+  const placeBelow = spaceAbove < 220 && window.innerHeight - anchor.bottom > spaceAbove;
+  const left = Math.min(
+    Math.max(margin, anchor.left),
+    Math.max(margin, window.innerWidth - width - margin),
+  );
+  const maxHeight = Math.max(
+    140,
+    (placeBelow ? window.innerHeight - anchor.bottom : anchor.top) - margin * 2,
+  );
+  const position = placeBelow
+    ? { top: `${anchor.bottom + margin}px` }
+    : { bottom: `${window.innerHeight - anchor.top + margin}px` };
+
+  const status = running
+    ? t('chat.tool_peek_running')
+    : failed
+      ? t('chat.tool_peek_failed')
+      : t('chat.tool_peek_done');
+
+  return createPortal((
+    <div
+      id={peekId}
+      class={`chat-tool-peek${running ? ' is-running' : ''}${failed ? ' is-failed' : ''}`}
+      style={{ left: `${left}px`, width: `${width}px`, maxHeight: `${maxHeight}px`, ...position }}
+      role="tooltip"
+    >
+      <div class="chat-tool-peek-frame" aria-hidden="true" />
+      <div class="chat-tool-peek-head">
+        <span class="chat-tool-peek-dot" aria-hidden="true" />
+        <span class="chat-tool-peek-tool">{toolName}</span>
+        <span class="chat-tool-peek-status">{status}</span>
+        {duration && <span class="chat-tool-peek-duration">{duration}</span>}
+      </div>
+      <div class="chat-tool-peek-body">
+        <div class="chat-tool-peek-section">
+          <span class="chat-tool-peek-label">{t('chat.tool_peek_command')}</span>
+          <pre class="chat-tool-peek-pre">{command || t('chat.tool_peek_empty')}</pre>
+        </div>
+        <div class="chat-tool-peek-section">
+          <span class="chat-tool-peek-label">{t('chat.tool_peek_output')}</span>
+          {running ? (
+            <div class="chat-tool-peek-pending">
+              <span class="chat-tool-peek-pending-bar" aria-hidden="true" />
+              {t('chat.tool_peek_waiting')}
+            </div>
+          ) : (
+            <pre class={`chat-tool-peek-pre${failed ? ' is-failed' : ''}`}>
+              {error || output || t('chat.tool_peek_empty')}
+            </pre>
+          )}
+        </div>
+      </div>
+    </div>
+  ), document.body);
 }
 
 /** One-line live tool telemetry for Simple view; expands details on demand. */
@@ -3235,11 +3631,74 @@ function ToolActivitySummary({
 }) {
   const { t } = useTranslation();
   const [expanded, setExpanded] = useState(false);
+  // Anchor rect, not a boolean: the peek is portalled out of the scroller, so it
+  // needs the chip's viewport position. Re-measured on every open so scrolling
+  // between hovers cannot leave it stranded.
+  const [peekAnchor, setPeekAnchor] = useState<DOMRect | null>(null);
+  // The element the peek is anchored to, kept so scroll/resize can re-measure it
+  // rather than leaving the panel at a rect that is now wrong.
+  const peekTriggerRef = useRef<HTMLElement | null>(null);
+  // Stable per-instance id for `aria-describedby`. A plain counter rather than
+  // `useId` so this does not depend on the Preact hooks version.
+  const peekIdRef = useRef<string | null>(null);
+  if (peekIdRef.current === null) peekIdRef.current = `chat-tool-peek-${++toolPeekIdCounter}`;
+  const peekId = peekIdRef.current;
   const counts = getToolActivityCounts(events);
+  // Tick only while something is actually running: a settled group must not keep
+  // a timer alive, and the shared ticker stops once its last listener leaves.
+  const nowMs = useNowTicker(counts.running > 0);
+  const last = getLastToolActivity(events, nowMs);
+  const lastDuration = last?.durationMs != null ? formatToolDuration(last.durationMs) : null;
+  // Same one-line preview the full row shows, so this reads as a miniature of it
+  // rather than a different rendering of the same data.
+  const lastInput = last ? splitToolFoldPreview(last.toolInput).firstLine : null;
   const summary = t('chat.tool_activity_summary', counts);
   const action = expanded
     ? t('chat.tool_activity_collapse')
     : t('chat.tool_activity_expand');
+  const openPeek = (element: HTMLElement | null) => {
+    if (!last || !element) return;
+    peekTriggerRef.current = element;
+    setPeekAnchor(element.getBoundingClientRect());
+  };
+  const closePeek = () => {
+    peekTriggerRef.current = null;
+    setPeekAnchor(null);
+  };
+  // Pointer only. Touch clients report no hover, and opening the peek on a tap
+  // would fight the expand toggle. Keyboard focus deliberately does NOT go
+  // through this gate: a no-hover device can still have a keyboard, and gating
+  // focus on hover capability made the panel unreachable for those users.
+  const openPeekFromPointer = (element: HTMLElement | null) => {
+    if (typeof window !== 'undefined' && window.matchMedia
+      && !window.matchMedia('(hover: hover)').matches) return;
+    openPeek(element);
+  };
+
+  // The anchor is a viewport rect and the panel is `position: fixed`, so any
+  // scroll invalidates it. Re-measure instead of drifting; drop the peek if the
+  // chip has left the viewport entirely.
+  useEffect(() => {
+    if (!peekAnchor) return;
+    const sync = () => {
+      const element = peekTriggerRef.current;
+      if (!element) return;
+      const rect = element.getBoundingClientRect();
+      const offscreen = rect.bottom < 0 || rect.top > window.innerHeight
+        || rect.right < 0 || rect.left > window.innerWidth;
+      if (offscreen) { closePeek(); return; }
+      setPeekAnchor(rect);
+    };
+    // Capture phase so nested scrollers (the chat list itself) are observed too;
+    // `scroll` does not bubble.
+    window.addEventListener('scroll', sync, true);
+    window.addEventListener('resize', sync);
+    return () => {
+      window.removeEventListener('scroll', sync, true);
+      window.removeEventListener('resize', sync);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [!peekAnchor]);
 
   if (counts.total === 0) return null;
 
@@ -3250,8 +3709,12 @@ function ToolActivitySummary({
         class={`chat-tool-activity${counts.running > 0 ? ' is-running' : ''}${counts.failed > 0 ? ' has-error' : ''}`}
         aria-expanded={expanded}
         aria-label={`${summary}. ${action}`}
-        title={summary}
-        onClick={() => setExpanded((value) => !value)}
+        {...(peekAnchor && last ? { 'aria-describedby': peekId } : {})}
+        onMouseEnter={(e) => openPeekFromPointer(e.currentTarget as HTMLElement)}
+        onMouseLeave={closePeek}
+        onFocus={(e) => openPeek(e.currentTarget as HTMLElement)}
+        onBlur={closePeek}
+        onClick={() => { closePeek(); setExpanded((value) => !value); }}
       >
         <span class="chat-tool-activity-core" aria-hidden="true" />
         <span class="chat-tool-activity-label">{t('chat.tool_activity_label')}</span>
@@ -3261,6 +3724,24 @@ function ToolActivitySummary({
           {counts.running > 0 && <span class="chat-tool-activity-stat is-running">●{counts.running}</span>}
           {counts.failed > 0 && <span class="chat-tool-activity-stat is-failed">×{counts.failed}</span>}
         </span>
+        {/* A miniature tool call: which tool, and what it was called with. Shown
+            on every client — "what is it doing" is the question during a wait
+            regardless of screen size; the chip goes full width and this ellipses
+            rather than being dropped. */}
+        {last && (
+          // No `title` on this span: the hover peek supersedes it, and a native
+          // tooltip would render on top of the panel.
+          <span class="chat-tool-activity-last" aria-hidden="true">
+            <span class="chat-tool-activity-last-name">{last.toolName}</span>
+            {lastInput && <span class="chat-tool-activity-last-input">{lastInput}</span>}
+          </span>
+        )}
+        {lastDuration && (
+          <span
+            class={`chat-tool-activity-time${last?.running ? ' is-running' : ''}`}
+            aria-hidden="true"
+          >{lastDuration}</span>
+        )}
         <span class="chat-tool-activity-rail" aria-hidden="true">
           {counts.completed > 0 && (
             <span class="chat-tool-activity-segment is-complete" style={{ flexGrow: counts.completed }} />
@@ -3274,6 +3755,19 @@ function ToolActivitySummary({
         </span>
         <span class="chat-tool-activity-chevron" aria-hidden="true">⌄</span>
       </button>
+      {peekAnchor && last && (
+        <ToolActivityPeek
+          anchor={peekAnchor}
+          peekId={peekId}
+          toolName={last.toolName}
+          command={last.toolInput}
+          output={last.toolOutput}
+          error={last.toolError}
+          running={last.running}
+          failed={last.failed}
+          duration={lastDuration}
+        />
+      )}
       <span class="chat-tool-activity-live" role="status" aria-live="polite" aria-atomic="true">{summary}</span>
       {expanded && (
         <div class="chat-tool-activity-details">
@@ -3586,19 +4080,39 @@ const ChatEvent = memo(function ChatEvent({
     case 'peer_audit.status':
       return null;
 
+    case AGENT_DELEGATION_REPLY_TIMELINE_EVENT: {
+      const source = String(event.payload.sourceLabel ?? event.payload.sourceSessionName ?? '—');
+      const result = typeof event.payload.result === 'string' ? event.payload.result : '';
+      return (
+        <section class="chat-event chat-system delegation-reply-card" data-event-id={event.eventId}>
+          <div class="delegation-reply-card-head">
+            <strong>{t('delegation.reply_title')}</strong>
+            <span>{t('delegation.reply_from', { source })}</span>
+          </div>
+          {result && (
+            <ChatMarkdown
+              text={result}
+              onPathClick={onPathClick}
+              onUrlClick={onUrlClick}
+              onDownload={onDownload}
+              onHtmlPreview={onHtmlPreview}
+              onImagePreview={onImagePreview}
+            />
+          )}
+          <ChatTime ts={event.ts} />
+        </section>
+      );
+    }
+
     case 'tool.call': {
-      const toolName = String(event.payload.tool ?? 'tool');
-      const callDetail = event.payload._callDetail ?? event.payload.detail;
-      const resultDetail = event.payload._resultDetail;
+      const { toolName, toolInput } = deriveToolCallDisplay(event);
       const callPayloadInput = Object.prototype.hasOwnProperty.call(event.payload, '_callPayloadInput')
         ? event.payload._callPayloadInput
         : event.payload.input;
+      const callDetail = event.payload._callDetail ?? event.payload.detail;
+      const resultDetail = event.payload._resultDetail;
       const resultPayloadOutput = event.payload._resultPayloadOutput;
       const shouldShowTime = showTime || event.payload._merged === true;
-      // Fall back to result detail for input — transport SDK tool.call may arrive without input
-      const callInput = summarizeToolInput(callPayloadInput, callDetail);
-      const resultInput = summarizeToolInput((resultDetail as any)?.input, resultDetail);
-      const toolInput = pickMergedToolInput(toolName, callInput, resultInput);
       const {
         firstLine: toolInputFirstLine,
         remainingLines: toolInputRemainingLines,

@@ -1,0 +1,360 @@
+import { isIP } from 'node:net';
+import {
+  FILE_TRANSFER_PATH_MAX_BYTES,
+  type AttachmentRef,
+  type FileTransferValidationResult,
+} from './transport/file-transfer.js';
+
+export const MACHINE_DIRECT_FILE_TRANSFER_CAPABILITY = 'file.transfer.machine_direct.v1' as const;
+export const MACHINE_DIRECT_FILE_FETCH_CAPABILITY = 'file.transfer.machine_direct_fetch.v1' as const;
+
+export const MACHINE_FILE_TRANSFER_TRANSPORT = {
+  DIRECT: 'direct',
+  RELAY: 'relay',
+} as const;
+
+export type MachineFileTransferTransport = typeof MACHINE_FILE_TRANSFER_TRANSPORT[keyof typeof MACHINE_FILE_TRANSFER_TRANSPORT];
+
+export const MACHINE_DIRECT_FILE_TRANSFER_MSG = {
+  REQUEST: 'file.machine_direct.request',
+  DONE: 'file.machine_direct.done',
+  ERROR: 'file.machine_direct.error',
+  FETCH_REQUEST: 'file.machine_direct.fetch_request',
+  FETCH_DONE: 'file.machine_direct.fetch_done',
+  FETCH_ERROR: 'file.machine_direct.fetch_error',
+} as const;
+
+export const MACHINE_DIRECT_HANDSHAKE_MSG = {
+  TARGET_HELLO: 'target_hello',
+  SOURCE_HELLO: 'source_hello',
+} as const;
+
+export const MACHINE_DIRECT_FRAME_TYPE = {
+  DATA: 1,
+  FINISH: 2,
+  START: 3,
+} as const;
+
+export const MACHINE_DIRECT_FILE_TRANSFER_ERROR = {
+  CONNECT_FAILED: 'connect_failed',
+  AUTH_FAILED: 'auth_failed',
+  TIMEOUT: 'timeout',
+  TRANSFER_FAILED: 'transfer_failed',
+  SIZE_MISMATCH: 'size_mismatch',
+  EXPIRED: 'expired',
+  SOURCE_INVALID: 'source_invalid',
+} as const;
+
+export const MACHINE_DIRECT_FILE_TRANSFER_LIMITS = {
+  MAX_CANDIDATES: 16,
+  MAX_CONTROL_BYTES: 32 * 1024,
+  MAX_FRAME_PLAINTEXT_BYTES: 64 * 1024 + 1,
+  MAX_BUFFERED_SOCKET_BYTES: 256 * 1024,
+  FRAME_LENGTH_HEADER_BYTES: 4,
+  FRAME_AUTH_TAG_BYTES: 16,
+  FINISH_FRAME_PLAINTEXT_BYTES: 9,
+  MAX_START_METADATA_BYTES: 2 * 1024,
+  HANDSHAKE_LINE_MAX_BYTES: 2 * 1024,
+  NONCE_BYTES: 18,
+  CONNECT_TIMEOUT_MS: 4_000,
+  HANDSHAKE_TIMEOUT_MS: 4_000,
+  TRANSFER_TIMEOUT_MS: 300_000,
+  // This is only the window to begin an authenticated direct connection. Each
+  // control hop re-mints it from its own clock, so it can be generous without
+  // relying on synchronized machines or extending an in-flight transfer.
+  AUTHORITY_TTL_MS: 10 * 60_000,
+  MAX_ACCEPT_ATTEMPTS: 4,
+  MAX_CONCURRENT_RECEIVERS: 2,
+} as const;
+
+export interface MachineDirectCandidate {
+  host: string;
+  port: number;
+}
+
+export interface MachineDirectUploadRequest {
+  type: typeof MACHINE_DIRECT_FILE_TRANSFER_MSG.REQUEST;
+  requestId: string;
+  clientUploadId: string;
+  capability: string;
+  candidates: MachineDirectCandidate[];
+  originalName: string;
+  mime?: string;
+  size: number;
+  expiresAt: number;
+}
+
+export interface MachineDirectFetchRequest {
+  type: typeof MACHINE_DIRECT_FILE_TRANSFER_MSG.FETCH_REQUEST;
+  requestId: string;
+  capability: string;
+  candidates: MachineDirectCandidate[];
+  sourcePath: string;
+  expiresAt: number;
+}
+
+export interface MachineDirectFetchStart {
+  size: number;
+  originalName: string;
+}
+
+/**
+ * Mint a fresh hop-local authority deadline after an authenticated control hop.
+ * Absolute wall clocks on the Full daemon, Server, and controlled node are not
+ * assumed to be synchronized; each receiver enforces the same short TTL using
+ * its own clock instead of trusting the sender's timestamp.
+ */
+export function refreshMachineDirectUploadAuthority(
+  request: MachineDirectUploadRequest,
+  now = Date.now(),
+): MachineDirectUploadRequest {
+  return {
+    ...request,
+    expiresAt: now + MACHINE_DIRECT_FILE_TRANSFER_LIMITS.AUTHORITY_TTL_MS,
+  };
+}
+
+export function refreshMachineDirectFetchAuthority(
+  request: MachineDirectFetchRequest,
+  now = Date.now(),
+): MachineDirectFetchRequest {
+  return {
+    ...request,
+    expiresAt: now + MACHINE_DIRECT_FILE_TRANSFER_LIMITS.AUTHORITY_TTL_MS,
+  };
+}
+
+export interface MachineDirectUploadDone {
+  type: typeof MACHINE_DIRECT_FILE_TRANSFER_MSG.DONE;
+  requestId: string;
+  attachment: AttachmentRef;
+}
+
+export interface MachineDirectUploadError {
+  type: typeof MACHINE_DIRECT_FILE_TRANSFER_MSG.ERROR;
+  requestId: string;
+  error: typeof MACHINE_DIRECT_FILE_TRANSFER_ERROR[keyof typeof MACHINE_DIRECT_FILE_TRANSFER_ERROR];
+}
+
+export type MachineDirectUploadResponse = MachineDirectUploadDone | MachineDirectUploadError;
+
+export interface MachineDirectFetchDone {
+  type: typeof MACHINE_DIRECT_FILE_TRANSFER_MSG.FETCH_DONE;
+  requestId: string;
+  size: number;
+}
+
+export interface MachineDirectFetchError {
+  type: typeof MACHINE_DIRECT_FILE_TRANSFER_MSG.FETCH_ERROR;
+  requestId: string;
+  error: typeof MACHINE_DIRECT_FILE_TRANSFER_ERROR[keyof typeof MACHINE_DIRECT_FILE_TRANSFER_ERROR];
+}
+
+export type MachineDirectFetchResponse = MachineDirectFetchDone | MachineDirectFetchError;
+
+export interface MachineDirectTargetHello {
+  type: typeof MACHINE_DIRECT_HANDSHAKE_MSG.TARGET_HELLO;
+  requestId: string;
+  nonce: string;
+  proof: string;
+}
+
+export interface MachineDirectSourceHello {
+  type: typeof MACHINE_DIRECT_HANDSHAKE_MSG.SOURCE_HELLO;
+  requestId: string;
+  nonce: string;
+  proof: string;
+}
+
+const ID_RE = /^[A-Za-z0-9_-]{16,128}$/;
+const CAPABILITY_RE = /^[A-Za-z0-9_-]{43}$/;
+const NONCE_RE = /^[A-Za-z0-9_-]{24}$/;
+const ERROR_SET = new Set<MachineDirectUploadError['error']>([
+  ...Object.values(MACHINE_DIRECT_FILE_TRANSFER_ERROR),
+]);
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function hasExactKeys(value: Record<string, unknown>, required: readonly string[], optional: readonly string[] = []): boolean {
+  const allowed = new Set([...required, ...optional]);
+  return required.every((key) => Object.prototype.hasOwnProperty.call(value, key))
+    && Object.keys(value).every((key) => allowed.has(key));
+}
+
+function utf8Bytes(value: string): number {
+  return Buffer.byteLength(value, 'utf8');
+}
+
+export function isPrivateMachineDirectAddress(host: string): boolean {
+  if (isIP(host) === 4) {
+    const [a, b] = host.split('.').map(Number);
+    return a === 10
+      || (a === 172 && b! >= 16 && b! <= 31)
+      || (a === 192 && b === 168)
+      || (a === 169 && b === 254)
+      || (a === 100 && b! >= 64 && b! <= 127);
+  }
+  if (isIP(host) === 6) {
+    const normalized = host.toLowerCase();
+    return normalized.startsWith('fc') || normalized.startsWith('fd') || normalized.startsWith('fe8')
+      || normalized.startsWith('fe9') || normalized.startsWith('fea') || normalized.startsWith('feb');
+  }
+  return false;
+}
+
+/**
+ * Return whether a private candidate can be dialed without receiver-local
+ * interface scope. The v1 wire validator intentionally remains broader for
+ * rolling compatibility with senders that included link-local candidates.
+ */
+export function isRoutableMachineDirectAddress(host: string): boolean {
+  if (!isPrivateMachineDirectAddress(host)) return false;
+  if (isIP(host) === 4) {
+    const [a, b] = host.split('.').map(Number);
+    return !(a === 169 && b === 254);
+  }
+  const normalized = host.toLowerCase();
+  return normalized.startsWith('fc') || normalized.startsWith('fd');
+}
+
+export function validateMachineDirectCandidate(value: unknown): MachineDirectCandidate | null {
+  if (!isObject(value) || !hasExactKeys(value, ['host', 'port'])) return null;
+  if (typeof value.host !== 'string' || value.host.length > 64 || !isPrivateMachineDirectAddress(value.host)) return null;
+  if (typeof value.port !== 'number' || !Number.isInteger(value.port) || value.port < 1 || value.port > 65535) return null;
+  return { host: value.host, port: value.port };
+}
+
+function isMachineDirectId(value: unknown): value is string {
+  return typeof value === 'string' && ID_RE.test(value);
+}
+
+function isMachineDirectNonce(value: unknown): value is string {
+  return typeof value === 'string'
+    && NONCE_RE.test(value)
+    && Buffer.from(value, 'base64url').length === MACHINE_DIRECT_FILE_TRANSFER_LIMITS.NONCE_BYTES;
+}
+
+function isMachineDirectProof(value: unknown): value is string {
+  return typeof value === 'string' && CAPABILITY_RE.test(value);
+}
+
+export function validateMachineDirectTargetHello(value: unknown): MachineDirectTargetHello | null {
+  if (!isObject(value) || !hasExactKeys(value, ['type', 'requestId', 'nonce', 'proof'])) return null;
+  if (value.type !== MACHINE_DIRECT_HANDSHAKE_MSG.TARGET_HELLO
+    || !isMachineDirectId(value.requestId)
+    || !isMachineDirectNonce(value.nonce)
+    || !isMachineDirectProof(value.proof)) return null;
+  return value as unknown as MachineDirectTargetHello;
+}
+
+export function validateMachineDirectSourceHello(value: unknown): MachineDirectSourceHello | null {
+  if (!isObject(value) || !hasExactKeys(value, ['type', 'requestId', 'nonce', 'proof'])) return null;
+  if (value.type !== MACHINE_DIRECT_HANDSHAKE_MSG.SOURCE_HELLO
+    || !isMachineDirectId(value.requestId)
+    || !isMachineDirectNonce(value.nonce)
+    || !isMachineDirectProof(value.proof)) return null;
+  return value as unknown as MachineDirectSourceHello;
+}
+
+export function isValidMachineDirectEncryptedFrameLength(length: number): boolean {
+  return Number.isInteger(length)
+    && length >= MACHINE_DIRECT_FILE_TRANSFER_LIMITS.FRAME_AUTH_TAG_BYTES + 1
+    && length <= MACHINE_DIRECT_FILE_TRANSFER_LIMITS.MAX_FRAME_PLAINTEXT_BYTES
+      + MACHINE_DIRECT_FILE_TRANSFER_LIMITS.FRAME_AUTH_TAG_BYTES;
+}
+
+export function validateMachineDirectUploadRequest(value: unknown): FileTransferValidationResult<MachineDirectUploadRequest> {
+  if (!isObject(value) || !hasExactKeys(
+    value,
+    ['type', 'requestId', 'clientUploadId', 'capability', 'candidates', 'originalName', 'size', 'expiresAt'],
+    ['mime'],
+  )) return { ok: false, error: 'invalid_object' };
+  if (value.type !== MACHINE_DIRECT_FILE_TRANSFER_MSG.REQUEST) return { ok: false, error: 'invalid_type' };
+  if (!isMachineDirectId(value.requestId)) return { ok: false, error: 'invalid_request_id' };
+  if (!isMachineDirectId(value.clientUploadId)) return { ok: false, error: 'invalid_client_upload_id' };
+  if (typeof value.capability !== 'string' || !CAPABILITY_RE.test(value.capability)) return { ok: false, error: 'invalid_capability' };
+  if (!Array.isArray(value.candidates) || value.candidates.length < 1 || value.candidates.length > MACHINE_DIRECT_FILE_TRANSFER_LIMITS.MAX_CANDIDATES) {
+    return { ok: false, error: 'invalid_candidates' };
+  }
+  const candidates = value.candidates.map(validateMachineDirectCandidate);
+  if (candidates.some((candidate) => !candidate)) return { ok: false, error: 'invalid_candidate' };
+  if (typeof value.originalName !== 'string' || value.originalName.length < 1 || utf8Bytes(value.originalName) > 1024) return { ok: false, error: 'invalid_name' };
+  if (value.mime !== undefined && (typeof value.mime !== 'string' || utf8Bytes(value.mime) > 256)) return { ok: false, error: 'invalid_mime' };
+  if (typeof value.size !== 'number' || !Number.isSafeInteger(value.size) || value.size < 0) return { ok: false, error: 'invalid_size' };
+  if (typeof value.expiresAt !== 'number' || !Number.isSafeInteger(value.expiresAt) || value.expiresAt <= 0) return { ok: false, error: 'invalid_expiry' };
+  return { ok: true, value: { ...value, candidates: candidates as MachineDirectCandidate[] } as MachineDirectUploadRequest };
+}
+
+export function validateMachineDirectFetchRequest(value: unknown): FileTransferValidationResult<MachineDirectFetchRequest> {
+  if (!isObject(value) || !hasExactKeys(
+    value,
+    ['type', 'requestId', 'capability', 'candidates', 'sourcePath', 'expiresAt'],
+  )) return { ok: false, error: 'invalid_object' };
+  if (value.type !== MACHINE_DIRECT_FILE_TRANSFER_MSG.FETCH_REQUEST) return { ok: false, error: 'invalid_type' };
+  if (!isMachineDirectId(value.requestId)) return { ok: false, error: 'invalid_request_id' };
+  if (typeof value.capability !== 'string' || !CAPABILITY_RE.test(value.capability)) return { ok: false, error: 'invalid_capability' };
+  if (!Array.isArray(value.candidates) || value.candidates.length < 1 || value.candidates.length > MACHINE_DIRECT_FILE_TRANSFER_LIMITS.MAX_CANDIDATES) {
+    return { ok: false, error: 'invalid_candidates' };
+  }
+  const candidates = value.candidates.map(validateMachineDirectCandidate);
+  if (candidates.some((candidate) => !candidate)) return { ok: false, error: 'invalid_candidate' };
+  if (typeof value.sourcePath !== 'string' || value.sourcePath.length < 1 || utf8Bytes(value.sourcePath) > FILE_TRANSFER_PATH_MAX_BYTES) {
+    return { ok: false, error: 'invalid_source_path' };
+  }
+  if (typeof value.expiresAt !== 'number' || !Number.isSafeInteger(value.expiresAt) || value.expiresAt <= 0) return { ok: false, error: 'invalid_expiry' };
+  return { ok: true, value: { ...value, candidates: candidates as MachineDirectCandidate[] } as MachineDirectFetchRequest };
+}
+
+export function validateMachineDirectFetchStart(value: unknown): MachineDirectFetchStart | null {
+  if (!isObject(value) || !hasExactKeys(value, ['size', 'originalName'])) return null;
+  if (typeof value.size !== 'number' || !Number.isSafeInteger(value.size) || value.size < 0) return null;
+  if (typeof value.originalName !== 'string' || value.originalName.length < 1 || utf8Bytes(value.originalName) > 1024) return null;
+  return value as unknown as MachineDirectFetchStart;
+}
+
+export function validateMachineDirectUploadResponse(
+  value: unknown,
+  validateAttachment: (value: unknown, options?: { maxSize?: number }) => AttachmentRef | null,
+): FileTransferValidationResult<MachineDirectUploadResponse> {
+  if (!isObject(value) || typeof value.type !== 'string') return { ok: false, error: 'invalid_object' };
+  if (value.type === MACHINE_DIRECT_FILE_TRANSFER_MSG.DONE) {
+    if (!hasExactKeys(value, ['type', 'requestId', 'attachment'])
+      || !isMachineDirectId(value.requestId)) return { ok: false, error: 'invalid_done' };
+    const attachment = validateAttachment(value.attachment, { maxSize: Number.MAX_SAFE_INTEGER });
+    return attachment
+      ? { ok: true, value: { type: MACHINE_DIRECT_FILE_TRANSFER_MSG.DONE, requestId: value.requestId, attachment } }
+      : { ok: false, error: 'invalid_attachment' };
+  }
+  if (value.type === MACHINE_DIRECT_FILE_TRANSFER_MSG.ERROR) {
+    if (!hasExactKeys(value, ['type', 'requestId', 'error'])
+      || !isMachineDirectId(value.requestId)
+      || typeof value.error !== 'string' || !ERROR_SET.has(value.error as MachineDirectUploadError['error'])) {
+      return { ok: false, error: 'invalid_error' };
+    }
+    return { ok: true, value: value as unknown as MachineDirectUploadError };
+  }
+  return { ok: false, error: 'invalid_type' };
+}
+
+export function validateMachineDirectFetchResponse(value: unknown): FileTransferValidationResult<MachineDirectFetchResponse> {
+  if (!isObject(value) || typeof value.type !== 'string') return { ok: false, error: 'invalid_object' };
+  if (value.type === MACHINE_DIRECT_FILE_TRANSFER_MSG.FETCH_DONE) {
+    if (!hasExactKeys(value, ['type', 'requestId', 'size'])
+      || !isMachineDirectId(value.requestId)
+      || typeof value.size !== 'number' || !Number.isSafeInteger(value.size) || value.size < 0) {
+      return { ok: false, error: 'invalid_done' };
+    }
+    return { ok: true, value: value as unknown as MachineDirectFetchDone };
+  }
+  if (value.type === MACHINE_DIRECT_FILE_TRANSFER_MSG.FETCH_ERROR) {
+    if (!hasExactKeys(value, ['type', 'requestId', 'error'])
+      || !isMachineDirectId(value.requestId)
+      || typeof value.error !== 'string' || !ERROR_SET.has(value.error as MachineDirectFetchError['error'])) {
+      return { ok: false, error: 'invalid_error' };
+    }
+    return { ok: true, value: value as unknown as MachineDirectFetchError };
+  }
+  return { ok: false, error: 'invalid_type' };
+}

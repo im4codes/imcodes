@@ -31,6 +31,11 @@ import {
   PEER_AUDIT_REPLY_TOTAL_BYTES,
 } from '../../shared/peer-audit.js';
 import { submitPeerAuditReply } from './peer-audit-reply-ingress.js';
+import { submitDelegationReply } from './delegation-reply-ingress.js';
+import {
+  AGENT_DELEGATION_REPLY_ERRORS,
+  AGENT_DELEGATION_REPLY_TOTAL_BYTES,
+} from '../../shared/agent-delegation.js';
 
 export { DEFAULT_HOOK_PORT };
 
@@ -308,6 +313,7 @@ interface SendRequest {
   files?: string[];
   context?: string;
   depth?: number;
+  reply?: boolean;
 }
 
 async function handleSend(body: SendRequest): Promise<{ status: number; body: Record<string, unknown> }> {
@@ -380,7 +386,14 @@ async function handleSend(body: SendRequest): Promise<{ status: number; body: Re
   const projectRoot = sender && sender !== 'ambiguous' ? sender.projectDir : null;
   let dispatch;
   try {
-    dispatch = await dispatchHookSend({ from, targetRecords: result.targets, message, files: body.files, projectRoot });
+    dispatch = await dispatchHookSend({
+      from,
+      targetRecords: result.targets,
+      message,
+      files: body.files,
+      projectRoot,
+      reply: body.reply === true,
+    });
   } catch (err) {
     return { status: 400, body: { ok: false, error: (err as Error).message } };
   }
@@ -389,10 +402,30 @@ async function handleSend(body: SendRequest): Promise<{ status: number; body: Re
     const target = result.targets[0].name;
     const messageId = dispatch.messages[0]?.messageId;
     if (dispatch.delivered.length === 1) {
-      return { status: 200, body: { ok: true, delivered: true, target, dispatchId: dispatch.dispatchId, messageId } };
+      return {
+        status: 200,
+        body: {
+          ok: true,
+          delivered: true,
+          target,
+          dispatchId: dispatch.dispatchId,
+          messageId,
+          ...(dispatch.messages[0]?.delegationId ? { delegationId: dispatch.messages[0].delegationId } : {}),
+        },
+      };
     }
     if (dispatch.queued.length === 1) {
-      return { status: 200, body: { ok: true, queued: true, target, dispatchId: dispatch.dispatchId, messageId } };
+      return {
+        status: 200,
+        body: {
+          ok: true,
+          queued: true,
+          target,
+          dispatchId: dispatch.dispatchId,
+          messageId,
+          ...(dispatch.messages[0]?.delegationId ? { delegationId: dispatch.messages[0].delegationId } : {}),
+        },
+      };
     }
     return { status: 500, body: { ok: false, error: dispatch.errors[0] ?? 'dispatch failed' } };
   }
@@ -532,6 +565,40 @@ export async function startHookServer(onHook: HookCallback): Promise<{ server: h
         const status = (err as Error).message === 'body too large' ? 413 : 400;
         res.writeHead(status, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: false, error: status === 413 ? 'oversize' : 'malformed' }));
+      }
+      return;
+    }
+
+    if (url === '/delegation-reply') {
+      const contentType = req.headers['content-type'] ?? '';
+      if (!contentType.includes('application/json')) {
+        res.writeHead(415, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'Content-Type must be application/json' }));
+        return;
+      }
+      try {
+        const body = await readBody(req, AGENT_DELEGATION_REPLY_TOTAL_BYTES);
+        const senderHeader = req.headers['x-imcodes-session'];
+        const senderSessionName = Array.isArray(senderHeader) ? senderHeader[0] : senderHeader;
+        const result = await submitDelegationReply({ rawBody: body, senderSessionName });
+        const status = result.ok
+          ? 200
+          : result.error === AGENT_DELEGATION_REPLY_ERRORS.RATE_LIMITED
+            ? 429
+            : result.error === 'ingress_unavailable'
+              ? 503
+              : 400;
+        res.writeHead(status, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(result));
+      } catch (error) {
+        const status = (error as Error).message === 'body too large' ? 413 : 400;
+        res.writeHead(status, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          ok: false,
+          error: status === 413
+            ? AGENT_DELEGATION_REPLY_ERRORS.OVERSIZE
+            : AGENT_DELEGATION_REPLY_ERRORS.MALFORMED,
+        }));
       }
       return;
     }

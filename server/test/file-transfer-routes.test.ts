@@ -8,11 +8,19 @@ import {
   FILE_TRANSFER_MSG,
   FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY,
 } from '../../shared/transport/file-transfer.js';
+import { DIRECT_FILE_TRANSFER_CAPABILITY } from '../../shared/direct-file-transfer.js';
+import {
+  MACHINE_DIRECT_FILE_TRANSFER_CAPABILITY,
+  MACHINE_DIRECT_FILE_FETCH_CAPABILITY,
+  MACHINE_DIRECT_FILE_TRANSFER_LIMITS,
+  MACHINE_DIRECT_FILE_TRANSFER_MSG,
+} from '../../shared/machine-direct-file-transfer.js';
 
-const { sendFileTransferRequestMock, isDaemonConnectedMock, hasDaemonCapabilityMock, mockResolveServerMemberAccessOrShareDeny, queryOneMock } = vi.hoisted(() => ({
+const { sendFileTransferRequestMock, isDaemonConnectedMock, hasDaemonCapabilityMock, daemonConnectionGenerationMock, mockResolveServerMemberAccessOrShareDeny, queryOneMock } = vi.hoisted(() => ({
   sendFileTransferRequestMock: vi.fn(),
   isDaemonConnectedMock: vi.fn(),
   hasDaemonCapabilityMock: vi.fn(),
+  daemonConnectionGenerationMock: vi.fn(),
   mockResolveServerMemberAccessOrShareDeny: vi.fn(),
   queryOneMock: vi.fn(),
 }));
@@ -41,6 +49,7 @@ vi.mock('../src/ws/bridge.js', () => ({
       isDaemonConnected: isDaemonConnectedMock,
       sendFileTransferRequest: sendFileTransferRequestMock,
       hasDaemonCapability: hasDaemonCapabilityMock,
+      daemonConnectionGeneration: daemonConnectionGenerationMock,
     }),
   },
 }));
@@ -77,6 +86,7 @@ describe('file-transfer upload route', () => {
     sendFileTransferRequestMock.mockReset();
     isDaemonConnectedMock.mockReset();
     hasDaemonCapabilityMock.mockReset();
+    daemonConnectionGenerationMock.mockReset().mockReturnValue(1);
     isDaemonConnectedMock.mockReturnValue(true);
     hasDaemonCapabilityMock.mockReturnValue(true);
     mockResolveServerMemberAccessOrShareDeny.mockResolvedValue({ ok: true, role: 'owner' });
@@ -143,7 +153,223 @@ describe('file-transfer upload route', () => {
       expect.any(String),
       expect.objectContaining({ type: FILE_TRANSFER_MSG.PATH_HANDLE, path: '/tmp/report.txt' }),
       FILE_TRANSFER_LIMITS.DOWNLOAD_TIMEOUT_MS,
+      undefined,
+      1,
     );
+  });
+
+  it('singlecasts bounded machine-direct control without receiving file bytes', async () => {
+    queryOneMock.mockResolvedValue({ user_id: 'user-1', node_role: 'controlled', exec_enabled: true, revoked_at: null });
+    const request = {
+      type: MACHINE_DIRECT_FILE_TRANSFER_MSG.REQUEST,
+      requestId: 'r'.repeat(32),
+      clientUploadId: 'c'.repeat(32),
+      capability: 'A'.repeat(43),
+      candidates: [{ host: '192.168.2.145', port: 45678 }],
+      originalName: 'report.txt',
+      size: 5,
+      expiresAt: Date.now() + 10_000,
+    };
+    sendFileTransferRequestMock.mockResolvedValueOnce({
+      type: MACHINE_DIRECT_FILE_TRANSFER_MSG.DONE,
+      requestId: request.requestId,
+      attachment: {
+        id: 'b'.repeat(32), source: 'upload', serverId: '', daemonPath: '/uploads/report.txt',
+        originalName: 'report.txt', size: 5, createdAt: new Date().toISOString(), downloadable: true,
+      },
+    });
+    const beforeDispatch = Date.now();
+    const res = await makeApp().request('/api/server/controlled-1/machine-direct-upload', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer source', 'X-Server-Id': 'full-1', 'Content-Type': 'application/json' },
+      body: JSON.stringify(request),
+    });
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toMatchObject({
+      type: MACHINE_DIRECT_FILE_TRANSFER_MSG.DONE,
+      attachment: { serverId: 'controlled-1', size: 5 },
+    });
+    expect(hasDaemonCapabilityMock).toHaveBeenCalledWith(MACHINE_DIRECT_FILE_TRANSFER_CAPABILITY);
+    expect(sendFileTransferRequestMock).toHaveBeenCalledWith(
+      request.requestId,
+      expect.objectContaining({ ...request, expiresAt: expect.any(Number) }),
+      MACHINE_DIRECT_FILE_TRANSFER_LIMITS.TRANSFER_TIMEOUT_MS,
+      undefined,
+      1,
+    );
+    const forwarded = sendFileTransferRequestMock.mock.calls[0]?.[1] as { expiresAt: number };
+    expect(forwarded.expiresAt).toBeGreaterThanOrEqual(beforeDispatch + MACHINE_DIRECT_FILE_TRANSFER_LIMITS.AUTHORITY_TTL_MS);
+    expect(forwarded.expiresAt).toBeLessThanOrEqual(Date.now() + MACHINE_DIRECT_FILE_TRANSFER_LIMITS.AUTHORITY_TTL_MS);
+    expect(forwarded.expiresAt).not.toBe(request.expiresAt);
+    expect(JSON.stringify(sendFileTransferRequestMock.mock.calls[0]?.[1])).not.toContain('content');
+  });
+
+  it('singlecasts reverse-direct fetch with Server-local authority and no file bytes', async () => {
+    queryOneMock.mockResolvedValue({ user_id: 'user-1', node_role: 'controlled', exec_enabled: true, revoked_at: null });
+    const request = {
+      type: MACHINE_DIRECT_FILE_TRANSFER_MSG.FETCH_REQUEST,
+      requestId: 'f'.repeat(32),
+      capability: 'B'.repeat(43),
+      candidates: [{ host: '172.16.253.211', port: 45679 }],
+      sourcePath: '/tmp/large.bin',
+      expiresAt: Date.now() - 30 * 86_400_000,
+    };
+    sendFileTransferRequestMock.mockResolvedValueOnce({
+      type: MACHINE_DIRECT_FILE_TRANSFER_MSG.FETCH_DONE,
+      requestId: request.requestId,
+      size: 4_294_967_296,
+    });
+    const beforeDispatch = Date.now();
+    const res = await makeApp().request('/api/server/controlled-1/machine-direct-fetch', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer source', 'X-Server-Id': 'full-1', 'Content-Type': 'application/json' },
+      body: JSON.stringify(request),
+    });
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toEqual({
+      type: MACHINE_DIRECT_FILE_TRANSFER_MSG.FETCH_DONE,
+      requestId: request.requestId,
+      size: 4_294_967_296,
+    });
+    expect(hasDaemonCapabilityMock).toHaveBeenCalledWith(MACHINE_DIRECT_FILE_FETCH_CAPABILITY);
+    const forwarded = sendFileTransferRequestMock.mock.calls[0]?.[1] as Record<string, unknown>;
+    expect(forwarded).toMatchObject({ ...request, expiresAt: expect.any(Number) });
+    expect(forwarded.expiresAt).toBeGreaterThanOrEqual(beforeDispatch + MACHINE_DIRECT_FILE_TRANSFER_LIMITS.AUTHORITY_TTL_MS);
+    expect(forwarded.expiresAt).toBeLessThanOrEqual(Date.now() + MACHINE_DIRECT_FILE_TRANSFER_LIMITS.AUTHORITY_TTL_MS);
+    expect(JSON.stringify(forwarded)).not.toContain('content');
+  });
+
+  it('rejects a reverse-direct fetch when the capable daemon generation is replaced while reading the body', async () => {
+    queryOneMock.mockResolvedValue({ user_id: 'user-1', node_role: 'controlled', exec_enabled: true, revoked_at: null });
+    let activeGeneration = 7;
+    daemonConnectionGenerationMock.mockImplementation(() => activeGeneration);
+    sendFileTransferRequestMock.mockImplementation(async (
+      _requestId: string,
+      _message: Record<string, unknown>,
+      _timeoutMs: number,
+      _onProgress: unknown,
+      expectedGeneration: number | undefined,
+    ) => {
+      if (expectedGeneration !== activeGeneration) throw new Error('daemon_generation_changed');
+      return { type: MACHINE_DIRECT_FILE_TRANSFER_MSG.FETCH_DONE, requestId: 'f'.repeat(32), size: 1 };
+    });
+
+    let releaseBody!: () => void;
+    const requestBody = new ReadableStream<Uint8Array>({
+      start(controller) {
+        releaseBody = () => {
+          controller.enqueue(new TextEncoder().encode(JSON.stringify({
+            type: MACHINE_DIRECT_FILE_TRANSFER_MSG.FETCH_REQUEST,
+            requestId: 'f'.repeat(32),
+            capability: 'B'.repeat(43),
+            candidates: [{ host: '172.16.253.211', port: 45679 }],
+            sourcePath: '/tmp/large.bin',
+            expiresAt: Date.now(),
+          })));
+          controller.close();
+        };
+      },
+    });
+    const request = new Request('http://localhost/api/server/controlled-1/machine-direct-fetch', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer source', 'X-Server-Id': 'full-1', 'Content-Type': 'application/json' },
+      body: requestBody,
+      duplex: 'half',
+    } as RequestInit & { duplex: 'half' });
+    const responsePromise = makeApp().request(request);
+    await vi.waitFor(() => expect(daemonConnectionGenerationMock).toHaveBeenCalled());
+
+    activeGeneration = 8;
+    releaseBody();
+
+    const response = await responsePromise;
+    expect(response.status).toBe(503);
+    await expect(response.json()).resolves.toEqual({ error: 'daemon_offline' });
+    expect(sendFileTransferRequestMock).toHaveBeenCalledWith(
+      'f'.repeat(32),
+      expect.objectContaining({ type: MACHINE_DIRECT_FILE_TRANSFER_MSG.FETCH_REQUEST }),
+      MACHINE_DIRECT_FILE_TRANSFER_LIMITS.TRANSFER_TIMEOUT_MS,
+      undefined,
+      7,
+    );
+  });
+
+  it('rejects injected reverse-direct controls before dispatch', async () => {
+    queryOneMock.mockResolvedValue({ user_id: 'user-1', node_role: 'controlled', exec_enabled: true, revoked_at: null });
+    const res = await makeApp().request('/api/server/controlled-1/machine-direct-fetch', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer source', 'X-Server-Id': 'full-1', 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        type: MACHINE_DIRECT_FILE_TRANSFER_MSG.FETCH_REQUEST,
+        requestId: 'f'.repeat(32), capability: 'B'.repeat(43),
+        candidates: [{ host: '172.16.253.211', port: 45679 }],
+        sourcePath: '/tmp/x', expiresAt: Date.now(), injected: true,
+      }),
+    });
+    expect(res.status).toBe(400);
+    expect(sendFileTransferRequestMock).not.toHaveBeenCalled();
+  });
+
+  it('rejects browser auth and injected/public candidates before machine-direct dispatch', async () => {
+    queryOneMock.mockResolvedValue({ user_id: 'user-1', node_role: 'controlled', exec_enabled: true, revoked_at: null });
+    const request = {
+      type: MACHINE_DIRECT_FILE_TRANSFER_MSG.REQUEST,
+      requestId: 'r'.repeat(32), clientUploadId: 'c'.repeat(32), capability: 'A'.repeat(43),
+      candidates: [{ host: '8.8.8.8', port: 53 }], originalName: 'x', size: 1, expiresAt: Date.now() + 10_000,
+    };
+    const browser = await makeApp().request('/api/server/controlled-1/machine-direct-upload', {
+      method: 'POST', headers: { Authorization: 'Bearer browser', 'Content-Type': 'application/json' }, body: JSON.stringify(request),
+    });
+    expect(browser.status).toBe(403);
+    queryOneMock.mockResolvedValue({ user_id: 'other-user', node_role: 'controlled', exec_enabled: true, revoked_at: null });
+    const crossAccount = await makeApp().request('/api/server/controlled-1/machine-direct-upload', {
+      method: 'POST', headers: { Authorization: 'Bearer source', 'X-Server-Id': 'full-1', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...request, candidates: [{ host: '192.168.2.145', port: 1234 }] }),
+    });
+    expect(crossAccount.status).toBe(403);
+    queryOneMock.mockResolvedValue({ user_id: 'user-1', node_role: 'controlled', exec_enabled: true, revoked_at: null });
+    const injected = await makeApp().request('/api/server/controlled-1/machine-direct-upload', {
+      method: 'POST', headers: { Authorization: 'Bearer source', 'X-Server-Id': 'full-1', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...request, candidates: [{ host: '192.168.2.145', port: 1234 }], targetIp: '10.0.0.8' }),
+    });
+    expect(injected.status).toBe(400);
+    const publicCandidate = await makeApp().request('/api/server/controlled-1/machine-direct-upload', {
+      method: 'POST', headers: { Authorization: 'Bearer source', 'X-Server-Id': 'full-1', 'Content-Type': 'application/json' }, body: JSON.stringify(request),
+    });
+    expect(publicCandidate.status).toBe(400);
+    expect(sendFileTransferRequestMock).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['slow by 30 days', -30 * 86_400_000],
+    ['fast by 30 days', 30 * 86_400_000],
+  ])('accepts a source clock that is %s and forwards a Server-local authority', async (_label, offset) => {
+    queryOneMock.mockResolvedValue({ user_id: 'user-1', node_role: 'controlled', exec_enabled: true, revoked_at: null });
+    const requestId = 'r'.repeat(32);
+    sendFileTransferRequestMock.mockResolvedValueOnce({
+      type: MACHINE_DIRECT_FILE_TRANSFER_MSG.DONE,
+      requestId,
+      attachment: {
+        id: 'b'.repeat(32), source: 'upload', serverId: '', daemonPath: '/uploads/x',
+        originalName: 'x', size: 1, createdAt: new Date().toISOString(), downloadable: true,
+      },
+    });
+    const beforeDispatch = Date.now();
+    const res = await makeApp().request('/api/server/controlled-1/machine-direct-upload', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer source', 'X-Server-Id': 'full-1', 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        type: MACHINE_DIRECT_FILE_TRANSFER_MSG.REQUEST,
+        requestId, clientUploadId: 'c'.repeat(32), capability: 'A'.repeat(43),
+        candidates: [{ host: '192.168.2.145', port: 1234 }], originalName: 'x', size: 1,
+        expiresAt: Date.now() + offset,
+      }),
+    });
+    expect(res.status).toBe(200);
+    const forwarded = sendFileTransferRequestMock.mock.calls[0]?.[1] as { expiresAt: number };
+    expect(forwarded.expiresAt).toBeGreaterThanOrEqual(beforeDispatch + MACHINE_DIRECT_FILE_TRANSFER_LIMITS.AUTHORITY_TTL_MS);
+    expect(forwarded.expiresAt).toBeLessThanOrEqual(Date.now() + MACHINE_DIRECT_FILE_TRANSFER_LIMITS.AUTHORITY_TTL_MS);
+    expect(forwarded.expiresAt).not.toBe(beforeDispatch + offset);
   });
 
   it('denies controlled-node file access from browser-style auth before dispatch', async () => {
@@ -269,6 +495,7 @@ describe('file-transfer upload route', () => {
 
     const form = new FormData();
     form.append('file', new File(['hello'], 'hello.txt', { type: 'text/plain' }));
+    form.append('clientUploadId', 'client_upload_1234');
 
     const res = await app.request('/api/server/srv-1/upload', {
       method: 'POST',
@@ -291,10 +518,34 @@ describe('file-transfer upload route', () => {
       mime: 'text/plain',
       size: 5,
       downloadUrl: expect.stringContaining('/api/server/srv-1/upload-staged/'),
+      clientUploadId: 'client_upload_1234',
     }));
     expect(sendFileTransferRequestMock.mock.calls[0]?.[2]).toBe(FILE_TRANSFER_LIMITS.UPLOAD_TIMEOUT_MS);
     expect(hasDaemonCapabilityMock).toHaveBeenCalledWith(FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY);
     expect(sendFileTransferRequestMock.mock.calls[0]?.[1]).not.toHaveProperty('content');
+  });
+
+  it('omits clientUploadId when relaying to an older daemon without direct-transfer capability', async () => {
+    hasDaemonCapabilityMock.mockImplementation((capability: string) => (
+      capability === FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY
+    ));
+
+    const form = new FormData();
+    form.append('file', new File(['hello'], 'hello.txt', { type: 'text/plain' }));
+    form.append('clientUploadId', 'client_upload_1234');
+
+    const res = await makeApp().request('/api/server/srv-1/upload', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer test' },
+      body: form,
+    });
+
+    expect(res.status).toBe(200);
+    expect(hasDaemonCapabilityMock).toHaveBeenCalledWith(DIRECT_FILE_TRANSFER_CAPABILITY);
+    expect(sendFileTransferRequestMock.mock.calls[0]?.[1]).toEqual(expect.objectContaining({
+      type: FILE_TRANSFER_MSG.UPLOAD_FETCH,
+    }));
+    expect(sendFileTransferRequestMock.mock.calls[0]?.[1]).not.toHaveProperty('clientUploadId');
   });
 
   it('cleans relay-staged uploads after a successful daemon fetch grace window', async () => {
@@ -419,11 +670,74 @@ describe('file-transfer upload route', () => {
   });
 });
 
+describe('file-transfer attachment deletion route', () => {
+  beforeEach(() => {
+    sendFileTransferRequestMock.mockReset();
+    isDaemonConnectedMock.mockReset().mockReturnValue(true);
+    hasDaemonCapabilityMock.mockReset().mockReturnValue(true);
+    daemonConnectionGenerationMock.mockReset().mockReturnValue(1);
+    mockResolveServerMemberAccessOrShareDeny.mockReset().mockResolvedValue({ ok: true, role: 'owner' });
+    queryOneMock.mockReset().mockResolvedValue({ user_id: 'user-1', node_role: 'full', exec_enabled: true, revoked_at: null });
+    sendFileTransferRequestMock.mockResolvedValue({ type: FILE_TRANSFER_MSG.DELETE_DONE, requestId: 'a'.repeat(32) });
+  });
+
+  it('authorizes the member and relays an exact attachment delete request', async () => {
+    const response = await makeApp().request('/api/server/srv-1/uploads/abcdef1234.txt', {
+      method: 'DELETE',
+      headers: { Authorization: 'Bearer test' },
+    });
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({ ok: true });
+    expect(mockResolveServerMemberAccessOrShareDeny).toHaveBeenCalledWith(expect.anything(), {
+      serverId: 'srv-1',
+      userId: 'user-1',
+    });
+    expect(sendFileTransferRequestMock).toHaveBeenCalledWith(
+      'a'.repeat(32),
+      { type: FILE_TRANSFER_MSG.DELETE, requestId: 'a'.repeat(32), attachmentId: 'abcdef1234.txt' },
+      30_000,
+      undefined,
+      undefined,
+    );
+  });
+
+  it('rejects share-only attachment deletion before contacting the daemon', async () => {
+    mockResolveServerMemberAccessOrShareDeny.mockResolvedValueOnce({
+      ok: false,
+      reason: 'share-direct-surface-denied',
+    });
+
+    const response = await makeApp().request('/api/server/srv-1/uploads/abcdef1234.txt', {
+      method: 'DELETE',
+      headers: { Authorization: 'Bearer test' },
+    });
+
+    expect(response.status).toBe(403);
+    await expect(response.json()).resolves.toEqual({
+      error: 'forbidden',
+      reason: 'share-direct-surface-denied',
+    });
+    expect(mockResolveServerMemberAccessOrShareDeny).toHaveBeenCalledOnce();
+    expect(sendFileTransferRequestMock).not.toHaveBeenCalled();
+  });
+
+  it('rejects malformed attachment ids before contacting the daemon', async () => {
+    const response = await makeApp().request('/api/server/srv-1/uploads/not.valid.ext.more', {
+      method: 'DELETE',
+      headers: { Authorization: 'Bearer test' },
+    });
+    expect(response.status).toBe(400);
+    expect(sendFileTransferRequestMock).not.toHaveBeenCalled();
+  });
+});
+
 describe('file-transfer download route', () => {
   beforeEach(() => {
     sendFileTransferRequestMock.mockReset();
     isDaemonConnectedMock.mockReset();
     hasDaemonCapabilityMock.mockReset();
+    daemonConnectionGenerationMock.mockReset().mockReturnValue(1);
     isDaemonConnectedMock.mockReturnValue(true);
     hasDaemonCapabilityMock.mockReturnValue(true);
     mockResolveServerMemberAccessOrShareDeny.mockResolvedValue({ ok: true, role: 'owner' });

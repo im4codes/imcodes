@@ -23,6 +23,19 @@ import { redactObject, REDACTED, type Redactable, type LogLevel } from '../../..
 const RESOLVED_ALIASES_FIELD = 'resolvedAliases';
 
 /**
+ * Sibling field carrying `{ aliasName: authorNote }`. Not a secret in the same
+ * sense as a value, but it is private user-authored text that routinely
+ * describes what the secret is for ("prod read replica, revoke after use"), so
+ * it is scrubbed on the same terms rather than logged verbatim.
+ */
+const RESOLVED_ALIAS_NOTES_FIELD = 'resolvedAliasNotes';
+
+const SCRUBBED_ALIAS_FIELDS: ReadonlySet<string> = new Set([
+  RESOLVED_ALIASES_FIELD,
+  RESOLVED_ALIAS_NOTES_FIELD,
+]);
+
+/**
  * Return a structurally-cloned copy of `value` in which every `resolvedAliases`
  * field (at any depth, inside objects and arrays) has its value replaced by the
  * `[REDACTED]` marker. Never mutates the caller's object. Non-plain values are
@@ -40,7 +53,7 @@ function scrubResolvedAliases(value: unknown): unknown {
   if (value && typeof value === 'object') {
     const out: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
-      out[k] = k === RESOLVED_ALIASES_FIELD ? REDACTED : scrubResolvedAliases(v);
+      out[k] = SCRUBBED_ALIAS_FIELDS.has(k) ? REDACTED : scrubResolvedAliases(v);
     }
     return out;
   }

@@ -17,6 +17,7 @@ import type {
   SessionInfoUpdate,
   ProviderStatusUpdate,
   ProviderUsageUpdate,
+  ProviderDelegationNotification,
   ToolCallEvent,
 } from '../transport-provider.js';
 import {
@@ -41,6 +42,11 @@ import { getDefaultMcpServers } from './getDefaultMcpServers.js';
 import { claudeRateLimitsToQuotaMeta, type ClaudeRateLimitInfo } from '../claude-rate-limit.js';
 import { formatProviderQuotaLabel } from '../../../shared/provider-quota.js';
 import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../../shared/memory-mcp-server-name.js';
+import {
+  AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES,
+  AGENT_DELEGATION_NOTIFICATION_RESULTS,
+  type AgentDelegationNotificationResult,
+} from '../../../shared/agent-delegation.js';
 import { CLAUDE_SYNTHETIC_SEED_TEXT } from '../../shared/claude-synthetic-seed.js';
 import {
   SDK_SUBAGENT_DETAIL_KIND,
@@ -217,12 +223,12 @@ class SdkInputQueue implements AsyncIterable<SDKUserMessage> {
   private pendingResolve: ((result: IteratorResult<SDKUserMessage>) => void) | null = null;
   private ended = false;
 
-  push(text: string): void {
-    const message = {
+  push(input: string | SDKUserMessage): void {
+    const message = typeof input === 'string' ? {
       type: 'user',
-      message: { role: 'user', content: text },
+      message: { role: 'user', content: input },
       parent_tool_use_id: null,
-    } as SDKUserMessage;
+    } as SDKUserMessage : input;
     const resolve = this.pendingResolve;
     if (resolve) {
       this.pendingResolve = null;
@@ -417,6 +423,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     supportedEffortLevels: CLAUDE_SDK_EFFORT_LEVELS,
     contextSupport: 'full-normalized-context-injection',
     backgroundSubagentWake: BACKGROUND_SUBAGENT_WAKE_MODES.NATIVE,
+    activeDelegationNotification: AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE,
     compact: {
       execution: 'slash-command',
       providerCommand: '/compact',
@@ -753,6 +760,31 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       CONNECTION_CLOSED_CONTINUE_RETRY_LIMIT,
       CLAUDE_AUTH_REFRESH_RETRY_LIMIT,
     );
+  }
+
+  async notifyActiveDelegation(
+    sessionId: string,
+    notification: ProviderDelegationNotification,
+  ): Promise<AgentDelegationNotificationResult> {
+    const state = this.sessions.get(sessionId);
+    if (!state?.currentQuery || !state.inputQueue || state.cancelled) {
+      return AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE;
+    }
+    state.inputQueue.push({
+      type: 'user',
+      message: { role: 'user', content: notification.text },
+      parent_tool_use_id: null,
+      uuid: notification.notificationId,
+      priority: 'now',
+      origin: {
+        kind: 'peer',
+        from: notification.sourceSessionName,
+        name: notification.delegationId,
+      },
+      shouldQuery: true,
+      isSynthetic: true,
+    } as SDKUserMessage);
+    return AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED;
   }
 
   async cancel(sessionId: string): Promise<void> {

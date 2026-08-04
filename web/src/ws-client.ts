@@ -14,6 +14,7 @@ import { P2P_CONFIG_MSG } from '@shared/p2p-config-events.js';
 import { P2P_WORKFLOW_MSG, isP2pWorkflowRequestId } from '@shared/p2p-workflow-messages.js';
 import { TRANSPORT_EVENT } from '@shared/transport-events.js';
 import type { DiskUsage } from '@shared/disk-usage.js';
+import type { EmbeddingStatus } from '@shared/embedding-status.js';
 import type { MemoryShortRefHealth } from '@shared/memory-short-ref-health.js';
 import { P2P_CAPABILITY_FRESHNESS_TTL_MS } from '@shared/p2p-workflow-constants.js';
 import { TRANSPORT_MSG } from '@shared/transport-events.js';
@@ -73,6 +74,7 @@ import type {
   FsDeleteResponse,
 } from '../../src/shared/transport/fs.js';
 import type { DaemonBuildInfo } from '@shared/build-manifest-types.js';
+import type { DirectFileTransferServerMessage } from '@shared/direct-file-transfer.js';
 
 export type MessageHandler = (msg: ServerMessage) => void;
 
@@ -131,6 +133,7 @@ export type SessionEventReason =
 
 export type ServerMessage =
   | ResourceChangedMessage
+  | DirectFileTransferServerMessage
   | { type: 'terminal.diff'; diff: TerminalDiff }
   | { type: 'terminal.history'; sessionName: string; content: string }
   | { type: 'terminal.stream_reset'; session: string; reason: string }
@@ -200,7 +203,7 @@ export type ServerMessage =
   | { type: 'discussion.done'; discussionId: string; filePath: string; conclusion: string }
   | { type: 'discussion.error'; discussionId?: string; requestId?: string; error: string }
   | { type: 'discussion.list'; discussions: Array<{ id: string; requestId?: string; topic: string; state: string; currentRound: number; maxRounds: number; completedHops?: number; totalHops?: number; currentSpeaker?: string; conclusion?: string; filePath?: string }> }
-  | { type: 'daemon.stats'; daemonVersion?: string | null; cpu: number; memUsed: number; memTotal: number; load1: number; load5: number; load15: number; uptime: number; disks?: DiskUsage[]; shortRefHealth?: MemoryShortRefHealth }
+  | { type: 'daemon.stats'; daemonVersion?: string | null; cpu: number; memUsed: number; memTotal: number; load1: number; load5: number; load15: number; uptime: number; embedding?: EmbeddingStatus; disks?: DiskUsage[]; shortRefHealth?: MemoryShortRefHealth; directConnectivity?: import('@shared/direct-file-transfer.js').DirectConnectivityRuntimeStatus }
   | FsLsResponse
   | FsReadResponse
   | FsGitStatusResponse
@@ -369,6 +372,37 @@ function compactP2pWorkflowRequestScope(scope: P2pWorkflowRequestScope | null | 
 
 function utf8ByteLength(text: string): number {
   return new TextEncoder().encode(text).byteLength;
+}
+
+/** Envelope + margin for `{"type":"subsession.rebuild_all","subSessions":[…]}`. */
+const SUBSESSION_REBUILD_BATCH_BUDGET_BYTES = DEFAULT_OUTBOUND_WS_MESSAGE_MAX_BYTES - 2_048;
+
+/**
+ * Split a rebuild list into batches that each serialize under the outbound cap.
+ *
+ * Greedy by measured size rather than a fixed count: entries vary by more than
+ * an order of magnitude (a shell sub-session versus one carrying
+ * `transportConfig`), so any fixed count is either wasteful or still too large.
+ * An entry that cannot fit even alone still gets its own batch — the daemon
+ * rejecting one oversized record is recoverable, silently dropping it is not.
+ */
+export function chunkSubSessionRebuildBatches<T>(items: readonly T[]): T[][] {
+  if (items.length === 0) return [];
+  const batches: T[][] = [];
+  let current: T[] = [];
+  let currentBytes = 0;
+  for (const item of items) {
+    const itemBytes = utf8ByteLength(JSON.stringify(item)) + 1; // +1 for the comma
+    if (current.length > 0 && currentBytes + itemBytes > SUBSESSION_REBUILD_BATCH_BUDGET_BYTES) {
+      batches.push(current);
+      current = [];
+      currentBytes = 0;
+    }
+    current.push(item);
+    currentBytes += itemBytes;
+  }
+  if (current.length > 0) batches.push(current);
+  return batches;
 }
 
 function maxOutboundMessageBytes(msg: object): number {
@@ -1056,7 +1090,23 @@ export class WsClient {
   }
 
   subSessionRebuildAll(subSessions: Array<{ id: string; type: string; runtimeType?: 'process' | 'transport' | null; providerId?: string | null; providerSessionId?: string | null; shellBin?: string | null; cwd?: string | null; ccSessionId?: string | null; geminiSessionId?: string | null; parentSession?: string | null; label?: string | null; ccPresetId?: string | null; requestedModel?: string | null; activeModel?: string | null; effort?: import('../../shared/effort-levels.js').TransportEffortLevel | null; transportConfig?: Record<string, unknown> | null }>): void {
-    this.send({ type: 'subsession.rebuild_all', subSessions });
+    // Send in size-bounded batches.
+    //
+    // One message carrying every sub-session crosses the 60 KB outbound cap at
+    // roughly 150 of them, and `send` answers that by THROWING. The throw
+    // escaped the effect that calls this, which aborted the rest of that
+    // effect flush — including the effect immediately after it that opens the
+    // transport chat subscriptions for those same sub-sessions. With no
+    // subscriber the server discards their live timeline events, so their
+    // replies only reappeared through history backfill: the typewriter stopped
+    // for sub-sessions while main sessions, subscribed in an earlier flush,
+    // were untouched.
+    //
+    // `rebuildSubSessions` on the daemon upserts per item and prunes nothing,
+    // so splitting the list is equivalent to sending it whole.
+    for (const batch of chunkSubSessionRebuildBatches(subSessions)) {
+      this.send({ type: 'subsession.rebuild_all', subSessions: batch });
+    }
   }
 
   subSessionDetectShells(): void {

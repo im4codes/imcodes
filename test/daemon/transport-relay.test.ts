@@ -51,6 +51,7 @@ import { timelineEmitter } from '../../src/daemon/timeline-emitter.js';
 import { appendTransportEvent } from '../../src/daemon/transport-history.js';
 
 import {
+  PROVIDER_CANCEL_ORIGINS,
   PROVIDER_ERROR_CODES,
   SDK_TURN_LOST_RECOVERY_CLASSIFIERS,
   SDK_TURN_LOST_RECOVERY_PHASES,
@@ -999,6 +1000,40 @@ describe('transport-relay (timeline-emitter based)', () => {
       // Nothing streamed → nothing to persist.
       expect(appendMock.mock.calls.some(c => c[1]?.type === 'assistant.text')).toBe(false);
       expect(emitMock.mock.calls.some(c => c[1] === 'session.state')).toBe(false);
+    });
+
+    it('labels watchdog recovery distinctly from a user cancellation and persists it', async () => {
+      const { provider, fireError } = makeMockProvider();
+      wireProviderToRelay(provider);
+      emitMock.mockClear();
+      appendMock.mockClear();
+
+      fireError('sess-watchdog', {
+        code: PROVIDER_ERROR_CODES.CANCELLED,
+        message: 'OpenCode was unresponsive and was automatically recovered.',
+        recoverable: true,
+        details: {
+          cancelOrigin: PROVIDER_CANCEL_ORIGINS.STALE_WATCHDOG,
+          reason: 'health-poll-stale-active-turn',
+        },
+      });
+      await Promise.resolve();
+
+      const textCall = emitMock.mock.calls.find(c => c[1] === 'assistant.text');
+      expect(textCall?.[2]).toMatchObject({
+        text: '⚠️ OpenCode was unresponsive and was automatically recovered.',
+        streaming: false,
+        memoryExcluded: true,
+        automation: true,
+        providerErrorCode: PROVIDER_ERROR_CODES.CANCELLED,
+        providerErrorRecoverable: true,
+        providerCancelOrigin: PROVIDER_CANCEL_ORIGINS.STALE_WATCHDOG,
+      });
+      expect(appendMock).toHaveBeenCalledWith('sess-watchdog', {
+        type: 'assistant.text',
+        sessionId: 'sess-watchdog',
+        text: '⚠️ OpenCode was unresponsive and was automatically recovered.',
+      });
     });
 
     it('recognizes typed sdk_turn_lost with a machine-readable helper, not message parsing', () => {

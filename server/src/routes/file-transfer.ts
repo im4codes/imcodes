@@ -12,17 +12,31 @@ import {
   FILE_TRANSFER_UPLOAD_ERROR_CODE,
   FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY,
   FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY,
+  FILE_TRANSFER_DELETE_ERROR,
   FILE_TRANSFER_PATH_HANDLE_CAPABILITY,
   FILE_TRANSFER_PATH_MAX_BYTES,
   FILE_TRANSFER_MSG,
+  validateFileDeleteRequest,
   validateFilePathHandleRequest,
 } from '../../../shared/transport/file-transfer.js';
+import { DIRECT_FILE_TRANSFER_CAPABILITY, isDirectFileTransferClientUploadId } from '../../../shared/direct-file-transfer.js';
+import {
+  MACHINE_DIRECT_FILE_TRANSFER_CAPABILITY,
+  MACHINE_DIRECT_FILE_FETCH_CAPABILITY,
+  MACHINE_DIRECT_FILE_TRANSFER_LIMITS,
+  MACHINE_DIRECT_FILE_TRANSFER_MSG,
+  refreshMachineDirectUploadAuthority,
+  refreshMachineDirectFetchAuthority,
+  validateMachineDirectFetchRequest,
+  validateMachineDirectUploadRequest,
+} from '../../../shared/machine-direct-file-transfer.js';
 import { FS_GENERIC_ERROR_CODES } from '../../../shared/fs-error-codes.js';
 import type {
   AttachmentRef,
   FileDownloadRequest,
   FileDownloadStreamRequest,
   FilePathHandleRequest,
+  FileDeleteRequest,
   FileUploadFetchRequest,
   FileUploadRequest,
 } from '../../../shared/transport/file-transfer.js';
@@ -320,7 +334,10 @@ const authMiddleware = requireAuth();
 
 fileTransferRoutes.use('/:id/upload', authMiddleware);
 fileTransferRoutes.use('/:id/machine-file-handle', authMiddleware);
+fileTransferRoutes.use('/:id/machine-direct-upload', authMiddleware);
+fileTransferRoutes.use('/:id/machine-direct-fetch', authMiddleware);
 fileTransferRoutes.use('/:id/uploads/:attachmentId/download-token', authMiddleware);
+fileTransferRoutes.use('/:id/uploads/:attachmentId', authMiddleware);
 fileTransferRoutes.use('/:id/uploads/:attachmentId/download', async (c, next) => {
   // Token-based auth bypass for native downloads (system browser has no app auth)
   const token = c.req.query('token');
@@ -347,7 +364,7 @@ fileTransferRoutes.use('/:id/uploads/:attachmentId/download', async (c, next) =>
 });
 
 type ControlledTargetGate =
-  | { ok: true; bridge: ReturnType<typeof WsBridge.get>; controlled: boolean }
+  | { ok: true; bridge: ReturnType<typeof WsBridge.get>; controlled: boolean; daemonGeneration?: number }
   | { ok: false; reason: 'scoped_auth' | 'target_forbidden' | 'exec_disabled' | 'daemon_offline' | 'capability_unavailable' };
 
 async function authorizeControlledFileTarget(
@@ -380,8 +397,12 @@ async function authorizeControlledFileTarget(
   if (target.user_id !== userId || target.revoked_at != null) return { ok: false, reason: 'target_forbidden' };
   if (!target.exec_enabled) return { ok: false, reason: 'exec_disabled' };
   if (!bridge.isDaemonConnected()) return { ok: false, reason: 'daemon_offline' };
+  // Capture the exact socket generation synchronously with the capability
+  // observation. Callers can spend time reading/validating request bodies, but
+  // must never dispatch the authorized command to a replacement generation.
+  const daemonGeneration = bridge.daemonConnectionGeneration();
   if (!bridge.hasDaemonCapability(capability)) return { ok: false, reason: 'capability_unavailable' };
-  return { ok: true, bridge, controlled: true };
+  return { ok: true, bridge, controlled: true, daemonGeneration };
 }
 
 function controlledTargetGateError(c: Context, reason: Exclude<ControlledTargetGate, { ok: true }>['reason']): Response {
@@ -537,6 +558,8 @@ fileTransferRoutes.post('/:id/machine-file-handle', async (c) => {
       requestId,
       parsed.value as FilePathHandleRequest as unknown as Record<string, unknown>,
       FILE_TRANSFER_LIMITS.DOWNLOAD_TIMEOUT_MS,
+      undefined,
+      gate.daemonGeneration,
     );
     if (result.type === FILE_TRANSFER_MSG.PATH_HANDLE_ERROR) {
       const reason = typeof result.error === 'string' ? result.error : 'path_handle_failed';
@@ -557,6 +580,71 @@ fileTransferRoutes.post('/:id/machine-file-handle', async (c) => {
     if (reason === 'timeout') return c.json({ error: 'timeout' }, 504);
     logger.error({ serverId, err }, 'Controlled node path handle failed');
     return c.json({ error: 'path_handle_failed' }, 500);
+  }
+});
+
+fileTransferRoutes.post('/:id/machine-direct-upload', async (c) => {
+  const serverId = c.req.param('id')!;
+  const gate = await authorizeControlledFileTarget(c, serverId, MACHINE_DIRECT_FILE_TRANSFER_CAPABILITY, true);
+  if (!gate.ok) return controlledTargetGateError(c, gate.reason);
+  const body = await readBoundedJsonObject(c.req.raw, MACHINE_DIRECT_FILE_TRANSFER_LIMITS.MAX_CONTROL_BYTES);
+  if (!body.ok) return c.json({ error: body.tooLarge ? 'body_too_large' : 'invalid_body' }, body.tooLarge ? 413 : 400);
+  const parsed = validateMachineDirectUploadRequest(body.value);
+  if (!parsed.ok) return c.json({ error: parsed.error }, 400);
+  // The request reached this authenticated, pod-sticky endpoint now. Re-mint
+  // its short authority window from the Server clock so source clock skew can
+  // neither reject a fresh request nor create a long-lived target authority.
+  const forwarded = refreshMachineDirectUploadAuthority(parsed.value);
+  try {
+    const result = await gate.bridge.sendFileTransferRequest(
+      forwarded.requestId,
+      forwarded as unknown as Record<string, unknown>,
+      MACHINE_DIRECT_FILE_TRANSFER_LIMITS.TRANSFER_TIMEOUT_MS,
+      undefined,
+      gate.daemonGeneration,
+    );
+    if (result.type !== MACHINE_DIRECT_FILE_TRANSFER_MSG.DONE) {
+      return c.json({ error: typeof result.error === 'string' ? result.error : 'direct_failed' }, 409);
+    }
+    const attachment = result.attachment as AttachmentRef;
+    attachment.serverId = serverId;
+    return c.json({ type: MACHINE_DIRECT_FILE_TRANSFER_MSG.DONE, requestId: forwarded.requestId, attachment });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (message === 'timeout') return c.json({ error: 'direct_timeout' }, 504);
+    if (message === 'request_id_conflict') return c.json({ error: message }, 409);
+    return c.json({ error: 'daemon_offline' }, 503);
+  }
+});
+
+fileTransferRoutes.post('/:id/machine-direct-fetch', async (c) => {
+  const serverId = c.req.param('id')!;
+  const gate = await authorizeControlledFileTarget(c, serverId, MACHINE_DIRECT_FILE_FETCH_CAPABILITY, true);
+  if (!gate.ok) return controlledTargetGateError(c, gate.reason);
+  const body = await readBoundedJsonObject(c.req.raw, MACHINE_DIRECT_FILE_TRANSFER_LIMITS.MAX_CONTROL_BYTES);
+  if (!body.ok) return c.json({ error: body.tooLarge ? 'body_too_large' : 'invalid_body' }, body.tooLarge ? 413 : 400);
+  const parsed = validateMachineDirectFetchRequest(body.value);
+  if (!parsed.ok) return c.json({ error: parsed.error }, 400);
+  const forwarded = refreshMachineDirectFetchAuthority(parsed.value);
+  try {
+    const result = await gate.bridge.sendFileTransferRequest(
+      forwarded.requestId,
+      forwarded as unknown as Record<string, unknown>,
+      MACHINE_DIRECT_FILE_TRANSFER_LIMITS.TRANSFER_TIMEOUT_MS,
+      undefined,
+      gate.daemonGeneration,
+    );
+    if (result.type !== MACHINE_DIRECT_FILE_TRANSFER_MSG.FETCH_DONE
+      || result.requestId !== forwarded.requestId
+      || typeof result.size !== 'number') {
+      return c.json({ error: typeof result.error === 'string' ? result.error : 'direct_failed' }, 409);
+    }
+    return c.json({ type: MACHINE_DIRECT_FILE_TRANSFER_MSG.FETCH_DONE, requestId: forwarded.requestId, size: result.size });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (message === 'timeout') return c.json({ error: 'direct_timeout' }, 504);
+    if (message === 'request_id_conflict') return c.json({ error: message }, 409);
+    return c.json({ error: 'daemon_offline' }, 503);
   }
 });
 
@@ -593,6 +681,10 @@ fileTransferRoutes.post('/:id/upload', async (c) => {
 
   const file = formData.get('file');
   if (!file || !(file instanceof File)) return c.json({ error: 'missing_file' }, 400);
+  const rawClientUploadId = formData.get('clientUploadId');
+  const clientUploadId = typeof rawClientUploadId === 'string' && isDirectFileTransferClientUploadId(rawClientUploadId)
+    ? rawClientUploadId
+    : undefined;
 
   // Size check
   if (file.size > FILE_TRANSFER_LIMITS.MAX_FILE_SIZE) {
@@ -607,6 +699,14 @@ fileTransferRoutes.post('/:id/upload', async (c) => {
   if (!bridge.isDaemonConnected()) {
     return c.json({ error: 'daemon_offline' }, 503);
   }
+  // Old controlled daemons use an exact-key request validator. Only include
+  // the new dedupe field when this daemon explicitly advertised direct-v1.
+  const negotiatedClientUploadId = (
+    bridge.hasDaemonCapability(DIRECT_FILE_TRANSFER_CAPABILITY)
+    || bridge.hasDaemonCapability(MACHINE_DIRECT_FILE_TRANSFER_CAPABILITY)
+  )
+    ? clientUploadId
+    : undefined;
 
   // Generate upload ID and sanitized filename
   const uploadId = randomHex(16);
@@ -663,6 +763,7 @@ fileTransferRoutes.post('/:id/upload', async (c) => {
       mime: file.type || undefined,
       size: file.size,
       downloadUrl: buildStagedUploadUrl(c.req.url, c.env.SERVER_URL, serverId, uploadId, token),
+      ...(negotiatedClientUploadId ? { clientUploadId: negotiatedClientUploadId } : {}),
     };
   } else {
     uploadMsg = {
@@ -673,6 +774,7 @@ fileTransferRoutes.post('/:id/upload', async (c) => {
       mime: file.type || undefined,
       size: file.size,
       content: (await readFile(stagedPath)).toString('base64'),
+      ...(negotiatedClientUploadId ? { clientUploadId: negotiatedClientUploadId } : {}),
     };
   }
 
@@ -683,6 +785,7 @@ fileTransferRoutes.post('/:id/upload', async (c) => {
         uploadMsg as unknown as Record<string, unknown>,
         FILE_TRANSFER_LIMITS.UPLOAD_TIMEOUT_MS,
         onProgress,
+        controlledGate.daemonGeneration,
       );
 
       if (result.type === 'file.upload_error') {
@@ -739,6 +842,7 @@ fileTransferRoutes.post('/:id/upload', async (c) => {
           uploadMsg as unknown as Record<string, unknown>,
           FILE_TRANSFER_LIMITS.UPLOAD_TIMEOUT_MS,
           (msg) => write(msg),
+          controlledGate.daemonGeneration,
         );
 
         if (result.type === 'file.upload_error') {
@@ -779,6 +883,45 @@ fileTransferRoutes.post('/:id/upload', async (c) => {
       'Cache-Control': 'no-store',
     },
   });
+});
+
+// ── DELETE /api/server/:id/uploads/:attachmentId ───────────────────────────
+
+fileTransferRoutes.delete('/:id/uploads/:attachmentId', async (c) => {
+  const userId = c.get('userId' as never) as string;
+  const serverId = c.req.param('id')!;
+  const attachmentId = c.req.param('attachmentId')!;
+
+  const access = await resolveServerMemberAccessOrShareDeny(c.env.DB, { serverId, userId });
+  if (!access.ok) return c.json({ error: 'forbidden', reason: access.reason }, 403);
+  const gate = await authorizeControlledFileTarget(c, serverId, FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY, false);
+  if (!gate.ok) return controlledTargetGateError(c, gate.reason);
+  if (!gate.bridge.isDaemonConnected()) return c.json({ error: 'daemon_offline' }, 503);
+
+  const requestId = randomHex(16);
+  const parsed = validateFileDeleteRequest({ type: FILE_TRANSFER_MSG.DELETE, requestId, attachmentId });
+  if (!parsed.ok) return c.json({ error: 'invalid_attachment_id' }, 400);
+
+  try {
+    const result = await gate.bridge.sendFileTransferRequest(
+      requestId,
+      parsed.value as FileDeleteRequest as unknown as Record<string, unknown>,
+      30_000,
+      undefined,
+      gate.daemonGeneration,
+    );
+    if (result.type === FILE_TRANSFER_MSG.DELETE_DONE) return c.json({ ok: true });
+    const reason = typeof result.error === 'string' ? result.error : FILE_TRANSFER_DELETE_ERROR.DELETE_FAILED;
+    return c.json({ error: reason }, reason === FILE_TRANSFER_DELETE_ERROR.FORBIDDEN ? 403 : 500);
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    if (reason === 'daemon_offline' || reason === 'daemon_disconnected' || reason === 'daemon_generation_changed') {
+      return c.json({ error: 'daemon_offline' }, 503);
+    }
+    if (reason === 'timeout') return c.json({ error: 'timeout' }, 504);
+    logger.error({ serverId, attachmentId, error }, 'Attachment deletion failed');
+    return c.json({ error: FILE_TRANSFER_DELETE_ERROR.DELETE_FAILED }, 500);
+  }
 });
 
 // ── POST /api/server/:id/uploads/:attachmentId/download-token ────────────────

@@ -5,6 +5,8 @@ import {
   AGENT_DELEGATION_CONTEXT_OMITTED_MARKER,
   AGENT_DELEGATION_CONTEXT_TRUNCATED_MARKER,
   AGENT_DELEGATION_REPLY_INSTRUCTION_MARKER,
+  AGENT_DELEGATION_STRUCTURED_REPLY_INSTRUCTION_MARKER,
+  AGENT_DELEGATION_REPLY_VERSION,
   AGENT_DELEGATION_TARGET_FIELD,
   DELEGATION_REPLY_CAPABLE_AGENT_TYPES,
   DELEGATION_REPLY_CAPABLE_PROCESS_AGENT_TYPES,
@@ -19,6 +21,8 @@ import {
   buildAgentDelegationOrchestrationPrompt,
   buildAgentDelegationReplyInstruction,
   buildQuickAgentDelegationTask,
+  decodeAgentDelegationReplyEnvelope,
+  extractAgentDelegationReplyAuthorityFromInstruction,
   findForbiddenAgentDelegationCommandFields,
   findMixedAgentDelegationP2pFields,
   hasAgentDelegationTargetField,
@@ -188,6 +192,50 @@ describe('agent delegation shared contract', () => {
     expect(isAgentDelegationControlInstructionText(instruction)).toBe(true);
   });
 
+  it('builds and validates one structured correlated delegation reply', () => {
+    const delegationId = 'delegation_identity_1234567890';
+    const replyCapability = 'reply_capability_1234567890_ABCDEFG';
+    const instruction = buildAgentDelegationReplyInstruction('deck_repo_brain', {
+      delegationId,
+      replyCapability,
+    });
+    expect(instruction).toContain(AGENT_DELEGATION_STRUCTURED_REPLY_INSTRUCTION_MARKER);
+    expect(instruction).toContain('delegation_reply');
+    expect(instruction).toContain(delegationId);
+    expect(instruction).toContain(replyCapability);
+    expect(instruction).not.toContain('send your response using: imcodes send');
+    expect(stripAgentDelegationControlInstructions(`task\n${instruction}`)).toBe('task');
+    expect(extractAgentDelegationReplyAuthorityFromInstruction(instruction)).toEqual({
+      delegationId,
+      replyCapability,
+    });
+    expect(extractAgentDelegationReplyAuthorityFromInstruction(
+      `${AGENT_DELEGATION_STRUCTURED_REPLY_INSTRUCTION_MARKER} {"delegationId":"${delegationId}","replyCapability":"${replyCapability}","forged":true}`,
+    )).toBeUndefined();
+
+    expect(decodeAgentDelegationReplyEnvelope({
+      version: AGENT_DELEGATION_REPLY_VERSION,
+      delegationId,
+      replyCapability,
+      result: 'PASS with evidence',
+    })).toEqual({
+      ok: true,
+      value: {
+        version: AGENT_DELEGATION_REPLY_VERSION,
+        delegationId,
+        replyCapability,
+        result: 'PASS with evidence',
+      },
+    });
+    expect(decodeAgentDelegationReplyEnvelope({
+      version: AGENT_DELEGATION_REPLY_VERSION,
+      delegationId,
+      replyCapability,
+      result: 'ok',
+      forged: true,
+    })).toEqual({ ok: false, error: 'unknown_field' });
+  });
+
   it('builds a current-session orchestration prompt for UI-picked single-agent delegation', () => {
     const prompt = buildAgentDelegationOrchestrationPrompt({
       targetSession: 'deck_repo_w1',
@@ -202,7 +250,7 @@ describe('agent delegation shared contract', () => {
     expect(prompt).toContain('imcodes send --reply "deck_repo_w1"');
     expect(prompt).not.toContain('imcodes send --no-reply "deck_repo_w1"');
     expect(prompt).toContain('do not poll the delegate, session status, logs, or transcripts');
-    expect(prompt).toContain('normal incoming message');
+    expect(prompt).toContain('one-time structured reply capability');
     expect(prompt).toContain('multiple @ delegates');
     expect(prompt).toContain('separate per-delegate briefs');
     expect(prompt).toContain('each delegate result separately');

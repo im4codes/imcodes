@@ -7,6 +7,7 @@ import { ServerLink, setServerLinkReconnectResyncHandler } from './server-link.j
 import { handleWebCommand, setRouterContext, refreshCodexQuotaMetadata, refreshClaudeSdkSubQuotaMetadata } from './command-handler.js';
 import { dispatchSessionMessageByName } from './session-dispatch.js';
 import { initFileTransfer, startCleanupTimer } from './file-transfer-handler.js';
+import { initializeDirectFileTransfer, shutdownDirectFileTransfers } from './direct-file-transfer.js';
 import { loadMemoryShortRefsFromStore } from '../context/memory-short-ref.js';
 import { notifySessionIdle, listP2pRuns, serializeP2pRun } from './p2p-orchestrator.js';
 import { isP2pParticipantMemoryNoise } from './p2p-memory-filter.js';
@@ -540,6 +541,7 @@ export async function startup(): Promise<DaemonContext> {
   await initFileTransfer();
   startCleanupTimer();
   logger.info('File transfer initialized');
+  await initializeDirectFileTransfer();
 
   // Warm the memory short-ref index so handles injected before this restart
   // still resolve. Resolution is synchronous (it runs inside render paths), so
@@ -700,6 +702,22 @@ export async function startup(): Promise<DaemonContext> {
     // each RE-connect, re-broadcast every transport session's current state.
     setServerLinkReconnectResyncHandler(() => {
       resyncTransportSessionStatesAfterLinkRestore();
+      // Sub-sessions need the same treatment, for a reason that bites harder.
+      // The server drops its entire `activeSubSessions` map when the daemon
+      // socket closes, and that map is what authorizes a browser's
+      // `chat.subscribe` for `deck_sub_*` (a sub-session has no row in the
+      // `sessions` table, so the only other route is a `sub_sessions` DB
+      // lookup). It is repopulated solely by `subsession.sync`, which this
+      // restore broadcast sends — and which was wired to daemon STARTUP only.
+      //
+      // So one socket blip was permanent: the map stayed empty, every
+      // sub-session subscribe was rejected, and the server then discarded
+      // their live timeline events for having no subscribed viewer. The chat
+      // still filled in via HTTP backfill, so the turn's text arrived in one
+      // block at the end and streaming looked broken for sub-sessions while
+      // main sessions (authorized straight from the `sessions` table) were
+      // unaffected.
+      scheduleServerLinkRestoreBroadcast?.();
     });
     serverLink.onMessage((msg) => {
       handleWebCommand(msg, serverLink!);
@@ -716,8 +734,16 @@ export async function startup(): Promise<DaemonContext> {
 
     // Broadcast cached repo detections after connect so browsers that missed
     // the initial repo.detected push (e.g. connected late, reconnected) get the data.
+    //
+    // Now that a reconnect also schedules this, a flapping link would otherwise
+    // stack one pending broadcast per reconnect and replay the whole session
+    // list several times over. Keep at most one armed: the newest reconnect is
+    // the one whose state is worth sending.
+    let restoreBroadcastTimer: ReturnType<typeof setTimeout> | null = null;
     scheduleServerLinkRestoreBroadcast = () => {
+      if (restoreBroadcastTimer) clearTimeout(restoreBroadcastTimer);
       const timer = setTimeout(() => {
+        restoreBroadcastTimer = null;
         if (!serverLink) return;
         for (const session of listSessions()) {
           const dir = session.projectDir;
@@ -789,6 +815,7 @@ export async function startup(): Promise<DaemonContext> {
           } catch { /* ignore */ }
         }
       }, 3_000); // delay to ensure WS auth handshake completes first
+      restoreBroadcastTimer = timer;
       timer.unref?.();
     };
   }
@@ -1176,6 +1203,14 @@ export async function startup(): Promise<DaemonContext> {
     slowWarmRestoreTransportProviders,
     startupBackgroundBaseDelayMs + STARTUP_TRANSPORT_SLOW_RESTORE_DELAY_MS,
   );
+  scheduleDaemonStartupBackgroundTask(
+    'delegation reply outbox resume',
+    async () => {
+      const { resumePendingDelegationReplies } = await import('./delegation-reply-ingress.js');
+      resumePendingDelegationReplies();
+    },
+    startupBackgroundBaseDelayMs + STARTUP_TRANSPORT_RESTORE_DELAY_MS + 1_000,
+  );
   if (creds && startupWorkerSessionSyncOutcome && startupWorkerSessionSyncOutcome.retryable) {
     workerSessionSyncRetrier?.stop();
     workerSessionSyncRetrier = createWorkerSessionSyncRetrier({
@@ -1357,6 +1392,10 @@ export async function shutdown(exitCode = 0): Promise<void> {
   // timeline and queue stores are drained.
   peerAuditService.shutdown();
 
+  await shutdownDirectFileTransfers().catch((err) => {
+    logger.warn({ err }, 'Daemon shutdown direct file transfer cleanup failed');
+  });
+
   // Kill all ConPTY sessions (they don't survive daemon exit like tmux)
   if ((BACKEND as string) === 'conpty') {
     try {
@@ -1494,7 +1533,7 @@ const HEALTH_POLL_MS = 30_000;
 // long-thinking latency, but not so high that a memory-compression/app-server
 // finalize miss leaves the UI "working" for a whole operator session. Active
 // tool calls still use the runtime's longer tool-aware floor.
-const TRANSPORT_STALE_ACTIVE_TURN_RECOVERY_MS = 5 * 60_000;
+const TRANSPORT_STALE_ACTIVE_TURN_RECOVERY_MS = 12 * 60_000;
 const MEMORY_COMPRESSION_AUTO_CONTINUE_AFTER_MS = 6 * 60_000;
 const CODEX_STALE_ACTIVE_TURN_AUTO_CONTINUE_AFTER_MS = 12 * 60_000;
 const CODEX_QUOTA_REFRESH_MS = 60_000;

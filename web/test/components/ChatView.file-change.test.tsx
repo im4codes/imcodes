@@ -44,6 +44,8 @@ vi.mock('react-i18next', () => ({
         'peerAuditResult.findingsPreview': 'Findings',
         'peerAuditQuick.result_unavailable': 'Peer auditor unavailable.',
         'peerAuditQuick.disposition.sent_unrevocable': 'sent (cannot revoke)',
+        'delegation.reply_title': 'Delegation reply',
+        'delegation.reply_from': `From ${vars?.source ?? ''}`,
       };
       return map[key] ?? key;
     },
@@ -443,6 +445,10 @@ describe('isUserVisible', () => {
   it('treats peer audit results as visible reconnect-safe chat content', () => {
     expect(isUserVisible({ type: 'peer_audit.result', payload: {} })).toBe(true);
   });
+
+  it('treats delegation replies as visible reconnect-safe chat content', () => {
+    expect(isUserVisible({ type: 'delegation.reply', payload: {} })).toBe(true);
+  });
 });
 
 describe('ChatView peer-audit result cards', () => {
@@ -464,5 +470,44 @@ describe('ChatView peer-audit result cards', () => {
     expect(card?.textContent).toContain('sent (cannot revoke)');
     expect(card?.textContent).toContain('Peer CC');
     expect(card?.textContent).not.toContain('target_unavailable');
+  });
+});
+
+describe('ChatView delegation reply cards', () => {
+  it('renders the reply source and full result without exposing notification framing', () => {
+    const event = makeEvent('delegation.reply', {
+      memoryExcluded: true,
+      sourceSessionName: 'deck_sub_reviewer',
+      sourceLabel: 'CC0',
+      result: 'PASS with exact evidence.',
+    }, { eventId: 'delegation-reply-1' });
+    const { container } = render(
+      <ChatView events={[event]} loading={false} sessionId="session-a" />,
+    );
+
+    const card = container.querySelector('.delegation-reply-card');
+    expect(card?.getAttribute('data-event-id')).toBe('delegation-reply-1');
+    expect(card?.textContent).toContain('Delegation reply');
+    expect(card?.textContent).toContain('From CC0');
+    expect(card?.textContent).toContain('PASS with exact evidence.');
+    expect(card?.textContent).not.toContain('<imcodes-delegation-completed-v1>');
+  });
+
+  it('renders a long audit reply completely in one non-collapsing card', () => {
+    const result = Array.from({ length: 80 }, (_, index) => `Audit evidence line ${index + 1}`).join('\n');
+    const event = makeEvent('delegation.reply', {
+      memoryExcluded: true,
+      sourceSessionName: 'deck_sub_reviewer',
+      sourceLabel: 'CC0',
+      result,
+    }, { eventId: 'delegation-reply-long' });
+    const { container } = render(
+      <ChatView events={[event]} loading={false} sessionId="session-a" />,
+    );
+
+    const cards = container.querySelectorAll('.delegation-reply-card');
+    expect(cards).toHaveLength(1);
+    expect(cards[0]?.textContent).toContain('Audit evidence line 1');
+    expect(cards[0]?.textContent).toContain('Audit evidence line 80');
   });
 });

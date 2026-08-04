@@ -1,10 +1,11 @@
 import { randomUUID } from 'node:crypto';
+import type { AliasSendAudit } from '../../shared/alias-types.js';
 import type { SessionRuntime } from './session-runtime.js';
 import { RUNTIME_TYPES } from './session-runtime.js';
 import type { AgentStatus } from './detect.js';
 import type { AgentMessage, MessageDelta } from '../../shared/agent-message.js';
-import type { TransportProvider, ProviderError, ProviderRolloutCompletionReconcileOptions, SessionConfig, SessionInfoUpdate, ProviderStatusUpdate, ProviderUsageUpdate, ToolCallEvent, SdkTurnLostRecoveryPhase, SdkTurnLostReplayDecision } from './transport-provider.js';
-import { BACKGROUND_SUBAGENT_WAKE_MODES, PROVIDER_ERROR_CODES, SDK_TURN_LOST_RECOVERY_PHASES, SDK_TURN_LOST_RECOVERY_STATUS } from './transport-provider.js';
+import type { TransportProvider, ProviderDelegationNotification, ProviderError, ProviderRolloutCompletionReconcileOptions, SessionConfig, SessionInfoUpdate, ProviderStatusUpdate, ProviderUsageUpdate, ToolCallEvent, SdkTurnLostRecoveryPhase, SdkTurnLostReplayDecision } from './transport-provider.js';
+import { BACKGROUND_SUBAGENT_WAKE_MODES, PROVIDER_CANCEL_ORIGINS, PROVIDER_ERROR_CODES, SDK_TURN_LOST_RECOVERY_PHASES, SDK_TURN_LOST_RECOVERY_STATUS } from './transport-provider.js';
 import type { ApprovalRequest } from './transport-provider.js';
 import type { TransportEffortLevel } from '../../shared/effort-levels.js';
 import {
@@ -91,6 +92,11 @@ import { incrementCounter } from '../util/metrics.js';
 import type { SharedActorEnvelope } from '../../shared/tab-sharing.js';
 import { getTransportQueueStore } from '../daemon/transport-queue-store.js';
 import type { PeerAuditCompletedTurnEvidence } from '../../shared/peer-audit.js';
+import {
+  AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES,
+  AGENT_DELEGATION_NOTIFICATION_RESULTS,
+  type AgentDelegationNotificationResult,
+} from '../../shared/agent-delegation.js';
 
 export interface PendingTransportMessage {
   clientMessageId: string;
@@ -103,6 +109,13 @@ export interface PendingTransportMessage {
    * expansion happened and `text` is delivered verbatim.
    */
   providerText?: string;
+  /**
+   * Alias send audit anchor (names + SHA-256, never plaintext). Rides the queued
+   * entry so a message dispatched after a drain, a reconnect, or a daemon
+   * restart still projects the anchor onto its final timeline `user.message` —
+   * without it, only immediately-sent messages were auditable.
+   */
+  aliasAudit?: AliasSendAudit;
   /** Provider-visible per-turn context rendered through the shared context preamble path. */
   messagePreamble?: string;
   attachments?: TransportAttachment[];
@@ -116,6 +129,10 @@ export interface PendingTransportMessage {
   peerAudit?: {
     contractVersion: string;
     attemptHash: string;
+  };
+  /** @internal: private completed-delegation notification; excluded from public snapshots and memory recall. */
+  delegationReply?: {
+    delegationId: string;
   };
 }
 
@@ -148,7 +165,10 @@ function publicPendingEntry(entry: PendingTransportMessage): PendingTransportMes
   // full material for internal resend preservation only.
   delete publicEntry.providerText;
   delete publicEntry.messagePreamble;
+  // `aliasAudit` deliberately survives: it holds only referenced names and a
+  // hash, and the onDrain consumer needs it to anchor the final user.message.
   delete publicEntry.peerAudit;
+  delete publicEntry.delegationReply;
   return publicEntry;
 }
 
@@ -160,6 +180,8 @@ export interface TransportSendMetadata {
    * `message`. Absent ⇒ `message` is delivered verbatim.
    */
   providerText?: string;
+  /** Alias send audit anchor to project onto this message's timeline event. */
+  aliasAudit?: AliasSendAudit;
   /**
    * Where to place this message when a provider turn is already active.
    * `front` is reserved for out-of-band dialog answers (ask.answer):
@@ -176,6 +198,10 @@ export interface TransportSendMetadata {
   peerAudit?: {
     contractVersion: string;
     attemptHash: string;
+  };
+  /** @internal: marks a provider/runtime-native delegation completion. */
+  delegationReply?: {
+    delegationId: string;
   };
 }
 
@@ -255,7 +281,7 @@ const TRANSPORT_STALE_ACTIVE_TURN_WITH_TOOL_MS = (() => {
 })();
 const TRANSPORT_STALE_SILENT_ACTIVE_TURN_MS = (() => {
   const raw = Number.parseInt(process.env.IMCODES_TRANSPORT_STALE_SILENT_ACTIVE_TURN_MS ?? '', 10);
-  return Number.isFinite(raw) && raw >= 60_000 ? raw : 5 * 60_000;
+  return Number.isFinite(raw) && raw >= 60_000 ? raw : 12 * 60_000;
 })();
 
 function isRecoverableProviderBusyError(error: ProviderError): boolean {
@@ -487,11 +513,11 @@ export class TransportSessionRuntime implements SessionRuntime {
   // counts as having active turn work (so new sends queue in order behind the
   // message being retried) and presents an in-progress status, not idle.
   private _recoverableRetryTimer: ReturnType<typeof setTimeout> | null = null;
-  // How many FRONT pending entries make up the turn currently being retried.
-  // STOP uses this to interrupt exactly that turn while keeping messages the
-  // user queued AFTER it. Overwritten on each re-queue; harmless when stale
-  // (only read while the retry timer is set, and re-queue always sets it first).
-  private _recoverableRetryEntryCount = 0;
+  // Stable identities of the logical turn currently being retried. The IDs
+  // preserve its batch boundary while backoff is active: messages queued later
+  // must remain a separate turn or they would change provider-level delivery
+  // identity and could replay already-accepted side effects.
+  private _recoverableRetryEntryIds: string[] = [];
   private _nextDispatchId = 0;
   private _activityGeneration = 0;
   private readonly _openTools = new Map<string, { generation: number; name: string; status: 'running' }>();
@@ -606,7 +632,7 @@ export class TransportSessionRuntime implements SessionRuntime {
         const completedEntry = this._activeDispatchEntries.length === 1
           ? this._activeDispatchEntries[0]
           : undefined;
-        this._lastCompletedTurn = completedEntry && !completedEntry.peerAudit
+        this._lastCompletedTurn = completedEntry && !completedEntry.peerAudit && !completedEntry.delegationReply
           ? {
               taskCommandId: completedEntry.clientMessageId,
               assistantText: message.content,
@@ -1097,6 +1123,7 @@ export class TransportSessionRuntime implements SessionRuntime {
           const material = JSON.parse(materialJson) as {
             text?: unknown;
             providerText?: unknown;
+            aliasAudit?: unknown;
             messagePreamble?: unknown;
             attachmentRefs?: unknown;
             sharedActorEnvelope?: unknown;
@@ -1108,6 +1135,9 @@ export class TransportSessionRuntime implements SessionRuntime {
               clientMessageId,
               text: material.text,
               ...(typeof material.providerText === 'string' ? { providerText: material.providerText } : {}),
+              ...(material.aliasAudit && typeof material.aliasAudit === 'object'
+                ? { aliasAudit: material.aliasAudit as AliasSendAudit }
+                : {}),
               ...(typeof material.messagePreamble === 'string' && material.messagePreamble ? { messagePreamble: material.messagePreamble } : {}),
               ...(Array.isArray(material.attachmentRefs) && material.attachmentRefs.length ? { attachments: material.attachmentRefs as TransportAttachment[] } : {}),
               ...(material.sharedActorEnvelope ? { sharedActor: material.sharedActorEnvelope as SharedActorEnvelope } : {}),
@@ -1299,7 +1329,12 @@ export class TransportSessionRuntime implements SessionRuntime {
 
     if (shouldCancelProvider) {
       try {
-        const cancelResult = this.provider.cancel!(providerSessionId);
+        const cancelResult = this.provider.cancel!(providerSessionId, {
+          origin: reason.includes('stale-active-turn')
+            ? PROVIDER_CANCEL_ORIGINS.STALE_WATCHDOG
+            : PROVIDER_CANCEL_ORIGINS.EXTERNAL_COMPLETION,
+          reason,
+        });
         void Promise.resolve(cancelResult).catch((err) => {
           logger.warn(
             { err, sessionKey: this.sessionKey, providerSessionId, reason },
@@ -1776,12 +1811,14 @@ export class TransportSessionRuntime implements SessionRuntime {
       ...(metadata?.providerText != null && metadata.providerText !== message
         ? { providerText: metadata.providerText }
         : {}),
+      ...(metadata?.aliasAudit ? { aliasAudit: metadata.aliasAudit } : {}),
       ...(messagePreamble?.trim() ? { messagePreamble: messagePreamble.trim() } : {}),
       ...(attachments?.length ? { attachments } : {}),
       ...(metadata?.sharedActor ? { sharedActor: metadata.sharedActor } : {}),
       ...(metadata?.timelineCommitted ? { timelineCommitted: true } : {}),
       ...(metadata?.historyCommitted ? { historyCommitted: true } : {}),
       ...(metadata?.peerAudit ? { peerAudit: { ...metadata.peerAudit } } : {}),
+      ...(metadata?.delegationReply ? { delegationReply: { ...metadata.delegationReply } } : {}),
     };
 
     if (this.hasActiveTurnWork()) {
@@ -1802,12 +1839,14 @@ export class TransportSessionRuntime implements SessionRuntime {
             clientMessageId: entry.clientMessageId,
             text: entry.text,
             ...(entry.providerText != null ? { providerText: entry.providerText } : {}),
+            ...(entry.aliasAudit ? { aliasAudit: entry.aliasAudit } : {}),
             ...(entry.messagePreamble ? { messagePreamble: entry.messagePreamble } : {}),
             ...(entry.attachments?.length ? { attachmentRefs: entry.attachments } : {}),
             ...(entry.sharedActor ? { sharedActorEnvelope: entry.sharedActor } : {}),
             ...(entry.timelineCommitted ? { timelineCommitted: true } : {}),
             ...(entry.historyCommitted ? { historyCommitted: true } : {}),
             ...(entry.peerAudit ? { peerAudit: entry.peerAudit } : {}),
+            ...(entry.delegationReply ? { delegationReply: entry.delegationReply } : {}),
           }),
         });
       } catch (err) {
@@ -1853,18 +1892,81 @@ export class TransportSessionRuntime implements SessionRuntime {
     return 'sent';
   }
 
-  editPendingMessage(clientMessageId: string, text: string): boolean {
+  /**
+   * Deliver a completed delegation without cancelling or joining the ordinary
+   * FIFO. Busy sessions use the provider's active-turn notification primitive;
+   * idle sessions start one private continuation turn. A busy race is returned
+   * as stale so the durable delegation outbox can retry against fresh state.
+   */
+  async deliverDelegationNotification(
+    notification: ProviderDelegationNotification,
+  ): Promise<AgentDelegationNotificationResult> {
+    if (!this._providerSessionId) return AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE;
+
+    if (this.hasActiveTurnWork()) {
+      if (this.provider.capabilities.activeDelegationNotification
+          !== AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE
+        || !this.provider.notifyActiveDelegation) {
+        return AGENT_DELEGATION_NOTIFICATION_RESULTS.UNSUPPORTED;
+      }
+      const result = await this.provider.notifyActiveDelegation(this._providerSessionId, notification);
+      if (result !== AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE || this.hasActiveTurnWork()) {
+        return result;
+      }
+    }
+
+    const disposition = this.send(
+      notification.text,
+      notification.notificationId,
+      undefined,
+      undefined,
+      {
+        timelineCommitted: true,
+        historyCommitted: true,
+        delegationReply: { delegationId: notification.delegationId },
+      },
+    );
+    if (disposition === 'sent') return AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED;
+
+    // A provider callback may have made the runtime busy between the awaited
+    // native attempt and the idle fallback. Never leave this private reply in
+    // the ordinary user FIFO.
+    this.removePendingMessage(notification.notificationId);
+    return AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE;
+  }
+
+  /**
+   * Replace a queued message's text.
+   *
+   * `expansion` carries the re-resolved alias material for the NEW text. It is
+   * required for correctness, not an optimisation: the edited text may contain
+   * `;;(name)` markers, and without a fresh expansion the provider would receive
+   * the literal marker while the old (now wrong) expansion is discarded.
+   * Omitting it keeps the previous behaviour — drop everything and deliver
+   * verbatim — which is right for an edit that references no alias.
+   */
+  editPendingMessage(
+    clientMessageId: string,
+    text: string,
+    expansion?: { providerText?: string; aliasAudit?: AliasSendAudit },
+  ): boolean {
     const nextText = text;
     if (!clientMessageId || nextText.length === 0) return false;
     const entry = this._pendingMessages.find((item) => item.clientMessageId === clientMessageId);
     if (!entry) return false;
     entry.text = nextText;
-    // The edit is fresh user text with no attached alias resolution — drop any
-    // stale expansion so the edited text is delivered to the provider verbatim.
-    entry.providerText = undefined;
+    // Any expansion from the PREVIOUS text is stale; only a freshly computed one
+    // may survive this edit.
+    entry.providerText = expansion?.providerText != null && expansion.providerText !== nextText
+      ? expansion.providerText
+      : undefined;
+    entry.aliasAudit = expansion?.aliasAudit;
     entry.messagePreamble = undefined;
     try {
-      getTransportQueueStore().edit(this.sessionKey, clientMessageId, nextText);
+      getTransportQueueStore().edit(this.sessionKey, clientMessageId, nextText, undefined, {
+        ...(entry.providerText != null ? { providerText: entry.providerText } : {}),
+        ...(entry.aliasAudit ? { aliasAudit: entry.aliasAudit } : {}),
+      });
     } catch (err) {
       logger.warn({ err, sessionKey: this.sessionKey, clientMessageId }, 'transport queue sqlite edit failed; preserving runtime-local edit');
     }
@@ -1914,15 +2016,17 @@ export class TransportSessionRuntime implements SessionRuntime {
     // not keep "working" with nothing scheduled.
     if (this._recoverableRetryTimer && !this._activeTurn && !this._sending) {
       // STOP during an auto-retry interrupts ONLY the turn being retried (the
-      // front entries). Messages the user queued AFTER it stay intact and drain,
-      // matching normal STOP semantics ("keep queued messages; interrupt the
-      // active turn"). Do NOT clear the whole queue.
-      const retriedEntryCount = this._recoverableRetryEntryCount;
+      // entries identified below). Messages the user queued AFTER it stay
+      // intact and drain, matching normal STOP semantics ("keep queued
+      // messages; interrupt the active turn"). Do NOT clear the whole queue.
+      const retriedEntryIds = new Set(this._recoverableRetryEntryIds);
       this.clearRecoverableRetryTimer();
       this._recoverableDispatchRetries = 0;
-      this._recoverableRetryEntryCount = 0;
-      if (retriedEntryCount > 0) {
-        this._pendingMessages.splice(0, retriedEntryCount);
+      this._recoverableRetryEntryIds = [];
+      if (retriedEntryIds.size > 0) {
+        this._pendingMessages = this._pendingMessages.filter(
+          (entry) => !retriedEntryIds.has(entry.clientMessageId),
+        );
         this._pendingVersion++;
       }
       this.markCurrentActivityGenerationLocallyCancelled();
@@ -2048,6 +2152,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     this._cancelledProviderErrorsToIgnore = 0;
     this.clearRecoverableRetryTimer();
     this._recoverableDispatchRetries = 0;
+    this._recoverableRetryEntryIds = [];
     if (this._pendingMessages.length > 0) {
       if (options.preserveTransportQueue) {
         logger.info(
@@ -2444,8 +2549,12 @@ export class TransportSessionRuntime implements SessionRuntime {
     if (this._activeDispatchEntries.length === 0) return false;
     if (this._recoverableDispatchRetries >= MAX_RECOVERABLE_DISPATCH_RETRIES) return false;
     this._recoverableDispatchRetries++;
-    // Record the size of THIS retried turn so STOP can drop exactly it.
-    this._recoverableRetryEntryCount = this._activeDispatchEntries.length;
+    // Preserve the exact logical turn boundary. New messages can queue during
+    // backoff, but must not be merged into this retry because provider-level
+    // idempotency keys are derived from these stable client message IDs.
+    this._recoverableRetryEntryIds = this._activeDispatchEntries.map(
+      (entry) => entry.clientMessageId,
+    );
     this._pendingMessages.unshift(...this._activeDispatchEntries);
     this._pendingVersion++;
     this._activeDispatchEntries = [];
@@ -2481,7 +2590,10 @@ export class TransportSessionRuntime implements SessionRuntime {
 
   private runRecoverableRetryTick(): void {
     this._recoverableRetryTimer = null;
-    if (!this._providerSessionId || this._pendingMessages.length === 0) return;
+    if (!this._providerSessionId || this._pendingMessages.length === 0) {
+      this._recoverableRetryEntryIds = [];
+      return;
+    }
     // A turn became active in the meantime (e.g. onComplete already drained the
     // queue) — its settlement owns the next drain.
     if (this._sending || this._activeTurn) return;
@@ -2547,8 +2659,8 @@ export class TransportSessionRuntime implements SessionRuntime {
       text: message,
       ...(attachments?.length ? { attachments } : {}),
     }]).map((entry) => ({ ...entry }));
-    const isPrivatePeerAuditDispatch = this._activeDispatchEntries.length > 0
-      && this._activeDispatchEntries.every((entry) => !!entry.peerAudit);
+    const isPrivateControlDispatch = this._activeDispatchEntries.length > 0
+      && this._activeDispatchEntries.every((entry) => !!entry.peerAudit || !!entry.delegationReply);
     this.bindSdkTurnLostReplacementDispatch(dispatchId, this._activeDispatchEntries);
 
     // Alias expansion (A′): the provider (and runtime history) receive the
@@ -2615,13 +2727,13 @@ export class TransportSessionRuntime implements SessionRuntime {
       // particular, do not consume first-turn startup memory or run semantic
       // recall: both can contain recent summaries and both emit public
       // memory.context evidence after provider acceptance.
-      const suppressMemoryContext = isSlashControl || isPrivatePeerAuditDispatch;
+      const suppressMemoryContext = isSlashControl || isPrivateControlDispatch;
       const startupMemory = suppressMemoryContext ? null : (this._startupMemory ?? (
         !this._startupMemoryInjected && authority.authoritySource === 'processed_local' && this._contextNamespace
           ? await buildTransportStartupMemory(this._contextNamespace, { projectDir: this._projectDir })
           : null
       ));
-      const memoryRecallResult = isPrivatePeerAuditDispatch
+      const memoryRecallResult = isPrivateControlDispatch
         ? { artifact: null }
         : isSlashControl
         ? {
@@ -2666,6 +2778,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       summarySyncReservation = undefined;
       const dispatchResult = await dispatchSharedContextSend(this.provider, this._providerSessionId!, {
         userMessage: providerMessage,
+        deliveryId: this._activeDispatchEntries.map((entry) => entry.clientMessageId).join('\n'),
         activityGeneration: this.currentActivityGeneration(),
         messagePreamble,
         description: isSlashControl ? undefined : this._description,
@@ -2891,7 +3004,29 @@ export class TransportSessionRuntime implements SessionRuntime {
     // Draining now supersedes any pending recoverable-retry backoff.
     this.clearRecoverableRetryTimer();
 
-    const messages = this._pendingMessages.splice(0);
+    const retryEntryIds = this._recoverableRetryEntryIds;
+    this._recoverableRetryEntryIds = [];
+    let messages: PendingTransportMessage[];
+    if (retryEntryIds.length > 0) {
+      const retryEntriesById = new Map(
+        this._pendingMessages.map((entry) => [entry.clientMessageId, entry]),
+      );
+      messages = retryEntryIds
+        .map((clientMessageId) => retryEntriesById.get(clientMessageId))
+        .filter((entry): entry is PendingTransportMessage => entry !== undefined);
+      if (messages.length > 0) {
+        const retryEntryIdSet = new Set(retryEntryIds);
+        this._pendingMessages = this._pendingMessages.filter(
+          (entry) => !retryEntryIdSet.has(entry.clientMessageId),
+        );
+      } else {
+        // The user removed the whole retried turn during backoff. Its timer no
+        // longer owns the queue; drain whatever remains as an ordinary turn.
+        messages = this._pendingMessages.splice(0);
+      }
+    } else {
+      messages = this._pendingMessages.splice(0);
+    }
     const timelineMessages = messages.filter((entry) => !entry.timelineCommitted);
     for (const entry of timelineMessages) entry.timelineCommitted = true;
     try {

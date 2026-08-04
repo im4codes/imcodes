@@ -627,7 +627,7 @@ jobs:
             runner: ubuntu-latest
             artifact: imcodes-node-linux
           - key: macos
-            runner: macos-latest
+            runner: macos-15
             artifact: imcodes-node-macos
           - key: windows
             runner: windows-latest

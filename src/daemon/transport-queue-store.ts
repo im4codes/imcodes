@@ -329,7 +329,17 @@ export class TransportQueueStore {
     }
   }
 
-  edit(sessionNameInput: string, clientMessageIdInput: string, text: string, now = Date.now()): QueueSnapshot {
+  edit(
+    sessionNameInput: string,
+    clientMessageIdInput: string,
+    text: string,
+    now = Date.now(),
+    /**
+     * Freshly computed dispatch material for the NEW text. Absent ⇒ the edit
+     * references no alias and the entry is delivered verbatim.
+     */
+    replacement?: { providerText?: string; aliasAudit?: unknown },
+  ): QueueSnapshot {
     const sessionName = normalizeSessionName(sessionNameInput);
     const clientMessageId = requireNonEmpty(clientMessageIdInput.trim(), 'clientMessageId');
     this.db.exec('BEGIN IMMEDIATE');
@@ -344,7 +354,7 @@ export class TransportQueueStore {
       // to the new text and STRIP the now-stale expanded alias value + preamble,
       // so a restart before re-delivery cannot rehydrate the old secret (and
       // cannot deliver the old expansion with the new text).
-      this.rewritePrivateMaterialTextStrippingSecrets(sessionName, clientMessageId, text, now);
+      this.rewritePrivateMaterialTextStrippingSecrets(sessionName, clientMessageId, text, now, replacement);
       const version = this.bumpVersion(sessionName, now);
       this.db.exec('COMMIT');
       return this.readSnapshot(sessionName, 'edit', version);
@@ -366,6 +376,7 @@ export class TransportQueueStore {
     clientMessageId: string,
     text: string,
     now: number,
+    replacement?: { providerText?: string; aliasAudit?: unknown },
   ): void {
     const row = this.db.prepare(`
       SELECT material_json AS materialJson
@@ -383,9 +394,15 @@ export class TransportQueueStore {
       this.db.prepare('DELETE FROM queue_private_material WHERE session_name = ? AND client_message_id = ?').run(sessionName, clientMessageId);
       return;
     }
+    // Always drop the previous expansion first: it belongs to the old text, and
+    // a restart before re-delivery must never rehydrate that secret. Anything
+    // written back below was computed from the NEW text.
     delete parsed.providerText;
     delete parsed.messagePreamble;
+    delete parsed.aliasAudit;
     parsed.text = text;
+    if (replacement?.providerText != null) parsed.providerText = replacement.providerText;
+    if (replacement?.aliasAudit) parsed.aliasAudit = replacement.aliasAudit;
     this.db.prepare(`
       INSERT OR REPLACE INTO queue_private_material (session_name, client_message_id, material_json, updated_at)
       VALUES (?, ?, ?, ?)

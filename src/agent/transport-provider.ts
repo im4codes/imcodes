@@ -17,6 +17,10 @@ import type { ProviderQuotaMeta } from '../../shared/provider-quota.js';
 import type { TransportAttachment } from '../../shared/transport-attachments.js';
 import type { MemoryMcpProviderStatusView } from '../../shared/memory-ws.js';
 import type {
+  AgentDelegationActiveNotificationMode,
+  AgentDelegationNotificationResult,
+} from '../../shared/agent-delegation.js';
+import type {
   ProviderContextPayload,
   ProviderSupportClass,
   SharedScopePolicyOverride,
@@ -66,6 +70,13 @@ export const PROVIDER_ERROR_CODES = {
   SDK_TURN_LOST:    'SDK_TURN_LOST',
 } as const;
 
+/** Why the runtime asked a provider to stop its active turn. */
+export const PROVIDER_CANCEL_ORIGINS = {
+  USER: 'user',
+  EXTERNAL_COMPLETION: 'external_completion',
+  STALE_WATCHDOG: 'stale_watchdog',
+} as const;
+
 // ── Derived types ───────────────────────────────────────────────────────────
 
 /** Connection mode determines how the transport manages the agent lifecycle. */
@@ -76,6 +87,13 @@ export type SessionOwnership = typeof SESSION_OWNERSHIP[keyof typeof SESSION_OWN
 
 /** Error code from a provider operation. */
 export type ProviderErrorCode = typeof PROVIDER_ERROR_CODES[keyof typeof PROVIDER_ERROR_CODES];
+export type ProviderCancelOrigin = typeof PROVIDER_CANCEL_ORIGINS[keyof typeof PROVIDER_CANCEL_ORIGINS];
+
+export interface ProviderCancelOptions {
+  origin: ProviderCancelOrigin;
+  /** Bounded machine-readable reason owned by the runtime, never raw provider output. */
+  reason?: string;
+}
 
 /** Machine-readable recovery reason for Codex SDK app-server lost foreground turns. */
 export const SDK_TURN_LOST_REASON = SHARED_SDK_TURN_LOST_RECOVERY_REASON;
@@ -198,6 +216,15 @@ export interface ProviderCapabilities {
   compact?: ProviderCompactCapability;
   /** How a completed background subagent re-enters an already-idle parent session. */
   backgroundSubagentWake?: BackgroundSubagentWakeMode;
+  /** Whether a delegation reply can enter the provider's currently active turn without cancellation or FIFO queueing. */
+  activeDelegationNotification?: AgentDelegationActiveNotificationMode;
+}
+
+export interface ProviderDelegationNotification {
+  notificationId: string;
+  delegationId: string;
+  sourceSessionName: string;
+  text: string;
 }
 
 /**
@@ -490,10 +517,20 @@ export interface TransportProvider {
   send(sessionId: string, payload: string | ProviderContextPayload, attachments?: TransportAttachment[], extraSystemPrompt?: string): Promise<void>;
 
   /**
+   * Deliver a completed delegation into the currently active provider turn.
+   * Implementations must never cancel the turn or enqueue an ordinary future
+   * user message. A stale result means the active turn ended before admission.
+   */
+  notifyActiveDelegation?(
+    sessionId: string,
+    notification: ProviderDelegationNotification,
+  ): Promise<AgentDelegationNotificationResult>;
+
+  /**
    * Best-effort cancellation of the current in-flight turn for a session.
    * Providers that support interruption should implement this.
    */
-  cancel?(sessionId: string): Promise<void>;
+  cancel?(sessionId: string, options?: ProviderCancelOptions): Promise<void>;
 
   /**
    * Register a callback to receive incremental output deltas while the agent is streaming.

@@ -17,6 +17,23 @@ import { encodeEnrollmentBlob, parseEnrollmentBlob } from '../../src/node/enroll
 import { loadInstallJournal } from '../../src/node/install-journal.js';
 import { createControlledNodeRuntime, isControlledNodeAuthAck } from '../../src/node/runtime.js';
 import type { AuthenticatedWebSocketLike } from '../../src/transport/authenticated-websocket.js';
+import {
+  MACHINE_DIRECT_FILE_TRANSFER_CAPABILITY,
+  MACHINE_DIRECT_FILE_FETCH_CAPABILITY,
+  MACHINE_DIRECT_FILE_TRANSFER_ERROR,
+  MACHINE_DIRECT_FILE_TRANSFER_LIMITS,
+  MACHINE_DIRECT_FILE_TRANSFER_MSG,
+} from '../../shared/machine-direct-file-transfer.js';
+
+const { receiveMachineDirectUploadMock, sendMachineDirectFetchMock } = vi.hoisted(() => ({
+  receiveMachineDirectUploadMock: vi.fn(),
+  sendMachineDirectFetchMock: vi.fn(),
+}));
+
+vi.mock('../../src/daemon/machine-direct-transfer.js', () => ({
+  receiveMachineDirectUpload: receiveMachineDirectUploadMock,
+  sendMachineDirectFetch: sendMachineDirectFetchMock,
+}));
 
 class MockSocket extends EventEmitter implements AuthenticatedWebSocketLike {
   readyState = 0;
@@ -28,6 +45,9 @@ class MockSocket extends EventEmitter implements AuthenticatedWebSocketLike {
 
 const temporaryDirs: string[] = [];
 afterEach(async () => {
+  vi.restoreAllMocks();
+  receiveMachineDirectUploadMock.mockReset();
+  sendMachineDirectFetchMock.mockReset();
   await Promise.all(temporaryDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
 });
 
@@ -60,6 +80,8 @@ describe('controlled node enrollment and runtime', () => {
       FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY,
       FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY,
       FILE_TRANSFER_PATH_HANDLE_CAPABILITY,
+      MACHINE_DIRECT_FILE_TRANSFER_CAPABILITY,
+      MACHINE_DIRECT_FILE_FETCH_CAPABILITY,
     ]));
     expect(JSON.parse(socket.sent[1]!)).toMatchObject({ type: 'heartbeat', daemonVersion: expect.any(String) });
 
@@ -120,6 +142,92 @@ describe('controlled node enrollment and runtime', () => {
     });
     socket.emit('message', JSON.stringify({ type: 'fs.list', requestId: 'forbidden', path: dir }));
     expect(socket.sent.some((raw) => raw.includes('forbidden'))).toBe(false);
+    runtime.stop();
+  });
+
+  it('strictly validates machine-direct control and refreshes authority from the controlled-node clock', async () => {
+    const receivedAt = Date.parse('2026-08-03T12:00:00.000Z');
+    vi.spyOn(Date, 'now').mockReturnValue(receivedAt);
+    receiveMachineDirectUploadMock.mockResolvedValue({
+      type: MACHINE_DIRECT_FILE_TRANSFER_MSG.ERROR,
+      requestId: 'r'.repeat(32),
+      error: MACHINE_DIRECT_FILE_TRANSFER_ERROR.CONNECT_FAILED,
+    });
+    const socket = new MockSocket();
+    const runtime = createControlledNodeRuntime({
+      serverUrl: 'https://im.example',
+      serverId: 'controlled-1',
+      token: 'secret',
+      nodeRole: NODE_ROLE.CONTROLLED,
+    }, () => socket);
+    runtime.start();
+    socket.open();
+    const request = {
+      type: MACHINE_DIRECT_FILE_TRANSFER_MSG.REQUEST,
+      requestId: 'r'.repeat(32),
+      clientUploadId: 'c'.repeat(32),
+      capability: 'A'.repeat(43),
+      candidates: [{ host: '192.168.2.145', port: 45123 }],
+      originalName: 'clock-skewed.txt',
+      size: 1,
+      expiresAt: receivedAt - 30 * 86_400_000,
+    };
+    const before = socket.sent.length;
+    socket.emit('message', JSON.stringify({ ...request, injected: true }));
+    await Promise.resolve();
+    expect(socket.sent).toHaveLength(before);
+
+    socket.emit('message', JSON.stringify(request));
+    await vi.waitFor(() => expect(receiveMachineDirectUploadMock).toHaveBeenCalledOnce());
+    expect(receiveMachineDirectUploadMock).toHaveBeenCalledWith(expect.objectContaining({
+      requestId: request.requestId,
+      expiresAt: receivedAt + MACHINE_DIRECT_FILE_TRANSFER_LIMITS.AUTHORITY_TTL_MS,
+    }));
+    expect(socket.sent.slice(before).map((raw) => JSON.parse(raw))).toContainEqual({
+      type: MACHINE_DIRECT_FILE_TRANSFER_MSG.ERROR,
+      requestId: request.requestId,
+      error: MACHINE_DIRECT_FILE_TRANSFER_ERROR.CONNECT_FAILED,
+    });
+    runtime.stop();
+  });
+
+  it('advertises reverse direct fetch and refreshes its authority before outbound sending', async () => {
+    const receivedAt = Date.parse('2026-08-03T12:00:00.000Z');
+    vi.spyOn(Date, 'now').mockReturnValue(receivedAt);
+    const requestId = 'f'.repeat(32);
+    sendMachineDirectFetchMock.mockResolvedValue({
+      type: MACHINE_DIRECT_FILE_TRANSFER_MSG.FETCH_DONE,
+      requestId,
+      size: 4,
+    });
+    const socket = new MockSocket();
+    const runtime = createControlledNodeRuntime({
+      serverUrl: 'https://im.example',
+      serverId: 'controlled-1',
+      token: 'secret',
+      nodeRole: NODE_ROLE.CONTROLLED,
+    }, () => socket);
+    runtime.start();
+    socket.open();
+    expect(JSON.parse(socket.sent[0]!).capabilities).toContain(MACHINE_DIRECT_FILE_FETCH_CAPABILITY);
+    socket.emit('message', JSON.stringify({
+      type: MACHINE_DIRECT_FILE_TRANSFER_MSG.FETCH_REQUEST,
+      requestId,
+      capability: 'B'.repeat(43),
+      candidates: [{ host: '172.16.253.211', port: 45125 }],
+      sourcePath: '/tmp/source.bin',
+      expiresAt: receivedAt - 30 * 86_400_000,
+    }));
+    await vi.waitFor(() => expect(sendMachineDirectFetchMock).toHaveBeenCalledOnce());
+    expect(sendMachineDirectFetchMock).toHaveBeenCalledWith(expect.objectContaining({
+      requestId,
+      expiresAt: receivedAt + MACHINE_DIRECT_FILE_TRANSFER_LIMITS.AUTHORITY_TTL_MS,
+    }));
+    expect(socket.sent.map((raw) => JSON.parse(raw))).toContainEqual({
+      type: MACHINE_DIRECT_FILE_TRANSFER_MSG.FETCH_DONE,
+      requestId,
+      size: 4,
+    });
     runtime.stop();
   });
 

@@ -11,6 +11,8 @@ import {
   CONTROLLED_NODE_ARTIFACT_HEADERS,
   CONTROLLED_NODE_ARTIFACT_UPGRADE_PATH,
   controlledNodeComputerUseHelperFilename,
+  isControlledNodeArtifactCompatibleWithRuntime,
+  normalizeControlledNodeArtifactPair,
 } from '../../shared/controlled-node-artifacts.js';
 import {
   buildPosixControlledNodeUpgradeScript,
@@ -39,9 +41,13 @@ const credential = {
 describe('controlled-node self-upgrade', () => {
   it('maps only canonical platform artifacts', () => {
     expect(controlledNodeArtifactTarget('win32', 'x64')).toEqual({ os: 'win', arch: 'x64' });
-    expect(controlledNodeArtifactTarget('darwin', 'arm64')).toEqual({ os: 'mac', arch: 'arm64' });
+    expect(controlledNodeArtifactTarget('darwin', 'arm64')).toEqual({ os: 'mac', arch: 'universal' });
+    expect(controlledNodeArtifactTarget('darwin', 'x64')).toEqual({ os: 'mac', arch: 'universal' });
     expect(controlledNodeArtifactTarget('linux', 'x64')).toEqual({ os: 'linux', arch: 'x64' });
     expect(controlledNodeArtifactTarget('win32', 'arm64')).toBeNull();
+    expect(normalizeControlledNodeArtifactPair('mac', 'arm64')).toEqual({ os: 'mac', arch: 'universal' });
+    expect(isControlledNodeArtifactCompatibleWithRuntime('mac', 'arm64', 'mac', 'arm64')).toBe(true);
+    expect(isControlledNodeArtifactCompatibleWithRuntime('mac', 'universal', 'mac', 'x64')).toBe(true);
     expect(controlledNodeComputerUseHelperFilename('win')).toBe('open-computer-use.exe');
     expect(controlledNodeComputerUseHelperFilename('mac')).toBe('open-computer-use.app.zip');
     expect(controlledNodeComputerUseHelperFilename('linux')).toBe('open-computer-use');

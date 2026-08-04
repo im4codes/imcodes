@@ -74,6 +74,66 @@ describe('preferTimelineEvent', () => {
     expect(preferTimelineEvent(hydrated, preview)).toBe(hydrated);
   });
 
+  it('lets a newer streaming delta past an older hydrated snapshot of the same message', () => {
+    // Detail hydration rebuilds the event as `{ ...existing, payload }`, so the
+    // hydrated copy carries the seq of the snapshot it hydrated. Ranking
+    // completeness first made that stale snapshot outrank every delta still
+    // arriving: the merge reported no change and the message stopped updating
+    // until the terminal event replaced it, so the whole reply appeared at once.
+    const hydratedMidStream = makeEvent({
+      eventId: 'evt-1',
+      seq: 5,
+      ts: 500,
+      payload: { text: 'hello wo', streaming: true, completeness: 'hydrated' },
+    });
+    const nextDelta = makeEvent({
+      eventId: 'evt-1',
+      seq: 9,
+      ts: 900,
+      payload: { text: 'hello world, and then some', streaming: true },
+    });
+
+    expect(preferTimelineEvent(hydratedMidStream, nextDelta)).toBe(nextDelta);
+    // Order must not matter: the same pair seen the other way round agrees.
+    expect(preferTimelineEvent(nextDelta, hydratedMidStream)).toBe(nextDelta);
+  });
+
+  it('still lets the terminal event replace a hydrated streaming snapshot', () => {
+    const hydratedMidStream = makeEvent({
+      eventId: 'evt-1',
+      seq: 5,
+      payload: { text: 'partial', streaming: true, completeness: 'hydrated' },
+    });
+    const terminal = makeEvent({
+      eventId: 'evt-1',
+      seq: 9,
+      payload: { text: 'final text' },
+    });
+
+    expect(preferTimelineEvent(hydratedMidStream, terminal)).toBe(terminal);
+  });
+
+  it('still prefers the more complete payload when two streaming versions share a seq', () => {
+    // Same generation, so there is no freshness signal to go on — completeness
+    // remains the tie-breaker and a truncated copy must not win.
+    const truncated = makeEvent({
+      eventId: 'evt-1',
+      seq: 5,
+      payload: {
+        text: 'trunc', streaming: true, completeness: 'preview',
+        detailRefs: [{ detailId: 'td_1', fieldPath: 'payload.text' }],
+      },
+    });
+    const hydrated = makeEvent({
+      eventId: 'evt-1',
+      seq: 5,
+      payload: { text: 'full text', streaming: true, completeness: 'hydrated' },
+    });
+
+    expect(preferTimelineEvent(truncated, hydrated)).toBe(hydrated);
+    expect(preferTimelineEvent(hydrated, truncated)).toBe(hydrated);
+  });
+
   it('honors explicit top-level completeness metadata', () => {
     const full = makeEvent({ eventId: 'evt-1', seq: 1, ts: 100, payload: { text: 'full payload' }, completeness: 'full' });
     const preview = makeEvent({ eventId: 'evt-1', seq: 2, ts: 200, payload: { text: 'preview payload' }, completeness: 'preview' });

@@ -15,6 +15,8 @@ import { EXECUTION_CLONE_KIND } from '../../shared/execution-clone.js';
 function session(name: string, patch: Partial<SessionRecord> = {}): SessionRecord {
   return {
     name,
+    sessionInstanceId: `instance_${name}`,
+    runtimeEpoch: `epoch_${name}`,
     projectName: 'proj',
     projectDir: '/repo',
     role: name.endsWith('_brain') ? 'brain' : 'w1',
@@ -115,7 +117,8 @@ describe('daemon delegation dispatch helper', () => {
     expect(dispatched).toHaveLength(1);
     expect(dispatched[0]).toContain('please do it');
     expect(dispatched[0]).toContain('prior context');
-    expect(dispatched[0]).toContain('imcodes send "deck_proj_brain"');
+    expect(dispatched[0]).toContain('delegation_reply');
+    expect(dispatched[0]).not.toContain('send your response using: imcodes send');
     expect(dispatched[0]).not.toContain('imcodes send --no-reply');
     expect(dispatched[0]).toContain('deck_proj_brain');
   });
@@ -128,6 +131,7 @@ describe('daemon delegation dispatch helper', () => {
       message: 'task',
     }, {
       listSessions: () => [session('deck_proj_brain'), session('deck_proj_w1')],
+      getSession: (name) => session(name),
       readTimeline: () => { throw new Error('boom'); },
       dispatchMessage: vi.fn(async (_target, message) => { sent.push(message); }),
     });
@@ -144,12 +148,13 @@ describe('daemon delegation dispatch helper', () => {
       message: 'task',
     }, {
       listSessions: () => [session('deck_proj_brain'), session('deck_proj_w1')],
+      getSession: (name) => session(name),
       readTimeline: () => [event('user.message', `${'long '.repeat(4000)}`)],
       dispatchMessage: vi.fn(async (_target, message) => { sent.push(message); }),
     });
     expect(result).toMatchObject({ status: 'accepted', contextStatus: 'truncated' });
     expect(sent[0]).toContain(AGENT_DELEGATION_CONTEXT_TRUNCATED_MARKER);
-    expect(sent[0]).toContain('imcodes send "deck_proj_brain"');
+    expect(sent[0]).toContain('delegation_reply');
     expect(sent[0]).not.toContain('imcodes send --no-reply');
   });
 });

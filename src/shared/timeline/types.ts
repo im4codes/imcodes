@@ -13,6 +13,7 @@ import type {
 } from '../../../shared/context-types.js';
 import { TIMELINE_EVENT_FILE_CHANGE } from '../../../shared/file-change.js';
 import { EXECUTION_CLONE_TIMELINE } from '../../../shared/execution-clone.js';
+import { AGENT_DELEGATION_REPLY_TIMELINE_EVENT } from '../../../shared/agent-delegation.js';
 import type { TimelineDetailRef, TimelineEventCompleteness } from '../../../shared/timeline-protocol.js';
 import type {
   PeerAuditRuntimeDisposition,
@@ -45,6 +46,10 @@ export type TimelineEventType =
   // back into supervision/model context.
   | 'peer_audit.result'
   | 'peer_audit.status'
+  // Durable, user-visible projection of a structured delegation reply. The
+  // provider notification remains separate so this event never becomes model
+  // input or a supervision task candidate.
+  | typeof AGENT_DELEGATION_REPLY_TIMELINE_EVENT
   // Emitted once per memory-compression call (NOT manual /compact, which is
   // forwarded to the SDK transport unchanged). Carries the backend+model that
   // did the compression plus token telemetry. Persisted to JSONL history for
@@ -77,6 +82,7 @@ export const TIMELINE_HISTORY_CONTENT_TYPES = [
   'memory.context',
   'peer_audit.result',
   'peer_audit.status',
+  AGENT_DELEGATION_REPLY_TIMELINE_EVENT,
   'memory.compression',
 ] as const satisfies readonly TimelineEventType[];
 
@@ -160,6 +166,15 @@ export interface PeerAuditStatusTimelinePayload {
   auditorLabel?: string;
   disposition?: PeerAuditRuntimeDisposition;
   reason?: string;
+}
+
+/** Public timeline projection of a structured delegation reply. Capability,
+ * opaque authority data, and provider notification framing are excluded. */
+export interface AgentDelegationReplyTimelinePayload {
+  memoryExcluded: true;
+  sourceSessionName: string;
+  sourceLabel?: string;
+  result: string;
 }
 
 export interface MemoryContextTimelineItem {

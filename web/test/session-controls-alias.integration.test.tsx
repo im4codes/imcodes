@@ -169,4 +169,80 @@ describe('SessionControls alias send (real useAliases, apiFetch mocked)', () => 
     const [, payload] = ws.sendSessionCommand.mock.calls[0];
     expect('resolvedAliases' in payload).toBe(false);
   });
+  // Cx3 REWORK: the queue's retry/edit paths bypassed alias resolution entirely,
+  // so a failed or edited message that referenced an alias reached the agent as
+  // a literal `;;(name)`.
+  const transportSession = {
+    name: 'deck_app_brain', project: 'app', role: 'brain',
+    agentType: 'codex-sdk', runtimeType: 'transport', state: 'running',
+    projectDir: '/work/app', queueEpoch: 'e1', queueAuthorityId: 'a1',
+    transportPendingMessageVersion: 0,
+  };
+
+  /** Queue action buttons carry no aria-label; the harness renders keys as text. */
+  function queuedAction(label: string): HTMLButtonElement | undefined {
+    return Array.from(document.querySelectorAll('.controls-queued-action'))
+      .find((node) => node.textContent?.trim() === label) as HTMLButtonElement | undefined;
+  }
+
+  it('re-resolves aliases when retrying a failed queued send', async () => {
+    apiFetchMock.mockResolvedValue({ aliases: [entry('deploy', 'ssh root@host', 'prod only')] });
+    const { ws, editor } = renderControls({ activeSession: transportSession as any });
+    await waitFor(() => expect(apiFetchMock).toHaveBeenCalled());
+
+    // Make the first send fail so the entry lands in the queue as retryable.
+    ws.sendSessionCommand.mockImplementationOnce(() => { throw new Error('socket down'); });
+    typeInto(editor, 'run ;;(deploy) now');
+    await waitFor(() => expect(editor.textContent).toContain(';;(deploy)'));
+    fireEvent.keyDown(editor, { key: 'Enter' });
+
+    const retry = await waitFor(() => {
+      const button = queuedAction('chat.retrySend');
+      expect(button).toBeTruthy();
+      return button!;
+    });
+    ws.sendSessionCommand.mockClear();
+    fireEvent.click(retry);
+
+    await waitFor(() => expect(ws.sendSessionCommand).toHaveBeenCalled());
+    const [, payload] = ws.sendSessionCommand.mock.calls[0];
+    // The retried text keeps its marker (values never live on the timeline) …
+    expect(payload.text).toBe('run ;;(deploy) now');
+    // … and the resolution rides along, so the agent gets the value, not `;;(deploy)`.
+    expect(payload.resolvedAliases).toEqual({ deploy: 'ssh root@host' });
+    expect(payload.resolvedAliasNotes).toEqual({ deploy: 'prod only' });
+  });
+
+  it('resolves aliases for the NEW text when editing a queued message', async () => {
+    apiFetchMock.mockResolvedValue({ aliases: [entry('deploy', 'ssh root@host')] });
+    const { ws, editor } = renderControls({ activeSession: transportSession as any });
+    await waitFor(() => expect(apiFetchMock).toHaveBeenCalled());
+
+    typeInto(editor, 'plain first send');
+    fireEvent.keyDown(editor, { key: 'Enter' });
+
+    const edit = await waitFor(() => {
+      const button = queuedAction('settings.edit');
+      expect(button).toBeTruthy();
+      return button!;
+    });
+    fireEvent.click(edit);
+    ws.send.mockClear();
+
+    typeInto(editor, 'now use ;;(deploy)');
+    await waitFor(() => expect(editor.textContent).toContain(';;(deploy)'));
+    fireEvent.keyDown(editor, { key: 'Enter' });
+
+    // Queue mutations go through ws.send(), not the session-command channel.
+    const editMsg = await waitFor(() => {
+      const call = ws.send.mock.calls.find(
+        ([msg]: [Record<string, unknown>]) => msg?.type === 'session.edit_queued_message',
+      );
+      expect(call).toBeTruthy();
+      return call![0] as Record<string, unknown>;
+    });
+    expect(editMsg.text).toBe('now use ;;(deploy)');
+    // The daemon drops the previous expansion and re-expands from this map.
+    expect(editMsg.resolvedAliases).toEqual({ deploy: 'ssh root@host' });
+  });
 });

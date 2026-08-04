@@ -35,6 +35,7 @@ import { TIMELINE_PAYLOAD_BUDGET_BYTES } from '../../shared/timeline-payload-bud
 import { OPENSPEC_AUTO_DELIVER_MSG } from '../../shared/openspec-auto-deliver-constants.js';
 import { EXECUTION_CLONE_KIND } from '../../shared/execution-clone.js';
 import { DAEMON_MSG } from '../../shared/daemon-events.js';
+import { DIRECT_FILE_TRANSFER_CAPABILITY, DIRECT_FILE_TRANSFER_MSG } from '../../shared/direct-file-transfer.js';
 import {
   DAEMON_UPGRADE_BLOCKED_ACK_DISPOSITION,
   DAEMON_UPGRADE_BLOCKED_SYNC_PROTOCOL,
@@ -1361,6 +1362,87 @@ describe('WsBridge', () => {
         .find((message) => message.type === 'daemon.stats');
       expect(stats).toBeDefined();
       expect(stats).not.toHaveProperty('disks');
+    });
+
+    it('relays daemon embedding status to browsers', async () => {
+      const { daemonWs, browserWs } = await setupAuthenticatedBridge();
+      const embedding = { state: 'ready', reason: null };
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'daemon.stats',
+        cpu: 12,
+        memUsed: 1,
+        memTotal: 2,
+        load1: 0.1,
+        load5: 0.2,
+        load15: 0.3,
+        uptime: 100,
+        embedding,
+      }));
+      await flushAsync();
+
+      const stats = browserWs.sentStrings
+        .map((message) => JSON.parse(message))
+        .find((message) => message.type === 'daemon.stats');
+      expect(stats).toMatchObject({ type: 'daemon.stats', embedding });
+    });
+
+    it('drops malformed daemon embedding status instead of forwarding junk', async () => {
+      const { daemonWs, browserWs } = await setupAuthenticatedBridge();
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'daemon.stats',
+        cpu: 12,
+        memUsed: 1,
+        memTotal: 2,
+        load1: 0.1,
+        load5: 0.2,
+        load15: 0.3,
+        uptime: 100,
+        embedding: { state: 'ready', reason: 42 },
+      }));
+      await flushAsync();
+
+      const stats = browserWs.sentStrings
+        .map((message) => JSON.parse(message))
+        .find((message) => message.type === 'daemon.stats');
+      expect(stats).toBeDefined();
+      expect(stats).not.toHaveProperty('embedding');
+    });
+
+    it('relays validated direct-connectivity runtime diagnostics and drops malformed values', async () => {
+      const { daemonWs, browserWs } = await setupAuthenticatedBridge();
+      daemonWs.emit('message', JSON.stringify({
+        type: 'daemon.stats',
+        cpu: 12,
+        memUsed: 1,
+        memTotal: 2,
+        load1: 0.1,
+        load5: 0.2,
+        load15: 0.3,
+        uptime: 100,
+        directConnectivity: { state: 'runtime_unavailable', error: 'native_module_missing' },
+      }));
+      daemonWs.emit('message', JSON.stringify({
+        type: 'daemon.stats',
+        cpu: 12,
+        memUsed: 1,
+        memTotal: 2,
+        load1: 0.1,
+        load5: 0.2,
+        load15: 0.3,
+        uptime: 100,
+        directConnectivity: { state: 'available', targetIp: '192.168.2.145' },
+      }));
+      await flushAsync();
+
+      const rows = browserWs.sentStrings
+        .map((message) => JSON.parse(message))
+        .filter((message) => message.type === 'daemon.stats');
+      expect(rows.at(-2)).toMatchObject({
+        directConnectivity: { state: 'runtime_unavailable', error: 'native_module_missing' },
+      });
+      expect(rows.at(-1)).not.toHaveProperty('directConnectivity');
     });
 
     it('translates session_event → session.event', async () => {
@@ -5347,6 +5429,60 @@ describe('WsBridge', () => {
       expect(timelineEvents[0].event.payload.text).toBe('live repair works');
     });
 
+    it('streams the same assistant timeline updates to mobile and desktop even if only mobile has subscribed', async () => {
+      const bridge = WsBridge.get(serverId);
+      const db = makeDb('valid-hash');
+      const daemonWs = new MockWs();
+      bridge.handleDaemonConnection(daemonWs as never, db, {} as never);
+      daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+
+      const desktop = new MockWs();
+      const mobile = new MockWs();
+      bridge.handleBrowserConnection(desktop as never, 'same-user', db, false);
+      bridge.handleBrowserConnection(mobile as never, 'same-user', db, true);
+      mobile.emit('message', JSON.stringify({
+        type: 'chat.subscribe',
+        sessionId: 'multi-device-stream',
+        forceHistory: false,
+      }));
+      await flushAsync();
+      desktop.sent.length = 0;
+      mobile.sent.length = 0;
+
+      for (const [seq, text, streaming] of [
+        [1, 'one', true],
+        [2, 'one two', true],
+        [3, 'one two three', false],
+      ] as const) {
+        daemonWs.emit('message', JSON.stringify({
+          type: TIMELINE_MESSAGES.EVENT,
+          event: {
+            eventId: 'transport:multi-device-stream:message-1',
+            sessionId: 'multi-device-stream',
+            ts: 1_000,
+            seq,
+            epoch: 1,
+            type: 'assistant.text',
+            payload: { text, streaming },
+          },
+        }));
+      }
+      await flushAsync();
+
+      for (const browser of [mobile, desktop]) {
+        const updates = browser.sentStrings
+          .map((raw) => JSON.parse(raw))
+          .filter((msg) => msg.type === TIMELINE_MESSAGES.EVENT)
+          .map((msg) => msg.event.payload);
+        expect(updates).toEqual([
+          { text: 'one', streaming: true },
+          { text: 'one two', streaming: true },
+          { text: 'one two three', streaming: false },
+        ]);
+      }
+    });
+
     it('retries live transport subscription ownership for newly created sub-sessions', async () => {
       const bridge = WsBridge.get(serverId);
       const db = makeSubSessionOwnershipRaceDb({ subId: 'race-live' });
@@ -6851,6 +6987,55 @@ describe('WsBridge', () => {
 
       expect(browserWs.sentStrings.some((msg) => msg.includes('"type":"timeline.event"'))).toBe(true);
       expect(errorSpy).toHaveBeenCalled();
+    });
+
+    it('wires direct-file signaling through generation-bound daemon and browser unicast routes', async () => {
+      const bridge = WsBridge.get(serverId);
+      const daemonWs = new MockWs();
+      const browserA = new MockWs();
+      const browserB = new MockWs();
+      const db = makeDb('valid-hash');
+      bridge.handleDaemonConnection(daemonWs as never, db, {} as never);
+      daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+      daemonWs.emit('message', JSON.stringify({
+        type: P2P_WORKFLOW_MSG.DAEMON_HELLO,
+        daemonId: serverId,
+        capabilities: [DIRECT_FILE_TRANSFER_CAPABILITY],
+        helloEpoch: 1,
+        sentAt: Date.now(),
+      }));
+      await flushAsync();
+      bridge.handleBrowserConnection(browserA as never, 'user-a', db);
+      bridge.handleBrowserConnection(browserB as never, 'user-b', db);
+      browserA.sent.length = 0;
+      browserB.sent.length = 0;
+      daemonWs.sent.length = 0;
+
+      const requestId = '123e4567-e89b-12d3-a456-426614174000';
+      const clientUploadId = '123e4567-e89b-12d3-a456-426614174001';
+      browserA.emit('message', JSON.stringify({
+        type: DIRECT_FILE_TRANSFER_MSG.INIT,
+        requestId,
+        clientUploadId,
+        filename: 'large.bin',
+        size: 5 * 1024 * 1024 * 1024,
+      }));
+      await flushAsync();
+      const prepare = daemonWs.sentStrings.map((row) => JSON.parse(row)).find((row) => row.type === DIRECT_FILE_TRANSFER_MSG.PREPARE);
+      const authorized = browserA.sentStrings.map((row) => JSON.parse(row)).find((row) => row.type === DIRECT_FILE_TRANSFER_MSG.AUTHORIZED);
+      expect(prepare).toMatchObject({ requestId, clientUploadId, size: 5 * 1024 * 1024 * 1024 });
+      expect(authorized).toMatchObject({ requestId, clientUploadId });
+
+      daemonWs.emit('message', JSON.stringify({
+        type: DIRECT_FILE_TRANSFER_MSG.ANSWER,
+        requestId,
+        capability: authorized.capability,
+        sdp: 'daemon-answer',
+      }));
+      await flushAsync();
+      expect(browserA.sentStrings.some((row) => row.includes('daemon-answer'))).toBe(true);
+      expect(browserB.sentStrings.some((row) => row.includes('daemon-answer'))).toBe(false);
     });
   });
 });

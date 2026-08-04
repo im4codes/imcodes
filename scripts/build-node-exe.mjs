@@ -11,7 +11,9 @@
 //      before postject and ad-hoc re-sign after.
 //   5. postject-inject NODE_SEA_BLOB (macOS also needs --macho-segment-name NODE_SEA).
 //
-// SEA produces a binary for the HOST platform only; CI runs one matrix job per OS.
+// SEA produces native Mach-O slices. macOS injects the same code-cache-free SEA
+// blob into the official arm64 and x64 Node binaries, then combines them into a
+// single Universal 2 executable.
 import { build } from 'esbuild';
 import { execFileSync } from 'node:child_process';
 import { mkdir, rm, copyFile, writeFile, chmod, stat, readFile, rename } from 'node:fs/promises';
@@ -34,6 +36,7 @@ const SEA_FUSE = 'NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2';
 const platform = process.platform; // darwin | linux | win32
 const arch = process.arch === 'arm64' ? 'arm64' : 'x64';
 const isWin = platform === 'win32';
+const artifactArch = platform === 'darwin' ? 'universal' : arch;
 const outName = isWin ? 'imcodes-node.exe' : `imcodes-node-${platform === 'darwin' ? 'macos' : 'linux'}`;
 
 const root = resolve(process.cwd());
@@ -48,14 +51,14 @@ async function downloadFile(url, destination, redirect = 'follow') {
   await writeFile(destination, Buffer.from(await response.arrayBuffer()));
 }
 
-async function ensureOfficialNode() {
+async function ensureOfficialNode(targetArch = arch) {
   const nodePlatform = platform === 'win32' ? 'win' : platform; // darwin|linux|win
-  const dirName = `node-${NODE_VERSION}-${nodePlatform}-${arch}`;
+  const dirName = `node-${NODE_VERSION}-${nodePlatform}-${targetArch}`;
   const cacheRoot = process.env.NODE_EXE_CACHE ?? join(tmpdir(), 'officialnode');
   const archiveName = `${dirName}.${isWin ? 'zip' : 'tar.gz'}`;
   const archivePath = join(cacheRoot, archiveName);
   const archiveTemp = `${archivePath}.${process.pid}.tmp`;
-  const shasumsPath = join(workDir, 'SHASUMS256.txt');
+  const shasumsPath = join(workDir, `SHASUMS256-${targetArch}.txt`);
   const nodeBin = isWin
     ? join(cacheRoot, dirName, 'node.exe')
     : join(cacheRoot, dirName, 'bin', 'node');
@@ -82,7 +85,11 @@ async function ensureOfficialNode() {
 }
 
 async function main() {
-  const { nodeBin: officialNode, nodeArchive, nodeArchiveSha256 } = await ensureOfficialNode();
+  const officialNodes = platform === 'darwin'
+    ? await Promise.all(['arm64', 'x64'].map((targetArch) => ensureOfficialNode(targetArch)))
+    : [await ensureOfficialNode()];
+  const officialNode = officialNodes.find(({ nodeBin }) => nodeBin.includes(`-${arch}/`)) ?? officialNodes[0];
+  if (!officialNode) throw new Error(`no official Node binary for build host architecture ${arch}`);
   await rm(workDir, { recursive: true, force: true });
   await mkdir(workDir, { recursive: true });
   await mkdir(buildDir, { recursive: true });
@@ -104,40 +111,71 @@ async function main() {
   const seaConfig = join(workDir, 'sea-config.json');
   const blobPath = join(workDir, 'app.blob');
   await writeFile(seaConfig, JSON.stringify({ main: bundlePath, output: blobPath, disableExperimentalSEAWarning: true }));
-  sh(officialNode, ['--experimental-sea-config', seaConfig]);
+  sh(officialNode.nodeBin, ['--experimental-sea-config', seaConfig]);
 
-  // 4. Copy the node binary → target exe (strip macOS signature before postject).
+  // 4. Copy the node binary → target exe (or inject both macOS slices).
   const outPath = join(buildDir, outName);
   await rm(outPath, { force: true });
-  await copyFile(officialNode, outPath);
-  await chmod(outPath, 0o755).catch(() => {});
-  if (platform === 'darwin') { try { sh('codesign', ['--remove-signature', outPath]); } catch { /* unsigned already */ } }
 
   // 5. postject-inject the SEA blob with the exact lockfile dependency. Never
   // resolve mutable registry state during a release build.
-  const postjectArgs = [outPath, 'NODE_SEA_BLOB', blobPath, '--sentinel-fuse', SEA_FUSE];
-  if (platform === 'darwin') postjectArgs.push('--macho-segment-name', 'NODE_SEA');
   const postjectPackage = JSON.parse(await readFile(join(root, 'node_modules', 'postject', 'package.json'), 'utf8'));
   const postjectVersion = postjectPackage.version;
   if (typeof postjectVersion !== 'string' || !postjectPackage.bin?.postject) throw new Error('invalid installed postject package');
-  sh(process.execPath, [join(root, 'node_modules', 'postject', postjectPackage.bin.postject), ...postjectArgs]);
-  if (platform === 'darwin') { try { sh('codesign', ['--sign', '-', outPath]); } catch { /* ad-hoc sign best-effort */ } }
+  const postjectBin = join(root, 'node_modules', 'postject', postjectPackage.bin.postject);
+  const inject = async (nodeBin, destination) => {
+    await rm(destination, { force: true });
+    await copyFile(nodeBin, destination);
+    await chmod(destination, 0o755).catch(() => {});
+    if (platform === 'darwin') {
+      try { sh('codesign', ['--remove-signature', destination]); } catch { /* unsigned already */ }
+    }
+    const args = [destination, 'NODE_SEA_BLOB', blobPath, '--sentinel-fuse', SEA_FUSE];
+    if (platform === 'darwin') args.push('--macho-segment-name', 'NODE_SEA');
+    sh(process.execPath, [postjectBin, ...args]);
+  };
+  if (platform === 'darwin') {
+    const slices = [];
+    for (const node of officialNodes) {
+      const slicePath = join(workDir, `imcodes-node-macos-${node.nodeArchive.includes('-arm64.') ? 'arm64' : 'x64'}`);
+      await inject(node.nodeBin, slicePath);
+      slices.push(slicePath);
+    }
+    sh('lipo', ['-create', ...slices, '-output', outPath]);
+    sh('codesign', ['--force', '--sign', '-', outPath]);
+  } else {
+    await inject(officialNode.nodeBin, outPath);
+  }
 
   const { size } = await stat(outPath);
   const buildCommit = process.env.GITHUB_SHA ?? execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).trim();
   // Copy the platform Computer Use helper as a sidecar artifact when available.
   // It is not injected into the SEA binary: the helper is an independently
   // signed/native executable and should remain replaceable/verifiable.
-  sh(process.execPath, [join(root, 'scripts', 'copy-computer-use-helper.mjs'), '--node-exe']);
+  sh(process.execPath, [join(root, 'scripts', 'copy-computer-use-helper.mjs'), '--node-exe'], {
+    env: {
+      ...process.env,
+      ...(platform === 'darwin' ? { IMCODES_COMPUTER_USE_HELPER_TARGET_ARCH: 'universal' } : {}),
+    },
+  });
 
   const manifestPath = `${outPath}${NODE_EXE_MANIFEST_SUFFIX}`;
   const manifest = await createNodeExeManifest({
     artifactPath: outPath,
     os: platform,
-    arch,
+    arch: artifactArch,
     nodeVersion: NODE_VERSION,
-    nodeArchive,
-    nodeArchiveSha256,
+    nodeArchive: officialNode.nodeArchive,
+    nodeArchiveSha256: officialNode.nodeArchiveSha256,
+    ...(platform === 'darwin'
+      ? {
+          nodeArchives: officialNodes.map((node) => ({
+            arch: node.nodeArchive.includes('-arm64.') ? 'arm64' : 'x64',
+            nodeArchive: node.nodeArchive,
+            nodeArchiveSha256: node.nodeArchiveSha256,
+          })),
+        }
+      : {}),
     postjectVersion,
     buildCommit,
     buildVersion,

@@ -39,6 +39,24 @@ import {
 } from '../subsession-accent-colors.js';
 import { OpenSpecAutoDeliverRunBar } from './OpenSpecAutoDeliver.js';
 import type { OpenSpecAutoDeliverProjection } from '../openspec-auto-deliver.js';
+import {
+  DIRECT_CONNECTIVITY_ENDPOINT_KIND,
+  DIRECT_CONNECTIVITY_PROBE_STAGE,
+  DIRECT_CONNECTIVITY_ROUTE,
+  DIRECT_CONNECTIVITY_RUNTIME_STATE,
+  DIRECT_FILE_TRANSFER_CAPABILITY,
+  DIRECT_FILE_TRANSFER_ERROR,
+  inferDirectConnectivityEndpointKind,
+  inferDirectConnectivityEndpointKindFromTypes,
+  type DirectConnectivityCandidateInfo,
+  type DirectConnectivityCandidateType,
+  type DirectConnectivityEndpointKind,
+  type DirectConnectivityProbeDiagnostics,
+  type DirectConnectivityProbeResult,
+  type DirectConnectivityProbeStage,
+  type DirectConnectivityRuntimeStatus,
+} from '@shared/direct-file-transfer.js';
+import { DirectFileTransferFailure, probeDirectConnectivity } from '../direct-file-transfer.js';
 
 interface DaemonStats {
   daemonVersion?: string | null;
@@ -52,6 +70,7 @@ interface DaemonStats {
   embedding?: EmbeddingStatus | null;
   disks?: DiskUsage[] | null;
   shortRefHealth?: MemoryShortRefHealth | null;
+  directConnectivity?: DirectConnectivityRuntimeStatus | null;
 }
 
 type DiscussionSummary = P2pProgressDiscussion & {
@@ -368,19 +387,121 @@ function ExpandedSubSessionPlaceholder({ sub, accentColor, cardSize, sharedState
 
 function DaemonStatsModal({
   stats,
+  ws,
   localClockText,
   onClose,
   t,
 }: {
   stats: DaemonStats;
+  ws: WsClient | null;
   localClockText: string;
   onClose: () => void;
   t: (key: string, vars?: Record<string, unknown>) => string;
 }) {
+  const PROBE_VIEW_STATE = {
+    IDLE: 'idle',
+    PROBING: 'probing',
+    SUCCESS: 'success',
+    FAILED: 'failed',
+  } as const;
+  const [probeState, setProbeState] = useState<typeof PROBE_VIEW_STATE[keyof typeof PROBE_VIEW_STATE]>(PROBE_VIEW_STATE.IDLE);
+  const [probeResult, setProbeResult] = useState<DirectConnectivityProbeResult | null>(null);
+  const [probeDiagnostics, setProbeDiagnostics] = useState<DirectConnectivityProbeDiagnostics | null>(null);
+  const [probeErrorKey, setProbeErrorKey] = useState<string | null>(null);
+  const autoProbeStarted = useRef(false);
   const embeddingKey = stats.embedding?.state
     ? `embedding.status_${stats.embedding.state}`
     : 'embedding.status_unknown';
   const shortRefHealth = stats.shortRefHealth;
+  const capabilityReady = Boolean(ws?.getDaemonCapabilitySnapshot?.()?.capabilities.includes(DIRECT_FILE_TRANSFER_CAPABILITY));
+  const runtimeUnavailable = stats.directConnectivity?.state === DIRECT_CONNECTIVITY_RUNTIME_STATE.RUNTIME_UNAVAILABLE;
+
+  const runProbe = useCallback(async () => {
+    if (!ws || runtimeUnavailable || !capabilityReady) return;
+    setProbeState(PROBE_VIEW_STATE.PROBING);
+    setProbeResult(null);
+    setProbeDiagnostics({
+      stage: DIRECT_CONNECTIVITY_PROBE_STAGE.AUTHORIZING,
+      browserCandidateTypes: [],
+      daemonCandidateTypes: [],
+    });
+    setProbeErrorKey(null);
+    try {
+      const result = await probeDirectConnectivity(ws, setProbeDiagnostics);
+      setProbeResult(result);
+      setProbeDiagnostics((current) => ({
+        stage: DIRECT_CONNECTIVITY_PROBE_STAGE.COMPLETE,
+        browserCandidateTypes: current?.browserCandidateTypes ?? [],
+        daemonCandidateTypes: current?.daemonCandidateTypes ?? [],
+      }));
+      setProbeState(PROBE_VIEW_STATE.SUCCESS);
+    } catch (error) {
+      const code = error instanceof DirectFileTransferFailure ? error.code : DIRECT_FILE_TRANSFER_ERROR.CONNECTION_FAILED;
+      const key = code === DIRECT_FILE_TRANSFER_ERROR.NEGOTIATION_TIMEOUT
+        ? 'subsessionBar.daemon_details_direct_timeout'
+        : code === DIRECT_FILE_TRANSFER_ERROR.DAEMON_OFFLINE
+          ? 'subsessionBar.daemon_details_direct_signaling_failed'
+          : code === DIRECT_FILE_TRANSFER_ERROR.CAPABILITY_UNAVAILABLE
+            ? 'subsessionBar.daemon_details_direct_runtime_unavailable'
+            : 'subsessionBar.daemon_details_direct_ice_failed';
+      setProbeErrorKey(key);
+      setProbeState(PROBE_VIEW_STATE.FAILED);
+    }
+  }, [capabilityReady, runtimeUnavailable, ws]);
+
+  useEffect(() => {
+    if (autoProbeStarted.current || !capabilityReady || runtimeUnavailable) return;
+    autoProbeStarted.current = true;
+    void runProbe();
+  }, [capabilityReady, runProbe, runtimeUnavailable]);
+
+  const routeKey = probeResult?.route === DIRECT_CONNECTIVITY_ROUTE.LAN_DIRECT
+    ? 'subsessionBar.daemon_details_direct_lan'
+    : probeResult?.route === DIRECT_CONNECTIVITY_ROUTE.RELAY
+      ? 'subsessionBar.daemon_details_direct_relay'
+      : 'subsessionBar.daemon_details_direct_ip';
+  const probeStageKeys: Record<DirectConnectivityProbeStage, string> = {
+    [DIRECT_CONNECTIVITY_PROBE_STAGE.AUTHORIZING]: 'subsessionBar.daemon_details_direct_stage_authorizing',
+    [DIRECT_CONNECTIVITY_PROBE_STAGE.CREATING_OFFER]: 'subsessionBar.daemon_details_direct_stage_offer',
+    [DIRECT_CONNECTIVITY_PROBE_STAGE.EXCHANGING_CANDIDATES]: 'subsessionBar.daemon_details_direct_stage_candidates',
+    [DIRECT_CONNECTIVITY_PROBE_STAGE.CHECKING]: 'subsessionBar.daemon_details_direct_stage_checking',
+    [DIRECT_CONNECTIVITY_PROBE_STAGE.DATA_CHANNEL_OPEN]: 'subsessionBar.daemon_details_direct_stage_channel',
+    [DIRECT_CONNECTIVITY_PROBE_STAGE.VERIFYING]: 'subsessionBar.daemon_details_direct_stage_verifying',
+    [DIRECT_CONNECTIVITY_PROBE_STAGE.COMPLETE]: 'subsessionBar.daemon_details_direct_stage_complete',
+  };
+  const endpointKindKeys: Record<DirectConnectivityEndpointKind, string> = {
+    [DIRECT_CONNECTIVITY_ENDPOINT_KIND.PRIVATE_ROUTED]: 'subsessionBar.daemon_details_direct_endpoint_private',
+    [DIRECT_CONNECTIVITY_ENDPOINT_KIND.PUBLIC_DIRECT]: 'subsessionBar.daemon_details_direct_endpoint_public',
+    [DIRECT_CONNECTIVITY_ENDPOINT_KIND.NAT_MAPPED]: 'subsessionBar.daemon_details_direct_endpoint_nat',
+    [DIRECT_CONNECTIVITY_ENDPOINT_KIND.PEER_REFLEXIVE]: 'subsessionBar.daemon_details_direct_endpoint_prflx',
+    [DIRECT_CONNECTIVITY_ENDPOINT_KIND.TURN_RELAY]: 'subsessionBar.daemon_details_direct_endpoint_relay',
+    [DIRECT_CONNECTIVITY_ENDPOINT_KIND.HOST_CANDIDATE]: 'subsessionBar.daemon_details_direct_endpoint_host',
+    [DIRECT_CONNECTIVITY_ENDPOINT_KIND.UNKNOWN]: 'subsessionBar.daemon_details_direct_endpoint_unknown',
+  };
+  const resolveEndpointKind = (
+    candidate: DirectConnectivityCandidateInfo | null,
+    candidateTypes: readonly DirectConnectivityCandidateType[],
+  ): DirectConnectivityEndpointKind => candidate
+      ? inferDirectConnectivityEndpointKind(candidate)
+      : inferDirectConnectivityEndpointKindFromTypes(candidateTypes);
+  const formatEndpointSummary = (
+    candidate: DirectConnectivityCandidateInfo | null,
+    candidateTypes: readonly DirectConnectivityCandidateType[],
+  ) => candidate || candidateTypes.length > 0
+    ? t(endpointKindKeys[resolveEndpointKind(candidate, candidateTypes)])
+    : t('subsessionBar.daemon_details_direct_no_candidates');
+  const formatEndpointTechnicalDetail = (
+    candidate: DirectConnectivityCandidateInfo | null,
+    candidateTypes: readonly DirectConnectivityCandidateType[],
+  ) => candidate
+      ? `${candidate.type.toUpperCase()} · ${candidate.address.includes(':') ? `[${candidate.address}]` : candidate.address}:${candidate.port}`
+      : candidateTypes.length > 0
+        ? candidateTypes.map((type) => type.toUpperCase()).join(' / ')
+        : t('subsessionBar.daemon_details_direct_no_candidates');
+  const browserCandidateTypes = probeDiagnostics?.browserCandidateTypes ?? [];
+  const daemonCandidateTypes = probeDiagnostics?.daemonCandidateTypes ?? [];
+  const probeStages = Object.values(DIRECT_CONNECTIVITY_PROBE_STAGE);
+  const probeStep = probeDiagnostics ? probeStages.indexOf(probeDiagnostics.stage) + 1 : 0;
 
   return (
     <div
@@ -463,6 +584,67 @@ function DaemonStatsModal({
         </div>
 
         <div class="daemon-details-health">
+          <div class="daemon-details-health-row daemon-details-direct-row">
+            <span>{t('subsessionBar.daemon_details_direct_connectivity')}</span>
+            <span class="daemon-details-direct-block">
+              <span class="daemon-details-direct-result">
+                {runtimeUnavailable || !capabilityReady ? (
+                  <span class="is-danger">{t('subsessionBar.daemon_details_direct_runtime_unavailable')}</span>
+                ) : probeState === PROBE_VIEW_STATE.PROBING ? (
+                  <span class="is-probing">{t('subsessionBar.daemon_details_direct_probing')}</span>
+                ) : probeState === PROBE_VIEW_STATE.SUCCESS && probeResult ? (
+                  <span class={probeResult.route === DIRECT_CONNECTIVITY_ROUTE.RELAY ? 'is-warning' : 'is-direct'}>
+                    {t(routeKey)} · {probeResult.rttMs.toFixed(1)} ms
+                    <small title={`${probeResult.remoteCandidate.address}:${probeResult.remoteCandidate.port}`}>
+                      {probeResult.localCandidate.type}/{probeResult.remoteCandidate.type} · {probeResult.localCandidate.transportType.toUpperCase()}
+                    </small>
+                  </span>
+                ) : probeState === PROBE_VIEW_STATE.FAILED && probeErrorKey ? (
+                  <span class="is-danger">{t(probeErrorKey)}</span>
+                ) : (
+                  <span>{t('subsessionBar.daemon_details_direct_not_tested')}</span>
+                )}
+                <button
+                  type="button"
+                  class="daemon-details-direct-refresh"
+                  onClick={() => { void runProbe(); }}
+                  disabled={!capabilityReady || runtimeUnavailable || probeState === PROBE_VIEW_STATE.PROBING}
+                  aria-label={t('subsessionBar.daemon_details_direct_refresh')}
+                  title={t('subsessionBar.daemon_details_direct_refresh')}
+                >
+                  ↻
+                </button>
+              </span>
+              {probeDiagnostics && !runtimeUnavailable && capabilityReady && (
+                <span class="daemon-details-direct-diagnostics" data-testid="direct-connectivity-diagnostics">
+                  <span>
+                    <b>{t('subsessionBar.daemon_details_direct_current_step')}</b>
+                    <em><strong>{probeStep}/{probeStages.length}</strong> · {t(probeStageKeys[probeDiagnostics.stage])}</em>
+                  </span>
+                  <span>
+                    <b>{t('subsessionBar.daemon_details_direct_browser_nat')}</b>
+                    <em>{formatEndpointSummary(probeResult?.remoteCandidate ?? null, browserCandidateTypes)}</em>
+                  </span>
+                  <span>
+                    <b>{t('subsessionBar.daemon_details_direct_daemon_nat')}</b>
+                    <em>{formatEndpointSummary(probeResult?.localCandidate ?? null, daemonCandidateTypes)}</em>
+                  </span>
+                  <details>
+                    <summary>{t('subsessionBar.daemon_details_direct_technical_details')}</summary>
+                    <span>
+                      <b>{t('subsessionBar.daemon_details_direct_browser_nat')}</b>
+                      <code>{formatEndpointTechnicalDetail(probeResult?.remoteCandidate ?? null, browserCandidateTypes)}</code>
+                    </span>
+                    <span>
+                      <b>{t('subsessionBar.daemon_details_direct_daemon_nat')}</b>
+                      <code>{formatEndpointTechnicalDetail(probeResult?.localCandidate ?? null, daemonCandidateTypes)}</code>
+                    </span>
+                    <small>{t('subsessionBar.daemon_details_direct_nat_note')}</small>
+                  </details>
+                </span>
+              )}
+            </span>
+          </div>
           <div class="daemon-details-health-row">
             <span>{t('subsessionBar.daemon_details_embedding')}</span>
             <span>
@@ -551,9 +733,6 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
     return () => document.removeEventListener('keydown', closeOnEscape);
   }, [showDaemonDetails]);
 
-  useEffect(() => {
-    if (desktopLayoutCapable) setShowDaemonDetails(false);
-  }, [desktopLayoutCapable]);
   const gestureCallbacksRef = useRef({
     onOpen,
     onFocus,
@@ -1023,11 +1202,12 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
           // Older daemons don't ship `embedding`; preserve null so the
           // icon falls through to its "unknown" rendering instead of
           // showing a misleading "ready".
-          embedding: (msg as { embedding?: EmbeddingStatus | null }).embedding ?? null,
+          embedding: msg.embedding ?? null,
           // Older daemons don't ship `disks`; null means "no data" so the
           // desktop strip simply hides the readout (and mobile never shows it).
           disks: msg.disks ?? null,
           shortRefHealth: msg.shortRefHealth ?? null,
+          directConnectivity: msg.directConnectivity ?? null,
         });
       }
     });
@@ -1107,7 +1287,14 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
             <span class="subcard-toolbar-label">{t('subsessionBar.subs_count', { count: subSessions.length })}</span>
             {/* Desktop: full stats in expanded toolbar */}
             {stats && (
-              <span class="daemon-stats-inline daemon-stats-inline-tech" title={`${stats.daemonVersion ? `Daemon ${stats.daemonVersion} | ` : ''}Load: ${stats.load1} / ${stats.load5} / ${stats.load15} | Uptime: ${formatUptime(stats.uptime)}${desktopLayoutCapable ? ` | ${localClockText}` : ''}`}>
+              <button
+                type="button"
+                class="daemon-stats-inline daemon-stats-inline-tech daemon-stats-trigger"
+                title={`${stats.daemonVersion ? `Daemon ${stats.daemonVersion} | ` : ''}Load: ${stats.load1} / ${stats.load5} / ${stats.load15} | Uptime: ${formatUptime(stats.uptime)}${desktopLayoutCapable ? ` | ${localClockText}` : ''}`}
+                onClick={() => setShowDaemonDetails(true)}
+                aria-haspopup="dialog"
+                aria-label={t('subsessionBar.daemon_details_open')}
+              >
                 {stats.daemonVersion && (
                   <>
                     {/* Display the short form (strips trailing -dev.NNN counter); the
@@ -1115,15 +1302,9 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
                     {desktopLayoutCapable ? (
                       <span class="daemon-stat-version">v{formatDaemonVersionShort(stats.daemonVersion)}</span>
                     ) : (
-                      <button
-                        type="button"
-                        class="daemon-stat-version daemon-stat-version-button"
-                        onClick={() => setShowDaemonDetails(true)}
-                        aria-haspopup="dialog"
-                        aria-label={t('subsessionBar.daemon_details_open')}
-                      >
+                      <span class="daemon-stat-version daemon-stat-version-chip">
                         {formatDaemonVersionMobile(stats.daemonVersion)}
-                      </button>
+                      </span>
                     )}
                     <span class="daemon-stat-sep"> · </span>
                   </>
@@ -1163,7 +1344,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
                     <span class="daemon-local-clock">{renderTechClock(localClockText)}</span>
                   </>
                 )}
-              </span>
+              </button>
             )}
           </>
         )}
@@ -1177,20 +1358,21 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
           const memTotal = useG ? totalGb.toFixed(1) : (stats.memTotal / div).toFixed(0);
           const ei = { fontSize: '0.65em', verticalAlign: 'middle' } as const;
           return (
-            <span class={`daemon-stats-inline daemon-stats-inline-tech daemon-stats-compact${desktopLayoutCapable ? '' : ' daemon-stats-mobile'}`} title={`${stats.daemonVersion ? `v${stats.daemonVersion} | ` : ''}CPU ${stats.cpu}% | Mem ${memUsed}/${memTotal}${unit} | Load: ${stats.load1} / ${stats.load5} / ${stats.load15} | Uptime: ${formatUptime(stats.uptime)}${desktopLayoutCapable ? ` | ${localClockText}` : ''}`}>
+            <button
+              type="button"
+              class={`daemon-stats-inline daemon-stats-inline-tech daemon-stats-compact daemon-stats-trigger${desktopLayoutCapable ? '' : ' daemon-stats-mobile'}`}
+              title={`${stats.daemonVersion ? `v${stats.daemonVersion} | ` : ''}CPU ${stats.cpu}% | Mem ${memUsed}/${memTotal}${unit} | Load: ${stats.load1} / ${stats.load5} / ${stats.load15} | Uptime: ${formatUptime(stats.uptime)}${desktopLayoutCapable ? ` | ${localClockText}` : ''}`}
+              onClick={() => setShowDaemonDetails(true)}
+              aria-haspopup="dialog"
+              aria-label={t('subsessionBar.daemon_details_open')}
+            >
               {/* Mobile-narrow stat strip — show short version; full string in title above. */}
               {stats.daemonVersion && (desktopLayoutCapable ? (
                 <span class="daemon-stat-version">v{formatDaemonVersionShort(stats.daemonVersion)} </span>
               ) : (
-                <button
-                  type="button"
-                  class="daemon-stat-version daemon-stat-version-button"
-                  onClick={() => setShowDaemonDetails(true)}
-                  aria-haspopup="dialog"
-                  aria-label={t('subsessionBar.daemon_details_open')}
-                >
+                <span class="daemon-stat-version daemon-stat-version-chip">
                   {formatDaemonVersionMobile(stats.daemonVersion)}
-                </button>
+                </span>
               ))}
               <span class={`daemon-stat-cpu${stats.cpu > 80 ? ' danger' : stats.cpu > 50 ? ' warn' : ''}`}><span style={ei}>⚙️</span>{stats.cpu}%</span>
               {' '}
@@ -1209,7 +1391,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
                   <span class="daemon-local-clock">{renderTechClock(localClockText)}</span>
                 </>
               )}
-            </span>
+            </button>
           );
         })()}
         {onNew && (
@@ -1542,9 +1724,10 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
           </div>
         </div>
       )}
-      {showDaemonDetails && isMobile && stats && (
+      {showDaemonDetails && stats && (
         <DaemonStatsModal
           stats={stats}
+          ws={ws}
           localClockText={localClockText}
           onClose={() => setShowDaemonDetails(false)}
           t={t}

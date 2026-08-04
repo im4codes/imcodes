@@ -1553,6 +1553,47 @@ describe('SubSessionWindow desktop file-browser stack integration', () => {
     activeToolCallMock = false;
   });
 
+  it('portals the mobile file browser outside the lower sub-session stacking context', async () => {
+    const originalUserAgent = navigator.userAgent;
+    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
+    const sub = makeSubSession({ type: 'claude-code-sdk', runtimeType: 'transport' as any } as any);
+    const { container, unmount } = render(
+      <SubSessionWindow
+        sub={sub}
+        ws={ws}
+        connected={true}
+        active={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        onMinimize={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRename={vi.fn()}
+        zIndex={6000}
+        onFocus={vi.fn()}
+      />,
+    );
+
+    try {
+      const subWindow = container.querySelector('.subsession-window') as HTMLElement | null;
+      const toggle = container.querySelector('button[title="picker.files"]') as HTMLButtonElement | null;
+      expect(subWindow).toBeTruthy();
+      expect(toggle).toBeTruthy();
+      toggle!.click();
+
+      await waitFor(() => {
+        const overlay = document.body.querySelector('.mobile-fb-overlay') as HTMLElement | null;
+        expect(overlay).toBeTruthy();
+        expect(overlay?.parentElement).toBe(document.body);
+        expect(subWindow?.contains(overlay)).toBe(false);
+        expect(overlay?.style.zIndex).toBe('');
+      });
+    } finally {
+      unmount();
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
+    }
+  });
+
   it('uses desktopFileBrowserZIndex for the floating child file-browser when supplied', async () => {
     const sub = makeSubSession({ type: 'claude-code-sdk', runtimeType: 'transport' as any } as any);
     const { container, rerender } = render(

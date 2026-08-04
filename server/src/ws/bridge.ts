@@ -35,16 +35,32 @@ import { RESOURCE_EVENT_MSG, type ResourceTopic } from '../../../shared/resource
 import { DAEMON_COMMAND_TYPES } from '../../../shared/daemon-command-types.js';
 import { PEER_AUDIT_COMMAND_ERRORS, PEER_AUDIT_MESSAGES } from '../../../shared/peer-audit.js';
 import { PeerAuditUnicastRouter } from './peer-audit-unicast-router.js';
+import { DirectFileTransferRouter } from './direct-file-transfer-router.js';
+import { createTurnIceServerAuthority } from './turn-credentials.js';
+import {
+  DIRECT_FILE_TRANSFER_AUTHENTICATED_ICE_CAPABILITY,
+  DIRECT_FILE_TRANSFER_CAPABILITY,
+  isDirectConnectivityRuntimeStatus,
+} from '../../../shared/direct-file-transfer.js';
 import { FS_TRANSPORT_MSG } from '../../../shared/fs-transport-messages.js';
 import {
   FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY,
   FILE_TRANSFER_MSG,
   FILE_TRANSFER_PATH_HANDLE_CAPABILITY,
   FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY,
+  validateAttachmentRef,
   validateControlledFileTransferResponse,
 } from '../../../shared/transport/file-transfer.js';
+import {
+  MACHINE_DIRECT_FILE_TRANSFER_CAPABILITY,
+  MACHINE_DIRECT_FILE_FETCH_CAPABILITY,
+  MACHINE_DIRECT_FILE_TRANSFER_MSG,
+  validateMachineDirectFetchResponse,
+  validateMachineDirectUploadResponse,
+} from '../../../shared/machine-direct-file-transfer.js';
 import { REPO_MSG, REPO_RELAY_TYPES } from '../../../shared/repo-types.js';
 import { TRANSPORT_RELAY_TYPES, TRANSPORT_MSG } from '../../../shared/transport-events.js';
+import { isEmbeddingStatus } from '../../../shared/embedding-status.js';
 import {
   MEMORY_WS,
   isMemoryManagementRequestType,
@@ -1221,6 +1237,26 @@ export class WsBridge {
       logWarn: (scope, fields, message) => { logger.warn(fields as Record<string, unknown>, message); },
     },
   );
+
+  /** Capability-bound WebRTC signaling routes; direct frames are never broadcast. */
+  private readonly directFileTransferRouter = new DirectFileTransferRouter({
+    serverId: () => this.serverId,
+    daemonAvailable: () => Boolean(
+      this.authenticated
+      && this.daemonNodeRole === NODE_ROLE.FULL
+      && this.daemonWs?.readyState === WebSocket.OPEN,
+    ),
+    daemonSupportsDirect: () => this.daemonP2pWorkflowCapabilities?.capabilities.includes(
+      DIRECT_FILE_TRANSFER_CAPABILITY,
+    ) ?? false,
+    daemonSupportsAuthenticatedIce: () => this.daemonP2pWorkflowCapabilities?.capabilities.includes(
+      DIRECT_FILE_TRANSFER_AUTHENTICATED_ICE_CAPABILITY,
+    ) ?? false,
+    daemonGeneration: () => this.daemonGeneration,
+    iceServers: (userId) => createTurnIceServerAuthority(userId),
+    sendDaemon: (message, generation) => this.trySendDirectFileTransfer(message, generation),
+    sendBrowser: (socket, message) => { safeSend(socket, JSON.stringify(message)); },
+  });
 
   /** Per-request memory management pending map — routes sensitive admin responses via requestId unicast. */
   private pendingMemoryManagementRequests = new Map<string, { socket: WebSocket; timer: ReturnType<typeof setTimeout> }>();
@@ -2419,6 +2455,10 @@ export class WsBridge {
     this.db = db;
     // Replace existing daemon connection
     if (this.daemonWs) {
+      // `ws.close()` completes asynchronously in production. Reject the old
+      // generation's request waiters before swapping `daemonWs`; otherwise the
+      // old socket's identity-guarded close handler cannot see or drain them.
+      this.rejectAllPendingFileTransfers('daemon_disconnected');
       try { this.daemonWs.close(1001, 'replaced'); } catch { /* ignore */ }
     }
     this.daemonWs = ws;
@@ -2427,6 +2467,7 @@ export class WsBridge {
     // stale result to a new waiter (10.6).
     this.daemonGeneration++;
     const connectionGeneration = this.daemonGeneration;
+    this.directFileTransferRouter.setDaemonGeneration(connectionGeneration);
     abandonPriorGenerations(this.serverId, this.daemonGeneration);
     // Invalidate every pending peer-audit response route: the prior daemon
     // is gone, and any reply that arrives for it must not be delivered to a
@@ -2575,7 +2616,9 @@ export class WsBridge {
                 .filter((capability): capability is string =>
                   capability === FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY
                   || capability === FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY
-                  || capability === FILE_TRANSFER_PATH_HANDLE_CAPABILITY),
+                  || capability === FILE_TRANSFER_PATH_HANDLE_CAPABILITY
+                  || capability === MACHINE_DIRECT_FILE_TRANSFER_CAPABILITY
+                  || capability === MACHINE_DIRECT_FILE_FETCH_CAPABILITY),
             )
           : new Set();
         this.authenticated = true;
@@ -2766,6 +2809,18 @@ export class WsBridge {
           }
           return;
         }
+        if (msg.type === MACHINE_DIRECT_FILE_TRANSFER_MSG.DONE || msg.type === MACHINE_DIRECT_FILE_TRANSFER_MSG.ERROR) {
+          const direct = validateMachineDirectUploadResponse(msg, validateAttachmentRef);
+          const resolved = direct.ok ? this.resolveFileTransfer(direct.value.requestId, direct.value as unknown as Record<string, unknown>) : false;
+          if (!resolved) WsBridge.controlledInboundDropped++;
+          return;
+        }
+        if (msg.type === MACHINE_DIRECT_FILE_TRANSFER_MSG.FETCH_DONE || msg.type === MACHINE_DIRECT_FILE_TRANSFER_MSG.FETCH_ERROR) {
+          const direct = validateMachineDirectFetchResponse(msg);
+          const resolved = direct.ok ? this.resolveFileTransfer(direct.value.requestId, direct.value as unknown as Record<string, unknown>) : false;
+          if (!resolved) WsBridge.controlledInboundDropped++;
+          return;
+        }
         const fileTransfer = validateControlledFileTransferResponse(msg);
         if (fileTransfer.ok) {
           const value = fileTransfer.value as unknown as Record<string, unknown>;
@@ -2815,6 +2870,10 @@ export class WsBridge {
 
       if (msg.type === P2P_WORKFLOW_MSG.DAEMON_HELLO) {
         this.handleDaemonP2pWorkflowHello(msg);
+        return;
+      }
+
+      if (this.directFileTransferRouter.handleDaemon(msg, connectionGeneration)) {
         return;
       }
 
@@ -3166,6 +3225,10 @@ export class WsBridge {
       }
       const browserMessageType = typeof msg.type === 'string' ? msg.type : '';
       if (!browserMessageType) {
+        return;
+      }
+
+      if (this.directFileTransferRouter.handleBrowser(ws, userId, msg)) {
         return;
       }
 
@@ -4563,6 +4626,11 @@ export class WsBridge {
       if (requestId) this.resolveFileTransfer(requestId, msg);
       return;
     }
+    if (type === FILE_TRANSFER_MSG.DELETE_DONE || type === FILE_TRANSFER_MSG.DELETE_ERROR) {
+      const requestId = msg.requestId as string | undefined;
+      if (requestId) this.resolveFileTransfer(requestId, msg);
+      return;
+    }
     if (type === 'file.download_done' || type === FILE_TRANSFER_MSG.DOWNLOAD_STREAM_READY || type === 'file.download_error') {
       const requestId = msg.downloadId as string | undefined;
       if (requestId) this.resolveFileTransfer(requestId, msg);
@@ -4640,7 +4708,23 @@ export class WsBridge {
       // Bypass TerminalForwardQueue: timeline events are control-plane and
       // must never queue behind PTY data. Critical for cancel/stop UX —
       // session.state(idle) used to arrive seconds after the push notification.
-      const timelineRecipients = this.sendJsonToSessionSubscribers(sessionId, JSON.stringify(msg));
+      // Timeline is the shared chat state for every browser viewing this
+      // server, not an exclusive transport stream. The web client normally
+      // keeps passive subscriptions for every known session, but those
+      // subscriptions are intentionally asynchronous (ownership checks,
+      // reconnect replay, runtime-type correction). Tying live timeline
+      // delivery to that transient map creates a multi-device split-brain:
+      // one device can receive every streaming assistant.text update while a
+      // second connected device misses them and only catches the persisted
+      // final event through history/backfill.
+      //
+      // Fan out to the subscribed viewer plus that same user's companion
+      // devices. Different users remain isolated by the session subscription
+      // boundary, and share-scoped sockets still pass through
+      // filterShareOutgoingJson(). PTY/raw frames, transport deltas, and
+      // request/response data remain on their existing subscription/unicast
+      // paths.
+      const timelineRecipients = this.sendJsonToSessionUserDevices(sessionId, JSON.stringify(msg));
       this.recordTimelineFanout(sessionId, rawEvent, timelineRecipients);
       return;
     }
@@ -5025,7 +5109,14 @@ export class WsBridge {
         daemonVersion: typeof msg.daemonVersion === 'string' ? msg.daemonVersion : this.daemonVersion,
         cpu: msg.cpu, memUsed: msg.memUsed, memTotal: msg.memTotal,
         load1: msg.load1, load5: msg.load5, load15: msg.load15, uptime: msg.uptime,
+        // The bridge rebuilds daemon.stats from an explicit allowlist. Keep
+        // embedding health on that list so the UI does not permanently fall
+        // back to "unknown" even while a current daemon is connected.
+        ...(isEmbeddingStatus(msg.embedding) ? { embedding: msg.embedding } : {}),
         ...(Array.isArray(msg.disks) ? { disks: msg.disks } : {}),
+        ...(isDirectConnectivityRuntimeStatus(msg.directConnectivity)
+          ? { directConnectivity: msg.directConnectivity }
+          : {}),
         // Memory-handle persistence failures ride this frame because the
         // daemon's own counter and log cannot leave a machine whose disk is
         // full. Rebuilding the payload without them put the signal in a hole:
@@ -5314,6 +5405,53 @@ export class WsBridge {
   }
 
   /**
+   * Deliver a live timeline event to current subscribers and to every other
+   * browser connection owned by those same users.
+   *
+   * Subscription state is still the authorization/routing anchor: a user with
+   * no socket subscribed to `sessionName` receives nothing. Once one of their
+   * devices is subscribed, companion devices must see the same chat stream
+   * even while their own reconnect/ownership/runtime-classification subscribe
+   * is still settling. This preserves cross-user session isolation while
+   * preventing the mobile-live / desktop-final-only split.
+   */
+  private sendJsonToSessionUserDevices(sessionName: string, json: string): number {
+    const msg = this.tryParseJsonRecord(json);
+    const sent = new Set<WebSocket>();
+    const viewerUserIds = new Set<string>();
+
+    const send = (ws: WebSocket, anchorViewer: boolean): void => {
+      if (sent.has(ws)) return;
+      const outgoing = msg ? this.filterShareOutgoingJson(ws, msg, json) : json;
+      if (!outgoing || !safeSend(ws, outgoing)) return;
+      sent.add(ws);
+      if (!anchorViewer) return;
+      const userId = this.browserUserIds.get(ws);
+      if (userId) viewerUserIds.add(userId);
+    };
+
+    for (const [ws, sessions] of this.browserSubscriptions) {
+      if (sessions.has(sessionName)) send(ws, true);
+    }
+    for (const [ws, sessions] of this.transportSubscriptions) {
+      if (sessions.has(sessionName)) send(ws, true);
+    }
+
+    // Ruled out as the cause of the sub-session streaming report: this fan-out
+    // was disabled in production for a full deploy cycle (the server image
+    // carries the web bundle, so app-build.json dates the running container)
+    // and sub-sessions still did not stream. It was also the only behavioural
+    // change on the streaming path between master and dev, so that path holds
+    // no regression — whatever breaks sub-session streaming is not in it.
+    if (viewerUserIds.size === 0) return sent.size;
+    for (const ws of this.browserSockets) {
+      const userId = this.browserUserIds.get(ws);
+      if (userId && viewerUserIds.has(userId)) send(ws, false);
+    }
+    return sent.size;
+  }
+
+  /**
    * Observe the fan-out result for a live timeline event.
    *
    * With zero subscribers both loops in `sendJsonToSessionSubscribers` simply never
@@ -5570,6 +5708,7 @@ export class WsBridge {
     this.transportSubscriptions.delete(ws);
     this.clearPendingFsRoutesForSocket(ws);
     this.peerAuditRouter.dropSocket(ws);
+    this.directFileTransferRouter.dropSocket(ws);
     // Clean up pending timeline requests for this socket
     for (const [reqId, pending] of this.pendingTimelineRequests) {
       if (pending.socket === ws) {
@@ -6271,6 +6410,9 @@ export class WsBridge {
   /** Force-close the daemon WebSocket. Use after token rotation to evict the stale connection. */
   kickDaemon(): void {
     if (this.daemonWs) {
+      // Production WebSocket close is asynchronous. Drain request waiters before
+      // clearing the socket identity, or the guarded close handler cannot do it.
+      this.rejectAllPendingFileTransfers('daemon_disconnected');
       try { this.daemonWs.close(4001, 'token_rotated'); } catch { /* ignore */ }
       this.daemonWs = null;
       this.authenticated = false;
@@ -6315,6 +6457,19 @@ export class WsBridge {
     }
   }
 
+  /** Direct-transfer signaling is connection-bound and must never enter the replay queue. */
+  private trySendDirectFileTransfer(message: Record<string, unknown>, expectedGeneration: number): boolean {
+    if (!this.daemonWs || !this.authenticated || this.daemonWs.readyState !== WebSocket.OPEN) return false;
+    if (this.daemonGeneration !== expectedGeneration || this.daemonNodeRole !== NODE_ROLE.FULL) return false;
+    try {
+      this.daemonWs.send(JSON.stringify(message));
+      return true;
+    } catch (error) {
+      logger.warn({ error, serverId: this.serverId, type: message.type }, 'Direct file transfer signaling send failed');
+      return false;
+    }
+  }
+
   sendToDaemon(message: string): void {
     const parsed = this.parseJsonObject(message);
     const parsedType = parsed?.type;
@@ -6340,6 +6495,9 @@ export class WsBridge {
       || parsedType === FILE_TRANSFER_MSG.DOWNLOAD
       || parsedType === FILE_TRANSFER_MSG.DOWNLOAD_STREAM
       || parsedType === FILE_TRANSFER_MSG.PATH_HANDLE
+      || parsedType === FILE_TRANSFER_MSG.DELETE
+      || parsedType === MACHINE_DIRECT_FILE_TRANSFER_MSG.REQUEST
+      || parsedType === MACHINE_DIRECT_FILE_TRANSFER_MSG.FETCH_REQUEST
     ) {
       logger.warn({ serverId: this.serverId, type: parsedType }, 'Dropped control command sent via generic sendToDaemon');
       return;
@@ -6676,11 +6834,18 @@ export class WsBridge {
     message: Record<string, unknown>,
     timeoutMs: number,
     onProgress?: (msg: Record<string, unknown>) => void,
+    expectedGeneration?: number,
   ): Promise<Record<string, unknown>> {
     const socket = this.daemonWs;
     const generation = this.daemonGeneration;
     if (!socket || !this.authenticated || socket.readyState !== WebSocket.OPEN) {
       return Promise.reject(new Error('daemon_offline'));
+    }
+    if (expectedGeneration !== undefined && generation !== expectedGeneration) {
+      return Promise.reject(new Error('daemon_generation_changed'));
+    }
+    if (this.pendingFileTransfers.has(requestId)) {
+      return Promise.reject(new Error('request_id_conflict'));
     }
     return new Promise<Record<string, unknown>>((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -6694,6 +6859,7 @@ export class WsBridge {
         if (
           this.daemonWs !== socket
           || this.daemonGeneration !== generation
+          || (expectedGeneration !== undefined && generation !== expectedGeneration)
           || !this.authenticated
           || socket.readyState !== WebSocket.OPEN
         ) {

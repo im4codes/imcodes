@@ -15,6 +15,12 @@ html { position: fixed; }
   --chrome-accent-2: #34d399;
   --chrome-accent-3: #a78bfa;
   --chrome-warm: #f59e0b;
+  /* Mobile layer contract: persistent navigation stays above session windows,
+     while full-screen work surfaces must cover the navigation instead of
+     rendering their headers underneath it. */
+  --mobile-server-bar-z: 6500;
+  --mobile-fullscreen-window-z: 7000;
+  --mobile-fullscreen-preview-z: 7001;
   --imcodes-app-font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
   --imcodes-app-cjk-font-family: 'PingFang SC', 'Microsoft YaHei', 'Hiragino Sans', 'Apple SD Gothic Neo', 'Malgun Gothic', sans-serif;
 }
@@ -345,6 +351,7 @@ html.native-ios-mac .chat-dl-btn {
 .shortcuts { display: flex; gap: 4px; padding: 4px 8px; overflow-x: auto; scrollbar-width: none; flex: 1; min-width: 0; }
 .shortcuts-transport { flex: 1 1 auto; min-width: 0; margin-left: 0; padding-left: 0; }
 .shortcuts::-webkit-scrollbar { display: none; }
+.shortcuts-meta-scroll { display: contents; }
 .shortcuts-model { padding: 4px 8px 4px 0; flex-shrink: 0; position: relative; }
 .shortcuts-model-supervision { display: inline-flex; align-items: center; gap: 4px; }
 .session-ctx-wrap { display: flex; align-items: center; gap: 4px; padding: 4px 8px 4px 0; flex-shrink: 0; cursor: default; }
@@ -774,24 +781,190 @@ html.native-ios-mac .chat-dl-btn {
   color: #cbd5e1;
 }
 .attachment-badges { display: flex; flex-wrap: wrap; gap: 4px; padding: 4px 8px 2px; position: relative; z-index: 1; }
+.composer-upload-list {
+  position: relative;
+  z-index: 1;
+  display: grid;
+  gap: 6px;
+  margin: 0 8px 5px;
+}
+.composer-upload-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) max-content max-content;
+  align-items: center;
+  min-height: 30px;
+  padding: 5px 7px;
+  column-gap: 9px;
+  row-gap: 5px;
+  border: 1px solid rgba(100, 116, 139, 0.22);
+  border-radius: 7px;
+  background: linear-gradient(100deg, rgba(15, 23, 42, 0.78), rgba(15, 23, 42, 0.46));
+}
+.composer-upload-name {
+  min-width: 0;
+  overflow: hidden;
+  color: #cbd5e1;
+  font-size: 11px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.composer-upload-transport {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  min-height: 18px;
+  padding: 1px 7px;
+  border: 1px solid rgba(148, 163, 184, 0.26);
+  border-radius: 999px;
+  background: rgba(51, 65, 85, 0.42);
+  color: #cbd5e1;
+  font-size: 10px;
+  font-weight: 750;
+  line-height: 1.35;
+  letter-spacing: 0.01em;
+  white-space: nowrap;
+}
+.composer-upload-transport-signal {
+  width: 6px;
+  height: 6px;
+  flex: 0 0 6px;
+  border-radius: 50%;
+  background: currentColor;
+  box-shadow: 0 0 7px currentColor;
+}
+.composer-upload-row-connecting,
+.composer-upload-row-direct {
+  border-color: rgba(34, 197, 94, 0.2);
+  background: linear-gradient(100deg, rgba(6, 78, 59, 0.2), rgba(15, 23, 42, 0.54));
+}
+.composer-upload-transport-connecting {
+  border-color: rgba(34, 211, 238, 0.34);
+  background: rgba(8, 145, 178, 0.13);
+  color: #67e8f9;
+}
+.composer-upload-transport-direct {
+  border-color: rgba(34, 197, 94, 0.4);
+  background: rgba(22, 163, 74, 0.14);
+  color: #86efac;
+}
+.composer-upload-row-falling_back,
+.composer-upload-row-relay {
+  border-color: rgba(245, 158, 11, 0.2);
+  background: linear-gradient(100deg, rgba(120, 53, 15, 0.18), rgba(15, 23, 42, 0.54));
+}
+.composer-upload-transport-falling_back,
+.composer-upload-transport-relay {
+  border-color: rgba(245, 158, 11, 0.38);
+  background: rgba(180, 83, 9, 0.14);
+  color: #fcd34d;
+}
+.composer-upload-transport-connecting .composer-upload-transport-signal,
+.composer-upload-transport-falling_back .composer-upload-transport-signal {
+  animation: composer-upload-signal 1.1s ease-in-out infinite;
+}
+.composer-upload-progress-track {
+  grid-column: 1 / 3;
+  height: 4px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.09);
+}
+.composer-upload-progress-fill {
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #0ea5e9, #22d3ee);
+  box-shadow: 0 0 7px rgba(34, 211, 238, 0.45);
+  transition: width 0.2s ease;
+}
+.composer-upload-row-direct .composer-upload-progress-fill {
+  background: linear-gradient(90deg, #16a34a, #4ade80);
+  box-shadow: 0 0 7px rgba(74, 222, 128, 0.42);
+}
+.composer-upload-row-falling_back .composer-upload-progress-fill,
+.composer-upload-row-relay .composer-upload-progress-fill {
+  background: linear-gradient(90deg, #d97706, #fbbf24);
+  box-shadow: 0 0 7px rgba(251, 191, 36, 0.38);
+}
+.composer-upload-progress-fill-error {
+  background: #ef4444 !important;
+  box-shadow: 0 0 7px rgba(239, 68, 68, 0.4) !important;
+}
+.composer-upload-progress-value {
+  color: #94a3b8;
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+.composer-upload-cancel {
+  appearance: none;
+  min-height: 20px;
+  padding: 1px 7px;
+  border: 1px solid rgba(248, 113, 113, 0.34);
+  border-radius: 999px;
+  background: rgba(127, 29, 29, 0.18);
+  color: #fca5a5;
+  cursor: pointer;
+  font: inherit;
+  font-size: 10px;
+  font-weight: 700;
+}
+.composer-upload-cancel:hover,
+.composer-upload-cancel:focus-visible {
+  border-color: rgba(248, 113, 113, 0.7);
+  background: rgba(153, 27, 27, 0.32);
+  color: #fecaca;
+}
+.composer-upload-stats {
+  display: flex;
+  grid-column: 1 / -1;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 5px 10px;
+  min-width: 0;
+  color: #94a3b8;
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.3;
+}
+.composer-upload-stats span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+@media (max-width: 640px) {
+  .composer-upload-stats {
+    gap: 4px 8px;
+  }
+}
+@keyframes composer-upload-signal {
+  0%, 100% { opacity: 0.45; transform: scale(0.82); }
+  50% { opacity: 1; transform: scale(1); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .composer-upload-transport-signal { animation: none !important; }
+}
 .attachment-badge { display: inline-flex; align-items: center; gap: 4px; background: rgba(15,23,42,0.72); border: 1px solid rgba(125,211,252,0.16); border-radius: 999px; padding: 2px 8px 2px 6px; font-size: 12px; color: #94a3b8; max-width: 200px; box-shadow: inset 0 1px 0 rgba(255,255,255,0.03); }
 .attachment-badge-icon { font-size: 11px; flex-shrink: 0; }
 .attachment-badge-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .attachment-badge-remove { background: none; border: none; color: #64748b; cursor: pointer; font-size: 14px; padding: 0 2px; line-height: 1; }
 .attachment-badge-remove:hover { color: #ef4444; }
+.attachment-badge-remove:disabled { cursor: wait; opacity: 0.45; }
 .quote-badge { border-color: rgba(167,139,250,0.42); background: rgba(76,29,149,0.28); }
 .quote-badge .attachment-badge-icon { color: #a78bfa; }
 .controls-target-bubble {
-  position: absolute;
-  left: 4px;
-  bottom: calc(100% + 5px);
-  z-index: 3;
+  position: relative;
+  z-index: 1;
   display: inline-flex;
   align-items: center;
+  align-self: center;
   gap: 6px;
+  flex: 0 1 auto;
   min-width: 0;
-  max-width: calc(100% - 8px);
-  height: 23px;
+  max-width: min(320px, calc(100vw - 96px));
+  height: 28px;
+  box-sizing: border-box;
   margin: 0;
   padding: 0 10px 0 8px;
   overflow: hidden;
@@ -1582,7 +1755,28 @@ html.native-ios-mac .chat-dl-btn {
   .controls-composer { min-height: 32px; }
   .shortcuts-row { overflow: visible; }
   .shortcuts { gap: 3px; padding: 4px 4px 4px 6px; }
-  .shortcuts-transport { flex: 1 1 auto; min-width: 30px; max-width: none; overflow: visible; padding-left: 0; }
+  .shortcuts-transport { flex: 0 0 auto; min-width: 0; max-width: none; overflow: visible; padding-left: 0; }
+  .shortcuts-meta-scroll {
+    display: flex;
+    align-items: center;
+    flex: 1 1 0;
+    min-width: 0;
+    overflow-x: auto;
+    overflow-y: hidden;
+    scrollbar-width: none;
+    overscroll-behavior-x: contain;
+    -webkit-overflow-scrolling: touch;
+  }
+  .shortcuts-meta-scroll::-webkit-scrollbar { display: none; }
+  .shortcuts-meta-scroll.has-open-menu { overflow: visible; }
+  /* Desktop right-aligns these controls because `.shortcuts` (flex: 1) eats the
+     free space and `display: contents` leaves them as direct row children. On
+     mobile the scroller itself is the growing box, so its children would pack
+     to the left of the leftover space instead. Push them back with an auto
+     start margin rather than `justify-content: flex-end`: on an overflowing
+     scroll container flex-end can make the leading items unreachable, whereas
+     the auto margin collapses to 0 once content overflows. */
+  .shortcuts-meta-scroll > :first-child { margin-inline-start: auto; }
   /* Bigger stop tap-target on mobile. Extra height comes from padding that is
      cancelled by equal negative vertical margins, so the button's margin-box
      (which drives the toolbar row height) is unchanged — the toolbar does not
@@ -2957,7 +3151,7 @@ html.native-ios-mac .chat-dl-btn {
      here. */
   /* Keep server selection above sub-session windows (6000), but below
      full-screen mobile panels (7000+) and system dialogs (9999+). */
-  .mobile-server-bar { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 7px 9px; background: linear-gradient(180deg, #0d1422 0%, #09111d 100%); border-bottom: 1px solid rgba(34,211,238,0.18); box-shadow: inset 0 1px 0 rgba(255,255,255,0.04), 0 4px 16px rgba(0,0,0,0.24); flex-shrink: 0; position: relative; z-index: 6500; }
+  .mobile-server-bar { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 7px 9px; background: linear-gradient(180deg, #0d1422 0%, #09111d 100%); border-bottom: 1px solid rgba(34,211,238,0.18); box-shadow: inset 0 1px 0 rgba(255,255,255,0.04), 0 4px 16px rgba(0,0,0,0.24); flex-shrink: 0; position: relative; z-index: var(--mobile-server-bar-z); }
   .mobile-server-bar::before { content: ''; position: absolute; left: 0; right: 0; top: 0; height: 1px; background: linear-gradient(90deg, transparent, rgba(34,211,238,0.72), rgba(52,211,153,0.55), transparent); pointer-events: none; }
   .mobile-sidebar-toggle { display: block; width: 36px; height: 36px; background: rgba(15,23,42,0.55); border: 1px solid rgba(125,211,252,0.16); border-radius: 10px; color: #94a3b8; font-size: 18px; cursor: pointer; padding: 0; line-height: 1; flex-shrink: 0; }
   .mobile-sidebar-toggle:active { color: var(--chrome-accent); border-color: rgba(34,211,238,0.5); background: rgba(8,145,178,0.16); }
@@ -2986,7 +3180,7 @@ html.native-ios-mac .chat-dl-btn {
 }
 
 /* Mobile sidebar overlay — always mounted, shown/hidden via .open class */
-.mobile-sidebar-overlay { position: fixed; inset: 0; z-index: 3000; background: rgba(0,0,0,0); pointer-events: none; transition: background 0.25s ease; }
+.mobile-sidebar-overlay { position: fixed; inset: 0; z-index: var(--mobile-fullscreen-window-z); background: rgba(0,0,0,0); pointer-events: none; transition: background 0.25s ease; }
 .mobile-sidebar-overlay.open { pointer-events: auto; background: rgba(0,0,0,0.5); }
 .mobile-sidebar-panel { position: absolute; top: 0; left: 0; width: 88%; max-width: 360px; height: var(--vvh, 100%); background: repeating-linear-gradient(90deg, transparent 0 22px, rgba(125,211,252,0.024) 22px 23px), linear-gradient(180deg, #0d1422 0%, #080d16 100%); border-right: 1px solid rgba(34,211,238,0.18); display: flex; flex-direction: column; box-shadow: 8px 0 28px rgba(0,0,0,0.48); transform: translateX(-100%); transition: transform 0.25s cubic-bezier(0.4,0,0.2,1); }
 .mobile-sidebar-overlay.open .mobile-sidebar-panel { transform: translateX(0); }
@@ -3128,8 +3322,23 @@ html.native-ios-mac .chat-dl-btn {
 .chat-user-message-fold-toggle { position: relative; z-index: 1; display: inline-flex; align-items: center; justify-content: center; margin-top: 6px; padding: 2px 8px; border: 1px solid rgba(147, 197, 253, 0.35); border-radius: 999px; background: rgba(15, 23, 42, 0.18); color: #bfdbfe; font-family: inherit; font-size: 11px; line-height: 1.4; cursor: pointer; -webkit-tap-highlight-color: transparent; }
 .chat-user-message-fold-toggle:hover { background: rgba(15, 23, 42, 0.32); border-color: rgba(147, 197, 253, 0.6); color: #e0f2fe; }
 .chat-user-message-fold-toggle:active { transform: translateY(1px); }
-.chat-assistant { padding: 6px 10px; word-break: break-word; overflow-wrap: break-word; line-height: 1.5; background: #161b22; border-radius: 8px; border-left: 2px solid #1e293b; }
-.chat-assistant-automation { border-left-color: #10b981; background: #101a19; }
+.chat-assistant { padding: 6px 10px; word-break: break-word; overflow-wrap: break-word; line-height: 1.5; background: #161b22; border-radius: 8px; border: 0; }
+/* Consecutive assistant.text events are one visual answer. The old per-event
+   margins exposed the blue chat backdrop as horizontal separator lines, and
+   the per-card left border made every streamed text segment look like a new
+   panel. Join adjacent text cards without changing spacing around tools or
+   user messages. */
+.chat-assistant:has(+ .chat-assistant) {
+  margin-bottom: 0;
+  border-bottom-left-radius: 0;
+  border-bottom-right-radius: 0;
+}
+.chat-assistant + .chat-assistant {
+  margin-top: -2px;
+  border-top-left-radius: 0;
+  border-top-right-radius: 0;
+}
+.chat-assistant-automation { background: #101a19; box-shadow: inset 2px 0 #10b981; }
 .chat-rich-text { white-space: pre-wrap; }
 .chat-code-block { background: #1a1a2e; border-radius: 8px; margin: 8px 0; overflow: hidden; }
 .chat-code-block pre { margin: 0; padding: 12px; overflow-x: auto; -webkit-overflow-scrolling: touch; font-size: 13px; line-height: 1.4; }
@@ -3155,15 +3364,18 @@ html.native-ios-mac .chat-dl-btn {
 .chat-tool-group { display: flex; flex-direction: column; gap: 2px; }
 .chat-tool-group .chat-event { margin: 0; }
 .chat-tool-group-indent { margin-left: 6px; display: flex; flex-direction: column; gap: 2px; }
-.chat-tool-activity-wrap { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; margin: 2px 0; min-width: 0; }
+.chat-tool-activity-wrap { display: flex; flex-direction: column; align-items: stretch; gap: 2px; margin: 2px 0; min-width: 0; }
 .chat-tool-activity {
   position: relative;
-  display: inline-flex;
+  display: flex;
   align-items: center;
   gap: 6px;
-  width: fit-content;
+  /* Full width on every client: the chip now carries a variable-length tool
+     descriptor, so sizing to content made it jump around as tools changed and
+     left no room to ellipse. */
+  width: 100%;
   max-width: 100%;
-  min-width: 218px;
+  min-width: 0;
   height: 26px;
   padding: 0 7px;
   overflow: hidden;
@@ -3246,9 +3458,194 @@ html.native-ios-mac .chat-dl-btn {
 .chat-tool-activity-segment.is-complete { background: linear-gradient(90deg, #0f766e, #34d399); }
 .chat-tool-activity-segment.is-running { background: linear-gradient(90deg, #0891b2, #67e8f9); box-shadow: 0 0 6px rgba(34, 211, 238, 0.7); }
 .chat-tool-activity-segment.is-failed { background: linear-gradient(90deg, #be123c, #fb7185); }
+/* Elapsed time of the newest tool. Shown on every client: during a long wait
+   "how long has this been going" is the question the counters cannot answer. */
+.chat-tool-activity-time {
+  flex: 0 0 auto;
+  color: #7dd3fc;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.02em;
+}
+/* A running timer changes every second; tabular figures above stop the chip
+   from twitching as digit widths change. */
+.chat-tool-activity-time.is-running { color: #67e8f9; }
+
+/* A miniature tool call: which tool, and what it was called with. Kept on every
+   screen size — it is the whole point of the chip during a long wait — so it
+   takes the slack and ellipses instead of being dropped on narrow screens. */
+.chat-tool-activity-last {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 5px;
+  overflow: hidden;
+  white-space: nowrap;
+}
+.chat-tool-activity-last-name { flex: 0 0 auto; color: #cbd5e1; font-weight: 600; }
+.chat-tool-activity-last-input {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #94a3b8;
+  opacity: 0.9;
+}
 .chat-tool-activity-chevron { flex: 0 0 auto; color: #64748b; font-size: 13px; transform: translateY(-1px); transition: transform 0.15s, color 0.15s; }
 .chat-tool-activity-wrap.is-expanded .chat-tool-activity-chevron { color: #67e8f9; transform: rotate(180deg) translateY(1px); }
-.chat-tool-activity-details { display: flex; flex-direction: column; gap: 2px; width: min(100%, 760px); margin-left: 6px; }
+
+/* ── Tool chip hover peek ──────────────────────────────────────────────────
+   Portalled to body and positioned from the chip's viewport rect, so it is
+   fixed rather than absolute and is not clipped by the chat scroller. */
+.chat-tool-peek {
+  position: fixed;
+  z-index: 60;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border: 1px solid rgba(34, 211, 238, 0.34);
+  border-radius: 10px;
+  background:
+    linear-gradient(180deg, rgba(8, 47, 73, 0.9), rgba(2, 6, 23, 0.94)),
+    repeating-linear-gradient(0deg, rgba(103, 232, 249, 0.05) 0 1px, transparent 1px 3px);
+  box-shadow:
+    0 18px 44px rgba(2, 6, 23, 0.66),
+    0 0 0 1px rgba(8, 145, 178, 0.12),
+    inset 0 1px 0 rgba(125, 211, 252, 0.12);
+  backdrop-filter: blur(14px) saturate(1.2);
+  -webkit-backdrop-filter: blur(14px) saturate(1.2);
+  color: #cbd5e1;
+  font-family: 'SF Mono', 'Cascadia Code', 'Fira Code', monospace;
+  font-size: 11px;
+  line-height: 1.5;
+  pointer-events: none;
+  animation: chat-tool-peek-in 0.13s ease-out;
+}
+.chat-tool-peek.is-failed { border-color: rgba(248, 113, 113, 0.42); }
+@keyframes chat-tool-peek-in {
+  from { opacity: 0; transform: translateY(3px) scale(0.99); }
+  to { opacity: 1; transform: none; }
+}
+/* Corner brackets — the HUD cue, drawn with one element so the panel keeps a
+   single child for layout. */
+.chat-tool-peek-frame {
+  position: absolute;
+  inset: 5px;
+  border-radius: 6px;
+  pointer-events: none;
+  background:
+    linear-gradient(90deg, #22d3ee 0 12px, transparent 12px) 0 0 / 100% 1px no-repeat,
+    linear-gradient(180deg, #22d3ee 0 12px, transparent 12px) 0 0 / 1px 100% no-repeat,
+    linear-gradient(270deg, #22d3ee 0 12px, transparent 12px) 100% 100% / 100% 1px no-repeat,
+    linear-gradient(0deg, #22d3ee 0 12px, transparent 12px) 100% 100% / 1px 100% no-repeat;
+  opacity: 0.5;
+}
+.chat-tool-peek-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex: 0 0 auto;
+  padding: 9px 12px 7px;
+  border-bottom: 1px solid rgba(34, 211, 238, 0.16);
+}
+.chat-tool-peek-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #34d399;
+  box-shadow: 0 0 8px rgba(52, 211, 153, 0.7);
+}
+.chat-tool-peek.is-running .chat-tool-peek-dot {
+  background: #22d3ee;
+  box-shadow: 0 0 8px rgba(34, 211, 238, 0.8);
+  animation: chat-tool-activity-core 1.25s ease-in-out infinite;
+}
+.chat-tool-peek.is-failed .chat-tool-peek-dot { background: #fb7185; box-shadow: 0 0 8px rgba(251, 113, 133, 0.7); }
+.chat-tool-peek-tool { color: #e2e8f0; font-weight: 700; letter-spacing: 0.02em; }
+.chat-tool-peek-status {
+  color: #67e8f9;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  padding: 2px 6px;
+  border: 1px solid rgba(34, 211, 238, 0.3);
+  border-radius: 999px;
+  background: rgba(8, 145, 178, 0.16);
+}
+.chat-tool-peek.is-failed .chat-tool-peek-status {
+  color: #fda4af;
+  border-color: rgba(248, 113, 113, 0.36);
+  background: rgba(190, 18, 60, 0.2);
+}
+.chat-tool-peek-duration { margin-left: auto; color: #64748b; font-variant-numeric: tabular-nums; }
+.chat-tool-peek-body { display: flex; flex-direction: column; gap: 10px; min-height: 0; overflow-y: auto; padding: 10px 12px 12px; }
+.chat-tool-peek-body::-webkit-scrollbar { width: 6px; }
+.chat-tool-peek-body::-webkit-scrollbar-thumb { border-radius: 3px; background: rgba(34, 211, 238, 0.26); }
+.chat-tool-peek-section { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.chat-tool-peek-label {
+  color: #7dd3fc;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  opacity: 0.75;
+}
+.chat-tool-peek-pre {
+  margin: 0;
+  max-height: 220px;
+  overflow: auto;
+  padding: 7px 9px;
+  border-left: 2px solid rgba(34, 211, 238, 0.4);
+  border-radius: 0 5px 5px 0;
+  background: rgba(15, 23, 42, 0.66);
+  color: #e2e8f0;
+  font: inherit;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.chat-tool-peek-pre.is-failed { border-left-color: rgba(248, 113, 113, 0.55); color: #fecaca; }
+.chat-tool-peek-pending { display: flex; align-items: center; gap: 8px; color: #67e8f9; }
+.chat-tool-peek-pending-bar {
+  position: relative;
+  flex: 1 1 auto;
+  height: 2px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: rgba(34, 211, 238, 0.16);
+}
+.chat-tool-peek-pending-bar::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 38%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, transparent, #22d3ee, transparent);
+  animation: chat-tool-peek-sweep 1.15s ease-in-out infinite;
+}
+@keyframes chat-tool-peek-sweep {
+  from { transform: translateX(-110%); }
+  to { transform: translateX(300%); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .chat-tool-peek { animation: none; }
+  .chat-tool-peek-pending-bar::after { animation: none; transform: none; width: 100%; }
+  .chat-tool-peek.is-running .chat-tool-peek-dot { animation: none; }
+}
+/* Expanded rows match the collapsed chip's full width. The old `min(100%, 760px)`
+   capped them well short of it, and combined with the left margin the content
+   ran past the right edge instead of fitting. `min-width: 0` lets the rows
+   inside shrink rather than forcing an overflow. */
+.chat-tool-activity-details {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  width: auto;
+  min-width: 0;
+  margin-left: 6px;
+}
 .chat-tool-activity-details .chat-event { margin: 0; }
 .chat-tool-activity-live {
   position: absolute;
@@ -3284,11 +3681,11 @@ html.native-ios-mac .chat-dl-btn {
   overflow: hidden;
   border: 1px solid rgba(56, 189, 248, 0.19);
   border-radius: 7px;
-  background:
-    linear-gradient(rgba(56, 189, 248, 0.025) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(56, 189, 248, 0.025) 1px, transparent 1px),
-    linear-gradient(115deg, rgba(8, 47, 73, 0.42), rgba(2, 6, 23, 0.9) 62%, rgba(30, 41, 59, 0.64));
-  background-size: 12px 12px, 12px 12px, auto;
+  /* No graph-paper grid here. The first of those layers drew a horizontal rule
+     every 12px, and a collapsed fold whose content is shorter than its box left
+     that texture bare — which reads as stray separator lines between the
+     messages around it, not as decoration. Plain gradient only. */
+  background: linear-gradient(115deg, rgba(8, 47, 73, 0.42), rgba(2, 6, 23, 0.9) 62%, rgba(30, 41, 59, 0.64));
   box-shadow: inset 0 1px 0 rgba(125, 211, 252, 0.06), 0 2px 8px rgba(0, 0, 0, 0.12);
   transition: border-color 0.16s, box-shadow 0.16s;
 }
@@ -3457,6 +3854,26 @@ html.native-ios-mac .chat-dl-btn {
 .chat-memory-context-status-detail { font-size: 11px; color: #94a3b8; white-space: pre-wrap; word-break: break-word; padding: 0 10px 10px; }
 .chat-mode { display: inline-block; background: #1e1338; color: #a78bfa; padding: 2px 8px; border-radius: 4px; font-size: 11px; }
 .chat-system { text-align: center; color: #475569; font-size: 11px; padding: 4px 0; }
+.delegation-reply-card {
+  /* This card can contain a full multi-page audit report. `.chat-view` is a
+     column flex scroller, so the default flex-shrink combined with this
+     card's overflow clipping can collapse it to the one-line header. Keep the
+     card at its content height and let the parent own vertical scrolling. */
+  flex: 0 0 auto;
+  align-self: stretch;
+  text-align: left;
+  padding: 10px 12px;
+  border: 1px solid rgba(34, 211, 238, 0.24);
+  border-radius: 10px;
+  background: linear-gradient(120deg, rgba(8, 47, 73, 0.34), rgba(15, 23, 42, 0.82));
+  color: #cbd5e1;
+  overflow: hidden;
+}
+.delegation-reply-card-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; margin-bottom: 7px; }
+.delegation-reply-card-head strong { color: #67e8f9; font-size: 12px; letter-spacing: 0.02em; }
+.delegation-reply-card-head span { min-width: 0; overflow: hidden; color: #94a3b8; text-overflow: ellipsis; white-space: nowrap; }
+.delegation-reply-card .chat-rich-text { color: #e2e8f0; font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
+.delegation-reply-card .chat-bubble-time { text-align: right; }
 .chat-loading { text-align: center; color: #475569; padding: 24px; }
 .chat-load-older-status { align-self: center; display: inline-flex; align-items: center; gap: 6px; margin: 4px auto 6px; padding: 4px 9px; border-radius: 999px; background: rgba(15, 23, 42, 0.78); border: 1px solid rgba(71, 85, 105, 0.72); color: #cbd5e1; font-size: 11px; line-height: 1; }
 .chat-history-overlay { position: absolute; left: 50%; bottom: 10px; transform: translateX(-50%); z-index: 4; min-height: 24px; max-width: min(92%, 560px); border-radius: 999px; background: rgba(15, 23, 42, 0.82); border: 1px solid rgba(51, 65, 85, 0.82); box-shadow: 0 8px 24px rgba(2, 6, 23, 0.28); backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); display: inline-flex; align-items: center; justify-content: center; gap: 7px; padding: 5px 9px; pointer-events: none; color: #94a3b8; }
@@ -3465,6 +3882,10 @@ html.native-ios-mac .chat-dl-btn {
 .chat-history-overlay-steps { display: flex; align-items: center; gap: 6px; min-width: 0; overflow: hidden; }
 .chat-history-step { display: inline-flex; align-items: center; gap: 3px; min-width: 0; font-size: 10px; line-height: 1.2; color: #64748b; white-space: nowrap; }
 .chat-history-step-icon { display: inline-block; width: 10px; text-align: center; color: inherit; opacity: 0.9; }
+/* How many events the step actually produced — a ✓ alone cannot distinguish
+   "nothing is stored locally" from "stored but not reaching the view". */
+.chat-history-step-count { margin-left: 1px; font-variant-numeric: tabular-nums; color: #7dd3fc; opacity: 0.95; }
+.chat-history-step.empty .chat-history-step-count { color: #f59e0b; }
 .chat-history-step.running { color: #60a5fa; }
 .chat-history-step.pending { color: #94a3b8; }
 .chat-history-step.done { color: #34d399; }
@@ -3562,33 +3983,40 @@ html.native-ios-mac .chat-dl-btn {
   color: #94a3b8;
   overflow: hidden;
 }
+.daemon-stats-trigger {
+  appearance: none;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: border-color 0.14s, background 0.14s, box-shadow 0.14s, color 0.14s;
+  -webkit-tap-highlight-color: transparent;
+}
+.daemon-stats-trigger:hover {
+  border-color: rgba(34,211,238,0.42);
+  background:
+    linear-gradient(90deg, rgba(34,211,238,0.16), rgba(168,85,247,0.13), rgba(15,23,42,0.48)),
+    repeating-linear-gradient(90deg, rgba(125,211,252,0.1) 0 1px, transparent 1px 12px);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.06), 0 0 18px rgba(34,211,238,0.15);
+}
+.daemon-stats-trigger:active { transform: scale(0.99); }
+.daemon-stats-trigger:focus-visible {
+  outline: 2px solid rgba(34,211,238,0.58);
+  outline-offset: 2px;
+}
 .daemon-stats-compact { font-size: 10px; }
 .daemon-stat-version,
 .daemon-stat-uptime,
 .daemon-stat-sep { color: #94a3b8; }
-.daemon-stat-version-button {
-  appearance: none;
+.daemon-stat-version-chip {
+  display: inline-block;
   margin: -2px 3px -2px -3px;
   padding: 2px 5px;
   border: 1px solid rgba(34,211,238,0.34);
   border-radius: 999px;
   background: rgba(8,145,178,0.13);
   color: #67e8f9;
-  font: inherit;
   line-height: 1.15;
-  cursor: pointer;
   box-shadow: inset 0 1px 0 rgba(255,255,255,0.05), 0 0 10px rgba(34,211,238,0.12);
-  -webkit-tap-highlight-color: transparent;
-}
-.daemon-stat-version-button:active {
-  color: #d1fae5;
-  border-color: rgba(52,211,153,0.68);
-  background: rgba(6,95,70,0.28);
-  transform: scale(0.97);
-}
-.daemon-stat-version-button:focus-visible {
-  outline: 2px solid rgba(34,211,238,0.52);
-  outline-offset: 2px;
 }
 .daemon-stat-cpu { color: #4ade80; text-shadow: 0 0 9px rgba(74,222,128,0.28); }
 .daemon-stat-cpu.warn { color: #fbbf24; text-shadow: 0 0 9px rgba(251,191,36,0.30); }
@@ -3827,6 +4255,101 @@ html.native-ios-mac .chat-dl-btn {
 .daemon-details-health-row > span:first-child { color: #64748b; font-weight: 700; }
 .daemon-details-health-row > span:last-child { min-width: 0; overflow-wrap: anywhere; color: #cbd5e1; text-align: right; }
 .daemon-details-health-row.is-danger > span:last-child { color: #fca5a5; }
+.daemon-details-direct-row { align-items: flex-start; }
+.daemon-details-direct-block {
+  display: grid;
+  min-width: 0;
+  gap: 8px;
+}
+.daemon-details-direct-result {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
+.daemon-details-direct-result > span { display: grid; gap: 2px; }
+.daemon-details-direct-result small {
+  color: #64748b;
+  font: 9px/1.2 'SF Mono', 'Cascadia Code', monospace;
+  text-transform: uppercase;
+}
+.daemon-details-direct-result .is-direct { color: #86efac; }
+.daemon-details-direct-result .is-warning { color: #fcd34d; }
+.daemon-details-direct-result .is-danger { color: #fca5a5; }
+.daemon-details-direct-result .is-probing { color: #67e8f9; }
+.daemon-details-direct-diagnostics {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  padding: 7px 8px;
+  border: 1px solid rgba(34, 211, 238, 0.14);
+  border-radius: 7px;
+  background: rgba(8, 47, 73, 0.2);
+  text-align: left;
+}
+.daemon-details-direct-diagnostics > span {
+  display: grid;
+  grid-template-columns: minmax(86px, auto) 1fr;
+  gap: 8px;
+  align-items: baseline;
+}
+.daemon-details-direct-diagnostics b {
+  color: #64748b;
+  font-size: 9px;
+}
+.daemon-details-direct-diagnostics em {
+  min-width: 0;
+  color: #cbd5e1;
+  font: normal 9px/1.35 'SF Mono', 'Cascadia Code', monospace;
+  overflow-wrap: anywhere;
+  text-align: right;
+}
+.daemon-details-direct-diagnostics em strong { color: #67e8f9; }
+.daemon-details-direct-diagnostics details {
+  border-top: 1px solid rgba(34, 211, 238, 0.1);
+  padding-top: 4px;
+  color: #64748b;
+  font: 8px/1.35 'SF Mono', 'Cascadia Code', monospace;
+}
+.daemon-details-direct-diagnostics summary {
+  cursor: pointer;
+  list-style-position: inside;
+  text-align: right;
+  user-select: none;
+}
+.daemon-details-direct-diagnostics details > span {
+  display: grid;
+  grid-template-columns: minmax(86px, auto) 1fr;
+  gap: 8px;
+  margin-top: 4px;
+  align-items: baseline;
+}
+.daemon-details-direct-diagnostics code {
+  color: #94a3b8;
+  font: inherit;
+  overflow-wrap: anywhere;
+  text-align: right;
+}
+.daemon-details-direct-diagnostics small {
+  display: block;
+  margin-top: 4px;
+  color: #475569;
+  font: 8px/1.35 'SF Mono', 'Cascadia Code', monospace;
+  text-align: right;
+}
+.daemon-details-direct-refresh {
+  flex: 0 0 auto;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 1px solid rgba(34, 211, 238, 0.35);
+  border-radius: 7px;
+  background: rgba(8, 47, 73, 0.45);
+  color: #67e8f9;
+  cursor: pointer;
+}
+.daemon-details-direct-refresh:disabled { opacity: 0.4; cursor: default; }
+.daemon-details-direct-refresh:not(:disabled):hover { border-color: #22d3ee; color: #ecfeff; }
 .daemon-details-clock {
   color: #67e8f9 !important;
   font-family: 'SF Mono', 'Cascadia Code', 'Fira Code', monospace;
@@ -5369,15 +5892,16 @@ html.native-ios-mac .chat-dl-btn {
 }
 .html-fullscreen-preview-error { color: #dc2626; }
 .fb-modal-wide { width: min(92vw, 900px) !important; }
-.mobile-fb-overlay { position: fixed; inset: 0; z-index: 2000; background: #0f172a; display: flex; flex-direction: column; }
+.mobile-fb-overlay { position: fixed; inset: 0; z-index: var(--mobile-fullscreen-window-z); background: #0f172a; display: flex; flex-direction: column; }
 .mobile-fb-header { display: flex; align-items: center; justify-content: space-between; padding: 10px 14px; border-bottom: 1px solid #334155; flex-shrink: 0; }
 .fb-preview-back { display: none; background: none; border: none; color: #94a3b8; cursor: pointer; font-size: 16px; padding: 2px 6px 2px 0; line-height: 1; }
 .fb-preview-back:hover { color: #e2e8f0; }
 @media (max-width: 640px) {
+  .fb-overlay { z-index: var(--mobile-fullscreen-window-z); }
   .fb-breadcrumb-seg { max-width: 11ch; }
   .fb-breadcrumb-seg.active { max-width: 16ch; }
   .fb-body-split > .fb-tree { display: none; }
-  .fb-body-split .fb-preview { position: fixed; inset: 0; z-index: 2000; background: #0f172a; display: flex; flex-direction: column; width: 100%; height: 100%; }
+  .fb-body-split .fb-preview { position: fixed; inset: 0; z-index: var(--mobile-fullscreen-preview-z); background: #0f172a; display: flex; flex-direction: column; width: 100%; height: 100%; }
   .fb-preview-back { display: block; }
   .fb-modal-wide { width: min(96vw, 900px) !important; }
 }

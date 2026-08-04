@@ -50,8 +50,13 @@ export function useNowTicker(active: boolean, intervalMs = 1000): number {
     const store = getStore(intervalMs);
     const listener: Listener = (value) => setNow(value);
     store.listeners.add(listener);
-    setNow(store.now);
+    // Start BEFORE seeding: a store whose last listener left keeps its final
+    // `now` forever, so seeding from it first would render one frame of an
+    // arbitrarily stale time — visible as a nonsense elapsed value on anything
+    // that counts up from a timestamp. `startStore` refreshes `now` when it was
+    // stopped; when it is already running, `now` is at most one interval old.
     startStore(intervalMs, store);
+    setNow(store.now);
 
     return () => {
       store.listeners.delete(listener);

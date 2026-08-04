@@ -257,8 +257,9 @@ describe('computer use IPC macOS GUI-session boundary', () => {
       helperExecutable: '/public/imcodes-helper',
       openComputerUseExecutable: '/public/Open Computer Use.app/Contents/MacOS/OpenComputerUse',
     };
-    const downloadHelper = vi.fn(async (input: { dir: string }) => {
-      const helperDir = join(input.dir, 'computer-use-helper', 'darwin-arm64');
+    const downloadHelper = vi.fn(async (input: { dir: string; target: { os: string; arch: string } }) => {
+      expect(input.target).toEqual({ os: 'mac', arch: 'universal' });
+      const helperDir = join(input.dir, 'computer-use-helper', 'darwin-universal');
       const artifactPath = join(helperDir, 'open-computer-use.app.zip');
       await mkdir(helperDir, { recursive: true });
       await writeFile(artifactPath, 'downloaded-ocu');
@@ -303,8 +304,9 @@ describe('computer use IPC macOS GUI-session boundary', () => {
         nodeRole: NODE_ROLE.CONTROLLED,
       },
       platform: 'darwin',
-      arch: 'arm64',
+      arch: 'x64',
       execPath,
+      macosComputerUseRuntimeRoot: join(dir, 'empty-runtime'),
       resolveMacosConsoleUser: async () => user,
       prepareMacosComputerUseRuntime: prepareRuntime,
       authorizeMacosComputerUseSocket: async () => {},

@@ -10,9 +10,13 @@ import {
   listSendTargets,
 } from '../../src/daemon/send-tool.js';
 import { isSendDispatchId, isSendMessageId } from '../../shared/send-message-id.js';
+import { AGENT_DELEGATION_PURPOSES } from '../../shared/agent-delegation.js';
+import { getDelegationReplyStore } from '../../src/daemon/delegation-reply-store.js';
 
 function session(overrides: Partial<SessionRecord> & Pick<SessionRecord, 'name' | 'projectName' | 'role'>): SessionRecord {
   return {
+    sessionInstanceId: `instance_${overrides.name.replace(/[^A-Za-z0-9_-]/g, '_')}`,
+    runtimeEpoch: `epoch_${overrides.name.replace(/[^A-Za-z0-9_-]/g, '_')}`,
     agentType: 'codex',
     projectDir: `/work/${overrides.projectName}`,
     state: 'idle',
@@ -111,7 +115,7 @@ describe('send-tool', () => {
       dispatchMessage,
     });
 
-    expect(result.status).toBe('accepted');
+    expect(result).toMatchObject({ status: 'accepted' });
     if (result.status !== 'accepted') throw new Error('expected accepted');
     expect(isSendDispatchId(result.dispatchId)).toBe(true);
     expect(isSendMessageId(result.messageId)).toBe(true);
@@ -130,7 +134,7 @@ describe('send-tool', () => {
       cancelSession,
     });
 
-    expect(result.status).toBe('accepted');
+    expect(result).toMatchObject({ status: 'accepted' });
     if (result.status !== 'accepted') throw new Error('expected accepted');
     expect(isSendDispatchId(result.dispatchId)).toBe(true);
     expect(result.deliveries).toEqual([{ target: 'deck_alpha_w1', status: 'delivered' }]);
@@ -149,8 +153,8 @@ describe('send-tool', () => {
       cancelSession,
     });
 
-    expect(result.status).toBe('accepted');
-    if (result.status !== 'accepted') throw new Error('expected accepted');
+    if (result.status !== 'accepted') throw new Error(JSON.stringify(result));
+    expect(result).toMatchObject({ status: 'accepted' });
     expect(cancelSession).toHaveBeenCalledTimes(2);
     expect(result.deliveries.map((d) => d.target).sort()).toEqual(['deck_alpha_w1', 'deck_alpha_w2']);
   });
@@ -484,12 +488,57 @@ describe('send-tool', () => {
 
   it('adds callback instructions when reply is requested', async () => {
     const dispatchMessage = vi.fn().mockResolvedValue(undefined);
+    const origin = session({ name: 'deck_alpha_brain', projectName: 'alpha', role: 'brain', label: 'Brain' });
+    const target = session({ name: 'deck_alpha_w1', projectName: 'alpha', role: 'w1', label: 'Coder' });
     await dispatchSendMessage(caller, { target: 'deck_alpha_w1', message: 'do it', reply: true }, {
-      listSessions: () => [session({ name: 'deck_alpha_w1', projectName: 'alpha', role: 'w1', label: 'Coder' })],
+      listSessions: () => [origin, target],
       dispatchMessage,
     });
 
-    expect(dispatchMessage.mock.calls[0][1]).toContain('imcodes send "deck_alpha_brain" "Task: <brief summary of the request>\\nResult: <your response>"');
-    expect(dispatchMessage.mock.calls[0][1]).not.toContain('imcodes send --no-reply');
+    expect(dispatchMessage.mock.calls[0][1]).toContain('<imcodes-agent-delegation-reply-instruction-v2>');
+    expect(dispatchMessage.mock.calls[0][1]).toContain('delegation_reply');
+    expect(dispatchMessage.mock.calls[0][1]).not.toContain('send your response using: imcodes send');
+  });
+
+  it('persists strict supervision audit purpose only for one reply-enabled target', async () => {
+    const dispatchMessage = vi.fn().mockResolvedValue(undefined);
+    const origin = session({ name: 'deck_alpha_brain', projectName: 'alpha', role: 'brain' });
+    const target = session({ name: 'deck_alpha_w1', projectName: 'alpha', role: 'w1', label: 'Auditor' });
+    const result = await dispatchSendMessage(caller, {
+      target: target.name,
+      message: 'perform the configured audit',
+      reply: true,
+      audit: {
+        kind: AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT,
+        attemptId: 'automatic_audit_attempt_1',
+      },
+    }, {
+      listSessions: () => [origin, target],
+      dispatchMessage,
+    });
+
+    if (result.status !== 'accepted') throw new Error(JSON.stringify(result));
+    expect(result).toMatchObject({ status: 'accepted' });
+    const delegationId = result.deliveries[0]?.delegationId;
+    expect(delegationId).toBeTruthy();
+    expect(getDelegationReplyStore().get(delegationId!)).toMatchObject({
+      purpose: AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT,
+      auditAttemptId: 'automatic_audit_attempt_1',
+    });
+
+    await expect(dispatchSendMessage(caller, {
+      target: target.name,
+      message: 'invalid uncorrelated audit',
+      audit: {
+        kind: AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT,
+        attemptId: 'automatic_audit_attempt_2',
+      },
+    }, {
+      listSessions: () => [origin, target],
+      dispatchMessage,
+    })).resolves.toMatchObject({
+      status: 'error',
+      reason: 'validation_failed',
+    });
   });
 });

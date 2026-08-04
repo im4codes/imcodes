@@ -10,6 +10,7 @@ import type { UseQuickDataResult } from './QuickInputPanel.js';
 import { FileBrowser } from './file-browser-lazy.js';
 import { CloneSessionGroupDialog } from './CloneSessionGroupDialog.js';
 import { useSwipeBack } from '../hooks/useSwipeBack.js';
+import { useNowTicker } from '../hooks/useNowTicker.js';
 import { SessionActionMenuIcon } from './SessionActionMenuIcon.js';
 import * as VoiceInput from './VoiceInput.js';
 import { VoiceOverlay } from './VoiceOverlay.js';
@@ -49,7 +50,8 @@ import { parseBooleanish, usePref } from '../hooks/usePref.js';
 import { useSupervisorDefaults } from '../hooks/useSupervisorDefaults.js';
 import { PREF_KEY_P2P_COMBO_CONFIRM_SKIP, PREF_KEY_P2P_DROPDOWN_TAB, p2pSessionConfigLegacyPrefKeys, p2pSessionConfigPrefKey } from '../constants/prefs.js';
 import { parseP2pSavedConfig, serializeP2pSavedConfig } from '../preferences/p2p-config-pref.js';
-import { uploadFile, sendSessionViaHttp, cancelSessionViaHttp } from '../api.js';
+import { sendSessionViaHttp, cancelSessionViaHttp, deleteAttachment } from '../api.js';
+import { DirectFileTransferFailure, isFileUploadCanceled, uploadFileWithDirectFallback, type FileUploadTransportMode } from '../direct-file-transfer.js';
 import { patchSession, patchSubSession } from '../api.js';
 import { isImeComposingKeyEvent } from '../ime-keyboard.js';
 import { deriveSessionLiveStatus, isRunningSessionState } from '../session-live-status.js';
@@ -94,6 +96,7 @@ import {
   type SupervisionMode,
 } from '@shared/supervision-config.js';
 import { FILE_TRANSFER_LIMITS } from '@shared/transport/file-transfer.js';
+import { DIRECT_FILE_TRANSFER_STATE } from '@shared/direct-file-transfer.js';
 import { shouldHideOptimisticUserMessageForSessionControl } from '@shared/session-control-commands.js';
 import type { SharedActorEnvelope } from '@shared/tab-sharing.js';
 import { EXECUTION_CLONE_KIND } from '@shared/execution-clone.js';
@@ -384,13 +387,14 @@ const IME_ESCAPE_CANCEL_GRACE_MS = 800;
  * `clearComposer` clears the attachments array.
  */
 type ComposerAttachment = { path: string; name: string; seq: number };
+type ComposerAttachmentRecord = ComposerAttachment & { id?: string; serverId?: string };
 
 /**
  * Renumber attachments so `seq` is `1..N` in array order. Used after
  * removing a middle attachment so the remaining ones renumber to stay
  * consecutive (otherwise `#1`, `#3`, `#5` gaps would confuse users).
  */
-function renumberAttachments(list: ComposerAttachment[]): ComposerAttachment[] {
+function renumberAttachments(list: ComposerAttachmentRecord[]): ComposerAttachmentRecord[] {
   return list.map((entry, index) => ({ ...entry, seq: index + 1 }));
 }
 
@@ -520,7 +524,7 @@ const aliasPickerEmptyStyle: Record<string, string | number> = {
   cursor: 'default',
 };
 
-function parseStoredComposerAttachments(raw: string | null): ComposerAttachment[] {
+function parseStoredComposerAttachments(raw: string | null): ComposerAttachmentRecord[] {
   if (!raw) return [];
   try {
     const parsed = JSON.parse(raw);
@@ -532,7 +536,7 @@ function parseStoredComposerAttachments(raw: string | null): ComposerAttachment[
      * consecutive across reloads even when the old entries lack
      * `seq`.
      */
-    const list: ComposerAttachment[] = parsed.flatMap((entry) => {
+    const list: ComposerAttachmentRecord[] = parsed.flatMap((entry) => {
       if (!entry || typeof entry !== 'object') return [];
       const path = typeof (entry as { path?: unknown }).path === 'string'
         ? (entry as { path: string }).path.trim()
@@ -541,7 +545,13 @@ function parseStoredComposerAttachments(raw: string | null): ComposerAttachment[
         ? (entry as { name: string }).name.trim()
         : '';
       if (!path || !name) return [];
-      return [{ path, name, seq: 0 }];
+      const id = typeof (entry as { id?: unknown }).id === 'string'
+        ? (entry as { id: string }).id.trim()
+        : undefined;
+      const storedServerId = typeof (entry as { serverId?: unknown }).serverId === 'string'
+        ? (entry as { serverId: string }).serverId.trim()
+        : undefined;
+      return [{ path, name, seq: 0, ...(id ? { id } : {}), ...(storedServerId ? { serverId: storedServerId } : {}) }];
     });
     return renumberAttachments(list);
   } catch {
@@ -549,7 +559,7 @@ function parseStoredComposerAttachments(raw: string | null): ComposerAttachment[
   }
 }
 
-function appendStoredComposerAttachment(storageKey: string, attachment: ComposerAttachment): ComposerAttachment[] {
+function appendStoredComposerAttachment(storageKey: string, attachment: ComposerAttachmentRecord): ComposerAttachmentRecord[] {
   const current = parseStoredComposerAttachments(window.sessionStorage.getItem(storageKey));
   const next = renumberAttachments([...current, attachment]);
   window.sessionStorage.setItem(storageKey, JSON.stringify(next));
@@ -566,6 +576,13 @@ type ComposerUploadItem = {
   name: string;
   progress: number;
   status: 'uploading' | 'done' | 'error';
+  transport: FileUploadTransportMode;
+  totalBytes: number;
+  startedAt: number;
+  lastSampleAt: number;
+  lastSampleBytes: number;
+  speedBps: number;
+  updatedAt: number;
 };
 
 type ComposerUploadEntry = {
@@ -578,6 +595,7 @@ const DEFAULT_COMPOSER_UPLOAD_STATE: ComposerUploadSnapshot = {
   error: null,
 };
 const composerUploadStore = new Map<string, ComposerUploadEntry>();
+const composerUploadAbortControllers = new Map<string, AbortController>();
 let composerUploadIdCounter = 0;
 
 function createComposerUploadId(): string {
@@ -625,6 +643,96 @@ function updateComposerUploadItem(key: string, id: string, patch: Partial<Compos
       item.id === id ? { ...item, ...patch } : item
     )),
   });
+}
+
+function updateComposerUploadProgress(key: string, id: string, rawProgress: number, now = Date.now()): void {
+  const entry = getComposerUploadEntry(key);
+  updateComposerUploadSnapshot(key, {
+    uploads: entry.snapshot.uploads.map((item) => {
+      if (item.id !== id) return item;
+      const clamped = Math.max(0, Math.min(100, Math.round(rawProgress)));
+      const progress = Math.max(item.progress, clamped);
+      const transferredBytes = Math.round((item.totalBytes * progress) / 100);
+      const sampleElapsedMs = now - item.lastSampleAt;
+      let speedBps = item.speedBps;
+      let lastSampleAt = item.lastSampleAt;
+      let lastSampleBytes = item.lastSampleBytes;
+      if (transferredBytes > item.lastSampleBytes && sampleElapsedMs >= 250) {
+        const instantSpeed = ((transferredBytes - item.lastSampleBytes) * 1000) / sampleElapsedMs;
+        speedBps = item.speedBps > 0
+          ? (item.speedBps * 0.7) + (instantSpeed * 0.3)
+          : instantSpeed;
+        lastSampleAt = now;
+        lastSampleBytes = transferredBytes;
+      }
+      return {
+        ...item,
+        progress,
+        speedBps,
+        lastSampleAt,
+        lastSampleBytes,
+        updatedAt: now,
+      };
+    }),
+  });
+}
+
+function updateComposerUploadTransport(
+  key: string,
+  id: string,
+  transport: FileUploadTransportMode,
+  now = Date.now(),
+): void {
+  const entry = getComposerUploadEntry(key);
+  updateComposerUploadSnapshot(key, {
+    uploads: entry.snapshot.uploads.map((item) => {
+      if (item.id !== id || item.transport === transport) return item;
+      const enteringDirect = transport === DIRECT_FILE_TRANSFER_STATE.DIRECT;
+      const restartingForRelay = transport === DIRECT_FILE_TRANSFER_STATE.FALLING_BACK
+        || (transport === DIRECT_FILE_TRANSFER_STATE.RELAY
+          && item.transport !== DIRECT_FILE_TRANSFER_STATE.FALLING_BACK);
+      const resetPhase = enteringDirect || restartingForRelay;
+      return {
+        ...item,
+        transport,
+        ...(restartingForRelay ? { progress: 0 } : {}),
+        ...(resetPhase ? {
+          lastSampleAt: now,
+          lastSampleBytes: 0,
+          speedBps: 0,
+        } : {}),
+        updatedAt: now,
+      };
+    }),
+  });
+}
+
+function formatUploadBytes(bytes: number): string {
+  const safeBytes = Math.max(0, Number.isFinite(bytes) ? bytes : 0);
+  const units: Array<{ size: number; unit: Intl.NumberFormatOptions['unit'] }> = [
+    { size: 1024 ** 4, unit: 'terabyte' },
+    { size: 1024 ** 3, unit: 'gigabyte' },
+    { size: 1024 ** 2, unit: 'megabyte' },
+    { size: 1024, unit: 'kilobyte' },
+    { size: 1, unit: 'byte' },
+  ];
+  const selected = units.find((entry) => safeBytes >= entry.size) ?? units[units.length - 1];
+  return new Intl.NumberFormat(undefined, {
+    style: 'unit',
+    unit: selected.unit,
+    unitDisplay: 'short',
+    maximumFractionDigits: selected.size === 1 ? 0 : 1,
+  }).format(safeBytes / selected.size);
+}
+
+function formatUploadDuration(seconds: number): string {
+  const totalSeconds = Math.max(0, Math.round(Number.isFinite(seconds) ? seconds : 0));
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const remainder = totalSeconds % 60;
+  return hours > 0
+    ? `${hours}:${String(minutes).padStart(2, '0')}:${String(remainder).padStart(2, '0')}`
+    : `${minutes}:${String(remainder).padStart(2, '0')}`;
 }
 
 function removeComposerUploadItems(key: string, ids: readonly string[]): void {
@@ -1235,7 +1343,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const draftRef = useRef('');      // saved unsent text while navigating
   const imeComposingRef = useRef(false);
   const lastImeCompositionAtRef = useRef(0);
-  const attachmentDraftRef = useRef<ComposerAttachment[]>([]);
+  const attachmentDraftRef = useRef<ComposerAttachmentRecord[]>([]);
   const composerDraftScope = buildComposerDraftScope(activeSession, subSessionId);
   const draftKey = composerDraftScope ? `rcc_draft_${composerDraftScope}` : null;
   const attachmentDraftKey = composerDraftScope ? `rcc_draft_attachments_${composerDraftScope}` : null;
@@ -1248,9 +1356,11 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const [uploadSnapshot, setUploadSnapshot] = useState(() => getComposerUploadSnapshot(composerUploadKey));
   const uploadRows = uploadSnapshot.uploads;
   const uploading = uploadRows.some((item) => item.status === 'uploading');
+  const uploadNow = useNowTicker(uploading);
   const uploadError = uploadSnapshot.error;
   const [sendWarning, setSendWarning] = useState<string | null>(null);
-  const [attachments, setAttachments] = useState<ComposerAttachment[]>([]);
+  const [attachments, setAttachments] = useState<ComposerAttachmentRecord[]>([]);
+  const [deletingAttachmentKeys, setDeletingAttachmentKeys] = useState<Set<string>>(() => new Set());
   const [pendingDelegateTarget, setPendingDelegateTarget] = useState<PendingDelegateTarget | null>(null);
   const sendWarningTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [localTransportConfig, setLocalTransportConfig] = useState<Record<string, unknown> | null>(activeSession?.transportConfig ?? null);
@@ -3505,6 +3615,10 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         mutationCommandId = sendQueuedMessageMutation('session.edit_queued_message', {
           clientMessageId: editingQueuedMessageId,
           text: payload.text,
+          // The daemon drops the previous expansion (it belongs to the old
+          // text) and re-expands from this; without it an edited message that
+          // still references an alias loses its value.
+          ...buildAliasSendExtra(payload.text, aliasAll),
         });
         if (!mutationCommandId) return 'rejected';
       } catch {
@@ -3628,7 +3742,13 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     if (entry.status !== 'failed') return;
     let commandId: string | null = null;
     try {
-      commandId = sendSessionMessage(entry.text);
+      // Re-resolve the markers in the retried text. The failed entry's text
+      // keeps its `;;(name)` markers (values never live on the timeline), so a
+      // bare resend would deliver the literal marker to a legend agent and
+      // fail closed on shell/script. Resolving here — instead of replaying a
+      // stored map — also keeps alias VALUES out of queue component state and
+      // picks up any edit made since the original send.
+      commandId = sendSessionMessage(entry.text, buildAliasSendExtra(entry.text, aliasAll));
     } catch {
       commandId = null;
     }
@@ -3645,7 +3765,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       });
       return next;
     });
-  }, [incomingQueuedTransportVersion, sendSessionMessage]);
+  }, [aliasAll, incomingQueuedTransportVersion, sendSessionMessage]);
 
   const maybePersistComboSendSkip = useCallback(() => {
     if (!rememberComboSendChoice) return;
@@ -4014,30 +4134,64 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     if (files.length === 0 || !serverId) return false;
     const uploadKey = composerUploadKey;
     const uploadAttachmentDraftKey = attachmentDraftKey;
-    const uploadItems = files.map((file) => ({
-      id: createComposerUploadId(),
-      name: file.name || 'file',
-      progress: 0,
-      status: 'uploading' as const,
-    }));
+    const uploadItems = files.map((file) => {
+      const now = Date.now();
+      return {
+        id: createComposerUploadId(),
+        name: file.name || 'file',
+        progress: 0,
+        status: 'uploading' as const,
+        transport: DIRECT_FILE_TRANSFER_STATE.CONNECTING,
+        totalBytes: file.size,
+        startedAt: now,
+        lastSampleAt: now,
+        lastSampleBytes: 0,
+        speedBps: 0,
+        updatedAt: now,
+      };
+    });
     addComposerUploadItems(uploadKey, uploadItems);
 
-    const uploadedAttachments = await Promise.all(files.map(async (file, index) => {
+    const uploadedAttachments = await Promise.all(files.map(async (file, index): Promise<ComposerAttachmentRecord | null> => {
       const uploadItem = uploadItems[index];
+      const abortController = new AbortController();
+      composerUploadAbortControllers.set(uploadItem.id, abortController);
       try {
-        const result = await uploadFile(serverId, file, (pct) => {
-          updateComposerUploadItem(uploadKey, uploadItem.id, { progress: pct });
+        const result = await uploadFileWithDirectFallback({
+          ws,
+          serverId,
+          file,
+          onProgress: (pct) => {
+            updateComposerUploadProgress(uploadKey, uploadItem.id, pct);
+          },
+          onMode: (transport) => {
+            updateComposerUploadTransport(uploadKey, uploadItem.id, transport);
+          },
+          signal: abortController.signal,
         });
-        updateComposerUploadItem(uploadKey, uploadItem.id, { progress: 100, status: 'done' });
+        updateComposerUploadProgress(uploadKey, uploadItem.id, 100);
+        updateComposerUploadItem(uploadKey, uploadItem.id, { status: 'done' });
         if (result.attachment?.daemonPath) {
-          return { path: result.attachment.daemonPath, name: file.name, seq: 0 };
+          return {
+            path: result.attachment.daemonPath,
+            name: file.name,
+            seq: 0,
+            ...(result.attachment.id ? { id: result.attachment.id } : {}),
+            ...(result.attachment.serverId ? { serverId: result.attachment.serverId } : { serverId }),
+          };
         }
         return null;
       } catch (err) {
+        if (isFileUploadCanceled(err)) {
+          removeComposerUploadItems(uploadKey, [uploadItem.id]);
+          return null;
+        }
         console.error('[upload] failed:', err);
         const body = err instanceof Error ? err.message : String(err);
         let errorMessage: string;
-        if (isInsufficientCapacityError(body)) {
+        if (err instanceof DirectFileTransferFailure && err.code === 'relay_size_limit') {
+          errorMessage = t('upload.direct_required_large', { max: MAX_UPLOAD_SIZE_MB });
+        } else if (isInsufficientCapacityError(body)) {
           errorMessage = t('upload.insufficient_capacity');
         } else if (body.includes('daemon_offline')) {
           errorMessage = t('upload.daemon_offline');
@@ -4050,13 +4204,15 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         updateComposerUploadSnapshot(uploadKey, { error: errorMessage });
         setTimeout(() => updateComposerUploadSnapshot(uploadKey, { error: null }), 5000);
         return null;
+      } finally {
+        composerUploadAbortControllers.delete(uploadItem.id);
       }
     }));
 
-    const successfulAttachments = uploadedAttachments.filter((entry): entry is ComposerAttachment => !!entry);
+    const successfulAttachments = uploadedAttachments.filter((entry): entry is ComposerAttachmentRecord => !!entry);
     if (successfulAttachments.length > 0) {
       if (uploadAttachmentDraftKey) {
-        let next: ComposerAttachment[] = [];
+        let next: ComposerAttachmentRecord[] = [];
         for (const attachment of successfulAttachments) {
           next = appendStoredComposerAttachment(uploadAttachmentDraftKey, attachment);
         }
@@ -4070,6 +4226,34 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     removeComposerUploadItems(uploadKey, uploadItems.map((item) => item.id));
     return successfulAttachments.length > 0;
   }, [attachmentDraftKey, composerUploadKey, serverId, t]);
+
+  const handleCancelUpload = useCallback((item: ComposerUploadItem) => {
+    if (!window.confirm(t('upload.cancel_confirm', { name: item.name }))) return;
+    composerUploadAbortControllers.get(item.id)?.abort();
+  }, [t]);
+
+  const handleRemoveAttachment = useCallback(async (attachment: ComposerAttachmentRecord) => {
+    const attachmentKey = attachment.id ?? attachment.path;
+    if (deletingAttachmentKeys.has(attachmentKey)) return;
+    const inferredId = attachment.id ?? attachment.path.split(/[\\/]/).pop();
+    setDeletingAttachmentKeys((current) => new Set(current).add(attachmentKey));
+    try {
+      if (inferredId && (attachment.serverId || serverId)) {
+        await deleteAttachment(attachment.serverId || serverId!, inferredId);
+      }
+      setAttachments((current) => renumberAttachments(current.filter((entry) => entry !== attachment)));
+    } catch (error) {
+      console.error('[upload] delete failed:', error);
+      updateComposerUploadSnapshot(composerUploadKey, { error: t('upload.delete_failed') });
+      setTimeout(() => updateComposerUploadSnapshot(composerUploadKey, { error: null }), 5000);
+    } finally {
+      setDeletingAttachmentKeys((current) => {
+        const next = new Set(current);
+        next.delete(attachmentKey);
+        return next;
+      });
+    }
+  }, [composerUploadKey, deletingAttachmentKeys, serverId, t]);
 
   const handleFileUpload = useCallback(async (files: FileList | null) => {
     if (!files || files.length === 0) return;
@@ -4350,7 +4534,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
 
   return (
     <>
-    {mobileFileBrowserOpen && ws && activeSession && (
+    {mobileFileBrowserOpen && ws && activeSession && createPortal(
       <div class="mobile-fb-overlay" ref={swipeBackRef}>
         <div class="mobile-fb-header">
           <span style={{ fontSize: 13, fontWeight: 600 }}>📁 Files</span>
@@ -4375,7 +4559,8 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           }}
           onClose={onMobileFileBrowserClose}
         />
-      </div>
+      </div>,
+      document.body,
     )}
     {openSpecFolderPath && ws && activeSession && (
       <div class="fb-overlay openspec-folder-overlay" onClick={() => setOpenSpecFolderPath(null)}>
@@ -4478,8 +4663,29 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
               </button>
             );
           })}
+          {showComposerTarget && (
+            <div
+              class="controls-target-bubble"
+              role="status"
+              aria-live="polite"
+              aria-label={t('session.composer_target_aria', { name: composerTargetPath })}
+            >
+              <span class="controls-target-pulse" aria-hidden="true" />
+              <span class="controls-target-label">{t('session.composer_target_label')}</span>
+              <span class="controls-target-name" title={composerTargetPath}>
+                {composerParentName && composerParentName !== composerTargetName && (
+                  <>
+                    <span class="controls-target-parent">{composerParentName}</span>
+                    <span class="controls-target-arrow" aria-hidden="true">→</span>
+                  </>
+                )}
+                <span class="controls-target-child">{composerTargetName}</span>
+              </span>
+            </div>
+          )}
         </div>}
 
+        <div class={`shortcuts-meta-scroll${autoOpen || modelOpen || thinkingOpen ? ' has-open-menu' : ''}`}>
         {/* Quick peer delegation reuses the ordinary @agent orchestration path.
             It stays separate from automatic supervision state and remains
             visible while Auto is off. */}
@@ -5169,6 +5375,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
             </>
           )}
         </div>}
+        </div>
       </div>}
 
       {pendingTransportApproval && effectiveRuntimeType === 'transport' && (
@@ -5254,40 +5461,79 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
 
       {/* Upload progress bars */}
       {uploadRows.length > 0 && (
-        <div style={{ margin: '0 8px 4px', display: 'grid', gap: 6 }}>
-          {uploadRows.map((item) => (
-            <div
-              key={item.id}
-              data-testid="composer-upload-row"
-              style={{ minHeight: 24, display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) 38px', alignItems: 'center', columnGap: 8, rowGap: 4 }}
-            >
-              <span
-                title={item.name}
-                style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 11, color: '#94a3b8' }}
-              >
-                {item.name}
-              </span>
+        <div class="composer-upload-list">
+          {uploadRows.map((item) => {
+            const transferredBytes = Math.round((item.totalBytes * item.progress) / 100);
+            const elapsedSeconds = Math.max(0, (Math.max(uploadNow, item.updatedAt) - item.startedAt) / 1000);
+            const remainingBytes = Math.max(0, item.totalBytes - transferredBytes);
+            const etaSeconds = item.speedBps > 0 ? remainingBytes / item.speedBps : null;
+            return (
               <div
-                role="progressbar"
-                aria-label={`${item.name} upload progress`}
-                aria-valuemin={0}
-                aria-valuemax={100}
-                aria-valuenow={item.progress}
-                style={{ gridColumn: '1 / -1', height: 4, background: 'rgba(255,255,255,0.1)', borderRadius: 2, overflow: 'hidden' }}
+                key={item.id}
+                data-testid="composer-upload-row"
+                data-transport={item.transport}
+                class={`composer-upload-row composer-upload-row-${item.transport}`}
               >
                 <div
-                  style={{
-                    width: `${item.progress}%`,
-                    height: '100%',
-                    background: item.status === 'error' ? '#ef4444' : '#3b82f6',
-                    borderRadius: 2,
-                    transition: 'width 0.2s ease',
-                  }}
-                />
+                  title={item.name}
+                  class="composer-upload-name"
+                >
+                  {item.name}
+                </div>
+                <span
+                  data-testid="composer-upload-transport"
+                  data-transport={item.transport}
+                  class={`composer-upload-transport composer-upload-transport-${item.transport}`}
+                  title={t(`upload.transport.${item.transport}`)}
+                >
+                  <span class="composer-upload-transport-signal" aria-hidden="true" />
+                  {t(`upload.transport.${item.transport}`)}
+                </span>
+                {item.status === 'uploading' && (
+                  <button
+                    type="button"
+                    class="composer-upload-cancel"
+                    onClick={() => handleCancelUpload(item)}
+                    title={t('upload.cancel')}
+                    aria-label={t('upload.cancel_named', { name: item.name })}
+                  >{t('upload.cancel')}</button>
+                )}
+                <div
+                  role="progressbar"
+                  aria-label={t('upload.progress_aria', {
+                    name: item.name,
+                    transport: t(`upload.transport.${item.transport}`),
+                    progress: item.progress,
+                  })}
+                  aria-valuemin={0}
+                  aria-valuemax={100}
+                  aria-valuenow={item.progress}
+                  class="composer-upload-progress-track"
+                >
+                  <div
+                    class={`composer-upload-progress-fill${item.status === 'error' ? ' composer-upload-progress-fill-error' : ''}`}
+                    style={{ width: `${item.progress}%` }}
+                  />
+                </div>
+                <span data-testid="composer-upload-progress" class="composer-upload-progress-value">{item.progress}%</span>
+                <div data-testid="composer-upload-stats" class="composer-upload-stats">
+                  <span>{t('upload.transferred', {
+                    transferred: formatUploadBytes(transferredBytes),
+                    total: formatUploadBytes(item.totalBytes),
+                  })}</span>
+                  <span>{item.speedBps > 0
+                    ? t('upload.speed', { speed: formatUploadBytes(item.speedBps) })
+                    : t('upload.speed_calculating')}</span>
+                  <span>{t('upload.elapsed', { time: formatUploadDuration(elapsedSeconds) })}</span>
+                  <span>{etaSeconds !== null && item.progress < 100
+                    ? t('upload.eta', { time: formatUploadDuration(etaSeconds) })
+                    : item.progress >= 100
+                      ? t('upload.eta_done')
+                      : t('upload.eta_calculating')}</span>
+                </div>
               </div>
-              <span data-testid="composer-upload-progress" style={{ fontSize: 11, color: '#94a3b8', textAlign: 'right' }}>{item.progress}%</span>
-            </div>
-          ))}
+            );
+          })}
         </div>
       )}
 
@@ -5322,7 +5568,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       {/* Attachment badges — above input row */}
       {attachments.length > 0 && (
         <div class="attachment-badges">
-          {attachments.map((a, i) => (
+          {attachments.map((a) => (
             <span
               key={a.path}
               class="attachment-badge"
@@ -5340,8 +5586,9 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
               <span class="attachment-badge-name">{a.name}</span>
               <button
                 class="attachment-badge-remove"
-                onClick={() => setAttachments((prev) => renumberAttachments(prev.filter((_, j) => j !== i)))}
-                title={t('common.delete')}
+                disabled={deletingAttachmentKeys.has(a.id ?? a.path)}
+                onClick={() => { void handleRemoveAttachment(a); }}
+                title={deletingAttachmentKeys.has(a.id ?? a.path) ? t('upload.deleting') : t('common.delete')}
               >×</button>
             </span>
           ))}
@@ -5725,26 +5972,6 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         */}
         {mobileComposerExpanded && <div class="controls-composer-backdrop" onClick={() => setMobileComposerExpanded(false)} />}
         <div class={`controls-composer${showEmbeddedVoiceButton ? ' controls-composer-with-voice' : ''}${mobileComposerExpanded ? ' controls-composer-mobile-expanded' : ''}`}>
-          {showComposerTarget && (
-            <div
-              class="controls-target-bubble"
-              role="status"
-              aria-live="polite"
-              aria-label={t('session.composer_target_aria', { name: composerTargetPath })}
-            >
-              <span class="controls-target-pulse" aria-hidden="true" />
-              <span class="controls-target-label">{t('session.composer_target_label')}</span>
-              <span class="controls-target-name" title={composerTargetPath}>
-                {composerParentName && composerParentName !== composerTargetName && (
-                  <>
-                    <span class="controls-target-parent">{composerParentName}</span>
-                    <span class="controls-target-arrow" aria-hidden="true">→</span>
-                  </>
-                )}
-                <span class="controls-target-child">{composerTargetName}</span>
-              </span>
-            </div>
-          )}
           <div
             ref={divRef}
             class={`controls-input${inputDisabled ? ' controls-input-disabled' : ''}${p2pMode !== 'solo' ? ' controls-input-p2p' : ''}${showEmbeddedVoiceButton ? ' controls-input-with-trailing' : ''}${fileDragActive ? ' controls-input-file-drag-over' : ''}`}

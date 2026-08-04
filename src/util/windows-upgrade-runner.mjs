@@ -364,6 +364,31 @@ function sharpRepair(npmPrefix) {
   }
 }
 
+/** Verify and repair node-datachannel's native addon after the global install.
+ *
+ * The top-level upgrade intentionally uses --ignore-scripts for sharp, which
+ * also skips node-datachannel's native install hook. Rebuild only this optional
+ * dependency with lifecycle scripts enabled, then verify it can actually be
+ * imported. Failure remains non-fatal because relay upload is still available.
+ */
+function nodeDatachannelRepair(npmPrefix) {
+  const imcodesDir = join(npmPrefix, 'node_modules', 'imcodes');
+  const repairScript = join(imcodesDir, 'dist', 'src', 'util', 'node-datachannel-repair.mjs');
+  if (!existsSync(repairScript)) {
+    log('node-datachannel repair utility absent — relay remains enabled');
+    return;
+  }
+  const result = spawnSync(process.execPath, [repairScript, imcodesDir], {
+    env: { ...process.env, IMCODES_NPM_BIN: NPM_CMD },
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+    windowsHide: true,
+    timeout: 6 * 60_000,
+  });
+  if (result.stderr) log(result.stderr.toString().trim());
+  if (result.status !== 0) log('node-datachannel repair unavailable — relay remains enabled');
+}
+
 /** Schedule a deferred delete of the runner's tmp dir.
  *
  *  IMPORTANT: only call this on the SUCCESS path.  On failure paths we
@@ -512,6 +537,11 @@ async function main() {
   trace(5, 'pre-sharp-repair');
   try { sharpRepair(npmPrefix); } catch (e) { log(`sharp repair threw: ${e?.message ?? e}`); }
   trace(5, 'post-sharp-repair');
+
+  // Step 5.1: node-datachannel native addon repair (best effort).
+  trace(5, 'pre-node-datachannel-repair');
+  try { nodeDatachannelRepair(npmPrefix); } catch (e) { log(`node-datachannel repair threw: ${e?.message ?? e}`); }
+  trace(5, 'post-node-datachannel-repair');
 
   // Step 6: Kill stale watchdogs and the old daemon.
   trace(6, 'pre-kill-watchdogs');

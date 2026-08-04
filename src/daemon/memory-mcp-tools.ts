@@ -62,6 +62,7 @@ import {
   type ComputerUseResult,
 } from '../../shared/computer-use.js';
 import { FILE_TRANSFER_LIMITS, FILE_TRANSFER_PATH_MAX_BYTES } from '../../shared/transport/file-transfer.js';
+import { MACHINE_FILE_TRANSFER_TRANSPORT, type MachineFileTransferTransport } from '../../shared/machine-direct-file-transfer.js';
 import { isValidMachineName, isValidMachineTarget, normalizeMachineTarget } from '../../shared/machine-reference.js';
 import { MEMORY_PROJECT_SCOPE_REASON } from '../../shared/memory-project-scope.js';
 import { sanitizeMcpErrorMessage } from '../../shared/mcp-error-sanitize.js';
@@ -85,6 +86,14 @@ import {
   PEER_AUDIT_VALIDATION_OUTCOMES,
   type PeerAuditReplyEnvelope,
 } from '../../shared/peer-audit.js';
+import {
+  AGENT_DELEGATION_PURPOSES,
+  AGENT_DELEGATION_REPLY_VERSION,
+  decodeAgentDelegationReplyEnvelope,
+  isAgentDelegationOpaqueId,
+  type AgentDelegationAuditRequest,
+  type AgentDelegationReplyEnvelope,
+} from '../../shared/agent-delegation.js';
 import { decodePeerAuditReplyCommandStructure } from './peer-audit-reply-ingress.js';
 import { deriveMemoryToolCaller, type McpRuntimeCaller } from './memory-mcp-caller.js';
 import { memoryGetSources } from '../context/memory-read-tools.js';
@@ -108,7 +117,7 @@ import {
 /** Upper bound on records expanded for one colliding handle. */
 const AMBIGUOUS_REF_CANDIDATE_CAP = 4;
 import { GitOriginRepositoryIdentityService } from '../agent/repository-identity-service.js';
-import { ALIAS_MCP_TOOLS, toAliasMetadata, type AliasMcpToolName } from '../../shared/alias-types.js';
+import { ALIAS_DESCRIPTION_MAX, ALIAS_MCP_TOOLS, toAliasMetadata, type AliasMcpToolName } from '../../shared/alias-types.js';
 import {
   aliasMcpList,
   aliasMcpResolve,
@@ -162,6 +171,7 @@ export interface MemoryMcpToolDeps {
   saveObservation?: typeof saveObservation;
   savePreference?: typeof savePreference;
   peerAuditReply?: (envelope: PeerAuditReplyEnvelope) => Promise<Record<string, unknown>> | Record<string, unknown>;
+  delegationReply?: (envelope: AgentDelegationReplyEnvelope) => Promise<Record<string, unknown>> | Record<string, unknown>;
   getProcessedProjectionById?: (id: string) => Promise<ProcessedContextProjection | undefined> | ProcessedContextProjection | undefined;
   archiveMemory?: (id: string) => Promise<boolean> | boolean;
   restoreArchivedMemory?: (id: string) => Promise<boolean> | boolean;
@@ -231,7 +241,7 @@ export interface ComputerUseToolResult {
 }
 
 export type MachineFileToolResult =
-  | { ok: true; size: number; attachmentId: string; remotePath?: string; destinationPath?: string }
+  | { ok: true; size: number; attachmentId: string; transport: MachineFileTransferTransport; remotePath?: string; destinationPath?: string }
   | { ok: false; reason: MCPErrorReason; error?: string };
 
 export interface MachineToolDeps {
@@ -469,6 +479,21 @@ function parseCloneArg(value: unknown): SendMessageCloneRequest | undefined | 'i
     ephemeral: true,
     parentRunId: record.parentRunId,
     parentStage: record.parentStage,
+  };
+}
+
+const AUDIT_ARG_ALLOWED_KEYS: ReadonlySet<string> = new Set(['kind', 'attemptId']);
+
+function parseAuditArg(value: unknown): AgentDelegationAuditRequest | undefined | 'invalid' {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== 'object' || Array.isArray(value)) return 'invalid';
+  const record = value as Record<string, unknown>;
+  if (Object.keys(record).some((key) => !AUDIT_ARG_ALLOWED_KEYS.has(key))
+    || record.kind !== AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT
+    || !isAgentDelegationOpaqueId(record.attemptId)) return 'invalid';
+  return {
+    kind: AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT,
+    attemptId: record.attemptId,
   };
 }
 
@@ -1167,6 +1192,26 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         ? error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, String(result.error ?? 'peer audit reply rejected'))
         : { status: 'ok', accepted: true };
     },
+    [MEMORY_MCP_TOOL_NAMES.DELEGATION_REPLY]: async (input) => {
+      if (!deps.delegationReply) return error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, 'delegation reply ingress is unavailable');
+      const record = input && typeof input === 'object' && !Array.isArray(input)
+        ? input as Record<string, unknown>
+        : {};
+      const decoded = decodeAgentDelegationReplyEnvelope({
+        ...record,
+        version: AGENT_DELEGATION_REPLY_VERSION,
+      });
+      if (!decoded.ok) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, decoded.error);
+      const result = await deps.delegationReply(decoded.value);
+      return result.ok === false
+        ? error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, String(result.error ?? 'delegation reply rejected'))
+        : {
+            status: 'ok',
+            accepted: true,
+            delivered: result.delivered === true,
+            ...(result.pending === true ? { pending: true } : {}),
+          };
+    },
     [MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS]: async (input) => {
       const sessions = await sendSessions();
       const args = pickAllowedMcpArgs(input, ['query', 'limit']);
@@ -1179,14 +1224,17 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
     },
     [MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE]: async (input) => {
       const sessions = await sendSessions();
-      const args = pickAllowedMcpArgs(input, ['target', 'message', 'files', 'reply', 'broadcast', 'idempotencyKey', 'clone']);
+      const args = pickAllowedMcpArgs(input, ['target', 'message', 'files', 'reply', 'audit', 'broadcast', 'idempotencyKey', 'clone']);
       const clone = parseCloneArg(args.clone);
       if (clone === 'invalid') return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'clone request is invalid');
+      const audit = parseAuditArg(args.audit);
+      if (audit === 'invalid') return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'audit request is invalid');
       return dispatchSendMessage(caller, {
         target: stringArg(args, 'target'),
         message: stringArg(args, 'message'),
         files: stringArrayArg(args, 'files'),
         reply: boolArg(args, 'reply'),
+        ...(audit ? { audit } : {}),
         broadcast: boolArg(args, 'broadcast'),
         idempotencyKey: stringArg(args, 'idempotencyKey'),
         ...(clone ? { clone } : {}),
@@ -1489,7 +1537,8 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       });
       if (!result.ok) return error(result.reason, result.error);
       if (!result.remotePath) return error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, 'machine file transfer returned no destination path');
-      return { status: 'ok', machine, remotePath: result.remotePath, attachmentId: result.attachmentId, size: result.size };
+      if (!result.transport) return error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, 'machine file transfer returned no transport mode');
+      return { status: 'ok', machine, remotePath: result.remotePath, attachmentId: result.attachmentId, size: result.size, transport: result.transport };
     },
     [MEMORY_MCP_TOOL_NAMES.FETCH_FILE_FROM_MACHINE]: async (input, context) => {
       if (!deps.machineDeps?.fetchFileFromMachine) return error(MCP_ERROR_REASONS.FEATURE_DISABLED, 'machine file transfer is not available on this node');
@@ -1511,7 +1560,15 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       });
       if (!result.ok) return error(result.reason, result.error);
       if (!result.destinationPath) return error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, 'machine file transfer returned no destination path');
-      return { status: 'ok', machine, destinationPath: result.destinationPath, attachmentId: result.attachmentId, size: result.size };
+      if (!result.transport) return error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, 'machine file transfer returned no transport mode');
+      return {
+        status: 'ok',
+        machine,
+        destinationPath: result.destinationPath,
+        attachmentId: result.attachmentId,
+        size: result.size,
+        transport: result.transport,
+      };
     },
     [MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_DOCS]: async (input) => {
       const args = pickAllowedMcpArgs(input, ['topic']);
@@ -1680,6 +1737,11 @@ const schemas = {
       summary: z.string(),
     }).strict()),
   }).strict(),
+  [MEMORY_MCP_TOOL_NAMES.DELEGATION_REPLY]: z.object({
+    delegationId: z.string(),
+    replyCapability: z.string(),
+    result: z.string(),
+  }).strict(),
   [MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS]: z.object({
     query: z.string().optional().describe('Case-insensitive name/display-label filter.'),
     limit: z.number().int().min(1).max(100).optional().describe('Maximum targets.'),
@@ -1689,6 +1751,10 @@ const schemas = {
     message: z.string().describe('Complete task/request and expected output.'),
     files: z.array(z.string()).optional().describe('Project-root path refs; no file bytes.'),
     reply: z.boolean().optional().describe('Request a reply/report.'),
+    audit: z.object({
+      kind: z.literal(AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT),
+      attemptId: z.string().min(1),
+    }).strict().optional().describe('Automatic supervision audit metadata; requires reply=true and one exact target.'),
     broadcast: z.boolean().optional().describe('Only when the user asks every/all sessions.'),
     idempotencyKey: z.string().optional().describe('Accepted-send replay key.'),
     clone: z.object({
@@ -1863,14 +1929,16 @@ const machineToolOutputSchemas: Partial<Record<MemoryMcpToolName, z.ZodTypeAny>>
     machine: z.string().min(1),
     remotePath: boundedUtf8String(FILE_TRANSFER_PATH_MAX_BYTES),
     attachmentId: z.string().min(1).max(128),
-    size: z.number().int().min(0).max(FILE_TRANSFER_LIMITS.MAX_FILE_SIZE),
+    size: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+    transport: z.enum([MACHINE_FILE_TRANSFER_TRANSPORT.DIRECT, MACHINE_FILE_TRANSFER_TRANSPORT.RELAY]),
   }),
   [MEMORY_MCP_TOOL_NAMES.FETCH_FILE_FROM_MACHINE]: z.strictObject({
     status: z.literal('ok'),
     machine: z.string().min(1),
     destinationPath: boundedUtf8String(FILE_TRANSFER_PATH_MAX_BYTES),
     attachmentId: z.string().min(1).max(128),
-    size: z.number().int().min(0).max(FILE_TRANSFER_LIMITS.MAX_FILE_SIZE),
+    size: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+    transport: z.enum([MACHINE_FILE_TRANSFER_TRANSPORT.DIRECT, MACHINE_FILE_TRANSFER_TRANSPORT.RELAY]),
   }),
   [MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_DOCS]: z.strictObject({
     status: z.literal('ok'),
@@ -1978,7 +2046,7 @@ const aliasSchemas: Record<AliasMcpToolName, z.ZodTypeAny> = {
   [ALIAS_MCP_TOOLS.SAVE]: z.object({
     name: z.string().describe('NFC letters/digits/._-, ≤20 code points; overwrites existing.'),
     value: z.string().describe('Exact inserted value; nonempty, ≤500 code points, no NUL.'),
-    description: z.string().optional().describe('Description, ≤200 code points.'),
+    description: z.string().optional().describe(`Description, ≤${ALIAS_DESCRIPTION_MAX} code points.`),
     tags: z.array(z.string()).optional().describe('≤10 tags, each ≤30 chars, no controls.'),
   }),
   [ALIAS_MCP_TOOLS.DELETE]: z.object({

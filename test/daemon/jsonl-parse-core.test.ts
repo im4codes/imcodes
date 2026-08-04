@@ -341,4 +341,38 @@ describe('jsonl-parse-core', () => {
     expect(ctx.pendingToolCalls.has('sA')).toBe(false);
     expect(ctx.pendingToolCalls.get('sB')?.has('tu_b')).toBe(true);
   });
+  it('puts the tool_use_id on both tool.call and tool.result payloads', () => {
+    // The web view pairs call/result by `toolCallId`. This producer already
+    // knew the id (it builds the eventId from it) but kept it off the payload,
+    // so the view fell back to adjacency and mispaired concurrent tools.
+    const ctx = createParseContext();
+    const useLine = jsonlLine({
+      type: 'assistant',
+      timestamp: '2026-04-24T00:00:00.000Z',
+      message: {
+        content: [{ type: 'tool_use', id: 'tu_pair', name: 'Bash', input: { command: 'ls' } }],
+      },
+    });
+    const resultLine = jsonlLine({
+      type: 'user',
+      timestamp: '2026-04-24T00:00:01.000Z',
+      message: {
+        content: [{ type: 'tool_result', tool_use_id: 'tu_pair', content: 'output' }],
+      },
+    });
+
+    const { emits: callEmits } = parseLines(ctx, {
+      sessionName: 'pair1',
+      items: [{ line: useLine, lineByteOffset: 0 }],
+    });
+    expect(callEmits[0].payload.toolCallId).toBe('tu_pair');
+
+    const { emits: resultEmits } = parseLines(ctx, {
+      sessionName: 'pair1',
+      items: [{ line: resultLine, lineByteOffset: 1 }],
+    });
+    expect(resultEmits[0].payload.toolCallId).toBe('tu_pair');
+
+    forgetSession(ctx, 'pair1');
+  });
 });

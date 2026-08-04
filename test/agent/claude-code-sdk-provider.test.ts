@@ -103,6 +103,9 @@ import type { AgentMessage, ToolCallEvent } from '../../shared/agent-message.js'
 import type { ProviderContextPayload } from '../../shared/context-types.js';
 import { MEMORY_MCP_STATUS } from '../../shared/memory-ws.js';
 import {
+  AGENT_DELEGATION_NOTIFICATION_RESULTS,
+} from '../../shared/agent-delegation.js';
+import {
   SDK_SUBAGENT_DETAIL_KIND,
   SDK_SUBAGENT_DIAGNOSTIC,
   SDK_SUBAGENT_PROVIDERS,
@@ -131,6 +134,46 @@ describe('ClaudeCodeSdkProvider', () => {
     sdkMock.setInterruptNeverResolves(false);
     sdkMock.setNextContextUsage(null);
     childProcessMock.spawn.mockClear();
+  });
+
+  it('pushes a correlated peer notification into the live Claude query without closing it', async () => {
+    sdkMock.setWaitForClose(true);
+    const provider = new ClaudeCodeSdkProvider();
+    await provider.connect({ binaryPath: 'claude' });
+    await provider.createSession({
+      sessionKey: 'route-delegation-notify',
+      sessionName: 'deck_project_brain',
+      cwd: '/tmp/project',
+    });
+    const sendPromise = provider.send('route-delegation-notify', 'foreground work');
+    await waitFor(() => sdkMock.runs.length === 1);
+
+    const result = await provider.notifyActiveDelegation?.('route-delegation-notify', {
+      notificationId: 'notification_identity',
+      delegationId: 'delegation_identity',
+      sourceSessionName: 'deck_sub_auditor',
+      text: 'delegated audit finished',
+    });
+
+    expect(result).toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    const queue = sdkMock.runs[0]?.promptSource as { buffer?: Array<Record<string, any>> };
+    expect(queue.buffer?.at(-1)).toMatchObject({
+      type: 'user',
+      uuid: 'notification_identity',
+      priority: 'now',
+      shouldQuery: true,
+      isSynthetic: true,
+      origin: {
+        kind: 'peer',
+        from: 'deck_sub_auditor',
+        name: 'delegation_identity',
+      },
+      message: { role: 'user', content: 'delegated audit finished' },
+    });
+    expect(sdkMock.runs[0]?.closed).toBe(false);
+
+    await provider.endSession('route-delegation-notify');
+    await sendPromise;
   });
 
   afterEach(() => {

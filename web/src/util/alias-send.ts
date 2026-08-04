@@ -22,7 +22,7 @@
  * comments at those call sites.
  */
 
-import type { AliasEntry, SendAliasResolution } from '@shared/alias-types.js';
+import type { AliasEntry, SendAliasNotes, SendAliasResolution } from '@shared/alias-types.js';
 import { buildResolvedAliases } from './alias-insert.js';
 
 /**
@@ -34,6 +34,8 @@ import { buildResolvedAliases } from './alias-insert.js';
 export interface AliasSendExtra {
   /** Out-of-band marker→value map (A′); present only when non-empty. */
   resolvedAliases?: SendAliasResolution;
+  /** Sibling marker→author-note map; present only when some alias has a note. */
+  resolvedAliasNotes?: SendAliasNotes;
   [key: string]: unknown;
 }
 
@@ -54,7 +56,11 @@ export function buildAliasSendExtra(
   bodyText: string,
   aliasList: readonly AliasEntry[],
 ): AliasSendExtra {
-  const { resolvedAliases } = buildResolvedAliases(bodyText, aliasList);
+  const { resolvedAliases, resolvedAliasNotes } = buildResolvedAliases(bodyText, aliasList);
   if (Object.keys(resolvedAliases).length === 0) return {};
-  return { resolvedAliases };
+  // Notes ride only when at least one resolved alias actually has one, so a
+  // note-free send stays byte-identical to before.
+  return Object.keys(resolvedAliasNotes).length > 0
+    ? { resolvedAliases, resolvedAliasNotes }
+    : { resolvedAliases };
 }

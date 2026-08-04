@@ -23,7 +23,9 @@
  * (windows-upgrade-script.ts) that solves the same problem differently.
  */
 import { describe, expect, it } from 'vitest';
-import { mkdirSync, mkdtempSync, writeFileSync, rmSync, readFileSync, existsSync } from 'node:fs';
+import {
+  mkdirSync, mkdtempSync, writeFileSync, rmSync, readFileSync, existsSync, realpathSync,
+} from 'node:fs';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
@@ -33,6 +35,7 @@ import { dirname } from 'node:path';
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(HERE, '../..');
 const LAUNCHER_SRC = resolve(REPO_ROOT, 'bin/imcodes-launch.sh');
+const NODE_DATACHANNEL_REPAIR_SRC = resolve(REPO_ROOT, 'src/util/node-datachannel-repair.mjs');
 
 const skip = process.platform === 'win32';
 const describeUnix = skip ? describe.skip : describe;
@@ -63,20 +66,27 @@ function makeSandbox(opts: {
   halfInstalledDeps?: string[];
   nodeExitCode?: number;
   npmExitCode?: number;
+  brokenNodeDatachannel?: boolean;
 }): Sandbox {
   const root = mkdtempSync(join(tmpdir(), 'imcodes-launch-'));
-  const pkgRoot = join(root, 'lib', 'node_modules', 'imcodes');
+  const pkgRootPath = join(root, 'lib', 'node_modules', 'imcodes');
   const binDir = join(root, 'shims');
   const homeDir = join(root, 'home');
   const npmCallLog = join(root, 'npm-calls.log');
-  mkdirSync(pkgRoot, { recursive: true });
+  mkdirSync(pkgRootPath, { recursive: true });
+  const pkgRoot = realpathSync(pkgRootPath);
   mkdirSync(binDir, { recursive: true });
   mkdirSync(join(homeDir, '.imcodes'), { recursive: true });
 
   // package.json with a known pinned version.
+  const manifest = {
+    name: 'imcodes',
+    version: '1.2.3',
+    ...(opts.brokenNodeDatachannel ? { optionalDependencies: { 'node-datachannel': '0.0.0-test' } } : {}),
+  };
   writeFileSync(
     join(pkgRoot, 'package.json'),
-    JSON.stringify({ name: 'imcodes', version: '1.2.3' }),
+    JSON.stringify(manifest),
   );
 
   // dist/src/index.js (optional).
@@ -86,6 +96,17 @@ function makeSandbox(opts: {
       join(pkgRoot, 'dist', 'src', 'index.js'),
       '#!/usr/bin/env node\nconsole.log("entry-ok");\n',
     );
+  }
+  if (opts.brokenNodeDatachannel) {
+    const utilDir = join(pkgRoot, 'dist', 'src', 'util');
+    const dependencyDir = join(pkgRoot, 'node_modules', 'node-datachannel');
+    mkdirSync(utilDir, { recursive: true });
+    mkdirSync(dependencyDir, { recursive: true });
+    writeFileSync(join(utilDir, 'node-datachannel-repair.mjs'), readFileSync(NODE_DATACHANNEL_REPAIR_SRC, 'utf8'));
+    writeFileSync(join(dependencyDir, 'package.json'), JSON.stringify({
+      name: 'node-datachannel', version: '0.0.0-test', type: 'module', main: 'index.js',
+    }));
+    writeFileSync(join(dependencyDir, 'index.js'), "throw new Error('native addon missing');\n");
   }
 
   // node_modules: by default ALL CRITICAL_DEPS are healthy; opts.halfInstalledDeps
@@ -121,6 +142,9 @@ function makeSandbox(opts: {
 if [ "$1" = "-e" ]; then
   exec ${process.execPath} "$@"
 fi
+case "$1" in
+  *node-datachannel-repair.mjs) exec ${process.execPath} "$@" ;;
+esac
 echo "node-shim called with: $@" >> "${join(root, 'node-calls.log')}"
 exit ${opts.nodeExitCode ?? 0}
 `;
@@ -172,6 +196,21 @@ describeUnix('bin/imcodes-launch.sh', () => {
       expect(nodeLog).toContain(`${sb.pkgRoot}/dist/src/index.js`);
       expect(nodeLog).toContain('start');
       expect(nodeLog).toContain('--foreground');
+    } finally {
+      rmSync(sb.root, { recursive: true, force: true });
+    }
+  });
+
+  it('first fixed-version launch repairs script-suppressed node-datachannel before daemon handoff', () => {
+    const sb = makeSandbox({ brokenNodeDatachannel: true });
+    try {
+      const r = runLauncher(sb);
+      expect(r.status).toBe(0);
+      const npmLog = readFileSync(sb.npmCallLog, 'utf8');
+      expect(npmLog).toContain(`rebuild --global=false --prefix ${sb.pkgRoot} node-datachannel --ignore-scripts=false --foreground-scripts`);
+      expect(npmLog).toContain(`install --global=false --prefix ${sb.pkgRoot} --no-save --ignore-scripts=false --foreground-scripts node-datachannel@0.0.0-test`);
+      const nodeLog = readFileSync(join(sb.root, 'node-calls.log'), 'utf8');
+      expect(nodeLog).toContain('start');
     } finally {
       rmSync(sb.root, { recursive: true, force: true });
     }

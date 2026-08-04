@@ -299,6 +299,7 @@ export const SHARE_HTTP_ROUTE_POLICY_INVENTORY = [
   { id: 'local-web-preview-create', method: 'POST', pattern: '/api/server/:id/local-web-preview', command: SHARE_BROWSER_COMMANDS.LOCAL_WEB_PREVIEW, disposition: 'share-denied', reason: 'share-direct-surface-denied' },
   { id: 'local-web-preview-close', method: 'DELETE', pattern: '/api/server/:id/local-web-preview/:previewId', command: SHARE_BROWSER_COMMANDS.LOCAL_WEB_PREVIEW, disposition: 'share-denied', reason: 'share-direct-surface-denied' },
   { id: 'file-upload', method: 'POST', pattern: '/api/server/:id/upload', command: SHARE_BROWSER_COMMANDS.FILE_WRITE, disposition: 'share-denied', reason: 'share-direct-surface-denied' },
+  { id: 'file-upload-delete', method: 'DELETE', pattern: '/api/server/:id/uploads/:attachmentId', command: SHARE_BROWSER_COMMANDS.FILE_DELETE, disposition: 'share-denied', reason: 'share-direct-surface-denied' },
   { id: 'file-download-token', method: 'POST', pattern: '/api/server/:id/uploads/:attachmentId/download-token', command: SHARE_BROWSER_COMMANDS.FILE_READ, disposition: 'share-denied', reason: 'share-direct-surface-denied' },
   { id: 'file-download', method: 'GET', pattern: '/api/server/:id/uploads/:attachmentId/download', command: SHARE_BROWSER_COMMANDS.FILE_READ, disposition: 'share-denied', reason: 'share-direct-surface-denied' },
   { id: 'memory-sources', method: 'GET', pattern: '/api/memory/sources', command: SHARE_BROWSER_COMMANDS.MEMORY_QUERY, disposition: 'share-denied', reason: 'share-direct-surface-denied' },

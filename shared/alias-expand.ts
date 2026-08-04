@@ -5,14 +5,17 @@
 
 import { SESSION_AGENT_TYPES, type SessionAgentType } from './agent-types.js';
 import {
+  ALIAS_NOTE_HARD_MAX,
   ALIAS_LEGEND_DIRECTIVE,
   ALIAS_REASONS,
   ALIAS_VALUE_MAX,
+  aliasNoteFor,
   buildAliasLegendLine,
   isValidMarkerName,
   nfc,
   parseAliasMarkers,
   type AliasReason,
+  type SendAliasNotes,
   type SendAliasResolution,
 } from './alias-types.js';
 
@@ -83,16 +86,39 @@ export interface AliasExpansionResult {
  *   - cap to ALIAS_VALUE_MAX code points (same ceiling as server-side validation),
  *     slicing on a code-point boundary so a surrogate pair is never split.
  */
-export function sanitizeResolvedAliasValue(value: string): string {
-  const normalized = nfc(value)
+function sanitizeInjected(text: string, maxCodePoints: number): string {
+  const normalized = nfc(text)
     // `[^\P{Cc}\n\t]` matches a char that IS `\p{Cc}` but is NOT `\n` and NOT
     // `\t` — i.e. "control chars except newline/tab". Drops NUL, ESC, CR, etc.
     // The `u` flag is required for the `\p{Cc}` / `\P{Cc}` property escapes.
     .replace(/[^\P{Cc}\n\t]/gu, '');
   const codePoints = Array.from(normalized);
-  return codePoints.length > ALIAS_VALUE_MAX
-    ? codePoints.slice(0, ALIAS_VALUE_MAX).join('')
+  return codePoints.length > maxCodePoints
+    ? codePoints.slice(0, maxCodePoints).join('')
     : normalized;
+}
+
+export function sanitizeResolvedAliasValue(value: string): string {
+  return sanitizeInjected(value, ALIAS_VALUE_MAX);
+}
+
+/**
+ * Same gate as {@link sanitizeResolvedAliasValue}, capped at the note hard
+ * ceiling. The note is client-supplied and re-validated here for the same reason
+ * the value is: the daemon never re-runs the server's save-path checks, so this
+ * is the last point before it enters an LLM prompt.
+ *
+ * The cap here is the abuse bound, NOT the token budget — `buildAliasLegendLine`
+ * applies the inline budget and appends the "fetch the rest" hint, which it can
+ * only do if an oversized note still looks oversized when it gets here.
+ *
+ * Newlines survive sanitizing (shared with the value path) but cannot break the
+ * legend block apart, because every legend field is passed through
+ * `legendValueSingleLine`, which collapses whitespace runs — so a note cannot
+ * forge an extra legend line.
+ */
+export function sanitizeResolvedAliasDescription(description: string): string {
+  return sanitizeInjected(description, ALIAS_NOTE_HARD_MAX);
 }
 
 /** Single-pass inline substitution: replace each valid, resolved marker; leave others literal. */
@@ -101,6 +127,8 @@ function substituteInline(text: string, resolved: SendAliasResolution): string {
     if (!isValidMarkerName(rawName)) return whole;
     const name = nfc(rawName);
     // Sanitize the injected value at the substitution point (enforcement).
+    // Values only: an inline expansion lands in a shell command for `shell`/
+    // `script` agents, where appending a prose note would corrupt the command.
     return Object.prototype.hasOwnProperty.call(resolved, name)
       ? sanitizeResolvedAliasValue(resolved[name])
       : whole;
@@ -122,6 +150,7 @@ export function expandForAgent(
   text: string,
   resolved: SendAliasResolution,
   mode: AliasExpansionMode,
+  notes?: SendAliasNotes,
 ): AliasExpansionResult {
   const names = parseAliasMarkers(text);
   const has = (n: string) => Object.prototype.hasOwnProperty.call(resolved, n);
@@ -138,9 +167,16 @@ export function expandForAgent(
   if (resolvedNames.length === 0) {
     return { deliver: true, text, unresolved };
   }
-  // Sanitize each value before it becomes a legend line (enforcement).
+  // Sanitize each value AND note before it becomes a legend line (enforcement).
   const legend = resolvedNames
-    .map((n) => buildAliasLegendLine(n, sanitizeResolvedAliasValue(resolved[n])))
+    .map((n) => {
+      const note = aliasNoteFor(notes, n);
+      return buildAliasLegendLine(
+        n,
+        sanitizeResolvedAliasValue(resolved[n]),
+        note === undefined ? undefined : sanitizeResolvedAliasDescription(note),
+      );
+    })
     .join('\n');
   return { deliver: true, text: `${ALIAS_LEGEND_DIRECTIVE}\n${legend}\n\n${text}`, unresolved };
 }

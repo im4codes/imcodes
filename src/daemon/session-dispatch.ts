@@ -14,6 +14,7 @@ import {
   isAgentDelegationForwardedPayloadText,
   isDelegationReplyCapableAgentType,
   stripAgentDelegationControlInstructions,
+  type AgentDelegationReplyAuthority,
   type AgentDelegationErrorCode,
   type DelegationContextStatus,
 } from '../../shared/agent-delegation.js';
@@ -29,6 +30,10 @@ import { buildTransportQueueSnapshotPayload } from './transport-queue-projection
 import { enqueueResend } from './transport-resend-queue.js';
 import { injectPeerAuditBriefIntoProcessSession, type PeerAuditProcessInjectError } from './peer-audit-process-injector.js';
 import { timelineEmitter } from './timeline-emitter.js';
+import {
+  createDelegationReplyAuthority,
+  expireDelegationReplyAuthority,
+} from './delegation-reply-authority.js';
 import type { TimelineEvent } from './timeline-event.js';
 
 export interface SessionDispatchRuntimeCaller {
@@ -47,7 +52,15 @@ export interface SessionDispatchMessageOptions {
 export type SessionDispatchOptions = SessionDispatchMessageOptions;
 export type SessionDispatchMessageResult = 'sent' | 'queued' | void;
 
-type BuildSessionDispatchMessageInput = { message?: string; files?: string[]; replyTo?: string | null; contextTail?: string | null; contextOmitted?: boolean; contextStatus?: DelegationContextStatus };
+type BuildSessionDispatchMessageInput = {
+  message?: string;
+  files?: string[];
+  replyTo?: string | null;
+  replyAuthority?: AgentDelegationReplyAuthority;
+  contextTail?: string | null;
+  contextOmitted?: boolean;
+  contextStatus?: DelegationContextStatus;
+};
 
 export function buildSessionDispatchMessage(message: string, options: Omit<BuildSessionDispatchMessageInput, 'message'>): string;
 export function buildSessionDispatchMessage(input: BuildSessionDispatchMessageInput): string;
@@ -74,7 +87,7 @@ export function buildSessionDispatchMessage(
     result += `\n\nReferenced files:\n${files.map((file) => `- ${file}`).join('\n')}`;
   }
   if (options.replyTo && isValidImcodesSessionName(options.replyTo)) {
-    result += `\n\n${buildAgentDelegationReplyInstruction(options.replyTo)}`;
+    result += `\n\n${buildAgentDelegationReplyInstruction(options.replyTo, options.replyAuthority)}`;
   }
   return result;
 }
@@ -319,7 +332,7 @@ export interface DelegatedSessionDispatchDeps {
 }
 
 export type DelegatedSessionDispatchResult =
-  | { status: 'accepted'; dispatchId: SendDispatchId; messageId: SendMessageId; target: string; contextStatus: DelegationContextStatus; contextOmitted?: boolean }
+  | { status: 'accepted'; dispatchId: SendDispatchId; messageId: SendMessageId; delegationId: string; target: string; contextStatus: DelegationContextStatus; contextOmitted?: boolean }
   | { status: 'error'; error: AgentDelegationErrorCode; detail?: string };
 
 export interface DelegationContextTailResult {
@@ -425,10 +438,27 @@ export async function dispatchDelegatedSessionSend(input: {
     : { text: '', status: 'omitted' as const };
   const dispatchId = createSendDispatchId();
   const messageId = createSendMessageId();
-  const callerRecord = input.caller.sessionName ? deps.getSession?.(input.caller.sessionName) : undefined;
+  const callerRecord = input.caller.sessionName
+    ? deps.getSession?.(input.caller.sessionName) ?? getStoredSession(input.caller.sessionName)
+    : undefined;
+  const replyAuthority = createDelegationReplyAuthority({
+    origin: callerRecord,
+    target: resolved.target,
+    dispatchId,
+    messageId,
+    now: deps.now?.() ?? Date.now(),
+  });
+  if (!replyAuthority) {
+    return {
+      status: 'error',
+      error: AGENT_DELEGATION_ERROR_CODES.DELEGATION_TARGET_NOT_REPLY_CAPABLE,
+      detail: 'reply-capable session identity is unavailable',
+    };
+  }
   const message = buildSessionDispatchMessage({
     message: input.message.trim(),
     replyTo: input.caller.sessionName,
+    replyAuthority: replyAuthority.authority,
     contextTail: context.text,
     contextStatus: context.status,
   });
@@ -445,8 +475,17 @@ export async function dispatchDelegatedSessionSend(input: {
         memoryExcluded: true,
       }, { source: 'daemon', confidence: 'medium' });
     }
-    return { status: 'accepted', dispatchId, messageId, target: resolved.target.name, contextStatus: context.status, ...(context.status === 'omitted' ? { contextOmitted: true } : {}) };
+    return {
+      status: 'accepted',
+      dispatchId,
+      messageId,
+      delegationId: replyAuthority.record.delegationId,
+      target: resolved.target.name,
+      contextStatus: context.status,
+      ...(context.status === 'omitted' ? { contextOmitted: true } : {}),
+    };
   } catch (err) {
+    expireDelegationReplyAuthority(replyAuthority.record.delegationId);
     return { status: 'error', error: AGENT_DELEGATION_ERROR_CODES.DELEGATION_TARGET_UNAVAILABLE, detail: sanitizeMcpErrorMessage(err) };
   }
 }

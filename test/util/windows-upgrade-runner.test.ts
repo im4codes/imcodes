@@ -140,6 +140,8 @@ describe('windows-upgrade-runner.mjs source invariants', () => {
       "trace(4, 'post-version-check'",
       "trace(5, 'pre-sharp-repair')",
       "trace(5, 'post-sharp-repair')",
+      "trace(5, 'pre-node-datachannel-repair')",
+      "trace(5, 'post-node-datachannel-repair')",
       "trace(6, 'pre-kill-watchdogs')",
       "trace(6, 'post-kill-watchdogs')",
       "trace(7, 'pre-repair-watchdog')",
@@ -169,6 +171,17 @@ describe('windows-upgrade-runner.mjs source invariants', () => {
     // grep against `\[exit \d+\]` works on every flow.
     expect(src).toMatch(/\[\$\{brokenDep\}\/package\.json missing\]/);
     expect(src).toMatch(/\[exit \$\{result\.status\} signal/);
+  });
+
+  it('repairs and verifies node-datachannel after the script-free global install', () => {
+    const repairIdx = src.indexOf('function nodeDatachannelRepair');
+    const callIdx = src.indexOf('try { nodeDatachannelRepair(npmPrefix)', repairIdx + 1);
+    const killIdx = src.indexOf("trace(6, 'pre-kill-watchdogs')");
+    expect(repairIdx).toBeGreaterThan(-1);
+    expect(src.slice(repairIdx, callIdx)).toContain('node-datachannel-repair.mjs');
+    expect(src.slice(repairIdx, callIdx)).toContain('IMCODES_NPM_BIN: NPM_CMD');
+    expect(callIdx).toBeGreaterThan(repairIdx);
+    expect(killIdx).toBeGreaterThan(callIdx);
   });
 
   it('logs runner_pid and script_dir at startup for cross-referencing with daemon.log', () => {

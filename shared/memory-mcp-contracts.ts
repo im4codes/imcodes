@@ -27,7 +27,8 @@ import {
   COMPUTER_USE_OUTCOMES,
   COMPUTER_USE_TOOLS,
 } from './computer-use.js';
-import { FILE_TRANSFER_LIMITS, FILE_TRANSFER_PATH_MAX_BYTES } from './transport/file-transfer.js';
+import { FILE_TRANSFER_PATH_MAX_BYTES } from './transport/file-transfer.js';
+import { MACHINE_FILE_TRANSFER_TRANSPORT } from './machine-direct-file-transfer.js';
 import {
   MACHINE_NAME_PATTERN,
   MACHINE_REF_NAME_MAX,
@@ -42,6 +43,10 @@ import {
   PEER_AUDIT_VALIDATION_OUTCOMES,
 } from './peer-audit.js';
 import { CRON_COMPLETION_POLICY } from './cron-types.js';
+import {
+  AGENT_DELEGATION_PURPOSES,
+  AGENT_DELEGATION_REPLY_RESULT_BYTES,
+} from './agent-delegation.js';
 
 export const MEMORY_MCP_TOOL_NAMES = {
   SEARCH_MEMORY: 'search_memory',
@@ -55,6 +60,7 @@ export const MEMORY_MCP_TOOL_NAMES = {
   SAVE_OBSERVATION: 'save_observation',
   SAVE_PREFERENCE: 'save_preference',
   PEER_AUDIT_REPLY: 'peer_audit_reply',
+  DELEGATION_REPLY: 'delegation_reply',
   SEND_LIST_TARGETS: 'send_list_targets',
   SEND_MESSAGE: 'send_message',
   SEND_STOP: 'send_stop',
@@ -89,6 +95,7 @@ export const MEMORY_MCP_TOOL_NAME_LIST = [
   MEMORY_MCP_TOOL_NAMES.SAVE_OBSERVATION,
   MEMORY_MCP_TOOL_NAMES.SAVE_PREFERENCE,
   MEMORY_MCP_TOOL_NAMES.PEER_AUDIT_REPLY,
+  MEMORY_MCP_TOOL_NAMES.DELEGATION_REPLY,
   MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS,
   MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE,
   MEMORY_MCP_TOOL_NAMES.SEND_STOP,
@@ -386,6 +393,16 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
     }, ['attemptId', 'replyCapability', 'verdict', 'findings', 'validations']),
     outputSchema: statusSchema,
   },
+  [MEMORY_MCP_TOOL_NAMES.DELEGATION_REPLY]: {
+    name: MEMORY_MCP_TOOL_NAMES.DELEGATION_REPLY,
+    description: 'Submit the one structured reply for a reply-enabled delegation. Use only the delegation id and one-time capability supplied in that delegation brief. The daemon correlates and notifies the originating session directly; do not also call send_message.',
+    inputSchema: objectSchema({
+      delegationId: stringSchema('Opaque delegation id supplied by the reply-enabled brief.'),
+      replyCapability: stringSchema('One-time reply capability supplied by the brief. Never repeat it inside result.'),
+      result: stringSchema(`Complete delegation result, at most ${AGENT_DELEGATION_REPLY_RESULT_BYTES} UTF-8 bytes.`),
+    }, ['delegationId', 'replyCapability', 'result']),
+    outputSchema: statusSchema,
+  },
   [MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS]: {
     name: MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS,
     description: 'List sendable caller-project siblings for delegation, for example "ask CC to audit" or "invite a reviewer to discuss". The current caller session and stopped sessions are excluded; if this returns no items, send_message cannot run. Filter by display label or name, then use the exact target; labels are not targets. If no match exists, report that no such running peer session is available.',
@@ -407,7 +424,18 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
         items: stringSchema(`Relative path or in-root absolute path reference, at most ${MEMORY_MCP_CAPS.SEND_FILE_PATH_MAX_CHARS} characters and without control characters.`),
         maxItems: MEMORY_MCP_CAPS.SEND_FILES_MAX_COUNT,
       },
-      reply: booleanSchema('Optional request for the target to reply to the runtime-bound caller session. Set true when you expect the target to respond or report back, such as audit/review requests or discussion invites; leave false for fire-and-forget notifications. The response is delivered later as a normal incoming message, so do not poll session state, logs, transcripts, or the target after a reply-enabled send.'),
+      reply: booleanSchema('Optional request for one correlated reply to the runtime-bound caller session. Set true for audit/review reports or discussion invites; the target receives an opaque delegation id and one-time capability, and its structured reply is delivered through the caller provider’s active-turn notification path when supported. Do not poll session state, logs, transcripts, or the target after a reply-enabled send.'),
+      audit: {
+        ...objectSchema({
+          kind: {
+            type: 'string',
+            enum: [AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT],
+            description: 'Exact supervision-audit purpose. Ordinary reply-enabled delegations must omit this object.',
+          },
+          attemptId: stringSchema('Exact automatic supervision audit attempt id supplied by the orchestration request.'),
+        }, ['kind', 'attemptId']),
+        description: 'Strict automatic-supervision metadata. Requires reply=true, one exact target, no broadcast, and no clone.',
+      },
       broadcast: booleanSchema('Optional project-scoped broadcast request; unavailable for unscoped callers. Use targeted sends for singular requests like "ask a reviewer"; use broadcast only when the user asks every/all available sessions.'),
       idempotencyKey: stringSchema(`Optional retry key; duplicate sends within ${MEMORY_MCP_CAPS.SEND_MESSAGE_IDEMPOTENCY_WINDOW_MS} ms reuse the original ids.`),
       clone: {
@@ -589,22 +617,23 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   },
   [MEMORY_MCP_TOOL_NAMES.SEND_FILE_TO_MACHINE]: {
     name: MEMORY_MCP_TOOL_NAMES.SEND_FILE_TO_MACHINE,
-    description: 'Send one regular file to a controlled machine. Pass either its bare ref_name or complete ^^(ref_name) marker without list_machines. Unsafe file types and credential paths are rejected. FULL nodes only.',
+    description: 'Direct→relay; reports mode. Relay≤2GiB. Resolve without list_machines. Unsafe/credential paths rejected.',
     inputSchema: objectSchema({
       machine: stringSchema('Bare stable ref_name or complete ^^(ref_name) marker.', { minLength: 1, maxLength: MACHINE_TARGET_MAX, pattern: MACHINE_TARGET_PATTERN.source }),
-      sourcePath: stringSchema(`Explicit local regular-file path, up to ${FILE_TRANSFER_PATH_MAX_BYTES} UTF-8 bytes and ${FILE_TRANSFER_LIMITS.MAX_FILE_SIZE} file bytes.`),
+      sourcePath: stringSchema(`Path ≤${FILE_TRANSFER_PATH_MAX_BYTES} UTF-8 bytes.`),
     }, ['machine', 'sourcePath']),
     outputSchema: objectSchema({
-      status: stringSchema('Always ok for a successful transfer.', { enum: ['ok'] }),
-      machine: stringSchema('Resolved machine ref_name.'),
-      remotePath: stringSchema('Exact protected staging path on the controlled node.'),
-      attachmentId: stringSchema('Short-lived attachment id.'),
-      size: numberSchema('Transferred byte count.', { minimum: 0, maximum: FILE_TRANSFER_LIMITS.MAX_FILE_SIZE }),
-    }, ['status', 'machine', 'remotePath', 'attachmentId', 'size']),
+      status: stringSchema('', { enum: ['ok'] }),
+      machine: stringSchema(''),
+      remotePath: stringSchema(''),
+      attachmentId: stringSchema(''),
+      size: numberSchema('', { minimum: 0, maximum: Number.MAX_SAFE_INTEGER }),
+      transport: stringSchema('', { enum: Object.values(MACHINE_FILE_TRANSFER_TRANSPORT) }),
+    }, ['status', 'machine', 'remotePath', 'attachmentId', 'size', 'transport']),
   },
   [MEMORY_MCP_TOOL_NAMES.FETCH_FILE_FROM_MACHINE]: {
     name: MEMORY_MCP_TOOL_NAMES.FETCH_FILE_FROM_MACHINE,
-    description: 'Fetch one regular file from a controlled machine. Pass either its bare ref_name or complete ^^(ref_name) marker without list_machines. Destination commit is atomic; overwrite defaults false. FULL nodes only.',
+    description: 'Direct-first controlled file fetch, then relay. Pass ref_name or ^^(ref_name) without list_machines. Reports mode; atomic commit; overwrite=false; FULL only.',
     inputSchema: objectSchema({
       machine: stringSchema('Bare stable ref_name or complete ^^(ref_name) marker.', { minLength: 1, maxLength: MACHINE_TARGET_MAX, pattern: MACHINE_TARGET_PATTERN.source }),
       sourcePath: stringSchema(`Explicit controlled-node regular-file path, up to ${FILE_TRANSFER_PATH_MAX_BYTES} UTF-8 bytes.`),
@@ -615,9 +644,10 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
       status: stringSchema('Always ok for a successful transfer.', { enum: ['ok'] }),
       machine: stringSchema('Resolved machine ref_name.'),
       destinationPath: stringSchema('Exact committed local destination path.'),
-      attachmentId: stringSchema('Short-lived source attachment id.'),
-      size: numberSchema('Transferred byte count.', { minimum: 0, maximum: FILE_TRANSFER_LIMITS.MAX_FILE_SIZE }),
-    }, ['status', 'machine', 'destinationPath', 'attachmentId', 'size']),
+      attachmentId: stringSchema('Relay attachment id or direct transfer id.'),
+      size: numberSchema('Transferred byte count.', { minimum: 0, maximum: Number.MAX_SAFE_INTEGER }),
+      transport: stringSchema('Actual mode.', { enum: Object.values(MACHINE_FILE_TRANSFER_TRANSPORT) }),
+    }, ['status', 'machine', 'destinationPath', 'attachmentId', 'size', 'transport']),
   },
   [MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_DOCS]: {
     name: MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_DOCS,

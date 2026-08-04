@@ -20,6 +20,7 @@ function preserveEntries(
     enqueueResend(sessionName, {
       text: entry.text,
       ...(entry.providerText != null ? { providerText: entry.providerText } : {}),
+      ...(entry.aliasAudit ? { aliasAudit: entry.aliasAudit } : {}),
       ...(entry.messagePreamble ? { messagePreamble: entry.messagePreamble } : {}),
       commandId: entry.clientMessageId,
       clientMessageId: entry.clientMessageId,

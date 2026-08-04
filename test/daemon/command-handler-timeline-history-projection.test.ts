@@ -450,7 +450,7 @@ describe('command-handler timeline history with SQLite-preferred reads', () => {
     }));
   });
 
-  it('defers OpenCode initial history synthesis instead of exporting on the daemon main thread', async () => {
+  it('recovers an empty initial OpenCode timeline from provider history', async () => {
     readByTypesPreferredMock.mockImplementation(async (_session: string, types: string[]) => (
       types.includes('session.state')
         ? [{ eventId: 's0', sessionId: 'deck_oc_initial', ts: 1000, seq: 1, epoch: 1, source: 'daemon', confidence: 'high', type: 'session.state', payload: { state: 'idle' } }]
@@ -462,6 +462,10 @@ describe('command-handler timeline history with SQLite-preferred reads', () => {
       projectDir: '/tmp/project',
       opencodeSessionId: 'oc-1',
     });
+    buildTimelineEventsFromOpenCodeExportMock.mockReturnValue([
+      { eventId: 'u1', sessionId: 'deck_oc_initial', ts: 1010, seq: 1, epoch: 99, source: 'daemon', confidence: 'high', type: 'user.message', payload: { text: 'restored prompt' } },
+      { eventId: 'a1', sessionId: 'deck_oc_initial', ts: 1020, seq: 2, epoch: 99, source: 'daemon', confidence: 'high', type: 'assistant.text', payload: { text: 'restored answer', streaming: false } },
+    ]);
 
     handleWebCommand({
       type: 'timeline.history_request',
@@ -471,15 +475,55 @@ describe('command-handler timeline history with SQLite-preferred reads', () => {
     }, serverLink as any);
     await flushAsync();
 
-    expect(exportOpenCodeSessionMock).not.toHaveBeenCalled();
+    expect(exportOpenCodeSessionMock).toHaveBeenCalledWith('/tmp/project', 'oc-1');
     expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
       type: TIMELINE_MESSAGES.HISTORY,
       sessionName: 'deck_oc_initial',
       requestId: 'hist-oc-initial',
-      status: TIMELINE_RESPONSE_STATUS.DEFERRED,
-      source: TIMELINE_RESPONSE_SOURCES.DEFERRED,
-      errorReason: TIMELINE_HISTORY_ERROR_REASONS.PROJECTION_UNAVAILABLE,
-      events: [],
+      status: TIMELINE_RESPONSE_STATUS.OK,
+      source: TIMELINE_RESPONSE_SOURCES.OPENCODE_EXPORT,
+      events: [
+        expect.objectContaining({ eventId: 'u1', type: 'user.message' }),
+        expect.objectContaining({ eventId: 'a1', type: 'assistant.text' }),
+      ],
+    }));
+  });
+
+  it('keeps initial OpenCode history on the fast SQLite path when messages already exist', async () => {
+    readByTypesPreferredMock.mockImplementation(async (_session: string, types: string[]) => (
+      types.includes('session.state')
+        ? []
+        : [
+          { eventId: 'u-sqlite', sessionId: 'deck_oc_cached', ts: 1010, seq: 1, epoch: 1, source: 'daemon', confidence: 'high', type: 'user.message', payload: { text: 'cached prompt' } },
+          { eventId: 'a-sqlite', sessionId: 'deck_oc_cached', ts: 1020, seq: 2, epoch: 1, source: 'daemon', confidence: 'high', type: 'assistant.text', payload: { text: 'cached answer', streaming: false } },
+        ]
+    ));
+    getSessionMock.mockReturnValue({
+      name: 'deck_oc_cached',
+      agentType: 'opencode',
+      projectDir: '/tmp/project',
+      opencodeSessionId: 'oc-cached',
+    });
+
+    handleWebCommand({
+      type: 'timeline.history_request',
+      sessionName: 'deck_oc_cached',
+      requestId: 'hist-oc-cached',
+      limit: 5,
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(exportOpenCodeSessionMock).not.toHaveBeenCalled();
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: TIMELINE_MESSAGES.HISTORY,
+      sessionName: 'deck_oc_cached',
+      requestId: 'hist-oc-cached',
+      status: TIMELINE_RESPONSE_STATUS.OK,
+      source: TIMELINE_RESPONSE_SOURCES.MAIN_SQLITE,
+      events: [
+        expect.objectContaining({ eventId: 'u-sqlite' }),
+        expect.objectContaining({ eventId: 'a-sqlite' }),
+      ],
     }));
   });
 

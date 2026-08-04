@@ -17,6 +17,7 @@ import {
   buildAliasMarker,
   parseAliasMarkers,
   type AliasEntry,
+  type SendAliasNotes,
   type SendAliasResolution,
 } from '@shared/alias-types.js';
 
@@ -47,23 +48,32 @@ export function insertAliasMarkerAtCaret(name: string): boolean {
  * name maps to its stored value in the returned `resolvedAliases`. Names not
  * in the list are skipped (their `;;(name)` marker stays literal in `text`).
  *
- * @returns `{ text, resolvedAliases }` — `text` is returned unchanged (markers
- *   are transported alongside the out-of-band map, not expanded here).
+ * @returns `{ text, resolvedAliases, resolvedAliasNotes }` — `text` is returned
+ *   unchanged (markers are transported alongside the out-of-band maps, not
+ *   expanded here). `resolvedAliasNotes` holds only the names that actually have
+ *   a non-blank note, so it is usually smaller than `resolvedAliases`.
  */
 export function buildResolvedAliases(
   text: string,
   aliasList: readonly AliasEntry[],
-): { text: string; resolvedAliases: SendAliasResolution } {
+): { text: string; resolvedAliases: SendAliasResolution; resolvedAliasNotes: SendAliasNotes } {
   const resolvedAliases: SendAliasResolution = {};
+  const resolvedAliasNotes: SendAliasNotes = {};
   const names = parseAliasMarkers(text);
-  if (names.length === 0) return { text, resolvedAliases };
+  if (names.length === 0) return { text, resolvedAliases, resolvedAliasNotes };
 
-  const byName = new Map<string, string>();
-  for (const entry of aliasList) byName.set(entry.name, entry.value);
+  const byName = new Map<string, AliasEntry>();
+  for (const entry of aliasList) byName.set(entry.name, entry);
 
   for (const name of names) {
-    const value = byName.get(name);
-    if (value !== undefined) resolvedAliases[name] = value;
+    const entry = byName.get(name);
+    if (entry === undefined) continue;
+    resolvedAliases[name] = entry.value;
+    // Carry the author's note in a sibling map. It is the part that tells the
+    // agent how the value may be used; dropping it here is what made an alias
+    // arrive as an unexplained bare secret.
+    const description = entry.description?.trim();
+    if (description) resolvedAliasNotes[name] = description;
   }
-  return { text, resolvedAliases };
+  return { text, resolvedAliases, resolvedAliasNotes };
 }

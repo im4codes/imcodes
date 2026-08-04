@@ -6,7 +6,8 @@
  * ChatView (rendering) to keep classification consistent.
  *
  * Classification:
- *   Visible:     user.message, assistant.text, ask.question, file.change
+ *   Visible:     user.message, assistant.text, ask.question, file.change,
+ *                peer_audit.result, delegation.reply
  *   Not visible: assistant.thinking (streaming partial — merged into indicator),
  *                session.state, usage.update, tool.result, tool.call, command.ack,
  *                agent.status, mode.state, terminal.snapshot
@@ -15,6 +16,8 @@
  * add it here.
  */
 
+import { AGENT_DELEGATION_REPLY_TIMELINE_EVENT } from '@shared/agent-delegation.js';
+
 const VISIBLE_TYPES = new Set([
   'user.message',
   'assistant.text',
@@ -22,6 +25,7 @@ const VISIBLE_TYPES = new Set([
   'ask.question',
   'file.change',
   'peer_audit.result',
+  AGENT_DELEGATION_REPLY_TIMELINE_EVENT,
 ]);
 
 export function isUserVisible(event: { type: string; payload?: Record<string, unknown> & { streaming?: boolean } }): boolean {

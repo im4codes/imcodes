@@ -14,6 +14,12 @@ describe('styles.css regression contracts', () => {
   const css = readFileSync(resolve(__dirname, '../src/styles.css'), 'utf8');
   const cssWithoutComments = css.replace(/\/\*[\s\S]*?\*\//g, '');
 
+  it('keeps long delegation replies at content height inside the chat flex scroller', () => {
+    const rule = cssWithoutComments.match(/\.delegation-reply-card\s*\{[^}]*\}/)?.[0];
+    expect(rule).toBeTruthy();
+    expect(rule).toMatch(/flex:\s*0\s+0\s+auto/);
+  });
+
   it('.chat-view-preview must NOT be a scroll container', () => {
     // User reported: card chat history flickers / oscillates infinitely
     // near the bottom at certain heights — only resolves after manual
@@ -80,12 +86,13 @@ describe('styles.css regression contracts', () => {
     expect(webkitScrollbarRule![0]).toMatch(/height:\s*0/);
   });
 
-  it('keeps the desktop composer target compact and truncates long session names', () => {
+  it('keeps the desktop composer target compact in the Stop toolbar and truncates long session names', () => {
     const bubbleRule = css.match(/\.controls-target-bubble\s*\{[^}]*\}/);
     expect(bubbleRule).not.toBeNull();
-    expect(bubbleRule![0]).toMatch(/position:\s*absolute/);
-    expect(bubbleRule![0]).toMatch(/bottom:\s*calc\(100%\s*\+\s*5px\)/);
-    expect(bubbleRule![0]).toMatch(/max-width:\s*calc\(100%\s*-\s*8px\)/);
+    expect(bubbleRule![0]).toMatch(/position:\s*relative/);
+    expect(bubbleRule![0]).toMatch(/height:\s*28px/);
+    expect(bubbleRule![0]).toMatch(/box-sizing:\s*border-box/);
+    expect(bubbleRule![0]).not.toMatch(/bottom:/);
     expect(bubbleRule![0]).toMatch(/overflow:\s*hidden/);
 
     const nameRule = css.match(/\.controls-target-name\s*\{[^}]*\}/);
@@ -93,6 +100,30 @@ describe('styles.css regression contracts', () => {
     expect(nameRule![0]).toMatch(/min-width:\s*0/);
     expect(nameRule![0]).toMatch(/text-overflow:\s*ellipsis/);
     expect(nameRule![0]).toMatch(/white-space:\s*nowrap/);
+  });
+
+  it('joins consecutive assistant text cards without blue separator lines', () => {
+    const assistantRule = css.match(/\.chat-assistant\s*\{[^}]*\}/);
+    const precedingRule = css.match(/\.chat-assistant:has\(\+ \.chat-assistant\)\s*\{[^}]*\}/);
+    const followingRule = css.match(/\.chat-assistant \+ \.chat-assistant\s*\{[^}]*\}/);
+
+    expect(assistantRule?.[0]).toMatch(/border:\s*0/);
+    expect(precedingRule?.[0]).toMatch(/margin-bottom:\s*0/);
+    expect(precedingRule?.[0]).toMatch(/border-bottom-left-radius:\s*0/);
+    expect(followingRule?.[0]).toMatch(/margin-top:\s*-2px/);
+    expect(followingRule?.[0]).toMatch(/border-top-left-radius:\s*0/);
+  });
+
+  it('visually distinguishes P2P direct uploads from relay uploads', () => {
+    const directBadgeRule = css.match(/\.composer-upload-transport-direct\s*\{[^}]*\}/);
+    const relayBadgeRule = css.match(/\.composer-upload-transport-falling_back,\s*\.composer-upload-transport-relay\s*\{[^}]*\}/);
+    const directProgressRule = css.match(/\.composer-upload-row-direct \.composer-upload-progress-fill\s*\{[^}]*\}/);
+    const relayProgressRule = css.match(/\.composer-upload-row-falling_back \.composer-upload-progress-fill,\s*\.composer-upload-row-relay \.composer-upload-progress-fill\s*\{[^}]*\}/);
+
+    expect(directBadgeRule?.[0]).toMatch(/color:\s*#86efac/);
+    expect(relayBadgeRule?.[0]).toMatch(/color:\s*#fcd34d/);
+    expect(directProgressRule?.[0]).toMatch(/#4ade80/);
+    expect(relayProgressRule?.[0]).toMatch(/#fbbf24/);
   });
 
   it('fits portrait videos by available preview height without stretching them to full width', () => {
@@ -251,9 +282,27 @@ describe('styles.css regression contracts', () => {
       .map((match) => match[0])
       .find((rule) => /max-width:\s*none/.test(rule));
     expect(mobileTransportShortcutRule).not.toBeNull();
-    expect(mobileTransportShortcutRule!).toMatch(/flex:\s*1\s+1\s+auto/);
+    expect(mobileTransportShortcutRule!).toMatch(/flex:\s*0\s+0\s+auto/);
+    expect(mobileTransportShortcutRule!).toMatch(/min-width:\s*0/);
     expect(mobileTransportShortcutRule!).toMatch(/max-width:\s*none/);
     expect(mobileTransportShortcutRule!).toMatch(/padding-left:\s*0/);
+
+    const mobileMetaScrollerRule = css.match(/\.shortcuts-meta-scroll\s*\{\s*display:\s*flex;[^}]*overflow-x:\s*auto;[^}]*\}/);
+    expect(mobileMetaScrollerRule).not.toBeNull();
+    expect(mobileMetaScrollerRule![0]).toMatch(/flex:\s*1\s+1\s+0/);
+    expect(mobileMetaScrollerRule![0]).toMatch(/min-width:\s*0/);
+    expect(mobileMetaScrollerRule![0]).toMatch(/overflow-y:\s*hidden/);
+    expect(mobileMetaScrollerRule![0]).toMatch(/scrollbar-width:\s*none/);
+    expect(css).toMatch(/\.shortcuts-meta-scroll::-webkit-scrollbar\s*\{\s*display:\s*none/);
+
+    // The mobile scroller is the flex item that grows, so without an explicit
+    // push its children pack to the left of the leftover space and the meta
+    // controls stop hugging the right edge. An auto start margin restores that
+    // and, unlike justify-content: flex-end, still lets an overflowing scroller
+    // reach its leading items.
+    expect(css).toMatch(
+      /\.shortcuts-meta-scroll\s*>\s*:first-child\s*\{\s*margin-inline-start:\s*auto;\s*\}/,
+    );
 
     const subcardStopRule = css.match(/\.subcard-stop-btn\s*\{[^}]*\}/);
     expect(subcardStopRule).not.toBeNull();
@@ -289,7 +338,7 @@ describe('styles.css regression contracts', () => {
     expect(css).toMatch(/@keyframes daemon-clock-tick/);
   });
 
-  it('keeps the mobile daemon details as a fixed dismissible overlay', () => {
+  it('keeps daemon details as a fixed dismissible overlay on every layout', () => {
     const backdropRule = css.match(/\.daemon-details-backdrop\s*\{[^}]*\}/);
     expect(backdropRule).not.toBeNull();
     expect(backdropRule![0]).toMatch(/position:\s*fixed/);
@@ -300,6 +349,35 @@ describe('styles.css regression contracts', () => {
     expect(panelRule).not.toBeNull();
     expect(panelRule![0]).toMatch(/max-height:\s*min\(82dvh,\s*680px\)/);
     expect(panelRule![0]).toMatch(/overflow:\s*auto/);
+
+    const triggerRule = css.match(/\.daemon-stats-trigger\s*\{[^}]*\}/);
+    expect(triggerRule).not.toBeNull();
+    expect(triggerRule![0]).toMatch(/appearance:\s*none/);
+    expect(triggerRule![0]).toMatch(/cursor:\s*pointer/);
+  });
+
+  it('keeps full-screen mobile work surfaces above the persistent server bar', () => {
+    const rootRule = css.match(/:root\s*\{[^}]*\}/);
+    expect(rootRule).not.toBeNull();
+    expect(rootRule![0]).toMatch(/--mobile-server-bar-z:\s*6500/);
+    expect(rootRule![0]).toMatch(/--mobile-fullscreen-window-z:\s*7000/);
+    expect(rootRule![0]).toMatch(/--mobile-fullscreen-preview-z:\s*7001/);
+
+    const sidebarRule = css.match(/\.mobile-sidebar-overlay\s*\{[^}]*\}/);
+    expect(sidebarRule).not.toBeNull();
+    expect(sidebarRule![0]).toMatch(/z-index:\s*var\(--mobile-fullscreen-window-z\)/);
+
+    const fileOverlayRule = Array.from(css.matchAll(/\.mobile-fb-overlay\s*\{[^}]*\}/g))
+      .map((match) => match[0])
+      .find((rule) => /position:\s*fixed/.test(rule));
+    expect(fileOverlayRule).toBeDefined();
+    expect(fileOverlayRule).toMatch(/z-index:\s*var\(--mobile-fullscreen-window-z\)/);
+
+    const previewRule = Array.from(css.matchAll(/\.fb-body-split \.fb-preview\s*\{[^}]*\}/g))
+      .map((match) => match[0])
+      .find((rule) => /position:\s*fixed/.test(rule));
+    expect(previewRule).toBeDefined();
+    expect(previewRule).toMatch(/z-index:\s*var\(--mobile-fullscreen-preview-z\)/);
   });
 
   it('sub-session close-all control stays a narrow strip at the left of the row', () => {
@@ -447,7 +525,7 @@ describe('styles.css regression contracts', () => {
       .find((rule) => /gap:\s*8px/.test(rule));
     expect(barRule).not.toBeNull();
     expect(barRule!).toMatch(/gap:\s*8px/);
-    expect(barRule!).toMatch(/z-index:\s*6500/);
+    expect(barRule!).toMatch(/z-index:\s*var\(--mobile-server-bar-z\)/);
 
     const backdropRule = css.match(/\.mobile-server-backdrop\s*\{[^}]*\}/);
     expect(backdropRule).not.toBeNull();
@@ -539,5 +617,41 @@ describe('styles.css regression contracts', () => {
       // global rule's specificity.
       expect(source).toMatch(/type=['"]checkbox['"][\s\S]{0,600}?width:\s*['"]auto['"]/);
     }
+  });
+  it('the expanded tool-activity details must not be narrower than the chip', () => {
+    // User reported the expanded rows running past the right edge instead of
+    // filling the width. Root cause: the details block was capped at
+    // `min(100%, 760px)` while the collapsed chip is full width, so the rows
+    // were laid out into a container narrower than the space available and the
+    // 6px left margin pushed the remainder out of view.
+    const rule = cssWithoutComments.match(/\.chat-tool-activity-details\s*\{[^}]*\}/)?.[0];
+    expect(rule, '.chat-tool-activity-details rule missing').toBeTruthy();
+    expect(rule).not.toMatch(/760px/);
+    expect(rule).not.toMatch(/max-width/);
+    // `min-width: 0` is what lets the horizontally-scrolling rows inside shrink
+    // to the container instead of forcing it wider.
+    expect(rule).toMatch(/min-width:\s*0/);
+  });
+
+  it('the collapsed tool-activity chip stays full width', () => {
+    // It carries a variable-length tool descriptor; sizing to content made it
+    // jump around as tools changed and left nothing to ellipse.
+    const rule = cssWithoutComments.match(/\.chat-tool-activity\s*\{[^}]*\}/)?.[0];
+    expect(rule, '.chat-tool-activity rule missing').toBeTruthy();
+    expect(rule).toMatch(/width:\s*100%/);
+    expect(rule).not.toMatch(/width:\s*fit-content/);
+  });
+  it('the collapsed tool fold must not carry a grid texture', () => {
+    // User reported "多余的线" between messages twice. Root cause: the fold's
+    // background stacked a 12x12 grid, whose first layer is a horizontal rule
+    // every 12px. When the collapsed content is shorter than the box, the bare
+    // texture reads as separator lines between the surrounding messages.
+    const rule = cssWithoutComments.match(/\.chat-tool-block-fold\s*\{[^}]*\}/)?.[0];
+    expect(rule, '.chat-tool-block-fold rule missing').toBeTruthy();
+    // A `1px, transparent 1px` stop is what draws the repeating line.
+    expect(rule).not.toMatch(/1px,\s*transparent\s*1px/);
+    expect(rule).not.toMatch(/background-size:[^;]*12px/);
+    // The card keeps its own gradient — this is about the texture, not the fill.
+    expect(rule).toMatch(/linear-gradient\(115deg/);
   });
 });

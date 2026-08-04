@@ -13,6 +13,7 @@ import logger from '../util/logger.js';
 import {
   FILE_TRANSFER_LIMITS,
   FILE_TRANSFER_MSG,
+  FILE_TRANSFER_DELETE_ERROR,
   FILE_TRANSFER_UPLOAD_ERROR_CODE,
   FILE_PATH_HANDLE_ERROR,
   type AttachmentRef,
@@ -28,6 +29,9 @@ import {
   type FileDownloadError,
   validateFilePathHandleRequest,
   type FilePathHandleErrorReason,
+  type FileDeleteDone,
+  type FileDeleteError,
+  validateFileDeleteRequest,
 } from '../../shared/transport/file-transfer.js';
 import { FS_GENERIC_ERROR_CODES } from '../../shared/fs-error-codes.js';
 import { validateCanonicalRealPath } from './file-preview-path-policy.js';
@@ -63,6 +67,8 @@ interface AttachmentEntry {
   size?: number;
   createdAt: number;
   expiresAt: number;
+  /** Stable browser upload identity used to deduplicate direct → relay fallback. */
+  clientUploadId?: string;
   /** Local-handle identity prevents path replacement between mint and read. */
   device?: number;
   inode?: number;
@@ -77,6 +83,36 @@ interface DownloadTarget {
 }
 
 const attachmentRegistry = new Map<string, AttachmentEntry>();
+const clientUploadClaims = new Map<string, {
+  token: symbol;
+  released: Promise<void>;
+  release: () => void;
+}>();
+
+/**
+ * Serialize direct transfer and relay fallback attempts that share the same
+ * browser-generated identity. This closes the ambiguous-completion window:
+ * relay waits for the direct writer to either commit or release its claim.
+ */
+export function tryClaimClientUpload(clientUploadId: string): symbol | null {
+  if (clientUploadClaims.has(clientUploadId)) return null;
+  const token = Symbol(clientUploadId);
+  let release = () => {};
+  const released = new Promise<void>((resolve) => { release = resolve; });
+  clientUploadClaims.set(clientUploadId, { token, released, release });
+  return token;
+}
+
+export function waitForClientUploadClaim(clientUploadId: string): Promise<void> | null {
+  return clientUploadClaims.get(clientUploadId)?.released ?? null;
+}
+
+export function releaseClientUploadClaim(clientUploadId: string, token: symbol): void {
+  const claim = clientUploadClaims.get(clientUploadId);
+  if (!claim || claim.token !== token) return;
+  clientUploadClaims.delete(clientUploadId);
+  claim.release();
+}
 
 function randomHex(bytes: number): string {
   return randomBytes(bytes).toString('hex');
@@ -193,7 +229,7 @@ async function resolveDownloadTarget(
   };
 }
 
-function resolveUploadPath(filename: string): string {
+export function resolveUploadPath(filename: string): string {
   const filePath = path.join(UPLOAD_DIR, filename);
   const resolved = path.resolve(filePath);
   if (!resolved.startsWith(path.resolve(UPLOAD_DIR) + path.sep)) {
@@ -210,11 +246,12 @@ async function finalizeUploadedFile(params: {
   resolved: string;
   size: number;
   serverLink: FileTransferSender;
+  clientUploadId?: string;
 }): Promise<void> {
-  const { uploadId, filename, originalName, mime, resolved, size, serverLink } = params;
+  const { uploadId, filename, originalName, mime, resolved, size, serverLink, clientUploadId } = params;
 
   const metaPath = resolved + '.meta.json';
-  await writeFile(metaPath, JSON.stringify({ originalName: originalName || filename, mime })).catch(() => {});
+  await writeFile(metaPath, JSON.stringify({ originalName: originalName || filename, mime, clientUploadId })).catch(() => {});
 
   const now = Date.now();
   const attachment: AttachmentRef = {
@@ -239,6 +276,7 @@ async function finalizeUploadedFile(params: {
     size,
     createdAt: now,
     expiresAt: now + FILE_TRANSFER_LIMITS.TEMP_TTL_MS,
+    clientUploadId,
   });
 
   const response: FileUploadDone = {
@@ -249,6 +287,90 @@ async function finalizeUploadedFile(params: {
   serverLink.send(response);
 
   logger.info({ uploadId, filename, size }, 'File upload complete');
+}
+
+/**
+ * Generate a daemon-owned upload filename. The user-controlled basename never
+ * becomes part of the persisted path; only a conservative extension survives.
+ */
+export function createDirectUploadFilename(originalName: string): string {
+  const ext = path.extname(originalName);
+  const safeExt = /^\.[A-Za-z0-9]{1,20}$/.test(ext) ? ext : '';
+  return `${randomHex(16)}${safeExt}`;
+}
+
+/** Return a committed upload for idempotent direct/relay retry handling. */
+export function lookupAttachmentByClientUploadId(clientUploadId: string): AttachmentRef | undefined {
+  for (const entry of attachmentRegistry.values()) {
+    if (entry.clientUploadId !== clientUploadId) continue;
+    return attachmentEntryToRef(entry);
+  }
+  return undefined;
+}
+
+async function acquireRelayUploadTurn(clientUploadId: string): Promise<
+  { attachment: AttachmentRef; claim?: never } | { attachment?: never; claim: symbol }
+> {
+  while (true) {
+    const attachment = lookupAttachmentByClientUploadId(clientUploadId);
+    if (attachment) return { attachment };
+    const claim = tryClaimClientUpload(clientUploadId);
+    if (claim) {
+      // The prior writer may have committed between the lookup and this claim.
+      // Re-check while holding the claim so a relay never duplicates that file.
+      const committed = lookupAttachmentByClientUploadId(clientUploadId);
+      if (!committed) return { claim };
+      releaseClientUploadClaim(clientUploadId, claim);
+      return { attachment: committed };
+    }
+    const released = waitForClientUploadClaim(clientUploadId);
+    if (released) await released;
+  }
+}
+
+function attachmentEntryToRef(entry: AttachmentEntry): AttachmentRef {
+  return {
+    id: entry.id,
+    source: entry.source,
+    serverId: '',
+    daemonPath: entry.daemonPath,
+    originalName: entry.originalName,
+    mime: entry.mime,
+    size: entry.size,
+    createdAt: new Date(entry.createdAt).toISOString(),
+    expiresAt: new Date(entry.expiresAt).toISOString(),
+    downloadable: true,
+  };
+}
+
+/** Commit a fully written direct-transfer temporary file into the attachment registry. */
+export async function finalizeDirectUploadedFile(params: {
+  clientUploadId: string;
+  filename: string;
+  originalName: string;
+  mime?: string;
+  resolved: string;
+  size: number;
+}): Promise<AttachmentRef> {
+  const now = Date.now();
+  await writeFile(`${params.resolved}.meta.json`, JSON.stringify({
+    originalName: params.originalName,
+    mime: params.mime,
+    clientUploadId: params.clientUploadId,
+  })).catch(() => {});
+  const entry: AttachmentEntry = {
+    id: params.filename,
+    daemonPath: params.resolved,
+    source: 'upload',
+    originalName: params.originalName,
+    mime: params.mime,
+    size: params.size,
+    createdAt: now,
+    expiresAt: now + FILE_TRANSFER_LIMITS.TEMP_TTL_MS,
+    clientUploadId: params.clientUploadId,
+  };
+  attachmentRegistry.set(params.filename, entry);
+  return attachmentEntryToRef(entry);
 }
 
 /** ENOSPC — the disk filled up mid-write. libuv surfaces it as error.code on
@@ -373,11 +495,13 @@ async function recoverRegistry(): Promise<void> {
         // Try to read metadata sidecar
         let origName: string = file;
         let mime: string | undefined;
+        let clientUploadId: string | undefined;
         try {
           const metaRaw = await readFile(filePath + '.meta.json', 'utf-8');
-          const meta = JSON.parse(metaRaw) as { originalName?: string; mime?: string };
+          const meta = JSON.parse(metaRaw) as { originalName?: string; mime?: string; clientUploadId?: string };
           if (meta.originalName) origName = meta.originalName;
           if (meta.mime) mime = meta.mime;
+          if (typeof meta.clientUploadId === 'string') clientUploadId = meta.clientUploadId;
         } catch { /* no sidecar or invalid */ }
 
         attachmentRegistry.set(file, {
@@ -389,6 +513,7 @@ async function recoverRegistry(): Promise<void> {
           size: fileStat.size,
           createdAt: fileStat.mtimeMs,
           expiresAt: fileStat.mtimeMs + FILE_TRANSFER_LIMITS.TEMP_TTL_MS,
+          clientUploadId,
         });
       } catch { /* skip unreadable files */ }
     }
@@ -403,12 +528,22 @@ async function recoverRegistry(): Promise<void> {
 export async function handleFileUpload(cmd: Record<string, unknown>, serverLink: FileTransferSender): Promise<void> {
   const msg = cmd as unknown as FileUploadRequest;
   const { uploadId, filename, originalName, mime, content } = msg;
+  let uploadClaim: symbol | null = null;
 
   try {
     await initFileTransfer();
 
     // Opportunistic cleanup before writing
     await cleanupExpiredUploads();
+
+    if (msg.clientUploadId) {
+      const turn = await acquireRelayUploadTurn(msg.clientUploadId);
+      if (turn.attachment) {
+        serverLink.send({ type: 'file.upload_done', uploadId, attachment: turn.attachment } satisfies FileUploadDone);
+        return;
+      }
+      uploadClaim = turn.claim;
+    }
 
     const resolved = resolveUploadPath(filename);
 
@@ -429,19 +564,32 @@ export async function handleFileUpload(cmd: Record<string, unknown>, serverLink:
       resolved,
       size: buffer.length,
       serverLink,
+      clientUploadId: msg.clientUploadId,
     });
   } catch (err) {
     sendUploadError(serverLink, uploadId, filename, err);
+  } finally {
+    if (msg.clientUploadId && uploadClaim) releaseClientUploadClaim(msg.clientUploadId, uploadClaim);
   }
 }
 
 export async function handleFileUploadFetch(cmd: Record<string, unknown>, serverLink: FileTransferSender): Promise<void> {
   const msg = cmd as unknown as FileUploadFetchRequest;
   const { uploadId, filename, originalName, mime, downloadUrl } = msg;
+  let uploadClaim: symbol | null = null;
 
   try {
     await initFileTransfer();
     await cleanupExpiredUploads();
+
+    if (msg.clientUploadId) {
+      const turn = await acquireRelayUploadTurn(msg.clientUploadId);
+      if (turn.attachment) {
+        serverLink.send({ type: 'file.upload_done', uploadId, attachment: turn.attachment } satisfies FileUploadDone);
+        return;
+      }
+      uploadClaim = turn.claim;
+    }
 
     const resolved = resolveUploadPath(filename);
     if (typeof msg.size !== 'number' || msg.size < 0 || msg.size > FILE_TRANSFER_LIMITS.MAX_FILE_SIZE) {
@@ -462,9 +610,55 @@ export async function handleFileUploadFetch(cmd: Record<string, unknown>, server
       resolved,
       size,
       serverLink,
+      clientUploadId: msg.clientUploadId,
     });
   } catch (err) {
     sendUploadError(serverLink, uploadId, filename, err);
+  } finally {
+    if (msg.clientUploadId && uploadClaim) releaseClientUploadClaim(msg.clientUploadId, uploadClaim);
+  }
+}
+
+async function deleteUploadedAttachment(entry: AttachmentEntry): Promise<void> {
+  if (entry.source !== 'upload') throw new Error(FILE_TRANSFER_DELETE_ERROR.FORBIDDEN);
+  const resolved = path.resolve(entry.daemonPath);
+  const uploadRoot = path.resolve(UPLOAD_DIR);
+  if (!resolved.startsWith(`${uploadRoot}${path.sep}`)) throw new Error(FILE_TRANSFER_DELETE_ERROR.FORBIDDEN);
+  try {
+    await unlink(resolved);
+  } catch (error) {
+    if (!isNotFoundError(error)) throw error;
+  }
+  await unlink(`${resolved}.meta.json`).catch((error) => {
+    if (!isNotFoundError(error)) logger.warn({ attachmentId: entry.id, error }, 'Failed to remove upload metadata');
+  });
+  attachmentRegistry.delete(entry.id);
+}
+
+export async function handleFileDelete(cmd: Record<string, unknown>, serverLink: FileTransferSender): Promise<void> {
+  const parsed = validateFileDeleteRequest(cmd);
+  const requestId = typeof cmd.requestId === 'string' ? cmd.requestId : '';
+  if (!parsed.ok) {
+    if (requestId) serverLink.send({
+      type: FILE_TRANSFER_MSG.DELETE_ERROR,
+      requestId,
+      error: FILE_TRANSFER_DELETE_ERROR.DELETE_FAILED,
+    } satisfies FileDeleteError);
+    return;
+  }
+  try {
+    await initFileTransfer();
+    const entry = attachmentRegistry.get(parsed.value.attachmentId);
+    // Deletion is idempotent: an expired/already-removed upload is already in
+    // the state requested by the user.
+    if (entry) await deleteUploadedAttachment(entry);
+    serverLink.send({ type: FILE_TRANSFER_MSG.DELETE_DONE, requestId: parsed.value.requestId } satisfies FileDeleteDone);
+  } catch (error) {
+    const reason = error instanceof Error && error.message === FILE_TRANSFER_DELETE_ERROR.FORBIDDEN
+      ? FILE_TRANSFER_DELETE_ERROR.FORBIDDEN
+      : FILE_TRANSFER_DELETE_ERROR.DELETE_FAILED;
+    logger.error({ requestId: parsed.value.requestId, attachmentId: parsed.value.attachmentId, error }, 'Failed to delete uploaded attachment');
+    serverLink.send({ type: FILE_TRANSFER_MSG.DELETE_ERROR, requestId: parsed.value.requestId, error: reason } satisfies FileDeleteError);
   }
 }
 

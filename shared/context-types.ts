@@ -148,6 +148,8 @@ export type ProviderSupportClass =
 export interface ProviderContextPayload {
   userMessage: string;
   assembledMessage: string;
+  /** Stable logical delivery identity retained across recoverable dispatch retries. */
+  deliveryId?: string;
   /** Runtime-minted transport activity generation for lifecycle attribution. */
   activityGeneration?: ActivityGeneration;
   sessionSystemText?: string;

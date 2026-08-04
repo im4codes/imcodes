@@ -1382,6 +1382,9 @@ async function drainTransportResendQueueIntoRuntime(
         const resendMetadata = {
           ...(entry.sharedActor ? { sharedActor: entry.sharedActor } : {}),
           ...(entry.providerText != null ? { providerText: entry.providerText } : {}),
+          // Preserve the anchor across a reconnect resend for the same reason as
+          // providerText: the user.message is emitted after this hop.
+          ...(entry.aliasAudit ? { aliasAudit: entry.aliasAudit } : {}),
           ...(entry.timelineCommitted ? { timelineCommitted: true } : {}),
           ...(entry.historyCommitted ? { historyCommitted: true } : {}),
         };
@@ -1417,6 +1420,9 @@ async function drainTransportResendQueueIntoRuntime(
               pendingMessageVersion: observeTransportQueueRevision(sessionName, runtime.pendingVersion),
               ...(attachments.length > 0 ? { attachments } : {}),
               ...(entry.sharedActor ? { sharedActor: entry.sharedActor } : {}),
+              // Resend delivers the expanded copy to the provider, so this
+              // user.message is the only place the anchor can land.
+              ...(entry.aliasAudit ? { aliasAudit: entry.aliasAudit } : {}),
             },
             { source: 'daemon', confidence: 'high', eventId: `transport-user:${clientMessageId}` },
           );
@@ -1703,6 +1709,7 @@ function wireTransportCallbacks(
           allowDuplicate: true,
           pendingMessageVersion: drainedVersion,
           ...(entry.sharedActor ? { sharedActor: entry.sharedActor } : {}),
+          ...(entry.aliasAudit ? { aliasAudit: entry.aliasAudit } : {}),
         },
         { source: 'daemon', confidence: 'high', eventId: transportUserEventId(entry.clientMessageId) },
       );

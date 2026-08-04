@@ -24,7 +24,17 @@ import { markEphemeralProviderSid, unmarkEphemeralProviderSid } from '../agent/s
 import logger from '../util/logger.js';
 import { sanitizeMcpErrorMessage } from '../../shared/mcp-error-sanitize.js';
 
-export type SupervisionDecisionKind = 'complete' | 'continue' | 'ask_human';
+/**
+ * `waiting` exists because the other three cannot express "correctly parked".
+ *
+ * A session that dispatched a peer audit and is forbidden from touching the
+ * repository until it returns is not `complete` (work remains), not
+ * `ask_human` (nobody needs to intervene), and emphatically not `continue` —
+ * yet `continue` was the only survivor, so automation re-prompted a session
+ * whose sole correct action was to wait, and it answered "still blocked" on
+ * every loop.
+ */
+export type SupervisionDecisionKind = 'complete' | 'continue' | 'waiting' | 'ask_human';
 
 /**
  * Structured supervisor verdict. The schema is intentionally action-oriented:
@@ -53,11 +63,22 @@ export type SupervisionDecisionKind = 'complete' | 'continue' | 'ask_human';
  *    verbatim to callers that want richer metadata without another schema
  *    bump.
  */
+/**
+ * How much audit a change is worth.
+ *
+ * `requiresAudit` alone is a yes/no, so a two-line stylesheet tweak and a
+ * cross-layer state-machine change were billed the same full audit. That is the
+ * main reason supervised sessions feel audited constantly. `narrow` keeps the
+ * independent check but scopes it to the diff and its direct blast radius.
+ */
+export type SupervisionAuditDepth = 'standard' | 'narrow';
+
 export interface SupervisionDecision {
   decision: SupervisionDecisionKind;
   reason: string;
   confidence: number;
   requiresAudit?: boolean;
+  auditDepth?: SupervisionAuditDepth;
   gap?: string;
   nextAction?: string;
   extra?: Record<string, unknown>;
@@ -89,7 +110,8 @@ export interface SupervisionBrokerDeps {
   waitForRetry?: (delayMs: number) => Promise<void>;
 }
 
-const DECISIONS = new Set<SupervisionDecisionKind>(['complete', 'continue', 'ask_human']);
+const DECISIONS = new Set<SupervisionDecisionKind>(['complete', 'continue', 'waiting', 'ask_human']);
+const AUDIT_DEPTHS = new Set<SupervisionAuditDepth>(['standard', 'narrow']);
 const MIN_SUPERVISION_EXECUTION_BUDGET_MS = 5;
 const MAX_RECOVERABLE_PROVIDER_RETRIES = 2;
 const PROVIDER_RETRY_DELAYS_MS = [250, 750] as const;
@@ -114,11 +136,42 @@ function errorRecord(value: unknown): Record<string, unknown> | null {
     : null;
 }
 
+/** Placeholder JS produces for `String(plainObject)` — never useful to a human. */
+const USELESS_STRINGIFIED_OBJECT = '[object Object]';
+
+/**
+ * Recover a diagnosable message from whatever the provider surfaced.
+ *
+ * `ProviderError` (transport-provider.ts) is a PLAIN OBJECT
+ * `{ code, message, recoverable, details }` — NOT an `Error`. `String()` on it
+ * yields the literal `[object Object]`, which is what previously reached both
+ * the user-facing warning and the daemon log, destroying every root cause: the
+ * operator saw "after 3 attempts: [object Object]" and had nothing left to
+ * diagnose with. Read the object's own `message` before falling back.
+ *
+ * The last resort deliberately reports the error CODE rather than the useless
+ * placeholder, so a message-less provider failure is still actionable. `details`
+ * is only used when it is already human text — adapters are supposed to keep it
+ * privacy-whitelisted, but stringifying an arbitrary payload here could leak a
+ * raw provider response into logs.
+ */
+function extractProviderErrorMessage(error: unknown, record: Record<string, unknown> | null): string {
+  if (error instanceof Error && error.message.trim()) return error.message.trim();
+  const message = typeof record?.message === 'string' ? record.message.trim() : '';
+  if (message) return message;
+  const code = typeof record?.code === 'string' ? record.code.trim() : '';
+  const details = typeof record?.details === 'string' ? record.details.trim() : '';
+  if (code) return details ? `${code}: ${details}` : `provider error (${code})`;
+  if (details) return details;
+  const raw = String(error).trim();
+  return raw && raw !== USELESS_STRINGIFIED_OBJECT ? raw : 'unknown provider error';
+}
+
 function normalizeProviderExecutionError(error: unknown): SupervisionExecutionError {
   const record = errorRecord(error);
   if (record?.supervisionUnavailableReason) return error as SupervisionExecutionError;
 
-  const message = error instanceof Error ? error.message : String(error);
+  const message = extractProviderErrorMessage(error, record);
   const code = typeof record?.code === 'string' && record.code.trim()
     ? record.code.trim()
     : undefined;
@@ -235,6 +288,7 @@ export function parseSupervisionDecision(text: string): SupervisionDecision | nu
   if (typeof record.reason !== 'string' || !record.reason.trim()) return null;
   if (typeof record.confidence !== 'number' || !Number.isFinite(record.confidence) || record.confidence < 0 || record.confidence > 1) return null;
   if (record.requiresAudit !== undefined && typeof record.requiresAudit !== 'boolean') return null;
+  if (record.auditDepth !== undefined && !AUDIT_DEPTHS.has(record.auditDepth as SupervisionAuditDepth)) return null;
   // gap / nextAction / extra are all optional at parse time — the guardrail
   // below is where "continue without nextAction" gets downgraded to
   // ask_human. Keeping the parser permissive means a still-correct
@@ -250,6 +304,9 @@ export function parseSupervisionDecision(text: string): SupervisionDecision | nu
     reason: record.reason.trim(),
     confidence: record.confidence,
     ...(typeof record.requiresAudit === 'boolean' ? { requiresAudit: record.requiresAudit } : {}),
+    ...(AUDIT_DEPTHS.has(record.auditDepth as SupervisionAuditDepth)
+      ? { auditDepth: record.auditDepth as SupervisionAuditDepth }
+      : {}),
     ...(gap ? { gap } : {}),
     ...(nextAction ? { nextAction } : {}),
     ...(extra ? { extra } : {}),
@@ -405,7 +462,10 @@ export class SupervisionBroker {
       return await this.evaluateWithProvider(provider, request, remainingBudget, snapshot, request.cwd);
     } catch (error) {
       const normalized = error as SupervisionExecutionError;
-      const message = error instanceof Error ? error.message : String(error);
+      // Same reason as normalizeProviderExecutionError: a non-Error thrown from
+      // anywhere in this chain must not degrade into `[object Object]` — this
+      // message becomes `decision.reason`, i.e. the detail the operator reads.
+      const message = extractProviderErrorMessage(error, errorRecord(error));
       const unavailableReason = (error && typeof error === 'object' && 'supervisionUnavailableReason' in error
         ? normalized.supervisionUnavailableReason
         : undefined) ?? SUPERVISION_UNAVAILABLE_REASONS.PROVIDER_NOT_CONNECTED;
@@ -455,7 +515,7 @@ export class SupervisionBroker {
         preset: snapshot.preset,
       });
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
+      const message = extractProviderErrorMessage(error, errorRecord(error));
       throw Object.assign(new Error(message), {
         supervisionUnavailableReason: SUPERVISION_UNAVAILABLE_REASONS.PROVIDER_ERROR,
         supervisionProviderCode: PROVIDER_ERROR_CODES.CONFIG_ERROR,
