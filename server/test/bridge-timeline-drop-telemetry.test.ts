@@ -117,9 +117,7 @@ describe('WsBridge timeline drop telemetry', () => {
       .toBe(0);
   });
 
-  // Skipped alongside `companionDeviceFanoutEnabled` in bridge.ts — see the
-  // flag's comment. Un-skip when the fan-out comes back.
-  it.skip('delivers live timeline events to a same-user companion without its own transient session subscription', async () => {
+  it('delivers live timeline events to a same-user companion without its own transient session subscription', async () => {
     const { bridge, daemon } = await setupAuthedDaemon();
     const subscribed = new MockWs();
     const companion = new MockWs();

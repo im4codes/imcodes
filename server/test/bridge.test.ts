@@ -5429,13 +5429,7 @@ describe('WsBridge', () => {
       expect(timelineEvents[0].event.payload.text).toBe('live repair works');
     });
 
-    // Skipped for as long as `companionDeviceFanoutEnabled` is false in
-    // bridge.ts. That flag is a bisect step for a sub-session streaming report:
-    // the fan-out this test covers is the only behavioural change on the
-    // streaming path between master and dev. Un-skip together with the flag —
-    // either when the bisect clears the fan-out, or when it is reintroduced in
-    // a form that keeps sub-sessions streaming.
-    it.skip('streams the same assistant timeline updates to mobile and desktop even if only mobile has subscribed', async () => {
+    it('streams the same assistant timeline updates to mobile and desktop even if only mobile has subscribed', async () => {
       const bridge = WsBridge.get(serverId);
       const db = makeDb('valid-hash');
       const daemonWs = new MockWs();
