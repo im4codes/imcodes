@@ -30,6 +30,12 @@ export type StackOrderEntry = string | { id: string };
 export const DESKTOP_BOTTOM_WINDOW_RESERVE_PX = 100;
 const SESSION_TAB_BUTTON_SELECTOR = '.tab-bar [role="tab"]';
 const SESSION_TAB_BAR_SELECTOR = '.tab-bar';
+/**
+ * Last-resort floor for the workspace top. `.main` is the content column, which
+ * sits below the app header by construction, so its top is always a safe
+ * boundary even when the tab bar cannot be measured.
+ */
+const MAIN_CONTENT_SELECTOR = '.main';
 
 const DEFAULT_MIN_W = 1;
 const DEFAULT_MIN_H = 1;
@@ -89,7 +95,19 @@ export function resolveSessionTabsBottom(doc: Document | null = typeof document 
   if (tabButtonBottoms.length > 0) return Math.max(...tabButtonBottoms);
 
   const tabBar = doc.querySelector<HTMLElement>(SESSION_TAB_BAR_SELECTOR);
-  return tabBar ? Math.max(0, finiteOr(tabBar.getBoundingClientRect().bottom, 0)) : 0;
+  if (tabBar) return Math.max(0, finiteOr(tabBar.getBoundingClientRect().bottom, 0));
+
+  // Falling through to 0 pins a window to the very top of the viewport, which
+  // slides its own title bar — and the close button in it — underneath the app
+  // header. That is reachable whenever the tab bar is absent or not yet laid
+  // out: on mobile the window top reads this value and drops back to the safe
+  // area inset alone when it is 0, and the ResizeObserver that would correct it
+  // only attaches if `.tab-bar` already exists when the effect runs.
+  //
+  // `.main` starts below the header, so its top is a strictly safer floor. This
+  // can only push the boundary DOWN relative to the old behaviour.
+  const mainContent = doc.querySelector<HTMLElement>(MAIN_CONTENT_SELECTOR);
+  return mainContent ? Math.max(0, finiteOr(mainContent.getBoundingClientRect().top, 0)) : 0;
 }
 
 export function viewportWorkspaceBelowSessionTabs(options: {

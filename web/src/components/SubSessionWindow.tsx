@@ -786,6 +786,11 @@ export function SubSessionWindow({
       }
       const tabBar = document.querySelector<HTMLElement>('.tab-bar');
       if (tabBar) ro.observe(tabBar);
+      // Observe the content column too. When the tab bar is missing at this
+      // moment nothing else would ever re-measure, and the window stays pinned
+      // to the top of the viewport with its title bar under the app header.
+      const mainContent = document.querySelector<HTMLElement>('.main');
+      if (mainContent) ro.observe(mainContent);
     };
 
     observeTargets();
