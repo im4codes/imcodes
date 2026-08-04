@@ -24,6 +24,15 @@ export async function resolveHttpShareAccess(
       actor: resolveEffectiveActor(membership, null),
     };
   }
+  // The WS path refuses a target belonging to another server before resolving
+  // coverage (`resolveShareCoverageFromDb`); this one did not. Every caller
+  // currently builds the target from the route's own serverId, so the two can
+  // never disagree today — but a caller that starts reading the target from a
+  // request body would turn that into cross-server access with no guard here
+  // to stop it.
+  if (params.target.serverId && params.target.serverId !== params.serverId) {
+    return { membership, actor: resolveEffectiveActor(null, null) };
+  }
   const coverage = await resolveEffectiveShareCoverage(db, { userId: params.userId, target: params.target, now });
   return {
     membership,

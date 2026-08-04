@@ -224,6 +224,7 @@ import type {
 } from '../../shared/p2p-workflow-types.js';
 import { bindP2pCompiledWorkflow } from './p2p-workflow-bind.js';
 import { readP2pDiscussionWithOffset } from './p2p-workflow-discussion-offsets.js';
+import { P2P_ROUTING_FIELDS } from '../../shared/p2p-routing-fields.js';
 import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
 import {
   PEER_AUDIT_MESSAGES,
@@ -3003,24 +3004,9 @@ function replayDelegationTerminalAckIfPresent(
   return true;
 }
 
-const DELEGATION_MIXED_P2P_FIELDS = [
-  'p2pAtTargets',
-  'directTargetSession',
-  'directTargetMode',
-  'p2pMode',
-  'p2pSessionConfig',
-  'p2pWorkflowLaunchEnvelope',
-  'workflowLaunchEnvelope',
-  'p2pRounds',
-  'p2pExtraPrompt',
-  'p2pLocale',
-  'p2pHopTimeoutMs',
-  'p2pAdvancedPresetKey',
-  'p2pAdvancedRounds',
-  'p2pAdvancedRunTimeoutMinutes',
-  'p2pContextReducer',
-  'dedicatedExecutionRouting',
-] as const;
+// Single source of truth, shared with the share-scope checker so the two
+// cannot drift. See shared/p2p-routing-fields.ts.
+const DELEGATION_MIXED_P2P_FIELDS = P2P_ROUTING_FIELDS;
 
 const DELEGATION_UNSUPPORTED_TOP_LEVEL_FIELDS = [
   'replyTo',

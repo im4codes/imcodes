@@ -1913,13 +1913,20 @@ export class WsBridge {
   private collectTimelineSubscriberSockets(sessionName: string): WebSocket[] {
     const sockets: WebSocket[] = [];
     const seen = new Set<WebSocket>();
+    // Share-scoped sockets are excluded outright. This path carries
+    // `timeline.history` / `replay` / `page` / `detail`, none of which appear
+    // in SHARE_SCOPED_DAEMON_MESSAGE_POLICY — the policy default-denies them —
+    // yet the sends here never went through filterShareOutgoingJson, so the
+    // full payloads (tool arguments, absolute paths, cwd) reached share
+    // sockets anyway. Dropping them here restores the policy's own verdict.
+    const admit = (ws: WebSocket): boolean => !this.browserShareStates.has(ws);
     for (const [ws, sessions] of this.browserSubscriptions) {
-      if (!sessions.has(sessionName) || seen.has(ws)) continue;
+      if (!sessions.has(sessionName) || seen.has(ws) || !admit(ws)) continue;
       seen.add(ws);
       sockets.push(ws);
     }
     for (const [ws, sessions] of this.transportSubscriptions) {
-      if (!sessions.has(sessionName) || seen.has(ws)) continue;
+      if (!sessions.has(sessionName) || seen.has(ws) || !admit(ws)) continue;
       seen.add(ws);
       sockets.push(ws);
     }
@@ -5387,7 +5394,7 @@ export class WsBridge {
       if (!sessions.has(sessionName)) continue;
       if (sent.has(ws)) continue;
       const msg = this.tryParseJsonRecord(json);
-      const outgoing = msg ? this.filterShareOutgoingJson(ws, msg, json) : json;
+      const outgoing = this.filterShareOutgoingJson(ws, msg, json);
       if (!outgoing) continue;
       sent.add(ws);
       safeSend(ws, outgoing);
@@ -5396,7 +5403,7 @@ export class WsBridge {
       if (!sessions.has(sessionName)) continue;
       if (sent.has(ws)) continue;
       const msg = this.tryParseJsonRecord(json);
-      const outgoing = msg ? this.filterShareOutgoingJson(ws, msg, json) : json;
+      const outgoing = this.filterShareOutgoingJson(ws, msg, json);
       if (!outgoing) continue;
       sent.add(ws);
       safeSend(ws, outgoing);
@@ -5422,7 +5429,7 @@ export class WsBridge {
 
     const send = (ws: WebSocket, anchorViewer: boolean): void => {
       if (sent.has(ws)) return;
-      const outgoing = msg ? this.filterShareOutgoingJson(ws, msg, json) : json;
+      const outgoing = this.filterShareOutgoingJson(ws, msg, json);
       if (!outgoing || !safeSend(ws, outgoing)) return;
       sent.add(ws);
       if (!anchorViewer) return;
@@ -5504,7 +5511,7 @@ export class WsBridge {
     for (const [ws, sessions] of this.transportSubscriptions) {
       if (!sessions.has(sessionId)) continue;
       const msg = this.tryParseJsonRecord(data);
-      const outgoing = msg ? this.filterShareOutgoingJson(ws, msg, data) : data;
+      const outgoing = this.filterShareOutgoingJson(ws, msg, data);
       if (!outgoing) continue;
       safeSend(ws, outgoing);
     }
@@ -5516,7 +5523,7 @@ export class WsBridge {
     if (!shareStateCoversSession(state, sessionName)) return false;
     if (typeof data !== 'string') return true;
     const msg = this.tryParseJsonRecord(data);
-    return !msg || !!this.filterShareOutgoingJson(ws, msg, data);
+    return !!this.filterShareOutgoingJson(ws, msg, data);
   }
 
   private handleQueueOverflow(sessionName: string, ws: WebSocket): void {
@@ -5844,7 +5851,7 @@ export class WsBridge {
     const msg = this.tryParseJsonRecord(json);
     for (const bs of this.browserSockets) {
       try {
-        const outgoing = msg ? this.filterShareOutgoingJson(bs, msg, json) : json;
+        const outgoing = this.filterShareOutgoingJson(bs, msg, json);
         if (!outgoing) continue;
         bs.send(outgoing);
       } catch {
@@ -5862,9 +5869,20 @@ export class WsBridge {
     }
   }
 
-  private filterShareOutgoingJson(ws: WebSocket, msg: Record<string, unknown>, originalJson: string): string | null {
+  /**
+   * `msg` is the parsed payload, or null when it did not parse to a JSON
+   * object. A non-share socket still gets the original bytes; a share socket
+   * gets nothing.
+   *
+   * The call sites used to read `msg ? filter(...) : json`, which sent the raw
+   * bytes to EVERY socket when parsing failed — the one case where the filter
+   * cannot make a judgement was also the one case it was skipped. Deciding it
+   * here keeps the fallback from being re-introduced at a new call site.
+   */
+  private filterShareOutgoingJson(ws: WebSocket, msg: Record<string, unknown> | null, originalJson: string): string | null {
     const state = this.browserShareStates.get(ws);
     if (!state) return originalJson;
+    if (!msg) return null;
     const filtered = filterShareDaemonMessage(msg, state);
     return filtered ? JSON.stringify(filtered) : null;
   }

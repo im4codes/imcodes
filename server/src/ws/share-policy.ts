@@ -169,6 +169,18 @@ export const SHARE_SCOPED_COMMAND_POLICY = new Map<string, ShareCommandPolicy>(
 type DaemonMessagePolicy = {
   target: (msg: Record<string, unknown>) => ShareTarget | null;
   redact?: (msg: Record<string, unknown>, state: ShareScopedSocketState) => Record<string, unknown> | null;
+  /**
+   * Set only when `redact` narrows a server-scoped message to what the
+   * receiving socket actually covers.
+   *
+   * A `kind: 'server'` target names no session, so the per-session coverage
+   * check cannot run on it. Without this flag such a message is delivered only
+   * to a socket whose own share is server-scoped. `session_list` opts in
+   * because `redactSessionList` drops the rows a narrower share does not cover;
+   * `discussion.*` and `p2p.run.*` must not, because they carry content from
+   * sessions the receiving socket may have no share for at all.
+   */
+  scopesServerTargetInRedact?: true;
 };
 
 export const SHARE_SCOPED_DAEMON_MESSAGE_POLICY = new Map<string, DaemonMessagePolicy>([
@@ -210,6 +222,9 @@ export const SHARE_SCOPED_DAEMON_MESSAGE_POLICY = new Map<string, DaemonMessageP
   ['session_list', {
     target: serverFieldTarget,
     redact: redactSessionList,
+    // `redactSessionList` drops the rows a narrower share does not cover, so a
+    // tab-scoped socket can safely receive this server-targeted message.
+    scopesServerTargetInRedact: true,
   }],
 ]);
 
@@ -424,7 +439,19 @@ export function filterShareDaemonMessage(
   const target = policy.target(msg);
   if (!target) return null;
   if (target.serverId && target.serverId !== state.target.serverId) return null;
-  if (target.kind !== 'server' && !shareStateCoversSession(state, sessionNameFromTarget(target))) return null;
+  if (target.kind === 'server') {
+    // A server-scoped target names no session, so per-session coverage cannot
+    // be evaluated. Previously that skipped the check entirely and delivered
+    // the message to every share socket on the server — a socket shared a
+    // single tab, in viewer role, received whole-server `discussion.*` and
+    // `p2p.run.*` payloads (round text, participant session names, hop output
+    // paths), neither of which has a redact. Decide on the RECEIVER's scope:
+    // a server-scoped share legitimately covers everything, and a narrower one
+    // may receive this only when the entry's redact re-scopes it.
+    if (state.target.kind !== 'server' && !policy.scopesServerTargetInRedact) return null;
+  } else if (!shareStateCoversSession(state, sessionNameFromTarget(target))) {
+    return null;
+  }
   return policy.redact ? policy.redact(msg, state) : msg;
 }
 
@@ -593,15 +620,49 @@ function subsessionRemovedTarget(msg: Record<string, unknown>): ShareTarget | nu
   return subsessionCreatedTarget(msg);
 }
 
+/**
+ * Host-side fields on a session row that a share recipient has no business
+ * seeing. They describe the machine and the provider account, not the
+ * conversation: `projectDir` is an absolute filesystem path, `transportConfig`
+ * is an opaque provider blob that can carry env and endpoint settings, and the
+ * rest identify the provider session or the owner's plan and quota.
+ *
+ * Row filtering alone never removed these — it only chose which rows to send —
+ * so every covered row shipped them in full, to server-scoped shares as well.
+ */
+const SHARE_REDACTED_SESSION_FIELDS = [
+  'projectDir',
+  'transportConfig',
+  'providerSessionId',
+  'qwenAuthType',
+  'qwenAuthLimit',
+  'qwenAvailableModels',
+  'quotaMeta',
+  'quotaLabel',
+  'quotaUsageLabel',
+  'contextNamespace',
+] as const;
+
+function redactSessionRow(row: Record<string, unknown>): Record<string, unknown> {
+  const redacted = { ...row };
+  for (const field of SHARE_REDACTED_SESSION_FIELDS) delete redacted[field];
+  return redacted;
+}
+
 function redactSessionList(msg: Record<string, unknown>, state: ShareScopedSocketState): Record<string, unknown> | null {
-  if (state.target.kind === 'server') return msg;
-  const sessions = Array.isArray(msg.sessions)
-    ? msg.sessions.filter((item) => {
+  const rows = Array.isArray(msg.sessions) ? msg.sessions : [];
+  // Server-scoped shares cover every session, so they keep every row — but the
+  // host-side fields come off for them too. Previously this returned the whole
+  // message untouched for them.
+  const serverScoped = state.target.kind === 'server';
+  const sessions = rows
+    .filter((item) => {
       if (!item || typeof item !== 'object') return false;
+      if (serverScoped) return true;
       const name = (item as Record<string, unknown>).name;
       return typeof name === 'string' && shareStateCoversSession(state, name);
     })
-    : [];
+    .map((item) => redactSessionRow(item as Record<string, unknown>));
   return { ...msg, sessions };
 }
 

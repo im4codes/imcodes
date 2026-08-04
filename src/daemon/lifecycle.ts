@@ -702,21 +702,23 @@ export async function startup(): Promise<DaemonContext> {
     // each RE-connect, re-broadcast every transport session's current state.
     setServerLinkReconnectResyncHandler(() => {
       resyncTransportSessionStatesAfterLinkRestore();
-      // Sub-sessions need the same treatment, for a reason that bites harder.
-      // The server drops its entire `activeSubSessions` map when the daemon
-      // socket closes, and that map is what authorizes a browser's
-      // `chat.subscribe` for `deck_sub_*` (a sub-session has no row in the
-      // `sessions` table, so the only other route is a `sub_sessions` DB
-      // lookup). It is repopulated solely by `subsession.sync`, which this
-      // restore broadcast sends — and which was wired to daemon STARTUP only.
+      // Sub-sessions need the same treatment.
       //
-      // So one socket blip was permanent: the map stayed empty, every
-      // sub-session subscribe was rejected, and the server then discarded
-      // their live timeline events for having no subscribed viewer. The chat
-      // still filled in via HTTP backfill, so the turn's text arrived in one
-      // block at the end and streaming looked broken for sub-sessions while
-      // main sessions (authorized straight from the `sessions` table) were
-      // unaffected.
+      // The server drops its `activeSubSessions` map when the daemon socket
+      // closes, and only `subsession.sync` refills it — which this restore
+      // broadcast sends, and which was wired to daemon STARTUP alone, so a
+      // socket blip left the map empty for the rest of the process's life.
+      //
+      // What that costs is the fast in-memory authorization and the runtime
+      // metadata: `verifySessionOwnership` still falls back to a `sub_sessions`
+      // DB lookup with retries, so subscribes are NOT rejected outright. An
+      // earlier version of this comment claimed they were and blamed the
+      // sub-session streaming failure on it. That was wrong — the real cause
+      // was `subsession.rebuild_all` exceeding the outbound WS cap and throwing
+      // out of an effect, which cancelled the subscribe effects behind it. The
+      // resync here is still worth doing (it restores the memory authorization
+      // path, repairs missing or stale DB rows, and re-sends state/queue
+      // snapshots), but it is a robustness fix, not that bug's fix.
       scheduleServerLinkRestoreBroadcast?.();
     });
     serverLink.onMessage((msg) => {

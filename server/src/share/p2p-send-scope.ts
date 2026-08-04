@@ -1,4 +1,5 @@
 import type { ShareDenialReason, ShareTarget } from '../../../shared/tab-sharing.js';
+import { collectP2pRoutedSessionNames } from '../../../shared/p2p-routing-fields.js';
 
 export interface P2pSendTargets {
   hasP2pRouting: boolean;
@@ -60,11 +61,19 @@ export function evaluateP2pSendTargetScope(params: {
   coversSession: (sessionName: string) => boolean;
 }): ShareDenialReason | null {
   const targets = extractP2pSendTargets(params.msg);
-  if (!targets.hasP2pRouting) return null;
+  // Sweep every routing field for session names, not just the four this file
+  // parses by hand. `p2pWorkflowLaunchEnvelope` nests its targets under
+  // `participants[].sessionName`, so the hand-parsed set reported "no P2P
+  // routing" and the send was allowed through unscoped. The sweep is driven by
+  // the shared field list, so a new routing field is covered on both sides at
+  // once instead of silently only on the daemon's.
+  const sweptSessions = collectP2pRoutedSessionNames(params.msg);
+  if (!targets.hasP2pRouting && sweptSessions.length === 0) return null;
   if (params.target.kind === 'server') return null;
   if (targets.hasUnboundedExpansion) return 'share-direct-surface-denied';
-  if (targets.sessions.some((name) => !params.coversSession(name))) {
-    return 'share-direct-surface-denied';
+  const routed = new Set([...targets.sessions, ...sweptSessions]);
+  for (const name of routed) {
+    if (!params.coversSession(name)) return 'share-direct-surface-denied';
   }
   return null;
 }

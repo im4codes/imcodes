@@ -167,12 +167,22 @@ function choosePreferredTimelineEvent(existing: TimelineEvent, incoming: Timelin
  * Resolve same-eventId conflicts deterministically.
  *
  * Preference order:
- * 1. full events over preview events
- * 2. terminal/non-streaming over streaming
- * 3. newer epoch
- * 4. newer seq
- * 5. newer ts
- * 6. incoming as tie-breaker
+ * 1. terminal/non-streaming over streaming — the turn is settled, and nothing
+ *    about a payload outranks that
+ * 2. between two streaming generations of one message, newer epoch then seq —
+ *    freshness, because completeness there describes a stale snapshot
+ * 3. full events over preview events
+ * 4. newer epoch
+ * 5. newer seq
+ * 6. newer ts
+ * 7. incoming as tie-breaker
+ *
+ * Steps 1 and 2 used to sit below completeness. A hydrated payload inherits the
+ * seq of the snapshot it hydrated, so ranking completeness first pinned that
+ * snapshot ahead of every delta still arriving and the message stopped updating
+ * until its terminal event landed. Keep this list in step with the code — the
+ * previous version of this comment described the old order and would have
+ * talked the next reader into restoring it.
  */
 export function preferTimelineEvent(existing: TimelineEvent, incoming: TimelineEvent): TimelineEvent {
   const preferred = choosePreferredTimelineEvent(existing, incoming);
