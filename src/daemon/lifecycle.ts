@@ -702,6 +702,22 @@ export async function startup(): Promise<DaemonContext> {
     // each RE-connect, re-broadcast every transport session's current state.
     setServerLinkReconnectResyncHandler(() => {
       resyncTransportSessionStatesAfterLinkRestore();
+      // Sub-sessions need the same treatment, for a reason that bites harder.
+      // The server drops its entire `activeSubSessions` map when the daemon
+      // socket closes, and that map is what authorizes a browser's
+      // `chat.subscribe` for `deck_sub_*` (a sub-session has no row in the
+      // `sessions` table, so the only other route is a `sub_sessions` DB
+      // lookup). It is repopulated solely by `subsession.sync`, which this
+      // restore broadcast sends — and which was wired to daemon STARTUP only.
+      //
+      // So one socket blip was permanent: the map stayed empty, every
+      // sub-session subscribe was rejected, and the server then discarded
+      // their live timeline events for having no subscribed viewer. The chat
+      // still filled in via HTTP backfill, so the turn's text arrived in one
+      // block at the end and streaming looked broken for sub-sessions while
+      // main sessions (authorized straight from the `sessions` table) were
+      // unaffected.
+      scheduleServerLinkRestoreBroadcast?.();
     });
     serverLink.onMessage((msg) => {
       handleWebCommand(msg, serverLink!);
@@ -718,8 +734,16 @@ export async function startup(): Promise<DaemonContext> {
 
     // Broadcast cached repo detections after connect so browsers that missed
     // the initial repo.detected push (e.g. connected late, reconnected) get the data.
+    //
+    // Now that a reconnect also schedules this, a flapping link would otherwise
+    // stack one pending broadcast per reconnect and replay the whole session
+    // list several times over. Keep at most one armed: the newest reconnect is
+    // the one whose state is worth sending.
+    let restoreBroadcastTimer: ReturnType<typeof setTimeout> | null = null;
     scheduleServerLinkRestoreBroadcast = () => {
+      if (restoreBroadcastTimer) clearTimeout(restoreBroadcastTimer);
       const timer = setTimeout(() => {
+        restoreBroadcastTimer = null;
         if (!serverLink) return;
         for (const session of listSessions()) {
           const dir = session.projectDir;
@@ -791,6 +815,7 @@ export async function startup(): Promise<DaemonContext> {
           } catch { /* ignore */ }
         }
       }, 3_000); // delay to ensure WS auth handshake completes first
+      restoreBroadcastTimer = timer;
       timer.unref?.();
     };
   }
