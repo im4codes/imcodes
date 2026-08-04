@@ -5416,6 +5416,19 @@ export class WsBridge {
    * preventing the mobile-live / desktop-final-only split.
    */
   private sendJsonToSessionUserDevices(sessionName: string, json: string): number {
+    // Bisect switch. Comparing the streaming path against `master` leaves the
+    // companion-device fan-out below as the ONLY behavioural change on it, and
+    // sub-session replies stopped rendering progressively somewhere in that
+    // range. The fan-out reads as strictly additive — the two subscriber loops
+    // are byte-for-byte the old `sendJsonToSessionSubscribers` — so it should
+    // not be able to remove delivery, but "should not" has been wrong three
+    // times on this report already.
+    //
+    // Off narrows delivery to exactly what `master` did, which answers the
+    // question instead of arguing it. If sub-sessions stream again, the fan-out
+    // owns the regression and it can be reintroduced correctly. If they do not,
+    // this flips back on and the multi-device split-brain it fixed stays fixed.
+    const companionDeviceFanoutEnabled = false;
     const msg = this.tryParseJsonRecord(json);
     const sent = new Set<WebSocket>();
     const viewerUserIds = new Set<string>();
@@ -5437,6 +5450,7 @@ export class WsBridge {
       if (sessions.has(sessionName)) send(ws, true);
     }
 
+    if (!companionDeviceFanoutEnabled) return sent.size;
     if (viewerUserIds.size === 0) return sent.size;
     for (const ws of this.browserSockets) {
       const userId = this.browserUserIds.get(ws);
