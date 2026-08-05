@@ -1204,7 +1204,6 @@ export function createIdleHistoryStatus(): TimelineHistoryStatus {
 }
 
 function createBootstrapHistoryStatus(opts: {
-  canDaemon: boolean;
   canHttp: boolean;
   /** True when mount-time seed already populated `events`; flips `cache` to 'done'. */
   cacheSeeded?: boolean;
@@ -1222,7 +1221,12 @@ function createBootstrapHistoryStatus(opts: {
     steps: {
       cache: opts.cacheSeeded ? 'done' : 'running',
       textTail: 'skipped',
-      daemon: opts.canDaemon ? 'pending' : 'skipped',
+      // `skipped` would claim the daemon fetch will never happen. On a cold
+      // start the socket is usually still connecting, and the bootstrap effect
+      // re-runs once it is up — so the fetch is pending, not skipped. Reporting
+      // it terminal made every step look settled, which is what let the view
+      // show "no messages" while the history was still on its way.
+      daemon: 'pending',
       http: opts.canHttp ? 'pending' : 'skipped',
       older: 'skipped',
     },
@@ -1597,7 +1601,6 @@ export function useTimeline(
   const [historyStatus, setHistoryStatus] = useState<TimelineHistoryStatus>(() => (
     events.length > 0
       ? createBootstrapHistoryStatus({
-          canDaemon: !!ws?.connected,
           canHttp: false,
           cacheSeeded: true,
         })
@@ -1774,7 +1777,6 @@ export function useTimeline(
     // the cache step done immediately so the bootstrap overlay never flashes
     // "本地缓存…" alongside the just-painted messages.
     setHistoryStatus(createBootstrapHistoryStatus({
-      canDaemon: wsConnected,
       canHttp: false,
       cacheSeeded: localRestoredIdsRef.current.size > 0,
       // Show the number at first paint too — a bare ✓ with no count is the
