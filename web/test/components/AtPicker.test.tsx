@@ -56,7 +56,7 @@ describe('AtPicker', () => {
     vi.clearAllMocks();
   });
 
-  function renderPicker() {
+  function renderPicker(query = '') {
     const wsClient = {
       connected: true,
       send: vi.fn(),
@@ -65,7 +65,7 @@ describe('AtPicker', () => {
 
     return render(
       <AtPicker
-        query=""
+        query={query}
         sessions={[
           { name: 'deck_proj_brain', agentType: 'claude-code', state: 'idle', parentSession: null, isSelf: true },
           { name: 'deck_sub_worker1', agentType: 'codex', state: 'idle', parentSession: 'deck_proj_brain' },
@@ -536,5 +536,21 @@ describe('AtPicker', () => {
     fireEvent.click(screen.getByText('audit › discuss'));
 
     expect(onLaunchTeam).toHaveBeenCalledWith('audit>discuss', 1);
+  });
+  it('drops straight into file search when a query is typed after @', () => {
+    // The chooser only disambiguates an EMPTY query. Requiring the user to
+    // select "files" before searching cost a keystroke on the most common path.
+    renderPicker('src/index');
+
+    // The chooser rows are gone — we are in the files category, searching.
+    expect(screen.queryByText('agents')).toBeNull();
+    expect(screen.queryByText('alias.category')).toBeNull();
+  });
+
+  it('still shows the chooser for a bare @ so other categories stay reachable', () => {
+    renderPicker('');
+
+    expect(screen.getByText('files')).toBeDefined();
+    expect(screen.getByText('agents')).toBeDefined();
   });
 });

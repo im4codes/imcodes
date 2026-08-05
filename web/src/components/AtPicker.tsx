@@ -295,6 +295,18 @@ export function AtPicker({
     setHighlightIdx(0);
   }, [query, visible]);
 
+  // Typing right after `@` means "find this file". The chooser only exists to
+  // disambiguate an EMPTY query, so making the user select files by hand
+  // before searching cost a keystroke on the common path. Entering the files
+  // category on the first typed character keeps every other category reachable
+  // from the empty-query chooser.
+  useLayoutEffect(() => {
+    if (!visible) return;
+    if (category !== 'choose') return;
+    if (!query) return;
+    setCategory('files');
+  }, [visible, category, query]);
+
   useLayoutEffect(() => {
     if (!visible) return;
     onStageChange?.(category);

@@ -181,8 +181,9 @@ vi.mock('../../src/components/VoiceInput.js', () => ({
 }));
 
 vi.mock('../../src/components/AtPicker.js', () => ({
-  AtPicker: ({ visible, onSelectAllConfig, onSelectAgent, onSelectDelegateAgent, p2pConfig, sessions, rootSession }: {
+  AtPicker: ({ visible, query, onSelectAllConfig, onSelectAgent, onSelectDelegateAgent, p2pConfig, sessions, rootSession }: {
     visible: boolean;
+    query?: string;
     onSelectAllConfig?: (config: unknown, rounds: number, modeOverride: string) => void;
     onSelectAgent?: (session: string, mode: string) => void;
     onSelectDelegateAgent?: (session: string) => void;
@@ -197,6 +198,9 @@ vi.mock('../../src/components/AtPicker.js', () => ({
       return sameRoot;
     });
     if (stage === 'root') {
+      // The real picker leaves the chooser as soon as a query is typed; mirror
+      // that here so a typed query does not look like a chooser render.
+      if (query) return <div data-testid="at-picker-search" data-query={query} />;
       return (
         <div>
           <button onClick={() => onSelectAllConfig?.(p2pConfig, p2pConfig?.rounds ?? 1, 'config')}>mock-select-all-config</button>
@@ -5881,7 +5885,7 @@ afterEach(() => {
     expect(input.textContent).toBe('pin');
   });
 
-  it('closes @ picker if user keeps typing without making a selection', () => {
+  it('keeps the @ picker open and searches files as soon as the user types', () => {
     render(<SessionControls ws={makeWs() as any} activeSession={makeSession()} quickData={makeQuickData() as any} />);
     const input = screen.getByRole('textbox') as HTMLDivElement;
     const getSelectionSpy = vi.spyOn(window, 'getSelection').mockImplementation(() => ({
@@ -5894,8 +5898,12 @@ afterEach(() => {
 
     input.textContent = '@hello';
     fireEvent.input(input);
-    expect(screen.queryByText('files')).toBeNull();
+    // The chooser is gone, but the picker stays open searching for `hello` —
+    // previously this closed the picker and the user had to reopen it and pick
+    // "files" by hand before any search happened.
     expect(screen.queryByText('agents')).toBeNull();
+    const search = screen.getByTestId('at-picker-search');
+    expect(search.getAttribute('data-query')).toBe('hello');
 
     getSelectionSpy.mockRestore();
   });

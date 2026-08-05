@@ -6038,7 +6038,11 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                       setAtPickerOpen(true);
                       setAtQuery('');
                     } else {
-                      setAtPickerOpen(false);
+                      // Keep the picker open and let the query flow through:
+                      // AtPicker owns the stage and drops into file search on
+                      // the first typed character.
+                      setAtPickerOpen(true);
+                      setAtQuery(query);
                     }
                   } else {
                     setAtPickerOpen(true);
