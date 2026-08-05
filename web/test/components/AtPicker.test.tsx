@@ -56,14 +56,13 @@ describe('AtPicker', () => {
     vi.clearAllMocks();
   });
 
-  function renderPicker(query = '') {
+  function pickerWithQuery(query: string) {
     const wsClient = {
       connected: true,
       send: vi.fn(),
       onMessage: vi.fn(() => () => {}),
     };
-
-    return render(
+    return (
       <AtPicker
         query={query}
         sessions={[
@@ -81,8 +80,12 @@ describe('AtPicker', () => {
         onSelectDelegateAgent={vi.fn()}
         onClose={vi.fn()}
         visible
-      />,
+      />
     );
+  }
+
+  function renderPicker(query = '') {
+    return render(pickerWithQuery(query));
   }
 
   it('defaults to files in category chooser', () => {
@@ -552,5 +555,31 @@ describe('AtPicker', () => {
 
     expect(screen.getByText('files')).toBeDefined();
     expect(screen.getByText('agents')).toBeDefined();
+  });
+  it('returns to the chooser after Escape even when a filter query is still typed', () => {
+    // Every back/Escape handler returns to the chooser WITHOUT clearing the
+    // query. A standing "non-empty query means files" rule re-fired on the way
+    // back and made the chooser unreachable once the user had typed anything.
+    const { rerender } = renderPicker('');
+
+    fireEvent.click(screen.getByText('agents'));
+    expect(screen.getByText('brain')).toBeDefined();
+
+    // The user filters inside agents — the composer forwards the query.
+    rerender(pickerWithQuery('bra'));
+    fireEvent.keyDown(document, { key: 'Escape' });
+
+    // Chooser, not a file search for "bra".
+    expect(screen.getByText('files')).toBeDefined();
+    expect(screen.getByText('agents')).toBeDefined();
+  });
+
+  it('still auto-enters file search on the first typed character', () => {
+    // The one-shot guard must not disable the feature it guards.
+    const { rerender } = renderPicker('');
+    expect(screen.getByText('agents')).toBeDefined();
+
+    rerender(pickerWithQuery('src/index'));
+    expect(screen.queryByText('agents')).toBeNull();
   });
 });

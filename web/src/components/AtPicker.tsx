@@ -170,6 +170,8 @@ export function AtPicker({
 }: AtPickerProps) {
   const { t } = useTranslation();
   const [category, setCategory] = useState<Category>('choose');
+  /** Previous query, so auto file-search fires on the empty -> typed edge only. */
+  const lastQueryRef = useRef('');
   // Alias list is filtered by the same inline query (name + description) the
   // rest of the picker uses. Selecting one inserts its `;;(name)` marker only.
   const { filtered: aliasResults } = useAliases(category === 'aliases' ? query : undefined);
@@ -301,9 +303,18 @@ export function AtPicker({
   // category on the first typed character keeps every other category reachable
   // from the empty-query chooser.
   useLayoutEffect(() => {
+    const previousQuery = lastQueryRef.current;
+    lastQueryRef.current = visible ? query : '';
     if (!visible) return;
     if (category !== 'choose') return;
     if (!query) return;
+    // Fire only on the empty -> non-empty transition, i.e. the moment the user
+    // starts typing. Every back/Escape handler returns to the chooser WITHOUT
+    // clearing the query, so a standing "non-empty means files" rule bounced
+    // straight back out and made the chooser unreachable after any typing —
+    // and a once-per-opening guard did not help, because in that flow the
+    // first firing IS the one on the way back.
+    if (previousQuery) return;
     setCategory('files');
   }, [visible, category, query]);
 
