@@ -406,6 +406,18 @@ function retainedTimelineMergeLimit(...eventSets: readonly TimelineEvent[][]): n
     ? MAX_HISTORY_EVENTS
     : MAX_MEMORY_EVENTS;
 }
+/**
+ * How long a cold timeline may report the daemon fetch as still coming while
+ * the socket is down.
+ *
+ * The bootstrap effect re-runs when `wsConnected` flips, so a real reconnect
+ * resolves this long before the bound. The bound exists because
+ * `requestDaemonHistory` returns early with no deadline when there is no
+ * socket — without it a never-reconnecting client would sit on a spinner
+ * forever, which is worse than the blank pane this whole change is fixing.
+ */
+const DAEMON_CONNECT_WAIT_MS = 15_000;
+
 const MAX_CACHED_SESSIONS = 12;
 
 // A first-paint seed (localStorage tail snapshot, WS-replay tail, or a
@@ -1156,7 +1168,7 @@ export type TimelineHistoryPhase = 'idle' | 'bootstrap' | 'refresh' | 'older';
  * cold device rendered a ✓ next to a blank chat, which reads as "your history
  * is cached but we refuse to show it" instead of "this device has no copy yet".
  */
-export type TimelineHistoryStepState = 'pending' | 'running' | 'done' | 'empty' | 'skipped';
+export type TimelineHistoryStepState = 'pending' | 'running' | 'done' | 'empty' | 'offline' | 'skipped';
 export type TimelineHistoryStepKey = 'cache' | 'textTail' | 'daemon' | 'http' | 'older';
 export type TimelineHistoryResponseState = 'ok' | 'empty' | 'partial' | 'deferred' | 'canceled' | 'error' | 'detail';
 
@@ -1573,6 +1585,8 @@ export function useTimeline(
    * first bootstrap keeps the synchronous seed it was built from.
    */
   const localRestoredKeyRef = useRef<string | null>(cacheKey ?? null);
+  /** Bounds how long the daemon step may claim "still coming" with no socket. */
+  const daemonWaitTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   /** Union in a local restore and return the running distinct total. */
   const recordLocalRestore = useCallback((restored: readonly TimelineEvent[]): number => {
     for (const event of restored) localRestoredIdsRef.current.add(event.eventId);
@@ -2025,6 +2039,25 @@ export function useTimeline(
           requestDaemonHistory(true);
         } else {
           setLoading(false);
+          // Nothing was fetched. Say WHICH it is instead of letting the status
+          // fall back to a blanket idle, which reads as "history settled" and
+          // renders the empty-chat placeholder while the fetch is still coming.
+          if (!isActiveSession) {
+            // Inactive timelines deliberately never issue the request, so this
+            // is terminal now — a spinner here would never resolve.
+            updateHistoryStep('daemon', 'offline', 'bootstrap');
+          } else {
+            // Active but no socket: the bootstrap effect re-runs on connect, so
+            // the fetch really is still coming. Bounded so it cannot hang.
+            updateHistoryStep('daemon', 'pending', 'bootstrap');
+            if (daemonWaitTimerRef.current) clearTimeout(daemonWaitTimerRef.current);
+            daemonWaitTimerRef.current = setTimeout(() => {
+              daemonWaitTimerRef.current = null;
+              if (cacheKeyRef.current !== cacheKey) return;
+              updateHistoryStep('daemon', 'offline', 'bootstrap');
+            }, DAEMON_CONNECT_WAIT_MS);
+            daemonWaitTimerRef.current.unref?.();
+          }
         }
         if (isActiveSession) {
           // IDB came back EMPTY. If a low-completeness seed (localStorage tail
@@ -3931,11 +3964,26 @@ export function useTimeline(
 
   useEffect(() => {
     if (loading || refreshing || httpRefreshing || loadingOlder) return;
-    setHistoryStatus((prev) => (prev.phase === 'idle' ? prev : { ...createIdleHistoryStatus(), response: prev.response }));
+    setHistoryStatus((prev) => {
+      if (prev.phase === 'idle') return prev;
+      // These four booleans do not know about a fetch that has not started yet.
+      // A cold start with no socket clears `loading` without requesting, so
+      // resetting here wiped the daemon verdict and claimed the history had
+      // settled. Keep both cold-start verdicts: `pending` (still coming — the
+      // wait is bounded above, so it cannot stall forever) and `offline` (no
+      // request will be made), because a blanket `skipped` cannot tell a
+      // waiting timeline from one that was never going to fetch.
+      if (prev.steps.daemon === 'pending' || prev.steps.daemon === 'offline') return prev;
+      return { ...createIdleHistoryStatus(), response: prev.response };
+    });
   }, [httpRefreshing, loading, loadingOlder, refreshing]);
 
   useEffect(() => {
     return () => {
+      if (daemonWaitTimerRef.current) {
+        clearTimeout(daemonWaitTimerRef.current);
+        daemonWaitTimerRef.current = null;
+      }
       clearForwardHistoryTimeout();
       clearHttpBackfillTimer();
       clearTerminalTailIdleReconcile();

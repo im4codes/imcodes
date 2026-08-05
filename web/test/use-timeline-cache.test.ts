@@ -3214,4 +3214,63 @@ describe('useTimeline global cache bounds', () => {
     expect(screen.getByTestId('probe-carry').getAttribute('data-state')).toBe('empty');
     expect(screen.getByTestId('probe-carry').textContent).toBe('0');
   });
+  // Cold start: the status must say WHICH of "still coming" vs "nothing will be
+  // fetched" applies. Reporting a blanket idle made the pane render its
+  // empty-chat placeholder with no progress strip while history was on its way.
+  describe('cold-start daemon step', () => {
+    function mountProbe(opts: { connected: boolean; isActiveSession: boolean; sessionName: string }) {
+      vi.spyOn(TimelineDB.prototype, 'open').mockResolvedValue();
+      vi.spyOn(TimelineDB.prototype, 'getLastSeqAndEpoch').mockResolvedValue(null);
+      vi.spyOn(TimelineDB.prototype, 'getRecentEvents').mockResolvedValue([]);
+      const ws: WsClient = {
+        get connected() { return opts.connected; },
+        onMessage: () => () => {},
+        sendTimelineHistoryRequest: () => 'h1',
+      } as unknown as WsClient;
+
+      let daemon = '';
+      function Probe() {
+        // No serverId: the blank-pane HTTP self-heal would otherwise park an
+        // unrelated `http` step in pending and mask what `daemon` is doing.
+        const { historyStatus } = useTimeline(opts.sessionName, ws, undefined, {
+          isActiveSession: opts.isActiveSession,
+        });
+        daemon = historyStatus?.steps.daemon ?? '';
+        return h('div', { 'data-testid': 'probe-daemon' }, daemon);
+      }
+      render(h(Probe));
+      return () => daemon;
+    }
+
+    it('keeps the daemon step pending while an active timeline waits for the socket', async () => {
+      const read = mountProbe({ connected: false, isActiveSession: true, sessionName: `deck_cold_wait_${Date.now()}` });
+
+      // Assert the SETTLED state, not the transient one: the blanket idle reset
+      // used to wipe this the moment `loading` cleared.
+      await vi.waitFor(() => expect(read()).toBe('pending'), { timeout: 3_000 });
+      await act(async () => { await new Promise((r) => setTimeout(r, 250)); });
+      expect(read()).toBe('pending');
+    });
+
+    it('marks the daemon step offline when an inactive timeline will never request', async () => {
+      const read = mountProbe({ connected: false, isActiveSession: false, sessionName: `deck_cold_inactive_${Date.now()}` });
+
+      // Inactive timelines deliberately never issue the request, so a spinner
+      // here would never resolve — this must be terminal, not pending.
+      await vi.waitFor(() => expect(read()).toBe('offline'), { timeout: 3_000 });
+    });
+
+    it('gives up waiting for the socket after a bound instead of spinning forever', async () => {
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+      try {
+        const read = mountProbe({ connected: false, isActiveSession: true, sessionName: `deck_cold_bound_${Date.now()}` });
+        await vi.waitFor(() => expect(read()).toBe('pending'), { timeout: 3_000 });
+
+        await act(async () => { await vi.advanceTimersByTimeAsync(15_000 + 500); });
+        expect(read()).toBe('offline');
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+  });
 });
