@@ -745,6 +745,10 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
         state.pendingComplete = undefined;
         state.pendingError = undefined;
         this.clearTaskNotificationWake(state);
+        // A new visible turn starts here without going through startQuery, so
+        // none of its per-turn resets run. Finished subagent rows from the
+        // previous turn would otherwise stay and be re-notified later.
+        this.pruneTerminalSubagentTasks(state);
         state.inputQueue.push(queued.assembledMessage);
         return;
       }
@@ -829,6 +833,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     this.clearResultCompletionFallback(state);
     this.clearTaskNotificationWake(state);
     state.retainedSubagentMode = false;
+    this.pruneTerminalSubagentTasks(state);
     state.toolCalls.clear();
     state.runtimeAgentToolCalls.clear();
     state.emittedToolStates.clear();
@@ -2313,6 +2318,28 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       }, 'Claude SDK subagent task(s) stale without terminal update; closing provider active-work evidence');
     }
     return expired;
+  }
+
+  /**
+   * Drop subagent rows that already reached a terminal state.
+   *
+   * `subagentTasks` was append-only: nothing ever removed an entry, and the map
+   * survives session re-create (`subagentTasks: existing?.subagentTasks ?? …`).
+   * Rows from a finished turn therefore sat in it forever, and two turn-blind
+   * paths kept acting on them — the 15-minute stale sweep and cancel both flip
+   * such a row terminal AND emit a snapshot for it. That snapshot is what
+   * reaches the session as a completion notice naming a task the current turn
+   * never started; the dedupe that would have suppressed a repeat
+   * (`emittedSubagentStates`) is cleared on every real query start, so the
+   * ghost's re-emission passes it.
+   *
+   * Only terminal rows go. A retained query exists precisely because live
+   * subagents are still running, and those must keep their bookkeeping.
+   */
+  private pruneTerminalSubagentTasks(state: ClaudeSdkSessionState): void {
+    for (const [taskId, task] of state.subagentTasks) {
+      if (task.terminal || !task.active) state.subagentTasks.delete(taskId);
+    }
   }
 
   private activeClaudeSubagentTasks(state: ClaudeSdkSessionState): ClaudeTaskState[] {

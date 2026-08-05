@@ -268,6 +268,28 @@ describe('ClaudeCodeSdkProvider', () => {
     expect(sessionInfo.some((info) => info.model === 'claude-sonnet-4-6')).toBe(true);
   });
 
+  it('does not carry finished subagent rows into the next turn', async () => {
+    // `subagentTasks` was append-only and survives session re-create, so rows
+    // from a finished turn stayed forever. The 15-minute stale sweep and cancel
+    // are both turn-blind: they flip such a row terminal and emit a snapshot
+    // for it, which reaches the session as a completion notice naming a task
+    // the current turn never started ("bvmpd67sr 在本会话不存在"). Live rows
+    // must survive — a retained query exists because subagents are running.
+    const provider = new ClaudeCodeSdkProvider();
+    const state = {
+      subagentTasks: new Map<string, { terminal: boolean; active: boolean }>([
+        ['done-1', { terminal: true, active: false }],
+        ['stopped-1', { terminal: false, active: false }],
+        ['running-1', { terminal: false, active: true }],
+      ]),
+    };
+
+    (provider as unknown as { pruneTerminalSubagentTasks: (s: unknown) => void })
+      .pruneTerminalSubagentTasks(state);
+
+    expect([...state.subagentTasks.keys()]).toEqual(['running-1']);
+  });
+
   it('keeps a subagent stream out of the foreground message', async () => {
     // A Task subagent's stream_events ride the SAME session stream, tagged with
     // `parent_tool_use_id`. `currentText` / `currentMessageId` describe the
