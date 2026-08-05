@@ -1320,8 +1320,16 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
         // with the previous message's full text. Without this, the new bubble
         // briefly shows "<prev message text><new delta>" and only snaps to the
         // correct text when the message completes — visible flicker/bleed.
-        state.currentText = '';
-        state.currentMessageId = event.message?.id ? String(event.message.id) : null;
+        //
+        // Foreground only: subagent messages ride this same stream, and
+        // `currentText` / `currentMessageId` describe the foreground message.
+        // A Task's message_start resetting them wiped the main bubble's text
+        // mid-turn. Usage below is NOT gated — a subagent's tokens are still
+        // this session's tokens.
+        if (msg.parent_tool_use_id == null) {
+          state.currentText = '';
+          state.currentMessageId = event.message?.id ? String(event.message.id) : null;
+        }
         // Anthropic-compatible streaming responses publish the authoritative
         // prompt-cache split on message_start. MiniMax follows that contract,
         // while its trailing Claude Agent SDK result frame can contain an
@@ -1350,6 +1358,14 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
           this.emitClaudeRuntimeSubagentSnapshot(sessionId, state, runtimeSubagentPayload);
           return;
         }
+        // Foreground text only. A subagent's deltas used to append here and go
+        // out under the foreground `currentMessageId`, so the main bubble's
+        // text was progressively replaced by the Task's output — first spliced
+        // onto the end of the real sentence, then overwritten wholesale as the
+        // subagent's own message boundaries reset the shared buffer. Subagent
+        // progress reaches the UI through the runtime-subagent snapshots
+        // instead, so dropping it from this accumulator loses nothing.
+        if (msg.parent_tool_use_id != null) return;
         state.currentText += event.delta.text;
         const messageId = makeMessageId(state);
         state.currentMessageId = messageId;

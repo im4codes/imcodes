@@ -268,6 +268,48 @@ describe('ClaudeCodeSdkProvider', () => {
     expect(sessionInfo.some((info) => info.model === 'claude-sonnet-4-6')).toBe(true);
   });
 
+  it('keeps a subagent stream out of the foreground message', async () => {
+    // A Task subagent's stream_events ride the SAME session stream, tagged with
+    // `parent_tool_use_id`. `currentText` / `currentMessageId` describe the
+    // FOREGROUND message only, and neither the accumulator reset nor the text
+    // deltas checked that tag — so a running subagent first spliced its output
+    // onto the end of the foreground sentence, then wiped it entirely when its
+    // own message_start reset the shared buffer. Observed live: a bubble
+    // reading "I'll begin searching across the categories." was replaced by
+    // successive slices of a subagent's unrelated report under the same id.
+    sdkMock.setNextMessages([
+      { type: 'system', subtype: 'init', session_id: 'session-sub', model: 'claude-sonnet-4-6' },
+      { type: 'stream_event', session_id: 'session-sub', event: { type: 'message_start', message: { id: 'fg-1' } } },
+      { type: 'stream_event', session_id: 'session-sub', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: "I'll begin" } } },
+      // Subagent starts and streams while the foreground message is still open.
+      { type: 'stream_event', session_id: 'session-sub', parent_tool_use_id: 'toolu_sub_1', event: { type: 'message_start', message: { id: 'sub-1' } } },
+      { type: 'stream_event', session_id: 'session-sub', parent_tool_use_id: 'toolu_sub_1', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'SUBAGENT REPORT' } } },
+      { type: 'stream_event', session_id: 'session-sub', parent_tool_use_id: 'toolu_sub_1', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: ' CONTINUED' } } },
+      // Foreground resumes; it must continue from its own text, not the Task's.
+      { type: 'stream_event', session_id: 'session-sub', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: ' searching.' } } },
+      { type: 'assistant', session_id: 'session-sub', message: { content: [{ type: 'text', text: "I'll begin searching." }] } },
+      { type: 'result', session_id: 'session-sub', subtype: 'success', is_error: false, result: "I'll begin searching.", usage: { input_tokens: 10, output_tokens: 5, cache_read_input_tokens: 0 } },
+    ]);
+
+    const provider = new ClaudeCodeSdkProvider();
+    await provider.connect({ binaryPath: 'claude' });
+    await provider.createSession({ sessionKey: 'route-sub', cwd: '/tmp/project', resumeId: 'session-sub' });
+
+    const deltas: Array<{ id: string; text: string }> = [];
+    provider.onDelta((_sid, delta) => deltas.push({ id: delta.messageId, text: delta.delta }));
+
+    await provider.send('route-sub', 'hello');
+    await flush();
+
+    // No subagent text may appear in any emitted delta, under any id.
+    for (const d of deltas) {
+      expect(d.text, 'subagent text leaked into a foreground delta').not.toContain('SUBAGENT');
+    }
+    // The foreground message accumulates only its own text, uninterrupted.
+    const foreground = deltas.filter((d) => d.id === 'fg-1').map((d) => d.text);
+    expect(foreground).toEqual(["I'll begin", "I'll begin searching."]);
+  });
+
   it('resets the streaming accumulator across messages so a second message is not prefixed with the first', async () => {
     // A single turn with a tool round produces TWO assistant messages, each
     // with its own message_start id. The second message's streaming deltas must
