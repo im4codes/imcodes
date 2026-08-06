@@ -254,6 +254,24 @@ html.native-ios-mac .chat-dl-btn {
 .shared-entry-title { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; font-weight: 700; }
 .shared-entry-subtitle { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #94a3b8; font-size: 10px; }
 .shared-entry-meta { display: inline-flex; flex-direction: column; align-items: flex-end; gap: 2px; color: #93c5fd; font-size: 10px; white-space: nowrap; }
+.tab-wrap-shared { flex-shrink: 0; }
+.tab-shared-entry { border-color: rgba(34,211,238,0.26); background: linear-gradient(180deg, rgba(8,145,178,0.16), rgba(15,23,42,0.72)); }
+.tab-shared-entry:hover { border-color: rgba(34,211,238,0.52); background: linear-gradient(180deg, rgba(8,145,178,0.24), rgba(15,23,42,0.78)); }
+.tab-shared-entry.active { border-color: rgba(34,211,238,0.72); box-shadow: 0 0 14px rgba(34,211,238,0.18); }
+.tab-shared-entry:disabled { opacity: 0.58; cursor: wait; }
+.tab-shared-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.session-tree-shared-refresh { margin-left: auto; width: 24px; height: 24px; border: 1px solid rgba(34,211,238,0.2); border-radius: 6px; background: rgba(15,23,42,0.68); color: #93c5fd; cursor: pointer; }
+.session-tree-shared-refresh:disabled { opacity: 0.55; cursor: wait; }
+.session-tree-shared-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; width: calc(100% - 16px); margin: 3px 8px; padding: 7px 9px; border: 1px solid rgba(34,211,238,0.18); border-radius: 7px; background: rgba(8,47,73,0.18); color: #e0f2fe; font: inherit; text-align: left; cursor: pointer; }
+.session-tree-shared-row:hover { border-color: rgba(34,211,238,0.38); background: rgba(8,145,178,0.16); }
+.session-tree-shared-row.active { border-color: rgba(34,211,238,0.66); background: rgba(8,145,178,0.24); box-shadow: inset 2px 0 0 #22d3ee; }
+.session-tree-shared-row:disabled { opacity: 0.58; cursor: wait; }
+.session-tree-shared-main { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.session-tree-shared-label, .session-tree-shared-server { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.session-tree-shared-label { color: #e0f2fe; font-size: 12px; font-weight: 700; }
+.session-tree-shared-server { color: #64748b; font-size: 10px; }
+.session-tree-shared-error { margin: 5px 10px; color: #fecaca; font-size: 11px; line-height: 1.35; }
+.session-tree-shared-status { margin: 5px 10px; color: #64748b; font-size: 11px; }
 .mobile-server-menu-shared { border-top: 1px solid #334155; padding: 6px 0; }
 .mobile-server-menu-shared-title { padding: 4px 12px; color: #94a3b8; font-size: 11px; font-weight: 800; }
 .chat-shared-actor-label,

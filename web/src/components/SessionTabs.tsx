@@ -7,6 +7,7 @@ import { getAgentBadgeConfig } from '../agent-display.js';
 import { SessionActionMenuIcon } from './SessionActionMenuIcon.js';
 import { SharedStateIndicator } from './SharedStateIndicator.js';
 import { isWorkingSessionState } from '@shared/session-activity-types.js';
+import type { SharedEntrySummary } from '../api.js';
 
 interface Props {
   sessions: SessionInfo[];
@@ -19,7 +20,7 @@ interface Props {
   p2pSessionLabels?: Set<string>;
   onAlertDismiss?: (sessionName: string) => void;
   onSelect: (name: string) => void;
-  onNewSession: () => void;
+  onNewSession?: () => void;
   onStopProject: (project: string) => void;
   onRestartProject: (project: string, fresh?: boolean) => void;
   onCloneSession?: (session: SessionInfo) => void;
@@ -36,6 +37,13 @@ interface Props {
   pinned: Set<string>;
   /** Setter for the pinned array (server-synced via useSyncedPreference) */
   setPinnedArr: (value: string[] | ((prev: string[]) => string[])) => void;
+  /** Recipient shares live beside owned tabs instead of replacing them. */
+  sharedEntries?: SharedEntrySummary[];
+  activeSharedEntryId?: string | null;
+  openingSharedEntryId?: string | null;
+  onSelectSharedEntry?: (entry: SharedEntrySummary) => void;
+  /** Owned tabs remain navigable while a share-scoped connection is active. */
+  navigationOnly?: boolean;
 }
 
 interface CtxMenu { x: number; y: number; session: SessionInfo }
@@ -72,7 +80,7 @@ function readLegacyOrder(): string[] {
   try { return JSON.parse(localStorage.getItem(LEGACY_LS_ORDER) ?? '[]'); } catch { return []; }
 }
 
-export function SessionTabs({ sessions, activeSession, connected, latencyMs, idleAlerts, p2pSessionLabels, onAlertDismiss, onSelect, onNewSession, onStopProject, onRestartProject, onCloneSession, onOpenSessionSettings, onShareSession, renameRequest, onRenameHandled, onRenameSession, sessionsLoaded, pinned, setPinnedArr }: Props) {
+export function SessionTabs({ sessions, activeSession, connected, latencyMs, idleAlerts, p2pSessionLabels, onAlertDismiss, onSelect, onNewSession, onStopProject, onRestartProject, onCloneSession, onOpenSessionSettings, onShareSession, renameRequest, onRenameHandled, onRenameSession, sessionsLoaded, pinned, setPinnedArr, sharedEntries = [], activeSharedEntryId = null, openingSharedEntryId = null, onSelectSharedEntry, navigationOnly = false }: Props) {
   const { t } = useTranslation();
   const [ctx, setCtx] = useState<CtxMenu | null>(null);
   const [stopConfirmProject, setStopConfirmProject] = useState<string | null>(null);
@@ -447,7 +455,7 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
 
   return (
     <div ref={tabBarRef} class="tab-bar" role="tablist">
-      {sessions.length === 0 && sessionsLoaded && (
+      {sessions.length === 0 && sharedEntries.length === 0 && sessionsLoaded && (
         <span class="tab-empty">No active sessions</span>
       )}
 
@@ -470,11 +478,11 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
           <div
             key={s.name}
             class={`tab-wrap${isDragOver ? ' tab-drop-target' : ''}`}
-            draggable
-            onDragStart={(e) => onDragStart(e as DragEvent, idx)}
-            onDragEnd={(e) => onDragEnd(e as DragEvent)}
-            onDragOver={(e) => onDragOver(e as DragEvent, idx)}
-            onDrop={(e) => onDrop(e as DragEvent, idx)}
+            draggable={!navigationOnly}
+            onDragStart={navigationOnly ? undefined : (e) => onDragStart(e as DragEvent, idx)}
+            onDragEnd={navigationOnly ? undefined : (e) => onDragEnd(e as DragEvent)}
+            onDragOver={navigationOnly ? undefined : (e) => onDragOver(e as DragEvent, idx)}
+            onDrop={navigationOnly ? undefined : (e) => onDrop(e as DragEvent, idx)}
           >
             {renaming === s.name ? (
               <input
@@ -508,16 +516,16 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
                   }
                   selectTab(s.name);
                 }}
-                onContextMenu={(e) => openCtx(e, s)}
-                onPointerDown={(e) => onTabPointerDown(e as PointerEvent, s)}
-                onPointerMove={(e) => onTabPointerMove(e as PointerEvent)}
-                onPointerUp={(e) => onTabPointerUp(e as PointerEvent)}
-                onPointerCancel={(e) => onTabPointerCancel(e as PointerEvent)}
-                onPointerLeave={(e) => onTabPointerCancel(e as PointerEvent)}
-                onMouseDown={(e) => onTabMouseDown(e as MouseEvent, s)}
-                onMouseMove={(e) => onTabMouseMove(e as MouseEvent)}
-                onMouseUp={(e) => onTabMouseEnd(e as MouseEvent)}
-                onMouseLeave={(e) => onTabMouseEnd(e as MouseEvent)}
+                onContextMenu={navigationOnly ? undefined : (e) => openCtx(e, s)}
+                onPointerDown={navigationOnly ? undefined : (e) => onTabPointerDown(e as PointerEvent, s)}
+                onPointerMove={navigationOnly ? undefined : (e) => onTabPointerMove(e as PointerEvent)}
+                onPointerUp={navigationOnly ? undefined : (e) => onTabPointerUp(e as PointerEvent)}
+                onPointerCancel={navigationOnly ? undefined : (e) => onTabPointerCancel(e as PointerEvent)}
+                onPointerLeave={navigationOnly ? undefined : (e) => onTabPointerCancel(e as PointerEvent)}
+                onMouseDown={navigationOnly ? undefined : (e) => onTabMouseDown(e as MouseEvent, s)}
+                onMouseMove={navigationOnly ? undefined : (e) => onTabMouseMove(e as MouseEvent)}
+                onMouseUp={navigationOnly ? undefined : (e) => onTabMouseEnd(e as MouseEvent)}
+                onMouseLeave={navigationOnly ? undefined : (e) => onTabMouseEnd(e as MouseEvent)}
                 title={`${s.agentType}${s.agentVersion ? ` ${s.agentVersion}` : ''} — ${s.state}${isPinned ? ' (pinned)' : ''}`}
               >
                 {isPinned && <span class="tab-pin">📌</span>}
@@ -537,7 +545,34 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
         );
       })}
 
-      <button class="tab-add-btn" onClick={onNewSession} title={t('session.new_btn', 'New session')}>＋</button>
+      {sharedEntries.map((entry) => {
+        const isActive = entry.id === activeSharedEntryId;
+        return (
+          <div key={`shared:${entry.id}`} class="tab-wrap tab-wrap-shared">
+            <button
+              class={`tab tab-shared-entry${isActive ? ' active' : ''}`}
+              role="tab"
+              aria-selected={isActive}
+              disabled={openingSharedEntryId === entry.id}
+              onClick={() => onSelectSharedEntry?.(entry)}
+              title={`${t('share.sharedWithMe.title')}: ${entry.targetLabel} — ${entry.serverName}`}
+            >
+              <span class="tab-shared-label">{entry.targetLabel}</span>
+              <SharedStateIndicator
+                state={{
+                  effectiveRole: entry.role,
+                  status: entry.status,
+                  scopeLabel: entry.targetLabel,
+                }}
+                compact
+                iconOnly
+              />
+            </button>
+          </div>
+        );
+      })}
+
+      {onNewSession && <button class="tab-add-btn" onClick={onNewSession} title={t('session.new_btn', 'New session')}>＋</button>}
 
       {ctx && (() => {
         // Pinned tabs can't be stopped — user must unpin first. Check both the

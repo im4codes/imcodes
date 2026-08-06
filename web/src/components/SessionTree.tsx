@@ -29,6 +29,7 @@ import { SharedStateIndicator } from './SharedStateIndicator.js';
 import { useVerticalResize } from '../hooks/useVerticalResize.js';
 import { isWorkingSessionState } from '@shared/session-activity-types.js';
 import { onExecutionCloneGroupReveal } from '../execution-clone-ui.js';
+import type { SharedEntrySummary } from '../api.js';
 
 interface Props {
   serverId?: string | null;
@@ -53,6 +54,13 @@ interface Props {
   height?: number;
   /** Persist a new height after a resize drag completes. */
   onResizeHeight?: (height: number) => void;
+  sharedEntries?: SharedEntrySummary[];
+  activeSharedEntryId?: string | null;
+  openingSharedEntryId?: string | null;
+  onSelectSharedEntry?: (entry: SharedEntrySummary) => void;
+  sharedEntriesLoading?: boolean;
+  sharedEntriesError?: string | null;
+  onRefreshSharedEntries?: () => void;
 }
 
 // ── Helper: compute label for a main session ─────────────────────────────────
@@ -228,6 +236,13 @@ function SessionTreeInner({
   onNewSubSession,
   height,
   onResizeHeight,
+  sharedEntries = [],
+  activeSharedEntryId = null,
+  openingSharedEntryId = null,
+  onSelectSharedEntry,
+  sharedEntriesLoading = false,
+  sharedEntriesError = null,
+  onRefreshSharedEntries,
 }: Props) {
   const { t } = useTranslation();
   const [collapsed, setCollapsed] = useState<Set<string>>(() => loadCollapsed(serverId));
@@ -348,6 +363,15 @@ function SessionTreeInner({
         {onNewSession && (
           <button class="session-tree-add-btn" data-onboarding="new-main-session" onClick={onNewSession} title={t('session.new_session', 'New session')}>+</button>
         )}
+        {onRefreshSharedEntries && (
+          <button
+            class="session-tree-shared-refresh"
+            onClick={onRefreshSharedEntries}
+            disabled={sharedEntriesLoading}
+            title={t('share.sharedWithMe.refresh')}
+            aria-label={t('share.sharedWithMe.refresh')}
+          >↻</button>
+        )}
       </div>
 
       <div class="session-tree-scroll">
@@ -464,6 +488,37 @@ function SessionTreeInner({
               );
             })}
           </div>
+        );
+      })}
+      {sharedEntriesError && <div class="session-tree-shared-error" role="alert">{sharedEntriesError}</div>}
+      {sharedEntriesLoading && sharedEntries.length === 0 && (
+        <div class="session-tree-shared-status">{t('common.loading')}</div>
+      )}
+      {sharedEntries.map((entry) => {
+        const isActive = entry.id === activeSharedEntryId;
+        return (
+          <button
+            key={`shared:${entry.id}`}
+            class={`session-tree-shared-row${isActive ? ' active' : ''}`}
+            role="treeitem"
+            type="button"
+            disabled={openingSharedEntryId === entry.id}
+            onClick={() => onSelectSharedEntry?.(entry)}
+            title={`${t('share.sharedWithMe.title')}: ${entry.targetLabel} — ${entry.serverName}`}
+          >
+            <span class="session-tree-shared-main">
+              <span class="session-tree-shared-label">{entry.targetLabel}</span>
+              <span class="session-tree-shared-server">{entry.serverName}</span>
+            </span>
+            <SharedStateIndicator
+              state={{
+                effectiveRole: entry.role,
+                status: entry.status,
+                scopeLabel: entry.targetLabel,
+              }}
+              iconOnly
+            />
+          </button>
         );
       })}
       </div>
