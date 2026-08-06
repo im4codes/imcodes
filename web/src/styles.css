@@ -258,7 +258,7 @@ html.native-ios-mac .chat-dl-btn {
 .shared-return-guide::before { content: ''; position: absolute; top: 17px; left: -8px; width: 14px; height: 14px; border-left: 1px solid rgba(34,211,238,0.68); border-bottom: 1px solid rgba(34,211,238,0.68); background: #0a3147; transform: rotate(45deg); }
 .shared-return-guide-actions { display: flex; align-items: center; gap: 6px; }
 .shared-return-guide-return, .shared-return-guide-dismiss { min-height: 28px; border-radius: 7px; padding: 0 8px; font: inherit; font-size: 10.5px; font-weight: 700; cursor: pointer; }
-.shared-return-guide-return { flex: 1; border: 1px solid rgba(34,211,238,0.68); background: linear-gradient(135deg, rgba(8,145,178,0.82), rgba(29,78,216,0.78)); color: #fff; box-shadow: 0 0 16px rgba(34,211,238,0.18); }
+.shared-return-guide-return { flex: 1; border: 1px solid rgba(34,211,238,0.68); background: linear-gradient(135deg, rgba(8,145,178,0.82), rgba(29,78,216,0.78)); color: #fff; animation: shared-return-server-pulse 1.05s ease-in-out infinite; }
 .shared-return-guide-dismiss { border: 1px solid rgba(148,163,184,0.26); background: rgba(15,23,42,0.72); color: #cbd5e1; }
 .server-icon-return-hint, .server-return-hint { position: relative; z-index: 1; animation: shared-return-server-pulse 1.05s ease-in-out infinite; }
 @keyframes shared-return-guide-in { from { opacity: 0; transform: translateX(-10px) scale(0.97); } to { opacity: 1; transform: none; } }
