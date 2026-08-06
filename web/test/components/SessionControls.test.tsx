@@ -520,7 +520,7 @@ afterEach(() => {
     expect(screen.getByRole('button', { name: /send/i })).toBeDefined();
   });
 
-  it('shares a dragged desktop composer height across every window and persists it', () => {
+  it('shares a dragged desktop composer height across every window and persists it', async () => {
     render(
       <>
         <SessionControls ws={makeWs() as any} activeSession={makeSession({ name: 'main-window' })} quickData={makeQuickData() as any} />
@@ -541,15 +541,24 @@ afterEach(() => {
     });
 
     const handle = screen.getAllByRole('separator', { name: 'Resize message input' })[0];
-    fireEvent.pointerDown(handle, { button: 0, clientY: 200, pointerId: 1 });
-    fireEvent.pointerMove(window, { clientY: 280, pointerId: 1 });
-
-    for (const input of inputs) {
-      expect(input.style.height).toBe('160px');
-    }
+    // Older jsdom releases do not expose `onpointerdown`, so Preact's event
+    // compatibility path registers the listener with the original casing.
+    const pointerDownEventName = 'onpointerdown' in handle ? 'pointerdown' : 'PointerDown';
+    fireEvent(handle, new MouseEvent(pointerDownEventName, {
+      bubbles: true,
+      cancelable: true,
+      button: 0,
+      clientY: 200,
+    }));
     expect(document.body.classList.contains('composer-height-resizing')).toBe(true);
+    fireEvent(window, new MouseEvent('pointermove', { clientY: 280 }));
 
-    fireEvent.pointerUp(window, { clientY: 280, pointerId: 1 });
+    await waitFor(() => {
+      for (const input of inputs) {
+        expect(input.style.height).toBe('160px');
+      }
+    });
+    fireEvent(window, new MouseEvent('pointerup', { clientY: 280 }));
     expect(localStorage.getItem(COMPOSER_HEIGHT_STORAGE_KEY)).toBe('160');
     expect(document.body.classList.contains('composer-height-resizing')).toBe(false);
 
