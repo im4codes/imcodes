@@ -4830,18 +4830,9 @@ export function App() {
           class="shared-return-guide"
           role="dialog"
           aria-modal="false"
-          aria-labelledby="shared-return-guide-title"
+          aria-label={trans('share.sharedWithMe.title')}
           data-testid="shared-return-guide"
         >
-          <div class="shared-return-guide-step">👥 {trans('share.sharedWithMe.guideEyebrow')}</div>
-          <button
-            class="shared-return-guide-close"
-            type="button"
-            onClick={() => setShowSharedReturnGuide(false)}
-            aria-label={trans('common.close')}
-          >×</button>
-          <h3 id="shared-return-guide-title">{trans('share.sharedWithMe.guideTitle')}</h3>
-          <p>{trans('share.sharedWithMe.guideBody', { server: sharedReturnServer.name })}</p>
           <div class="shared-return-guide-actions">
             <button
               class="shared-return-guide-return"

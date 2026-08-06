@@ -2096,11 +2096,11 @@ describe('App shell', () => {
 
     await waitFor(() => expect(openSharedEntryMock).toHaveBeenCalledWith(sharedEntry.target));
     const guide = await screen.findByTestId('shared-return-guide');
-    expect(guide.textContent).toContain('share.sharedWithMe.guideTitle');
     expect(guide.textContent).toContain('share.sharedWithMe.guideReturn');
+    expect(guide.textContent).toContain('share.sharedWithMe.guideDismiss');
     expect(screen.getByTestId('server-icon-bar').getAttribute('data-return-hint-server-id')).toBe('srv-1');
 
-    fireEvent.click(screen.getByRole('button', { name: 'common.close' }));
+    fireEvent.click(screen.getByRole('button', { name: 'share.sharedWithMe.guideDismiss' }));
     expect(screen.queryByTestId('shared-return-guide')).toBeNull();
   }, 20_000);
 });

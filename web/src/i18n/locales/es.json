@@ -171,9 +171,6 @@
       "title": "Compartido conmigo",
       "empty": "No hay pestañas ni servidores compartidos",
       "refresh": "Actualizar acceso compartido",
-      "guideEyebrow": "Vista compartida",
-      "guideTitle": "Has cambiado a contenido compartido",
-      "guideBody": "Tu servidor sigue disponible. Haz clic en {{server}} en la lista de servidores o usa el botón inferior para volver.",
       "guideReturn": "Volver a {{server}}",
       "guideDismiss": "Entendido",
       "kind": {
