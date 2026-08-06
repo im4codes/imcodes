@@ -94,45 +94,6 @@ describe('SessionTree', () => {
     expect(localStorage.getItem('rcc_tree_collapsed:srv-2')).toBeNull();
   });
 
-  it('keeps owned sessions and marked shared entries in one navigation tree', () => {
-    const onSelectSession = vi.fn();
-    const onSelectSharedEntry = vi.fn();
-    const sharedEntry = {
-      id: 'share-tree-1',
-      serverId: 'shared-server',
-      serverName: 'Shared workstation',
-      role: 'viewer' as const,
-      status: 'active' as const,
-      targetLabel: 'Shared project',
-      target: { kind: 'main' as const, serverId: 'shared-server', sessionName: 'deck_shared_brain' },
-    };
-
-    render(
-      <SessionTree
-        serverId="srv-owned"
-        sessions={sessions}
-        subSessions={[]}
-        activeSession={null}
-        unreadCounts={new Map()}
-        onSelectSession={onSelectSession}
-        onSelectSubSession={vi.fn()}
-        sharedEntries={[sharedEntry]}
-        activeSharedEntryId="share-tree-1"
-        onSelectSharedEntry={onSelectSharedEntry}
-      />,
-    );
-
-    expect(screen.getByText('main')).toBeDefined();
-    const sharedButton = screen.getByText('Shared project').closest('button');
-    expect(sharedButton).not.toBeNull();
-    expect(sharedButton?.classList.contains('active')).toBe(true);
-
-    fireEvent.click(screen.getByText('main').closest('button')!);
-    expect(onSelectSession).toHaveBeenCalledWith('deck_main_brain');
-    fireEvent.click(sharedButton!);
-    expect(onSelectSharedEntry).toHaveBeenCalledWith(sharedEntry);
-  });
-
   it('groups execution clones under a collapsed per-run section instead of flat rows', () => {
     const withClones = [
       ...subSessions,

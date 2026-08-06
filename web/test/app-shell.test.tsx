@@ -9,16 +9,12 @@ const {
   apiFetchMock,
   fetchMeMock,
   listP2pRunsMock,
-  discoverSharedEntriesMock,
-  openSharedEntryMock,
   wsInstances,
   useSubSessionsState,
 } = vi.hoisted(() => ({
   apiFetchMock: vi.fn(),
   fetchMeMock: vi.fn(),
   listP2pRunsMock: vi.fn(),
-  discoverSharedEntriesMock: vi.fn(),
-  openSharedEntryMock: vi.fn(),
   wsInstances: [] as Array<{
     connected: boolean;
     messageHandlers: Array<(message: any) => void>;
@@ -85,8 +81,7 @@ vi.mock('../src/api.js', () => {
     clearApiKey: vi.fn(),
     configure: vi.fn(),
     configureApiKey: vi.fn(),
-    discoverSharedEntries: (...args: unknown[]) => discoverSharedEntriesMock(...args),
-    openSharedEntry: (...args: unknown[]) => openSharedEntryMock(...args),
+    discoverSharedEntries: vi.fn(async () => []),
     fetchMe: (...args: unknown[]) => fetchMeMock(...args),
     getApiKey: vi.fn(() => 'api-key-1'),
     listP2pRuns: (...args: unknown[]) => listP2pRunsMock(...args),
@@ -321,17 +316,9 @@ vi.mock('../src/components/SessionTree.js', () => ({
   ),
 }));
 vi.mock('../src/components/SessionTabs.js', () => ({
-  SessionTabs: ({ sessions, sharedEntries, activeSharedEntryId, onSelectSharedEntry, onSelect, onAlertDismiss, onNewSession, onStopProject, onRestartProject, onOpenSessionSettings, onCloneSession, onRenameHandled, onRenameSession }: any) => (
-    <div data-testid="session-tabs" data-owned-session-names={sessions?.map((session: any) => session.name).join(',') ?? ''}>
+  SessionTabs: ({ sessions, onSelect, onAlertDismiss, onNewSession, onStopProject, onRestartProject, onOpenSessionSettings, onCloneSession, onRenameHandled, onRenameSession }: any) => (
+    <div>
       session-tabs
-      {sharedEntries?.map((entry: any) => (
-        <button
-          key={entry.id}
-          data-testid={`tabs-shared-${entry.id}`}
-          data-active={entry.id === activeSharedEntryId ? 'true' : 'false'}
-          onClick={() => onSelectSharedEntry?.(entry)}
-        >{entry.targetLabel}</button>
-      ))}
       <button onClick={() => onSelect?.(sessions?.[0]?.name)}>tabs-select</button>
       <button onClick={() => onAlertDismiss?.(sessions?.[0]?.name)}>tabs-dismiss</button>
       <button onClick={onNewSession}>tabs-new-session</button>
@@ -664,8 +651,6 @@ beforeEach(() => {
     has_password: true,
   });
   listP2pRunsMock.mockResolvedValue([]);
-  discoverSharedEntriesMock.mockResolvedValue([]);
-  openSharedEntryMock.mockReset();
   apiFetchMock.mockImplementation(async (path: string) => {
     if (path === '/api/auth/user/me') return { id: 'user-1' };
     if (path === '/api/server') return serverList();
@@ -780,58 +765,6 @@ describe('App shell', () => {
     expect(view.container.textContent).toContain('session-pane:deck_alpha_brain');
     expect(view.container.textContent).toContain('session-tree');
     expect(ws.connect).toHaveBeenCalled();
-  }, 20_000);
-
-  it('keeps owned tabs in navigation after opening a shared entry', async () => {
-    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
-    localStorage.setItem('rcc_server', 'srv-1');
-    localStorage.setItem('rcc_server_name', 'Alpha Server');
-    localStorage.setItem('rcc_session', 'deck_alpha_brain');
-    const sharedEntry = {
-      id: 'share-1',
-      serverId: 'srv-shared',
-      serverName: 'Shared Server',
-      role: 'viewer',
-      status: 'active',
-      targetLabel: 'Shared Beta',
-      target: { kind: 'main', serverId: 'srv-shared', sessionName: 'deck_beta_brain' },
-    };
-    discoverSharedEntriesMock.mockResolvedValue([sharedEntry]);
-    openSharedEntryMock.mockResolvedValue({
-      server: {
-        id: 'srv-shared',
-        name: 'Shared Server',
-        status: 'online',
-        lastHeartbeatAt: Date.now(),
-      },
-      target: sharedEntry.target,
-      coverage: {
-        effectiveRole: 'viewer',
-        historyCutoffAt: 0,
-        nextCoverageRecheckAt: null,
-        coveringShareIds: ['share-1'],
-        primaryShareId: 'share-1',
-        authorizedAt: Date.now(),
-      },
-      sessions: [{
-        sessionName: 'deck_beta_brain',
-        title: 'Shared Beta',
-        state: 'idle',
-        agentType: 'codex-sdk',
-      }],
-      subSessions: [],
-    });
-
-    const { App } = await importApp();
-    render(<App />);
-
-    await waitFor(() => expect(screen.getByTestId('session-tabs').getAttribute('data-owned-session-names')).toContain('deck_alpha_brain'));
-    fireEvent.click(await screen.findByTestId('tabs-shared-share-1'));
-
-    await waitFor(() => expect(openSharedEntryMock).toHaveBeenCalledWith(sharedEntry.target));
-    expect(screen.getByTestId('session-tabs').getAttribute('data-owned-session-names')).toContain('deck_alpha_brain');
-    expect(screen.getByTestId('session-tabs').getAttribute('data-owned-session-names')).not.toContain('deck_beta_brain');
-    expect(screen.getByTestId('tabs-shared-share-1').getAttribute('data-active')).toBe('true');
   }, 20_000);
 
   it('opens controlled-node management above sub-session windows and re-fronts it from the sidebar', async () => {

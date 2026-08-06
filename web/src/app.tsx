@@ -33,6 +33,7 @@ import { SessionTabs } from './components/SessionTabs.js';
 // TransportChatView removed — transport sessions use unified ChatView via timelineEmitter
 import { SessionPane } from './components/SessionPane.js';
 import { ShareSessionDialog } from './components/ShareSessionDialog.js';
+import { SharedEntriesPanel } from './components/SharedEntriesPanel.js';
 import { SharedStateIndicator } from './components/SharedStateIndicator.js';
 import { applyGlobalFontPrefs, DEFAULT_CHAT_FONT, useFontPrefs } from './components/FontPrefsDropdown.js';
 import { useQuickData } from './components/QuickInputPanel.js';
@@ -450,12 +451,6 @@ type RepoPanelTarget = {
   parentServerId?: string | null;
 };
 
-interface OwnedNavigationSnapshot {
-  serverId: string;
-  serverName: string | null;
-  sessions: SessionInfo[];
-}
-
 function getRepoDesktopWindowId(parentSubId?: string | null): string {
   return parentSubId ? DESKTOP_WINDOW_IDS.subsessionRepo(parentSubId) : DESKTOP_WINDOW_IDS.repo;
 }
@@ -496,7 +491,6 @@ export function App() {
     setSelectedServerId(null);
     setSelectedServerName(null);
     setSelectedShareTarget(null);
-    setOwnedNavigationSnapshot(null);
     setSharedEntries([]);
     setSharedEntriesError(null);
     setManagedShares([]);
@@ -526,7 +520,6 @@ export function App() {
   const [showMobileFileBrowser, setShowMobileFileBrowser] = useState(false);
   const [shareDialogTarget, setShareDialogTarget] = useState<ShareDialogTarget | null>(null);
   const [selectedShareTarget, setSelectedShareTarget] = useState<ShareTarget | null>(null);
-  const [ownedNavigationSnapshot, setOwnedNavigationSnapshot] = useState<OwnedNavigationSnapshot | null>(null);
   const [sharedEntries, setSharedEntries] = useState<SharedEntrySummary[]>([]);
   const [sharedEntriesLoading, setSharedEntriesLoading] = useState(false);
   const [sharedEntriesError, setSharedEntriesError] = useState<string | null>(null);
@@ -1209,14 +1202,6 @@ export function App() {
     }),
     [managedSharedSessionStateByName, navigableMainSessions],
   );
-  const navigationMainSessions = selectedShareTarget && ownedNavigationSnapshot
-    ? ownedNavigationSnapshot.sessions
-    : visibleMainSessions;
-  const activeSharedEntryId = useMemo(() => {
-    const selectedKey = shareTargetKey(selectedShareTarget);
-    if (!selectedKey) return null;
-    return sharedEntries.find((entry) => shareTargetKey(entry.target) === selectedKey)?.id ?? null;
-  }, [selectedShareTarget, sharedEntries]);
   const [sessionsLoaded, setSessionsLoaded] = useState(false);
   const [activeSession, setActiveSessionState] = useState<string | null>(
     () => resolveInitialSessionName(),
@@ -2156,29 +2141,6 @@ export function App() {
     });
   }, [closeAllSubSessionWindows, setActiveSession]);
 
-  const selectOwnedNavigationTab = useCallback((name: string) => {
-    if (!selectedShareTarget || !ownedNavigationSnapshot) {
-      selectMainSessionTab(name);
-      return;
-    }
-
-    // A share-scoped WebSocket cannot safely issue owner actions. Restore the
-    // owner's server first, then let the normal bootstrap reconnect and load a
-    // fresh authoritative session list for the selected owned tab.
-    autoEntryRunRef.current++;
-    localStorage.setItem('rcc_server', ownedNavigationSnapshot.serverId);
-    if (ownedNavigationSnapshot.serverName) {
-      localStorage.setItem('rcc_server_name', ownedNavigationSnapshot.serverName);
-    } else {
-      localStorage.removeItem('rcc_server_name');
-    }
-    safeLocalStorageSetItem('rcc_session', name);
-    localStorage.setItem(`rcc_session_${ownedNavigationSnapshot.serverId}`, name);
-    writeHashState(ownedNavigationSnapshot.serverId, name);
-    markFastServerSwitchSplash();
-    window.location.reload();
-  }, [ownedNavigationSnapshot, selectMainSessionTab, selectedShareTarget]);
-
   const selectSubSessionFromTree = useCallback((sub: SubSession) => {
     if (sub.parentSession && sub.parentSession !== activeSessionRef.current) {
       setActiveSession(sub.parentSession, { keepSubWindows: true });
@@ -2463,13 +2425,6 @@ export function App() {
 
   const handleOpenSharedEntry = useCallback(async (entry: SharedEntrySummary) => {
     if (openingSharedEntryId) return;
-    if (!selectedShareTarget && selectedServerId) {
-      setOwnedNavigationSnapshot({
-        serverId: selectedServerId,
-        serverName: resolvedSelectedServerName,
-        sessions: visibleMainSessions,
-      });
-    }
     setOpeningSharedEntryId(entry.id);
     setSharedEntriesError(null);
     try {
@@ -2536,7 +2491,7 @@ export function App() {
     } finally {
       setOpeningSharedEntryId(null);
     }
-  }, [hydrateSharedSubSessions, openingSharedEntryId, resolvedSelectedServerName, selectedServerId, selectedShareTarget, setActiveSession, visibleMainSessions]);
+  }, [hydrateSharedSubSessions, openingSharedEntryId, setActiveSession]);
 
   const closeSubSessionAndClearMaximized = useCallback((id: string) => {
     clearSubSessionMaximized(id);
@@ -4191,7 +4146,6 @@ export function App() {
     setActiveSession(null);
     setSelectedServerId(null);
     setSelectedShareTarget(null);
-    setOwnedNavigationSnapshot(null);
     setSharedEntries([]);
     setSharedEntriesError(null);
     setDiscussions([]);
@@ -4212,7 +4166,6 @@ export function App() {
     autoEntryRunRef.current++;
     setManualDashboard(false);
     setSelectedShareTarget(null);
-    setOwnedNavigationSnapshot(null);
     // Save current active session for the server we're leaving
     const prevServer = localStorage.getItem('rcc_server');
     const currentSession = localStorage.getItem('rcc_session');
@@ -4353,7 +4306,6 @@ export function App() {
     setSelectedServerId(null);
     setSelectedServerName(null);
     setSelectedShareTarget(null);
-    setOwnedNavigationSnapshot(null);
     setActiveSession(null);
     setShowMobileServerMenu(false);
   }, [setActiveSession]);
@@ -4910,18 +4862,26 @@ export function App() {
                 aria-pressed={!mobileHideTabBar}
               >⊞</button>
             </div>
+            <SharedEntriesPanel
+              entries={sharedEntries}
+              loading={sharedEntriesLoading}
+              error={sharedEntriesError}
+              openingEntryId={openingSharedEntryId}
+              onOpen={(entry) => void handleOpenSharedEntry(entry)}
+              onRefresh={() => void refreshSharedEntries()}
+            />
             {/* Session tree — hidden via the ⊞ list toggle above */}
             {!mobileHideTabBar && <SessionTree
               serverId={selectedServerId}
-              sessions={navigationMainSessions}
-              subSessions={selectedShareTarget ? [] : subSessions}
+              sessions={visibleMainSessions}
+              subSessions={subSessions}
               sharedSubSessionStates={managedSharedSubSessionStateById}
-              activeSession={selectedShareTarget ? null : activeSession}
+              activeSession={activeSession}
               unreadCounts={unreadCounts}
               idleFlashTokens={idleFlashTokens}
               p2pSessionLabels={p2pSessionLabels}
               onSelectSession={(name) => {
-                selectOwnedNavigationTab(name);
+                setActiveSession(name);
                 setIdleAlerts((prev) => { const s = new Set(prev); s.delete(name); return s; });
               }}
               onSelectSubSession={(sub) => {
@@ -4929,13 +4889,6 @@ export function App() {
               }}
               onNewSession={selectedShareTarget ? undefined : () => setShowNewSession(true)}
               onNewSubSession={selectedShareTarget ? undefined : () => setShowSubDialog(true)}
-              sharedEntries={sharedEntries}
-              activeSharedEntryId={activeSharedEntryId}
-              openingSharedEntryId={openingSharedEntryId}
-              onSelectSharedEntry={(entry) => void handleOpenSharedEntry(entry)}
-              sharedEntriesLoading={sharedEntriesLoading}
-              sharedEntriesError={sharedEntriesError}
-              onRefreshSharedEntries={() => void refreshSharedEntries()}
             />}
 
             {/* P2P ring progress — show active P2P runs */}
@@ -5212,15 +5165,15 @@ export function App() {
             {showMobileServerMenu && <div class="mobile-server-backdrop" onClick={() => setShowMobileServerMenu(false)} />}
 
             <SessionTabs
-              sessions={navigationMainSessions}
-              activeSession={selectedShareTarget ? null : activeSession}
+              sessions={visibleMainSessions}
+              activeSession={activeSession}
               connected={connected}
               latencyMs={latencyMs}
               idleAlerts={idleAlerts}
               p2pSessionLabels={p2pSessionLabels}
               onAlertDismiss={(name) => setIdleAlerts((prev) => { const s = new Set(prev); s.delete(name); return s; })}
-              onSelect={selectOwnedNavigationTab}
-              onNewSession={selectedShareTarget ? undefined : () => setShowNewSession(true)}
+              onSelect={selectMainSessionTab}
+              onNewSession={() => setShowNewSession(true)}
               onStopProject={handleStopProject}
               onRestartProject={handleRestartProject}
               onOpenSessionSettings={(session) => setSettingsTarget({
@@ -5245,11 +5198,6 @@ export function App() {
               sessionsLoaded={sessionsLoaded}
               pinned={pinnedTabs}
               setPinnedArr={setPinnedTabsArr}
-              sharedEntries={sharedEntries}
-              activeSharedEntryId={activeSharedEntryId}
-              openingSharedEntryId={openingSharedEntryId}
-              onSelectSharedEntry={(entry) => void handleOpenSharedEntry(entry)}
-              navigationOnly={Boolean(selectedShareTarget)}
             />
 
             <div
@@ -5622,20 +5570,28 @@ export function App() {
                       </button>
                     );
                   })}
+                  <SharedEntriesPanel
+                    entries={sharedEntries}
+                    loading={sharedEntriesLoading}
+                    error={sharedEntriesError}
+                    openingEntryId={openingSharedEntryId}
+                    onOpen={(entry) => void handleOpenSharedEntry(entry)}
+                    onRefresh={() => void refreshSharedEntries()}
+                  />
                 </div>
               )}
               {/* Session tree — collapsible via sidebar toggle */}
               {!mobileHideTabBar && <SessionTree
                 serverId={selectedServerId}
-                sessions={navigationMainSessions}
-                subSessions={selectedShareTarget ? [] : subSessions}
+                sessions={visibleMainSessions}
+                subSessions={subSessions}
                 sharedSubSessionStates={managedSharedSubSessionStateById}
-                activeSession={selectedShareTarget ? null : activeSession}
+                activeSession={activeSession}
                 unreadCounts={unreadCounts}
                 idleFlashTokens={idleFlashTokens}
                 p2pSessionLabels={p2pSessionLabels}
                 onSelectSession={(name) => {
-                  selectOwnedNavigationTab(name);
+                  setActiveSession(name);
                   setIdleAlerts((prev) => { const s = new Set(prev); s.delete(name); return s; });
                   closeSidebar();
                 }}
@@ -5645,13 +5601,6 @@ export function App() {
                 }}
                 onNewSession={selectedShareTarget ? undefined : () => { setShowNewSession(true); closeSidebar(); }}
                 onNewSubSession={selectedShareTarget ? undefined : () => { setShowSubDialog(true); closeSidebar(); }}
-                sharedEntries={sharedEntries}
-                activeSharedEntryId={activeSharedEntryId}
-                openingSharedEntryId={openingSharedEntryId}
-                onSelectSharedEntry={(entry) => { void handleOpenSharedEntry(entry); closeSidebar(); }}
-                sharedEntriesLoading={sharedEntriesLoading}
-                sharedEntriesError={sharedEntriesError}
-                onRefreshSharedEntries={() => void refreshSharedEntries()}
                 height={sessionTreeHeight}
                 onResizeHeight={saveSessionTreeHeight}
               />}
