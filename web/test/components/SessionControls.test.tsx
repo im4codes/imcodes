@@ -520,7 +520,7 @@ afterEach(() => {
     expect(screen.getByRole('button', { name: /send/i })).toBeDefined();
   });
 
-  it('shares a dragged desktop composer height across every window and persists it', async () => {
+  it('shares corner and top-edge desktop resizing across every window and persists it', async () => {
     render(
       <>
         <SessionControls ws={makeWs() as any} activeSession={makeSession({ name: 'main-window' })} quickData={makeQuickData() as any} />
@@ -540,7 +540,7 @@ afterEach(() => {
       toJSON: () => ({}),
     });
 
-    const handle = screen.getAllByRole('separator', { name: 'Resize message input' })[0];
+    const handle = document.querySelector('.controls-composer-resize-corner') as HTMLDivElement;
     // Older jsdom releases do not expose `onpointerdown`, so Preact's event
     // compatibility path registers the listener with the original casing.
     const pointerDownEventName = 'onpointerdown' in handle ? 'pointerdown' : 'PointerDown';
@@ -562,9 +562,29 @@ afterEach(() => {
     expect(localStorage.getItem(COMPOSER_HEIGHT_STORAGE_KEY)).toBe('160');
     expect(document.body.classList.contains('composer-height-resizing')).toBe(false);
 
+    const topEdge = document.querySelector('.controls-composer-resize-edge') as HTMLDivElement;
+    const topPointerDownEventName = 'onpointerdown' in topEdge ? 'pointerdown' : 'PointerDown';
+    fireEvent(topEdge, new MouseEvent(topPointerDownEventName, {
+      bubbles: true,
+      cancelable: true,
+      button: 0,
+      clientY: 200,
+    }));
+    expect(document.body.classList.contains('composer-height-resizing-top')).toBe(true);
+    fireEvent(window, new MouseEvent('pointermove', { clientY: 240 }));
+
+    await waitFor(() => {
+      for (const input of inputs) {
+        expect(input.style.height).toBe('120px');
+      }
+    });
+    fireEvent(window, new MouseEvent('pointerup', { clientY: 240 }));
+    expect(localStorage.getItem(COMPOSER_HEIGHT_STORAGE_KEY)).toBe('120');
+    expect(document.body.classList.contains('composer-height-resizing')).toBe(false);
+
     cleanup();
     render(<SessionControls ws={makeWs() as any} activeSession={makeSession()} quickData={makeQuickData() as any} />);
-    expect((screen.getByRole('textbox') as HTMLDivElement).style.height).toBe('160px');
+    expect((screen.getByRole('textbox') as HTMLDivElement).style.height).toBe('120px');
   });
 
   it('keeps the shared desktop height and resize affordance out of the mobile composer', () => {
@@ -575,6 +595,7 @@ afterEach(() => {
 
     const input = screen.getByRole('textbox') as HTMLDivElement;
     expect(screen.queryByRole('separator', { name: 'Resize message input' })).toBeNull();
+    expect(screen.queryByRole('separator', { name: 'Resize message input from top edge' })).toBeNull();
     expect(input.style.height).toBe('');
   });
 

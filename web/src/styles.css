@@ -624,12 +624,43 @@ html.native-ios-mac .chat-dl-btn {
 }
 .controls-composer-resize-handle:hover,
 .controls-composer-resize-handle:focus-visible,
-.composer-height-resizing .controls-composer-resize-handle {
+.composer-height-resizing-corner .controls-composer-resize-handle {
   opacity: 1;
   background-color: rgba(34,211,238,0.07);
   filter: drop-shadow(0 0 4px rgba(34,211,238,0.32));
 }
-.composer-height-resizing { cursor: nwse-resize !important; user-select: none !important; }
+.controls-composer-resize-edge {
+  position: absolute;
+  top: -4px;
+  right: 8px;
+  left: 8px;
+  z-index: 3;
+  height: 9px;
+  cursor: ns-resize;
+  touch-action: none;
+  outline: none;
+}
+.controls-composer-resize-edge::after {
+  position: absolute;
+  top: 4px;
+  right: 0;
+  left: 0;
+  height: 1px;
+  border-radius: 1px;
+  background: rgba(103,232,249,0.7);
+  content: '';
+  opacity: 0;
+  transition: opacity 0.14s, box-shadow 0.14s;
+}
+.controls-composer-resize-edge:hover::after,
+.controls-composer-resize-edge:focus-visible::after,
+.composer-height-resizing-top .controls-composer-resize-edge::after {
+  opacity: 0.52;
+  box-shadow: 0 0 5px rgba(34,211,238,0.26);
+}
+.composer-height-resizing { user-select: none !important; }
+.composer-height-resizing-corner { cursor: nwse-resize !important; }
+.composer-height-resizing-top { cursor: ns-resize !important; }
 .controls-composer-backdrop {
   position: fixed;
   inset: 0;
@@ -961,7 +992,8 @@ html.native-ios-mac .chat-dl-btn {
   white-space: nowrap;
 }
 @media (max-width: 640px) {
-  .controls-composer-resize-handle { display: none; }
+  .controls-composer-resize-handle,
+  .controls-composer-resize-edge { display: none; }
   .composer-upload-stats {
     gap: 4px 8px;
   }
