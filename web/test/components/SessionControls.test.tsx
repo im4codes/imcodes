@@ -285,7 +285,11 @@ vi.mock('../../src/api.js', () => ({
 }));
 
 import { OpenSpecAutoDeliverLauncher } from '../../src/components/OpenSpecAutoDeliver.js';
-import { OPENSPEC_LIST_REQUEST_TIMEOUT_MS, SessionControls } from '../../src/components/SessionControls.js';
+import {
+  COMPOSER_HEIGHT_STORAGE_KEY,
+  OPENSPEC_LIST_REQUEST_TIMEOUT_MS,
+  SessionControls,
+} from '../../src/components/SessionControls.js';
 import { __resetPrefCacheForTests } from '../../src/hooks/usePref.js';
 import type { SessionInfo } from '../../src/types.js';
 import { DAEMON_MSG } from '@shared/daemon-events.js';
@@ -514,6 +518,55 @@ afterEach(() => {
     render(<SessionControls ws={makeWs() as any} activeSession={makeSession()} quickData={makeQuickData() as any} />);
     expect(screen.getByRole('textbox')).toBeDefined();
     expect(screen.getByRole('button', { name: /send/i })).toBeDefined();
+  });
+
+  it('shares a dragged desktop composer height across every window and persists it', () => {
+    render(
+      <>
+        <SessionControls ws={makeWs() as any} activeSession={makeSession({ name: 'main-window' })} quickData={makeQuickData() as any} />
+        <SessionControls ws={makeWs() as any} activeSession={makeSession({ name: 'sub-window' })} quickData={makeQuickData() as any} />
+      </>,
+    );
+    const inputs = screen.getAllByRole('textbox') as HTMLDivElement[];
+    inputs[0].getBoundingClientRect = () => ({
+      width: 600,
+      height: 80,
+      top: 0,
+      right: 600,
+      bottom: 80,
+      left: 0,
+      x: 0,
+      y: 0,
+      toJSON: () => ({}),
+    });
+
+    const handle = screen.getAllByRole('separator', { name: 'Resize message input' })[0];
+    fireEvent.pointerDown(handle, { button: 0, clientY: 200, pointerId: 1 });
+    fireEvent.pointerMove(window, { clientY: 280, pointerId: 1 });
+
+    for (const input of inputs) {
+      expect(input.style.height).toBe('160px');
+    }
+    expect(document.body.classList.contains('composer-height-resizing')).toBe(true);
+
+    fireEvent.pointerUp(window, { clientY: 280, pointerId: 1 });
+    expect(localStorage.getItem(COMPOSER_HEIGHT_STORAGE_KEY)).toBe('160');
+    expect(document.body.classList.contains('composer-height-resizing')).toBe(false);
+
+    cleanup();
+    render(<SessionControls ws={makeWs() as any} activeSession={makeSession()} quickData={makeQuickData() as any} />);
+    expect((screen.getByRole('textbox') as HTMLDivElement).style.height).toBe('160px');
+  });
+
+  it('keeps the shared desktop height and resize affordance out of the mobile composer', () => {
+    localStorage.setItem(COMPOSER_HEIGHT_STORAGE_KEY, '180');
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 390 });
+
+    render(<SessionControls ws={makeWs() as any} activeSession={makeSession()} quickData={makeQuickData() as any} />);
+
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    expect(screen.queryByRole('separator', { name: 'Resize message input' })).toBeNull();
+    expect(input.style.height).toBe('');
   });
 
   it('shows copy group action only for main-session controls and hides it from sub/compact surfaces', () => {

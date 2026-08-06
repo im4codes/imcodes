@@ -1,7 +1,7 @@
 import { useState, useRef, useEffect, useCallback, useMemo } from 'preact/hooks';
 import { createPortal } from 'preact/compat';
 import { useTranslation } from 'react-i18next';
-import type { ComponentChildren, RefObject } from 'preact';
+import type { ComponentChildren, JSX, RefObject } from 'preact';
 import type { WsClient, ServerMessage, TimelineEvent } from '../ws-client.js';
 import type { SessionInfo } from '../types.js';
 import { QuickInputPanel } from './QuickInputPanel.js';
@@ -108,6 +108,67 @@ import {
   SESSION_SETTINGS_FOCUS,
   type SessionSettingsOpenIntent,
 } from '../session-settings-open-intent.js';
+
+export const COMPOSER_HEIGHT_STORAGE_KEY = 'imcodes_composer_height_v1';
+export const COMPOSER_HEIGHT_MIN_PX = 32;
+export const COMPOSER_HEIGHT_MAX_PX = 360;
+const COMPOSER_HEIGHT_STEP_PX = 16;
+const COMPOSER_HEIGHT_EVENT = 'imcodes:composer-height';
+
+function clampComposerHeight(height: number): number {
+  return Math.min(COMPOSER_HEIGHT_MAX_PX, Math.max(COMPOSER_HEIGHT_MIN_PX, Math.round(height)));
+}
+
+function readStoredComposerHeight(): number | null {
+  if (typeof window === 'undefined') return null;
+  try {
+    const parsed = Number.parseInt(window.localStorage.getItem(COMPOSER_HEIGHT_STORAGE_KEY) ?? '', 10);
+    return Number.isFinite(parsed) ? clampComposerHeight(parsed) : null;
+  } catch {
+    return null;
+  }
+}
+
+function broadcastComposerHeight(height: number): void {
+  if (typeof window === 'undefined') return;
+  window.dispatchEvent(new CustomEvent<number>(COMPOSER_HEIGHT_EVENT, { detail: clampComposerHeight(height) }));
+}
+
+function persistComposerHeight(height: number): void {
+  const next = clampComposerHeight(height);
+  if (typeof window === 'undefined') return;
+  try {
+    window.localStorage.setItem(COMPOSER_HEIGHT_STORAGE_KEY, String(next));
+  } catch {
+    // Private browsing/storage denial must not disable live resizing.
+  }
+  broadcastComposerHeight(next);
+}
+
+function useSharedComposerHeight(): number | null {
+  const [height, setHeight] = useState<number | null>(readStoredComposerHeight);
+
+  useEffect(() => {
+    const syncStoredHeight = (event: StorageEvent) => {
+      if (event.key === COMPOSER_HEIGHT_STORAGE_KEY || event.key === null) {
+        setHeight(readStoredComposerHeight());
+      }
+    };
+    const syncLiveHeight = (event: Event) => {
+      const next = (event as CustomEvent<number>).detail;
+      if (Number.isFinite(next)) setHeight(clampComposerHeight(next));
+    };
+    window.addEventListener('storage', syncStoredHeight);
+    window.addEventListener(COMPOSER_HEIGHT_EVENT, syncLiveHeight);
+    setHeight(readStoredComposerHeight());
+    return () => {
+      window.removeEventListener('storage', syncStoredHeight);
+      window.removeEventListener(COMPOSER_HEIGHT_EVENT, syncLiveHeight);
+    };
+  }, []);
+
+  return height;
+}
 
 function isExecutionCloneTemplateLike(sub: { executionCloneKind?: string | null; parentRunId?: string | null }): boolean {
   return sub.executionCloneKind === EXECUTION_CLONE_KIND || typeof sub.parentRunId === 'string';
@@ -1147,6 +1208,8 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const [settledQueuedIds, setSettledQueuedIds] = useState<ReadonlySet<string>>(() => new Set());
   const [mobileComposerMultiline, setMobileComposerMultiline] = useState(false);
   const [mobileComposerExpanded, setMobileComposerExpanded] = useState(false);
+  const sharedComposerHeight = useSharedComposerHeight();
+  const composerResizeCleanupRef = useRef<(() => void) | null>(null);
   const [confirm, setConfirm] = useState<MenuAction | null>(null);
   const [confirmLevel, setConfirmLevel] = useState(0); // 0=none, 1=first warning, 2=second warning (sub-session only)
   const [skipComboSendConfirm, setSkipComboSendConfirm] = useState(false);
@@ -1313,6 +1376,60 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   ), [activeSession]);
   // Internal ref for contenteditable — also written to the external inputRef
   const divRef = useRef<HTMLDivElement>(null);
+  const stopComposerResize = useCallback(() => {
+    composerResizeCleanupRef.current?.();
+    composerResizeCleanupRef.current = null;
+  }, []);
+
+  const startComposerResize = useCallback((event: JSX.TargetedPointerEvent<HTMLDivElement>) => {
+    if (event.button !== 0 || window.innerWidth <= 640) return;
+    event.preventDefault();
+    stopComposerResize();
+
+    const startY = event.clientY;
+    const startHeight = clampComposerHeight(
+      sharedComposerHeight ?? divRef.current?.getBoundingClientRect().height ?? COMPOSER_HEIGHT_MIN_PX,
+    );
+    let latestHeight = startHeight;
+    document.body.classList.add('composer-height-resizing');
+
+    const handlePointerMove = (moveEvent: PointerEvent) => {
+      latestHeight = clampComposerHeight(startHeight + moveEvent.clientY - startY);
+      broadcastComposerHeight(latestHeight);
+    };
+    const cleanupResize = () => {
+      window.removeEventListener('pointermove', handlePointerMove);
+      window.removeEventListener('pointerup', handlePointerEnd);
+      window.removeEventListener('pointercancel', handlePointerEnd);
+      document.body.classList.remove('composer-height-resizing');
+    };
+    const handlePointerEnd = () => {
+      cleanupResize();
+      composerResizeCleanupRef.current = null;
+      persistComposerHeight(latestHeight);
+    };
+
+    window.addEventListener('pointermove', handlePointerMove);
+    window.addEventListener('pointerup', handlePointerEnd);
+    window.addEventListener('pointercancel', handlePointerEnd);
+    composerResizeCleanupRef.current = cleanupResize;
+  }, [sharedComposerHeight, stopComposerResize]);
+
+  const handleComposerResizeKeyDown = useCallback((event: JSX.TargetedKeyboardEvent<HTMLDivElement>) => {
+    const current = sharedComposerHeight
+      ?? divRef.current?.getBoundingClientRect().height
+      ?? COMPOSER_HEIGHT_MIN_PX;
+    let next: number | null = null;
+    if (event.key === 'ArrowUp') next = current + COMPOSER_HEIGHT_STEP_PX;
+    if (event.key === 'ArrowDown') next = current - COMPOSER_HEIGHT_STEP_PX;
+    if (event.key === 'Home') next = COMPOSER_HEIGHT_MIN_PX;
+    if (event.key === 'End') next = COMPOSER_HEIGHT_MAX_PX;
+    if (next === null) return;
+    event.preventDefault();
+    persistComposerHeight(next);
+  }, [sharedComposerHeight]);
+
+  useEffect(() => () => stopComposerResize(), [stopComposerResize]);
   // Shared alias data — feeds compose-time resolution (A′) on send and the
   // inline `;` autocomplete. `aliasFiltered` is the name+description filtered
   // view for the current inline query; `aliasAll` is the full list used to
@@ -5972,6 +6089,20 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         */}
         {mobileComposerExpanded && <div class="controls-composer-backdrop" onClick={() => setMobileComposerExpanded(false)} />}
         <div class={`controls-composer${showEmbeddedVoiceButton ? ' controls-composer-with-voice' : ''}${mobileComposerExpanded ? ' controls-composer-mobile-expanded' : ''}`}>
+          {!isMobileLayout && (
+            <div
+              class="controls-composer-resize-handle"
+              role="separator"
+              tabIndex={0}
+              aria-orientation="horizontal"
+              aria-label="Resize message input"
+              aria-valuemin={COMPOSER_HEIGHT_MIN_PX}
+              aria-valuemax={COMPOSER_HEIGHT_MAX_PX}
+              aria-valuenow={sharedComposerHeight ?? undefined}
+              onPointerDown={startComposerResize}
+              onKeyDown={handleComposerResizeKeyDown}
+            />
+          )}
           <div
             ref={divRef}
             class={`controls-input${inputDisabled ? ' controls-input-disabled' : ''}${p2pMode !== 'solo' ? ' controls-input-p2p' : ''}${showEmbeddedVoiceButton ? ' controls-input-with-trailing' : ''}${fileDragActive ? ' controls-input-file-drag-over' : ''}`}
@@ -5983,7 +6114,14 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
             data-placeholder={placeholder}
             spellcheck={false}
             enterkeyhint={isMobileLayout ? 'send' : undefined}
-            style={p2pMode !== 'solo' ? { borderColor: getP2pModeColor(p2pMode), boxShadow: `0 0 0 1px ${getP2pModeColor(p2pMode)}40` } : undefined}
+            style={{
+              ...(p2pMode !== 'solo' ? { borderColor: getP2pModeColor(p2pMode), boxShadow: `0 0 0 1px ${getP2pModeColor(p2pMode)}40` } : {}),
+              ...(sharedComposerHeight !== null && !isMobileLayout ? {
+                height: `${sharedComposerHeight}px`,
+                minHeight: `${sharedComposerHeight}px`,
+                maxHeight: `${sharedComposerHeight}px`,
+              } : {}),
+            }}
             onFocus={handleFocus}
             onBlur={handleBlur}
             onInput={() => {
