@@ -171,6 +171,11 @@
       "title": "Shared with me",
       "empty": "No shared tabs or servers",
       "refresh": "Refresh shared access",
+      "guideEyebrow": "Shared view",
+      "guideTitle": "You switched to shared content",
+      "guideBody": "Your own server is still available. Click {{server}} in the server list, or use the button below, to return.",
+      "guideReturn": "Return to {{server}}",
+      "guideDismiss": "Got it",
       "kind": {
         "server": "Server",
         "tab": "Tab",

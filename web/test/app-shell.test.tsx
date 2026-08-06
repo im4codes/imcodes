@@ -7,14 +7,18 @@ import { P2P_WORKFLOW_MSG } from '@shared/p2p-workflow-messages.js';
 
 const {
   apiFetchMock,
+  discoverSharedEntriesMock,
   fetchMeMock,
   listP2pRunsMock,
+  openSharedEntryMock,
   wsInstances,
   useSubSessionsState,
 } = vi.hoisted(() => ({
   apiFetchMock: vi.fn(),
+  discoverSharedEntriesMock: vi.fn(),
   fetchMeMock: vi.fn(),
   listP2pRunsMock: vi.fn(),
+  openSharedEntryMock: vi.fn(),
   wsInstances: [] as Array<{
     connected: boolean;
     messageHandlers: Array<(message: any) => void>;
@@ -81,11 +85,12 @@ vi.mock('../src/api.js', () => {
     clearApiKey: vi.fn(),
     configure: vi.fn(),
     configureApiKey: vi.fn(),
-    discoverSharedEntries: vi.fn(async () => []),
+    discoverSharedEntries: (...args: unknown[]) => discoverSharedEntriesMock(...args),
     fetchMe: (...args: unknown[]) => fetchMeMock(...args),
     getApiKey: vi.fn(() => 'api-key-1'),
     listP2pRuns: (...args: unknown[]) => listP2pRunsMock(...args),
     normalizeLocalWebPreviewPath: (path: string) => path.startsWith('/') ? path : `/${path}`,
+    openSharedEntry: (...args: unknown[]) => openSharedEntryMock(...args),
     onAuthExpired: vi.fn(),
     refreshSessionIfStale: vi.fn(),
     startProactiveRefresh: vi.fn(),
@@ -165,6 +170,7 @@ vi.mock('../src/hooks/useSubSessions.js', () => ({
     ...useSubSessionsState,
     create: vi.fn(async () => null),
     close: vi.fn(),
+    hydrateShared: vi.fn(),
     restart: vi.fn(),
     rename: vi.fn(),
     updateLocal: vi.fn(),
@@ -280,8 +286,8 @@ vi.mock('../src/pages/CronManager.js', () => ({
 }));
 
 vi.mock('../src/components/ServerIconBar.js', () => ({
-  ServerIconBar: ({ servers, onSelectServer, onSettings, onAdmin, onHome, onToggleSidebar, onServerContextMenu }: any) => (
-    <div>
+  ServerIconBar: ({ servers, returnHintServerId, onSelectServer, onSettings, onAdmin, onHome, onToggleSidebar, onServerContextMenu }: any) => (
+    <div data-testid="server-icon-bar" data-return-hint-server-id={returnHintServerId ?? ''}>
       server-icon-bar
       <button onClick={onSettings}>server-settings</button>
       <button onClick={onAdmin}>server-admin</button>
@@ -651,6 +657,9 @@ beforeEach(() => {
     has_password: true,
   });
   listP2pRunsMock.mockResolvedValue([]);
+  discoverSharedEntriesMock.mockReset();
+  discoverSharedEntriesMock.mockResolvedValue([]);
+  openSharedEntryMock.mockReset();
   apiFetchMock.mockImplementation(async (path: string) => {
     if (path === '/api/auth/user/me') return { id: 'user-1' };
     if (path === '/api/server') return serverList();
@@ -2048,4 +2057,50 @@ describe('App shell', () => {
 
     expect(view.container.textContent).toContain('sub-session-bar');
   }, 30_000);
+
+  it('guides the user back to their previous server after opening shared content', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_server_name', 'Alpha Server');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    const sharedEntry = {
+      id: 'share-1',
+      serverId: 'srv-shared',
+      serverName: 'Shared Server',
+      role: 'viewer',
+      status: 'active',
+      targetLabel: 'Shared Beta',
+      target: { kind: 'main', serverId: 'srv-shared', sessionName: 'deck_beta_brain' },
+    };
+    discoverSharedEntriesMock.mockResolvedValue([sharedEntry]);
+    openSharedEntryMock.mockResolvedValue({
+      server: { id: 'srv-shared', name: 'Shared Server', status: 'online', lastHeartbeatAt: Date.now() },
+      target: sharedEntry.target,
+      coverage: {
+        effectiveRole: 'viewer',
+        historyCutoffAt: 0,
+        nextCoverageRecheckAt: null,
+        coveringShareIds: ['share-1'],
+        primaryShareId: 'share-1',
+        authorizedAt: Date.now(),
+      },
+      sessions: [{ sessionName: 'deck_beta_brain', title: 'Shared Beta', state: 'idle', agentType: 'codex-sdk' }],
+      subSessions: [],
+    });
+
+    const { App } = await importApp();
+    render(<App />);
+
+    const entryLabel = await screen.findByText('Shared Beta');
+    fireEvent.click(entryLabel.closest('button')!);
+
+    await waitFor(() => expect(openSharedEntryMock).toHaveBeenCalledWith(sharedEntry.target));
+    const guide = await screen.findByTestId('shared-return-guide');
+    expect(guide.textContent).toContain('share.sharedWithMe.guideTitle');
+    expect(guide.textContent).toContain('share.sharedWithMe.guideReturn');
+    expect(screen.getByTestId('server-icon-bar').getAttribute('data-return-hint-server-id')).toBe('srv-1');
+
+    fireEvent.click(screen.getByRole('button', { name: 'common.close' }));
+    expect(screen.queryByTestId('shared-return-guide')).toBeNull();
+  }, 20_000);
 });

@@ -24,13 +24,14 @@ interface Props {
   isAdmin?: boolean;
   onAdmin?: () => void;
   sharedServerStates?: ReadonlyMap<string, SharedStateSummary>;
+  returnHintServerId?: string | null;
 }
 
 function getInitial(name: string): string {
   return (name || '?').charAt(0).toUpperCase();
 }
 
-export function ServerIconBar({ servers, activeServerId, onSelectServer, onServerContextMenu, sidebarCollapsed, onToggleSidebar, onSettings, onHome, isAdmin, onAdmin, sharedServerStates }: Props) {
+export function ServerIconBar({ servers, activeServerId, onSelectServer, onServerContextMenu, sidebarCollapsed, onToggleSidebar, onSettings, onHome, isAdmin, onAdmin, sharedServerStates, returnHintServerId = null }: Props) {
   const { t } = useTranslation();
 
   return (
@@ -52,7 +53,7 @@ export function ServerIconBar({ servers, activeServerId, onSelectServer, onServe
         return (
           <button
             key={server.id}
-            class={`server-icon${isActive ? ' server-icon-active' : ''}`}
+            class={`server-icon${isActive ? ' server-icon-active' : ''}${server.id === returnHintServerId ? ' server-icon-return-hint' : ''}`}
             title={server.name}
             aria-label={server.name}
             aria-pressed={isActive}

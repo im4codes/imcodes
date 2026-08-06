@@ -171,6 +171,11 @@
       "title": "나에게 공유됨",
       "empty": "공유된 탭 또는 서버가 없습니다",
       "refresh": "공유 액세스 새로고침",
+      "guideEyebrow": "공유 보기",
+      "guideTitle": "공유 콘텐츠로 전환되었습니다",
+      "guideBody": "내 서버는 그대로 유지됩니다. 서버 목록에서 {{server}}을 클릭하거나 아래 버튼으로 돌아가세요.",
+      "guideReturn": "{{server}}로 돌아가기",
+      "guideDismiss": "확인",
       "kind": {
         "server": "서버",
         "tab": "탭",

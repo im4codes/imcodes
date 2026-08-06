@@ -171,6 +171,11 @@
       "title": "别人共享给我",
       "empty": "没有共享的标签或服务器",
       "refresh": "刷新共享访问",
+      "guideEyebrow": "共享视图",
+      "guideTitle": "你已切换到别人共享的内容",
+      "guideBody": "你自己的服务器仍然保留。点击服务器列表中的 {{server}}，或使用下方按钮即可返回。",
+      "guideReturn": "返回 {{server}}",
+      "guideDismiss": "知道了",
       "kind": {
         "server": "服务器",
         "tab": "标签",

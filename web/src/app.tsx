@@ -395,6 +395,11 @@ interface ServerInfo {
   createdAt: number;
 }
 
+interface SharedReturnServer {
+  id: string;
+  name: string;
+}
+
 interface WatchSessionRow {
   serverId: string;
   sessionName: string;
@@ -520,6 +525,8 @@ export function App() {
   const [showMobileFileBrowser, setShowMobileFileBrowser] = useState(false);
   const [shareDialogTarget, setShareDialogTarget] = useState<ShareDialogTarget | null>(null);
   const [selectedShareTarget, setSelectedShareTarget] = useState<ShareTarget | null>(null);
+  const [sharedReturnServer, setSharedReturnServer] = useState<SharedReturnServer | null>(null);
+  const [showSharedReturnGuide, setShowSharedReturnGuide] = useState(false);
   const [sharedEntries, setSharedEntries] = useState<SharedEntrySummary[]>([]);
   const [sharedEntriesLoading, setSharedEntriesLoading] = useState(false);
   const [sharedEntriesError, setSharedEntriesError] = useState<string | null>(null);
@@ -2425,6 +2432,16 @@ export function App() {
 
   const handleOpenSharedEntry = useCallback(async (entry: SharedEntrySummary) => {
     if (openingSharedEntryId) return;
+    const returnServer = selectedShareTarget
+      ? sharedReturnServer
+      : selectedServerId
+        ? {
+            id: selectedServerId,
+            name: resolvedSelectedServerName
+              ?? servers.find((server) => server.id === selectedServerId)?.name
+              ?? selectedServerId,
+          }
+        : null;
     setOpeningSharedEntryId(entry.id);
     setSharedEntriesError(null);
     try {
@@ -2484,6 +2501,10 @@ export function App() {
       if (openedTarget.kind === 'subsession') {
         setOpenSubIds((prev) => new Set([...prev, openedTarget.subSessionId]));
       }
+      if (returnServer) {
+        setSharedReturnServer(returnServer);
+        setShowSharedReturnGuide(true);
+      }
       setShowMobileServerMenu(false);
       setMobileSidebarOpen(false);
     } catch (err) {
@@ -2491,7 +2512,7 @@ export function App() {
     } finally {
       setOpeningSharedEntryId(null);
     }
-  }, [hydrateSharedSubSessions, openingSharedEntryId, setActiveSession]);
+  }, [hydrateSharedSubSessions, openingSharedEntryId, resolvedSelectedServerName, selectedServerId, selectedShareTarget, servers, setActiveSession, sharedReturnServer]);
 
   const closeSubSessionAndClearMaximized = useCallback((id: string) => {
     clearSubSessionMaximized(id);
@@ -4146,6 +4167,8 @@ export function App() {
     setActiveSession(null);
     setSelectedServerId(null);
     setSelectedShareTarget(null);
+    setSharedReturnServer(null);
+    setShowSharedReturnGuide(false);
     setSharedEntries([]);
     setSharedEntriesError(null);
     setDiscussions([]);
@@ -4166,6 +4189,7 @@ export function App() {
     autoEntryRunRef.current++;
     setManualDashboard(false);
     setSelectedShareTarget(null);
+    setShowSharedReturnGuide(false);
     // Save current active session for the server we're leaving
     const prevServer = localStorage.getItem('rcc_server');
     const currentSession = localStorage.getItem('rcc_session');
@@ -4801,6 +4825,41 @@ export function App() {
 
   return (
     <div class="layout" key={selectedServerId ?? ''}>
+      {showSharedReturnGuide && sharedReturnServer && selectedShareTarget && (
+        <aside
+          class="shared-return-guide"
+          role="dialog"
+          aria-modal="false"
+          aria-labelledby="shared-return-guide-title"
+          data-testid="shared-return-guide"
+        >
+          <div class="shared-return-guide-step">👥 {trans('share.sharedWithMe.guideEyebrow')}</div>
+          <button
+            class="shared-return-guide-close"
+            type="button"
+            onClick={() => setShowSharedReturnGuide(false)}
+            aria-label={trans('common.close')}
+          >×</button>
+          <h3 id="shared-return-guide-title">{trans('share.sharedWithMe.guideTitle')}</h3>
+          <p>{trans('share.sharedWithMe.guideBody', { server: sharedReturnServer.name })}</p>
+          <div class="shared-return-guide-actions">
+            <button
+              class="shared-return-guide-return"
+              type="button"
+              onClick={() => void handleSelectServer(sharedReturnServer.id, sharedReturnServer.name)}
+            >
+              ← {trans('share.sharedWithMe.guideReturn', { server: sharedReturnServer.name })}
+            </button>
+            <button
+              class="shared-return-guide-dismiss"
+              type="button"
+              onClick={() => setShowSharedReturnGuide(false)}
+            >
+              {trans('share.sharedWithMe.guideDismiss')}
+            </button>
+          </div>
+        </aside>
+      )}
       {/* Desktop 3-column: [ServerIconBar][SidebarPanel][MainContent] */}
       {!isMobile && (
         <>
@@ -4816,6 +4875,7 @@ export function App() {
             isAdmin={isAdmin}
             onAdmin={() => setShowAdminPage(true)}
             sharedServerStates={managedSharedServerStateById}
+            returnHintServerId={showSharedReturnGuide ? sharedReturnServer?.id : null}
           />
           <Sidebar
             collapsed={sidebarCollapsed}
@@ -4972,7 +5032,7 @@ export function App() {
             return (
               <button
                 key={server.id}
-                class={`server-item${server.id === selectedServerId ? ' active' : ''}${online ? '' : ' offline'}`}
+                class={`server-item${server.id === selectedServerId ? ' active' : ''}${online ? '' : ' offline'}${showSharedReturnGuide && server.id === sharedReturnServer?.id ? ' server-return-hint' : ''}`}
                 onClick={() => handleSelectServer(server.id, server.name)}
                 onContextMenu={(e) => { e.preventDefault(); setServerCtxMenu({ server, x: e.clientX, y: e.clientY }); }}
               >
@@ -5094,7 +5154,7 @@ export function App() {
                       return (
                         <button
                           key={s.id}
-                          class={`mobile-server-menu-item${s.id === selectedServerId ? ' active' : ''}`}
+                          class={`mobile-server-menu-item${s.id === selectedServerId ? ' active' : ''}${showSharedReturnGuide && s.id === sharedReturnServer?.id ? ' server-return-hint' : ''}`}
                           onClick={() => { handleSelectServer(s.id, s.name); setShowMobileServerMenu(false); }}
                         >
                           <span style={{ color: online ? '#4ade80' : '#475569' }}>{online ? '●' : '○'}</span>
@@ -5560,7 +5620,7 @@ export function App() {
                     return (
                       <button
                         key={s.id}
-                        class={`server-item${s.id === selectedServerId ? ' active' : ''}${online ? '' : ' offline'}`}
+                        class={`server-item${s.id === selectedServerId ? ' active' : ''}${online ? '' : ' offline'}${showSharedReturnGuide && s.id === sharedReturnServer?.id ? ' server-return-hint' : ''}`}
                         onClick={() => { handleSelectServer(s.id, s.name); closeSidebar(); }}
                       >
                         <span class="server-item-dot" style={{ color: online ? '#4ade80' : '#475569' }}>

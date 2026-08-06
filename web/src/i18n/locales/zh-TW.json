@@ -171,6 +171,11 @@
       "title": "別人分享給我",
       "empty": "沒有分享的標籤或伺服器",
       "refresh": "重新整理分享存取",
+      "guideEyebrow": "分享檢視",
+      "guideTitle": "你已切換到別人分享的內容",
+      "guideBody": "你自己的伺服器仍然保留。點擊伺服器列表中的 {{server}}，或使用下方按鈕即可返回。",
+      "guideReturn": "返回 {{server}}",
+      "guideDismiss": "知道了",
       "kind": {
         "server": "伺服器",
         "tab": "標籤",

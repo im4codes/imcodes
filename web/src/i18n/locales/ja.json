@@ -171,6 +171,11 @@
       "title": "自分に共有",
       "empty": "共有されたタブまたはサーバーはありません",
       "refresh": "共有アクセスを更新",
+      "guideEyebrow": "共有ビュー",
+      "guideTitle": "共有コンテンツに切り替わりました",
+      "guideBody": "自分のサーバーはそのまま利用できます。サーバー一覧の {{server}}、または下のボタンを押すと戻れます。",
+      "guideReturn": "{{server}} に戻る",
+      "guideDismiss": "了解",
       "kind": {
         "server": "サーバー",
         "tab": "タブ",
