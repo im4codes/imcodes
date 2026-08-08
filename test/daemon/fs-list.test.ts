@@ -19,6 +19,7 @@ const mockPreviewCoordinator = vi.hoisted(() => ({
   handle: vi.fn(),
   invalidate: vi.fn(),
 }));
+const mockLookupAttachment = vi.hoisted(() => vi.fn());
 
 // ── Mock fs/promises ───────────────────────────────────────────────────────
 vi.mock('node:fs/promises', () => ({
@@ -37,6 +38,11 @@ vi.mock('../../src/daemon/file-preview-read-coordinator.js', () => ({
   getDefaultPreviewReadCoordinator: vi.fn(() => mockPreviewCoordinator),
   __resetPreviewReadCoordinatorForTests: vi.fn(),
 }), { virtual: true });
+
+vi.mock('../../src/daemon/file-transfer-handler.js', async (importOriginal) => ({
+  ...await importOriginal<typeof import('../../src/daemon/file-transfer-handler.js')>(),
+  lookupAttachment: mockLookupAttachment,
+}));
 
 // ── Pull the handler function out of command-handler indirectly ────────────
 // We test via handleWebCommand to keep the test at the public API level.
@@ -64,6 +70,7 @@ describe('fs.ls handler', () => {
     // Restore send implementation after clearAllMocks resets it
     mockServerLink.send.mockImplementation((msg: unknown) => { sent.push(msg); });
     mockPreviewCoordinator.handle.mockImplementation(() => {});
+    mockLookupAttachment.mockReturnValue(undefined);
     mockStat.mockResolvedValue({ mtimeMs: 1, size: 0 } as any);
   });
 
@@ -205,6 +212,88 @@ describe('fs.ls handler', () => {
     expect(sent[0]).toMatchObject({
       type: 'fs.read_response',
       requestId: 'read-session-outside',
+      status: 'error',
+      error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH,
+    });
+  });
+
+  it('allows an exact live registered upload to be previewed from a shared session', async () => {
+    const projectDir = path.join(homedir(), 'project');
+    const uploadRoot = path.join(homedir(), '.imcodes', 'uploads');
+    const uploadPath = path.join(uploadRoot, '392836a75fc67a4ff38c2dcedc9afe32.png');
+    vi.spyOn(sessionStore, 'getSession').mockReturnValue({ name: 'deck_project_brain', projectDir } as never);
+    mockLookupAttachment.mockReturnValue({
+      id: path.basename(uploadPath),
+      daemonPath: uploadPath,
+      source: 'upload',
+      createdAt: Date.now(),
+      expiresAt: Date.now() + 60_000,
+    });
+    vi.mocked(fsp.lstat).mockResolvedValue({ isSymbolicLink: () => false, isFile: () => true } as fsp.Stats);
+    mockRealpath.mockImplementation(async (target) => String(target));
+
+    handleWebCommand({
+      type: 'fs.read',
+      path: uploadPath,
+      requestId: 'read-shared-upload',
+      sessionName: 'deck_project_brain',
+    }, mockServerLink as any);
+    await flushAsync();
+
+    expect(sent).toEqual([]);
+    expect(mockPreviewCoordinator.handle).toHaveBeenCalledWith(uploadPath, 'read-shared-upload', expect.any(Function));
+  });
+
+  it('keeps unregistered files in the upload directory outside shared-session reach', async () => {
+    const projectDir = path.join(homedir(), 'project');
+    const uploadPath = path.join(homedir(), '.imcodes', 'uploads', 'not-registered.png');
+    vi.spyOn(sessionStore, 'getSession').mockReturnValue({ name: 'deck_project_brain', projectDir } as never);
+    vi.mocked(fsp.lstat).mockResolvedValue({ isSymbolicLink: () => false, isFile: () => true } as fsp.Stats);
+    mockRealpath.mockImplementation(async (target) => String(target));
+
+    handleWebCommand({
+      type: 'fs.read',
+      path: uploadPath,
+      requestId: 'read-unregistered-upload',
+      sessionName: 'deck_project_brain',
+    }, mockServerLink as any);
+    await flushAsync();
+
+    expect(mockPreviewCoordinator.handle).not.toHaveBeenCalled();
+    expect(sent[0]).toMatchObject({
+      type: 'fs.read_response',
+      requestId: 'read-unregistered-upload',
+      status: 'error',
+      error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH,
+    });
+  });
+
+  it('rejects an upload-labeled registry entry outside the daemon upload root', async () => {
+    const projectDir = path.join(homedir(), 'project');
+    const outsidePath = path.join(homedir(), 'other', 'registry-poisoned.png');
+    vi.spyOn(sessionStore, 'getSession').mockReturnValue({ name: 'deck_project_brain', projectDir } as never);
+    mockLookupAttachment.mockReturnValue({
+      id: path.basename(outsidePath),
+      daemonPath: outsidePath,
+      source: 'upload',
+      createdAt: Date.now(),
+      expiresAt: Date.now() + 60_000,
+    });
+    vi.mocked(fsp.lstat).mockResolvedValue({ isSymbolicLink: () => false, isFile: () => true } as fsp.Stats);
+    mockRealpath.mockImplementation(async (target) => String(target));
+
+    handleWebCommand({
+      type: 'fs.read',
+      path: outsidePath,
+      requestId: 'read-poisoned-upload',
+      sessionName: 'deck_project_brain',
+    }, mockServerLink as any);
+    await flushAsync();
+
+    expect(mockPreviewCoordinator.handle).not.toHaveBeenCalled();
+    expect(sent[0]).toMatchObject({
+      type: 'fs.read_response',
+      requestId: 'read-poisoned-upload',
       status: 'error',
       error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH,
     });

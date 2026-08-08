@@ -8155,6 +8155,39 @@ function isSameOrInsidePath(root: string, candidate: string): boolean {
   return relative === '' || (!!relative && !relative.startsWith('..') && !nodePath.isAbsolute(relative));
 }
 
+/**
+ * Shared file reads are normally confined to the session project root. Chat
+ * attachments are the one deliberate exception: uploads live under the
+ * daemon-owned ~/.imcodes/uploads directory, outside every project root.
+ *
+ * Keep the exception capability-based rather than directory-based. The exact
+ * path must still be a live upload entry in the attachment registry, must be a
+ * regular non-symlink file, and must remain inside the canonical upload root.
+ * This permits previews/download-handle minting without exposing directory
+ * listing or arbitrary files beside an attachment.
+ */
+async function resolveRegisteredUploadReadTarget(rawPath: string): Promise<string | null> {
+  const entry = lookupAttachment(rawPath);
+  if (!entry || entry.source !== 'upload' || Date.now() > entry.expiresAt) return null;
+
+  const uploadRoot = nodePath.resolve(homedir(), '.imcodes', 'uploads');
+  const registeredPath = nodePath.resolve(entry.daemonPath);
+  if (registeredPath === uploadRoot || !isSameOrInsidePath(uploadRoot, registeredPath)) return null;
+
+  try {
+    const linkStats = await fsLstat(registeredPath);
+    if (linkStats.isSymbolicLink() || !linkStats.isFile()) return null;
+    const [realRoot, realTarget] = await Promise.all([
+      fsRealpath(uploadRoot),
+      fsRealpath(registeredPath),
+    ]);
+    if (!isSameOrInsidePath(realRoot, realTarget) || !isPathAllowed(realTarget)) return null;
+    return realTarget;
+  } catch {
+    return null;
+  }
+}
+
 async function resolveFsSessionRoot(cmd: Record<string, unknown>): Promise<
   | { ok: true; realRoot?: string }
   | { ok: false; error: string }
@@ -9038,6 +9071,13 @@ async function handleFsRead(cmd: Record<string, unknown>, serverLink: ServerLink
   if (sessionRoot.realRoot) {
     const target = await resolveExistingFsMutationTarget(rawPath, sessionRoot.realRoot);
     if (!target.ok) {
+      const registeredUpload = target.error === FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH
+        ? await resolveRegisteredUploadReadTarget(rawPath)
+        : null;
+      if (registeredUpload) {
+        getDefaultPreviewReadCoordinator().handle(registeredUpload, requestId, (message) => serverLink.send(message));
+        return;
+      }
       try { serverLink.send({ type: 'fs.read_response', requestId, path: rawPath, status: 'error', error: target.error }); } catch { /* ignore */ }
       return;
     }

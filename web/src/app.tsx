@@ -5923,6 +5923,7 @@ export function App() {
             ws={wsRef.current}
             serverId={selectedServerId ?? undefined}
             sessionName={previewFileRequest.sessionName ?? activeSession ?? undefined}
+            scopeToSessionRoot={!!previewFileRequest.sessionName}
             mode="file-single"
             layout="panel"
             initialPath={getFilePreviewInitialPath(previewFileRequest)}

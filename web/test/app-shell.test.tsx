@@ -352,6 +352,7 @@ vi.mock('../src/components/SessionPane.js', () => ({
     onInputRef,
     onMobileFileBrowserClose,
     onPendingPrefillApplied,
+    onPreviewFile,
     onRenameSession,
     onScrollBottomFn,
     onSettings,
@@ -377,6 +378,10 @@ vi.mock('../src/components/SessionPane.js', () => ({
       <button onClick={onAfterAction}>pane-after-action</button>
       <button onClick={onMobileFileBrowserClose}>pane-close-mobile-files</button>
       <button onClick={onPendingPrefillApplied}>pane-prefill-applied</button>
+      <button onClick={() => onPreviewFile?.({
+        path: '/home/ai/.imcodes/uploads/392836a75fc67a4ff38c2dcedc9afe32.png',
+        sessionName: session.name,
+      })}>pane-preview-upload</button>
     </div>
   ),
 }));
@@ -591,8 +596,11 @@ vi.mock('../src/components/LocalWebPreviewPanel.js', () => ({
   ),
 }));
 vi.mock('../src/components/file-browser-lazy.js', () => ({
-  FileBrowser: ({ onClose, onConfirm, onPreviewStateChange }: any) => (
-    <div>
+  FileBrowser: ({ autoPreviewPath, onClose, onConfirm, onPreviewStateChange, scopeToSessionRoot }: any) => (
+    <div
+      data-testid={autoPreviewPath ? 'file-browser-preview' : 'file-browser'}
+      data-scope-to-session-root={String(!!scopeToSessionRoot)}
+    >
       file-browser
       <button onClick={() => onConfirm?.(['/work/alpha/src/index.ts'])}>file-confirm</button>
       <button onClick={() => onPreviewStateChange?.({ path: '/work/alpha/src/index.ts', preview: { status: 'loaded' } })}>file-preview-state</button>
@@ -1912,6 +1920,10 @@ describe('App shell', () => {
     expect(await screen.findByText('file-browser')).toBeTruthy();
     fireEvent.click(screen.getByText('file-confirm'));
     fireEvent.click(screen.getByText('file-preview-state'));
+    fireEvent.click(screen.getByText('file-close'));
+
+    fireEvent.click(screen.getByText('pane-preview-upload'));
+    expect((await screen.findByTestId('file-browser-preview')).getAttribute('data-scope-to-session-root')).toBe('true');
     fireEvent.click(screen.getByText('file-close'));
 
     fireEvent.click(screen.getByText('subbar-repo'));
