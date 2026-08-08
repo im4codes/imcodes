@@ -1750,13 +1750,14 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   //      hydration set by `buildSessionList()` for main sessions (first
   //      paint before the WS probe reply arrives).
   //   3. Provider-specific fallback constants where available.
-  const dynamicModelsAgentType = supportsDynamicTransportModels(activeSession?.agentType)
+  const dynamicModelsAgentType = canSharedSessionSend && supportsDynamicTransportModels(activeSession?.agentType)
     ? activeSession!.agentType
     : null;
   const dynamicTransportModels = useTransportModels(
     ws,
     dynamicModelsAgentType,
     activeSession?.agentType === 'claude-code-sdk' ? activeSession.ccPreset : undefined,
+    activeSession?.name,
   );
   const genericTransportModelSuggestions: readonly string[] = useMemo(() => {
     if (dynamicTransportModels.models.length > 0) {

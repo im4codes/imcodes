@@ -3838,7 +3838,9 @@ export class WsBridge {
 
   private shareAuditActionTypeForCommand(msg: Record<string, unknown>): ShareAuditActionType | null {
     const type = typeof msg.type === 'string' ? msg.type : '';
-    if (type === 'session.send' || type === 'subsession.set_model') return 'session.send';
+    if (type === 'session.send'
+      || type === 'subsession.set_model'
+      || type === TRANSPORT_MSG.LIST_MODELS) return 'session.send';
     if (type === DAEMON_COMMAND_TYPES.SESSION_CANCEL) return 'session.cancel';
     if (type === 'discussion.start') return 'p2p.orchestration';
     return null;
@@ -3861,10 +3863,11 @@ export class WsBridge {
     const type = typeof msg.type === 'string' ? msg.type : '';
     if (type !== 'session.send'
       && type !== 'subsession.set_model'
+      && type !== TRANSPORT_MSG.LIST_MODELS
       && type !== DAEMON_COMMAND_TYPES.SESSION_CANCEL) return null;
     const commandId = typeof msg.commandId === 'string' ? msg.commandId.trim() : '';
     if (commandId && this.inflightCommands.has(commandId)) return null;
-    if (type === 'session.send' || type === 'subsession.set_model') {
+    if (type === 'session.send' || type === 'subsession.set_model' || type === TRANSPORT_MSG.LIST_MODELS) {
       const pending = [...this.inflightCommands.values()].filter((entry) => (
         entry.share?.userId === state.userId
         && entry.sessionName === sessionName

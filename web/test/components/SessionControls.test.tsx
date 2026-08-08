@@ -7638,6 +7638,11 @@ afterEach(() => {
     const modelButton = screen.getByRole('button', { name: /^gpt-5.4$/i }) as HTMLButtonElement;
     expect(modelButton.disabled).toBe(false);
     expect((screen.getByTitle('actions') as HTMLButtonElement).disabled).toBe(true);
+    expect(ws.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: TRANSPORT_MSG.LIST_MODELS,
+      sessionName: 'shared-copilot-session',
+      agentType: 'copilot-sdk',
+    }));
 
     fireEvent.click(modelButton);
     fireEvent.click(screen.getByRole('button', { name: /gpt-5.4-mini/i }));
@@ -7666,6 +7671,9 @@ afterEach(() => {
 
     const modelButton = screen.getByRole('button', { name: /^gpt-5.4$/i }) as HTMLButtonElement;
     expect(modelButton.disabled).toBe(true);
+    expect(ws.send).not.toHaveBeenCalledWith(expect.objectContaining({
+      type: TRANSPORT_MSG.LIST_MODELS,
+    }));
     expect(document.querySelector('.menu-dropdown')).toBeFalsy();
     expect(gatherSendCalls(ws)).toHaveLength(0);
   });

@@ -10318,6 +10318,7 @@ async function handleTransportListModels(
 ): Promise<void> {
   const agentType = typeof cmd.agentType === 'string' ? cmd.agentType : '';
   const ccPreset = typeof cmd.ccPreset === 'string' ? cmd.ccPreset.trim() : '';
+  const sessionName = typeof cmd.sessionName === 'string' ? cmd.sessionName.trim() : '';
   const requestId = typeof cmd.requestId === 'string' ? cmd.requestId : undefined;
   const force = cmd.force === true;
   const reply = (payload: {
@@ -10330,6 +10331,7 @@ async function handleTransportListModels(
       serverLink.send({
         type: TRANSPORT_MSG.MODELS_RESPONSE,
         agentType,
+        ...(sessionName ? { sessionName } : {}),
         ...(ccPreset ? { ccPreset } : {}),
         ...(requestId ? { requestId } : {}),
         ...payload,

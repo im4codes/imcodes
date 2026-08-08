@@ -69,6 +69,7 @@ type ShareCommandPolicy =
   | { kind: 'participant-discussion-start' }
   | { kind: 'participant-send' }
   | { kind: 'participant-model-switch' }
+  | { kind: 'participant-model-list' }
   | { kind: 'participant-cancel' }
   | { kind: 'deny'; reason: ShareReason };
 
@@ -93,6 +94,17 @@ export const SHARE_REASONS = {
   COMMENT_INVALID: 'share-comment-invalid',
 } as const satisfies Record<string, ShareReason>;
 
+const SHARE_MODEL_CATALOG_AGENT_TYPES = new Set([
+  'claude-code-sdk',
+  'copilot-sdk',
+  'cursor-headless',
+  'codex-sdk',
+  'opencode-sdk',
+  'gemini-sdk',
+  'grok-sdk',
+  'kimi-sdk',
+]);
+
 function denyFromShared(sharedCommand: string): ShareCommandPolicy {
   const policy = getShareScopedCommandPolicy(sharedCommand);
   if (policy.disposition !== 'deny' || !policy.reason) {
@@ -115,6 +127,7 @@ export const SHARE_WS_COMMAND_POLICY_INVENTORY: readonly ShareBridgeCommandInven
   { bridgeCommand: 'discussion.start', sharedCommand: SHARE_BROWSER_COMMANDS.DISCUSSION_START, policy: { kind: 'participant-discussion-start' } },
   { bridgeCommand: 'session.send', sharedCommand: SHARE_BROWSER_COMMANDS.SESSION_SEND, policy: { kind: 'participant-send' } },
   { bridgeCommand: 'subsession.set_model', sharedCommand: SHARE_BROWSER_COMMANDS.SESSION_MODEL_SWITCH, policy: { kind: 'participant-model-switch' } },
+  { bridgeCommand: TRANSPORT_MSG.LIST_MODELS, sharedCommand: SHARE_BROWSER_COMMANDS.SESSION_MODEL_LIST, policy: { kind: 'participant-model-list' } },
   { bridgeCommand: DAEMON_COMMAND_TYPES.SESSION_CANCEL, sharedCommand: SHARE_BROWSER_COMMANDS.SESSION_CANCEL, policy: { kind: 'participant-cancel' } },
   { bridgeCommand: 'discussion.comment', sharedCommand: SHARE_BROWSER_COMMANDS.DISCUSSION_COMMENT, policy: { kind: 'allow-covered-read', requireTarget: false } },
   { bridgeCommand: 'fs.ls', sharedCommand: SHARE_BROWSER_COMMANDS.FILE_BROWSE, policy: { kind: 'allow-covered-read', requireTarget: true } },
@@ -225,6 +238,10 @@ export const SHARE_SCOPED_DAEMON_MESSAGE_POLICY = new Map<string, DaemonMessageP
   [TRANSPORT_MSG.CHAT_HISTORY, {
     target: sessionIdFieldTarget,
     redact: redactTransportHistory,
+  }],
+  [TRANSPORT_MSG.MODELS_RESPONSE, {
+    target: sessionNameFieldTarget,
+    redact: redactParticipantModelCatalog,
   }],
   ['chat.delta', { target: sessionIdFieldTarget }],
   ['chat.complete', { target: sessionIdFieldTarget }],
@@ -366,6 +383,27 @@ export function evaluateShareCommand(input: {
     return {
       allowed: true,
       stampedMessage: { ...safeMessage, model },
+    };
+  }
+
+  if (policy.kind === 'participant-model-list') {
+    if (!sessionName || !shareStateCoversSession(input.state, sessionName)) {
+      return { allowed: false, reason: SHARE_REASONS.DIRECT_SURFACE_DENIED };
+    }
+    const agentType = typeof input.msg.agentType === 'string' ? input.msg.agentType.trim() : '';
+    const requestId = typeof input.msg.requestId === 'string' ? input.msg.requestId.trim() : '';
+    if (!SHARE_MODEL_CATALOG_AGENT_TYPES.has(agentType) || !requestId || requestId.length > 256) {
+      return { allowed: false, reason: SHARE_REASONS.DIRECT_SURFACE_DENIED };
+    }
+    return {
+      allowed: true,
+      stampedMessage: {
+        type: TRANSPORT_MSG.LIST_MODELS,
+        sessionName,
+        agentType,
+        requestId,
+        ...(input.msg.force === true ? { force: true } : {}),
+      },
     };
   }
 
@@ -740,6 +778,10 @@ function redactSessionList(msg: Record<string, unknown>, state: ShareScopedSocke
 
 function redactTransportHistory(msg: Record<string, unknown>, _state: ShareScopedSocketState): Record<string, unknown> | null {
   return msg;
+}
+
+function redactParticipantModelCatalog(msg: Record<string, unknown>, state: ShareScopedSocketState): Record<string, unknown> | null {
+  return state.snapshot.effectiveRole === 'participant' ? msg : null;
 }
 
 function redactActiveDispatchForViewers(msg: Record<string, unknown>, state: ShareScopedSocketState): Record<string, unknown> | null {

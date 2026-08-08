@@ -417,6 +417,7 @@ describe('WsBridge share-scoped sockets', () => {
       } else if (
         actualPolicy?.kind === 'participant-send'
         || actualPolicy?.kind === 'participant-model-switch'
+        || actualPolicy?.kind === 'participant-model-list'
         || actualPolicy?.kind === 'participant-cancel'
         || actualPolicy?.kind === 'participant-discussion-start'
         || actualPolicy?.kind === 'participant-covered-action'
@@ -839,6 +840,51 @@ describe('WsBridge share-scoped sockets', () => {
       }),
     ]));
     expect(daemon.sentJson.filter((msg) => msg.type === 'subsession.set_model')).toHaveLength(1);
+
+    participant.emit('message', JSON.stringify({
+      type: TRANSPORT_MSG.LIST_MODELS,
+      sessionName: 'deck_sub_child_1',
+      agentType: 'grok-sdk',
+      requestId: 'models-participant',
+      force: true,
+      ccPreset: 'must-not-cross-share-boundary',
+      unexpected: 'drop-me',
+    }));
+    viewer.emit('message', JSON.stringify({
+      type: TRANSPORT_MSG.LIST_MODELS,
+      sessionName: 'deck_sub_child_1',
+      agentType: 'grok-sdk',
+      requestId: 'models-viewer',
+    }));
+    await flushAsync();
+
+    const modelRequests = daemon.sentJson.filter((msg) => msg.type === TRANSPORT_MSG.LIST_MODELS);
+    expect(modelRequests).toEqual([{
+      type: TRANSPORT_MSG.LIST_MODELS,
+      sessionName: 'deck_sub_child_1',
+      agentType: 'grok-sdk',
+      requestId: 'models-participant',
+      force: true,
+    }]);
+    participant.sent.length = 0;
+    viewer.sent.length = 0;
+    daemon.emit('message', JSON.stringify({
+      type: TRANSPORT_MSG.MODELS_RESPONSE,
+      sessionName: 'deck_sub_child_1',
+      agentType: 'grok-sdk',
+      requestId: 'models-participant',
+      models: [{ id: 'grok-code-fast-1' }],
+    }));
+    await flushAsync();
+
+    expect(participant.sentJson).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: TRANSPORT_MSG.MODELS_RESPONSE,
+        requestId: 'models-participant',
+        models: [{ id: 'grok-code-fast-1' }],
+      }),
+    ]));
+    expect(viewer.sentJson.some((msg) => msg.type === TRANSPORT_MSG.MODELS_RESPONSE)).toBe(false);
     expect(auditRows).toEqual(expect.arrayContaining([
       expect.objectContaining({ actionType: 'session.send', decision: 'accepted', actorUserId: 'participant-user' }),
       expect.objectContaining({ actionType: 'session.send', decision: 'rejected', actorUserId: 'participant-user', reason: SHARE_REASONS.DIRECT_SURFACE_DENIED }),

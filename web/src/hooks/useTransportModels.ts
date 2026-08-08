@@ -36,6 +36,7 @@ export function useTransportModels(
   ws: WsClient | null,
   agentType: string | undefined | null,
   ccPreset?: string | null,
+  sessionName?: string | null,
 ): TransportModelState & { refresh: () => void } {
   const [state, setState] = useState<TransportModelState>({ models: [], loading: false });
   const pendingRequestId = useRef<string | null>(null);
@@ -64,6 +65,7 @@ export function useTransportModels(
           type: TRANSPORT_MSG.LIST_MODELS,
           agentType,
           requestId,
+          ...(sessionName?.trim() ? { sessionName: sessionName.trim() } : {}),
           ...(ccPreset?.trim() ? { ccPreset: ccPreset.trim() } : {}),
           ...(force ? { force: true } : {}),
         });
@@ -75,7 +77,7 @@ export function useTransportModels(
         });
       }
     },
-    [ws, wsConnected, agentType, ccPreset, catalogIdentity],
+    [ws, wsConnected, agentType, ccPreset, sessionName, catalogIdentity],
   );
 
   useEffect(() => {

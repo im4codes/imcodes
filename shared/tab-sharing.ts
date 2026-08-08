@@ -142,6 +142,7 @@ export const SHARE_BROWSER_COMMANDS = {
   P2P_CONFIG_SAVE: 'p2p.config.save',
   SESSION_SEND: 'session.send',
   SESSION_MODEL_SWITCH: 'session.model_switch',
+  SESSION_MODEL_LIST: 'session.model_list',
   SESSION_CANCEL: 'session.cancel',
   SESSION_STOP: 'session.stop',
   SESSION_START: 'session.start',
@@ -208,6 +209,7 @@ export const SHARE_SCOPED_COMMAND_POLICY = {
   [SHARE_BROWSER_COMMANDS.P2P_CANCEL]: deny('direct-surface', 'share-direct-surface-denied'),
   [SHARE_BROWSER_COMMANDS.SESSION_SEND]: allowParticipant('concrete-tab'),
   [SHARE_BROWSER_COMMANDS.SESSION_MODEL_SWITCH]: allowParticipant('concrete-tab'),
+  [SHARE_BROWSER_COMMANDS.SESSION_MODEL_LIST]: allowParticipant('concrete-tab'),
   [SHARE_BROWSER_COMMANDS.SESSION_CANCEL]: {
     ...allowParticipant('concrete-tab'),
     requiresObservedDispatchId: true,
