@@ -15,6 +15,7 @@ import { SessionActionMenuIcon } from './SessionActionMenuIcon.js';
 import * as VoiceInput from './VoiceInput.js';
 import { VoiceOverlay } from './VoiceOverlay.js';
 import { AtPicker } from './AtPicker.js';
+import { FS_SESSION_ROOT_PATH } from '../../../src/shared/transport/fs.js';
 import { QuickAgentDelegationDialog, type QuickAgentDelegationCandidate } from './QuickAgentDelegationDialog.js';
 import { useAliases } from '../hooks/useAliases.js';
 import { insertAliasMarkerAtCaret } from '../util/alias-insert.js';
@@ -4293,6 +4294,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         const result = await uploadFileWithDirectFallback({
           ws,
           serverId,
+          ...(isShareScopedSession && activeSession?.name ? { sessionName: activeSession.name } : {}),
           file,
           onProgress: (pct) => {
             updateComposerUploadProgress(uploadKey, uploadItem.id, pct);
@@ -4358,7 +4360,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     }
     removeComposerUploadItems(uploadKey, uploadItems.map((item) => item.id));
     return successfulAttachments.length > 0;
-  }, [attachmentDraftKey, composerUploadKey, serverId, t]);
+  }, [activeSession?.name, attachmentDraftKey, composerUploadKey, isShareScopedSession, serverId, t]);
 
   const handleCancelUpload = useCallback((item: ComposerUploadItem) => {
     if (!window.confirm(t('upload.cancel_confirm', { name: item.name }))) return;
@@ -4372,7 +4374,11 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     setDeletingAttachmentKeys((current) => new Set(current).add(attachmentKey));
     try {
       if (inferredId && (attachment.serverId || serverId)) {
-        await deleteAttachment(attachment.serverId || serverId!, inferredId);
+        if (isShareScopedSession && activeSession?.name) {
+          await deleteAttachment(attachment.serverId || serverId!, inferredId, activeSession.name);
+        } else {
+          await deleteAttachment(attachment.serverId || serverId!, inferredId);
+        }
       }
       setAttachments((current) => renumberAttachments(current.filter((entry) => entry !== attachment)));
     } catch (error) {
@@ -4386,7 +4392,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         return next;
       });
     }
-  }, [composerUploadKey, deletingAttachmentKeys, serverId, t]);
+  }, [activeSession?.name, composerUploadKey, deletingAttachmentKeys, isShareScopedSession, serverId, t]);
 
   const handleFileUpload = useCallback(async (files: FileList | null) => {
     if (!files || files.length === 0) return;
@@ -4677,6 +4683,8 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
             ws={ws}
             serverId={serverId}
             sessionName={activeSession.name}
+            scopeToSessionRoot={isShareScopedSession}
+            readOnly={isShareScopedSession && !canSharedSessionSend}
             mode="file-multi"
           layout="panel"
           initialPath={activeSession.projectDir ?? '~'}
@@ -4707,6 +4715,8 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
             ws={ws}
             serverId={serverId}
             sessionName={activeSession.name}
+            scopeToSessionRoot={isShareScopedSession}
+            readOnly={isShareScopedSession && !canSharedSessionSend}
             mode="file-multi"
             layout="panel"
             initialPath={openSpecFolderPath}
@@ -5830,7 +5840,10 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
             ]}
             rootSession={rootSession}
             wsClient={ws}
-            projectDir={activeSession.projectDir ?? ''}
+            projectDir={isShareScopedSession
+              ? (activeSession.projectDir ?? FS_SESSION_ROOT_PATH)
+              : (activeSession.projectDir ?? '')}
+            sessionName={isShareScopedSession ? activeSession.name : undefined}
             onSelectFile={(path) => {
               const text = divRef.current ? readComposerElementText(divRef.current) : '';
               const before = text.replace(/@[^\s@]*$/, '');

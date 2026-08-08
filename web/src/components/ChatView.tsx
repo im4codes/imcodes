@@ -108,6 +108,10 @@ interface Props {
   agentType?: string | null;
   /** Server ID for file transfer download API. */
   serverId?: string;
+  /** Shared viewers may browse/preview/download but cannot mutate files. */
+  readOnlyFiles?: boolean;
+  /** Constrain file operations to this session's canonical project root. */
+  scopeFilesToSession?: boolean;
   /** Retry a failed optimistic send — called with the original commandId and text. */
   onResendFailed?: (commandId: string, text: string) => void;
 }
@@ -1561,9 +1565,10 @@ function SdkAgentsDiagnosticRow({ diagnostic }: { diagnostic: SdkSubagentDiagnos
   );
 }
 
-function ChatViewImpl({ events, loading, refreshing = false, historyStatus, loadingOlder, hasOlderHistory = true, onLoadOlder, sessionState, sessionId, onScrollBottomFn, preview, onPreviewFile, ws, onInsertPath, workdir, onViewRepo, serverId, onQuote, agentType: _agentType, onResendFailed, onForceSync }: Props) {
+function ChatViewImpl({ events, loading, refreshing = false, historyStatus, loadingOlder, hasOlderHistory = true, onLoadOlder, sessionState, sessionId, onScrollBottomFn, preview, onPreviewFile, ws, onInsertPath, workdir, onViewRepo, serverId, readOnlyFiles = false, scopeFilesToSession = false, onQuote, agentType: _agentType, onResendFailed, onForceSync }: Props) {
   const { t, i18n } = useTranslation();
   const locale = resolveI18nLocale(i18n);
+  const fileScopeSessionName = scopeFilesToSession ? (sessionId ?? undefined) : undefined;
   const [syncDisabled, setSyncDisabled] = useState(false);
   const handleForceSync = useCallback(() => {
     if (syncDisabled || !onForceSync) return;
@@ -1759,14 +1764,14 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
     const viewMode = previewViewMode ?? (preferDiff ? 'diff' : 'source');
     onPreviewFile({
       path: resolvedPath,
-      sessionName: sessionId ?? undefined,
+      sessionName: fileScopeSessionName,
       preferDiff: viewMode === 'diff' && preferDiff,
       previewViewMode: viewMode,
       preview: { status: 'loading', path: resolvedPath },
       rootPath: workdir ?? undefined,
       sourcePreviewLive: false,
     });
-  }, [onPreviewFile, workdir]);
+  }, [fileScopeSessionName, onPreviewFile, workdir]);
 
   const handlePathClick = useCallback((path: string) => {
     openFilePreview(path, false);
@@ -1795,7 +1800,7 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
       return;
     }
     try {
-      const requestId = ws.fsReadFile(resolvedPath);
+      const requestId = fileScopeSessionName ? ws.fsReadFile(resolvedPath, fileScopeSessionName) : ws.fsReadFile(resolvedPath);
       setHtmlFullscreenPreview({ status: 'loading', path: resolvedPath, requestId });
     } catch (err) {
       setHtmlFullscreenPreview({
@@ -1804,7 +1809,7 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
         error: mapPreviewDispatchError(err),
       });
     }
-  }, [mapPreviewDispatchError, t, workdir, ws]);
+  }, [fileScopeSessionName, mapPreviewDispatchError, t, workdir, ws]);
 
   const closeHtmlFullscreenPreview = useCallback(() => {
     setHtmlFullscreenPreview(null);
@@ -1853,7 +1858,7 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
         unsub?.();
       };
       try {
-        const reqId = ws.fsReadFile(path);
+        const reqId = fileScopeSessionName ? ws.fsReadFile(path, fileScopeSessionName) : ws.fsReadFile(path);
         timer = setTimeout(() => {
           cleanup();
           reject(new Error(t('upload.download_timeout')));
@@ -1876,7 +1881,7 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
         reject(new Error(mapDownloadError(err)));
       }
     })
-  ), [mapDownloadError, t, ws]);
+  ), [fileScopeSessionName, mapDownloadError, t, ws]);
 
   const handleImagePreview = useCallback<ChatLocalImagePreviewLoader>((path: string) => (
     new Promise((resolve, reject) => {
@@ -1897,7 +1902,7 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
 
       getCachedChatLocalImagePreview(cacheKey, () => new Promise<ChatLocalImagePreviewResult>((resolveCached, rejectCached) => {
         try {
-          const reqId = ws.fsReadFile(resolvedPath);
+          const reqId = fileScopeSessionName ? ws.fsReadFile(resolvedPath, fileScopeSessionName) : ws.fsReadFile(resolvedPath);
           timer = setTimeout(() => {
             cleanup();
             rejectCached(new Error(t('upload.download_timeout')));
@@ -1924,7 +1929,7 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
         }
       })).then(resolve, reject);
     })
-  ), [serverId, sessionId, t, workdir, ws]);
+  ), [fileScopeSessionName, serverId, sessionId, t, workdir, ws]);
 
   const handleDownload = useCallback<ChatPathDownloadHandler>(async (path: string) => {
     if (!serverId) throw new Error(t('upload.daemon_offline'));
@@ -1932,19 +1937,21 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
     let downloadId = await requestPathDownloadId(resolvedPath);
     const { downloadAttachment } = await import('../api.js');
     try {
-      await downloadAttachment(serverId, downloadId);
+      if (sessionId) await downloadAttachment(serverId, downloadId, sessionId);
+      else await downloadAttachment(serverId, downloadId);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       const isStaleHandle = msg.includes('410') || msg.includes('expired') || msg.includes('not_found') || msg.includes('404');
       if (!isStaleHandle) throw new Error(mapDownloadError(err));
       downloadId = await requestPathDownloadId(resolvedPath);
       try {
-        await downloadAttachment(serverId, downloadId);
+        if (sessionId) await downloadAttachment(serverId, downloadId, sessionId);
+        else await downloadAttachment(serverId, downloadId);
       } catch (retryErr) {
         throw new Error(mapDownloadError(retryErr));
       }
     }
-  }, [mapDownloadError, requestPathDownloadId, serverId, t, workdir]);
+  }, [mapDownloadError, requestPathDownloadId, serverId, sessionId, t, workdir]);
 
   const pathClickHandler = ws && !preview ? handlePathClick : undefined;
   const htmlPreviewHandler = ws && typeof ws.fsReadFile === 'function' && !preview ? handleHtmlPreview : undefined;
@@ -3136,15 +3143,16 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
             }
             const linkedEvents = item.linkedEvents ?? [];
             if (linkedEvents.length === 0) {
-              return <ChatEvent key={item.key} event={item.event!} onPathClick={pathClickHandler} onUrlClick={urlClickHandler} onFileChangeOpen={fileChangeOpenHandler} onDownload={downloadHandler} onHtmlPreview={htmlPreviewHandler} onImagePreview={imagePreviewHandler} serverId={serverId} onResendFailed={onResendFailed} />;
+              return <ChatEvent key={item.key} event={item.event!} sessionName={sessionId ?? undefined} onPathClick={pathClickHandler} onUrlClick={urlClickHandler} onFileChangeOpen={fileChangeOpenHandler} onDownload={downloadHandler} onHtmlPreview={htmlPreviewHandler} onImagePreview={imagePreviewHandler} serverId={serverId} onResendFailed={onResendFailed} />;
             }
             return (
               <div key={item.key} class="chat-linked-event-group">
-                <ChatEvent event={item.event!} onPathClick={pathClickHandler} onUrlClick={urlClickHandler} onFileChangeOpen={fileChangeOpenHandler} onDownload={downloadHandler} onHtmlPreview={htmlPreviewHandler} onImagePreview={imagePreviewHandler} serverId={serverId} onResendFailed={onResendFailed} />
+                <ChatEvent event={item.event!} sessionName={sessionId ?? undefined} onPathClick={pathClickHandler} onUrlClick={urlClickHandler} onFileChangeOpen={fileChangeOpenHandler} onDownload={downloadHandler} onHtmlPreview={htmlPreviewHandler} onImagePreview={imagePreviewHandler} serverId={serverId} onResendFailed={onResendFailed} />
                 {linkedEvents.map((linkedEvent) => (
                   <ChatEvent
                     key={linkedEvent.eventId}
                     event={linkedEvent}
+                    sessionName={sessionId ?? undefined}
                     onPathClick={pathClickHandler}
                     onUrlClick={urlClickHandler}
                     onFileChangeOpen={fileChangeOpenHandler}
@@ -3300,6 +3308,8 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
               ws={ws}
               serverId={serverId}
               sessionName={sessionId ?? undefined}
+              scopeToSessionRoot={scopeFilesToSession}
+              readOnly={readOnlyFiles}
               mode="file-single"
               layout="panel"
               initialPath={workdir ?? '~'}
@@ -3872,11 +3882,13 @@ function AttachmentDownloadButton({
   serverId,
   onPathClick,
   onHtmlPreview,
+  sessionName,
 }: {
   att: { id: string; originalName?: string; size?: number; daemonPath?: string };
   serverId: string;
   onPathClick?: (p: string) => void;
   onHtmlPreview?: (p: string) => void;
+  sessionName?: string;
 }) {
   const { t } = useTranslation();
   const [error, setError] = useState<string | null>(null);
@@ -3905,7 +3917,10 @@ function AttachmentDownloadButton({
             return;
           }
           import('../api.js').then(({ previewAttachment }) => {
-            previewAttachment(serverId, att.id).catch(handleError);
+            const request = sessionName
+              ? previewAttachment(serverId, att.id, sessionName)
+              : previewAttachment(serverId, att.id);
+            request.catch(handleError);
           });
         }}
         title={error || label}
@@ -3917,7 +3932,10 @@ function AttachmentDownloadButton({
         onClick={() => {
           setError(null);
           import('../api.js').then(({ downloadAttachment }) => {
-            downloadAttachment(serverId, att.id).catch(handleError);
+            const request = sessionName
+              ? downloadAttachment(serverId, att.id, sessionName)
+              : downloadAttachment(serverId, att.id);
+            request.catch(handleError);
           });
         }}
         title={t('upload.download_file')}
@@ -3945,6 +3963,7 @@ function AttachmentDownloadButton({
 
 const ChatEvent = memo(function ChatEvent({
   event,
+  sessionName,
   onPathClick,
   onUrlClick,
   onFileChangeOpen,
@@ -3956,6 +3975,7 @@ const ChatEvent = memo(function ChatEvent({
   showTime,
 }: {
   event: TimelineEvent;
+  sessionName?: string;
   onPathClick?: (p: string) => void;
   onUrlClick?: (url: string) => void;
   onFileChangeOpen?: (path: string, preferDiff?: boolean) => void;
@@ -3996,7 +4016,7 @@ const ChatEvent = memo(function ChatEvent({
             </div>
           )}
           {attachments && serverId && attachments.map((att) => (
-            <AttachmentDownloadButton key={att.id} att={att} serverId={serverId} onPathClick={onPathClick} onHtmlPreview={onHtmlPreview} />
+            <AttachmentDownloadButton key={att.id} att={att} serverId={serverId} sessionName={sessionName} onPathClick={onPathClick} onHtmlPreview={onHtmlPreview} />
           ))}
           {userText && (
             <UserMessageText

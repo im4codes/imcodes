@@ -46,6 +46,8 @@ export interface FileEditorProps {
   onContentChange?: (content: string) => void;
   /** Dirty state driven by parent (FileEditorContent via FileBrowser) */
   isDirty?: boolean;
+  /** Session whose project directory scopes file writes. */
+  sessionName?: string;
 }
 
 /** Detect CodeMirror language extension from file path */
@@ -79,7 +81,7 @@ function isFileTooLargeSaveError(error: unknown): boolean {
   return message === FS_GENERIC_ERROR_CODES.FILE_TOO_LARGE || message.includes('Message too large');
 }
 
-export function FileEditor({ ws, path, content, mtime, onClose, onSaved, onMessage, currentContent, isDirty: isDirtyProp }: FileEditorProps) {
+export function FileEditor({ ws, path, content, mtime, onClose, onSaved, onMessage, currentContent, isDirty: isDirtyProp, sessionName }: FileEditorProps) {
   const { t } = useTranslation();
   const [originalMtime, setOriginalMtime] = useState(mtime);
   // Keep local mtime in sync when parent updates (e.g. after file reload or conflict resolution)
@@ -160,7 +162,10 @@ export function FileEditor({ ws, path, content, mtime, onClose, onSaved, onMessa
     setSaveError(null);
     let requestId: string;
     try {
-      requestId = ws.fsWriteFile(path, currentContent ?? content, forceWrite ? undefined : originalMtime);
+      requestId = ws.fsWriteFile(path, currentContent ?? content, {
+        ...(forceWrite ? {} : { expectedMtime: originalMtime }),
+        ...(sessionName ? { sessionName } : {}),
+      });
     } catch (error) {
       setSaveStatus('error');
       setSaveError(isFileTooLargeSaveError(error) ? t('fileBrowser.fileTooLarge') : t('fileBrowser.saveError'));
@@ -211,7 +216,7 @@ export function FileEditor({ ws, path, content, mtime, onClose, onSaved, onMessa
 }
 
 /** Editor content area — CodeMirror editor + conflict dialog */
-export function FileEditorContent({ ws, path, content, mtime: _mtime, onMessage, onDirtyChange, onContentChange, onSaved, onMtimeUpdate }: Omit<FileEditorProps, 'onClose'> & { onMtimeUpdate?: (mtime: number) => void }) {
+export function FileEditorContent({ ws, path, content, mtime: _mtime, onMessage, onDirtyChange, onContentChange, onSaved, onMtimeUpdate, sessionName }: Omit<FileEditorProps, 'onClose'> & { onMtimeUpdate?: (mtime: number) => void }) {
   const { t } = useTranslation();
   const [isDirty, setIsDirty] = useState(false);
   const [conflictData, setConflictData] = useState<{ diskContent: string; diskMtime: number } | null>(null);
@@ -315,7 +320,7 @@ export function FileEditorContent({ ws, path, content, mtime: _mtime, onMessage,
             <div class="fb-conflict-actions">
               <button class="btn btn-primary" onClick={() => {
                 setConflictData(null);
-                const requestId = ws.fsWriteFile(path, currentContentRef.current);
+                const requestId = ws.fsWriteFile(path, currentContentRef.current, sessionName ? { sessionName } : undefined);
                 pendingWriteRef.current.set(requestId, path);
               }}>{t('fileBrowser.conflictKeepMine')}</button>
               <button class="btn btn-secondary" onClick={() => {

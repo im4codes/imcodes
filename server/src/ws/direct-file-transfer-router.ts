@@ -236,8 +236,12 @@ export class DirectFileTransferRouter {
     this.routes.set(route.requestId, route);
     this.uploadIds.set(route.clientUploadId, route.requestId);
 
+    // sessionName is a browser→Server authorization hint for shared tabs. It
+    // is intentionally removed before the strict daemon/browser transfer
+    // authority is minted; the opaque route capability owns all later frames.
+    const { sessionName: _sessionName, ...transferInit } = init;
     const authority = {
-      ...init,
+      ...transferInit,
       capability,
       expiresAt,
       iceServers: resolvedIce.iceServers,

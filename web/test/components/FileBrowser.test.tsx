@@ -315,6 +315,74 @@ describe('FileBrowser', () => {
     expect(fsListDir).toHaveBeenCalledWith('~/projects', false, false);
   });
 
+  it('scopes shared-session browsing and keeps viewer file management read-only', async () => {
+    const { ws, fsListDir, fsMkdir, fsWriteFile, fsRename, fsDelete, respond } = makeWsFactory();
+    render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user/project"
+        sessionName="deck_project_brain"
+        scopeToSessionRoot
+        readOnly
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    expect(fsListDir).toHaveBeenCalledWith('/home/user/project', true, false, {
+      sessionName: 'deck_project_brain',
+    });
+    expect(screen.queryByTitle('New file')).toBeNull();
+    expect(screen.queryByTitle('New folder')).toBeNull();
+
+    await act(async () => { respond([{ name: 'shared.png', isDir: false }], '/home/user/project'); });
+    const row = screen.getByText('shared.png').closest('.fb-node');
+    expect(row).not.toBeNull();
+    fireEvent.contextMenu(row!);
+    expect(screen.queryByText('Rename')).toBeNull();
+    expect(screen.queryByText('Delete')).toBeNull();
+    expect(fsMkdir).not.toHaveBeenCalled();
+    expect(fsWriteFile).not.toHaveBeenCalled();
+    expect(fsRename).not.toHaveBeenCalled();
+    expect(fsDelete).not.toHaveBeenCalled();
+  });
+
+  it('does not narrow ordinary owned-session browsing to the project root', () => {
+    const { ws, fsListDir } = makeWsFactory();
+    render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        sessionName="deck_owned_brain"
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    expect(fsListDir).toHaveBeenCalledWith('/home/user', true, false);
+    expect(fsListDir).not.toHaveBeenCalledWith('/home/user', true, false, expect.anything());
+  });
+
+  it('opens a shared file manager at the virtual session root when projectDir is hidden', () => {
+    const { ws, fsListDir } = makeWsFactory();
+    render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        sessionName="deck_project_brain"
+        scopeToSessionRoot
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    expect(fsListDir).toHaveBeenCalledWith(':session-root:', true, false, {
+      sessionName: 'deck_project_brain',
+    });
+  });
+
   it('does NOT include files for dir-only mode', () => {
     const { ws, getIncludeFiles } = makeWsFactory();
     render(<FileBrowser ws={ws} mode="dir-only" layout="modal" onConfirm={vi.fn()} onClose={vi.fn()} />);

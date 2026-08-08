@@ -440,6 +440,8 @@ export function SessionPane({
           onPreviewFile={onPreviewFile}
           ws={connected ? ws : null}
           serverId={serverId}
+          scopeFilesToSession={!!session.sharedState}
+          readOnlyFiles={!!session.sharedState && session.sharedState.effectiveRole !== 'participant'}
           onQuote={addQuote}
           agentType={session.agentType}
           onResendFailed={handleResendFailed}

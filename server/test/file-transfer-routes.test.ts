@@ -16,12 +16,13 @@ import {
   MACHINE_DIRECT_FILE_TRANSFER_MSG,
 } from '../../shared/machine-direct-file-transfer.js';
 
-const { sendFileTransferRequestMock, isDaemonConnectedMock, hasDaemonCapabilityMock, daemonConnectionGenerationMock, mockResolveServerMemberAccessOrShareDeny, queryOneMock } = vi.hoisted(() => ({
+const { sendFileTransferRequestMock, isDaemonConnectedMock, hasDaemonCapabilityMock, daemonConnectionGenerationMock, mockResolveServerMemberAccessOrShareDeny, mockResolveHttpShareAccessForCoveredSession, queryOneMock } = vi.hoisted(() => ({
   sendFileTransferRequestMock: vi.fn(),
   isDaemonConnectedMock: vi.fn(),
   hasDaemonCapabilityMock: vi.fn(),
   daemonConnectionGenerationMock: vi.fn(),
   mockResolveServerMemberAccessOrShareDeny: vi.fn(),
+  mockResolveHttpShareAccessForCoveredSession: vi.fn(),
   queryOneMock: vi.fn(),
 }));
 
@@ -56,6 +57,7 @@ vi.mock('../src/ws/bridge.js', () => ({
 
 vi.mock('../src/routes/share-http-auth.js', () => ({
   resolveServerMemberAccessOrShareDeny: (...args: unknown[]) => mockResolveServerMemberAccessOrShareDeny(...args),
+  resolveHttpShareAccessForCoveredSession: (...args: unknown[]) => mockResolveHttpShareAccessForCoveredSession(...args),
 }));
 
 vi.mock('../src/util/logger.js', () => ({
@@ -81,6 +83,21 @@ function makeApp(serverUrl = 'http://localhost'): Hono {
   return app;
 }
 
+function mockSharedFileAccess(role: 'viewer' | 'participant'): void {
+  mockResolveServerMemberAccessOrShareDeny.mockResolvedValue({
+    ok: false,
+    reason: 'share-direct-surface-denied',
+  });
+  mockResolveHttpShareAccessForCoveredSession.mockResolvedValue({
+    membership: 'none',
+    actor: {
+      kind: 'share',
+      effectiveActorRole: role,
+      coverage: { target: { kind: 'main', serverId: 'srv-1', sessionName: 'deck_project_brain' } },
+    },
+  });
+}
+
 describe('file-transfer upload route', () => {
   beforeEach(() => {
     sendFileTransferRequestMock.mockReset();
@@ -90,6 +107,7 @@ describe('file-transfer upload route', () => {
     isDaemonConnectedMock.mockReturnValue(true);
     hasDaemonCapabilityMock.mockReturnValue(true);
     mockResolveServerMemberAccessOrShareDeny.mockResolvedValue({ ok: true, role: 'owner' });
+    mockResolveHttpShareAccessForCoveredSession.mockReset();
     queryOneMock.mockReset();
     queryOneMock.mockResolvedValue({ user_id: 'user-1', node_role: 'full', exec_enabled: true, revoked_at: null });
     sendFileTransferRequestMock.mockResolvedValue({
@@ -452,6 +470,36 @@ describe('file-transfer upload route', () => {
     expect(sendFileTransferRequestMock).not.toHaveBeenCalled();
   });
 
+  it('lets a shared participant upload within the covered session while a viewer remains read-only', async () => {
+    mockSharedFileAccess('viewer');
+    const viewerForm = new FormData();
+    viewerForm.append('file', new File(['viewer'], 'viewer.txt', { type: 'text/plain' }));
+    const viewer = await makeApp().request('/api/server/srv-1/upload?sessionName=deck_project_brain', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer test' },
+      body: viewerForm,
+    });
+    expect(viewer.status).toBe(403);
+    await expect(viewer.json()).resolves.toEqual({ error: 'forbidden', reason: 'share-role-denied' });
+    expect(sendFileTransferRequestMock).not.toHaveBeenCalled();
+
+    mockSharedFileAccess('participant');
+    const participantForm = new FormData();
+    participantForm.append('file', new File(['participant'], 'participant.txt', { type: 'text/plain' }));
+    const participant = await makeApp().request('/api/server/srv-1/upload?sessionName=deck_project_brain', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer test' },
+      body: participantForm,
+    });
+    expect(participant.status).toBe(200);
+    expect(mockResolveHttpShareAccessForCoveredSession).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      serverId: 'srv-1',
+      userId: 'user-1',
+      target: { kind: 'main', serverId: 'srv-1', sessionName: 'deck_project_brain' },
+    }));
+    expect(sendFileTransferRequestMock).toHaveBeenCalled();
+  });
+
   it('rejects oversized legacy uploads from content-length before daemon relay', async () => {
     const res = await makeApp().request('/api/server/srv-1/upload', {
       method: 'POST',
@@ -677,6 +725,7 @@ describe('file-transfer attachment deletion route', () => {
     hasDaemonCapabilityMock.mockReset().mockReturnValue(true);
     daemonConnectionGenerationMock.mockReset().mockReturnValue(1);
     mockResolveServerMemberAccessOrShareDeny.mockReset().mockResolvedValue({ ok: true, role: 'owner' });
+    mockResolveHttpShareAccessForCoveredSession.mockReset();
     queryOneMock.mockReset().mockResolvedValue({ user_id: 'user-1', node_role: 'full', exec_enabled: true, revoked_at: null });
     sendFileTransferRequestMock.mockResolvedValue({ type: FILE_TRANSFER_MSG.DELETE_DONE, requestId: 'a'.repeat(32) });
   });
@@ -722,6 +771,23 @@ describe('file-transfer attachment deletion route', () => {
     expect(sendFileTransferRequestMock).not.toHaveBeenCalled();
   });
 
+  it('allows a shared participant to delete an uploaded attachment in the covered session', async () => {
+    mockSharedFileAccess('participant');
+    const response = await makeApp().request(
+      '/api/server/srv-1/uploads/abcdef1234.txt?sessionName=deck_project_brain',
+      { method: 'DELETE', headers: { Authorization: 'Bearer test' } },
+    );
+
+    expect(response.status).toBe(200);
+    expect(sendFileTransferRequestMock).toHaveBeenCalledWith(
+      'a'.repeat(32),
+      expect.objectContaining({ type: FILE_TRANSFER_MSG.DELETE, attachmentId: 'abcdef1234.txt' }),
+      30_000,
+      undefined,
+      undefined,
+    );
+  });
+
   it('rejects malformed attachment ids before contacting the daemon', async () => {
     const response = await makeApp().request('/api/server/srv-1/uploads/not.valid.ext.more', {
       method: 'DELETE',
@@ -741,6 +807,29 @@ describe('file-transfer download route', () => {
     isDaemonConnectedMock.mockReturnValue(true);
     hasDaemonCapabilityMock.mockReturnValue(true);
     mockResolveServerMemberAccessOrShareDeny.mockResolvedValue({ ok: true, role: 'owner' });
+    mockResolveHttpShareAccessForCoveredSession.mockReset();
+  });
+
+  it('allows a shared viewer to download and preview a covered-session attachment', async () => {
+    mockSharedFileAccess('viewer');
+    sendFileTransferRequestMock.mockResolvedValueOnce({
+      type: FILE_TRANSFER_MSG.DOWNLOAD_DONE,
+      content: Buffer.from('shared image bytes').toString('base64'),
+      mime: 'image/png',
+      filename: 'shared.png',
+    });
+
+    const response = await makeApp().request(
+      '/api/server/srv-1/uploads/abc123/download?sessionName=deck_project_brain',
+      { headers: { Authorization: 'Bearer test' } },
+    );
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get('content-type')).toContain('image/png');
+    await expect(response.text()).resolves.toBe('shared image bytes');
+    expect(mockResolveHttpShareAccessForCoveredSession).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      target: { kind: 'main', serverId: 'srv-1', sessionName: 'deck_project_brain' },
+    }));
   });
 
   it('uses canonical SERVER_URL for the controlled-node staged upload callback', async () => {

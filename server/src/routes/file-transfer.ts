@@ -4,7 +4,8 @@
 import { Hono, type Context } from 'hono';
 import type { Env } from '../env.js';
 import { requireAuth } from '../security/authorization.js';
-import { resolveServerMemberAccessOrShareDeny } from './share-http-auth.js';
+import { resolveHttpShareAccessForCoveredSession, resolveServerMemberAccessOrShareDeny } from './share-http-auth.js';
+import { shareTargetFromSessionName } from '../db/tab-sharing.js';
 import { WsBridge } from '../ws/bridge.js';
 import { randomHex } from '../security/crypto.js';
 import {
@@ -68,6 +69,7 @@ const downloadTokens = new Map<string, {
   userId: string;
   expiresAt: number;
   remainingUses: number;
+  sessionName?: string;
 }>();
 const stagedUploads = new Map<string, {
   serverId: string;
@@ -357,6 +359,7 @@ fileTransferRoutes.use('/:id/uploads/:attachmentId/download', async (c, next) =>
     c.set('userId' as never, entry.userId as never);
     c.set('tokenServerId' as never, entry.serverId as never);
     c.set('tokenAttachmentId' as never, entry.attachmentId as never);
+    if (entry.sessionName) c.set('tokenSessionName' as never, entry.sessionName as never);
     return next();
   }
   // No token — fall back to cookie/bearer auth
@@ -409,6 +412,37 @@ function controlledTargetGateError(c: Context, reason: Exclude<ControlledTargetG
   if (reason === 'daemon_offline') return c.json({ error: reason }, 503);
   if (reason === 'capability_unavailable') return c.json({ error: reason }, 409);
   return c.json({ error: reason }, 403);
+}
+
+type SharedFileAccessMode = 'read' | 'write';
+
+async function authorizeSessionFileAccess(
+  c: Context,
+  serverId: string,
+  userId: string,
+  mode: SharedFileAccessMode,
+): Promise<{ ok: true; sessionName?: string } | { ok: false; reason: string }> {
+  const member = await resolveServerMemberAccessOrShareDeny(c.env.DB, { serverId, userId });
+  if (member.ok) return { ok: true };
+
+  const sessionName = (
+    (c.get('tokenSessionName' as never) as string | undefined)
+    ?? c.req.query('sessionName')
+    ?? ''
+  ).trim();
+  const target = shareTargetFromSessionName(serverId, sessionName);
+  if (!target) return { ok: false, reason: member.reason };
+
+  const access = await resolveHttpShareAccessForCoveredSession(c.env.DB, {
+    serverId,
+    userId,
+    target,
+  });
+  if (access.actor.kind !== 'share') return { ok: false, reason: member.reason };
+  if (mode === 'write' && access.actor.effectiveActorRole !== 'participant') {
+    return { ok: false, reason: 'share-role-denied' };
+  }
+  return { ok: true, sessionName };
 }
 
 async function readBoundedJsonObject(
@@ -653,7 +687,7 @@ fileTransferRoutes.post('/:id/upload', async (c) => {
   const serverId = c.req.param('id')!;
 
   // Permission check
-  const access = await resolveServerMemberAccessOrShareDeny(c.env.DB, { serverId, userId });
+  const access = await authorizeSessionFileAccess(c, serverId, userId, 'write');
   if (!access.ok) return c.json({ error: 'forbidden', reason: access.reason }, 403);
   const controlledGate = await authorizeControlledFileTarget(
     c,
@@ -892,7 +926,7 @@ fileTransferRoutes.delete('/:id/uploads/:attachmentId', async (c) => {
   const serverId = c.req.param('id')!;
   const attachmentId = c.req.param('attachmentId')!;
 
-  const access = await resolveServerMemberAccessOrShareDeny(c.env.DB, { serverId, userId });
+  const access = await authorizeSessionFileAccess(c, serverId, userId, 'write');
   if (!access.ok) return c.json({ error: 'forbidden', reason: access.reason }, 403);
   const gate = await authorizeControlledFileTarget(c, serverId, FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY, false);
   if (!gate.ok) return controlledTargetGateError(c, gate.reason);
@@ -932,7 +966,7 @@ fileTransferRoutes.post('/:id/uploads/:attachmentId/download-token', async (c) =
   const serverId = c.req.param('id')!;
   const attachmentId = c.req.param('attachmentId')!;
 
-  const access = await resolveServerMemberAccessOrShareDeny(c.env.DB, { serverId, userId });
+  const access = await authorizeSessionFileAccess(c, serverId, userId, 'read');
   if (!access.ok) return c.json({ error: 'forbidden', reason: access.reason }, 403);
   const controlledGate = await authorizeControlledFileTarget(
     c,
@@ -953,6 +987,7 @@ fileTransferRoutes.post('/:id/uploads/:attachmentId/download-token', async (c) =
     userId,
     expiresAt: Date.now() + 900_000,
     remainingUses: DOWNLOAD_TOKEN_MAX_USES,
+    ...(access.sessionName ? { sessionName: access.sessionName } : {}),
   });
 
   // Cleanup expired tokens periodically (max 1000 entries)
@@ -982,7 +1017,7 @@ fileTransferRoutes.get('/:id/uploads/:attachmentId/download', async (c) => {
   }
 
   // Permission check
-  const access = await resolveServerMemberAccessOrShareDeny(c.env.DB, { serverId, userId });
+  const access = await authorizeSessionFileAccess(c, serverId, userId, 'read');
   if (!access.ok) return c.json({ error: 'forbidden', reason: access.reason }, 403);
   const controlledGate = await authorizeControlledFileTarget(
     c,

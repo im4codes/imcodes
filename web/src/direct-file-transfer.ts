@@ -113,6 +113,7 @@ type DirectOperation = {
   kind: 'upload';
   file: File;
   clientUploadId: string;
+  sessionName?: string;
   onProgress?: (pct: number) => void;
   onConnected?: () => void;
   signal?: AbortSignal;
@@ -421,6 +422,7 @@ async function runDirectOperation(ws: WsClient, operation: DirectOperation): Pro
       filename,
       ...(mime ? { mime } : {}),
       size,
+      ...(operation.kind === 'upload' && operation.sessionName ? { sessionName: operation.sessionName } : {}),
     });
   });
 }
@@ -432,8 +434,9 @@ export async function uploadFileDirect(
   onProgress?: (pct: number) => void,
   onConnected?: () => void,
   signal?: AbortSignal,
+  sessionName?: string,
 ): Promise<{ ok: true; attachment: AttachmentRefResponse }> {
-  const result = await runDirectOperation(ws, { kind: 'upload', file, clientUploadId, onProgress, onConnected, signal });
+  const result = await runDirectOperation(ws, { kind: 'upload', file, clientUploadId, sessionName, onProgress, onConnected, signal });
   if (result.kind !== 'upload') throw new DirectFileTransferFailure(DIRECT_FILE_TRANSFER_ERROR.INTERNAL_ERROR, false);
   return { ok: true, attachment: result.attachment };
 }
@@ -450,6 +453,7 @@ export async function probeDirectConnectivity(
 export async function uploadFileWithDirectFallback(options: {
   ws: WsClient | null;
   serverId: string;
+  sessionName?: string;
   file: File;
   onProgress?: (pct: number) => void;
   onMode?: (mode: FileUploadTransportMode) => void;
@@ -466,6 +470,7 @@ export async function uploadFileWithDirectFallback(options: {
         options.onProgress,
         () => options.onMode?.(DIRECT_FILE_TRANSFER_STATE.DIRECT),
         options.signal,
+        options.sessionName,
       );
       return result;
     } catch (error) {
@@ -486,7 +491,9 @@ export async function uploadFileWithDirectFallback(options: {
     throw new DirectFileTransferFailure(DIRECT_FILE_TRANSFER_ERROR.RELAY_SIZE_LIMIT, false);
   }
   options.onMode?.(DIRECT_FILE_TRANSFER_STATE.RELAY);
-  return uploadFile(options.serverId, options.file, options.onProgress, clientUploadId, options.signal);
+  return options.sessionName
+    ? uploadFile(options.serverId, options.file, options.onProgress, clientUploadId, options.signal, options.sessionName)
+    : uploadFile(options.serverId, options.file, options.onProgress, clientUploadId, options.signal);
 }
 
 export function isFileUploadCanceled(error: unknown): boolean {

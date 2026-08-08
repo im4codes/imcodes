@@ -86,6 +86,8 @@ export interface P2pWorkflowRequestScope {
 
 export interface FsListDirOptions {
   includeOpenSpecTaskStats?: boolean;
+  /** Session whose project directory scopes this request. */
+  sessionName?: string;
 }
 
 /** Snapshot of the most recent `daemon.hello` capability handshake the browser
@@ -1431,14 +1433,15 @@ export class WsClient {
       includeFiles,
       includeMetadata,
       ...(options?.includeOpenSpecTaskStats ? { includeOpenSpecTaskStats: true } : {}),
+      ...(options?.sessionName ? { sessionName: options.sessionName } : {}),
     });
     return requestId;
   }
 
   /** Request a file's content from the daemon. Returns the requestId for matching the response. */
-  fsReadFile(path: string): string {
+  fsReadFile(path: string, sessionName?: string): string {
     const requestId = crypto.randomUUID();
-    this.send({ type: 'fs.read', path, requestId });
+    this.send({ type: 'fs.read', path, requestId, ...(sessionName ? { sessionName } : {}) });
     return requestId;
   }
 
@@ -1459,14 +1462,15 @@ export class WsClient {
       requestId,
       ...(expectedMtime !== undefined ? { expectedMtime } : {}),
       ...(options?.createOnly ? { createOnly: true } : {}),
+      ...(options?.sessionName ? { sessionName: options.sessionName } : {}),
     });
     return requestId;
   }
 
   /** Create a directory on the daemon. Returns requestId. */
-  fsMkdir(path: string): string {
+  fsMkdir(path: string, sessionName?: string): string {
     const requestId = crypto.randomUUID();
-    this.send({ type: 'fs.mkdir', path, requestId });
+    this.send({ type: 'fs.mkdir', path, requestId, ...(sessionName ? { sessionName } : {}) });
     return requestId;
   }
 
@@ -1485,16 +1489,22 @@ export class WsClient {
   }
 
   /** Request git status for a directory. Returns requestId. */
-  fsGitStatus(path: string, opts?: { includeStats?: boolean }): string {
+  fsGitStatus(path: string, opts?: { includeStats?: boolean; sessionName?: string }): string {
     const requestId = crypto.randomUUID();
-    this.send({ type: 'fs.git_status', path, requestId, ...(opts?.includeStats ? { includeStats: true } : {}) });
+    this.send({
+      type: 'fs.git_status',
+      path,
+      requestId,
+      ...(opts?.includeStats ? { includeStats: true } : {}),
+      ...(opts?.sessionName ? { sessionName: opts.sessionName } : {}),
+    });
     return requestId;
   }
 
   /** Request git diff for a file. Returns requestId. */
-  fsGitDiff(path: string): string {
+  fsGitDiff(path: string, sessionName?: string): string {
     const requestId = crypto.randomUUID();
-    this.send({ type: 'fs.git_diff', path, requestId });
+    this.send({ type: 'fs.git_diff', path, requestId, ...(sessionName ? { sessionName } : {}) });
     return requestId;
   }
 

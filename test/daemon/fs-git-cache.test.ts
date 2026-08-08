@@ -47,6 +47,7 @@ vi.mock('node:child_process', async () => {
 });
 
 import { handleWebCommand, __resetFsGitCachesForTests } from '../../src/daemon/command-handler.js';
+import * as sessionStore from '../../src/store/session-store.js';
 import { FsGitStatusWorkerPool, __setDefaultFsGitStatusWorkerPoolForTests, type FsGitStatusWorkerThreadLike } from '../../src/daemon/fs-git-status-pool.js';
 import type { FsGitStatusWorkerRequest, FsGitStatusWorkerResult } from '../../src/daemon/fs-git-status-worker-types.js';
 
@@ -622,6 +623,35 @@ describe('fs git cache handlers', () => {
 
     expect((sent.find((msg: any) => msg.requestId === 'status-forbidden') as any)?.error).toBe('forbidden_path');
     expect((sent.find((msg: any) => msg.requestId === 'diff-forbidden') as any)?.error).toBe('forbidden_path');
+  });
+
+  it('confines shared-session git status and diff to the owning project root', async () => {
+    const projectRoot = path.join(homedir(), 'project');
+    const outsideRoot = path.join(homedir(), 'other');
+    const outsideFile = path.join(outsideRoot, 'secret.ts');
+    const sessionSpy = vi.spyOn(sessionStore, 'getSession').mockReturnValue({
+      name: 'deck_project_brain',
+      projectDir: projectRoot,
+    } as never);
+    mockRealpath.mockImplementation(async (target) => String(target));
+    mockStat.mockResolvedValue(makeStats('file', 10, 10));
+
+    try {
+      handleWebCommand({
+        type: 'fs.git_status', path: outsideRoot, requestId: 'status-session-outside', sessionName: 'deck_project_brain',
+      }, mockServerLink as any);
+      handleWebCommand({
+        type: 'fs.git_diff', path: outsideFile, requestId: 'diff-session-outside', sessionName: 'deck_project_brain',
+      }, mockServerLink as any);
+      await flushAsync();
+
+      expect((sent.find((msg: any) => msg.requestId === 'status-session-outside') as any)?.error).toBe('forbidden_path');
+      expect((sent.find((msg: any) => msg.requestId === 'diff-session-outside') as any)?.error).toBe('forbidden_path');
+      expect(mockExec).not.toHaveBeenCalled();
+      expect(mockExecFile).not.toHaveBeenCalled();
+    } finally {
+      sessionSpy.mockRestore();
+    }
   });
 
   it('returns worker_timeout once and ignores late git worker success', async () => {

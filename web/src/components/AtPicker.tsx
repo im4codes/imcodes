@@ -41,6 +41,7 @@ interface AtPickerProps {
   rootSession: string;
   wsClient: any;
   projectDir?: string;
+  sessionName?: string;
   onSelectFile: (path: string) => void;
   onSelectAgent: (session: string, mode: string) => void;
   onSelectDelegateAgent: (session: string) => void;
@@ -159,6 +160,7 @@ export function AtPicker({
   rootSession,
   wsClient,
   projectDir,
+  sessionName,
   onSelectFile,
   onSelectDelegateAgent,
   onSelectAlias,
@@ -248,7 +250,7 @@ export function AtPicker({
       const reqId = crypto.randomUUID();
       requestIdRef.current = reqId;
       try {
-        wsClient.send({ type: 'file.search', requestId: reqId, query, projectDir });
+        wsClient.send({ type: 'file.search', requestId: reqId, query, projectDir, ...(sessionName ? { sessionName } : {}) });
       } catch {
         // WS not connected
       }
@@ -257,7 +259,7 @@ export function AtPicker({
     return () => {
       if (debounceRef.current) clearTimeout(debounceRef.current);
     };
-  }, [query, visible, wsClient, category, projectDir]);
+  }, [query, visible, wsClient, category, projectDir, sessionName]);
 
   // Listen for file search responses
   useEffect(() => {

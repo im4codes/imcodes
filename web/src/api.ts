@@ -128,14 +128,20 @@ export function getApiBaseUrl(): string {
   return _baseUrl || window.location.origin;
 }
 
-export async function buildAttachmentDownloadUrl(serverId: string, attachmentId: string): Promise<string> {
+function withSessionName(path: string, sessionName?: string): string {
+  if (!sessionName?.trim()) return path;
+  const separator = path.includes('?') ? '&' : '?';
+  return `${path}${separator}sessionName=${encodeURIComponent(sessionName.trim())}`;
+}
+
+export async function buildAttachmentDownloadUrl(serverId: string, attachmentId: string, sessionName?: string): Promise<string> {
   const encodedServerId = encodeURIComponent(serverId);
   const encodedAttachmentId = encodeURIComponent(attachmentId);
   const baseUrl = _baseUrl || window.location.origin;
   if (!isNative()) {
-    return `${baseUrl}/api/server/${encodedServerId}/uploads/${encodedAttachmentId}/download`;
+    return withSessionName(`${baseUrl}/api/server/${encodedServerId}/uploads/${encodedAttachmentId}/download`, sessionName);
   }
-  const tokenRes = await apiFetch(`/api/server/${encodedServerId}/uploads/${encodedAttachmentId}/download-token`, { method: 'POST' });
+  const tokenRes = await apiFetch(withSessionName(`/api/server/${encodedServerId}/uploads/${encodedAttachmentId}/download-token`, sessionName), { method: 'POST' });
   const downloadToken = (tokenRes as { token?: string }).token;
   if (!downloadToken || typeof downloadToken !== 'string' || downloadToken.length < 32) {
     throw new Error('Failed to acquire download token');
@@ -1396,6 +1402,7 @@ export async function uploadFile(
   onProgress?: (pct: number) => void,
   clientUploadId?: string,
   signal?: AbortSignal,
+  sessionName?: string,
 ): Promise<{ ok: boolean; attachment: AttachmentRefResponse }> {
   const form = new FormData();
   form.append('file', file);
@@ -1406,7 +1413,7 @@ export async function uploadFile(
   // Use XHR for upload progress reporting
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
-    xhr.open('POST', `${_baseUrl}/api/server/${serverId}/upload`);
+    xhr.open('POST', withSessionName(`${_baseUrl}/api/server/${serverId}/upload`, sessionName));
     xhr.setRequestHeader('Accept', 'application/x-ndjson, application/json');
 
     // Auth headers (same as rawFetch)
@@ -1528,24 +1535,24 @@ export async function uploadFile(
   });
 }
 
-export async function deleteAttachment(serverId: string, attachmentId: string): Promise<void> {
-  await apiFetch(`/api/server/${encodeURIComponent(serverId)}/uploads/${encodeURIComponent(attachmentId)}`, {
+export async function deleteAttachment(serverId: string, attachmentId: string, sessionName?: string): Promise<void> {
+  await apiFetch(withSessionName(`/api/server/${encodeURIComponent(serverId)}/uploads/${encodeURIComponent(attachmentId)}`, sessionName), {
     method: 'DELETE',
   });
 }
 
-export async function downloadAttachment(serverId: string, attachmentId: string): Promise<void> {
+export async function downloadAttachment(serverId: string, attachmentId: string, sessionName?: string): Promise<void> {
   // Native: skip blob fetch — WebViews can't reliably trigger downloads from blob URLs.
   // Get a one-time token and open in system browser which handles save natively.
   if (isNative()) {
-    const downloadUrl = await buildAttachmentDownloadUrl(serverId, attachmentId);
+    const downloadUrl = await buildAttachmentDownloadUrl(serverId, attachmentId, sessionName);
     const { Browser } = await import('@capacitor/browser');
     await Browser.open({ url: downloadUrl });
     return;
   }
 
   // Desktop: fetch blob and trigger <a download>
-  const res = await rawFetch(`/api/server/${encodeURIComponent(serverId)}/uploads/${encodeURIComponent(attachmentId)}/download`);
+  const res = await rawFetch(withSessionName(`/api/server/${encodeURIComponent(serverId)}/uploads/${encodeURIComponent(attachmentId)}/download`, sessionName));
   if (!res.ok) {
     const body = await res.text().catch(() => '');
     throw new ApiError(res.status, body);
@@ -1644,8 +1651,8 @@ export async function downloadControlledNodeExecutable(
   }
 }
 
-export async function previewAttachment(serverId: string, attachmentId: string): Promise<void> {
-  const res = await rawFetch(`/api/server/${encodeURIComponent(serverId)}/uploads/${encodeURIComponent(attachmentId)}/download`);
+export async function previewAttachment(serverId: string, attachmentId: string, sessionName?: string): Promise<void> {
+  const res = await rawFetch(withSessionName(`/api/server/${encodeURIComponent(serverId)}/uploads/${encodeURIComponent(attachmentId)}/download`, sessionName));
   if (!res.ok) {
     const body = await res.text().catch(() => '');
     throw new ApiError(res.status, body);

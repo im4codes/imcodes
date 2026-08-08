@@ -19,6 +19,7 @@ const mockServerLink = {
 // ── Mock fs/promises ───────────────────────────────────────────────────────
 vi.mock('node:fs/promises', () => ({
   lstat: vi.fn(),
+  mkdir: vi.fn(),
   readdir: vi.fn(),
   realpath: vi.fn(),
   readFile: vi.fn(),
@@ -29,6 +30,7 @@ vi.mock('node:fs/promises', () => ({
 }));
 
 const mockLstat = vi.mocked(fsp.lstat);
+const mockMkdir = vi.mocked(fsp.mkdir);
 const mockRealpath = vi.mocked(fsp.realpath);
 const mockRename = vi.mocked(fsp.rename);
 const mockRm = vi.mocked(fsp.rm);
@@ -52,6 +54,7 @@ describe('fs.write handler', () => {
     sent.length = 0;
     mockServerLink.send.mockImplementation((msg: unknown) => { sent.push(msg); });
     mockLstat.mockRejectedValue(Object.assign(new Error('ENOENT'), { code: 'ENOENT' }));
+    mockMkdir.mockResolvedValue(undefined);
     mockRename.mockResolvedValue(undefined);
     mockRm.mockResolvedValue(undefined);
     __resetFsGitCachesForTests();
@@ -94,6 +97,58 @@ describe('fs.write handler', () => {
       requestId: 'req-forbidden-existing',
       status: 'error',
       error: 'forbidden_path',
+    });
+  });
+
+  it('refuses to write an existing file outside the owning session project directory', async () => {
+    const projectDir = path.join(homedir(), 'project');
+    const outsidePath = path.join(homedir(), 'other', 'outside.txt');
+    vi.spyOn(sessionStore, 'getSession').mockReturnValue({ name: 'deck_project_brain', projectDir } as never);
+    mockStat.mockResolvedValue({ mtimeMs: 1 } as fsp.Stats);
+    mockRealpath.mockImplementation(async (target) => String(target));
+
+    handleWebCommand({
+      type: 'fs.write',
+      path: outsidePath,
+      content: 'must-not-write',
+      requestId: 'write-session-outside',
+      sessionName: 'deck_project_brain',
+    }, mockServerLink as any);
+    await flushAsync();
+
+    expect(mockWriteFile).not.toHaveBeenCalled();
+    expect(sent[0]).toMatchObject({
+      type: 'fs.write_response',
+      requestId: 'write-session-outside',
+      status: 'error',
+      error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH,
+    });
+  });
+
+  it('refuses a scoped mkdir when the created path resolves outside the project root', async () => {
+    const projectDir = path.join(homedir(), 'project');
+    const requestedPath = path.join(projectDir, 'linked-dir');
+    const escapedPath = path.join(homedir(), 'other');
+    vi.spyOn(sessionStore, 'getSession').mockReturnValue({ name: 'deck_project_brain', projectDir } as never);
+    mockRealpath.mockImplementation(async (target) => {
+      const value = String(target);
+      return value === requestedPath ? escapedPath : value;
+    });
+
+    handleWebCommand({
+      type: 'fs.mkdir',
+      path: requestedPath,
+      requestId: 'mkdir-session-symlink',
+      sessionName: 'deck_project_brain',
+    }, mockServerLink as any);
+    await flushAsync();
+
+    expect(mockMkdir).toHaveBeenCalledWith(requestedPath, { recursive: true });
+    expect(sent[0]).toMatchObject({
+      type: 'fs.mkdir_response',
+      requestId: 'mkdir-session-symlink',
+      status: 'error',
+      error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH,
     });
   });
 

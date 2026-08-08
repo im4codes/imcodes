@@ -550,6 +550,36 @@ describe('AtPicker', () => {
     expect(screen.queryByText('alias.category')).toBeNull();
   });
 
+  it('scopes shared-session file search without exposing an absolute project path', async () => {
+    const wsClient = { connected: true, send: vi.fn(), onMessage: vi.fn(() => () => {}) };
+    render(
+      <AtPicker
+        query="readme"
+        sessions={[]}
+        rootSession="deck_project_brain"
+        wsClient={wsClient as any}
+        projectDir=":session-root:"
+        sessionName="deck_project_brain"
+        onSelectFile={vi.fn()}
+        onSelectAgent={vi.fn()}
+        onSelectDelegateAgent={vi.fn()}
+        onClose={vi.fn()}
+        visible
+      />,
+    );
+
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    });
+
+    expect(wsClient.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'file.search',
+      query: 'readme',
+      projectDir: ':session-root:',
+      sessionName: 'deck_project_brain',
+    }));
+  });
+
   it('still shows the chooser for a bare @ so other categories stay reachable', () => {
     renderPicker('');
 

@@ -65,15 +65,20 @@ function fixture(options: {
 describe('DirectFileTransferRouter', () => {
   it('mints one authority, routes signaling to one socket, and never broadcasts daemon results', () => {
     const f = fixture();
-    expect(f.router.handleBrowser(f.browserA, 'user-a', init)).toBe(true);
+    expect(f.router.handleBrowser(f.browserA, 'user-a', {
+      ...init,
+      sessionName: 'deck_project_brain',
+    })).toBe(true);
     expect(f.daemonMessages).toHaveLength(1);
     expect(f.daemonMessages[0]).toMatchObject({
       type: DIRECT_FILE_TRANSFER_MSG.PREPARE,
       requestId: init.requestId,
       size: init.size,
     });
+    expect(f.daemonMessages[0]).not.toHaveProperty('sessionName');
     const authorized = f.messages(f.browserA)[0];
     expect(authorized).toMatchObject({ type: DIRECT_FILE_TRANSFER_MSG.AUTHORIZED, requestId: init.requestId });
+    expect(authorized).not.toHaveProperty('sessionName');
     expect((authorized.capability as string).length).toBeGreaterThanOrEqual(32);
 
     f.router.handleBrowser(f.browserA, 'user-a', {

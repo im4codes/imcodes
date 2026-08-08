@@ -183,7 +183,7 @@ import {
 } from '../../shared/memory-ws.js';
 import { buildMemoryProjectionFallbackSource } from '../../shared/memory-projection-source-fallback.js';
 import { parseOpenSpecTasksMarkdown } from '../../shared/openspec-auto-deliver-validators.js';
-import { FS_WRITE_ERROR } from '../shared/transport/fs.js';
+import { FS_SESSION_ROOT_PATH, FS_WRITE_ERROR } from '../shared/transport/fs.js';
 import { P2P_CONFIG_ERROR, P2P_CONFIG_MSG, MAX_P2P_PARTICIPANTS } from '../../shared/p2p-config-events.js';
 import { P2P_PRESET_DEFAULT_SUMMARY_PROMPT, P2P_WORKFLOW_SCHEMA_VERSION } from '../../shared/p2p-workflow-constants.js';
 import { makeP2pWorkflowDiagnostic, type P2pWorkflowDiagnostic } from '../../shared/p2p-workflow-diagnostics.js';
@@ -8155,7 +8155,7 @@ function isSameOrInsidePath(root: string, candidate: string): boolean {
   return relative === '' || (!!relative && !relative.startsWith('..') && !nodePath.isAbsolute(relative));
 }
 
-async function resolveFsMutationSessionRoot(cmd: Record<string, unknown>): Promise<
+async function resolveFsSessionRoot(cmd: Record<string, unknown>): Promise<
   | { ok: true; realRoot?: string }
   | { ok: false; error: string }
 > {
@@ -8443,8 +8443,18 @@ async function handleFileSearch(cmd: Record<string, unknown>, serverLink: Server
   if (!requestId || !projectDir) return;
 
   try {
-    const canonical = await resolveCanonical(projectDir, 'strict');
-    if (!canonical) {
+    const sessionRoot = await resolveFsSessionRoot(cmd);
+    if (!sessionRoot.ok) {
+      try { serverLink.send({ type: 'file.search_response', requestId, results: [], error: sessionRoot.error }); } catch { /* ignore */ }
+      return;
+    }
+    if (projectDir === FS_SESSION_ROOT_PATH && !sessionRoot.realRoot) {
+      try { serverLink.send({ type: 'file.search_response', requestId, results: [], error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH }); } catch { /* ignore */ }
+      return;
+    }
+    const searchRoot = projectDir === FS_SESSION_ROOT_PATH ? sessionRoot.realRoot! : projectDir;
+    const canonical = await resolveCanonical(searchRoot, 'strict');
+    if (!canonical || (sessionRoot.realRoot && !isSameOrInsidePath(sessionRoot.realRoot, canonical.realPath))) {
       try { serverLink.send({ type: 'file.search_response', requestId, results: [], error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH }); } catch { /* ignore */ }
       return;
     }
@@ -8915,9 +8925,26 @@ async function handleFsList(cmd: Record<string, unknown>, serverLink: ServerLink
   const includeOpenSpecTaskStats = cmd.includeOpenSpecTaskStats === true;
   if (!rawPath || !requestId) return;
 
+  const sessionRoot = await resolveFsSessionRoot(cmd);
+  if (!sessionRoot.ok) {
+    try { serverLink.send({ type: 'fs.ls_response', requestId, path: rawPath, status: 'error', error: sessionRoot.error }); } catch { /* ignore */ }
+    return;
+  }
+
+  if (rawPath === FS_SESSION_ROOT_PATH && !sessionRoot.realRoot) {
+    try { serverLink.send({ type: 'fs.ls_response', requestId, path: rawPath, status: 'error', error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH }); } catch { /* ignore */ }
+    return;
+  }
+
   // Special sentinel paths bypass normal path resolution
   const isDrivesSentinel = rawPath === WINDOWS_DRIVES_PATH;
-  const expanded = isDrivesSentinel
+  if (isDrivesSentinel && sessionRoot.realRoot) {
+    try { serverLink.send({ type: 'fs.ls_response', requestId, path: rawPath, status: 'error', error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH }); } catch { /* ignore */ }
+    return;
+  }
+  const expanded = rawPath === FS_SESSION_ROOT_PATH
+    ? sessionRoot.realRoot!
+    : isDrivesSentinel
     ? rawPath
     : (rawPath.startsWith('~') ? rawPath.replace(/^~/, homedir()) : rawPath);
   const resolved = isDrivesSentinel ? rawPath : nodePath.resolve(expanded);
@@ -8930,7 +8957,7 @@ async function handleFsList(cmd: Record<string, unknown>, serverLink: ServerLink
   });
 
   try {
-    await Promise.race([handleFsListInner(resolved, rawPath, requestId, includeFiles, includeMetadata, includeOpenSpecTaskStats, requestContext), deadline]);
+    await Promise.race([handleFsListInner(resolved, rawPath, requestId, includeFiles, includeMetadata, includeOpenSpecTaskStats, requestContext, sessionRoot.realRoot), deadline]);
   } catch (err) {
     const msg = fsListErrorCode(err);
     if (msg === FS_GENERIC_ERROR_CODES.FS_LIST_TIMEOUT || msg === FS_GENERIC_ERROR_CODES.FS_LIST_WORKER_TIMEOUT) {
@@ -8955,6 +8982,7 @@ async function handleFsListInner(
   includeMetadata: boolean,
   includeOpenSpecTaskStats: boolean,
   requestContext: FsListRequestContext,
+  sessionRealRoot?: string,
 ): Promise<void> {
   // Windows drive picker — only triggered by the explicit `:drives:` path,
   // NOT by `~` (which always means the user's home directory on every OS).
@@ -8983,7 +9011,7 @@ async function handleFsListInner(
   }
 
   const canonical = await resolveCanonical(resolved, includeMetadata ? 'lenient' : 'strict');
-  if (!canonical) {
+  if (!canonical || (sessionRealRoot && (canonical.usedFallback || !isSameOrInsidePath(sessionRealRoot, canonical.realPath)))) {
     requestContext.send({ type: 'fs.ls_response', requestId, path: rawPath, status: 'error', error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH });
     return;
   }
@@ -8999,7 +9027,24 @@ async function handleFsListInner(
 const REPO_CONTEXT_CACHE_TTL_MS = 5_000;
 
 async function handleFsRead(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
-  getDefaultPreviewReadCoordinator().handle(cmd.path, cmd.requestId, (message) => serverLink.send(message));
+  const rawPath = typeof cmd.path === 'string' ? cmd.path : '';
+  const requestId = typeof cmd.requestId === 'string' ? cmd.requestId : '';
+  if (!rawPath || !requestId) return;
+  const sessionRoot = await resolveFsSessionRoot(cmd);
+  if (!sessionRoot.ok) {
+    try { serverLink.send({ type: 'fs.read_response', requestId, path: rawPath, status: 'error', error: sessionRoot.error }); } catch { /* ignore */ }
+    return;
+  }
+  if (sessionRoot.realRoot) {
+    const target = await resolveExistingFsMutationTarget(rawPath, sessionRoot.realRoot);
+    if (!target.ok) {
+      try { serverLink.send({ type: 'fs.read_response', requestId, path: rawPath, status: 'error', error: target.error }); } catch { /* ignore */ }
+      return;
+    }
+    getDefaultPreviewReadCoordinator().handle(target.real, requestId, (message) => serverLink.send(message));
+    return;
+  }
+  getDefaultPreviewReadCoordinator().handle(rawPath, requestId, (message) => serverLink.send(message));
 }
 
 const GIT_STATUS_CACHE_TTL_MS = 5_000;
@@ -9719,6 +9764,12 @@ async function handleFsGitStatus(cmd: Record<string, unknown>, serverLink: Serve
   const includeStats = cmd.includeStats === true;
   if (!rawPath || !requestId) return;
 
+  const sessionRoot = await resolveFsSessionRoot(cmd);
+  if (!sessionRoot.ok) {
+    try { serverLink.send({ type: 'fs.git_status_response', requestId, path: rawPath, status: 'error', files: [], error: sessionRoot.error }); } catch { /* ignore */ }
+    return;
+  }
+
   const expanded = rawPath.startsWith('~') ? rawPath.replace(/^~/, homedir()) : rawPath;
   const resolved = nodePath.resolve(expanded);
   const requestContext = createFsListRequestContext(serverLink);
@@ -9729,7 +9780,7 @@ async function handleFsGitStatus(cmd: Record<string, unknown>, serverLink: Serve
     deadlineTimer.unref?.();
   });
   try {
-    await Promise.race([handleFsGitStatusInner(resolved, rawPath, requestId, includeStats, requestContext), deadline]);
+    await Promise.race([handleFsGitStatusInner(resolved, rawPath, requestId, includeStats, requestContext, sessionRoot.realRoot), deadline]);
   } catch (err) {
     const msg = fsGitStatusErrorCode(err);
     if (msg === FS_GENERIC_ERROR_CODES.FS_LIST_WORKER_TIMEOUT) {
@@ -9750,9 +9801,10 @@ async function handleFsGitStatusInner(
   requestId: string,
   includeStats: boolean,
   requestContext: FsListRequestContext,
+  sessionRealRoot?: string,
 ): Promise<void> {
   const real = await fsRealpath(resolved);
-  const allowed = isPathAllowed(real);
+  const allowed = isPathAllowed(real) && (!sessionRealRoot || isSameOrInsidePath(sessionRealRoot, real));
   if (!allowed) {
     requestContext.send({ type: 'fs.git_status_response', requestId, path: rawPath, status: 'error', error: FS_READ_ERROR_CODES.FORBIDDEN_PATH });
     return;
@@ -9774,6 +9826,12 @@ async function handleFsGitDiff(cmd: Record<string, unknown>, serverLink: ServerL
   const requestId = cmd.requestId as string | undefined;
   if (!rawPath || !requestId) return;
 
+  const sessionRoot = await resolveFsSessionRoot(cmd);
+  if (!sessionRoot.ok) {
+    try { serverLink.send({ type: 'fs.git_diff_response', requestId, path: rawPath, status: 'error', error: sessionRoot.error }); } catch { /* ignore */ }
+    return;
+  }
+
   const expanded = rawPath.startsWith('~') ? rawPath.replace(/^~/, homedir()) : rawPath;
   const resolved = nodePath.resolve(expanded);
 
@@ -9789,7 +9847,8 @@ async function handleFsGitDiff(cmd: Record<string, unknown>, serverLink: ServerL
         allowedProbe = parent;
       }
     }
-    const allowed = isPathAllowed(allowedProbe);
+    const allowed = isPathAllowed(allowedProbe)
+      && (!sessionRoot.realRoot || isSameOrInsidePath(sessionRoot.realRoot, allowedProbe));
     if (!allowed) {
       try { serverLink.send({ type: 'fs.git_diff_response', requestId, path: rawPath, status: 'error', error: FS_READ_ERROR_CODES.FORBIDDEN_PATH }); } catch { /* ignore */ }
       return;
@@ -9809,6 +9868,12 @@ async function handleFsMkdir(cmd: Record<string, unknown>, serverLink: ServerLin
   const requestId = cmd.requestId as string | undefined;
   if (!rawPath || !requestId) return;
 
+  const sessionRoot = await resolveFsSessionRoot(cmd);
+  if (!sessionRoot.ok) {
+    try { serverLink.send({ type: 'fs.mkdir_response', requestId, path: rawPath, status: 'error', error: sessionRoot.error }); } catch { /* ignore */ }
+    return;
+  }
+
   const expanded = rawPath.startsWith('~') ? rawPath.replace(/^~/, homedir()) : rawPath;
   const resolved = nodePath.resolve(expanded);
 
@@ -9816,7 +9881,8 @@ async function handleFsMkdir(cmd: Record<string, unknown>, serverLink: ServerLin
   const parent = nodePath.dirname(resolved);
   try {
     const realParent = await fsRealpath(parent);
-    const allowed = isPathAllowed(realParent);
+    const allowed = isPathAllowed(realParent)
+      && (!sessionRoot.realRoot || isSameOrInsidePath(sessionRoot.realRoot, realParent));
     if (!allowed) {
       try { serverLink.send({ type: 'fs.mkdir_response', requestId, path: rawPath, status: 'error', error: FS_READ_ERROR_CODES.FORBIDDEN_PATH }); } catch { /* ignore */ }
       return;
@@ -9830,6 +9896,10 @@ async function handleFsMkdir(cmd: Record<string, unknown>, serverLink: ServerLin
     const { mkdir } = await import('fs/promises');
     await mkdir(resolved, { recursive: true });
     const real = await fsRealpath(resolved);
+    if (!isPathAllowed(real) || (sessionRoot.realRoot && !isSameOrInsidePath(sessionRoot.realRoot, real))) {
+      try { serverLink.send({ type: 'fs.mkdir_response', requestId, path: rawPath, status: 'error', error: FS_READ_ERROR_CODES.FORBIDDEN_PATH }); } catch { /* ignore */ }
+      return;
+    }
     invalidateFsListCachesForPath(real);
     invalidateFileSearchCachesForPath(real);
     try { serverLink.send({ type: 'fs.mkdir_response', requestId, path: rawPath, resolvedPath: real, status: 'ok' }); } catch { /* ignore */ }
@@ -9861,6 +9931,12 @@ async function handleFsWrite(cmd: Record<string, unknown>, serverLink: ServerLin
   const expectedMtime = typeof cmd.expectedMtime === 'number' ? cmd.expectedMtime : undefined;
   const createOnly = cmd.createOnly === true;
 
+  const sessionRoot = await resolveFsSessionRoot(cmd);
+  if (!sessionRoot.ok) {
+    try { serverLink.send({ type: 'fs.write_response', requestId, path: rawPath, status: 'error', error: sessionRoot.error }); } catch { /* ignore */ }
+    return;
+  }
+
   const expanded = rawPath.startsWith('~') ? rawPath.replace(/^~/, homedir()) : rawPath;
   const resolved = nodePath.resolve(expanded);
 
@@ -9883,7 +9959,8 @@ async function handleFsWrite(cmd: Record<string, unknown>, serverLink: ServerLin
     // Existing file: realpath of target must be within FS_ALLOWED_ROOTS
     try {
       const real = await fsRealpath(resolved);
-      const allowed = isPathAllowed(real);
+      const allowed = isPathAllowed(real)
+        && (!sessionRoot.realRoot || isSameOrInsidePath(sessionRoot.realRoot, real));
       if (!allowed) {
         try { serverLink.send({ type: 'fs.write_response', requestId, path: rawPath, resolvedPath: real, status: 'error', error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH }); } catch { /* ignore */ }
         return;
@@ -9927,7 +10004,8 @@ async function handleFsWrite(cmd: Record<string, unknown>, serverLink: ServerLin
     const parent = nodePath.dirname(resolved);
     try {
       const realParent = await fsRealpath(parent);
-      const allowed = isPathAllowed(realParent);
+      const allowed = isPathAllowed(realParent)
+        && (!sessionRoot.realRoot || isSameOrInsidePath(sessionRoot.realRoot, realParent));
       if (!allowed) {
         try { serverLink.send({ type: 'fs.write_response', requestId, path: rawPath, status: 'error', error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH }); } catch { /* ignore */ }
         return;
@@ -10021,7 +10099,7 @@ async function handleFsRename(cmd: Record<string, unknown>, serverLink: ServerLi
     return;
   }
 
-  const sessionRoot = await resolveFsMutationSessionRoot(cmd);
+  const sessionRoot = await resolveFsSessionRoot(cmd);
   if (!sessionRoot.ok) {
     try { serverLink.send({ type: FS_TRANSPORT_MSG.RENAME_RESPONSE, requestId, path: rawPath, newPath: rawNewPath, status: 'error', error: sessionRoot.error }); } catch { /* ignore */ }
     return;
@@ -10072,7 +10150,7 @@ async function handleFsDelete(cmd: Record<string, unknown>, serverLink: ServerLi
     return;
   }
 
-  const sessionRoot = await resolveFsMutationSessionRoot(cmd);
+  const sessionRoot = await resolveFsSessionRoot(cmd);
   if (!sessionRoot.ok) {
     try { serverLink.send({ type: FS_TRANSPORT_MSG.DELETE_RESPONSE, requestId, path: rawPath, status: 'error', error: sessionRoot.error }); } catch { /* ignore */ }
     return;

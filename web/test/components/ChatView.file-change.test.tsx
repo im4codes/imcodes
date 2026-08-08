@@ -178,7 +178,7 @@ describe('ChatView file-change cards', () => {
       previewViewMode: 'diff',
       preview: { status: 'loading', path: '/repo/src/app.tsx' },
       rootPath: '/repo',
-      sessionName: 'session-a',
+      sessionName: undefined,
       sourcePreviewLive: false,
     });
   });
@@ -346,7 +346,7 @@ describe('ChatView file-change cards', () => {
       previewViewMode: 'diff',
       preview: { status: 'loading', path: '/repo/src/diff.ts' },
       rootPath: '/repo',
-      sessionName: 'session-a',
+      sessionName: undefined,
       sourcePreviewLive: false,
     });
   });
@@ -422,7 +422,7 @@ describe('ChatView file-change cards', () => {
       previewViewMode: 'source',
       preview: { status: 'loading', path: '/repo/src/new-name.ts' },
       rootPath: '/repo',
-      sessionName: 'session-a',
+      sessionName: undefined,
       sourcePreviewLive: false,
     });
     expect(onPreviewFile).toHaveBeenNthCalledWith(2, {
@@ -431,7 +431,7 @@ describe('ChatView file-change cards', () => {
       previewViewMode: 'source',
       preview: { status: 'loading', path: '/repo/src/deleted.ts' },
       rootPath: '/repo',
-      sessionName: 'session-a',
+      sessionName: undefined,
       sourcePreviewLive: false,
     });
   });

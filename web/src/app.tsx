@@ -5404,6 +5404,8 @@ export function App() {
                   ws={wsRef.current}
                   serverId={selectedServerId}
                   sessionName={activeSession ?? undefined}
+                  scopeToSessionRoot={!!activeSessionInfo.sharedState}
+                  readOnly={!!activeSessionInfo.sharedState && activeSessionInfo.sharedState.effectiveRole !== 'participant'}
                   mode="file-multi"
                   layout="panel"
                   initialPath={activeSessionInfo.projectDir ?? '~'}

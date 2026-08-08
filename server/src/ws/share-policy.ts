@@ -19,6 +19,7 @@ import {
 } from '../../../shared/tab-sharing.js';
 import { REPO_MSG } from '../../../shared/repo-types.js';
 import { TIMELINE_MESSAGES } from '../../../shared/timeline-protocol.js';
+import { DIRECT_FILE_TRANSFER_MSG } from '../../../shared/direct-file-transfer.js';
 
 export { shareTargetKey };
 export type { EffectiveCoverage, ShareTarget };
@@ -63,6 +64,8 @@ export type ShareCommandDecision =
 
 type ShareCommandPolicy =
   | { kind: 'allow-covered-read'; requireTarget: boolean }
+  | { kind: 'participant-covered-action' }
+  | { kind: 'participant-bound-action' }
   | { kind: 'participant-discussion-start' }
   | { kind: 'participant-send' }
   | { kind: 'participant-cancel' }
@@ -112,6 +115,20 @@ export const SHARE_WS_COMMAND_POLICY_INVENTORY: readonly ShareBridgeCommandInven
   { bridgeCommand: 'session.send', sharedCommand: SHARE_BROWSER_COMMANDS.SESSION_SEND, policy: { kind: 'participant-send' } },
   { bridgeCommand: DAEMON_COMMAND_TYPES.SESSION_CANCEL, sharedCommand: SHARE_BROWSER_COMMANDS.SESSION_CANCEL, policy: { kind: 'participant-cancel' } },
   { bridgeCommand: 'discussion.comment', sharedCommand: SHARE_BROWSER_COMMANDS.DISCUSSION_COMMENT, policy: { kind: 'allow-covered-read', requireTarget: false } },
+  { bridgeCommand: 'fs.ls', sharedCommand: SHARE_BROWSER_COMMANDS.FILE_BROWSE, policy: { kind: 'allow-covered-read', requireTarget: true } },
+  { bridgeCommand: 'fs.read', sharedCommand: SHARE_BROWSER_COMMANDS.FILE_READ, policy: { kind: 'allow-covered-read', requireTarget: true } },
+  { bridgeCommand: 'file.search', sharedCommand: SHARE_BROWSER_COMMANDS.FILE_SEARCH, policy: { kind: 'allow-covered-read', requireTarget: true } },
+  { bridgeCommand: 'fs.git_status', sharedCommand: SHARE_BROWSER_COMMANDS.REPO_STATUS, policy: { kind: 'allow-covered-read', requireTarget: true } },
+  { bridgeCommand: 'fs.git_diff', sharedCommand: SHARE_BROWSER_COMMANDS.REPO_DIFF, policy: { kind: 'allow-covered-read', requireTarget: true } },
+  { bridgeCommand: 'fs.mkdir', sharedCommand: SHARE_BROWSER_COMMANDS.FILE_WRITE, policy: { kind: 'participant-covered-action' } },
+  { bridgeCommand: 'fs.write', sharedCommand: SHARE_BROWSER_COMMANDS.FILE_WRITE, policy: { kind: 'participant-covered-action' } },
+  { bridgeCommand: FS_TRANSPORT_MSG.RENAME, sharedCommand: SHARE_BROWSER_COMMANDS.FILE_EDIT, policy: { kind: 'participant-covered-action' } },
+  { bridgeCommand: FS_TRANSPORT_MSG.DELETE, sharedCommand: SHARE_BROWSER_COMMANDS.FILE_DELETE, policy: { kind: 'participant-covered-action' } },
+  { bridgeCommand: DIRECT_FILE_TRANSFER_MSG.INIT, sharedCommand: SHARE_BROWSER_COMMANDS.FILE_WRITE, policy: { kind: 'participant-covered-action' } },
+  { bridgeCommand: DIRECT_FILE_TRANSFER_MSG.OFFER, sharedCommand: SHARE_BROWSER_COMMANDS.FILE_WRITE, policy: { kind: 'participant-bound-action' } },
+  { bridgeCommand: DIRECT_FILE_TRANSFER_MSG.ICE, sharedCommand: SHARE_BROWSER_COMMANDS.FILE_WRITE, policy: { kind: 'participant-bound-action' } },
+  { bridgeCommand: DIRECT_FILE_TRANSFER_MSG.CANCEL, sharedCommand: SHARE_BROWSER_COMMANDS.FILE_WRITE, policy: { kind: 'participant-bound-action' } },
+  { bridgeCommand: DIRECT_FILE_TRANSFER_MSG.STATUS_QUERY, sharedCommand: SHARE_BROWSER_COMMANDS.FILE_WRITE, policy: { kind: 'participant-bound-action' } },
 
   { bridgeCommand: 'session.start', sharedCommand: SHARE_BROWSER_COMMANDS.SESSION_START, policy: denyFromShared(SHARE_BROWSER_COMMANDS.SESSION_START) },
   { bridgeCommand: 'session.stop', sharedCommand: SHARE_BROWSER_COMMANDS.SESSION_STOP, policy: denyFromShared(SHARE_BROWSER_COMMANDS.SESSION_STOP) },
@@ -128,17 +145,9 @@ export const SHARE_WS_COMMAND_POLICY_INVENTORY: readonly ShareBridgeCommandInven
   { bridgeCommand: TRANSPORT_MSG.PROVIDER_STATUS, sharedCommand: SHARE_BROWSER_COMMANDS.PROVIDER_STATUS, policy: denyFromShared(SHARE_BROWSER_COMMANDS.PROVIDER_STATUS) },
   { bridgeCommand: TRANSPORT_MSG.LIST_SESSIONS, sharedCommand: SHARE_BROWSER_COMMANDS.PROVIDER_LIST, policy: denyFromShared(SHARE_BROWSER_COMMANDS.PROVIDER_LIST) },
   { bridgeCommand: 'provider.sync_sessions', sharedCommand: SHARE_BROWSER_COMMANDS.PROVIDER_LIST, policy: denyFromShared(SHARE_BROWSER_COMMANDS.PROVIDER_LIST) },
-  { bridgeCommand: 'fs.ls', sharedCommand: SHARE_BROWSER_COMMANDS.FILE_BROWSE, policy: denyFromShared(SHARE_BROWSER_COMMANDS.FILE_BROWSE) },
-  { bridgeCommand: 'fs.read', sharedCommand: SHARE_BROWSER_COMMANDS.FILE_READ, policy: denyFromShared(SHARE_BROWSER_COMMANDS.FILE_READ) },
-  { bridgeCommand: 'fs.write', sharedCommand: SHARE_BROWSER_COMMANDS.FILE_WRITE, policy: denyFromShared(SHARE_BROWSER_COMMANDS.FILE_WRITE) },
-  { bridgeCommand: FS_TRANSPORT_MSG.RENAME, sharedCommand: SHARE_BROWSER_COMMANDS.FILE_EDIT, policy: denyFromShared(SHARE_BROWSER_COMMANDS.FILE_EDIT) },
-  { bridgeCommand: 'fs.edit', sharedCommand: SHARE_BROWSER_COMMANDS.FILE_EDIT, policy: denyFromShared(SHARE_BROWSER_COMMANDS.FILE_EDIT) },
-  { bridgeCommand: 'fs.delete', sharedCommand: SHARE_BROWSER_COMMANDS.FILE_DELETE, policy: denyFromShared(SHARE_BROWSER_COMMANDS.FILE_DELETE) },
-  { bridgeCommand: 'fs.patch', sharedCommand: SHARE_BROWSER_COMMANDS.FILE_PATCH, policy: denyFromShared(SHARE_BROWSER_COMMANDS.FILE_PATCH) },
-  { bridgeCommand: 'fs.git_status', sharedCommand: SHARE_BROWSER_COMMANDS.REPO_STATUS, policy: denyFromShared(SHARE_BROWSER_COMMANDS.REPO_STATUS) },
-  { bridgeCommand: 'fs.git_diff', sharedCommand: SHARE_BROWSER_COMMANDS.REPO_DIFF, policy: denyFromShared(SHARE_BROWSER_COMMANDS.REPO_DIFF) },
-  { bridgeCommand: 'file.search', sharedCommand: SHARE_BROWSER_COMMANDS.FILE_SEARCH, policy: denyFromShared(SHARE_BROWSER_COMMANDS.FILE_SEARCH) },
-  { bridgeCommand: REPO_MSG.DETECT, sharedCommand: SHARE_BROWSER_COMMANDS.REPO_STATUS, policy: denyFromShared(SHARE_BROWSER_COMMANDS.REPO_STATUS) },
+  { bridgeCommand: 'fs.edit', sharedCommand: SHARE_BROWSER_COMMANDS.FILE_EDIT, policy: { kind: 'deny', reason: SHARE_REASONS.DIRECT_SURFACE_DENIED } },
+  { bridgeCommand: 'fs.patch', sharedCommand: SHARE_BROWSER_COMMANDS.FILE_PATCH, policy: { kind: 'deny', reason: SHARE_REASONS.DIRECT_SURFACE_DENIED } },
+  { bridgeCommand: REPO_MSG.DETECT, sharedCommand: SHARE_BROWSER_COMMANDS.REPO_STATUS, policy: { kind: 'deny', reason: SHARE_REASONS.DIRECT_SURFACE_DENIED } },
   { bridgeCommand: REPO_MSG.LIST_BRANCHES, sharedCommand: SHARE_BROWSER_COMMANDS.REPO_BRANCH, policy: denyFromShared(SHARE_BROWSER_COMMANDS.REPO_BRANCH) },
   { bridgeCommand: REPO_MSG.CHECKOUT_BRANCH, sharedCommand: SHARE_BROWSER_COMMANDS.REPO_BRANCH, policy: denyFromShared(SHARE_BROWSER_COMMANDS.REPO_BRANCH) },
   { bridgeCommand: REPO_MSG.LIST_COMMITS, sharedCommand: SHARE_BROWSER_COMMANDS.REPO_SEARCH, policy: denyFromShared(SHARE_BROWSER_COMMANDS.REPO_SEARCH) },
@@ -324,6 +333,19 @@ export function evaluateShareCommand(input: {
 
   if (input.state.snapshot.effectiveRole !== 'participant') {
     return { allowed: false, reason: SHARE_REASONS.ROLE_DENIED };
+  }
+
+  if (policy.kind === 'participant-bound-action') {
+    // Follow-up direct-transfer frames are authorized by the router's opaque
+    // request capability. Re-checking the participant role here ensures a
+    // role downgrade/revocation stops an in-flight shared upload immediately.
+    return { allowed: true };
+  }
+
+  if (policy.kind === 'participant-covered-action') {
+    return sessionName && shareStateCoversSession(input.state, sessionName)
+      ? { allowed: true }
+      : { allowed: false, reason: SHARE_REASONS.DIRECT_SURFACE_DENIED };
   }
 
   if (policy.kind === 'participant-discussion-start') {

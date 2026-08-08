@@ -135,6 +135,7 @@ export const DIRECT_FILE_TRANSFER_LIMITS = {
   CAPABILITY_BYTES: 128,
   FILENAME_BYTES: 1024,
   MIME_BYTES: 256,
+  SESSION_NAME_BYTES: 256,
   SDP_BYTES: 256 * 1024,
   ICE_CANDIDATE_BYTES: 16 * 1024,
   ICE_MID_BYTES: 256,
@@ -183,6 +184,8 @@ export interface DirectFileTransferInit {
   mime?: string;
   size: number;
   sha256?: string;
+  /** Covered session used only by the Server's shared-tab authorization gate. */
+  sessionName?: string;
 }
 
 export interface DirectFileTransferAuthority extends Omit<DirectFileTransferInit, 'type'> {
@@ -429,6 +432,7 @@ function validateMetadata(value: Record<string, unknown>): boolean {
     && isDirectFileTransferClientUploadId(value.clientUploadId)
     && isBoundedString(value.filename, DIRECT_FILE_TRANSFER_LIMITS.FILENAME_BYTES)
     && (value.mime === undefined || isBoundedString(value.mime, DIRECT_FILE_TRANSFER_LIMITS.MIME_BYTES))
+    && (value.sessionName === undefined || isBoundedString(value.sessionName, DIRECT_FILE_TRANSFER_LIMITS.SESSION_NAME_BYTES))
     && isDirectFileTransferSize(value.size)
     && (value.sha256 === undefined || (typeof value.sha256 === 'string' && SHA256_RE.test(value.sha256)));
 }
@@ -552,7 +556,7 @@ function validateAuthorityFields(value: Record<string, unknown>): boolean {
 export function validateDirectFileTransferBrowserMessage(value: unknown): ValidationResult<DirectFileTransferBrowserMessage> {
   if (!isRecord(value) || typeof value.type !== 'string') return { ok: false, error: DIRECT_FILE_TRANSFER_ERROR.INVALID_REQUEST };
   if (value.type === DIRECT_FILE_TRANSFER_MSG.INIT) {
-    if (!hasExactKeys(value, ['type', 'requestId', 'clientUploadId', 'filename', 'size'], ['purpose', 'mime', 'sha256']) || !validateMetadata(value)) {
+    if (!hasExactKeys(value, ['type', 'requestId', 'clientUploadId', 'filename', 'size'], ['purpose', 'mime', 'sha256', 'sessionName']) || !validateMetadata(value)) {
       return { ok: false, error: DIRECT_FILE_TRANSFER_ERROR.INVALID_REQUEST };
     }
     return { ok: true, value: value as unknown as DirectFileTransferInit };

@@ -279,6 +279,37 @@ describe('shared-context and file API contracts', () => {
     );
   });
 
+  it('carries the covered session through shared upload, delete, download, and image preview requests', async () => {
+    const fetchMock = vi.mocked(fetch);
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse({ ok: true }))
+      .mockResolvedValueOnce(blobResponse('download'))
+      .mockResolvedValueOnce(blobResponse('preview'));
+    Object.defineProperty(URL, 'createObjectURL', { configurable: true, value: vi.fn(() => 'blob:shared') });
+    Object.defineProperty(URL, 'revokeObjectURL', { configurable: true, value: vi.fn() });
+    vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => undefined);
+    vi.spyOn(window, 'open').mockReturnValue(null);
+    const { buildAttachmentDownloadUrl, configure, deleteAttachment, downloadAttachment, previewAttachment, uploadFile } = await import('../src/api.js');
+    configure('https://api.example');
+
+    await uploadFile('srv-1', new File(['shared'], 'shared.txt'), undefined, 'client-upload', undefined, 'deck_project_brain');
+    expect(MockXmlHttpRequest.instances[0].url).toBe(
+      'https://api.example/api/server/srv-1/upload?sessionName=deck_project_brain',
+    );
+    await deleteAttachment('srv-1', 'att-delete', 'deck_project_brain');
+    await downloadAttachment('srv-1', 'att-download', 'deck_project_brain');
+    await previewAttachment('srv-1', 'att-preview', 'deck_project_brain');
+    await expect(buildAttachmentDownloadUrl('srv-1', 'att-url', 'deck_project_brain')).resolves.toBe(
+      'https://api.example/api/server/srv-1/uploads/att-url/download?sessionName=deck_project_brain',
+    );
+
+    expect(fetchMock.mock.calls.map(([url]) => String(url))).toEqual([
+      'https://api.example/api/server/srv-1/uploads/att-delete?sessionName=deck_project_brain',
+      'https://api.example/api/server/srv-1/uploads/att-download/download?sessionName=deck_project_brain',
+      'https://api.example/api/server/srv-1/uploads/att-preview/download?sessionName=deck_project_brain',
+    ]);
+  });
+
   it('downloads and previews attachments through desktop and native paths', async () => {
     vi.useFakeTimers();
     const fetchMock = vi.mocked(fetch);
