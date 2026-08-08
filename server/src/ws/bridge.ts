@@ -43,6 +43,7 @@ import {
   isDirectConnectivityRuntimeStatus,
 } from '../../../shared/direct-file-transfer.js';
 import { FS_TRANSPORT_MSG } from '../../../shared/fs-transport-messages.js';
+import { FS_SESSION_ROOT_PATH } from '../../../src/shared/transport/fs.js';
 import {
   FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY,
   FILE_TRANSFER_MSG,
@@ -1105,6 +1106,25 @@ interface PendingFsRoute {
 
 type PendingFsRouteMap = Map<string, PendingFsRoute>;
 
+interface PendingRepoRoute {
+  socket: WebSocket;
+  timer: ReturnType<typeof setTimeout>;
+}
+
+const REPO_REQUEST_TYPES = new Set<string>([
+  REPO_MSG.DETECT,
+  REPO_MSG.LIST_ISSUES,
+  REPO_MSG.LIST_PRS,
+  REPO_MSG.LIST_BRANCHES,
+  REPO_MSG.LIST_COMMITS,
+  REPO_MSG.LIST_ACTIONS,
+  REPO_MSG.CHECKOUT_BRANCH,
+  REPO_MSG.ACTION_DETAIL,
+  REPO_MSG.COMMIT_DETAIL,
+  REPO_MSG.PR_DETAIL,
+  REPO_MSG.ISSUE_DETAIL,
+]);
+
 // Periodic cleanup interval handle (module-level, shared across all bridge instances)
 let cleanupSweepHandle: ReturnType<typeof setInterval> | null = null;
 let shareClockNow = (): number => Date.now();
@@ -1221,6 +1241,8 @@ export class WsBridge {
   private pendingFsWriteRequests: PendingFsRouteMap = new Map();
   private pendingFsRenameRequests: PendingFsRouteMap = new Map();
   private pendingFsDeleteRequests: PendingFsRouteMap = new Map();
+  /** Repo responses are request-scoped and must never be broadcast to another shared browser. */
+  private pendingRepoRequests = new Map<string, PendingRepoRoute>();
 
   /** Per-request timeline pending map — routes responses via requestId unicast. */
   private pendingTimelineRequests = new Map<string, PendingTimelineRequest>();
@@ -1525,6 +1547,27 @@ export class WsBridge {
         map.delete(requestId);
       }
     }
+  }
+
+  private registerPendingRepoRoute(ws: WebSocket, msg: Record<string, unknown>): void {
+    const requestId = optionalString(msg.requestId);
+    if (!requestId) return;
+    const previous = this.pendingRepoRequests.get(requestId);
+    if (previous) clearTimeout(previous.timer);
+    const timer = setTimeout(() => this.pendingRepoRequests.delete(requestId), FS_PENDING_UNICAST_TIMEOUT_MS);
+    timer.unref?.();
+    this.pendingRepoRequests.set(requestId, { socket: ws, timer });
+  }
+
+  private forwardPendingRepoRoute(msg: Record<string, unknown>): boolean {
+    const requestId = optionalString(msg.requestId);
+    if (!requestId) return false;
+    const pending = this.pendingRepoRequests.get(requestId);
+    if (!pending) return false;
+    clearTimeout(pending.timer);
+    this.pendingRepoRequests.delete(requestId);
+    safeSend(pending.socket, JSON.stringify(msg));
+    return true;
   }
 
   private registerPendingTimelineRequest(ws: WebSocket, msg: Record<string, unknown>): void {
@@ -3236,6 +3279,10 @@ export class WsBridge {
           msg = shareCommandDecision.stampedMessage;
           raw = JSON.stringify(msg);
         }
+        if (typeof msg.type === 'string' && REPO_REQUEST_TYPES.has(msg.type) && msg.projectDir !== FS_SESSION_ROOT_PATH) {
+          this.rejectShareScopedBrowserCommand(ws, msg, SHARE_REASONS.DIRECT_SURFACE_DENIED);
+          return;
+        }
       }
       const browserMessageType = typeof msg.type === 'string' ? msg.type : '';
       if (!browserMessageType) {
@@ -3395,6 +3442,10 @@ export class WsBridge {
       if (msg.type === REPO_MSG.CHECKOUT_BRANCH) {
         const authorized = await this.verifyRepoCheckoutAuthorization(ws, msg);
         if (!authorized) return;
+      }
+
+      if (REPO_REQUEST_TYPES.has(browserMessageType)) {
+        this.registerPendingRepoRoute(ws, msg);
       }
 
       // Track fs.ls requests for single-cast response routing
@@ -5173,6 +5224,7 @@ export class WsBridge {
 
     // Repo messages: use shared constants to prevent type-name drift between daemon and bridge
     if ((REPO_RELAY_TYPES as Set<string>).has(type)) {
+      if (this.forwardPendingRepoRoute(msg)) return;
       this.broadcastToBrowsers(JSON.stringify(msg));
       return;
     }
@@ -5752,6 +5804,11 @@ export class WsBridge {
     this.transportSubscriptionRevisions.delete(ws);
     this.transportSubscriptions.delete(ws);
     this.clearPendingFsRoutesForSocket(ws);
+    for (const [requestId, pending] of this.pendingRepoRequests) {
+      if (pending.socket !== ws) continue;
+      clearTimeout(pending.timer);
+      this.pendingRepoRequests.delete(requestId);
+    }
     this.peerAuditRouter.dropSocket(ws);
     this.directFileTransferRouter.dropSocket(ws);
     // Clean up pending timeline requests for this socket
@@ -5835,6 +5892,18 @@ export class WsBridge {
     if (!requestId || !sessionId || !projectDir || typeof msg.branch !== 'string') {
       sendRepoError('invalid_params');
       return false;
+    }
+
+    // Share-scoped commands have already passed the live participant + covered
+    // session policy immediately above this handler. They may address only the
+    // daemon-owned virtual session root; accepting a host path here would turn
+    // repository checkout into a path-selection capability.
+    if (this.browserShareStates.has(ws)) {
+      if (projectDir !== FS_SESSION_ROOT_PATH) {
+        sendRepoError('unauthorized');
+        return false;
+      }
+      return true;
     }
 
     if (!this.db) return true;

@@ -126,6 +126,30 @@ describe('CronManager', () => {
     expect(deleteBtn.disabled).toBe(true);
   });
 
+  it('scopes shared viewer requests to the covered session and hides mutations', async () => {
+    apiFetch.mockResolvedValueOnce({ jobs: [cronJob()] });
+
+    render(
+      <CronManager
+        serverId="srv-current"
+        projectName="cd"
+        sessions={sessions}
+        subSessions={subSessions}
+        activeSession="deck_cd_brain"
+        sharedSessionName="deck_cd_brain"
+        readOnly
+        onBack={vi.fn()}
+      />,
+    );
+
+    expect(await screen.findByText('Current job')).toBeDefined();
+    expect(apiFetch).toHaveBeenCalledWith(expect.stringContaining('sessionName=deck_cd_brain'));
+    expect(screen.queryByTitle('cron.create')).toBeNull();
+    expect((screen.getByText('▶') as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByText('✎') as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByText('✕') as HTMLButtonElement).disabled).toBe(true);
+  });
+
   it('renders other-tab jobs as read-only', async () => {
     apiFetch.mockResolvedValueOnce({
       jobs: [{

@@ -79,6 +79,10 @@ interface Props {
   servers?: ServerSlim[];
   /** WS client used to subscribe to server-pushed cron `resource.changed` events. */
   ws?: WsClient | null;
+  /** Concrete covered session used to authorize a received share. */
+  sharedSessionName?: string;
+  /** Viewer shares can inspect schedules and history but cannot mutate them. */
+  readOnly?: boolean;
 }
 
 type CronSendActionView = Extract<CronAction, { type: 'send' }>;
@@ -191,7 +195,7 @@ function isCurrentContextJob(job: Pick<CronJob, 'server_id' | 'project_name'>, s
 
 // ── Component ────────────────────────────────────────────────────────────
 
-export function CronManager({ serverId, projectName, sessions, subSessions = [], activeSession, onBack: _onBack, onViewDiscussion, onNavigateSession, servers = [], ws }: Props) {
+export function CronManager({ serverId, projectName, sessions, subSessions = [], activeSession, onBack: _onBack, onViewDiscussion, onNavigateSession, servers = [], ws, sharedSessionName, readOnly = false }: Props) {
   const { t } = useTranslation();
   const [jobs, setJobs] = useState<CronJob[]>([]);
   const [loading, setLoading] = useState(true);
@@ -208,6 +212,12 @@ export function CronManager({ serverId, projectName, sessions, subSessions = [],
   const [crossExecsLoading, setCrossExecsLoading] = useState(false);
 
   const serverNameMap = new Map(servers.map(s => [s.id, s.name]));
+  const scopedUrl = useCallback((path: string) => {
+    if (!sharedSessionName) return path;
+    const join = path.includes('?') ? '&' : '?';
+    return `${path}${join}sessionName=${encodeURIComponent(sharedSessionName)}`;
+  }, [sharedSessionName]);
+  const effectiveShowAllServers = !sharedSessionName && showAllServers;
 
   // Wrap onNavigateSession to close internal panels before navigating
   const handleNavigateSession = useMemo(() => {
@@ -225,8 +235,8 @@ export function CronManager({ serverId, projectName, sessions, subSessions = [],
   // ── Load jobs ──────────────────────────────────────────────────────────
   const loadJobs = useCallback(async (silent = false) => {
     try {
-      const q = showAllServers ? '' : `serverId=${serverId}&projectName=${projectName}`;
-      const res = await apiFetch<{ jobs: CronJob[] }>(`/api/cron?${q}`);
+      const q = effectiveShowAllServers ? '' : `serverId=${encodeURIComponent(serverId)}&projectName=${encodeURIComponent(projectName)}`;
+      const res = await apiFetch<{ jobs: CronJob[] }>(scopedUrl(`/api/cron?${q}`));
       setJobs(res.jobs);
       setError(null);
     } catch (err) {
@@ -236,7 +246,7 @@ export function CronManager({ serverId, projectName, sessions, subSessions = [],
     } finally {
       setLoading(false);
     }
-  }, [serverId, projectName, showAllServers]);
+  }, [serverId, projectName, effectiveShowAllServers, scopedUrl]);
 
   useEffect(() => { loadJobs(); }, [loadJobs]);
 
@@ -265,15 +275,15 @@ export function CronManager({ serverId, projectName, sessions, subSessions = [],
   const loadCrossExecs = useCallback(async () => {
     setCrossExecsLoading(true);
     try {
-      const q = showAllServers ? `mode=${execMode}` : `mode=${execMode}&serverId=${serverId}`;
-      const res = await apiFetch<{ executions: CrossJobExecution[] }>(`/api/cron/executions?${q}`);
+      const q = effectiveShowAllServers ? `mode=${execMode}` : `mode=${execMode}&serverId=${encodeURIComponent(serverId)}`;
+      const res = await apiFetch<{ executions: CrossJobExecution[] }>(scopedUrl(`/api/cron/executions?${q}`));
       setCrossExecs(res.executions);
     } catch (err) {
       setError(String(err));
     } finally {
       setCrossExecsLoading(false);
     }
-  }, [serverId, showAllServers, execMode]);
+  }, [serverId, effectiveShowAllServers, execMode, scopedUrl]);
 
   useEffect(() => { if (tab === 'executions') loadCrossExecs(); }, [tab, loadCrossExecs]);
 
@@ -281,7 +291,7 @@ export function CronManager({ serverId, projectName, sessions, subSessions = [],
   const handlePauseResume = async (job: CronJob) => {
     const newStatus = job.status === CRON_STATUS.ACTIVE ? CRON_STATUS.PAUSED : CRON_STATUS.ACTIVE;
     try {
-      await apiFetch(`/api/cron/${job.id}/status`, { method: 'PATCH', body: JSON.stringify({ status: newStatus }) });
+      await apiFetch(scopedUrl(`/api/cron/${job.id}/status`), { method: 'PATCH', body: JSON.stringify({ status: newStatus }) });
       await loadJobs();
     } catch (err) {
       setError(String(err));
@@ -291,7 +301,7 @@ export function CronManager({ serverId, projectName, sessions, subSessions = [],
   const handleDelete = async (job: CronJob) => {
     if (!window.confirm(t('cron.confirm_delete'))) return;
     try {
-      await apiFetch(`/api/cron/${job.id}`, { method: 'DELETE' });
+      await apiFetch(scopedUrl(`/api/cron/${job.id}`), { method: 'DELETE' });
       setJobs(prev => prev.filter(j => j.id !== job.id));
     } catch (err) {
       setError(String(err));
@@ -301,7 +311,7 @@ export function CronManager({ serverId, projectName, sessions, subSessions = [],
   const handleTriggerNow = async (job: CronJob) => {
     if (!window.confirm(t('cron.confirm_trigger'))) return;
     try {
-      await apiFetch(`/api/cron/${job.id}/trigger`, { method: 'POST' });
+      await apiFetch(scopedUrl(`/api/cron/${job.id}/trigger`), { method: 'POST' });
       await loadJobs();
     } catch (err) {
       setError(String(err));
@@ -323,7 +333,7 @@ export function CronManager({ serverId, projectName, sessions, subSessions = [],
     setSubPanel(`history:${jobId}`);
     if (!historyData[jobId]) {
       try {
-        const res = await apiFetch<{ executions: CronExecution[] }>(`/api/cron/${jobId}/executions?limit=20`);
+        const res = await apiFetch<{ executions: CronExecution[] }>(scopedUrl(`/api/cron/${jobId}/executions?limit=20`));
         setHistoryData(prev => ({ ...prev, [jobId]: res.executions }));
       } catch { /* ignore */ }
     }
@@ -362,10 +372,10 @@ export function CronManager({ serverId, projectName, sessions, subSessions = [],
             {t('cron.history')}
           </button>
         </div>
-        <label style={{ color: '#94a3b8', fontSize: '12px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '4px' }}>
+        {!sharedSessionName && <label style={{ color: '#94a3b8', fontSize: '12px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '4px' }}>
           <input type="checkbox" checked={showAllServers} onChange={toggleShowAll} />
           {t('cron.show_all_servers')}
-        </label>
+        </label>}
         <div style={{ flex: 1 }} />
         {tab === 'executions' && (
           <div style={{ display: 'flex', gap: '2px', background: '#0f172a', borderRadius: '6px', padding: '2px' }}>
@@ -381,7 +391,7 @@ export function CronManager({ serverId, projectName, sessions, subSessions = [],
             </button>
           </div>
         )}
-        {tab === 'tasks' && (
+        {tab === 'tasks' && !readOnly && (
           <button onClick={() => { setEditingJob(null); setSubPanel('form'); }}
             style={{ padding: '3px 10px', background: '#3b82f6', color: '#fff', border: 'none', borderRadius: '6px', cursor: 'pointer', fontSize: '16px', lineHeight: 1 }}
             title={t('cron.create')}>+</button>
@@ -396,7 +406,7 @@ export function CronManager({ serverId, projectName, sessions, subSessions = [],
           executions={crossExecs}
           loading={crossExecsLoading}
           serverNameMap={serverNameMap}
-          showAllServers={showAllServers}
+          showAllServers={effectiveShowAllServers}
           onViewDiscussion={onViewDiscussion}
           onNavigateSession={handleNavigateSession}
           t={t}
@@ -412,12 +422,12 @@ export function CronManager({ serverId, projectName, sessions, subSessions = [],
 
       {tab === 'tasks' && jobs.map(job => {
         const action = parseAction(job.action);
-        const isReadOnly = !isCurrentContextJob(job, serverId, projectName);
+        const isReadOnly = readOnly || !isCurrentContextJob(job, serverId, projectName);
         return (
           <div key={job.id} style={{ ...cardStyle, padding: '12px 16px', marginBottom: '10px' }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '6px' }}>
               <span style={{ color: '#e2e8f0', fontWeight: 600, fontSize: '14px', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{job.name}</span>
-              {showAllServers && <span style={{ color: '#64748b', fontSize: '11px', flexShrink: 0 }}>{serverNameMap.get(job.server_id) ?? job.server_id.slice(0, 6)} / {job.project_name}</span>}
+              {effectiveShowAllServers && <span style={{ color: '#64748b', fontSize: '11px', flexShrink: 0 }}>{serverNameMap.get(job.server_id) ?? job.server_id.slice(0, 6)} / {job.project_name}</span>}
               {isReadOnly && (
                 <span title={t('cron.read_only_scope')} style={{ color: '#fbbf24', fontSize: '11px', fontWeight: 600, flexShrink: 0 }}>
                   {t('cron.read_only')}
@@ -477,6 +487,7 @@ export function CronManager({ serverId, projectName, sessions, subSessions = [],
               sessions={eligible}
               subSessions={scopedSubs}
               activeSession={activeSession}
+              sharedSessionName={sharedSessionName}
               job={editingJob}
               onDone={handleFormDone}
               onCancel={() => { setSubPanel(null); setEditingJob(null); }}
@@ -885,6 +896,7 @@ interface CronFormProps {
   sessions: SessionInfo[];
   subSessions?: SubSessionSlim[];
   activeSession?: string | null;
+  sharedSessionName?: string;
   job: CronJob | null; // null = create, non-null = edit
   onDone: () => void;
   onCancel: () => void;
@@ -892,7 +904,7 @@ interface CronFormProps {
 
 const CRON_COMMAND_INLINE_CHAR_LIMIT = 5000;
 
-function CronForm({ serverId, projectName, sessions, subSessions = [], activeSession, job, onDone, onCancel }: CronFormProps) {
+function CronForm({ serverId, projectName, sessions, subSessions = [], activeSession, sharedSessionName, job, onDone, onCancel }: CronFormProps) {
   const { t } = useTranslation();
   const isEdit = !!job;
   const existingAction = job ? parseAction(job.action) : null;
@@ -1012,10 +1024,11 @@ function CronForm({ serverId, projectName, sessions, subSessions = [], activeSes
     };
 
     try {
+      const sharedQuery = sharedSessionName ? `?sessionName=${encodeURIComponent(sharedSessionName)}` : '';
       if (isEdit) {
-        await apiFetch(`/api/cron/${job.id}`, { method: 'PUT', body: JSON.stringify(payload) });
+        await apiFetch(`/api/cron/${job.id}${sharedQuery}`, { method: 'PUT', body: JSON.stringify(payload) });
       } else {
-        await apiFetch('/api/cron', { method: 'POST', body: JSON.stringify(payload) });
+        await apiFetch(`/api/cron${sharedQuery}`, { method: 'POST', body: JSON.stringify(payload) });
       }
       onDone();
     } catch (err: unknown) {

@@ -19,6 +19,7 @@ import {
   type FileBrowserPreviewUpdate,
 } from './components/file-browser-lazy.js';
 import { DAEMON_MSG } from '@shared/daemon-events.js';
+import { FS_SESSION_ROOT_PATH } from '../../src/shared/transport/fs.js';
 import { P2P_WORKFLOW_MSG } from '@shared/p2p-workflow-messages.js';
 import { RECONNECT_GRACE_MS } from '@shared/ack-protocol.js';
 import type { UsageContextWindowSource } from '@shared/usage-context-window.js';
@@ -4398,6 +4399,9 @@ export function App() {
   }
 
   const activeSessionInfo = sessions.find((s) => s.name === activeSession) ?? null;
+  const sharedAccessRole = selectedShareTarget
+    ? (activeSessionInfo?.sharedState?.effectiveRole ?? 'viewer')
+    : null;
 
   const resolveRepoProjectDir = useCallback((sessionId?: string | null) => {
     if (!sessionId) return activeSessionInfo?.projectDir ?? undefined;
@@ -4410,7 +4414,9 @@ export function App() {
   const openRepoPage = useCallback((target?: { sessionId?: string | null; projectDir?: string | null; initialTab?: RepoPageTabKey; parentSubId?: string | null }) => {
     runVersionSensitiveAction(trans('repo.info_title', { defaultValue: 'Repository information' }), () => {
       const sessionId = target?.sessionId ?? activeSession ?? null;
-      const projectDir = target?.projectDir ?? resolveRepoProjectDir(sessionId);
+      const projectDir = selectedShareTarget
+        ? FS_SESSION_ROOT_PATH
+        : target?.projectDir ?? resolveRepoProjectDir(sessionId);
       if (!projectDir) return;
       const subSessionTarget = sessionId ? subSessions.find((sub) => sub.sessionName === sessionId) : null;
       const parentSubId = target?.parentSubId ?? subSessionTarget?.id ?? null;
@@ -4448,10 +4454,12 @@ export function App() {
       }
       setShowRepoPage(true);
     });
-  }, [activeSession, ensureDesktopWindow, removeDesktopWindow, repoPanelTarget?.parentSubId, resolveRepoProjectDir, runVersionSensitiveAction, selectedServerId, subSessions, trans]);
+  }, [activeSession, ensureDesktopWindow, removeDesktopWindow, repoPanelTarget?.parentSubId, resolveRepoProjectDir, runVersionSensitiveAction, selectedServerId, selectedShareTarget, subSessions, trans]);
 
   const repoPanelSessionId = repoPanelTarget?.sessionId ?? activeSession ?? null;
-  const repoPanelProjectDir = repoPanelTarget?.projectDir ?? activeSessionInfo?.projectDir;
+  const repoPanelProjectDir = selectedShareTarget
+    ? FS_SESSION_ROOT_PATH
+    : repoPanelTarget?.projectDir ?? activeSessionInfo?.projectDir;
 
   // Audit fix (DiscussionsPage spam-fetch loop) — memoize the
   // request-scope object so its identity stays stable across parent
@@ -4971,6 +4979,7 @@ export function App() {
                 onPreviewStateChange: handlePreviewStateChange,
                 activeSession,
                 activeProjectDir: activeSessionInfo?.projectDir,
+                sharedAccessRole,
                 sessions,
                 servers: servers.map(s => ({ id: s.id, name: s.name })),
                 onQuote: (text) => {
@@ -5685,6 +5694,7 @@ export function App() {
                   onPreviewStateChange: handlePreviewStateChange,
                   activeSession,
                   activeProjectDir: activeSessionInfo?.projectDir,
+                  sharedAccessRole,
                   sessions,
                   servers: servers.map(s => ({ id: s.id, name: s.name })),
                   onQuote: (text) => {
@@ -5817,7 +5827,7 @@ export function App() {
           )}
           onFocus={() => bringDesktopWindowToFront(repoPanelDesktopWindowId)}
         >
-          <RepoPage ws={wsRef.current} sessionId={repoPanelSessionId} projectDir={repoPanelProjectDir} initialTab={repoPanelTarget?.initialTab} initialTabToken={repoPanelTarget?.initialTabToken} onBack={() => setShowRepoPage(false)} onCiEvent={(run) => {
+          <RepoPage ws={wsRef.current} sessionId={repoPanelSessionId} projectDir={repoPanelProjectDir} scopeToSessionRoot={!!sharedAccessRole} readOnly={sharedAccessRole === 'viewer'} initialTab={repoPanelTarget?.initialTab} initialTabToken={repoPanelTarget?.initialTabToken} onBack={() => setShowRepoPage(false)} onCiEvent={(run) => {
             const id = Date.now();
             const icon = run.status === 'success' ? '✅' : '❌';
             const failurePath = [run.failedJobName, run.failedStepName].filter(Boolean).join(' → ');
@@ -5928,6 +5938,8 @@ export function App() {
               sessions={sessions}
               subSessions={subSessionsSlim}
               activeSession={activeSession}
+              sharedSessionName={sharedAccessRole ? activeSession ?? undefined : undefined}
+              readOnly={sharedAccessRole === 'viewer'}
               onNavigateSession={(sessionName, quote) => {
                 setShowCronManager(false);
                 window.dispatchEvent(new CustomEvent('deck:navigate', { detail: { session: sessionName, quote } }));

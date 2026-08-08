@@ -20,6 +20,7 @@ import { FS_TRANSPORT_MSG } from '../../shared/fs-transport-messages.js';
 import { P2P_WORKFLOW_MSG } from '../../shared/p2p-workflow-messages.js';
 import { getShareScopedCommandPolicy } from '../../shared/tab-sharing.js';
 import { REPO_MSG } from '../../shared/repo-types.js';
+import { FS_SESSION_ROOT_PATH } from '../../src/shared/transport/fs.js';
 import { resetSharedCommandRateLimitsForTests } from '../src/share/share-rate-limit.js';
 import { TIMELINE_MESSAGES } from '../../shared/timeline-protocol.js';
 import { DIRECT_FILE_TRANSFER_MSG } from '../../shared/direct-file-transfer.js';
@@ -639,6 +640,84 @@ describe('WsBridge share-scoped sockets', () => {
     expect(shared.sentJson).toEqual(expect.arrayContaining([
       expect.objectContaining({ type: 'error', code: SHARE_REASONS.ROLE_DENIED, originalType: 'fs.write' }),
       expect.objectContaining({ type: 'error', code: SHARE_REASONS.DIRECT_SURFACE_DENIED, originalType: 'fs.read' }),
+    ]));
+  });
+
+  it('single-casts covered repository reads and permits checkout only for participants', async () => {
+    const bridge = WsBridge.get(serverId);
+    const target: ShareTarget = { kind: 'main', serverId, sessionName: 'deck_proj_brain' };
+    bridge.setShareCoverageResolverForTests(async () => coverage(target, 'participant', now));
+    const daemon = new MockWs();
+    bridge.handleDaemonConnection(daemon as never, makeDb(), {} as never);
+    daemon.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+    await flushAsync();
+    daemon.sent.length = 0;
+
+    const participant = new MockWs();
+    bridge.handleShareBrowserConnection(participant as never, 'participant-user', makeDb(), {
+      ticketId: 'repo-participant', target, snapshot: coverage(target, 'participant', now),
+    });
+    const member = new MockWs();
+    bridge.handleBrowserConnection(member as never, 'member-user', makeDb());
+    member.sent.length = 0;
+
+    participant.emit('message', JSON.stringify({
+      type: REPO_MSG.DETECT,
+      requestId: 'repo-shared-detect',
+      projectDir: FS_SESSION_ROOT_PATH,
+      sessionName: 'deck_proj_brain',
+    }));
+    participant.emit('message', JSON.stringify({
+      type: REPO_MSG.CHECKOUT_BRANCH,
+      requestId: 'repo-shared-checkout',
+      projectDir: FS_SESSION_ROOT_PATH,
+      sessionId: 'deck_proj_brain',
+      branch: 'feature/shared',
+    }));
+    participant.emit('message', JSON.stringify({
+      type: REPO_MSG.LIST_COMMITS,
+      requestId: 'repo-host-path-bypass',
+      projectDir: '/owner/other-project',
+      sessionName: 'deck_proj_brain',
+    }));
+    await flushAsync();
+
+    expect(daemon.sentJson).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: REPO_MSG.DETECT, requestId: 'repo-shared-detect' }),
+      expect.objectContaining({ type: REPO_MSG.CHECKOUT_BRANCH, requestId: 'repo-shared-checkout' }),
+    ]));
+    expect(daemon.sentJson.some((msg) => msg.requestId === 'repo-host-path-bypass')).toBe(false);
+    expect(participant.sentJson).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: 'error', code: SHARE_REASONS.DIRECT_SURFACE_DENIED, originalType: REPO_MSG.LIST_COMMITS }),
+    ]));
+
+    daemon.emit('message', JSON.stringify({
+      type: REPO_MSG.DETECT_RESPONSE,
+      requestId: 'repo-shared-detect',
+      projectDir: '/owner/project',
+      status: 'ok',
+    }));
+    await flushAsync();
+    expect(participant.sentJson).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: REPO_MSG.DETECT_RESPONSE, requestId: 'repo-shared-detect' }),
+    ]));
+    expect(member.sentJson.some((msg) => msg.requestId === 'repo-shared-detect')).toBe(false);
+
+    bridge.setShareCoverageResolverForTests(async () => coverage(target, 'viewer', now));
+    const viewer = new MockWs();
+    bridge.handleShareBrowserConnection(viewer as never, 'viewer-user', makeDb(), {
+      ticketId: 'repo-viewer', target, snapshot: coverage(target, 'viewer', now),
+    });
+    viewer.emit('message', JSON.stringify({
+      type: REPO_MSG.CHECKOUT_BRANCH,
+      requestId: 'repo-viewer-checkout',
+      projectDir: FS_SESSION_ROOT_PATH,
+      sessionId: 'deck_proj_brain',
+      branch: 'main',
+    }));
+    await flushAsync();
+    expect(viewer.sentJson).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: 'error', code: SHARE_REASONS.ROLE_DENIED, originalType: REPO_MSG.CHECKOUT_BRANCH }),
     ]));
   });
 

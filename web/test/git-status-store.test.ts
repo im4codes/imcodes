@@ -18,6 +18,7 @@ import {
   type ChangeFile,
 } from '../src/git-status-store.js';
 import type { WsClient, ServerMessage } from '../src/ws-client.js';
+import { FS_SESSION_ROOT_PATH } from '../../src/shared/transport/fs.js';
 
 function makeFakeWs() {
   const requestIds: string[] = [];
@@ -202,5 +203,16 @@ describe('git-status-store — refresh resilience', () => {
     expect(listener).not.toHaveBeenLastCalledWith([{ path: '/repo/e/stale.ts', code: 'A' }]);
     emit(filesResponse('req-3', []));
     expect(listener).toHaveBeenLastCalledWith([]);
+  });
+
+  it('keeps a shared checkout refresh bound to the covered session root', () => {
+    const { ws } = makeFakeWs();
+
+    forceRefreshSharedChangesForCheckout(ws, FS_SESSION_ROOT_PATH, 1, 'deck_proj_brain');
+
+    expect(ws.fsGitStatus).toHaveBeenCalledWith(FS_SESSION_ROOT_PATH, {
+      includeStats: true,
+      sessionName: 'deck_proj_brain',
+    });
   });
 });

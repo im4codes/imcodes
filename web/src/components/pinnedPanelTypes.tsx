@@ -24,6 +24,7 @@ import { SharedContextManagementPanel } from './SharedContextManagementPanel.js'
 import { ContextDiagnosticsPanel } from './ContextDiagnosticsPanel.js';
 import { resolveEffectiveSessionModel } from '@shared/session-model.js';
 import { resolveTimelineBackedSessionState } from '../session-live-status.js';
+import { FS_SESSION_ROOT_PATH } from '../../../src/shared/transport/fs.js';
 
 export const LOCAL_WEB_PREVIEW_PANEL_TYPE = 'localwebpreview';
 export const SHARED_CONTEXT_MANAGEMENT_PANEL_TYPE = 'sharedcontext-management';
@@ -160,7 +161,9 @@ registerPanelType('filebrowser', {
   title: () => '📁 Files',
   render: (panel, ctx) => {
     // Follow active tab's project dir; fall back to captured dir at pin time
-    const projectDir = ctx.activeProjectDir ?? panel.props?.projectDir as string | undefined;
+    const projectDir = ctx.sharedAccessRole
+      ? FS_SESSION_ROOT_PATH
+      : ctx.activeProjectDir ?? (panel.props?.projectDir as string | undefined);
     if (!ctx.ws || !projectDir) return <div class="sidebar-pinned-unavailable">No project dir</div>;
     const activeSession = ctx.activeSession ?? panel.props?.sessionName as string | undefined;
     return (
@@ -169,6 +172,8 @@ registerPanelType('filebrowser', {
         ws={ctx.ws}
         serverId={ctx.serverId}
         sessionName={activeSession}
+        scopeToSessionRoot={!!ctx.sharedAccessRole}
+        readOnly={ctx.sharedAccessRole === 'viewer'}
         mode="file-multi"
         layout="panel"
         initialPath={projectDir}
@@ -210,7 +215,9 @@ registerPanelType('repopage', {
   title: () => 'Repository',
   render: (panel, ctx) => {
     // Follow active tab's project dir — keep mounted during WS reconnect to preserve state
-    const projectDir = ctx.activeProjectDir ?? panel.props?.projectDir as string | undefined;
+    const projectDir = ctx.sharedAccessRole
+      ? FS_SESSION_ROOT_PATH
+      : ctx.activeProjectDir ?? (panel.props?.projectDir as string | undefined);
     if (!ctx.ws || !projectDir) return <div class="sidebar-pinned-unavailable">No project dir</div>;
     return (
       <RepoPage
@@ -218,6 +225,8 @@ registerPanelType('repopage', {
         ws={ctx.ws}
         sessionId={ctx.activeSession ?? panel.props?.sessionName as string | undefined}
         projectDir={projectDir}
+        scopeToSessionRoot={!!ctx.sharedAccessRole}
+        readOnly={ctx.sharedAccessRole === 'viewer'}
         onBack={() => {}}
         onCiEvent={ctx.onCiEvent ?? (() => {})}
       />
@@ -246,6 +255,8 @@ registerPanelType('cronmanager', {
         sessions={(ctx.sessions ?? []) as any}
         subSessions={subSessionsSlim}
         activeSession={ctx.activeSession}
+        sharedSessionName={ctx.sharedAccessRole ? ctx.activeSession ?? undefined : undefined}
+        readOnly={ctx.sharedAccessRole === 'viewer'}
         onBack={() => {}}
         onNavigateSession={(sessionName, quote) => {
           window.dispatchEvent(new CustomEvent('deck:navigate', { detail: { session: sessionName, quote } }));

@@ -1511,35 +1511,35 @@ export class WsClient {
   // ── Repo commands ──────────────────────────────────────────────────────────
 
   /** Detect repo context for a project directory. Returns requestId. */
-  repoDetect(projectDir: string, opts?: { force?: boolean }): string {
+  repoDetect(projectDir: string, opts?: { force?: boolean; sessionName?: string }): string {
     const requestId = crypto.randomUUID();
-    this.send({ type: REPO_MSG.DETECT, requestId, projectDir, ...(opts?.force ? { force: true } : {}) });
+    this.send({ type: REPO_MSG.DETECT, requestId, projectDir, ...(opts?.force ? { force: true } : {}), ...(opts?.sessionName ? { sessionName: opts.sessionName } : {}) });
     return requestId;
   }
 
   /** List issues for a project. Returns requestId. */
-  repoListIssues(projectDir: string, opts?: { state?: string; page?: number; force?: boolean }): string {
+  repoListIssues(projectDir: string, opts?: { state?: string; page?: number; force?: boolean; sessionName?: string }): string {
     const requestId = crypto.randomUUID();
     this.send({ type: REPO_MSG.LIST_ISSUES, requestId, projectDir, ...opts });
     return requestId;
   }
 
   /** List pull requests for a project. Returns requestId. */
-  repoListPRs(projectDir: string, opts?: { state?: string; page?: number; force?: boolean }): string {
+  repoListPRs(projectDir: string, opts?: { state?: string; page?: number; force?: boolean; sessionName?: string }): string {
     const requestId = crypto.randomUUID();
     this.send({ type: REPO_MSG.LIST_PRS, requestId, projectDir, ...opts });
     return requestId;
   }
 
   /** List branches for a project. Returns requestId. */
-  repoListBranches(projectDir: string, opts?: { force?: boolean }): string {
+  repoListBranches(projectDir: string, opts?: { force?: boolean; sessionName?: string }): string {
     const requestId = crypto.randomUUID();
-    this.send({ type: REPO_MSG.LIST_BRANCHES, requestId, projectDir, ...(opts?.force ? { force: true } : {}) });
+    this.send({ type: REPO_MSG.LIST_BRANCHES, requestId, projectDir, ...(opts?.force ? { force: true } : {}), ...(opts?.sessionName ? { sessionName: opts.sessionName } : {}) });
     return requestId;
   }
 
   /** List commits for a project. Returns requestId. */
-  repoListCommits(projectDir: string, opts?: { branch?: string; page?: number; force?: boolean }): string {
+  repoListCommits(projectDir: string, opts?: { branch?: string; page?: number; force?: boolean; sessionName?: string }): string {
     const requestId = crypto.randomUUID();
     this.send({ type: REPO_MSG.LIST_COMMITS, requestId, projectDir, ...opts });
     return requestId;
@@ -1559,37 +1559,37 @@ export class WsClient {
   }
 
   /** List workflow runs (CI/CD actions) for a project. Returns requestId. */
-  repoListActions(projectDir: string, opts?: { page?: number; force?: boolean }): string {
+  repoListActions(projectDir: string, opts?: { page?: number; force?: boolean; sessionName?: string }): string {
     const requestId = crypto.randomUUID();
     this.send({ type: REPO_MSG.LIST_ACTIONS, requestId, projectDir, ...opts });
     return requestId;
   }
 
   /** Get workflow run jobs/steps for a project. Returns requestId. */
-  repoActionDetail(projectDir: string, runId: number, opts?: { force?: boolean }): string {
+  repoActionDetail(projectDir: string, runId: number, opts?: { force?: boolean; sessionName?: string }): string {
     const requestId = crypto.randomUUID();
     this.send({ type: REPO_MSG.ACTION_DETAIL, projectDir, runId, requestId, ...opts });
     return requestId;
   }
 
   /** Get commit detail (diff stats, files). Returns requestId. */
-  repoCommitDetail(projectDir: string, sha: string): string {
+  repoCommitDetail(projectDir: string, sha: string, opts?: { sessionName?: string }): string {
     const requestId = crypto.randomUUID();
-    this.send({ type: REPO_MSG.COMMIT_DETAIL, projectDir, sha, requestId });
+    this.send({ type: REPO_MSG.COMMIT_DETAIL, projectDir, sha, requestId, ...(opts?.sessionName ? { sessionName: opts.sessionName } : {}) });
     return requestId;
   }
 
   /** Get PR detail (body, review, checks, stats). Returns requestId. */
-  repoPRDetail(projectDir: string, number: number): string {
+  repoPRDetail(projectDir: string, number: number, opts?: { sessionName?: string }): string {
     const requestId = crypto.randomUUID();
-    this.send({ type: REPO_MSG.PR_DETAIL, projectDir, number, requestId });
+    this.send({ type: REPO_MSG.PR_DETAIL, projectDir, number, requestId, ...(opts?.sessionName ? { sessionName: opts.sessionName } : {}) });
     return requestId;
   }
 
   /** Get issue detail (body, comments). Returns requestId. */
-  repoIssueDetail(projectDir: string, number: number): string {
+  repoIssueDetail(projectDir: string, number: number, opts?: { sessionName?: string }): string {
     const requestId = crypto.randomUUID();
-    this.send({ type: REPO_MSG.ISSUE_DETAIL, projectDir, number, requestId });
+    this.send({ type: REPO_MSG.ISSUE_DETAIL, projectDir, number, requestId, ...(opts?.sessionName ? { sessionName: opts.sessionName } : {}) });
     return requestId;
   }
 

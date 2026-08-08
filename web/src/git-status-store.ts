@@ -203,13 +203,14 @@ export function forceRefreshSharedChangesForCheckout(
   ws: WsClient,
   repoPath: string,
   repoGeneration?: number,
+  sessionName?: string,
 ): void {
   const key = getSharedChangesKey(ws, repoPath);
   if (typeof repoGeneration === 'number' && Number.isFinite(repoGeneration)) {
     if (checkoutRefreshGenerationByKey.get(key) === repoGeneration) return;
     checkoutRefreshGenerationByKey.set(key, repoGeneration);
   }
-  requestSharedChanges(ws, repoPath, true);
+  requestSharedChanges(ws, repoPath, true, sessionName);
 }
 
 export function settleSharedChangesRequest(requestId: string, files: ChangeFile[] | null): boolean {

@@ -36,6 +36,8 @@ export interface PanelRenderContext {
   activeSession?: string | null;
   /** Current active session's project directory — follows tab switches */
   activeProjectDir?: string;
+  /** Present only while connected through a received share entry. */
+  sharedAccessRole?: 'viewer' | 'participant' | null;
   /** Quote callback — adds quoted text to the main session's input */
   onQuote?: (text: string) => void;
   /** Main sessions list — for panels that need session info (e.g., cron manager) */
