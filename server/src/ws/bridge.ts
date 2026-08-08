@@ -3838,7 +3838,7 @@ export class WsBridge {
 
   private shareAuditActionTypeForCommand(msg: Record<string, unknown>): ShareAuditActionType | null {
     const type = typeof msg.type === 'string' ? msg.type : '';
-    if (type === 'session.send') return 'session.send';
+    if (type === 'session.send' || type === 'subsession.set_model') return 'session.send';
     if (type === DAEMON_COMMAND_TYPES.SESSION_CANCEL) return 'session.cancel';
     if (type === 'discussion.start') return 'p2p.orchestration';
     return null;
@@ -3859,14 +3859,16 @@ export class WsBridge {
     now: number,
   ): ShareReason | null {
     const type = typeof msg.type === 'string' ? msg.type : '';
-    if (type !== 'session.send' && type !== DAEMON_COMMAND_TYPES.SESSION_CANCEL) return null;
+    if (type !== 'session.send'
+      && type !== 'subsession.set_model'
+      && type !== DAEMON_COMMAND_TYPES.SESSION_CANCEL) return null;
     const commandId = typeof msg.commandId === 'string' ? msg.commandId.trim() : '';
     if (commandId && this.inflightCommands.has(commandId)) return null;
-    if (type === 'session.send') {
+    if (type === 'session.send' || type === 'subsession.set_model') {
       const pending = [...this.inflightCommands.values()].filter((entry) => (
         entry.share?.userId === state.userId
         && entry.sessionName === sessionName
-        && this.rawPayloadType(entry.rawPayload) === 'session.send'
+        && this.rawPayloadType(entry.rawPayload) === type
       )).length;
       return evaluateSharedCommandRateLimit({
         userId: state.userId,

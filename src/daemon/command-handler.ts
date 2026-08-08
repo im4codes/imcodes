@@ -6073,7 +6073,6 @@ async function handleSubSessionDetectShells(serverLink: ServerLink): Promise<voi
 async function handleSubSessionSetModel(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
   const sessionName = cmd.sessionName as string | undefined;
   const model = cmd.model as string | undefined;
-  const cwd = cmd.cwd as string | undefined;
 
   if (!sessionName || !model) {
     logger.warn('subsession.set_model: missing sessionName or model');
@@ -6088,10 +6087,19 @@ async function handleSubSessionSetModel(cmd: Record<string, unknown>, serverLink
     return;
   }
 
+  // The session store is authoritative for the working directory. In
+  // particular, share-scoped participants may switch the model but must not
+  // be able to smuggle an arbitrary host path through the browser payload.
+  const existing = getSession(sessionName);
+  if (!existing) {
+    logger.warn({ sessionName }, 'subsession.set_model: session not found');
+    return;
+  }
+
   logger.info({ sessionName, model }, 'Restarting Codex sub-session with new model');
   await stopSubSession(sessionName, serverLink).catch(() => {});
   try {
-    await startSubSession({ id, type: 'codex', cwd: cwd ?? null, codexModel: model });
+    await startSubSession({ id, type: 'codex', cwd: existing.projectDir, codexModel: model });
     // Sync restarted sub-session to server DB
     try {
       await sendSubSessionSync(serverLink, id, undefined, getSubSessionSyncOptions(sessionName));

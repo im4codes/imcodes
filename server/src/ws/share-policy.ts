@@ -68,6 +68,7 @@ type ShareCommandPolicy =
   | { kind: 'participant-bound-action' }
   | { kind: 'participant-discussion-start' }
   | { kind: 'participant-send' }
+  | { kind: 'participant-model-switch' }
   | { kind: 'participant-cancel' }
   | { kind: 'deny'; reason: ShareReason };
 
@@ -113,6 +114,7 @@ export const SHARE_WS_COMMAND_POLICY_INVENTORY: readonly ShareBridgeCommandInven
   { bridgeCommand: TIMELINE_MESSAGES.DETAIL_REQUEST, sharedCommand: SHARE_BROWSER_COMMANDS.CHAT_HISTORY, policy: { kind: 'allow-covered-read', requireTarget: true } },
   { bridgeCommand: 'discussion.start', sharedCommand: SHARE_BROWSER_COMMANDS.DISCUSSION_START, policy: { kind: 'participant-discussion-start' } },
   { bridgeCommand: 'session.send', sharedCommand: SHARE_BROWSER_COMMANDS.SESSION_SEND, policy: { kind: 'participant-send' } },
+  { bridgeCommand: 'subsession.set_model', sharedCommand: SHARE_BROWSER_COMMANDS.SESSION_MODEL_SWITCH, policy: { kind: 'participant-model-switch' } },
   { bridgeCommand: DAEMON_COMMAND_TYPES.SESSION_CANCEL, sharedCommand: SHARE_BROWSER_COMMANDS.SESSION_CANCEL, policy: { kind: 'participant-cancel' } },
   { bridgeCommand: 'discussion.comment', sharedCommand: SHARE_BROWSER_COMMANDS.DISCUSSION_COMMENT, policy: { kind: 'allow-covered-read', requireTarget: false } },
   { bridgeCommand: 'fs.ls', sharedCommand: SHARE_BROWSER_COMMANDS.FILE_BROWSE, policy: { kind: 'allow-covered-read', requireTarget: true } },
@@ -350,6 +352,21 @@ export function evaluateShareCommand(input: {
     return sessionName && shareStateCoversSession(input.state, sessionName)
       ? { allowed: true }
       : { allowed: false, reason: SHARE_REASONS.DIRECT_SURFACE_DENIED };
+  }
+
+  if (policy.kind === 'participant-model-switch') {
+    if (!sessionName || !shareStateCoversSession(input.state, sessionName)) {
+      return { allowed: false, reason: SHARE_REASONS.DIRECT_SURFACE_DENIED };
+    }
+    const model = typeof input.msg.model === 'string' ? input.msg.model.trim() : '';
+    if (!model || model.length > 256) {
+      return { allowed: false, reason: SHARE_REASONS.DIRECT_SURFACE_DENIED };
+    }
+    const { cwd: _untrustedCwd, ...safeMessage } = input.msg;
+    return {
+      allowed: true,
+      stampedMessage: { ...safeMessage, model },
+    };
   }
 
   if (policy.kind === 'participant-discussion-start') {

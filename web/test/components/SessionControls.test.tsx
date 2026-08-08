@@ -7619,6 +7619,57 @@ afterEach(() => {
     });
   });
 
+  it('lets a shared participant switch models while keeping other shared controls gated', () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({
+          name: 'shared-copilot-session',
+          agentType: 'copilot-sdk',
+          runtimeType: 'transport',
+          activeModel: 'gpt-5.4',
+          sharedState: { effectiveRole: 'participant', status: 'active' },
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    const modelButton = screen.getByRole('button', { name: /^gpt-5.4$/i }) as HTMLButtonElement;
+    expect(modelButton.disabled).toBe(false);
+    expect((screen.getByTitle('actions') as HTMLButtonElement).disabled).toBe(true);
+
+    fireEvent.click(modelButton);
+    fireEvent.click(screen.getByRole('button', { name: /gpt-5.4-mini/i }));
+
+    expectSendPayload(ws, {
+      sessionName: 'shared-copilot-session',
+      text: '/model gpt-5.4-mini',
+    });
+  });
+
+  it('keeps the model selector disabled for a shared viewer', () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({
+          name: 'viewer-copilot-session',
+          agentType: 'copilot-sdk',
+          runtimeType: 'transport',
+          activeModel: 'gpt-5.4',
+          sharedState: { effectiveRole: 'viewer', status: 'active' },
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    const modelButton = screen.getByRole('button', { name: /^gpt-5.4$/i }) as HTMLButtonElement;
+    expect(modelButton.disabled).toBe(true);
+    expect(document.querySelector('.menu-dropdown')).toBeFalsy();
+    expect(gatherSendCalls(ws)).toHaveLength(0);
+  });
+
   it('shows a model selector for gemini-sdk and sends /model', () => {
     const ws = makeWs();
     render(

@@ -416,6 +416,7 @@ describe('WsBridge share-scoped sockets', () => {
         }
       } else if (
         actualPolicy?.kind === 'participant-send'
+        || actualPolicy?.kind === 'participant-model-switch'
         || actualPolicy?.kind === 'participant-cancel'
         || actualPolicy?.kind === 'participant-discussion-start'
         || actualPolicy?.kind === 'participant-covered-action'
@@ -743,7 +744,7 @@ describe('WsBridge share-scoped sockets', () => {
       type: 'session.send',
       commandId: 'cmd-participant',
       sessionName: 'deck_proj_brain',
-      text: 'hello',
+      text: '/model gpt-5.4',
       sharedActor: { actorUserId: 'spoofed' },
     }));
     await flushAsync();
@@ -751,6 +752,7 @@ describe('WsBridge share-scoped sockets', () => {
     const forwarded = daemon.sentJson.find((msg) => msg.type === 'session.send');
     expect(forwarded).toMatchObject({
       commandId: 'cmd-participant',
+      text: '/model gpt-5.4',
       sharedActor: {
         actorUserId: 'shared-user',
         actorDisplayName: 'Shared User',
@@ -759,6 +761,89 @@ describe('WsBridge share-scoped sockets', () => {
         origin: 'shared-tab',
       },
     });
+  });
+
+  it('allows only participants to switch a covered sub-session model and strips client paths', async () => {
+    const bridge = WsBridge.get(serverId);
+    const target: ShareTarget = { kind: 'subsession', serverId, subSessionId: 'child_1' };
+    const auditRows: AuditInsert[] = [];
+    const db = makeDb(null, auditRows);
+    bridge.setShareCoverageResolverForTests(async ({ userId }) => coverage(
+      target,
+      userId === 'viewer-user' ? 'viewer' : 'participant',
+      now,
+    ));
+    const daemon = new MockWs();
+    bridge.handleDaemonConnection(daemon as never, db, {} as never);
+    daemon.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+    await flushAsync();
+    daemon.sent.length = 0;
+
+    const participant = new MockWs();
+    bridge.handleShareBrowserConnection(participant as never, 'participant-user', db, {
+      ticketId: 'model-participant',
+      target,
+      snapshot: coverage(target, 'participant', now),
+    });
+    await flushAsync();
+
+    participant.emit('message', JSON.stringify({
+      type: 'subsession.set_model',
+      sessionName: 'deck_sub_child_1',
+      model: ' gpt-5.4 ',
+      cwd: '/untrusted/browser/path',
+    }));
+    participant.emit('message', JSON.stringify({
+      type: 'subsession.set_model',
+      sessionName: 'deck_sub_outside',
+      model: 'gpt-5.4',
+    }));
+    await flushAsync();
+
+    expect(daemon.sentJson).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: 'subsession.set_model',
+        sessionName: 'deck_sub_child_1',
+        model: 'gpt-5.4',
+      }),
+    ]));
+    const forwarded = daemon.sentJson.find((msg) => msg.type === 'subsession.set_model');
+    expect(forwarded).not.toHaveProperty('cwd');
+    expect(daemon.sentJson.some((msg) => msg.sessionName === 'deck_sub_outside')).toBe(false);
+    expect(participant.sentJson).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: 'error',
+        code: SHARE_REASONS.DIRECT_SURFACE_DENIED,
+        originalType: 'subsession.set_model',
+      }),
+    ]));
+
+    const viewer = new MockWs();
+    bridge.handleShareBrowserConnection(viewer as never, 'viewer-user', db, {
+      ticketId: 'model-viewer',
+      target,
+      snapshot: coverage(target, 'viewer', now),
+    });
+    viewer.emit('message', JSON.stringify({
+      type: 'subsession.set_model',
+      sessionName: 'deck_sub_child_1',
+      model: 'gpt-5.4',
+    }));
+    await flushAsync();
+
+    expect(viewer.sentJson).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: 'error',
+        code: SHARE_REASONS.ROLE_DENIED,
+        originalType: 'subsession.set_model',
+      }),
+    ]));
+    expect(daemon.sentJson.filter((msg) => msg.type === 'subsession.set_model')).toHaveLength(1);
+    expect(auditRows).toEqual(expect.arrayContaining([
+      expect.objectContaining({ actionType: 'session.send', decision: 'accepted', actorUserId: 'participant-user' }),
+      expect.objectContaining({ actionType: 'session.send', decision: 'rejected', actorUserId: 'participant-user', reason: SHARE_REASONS.DIRECT_SURFACE_DENIED }),
+      expect.objectContaining({ actionType: 'session.send', decision: 'rejected', actorUserId: 'viewer-user', reason: SHARE_REASONS.ROLE_DENIED }),
+    ]));
   });
 
   it('treats a shared main tab as covering its existing child sub-sessions over WS', async () => {

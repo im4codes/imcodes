@@ -1710,6 +1710,9 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const inputDisabled = !hasSession || !canSharedSessionSend;
   // Send/action buttons disabled when disconnected, missing a session, or share-scoped direct controls are unavailable.
   const disabled = !connected || !hasSession || isShareScopedSession;
+  // Model switching is a scoped participant action. Keep every other direct
+  // control under the stricter shared-session gate above.
+  const modelSwitchDisabled = !connected || !hasSession || !canSharedSessionSend;
   const isClaudeCode = activeSession?.agentType === 'claude-code' || activeSession?.agentType === 'claude-code-sdk';
   const isShellLike = activeSession?.agentType === 'shell' || activeSession?.agentType === 'script';
   const isTransport = effectiveRuntimeType === 'transport';
@@ -5164,7 +5167,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
               onClick={() => toggleModelMenu({
                 refreshDynamic: activeSession?.agentType === 'claude-code-sdk',
               })}
-              disabled={disabled}
+              disabled={modelSwitchDisabled}
               title={displayedClaudeModel ? `Model: ${displayedClaudeModel}` : 'Model: Unknown — tap to select'}
               style={{ color: displayedClaudeModel ? '#a78bfa' : '#6b7280', fontSize: 10 }}
             >
@@ -5192,7 +5195,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
               onClick={() => toggleModelMenu({
                 refreshDynamic: activeSession?.agentType === 'codex-sdk',
               })}
-              disabled={disabled}
+              disabled={modelSwitchDisabled}
               title={displayedCodexModel ? `Model: ${displayedCodexModel}` : 'Model: default — tap to select'}
               style={{ color: displayedCodexModel ? '#34d399' : '#6b7280', fontSize: 10 }}
             >
@@ -5218,7 +5221,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
             <button
               class="shortcut-btn"
               onClick={() => setModelOpen((o) => !o)}
-              disabled={disabled}
+              disabled={modelSwitchDisabled}
               title={qwenModel
                 ? t('session.qwen_model_title', { tier: qwenTierLabel, model: qwenModel })
                 : t('session.qwen_source_title', { tier: qwenTierLabel })}
@@ -5247,7 +5250,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
             <button
               class="shortcut-btn"
               onClick={() => toggleModelMenu({ refreshDynamic: true })}
-              disabled={disabled}
+              disabled={modelSwitchDisabled}
               title={genericTransportModel ? `Model: ${genericTransportModel}` : 'Model: default — tap to select'}
               style={{ color: genericTransportModel ? '#34d399' : '#6b7280', fontSize: 10 }}
             >
