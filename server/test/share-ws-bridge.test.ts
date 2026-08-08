@@ -20,6 +20,7 @@ import { P2P_WORKFLOW_MSG } from '../../shared/p2p-workflow-messages.js';
 import { getShareScopedCommandPolicy } from '../../shared/tab-sharing.js';
 import { REPO_MSG } from '../../shared/repo-types.js';
 import { resetSharedCommandRateLimitsForTests } from '../src/share/share-rate-limit.js';
+import { TIMELINE_MESSAGES } from '../../shared/timeline-protocol.js';
 
 class MockWs extends EventEmitter {
   sent: Array<string | Buffer> = [];
@@ -407,6 +408,10 @@ describe('WsBridge share-scoped sockets', () => {
       TRANSPORT_MSG.CHAT_SUBSCRIBE,
       TRANSPORT_MSG.CHAT_UNSUBSCRIBE,
       TRANSPORT_MSG.CHAT_HISTORY,
+      TIMELINE_MESSAGES.HISTORY_REQUEST,
+      TIMELINE_MESSAGES.REPLAY_REQUEST,
+      TIMELINE_MESSAGES.PAGE_REQUEST,
+      TIMELINE_MESSAGES.DETAIL_REQUEST,
     ];
     for (const [index, type] of targetlessReadCommands.entries()) {
       shared.emit('message', JSON.stringify({ type, requestId: `targetless-${index}` }));
@@ -657,6 +662,62 @@ describe('WsBridge share-scoped sockets', () => {
         type: 'chat.delta',
         sessionId: 'deck_sub_child_1',
         text: 'child output',
+      }),
+    ]));
+
+    const requestId = 'shared-child-history';
+    shared.sent.length = 0;
+    shared.emit('message', JSON.stringify({
+      type: TIMELINE_MESSAGES.HISTORY_REQUEST,
+      requestId,
+      sessionName: 'deck_sub_child_1',
+      limit: 50,
+    }));
+    await flushAsync();
+
+    expect(daemon.sentJson).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: TIMELINE_MESSAGES.HISTORY_REQUEST,
+        requestId,
+        sessionName: 'deck_sub_child_1',
+      }),
+    ]));
+
+    daemon.emit('message', JSON.stringify({
+      type: TIMELINE_MESSAGES.HISTORY,
+      requestId,
+      sessionName: 'deck_sub_child_1',
+      epoch: 1,
+      events: [{ eventId: 'child-history-1', sessionId: 'deck_sub_child_1', ts: 1, type: 'assistant.text', payload: { text: 'history' } }],
+    }));
+    await flushAsync();
+    await flushAsync();
+
+    expect(shared.sentJson).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: TIMELINE_MESSAGES.HISTORY,
+        requestId,
+        sessionName: 'deck_sub_child_1',
+        events: [expect.objectContaining({ eventId: 'child-history-1' })],
+      }),
+    ]));
+
+    daemon.sent.length = 0;
+    shared.sent.length = 0;
+    shared.emit('message', JSON.stringify({
+      type: TIMELINE_MESSAGES.HISTORY_REQUEST,
+      requestId: 'outside-history',
+      sessionName: 'deck_sub_outside',
+    }));
+    await flushAsync();
+
+    expect(daemon.sentJson.some((msg) => msg.requestId === 'outside-history')).toBe(false);
+    expect(shared.sentJson).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: 'error',
+        code: SHARE_REASONS.DIRECT_SURFACE_DENIED,
+        originalType: TIMELINE_MESSAGES.HISTORY_REQUEST,
+        requestId: 'outside-history',
       }),
     ]));
   });

@@ -13,7 +13,7 @@ import {
 } from '../db/queries.js';
 import { requireAuth, resolveServerRole } from '../security/authorization.js';
 import { shareTargetFromSessionName, targetExists } from '../db/tab-sharing.js';
-import { resolveHttpShareAccess } from './share-http-auth.js';
+import { resolveHttpShareAccessForCoveredSession } from './share-http-auth.js';
 import { WsBridge } from '../ws/bridge.js';
 import { IMCODES_POD_HEADER } from '../../../shared/http-header-names.js';
 import { TIMELINE_PAYLOAD_BUDGET_BYTES } from '../../../shared/timeline-payload-budget.js';
@@ -315,7 +315,7 @@ async function authorizeWatchTimelineSession(
 ): Promise<{ ok: true } | { ok: false; reason?: string }> {
   const target = shareTargetFromSessionName(params.serverId, params.sessionName);
   if (!target) return { ok: false, reason: 'share-target-unavailable' };
-  const access = await resolveHttpShareAccess(db, {
+  const access = await resolveHttpShareAccessForCoveredSession(db, {
     serverId: params.serverId,
     userId: params.userId,
     target,

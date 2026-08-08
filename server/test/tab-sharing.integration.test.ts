@@ -12,9 +12,10 @@ import {
   writeShareAuditEvent,
 } from '../src/db/tab-sharing.js';
 import { tabSharingRoutes } from '../src/routes/tab-sharing.js';
-import { resolveHttpShareAccess } from '../src/routes/share-http-auth.js';
+import { resolveHttpShareAccess, resolveHttpShareAccessForCoveredSession } from '../src/routes/share-http-auth.js';
 import { resolveServerRole } from '../src/security/authorization.js';
 import { signJwt, verifyJwt } from '../src/security/crypto.js';
+import { EXECUTION_CLONE_KIND } from '../../shared/execution-clone.js';
 
 const JWT_KEY = 'test-signing-key-32chars-padding!!';
 
@@ -275,6 +276,63 @@ describe('tab sharing persistence helpers', () => {
 
     const afterAllExpired = await resolveEffectiveShareCoverage(db, { userId: recipientId, target: mainTarget, now: 10_000 });
     expect(afterAllExpired).toBeNull();
+  });
+
+  it('lets a main share cover ordinary child HTTP history without covering execution clones', async () => {
+    const { ownerId, recipientId, serverId, sessionName, subSessionId } = await seedShareTarget();
+    await createOrUpdateShare(db, {
+      id: id('share'),
+      target: { kind: 'main', serverId, sessionName },
+      targetUserId: recipientId,
+      role: 'viewer',
+      createdBy: ownerId,
+      now: 1_000,
+    });
+
+    const childAccess = await resolveHttpShareAccessForCoveredSession(db, {
+      serverId,
+      userId: recipientId,
+      target: { kind: 'subsession', serverId, subSessionId },
+      now: 2_000,
+    });
+    expect(childAccess.actor).toMatchObject({
+      kind: 'share',
+      coverage: {
+        target: { kind: 'main', serverId, sessionName },
+        effectiveRole: 'viewer',
+      },
+    });
+
+    const cloneId = id('clone');
+    await createSubSession(
+      db,
+      cloneId,
+      serverId,
+      'codex',
+      null,
+      '/tmp/proj',
+      'Execution clone',
+      null,
+      null,
+      sessionName,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      { kind: EXECUTION_CLONE_KIND, parentRunId: id('run') },
+    );
+    const cloneAccess = await resolveHttpShareAccessForCoveredSession(db, {
+      serverId,
+      userId: recipientId,
+      target: { kind: 'subsession', serverId, subSessionId: cloneId },
+      now: 2_000,
+    });
+    expect(cloneAccess.actor).toEqual({ kind: 'none' });
   });
 });
 

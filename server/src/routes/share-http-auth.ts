@@ -1,4 +1,5 @@
 import type { Database } from '../db/client.js';
+import { getSubSessionById, isExecutionCloneRow } from '../db/queries.js';
 import { listActiveSharesForUser, resolveEffectiveShareCoverage, type ShareTarget } from '../db/tab-sharing.js';
 import { resolveServerRole, type ServerRole } from '../security/authorization.js';
 import { resolveEffectiveActor, type ResolveEffectiveActorResult } from '../../../shared/tab-sharing.js';
@@ -38,6 +39,35 @@ export async function resolveHttpShareAccess(
     membership,
     actor: resolveEffectiveActor(null, coverage),
   };
+}
+
+/**
+ * Resolve HTTP access to one concrete session using the same coverage model as
+ * the share-scoped WebSocket. A main-session share includes its ordinary child
+ * sub-sessions, but never execution clones.
+ *
+ * Direct membership, server shares, and explicit sub-session shares are
+ * resolved first. The parent lookup is only needed for an otherwise-denied
+ * sub-session target, keeping the common path unchanged.
+ */
+export async function resolveHttpShareAccessForCoveredSession(
+  db: Database,
+  params: { serverId: string; userId: string; target: ShareTarget; now?: number },
+): Promise<HttpShareAccess> {
+  const direct = await resolveHttpShareAccess(db, params);
+  if (direct.actor.kind !== 'none' || params.target.kind !== 'subsession') return direct;
+
+  const child = await getSubSessionById(db, params.target.subSessionId, params.serverId);
+  if (!child || child.closed_at !== null || isExecutionCloneRow(child) || !child.parent_session) return direct;
+
+  return resolveHttpShareAccess(db, {
+    ...params,
+    target: {
+      kind: 'main',
+      serverId: params.serverId,
+      sessionName: child.parent_session,
+    },
+  });
 }
 
 export async function resolveServerMemberAccessOrShareDeny(

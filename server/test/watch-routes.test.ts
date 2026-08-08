@@ -21,6 +21,7 @@ const mockSendToDaemon = vi.fn();
 const mockGetPodIdentity = vi.fn(() => 'pod-a');
 const mockDbQueryOne = vi.fn();
 const mockResolveHttpShareAccess = vi.fn();
+const mockResolveHttpShareAccessForCoveredSession = vi.fn();
 
 vi.mock('../src/security/authorization.js', () => ({
   requireAuth: () => async (c: { set: (key: string, value: string) => void }, next: () => Promise<void>) => {
@@ -64,6 +65,7 @@ vi.mock('../src/util/pod-identity.js', () => ({
 
 vi.mock('../src/routes/share-http-auth.js', () => ({
   resolveHttpShareAccess: (...args: unknown[]) => mockResolveHttpShareAccess(...args),
+  resolveHttpShareAccessForCoveredSession: (...args: unknown[]) => mockResolveHttpShareAccessForCoveredSession(...args),
 }));
 
 function makeEnv(): Env {
@@ -111,6 +113,9 @@ describe('Watch routes', () => {
         ? { membership: 'none', actor: { kind: 'none' } }
         : { membership: role, actor: { kind: 'server-member', effectiveActorRole: role === 'member' ? 'server-member' : 'server-manager' } };
     });
+    mockResolveHttpShareAccessForCoveredSession.mockImplementation(
+      (...args: unknown[]) => mockResolveHttpShareAccess(...args),
+    );
     mockGetFullServersByUserId.mockResolvedValue([]);
     mockGetDbSessionsByServer.mockResolvedValue([]);
     mockGetSubSessionsByServer.mockResolvedValue([]);
@@ -471,6 +476,48 @@ describe('Watch routes', () => {
     expect(mockRequestTimelineHistory).toHaveBeenCalledWith(expect.objectContaining({
       sessionName: 'deck_proj_brain',
       afterTs: 500,
+    }));
+  });
+
+  it('GET /api/server/:id/timeline/history authorizes a child through its shared parent main session', async () => {
+    mockResolveServerRole.mockResolvedValue('none');
+    mockResolveHttpShareAccess.mockResolvedValue({ membership: 'none', actor: { kind: 'none' } });
+    mockResolveHttpShareAccessForCoveredSession.mockResolvedValue({
+      membership: 'none',
+      actor: {
+        kind: 'share',
+        effectiveActorRole: 'viewer',
+        coverage: {
+          target: { kind: 'main', serverId: 'srv-1', sessionName: 'deck_proj_brain' },
+          effectiveRole: 'viewer',
+          historyCutoffAt: 0,
+          nextCoverageRecheckAt: null,
+          coveringShareIds: ['share-main'],
+          primaryShareId: 'share-main',
+          authorizedAt: 2_000,
+        },
+      },
+    });
+    mockRequestTimelineHistory.mockResolvedValue({
+      epoch: 2,
+      events: [{ eventId: 'child-event', sessionId: 'deck_sub_abc123', ts: 2, type: 'assistant.text', payload: { text: 'child history' } }],
+    });
+
+    const app = await buildTestApp();
+    const res = await app.request('/api/server/srv-1/timeline/history?sessionName=deck_sub_abc123');
+
+    expect(res.status).toBe(200);
+    expect(mockResolveHttpShareAccessForCoveredSession).toHaveBeenCalledWith(
+      expect.anything(),
+      {
+        serverId: 'srv-1',
+        userId: 'user-1',
+        target: { kind: 'subsession', serverId: 'srv-1', subSessionId: 'abc123' },
+      },
+    );
+    expect(mockResolveHttpShareAccess).not.toHaveBeenCalled();
+    expect(mockRequestTimelineHistory).toHaveBeenCalledWith(expect.objectContaining({
+      sessionName: 'deck_sub_abc123',
     }));
   });
 
