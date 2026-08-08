@@ -212,7 +212,7 @@ export const SHARE_SCOPED_DAEMON_MESSAGE_POLICY = new Map<string, DaemonMessageP
   ['session.idle', { target: sessionFieldTarget }],
   ['session.notification', { target: sessionFieldTarget }],
   ['session.tool', { target: sessionFieldTarget }],
-  ['command.ack', { target: sessionFieldTarget }],
+  ['command.ack', { target: sessionFieldTarget, redact: redactActiveDispatchForViewers }],
   ['command.failed', { target: sessionFieldTarget }],
   ['subsession.response', { target: sessionNameFieldTarget }],
   ['subsession.created', { target: subsessionCreatedTarget }],
@@ -690,10 +690,13 @@ const SHARE_VISIBLE_SESSION_FIELDS = new Set([
   'modelDisplay',
 ]);
 
-function redactSessionRow(row: Record<string, unknown>): Record<string, unknown> {
+function redactSessionRow(row: Record<string, unknown>, includeActiveDispatch: boolean): Record<string, unknown> {
   const redacted: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(row)) {
     if (SHARE_VISIBLE_SESSION_FIELDS.has(key)) redacted[key] = value;
+  }
+  if (includeActiveDispatch && Object.prototype.hasOwnProperty.call(row, 'activeDispatchId')) {
+    redacted.activeDispatchId = row.activeDispatchId;
   }
   return redacted;
 }
@@ -711,7 +714,10 @@ function redactSessionList(msg: Record<string, unknown>, state: ShareScopedSocke
       const name = (item as Record<string, unknown>).name;
       return typeof name === 'string' && shareStateCoversSession(state, name);
     })
-    .map((item) => redactSessionRow(item as Record<string, unknown>));
+    .map((item) => redactSessionRow(
+      item as Record<string, unknown>,
+      state.snapshot.effectiveRole === 'participant',
+    ));
   return { ...msg, sessions };
 }
 

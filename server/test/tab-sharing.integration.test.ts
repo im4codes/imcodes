@@ -16,6 +16,7 @@ import { resolveHttpShareAccess, resolveHttpShareAccessForCoveredSession } from 
 import { resolveServerRole } from '../src/security/authorization.js';
 import { signJwt, verifyJwt } from '../src/security/crypto.js';
 import { EXECUTION_CLONE_KIND } from '../../shared/execution-clone.js';
+import { WsBridge } from '../src/ws/bridge.js';
 
 const JWT_KEY = 'test-signing-key-32chars-padding!!';
 
@@ -452,11 +453,13 @@ describe('tab sharing APIs', () => {
     };
     expect(openBody.coverage).toMatchObject({ effectiveRole: 'viewer', historyCutoffAt: 0 });
     expect(openBody.sessions).toEqual([expect.objectContaining({ sessionName })]);
+    expect(openBody.sessions[0]).not.toHaveProperty('activeDispatchId');
     expect(openBody.subSessions).toEqual([expect.objectContaining({
       subSessionId,
       sessionName: `deck_sub_${subSessionId}`,
       parentSessionName: sessionName,
     })]);
+    expect(openBody.subSessions[0]).not.toHaveProperty('activeDispatchId');
 
     const openServer = await app.request('/api/shares/open', {
       method: 'POST',
@@ -807,6 +810,8 @@ describe('tab sharing APIs', () => {
       body: JSON.stringify({ target: { kind: 'subsession', serverId, subSessionId } }),
     });
     expect(open.status).toBe(403);
+    const activeDispatchSpy = vi.spyOn(WsBridge.get(serverId), 'getActiveDispatchIdForSession')
+      .mockImplementation((name) => name === sessionName ? 'dispatch-main-1' : 'dispatch-sub-1');
     const openMain = await app.request('/api/shares/open', {
       method: 'POST',
       headers: authHeaders(recipientId),
@@ -814,6 +819,7 @@ describe('tab sharing APIs', () => {
     });
     expect(openMain.status).toBe(200);
     const openBody = await openMain.json() as Record<string, unknown>;
+    activeDispatchSpy.mockRestore();
     expect(openBody).toMatchObject({
       server: {
         id: serverId,
@@ -826,6 +832,7 @@ describe('tab sharing APIs', () => {
           title: 'Main Label',
           state: 'idle',
           agentType: 'codex',
+          activeDispatchId: 'dispatch-main-1',
         },
       ],
       subSessions: [
@@ -835,6 +842,7 @@ describe('tab sharing APIs', () => {
           title: 'Sub Label',
           type: 'codex',
           parentSessionName: sessionName,
+          activeDispatchId: 'dispatch-sub-1',
         },
       ],
     });

@@ -4765,12 +4765,24 @@ export class WsBridge {
       if (type === 'session_list') {
         this.replaceActiveMainSessions(msg.sessions);
         this.pruneMainSessionRecentText(msg.sessions);
+        const sessions = Array.isArray(msg.sessions)
+          ? msg.sessions.map((rawSession) => {
+              if (!rawSession || typeof rawSession !== 'object') return rawSession;
+              const session = rawSession as Record<string, unknown>;
+              const name = typeof session.name === 'string' ? session.name : '';
+              return {
+                ...session,
+                activeDispatchId: name ? this.activeDispatchIds.get(name) ?? null : null,
+              };
+            })
+          : msg.sessions;
         this.broadcastToBrowsers(JSON.stringify({
-        ...msg,
-        daemonVersion: typeof msg.daemonVersion === 'string' ? msg.daemonVersion : this.daemonVersion,
-      }));
-      return;
-    }
+          ...msg,
+          sessions,
+          daemonVersion: typeof msg.daemonVersion === 'string' ? msg.daemonVersion : this.daemonVersion,
+        }));
+        return;
+      }
 
     // ── Timeline events: session-scoped ───────────────────────────────────────
     if (type === TIMELINE_MESSAGES.EVENT) {
@@ -4834,6 +4846,7 @@ export class WsBridge {
         return;
       }
       const commandId = typeof msg.commandId === 'string' ? msg.commandId : null;
+      const status = typeof msg.status === 'string' ? msg.status : '';
       if (commandId) {
         // Dedup replayed acks from daemon outbox flush (sticky-pod keeps this
         // LRU authoritative within a pod lifetime).
@@ -4843,10 +4856,16 @@ export class WsBridge {
         }
         this.seenCommandAcks.set(commandId, Date.now());
         this.clearInflightOnAck(commandId);
+        if ((status === 'error' || status === 'conflict') && this.activeDispatchIds.get(sessionName) === commandId) {
+          this.activeDispatchIds.delete(sessionName);
+        }
       }
       // Control-plane: bypass the PTY queue. command.ack drives the UI
       // optimistic-bubble state — must never head-of-line block.
-      this.sendJsonToSessionSubscribers(sessionName, JSON.stringify(msg));
+      this.sendJsonToSessionSubscribers(sessionName, JSON.stringify({
+        ...msg,
+        activeDispatchId: this.activeDispatchIds.get(sessionName) ?? null,
+      }));
       return;
     }
 
@@ -6110,7 +6129,7 @@ export class WsBridge {
       ? this.withBridgeRetryMarker(entry.rawPayload, entry.dispatchAttempts + 1)
       : entry.rawPayload;
     this.sendToDaemon(rawPayload);
-    if (entry.share && this.rawPayloadType(entry.rawPayload) === 'session.send') {
+    if (this.rawPayloadType(entry.rawPayload) === 'session.send') {
       this.activeDispatchIds.set(entry.sessionName, entry.commandId);
     }
     entry.dispatchAttempts += 1;

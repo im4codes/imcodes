@@ -685,6 +685,7 @@ export interface OpenSharedEntryResponse {
     title: string;
     state: string;
     agentType: string;
+    activeDispatchId?: string | null;
   }>;
   subSessions: Array<{
     subSessionId: string;
@@ -692,6 +693,7 @@ export interface OpenSharedEntryResponse {
     title: string;
     type: string;
     parentSessionName: string | null;
+    activeDispatchId?: string | null;
   }>;
 }
 

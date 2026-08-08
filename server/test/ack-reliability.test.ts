@@ -119,6 +119,7 @@ describe('WsBridge — command ack reliability', () => {
     expect(forwarded.length).toBe(1);
     expect(forwarded[0].commandId).toBe('C1');
     expect(bridge._getInflightCountForTest()).toBe(1);
+    expect(bridge.getActiveDispatchIdForSession('deck_test_brain')).toBe('C1');
   });
 
   it('dispatches session.cancel through the reliable priority command path', async () => {

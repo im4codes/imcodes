@@ -1179,6 +1179,7 @@ export function App() {
   }, [auth, selectedServerId, selectedShareTarget]);
 
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
+  const [sharedActiveDispatchIds, setSharedActiveDispatchIds] = useState<Map<string, string>>(() => new Map());
   const navigableMainSessions = useMemo(
     () => sessions.filter(isNavigableMainSession),
     [sessions],
@@ -1198,11 +1199,16 @@ export function App() {
     if (!selectedServerId) return states;
     for (const session of navigableMainSessions) {
       const directState = managedSharedStateByTarget.get(`main:${selectedServerId}:${session.name}`);
-      const state = directState ?? selectedServerSharedOutState;
-      if (state) states.set(session.name, state);
+      const state = directState ?? selectedServerSharedOutState ?? session.sharedState;
+      if (state) {
+        states.set(session.name, {
+          ...state,
+          activeDispatchId: sharedActiveDispatchIds.get(session.name) ?? null,
+        });
+      }
     }
     return states;
-  }, [managedSharedStateByTarget, navigableMainSessions, selectedServerId, selectedServerSharedOutState]);
+  }, [managedSharedStateByTarget, navigableMainSessions, selectedServerId, selectedServerSharedOutState, sharedActiveDispatchIds]);
   const visibleMainSessions = useMemo(
     () => navigableMainSessions.map((session) => {
       const sharedState = managedSharedSessionStateByName.get(session.name) ?? session.sharedState;
@@ -2425,11 +2431,15 @@ export function App() {
       const parentState = sub.parentSession ? managedSharedSessionStateByName.get(sub.parentSession) : null;
       const state = directState ?? parentState ?? selectedServerSharedOutState;
       if (!state) continue;
-      states.set(sub.id, state);
-      states.set(sub.sessionName, state);
+      const withActiveDispatch = {
+        ...state,
+        activeDispatchId: sharedActiveDispatchIds.get(sub.sessionName) ?? null,
+      };
+      states.set(sub.id, withActiveDispatch);
+      states.set(sub.sessionName, withActiveDispatch);
     }
     return states;
-  }, [managedSharedSessionStateByName, managedSharedStateByTarget, selectedServerId, selectedServerSharedOutState, subSessions]);
+  }, [managedSharedSessionStateByName, managedSharedStateByTarget, selectedServerId, selectedServerSharedOutState, sharedActiveDispatchIds, subSessions]);
 
   const handleOpenSharedEntry = useCallback(async (entry: SharedEntrySummary) => {
     if (openingSharedEntryId) return;
@@ -2467,9 +2477,19 @@ export function App() {
             effectiveRole: opened.coverage.effectiveRole,
             status: 'active',
             scopeLabel: entry.targetLabel,
+            activeDispatchId: session.activeDispatchId ?? null,
           },
         };
       });
+
+      const openedDispatchIds = new Map<string, string>();
+      for (const session of opened.sessions) {
+        if (session.activeDispatchId) openedDispatchIds.set(session.sessionName, session.activeDispatchId);
+      }
+      for (const subSession of opened.subSessions) {
+        if (subSession.activeDispatchId) openedDispatchIds.set(subSession.sessionName, subSession.activeDispatchId);
+      }
+      setSharedActiveDispatchIds(openedDispatchIds);
 
       setSelectedShareTarget(opened.target);
       setManualDashboard(false);
@@ -3037,6 +3057,17 @@ export function App() {
         }
       }
       if (msg.type === 'session_list') {
+        if (selectedShareTarget) {
+          setSharedActiveDispatchIds((previous) => {
+            const next = new Map(previous);
+            for (const session of msg.sessions) {
+              if (!Object.prototype.hasOwnProperty.call(session, 'activeDispatchId')) continue;
+              if (session.activeDispatchId) next.set(session.name, session.activeDispatchId);
+              else next.delete(session.name);
+            }
+            return next;
+          });
+        }
         const watchServerName = resolvedSelectedServerName
           ?? selectedServerId;
         // Build sub-session inputs from app state (daemon filters them from session_list)
@@ -3241,6 +3272,14 @@ export function App() {
               ? { ...s, state: 'error' as SessionInfo['state'], error: errorDetail ?? s.error ?? null }
               : s));
           }
+        }
+        if (event.type === 'session.state' && String(event.payload.state ?? '') === 'idle') {
+          setSharedActiveDispatchIds((previous) => {
+            if (!previous.has(event.sessionId)) return previous;
+            const next = new Map(previous);
+            next.delete(event.sessionId);
+            return next;
+          });
         }
         if (event.type === 'session.state') {
           const liveState = String(event.payload.state ?? '');
@@ -3716,6 +3755,14 @@ export function App() {
           }]);
           setTimeout(() => setToasts((prev) => prev.filter((x) => x.id !== id)), 8000);
         }
+      }
+      if (msg.type === 'command.ack' && selectedShareTarget) {
+        setSharedActiveDispatchIds((previous) => {
+          const next = new Map(previous);
+          if (msg.activeDispatchId) next.set(msg.session, msg.activeDispatchId);
+          else next.delete(msg.session);
+          return next;
+        });
       }
       if (msg.type === DAEMON_MSG.RECONNECTED) {
         void checkForAppUpdate();
@@ -5317,7 +5364,7 @@ export function App() {
             )}
 
             {/* Session panes: visible brain sessions stay mounted; worker sessions remain addressable but hidden from main windows. */}
-            {navigableMainSessions.map((s) => (
+            {visibleMainSessions.map((s) => (
               <ErrorBoundary key={`eb-${s.name}`}>
               <SessionPane
                 key={s.name}
@@ -6179,6 +6226,7 @@ export function App() {
               serverId={selectedServerId ?? undefined}
               detectedModelHint={detectedModels.get(sub.sessionName)}
               inP2p={p2pSessionLabels.has(sub.sessionName)}
+              sharedState={managedSharedSubSessionStateById.get(sub.id) ?? managedSharedSubSessionStateById.get(sub.sessionName)}
               accentColor={visibleSubSessionAccentColors.get(sub.id) ?? DEFAULT_SUBSESSION_ACCENT_COLOR}
               pendingPrefillText={pendingPrefills[sub.sessionName] ?? null}
               onPendingPrefillApplied={() => setPendingPrefills((prev) => {

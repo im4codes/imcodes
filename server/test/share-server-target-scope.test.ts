@@ -18,10 +18,10 @@ import type { EffectiveCoverage, ShareTarget } from '../../shared/tab-sharing.js
 const serverId = 'srv-scope-1';
 const now = 1_800_000_000_000;
 
-function coverage(target: ShareTarget): EffectiveCoverage {
+function coverage(target: ShareTarget, effectiveRole: EffectiveCoverage['effectiveRole'] = 'viewer'): EffectiveCoverage {
   return {
     target,
-    effectiveRole: 'viewer',
+    effectiveRole,
     historyCutoffAt: 0,
     nextCoverageRecheckAt: null,
     coveringShareIds: ['share-1'],
@@ -30,13 +30,13 @@ function coverage(target: ShareTarget): EffectiveCoverage {
   };
 }
 
-function socket(target: ShareTarget) {
+function socket(target: ShareTarget, effectiveRole: EffectiveCoverage['effectiveRole'] = 'viewer') {
   return {
     userId: 'shared-user',
     target,
     connectedAt: now,
     ticketId: 'ticket-1',
-    snapshot: coverage(target),
+    snapshot: coverage(target, effectiveRole),
   };
 }
 
@@ -147,5 +147,36 @@ describe('session_list row redaction', () => {
     for (const key of Object.keys(out)) {
       expect(allowed.has(key), `${key} must not reach a share recipient`).toBe(true);
     }
+  });
+
+  it('exposes the cancel guard token only to participants', () => {
+    const withDispatch = { ...row, activeDispatchId: 'dispatch-current' };
+    const viewer = filterShareDaemonMessage(
+      { type: 'session_list', serverId, sessions: [withDispatch] },
+      socket(tabScoped, 'viewer'),
+    );
+    const participant = filterShareDaemonMessage(
+      { type: 'session_list', serverId, sessions: [withDispatch] },
+      socket(tabScoped, 'participant'),
+    );
+
+    expect((viewer?.sessions as Array<Record<string, unknown>>)[0]).not.toHaveProperty('activeDispatchId');
+    expect((participant?.sessions as Array<Record<string, unknown>>)[0]).toMatchObject({
+      activeDispatchId: 'dispatch-current',
+    });
+    expect(filterShareDaemonMessage({
+      type: 'command.ack',
+      session: 'deck_proj_brain',
+      commandId: 'command-1',
+      status: 'accepted',
+      activeDispatchId: 'dispatch-current',
+    }, socket(tabScoped, 'viewer'))).not.toHaveProperty('activeDispatchId');
+    expect(filterShareDaemonMessage({
+      type: 'command.ack',
+      session: 'deck_proj_brain',
+      commandId: 'command-1',
+      status: 'accepted',
+      activeDispatchId: 'dispatch-current',
+    }, socket(tabScoped, 'participant'))).toMatchObject({ activeDispatchId: 'dispatch-current' });
   });
 });

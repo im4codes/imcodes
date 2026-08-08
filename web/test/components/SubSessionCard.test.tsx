@@ -481,6 +481,7 @@ describe('SubSessionCard', () => {
     const { container } = render(
       <SubSessionCard
         sub={makeSubSession({ runtimeType: 'transport', state: 'running' } as any)}
+        sharedState={{ effectiveRole: 'participant', status: 'active', activeDispatchId: 'dispatch-sub-1' }}
         ws={ws}
         connected={true}
         isOpen={false}
@@ -498,6 +499,7 @@ describe('SubSessionCard', () => {
       expect(ws.sendSessionCommandUrgent).toHaveBeenCalledWith('cancel', {
         sessionName: 'deck_sub_sub-card-1',
         commandId: expect.any(String),
+        observedDispatchId: 'dispatch-sub-1',
       });
     });
     // Stop must not be represented as a chat send.

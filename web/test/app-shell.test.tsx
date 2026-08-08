@@ -21,6 +21,7 @@ const {
   openSharedEntryMock: vi.fn(),
   wsInstances: [] as Array<{
     connected: boolean;
+    options?: { shareTarget?: unknown };
     messageHandlers: Array<(message: any) => void>;
     latencyHandler: ((ms: number) => void) | null;
     connect: ReturnType<typeof vi.fn>;
@@ -117,6 +118,7 @@ vi.mock('../src/push-notifications.js', () => ({
 vi.mock('../src/ws-client.js', () => ({
   WsClient: class MockWsClient {
     connected = false;
+    options?: { shareTarget?: unknown };
     messageHandlers: Array<(message: any) => void> = [];
     latencyHandler: ((ms: number) => void) | null = null;
     connect = vi.fn(() => { this.connected = true; });
@@ -140,7 +142,8 @@ vi.mock('../src/ws-client.js', () => ({
     resumeConnection = vi.fn();
     reconnectNow = vi.fn();
 
-    constructor() {
+    constructor(_baseUrl?: string, _serverId?: string, options?: { shareTarget?: unknown }) {
+      this.options = options;
       wsInstances.push(this);
     }
 
@@ -355,7 +358,10 @@ vi.mock('../src/components/SessionPane.js', () => ({
     onStopProject,
     onTransportConfigSaved,
   }: any) => (
-    <div>
+    <div
+      data-testid={`session-pane-${session.name}`}
+      data-active-dispatch-id={session.sharedState?.activeDispatchId ?? ''}
+    >
       session-pane:{session.name}
       <button onClick={() => onFitFn?.(vi.fn())}>pane-fit-ref</button>
       <button onClick={() => onScrollBottomFn?.(vi.fn())}>pane-scroll-ref</button>
@@ -2067,7 +2073,7 @@ describe('App shell', () => {
       id: 'share-1',
       serverId: 'srv-shared',
       serverName: 'Shared Server',
-      role: 'viewer',
+      role: 'participant',
       status: 'active',
       targetLabel: 'Shared Beta',
       target: { kind: 'main', serverId: 'srv-shared', sessionName: 'deck_beta_brain' },
@@ -2077,24 +2083,49 @@ describe('App shell', () => {
       server: { id: 'srv-shared', name: 'Shared Server', status: 'online', lastHeartbeatAt: Date.now() },
       target: sharedEntry.target,
       coverage: {
-        effectiveRole: 'viewer',
+        effectiveRole: 'participant',
         historyCutoffAt: 0,
         nextCoverageRecheckAt: null,
         coveringShareIds: ['share-1'],
         primaryShareId: 'share-1',
         authorizedAt: Date.now(),
       },
-      sessions: [{ sessionName: 'deck_beta_brain', title: 'Shared Beta', state: 'idle', agentType: 'codex-sdk' }],
+      sessions: [{
+        sessionName: 'deck_beta_brain',
+        title: 'Shared Beta',
+        state: 'running',
+        agentType: 'codex-sdk',
+        activeDispatchId: 'dispatch-open-1',
+      }],
       subSessions: [],
     });
 
     const { App } = await importApp();
     render(<App />);
 
+    const ownServerWsCount = wsInstances.length;
     const entryLabel = await screen.findByText('Shared Beta');
     fireEvent.click(entryLabel.closest('button')!);
 
     await waitFor(() => expect(openSharedEntryMock).toHaveBeenCalledWith(sharedEntry.target));
+    const sharedPane = await screen.findByTestId('session-pane-deck_beta_brain');
+    expect(sharedPane.getAttribute('data-active-dispatch-id')).toBe('dispatch-open-1');
+    await waitFor(() => expect(wsInstances.length).toBeGreaterThan(ownServerWsCount));
+    await waitFor(() => expect(wsInstances.some((instance) => instance.options?.shareTarget === sharedEntry.target)).toBe(true));
+    const sharedWs = wsInstances.findLast((instance) => instance.options?.shareTarget === sharedEntry.target)!;
+    await waitFor(() => expect(sharedWs.messageHandlers.length).toBeGreaterThan(0));
+    act(() => {
+      sharedWs.emit({
+        type: 'command.ack',
+        commandId: 'dispatch-live-2',
+        status: 'accepted',
+        session: 'deck_beta_brain',
+        activeDispatchId: 'dispatch-live-2',
+      });
+    });
+    await waitFor(() => {
+      expect(screen.getByTestId('session-pane-deck_beta_brain').getAttribute('data-active-dispatch-id')).toBe('dispatch-live-2');
+    });
     const guide = await screen.findByTestId('shared-return-guide');
     expect(guide.textContent).toContain('share.sharedWithMe.guideReturn');
     expect(guide.textContent).toContain('share.sharedWithMe.guideDismiss');

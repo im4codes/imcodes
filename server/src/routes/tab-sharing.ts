@@ -221,6 +221,8 @@ tabSharingRoutes.post('/shares/open', requireAuth(), async (c) => {
     : target.kind === 'main'
       ? mainRows.filter((session) => session.name === target.sessionName)
       : mainRows.filter((session) => subSessions.some((subSession) => subSession.parent_session === session.name));
+  const bridge = WsBridge.get(target.serverId);
+  const includeActiveDispatch = coverage.effectiveRole === 'participant';
 
   return c.json({
     server: {
@@ -236,6 +238,9 @@ tabSharingRoutes.post('/shares/open', requireAuth(), async (c) => {
       title: session.label?.trim() || session.project_name,
       state: session.state,
       agentType: session.agent_type,
+      ...(includeActiveDispatch
+        ? { activeDispatchId: bridge.getActiveDispatchIdForSession(session.name) }
+        : {}),
     })),
     subSessions: subSessions.map((subSession) => ({
       subSessionId: subSession.id,
@@ -243,6 +248,9 @@ tabSharingRoutes.post('/shares/open', requireAuth(), async (c) => {
       title: subSession.label?.trim() || subSession.type,
       type: subSession.type,
       parentSessionName: subSession.parent_session,
+      ...(includeActiveDispatch
+        ? { activeDispatchId: bridge.getActiveDispatchIdForSession(`deck_sub_${subSession.id}`) }
+        : {}),
     })),
   });
 });

@@ -210,6 +210,7 @@ describe('SubSessionWindow metadata wiring', () => {
           activeModel: 'gpt-5.6',
           providerId: 'openai',
         })}
+        sharedState={{ effectiveRole: 'participant', status: 'active', activeDispatchId: 'dispatch-window-1' }}
         ws={ws}
         connected={true}
         active={true}
@@ -230,6 +231,10 @@ describe('SubSessionWindow metadata wiring', () => {
       runtimeEpoch: 'window-runtime-1',
       activeModel: 'gpt-5.6',
       providerId: 'openai',
+      sharedState: expect.objectContaining({
+        effectiveRole: 'participant',
+        activeDispatchId: 'dispatch-window-1',
+      }),
     });
   });
 
