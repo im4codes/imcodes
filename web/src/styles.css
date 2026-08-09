@@ -3720,6 +3720,23 @@ html.native-ios-mac .chat-dl-btn {
   margin-left: 6px;
 }
 .chat-tool-activity-details .chat-event { margin: 0; }
+.chat-tool-activity-collapse-footer {
+  margin-top: 2px;
+  justify-content: center;
+  border-color: rgba(52, 211, 153, 0.28);
+  background: linear-gradient(100deg, rgba(6, 78, 59, 0.46), rgba(15, 23, 42, 0.82) 62%, rgba(30, 41, 59, 0.72));
+}
+.chat-tool-activity-collapse-footer:hover {
+  border-color: rgba(110, 231, 183, 0.58);
+  background: linear-gradient(100deg, rgba(6, 95, 70, 0.62), rgba(15, 23, 42, 0.9) 62%, rgba(30, 41, 59, 0.82));
+}
+.chat-tool-activity-collapse-footer .chat-tool-activity-core {
+  border-color: #6ee7b7;
+  background: rgba(16, 185, 129, 0.38);
+  box-shadow: 0 0 7px rgba(52, 211, 153, 0.48);
+}
+.chat-tool-activity-collapse-label { color: #a7f3d0; font-weight: 600; }
+.chat-tool-activity-collapse-chevron { color: #6ee7b7; font-size: 13px; transform: translateY(1px); }
 .chat-tool-activity-live {
   position: absolute;
   width: 1px;

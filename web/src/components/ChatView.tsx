@@ -3795,21 +3795,36 @@ function ToolActivitySummary({
       )}
       <span class="chat-tool-activity-live" role="status" aria-live="polite" aria-atomic="true">{summary}</span>
       {expanded && (
-        <div class="chat-tool-activity-details">
-          {events.map((event) => (
-            <ChatEvent
-              key={event.eventId}
-              event={event}
-              onPathClick={onPathClick}
-              onUrlClick={onUrlClick}
-              onDownload={onDownload}
-              onHtmlPreview={onHtmlPreview}
-              onImagePreview={onImagePreview}
-              serverId={serverId}
-              showTime
-            />
-          ))}
-        </div>
+        <>
+          <div class="chat-tool-activity-details">
+            {events.map((event) => (
+              <ChatEvent
+                key={event.eventId}
+                event={event}
+                onPathClick={onPathClick}
+                onUrlClick={onUrlClick}
+                onDownload={onDownload}
+                onHtmlPreview={onHtmlPreview}
+                onImagePreview={onImagePreview}
+                serverId={serverId}
+                showTime
+              />
+            ))}
+          </div>
+          <button
+            type="button"
+            class="chat-tool-activity chat-tool-activity-collapse-footer"
+            aria-expanded={expanded}
+            aria-label={action}
+            title={action}
+            onClick={() => { closePeek(); setExpanded(false); }}
+          >
+            <span class="chat-tool-activity-core" aria-hidden="true" />
+            <span class="chat-tool-activity-label">{t('chat.tool_activity_label')}</span>
+            <span class="chat-tool-activity-collapse-label">{action}</span>
+            <span class="chat-tool-activity-collapse-chevron" aria-hidden="true">⌃</span>
+          </button>
+        </>
       )}
     </div>
   );
