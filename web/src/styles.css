@@ -3815,6 +3815,27 @@ html.native-ios-mac .chat-dl-btn {
 .chat-tool-block-fold-content::-webkit-scrollbar { width: 5px; height: 3px; }
 .chat-tool-block-fold-content::-webkit-scrollbar-track { background: rgba(15, 23, 42, 0.25); }
 .chat-tool-block-fold-content::-webkit-scrollbar-thumb { border-radius: 999px; background: rgba(34, 211, 238, 0.35); }
+.chat-tool-fold-footer {
+  display: flex;
+  justify-content: center;
+  padding: 6px 8px 7px;
+  border-top: 1px solid rgba(34, 211, 238, 0.16);
+  background: rgba(2, 6, 23, 0.28);
+}
+.chat-tool-fold-collapse {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 10px;
+  border: 1px solid rgba(52, 211, 153, 0.38);
+  border-radius: 999px;
+  background: rgba(6, 78, 59, 0.42);
+  color: #6ee7b7;
+  font: 600 11px/1.2 'SF Mono', 'Cascadia Code', 'Fira Code', monospace;
+  cursor: pointer;
+}
+.chat-tool-fold-collapse:hover { border-color: rgba(110, 231, 183, 0.7); color: #d1fae5; background: rgba(6, 95, 70, 0.58); }
+.chat-tool-fold-collapse:focus-visible { outline: 1px solid #6ee7b7; outline-offset: 2px; }
 .chat-tool-block-fold.is-collapsed .chat-tool-command-row::-webkit-scrollbar,
 .chat-tool-block-fold.is-collapsed .chat-tool-result-row::-webkit-scrollbar,
 .chat-tool-block-fold.is-collapsed .chat-tool-result-preview::-webkit-scrollbar {

@@ -3405,6 +3405,21 @@ function ToolBlockFold({
     <div class={`chat-tool-block-fold${expanded ? ' is-expanded' : ' is-collapsed'}`}>
       <div class="chat-tool-block-fold-content">
         {children(expanded, toggleExpanded, action)}
+        {expanded && (
+          <div class="chat-tool-fold-footer">
+            <button
+              type="button"
+              class="chat-tool-fold-collapse"
+              aria-expanded={expanded}
+              aria-label={action}
+              title={action}
+              onClick={toggleExpanded}
+            >
+              <span aria-hidden="true">▴</span>
+              <span>{action}</span>
+            </button>
+          </div>
+        )}
       </div>
     </div>
   );
