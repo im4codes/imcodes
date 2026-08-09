@@ -85,6 +85,7 @@ vi.mock('../src/api.js', () => {
     apiFetch: (...args: unknown[]) => apiFetchMock(...args),
     clearApiKey: vi.fn(),
     configure: vi.fn(),
+    configureExpectedUserId: vi.fn(),
     configureApiKey: vi.fn(),
     discoverSharedEntries: (...args: unknown[]) => discoverSharedEntriesMock(...args),
     fetchMe: (...args: unknown[]) => fetchMeMock(...args),

@@ -2793,6 +2793,8 @@
     "mint_executable_not_built": "This installer is not available on the server yet.",
     "mint_canonical_server_url_required": "The server URL is not configured for controlled-node downloads. Ask your administrator to set a canonical public URL.",
     "ticket_expired": "This download link has expired. Start a new download.",
+    "auth_identity_changed": "Your signed-in account changed. Sign in again before downloading.",
+    "auth_identity_expectation_required": "Refresh this page, then start the download again.",
     "ticket_expires_at": "Link valid until {{time}}",
     "artifact_meta": "{{detail}}",
     "usage_title": "How to use",

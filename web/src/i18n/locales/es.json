@@ -2793,6 +2793,8 @@
     "mint_executable_not_built": "Este instalador aún no está disponible en el servidor.",
     "mint_canonical_server_url_required": "La URL del servidor no está configurada para descargas de nodos controlados. Pide al administrador que establezca una URL pública canónica.",
     "ticket_expired": "Este enlace de descarga ha caducado. Inicia una nueva descarga.",
+    "auth_identity_changed": "La cuenta con la sesión iniciada cambió. Vuelve a iniciar sesión antes de descargar.",
+    "auth_identity_expectation_required": "Actualiza la página y vuelve a iniciar la descarga.",
     "ticket_expires_at": "Enlace válido hasta {{time}}",
     "artifact_meta": "{{detail}}",
     "usage_title": "Cómo usar",

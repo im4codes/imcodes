@@ -10,6 +10,7 @@
  */
 import {
   compareControlledNodeArtifactPairs,
+  CONTROLLED_NODE_MINT_ERRORS,
   controlledNodeArtifactKey,
   isCanonicalControlledNodePair,
   isControlledNodeArtifactArch,
@@ -20,7 +21,7 @@ import {
   type ControlledNodeOs,
 } from '@shared/controlled-node-artifacts.js';
 import { MACHINE_API_PATH } from '@shared/machine-reference.js';
-import { apiFetch, getApiBaseUrl } from '../api.js';
+import { apiFetch, getApiBaseUrl, getExpectedUserId } from '../api.js';
 
 export type { ControlledNodeArtifactArch, ControlledNodeOs };
 
@@ -63,6 +64,7 @@ export interface ControlledNodeExecutableTicket {
   sizeBytes: number;
   sha256: string;
   expiresAt: number;
+  ownerUserId: string;
 }
 
 const ENROLL_V2_AVAILABILITY_PATH = '/api/enroll/v2/availability';
@@ -100,7 +102,7 @@ function normalizeAvailability(res: unknown): ControlledNodeAvailability {
   return { available, artifacts };
 }
 
-function normalizeTicket(res: unknown): ControlledNodeExecutableTicket {
+function normalizeTicket(res: unknown, expectedOwnerUserId: string): ControlledNodeExecutableTicket {
   if (!isRecord(res)) throw new Error('invalid_ticket_response');
   if (res.version !== 2) throw new Error('invalid_ticket_response');
   const ticket = typeof res.ticket === 'string' ? res.ticket : '';
@@ -115,11 +117,15 @@ function normalizeTicket(res: unknown): ControlledNodeExecutableTicket {
   const sizeBytes = typeof res.sizeBytes === 'number' && Number.isFinite(res.sizeBytes) ? res.sizeBytes : null;
   const sha256 = typeof res.sha256 === 'string' && isControlledNodeArtifactSha256(res.sha256) ? res.sha256 : null;
   const expiresAt = typeof res.expiresAt === 'number' && Number.isFinite(res.expiresAt) ? res.expiresAt : null;
-  if (!ticket || !ticketId || !os || !arch || !filename || sizeBytes === null || !sha256 || expiresAt === null) {
+  const ownerUserId = typeof res.ownerUserId === 'string' ? res.ownerUserId : '';
+  if (ownerUserId && ownerUserId !== expectedOwnerUserId) {
+    throw new Error(CONTROLLED_NODE_MINT_ERRORS.AUTH_IDENTITY_CHANGED);
+  }
+  if (!ticket || !ticketId || !os || !arch || !filename || sizeBytes === null || !sha256 || expiresAt === null || !ownerUserId) {
     throw new Error('invalid_ticket_response');
   }
   if (!isCanonicalControlledNodePair(os, arch)) throw new Error('invalid_ticket_response');
-  return { version: 2, ticket, ticketId, os, arch, filename, sizeBytes, sha256, expiresAt };
+  return { version: 2, ticket, ticketId, os, arch, filename, sizeBytes, sha256, expiresAt, ownerUserId };
 }
 
 /** Build download targets: one per canonical (os, arch) artifact with explicit arch. */
@@ -210,12 +216,16 @@ export async function mintControlledNodeExecutableTicket(
   if (!isCanonicalControlledNodePair(selection.os, selection.arch)) {
     throw new Error('controlled_node_non_canonical_pair');
   }
+  const expectedOwnerUserId = getExpectedUserId();
+  if (!expectedOwnerUserId) {
+    throw new Error(CONTROLLED_NODE_MINT_ERRORS.AUTH_IDENTITY_EXPECTATION_REQUIRED);
+  }
   const res = await apiFetch<unknown>(ENROLL_V2_TICKET_PATH, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ version: 2, os: selection.os, arch: selection.arch }),
   });
-  return normalizeTicket(res);
+  return normalizeTicket(res, expectedOwnerUserId);
 }
 
 /**

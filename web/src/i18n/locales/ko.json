@@ -2792,6 +2792,8 @@
     "mint_executable_not_built": "이 설치 파일은 서버에서 아직 사용할 수 없습니다.",
     "mint_canonical_server_url_required": "제어 노드 다운로드를 위한 서버 URL이 구성되지 않았습니다. 관리자에게 정식 공개 URL 설정을 요청하세요.",
     "ticket_expired": "다운로드 링크가 만료되었습니다. 새 다운로드를 시작하세요.",
+    "auth_identity_changed": "로그인한 계정이 변경되었습니다. 다시 로그인한 후 다운로드하세요.",
+    "auth_identity_expectation_required": "페이지를 새로고침한 후 다시 다운로드하세요.",
     "ticket_expires_at": "링크 유효 기간: {{time}}",
     "artifact_meta": "{{detail}}",
     "usage_title": "사용 방법",

@@ -2792,6 +2792,8 @@
     "mint_executable_not_built": "このインストーラーはサーバーでまだ利用できません。",
     "mint_canonical_server_url_required": "被制御ノードのダウンロード用にサーバー URL が設定されていません。管理者に正規の公開 URL の設定を依頼してください。",
     "ticket_expired": "このダウンロードリンクの有効期限が切れました。新しいダウンロードを開始してください。",
+    "auth_identity_changed": "ログイン中のアカウントが変更されました。再ログインしてからダウンロードしてください。",
+    "auth_identity_expectation_required": "ページを再読み込みしてから、もう一度ダウンロードしてください。",
     "ticket_expires_at": "リンクの有効期限: {{time}}",
     "artifact_meta": "{{detail}}",
     "usage_title": "使い方",

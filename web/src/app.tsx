@@ -19,6 +19,7 @@ import {
   type FileBrowserPreviewUpdate,
 } from './components/file-browser-lazy.js';
 import { DAEMON_MSG } from '@shared/daemon-events.js';
+import { AUTH_IDENTITY_ERRORS } from '@shared/auth-identity.js';
 import { FS_SESSION_ROOT_PATH } from '../../src/shared/transport/fs.js';
 import { P2P_WORKFLOW_MSG } from '@shared/p2p-workflow-messages.js';
 import { RECONNECT_GRACE_MS } from '@shared/ack-protocol.js';
@@ -137,7 +138,7 @@ import {
 } from './onboarding.js';
 // useSwipeBack now handled inside FloatingPanel for discussion/repo pages
 import { WsClient, type P2pWorkflowRequestScope } from './ws-client.js';
-import { configure as configureApi, apiFetch, onAuthExpired, startProactiveRefresh, stopProactiveRefresh, refreshSessionIfStale, ApiError, configureApiKey, clearApiKey, fetchMe, getApiKey, normalizeLocalWebPreviewPath, listP2pRuns, discoverSharedEntries, openSharedEntry, listManagedSharesForServer, type SharedEntrySummary } from './api.js';
+import { configure as configureApi, configureExpectedUserId, apiFetch, onAuthExpired, startProactiveRefresh, stopProactiveRefresh, refreshSessionIfStale, ApiError, configureApiKey, clearApiKey, fetchMe, getApiKey, normalizeLocalWebPreviewPath, listP2pRuns, discoverSharedEntries, openSharedEntry, listManagedSharesForServer, type SharedEntrySummary } from './api.js';
 import { isNative, getServerUrl, clearServerUrl } from './native.js';
 import { getAuthKey, clearAuthKey } from './biometric-auth.js';
 import { initPushNotifications, resetPushBadge } from './push-notifications.js';
@@ -471,7 +472,10 @@ export function App() {
     try {
       const raw = localStorage.getItem('rcc_auth');
       const state = raw ? (JSON.parse(raw) as AuthState) : null;
-      if (state) configureApi(state.baseUrl);
+      if (state) {
+        configureApi(state.baseUrl);
+        configureExpectedUserId(state.userId);
+      }
       return state;
     } catch {
       return null;
@@ -481,6 +485,7 @@ export function App() {
   const clearAuthState = useCallback(async (reason?: string) => {
     console.warn('[auth] clearing auth state', reason ?? '');
     clearApiKey();
+    configureExpectedUserId(null);
     try { await clearAuthKey(); } catch { /* ignore */ }
     try {
       const { Preferences } = await import('@capacitor/preferences');
@@ -841,6 +846,7 @@ export function App() {
           try {
             const user = await apiFetch<{ id: string }>('/api/auth/user/me');
             const authState: AuthState = { userId: user.id, baseUrl: url! };
+            configureExpectedUserId(user.id);
             localStorage.setItem('rcc_auth', JSON.stringify(authState));
             setAuth(authState);
           } catch (err) {
@@ -923,7 +929,12 @@ export function App() {
     console.warn('[auth] mount: verifying session via /api/auth/user/me');
     apiFetch<{ id: string }>('/api/auth/user/me').then((user) => {
       console.warn(`[auth] /me OK: userId=${user.id}`);
+      if (auth && auth.userId !== user.id) {
+        void clearAuthState(AUTH_IDENTITY_ERRORS.CHANGED);
+        return;
+      }
       const authState: AuthState = { userId: user.id, baseUrl };
+      configureExpectedUserId(user.id);
       localStorage.setItem('rcc_auth', JSON.stringify(authState));
       setAuth((prev) => {
         if (prev && prev.userId === authState.userId && prev.baseUrl === authState.baseUrl) return prev;
@@ -940,6 +951,7 @@ export function App() {
 
   // Configure API client when auth changes; start/stop proactive refresh timer
   useEffect(() => {
+    configureExpectedUserId(auth?.userId ?? null);
     if (auth) {
       configureApi(auth.baseUrl);
       startProactiveRefresh();
@@ -4210,6 +4222,7 @@ export function App() {
     localStorage.removeItem('rcc_server');
     localStorage.removeItem('rcc_server_name');
     localStorage.removeItem('rcc_session');
+    configureExpectedUserId(null);
     setAuth(null);
     setSessions([]);
     setActiveSession(null);
@@ -4437,6 +4450,7 @@ export function App() {
         serverUrl={nativeServerUrl}
         onLoginSuccess={(userId, url) => {
           const authState: AuthState = { userId, baseUrl: url };
+          configureExpectedUserId(userId);
           localStorage.setItem('rcc_auth', JSON.stringify(authState));
           setAuth(authState);
         }}

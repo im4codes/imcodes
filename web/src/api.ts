@@ -5,7 +5,9 @@
  */
 
 import { COOKIE_SESSION, COOKIE_CSRF, HEADER_CSRF } from '@shared/cookie-names.js';
-import { CLIENT_TIMEZONE_HEADER } from '@shared/http-header-names.js';
+import { CLIENT_TIMEZONE_HEADER, EXPECTED_USER_ID_HEADER } from '@shared/http-header-names.js';
+import { AUTH_IDENTITY_ERRORS } from '@shared/auth-identity.js';
+import { CONTROLLED_NODE_MINT_ERRORS } from '@shared/controlled-node-artifacts.js';
 import { normalizeClientTimezone } from '@shared/client-timezone.js';
 import { PREVIEW_ACCESS_TOKEN_QUERY_PARAM } from '@shared/preview-types.js';
 import { getSessionRuntimeType } from '@shared/agent-types.js';
@@ -30,6 +32,7 @@ import type { ShareGrantSummary, ShareRole, ShareTarget } from './tab-sharing-ui
 let _baseUrl = '';
 let _onAuthExpired: ((reason?: string) => void) | null = null;
 let _apiKey: string | null = null;
+let _expectedUserId: string | null = null;
 type AuthTelemetryHeaders = {
   'X-Platform': string;
   'X-App-Version': string;
@@ -74,6 +77,19 @@ export function clearApiKey(): void {
 /** Return the currently configured Bearer API key, if any. */
 export function getApiKey(): string | null {
   return _apiKey;
+}
+
+/**
+ * Set the account identity currently rendered by this client. Authenticated
+ * requests carry this snapshot so an origin-wide cookie changed by another tab
+ * cannot silently execute work under a different account.
+ */
+export function configureExpectedUserId(userId: string | null): void {
+  _expectedUserId = typeof userId === 'string' ? (userId.trim() || null) : null;
+}
+
+export function getExpectedUserId(): string | null {
+  return _expectedUserId;
 }
 
 const TELEMETRY_FALLBACK: AuthTelemetryHeaders = { 'X-Platform': 'unknown', 'X-App-Version': 'unknown', 'X-Bundle-Version': 'none' };
@@ -313,6 +329,9 @@ async function rawFetch(path: string, opts: RequestInit = {}, baseUrl = _baseUrl
       if (timezone) headers.set(CLIENT_TIMEZONE_HEADER, timezone);
     } catch { /* restricted or incomplete Intl runtime — cron writes still carry their explicit body value */ }
   }
+  if (_expectedUserId && !headers.has(EXPECTED_USER_ID_HEADER)) {
+    headers.set(EXPECTED_USER_ID_HEADER, _expectedUserId);
+  }
   if (path.startsWith('/api/auth/') && !path.includes('ws-ticket')) {
     try {
       const telemetry = await getAuthTelemetryHeaders();
@@ -427,6 +446,14 @@ export async function apiFetch<T = unknown>(
 ): Promise<T> {
   const res = await rawFetch(path, opts);
 
+  if (res.status === 409) {
+    const body = await res.text().catch(() => '');
+    if (body.includes(AUTH_IDENTITY_ERRORS.CHANGED)) {
+      _onAuthExpired?.(AUTH_IDENTITY_ERRORS.CHANGED);
+    }
+    throw new ApiError(res.status, body);
+  }
+
   if (res.status === 401 && path !== '/api/auth/refresh') {
     console.warn(`[auth] 401 on ${path} — attempting refresh`);
     // Try to refresh the token (with one retry on failure).
@@ -444,6 +471,13 @@ export async function apiFetch<T = unknown>(
       }
       if (ok) {
         const retryRes = await rawFetch(path, opts);
+        if (retryRes.status === 409) {
+          const body = await retryRes.text().catch(() => '');
+          if (body.includes(AUTH_IDENTITY_ERRORS.CHANGED)) {
+            _onAuthExpired?.(AUTH_IDENTITY_ERRORS.CHANGED);
+          }
+          throw new ApiError(retryRes.status, body);
+        }
         if (!retryRes.ok) {
           const body = await retryRes.text().catch(() => '');
           throw new ApiError(retryRes.status, body);
@@ -1626,6 +1660,12 @@ export function controlledNodeDownloadErrorKey(err: unknown): string {
   if (err instanceof Error && err.message === 'popup_blocked') {
     return 'controlled_nodes.download_popup_blocked';
   }
+  if (err instanceof Error && err.message === CONTROLLED_NODE_MINT_ERRORS.AUTH_IDENTITY_CHANGED) {
+    return 'controlled_nodes.auth_identity_changed';
+  }
+  if (err instanceof Error && err.message === CONTROLLED_NODE_MINT_ERRORS.AUTH_IDENTITY_EXPECTATION_REQUIRED) {
+    return 'controlled_nodes.auth_identity_expectation_required';
+  }
   if (err instanceof ApiError) {
     switch (err.code) {
       case 'executable_not_built':
@@ -1634,12 +1674,18 @@ export function controlledNodeDownloadErrorKey(err: unknown): string {
         return 'controlled_nodes.mint_canonical_server_url_required';
       case 'invalid_or_expired_ticket':
         return 'controlled_nodes.ticket_expired';
+      case CONTROLLED_NODE_MINT_ERRORS.AUTH_IDENTITY_CHANGED:
+        return 'controlled_nodes.auth_identity_changed';
+      case CONTROLLED_NODE_MINT_ERRORS.AUTH_IDENTITY_EXPECTATION_REQUIRED:
+        return 'controlled_nodes.auth_identity_expectation_required';
       default:
         break;
     }
     if (err.body.includes('executable_not_built')) return 'controlled_nodes.mint_executable_not_built';
     if (err.body.includes('canonical_server_url_required')) return 'controlled_nodes.mint_canonical_server_url_required';
     if (err.body.includes('invalid_or_expired_ticket')) return 'controlled_nodes.ticket_expired';
+    if (err.body.includes(CONTROLLED_NODE_MINT_ERRORS.AUTH_IDENTITY_CHANGED)) return 'controlled_nodes.auth_identity_changed';
+    if (err.body.includes(CONTROLLED_NODE_MINT_ERRORS.AUTH_IDENTITY_EXPECTATION_REQUIRED)) return 'controlled_nodes.auth_identity_expectation_required';
   }
   return 'controlled_nodes.download_error';
 }

@@ -2793,6 +2793,8 @@
     "mint_executable_not_built": "伺服器上尚無此安裝程式。",
     "mint_canonical_server_url_required": "伺服器未設定受控節點下載所需的公開 URL,請聯絡管理員設定規範位址。",
     "ticket_expired": "下載連結已過期,請重新下載。",
+    "auth_identity_changed": "登入帳號已變更，請重新登入後再下載。",
+    "auth_identity_expectation_required": "請重新整理頁面後再次下載。",
     "ticket_expires_at": "連結有效期至 {{time}}",
     "artifact_meta": "{{detail}}",
     "usage_title": "使用方法",

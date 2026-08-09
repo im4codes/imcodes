@@ -6,6 +6,8 @@ import { buildApp } from '../src/index.js';
 import type { Env } from '../src/env.js';
 import type { Database } from '../src/db/client.js';
 import { COOKIE_SESSION } from '../../shared/cookie-names.js';
+import { EXPECTED_USER_ID_HEADER } from '../../shared/http-header-names.js';
+import { AUTH_IDENTITY_ERRORS } from '../../shared/auth-identity.js';
 
 // ── In-memory mock DB ─────────────────────────────────────────────────────────
 
@@ -185,6 +187,31 @@ describe('share ticket auth boundary', () => {
 
     expect(bearerAuth).toBeNull();
     expect(cookieAuth).toBeNull();
+  });
+});
+
+describe('browser identity expectation boundary', () => {
+  it('rejects a stale rendered identity before an authenticated route executes', async () => {
+    const env = makeEnv();
+    const app = buildApp(env);
+    const register = await app.request('/api/auth/register', { method: 'POST' });
+    const { userId, apiKey } = await register.json() as { userId: string; apiKey: string };
+
+    const matching = await app.request('/api/machines', {
+      headers: { authorization: `Bearer ${apiKey}`, [EXPECTED_USER_ID_HEADER]: userId },
+    });
+    expect(matching.status).toBe(200);
+
+    const legacy = await app.request('/api/machines', {
+      headers: { authorization: `Bearer ${apiKey}` },
+    });
+    expect(legacy.status).toBe(200);
+
+    const changed = await app.request('/api/machines', {
+      headers: { authorization: `Bearer ${apiKey}`, [EXPECTED_USER_ID_HEADER]: 'another-user' },
+    });
+    expect(changed.status).toBe(409);
+    expect(await changed.json()).toEqual({ error: AUTH_IDENTITY_ERRORS.CHANGED });
   });
 });
 

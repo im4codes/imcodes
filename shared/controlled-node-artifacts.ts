@@ -3,6 +3,8 @@
 // The product ships one downloadable artifact per OS. macOS is a Universal 2
 // binary while the enrolled machine still reports its real runtime architecture.
 
+import { AUTH_IDENTITY_ERRORS } from './auth-identity.js';
+
 export const CONTROLLED_NODE_OS_WIN = 'win' as const;
 export const CONTROLLED_NODE_OS_MAC = 'mac' as const;
 export const CONTROLLED_NODE_OS_LINUX = 'linux' as const;
@@ -88,6 +90,8 @@ export const CONTROLLED_NODE_MINT_ERRORS = {
   EXECUTABLE_NOT_BUILT: 'executable_not_built',
   CANONICAL_SERVER_URL_REQUIRED: 'canonical_server_url_required',
   INVALID_OR_EXPIRED_TICKET: 'invalid_or_expired_ticket',
+  AUTH_IDENTITY_CHANGED: AUTH_IDENTITY_ERRORS.CHANGED,
+  AUTH_IDENTITY_EXPECTATION_REQUIRED: AUTH_IDENTITY_ERRORS.EXPECTATION_REQUIRED,
 } as const;
 
 

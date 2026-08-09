@@ -324,6 +324,32 @@ describe('auth nonce exchange API', () => {
     expect(fetchMock).toHaveBeenCalledTimes(cases.length);
   });
 
+  it('attaches the rendered account identity to authenticated requests', async () => {
+    const fetchMock = vi.mocked(fetch);
+    fetchMock.mockResolvedValue(jsonResponse({ ok: true }));
+    const { apiFetch, configureExpectedUserId } = await import('../src/api.js');
+
+    configureExpectedUserId('user-rock');
+    await apiFetch('/api/machines');
+
+    const headers = new Headers((fetchMock.mock.calls[0][1] as RequestInit).headers);
+    expect(headers.get('x-imcodes-expected-user-id')).toBe('user-rock');
+  });
+
+  it('clears stale client auth when the server detects an account mismatch', async () => {
+    const fetchMock = vi.mocked(fetch);
+    fetchMock.mockResolvedValue(jsonResponse({ error: 'auth_identity_changed' }, 409));
+    const expired = vi.fn();
+    const { apiFetch, configureExpectedUserId, onAuthExpired, ApiError } = await import('../src/api.js');
+
+    configureExpectedUserId('user-rock');
+    onAuthExpired(expired);
+
+    await expect(apiFetch('/api/machines')).rejects.toBeInstanceOf(ApiError);
+    expect(expired).toHaveBeenCalledOnce();
+    expect(expired).toHaveBeenCalledWith('auth_identity_changed');
+  });
+
   it('propagates JSON decode failures from successful API responses', async () => {
     const fetchMock = vi.mocked(fetch);
     fetchMock.mockResolvedValue(new Response('not json', {

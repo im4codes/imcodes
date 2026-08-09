@@ -9,6 +9,8 @@ import { randomHex, sha256Hex, encryptBotConfig, decryptBotConfig } from '../sec
 import { logAudit } from '../security/audit.js';
 import { requireAuth } from '../security/authorization.js';
 import logger from '../util/logger.js';
+import { AUTH_IDENTITY_ERRORS } from '../../../shared/auth-identity.js';
+import { EXPECTED_USER_ID_HEADER } from '../../../shared/http-header-names.js';
 import { NODE_ROLE, encodeEnrollmentTrailer, isEnrollmentNodeTokenHash } from '../../../shared/remote-exec.js';
 import { deriveRefName, deriveDisplayName } from '../../../shared/machine-reference.js';
 import {
@@ -89,6 +91,17 @@ enrollRoutes.post('/v2/ticket', requireAuth(), async (c) => {
   if (!originCheck.ok) return c.json({ error: originCheck.reason }, 403);
 
   const userId = c.get('userId' as never) as string;
+  // Minting creates a durable, reusable installer identity. Unlike ordinary
+  // API reads, an old client is not allowed to omit its in-memory owner
+  // expectation: otherwise a cookie replaced by another tab could permanently
+  // bind every future install from this executable to the wrong account.
+  const expectedOwnerUserId = c.req.header(EXPECTED_USER_ID_HEADER)?.trim();
+  if (!expectedOwnerUserId) {
+    return c.json({ error: AUTH_IDENTITY_ERRORS.EXPECTATION_REQUIRED }, 428);
+  }
+  if (expectedOwnerUserId !== userId) {
+    return c.json({ error: AUTH_IDENTITY_ERRORS.CHANGED }, 409);
+  }
   const body = await c.req.json().catch(() => null);
   const parsed = TICKET_BODY.safeParse(body);
   if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
@@ -157,6 +170,7 @@ enrollRoutes.post('/v2/ticket', requireAuth(), async (c) => {
     sha256: v.descriptor.sha256,
     maxConsumes: TICKET_MAX_CONSUMES,
     expiresAt: ticketExpiresAt,
+    ownerUserId: userId,
   });
 });
 

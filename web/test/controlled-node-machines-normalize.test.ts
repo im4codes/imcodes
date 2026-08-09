@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const apiFetch = vi.fn();
 vi.mock('../src/api.js', async (importOriginal) => {
@@ -11,10 +11,15 @@ vi.mock('../src/api.js', async (importOriginal) => {
 });
 
 import { listAvailableExecutables, mintControlledNodeExecutableTicket } from '../src/api/machines.js';
+import { configureExpectedUserId } from '../src/api.js';
 
 const VALID_SHA256 = 'a'.repeat(64);
 
-afterEach(() => { vi.clearAllMocks(); });
+beforeEach(() => { configureExpectedUserId('user-rock'); });
+afterEach(() => {
+  configureExpectedUserId(null);
+  vi.clearAllMocks();
+});
 
 describe('controlled-node availability normalization', () => {
   it('drops artifacts with null, short, or non-hex sha256', async () => {
@@ -45,6 +50,7 @@ describe('controlled-node ticket normalization', () => {
       sizeBytes: 1,
       sha256: 'x',
       expiresAt: Date.now(),
+      ownerUserId: 'user-rock',
     });
     await expect(mintControlledNodeExecutableTicket({ os: 'win', arch: 'x64' }))
       .rejects.toThrow('invalid_ticket_response');
@@ -61,6 +67,7 @@ describe('controlled-node ticket normalization', () => {
       sizeBytes: 1,
       sha256: 'abc',
       expiresAt: Date.now() + 60_000,
+      ownerUserId: 'user-rock',
     });
     await expect(mintControlledNodeExecutableTicket({ os: 'win', arch: 'x64' }))
       .rejects.toThrow('invalid_ticket_response');
@@ -77,6 +84,7 @@ describe('controlled-node ticket normalization', () => {
       sizeBytes: 1,
       sha256: VALID_SHA256,
       expiresAt: Date.now() + 60_000,
+      ownerUserId: 'user-rock',
     });
     await expect(mintControlledNodeExecutableTicket({ os: 'win', arch: 'x64' }))
       .rejects.toThrow('invalid_ticket_response');
@@ -93,15 +101,41 @@ describe('controlled-node ticket normalization', () => {
       sizeBytes: 1,
       sha256: VALID_SHA256,
       expiresAt: Date.now() + 60_000,
+      ownerUserId: 'user-rock',
     });
     const ticket = await mintControlledNodeExecutableTicket({ os: 'win', arch: 'x64' });
     expect(ticket.version).toBe(2);
     expect(ticket.ticketId).toBe('id');
+    expect(ticket.ownerUserId).toBe('user-rock');
+  });
+
+  it('rejects a ticket bound to a different owner than the rendered account', async () => {
+    apiFetch.mockResolvedValueOnce({
+      version: 2,
+      ticket: 't',
+      ticketId: 'id',
+      os: 'win',
+      arch: 'x64',
+      filename: 'a.exe',
+      sizeBytes: 1,
+      sha256: VALID_SHA256,
+      expiresAt: Date.now() + 60_000,
+      ownerUserId: 'user-emma',
+    });
+    await expect(mintControlledNodeExecutableTicket({ os: 'win', arch: 'x64' }))
+      .rejects.toThrow('auth_identity_changed');
   });
 
   it('rejects non-canonical mint selection before calling the server', async () => {
     await expect(mintControlledNodeExecutableTicket({ os: 'win', arch: 'arm64' }))
       .rejects.toThrow('controlled_node_non_canonical_pair');
+    expect(apiFetch).not.toHaveBeenCalled();
+  });
+
+  it('refuses to mint without a rendered account expectation', async () => {
+    configureExpectedUserId(null);
+    await expect(mintControlledNodeExecutableTicket({ os: 'win', arch: 'x64' }))
+      .rejects.toThrow('auth_identity_expectation_required');
     expect(apiFetch).not.toHaveBeenCalled();
   });
 });
