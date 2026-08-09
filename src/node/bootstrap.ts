@@ -447,6 +447,13 @@ async function reconcileStableServicePersistence(
   if (!inspection || !isHealthyServiceInspection(inspection, repairedReceipt)) {
     deps.warn('stable service persistence remains unverified after durable definition repair; refusing service_healthy until a fresh inspection passes');
   }
+  if (repairedReceipt.platform === 'linux') {
+    // An already-running process launched by the legacy unit has no
+    // NOTIFY_SOCKET, even after daemon-reload. Exit non-zero only after the new
+    // definition + receipt are durable; the legacy Restart=on-failure policy
+    // then starts this executable under the watchdog-enabled unit.
+    throw new Error('controlled node Linux watchdog definition repaired; restarting under systemd supervision');
+  }
   return journal;
 }
 

@@ -47,6 +47,15 @@ const SERVICE_RECEIPT: ServiceReceipt = {
   definitionSha256: 'c'.repeat(64),
   action: '/tmp/staged/imcodes-node',
 };
+const MAC_SERVICE_RECEIPT: ServiceReceipt = {
+  name: 'cc.imcodes.node',
+  platform: 'darwin',
+  definitionPath: '/Library/LaunchDaemons/cc.imcodes.node.plist',
+  definitionSha256: 'd'.repeat(64),
+  watchdogDefinitionPath: '/Library/LaunchDaemons/cc.imcodes.node.watchdog.plist',
+  watchdogDefinitionSha256: 'e'.repeat(64),
+  action: '/tmp/staged/imcodes-node',
+};
 
 function makeSource(over: Partial<VerifiedEnrollmentSource> = {}): VerifiedEnrollmentSource {
   return {
@@ -141,21 +150,22 @@ describe('bootstrapControlledNode — journaled first run (10.10 + D-A v2)', () 
     expect(deps.startService).not.toHaveBeenCalled();
   });
 
-  it('stable owner repairs durable drift, re-inspects, and never restarts itself', async () => {
+  it('stable macOS owner repairs durable drift, re-inspects, and never restarts itself', async () => {
     const inspectServiceState = vi.fn()
-      .mockResolvedValueOnce({ installed: true, action: '/wrong', effectiveAction: '/wrong', loadedActionMatches: false, loaded: true, bootEnabled: true, principal: 'root', restartPolicy: 'on-failure', observedDefinitionSha256: 'd'.repeat(64), definitionMatches: false, runState: 'running', errors: [], raw: 'drift' })
-      .mockResolvedValueOnce({ installed: true, action: SERVICE_RECEIPT.action, effectiveAction: SERVICE_RECEIPT.action, loadedActionMatches: true, loaded: true, bootEnabled: true, principal: 'root', restartPolicy: 'on-failure', observedDefinitionSha256: SERVICE_RECEIPT.definitionSha256, definitionMatches: true, runState: 'running', errors: [], raw: 'repaired' });
+      .mockResolvedValueOnce({ installed: true, action: '/wrong', effectiveAction: '/wrong', loadedActionMatches: false, loaded: true, bootEnabled: true, principal: 'root', restartPolicy: 'keepalive', observedDefinitionSha256: 'x'.repeat(64), definitionMatches: false, runState: 'running', errors: [], raw: 'drift' })
+      .mockResolvedValueOnce({ installed: true, action: MAC_SERVICE_RECEIPT.action, effectiveAction: MAC_SERVICE_RECEIPT.action, loadedActionMatches: true, loaded: true, bootEnabled: true, principal: 'root', restartPolicy: 'keepalive', observedDefinitionSha256: MAC_SERVICE_RECEIPT.definitionSha256, definitionMatches: true, runState: 'running', errors: [], raw: 'repaired' });
     const deps = makeDeps({
       loadCredential: vi.fn(async () => CRED),
       isStableRuntime: vi.fn(async () => true),
+      installDefinition: vi.fn(async () => MAC_SERVICE_RECEIPT),
       inspectServiceState,
       loadInstallJournal: vi.fn(async () => ({
         phase: 'service_start_requested' as InstallPhase,
         updatedAt: 5,
         stagedExePath: STAGED_RECEIPT.path,
         stagedReceipt: STAGED_RECEIPT,
-        serviceName: SERVICE_RECEIPT.name,
-        serviceReceipt: SERVICE_RECEIPT,
+        serviceName: MAC_SERVICE_RECEIPT.name,
+        serviceReceipt: MAC_SERVICE_RECEIPT,
         serviceStartRequestedAt: 5,
       })),
     });
@@ -166,15 +176,43 @@ describe('bootstrapControlledNode — journaled first run (10.10 + D-A v2)', () 
     expect(deps.startService).not.toHaveBeenCalled();
   });
 
-  it('stable owner refuses healthy when the disk definition is rewritten but the manager keeps the old action', async () => {
+  it('stable macOS owner refuses healthy when the disk definition is rewritten but the manager keeps the old action', async () => {
     // Post-rewrite the on-disk definition matches the receipt, but the service
     // MANAGER never reloaded, so its effective loaded action still lags. That
     // divergence (definitionMatches=true, loadedActionMatches=false) MUST keep
     // reconciliation unhealthy — the stable owner may repair the file but is
     // forbidden from restarting itself, so it refuses to claim persistence.
     const inspectServiceState = vi.fn()
-      .mockResolvedValueOnce({ installed: true, action: '/old', effectiveAction: '/old', loadedActionMatches: false, loaded: true, bootEnabled: true, principal: 'root', restartPolicy: 'on-failure', observedDefinitionSha256: 'e'.repeat(64), definitionMatches: false, runState: 'running', errors: [], raw: 'pre-repair' })
-      .mockResolvedValueOnce({ installed: true, action: SERVICE_RECEIPT.action, effectiveAction: '/old', loadedActionMatches: false, loaded: true, bootEnabled: true, principal: 'root', restartPolicy: 'on-failure', observedDefinitionSha256: SERVICE_RECEIPT.definitionSha256, definitionMatches: true, runState: 'running', errors: [], raw: 'disk-rewritten-manager-stale' });
+      .mockResolvedValueOnce({ installed: true, action: '/old', effectiveAction: '/old', loadedActionMatches: false, loaded: true, bootEnabled: true, principal: 'root', restartPolicy: 'keepalive', observedDefinitionSha256: 'x'.repeat(64), definitionMatches: false, runState: 'running', errors: [], raw: 'pre-repair' })
+      .mockResolvedValueOnce({ installed: true, action: MAC_SERVICE_RECEIPT.action, effectiveAction: '/old', loadedActionMatches: false, loaded: true, bootEnabled: true, principal: 'root', restartPolicy: 'keepalive', observedDefinitionSha256: MAC_SERVICE_RECEIPT.definitionSha256, definitionMatches: true, runState: 'running', errors: [], raw: 'disk-rewritten-manager-stale' });
+    const deps = makeDeps({
+      loadCredential: vi.fn(async () => CRED),
+      isStableRuntime: vi.fn(async () => true),
+      installDefinition: vi.fn(async () => MAC_SERVICE_RECEIPT),
+      inspectServiceState,
+      loadInstallJournal: vi.fn(async () => ({
+        phase: 'service_start_requested' as InstallPhase,
+        updatedAt: 5,
+        stagedExePath: STAGED_RECEIPT.path,
+        stagedReceipt: STAGED_RECEIPT,
+        serviceName: MAC_SERVICE_RECEIPT.name,
+        serviceReceipt: MAC_SERVICE_RECEIPT,
+        serviceStartRequestedAt: 5,
+      })),
+    });
+    const result = await bootstrapControlledNodeWithDisposition(deps);
+    expect(result.disposition).toBe('run_runtime');
+    expect(deps.installDefinition).toHaveBeenCalledWith(STAGED_RECEIPT.path);
+    expect(inspectServiceState).toHaveBeenCalledTimes(2);
+    // SIDE-EFFECT-FREE reconciliation: rewrote the file, never restarted itself.
+    expect(deps.startService).not.toHaveBeenCalled();
+    expect(deps.warn).toHaveBeenCalledWith(expect.stringContaining('remains unverified'));
+  });
+
+  it('stable Linux owner durably repairs WatchdogSec then exits for systemd to relaunch it', async () => {
+    const inspectServiceState = vi.fn()
+      .mockResolvedValueOnce({ installed: true, action: SERVICE_RECEIPT.action, effectiveAction: SERVICE_RECEIPT.action, loadedActionMatches: true, loaded: true, bootEnabled: true, principal: 'root', restartPolicy: 'on-failure', observedDefinitionSha256: 'legacy', definitionMatches: false, runState: 'running', errors: [], raw: 'watchdog disabled' })
+      .mockResolvedValueOnce({ installed: true, action: SERVICE_RECEIPT.action, effectiveAction: SERVICE_RECEIPT.action, loadedActionMatches: true, loaded: true, bootEnabled: true, principal: 'root', restartPolicy: 'on-failure', observedDefinitionSha256: SERVICE_RECEIPT.definitionSha256, definitionMatches: true, runState: 'running', errors: [], raw: 'definition loaded' });
     const deps = makeDeps({
       loadCredential: vi.fn(async () => CRED),
       isStableRuntime: vi.fn(async () => true),
@@ -189,13 +227,16 @@ describe('bootstrapControlledNode — journaled first run (10.10 + D-A v2)', () 
         serviceStartRequestedAt: 5,
       })),
     });
-    const result = await bootstrapControlledNodeWithDisposition(deps);
-    expect(result.disposition).toBe('run_runtime');
+
+    await expect(bootstrapControlledNodeWithDisposition(deps))
+      .rejects.toThrow('restarting under systemd supervision');
     expect(deps.installDefinition).toHaveBeenCalledWith(STAGED_RECEIPT.path);
-    expect(inspectServiceState).toHaveBeenCalledTimes(2);
-    // SIDE-EFFECT-FREE reconciliation: rewrote the file, never restarted itself.
+    expect(deps.writeInstallPhase).toHaveBeenCalledWith(
+      deps.journalPath,
+      'service_start_requested',
+      expect.objectContaining({ serviceReceipt: SERVICE_RECEIPT }),
+    );
     expect(deps.startService).not.toHaveBeenCalled();
-    expect(deps.warn).toHaveBeenCalledWith(expect.stringContaining('remains unverified'));
   });
 
   it('stable owner at service_registered only persists start intent and does not restart itself', async () => {

@@ -23,11 +23,14 @@ export const CONTROLLED_NODE_SERVICE = {
   WINDOWS_WATCHDOG_TASK: 'imcodes-node-watchdog',
   /** macOS LaunchDaemon label (full daemon uses `imcodes.daemon`). */
   MACOS_LABEL: 'cc.imcodes.node',
+  /** Separate periodic authenticated-health supervisor for the macOS daemon. */
+  MACOS_WATCHDOG_LABEL: 'cc.imcodes.node.watchdog',
   /** Linux systemd unit name (full daemon uses `imcodes.service`). */
   LINUX_UNIT: 'imcodes-node.service',
 } as const;
 
 export const MACOS_PLIST_PATH = `/Library/LaunchDaemons/${CONTROLLED_NODE_SERVICE.MACOS_LABEL}.plist`;
+export const MACOS_WATCHDOG_PLIST_PATH = `/Library/LaunchDaemons/${CONTROLLED_NODE_SERVICE.MACOS_WATCHDOG_LABEL}.plist`;
 export const LINUX_UNIT_PATH = `/etc/systemd/system/${CONTROLLED_NODE_SERVICE.LINUX_UNIT}`;
 
 export interface PrivilegeCheckOptions {
@@ -40,6 +43,7 @@ export interface ServiceInstallOptions {
   platform?: NodeJS.Platform;
   runCommand?: (file: string, args: readonly string[]) => unknown;
   macosPlistPath?: string;
+  macosWatchdogPlistPath?: string;
   linuxUnitPath?: string;
   /** Test seam for the Windows watchdog trigger's local start boundary. */
   now?: () => Date;
@@ -371,6 +375,31 @@ export function macosLaunchDaemonPlist(exePath: string): string {
 `;
 }
 
+/**
+ * Periodic application-health supervisor. launchd's KeepAlive only detects a
+ * dead process; this companion checks the authenticated heartbeat lease and
+ * kickstarts the main daemon when its live process has lost server control.
+ */
+export function macosHealthWatchdogLaunchDaemonPlist(exePath: string): string {
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>${CONTROLLED_NODE_SERVICE.MACOS_WATCHDOG_LABEL}</string>
+  <key>ProgramArguments</key><array>
+    <string>${escapeXmlText(exePath)}</string>
+    <string>--health-watchdog</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>StartInterval</key><integer>60</integer>
+  <key>ProcessType</key><string>Background</string>
+  <key>StandardErrorPath</key><string>/var/log/imcodes-node-watchdog.err.log</string>
+  <key>StandardOutPath</key><string>/var/log/imcodes-node-watchdog.out.log</string>
+</dict>
+</plist>
+`;
+}
+
 /** Linux systemd SYSTEM unit (boot-scoped, restart-on-failure with backoff). */
 export function linuxSystemdUnit(exePath: string): string {
   return `[Unit]
@@ -381,6 +410,8 @@ Wants=network-online.target
 [Service]
 Type=simple
 ExecStart=${exePath}
+NotifyAccess=all
+WatchdogSec=180
 Restart=on-failure
 RestartSec=5
 
@@ -506,6 +537,7 @@ interface DefinitionInspection {
   present: boolean;
   action: string | null;
   sha256: string | null;
+  content: string | null;
   matches: boolean;
   errors: string[];
 }
@@ -522,12 +554,12 @@ function decodeXmlText(value: string): string {
 async function inspectDefinitionFile(receipt: ServiceReceipt): Promise<DefinitionInspection> {
   const errors: string[] = [];
   if (!receipt.definitionPath || !receipt.definitionSha256) {
-    return { present: false, action: null, sha256: null, matches: false, errors: ['definition_receipt_incomplete'] };
+    return { present: false, action: null, sha256: null, content: null, matches: false, errors: ['definition_receipt_incomplete'] };
   }
   try {
     const st = await lstat(receipt.definitionPath);
     if (st.isSymbolicLink() || !st.isFile()) {
-      return { present: false, action: null, sha256: null, matches: false, errors: ['definition_not_regular'] };
+      return { present: false, action: null, sha256: null, content: null, matches: false, errors: ['definition_not_regular'] };
     }
     const content = await readFile(receipt.definitionPath, 'utf8');
     const sha256 = sha256Text(content);
@@ -543,12 +575,13 @@ async function inspectDefinitionFile(receipt: ServiceReceipt): Promise<Definitio
       present: true,
       action,
       sha256,
+      content,
       matches: sha256 === receipt.definitionSha256 && action === (receipt.action ?? null),
       errors,
     };
   } catch (error) {
     errors.push(`definition_read_failed:${(error as Error).message}`);
-    return { present: false, action: null, sha256: null, matches: false, errors };
+    return { present: false, action: null, sha256: null, content: null, matches: false, errors };
   }
 }
 
@@ -666,6 +699,7 @@ interface SystemctlShowInspection {
   unitFileState: string | null;
   principal: string | null;
   restartPolicy: string | null;
+  watchdogEnabled: boolean;
 }
 
 /**
@@ -687,6 +721,8 @@ function parseSystemctlShow(showOut: string): SystemctlShowInspection {
   }
   const userRaw = prop('User');
   const restartPolicy = prop('Restart');
+  const watchdogRaw = prop('WatchdogUSec');
+  const notifyAccess = prop('NotifyAccess');
   return {
     effectiveAction,
     fragmentPath: prop('FragmentPath'),
@@ -695,7 +731,17 @@ function parseSystemctlShow(showOut: string): SystemctlShowInspection {
     // A systemd SYSTEM unit with no `User=` runs as root.
     principal: userRaw && userRaw.length > 0 ? userRaw : (showOut.trim().length > 0 ? 'root' : null),
     restartPolicy: restartPolicy && restartPolicy.length > 0 ? restartPolicy : null,
+    watchdogEnabled: notifyAccess === 'all'
+      && watchdogRaw !== null
+      && !/^(?:0|0us|infinity)$/i.test(watchdogRaw),
   };
+}
+
+function macosWatchdogPath(options: ServiceInstallOptions, mainPlistPath: string): string {
+  return options.macosWatchdogPlistPath
+    ?? (mainPlistPath === MACOS_PLIST_PATH
+      ? MACOS_WATCHDOG_PLIST_PATH
+      : join(dirname(mainPlistPath), `${CONTROLLED_NODE_SERVICE.MACOS_WATCHDOG_LABEL}.plist`));
 }
 
 /** The manager's live loaded action must be present AND equal the receipt's pin. */
@@ -720,13 +766,24 @@ export async function installDefinition(
   }
   if (platform === 'darwin') {
     const plistPath = options.macosPlistPath ?? MACOS_PLIST_PATH;
+    const watchdogPath = macosWatchdogPath(options, plistPath);
     const plist = macosLaunchDaemonPlist(exePath);
+    const watchdogPlist = macosHealthWatchdogLaunchDaemonPlist(exePath);
     await writeDurableTextFile(plistPath, plist, 0o644);
+    await writeDurableTextFile(watchdogPath, watchdogPlist, 0o644);
+    try {
+      runCommand('launchctl', ['bootout', `system/${CONTROLLED_NODE_SERVICE.MACOS_WATCHDOG_LABEL}`]);
+    } catch {
+      // Expected on first install; bootstrap below is authoritative.
+    }
+    runCommand('launchctl', ['bootstrap', 'system', watchdogPath]);
     return {
       name: CONTROLLED_NODE_SERVICE.MACOS_LABEL,
       platform,
       definitionPath: plistPath,
       definitionSha256: sha256Text(plist),
+      watchdogDefinitionPath: watchdogPath,
+      watchdogDefinitionSha256: sha256Text(watchdogPlist),
       action: exePath,
     };
   }
@@ -763,6 +820,15 @@ export async function inspectDefinition(
     const content = await readFile(receipt.definitionPath, 'utf8');
     if (sha256Text(content) !== receipt.definitionSha256) {
       throw new Error('controlled node service definition hash mismatch');
+    }
+  }
+  if (platform === 'darwin') {
+    if (!receipt.watchdogDefinitionPath || !receipt.watchdogDefinitionSha256) {
+      throw new Error('controlled node macOS watchdog definition receipt is incomplete');
+    }
+    const content = await readFile(receipt.watchdogDefinitionPath, 'utf8');
+    if (sha256Text(content) !== receipt.watchdogDefinitionSha256) {
+      throw new Error('controlled node macOS watchdog definition hash mismatch');
     }
   }
   return receipt;
@@ -874,8 +940,36 @@ export async function inspectServiceState(
     const managerState = parseLaunchctlPrint(printOut);
     const definition = await inspectDefinitionFile(receipt);
     errors.push(...definition.errors);
-    raw = printOut;
-    const installed = printOut.length > 0 && definition.present;
+    const watchdogPath = receipt.watchdogDefinitionPath
+      ?? macosWatchdogPath(options, receipt.definitionPath ?? options.macosPlistPath ?? MACOS_PLIST_PATH);
+    const watchdogReceipt: ServiceReceipt = {
+      name: CONTROLLED_NODE_SERVICE.MACOS_WATCHDOG_LABEL,
+      platform: 'darwin',
+      definitionPath: watchdogPath,
+      definitionSha256: receipt.watchdogDefinitionSha256
+        ?? sha256Text(macosHealthWatchdogLaunchDaemonPlist(receipt.action ?? '')),
+      action: receipt.action,
+    };
+    const watchdogDefinition = await inspectDefinitionFile(watchdogReceipt);
+    errors.push(...watchdogDefinition.errors.map((error) => `watchdog_${error}`));
+    let watchdogPrintOut = '';
+    try {
+      watchdogPrintOut = String(runCommand('launchctl', ['print', `system/${CONTROLLED_NODE_SERVICE.MACOS_WATCHDOG_LABEL}`]));
+    } catch (err) {
+      errors.push(`watchdog_launchctl_print_failed:${(err as Error).message}`);
+    }
+    const watchdogManagerState = parseLaunchctlPrint(watchdogPrintOut);
+    raw = `${printOut}\nwatchdog:\n${watchdogPrintOut}`;
+    const watchdogExpected = receipt.action ? macosHealthWatchdogLaunchDaemonPlist(receipt.action) : null;
+    const watchdogMatches = watchdogExpected !== null
+      && watchdogDefinition.content === watchdogExpected
+      && watchdogDefinition.matches
+      && watchdogManagerState.loaded
+      && watchdogManagerState.loadedPath === watchdogPath
+      && watchdogManagerState.effectiveAction === receipt.action
+      && watchdogPrintOut.includes('--health-watchdog');
+    const installed = printOut.length > 0 && definition.present
+      && watchdogPrintOut.length > 0 && watchdogDefinition.present;
     // /LoadState is shown by `launchctl print` as "running" / "waiting" /
     // "not running" — we accept any of those as the run state.
     let runState: ServiceInspection['runState'] = 'unknown';
@@ -899,7 +993,7 @@ export async function inspectServiceState(
       principal: managerState.principal,
       restartPolicy: managerState.restartPolicy,
       observedDefinitionSha256: definition.sha256,
-      definitionMatches: definition.matches,
+      definitionMatches: definition.matches && watchdogMatches,
       runState,
       errors,
       raw,
@@ -918,7 +1012,7 @@ export async function inspectServiceState(
       errors.push(`systemctl_is_enabled_failed:${(err as Error).message}`);
     }
     try {
-      showOut = String(runCommand('systemctl', ['show', CONTROLLED_NODE_SERVICE.LINUX_UNIT, '--property=ActiveState,SubState,LoadState,FragmentPath,ExecMainStartTimestamp,ExecStart,User,Restart,UnitFileState']) ?? '');
+      showOut = String(runCommand('systemctl', ['show', CONTROLLED_NODE_SERVICE.LINUX_UNIT, '--property=ActiveState,SubState,LoadState,FragmentPath,ExecMainStartTimestamp,ExecStart,User,Restart,UnitFileState,WatchdogUSec,NotifyAccess']) ?? '');
     } catch (err) {
       errors.push(`systemctl_show_failed:${(err as Error).message}`);
     }
@@ -947,7 +1041,9 @@ export async function inspectServiceState(
       principal: managerState.principal,
       restartPolicy: managerState.restartPolicy,
       observedDefinitionSha256: definition.sha256,
-      definitionMatches: definition.matches,
+      definitionMatches: definition.matches
+        && definition.content === linuxSystemdUnit(receipt.action ?? '')
+        && managerState.watchdogEnabled,
       runState,
       errors,
       raw,

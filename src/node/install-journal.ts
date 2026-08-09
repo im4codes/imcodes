@@ -58,6 +58,9 @@ export interface ServiceReceipt {
   platform: NodeJS.Platform;
   definitionPath?: string;
   definitionSha256?: string;
+  /** Auxiliary application-health supervisor definition (currently macOS). */
+  watchdogDefinitionPath?: string;
+  watchdogDefinitionSha256?: string;
   action?: string;
 }
 
@@ -119,6 +122,8 @@ function isServiceReceipt(value: unknown): value is ServiceReceipt {
     && isNonEmptyString(record.platform, 32)
     && (record.definitionPath === undefined || isNonEmptyString(record.definitionPath))
     && (record.definitionSha256 === undefined || isNonEmptyString(record.definitionSha256, 256))
+    && (record.watchdogDefinitionPath === undefined || isNonEmptyString(record.watchdogDefinitionPath))
+    && (record.watchdogDefinitionSha256 === undefined || isNonEmptyString(record.watchdogDefinitionSha256, 256))
     && (record.action === undefined || isNonEmptyString(record.action, 4096));
 }
 

@@ -1,9 +1,16 @@
 #!/usr/bin/env node
+import { execFileSync } from 'node:child_process';
 import { bootstrapControlledNodeWithDisposition, defaultBootstrapDeps, journalPathFor, markServiceHealthy } from './bootstrap.js';
 import { runComputerUseIpcHelper } from './computer-use-ipc.js';
 import { createControlledNodeRuntime } from './runtime.js';
 import { DAEMON_VERSION } from '../util/version.js';
-import { controlledNodeHealthLeasePath, createControlledNodeHealthLeasePublisher } from './health-lease.js';
+import {
+  controlledNodeHealthLeasePath,
+  createControlledNodeHealthLeasePublisher,
+  createSystemdWatchdogNotifier,
+  runMacosControlledNodeHealthWatchdog,
+} from './health-lease.js';
+import { CONTROLLED_NODE_SERVICE } from './installer.js';
 
 async function main(): Promise<void> {
   if (process.argv[2] === '--version') {
@@ -17,18 +24,36 @@ async function main(): Promise<void> {
     await runComputerUseIpcHelper(pipe);
     return;
   }
+  if (process.argv[2] === '--health-watchdog') {
+    if (process.platform !== 'darwin') throw new Error('--health-watchdog is macOS-only');
+    const result = await runMacosControlledNodeHealthWatchdog({
+      journalPath: journalPathFor(),
+      restartService: () => {
+        execFileSync('launchctl', [
+          'kickstart', '-k', `system/${CONTROLLED_NODE_SERVICE.MACOS_LABEL}`,
+        ], { stdio: 'ignore' });
+      },
+    });
+    if (result.restarted) {
+      process.stderr.write(`imcodes-node: restarted unhealthy controlled node (${result.reason})\n`);
+    }
+    return;
+  }
   const now = Date.now();
   const deps = defaultBootstrapDeps(now);
   const bootstrap = await bootstrapControlledNodeWithDisposition(deps);
   if (bootstrap.disposition === 'handoff_complete') return;
-  const healthLease = process.platform === 'win32'
-    ? createControlledNodeHealthLeasePublisher(controlledNodeHealthLeasePath(deps.journalPath), {
-      onError: (err) => {
-        const message = err instanceof Error ? err.message : String(err);
-        process.stderr.write(`imcodes-node: failed to publish authenticated health lease (${message})\n`);
-      },
-    })
-    : undefined;
+  const reportHealthError = (err: unknown): void => {
+    const message = err instanceof Error ? err.message : String(err);
+    process.stderr.write(`imcodes-node: failed to publish authenticated health signal (${message})\n`);
+  };
+  const healthLease = process.platform === 'linux'
+    ? createSystemdWatchdogNotifier({ onError: reportHealthError })
+    : process.platform === 'win32' || process.platform === 'darwin'
+      ? createControlledNodeHealthLeasePublisher(controlledNodeHealthLeasePath(deps.journalPath), {
+        onError: reportHealthError,
+      })
+      : undefined;
   const runtime = createControlledNodeRuntime(bootstrap.credential, undefined, {
     onAuthenticated: () => markServiceHealthy(deps.journalPath, Date.now(), {
       isStableRuntime: deps.isStableRuntime,

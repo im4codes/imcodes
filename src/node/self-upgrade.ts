@@ -20,6 +20,8 @@ import { DAEMON_UPGRADE_TARGET_LATEST, normalizeDaemonUpgradeTargetVersion } fro
 import {
   CONTROLLED_NODE_SERVICE,
   encodeWindowsScheduledTaskXml,
+  MACOS_PLIST_PATH,
+  MACOS_WATCHDOG_PLIST_PATH,
   windowsComputerUseHelperAclCommands,
   windowsExecutableFileAclCommands,
 } from './installer.js';
@@ -341,7 +343,7 @@ export function buildPosixControlledNodeUpgradeScript(input: {
   if (input.platform === 'linux') {
     return `#!/bin/sh\nset +e\nsleep 3\nsystemctl stop ${CONTROLLED_NODE_SERVICE.LINUX_UNIT}\n${copy}systemctl start ${CONTROLLED_NODE_SERVICE.LINUX_UNIT}\n`;
   }
-  return `#!/bin/sh\nset +e\nsleep 3\nlaunchctl bootout system/${CONTROLLED_NODE_SERVICE.MACOS_LABEL}\n${copy}launchctl bootstrap system /Library/LaunchDaemons/${CONTROLLED_NODE_SERVICE.MACOS_LABEL}.plist\nlaunchctl kickstart -k system/${CONTROLLED_NODE_SERVICE.MACOS_LABEL}\n`;
+  return `#!/bin/sh\nset +e\nlaunchctl bootout system/${CONTROLLED_NODE_SERVICE.MACOS_WATCHDOG_LABEL}\nsleep 3\nlaunchctl bootout system/${CONTROLLED_NODE_SERVICE.MACOS_LABEL}\n${copy}launchctl bootstrap system ${shQuote(MACOS_PLIST_PATH)}\nlaunchctl kickstart -k system/${CONTROLLED_NODE_SERVICE.MACOS_LABEL}\nlaunchctl bootstrap system ${shQuote(MACOS_WATCHDOG_PLIST_PATH)}\n`;
 }
 
 async function prepareUpgradeJournal(input: {

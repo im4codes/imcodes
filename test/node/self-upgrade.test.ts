@@ -273,7 +273,7 @@ describe('controlled-node self-upgrade', () => {
 
   it.each([
     ['linux', 'systemctl stop imcodes-node.service', 'systemctl start imcodes-node.service'],
-    ['darwin', 'launchctl bootout system/cc.imcodes.node', 'launchctl bootstrap system /Library/LaunchDaemons/cc.imcodes.node.plist'],
+    ['darwin', 'launchctl bootout system/cc.imcodes.node', "launchctl bootstrap system '/Library/LaunchDaemons/cc.imcodes.node.plist'"],
   ] as const)('builds a detached %s upgrader that replaces the binary before restarting the boot service', (platform, stop, start) => {
     const script = buildPosixControlledNodeUpgradeScript({
       platform,
@@ -301,6 +301,12 @@ describe('controlled-node self-upgrade', () => {
     expect(script).toContain("chmod 755 '/opt/imcodes-node/imcodes-node.new'");
     // The manifest must not vouch for a binary that never got published.
     expect(script.indexOf('mv -f')).toBeLessThan(script.indexOf('imcodes-node.manifest.json'));
+    if (platform === 'darwin') {
+      expect(script).toContain('launchctl bootout system/cc.imcodes.node.watchdog');
+      expect(script).toContain("launchctl bootstrap system '/Library/LaunchDaemons/cc.imcodes.node.watchdog.plist'");
+      expect(script.indexOf('bootout system/cc.imcodes.node.watchdog'))
+        .toBeLessThan(script.indexOf('bootout system/cc.imcodes.node\n'));
+    }
   });
 
   it('refuses to publish a macOS binary the kernel would kill, and leaves the old one intact', () => {
@@ -398,8 +404,10 @@ describe('controlled-node self-upgrade', () => {
     });
     const serviceLog = await readFile(logPath, 'utf8');
     if (process.platform === 'darwin') {
+      expect(serviceLog).toContain('bootout system/cc.imcodes.node.watchdog');
       expect(serviceLog).toContain('bootout system/cc.imcodes.node');
       expect(serviceLog).toContain('bootstrap system /Library/LaunchDaemons/cc.imcodes.node.plist');
+      expect(serviceLog).toContain('bootstrap system /Library/LaunchDaemons/cc.imcodes.node.watchdog.plist');
     } else {
       expect(serviceLog).toContain('stop');
       expect(serviceLog).toContain('start');

@@ -20,8 +20,10 @@ import {
   windowsExecutableFileAclCommands,
   windowsSecretFileAclCommands,
   macosLaunchDaemonPlist,
+  macosHealthWatchdogLaunchDaemonPlist,
   linuxSystemdUnit,
   MACOS_PLIST_PATH,
+  MACOS_WATCHDOG_PLIST_PATH,
   LINUX_UNIT_PATH,
   isProcessElevated,
   assertProcessElevated,
@@ -59,6 +61,7 @@ describe('controlled-node installer artifacts (4.1-4.4)', () => {
     expect(CONTROLLED_NODE_SERVICE.WINDOWS_TASK).not.toBe('imcodes-daemon');
     expect(CONTROLLED_NODE_SERVICE.MACOS_LABEL).toBe('cc.imcodes.node');
     expect(CONTROLLED_NODE_SERVICE.MACOS_LABEL).not.toBe('imcodes.daemon');
+    expect(CONTROLLED_NODE_SERVICE.MACOS_WATCHDOG_LABEL).toBe('cc.imcodes.node.watchdog');
     expect(CONTROLLED_NODE_SERVICE.LINUX_UNIT).toBe('imcodes-node.service');
     expect(CONTROLLED_NODE_SERVICE.LINUX_UNIT).not.toBe('imcodes.service');
   });
@@ -221,14 +224,20 @@ describe('controlled-node installer artifacts (4.1-4.4)', () => {
     expect(calls).toHaveLength(4);
   });
 
-  it('macOS artifact is a LaunchDaemon (root, boot), not a LaunchAgent (4.2)', () => {
+  it('macOS artifacts provide boot persistence plus a periodic authenticated-health watchdog (4.2)', () => {
     expect(MACOS_PLIST_PATH).toContain('/Library/LaunchDaemons/');
     expect(MACOS_PLIST_PATH).not.toContain('LaunchAgents');
+    expect(MACOS_WATCHDOG_PLIST_PATH).toContain('/Library/LaunchDaemons/');
     const plist = macosLaunchDaemonPlist(EXE);
     expect(plist).toContain('<string>cc.imcodes.node</string>');
     expect(plist).toContain('<key>RunAtLoad</key><true/>');
     expect(plist).toContain(EXE);
     expect(macosLaunchDaemonPlist('/tmp/node<&>.bin')).toContain('/tmp/node&lt;&amp;&gt;.bin');
+    const watchdog = macosHealthWatchdogLaunchDaemonPlist(EXE);
+    expect(watchdog).toContain('<string>cc.imcodes.node.watchdog</string>');
+    expect(watchdog).toContain('<string>--health-watchdog</string>');
+    expect(watchdog).toContain('<key>StartInterval</key><integer>60</integer>');
+    expect(watchdog).not.toContain('<key>KeepAlive</key>');
   });
 
   it('macOS start reloads the current durable plist instead of trusting a loaded label', async () => {
@@ -243,14 +252,15 @@ describe('controlled-node installer artifacts (4.1-4.4)', () => {
       await installControlledNodeService(EXE, { platform: 'darwin', macosPlistPath: plistPath, runCommand });
       await installControlledNodeService(EXE, { platform: 'darwin', macosPlistPath: plistPath, runCommand });
 
-      expect(calls.filter(({ args }) => args[0] === 'bootout')).toEqual([
+      expect(calls.filter(({ args }) => args[0] === 'bootout' && args[1] === 'system/cc.imcodes.node')).toEqual([
         { file: 'launchctl', args: ['bootout', 'system/cc.imcodes.node'] },
         { file: 'launchctl', args: ['bootout', 'system/cc.imcodes.node'] },
       ]);
-      expect(calls.filter(({ args }) => args[0] === 'bootstrap')).toEqual([
+      expect(calls.filter(({ args }) => args[0] === 'bootstrap' && args[2] === plistPath)).toEqual([
         { file: 'launchctl', args: ['bootstrap', 'system', plistPath] },
         { file: 'launchctl', args: ['bootstrap', 'system', plistPath] },
       ]);
+      expect(calls.filter(({ args }) => args[0] === 'bootstrap' && String(args[2]).includes('watchdog'))).toHaveLength(2);
       expect(calls.filter(({ args }) => args[0] === 'kickstart')).toHaveLength(2);
     } finally {
       await rm(dir, { recursive: true, force: true });
@@ -280,6 +290,8 @@ describe('controlled-node installer artifacts (4.1-4.4)', () => {
     const unit = linuxSystemdUnit(EXE);
     expect(unit).toContain('WantedBy=multi-user.target'); // system, not user
     expect(unit).toContain('Restart=on-failure');
+    expect(unit).toContain('NotifyAccess=all');
+    expect(unit).toContain('WatchdogSec=180');
     expect(unit).toContain(`ExecStart=${EXE}`);
   });
 
@@ -528,28 +540,34 @@ describe('controlled-node installer artifacts (4.1-4.4)', () => {
     const dir = await mkdtemp(join(tmpdir(), 'imcodes-service-inspect-'));
     try {
       const plistPath = join(dir, 'cc.imcodes.node.plist');
+      const watchdogPath = join(dir, 'cc.imcodes.node.watchdog.plist');
       const unitPath = join(dir, 'imcodes-node.service');
       await writeFile(plistPath, macosLaunchDaemonPlist(EXE));
+      await writeFile(watchdogPath, macosHealthWatchdogLaunchDaemonPlist(EXE));
       await writeFile(unitPath, linuxSystemdUnit(EXE));
       const commands: Array<{ file: string; args: readonly string[] }> = [];
       const mac = await inspectServiceState({
         name: CONTROLLED_NODE_SERVICE.MACOS_LABEL, platform: 'darwin', definitionPath: plistPath,
-        definitionSha256: createHash('sha256').update(macosLaunchDaemonPlist(EXE)).digest('hex'), action: EXE,
+        definitionSha256: createHash('sha256').update(macosLaunchDaemonPlist(EXE)).digest('hex'),
+        watchdogDefinitionPath: watchdogPath,
+        watchdogDefinitionSha256: createHash('sha256').update(macosHealthWatchdogLaunchDaemonPlist(EXE)).digest('hex'),
+        action: EXE,
       }, {
         platform: 'darwin',
         runCommand: (file, args) => {
           commands.push({ file, args: [...args] });
+          const watchdog = args.includes(`system/${CONTROLLED_NODE_SERVICE.MACOS_WATCHDOG_LABEL}`);
           return [
-            `system/${CONTROLLED_NODE_SERVICE.MACOS_LABEL} = {`,
-            `\tpath = ${plistPath}`,
+            `system/${watchdog ? CONTROLLED_NODE_SERVICE.MACOS_WATCHDOG_LABEL : CONTROLLED_NODE_SERVICE.MACOS_LABEL} = {`,
+            `\tpath = ${watchdog ? watchdogPath : plistPath}`,
             '\tstate = running',
             `\tprogram = ${EXE}`,
             '\targuments = {',
             `\t\t${EXE}`,
+            ...(watchdog ? ['\t\t--health-watchdog'] : []),
             '\t}',
             '\tusername = root',
-            '\tkeepalive = {',
-            '\t}',
+            ...(!watchdog ? ['\tkeepalive = {', '\t}'] : []),
             '}',
           ].join('\n');
         },
@@ -563,6 +581,8 @@ describe('controlled-node installer artifacts (4.1-4.4)', () => {
         'User=',
         'Restart=on-failure',
         'UnitFileState=enabled',
+        'WatchdogUSec=3min',
+        'NotifyAccess=all',
       ].join('\n');
       const linux = await inspectServiceState({
         name: CONTROLLED_NODE_SERVICE.LINUX_UNIT, platform: 'linux', definitionPath: unitPath,
@@ -588,6 +608,7 @@ describe('controlled-node installer artifacts (4.1-4.4)', () => {
       const showCall = commands.find(({ file, args }) => file === 'systemctl' && args[0] === 'show');
       expect(showCall?.args.join(' ')).toContain('ExecStart');
       expect(showCall?.args.join(' ')).toContain('FragmentPath');
+      expect(showCall?.args.join(' ')).toContain('WatchdogUSec');
       const allArgs = commands.flatMap(({ args }) => args);
       for (const forbidden of ['bootout', 'bootstrap', 'kickstart', 'restart', 'daemon-reload', '/Run', '/Create']) {
         expect(allArgs).not.toContain(forbidden);
@@ -597,26 +618,79 @@ describe('controlled-node installer artifacts (4.1-4.4)', () => {
     }
   });
 
+  it('rejects legacy macOS/Linux persistence that only supervises process existence', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'imcodes-service-inspect-'));
+    try {
+      const plistPath = join(dir, 'cc.imcodes.node.plist');
+      const unitPath = join(dir, 'imcodes-node.service');
+      await writeFile(plistPath, macosLaunchDaemonPlist(EXE));
+      await writeFile(unitPath, linuxSystemdUnit(EXE));
+      const mac = await inspectServiceState({
+        name: CONTROLLED_NODE_SERVICE.MACOS_LABEL,
+        platform: 'darwin',
+        definitionPath: plistPath,
+        definitionSha256: createHash('sha256').update(macosLaunchDaemonPlist(EXE)).digest('hex'),
+        action: EXE,
+      }, {
+        platform: 'darwin',
+        runCommand: (_file, args) => {
+          if (args.includes(`system/${CONTROLLED_NODE_SERVICE.MACOS_WATCHDOG_LABEL}`)) {
+            throw new Error('legacy install has no watchdog');
+          }
+          return `system/${CONTROLLED_NODE_SERVICE.MACOS_LABEL} = {\npath = ${plistPath}\nstate = running\nprogram = ${EXE}\nusername = root\nkeepalive = {\n}\n}`;
+        },
+      });
+      expect(mac.definitionMatches).toBe(false);
+      expect(mac.errors.join(' ')).toContain('watchdog_');
+
+      const linux = await inspectServiceState({
+        name: CONTROLLED_NODE_SERVICE.LINUX_UNIT,
+        platform: 'linux',
+        definitionPath: unitPath,
+        definitionSha256: createHash('sha256').update(linuxSystemdUnit(EXE)).digest('hex'),
+        action: EXE,
+      }, {
+        platform: 'linux',
+        runCommand: (_file, args) => (args[0] === 'is-enabled' ? 'enabled'
+          : `ActiveState=active\nLoadState=loaded\nFragmentPath=${unitPath}\nExecStart={ path=${EXE} ; argv[]=${EXE} }\nUser=\nRestart=on-failure\nUnitFileState=enabled\nWatchdogUSec=0\nNotifyAccess=none`),
+      });
+      expect(linux.definitionMatches).toBe(false);
+      expect(linux.loadedActionMatches).toBe(true);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   it('macOS flags a stale loaded action: the on-disk plist matches the receipt but launchd still runs the old exe', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'imcodes-service-inspect-'));
     try {
       const plistPath = join(dir, 'cc.imcodes.node.plist');
+      const watchdogPath = join(dir, 'cc.imcodes.node.watchdog.plist');
       // The durable plist already points at the NEW exe (matches the receipt)…
       await writeFile(plistPath, macosLaunchDaemonPlist(EXE));
+      await writeFile(watchdogPath, macosHealthWatchdogLaunchDaemonPlist(EXE));
       const OLD = '/opt/imcodes-node/imcodes-node.old';
       const inspection = await inspectServiceState({
         name: CONTROLLED_NODE_SERVICE.MACOS_LABEL, platform: 'darwin', definitionPath: plistPath,
-        definitionSha256: createHash('sha256').update(macosLaunchDaemonPlist(EXE)).digest('hex'), action: EXE,
+        definitionSha256: createHash('sha256').update(macosLaunchDaemonPlist(EXE)).digest('hex'),
+        watchdogDefinitionPath: watchdogPath,
+        watchdogDefinitionSha256: createHash('sha256').update(macosHealthWatchdogLaunchDaemonPlist(EXE)).digest('hex'),
+        action: EXE,
       }, {
         platform: 'darwin',
         // …but launchd was never rebootstrapped, so it still has the OLD exe loaded.
-        runCommand: () => [
-          `system/${CONTROLLED_NODE_SERVICE.MACOS_LABEL} = {`,
+        runCommand: (_file, args) => {
+          const watchdog = args.includes(`system/${CONTROLLED_NODE_SERVICE.MACOS_WATCHDOG_LABEL}`);
+          return [
+          `system/${watchdog ? CONTROLLED_NODE_SERVICE.MACOS_WATCHDOG_LABEL : CONTROLLED_NODE_SERVICE.MACOS_LABEL} = {`,
+          `\tpath = ${watchdog ? watchdogPath : plistPath}`,
           '\tstate = running',
-          `\tprogram = ${OLD}`,
+          `\tprogram = ${watchdog ? EXE : OLD}`,
+          ...(watchdog ? ['\targuments = {', `\t\t${EXE}`, '\t\t--health-watchdog', '\t}'] : []),
           '\tusername = root',
           '}',
-        ].join('\n'),
+          ].join('\n');
+        },
       });
       expect(inspection.definitionMatches).toBe(true); // disk is already correct
       expect(inspection.action).toBe(EXE); // on-disk action
@@ -642,7 +716,7 @@ describe('controlled-node installer artifacts (4.1-4.4)', () => {
       const staleExec = await inspectServiceState(receipt, {
         platform: 'linux',
         runCommand: (_file, args) => (args[0] === 'is-enabled' ? 'enabled'
-          : `ActiveState=active\nLoadState=loaded\nFragmentPath=${unitPath}\nExecStart={ path=${OLD} ; argv[]=${OLD} }\nUser=\nRestart=on-failure\nUnitFileState=enabled`),
+          : `ActiveState=active\nLoadState=loaded\nFragmentPath=${unitPath}\nExecStart={ path=${OLD} ; argv[]=${OLD} }\nUser=\nRestart=on-failure\nUnitFileState=enabled\nWatchdogUSec=3min\nNotifyAccess=all`),
       });
       expect(staleExec.definitionMatches).toBe(true);
       expect(staleExec.effectiveAction).toBe(OLD);
@@ -651,7 +725,7 @@ describe('controlled-node installer artifacts (4.1-4.4)', () => {
       const staleFragment = await inspectServiceState(receipt, {
         platform: 'linux',
         runCommand: (_file, args) => (args[0] === 'is-enabled' ? 'enabled'
-          : `ActiveState=active\nLoadState=loaded\nFragmentPath=/etc/systemd/system/other.service\nExecStart={ path=${EXE} ; argv[]=${EXE} }\nUser=imcodes\nRestart=on-failure\nUnitFileState=enabled`),
+          : `ActiveState=active\nLoadState=loaded\nFragmentPath=/etc/systemd/system/other.service\nExecStart={ path=${EXE} ; argv[]=${EXE} }\nUser=imcodes\nRestart=on-failure\nUnitFileState=enabled\nWatchdogUSec=3min\nNotifyAccess=all`),
       });
       expect(staleFragment.loaded).toBe(false);
       expect(staleFragment.loadedActionMatches).toBe(false);
