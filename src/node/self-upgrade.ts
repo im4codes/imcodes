@@ -217,11 +217,14 @@ export function buildWindowsControlledNodeUpgradeScript(input: {
   return `$ErrorActionPreference = 'Stop'\r\n`
     + `Start-Sleep -Seconds 3\r\n`
     + `$task = ${psQuote(CONTROLLED_NODE_SERVICE.WINDOWS_TASK)}\r\n`
+    + `$watchdogTask = ${psQuote(CONTROLLED_NODE_SERVICE.WINDOWS_WATCHDOG_TASK)}\r\n`
     + `$dst = ${psQuote(input.destinationPath)}\r\n`
     + `$src = ${psQuote(input.stagedArtifactPath)}\r\n`
     + `$dstManifest = ${psQuote(input.destinationManifestPath)}\r\n`
     + `$srcManifest = ${psQuote(input.stagedManifestPath)}\r\n`
     + `try {\r\n`
+    + `Disable-ScheduledTask -TaskName $watchdogTask -ErrorAction SilentlyContinue\r\n`
+    + `Stop-ScheduledTask -TaskName $watchdogTask -ErrorAction SilentlyContinue\r\n`
     + `Stop-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue\r\n`
     + `Start-Sleep -Seconds 2\r\n`
     + `Get-CimInstance Win32_Process -Filter 'name="imcodes-node.exe"' | Where-Object { $_.CommandLine -like '*ProgramData*imcodes-node.exe*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }\r\n`
@@ -239,6 +242,7 @@ export function buildWindowsControlledNodeUpgradeScript(input: {
     + exeAcl + `\r\n`
     + helperAcl + `\r\n`
     + `} finally {\r\n`
+    + `Enable-ScheduledTask -TaskName $watchdogTask -ErrorAction SilentlyContinue\r\n`
     + `Start-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue\r\n`
     + upgradeTaskCleanup
     + `}\r\n`;

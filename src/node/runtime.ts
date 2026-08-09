@@ -52,6 +52,8 @@ export function isControlledNodeAuthAck(message: Record<string, unknown>): boole
 export interface ControlledNodeRuntimeOptions {
   onAuthenticated?: () => void | Promise<void>;
   onAuthenticationError?: (error: unknown) => void;
+  /** Called for every authenticated server heartbeat acknowledgement. */
+  onHeartbeatAck?: () => void | Promise<void>;
 }
 
 export function createControlledNodeRuntime(
@@ -143,7 +145,14 @@ export function createControlledNodeRuntime(
       } catch {
         return;
       }
-      if (isControlledNodeAuthAck(message)) persistAuthentication();
+      if (isControlledNodeAuthAck(message)) {
+        persistAuthentication();
+        try {
+          void Promise.resolve(options.onHeartbeatAck?.()).catch(reportAuthenticationError);
+        } catch (error) {
+          reportAuthenticationError(error);
+        }
+      }
       if (message.type === DAEMON_COMMAND_TYPES.DAEMON_UPGRADE) {
         if (upgradeInFlight) {
           client.send({ type: DAEMON_MSG.UPGRADE_BLOCKED, reason: 'already_in_progress' });

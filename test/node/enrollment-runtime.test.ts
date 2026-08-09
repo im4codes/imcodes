@@ -65,12 +65,13 @@ describe('controlled node enrollment and runtime', () => {
   it('authenticates, executes only machine.exec, and returns a correlated result', async () => {
     const socket = new MockSocket();
     const onAuthenticated = vi.fn();
+    const onHeartbeatAck = vi.fn();
     const runtime = createControlledNodeRuntime({
       serverUrl: 'https://im.example',
       serverId: 'controlled-1',
       token: 'secret',
       nodeRole: NODE_ROLE.CONTROLLED,
-    }, () => socket, { onAuthenticated });
+    }, () => socket, { onAuthenticated, onHeartbeatAck });
     runtime.start();
     socket.open();
     const authFrame = JSON.parse(socket.sent[0]!);
@@ -90,6 +91,10 @@ describe('controlled node enrollment and runtime', () => {
 
     socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
     expect(onAuthenticated).toHaveBeenCalledOnce();
+    expect(onHeartbeatAck).toHaveBeenCalledOnce();
+    socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
+    expect(onAuthenticated).toHaveBeenCalledOnce();
+    expect(onHeartbeatAck).toHaveBeenCalledTimes(2);
     expect(isControlledNodeAuthAck({ type: 'heartbeat_ack' })).toBe(true);
 
     const execCommand = process.platform === 'win32' ? "[Console]::Write('ok')" : 'printf ok';

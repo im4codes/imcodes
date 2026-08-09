@@ -3,6 +3,7 @@ import { bootstrapControlledNodeWithDisposition, defaultBootstrapDeps, journalPa
 import { runComputerUseIpcHelper } from './computer-use-ipc.js';
 import { createControlledNodeRuntime } from './runtime.js';
 import { DAEMON_VERSION } from '../util/version.js';
+import { controlledNodeHealthLeasePath, createControlledNodeHealthLeasePublisher } from './health-lease.js';
 
 async function main(): Promise<void> {
   if (process.argv[2] === '--version') {
@@ -20,6 +21,14 @@ async function main(): Promise<void> {
   const deps = defaultBootstrapDeps(now);
   const bootstrap = await bootstrapControlledNodeWithDisposition(deps);
   if (bootstrap.disposition === 'handoff_complete') return;
+  const healthLease = process.platform === 'win32'
+    ? createControlledNodeHealthLeasePublisher(controlledNodeHealthLeasePath(deps.journalPath), {
+      onError: (err) => {
+        const message = err instanceof Error ? err.message : String(err);
+        process.stderr.write(`imcodes-node: failed to publish authenticated health lease (${message})\n`);
+      },
+    })
+    : undefined;
   const runtime = createControlledNodeRuntime(bootstrap.credential, undefined, {
     onAuthenticated: () => markServiceHealthy(deps.journalPath, Date.now(), {
       isStableRuntime: deps.isStableRuntime,
@@ -29,6 +38,7 @@ async function main(): Promise<void> {
       const message = err instanceof Error ? err.message : String(err);
       process.stderr.write(`imcodes-node: failed to record service_healthy (${message})\n`);
     },
+    onHeartbeatAck: healthLease?.recordAuthenticatedHeartbeat,
   });
   runtime.start();
   const stop = () => {

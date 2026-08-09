@@ -131,6 +131,10 @@ describe('controlled-node self-upgrade', () => {
     const script = await readFile(result.scriptPath!, 'utf8');
     expect(script).toContain('Stop-ScheduledTask');
     expect(script).toContain('Start-ScheduledTask');
+    expect(script).toContain("$watchdogTask = 'imcodes-node-watchdog'");
+    expect(script).toContain('Disable-ScheduledTask -TaskName $watchdogTask');
+    expect(script).toContain('Stop-ScheduledTask -TaskName $watchdogTask');
+    expect(script).toContain('Enable-ScheduledTask -TaskName $watchdogTask');
     expect(script).toContain('Copy-Item -Force $src $dst');
     expect(script).toContain('computer-use-helper');
     expect(script).toContain('Copy-Item -Recurse -Force -Path (Join-Path $srcHelper');
@@ -354,7 +358,9 @@ describe('controlled-node self-upgrade', () => {
       const quotedLog = logPath.replaceAll("'", "''");
       await writeFile(harnessPath, [
         `function Start-Sleep { param([int]$Seconds) }`,
+        `function Disable-ScheduledTask { param($TaskName, $ErrorAction); Add-Content -LiteralPath '${quotedLog}' -Value "disable:$TaskName" }`,
         `function Stop-ScheduledTask { param($TaskName, $ErrorAction); Add-Content -LiteralPath '${quotedLog}' -Value "stop:$TaskName" }`,
+        `function Enable-ScheduledTask { param($TaskName, $ErrorAction); Add-Content -LiteralPath '${quotedLog}' -Value "enable:$TaskName" }`,
         `function Start-ScheduledTask { param($TaskName); Add-Content -LiteralPath '${quotedLog}' -Value "start:$TaskName" }`,
         'function Get-CimInstance { param($ClassName, $Filter); @() }',
         generated,
