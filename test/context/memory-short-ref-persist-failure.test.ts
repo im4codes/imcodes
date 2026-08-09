@@ -27,6 +27,7 @@ vi.mock('../../src/util/metrics.js', () => ({ incrementCounter: incrementCounter
 vi.mock('../../src/util/rate-limited-warn.js', () => ({ warnOncePerHour: warnOncePerHourMock }));
 
 import {
+  getMemoryShortRefHealth,
   registerMemoryShortRefs,
   resetMemoryShortRefsForTests,
   resolveMemoryShortRef,
@@ -116,6 +117,19 @@ describe('memory short refs — persistence failures stay observable', () => {
     await vi.waitFor(() => expect(warnOncePerHourMock).toHaveBeenCalled());
     // The unpersisted handle still resolves for the life of this process.
     expect(resolveMemoryShortRef(refs[0]!, entry.namespace)).toMatchObject({ id: entry.id });
+  });
+
+  it('clears a file-write alert after the complete cache is written successfully', () => {
+    process.env.IMCODES_MEMORY_SHORT_REF_PATH = '/tmp/imcodes-short-ref-health-test.json';
+    writeFileSyncMock
+      .mockImplementationOnce(() => { throw Object.assign(new Error('ENOSPC'), { code: 'ENOSPC' }); })
+      .mockImplementationOnce(() => undefined);
+
+    registerMemoryShortRefs([entry]);
+    expect(getMemoryShortRefHealth()).toMatchObject({ stage: 'persist_file' });
+
+    registerMemoryShortRefs([{ ...entry, id: 'file-recovery-row' }]);
+    expect(getMemoryShortRefHealth()).toBeUndefined();
   });
 
   it('reports a failed warm-load instead of returning an ambiguous zero', async () => {

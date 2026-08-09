@@ -41,6 +41,24 @@ const persistedRefHydrations = new Map<string, Promise<number>>();
 let persistedLoaded = false;
 let shortRefHealth: MemoryShortRefHealth | undefined;
 
+interface MemoryShortRefStoreRow {
+  ref: string;
+  kind: MemoryShortRefKind;
+  id: string;
+  namespaceKey: string;
+  namespaceJson: string | null;
+  lastSeenAt: number;
+}
+
+const SHORT_REF_STORE_BATCH_SIZE = 250;
+const SHORT_REF_STORE_RETRY_BASE_MS = 1_000;
+const SHORT_REF_STORE_RETRY_MAX_MS = 60_000;
+const pendingStoreRows = new Map<string, MemoryShortRefStoreRow>();
+let storeFlushPromise: Promise<void> | null = null;
+let storeRetryTimer: NodeJS.Timeout | null = null;
+let storeRetryAttempt = 0;
+let shortRefStateGeneration = 0;
+
 function refPrefix(kind: MemoryShortRefKind): 'proj' | 'obs' {
   return kind === 'projection' ? 'proj' : 'obs';
 }
@@ -327,6 +345,9 @@ function persistShortRefsToFile(): void {
       schemaVersion: SHORT_REF_SCHEMA_VERSION,
       entries: entries.slice(0, MAX_SHORT_REF_ENTRIES),
     }), 'utf8');
+    // The file branch rewrites the complete in-memory index, so one successful
+    // write also repairs every handle covered by a prior failed write.
+    if (shortRefHealth?.stage === 'persist_file') shortRefHealth = undefined;
   } catch (error) {
     // Non-fatal, but never silent: an unwritable file is exactly how handles
     // used to disappear without a trace.
@@ -379,9 +400,77 @@ function recordShortRefFailure(stage: string, message: string): void {
   };
 }
 
+function storeRowKey(row: MemoryShortRefStoreRow): string {
+  return JSON.stringify([row.ref, row.kind, row.id, row.namespaceKey]);
+}
+
+function clearRecoveredStoreHealth(): void {
+  if (pendingStoreRows.size === 0 && shortRefHealth?.stage === 'persist_store') {
+    shortRefHealth = undefined;
+  }
+}
+
+function scheduleStoreRetry(generation: number): void {
+  if (generation !== shortRefStateGeneration || storeRetryTimer || pendingStoreRows.size === 0) return;
+  const exponent = Math.max(0, storeRetryAttempt - 1);
+  const delay = Math.min(SHORT_REF_STORE_RETRY_BASE_MS * (2 ** Math.min(exponent, 10)), SHORT_REF_STORE_RETRY_MAX_MS);
+  storeRetryTimer = setTimeout(() => {
+    storeRetryTimer = null;
+    flushPendingStoreRows();
+  }, delay);
+  if (typeof storeRetryTimer.unref === 'function') storeRetryTimer.unref();
+}
+
+function flushPendingStoreRows(): void {
+  if (storeFlushPromise || storeRetryTimer || pendingStoreRows.size === 0) {
+    clearRecoveredStoreHealth();
+    return;
+  }
+  const generation = shortRefStateGeneration;
+  const batch = [...pendingStoreRows.entries()].slice(0, SHORT_REF_STORE_BATCH_SIZE);
+  let succeeded = false;
+  let operation!: Promise<void>;
+  operation = getContextStoreClient()
+    .run('upsertMemoryShortRefs', [batch.map(([, row]) => row)])
+    .then(() => {
+      if (generation !== shortRefStateGeneration) return;
+      succeeded = true;
+      storeRetryAttempt = 0;
+      for (const [key, row] of batch) {
+        // A newer registration for the same identity may have refreshed
+        // lastSeenAt while this batch was in flight. Keep that newer row queued.
+        if (pendingStoreRows.get(key) === row) pendingStoreRows.delete(key);
+      }
+      clearRecoveredStoreHealth();
+    })
+    .catch((error: unknown) => {
+      if (generation !== shortRefStateGeneration) return;
+      storeRetryAttempt += 1;
+      // Keep the exact failed rows queued. A later successful retry is what
+      // makes these already-issued handles durable and clears the heartbeat.
+      reportShortRefFailure('persist_store', error, { rows: batch.length });
+    })
+    .finally(() => {
+      if (generation !== shortRefStateGeneration || storeFlushPromise !== operation) return;
+      storeFlushPromise = null;
+      if (pendingStoreRows.size === 0) {
+        clearRecoveredStoreHealth();
+      } else if (succeeded) {
+        // Drain a large backlog batch-by-batch without a timer delay once the
+        // worker has proved healthy again.
+        queueMicrotask(flushPendingStoreRows);
+      } else {
+        scheduleStoreRetry(generation);
+      }
+    });
+  storeFlushPromise = operation;
+}
+
 /**
- * Latest persistence failure, or undefined while healthy. Sticky rather than
- * edge-triggered, so a reader that connects after the failure still sees it.
+ * Latest unresolved persistence failure, or undefined while healthy. Store
+ * write failures remain visible until the retained rows have all been retried
+ * successfully, so reconnecting readers see a real standing fault rather than
+ * either a missed edge or a stale, already-repaired incident.
  */
 export function getMemoryShortRefHealth(): MemoryShortRefHealth | undefined {
   return shortRefHealth;
@@ -405,7 +494,7 @@ function persistShortRefs(touched: ReadonlyArray<{ ref: string; entry: MemorySho
     return;
   }
   if (touched.length === 0) return;
-  const rows = touched.map(({ ref, entry }) => ({
+  const rows: MemoryShortRefStoreRow[] = touched.map(({ ref, entry }) => ({
     ref,
     kind: entry.kind,
     id: entry.id,
@@ -413,15 +502,10 @@ function persistShortRefs(touched: ReadonlyArray<{ ref: string; entry: MemorySho
     namespaceJson: entry.namespace ? JSON.stringify(entry.namespace) : null,
     lastSeenAt: entry.lastSeenAt ?? Date.now(),
   }));
-  void getContextStoreClient()
-    .run('upsertMemoryShortRefs', [rows])
-    .catch((error: unknown) => {
-      // Non-fatal for this process — the in-memory index still resolves, handles
-      // are a pure function of the id, and sourceLookup full ids stay canonical.
-      // But it IS the failure this change exists to make visible: handles that
-      // never land stop resolving after a restart.
-      reportShortRefFailure('persist_store', error, { rows: rows.length });
-    });
+  for (const row of rows) pendingStoreRows.set(storeRowKey(row), row);
+  // Registration stays synchronous/non-fatal. The async flusher retains failed
+  // rows and retries with bounded backoff until every issued handle is durable.
+  flushPendingStoreRows();
 }
 
 function normalizePersistedShortRefRow(
@@ -739,6 +823,12 @@ export function seedMemoryShortRefCollisionForTests(ref: string, entries: readon
 }
 
 export function resetMemoryShortRefsForTests(): void {
+  shortRefStateGeneration += 1;
+  if (storeRetryTimer) clearTimeout(storeRetryTimer);
+  storeRetryTimer = null;
+  storeFlushPromise = null;
+  storeRetryAttempt = 0;
+  pendingStoreRows.clear();
   entriesByRef.clear();
   persistedRefHydrations.clear();
   shortRefHealth = undefined;

@@ -9,8 +9,10 @@
  * failure being reported, with write errors swallowed. In the original
  * disk-full incident neither signal could leave the machine.
  *
- * This travels the WebSocket instead, and is sticky rather than edge-triggered,
- * so it is still visible to whoever reconnects after the fact.
+ * This travels the WebSocket instead. A failure remains visible while affected
+ * rows are not durable, then clears only after a successful repair flush, so a
+ * reconnecting reader sees the current persistence state rather than a missed
+ * edge or an already-repaired stale alert.
  */
 export interface MemoryShortRefHealth {
   /** Where the last failure happened (persist_store, persist_file, warm_load, hydrate_ref, load_file). */
