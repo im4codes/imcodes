@@ -38,6 +38,7 @@ export type ShareAuditActionType =
   | 'share.expire'
   | 'share.target_delete'
   | 'session.send'
+  | 'session.supervision'
   | 'session.cancel'
   | 'discussion.comment'
   | 'p2p.orchestration'

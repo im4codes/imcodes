@@ -18,6 +18,7 @@ import {
 import { TRANSPORT_MSG } from '../../shared/transport-events.js';
 import { FS_TRANSPORT_MSG } from '../../shared/fs-transport-messages.js';
 import { P2P_WORKFLOW_MSG } from '../../shared/p2p-workflow-messages.js';
+import { P2P_CONFIG_MSG } from '../../shared/p2p-config-events.js';
 import { getShareScopedCommandPolicy } from '../../shared/tab-sharing.js';
 import { REPO_MSG } from '../../shared/repo-types.js';
 import { FS_SESSION_ROOT_PATH } from '../../src/shared/transport/fs.js';
@@ -1206,6 +1207,131 @@ describe('WsBridge share-scoped sockets', () => {
       expect.objectContaining({ type: 'discussion.started', discussionId: 'discussion-1' }),
     ]));
     expect(otherShared.sentJson.some((msg) => msg.type === 'discussion.started')).toBe(false);
+  });
+
+  it('allows participants to save only covered Team config and denies viewers or outside session entries', async () => {
+    const bridge = WsBridge.get(serverId);
+    const target: ShareTarget = { kind: 'main', serverId, sessionName: 'deck_proj_brain' };
+    const auditRows: AuditInsert[] = [];
+    let role: 'viewer' | 'participant' = 'participant';
+    bridge.setShareCoverageResolverForTests(async () => coverage(target, role, now));
+    const db = makeDb(null, auditRows, {
+      subSessions: [{ id: 'child_1', parent_session: 'deck_proj_brain' }],
+    });
+    const daemon = new MockWs();
+    bridge.handleDaemonConnection(daemon as never, db, {} as never);
+    daemon.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+    await flushAsync();
+    daemon.sent.length = 0;
+
+    const participant = new MockWs();
+    bridge.handleShareBrowserConnection(participant as never, 'participant-user', db, {
+      ticketId: 'share-team-config',
+      target,
+      snapshot: coverage(target, 'participant', now),
+    });
+    participant.emit('message', JSON.stringify({
+      type: P2P_CONFIG_MSG.SAVE,
+      requestId: 'team-config-covered',
+      scopeSession: 'deck_proj_brain',
+      config: {
+        sessions: { deck_sub_child_1: { enabled: true, mode: 'review' } },
+        rounds: 2,
+      },
+      sharedActor: { actorUserId: 'spoofed' },
+      unexpected: 'drop-me',
+    }));
+    await flushAsync();
+
+    expect(daemon.sentJson).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: P2P_CONFIG_MSG.SAVE,
+        requestId: 'team-config-covered',
+        scopeSession: 'deck_proj_brain',
+        config: {
+          sessions: { deck_sub_child_1: { enabled: true, mode: 'review' } },
+          rounds: 2,
+        },
+      }),
+    ]));
+    const forwarded = daemon.sentJson.find((msg) => msg.requestId === 'team-config-covered');
+    expect(forwarded).not.toHaveProperty('unexpected');
+    expect(forwarded).not.toHaveProperty('sharedActor');
+    expect(auditRows).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        actorUserId: 'participant-user',
+        actionType: 'p2p.orchestration',
+        decision: 'accepted',
+        actionId: 'team-config-covered',
+      }),
+    ]));
+
+    daemon.sent.length = 0;
+    participant.emit('message', JSON.stringify({
+      type: P2P_CONFIG_MSG.SAVE,
+      requestId: 'team-config-outside',
+      scopeSession: 'deck_proj_brain',
+      config: {
+        sessions: { deck_other_worker: { enabled: true, mode: 'review' } },
+        rounds: 1,
+      },
+    }));
+    await flushAsync();
+    expect(participant.sentJson).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: 'error',
+        code: SHARE_REASONS.DIRECT_SURFACE_DENIED,
+        originalType: P2P_CONFIG_MSG.SAVE,
+      }),
+    ]));
+    expect(daemon.sentJson.some((msg) => msg.requestId === 'team-config-outside')).toBe(false);
+
+    participant.emit('message', JSON.stringify({
+      type: P2P_CONFIG_MSG.SAVE,
+      requestId: 'team-config-nested-outside',
+      scopeSession: 'deck_proj_brain',
+      config: {
+        sessions: {},
+        rounds: 1,
+        workflowDraft: {
+          participants: [{ sessionName: 'deck_other_worker' }],
+        },
+      },
+    }));
+    await flushAsync();
+    expect(participant.sentJson).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: 'error',
+        code: SHARE_REASONS.DIRECT_SURFACE_DENIED,
+        originalType: P2P_CONFIG_MSG.SAVE,
+        requestId: 'team-config-nested-outside',
+      }),
+    ]));
+    expect(daemon.sentJson.some((msg) => msg.requestId === 'team-config-nested-outside')).toBe(false);
+
+    role = 'viewer';
+    now += 1;
+    const viewer = new MockWs();
+    bridge.handleShareBrowserConnection(viewer as never, 'viewer-user', db, {
+      ticketId: 'share-team-config-viewer',
+      target,
+      snapshot: coverage(target, 'viewer', now),
+    });
+    viewer.emit('message', JSON.stringify({
+      type: P2P_CONFIG_MSG.SAVE,
+      requestId: 'team-config-viewer',
+      scopeSession: 'deck_proj_brain',
+      config: { sessions: {}, rounds: 1 },
+    }));
+    await flushAsync();
+    expect(viewer.sentJson).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: 'error',
+        code: SHARE_REASONS.ROLE_DENIED,
+        originalType: P2P_CONFIG_MSG.SAVE,
+      }),
+    ]));
+    expect(daemon.sentJson.some((msg) => msg.requestId === 'team-config-viewer')).toBe(false);
   });
 
   it('denies viewer and out-of-scope share Team discussion starts before daemon forwarding', async () => {

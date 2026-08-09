@@ -53,7 +53,7 @@ import { PREF_KEY_P2P_COMBO_CONFIRM_SKIP, PREF_KEY_P2P_DROPDOWN_TAB, p2pSessionC
 import { parseP2pSavedConfig, serializeP2pSavedConfig } from '../preferences/p2p-config-pref.js';
 import { sendSessionViaHttp, cancelSessionViaHttp, deleteAttachment } from '../api.js';
 import { DirectFileTransferFailure, isFileUploadCanceled, uploadFileWithDirectFallback, type FileUploadTransportMode } from '../direct-file-transfer.js';
-import { patchSession, patchSubSession } from '../api.js';
+import { patchSession, patchSessionSupervision, patchSubSession } from '../api.js';
 import { isImeComposingKeyEvent } from '../ime-keyboard.js';
 import { deriveSessionLiveStatus, isRunningSessionState } from '../session-live-status.js';
 import { DAEMON_MSG } from '@shared/daemon-events.js';
@@ -1708,11 +1708,11 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     || (sharedState?.status === 'active' && sharedState.effectiveRole === 'participant');
   // Input only disabled when there's no session or the active share cannot dispatch messages.
   const inputDisabled = !hasSession || !canSharedSessionSend;
-  // Send/action buttons disabled when disconnected, missing a session, or share-scoped direct controls are unavailable.
+  // Owner-only controls stay disabled for shared sessions. Participant-scoped
+  // controls use the narrower gate below.
   const disabled = !connected || !hasSession || isShareScopedSession;
-  // Model switching is a scoped participant action. Keep every other direct
-  // control under the stricter shared-session gate above.
-  const modelSwitchDisabled = !connected || !hasSession || !canSharedSessionSend;
+  const participantControlDisabled = !connected || !hasSession || !canSharedSessionSend;
+  const modelSwitchDisabled = participantControlDisabled;
   const isClaudeCode = activeSession?.agentType === 'claude-code' || activeSession?.agentType === 'claude-code-sdk';
   const isShellLike = activeSession?.agentType === 'shell' || activeSession?.agentType === 'script';
   const isTransport = effectiveRuntimeType === 'transport';
@@ -2348,16 +2348,22 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       ? t('session.supervision.quickAuditLabel')
       : t('session.supervision.quickLabel');
 
-  const persistTransportConfig = useCallback(async (transportConfig: Record<string, unknown> | null) => {
+  const persistTransportConfig = useCallback(async (
+    transportConfig: Record<string, unknown> | null,
+    supervision: Partial<SessionSupervisionSnapshot>,
+  ) => {
     if (!serverId || !activeSession) return;
-    if (subSessionId) {
+    let persistedTransportConfig = transportConfig;
+    if (isShareScopedSession) {
+      persistedTransportConfig = await patchSessionSupervision(serverId, activeSession.name, supervision);
+    } else if (subSessionId) {
       await patchSubSession(serverId, subSessionId, { transportConfig });
     } else {
       await patchSession(serverId, activeSession.name, { transportConfig });
     }
-    setLocalTransportConfig(transportConfig);
-    onTransportConfigSaved?.(transportConfig);
-  }, [activeSession, onTransportConfigSaved, serverId, subSessionId]);
+    setLocalTransportConfig(persistedTransportConfig);
+    onTransportConfigSaved?.(persistedTransportConfig);
+  }, [activeSession, isShareScopedSession, onTransportConfigSaved, serverId, subSessionId]);
 
   const handleQuickSupervisionModeSelect = useCallback(async (nextMode: SupervisionMode) => {
     if (!activeSession || !serverId || !canQuickControlSupervision) return;
@@ -2373,14 +2379,15 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     };
 
     if (nextMode === SUPERVISION_MODE.OFF) {
+      const nextSnapshot = supervisionSnapshot
+        ? { ...supervisionSnapshot, mode: SUPERVISION_MODE.OFF }
+        : { mode: SUPERVISION_MODE.OFF };
       const nextTransportConfig = buildTransportConfigWithSupervision(
         currentTransportConfig,
-        supervisionSnapshot
-          ? { ...supervisionSnapshot, mode: SUPERVISION_MODE.OFF }
-          : { mode: SUPERVISION_MODE.OFF },
+        nextSnapshot,
       );
       try {
-        await persistTransportConfig(nextTransportConfig);
+        await persistTransportConfig(nextTransportConfig, nextSnapshot);
         setAutoOpen(false);
       } catch {
         showSendWarning(t('upload.upload_failed'));
@@ -2426,7 +2433,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
 
     const nextTransportConfig = buildTransportConfigWithSupervision(currentTransportConfig, nextSnapshot);
     try {
-      await persistTransportConfig(nextTransportConfig);
+      await persistTransportConfig(nextTransportConfig, nextSnapshot);
       setAutoOpen(false);
     } catch {
       showSendWarning(t('upload.upload_failed'));
@@ -3110,7 +3117,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     config: P2pSavedConfig,
     options?: { awaitAck?: boolean },
   ): Promise<P2pConfigPersistResult> => {
-    if (!ws) return Promise.resolve({ ok: false, error: P2P_CONFIG_ERROR.SAVE_TIMEOUT });
+    if (!ws || !canSharedSessionSend) return Promise.resolve({ ok: false, error: P2P_CONFIG_ERROR.SAVE_TIMEOUT });
     const requestId = globalThis.crypto?.randomUUID?.() ?? `p2p-config-${Date.now()}-${Math.random().toString(16).slice(2)}`;
     const awaitAck = options?.awaitAck !== false;
     if (!awaitAck) {
@@ -3132,7 +3139,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         resolvePendingP2pConfigSave(requestId, { ok: false, error: P2P_CONFIG_ERROR.SAVE_TIMEOUT });
       }
     });
-  }, [resolvePendingP2pConfigSave, ws]);
+  }, [canSharedSessionSend, resolvePendingP2pConfigSave, ws]);
 
   const handleP2pDropdownRoundsChange = useCallback((nextRounds: number) => {
     const cfg: P2pSavedConfig = sanitizeP2pSavedConfig({
@@ -4845,7 +4852,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                 setQuickDelegationError(null);
                 setPeerAuditOpen(true);
               }}
-              disabled={disabled || peerAuditOpen}
+              disabled={participantControlDisabled || peerAuditOpen}
               title={t('peerAuditQuick.tooltip')}
               aria-label={t('peerAuditQuick.iconLabel')}
               aria-haspopup="dialog"
@@ -4864,7 +4871,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
             <button
               class={`shortcut-btn shortcut-btn-auto ${quickAutoModeClass}`}
               onClick={() => setAutoOpen((open) => !open)}
-              disabled={disabled}
+              disabled={participantControlDisabled}
               title={t('session.supervision.quickTitle')}
               aria-label={t('session.supervision.quickLabel')}
               aria-haspopup="menu"
@@ -4897,7 +4904,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                 >
                   {quickSupervisionMode === SUPERVISION_MODE.SUPERVISED_AUDIT ? '● ' : '○ '}{t('session.supervision.mode.supervised_audit')}
                 </button>
-                {!!onSettings && (
+                {!!onSettings && !isShareScopedSession && (
                   <>
                     <div class="menu-divider" />
                     <button
@@ -5277,7 +5284,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
             <button
               class="shortcut-btn"
               onClick={() => setThinkingOpen((o) => !o)}
-              disabled={disabled}
+              disabled={participantControlDisabled}
               title={currentThinking ? t('session.thinking_title', { value: currentThinking }) : t('session.thinking')}
               style={{ color: currentThinking ? '#38bdf8' : '#6b7280', fontSize: 10 }}
             >
@@ -5307,7 +5314,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
               if (openSpecAutoActive) return;
               setP2pOpen((o) => !o);
             }}
-            disabled={disabled || openSpecAutoActive}
+            disabled={participantControlDisabled || openSpecAutoActive}
             title={openSpecAutoActionLockReason ?? (p2pMode === 'solo' ? getP2pModeLabel('solo', t) : `${t('p2p.team_button', 'Team')}: ${getP2pModeLabel(p2pMode, t)}`)}
             style={{ color: getP2pModeColor(p2pMode), fontSize: 10, fontWeight: p2pMode === 'solo' ? 600 : 700 }}
           >
@@ -5316,7 +5323,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           <button
             class="shortcut-btn p2p-settings-btn"
             onClick={() => { setP2pOpen(false); openP2pConfigPanel('participants'); }}
-            disabled={disabled || openSpecAutoActive}
+            disabled={participantControlDisabled || openSpecAutoActive}
             title={openSpecAutoActionLockReason ?? t('p2p.settings_title')}
             aria-label={t('p2p.settings_button')}
           >

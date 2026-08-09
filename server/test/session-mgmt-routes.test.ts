@@ -9,9 +9,13 @@ import {
 const mockResolveServerRole = vi.fn<() => Promise<string>>().mockResolvedValue('owner');
 const mockUpsertDbSession = vi.fn();
 const mockUpdateSession = vi.fn();
+const mockUpdateSubSession = vi.fn();
+const mockGetDbSessionByName = vi.fn();
+const mockGetSubSessionById = vi.fn();
 const mockGetDbSessionsByServer = vi.fn<(...args: unknown[]) => Promise<unknown[]>>(async () => []);
 const mockGetSubSessionsByServer = vi.fn<(...args: unknown[]) => Promise<unknown[]>>(async () => []);
 const mockResolveHttpShareAccess = vi.fn();
+const mockResolveHttpShareAccessForCoveredSession = vi.fn();
 const mockResolveServerMemberAccessOrShareDeny = vi.fn();
 const mockDbQueryOne = vi.fn();
 const mockDbQuery = vi.fn(async () => []);
@@ -33,12 +37,15 @@ vi.mock('../src/security/authorization.js', () => ({
 vi.mock('../src/db/queries.js', () => ({
   getServerById: vi.fn(async () => ({ id: 'srv-1' })),
   getDbSessionsByServer: (...args: unknown[]) => mockGetDbSessionsByServer(...args),
+  getDbSessionByName: (...args: unknown[]) => mockGetDbSessionByName(...args),
+  getSubSessionById: (...args: unknown[]) => mockGetSubSessionById(...args),
   getSubSessionsByServer: (...args: unknown[]) => mockGetSubSessionsByServer(...args),
   upsertDbSession: (...args: unknown[]) => mockUpsertDbSession(...args),
   deleteDbSession: vi.fn(),
   updateSessionLabel: vi.fn(),
   updateProjectName: vi.fn(),
   updateSession: (...args: unknown[]) => mockUpdateSession(...args),
+  updateSubSession: (...args: unknown[]) => mockUpdateSubSession(...args),
 }));
 
 vi.mock('../src/security/crypto.js', () => ({
@@ -57,6 +64,7 @@ vi.mock('../src/ws/bridge.js', () => ({
 
 vi.mock('../src/routes/share-http-auth.js', () => ({
   resolveHttpShareAccess: (...args: unknown[]) => mockResolveHttpShareAccess(...args),
+  resolveHttpShareAccessForCoveredSession: (...args: unknown[]) => mockResolveHttpShareAccessForCoveredSession(...args),
   resolveServerMemberAccessOrShareDeny: (...args: unknown[]) => mockResolveServerMemberAccessOrShareDeny(...args),
 }));
 
@@ -73,6 +81,11 @@ describe('session-mgmt persistence routes', () => {
       membership: 'owner',
       actor: { kind: 'server-member', effectiveActorRole: 'server-manager' },
     });
+    mockResolveHttpShareAccessForCoveredSession.mockResolvedValue({
+      actor: { kind: 'server-member', effectiveActorRole: 'server-manager' },
+    });
+    mockGetDbSessionByName.mockResolvedValue(null);
+    mockGetSubSessionById.mockResolvedValue(null);
     mockDbQueryOne.mockResolvedValue(null);
     mockDbQuery.mockResolvedValue([]);
     mockDbExecute.mockResolvedValue({ changes: 1 });
@@ -413,6 +426,169 @@ describe('session-mgmt persistence routes', () => {
       sessionName: 'deck_proj_brain',
       label: null,
     });
+  });
+
+  it('PATCH /sessions/:name/supervision lets a covered participant change only supervision mode', async () => {
+    const coverage = {
+      target: { kind: 'main', serverId: 'srv-1', sessionName: 'deck_proj_brain' },
+      effectiveRole: 'participant',
+      historyCutoffAt: 1_000,
+      nextCoverageRecheckAt: null,
+      coveringShareIds: ['share-1'],
+      primaryShareId: 'share-1',
+      authorizedAt: 2_000,
+    };
+    mockResolveHttpShareAccessForCoveredSession.mockResolvedValue({
+      actor: { kind: 'share', effectiveActorRole: 'participant', coverage },
+    });
+    mockGetDbSessionByName.mockResolvedValue({
+      name: 'deck_proj_brain',
+      agent_type: 'codex-sdk',
+      transport_config: {
+        provider: { privateSetting: 'preserved' },
+        supervision: {
+          mode: 'off',
+          backend: 'codex-sdk',
+          model: 'gpt-5.4',
+          timeoutMs: 45_000,
+          promptVersion: 'supervision_decision_v1',
+          maxParseRetries: 1,
+          maxAutoContinueStreak: 2,
+          maxAutoContinueTotal: 0,
+          maxAuditLoops: 2,
+          taskRunPromptVersion: 'task_run_status_v1',
+        },
+      },
+    });
+    const app = await buildApp();
+
+    const res = await app.request('/api/server/srv-1/sessions/deck_proj_brain/supervision', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        supervision: {
+          mode: 'supervised',
+          backend: 'claude-code-sdk',
+          model: 'sonnet',
+          timeoutMs: 30_000,
+          promptVersion: 'supervision_decision_v1',
+          maxParseRetries: 1,
+          maxAutoContinueStreak: 1,
+          maxAutoContinueTotal: 1,
+        },
+      }),
+    });
+
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toEqual({
+      ok: true,
+      transportConfig: {
+        supervision: expect.objectContaining({
+          mode: 'supervised',
+          backend: 'codex-sdk',
+          model: 'gpt-5.4',
+        }),
+      },
+    });
+    const expectedTransportConfig = {
+      provider: { privateSetting: 'preserved' },
+      supervision: expect.objectContaining({
+        mode: 'supervised',
+        backend: 'codex-sdk',
+        model: 'gpt-5.4',
+        timeoutMs: 45_000,
+        maxAutoContinueStreak: 2,
+        maxAutoContinueTotal: 0,
+      }),
+    };
+    expect(mockUpdateSession).toHaveBeenCalledWith(
+      mockDb,
+      'srv-1',
+      'deck_proj_brain',
+      { transport_config: expectedTransportConfig },
+    );
+    expect(JSON.parse(String(sendToDaemonMock.mock.calls[0]?.[0]))).toEqual({
+      type: DAEMON_COMMAND_TYPES.SESSION_UPDATE_TRANSPORT_CONFIG,
+      sessionName: 'deck_proj_brain',
+      transportConfig: expectedTransportConfig,
+    });
+  });
+
+  it('PATCH /sessions/:name/supervision denies viewers and uncovered share actors before mutation', async () => {
+    const app = await buildApp();
+    for (const actor of [
+      {
+        kind: 'share',
+        effectiveActorRole: 'viewer',
+        coverage: {
+          target: { kind: 'main', serverId: 'srv-1', sessionName: 'deck_proj_brain' },
+          effectiveRole: 'viewer',
+          historyCutoffAt: 1_000,
+          nextCoverageRecheckAt: null,
+          coveringShareIds: ['share-viewer'],
+          primaryShareId: 'share-viewer',
+          authorizedAt: 2_000,
+        },
+      },
+      { kind: 'none' },
+    ]) {
+      mockResolveHttpShareAccessForCoveredSession.mockResolvedValueOnce({ actor });
+      const res = await app.request('/api/server/srv-1/sessions/deck_proj_brain/supervision', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ supervision: { mode: 'off' } }),
+      });
+      expect(res.status).toBe(403);
+    }
+    expect(mockGetDbSessionByName).not.toHaveBeenCalled();
+    expect(mockUpdateSession).not.toHaveBeenCalled();
+    expect(sendToDaemonMock).not.toHaveBeenCalled();
+  });
+
+  it('PATCH /sessions/:name/supervision denies an audit target outside the participant share', async () => {
+    const coverage = {
+      target: { kind: 'main', serverId: 'srv-1', sessionName: 'deck_proj_brain' },
+      effectiveRole: 'participant',
+      historyCutoffAt: 1_000,
+      nextCoverageRecheckAt: null,
+      coveringShareIds: ['share-1'],
+      primaryShareId: 'share-1',
+      authorizedAt: 2_000,
+    };
+    mockResolveHttpShareAccessForCoveredSession.mockResolvedValue({
+      actor: { kind: 'share', effectiveActorRole: 'participant', coverage },
+    });
+    mockGetDbSessionByName.mockResolvedValue({
+      name: 'deck_proj_brain',
+      agent_type: 'codex-sdk',
+      transport_config: {},
+    });
+    const app = await buildApp();
+    const res = await app.request('/api/server/srv-1/sessions/deck_proj_brain/supervision', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        supervision: {
+          mode: 'supervised_audit',
+          backend: 'codex-sdk',
+          model: 'gpt-5.4',
+          timeoutMs: 30_000,
+          promptVersion: 'supervision_decision_v1',
+          maxParseRetries: 1,
+          maxAutoContinueStreak: 2,
+          maxAutoContinueTotal: 0,
+          auditTargetSessionName: 'deck_other_brain',
+        },
+      }),
+    });
+
+    expect(res.status).toBe(403);
+    await expect(res.json()).resolves.toEqual({
+      error: 'forbidden',
+      reason: 'share-direct-surface-denied',
+    });
+    expect(mockUpdateSession).not.toHaveBeenCalled();
+    expect(sendToDaemonMock).not.toHaveBeenCalled();
   });
 
   it('POST /session/send allows share participants and stamps a server-authored sharedActor', async () => {

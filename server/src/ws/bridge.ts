@@ -3842,7 +3842,7 @@ export class WsBridge {
       || type === 'subsession.set_model'
       || type === TRANSPORT_MSG.LIST_MODELS) return 'session.send';
     if (type === DAEMON_COMMAND_TYPES.SESSION_CANCEL) return 'session.cancel';
-    if (type === 'discussion.start') return 'p2p.orchestration';
+    if (type === 'discussion.start' || type === P2P_CONFIG_MSG.SAVE) return 'p2p.orchestration';
     return null;
   }
 

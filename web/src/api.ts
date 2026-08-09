@@ -22,6 +22,7 @@ import {
   SUPERVISION_USER_DEFAULT_PREF_KEY,
   normalizeSupervisorDefaultConfig,
   parseSupervisorDefaultConfig,
+  type SessionSupervisionSnapshot,
   type SupervisorDefaultConfig,
 } from '@shared/supervision-config.js';
 import type { ShareGrantSummary, ShareRole, ShareTarget } from './tab-sharing-ui.js';
@@ -987,6 +988,21 @@ export async function patchSession(
     method: 'PATCH',
     body: JSON.stringify(body),
   });
+}
+
+export async function patchSessionSupervision(
+  serverId: string,
+  sessionName: string,
+  supervision: Partial<SessionSupervisionSnapshot>,
+): Promise<Record<string, unknown> | null> {
+  const response = await apiFetch<{ ok: boolean; transportConfig: Record<string, unknown> | null }>(
+    `/api/server/${serverId}/sessions/${encodeURIComponent(sessionName)}/supervision`,
+    {
+      method: 'PATCH',
+      body: JSON.stringify({ supervision }),
+    },
+  );
+  return response.transportConfig ?? null;
 }
 
 export async function reorderSubSessions(serverId: string, ids: string[]): Promise<void> {

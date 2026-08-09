@@ -252,6 +252,7 @@ const getUserPrefMock = vi.fn().mockResolvedValue(null);
 const saveUserPrefMock = vi.fn().mockResolvedValue(undefined);
 const fetchSupervisorDefaultsMock = vi.fn().mockResolvedValue(null);
 const patchSessionMock = vi.fn().mockResolvedValue(undefined);
+const patchSessionSupervisionMock = vi.fn().mockResolvedValue(null);
 const patchSubSessionMock = vi.fn().mockResolvedValue(undefined);
 const sendSessionViaHttpMock = vi.fn().mockResolvedValue(undefined);
 const onUserPrefChangedMock = vi.fn((cb: (key: string, value: unknown) => void) => {
@@ -279,6 +280,7 @@ vi.mock('../../src/api.js', () => ({
   saveUserPref: (...args: unknown[]) => saveUserPrefMock(...args),
   fetchSupervisorDefaults: (...args: unknown[]) => fetchSupervisorDefaultsMock(...args),
   patchSession: (...args: unknown[]) => patchSessionMock(...args),
+  patchSessionSupervision: (...args: unknown[]) => patchSessionSupervisionMock(...args),
   patchSubSession: (...args: unknown[]) => patchSubSessionMock(...args),
   sendSessionViaHttp: (...args: unknown[]) => sendSessionViaHttpMock(...args),
   onUserPrefChanged: (...args: unknown[]) => onUserPrefChangedMock(...args as Parameters<typeof onUserPrefChangedMock>),
@@ -498,6 +500,7 @@ afterEach(() => {
     localStorage.clear();
     fetchSupervisorDefaultsMock.mockResolvedValue(null);
     patchSessionMock.mockResolvedValue(undefined);
+    patchSessionSupervisionMock.mockResolvedValue(null);
     patchSubSessionMock.mockResolvedValue(undefined);
     sendSessionViaHttpMock.mockReset().mockResolvedValue(undefined);
     getUserPrefMock.mockImplementation(async (key: unknown) => {
@@ -7619,18 +7622,45 @@ afterEach(() => {
     });
   });
 
-  it('lets a shared participant switch models while keeping other shared controls gated', () => {
+  it('lets a shared participant use models, Thinking, Quick Audit, Auto supervision, and Team', async () => {
     const ws = makeWs();
+    fetchSupervisorDefaultsMock.mockResolvedValue({
+      backend: 'codex-sdk',
+      model: 'gpt-5.4',
+      timeoutMs: 30_000,
+      promptVersion: 'supervision_decision_v1',
+    });
+    patchSessionSupervisionMock.mockResolvedValue({
+      supervision: {
+        mode: 'supervised',
+        backend: 'codex-sdk',
+        model: 'gpt-5.4',
+        timeoutMs: 30_000,
+        promptVersion: 'supervision_decision_v1',
+        maxParseRetries: 1,
+        maxAutoContinueStreak: 2,
+        maxAutoContinueTotal: 0,
+      },
+    });
     render(
       <SessionControls
         ws={ws as any}
+        serverId="srv-shared"
         activeSession={makeSession({
           name: 'shared-copilot-session',
           agentType: 'copilot-sdk',
           runtimeType: 'transport',
           activeModel: 'gpt-5.4',
+          effort: 'medium',
           sharedState: { effectiveRole: 'participant', status: 'active' },
         })}
+        sessions={[
+          makeSession({
+            name: 'shared-copilot-session',
+            agentType: 'copilot-sdk',
+            runtimeType: 'transport',
+          }),
+        ]}
         quickData={makeQuickData() as any}
       />,
     );
@@ -7651,9 +7681,43 @@ afterEach(() => {
       sessionName: 'shared-copilot-session',
       text: '/model gpt-5.4-mini',
     });
+
+    const thinkingButton = screen.getByRole('button', { name: /^medium$/i }) as HTMLButtonElement;
+    expect(thinkingButton.disabled).toBe(false);
+    fireEvent.click(thinkingButton);
+    fireEvent.click(screen.getByRole('button', { name: '○ High' }));
+    expectSendPayload(ws, {
+      sessionName: 'shared-copilot-session',
+      text: '/thinking high',
+    });
+
+    const quickAuditButton = screen.getByTestId('peer-audit-icon') as HTMLButtonElement;
+    expect(quickAuditButton.disabled).toBe(false);
+    fireEvent.click(quickAuditButton);
+    expect(screen.getByTestId('peer-audit-modal')).toBeDefined();
+    fireEvent.click(screen.getByTestId('peer-audit-overlay'));
+
+    const autoButton = screen.getByRole('button', { name: /^Auto$/ }) as HTMLButtonElement;
+    expect(autoButton.disabled).toBe(false);
+    fireEvent.click(autoButton);
+    fireEvent.click(screen.getByRole('button', { name: /supervised$/i }));
+    await waitFor(() => expect(patchSessionSupervisionMock).toHaveBeenCalledWith(
+      'srv-shared',
+      'shared-copilot-session',
+      expect.objectContaining({ mode: 'supervised' }),
+    ));
+    expect(patchSessionMock).not.toHaveBeenCalled();
+    expect(patchSubSessionMock).not.toHaveBeenCalled();
+
+    const teamButton = screen.getByRole('button', { name: /^Team$/ }) as HTMLButtonElement;
+    const teamSettingsButton = screen.getByRole('button', { name: 'settings_button' }) as HTMLButtonElement;
+    expect(teamButton.disabled).toBe(false);
+    expect(teamSettingsButton.disabled).toBe(false);
+    fireEvent.click(teamButton);
+    expect(screen.getByTestId('p2p-dropdown')).toBeDefined();
   });
 
-  it('keeps the model selector disabled for a shared viewer', () => {
+  it('keeps participant controls disabled for a shared viewer', () => {
     const ws = makeWs();
     render(
       <SessionControls
@@ -7663,8 +7727,10 @@ afterEach(() => {
           agentType: 'copilot-sdk',
           runtimeType: 'transport',
           activeModel: 'gpt-5.4',
+          effort: 'medium',
           sharedState: { effectiveRole: 'viewer', status: 'active' },
         })}
+        serverId="srv-shared"
         quickData={makeQuickData() as any}
       />,
     );
@@ -7674,6 +7740,11 @@ afterEach(() => {
     expect(ws.send).not.toHaveBeenCalledWith(expect.objectContaining({
       type: TRANSPORT_MSG.LIST_MODELS,
     }));
+    expect((screen.getByRole('button', { name: /^medium$/i }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByTestId('peer-audit-icon') as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole('button', { name: /^Auto$/ }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole('button', { name: /^Team$/ }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole('button', { name: 'settings_button' }) as HTMLButtonElement).disabled).toBe(true);
     expect(document.querySelector('.menu-dropdown')).toBeFalsy();
     expect(gatherSendCalls(ws)).toHaveLength(0);
   });

@@ -5,6 +5,9 @@ import { DAEMON_COMMAND_TYPES } from '../../../shared/daemon-command-types.js';
 import { TRANSPORT_MSG } from '../../../shared/transport-events.js';
 import { FS_TRANSPORT_MSG } from '../../../shared/fs-transport-messages.js';
 import { P2P_WORKFLOW_MSG } from '../../../shared/p2p-workflow-messages.js';
+import { P2P_CONFIG_MSG } from '../../../shared/p2p-config-events.js';
+import { isP2pSavedConfig, sanitizeP2pSavedConfig } from '../../../shared/p2p-modes.js';
+import { collectRoutedSessionNames } from '../../../shared/p2p-routing-fields.js';
 import {
   SHARE_BROWSER_COMMANDS,
   rawSubSessionIdFromDisplayName,
@@ -70,6 +73,7 @@ type ShareCommandPolicy =
   | { kind: 'participant-send' }
   | { kind: 'participant-model-switch' }
   | { kind: 'participant-model-list' }
+  | { kind: 'participant-p2p-config-save' }
   | { kind: 'participant-cancel' }
   | { kind: 'deny'; reason: ShareReason };
 
@@ -155,7 +159,7 @@ export const SHARE_WS_COMMAND_POLICY_INVENTORY: readonly ShareBridgeCommandInven
   { bridgeCommand: 'subsession.start', sharedCommand: SHARE_BROWSER_COMMANDS.SUBSESSION_START, policy: denyFromShared(SHARE_BROWSER_COMMANDS.SUBSESSION_START) },
   { bridgeCommand: 'subsession.stop', sharedCommand: SHARE_BROWSER_COMMANDS.SUBSESSION_STOP, policy: denyFromShared(SHARE_BROWSER_COMMANDS.SUBSESSION_STOP) },
   { bridgeCommand: 'subsession.restart', sharedCommand: SHARE_BROWSER_COMMANDS.SUBSESSION_RESTART, policy: denyFromShared(SHARE_BROWSER_COMMANDS.SUBSESSION_RESTART) },
-  { bridgeCommand: 'p2p.config.save', sharedCommand: SHARE_BROWSER_COMMANDS.P2P_CONFIG_SAVE, policy: denyFromShared(SHARE_BROWSER_COMMANDS.P2P_CONFIG_SAVE) },
+  { bridgeCommand: P2P_CONFIG_MSG.SAVE, sharedCommand: SHARE_BROWSER_COMMANDS.P2P_CONFIG_SAVE, policy: { kind: 'participant-p2p-config-save' } },
   { bridgeCommand: TRANSPORT_MSG.APPROVAL_RESPONSE, sharedCommand: SHARE_BROWSER_COMMANDS.CHAT_APPROVAL_RESPONSE, policy: denyFromShared(SHARE_BROWSER_COMMANDS.CHAT_APPROVAL_RESPONSE) },
   { bridgeCommand: TRANSPORT_MSG.PROVIDER_STATUS, sharedCommand: SHARE_BROWSER_COMMANDS.PROVIDER_STATUS, policy: denyFromShared(SHARE_BROWSER_COMMANDS.PROVIDER_STATUS) },
   { bridgeCommand: TRANSPORT_MSG.LIST_SESSIONS, sharedCommand: SHARE_BROWSER_COMMANDS.PROVIDER_LIST, policy: denyFromShared(SHARE_BROWSER_COMMANDS.PROVIDER_LIST) },
@@ -403,6 +407,34 @@ export function evaluateShareCommand(input: {
         agentType,
         requestId,
         ...(input.msg.force === true ? { force: true } : {}),
+      },
+    };
+  }
+
+  if (policy.kind === 'participant-p2p-config-save') {
+    const scopeSession = typeof input.msg.scopeSession === 'string' ? input.msg.scopeSession.trim() : '';
+    const requestId = typeof input.msg.requestId === 'string' ? input.msg.requestId.trim() : '';
+    if (!scopeSession || !shareStateCoversSession(input.state, scopeSession) || !requestId || requestId.length > 256) {
+      return { allowed: false, reason: SHARE_REASONS.DIRECT_SURFACE_DENIED };
+    }
+    if (!isP2pSavedConfig(input.msg.config)) {
+      return { allowed: false, reason: SHARE_REASONS.DIRECT_SURFACE_DENIED };
+    }
+    const config = sanitizeP2pSavedConfig(input.msg.config, { scopeSession });
+    const routedSessions = collectRoutedSessionNames(config);
+    if (
+      Object.keys(config.sessions).some((name) => !shareStateCoversSession(input.state, name))
+      || [...routedSessions].some((name) => !shareStateCoversSession(input.state, name))
+    ) {
+      return { allowed: false, reason: SHARE_REASONS.DIRECT_SURFACE_DENIED };
+    }
+    return {
+      allowed: true,
+      stampedMessage: {
+        type: P2P_CONFIG_MSG.SAVE,
+        requestId,
+        scopeSession,
+        config,
       },
     };
   }

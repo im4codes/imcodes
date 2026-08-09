@@ -584,6 +584,13 @@ export async function getDbSessionsByServer(db: Database, serverId: string): Pro
   );
 }
 
+export async function getDbSessionByName(db: Database, serverId: string, name: string): Promise<DbSession | null> {
+  return db.queryOne<DbSession>(
+    'SELECT * FROM sessions WHERE server_id = $1 AND name = $2',
+    [serverId, name],
+  );
+}
+
 export async function upsertDbSession(
   db: Database,
   id: string,
