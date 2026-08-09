@@ -123,7 +123,7 @@ import {
   resolveP2pRootSession,
   serializeP2pSavedConfig,
 } from './preferences/p2p-config-pref.js';
-import { resolveInitialServerId, resolveInitialSessionName, writeHashState } from './hooks/useHashState.js';
+import { readHashState, resolveInitialServerId, resolveInitialSessionName, writeHashState } from './hooks/useHashState.js';
 import { useSubSessions, type SubSession } from './hooks/useSubSessions.js';
 import { useProviderStatus } from './hooks/useProviderStatus.js';
 import { useProgressiveMount } from './hooks/useProgressiveMount.js';
@@ -462,8 +462,30 @@ function getRepoDesktopWindowId(parentSubId?: string | null): string {
   return parentSubId ? DESKTOP_WINDOW_IDS.subsessionRepo(parentSubId) : DESKTOP_WINDOW_IDS.repo;
 }
 
+function findSharedEntryForHash(
+  entries: SharedEntrySummary[],
+  serverId: string,
+  sessionName: string | null,
+): SharedEntrySummary | null {
+  const candidates = entries.filter((entry) => entry.status === 'active' && entry.serverId === serverId);
+  if (sessionName) {
+    const main = candidates.find((entry) => (
+      entry.target.kind === 'main' && entry.target.sessionName === sessionName
+    ));
+    if (main) return main;
+    const subSession = candidates.find((entry) => (
+      entry.target.kind === 'subsession'
+      && (`deck_sub_${entry.target.subSessionId}` === sessionName
+        || entry.target.subSessionDisplayName === sessionName)
+    ));
+    if (subSession) return subSession;
+  }
+  return candidates.find((entry) => entry.target.kind === 'server') ?? null;
+}
+
 export function App() {
   const { t: trans } = useTranslation();
+  const initialHashStateRef = useRef(readHashState());
   const [globalFontPrefs] = useFontPrefs('chat', DEFAULT_CHAT_FONT);
   useEffect(() => {
     applyGlobalFontPrefs(globalFontPrefs);
@@ -531,10 +553,15 @@ export function App() {
   const [showMobileFileBrowser, setShowMobileFileBrowser] = useState(false);
   const [shareDialogTarget, setShareDialogTarget] = useState<ShareDialogTarget | null>(null);
   const [selectedShareTarget, setSelectedShareTarget] = useState<ShareTarget | null>(null);
+  const [sharedHashRestorePending, setSharedHashRestorePending] = useState(
+    () => Boolean(initialHashStateRef.current.serverId),
+  );
+  const sharedHashRestoreStartedRef = useRef(false);
   const [sharedReturnServer, setSharedReturnServer] = useState<SharedReturnServer | null>(null);
   const [showSharedReturnGuide, setShowSharedReturnGuide] = useState(false);
   const [sharedEntries, setSharedEntries] = useState<SharedEntrySummary[]>([]);
   const [sharedEntriesLoading, setSharedEntriesLoading] = useState(false);
+  const [sharedEntriesLoaded, setSharedEntriesLoaded] = useState(false);
   const [sharedEntriesError, setSharedEntriesError] = useState<string | null>(null);
   const [openingSharedEntryId, setOpeningSharedEntryId] = useState<string | null>(null);
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
@@ -625,12 +652,13 @@ export function App() {
 
   useEffect(() => {
     selectedServerIdRef.current = selectedServerId;
+    if (sharedHashRestorePending) return;
     if (selectedServerId) {
       localStorage.setItem('rcc_server', selectedServerId);
       return;
     }
     localStorage.removeItem('rcc_server');
-  }, [selectedServerId]);
+  }, [selectedServerId, sharedHashRestorePending]);
 
   const resolvedSelectedServerName = useMemo(
     () => selectedShareTarget
@@ -640,6 +668,7 @@ export function App() {
   );
 
   useEffect(() => {
+    if (sharedHashRestorePending) return;
     if (!selectedServerId || servers.length === 0) return;
     if (resolvedSelectedServerName === selectedServerName) return;
     setSelectedServerName(resolvedSelectedServerName);
@@ -648,10 +677,11 @@ export function App() {
       return;
     }
     localStorage.removeItem('rcc_server_name');
-  }, [resolvedSelectedServerName, selectedServerId, selectedServerName, servers.length]);
+  }, [resolvedSelectedServerName, selectedServerId, selectedServerName, servers.length, sharedHashRestorePending]);
 
   useEffect(() => {
     if (!serversSynced) return;
+    if (sharedHashRestorePending) return;
     if (selectedShareTarget) return;
     if (!shouldResetSelectedServer(selectedServerId, servers, serversLoaded)) return;
     setSelectedServerId(null);
@@ -661,7 +691,7 @@ export function App() {
     localStorage.removeItem('rcc_server');
     localStorage.removeItem('rcc_server_name');
     localStorage.removeItem('rcc_session');
-  }, [selectedServerId, servers, serversLoaded, serversSynced, selectedShareTarget]);
+  }, [selectedServerId, servers, serversLoaded, serversSynced, selectedShareTarget, sharedHashRestorePending]);
 
   useEffect(() => {
     let cleanup = () => {};
@@ -1104,9 +1134,11 @@ export function App() {
     if (!auth) {
       setSharedEntries([]);
       setSharedEntriesError(null);
+      setSharedEntriesLoaded(false);
       return;
     }
     setSharedEntriesLoading(true);
+    setSharedEntriesLoaded(false);
     setSharedEntriesError(null);
     try {
       setSharedEntries(await discoverSharedEntries());
@@ -1115,6 +1147,7 @@ export function App() {
       setSharedEntriesError(formatSharedAccessError(err));
     } finally {
       setSharedEntriesLoading(false);
+      setSharedEntriesLoaded(true);
     }
   }, [auth]);
 
@@ -1140,7 +1173,7 @@ export function App() {
 
   // Fetch sessions from DB immediately when auth + server are available
   useEffect(() => {
-    if (!auth || !selectedServerId || selectedShareTarget) return;
+    if (!auth || !selectedServerId || selectedShareTarget || sharedHashRestorePending) return;
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), 5_000); // 5s timeout — don't block UI on slow network
     apiFetch<{ sessions: Array<{ name: string; project_name: string; role: string; agent_type: string; agent_version?: string; state: string; error?: string | null; project_dir?: string; runtime_type?: 'process' | 'transport'; label?: string | null; description?: string | null }> }>(
@@ -1188,7 +1221,7 @@ export function App() {
       }
     }).catch(() => { clearTimeout(timer); /* WS fallback */ });
     return () => { clearTimeout(timer); ctrl.abort(); };
-  }, [auth, selectedServerId, selectedShareTarget]);
+  }, [auth, selectedServerId, selectedShareTarget, sharedHashRestorePending]);
 
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
   const [sharedActiveDispatchIds, setSharedActiveDispatchIds] = useState<Map<string, string>>(() => new Map());
@@ -2323,7 +2356,7 @@ export function App() {
   const [daemonStats, setDaemonStats] = useState<{ daemonVersion?: string | null; cpu: number; memUsed: number; memTotal: number; load1: number; load5: number; load15: number; uptime: number } | null>(null);
 
   useEffect(() => {
-    if (!auth || !selectedServerId) return;
+    if (!auth || !selectedServerId || sharedHashRestorePending) return;
     let cancelled = false;
     void listP2pRuns(selectedServerId)
       .then((runs) => {
@@ -2338,7 +2371,7 @@ export function App() {
       })
       .catch(() => {});
     return () => { cancelled = true; };
-  }, [auth, selectedServerId]);
+  }, [auth, selectedServerId, sharedHashRestorePending]);
 
   // ── Sub-sessions ───────────────────────────────────────────────────────────
   const { subSessions, visibleSubSessions, loadedServerId, create: createSubSession, close: closeSubSession, restart: restartSubSession, rename: renameSubSession, updateLocal: updateSubLocal, hydrateShared: hydrateSharedSubSessions } = useSubSessions(
@@ -2453,9 +2486,14 @@ export function App() {
     return states;
   }, [managedSharedSessionStateByName, managedSharedStateByTarget, selectedServerId, selectedServerSharedOutState, sharedActiveDispatchIds, subSessions]);
 
-  const handleOpenSharedEntry = useCallback(async (entry: SharedEntrySummary) => {
+  const handleOpenSharedEntry = useCallback(async (
+    entry: SharedEntrySummary,
+    options?: { restoreFromHash?: boolean; preferredSessionName?: string | null },
+  ) => {
     if (openingSharedEntryId) return;
-    const returnServer = selectedShareTarget
+    const returnServer = options?.restoreFromHash
+      ? null
+      : selectedShareTarget
       ? sharedReturnServer
       : selectedServerId
         ? {
@@ -2518,7 +2556,11 @@ export function App() {
       hydrateSharedSubSessions(opened.server.id, opened.subSessions);
 
       const openedTarget = opened.target;
-      const activeFromTarget = openedTarget.kind === 'main'
+      const preferredSessionName = options?.preferredSessionName;
+      const activeFromTarget = preferredSessionName
+        && mappedSessions.some((session) => session.name === preferredSessionName)
+        ? preferredSessionName
+        : openedTarget.kind === 'main'
         ? openedTarget.sessionName
         : openedTarget.kind === 'subsession'
           ? (opened.subSessions.find((sub) => sub.subSessionId === openedTarget.subSessionId)?.parentSessionName ?? null)
@@ -2546,6 +2588,50 @@ export function App() {
       setOpeningSharedEntryId(null);
     }
   }, [hydrateSharedSubSessions, openingSharedEntryId, resolvedSelectedServerName, selectedServerId, selectedShareTarget, servers, setActiveSession, sharedReturnServer]);
+
+  useEffect(() => {
+    if (!sharedHashRestorePending || !auth || !serversLoaded) return;
+    if (sharedHashRestoreStartedRef.current) return;
+
+    const initial = initialHashStateRef.current;
+    if (!initial.serverId
+      || selectedServerId !== initial.serverId
+      || selectedShareTarget) {
+      sharedHashRestoreStartedRef.current = true;
+      setSharedHashRestorePending(false);
+      return;
+    }
+    if (servers.some((server) => server.id === initial.serverId)) {
+      sharedHashRestoreStartedRef.current = true;
+      setSharedHashRestorePending(false);
+      return;
+    }
+    if (!sharedEntriesLoaded) return;
+
+    sharedHashRestoreStartedRef.current = true;
+    const entry = findSharedEntryForHash(sharedEntries, initial.serverId, initial.sessionName);
+    if (!entry) {
+      setSharedHashRestorePending(false);
+      return;
+    }
+
+    void handleOpenSharedEntry(entry, {
+      restoreFromHash: true,
+      preferredSessionName: initial.sessionName,
+    }).finally(() => {
+      setSharedHashRestorePending(false);
+    });
+  }, [
+    auth,
+    handleOpenSharedEntry,
+    selectedServerId,
+    selectedShareTarget,
+    servers,
+    serversLoaded,
+    sharedEntries,
+    sharedEntriesLoaded,
+    sharedHashRestorePending,
+  ]);
 
   const closeSubSessionAndClearMaximized = useCallback((id: string) => {
     clearSubSessionMaximized(id);
@@ -2959,7 +3045,7 @@ export function App() {
 
   // Set up WebSocket only when a server is selected
   useEffect(() => {
-    if (!auth || !selectedServerId) return;
+    if (!auth || !selectedServerId || sharedHashRestorePending) return;
 
     const ws = new WsClient(auth.baseUrl, selectedServerId, { shareTarget: selectedShareTarget });
     wsRef.current = ws;
@@ -3945,7 +4031,7 @@ export function App() {
       for (const timer of resubscribeTimersRef.current) clearTimeout(timer);
       resubscribeTimersRef.current.clear();
     };
-  }, [auth, selectedServerId, selectedShareTarget, requestP2pStatusWithCachedRunConfirmation]);
+  }, [auth, selectedServerId, selectedShareTarget, sharedHashRestorePending, requestP2pStatusWithCachedRunConfirmation]);
 
   // Subscribe to terminal streams for process-backed sessions when connected.
   // Transport/SDK sessions have no PTY stream; their timeline updates are

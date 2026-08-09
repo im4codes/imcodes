@@ -658,6 +658,7 @@ async function getActiveWsClient() {
 
 beforeEach(() => {
   vi.resetModules();
+  history.replaceState(null, '', '/');
   localStorage.clear();
   sessionStorage.clear();
   wsInstances.length = 0;
@@ -2146,5 +2147,88 @@ describe('App shell', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'share.sharedWithMe.guideDismiss' }));
     expect(screen.queryByTestId('shared-return-guide')).toBeNull();
+  }, 20_000);
+
+  it('restores a shared tab from the URL hash instead of falling back to an owned tab', async () => {
+    history.replaceState(null, '', '/#/srv-shared/deck_beta_brain');
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_server_name', 'Alpha Server');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    const sharedEntry = {
+      id: 'share-refresh-1',
+      serverId: 'srv-shared',
+      serverName: 'Shared Server',
+      role: 'participant',
+      status: 'active',
+      targetLabel: 'Shared Beta',
+      target: { kind: 'main', serverId: 'srv-shared', sessionName: 'deck_beta_brain' },
+    };
+    let resolveSharedEntries!: (entries: unknown[]) => void;
+    discoverSharedEntriesMock.mockImplementation(() => new Promise((resolve) => {
+      resolveSharedEntries = resolve;
+    }));
+    openSharedEntryMock.mockResolvedValue({
+      server: { id: 'srv-shared', name: 'Shared Server', status: 'online', lastHeartbeatAt: Date.now() },
+      target: sharedEntry.target,
+      coverage: {
+        effectiveRole: 'participant',
+        historyCutoffAt: 0,
+        nextCoverageRecheckAt: null,
+        coveringShareIds: ['share-refresh-1'],
+        primaryShareId: 'share-refresh-1',
+        authorizedAt: Date.now(),
+      },
+      sessions: [{
+        sessionName: 'deck_beta_brain',
+        title: 'Shared Beta',
+        state: 'running',
+        agentType: 'codex-sdk',
+        activeDispatchId: 'dispatch-refresh-1',
+      }],
+      subSessions: [],
+    });
+
+    const { App } = await importApp();
+    render(<App />);
+
+    await waitFor(() => expect(apiFetchMock).toHaveBeenCalledWith('/api/server'));
+    await waitFor(() => expect(discoverSharedEntriesMock).toHaveBeenCalledTimes(1));
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(window.location.hash).toBe('#/srv-shared/deck_beta_brain');
+    expect(openSharedEntryMock).not.toHaveBeenCalled();
+
+    await act(async () => {
+      resolveSharedEntries([sharedEntry]);
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(openSharedEntryMock).toHaveBeenCalledTimes(1));
+    expect(openSharedEntryMock).toHaveBeenCalledWith(sharedEntry.target);
+    const sharedPane = await screen.findByTestId('session-pane-deck_beta_brain');
+    expect(sharedPane.getAttribute('data-active-dispatch-id')).toBe('dispatch-refresh-1');
+    expect(window.location.hash).toBe('#/srv-shared/deck_beta_brain');
+    expect(screen.queryByTestId('session-pane-deck_alpha_brain')).toBeNull();
+    expect(screen.queryByTestId('shared-return-guide')).toBeNull();
+    await waitFor(() => {
+      expect(wsInstances.some((instance) => instance.options?.shareTarget === sharedEntry.target)).toBe(true);
+    });
+    expect(apiFetchMock).not.toHaveBeenCalledWith('/api/server/srv-shared/sessions', expect.anything());
+  }, 20_000);
+
+  it('does not wait for shared-entry discovery when the hash points to an owned server', async () => {
+    history.replaceState(null, '', '/#/srv-1/deck_alpha_brain');
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    discoverSharedEntriesMock.mockImplementation(() => new Promise(() => {}));
+
+    const { App } = await importApp();
+    render(<App />);
+
+    expect(await screen.findByTestId('session-pane-deck_alpha_brain')).toBeTruthy();
+    await waitFor(() => expect(wsInstances.some((instance) => !instance.options?.shareTarget)).toBe(true));
+    expect(window.location.hash).toBe('#/srv-1/deck_alpha_brain');
+    expect(openSharedEntryMock).not.toHaveBeenCalled();
   }, 20_000);
 });
