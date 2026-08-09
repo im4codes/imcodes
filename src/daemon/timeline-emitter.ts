@@ -18,6 +18,7 @@ import logger from '../util/logger.js';
 import { recordTimelineEmit } from './latency-tracer.js';
 import { TIMELINE_RESPONSE_SOURCES, type TimelineResponseSource } from '../../shared/timeline-protocol.js';
 import { isSessionModelSwitchCommandText } from '../../shared/session-control-commands.js';
+import { recordAssistantFileReadGrants } from './session-file-read-grants.js';
 
 /** Pattern matching temp file instruction: "Read and execute all instructions in @<path>" */
 const TEMP_FILE_RE = /^Read and execute all instructions in @(.+\.imcodes-prompt-[0-9a-f]+\.md)$/;
@@ -198,6 +199,10 @@ export class TimelineEmitter {
         memoryExcluded: true,
         assistantKind: typeof payload.assistantKind === 'string' ? payload.assistantKind : 'error',
       };
+    }
+
+    if (type === 'assistant.text' && typeof payload.text === 'string' && opts?.hidden !== true) {
+      recordAssistantFileReadGrants(sessionId, payload.text);
     }
 
     const seq = (this.seqMap.get(sessionId) ?? 0) + 1;

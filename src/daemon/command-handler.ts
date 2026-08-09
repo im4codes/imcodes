@@ -17,6 +17,7 @@ import type { ServerLink } from './server-link.js';
 import { timelineEmitter } from './timeline-emitter.js';
 import { emitTransportUserMessage as emitTransportUserMessageEvent } from './transport-relay.js';
 import { TimelinePreferredReadError, timelineStore } from './timeline-store.js';
+import { hasAssistantFileReadGrant } from './session-file-read-grants.js';
 import {
   recordFsWorkerMetric,
   recordTimelineBudgetShape,
@@ -8196,6 +8197,36 @@ async function resolveRegisteredUploadReadTarget(rawPath: string): Promise<strin
   }
 }
 
+/**
+ * A shared participant may follow an exact local file path that the assistant
+ * explicitly published in that same session. This is a read-only capability,
+ * not another root: directory listing/search and every write path continue to
+ * use the session project root exclusively.
+ */
+async function resolveAssistantPublishedReadTarget(sessionName: string, rawPath: string): Promise<string | null> {
+  let granted = false;
+  try {
+    granted = await hasAssistantFileReadGrant(sessionName, rawPath, async () => (
+      await timelineStore.readByTypesPreferred(sessionName, ['assistant.text'], { limit: 500 })
+    ));
+  } catch {
+    // Projection/history unavailable must fail closed.
+    return null;
+  }
+  if (!granted) return null;
+
+  const requestedPath = nodePath.resolve(rawPath);
+  try {
+    const linkStats = await fsLstat(requestedPath);
+    if (linkStats.isSymbolicLink() || !linkStats.isFile()) return null;
+    const realTarget = await fsRealpath(requestedPath);
+    if (realTarget !== requestedPath || !isPathAllowed(realTarget)) return null;
+    return realTarget;
+  } catch {
+    return null;
+  }
+}
+
 async function resolveFsSessionRoot(cmd: Record<string, unknown>): Promise<
   | { ok: true; realRoot?: string }
   | { ok: false; error: string }
@@ -9082,8 +9113,15 @@ async function handleFsRead(cmd: Record<string, unknown>, serverLink: ServerLink
       const registeredUpload = target.error === FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH
         ? await resolveRegisteredUploadReadTarget(rawPath)
         : null;
-      if (registeredUpload) {
-        getDefaultPreviewReadCoordinator().handle(registeredUpload, requestId, (message) => serverLink.send(message));
+      const assistantPublished = !registeredUpload && target.error === FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH
+        ? await resolveAssistantPublishedReadTarget(
+          typeof cmd.sessionName === 'string' ? cmd.sessionName : typeof cmd.session === 'string' ? cmd.session : '',
+          rawPath,
+        )
+        : null;
+      const exactReadTarget = registeredUpload ?? assistantPublished;
+      if (exactReadTarget) {
+        getDefaultPreviewReadCoordinator().handle(exactReadTarget, requestId, (message) => serverLink.send(message));
         return;
       }
       try { serverLink.send({ type: 'fs.read_response', requestId, path: rawPath, status: 'error', error: target.error }); } catch { /* ignore */ }

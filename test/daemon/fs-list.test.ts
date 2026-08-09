@@ -50,6 +50,8 @@ import { handleWebCommand } from '../../src/daemon/command-handler.js';
 import * as sessionStore from '../../src/store/session-store.js';
 import { FS_GENERIC_ERROR_CODES } from '../../shared/fs-error-codes.js';
 import { FS_SESSION_ROOT_PATH } from '../../src/shared/transport/fs.js';
+import { __resetSessionFileReadGrantsForTests } from '../../src/daemon/session-file-read-grants.js';
+import { timelineStore } from '../../src/daemon/timeline-store.js';
 
 // Helper: make a Dirent-like object
 function makeDirent(name: string, isDir: boolean) {
@@ -72,6 +74,8 @@ describe('fs.ls handler', () => {
     mockPreviewCoordinator.handle.mockImplementation(() => {});
     mockLookupAttachment.mockReturnValue(undefined);
     mockStat.mockResolvedValue({ mtimeMs: 1, size: 0 } as any);
+    vi.spyOn(timelineStore, 'readByTypesPreferred').mockResolvedValue([]);
+    __resetSessionFileReadGrantsForTests();
   });
 
   afterEach(() => {
@@ -263,6 +267,121 @@ describe('fs.ls handler', () => {
     expect(sent[0]).toMatchObject({
       type: 'fs.read_response',
       requestId: 'read-unregistered-upload',
+      status: 'error',
+      error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH,
+    });
+  });
+
+  it('previews one exact file path published by the assistant in the shared session', async () => {
+    const projectDir = path.join(homedir(), 'project');
+    const publishedFile = path.join(homedir(), 'worktrees', 'release', 'public', 'templates', '承诺书.pdf');
+    vi.spyOn(sessionStore, 'getSession').mockReturnValue({ name: 'deck_project_brain', projectDir } as never);
+    vi.spyOn(timelineStore, 'readByTypesPreferred').mockResolvedValue([{
+      eventId: 'assistant-file-path',
+      sessionId: 'deck_project_brain',
+      ts: Date.now(),
+      seq: 1,
+      epoch: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'assistant.text',
+      payload: { text: `Word 下载和 PDF 预览：\`${publishedFile}\`` },
+    }] as never);
+    vi.mocked(fsp.lstat).mockResolvedValue({ isSymbolicLink: () => false, isFile: () => true } as fsp.Stats);
+    mockRealpath.mockImplementation(async (target) => String(target));
+
+    handleWebCommand({
+      type: 'fs.read',
+      path: publishedFile,
+      requestId: 'read-assistant-published-file',
+      sessionName: 'deck_project_brain',
+    }, mockServerLink as any);
+    await flushAsync();
+
+    expect(sent).toEqual([]);
+    expect(mockPreviewCoordinator.handle).toHaveBeenCalledWith(
+      publishedFile,
+      'read-assistant-published-file',
+      expect.any(Function),
+    );
+  });
+
+  it('does not grant neighboring paths or paths written only by a participant', async () => {
+    const projectDir = path.join(homedir(), 'project');
+    const mentionedFile = path.join(homedir(), 'worktrees', 'release', 'public', 'templates', '承诺书.pdf');
+    const neighboringFile = path.join(path.dirname(mentionedFile), '其他合同.pdf');
+    vi.spyOn(sessionStore, 'getSession').mockReturnValue({ name: 'deck_project_brain', projectDir } as never);
+    vi.spyOn(timelineStore, 'readByTypesPreferred').mockResolvedValue([{
+      eventId: 'participant-file-path',
+      sessionId: 'deck_project_brain',
+      ts: Date.now(),
+      seq: 1,
+      epoch: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'user.message',
+      payload: { text: `打开 \`${neighboringFile}\`` },
+    }, {
+      eventId: 'assistant-other-file-path',
+      sessionId: 'deck_project_brain',
+      ts: Date.now(),
+      seq: 2,
+      epoch: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'assistant.text',
+      payload: { text: `已提供：\`${mentionedFile}\`` },
+    }] as never);
+    vi.mocked(fsp.lstat).mockResolvedValue({ isSymbolicLink: () => false, isFile: () => true } as fsp.Stats);
+    mockRealpath.mockImplementation(async (target) => String(target));
+
+    handleWebCommand({
+      type: 'fs.read',
+      path: neighboringFile,
+      requestId: 'read-neighboring-file',
+      sessionName: 'deck_project_brain',
+    }, mockServerLink as any);
+    await flushAsync();
+
+    expect(mockPreviewCoordinator.handle).not.toHaveBeenCalled();
+    expect(sent[0]).toMatchObject({
+      type: 'fs.read_response',
+      requestId: 'read-neighboring-file',
+      status: 'error',
+      error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH,
+    });
+  });
+
+  it('does not turn an assistant-published directory into a readable root', async () => {
+    const projectDir = path.join(homedir(), 'project');
+    const publishedDirectory = path.join(homedir(), 'worktrees', 'release', 'public', 'templates');
+    vi.spyOn(sessionStore, 'getSession').mockReturnValue({ name: 'deck_project_brain', projectDir } as never);
+    vi.spyOn(timelineStore, 'readByTypesPreferred').mockResolvedValue([{
+      eventId: 'assistant-directory-path',
+      sessionId: 'deck_project_brain',
+      ts: Date.now(),
+      seq: 1,
+      epoch: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'assistant.text',
+      payload: { text: `模板目录：\`${publishedDirectory}\`` },
+    }] as never);
+    vi.mocked(fsp.lstat).mockResolvedValue({ isSymbolicLink: () => false, isFile: () => false } as fsp.Stats);
+    mockRealpath.mockImplementation(async (target) => String(target));
+
+    handleWebCommand({
+      type: 'fs.read',
+      path: publishedDirectory,
+      requestId: 'read-assistant-published-directory',
+      sessionName: 'deck_project_brain',
+    }, mockServerLink as any);
+    await flushAsync();
+
+    expect(mockPreviewCoordinator.handle).not.toHaveBeenCalled();
+    expect(sent[0]).toMatchObject({
+      type: 'fs.read_response',
+      requestId: 'read-assistant-published-directory',
       status: 'error',
       error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH,
     });
