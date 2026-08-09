@@ -242,6 +242,21 @@ describe('SessionControls — inline ; autocomplete', () => {
     expect(ws.sendSessionCommand).not.toHaveBeenCalled();
     await waitFor(() => expect(container.querySelector('.controls-alias-picker')).toBeNull());
   });
+
+  it('scrolls the last alias into view when ArrowUp wraps from the first row', async () => {
+    const { editor, container } = renderControls();
+    typeInto(editor, ';');
+    await waitFor(() => expect(container.querySelector('.controls-alias-picker')).toBeTruthy());
+
+    const lastRow = container.querySelector<HTMLElement>('[data-alias-name="winbox"]')!;
+    const scrollIntoView = vi.fn();
+    lastRow.scrollIntoView = scrollIntoView;
+
+    fireEvent.keyDown(editor, { key: 'ArrowUp' });
+
+    await waitFor(() => expect(lastRow.getAttribute('aria-selected')).toBe('true'));
+    expect(scrollIntoView).toHaveBeenCalledWith({ block: 'nearest' });
+  });
 });
 
 describe('matchInlineAliasTrigger (unit)', () => {

@@ -1219,6 +1219,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const [pendingTransportApproval, setPendingTransportApproval] = useState<PendingTransportApproval | null>(null);
   const [fileDragActive, setFileDragActive] = useState(false);
   const controlsWrapperRef = useRef<HTMLDivElement>(null);
+  const aliasPickerRef = useRef<HTMLDivElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   const modelRef = useRef<HTMLDivElement>(null);
   const autoRef = useRef<HTMLDivElement>(null);
@@ -1458,6 +1459,11 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     error: aliasError,
     refetch: refetchAliases,
   } = useAliases(aliasQuery);
+  useEffect(() => {
+    if (!aliasPickerOpen || aliasFiltered.length === 0) return;
+    const highlighted = aliasPickerRef.current?.querySelector<HTMLElement>('[data-hl="true"]');
+    highlighted?.scrollIntoView({ block: 'nearest' });
+  }, [aliasFiltered, aliasHighlightIdx, aliasPickerOpen]);
   // Shared machine data — feeds compose-time resolution on send (the out-of-band
   // `resolvedMachines` hint) and the inline `^` autocomplete. `machineFiltered`
   // is the refName+displayName filtered view for the current inline query;
@@ -6018,7 +6024,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         {/* Inline `;` alias autocomplete dropdown. Mirrors the @ picker's
             positioning; owns Enter/Tab/Arrow/Escape via handleKeyDown while open. */}
         {aliasPickerOpen && activeSession && (
-          <div class="controls-alias-picker" role="listbox" aria-label={t('alias.category')} style={aliasPickerContainerStyle}>
+          <div ref={aliasPickerRef} class="controls-alias-picker" role="listbox" aria-label={t('alias.category')} style={aliasPickerContainerStyle}>
             <div style={aliasPickerGroupLabelStyle}>
               {t('alias.category')} {aliasQuery ? `— "${aliasQuery}"` : ''}
             </div>
