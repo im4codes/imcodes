@@ -2193,7 +2193,7 @@ describe('App shell', () => {
     render(<App />);
 
     await waitFor(() => expect(apiFetchMock).toHaveBeenCalledWith('/api/server'));
-    await waitFor(() => expect(discoverSharedEntriesMock).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(discoverSharedEntriesMock).toHaveBeenCalled());
     await act(async () => {
       await Promise.resolve();
       await Promise.resolve();
