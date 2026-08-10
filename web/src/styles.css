@@ -6204,6 +6204,48 @@ html.native-ios-mac .chat-dl-btn {
 @keyframes chatImagePreviewPulse { 0% { background-position: 100% 0; } 100% { background-position: -100% 0; } }
 .chat-external-link { color: #60a5fa; text-decoration: underline; text-underline-offset: 2px; cursor: pointer; }
 .chat-external-link:hover { color: #93c5fd; }
+.chat-loopback-link {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px;
+  max-width: 100%;
+}
+.chat-loopback-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+}
+.chat-loopback-action {
+  appearance: none;
+  border: 1px solid rgba(100,116,139,0.52);
+  border-radius: 5px;
+  background: rgba(30,41,59,0.72);
+  color: #94a3b8;
+  cursor: pointer;
+  font: inherit;
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1.2;
+  padding: 2px 5px;
+  white-space: nowrap;
+}
+.chat-loopback-action:hover:not(:disabled) {
+  border-color: rgba(96,165,250,0.62);
+  color: #dbeafe;
+  background: rgba(30,64,175,0.22);
+}
+.chat-loopback-action.is-proxy {
+  border-color: rgba(96,165,250,0.42);
+  color: #bfdbfe;
+}
+.chat-loopback-action:disabled { cursor: wait; opacity: 0.68; }
+.chat-loopback-error {
+  flex-basis: 100%;
+  color: #fda4af;
+  font-size: 10px;
+  line-height: 1.25;
+}
 .external-link-overlay {
   background:
     radial-gradient(circle at 50% 0%, rgba(59,130,246,0.18), transparent 34%),

@@ -23,6 +23,7 @@ import {
   type ChatPathDownloadHandler,
 } from '../chat-path-actions.js';
 import type { ChatLocalImagePreviewLoader } from './ChatLocalImagePreview.js';
+import { ChatLoopbackLink } from './ChatLoopbackLink.js';
 
 interface Props {
   text: string;
@@ -32,6 +33,7 @@ interface Props {
   onDownload?: ChatPathDownloadHandler;
   onHtmlPreview?: (path: string) => void;
   onImagePreview?: ChatLocalImagePreviewLoader;
+  serverId?: string;
 }
 
 interface RenderContext {
@@ -40,6 +42,7 @@ interface RenderContext {
   onDownload?: ChatPathDownloadHandler;
   onHtmlPreview?: (path: string) => void;
   onImagePreview?: ChatLocalImagePreviewLoader;
+  serverId?: string;
   downloadLabel: string;
   htmlPreviewLabel: string;
 }
@@ -54,6 +57,7 @@ function CodeBlock({
   onDownload,
   onHtmlPreview,
   onImagePreview,
+  serverId,
   downloadLabel,
   htmlPreviewLabel,
 }: {
@@ -64,6 +68,7 @@ function CodeBlock({
   onDownload?: ChatPathDownloadHandler;
   onHtmlPreview?: (path: string) => void;
   onImagePreview?: ChatLocalImagePreviewLoader;
+  serverId?: string;
   downloadLabel: string;
   htmlPreviewLabel: string;
 }) {
@@ -84,6 +89,7 @@ function CodeBlock({
     onDownload,
     onHtmlPreview,
     onImagePreview,
+    serverId,
     downloadLabel,
     htmlPreviewLabel,
   };
@@ -221,6 +227,7 @@ function renderToken(
           onDownload={ctx.onDownload}
           onHtmlPreview={ctx.onHtmlPreview}
           onImagePreview={ctx.onImagePreview}
+          serverId={ctx.serverId}
           downloadLabel={ctx.downloadLabel}
           htmlPreviewLabel={ctx.htmlPreviewLabel}
         />
@@ -250,40 +257,26 @@ function renderToken(
         : '';
       const linkText = isAutoLinkLike ? sanitizedHref : renderInlineTokens(t.tokens, ctx, true);
       const link = (
-        <a
-          class="chat-external-link"
+        <ChatLoopbackLink
           href={sanitizedHref}
-          title={sanitizedHref}
-          target="_blank"
-          rel="noopener noreferrer"
-          onClick={(e: Event) => {
-            if (!ctx.onUrlClick) return;
-            e.preventDefault();
-            ctx.onUrlClick(sanitizedHref);
-          }}
+          serverId={ctx.serverId}
+          onUrlClick={ctx.onUrlClick}
         >
           {linkText}
-        </a>
+        </ChatLoopbackLink>
       );
       if (trailingText) {
         return <span key={key}>{link}<span>{trailingText}</span></span>;
       }
       return (
-        <a
+        <ChatLoopbackLink
           key={key}
-          class="chat-external-link"
           href={sanitizedHref}
-          title={sanitizedHref}
-          target="_blank"
-          rel="noopener noreferrer"
-          onClick={(e: Event) => {
-            if (!ctx.onUrlClick) return;
-            e.preventDefault();
-            ctx.onUrlClick(sanitizedHref);
-          }}
+          serverId={ctx.serverId}
+          onUrlClick={ctx.onUrlClick}
         >
           {linkText}
-        </a>
+        </ChatLoopbackLink>
       );
     }
 
@@ -395,21 +388,14 @@ function splitPathsAndUrlsInternal(
   for (const chunk of chunks) {
     if (chunk.type === 'url') {
       parts.push(
-        <a
+        <ChatLoopbackLink
           key={`u${chunk.start}`}
-          class="chat-external-link"
           href={chunk.value}
-          title={chunk.value}
-          target="_blank"
-          rel="noopener noreferrer"
-          onClick={(e: Event) => {
-            if (!ctx.onUrlClick) return;
-            e.preventDefault();
-            ctx.onUrlClick(chunk.value);
-          }}
+          serverId={ctx.serverId}
+          onUrlClick={ctx.onUrlClick}
         >
           {chunk.value}
-        </a>,
+        </ChatLoopbackLink>,
       );
     } else if (ctx.onPathClick || ctx.onImagePreview) {
       let pathLast = 0;
@@ -445,7 +431,7 @@ function splitPathsAndUrlsInternal(
 
 // ── Public component ────────────────────────────────────────────────────────
 
-export function ChatMarkdown({ text, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview }: Props) {
+export function ChatMarkdown({ text, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, serverId }: Props) {
   const { t } = useTranslation();
   const skipRichTextEnhancement = shouldSkipRichTextEnhancement(text);
   const tokens = useMemo(() => (
@@ -457,9 +443,10 @@ export function ChatMarkdown({ text, onPathClick, onUrlClick, onDownload, onHtml
     onDownload,
     onHtmlPreview,
     onImagePreview,
+    serverId,
     downloadLabel: t('upload.download_file'),
     htmlPreviewLabel: t('chat.html_preview', 'Render HTML'),
-  }), [onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t]);
+  }), [onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, serverId, t]);
 
   if (skipRichTextEnhancement) {
     return (
