@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'preact/hooks';
+import { useLayoutEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import type { MessagePin } from '@shared/message-pins.js';
 
@@ -25,6 +25,7 @@ export function MessagePinsBar({
   onDismissError,
 }: Props) {
   const { t, i18n } = useTranslation();
+  const barRef = useRef<HTMLElement>(null);
   const [expanded, setExpanded] = useState(false);
   const [tab, setTab] = useState<'current' | 'all'>('current');
   const currentPins = useMemo(
@@ -33,8 +34,17 @@ export function MessagePinsBar({
   );
   const visiblePins = tab === 'current' ? currentPins : pins;
 
+  useLayoutEffect(() => {
+    if (!expanded) return;
+    const closeOutside = (event: MouseEvent) => {
+      if (!barRef.current?.contains(event.target as Node)) setExpanded(false);
+    };
+    document.addEventListener('click', closeOutside);
+    return () => document.removeEventListener('click', closeOutside);
+  }, [expanded]);
+
   return (
-    <section class={`message-pins-bar${expanded ? ' expanded' : ''}`} aria-label={t('messagePins.title')}>
+    <section ref={barRef} class={`message-pins-bar${expanded ? ' expanded' : ''}`} aria-label={t('messagePins.title')}>
       <button
         type="button"
         class="message-pins-summary"
@@ -45,7 +55,7 @@ export function MessagePinsBar({
         data-testid="message-pins-trigger"
       >
         <span aria-hidden="true">📌</span>
-        <span class="message-pins-count">{pins.length}</span>
+        <span class="message-pins-count">{currentPins.length}/{pins.length}</span>
       </button>
       {expanded && (
         <div class="message-pins-panel">

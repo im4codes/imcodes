@@ -78,7 +78,7 @@ describe('ChatView message pin action', () => {
     expect(titlebar!.children[0]?.querySelector('[aria-label="Aa"]')).toBeTruthy();
     expect(titlebar!.children[1]?.querySelector('.session-repo-branch-summary')).toBeTruthy();
     expect(titlebar!.children[2]).toBe(trigger.closest('.message-pins-bar'));
-    expect(trigger.textContent).toBe('📌0');
+    expect(trigger.textContent).toBe('📌0/0');
   });
 
   it('wires the message action menu to a session-scoped pin payload', async () => {
