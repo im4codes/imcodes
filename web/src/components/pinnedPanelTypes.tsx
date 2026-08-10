@@ -105,6 +105,7 @@ function SubSessionContent({ panel, ctx }: { panel: PinnedPanel; ctx: PanelRende
           workdir={liveSub.cwd ?? null}
           serverId={ctx.serverId}
           onPreviewFile={ctx.onPreviewFile}
+          onOpenLocalWebPreview={ctx.onOpenLocalWebPreview}
           onQuote={ctx.onQuote}
           agentType={liveSub.type}
         />

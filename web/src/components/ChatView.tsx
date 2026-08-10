@@ -31,7 +31,10 @@ import { parseUnifiedDiff } from '@shared/unified-diff.js';
 import { isHtmlPreviewPath, type HtmlPreviewViewMode } from '@shared/html-preview.js';
 import { FileBrowser, type FileBrowserPreviewRequest } from './file-browser-lazy.js';
 import { ChatMarkdown } from './ChatMarkdown.js';
-import { ChatLoopbackLink } from './ChatLoopbackLink.js';
+import {
+  ChatLoopbackLink,
+  type ChatLocalWebPreviewOpenHandler,
+} from './ChatLoopbackLink.js';
 import { AgentTodoList } from './AgentTodoList.js';
 import {
   CHAT_MOUNT_SETTLE_MS,
@@ -109,6 +112,8 @@ interface Props {
   agentType?: string | null;
   /** Server ID for file transfer download API. */
   serverId?: string;
+  /** Opens loopback HTTP links in the shared local-web-preview window. */
+  onOpenLocalWebPreview?: ChatLocalWebPreviewOpenHandler;
   /** Shared viewers may browse/preview/download but cannot mutate files. */
   readOnlyFiles?: boolean;
   /** Constrain file operations to this session's canonical project root. */
@@ -152,7 +157,7 @@ interface AssistantBlockProps {
   onDownload?: ChatPathDownloadHandler;
   onHtmlPreview?: (path: string) => void;
   onImagePreview?: ChatLocalImagePreviewLoader;
-  serverId?: string;
+  onOpenLocalWebPreview?: ChatLocalWebPreviewOpenHandler;
 }
 
 const USER_MESSAGE_COLLAPSE_LINE_LIMIT = 10;
@@ -1567,7 +1572,7 @@ function SdkAgentsDiagnosticRow({ diagnostic }: { diagnostic: SdkSubagentDiagnos
   );
 }
 
-function ChatViewImpl({ events, loading, refreshing = false, historyStatus, loadingOlder, hasOlderHistory = true, onLoadOlder, sessionState, sessionId, onScrollBottomFn, preview, onPreviewFile, ws, onInsertPath, workdir, onViewRepo, serverId, readOnlyFiles = false, scopeFilesToSession = false, onQuote, agentType: _agentType, onResendFailed, onForceSync }: Props) {
+function ChatViewImpl({ events, loading, refreshing = false, historyStatus, loadingOlder, hasOlderHistory = true, onLoadOlder, sessionState, sessionId, onScrollBottomFn, preview, onPreviewFile, ws, onInsertPath, workdir, onViewRepo, serverId, onOpenLocalWebPreview, readOnlyFiles = false, scopeFilesToSession = false, onQuote, agentType: _agentType, onResendFailed, onForceSync }: Props) {
   const { t, i18n } = useTranslation();
   const locale = resolveI18nLocale(i18n);
   const fileScopeSessionName = scopeFilesToSession ? (sessionId ?? undefined) : undefined;
@@ -3134,23 +3139,23 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
                   onDownload={downloadHandler}
                   onHtmlPreview={htmlPreviewHandler}
                   onImagePreview={imagePreviewHandler}
-                  serverId={serverId}
+                  onOpenLocalWebPreview={onOpenLocalWebPreview}
                 />
               );
             }
             if (item.type === 'tool-group') {
-              return <ToolCallGroup key={item.key} events={item.toolEvents!} onPathClick={pathClickHandler} onUrlClick={urlClickHandler} onDownload={downloadHandler} onHtmlPreview={htmlPreviewHandler} onImagePreview={imagePreviewHandler} serverId={serverId} />;
+              return <ToolCallGroup key={item.key} events={item.toolEvents!} onPathClick={pathClickHandler} onUrlClick={urlClickHandler} onDownload={downloadHandler} onHtmlPreview={htmlPreviewHandler} onImagePreview={imagePreviewHandler} onOpenLocalWebPreview={onOpenLocalWebPreview} serverId={serverId} />;
             }
             if (item.type === 'tool-activity') {
-              return <ToolActivitySummary key={item.key} events={item.toolEvents!} onPathClick={pathClickHandler} onUrlClick={urlClickHandler} onDownload={downloadHandler} onHtmlPreview={htmlPreviewHandler} onImagePreview={imagePreviewHandler} serverId={serverId} />;
+              return <ToolActivitySummary key={item.key} events={item.toolEvents!} onPathClick={pathClickHandler} onUrlClick={urlClickHandler} onDownload={downloadHandler} onHtmlPreview={htmlPreviewHandler} onImagePreview={imagePreviewHandler} onOpenLocalWebPreview={onOpenLocalWebPreview} serverId={serverId} />;
             }
             const linkedEvents = item.linkedEvents ?? [];
             if (linkedEvents.length === 0) {
-              return <ChatEvent key={item.key} event={item.event!} sessionName={sessionId ?? undefined} onPathClick={pathClickHandler} onUrlClick={urlClickHandler} onFileChangeOpen={fileChangeOpenHandler} onDownload={downloadHandler} onHtmlPreview={htmlPreviewHandler} onImagePreview={imagePreviewHandler} serverId={serverId} onResendFailed={onResendFailed} />;
+              return <ChatEvent key={item.key} event={item.event!} sessionName={sessionId ?? undefined} onPathClick={pathClickHandler} onUrlClick={urlClickHandler} onFileChangeOpen={fileChangeOpenHandler} onDownload={downloadHandler} onHtmlPreview={htmlPreviewHandler} onImagePreview={imagePreviewHandler} onOpenLocalWebPreview={onOpenLocalWebPreview} serverId={serverId} onResendFailed={onResendFailed} />;
             }
             return (
               <div key={item.key} class="chat-linked-event-group">
-                <ChatEvent event={item.event!} sessionName={sessionId ?? undefined} onPathClick={pathClickHandler} onUrlClick={urlClickHandler} onFileChangeOpen={fileChangeOpenHandler} onDownload={downloadHandler} onHtmlPreview={htmlPreviewHandler} onImagePreview={imagePreviewHandler} serverId={serverId} onResendFailed={onResendFailed} />
+                <ChatEvent event={item.event!} sessionName={sessionId ?? undefined} onPathClick={pathClickHandler} onUrlClick={urlClickHandler} onFileChangeOpen={fileChangeOpenHandler} onDownload={downloadHandler} onHtmlPreview={htmlPreviewHandler} onImagePreview={imagePreviewHandler} onOpenLocalWebPreview={onOpenLocalWebPreview} serverId={serverId} onResendFailed={onResendFailed} />
                 {linkedEvents.map((linkedEvent) => (
                   <ChatEvent
                     key={linkedEvent.eventId}
@@ -3162,6 +3167,7 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
                     onDownload={downloadHandler}
                     onHtmlPreview={htmlPreviewHandler}
                     onImagePreview={imagePreviewHandler}
+                    onOpenLocalWebPreview={onOpenLocalWebPreview}
                     serverId={serverId}
                     onResendFailed={onResendFailed}
                   />
@@ -3647,6 +3653,7 @@ function ToolActivitySummary({
   onDownload,
   onHtmlPreview,
   onImagePreview,
+  onOpenLocalWebPreview,
   serverId,
 }: {
   events: TimelineEvent[];
@@ -3655,6 +3662,7 @@ function ToolActivitySummary({
   onDownload?: ChatPathDownloadHandler;
   onHtmlPreview?: (path: string) => void;
   onImagePreview?: ChatLocalImagePreviewLoader;
+  onOpenLocalWebPreview?: ChatLocalWebPreviewOpenHandler;
   serverId?: string;
 }) {
   const { t } = useTranslation();
@@ -3809,6 +3817,7 @@ function ToolActivitySummary({
                 onDownload={onDownload}
                 onHtmlPreview={onHtmlPreview}
                 onImagePreview={onImagePreview}
+                onOpenLocalWebPreview={onOpenLocalWebPreview}
                 serverId={serverId}
                 showTime
               />
@@ -3841,6 +3850,7 @@ function ToolCallGroup({
   onDownload,
   onHtmlPreview,
   onImagePreview,
+  onOpenLocalWebPreview,
   serverId,
 }: {
   events: TimelineEvent[];
@@ -3849,6 +3859,7 @@ function ToolCallGroup({
   onDownload?: ChatPathDownloadHandler;
   onHtmlPreview?: (path: string) => void;
   onImagePreview?: ChatLocalImagePreviewLoader;
+  onOpenLocalWebPreview?: ChatLocalWebPreviewOpenHandler;
   serverId?: string;
 }) {
   const { t } = useTranslation();
@@ -3863,18 +3874,18 @@ function ToolCallGroup({
 
   return (
     <div class="chat-tool-group">
-      <ChatEvent event={first} onPathClick={onPathClick} onUrlClick={onUrlClick} onDownload={onDownload} onHtmlPreview={onHtmlPreview} onImagePreview={onImagePreview} serverId={serverId} />
+      <ChatEvent event={first} onPathClick={onPathClick} onUrlClick={onUrlClick} onDownload={onDownload} onHtmlPreview={onHtmlPreview} onImagePreview={onImagePreview} onOpenLocalWebPreview={onOpenLocalWebPreview} serverId={serverId} />
       <div class="chat-tool-group-indent">
         {middle.length > 0 && (
           expanded ? (
-            middle.map((ev) => <ChatEvent key={ev.eventId} event={ev} onPathClick={onPathClick} onUrlClick={onUrlClick} onDownload={onDownload} onHtmlPreview={onHtmlPreview} onImagePreview={onImagePreview} serverId={serverId} />)
+            middle.map((ev) => <ChatEvent key={ev.eventId} event={ev} onPathClick={onPathClick} onUrlClick={onUrlClick} onDownload={onDownload} onHtmlPreview={onHtmlPreview} onImagePreview={onImagePreview} onOpenLocalWebPreview={onOpenLocalWebPreview} serverId={serverId} />)
           ) : (
             <button class="chat-tool-fold-btn" onClick={() => setExpanded(true)}>
               {t('chat.tool_group_more', { count: middle.length })}
             </button>
           )
         )}
-        {last && <ChatEvent event={last} onPathClick={onPathClick} onUrlClick={onUrlClick} onDownload={onDownload} onHtmlPreview={onHtmlPreview} onImagePreview={onImagePreview} serverId={serverId} showTime />}
+        {last && <ChatEvent event={last} onPathClick={onPathClick} onUrlClick={onUrlClick} onDownload={onDownload} onHtmlPreview={onHtmlPreview} onImagePreview={onImagePreview} onOpenLocalWebPreview={onOpenLocalWebPreview} serverId={serverId} showTime />}
         {expanded && middle.length > 0 && (
           <button class="chat-tool-fold-btn" onClick={() => setExpanded(false)}>
             {t('chat.tool_group_collapse')}
@@ -3898,14 +3909,14 @@ const AssistantBlock = memo(function AssistantBlock({
   onDownload,
   onHtmlPreview,
   onImagePreview,
-  serverId,
+  onOpenLocalWebPreview,
 }: AssistantBlockProps) {
   return (
     <div
       class={`chat-event chat-assistant${automation ? ' chat-assistant-automation' : ''}`}
       data-event-id={eventId}
     >
-      <ChatMarkdown text={parseTimelineDisplayText(text)} onPathClick={onPathClick} onUrlClick={onUrlClick} onDownload={onDownload} onHtmlPreview={onHtmlPreview} onImagePreview={onImagePreview} serverId={serverId} />
+      <ChatMarkdown text={parseTimelineDisplayText(text)} onPathClick={onPathClick} onUrlClick={onUrlClick} onDownload={onDownload} onHtmlPreview={onHtmlPreview} onImagePreview={onImagePreview} onOpenLocalWebPreview={onOpenLocalWebPreview} />
       <ChatTime ts={ts} />
     </div>
   );
@@ -4004,6 +4015,7 @@ const ChatEvent = memo(function ChatEvent({
   onDownload,
   onHtmlPreview,
   onImagePreview,
+  onOpenLocalWebPreview,
   serverId,
   onResendFailed,
   showTime,
@@ -4016,6 +4028,7 @@ const ChatEvent = memo(function ChatEvent({
   onDownload?: ChatPathDownloadHandler;
   onHtmlPreview?: (path: string) => void;
   onImagePreview?: ChatLocalImagePreviewLoader;
+  onOpenLocalWebPreview?: ChatLocalWebPreviewOpenHandler;
   serverId?: string;
   onResendFailed?: (commandId: string, text: string) => void;
   showTime?: boolean;
@@ -4060,7 +4073,7 @@ const ChatEvent = memo(function ChatEvent({
               onDownload={onDownload}
               onHtmlPreview={onHtmlPreview}
               onImagePreview={onImagePreview}
-              serverId={serverId}
+              onOpenLocalWebPreview={onOpenLocalWebPreview}
             />
           )}
           {isPending && (
@@ -4124,7 +4137,7 @@ const ChatEvent = memo(function ChatEvent({
           {findingsPreview && (
             <details>
               <summary>{t('peerAuditResult.findingsPreview')}</summary>
-              <ChatMarkdown text={findingsPreview} onUrlClick={onUrlClick} serverId={serverId} />
+              <ChatMarkdown text={findingsPreview} onUrlClick={onUrlClick} onOpenLocalWebPreview={onOpenLocalWebPreview} />
             </details>
           )}
           <ChatTime ts={event.ts} />
@@ -4152,7 +4165,7 @@ const ChatEvent = memo(function ChatEvent({
               onDownload={onDownload}
               onHtmlPreview={onHtmlPreview}
               onImagePreview={onImagePreview}
-              serverId={serverId}
+              onOpenLocalWebPreview={onOpenLocalWebPreview}
             />
           )}
           <ChatTime ts={event.ts} />
@@ -4195,18 +4208,18 @@ const ChatEvent = memo(function ChatEvent({
                   <span aria-hidden="true">{expanded ? '▾' : '▸'}</span>
                 </button>
                 <span class="chat-tool-name">{toolName}</span>
-                {toolInputFirstLine && <span class="chat-tool-input">{' '}{splitPathsAndUrls(toolInputFirstLine, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'), serverId)}</span>}
+                {toolInputFirstLine && <span class="chat-tool-input">{' '}{splitPathsAndUrls(toolInputFirstLine, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'), onOpenLocalWebPreview)}</span>}
                 {isMerged && <span class={`chat-tool-state${toolFailed ? ' is-failed' : ' is-complete'}`} aria-hidden="true">{toolFailed ? '×' : '✓'}</span>}
                 {shouldShowTime && <span class="chat-bubble-time" style={{ display: 'inline', margin: 0 }}>{formatChatDateTime(event.ts, Date.now(), locale)}</span>}
               </div>
               {toolInputRemainingLines !== null && (
                 <div class="chat-event chat-tool chat-tool-fold-continuation">
-                  <span class="chat-tool-input">{splitPathsAndUrls(toolInputRemainingLines, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'), serverId)}</span>
+                  <span class="chat-tool-input">{splitPathsAndUrls(toolInputRemainingLines, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'), onOpenLocalWebPreview)}</span>
                 </div>
               )}
               {toolOutput && (
                 <div class="chat-event chat-tool chat-tool-result-preview">
-                  <span class="chat-tool-output">{splitPathsAndUrls(toolOutput, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'), serverId)}</span>
+                  <span class="chat-tool-output">{splitPathsAndUrls(toolOutput, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'), onOpenLocalWebPreview)}</span>
                 </div>
               )}
               {expanded && (
@@ -4257,12 +4270,12 @@ const ChatEvent = memo(function ChatEvent({
                 >
                   <span aria-hidden="true">{expanded ? '▾' : '▸'}</span>
                 </button>
-                <span class={resultClass}>{splitPathsAndUrls(resultFirstLine, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'), serverId)}</span>
+                <span class={resultClass}>{splitPathsAndUrls(resultFirstLine, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'), onOpenLocalWebPreview)}</span>
                 {showTime && <span class="chat-bubble-time" style={{ display: 'inline', margin: 0 }}>{formatChatDateTime(event.ts, Date.now(), locale)}</span>}
               </div>
               {resultRemainingLines !== null && (
                 <div class="chat-event chat-tool chat-tool-fold-continuation">
-                  <span class={resultClass}>{splitPathsAndUrls(resultRemainingLines, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'), serverId)}</span>
+                  <span class={resultClass}>{splitPathsAndUrls(resultRemainingLines, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'), onOpenLocalWebPreview)}</span>
                 </div>
               )}
               {expanded && <ToolResultDetailPanel detail={detail} payloadOutput={event.payload.output} />}
@@ -4716,7 +4729,7 @@ function UserMessageText({
   onDownload,
   onHtmlPreview,
   onImagePreview,
-  serverId,
+  onOpenLocalWebPreview,
 }: {
   text: string;
   onPathClick?: (p: string) => void;
@@ -4724,7 +4737,7 @@ function UserMessageText({
   onDownload?: ChatPathDownloadHandler;
   onHtmlPreview?: (path: string) => void;
   onImagePreview?: ChatLocalImagePreviewLoader;
-  serverId?: string;
+  onOpenLocalWebPreview?: ChatLocalWebPreviewOpenHandler;
 }) {
   const { t } = useTranslation();
   const lineCount = countHardLines(text);
@@ -4735,7 +4748,7 @@ function UserMessageText({
   return (
     <div class={`chat-user-message-fold${shouldFold ? ' is-foldable' : ''}${folded ? ' is-folded' : ''}`}>
       <div class={`chat-bubble-content chat-user-message-fold-content${folded ? ' is-folded' : ''}`}>
-        {splitPathsAndUrls(text, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'), serverId)}
+        {splitPathsAndUrls(text, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'), onOpenLocalWebPreview)}
       </div>
       {shouldFold && (
         <button
@@ -4776,9 +4789,9 @@ function splitPathsAndUrls(
   onImagePreview?: ChatLocalImagePreviewLoader,
   downloadLabel = '',
   htmlPreviewLabel = '',
-  serverId?: string,
+  onOpenLocalWebPreview?: ChatLocalWebPreviewOpenHandler,
 ): h.JSX.Element[] {
-  if (!onPathClick && !onUrlClick && !onDownload && !onHtmlPreview && !onImagePreview) return [<span>{text}</span>];
+  if (!onPathClick && !onUrlClick && !onDownload && !onHtmlPreview && !onImagePreview && !onOpenLocalWebPreview) return [<span>{text}</span>];
   if (shouldSkipRichTextEnhancement(text)) return [<span>{text}</span>];
 
   // Step 1: Split by URLs first (URLs take priority over path detection)
@@ -4792,7 +4805,7 @@ function splitPathsAndUrls(
         <ChatLoopbackLink
           key={`u${chunk.start}`}
           href={chunk.value}
-          serverId={serverId}
+          onOpenLocalWebPreview={onOpenLocalWebPreview}
           onUrlClick={onUrlClick}
         >
           {chunk.value}

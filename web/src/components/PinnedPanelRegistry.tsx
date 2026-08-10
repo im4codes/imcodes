@@ -17,6 +17,7 @@ import type { PinnedPanel } from '../app.js';
 import type { SubSession } from '../hooks/useSubSessions.js';
 import type { FileBrowserPreviewRequest, FileBrowserPreviewUpdate } from './FileBrowser.js';
 import type { SessionContextBootstrapState } from '@shared/session-context-bootstrap.js';
+import type { ChatLocalWebPreviewOpenHandler } from './ChatLoopbackLink.js';
 
 export interface PanelRenderContext {
   ws: WsClient | null;
@@ -30,6 +31,8 @@ export interface PanelRenderContext {
   onCiEvent?: (run: { name: string; status: string; conclusion?: string | null }) => void;
   /** Open a file preview in a large floating window (used by pinned file browser) */
   onPreviewFile?: (request: FileBrowserPreviewRequest) => void;
+  /** Open a loopback URL in the shared local-web-preview host. */
+  onOpenLocalWebPreview?: ChatLocalWebPreviewOpenHandler;
   /** Sync preview state from a source FileBrowser into the floating preview host/cache. */
   onPreviewStateChange?: (update: FileBrowserPreviewUpdate) => void;
   /** Current active session name — for file browser to follow tab switches */

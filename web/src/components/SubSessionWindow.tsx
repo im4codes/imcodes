@@ -53,6 +53,7 @@ import { DEFAULT_SUBSESSION_ACCENT_COLOR } from '../subsession-accent-colors.js'
 import { EXECUTION_CLONE_KIND } from '@shared/execution-clone.js';
 import type { SessionSettingsOpenIntent } from '../session-settings-open-intent.js';
 import { useStableCallback } from '../hooks/useStableCallback.js';
+import type { ChatLocalWebPreviewOpenHandler } from './ChatLoopbackLink.js';
 
 function isExecutionCloneTemplateLike(sub: { executionCloneKind?: string | null; parentRunId?: string | null }): boolean {
   return sub.executionCloneKind === EXECUTION_CLONE_KIND || typeof sub.parentRunId === 'string';
@@ -86,6 +87,8 @@ interface Props {
   onTransportConfigSaved?: (transportConfig: Record<string, unknown> | null) => void;
   /** Open a file preview in the shared floating preview host. */
   onPreviewFile?: (request: FileBrowserPreviewRequest) => void;
+  /** Open a loopback URL in the shared local-web-preview host. */
+  onOpenLocalWebPreview?: ChatLocalWebPreviewOpenHandler;
   zIndex: number;
   onFocus: () => void;
   /**
@@ -255,7 +258,7 @@ function saveLocal(id: string, geom: WindowGeometry, viewMode: ViewMode) {
 }
 
 export function SubSessionWindow({
-  sub, ws, connected, active, onPendingQuestion, idleFlashToken, onDiff, onHistory, onMinimize, onClose, maximized = false, onToggleMaximized, onRestoreBeforeClose, getMaximizeBounds, desktopLayoutCapable = true, onRestart, onRename, onSettings, onShareSession, onViewRepo, onTransportConfigSaved, onPreviewFile, zIndex, onFocus, desktopFileBrowserZIndex, onDesktopFileBrowserOpen, onDesktopFileBrowserFocus, onDesktopFileBrowserClose, onPin, sessions, subSessions, serverId, pendingPrefillText, onPendingPrefillApplied, onVersionSensitiveAction, detectedModelHint, inP2p, sharedState, accentColor = DEFAULT_SUBSESSION_ACCENT_COLOR,
+  sub, ws, connected, active, onPendingQuestion, idleFlashToken, onDiff, onHistory, onMinimize, onClose, maximized = false, onToggleMaximized, onRestoreBeforeClose, getMaximizeBounds, desktopLayoutCapable = true, onRestart, onRename, onSettings, onShareSession, onViewRepo, onTransportConfigSaved, onPreviewFile, onOpenLocalWebPreview, zIndex, onFocus, desktopFileBrowserZIndex, onDesktopFileBrowserOpen, onDesktopFileBrowserFocus, onDesktopFileBrowserClose, onPin, sessions, subSessions, serverId, pendingPrefillText, onPendingPrefillApplied, onVersionSensitiveAction, detectedModelHint, inP2p, sharedState, accentColor = DEFAULT_SUBSESSION_ACCENT_COLOR,
 }: Props) {
   const { t } = useTranslation();
   const activeIdleFlashToken = useIdleFlashPlayback(idleFlashToken);
@@ -521,6 +524,7 @@ export function SubSessionWindow({
   // identity on every timeline event, defeating ChatView's memo boundary.
   const stableOnViewRepo = useStableCallback(onViewRepo);
   const stableOnPreviewFile = useStableCallback(onPreviewFile);
+  const stableOnOpenLocalWebPreview = useStableCallback(onOpenLocalWebPreview);
 
   // Non-shell window: subscribe raw only while focused (full-fidelity view); when
   // unfocused it falls back to the passive (non-raw) subscription app.tsx keeps.
@@ -970,6 +974,7 @@ export function SubSessionWindow({
             workdir={sub.cwd ?? null}
             onViewRepo={stableOnViewRepo}
             onPreviewFile={stableOnPreviewFile}
+            onOpenLocalWebPreview={onOpenLocalWebPreview ? stableOnOpenLocalWebPreview : undefined}
             serverId={serverId}
             onQuote={addQuote}
             agentType={sessionInfo?.agentType ?? sub.type}

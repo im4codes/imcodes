@@ -33,6 +33,7 @@ import { loadLegacyCodexModelPreferenceForModelessSession } from '../codex-model
 import type { FileBrowserPreviewRequest } from './file-browser-lazy.js';
 import { EXECUTION_CLONE_KIND } from '@shared/execution-clone.js';
 import type { SessionSettingsOpenIntent } from '../session-settings-open-intent.js';
+import type { ChatLocalWebPreviewOpenHandler } from './ChatLoopbackLink.js';
 
 function isExecutionCloneTemplateLike(sub: { executionCloneKind?: string | null; parentRunId?: string | null }): boolean {
   return sub.executionCloneKind === EXECUTION_CLONE_KIND || typeof sub.parentRunId === 'string';
@@ -112,6 +113,8 @@ export interface SessionPaneProps {
   onAfterAction?: () => void;
   /** Open a file preview in the shared floating preview host. */
   onPreviewFile?: (request: FileBrowserPreviewRequest) => void;
+  /** Open a loopback URL in the shared local-web-preview host. */
+  onOpenLocalWebPreview?: ChatLocalWebPreviewOpenHandler;
   /** Mobile: whether the file browser overlay is open. */
   mobileFileBrowserOpen?: boolean;
   /** Mobile: called when the file browser overlay requests close. */
@@ -155,6 +158,7 @@ export function SessionPane({
   onTransportConfigSaved,
   onAfterAction,
   onPreviewFile,
+  onOpenLocalWebPreview,
   mobileFileBrowserOpen,
   onMobileFileBrowserClose,
   pendingPrefillText,
@@ -438,6 +442,7 @@ export function SessionPane({
           workdir={session.projectDir}
           onViewRepo={onViewRepo}
           onPreviewFile={onPreviewFile}
+          onOpenLocalWebPreview={onOpenLocalWebPreview}
           ws={connected ? ws : null}
           serverId={serverId}
           scopeFilesToSession={!!session.sharedState}

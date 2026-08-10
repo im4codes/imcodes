@@ -6230,7 +6230,7 @@ html.native-ios-mac .chat-dl-btn {
   padding: 2px 5px;
   white-space: nowrap;
 }
-.chat-loopback-action:hover:not(:disabled) {
+.chat-loopback-action:hover {
   border-color: rgba(96,165,250,0.62);
   color: #dbeafe;
   background: rgba(30,64,175,0.22);
@@ -6238,13 +6238,6 @@ html.native-ios-mac .chat-dl-btn {
 .chat-loopback-action.is-proxy {
   border-color: rgba(96,165,250,0.42);
   color: #bfdbfe;
-}
-.chat-loopback-action:disabled { cursor: wait; opacity: 0.68; }
-.chat-loopback-error {
-  flex-basis: 100%;
-  color: #fda4af;
-  font-size: 10px;
-  line-height: 1.25;
 }
 .external-link-overlay {
   background:

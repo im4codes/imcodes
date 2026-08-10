@@ -93,6 +93,7 @@ import {
   SHARED_CONTEXT_MANAGEMENT_PANEL_TYPE,
 } from './components/pinnedPanelTypes.js';
 import { LocalWebPreviewPanel } from './components/LocalWebPreviewPanel.js';
+import type { ChatLocalWebPreviewOpenHandler } from './components/ChatLoopbackLink.js';
 import { formatDaemonVersionShort } from './util/format-version.js';
 import { nextDaemonUpgradingState, daemonUpgradingLabel, type DaemonUpgradingState } from './util/daemon-upgrade-status.js';
 import {
@@ -600,6 +601,7 @@ export function App() {
   const [showDesktopLocalWebPreview, setShowDesktopLocalWebPreview] = useState(false);
   const [localWebPreviewPort, setLocalWebPreviewPort] = useState('');
   const [localWebPreviewPath, setLocalWebPreviewPath] = useState('/');
+  const [localWebPreviewLaunchToken, setLocalWebPreviewLaunchToken] = useState(0);
   // File browser geometry now managed by FloatingPanel (id="filebrowser")
   // NOTE: top-bar 📁 buttons call setShowMobile/DesktopFileBrowser directly.
   // Sub-sessions now own their own FileBrowser inside SubSessionWindow
@@ -1572,6 +1574,20 @@ export function App() {
     }
     if (changed) bumpStack();
   }, []);
+
+  const openLocalWebPreviewFromChat = useCallback<ChatLocalWebPreviewOpenHandler>(({ port, path }) => {
+    setLocalWebPreviewPort(String(port));
+    setLocalWebPreviewPath(path);
+    // LocalWebPreviewPanel auto-opens only once per mount. Remount it for each
+    // chat-link launch so a second link immediately replaces the active relay.
+    setLocalWebPreviewLaunchToken((token) => token + 1);
+    setShowDesktopLocalWebPreview(true);
+    if (!selectedServerId) return;
+    ensureDesktopWindow(DESKTOP_WINDOW_IDS.localWebPreview(selectedServerId), {
+      kind: DESKTOP_WINDOW_KINDS.localWebPreview,
+      serverId: selectedServerId,
+    }, { bringToFront: true });
+  }, [ensureDesktopWindow, selectedServerId]);
 
   /** Raise an existing window. No-op (no version bump) if it is already frontmost. */
   const bringDesktopWindowToFront = useCallback((id: string) => {
@@ -5123,6 +5139,7 @@ export function App() {
                 subSessions,
                 inputRefsMap,
                 onPreviewFile: (request) => handlePreviewFileRequest({ ...request, sourcePreviewLive: false }),
+                onOpenLocalWebPreview: openLocalWebPreviewFromChat,
                 onPreviewStateChange: handlePreviewStateChange,
                 activeSession,
                 activeProjectDir: activeSessionInfo?.projectDir,
@@ -5504,6 +5521,7 @@ export function App() {
                   )));
                 }}
                 onPreviewFile={(request) => handlePreviewFileRequest({ ...request, sourcePreviewLive: false })}
+                onOpenLocalWebPreview={openLocalWebPreviewFromChat}
                 onAfterAction={focusTerminal}
                 mobileFileBrowserOpen={s.name === activeSession ? showMobileFileBrowser : false}
                 onMobileFileBrowserClose={() => setShowMobileFileBrowser(false)}
@@ -5604,6 +5622,7 @@ export function App() {
                 onFocus={() => bringDesktopWindowToFront(DESKTOP_WINDOW_IDS.localWebPreview(selectedServerId))}
               >
                 <LocalWebPreviewPanel
+                  key={`${selectedServerId}:${localWebPreviewLaunchToken}`}
                   serverId={selectedServerId}
                   port={localWebPreviewPort}
                   path={localWebPreviewPath}
@@ -5838,6 +5857,7 @@ export function App() {
                   subSessions,
                   inputRefsMap,
                   onPreviewFile: (request) => { handlePreviewFileRequest({ ...request, sourcePreviewLive: false }); closeSidebar(); },
+                  onOpenLocalWebPreview: openLocalWebPreviewFromChat,
                   onPreviewStateChange: handlePreviewStateChange,
                   activeSession,
                   activeProjectDir: activeSessionInfo?.projectDir,
@@ -6301,6 +6321,7 @@ export function App() {
               onViewRepo={() => openRepoPage({ sessionId: sub.sessionName, projectDir: sub.cwd, initialTab: 'branches', parentSubId: sub.id })}
               onTransportConfigSaved={(transportConfig) => updateSubLocal(sub.id, { transportConfig })}
               onPreviewFile={(request) => handlePreviewFileRequest({ ...request, sourcePreviewLive: false })}
+              onOpenLocalWebPreview={openLocalWebPreviewFromChat}
               zIndex={getDesktopWindowZIndex(DESKTOP_WINDOW_IDS.subSession(sub.id), 6000)}
               onFocus={() => bringSubToFront(sub.id)}
               desktopFileBrowserZIndex={getDesktopWindowZIndex(DESKTOP_WINDOW_IDS.subsessionFileBrowser(sub.id), getDesktopWindowZIndex(DESKTOP_WINDOW_IDS.subSession(sub.id), 6000) + 1)}

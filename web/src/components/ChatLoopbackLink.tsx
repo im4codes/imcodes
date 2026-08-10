@@ -1,15 +1,12 @@
 import type { ComponentChildren } from 'preact';
-import { useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
-import {
-  buildLocalWebPreviewProxyUrl,
-  createLocalWebPreview,
-} from '../api.js';
 
 export interface LoopbackHttpTarget {
   port: number;
   path: string;
 }
+
+export type ChatLocalWebPreviewOpenHandler = (target: LoopbackHttpTarget) => void;
 
 /**
  * Only loopback HTTP links can be safely mapped to the daemon's local preview
@@ -37,7 +34,7 @@ export function parseLoopbackHttpTarget(value: string): LoopbackHttpTarget | nul
 
 interface Props {
   href: string;
-  serverId?: string;
+  onOpenLocalWebPreview?: ChatLocalWebPreviewOpenHandler;
   onUrlClick?: (url: string) => void;
   children: ComponentChildren;
 }
@@ -46,46 +43,11 @@ function openNewTab(url: string): void {
   window.open(url, '_blank', 'noopener,noreferrer');
 }
 
-export function ChatLoopbackLink({ href, serverId, onUrlClick, children }: Props) {
+export function ChatLoopbackLink({ href, onOpenLocalWebPreview, onUrlClick, children }: Props) {
   const { t } = useTranslation();
   const target = parseLoopbackHttpTarget(href);
-  const [openingProxy, setOpeningProxy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
 
-  const openProxy = async () => {
-    if (!target || !serverId || openingProxy) return;
-    setOpeningProxy(true);
-    setError(null);
-
-    // Reserve the tab while this trusted click is still on the browser's user
-    // activation stack. Opening only after the POST resolves is blocked by
-    // Safari and by stricter Chromium popup settings.
-    const pendingTab = window.open('about:blank', '_blank');
-    if (pendingTab) pendingTab.opener = null;
-    try {
-      const preview = await createLocalWebPreview(serverId, target.port, target.path);
-      const proxyUrl = buildLocalWebPreviewProxyUrl(
-        serverId,
-        preview.previewId,
-        target.path,
-        preview.previewAccessToken,
-      );
-      if (pendingTab && !pendingTab.closed) {
-        pendingTab.location.replace(proxyUrl);
-      } else {
-        openNewTab(proxyUrl);
-      }
-    } catch (err) {
-      pendingTab?.close();
-      setError(err instanceof Error && err.message
-        ? err.message
-        : t('chat.local_link_proxy_failed'));
-    } finally {
-      setOpeningProxy(false);
-    }
-  };
-
-  if (!target || !serverId) {
+  if (!target || !onOpenLocalWebPreview) {
     return (
       <a
         class="chat-external-link"
@@ -112,7 +74,7 @@ export function ChatLoopbackLink({ href, serverId, onUrlClick, children }: Props
         title={t('chat.local_link_proxy_default')}
         onClick={(event: Event) => {
           event.preventDefault();
-          void openProxy();
+          onOpenLocalWebPreview(target);
         }}
       >
         {children}
@@ -121,10 +83,9 @@ export function ChatLoopbackLink({ href, serverId, onUrlClick, children }: Props
         <button
           type="button"
           class="chat-loopback-action is-proxy"
-          disabled={openingProxy}
-          onClick={() => void openProxy()}
+          onClick={() => onOpenLocalWebPreview(target)}
         >
-          {openingProxy ? t('chat.local_link_proxy_opening') : t('chat.local_link_proxy_open')}
+          {t('chat.local_link_proxy_open')}
         </button>
         <button
           type="button"
@@ -134,7 +95,6 @@ export function ChatLoopbackLink({ href, serverId, onUrlClick, children }: Props
           {t('chat.local_link_direct_open')}
         </button>
       </span>
-      {error && <span class="chat-loopback-error" role="alert">{error}</span>}
     </span>
   );
 }

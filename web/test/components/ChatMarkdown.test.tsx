@@ -19,11 +19,11 @@ import { ChatMarkdown } from '../../src/components/ChatMarkdown';
 import { RICH_TEXT_ENHANCEMENT_CHAR_LIMIT } from '../../src/chat-render-limits';
 
 describe('ChatMarkdown', () => {
-  it('adds proxy and direct actions to detected loopback links when a server is available', () => {
+  it('adds preview and direct actions to detected loopback links when the preview host is available', () => {
     const { container } = render(
       <ChatMarkdown
         text="本机访问：http://127.0.0.1:8787/"
-        serverId="server-1"
+        onOpenLocalWebPreview={() => {}}
         onUrlClick={() => {}}
       />,
     );

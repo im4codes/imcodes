@@ -354,6 +354,7 @@ vi.mock('../src/components/SessionPane.js', () => ({
     onMobileFileBrowserClose,
     onPendingPrefillApplied,
     onPreviewFile,
+    onOpenLocalWebPreview,
     onRenameSession,
     onScrollBottomFn,
     onSettings,
@@ -383,6 +384,7 @@ vi.mock('../src/components/SessionPane.js', () => ({
         path: '/home/ai/.imcodes/uploads/392836a75fc67a4ff38c2dcedc9afe32.png',
         sessionName: session.name,
       })}>pane-preview-upload</button>
+      <button onClick={() => onOpenLocalWebPreview?.({ port: 8787, path: '/docs?q=1#intro' })}>pane-preview-loopback</button>
     </div>
   ),
 }));
@@ -589,8 +591,8 @@ vi.mock('../src/components/SidebarPinnedPanel.js', () => ({
   ),
 }));
 vi.mock('../src/components/LocalWebPreviewPanel.js', () => ({
-  LocalWebPreviewPanel: ({ onDraftChange }: any) => (
-    <div>
+  LocalWebPreviewPanel: ({ port, path, onDraftChange }: any) => (
+    <div data-testid="local-web-preview" data-port={port} data-path={path}>
       local-web-preview
       <button onClick={() => onDraftChange?.({ port: '5173', path: '/app' })}>preview-draft</button>
     </div>
@@ -1950,6 +1952,11 @@ describe('App shell', () => {
     fireEvent.click(screen.getAllByTitle('localWebPreview.title')[0]);
     expect(await screen.findByText('local-web-preview')).toBeTruthy();
     fireEvent.click(screen.getByText('preview-draft'));
+
+    fireEvent.click(screen.getByText('pane-preview-loopback'));
+    const loopbackPreview = await screen.findByTestId('local-web-preview');
+    expect(loopbackPreview.getAttribute('data-port')).toBe('8787');
+    expect(loopbackPreview.getAttribute('data-path')).toBe('/docs?q=1#intro');
 
     for (const label of [
       'pane-fit-ref',
