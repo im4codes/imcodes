@@ -35,15 +35,17 @@ function pin(id: string, sessionName: string): MessagePin {
 describe('MessagePinsBar', () => {
   afterEach(cleanup);
 
-  it('collapses to one count line and switches between current and all sessions', () => {
+  it('collapses to a compact icon count and switches between current and all sessions', () => {
     const onLocate = vi.fn();
     const onUnpin = vi.fn();
     const pins = [pin('u1', 'deck_current'), pin('a2', 'deck_current'), pin('a3', 'deck_other')];
     render(<MessagePinsBar pins={pins} currentSessionName="deck_current" onLocate={onLocate} onUnpin={onUnpin} />);
 
-    expect(screen.getByText('current 2 / all 3')).toBeTruthy();
+    const trigger = screen.getByTestId('message-pins-trigger');
+    expect(trigger.textContent).toBe('📌3');
+    expect(trigger.getAttribute('aria-label')).toBe('current 2 / all 3');
     expect(screen.queryByText('pinned u1')).toBeNull();
-    fireEvent.click(screen.getByText('current 2 / all 3'));
+    fireEvent.click(trigger);
     expect(screen.getByText('pinned u1')).toBeTruthy();
     expect(screen.getByText('pinned a2')).toBeTruthy();
     expect(screen.queryByText('pinned a3')).toBeNull();
@@ -60,9 +62,14 @@ describe('MessagePinsBar', () => {
     const onUnpin = vi.fn();
     const pins = [pin('u1', 'deck_current')];
     render(<MessagePinsBar pins={pins} currentSessionName="deck_current" onLocate={onLocate} onUnpin={onUnpin} />);
-    fireEvent.click(screen.getByText('current 1 / all 1'));
+    fireEvent.click(screen.getByTestId('message-pins-trigger'));
     fireEvent.click(screen.getByLabelText('messagePins.unpin'));
     expect(onUnpin).toHaveBeenCalledWith(pins[0]);
     expect(onLocate).not.toHaveBeenCalled();
+  });
+
+  it('keeps the compact entry visible with a zero count', () => {
+    render(<MessagePinsBar pins={[]} currentSessionName="deck_current" onLocate={vi.fn()} onUnpin={vi.fn()} />);
+    expect(screen.getByTestId('message-pins-trigger').textContent).toBe('📌0');
   });
 });

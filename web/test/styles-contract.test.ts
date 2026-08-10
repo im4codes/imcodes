@@ -26,6 +26,22 @@ describe('styles.css regression contracts', () => {
     expect(dismissRule).toMatch(/cursor:\s*pointer/);
   });
 
+  it('keeps pinned messages as a compact titlebar counter with an overlay list', () => {
+    const barRule = css.match(/\.message-pins-bar\s*\{[^}]*\}/)?.[0];
+    expect(barRule).toBeTruthy();
+    expect(barRule).toMatch(/display:\s*inline-flex/);
+    expect(barRule).not.toMatch(/margin:/);
+
+    const triggerRule = css.match(/\.message-pins-summary\s*\{[^}]*\}/)?.[0];
+    expect(triggerRule).toBeTruthy();
+    expect(triggerRule).toMatch(/height:\s*24px/);
+    expect(triggerRule).toMatch(/width:\s*auto/);
+
+    const panelRule = css.match(/\.message-pins-panel\s*\{[^}]*\}/)?.[0];
+    expect(panelRule).toBeTruthy();
+    expect(panelRule).toMatch(/position:\s*absolute/);
+  });
+
   it('keeps long delegation replies at content height inside the chat flex scroller', () => {
     const rule = cssWithoutComments.match(/\.delegation-reply-card\s*\{[^}]*\}/)?.[0];
     expect(rule).toBeTruthy();

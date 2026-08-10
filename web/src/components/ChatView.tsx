@@ -3038,6 +3038,7 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
               padding: '4px 8px',
               minHeight: 30,
               flexShrink: 0,
+              position: 'relative',
               borderBottom: '1px solid rgba(51,65,85,0.5)',
               background: 'rgba(15,23,42,0.35)',
             }}
@@ -3053,23 +3054,23 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
               onOpenRepo={onViewRepo}
               className="session-repo-branch-summary-chat-titlebar"
             />
+            {pinsEnabled && sessionId && (
+              <MessagePinsBar
+                pins={messagePins.pins}
+                currentSessionName={sessionId}
+                loading={messagePins.loading}
+                mutating={messagePins.mutating}
+                error={messagePins.error}
+                locateError={pinnedLocateError}
+                onLocate={(pin) => { void locatePinnedMessage(pin); }}
+                onUnpin={(pin) => { void messagePins.unpinMessage(pin); }}
+                onDismissError={() => {
+                  messagePins.clearError();
+                  setPinnedLocateError(false);
+                }}
+              />
+            )}
           </div>
-        )}
-        {pinsEnabled && sessionId && (
-          <MessagePinsBar
-            pins={messagePins.pins}
-            currentSessionName={sessionId}
-            loading={messagePins.loading}
-            mutating={messagePins.mutating}
-            error={messagePins.error}
-            locateError={pinnedLocateError}
-            onLocate={(pin) => { void locatePinnedMessage(pin); }}
-            onUnpin={(pin) => { void messagePins.unpinMessage(pin); }}
-            onDismissError={() => {
-              messagePins.clearError();
-              setPinnedLocateError(false);
-            }}
-          />
         )}
         {showRefreshOverlay && (
           <div

@@ -32,7 +32,6 @@ export function MessagePinsBar({
     [currentSessionName, pins],
   );
   const visiblePins = tab === 'current' ? currentPins : pins;
-  if (!loading && pins.length === 0 && !error) return null;
 
   return (
     <section class={`message-pins-bar${expanded ? ' expanded' : ''}`} aria-label={t('messagePins.title')}>
@@ -41,10 +40,12 @@ export function MessagePinsBar({
         class="message-pins-summary"
         onClick={() => setExpanded((value) => !value)}
         aria-expanded={expanded}
+        aria-label={t('messagePins.summary', { current: currentPins.length, total: pins.length })}
+        title={t('messagePins.summary', { current: currentPins.length, total: pins.length })}
+        data-testid="message-pins-trigger"
       >
         <span aria-hidden="true">📌</span>
-        <span>{t('messagePins.summary', { current: currentPins.length, total: pins.length })}</span>
-        <span class="message-pins-chevron" aria-hidden="true">{expanded ? '▴' : '▾'}</span>
+        <span class="message-pins-count">{pins.length}</span>
       </button>
       {expanded && (
         <div class="message-pins-panel">

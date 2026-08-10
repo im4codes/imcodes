@@ -20,6 +20,10 @@ vi.mock('../../src/hooks/useMessagePins.js', () => ({
   }),
 }));
 
+vi.mock('../../src/session-repo-context-store.js', () => ({
+  useSessionRepoContext: () => ({ currentBranch: 'dev' }),
+}));
+
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
     i18n: { language: 'en' },
@@ -54,6 +58,28 @@ describe('ChatView message pin action', () => {
     Reflect.deleteProperty(window, 'ontouchstart');
   });
   afterEach(cleanup);
+
+  it('places the compact pin counter after the font and branch controls', () => {
+    const { container } = render(
+      <ChatView
+        events={[]}
+        loading={false}
+        sessionId="deck_pin_main"
+        serverId="srv-1"
+        workdir="/repo"
+        onViewRepo={vi.fn()}
+        messagePinsEnabled
+      />,
+    );
+    const titlebar = container.querySelector('.chat-titlebar');
+    const trigger = screen.getByTestId('message-pins-trigger');
+    expect(titlebar).not.toBeNull();
+    expect(titlebar!.children).toHaveLength(3);
+    expect(titlebar!.children[0]?.querySelector('[aria-label="Aa"]')).toBeTruthy();
+    expect(titlebar!.children[1]?.querySelector('.session-repo-branch-summary')).toBeTruthy();
+    expect(titlebar!.children[2]).toBe(trigger.closest('.message-pins-bar'));
+    expect(trigger.textContent).toBe('📌0');
+  });
 
   it('wires the message action menu to a session-scoped pin payload', async () => {
     const { container } = render(
