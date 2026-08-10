@@ -74,6 +74,7 @@ import { ControlledNodesPanel } from './components/ControlledNodesPanel.js';
 import { ContextDiagnosticsPanel } from './components/ContextDiagnosticsPanel.js';
 import { NewUserGuide, type NewUserGuideStep } from './components/NewUserGuide.js';
 import { TeamDiscussionGuide } from './components/TeamDiscussionGuide.js';
+import { FeatureAnnouncementHost } from './components/FeatureAnnouncement.js';
 import { mergeUsageUpdate } from './usage-data.js';
 import { ServerIconBar } from './components/ServerIconBar.js';
 import { Sidebar, loadSidebarCollapsed, saveSidebarCollapsed } from './components/Sidebar.js';
@@ -1498,6 +1499,7 @@ export function App() {
   }, [setPinnedTabsArr]);
   const [newUserGuidePref, setNewUserGuidePref] = useSyncedPreference<NewUserGuidePref>('new_user_guide', DEFAULT_NEW_USER_GUIDE_PREF, 0);
   const [teamDiscussionGuidePref, setTeamDiscussionGuidePref] = useSyncedPreference<TeamDiscussionGuidePref>('team_discussion_guide', DEFAULT_TEAM_DISCUSSION_GUIDE_PREF, 0);
+  const [featureAnnouncementsPending, setFeatureAnnouncementsPending] = useState(true);
   const [showNewUserGuidePrompt, setShowNewUserGuidePrompt] = useState(false);
   const [showNewUserGuide, setShowNewUserGuide] = useState(false);
   const [guidePromptSnoozed, setGuidePromptSnoozed] = useState(false);
@@ -4744,20 +4746,32 @@ export function App() {
       ],
     },
   ], []);
+  const featureAnnouncementBlocked = showNewUserGuidePrompt
+    || showNewUserGuide
+    || showNewSession
+    || showSubDialog
+    || showRepoPage
+    || showSettingsPage
+    || showUsageSummaryPage
+    || showCronManager
+    || showAdminPage
+    || showSharedContextManagement
+    || showControlledNodes
+    || showSharedContextDiagnostics
+    || showDiscussionsPage
+    || showDiscussionDialog
+    || settingsTarget !== null
+    || cloneSessionTarget !== null
+    || shareDialogTarget !== null
+    || deleteTarget !== null
+    || pendingQuestion !== null
+    || appUpdateNotice?.required === true;
   const showTeamDiscussionGuide = shouldShowTeamDiscussionGuide(
     teamDiscussionGuidePref,
     sessionsLoaded,
     sessions.length,
-    showNewUserGuidePrompt
-      || showNewUserGuide
-      || showNewSession
-      || showSubDialog
-      || showRepoPage
-      || showSettingsPage
-      || showCronManager
-      || showAdminPage
-      || showDiscussionsPage
-      || showDiscussionDialog
+    featureAnnouncementsPending
+      || featureAnnouncementBlocked
       || !activeSession,
   );
 
@@ -6292,6 +6306,15 @@ export function App() {
           setGuidePromptSnoozed(true);
           setNewUserGuidePref((prev) => ({ ...prev, pending: false, completed: true }));
         }}
+      />
+
+      <FeatureAnnouncementHost
+        key={auth.userId}
+        userId={auth.userId}
+        sessionsLoaded={sessionsLoaded}
+        hasActiveSession={!!activeSessionInfo}
+        blockedByModal={featureAnnouncementBlocked}
+        onPendingChange={setFeatureAnnouncementsPending}
       />
 
       <TeamDiscussionGuide

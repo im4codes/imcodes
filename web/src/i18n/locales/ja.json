@@ -2882,6 +2882,11 @@
     "acknowledge": "閉じる",
     "cancel_pending": "キャンセル"
   },
+  "featureAnnouncements": {
+    "label": "新機能",
+    "messagePins": "メッセージを右クリックすると固定できます。モバイルでは長押ししてください。",
+    "dismiss": "了解"
+  },
   "messagePins": {
     "title": "固定メッセージ",
     "summary": "固定 · 現在 {{current}} / すべて {{total}}",

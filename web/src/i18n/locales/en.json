@@ -2883,6 +2883,11 @@
     "acknowledge": "Dismiss",
     "cancel_pending": "Cancel"
   },
+  "featureAnnouncements": {
+    "label": "New feature",
+    "messagePins": "Right-click a message to pin it. On mobile, press and hold.",
+    "dismiss": "Got it"
+  },
   "messagePins": {
     "title": "Pinned messages",
     "summary": "Pinned · current {{current}} / all {{total}}",

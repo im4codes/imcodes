@@ -2883,6 +2883,11 @@
     "acknowledge": "關閉",
     "cancel_pending": "取消"
   },
+  "featureAnnouncements": {
+    "label": "新功能",
+    "messagePins": "在訊息上按右鍵即可固定；行動裝置請長按訊息。",
+    "dismiss": "知道了"
+  },
   "messagePins": {
     "title": "固定訊息",
     "summary": "固定訊息 · 目前 {{current}} / 全部 {{total}}",

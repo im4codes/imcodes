@@ -202,7 +202,10 @@ vi.mock('../src/hooks/usePref.js', () => ({
 vi.mock('../src/hooks/useSyncedPreference.js', async () => {
   const { useState } = await vi.importActual<typeof import('preact/hooks')>('preact/hooks');
   return {
-    useSyncedPreference: (_key: string, initial: unknown) => useState(initial),
+    useSyncedPreference: (_key: string, initial: unknown) => {
+      const [value, setValue] = useState(initial);
+      return [value, setValue, true];
+    },
   };
 });
 
@@ -792,6 +795,9 @@ describe('App shell', () => {
     expect(view.container.textContent).toContain('session-pane:deck_alpha_brain');
     expect(view.container.textContent).toContain('session-tree');
     expect(ws.connect).toHaveBeenCalled();
+    expect(screen.getByText('featureAnnouncements.messagePins')).toBeTruthy();
+    fireEvent.click(screen.getByText('featureAnnouncements.dismiss'));
+    await waitFor(() => expect(screen.queryByTestId('feature-announcement')).toBeNull());
   }, 20_000);
 
   it('opens the session named by an all-pins navigation request', async () => {

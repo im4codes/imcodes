@@ -5717,6 +5717,15 @@ html.native-ios-mac .chat-dl-btn {
 .onboarding-step { font-size: 11px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase; color: #60a5fa; }
 .onboarding-title { font-size: 17px; font-weight: 700; color: #f8fafc; }
 .onboarding-body { display: flex; flex-direction: column; gap: 8px; font-size: 13px; line-height: 1.6; color: #cbd5e1; }
+.feature-announcement { position: fixed; left: 50%; bottom: calc(18px + var(--sab, 0px)); transform: translateX(-50%); z-index: 10004; width: min(520px, calc(100vw - 24px)); display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 11px 12px 11px 14px; border: 1px solid rgba(96, 165, 250, 0.42); border-radius: 12px; background: rgba(15, 23, 42, 0.97); color: #dbeafe; box-shadow: 0 18px 48px rgba(2, 6, 23, 0.48), 0 0 24px rgba(37, 99, 235, 0.14); }
+.feature-announcement-message { display: flex; align-items: center; gap: 9px; min-width: 0; font-size: 13px; line-height: 1.45; }
+.feature-announcement-icon { flex: 0 0 auto; font-size: 17px; }
+.feature-announcement-dismiss { flex: 0 0 auto; min-height: 30px; border: 1px solid rgba(96, 165, 250, 0.38); border-radius: 8px; background: rgba(37, 99, 235, 0.24); color: #dbeafe; padding: 5px 10px; font: inherit; font-size: 12px; font-weight: 700; cursor: pointer; }
+.feature-announcement-dismiss:hover { background: rgba(37, 99, 235, 0.38); color: #fff; }
+@media (max-width: 520px) {
+  .feature-announcement { align-items: flex-start; gap: 10px; }
+  .feature-announcement-message { font-size: 12.5px; }
+}
 .team-discussion-guide { position: fixed; z-index: 10003; background: linear-gradient(180deg, rgba(15, 23, 42, 0.98), rgba(17, 24, 39, 0.98)); border: 1px solid rgba(96, 165, 250, 0.42); border-radius: 12px; padding: 14px 14px 12px; color: #dbeafe; box-shadow: 0 18px 48px rgba(2, 6, 23, 0.48), 0 0 0 1px rgba(14, 165, 233, 0.10), 0 0 28px rgba(37, 99, 235, 0.16); }
 .team-discussion-guide::before { content: ''; position: absolute; inset: 0; pointer-events: none; border-radius: inherit; background: linear-gradient(135deg, rgba(125, 211, 252, 0.13), transparent 36%, rgba(168, 85, 247, 0.08)); }
 .team-discussion-guide-arrow { position: absolute; width: 16px; height: 16px; background: rgba(15, 23, 42, 0.98); border: 1px solid rgba(96, 165, 250, 0.42); transform: rotate(45deg); }

@@ -2883,6 +2883,11 @@
     "acknowledge": "Cerrar",
     "cancel_pending": "Cancelar"
   },
+  "featureAnnouncements": {
+    "label": "Nueva función",
+    "messagePins": "Haz clic derecho en un mensaje para fijarlo. En móvil, mantenlo pulsado.",
+    "dismiss": "Entendido"
+  },
   "messagePins": {
     "title": "Mensajes fijados",
     "summary": "Fijados · actual {{current}} / todos {{total}}",

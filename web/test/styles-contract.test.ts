@@ -14,6 +14,18 @@ describe('styles.css regression contracts', () => {
   const css = readFileSync(resolve(__dirname, '../src/styles.css'), 'utf8');
   const cssWithoutComments = css.replace(/\/\*[\s\S]*?\*\//g, '');
 
+  it('keeps feature announcements visible and dismissible on desktop and mobile', () => {
+    const announcementRule = css.match(/\.feature-announcement\s*\{[^}]*\}/)?.[0];
+    expect(announcementRule).toBeTruthy();
+    expect(announcementRule).toMatch(/position:\s*fixed/);
+    expect(announcementRule).toMatch(/z-index:\s*10004/);
+    expect(announcementRule).not.toMatch(/display:\s*none/);
+
+    const dismissRule = css.match(/\.feature-announcement-dismiss\s*\{[^}]*\}/)?.[0];
+    expect(dismissRule).toBeTruthy();
+    expect(dismissRule).toMatch(/cursor:\s*pointer/);
+  });
+
   it('keeps long delegation replies at content height inside the chat flex scroller', () => {
     const rule = cssWithoutComments.match(/\.delegation-reply-card\s*\{[^}]*\}/)?.[0];
     expect(rule).toBeTruthy();
