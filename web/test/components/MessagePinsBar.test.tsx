@@ -55,6 +55,8 @@ describe('MessagePinsBar', () => {
     expect(screen.getByText('deck_other')).toBeTruthy();
     fireEvent.click(screen.getByText('pinned a3'));
     expect(onLocate).toHaveBeenCalledWith(pins[2]);
+    expect(trigger.getAttribute('aria-expanded')).toBe('false');
+    expect(screen.queryByText('pinned a3')).toBeNull();
   });
 
   it('keeps removal separate from navigation', () => {

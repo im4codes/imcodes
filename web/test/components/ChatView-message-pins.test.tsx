@@ -104,7 +104,7 @@ describe('ChatView message pin action', () => {
     });
   });
 
-  it('locates a pinned assistant event even when history merges it under an earlier block id', async () => {
+  it('locates a merged pinned event by scrolling only the chat viewport', async () => {
     const scrollIntoView = vi.fn();
     const original = Element.prototype.scrollIntoView;
     Element.prototype.scrollIntoView = scrollIntoView;
@@ -131,6 +131,18 @@ describe('ChatView message pin action', () => {
           messagePinsEnabled
         />,
       );
+      await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+      const viewport = document.querySelector('.chat-view') as HTMLElement;
+      const target = document.querySelector('[data-event-id="assistant-first"]') as HTMLElement;
+      const scrollTo = vi.fn();
+      viewport.scrollTo = scrollTo;
+      Object.defineProperties(viewport, {
+        clientHeight: { configurable: true, value: 400 },
+        scrollHeight: { configurable: true, value: 1_200 },
+        scrollTop: { configurable: true, writable: true, value: 100 },
+      });
+      viewport.getBoundingClientRect = () => ({ top: 50, bottom: 450, height: 400, left: 0, right: 600, width: 600, x: 0, y: 50, toJSON: () => ({}) });
+      target.getBoundingClientRect = () => ({ top: 550, bottom: 590, height: 40, left: 0, right: 600, width: 600, x: 0, y: 550, toJSON: () => ({}) });
       requestMessagePinNavigation({
         id: 'pin-assistant',
         serverId: 'srv-1',
@@ -142,8 +154,13 @@ describe('ChatView message pin action', () => {
         createdAt: 1,
         updatedAt: 1,
       });
-      await waitFor(() => expect(scrollIntoView).toHaveBeenCalledTimes(1));
-      expect(document.querySelector('[data-event-id="assistant-first"]')).not.toBeNull();
+      await waitFor(() => expect(scrollTo).toHaveBeenCalledTimes(1));
+      const scrollOptions = scrollTo.mock.calls[0]?.[0] as ScrollToOptions;
+      expect(scrollOptions.behavior).toBe('smooth');
+      expect(scrollOptions.top).toBeGreaterThanOrEqual(0);
+      expect(scrollOptions.top).toBeLessThanOrEqual(800);
+      expect(scrollIntoView).not.toHaveBeenCalled();
+      expect(target).not.toBeNull();
       expect(document.querySelector('[data-event-id="assistant-pinned"]')).toBeNull();
     } finally {
       Element.prototype.scrollIntoView = original;

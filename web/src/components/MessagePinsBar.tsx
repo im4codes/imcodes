@@ -80,7 +80,10 @@ export function MessagePinsBar({
             <div class="message-pins-list">
               {visiblePins.map((pin) => (
                 <div class="message-pin-row" key={pin.id}>
-                  <button type="button" class="message-pin-open" onClick={() => onLocate(pin)}>
+                  <button type="button" class="message-pin-open" onClick={() => {
+                    setExpanded(false);
+                    onLocate(pin);
+                  }}>
                     {tab === 'all' && <span class="message-pin-session">{pin.sessionName}</span>}
                     <span class="message-pin-text">{pin.text}</span>
                     <span class="message-pin-meta">

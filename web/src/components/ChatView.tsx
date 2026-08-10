@@ -1258,6 +1258,23 @@ function findEventElement(root: ParentNode, eventId: string): HTMLElement | null
   return null;
 }
 
+/** Center a message inside the chat's own scroll viewport. `scrollIntoView`
+ * also scrolls every eligible ancestor, which can move a floating chat window
+ * and push its titlebar (including the pin control) out of view. */
+function scrollEventWithinChat(container: HTMLElement, target: HTMLElement, behavior: ScrollBehavior): void {
+  const containerRect = container.getBoundingClientRect();
+  const targetRect = target.getBoundingClientRect();
+  const targetTop = container.scrollTop + targetRect.top - containerRect.top;
+  const centerOffset = Math.max(0, (container.clientHeight - targetRect.height) / 2);
+  const maxTop = Math.max(0, container.scrollHeight - container.clientHeight);
+  const top = Math.min(maxTop, Math.max(0, targetTop - centerOffset));
+  if (typeof container.scrollTo === 'function') {
+    container.scrollTo({ top, behavior });
+  } else {
+    container.scrollTop = top;
+  }
+}
+
 /** Walk up the DOM from `start` and return the nearest ancestor that actually
  *  scrolls (overflow-y is `auto` or `scroll` AND the element has extra scroll
  *  height beyond its clientHeight). Used by the pinned-last-sent banner to
@@ -2121,11 +2138,12 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
     setRenderItemLimit((current) => Math.max(current, requiredTailItems));
     const frame = requestAnimationFrame(() => {
       const root = scrollRef.current;
-      const target = root ? findEventElement(root, targetDomEventId) : null;
+      if (!root) return;
+      const target = findEventElement(root, targetDomEventId);
       if (!target) return;
       const reducedMotion = typeof window.matchMedia === 'function'
         && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-      target.scrollIntoView({ behavior: reducedMotion ? 'auto' : 'smooth', block: 'center' });
+      scrollEventWithinChat(root, target, reducedMotion ? 'auto' : 'smooth');
       target.classList.add('chat-pin-located');
       window.setTimeout(() => target.classList.remove('chat-pin-located'), 1_800);
       clearPendingMessagePin(pendingPinnedLocate.id);
