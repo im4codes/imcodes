@@ -2748,27 +2748,6 @@ export function App() {
   // bringSubToFront so the callback can close over it). Just sync each render.
   subSessionsRef.current = subSessions;
 
-  useEffect(() => {
-    const openPinnedMessageSession = (pin: MessagePin) => {
-      if (pin.serverId !== selectedServerId) return;
-      const sub = subSessionsRef.current.find((candidate) => candidate.sessionName === pin.sessionName);
-      if (sub) {
-        if (sub.parentSession && sub.parentSession !== activeSessionRef.current) {
-          setActiveSession(sub.parentSession, { keepSubWindows: true });
-        }
-        openSubSessionWindow(sub.id);
-        return;
-      }
-      if (sessions.some((session) => session.name === pin.sessionName)) {
-        setActiveSession(pin.sessionName);
-      }
-    };
-    const unsubscribe = subscribeMessagePinNavigation(openPinnedMessageSession);
-    const pending = peekPendingMessagePin();
-    if (pending) openPinnedMessageSession(pending);
-    return unsubscribe;
-  }, [openSubSessionWindow, selectedServerId, sessions, setActiveSession, subSessions]);
-
   // Auto-navigate to the session that raised an AskUserQuestion so the operator
   // sees its context (the card itself is a global overlay, but the underlying
   // view should follow). Runs once per question (tracked by toolUseId).
@@ -4429,13 +4408,23 @@ export function App() {
   });
   const [pendingPrefills, setPendingPrefills] = useState<Record<string, string>>({});
 
+  const resolveNavigationSubSession = useCallback((sessionName: string, candidates: readonly SubSession[]) => {
+    const exact = candidates.find((candidate) => candidate.sessionName === sessionName);
+    if (exact) return { isSubSession: true, sub: exact };
+
+    const idMatch = sessionName.match(/^deck_sub_(.+)$/);
+    return {
+      isSubSession: !!idMatch,
+      sub: idMatch ? candidates.find((candidate) => candidate.id === idMatch[1]) : undefined,
+    };
+  }, []);
+
   // Helper: navigate to a session (main or sub) without reload.
   // For sub-sessions, if sub-session data isn't loaded yet, queues a pending nav.
   const navigateToSession = useCallback((session: string, quote?: string) => {
-    const subMatch = session.match(/^deck_sub_(.+)$/);
-    if (subMatch) {
-      const subId = subMatch[1];
-      const sub = subSessionsRef.current.find((s) => s.id === subId);
+    const target = resolveNavigationSubSession(session, subSessionsRef.current);
+    if (target.isSubSession) {
+      const sub = target.sub;
       if (!sub) {
         // Sub-sessions not loaded yet — queue for retry when they arrive
         setPendingNav({ session, quote });
@@ -4446,8 +4435,8 @@ export function App() {
         safeLocalStorageSetItem('rcc_session', sub.parentSession);
         setActiveSession(sub.parentSession, { keepSubWindows: true });
       }
-      setOpenSubIds((prev) => new Set([...prev, subId]));
-      bringSubToFront(subId);
+      setOpenSubIds((prev) => new Set([...prev, sub.id]));
+      bringSubToFront(sub.id);
     } else {
       safeLocalStorageSetItem('rcc_session', session);
       setActiveSession(session);
@@ -4456,26 +4445,34 @@ export function App() {
       const quoteText = `${quote.trim().split('\n').map((l: string) => `> ${l}`).join('\n')}\n`;
       setPendingPrefills((prev) => ({ ...prev, [session]: (prev[session] || '') + quoteText }));
     }
-  }, [setActiveSession, bringSubToFront]);
+  }, [setActiveSession, bringSubToFront, resolveNavigationSubSession]);
 
   const navigateToSessionRef = useRef(navigateToSession);
   navigateToSessionRef.current = navigateToSession;
 
+  // Message pins use the exact same activation path as notification clicks.
+  // This keeps parent activation, already-open window fronting, and the
+  // not-yet-loaded sub-session retry queue in one authoritative workflow.
+  useEffect(() => {
+    const navigateToPinnedMessage = (pin: MessagePin) => {
+      if (pin.serverId !== selectedServerId) return;
+      navigateToSession(pin.sessionName);
+    };
+    const unsubscribe = subscribeMessagePinNavigation(navigateToPinnedMessage);
+    const pending = peekPendingMessagePin();
+    if (pending) navigateToPinnedMessage(pending);
+    return unsubscribe;
+  }, [navigateToSession, selectedServerId]);
+
   // Reactive: when sub-sessions load and we have a pending nav, retry navigation
   useEffect(() => {
     if (!pendingNav) return;
-    const subMatch = pendingNav.session.match(/^deck_sub_(.+)$/);
-    if (!subMatch) {
-      navigateToSession(pendingNav.session, pendingNav.quote);
-      setPendingNav(null);
-      return;
-    }
-    const sub = subSessions.find((s) => s.id === subMatch[1]);
-    if (sub) {
+    const target = resolveNavigationSubSession(pendingNav.session, subSessions);
+    if (!target.isSubSession || target.sub) {
       navigateToSession(pendingNav.session, pendingNav.quote);
       setPendingNav(null);
     }
-  }, [pendingNav, subSessions, navigateToSession]);
+  }, [pendingNav, subSessions, navigateToSession, resolveNavigationSubSession]);
 
   // Safety timeout: if pending nav isn't resolved within 8s, clear it
   useEffect(() => {

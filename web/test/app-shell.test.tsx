@@ -877,6 +877,70 @@ describe('App shell', () => {
     expect(await screen.findByTestId('sub-session-window-sub-1')).toBeTruthy();
   }, 20_000);
 
+  it('fronts an already-open sub-session selected from another window pin list', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    useSubSessionsState.subSessions = [
+      {
+        id: 'sub-1',
+        sessionName: 'deck_sub_alpha_helper',
+        parentSession: 'deck_alpha_brain',
+        label: 'Helper',
+        description: 'Helper session',
+        cwd: '/work/alpha',
+        type: 'codex-sdk',
+        runtimeType: 'transport',
+        state: 'idle',
+        serverId: 'srv-1',
+      },
+      {
+        id: 'sub-2',
+        sessionName: 'deck_sub_alpha_reviewer',
+        parentSession: 'deck_alpha_brain',
+        label: 'Reviewer',
+        description: 'Reviewer session',
+        cwd: '/work/alpha',
+        type: 'codex-sdk',
+        runtimeType: 'transport',
+        state: 'idle',
+        serverId: 'srv-1',
+      },
+    ];
+    useSubSessionsState.visibleSubSessions = useSubSessionsState.subSessions;
+
+    const { App } = await importApp();
+    render(<App />);
+    await waitFor(() => expect(wsInstances.length).toBe(1));
+
+    fireEvent.click(screen.getByText('subbar-open-sub-1'));
+    const first = await screen.findByTestId('sub-session-window-sub-1');
+    fireEvent.click(screen.getByText('subbar-open-sub-2'));
+    const second = await screen.findByTestId('sub-session-window-sub-2');
+    await waitFor(() => expect(second.getAttribute('data-active')).toBe('true'));
+
+    const { requestMessagePinNavigation } = await import('../src/message-pin-navigation.js');
+    act(() => requestMessagePinNavigation({
+      id: 'pin-sub-front',
+      serverId: 'srv-1',
+      sessionName: 'deck_sub_alpha_helper',
+      eventId: 'event-sub-front',
+      eventTs: 123,
+      eventType: 'assistant.text',
+      text: 'Pinned in the background helper window',
+      createdAt: 123,
+      updatedAt: 123,
+    }));
+
+    await waitFor(() => {
+      const firstNow = screen.getByTestId('sub-session-window-sub-1');
+      const secondNow = screen.getByTestId('sub-session-window-sub-2');
+      expect(firstNow.getAttribute('data-active')).toBe('true');
+      expect(secondNow.getAttribute('data-active')).toBe('false');
+      expect(Number((firstNow as HTMLElement).style.zIndex)).toBeGreaterThan(Number((secondNow as HTMLElement).style.zIndex));
+    });
+  }, 20_000);
+
   it('opens controlled-node management above sub-session windows and re-fronts it from the sidebar', async () => {
     localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
     localStorage.setItem('rcc_server', 'srv-1');
