@@ -7,6 +7,7 @@ import { P2P_WORKFLOW_MSG } from '@shared/p2p-workflow-messages.js';
 
 const {
   apiFetchMock,
+  chatScrollMock,
   discoverSharedEntriesMock,
   fetchMeMock,
   listP2pRunsMock,
@@ -15,6 +16,7 @@ const {
   useSubSessionsState,
 } = vi.hoisted(() => ({
   apiFetchMock: vi.fn(),
+  chatScrollMock: vi.fn(),
   discoverSharedEntriesMock: vi.fn(),
   fetchMeMock: vi.fn(),
   listP2pRunsMock: vi.fn(),
@@ -372,7 +374,7 @@ vi.mock('../src/components/SessionPane.js', () => ({
       <button onClick={() => onFitFn?.(vi.fn())}>pane-fit-ref</button>
       <button onClick={() => onScrollBottomFn?.(vi.fn())}>pane-scroll-ref</button>
       <button onClick={() => onFocusFn?.(vi.fn())}>pane-focus-ref</button>
-      <button onClick={() => onChatScrollFn?.(vi.fn())}>pane-chat-ref</button>
+      <button onClick={() => onChatScrollFn?.(chatScrollMock)}>pane-chat-ref</button>
       <button onClick={() => onInputRef?.(document.createElement('div'))}>pane-input-ref</button>
       <button onClick={() => onDiff?.(vi.fn())}>pane-diff-ref</button>
       <button onClick={() => onHistory?.(vi.fn())}>pane-history-ref</button>
@@ -670,6 +672,7 @@ beforeEach(() => {
   useSubSessionsState.subSessions = [];
   useSubSessionsState.visibleSubSessions = [];
   useSubSessionsState.loadedServerId = 'srv-1';
+  chatScrollMock.mockReset();
   fetchMeMock.mockResolvedValue({
     id: 'user-1',
     is_admin: true,
@@ -938,6 +941,53 @@ describe('App shell', () => {
       expect(firstNow.getAttribute('data-active')).toBe('true');
       expect(secondNow.getAttribute('data-active')).toBe('false');
       expect(Number((firstNow as HTMLElement).style.zIndex)).toBeGreaterThan(Number((secondNow as HTMLElement).style.zIndex));
+    });
+  }, 20_000);
+
+  it('hides the source sub-session when its pin list navigates to a main session', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    useSubSessionsState.subSessions = [{
+      id: 'sub-1',
+      sessionName: 'deck_sub_alpha_helper',
+      parentSession: 'deck_alpha_brain',
+      label: 'Helper',
+      description: 'Helper session',
+      cwd: '/work/alpha',
+      type: 'codex-sdk',
+      runtimeType: 'transport',
+      state: 'idle',
+      serverId: 'srv-1',
+    }];
+    useSubSessionsState.visibleSubSessions = useSubSessionsState.subSessions;
+
+    const { App } = await importApp();
+    render(<App />);
+    await waitFor(() => expect(wsInstances.length).toBe(1));
+
+    fireEvent.click(screen.getByText('subbar-open-sub-1'));
+    expect(await screen.findByTestId('sub-session-window-sub-1')).toBeTruthy();
+    fireEvent.click(screen.getByText('pane-chat-ref'));
+    chatScrollMock.mockClear();
+
+    const { requestMessagePinNavigation } = await import('../src/message-pin-navigation.js');
+    act(() => requestMessagePinNavigation({
+      id: 'pin-main-from-sub',
+      serverId: 'srv-1',
+      sessionName: 'deck_alpha_brain',
+      eventId: 'event-main-from-sub',
+      eventTs: 123,
+      eventType: 'assistant.text',
+      text: 'Pinned in the parent main session',
+      createdAt: 123,
+      updatedAt: 123,
+    }, 'deck_sub_alpha_helper'));
+
+    await waitFor(() => {
+      expect(screen.queryByTestId('sub-session-window-sub-1')).toBeNull();
+      expect(screen.getByTestId('session-pane-deck_alpha_brain')).toBeTruthy();
+      expect(chatScrollMock).not.toHaveBeenCalled();
     });
   }, 20_000);
 

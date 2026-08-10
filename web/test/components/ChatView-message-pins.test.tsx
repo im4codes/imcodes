@@ -1,16 +1,18 @@
 /** @vitest-environment jsdom */
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/preact';
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/preact';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { h } from 'preact';
 import type { TimelineEvent } from '../../src/ws-client.js';
+import type { MessagePin } from '../../../shared/message-pins.js';
 import { requestMessagePinNavigation } from '../../src/message-pin-navigation.js';
 
 const pinMessageMock = vi.hoisted(() => vi.fn());
 const unpinMessageMock = vi.hoisted(() => vi.fn());
+const messagePinsState = vi.hoisted(() => ({ pins: [] as MessagePin[] }));
 
 vi.mock('../../src/hooks/useMessagePins.js', () => ({
   useMessagePins: () => ({
-    pins: [],
+    pins: messagePinsState.pins,
     loading: false,
     mutating: false,
     error: null,
@@ -55,6 +57,7 @@ describe('ChatView message pin action', () => {
   beforeEach(() => {
     pinMessageMock.mockReset().mockResolvedValue(null);
     unpinMessageMock.mockReset();
+    messagePinsState.pins = [];
     Reflect.deleteProperty(window, 'ontouchstart');
   });
   afterEach(cleanup);
@@ -164,6 +167,82 @@ describe('ChatView message pin action', () => {
       expect(document.querySelector('[data-event-id="assistant-pinned"]')).toBeNull();
     } finally {
       Element.prototype.scrollIntoView = original;
+    }
+  });
+
+  it('carries the source session and automatically locates a pin in another mounted chat', async () => {
+    const targetEvent: TimelineEvent = {
+      ...userEvent(),
+      eventId: 'event-in-target',
+      sessionId: 'deck_pin_target',
+      payload: { text: 'Pinned target message' },
+    };
+    messagePinsState.pins = [{
+      id: 'pin-in-target',
+      serverId: 'srv-1',
+      sessionName: 'deck_pin_target',
+      eventId: targetEvent.eventId,
+      eventTs: targetEvent.ts,
+      eventType: 'user.message',
+      text: 'Pinned target message',
+      createdAt: 1,
+      updatedAt: 1,
+    }];
+
+    const { getPendingMessagePin, subscribeMessagePinNavigation } = await import('../../src/message-pin-navigation.js');
+    const observedSources: Array<string | null> = [];
+    const unsubscribe = subscribeMessagePinNavigation((_pin, sourceSessionName) => {
+      observedSources.push(sourceSessionName);
+    });
+
+    try {
+      render(
+        <div>
+          <div data-testid="source-chat">
+            <ChatView
+              events={[]}
+              loading={false}
+              sessionId="deck_pin_source"
+              serverId="srv-1"
+              messagePinsEnabled
+            />
+          </div>
+          <div data-testid="target-chat">
+            <ChatView
+              events={[targetEvent]}
+              loading={false}
+              sessionId="deck_pin_target"
+              serverId="srv-1"
+              messagePinsEnabled
+            />
+          </div>
+        </div>,
+      );
+      await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+
+      const targetChat = screen.getByTestId('target-chat');
+      const viewport = targetChat.querySelector('.chat-view') as HTMLElement;
+      const target = targetChat.querySelector('[data-event-id="event-in-target"]') as HTMLElement;
+      const scrollTo = vi.fn();
+      viewport.scrollTo = scrollTo;
+      Object.defineProperties(viewport, {
+        clientHeight: { configurable: true, value: 400 },
+        scrollHeight: { configurable: true, value: 1_200 },
+        scrollTop: { configurable: true, writable: true, value: 100 },
+      });
+      viewport.getBoundingClientRect = () => ({ top: 50, bottom: 450, height: 400, left: 0, right: 600, width: 600, x: 0, y: 50, toJSON: () => ({}) });
+      target.getBoundingClientRect = () => ({ top: 550, bottom: 590, height: 40, left: 0, right: 600, width: 600, x: 0, y: 550, toJSON: () => ({}) });
+
+      const sourceChat = within(screen.getByTestId('source-chat'));
+      fireEvent.click(sourceChat.getByTestId('message-pins-trigger'));
+      fireEvent.click(sourceChat.getByText('messagePins.allTab'));
+      fireEvent.click(sourceChat.getByText('Pinned target message'));
+
+      await waitFor(() => expect(scrollTo).toHaveBeenCalledTimes(1));
+      expect(observedSources).toContain('deck_pin_source');
+      expect(getPendingMessagePin('deck_pin_target')).toBeNull();
+    } finally {
+      unsubscribe();
     }
   });
 });

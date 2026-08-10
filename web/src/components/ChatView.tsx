@@ -2095,7 +2095,7 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
 
   const locatePinnedMessage = useCallback(async (pin: MessagePin) => {
     if (!sessionId || pin.sessionName !== sessionId) {
-      requestMessagePinNavigation(pin);
+      requestMessagePinNavigation(pin, sessionId);
       return;
     }
     if (pendingPinnedLocateIdRef.current === pin.id) return;

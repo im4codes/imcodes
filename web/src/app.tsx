@@ -97,7 +97,7 @@ import {
 import { LocalWebPreviewPanel } from './components/LocalWebPreviewPanel.js';
 import {
   clearMessagePinNavigation,
-  peekPendingMessagePin,
+  peekPendingMessagePinNavigation,
   subscribeMessagePinNavigation,
 } from './message-pin-navigation.js';
 import { clearMessagePinsCache } from './hooks/useMessagePins.js';
@@ -2192,7 +2192,10 @@ export function App() {
     }
   }, [previewFileRequest, selectedServerId, ensureDesktopWindow, removeDesktopWindow]);
 
-  const setActiveSession = useCallback((name: string | null, opts?: { keepSubWindows?: boolean }) => {
+  const setActiveSession = useCallback((
+    name: string | null,
+    opts?: { keepSubWindows?: boolean; scrollToBottom?: boolean },
+  ) => {
     if (name) safeLocalStorageSetItem('rcc_session', name);
     else safeLocalStorageRemoveItem('rcc_session');
     setActiveSessionState(name);
@@ -2211,7 +2214,9 @@ export function App() {
       }
     }
     // scroll chat to bottom on session switch (rAF gives ChatView time to mount)
-    if (name) requestAnimationFrame(() => chatScrollFnsRef.current.get(name)?.());
+    if (name && opts?.scrollToBottom !== false) {
+      requestAnimationFrame(() => chatScrollFnsRef.current.get(name)?.());
+    }
   }, [setOpenSubIds]);
 
   const selectMainSessionTab = useCallback((name: string) => {
@@ -4421,7 +4426,11 @@ export function App() {
 
   // Helper: navigate to a session (main or sub) without reload.
   // For sub-sessions, if sub-session data isn't loaded yet, queues a pending nav.
-  const navigateToSession = useCallback((session: string, quote?: string) => {
+  const navigateToSession = useCallback((
+    session: string,
+    quote?: string,
+    options?: { scrollToBottom?: boolean },
+  ) => {
     const target = resolveNavigationSubSession(session, subSessionsRef.current);
     if (target.isSubSession) {
       const sub = target.sub;
@@ -4433,13 +4442,16 @@ export function App() {
       // Activate parent main session first
       if (sub.parentSession) {
         safeLocalStorageSetItem('rcc_session', sub.parentSession);
-        setActiveSession(sub.parentSession, { keepSubWindows: true });
+        setActiveSession(sub.parentSession, {
+          keepSubWindows: true,
+          scrollToBottom: options?.scrollToBottom,
+        });
       }
       setOpenSubIds((prev) => new Set([...prev, sub.id]));
       bringSubToFront(sub.id);
     } else {
       safeLocalStorageSetItem('rcc_session', session);
-      setActiveSession(session);
+      setActiveSession(session, { scrollToBottom: options?.scrollToBottom });
     }
     if (quote) {
       const quoteText = `${quote.trim().split('\n').map((l: string) => `> ${l}`).join('\n')}\n`;
@@ -4454,15 +4466,26 @@ export function App() {
   // This keeps parent activation, already-open window fronting, and the
   // not-yet-loaded sub-session retry queue in one authoritative workflow.
   useEffect(() => {
-    const navigateToPinnedMessage = (pin: MessagePin) => {
+    const navigateToPinnedMessage = (pin: MessagePin, sourceSessionName: string | null) => {
       if (pin.serverId !== selectedServerId) return;
-      navigateToSession(pin.sessionName);
+      const target = resolveNavigationSubSession(pin.sessionName, subSessionsRef.current);
+      navigateToSession(pin.sessionName, undefined, { scrollToBottom: false });
+
+      // A pin selected from a floating sub-session can target its parent main
+      // chat. Hide only that source window so the newly activated main chat is
+      // actually visible; other open sub-session windows remain untouched.
+      if (!target.isSubSession && sourceSessionName) {
+        const sourceSub = subSessionsRef.current.find((candidate) => (
+          candidate.sessionName === sourceSessionName
+        ));
+        if (sourceSub) minimizeSubSessionWindow(sourceSub.id);
+      }
     };
     const unsubscribe = subscribeMessagePinNavigation(navigateToPinnedMessage);
-    const pending = peekPendingMessagePin();
-    if (pending) navigateToPinnedMessage(pending);
+    const pending = peekPendingMessagePinNavigation();
+    if (pending) navigateToPinnedMessage(pending.pin, pending.sourceSessionName);
     return unsubscribe;
-  }, [navigateToSession, selectedServerId]);
+  }, [minimizeSubSessionWindow, navigateToSession, resolveNavigationSubSession, selectedServerId]);
 
   // Reactive: when sub-sessions load and we have a pending nav, retry navigation
   useEffect(() => {
