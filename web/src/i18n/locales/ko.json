@@ -2882,6 +2882,20 @@
     "acknowledge": "닫기",
     "cancel_pending": "취소"
   },
+  "messagePins": {
+    "title": "고정 메시지",
+    "summary": "고정 · 현재 {{current}} / 전체 {{total}}",
+    "currentTab": "현재 ({{count}})",
+    "allTab": "전체 ({{count}})",
+    "noCurrent": "이 세션에 고정된 메시지가 없습니다",
+    "noPins": "고정된 메시지가 없습니다",
+    "pin": "메시지 고정",
+    "unpin": "고정 해제",
+    "userMessage": "사용자 메시지",
+    "assistantMessage": "어시스턴트 메시지",
+    "requestFailed": "고정 메시지 요청에 실패했습니다. 눌러서 닫으세요.",
+    "locateFailed": "원본 메시지를 불러올 수 없습니다. 눌러서 닫으세요."
+  },
   "peerAuditResult": {
     "title": "피어 감사 결과",
     "attributionAuditor": "감사자:{{auditor}}",

@@ -68,6 +68,20 @@ import { isPeerAuditRuntimeDisposition } from '@shared/peer-audit.js';
 import { AGENT_DELEGATION_REPLY_TIMELINE_EVENT } from '@shared/agent-delegation.js';
 import { parseTimelineDisplayText } from '../timeline-display-text.js';
 import {
+  MESSAGE_PIN_LIMITS,
+  isMessagePinEventType,
+  type MessagePin,
+  type MessagePinEventType,
+} from '@shared/message-pins.js';
+import { useMessagePins } from '../hooks/useMessagePins.js';
+import { MessagePinsBar } from './MessagePinsBar.js';
+import {
+  clearPendingMessagePin,
+  getPendingMessagePin,
+  requestMessagePinNavigation,
+  subscribeMessagePinNavigation,
+} from '../message-pin-navigation.js';
+import {
   deriveSdkSubagentStatusRows,
   type SdkSubagentDiagnostic,
   type SdkSubagentStatusRow,
@@ -120,6 +134,10 @@ interface Props {
   scopeFilesToSession?: boolean;
   /** Retry a failed optimistic send — called with the original commandId and text. */
   onResendFailed?: (commandId: string, text: string) => void;
+  /** Load the bounded timeline window around an old PostgreSQL-backed pin. */
+  onLoadMessageContext?: (eventId: string, eventTs: number) => Promise<boolean>;
+  /** Compact pinned panels reuse ChatView but intentionally omit message-pin chrome. */
+  messagePinsEnabled?: boolean;
 }
 
 /** A merged view item — a single event, assistant text, or a tool presentation. */
@@ -129,6 +147,8 @@ interface ViewItem {
   event?: TimelineEvent;
   /** Merged text for assistant-block */
   text?: string;
+  /** Source event ids represented by an assistant block (for old-pin locate). */
+  eventIds?: string[];
   assistantAutomation?: boolean;
   /** All events in a collapsed tool group (first, middle..., last) */
   toolEvents?: TimelineEvent[];
@@ -991,6 +1011,7 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
   let pendingFirstTs = 0;
   let pendingLastTs = 0;
   let pendingKey = '';
+  let pendingEventIds: string[] = [];
   let pendingAssistantAutomation = false;
   let pendingTools: TimelineEvent[] = [];
   let deferredEvents: TimelineEvent[] = [];
@@ -1001,11 +1022,13 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
         key: pendingKey,
         type: 'assistant-block',
         text: pendingText.join('\n'),
+        eventIds: [...pendingEventIds],
         assistantAutomation: pendingAssistantAutomation,
         ts: pendingFirstTs,
         lastTs: pendingLastTs,
       });
       pendingText = [];
+      pendingEventIds = [];
       pendingAssistantAutomation = false;
     }
   };
@@ -1054,6 +1077,7 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
       }
       pendingLastTs = event.ts;
       pendingText.push(text);
+      pendingEventIds.push(event.eventId);
     } else if (event.type === 'tool.call' || event.type === 'tool.result') {
       flushPending();
       pendingTools.push(event);
@@ -1572,7 +1596,7 @@ function SdkAgentsDiagnosticRow({ diagnostic }: { diagnostic: SdkSubagentDiagnos
   );
 }
 
-function ChatViewImpl({ events, loading, refreshing = false, historyStatus, loadingOlder, hasOlderHistory = true, onLoadOlder, sessionState, sessionId, onScrollBottomFn, preview, onPreviewFile, ws, onInsertPath, workdir, onViewRepo, serverId, onOpenLocalWebPreview, readOnlyFiles = false, scopeFilesToSession = false, onQuote, agentType: _agentType, onResendFailed, onForceSync }: Props) {
+function ChatViewImpl({ events, loading, refreshing = false, historyStatus, loadingOlder, hasOlderHistory = true, onLoadOlder, sessionState, sessionId, onScrollBottomFn, preview, onPreviewFile, ws, onInsertPath, workdir, onViewRepo, serverId, onOpenLocalWebPreview, readOnlyFiles = false, scopeFilesToSession = false, onQuote, agentType: _agentType, onResendFailed, onForceSync, onLoadMessageContext, messagePinsEnabled = false }: Props) {
   const { t, i18n } = useTranslation();
   const locale = resolveI18nLocale(i18n);
   const fileScopeSessionName = scopeFilesToSession ? (sessionId ?? undefined) : undefined;
@@ -1598,6 +1622,11 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
   highlightElRef.current = highlightEl;
   const [ctxMenu, setCtxMenu] = useState<SelectionMenu | null>(null);
   const ctxMenuRef = useRef<HTMLDivElement>(null);
+  const [pendingPinnedLocate, setPendingPinnedLocate] = useState<MessagePin | null>(null);
+  const pendingPinnedLocateIdRef = useRef<string | null>(null);
+  const timelineEventsRef = useRef(events);
+  timelineEventsRef.current = events;
+  const [pinnedLocateError, setPinnedLocateError] = useState(false);
   const [revealingOlder, setRevealingOlder] = useState(false);
   const revealingOlderTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Scroll anchor preservation: pre-prepend scrollHeight, restored after the
@@ -1613,6 +1642,8 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
   // the portion they want to copy.
   const [zoomText, setZoomText] = useState<string | null>(null);
   const [renderItemLimit, setRenderItemLimit] = useState(CHAT_INITIAL_RENDER_ITEM_LIMIT);
+  const pinsEnabled = messagePinsEnabled && !preview && !!serverId && !!sessionId;
+  const messagePins = useMessagePins(serverId, sessionId, pinsEnabled);
 
   const autoScrollRef = useRef(true);
   const [showScrollBtn, setShowScrollBtn] = useState(false);
@@ -2045,6 +2076,65 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
     [renderedViewItems],
   );
 
+  const locatePinnedMessage = useCallback(async (pin: MessagePin) => {
+    if (!sessionId || pin.sessionName !== sessionId) {
+      requestMessagePinNavigation(pin);
+      return;
+    }
+    if (pendingPinnedLocateIdRef.current === pin.id) return;
+    pendingPinnedLocateIdRef.current = pin.id;
+    setPinnedLocateError(false);
+    setPendingPinnedLocate(pin);
+    if (timelineEventsRef.current.some((event) => event.eventId === pin.eventId)) return;
+    if (!onLoadMessageContext || !await onLoadMessageContext(pin.eventId, pin.eventTs)) {
+      clearPendingMessagePin(pin.id);
+      pendingPinnedLocateIdRef.current = null;
+      setPendingPinnedLocate(null);
+      setPinnedLocateError(true);
+    }
+  }, [onLoadMessageContext, sessionId]);
+
+  useEffect(() => {
+    if (!pinsEnabled || !sessionId) return undefined;
+    const handleNavigation = (pin: MessagePin) => {
+      if (pin.sessionName === sessionId) void locatePinnedMessage(pin);
+    };
+    const pending = getPendingMessagePin(sessionId);
+    if (pending) void locatePinnedMessage(pending);
+    return subscribeMessagePinNavigation(handleNavigation);
+  }, [locatePinnedMessage, pinsEnabled, sessionId]);
+
+  useEffect(() => {
+    if (!pendingPinnedLocate) return undefined;
+    if (!events.some((event) => event.eventId === pendingPinnedLocate.eventId)) return undefined;
+    const targetItemIndex = viewItems.findIndex((item) => (
+      item.key === pendingPinnedLocate.eventId
+      || item.event?.eventId === pendingPinnedLocate.eventId
+      || item.eventIds?.includes(pendingPinnedLocate.eventId)
+    ));
+    if (targetItemIndex < 0) return undefined;
+    const targetDomEventId = viewItems[targetItemIndex]!.key;
+    // The renderer is tail-limited. Reveal only enough tail items to include
+    // the target instead of mounting a previously expanded 2,000-item history
+    // in one task (which would revive the multi-window freeze this UI avoids).
+    const requiredTailItems = viewItems.length - targetItemIndex;
+    setRenderItemLimit((current) => Math.max(current, requiredTailItems));
+    const frame = requestAnimationFrame(() => {
+      const root = scrollRef.current;
+      const target = root ? findEventElement(root, targetDomEventId) : null;
+      if (!target) return;
+      const reducedMotion = typeof window.matchMedia === 'function'
+        && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+      target.scrollIntoView({ behavior: reducedMotion ? 'auto' : 'smooth', block: 'center' });
+      target.classList.add('chat-pin-located');
+      window.setTimeout(() => target.classList.remove('chat-pin-located'), 1_800);
+      clearPendingMessagePin(pendingPinnedLocate.id);
+      pendingPinnedLocateIdRef.current = null;
+      setPendingPinnedLocate(null);
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [events, pendingPinnedLocate, renderedRevision, viewItems.length]);
+
   useEffect(() => {
     if (revealingOlderTimerRef.current) {
       clearTimeout(revealingOlderTimerRef.current);
@@ -2052,6 +2142,9 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
     }
     setRevealingOlder(false);
     setRenderItemLimit(CHAT_INITIAL_RENDER_ITEM_LIMIT);
+    pendingPinnedLocateIdRef.current = null;
+    setPendingPinnedLocate(null);
+    setPinnedLocateError(false);
   }, [sessionId]);
 
   useEffect(() => () => {
@@ -2873,6 +2966,16 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
   // `empty` is terminal like `done` — a cold local cache is not still working.
   const showHistoryProgress = !preview && historySteps.some((step) => step.state === 'pending' || step.state === 'running');
   const showRefreshOverlay = !preview && (showHistoryProgress || refreshing);
+  const contextMenuEvent = ctxMenu?.eventId
+    ? events.find((event) => event.eventId === ctxMenu.eventId)
+    : undefined;
+  const contextMenuPinEvent: (TimelineEvent & { type: MessagePinEventType }) | undefined = contextMenuEvent
+    && isMessagePinEventType(contextMenuEvent.type)
+    ? contextMenuEvent as TimelineEvent & { type: MessagePinEventType }
+    : undefined;
+  const contextMenuPin = contextMenuPinEvent
+    ? messagePins.pins.find((pin) => pin.sessionName === sessionId && pin.eventId === contextMenuPinEvent.eventId)
+    : undefined;
   return (
     <div class={`chat-view-wrap${hasRightPanel ? ' chat-split' : ''}`}>
       {(canShowAgentsControl || onForceSync || canShowFilePanel) && (
@@ -2951,6 +3054,22 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
               className="session-repo-branch-summary-chat-titlebar"
             />
           </div>
+        )}
+        {pinsEnabled && sessionId && (
+          <MessagePinsBar
+            pins={messagePins.pins}
+            currentSessionName={sessionId}
+            loading={messagePins.loading}
+            mutating={messagePins.mutating}
+            error={messagePins.error}
+            locateError={pinnedLocateError}
+            onLocate={(pin) => { void locatePinnedMessage(pin); }}
+            onUnpin={(pin) => { void messagePins.unpinMessage(pin); }}
+            onDismissError={() => {
+              messagePins.clearError();
+              setPinnedLocateError(false);
+            }}
+          />
         )}
         {showRefreshOverlay && (
           <div
@@ -3271,6 +3390,28 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
                 {t('common.quote_block', 'Quote All')}
               </button>
               </>
+            )}
+            {contextMenuPinEvent && (
+              <button
+                class="chat-sel-btn"
+                disabled={messagePins.mutating}
+                onClick={() => {
+                  if (contextMenuPin) {
+                    void messagePins.unpinMessage(contextMenuPin);
+                  } else {
+                    void messagePins.pinMessage({
+                      eventId: contextMenuPinEvent.eventId,
+                      eventTs: contextMenuPinEvent.ts,
+                      eventType: contextMenuPinEvent.type,
+                      text: ctxMenu.text.slice(0, MESSAGE_PIN_LIMITS.TEXT_CHARS),
+                    });
+                  }
+                  setCtxMenu(null);
+                  if (highlightEl) { highlightEl.classList.remove('chat-highlight'); setHighlightEl(null); }
+                }}
+              >
+                {contextMenuPin ? t('messagePins.unpin') : t('messagePins.pin')}
+              </button>
             )}
             {ctxMenu.eventId && ws && sessionId && (
               <button

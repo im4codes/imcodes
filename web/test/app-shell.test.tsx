@@ -794,6 +794,83 @@ describe('App shell', () => {
     expect(ws.connect).toHaveBeenCalled();
   }, 20_000);
 
+  it('opens the session named by an all-pins navigation request', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') return { id: 'user-1' };
+      if (path === '/api/server') return serverList();
+      if (path === '/api/server/srv-1/sessions') {
+        return {
+          sessions: [
+            ...sessionList().sessions,
+            { ...sessionList().sessions[0], name: 'deck_beta_brain', project_name: 'Beta', label: 'Beta Brain' },
+          ],
+        };
+      }
+      if (path.startsWith('/api/watch/sessions')) return { sessions: [] };
+      return {};
+    });
+
+    const { App } = await importApp();
+    const view = render(<App />);
+    await waitFor(() => expect(view.container.textContent).toContain('session-pane:deck_alpha_brain'));
+
+    const { requestMessagePinNavigation } = await import('../src/message-pin-navigation.js');
+    act(() => requestMessagePinNavigation({
+      id: 'pin-beta',
+      serverId: 'srv-1',
+      sessionName: 'deck_beta_brain',
+      eventId: 'event-beta',
+      eventTs: 123,
+      eventType: 'assistant.text',
+      text: 'Pinned in Beta',
+      createdAt: 123,
+      updatedAt: 123,
+    }));
+
+    await waitFor(() => expect(view.container.textContent).toContain('session-pane:deck_beta_brain'));
+  }, 20_000);
+
+  it('opens the sub-session window named by an all-pins navigation request', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    useSubSessionsState.subSessions = [{
+      id: 'sub-1',
+      sessionName: 'deck_sub_alpha_helper',
+      parentSession: 'deck_alpha_brain',
+      label: 'Helper',
+      description: 'Helper session',
+      cwd: '/work/alpha',
+      type: 'codex-sdk',
+      runtimeType: 'transport',
+      state: 'idle',
+      serverId: 'srv-1',
+    }];
+    useSubSessionsState.visibleSubSessions = useSubSessionsState.subSessions;
+
+    const { App } = await importApp();
+    render(<App />);
+    await waitFor(() => expect(wsInstances.length).toBe(1));
+
+    const { requestMessagePinNavigation } = await import('../src/message-pin-navigation.js');
+    act(() => requestMessagePinNavigation({
+      id: 'pin-sub',
+      serverId: 'srv-1',
+      sessionName: 'deck_sub_alpha_helper',
+      eventId: 'event-sub',
+      eventTs: 123,
+      eventType: 'user.message',
+      text: 'Pinned in Helper',
+      createdAt: 123,
+      updatedAt: 123,
+    }));
+
+    expect(await screen.findByTestId('sub-session-window-sub-1')).toBeTruthy();
+  }, 20_000);
+
   it('opens controlled-node management above sub-session windows and re-fronts it from the sidebar', async () => {
     localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
     localStorage.setItem('rcc_server', 'srv-1');

@@ -36,6 +36,7 @@ import { cronApiRoutes } from './routes/cron-api.js';
 import { pushRoutes } from './routes/push.js';
 import { quickDataRoutes } from './routes/quick-data.js';
 import { watchRoutes } from './routes/watch.js';
+import { messagePinRoutes } from './routes/message-pins.js';
 import { memoryRoutes } from './routes/memory.js';
 import { sessionMgmtRoutes } from './routes/session-mgmt.js';
 import { subSessionRoutes } from './routes/sub-sessions.js';
@@ -183,6 +184,7 @@ export function buildApp(env: Env) {
   app.route('/api/push', pushRoutes);
   app.route('/api/quick-data', quickDataRoutes);
   app.route('/api', watchRoutes);
+  app.route('/api', messagePinRoutes);
   app.route('/api', tabSharingRoutes);
   app.route('/api', tokenUsageRoutes);
   // Pod-sticky memory routes: serverId is read from the `?serverId=` query

@@ -79,6 +79,7 @@ import {
 } from '../../../src/shared/timeline/merge.js';
 import { TIMELINE_HISTORY_CONTENT_TYPES } from '../../../src/shared/timeline/types.js';
 import { fetchTimelineHistoryHttp, sendSessionViaHttp } from '../api.js';
+import { MESSAGE_PIN_LIMITS } from '@shared/message-pins.js';
 import { runNewestWindowBackfill } from '../timeline/catchup/backfill-pager.js';
 import { buildTransportPendingSyncPatch, normalizeTransportPendingEntries } from '../transport-queue.js';
 
@@ -92,6 +93,17 @@ const TRANSPORT_QUEUE_EVENT_TYPES = new Set([
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+
+function isTimelineHistoryEvent(value: unknown): value is TimelineEvent {
+  if (!isRecord(value) || !isRecord(value.payload)) return false;
+  return typeof value.eventId === 'string'
+    && typeof value.sessionId === 'string'
+    && typeof value.ts === 'number'
+    && Number.isFinite(value.ts)
+    && typeof value.seq === 'number'
+    && typeof value.epoch === 'number'
+    && typeof value.type === 'string';
 }
 
 function isTransportQueueEvent(value: unknown): value is QueueEvent {
@@ -394,6 +406,9 @@ if (typeof document !== 'undefined' && typeof window !== 'undefined') {
 
 const MAX_MEMORY_EVENTS = 300;
 const MAX_HISTORY_EVENTS = 2000;
+const MAX_PIN_CONTEXT_EVENTS = MESSAGE_PIN_LIMITS.CONTEXT_EVENTS_BEFORE
+  + 1
+  + MESSAGE_PIN_LIMITS.CONTEXT_EVENTS_AFTER;
 
 /**
  * The initial window stays small, but once the user has paged older history
@@ -402,6 +417,9 @@ const MAX_HISTORY_EVENTS = 2000;
  * message. Keep the larger bounded history window until the session changes.
  */
 function retainedTimelineMergeLimit(...eventSets: readonly TimelineEvent[][]): number {
+  if (eventSets.some((events) => events.length > MAX_HISTORY_EVENTS)) {
+    return MAX_HISTORY_EVENTS + MAX_PIN_CONTEXT_EVENTS;
+  }
   return eventSets.some((events) => events.length > MAX_MEMORY_EVENTS)
     ? MAX_HISTORY_EVENTS
     : MAX_MEMORY_EVENTS;
@@ -1135,6 +1153,10 @@ export interface UseTimelineResult {
    *  no cooldown. Unlike the global `requestActiveTimelineRefresh`, this is
    *  per-session and surfaces visible feedback. */
   forceRefresh: () => void;
+  /** Load a bounded window around a PostgreSQL-pinned message into the local
+   * timeline, so ChatView can reveal and scroll to an event older than the
+   * current in-memory tail. */
+  loadMessageContext: (eventId: string, eventTs: number) => Promise<boolean>;
 }
 
 export interface UseTimelineOptions {
@@ -2793,6 +2815,101 @@ export function useTimeline(
     persistTimelineEvents(key, preferred);
   }, []);
 
+  const loadMessageContext = useCallback(async (eventId: string, eventTs: number): Promise<boolean> => {
+    if (!serverId || !sessionId || disableHistory || !eventId || !Number.isFinite(eventTs)) return false;
+    if (eventsRef.current.some((event) => event.eventId === eventId)) return true;
+    const requestedKey = cacheKeyRef.current;
+    if (!requestedKey) return false;
+
+    try {
+      const beforeResult = await fetchTimelineHistoryHttp(serverId, sessionId, {
+        beforeTs: eventTs + 1,
+        limit: 500,
+        timeoutMs: 12_000,
+      });
+      if (cacheKeyRef.current !== requestedKey || !beforeResult) return false;
+      const preceding = beforeResult.events.filter(isTimelineHistoryEvent);
+
+      // The history API returns the newest N events in a range. To obtain the
+      // events immediately after an old pin, grow a bounded time window until
+      // it contains a successor; if the window itself overflows, shrink it
+      // until all rows fit and the ascending response really starts beside the
+      // anchor rather than at the newest edge of a huge conversation.
+      let following: TimelineEvent[] = [];
+      let spanMs = 60_000;
+      let emptyLowerSpanMs = 0;
+      let overflowingUpperSpanMs: number | null = null;
+      const newestUsefulTs = Math.max(eventTs + 2, Date.now() + 1);
+      for (let attempt = 0; attempt < 32; attempt += 1) {
+        const beforeTs = Math.min(newestUsefulTs, eventTs + spanMs);
+        const afterResult = await fetchTimelineHistoryHttp(serverId, sessionId, {
+          afterTs: Math.max(0, eventTs - 1),
+          beforeTs,
+          limit: 500,
+          timeoutMs: 12_000,
+        });
+        if (cacheKeyRef.current !== requestedKey || !afterResult) break;
+        const inWindow = afterResult.events.filter(isTimelineHistoryEvent);
+        if (afterResult.hasMore) {
+          overflowingUpperSpanMs = spanMs;
+          if (overflowingUpperSpanMs - emptyLowerSpanMs <= 1) break;
+          spanMs = Math.max(
+            emptyLowerSpanMs + 1,
+            Math.floor((emptyLowerSpanMs + overflowingUpperSpanMs) / 2),
+          );
+          continue;
+        }
+        const anchorIndex = inWindow.findIndex((event) => event.eventId === eventId);
+        following = (anchorIndex >= 0
+          ? inWindow.slice(anchorIndex + 1)
+          : inWindow.filter((event) => event.ts > eventTs))
+          .slice(0, MESSAGE_PIN_LIMITS.CONTEXT_EVENTS_AFTER);
+        if (following.length > 0 || beforeTs >= newestUsefulTs) break;
+        emptyLowerSpanMs = spanMs;
+        if (overflowingUpperSpanMs !== null) {
+          if (overflowingUpperSpanMs - emptyLowerSpanMs <= 1) break;
+          spanMs = Math.floor((emptyLowerSpanMs + overflowingUpperSpanMs) / 2);
+        } else {
+          spanMs = Math.min(
+            newestUsefulTs - eventTs,
+            Math.max(spanMs + 1, spanMs * 8),
+          );
+        }
+      }
+
+      const anchorIndex = preceding.findIndex((event) => event.eventId === eventId);
+      if (anchorIndex < 0) return false;
+      const context = [
+        ...preceding.slice(Math.max(0, anchorIndex - MESSAGE_PIN_LIMITS.CONTEXT_EVENTS_BEFORE), anchorIndex + 1),
+        ...following,
+      ];
+      // A normal expanded timeline retains the newest MAX_HISTORY_EVENTS. An
+      // old pin can sit before every one of those rows, so a normal bounded
+      // merge would immediately trim the just-loaded anchor back out. Keep
+      // the recent window plus this one bounded context window; the renderer
+      // remains tail-limited and a later pin replaces, rather than endlessly
+      // accumulating, older context windows.
+      setEvents((previous) => {
+        const shared = getSharedTimelineBase(
+          cacheKeyRef.current,
+          previous,
+          MAX_HISTORY_EVENTS + context.length,
+        );
+        const recent = shared.length > MAX_HISTORY_EVENTS
+          ? shared.slice(shared.length - MAX_HISTORY_EVENTS)
+          : shared;
+        const base = removeReconciledLocalUserMessages(recent, context);
+        const result = mergeTimelineEvents(base, context, MAX_HISTORY_EVENTS + context.length);
+        if (cacheKeyRef.current) setCachedEvents(cacheKeyRef.current, result);
+        return result;
+      });
+      idbPutEvents(context);
+      return true;
+    } catch {
+      return false;
+    }
+  }, [disableHistory, idbPutEvents, serverId, sessionId]);
+
   const pendingRealtimeEventsRef = useRef(new Map<string, TimelineEvent>());
   const pendingRealtimeFlushCancelRef = useRef<(() => void) | null>(null);
 
@@ -4019,5 +4136,6 @@ export function useTimeline(
     retryOptimisticMessage,
     loadOlderEvents,
     forceRefresh,
+    loadMessageContext,
   };
 }

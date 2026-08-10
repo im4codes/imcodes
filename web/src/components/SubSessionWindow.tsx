@@ -287,6 +287,7 @@ export function SubSessionWindow({
     loadingOlder,
     hasOlderHistory,
     loadOlderEvents,
+    loadMessageContext,
   } = useTimeline(sub.sessionName, ws, serverId, {
     // Any mounted sub-session window is user-visible work, even when it is not
     // the focused/topmost one. Keep its active history/replay/retry path armed
@@ -967,6 +968,7 @@ export function SubSessionWindow({
             loadingOlder={loadingOlder}
             hasOlderHistory={hasOlderHistory}
             onLoadOlder={loadOlderEvents}
+            onLoadMessageContext={loadMessageContext}
             sessionId={sub.sessionName}
             onForceSync={timelineForceRefresh}
             onScrollBottomFn={onChatScrollBottomFn}
@@ -979,6 +981,7 @@ export function SubSessionWindow({
             onQuote={addQuote}
             agentType={sessionInfo?.agentType ?? sub.type}
             onResendFailed={handleResendFailed}
+            messagePinsEnabled
           />
         )}
       </div>

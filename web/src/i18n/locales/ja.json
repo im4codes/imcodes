@@ -2882,6 +2882,20 @@
     "acknowledge": "閉じる",
     "cancel_pending": "キャンセル"
   },
+  "messagePins": {
+    "title": "固定メッセージ",
+    "summary": "固定 · 現在 {{current}} / すべて {{total}}",
+    "currentTab": "現在（{{count}}）",
+    "allTab": "すべて（{{count}}）",
+    "noCurrent": "このセッションに固定メッセージはありません",
+    "noPins": "固定メッセージはありません",
+    "pin": "メッセージを固定",
+    "unpin": "固定を解除",
+    "userMessage": "ユーザーメッセージ",
+    "assistantMessage": "アシスタントメッセージ",
+    "requestFailed": "固定メッセージの操作に失敗しました。タップして閉じます。",
+    "locateFailed": "元のメッセージを読み込めませんでした。タップして閉じます。"
+  },
   "peerAuditResult": {
     "title": "ピア監査結果",
     "attributionAuditor": "監査者:{{auditor}}",

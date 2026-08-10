@@ -108,6 +108,7 @@ function SubSessionContent({ panel, ctx }: { panel: PinnedPanel; ctx: PanelRende
           onOpenLocalWebPreview={ctx.onOpenLocalWebPreview}
           onQuote={ctx.onQuote}
           agentType={liveSub.type}
+          messagePinsEnabled={false}
         />
       )}
       {(lastUsage || activeThinkingTs || activeToolCall || activeTimelineTurn || statusText || liveSessionState === 'running' || liveSessionState === 'idle' || liveSub.planLabel || liveSub.quotaLabel || liveSub.quotaUsageLabel || liveSub.quotaMeta) && (

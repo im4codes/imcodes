@@ -2883,6 +2883,20 @@
     "acknowledge": "Cerrar",
     "cancel_pending": "Cancelar"
   },
+  "messagePins": {
+    "title": "Mensajes fijados",
+    "summary": "Fijados · actual {{current}} / todos {{total}}",
+    "currentTab": "Actual ({{count}})",
+    "allTab": "Todos ({{count}})",
+    "noCurrent": "No hay mensajes fijados en esta sesión",
+    "noPins": "No hay mensajes fijados",
+    "pin": "Fijar mensaje",
+    "unpin": "Desfijar",
+    "userMessage": "Mensaje del usuario",
+    "assistantMessage": "Mensaje del asistente",
+    "requestFailed": "Falló la solicitud de mensajes fijados. Toca para cerrar.",
+    "locateFailed": "No se pudo cargar el mensaje original. Toca para cerrar."
+  },
   "peerAuditResult": {
     "title": "Resultado de auditoría",
     "attributionAuditor": "Revisado por {{auditor}}",

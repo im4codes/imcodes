@@ -192,6 +192,7 @@ export function SessionPane({
     markOptimisticFailed,
     retryOptimisticMessage,
     loadOlderEvents,
+    loadMessageContext,
     forceRefresh: timelineForceRefresh,
   } = useTimeline(sessionName, ws, serverId, {
     isActiveSession: isActive,
@@ -436,6 +437,7 @@ export function SessionPane({
           loadingOlder={timelineLoadingOlder}
           hasOlderHistory={timelineHasOlderHistory}
           onLoadOlder={loadOlderEvents}
+          onLoadMessageContext={loadMessageContext}
           sessionId={sessionName}
           sessionState={liveSessionState ?? undefined}
           onScrollBottomFn={setChatScrollFn}
@@ -450,6 +452,7 @@ export function SessionPane({
           onQuote={addQuote}
           agentType={session.agentType}
           onResendFailed={handleResendFailed}
+          messagePinsEnabled
         />
       )}
 

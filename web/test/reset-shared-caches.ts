@@ -13,4 +13,12 @@ export async function resetWebSharedCachesForTests(): Promise<void> {
       quickDataModule.__resetQuickDataForTests();
     }
   } catch { /* optional; some suites mock QuickInputPanel or api.ts narrowly */ }
+  try {
+    const { __resetMessagePinsCacheForTests } = await import('../src/hooks/useMessagePins.js');
+    __resetMessagePinsCacheForTests();
+  } catch { /* optional; some suites mock the pin hook */ }
+  try {
+    const { __resetMessagePinNavigationForTests } = await import('../src/message-pin-navigation.js');
+    __resetMessagePinNavigationForTests();
+  } catch { /* optional */ }
 }

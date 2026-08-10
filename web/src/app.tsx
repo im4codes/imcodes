@@ -24,6 +24,7 @@ import { FS_SESSION_ROOT_PATH } from '../../src/shared/transport/fs.js';
 import { P2P_WORKFLOW_MSG } from '@shared/p2p-workflow-messages.js';
 import { RECONNECT_GRACE_MS } from '@shared/ack-protocol.js';
 import type { UsageContextWindowSource } from '@shared/usage-context-window.js';
+import type { MessagePin } from '@shared/message-pins.js';
 import { mapP2pRunToDiscussion, mergeP2pDiscussionUpdate, mergeP2pStatusResponseDiscussions } from './p2p-run-mapping.js';
 import { matchDiscussionIndex, reconcileDiscussionEntry, reconcileClassicList, isBarActiveDiscussion, makeOptimisticDiscussionEntry, discussionErrorReasonKey, shouldToastDiscussionError, classifyDiscussionStop, removeDiscussionByRequestId } from './discussion-reconcile.js';
 import { PENDING_START_TIMEOUT_MS, DISCUSSION_RECONCILE_HIDDEN_MS } from '@shared/discussion-ui.js';
@@ -93,6 +94,12 @@ import {
   SHARED_CONTEXT_MANAGEMENT_PANEL_TYPE,
 } from './components/pinnedPanelTypes.js';
 import { LocalWebPreviewPanel } from './components/LocalWebPreviewPanel.js';
+import {
+  clearMessagePinNavigation,
+  peekPendingMessagePin,
+  subscribeMessagePinNavigation,
+} from './message-pin-navigation.js';
+import { clearMessagePinsCache } from './hooks/useMessagePins.js';
 import type { ChatLocalWebPreviewOpenHandler } from './components/ChatLoopbackLink.js';
 import { formatDaemonVersionShort } from './util/format-version.js';
 import { nextDaemonUpgradingState, daemonUpgradingLabel, type DaemonUpgradingState } from './util/daemon-upgrade-status.js';
@@ -518,6 +525,8 @@ export function App() {
     localStorage.removeItem('rcc_server');
     localStorage.removeItem('rcc_server_name');
     localStorage.removeItem('rcc_session');
+    clearMessagePinsCache();
+    clearMessagePinNavigation();
     setAuth(null);
     setServers([]);
     setServersLoaded(false);
@@ -2737,6 +2746,27 @@ export function App() {
   // bringSubToFront so the callback can close over it). Just sync each render.
   subSessionsRef.current = subSessions;
 
+  useEffect(() => {
+    const openPinnedMessageSession = (pin: MessagePin) => {
+      if (pin.serverId !== selectedServerId) return;
+      const sub = subSessionsRef.current.find((candidate) => candidate.sessionName === pin.sessionName);
+      if (sub) {
+        if (sub.parentSession && sub.parentSession !== activeSessionRef.current) {
+          setActiveSession(sub.parentSession, { keepSubWindows: true });
+        }
+        openSubSessionWindow(sub.id);
+        return;
+      }
+      if (sessions.some((session) => session.name === pin.sessionName)) {
+        setActiveSession(pin.sessionName);
+      }
+    };
+    const unsubscribe = subscribeMessagePinNavigation(openPinnedMessageSession);
+    const pending = peekPendingMessagePin();
+    if (pending) openPinnedMessageSession(pending);
+    return unsubscribe;
+  }, [openSubSessionWindow, selectedServerId, sessions, setActiveSession, subSessions]);
+
   // Auto-navigate to the session that raised an AskUserQuestion so the operator
   // sees its context (the card itself is a global overlay, but the underlying
   // view should follow). Runs once per question (tracked by toolUseId).
@@ -4324,6 +4354,8 @@ export function App() {
     localStorage.removeItem('rcc_server');
     localStorage.removeItem('rcc_server_name');
     localStorage.removeItem('rcc_session');
+    clearMessagePinsCache();
+    clearMessagePinNavigation();
     configureExpectedUserId(null);
     setAuth(null);
     setSessions([]);

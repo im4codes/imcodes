@@ -2883,6 +2883,20 @@
     "acknowledge": "關閉",
     "cancel_pending": "取消"
   },
+  "messagePins": {
+    "title": "固定訊息",
+    "summary": "固定訊息 · 目前 {{current}} / 全部 {{total}}",
+    "currentTab": "目前（{{count}}）",
+    "allTab": "全部（{{count}}）",
+    "noCurrent": "目前工作階段尚無固定訊息",
+    "noPins": "尚無固定訊息",
+    "pin": "固定訊息",
+    "unpin": "取消固定",
+    "userMessage": "使用者訊息",
+    "assistantMessage": "助手訊息",
+    "requestFailed": "固定訊息操作失敗，點擊關閉",
+    "locateFailed": "無法載入原訊息及上下文，點擊關閉"
+  },
   "peerAuditResult": {
     "title": "對等稽核結果",
     "attributionAuditor": "審核者:{{auditor}}",

@@ -2883,6 +2883,20 @@
     "acknowledge": "关闭",
     "cancel_pending": "取消"
   },
+  "messagePins": {
+    "title": "固定消息",
+    "summary": "固定消息 · 当前 {{current}} / 所有 {{total}}",
+    "currentTab": "当前（{{count}}）",
+    "allTab": "所有（{{count}}）",
+    "noCurrent": "当前会话还没有固定消息",
+    "noPins": "还没有固定消息",
+    "pin": "固定消息",
+    "unpin": "取消固定",
+    "userMessage": "用户消息",
+    "assistantMessage": "助手消息",
+    "requestFailed": "固定消息操作失败，点击关闭",
+    "locateFailed": "无法加载原消息及上下文，点击关闭"
+  },
   "peerAuditResult": {
     "title": "对等审计结果",
     "attributionAuditor": "审核者:{{auditor}}",

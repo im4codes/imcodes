@@ -2883,6 +2883,20 @@
     "acknowledge": "Dismiss",
     "cancel_pending": "Cancel"
   },
+  "messagePins": {
+    "title": "Pinned messages",
+    "summary": "Pinned · current {{current}} / all {{total}}",
+    "currentTab": "Current ({{count}})",
+    "allTab": "All ({{count}})",
+    "noCurrent": "No pinned messages in this session",
+    "noPins": "No pinned messages",
+    "pin": "Pin message",
+    "unpin": "Unpin",
+    "userMessage": "Your message",
+    "assistantMessage": "Assistant message",
+    "requestFailed": "Pinned-message request failed. Tap to dismiss.",
+    "locateFailed": "The original message could not be loaded. Tap to dismiss."
+  },
   "peerAuditResult": {
     "title": "Peer audit result",
     "attributionAuditor": "Reviewed by {{auditor}}",
