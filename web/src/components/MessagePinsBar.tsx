@@ -17,7 +17,7 @@ interface Props {
   onQuote?: (text: string) => void;
   previewMode?: MessagePinPreviewMode;
   onPreviewModeChange?: (mode: MessagePinPreviewMode) => void;
-  renderPreview?: (text: string) => ComponentChildren;
+  renderPreview?: (text: string, closePreview: () => void) => ComponentChildren;
   resolvePinText?: (pin: MessagePin) => string;
   onUnpin: (pin: MessagePin) => void;
   onDismissError?: () => void;
@@ -133,7 +133,7 @@ export function MessagePinsBar({
           messagePreviewLayout
           onClose={() => setPreviewPin(null)}
           renderedContent={previewMode === 'rendered' && renderPreview
-            ? renderPreview(previewText)
+            ? renderPreview(previewText, () => setPreviewPin(null))
             : undefined}
           viewControls={renderPreview && onPreviewModeChange ? (
             <div class="zoom-text-mode-switch" role="group" aria-label={t('messagePins.previewMode')}>

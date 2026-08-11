@@ -2053,15 +2053,21 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
       console.warn('[message-pins] failed to save preview mode:', error);
     });
   }, [messagePinPreviewMode, messagePinPreviewModePref]);
-  const renderPinnedMessagePreview = useCallback((text: string) => (
+  const renderPinnedMessagePreview = useCallback((text: string, closePreview: () => void) => (
     <ChatMarkdown
       text={parseTimelineDisplayText(text)}
       onPathClick={pathClickHandler}
-      onUrlClick={urlClickHandler}
+      onUrlClick={urlClickHandler ? (url) => {
+        closePreview();
+        urlClickHandler(url);
+      } : undefined}
       onDownload={downloadHandler}
       onHtmlPreview={htmlPreviewHandler}
       onImagePreview={imagePreviewHandler}
-      onOpenLocalWebPreview={onOpenLocalWebPreview}
+      onOpenLocalWebPreview={onOpenLocalWebPreview ? (target) => {
+        closePreview();
+        onOpenLocalWebPreview(target);
+      } : undefined}
     />
   ), [downloadHandler, htmlPreviewHandler, imagePreviewHandler, onOpenLocalWebPreview, pathClickHandler, urlClickHandler]);
 

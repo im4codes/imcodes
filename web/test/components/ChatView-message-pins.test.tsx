@@ -74,16 +74,43 @@ vi.mock('react-i18next', () => ({
 }));
 
 vi.mock('../../src/components/ChatMarkdown.js', () => ({
-  ChatMarkdown: ({ text }: { text: string }) => text.includes('127.0.0.1:8787')
+  ChatMarkdown: ({
+    text,
+    onOpenLocalWebPreview,
+    onUrlClick,
+  }: {
+    text: string;
+    onOpenLocalWebPreview?: (target: { port: number; path: string }) => void;
+    onUrlClick?: (url: string) => void;
+  }) => text.includes('127.0.0.1:8787')
     ? (
       <span data-testid="chat-markdown" data-source-text={text}>
-        <strong>Local access</strong>: http://127.0.0.1:8787/
+        <strong>Local access</strong>:{' '}
+        <a
+          href="http://127.0.0.1:8787/"
+          data-testid="chat-markdown-loopback-link"
+          onClick={(event) => {
+            event.preventDefault();
+            onOpenLocalWebPreview?.({ port: 8787, path: '/' });
+          }}
+        >http://127.0.0.1:8787/</a>
         <span class="chat-loopback-actions">
-          <button>Open through IM.codes proxy</button>
+          <button onClick={() => onOpenLocalWebPreview?.({ port: 8787, path: '/' })}>Open through IM.codes proxy</button>
           <button>Open directly on LAN</button>
         </span>
       </span>
     )
+    : text.includes('https://example.test/docs')
+      ? (
+        <a
+          href="https://example.test/docs"
+          data-testid="chat-markdown-external-link"
+          onClick={(event) => {
+            event.preventDefault();
+            onUrlClick?.('https://example.test/docs');
+          }}
+        >https://example.test/docs</a>
+      )
     : <span data-testid="chat-markdown">{text}</span>,
 }));
 
@@ -432,6 +459,75 @@ describe('ChatView message pin action', () => {
     expect(previewModePref.requestedKeys).toContain('message_pin_preview_mode');
     fireEvent.click(screen.getByRole('button', { name: 'messagePins.textMode' }));
     expect(previewModePref.save).toHaveBeenCalledWith('text');
+  });
+
+  it('closes the pin preview before opening a loopback link in Local Web Preview', () => {
+    const onOpenLocalWebPreview = vi.fn();
+    messagePinsState.pins = [{
+      id: 'pin-loopback-preview',
+      serverId: 'srv-1',
+      sessionName: 'deck_pin_main',
+      eventId: 'event-loopback-preview',
+      eventTs: 1234,
+      eventType: 'assistant.text',
+      text: 'Local access: http://127.0.0.1:8787/',
+      createdAt: 1,
+      updatedAt: 1,
+    }];
+
+    render(
+      <ChatView
+        events={[]}
+        loading={false}
+        sessionId="deck_pin_main"
+        serverId="srv-1"
+        messagePinsEnabled
+        onOpenLocalWebPreview={onOpenLocalWebPreview}
+      />,
+    );
+
+    fireEvent.click(screen.getByTestId('message-pins-trigger'));
+    fireEvent.click(screen.getByText('Local access: http://127.0.0.1:8787/'));
+    expect(screen.getByText('messagePins.previewTitle')).toBeTruthy();
+
+    fireEvent.click(screen.getByTestId('chat-markdown-loopback-link'));
+
+    expect(onOpenLocalWebPreview).toHaveBeenCalledWith({ port: 8787, path: '/' });
+    expect(screen.queryByText('messagePins.previewTitle')).toBeNull();
+  });
+
+  it('closes the pin preview before showing the external-link confirmation', () => {
+    messagePinsState.pins = [{
+      id: 'pin-external-preview',
+      serverId: 'srv-1',
+      sessionName: 'deck_pin_main',
+      eventId: 'event-external-preview',
+      eventTs: 1234,
+      eventType: 'assistant.text',
+      text: 'Docs: https://example.test/docs',
+      createdAt: 1,
+      updatedAt: 1,
+    }];
+
+    render(
+      <ChatView
+        events={[]}
+        loading={false}
+        sessionId="deck_pin_main"
+        serverId="srv-1"
+        messagePinsEnabled
+      />,
+    );
+
+    fireEvent.click(screen.getByTestId('message-pins-trigger'));
+    fireEvent.click(screen.getByText('Docs: https://example.test/docs'));
+    expect(screen.getByText('messagePins.previewTitle')).toBeTruthy();
+
+    fireEvent.click(screen.getByTestId('chat-markdown-external-link'));
+
+    expect(screen.queryByText('messagePins.previewTitle')).toBeNull();
+    expect(screen.getByText('chat.external_link_title')).toBeTruthy();
+    expect(screen.getByText('https://example.test/docs')).toBeTruthy();
   });
 
   it('recovers an existing polluted pin from its loaded source event in every preview mode', () => {
