@@ -6415,6 +6415,9 @@ html.native-ios-mac .chat-dl-btn {
   box-shadow: 0 24px 80px rgba(0,0,0,0.52), inset 0 1px 0 rgba(255,255,255,0.04);
   overflow: hidden;
 }
+.zoom-text-dialog-message-preview {
+  width: min(50vw, calc(100vw - 24px));
+}
 .zoom-text-header { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-shrink: 0; }
 .zoom-text-title { font-size: 13px; font-weight: 600; color: #cbd5e1; letter-spacing: 0.02em; text-transform: uppercase; }
 .zoom-text-subtitle { font-size: 11px; color: #94a3b8; line-height: 1.4; overflow-wrap: anywhere; }
@@ -6440,6 +6443,30 @@ html.native-ios-mac .chat-dl-btn {
   white-space: pre-wrap;
   word-break: break-word;
   overflow-wrap: anywhere;
+}
+.zoom-text-content-rendered { white-space: normal; }
+.zoom-text-mode-switch {
+  display: inline-flex;
+  align-self: flex-start;
+  gap: 2px;
+  padding: 2px;
+  border: 1px solid rgba(71,85,105,0.72);
+  border-radius: 7px;
+  background: rgba(2,6,23,0.72);
+}
+.zoom-text-mode-switch button {
+  border: 0;
+  border-radius: 5px;
+  padding: 4px 10px;
+  background: transparent;
+  color: #94a3b8;
+  cursor: pointer;
+  font: inherit;
+  font-size: 11px;
+}
+.zoom-text-mode-switch button.active {
+  background: #334155;
+  color: #f8fafc;
 }
 /* Force-enable native selection inside the zoom dialog. The chat view's
    `@media (pointer: coarse)` rule turns off user-select for everything inside
@@ -6469,10 +6496,33 @@ html.native-ios-mac .chat-dl-btn {
 }
 .zoom-text-btn:hover { background: #1d4ed8; border-color: rgba(147,197,253,0.72); }
 .zoom-text-btn.is-copied { background: #166534; border-color: #16a34a; color: #86efac; }
+.zoom-text-resize-handle {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 10px;
+  cursor: ns-resize;
+  touch-action: none;
+}
+.zoom-text-resize-handle::after {
+  content: '';
+  position: absolute;
+  left: 50%;
+  bottom: 3px;
+  width: 40px;
+  height: 3px;
+  transform: translateX(-50%);
+  border-radius: 999px;
+  background: rgba(148,163,184,0.38);
+}
 @media (max-width: 520px) {
   .zoom-text-dialog { width: calc(100vw - 16px); padding: 12px; }
   .zoom-text-btn { width: 100%; padding: 10px; font-size: 13px; }
   .zoom-text-actions { width: 100%; flex-direction: column; }
+}
+@media (max-width: 640px) {
+  .zoom-text-dialog-message-preview { width: calc(100vw - 16px); }
 }
 /* GFM tables in chat */
 .chat-table { border-collapse: collapse; margin: 8px 0; font-size: 13px; width: auto; max-width: 100%; overflow-x: auto; display: block; }

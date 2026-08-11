@@ -13,6 +13,11 @@ import {
 const pinMessageMock = vi.hoisted(() => vi.fn());
 const unpinMessageMock = vi.hoisted(() => vi.fn());
 const messagePinsState = vi.hoisted(() => ({ pins: [] as MessagePin[] }));
+const previewModePref = vi.hoisted(() => ({
+  value: null as 'rendered' | 'text' | null,
+  save: vi.fn(),
+  requestedKeys: [] as Array<string | null>,
+}));
 
 vi.mock('../../src/hooks/useMessagePins.js', () => ({
   useMessagePins: () => ({
@@ -30,6 +35,37 @@ vi.mock('../../src/session-repo-context-store.js', () => ({
   useSessionRepoContext: () => ({ currentBranch: 'dev' }),
 }));
 
+vi.mock('../../src/hooks/usePref.js', () => ({
+  parseBooleanish: (raw: unknown) => (raw === true || raw === 'true' ? true : raw === false || raw === 'false' ? false : null),
+  usePref: (key: string | null) => {
+    previewModePref.requestedKeys.push(key);
+    if (key === 'message_pin_preview_mode') {
+      return {
+        value: previewModePref.value,
+        rawValue: previewModePref.value,
+        loaded: true,
+        loading: false,
+        stale: false,
+        error: null,
+        save: previewModePref.save,
+        set: vi.fn(),
+        reload: vi.fn(),
+      };
+    }
+    return {
+      value: true,
+      rawValue: true,
+      loaded: true,
+      loading: false,
+      stale: false,
+      error: null,
+      save: vi.fn(),
+      set: vi.fn(),
+      reload: vi.fn(),
+    };
+  },
+}));
+
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
     i18n: { language: 'en' },
@@ -38,7 +74,7 @@ vi.mock('react-i18next', () => ({
 }));
 
 vi.mock('../../src/components/ChatMarkdown.js', () => ({
-  ChatMarkdown: ({ text }: { text: string }) => <span>{text}</span>,
+  ChatMarkdown: ({ text }: { text: string }) => <span data-testid="chat-markdown">{text}</span>,
 }));
 
 import { ChatView } from '../../src/components/ChatView.js';
@@ -62,6 +98,9 @@ describe('ChatView message pin action', () => {
     pinMessageMock.mockReset().mockResolvedValue(null);
     unpinMessageMock.mockReset();
     messagePinsState.pins = [];
+    previewModePref.value = null;
+    previewModePref.save.mockReset().mockResolvedValue(undefined);
+    previewModePref.requestedKeys.length = 0;
     __resetMessagePinNavigationForTests();
     Reflect.deleteProperty(window, 'ontouchstart');
   });
@@ -286,5 +325,37 @@ describe('ChatView message pin action', () => {
     expect(onQuote).toHaveBeenCalledWith('Quote this into the current composer');
     expect(getPendingMessagePin('deck_pin_other')).toBeNull();
     expect(screen.queryByText('messagePins.previewTitle')).toBeNull();
+  });
+
+  it('reuses ChatMarkdown by default and saves preview mode as an account preference', () => {
+    messagePinsState.pins = [{
+      id: 'pin-markdown-preview',
+      serverId: 'srv-1',
+      sessionName: 'deck_pin_main',
+      eventId: 'event-markdown-preview',
+      eventTs: 1234,
+      eventType: 'assistant.text',
+      text: '**Rendered by chat markdown**',
+      createdAt: 1,
+      updatedAt: 1,
+    }];
+
+    render(
+      <ChatView
+        events={[]}
+        loading={false}
+        sessionId="deck_pin_main"
+        serverId="srv-1"
+        messagePinsEnabled
+      />,
+    );
+
+    fireEvent.click(screen.getByTestId('message-pins-trigger'));
+    fireEvent.click(screen.getByText('**Rendered by chat markdown**'));
+
+    expect(screen.getByTestId('chat-markdown').textContent).toBe('**Rendered by chat markdown**');
+    expect(previewModePref.requestedKeys).toContain('message_pin_preview_mode');
+    fireEvent.click(screen.getByRole('button', { name: 'messagePins.textMode' }));
+    expect(previewModePref.save).toHaveBeenCalledWith('text');
   });
 });

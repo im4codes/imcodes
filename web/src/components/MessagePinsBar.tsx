@@ -1,7 +1,10 @@
 import { useLayoutEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
+import type { ComponentChildren } from 'preact';
 import type { MessagePin } from '@shared/message-pins.js';
 import { ZoomedTextDialog } from './ZoomedTextDialog.js';
+
+export type MessagePinPreviewMode = 'rendered' | 'text';
 
 interface Props {
   pins: MessagePin[];
@@ -12,6 +15,9 @@ interface Props {
   locateError?: boolean;
   onLocate: (pin: MessagePin) => void;
   onQuote?: (text: string) => void;
+  previewMode?: MessagePinPreviewMode;
+  onPreviewModeChange?: (mode: MessagePinPreviewMode) => void;
+  renderPreview?: (text: string) => ComponentChildren;
   onUnpin: (pin: MessagePin) => void;
   onDismissError?: () => void;
 }
@@ -24,6 +30,9 @@ export function MessagePinsBar({
   locateError = false,
   onLocate,
   onQuote,
+  previewMode = 'rendered',
+  onPreviewModeChange,
+  renderPreview,
   onUnpin,
   onDismissError,
 }: Props) {
@@ -116,7 +125,31 @@ export function MessagePinsBar({
           title={t('messagePins.previewTitle')}
           subtitle={`${previewPin.sessionName} · ${new Date(previewPin.eventTs).toLocaleString(i18n.resolvedLanguage || i18n.language)}`}
           copyLabel={t('common.copy')}
+          messagePreviewLayout
           onClose={() => setPreviewPin(null)}
+          renderedContent={previewMode === 'rendered' && renderPreview
+            ? renderPreview(previewPin.text)
+            : undefined}
+          viewControls={renderPreview && onPreviewModeChange ? (
+            <div class="zoom-text-mode-switch" role="group" aria-label={t('messagePins.previewMode')}>
+              <button
+                type="button"
+                class={previewMode === 'rendered' ? 'active' : ''}
+                aria-pressed={previewMode === 'rendered'}
+                onClick={() => onPreviewModeChange('rendered')}
+              >
+                {t('messagePins.renderedMode')}
+              </button>
+              <button
+                type="button"
+                class={previewMode === 'text' ? 'active' : ''}
+                aria-pressed={previewMode === 'text'}
+                onClick={() => onPreviewModeChange('text')}
+              >
+                {t('messagePins.textMode')}
+              </button>
+            </div>
+          ) : undefined}
           actions={(
             <>
               {onQuote && (

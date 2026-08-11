@@ -47,7 +47,7 @@ import { isLikelyDomainPath, renderChatPathActions, type ChatPathDownloadHandler
 import { FontPrefsDropdown, useFontPrefs, DEFAULT_CHAT_FONT } from './FontPrefsDropdown.js';
 import { SessionRepoBranchSummary } from './SessionRepoBranchSummary.js';
 import { usePref, parseBooleanish } from '../hooks/usePref.js';
-import { PREF_KEY_SHOW_TOOL_CALLS } from '../constants/prefs.js';
+import { PREF_KEY_MESSAGE_PIN_PREVIEW_MODE, PREF_KEY_SHOW_TOOL_CALLS } from '../constants/prefs.js';
 import type { TimelineHistoryStatus, TimelineHistoryStepKey } from '../hooks/useTimeline.js';
 import { positionChatActionMenu } from '../chat-action-menu-position.js';
 import { splitTextByHttpUrls } from '../link-detection.js';
@@ -74,7 +74,7 @@ import {
   type MessagePinEventType,
 } from '@shared/message-pins.js';
 import { useMessagePins } from '../hooks/useMessagePins.js';
-import { MessagePinsBar } from './MessagePinsBar.js';
+import { MessagePinsBar, type MessagePinPreviewMode } from './MessagePinsBar.js';
 import {
   clearPendingMessagePin,
   getPendingMessagePin,
@@ -138,6 +138,10 @@ interface Props {
   onLoadMessageContext?: (eventId: string, eventTs: number) => Promise<boolean>;
   /** Compact pinned panels reuse ChatView but intentionally omit message-pin chrome. */
   messagePinsEnabled?: boolean;
+}
+
+function parseMessagePinPreviewMode(raw: unknown): MessagePinPreviewMode | null {
+  return raw === 'rendered' || raw === 'text' ? raw : null;
 }
 
 /** A merged view item — a single event, assistant text, or a tool presentation. */
@@ -2015,6 +2019,33 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
   const urlClickHandler = !preview ? handleUrlClick : undefined;
   const downloadHandler = serverId && ws ? handleDownload : undefined;
 
+  // The presentation choice is account-scoped and shared by every mounted
+  // chat window. Geometry remains device-local in ZoomedTextDialog.
+  const messagePinPreviewModePref = usePref<MessagePinPreviewMode>(
+    messagePinsEnabled ? PREF_KEY_MESSAGE_PIN_PREVIEW_MODE : null,
+    { parse: parseMessagePinPreviewMode },
+  );
+  const messagePinPreviewMode: MessagePinPreviewMode = messagePinPreviewModePref.value === 'text'
+    ? 'text'
+    : 'rendered';
+  const handleMessagePinPreviewModeChange = useCallback((mode: MessagePinPreviewMode) => {
+    if (mode === messagePinPreviewMode) return;
+    void messagePinPreviewModePref.save(mode).catch((error) => {
+      console.warn('[message-pins] failed to save preview mode:', error);
+    });
+  }, [messagePinPreviewMode, messagePinPreviewModePref]);
+  const renderPinnedMessagePreview = useCallback((text: string) => (
+    <ChatMarkdown
+      text={parseTimelineDisplayText(text)}
+      onPathClick={pathClickHandler}
+      onUrlClick={urlClickHandler}
+      onDownload={downloadHandler}
+      onHtmlPreview={htmlPreviewHandler}
+      onImagePreview={imagePreviewHandler}
+      onOpenLocalWebPreview={onOpenLocalWebPreview}
+    />
+  ), [downloadHandler, htmlPreviewHandler, imagePreviewHandler, onOpenLocalWebPreview, pathClickHandler, urlClickHandler]);
+
   // Tool-call/detail visibility preference (shared cache via usePref). Tri-state:
   //   value === true  → developer view, show tool/file/thinking rows
   //   value === false → simple chat, summarize tools and hide other details
@@ -3082,6 +3113,9 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
                 locateError={pinnedLocateError}
                 onLocate={(pin) => { void locatePinnedMessage(pin); }}
                 onQuote={onQuote}
+                previewMode={messagePinPreviewMode}
+                onPreviewModeChange={handleMessagePinPreviewModeChange}
+                renderPreview={renderPinnedMessagePreview}
                 onUnpin={(pin) => { void messagePins.unpinMessage(pin); }}
                 onDismissError={() => {
                   messagePins.clearError();

@@ -42,6 +42,16 @@ describe('styles.css regression contracts', () => {
     expect(panelRule).toMatch(/position:\s*absolute/);
   });
 
+  it('uses half the desktop viewport and full mobile width for pinned-message previews', () => {
+    const previewRule = css.match(/\.zoom-text-dialog-message-preview\s*\{[^}]*\}/)?.[0];
+    expect(previewRule).toBeTruthy();
+    expect(previewRule).toMatch(/width:\s*min\(50vw,\s*calc\(100vw - 24px\)\)/);
+
+    const mobileRule = css.match(/@media\s*\(max-width:\s*640px\)\s*\{[\s\S]*?\.zoom-text-dialog-message-preview\s*\{[^}]*\}/)?.[0];
+    expect(mobileRule).toBeTruthy();
+    expect(mobileRule).toMatch(/width:\s*calc\(100vw - 16px\)/);
+  });
+
   it('keeps long delegation replies at content height inside the chat flex scroller', () => {
     const rule = cssWithoutComments.match(/\.delegation-reply-card\s*\{[^}]*\}/)?.[0];
     expect(rule).toBeTruthy();

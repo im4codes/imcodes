@@ -2899,6 +2899,9 @@
     "userMessage": "ユーザーメッセージ",
     "assistantMessage": "アシスタントメッセージ",
     "previewTitle": "固定メッセージのプレビュー",
+    "previewMode": "プレビューモード",
+    "renderedMode": "レンダリング",
+    "textMode": "プレーンテキスト",
     "jump": "メッセージへ移動",
     "requestFailed": "固定メッセージの操作に失敗しました。タップして閉じます。",
     "locateFailed": "元のメッセージを読み込めませんでした。タップして閉じます。"

@@ -21,6 +21,7 @@ afterEach(() => {
   else delete (navigator as unknown as { clipboard?: Clipboard }).clipboard;
   if (originalExecCommandDescriptor) Object.defineProperty(document, 'execCommand', originalExecCommandDescriptor);
   else delete (document as unknown as { execCommand?: (commandId: string) => boolean }).execCommand;
+  localStorage.removeItem('message_pin_preview_height');
   cleanup();
 });
 
@@ -112,5 +113,29 @@ describe('ZoomedTextDialog', () => {
     expect(overlay).toBeTruthy();
     expect(overlay?.parentElement).toBe(document.body);
     expect(document.querySelector('.zoom-text-close')).toBeTruthy();
+  });
+
+  it('persists a resized pinned-preview height locally', async () => {
+    render(
+      <ZoomedTextDialog
+        text="resizable preview"
+        onClose={vi.fn()}
+        messagePreviewLayout
+      />,
+    );
+
+    const dialog = document.querySelector<HTMLElement>('.zoom-text-dialog-message-preview')!;
+    const initialHeight = Number.parseInt(dialog.style.height, 10);
+    expect(initialHeight).toBeGreaterThanOrEqual(280);
+
+    const handle = document.querySelector('.zoom-text-resize-handle')!;
+    fireEvent.mouseDown(handle, { clientY: 300 });
+    fireEvent.mouseMove(document, { clientY: 360 });
+    fireEvent.mouseUp(document, { clientY: 360 });
+
+    await waitFor(() => {
+      expect(localStorage.getItem('message_pin_preview_height')).toBe(String(initialHeight + 60));
+      expect(dialog.style.height).toBe(`${initialHeight + 60}px`);
+    });
   });
 });

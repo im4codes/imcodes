@@ -11,11 +11,12 @@
  * The text shown here is produced by `domNodeToPlainText`, so it already
  * carries the right paragraph/list/code-block structure.
  */
-import { useEffect, useRef, useState } from 'preact/hooks';
+import { useCallback, useEffect, useRef, useState } from 'preact/hooks';
 import { createPortal } from 'preact/compat';
 import type { ComponentChildren } from 'preact';
 import { useTranslation } from 'react-i18next';
 import { positionChatActionMenu } from '../chat-action-menu-position.js';
+import { useVerticalResize } from '../hooks/useVerticalResize.js';
 import { copyToClipboard } from '../util/clipboard.js';
 import { selectionToPlainText } from '../util/dom-to-text.js';
 import { selectionSignature } from '../util/selection-signature.js';
@@ -33,8 +34,14 @@ interface Props {
   subtitle?: string;
   /** Context actions rendered before the built-in copy action. */
   actions?: ComponentChildren;
+  /** Optional toolbar rendered between the context line and message body. */
+  viewControls?: ComponentChildren;
+  /** Rich rendering of the same source text; plain mode omits this prop. */
+  renderedContent?: ComponentChildren;
   /** Override the built-in "Copy all" label for preview-style dialogs. */
   copyLabel?: string;
+  /** Applies the pinned-preview width and locally persisted height behavior. */
+  messagePreviewLayout?: boolean;
 }
 
 interface SelectionMenuState {
@@ -43,12 +50,62 @@ interface SelectionMenuState {
   y: number;
 }
 
-export function ZoomedTextDialog({ text, onClose, onQuote, title, subtitle, actions, copyLabel }: Props) {
+const MESSAGE_PREVIEW_HEIGHT_KEY = 'message_pin_preview_height';
+const MESSAGE_PREVIEW_MIN_HEIGHT = 280;
+
+function viewportHeight(): number {
+  if (typeof window === 'undefined') return 800;
+  return window.visualViewport?.height ?? window.innerHeight ?? 800;
+}
+
+function clampMessagePreviewHeight(value: number): number {
+  const max = Math.max(MESSAGE_PREVIEW_MIN_HEIGHT, viewportHeight() - 32);
+  return Math.min(max, Math.max(MESSAGE_PREVIEW_MIN_HEIGHT, Math.round(value)));
+}
+
+function readMessagePreviewHeight(): number {
+  const fallback = clampMessagePreviewHeight(viewportHeight() * 0.6);
+  try {
+    const stored = Number(localStorage.getItem(MESSAGE_PREVIEW_HEIGHT_KEY));
+    return Number.isFinite(stored) && stored > 0 ? clampMessagePreviewHeight(stored) : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+export function ZoomedTextDialog({
+  text,
+  onClose,
+  onQuote,
+  title,
+  subtitle,
+  actions,
+  viewControls,
+  renderedContent,
+  copyLabel,
+  messagePreviewLayout = false,
+}: Props) {
   const { t } = useTranslation();
   const [copied, setCopied] = useState(false);
   const [selectionMenu, setSelectionMenu] = useState<SelectionMenuState | null>(null);
   const dialogRef = useRef<HTMLDivElement>(null);
-  const contentRef = useRef<HTMLPreElement>(null);
+  const contentRef = useRef<HTMLElement>(null);
+  const [messagePreviewHeight, setMessagePreviewHeight] = useState(readMessagePreviewHeight);
+  const persistMessagePreviewHeight = useCallback((height: number) => {
+    if (!messagePreviewLayout) return;
+    const clamped = clampMessagePreviewHeight(height);
+    setMessagePreviewHeight(clamped);
+    try { localStorage.setItem(MESSAGE_PREVIEW_HEIGHT_KEY, String(clamped)); } catch { /* geometry is best-effort */ }
+  }, [messagePreviewLayout]);
+  const {
+    height: liveMessagePreviewHeight,
+    onMouseDown: onResizeMouseDown,
+    onTouchStart: onResizeTouchStart,
+  } = useVerticalResize({
+    height: messagePreviewHeight,
+    minHeight: MESSAGE_PREVIEW_MIN_HEIGHT,
+    onResize: persistMessagePreviewHeight,
+  });
 
   // Close on Escape — desktop users with keyboards expect this even though
   // the dialog is primarily a mobile-affordance.
@@ -146,7 +203,8 @@ export function ZoomedTextDialog({ text, onClose, onQuote, title, subtitle, acti
     >
       <div
         ref={dialogRef}
-        class="zoom-text-dialog"
+        class={`zoom-text-dialog${messagePreviewLayout ? ' zoom-text-dialog-message-preview' : ''}`}
+        style={messagePreviewLayout ? { height: `${liveMessagePreviewHeight}px` } : undefined}
         role="dialog"
         aria-modal="true"
         aria-labelledby="zoom-text-dialog-title"
@@ -162,8 +220,13 @@ export function ZoomedTextDialog({ text, onClose, onQuote, title, subtitle, acti
           >×</button>
         </div>
         {subtitle && <div class="zoom-text-subtitle">{subtitle}</div>}
+        {viewControls}
         <div class="zoom-text-body">
-          <pre ref={contentRef} class="zoom-text-content">{text}</pre>
+          {renderedContent ? (
+            <div ref={(element) => { contentRef.current = element; }} class="zoom-text-content zoom-text-content-rendered">{renderedContent}</div>
+          ) : (
+            <pre ref={(element) => { contentRef.current = element; }} class="zoom-text-content">{text}</pre>
+          )}
         </div>
         {selectionMenu && (
           <div
@@ -202,6 +265,14 @@ export function ZoomedTextDialog({ text, onClose, onQuote, title, subtitle, acti
             {copied ? t('common.copied') : (copyLabel ?? t('chat.zoom_copy_all'))}
           </button>
         </div>
+        {messagePreviewLayout && (
+          <div
+            class="zoom-text-resize-handle"
+            onMouseDown={onResizeMouseDown}
+            onTouchStart={onResizeTouchStart}
+            aria-hidden="true"
+          />
+        )}
       </div>
     </div>
   ), document.body);

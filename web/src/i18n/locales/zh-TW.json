@@ -2900,6 +2900,9 @@
     "userMessage": "使用者訊息",
     "assistantMessage": "助手訊息",
     "previewTitle": "固定訊息預覽",
+    "previewMode": "預覽模式",
+    "renderedMode": "渲染",
+    "textMode": "純文字",
     "jump": "跳轉至訊息",
     "requestFailed": "固定訊息操作失敗，點擊關閉",
     "locateFailed": "無法載入原訊息及上下文，點擊關閉"

@@ -2,6 +2,7 @@
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/preact';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { h } from 'preact';
+import { useState } from 'preact/hooks';
 import type { MessagePin } from '../../../shared/message-pins.js';
 
 vi.mock('react-i18next', () => ({
@@ -89,6 +90,35 @@ describe('MessagePinsBar', () => {
   it('keeps the compact entry visible with a zero count', () => {
     render(<MessagePinsBar pins={[]} currentSessionName="deck_current" onLocate={vi.fn()} onUnpin={vi.fn()} />);
     expect(screen.getByTestId('message-pins-trigger').textContent).toBe('📌0/0');
+  });
+
+  it('defaults to the chat renderer and can switch to plain text', () => {
+    function Harness() {
+      const [mode, setMode] = useState<'rendered' | 'text'>('rendered');
+      return (
+        <MessagePinsBar
+          pins={[pin('a1', 'deck_current')]}
+          currentSessionName="deck_current"
+          onLocate={vi.fn()}
+          onUnpin={vi.fn()}
+          previewMode={mode}
+          onPreviewModeChange={setMode}
+          renderPreview={(text) => <strong data-testid="rendered-preview">rendered: {text}</strong>}
+        />
+      );
+    }
+
+    render(<Harness />);
+    fireEvent.click(screen.getByTestId('message-pins-trigger'));
+    fireEvent.click(screen.getByText('pinned a1'));
+
+    expect(screen.getByTestId('rendered-preview').textContent).toBe('rendered: pinned a1');
+    expect(screen.getByRole('button', { name: 'messagePins.renderedMode' }).getAttribute('aria-pressed')).toBe('true');
+
+    fireEvent.click(screen.getByRole('button', { name: 'messagePins.textMode' }));
+    expect(screen.queryByTestId('rendered-preview')).toBeNull();
+    expect(document.querySelector('pre.zoom-text-content')?.textContent).toBe('pinned a1');
+    expect(screen.getByRole('button', { name: 'messagePins.textMode' }).getAttribute('aria-pressed')).toBe('true');
   });
 
   it('closes the expanded list when clicking outside the pin control', async () => {
