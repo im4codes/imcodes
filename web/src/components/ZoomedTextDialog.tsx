@@ -13,6 +13,7 @@
  */
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { createPortal } from 'preact/compat';
+import type { ComponentChildren } from 'preact';
 import { useTranslation } from 'react-i18next';
 import { positionChatActionMenu } from '../chat-action-menu-position.js';
 import { copyToClipboard } from '../util/clipboard.js';
@@ -26,6 +27,14 @@ interface Props {
   onClose: () => void;
   /** Quotes the currently selected text back into the composer. */
   onQuote?: (text: string) => void;
+  /** Optional context-specific title used when this dialog previews an item. */
+  title?: string;
+  /** Optional context line shown above the message body. */
+  subtitle?: string;
+  /** Context actions rendered before the built-in copy action. */
+  actions?: ComponentChildren;
+  /** Override the built-in "Copy all" label for preview-style dialogs. */
+  copyLabel?: string;
 }
 
 interface SelectionMenuState {
@@ -34,7 +43,7 @@ interface SelectionMenuState {
   y: number;
 }
 
-export function ZoomedTextDialog({ text, onClose, onQuote }: Props) {
+export function ZoomedTextDialog({ text, onClose, onQuote, title, subtitle, actions, copyLabel }: Props) {
   const { t } = useTranslation();
   const [copied, setCopied] = useState(false);
   const [selectionMenu, setSelectionMenu] = useState<SelectionMenuState | null>(null);
@@ -144,7 +153,7 @@ export function ZoomedTextDialog({ text, onClose, onQuote }: Props) {
         onClick={(e: Event) => e.stopPropagation()}
       >
         <div class="zoom-text-header">
-          <div class="zoom-text-title" id="zoom-text-dialog-title">{t('chat.zoom_title')}</div>
+          <div class="zoom-text-title" id="zoom-text-dialog-title">{title ?? t('chat.zoom_title')}</div>
           <button
             type="button"
             class="zoom-text-close"
@@ -152,6 +161,7 @@ export function ZoomedTextDialog({ text, onClose, onQuote }: Props) {
             aria-label={t('common.close')}
           >×</button>
         </div>
+        {subtitle && <div class="zoom-text-subtitle">{subtitle}</div>}
         <div class="zoom-text-body">
           <pre ref={contentRef} class="zoom-text-content">{text}</pre>
         </div>
@@ -183,12 +193,13 @@ export function ZoomedTextDialog({ text, onClose, onQuote }: Props) {
         )}
         <div class="zoom-text-hint">{t('chat.zoom_hint')}</div>
         <div class="zoom-text-actions">
+          {actions}
           <button
             type="button"
             class={`zoom-text-btn${copied ? ' is-copied' : ''}`}
             onClick={handleCopy}
           >
-            {copied ? t('common.copied') : t('chat.zoom_copy_all')}
+            {copied ? t('common.copied') : (copyLabel ?? t('chat.zoom_copy_all'))}
           </button>
         </div>
       </div>

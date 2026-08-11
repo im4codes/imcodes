@@ -1,6 +1,7 @@
 import { useLayoutEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import type { MessagePin } from '@shared/message-pins.js';
+import { ZoomedTextDialog } from './ZoomedTextDialog.js';
 
 interface Props {
   pins: MessagePin[];
@@ -10,6 +11,7 @@ interface Props {
   error?: string | null;
   locateError?: boolean;
   onLocate: (pin: MessagePin) => void;
+  onQuote?: (text: string) => void;
   onUnpin: (pin: MessagePin) => void;
   onDismissError?: () => void;
 }
@@ -21,12 +23,14 @@ export function MessagePinsBar({
   error,
   locateError = false,
   onLocate,
+  onQuote,
   onUnpin,
   onDismissError,
 }: Props) {
   const { t, i18n } = useTranslation();
   const barRef = useRef<HTMLElement>(null);
   const [expanded, setExpanded] = useState(false);
+  const [previewPin, setPreviewPin] = useState<MessagePin | null>(null);
   const [tab, setTab] = useState<'current' | 'all'>('current');
   const currentPins = useMemo(
     () => pins.filter((pin) => pin.sessionName === currentSessionName),
@@ -82,7 +86,7 @@ export function MessagePinsBar({
                 <div class="message-pin-row" key={pin.id}>
                   <button type="button" class="message-pin-open" onClick={() => {
                     setExpanded(false);
-                    onLocate(pin);
+                    setPreviewPin(pin);
                   }}>
                     {tab === 'all' && <span class="message-pin-session">{pin.sessionName}</span>}
                     <span class="message-pin-text">{pin.text}</span>
@@ -105,6 +109,42 @@ export function MessagePinsBar({
             </div>
           )}
         </div>
+      )}
+      {previewPin && (
+        <ZoomedTextDialog
+          text={previewPin.text}
+          title={t('messagePins.previewTitle')}
+          subtitle={`${previewPin.sessionName} · ${new Date(previewPin.eventTs).toLocaleString(i18n.resolvedLanguage || i18n.language)}`}
+          copyLabel={t('common.copy')}
+          onClose={() => setPreviewPin(null)}
+          actions={(
+            <>
+              {onQuote && (
+                <button
+                  type="button"
+                  class="zoom-text-btn"
+                  onClick={() => {
+                    onQuote(previewPin.text);
+                    setPreviewPin(null);
+                  }}
+                >
+                  {t('common.quote')}
+                </button>
+              )}
+              <button
+                type="button"
+                class="zoom-text-btn"
+                onClick={() => {
+                  const pin = previewPin;
+                  setPreviewPin(null);
+                  onLocate(pin);
+                }}
+              >
+                {t('messagePins.jump')}
+              </button>
+            </>
+          )}
+        />
       )}
     </section>
   );

@@ -2898,6 +2898,8 @@
     "unpin": "고정 해제",
     "userMessage": "사용자 메시지",
     "assistantMessage": "어시스턴트 메시지",
+    "previewTitle": "고정 메시지 미리보기",
+    "jump": "메시지로 이동",
     "requestFailed": "고정 메시지 요청에 실패했습니다. 눌러서 닫으세요.",
     "locateFailed": "원본 메시지를 불러올 수 없습니다. 눌러서 닫으세요."
   },

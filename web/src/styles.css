@@ -6417,6 +6417,7 @@ html.native-ios-mac .chat-dl-btn {
 }
 .zoom-text-header { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-shrink: 0; }
 .zoom-text-title { font-size: 13px; font-weight: 600; color: #cbd5e1; letter-spacing: 0.02em; text-transform: uppercase; }
+.zoom-text-subtitle { font-size: 11px; color: #94a3b8; line-height: 1.4; overflow-wrap: anywhere; }
 .zoom-text-close { background: none; border: none; color: #64748b; font-size: 22px; line-height: 1; cursor: pointer; padding: 0 4px; }
 .zoom-text-close:hover { color: #e2e8f0; }
 .zoom-text-body {
@@ -6453,7 +6454,7 @@ html.native-ios-mac .chat-dl-btn {
 }
 .zoom-text-selection-menu { z-index: 2; }
 .zoom-text-hint { font-size: 11px; color: #64748b; line-height: 1.4; flex-shrink: 0; }
-.zoom-text-actions { display: flex; justify-content: flex-end; gap: 8px; flex-shrink: 0; }
+.zoom-text-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; flex-shrink: 0; }
 .zoom-text-btn {
   border: 1px solid rgba(96,165,250,0.5);
   border-radius: 7px;
@@ -6471,7 +6472,7 @@ html.native-ios-mac .chat-dl-btn {
 @media (max-width: 520px) {
   .zoom-text-dialog { width: calc(100vw - 16px); padding: 12px; }
   .zoom-text-btn { width: 100%; padding: 10px; font-size: 13px; }
-  .zoom-text-actions { width: 100%; }
+  .zoom-text-actions { width: 100%; flex-direction: column; }
 }
 /* GFM tables in chat */
 .chat-table { border-collapse: collapse; margin: 8px 0; font-size: 13px; width: auto; max-width: 100%; overflow-x: auto; display: block; }

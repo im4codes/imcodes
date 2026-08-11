@@ -4,7 +4,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { h } from 'preact';
 import type { TimelineEvent } from '../../src/ws-client.js';
 import type { MessagePin } from '../../../shared/message-pins.js';
-import { requestMessagePinNavigation } from '../../src/message-pin-navigation.js';
+import {
+  __resetMessagePinNavigationForTests,
+  getPendingMessagePin,
+  requestMessagePinNavigation,
+} from '../../src/message-pin-navigation.js';
 
 const pinMessageMock = vi.hoisted(() => vi.fn());
 const unpinMessageMock = vi.hoisted(() => vi.fn());
@@ -58,6 +62,7 @@ describe('ChatView message pin action', () => {
     pinMessageMock.mockReset().mockResolvedValue(null);
     unpinMessageMock.mockReset();
     messagePinsState.pins = [];
+    __resetMessagePinNavigationForTests();
     Reflect.deleteProperty(window, 'ontouchstart');
   });
   afterEach(cleanup);
@@ -189,7 +194,7 @@ describe('ChatView message pin action', () => {
       updatedAt: 1,
     }];
 
-    const { getPendingMessagePin, subscribeMessagePinNavigation } = await import('../../src/message-pin-navigation.js');
+    const { subscribeMessagePinNavigation } = await import('../../src/message-pin-navigation.js');
     const observedSources: Array<string | null> = [];
     const unsubscribe = subscribeMessagePinNavigation((_pin, sourceSessionName) => {
       observedSources.push(sourceSessionName);
@@ -237,6 +242,8 @@ describe('ChatView message pin action', () => {
       fireEvent.click(sourceChat.getByTestId('message-pins-trigger'));
       fireEvent.click(sourceChat.getByText('messagePins.allTab'));
       fireEvent.click(sourceChat.getByText('Pinned target message'));
+      expect(scrollTo).not.toHaveBeenCalled();
+      fireEvent.click(screen.getByText('messagePins.jump'));
 
       await waitFor(() => expect(scrollTo).toHaveBeenCalledTimes(1));
       expect(observedSources).toContain('deck_pin_source');
@@ -244,5 +251,40 @@ describe('ChatView message pin action', () => {
     } finally {
       unsubscribe();
     }
+  });
+
+  it('quotes a previewed cross-session pin into the current chat without navigating', () => {
+    const onQuote = vi.fn();
+    messagePinsState.pins = [{
+      id: 'pin-for-current-quote',
+      serverId: 'srv-1',
+      sessionName: 'deck_pin_other',
+      eventId: 'event-in-other',
+      eventTs: 1234,
+      eventType: 'assistant.text',
+      text: 'Quote this into the current composer',
+      createdAt: 1,
+      updatedAt: 1,
+    }];
+
+    render(
+      <ChatView
+        events={[]}
+        loading={false}
+        sessionId="deck_pin_current"
+        serverId="srv-1"
+        onQuote={onQuote}
+        messagePinsEnabled
+      />,
+    );
+
+    fireEvent.click(screen.getByTestId('message-pins-trigger'));
+    fireEvent.click(screen.getByText('messagePins.allTab'));
+    fireEvent.click(screen.getByText('Quote this into the current composer'));
+    fireEvent.click(screen.getByText('common.quote'));
+
+    expect(onQuote).toHaveBeenCalledWith('Quote this into the current composer');
+    expect(getPendingMessagePin('deck_pin_other')).toBeNull();
+    expect(screen.queryByText('messagePins.previewTitle')).toBeNull();
   });
 });

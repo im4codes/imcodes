@@ -2899,6 +2899,8 @@
     "unpin": "Unpin",
     "userMessage": "Your message",
     "assistantMessage": "Assistant message",
+    "previewTitle": "Pinned message preview",
+    "jump": "Jump to message",
     "requestFailed": "Pinned-message request failed. Tap to dismiss.",
     "locateFailed": "The original message could not be loaded. Tap to dismiss."
   },

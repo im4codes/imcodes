@@ -2899,6 +2899,8 @@
     "unpin": "Desfijar",
     "userMessage": "Mensaje del usuario",
     "assistantMessage": "Mensaje del asistente",
+    "previewTitle": "Vista previa del mensaje fijado",
+    "jump": "Ir al mensaje",
     "requestFailed": "Falló la solicitud de mensajes fijados. Toca para cerrar.",
     "locateFailed": "No se pudo cargar el mensaje original. Toca para cerrar."
   },

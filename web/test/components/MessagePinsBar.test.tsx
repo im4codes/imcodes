@@ -37,9 +37,10 @@ describe('MessagePinsBar', () => {
 
   it('collapses to a compact current/total count and switches between current and all sessions', () => {
     const onLocate = vi.fn();
+    const onQuote = vi.fn();
     const onUnpin = vi.fn();
     const pins = [pin('u1', 'deck_current'), pin('a2', 'deck_current'), pin('a3', 'deck_other')];
-    render(<MessagePinsBar pins={pins} currentSessionName="deck_current" onLocate={onLocate} onUnpin={onUnpin} />);
+    render(<MessagePinsBar pins={pins} currentSessionName="deck_current" onLocate={onLocate} onQuote={onQuote} onUnpin={onUnpin} />);
 
     const trigger = screen.getByTestId('message-pins-trigger');
     expect(trigger.textContent).toBe('📌2/3');
@@ -54,9 +55,24 @@ describe('MessagePinsBar', () => {
     expect(screen.getByText('pinned a3')).toBeTruthy();
     expect(screen.getByText('deck_other')).toBeTruthy();
     fireEvent.click(screen.getByText('pinned a3'));
-    expect(onLocate).toHaveBeenCalledWith(pins[2]);
+    expect(onLocate).not.toHaveBeenCalled();
     expect(trigger.getAttribute('aria-expanded')).toBe('false');
-    expect(screen.queryByText('pinned a3')).toBeNull();
+    expect(document.querySelector('.message-pins-panel')).toBeNull();
+    expect(screen.getByText('messagePins.previewTitle')).toBeTruthy();
+    expect(screen.getByText('common.quote')).toBeTruthy();
+    expect(screen.getByText('messagePins.jump')).toBeTruthy();
+    expect(screen.getByText('common.copy')).toBeTruthy();
+
+    fireEvent.click(screen.getByText('common.quote'));
+    expect(onQuote).toHaveBeenCalledWith('pinned a3');
+    expect(onLocate).not.toHaveBeenCalled();
+    expect(screen.queryByText('messagePins.previewTitle')).toBeNull();
+
+    fireEvent.click(trigger);
+    fireEvent.click(screen.getByText('All (3)'));
+    fireEvent.click(screen.getByText('pinned a3'));
+    fireEvent.click(screen.getByText('messagePins.jump'));
+    expect(onLocate).toHaveBeenCalledWith(pins[2]);
   });
 
   it('keeps removal separate from navigation', () => {

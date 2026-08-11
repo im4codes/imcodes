@@ -12,6 +12,8 @@ const REQUIRED_KEYS = [
   'unpin',
   'userMessage',
   'assistantMessage',
+  'previewTitle',
+  'jump',
   'requestFailed',
   'locateFailed',
 ] as const;

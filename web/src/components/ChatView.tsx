@@ -3081,6 +3081,7 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
                 error={messagePins.error}
                 locateError={pinnedLocateError}
                 onLocate={(pin) => { void locatePinnedMessage(pin); }}
+                onQuote={onQuote}
                 onUnpin={(pin) => { void messagePins.unpinMessage(pin); }}
                 onDismissError={() => {
                   messagePins.clearError();

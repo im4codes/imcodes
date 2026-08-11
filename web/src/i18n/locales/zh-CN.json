@@ -2899,6 +2899,8 @@
     "unpin": "取消固定",
     "userMessage": "用户消息",
     "assistantMessage": "助手消息",
+    "previewTitle": "固定消息预览",
+    "jump": "跳转到消息",
     "requestFailed": "固定消息操作失败，点击关闭",
     "locateFailed": "无法加载原消息及上下文，点击关闭"
   },
