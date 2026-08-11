@@ -6403,7 +6403,9 @@ html.native-ios-mac .chat-dl-btn {
 }
 .zoom-text-dialog {
   position: relative;
+  box-sizing: border-box;
   width: min(640px, calc(100vw - 24px));
+  max-width: calc(100vw - 24px);
   max-height: calc(100vh - var(--sat, 0px) - env(safe-area-inset-bottom, 0px) - 32px);
   display: flex;
   flex-direction: column;
@@ -6498,14 +6500,34 @@ html.native-ios-mac .chat-dl-btn {
 .zoom-text-btn.is-copied { background: #166534; border-color: #16a34a; color: #86efac; }
 .zoom-text-resize-handle {
   position: absolute;
-  left: 0;
-  right: 0;
+  z-index: 3;
+  touch-action: none;
+  -webkit-user-select: none !important;
+  user-select: none !important;
+}
+.zoom-text-resize-handle.is-bottom {
+  left: 14px;
+  right: 14px;
   bottom: 0;
   height: 10px;
   cursor: ns-resize;
-  touch-action: none;
 }
-.zoom-text-resize-handle::after {
+.zoom-text-resize-handle.is-right {
+  top: 14px;
+  right: 0;
+  bottom: 14px;
+  width: 10px;
+  cursor: ew-resize;
+}
+.zoom-text-resize-handle.is-corner {
+  right: 0;
+  bottom: 0;
+  width: 22px;
+  height: 22px;
+  cursor: nwse-resize;
+  z-index: 4;
+}
+.zoom-text-resize-handle.is-bottom::after {
   content: '';
   position: absolute;
   left: 50%;
@@ -6516,13 +6538,40 @@ html.native-ios-mac .chat-dl-btn {
   border-radius: 999px;
   background: rgba(148,163,184,0.38);
 }
+.zoom-text-resize-handle.is-right::after {
+  content: '';
+  position: absolute;
+  top: 50%;
+  right: 3px;
+  width: 3px;
+  height: 40px;
+  transform: translateY(-50%);
+  border-radius: 999px;
+  background: rgba(148,163,184,0.38);
+}
+.zoom-text-resize-handle.is-corner::after {
+  content: '';
+  position: absolute;
+  right: 4px;
+  bottom: 4px;
+  width: 10px;
+  height: 10px;
+  border-right: 2px solid rgba(148,163,184,0.56);
+  border-bottom: 2px solid rgba(148,163,184,0.56);
+  border-radius: 0 0 4px;
+}
+@media (pointer: coarse) {
+  .zoom-text-resize-handle.is-bottom { height: 16px; }
+  .zoom-text-resize-handle.is-right { width: 16px; }
+  .zoom-text-resize-handle.is-corner { width: 30px; height: 30px; }
+}
 @media (max-width: 520px) {
-  .zoom-text-dialog { width: calc(100vw - 16px); padding: 12px; }
+  .zoom-text-dialog { width: calc(100vw - 16px); max-width: calc(100vw - 16px); padding: 12px; }
   .zoom-text-btn { width: 100%; padding: 10px; font-size: 13px; }
   .zoom-text-actions { width: 100%; flex-direction: column; }
 }
 @media (max-width: 640px) {
-  .zoom-text-dialog-message-preview { width: calc(100vw - 16px); }
+  .zoom-text-dialog-message-preview { width: calc(100vw - 16px); max-width: calc(100vw - 16px); }
 }
 /* GFM tables in chat */
 .chat-table { border-collapse: collapse; margin: 8px 0; font-size: 13px; width: auto; max-width: 100%; overflow-x: auto; display: block; }
