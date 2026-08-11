@@ -1900,6 +1900,8 @@
     "port": "連接埠",
     "path": "路徑",
     "open": "開啟",
+    "back": "上一頁",
+    "forward": "下一頁",
     "refresh": "重新整理",
     "openInNewTab": "在新分頁開啟",
     "closePreview": "關閉預覽",

@@ -1900,6 +1900,8 @@
     "port": "Port",
     "path": "Path",
     "open": "Open",
+    "back": "Back",
+    "forward": "Forward",
     "refresh": "Refresh",
     "openInNewTab": "Open in new tab",
     "closePreview": "Close preview",

@@ -1899,6 +1899,8 @@
     "port": "ポート",
     "path": "パス",
     "open": "開く",
+    "back": "戻る",
+    "forward": "進む",
     "refresh": "更新",
     "openInNewTab": "新しいタブで開く",
     "closePreview": "プレビューを閉じる",

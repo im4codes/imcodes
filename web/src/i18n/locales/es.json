@@ -1900,6 +1900,8 @@
     "port": "Puerto",
     "path": "Ruta",
     "open": "Abrir",
+    "back": "Atrás",
+    "forward": "Adelante",
     "refresh": "Actualizar",
     "openInNewTab": "Abrir en una nueva pestaña",
     "closePreview": "Cerrar vista previa",

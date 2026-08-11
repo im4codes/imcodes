@@ -1899,6 +1899,8 @@
     "port": "포트",
     "path": "경로",
     "open": "열기",
+    "back": "뒤로",
+    "forward": "앞으로",
     "refresh": "새로고침",
     "openInNewTab": "새 탭에서 열기",
     "closePreview": "미리보기 닫기",

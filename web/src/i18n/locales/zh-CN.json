@@ -1900,6 +1900,8 @@
     "port": "端口",
     "path": "路径",
     "open": "打开",
+    "back": "后退",
+    "forward": "前进",
     "refresh": "刷新",
     "openInNewTab": "在新标签页打开",
     "closePreview": "关闭预览",
