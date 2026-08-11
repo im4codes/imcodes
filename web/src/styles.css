@@ -6569,6 +6569,8 @@ html.native-ios-mac .chat-dl-btn {
   .zoom-text-dialog { width: calc(100vw - 16px); max-width: calc(100vw - 16px); padding: 12px; }
   .zoom-text-btn { width: 100%; padding: 10px; font-size: 13px; }
   .zoom-text-actions { width: 100%; flex-direction: column; }
+  .zoom-text-dialog-message-preview .zoom-text-actions { flex-direction: row; flex-wrap: nowrap; gap: 6px; }
+  .zoom-text-dialog-message-preview .zoom-text-btn { flex: 1 1 0; min-width: 0; width: auto; padding: 10px 5px; font-size: 12px; }
 }
 @media (max-width: 640px) {
   .zoom-text-dialog-message-preview { width: calc(100vw - 16px); max-width: calc(100vw - 16px); }

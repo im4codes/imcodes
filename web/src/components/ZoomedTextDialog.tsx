@@ -86,7 +86,9 @@ function clampMessagePreviewWidth(value: number): number {
 }
 
 function readMessagePreviewHeight(): number {
-  const fallback = clampMessagePreviewHeight(viewportHeight() * 0.6);
+  const fallback = clampMessagePreviewHeight(
+    viewportHeight() * (viewportWidth() <= MESSAGE_PREVIEW_MOBILE_BREAKPOINT ? 0.9 : 0.6),
+  );
   try {
     const stored = Number(localStorage.getItem(MESSAGE_PREVIEW_HEIGHT_KEY));
     return Number.isFinite(stored) && stored > 0 ? clampMessagePreviewHeight(stored) : fallback;

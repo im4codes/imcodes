@@ -50,6 +50,16 @@ describe('styles.css regression contracts', () => {
     const mobileRule = css.match(/@media\s*\(max-width:\s*640px\)\s*\{[\s\S]*?\.zoom-text-dialog-message-preview\s*\{[^}]*\}/)?.[0];
     expect(mobileRule).toBeTruthy();
     expect(mobileRule).toMatch(/width:\s*calc\(100vw - 16px\)/);
+
+    const mobileActionsRule = css.match(/@media\s*\(max-width:\s*520px\)\s*\{[\s\S]*?\.zoom-text-dialog-message-preview \.zoom-text-actions\s*\{[^}]*\}/)?.[0];
+    expect(mobileActionsRule).toBeTruthy();
+    expect(mobileActionsRule).toMatch(/flex-direction:\s*row/);
+    expect(mobileActionsRule).toMatch(/flex-wrap:\s*nowrap/);
+
+    const mobileButtonRule = css.match(/@media\s*\(max-width:\s*520px\)\s*\{[\s\S]*?\.zoom-text-dialog-message-preview \.zoom-text-btn\s*\{[^}]*\}/)?.[0];
+    expect(mobileButtonRule).toBeTruthy();
+    expect(mobileButtonRule).toMatch(/flex:\s*1\s+1\s+0/);
+    expect(mobileButtonRule).toMatch(/width:\s*auto/);
   });
 
   it('keeps long delegation replies at content height inside the chat flex scroller', () => {

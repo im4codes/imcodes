@@ -133,6 +133,33 @@ describe('ZoomedTextDialog', () => {
     expect(document.querySelector('.zoom-text-close')).toBeTruthy();
   });
 
+  it('defaults pinned-message previews to 90% of the mobile viewport height', () => {
+    const innerWidthDescriptor = Object.getOwnPropertyDescriptor(window, 'innerWidth');
+    const innerHeightDescriptor = Object.getOwnPropertyDescriptor(window, 'innerHeight');
+    const visualViewportDescriptor = Object.getOwnPropertyDescriptor(window, 'visualViewport');
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 390 });
+    Object.defineProperty(window, 'innerHeight', { configurable: true, value: 800 });
+    Object.defineProperty(window, 'visualViewport', { configurable: true, value: undefined });
+
+    try {
+      render(
+        <ZoomedTextDialog
+          text="mobile preview"
+          onClose={vi.fn()}
+          messagePreviewLayout
+        />,
+      );
+
+      const dialog = document.querySelector<HTMLElement>('.zoom-text-dialog-message-preview')!;
+      expect(dialog.style.height).toBe('720px');
+    } finally {
+      if (innerWidthDescriptor) Object.defineProperty(window, 'innerWidth', innerWidthDescriptor);
+      if (innerHeightDescriptor) Object.defineProperty(window, 'innerHeight', innerHeightDescriptor);
+      if (visualViewportDescriptor) Object.defineProperty(window, 'visualViewport', visualViewportDescriptor);
+      else Reflect.deleteProperty(window, 'visualViewport');
+    }
+  });
+
   it('persists pinned-preview width and height without closing after resize', async () => {
     const onClose = vi.fn();
     render(
