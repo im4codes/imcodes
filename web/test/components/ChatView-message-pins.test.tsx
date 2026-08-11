@@ -74,7 +74,17 @@ vi.mock('react-i18next', () => ({
 }));
 
 vi.mock('../../src/components/ChatMarkdown.js', () => ({
-  ChatMarkdown: ({ text }: { text: string }) => <span data-testid="chat-markdown">{text}</span>,
+  ChatMarkdown: ({ text }: { text: string }) => text.includes('127.0.0.1:8787')
+    ? (
+      <span data-testid="chat-markdown" data-source-text={text}>
+        <strong>Local access</strong>: http://127.0.0.1:8787/
+        <span class="chat-loopback-actions">
+          <button>Open through IM.codes proxy</button>
+          <button>Open directly on LAN</button>
+        </span>
+      </span>
+    )
+    : <span data-testid="chat-markdown">{text}</span>,
 }));
 
 import { ChatView } from '../../src/components/ChatView.js';
@@ -148,6 +158,71 @@ describe('ChatView message pin action', () => {
       eventTs: 1234,
       eventType: 'user.message',
       text: 'Keep this exact message',
+    });
+  });
+
+  it('pins source Markdown instead of rendered loopback action labels', async () => {
+    const sourceText = '**Local access**: http://127.0.0.1:8787/';
+    const event: TimelineEvent = {
+      ...userEvent(),
+      type: 'assistant.text',
+      payload: { text: sourceText },
+    };
+    const { container } = render(
+      <ChatView
+        events={[event]}
+        loading={false}
+        sessionId="deck_pin_main"
+        serverId="srv-1"
+        messagePinsEnabled
+      />,
+    );
+    const bubble = container.querySelector<HTMLElement>('[data-event-id="event-to-pin"]');
+    expect(bubble?.textContent).toContain('Open through IM.codes proxy');
+    fireEvent.contextMenu(bubble!, { clientX: 40, clientY: 40 });
+    await waitFor(() => expect(screen.getByText('messagePins.pin')).toBeTruthy());
+    fireEvent.click(screen.getByText('messagePins.pin'));
+
+    expect(pinMessageMock).toHaveBeenCalledWith({
+      eventId: 'event-to-pin',
+      eventTs: 1234,
+      eventType: 'assistant.text',
+      text: sourceText,
+    });
+  });
+
+  it('pins the complete source text of a merged assistant bubble', async () => {
+    const first: TimelineEvent = {
+      ...userEvent(),
+      type: 'assistant.text',
+      payload: { text: '**First part**' },
+    };
+    const second: TimelineEvent = {
+      ...first,
+      eventId: 'event-to-pin-part-2',
+      ts: 1235,
+      seq: 2,
+      payload: { text: 'Second part' },
+    };
+    const { container } = render(
+      <ChatView
+        events={[first, second]}
+        loading={false}
+        sessionId="deck_pin_main"
+        serverId="srv-1"
+        messagePinsEnabled
+      />,
+    );
+    const bubble = container.querySelector<HTMLElement>('[data-event-id="event-to-pin"]');
+    fireEvent.contextMenu(bubble!, { clientX: 40, clientY: 40 });
+    await waitFor(() => expect(screen.getByText('messagePins.pin')).toBeTruthy());
+    fireEvent.click(screen.getByText('messagePins.pin'));
+
+    expect(pinMessageMock).toHaveBeenCalledWith({
+      eventId: 'event-to-pin',
+      eventTs: 1234,
+      eventType: 'assistant.text',
+      text: '**First part**\nSecond part',
     });
   });
 
@@ -357,5 +432,47 @@ describe('ChatView message pin action', () => {
     expect(previewModePref.requestedKeys).toContain('message_pin_preview_mode');
     fireEvent.click(screen.getByRole('button', { name: 'messagePins.textMode' }));
     expect(previewModePref.save).toHaveBeenCalledWith('text');
+  });
+
+  it('recovers an existing polluted pin from its loaded source event in every preview mode', () => {
+    const sourceText = '**Local access**: http://127.0.0.1:8787/';
+    const pollutedText = 'Local access: http://127.0.0.1:8787/Open through IM.codes proxyOpen directly on LAN';
+    const onQuote = vi.fn();
+    messagePinsState.pins = [{
+      id: 'pin-polluted-loopback',
+      serverId: 'srv-1',
+      sessionName: 'deck_pin_main',
+      eventId: 'event-to-pin',
+      eventTs: 1234,
+      eventType: 'user.message',
+      text: pollutedText,
+      createdAt: 1,
+      updatedAt: 1,
+    }];
+
+    const props = {
+      events: [{ ...userEvent(), payload: { text: sourceText } }],
+      loading: false,
+      sessionId: 'deck_pin_main',
+      serverId: 'srv-1',
+      onQuote,
+      messagePinsEnabled: true,
+    };
+    const view = render(
+      <ChatView
+        {...props}
+      />,
+    );
+
+    fireEvent.click(screen.getByTestId('message-pins-trigger'));
+    expect(document.querySelector('.message-pin-text')?.textContent).toBe(sourceText);
+    fireEvent.click(document.querySelector('.message-pin-open')!);
+    expect(screen.getByTestId('chat-markdown').getAttribute('data-source-text')).toBe(sourceText);
+
+    previewModePref.value = 'text';
+    view.rerender(<ChatView {...props} events={[...props.events]} />);
+    expect(document.querySelector('pre.zoom-text-content')?.textContent).toBe(sourceText);
+    fireEvent.click(screen.getByText('common.quote'));
+    expect(onQuote).toHaveBeenCalledWith(sourceText);
   });
 });

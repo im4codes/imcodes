@@ -1111,6 +1111,25 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
   return items;
 }
 
+/** Return the source text represented by a pinnable timeline event.
+ *
+ * Assistant rows can merge several consecutive `assistant.text` events into
+ * one visible bubble. In that case the first event id is attached to the DOM,
+ * so reading only that event's payload would truncate the pinned message. The
+ * merged ViewItem is still source data (including Markdown), unlike text read
+ * back from the rendered DOM, which also contains interactive link controls. */
+function messagePinSourceText(event: TimelineEvent, viewItems: ViewItem[]): string | null {
+  if (event.type === 'assistant.text') {
+    const block = viewItems.find((item) => (
+      item.type === 'assistant-block'
+      && (item.key === event.eventId || item.eventIds?.includes(event.eventId))
+    ));
+    if (typeof block?.text === 'string' && block.text.trim()) return block.text;
+  }
+  const text = event.payload.text;
+  return typeof text === 'string' && text.trim() ? text : null;
+}
+
 function textRevision(text: string | undefined): string {
   const value = text ?? '';
   return `${value.length}:${value.slice(-48)}`;
@@ -2123,6 +2142,11 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
     () => getRenderedViewRevision(renderedViewItems),
     [renderedViewItems],
   );
+  const resolvePinnedMessageText = useCallback((pin: MessagePin): string => {
+    if (pin.sessionName !== sessionId) return pin.text;
+    const sourceEvent = events.find((event) => event.eventId === pin.eventId);
+    return sourceEvent ? (messagePinSourceText(sourceEvent, viewItems) ?? pin.text) : pin.text;
+  }, [events, sessionId, viewItems]);
 
   const locatePinnedMessage = useCallback(async (pin: MessagePin) => {
     if (!sessionId || pin.sessionName !== sessionId) {
@@ -3025,6 +3049,9 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
   const contextMenuPin = contextMenuPinEvent
     ? messagePins.pins.find((pin) => pin.sessionName === sessionId && pin.eventId === contextMenuPinEvent.eventId)
     : undefined;
+  const contextMenuPinText = contextMenuPinEvent
+    ? (messagePinSourceText(contextMenuPinEvent, viewItems) ?? '')
+    : '';
   return (
     <div class={`chat-view-wrap${hasRightPanel ? ' chat-split' : ''}`}>
       {(canShowAgentsControl || onForceSync || canShowFilePanel) && (
@@ -3116,6 +3143,7 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
                 previewMode={messagePinPreviewMode}
                 onPreviewModeChange={handleMessagePinPreviewModeChange}
                 renderPreview={renderPinnedMessagePreview}
+                resolvePinText={resolvePinnedMessageText}
                 onUnpin={(pin) => { void messagePins.unpinMessage(pin); }}
                 onDismissError={() => {
                   messagePins.clearError();
@@ -3445,7 +3473,7 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
               </button>
               </>
             )}
-            {contextMenuPinEvent && (
+            {contextMenuPinEvent && contextMenuPinText && (
               <button
                 class="chat-sel-btn"
                 disabled={messagePins.mutating}
@@ -3457,7 +3485,7 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
                       eventId: contextMenuPinEvent.eventId,
                       eventTs: contextMenuPinEvent.ts,
                       eventType: contextMenuPinEvent.type,
-                      text: ctxMenu.text.slice(0, MESSAGE_PIN_LIMITS.TEXT_CHARS),
+                      text: contextMenuPinText.slice(0, MESSAGE_PIN_LIMITS.TEXT_CHARS),
                     });
                   }
                   setCtxMenu(null);

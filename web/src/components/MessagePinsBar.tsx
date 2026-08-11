@@ -18,6 +18,7 @@ interface Props {
   previewMode?: MessagePinPreviewMode;
   onPreviewModeChange?: (mode: MessagePinPreviewMode) => void;
   renderPreview?: (text: string) => ComponentChildren;
+  resolvePinText?: (pin: MessagePin) => string;
   onUnpin: (pin: MessagePin) => void;
   onDismissError?: () => void;
 }
@@ -33,6 +34,7 @@ export function MessagePinsBar({
   previewMode = 'rendered',
   onPreviewModeChange,
   renderPreview,
+  resolvePinText,
   onUnpin,
   onDismissError,
 }: Props) {
@@ -46,6 +48,9 @@ export function MessagePinsBar({
     [currentSessionName, pins],
   );
   const visiblePins = tab === 'current' ? currentPins : pins;
+  const previewText = previewPin
+    ? (resolvePinText?.(previewPin) || previewPin.text)
+    : '';
 
   useLayoutEffect(() => {
     if (!expanded) return;
@@ -98,7 +103,7 @@ export function MessagePinsBar({
                     setPreviewPin(pin);
                   }}>
                     {tab === 'all' && <span class="message-pin-session">{pin.sessionName}</span>}
-                    <span class="message-pin-text">{pin.text}</span>
+                    <span class="message-pin-text">{resolvePinText?.(pin) || pin.text}</span>
                     <span class="message-pin-meta">
                       {pin.eventType === 'user.message' ? t('messagePins.userMessage') : t('messagePins.assistantMessage')}
                       {' · '}
@@ -121,14 +126,14 @@ export function MessagePinsBar({
       )}
       {previewPin && (
         <ZoomedTextDialog
-          text={previewPin.text}
+          text={previewText}
           title={t('messagePins.previewTitle')}
           subtitle={`${previewPin.sessionName} · ${new Date(previewPin.eventTs).toLocaleString(i18n.resolvedLanguage || i18n.language)}`}
           copyLabel={t('common.copy')}
           messagePreviewLayout
           onClose={() => setPreviewPin(null)}
           renderedContent={previewMode === 'rendered' && renderPreview
-            ? renderPreview(previewPin.text)
+            ? renderPreview(previewText)
             : undefined}
           viewControls={renderPreview && onPreviewModeChange ? (
             <div class="zoom-text-mode-switch" role="group" aria-label={t('messagePins.previewMode')}>
@@ -157,7 +162,7 @@ export function MessagePinsBar({
                   type="button"
                   class="zoom-text-btn"
                   onClick={() => {
-                    onQuote(previewPin.text);
+                    onQuote(previewText);
                     setPreviewPin(null);
                   }}
                 >
