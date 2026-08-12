@@ -92,6 +92,28 @@ describe('AuthenticatedWebSocketClient reconnect ownership', () => {
     client.stop();
   });
 
+  it('reconnects after connect timeout even if terminate never emits close', async () => {
+    vi.useFakeTimers();
+    const sockets: FakeSocket[] = [];
+    const client = createClient(() => {
+      const socket = new FakeSocket();
+      sockets.push(socket);
+      return socket;
+    });
+
+    client.start();
+    await vi.advanceTimersByTimeAsync(999);
+    expect(sockets[0]!.terminateCalls).toBe(0);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(sockets[0]!.terminateCalls).toBe(1);
+    await vi.advanceTimersByTimeAsync(99);
+    expect(sockets).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(sockets).toHaveLength(2);
+
+    client.stop();
+  });
+
   it('reconnects on inbound silence even if terminate never emits close', async () => {
     vi.useFakeTimers();
     const sockets: FakeSocket[] = [];
@@ -131,5 +153,23 @@ describe('AuthenticatedWebSocketClient reconnect ownership', () => {
     expect(sockets).toHaveLength(2);
 
     client.stop();
+  });
+
+  it('does not reconnect after stop when failed-socket events arrive late', async () => {
+    vi.useFakeTimers();
+    const sockets: FakeSocket[] = [];
+    const client = createClient(() => {
+      const socket = new FakeSocket();
+      sockets.push(socket);
+      return socket;
+    });
+
+    client.start();
+    sockets[0]!.emit('error', new Error('network adapter disappeared'));
+    client.stop();
+    sockets[0]!.emit('close');
+    sockets[0]!.emit('error', new Error('late socket error'));
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(sockets).toHaveLength(1);
   });
 });
