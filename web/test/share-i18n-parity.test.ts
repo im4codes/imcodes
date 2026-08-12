@@ -28,4 +28,17 @@ describe('share i18n parity', () => {
       expect(keys, locale).toEqual(baseKeys);
     }
   });
+
+  it('defines a translated owner role for controlled nodes in every locale', () => {
+    for (const locale of SUPPORTED_LOCALES) {
+      const messages = JSON.parse(
+        readFileSync(join(WEB_ROOT, 'src/i18n/locales', `${locale}.json`), 'utf8'),
+      ) as { share?: { role?: { owner?: unknown } } };
+      const owner = messages.share?.role?.owner;
+
+      expect(typeof owner, locale).toBe('string');
+      expect(String(owner).trim(), locale).not.toBe('');
+      expect(owner, locale).not.toBe('share.role.owner');
+    }
+  });
 });

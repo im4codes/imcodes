@@ -139,6 +139,7 @@
     },
     "role": {
       "label": "ロール",
+      "owner": "所有者",
       "viewer": "閲覧者",
       "participant": "参加者",
       "serverMember": "サーバーメンバー",

@@ -139,6 +139,7 @@
     },
     "role": {
       "label": "Rol",
+      "owner": "Propietario",
       "viewer": "Visualizador",
       "participant": "Participante",
       "serverMember": "Miembro del servidor",

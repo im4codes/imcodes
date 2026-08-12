@@ -139,6 +139,7 @@
     },
     "role": {
       "label": "角色",
+      "owner": "擁有者",
       "viewer": "檢視者",
       "participant": "參與者",
       "serverMember": "伺服器成員",

@@ -139,6 +139,7 @@
     },
     "role": {
       "label": "Роль",
+      "owner": "Владелец",
       "viewer": "Наблюдатель",
       "participant": "Участник",
       "serverMember": "Участник сервера",

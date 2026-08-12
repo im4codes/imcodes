@@ -139,6 +139,7 @@
     },
     "role": {
       "label": "역할",
+      "owner": "소유자",
       "viewer": "뷰어",
       "participant": "참가자",
       "serverMember": "서버 멤버",
