@@ -537,6 +537,7 @@
     "transport_queue_append": "Добавить",
     "transport_queue_append_all": "Добавить все",
     "transport_queue_append_failed": "Не удалось добавить сообщение; оно осталось в очереди.",
+    "stop_appended_queue": "Сообщения из очереди добавлены; сессия продолжает работу.",
     "send_placeholder": "Отправить в {{name}}…",
     "send_placeholder_desktop_upload": "{{placeholder}} Поддерживается быстрая загрузка нескольких файлов вставкой или перетаскиванием",
     "composer_target_label": "Отправка в",

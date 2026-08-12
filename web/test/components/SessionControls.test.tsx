@@ -132,6 +132,7 @@ vi.mock('react-i18next', () => ({
         return 'Paste is too large for inline input here. Upload it as a file instead.';
       }
       if (key === 'session.stop_plain') return 'Stop';
+      if (key === 'session.stop_appended_queue') return 'Queued messages appended; the session is still running.';
       if (key === 'session.restart_plain') return 'Restart';
       if (key === 'session.start_fresh') return 'Start fresh';
       if (key === 'session.pin_plain') return 'Pin';
@@ -4586,7 +4587,9 @@ afterEach(() => {
       />,
     );
 
-    fireEvent.click(screen.getAllByRole('button', { name: 'transport_queue_append' })[0]);
+    const append = screen.getAllByRole('button', { name: 'transport_queue_append' })[0];
+    expect(append.parentElement?.firstElementChild).toBe(append);
+    fireEvent.click(append);
 
     expect(ws.send).toHaveBeenCalledWith(expect.objectContaining({
       type: 'session.append_queued_messages',
@@ -4599,7 +4602,7 @@ afterEach(() => {
     expect(screen.getByText('leave this queued')).toBeDefined();
   });
 
-  it('appends every queued message from the action beside Hide', () => {
+  it('puts Append all at the far left and appends every queued message', () => {
     const ws = makeWs();
     render(
       <SessionControls
@@ -4621,6 +4624,7 @@ afterEach(() => {
     const appendAll = screen.getByRole('button', { name: 'transport_queue_append_all' });
     const hide = screen.getByRole('button', { name: 'hide' });
     expect(appendAll.parentElement).toBe(hide.parentElement);
+    expect(appendAll.parentElement?.firstElementChild).toBe(appendAll);
     fireEvent.click(appendAll);
 
     expect(ws.send).toHaveBeenCalledWith(expect.objectContaining({
@@ -4631,6 +4635,65 @@ afterEach(() => {
     }));
     expect(screen.queryByText('first append')).toBeNull();
     expect(screen.queryByText('second append')).toBeNull();
+  });
+
+  it('uses Stop to append the queue first and shows that the session is still running', () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({
+          name: 'qwen-session',
+          agentType: 'qwen',
+          runtimeType: 'transport',
+          state: 'running',
+          transportPendingMessageEntries: [
+            { clientMessageId: 'msg-1', text: 'append before stopping' },
+          ],
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    const stop = screen.getByRole('button', { name: /^stop$/i });
+    fireEvent.pointerDown(stop);
+    fireEvent.click(stop);
+
+    expect(ws.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'session.append_queued_messages',
+      sessionName: 'qwen-session',
+      clientMessageIds: ['msg-1'],
+      commandId: expect.any(String),
+    }));
+    expect(gatherCancelCalls(ws)).toEqual([]);
+    expect(ws.send.mock.calls.filter(([payload]) => (
+      (payload as { type?: string }).type === 'session.append_queued_messages'
+    ))).toHaveLength(1);
+    expect(screen.getByText('Queued messages appended; the session is still running.')).toBeDefined();
+  });
+
+  it('uses Stop to cancel when there are no appendable queued messages', () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({
+          name: 'qwen-session',
+          agentType: 'qwen',
+          runtimeType: 'transport',
+          state: 'running',
+          transportPendingMessageEntries: [],
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /^stop$/i }));
+
+    expectUrgentCancelPayload(ws, { sessionName: 'qwen-session' });
+    expect(ws.send).not.toHaveBeenCalledWith(expect.objectContaining({
+      type: 'session.append_queued_messages',
+    }));
   });
 
   it('restores queued messages in their original order when an active-turn append is rejected', async () => {

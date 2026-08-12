@@ -537,6 +537,7 @@
     "transport_queue_append": "追加",
     "transport_queue_append_all": "全部追加",
     "transport_queue_append_failed": "追加失敗，訊息仍保留在佇列中。",
+    "stop_appended_queue": "已追加佇列訊息，本次未停止工作階段。",
     "send_placeholder": "傳送給 {{name}}…",
     "send_placeholder_desktop_upload": "{{placeholder}} 支援多檔案貼上或拖曳快速上傳",
     "composer_target_label": "傳送至",

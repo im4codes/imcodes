@@ -3934,11 +3934,11 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     });
   }, [editingQueuedMessageId, incomingQueuedTransportEntries, isEditableQueuedEntry, publishComposerText, sendQueuedMessageMutation]);
 
-  const handleQueuedMessagesAppend = useCallback((entries: LocalQueuedTransportEntry[]) => {
+  const handleQueuedMessagesAppend = useCallback((entries: LocalQueuedTransportEntry[]): boolean => {
     const appendable = entries.filter((entry) => (
       entry.status !== 'failed' && entry.status !== 'sending' && isEditableQueuedEntry(entry)
     ));
-    if (appendable.length === 0) return;
+    if (appendable.length === 0) return false;
     let mutationCommandId: string | false = false;
     try {
       mutationCommandId = sendQueuedMessageMutation(TRANSPORT_QUEUE_COMMANDS.APPEND_MESSAGES, {
@@ -3949,7 +3949,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     }
     if (!mutationCommandId) {
       showSendWarning(transportQueueAppendFailedLabel);
-      return;
+      return false;
     }
     queuedMutationRollbackRef.current.set(mutationCommandId, {
       type: 'append',
@@ -3962,7 +3962,21 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       return source.filter((entry) => !appendIds.has(entry.clientMessageId));
     });
     setOptimisticallyRemovedQueuedIds((prev) => new Set([...prev, ...appendIds]));
+    return true;
   }, [incomingQueuedTransportEntries, isEditableQueuedEntry, queuedTransportEntries, sendQueuedMessageMutation, showSendWarning, transportQueueAppendFailedLabel]);
+
+  const handleStopButtonPress = useCallback(() => {
+    if (appendableQueuedTransportEntries.length > 0) {
+      const now = Date.now();
+      if (now - stopPressGuardRef.current < 600) return;
+      stopPressGuardRef.current = now;
+      if (handleQueuedMessagesAppend(appendableQueuedTransportEntries)) {
+        showSendWarning(t('session.stop_appended_queue'));
+      }
+      return;
+    }
+    handleStopPress();
+  }, [appendableQueuedTransportEntries, handleQueuedMessagesAppend, handleStopPress, showSendWarning, t]);
 
   const handleQueuedMessageRetry = useCallback((entry: LocalQueuedTransportEntry) => {
     if (entry.status !== 'failed') return;
@@ -4862,8 +4876,8 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
               title={`${t('session.stop_plain')} (/stop)`}
               aria-label={t('session.stop_plain')}
               disabled={disabled || activeSession?.state === 'stopped'}
-              onPointerDown={(e) => { e.preventDefault(); handleStopPress(); }}
-              onClick={handleStopPress}
+              onPointerDown={(e) => { e.preventDefault(); handleStopButtonPress(); }}
+              onClick={handleStopButtonPress}
               style={activeSessionLiveStatus.sweep ? { color: '#f87171' } : undefined}
             >
               <span aria-hidden="true">■</span>
@@ -6569,27 +6583,30 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         queuedHintExpanded ? (
           <div class="controls-queued-hint" role="status" aria-live="polite">
             <div class="controls-queued-header">
-              <div>{t('session.transport_send_queued')}</div>
-              <span class="controls-queued-header-actions">
-                {appendableQueuedTransportEntries.length > 0 && (
-                  <button
-                    type="button"
-                    class="controls-queued-toggle"
-                    onClick={() => handleQueuedMessagesAppend(appendableQueuedTransportEntries)}
-                  >
-                    {t('session.transport_queue_append_all')}
-                  </button>
-                )}
-                <button type="button" class="controls-queued-toggle" onClick={toggleQueuedHintExpanded}>
-                  {t('common.hide')}
+              {appendableQueuedTransportEntries.length > 0 && (
+                <button
+                  type="button"
+                  class="controls-queued-toggle"
+                  onClick={() => handleQueuedMessagesAppend(appendableQueuedTransportEntries)}
+                >
+                  {t('session.transport_queue_append_all')}
                 </button>
-              </span>
+              )}
+              <div>{t('session.transport_send_queued')}</div>
+              <button type="button" class="controls-queued-toggle" onClick={toggleQueuedHintExpanded}>
+                {t('common.hide')}
+              </button>
             </div>
             <div class="controls-queued-list">
               {queuedTransportEntries.map((entry) => {
                 const sharedActorLabel = formatSharedActorLabel(t, entry.sharedActor);
                 return (
                 <div class="controls-queued-item" key={entry.clientMessageId}>
+                  {entry.status !== 'failed' && entry.status !== 'sending' && isEditableQueuedEntry(entry) && (
+                    <button type="button" class="controls-queued-action controls-queued-action-append" onClick={() => handleQueuedMessagesAppend([entry])}>
+                      {t('session.transport_queue_append')}
+                    </button>
+                  )}
                   <span class="controls-queued-item-text">{entry.text}</span>
                   {sharedActorLabel && (
                     <span class="controls-queued-item-actor" title={sharedActorLabel}>
@@ -6620,16 +6637,9 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                           {t('chat.retrySend', 'Retry')}
                         </button>
                       ) : (
-                        <>
-                          {entry.status !== 'sending' && (
-                            <button type="button" class="controls-queued-action controls-queued-action-append" onClick={() => handleQueuedMessagesAppend([entry])}>
-                              {t('session.transport_queue_append')}
-                            </button>
-                          )}
-                          <button type="button" class="controls-queued-action" onClick={() => handleQueuedMessageEdit(entry)}>
-                            {t('settings.edit')}
-                          </button>
-                        </>
+                        <button type="button" class="controls-queued-action" onClick={() => handleQueuedMessageEdit(entry)}>
+                          {t('settings.edit')}
+                        </button>
                       )}
                       <button type="button" class="controls-queued-action controls-queued-action-danger" onClick={() => handleQueuedMessageDelete(entry)}>
                         {t('common.delete')}

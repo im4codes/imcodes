@@ -537,6 +537,7 @@
     "transport_queue_append": "추가",
     "transport_queue_append_all": "모두 추가",
     "transport_queue_append_failed": "메시지를 추가하지 못했습니다. 대기열에는 그대로 남아 있습니다.",
+    "stop_appended_queue": "대기열 메시지를 추가했습니다. 세션은 계속 실행 중입니다.",
     "send_placeholder": "{{name}}에게 전송…",
     "send_placeholder_desktop_upload": "{{placeholder}} 여러 파일 붙여넣기 또는 드래그 빠른 업로드 지원",
     "composer_target_label": "보낼 대상",

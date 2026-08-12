@@ -537,6 +537,7 @@
     "transport_queue_append": "追加",
     "transport_queue_append_all": "全部追加",
     "transport_queue_append_failed": "追加失败，消息仍保留在队列中。",
+    "stop_appended_queue": "已追加队列消息，本次未停止会话。",
     "send_placeholder": "发送到 {{name}}…",
     "send_placeholder_desktop_upload": "{{placeholder}} 支持多文件粘贴或拖拽快速上传",
     "composer_target_label": "发送至",

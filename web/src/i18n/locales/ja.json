@@ -537,6 +537,7 @@
     "transport_queue_append": "追加",
     "transport_queue_append_all": "すべて追加",
     "transport_queue_append_failed": "メッセージを追加できませんでした。キューには残っています。",
+    "stop_appended_queue": "キューのメッセージを追加しました。セッションは実行中です。",
     "send_placeholder": "{{name}} へ送信…",
     "send_placeholder_desktop_upload": "{{placeholder}} 複数ファイルの貼り付け/ドラッグによる高速アップロードに対応",
     "composer_target_label": "送信先",

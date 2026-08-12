@@ -537,6 +537,7 @@
     "transport_queue_append": "Append",
     "transport_queue_append_all": "Append all",
     "transport_queue_append_failed": "Could not append the message; it remains queued.",
+    "stop_appended_queue": "Queued messages appended; the session is still running.",
     "send_placeholder": "Send to {{name}}…",
     "send_placeholder_desktop_upload": "{{placeholder}} Supports fast multi-file paste or drag upload",
     "composer_target_label": "Sending to",
