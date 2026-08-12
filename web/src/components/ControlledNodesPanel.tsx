@@ -18,6 +18,14 @@ import {
 } from '../api/machines.js';
 import { normalizeMachineDisplayName } from '@shared/machine-reference.js';
 import { useMachines } from '../hooks/useMachines.js';
+
+/**
+ * Presence is DB-backed and changes independently of this browser after an
+ * installer starts. Keep the open management panel fresh so a first install
+ * moves from offline to online without requiring a second installer run or a
+ * manual refresh.
+ */
+export const CONTROLLED_NODE_PRESENCE_REFRESH_MS = 5_000;
 import { isNative } from '../native.js';
 import { ShareSessionDialog } from './ShareSessionDialog.js';
 import type { MachineListItem } from '../api/machines.js';
@@ -116,6 +124,11 @@ export function ControlledNodesPanel() {
   }, [t]);
 
   useEffect(() => { refreshAvailability(); }, [refreshAvailability]);
+
+  useEffect(() => {
+    const timer = window.setInterval(refetch, CONTROLLED_NODE_PRESENCE_REFRESH_MS);
+    return () => window.clearInterval(timer);
+  }, [refetch]);
 
   const onDownload = async (target: ControlledNodeArtifactSelection) => {
     const key = artifactSelectionKey(target);

@@ -4,7 +4,7 @@
  * ControlledNodesPanel (tasks 12.2/12.3): download buttons gated by server
  * availability + machine list with exec toggle and revoke.
  */
-import { render, cleanup, fireEvent, waitFor } from '@testing-library/preact';
+import { act, render, cleanup, fireEvent, waitFor } from '@testing-library/preact';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { ControlledNodeAvailability, MachineListItem } from '../src/api/machines.js';
 
@@ -77,7 +77,10 @@ vi.mock('../src/api.js', async (importOriginal) => {
   };
 });
 
-import { ControlledNodesPanel } from '../src/components/ControlledNodesPanel.js';
+import {
+  CONTROLLED_NODE_PRESENCE_REFRESH_MS,
+  ControlledNodesPanel,
+} from '../src/components/ControlledNodesPanel.js';
 
 afterEach(() => {
   cleanup();
@@ -89,6 +92,27 @@ afterEach(() => {
 const machine = (over: Partial<MachineListItem>): MachineListItem => ({ serverId: 's', refName: 'r', displayName: 'D', online: true, execEnabled: false, ...over });
 
 describe('ControlledNodesPanel (12.3)', () => {
+  it('refreshes DB-backed presence while open and stops polling after close', async () => {
+    vi.useFakeTimers();
+    try {
+      const rendered = render(<ControlledNodesPanel />);
+      expect(refetch).not.toHaveBeenCalled();
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(CONTROLLED_NODE_PRESENCE_REFRESH_MS);
+      });
+      expect(refetch).toHaveBeenCalledTimes(1);
+
+      rendered.unmount();
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(CONTROLLED_NODE_PRESENCE_REFRESH_MS * 2);
+      });
+      expect(refetch).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('renders the node-grid hierarchy and live machine metrics', async () => {
     machines = [
       machine({ serverId: 'online', refName: 'win-edge', displayName: 'Edge One', os: 'win', online: true, execEnabled: true }),
