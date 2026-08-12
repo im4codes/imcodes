@@ -151,4 +151,24 @@ describe('message pin MCP tools', () => {
     expect((calls[0]?.init?.headers as Record<string, string>).Authorization).toBe('Bearer owner-token');
     expect((calls[0]?.init?.headers as Record<string, string>)['X-Server-Id']).toBe('srv-1');
   });
+
+  it('defaults HTTP list requests to the bounded 200-result limit', async () => {
+    const calls: string[] = [];
+    const fetchImpl = vi.fn(async (input: string | URL | Request) => {
+      calls.push(String(input));
+      return new Response(JSON.stringify({ pins: [] }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }) as unknown as typeof fetch;
+
+    await messagePinMcpList({ sessionName: 'deck_project_brain' }, {
+      endpoint: ENDPOINT,
+      fetchImpl,
+    });
+
+    expect(calls).toEqual([
+      'https://example.test/api/message-pins?sessionName=deck_project_brain&limit=200&serverId=srv-1',
+    ]);
+  });
 });

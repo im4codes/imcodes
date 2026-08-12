@@ -107,6 +107,23 @@ describe('MessagePinsBar', () => {
     expect(screen.getByText('messagePins.noMatches')).toBeTruthy();
   });
 
+  it('searches the resolved text that is displayed for a pinned message', () => {
+    const pins = [pin('a1', 'deck_current')];
+    render(
+      <MessagePinsBar
+        pins={pins}
+        currentSessionName="deck_current"
+        onLocate={vi.fn()}
+        onUnpin={vi.fn()}
+        resolvePinText={() => 'Resolved live message text'}
+      />,
+    );
+    fireEvent.click(screen.getByTestId('message-pins-trigger'));
+    fireEvent.input(screen.getByLabelText('messagePins.searchLabel'), { target: { value: 'live message' } });
+    expect(screen.getByText('Resolved live message text')).toBeTruthy();
+    expect(screen.queryByText('messagePins.noMatches')).toBeNull();
+  });
+
   it('keeps the compact entry visible with a zero count', () => {
     render(<MessagePinsBar pins={[]} currentSessionName="deck_current" onLocate={vi.fn()} onUnpin={vi.fn()} />);
     expect(screen.getByTestId('message-pins-trigger').textContent).toBe('📌0/0');

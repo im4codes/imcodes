@@ -149,7 +149,19 @@ describe('message pin routes', () => {
     });
   });
 
-  it('does not expose or delete a pin after its original session access is revoked', async () => {
+  it('does not expose a pin after its original session access is revoked', async () => {
+    const app = await makeApp();
+    getMessagePinMock.mockResolvedValue(pin('pin-1', 'deck_revoked'));
+    authorizeTimelineSessionMock.mockResolvedValue({ ok: false });
+    const response = await app.request('/api/message-pins/pin-1?serverId=srv-1');
+    expect(response.status).toBe(403);
+    expect(await response.json()).toEqual({ error: 'forbidden' });
+    expect(authorizeTimelineSessionMock).toHaveBeenCalledWith(expect.anything(), {
+      userId: 'user-1', serverId: 'srv-1', sessionName: 'deck_revoked',
+    });
+  });
+
+  it('does not delete a pin after its original session access is revoked', async () => {
     const app = await makeApp();
     getMessagePinMock.mockResolvedValue(pin('pin-1', 'deck_revoked'));
     authorizeTimelineSessionMock.mockResolvedValue({ ok: false });
