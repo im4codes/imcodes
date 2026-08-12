@@ -47,8 +47,8 @@ interface AtPickerProps {
   onSelectDelegateAgent: (session: string) => void;
   /** Insert the `;;(name)` marker for the chosen alias (never the value). */
   onSelectAlias?: (name: string) => void;
-  /** Insert the `^^(refName)` marker for the chosen machine (marker only). */
-  onSelectMachine?: (refName: string) => void;
+  /** Insert the stable machine marker plus its human-readable display note. */
+  onSelectMachine?: (refName: string, displayName: string) => void;
   onSelectAllConfig?: (config: P2pSavedConfig, rounds: number, modeOverride: string) => void;
   /** Launch a Team discussion directly with the chosen combo/mode and round count. */
   onLaunchTeam?: (modeKey: string, rounds: number) => void;
@@ -383,7 +383,7 @@ export function AtPicker({
           // Snap an offline/out-of-range highlight to the first online row.
           const effIdx = machineResults[highlightIdx]?.online ? highlightIdx : onlineIdx[0];
           const m = machineResults[effIdx];
-          if (m) onSelectMachine?.(m.refName);
+          if (m) onSelectMachine?.(m.refName, m.displayName);
           return;
         }
         return;
@@ -579,7 +579,7 @@ export function AtPicker({
                 ...(hl ? itemHighlightStyle : itemStyle),
                 ...(selectable ? {} : { color: '#64748b', cursor: 'not-allowed', opacity: 0.65 }),
               }}
-              onClick={() => { if (selectable) onSelectMachine?.(m.refName); }}
+              onClick={() => { if (selectable) onSelectMachine?.(m.refName, m.displayName); }}
               onMouseEnter={() => { if (selectable) setHighlightIdx(idx); }}
             >
               <span

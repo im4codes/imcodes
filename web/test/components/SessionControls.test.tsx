@@ -181,12 +181,13 @@ vi.mock('../../src/components/VoiceInput.js', () => ({
 }));
 
 vi.mock('../../src/components/AtPicker.js', () => ({
-  AtPicker: ({ visible, query, onSelectAllConfig, onSelectAgent, onSelectDelegateAgent, p2pConfig, sessions, rootSession }: {
+  AtPicker: ({ visible, query, onSelectAllConfig, onSelectAgent, onSelectDelegateAgent, onSelectMachine, p2pConfig, sessions, rootSession }: {
     visible: boolean;
     query?: string;
     onSelectAllConfig?: (config: unknown, rounds: number, modeOverride: string) => void;
     onSelectAgent?: (session: string, mode: string) => void;
     onSelectDelegateAgent?: (session: string) => void;
+    onSelectMachine?: (refName: string, displayName: string) => void;
     p2pConfig?: { rounds?: number } | null;
     sessions?: Array<{ name: string; label?: string | null; parentSession?: string | null; isSelf?: boolean }>;
     rootSession?: string | null;
@@ -204,6 +205,7 @@ vi.mock('../../src/components/AtPicker.js', () => ({
       return (
         <div>
           <button onClick={() => onSelectAllConfig?.(p2pConfig, p2pConfig?.rounds ?? 1, 'config')}>mock-select-all-config</button>
+          <button onClick={() => onSelectMachine?.('office-pc', 'Office PC')}>mock-select-machine</button>
           <button>files</button>
           <button onClick={() => setStage('agents')}>agents</button>
         </div>
@@ -1164,6 +1166,29 @@ afterEach(() => {
     expect(sent).not.toHaveProperty('p2pAdvancedRounds');
     expect(sent).not.toHaveProperty('p2pAdvancedRunTimeoutMinutes');
     expect(sent).not.toHaveProperty('p2pContextReducer');
+  });
+
+  it('inserts an annotated controlled-node reference from the @ picker', () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({ name: 'my-session' })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.textContent = '@';
+    fireEvent.input(input);
+    fireEvent.click(screen.getByText('mock-select-machine'));
+
+    expect(execCommandMock).toHaveBeenCalledWith(
+      'insertText',
+      false,
+      '^^(office-pc)-(Office PC)',
+    );
+    expect(input.textContent).toBe('^^(office-pc)-(Office PC)');
   });
 
   it('keeps the p2p button in solo mode after triggering a combo from the dropdown', async () => {

@@ -2616,14 +2616,15 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   }, [publishComposerText, syncMobileComposerMetrics]);
 
   /**
-   * Insert a `^^(refName)` machine marker at the caret via the shared helper
-   * (marker only; never resolves; never sends), mirroring `insertAliasMarker`.
+   * Insert a `^^(refName)-(displayName)` machine reference at the caret via the
+   * shared helper (stable marker plus render-only note; never resolves or sends),
+   * mirroring `insertAliasMarker`.
    * When the inline `^query` fragment is still present at the end of the composer
    * (the inline `^` autocomplete path), it is stripped first so we don't leave a
    * stray `^dep` before the inserted marker. Used by both the inline picker and
    * the `@machine` category.
    */
-  const insertMachineMarker = useCallback((refName: string) => {
+  const insertMachineMarker = useCallback((refName: string, displayName: string) => {
     const el = divRef.current;
     if (el) {
       const current = readComposerElementText(el);
@@ -2642,7 +2643,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       } catch { /* jsdom lacks Selection API */ }
       el.focus();
     }
-    insertMachineMarkerAtCaret(refName);
+    insertMachineMarkerAtCaret(refName, displayName);
     const nextText = el ? readComposerElementText(el) : '';
     setHasText(!!nextText.trim());
     publishComposerText(nextText);
@@ -4260,7 +4261,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         setMachineQuery('');
         machineJustClosedRef.current = true;
         setTimeout(() => { machineJustClosedRef.current = false; }, 150);
-        if (chosen) insertMachineMarker(chosen.refName);
+        if (chosen) insertMachineMarker(chosen.refName, chosen.displayName);
         return;
       }
     }
@@ -6068,9 +6069,9 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
               setTimeout(() => { atJustClosedRef.current = false; atSelectionLockRef.current = false; }, 150);
               insertAliasMarker(name);
             }}
-            onSelectMachine={(refName) => {
+            onSelectMachine={(refName, displayName) => {
               // @machine → strip the trailing `@query` fragment, then insert the
-              // `^^(refName)` marker via the shared helper (marker only).
+              // stable marker plus its human-readable display note.
               const text = divRef.current ? readComposerElementText(divRef.current) : '';
               const before = text.replace(/@[^\s@]*$/, '');
               if (divRef.current) setComposerElementText(divRef.current, before);
@@ -6086,7 +6087,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
               setAtPickerStage('choose');
               atJustClosedRef.current = true;
               setTimeout(() => { atJustClosedRef.current = false; atSelectionLockRef.current = false; }, 150);
-              insertMachineMarker(refName);
+              insertMachineMarker(refName, displayName);
             }}
             p2pConfig={p2pSavedConfig}
             onClose={() => { setAtPickerOpen(false); setAtPickerStage('choose'); }}
@@ -6179,7 +6180,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                       if (!selectable) return;
                       setMachinePickerOpen(false);
                       setMachineQuery('');
-                      insertMachineMarker(m.refName);
+                      insertMachineMarker(m.refName, m.displayName);
                     }}
                     onMouseEnter={() => { if (selectable) setMachineHighlightIdx(idx); }}
                   >

@@ -8,25 +8,26 @@
  * `serverId` (a hint the server re-validates against the owner's machines).
  */
 import {
-  buildMachineMarker,
+  buildMachineComposerReference,
   buildResolvedMachines as buildResolvedMachinesPure,
   type MachineRef,
   type SendMachineResolution,
 } from '@shared/machine-reference.js';
 
 /**
- * Insert a `^^(refName)` marker at the caret of a focused contenteditable/textarea
- * composer via `execCommand('insertText', ...)`, mirroring the alias insert path.
- * Inserts the marker text only (never resolves) and does not send.
+ * Insert a `^^(refName)-(displayName)` reference at the caret of a focused
+ * contenteditable/textarea composer via `execCommand('insertText', ...)`,
+ * mirroring the alias insert path. The marker remains the routing identity;
+ * the suffix is render-only context. This does not resolve or send anything.
  *
  * @returns `true` if the insert command was issued, `false` when unavailable
  *   (e.g. SSR / no `document`).
  */
-export function insertMachineMarkerAtCaret(refName: string): boolean {
+export function insertMachineMarkerAtCaret(refName: string, displayName?: string): boolean {
   if (typeof document === 'undefined' || typeof document.execCommand !== 'function') {
     return false;
   }
-  return document.execCommand('insertText', false, buildMachineMarker(refName));
+  return document.execCommand('insertText', false, buildMachineComposerReference(refName, displayName));
 }
 
 /**
