@@ -1,6 +1,5 @@
 import { useState, useEffect, useCallback, useMemo } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
-import { marked } from 'marked';
 import { apiFetch } from '../api.js';
 import type { CronAction, CronCompletionPolicy, CronJobStatus } from '@shared/cron-types';
 import {
@@ -13,6 +12,7 @@ import type { SessionInfo } from '../types.js';
 import { formatLabel } from '../format-label.js';
 import { getAgentBadgeLabel } from '../agent-display.js';
 import { FloatingPanel } from '../components/FloatingPanel.js';
+import { ChatMarkdown } from '../components/ChatMarkdown.js';
 import { useResourceEvent } from '../hooks/useResourceEvent.js';
 import { RESOURCE_TOPICS } from '@shared/resource-events.js';
 import type { WsClient } from '../ws-client.js';
@@ -106,26 +106,31 @@ function compactMessage(text: string): string {
   return text.replace(/\s+/g, ' ').trim();
 }
 
+function truncateSummary(text: unknown, max = 96): string {
+  if (typeof text !== 'string') return '';
+  const compact = compactMessage(text);
+  return compact.length > max ? `${compact.slice(0, max).trimEnd()}…` : compact;
+}
+
 function sendTargetText(action: CronSendActionView, t: (key: string) => string): string {
-  return action.broadcast ? t('cron.send_broadcast') : action.target;
+  return action.broadcast
+    ? t('cron.send_broadcast')
+    : typeof action.target === 'string' && action.target.trim()
+      ? action.target
+      : '—';
 }
 
 function sendActionSummary(action: CronSendActionView, t: (key: string) => string): string {
-  const message = compactMessage(action.message);
+  const message = typeof action.message === 'string' ? compactMessage(action.message) : '';
   const target = sendTargetText(action, t);
   return message ? `${t('common.send')} → ${target}: ${message}` : `${t('common.send')} → ${target}`;
 }
 
-function SendActionDetails({ action, t }: { action: CronSendActionView; t: (key: string) => string }) {
-  return (
-    <div style={{ marginTop: '2px', display: 'grid', gap: '4px' }}>
-      <div>
-        <strong style={{ color: '#cbd5e1' }}>{t('common.send')}:</strong> {sendTargetText(action, t)}
-        {action.reply && <span style={{ color: '#94a3b8' }}> · {t('cron.send_reply')}</span>}
-      </div>
-      <pre style={{ margin: 0, whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', color: '#e2e8f0', fontFamily: 'inherit' }}>{action.message}</pre>
-    </div>
-  );
+function executionActionSummary(action: CronAction | null, t: (key: string) => string): string | null {
+  if (!action) return null;
+  if (action.type === 'command') return truncateSummary(action.command) || null;
+  if (action.type === 'p2p') return truncateSummary(action.topic) || null;
+  return truncateSummary(sendActionSummary(action, t)) || null;
 }
 
 function fmtTime(ts: number | null): string {
@@ -357,9 +362,9 @@ export function CronManager({ serverId, projectName, sessions, subSessions = [],
   };
 
   return (
-    <div style={{ width: '90%', maxWidth: '700px', margin: '0 auto', padding: '12px 0', height: '100%', overflow: 'auto' }}>
+    <div class={tab === 'executions' ? 'cron-manager cron-manager--history' : 'cron-manager'} style={{ width: '90%', maxWidth: tab === 'executions' ? '860px' : '700px', margin: '0 auto', padding: '12px 0', height: '100%', overflow: 'auto' }}>
       {/* Toolbar: tabs + show-all toggle + add button */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '10px' }}>
+      <div class="cron-manager-toolbar" style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '10px' }}>
         <div style={{ display: 'flex', gap: '2px', background: '#0f172a', borderRadius: '6px', padding: '2px' }}>
           <button onClick={() => setTab('tasks')}
             style={{ padding: '3px 10px', borderRadius: '4px', border: 'none', cursor: 'pointer', fontSize: '12px', fontWeight: 600,
@@ -502,7 +507,8 @@ export function CronManager({ serverId, projectName, sessions, subSessions = [],
           id={`cron-history-${historyJobId}`}
           title={`${t('cron.history')} · ${historyJob.name}`}
           onClose={() => setSubPanel(null)}
-          defaultW={520} defaultH={460}
+          defaultW={660} defaultH={580}
+          className="cron-floating-panel"
         >
           <CronHistoryPanel
             executions={historyData[historyJobId] ?? null}
@@ -530,39 +536,64 @@ function CrossJobExecutionList({ executions, loading, serverNameMap, showAllServ
 }) {
   const [detailExec, setDetailExec] = useState<CrossJobExecution | null>(null);
 
-  if (loading) return <div style={{ color: '#94a3b8', textAlign: 'center', padding: '40px' }}>{t('common.loading')}</div>;
-  if (!executions || executions.length === 0) return <div style={{ color: '#64748b', textAlign: 'center', padding: '40px' }}>{t('cron.no_history')}</div>;
+  if (loading) return <div class="cron-execution-empty cron-execution-empty--loading"><span class="cron-execution-spinner" />{t('common.loading')}</div>;
+  if (!executions || executions.length === 0) return <div class="cron-execution-empty"><span class="cron-execution-empty-icon">◇</span>{t('cron.no_history')}</div>;
 
   return (
-    <div>
-      {executions.map(exec => {
+    <div class="cron-execution-page">
+      <div class="cron-execution-hero">
+        <div class="cron-execution-hero-icon" aria-hidden="true">⌁</div>
+        <div class="cron-execution-hero-copy">
+          <strong>{t('cron.history')}</strong>
+          <span>{t('cron.final_output_hint')}</span>
+        </div>
+        <span class="cron-execution-count"><b>{executions.length}</b> {t('cron.runs')}</span>
+      </div>
+      <div class="cron-execution-list">
+        {executions.map((exec, index) => {
         const hasDetail = !!exec.detail && !exec.detail.startsWith('p2p:');
         const hasP2p = !!exec.detail?.startsWith('p2p:');
         const action = parseAction(exec.action);
+        const actionSummary = executionActionSummary(action, t);
 
         return (
-          <div key={exec.id}
-            style={{ ...cardStyle, padding: '10px 14px', marginBottom: '6px', cursor: hasDetail ? 'pointer' : 'default' }}
+          <article key={exec.id}
+            class={`cron-execution-card${hasDetail ? ' cron-execution-card--interactive' : ''}`}
             onClick={() => hasDetail && setDetailExec(exec)}
+            onKeyDown={(event) => {
+              if (hasDetail && (event.key === 'Enter' || event.key === ' ')) {
+                event.preventDefault();
+                setDetailExec(exec);
+              }
+            }}
+            tabIndex={hasDetail ? 0 : undefined}
           >
-            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '4px' }}>
-              <span style={{ color: '#e2e8f0', fontWeight: 600, fontSize: '13px', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                {exec.job_name}
-              </span>
-              <span style={{ color: execStatusColor(exec.status), fontWeight: 600, fontSize: '11px' }}>
-                {execStatusLabel(exec.status, t)}
-              </span>
+            <div class="cron-execution-rail" aria-hidden="true">
+              <span class="cron-execution-index">{String(index + 1).padStart(2, '0')}</span>
+              <span class="cron-execution-dot" style={{ background: execStatusColor(exec.status), boxShadow: `0 0 12px ${execStatusColor(exec.status)}` }} />
+              <span class="cron-execution-line" />
             </div>
-            <div style={{ display: 'flex', gap: '10px', fontSize: '11px', color: '#64748b', flexWrap: 'wrap' }}>
-              <span>{fmtTime(exec.created_at)}</span>
-              {showAllServers && <span>{serverNameMap.get(exec.server_id) ?? exec.server_id.slice(0, 6)} / {exec.project_name}</span>}
-              <span>→ {exec.target_role}</span>
-              {action?.type === 'p2p' && <span>Team {action.mode}</span>}
-              {action?.type === 'command' && <span style={{ maxWidth: '150px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{action.command}</span>}
-              {action?.type === 'send' && <span title={sendActionSummary(action, t)} style={{ maxWidth: '220px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{sendActionSummary(action, t)}</span>}
+            <div class="cron-execution-card-body">
+              <div class="cron-execution-card-title-row">
+                <span class="cron-execution-card-title">
+                {exec.job_name}
+                </span>
+                <span class="cron-execution-status" style={{ color: execStatusColor(exec.status), borderColor: `${execStatusColor(exec.status)}55`, background: `${execStatusColor(exec.status)}12` }}>
+                {execStatusLabel(exec.status, t)}
+                </span>
+              </div>
+              <div class="cron-execution-meta">
+                <span class="cron-execution-time">◷ {fmtTime(exec.created_at)}</span>
+                {showAllServers && <span>◈ {serverNameMap.get(exec.server_id) ?? exec.server_id.slice(0, 6)} / {exec.project_name}</span>}
+                <span>⌁ {exec.target_session_name ?? exec.target_role}</span>
+                {action?.type === 'p2p' && <span>Team · {action.mode}</span>}
+              </div>
+              {actionSummary && <div class="cron-execution-prompt-summary"><span>›</span>{actionSummary}</div>}
+              {hasDetail && <div class="cron-execution-preview">{exec.detail!.slice(0, 240)}</div>}
+              <div class="cron-execution-actions">
               {hasP2p && onViewDiscussion && (
                 <button type="button" onClick={(e) => { e.stopPropagation(); onViewDiscussion(exec.detail!.slice(4)); }}
-                  style={{ color: '#60a5fa', background: 'none', border: 'none', cursor: 'pointer', fontSize: '11px', padding: 0, textDecoration: 'underline' }}>
+                  class="cron-execution-link">
                   {t('cron.view_discussion')}
                 </button>
               )}
@@ -572,21 +603,18 @@ function CrossJobExecutionList({ executions, loading, serverNameMap, showAllServ
                   const session = resolveExecSession(exec);
                   onNavigateSession(session, hasDetail ? exec.detail!.slice(0, 500) : undefined);
                 }}
-                  style={{ color: '#00ffb4', background: 'none', border: 'none', cursor: 'pointer', fontSize: '11px', padding: 0, textDecoration: 'underline', marginLeft: 'auto' }}
+                  class="cron-execution-link cron-execution-link--primary"
                   title={hasDetail ? t('cron.go_and_quote') : t('cron.go_to_session')}>
                   {t(hasDetail ? 'cron.go_and_quote' : 'cron.go_to_session')} →
                 </button>
               )}
+              {hasDetail && <span class="cron-execution-open-hint">{t('cron.view_output')} ↗</span>}
+              </div>
             </div>
-            {/* 3-5 line preview */}
-            {hasDetail && (
-              <pre style={{ color: '#64748b', fontSize: '11px', marginTop: '4px', padding: '4px 6px', background: '#0f172a', borderRadius: '4px', whiteSpace: 'pre-wrap', wordBreak: 'break-word', maxHeight: '4.5em', overflow: 'hidden', lineHeight: 1.4 }}>
-                {exec.detail!.slice(0, 300)}
-              </pre>
-            )}
-          </div>
+          </article>
         );
       })}
+      </div>
 
       {/* Detail floating panel */}
       {detailExec && (
@@ -594,7 +622,8 @@ function CrossJobExecutionList({ executions, loading, serverNameMap, showAllServ
           id={`exec-detail-${detailExec.id}`}
           title={`${detailExec.job_name} · ${fmtTime(detailExec.created_at)}`}
           onClose={() => setDetailExec(null)}
-          defaultW={600} defaultH={500}
+          defaultW={720} defaultH={620}
+          className="cron-floating-panel cron-execution-detail-panel"
         >
           <ExecDetailView exec={detailExec} onNavigateSession={onNavigateSession ? () => onNavigateSession(resolveExecSession(detailExec), detailExec.detail?.slice(0, 500)) : undefined} t={t} />
         </FloatingPanel>
@@ -624,43 +653,58 @@ function CronHistoryPanel({ executions, job, onViewDiscussion, onNavigateSession
   const action = parseAction(job.action);
 
   return (
-    <div style={{ padding: '12px', overflow: 'auto', height: '100%' }}>
+    <div class="cron-history-panel">
       {/* Job summary header */}
-      <div style={{ padding: '8px 10px', background: '#0f172a', borderRadius: '6px', marginBottom: '12px', fontSize: '12px', color: '#94a3b8' }}>
-        <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap', marginBottom: '4px' }}>
-          <span><strong style={{ color: '#cbd5e1' }}>{t('cron.schedule')}:</strong> <code style={{ color: '#e2e8f0' }}>{job.cron_expr}</code></span>
-          <span><strong style={{ color: '#cbd5e1' }}>{t('cron.target')}:</strong> {job.target_session_name ?? job.target_role}</span>
+      <div class="cron-history-summary">
+        <div class="cron-history-summary-grid">
+          <span><small>{t('cron.schedule')}</small><code>{job.cron_expr}</code></span>
+          <span><small>{t('cron.target')}</small><b>{job.target_session_name ?? job.target_role}</b></span>
+          {job.next_run_at && <span><small>{t('cron.next_run')}</small><b>{fmtTime(job.next_run_at)}</b></span>}
         </div>
-        {action?.type === 'command' && (
-          <div style={{ marginTop: '2px' }}><strong style={{ color: '#cbd5e1' }}>{t('cron.action_command')}:</strong> <code style={{ color: '#e2e8f0' }}>{action.command}</code></div>
+        {executionActionSummary(action, t) && (
+          <div class="cron-execution-prompt-summary cron-history-prompt-summary">
+            <span>›</span>{executionActionSummary(action, t)}
+          </div>
         )}
-        {action?.type === 'p2p' && (
-          <div style={{ marginTop: '2px' }}><strong style={{ color: '#cbd5e1' }}>Team:</strong> {action.mode} · {action.rounds ?? 1} {t('cron.p2p_rounds').toLowerCase()}</div>
-        )}
-        {action?.type === 'send' && <SendActionDetails action={action} t={t} />}
-        {job.next_run_at && <div style={{ marginTop: '4px', fontSize: '11px', color: '#64748b' }}>{t('cron.next_run')}: {fmtTime(job.next_run_at)}</div>}
       </div>
 
       {/* Execution list */}
-      {!executions && <div style={{ color: '#64748b', fontSize: '13px', textAlign: 'center', padding: '20px' }}>{t('common.loading')}</div>}
-      {executions?.length === 0 && <div style={{ color: '#64748b', fontSize: '13px', textAlign: 'center', padding: '20px' }}>{t('cron.no_history')}</div>}
-      {executions?.map(exec => {
+      {!executions && <div class="cron-execution-empty cron-execution-empty--loading"><span class="cron-execution-spinner" />{t('common.loading')}</div>}
+      {executions?.length === 0 && <div class="cron-execution-empty"><span class="cron-execution-empty-icon">◇</span>{t('cron.no_history')}</div>}
+      <div class="cron-history-list">
+      {executions?.map((exec, index) => {
         const hasDetail = !!exec.detail && !exec.detail.startsWith('p2p:');
         const hasP2p = !!exec.detail?.startsWith('p2p:');
 
         return (
-          <div key={exec.id}
-            style={{ fontSize: '12px', color: '#94a3b8', borderRadius: '6px', marginBottom: '4px', padding: '6px 8px', cursor: hasDetail ? 'pointer' : 'default' }}
+          <article key={exec.id}
+            class={`cron-execution-card cron-execution-card--compact${hasDetail ? ' cron-execution-card--interactive' : ''}`}
             onClick={() => hasDetail && setDetailExec(exec)}
+            onKeyDown={(event) => {
+              if (hasDetail && (event.key === 'Enter' || event.key === ' ')) {
+                event.preventDefault();
+                setDetailExec(exec);
+              }
+            }}
+            tabIndex={hasDetail ? 0 : undefined}
           >
-            <div style={{ display: 'flex', gap: '10px', alignItems: 'center' }}>
-              <span style={{ minWidth: '130px', fontSize: '11px' }}>{fmtTime(exec.created_at)}</span>
-              <span style={{ color: execStatusColor(exec.status), fontWeight: 600, fontSize: '11px' }}>
+            <div class="cron-execution-rail" aria-hidden="true">
+              <span class="cron-execution-index">{String(index + 1).padStart(2, '0')}</span>
+              <span class="cron-execution-dot" style={{ background: execStatusColor(exec.status), boxShadow: `0 0 12px ${execStatusColor(exec.status)}` }} />
+              <span class="cron-execution-line" />
+            </div>
+            <div class="cron-execution-card-body">
+              <div class="cron-execution-card-title-row">
+                <span class="cron-execution-time">◷ {fmtTime(exec.created_at)}</span>
+                <span class="cron-execution-status" style={{ color: execStatusColor(exec.status), borderColor: `${execStatusColor(exec.status)}55`, background: `${execStatusColor(exec.status)}12` }}>
                 {execStatusLabel(exec.status, t)}
-              </span>
+                </span>
+              </div>
+              {hasDetail && <div class="cron-execution-preview">{exec.detail!.slice(0, 240)}</div>}
+              <div class="cron-execution-actions">
               {hasP2p && onViewDiscussion && (
                 <button type="button" onClick={(e) => { e.stopPropagation(); onViewDiscussion(exec.detail!.slice(4)); }}
-                  style={{ color: '#60a5fa', background: 'none', border: 'none', cursor: 'pointer', fontSize: '11px', padding: 0, textDecoration: 'underline' }}>
+                  class="cron-execution-link">
                   {t('cron.view_discussion')}
                 </button>
               )}
@@ -669,21 +713,18 @@ function CronHistoryPanel({ executions, job, onViewDiscussion, onNavigateSession
                   e.stopPropagation();
                   onNavigateSession(jobSessionName, hasDetail ? exec.detail!.slice(0, 500) : undefined);
                 }}
-                  style={{ color: '#00ffb4', background: 'none', border: 'none', cursor: 'pointer', fontSize: '11px', padding: 0, textDecoration: 'underline', marginLeft: 'auto' }}
+                  class="cron-execution-link cron-execution-link--primary"
                   title={hasDetail ? t('cron.go_and_quote') : t('cron.go_to_session')}>
                   {t(hasDetail ? 'cron.go_and_quote' : 'cron.go_to_session')} →
                 </button>
               )}
+              {hasDetail && <span class="cron-execution-open-hint">{t('cron.view_output')} ↗</span>}
+              </div>
             </div>
-            {/* 3-5 line preview */}
-            {hasDetail && (
-              <pre style={{ color: '#64748b', fontSize: '11px', marginTop: '4px', padding: '4px 6px', background: '#0f172a', borderRadius: '4px', whiteSpace: 'pre-wrap', wordBreak: 'break-word', maxHeight: '4.5em', overflow: 'hidden', lineHeight: 1.4 }}>
-                {exec.detail!.slice(0, 300)}
-              </pre>
-            )}
-          </div>
+          </article>
         );
       })}
+      </div>
 
       {/* Detail floating panel */}
       {detailExec && (
@@ -691,7 +732,8 @@ function CronHistoryPanel({ executions, job, onViewDiscussion, onNavigateSession
           id={`exec-detail-${detailExec.id}`}
           title={`${job.name} · ${fmtTime(detailExec.created_at)}`}
           onClose={() => setDetailExec(null)}
-          defaultW={600} defaultH={500}
+          defaultW={720} defaultH={620}
+          className="cron-floating-panel cron-execution-detail-panel"
         >
           <ExecDetailView exec={detailExec} onNavigateSession={onNavigateSession ? () => onNavigateSession(jobSessionName, detailExec.detail?.slice(0, 500)) : undefined} t={t} />
         </FloatingPanel>
@@ -703,31 +745,31 @@ function CronHistoryPanel({ executions, job, onViewDiscussion, onNavigateSession
 // ── Execution Detail View (FloatingPanel content, renders markdown) ──────
 
 function ExecDetailView({ exec, onNavigateSession, t }: { exec: { status: string; detail: string | null; created_at: number }; onNavigateSession?: () => void; t: (key: string) => string }) {
-  const html = useMemo(() => {
-    if (!exec.detail) return '';
-    try { return marked(exec.detail, { breaks: true }) as string; } catch { return exec.detail; }
-  }, [exec.detail]);
-
   return (
-    <div style={{ padding: '16px', overflow: 'auto', height: '100%' }}>
-      <div style={{ display: 'flex', gap: '10px', alignItems: 'center', marginBottom: '12px', fontSize: '12px' }}>
-        <span style={{ color: '#94a3b8' }}>{fmtTime(exec.created_at)}</span>
-        <span style={{ color: execStatusColor(exec.status), fontWeight: 600 }}>{execStatusLabel(exec.status, t)}</span>
+    <div class="cron-execution-detail">
+      <div class="cron-execution-detail-toolbar">
+        <span class="cron-execution-time">◷ {fmtTime(exec.created_at)}</span>
+        <span class="cron-execution-status" style={{ color: execStatusColor(exec.status), borderColor: `${execStatusColor(exec.status)}55`, background: `${execStatusColor(exec.status)}12` }}>{execStatusLabel(exec.status, t)}</span>
         {onNavigateSession && exec.detail && (
           <button type="button" onClick={onNavigateSession}
-            style={{ ...btnSecondary, marginLeft: 'auto', fontSize: '11px', padding: '4px 10px' }}>
+            class="cron-execution-detail-action">
             {t('cron.go_and_quote')} →
           </button>
         )}
       </div>
       {exec.detail ? (
-        <div
-          class="discussions-markdown"
-          style={{ fontSize: '13px' }}
-          dangerouslySetInnerHTML={{ __html: html }}
-        />
+        <section class="cron-execution-output">
+          <div class="cron-execution-output-heading">
+            <span class="cron-execution-output-pulse" />
+            <span>{t('cron.final_output')}</span>
+            <small>{exec.detail.length.toLocaleString()} {t('cron.characters')}</small>
+          </div>
+          <div class="cron-execution-output-body chat-markdown">
+            <ChatMarkdown text={exec.detail} />
+          </div>
+        </section>
       ) : (
-        <div style={{ color: '#64748b', fontSize: '13px' }}>{t('cron.no_detail')}</div>
+        <div class="cron-execution-empty"><span class="cron-execution-empty-icon">◇</span>{t('cron.no_detail')}</div>
       )}
     </div>
   );

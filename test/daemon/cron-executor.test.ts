@@ -816,6 +816,51 @@ describe('executeCronJob', () => {
     });
   });
 
+  it('records only the final assistant text instead of every streaming update', async () => {
+    let handler: ((event: any) => void) | undefined;
+    timelineOn.mockImplementation((fn: (event: any) => void) => {
+      handler = fn;
+      return () => {};
+    });
+    (getSession as ReturnType<typeof vi.fn>).mockReturnValue(makeSession());
+    (detectStatusAsync as ReturnType<typeof vi.fn>).mockResolvedValue('idle');
+
+    await executeCronJob(makeMsg({ executionId: 'exec-final-text' }), mockServerLink);
+
+    handler?.({ sessionId: 'deck_myapp_brain', type: 'assistant.text', payload: { text: '主', streaming: true } });
+    handler?.({ sessionId: 'deck_myapp_brain', type: 'assistant.text', payload: { text: '主人，', streaming: true } });
+    handler?.({ sessionId: 'deck_myapp_brain', type: 'assistant.text', payload: { text: '主人，最终结果。', streaming: false } });
+    handler?.({ sessionId: 'deck_myapp_brain', type: 'session.state', payload: { state: 'idle' } });
+
+    expect(mockServerLink.send).toHaveBeenCalledWith({
+      type: CRON_MSG.COMMAND_RESULT,
+      jobId: 'job-1',
+      executionId: 'exec-final-text',
+      detail: '主人，最终结果。',
+    });
+  });
+
+  it('falls back to the latest snapshot when an older provider goes idle without a terminal text event', async () => {
+    let handler: ((event: any) => void) | undefined;
+    timelineOn.mockImplementation((fn: (event: any) => void) => {
+      handler = fn;
+      return () => {};
+    });
+    (getSession as ReturnType<typeof vi.fn>).mockReturnValue(makeSession());
+    (detectStatusAsync as ReturnType<typeof vi.fn>).mockResolvedValue('idle');
+
+    await executeCronJob(makeMsg({ executionId: 'exec-latest-snapshot' }), mockServerLink);
+
+    handler?.({ sessionId: 'deck_myapp_brain', type: 'assistant.text', payload: { text: 'partial', streaming: true } });
+    handler?.({ sessionId: 'deck_myapp_brain', type: 'assistant.text', payload: { text: 'complete snapshot', streaming: true } });
+    handler?.({ sessionId: 'deck_myapp_brain', type: 'session.state', payload: { state: 'idle' } });
+
+    expect(mockServerLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      executionId: 'exec-latest-snapshot',
+      detail: 'complete snapshot',
+    }));
+  });
+
   it('retries command result send after a transient link failure', async () => {
     vi.useFakeTimers();
     let handler: ((event: any) => void) | undefined;

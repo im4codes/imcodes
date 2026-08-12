@@ -574,8 +574,47 @@ describe('CronManager', () => {
     fireEvent.click(screen.getAllByText('cron.history').at(-1)!);
     const detailPreview = await screen.findByText((_text, node) => node?.textContent === '## Result\nLine one');
     fireEvent.click(detailPreview);
+    expect(screen.getByText('cron.final_output')).toBeDefined();
     fireEvent.click(screen.getAllByText('cron.go_and_quote →').at(-1)!);
     expect(onNavigateSession).toHaveBeenCalledWith('deck_cd_brain', '## Result\nLine one');
+  });
+
+  it('keeps execution prompts to a compact one-line summary', async () => {
+    const longPrompt = `Inspect the deployment and summarize only the final result ${'without showing this repeated context '.repeat(8)}`;
+    apiFetch
+      .mockResolvedValueOnce({ jobs: [cronJob({ id: 'job-compact', name: 'Compact prompt job' })] })
+      .mockResolvedValueOnce({
+        executions: [{
+          id: 'compact-1',
+          job_id: 'job-compact',
+          job_name: 'Compact prompt job',
+          server_id: 'srv-current',
+          project_name: 'cd',
+          cron_expr: '0 9 * * *',
+          target_role: 'brain',
+          target_session_name: null,
+          action: JSON.stringify({ type: 'command', command: longPrompt }),
+          status: 'dispatched',
+          detail: 'Final result only',
+          created_at: Date.now(),
+        }],
+      });
+
+    render(
+      <CronManager
+        serverId="srv-current"
+        projectName="cd"
+        sessions={sessions}
+        onBack={vi.fn()}
+      />,
+    );
+
+    expect(await screen.findByText('Compact prompt job')).toBeDefined();
+    fireEvent.click(screen.getAllByText('cron.history')[0]);
+    await screen.findByText('Final result only');
+
+    expect(screen.queryByText(longPrompt)).toBeNull();
+    expect(screen.getByText((text) => text.startsWith('Inspect the deployment') && text.endsWith('…'))).toBeDefined();
   });
 
   it('loads cross-job executions and switches latest/all modes across servers', async () => {
