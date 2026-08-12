@@ -33,9 +33,11 @@ export function isNodeRole(value: unknown): value is NodeRole {
 export const REMOTE_EXEC_SHELLS = ['powershell', 'cmd', 'bash', 'sh'] as const;
 export type RemoteExecShell = (typeof REMOTE_EXEC_SHELLS)[number];
 
-export const REMOTE_EXEC_DEFAULT_TIMEOUT_MS = 120_000;
+/** Default one-shot command timeout: 15 minutes. */
+export const REMOTE_EXEC_DEFAULT_TIMEOUT_MS = 900_000;
 export const REMOTE_EXEC_MIN_TIMEOUT_MS = 1_000;
-export const REMOTE_EXEC_MAX_TIMEOUT_MS = 600_000;
+/** Hard ceiling accepted by every remote-exec boundary: 1 hour. */
+export const REMOTE_EXEC_MAX_TIMEOUT_MS = 3_600_000;
 /** Hard cap on captured stdout/stderr each; excess is truncated (flagged). */
 export const REMOTE_EXEC_MAX_OUTPUT_BYTES = 1_000_000;
 /** Per-frame stdout/stderr payload cap; large process chunks are split before WS dispatch. */
