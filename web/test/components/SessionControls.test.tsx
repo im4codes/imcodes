@@ -4656,6 +4656,7 @@ afterEach(() => {
     );
 
     const stop = screen.getByRole('button', { name: /^stop$/i });
+    expect(within(stop).getByText('1').classList.contains('shortcut-btn-stop-queue-count')).toBe(true);
     fireEvent.pointerDown(stop);
     fireEvent.click(stop);
 
@@ -4669,7 +4670,9 @@ afterEach(() => {
     expect(ws.send.mock.calls.filter(([payload]) => (
       (payload as { type?: string }).type === 'session.append_queued_messages'
     ))).toHaveLength(1);
-    expect(screen.getByText('Queued messages appended; the session is still running.')).toBeDefined();
+    const notice = screen.getByRole('status');
+    expect(notice.textContent).toContain('Queued messages appended; the session is still running.');
+    expect(notice.classList.contains('queue-append-success-toast')).toBe(true);
   });
 
   it('uses Stop to cancel when there are no appendable queued messages', () => {
@@ -4688,7 +4691,9 @@ afterEach(() => {
       />,
     );
 
-    fireEvent.click(screen.getByRole('button', { name: /^stop$/i }));
+    const stop = screen.getByRole('button', { name: /^stop$/i });
+    expect(stop.querySelector('.shortcut-btn-stop-queue-count')).toBeNull();
+    fireEvent.click(stop);
 
     expectUrgentCancelPayload(ws, { sessionName: 'qwen-session' });
     expect(ws.send).not.toHaveBeenCalledWith(expect.objectContaining({

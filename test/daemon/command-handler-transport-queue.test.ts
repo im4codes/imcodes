@@ -4129,6 +4129,88 @@ describe('handleWebCommand transport queue behavior', () => {
     }));
   });
 
+  it('waits for an in-flight send to register before appending its optimistic queue row', async () => {
+    enablePreferenceFeature();
+    let releasePreferenceLoad!: (value: unknown[]) => void;
+    listContextObservationsMock.mockImplementationOnce(() => new Promise((resolve) => {
+      releasePreferenceLoad = resolve;
+    }) as any);
+
+    const store = getTransportQueueStore();
+    let queued = false;
+    const transportSend = vi.fn((text: string, clientMessageId: string) => {
+      store.enqueue({
+        sessionName: 'deck_transport_brain',
+        clientMessageId,
+        text,
+        now: 100,
+      });
+      queued = true;
+      return 'queued' as const;
+    });
+    const appendPendingMessagesToActiveTurn = vi.fn(async (ids: string[], notificationId: string) => {
+      if (!queued) return { status: 'not_found' as const };
+      const finalized = store.finalizeSentBatch('deck_transport_brain', ids, notificationId, 200);
+      return {
+        status: 'delivered' as const,
+        entries: [{ clientMessageId: 'cmd-sync-race', text: 'append after registration' }],
+        queueSnapshot: finalized.snapshot,
+        deliveryFacts: finalized.deliveryFacts,
+      };
+    });
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'route-transport',
+      send: transportSend,
+      appendPendingMessagesToActiveTurn,
+      sending: true,
+      get pendingCount() { return queued ? 1 : 0; },
+      get pendingMessages() { return queued ? ['append after registration'] : []; },
+      get pendingEntries() {
+        return queued
+          ? [{ clientMessageId: 'cmd-sync-race', text: 'append after registration' }]
+          : [];
+      },
+    });
+
+    handleWebCommand({
+      type: 'session.send',
+      sessionName: 'deck_transport_brain',
+      text: 'append after registration',
+      commandId: 'cmd-sync-race',
+      origin: 'user_keyboard',
+      userId: 'user-1',
+    }, serverLink as any);
+    handleWebCommand({
+      type: TRANSPORT_QUEUE_COMMANDS.APPEND_MESSAGES,
+      sessionName: 'deck_transport_brain',
+      clientMessageIds: ['cmd-sync-race'],
+      commandId: 'cmd-sync-race-append',
+    }, serverLink as any);
+
+    await flushAsync();
+    expect(transportSend).not.toHaveBeenCalled();
+    expect(appendPendingMessagesToActiveTurn).not.toHaveBeenCalled();
+
+    releasePreferenceLoad([]);
+    await waitForAsync(() => serverLink.send.mock.calls.some(([payload]) => (
+      payload?.type === 'command.ack'
+      && payload?.commandId === 'cmd-sync-race-append'
+      && payload?.status === 'accepted'
+    )));
+
+    expect(transportSend).toHaveBeenCalledOnce();
+    expect(appendPendingMessagesToActiveTurn).toHaveBeenCalledOnce();
+    expect(appendPendingMessagesToActiveTurn).toHaveBeenCalledWith(
+      ['cmd-sync-race'],
+      'cmd-sync-race-append',
+    );
+    expect(serverLink.send).not.toHaveBeenCalledWith(expect.objectContaining({
+      commandId: 'cmd-sync-race-append',
+      status: 'error',
+      error: 'Queued message not found',
+    }));
+  });
+
   it('rejects an oversized active-turn append before invoking the runtime', async () => {
     const appendPendingMessagesToActiveTurn = vi.fn();
     getTransportRuntimeMock.mockReturnValue({

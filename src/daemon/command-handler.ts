@@ -363,6 +363,84 @@ import {
 import { getProvider } from '../agent/provider-registry.js';
 
 const MAX_P2P_FILE_PULL_COUNT = 20;
+const TRANSPORT_QUEUE_SEND_SYNC_WAIT_MS = 3_000;
+
+interface InFlightSessionSend {
+  settled: Promise<void>;
+  settle: () => void;
+}
+
+// A browser renders an optimistic queued row as soon as session.send receives
+// its receipt ack. The send handler may still be awaiting preference/context
+// work before it reaches TransportSessionRuntime.send(), so a quick follow-up
+// append command can otherwise overtake it and observe a false "not found".
+// Track the exact send command until its handler settles so append can wait for
+// the relevant queue registration without serializing unrelated messages.
+const inFlightSessionSends = new Map<string, InFlightSessionSend>();
+
+function inFlightSessionSendKey(sessionName: string, clientMessageId: string): string {
+  return `${sessionName}\u0000${clientMessageId}`;
+}
+
+function dispatchSessionSend(cmd: Record<string, unknown>, serverLink: ServerLink): void {
+  const sessionName = typeof (cmd.sessionName ?? cmd.session) === 'string'
+    ? String(cmd.sessionName ?? cmd.session).trim()
+    : '';
+  const clientMessageId = typeof cmd.commandId === 'string' ? cmd.commandId.trim() : '';
+  if (!sessionName || !clientMessageId) {
+    void handleSend(cmd, serverLink);
+    return;
+  }
+
+  const key = inFlightSessionSendKey(sessionName, clientMessageId);
+  // A bridge retry can reuse a command id while the original handler is still
+  // active. Keep the original barrier; the dedup path may finish first.
+  if (inFlightSessionSends.has(key)) {
+    void handleSend(cmd, serverLink);
+    return;
+  }
+
+  let settle!: () => void;
+  const settled = new Promise<void>((resolve) => {
+    settle = resolve;
+  });
+  const tracked = { settled, settle };
+  inFlightSessionSends.set(key, tracked);
+  void (async () => {
+    try {
+      await handleSend(cmd, serverLink);
+    } finally {
+      if (inFlightSessionSends.get(key) === tracked) {
+        inFlightSessionSends.delete(key);
+      }
+      tracked.settle();
+    }
+  })();
+}
+
+async function waitForSelectedSessionSends(
+  sessionName: string,
+  clientMessageIds: readonly string[],
+): Promise<void> {
+  const pending = [...new Set(clientMessageIds.flatMap((clientMessageId) => {
+    const tracked = inFlightSessionSends.get(inFlightSessionSendKey(sessionName, clientMessageId));
+    return tracked ? [tracked.settled] : [];
+  }))];
+  if (pending.length === 0) return;
+
+  await new Promise<void>((resolve) => {
+    let done = false;
+    const finish = (): void => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      resolve();
+    };
+    const timer = setTimeout(finish, TRANSPORT_QUEUE_SEND_SYNC_WAIT_MS);
+    void Promise.all(pending).then(finish);
+  });
+}
+
 const processRecallRepositoryIdentityService = new GitOriginRepositoryIdentityService();
 const DAEMON_LOCAL_PREFERENCE_USER_ID = 'daemon-local';
 
@@ -1477,7 +1555,7 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
       void handleSessionTransportConfigUpdate(cmd, serverLink);
       break;
     case 'session.send':
-      void handleSend(cmd, serverLink);
+      dispatchSessionSend(cmd, serverLink);
       break;
     case 'session.edit_queued_message':
       void handleEditQueuedTransportMessage(cmd, serverLink);
@@ -4769,6 +4847,12 @@ async function handleAppendQueuedTransportMessages(cmd: Record<string, unknown>,
     reject('Invalid queued message selection');
     return;
   }
+
+  // session.send emits its receipt ack before all asynchronous preparation is
+  // complete. If this append targets one of those optimistic rows, let that
+  // exact send reach the runtime/store before deciding that the id is absent.
+  await waitForSelectedSessionSends(sessionName, clientMessageIds);
+
   const runtime = getTransportRuntime(sessionName);
   const record = getSession(sessionName);
   if (!runtime || record?.runtimeType !== 'transport') {

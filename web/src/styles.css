@@ -214,6 +214,54 @@ html.native-ios-mac .chat-dl-btn {
 .toast-close:hover { color: #e6edf3; }
 @keyframes toast-in { from { opacity: 0; transform: translateY(12px); } to { opacity: 1; transform: none; } }
 @media (max-width: 640px) { .toast-container { bottom: 130px; right: 8px; left: 8px; } .toast { max-width: 100%; } }
+
+/* Center-screen confirmation for Stop's queue-first action. */
+.queue-append-success-toast {
+  position: fixed;
+  z-index: 12000;
+  top: 50%;
+  left: 50%;
+  width: max-content;
+  max-width: min(520px, calc(100vw - 32px));
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  padding: 13px 18px;
+  color: #e8fbff;
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: .01em;
+  background: linear-gradient(135deg, rgb(7 24 38 / 94%), rgb(10 38 52 / 92%));
+  border: 1px solid rgb(68 222 255 / 68%);
+  border-radius: 999px;
+  box-shadow: 0 0 0 1px rgb(44 170 255 / 12%), 0 14px 48px rgb(0 0 0 / 48%), 0 0 28px rgb(41 200 255 / 20%);
+  backdrop-filter: blur(14px) saturate(145%);
+  pointer-events: none;
+  animation: queue-append-success-in .24s cubic-bezier(.2, .9, .2, 1) both;
+}
+
+.queue-append-success-toast-icon {
+  display: grid;
+  width: 25px;
+  height: 25px;
+  flex: 0 0 25px;
+  place-items: center;
+  color: #07131d;
+  background: linear-gradient(135deg, #67e8f9, #38bdf8);
+  border-radius: 50%;
+  box-shadow: 0 0 16px rgb(56 189 248 / 72%);
+  font-size: 15px;
+  font-weight: 900;
+}
+
+@keyframes queue-append-success-in {
+  from { opacity: 0; transform: translate(-50%, -42%) scale(.94); filter: blur(4px); }
+  to { opacity: 1; transform: translate(-50%, -50%) scale(1); filter: blur(0); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .queue-append-success-toast { animation: none; transform: translate(-50%, -50%); }
+}
 .tab-context-menu { position: fixed; background: #1c2128; border: 1px solid #30363d; border-radius: 6px; min-width: 150px; box-shadow: 0 8px 24px #00000080; z-index: 100; overflow: hidden; }
 .menu-divider { height: 1px; background: #21262d; margin: 2px 0; }
 .share-dialog { max-width: 520px; }
@@ -407,7 +455,28 @@ html.native-ios-mac .chat-dl-btn {
 .shortcut-btn:disabled { opacity: 0.4; cursor: default; }
 .shortcut-btn-wide { padding-left: 14px; padding-right: 14px; }
 .shortcut-btn-icon { width: 28px; min-width: 28px; padding: 4px 0; display: inline-flex; align-items: center; justify-content: center; }
-.shortcut-btn-stop { width: 44px; min-width: 44px; font-size: 18px; line-height: 1; }
+.shortcut-btn-stop { position: relative; width: 44px; min-width: 44px; font-size: 18px; line-height: 1; }
+.shortcut-btn-stop-queue-count {
+  position: absolute;
+  top: -7px;
+  right: -7px;
+  z-index: 3;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 4px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: #07131d;
+  background: linear-gradient(135deg, #67e8f9, #38bdf8);
+  border: 2px solid #0b1220;
+  border-radius: 999px;
+  box-shadow: 0 0 12px rgb(56 189 248 / 64%);
+  font-size: 10px;
+  font-weight: 800;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+}
 /* Mobile arrow D-pad — replaces the separate up/down buttons on small screens.
  * Drag toward a direction to send that arrow key. touch-action:none keeps the
  * drag from scrolling the page; the four glyphs sit around a center. */

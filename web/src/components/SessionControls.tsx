@@ -1508,10 +1508,12 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const uploadNow = useNowTicker(uploading);
   const uploadError = uploadSnapshot.error;
   const [sendWarning, setSendWarning] = useState<string | null>(null);
+  const [appendSuccessNotice, setAppendSuccessNotice] = useState<string | null>(null);
   const [attachments, setAttachments] = useState<ComposerAttachmentRecord[]>([]);
   const [deletingAttachmentKeys, setDeletingAttachmentKeys] = useState<Set<string>>(() => new Set());
   const [pendingDelegateTarget, setPendingDelegateTarget] = useState<PendingDelegateTarget | null>(null);
   const sendWarningTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const appendSuccessTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [localTransportConfig, setLocalTransportConfig] = useState<Record<string, unknown> | null>(activeSession?.transportConfig ?? null);
 
   // Keep external inputRef in sync so parent can call .focus()
@@ -1591,6 +1593,14 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       setSendWarning(null);
     }, 5000);
   }, []);
+  const showAppendSuccessNotice = useCallback((message: string) => {
+    if (appendSuccessTimerRef.current) clearTimeout(appendSuccessTimerRef.current);
+    setAppendSuccessNotice(message);
+    appendSuccessTimerRef.current = setTimeout(() => {
+      appendSuccessTimerRef.current = null;
+      setAppendSuccessNotice(null);
+    }, 3500);
+  }, []);
   const transportQueueAppendFailedLabel = t('session.transport_queue_append_failed');
 
   // Persist input draft across unmount/remount (sub-session minimize/restore)
@@ -1639,6 +1649,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
 
   useEffect(() => () => {
     if (sendWarningTimerRef.current) clearTimeout(sendWarningTimerRef.current);
+    if (appendSuccessTimerRef.current) clearTimeout(appendSuccessTimerRef.current);
   }, []);
 
   useEffect(() => {
@@ -3971,12 +3982,12 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       if (now - stopPressGuardRef.current < 600) return;
       stopPressGuardRef.current = now;
       if (handleQueuedMessagesAppend(appendableQueuedTransportEntries)) {
-        showSendWarning(t('session.stop_appended_queue'));
+        showAppendSuccessNotice(t('session.stop_appended_queue'));
       }
       return;
     }
     handleStopPress();
-  }, [appendableQueuedTransportEntries, handleQueuedMessagesAppend, handleStopPress, showSendWarning, t]);
+  }, [appendableQueuedTransportEntries, handleQueuedMessagesAppend, handleStopPress, showAppendSuccessNotice, t]);
 
   const handleQueuedMessageRetry = useCallback((entry: LocalQueuedTransportEntry) => {
     if (entry.status !== 'failed') return;
@@ -4779,6 +4790,13 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
 
   return (
     <>
+    {appendSuccessNotice && typeof document !== 'undefined' && createPortal(
+      <div class="queue-append-success-toast" role="status" aria-live="polite">
+        <span class="queue-append-success-toast-icon" aria-hidden="true">↗</span>
+        <span>{appendSuccessNotice}</span>
+      </div>,
+      document.body,
+    )}
     {mobileFileBrowserOpen && ws && activeSession && createPortal(
       <div class="mobile-fb-overlay" ref={swipeBackRef}>
         <div class="mobile-fb-header">
@@ -4873,7 +4891,9 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           {isTransport ? (
             <button
               class={`shortcut-btn shortcut-btn-icon shortcut-btn-stop${stopRequested ? ' shortcut-btn-stop-pending' : ''}`}
-              title={`${t('session.stop_plain')} (/stop)`}
+              title={appendableQueuedTransportEntries.length > 0
+                ? `${t('session.stop_plain')} · ${t('session.transport_send_queued_count', { count: appendableQueuedTransportEntries.length })}`
+                : `${t('session.stop_plain')} (/stop)`}
               aria-label={t('session.stop_plain')}
               disabled={disabled || activeSession?.state === 'stopped'}
               onPointerDown={(e) => { e.preventDefault(); handleStopButtonPress(); }}
@@ -4881,6 +4901,11 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
               style={activeSessionLiveStatus.sweep ? { color: '#f87171' } : undefined}
             >
               <span aria-hidden="true">■</span>
+              {appendableQueuedTransportEntries.length > 0 && (
+                <span class="shortcut-btn-stop-queue-count" aria-hidden="true">
+                  {appendableQueuedTransportEntries.length > 99 ? '99+' : appendableQueuedTransportEntries.length}
+                </span>
+              )}
             </button>
           ) : SHORTCUTS.map((s) => {
             // Mobile: collapse the separate ↑/↓ buttons into one drag D-pad
