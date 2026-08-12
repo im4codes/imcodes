@@ -31,6 +31,10 @@ import {
   validateMachineDirectFetchRequest,
   validateMachineDirectUploadRequest,
 } from '../../../shared/machine-direct-file-transfer.js';
+import {
+  canOperateControlledMachine,
+  resolveControlledMachineAccess,
+} from '../share/machine-access.js';
 import { FS_GENERIC_ERROR_CODES } from '../../../shared/fs-error-codes.js';
 import type {
   AttachmentRef,
@@ -73,6 +77,7 @@ const downloadTokens = new Map<string, {
 }>();
 const stagedUploads = new Map<string, {
   serverId: string;
+  controlledAccessUserId?: string;
   token: string;
   dir: string;
   filePath: string;
@@ -84,6 +89,7 @@ const stagedUploads = new Map<string, {
 }>();
 const stagedDownloads = new Map<string, {
   serverId: string;
+  controlledAccessUserId?: string;
   token: string;
   stream: PassThrough;
   ready: Promise<Record<string, unknown>>;
@@ -94,6 +100,22 @@ const stagedDownloads = new Map<string, {
   timer: ReturnType<typeof setTimeout>;
   started: boolean;
 }>();
+
+async function hasCurrentControlledStageAccess(
+  db: Env['DB'],
+  entry: { serverId: string; controlledAccessUserId?: string },
+): Promise<boolean> {
+  if (!entry.controlledAccessUserId) return true;
+  const access = await resolveControlledMachineAccess(
+    db,
+    entry.controlledAccessUserId,
+    entry.serverId,
+    Date.now(),
+  );
+  return access != null
+    && canOperateControlledMachine(access.access_role)
+    && access.exec_enabled;
+}
 
 function settleStagedDownloadReady(downloadId: string, settle: (entry: NonNullable<ReturnType<typeof stagedDownloads.get>>) => void): void {
   const entry = stagedDownloads.get(downloadId);
@@ -226,6 +248,7 @@ async function attemptStreamedDownload(
   bridge: ReturnType<typeof WsBridge.get>,
   serverId: string,
   attachmentId: string,
+  controlledAccessUserId?: string,
 ): Promise<{ kind: 'done'; response: Response } | { kind: 'retry' }> {
   const downloadId = randomHex(16);
   const token = randomHex(32);
@@ -245,6 +268,7 @@ async function attemptStreamedDownload(
   });
   stagedDownloads.set(downloadId, {
     serverId,
+    ...(controlledAccessUserId ? { controlledAccessUserId } : {}),
     token,
     stream,
     ready,
@@ -397,8 +421,11 @@ async function authorizeControlledFileTarget(
   if (nodeRole !== 'full' || !sourceServerId || sourceServerId === serverId) {
     return { ok: false, reason: 'scoped_auth' };
   }
-  if (target.user_id !== userId || target.revoked_at != null) return { ok: false, reason: 'target_forbidden' };
-  if (!target.exec_enabled) return { ok: false, reason: 'exec_disabled' };
+  const access = await resolveControlledMachineAccess(c.env.DB, userId, serverId, Date.now());
+  if (!access || !canOperateControlledMachine(access.access_role)) {
+    return { ok: false, reason: 'target_forbidden' };
+  }
+  if (!access.exec_enabled) return { ok: false, reason: 'exec_disabled' };
   if (!bridge.isDaemonConnected()) return { ok: false, reason: 'daemon_offline' };
   // Capture the exact socket generation synchronously with the capability
   // observation. Callers can spend time reading/validating request bodies, but
@@ -477,6 +504,8 @@ async function readBoundedJsonObject(
 
 // ── GET /api/server/:id/upload-staged/:uploadId ─────────────────────────────
 // Token-authenticated, relay-local temporary object fetch for daemon uploads.
+// Controlled-node stages also revalidate the issuing user's current grant
+// before bytes leave the Server, so a queued token cannot outlive revocation.
 // The token stays reusable for a short grace window after a successful read so
 // daemon-side HTTP retries do not fail, then the staged object is removed.
 
@@ -491,6 +520,16 @@ fileTransferRoutes.get('/:id/upload-staged/:uploadId', async (c) => {
     return c.json({ error: 'expired' }, 410);
   }
   if (!token || token !== entry.token) return c.json({ error: 'forbidden' }, 403);
+  const accessCurrent = await hasCurrentControlledStageAccess(c.env.DB, entry);
+  if (stagedUploads.get(uploadId) !== entry) return c.json({ error: 'not_found' }, 404);
+  if (!accessCurrent) {
+    deleteStagedUpload(uploadId);
+    return c.json({ error: 'forbidden' }, 403);
+  }
+  if (Date.now() > entry.expiresAt) {
+    deleteStagedUpload(uploadId);
+    return c.json({ error: 'expired' }, 410);
+  }
 
   const fileStream = createReadStream(entry.filePath);
   fileStream.once('end', () => scheduleStagedUploadFetchCleanup(uploadId));
@@ -512,6 +551,7 @@ fileTransferRoutes.get('/:id/upload-staged/:uploadId', async (c) => {
 // Token-authenticated, relay-local sink for daemon → browser streaming
 // downloads. The daemon uploads raw bytes here; the browser GET response reads
 // the paired PassThrough, so large files never cross the daemon WS as base64.
+// Controlled-node stages revalidate access before accepting the first byte.
 
 fileTransferRoutes.put('/:id/download-staged/:downloadId', async (c) => {
   const serverId = c.req.param('id')!;
@@ -524,6 +564,16 @@ fileTransferRoutes.put('/:id/download-staged/:downloadId', async (c) => {
     return c.json({ error: 'expired' }, 410);
   }
   if (!token || token !== entry.token) return c.json({ error: 'forbidden' }, 403);
+  const accessCurrent = await hasCurrentControlledStageAccess(c.env.DB, entry);
+  if (stagedDownloads.get(downloadId) !== entry) return c.json({ error: 'not_found' }, 404);
+  if (!accessCurrent) {
+    deleteStagedDownload(downloadId, new Error('authorization_revoked'));
+    return c.json({ error: 'forbidden' }, 403);
+  }
+  if (Date.now() > entry.expiresAt) {
+    deleteStagedDownload(downloadId, new Error('expired'));
+    return c.json({ error: 'expired' }, 410);
+  }
   if (entry.started) return c.json({ error: 'already_started' }, 409);
 
   const contentLengthHeader = c.req.header('content-length');
@@ -779,6 +829,7 @@ fileTransferRoutes.post('/:id/upload', async (c) => {
     timer.unref?.();
     stagedUploads.set(uploadId, {
       serverId,
+      ...(controlledGate.controlled ? { controlledAccessUserId: userId } : {}),
       token,
       dir: stagedDir,
       filePath: stagedPath,
@@ -1051,7 +1102,13 @@ fileTransferRoutes.get('/:id/uploads/:attachmentId/download', async (c) => {
       // missing-or-expired handle is terminal; everything else retries, then
       // falls through to base64.
       for (let attempt = 0; attempt < FILE_TRANSFER_LIMITS.DOWNLOAD_STREAM_MAX_ATTEMPTS; attempt++) {
-        const outcome = await attemptStreamedDownload(c, bridge, serverId, attachmentId);
+        const outcome = await attemptStreamedDownload(
+          c,
+          bridge,
+          serverId,
+          attachmentId,
+          controlledGate.controlled ? userId : undefined,
+        );
         if (outcome.kind === 'done') return outcome.response;
       }
       logger.warn(

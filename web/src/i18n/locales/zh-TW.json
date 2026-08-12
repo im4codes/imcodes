@@ -2815,7 +2815,7 @@
     "usage_win_run": "以系統管理員身分執行。若出現 SmartScreen,選擇「詳細資訊」→「仍要執行」。",
     "usage_mac_run": "首次啟動需繞過 Gatekeeper:右鍵應用程式→打開,或執行 xattr -cr <路徑> 後正常打開。",
     "usage_linux_run": "新增可執行權限(chmod +x <檔案>)並以 root 執行一次(sudo)。",
-    "machines_title": "你的機器",
+    "machines_title": "機器",
     "refresh": "重新整理",
     "error_generic": "發生錯誤,請重試。",
     "empty": "尚無受控節點。",
@@ -2826,7 +2826,19 @@
     "rename_label": "受控節點名稱",
     "rename_invalid": "請輸入 1–120 個字元的名稱，且不可包含控制字元。",
     "revoke": "撤銷",
-    "revoke_confirm": "撤銷這台機器?撤銷後將無法再控制,需要重新註冊。"
+    "revoke_confirm": "撤銷這台機器?撤銷後將無法再控制,需要重新註冊。",
+    "access_role": "權限：{{role}}",
+    "share": {
+      "title": "共享受控節點",
+      "subtitle": "授予對 {{target}} 的存取權限",
+      "role_help": {
+        "viewer": "可查看節點上線狀態和基本資訊，但不能操作節點。",
+        "participant": "節點允許執行時，可執行命令、傳輸檔案及使用電腦控制。"
+      },
+      "trust_title": "參與者可以控制這台機器",
+      "trust_body": "僅共享給你信任的人；其操作會以受控節點的系統權限執行。",
+      "view_only": "僅檢視"
+    }
   },
   "peerAuditQuick": {
     "iconLabel": "對等稽核",

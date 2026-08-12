@@ -2815,7 +2815,7 @@
     "usage_win_run": "以管理员身份运行。若出现 SmartScreen,选择“更多信息”→“仍要运行”。",
     "usage_mac_run": "首次启动需绕过 Gatekeeper:右键应用→打开,或执行 xattr -cr <路径> 后正常打开。",
     "usage_linux_run": "添加可执行权限(chmod +x <文件>)并以 root 运行一次(sudo)。",
-    "machines_title": "你的机器",
+    "machines_title": "机器",
     "refresh": "刷新",
     "error_generic": "出错了,请重试。",
     "empty": "还没有被控节点。",
@@ -2826,7 +2826,19 @@
     "rename_label": "受控节点名称",
     "rename_invalid": "请输入 1–120 个字符的名称，且不能包含控制字符。",
     "revoke": "吊销",
-    "revoke_confirm": "吊销这台机器?吊销后将无法再控制,需要重新注册。"
+    "revoke_confirm": "吊销这台机器?吊销后将无法再控制,需要重新注册。",
+    "access_role": "权限：{{role}}",
+    "share": {
+      "title": "共享被控节点",
+      "subtitle": "授予对 {{target}} 的访问权限",
+      "role_help": {
+        "viewer": "可查看节点在线状态和基本信息，但不能操作节点。",
+        "participant": "节点允许执行时，可运行命令、传输文件和使用电脑控制。"
+      },
+      "trust_title": "参与者可以控制这台机器",
+      "trust_body": "仅共享给你信任的人；其操作将以被控节点的系统权限执行。",
+      "view_only": "仅查看"
+    }
   },
   "peerAuditQuick": {
     "iconLabel": "对等审计",

@@ -11,14 +11,19 @@ import {
   MACHINE_LIST_MAX_ITEMS,
   MACHINE_PRESENCE_STALENESS_MS,
   canonicalMachineOs,
+  type MachineAccessRole,
   type MachineSummary,
 } from '../../../shared/remote-exec.js';
 import {
   MACHINE_REASONS,
   normalizeMachineDisplayName,
 } from '../../../shared/machine-reference.js';
+import { listAccessibleControlledMachines } from '../share/machine-access.js';
 
-export const machinesRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
+export const machinesRoutes = new Hono<{
+  Bindings: Env;
+  Variables: { userId: string; role: string; nodeRole?: string; authServerId?: string };
+}>();
 
 interface ControlledRow {
   id: string;
@@ -28,10 +33,11 @@ interface ControlledRow {
   last_heartbeat_at: number | null;
   exec_enabled: boolean;
   os: string | null;
+  access_role: MachineAccessRole;
 }
 
 /**
- * Shared owner-scoped controlled-machine query + DTO mapping (F1: presence is
+ * Shared access-scoped controlled-machine query + DTO mapping (F1: presence is
  * read from the DB `status`/`last_heartbeat_at`, NOT per-pod WsBridge). Both the
  * MCP `list_machines` tool and this HTTP route use this — they do not call each other.
  */
@@ -39,15 +45,12 @@ export async function listControlledMachines(
   db: Database,
   userId: string,
   nowMs: number,
-): Promise<{ machines: (MachineSummary & { refName: string; displayName: string; execEnabled: boolean })[]; overLimit: boolean }> {
-  const rows = await db.query<ControlledRow>(
-    `SELECT id, ref_name, display_name, status, last_heartbeat_at, exec_enabled,
-            os
-       FROM servers
-      WHERE user_id = $1 AND node_role = $2 AND revoked_at IS NULL
-      ORDER BY display_name NULLS LAST, id
-      LIMIT $3`,
-    [userId, NODE_ROLE.CONTROLLED, MACHINE_LIST_MAX_ITEMS + 1],
+): Promise<{ machines: (MachineSummary & { refName: string; displayName: string; execEnabled: boolean; accessRole: MachineAccessRole })[]; overLimit: boolean }> {
+  const rows: ControlledRow[] = await listAccessibleControlledMachines(
+    db,
+    userId,
+    nowMs,
+    MACHINE_LIST_MAX_ITEMS + 1,
   );
   const overLimit = rows.length > MACHINE_LIST_MAX_ITEMS;
   const machines = rows.slice(0, MACHINE_LIST_MAX_ITEMS).map((r) => {
@@ -61,7 +64,10 @@ export async function listControlledMachines(
       displayName: r.display_name ?? r.ref_name ?? r.id,
       online,
       nodeRole: NODE_ROLE.CONTROLLED,
-      execEnabled: r.exec_enabled === true,
+      // Viewers may inspect bounded metadata only. Projecting false here also
+      // keeps old MCP resolution logic from presenting a non-operable target.
+      execEnabled: r.exec_enabled === true && r.access_role !== 'viewer',
+      accessRole: r.access_role,
       ...(canonicalMachineOs(r.os) ? { os: canonicalMachineOs(r.os) } : {}),
       ...(typeof r.last_heartbeat_at === 'number' ? { lastSeenMs: r.last_heartbeat_at } : {}),
     };
@@ -69,14 +75,22 @@ export async function listControlledMachines(
   return { machines, overLimit };
 }
 
-// GET /api/machines — owner-scoped controlled machine list with DB-backed presence.
+// GET /api/machines — owned + actively shared controlled machines with DB-backed presence.
 machinesRoutes.get('/', requireAuth(), async (c) => {
   const userId = c.get('userId' as never) as string;
   const { machines, overLimit } = await listControlledMachines(c.env.DB, userId, Date.now());
   if (overLimit) {
     return c.json({ error: 'machine_list_over_limit', maxItems: MACHINE_LIST_MAX_ITEMS }, 413);
   }
-  return c.json({ machines });
+  // Older daemons strictly reject unknown machine-list keys. Server-authenticated
+  // callers do not need the display-only role because every action is admitted
+  // again against the DB; preserve their legacy DTO during rolling upgrades.
+  const authenticatedDaemon = c.get('nodeRole') === NODE_ROLE.FULL
+    && typeof c.get('authServerId') === 'string';
+  const responseMachines = authenticatedDaemon
+    ? machines.map(({ accessRole: _accessRole, ...machine }) => machine)
+    : machines;
+  return c.json({ machines: responseMachines });
 });
 
 // POST /api/machines/:serverId/display-name — owner-controlled render name.

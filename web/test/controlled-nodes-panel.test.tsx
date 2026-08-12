@@ -62,12 +62,18 @@ const beginControlledNodeDesktopDownload = vi.fn(() => ({
   closed: false,
   close: vi.fn(),
 }));
+const listSharesForTarget = vi.fn(async () => []);
+const createShare = vi.fn(async () => ({
+  id: 'share-1', targetUserId: 'user-2', role: 'viewer' as const, status: 'active' as const,
+}));
 vi.mock('../src/api.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../src/api.js')>();
   return {
     ...actual,
     downloadControlledNodeExecutable: (...a: unknown[]) => downloadControlledNodeExecutable(...a),
     beginControlledNodeDesktopDownload: () => beginControlledNodeDesktopDownload(),
+    listSharesForTarget: (...a: unknown[]) => listSharesForTarget(...a),
+    createShare: (...a: unknown[]) => createShare(...a),
   };
 });
 
@@ -219,6 +225,36 @@ describe('ControlledNodesPanel (12.3)', () => {
     fireEvent.click(toggle!);
     await waitFor(() => expect(setMachineExecEnabled).toHaveBeenCalledWith('srv1', true));
     expect(refetch).toHaveBeenCalled();
+  });
+
+  it('opens fixed-target sharing for an owner machine', async () => {
+    machines = [machine({ serverId: 'shared-machine', displayName: 'Office Node', accessRole: 'owner' })];
+    const { container } = render(<ControlledNodesPanel />);
+    await waitFor(() => expect(container.textContent).toContain('Office Node'));
+    fireEvent.click(container.querySelector('.share-revoke-btn')!);
+
+    await waitFor(() => expect(container.textContent).toContain('controlled_nodes.share.title'));
+    expect(listSharesForTarget).toHaveBeenCalledWith(
+      'shared-machine',
+      { kind: 'server', serverId: 'shared-machine' },
+    );
+    expect(container.querySelector('[role="radiogroup"][aria-label="share.target.label"]')).toBeNull();
+  });
+
+  it('keeps owner controls hidden for shared Viewer and Participant machines', async () => {
+    machines = [
+      machine({ serverId: 'viewer', displayName: 'Viewer Node', accessRole: 'viewer', execEnabled: false }),
+      machine({ serverId: 'participant', displayName: 'Participant Node', accessRole: 'participant', execEnabled: true }),
+    ];
+    const { container } = render(<ControlledNodesPanel />);
+    await waitFor(() => expect(container.textContent).toContain('Participant Node'));
+
+    expect(container.querySelector('.share-revoke-btn')).toBeNull();
+    expect(container.querySelector('.controlled-nodes-rename')).toBeNull();
+    expect(container.querySelector('.controlled-nodes-exec-toggle')).toBeNull();
+    expect(container.querySelector('.controlled-nodes-revoke')).toBeNull();
+    expect(container.textContent).toContain('controlled_nodes.share.view_only');
+    expect(container.textContent).toContain('controlled_nodes.exec_on');
   });
 
   it('renames only the mutable display name and refreshes the list', async () => {

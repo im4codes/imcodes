@@ -2815,7 +2815,7 @@
     "usage_win_run": "Ejecuta como Administrador. Si aparece SmartScreen, elige Más información → Ejecutar de todos modos.",
     "usage_mac_run": "En el primer arranque, evita Gatekeeper: clic derecho en la app → Abrir, o ejecuta: xattr -cr <ruta> y ábrela normalmente.",
     "usage_linux_run": "Hazlo ejecutable (chmod +x <archivo>) y ejecútalo una vez como root (sudo).",
-    "machines_title": "Tus máquinas",
+    "machines_title": "Máquinas",
     "refresh": "Actualizar",
     "error_generic": "Algo salió mal. Inténtalo de nuevo.",
     "empty": "Aún no hay nodos controlados.",
@@ -2826,7 +2826,19 @@
     "rename_label": "Nombre del nodo controlado",
     "rename_invalid": "Introduce un nombre de 1 a 120 caracteres sin caracteres de control.",
     "revoke": "Revocar",
-    "revoke_confirm": "¿Revocar esta máquina? Ya no se podrá controlar y deberá volver a registrarse."
+    "revoke_confirm": "¿Revocar esta máquina? Ya no se podrá controlar y deberá volver a registrarse.",
+    "access_role": "Acceso: {{role}}",
+    "share": {
+      "title": "Compartir nodo controlado",
+      "subtitle": "Conceder acceso a {{target}}",
+      "role_help": {
+        "viewer": "Puede ver la presencia y los datos básicos del nodo, pero no controlarlo.",
+        "participant": "Puede ejecutar comandos, transferir archivos y usar el control del equipo mientras la ejecución esté habilitada."
+      },
+      "trust_title": "El acceso de participante permite controlar esta máquina",
+      "trust_body": "Compártela solo con personas de confianza. Sus acciones se ejecutan con los privilegios del nodo controlado.",
+      "view_only": "Solo lectura"
+    }
   },
   "peerAuditQuick": {
     "iconLabel": "Auditoría de pares",

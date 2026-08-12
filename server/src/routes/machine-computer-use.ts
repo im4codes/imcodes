@@ -19,6 +19,10 @@ import {
 } from '../../../shared/computer-use.js';
 import { DAEMON_MSG } from '../../../shared/daemon-events.js';
 import { NODE_ROLE } from '../../../shared/remote-exec.js';
+import {
+  canOperateControlledMachine,
+  resolveControlledMachineAccess,
+} from '../share/machine-access.js';
 
 const DEFAULT_RELAY_DEADLINE_BUFFER_MS = 30_000;
 const ALLOWED_BODY_KEYS = new Set(['tool', 'arguments', 'timeoutMs']);
@@ -85,13 +89,10 @@ export function createMachineComputerUseRoutes(dispatcher: ComputerUseDispatcher
     const v = validateComputerUseFrame({ type: DAEMON_COMMAND_TYPES.COMPUTER_USE, ...(body ?? {}), correlationId });
     if (!v.ok) return c.json(pre(COMPUTER_USE_HTTP_REASON.INVALID_REQUEST), 400);
 
-    const target = await c.env.DB.queryOne<{ user_id: string; node_role: string; exec_enabled: boolean; revoked_at: number | null }>(
-      'SELECT user_id, node_role, exec_enabled, revoked_at FROM servers WHERE id = $1',
-      [targetId],
-    );
-    if (!target || target.user_id !== auth.userId) return c.json(pre(COMPUTER_USE_HTTP_REASON.TARGET_FORBIDDEN), 403);
-    if (target.node_role !== NODE_ROLE.CONTROLLED) return c.json(pre(COMPUTER_USE_HTTP_REASON.TARGET_FORBIDDEN), 403);
-    if (target.revoked_at != null) return c.json(pre(COMPUTER_USE_HTTP_REASON.TARGET_FORBIDDEN), 403);
+    const target = await resolveControlledMachineAccess(c.env.DB, auth.userId, targetId, Date.now());
+    if (!target || !canOperateControlledMachine(target.access_role)) {
+      return c.json(pre(COMPUTER_USE_HTTP_REASON.TARGET_FORBIDDEN), 403);
+    }
     if (!target.exec_enabled) return c.json(pre(COMPUTER_USE_HTTP_REASON.EXEC_DISABLED), 403);
 
     let dispatch: { online: boolean; result?: ComputerUseResult };

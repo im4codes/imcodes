@@ -19,6 +19,8 @@ import {
 import { normalizeMachineDisplayName } from '@shared/machine-reference.js';
 import { useMachines } from '../hooks/useMachines.js';
 import { isNative } from '../native.js';
+import { ShareSessionDialog } from './ShareSessionDialog.js';
+import type { MachineListItem } from '../api/machines.js';
 
 function formatByteSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
@@ -64,6 +66,12 @@ function findArtifactForTarget(
   return artifacts.find((a) => a.os === target.os && a.arch === target.arch);
 }
 
+function machineAccessRole(machine: MachineListItem): 'owner' | 'viewer' | 'participant' {
+  // The field is optional on the wire so a newly upgraded Web remains usable
+  // with an older Server, whose machine list was owner-only.
+  return machine.accessRole ?? 'owner';
+}
+
 const PLATFORM_PRESENTATION: Record<ControlledNodeOs, { glyph: string; name: string }> = {
   win: { glyph: '⊞', name: 'Windows' },
   mac: { glyph: '⌘', name: 'macOS' },
@@ -87,6 +95,7 @@ export function ControlledNodesPanel() {
   const [busyServerId, setBusyServerId] = useState<string | null>(null);
   const [editingServerId, setEditingServerId] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState('');
+  const [sharingMachine, setSharingMachine] = useState<MachineListItem | null>(null);
 
   const sortedTargets = useMemo(() => downloadTargets, [downloadTargets]);
   const availableOses = useMemo(
@@ -295,34 +304,53 @@ export function ControlledNodesPanel() {
                 <div class="controlled-nodes-machine-meta">
                   <code>{m.refName}</code>
                   {m.os && <span>{m.os.toUpperCase()}</span>}
+                  <span>{t('controlled_nodes.access_role', { role: t(`share.role.${machineAccessRole(m)}`) })}</span>
                 </div>
               </div>
               <div class="controlled-nodes-machine-actions">
-                <button
-                  type="button"
-                  class="controlled-nodes-rename"
-                  disabled={busyServerId === m.serverId || editingServerId === m.serverId}
-                  title={t('common.rename')}
-                  onClick={() => startRename(m.serverId, m.displayName)}
-                >✎</button>
-                <button
-                  type="button"
-                  class={`controlled-nodes-exec-toggle ${m.execEnabled ? 'is-enabled' : 'is-disabled'}`}
-                  disabled={busyServerId === m.serverId}
-                  aria-pressed={m.execEnabled}
-                  onClick={() => onToggleExec(m.serverId, !m.execEnabled)}
-                >
-                  <span class="controlled-nodes-toggle-track" aria-hidden="true"><i /></span>
-                  <span>{m.execEnabled ? t('controlled_nodes.exec_on') : t('controlled_nodes.exec_off')}</span>
-                </button>
-                <button
-                  type="button"
-                  class="controlled-nodes-revoke"
-                  disabled={busyServerId === m.serverId}
-                  onClick={() => onRevoke(m.serverId)}
-                >
-                  <span aria-hidden="true">×</span> {t('controlled_nodes.revoke')}
-                </button>
+                {machineAccessRole(m) === 'owner' ? (
+                  <>
+                    <button
+                      type="button"
+                      class="share-revoke-btn"
+                      disabled={busyServerId === m.serverId}
+                      onClick={() => setSharingMachine(m)}
+                    >
+                      {t('share.menu.shareTab')}
+                    </button>
+                    <button
+                      type="button"
+                      class="controlled-nodes-rename"
+                      disabled={busyServerId === m.serverId || editingServerId === m.serverId}
+                      title={t('common.rename')}
+                      onClick={() => startRename(m.serverId, m.displayName)}
+                    >✎</button>
+                    <button
+                      type="button"
+                      class={`controlled-nodes-exec-toggle ${m.execEnabled ? 'is-enabled' : 'is-disabled'}`}
+                      disabled={busyServerId === m.serverId}
+                      aria-pressed={m.execEnabled}
+                      onClick={() => onToggleExec(m.serverId, !m.execEnabled)}
+                    >
+                      <span class="controlled-nodes-toggle-track" aria-hidden="true"><i /></span>
+                      <span>{m.execEnabled ? t('controlled_nodes.exec_on') : t('controlled_nodes.exec_off')}</span>
+                    </button>
+                    <button
+                      type="button"
+                      class="controlled-nodes-revoke"
+                      disabled={busyServerId === m.serverId}
+                      onClick={() => onRevoke(m.serverId)}
+                    >
+                      <span aria-hidden="true">×</span> {t('controlled_nodes.revoke')}
+                    </button>
+                  </>
+                ) : (
+                  <span class="controlled-nodes-muted">
+                    {machineAccessRole(m) === 'participant'
+                      ? (m.execEnabled ? t('controlled_nodes.exec_on') : t('controlled_nodes.exec_off'))
+                      : t('controlled_nodes.share.view_only')}
+                  </span>
+                )}
               </div>
             </li>
           ))}
@@ -410,6 +438,21 @@ export function ControlledNodesPanel() {
           </ul>
         )}
       </section>
+
+      {sharingMachine && (
+        <ShareSessionDialog
+          variant="machine"
+          fixedTarget={{ kind: 'server', serverId: sharingMachine.serverId }}
+          target={{
+            serverId: sharingMachine.serverId,
+            serverLabel: sharingMachine.displayName,
+            sessionName: '',
+            tabLabel: sharingMachine.displayName,
+          }}
+          onClose={() => setSharingMachine(null)}
+          onSharesChanged={() => refetch()}
+        />
+      )}
     </div>
   );
 }

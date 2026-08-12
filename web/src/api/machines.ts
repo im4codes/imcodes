@@ -21,6 +21,7 @@ import {
   type ControlledNodeOs,
 } from '@shared/controlled-node-artifacts.js';
 import { MACHINE_API_PATH } from '@shared/machine-reference.js';
+import { isMachineAccessRole, type MachineAccessRole } from '@shared/remote-exec.js';
 import { apiFetch, getApiBaseUrl, getExpectedUserId } from '../api.js';
 
 export type { ControlledNodeArtifactArch, ControlledNodeOs };
@@ -33,6 +34,7 @@ export interface MachineListItem {
   os?: string;
   online: boolean;
   execEnabled: boolean;
+  accessRole?: MachineAccessRole;
 }
 
 /** Identifies one downloadable artifact in the canonical OS+arch matrix. */
@@ -148,6 +150,12 @@ function normalizeMachine(raw: unknown): MachineListItem | null {
     ...(typeof raw.os === 'string' && raw.os ? { os: raw.os } : {}),
     online: raw.online === true,
     execEnabled: raw.execEnabled === true,
+    // Old Servers return owned machines only and omit this field. A present but
+    // malformed role fails closed in the UI; Server-side action checks remain
+    // authoritative either way.
+    accessRole: raw.accessRole === undefined
+      ? 'owner'
+      : isMachineAccessRole(raw.accessRole) ? raw.accessRole : 'viewer',
   };
 }
 

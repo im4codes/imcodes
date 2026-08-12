@@ -109,7 +109,7 @@ describe('file-transfer upload route', () => {
     mockResolveServerMemberAccessOrShareDeny.mockResolvedValue({ ok: true, role: 'owner' });
     mockResolveHttpShareAccessForCoveredSession.mockReset();
     queryOneMock.mockReset();
-    queryOneMock.mockResolvedValue({ user_id: 'user-1', node_role: 'full', exec_enabled: true, revoked_at: null });
+    queryOneMock.mockResolvedValue({ user_id: 'user-1', node_role: 'full', exec_enabled: true, revoked_at: null, access_role: 'owner' });
     sendFileTransferRequestMock.mockResolvedValue({
       type: 'file.upload_done',
       attachment: {
@@ -137,7 +137,7 @@ describe('file-transfer upload route', () => {
   });
 
   it('mints an explicit-path handle only for a FULL source and capable controlled target', async () => {
-    queryOneMock.mockResolvedValue({ user_id: 'user-1', node_role: 'controlled', exec_enabled: true, revoked_at: null });
+    queryOneMock.mockResolvedValue({ user_id: 'user-1', node_role: 'controlled', exec_enabled: true, revoked_at: null, access_role: 'owner' });
     sendFileTransferRequestMock.mockResolvedValueOnce({
       type: FILE_TRANSFER_MSG.PATH_HANDLE_DONE,
       requestId: 'a'.repeat(32),
@@ -176,8 +176,48 @@ describe('file-transfer upload route', () => {
     );
   });
 
+  it('allows a participant grant but denies a viewer grant for controlled-node files', async () => {
+    sendFileTransferRequestMock.mockResolvedValue({
+      type: FILE_TRANSFER_MSG.PATH_HANDLE_DONE,
+      requestId: 'a'.repeat(32),
+      attachment: {
+        id: 'b'.repeat(32),
+        source: 'local',
+        serverId: '',
+        daemonPath: '/tmp/report.txt',
+        createdAt: new Date().toISOString(),
+        downloadable: true,
+      },
+    });
+    const request = () => makeApp().request('/api/server/controlled-1/machine-file-handle', {
+      method: 'POST',
+      headers: {
+        Authorization: 'Bearer source-token',
+        'X-Server-Id': 'full-1',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ path: '/tmp/report.txt' }),
+    });
+
+    queryOneMock.mockResolvedValue({
+      user_id: 'machine-owner', node_role: 'controlled', exec_enabled: true,
+      revoked_at: null, access_role: 'participant',
+    });
+    expect((await request()).status).toBe(200);
+
+    sendFileTransferRequestMock.mockClear();
+    queryOneMock.mockResolvedValue({
+      user_id: 'machine-owner', node_role: 'controlled', exec_enabled: true,
+      revoked_at: null, access_role: 'viewer',
+    });
+    const denied = await request();
+    expect(denied.status).toBe(403);
+    expect(await denied.json()).toEqual({ error: 'target_forbidden' });
+    expect(sendFileTransferRequestMock).not.toHaveBeenCalled();
+  });
+
   it('singlecasts bounded machine-direct control without receiving file bytes', async () => {
-    queryOneMock.mockResolvedValue({ user_id: 'user-1', node_role: 'controlled', exec_enabled: true, revoked_at: null });
+    queryOneMock.mockResolvedValue({ user_id: 'user-1', node_role: 'controlled', exec_enabled: true, revoked_at: null, access_role: 'owner' });
     const request = {
       type: MACHINE_DIRECT_FILE_TRANSFER_MSG.REQUEST,
       requestId: 'r'.repeat(32),
@@ -223,7 +263,7 @@ describe('file-transfer upload route', () => {
   });
 
   it('singlecasts reverse-direct fetch with Server-local authority and no file bytes', async () => {
-    queryOneMock.mockResolvedValue({ user_id: 'user-1', node_role: 'controlled', exec_enabled: true, revoked_at: null });
+    queryOneMock.mockResolvedValue({ user_id: 'user-1', node_role: 'controlled', exec_enabled: true, revoked_at: null, access_role: 'owner' });
     const request = {
       type: MACHINE_DIRECT_FILE_TRANSFER_MSG.FETCH_REQUEST,
       requestId: 'f'.repeat(32),
@@ -258,7 +298,7 @@ describe('file-transfer upload route', () => {
   });
 
   it('rejects a reverse-direct fetch when the capable daemon generation is replaced while reading the body', async () => {
-    queryOneMock.mockResolvedValue({ user_id: 'user-1', node_role: 'controlled', exec_enabled: true, revoked_at: null });
+    queryOneMock.mockResolvedValue({ user_id: 'user-1', node_role: 'controlled', exec_enabled: true, revoked_at: null, access_role: 'owner' });
     let activeGeneration = 7;
     daemonConnectionGenerationMock.mockImplementation(() => activeGeneration);
     sendFileTransferRequestMock.mockImplementation(async (
@@ -313,7 +353,7 @@ describe('file-transfer upload route', () => {
   });
 
   it('rejects injected reverse-direct controls before dispatch', async () => {
-    queryOneMock.mockResolvedValue({ user_id: 'user-1', node_role: 'controlled', exec_enabled: true, revoked_at: null });
+    queryOneMock.mockResolvedValue({ user_id: 'user-1', node_role: 'controlled', exec_enabled: true, revoked_at: null, access_role: 'owner' });
     const res = await makeApp().request('/api/server/controlled-1/machine-direct-fetch', {
       method: 'POST',
       headers: { Authorization: 'Bearer source', 'X-Server-Id': 'full-1', 'Content-Type': 'application/json' },
@@ -329,7 +369,7 @@ describe('file-transfer upload route', () => {
   });
 
   it('rejects browser auth and injected/public candidates before machine-direct dispatch', async () => {
-    queryOneMock.mockResolvedValue({ user_id: 'user-1', node_role: 'controlled', exec_enabled: true, revoked_at: null });
+    queryOneMock.mockResolvedValue({ user_id: 'user-1', node_role: 'controlled', exec_enabled: true, revoked_at: null, access_role: 'owner' });
     const request = {
       type: MACHINE_DIRECT_FILE_TRANSFER_MSG.REQUEST,
       requestId: 'r'.repeat(32), clientUploadId: 'c'.repeat(32), capability: 'A'.repeat(43),
@@ -339,13 +379,13 @@ describe('file-transfer upload route', () => {
       method: 'POST', headers: { Authorization: 'Bearer browser', 'Content-Type': 'application/json' }, body: JSON.stringify(request),
     });
     expect(browser.status).toBe(403);
-    queryOneMock.mockResolvedValue({ user_id: 'other-user', node_role: 'controlled', exec_enabled: true, revoked_at: null });
+    queryOneMock.mockResolvedValue({ user_id: 'other-user', node_role: 'controlled', exec_enabled: true, revoked_at: null, access_role: undefined });
     const crossAccount = await makeApp().request('/api/server/controlled-1/machine-direct-upload', {
       method: 'POST', headers: { Authorization: 'Bearer source', 'X-Server-Id': 'full-1', 'Content-Type': 'application/json' },
       body: JSON.stringify({ ...request, candidates: [{ host: '192.168.2.145', port: 1234 }] }),
     });
     expect(crossAccount.status).toBe(403);
-    queryOneMock.mockResolvedValue({ user_id: 'user-1', node_role: 'controlled', exec_enabled: true, revoked_at: null });
+    queryOneMock.mockResolvedValue({ user_id: 'user-1', node_role: 'controlled', exec_enabled: true, revoked_at: null, access_role: 'owner' });
     const injected = await makeApp().request('/api/server/controlled-1/machine-direct-upload', {
       method: 'POST', headers: { Authorization: 'Bearer source', 'X-Server-Id': 'full-1', 'Content-Type': 'application/json' },
       body: JSON.stringify({ ...request, candidates: [{ host: '192.168.2.145', port: 1234 }], targetIp: '10.0.0.8' }),
@@ -362,7 +402,7 @@ describe('file-transfer upload route', () => {
     ['slow by 30 days', -30 * 86_400_000],
     ['fast by 30 days', 30 * 86_400_000],
   ])('accepts a source clock that is %s and forwards a Server-local authority', async (_label, offset) => {
-    queryOneMock.mockResolvedValue({ user_id: 'user-1', node_role: 'controlled', exec_enabled: true, revoked_at: null });
+    queryOneMock.mockResolvedValue({ user_id: 'user-1', node_role: 'controlled', exec_enabled: true, revoked_at: null, access_role: 'owner' });
     const requestId = 'r'.repeat(32);
     sendFileTransferRequestMock.mockResolvedValueOnce({
       type: MACHINE_DIRECT_FILE_TRANSFER_MSG.DONE,
@@ -391,7 +431,7 @@ describe('file-transfer upload route', () => {
   });
 
   it('denies controlled-node file access from browser-style auth before dispatch', async () => {
-    queryOneMock.mockResolvedValue({ user_id: 'user-1', node_role: 'controlled', exec_enabled: true, revoked_at: null });
+    queryOneMock.mockResolvedValue({ user_id: 'user-1', node_role: 'controlled', exec_enabled: true, revoked_at: null, access_role: 'owner' });
     const res = await makeApp().request('/api/server/controlled-1/machine-file-handle', {
       method: 'POST',
       headers: { Authorization: 'Bearer browser', 'Content-Type': 'application/json' },
@@ -403,11 +443,11 @@ describe('file-transfer upload route', () => {
   });
 
   it.each([
-    ['cross-account', { user_id: 'other', node_role: 'controlled', exec_enabled: true, revoked_at: null }, true, true, 403, 'target_forbidden'],
-    ['revoked', { user_id: 'user-1', node_role: 'controlled', exec_enabled: true, revoked_at: 1 }, true, true, 403, 'target_forbidden'],
-    ['disabled', { user_id: 'user-1', node_role: 'controlled', exec_enabled: false, revoked_at: null }, true, true, 403, 'exec_disabled'],
-    ['offline', { user_id: 'user-1', node_role: 'controlled', exec_enabled: true, revoked_at: null }, false, true, 503, 'daemon_offline'],
-    ['missing capability', { user_id: 'user-1', node_role: 'controlled', exec_enabled: true, revoked_at: null }, true, false, 409, 'capability_unavailable'],
+    ['cross-account', { user_id: 'other', node_role: 'controlled', exec_enabled: true, revoked_at: null, access_role: undefined }, true, true, 403, 'target_forbidden'],
+    ['revoked', { user_id: 'user-1', node_role: 'controlled', exec_enabled: true, revoked_at: 1, access_role: undefined }, true, true, 403, 'target_forbidden'],
+    ['disabled', { user_id: 'user-1', node_role: 'controlled', exec_enabled: false, revoked_at: null, access_role: 'owner' }, true, true, 403, 'exec_disabled'],
+    ['offline', { user_id: 'user-1', node_role: 'controlled', exec_enabled: true, revoked_at: null, access_role: 'owner' }, false, true, 503, 'daemon_offline'],
+    ['missing capability', { user_id: 'user-1', node_role: 'controlled', exec_enabled: true, revoked_at: null, access_role: 'owner' }, true, false, 409, 'capability_unavailable'],
   ] as const)('rejects a %s controlled target before file dispatch', async (_label, row, online, capability, status, error) => {
     queryOneMock.mockResolvedValue(row);
     isDaemonConnectedMock.mockReturnValue(online);
@@ -425,7 +465,7 @@ describe('file-transfer upload route', () => {
   });
 
   it('rejects unknown explicit-path request fields without echoing them', async () => {
-    queryOneMock.mockResolvedValue({ user_id: 'user-1', node_role: 'controlled', exec_enabled: true, revoked_at: null });
+    queryOneMock.mockResolvedValue({ user_id: 'user-1', node_role: 'controlled', exec_enabled: true, revoked_at: null, access_role: 'owner' });
     const res = await makeApp().request('/api/server/controlled-1/machine-file-handle', {
       method: 'POST',
       headers: { Authorization: 'Bearer source', 'X-Server-Id': 'full-1', 'Content-Type': 'application/json' },
@@ -437,7 +477,7 @@ describe('file-transfer upload route', () => {
   });
 
   it('rejects an oversized explicit-path request before daemon dispatch', async () => {
-    queryOneMock.mockResolvedValue({ user_id: 'user-1', node_role: 'controlled', exec_enabled: true, revoked_at: null });
+    queryOneMock.mockResolvedValue({ user_id: 'user-1', node_role: 'controlled', exec_enabled: true, revoked_at: null, access_role: 'owner' });
     const privateValue = `private-${'x'.repeat(FILE_TRANSFER_PATH_MAX_BYTES + 1024)}`;
     const res = await makeApp().request('/api/server/controlled-1/machine-file-handle', {
       method: 'POST',
@@ -639,6 +679,36 @@ describe('file-transfer upload route', () => {
     }
   });
 
+  it('rechecks controlled access before a daemon redeems a staged upload', async () => {
+    const app = makeApp();
+    queryOneMock.mockResolvedValue({
+      user_id: 'machine-owner', node_role: 'controlled', exec_enabled: true,
+      revoked_at: null, access_role: 'participant',
+    });
+    let stagedStatus: number | undefined;
+    sendFileTransferRequestMock.mockImplementationOnce(async (_requestId, message) => {
+      const uploadUrl = new URL((message as { downloadUrl: string }).downloadUrl);
+      queryOneMock.mockResolvedValue({
+        user_id: 'machine-owner', node_role: 'controlled', exec_enabled: true,
+        revoked_at: null, access_role: 'viewer',
+      });
+      const staged = await app.request(`${uploadUrl.pathname}${uploadUrl.search}`);
+      stagedStatus = staged.status;
+      return { type: 'file.upload_error', message: 'forbidden' };
+    });
+
+    const form = new FormData();
+    form.append('file', new File(['secret'], 'secret.txt', { type: 'text/plain' }));
+    const response = await app.request('/api/server/controlled-1/upload', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer source', 'X-Server-Id': 'full-1' },
+      body: form,
+    });
+
+    expect(response.status).toBe(500);
+    expect(stagedStatus).toBe(403);
+  });
+
   it('falls back to legacy base64 upload when daemon has no relay fetch capability', async () => {
     hasDaemonCapabilityMock.mockReturnValue(false);
 
@@ -726,7 +796,7 @@ describe('file-transfer attachment deletion route', () => {
     daemonConnectionGenerationMock.mockReset().mockReturnValue(1);
     mockResolveServerMemberAccessOrShareDeny.mockReset().mockResolvedValue({ ok: true, role: 'owner' });
     mockResolveHttpShareAccessForCoveredSession.mockReset();
-    queryOneMock.mockReset().mockResolvedValue({ user_id: 'user-1', node_role: 'full', exec_enabled: true, revoked_at: null });
+    queryOneMock.mockReset().mockResolvedValue({ user_id: 'user-1', node_role: 'full', exec_enabled: true, revoked_at: null, access_role: 'owner' });
     sendFileTransferRequestMock.mockResolvedValue({ type: FILE_TRANSFER_MSG.DELETE_DONE, requestId: 'a'.repeat(32) });
   });
 
@@ -808,6 +878,10 @@ describe('file-transfer download route', () => {
     hasDaemonCapabilityMock.mockReturnValue(true);
     mockResolveServerMemberAccessOrShareDeny.mockResolvedValue({ ok: true, role: 'owner' });
     mockResolveHttpShareAccessForCoveredSession.mockReset();
+    queryOneMock.mockReset().mockResolvedValue({
+      user_id: 'user-1', node_role: 'full', exec_enabled: true,
+      revoked_at: null, access_role: 'owner',
+    });
   });
 
   it('allows a shared viewer to download and preview a covered-session attachment', async () => {
@@ -890,6 +964,37 @@ describe('file-transfer download route', () => {
       FILE_TRANSFER_LIMITS.DOWNLOAD_TIMEOUT_MS,
     );
     expect(hasDaemonCapabilityMock).toHaveBeenCalledWith(FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY);
+  });
+
+  it('rejects a staged download sink when controlled access was revoked after minting', async () => {
+    const app = makeApp();
+    queryOneMock.mockResolvedValue({
+      user_id: 'machine-owner', node_role: 'controlled', exec_enabled: true,
+      revoked_at: null, access_role: 'participant',
+    });
+    const stagedStatuses: number[] = [];
+    sendFileTransferRequestMock.mockImplementation(async (_requestId, message) => {
+      if ((message as { type?: string }).type !== FILE_TRANSFER_MSG.DOWNLOAD_STREAM) {
+        return { type: 'file.download_error', message: 'not_found' };
+      }
+      const uploadUrl = new URL((message as { uploadUrl: string }).uploadUrl);
+      queryOneMock.mockResolvedValue(null);
+      const staged = await app.request(`${uploadUrl.pathname}${uploadUrl.search}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'text/plain', 'Content-Length': '6' },
+        body: 'secret',
+      });
+      stagedStatuses.push(staged.status);
+      return { type: 'file.download_error', message: 'not_found' };
+    });
+
+    const response = await app.request('/api/server/controlled-1/uploads/abc123/download', {
+      headers: { Authorization: 'Bearer source', 'X-Server-Id': 'full-1' },
+    });
+
+    expect(response.status).toBe(404);
+    expect(stagedStatuses.length).toBeGreaterThan(0);
+    expect(stagedStatuses.every((status) => status === 403)).toBe(true);
   });
 
   it('falls back to the base64 download when the streamed relay fails to deliver bytes', async () => {

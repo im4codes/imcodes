@@ -2814,7 +2814,7 @@
     "usage_win_run": "관리자 권한으로 실행하세요. SmartScreen이 나타나면 추가 정보 → 실행을 선택하세요.",
     "usage_mac_run": "첫 실행 시 Gatekeeper 우회: 앱을 우클릭 → 열기, 또는 xattr -cr <경로> 실행 후 일반적으로 엽니다.",
     "usage_linux_run": "실행 권한 부여(chmod +x <파일>) 후 root로 한 번 실행하세요(sudo).",
-    "machines_title": "내 머신",
+    "machines_title": "머신",
     "refresh": "새로고침",
     "error_generic": "문제가 발생했습니다. 다시 시도하세요.",
     "empty": "아직 제어 노드가 없습니다.",
@@ -2825,7 +2825,19 @@
     "rename_label": "제어 노드 이름",
     "rename_invalid": "제어 문자를 제외한 1~120자의 이름을 입력하세요.",
     "revoke": "해지",
-    "revoke_confirm": "이 머신을 해지하시겠습니까? 해지 후에는 제어할 수 없으며 다시 등록해야 합니다."
+    "revoke_confirm": "이 머신을 해지하시겠습니까? 해지 후에는 제어할 수 없으며 다시 등록해야 합니다.",
+    "access_role": "접근 권한: {{role}}",
+    "share": {
+      "title": "제어 노드 공유",
+      "subtitle": "{{target}} 접근 권한 부여",
+      "role_help": {
+        "viewer": "노드의 연결 상태와 기본 정보만 볼 수 있으며 조작할 수 없습니다.",
+        "participant": "실행이 허용된 동안 명령 실행, 파일 전송 및 컴퓨터 제어를 사용할 수 있습니다."
+      },
+      "trust_title": "참여자는 이 머신을 제어할 수 있습니다",
+      "trust_body": "신뢰하는 사람에게만 공유하세요. 해당 작업은 제어 노드의 권한으로 실행됩니다.",
+      "view_only": "보기 전용"
+    }
   },
   "peerAuditQuick": {
     "iconLabel": "피어 감사",

@@ -10,7 +10,7 @@ vi.mock('../src/api.js', async (importOriginal) => {
   };
 });
 
-import { listAvailableExecutables, mintControlledNodeExecutableTicket } from '../src/api/machines.js';
+import { listAvailableExecutables, listControllableMachines, mintControlledNodeExecutableTicket } from '../src/api/machines.js';
 import { configureExpectedUserId } from '../src/api.js';
 
 const VALID_SHA256 = 'a'.repeat(64);
@@ -36,6 +36,25 @@ describe('controlled-node availability normalization', () => {
     expect(res.artifacts).toEqual([
       { os: 'win', arch: 'x64', filename: 'good.exe', sizeBytes: 1, sha256: VALID_SHA256 },
     ]);
+  });
+});
+
+describe('controlled-node access-role normalization', () => {
+  it('preserves valid shared roles, defaults an old-server omission to owner, and fails malformed roles closed', async () => {
+    apiFetch.mockResolvedValueOnce({
+      machines: [
+        { serverId: 'participant', refName: 'p', displayName: 'P', online: true, execEnabled: true, accessRole: 'participant' },
+        { serverId: 'legacy-owner', refName: 'o', displayName: 'O', online: true, execEnabled: true },
+        { serverId: 'malformed', refName: 'm', displayName: 'M', online: true, execEnabled: true, accessRole: 'administrator' },
+      ],
+    });
+
+    expect((await listControllableMachines()).map((machine) => [machine.serverId, machine.accessRole]))
+      .toEqual([
+        ['participant', 'participant'],
+        ['legacy-owner', 'owner'],
+        ['malformed', 'viewer'],
+      ]);
   });
 });
 

@@ -14,6 +14,9 @@ interface Props {
   target: ShareDialogTarget;
   onClose: () => void;
   onSharesChanged?: () => void;
+  /** Fixed machine targets reuse grant management without exposing Tab/server scope choices. */
+  fixedTarget?: ShareTarget;
+  variant?: 'session' | 'machine';
 }
 
 type TargetChoice = 'current-tab' | 'server';
@@ -28,7 +31,7 @@ function getGrantDisplayName(grant: ShareGrantSummary): string {
   return grant.targetUserDisplayName?.trim() || grant.targetUserId;
 }
 
-export function ShareSessionDialog({ target, onClose, onSharesChanged }: Props) {
+export function ShareSessionDialog({ target, onClose, onSharesChanged, fixedTarget, variant = 'session' }: Props) {
   const { t } = useTranslation();
   const [targetChoice, setTargetChoice] = useState<TargetChoice>('current-tab');
   const [role, setRole] = useState<ShareRole>('viewer');
@@ -40,14 +43,17 @@ export function ShareSessionDialog({ target, onClose, onSharesChanged }: Props) 
   const [updatingShareId, setUpdatingShareId] = useState<string | null>(null);
 
   const selectedTarget = useMemo<ShareTarget>(() => (
-    targetChoice === 'server'
+    fixedTarget ?? (targetChoice === 'server'
       ? { kind: 'server', serverId: target.serverId }
-      : buildCurrentTabShareTarget(target)
-  ), [target, targetChoice]);
+      : buildCurrentTabShareTarget(target))
+  ), [fixedTarget, target, targetChoice]);
 
-  const targetLabel = targetChoice === 'server'
+  const targetLabel = fixedTarget
+    ? target.tabLabel
+    : targetChoice === 'server'
     ? (target.serverLabel?.trim() || t('share.target.serverFallback'))
     : target.tabLabel;
+  const roleHelpPrefix = variant === 'machine' ? 'controlled_nodes.share.role_help' : 'share.roleHelp';
 
   const loadShares = useCallback(async () => {
     setSharesLoading(true);
@@ -123,13 +129,13 @@ export function ShareSessionDialog({ target, onClose, onSharesChanged }: Props) 
 
   return (
     <div class="ask-dialog-overlay" onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}>
-      <div class="ask-dialog share-dialog" onClick={(e) => e.stopPropagation()} role="dialog" aria-modal="true" aria-label={t('share.dialogTitle')}>
+      <div class="ask-dialog share-dialog" onClick={(e) => e.stopPropagation()} role="dialog" aria-modal="true" aria-label={t(variant === 'machine' ? 'controlled_nodes.share.title' : 'share.dialogTitle')}>
         <div>
-          <div class="share-dialog-title">{t('share.dialogTitle')}</div>
-          <div class="share-dialog-subtitle">{t('share.dialogSubtitle', { target: targetLabel })}</div>
+          <div class="share-dialog-title">{t(variant === 'machine' ? 'controlled_nodes.share.title' : 'share.dialogTitle')}</div>
+          <div class="share-dialog-subtitle">{t(variant === 'machine' ? 'controlled_nodes.share.subtitle' : 'share.dialogSubtitle', { target: targetLabel })}</div>
         </div>
 
-        <div class="share-field">
+        {!fixedTarget && <div class="share-field">
           <div class="share-field-label">{t('share.target.label')}</div>
           <div class="share-choice-row" role="radiogroup" aria-label={t('share.target.label')}>
             <label class="share-choice">
@@ -149,7 +155,7 @@ export function ShareSessionDialog({ target, onClose, onSharesChanged }: Props) 
               <span>{t('share.target.server')}</span>
             </label>
           </div>
-        </div>
+        </div>}
 
         <div class="share-field">
           <div class="share-field-label">{t('share.role.label')}</div>
@@ -163,13 +169,13 @@ export function ShareSessionDialog({ target, onClose, onSharesChanged }: Props) 
               <span>{t('share.role.participant')}</span>
             </label>
           </div>
-          <div class="share-help">{t(`share.roleHelp.${role}`)}</div>
+          <div class="share-help">{t(`${roleHelpPrefix}.${role}`)}</div>
         </div>
 
         {isParticipantRole(role) && (
           <div class="share-trust-disclosure" role="note">
-            <strong>{t('share.trust.title')}</strong>
-            <span>{t('share.trust.body')}</span>
+            <strong>{t(variant === 'machine' ? 'controlled_nodes.share.trust_title' : 'share.trust.title')}</strong>
+            <span>{t(variant === 'machine' ? 'controlled_nodes.share.trust_body' : 'share.trust.body')}</span>
           </div>
         )}
 

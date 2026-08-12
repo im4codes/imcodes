@@ -2815,7 +2815,7 @@
     "usage_win_run": "Run as Administrator. If SmartScreen appears, choose More info → Run anyway.",
     "usage_mac_run": "On first launch, bypass Gatekeeper: right-click the app → Open, or run: xattr -cr <path> then open normally.",
     "usage_linux_run": "Make it executable (chmod +x <file>) and run once as root (sudo).",
-    "machines_title": "Your machines",
+    "machines_title": "Machines",
     "refresh": "Refresh",
     "error_generic": "Something went wrong. Please try again.",
     "empty": "No controlled nodes yet.",
@@ -2826,7 +2826,19 @@
     "rename_label": "Controlled node name",
     "rename_invalid": "Enter a name from 1 to 120 characters without control characters.",
     "revoke": "Revoke",
-    "revoke_confirm": "Revoke this machine? It can no longer be controlled and must be re-enrolled."
+    "revoke_confirm": "Revoke this machine? It can no longer be controlled and must be re-enrolled.",
+    "access_role": "Access: {{role}}",
+    "share": {
+      "title": "Share controlled node",
+      "subtitle": "Grant access to {{target}}",
+      "role_help": {
+        "viewer": "Can view this node's presence and basic details, but cannot operate it.",
+        "participant": "Can run commands, transfer files, and use computer control while execution is enabled."
+      },
+      "trust_title": "Participant access can control this machine",
+      "trust_body": "Only share with someone you trust. Their actions run with the controlled node's privileges.",
+      "view_only": "View only"
+    }
   },
   "peerAuditQuick": {
     "iconLabel": "Peer audit",

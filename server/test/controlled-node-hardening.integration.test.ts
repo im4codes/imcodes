@@ -238,12 +238,13 @@ describe('owner-scoped machine listing (DB presence)', () => {
 
     const mine = await app.request('/api/machines', { headers: { 'X-Server-Id': owner.serverId, authorization: `Bearer ${owner.token}` } });
     expect(mine.status).toBe(200);
-    const list = (await mine.json() as { machines: { serverId: string; online: boolean; execEnabled: boolean; os?: string; nodeRole: string }[] }).machines;
+    const list = (await mine.json() as { machines: { serverId: string; online: boolean; execEnabled: boolean; os?: string; nodeRole: string; accessRole?: string }[] }).machines;
     expect(list.length).toBe(1);
     expect(list[0].online).toBe(false); // no heartbeat yet
     expect(list[0].execEnabled).toBe(true); // installation is explicit consent; owner can still disable later
     expect(list[0].nodeRole).toBe(NODE_ROLE.CONTROLLED);
     expect(list[0].os).toBe('linux');
+    expect(list[0]).not.toHaveProperty('accessRole'); // rolling-upgrade compatibility with strict old daemons
 
     const theirs = await app.request('/api/machines', { headers: { 'X-Server-Id': other.serverId, authorization: `Bearer ${other.token}` } });
     expect(((await theirs.json() as { machines: unknown[] }).machines).length).toBe(0);

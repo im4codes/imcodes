@@ -116,6 +116,15 @@ export interface MachineSummary {
   online: boolean;
   nodeRole: NodeRole;
   lastSeenMs?: number;
+  /** Optional for compatibility with owner-only Servers released before machine sharing. */
+  accessRole?: MachineAccessRole;
+}
+
+export const MACHINE_ACCESS_ROLES = ['owner', 'viewer', 'participant'] as const;
+export type MachineAccessRole = (typeof MACHINE_ACCESS_ROLES)[number];
+
+export function isMachineAccessRole(value: unknown): value is MachineAccessRole {
+  return typeof value === 'string' && (MACHINE_ACCESS_ROLES as readonly string[]).includes(value);
 }
 
 export function canonicalMachineOs(value: unknown): EnrollmentOs | undefined {

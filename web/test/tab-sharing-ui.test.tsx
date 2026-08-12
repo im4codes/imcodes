@@ -52,6 +52,12 @@ const messages: Record<string, string> = {
   'share.roleHelp.participant': 'Can send.',
   'share.trust.title': 'Participant trust disclosure',
   'share.trust.body': 'Agents are not sandboxed.',
+  'controlled_nodes.share.title': 'Share controlled node',
+  'controlled_nodes.share.subtitle': 'Grant access to {{target}}',
+  'controlled_nodes.share.role_help.viewer': 'Can view this node.',
+  'controlled_nodes.share.role_help.participant': 'Can control this node.',
+  'controlled_nodes.share.trust_title': 'Machine control disclosure',
+  'controlled_nodes.share.trust_body': 'Only share with someone you trust.',
   'share.recipient.label': 'Recipient',
   'share.recipient.placeholder': 'User ID or email',
   'share.list.label': 'Shared users',
@@ -408,6 +414,43 @@ describe('collaborative tab sharing UI', () => {
     expect(await screen.findByText('User Example')).not.toBeNull();
     expect(screen.queryByText('user@example.test')).toBeNull();
     expect(screen.queryByText('share-1')).toBeNull();
+  });
+
+  it('uses the same grant API for a fixed controlled-node target without Tab scope choices', async () => {
+    apiMocks.listSharesForTarget.mockResolvedValue([]);
+    apiMocks.createShare.mockResolvedValue({
+      id: 'machine-share',
+      targetUserId: 'recipient-1',
+      targetUserDisplayName: 'Recipient One',
+      role: 'participant',
+      status: 'active',
+    });
+    render(
+      <ShareSessionDialog
+        variant="machine"
+        fixedTarget={{ kind: 'server', serverId: 'machine-1' }}
+        target={{
+          serverId: 'machine-1',
+          serverLabel: 'Office Node',
+          sessionName: '',
+          tabLabel: 'Office Node',
+        }}
+        onClose={() => {}}
+      />,
+    );
+
+    expect(await screen.findByText('Share controlled node')).not.toBeNull();
+    expect(screen.queryByLabelText('Target')).toBeNull();
+    fireEvent.click(screen.getByLabelText('Participant'));
+    expect(screen.getByText('Machine control disclosure')).not.toBeNull();
+    fireEvent.input(screen.getByLabelText('Recipient'), { target: { value: 'recipient-1' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Create share' }));
+
+    await waitFor(() => expect(apiMocks.createShare).toHaveBeenCalledWith('machine-1', {
+      target: { kind: 'server', serverId: 'machine-1' },
+      targetUserId: 'recipient-1',
+      role: 'participant',
+    }));
   });
 
   it('lets managers update and revoke existing shares from the share dialog', async () => {
