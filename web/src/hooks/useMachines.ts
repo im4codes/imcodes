@@ -42,7 +42,7 @@ export interface UseMachinesResult {
   loading: boolean;
   error: unknown | null;
   stale: boolean;
-  refetch: () => void;
+  refetch: () => Promise<MachineListItem[] | null>;
 }
 
 /** Shared machine data (read-only). Pass an optional `query` for a filtered view. */
@@ -57,7 +57,7 @@ export function useMachines(query?: string): UseMachinesResult {
     loading: snapshot.loading,
     error: snapshot.error,
     stale: snapshot.stale,
-    refetch: machineResource.invalidate,
+    refetch: machineResource.reload,
   };
 }
 

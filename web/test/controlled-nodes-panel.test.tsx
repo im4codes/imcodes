@@ -19,9 +19,11 @@ vi.mock('react-i18next', () => ({
 
 // Mutable machine list + spies shared across the mock and assertions.
 let machines: MachineListItem[] = [];
-const refetch = vi.fn(() => { /* re-read handled by test via rerender */ });
+let machinesLoaded = true;
+let machinesLoading = false;
+const refetch = vi.fn(async (): Promise<MachineListItem[] | null> => null);
 vi.mock('../src/hooks/useMachines.js', () => ({
-  useMachines: () => ({ machines, filtered: machines, loaded: true, loading: false, error: null, stale: false, refetch }),
+  useMachines: () => ({ machines, filtered: machines, loaded: machinesLoaded, loading: machinesLoading, error: null, stale: false, refetch }),
 }));
 
 const setMachineExecEnabled = vi.fn(async () => {});
@@ -87,6 +89,9 @@ afterEach(() => {
   vi.clearAllMocks();
   vi.unstubAllGlobals();
   machines = [];
+  machinesLoaded = true;
+  machinesLoading = false;
+  refetch.mockResolvedValue(null);
 });
 
 const machine = (over: Partial<MachineListItem>): MachineListItem => ({ serverId: 's', refName: 'r', displayName: 'D', online: true, execEnabled: false, ...over });
@@ -96,21 +101,57 @@ describe('ControlledNodesPanel (12.3)', () => {
     vi.useFakeTimers();
     try {
       const rendered = render(<ControlledNodesPanel />);
-      expect(refetch).not.toHaveBeenCalled();
+      expect(CONTROLLED_NODE_PRESENCE_REFRESH_MS).toBe(5_000);
+      expect(refetch).toHaveBeenCalledTimes(1);
 
       await act(async () => {
-        await vi.advanceTimersByTimeAsync(CONTROLLED_NODE_PRESENCE_REFRESH_MS);
+        await vi.advanceTimersByTimeAsync(4_999);
       });
       expect(refetch).toHaveBeenCalledTimes(1);
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1);
+      });
+      expect(refetch).toHaveBeenCalledTimes(2);
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(5_000);
+      });
+      expect(refetch).toHaveBeenCalledTimes(3);
 
       rendered.unmount();
       await act(async () => {
-        await vi.advanceTimersByTimeAsync(CONTROLLED_NODE_PRESENCE_REFRESH_MS * 2);
+        await vi.advanceTimersByTimeAsync(10_000);
       });
-      expect(refetch).toHaveBeenCalledTimes(1);
+      expect(refetch).toHaveBeenCalledTimes(3);
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it('refreshes immediately when a throttled background tab becomes visible', () => {
+    const visibility = vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('hidden');
+    const rendered = render(<ControlledNodesPanel />);
+    expect(refetch).toHaveBeenCalledTimes(1);
+
+    visibility.mockReturnValue('visible');
+    document.dispatchEvent(new Event('visibilitychange'));
+    expect(refetch).toHaveBeenCalledTimes(2);
+
+    rendered.unmount();
+    document.dispatchEvent(new Event('visibilitychange'));
+    expect(refetch).toHaveBeenCalledTimes(2);
+    visibility.mockRestore();
+  });
+
+  it('keeps background presence reloads visually quiet for an empty loaded list', () => {
+    machinesLoaded = true;
+    machinesLoading = true;
+    const { container } = render(<ControlledNodesPanel />);
+
+    expect(container.textContent).toContain('controlled_nodes.empty');
+    expect(container.querySelector('.controlled-nodes-refresh')?.hasAttribute('disabled')).toBe(false);
+    expect(container.querySelector('.controlled-nodes-refresh-icon')?.classList.contains('is-spinning')).toBe(false);
   });
 
   it('renders the node-grid hierarchy and live machine metrics', async () => {

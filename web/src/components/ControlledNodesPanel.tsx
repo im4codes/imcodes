@@ -18,6 +18,9 @@ import {
 } from '../api/machines.js';
 import { normalizeMachineDisplayName } from '@shared/machine-reference.js';
 import { useMachines } from '../hooks/useMachines.js';
+import { isNative } from '../native.js';
+import { ShareSessionDialog } from './ShareSessionDialog.js';
+import type { MachineListItem } from '../api/machines.js';
 
 /**
  * Presence is DB-backed and changes independently of this browser after an
@@ -26,9 +29,6 @@ import { useMachines } from '../hooks/useMachines.js';
  * manual refresh.
  */
 export const CONTROLLED_NODE_PRESENCE_REFRESH_MS = 5_000;
-import { isNative } from '../native.js';
-import { ShareSessionDialog } from './ShareSessionDialog.js';
-import type { MachineListItem } from '../api/machines.js';
 
 function formatByteSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
@@ -88,7 +88,7 @@ const PLATFORM_PRESENTATION: Record<ControlledNodeOs, { glyph: string; name: str
 
 export function ControlledNodesPanel() {
   const { t, i18n } = useTranslation();
-  const { machines, loading, error, refetch } = useMachines();
+  const { machines, loaded, loading, error, refetch } = useMachines();
 
   const [artifacts, setArtifacts] = useState<ControlledNodeArtifactMetadata[]>([]);
   const [downloadTargets, setDownloadTargets] = useState<ControlledNodeArtifactSelection[]>([]);
@@ -100,6 +100,7 @@ export function ControlledNodesPanel() {
   const [ticketExpiryByKey, setTicketExpiryByKey] = useState<Partial<Record<string, number>>>({});
 
   const [actionError, setActionError] = useState<string | null>(null);
+  const [manualPresenceRefresh, setManualPresenceRefresh] = useState(false);
   const [busyServerId, setBusyServerId] = useState<string | null>(null);
   const [editingServerId, setEditingServerId] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState('');
@@ -126,9 +127,32 @@ export function ControlledNodesPanel() {
   useEffect(() => { refreshAvailability(); }, [refreshAvailability]);
 
   useEffect(() => {
-    const timer = window.setInterval(refetch, CONTROLLED_NODE_PRESENCE_REFRESH_MS);
-    return () => window.clearInterval(timer);
+    const refreshQuietly = (): void => {
+      void refetch().catch(() => undefined);
+    };
+    const refreshWhenVisible = (): void => {
+      if (document.visibilityState === 'visible') refreshQuietly();
+    };
+    refreshQuietly();
+    const timer = window.setInterval(refreshQuietly, CONTROLLED_NODE_PRESENCE_REFRESH_MS);
+    document.addEventListener('visibilitychange', refreshWhenVisible);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener('visibilitychange', refreshWhenVisible);
+    };
   }, [refetch]);
+
+  const refreshPresenceManually = useCallback(async (): Promise<void> => {
+    if (manualPresenceRefresh) return;
+    setManualPresenceRefresh(true);
+    try {
+      await refetch();
+    } catch {
+      // The shared resource publishes the error for the panel to render.
+    } finally {
+      setManualPresenceRefresh(false);
+    }
+  }, [manualPresenceRefresh, refetch]);
 
   const onDownload = async (target: ControlledNodeArtifactSelection) => {
     const key = artifactSelectionKey(target);
@@ -257,16 +281,16 @@ export function ControlledNodesPanel() {
           <button
             type="button"
             class="controlled-nodes-refresh"
-            onClick={() => refetch()}
-            disabled={loading}
+            onClick={() => { void refreshPresenceManually(); }}
+            disabled={manualPresenceRefresh || (!loaded && loading)}
           >
-            <span class={loading ? 'controlled-nodes-refresh-icon is-spinning' : 'controlled-nodes-refresh-icon'} aria-hidden="true">↻</span>
+            <span class={manualPresenceRefresh || (!loaded && loading) ? 'controlled-nodes-refresh-icon is-spinning' : 'controlled-nodes-refresh-icon'} aria-hidden="true">↻</span>
             {t('controlled_nodes.refresh')}
           </button>
         </div>
         {actionError && <p class="controlled-nodes-error" role="alert">{actionError}</p>}
         {error && <p class="controlled-nodes-error" role="alert">{t('controlled_nodes.error_generic')}</p>}
-        {!loading && machines.length === 0 && (
+        {loaded && machines.length === 0 && (
           <div class="controlled-nodes-empty">
             <span class="controlled-nodes-empty-radar" aria-hidden="true"><i /></span>
             <p>{t('controlled_nodes.empty')}</p>
