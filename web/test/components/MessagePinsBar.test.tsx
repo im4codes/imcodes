@@ -87,6 +87,26 @@ describe('MessagePinsBar', () => {
     expect(onLocate).not.toHaveBeenCalled();
   });
 
+  it('searches pin text and session names and filters by message type', () => {
+    const pins = [pin('u1', 'deck_current'), pin('a2', 'deck_current'), pin('a3', 'deck_research')];
+    render(<MessagePinsBar pins={pins} currentSessionName="deck_current" onLocate={vi.fn()} onUnpin={vi.fn()} />);
+    fireEvent.click(screen.getByTestId('message-pins-trigger'));
+    fireEvent.click(screen.getByText('All (3)'));
+
+    const search = screen.getByLabelText('messagePins.searchLabel');
+    fireEvent.input(search, { target: { value: 'research' } });
+    expect(screen.getByText('pinned a3')).toBeTruthy();
+    expect(screen.queryByText('pinned u1')).toBeNull();
+
+    fireEvent.input(search, { target: { value: '' } });
+    fireEvent.input(screen.getByLabelText('messagePins.filterLabel'), { target: { value: 'user.message' } });
+    expect(screen.getByText('pinned u1')).toBeTruthy();
+    expect(screen.queryByText('pinned a2')).toBeNull();
+
+    fireEvent.input(search, { target: { value: 'missing' } });
+    expect(screen.getByText('messagePins.noMatches')).toBeTruthy();
+  });
+
   it('keeps the compact entry visible with a zero count', () => {
     render(<MessagePinsBar pins={[]} currentSessionName="deck_current" onLocate={vi.fn()} onUnpin={vi.fn()} />);
     expect(screen.getByTestId('message-pins-trigger').textContent).toBe('📌0/0');

@@ -6,7 +6,7 @@ import {
   type CreateMessagePinInput,
 } from '../../../shared/message-pins.js';
 import type { Env } from '../env.js';
-import { deleteMessagePin, listMessagePins, upsertMessagePin } from '../db/message-pins.js';
+import { deleteMessagePin, getMessagePin, listMessagePins, upsertMessagePin } from '../db/message-pins.js';
 import { requireAuth } from '../security/authorization.js';
 import { authorizeTimelineSession } from './timeline-session-access.js';
 
@@ -33,20 +33,50 @@ async function authorizeScope(
   return access.ok;
 }
 
+function readPinId(raw: string | undefined): string | null {
+  const id = raw?.trim() ?? '';
+  return id && id.length <= MESSAGE_PIN_LIMITS.ID_CHARS ? id : null;
+}
+
+function filterPins<T extends { sessionName: string; eventType: string; text: string }>(
+  pins: T[],
+  query: string,
+  eventType: string | undefined,
+  limit: number | undefined,
+): T[] {
+  const needle = query.toLocaleLowerCase();
+  const filtered = pins.filter((pin) => (
+    (!eventType || pin.eventType === eventType)
+    && (!needle || pin.text.toLocaleLowerCase().includes(needle) || pin.sessionName.toLocaleLowerCase().includes(needle))
+  ));
+  return limit === undefined ? filtered : filtered.slice(0, limit);
+}
+
 messagePinRoutes.get('/message-pins', requireAuth(), async (c) => {
   const serverId = readServerId(c);
   if (!serverId) return c.json({ error: MESSAGE_PIN_ERRORS.SCOPE_REQUIRED }, 400);
   const userId = c.get('userId' as never) as string;
   const sessionName = c.req.query('sessionName')?.trim() || undefined;
+  const query = c.req.query('q')?.trim() ?? '';
+  const eventType = c.req.query('eventType')?.trim() || undefined;
+  const rawLimit = c.req.query('limit')?.trim();
+  const limit = rawLimit ? Number(rawLimit) : undefined;
   if (sessionName && sessionName.length > MESSAGE_PIN_LIMITS.SESSION_NAME_CHARS) {
     return c.json({ error: MESSAGE_PIN_ERRORS.SCOPE_REQUIRED }, 400);
+  }
+  if (
+    query.length > MESSAGE_PIN_LIMITS.QUERY_CHARS
+    || (eventType !== undefined && !isMessagePinEventType(eventType))
+    || (limit !== undefined && (!Number.isSafeInteger(limit) || limit < 1 || limit > MESSAGE_PIN_LIMITS.MCP_LIST_RESULTS))
+  ) {
+    return c.json({ error: MESSAGE_PIN_ERRORS.INVALID_PAYLOAD }, 400);
   }
 
   if (sessionName) {
     const scope = { serverId, sessionName };
     if (!await authorizeScope(c.env.DB, userId, scope)) return c.json({ error: 'forbidden' }, 403);
     const pins = await listMessagePins(c.env.DB, { userId, ...scope });
-    return c.json({ pins });
+    return c.json({ pins: filterPins(pins, query, eventType, limit) });
   }
 
   // "All" is still scoped to the signed-in user and selected server. A pin
@@ -67,7 +97,23 @@ messagePinRoutes.get('/message-pins', requireAuth(), async (c) => {
       access.set(candidate, await authorizeScope(c.env.DB, userId, { serverId, sessionName: candidate }));
     }
   }));
-  return c.json({ pins: pins.filter((pin) => access.get(pin.sessionName) === true) });
+  return c.json({
+    pins: filterPins(pins.filter((pin) => access.get(pin.sessionName) === true), query, eventType, limit),
+  });
+});
+
+messagePinRoutes.get('/message-pins/:id', requireAuth(), async (c) => {
+  const serverId = readServerId(c);
+  const id = readPinId(c.req.param('id'));
+  if (!serverId) return c.json({ error: MESSAGE_PIN_ERRORS.SCOPE_REQUIRED }, 400);
+  if (!id) return c.json({ error: MESSAGE_PIN_ERRORS.NOT_FOUND }, 404);
+  const userId = c.get('userId' as never) as string;
+  const pin = await getMessagePin(c.env.DB, { id, userId, serverId });
+  if (!pin) return c.json({ error: MESSAGE_PIN_ERRORS.NOT_FOUND }, 404);
+  if (!await authorizeScope(c.env.DB, userId, { serverId, sessionName: pin.sessionName })) {
+    return c.json({ error: 'forbidden' }, 403);
+  }
+  return c.json({ pin });
 });
 
 messagePinRoutes.post('/message-pins', requireAuth(), async (c) => {
@@ -106,13 +152,17 @@ messagePinRoutes.post('/message-pins', requireAuth(), async (c) => {
 });
 
 messagePinRoutes.delete('/message-pins/:id', requireAuth(), async (c) => {
-  const scope = readScope(c);
-  if (!scope) return c.json({ error: MESSAGE_PIN_ERRORS.SCOPE_REQUIRED }, 400);
+  const serverId = readServerId(c);
+  if (!serverId) return c.json({ error: MESSAGE_PIN_ERRORS.SCOPE_REQUIRED }, 400);
   const userId = c.get('userId' as never) as string;
-  if (!await authorizeScope(c.env.DB, userId, scope)) return c.json({ error: 'forbidden' }, 403);
-  const id = c.req.param('id')?.trim() ?? '';
+  const id = readPinId(c.req.param('id'));
   if (!id) return c.json({ error: MESSAGE_PIN_ERRORS.NOT_FOUND }, 404);
-  const deleted = await deleteMessagePin(c.env.DB, { id, userId, ...scope });
+  const pin = await getMessagePin(c.env.DB, { id, userId, serverId });
+  if (!pin) return c.json({ error: MESSAGE_PIN_ERRORS.NOT_FOUND }, 404);
+  if (!await authorizeScope(c.env.DB, userId, { serverId, sessionName: pin.sessionName })) {
+    return c.json({ error: 'forbidden' }, 403);
+  }
+  const deleted = await deleteMessagePin(c.env.DB, { id, userId, serverId });
   return deleted
     ? c.json({ ok: true })
     : c.json({ error: MESSAGE_PIN_ERRORS.NOT_FOUND }, 404);

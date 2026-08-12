@@ -9,12 +9,25 @@ export type MessagePinEventType = typeof MESSAGE_PIN_EVENT_TYPES[keyof typeof ME
 
 export const MESSAGE_PIN_LIMITS = {
   PER_SESSION: 200,
+  ID_CHARS: 128,
   EVENT_ID_CHARS: 512,
   SESSION_NAME_CHARS: 255,
   TEXT_CHARS: 20_000,
+  QUERY_CHARS: 200,
+  MCP_LIST_RESULTS: 200,
+  MCP_TEXT_PREVIEW_CHARS: 500,
   CONTEXT_EVENTS_BEFORE: 40,
   CONTEXT_EVENTS_AFTER: 20,
 } as const;
+
+export const MESSAGE_PIN_MCP_TOOLS = {
+  LIST: 'list_message_pins',
+  GET: 'get_message_pin',
+  SAVE: 'pin_message',
+  DELETE: 'delete_message_pin',
+} as const;
+
+export type MessagePinMcpToolName = typeof MESSAGE_PIN_MCP_TOOLS[keyof typeof MESSAGE_PIN_MCP_TOOLS];
 
 export const MESSAGE_PIN_ERRORS = {
   SCOPE_REQUIRED: 'message_pin_scope_required',

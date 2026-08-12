@@ -1,7 +1,7 @@
 import { useLayoutEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import type { ComponentChildren } from 'preact';
-import type { MessagePin } from '@shared/message-pins.js';
+import { MESSAGE_PIN_EVENT_TYPES, type MessagePin, type MessagePinEventType } from '@shared/message-pins.js';
 import { ZoomedTextDialog } from './ZoomedTextDialog.js';
 
 export type MessagePinPreviewMode = 'rendered' | 'text';
@@ -43,11 +43,23 @@ export function MessagePinsBar({
   const [expanded, setExpanded] = useState(false);
   const [previewPin, setPreviewPin] = useState<MessagePin | null>(null);
   const [tab, setTab] = useState<'current' | 'all'>('current');
+  const [query, setQuery] = useState('');
+  const [eventType, setEventType] = useState<'all' | MessagePinEventType>('all');
   const currentPins = useMemo(
     () => pins.filter((pin) => pin.sessionName === currentSessionName),
     [currentSessionName, pins],
   );
-  const visiblePins = tab === 'current' ? currentPins : pins;
+  const scopePins = tab === 'current' ? currentPins : pins;
+  const visiblePins = useMemo(() => {
+    const needle = query.trim().toLocaleLowerCase();
+    return scopePins.filter((pin) => (
+      (eventType === 'all' || pin.eventType === eventType)
+      && (!needle
+        || (resolvePinText?.(pin) || pin.text).toLocaleLowerCase().includes(needle)
+        || pin.sessionName.toLocaleLowerCase().includes(needle))
+    ));
+  }, [eventType, query, resolvePinText, scopePins]);
+  const filtersActive = query.trim().length > 0 || eventType !== 'all';
   const previewText = previewPin
     ? (resolvePinText?.(previewPin) || previewPin.text)
     : '';
@@ -85,6 +97,24 @@ export function MessagePinsBar({
               {t('messagePins.allTab', { count: pins.length })}
             </button>
           </div>
+          <div class="message-pins-filters">
+            <input
+              type="search"
+              value={query}
+              onInput={(event) => setQuery((event.currentTarget as HTMLInputElement).value)}
+              placeholder={t('messagePins.searchPlaceholder')}
+              aria-label={t('messagePins.searchLabel')}
+            />
+            <select
+              value={eventType}
+              onInput={(event) => setEventType((event.currentTarget as HTMLSelectElement).value as 'all' | MessagePinEventType)}
+              aria-label={t('messagePins.filterLabel')}
+            >
+              <option value="all">{t('messagePins.filterAll')}</option>
+              <option value={MESSAGE_PIN_EVENT_TYPES.USER}>{t('messagePins.userMessage')}</option>
+              <option value={MESSAGE_PIN_EVENT_TYPES.ASSISTANT}>{t('messagePins.assistantMessage')}</option>
+            </select>
+          </div>
           {(error || locateError) && (
             <button type="button" class="message-pins-error" onClick={onDismissError}>
               {locateError ? t('messagePins.locateFailed') : t('messagePins.requestFailed')}
@@ -93,7 +123,9 @@ export function MessagePinsBar({
           {loading ? (
             <div class="message-pins-empty">{t('common.loading')}</div>
           ) : visiblePins.length === 0 ? (
-            <div class="message-pins-empty">{t(tab === 'current' ? 'messagePins.noCurrent' : 'messagePins.noPins')}</div>
+            <div class="message-pins-empty">{t(filtersActive
+              ? 'messagePins.noMatches'
+              : tab === 'current' ? 'messagePins.noCurrent' : 'messagePins.noPins')}</div>
           ) : (
             <div class="message-pins-list">
               {visiblePins.map((pin) => (

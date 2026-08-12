@@ -29,6 +29,6 @@ export async function saveMessagePin(
   return response.pin;
 }
 
-export async function removeMessagePin(serverId: string, sessionName: string, pinId: string): Promise<void> {
-  await apiFetch(scopedMessagePinsPath(serverId, sessionName, pinId), { method: 'DELETE' });
+export async function removeMessagePin(serverId: string, pinId: string): Promise<void> {
+  await apiFetch(scopedMessagePinsPath(serverId, undefined, pinId), { method: 'DELETE' });
 }

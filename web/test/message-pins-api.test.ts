@@ -11,7 +11,7 @@ describe('message pins API client', () => {
     apiFetchMock.mockResolvedValue({ pins: [], pin: { id: 'pin-1' }, ok: true });
   });
 
-  it('uses the mounted /api route and keeps the original session on mutations', async () => {
+  it('uses the mounted /api route and scopes creation to the current session', async () => {
     const { fetchMessagePins, removeMessagePin, saveMessagePin } = await import('../src/api/message-pins.js');
 
     await fetchMessagePins('server / 1');
@@ -21,7 +21,7 @@ describe('message pins API client', () => {
       eventType: 'assistant.text',
       text: 'Pinned text',
     });
-    await removeMessagePin('server / 1', 'deck_sub_一', 'pin / 1');
+    await removeMessagePin('server / 1', 'pin / 1');
 
     expect(apiFetchMock.mock.calls).toEqual([
       ['/api/message-pins?serverId=server+%2F+1'],
@@ -34,7 +34,7 @@ describe('message pins API client', () => {
           text: 'Pinned text',
         }),
       }],
-      ['/api/message-pins/pin%20%2F%201?serverId=server+%2F+1&sessionName=deck_sub_%E4%B8%80', {
+      ['/api/message-pins/pin%20%2F%201?serverId=server+%2F+1', {
         method: 'DELETE',
       }],
     ]);

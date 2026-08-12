@@ -2,7 +2,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { createDatabase, type Database } from '../src/db/client.js';
 import { runMigrations } from '../src/db/migrate.js';
 import { createServer, createUser } from '../src/db/queries.js';
-import { deleteMessagePin, listMessagePins, upsertMessagePin } from '../src/db/message-pins.js';
+import { deleteMessagePin, getMessagePin, listMessagePins, upsertMessagePin } from '../src/db/message-pins.js';
 import { randomHex, sha256Hex } from '../src/security/crypto.js';
 
 let db: Database;
@@ -24,7 +24,7 @@ afterAll(async () => {
 });
 
 describe('message pin PostgreSQL persistence', () => {
-  it('round-trips current/all scopes, updates idempotently, and deletes by original session', async () => {
+  it('round-trips current/all scopes, updates idempotently, gets by id, and deletes in user/server scope', async () => {
     const first = await upsertMessagePin(db, {
       userId,
       serverId,
@@ -59,18 +59,20 @@ describe('message pin PostgreSQL persistence', () => {
     expect(current[0]).toMatchObject({ text: 'first updated', eventTs: 101 });
     const all = await listMessagePins(db, { userId, serverId });
     expect(all.map((pin) => pin.sessionName)).toEqual(['deck_pin_other', 'deck_pin_main']);
+    await expect(getMessagePin(db, { id: first.pin.id, userId, serverId })).resolves.toMatchObject({
+      id: first.pin.id,
+      sessionName: 'deck_pin_main',
+    });
 
     await expect(deleteMessagePin(db, {
       id: first.pin.id,
-      userId,
+      userId: `${userId}-other`,
       serverId,
-      sessionName: 'deck_pin_other',
     })).resolves.toBe(false);
     await expect(deleteMessagePin(db, {
       id: first.pin.id,
       userId,
       serverId,
-      sessionName: 'deck_pin_main',
     })).resolves.toBe(true);
   });
 });

@@ -9,6 +9,7 @@ import {
   type McpRuntimeCaller,
 } from './memory-mcp-caller.js';
 import { registerAliasMcpTools, registerMemoryMcpTools, type MemoryMcpToolDeps } from './memory-mcp-tools.js';
+import { registerMessagePinMcpTools, type MessagePinMcpToolDeps } from './message-pin-mcp-tools.js';
 import { createDaemonMachineToolDeps } from './machine-mcp-deps.js';
 import { loadStore, type SessionRecord } from '../store/session-store.js';
 import { isDaemonCapabilityAdvertised } from './server-link.js';
@@ -18,18 +19,23 @@ import { resolveExecutionCloneLimitsForParentRun } from './execution-clone-limit
 export interface MemoryMcpServerOptions {
   env?: Record<string, string | undefined>;
   toolDeps?: MemoryMcpToolDeps;
+  messagePinToolDeps?: MessagePinMcpToolDeps;
 }
 
-export function createMemoryMcpServer(caller: McpRuntimeCaller, toolDeps: MemoryMcpToolDeps = {}): McpServer {
+export function createMemoryMcpServer(
+  caller: McpRuntimeCaller,
+  toolDeps: MemoryMcpToolDeps = {},
+  messagePinToolDeps: MessagePinMcpToolDeps = {},
+): McpServer {
   const server = new McpServer({
     name: IMCODES_MEMORY_MCP_SERVER_NAME,
     version: '0.1.0',
   });
   registerMemoryMcpTools(server, caller, toolDeps);
-  // Read-only alias tools (resolve_alias / list_aliases) share the same MCP
-  // server surface but are NOT part of the memory tool set (kept off
-  // MEMORY_MCP_TOOL_NAME_LIST / the memory schema firewall). No write tools.
+  // Exact server-backed stores share this MCP server surface but stay outside
+  // the fuzzy-memory contract list and schema firewall.
   registerAliasMcpTools(server, caller);
+  registerMessagePinMcpTools(server, caller, messagePinToolDeps);
   return server;
 }
 
@@ -155,7 +161,11 @@ export function mergeDefaultToolDeps(caller: McpRuntimeCaller, toolDeps: MemoryM
 
 export function createMemoryMcpServerFromEnv(options: MemoryMcpServerOptions = {}): McpServer {
   const caller = parseMcpRuntimeCallerFromEnv(options.env ?? process.env, 'stdio');
-  return createMemoryMcpServer(caller, mergeDefaultToolDeps(caller, options.toolDeps ?? {}));
+  return createMemoryMcpServer(
+    caller,
+    mergeDefaultToolDeps(caller, options.toolDeps ?? {}),
+    options.messagePinToolDeps,
+  );
 }
 
 export async function runMemoryMcpServer(options: MemoryMcpServerOptions = {}): Promise<void> {

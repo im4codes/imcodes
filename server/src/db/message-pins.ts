@@ -59,6 +59,18 @@ export async function listMessagePins(
   return rows.map(toMessagePin);
 }
 
+export async function getMessagePin(
+  db: Database,
+  params: { id: string; userId: string; serverId: string },
+): Promise<MessagePin | null> {
+  const row = await db.queryOne<MessagePinRow>(`
+    SELECT ${MESSAGE_PIN_COLUMNS}
+    FROM message_pins
+    WHERE id = $1 AND user_id = $2 AND server_id = $3
+  `, [params.id, params.userId, params.serverId]);
+  return row ? toMessagePin(row) : null;
+}
+
 export async function upsertMessagePin(
   db: Database,
   params: { userId: string; serverId: string; sessionName: string; pin: CreateMessagePinInput; now?: number },
@@ -117,11 +129,11 @@ export async function upsertMessagePin(
 
 export async function deleteMessagePin(
   db: Database,
-  params: { id: string; userId: string; serverId: string; sessionName: string },
+  params: { id: string; userId: string; serverId: string },
 ): Promise<boolean> {
   const result = await db.execute(`
     DELETE FROM message_pins
-    WHERE id = $1 AND user_id = $2 AND server_id = $3 AND session_name = $4
-  `, [params.id, params.userId, params.serverId, params.sessionName]);
+    WHERE id = $1 AND user_id = $2 AND server_id = $3
+  `, [params.id, params.userId, params.serverId]);
   return result.changes > 0;
 }

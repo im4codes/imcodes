@@ -4,6 +4,7 @@ import type { Env } from '../src/env.js';
 import type { MessagePin } from '../../shared/message-pins.js';
 
 const listMessagePinsMock = vi.fn();
+const getMessagePinMock = vi.fn();
 const upsertMessagePinMock = vi.fn();
 const deleteMessagePinMock = vi.fn();
 const authorizeTimelineSessionMock = vi.fn();
@@ -22,6 +23,7 @@ vi.mock('../src/routes/timeline-session-access.js', () => ({
 
 vi.mock('../src/db/message-pins.js', () => ({
   listMessagePins: (...args: unknown[]) => listMessagePinsMock(...args),
+  getMessagePin: (...args: unknown[]) => getMessagePinMock(...args),
   upsertMessagePin: (...args: unknown[]) => upsertMessagePinMock(...args),
   deleteMessagePin: (...args: unknown[]) => deleteMessagePinMock(...args),
 }));
@@ -57,6 +59,7 @@ describe('message pin routes', () => {
     vi.clearAllMocks();
     authorizeTimelineSessionMock.mockResolvedValue({ ok: true });
     listMessagePinsMock.mockResolvedValue([]);
+    getMessagePinMock.mockResolvedValue(null);
     deleteMessagePinMock.mockResolvedValue(true);
   });
 
@@ -92,6 +95,19 @@ describe('message pin routes', () => {
     });
   });
 
+  it('searches authorized pins by text or session and filters by event type', async () => {
+    const app = await makeApp();
+    listMessagePinsMock.mockResolvedValue([
+      pin('assistant', 'deck_other'),
+      { ...pin('user', 'deck_matching'), eventType: 'user.message', text: 'different' },
+      { ...pin('ignored', 'deck_other'), text: 'unrelated' },
+    ]);
+    const response = await app.request('/api/message-pins?serverId=srv-1&q=matching&eventType=user.message&limit=1');
+    expect(response.status).toBe(200);
+    const body = await response.json() as { pins: MessagePin[] };
+    expect(body.pins.map((item) => item.id)).toEqual(['user']);
+  });
+
   it('persists a validated pin under its current session scope', async () => {
     const app = await makeApp();
     const saved = pin('saved', 'deck_main');
@@ -113,14 +129,32 @@ describe('message pin routes', () => {
     }));
   });
 
-  it('deletes only through the pin original session scope', async () => {
+  it('gets and deletes only after re-authorizing the pin original session', async () => {
     const app = await makeApp();
-    const response = await app.request('/api/message-pins/pin-1?serverId=srv-1&sessionName=deck_main', {
+    const saved = pin('pin-1', 'deck_original');
+    getMessagePinMock.mockResolvedValue(saved);
+    const getResponse = await app.request('/api/message-pins/pin-1?serverId=srv-1');
+    expect(getResponse.status).toBe(200);
+    expect(await getResponse.json()).toEqual({ pin: saved });
+
+    const response = await app.request('/api/message-pins/pin-1?serverId=srv-1', {
       method: 'DELETE',
     });
     expect(response.status).toBe(200);
-    expect(deleteMessagePinMock).toHaveBeenCalledWith(expect.anything(), {
-      id: 'pin-1', userId: 'user-1', serverId: 'srv-1', sessionName: 'deck_main',
+    expect(authorizeTimelineSessionMock).toHaveBeenLastCalledWith(expect.anything(), {
+      userId: 'user-1', serverId: 'srv-1', sessionName: 'deck_original',
     });
+    expect(deleteMessagePinMock).toHaveBeenCalledWith(expect.anything(), {
+      id: 'pin-1', userId: 'user-1', serverId: 'srv-1',
+    });
+  });
+
+  it('does not expose or delete a pin after its original session access is revoked', async () => {
+    const app = await makeApp();
+    getMessagePinMock.mockResolvedValue(pin('pin-1', 'deck_revoked'));
+    authorizeTimelineSessionMock.mockResolvedValue({ ok: false });
+    const response = await app.request('/api/message-pins/pin-1?serverId=srv-1', { method: 'DELETE' });
+    expect(response.status).toBe(403);
+    expect(deleteMessagePinMock).not.toHaveBeenCalled();
   });
 });

@@ -118,7 +118,7 @@ export function useMessagePins(
     setMutating(true);
     setError(null);
     try {
-      await removeMessagePin(serverId, pin.sessionName, pin.id);
+      await removeMessagePin(serverId, pin.id);
       if (generation !== pinsCacheGeneration) return false;
       const previous = pinsCache.get(serverId) ?? pins;
       const next = previous.filter((candidate) => candidate.id !== pin.id);
