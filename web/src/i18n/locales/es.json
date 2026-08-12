@@ -2818,6 +2818,7 @@
     "machines_title": "Máquinas",
     "refresh": "Actualizar",
     "error_generic": "Algo salió mal. Inténtalo de nuevo.",
+    "refresh_error": "No se pudo actualizar el estado del nodo. Se muestran los últimos datos conocidos.",
     "empty": "Aún no hay nodos controlados.",
     "online": "En línea",
     "offline": "Sin conexión",

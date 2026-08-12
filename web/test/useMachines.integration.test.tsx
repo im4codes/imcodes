@@ -23,7 +23,7 @@ function Probe() {
   return (
     <div>
       <span>{state}</span>
-      <button type="button" onClick={() => { void refetch(); }}>refresh</button>
+      <button type="button" onClick={() => { void refetch().catch(() => undefined); }}>refresh</button>
     </div>
   );
 }

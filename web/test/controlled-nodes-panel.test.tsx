@@ -96,6 +96,12 @@ afterEach(() => {
 
 const machine = (over: Partial<MachineListItem>): MachineListItem => ({ serverId: 's', refName: 'r', displayName: 'D', online: true, execEnabled: false, ...over });
 
+function rejectRefreshAfterInitialLoad(): void {
+  refetch
+    .mockResolvedValueOnce(null)
+    .mockRejectedValueOnce(new TypeError('Failed to fetch'));
+}
+
 describe('ControlledNodesPanel (12.3)', () => {
   it('refreshes DB-backed presence while open and stops polling after close', async () => {
     vi.useFakeTimers();
@@ -152,6 +158,32 @@ describe('ControlledNodesPanel (12.3)', () => {
     expect(container.textContent).toContain('controlled_nodes.empty');
     expect(container.querySelector('.controlled-nodes-refresh')?.hasAttribute('disabled')).toBe(false);
     expect(container.querySelector('.controlled-nodes-refresh-icon')?.classList.contains('is-spinning')).toBe(false);
+  });
+
+  it('keeps one stable refresh warning across repeated failures and clears it after recovery', async () => {
+    const visibility = vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('visible');
+    refetch
+      .mockRejectedValueOnce(new TypeError('Failed to fetch'))
+      .mockRejectedValueOnce(new TypeError('Failed to fetch'))
+      .mockResolvedValueOnce(null);
+    const { container } = render(<ControlledNodesPanel />);
+
+    await waitFor(() => expect(container.textContent).toContain('controlled_nodes.refresh_error'));
+    const firstAlert = container.querySelector('.controlled-nodes-presence-error');
+    expect(firstAlert).toBeTruthy();
+
+    act(() => {
+      document.dispatchEvent(new Event('visibilitychange'));
+    });
+    await waitFor(() => expect(refetch).toHaveBeenCalledTimes(2));
+    expect(container.querySelector('.controlled-nodes-presence-error')).toBe(firstAlert);
+
+    act(() => {
+      document.dispatchEvent(new Event('visibilitychange'));
+    });
+    await waitFor(() => expect(refetch).toHaveBeenCalledTimes(3));
+    await waitFor(() => expect(container.querySelector('.controlled-nodes-presence-error')).toBeNull());
+    visibility.mockRestore();
   });
 
   it('renders the node-grid hierarchy and live machine metrics', async () => {
@@ -292,6 +324,19 @@ describe('ControlledNodesPanel (12.3)', () => {
     expect(refetch).toHaveBeenCalled();
   });
 
+  it('does not report a successful exec toggle as failed when its refresh fails', async () => {
+    rejectRefreshAfterInitialLoad();
+    machines = [machine({ serverId: 'srv-toggle-refresh', displayName: 'Toggle Node', execEnabled: false })];
+    const { container } = render(<ControlledNodesPanel />);
+    await waitFor(() => expect(container.textContent).toContain('Toggle Node'));
+
+    fireEvent.click(container.querySelector('.controlled-nodes-exec-toggle')!);
+
+    await waitFor(() => expect(setMachineExecEnabled).toHaveBeenCalledWith('srv-toggle-refresh', true));
+    await waitFor(() => expect(container.textContent).toContain('controlled_nodes.refresh_error'));
+    expect(container.textContent).not.toContain('controlled_nodes.error_generic');
+  });
+
   it('opens fixed-target sharing for an owner machine', async () => {
     machines = [machine({ serverId: 'shared-machine', displayName: 'Office Node', accessRole: 'owner' })];
     const { container } = render(<ControlledNodesPanel />);
@@ -304,6 +349,27 @@ describe('ControlledNodesPanel (12.3)', () => {
       { kind: 'server', serverId: 'shared-machine' },
     );
     expect(container.querySelector('[role="radiogroup"][aria-label="share.target.label"]')).toBeNull();
+  });
+
+  it('contains a failed post-share refresh without rejecting or marking the share failed', async () => {
+    rejectRefreshAfterInitialLoad();
+    machines = [machine({ serverId: 'share-refresh', displayName: 'Share Refresh', accessRole: 'owner' })];
+    const { container } = render(<ControlledNodesPanel />);
+    await waitFor(() => expect(container.textContent).toContain('Share Refresh'));
+    fireEvent.click(container.querySelector('.share-revoke-btn')!);
+
+    const recipient = await waitFor(() => {
+      const input = container.querySelector('#share-target-user');
+      if (!(input instanceof HTMLInputElement)) throw new Error('share recipient input not found');
+      return input;
+    });
+    fireEvent.input(recipient, { target: { value: 'user-2' } });
+    fireEvent.click(container.querySelector('.ask-btn-submit')!);
+
+    await waitFor(() => expect(createShare).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(container.textContent).toContain('controlled_nodes.refresh_error'));
+    expect(container.querySelector('.share-error')).toBeNull();
+    expect(container.textContent).not.toContain('controlled_nodes.error_generic');
   });
 
   it('keeps owner controls hidden for shared Viewer and Participant machines', async () => {
@@ -338,6 +404,21 @@ describe('ControlledNodesPanel (12.3)', () => {
     expect(container.textContent).toContain('stable-ref');
   });
 
+  it('does not report a successful rename as failed when its refresh fails', async () => {
+    rejectRefreshAfterInitialLoad();
+    machines = [machine({ serverId: 'rename-refresh', displayName: 'Old refresh name' })];
+    const { container } = render(<ControlledNodesPanel />);
+    await waitFor(() => expect(container.textContent).toContain('Old refresh name'));
+
+    fireEvent.click(container.querySelector('.controlled-nodes-rename')!);
+    fireEvent.input(container.querySelector('.controlled-nodes-rename-input')!, { target: { value: 'New refresh name' } });
+    fireEvent.click(container.querySelector('.controlled-nodes-rename-save')!);
+
+    await waitFor(() => expect(renameMachine).toHaveBeenCalledWith('rename-refresh', 'New refresh name'));
+    await waitFor(() => expect(container.textContent).toContain('controlled_nodes.refresh_error'));
+    expect(container.textContent).not.toContain('controlled_nodes.error_generic');
+  });
+
   it('rejects an invalid display name before calling the API', async () => {
     machines = [machine({ serverId: 'srv-invalid', displayName: 'Old name' })];
     const { container } = render(<ControlledNodesPanel />);
@@ -363,6 +444,21 @@ describe('ControlledNodesPanel (12.3)', () => {
     confirmSpy.mockReturnValue(true);
     fireEvent.click(revoke!);
     await waitFor(() => expect(revokeMachine).toHaveBeenCalledWith('srv2'));
+    confirmSpy.mockRestore();
+  });
+
+  it('does not report a successful revoke as failed when its refresh fails', async () => {
+    rejectRefreshAfterInitialLoad();
+    machines = [machine({ serverId: 'revoke-refresh', displayName: 'Revoke Refresh' })];
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true);
+    const { container } = render(<ControlledNodesPanel />);
+    await waitFor(() => expect(container.textContent).toContain('Revoke Refresh'));
+
+    fireEvent.click(container.querySelector('.controlled-nodes-revoke')!);
+
+    await waitFor(() => expect(revokeMachine).toHaveBeenCalledWith('revoke-refresh'));
+    await waitFor(() => expect(container.textContent).toContain('controlled_nodes.refresh_error'));
+    expect(container.textContent).not.toContain('controlled_nodes.error_generic');
     confirmSpy.mockRestore();
   });
 });

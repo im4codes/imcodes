@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'preact/hooks';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import {
   controlledNodeDownloadErrorKey,
@@ -100,11 +100,13 @@ export function ControlledNodesPanel() {
   const [ticketExpiryByKey, setTicketExpiryByKey] = useState<Partial<Record<string, number>>>({});
 
   const [actionError, setActionError] = useState<string | null>(null);
+  const [presenceRefreshFailed, setPresenceRefreshFailed] = useState(error != null);
   const [manualPresenceRefresh, setManualPresenceRefresh] = useState(false);
   const [busyServerId, setBusyServerId] = useState<string | null>(null);
   const [editingServerId, setEditingServerId] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState('');
   const [sharingMachine, setSharingMachine] = useState<MachineListItem | null>(null);
+  const presenceMountedRef = useRef(true);
 
   const sortedTargets = useMemo(() => downloadTargets, [downloadTargets]);
   const availableOses = useMemo(
@@ -127,8 +129,29 @@ export function ControlledNodesPanel() {
   useEffect(() => { refreshAvailability(); }, [refreshAvailability]);
 
   useEffect(() => {
+    presenceMountedRef.current = true;
+    return () => { presenceMountedRef.current = false; };
+  }, []);
+
+  useEffect(() => {
+    if (error) setPresenceRefreshFailed(true);
+  }, [error]);
+
+  const refreshPresence = useCallback(async (): Promise<void> => {
+    try {
+      await refetch();
+      if (presenceMountedRef.current) setPresenceRefreshFailed(false);
+    } catch {
+      // Keep the last known machine list visible and contain the rejection at
+      // this boundary. A failed refresh must never become an operation error
+      // or an unhandled rejection interpreted as a failed app update.
+      if (presenceMountedRef.current) setPresenceRefreshFailed(true);
+    }
+  }, [refetch]);
+
+  useEffect(() => {
     const refreshQuietly = (): void => {
-      void refetch().catch(() => undefined);
+      void refreshPresence();
     };
     const refreshWhenVisible = (): void => {
       if (document.visibilityState === 'visible') refreshQuietly();
@@ -140,19 +163,17 @@ export function ControlledNodesPanel() {
       window.clearInterval(timer);
       document.removeEventListener('visibilitychange', refreshWhenVisible);
     };
-  }, [refetch]);
+  }, [refreshPresence]);
 
   const refreshPresenceManually = useCallback(async (): Promise<void> => {
     if (manualPresenceRefresh) return;
     setManualPresenceRefresh(true);
     try {
-      await refetch();
-    } catch {
-      // The shared resource publishes the error for the panel to render.
+      await refreshPresence();
     } finally {
       setManualPresenceRefresh(false);
     }
-  }, [manualPresenceRefresh, refetch]);
+  }, [manualPresenceRefresh, refreshPresence]);
 
   const onDownload = async (target: ControlledNodeArtifactSelection) => {
     const key = artifactSelectionKey(target);
@@ -183,12 +204,13 @@ export function ControlledNodesPanel() {
     setBusyServerId(serverId);
     try {
       await setMachineExecEnabled(serverId, next);
-      await refetch();
     } catch {
       setActionError(t('controlled_nodes.error_generic'));
-    } finally {
       setBusyServerId(null);
+      return;
     }
+    await refreshPresence();
+    setBusyServerId(null);
   };
 
   const startRename = (serverId: string, displayName: string) => {
@@ -213,12 +235,13 @@ export function ControlledNodesPanel() {
     try {
       await renameMachine(serverId, displayName);
       cancelRename();
-      await refetch();
     } catch {
       setActionError(t('controlled_nodes.error_generic'));
-    } finally {
       setBusyServerId(null);
+      return;
     }
+    await refreshPresence();
+    setBusyServerId(null);
   };
 
   const onRevoke = async (serverId: string) => {
@@ -227,12 +250,13 @@ export function ControlledNodesPanel() {
     setBusyServerId(serverId);
     try {
       await revokeMachine(serverId);
-      await refetch();
     } catch {
       setActionError(t('controlled_nodes.error_generic'));
-    } finally {
       setBusyServerId(null);
+      return;
     }
+    await refreshPresence();
+    setBusyServerId(null);
   };
 
   const usageOsKeys: Array<{ os: ControlledNodeOs; key: string }> = [
@@ -289,7 +313,11 @@ export function ControlledNodesPanel() {
           </button>
         </div>
         {actionError && <p class="controlled-nodes-error" role="alert">{actionError}</p>}
-        {error && <p class="controlled-nodes-error" role="alert">{t('controlled_nodes.error_generic')}</p>}
+        {(presenceRefreshFailed || error) && (
+          <p class="controlled-nodes-error controlled-nodes-presence-error" role="alert">
+            {t('controlled_nodes.refresh_error')}
+          </p>
+        )}
         {loaded && machines.length === 0 && (
           <div class="controlled-nodes-empty">
             <span class="controlled-nodes-empty-radar" aria-hidden="true"><i /></span>
@@ -487,7 +515,7 @@ export function ControlledNodesPanel() {
             tabLabel: sharingMachine.displayName,
           }}
           onClose={() => setSharingMachine(null)}
-          onSharesChanged={() => refetch()}
+          onSharesChanged={() => { void refreshPresence(); }}
         />
       )}
     </div>

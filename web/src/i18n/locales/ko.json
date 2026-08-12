@@ -2817,6 +2817,7 @@
     "machines_title": "머신",
     "refresh": "새로고침",
     "error_generic": "문제가 발생했습니다. 다시 시도하세요.",
+    "refresh_error": "노드 상태를 새로 고칠 수 없습니다. 마지막으로 확인된 데이터를 표시합니다.",
     "empty": "아직 제어 노드가 없습니다.",
     "online": "온라인",
     "offline": "오프라인",

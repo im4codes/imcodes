@@ -2818,6 +2818,7 @@
     "machines_title": "機器",
     "refresh": "重新整理",
     "error_generic": "發生錯誤,請重試。",
+    "refresh_error": "無法重新整理節點狀態，正在顯示上次資料。",
     "empty": "尚無受控節點。",
     "online": "在線",
     "offline": "離線",

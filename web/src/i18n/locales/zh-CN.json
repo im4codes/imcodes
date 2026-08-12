@@ -2818,6 +2818,7 @@
     "machines_title": "机器",
     "refresh": "刷新",
     "error_generic": "出错了,请重试。",
+    "refresh_error": "无法刷新节点状态，正在显示上次数据。",
     "empty": "还没有被控节点。",
     "online": "在线",
     "offline": "离线",

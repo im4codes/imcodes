@@ -2818,6 +2818,7 @@
     "machines_title": "Machines",
     "refresh": "Refresh",
     "error_generic": "Something went wrong. Please try again.",
+    "refresh_error": "Could not refresh node status. Showing the last known data.",
     "empty": "No controlled nodes yet.",
     "online": "Online",
     "offline": "Offline",
