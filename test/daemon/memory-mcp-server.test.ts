@@ -9,7 +9,12 @@ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { MEMORY_MCP_ENV_KEYS, buildMemoryMcpServerEnv } from '../../shared/memory-mcp-env.js';
 import { MEMORY_MCP_TOOL_NAME_LIST } from '../../shared/memory-mcp-contracts.js';
 import { ALIAS_MCP_TOOLS } from '../../shared/alias-types.js';
-import { createMemoryMcpServerFromEnv, mergeDefaultToolDeps } from '../../src/daemon/memory-mcp-server.js';
+import { AGENT_DELEGATION_REPLY_ERRORS } from '../../shared/agent-delegation.js';
+import {
+  createMemoryMcpServerFromEnv,
+  mergeDefaultToolDeps,
+  postHookSend,
+} from '../../src/daemon/memory-mcp-server.js';
 import type { McpRuntimeCaller } from '../../src/daemon/memory-mcp-caller.js';
 
 // Hoisted mock: prove the production run-authoritative limit resolver is wired
@@ -428,7 +433,12 @@ describe('memory MCP stdio server', () => {
           sender: typeof req.headers['x-imcodes-session'] === 'string' ? req.headers['x-imcodes-session'] : undefined,
         });
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: true, delivered: true }));
+        res.end(JSON.stringify({
+          ok: true,
+          delivered: false,
+          pending: true,
+          reason: AGENT_DELEGATION_REPLY_ERRORS.DELIVERY_PENDING,
+        }));
       });
     });
     await new Promise<void>((resolve) => hookServer.listen(0, '127.0.0.1', resolve));
@@ -453,7 +463,12 @@ describe('memory MCP stdio server', () => {
           result: 'Completed with exact evidence.',
         },
       });
-      expect(result.structuredContent).toEqual({ status: 'ok', accepted: true, delivered: true });
+      expect(result.structuredContent).toEqual({
+        status: 'ok',
+        accepted: true,
+        delivered: false,
+        pending: true,
+      });
       expect(received).toEqual([{
         sender: 'deck_sub_worker',
         body: {
@@ -465,6 +480,27 @@ describe('memory MCP stdio server', () => {
       }]);
     } finally {
       await client.close();
+      await new Promise<void>((resolve, reject) => hookServer.close((err) => (err ? reject(err) : resolve())));
+    }
+  });
+
+  it('bounds a delegation hook request when the daemon accepts the socket but never replies', async () => {
+    const hookServer = createServer((_req, _res) => {
+      // Deliberately leave the response open: this is the daemon-side hang
+      // that previously left the MCP tool running until the user pressed Stop.
+    });
+    await new Promise<void>((resolve) => hookServer.listen(0, '127.0.0.1', resolve));
+    const address = hookServer.address();
+    if (!address || typeof address === 'string') throw new Error('expected TCP hook server address');
+    try {
+      await expect(postHookSend(
+        address.port,
+        { result: 'done' },
+        '/delegation-reply',
+        'deck_sub_worker',
+        25,
+      )).rejects.toThrow('hook request timed out after 25ms');
+    } finally {
       await new Promise<void>((resolve, reject) => hookServer.close((err) => (err ? reject(err) : resolve())));
     }
   });

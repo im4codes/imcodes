@@ -33,6 +33,7 @@ import {
   selectLiveQueueEntries,
   type TransportQueueReducerState,
 } from '@shared/transport-queue-reducer.js';
+import { reduceTimelineActivity } from '@shared/session-activity-types.js';
 import type { QueueEvent, QueueProjectionEntry, QueueSnapshot } from '@shared/transport-queue-types.js';
 import { TIMELINE_SNAPSHOT_STORAGE_PREFIX } from '../local-storage-quota.js';
 
@@ -1181,6 +1182,12 @@ export interface UseTimelineOptions {
    * hook stays idle and skips daemon/HTTP/text-tail history work entirely.
    */
   disableHistory?: boolean;
+  /**
+   * Session-list state from the daemon. This is an independent authority from
+   * the timeline stream and lets a pane self-heal when it missed the terminal
+   * tool/result/idle frames but the daemon already reports the session idle.
+   */
+  authoritativeSessionState?: string;
 }
 
 export type TimelineHistoryPhase = 'idle' | 'bootstrap' | 'refresh' | 'older';
@@ -1552,6 +1559,7 @@ export function useTimeline(
   const isActiveSession = options?.isActiveSession ?? true;
   const isVisible = options?.isVisible ?? isActiveSession;
   const disableHistory = options?.disableHistory ?? false;
+  const authoritativeSessionState = options?.authoritativeSessionState;
   const wsConnected = !!ws?.connected;
   const cacheKeyRef = useRef(cacheKey);
   cacheKeyRef.current = cacheKey;
@@ -3341,6 +3349,7 @@ export function useTimeline(
   // by forceRefresh. `manualLatestWindow` also clears any pending tail backfill,
   // so this does not double-fetch after the mount bootstrap timer.
   const blankSelfHealRef = useRef<string | null>(null);
+  const staleToolSelfHealRef = useRef<string | null>(null);
   const fireBlankPaneRecovery = useCallback((visible: boolean) => {
     const key = cacheKeyRef.current;
     if (!key) return;
@@ -3373,6 +3382,42 @@ export function useTimeline(
     disableHistory,
     fireBlankPaneRecovery,
   ]);
+
+  // Independent-authority self-heal: if the daemon/session list says the turn
+  // is idle while this timeline still contains an unmatched tool.call, the
+  // result/final frames were missed or merged into a different cache segment.
+  // Pull one authoritative newest window automatically instead of leaving the
+  // local elapsed timer running forever until the user force-refreshes.
+  useEffect(() => {
+    const key = cacheKey;
+    if (!key || disableHistory || authoritativeSessionState !== 'idle') {
+      staleToolSelfHealRef.current = null;
+      return;
+    }
+    const activity = reduceTimelineActivity(events);
+    if (activity.openToolCount <= 0) {
+      staleToolSelfHealRef.current = null;
+      return;
+    }
+    if (!isActiveSessionRef.current && !isVisibleRef.current) return;
+    let newestToolCallEventId = 'anonymous';
+    for (let index = events.length - 1; index >= 0; index -= 1) {
+      if (events[index]?.type === 'tool.call') {
+        newestToolCallEventId = events[index]?.eventId ?? newestToolCallEventId;
+        break;
+      }
+    }
+    const signature = `${key}:${newestToolCallEventId}:${activity.openToolCount}`;
+    if (staleToolSelfHealRef.current === signature) return;
+    staleToolSelfHealRef.current = signature;
+    void reloadLocalTimelineRef.current();
+    fireHttpBackfillRef.current(0, {
+      phase: 'refresh',
+      visible: false,
+      force: true,
+      mode: 'manualLatestWindow',
+    });
+  }, [authoritativeSessionState, cacheKey, disableHistory, events]);
 
   const lastActiveRefreshAtRef = useRef(0);
 

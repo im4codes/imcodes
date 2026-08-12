@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   AGENT_DELEGATION_COMPLETION_NOTIFICATION_MARKER,
   AGENT_DELEGATION_NOTIFICATION_RESULTS,
+  AGENT_DELEGATION_REPLY_ERRORS,
   AGENT_DELEGATION_REPLY_TIMELINE_EVENT,
   AGENT_DELEGATION_REPLY_VERSION,
 } from '../../shared/agent-delegation.js';
@@ -118,7 +119,12 @@ describe('delegation reply ingress', () => {
     await expect(submitDelegationReply({
       rawBody: envelope,
       senderSessionName: target.sessionName,
-    })).resolves.toEqual({ ok: true, delivered: true });
+    })).resolves.toEqual({
+      ok: true,
+      delivered: false,
+      pending: true,
+      reason: AGENT_DELEGATION_REPLY_ERRORS.DELIVERY_PENDING,
+    });
 
     expect(mocks.store.receive).toHaveBeenCalledWith(expect.objectContaining({
       delegationId: record.delegationId,
@@ -134,7 +140,9 @@ describe('delegation reply ingress', () => {
     expect(mocks.runtime?.deliverDelegationNotification).toHaveBeenCalledWith(
       expect.objectContaining({ text: expect.stringContaining(record.result) }),
     );
-    expect(mocks.store.markDelivered).toHaveBeenCalledWith(record.delegationId);
+    await vi.waitFor(() => {
+      expect(mocks.store.markDelivered).toHaveBeenCalledWith(record.delegationId);
+    });
     expect(mocks.timelineEmit).toHaveBeenCalledWith(
       origin.sessionName,
       AGENT_DELEGATION_REPLY_TIMELINE_EVENT,
@@ -149,10 +157,12 @@ describe('delegation reply ingress', () => {
         eventId: `delegation-reply:${record.notificationId}`,
       },
     );
-    expect(delivered).toHaveBeenCalledWith(expect.objectContaining({
-      delegationId: record.delegationId,
-      result: record.result,
-    }));
+    await vi.waitFor(() => {
+      expect(delivered).toHaveBeenCalledWith(expect.objectContaining({
+        delegationId: record.delegationId,
+        result: record.result,
+      }));
+    });
     unsubscribe();
   });
 
@@ -165,11 +175,47 @@ describe('delegation reply ingress', () => {
     await expect(submitDelegationReply({
       rawBody: envelope,
       senderSessionName: target.sessionName,
-    })).resolves.toEqual({ ok: true, delivered: true });
+    })).resolves.toEqual({
+      ok: true,
+      delivered: false,
+      pending: true,
+      reason: AGENT_DELEGATION_REPLY_ERRORS.DELIVERY_PENDING,
+    });
 
-    expect(ensureTransportRuntimeAvailable).toHaveBeenCalledWith(origin.sessionName);
-    expect(mocks.restoredRuntime.deliverDelegationNotification).toHaveBeenCalledOnce();
-    expect(mocks.store.markDelivered).toHaveBeenCalledOnce();
+    await vi.waitFor(() => {
+      expect(ensureTransportRuntimeAvailable).toHaveBeenCalledWith(origin.sessionName);
+      expect(mocks.restoredRuntime?.deliverDelegationNotification).toHaveBeenCalledOnce();
+      expect(mocks.store.markDelivered).toHaveBeenCalledOnce();
+    });
+  });
+
+  it('acknowledges durable receipt without waiting for a wedged provider notification', async () => {
+    mocks.runtime = {
+      deliverDelegationNotification: vi.fn(() => new Promise(() => {})),
+    };
+
+    const outcome = await Promise.race([
+      submitDelegationReply({
+        rawBody: envelope,
+        senderSessionName: target.sessionName,
+      }),
+      new Promise<'timed_out'>((resolve) => setTimeout(() => resolve('timed_out'), 100)),
+    ]);
+
+    expect(outcome).toEqual({
+      ok: true,
+      delivered: false,
+      pending: true,
+      reason: AGENT_DELEGATION_REPLY_ERRORS.DELIVERY_PENDING,
+    });
+    expect(mocks.runtime.deliverDelegationNotification).toHaveBeenCalledOnce();
+    expect(mocks.store.markDelivered).not.toHaveBeenCalled();
+    expect(mocks.timelineEmit).toHaveBeenCalledWith(
+      origin.sessionName,
+      AGENT_DELEGATION_REPLY_TIMELINE_EVENT,
+      expect.objectContaining({ result: record.result }),
+      expect.objectContaining({ eventId: `delegation-reply:${record.notificationId}` }),
+    );
   });
 
   it('keeps the reply pending when a busy provider cannot accept native notification', async () => {
@@ -184,9 +230,12 @@ describe('delegation reply ingress', () => {
       ok: true,
       delivered: false,
       pending: true,
-      reason: 'active_notification_unsupported',
+      reason: AGENT_DELEGATION_REPLY_ERRORS.DELIVERY_PENDING,
     });
 
+    await vi.waitFor(() => {
+      expect(mocks.runtime?.deliverDelegationNotification).toHaveBeenCalledOnce();
+    });
     expect(mocks.store.markDelivered).not.toHaveBeenCalled();
     expect(mocks.timelineEmit).toHaveBeenCalledWith(
       origin.sessionName,
@@ -210,9 +259,12 @@ describe('delegation reply ingress', () => {
       ok: true,
       delivered: false,
       pending: true,
-      reason: 'runtime_stale',
+      reason: AGENT_DELEGATION_REPLY_ERRORS.DELIVERY_PENDING,
     });
 
+    await vi.waitFor(() => {
+      expect(mocks.runtime?.deliverDelegationNotification).toHaveBeenCalledOnce();
+    });
     expect(mocks.store.markDelivered).not.toHaveBeenCalled();
   });
 

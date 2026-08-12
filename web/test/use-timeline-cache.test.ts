@@ -278,6 +278,108 @@ describe('useTimeline global cache bounds', () => {
     });
   });
 
+  it('self-heals an unmatched running tool when the authoritative session is already idle', async () => {
+    vi.useFakeTimers();
+    const sessionName = `deck_stale_tool_${Date.now()}`;
+    const serverId = `srv-stale-${Date.now()}`;
+    __setTimelineCacheForTests(`${serverId}:${sessionName}`, [{
+      eventId: `${sessionName}-tool-call`,
+      sessionId: sessionName,
+      ts: 1,
+      epoch: 1,
+      seq: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'tool.call',
+      payload: { toolCallId: 'delegation-reply-stuck', name: 'delegation_reply' },
+    }]);
+    fetchHistorySpy.mockResolvedValue({
+      events: [],
+      epoch: 1,
+      hasMore: false,
+      nextCursor: null,
+    });
+    const ws: WsClient = {
+      connected: true,
+      onMessage: () => () => { /* noop */ },
+      sendTimelineHistoryRequest: vi.fn(() => 'history-stale-tool'),
+    } as unknown as WsClient;
+
+    function Probe({ state }: { state: string }) {
+      const timeline = useTimeline(sessionName, ws, serverId, {
+        authoritativeSessionState: state,
+      });
+      return h('div', { 'data-testid': 'stale-tool-probe' }, String(timeline.events.length));
+    }
+
+    const view = render(h(Probe, { state: 'running' }));
+    await act(async () => { await flushMicrotasks(); });
+    expect(fetchHistorySpy).not.toHaveBeenCalled();
+
+    view.rerender(h(Probe, { state: 'idle' }));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+      await flushMicrotasks();
+    });
+
+    expect(fetchHistorySpy).toHaveBeenCalledTimes(1);
+    expect(fetchHistorySpy).toHaveBeenCalledWith(
+      serverId,
+      sessionName,
+      expect.objectContaining({ afterTs: undefined, limit: 300 }),
+    );
+  });
+
+  it('does not self-heal an idle timeline after the matching tool result arrived', async () => {
+    vi.useFakeTimers();
+    const sessionName = `deck_settled_tool_${Date.now()}`;
+    const serverId = `srv-settled-${Date.now()}`;
+    __setTimelineCacheForTests(`${serverId}:${sessionName}`, [
+      {
+        eventId: `${sessionName}-tool-call`,
+        sessionId: sessionName,
+        ts: 1,
+        epoch: 1,
+        seq: 1,
+        source: 'daemon',
+        confidence: 'high',
+        type: 'tool.call',
+        payload: { toolCallId: 'delegation-reply-done', name: 'delegation_reply' },
+      },
+      {
+        eventId: `${sessionName}-tool-result`,
+        sessionId: sessionName,
+        ts: 2,
+        epoch: 1,
+        seq: 2,
+        source: 'daemon',
+        confidence: 'high',
+        type: 'tool.result',
+        payload: { toolCallId: 'delegation-reply-done', status: 'succeeded' },
+      },
+    ]);
+    const ws: WsClient = {
+      connected: true,
+      onMessage: () => () => { /* noop */ },
+      sendTimelineHistoryRequest: vi.fn(() => 'history-settled-tool'),
+    } as unknown as WsClient;
+
+    function Probe() {
+      const timeline = useTimeline(sessionName, ws, serverId, {
+        authoritativeSessionState: 'idle',
+      });
+      return h('div', { 'data-testid': 'settled-tool-probe' }, String(timeline.events.length));
+    }
+
+    render(h(Probe));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+      await flushMicrotasks();
+    });
+
+    expect(fetchHistorySpy).not.toHaveBeenCalled();
+  });
+
   it('inactive sessions still load IDB history after a short stagger (not just visible ones)', async () => {
     // Regression: SubSessionCard previews and hidden tabs went empty
     // after commit 90cd30ec gated path-3 behind isActiveSession.

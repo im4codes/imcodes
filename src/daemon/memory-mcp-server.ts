@@ -39,7 +39,15 @@ export function createMemoryMcpServer(
   return server;
 }
 
-async function postHookSend(port: number, body: Record<string, unknown>, hookPath = '/send', senderSessionName?: string): Promise<Record<string, unknown>> {
+const DELEGATION_REPLY_HOOK_TIMEOUT_MS = 10_000;
+
+export async function postHookSend(
+  port: number,
+  body: Record<string, unknown>,
+  hookPath = '/send',
+  senderSessionName?: string,
+  timeoutMs?: number,
+): Promise<Record<string, unknown>> {
   const data = JSON.stringify(body);
   return new Promise((resolve, reject) => {
     const req = http.request({
@@ -69,6 +77,11 @@ async function postHookSend(port: number, body: Record<string, unknown>, hookPat
         }
       });
     });
+    if (timeoutMs && timeoutMs > 0) {
+      req.setTimeout(timeoutMs, () => {
+        req.destroy(new Error(`hook request timed out after ${timeoutMs}ms`));
+      });
+    }
     req.on('error', reject);
     req.write(data);
     req.end();
@@ -98,7 +111,13 @@ export function mergeDefaultToolDeps(caller: McpRuntimeCaller, toolDeps: MemoryM
       const port = await resolveLiveHookPort();
       if (!port) throw new Error('daemon delegation reply ingress is unavailable');
       if (!caller.sessionName) throw new Error('delegation_reply requires a scoped caller');
-      return postHookSend(port, envelope as unknown as Record<string, unknown>, '/delegation-reply', caller.sessionName);
+      return postHookSend(
+        port,
+        envelope as unknown as Record<string, unknown>,
+        '/delegation-reply',
+        caller.sessionName,
+        DELEGATION_REPLY_HOOK_TIMEOUT_MS,
+      );
     }),
     // FULL-node machine tools relay through the daemon's own bound credential.
     // An injected override (tests) wins; otherwise the daemon default is used.

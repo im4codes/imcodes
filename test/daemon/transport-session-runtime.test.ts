@@ -274,6 +274,7 @@ describe('TransportSessionRuntime', () => {
     resetTransportQueueStoreForTests();
     resetContextStoreClientForTests();
     vi.unstubAllEnvs();
+    vi.useRealTimers();
   });
 
   it('type is transport', () => {
@@ -402,6 +403,33 @@ describe('TransportSessionRuntime', () => {
     expect(result).toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.UNSUPPORTED);
     expect(runtime.pendingEntries).toEqual([]);
     expect(mock.provider.send).toHaveBeenCalledTimes(1);
+  });
+
+  it('bounds a wedged active delegation notification so the durable ingress can retry it', async () => {
+    const mock = makeMockProvider();
+    mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
+    mock.provider.notifyActiveDelegation = vi.fn(() => new Promise(() => {}));
+    const runtime = new TransportSessionRuntime(mock.provider, 'deck_test_brain');
+    await runtime.initialize(defaultConfig);
+    runtime.send('foreground work', 'foreground-wedged-notification');
+    await flushDispatch();
+    vi.useFakeTimers();
+
+    const delivery = runtime.deliverDelegationNotification({
+      notificationId: 'notify-wedged',
+      delegationId: 'delegation-wedged',
+      sourceSessionName: 'deck_sub_auditor',
+      text: 'audit complete',
+    });
+    let settled = false;
+    void delivery.finally(() => { settled = true; });
+
+    await vi.advanceTimersByTimeAsync(9_999);
+    expect(settled).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    await expect(delivery).resolves.toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE);
+    expect(mock.provider.notifyActiveDelegation).toHaveBeenCalledOnce();
+    expect(runtime.pendingEntries).toEqual([]);
   });
 
   it('appends selected queued messages into the active turn without cancelling or draining the rest', async () => {

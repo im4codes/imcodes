@@ -197,6 +197,7 @@ export function SessionPane({
   } = useTimeline(sessionName, ws, serverId, {
     isActiveSession: isActive,
     disableHistory: !hasChatTimeline,
+    authoritativeSessionState: session.state,
   });
   const historyStatus = timelineHistoryStatus ?? IDLE_HISTORY_STATUS;
 

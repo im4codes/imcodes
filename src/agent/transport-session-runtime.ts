@@ -244,6 +244,7 @@ export interface TransportRuntimeDiagnosticSnapshot {
 
 const DEFAULT_TRANSPORT_CONTEXT_BUDGET_MS = 2_500;
 const DEFAULT_TRANSPORT_PROVIDER_SEND_TIMEOUT_MS = 60_000;
+const DEFAULT_ACTIVE_DELEGATION_NOTIFICATION_TIMEOUT_MS = 10_000;
 const DEFAULT_TRANSPORT_STALE_PENDING_RECOVERY_MS = 300_000;
 const DEFAULT_TRANSPORT_STALE_PENDING_CANCEL_FALLBACK_MS = 5_000;
 const MIN_TRANSPORT_CONTEXT_BUDGET_MS = 50;
@@ -1919,7 +1920,23 @@ export class TransportSessionRuntime implements SessionRuntime {
         || !this.provider.notifyActiveDelegation) {
         return AGENT_DELEGATION_NOTIFICATION_RESULTS.UNSUPPORTED;
       }
-      const result = await this.provider.notifyActiveDelegation(this._providerSessionId, notification);
+      const outcome = await withTimeoutOutcome(
+        this.provider.notifyActiveDelegation(this._providerSessionId, notification),
+        DEFAULT_ACTIVE_DELEGATION_NOTIFICATION_TIMEOUT_MS,
+      );
+      // Admission must be a short control-plane operation. A provider adapter
+      // that never settles used to pin the delegation_reply MCP call forever;
+      // report stale so the durable delegation outbox retries the SAME
+      // notification id instead of requiring the user to Stop the session.
+      if (outcome.timedOut) {
+        logger.warn({
+          providerSessionId: this._providerSessionId,
+          notificationId: notification.notificationId,
+          timeoutMs: DEFAULT_ACTIVE_DELEGATION_NOTIFICATION_TIMEOUT_MS,
+        }, 'active delegation notification admission timed out; scheduling durable retry');
+        return AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE;
+      }
+      const result = outcome.value;
       if (result !== AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE || this.hasActiveTurnWork()) {
         return result;
       }

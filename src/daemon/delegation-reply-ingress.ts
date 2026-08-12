@@ -24,11 +24,46 @@ import logger from '../util/logger.js';
 const retryTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const inFlight = new Map<string, Promise<DelegationReplyIngressResult>>();
 const rateLimiter = new PeerAuditReplyRateLimiter();
+const DELEGATION_REPLY_RUNTIME_RECOVERY_TIMEOUT_MS = 10_000;
 
 export type DelegationReplyIngressResult =
   | { ok: true; delivered: true }
-  | { ok: true; delivered: false; pending: true; reason: 'active_notification_unsupported' | 'runtime_stale' }
+  | {
+    ok: true;
+    delivered: false;
+    pending: true;
+    reason:
+      | typeof AGENT_DELEGATION_REPLY_ERRORS.DELIVERY_PENDING
+      | typeof AGENT_DELEGATION_REPLY_ERRORS.NOTIFICATION_UNSUPPORTED;
+  }
   | { ok: false; error: AgentDelegationReplyError | 'sender_unavailable' | 'ingress_unavailable' };
+
+type TimeoutOutcome<T> = { timedOut: true } | { timedOut: false; value: T };
+
+function withTimeoutOutcome<T>(promise: Promise<T>, timeoutMs: number): Promise<TimeoutOutcome<T>> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  return new Promise<TimeoutOutcome<T>>((resolve, reject) => {
+    timer = setTimeout(() => resolve({ timedOut: true }), timeoutMs);
+    timer.unref?.();
+    promise.then(
+      (value) => {
+        if (timer) clearTimeout(timer);
+        resolve({ timedOut: false, value });
+      },
+      (error) => {
+        if (timer) clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
+
+function startBackgroundDelivery(record: DelegationReplyRecord): void {
+  void deliverRecord(record).catch((error) => {
+    logger.warn({ error, delegationId: record.delegationId }, 'delegation reply background delivery failed');
+    scheduleRetry(record.delegationId, 1_000);
+  });
+}
 
 function boundIdentity(record: SessionRecord | undefined): DelegationReplyBoundIdentity | null {
   const sessionInstanceId = record?.sessionInstanceId?.trim();
@@ -114,11 +149,34 @@ async function deliverRecord(record: DelegationReplyRecord): Promise<DelegationR
 
     let runtime = getTransportRuntime(record.origin.sessionName);
     if (!runtime) {
-      runtime = await ensureTransportRuntimeAvailable(record.origin.sessionName);
+      const recovery = await withTimeoutOutcome(
+        ensureTransportRuntimeAvailable(record.origin.sessionName),
+        DELEGATION_REPLY_RUNTIME_RECOVERY_TIMEOUT_MS,
+      );
+      if (recovery.timedOut) {
+        logger.warn({
+          delegationId: record.delegationId,
+          sessionName: record.origin.sessionName,
+          timeoutMs: DELEGATION_REPLY_RUNTIME_RECOVERY_TIMEOUT_MS,
+        }, 'delegation reply runtime recovery timed out; scheduling durable retry');
+        scheduleRetry(record.delegationId, 1_000);
+        return {
+          ok: true,
+          delivered: false,
+          pending: true,
+          reason: AGENT_DELEGATION_REPLY_ERRORS.DELIVERY_PENDING,
+        };
+      }
+      runtime = recovery.value;
     }
     if (!runtime) {
       scheduleRetry(record.delegationId, 5_000);
-      return { ok: true, delivered: false, pending: true, reason: 'runtime_stale' };
+      return {
+        ok: true,
+        delivered: false,
+        pending: true,
+        reason: AGENT_DELEGATION_REPLY_ERRORS.DELIVERY_PENDING,
+      };
     }
 
     let result;
@@ -132,7 +190,12 @@ async function deliverRecord(record: DelegationReplyRecord): Promise<DelegationR
     } catch (error) {
       logger.warn({ error, delegationId: record.delegationId }, 'delegation reply notification admission failed');
       scheduleRetry(record.delegationId, 1_000);
-      return { ok: true, delivered: false, pending: true, reason: 'runtime_stale' };
+      return {
+        ok: true,
+        delivered: false,
+        pending: true,
+        reason: AGENT_DELEGATION_REPLY_ERRORS.DELIVERY_PENDING,
+      };
     }
     if (result === AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED) {
       if (getDelegationReplyStore().markDelivered(record.delegationId)) {
@@ -147,7 +210,9 @@ async function deliverRecord(record: DelegationReplyRecord): Promise<DelegationR
       ok: true,
       delivered: false,
       pending: true,
-      reason: unsupported ? 'active_notification_unsupported' : 'runtime_stale',
+      reason: unsupported
+        ? AGENT_DELEGATION_REPLY_ERRORS.NOTIFICATION_UNSUPPORTED
+        : AGENT_DELEGATION_REPLY_ERRORS.DELIVERY_PENDING,
     };
   })().finally(() => {
     inFlight.delete(record.delegationId);
@@ -199,11 +264,25 @@ export async function submitDelegationReply(input: {
             : AGENT_DELEGATION_REPLY_ERRORS.INVALID_DELEGATION_ID;
     return { ok: false, error };
   }
-  // Timeline visibility is tied to authenticated reply receipt, not provider
-  // availability. Native notification delivery may need retries while the
-  // origin has an active turn, but the user should see the reply immediately.
+  const currentOrigin = boundIdentity(getSession(received.record.origin.sessionName));
+  const currentTarget = boundIdentity(getSession(received.record.target.sessionName));
+  if (!identityMatches(received.record.origin, currentOrigin)
+    || !identityMatches(received.record.target, currentTarget)) {
+    getDelegationReplyStore().expire(received.record.delegationId);
+    return { ok: false, error: AGENT_DELEGATION_REPLY_ERRORS.IDENTITY_MISMATCH };
+  }
+  // Receipt is the durable boundary. Do NOT make the delegate's MCP tool wait
+  // for provider admission: a wedged turn/steer used to keep delegation_reply
+  // running until the user pressed Stop. Timeline visibility is immediate and
+  // provider delivery continues through the durable retry outbox.
   emitDelegationReplyTimeline(received.record);
-  return deliverRecord(received.record);
+  startBackgroundDelivery(received.record);
+  return {
+    ok: true,
+    delivered: false,
+    pending: true,
+    reason: AGENT_DELEGATION_REPLY_ERRORS.DELIVERY_PENDING,
+  };
 }
 
 export function resumePendingDelegationReplies(): void {
