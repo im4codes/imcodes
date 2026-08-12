@@ -6,6 +6,7 @@ import {
   CRON_COMPLETION_POLICY,
   CRON_STATUS,
   normalizeCronCompletionPolicy,
+  normalizeCronExecutionDetail,
 } from '@shared/cron-types';
 import { BUILT_IN_MODES } from '@shared/p2p-modes';
 import type { SessionInfo } from '../types.js';
@@ -57,6 +58,12 @@ interface CrossJobExecution extends CronExecution {
   target_role: string;
   target_session_name?: string | null;
   action: string;
+}
+
+function normalizeExecution<T extends CronExecution>(execution: T): T {
+  if (typeof execution.detail !== 'string') return execution;
+  const detail = normalizeCronExecutionDetail(execution.detail);
+  return detail === execution.detail ? execution : { ...execution, detail };
 }
 
 interface SubSessionSlim {
@@ -282,7 +289,9 @@ export function CronManager({ serverId, projectName, sessions, subSessions = [],
     try {
       const q = effectiveShowAllServers ? `mode=${execMode}` : `mode=${execMode}&serverId=${encodeURIComponent(serverId)}`;
       const res = await apiFetch<{ executions: CrossJobExecution[] }>(scopedUrl(`/api/cron/executions?${q}`));
-      setCrossExecs(res.executions);
+      // Keep the browser compatible with an older server during rolling
+      // deploys, and immediately repair legacy rows already stored in history.
+      setCrossExecs(res.executions.map(normalizeExecution));
     } catch (err) {
       setError(String(err));
     } finally {
@@ -339,7 +348,7 @@ export function CronManager({ serverId, projectName, sessions, subSessions = [],
     if (!historyData[jobId]) {
       try {
         const res = await apiFetch<{ executions: CronExecution[] }>(scopedUrl(`/api/cron/${jobId}/executions?limit=20`));
-        setHistoryData(prev => ({ ...prev, [jobId]: res.executions }));
+        setHistoryData(prev => ({ ...prev, [jobId]: res.executions.map(normalizeExecution) }));
       } catch { /* ignore */ }
     }
   };

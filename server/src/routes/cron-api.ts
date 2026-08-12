@@ -14,6 +14,7 @@ import {
   CRON_COMPLETION_POLICY,
   CRON_STATUS,
   normalizeCronCompletionPolicy,
+  normalizeCronExecutionDetail,
 } from '../../../shared/cron-types.js';
 import { MEMORY_MCP_CAPS } from '../../../shared/memory-mcp-contracts.js';
 import { MEMORY_MCP_SOURCE_FIELDS, stripMemoryMcpSourceProvenance } from '../../../shared/memory-mcp-provenance.js';
@@ -135,6 +136,14 @@ async function withDefaultCronTimezone(
 
 function isWrongPodStickyServer(jobServerId: string, routeServerId: string | null): boolean {
   return routeServerId !== null && jobServerId !== routeServerId;
+}
+
+function normalizeCronExecutionRows<T extends Record<string, unknown>>(rows: T[]): T[] {
+  return rows.map((row) => {
+    if (typeof row.detail !== 'string') return row;
+    const detail = normalizeCronExecutionDetail(row.detail);
+    return detail === row.detail ? row : { ...row, detail };
+  });
 }
 
 function isDaemonServerTokenCronRequest(
@@ -756,7 +765,8 @@ cronApiRoutes.get('/executions', requireCronAuth(), async (c) => {
        ORDER BY j.id, e.created_at DESC`,
       [access.scope.ownerUserId, serverId, access.scope.projectName, access.scope.sharedTargetSessionNames, access.scope.sharedMainRole],
     );
-    return c.json({ executions: await filterCronRowsForSharedScope(c, access.scope, rows as Array<DbCronJob & Record<string, unknown>>) });
+    const visibleRows = await filterCronRowsForSharedScope(c, access.scope, rows as Array<DbCronJob & Record<string, unknown>>);
+    return c.json({ executions: normalizeCronExecutionRows(visibleRows) });
   }
 
   // mode=all: all executions sorted by time
@@ -775,7 +785,8 @@ cronApiRoutes.get('/executions', requireCronAuth(), async (c) => {
      LIMIT $6`,
     [access.scope.ownerUserId, serverId, access.scope.projectName, access.scope.sharedTargetSessionNames, access.scope.sharedMainRole, limit],
   );
-  return c.json({ executions: await filterCronRowsForSharedScope(c, access.scope, rows as Array<DbCronJob & Record<string, unknown>>) });
+  const visibleRows = await filterCronRowsForSharedScope(c, access.scope, rows as Array<DbCronJob & Record<string, unknown>>);
+  return c.json({ executions: normalizeCronExecutionRows(visibleRows) });
 });
 
 // GET /api/cron/:id/executions — execution history for a cron job
@@ -800,5 +811,5 @@ cronApiRoutes.get('/:id/executions', requireCronAuth(), async (c) => {
     'SELECT id, status, detail, created_at FROM cron_executions WHERE job_id = $1 ORDER BY created_at DESC LIMIT $2',
     [jobId, limit],
   );
-  return c.json({ executions });
+  return c.json({ executions: normalizeCronExecutionRows(executions as Array<Record<string, unknown>>) });
 });

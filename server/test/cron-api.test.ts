@@ -850,13 +850,20 @@ describe('Cron API routes', () => {
       // Seed executions
       mockDb.cronExecutions.push(
         { id: 'exec-1', job_id: 'job-exec', status: 'ok', detail: null, created_at: Date.now() - 5000 },
-        { id: 'exec-2', job_id: 'job-exec', status: 'error', detail: 'timeout', created_at: Date.now() },
+        {
+          id: 'exec-2',
+          job_id: 'job-exec',
+          status: 'error',
+          detail: ['execution', 'execution result', 'execution result is', 'execution result is a', 'execution result is a timeout'].join('\n'),
+          created_at: Date.now(),
+        },
       );
 
       const res = await app.request('/api/cron/job-exec/executions', { method: 'GET' });
       expect(res.status).toBe(200);
-      const body = await res.json() as { executions: unknown[] };
+      const body = await res.json() as { executions: Array<{ id: string; detail: string | null }> };
       expect(body.executions).toHaveLength(2);
+      expect(body.executions.find((execution) => execution.id === 'exec-2')?.detail).toBe('execution result is a timeout');
     });
 
     it('returns 403 when resolveServerRole is none', async () => {

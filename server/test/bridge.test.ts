@@ -6025,6 +6025,36 @@ describe('WsBridge', () => {
         ['busy', 'skipped_busy', 'exec-1'],
       );
     });
+
+    it('collapses cumulative streaming snapshots sent by an older daemon before persistence', async () => {
+      const execSpy = vi.fn(async () => ({ changes: 1 }));
+      const db = {
+        queryOne: async () => ({ token_hash: 'valid-hash' }),
+        query: async () => [],
+        execute: execSpy,
+        exec: async () => {},
+        close: () => {},
+      } as unknown as import('../src/db/client.js').Database;
+
+      const bridge = WsBridge.get(serverId);
+      const daemonWs = new MockWs();
+      bridge.handleDaemonConnection(daemonWs as never, db, {} as never);
+      daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'cron.command_result',
+        jobId: 'job-stream',
+        executionId: 'exec-stream',
+        detail: ['主人开始今日任务', '主人开始今日任务执行', '主人开始今日任务执行并检查', '主人开始今日任务执行并检查结果', '主人开始今日任务执行并检查结果完成。'].join('\n'),
+      }));
+      await flushAsync();
+
+      expect(execSpy).toHaveBeenCalledWith(
+        'UPDATE cron_executions SET detail = $1 WHERE id = $2',
+        ['主人开始今日任务执行并检查结果完成。', 'exec-stream'],
+      );
+    });
   });
 
   // ── Timeline history requestId unicast ────────────────────────────────────

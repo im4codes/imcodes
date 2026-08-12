@@ -121,6 +121,109 @@ export interface CronCommandResultMessage {
 
 // ── Job status ───────────────────────────────────────────────────────────
 
+// Older daemons persisted every cumulative `assistant.text` streaming snapshot
+// by joining them with newlines. Besides wasting space, the 4KB execution cap
+// could be exhausted before the terminal snapshot arrived. Recover the newest
+// snapshot only when the text contains a strong monotonic-prefix chain; normal
+// multiline output is returned byte-for-byte unchanged.
+const LEGACY_CRON_STREAM_MIN_PREFIX_SNAPSHOTS = 4;
+const LEGACY_CRON_STREAM_MIN_GROWTH_STEPS = 4;
+const LEGACY_CRON_STREAM_MIN_DISCARDED_CHARS = 32;
+const LEGACY_CRON_STREAM_MIN_FINAL_CHARS = 16;
+
+interface LegacyCronSnapshotChainScore {
+  snapshots: number;
+  growthSteps: number;
+}
+
+function findLegacyCronSnapshotChain(
+  source: string,
+  prefixEnd: number,
+  finalSnapshot: string,
+): LegacyCronSnapshotChainScore | null {
+  const memo = new Map<string, LegacyCronSnapshotChainScore | null>();
+
+  const visit = (start: number, previousLength: number): LegacyCronSnapshotChainScore | null => {
+    const key = `${start}:${previousLength}`;
+    if (memo.has(key)) return memo.get(key) ?? null;
+
+    let best: LegacyCronSnapshotChainScore | null = null;
+    let end = source.indexOf('\n', start);
+    while (end >= 0 && end <= prefixEnd) {
+      const snapshot = source.slice(start, end);
+      const length = snapshot.length;
+      if (
+        length > 0
+        && length >= previousLength
+        && length <= finalSnapshot.length
+        && finalSnapshot.startsWith(snapshot)
+      ) {
+        const tail = end === prefixEnd
+          ? { snapshots: 0, growthSteps: length < finalSnapshot.length ? 1 : 0 }
+          : visit(end + 1, length);
+        if (tail) {
+          const score = {
+            snapshots: tail.snapshots + 1,
+            growthSteps: tail.growthSteps + (previousLength >= 0 && length > previousLength ? 1 : 0),
+          };
+          if (
+            !best
+            || score.snapshots > best.snapshots
+            || (score.snapshots === best.snapshots && score.growthSteps > best.growthSteps)
+          ) {
+            best = score;
+          }
+        }
+      }
+      end = source.indexOf('\n', end + 1);
+    }
+
+    memo.set(key, best);
+    return best;
+  };
+
+  return visit(0, -1);
+}
+
+/**
+ * Collapse the legacy newline-joined cumulative stream format to its newest
+ * snapshot. This is intentionally conservative so ordinary Markdown, lists,
+ * logs, and repeated lines are not rewritten.
+ */
+export function normalizeCronExecutionDetail(detail: string): string {
+  if (!detail.includes('\n')) return detail;
+  const source = detail.includes('\r\n') ? detail.replace(/\r\n/g, '\n') : detail;
+  let best: { detail: string; score: LegacyCronSnapshotChainScore } | null = null;
+
+  let separator = source.indexOf('\n');
+  while (separator >= 0 && separator < source.length - 1) {
+    const finalSnapshot = source.slice(separator + 1);
+    const score = findLegacyCronSnapshotChain(source, separator, finalSnapshot);
+    if (
+      score
+      && score.snapshots >= LEGACY_CRON_STREAM_MIN_PREFIX_SNAPSHOTS
+      && score.growthSteps >= LEGACY_CRON_STREAM_MIN_GROWTH_STEPS
+      && separator >= LEGACY_CRON_STREAM_MIN_DISCARDED_CHARS
+      && finalSnapshot.length >= LEGACY_CRON_STREAM_MIN_FINAL_CHARS
+      && (
+        !best
+        || score.snapshots > best.score.snapshots
+        || (score.snapshots === best.score.snapshots && score.growthSteps > best.score.growthSteps)
+        || (
+          score.snapshots === best.score.snapshots
+          && score.growthSteps === best.score.growthSteps
+          && finalSnapshot.length > best.detail.length
+        )
+      )
+    ) {
+      best = { detail: finalSnapshot, score };
+    }
+    separator = source.indexOf('\n', separator + 1);
+  }
+
+  return best?.detail ?? detail;
+}
+
 export type CronJobStatus = 'active' | 'paused' | 'expired' | 'error';
 
 export const CRON_STATUS = {

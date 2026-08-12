@@ -20,6 +20,7 @@ import { MemoryRateLimiter } from './rate-limiter.js';
 import { randomHex, sha256Hex } from '../security/crypto.js';
 import { resolveServerRole } from '../security/authorization.js';
 import { DAEMON_MSG } from '../../../shared/daemon-events.js';
+import { CRON_MSG, normalizeCronExecutionDetail } from '../../../shared/cron-types.js';
 import { resolvePendingExec, resolvePendingExecChunk, abandonPriorGenerations } from './machine-exec-registry.js';
 import { resolvePendingComputerUse, abandonComputerUsePriorGenerations } from './computer-use-registry.js';
 import {
@@ -5124,10 +5125,12 @@ export class WsBridge {
     }
 
     // ── Cron command result: update execution detail with agent response ──
-    if (type === 'cron.command_result' && this.db) {
+    if (type === CRON_MSG.COMMAND_RESULT && this.db) {
       const { jobId, executionId, detail, status } = msg as { jobId: string; executionId?: string; detail: string; status?: string };
       if (jobId && detail) {
-        const params: unknown[] = [detail.slice(0, 4000)];
+        // Accept results from independently-upgraded older daemons without
+        // persisting their newline-joined cumulative streaming snapshots.
+        const params: unknown[] = [normalizeCronExecutionDetail(detail.slice(0, 4000))];
         let sql = '';
         if (executionId) {
           if (status) {

@@ -617,6 +617,34 @@ describe('CronManager', () => {
     expect(screen.getByText((text) => text.startsWith('Inspect the deployment') && text.endsWith('…'))).toBeDefined();
   });
 
+  it('shows only the latest snapshot for legacy cumulative execution output', async () => {
+    const snapshots = ['主人开始今日任务', '主人开始今日任务执行', '主人开始今日任务执行并检查', '主人开始今日任务执行并检查结果', '主人开始今日任务执行并检查结果完成。'];
+    apiFetch
+      .mockResolvedValueOnce({ jobs: [cronJob({ id: 'legacy-stream', name: 'Legacy stream' })] })
+      .mockResolvedValueOnce({
+        executions: [{
+          id: 'legacy-stream-exec',
+          status: 'dispatched',
+          detail: snapshots.join('\n'),
+          created_at: Date.now(),
+        }],
+      });
+
+    render(
+      <CronManager
+        serverId="srv-current"
+        projectName="cd"
+        sessions={sessions}
+        onBack={vi.fn()}
+      />,
+    );
+
+    expect(await screen.findByText('Legacy stream')).toBeDefined();
+    fireEvent.click(screen.getAllByText('cron.history').at(-1)!);
+    expect(await screen.findByText(snapshots.at(-1)!)).toBeDefined();
+    expect(screen.queryByText(snapshots.join('\n'))).toBeNull();
+  });
+
   it('loads cross-job executions and switches latest/all modes across servers', async () => {
     const onViewDiscussion = vi.fn();
     const onNavigateSession = vi.fn();
