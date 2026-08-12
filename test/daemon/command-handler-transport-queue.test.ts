@@ -5,7 +5,10 @@ import { join } from 'node:path';
 import { COMMAND_ACK_ERROR_DUPLICATE_COMMAND_ID } from '../../shared/ack-protocol.js';
 import { TRANSPORT_SESSION_AGENT_TYPES } from '../../shared/agent-types.js';
 import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
-import { TRANSPORT_QUEUE_COMMANDS } from '../../shared/transport-queue-types.js';
+import {
+  TRANSPORT_QUEUE_APPEND_MAX_ENTRIES,
+  TRANSPORT_QUEUE_COMMANDS,
+} from '../../shared/transport-queue-types.js';
 import {
   SESSION_CONTROL_TIMELINE_REASON_USER_CANCEL,
   SESSION_CONTROL_TIMELINE_STATE_STOPPING,
@@ -4123,6 +4126,37 @@ describe('handleWebCommand transport queue behavior', () => {
       type: 'command.ack',
       commandId: 'cmd-append-action',
       status: 'accepted',
+    }));
+  });
+
+  it('rejects an oversized active-turn append before invoking the runtime', async () => {
+    const appendPendingMessagesToActiveTurn = vi.fn();
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'route-transport',
+      appendPendingMessagesToActiveTurn,
+      sending: true,
+      pendingCount: 1,
+      pendingMessages: ['queued'],
+      pendingEntries: [{ clientMessageId: 'queued-1', text: 'queued' }],
+    });
+
+    handleWebCommand({
+      type: TRANSPORT_QUEUE_COMMANDS.APPEND_MESSAGES,
+      sessionName: 'deck_transport_brain',
+      clientMessageIds: Array.from(
+        { length: TRANSPORT_QUEUE_APPEND_MAX_ENTRIES + 1 },
+        (_, index) => `queued-${index}`,
+      ),
+      commandId: 'cmd-append-oversized',
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(appendPendingMessagesToActiveTurn).not.toHaveBeenCalled();
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'command.ack',
+      commandId: 'cmd-append-oversized',
+      status: 'error',
+      error: 'Invalid queued message selection',
     }));
   });
 

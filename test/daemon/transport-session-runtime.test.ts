@@ -451,6 +451,79 @@ describe('TransportSessionRuntime', () => {
     ]);
   });
 
+  it('rejects queued attachments without steering or removing them', async () => {
+    mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
+    mock.provider.notifyActiveDelegation = vi.fn().mockResolvedValue(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    runtime.send('foreground work', 'foreground-attachment');
+    await flushDispatch();
+    expect(runtime.send('image request', 'queued-attachment', [
+      { id: 'att-append', daemonPath: '/tmp/append.png', originalName: 'append.png', type: 'image' },
+    ])).toBe('queued');
+
+    const result = await runtime.appendPendingMessagesToActiveTurn(['queued-attachment'], 'append-attachment');
+
+    expect(result).toEqual({ status: 'attachments_unsupported' });
+    expect(mock.provider.notifyActiveDelegation).not.toHaveBeenCalled();
+    expect(runtime.pendingEntries).toEqual([expect.objectContaining({
+      clientMessageId: 'queued-attachment',
+      text: 'image request',
+      attachments: [expect.objectContaining({ id: 'att-append' })],
+    })]);
+    expect(getTransportQueueStore().readSnapshot('deck_test_brain').pendingMessageEntries).toEqual([
+      expect.objectContaining({ clientMessageId: 'queued-attachment', status: 'queued' }),
+    ]);
+  });
+
+  it('rejects queued slash controls without steering or removing them', async () => {
+    mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
+    mock.provider.notifyActiveDelegation = vi.fn().mockResolvedValue(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    runtime.send('foreground work', 'foreground-control');
+    await flushDispatch();
+    expect(runtime.send('/compact', 'queued-control')).toBe('queued');
+
+    const result = await runtime.appendPendingMessagesToActiveTurn(['queued-control'], 'append-control');
+
+    expect(result).toEqual({ status: 'control_unsupported' });
+    expect(mock.provider.notifyActiveDelegation).not.toHaveBeenCalled();
+    expect(runtime.pendingEntries).toEqual([{ clientMessageId: 'queued-control', text: '/compact' }]);
+    expect(getTransportQueueStore().readSnapshot('deck_test_brain').pendingMessageEntries).toEqual([
+      expect.objectContaining({ clientMessageId: 'queued-control', status: 'queued' }),
+    ]);
+  });
+
+  it('keeps an accepted append delivered when SQLite finalization fails', async () => {
+    mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
+    mock.provider.notifyActiveDelegation = vi.fn().mockResolvedValue(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    runtime.send('foreground work', 'foreground-finalize-failure');
+    await flushDispatch();
+    expect(runtime.send('accepted before sqlite fails', 'queued-finalize-failure')).toBe('queued');
+    const store = getTransportQueueStore();
+    const finalizeSpy = vi.spyOn(store, 'finalizeSentBatch').mockImplementation(() => {
+      throw new Error('sqlite unavailable');
+    });
+
+    const result = await runtime.appendPendingMessagesToActiveTurn(
+      ['queued-finalize-failure'],
+      'append-finalize-failure',
+    );
+
+    expect(finalizeSpy).toHaveBeenCalledTimes(2);
+    expect(result).toMatchObject({
+      status: 'delivered',
+      queueSnapshot: {
+        pendingMessageEntries: [],
+        degraded: true,
+        degradedReason: 'sqlite_finalize_failed_after_provider_delivery',
+      },
+      deliveryFacts: [expect.objectContaining({
+        clientMessageId: 'queued-finalize-failure',
+        deliveryFrameId: 'append-finalize-failure',
+      })],
+    });
+    expect(runtime.pendingEntries).toEqual([]);
+    expect(mock.provider.notifyActiveDelegation).toHaveBeenCalledOnce();
+  });
+
   it('restores the original FIFO before messages queued during a rejected append', async () => {
     mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
     mock.provider.notifyActiveDelegation = vi.fn(async () => {

@@ -2046,11 +2046,59 @@ export class TransportSessionRuntime implements SessionRuntime {
       for (const entry of historyEntries) entry.historyCommitted = true;
     }
 
-    const finalized = store.finalizeSentBatch(
-      this.sessionKey,
-      selected.map((entry) => entry.clientMessageId),
-      notificationId,
-    );
+    const selectedIds = selected.map((entry) => entry.clientMessageId);
+    let finalized: { snapshot: QueueSnapshot; deliveryFacts: QueueDeliveryFact[] };
+    try {
+      finalized = store.finalizeSentBatch(this.sessionKey, selectedIds, notificationId);
+    } catch (firstError) {
+      try {
+        // The transaction is idempotent (replace tombstone + delete by id), so
+        // one bounded retry safely repairs transient SQLite failures and the
+        // ambiguous "commit succeeded, snapshot read failed" case.
+        finalized = store.finalizeSentBatch(this.sessionKey, selectedIds, notificationId);
+      } catch (error) {
+        // Provider admission is irreversible. Once steer/priority-now accepted
+        // the text, a bookkeeping failure must not be reported as delivery
+        // failure: doing so makes the browser restore and resend work the model
+        // already received. Reconcile the public queue from runtime truth and
+        // emit delivery facts so every viewer settles the selected ids. The
+        // handoff rows deliberately remain non-replayable in SQLite; a later
+        // repair can finalize them without risking duplicate provider execution.
+        logger.warn(
+          { error, firstError, sessionKey: this.sessionKey, clientMessageIds: selectedIds, notificationId },
+          'transport queue sqlite finalizeSentBatch failed after active-turn append was accepted',
+        );
+        const selectedIdSet = new Set(selectedIds);
+        const persisted = store.readSnapshotSafely(this.sessionKey, 'active_turn_append_finalize_failed');
+        const pendingMessageVersion = Math.max(this._pendingVersion + 1, persisted.pendingMessageVersion);
+        const snapshot: QueueSnapshot = {
+          ...persisted,
+          pendingMessageVersion,
+          pendingMessageEntries: persisted.pendingMessageEntries.filter(
+            (entry) => !selectedIdSet.has(entry.clientMessageId),
+          ),
+          failedMessageEntries: persisted.failedMessageEntries.filter(
+            (entry) => !selectedIdSet.has(entry.clientMessageId),
+          ),
+          source: 'active_turn_append_finalize_failed',
+          degraded: true,
+          degradedReason: 'sqlite_finalize_failed_after_provider_delivery',
+        };
+        finalized = {
+          snapshot,
+          deliveryFacts: selectedIds.map((clientMessageId): QueueDeliveryFact => ({
+            type: 'transport.queue.delivery',
+            sessionName: this.sessionKey,
+            clientMessageId,
+            queueEpoch: snapshot.queueEpoch,
+            queueAuthorityId: snapshot.queueAuthorityId,
+            pendingMessageVersion,
+            deliveryFrameId: notificationId,
+            deliveryFrameVersion: pendingMessageVersion,
+          })),
+        };
+      }
+    }
     this._pendingVersion = Math.max(this._pendingVersion + 1, finalized.snapshot.pendingMessageVersion);
     return {
       status: 'delivered',

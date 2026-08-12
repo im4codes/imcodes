@@ -4632,6 +4632,39 @@ afterEach(() => {
     expect(screen.queryByText('restore after rejection')).toBeNull();
 
     await act(async () => {
+      // A newer authoritative snapshot can arrive while provider admission is
+      // pending. It omits the reserved row and adds a newly queued message;
+      // rollback must reconstruct the original prefix before that new tail.
+      ws.emit({
+        type: 'timeline.event',
+        event: {
+          eventId: 'append-inflight-queue-update',
+          sessionId: 'qwen-session',
+          type: 'session.state',
+          ts: Date.now(),
+          seq: 1,
+          epoch: 1,
+          source: 'daemon',
+          confidence: 'high',
+          payload: {
+            state: 'queued',
+            queueEpoch: 'queue-epoch-append',
+            queueAuthorityId: 'queue-authority-append',
+            pendingMessageVersion: 2,
+            pendingMessageEntries: [
+              { clientMessageId: 'msg-2', text: 'remains queued behind it', status: 'queued' },
+              { clientMessageId: 'msg-3', text: 'arrived during append', status: 'queued' },
+            ],
+          },
+        },
+      });
+    });
+    expect([...document.querySelectorAll('.controls-queued-item-text')].map((node) => node.textContent)).toEqual([
+      'remains queued behind it',
+      'arrived during append',
+    ]);
+
+    await act(async () => {
       ws.emit({
         type: 'command.ack',
         session: 'qwen-session',
@@ -4645,6 +4678,7 @@ afterEach(() => {
     expect([...document.querySelectorAll('.controls-queued-item-text')].map((node) => node.textContent)).toEqual([
       'restore after rejection',
       'remains queued behind it',
+      'arrived during append',
     ]);
     expect(screen.getByText('provider does not support append')).toBeDefined();
   });

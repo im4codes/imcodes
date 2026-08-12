@@ -2186,24 +2186,37 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                 for (const id of rollbackIds) next.delete(id);
                 return next;
               });
+              const rollbackQueueIds = new Set(rollback.queue.map((entry) => entry.clientMessageId));
+              const restoreAppendQueue = (source: LocalQueuedTransportEntry[]) => [
+                ...rollback.queue,
+                ...source.filter((entry) => !rollbackQueueIds.has(entry.clientMessageId)),
+              ];
+              const currentQueue = realtimeQueueStateRef.current;
+              // Keep the incoming/base order aligned with the optimistic
+              // rollback. Merely returning an ordered optimistic array is not
+              // enough: the merge map preserves the prior authoritative
+              // insertion order for ids that exist in both arrays.
+              setRealtimeQueueOverride({
+                sessionName,
+                entries: restoreAppendQueue(currentQueue.incomingQueuedTransportEntries),
+                version: currentQueue.incomingQueuedTransportVersion,
+              });
+              setOptimisticQueuedEntries((prev) => restoreAppendQueue(
+                prev ?? currentQueue.incomingQueuedTransportEntries,
+              ));
             }
-            setOptimisticQueuedEntries((prev) => {
-              const source = prev ?? realtimeQueueStateRef.current.incomingQueuedTransportEntries;
-              if (rollback.type === 'edit') {
-                return source.map((entry) => (
-                  entry.clientMessageId === rollback.entry.clientMessageId ? rollback.entry : entry
-                ));
-              }
-              const restoredEntries = rollback.type === 'append' ? rollback.entries : [rollback.entry];
-              if (rollback.type === 'append') {
-                const rollbackQueueIds = new Set(rollback.queue.map((entry) => entry.clientMessageId));
-                const entriesAddedAfterMutation = source.filter((entry) => !rollbackQueueIds.has(entry.clientMessageId));
-                return [...rollback.queue, ...entriesAddedAfterMutation];
-              }
-              const sourceIds = new Set(source.map((entry) => entry.clientMessageId));
-              const missing = restoredEntries.filter((entry) => !sourceIds.has(entry.clientMessageId));
-              return missing.length > 0 ? [...source, ...missing] : source;
-            });
+            if (rollback.type !== 'append') {
+              setOptimisticQueuedEntries((prev) => {
+                const source = prev ?? realtimeQueueStateRef.current.incomingQueuedTransportEntries;
+                if (rollback.type === 'edit') {
+                  return source.map((entry) => (
+                    entry.clientMessageId === rollback.entry.clientMessageId ? rollback.entry : entry
+                  ));
+                }
+                const sourceIds = new Set(source.map((entry) => entry.clientMessageId));
+                return sourceIds.has(rollback.entry.clientMessageId) ? source : [...source, rollback.entry];
+              });
+            }
             if (rollback.type === 'append') {
               showSendWarning(msg.error || transportQueueAppendFailedLabel);
             }
