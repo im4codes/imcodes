@@ -91,6 +91,18 @@ describe('human-readable machine references', () => {
     expect(parseMachineMarkers(reference)).toEqual(['win-1']);
   });
 
+  it.each([
+    ['missing', undefined],
+    ['blank', '   '],
+    ['control character', 'Office\nPC'],
+    ['bidirectional override', 'Office\u202ePC'],
+    ['over length', 'x'.repeat(121)],
+  ] as const)('falls back to the stable marker for a %s display note', (_label, displayName) => {
+    const reference = buildMachineComposerReference('win-1', displayName);
+    expect(reference).toBe('^^(win-1)');
+    expect(parseMachineMarkers(reference)).toEqual(['win-1']);
+  });
+
   it('inserts the annotated reference at the caret', () => {
     const execCommand = vi.fn(() => true);
     Object.defineProperty(document, 'execCommand', {
