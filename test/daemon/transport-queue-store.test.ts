@@ -125,6 +125,22 @@ describe('TransportQueueStore', () => {
     expect(JSON.stringify(snapshot)).not.toContain('messagePreamble');
   });
 
+  it('releases only the matching handoff back to the queued state', () => {
+    store.enqueue({ sessionName: 'deck', clientMessageId: 'msg-1', text: 'first', now: 100 });
+    store.enqueue({ sessionName: 'deck', clientMessageId: 'msg-2', text: 'second', now: 101 });
+    const handoff = store.markHandoffInFlight('deck', ['msg-1'], 60_000, 200);
+    expect(store.markHandoffInFlight('deck', ['msg-1'], 60_000, 201)).toEqual([]);
+
+    const unchanged = store.releaseHandoff('deck', 'wrong-handoff', ['msg-1'], 202);
+    expect(unchanged.pendingMessageEntries[0]?.status).toBe('handoff_inflight');
+
+    const released = store.releaseHandoff('deck', handoff[0]!.handoffId, ['msg-1'], 203);
+    expect(released.pendingMessageEntries).toEqual([
+      expect.objectContaining({ clientMessageId: 'msg-1', status: 'queued' }),
+      expect.objectContaining({ clientMessageId: 'msg-2', status: 'queued' }),
+    ]);
+  });
+
   it('recovers private dispatch material from SQLite and fails closed when it is missing', () => {
     store.enqueue({
       sessionName: 'deck',

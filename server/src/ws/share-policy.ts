@@ -23,6 +23,7 @@ import {
 import { REPO_MSG } from '../../../shared/repo-types.js';
 import { TIMELINE_MESSAGES } from '../../../shared/timeline-protocol.js';
 import { DIRECT_FILE_TRANSFER_MSG } from '../../../shared/direct-file-transfer.js';
+import { TRANSPORT_QUEUE_COMMANDS } from '../../../shared/transport-queue-types.js';
 
 export { shareTargetKey };
 export type { EffectiveCoverage, ShareTarget };
@@ -156,6 +157,7 @@ export const SHARE_WS_COMMAND_POLICY_INVENTORY: readonly ShareBridgeCommandInven
   { bridgeCommand: 'session.resize', sharedCommand: SHARE_BROWSER_COMMANDS.TERMINAL_RESIZE, policy: denyFromShared(SHARE_BROWSER_COMMANDS.TERMINAL_RESIZE) },
   { bridgeCommand: 'session.edit_queued_message', sharedCommand: SHARE_BROWSER_COMMANDS.QUEUE_EDIT, policy: denyFromShared(SHARE_BROWSER_COMMANDS.QUEUE_EDIT) },
   { bridgeCommand: 'session.undo_queued_message', sharedCommand: SHARE_BROWSER_COMMANDS.QUEUE_UNDO, policy: denyFromShared(SHARE_BROWSER_COMMANDS.QUEUE_UNDO) },
+  { bridgeCommand: TRANSPORT_QUEUE_COMMANDS.APPEND_MESSAGES, sharedCommand: SHARE_BROWSER_COMMANDS.QUEUE_APPEND, policy: denyFromShared(SHARE_BROWSER_COMMANDS.QUEUE_APPEND) },
   { bridgeCommand: 'subsession.start', sharedCommand: SHARE_BROWSER_COMMANDS.SUBSESSION_START, policy: denyFromShared(SHARE_BROWSER_COMMANDS.SUBSESSION_START) },
   { bridgeCommand: 'subsession.stop', sharedCommand: SHARE_BROWSER_COMMANDS.SUBSESSION_STOP, policy: denyFromShared(SHARE_BROWSER_COMMANDS.SUBSESSION_STOP) },
   { bridgeCommand: 'subsession.restart', sharedCommand: SHARE_BROWSER_COMMANDS.SUBSESSION_RESTART, policy: denyFromShared(SHARE_BROWSER_COMMANDS.SUBSESSION_RESTART) },

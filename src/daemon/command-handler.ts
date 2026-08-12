@@ -227,6 +227,10 @@ import { bindP2pCompiledWorkflow } from './p2p-workflow-bind.js';
 import { readP2pDiscussionWithOffset } from './p2p-workflow-discussion-offsets.js';
 import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
 import {
+  TRANSPORT_QUEUE_APPEND_MAX_ENTRIES,
+  TRANSPORT_QUEUE_COMMANDS,
+} from '../../shared/transport-queue-types.js';
+import {
   PEER_AUDIT_MESSAGES,
   decodePeerAuditCancelCommand,
   decodePeerAuditListCandidatesCommand,
@@ -1480,6 +1484,9 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
       break;
     case 'session.undo_queued_message':
       void handleUndoQueuedTransportMessage(cmd, serverLink);
+      break;
+    case TRANSPORT_QUEUE_COMMANDS.APPEND_MESSAGES:
+      void handleAppendQueuedTransportMessages(cmd, serverLink);
       break;
     case TIMELINE_MESSAGES.DELETE:
       void handleDeleteTimelineMessage(cmd, serverLink);
@@ -4739,6 +4746,87 @@ async function handleUndoQueuedTransportMessage(cmd: Record<string, unknown>, se
     }, { source: 'daemon', confidence: 'high' });
     timelineEmitter.emit(sessionName, 'command.ack', { commandId, status: 'accepted' });
     emitCommandAckReliable(serverLink, { commandId, sessionName, status: 'accepted' });
+  } finally {
+    release();
+  }
+}
+
+async function handleAppendQueuedTransportMessages(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
+  const sessionName = typeof cmd.sessionName === 'string' ? cmd.sessionName.trim() : '';
+  const commandId = typeof cmd.commandId === 'string' && cmd.commandId.trim()
+    ? cmd.commandId.trim()
+    : `append-queued-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const clientMessageIds = Array.isArray(cmd.clientMessageIds)
+    ? [...new Set(cmd.clientMessageIds.flatMap((value) => (
+        typeof value === 'string' && value.trim() ? [value.trim()] : []
+      )))]
+    : [];
+  const reject = (error: string): void => {
+    timelineEmitter.emit(sessionName, 'command.ack', { commandId, status: 'error', error });
+    emitCommandAckReliable(serverLink, { commandId, sessionName, status: 'error', error });
+  };
+  if (!sessionName || clientMessageIds.length === 0 || clientMessageIds.length > TRANSPORT_QUEUE_APPEND_MAX_ENTRIES) {
+    reject('Invalid queued message selection');
+    return;
+  }
+  const runtime = getTransportRuntime(sessionName);
+  const record = getSession(sessionName);
+  if (!runtime || record?.runtimeType !== 'transport') {
+    reject('Transport session unavailable');
+    return;
+  }
+
+  const release = await getMutex(sessionName).acquire();
+  try {
+    const result = await runtime.appendPendingMessagesToActiveTurn(clientMessageIds, commandId);
+    if (result.status !== 'delivered') {
+      const error = result.status === 'unsupported'
+        ? 'Active-turn append is not supported by this provider'
+        : result.status === 'attachments_unsupported'
+          ? 'Queued messages with attachments cannot be appended to an active turn'
+          : result.status === 'control_unsupported'
+            ? 'Queued control commands cannot be appended to an active turn'
+            : result.status === 'stale'
+              ? 'The active turn already finished'
+              : 'Queued message not found';
+      reject(error);
+      return;
+    }
+
+    for (const entry of result.entries) {
+      supervisionAutomation.removeQueuedTaskIntent(sessionName, entry.clientMessageId);
+      timelineEmitter.emit(
+        sessionName,
+        'user.message',
+        {
+          text: entry.text,
+          clientMessageId: entry.clientMessageId,
+          allowDuplicate: true,
+          // This row records an in-turn queue steer. It extends the currently
+          // supervised task and must not seed a second implicit run at idle.
+          queueAppended: true,
+          pendingMessageVersion: result.queueSnapshot.pendingMessageVersion,
+          ...(entry.sharedActor ? { sharedActor: entry.sharedActor } : {}),
+          ...(entry.aliasAudit ? { aliasAudit: entry.aliasAudit } : {}),
+        },
+        { source: 'daemon', confidence: 'high', eventId: `transport-user:${entry.clientMessageId}` },
+      );
+    }
+    for (const fact of result.deliveryFacts) {
+      timelineEmitter.emit(sessionName, 'transport.queue.delivery', { ...fact }, {
+        source: 'daemon',
+        confidence: 'high',
+      });
+    }
+    timelineEmitter.emit(sessionName, 'session.state', {
+      state: runtime.pendingCount > 0 ? 'queued' : (runtime.sending ? 'running' : 'idle'),
+      ...transportQueueSnapshotToPayload(result.queueSnapshot),
+    }, { source: 'daemon', confidence: 'high' });
+    timelineEmitter.emit(sessionName, 'command.ack', { commandId, status: 'accepted' });
+    emitCommandAckReliable(serverLink, { commandId, sessionName, status: 'accepted' });
+  } catch (error) {
+    logger.warn({ error, sessionName, clientMessageIds }, 'active-turn queue append failed');
+    reject('Failed to append queued messages');
   } finally {
     release();
   }

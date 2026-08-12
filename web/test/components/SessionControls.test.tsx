@@ -4542,6 +4542,113 @@ afterEach(() => {
     expect(screen.queryByText('2 queued · showing latest only')).toBeNull();
   });
 
+  it('appends one queued message into the active turn without cancelling it', () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({
+          name: 'qwen-session',
+          agentType: 'qwen',
+          runtimeType: 'transport',
+          state: 'running',
+          transportPendingMessageEntries: [
+            { clientMessageId: 'msg-1', text: 'append this' },
+            { clientMessageId: 'msg-2', text: 'leave this queued' },
+          ],
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    fireEvent.click(screen.getAllByRole('button', { name: 'transport_queue_append' })[0]);
+
+    expect(ws.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'session.append_queued_messages',
+      sessionName: 'qwen-session',
+      clientMessageIds: ['msg-1'],
+      commandId: expect.any(String),
+    }));
+    expect(ws.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'session.cancel' }));
+    expect(screen.queryByText('append this')).toBeNull();
+    expect(screen.getByText('leave this queued')).toBeDefined();
+  });
+
+  it('appends every queued message from the action beside Hide', () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({
+          name: 'qwen-session',
+          agentType: 'qwen',
+          runtimeType: 'transport',
+          state: 'running',
+          transportPendingMessageEntries: [
+            { clientMessageId: 'msg-1', text: 'first append' },
+            { clientMessageId: 'msg-2', text: 'second append' },
+          ],
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    const appendAll = screen.getByRole('button', { name: 'transport_queue_append_all' });
+    const hide = screen.getByRole('button', { name: 'hide' });
+    expect(appendAll.parentElement).toBe(hide.parentElement);
+    fireEvent.click(appendAll);
+
+    expect(ws.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'session.append_queued_messages',
+      sessionName: 'qwen-session',
+      clientMessageIds: ['msg-1', 'msg-2'],
+      commandId: expect.any(String),
+    }));
+    expect(screen.queryByText('first append')).toBeNull();
+    expect(screen.queryByText('second append')).toBeNull();
+  });
+
+  it('restores queued messages in their original order when an active-turn append is rejected', async () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({
+          name: 'qwen-session',
+          agentType: 'qwen',
+          runtimeType: 'transport',
+          state: 'running',
+          transportPendingMessageEntries: [
+            { clientMessageId: 'msg-1', text: 'restore after rejection' },
+            { clientMessageId: 'msg-2', text: 'remains queued behind it' },
+          ],
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    fireEvent.click(screen.getAllByRole('button', { name: 'transport_queue_append' })[0]);
+    const mutation = ws.send.mock.calls.at(-1)?.[0] as { commandId: string };
+    expect(screen.queryByText('restore after rejection')).toBeNull();
+
+    await act(async () => {
+      ws.emit({
+        type: 'command.ack',
+        session: 'qwen-session',
+        commandId: mutation.commandId,
+        status: 'error',
+        error: 'provider does not support append',
+      });
+    });
+
+    expect(screen.getByText('restore after rejection')).toBeDefined();
+    expect([...document.querySelectorAll('.controls-queued-item-text')].map((node) => node.textContent)).toEqual([
+      'restore after rejection',
+      'remains queued behind it',
+    ]);
+    expect(screen.getByText('provider does not support append')).toBeDefined();
+  });
+
   it('remembers queued transport message visibility per session and defaults to visible', () => {
     const runningSession = makeSession({
       name: 'qwen-session',

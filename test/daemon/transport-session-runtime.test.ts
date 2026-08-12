@@ -404,6 +404,74 @@ describe('TransportSessionRuntime', () => {
     expect(mock.provider.send).toHaveBeenCalledTimes(1);
   });
 
+  it('appends selected queued messages into the active turn without cancelling or draining the rest', async () => {
+    mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
+    mock.provider.notifyActiveDelegation = vi.fn().mockResolvedValue(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    runtime.send('foreground work', 'foreground-append');
+    await flushDispatch();
+    expect(runtime.send('append first', 'queued-append-1')).toBe('queued');
+    expect(runtime.send('leave second queued', 'queued-append-2')).toBe('queued');
+
+    const result = await runtime.appendPendingMessagesToActiveTurn(['queued-append-1'], 'append-command-1');
+
+    expect(result.status).toBe('delivered');
+    expect(mock.provider.notifyActiveDelegation).toHaveBeenCalledWith('sess-1', expect.objectContaining({
+      notificationId: 'append-command-1',
+      sourceSessionName: 'deck_test_brain',
+      text: 'append first',
+    }));
+    expect(mock.provider.cancel).not.toHaveBeenCalled();
+    expect(runtime.pendingEntries).toEqual([
+      { clientMessageId: 'queued-append-2', text: 'leave second queued' },
+    ]);
+    expect(getTransportQueueStore().readSnapshot('deck_test_brain').pendingMessageEntries).toEqual([
+      expect.objectContaining({ clientMessageId: 'queued-append-2', text: 'leave second queued' }),
+    ]);
+    if (result.status === 'delivered') {
+      expect(result.deliveryFacts).toEqual([
+        expect.objectContaining({ clientMessageId: 'queued-append-1', deliveryFrameId: 'append-command-1' }),
+      ]);
+    }
+  });
+
+  it('keeps queued messages intact when active-turn append is unsupported', async () => {
+    mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.UNSUPPORTED;
+    runtime.send('foreground work', 'foreground-unsupported');
+    await flushDispatch();
+    expect(runtime.send('stay queued', 'queued-unsupported')).toBe('queued');
+
+    const result = await runtime.appendPendingMessagesToActiveTurn(['queued-unsupported'], 'append-command-unsupported');
+
+    expect(result).toEqual({ status: 'unsupported' });
+    expect(runtime.pendingEntries).toEqual([
+      { clientMessageId: 'queued-unsupported', text: 'stay queued' },
+    ]);
+    expect(getTransportQueueStore().readSnapshot('deck_test_brain').pendingMessageEntries).toEqual([
+      expect.objectContaining({ clientMessageId: 'queued-unsupported', text: 'stay queued' }),
+    ]);
+  });
+
+  it('restores the original FIFO before messages queued during a rejected append', async () => {
+    mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
+    mock.provider.notifyActiveDelegation = vi.fn(async () => {
+      expect(runtime.send('arrived while appending', 'queued-during-append')).toBe('queued');
+      return AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE;
+    });
+    runtime.send('foreground work', 'foreground-restore-order');
+    await flushDispatch();
+    expect(runtime.send('append first', 'queued-restore-1')).toBe('queued');
+    expect(runtime.send('leave between', 'queued-restore-2')).toBe('queued');
+
+    const result = await runtime.appendPendingMessagesToActiveTurn(['queued-restore-1'], 'append-rejected');
+
+    expect(result).toEqual({ status: 'stale' });
+    expect(runtime.pendingEntries).toEqual([
+      { clientMessageId: 'queued-restore-1', text: 'append first' },
+      { clientMessageId: 'queued-restore-2', text: 'leave between' },
+      { clientMessageId: 'queued-during-append', text: 'arrived while appending' },
+    ]);
+  });
+
   it('starts a private continuation immediately when the origin runtime is idle', async () => {
     const mock = makeMockProvider();
     const runtime = new TransportSessionRuntime(mock.provider, 'deck_test_brain');

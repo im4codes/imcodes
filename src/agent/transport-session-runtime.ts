@@ -91,6 +91,7 @@ import logger from '../util/logger.js';
 import { incrementCounter } from '../util/metrics.js';
 import type { SharedActorEnvelope } from '../../shared/tab-sharing.js';
 import { getTransportQueueStore } from '../daemon/transport-queue-store.js';
+import type { QueueDeliveryFact, QueueSnapshot } from '../../shared/transport-queue-types.js';
 import type { PeerAuditCompletedTurnEvidence } from '../../shared/peer-audit.js';
 import {
   AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES,
@@ -135,6 +136,15 @@ export interface PendingTransportMessage {
     delegationId: string;
   };
 }
+
+export type AppendQueuedMessagesResult =
+  | {
+      status: 'delivered';
+      entries: PendingTransportMessage[];
+      queueSnapshot: QueueSnapshot;
+      deliveryFacts: QueueDeliveryFact[];
+    }
+  | { status: 'stale' | 'unsupported' | 'not_found' | 'attachments_unsupported' | 'control_unsupported' };
 
 type SdkTurnLostRecoveryAttemptStatus =
   | 'detected'
@@ -1933,6 +1943,121 @@ export class TransportSessionRuntime implements SessionRuntime {
     // the ordinary user FIFO.
     this.removePendingMessage(notification.notificationId);
     return AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE;
+  }
+
+  /**
+   * Steer selected ordinary queued messages into the provider's active turn.
+   * This deliberately reuses the same native, non-cancelling admission path as
+   * delegation replies, while retaining queue ids/tombstones for exactly-once
+   * UI reconciliation. Unsupported providers fail closed and keep the FIFO.
+   */
+  async appendPendingMessagesToActiveTurn(
+    clientMessageIds: string[],
+    notificationId: string,
+  ): Promise<AppendQueuedMessagesResult> {
+    const ids = [...new Set(clientMessageIds.map((id) => id.trim()).filter(Boolean))];
+    if (ids.length === 0 || !this._providerSessionId) return { status: 'not_found' };
+    if (!this.hasActiveTurnWork()) return { status: 'stale' };
+    if (this.provider.capabilities.activeDelegationNotification
+        !== AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE
+      || !this.provider.notifyActiveDelegation) {
+      return { status: 'unsupported' };
+    }
+
+    const idSet = new Set(ids);
+    const originalQueue = [...this._pendingMessages];
+    const selected = originalQueue.filter((entry) => idSet.has(entry.clientMessageId));
+    if (selected.length !== ids.length) return { status: 'not_found' };
+    if (selected.some((entry) => (entry.attachments?.length ?? 0) > 0)) {
+      return { status: 'attachments_unsupported' };
+    }
+    if (selected.some((entry) => entry.text.trim().startsWith('/'))) {
+      return { status: 'control_unsupported' };
+    }
+
+    const store = getTransportQueueStore();
+    const handoffs = store.markHandoffInFlight(this.sessionKey, selected.map((entry) => entry.clientMessageId));
+    if (handoffs.length !== selected.length) {
+      const handoffId = handoffs[0]?.handoffId;
+      if (handoffId) store.releaseHandoff(this.sessionKey, handoffId, handoffs.map((entry) => entry.entry.clientMessageId));
+      return { status: 'not_found' };
+    }
+    const handoffId = handoffs[0]!.handoffId;
+    const reservedVersion = this._pendingVersion + 1;
+    this._pendingMessages = originalQueue.filter((entry) => !idSet.has(entry.clientMessageId));
+    this._pendingVersion = reservedVersion;
+
+    const restoreReservation = (): void => {
+      if (this._pendingVersion === reservedVersion) {
+        this._pendingMessages = originalQueue;
+      } else {
+        const originalIds = new Set(originalQueue.map((entry) => entry.clientMessageId));
+        const entriesAddedWhileAwaitingAdmission = this._pendingMessages.filter(
+          (entry) => !originalIds.has(entry.clientMessageId),
+        );
+        // Restore the exact pre-admission FIFO, then retain any messages that
+        // arrived while the provider admission call was in flight. Prepending
+        // only the selected rows would reorder a failed partial append.
+        this._pendingMessages = [...originalQueue, ...entriesAddedWhileAwaitingAdmission];
+      }
+      try {
+        const snapshot = store.releaseHandoff(
+          this.sessionKey,
+          handoffId,
+          selected.map((entry) => entry.clientMessageId),
+        );
+        this._pendingVersion = Math.max(this._pendingVersion + 1, snapshot.pendingMessageVersion);
+      } catch (error) {
+        this._pendingVersion++;
+        logger.warn({ error, sessionKey: this.sessionKey, handoffId }, 'active-turn queue append handoff release failed');
+      }
+    };
+
+    let admission: AgentDelegationNotificationResult;
+    try {
+      admission = await this.provider.notifyActiveDelegation(this._providerSessionId, {
+        notificationId,
+        delegationId: `queue-append:${notificationId}`,
+        sourceSessionName: this.sessionKey,
+        text: selected.map((entry) => entry.providerText ?? entry.text).join('\n\n'),
+      });
+    } catch (error) {
+      restoreReservation();
+      throw error;
+    }
+    if (admission !== AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED) {
+      restoreReservation();
+      return {
+        status: admission === AGENT_DELEGATION_NOTIFICATION_RESULTS.UNSUPPORTED ? 'unsupported' : 'stale',
+      };
+    }
+
+    const historyEntries = selected.filter((entry) => !entry.historyCommitted);
+    if (historyEntries.length > 0) {
+      this._history.push({
+        id: randomUUID(),
+        sessionId: this._providerSessionId,
+        kind: 'text',
+        role: 'user',
+        content: historyEntries.map((entry) => entry.providerText ?? entry.text).join('\n\n'),
+        timestamp: Date.now(),
+        status: 'complete',
+      });
+      for (const entry of historyEntries) entry.historyCommitted = true;
+    }
+
+    const finalized = store.finalizeSentBatch(
+      this.sessionKey,
+      selected.map((entry) => entry.clientMessageId),
+      notificationId,
+    );
+    this._pendingVersion = Math.max(this._pendingVersion + 1, finalized.snapshot.pendingMessageVersion);
+    return {
+      status: 'delivered',
+      entries: selected.map((entry) => ({ ...entry })),
+      queueSnapshot: finalized.snapshot,
+      deliveryFacts: finalized.deliveryFacts,
+    };
   }
 
   /**

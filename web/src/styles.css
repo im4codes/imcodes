@@ -763,6 +763,12 @@ html.native-ios-mac .chat-dl-btn {
   justify-content: space-between;
   gap: 8px;
 }
+.controls-queued-header-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  flex-shrink: 0;
+}
 .controls-queued-toggle {
   border: none;
   background: transparent;
@@ -840,6 +846,8 @@ html.native-ios-mac .chat-dl-btn {
   padding: 0;
 }
 .controls-queued-action:hover { color: #fde68a; }
+.controls-queued-action-append { color: #67e8f9; }
+.controls-queued-action-append:hover { color: #a5f3fc; }
 .controls-queued-action-danger { color: #fda4af; }
 .controls-queued-action-danger:hover { color: #fecdd3; }
 .controls-queued-editing {

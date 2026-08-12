@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { COMMAND_ACK_ERROR_DUPLICATE_COMMAND_ID } from '../../shared/ack-protocol.js';
 import { TRANSPORT_SESSION_AGENT_TYPES } from '../../shared/agent-types.js';
 import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
+import { TRANSPORT_QUEUE_COMMANDS } from '../../shared/transport-queue-types.js';
 import {
   SESSION_CONTROL_TIMELINE_REASON_USER_CANCEL,
   SESSION_CONTROL_TIMELINE_STATE_STOPPING,
@@ -4048,6 +4049,81 @@ describe('handleWebCommand transport queue behavior', () => {
     );
     expect(stateCall?.[2]).not.toHaveProperty('pendingCount');
     expect(stateCall?.[2]).not.toHaveProperty('pendingMessages');
+  });
+
+  it('appends selected queued messages to the active turn and emits authoritative delivery facts', async () => {
+    const store = getTransportQueueStore();
+    store.enqueue({
+      sessionName: 'deck_transport_brain',
+      clientMessageId: 'cmd-append-1',
+      text: 'append now',
+      now: 100,
+    });
+    store.enqueue({
+      sessionName: 'deck_transport_brain',
+      clientMessageId: 'cmd-append-2',
+      text: 'leave queued',
+      now: 101,
+    });
+    const appendPendingMessagesToActiveTurn = vi.fn(async (ids: string[], notificationId: string) => {
+      const finalized = store.finalizeSentBatch('deck_transport_brain', ids, notificationId, 200);
+      return {
+        status: 'delivered' as const,
+        entries: [{ clientMessageId: 'cmd-append-1', text: 'append now' }],
+        queueSnapshot: finalized.snapshot,
+        deliveryFacts: finalized.deliveryFacts,
+      };
+    });
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'route-transport',
+      appendPendingMessagesToActiveTurn,
+      sending: true,
+      pendingCount: 1,
+      pendingMessages: ['leave queued'],
+      pendingEntries: [{ clientMessageId: 'cmd-append-2', text: 'leave queued' }],
+    });
+
+    handleWebCommand({
+      type: TRANSPORT_QUEUE_COMMANDS.APPEND_MESSAGES,
+      sessionName: 'deck_transport_brain',
+      clientMessageIds: ['cmd-append-1'],
+      commandId: 'cmd-append-action',
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(appendPendingMessagesToActiveTurn).toHaveBeenCalledWith(['cmd-append-1'], 'cmd-append-action');
+    expect(removeQueuedTaskIntentMock).toHaveBeenCalledWith('deck_transport_brain', 'cmd-append-1');
+    expect(emitMock).toHaveBeenCalledWith(
+      'deck_transport_brain',
+      'user.message',
+      expect.objectContaining({
+        text: 'append now',
+        clientMessageId: 'cmd-append-1',
+        queueAppended: true,
+        pendingMessageVersion: expect.any(Number),
+      }),
+      expect.objectContaining({ eventId: 'transport-user:cmd-append-1' }),
+    );
+    expect(emitMock).toHaveBeenCalledWith(
+      'deck_transport_brain',
+      'transport.queue.delivery',
+      expect.objectContaining({ clientMessageId: 'cmd-append-1', deliveryFrameId: 'cmd-append-action' }),
+      expect.any(Object),
+    );
+    expect(emitMock).toHaveBeenCalledWith(
+      'deck_transport_brain',
+      'session.state',
+      expect.objectContaining({
+        state: 'queued',
+        pendingMessageEntries: [expect.objectContaining({ clientMessageId: 'cmd-append-2' })],
+      }),
+      expect.any(Object),
+    );
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'command.ack',
+      commandId: 'cmd-append-action',
+      status: 'accepted',
+    }));
   });
 
   it('deduplicates concurrent session.restart requests for the same transport session', async () => {

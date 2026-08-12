@@ -57,7 +57,10 @@ import { patchSession, patchSessionSupervision, patchSubSession } from '../api.j
 import { isImeComposingKeyEvent } from '../ime-keyboard.js';
 import { deriveSessionLiveStatus, isRunningSessionState } from '../session-live-status.js';
 import { DAEMON_MSG } from '@shared/daemon-events.js';
-import { TRANSPORT_QUEUE_DELIVERY_EVENT_TYPE } from '@shared/transport-queue-types.js';
+import {
+  TRANSPORT_QUEUE_COMMANDS,
+  TRANSPORT_QUEUE_DELIVERY_EVENT_TYPE,
+} from '@shared/transport-queue-types.js';
 import { MSG_COMMAND_FAILED } from '@shared/ack-protocol.js';
 import { FS_READ_ERROR_CODES } from '@shared/fs-read-error-codes.js';
 import {
@@ -1196,7 +1199,10 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const [realtimeQueueOverride, setRealtimeQueueOverride] = useState<RealtimeTransportQueueOverride | null>(null);
   const lastRealtimeEmptyQueueSnapshotRef = useRef<{ sessionName: string; version?: number; observedAtMs: number } | null>(null);
   const failedQueuedCommandIdsRef = useRef<Set<string>>(new Set());
-  const queuedMutationRollbackRef = useRef<Map<string, { type: 'edit' | 'undo'; entry: LocalQueuedTransportEntry }>>(new Map());
+  const queuedMutationRollbackRef = useRef<Map<string,
+    | { type: 'edit' | 'undo'; entry: LocalQueuedTransportEntry }
+    | { type: 'append'; entries: LocalQueuedTransportEntry[]; queue: LocalQueuedTransportEntry[] }
+  >>(new Map());
   // Command ids that have reached the timeline (a `user.message` event) and are
   // therefore NO LONGER queued — the timeline is the authoritative truth for
   // "delivered". The displayed queue filters these out so a delivered message
@@ -1368,6 +1374,9 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     return raw;
   }, [t]);
   const queuedTransportMessages = queuedTransportEntries.map((entry) => entry.text);
+  const appendableQueuedTransportEntries = queuedTransportEntries.filter((entry) => (
+    entry.status !== 'failed' && entry.status !== 'sending'
+  ));
   const queuedTransportLatestMessage = queuedTransportMessages[queuedTransportMessages.length - 1] ?? '';
   const editingQueuedEntry = editingQueuedMessageId
     ? queuedTransportEntries.find((entry) => entry.clientMessageId === editingQueuedMessageId) ?? null
@@ -1582,6 +1591,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       setSendWarning(null);
     }, 5000);
   }, []);
+  const transportQueueAppendFailedLabel = t('session.transport_queue_append_failed');
 
   // Persist input draft across unmount/remount (sub-session minimize/restore)
   const [hydratedAttachmentDraftKey, setHydratedAttachmentDraftKey] = useState<string | null>(null);
@@ -2168,6 +2178,14 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                 next.delete(rollback.entry.clientMessageId);
                 return next;
               });
+            } else if (rollback.type === 'append') {
+              const rollbackIds = new Set(rollback.entries.map((entry) => entry.clientMessageId));
+              setOptimisticallyRemovedQueuedIds((prev) => {
+                if (![...rollbackIds].some((id) => prev.has(id))) return prev;
+                const next = new Set(prev);
+                for (const id of rollbackIds) next.delete(id);
+                return next;
+              });
             }
             setOptimisticQueuedEntries((prev) => {
               const source = prev ?? realtimeQueueStateRef.current.incomingQueuedTransportEntries;
@@ -2176,9 +2194,19 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                   entry.clientMessageId === rollback.entry.clientMessageId ? rollback.entry : entry
                 ));
               }
-              if (source.some((entry) => entry.clientMessageId === rollback.entry.clientMessageId)) return source;
-              return [...source, rollback.entry];
+              const restoredEntries = rollback.type === 'append' ? rollback.entries : [rollback.entry];
+              if (rollback.type === 'append') {
+                const rollbackQueueIds = new Set(rollback.queue.map((entry) => entry.clientMessageId));
+                const entriesAddedAfterMutation = source.filter((entry) => !rollbackQueueIds.has(entry.clientMessageId));
+                return [...rollback.queue, ...entriesAddedAfterMutation];
+              }
+              const sourceIds = new Set(source.map((entry) => entry.clientMessageId));
+              const missing = restoredEntries.filter((entry) => !sourceIds.has(entry.clientMessageId));
+              return missing.length > 0 ? [...source, ...missing] : source;
             });
+            if (rollback.type === 'append') {
+              showSendWarning(msg.error || transportQueueAppendFailedLabel);
+            }
             queuedMutationRollbackRef.current.delete(msg.commandId);
           } else {
             markLocalQueuedEntry(msg.commandId, 'failed');
@@ -2259,7 +2287,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       }
     };
     return ws.onMessage(handleRealtimeQueueMessage);
-  }, [activeSession?.name, ws]);
+  }, [activeSession?.name, showSendWarning, transportQueueAppendFailedLabel, ws]);
 
   // Reset P2P mode on session change
   useEffect(() => { setP2pMode('solo'); setP2pOpen(false); }, [activeSession?.name]);
@@ -3704,7 +3732,10 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     return commandId;
   }, [activeSession, cancelActiveTransportTurn, effectiveRuntimeType, makeCommandId, serverId, showStopFeedback, ws]);
 
-  const sendQueuedMessageMutation = useCallback((type: 'session.edit_queued_message' | 'session.undo_queued_message', payload: Record<string, unknown>) => {
+  const sendQueuedMessageMutation = useCallback((
+    type: 'session.edit_queued_message' | 'session.undo_queued_message' | typeof TRANSPORT_QUEUE_COMMANDS.APPEND_MESSAGES,
+    payload: Record<string, unknown>,
+  ) => {
     if (!ws || !activeSession) return false;
     const commandId = globalThis.crypto?.randomUUID?.() ?? `cmd-${Date.now()}-${Math.random().toString(16).slice(2)}`;
     ws.send({
@@ -3888,6 +3919,36 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       return new Set([...prev, entry.clientMessageId]);
     });
   }, [editingQueuedMessageId, incomingQueuedTransportEntries, isEditableQueuedEntry, publishComposerText, sendQueuedMessageMutation]);
+
+  const handleQueuedMessagesAppend = useCallback((entries: LocalQueuedTransportEntry[]) => {
+    const appendable = entries.filter((entry) => (
+      entry.status !== 'failed' && entry.status !== 'sending' && isEditableQueuedEntry(entry)
+    ));
+    if (appendable.length === 0) return;
+    let mutationCommandId: string | false = false;
+    try {
+      mutationCommandId = sendQueuedMessageMutation(TRANSPORT_QUEUE_COMMANDS.APPEND_MESSAGES, {
+        clientMessageIds: appendable.map((entry) => entry.clientMessageId),
+      });
+    } catch {
+      mutationCommandId = false;
+    }
+    if (!mutationCommandId) {
+      showSendWarning(transportQueueAppendFailedLabel);
+      return;
+    }
+    queuedMutationRollbackRef.current.set(mutationCommandId, {
+      type: 'append',
+      entries: appendable.map((entry) => ({ ...entry, status: 'queued' })),
+      queue: queuedTransportEntries.map((entry) => ({ ...entry })),
+    });
+    const appendIds = new Set(appendable.map((entry) => entry.clientMessageId));
+    setOptimisticQueuedEntries((prev) => {
+      const source = prev ?? incomingQueuedTransportEntries;
+      return source.filter((entry) => !appendIds.has(entry.clientMessageId));
+    });
+    setOptimisticallyRemovedQueuedIds((prev) => new Set([...prev, ...appendIds]));
+  }, [incomingQueuedTransportEntries, isEditableQueuedEntry, queuedTransportEntries, sendQueuedMessageMutation, showSendWarning, transportQueueAppendFailedLabel]);
 
   const handleQueuedMessageRetry = useCallback((entry: LocalQueuedTransportEntry) => {
     if (entry.status !== 'failed') return;
@@ -6495,9 +6556,20 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           <div class="controls-queued-hint" role="status" aria-live="polite">
             <div class="controls-queued-header">
               <div>{t('session.transport_send_queued')}</div>
-              <button type="button" class="controls-queued-toggle" onClick={toggleQueuedHintExpanded}>
-                {t('common.hide')}
-              </button>
+              <span class="controls-queued-header-actions">
+                {appendableQueuedTransportEntries.length > 0 && (
+                  <button
+                    type="button"
+                    class="controls-queued-toggle"
+                    onClick={() => handleQueuedMessagesAppend(appendableQueuedTransportEntries)}
+                  >
+                    {t('session.transport_queue_append_all')}
+                  </button>
+                )}
+                <button type="button" class="controls-queued-toggle" onClick={toggleQueuedHintExpanded}>
+                  {t('common.hide')}
+                </button>
+              </span>
             </div>
             <div class="controls-queued-list">
               {queuedTransportEntries.map((entry) => {
@@ -6534,9 +6606,16 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                           {t('chat.retrySend', 'Retry')}
                         </button>
                       ) : (
-                        <button type="button" class="controls-queued-action" onClick={() => handleQueuedMessageEdit(entry)}>
-                          {t('settings.edit')}
-                        </button>
+                        <>
+                          {entry.status !== 'sending' && (
+                            <button type="button" class="controls-queued-action controls-queued-action-append" onClick={() => handleQueuedMessagesAppend([entry])}>
+                              {t('session.transport_queue_append')}
+                            </button>
+                          )}
+                          <button type="button" class="controls-queued-action" onClick={() => handleQueuedMessageEdit(entry)}>
+                            {t('settings.edit')}
+                          </button>
+                        </>
                       )}
                       <button type="button" class="controls-queued-action controls-queued-action-danger" onClick={() => handleQueuedMessageDelete(entry)}>
                         {t('common.delete')}
