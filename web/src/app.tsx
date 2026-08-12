@@ -5061,7 +5061,7 @@ export function App() {
   }
 
   return (
-    <div class="layout" key={selectedServerId ?? ''}>
+    <div class={`layout${isMobile ? ' layout-mobile' : ''}`} key={selectedServerId ?? ''}>
       {showSharedReturnGuide && sharedReturnServer && selectedShareTarget && (
         <aside
           class="shared-return-guide"

@@ -596,6 +596,20 @@ describe('styles.css regression contracts', () => {
     expect(nameRule![0]).toMatch(/white-space:\s*nowrap/);
   });
 
+  it('mobile shell chrome does not depend solely on the narrow viewport breakpoint', () => {
+    const mobileLayoutBarRule = css.match(/\.layout-mobile\s+\.mobile-server-bar\s*\{[^}]*\}/);
+    expect(mobileLayoutBarRule).not.toBeNull();
+    expect(mobileLayoutBarRule![0]).toMatch(/display:\s*flex/);
+
+    const mobileLayoutToggleRule = css.match(/\.layout-mobile\s+\.mobile-sidebar-toggle\s*\{[^}]*\}/);
+    expect(mobileLayoutToggleRule).not.toBeNull();
+    expect(mobileLayoutToggleRule![0]).toMatch(/display:\s*block/);
+
+    const mobileLayoutSidebarRule = css.match(/\.layout-mobile\s+\.sidebar\s*\{[^}]*\}/);
+    expect(mobileLayoutSidebarRule).not.toBeNull();
+    expect(mobileLayoutSidebarRule![0]).toMatch(/display:\s*none/);
+  });
+
   it('Shared Context management keeps the sci-fi chrome styling hooks', () => {
     const app = readFileSync(resolve(__dirname, '../src/app.tsx'), 'utf8');
     expect(app).toContain('className="shared-context-floating-panel"');

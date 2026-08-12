@@ -1031,9 +1031,11 @@ describe('App shell', () => {
     await waitFor(() => expect(panelZ()).toBeGreaterThan(subZ()));
   }, 20_000);
 
-  it('opens controlled-node management from the mobile server menu', async () => {
+  it('keeps the mobile server menu available on wide-viewport Android browsers', async () => {
     const originalUserAgent = navigator.userAgent;
-    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
+    const originalInnerWidth = window.innerWidth;
+    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'Android' });
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 800 });
 
     try {
       localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
@@ -1044,6 +1046,7 @@ describe('App shell', () => {
       const view = render(<App />);
 
       await waitFor(() => expect(wsInstances.length).toBe(1));
+      expect(view.container.querySelector('.layout')?.classList.contains('layout-mobile')).toBe(true);
       fireEvent.click(view.container.querySelector('.mobile-server-btn')!);
 
       const controlledNodesButton = await screen.findByRole('button', { name: 'controlled_nodes.title' });
@@ -1055,6 +1058,7 @@ describe('App shell', () => {
       expect(view.container.querySelector('.mobile-server-menu')).toBeNull();
     } finally {
       Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
+      Object.defineProperty(window, 'innerWidth', { configurable: true, value: originalInnerWidth });
     }
   }, 20_000);
 
