@@ -49,6 +49,11 @@ describe('controlled-node executable release wiring', () => {
     expect(workerBuild.indexOf("scripts\\resolve-windows-driver-kit.ps1"))
       .toBeLessThan(workerBuild.indexOf('gclient sync'));
     expect(workerBuild).toContain('DriverKitBin = $WindowsDriverKitBin');
+    expect(workerBuild).toContain(
+      '$ArtifactRoot = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($ArtifactRoot)',
+    );
+    expect(workerBuild.indexOf('GetUnresolvedProviderPathFromPSPath($ArtifactRoot)'))
+      .toBeLessThan(workerBuild.indexOf('Push-Location $WebRtcRoot'));
     expect(displayBuild).toContain("scripts\\resolve-windows-driver-kit.ps1");
     expect(driverKitResolver).toContain("Join-Path $_.FullName 'x86\\inf2cat.exe'");
     expect(driverKitResolver).toContain("Join-Path $_.FullName 'x64\\signtool.exe'");

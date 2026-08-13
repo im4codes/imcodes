@@ -22,6 +22,7 @@ $TargetDirectory = Join-Path $WebRtcRoot 'third_party\imcodes_remote_desktop'
 $BuildDirectory = Join-Path $WebRtcRoot 'out\imcodes_remote_desktop'
 $RootBuildPath = Join-Path $WebRtcRoot 'BUILD.gn'
 $RootBuildOriginal = $null
+$ArtifactRoot = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($ArtifactRoot)
 $ExpectedSources = @(
   'BUILD.gn',
   'display_capture.cc', 'display_capture.h', 'display_capture_unittest.cc',
