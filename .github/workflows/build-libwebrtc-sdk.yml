@@ -1,0 +1,137 @@
+name: build-libwebrtc-sdk
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_commit:
+        description: Full source commit represented by this immutable SDK
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-libwebrtc-sdk-windows-x64
+  cancel-in-progress: false
+
+env:
+  NODE_VERSION_PRIMARY: '24'
+
+jobs:
+  build:
+    name: Build fixed Windows libwebrtc SDK
+    runs-on: windows-2022
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION_PRIMARY }}
+          cache: npm
+      - name: Install dependencies
+        shell: bash
+        run: ./scripts/ci-npm-ci.sh .
+      - name: Restore pinned depot_tools and CIPD bootstrap
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/imcodes-webrtc/depot_tools
+          key: imcodes-depot-tools-windows-2022-a1bda5b6167435ad0666191f0353f242104f5845-v1
+      - name: Import Windows release-signing certificate
+        shell: powershell
+        env:
+          IMCODES_WINDOWS_SIGNING_PFX_BASE64: ${{ secrets.IMCODES_WINDOWS_SIGNING_PFX_BASE64 }}
+          IMCODES_WINDOWS_SIGNING_PFX_PASSWORD: ${{ secrets.IMCODES_WINDOWS_SIGNING_PFX_PASSWORD }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:IMCODES_WINDOWS_SIGNING_PFX_BASE64) -or
+              [string]::IsNullOrWhiteSpace($env:IMCODES_WINDOWS_SIGNING_PFX_PASSWORD)) {
+            throw 'Windows release-signing secrets are required.'
+          }
+          $pfxPath = Join-Path $env:RUNNER_TEMP 'imcodes-windows-release-signing.pfx'
+          [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:IMCODES_WINDOWS_SIGNING_PFX_BASE64))
+          $password = ConvertTo-SecureString $env:IMCODES_WINDOWS_SIGNING_PFX_PASSWORD -AsPlainText -Force
+          $certificate = Import-PfxCertificate -FilePath $pfxPath -CertStoreLocation Cert:\CurrentUser\My -Password $password
+          if (-not $certificate -or -not $certificate.HasPrivateKey) { throw 'Imported signing certificate has no private key.' }
+          Remove-Item -LiteralPath $pfxPath -Force
+          $publicCertificatePath = Join-Path $env:RUNNER_TEMP 'imcodes-windows-release-signing.cer'
+          Export-Certificate -Cert $certificate -FilePath $publicCertificatePath -Force | Out-Null
+          Import-Certificate -FilePath $publicCertificatePath -CertStoreLocation Cert:\LocalMachine\TrustedPeople | Out-Null
+          Import-Certificate -FilePath $publicCertificatePath -CertStoreLocation Cert:\LocalMachine\TrustedPublisher | Out-Null
+          "IMCODES_WINDOWS_SIGNING_CERT_THUMBPRINT=$($certificate.Thumbprint)" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+          $sha256 = [Security.Cryptography.SHA256]::Create()
+          try { $signerSha256 = [BitConverter]::ToString($sha256.ComputeHash($certificate.RawData)).Replace('-', '').ToLowerInvariant() } finally { $sha256.Dispose() }
+          "IMCODES_WINDOWS_SIGNING_CERT_SHA256=$signerSha256" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Build and test pinned production media stack once
+        shell: powershell
+        run: |
+          $arguments = @{
+            CheckoutRoot = "$env:RUNNER_TEMP\imcodes-webrtc"
+            ArtifactRoot = 'dist-node-exe\remote-desktop-worker\win32-x64'
+            Jobs = 4
+            WorkerVersion = '0.0.0-sdk'
+            CodeSigningCertificateThumbprint = $env:IMCODES_WINDOWS_SIGNING_CERT_THUMBPRINT
+            CodeSigningTimestampUrl = 'http://timestamp.digicert.com'
+            RequireAuthenticodeSignature = $true
+            RunNativeTests = $true
+          }
+          & .\native\windows-remote-desktop\build-worker.ps1 @arguments
+      - name: Package immutable libwebrtc SDK and lock
+        shell: powershell
+        run: |
+          node scripts/publish-libwebrtc-sdk.mjs `
+            dist-node-exe `
+            sdk-release `
+            '${{ inputs.source_commit }}'
+          node scripts/libwebrtc-sdk-artifacts.mjs verify-lock sdk-release/libwebrtc-sdk.lock.json sdk-release/imcodes-libwebrtc-sdk-windows-x64.zip
+          $lock = Get-Content -LiteralPath sdk-release\libwebrtc-sdk.lock.json -Raw | ConvertFrom-Json
+          "release_tag=$($lock.releaseTag)" | Out-File $env:GITHUB_OUTPUT -Encoding utf8 -Append
+        id: sdk
+      - name: Verify every SDK binary uses the release publisher
+        shell: powershell
+        run: |
+          $sdk = Join-Path $env:RUNNER_TEMP 'imcodes-libwebrtc-sdk-verify'
+          Expand-Archive -LiteralPath sdk-release\imcodes-libwebrtc-sdk-windows-x64.zip -DestinationPath $sdk -Force
+          node scripts/libwebrtc-sdk-artifacts.mjs verify-lock `
+            sdk-release/libwebrtc-sdk.lock.json `
+            sdk-release/imcodes-libwebrtc-sdk-windows-x64.zip `
+            $sdk
+          $driver = Join-Path $env:RUNNER_TEMP 'imcodes-libwebrtc-sdk-driver-verify'
+          Expand-Archive -LiteralPath (Join-Path $sdk 'imcodes-virtual-display.zip') -DestinationPath $driver -Force
+          foreach ($artifact in @(
+              (Join-Path $sdk 'imcodes-remote-desktop-worker.exe'),
+              (Join-Path $driver 'imcodes-virtual-display.dll'),
+              (Join-Path $driver 'imcodes-virtual-display.cat'))) {
+            & .\scripts\windows-sign-release-artifact.ps1 -Mode Verify -ArtifactPath $artifact -ExpectedSignerSha256 $env:IMCODES_WINDOWS_SIGNING_CERT_SHA256
+          }
+      - name: Upload immutable SDK candidate and repository lock
+        uses: actions/upload-artifact@v4
+        with:
+          name: libwebrtc-sdk-candidate-${{ steps.sdk.outputs.release_tag }}
+          path: |
+            sdk-release/imcodes-libwebrtc-sdk-windows-x64.zip
+            sdk-release/libwebrtc-sdk.lock.json
+          if-no-files-found: error
+          retention-days: 30
+      - name: Remove Windows release-signing material
+        if: always()
+        shell: powershell
+        run: |
+          $certificatePaths = @()
+          if ($env:IMCODES_WINDOWS_SIGNING_CERT_THUMBPRINT) {
+            $certificatePaths = @(
+              "Cert:\CurrentUser\My\$env:IMCODES_WINDOWS_SIGNING_CERT_THUMBPRINT",
+              "Cert:\LocalMachine\TrustedPeople\$env:IMCODES_WINDOWS_SIGNING_CERT_THUMBPRINT",
+              "Cert:\LocalMachine\TrustedPublisher\$env:IMCODES_WINDOWS_SIGNING_CERT_THUMBPRINT"
+            )
+          }
+          foreach ($certificatePath in $certificatePaths) {
+            Remove-Item -LiteralPath $certificatePath -Force -ErrorAction SilentlyContinue
+          }
+          Remove-Item -LiteralPath (Join-Path $env:RUNNER_TEMP 'imcodes-windows-release-signing.pfx') -Force -ErrorAction SilentlyContinue
+          Remove-Item -LiteralPath (Join-Path $env:RUNNER_TEMP 'imcodes-windows-release-signing.cer') -Force -ErrorAction SilentlyContinue
+          $materialPaths = @(
+            (Join-Path $env:RUNNER_TEMP 'imcodes-windows-release-signing.pfx'),
+            (Join-Path $env:RUNNER_TEMP 'imcodes-windows-release-signing.cer')
+          )
+          $leftovers = @(($certificatePaths + $materialPaths) | Where-Object { Test-Path -LiteralPath $_ })
+          if ($leftovers.Count -gt 0) { throw 'Windows release-signing material cleanup was incomplete.' }

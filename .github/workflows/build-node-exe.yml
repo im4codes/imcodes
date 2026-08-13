@@ -92,44 +92,28 @@ jobs:
           "IMCODES_WINDOWS_SIGNING_CERT_SHA256=$signerSha256" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       - name: Build controlled-node executable
         run: npm run build:node-exe
-      - name: Resolve Windows native cache identity and preflight WDK
+      - name: Resolve fixed libwebrtc SDK release
         if: runner.os == 'Windows'
-        id: windows_native_cache
+        id: libwebrtc_sdk
+        run: node scripts/resolve-libwebrtc-sdk-release.mjs
+      - name: Download and materialize fixed libwebrtc SDK
+        if: runner.os == 'Windows'
         shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          $identity = (& .\scripts\resolve-windows-native-cache-identity.ps1).Trim()
-          "identity=$identity" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-      - name: Restore incremental WebRTC build
-        if: runner.os == 'Windows'
-        id: webrtc_build_cache
-        continue-on-error: true
-        uses: actions/cache/restore@v4
-        with:
-          path: ${{ runner.temp }}/imcodes-webrtc/src/out/imcodes_remote_desktop
-          key: imcodes-webrtc-build-${{ steps.windows_native_cache.outputs.identity }}-x64-f20ebb8adbf4fa781830e4384c61f732bd28a217-gn-v2
-      - name: Build and test production remote-desktop worker
-        if: runner.os == 'Windows'
-        timeout-minutes: 180
-        shell: powershell
-        run: |
-          $buildArguments = @{
-            CheckoutRoot = "$env:RUNNER_TEMP\imcodes-webrtc"
-            ArtifactRoot = 'dist-node-exe\remote-desktop-worker\win32-x64'
-            Jobs = 4
-            WorkerVersion = $env:IMCODES_BUILD_VERSION
-            CodeSigningCertificateThumbprint = $env:IMCODES_WINDOWS_SIGNING_CERT_THUMBPRINT
-            CodeSigningTimestampUrl = 'http://timestamp.digicert.com'
-            RequireAuthenticodeSignature = $true
-            RunNativeTests = $true
-          }
-          & .\native\windows-remote-desktop\build-worker.ps1 @buildArguments
-      - name: Save incremental WebRTC build
-        if: runner.os == 'Windows' && steps.webrtc_build_cache.outputs.cache-hit != 'true'
-        continue-on-error: true
-        uses: actions/cache/save@v4
-        with:
-          path: ${{ runner.temp }}/imcodes-webrtc/src/out/imcodes_remote_desktop
-          key: imcodes-webrtc-build-${{ steps.windows_native_cache.outputs.identity }}-x64-f20ebb8adbf4fa781830e4384c61f732bd28a217-gn-v2
+          $download = Join-Path $env:RUNNER_TEMP 'imcodes-libwebrtc-sdk-download'
+          New-Item -ItemType Directory -Force -Path $download | Out-Null
+          gh release download '${{ steps.libwebrtc_sdk.outputs.release_tag }}' `
+            --repo '${{ steps.libwebrtc_sdk.outputs.repository }}' `
+            --pattern '${{ steps.libwebrtc_sdk.outputs.asset_name }}' `
+            --dir $download `
+            --clobber
+          if ($LASTEXITCODE -ne 0) { throw 'Fixed libwebrtc SDK download failed.' }
+          node scripts/install-libwebrtc-sdk.mjs `
+            (Join-Path $download '${{ steps.libwebrtc_sdk.outputs.asset_name }}') `
+            dist-node-exe `
+            $env:IMCODES_BUILD_VERSION
       - name: Verify production remote-desktop worker artifact
         if: runner.os == 'Windows'
         run: node scripts/remote-desktop-worker-artifacts.mjs verify dist-node-exe "${{ env.IMCODES_BUILD_VERSION }}"
