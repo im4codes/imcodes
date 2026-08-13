@@ -84,6 +84,7 @@ const {
   getProviderMock,
   ensureProviderConnectedMock,
   getPresetModelCatalogMock,
+  lookupAttachmentMock,
 } = vi.hoisted(() => ({
   getSessionMock: vi.fn(),
   upsertSessionMock: vi.fn(),
@@ -136,6 +137,7 @@ const {
   getProviderMock: vi.fn(),
   ensureProviderConnectedMock: vi.fn(),
   getPresetModelCatalogMock: vi.fn(),
+  lookupAttachmentMock: vi.fn(() => undefined),
 }));
 
 vi.mock('../../src/store/session-store.js', () => ({
@@ -243,7 +245,7 @@ vi.mock('../../src/daemon/file-transfer-handler.js', () => ({
   createProjectFileHandle: vi.fn(),
   createProjectFileHandleFromValidatedPath: vi.fn(),
   tryCreateProjectFileHandle: vi.fn(),
-  lookupAttachment: vi.fn(() => undefined),
+  lookupAttachment: lookupAttachmentMock,
 }));
 
 vi.mock('../../src/daemon/preview-relay.js', () => ({
@@ -509,6 +511,8 @@ describe('handleWebCommand transport queue behavior', () => {
     getProviderMock.mockReset();
     ensureProviderConnectedMock.mockReset();
     getPresetModelCatalogMock.mockReset();
+    lookupAttachmentMock.mockReset();
+    lookupAttachmentMock.mockReturnValue(undefined);
     __resetTransportListModelsCacheForTests();
     clearAllTransportQueueRevisions();
     resetTransportQueueStoreForTests();
@@ -1758,6 +1762,73 @@ describe('handleWebCommand transport queue behavior', () => {
       expect.objectContaining({ state: 'queued' }),
       expect.anything(),
     );
+  });
+
+  it('injects a numbered temporary-upload reminder for the agent without changing the transport timeline', async () => {
+    const send = vi.fn(() => 'sent');
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'route-transport',
+      send,
+      pendingCount: 0,
+    });
+    lookupAttachmentMock.mockImplementation((daemonPath: string) => {
+      if (daemonPath !== '/tmp/a.png' && daemonPath !== '/tmp/b.pdf') return undefined;
+      return {
+        id: daemonPath,
+        daemonPath,
+        source: 'upload',
+        expiresAt: Date.now() + 60_000,
+      };
+    });
+    const text = '#1:(/tmp/a.png) #2:(/tmp/b.pdf) compare #1 and #2';
+
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_transport_brain',
+      text,
+      commandId: 'cmd-upload-retention-transport',
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(send).toHaveBeenCalledWith(
+      text,
+      'cmd-upload-retention-transport',
+      undefined,
+      '#1, #2 expire in 24h. Copy to keep.',
+    );
+    const userMessage = emitMock.mock.calls.find(([session, type, payload]) => (
+      session === 'deck_transport_brain'
+      && type === 'user.message'
+      && (payload as { commandId?: string } | undefined)?.commandId === 'cmd-upload-retention-transport'
+    ));
+    expect(userMessage?.[2]).toMatchObject({ text });
+    expect(JSON.stringify(userMessage?.[2] ?? '')).not.toContain('Copy to keep');
+  });
+
+  it('injects no upload reminder when numbered paths are not live registered uploads', async () => {
+    const send = vi.fn(() => 'sent');
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'route-transport',
+      send,
+      pendingCount: 0,
+    });
+    lookupAttachmentMock.mockImplementation((daemonPath: string) => ({
+      id: daemonPath,
+      daemonPath,
+      source: daemonPath.includes('local') ? 'local' : 'upload',
+      expiresAt: daemonPath.includes('expired') ? 0 : Date.now() + 60_000,
+    }));
+    const text = '#1:(/tmp/local.txt) #2:(/tmp/expired.txt) inspect these';
+
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_transport_brain',
+      text,
+      commandId: 'cmd-no-upload-retention',
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(send).toHaveBeenCalledWith(text, 'cmd-no-upload-retention');
   });
 
   it('emits ordinary send ack synchronously before the first async delivery boundary', async () => {
@@ -3128,6 +3199,49 @@ describe('handleWebCommand transport queue behavior', () => {
     // Anchor stays plaintext-free.
     expect(JSON.stringify(entry?.aliasAudit)).not.toContain('prod.example.com');
     expect(JSON.stringify(entry?.aliasAudit)).not.toContain('read replica only');
+  });
+
+  it('carries the numbered-upload reminder through the offline resend queue', async () => {
+    const { clearAllResend, getResendEntries } = await import('../../src/daemon/transport-resend-queue.js');
+    clearAllResend();
+    getSessionMock.mockReturnValue({
+      name: 'deck_transport_brain',
+      projectName: 'transport',
+      role: 'brain',
+      agentType: 'claude-code-sdk',
+      runtimeType: 'transport',
+      providerId: 'claude-code-sdk',
+      state: 'idle',
+    });
+    getTransportRuntimeMock.mockReturnValue(undefined);
+    lookupAttachmentMock.mockReturnValue({
+      id: 'offline.png',
+      daemonPath: '/tmp/offline.png',
+      source: 'upload',
+      expiresAt: Date.now() + 60_000,
+    });
+    const text = '#1:(/tmp/offline.png) inspect #1';
+
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_transport_brain',
+      text,
+      commandId: 'cmd-offline-upload-retention',
+    }, serverLink as any);
+    await flushAsync();
+
+    const entry = getResendEntries('deck_transport_brain')
+      .find((candidate) => candidate.commandId === 'cmd-offline-upload-retention');
+    expect(entry).toMatchObject({
+      text,
+      messagePreamble: '#1 expires in 24h. Copy to keep.',
+    });
+    const userMessages = emitMock.mock.calls.filter(([session, type, payload]) => (
+      session === 'deck_transport_brain'
+      && type === 'user.message'
+      && (payload as { commandId?: string } | undefined)?.commandId === 'cmd-offline-upload-retention'
+    ));
+    expect(userMessages).toHaveLength(0);
   });
 
   it('carries the anchor on the missing-providerSessionId branch too', async () => {

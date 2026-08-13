@@ -573,6 +573,39 @@ function prepareProcessPreferenceProviderText(input: {
   return prependPreferenceProviderContext(input.providerText, context);
 }
 
+const TAGGED_ATTACHMENT_REFERENCE_RE = /#(\d+):\(([^)\r\n]+)\)/g;
+
+/**
+ * Build a short, agent-only retention reminder for the numbered upload
+ * references that are actually registered on this daemon. The browser writes
+ * the mapping into the message as `#N:(daemonPath)`; validating the path here
+ * prevents arbitrary user text from manufacturing a reminder for a file that
+ * is not one of this message's live temporary uploads.
+ */
+function buildAttachmentRetentionPreamble(text: string, now = Date.now()): string | undefined {
+  const labels: string[] = [];
+  const seen = new Set<string>();
+  for (const match of text.matchAll(TAGGED_ATTACHMENT_REFERENCE_RE)) {
+    const sequence = match[1];
+    const daemonPath = match[2];
+    if (!sequence || !daemonPath) continue;
+    const entry = lookupAttachment(daemonPath);
+    if (!entry || entry.source !== 'upload' || entry.expiresAt <= now) continue;
+    const label = `#${sequence}`;
+    if (seen.has(label)) continue;
+    seen.add(label);
+    labels.push(label);
+  }
+  if (labels.length === 0) return undefined;
+  if (labels.length === 1) return `${labels[0]} expires in 24h. Copy to keep.`;
+  return `${labels.join(', ')} expire in 24h. Copy to keep.`;
+}
+
+function mergeAgentMessagePreambles(...parts: Array<string | undefined>): string | undefined {
+  const resolved = parts.map((part) => part?.trim()).filter((part): part is string => !!part);
+  return resolved.join('\n\n') || undefined;
+}
+
 /**
  * Tolerant normalizer for the launch-payload `dedicatedExecutionRouting` field
  * (task 2.7 daemon receive-end). Returns the run-level routing object
@@ -3858,6 +3891,11 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     userId: preferenceUserId,
     currentRecords: preferenceIngest.records,
   });
+  const attachmentRetentionPreamble = buildAttachmentRetentionPreamble(displayText);
+  const agentMessagePreamble = mergeAgentMessagePreambles(
+    preferenceMessagePreamble,
+    attachmentRetentionPreamble,
+  );
   schedulePreferencePersistence({
     userId: preferenceUserId,
     commandId: effectiveId,
@@ -3899,7 +3937,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       // offline-queued send still delivers the alias VALUE to the provider on
       // reconnect while the timeline records nothing about what was delivered.
       ...(aliasAudit ? { aliasAudit } : {}),
-      ...(preferenceMessagePreamble ? { messagePreamble: preferenceMessagePreamble } : {}),
+      ...(agentMessagePreamble ? { messagePreamble: agentMessagePreamble } : {}),
       ...(sharedActor ? { sharedActor } : {}),
       commandId: effectiveId,
       ...(inboundClientMessageId ? { clientMessageId: inboundClientMessageId } : {}),
@@ -3989,7 +4027,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       // Same reason as the no-runtime branch above: the anchor must accompany
       // the expansion, or this delivery lands unauditable.
       ...(aliasAudit ? { aliasAudit } : {}),
-      ...(preferenceMessagePreamble ? { messagePreamble: preferenceMessagePreamble } : {}),
+      ...(agentMessagePreamble ? { messagePreamble: agentMessagePreamble } : {}),
       ...(sharedActor ? { sharedActor } : {}),
       commandId: effectiveId,
       ...(inboundClientMessageId ? { clientMessageId: inboundClientMessageId } : {}),
@@ -4381,20 +4419,20 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
             ...(aliasAudit ? { aliasAudit } : {}),
           }
         : undefined;
-      const result = preferenceMessagePreamble
+      const result = agentMessagePreamble
         ? (sendMetadata
             ? transportRuntime.send(
               displayText,
               effectiveId,
               attachments.length > 0 ? attachments : undefined,
-              preferenceMessagePreamble,
+              agentMessagePreamble,
               sendMetadata,
             )
             : transportRuntime.send(
               displayText,
               effectiveId,
               attachments.length > 0 ? attachments : undefined,
-              preferenceMessagePreamble,
+              agentMessagePreamble,
             ))
         : (attachments.length > 0
             ? (sendMetadata
@@ -4520,6 +4558,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   try {
     await sendProcessSessionMessage(sessionName, finalText, attachments, {
       originalText: displayText,
+      ...(attachmentRetentionPreamble ? { agentMessagePreamble: attachmentRetentionPreamble } : {}),
       commandId: effectiveId,
       isLegacy,
       ackAlreadySent: receiptAcked,
@@ -4574,6 +4613,8 @@ async function sendProcessSessionMessage(
     serverLink?: Pick<ServerLink, 'send'>;
     /** RV-C non-displayed audit anchor for an alias-bearing send (no plaintext). */
     aliasAudit?: AliasSendAudit;
+    /** Per-turn agent-only context that must never be projected to the timeline. */
+    agentMessagePreamble?: string;
     /** Trusted daemon-owned metadata for automation surfaces such as P2P.
      * Values are projected only to the local user.message event. */
     userMessageMetadata?: Readonly<{
@@ -4636,6 +4677,11 @@ async function sendProcessSessionMessage(
     memoryRecallCancelled = true;
     rollbackSummarySyncReservation(memoryContext.summaryReservation);
     logger.warn({ sessionName, timeoutMs: PROCESS_MEMORY_RECALL_DEADLINE_MS, err: recallErr }, 'memory recall skipped — sending without memory injection');
+  }
+
+  const agentMessagePreamble = options?.agentMessagePreamble?.trim();
+  if (agentMessagePreamble) {
+    sendText = `${agentMessagePreamble}\n\n${sendText}`;
   }
 
   // ── Step 3: Serialize only the actual stdin write ──────────────────────────

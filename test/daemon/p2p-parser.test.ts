@@ -20,6 +20,7 @@ vi.mock('../../src/store/session-store.js', () => ({
 
 const getSavedP2pConfigMock = vi.fn();
 const upsertSavedP2pConfigMock = vi.fn();
+const lookupAttachmentMock = vi.hoisted(() => vi.fn(() => undefined));
 vi.mock('../../src/store/p2p-config-store.js', () => ({
   getSavedP2pConfig: (...args: unknown[]) => getSavedP2pConfigMock(...args),
   upsertSavedP2pConfig: (...args: unknown[]) => upsertSavedP2pConfigMock(...args),
@@ -101,7 +102,7 @@ vi.mock('../../src/daemon/file-transfer-handler.js', () => ({
   createProjectFileHandle: vi.fn(),
   createProjectFileHandleFromValidatedPath: vi.fn(),
   tryCreateProjectFileHandle: vi.fn(),
-  lookupAttachment: vi.fn(() => undefined),
+  lookupAttachment: lookupAttachmentMock,
 }));
 
 vi.mock('../../src/context/memory-search.js', () => ({
@@ -290,6 +291,8 @@ describe('structured P2P routing via WS fields', () => {
     vi.clearAllMocks();
     getSavedP2pConfigMock.mockResolvedValue(undefined);
     upsertSavedP2pConfigMock.mockResolvedValue(undefined);
+    lookupAttachmentMock.mockReset();
+    lookupAttachmentMock.mockReturnValue(undefined);
     (listP2pRuns as ReturnType<typeof vi.fn>).mockReturnValue([]);
     (startP2pRun as ReturnType<typeof vi.fn>).mockResolvedValue({ id: 'run-1' });
   });
@@ -780,6 +783,42 @@ describe('structured P2P routing via WS fields', () => {
       else process.env.IMCODES_TEST_REFS_DIR = originalRefsDir;
       await rm(homeDir, { recursive: true, force: true });
     }
+  });
+
+  it('injects the singular numbered-upload reminder only into the process agent input', async () => {
+    lookupAttachmentMock.mockImplementation((daemonPath: string) => {
+      if (daemonPath !== '/tmp/report.pdf') return undefined;
+      return {
+        id: 'report.pdf',
+        daemonPath,
+        source: 'upload',
+        expiresAt: Date.now() + 60_000,
+      };
+    });
+    const { timelineEmitter } = await import('../../src/daemon/timeline-emitter.js');
+    const emitMock = (timelineEmitter as unknown as { emit: ReturnType<typeof vi.fn> }).emit;
+    const text = '#1:(/tmp/report.pdf) summarize #1';
+
+    handleWebCommand({
+      type: 'session.send',
+      sessionName: 'deck_proj_brain',
+      text,
+      commandId: 'cmd-process-upload-retention',
+    }, mockServerLink as any);
+
+    await vi.waitFor(() => expect(sendKeysDelayedEnter).toHaveBeenCalled());
+    const sentText = String(vi.mocked(sendKeysDelayedEnter).mock.calls.at(-1)?.[1] ?? '');
+    expect(sentText).toContain('#1 expires in 24h. Copy to keep.');
+    expect(sentText.match(/#1 expires in 24h\. Copy to keep\./g)).toHaveLength(1);
+    expect(sentText).toContain(text);
+
+    const userMessage = emitMock.mock.calls.find(([session, type, payload]) => (
+      session === 'deck_proj_brain'
+      && type === 'user.message'
+      && (payload as { commandId?: string } | undefined)?.commandId === 'cmd-process-upload-retention'
+    ));
+    expect(userMessage?.[2]).toMatchObject({ text });
+    expect(JSON.stringify(userMessage?.[2] ?? '')).not.toContain('Copy to keep');
   });
 
 
