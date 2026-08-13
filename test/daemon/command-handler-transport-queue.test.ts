@@ -4081,9 +4081,12 @@ describe('handleWebCommand transport queue behavior', () => {
       providerSessionId: 'route-transport',
       appendPendingMessagesToActiveTurn,
       sending: true,
-      pendingCount: 1,
-      pendingMessages: ['leave queued'],
-      pendingEntries: [{ clientMessageId: 'cmd-append-2', text: 'leave queued' }],
+      pendingCount: 2,
+      pendingMessages: ['append now', 'leave queued'],
+      pendingEntries: [
+        { clientMessageId: 'cmd-append-1', text: 'append now' },
+        { clientMessageId: 'cmd-append-2', text: 'leave queued' },
+      ],
     });
 
     handleWebCommand({
@@ -4129,7 +4132,7 @@ describe('handleWebCommand transport queue behavior', () => {
     }));
   });
 
-  it('waits for an in-flight send to register before appending its optimistic queue row', async () => {
+  it('waits for an optimistic queue row even when append arrives before its matching send', async () => {
     enablePreferenceFeature();
     let releasePreferenceLoad!: (value: unknown[]) => void;
     listContextObservationsMock.mockImplementationOnce(() => new Promise((resolve) => {
@@ -4172,6 +4175,14 @@ describe('handleWebCommand transport queue behavior', () => {
       },
     });
 
+    // Exercise the harder ordering: the append frame reaches the daemon before
+    // session.send has installed its in-flight barrier or registered the row.
+    handleWebCommand({
+      type: TRANSPORT_QUEUE_COMMANDS.APPEND_MESSAGES,
+      sessionName: 'deck_transport_brain',
+      clientMessageIds: ['cmd-sync-race'],
+      commandId: 'cmd-sync-race-append',
+    }, serverLink as any);
     handleWebCommand({
       type: 'session.send',
       sessionName: 'deck_transport_brain',
@@ -4179,12 +4190,6 @@ describe('handleWebCommand transport queue behavior', () => {
       commandId: 'cmd-sync-race',
       origin: 'user_keyboard',
       userId: 'user-1',
-    }, serverLink as any);
-    handleWebCommand({
-      type: TRANSPORT_QUEUE_COMMANDS.APPEND_MESSAGES,
-      sessionName: 'deck_transport_brain',
-      clientMessageIds: ['cmd-sync-race'],
-      commandId: 'cmd-sync-race-append',
     }, serverLink as any);
 
     await flushAsync();

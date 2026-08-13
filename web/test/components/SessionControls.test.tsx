@@ -4675,6 +4675,71 @@ afterEach(() => {
     expect(notice.classList.contains('queue-append-success-toast')).toBe(true);
   });
 
+  it('offers immediate append for a locally queued message before daemon synchronization', () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeTransportSession({
+          name: 'qwen-session',
+          agentType: 'qwen',
+          state: 'running',
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.textContent = 'append before daemon echo';
+    fireEvent.input(input);
+    fireEvent.keyDown(input, { key: 'Enter', shiftKey: false });
+    const send = gatherSendCalls(ws).at(-1);
+    expect(send?.commandId).toEqual(expect.any(String));
+
+    const append = screen.getByRole('button', { name: 'transport_queue_append' });
+    fireEvent.click(append);
+
+    expect(ws.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'session.append_queued_messages',
+      sessionName: 'qwen-session',
+      clientMessageIds: [send?.commandId],
+    }));
+    expect(gatherCancelCalls(ws)).toEqual([]);
+  });
+
+  it('keeps Stop in append mode while a local queue row is still synchronizing', () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeTransportSession({
+          name: 'qwen-session',
+          agentType: 'qwen',
+          state: 'running',
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.textContent = 'stop must append immediately';
+    fireEvent.input(input);
+    fireEvent.keyDown(input, { key: 'Enter', shiftKey: false });
+    const send = gatherSendCalls(ws).at(-1);
+
+    const stop = screen.getByRole('button', { name: /^stop$/i });
+    expect(within(stop).getByText('1')).toBeDefined();
+    fireEvent.pointerDown(stop);
+    fireEvent.click(stop);
+
+    expect(ws.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'session.append_queued_messages',
+      sessionName: 'qwen-session',
+      clientMessageIds: [send?.commandId],
+    }));
+    expect(gatherCancelCalls(ws)).toEqual([]);
+  });
+
   it('uses Stop to cancel when there are no appendable queued messages', () => {
     const ws = makeWs();
     render(

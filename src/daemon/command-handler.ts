@@ -363,7 +363,8 @@ import {
 import { getProvider } from '../agent/provider-registry.js';
 
 const MAX_P2P_FILE_PULL_COUNT = 20;
-const TRANSPORT_QUEUE_SEND_SYNC_WAIT_MS = 3_000;
+const TRANSPORT_QUEUE_SEND_SYNC_WAIT_MS = 15_000;
+const TRANSPORT_QUEUE_SEND_SYNC_POLL_MS = 25;
 
 interface InFlightSessionSend {
   settled: Promise<void>;
@@ -422,23 +423,37 @@ async function waitForSelectedSessionSends(
   sessionName: string,
   clientMessageIds: readonly string[],
 ): Promise<void> {
-  const pending = [...new Set(clientMessageIds.flatMap((clientMessageId) => {
-    const tracked = inFlightSessionSends.get(inFlightSessionSendKey(sessionName, clientMessageId));
-    return tracked ? [tracked.settled] : [];
-  }))];
-  if (pending.length === 0) return;
+  const ids = [...new Set(clientMessageIds)];
+  const deadline = Date.now() + TRANSPORT_QUEUE_SEND_SYNC_WAIT_MS;
 
-  await new Promise<void>((resolve) => {
-    let done = false;
-    const finish = (): void => {
-      if (done) return;
-      done = true;
-      clearTimeout(timer);
-      resolve();
-    };
-    const timer = setTimeout(finish, TRANSPORT_QUEUE_SEND_SYNC_WAIT_MS);
-    void Promise.all(pending).then(finish);
-  });
+  // Do not rely solely on an already-populated inFlightSessionSends entry.
+  // Browser and bridge frames can briefly overtake each other, so an append
+  // may reach the daemon before the matching session.send has even installed
+  // its barrier. Polling runtime truth while also observing known send
+  // promises closes both orderings without exposing a transient not_found to
+  // the user. The wait is bounded so genuinely stale client ids still fail.
+  while (Date.now() < deadline) {
+    const runtime = getTransportRuntime(sessionName);
+    if (runtime) {
+      const queuedIds = new Set((runtime.pendingEntries ?? []).map((entry) => entry.clientMessageId));
+      if (ids.every((id) => queuedIds.has(id))) return;
+    }
+
+    const pending = [...new Set(ids.flatMap((clientMessageId) => {
+      const tracked = inFlightSessionSends.get(inFlightSessionSendKey(sessionName, clientMessageId));
+      return tracked ? [tracked.settled] : [];
+    }))];
+    const waitMs = Math.min(
+      TRANSPORT_QUEUE_SEND_SYNC_POLL_MS,
+      Math.max(0, deadline - Date.now()),
+    );
+    if (waitMs <= 0) return;
+
+    await Promise.race([
+      ...(pending.length > 0 ? [Promise.all(pending).then(() => undefined)] : []),
+      new Promise<void>((resolve) => setTimeout(resolve, waitMs)),
+    ]);
+  }
 }
 
 const processRecallRepositoryIdentityService = new GitOriginRepositoryIdentityService();

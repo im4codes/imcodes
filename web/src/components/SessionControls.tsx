@@ -1375,7 +1375,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   }, [t]);
   const queuedTransportMessages = queuedTransportEntries.map((entry) => entry.text);
   const appendableQueuedTransportEntries = queuedTransportEntries.filter((entry) => (
-    entry.status !== 'failed' && entry.status !== 'sending'
+    entry.status !== 'failed'
   ));
   const queuedTransportLatestMessage = queuedTransportMessages[queuedTransportMessages.length - 1] ?? '';
   const editingQueuedEntry = editingQueuedMessageId
@@ -3947,7 +3947,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
 
   const handleQueuedMessagesAppend = useCallback((entries: LocalQueuedTransportEntry[]): boolean => {
     const appendable = entries.filter((entry) => (
-      entry.status !== 'failed' && entry.status !== 'sending' && isEditableQueuedEntry(entry)
+      entry.status !== 'failed' && isEditableQueuedEntry(entry)
     ));
     if (appendable.length === 0) return false;
     let mutationCommandId: string | false = false;
@@ -6627,7 +6627,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                 const sharedActorLabel = formatSharedActorLabel(t, entry.sharedActor);
                 return (
                 <div class="controls-queued-item" key={entry.clientMessageId}>
-                  {entry.status !== 'failed' && entry.status !== 'sending' && isEditableQueuedEntry(entry) && (
+                  {entry.status !== 'failed' && isEditableQueuedEntry(entry) && (
                     <button type="button" class="controls-queued-action controls-queued-action-append" onClick={() => handleQueuedMessagesAppend([entry])}>
                       {t('session.transport_queue_append')}
                     </button>
