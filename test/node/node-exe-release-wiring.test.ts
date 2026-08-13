@@ -28,6 +28,10 @@ describe('controlled-node executable release wiring', () => {
     expect(workerBuild).toContain("Join-Path $DepotTools 'git.bat'");
     expect(workerBuild).toContain('& $WinToolsBootstrap.FullName');
     expect(workerBuild).toContain('$PostBootstrapDepotToolsRevision -ne $DepotToolsRevision');
+    expect(workerBuild).toContain("$env:GIT_CONFIG_COUNT = '4'");
+    expect(workerBuild).toContain("url.https://chromium.googlesource.com/external/github.com/llvm/llvm-project/.insteadOf");
+    expect(workerBuild).toContain("$env:GIT_CONFIG_VALUE_0 = 'https://chromium.googlesource.com/external/github.com/llvm/llvm-project/'");
+    expect(workerBuild).toContain("$env:GIT_CONFIG_KEY_1 = 'url.https://github.com/.insteadOf'");
     expect(workerBuild.indexOf('& $WinToolsBootstrap.FullName'))
       .toBeLessThan(workerBuild.indexOf('$env:DEPOT_TOOLS_UPDATE'));
     expect(workerBuild).toContain("Where-Object { $_.Name -match '^\\d+\\.\\d+\\.\\d+\\.\\d+$' }");

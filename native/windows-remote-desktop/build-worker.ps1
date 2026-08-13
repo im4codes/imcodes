@@ -41,13 +41,18 @@ $ExpectedSources = @(
 # Qualification builds can be prepared by the SYSTEM node service and then
 # resumed by a dedicated SSH build account. Trust only these two explicit,
 # pinned checkout roots for this process; never weaken Git's global policy.
-$env:GIT_CONFIG_COUNT = '3'
-$env:GIT_CONFIG_KEY_0 = 'url.https://github.com/.insteadOf'
-$env:GIT_CONFIG_VALUE_0 = 'https://chromium.googlesource.com/external/github.com/'
-$env:GIT_CONFIG_KEY_1 = 'safe.directory'
-$env:GIT_CONFIG_VALUE_1 = $DepotTools
+$env:GIT_CONFIG_COUNT = '4'
+# The pinned DEPS contains standalone Chromium mirrors of LLVM subtrees. They
+# are not GitHub repositories, so exempt the longer LLVM prefix from the broad
+# canonical-upstream rewrite below. Git chooses the longest insteadOf match.
+$env:GIT_CONFIG_KEY_0 = 'url.https://chromium.googlesource.com/external/github.com/llvm/llvm-project/.insteadOf'
+$env:GIT_CONFIG_VALUE_0 = 'https://chromium.googlesource.com/external/github.com/llvm/llvm-project/'
+$env:GIT_CONFIG_KEY_1 = 'url.https://github.com/.insteadOf'
+$env:GIT_CONFIG_VALUE_1 = 'https://chromium.googlesource.com/external/github.com/'
 $env:GIT_CONFIG_KEY_2 = 'safe.directory'
-$env:GIT_CONFIG_VALUE_2 = $WebRtcRoot
+$env:GIT_CONFIG_VALUE_2 = $DepotTools
+$env:GIT_CONFIG_KEY_3 = 'safe.directory'
+$env:GIT_CONFIG_VALUE_3 = $WebRtcRoot
 
 if ([string]::IsNullOrWhiteSpace($CheckoutRoot) -or
     [System.IO.Path]::GetPathRoot($CheckoutRoot) -eq $CheckoutRoot) {
@@ -113,8 +118,9 @@ $env:GYP_MSVS_OVERRIDE_PATH = $VisualStudioRoot
 $env:vs2022_install = $VisualStudioRoot
 $env:VPYTHON_BYPASS = 'manually managed by the pinned IM.codes worker build'
 # Chromium hosts mirrors of many GitHub projects behind one anonymous quota.
-# The process-scoped Git configuration above resolves that exact prefix to
-# each project's canonical upstream; DEPS still pins every commit.
+# The process-scoped Git configuration above resolves ordinary two-component
+# repositories to their canonical upstream while retaining Chromium's
+# standalone LLVM subtree mirrors; DEPS still pins every commit.
 
 if (-not $SkipSync -and -not (Test-Path (Join-Path $WebRtcRoot '.git'))) {
   & git clone --filter=blob:none --no-checkout https://webrtc.googlesource.com/src.git $WebRtcRoot
