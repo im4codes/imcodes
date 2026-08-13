@@ -326,6 +326,10 @@ describe('controlled-node self-upgrade', () => {
     expect(script).toContain("$dstRemoteDesktop = 'C:\\ProgramData\\imcodes-node\\remote-desktop-worker'");
     expect(script).toContain('remote-desktop-worker\\win32-x64\\imcodes-remote-desktop-worker.exe');
     expect(script).toContain('Get-AuthenticodeSignature -LiteralPath $srcRemoteDesktopExe');
+    expect(script).toContain("Join-Path $PSHOME 'Modules\\Microsoft.PowerShell.Security\\Microsoft.PowerShell.Security.psd1'");
+    expect(script).toContain('Import-Module -Name $securityModulePath -ErrorAction Stop');
+    expect(script.indexOf('Import-Module -Name $securityModulePath -ErrorAction Stop'))
+      .toBeLessThan(script.indexOf('Get-AuthenticodeSignature -LiteralPath $srcRemoteDesktopExe'));
     expect(script).toContain('[System.Management.Automation.SignatureStatus]::Valid');
     expect(script).toContain('remote desktop worker signer mismatch');
     expect(script).toContain('authenticodeSignerSha256');

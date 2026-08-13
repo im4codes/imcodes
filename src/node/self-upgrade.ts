@@ -332,6 +332,9 @@ export function buildWindowsControlledNodeUpgradeScript(input: {
   const upgradeTaskCleanup = input.upgradeTaskName
     ? `Unregister-ScheduledTask -TaskName ${psQuote(input.upgradeTaskName)} -Confirm:$false -ErrorAction SilentlyContinue\r\n`
     : '';
+  const powershellSecurityModulePreflight = `$securityModulePath = Join-Path $PSHOME 'Modules\\Microsoft.PowerShell.Security\\Microsoft.PowerShell.Security.psd1'\r\n`
+    + `if (-not (Test-Path -LiteralPath $securityModulePath -PathType Leaf)) { throw 'Windows PowerShell security module was not found' }\r\n`
+    + `Import-Module -Name $securityModulePath -ErrorAction Stop\r\n`;
   const releaseArtifactPreflight = `$trustedReleaseSigner = ${psQuote(WINDOWS_COMPILED_RELEASE_SIGNER_SHA256)}\r\n`
     + `if ($trustedReleaseSigner -cnotmatch '^[a-f0-9]{64}$') { throw 'controlled node build has no Windows release trust anchor' }\r\n`
     + `$verifyReleaseArtifact = { param([string]$path)\r\n`
@@ -468,6 +471,7 @@ export function buildWindowsControlledNodeUpgradeScript(input: {
       ? `if (Test-Path -LiteralPath $dstRemoteDesktop) { $rollbackRemoteDesktopPlatform = Join-Path $dstRemoteDesktop 'win32-x64'; $rollbackRemoteDesktopExe = Join-Path $rollbackRemoteDesktopPlatform ${psQuote(REMOTE_DESKTOP_WORKER_FILENAME)}; $rollbackRemoteDesktopManifest = "$rollbackRemoteDesktopExe${REMOTE_DESKTOP_WORKER_MANIFEST_SUFFIX}"; $rollbackRemoteDesktopArchive = Join-Path $rollbackRemoteDesktopPlatform ${psQuote(REMOTE_DESKTOP_VIRTUAL_DISPLAY_ARCHIVE_FILENAME)}; $rollbackRemoteDesktopWorkerHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $rollbackRemoteDesktopExe).Hash.ToLowerInvariant(); $rollbackRemoteDesktopManifestHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $rollbackRemoteDesktopManifest).Hash.ToLowerInvariant(); $rollbackRemoteDesktopArchiveHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $rollbackRemoteDesktopArchive).Hash.ToLowerInvariant(); & $verifyRemoteDesktopArtifactSet $dstRemoteDesktop $rollbackRemoteDesktopWorkerHash $rollbackRemoteDesktopManifestHash $rollbackRemoteDesktopArchiveHash $trustedReleaseSigner }\r\n`
       : '');
   const releasePreflightGuard = `try {\r\n`
+      + powershellSecurityModulePreflight
       + releaseArtifactPreflight
       + remoteDesktopPreflight
       + installedArtifactPreflight
