@@ -22,12 +22,11 @@ describe('controlled-node executable release wiring', () => {
     expect(workflow).toContain('runner: windows-2022');
     expect(workflow).toContain('uses: actions/cache/restore@v4');
     expect(workflow).toContain('uses: actions/cache/save@v4');
-    expect(workflow).toContain('${{ runner.temp }}/imcodes-webrtc');
+    expect(workflow).toContain('${{ runner.temp }}/imcodes-webrtc/src/out/imcodes_remote_desktop');
     expect(workflow).toContain('scripts\\resolve-windows-native-cache-identity.ps1');
-    expect(workflow).toContain('imcodes-webrtc-checkout-windows-x64-f20ebb8adbf4fa781830e4384c61f732bd28a217');
+    expect(workflow).not.toContain('imcodes-webrtc-checkout-windows-x64-');
     expect(workflow).toContain('imcodes-webrtc-build-${{ steps.windows_native_cache.outputs.identity }}');
-    expect(workflow).toContain("'${{ steps.webrtc_checkout_cache.outputs.cache-hit }}' -eq 'true'");
-    expect(workflow).toContain('$buildArguments.SkipSync = $true');
+    expect(workflow).not.toContain('steps.webrtc_checkout_cache.outputs.cache-hit');
     const workerBuild = readFileSync('native/windows-remote-desktop/build-worker.ps1', 'utf8');
     const displayBuild = readFileSync('native/windows-virtual-display/build-virtual-display.ps1', 'utf8');
     const driverKitResolver = readFileSync('scripts/resolve-windows-driver-kit.ps1', 'utf8');
@@ -49,6 +48,12 @@ describe('controlled-node executable release wiring', () => {
     expect(workerBuild.indexOf("scripts\\resolve-windows-driver-kit.ps1"))
       .toBeLessThan(workerBuild.indexOf('gclient sync'));
     expect(workerBuild).toContain('DriverKitBin = $WindowsDriverKitBin');
+    expect(workerBuild).toContain("Join-Path $CheckoutRoot 'imcodes_remote_desktop.restored-build-cache'");
+    expect(workerBuild.indexOf('Move-Item -LiteralPath $BuildDirectory -Destination $RestoredBuildCache'))
+      .toBeLessThan(workerBuild.indexOf('git clone --filter=blob:none --no-checkout https://webrtc.googlesource.com/src.git'));
+    expect(workerBuild.indexOf('Move-Item -LiteralPath $RestoredBuildCache -Destination $BuildDirectory'))
+      .toBeGreaterThan(workerBuild.indexOf('gclient sync -D'));
+    expect(workerBuild).toContain('[System.IO.File]::SetLastWriteTimeUtc($_.FullName, $RestoredAt)');
     expect(workerBuild).toContain(
       '$ArtifactRoot = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($ArtifactRoot)',
     );
@@ -76,7 +81,7 @@ describe('controlled-node executable release wiring', () => {
     expect(standaloneWorkflow).toContain('uses: actions/cache/restore@v4');
     expect(standaloneWorkflow).toContain('uses: actions/cache/save@v4');
     expect(standaloneWorkflow).toContain('imcodes-webrtc-build-${{ steps.windows_native_cache.outputs.identity }}');
-    expect(standaloneWorkflow).toContain('$buildArguments.SkipSync = $true');
+    expect(standaloneWorkflow).not.toContain('imcodes-webrtc-checkout-windows-x64-');
   });
 
   it('exposes the embedded runtime version without bootstrapping or installing', () => {

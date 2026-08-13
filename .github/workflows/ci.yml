@@ -680,19 +680,8 @@ jobs:
         run: |
           $identity = (& .\scripts\resolve-windows-native-cache-identity.ps1).Trim()
           "identity=$identity" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-      - name: Restore pinned WebRTC checkout
-        if: runner.os == 'Windows'
-        id: webrtc_checkout_cache
-        continue-on-error: true
-        uses: actions/cache/restore@v4
-        with:
-          path: |
-            ${{ runner.temp }}/imcodes-webrtc
-            !${{ runner.temp }}/imcodes-webrtc/src/out
-            !${{ runner.temp }}/imcodes-webrtc/src/third_party/imcodes_remote_desktop
-          key: imcodes-webrtc-checkout-windows-x64-f20ebb8adbf4fa781830e4384c61f732bd28a217-a1bda5b6167435ad0666191f0353f242104f5845-v2
       - name: Restore incremental WebRTC build
-        if: runner.os == 'Windows' && steps.webrtc_checkout_cache.outputs.cache-hit == 'true'
+        if: runner.os == 'Windows'
         id: webrtc_build_cache
         continue-on-error: true
         uses: actions/cache/restore@v4
@@ -714,20 +703,7 @@ jobs:
             RequireAuthenticodeSignature = $true
             RunNativeTests = $true
           }
-          if ('${{ steps.webrtc_checkout_cache.outputs.cache-hit }}' -eq 'true') {
-            $buildArguments.SkipSync = $true
-          }
           & .\native\windows-remote-desktop\build-worker.ps1 @buildArguments
-      - name: Save pinned WebRTC checkout
-        if: runner.os == 'Windows' && steps.webrtc_checkout_cache.outputs.cache-hit != 'true'
-        continue-on-error: true
-        uses: actions/cache/save@v4
-        with:
-          path: |
-            ${{ runner.temp }}/imcodes-webrtc
-            !${{ runner.temp }}/imcodes-webrtc/src/out
-            !${{ runner.temp }}/imcodes-webrtc/src/third_party/imcodes_remote_desktop
-          key: imcodes-webrtc-checkout-windows-x64-f20ebb8adbf4fa781830e4384c61f732bd28a217-a1bda5b6167435ad0666191f0353f242104f5845-v2
       - name: Save incremental WebRTC build
         if: runner.os == 'Windows' && steps.webrtc_build_cache.outputs.cache-hit != 'true'
         continue-on-error: true

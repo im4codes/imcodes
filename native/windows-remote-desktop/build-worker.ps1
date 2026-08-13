@@ -20,6 +20,7 @@ $DepotTools = Join-Path $CheckoutRoot 'depot_tools'
 $WebRtcRoot = Join-Path $CheckoutRoot 'src'
 $TargetDirectory = Join-Path $WebRtcRoot 'third_party\imcodes_remote_desktop'
 $BuildDirectory = Join-Path $WebRtcRoot 'out\imcodes_remote_desktop'
+$RestoredBuildCache = Join-Path $CheckoutRoot 'imcodes_remote_desktop.restored-build-cache'
 $RootBuildPath = Join-Path $WebRtcRoot 'BUILD.gn'
 $RootBuildOriginal = $null
 $ArtifactRoot = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($ArtifactRoot)
@@ -61,6 +62,16 @@ if ([string]::IsNullOrWhiteSpace($CheckoutRoot) -or
 }
 
 New-Item -ItemType Directory -Force -Path $CheckoutRoot | Out-Null
+# actions/cache restores the compact native output before the multi-repository
+# WebRTC checkout exists. Move it out of the future clone destination, then put
+# it back after gclient has materialized the pinned source tree. This keeps the
+# useful ~200 MB object cache independent from the uncacheable ~20 GB checkout.
+if (-not (Test-Path (Join-Path $WebRtcRoot '.git')) -and
+    (Test-Path -LiteralPath $BuildDirectory -PathType Container)) {
+  Remove-Item -Recurse -Force -LiteralPath $RestoredBuildCache -ErrorAction SilentlyContinue
+  Move-Item -LiteralPath $BuildDirectory -Destination $RestoredBuildCache
+  Remove-Item -Recurse -Force -LiteralPath $WebRtcRoot
+}
 if (-not (Test-Path (Join-Path $DepotTools '.git'))) {
   & git clone --filter=blob:none --no-checkout https://chromium.googlesource.com/chromium/tools/depot_tools.git $DepotTools
   if ($LASTEXITCODE -ne 0) { throw 'depot_tools clone failed' }
@@ -153,6 +164,15 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Pinned WebRTC revision checkout failed' }
     & gclient sync -D -j $Jobs --revision "src@$Revision"
     if ($LASTEXITCODE -ne 0) { throw 'Pinned WebRTC dependency sync failed' }
+  }
+
+  if (Test-Path -LiteralPath $RestoredBuildCache -PathType Container) {
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $BuildDirectory) | Out-Null
+    Remove-Item -Recurse -Force -LiteralPath $BuildDirectory -ErrorAction SilentlyContinue
+    Move-Item -LiteralPath $RestoredBuildCache -Destination $BuildDirectory
+    $RestoredAt = [DateTime]::UtcNow
+    Get-ChildItem -LiteralPath $BuildDirectory -Recurse -File |
+      ForEach-Object { [System.IO.File]::SetLastWriteTimeUtc($_.FullName, $RestoredAt) }
   }
 
   New-Item -ItemType Directory -Force -Path $TargetDirectory | Out-Null
