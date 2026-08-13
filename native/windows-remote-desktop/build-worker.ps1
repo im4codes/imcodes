@@ -172,7 +172,13 @@ try {
     Move-Item -LiteralPath $RestoredBuildCache -Destination $BuildDirectory
     $RestoredAt = [DateTime]::UtcNow
     Get-ChildItem -LiteralPath $BuildDirectory -Recurse -File |
-      ForEach-Object { [System.IO.File]::SetLastWriteTimeUtc($_.FullName, $RestoredAt) }
+      ForEach-Object {
+        try {
+          [System.IO.File]::SetLastWriteTimeUtc($_.FullName, $RestoredAt)
+        } catch [System.Management.Automation.MethodInvocationException] {
+          if ($_.Exception.InnerException -isnot [System.IO.FileNotFoundException]) { throw }
+        }
+      }
   }
 
   New-Item -ItemType Directory -Force -Path $TargetDirectory | Out-Null

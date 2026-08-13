@@ -54,6 +54,7 @@ describe('controlled-node executable release wiring', () => {
     expect(workerBuild.indexOf('Move-Item -LiteralPath $RestoredBuildCache -Destination $BuildDirectory'))
       .toBeGreaterThan(workerBuild.indexOf('gclient sync -D'));
     expect(workerBuild).toContain('[System.IO.File]::SetLastWriteTimeUtc($_.FullName, $RestoredAt)');
+    expect(workerBuild).toContain('if ($_.Exception.InnerException -isnot [System.IO.FileNotFoundException]) { throw }');
     expect(workerBuild).toContain(
       '$ArtifactRoot = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($ArtifactRoot)',
     );
