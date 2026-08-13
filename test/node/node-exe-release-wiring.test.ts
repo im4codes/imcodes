@@ -14,13 +14,24 @@ describe('controlled-node executable release wiring', () => {
     expect(workflow).toContain('dist-node-exe/computer-use-helper/**');
     expect(workflow).toContain('native\\windows-remote-desktop\\build-worker.ps1');
     expect(workflow).toContain('IMCODES_WINDOWS_SIGNING_PFX_BASE64');
-    expect(workflow).toContain('-RequireAuthenticodeSignature');
-    expect(workflow).toContain('-CodeSigningTimestampUrl');
+    expect(workflow).toContain('RequireAuthenticodeSignature = $true');
+    expect(workflow).toContain("CodeSigningTimestampUrl = 'http://timestamp.digicert.com'");
     expect(workflow).toContain('dist-node-exe/remote-desktop-worker/**');
     expect(workflow).toContain('remote-desktop-worker-artifacts.mjs verify');
     expect(workflow).toContain('npx tsx scripts/qualify-windows-self-upgrade.ts');
+    expect(workflow).toContain('runner: windows-2022');
+    expect(workflow).toContain('uses: actions/cache/restore@v4');
+    expect(workflow).toContain('uses: actions/cache/save@v4');
+    expect(workflow).toContain('${{ runner.temp }}/imcodes-webrtc');
+    expect(workflow).toContain('scripts\\resolve-windows-native-cache-identity.ps1');
+    expect(workflow).toContain('imcodes-webrtc-checkout-windows-x64-f20ebb8adbf4fa781830e4384c61f732bd28a217');
+    expect(workflow).toContain('imcodes-webrtc-build-${{ steps.windows_native_cache.outputs.identity }}');
+    expect(workflow).toContain("'${{ steps.webrtc_checkout_cache.outputs.cache-hit }}' -eq 'true'");
+    expect(workflow).toContain('$buildArguments.SkipSync = $true');
     const workerBuild = readFileSync('native/windows-remote-desktop/build-worker.ps1', 'utf8');
     const displayBuild = readFileSync('native/windows-virtual-display/build-virtual-display.ps1', 'utf8');
+    const driverKitResolver = readFileSync('scripts/resolve-windows-driver-kit.ps1', 'utf8');
+    const cacheIdentityResolver = readFileSync('scripts/resolve-windows-native-cache-identity.ps1', 'utf8');
     expect(workerBuild).toContain('tools_webrtc\\libs\\generate_licenses.py');
     expect(workerBuild).toContain('THIRD_PARTY_NOTICES.webrtc.md');
     expect(workerBuild).toContain('Remove-Item -Force -LiteralPath $ThirdPartyNotices');
@@ -35,6 +46,14 @@ describe('controlled-node executable release wiring', () => {
     expect(workerBuild.indexOf('& $WinToolsBootstrap.FullName'))
       .toBeLessThan(workerBuild.indexOf('$env:DEPOT_TOOLS_UPDATE'));
     expect(workerBuild).toContain("Where-Object { $_.Name -match '^\\d+\\.\\d+\\.\\d+\\.\\d+$' }");
+    expect(workerBuild.indexOf("scripts\\resolve-windows-driver-kit.ps1"))
+      .toBeLessThan(workerBuild.indexOf('gclient sync'));
+    expect(workerBuild).toContain('DriverKitBin = $WindowsDriverKitBin');
+    expect(displayBuild).toContain("scripts\\resolve-windows-driver-kit.ps1");
+    expect(driverKitResolver).toContain("Join-Path $_.FullName 'x86\\inf2cat.exe'");
+    expect(driverKitResolver).toContain("Join-Path $_.FullName 'x64\\signtool.exe'");
+    expect(cacheIdentityResolver).toContain('$env:ImageVersion');
+    expect(cacheIdentityResolver).toContain('resolve-windows-driver-kit.ps1');
     expect(displayBuild).toContain("'THIRD_PARTY_NOTICES.webrtc.md'");
     const signDll = displayBuild.indexOf('$Arguments += $DllPath');
     const buildCatalog = displayBuild.indexOf('& $Inf2Cat');
@@ -47,6 +66,12 @@ describe('controlled-node executable release wiring', () => {
     expect(workflow).toContain('IMCODES_BUILD_VERSION: ${{ needs.release_version.outputs.app_version }}');
     expect(workflow).toContain('APP_VERSION=${{ needs.release_version.outputs.app_version }}');
     expect(workflow).toContain('runner: macos-15');
+    const standaloneWorkflow = readFileSync('.github/workflows/build-node-exe.yml', 'utf8');
+    expect(standaloneWorkflow).toContain('- os: windows-2022');
+    expect(standaloneWorkflow).toContain('uses: actions/cache/restore@v4');
+    expect(standaloneWorkflow).toContain('uses: actions/cache/save@v4');
+    expect(standaloneWorkflow).toContain('imcodes-webrtc-build-${{ steps.windows_native_cache.outputs.identity }}');
+    expect(standaloneWorkflow).toContain('$buildArguments.SkipSync = $true');
   });
 
   it('exposes the embedded runtime version without bootstrapping or installing', () => {

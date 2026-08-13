@@ -1,6 +1,7 @@
 param(
   [string]$ArtifactRoot = 'E:\imcodes-build-output\virtual-display',
   [string]$VisualStudioRoot = '',
+  [string]$DriverKitBin = '',
   [Parameter(Mandatory = $true)][string]$ThirdPartyNoticesPath,
   [string]$CodeSigningCertificateThumbprint = '',
   [string]$CodeSigningTimestampUrl = '',
@@ -36,12 +37,17 @@ if (-not (Test-Path $MsBuild)) {
   $MsBuild = Join-Path $VisualStudioRoot 'MSBuild\Current\Bin\MSBuild.exe'
 }
 if (-not (Test-Path $MsBuild)) { throw 'MSBuild was not found.' }
-$KitBin = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin' -Directory |
-  Where-Object { Test-Path (Join-Path $_.FullName 'x86\inf2cat.exe') } |
-  Sort-Object Name -Descending | Select-Object -First 1
-if (-not $KitBin) { throw 'A matching WDK with inf2cat.exe was not found.' }
-$Inf2Cat = Join-Path $KitBin.FullName 'x86\inf2cat.exe'
-$SignTool = Join-Path $KitBin.FullName 'x64\signtool.exe'
+if ([string]::IsNullOrWhiteSpace($DriverKitBin)) {
+  $RepositoryRoot = Split-Path -Parent (Split-Path -Parent $SourceDirectory)
+  $DriverKitResolver = Join-Path $RepositoryRoot 'scripts\resolve-windows-driver-kit.ps1'
+  $DriverKitBin = (& $DriverKitResolver).Trim()
+}
+$Inf2Cat = Join-Path $DriverKitBin 'x86\inf2cat.exe'
+$SignTool = Join-Path $DriverKitBin 'x64\signtool.exe'
+if (-not (Test-Path -LiteralPath $Inf2Cat -PathType Leaf) -or
+    -not (Test-Path -LiteralPath $SignTool -PathType Leaf)) {
+  throw 'Resolved Windows Driver Kit is missing inf2cat.exe or signtool.exe.'
+}
 
 & $MsBuild $Project '/t:Clean;Build' '/p:Configuration=Release' `
   '/p:Platform=x64' '/p:SignMode=Off' '/m:2'

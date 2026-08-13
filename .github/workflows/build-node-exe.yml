@@ -37,7 +37,7 @@ jobs:
             artifact: imcodes-node-linux
           - os: macos-15
             artifact: imcodes-node-macos
-          - os: windows-latest
+          - os: windows-2022
             artifact: imcodes-node.exe
     steps:
       - uses: actions/checkout@v4
@@ -92,20 +92,68 @@ jobs:
           "IMCODES_WINDOWS_SIGNING_CERT_SHA256=$signerSha256" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       - name: Build controlled-node executable
         run: npm run build:node-exe
+      - name: Resolve Windows native cache identity and preflight WDK
+        if: runner.os == 'Windows'
+        id: windows_native_cache
+        shell: powershell
+        run: |
+          $identity = (& .\scripts\resolve-windows-native-cache-identity.ps1).Trim()
+          "identity=$identity" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+      - name: Restore pinned WebRTC checkout
+        if: runner.os == 'Windows'
+        id: webrtc_checkout_cache
+        continue-on-error: true
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ${{ runner.temp }}/imcodes-webrtc
+            !${{ runner.temp }}/imcodes-webrtc/src/out
+            !${{ runner.temp }}/imcodes-webrtc/src/third_party/imcodes_remote_desktop
+          key: imcodes-webrtc-checkout-windows-x64-f20ebb8adbf4fa781830e4384c61f732bd28a217-a1bda5b6167435ad0666191f0353f242104f5845-v2
+      - name: Restore incremental WebRTC build
+        if: runner.os == 'Windows' && steps.webrtc_checkout_cache.outputs.cache-hit == 'true'
+        id: webrtc_build_cache
+        continue-on-error: true
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/imcodes-webrtc/src/out/imcodes_remote_desktop
+          key: imcodes-webrtc-build-${{ steps.windows_native_cache.outputs.identity }}-x64-f20ebb8adbf4fa781830e4384c61f732bd28a217-gn-v2
       - name: Build and test production remote-desktop worker
         if: runner.os == 'Windows'
         timeout-minutes: 180
         shell: powershell
-        run: >-
-          & .\native\windows-remote-desktop\build-worker.ps1
-          -CheckoutRoot "$env:RUNNER_TEMP\imcodes-webrtc"
-          -ArtifactRoot "dist-node-exe\remote-desktop-worker\win32-x64"
-          -Jobs 4
-          -WorkerVersion "$env:IMCODES_BUILD_VERSION"
-          -CodeSigningCertificateThumbprint "$env:IMCODES_WINDOWS_SIGNING_CERT_THUMBPRINT"
-          -CodeSigningTimestampUrl "http://timestamp.digicert.com"
-          -RequireAuthenticodeSignature
-          -RunNativeTests
+        run: |
+          $buildArguments = @{
+            CheckoutRoot = "$env:RUNNER_TEMP\imcodes-webrtc"
+            ArtifactRoot = 'dist-node-exe\remote-desktop-worker\win32-x64'
+            Jobs = 4
+            WorkerVersion = $env:IMCODES_BUILD_VERSION
+            CodeSigningCertificateThumbprint = $env:IMCODES_WINDOWS_SIGNING_CERT_THUMBPRINT
+            CodeSigningTimestampUrl = 'http://timestamp.digicert.com'
+            RequireAuthenticodeSignature = $true
+            RunNativeTests = $true
+          }
+          if ('${{ steps.webrtc_checkout_cache.outputs.cache-hit }}' -eq 'true') {
+            $buildArguments.SkipSync = $true
+          }
+          & .\native\windows-remote-desktop\build-worker.ps1 @buildArguments
+      - name: Save pinned WebRTC checkout
+        if: runner.os == 'Windows' && steps.webrtc_checkout_cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ${{ runner.temp }}/imcodes-webrtc
+            !${{ runner.temp }}/imcodes-webrtc/src/out
+            !${{ runner.temp }}/imcodes-webrtc/src/third_party/imcodes_remote_desktop
+          key: imcodes-webrtc-checkout-windows-x64-f20ebb8adbf4fa781830e4384c61f732bd28a217-a1bda5b6167435ad0666191f0353f242104f5845-v2
+      - name: Save incremental WebRTC build
+        if: runner.os == 'Windows' && steps.webrtc_build_cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/imcodes-webrtc/src/out/imcodes_remote_desktop
+          key: imcodes-webrtc-build-${{ steps.windows_native_cache.outputs.identity }}-x64-f20ebb8adbf4fa781830e4384c61f732bd28a217-gn-v2
       - name: Verify production remote-desktop worker artifact
         if: runner.os == 'Windows'
         run: node scripts/remote-desktop-worker-artifacts.mjs verify dist-node-exe "${{ env.IMCODES_BUILD_VERSION }}"

@@ -95,6 +95,7 @@ const execFileAsync = promisify(execFile);
 // enough headroom for full-suite contention; a genuinely absent send still
 // fails explicitly at the deadline.
 const SEND_WAIT_MS = 30_000;
+const COVERAGE_CONTENDED_SEND_WAIT_MS = 60_000;
 vi.setConfig({ testTimeout: 120_000, hookTimeout: 60_000 });
 
 async function makeChange(name: string, tasks = '- [ ] first\n- [x] second\n'): Promise<void> {
@@ -3031,7 +3032,7 @@ exec "${realGit}" "$@"
     const repairPrompt = await waitForTransportSend((text) =>
       text.includes('OpenSpec Auto Deliver needs the final implementation acceptance audit authoritative result file')
       && text.includes('Problem: invalid_evidence_summary'),
-      SEND_WAIT_MS,
+      COVERAGE_CONTENDED_SEND_WAIT_MS,
     );
     expect(repairPrompt).toContain(`Authoritative result file: ${origin.authoritativeResultPath}`);
     expect(repairPrompt).toContain('Allowed verdict values: PASS, REWORK, BLOCKED');

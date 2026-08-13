@@ -111,6 +111,11 @@ if ([string]::IsNullOrWhiteSpace($VisualStudioRoot) -or
     -not (Test-Path (Join-Path $VisualStudioRoot 'VC\Auxiliary\Build\Microsoft.VCToolsVersion.default.txt'))) {
   throw 'Visual Studio C++ toolchain not found.'
 }
+$RepositoryRoot = Split-Path -Parent (Split-Path -Parent $SourceDirectory)
+$DriverKitResolver = Join-Path $RepositoryRoot 'scripts\resolve-windows-driver-kit.ps1'
+# Fail before the multi-gigabyte WebRTC sync/build when the hosted image lacks
+# the WDK catalog tool required by the signed virtual-display release package.
+$WindowsDriverKitBin = (& $DriverKitResolver).Trim()
 $env:PATH = "$DepotTools;$env:PATH"
 $env:DEPOT_TOOLS_WIN_TOOLCHAIN = '0'
 $env:DEPOT_TOOLS_UPDATE = '0'
@@ -311,6 +316,7 @@ try {
   $VirtualDisplayArguments = @{
     ArtifactRoot = $VirtualDisplayPackage
     VisualStudioRoot = $VisualStudioRoot
+    DriverKitBin = $WindowsDriverKitBin
     ThirdPartyNoticesPath = $ThirdPartyNotices
     CodeSigningCertificateThumbprint = $CodeSigningCertificateThumbprint
   }
