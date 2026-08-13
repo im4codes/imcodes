@@ -21,6 +21,8 @@ import { useMachines } from '../hooks/useMachines.js';
 import { isNative } from '../native.js';
 import { ShareSessionDialog } from './ShareSessionDialog.js';
 import type { MachineListItem } from '../api/machines.js';
+import { RemoteDesktopPanel, canOpenRemoteDesktop } from './RemoteDesktopPanel.js';
+import type { WsClient } from '../ws-client.js';
 
 /**
  * Presence is DB-backed and changes independently of this browser after an
@@ -86,7 +88,7 @@ const PLATFORM_PRESENTATION: Record<ControlledNodeOs, { glyph: string; name: str
   linux: { glyph: '◇', name: 'Linux' },
 };
 
-export function ControlledNodesPanel() {
+export function ControlledNodesPanel({ ws = null }: { ws?: WsClient | null }) {
   const { t, i18n } = useTranslation();
   const { machines, loaded, loading, error, refetch } = useMachines();
 
@@ -106,6 +108,7 @@ export function ControlledNodesPanel() {
   const [editingServerId, setEditingServerId] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState('');
   const [sharingMachine, setSharingMachine] = useState<MachineListItem | null>(null);
+  const [remoteDesktopMachine, setRemoteDesktopMachine] = useState<MachineListItem | null>(null);
   const presenceMountedRef = useRef(true);
 
   const sortedTargets = useMemo(() => downloadTargets, [downloadTargets]);
@@ -373,6 +376,15 @@ export function ControlledNodesPanel() {
                 </div>
               </div>
               <div class="controlled-nodes-machine-actions">
+                {canOpenRemoteDesktop(m) && (
+                  <button
+                    type="button"
+                    class="controlled-nodes-remote-desktop"
+                    onClick={() => setRemoteDesktopMachine(m)}
+                  >
+                    {t('remote_desktop.open')}
+                  </button>
+                )}
                 {machineAccessRole(m) === 'owner' ? (
                   <>
                     <button
@@ -516,6 +528,13 @@ export function ControlledNodesPanel() {
           }}
           onClose={() => setSharingMachine(null)}
           onSharesChanged={() => { void refreshPresence(); }}
+        />
+      )}
+      {remoteDesktopMachine && (
+        <RemoteDesktopPanel
+          machine={remoteDesktopMachine}
+          ws={ws}
+          onClose={() => setRemoteDesktopMachine(null)}
         />
       )}
     </div>

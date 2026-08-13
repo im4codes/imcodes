@@ -19,6 +19,8 @@ import {
   normalizeMachineDisplayName,
 } from '../../../shared/machine-reference.js';
 import { listAccessibleControlledMachines } from '../share/machine-access.js';
+import { validateControlledNodeCapabilities } from '../../../shared/controlled-node-capabilities.js';
+import { REMOTE_DESKTOP_TERMINAL_REASON } from '../../../shared/remote-desktop.js';
 
 export const machinesRoutes = new Hono<{
   Bindings: Env;
@@ -34,6 +36,7 @@ interface ControlledRow {
   exec_enabled: boolean;
   os: string | null;
   access_role: MachineAccessRole;
+  controlled_capabilities: unknown;
 }
 
 /**
@@ -57,6 +60,7 @@ export async function listControlledMachines(
     const online = r.status === 'online'
       && typeof r.last_heartbeat_at === 'number'
       && nowMs - r.last_heartbeat_at < MACHINE_PRESENCE_STALENESS_MS;
+    const capabilities = validateControlledNodeCapabilities(r.controlled_capabilities);
     return {
       serverId: r.id,
       name: r.display_name ?? r.ref_name ?? r.id,
@@ -68,6 +72,7 @@ export async function listControlledMachines(
       // keeps old MCP resolution logic from presenting a non-operable target.
       execEnabled: r.exec_enabled === true && r.access_role !== 'viewer',
       accessRole: r.access_role,
+      ...(capabilities.ok && capabilities.value.length > 0 ? { capabilities: capabilities.value } : {}),
       ...(canonicalMachineOs(r.os) ? { os: canonicalMachineOs(r.os) } : {}),
       ...(typeof r.last_heartbeat_at === 'number' ? { lastSeenMs: r.last_heartbeat_at } : {}),
     };
@@ -88,7 +93,7 @@ machinesRoutes.get('/', requireAuth(), async (c) => {
   const authenticatedDaemon = c.get('nodeRole') === NODE_ROLE.FULL
     && typeof c.get('authServerId') === 'string';
   const responseMachines = authenticatedDaemon
-    ? machines.map(({ accessRole: _accessRole, ...machine }) => machine)
+    ? machines.map(({ accessRole: _accessRole, capabilities: _capabilities, ...machine }) => machine)
     : machines;
   return c.json({ machines: responseMachines });
 });
@@ -142,7 +147,9 @@ machinesRoutes.post('/:serverId/revoke', requireAuth(), async (c) => {
   // abandoned to `null` → the source sees an indeterminate outcome (the command
   // may already have run on the node), never a fabricated success/failure.
   try {
-    WsBridge.get(serverId).kickDaemon();
+    const bridge = WsBridge.get(serverId);
+    bridge.stopAllRemoteDesktop(REMOTE_DESKTOP_TERMINAL_REASON.AUTHORITY_REVOKED);
+    bridge.kickDaemon();
     abandonAllForTarget(serverId);
   } catch { /* offline / other pod */ }
   const ip = (c.get('clientIp' as never) as string) ?? 'unknown';
@@ -168,6 +175,11 @@ machinesRoutes.post('/:serverId/exec-enabled', requireAuth(), async (c) => {
     [serverId, userId, parsed.data.enabled, NODE_ROLE.CONTROLLED],
   );
   if (!row) return c.json({ error: 'not_found' }, 404);
+  if (!parsed.data.enabled) {
+    // This route is pod-sticky by serverId. Terminate every peer immediately
+    // after the DB mutation; worker lease expiry remains the lost-message guard.
+    WsBridge.get(serverId).stopAllRemoteDesktop(REMOTE_DESKTOP_TERMINAL_REASON.EXECUTION_DISABLED);
+  }
   const ip = (c.get('clientIp' as never) as string) ?? 'unknown';
   logAudit({
     userId,

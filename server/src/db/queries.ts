@@ -417,8 +417,21 @@ export async function updateServerSharedContextRuntimeConfig(
   return result.changes > 0;
 }
 
-export async function updateServerHeartbeat(db: Database, id: string, daemonVersion?: string | null): Promise<void> {
-  if (daemonVersion) {
+export async function updateServerHeartbeat(
+  db: Database,
+  id: string,
+  daemonVersion?: string | null,
+  controlledCapabilities?: readonly string[],
+): Promise<void> {
+  if (controlledCapabilities !== undefined) {
+    await db.execute(
+      `UPDATE servers
+          SET last_heartbeat_at = $1, status = $2, daemon_version = COALESCE($3, daemon_version),
+              controlled_capabilities = $4::jsonb
+        WHERE id = $5`,
+      [Date.now(), 'online', daemonVersion ?? null, JSON.stringify(controlledCapabilities), id],
+    );
+  } else if (daemonVersion) {
     await db.execute('UPDATE servers SET last_heartbeat_at = $1, status = $2, daemon_version = $3 WHERE id = $4', [Date.now(), 'online', daemonVersion, id]);
   } else {
     await db.execute('UPDATE servers SET last_heartbeat_at = $1, status = $2 WHERE id = $3', [Date.now(), 'online', id]);

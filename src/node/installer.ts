@@ -14,20 +14,10 @@ import { chmod, lstat, mkdir, mkdtemp, open, readFile, rename, rm, unlink, write
 import { tmpdir } from 'node:os';
 import { dirname, join, win32 } from 'node:path';
 import type { ServiceReceipt } from './install-journal.js';
+import { CONTROLLED_NODE_SERVICE } from '../../shared/controlled-node-service.js';
 
 /** Controlled-node service identities — distinct from the full daemon's. */
-export const CONTROLLED_NODE_SERVICE = {
-  /** Windows Task Scheduler task name (full daemon uses `imcodes-daemon`). */
-  WINDOWS_TASK: 'imcodes-node',
-  /** Independent application-health watchdog; distinct from the process task. */
-  WINDOWS_WATCHDOG_TASK: 'imcodes-node-watchdog',
-  /** macOS LaunchDaemon label (full daemon uses `imcodes.daemon`). */
-  MACOS_LABEL: 'cc.imcodes.node',
-  /** Separate periodic authenticated-health supervisor for the macOS daemon. */
-  MACOS_WATCHDOG_LABEL: 'cc.imcodes.node.watchdog',
-  /** Linux systemd unit name (full daemon uses `imcodes.service`). */
-  LINUX_UNIT: 'imcodes-node.service',
-} as const;
+export { CONTROLLED_NODE_SERVICE } from '../../shared/controlled-node-service.js';
 
 export const MACOS_PLIST_PATH = `/Library/LaunchDaemons/${CONTROLLED_NODE_SERVICE.MACOS_LABEL}.plist`;
 export const MACOS_WATCHDOG_PLIST_PATH = `/Library/LaunchDaemons/${CONTROLLED_NODE_SERVICE.MACOS_WATCHDOG_LABEL}.plist`;
@@ -99,6 +89,15 @@ const WINDOWS_WATCHDOG_INTERVAL = 'PT1M';
 const WINDOWS_WATCHDOG_SCRIPT_NAME = 'imcodes-node-health-watchdog.ps1';
 const WINDOWS_HEALTH_LEASE_NAME = 'health-lease.json';
 const WINDOWS_HEALTH_STALE_SECONDS = 180;
+export const WINDOWS_UPGRADE_MARKER_NAME = 'upgrade-in-progress.json';
+const WINDOWS_UPGRADE_MARKER_MAX_AGE_MS = 15 * 60 * 1000;
+
+export function windowsPowerShellExecutablePath(
+  env: { WINDIR?: string } = process.env,
+): string {
+  const windowsDirectory = env.WINDIR?.trim() || 'C:\\Windows';
+  return win32.join(windowsDirectory, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+}
 
 function windowsWatchdogStartBoundary(now: Date): string {
   const start = new Date(now.getTime());
@@ -168,12 +167,14 @@ export function windowsControlledNodeHealthPaths(exePath: string): {
   scriptPath: string;
   leasePath: string;
   logPath: string;
+  upgradeMarkerPath: string;
 } {
   const baseDir = win32.dirname(exePath);
   return {
     scriptPath: win32.join(baseDir, WINDOWS_WATCHDOG_SCRIPT_NAME),
     leasePath: win32.join(baseDir, WINDOWS_HEALTH_LEASE_NAME),
     logPath: win32.join(baseDir, 'health-watchdog.log'),
+    upgradeMarkerPath: win32.join(baseDir, WINDOWS_UPGRADE_MARKER_NAME),
   };
 }
 
@@ -194,12 +195,22 @@ export function windowsControlledNodeHealthWatchdogScript(exePath: string): stri
     + `$nodeTask = ${powershellSingleQuoted(CONTROLLED_NODE_SERVICE.WINDOWS_TASK)}\r\n`
     + `$leasePath = ${powershellSingleQuoted(paths.leasePath)}\r\n`
     + `$logPath = ${powershellSingleQuoted(paths.logPath)}\r\n`
+    + `$upgradeMarkerPath = ${powershellSingleQuoted(paths.upgradeMarkerPath)}\r\n`
+    + `$upgradeMarkerMaxAgeMs = ${WINDOWS_UPGRADE_MARKER_MAX_AGE_MS}\r\n`
     + `$staleSeconds = ${WINDOWS_HEALTH_STALE_SECONDS}\r\n`
     + `function Write-HealthLog([string]$message) {\r\n`
     + `  if ((Test-Path -LiteralPath $logPath) -and (Get-Item -LiteralPath $logPath).Length -gt 2MB) { Move-Item -Force -LiteralPath $logPath -Destination ($logPath + '.1') }\r\n`
     + `  Add-Content -LiteralPath $logPath -Encoding UTF8 -Value (('{0} {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $message))\r\n`
     + `}\r\n`
     + `$process = Get-CimInstance Win32_Process -Filter \"Name='imcodes-node.exe'\" -ErrorAction SilentlyContinue | Where-Object { $_.ExecutablePath -eq $nodePath -and $_.CommandLine -notmatch '--computer-use-helper' } | Select-Object -First 1\r\n`
+    + `if (Test-Path -LiteralPath $upgradeMarkerPath) {\r\n`
+    + `  try {\r\n`
+    + `    $upgradeMarker = Get-Content -LiteralPath $upgradeMarkerPath -Raw | ConvertFrom-Json\r\n`
+    + `    $upgradeAgeMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - [int64]$upgradeMarker.startedAt\r\n`
+    + `    if ([int]$upgradeMarker.version -eq 1 -and $upgradeAgeMs -ge -60000 -and $upgradeAgeMs -le $upgradeMarkerMaxAgeMs) { exit 0 }\r\n`
+    + `  } catch { }\r\n`
+    + `  Remove-Item -Force -LiteralPath $upgradeMarkerPath -ErrorAction SilentlyContinue\r\n`
+    + `}\r\n`
     + `$healthy = $false\r\n`
     + `$reason = 'process_missing'\r\n`
     + `if ($process) {\r\n`
@@ -228,6 +239,7 @@ export function windowsControlledNodeHealthWatchdogScript(exePath: string): stri
 export function windowsControlledNodeHealthWatchdogTaskXml(scriptPath: string, now: Date = new Date()): string {
   const startBoundary = windowsWatchdogStartBoundary(now);
   const argumentsText = `-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "${scriptPath}"`;
+  const powershellPath = windowsPowerShellExecutablePath();
   return `<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo><Description>IM.codes controlled node authenticated-health watchdog</Description></RegistrationInfo>
@@ -249,7 +261,7 @@ export function windowsControlledNodeHealthWatchdogTaskXml(scriptPath: string, n
     <ExecutionTimeLimit>PT2M</ExecutionTimeLimit>
     <RestartOnFailure><Interval>PT1M</Interval><Count>3</Count></RestartOnFailure>
   </Settings>
-  <Actions Context="System"><Exec><Command>powershell.exe</Command><Arguments>${escapeXmlText(argumentsText)}</Arguments></Exec></Actions>
+  <Actions Context="System"><Exec><Command>${escapeXmlText(powershellPath)}</Command><Arguments>${escapeXmlText(argumentsText)}</Arguments></Exec></Actions>
 </Task>
 `;
 }
@@ -345,7 +357,14 @@ export function windowsExecutableFileAclCommands(path: string): WindowsAclComman
 
 export function windowsComputerUseHelperAclCommands(path: string): WindowsAclCommand[] {
   return [
-    [path, '/grant:r', `${WINDOWS_AUTHENTICATED_USERS_SID}:(OI)(CI)RX`, '/T'],
+    // Protect only the helper root. Its children must keep inheriting these
+    // explicit root ACEs; recursively stripping inheritance would leave the
+    // helper files unreadable even to the intended interactive controller.
+    [path, '/grant:r', `${WINDOWS_SYSTEM_SID}:(OI)(CI)F`],
+    [path, '/grant:r', `${WINDOWS_ADMINISTRATORS_SID}:(OI)(CI)F`],
+    [path, '/grant:r', `${WINDOWS_AUTHENTICATED_USERS_SID}:(OI)(CI)RX`],
+    [path, '/inheritance:r'],
+    [path, '/setowner', WINDOWS_SYSTEM_SID, '/T'],
   ];
 }
 

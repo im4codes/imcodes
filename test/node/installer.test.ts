@@ -88,6 +88,7 @@ describe('controlled-node installer artifacts (4.1-4.4)', () => {
       scriptPath: 'C:\\ProgramData\\imcodes-node\\imcodes-node-health-watchdog.ps1',
       leasePath: 'C:\\ProgramData\\imcodes-node\\health-lease.json',
       logPath: 'C:\\ProgramData\\imcodes-node\\health-watchdog.log',
+      upgradeMarkerPath: 'C:\\ProgramData\\imcodes-node\\upgrade-in-progress.json',
     });
     const watchdogXml = windowsControlledNodeHealthWatchdogTaskXml(
       healthPaths.scriptPath,
@@ -100,7 +101,7 @@ describe('controlled-node installer artifacts (4.1-4.4)', () => {
     expect(watchdogXml).toContain('<UserId>S-1-5-18</UserId>');
     expect(watchdogXml).toContain('<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>');
     expect(watchdogXml).toContain('<ExecutionTimeLimit>PT2M</ExecutionTimeLimit>');
-    expect(watchdogXml).toContain('<Command>powershell.exe</Command>');
+    expect(watchdogXml).toContain('<Command>C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe</Command>');
     expect(watchdogXml).toContain('-File "C:\\ProgramData\\imcodes-node\\imcodes-node-health-watchdog.ps1"');
 
     const watchdogScript = windowsControlledNodeHealthWatchdogScript(WINDOWS_EXE);
@@ -111,6 +112,10 @@ describe('controlled-node installer artifacts (4.1-4.4)', () => {
     expect(watchdogScript).toContain('$process.CreationDate');
     expect(watchdogScript).toContain('$processAgeSeconds -lt $staleSeconds');
     expect(watchdogScript).toContain('$staleSeconds = 180');
+    expect(watchdogScript).toContain("$upgradeMarkerPath = 'C:\\ProgramData\\imcodes-node\\upgrade-in-progress.json'");
+    expect(watchdogScript).toContain('$upgradeMarkerMaxAgeMs = 900000');
+    expect(watchdogScript).toContain('$upgradeAgeMs -le $upgradeMarkerMaxAgeMs');
+    expect(watchdogScript).toContain('Remove-Item -Force -LiteralPath $upgradeMarkerPath');
     expect(watchdogScript).toContain('Start-ScheduledTask -TaskName $nodeTask');
     expect(watchdogScript).toContain("-notmatch '--computer-use-helper'");
     expect(watchdogScript).not.toContain('43.248.99.95');
@@ -202,7 +207,11 @@ describe('controlled-node installer artifacts (4.1-4.4)', () => {
       [`${dir}\\imcodes-node.exe`, '/setowner', '*S-1-5-18'],
     ]);
     expect(windowsComputerUseHelperAclCommands(`${dir}\\computer-use-helper`)).toEqual([
-      [`${dir}\\computer-use-helper`, '/grant:r', '*S-1-5-11:(OI)(CI)RX', '/T'],
+      [`${dir}\\computer-use-helper`, '/grant:r', '*S-1-5-18:(OI)(CI)F'],
+      [`${dir}\\computer-use-helper`, '/grant:r', '*S-1-5-32-544:(OI)(CI)F'],
+      [`${dir}\\computer-use-helper`, '/grant:r', '*S-1-5-11:(OI)(CI)RX'],
+      [`${dir}\\computer-use-helper`, '/inheritance:r'],
+      [`${dir}\\computer-use-helper`, '/setowner', '*S-1-5-18', '/T'],
     ]);
 
     const fileCommands = windowsSecretFileAclCommands(`${dir}\\credential.json`);

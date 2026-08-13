@@ -7,6 +7,7 @@
 import { act, render, cleanup, fireEvent, waitFor } from '@testing-library/preact';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { ControlledNodeAvailability, MachineListItem } from '../src/api/machines.js';
+import { REMOTE_DESKTOP_CAPABILITY } from '@shared/remote-desktop.js';
 
 const translate = (key: string, options?: Record<string, string>) =>
   key === 'controlled_nodes.artifact_meta' && options?.detail ? options.detail : key;
@@ -386,6 +387,25 @@ describe('ControlledNodesPanel (12.3)', () => {
     expect(container.querySelector('.controlled-nodes-revoke')).toBeNull();
     expect(container.textContent).toContain('controlled_nodes.share.view_only');
     expect(container.textContent).toContain('controlled_nodes.exec_on');
+  });
+
+  it('shows Remote Desktop only for an operable Windows Owner or Participant with the exact capability', async () => {
+    machines = [
+      machine({ serverId: 'owner-ready', displayName: 'Owner Ready', os: 'win', accessRole: 'owner', execEnabled: true, capabilities: [REMOTE_DESKTOP_CAPABILITY] }),
+      machine({ serverId: 'participant-ready', displayName: 'Participant Ready', os: 'win', accessRole: 'participant', execEnabled: true, capabilities: [REMOTE_DESKTOP_CAPABILITY] }),
+      machine({ serverId: 'viewer', displayName: 'Viewer', os: 'win', accessRole: 'viewer', execEnabled: true, capabilities: [REMOTE_DESKTOP_CAPABILITY] }),
+      machine({ serverId: 'disabled', displayName: 'Disabled', os: 'win', accessRole: 'owner', execEnabled: false, capabilities: [REMOTE_DESKTOP_CAPABILITY] }),
+      machine({ serverId: 'offline', displayName: 'Offline', os: 'win', accessRole: 'owner', online: false, execEnabled: true, capabilities: [REMOTE_DESKTOP_CAPABILITY] }),
+      machine({ serverId: 'old-node', displayName: 'Old Node', os: 'win', accessRole: 'owner', execEnabled: true }),
+      machine({ serverId: 'linux', displayName: 'Linux', os: 'linux', accessRole: 'owner', execEnabled: true, capabilities: [REMOTE_DESKTOP_CAPABILITY] }),
+    ];
+    const { container } = render(<ControlledNodesPanel />);
+    await waitFor(() => expect(container.textContent).toContain('Owner Ready'));
+
+    const buttons = container.querySelectorAll('.controlled-nodes-remote-desktop');
+    expect(buttons).toHaveLength(2);
+    expect(buttons[0]?.closest('li')?.textContent).toContain('Owner Ready');
+    expect(buttons[1]?.closest('li')?.textContent).toContain('Participant Ready');
   });
 
   it('renames only the mutable display name and refreshes the list', async () => {

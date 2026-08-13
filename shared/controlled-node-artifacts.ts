@@ -102,6 +102,9 @@ export const CONTROLLED_NODE_ARTIFACT_UPGRADE_PATH = '/api/enroll/v2/node-artifa
 export const CONTROLLED_NODE_ARTIFACT_ASSETS = {
   NODE: 'node',
   COMPUTER_USE_HELPER: 'computer-use-helper',
+  REMOTE_DESKTOP_WORKER: 'remote-desktop-worker',
+  REMOTE_DESKTOP_WORKER_MANIFEST: 'remote-desktop-worker-manifest',
+  REMOTE_DESKTOP_VIRTUAL_DISPLAY: 'remote-desktop-virtual-display',
 } as const;
 
 export const CONTROLLED_NODE_COMPUTER_USE_HELPER_FILENAMES = {
@@ -119,6 +122,7 @@ export const CONTROLLED_NODE_ARTIFACT_HEADERS = {
   SIZE_BYTES: 'x-imcodes-node-artifact-size-bytes',
   FILENAME: 'x-imcodes-node-artifact-filename',
   VERSION: 'x-imcodes-node-artifact-version',
+  REMOTE_DESKTOP_PROTOCOL_VERSION: 'x-imcodes-remote-desktop-protocol-version',
 } as const;
 
 export function controlledNodeArtifactKey(os: ControlledNodeOs, arch: ControlledNodeArtifactArch): string {

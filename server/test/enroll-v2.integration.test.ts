@@ -26,9 +26,17 @@ import {
   makeSafeCloseOnce,
   type ArtifactCatalog,
 } from '../src/services/controlled-node-artifact-catalog.js';
-import { NODE_ROLE, decodeEnrollmentTrailer } from '../../shared/remote-exec.js';
+import { NODE_ROLE, decodeEnrollmentTrailer, decodeEnrollmentTrailerWithRange } from '../../shared/remote-exec.js';
+import { inspectWindowsAuthenticodeEnrollmentContainer } from '../../shared/windows-authenticode-enrollment.js';
 import { EXPECTED_USER_ID_HEADER } from '../../shared/http-header-names.js';
 import { AUTH_IDENTITY_ERRORS } from '../../shared/auth-identity.js';
+import { CONTROLLED_NODE_ARTIFACT_HEADERS } from '../../shared/controlled-node-artifacts.js';
+import {
+  REMOTE_DESKTOP_LEGACY_UPGRADE_PROTOCOL_VERSION,
+  REMOTE_DESKTOP_WORKER_FILENAME,
+  REMOTE_DESKTOP_WORKER_MANIFEST_SUFFIX,
+} from '../../shared/remote-desktop-worker.js';
+import { WINDOWS_REMOTE_DESKTOP_QUALIFICATION_PLAN } from '../../shared/remote-desktop-qualification.js';
 
 let db: Database;
 const hex = (n: number) => randomBytes(n).toString('hex');
@@ -37,6 +45,24 @@ const sha256 = (value: string | Buffer) => createHash('sha256').update(value).di
 let exeDir: string;
 let artifactCatalog: ArtifactCatalog;
 const FAKE_BINARY = Buffer.from('IMCODES_FAKE_EXECUTABLE_BINARY_v1');
+function fakeSignedWindowsPe(): Buffer {
+  const certificateOffset = 512;
+  const certificateSize = 16;
+  const file = Buffer.alloc(certificateOffset + certificateSize, 0x5a);
+  file.writeUInt32LE(0x80, 0x3c);
+  file.writeUInt32LE(0x00004550, 0x80);
+  const optional = 0x80 + 24;
+  file.writeUInt16LE(0x20b, optional);
+  file.writeUInt32LE(16, optional + 108);
+  const securityEntry = optional + 112 + 4 * 8;
+  file.writeUInt32LE(certificateOffset, securityEntry);
+  file.writeUInt32LE(certificateSize, securityEntry + 4);
+  file.writeUInt32LE(certificateSize, certificateOffset);
+  file.writeUInt16LE(0x0200, certificateOffset + 4);
+  file.writeUInt16LE(0x0002, certificateOffset + 6);
+  return file;
+}
+const FAKE_WINDOWS_SIGNED_PE = fakeSignedWindowsPe();
 const TEST_ENCRYPTION_KEY = 'test-bot-encryption-key-do-not-use-in-prod';
 
 async function writeManifest(
@@ -70,7 +96,7 @@ beforeAll(async () => {
   await runMigrations(db);
   exeDir = await mkdtemp(join(tmpdir(), 'imcodes-v2-exe-'));
   await writeFile(join(exeDir, 'imcodes-node-linux'), FAKE_BINARY);
-  await writeFile(join(exeDir, 'imcodes-node.exe'), FAKE_BINARY);
+  await writeFile(join(exeDir, 'imcodes-node.exe'), FAKE_WINDOWS_SIGNED_PE);
   await mkdir(join(exeDir, 'imcodes-node-macos')); // directory, not file
   process.env.IMCODES_NODE_EXE_DIR = exeDir;
 });
@@ -96,7 +122,8 @@ beforeEach(async () => {
     }
   }
   await writeManifest('imcodes-node-linux', 'linux', 'x64');
-  await writeManifest('imcodes-node.exe', 'win32', 'x64');
+  await writeFile(join(exeDir, 'imcodes-node.exe'), FAKE_WINDOWS_SIGNED_PE);
+  await writeManifest('imcodes-node.exe', 'win32', 'x64', FAKE_WINDOWS_SIGNED_PE);
   await rm(join(exeDir, 'imcodes-node-macos'), { recursive: true, force: true });
   await mkdir(join(exeDir, 'imcodes-node-macos'));
   // Restore dev mode by default (overridden per-test when needed).
@@ -424,6 +451,40 @@ describe('POST /api/enroll/v2/ticket (artifact manifest → enrollments_v2 row)'
 // ─────────────────────────── GET /v2/download ───────────────────────────
 
 describe('GET|POST /api/enroll/v2/download (ticket + streaming)', () => {
+  it('personalizes a signed Windows PE inside its certificate table and preserves reversible signed bytes', async () => {
+    const app = buildApp();
+    const userId = `u_${hex(4)}`;
+    await createUser(db, userId);
+    const o = await owner(userId);
+    const mint = await app.request('/api/enroll/v2/ticket', {
+      method: 'POST',
+      headers: ticketHeaders(userId, o),
+      body: JSON.stringify({ version: 2, os: 'win', arch: 'x64' }),
+    });
+    expect(mint.status).toBe(200);
+    const { ticket } = await mint.json() as { ticket: string };
+    const response = await app.request('/api/enroll/v2/download', {
+      headers: { authorization: `Bearer ${ticket}` },
+    });
+    expect(response.status).toBe(200);
+    const personalized = Buffer.from(await response.arrayBuffer());
+    expect(Number(response.headers.get('content-length'))).toBe(personalized.length);
+    const decoded = decodeEnrollmentTrailerWithRange(personalized);
+    expect(decoded?.blob.serverUrl).toBe('http://localhost');
+    const restore = inspectWindowsAuthenticodeEnrollmentContainer(
+      personalized.subarray(0, Math.min(personalized.length, 4096)),
+      personalized.length,
+      personalized,
+      0,
+      decoded!.trailerStart,
+      decoded!.trailerLength,
+    );
+    expect(restore).not.toBeNull();
+    const restored = Buffer.from(personalized.subarray(0, restore!.signedArtifactSize));
+    restored.writeUInt32LE(restore!.originalCertificateTableSize, restore!.sizeFieldOffset);
+    expect(restored).toEqual(FAKE_WINDOWS_SIGNED_PE);
+  });
+
   it('admits at most three concurrent streams, hashes once, and closes every pinned handle', async () => {
     const app = buildApp();
     const userId = `u_${hex(4)}`;
@@ -1456,9 +1517,9 @@ describe('GET /api/enroll/v2/node-artifact (controlled-node self-upgrade)', () =
       headers: { authorization: `Bearer ${token}` },
     });
     expect(response.status).toBe(200);
-    expect(response.headers.get('x-imcodes-node-artifact-sha256')).toBe(sha256(FAKE_BINARY));
+    expect(response.headers.get('x-imcodes-node-artifact-sha256')).toBe(sha256(FAKE_WINDOWS_SIGNED_PE));
     expect(response.headers.get('x-imcodes-node-artifact-version')).toBe('2026.7.1234-dev.5');
-    expect(Buffer.from(await response.arrayBuffer())).toEqual(FAKE_BINARY);
+    expect(Buffer.from(await response.arrayBuffer())).toEqual(FAKE_WINDOWS_SIGNED_PE);
 
     const helperBytes = Buffer.from('FAKE_OPEN_COMPUTER_USE_HELPER');
     await mkdir(join(exeDir, 'computer-use-helper', 'win32-x64'), { recursive: true });
@@ -1470,6 +1531,95 @@ describe('GET /api/enroll/v2/node-artifact (controlled-node self-upgrade)', () =
     expect(helperResponse.headers.get('x-imcodes-node-artifact-filename')).toBe('open-computer-use.exe');
     expect(helperResponse.headers.get('x-imcodes-node-artifact-sha256')).toBe(sha256(helperBytes));
     expect(Buffer.from(await helperResponse.arrayBuffer())).toEqual(helperBytes);
+
+    const workerBytes = Buffer.from('FAKE_PINNED_LIBWEBRTC_WORKER');
+    const virtualDisplayBytes = Buffer.from('SIGNED_VIRTUAL_DISPLAY_ARCHIVE');
+    const workerDir = join(exeDir, 'remote-desktop-worker', 'win32-x64');
+    await mkdir(workerDir, { recursive: true });
+    await writeFile(join(workerDir, REMOTE_DESKTOP_WORKER_FILENAME), workerBytes);
+    const workerManifest = {
+      manifestVersion: 2,
+      workerVersion: '0.1.2',
+      protocolVersion: 2,
+      ipcVersion: 1,
+      os: 'win32',
+      arch: 'x64',
+      fileName: REMOTE_DESKTOP_WORKER_FILENAME,
+      size: workerBytes.length,
+      sha256: sha256(workerBytes),
+      authenticodeSignerSha256: 'c'.repeat(64),
+      libwebrtcRevision: WINDOWS_REMOTE_DESKTOP_QUALIFICATION_PLAN.mediaStackDecision.libwebrtcRevision,
+      virtualDisplay: {
+        archiveFileName: 'imcodes-virtual-display.zip',
+        packageManifestFileName: 'imcodes-virtual-display.manifest.json',
+        size: virtualDisplayBytes.length,
+        sha256: sha256(virtualDisplayBytes),
+      },
+      toolchain: {
+        msvc: '14.44',
+        windowsSdk: '10.0.26100.0',
+        cmake: 'not-used-gn',
+        ninja: '1.13.1',
+        depotTools: WINDOWS_REMOTE_DESKTOP_QUALIFICATION_PLAN.mediaStackDecision.depotToolsRevision,
+      },
+    };
+    const workerManifestBytes = Buffer.from(JSON.stringify(workerManifest));
+    await writeFile(
+      join(workerDir, `${REMOTE_DESKTOP_WORKER_FILENAME}${REMOTE_DESKTOP_WORKER_MANIFEST_SUFFIX}`),
+      workerManifestBytes,
+    );
+    await writeFile(join(workerDir, 'imcodes-virtual-display.zip'), virtualDisplayBytes);
+    const workerResponse = await app.request(`/api/enroll/v2/node-artifact?serverId=${serverId}&os=win&arch=x64&asset=remote-desktop-worker`, {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(workerResponse.status).toBe(200);
+    expect(workerResponse.headers.get('x-imcodes-node-artifact-filename')).toBe(REMOTE_DESKTOP_WORKER_FILENAME);
+    expect(workerResponse.headers.get('x-imcodes-node-artifact-sha256')).toBe(sha256(workerBytes));
+    expect(Buffer.from(await workerResponse.arrayBuffer())).toEqual(workerBytes);
+    const workerManifestResponse = await app.request(`/api/enroll/v2/node-artifact?serverId=${serverId}&os=win&arch=x64&asset=remote-desktop-worker-manifest`, {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(workerManifestResponse.status).toBe(200);
+    expect(workerManifestResponse.headers.get('x-imcodes-node-artifact-filename')).toBe(`${REMOTE_DESKTOP_WORKER_FILENAME}${REMOTE_DESKTOP_WORKER_MANIFEST_SUFFIX}`);
+    const legacyManifestBytes = Buffer.from(await workerManifestResponse.arrayBuffer());
+    expect(JSON.parse(legacyManifestBytes.toString('utf8'))).toEqual({
+      ...workerManifest,
+      protocolVersion: REMOTE_DESKTOP_LEGACY_UPGRADE_PROTOCOL_VERSION,
+    });
+    expect(workerManifestResponse.headers.get('x-imcodes-node-artifact-sha256'))
+      .toBe(sha256(legacyManifestBytes));
+
+    const currentWorkerManifestResponse = await app.request(`/api/enroll/v2/node-artifact?serverId=${serverId}&os=win&arch=x64&asset=remote-desktop-worker-manifest`, {
+      headers: {
+        authorization: `Bearer ${token}`,
+        [CONTROLLED_NODE_ARTIFACT_HEADERS.REMOTE_DESKTOP_PROTOCOL_VERSION]: '2',
+      },
+    });
+    expect(currentWorkerManifestResponse.status).toBe(200);
+    expect(currentWorkerManifestResponse.headers.get('vary'))
+      .toBe(CONTROLLED_NODE_ARTIFACT_HEADERS.REMOTE_DESKTOP_PROTOCOL_VERSION);
+    expect(Buffer.from(await currentWorkerManifestResponse.arrayBuffer())).toEqual(workerManifestBytes);
+    const duplicatedCurrentProtocolResponse = await app.request(`/api/enroll/v2/node-artifact?serverId=${serverId}&os=win&arch=x64&asset=remote-desktop-worker-manifest`, {
+      headers: {
+        authorization: `Bearer ${token}`,
+        [CONTROLLED_NODE_ARTIFACT_HEADERS.REMOTE_DESKTOP_PROTOCOL_VERSION]: '2, 2',
+      },
+    });
+    expect(duplicatedCurrentProtocolResponse.status).toBe(200);
+    expect(Buffer.from(await duplicatedCurrentProtocolResponse.arrayBuffer())).toEqual(workerManifestBytes);
+    const unsupportedWorkerManifestResponse = await app.request(`/api/enroll/v2/node-artifact?serverId=${serverId}&os=win&arch=x64&asset=remote-desktop-worker-manifest`, {
+      headers: {
+        authorization: `Bearer ${token}`,
+        [CONTROLLED_NODE_ARTIFACT_HEADERS.REMOTE_DESKTOP_PROTOCOL_VERSION]: '99',
+      },
+    });
+    expect(unsupportedWorkerManifestResponse.status).toBe(409);
+    const virtualDisplayResponse = await app.request(`/api/enroll/v2/node-artifact?serverId=${serverId}&os=win&arch=x64&asset=remote-desktop-virtual-display`, {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(virtualDisplayResponse.status).toBe(200);
+    expect(virtualDisplayResponse.headers.get('x-imcodes-node-artifact-filename')).toBe('imcodes-virtual-display.zip');
+    expect(Buffer.from(await virtualDisplayResponse.arrayBuffer())).toEqual(virtualDisplayBytes);
 
     const macToken = hex(16);
     const macServerId = hex(8);

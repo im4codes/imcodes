@@ -1593,7 +1593,13 @@ export async function deleteAttachment(serverId: string, attachmentId: string, s
   });
 }
 
-export async function downloadAttachment(serverId: string, attachmentId: string, sessionName?: string): Promise<void> {
+export async function downloadAttachment(
+  serverId: string,
+  attachmentId: string,
+  sessionName?: string,
+  signal?: AbortSignal,
+): Promise<void> {
+  if (signal?.aborted) throw new DOMException('download_canceled', 'AbortError');
   // Native: skip blob fetch — WebViews can't reliably trigger downloads from blob URLs.
   // Get a one-time token and open in system browser which handles save natively.
   if (isNative()) {
@@ -1604,12 +1610,16 @@ export async function downloadAttachment(serverId: string, attachmentId: string,
   }
 
   // Desktop: fetch blob and trigger <a download>
-  const res = await rawFetch(withSessionName(`/api/server/${encodeURIComponent(serverId)}/uploads/${encodeURIComponent(attachmentId)}/download`, sessionName));
+  const res = await rawFetch(
+    withSessionName(`/api/server/${encodeURIComponent(serverId)}/uploads/${encodeURIComponent(attachmentId)}/download`, sessionName),
+    { signal },
+  );
   if (!res.ok) {
     const body = await res.text().catch(() => '');
     throw new ApiError(res.status, body);
   }
   const blob = await res.blob();
+  if (signal?.aborted) throw new DOMException('download_canceled', 'AbortError');
   const disposition = res.headers.get('Content-Disposition');
   let filename = attachmentId;
   if (disposition) {

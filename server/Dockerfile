@@ -107,6 +107,7 @@ COPY --from=builder /app/web/dist ./web/dist
 # CI, and copied into the production image for the versioned v2 ticket/download flow.
 COPY server/controlled-node-artifacts/ ./controlled-node-executables/
 COPY scripts/node-exe-artifacts.mjs ./scripts/node-exe-artifacts.mjs
+COPY scripts/remote-desktop-worker-artifacts.mjs ./scripts/remote-desktop-worker-artifacts.mjs
 
 # Copy landing page
 COPY landing/ ./landing/

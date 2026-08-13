@@ -1,0 +1,182 @@
+#ifndef IMCODES_REMOTE_DESKTOP_PEER_SESSION_H_
+#define IMCODES_REMOTE_DESKTOP_PEER_SESSION_H_
+
+#include <atomic>
+#include <chrono>
+#include <functional>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <set>
+#include <string>
+#include <vector>
+
+#include "api/data_channel_interface.h"
+#include "api/peer_connection_interface.h"
+#include "api/scoped_refptr.h"
+#include "rtc_base/thread.h"
+#include "third_party/imcodes_remote_desktop/display_capture.h"
+#include "third_party/imcodes_remote_desktop/input_injector.h"
+#include "third_party/imcodes_remote_desktop/ice_candidate_queue.h"
+#include "third_party/imcodes_remote_desktop/json_protocol.h"
+
+namespace imcodes::rd {
+
+using EmitJson = std::function<void(const Json::Value&)>;
+using AcquireSource = std::function<webrtc::scoped_refptr<DxgiDesktopSource>(
+    const DisplayInfo&)>;
+using ReleaseSource = std::function<void(const DisplayInfo&)>;
+
+class PeerSession;
+
+class PeerDataObserver final : public webrtc::DataChannelObserver {
+ public:
+  PeerDataObserver(std::weak_ptr<PeerSession> session, std::string label);
+  void OnStateChange() override;
+  void OnMessage(const webrtc::DataBuffer& buffer) override;
+
+ private:
+  const std::weak_ptr<PeerSession> session_;
+  const std::string label_;
+};
+
+class PeerSession final : public webrtc::PeerConnectionObserver,
+                          public std::enable_shared_from_this<PeerSession> {
+ public:
+  static std::shared_ptr<PeerSession> Create(
+      Authority authority,
+      webrtc::scoped_refptr<webrtc::PeerConnectionFactoryInterface> factory,
+      std::vector<DisplayInfo> displays,
+      AcquireSource acquire_source,
+      ReleaseSource release_source,
+      InputArbiter* input,
+      webrtc::Thread* signaling_thread,
+      EmitJson emit);
+  ~PeerSession() override;
+
+  bool Initialize();
+  bool ApplyOffer(const std::string& sdp);
+  bool AddIce(const std::string& mid, const std::string& candidate);
+  bool Renew(const Authority& renewal);
+  bool SetMode(const Authority& update, const std::string& reason);
+  bool RefreshDisplays(std::vector<DisplayInfo> displays);
+  bool Expired(int64_t now_ms) const;
+  bool IdleExpired() const;
+  void Close(const char* terminal_reason, bool emit_terminal = true);
+  const Authority& authority() const { return authority_; }
+  bool controlling() const;
+  bool protected_content_masked() const;
+  bool closed() const { return closed_.load(); }
+  void CheckMediaProgress();
+  void HandleMediaStats(uint64_t generation,
+                        bool has_outbound_video,
+                        uint64_t outbound_bytes);
+
+  void HandleData(const std::string& label,
+                  const webrtc::DataBuffer& buffer);
+  void HandleChannelState(const std::string& label);
+  void CreateAnswer();
+  void SendAnswer(std::unique_ptr<webrtc::SessionDescriptionInterface> answer,
+                  const std::string& sdp);
+  void OnRemoteDescriptionSet(bool success);
+
+  // PeerConnectionObserver.
+  void OnSignalingChange(
+      webrtc::PeerConnectionInterface::SignalingState) override {}
+  void OnDataChannel(
+      webrtc::scoped_refptr<webrtc::DataChannelInterface> channel) override;
+  void OnIceGatheringChange(
+      webrtc::PeerConnectionInterface::IceGatheringState) override {}
+  void OnIceCandidate(const webrtc::IceCandidate* candidate) override;
+  void OnConnectionChange(
+      webrtc::PeerConnectionInterface::PeerConnectionState state) override;
+  void OnIceSelectedCandidatePairChanged(
+      const webrtc::CandidatePairChangeEvent& event) override;
+
+ private:
+  PeerSession(Authority authority,
+              webrtc::scoped_refptr<webrtc::PeerConnectionFactoryInterface>
+                  factory,
+              std::vector<DisplayInfo> displays,
+              AcquireSource acquire_source,
+              ReleaseSource release_source,
+              InputArbiter* input,
+              webrtc::Thread* signaling_thread,
+              EmitJson emit);
+
+  bool Matches(const Authority& authority) const;
+  bool ValidateInputBase(const Json::Value& root,
+                         const std::string& channel,
+                         bool require_control,
+                         uint64_t* sequence);
+  bool ConsumeRate(const std::string& bucket, int maximum,
+                   std::chrono::seconds window);
+  void HandleDataOnSignaling(const std::string& label,
+                             const std::string& text);
+  void HandleControl(const std::string& channel, const Json::Value& root);
+  void HandlePointer(const std::string& channel, const Json::Value& root);
+  void HandleKeyboard(const std::string& channel, const Json::Value& root);
+  void SendTopology();
+  void SendQuality();
+  void SendInputAck(uint64_t acknowledged_sequence);
+  void SendStatus(const char* state, bool input_enabled);
+  void EmitIceCandidate(std::string mid, std::string candidate);
+  bool FlushPendingRemoteIce();
+  bool SelectDisplay(const std::string& id);
+  bool SetDisplayMode(const std::string& id, int width, int height);
+  bool SendControl(const Json::Value& value);
+  bool ChannelsReady() const;
+  bool InputReady() const;
+  void ReleaseInput();
+  void TouchActivity();
+  void ResetMediaProgressWatchdog();
+
+  Authority authority_;
+  const webrtc::scoped_refptr<webrtc::PeerConnectionFactoryInterface> factory_;
+  std::vector<DisplayInfo> displays_;
+  const AcquireSource acquire_source_;
+  const ReleaseSource release_source_;
+  InputArbiter* const input_;
+  webrtc::Thread* const signaling_thread_;
+  const EmitJson emit_;
+  webrtc::scoped_refptr<webrtc::PeerConnectionInterface> peer_;
+  webrtc::scoped_refptr<webrtc::CreateSessionDescriptionObserver>
+      answer_observer_;
+  webrtc::scoped_refptr<webrtc::VideoTrackInterface> track_;
+  webrtc::scoped_refptr<DxgiDesktopSource> source_;
+  size_t selected_display_ = 0;
+  bool selection_required_ = false;
+  int layout_revision_ = 1;
+  uint64_t outbound_sequence_ = 0;
+  std::map<std::string, uint64_t> last_sequence_by_channel_;
+  std::map<std::string, webrtc::scoped_refptr<webrtc::DataChannelInterface>>
+      channels_;
+  std::map<std::string, std::unique_ptr<PeerDataObserver>> channel_observers_;
+  std::set<std::string> pressed_codes_;
+  struct RateWindow {
+    std::chrono::steady_clock::time_point start;
+    int count = 0;
+  };
+  std::map<std::string, RateWindow> rate_windows_;
+  std::chrono::steady_clock::time_point last_activity_ =
+      std::chrono::steady_clock::now();
+  int remote_ice_count_ = 0;
+  int local_ice_count_ = 0;
+  PendingRemoteIceCandidates pending_remote_ice_{kMaxIceCandidates};
+  bool setting_remote_description_ = false;
+  bool remote_description_set_ = false;
+  bool layout_acknowledged_ = false;
+  std::atomic<bool> closed_{false};
+  std::atomic<bool> relayed_{false};
+  uint64_t media_stats_generation_ = 0;
+  uint64_t last_outbound_video_bytes_ = 0;
+  uint64_t source_frames_at_media_progress_ = 0;
+  int64_t media_stats_requested_at_ms_ = 0;
+  int64_t last_media_progress_at_ms_ = 0;
+  bool media_stats_in_flight_ = false;
+  bool media_stats_initialized_ = false;
+};
+
+}  // namespace imcodes::rd
+
+#endif  // IMCODES_REMOTE_DESKTOP_PEER_SESSION_H_

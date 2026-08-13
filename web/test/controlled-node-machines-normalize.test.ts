@@ -12,6 +12,7 @@ vi.mock('../src/api.js', async (importOriginal) => {
 
 import { listAvailableExecutables, listControllableMachines, mintControlledNodeExecutableTicket } from '../src/api/machines.js';
 import { configureExpectedUserId } from '../src/api.js';
+import { REMOTE_DESKTOP_CAPABILITY } from '../../shared/remote-desktop.js';
 
 const VALID_SHA256 = 'a'.repeat(64);
 
@@ -55,6 +56,19 @@ describe('controlled-node access-role normalization', () => {
         ['legacy-owner', 'owner'],
         ['malformed', 'viewer'],
       ]);
+  });
+
+  it('keeps only an exact, known remote-desktop capability list', async () => {
+    apiFetch.mockResolvedValueOnce({
+      machines: [
+        { serverId: 'exact', refName: 'exact', online: true, execEnabled: true, capabilities: [REMOTE_DESKTOP_CAPABILITY] },
+        { serverId: 'future', refName: 'future', online: true, execEnabled: true, capabilities: ['remote.desktop.windows.h264.v3'] },
+      ],
+    });
+
+    const machines = await listControllableMachines();
+    expect(machines[0]?.capabilities).toEqual([REMOTE_DESKTOP_CAPABILITY]);
+    expect(machines[1]).not.toHaveProperty('capabilities');
   });
 });
 

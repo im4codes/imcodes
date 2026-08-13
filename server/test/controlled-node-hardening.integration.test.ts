@@ -15,8 +15,11 @@ import { machinesRoutes } from '../src/routes/machines.js';
 import { WsBridge } from '../src/ws/bridge.js';
 import { MACHINE_LIST_MAX_ITEMS, NODE_ROLE } from '../../shared/remote-exec.js';
 import { MACHINE_REASONS } from '../../shared/machine-reference.js';
+import { REMOTE_DESKTOP_CAPABILITY } from '../../shared/remote-desktop.js';
+import { signJwt } from '../src/security/crypto.js';
 
 let db: Database;
+const JWT_KEY = 'test-signing-key-32chars-padding!!';
 const hex = (n: number) => randomBytes(n).toString('hex');
 const sha256 = (s: string) => createHash('sha256').update(s).digest('hex');
 
@@ -29,7 +32,7 @@ afterAll(async () => { await db.close(); });
 function buildApp() {
   const app = new Hono();
   app.use('*', async (c, next) => {
-    (c as unknown as { env: { DB: Database } }).env = { DB: db };
+    (c as unknown as { env: { DB: Database; JWT_SIGNING_KEY: string } }).env = { DB: db, JWT_SIGNING_KEY: JWT_KEY };
     await next();
   });
   app.route('/api/enroll', enrollRoutes);
@@ -231,10 +234,23 @@ describe('owner-scoped machine listing (DB presence)', () => {
     const other = await fullCredential(otherId);
     const code = `tok_${hex(6)}`;
     await seedV2Enrollment(code, userId);
-    await app.request('/api/enroll/v2/redeem', {
+    const redeem = await app.request('/api/enroll/v2/redeem', {
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ version: 2, enrollToken: code, installId: 'i1', nodeTokenHash: sha256(hex(16)), hostname: 'mybox', os: 'linux', arch: 'x64' }),
     });
+    const controlledId = (await redeem.json() as { serverId: string }).serverId;
+    await db.execute(
+      'UPDATE servers SET controlled_capabilities = $2::jsonb WHERE id = $1',
+      [controlledId, JSON.stringify([REMOTE_DESKTOP_CAPABILITY])],
+    );
+
+    const browser = await app.request('/api/machines', {
+      headers: { authorization: `Bearer ${signJwt({ sub: userId, type: 'web' }, JWT_KEY, 3_600)}` },
+    });
+    expect(browser.status).toBe(200);
+    const browserList = (await browser.json() as { machines: { capabilities?: string[]; accessRole?: string }[] }).machines;
+    expect(browserList[0]?.capabilities).toEqual([REMOTE_DESKTOP_CAPABILITY]);
+    expect(browserList[0]?.accessRole).toBe('owner');
 
     const mine = await app.request('/api/machines', { headers: { 'X-Server-Id': owner.serverId, authorization: `Bearer ${owner.token}` } });
     expect(mine.status).toBe(200);
@@ -245,6 +261,7 @@ describe('owner-scoped machine listing (DB presence)', () => {
     expect(list[0].nodeRole).toBe(NODE_ROLE.CONTROLLED);
     expect(list[0].os).toBe('linux');
     expect(list[0]).not.toHaveProperty('accessRole'); // rolling-upgrade compatibility with strict old daemons
+    expect(list[0]).not.toHaveProperty('capabilities');
 
     const theirs = await app.request('/api/machines', { headers: { 'X-Server-Id': other.serverId, authorization: `Bearer ${other.token}` } });
     expect(((await theirs.json() as { machines: unknown[] }).machines).length).toBe(0);

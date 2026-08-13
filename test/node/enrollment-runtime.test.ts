@@ -24,6 +24,12 @@ import {
   MACHINE_DIRECT_FILE_TRANSFER_LIMITS,
   MACHINE_DIRECT_FILE_TRANSFER_MSG,
 } from '../../shared/machine-direct-file-transfer.js';
+import {
+  REMOTE_DESKTOP_ACCESS_MODE,
+  REMOTE_DESKTOP_CAPABILITY,
+  REMOTE_DESKTOP_MSG,
+} from '../../shared/remote-desktop.js';
+import { CONTROLLED_NODE_SAFE_SELF_UPGRADE_CAPABILITY } from '../../shared/controlled-node-service.js';
 
 const { receiveMachineDirectUploadMock, sendMachineDirectFetchMock } = vi.hoisted(() => ({
   receiveMachineDirectUploadMock: vi.fn(),
@@ -44,7 +50,10 @@ class MockSocket extends EventEmitter implements AuthenticatedWebSocketLike {
 }
 
 const temporaryDirs: string[] = [];
+const originalRemoteDesktopEnabled = process.env.IMCODES_REMOTE_DESKTOP_ENABLED;
 afterEach(async () => {
+  if (originalRemoteDesktopEnabled === undefined) delete process.env.IMCODES_REMOTE_DESKTOP_ENABLED;
+  else process.env.IMCODES_REMOTE_DESKTOP_ENABLED = originalRemoteDesktopEnabled;
   vi.restoreAllMocks();
   receiveMachineDirectUploadMock.mockReset();
   sendMachineDirectFetchMock.mockReset();
@@ -66,12 +75,13 @@ describe('controlled node enrollment and runtime', () => {
     const socket = new MockSocket();
     const onAuthenticated = vi.fn();
     const onHeartbeatAck = vi.fn();
+    const cleanupLegacyUpgradeRescue = vi.fn(async () => {});
     const runtime = createControlledNodeRuntime({
       serverUrl: 'https://im.example',
       serverId: 'controlled-1',
       token: 'secret',
       nodeRole: NODE_ROLE.CONTROLLED,
-    }, () => socket, { onAuthenticated, onHeartbeatAck });
+    }, () => socket, { onAuthenticated, onHeartbeatAck, cleanupLegacyUpgradeRescue });
     runtime.start();
     socket.open();
     const authFrame = JSON.parse(socket.sent[0]!);
@@ -83,6 +93,7 @@ describe('controlled node enrollment and runtime', () => {
       FILE_TRANSFER_PATH_HANDLE_CAPABILITY,
       MACHINE_DIRECT_FILE_TRANSFER_CAPABILITY,
       MACHINE_DIRECT_FILE_FETCH_CAPABILITY,
+      CONTROLLED_NODE_SAFE_SELF_UPGRADE_CAPABILITY,
     ]));
     expect(JSON.parse(socket.sent[1]!)).toMatchObject({ type: 'heartbeat', daemonVersion: expect.any(String) });
 
@@ -92,9 +103,11 @@ describe('controlled node enrollment and runtime', () => {
     socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
     expect(onAuthenticated).toHaveBeenCalledOnce();
     expect(onHeartbeatAck).toHaveBeenCalledOnce();
+    await vi.waitFor(() => expect(cleanupLegacyUpgradeRescue).toHaveBeenCalledOnce());
     socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
     expect(onAuthenticated).toHaveBeenCalledOnce();
     expect(onHeartbeatAck).toHaveBeenCalledTimes(2);
+    expect(cleanupLegacyUpgradeRescue).toHaveBeenCalledOnce();
     expect(isControlledNodeAuthAck({ type: 'heartbeat_ack' })).toBe(true);
 
     const execCommand = process.platform === 'win32' ? "[Console]::Write('ok')" : 'printf ok';
@@ -115,6 +128,123 @@ describe('controlled node enrollment and runtime', () => {
       exitCode: 0,
       stdout: 'ok',
     }));
+    runtime.stop();
+  });
+
+  it('advertises and dispatches remote desktop only through a verified worker', async () => {
+    const socket = new MockSocket();
+    const remoteDesktopWorker = {
+      available: vi.fn(() => true),
+      handle: vi.fn(async () => true),
+      close: vi.fn(),
+    };
+    const runtime = createControlledNodeRuntime({
+      serverUrl: 'https://im.example',
+      serverId: 'controlled-1',
+      token: 'secret',
+      nodeRole: NODE_ROLE.CONTROLLED,
+    }, () => socket, { remoteDesktopWorker });
+    runtime.start();
+    socket.open();
+    expect(JSON.parse(socket.sent[0]!).capabilities).toContain(REMOTE_DESKTOP_CAPABILITY);
+
+    const prepare = {
+      type: REMOTE_DESKTOP_MSG.PREPARE,
+      requestId: 'request_12345678',
+      sessionId: 'session_12345678',
+      capability: 'a'.repeat(43),
+      expiresAt: Date.now() + 60_000,
+      leaseExpiresAt: Date.now() + 15_000,
+      daemonGeneration: 7,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW,
+      inputEpoch: 0,
+      iceServers: ['stun:stun.example.test:3478'],
+    };
+    socket.emit('message', JSON.stringify(prepare));
+    await vi.waitFor(() => expect(remoteDesktopWorker.handle).toHaveBeenCalledWith(prepare));
+
+    socket.emit('message', JSON.stringify({ ...prepare, injected: true }));
+    await Promise.resolve();
+    expect(remoteDesktopWorker.handle).toHaveBeenCalledOnce();
+    runtime.stop();
+    expect(remoteDesktopWorker.close).toHaveBeenCalled();
+  });
+
+  it('keeps heartbeat, exec, and file transfer available when the remote-desktop kill switch is off', async () => {
+    process.env.IMCODES_REMOTE_DESKTOP_ENABLED = '0';
+    const dir = await mkdtemp(join(tmpdir(), 'imcodes-node-rd-disabled-'));
+    temporaryDirs.push(dir);
+    const filePath = join(dir, 'still-available.txt');
+    await writeFile(filePath, 'available');
+    const socket = new MockSocket();
+    const remoteDesktopWorker = {
+      available: vi.fn(() => true),
+      handle: vi.fn(async () => true),
+      close: vi.fn(),
+    };
+    const runtime = createControlledNodeRuntime({
+      serverUrl: 'https://im.example',
+      serverId: 'controlled-1',
+      token: 'secret',
+      nodeRole: NODE_ROLE.CONTROLLED,
+    }, () => socket, { remoteDesktopWorker });
+    runtime.start();
+    socket.open();
+    const authFrame = JSON.parse(socket.sent[0]!);
+    expect(authFrame.capabilities).not.toContain(REMOTE_DESKTOP_CAPABILITY);
+    expect(authFrame.capabilities).toEqual(expect.arrayContaining([
+      FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY,
+      FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY,
+      FILE_TRANSFER_PATH_HANDLE_CAPABILITY,
+    ]));
+    expect(JSON.parse(socket.sent[1]!)).toMatchObject({ type: 'heartbeat' });
+
+    const prepare = {
+      type: REMOTE_DESKTOP_MSG.PREPARE,
+      requestId: 'request_12345678',
+      sessionId: 'session_12345678',
+      capability: 'a'.repeat(43),
+      expiresAt: Date.now() + 60_000,
+      leaseExpiresAt: Date.now() + 15_000,
+      daemonGeneration: 7,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
+      inputEpoch: 1,
+      iceServers: ['stun:stun.example.test:3478'],
+    };
+    socket.emit('message', JSON.stringify(prepare));
+    await vi.waitFor(() => expect(socket.sent.map((raw) => JSON.parse(raw))).toContainEqual(
+      expect.objectContaining({
+        type: REMOTE_DESKTOP_MSG.TERMINAL,
+        reason: 'capability_unavailable',
+      }),
+    ));
+    expect(remoteDesktopWorker.handle).not.toHaveBeenCalled();
+
+    socket.emit('message', JSON.stringify({
+      type: FILE_TRANSFER_MSG.PATH_HANDLE,
+      requestId: 'path-kill-switch',
+      path: filePath,
+    }));
+    await vi.waitFor(() => expect(socket.sent.map((raw) => JSON.parse(raw))).toContainEqual(
+      expect.objectContaining({
+        type: FILE_TRANSFER_MSG.PATH_HANDLE_DONE,
+        requestId: 'path-kill-switch',
+      }),
+    ));
+    const execCommand = process.platform === 'win32' ? "[Console]::Write('ok')" : 'printf ok';
+    socket.emit('message', JSON.stringify({
+      type: DAEMON_COMMAND_TYPES.MACHINE_EXEC,
+      correlationId: 'exec-kill-switch',
+      idempotencyKey: 'exec-kill-switch',
+      command: execCommand,
+    }));
+    await vi.waitFor(() => expect(socket.sent.map((raw) => JSON.parse(raw))).toContainEqual(
+      expect.objectContaining({
+        type: DAEMON_MSG.MACHINE_EXEC_RESULT,
+        correlationId: 'exec-kill-switch',
+        ok: true,
+      }),
+    ), { timeout: 5_000 });
     runtime.stop();
   });
 

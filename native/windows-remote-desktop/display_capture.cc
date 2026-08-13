@@ -1,0 +1,562 @@
+#include "third_party/imcodes_remote_desktop/display_capture.h"
+
+#include <d3d11.h>
+#include <dxgi1_2.h>
+#include <shellscalingapi.h>
+
+#include <algorithm>
+#include <chrono>
+#include <cstring>
+#include <iomanip>
+#include <sstream>
+#include <utility>
+
+#include "api/make_ref_counted.h"
+#include "api/video/i420_buffer.h"
+#include "libyuv/convert.h"
+#include "libyuv/rotate.h"
+#include "rtc_base/logging.h"
+#include "system_wrappers/include/clock.h"
+#include "third_party/imcodes_remote_desktop/json_protocol.h"
+#include "third_party/imcodes_remote_desktop/worker_policy.h"
+
+namespace imcodes::rd {
+namespace {
+
+std::string Narrow(const wchar_t* value) {
+  if (!value || !*value) return {};
+  const int size = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, value,
+                                       -1, nullptr, 0, nullptr, nullptr);
+  if (size <= 1) return {};
+  std::string result(static_cast<size_t>(size), '\0');
+  WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, value, -1,
+                      result.data(), size, nullptr, nullptr);
+  result.pop_back();
+  return result;
+}
+
+std::string DisplayId(const LUID& luid, UINT output_index) {
+  std::ostringstream id;
+  id << "display_" << std::hex << std::setw(8) << std::setfill('0')
+     << static_cast<uint32_t>(luid.HighPart) << std::setw(8)
+     << static_cast<uint32_t>(luid.LowPart) << "_" << std::dec << output_index;
+  return id.str();
+}
+
+int RotationDegrees(DXGI_MODE_ROTATION rotation) {
+  switch (rotation) {
+    case DXGI_MODE_ROTATION_ROTATE90:
+      return 90;
+    case DXGI_MODE_ROTATION_ROTATE180:
+      return 180;
+    case DXGI_MODE_ROTATION_ROTATE270:
+      return 270;
+    default:
+      return 0;
+  }
+}
+
+bool IsImcodesVirtualDisplay(const wchar_t* device_name) {
+  for (DWORD index = 0;; ++index) {
+    DISPLAY_DEVICEW device{};
+    device.cb = sizeof(device);
+    if (!EnumDisplayDevicesW(nullptr, index, &device, 0)) return false;
+    if (lstrcmpiW(device.DeviceName, device_name) != 0) continue;
+    return lstrcmpW(device.DeviceString, L"IM.codes Headless Display") == 0 &&
+           lstrcmpiW(device.DeviceID, L"ImcodesVirtualDisplay") == 0;
+  }
+}
+
+libyuv::RotationMode LibyuvRotation(int degrees) {
+  switch (degrees) {
+    case 90:
+      return libyuv::kRotate90;
+    case 180:
+      return libyuv::kRotate180;
+    case 270:
+      return libyuv::kRotate270;
+    default:
+      return libyuv::kRotate0;
+  }
+}
+
+}  // namespace
+
+std::vector<DisplayInfo> EnumerateDisplays() {
+  std::vector<DisplayInfo> displays;
+  Microsoft::WRL::ComPtr<IDXGIFactory1> factory;
+  if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return displays;
+  for (UINT adapter_index = 0; displays.size() < kMaxDisplays;
+       ++adapter_index) {
+    Microsoft::WRL::ComPtr<IDXGIAdapter1> adapter;
+    if (factory->EnumAdapters1(adapter_index, &adapter) == DXGI_ERROR_NOT_FOUND)
+      break;
+    DXGI_ADAPTER_DESC1 adapter_desc{};
+    if (FAILED(adapter->GetDesc1(&adapter_desc))) continue;
+    for (UINT output_index = 0; displays.size() < kMaxDisplays;
+         ++output_index) {
+      Microsoft::WRL::ComPtr<IDXGIOutput> output;
+      if (adapter->EnumOutputs(output_index, &output) == DXGI_ERROR_NOT_FOUND)
+        break;
+      DXGI_OUTPUT_DESC desc{};
+      if (FAILED(output->GetDesc(&desc)) || !desc.AttachedToDesktop) continue;
+      DisplayInfo info;
+      info.id = DisplayId(adapter_desc.AdapterLuid, output_index);
+      info.label = Narrow(desc.DeviceName);
+      info.device_name = desc.DeviceName;
+      info.desktop_rect = desc.DesktopCoordinates;
+      info.width = desc.DesktopCoordinates.right - desc.DesktopCoordinates.left;
+      info.height = desc.DesktopCoordinates.bottom - desc.DesktopCoordinates.top;
+      info.rotation_degrees = RotationDegrees(desc.Rotation);
+      info.primary = desc.DesktopCoordinates.left == 0 &&
+                     desc.DesktopCoordinates.top == 0;
+      info.imcodes_virtual = IsImcodesVirtualDisplay(desc.DeviceName);
+      if (info.imcodes_virtual) info.label = "IM.codes Headless Display";
+      info.adapter_luid = adapter_desc.AdapterLuid;
+      info.output_index = output_index;
+      UINT dpi_x = 96;
+      UINT dpi_y = 96;
+      if (SUCCEEDED(GetDpiForMonitor(desc.Monitor, MDT_EFFECTIVE_DPI,
+                                     &dpi_x, &dpi_y))) {
+        info.dpi_scale = std::clamp(static_cast<double>(dpi_x) / 96.0,
+                                    0.5, 8.0);
+      }
+      if (info.width > 0 && info.height > 0) displays.push_back(info);
+    }
+  }
+  std::stable_sort(displays.begin(), displays.end(),
+                   [](const DisplayInfo& left, const DisplayInfo& right) {
+                     if (left.primary != right.primary) return left.primary;
+                     if (left.desktop_rect.top != right.desktop_rect.top)
+                       return left.desktop_rect.top < right.desktop_rect.top;
+                     return left.desktop_rect.left < right.desktop_rect.left;
+                   });
+  return displays;
+}
+
+std::string DisplaySourceKey(const DisplayInfo& display) {
+  std::ostringstream key;
+  key << display.id << ':' << display.desktop_rect.left << ':'
+      << display.desktop_rect.top << ':' << display.desktop_rect.right << ':'
+      << display.desktop_rect.bottom << ':' << display.rotation_degrees;
+  return key.str();
+}
+
+webrtc::scoped_refptr<DxgiDesktopSource> DxgiDesktopSource::Create(
+    const DisplayInfo& display) {
+  return webrtc::make_ref_counted<DxgiDesktopSource>(display);
+}
+
+DxgiDesktopSource::DxgiDesktopSource(DisplayInfo display)
+    : VideoTrackSource(/*remote=*/false), display_(std::move(display)) {}
+
+DxgiDesktopSource::~DxgiDesktopSource() {
+  Stop();
+  if (cursor_dc_) {
+    if (cursor_old_bitmap_) SelectObject(cursor_dc_, cursor_old_bitmap_);
+    if (cursor_bitmap_) DeleteObject(cursor_bitmap_);
+    DeleteDC(cursor_dc_);
+  }
+}
+
+void DxgiDesktopSource::Start() {
+  bool expected = false;
+  if (!running_.compare_exchange_strong(expected, true)) return;
+  capture_thread_ = std::thread([this] { CaptureLoop(); });
+}
+
+void DxgiDesktopSource::Stop() {
+  if (!running_.exchange(false)) return;
+  first_frame_condition_.notify_all();
+  if (capture_thread_.joinable()) capture_thread_.join();
+  std::lock_guard<std::mutex> lock(state_mutex_);
+  ResetDuplication();
+}
+
+bool DxgiDesktopSource::WaitForFirstFrame(
+    std::chrono::milliseconds timeout) {
+  if (captured_frames_.load() > 0) return true;
+  std::unique_lock<std::mutex> lock(first_frame_mutex_);
+  return first_frame_condition_.wait_for(lock, timeout, [this] {
+    return captured_frames_.load() > 0 || !running_.load();
+  }) && captured_frames_.load() > 0;
+}
+
+bool DxgiDesktopSource::InitializeDuplication() {
+  ResetDuplication();
+  Microsoft::WRL::ComPtr<IDXGIFactory1> factory;
+  if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return false;
+  Microsoft::WRL::ComPtr<IDXGIAdapter1> selected_adapter;
+  for (UINT index = 0;; ++index) {
+    Microsoft::WRL::ComPtr<IDXGIAdapter1> adapter;
+    if (factory->EnumAdapters1(index, &adapter) == DXGI_ERROR_NOT_FOUND) break;
+    DXGI_ADAPTER_DESC1 desc{};
+    if (SUCCEEDED(adapter->GetDesc1(&desc)) &&
+        desc.AdapterLuid.HighPart == display_.adapter_luid.HighPart &&
+        desc.AdapterLuid.LowPart == display_.adapter_luid.LowPart) {
+      selected_adapter = adapter;
+      break;
+    }
+  }
+  if (!selected_adapter) return false;
+  const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1,
+                                      D3D_FEATURE_LEVEL_11_0,
+                                      D3D_FEATURE_LEVEL_10_1,
+                                      D3D_FEATURE_LEVEL_10_0};
+  D3D_FEATURE_LEVEL selected_level{};
+  UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+  HRESULT hr = D3D11CreateDevice(selected_adapter.Get(),
+                                 D3D_DRIVER_TYPE_UNKNOWN, nullptr, flags,
+                                 levels, ARRAYSIZE(levels), D3D11_SDK_VERSION,
+                                 &device_, &selected_level, &context_);
+  if (FAILED(hr)) return false;
+  Microsoft::WRL::ComPtr<IDXGIOutput> output;
+  if (FAILED(selected_adapter->EnumOutputs(display_.output_index, &output)))
+    return false;
+  Microsoft::WRL::ComPtr<IDXGIOutput1> output1;
+  if (FAILED(output.As(&output1)) ||
+      FAILED(output1->DuplicateOutput(device_.Get(), &duplication_))) {
+    return false;
+  }
+  return true;
+}
+
+void DxgiDesktopSource::ResetDuplication() {
+  staging_.Reset();
+  duplication_.Reset();
+  context_.Reset();
+  device_.Reset();
+  surface_width_ = 0;
+  surface_height_ = 0;
+  last_frame_ = nullptr;
+  last_broadcast_us_ = 0;
+}
+
+void DxgiDesktopSource::CaptureLoop() {
+  SetThreadDescription(GetCurrentThread(), L"IM.codes DXGI capture");
+  CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+  auto next_frame = std::chrono::steady_clock::now();
+  while (running_) {
+    {
+      std::lock_guard<std::mutex> lock(state_mutex_);
+      if (!duplication_ && !InitializeDuplication()) {
+        ++consecutive_failures_;
+        ++dropped_frames_;
+      } else if (CaptureOne()) {
+        consecutive_failures_ = 0;
+      } else {
+        ++dropped_frames_;
+      }
+      if (consecutive_failures_ >= 5) {
+        ResetDuplication();
+        consecutive_failures_ = 0;
+      }
+    }
+    next_frame += std::chrono::milliseconds(33);
+    std::this_thread::sleep_until(next_frame);
+    if (std::chrono::steady_clock::now() - next_frame >
+        std::chrono::milliseconds(250)) {
+      next_frame = std::chrono::steady_clock::now();
+    }
+  }
+  CoUninitialize();
+}
+
+bool DxgiDesktopSource::CaptureOne() {
+  DXGI_OUTDUPL_FRAME_INFO frame_info{};
+  Microsoft::WRL::ComPtr<IDXGIResource> resource;
+  const HRESULT acquired =
+      duplication_->AcquireNextFrame(16, &frame_info, &resource);
+  const CaptureAcquireAction acquire_action =
+      ClassifyCaptureAcquireResult(acquired);
+  if (acquire_action == CaptureAcquireAction::kWait) {
+    // A completely static desktop may not yield another DXGI frame for a long
+    // time. Re-submit the last immutable buffer at a bounded cadence so an
+    // upstream PLI/keyframe request can recover without turning capture into a
+    // screenshot poll or continuously re-encoding an unchanged desktop.
+    const int64_t now_us =
+        webrtc::Clock::GetRealTimeClock()->TimeInMicroseconds();
+    if (last_frame_ && now_us - last_broadcast_us_ >= 2'000'000)
+      BroadcastFrame(last_frame_);
+    return true;
+  }
+  if (acquire_action == CaptureAcquireAction::kReset) {
+    ResetDuplication();
+    return false;
+  }
+  if (acquire_action != CaptureAcquireAction::kFrame) return false;
+  struct ReleaseFrame {
+    IDXGIOutputDuplication* duplication;
+    ~ReleaseFrame() { duplication->ReleaseFrame(); }
+  } release{duplication_.Get()};
+
+  if (!ConsumeFrameMetadata(frame_info)) return false;
+
+  Microsoft::WRL::ComPtr<ID3D11Texture2D> texture;
+  if (FAILED(resource.As(&texture))) return false;
+  D3D11_TEXTURE2D_DESC desc{};
+  texture->GetDesc(&desc);
+  if (desc.Width == 0 || desc.Height == 0 ||
+      desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM) {
+    return false;
+  }
+  if (!staging_ || surface_width_ != desc.Width ||
+      surface_height_ != desc.Height) {
+    D3D11_TEXTURE2D_DESC staging_desc = desc;
+    staging_desc.BindFlags = 0;
+    staging_desc.MiscFlags = 0;
+    staging_desc.Usage = D3D11_USAGE_STAGING;
+    staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    staging_desc.ArraySize = 1;
+    staging_desc.MipLevels = 1;
+    staging_desc.SampleDesc.Count = 1;
+    if (FAILED(device_->CreateTexture2D(&staging_desc, nullptr, &staging_)))
+      return false;
+    surface_width_ = desc.Width;
+    surface_height_ = desc.Height;
+  }
+  context_->CopyResource(staging_.Get(), texture.Get());
+  D3D11_MAPPED_SUBRESOURCE mapped{};
+  if (FAILED(context_->Map(staging_.Get(), 0, D3D11_MAP_READ, 0, &mapped)))
+    return false;
+  const bool cursor_ready = EnsureCursorSurface(desc.Width, desc.Height);
+  if (!cursor_ready) {
+    context_->Unmap(staging_.Get(), 0);
+    return false;
+  }
+  for (UINT row = 0; row < desc.Height; ++row) {
+    std::memcpy(cursor_bits_ + static_cast<size_t>(row) * desc.Width * 4,
+                static_cast<const uint8_t*>(mapped.pData) +
+                    static_cast<size_t>(row) * mapped.RowPitch,
+                static_cast<size_t>(desc.Width) * 4);
+  }
+  context_->Unmap(staging_.Get(), 0);
+  CompositeCursor(cursor_bits_, static_cast<int>(desc.Width * 4), desc.Width,
+                  desc.Height);
+
+  auto raw = webrtc::I420Buffer::Create(desc.Width, desc.Height);
+  if (libyuv::ARGBToI420(cursor_bits_, static_cast<int>(desc.Width * 4),
+                         raw->MutableDataY(), raw->StrideY(),
+                         raw->MutableDataU(), raw->StrideU(),
+                         raw->MutableDataV(), raw->StrideV(), desc.Width,
+                         desc.Height) != 0) {
+    return false;
+  }
+  webrtc::scoped_refptr<webrtc::I420Buffer> output = raw;
+  if (display_.rotation_degrees != 0) {
+    const bool swap = display_.rotation_degrees == 90 ||
+                      display_.rotation_degrees == 270;
+    output = webrtc::I420Buffer::Create(swap ? desc.Height : desc.Width,
+                                        swap ? desc.Width : desc.Height);
+    if (libyuv::I420Rotate(
+            raw->DataY(), raw->StrideY(), raw->DataU(), raw->StrideU(),
+            raw->DataV(), raw->StrideV(), output->MutableDataY(),
+            output->StrideY(), output->MutableDataU(), output->StrideU(),
+            output->MutableDataV(), output->StrideV(), desc.Width, desc.Height,
+            LibyuvRotation(display_.rotation_degrees)) != 0) {
+      return false;
+    }
+  }
+  last_frame_ = output;
+  BroadcastFrame(output);
+  return true;
+}
+
+void DxgiDesktopSource::BroadcastFrame(
+    const webrtc::scoped_refptr<webrtc::I420Buffer>& buffer) {
+  const int64_t now_us =
+      webrtc::Clock::GetRealTimeClock()->TimeInMicroseconds();
+  webrtc::VideoFrame frame = webrtc::VideoFrame::Builder()
+                                  .set_video_frame_buffer(buffer)
+                                  .set_timestamp_us(now_us)
+                                  .set_rotation(webrtc::kVideoRotation_0)
+                                  .build();
+  broadcaster_.OnFrame(frame);
+  last_broadcast_us_ = now_us;
+  captured_frames_++;
+  first_frame_condition_.notify_all();
+}
+
+bool DxgiDesktopSource::ConsumeFrameMetadata(
+    const DXGI_OUTDUPL_FRAME_INFO& frame_info) {
+  protected_content_masked_ = frame_info.ProtectedContentMaskedOut != FALSE;
+  if (protected_content_masked_) return false;
+  if (frame_info.TotalMetadataBufferSize > 0) {
+    if (frame_metadata_.size() < frame_info.TotalMetadataBufferSize)
+      frame_metadata_.resize(frame_info.TotalMetadataBufferSize);
+    UINT move_bytes = 0;
+    auto* moves = reinterpret_cast<DXGI_OUTDUPL_MOVE_RECT*>(
+        frame_metadata_.data());
+    if (FAILED(duplication_->GetFrameMoveRects(
+            static_cast<UINT>(frame_metadata_.size()), moves,
+            &move_bytes)) || move_bytes > frame_metadata_.size()) {
+      return false;
+    }
+    UINT dirty_bytes = 0;
+    auto* dirty = reinterpret_cast<RECT*>(frame_metadata_.data() + move_bytes);
+    if (FAILED(duplication_->GetFrameDirtyRects(
+            static_cast<UINT>(frame_metadata_.size() - move_bytes), dirty,
+            &dirty_bytes)) ||
+        static_cast<size_t>(move_bytes) + dirty_bytes >
+            frame_metadata_.size()) {
+      return false;
+    }
+    move_regions_ += move_bytes / sizeof(DXGI_OUTDUPL_MOVE_RECT);
+    dirty_regions_ += dirty_bytes / sizeof(RECT);
+  }
+
+  if (frame_info.PointerShapeBufferSize > 0) {
+    if (pointer_shape_.size() < frame_info.PointerShapeBufferSize)
+      pointer_shape_.resize(frame_info.PointerShapeBufferSize);
+    UINT required = 0;
+    DXGI_OUTDUPL_POINTER_SHAPE_INFO shape{};
+    if (FAILED(duplication_->GetFramePointerShape(
+            static_cast<UINT>(pointer_shape_.size()), pointer_shape_.data(),
+            &required, &shape)) || required > pointer_shape_.size() ||
+        shape.Width == 0 || shape.Height == 0 || shape.Pitch == 0) {
+      return false;
+    }
+    pointer_shape_.resize(required);
+    pointer_shape_info_ = shape;
+    pointer_shape_valid_ = true;
+    ++pointer_updates_;
+  }
+  if (frame_info.LastMouseUpdateTime.QuadPart != 0) {
+    pointer_position_ = frame_info.PointerPosition.Position;
+    pointer_visible_ = frame_info.PointerPosition.Visible != FALSE;
+    pointer_position_known_ = true;
+    ++pointer_updates_;
+  }
+  return true;
+}
+
+bool DxgiDesktopSource::EnsureCursorSurface(int width, int height) {
+  if (cursor_dc_ && cursor_width_ == width && cursor_height_ == height)
+    return true;
+  if (cursor_dc_) {
+    if (cursor_old_bitmap_) SelectObject(cursor_dc_, cursor_old_bitmap_);
+    DeleteObject(cursor_bitmap_);
+    DeleteDC(cursor_dc_);
+  }
+  cursor_dc_ = CreateCompatibleDC(nullptr);
+  BITMAPINFO info{};
+  info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+  info.bmiHeader.biWidth = width;
+  info.bmiHeader.biHeight = -height;
+  info.bmiHeader.biPlanes = 1;
+  info.bmiHeader.biBitCount = 32;
+  info.bmiHeader.biCompression = BI_RGB;
+  cursor_bitmap_ = CreateDIBSection(cursor_dc_, &info, DIB_RGB_COLORS,
+                                    reinterpret_cast<void**>(&cursor_bits_),
+                                    nullptr, 0);
+  if (!cursor_dc_ || !cursor_bitmap_ || !cursor_bits_) return false;
+  cursor_old_bitmap_ = SelectObject(cursor_dc_, cursor_bitmap_);
+  cursor_width_ = width;
+  cursor_height_ = height;
+  return true;
+}
+
+void DxgiDesktopSource::CompositeCursor(uint8_t* bgra, int stride,
+                                        int width, int height) {
+  if (pointer_position_known_) {
+    if (pointer_visible_ && pointer_shape_valid_)
+      CompositeDxgiCursor(bgra, stride, width, height);
+    // DXGI reports Visible=false when the pointer is hidden or already
+    // embedded in the acquired desktop image. Never draw a second cursor.
+    return;
+  }
+
+  // Very first frames can precede DXGI's first pointer metadata update. Use
+  // the current native cursor only until DXGI becomes authoritative.
+  CURSORINFO cursor{};
+  cursor.cbSize = sizeof(cursor);
+  if (!GetCursorInfo(&cursor) || !(cursor.flags & CURSOR_SHOWING) ||
+      !cursor.hCursor) {
+    return;
+  }
+  ICONINFO icon{};
+  if (!GetIconInfo(cursor.hCursor, &icon)) return;
+  const int x = cursor.ptScreenPos.x - display_.desktop_rect.left -
+                static_cast<int>(icon.xHotspot);
+  const int y = cursor.ptScreenPos.y - display_.desktop_rect.top -
+                static_cast<int>(icon.yHotspot);
+  DrawIconEx(cursor_dc_, x, y, cursor.hCursor, 0, 0, 0, nullptr, DI_NORMAL);
+  if (icon.hbmColor) DeleteObject(icon.hbmColor);
+  if (icon.hbmMask) DeleteObject(icon.hbmMask);
+}
+
+void DxgiDesktopSource::CompositeDxgiCursor(uint8_t* bgra, int stride,
+                                            int width, int height) {
+  if (!bgra || stride < width * 4 || pointer_shape_.empty()) return;
+  const int cursor_x = pointer_position_.x;
+  const int cursor_y = pointer_position_.y;
+  const UINT shape_width = pointer_shape_info_.Width;
+  UINT shape_height = pointer_shape_info_.Height;
+  if (pointer_shape_info_.Type ==
+      DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME) {
+    if ((shape_height & 1) != 0) return;
+    shape_height /= 2;
+  }
+
+  for (UINT sy = 0; sy < shape_height; ++sy) {
+    const int dy = cursor_y + static_cast<int>(sy);
+    if (dy < 0 || dy >= height) continue;
+    for (UINT sx = 0; sx < shape_width; ++sx) {
+      const int dx = cursor_x + static_cast<int>(sx);
+      if (dx < 0 || dx >= width) continue;
+      uint8_t* destination = bgra + static_cast<size_t>(dy) * stride +
+                             static_cast<size_t>(dx) * 4;
+      if (pointer_shape_info_.Type ==
+          DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME) {
+        const size_t byte_index = static_cast<size_t>(sy) *
+                                      pointer_shape_info_.Pitch +
+                                  sx / 8;
+        const size_t xor_index = static_cast<size_t>(sy + shape_height) *
+                                     pointer_shape_info_.Pitch +
+                                 sx / 8;
+        if (xor_index >= pointer_shape_.size()) return;
+        const uint8_t bit = static_cast<uint8_t>(0x80u >> (sx & 7));
+        const uint8_t and_mask =
+            (pointer_shape_[byte_index] & bit) != 0 ? 0xff : 0x00;
+        const uint8_t xor_mask =
+            (pointer_shape_[xor_index] & bit) != 0 ? 0xff : 0x00;
+        for (int channel = 0; channel < 3; ++channel)
+          destination[channel] =
+              static_cast<uint8_t>((destination[channel] & and_mask) ^
+                                   xor_mask);
+        destination[3] = 0xff;
+        continue;
+      }
+
+      const size_t source_index = static_cast<size_t>(sy) *
+                                      pointer_shape_info_.Pitch +
+                                  static_cast<size_t>(sx) * 4;
+      if (source_index + 4 > pointer_shape_.size()) return;
+      const uint8_t* source = pointer_shape_.data() + source_index;
+      if (pointer_shape_info_.Type ==
+          DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR) {
+        for (int channel = 0; channel < 3; ++channel) {
+          destination[channel] = source[3] == 0
+                                     ? destination[channel] ^ source[channel]
+                                     : source[channel];
+        }
+        destination[3] = 0xff;
+        continue;
+      }
+      if (pointer_shape_info_.Type !=
+          DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR) {
+        return;
+      }
+      const uint32_t alpha = source[3];
+      const uint32_t inverse = 255 - alpha;
+      for (int channel = 0; channel < 3; ++channel) {
+        destination[channel] = static_cast<uint8_t>(
+            std::min<uint32_t>(255, source[channel] +
+                                        destination[channel] * inverse / 255));
+      }
+      destination[3] = 0xff;
+    }
+  }
+}
+
+}  // namespace imcodes::rd

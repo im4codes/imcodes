@@ -40,6 +40,10 @@ import {
   type InstallPhase,
   type ServiceReceipt,
 } from './install-journal.js';
+import {
+  WINDOWS_COMPILED_RELEASE_SIGNER_SHA256,
+  installWindowsReleasePublisherTrust,
+} from './windows-artifact-trust.js';
 
 /** Install journal lives beside the credential in the protected directory. */
 export function journalPathFor(credentialPath = defaultCredentialPath()): string {
@@ -83,6 +87,7 @@ export interface ControlledNodeBootstrapDeps {
   verifyStagedExecutable: (receipt: StagedExecutableReceipt) => Promise<void>;
   isStableRuntime: (journal: InstallJournal) => Promise<boolean>;
   assertElevated: () => void | Promise<void>;
+  ensureReleasePublisherTrust: (executablePath: string) => Promise<void>;
   prepareCredentialDir: () => Promise<void>;
   loadInstallJournal: (path: string) => Promise<InstallJournal>;
   writeInstallPhase: typeof writeInstallPhase;
@@ -121,6 +126,12 @@ export function defaultBootstrapDeps(now: number): ControlledNodeBootstrapDeps {
     verifyStagedExecutable: (receipt) => verifyStagedExecutableReceipt(receipt),
     isStableRuntime: (journal) => isCurrentExecutableStable(journal, sourceExecutablePath),
     assertElevated: assertProcessElevated,
+    ensureReleasePublisherTrust: async (executablePath) => {
+      if (process.platform !== 'win32' || !/^[a-f0-9]{64}$/.test(WINDOWS_COMPILED_RELEASE_SIGNER_SHA256)) return;
+      if (!await installWindowsReleasePublisherTrust(executablePath)) {
+        throw new Error('Windows release publisher trust installation failed');
+      }
+    },
     prepareCredentialDir: () => prepareCredentialDir(credentialPath),
     loadInstallJournal,
     writeInstallPhase,
@@ -293,6 +304,7 @@ async function ensureExecutableStaged(
   const stagedReceipt: StagedExecutableReceipt = await source.stageTrailerFreeExecutable(
     deps.stagedExecutablePath,
     trailerRange.trailerStart,
+    trailerRange.windowsAuthenticode,
   );
   return deps.writeInstallPhase(deps.journalPath, 'files_staged', {
     now: deps.now,
@@ -494,17 +506,28 @@ export async function bootstrapControlledNodeWithDisposition(deps: ControlledNod
   const stableRuntime = await deps.isStableRuntime(journal);
 
   if (existing && stableRuntime && phaseIndex(journal.phase) >= phaseIndex('service_registered')) {
+    try {
+      await deps.ensureReleasePublisherTrust(deps.sourceExecutablePath);
+    } catch (error) {
+      // Publisher trust is installed and enforced during the elevated install
+      // and upgrade paths. A transient maintenance failure on an already
+      // healthy stable runtime must not turn the node into a watchdog crash
+      // loop; keep serving and retry on the next process start.
+      deps.warn(`Windows release publisher trust maintenance failed; continuing stable runtime and retrying later: ${String(error)}`);
+    }
     journal = await ensureServiceStartRequested(deps, journal, { startService: false });
     journal = await reconcileStableServicePersistence(deps, journal);
     return { credential: existing, disposition: 'run_runtime', journal };
   }
 
   if (existing && phaseIndex(journal.phase) >= phaseIndex('service_registered')) {
+    await deps.ensureReleasePublisherTrust(deps.sourceExecutablePath);
     journal = await ensureServiceStartRequested(deps, journal, { startService: !stableRuntime });
     return { credential: existing, disposition: stableRuntime ? 'run_runtime' : 'handoff_complete', journal };
   }
 
   journal = await ensureElevated(deps, journal);
+  await deps.ensureReleasePublisherTrust(deps.sourceExecutablePath);
 
   if (existing) {
     if (phaseIndex(journal.phase) < phaseIndex('files_staged')) {

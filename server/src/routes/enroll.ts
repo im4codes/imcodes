@@ -12,11 +12,14 @@ import logger from '../util/logger.js';
 import { AUTH_IDENTITY_ERRORS } from '../../../shared/auth-identity.js';
 import { EXPECTED_USER_ID_HEADER } from '../../../shared/http-header-names.js';
 import { NODE_ROLE, encodeEnrollmentTrailer, isEnrollmentNodeTokenHash } from '../../../shared/remote-exec.js';
+import { REMOTE_DESKTOP_PROTOCOL_VERSION } from '../../../shared/remote-desktop.js';
+import { buildWindowsAuthenticodeEnrollmentPlan } from '../../../shared/windows-authenticode-enrollment.js';
 import { deriveRefName, deriveDisplayName } from '../../../shared/machine-reference.js';
 import {
   isCanonicalControlledNodePair,
   CONTROLLED_NODE_ARTIFACT_ASSETS,
   CONTROLLED_NODE_ARTIFACT_HEADERS,
+  CONTROLLED_NODE_OS_WIN,
   controlledNodeComputerUseHelperFilename,
   isControlledNodeArtifactArch,
   isControlledNodeArtifactCompatibleWithRuntime,
@@ -27,6 +30,13 @@ import {
   type ControlledNodeArtifactArch,
   type ControlledNodeOs,
 } from '../../../shared/controlled-node-artifacts.js';
+import {
+  REMOTE_DESKTOP_LEGACY_UPGRADE_PROTOCOL_VERSION,
+  REMOTE_DESKTOP_WORKER_FILENAME,
+  REMOTE_DESKTOP_WORKER_MANIFEST_SUFFIX,
+  REMOTE_DESKTOP_VIRTUAL_DISPLAY_ARCHIVE_FILENAME,
+  validateRemoteDesktopWorkerManifest,
+} from '../../../shared/remote-desktop-worker.js';
 import {
   createArtifactCatalog,
   defaultArtifactCatalog,
@@ -379,6 +389,7 @@ function buildArtifactStream(
   sizeBytes: number,
   trailer: Buffer,
   closeOnce: () => Promise<void>,
+  patch?: { offset: number; bytes: Buffer },
 ): ReadableStream<Uint8Array> {
   let position = 0;
   let trailerSent = false;
@@ -390,8 +401,22 @@ function buildArtifactStream(
           const length = Math.min(buffer.length, sizeBytes - position);
           const { bytesRead } = await handle.read(buffer, 0, length, position);
           if (bytesRead <= 0) throw new Error('artifact_stream_ended_early');
+          const chunkStart = position;
           position += bytesRead;
-          controller.enqueue(Buffer.from(buffer.subarray(0, bytesRead)));
+          const chunk = Buffer.from(buffer.subarray(0, bytesRead));
+          if (patch) {
+            const overlapStart = Math.max(chunkStart, patch.offset);
+            const overlapEnd = Math.min(position, patch.offset + patch.bytes.length);
+            if (overlapStart < overlapEnd) {
+              patch.bytes.copy(
+                chunk,
+                overlapStart - chunkStart,
+                overlapStart - patch.offset,
+                overlapEnd - patch.offset,
+              );
+            }
+          }
+          controller.enqueue(chunk);
           return;
         }
         if (!trailerSent) {
@@ -436,6 +461,27 @@ function buildBareArtifactStream(
         await closeOnce();
         controller.error(error);
       }
+    },
+    async cancel() {
+      await closeOnce();
+    },
+  });
+}
+
+function buildBufferArtifactStream(
+  bytes: Buffer,
+  closeOnce: () => Promise<void>,
+): ReadableStream<Uint8Array> {
+  let sent = false;
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      if (!sent) {
+        sent = true;
+        controller.enqueue(Buffer.from(bytes));
+        return;
+      }
+      await closeOnce();
+      controller.close();
     },
     async cancel() {
       await closeOnce();
@@ -548,6 +594,26 @@ async function consumeAndStream(c: Context, rawTicket: string): Promise<Response
     return c.json({ error: 'artifact_digest_mismatch' }, 503);
   }
 
+  let streamSuffix = trailer;
+  let streamPatch: { offset: number; bytes: Buffer } | undefined;
+  if (downloadTarget.os === CONTROLLED_NODE_OS_WIN) {
+    const header = Buffer.alloc(Math.min(actualSize, 4096));
+    const { bytesRead } = await opened.handle.read(header, 0, header.length, 0);
+    const personalization = bytesRead === header.length
+      ? buildWindowsAuthenticodeEnrollmentPlan(header, actualSize, trailer)
+      : null;
+    if (!personalization) {
+      await opened.close();
+      await releaseAttempt(c.env.DB as Database, reservation.attemptId, reservation.ticketId, ip, now);
+      return c.json({ error: 'windows_artifact_authenticode_container_invalid' }, 503);
+    }
+    streamSuffix = personalization.certificateEntry;
+    streamPatch = {
+      offset: personalization.sizeFieldOffset,
+      bytes: personalization.patchedCertificateTableSize,
+    };
+  }
+
   // Step 4: commit attempt + consume audit before response bytes. Audit/commit
   // failure is pre-response, so close/release and return a retryable 503.
   try {
@@ -559,7 +625,7 @@ async function consumeAndStream(c: Context, rawTicket: string): Promise<Response
     return c.json({ error: 'ticket_consume_unavailable' }, 503);
   }
 
-  const total = actualSize + trailer.length;
+  const total = actualSize + streamSuffix.length;
   c.header('Content-Length', String(total));
   c.header('Content-Type', 'application/octet-stream');
   c.header('Content-Disposition', `attachment; filename="${filename}"`);
@@ -570,7 +636,7 @@ async function consumeAndStream(c: Context, rawTicket: string): Promise<Response
 
   // Step 5: stream. safeCloseOnce guarantees a single FD close across the
   // ReadableStream's normal end, stream error, and explicit cancellation.
-  const stream = buildArtifactStream(opened.handle, actualSize, trailer, opened.close);
+  const stream = buildArtifactStream(opened.handle, actualSize, streamSuffix, opened.close, streamPatch);
   return c.body(stream as unknown as ReadableStream, 200);
 }
 
@@ -596,7 +662,13 @@ const NODE_ARTIFACT_QUERY = z.object({
   serverId: z.string().min(1).max(128),
   os: z.string(),
   arch: z.string(),
-  asset: z.enum([CONTROLLED_NODE_ARTIFACT_ASSETS.NODE, CONTROLLED_NODE_ARTIFACT_ASSETS.COMPUTER_USE_HELPER])
+  asset: z.enum([
+    CONTROLLED_NODE_ARTIFACT_ASSETS.NODE,
+    CONTROLLED_NODE_ARTIFACT_ASSETS.COMPUTER_USE_HELPER,
+    CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER,
+    CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER_MANIFEST,
+    CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_VIRTUAL_DISPLAY,
+  ])
     .default(CONTROLLED_NODE_ARTIFACT_ASSETS.NODE),
 }).strict();
 
@@ -656,6 +728,180 @@ async function openComputerUseHelperArtifact(
   } catch {
     await handle?.close().catch(() => {});
     return null;
+  }
+}
+
+async function openRemoteDesktopWorkerArtifact(
+  dir: string,
+  asset: typeof CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER
+    | typeof CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER_MANIFEST
+    | typeof CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_VIRTUAL_DISPLAY,
+  legacyManifest = false,
+): Promise<{
+  handle?: FileHandle;
+  bytes?: Buffer;
+  close: () => Promise<void>;
+  filename: string;
+  sizeBytes: number;
+  sha256: string;
+  version: string;
+} | null> {
+  const workerDir = join(dir, 'remote-desktop-worker', 'win32-x64');
+  const executablePath = join(workerDir, REMOTE_DESKTOP_WORKER_FILENAME);
+  const manifestFilename = `${REMOTE_DESKTOP_WORKER_FILENAME}${REMOTE_DESKTOP_WORKER_MANIFEST_SUFFIX}`;
+  const manifestPath = join(workerDir, manifestFilename);
+  const virtualDisplayPath = join(workerDir, REMOTE_DESKTOP_VIRTUAL_DISPLAY_ARCHIVE_FILENAME);
+  let executable: FileHandle | null = null;
+  let manifestHandle: FileHandle | null = null;
+  let virtualDisplayHandle: FileHandle | null = null;
+  let requested: FileHandle | null = null;
+  try {
+    const [executablePathStat, manifestPathStat, virtualDisplayPathStat] = await Promise.all([
+      lstat(executablePath),
+      lstat(manifestPath),
+      lstat(virtualDisplayPath),
+    ]);
+    if (!executablePathStat.isFile() || executablePathStat.isSymbolicLink()
+      || !manifestPathStat.isFile() || manifestPathStat.isSymbolicLink()
+      || !virtualDisplayPathStat.isFile() || virtualDisplayPathStat.isSymbolicLink()
+      || manifestPathStat.size <= 0 || manifestPathStat.size > 64 * 1024) return null;
+    manifestHandle = await open(manifestPath, 'r');
+    const manifestStat = await manifestHandle.stat();
+    if (!manifestStat.isFile() || manifestStat.size !== manifestPathStat.size
+      || manifestStat.mtimeMs !== manifestPathStat.mtimeMs
+      || manifestStat.ctimeMs !== manifestPathStat.ctimeMs) return null;
+    // Keep the exact bytes used for the HTTP digest. Decoding and re-encoding
+    // would make the advertised SHA-256 differ from the bytes held by this
+    // pinned descriptor if a malformed UTF-8 sequence ever reached disk.
+    const rawManifest = await manifestHandle.readFile();
+    await manifestHandle.close();
+    manifestHandle = null;
+    const manifest = validateRemoteDesktopWorkerManifest(JSON.parse(rawManifest.toString('utf8')));
+    if (!manifest || manifest.protocolVersion !== REMOTE_DESKTOP_PROTOCOL_VERSION
+      || manifest.size !== executablePathStat.size
+      || manifest.virtualDisplay.size !== virtualDisplayPathStat.size) return null;
+
+    executable = await open(executablePath, 'r');
+    const executableStat = await executable.stat();
+    if (!executableStat.isFile() || executableStat.size !== executablePathStat.size
+      || executableStat.mtimeMs !== executablePathStat.mtimeMs
+      || executableStat.ctimeMs !== executablePathStat.ctimeMs) return null;
+    const executableHash = createHash('sha256');
+    const executableBuffer = Buffer.alloc(64 * 1024);
+    let executablePosition = 0;
+    while (executablePosition < executableStat.size) {
+      const { bytesRead } = await executable.read(
+        executableBuffer,
+        0,
+        Math.min(executableBuffer.length, executableStat.size - executablePosition),
+        executablePosition,
+      );
+      if (bytesRead <= 0) return null;
+      executableHash.update(executableBuffer.subarray(0, bytesRead));
+      executablePosition += bytesRead;
+    }
+    if (executableHash.digest('hex') !== manifest.sha256) return null;
+
+    virtualDisplayHandle = await open(virtualDisplayPath, 'r');
+    const virtualDisplayStat = await virtualDisplayHandle.stat();
+    if (!virtualDisplayStat.isFile()
+      || virtualDisplayStat.size !== virtualDisplayPathStat.size
+      || virtualDisplayStat.mtimeMs !== virtualDisplayPathStat.mtimeMs
+      || virtualDisplayStat.ctimeMs !== virtualDisplayPathStat.ctimeMs) {
+      return null;
+    }
+    const virtualDisplayHash = createHash('sha256');
+    const virtualDisplayBuffer = Buffer.alloc(64 * 1024);
+    let virtualDisplayPosition = 0;
+    while (virtualDisplayPosition < virtualDisplayStat.size) {
+      const { bytesRead } = await virtualDisplayHandle.read(
+        virtualDisplayBuffer,
+        0,
+        Math.min(virtualDisplayBuffer.length, virtualDisplayStat.size - virtualDisplayPosition),
+        virtualDisplayPosition,
+      );
+      if (bytesRead <= 0) {
+        return null;
+      }
+      virtualDisplayHash.update(virtualDisplayBuffer.subarray(0, bytesRead));
+      virtualDisplayPosition += bytesRead;
+    }
+    if (virtualDisplayHash.digest('hex') !== manifest.virtualDisplay.sha256) {
+      return null;
+    }
+
+    if (asset === CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER_MANIFEST
+      && legacyManifest) {
+      const bytes = Buffer.from(JSON.stringify({
+        ...manifest,
+        protocolVersion: REMOTE_DESKTOP_LEGACY_UPGRADE_PROTOCOL_VERSION,
+      }));
+      await executable.close();
+      executable = null;
+      await virtualDisplayHandle.close();
+      virtualDisplayHandle = null;
+      return {
+        bytes,
+        close: async () => {},
+        filename: manifestFilename,
+        sizeBytes: bytes.length,
+        sha256: createHash('sha256').update(bytes).digest('hex'),
+        version: manifest.workerVersion,
+      };
+    }
+
+    const requestedPath = asset === CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER
+      ? executablePath
+      : asset === CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER_MANIFEST
+        ? manifestPath : virtualDisplayPath;
+    const requestedPathStat = asset === CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER
+      ? executablePathStat
+      : asset === CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER_MANIFEST
+        ? manifestPathStat : virtualDisplayPathStat;
+    requested = asset === CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER
+      ? executable
+      : asset === CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_VIRTUAL_DISPLAY
+        ? virtualDisplayHandle : await open(requestedPath, 'r');
+    if (requested === executable) executable = null;
+    if (requested === virtualDisplayHandle) virtualDisplayHandle = null;
+    else {
+      await virtualDisplayHandle.close();
+      virtualDisplayHandle = null;
+    }
+    const requestedStat = await requested.stat();
+    if (!requestedStat.isFile() || requestedStat.size !== requestedPathStat.size
+      || requestedStat.mtimeMs !== requestedPathStat.mtimeMs
+      || requestedStat.ctimeMs !== requestedPathStat.ctimeMs) return null;
+    const requestedHash = asset === CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER
+      ? manifest.sha256
+      : asset === CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER_MANIFEST
+        ? createHash('sha256').update(rawManifest).digest('hex')
+        : manifest.virtualDisplay.sha256;
+    let closed = false;
+    const pinned = requested;
+    requested = null;
+    return {
+      handle: pinned,
+      close: async () => {
+        if (closed) return;
+        closed = true;
+        await pinned.close().catch(() => {});
+      },
+      filename: asset === CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER
+        ? REMOTE_DESKTOP_WORKER_FILENAME
+        : asset === CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER_MANIFEST
+          ? manifestFilename : REMOTE_DESKTOP_VIRTUAL_DISPLAY_ARCHIVE_FILENAME,
+      sizeBytes: requestedStat.size,
+      sha256: requestedHash,
+      version: manifest.workerVersion,
+    };
+  } catch {
+    return null;
+  } finally {
+    await executable?.close().catch(() => {});
+    await manifestHandle?.close().catch(() => {});
+    await virtualDisplayHandle?.close().catch(() => {});
+    await requested?.close().catch(() => {});
   }
 }
 
@@ -724,6 +970,44 @@ enrollRoutes.get('/v2/node-artifact', async (c) => {
     c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.SIZE_BYTES, String(openedHelper.sizeBytes));
     c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.FILENAME, openedHelper.filename);
     return c.body(buildBareArtifactStream(openedHelper.handle, openedHelper.sizeBytes, openedHelper.close) as unknown as ReadableStream, 200);
+  }
+  if (asset === CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER
+    || asset === CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER_MANIFEST
+    || asset === CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_VIRTUAL_DISPLAY) {
+    if (artifactTarget.os !== 'win' || artifactTarget.arch !== 'x64') {
+      return c.json({ error: 'remote_desktop_worker_unsupported', os: artifactTarget.os, arch: artifactTarget.arch }, 404);
+    }
+    const requestedProtocol = c.req.header(
+      CONTROLLED_NODE_ARTIFACT_HEADERS.REMOTE_DESKTOP_PROTOCOL_VERSION,
+    );
+    const requestedProtocols = requestedProtocol?.split(',').map((value) => value.trim()) ?? [];
+    if (requestedProtocols.length > 0
+      && requestedProtocols.some((value) => value !== String(REMOTE_DESKTOP_PROTOCOL_VERSION))) {
+      return c.json({ error: 'remote_desktop_protocol_unsupported' }, 409);
+    }
+    // v1 nodes predate the request header and embed a strict v1 manifest
+    // validator. Give only those legacy manifest requests a v1-shaped view of
+    // the same hash-pinned v2 worker so they can make the one-hop upgrade.
+    const legacyManifest = asset === CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER_MANIFEST
+      && requestedProtocol === undefined;
+    const openedWorker = await openRemoteDesktopWorkerArtifact(dir, asset, legacyManifest);
+    if (!openedWorker) return c.json({ error: 'remote_desktop_worker_not_built', os: artifactTarget.os, arch: artifactTarget.arch }, 503);
+    c.header('Content-Length', String(openedWorker.sizeBytes));
+    c.header('Content-Type', 'application/octet-stream');
+    c.header('Content-Disposition', `attachment; filename="${openedWorker.filename}"`);
+    c.header('Cache-Control', 'private, no-store');
+    c.header('Vary', CONTROLLED_NODE_ARTIFACT_HEADERS.REMOTE_DESKTOP_PROTOCOL_VERSION);
+    c.header('Referrer-Policy', 'no-referrer');
+    c.header('X-Content-Type-Options', 'nosniff');
+    c.header('Accept-Ranges', 'none');
+    c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256, openedWorker.sha256);
+    c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.SIZE_BYTES, String(openedWorker.sizeBytes));
+    c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.FILENAME, openedWorker.filename);
+    c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.VERSION, openedWorker.version);
+    const stream = openedWorker.bytes
+      ? buildBufferArtifactStream(openedWorker.bytes, openedWorker.close)
+      : buildBareArtifactStream(openedWorker.handle!, openedWorker.sizeBytes, openedWorker.close);
+    return c.body(stream as unknown as ReadableStream, 200);
   }
   const v = await artifactCatalog.ensureVerified(dir, artifactTarget.os, artifactTarget.arch);
   if (!v.ok) return c.json({ error: 'executable_not_built', os: artifactTarget.os, arch: artifactTarget.arch }, 503);

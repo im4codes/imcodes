@@ -1,5 +1,4 @@
 import {
-  DIRECT_CONNECTIVITY_CANDIDATE_TYPE,
   DIRECT_CONNECTIVITY_PROBE_STAGE,
   classifyDirectConnectivityRoute,
   DIRECT_FILE_TRANSFER_CAPABILITY,
@@ -18,6 +17,11 @@ import {
   type DirectFileTransferIceServerConfig,
   type DirectFileTransferServerMessage,
 } from '@shared/direct-file-transfer.js';
+import {
+  PendingWebRtcCandidates,
+  readWebRtcCandidateType,
+  toWebRtcIceServers,
+} from '@shared/webrtc-connectivity.js';
 import { FILE_TRANSFER_LIMITS } from '@shared/transport/file-transfer.js';
 import { uploadFile, type AttachmentRefResponse } from './api.js';
 import type { ServerMessage, WsClient } from './ws-client.js';
@@ -42,13 +46,7 @@ export class DirectFileTransferFailure extends Error {
 export function toBrowserIceServers(
   iceServers: readonly DirectFileTransferIceServerConfig[],
 ): RTCIceServer[] {
-  return iceServers.map((entry) => typeof entry === 'string'
-    ? { urls: entry }
-    : {
-        urls: [...entry.urls],
-        ...(entry.username ? { username: entry.username } : {}),
-        ...(entry.credential ? { credential: entry.credential } : {}),
-      });
+  return toWebRtcIceServers(iceServers);
 }
 
 function isDirectMessage(message: ServerMessage, requestId: string): message is DirectFileTransferServerMessage {
@@ -145,7 +143,7 @@ async function runDirectOperation(ws: WsClient, operation: DirectOperation): Pro
   let timeout: ReturnType<typeof setTimeout> | null = null;
   let pumping = false;
   let uploadFinalizing = false;
-  const pendingCandidates: RTCIceCandidateInit[] = [];
+  const pendingCandidates = new PendingWebRtcCandidates<RTCIceCandidateInit>();
   const browserCandidateTypes = new Set<DirectConnectivityCandidateType>();
   const daemonCandidateTypes = new Set<DirectConnectivityCandidateType>();
   let probeStage: DirectConnectivityProbeDiagnostics['stage'] = DIRECT_CONNECTIVITY_PROBE_STAGE.AUTHORIZING;
@@ -159,12 +157,6 @@ async function runDirectOperation(ws: WsClient, operation: DirectOperation): Pro
     DIRECT_CONNECTIVITY_PROBE_STAGE.COMPLETE,
   ];
 
-  const readCandidateType = (candidate: string, declaredType?: string | null): DirectConnectivityCandidateType | null => {
-    const rawType = declaredType?.toLowerCase() ?? /\btyp\s+([a-z0-9_-]+)/i.exec(candidate)?.[1]?.toLowerCase();
-    return Object.values(DIRECT_CONNECTIVITY_CANDIDATE_TYPE).includes(rawType as DirectConnectivityCandidateType)
-      ? rawType as DirectConnectivityCandidateType
-      : null;
-  };
   const emitProbeDiagnostics = (stage?: DirectConnectivityProbeDiagnostics['stage']) => {
     if (operation.kind !== 'probe') return;
     if (stage && probeStageOrder.indexOf(stage) >= probeStageOrder.indexOf(probeStage)) probeStage = stage;
@@ -239,10 +231,7 @@ async function runDirectOperation(ws: WsClient, operation: DirectOperation): Pro
     };
     const flushRemoteCandidates = async () => {
       if (!peer?.remoteDescription) return;
-      while (pendingCandidates.length > 0) {
-        const candidate = pendingCandidates.shift();
-        if (candidate) await peer.addIceCandidate(candidate);
-      }
+      await pendingCandidates.flush((candidate) => peer?.addIceCandidate(candidate));
     };
     const handleAuthorized = async (message: ServerMessage) => {
       const parsed = validateDirectFileTransferAuthorized(message);
@@ -323,7 +312,7 @@ async function runDirectOperation(ws: WsClient, operation: DirectOperation): Pro
       });
       peer.addEventListener('icecandidate', (event) => {
         if (!event.candidate || !capability) return;
-        const candidateType = readCandidateType(
+        const candidateType = readWebRtcCandidateType(
           event.candidate.candidate,
           (event.candidate as RTCIceCandidate & { type?: string | null }).type,
         );
@@ -372,7 +361,7 @@ async function runDirectOperation(ws: WsClient, operation: DirectOperation): Pro
         return;
       }
       if (message.type === DIRECT_FILE_TRANSFER_MSG.ICE && peer && capability === message.capability) {
-        const candidateType = readCandidateType(message.candidate);
+        const candidateType = readWebRtcCandidateType(message.candidate);
         if (candidateType) daemonCandidateTypes.add(candidateType);
         emitProbeDiagnostics();
         const candidate = { candidate: message.candidate, sdpMid: message.mid };

@@ -104,6 +104,7 @@ function makeDeps(over: Partial<ControlledNodeBootstrapDeps> = {}): ControlledNo
     verifyStagedExecutable: vi.fn(async () => {}),
     isStableRuntime: vi.fn(async () => false),
     assertElevated: vi.fn(async () => {}),
+    ensureReleasePublisherTrust: vi.fn(async () => {}),
     prepareCredentialDir: vi.fn(async () => {}),
     loadInstallJournal: vi.fn(async () => journal),
     writeInstallPhase: vi.fn(async (_p: string, phase: InstallPhase, extra: Partial<InstallJournal> & { previous?: InstallJournal | null; now: number }) => {
@@ -147,6 +148,46 @@ describe('bootstrapControlledNode — journaled first run (10.10 + D-A v2)', () 
     expect(deps.redeemEnrollmentV2).not.toHaveBeenCalled();
     expect(deps.installDefinition).not.toHaveBeenCalled();
     expect(deps.inspectServiceState).toHaveBeenCalledWith(SERVICE_RECEIPT);
+    expect(deps.startService).not.toHaveBeenCalled();
+  });
+
+  it('keeps an already-installed stable runtime online when publisher-trust maintenance transiently fails', async () => {
+    const trustFailure = new Error('PowerShell trust-store timeout');
+    const deps = makeDeps({
+      loadCredential: vi.fn(async () => CRED),
+      isStableRuntime: vi.fn(async () => true),
+      ensureReleasePublisherTrust: vi.fn(async () => { throw trustFailure; }),
+      loadInstallJournal: vi.fn(async () => ({
+        phase: 'service_start_requested' as InstallPhase,
+        stagedExePath: '/tmp/staged/imcodes-node',
+        stagedReceipt: STAGED_RECEIPT,
+        serviceName: 'imcodes-node',
+        serviceReceipt: SERVICE_RECEIPT,
+      })),
+    });
+
+    await expect(bootstrapControlledNodeWithDisposition(deps)).resolves.toMatchObject({
+      credential: CRED,
+      disposition: 'run_runtime',
+    });
+    expect(deps.warn).toHaveBeenCalledWith(expect.stringContaining('trust-store timeout'));
+    expect(deps.startService).not.toHaveBeenCalled();
+  });
+
+  it('still fails closed on publisher-trust failure before a non-stable handoff', async () => {
+    const deps = makeDeps({
+      loadCredential: vi.fn(async () => CRED),
+      ensureReleasePublisherTrust: vi.fn(async () => { throw new Error('publisher trust invalid'); }),
+      loadInstallJournal: vi.fn(async () => ({
+        phase: 'service_registered' as InstallPhase,
+        stagedExePath: '/tmp/staged/imcodes-node',
+        stagedReceipt: STAGED_RECEIPT,
+        serviceName: 'imcodes-node',
+        serviceReceipt: SERVICE_RECEIPT,
+      })),
+    });
+
+    await expect(bootstrapControlledNodeWithDisposition(deps)).rejects.toThrow(/publisher trust invalid/);
     expect(deps.startService).not.toHaveBeenCalled();
   });
 
@@ -290,6 +331,7 @@ describe('bootstrapControlledNode — journaled first run (10.10 + D-A v2)', () 
     const deps = makeDeps({
       openVerifiedEnrollmentSource: vi.fn(async () => source),
       assertElevated: vi.fn(async () => { order.push('elevate'); }),
+      ensureReleasePublisherTrust: vi.fn(async () => { order.push('trust'); }),
       prepareCredentialDir: vi.fn(async () => { order.push('prepare'); }),
       persistInstallIdentity: vi.fn(async () => { order.push('identity'); }),
       redeemEnrollmentV2: vi.fn(async () => { order.push('redeem'); return CRED; }),
@@ -300,8 +342,8 @@ describe('bootstrapControlledNode — journaled first run (10.10 + D-A v2)', () 
     });
     const result = await bootstrapControlledNodeWithDisposition(deps);
     expect(result).toMatchObject({ credential: CRED, disposition: 'handoff_complete' });
-    expect(order).toEqual(['elevate', 'trailer', 'prepare', 'identity', 'stage', 'redeem', 'persist', 'install', 'inspect', 'start']);
-    expect(source.stageTrailerFreeExecutable).toHaveBeenCalledWith('/tmp/staged/imcodes-node', TRAILER.trailerStart);
+    expect(order).toEqual(['elevate', 'trust', 'trailer', 'prepare', 'identity', 'stage', 'redeem', 'persist', 'install', 'inspect', 'start']);
+    expect(source.stageTrailerFreeExecutable).toHaveBeenCalledWith('/tmp/staged/imcodes-node', TRAILER.trailerStart, undefined);
     expect(source.cleanupEnrollmentSource).not.toHaveBeenCalled();
     expect(source.close).toHaveBeenCalledOnce();
     expect(deps.phases).toEqual(['elevated', 'credential_prepared', 'files_staged', 'enrolled', 'service_registered', 'service_start_requested']);

@@ -35,6 +35,18 @@ import {
   validateMachineDirectUploadRequest,
 } from '../../shared/machine-direct-file-transfer.js';
 import { receiveMachineDirectUpload, sendMachineDirectFetch } from '../daemon/machine-direct-transfer.js';
+import {
+  REMOTE_DESKTOP_CAPABILITY,
+  REMOTE_DESKTOP_MSG,
+  REMOTE_DESKTOP_TERMINAL_REASON,
+  isRemoteDesktopMessageType,
+  validateRemoteDesktopDaemonCommand,
+  type RemoteDesktopDaemonCommand,
+} from '../../shared/remote-desktop.js';
+import { RemoteDesktopWorkerHost } from './remote-desktop-worker-host.js';
+import { isRemoteDesktopFeatureEnabled } from '../../shared/remote-desktop-feature.js';
+import { CONTROLLED_NODE_SAFE_SELF_UPGRADE_CAPABILITY } from '../../shared/controlled-node-service.js';
+import { cleanupLegacyWindowsUpgradeRescue } from './legacy-upgrade-rescue.js';
 
 /** Server → controlled node: auth succeeded; connection is live (bridge.ts heartbeat path). */
 const CONTROLLED_NODE_AUTH_ACK_TYPE = 'heartbeat_ack' as const;
@@ -54,6 +66,12 @@ export interface ControlledNodeRuntimeOptions {
   onAuthenticationError?: (error: unknown) => void;
   /** Called for every authenticated server heartbeat acknowledgement. */
   onHeartbeatAck?: () => void | Promise<void>;
+  remoteDesktopWorker?: {
+    available(): boolean;
+    handle(message: RemoteDesktopDaemonCommand): Promise<boolean>;
+    close(): void;
+  };
+  cleanupLegacyUpgradeRescue?: () => Promise<void>;
 }
 
 export function createControlledNodeRuntime(
@@ -63,9 +81,19 @@ export function createControlledNodeRuntime(
 ): AuthenticatedWebSocketClient {
   const worker = new MachineExecWorker();
   const computerUseWorker = new ComputerUseWorker(credential);
+  let client!: AuthenticatedWebSocketClient;
+  const remoteDesktopWorker = options.remoteDesktopWorker ?? new RemoteDesktopWorkerHost((message) => {
+    client.send(message);
+  });
+  const remoteDesktopEnabled = remoteDesktopWorker.available()
+    && isRemoteDesktopFeatureEnabled(
+      process.env.IMCODES_REMOTE_DESKTOP_ENABLED,
+      process.env.NODE_ENV,
+    );
   let upgradeInFlight = false;
   let authenticationPersisted = false;
   let authenticationPersistenceInFlight = false;
+  let legacyUpgradeRescueCleanupStarted = false;
   const activeMachineDirectTransfers = new Set<string>();
   const reportAuthenticationError = (error: unknown) => {
     try {
@@ -92,7 +120,6 @@ export function createControlledNodeRuntime(
       authenticationPersistenceInFlight = false;
     });
   };
-  let client!: AuthenticatedWebSocketClient;
   const fileSender: FileTransferSender = {
     send(message: unknown): boolean {
       let candidate = message;
@@ -122,6 +149,8 @@ export function createControlledNodeRuntime(
         FILE_TRANSFER_PATH_HANDLE_CAPABILITY,
         MACHINE_DIRECT_FILE_TRANSFER_CAPABILITY,
         MACHINE_DIRECT_FILE_FETCH_CAPABILITY,
+        CONTROLLED_NODE_SAFE_SELF_UPGRADE_CAPABILITY,
+        ...(remoteDesktopEnabled ? [REMOTE_DESKTOP_CAPABILITY] : []),
       ],
     },
     heartbeatMessage: { type: 'heartbeat', daemonVersion: DAEMON_VERSION },
@@ -133,6 +162,9 @@ export function createControlledNodeRuntime(
     },
     onClose: () => {
       worker.abortAll();
+      // Remote desktop authority is connection-generation-bound. Unlike the
+      // warm Computer Use helper, every peer must die on Server-link loss.
+      remoteDesktopWorker.close();
       // Keep Computer Use warm across daemon websocket reconnects. The helper owns
       // long-lived OCU/MCP and fast-click subprocesses after first use; closing it
       // here would make every transient network reconnect pay the cold-start cost.
@@ -148,7 +180,16 @@ export function createControlledNodeRuntime(
       if (isControlledNodeAuthAck(message)) {
         persistAuthentication();
         try {
-          void Promise.resolve(options.onHeartbeatAck?.()).catch(reportAuthenticationError);
+          void Promise.resolve(options.onHeartbeatAck?.()).then(async () => {
+            if (legacyUpgradeRescueCleanupStarted) return;
+            legacyUpgradeRescueCleanupStarted = true;
+            try {
+              await (options.cleanupLegacyUpgradeRescue ?? cleanupLegacyWindowsUpgradeRescue)();
+            } catch (error) {
+              legacyUpgradeRescueCleanupStarted = false;
+              throw error;
+            }
+          }).catch(reportAuthenticationError);
         } catch (error) {
           reportAuthenticationError(error);
         }
@@ -179,6 +220,40 @@ export function createControlledNodeRuntime(
       if (message.type === DAEMON_COMMAND_TYPES.COMPUTER_USE) {
         const reply = await computerUseWorker.handle(message);
         if (reply) client.send({ type: DAEMON_MSG.COMPUTER_USE_RESULT, ...reply });
+        return;
+      }
+      if (isRemoteDesktopMessageType(message.type)) {
+        const parsed = validateRemoteDesktopDaemonCommand(message);
+        if (!parsed.ok) return;
+        if (!remoteDesktopEnabled) {
+          if (parsed.value.type !== REMOTE_DESKTOP_MSG.STOP
+            && parsed.value.type !== REMOTE_DESKTOP_MSG.CANCEL) {
+            client.send({
+              type: REMOTE_DESKTOP_MSG.TERMINAL,
+              requestId: parsed.value.requestId,
+              sessionId: parsed.value.sessionId,
+              capability: parsed.value.capability,
+              reason: REMOTE_DESKTOP_TERMINAL_REASON.CAPABILITY_UNAVAILABLE,
+            });
+          }
+          return;
+        }
+        try {
+          if (await remoteDesktopWorker.handle(parsed.value)) return;
+        } catch {
+          // Fall through to a bounded terminal frame. The worker never receives
+          // the long-lived node credential and no error detail is reflected.
+        }
+        if (parsed.value.type !== REMOTE_DESKTOP_MSG.STOP
+          && parsed.value.type !== REMOTE_DESKTOP_MSG.CANCEL) {
+          client.send({
+            type: REMOTE_DESKTOP_MSG.TERMINAL,
+            requestId: parsed.value.requestId,
+            sessionId: parsed.value.sessionId,
+            capability: parsed.value.capability,
+            reason: REMOTE_DESKTOP_TERMINAL_REASON.WORKER_FAILED,
+          });
+        }
         return;
       }
       if (message.type === MACHINE_DIRECT_FILE_TRANSFER_MSG.REQUEST) {

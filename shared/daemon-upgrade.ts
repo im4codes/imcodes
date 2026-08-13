@@ -25,6 +25,7 @@ export const DAEMON_UPGRADE_DELIVERY_STATUS = {
   BACKOFF: 'backoff',
   SUPPRESSED: 'suppressed',
   PENDING_PUBLICATION: 'pending_publication',
+  PREPARING_RESCUE: 'preparing_rescue',
   INVALID_TARGET: 'invalid_target',
 } as const;
 

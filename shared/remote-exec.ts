@@ -1,5 +1,7 @@
 import { DAEMON_MSG } from './daemon-events.js';
 import { DAEMON_COMMAND_TYPES } from './daemon-command-types.js';
+import type { ControlledNodeCapability } from './controlled-node-capabilities.js';
+import type { WindowsAuthenticodeEnrollmentRestore } from './windows-authenticode-enrollment.js';
 
 // Remote-exec / controlled-node protocol shared by daemon (source + controlled
 // node), server relay, and the exe build pipeline.
@@ -120,6 +122,8 @@ export interface MachineSummary {
   lastSeenMs?: number;
   /** Optional for compatibility with owner-only Servers released before machine sharing. */
   accessRole?: MachineAccessRole;
+  /** Optional for pre-capability nodes and old Servers. Exact versions only. */
+  capabilities?: ControlledNodeCapability[];
 }
 
 export const MACHINE_ACCESS_ROLES = ['owner', 'viewer', 'participant'] as const;
@@ -199,6 +203,8 @@ export interface EnrollmentTrailerRange {
   trailerStart: number;
   /** Trailer byte length (JSON body + footer). */
   trailerLength: number;
+  /** Present for signed Windows downloads personalized inside the PE certificate table. */
+  windowsAuthenticode?: WindowsAuthenticodeEnrollmentRestore;
 }
 
 /** Validate a normalized lowercase hex sha256 nodeTokenHash. */

@@ -3,6 +3,7 @@ import {
   NODE_ROLE,
   type MachineAccessRole,
 } from '../../../shared/remote-exec.js';
+import type { ControlledNodeCapability } from '../../../shared/controlled-node-capabilities.js';
 
 export interface ControlledMachineAccessRow {
   id: string;
@@ -15,12 +16,15 @@ export interface ControlledMachineAccessRow {
   os: string | null;
   revoked_at: number | null;
   access_role: MachineAccessRole;
+  access_expires_at: number | null;
+  controlled_capabilities: ControlledNodeCapability[] | null;
 }
 
 const CONTROLLED_MACHINE_ACCESS_SELECT = `
   SELECT s.id, s.user_id, s.ref_name, s.display_name, s.status,
-         s.last_heartbeat_at, s.exec_enabled, s.os, s.revoked_at,
-         CASE WHEN s.user_id = $1 THEN 'owner' ELSE sh.role END AS access_role
+         s.last_heartbeat_at, s.exec_enabled, s.os, s.revoked_at, s.controlled_capabilities,
+         CASE WHEN s.user_id = $1 THEN 'owner' ELSE sh.role END AS access_role,
+         sh.expires_at AS access_expires_at
     FROM servers s
     LEFT JOIN server_shares sh
       ON sh.server_id = s.id
@@ -71,6 +75,8 @@ export async function listAccessibleControlledMachines(
   );
 }
 
-export function canOperateControlledMachine(accessRole: MachineAccessRole): boolean {
+export function canOperateControlledMachine(
+  accessRole: MachineAccessRole,
+): accessRole is Extract<MachineAccessRole, 'owner' | 'participant'> {
   return accessRole === 'owner' || accessRole === 'participant';
 }

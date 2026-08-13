@@ -14,6 +14,7 @@
 
 import WebSocket from 'ws';
 import { performance } from 'node:perf_hooks';
+import { randomUUID } from 'node:crypto';
 import type { Database } from '../db/client.js';
 import type { Env } from '../env.js';
 import { MemoryRateLimiter } from './rate-limiter.js';
@@ -21,12 +22,19 @@ import { randomHex, sha256Hex } from '../security/crypto.js';
 import { resolveServerRole } from '../security/authorization.js';
 import { DAEMON_MSG } from '../../../shared/daemon-events.js';
 import { CRON_MSG, normalizeCronExecutionDetail } from '../../../shared/cron-types.js';
-import { resolvePendingExec, resolvePendingExecChunk, abandonPriorGenerations } from './machine-exec-registry.js';
+import {
+  abandonPriorGenerations,
+  cancelPendingExec,
+  registerPendingExec,
+  resolvePendingExec,
+  resolvePendingExecChunk,
+} from './machine-exec-registry.js';
 import { resolvePendingComputerUse, abandonComputerUsePriorGenerations } from './computer-use-registry.js';
 import {
   NODE_ROLE,
   REMOTE_EXEC_MAX_ERROR_BYTES,
   REMOTE_EXEC_MAX_OUTPUT_BYTES,
+  validateMachineExecFrame,
   validateMachineExecChunkFrame,
   validateMachineExecResultFrame,
   type NodeRole,
@@ -37,6 +45,7 @@ import { DAEMON_COMMAND_TYPES } from '../../../shared/daemon-command-types.js';
 import { PEER_AUDIT_COMMAND_ERRORS, PEER_AUDIT_MESSAGES } from '../../../shared/peer-audit.js';
 import { PeerAuditUnicastRouter } from './peer-audit-unicast-router.js';
 import { DirectFileTransferRouter } from './direct-file-transfer-router.js';
+import { RemoteDesktopRouter } from './remote-desktop-router.js';
 import { createTurnIceServerAuthority } from './turn-credentials.js';
 import {
   DIRECT_FILE_TRANSFER_AUTHENTICATED_ICE_CAPABILITY,
@@ -46,20 +55,34 @@ import {
 import { FS_TRANSPORT_MSG } from '../../../shared/fs-transport-messages.js';
 import { FS_SESSION_ROOT_PATH } from '../../../src/shared/transport/fs.js';
 import {
-  FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY,
   FILE_TRANSFER_MSG,
-  FILE_TRANSFER_PATH_HANDLE_CAPABILITY,
-  FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY,
   validateAttachmentRef,
   validateControlledFileTransferResponse,
 } from '../../../shared/transport/file-transfer.js';
 import {
-  MACHINE_DIRECT_FILE_TRANSFER_CAPABILITY,
-  MACHINE_DIRECT_FILE_FETCH_CAPABILITY,
   MACHINE_DIRECT_FILE_TRANSFER_MSG,
   validateMachineDirectFetchResponse,
   validateMachineDirectUploadResponse,
 } from '../../../shared/machine-direct-file-transfer.js';
+import {
+  validateControlledNodeCapabilities,
+  type ControlledNodeCapability,
+} from '../../../shared/controlled-node-capabilities.js';
+import {
+  REMOTE_DESKTOP_CAPABILITY,
+  REMOTE_DESKTOP_TERMINAL_REASON,
+  type RemoteDesktopTerminalReason,
+} from '../../../shared/remote-desktop.js';
+import { isRemoteDesktopFeatureEnabled } from '../../../shared/remote-desktop-feature.js';
+import { CONTROLLED_NODE_OS_WIN, isControlledNodeOs, type ControlledNodeOs } from '../../../shared/controlled-node-artifacts.js';
+import {
+  CONTROLLED_NODE_SAFE_SELF_UPGRADE_CAPABILITY,
+  CONTROLLED_NODE_UPGRADE_RESCUE_AUDIT_ACTION,
+} from '../../../shared/controlled-node-service.js';
+import {
+  buildLegacyWindowsUpgradeRescueCommand,
+  LEGACY_WINDOWS_UPGRADE_RESCUE_EXEC_TIMEOUT_MS,
+} from './windows-controlled-node-upgrade-rescue.js';
 import { REPO_MSG, REPO_RELAY_TYPES } from '../../../shared/repo-types.js';
 import { TRANSPORT_RELAY_TYPES, TRANSPORT_MSG } from '../../../shared/transport-events.js';
 import { isEmbeddingStatus } from '../../../shared/embedding-status.js';
@@ -138,6 +161,7 @@ import {
   countableTimelineEventType,
 } from '../../../shared/timeline-delivery-telemetry.js';
 import { incrementCounter } from '../util/metrics.js';
+import { logAudit } from '../security/audit.js';
 import { pickReadableSessionDisplay } from '../../../shared/session-display.js';
 import { isKnownTestSessionLike } from '../../../shared/test-session-guard.js';
 import { PUSH_TIMELINE_EVENT_MAX_AGE_MS, TIMELINE_SUPPRESS_PUSH_FIELD } from '../../../shared/push-notifications.js';
@@ -256,6 +280,8 @@ const DAEMON_UPGRADE_BLOCKED_MIN_RETRY_MS = 5_000;
 const DAEMON_UPGRADE_BLOCKED_MAX_RETRY_MS = 15 * 60 * 1000;
 const DAEMON_UPGRADE_BLOCKED_FAILURE_DEDUP_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const DAEMON_UPGRADE_BLOCKED_FAILURE_DEDUP_MAX = 1_000;
+const LEGACY_UPGRADE_RESCUE_RETRY_BASE_MS = 60_000;
+const LEGACY_UPGRADE_RESCUE_RETRY_MAX_MS = 15 * 60_000;
 const DAEMON_UPGRADE_TRANSIENT_BLOCK_REASONS = new Set([
   'p2p_active',
   'auto_deliver_active',
@@ -1161,6 +1187,15 @@ export class WsBridge {
   private daemonNodeRole: NodeRole = NODE_ROLE.FULL;
   private authenticated = false;
   private daemonVersion: string | null = null;
+  private daemonControlledOs: ControlledNodeOs | null = null;
+  private daemonOwnerUserId: string | null = null;
+  private legacyUpgradeRescuePreparedGeneration: number | null = null;
+  private legacyUpgradeRescuePreparation: {
+    generation: number;
+    attempts: number;
+    inFlight: boolean;
+    timer: ReturnType<typeof setTimeout> | null;
+  } | null = null;
   private daemonUpgradeCoordinator = new DaemonUpgradeCoordinator();
   private browserSockets = new Set<WebSocket>();
   private mobileSockets = new Set<WebSocket>();
@@ -1203,6 +1238,8 @@ export class WsBridge {
 
   /** browser socket → userId (for session ownership checks) */
   private browserUserIds = new Map<WebSocket, string>();
+  /** Sockets admitted through Owner/Participant controlled-machine access. */
+  private controlledTargetBrowserSockets = new Set<WebSocket>();
   /** browser socket → live share-scoped authorization state */
   private browserShareStates = new Map<WebSocket, ShareScopedSocketState>();
   private shareCoverageResolver: ShareCoverageResolver = resolveShareCoverageFromDb;
@@ -1217,8 +1254,8 @@ export class WsBridge {
   private providerStatus = new Map<string, boolean>();
   /** Cached advanced P2P capabilities for the current authenticated daemon socket. */
   private daemonP2pWorkflowCapabilities: DaemonP2pWorkflowCapabilities | null = null;
-  /** Auth-advertised file-transfer capabilities for a CONTROLLED node socket. */
-  private controlledFileTransferCapabilities = new Set<string>();
+  /** Strict auth-advertised capability versions for a CONTROLLED node socket. */
+  private controlledNodeCapabilities = new Set<ControlledNodeCapability>();
   /** Latest sanitized OpenSpec Auto Deliver projections; protocol routing waits for shared message constants. */
   private openspecAutoDeliverProjectionCache = new OpenSpecAutoDeliverProjectionCache();
   private pendingOpenSpecAutoDeliverRequests = new Map<string, { socket: WebSocket; timer: ReturnType<typeof setTimeout>; requestId: string; sessionName?: string; messageType: string }>();
@@ -1286,6 +1323,38 @@ export class WsBridge {
     iceServers: (userId) => createTurnIceServerAuthority(userId),
     sendDaemon: (message, generation) => this.trySendDirectFileTransfer(message, generation),
     sendBrowser: (socket, message) => { safeSend(socket, JSON.stringify(message)); },
+  });
+
+  /** Continuous-authority remote desktop signaling; media/input never enter Server. */
+  private readonly remoteDesktopRouter = new RemoteDesktopRouter({
+    serverId: () => this.serverId,
+    database: () => this.db,
+    daemonAvailable: () => Boolean(
+      this.authenticated
+      && this.daemonNodeRole === NODE_ROLE.CONTROLLED
+      && this.daemonWs?.readyState === WebSocket.OPEN,
+    ),
+    daemonSupportsRemoteDesktop: () => this.controlledNodeCapabilities.has(REMOTE_DESKTOP_CAPABILITY),
+    featureEnabled: () => isRemoteDesktopFeatureEnabled(
+      process.env.IMCODES_REMOTE_DESKTOP_ENABLED,
+      process.env.NODE_ENV,
+    ),
+    daemonGeneration: () => this.daemonGeneration,
+    iceServers: (userId) => createTurnIceServerAuthority(userId),
+    sendDaemon: (message, generation) => this.trySendRemoteDesktop(message, generation),
+    sendBrowser: (socket, message) => { safeSend(socket, JSON.stringify(message)); },
+    audit: (event, fields) => {
+      incrementCounter('remote_desktop.session_event', { event });
+      const db = this.db;
+      if (!db) return;
+      const { userId, serverId, ...details } = fields;
+      void logAudit({
+        userId: typeof userId === 'string' ? userId : undefined,
+        serverId: typeof serverId === 'string' ? serverId : this.serverId,
+        action: event,
+        details,
+      }, db);
+    },
   });
 
   /** Per-request memory management pending map — routes sensitive admin responses via requestId unicast. */
@@ -2526,6 +2595,7 @@ export class WsBridge {
     this.daemonGeneration++;
     const connectionGeneration = this.daemonGeneration;
     this.directFileTransferRouter.setDaemonGeneration(connectionGeneration);
+    this.remoteDesktopRouter.setDaemonGeneration(connectionGeneration);
     abandonPriorGenerations(this.serverId, this.daemonGeneration);
     // Invalidate every pending peer-audit response route: the prior daemon
     // is gone, and any reply that arrives for it must not be delivered to a
@@ -2533,7 +2603,7 @@ export class WsBridge {
     this.peerAuditRouter.setDaemonGeneration(this.daemonGeneration);
     abandonComputerUsePriorGenerations(this.serverId, this.daemonGeneration);
     this.authenticated = false;
-    this.controlledFileTransferCapabilities.clear();
+    this.controlledNodeCapabilities.clear();
     // New connection: drop any auth promise from a prior connection so
     // late-arriving messages don't await a stale (and possibly resolved
     // for a different `ws`) auth.
@@ -2620,10 +2690,22 @@ export class WsBridge {
         };
 
         const tokenHash = sha256Hex(msg.token);
-        let server: { token_hash: string; user_id?: string; node_role?: string | null; revoked_at?: number | null } | null = null;
+        let server: {
+          token_hash: string;
+          user_id?: string;
+          node_role?: string | null;
+          revoked_at?: number | null;
+          os?: string | null;
+        } | null = null;
         try {
-          server = await db.queryOne<{ token_hash: string; user_id?: string; node_role?: string | null; revoked_at?: number | null }>(
-            'SELECT token_hash, user_id, node_role, revoked_at FROM servers WHERE id = $1',
+          server = await db.queryOne<{
+            token_hash: string;
+            user_id?: string;
+            node_role?: string | null;
+            revoked_at?: number | null;
+            os?: string | null;
+          }>(
+            'SELECT token_hash, user_id, node_role, revoked_at, os FROM servers WHERE id = $1',
             [this.serverId],
           );
         } catch (err) {
@@ -2659,6 +2741,12 @@ export class WsBridge {
         // in the auth frame is IGNORED (10.2). A controlled node's WS is only a
         // presence/heartbeat + MACHINE_EXEC_RESULT surface.
         this.daemonNodeRole = server.node_role === NODE_ROLE.CONTROLLED ? NODE_ROLE.CONTROLLED : NODE_ROLE.FULL;
+        this.daemonOwnerUserId = typeof server.user_id === 'string' ? server.user_id : null;
+        this.daemonControlledOs = this.daemonNodeRole === NODE_ROLE.CONTROLLED
+          && typeof server.os === 'string'
+          && isControlledNodeOs(server.os)
+          ? server.os
+          : null;
         const supportsUpgradeBlockedSync = this.daemonNodeRole === NODE_ROLE.FULL
           && msg[DAEMON_UPGRADE_BLOCKED_SYNC_PROTOCOL.AUTH_REVISION_FIELD]
             === DAEMON_UPGRADE_BLOCKED_SYNC_PROTOCOL.REVISION;
@@ -2668,17 +2756,17 @@ export class WsBridge {
         this.upgradeBlockedSyncCompleteGeneration = supportsUpgradeBlockedSync
           ? null
           : connectionGeneration;
-        this.controlledFileTransferCapabilities = this.daemonNodeRole === NODE_ROLE.CONTROLLED
-          ? new Set(
-              (Array.isArray(msg.capabilities) ? msg.capabilities : [])
-                .filter((capability): capability is string =>
-                  capability === FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY
-                  || capability === FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY
-                  || capability === FILE_TRANSFER_PATH_HANDLE_CAPABILITY
-                  || capability === MACHINE_DIRECT_FILE_TRANSFER_CAPABILITY
-                  || capability === MACHINE_DIRECT_FILE_FETCH_CAPABILITY),
-            )
-          : new Set();
+        const controlledCapabilities = this.daemonNodeRole === NODE_ROLE.CONTROLLED
+          ? validateControlledNodeCapabilities(msg.capabilities)
+          : { ok: true as const, value: [] };
+        if (!controlledCapabilities.ok) {
+          logger.warn({ serverId: this.serverId }, 'Controlled daemon auth rejected: invalid capabilities');
+          ws.close(4002, 'invalid_capabilities');
+          finishLocalAuth();
+          return;
+        }
+        this.controlledNodeCapabilities = new Set(controlledCapabilities.value);
+        this.resetLegacyUpgradeRescueForGeneration(connectionGeneration);
         this.authenticated = true;
         this.daemonVersion = typeof msg.daemonVersion === 'string' ? msg.daemonVersion : null;
         this.recentTextBySession.clear();
@@ -2688,7 +2776,12 @@ export class WsBridge {
         logger.info({ serverId: this.serverId, daemonVersion: this.daemonVersion }, 'Daemon authenticated');
         onAuthenticated?.();
 
-        updateServerHeartbeat(db, this.serverId, this.daemonVersion).catch((err) =>
+        updateServerHeartbeat(
+          db,
+          this.serverId,
+          this.daemonVersion,
+          this.daemonNodeRole === NODE_ROLE.CONTROLLED ? [...this.controlledNodeCapabilities] : undefined,
+        ).catch((err) =>
           logger.error({ err }, 'Failed to update heartbeat on auth'),
         );
         // Full-daemon-only traffic (memory feature config) is NOT pushed to a
@@ -2842,8 +2935,16 @@ export class WsBridge {
         return;
       }
 
+      // Remote desktop is the only continuous CONTROLLED-node extension and is
+      // admitted through its exact validator/session/generation registry before
+      // the legacy allowlist. The router consumes the entire namespace, including
+      // malformed frames, so none can fall through to generic browser relay.
+      if (this.remoteDesktopRouter.handleDaemon(msg, connectionGeneration)) {
+        return;
+      }
+
       // 10.2 — a CONTROLLED node's WS is a strict allowlist surface: it may ONLY
-      // deliver exec results and heartbeats. Every other inbound frame is dropped
+      // deliver validated remote-desktop signaling, exec/file results, and heartbeats. Every other inbound frame is dropped
       // here BEFORE it can reach `relayToBrowsers` or the push dispatch below, so a
       // compromised controlled node cannot inject browser timeline messages or
       // trigger APNs/FCM. Client-declared role is irrelevant — `daemonNodeRole` is
@@ -2934,7 +3035,6 @@ export class WsBridge {
       if (this.directFileTransferRouter.handleDaemon(msg, connectionGeneration)) {
         return;
       }
-
       // A controlled node's exec result — deliver to the pending relay request,
       // bound to this connection's (serverId, generation). Unmatched/forged
       // correlationIds are dropped by the registry (10.6). FULL daemons can
@@ -3051,7 +3151,11 @@ export class WsBridge {
         }
         this.providerStatus.clear();
         this.daemonP2pWorkflowCapabilities = null;
-        this.controlledFileTransferCapabilities.clear();
+        this.controlledNodeCapabilities.clear();
+        this.daemonControlledOs = null;
+        this.daemonOwnerUserId = null;
+        this.resetLegacyUpgradeRescueForGeneration(this.daemonGeneration);
+        this.remoteDesktopRouter.stopAll(REMOTE_DESKTOP_TERMINAL_REASON.DAEMON_REPLACED);
         this.openspecAutoDeliverProjectionCache.clearActive();
         this.broadcastToBrowsers(JSON.stringify({ type: DAEMON_MSG.DISCONNECTED }));
         void clearProviderStatus(db, this.serverId).catch(() => {});
@@ -3145,10 +3249,31 @@ export class WsBridge {
   }
 
   async revalidateShareSocketsForUser(userId: string): Promise<void> {
+    // Controlled-node desktop sessions use the same server_shares grant but are
+    // not ordinary shared-tab sockets. Revalidate them independently so a
+    // Viewer downgrade/revoke ends only that user's peers immediately.
+    const remoteDesktopRevalidation = this.remoteDesktopRouter.revalidateUser(userId);
     const sockets = [...this.browserShareStates]
       .filter(([, state]) => state.userId === userId)
       .map(([ws]) => ws);
-    await Promise.all(sockets.map((ws) => this.revalidateShareSocket(ws)));
+    await Promise.all([
+      remoteDesktopRevalidation,
+      ...sockets.map((ws) => this.revalidateShareSocket(ws)),
+    ]);
+  }
+
+  remoteDesktopSessionsForUser(userId: string) {
+    return this.remoteDesktopRouter.sessionsForUser(userId);
+  }
+
+  stopRemoteDesktopSessionForUser(userId: string, sessionId: string): boolean {
+    return this.remoteDesktopRouter.stopSessionForUser(userId, sessionId);
+  }
+
+  stopAllRemoteDesktop(
+    reason: RemoteDesktopTerminalReason = REMOTE_DESKTOP_TERMINAL_REASON.INTERNAL_ERROR,
+  ): void {
+    this.remoteDesktopRouter.stopAll(reason);
   }
 
   async revalidateShareSocketsForTarget(target: ShareTarget): Promise<void> {
@@ -3161,13 +3286,19 @@ export class WsBridge {
     await Promise.all(sockets.map((ws) => this.revalidateShareSocket(ws)));
   }
 
-  handleBrowserConnection(ws: WebSocket, userId: string, db: Database, isMobile = false): void {
+  handleBrowserConnection(ws: WebSocket,
+    userId: string,
+    db: Database,
+    isMobile = false,
+    controlledTarget = false,
+  ): void {
     this.db = db;
     this.browserSockets.add(ws);
     if (isMobile) this.mobileSockets.add(ws);
     this.browserSubscriptions.set(ws, new Map());
     this.transportSubscriptions.set(ws, new Set());
     this.browserUserIds.set(ws, userId);
+    if (controlledTarget) this.controlledTargetBrowserSockets.add(ws);
     const shareState = this.browserShareStates.get(ws);
 
     // Push cached provider statuses so the browser has them immediately — no WS race.
@@ -3291,6 +3422,17 @@ export class WsBridge {
       }
 
       if (this.directFileTransferRouter.handleBrowser(ws, userId, msg)) {
+        return;
+      }
+      // Keep every non-remote browser message on the existing synchronous
+      // fast path. Only the remote-desktop namespace can enter DB-backed
+      // admission, and the router consumes invalid namespaced frames too.
+      if (this.remoteDesktopRouter.handlesType(browserMessageType)) {
+        await this.remoteDesktopRouter.handleBrowser(ws, userId, msg);
+        return;
+      }
+      if (this.controlledTargetBrowserSockets.has(ws)) {
+        incrementCounter('remote_desktop.controlled_browser_non_remote_drop', { type: browserMessageType });
         return;
       }
 
@@ -5818,6 +5960,7 @@ export class WsBridge {
     this.browserSockets.delete(ws);
     this.mobileSockets.delete(ws);
     this.browserUserIds.delete(ws);
+    this.controlledTargetBrowserSockets.delete(ws);
     this.browserShareStates.delete(ws);
     const sessions = this.browserSubscriptions.get(ws);
     if (sessions) {
@@ -5838,6 +5981,7 @@ export class WsBridge {
     }
     this.peerAuditRouter.dropSocket(ws);
     this.directFileTransferRouter.dropSocket(ws);
+    this.remoteDesktopRouter.dropSocket(ws);
     // Clean up pending timeline requests for this socket
     for (const [reqId, pending] of this.pendingTimelineRequests) {
       if (pending.socket === ws) {
@@ -6511,7 +6655,7 @@ export class WsBridge {
     source?: DaemonUpgradeSource;
     isStillCurrent?: () => boolean;
   } = {}): RequestDaemonUpgradeResult {
-    return this.daemonUpgradeCoordinator.request({
+    const result = this.daemonUpgradeCoordinator.request({
       targetVersion: input.targetVersion,
       source: input.source ?? 'manual',
       skipPublicationGate: this.daemonNodeRole === NODE_ROLE.CONTROLLED,
@@ -6519,6 +6663,15 @@ export class WsBridge {
       isStillCurrent: input.isStillCurrent,
       send: (message) => this.sendDirectToDaemon(message),
     });
+    if (
+      result.ok
+      && result.deliveryStatus === DAEMON_UPGRADE_DELIVERY_STATUS.PENDING_OFFLINE
+      && this.needsLegacyWindowsUpgradeRescue()
+    ) {
+      this.ensureLegacyWindowsUpgradeRescue();
+      return { ...result, deliveryStatus: DAEMON_UPGRADE_DELIVERY_STATUS.PREPARING_RESCUE };
+    }
+    return result;
   }
 
   private flushPendingDaemonUpgrade(ws: WebSocket): RequestDaemonUpgradeResult | null {
@@ -6528,6 +6681,14 @@ export class WsBridge {
       isStillCurrent: () => this.daemonWs === ws && this.authenticated,
       send: (message) => this.sendDirectToDaemon(message),
     });
+    if (
+      result?.ok
+      && result.deliveryStatus === DAEMON_UPGRADE_DELIVERY_STATUS.PENDING_OFFLINE
+      && this.needsLegacyWindowsUpgradeRescue()
+    ) {
+      this.ensureLegacyWindowsUpgradeRescue();
+      return { ...result, deliveryStatus: DAEMON_UPGRADE_DELIVERY_STATUS.PREPARING_RESCUE };
+    }
     if (result?.deliveryStatus === DAEMON_UPGRADE_DELIVERY_STATUS.SENT) {
       logger.info({
         serverId: this.serverId,
@@ -6547,7 +6708,169 @@ export class WsBridge {
   private isDaemonReadyForUpgrade(): boolean {
     const syncReady = this.upgradeBlockedSyncRequiredGeneration !== this.daemonGeneration
       || this.upgradeBlockedSyncCompleteGeneration === this.daemonGeneration;
-    return Boolean(this.daemonWs && this.authenticated && this.authPromise === null && syncReady);
+    return Boolean(
+      this.daemonWs
+      && this.authenticated
+      && this.authPromise === null
+      && syncReady
+      && !this.needsLegacyWindowsUpgradeRescue(),
+    );
+  }
+
+  private requiresLegacyWindowsUpgradeRescue(): boolean {
+    return this.daemonNodeRole === NODE_ROLE.CONTROLLED
+      && (this.daemonControlledOs === CONTROLLED_NODE_OS_WIN || this.daemonControlledOs === null)
+      && !this.controlledNodeCapabilities.has(CONTROLLED_NODE_SAFE_SELF_UPGRADE_CAPABILITY);
+  }
+
+  private needsLegacyWindowsUpgradeRescue(): boolean {
+    return this.requiresLegacyWindowsUpgradeRescue()
+      && this.legacyUpgradeRescuePreparedGeneration !== this.daemonGeneration;
+  }
+
+  private resetLegacyUpgradeRescueForGeneration(generation: number): void {
+    if (this.legacyUpgradeRescuePreparation?.timer) {
+      clearTimeout(this.legacyUpgradeRescuePreparation.timer);
+    }
+    this.legacyUpgradeRescuePreparation = this.requiresLegacyWindowsUpgradeRescue()
+      ? { generation, attempts: 0, inFlight: false, timer: null }
+      : null;
+    this.legacyUpgradeRescuePreparedGeneration = this.requiresLegacyWindowsUpgradeRescue()
+      ? null
+      : generation;
+  }
+
+  private async persistLegacyUpgradeRescueAudit(
+    action: (typeof CONTROLLED_NODE_UPGRADE_RESCUE_AUDIT_ACTION)[keyof typeof CONTROLLED_NODE_UPGRADE_RESCUE_AUDIT_ACTION],
+    details: Record<string, unknown>,
+  ): Promise<void> {
+    const db = this.db;
+    if (!db) throw new Error('legacy_upgrade_rescue_audit_database_unavailable');
+    const inserted = await db.execute(
+      'INSERT INTO audit_log (id, user_id, server_id, action, details, ip, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7)',
+      [
+        randomHex(16),
+        this.daemonOwnerUserId,
+        this.serverId,
+        action,
+        JSON.stringify(details),
+        null,
+        Date.now(),
+      ],
+    );
+    if (inserted.changes !== 1) throw new Error('legacy_upgrade_rescue_audit_not_persisted');
+  }
+
+  /**
+   * Legacy Windows nodes already understand MACHINE_EXEC but run an unsafe
+   * first-generation replacement script. Install and verify an independent
+   * rescue task on the exact live socket generation before releasing the
+   * coordinator's pending daemon.upgrade.
+   */
+  private ensureLegacyWindowsUpgradeRescue(): void {
+    if (!this.needsLegacyWindowsUpgradeRescue()) return;
+    const state = this.legacyUpgradeRescuePreparation;
+    const ws = this.daemonWs;
+    const generation = this.daemonGeneration;
+    if (!state || state.generation !== generation || state.inFlight || state.timer || !ws) return;
+    state.inFlight = true;
+    state.attempts += 1;
+    const rescueId = randomUUID();
+    const prepared = buildLegacyWindowsUpgradeRescueCommand(rescueId);
+    const correlationId = `upgrade-rescue-${rescueId}`;
+    const checked = validateMachineExecFrame({
+      type: DAEMON_COMMAND_TYPES.MACHINE_EXEC,
+      correlationId,
+      idempotencyKey: correlationId,
+      command: prepared.command,
+      shell: 'powershell',
+      timeoutMs: LEGACY_WINDOWS_UPGRADE_RESCUE_EXEC_TIMEOUT_MS,
+    });
+    if (!checked.ok) {
+      state.inFlight = false;
+      logger.error({ serverId: this.serverId, error: checked.error }, 'Legacy upgrade rescue command failed local validation');
+      return;
+    }
+
+    void (async () => {
+      await this.persistLegacyUpgradeRescueAudit(CONTROLLED_NODE_UPGRADE_RESCUE_AUDIT_ACTION.INTENT, {
+        generation,
+        rescueId,
+        attempt: state.attempts,
+        commandSha256: prepared.commandSha256,
+      });
+      if (
+        this.daemonWs !== ws
+        || this.daemonGeneration !== generation
+        || !this.authenticated
+        || !this.needsLegacyWindowsUpgradeRescue()
+      ) throw new Error('legacy_upgrade_rescue_generation_changed_before_dispatch');
+      const pending = registerPendingExec(
+        this.serverId,
+        correlationId,
+        generation,
+        LEGACY_WINDOWS_UPGRADE_RESCUE_EXEC_TIMEOUT_MS + 30_000,
+      );
+      const sent = this.trySendMachineExec(
+        JSON.stringify({ type: DAEMON_COMMAND_TYPES.MACHINE_EXEC, ...checked.value }),
+        generation,
+      );
+      if (sent !== 'sent') {
+        cancelPendingExec(correlationId);
+        throw new Error(`legacy_upgrade_rescue_${sent}`);
+      }
+      const result = await pending;
+      if (!result) throw new Error('legacy_upgrade_rescue_result_missing');
+      if (
+        result.ok !== true
+        || result.exitCode !== 0
+        || result.timedOut === true
+        || result.truncated === true
+        || result.error !== undefined
+        || result.stderr.trim() !== ''
+        || result.stdout.trim() !== prepared.expectedStdout
+      ) throw new Error('legacy_upgrade_rescue_verification_failed');
+      if (
+        this.daemonWs !== ws
+        || this.daemonGeneration !== generation
+        || !this.authenticated
+        || !this.needsLegacyWindowsUpgradeRescue()
+      ) throw new Error('legacy_upgrade_rescue_generation_changed_after_dispatch');
+      this.legacyUpgradeRescuePreparedGeneration = generation;
+      await this.persistLegacyUpgradeRescueAudit(CONTROLLED_NODE_UPGRADE_RESCUE_AUDIT_ACTION.RESULT, {
+        generation,
+        rescueId,
+        attempt: state.attempts,
+        outcome: 'prepared',
+      });
+      state.inFlight = false;
+      this.flushPendingDaemonUpgrade(ws);
+    })().catch((error) => {
+      state.inFlight = false;
+      void this.persistLegacyUpgradeRescueAudit(CONTROLLED_NODE_UPGRADE_RESCUE_AUDIT_ACTION.RESULT, {
+        generation,
+        rescueId,
+        attempt: state.attempts,
+        outcome: 'failed',
+        reason: error instanceof Error ? error.message : 'legacy_upgrade_rescue_failed',
+      }).catch((auditError) => logger.error({ auditError, serverId: this.serverId }, 'Legacy upgrade rescue result audit failed'));
+      if (
+        this.daemonWs !== ws
+        || this.daemonGeneration !== generation
+        || !this.authenticated
+        || !this.needsLegacyWindowsUpgradeRescue()
+      ) return;
+      const retryMs = Math.min(
+        LEGACY_UPGRADE_RESCUE_RETRY_MAX_MS,
+        LEGACY_UPGRADE_RESCUE_RETRY_BASE_MS * (2 ** Math.min(4, state.attempts - 1)),
+      );
+      logger.warn({ error, serverId: this.serverId, retryMs }, 'Legacy Windows upgrade rescue preparation failed; keeping old node online');
+      state.timer = setTimeout(() => {
+        state.timer = null;
+        this.ensureLegacyWindowsUpgradeRescue();
+      }, retryMs);
+      state.timer.unref?.();
+    });
   }
 
   private sendDirectToDaemon(message: Record<string, unknown>): void {
@@ -6572,7 +6895,11 @@ export class WsBridge {
       this.upgradeBlockedSyncRequiredGeneration = null;
       this.upgradeBlockedSyncCompleteGeneration = null;
       this.daemonP2pWorkflowCapabilities = null;
-      this.controlledFileTransferCapabilities.clear();
+      this.controlledNodeCapabilities.clear();
+      this.daemonControlledOs = null;
+      this.daemonOwnerUserId = null;
+      this.resetLegacyUpgradeRescueForGeneration(this.daemonGeneration);
+      this.remoteDesktopRouter.stopAll(REMOTE_DESKTOP_TERMINAL_REASON.DAEMON_REPLACED);
     }
   }
 
@@ -6622,6 +6949,21 @@ export class WsBridge {
     }
   }
 
+  /** Remote desktop signaling is CONTROLLED-only, generation-bound, and never queued. */
+  private trySendRemoteDesktop(message: Record<string, unknown>, expectedGeneration: number): boolean {
+    if (!this.daemonWs || !this.authenticated || this.daemonWs.readyState !== WebSocket.OPEN) return false;
+    if (this.daemonGeneration !== expectedGeneration
+      || this.daemonNodeRole !== NODE_ROLE.CONTROLLED
+      || !this.controlledNodeCapabilities.has(REMOTE_DESKTOP_CAPABILITY)) return false;
+    try {
+      this.daemonWs.send(JSON.stringify(message));
+      return true;
+    } catch {
+      incrementCounter('remote_desktop.signaling_send_failed', { type: String(message.type ?? 'unknown') });
+      return false;
+    }
+  }
+
   sendToDaemon(message: string): void {
     const parsed = this.parseJsonObject(message);
     const parsedType = parsed?.type;
@@ -6650,6 +6992,7 @@ export class WsBridge {
       || parsedType === FILE_TRANSFER_MSG.DELETE
       || parsedType === MACHINE_DIRECT_FILE_TRANSFER_MSG.REQUEST
       || parsedType === MACHINE_DIRECT_FILE_TRANSFER_MSG.FETCH_REQUEST
+      || (typeof parsedType === 'string' && parsedType.startsWith('remote_desktop.'))
     ) {
       logger.warn({ serverId: this.serverId, type: parsedType }, 'Dropped control command sent via generic sendToDaemon');
       return;
@@ -8022,7 +8365,7 @@ export class WsBridge {
     // getDaemonP2pWorkflowCapabilities(now).
     if (!this.daemonWs || this.daemonWs.readyState !== WebSocket.OPEN) return false;
     if (this.daemonNodeRole === NODE_ROLE.CONTROLLED) {
-      return this.controlledFileTransferCapabilities.has(capability);
+      return this.controlledNodeCapabilities.has(capability as ControlledNodeCapability);
     }
     return this.daemonP2pWorkflowCapabilities?.capabilities.includes(capability) ?? false;
   }

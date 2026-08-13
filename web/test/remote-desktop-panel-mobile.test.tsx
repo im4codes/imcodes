@@ -1,0 +1,678 @@
+/** @vitest-environment jsdom */
+import { act, cleanup, render } from '@testing-library/preact';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import {
+  REMOTE_DESKTOP_ACCESS_MODE,
+  REMOTE_DESKTOP_CAPABILITY,
+  REMOTE_DESKTOP_LIMITS,
+  REMOTE_DESKTOP_STATE,
+  REMOTE_DESKTOP_TERMINAL_REASON,
+} from '@shared/remote-desktop.js';
+
+vi.mock('react-i18next', () => ({
+  useTranslation: () => ({ t: (key: string) => key }),
+}));
+
+const pointerButton = vi.fn(() => true);
+const pointerMove = vi.fn();
+const wheel = vi.fn(() => true);
+const releaseAll = vi.fn();
+const releasePointerButtons = vi.fn();
+const acknowledgePresentedFrame = vi.fn(() => true);
+const setDisplayMode = vi.fn(() => true);
+const selectDisplay = vi.fn(() => true);
+const stop = vi.fn();
+const { uploadFileWithDirectFallback } = vi.hoisted(() => ({
+  uploadFileWithDirectFallback: vi.fn(),
+}));
+const clientHooks: Array<{ onSnapshot(value: unknown): void }> = [];
+
+vi.mock('../src/remote-desktop-client.js', () => ({
+  RemoteDesktopClient: class {
+    constructor(_serverId: string, hooks: { onSnapshot(value: unknown): void }) {
+      clientHooks.push(hooks);
+      queueMicrotask(() => hooks.onSnapshot({
+        state: REMOTE_DESKTOP_STATE.DIRECT,
+        mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
+        inputEpoch: 1,
+        inputEnabled: true,
+        route: 'direct',
+        displays: [
+          {
+            id: 'display-primary', label: 'Display 1', primary: true, available: true,
+            width: 1920, height: 1080, dpiScale: 2.25, rotation: 0,
+          },
+          {
+            id: 'display-second', label: 'Display 2', primary: false, available: true,
+            width: 2560, height: 1440, dpiScale: 1.5, rotation: 0,
+          },
+        ],
+        selectedDisplayId: 'display-primary',
+        layoutRevision: 1,
+        stream: null,
+      }));
+    }
+    start = vi.fn(async () => {});
+    stop = stop;
+    releaseAll = releaseAll;
+    releasePointerButtons = releasePointerButtons;
+    acknowledgePresentedFrame = acknowledgePresentedFrame;
+    pointerButton = pointerButton;
+    pointerMove = pointerMove;
+    wheel = wheel;
+    key = vi.fn();
+    text = vi.fn();
+    setMode = vi.fn();
+    selectDisplay = selectDisplay;
+    setDisplayMode = setDisplayMode;
+  },
+}));
+
+vi.mock('../src/api.js', () => ({
+  downloadAttachment: vi.fn(),
+}));
+
+vi.mock('../src/direct-file-transfer.js', () => ({
+  uploadFileWithDirectFallback,
+  isFileUploadCanceled: (error: unknown) => (
+    typeof error === 'object' && error !== null && 'name' in error && error.name === 'AbortError'
+  ),
+}));
+
+vi.mock('../src/api/machines.js', () => ({
+  createMachineFileHandle: vi.fn(),
+}));
+
+import { RemoteDesktopPanel } from '../src/components/RemoteDesktopPanel.js';
+
+afterEach(() => {
+  cleanup();
+  vi.clearAllMocks();
+  vi.useRealTimers();
+  clientHooks.length = 0;
+});
+
+function pointer(
+  target: Element,
+  type: 'pointerdown' | 'pointermove' | 'pointerup',
+  values: { pointerId: number; clientX: number; clientY: number },
+): void {
+  const eventName = type === 'pointerdown' && !('onpointerdown' in target)
+    ? 'PointerDown'
+    : type === 'pointermove' && !('onpointermove' in target)
+      ? 'PointerMove'
+      : type === 'pointerup' && !('onpointerup' in target)
+        ? 'PointerUp'
+        : type;
+  const event = new MouseEvent(eventName, {
+    bubbles: true,
+    cancelable: true,
+    clientX: values.clientX,
+    clientY: values.clientY,
+  });
+  Object.defineProperties(event, {
+    pointerId: { value: values.pointerId },
+    pointerType: { value: 'touch' },
+    button: { value: 0 },
+  });
+  target.dispatchEvent(event);
+}
+
+function mousePointer(
+  target: Element,
+  type: 'pointerdown' | 'pointerup' | 'pointercancel' | 'lostpointercapture',
+  values: { pointerId: number; clientX: number; clientY: number; button?: number },
+): void {
+  const eventName = type === 'pointerdown' && !('onpointerdown' in target)
+    ? 'PointerDown'
+    : type === 'pointerup' && !('onpointerup' in target)
+      ? 'PointerUp'
+      : type === 'pointercancel' && !('onpointercancel' in target)
+        ? 'PointerCancel'
+        : type === 'lostpointercapture' && !('onlostpointercapture' in target)
+          ? 'LostPointerCapture'
+      : type;
+  const event = new MouseEvent(eventName, {
+    bubbles: true,
+    cancelable: true,
+    clientX: values.clientX,
+    clientY: values.clientY,
+    button: values.button ?? 0,
+  });
+  Object.defineProperties(event, {
+    pointerId: { value: values.pointerId },
+    pointerType: { value: 'mouse' },
+  });
+  target.dispatchEvent(event);
+}
+
+async function renderPanel(ws?: { targetsServer(serverId: string): boolean }) {
+  const result = render(<RemoteDesktopPanel
+    machine={{
+      serverId: 'server-1',
+      refName: 'controlled-1',
+      displayName: 'Windows',
+      os: 'win',
+      online: true,
+      execEnabled: true,
+      accessRole: 'owner',
+      capabilities: [REMOTE_DESKTOP_CAPABILITY],
+    }}
+    ws={ws as never}
+    onClose={vi.fn()}
+  />);
+  await act(async () => { await Promise.resolve(); });
+  const stage = result.container.querySelector('.remote-desktop-stage') as HTMLDivElement;
+  const video = result.container.querySelector('video') as HTMLVideoElement;
+  Object.defineProperties(stage, {
+    clientWidth: { value: 400, configurable: true },
+    clientHeight: { value: 300, configurable: true },
+  });
+  Object.defineProperties(video, {
+    offsetWidth: { value: 400, configurable: true },
+    offsetHeight: { value: 300, configurable: true },
+    videoWidth: { value: 1920, configurable: true },
+    videoHeight: { value: 1080, configurable: true },
+  });
+  stage.getBoundingClientRect = () => ({
+    x: 0, y: 0, left: 0, top: 0, right: 400, bottom: 300,
+    width: 400, height: 300, toJSON: () => ({}),
+  });
+  video.getBoundingClientRect = () => ({
+    x: 0, y: 0, left: 0, top: 0, right: 400, bottom: 300,
+    width: 400, height: 300, toJSON: () => ({}),
+  });
+  return { ...result, stage, video };
+}
+
+describe('RemoteDesktopPanel mobile gestures', () => {
+  it('reuses direct file transfer progress/mode and cancels without touching the desktop peer', async () => {
+    uploadFileWithDirectFallback.mockImplementation(async (options: {
+      onMode?(mode: string): void;
+      onProgress?(progress: number): void;
+      signal: AbortSignal;
+    }) => {
+      options.onMode?.('direct');
+      options.onProgress?.(33);
+      return await new Promise((_resolve, reject) => {
+        options.signal.addEventListener('abort', () => {
+          reject(new DOMException('upload_canceled', 'AbortError'));
+        }, { once: true });
+      });
+    });
+    const ws = { targetsServer: vi.fn(() => true) };
+    const { container, getByRole } = await renderPanel(ws);
+    const input = container.querySelector('input[type="file"]') as HTMLInputElement;
+    const file = new File(['payload'], 'report.txt', { type: 'text/plain' });
+    Object.defineProperty(input, 'files', { value: [file], configurable: true });
+    act(() => input.dispatchEvent(new Event('change', { bubbles: true })));
+
+    await vi.waitFor(() => expect(container.textContent).toContain('upload.transport.direct'));
+    expect((container.querySelector('progress') as HTMLProgressElement).value).toBe(33);
+    expect(ws.targetsServer).toHaveBeenCalledWith('server-1');
+    expect(pointerMove).not.toHaveBeenCalled();
+
+    act(() => (getByRole('button', { name: 'remote_desktop.cancel_transfer' }) as HTMLButtonElement).click());
+    await vi.waitFor(() => expect(container.textContent).toContain('remote_desktop.transfer_status_canceled'));
+  });
+
+  it('keeps relay fallback visible in the remote-panel transfer row', async () => {
+    uploadFileWithDirectFallback.mockImplementation(async (options: {
+      onMode?(mode: string): void;
+      onProgress?(progress: number): void;
+    }) => {
+      options.onMode?.('falling_back');
+      options.onMode?.('relay');
+      options.onProgress?.(100);
+      return { ok: true, attachment: { id: 'attachment-1' } };
+    });
+    const { container } = await renderPanel();
+    const input = container.querySelector('input[type="file"]') as HTMLInputElement;
+    Object.defineProperty(input, 'files', {
+      value: [new File(['payload'], 'relay.txt')],
+      configurable: true,
+    });
+    act(() => input.dispatchEvent(new Event('change', { bubbles: true })));
+    await vi.waitFor(() => expect(container.textContent).toContain('upload.transport.relay'));
+    await vi.waitFor(() => expect(container.textContent).toContain('remote_desktop.transfer_status_done'));
+  });
+
+  it('shows bounded connection diagnostics without rendering signaling or authority secrets', async () => {
+    const { container } = await renderPanel();
+    act(() => clientHooks[0]!.onSnapshot({
+      state: REMOTE_DESKTOP_STATE.DIRECT,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
+      inputEpoch: 1,
+      inputEnabled: true,
+      route: 'relay',
+      displays: [{
+        id: 'display-primary', label: 'Display 1', primary: true, available: true,
+        width: 1920, height: 1080, dpiScale: 1.5, rotation: 0,
+      }],
+      selectedDisplayId: 'display-primary',
+      layoutRevision: 1,
+      quality: {
+        preset: '1080p30', encoderClass: 'software', width: 1920, height: 1080,
+        fps: 29, bitrateBps: 4_200_000, droppedFrames: 3, rttMs: 24,
+      },
+      stream: null,
+      durationMs: 12_000,
+      reconnectCount: 2,
+      capabilityVersion: REMOTE_DESKTOP_CAPABILITY,
+      // These are deliberately outside the snapshot contract and therefore
+      // must not become a rendering escape hatch for sensitive diagnostics.
+      sdp: 'secret-sdp-marker',
+      iceCredential: 'secret-turn-marker',
+      rawCapability: 'secret-capability-marker',
+      inputHistory: 'KeyA',
+    }));
+    const diagnostics = container.querySelector('.remote-desktop-diagnostics');
+    expect(diagnostics?.textContent).toContain('1920×1080');
+    expect(diagnostics?.textContent).toContain('29 FPS');
+    expect(diagnostics?.textContent).toContain('4.2 Mbps · 24 ms');
+    expect(diagnostics?.textContent).not.toContain('secret-sdp-marker');
+    expect(diagnostics?.textContent).not.toContain('secret-turn-marker');
+    expect(diagnostics?.textContent).not.toContain('secret-capability-marker');
+    expect(diagnostics?.textContent).not.toContain('KeyA');
+  });
+
+  it('keeps monitor and mode controls keyboard-focusable while viewing', async () => {
+    const { getByRole } = await renderPanel();
+    act(() => clientHooks[0]!.onSnapshot({
+      state: REMOTE_DESKTOP_STATE.DIRECT,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW,
+      inputEpoch: 2,
+      inputEnabled: false,
+      route: 'direct',
+      displays: [{
+        id: 'display-primary', label: 'Display 1', primary: true, available: true,
+        width: 1920, height: 1080, dpiScale: 1.5, rotation: 0,
+      }],
+      selectedDisplayId: 'display-primary',
+      layoutRevision: 2,
+      stream: null,
+    }));
+
+    const displayTab = getByRole('tab', { name: 'Display 1' });
+    const controlButton = getByRole('button', { name: 'remote_desktop.control_mode' });
+    displayTab.focus();
+    expect(document.activeElement).toBe(displayTab);
+    controlButton.focus();
+    expect(document.activeElement).toBe(controlButton);
+    expect((controlButton as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it('opens each display resolution menu by context gesture and switches a fixed 720p-4K mode', async () => {
+    const { getByRole, getAllByRole } = await renderPanel();
+    const displayTab = getByRole('tab', { name: 'Display 1' });
+    act(() => {
+      displayTab.dispatchEvent(new MouseEvent('contextmenu', {
+        bubbles: true,
+        cancelable: true,
+        clientX: 40,
+        clientY: 50,
+      }));
+    });
+    expect(getByRole('menu')).not.toBeNull();
+    const modes = getAllByRole('menuitemradio');
+    expect(modes.map((mode) => mode.textContent)).toEqual([
+      '720p1280×720',
+      '1080p1920×1080',
+      '1440p2560×1440',
+      '4K3840×2160',
+    ]);
+    act(() => { (modes[3] as HTMLButtonElement).click(); });
+    expect(setDisplayMode).toHaveBeenCalledWith('display-primary', 3840, 2160);
+
+    const secondDisplayTab = getByRole('tab', { name: 'Display 2' });
+    act(() => {
+      secondDisplayTab.dispatchEvent(new MouseEvent('contextmenu', {
+        bubbles: true,
+        cancelable: true,
+        clientX: 80,
+        clientY: 50,
+      }));
+    });
+    const secondModes = getAllByRole('menuitemradio');
+    act(() => { (secondModes[0] as HTMLButtonElement).click(); });
+    expect(setDisplayMode).toHaveBeenCalledWith('display-second', 1280, 720);
+  });
+
+  it('opens the focused display resolution menu from the keyboard context-menu gesture', async () => {
+    const { getByRole } = await renderPanel();
+    const displayTab = getByRole('tab', { name: 'Display 1' });
+    displayTab.focus();
+    act(() => {
+      displayTab.dispatchEvent(new KeyboardEvent('keydown', {
+        bubbles: true,
+        cancelable: true,
+        key: 'F10',
+        shiftKey: true,
+      }));
+    });
+    expect(getByRole('menu')).not.toBeNull();
+    expect(document.activeElement).toBe(displayTab);
+  });
+
+  it('opens the same per-display resolution menu on a mobile long press without selecting the tab', async () => {
+    vi.useFakeTimers();
+    const { getByRole } = await renderPanel();
+    const displayTab = getByRole('tab', { name: 'Display 1' });
+    act(() => {
+      pointer(displayTab, 'pointerdown', { pointerId: 44, clientX: 80, clientY: 60 });
+    });
+    await act(async () => { await vi.advanceTimersByTimeAsync(550); });
+    expect(getByRole('menu')).not.toBeNull();
+    act(() => {
+      pointer(displayTab, 'pointerup', { pointerId: 44, clientX: 80, clientY: 60 });
+      (displayTab as HTMLButtonElement).click();
+    });
+    expect(setDisplayMode).not.toHaveBeenCalled();
+  });
+
+  it('does not leave a stale click suppression behind when a long press emits no click', async () => {
+    vi.useFakeTimers();
+    const { getByRole } = await renderPanel();
+    const displayTab = getByRole('tab', { name: 'Display 2' });
+    act(() => {
+      pointer(displayTab, 'pointerdown', { pointerId: 45, clientX: 100, clientY: 60 });
+    });
+    await act(async () => { await vi.advanceTimersByTimeAsync(1_551); });
+    act(() => { (displayTab as HTMLButtonElement).click(); });
+    expect(selectDisplay).toHaveBeenCalledWith('display-second');
+  });
+
+  it('turns a touch tap into one remote left click without DPI multiplication', async () => {
+    const { stage } = await renderPanel();
+    pointer(stage, 'pointerdown', { pointerId: 1, clientX: 200, clientY: 150 });
+    pointer(stage, 'pointerup', { pointerId: 1, clientX: 200, clientY: 150 });
+    expect(pointerButton).toHaveBeenNthCalledWith(1, 'left', true, 0.5, 0.5);
+    expect(pointerButton).toHaveBeenNthCalledWith(2, 'left', false, 0.5, 0.5);
+  });
+
+  it('releases a captured mouse button even when pointer-up is outside video content', async () => {
+    const { stage } = await renderPanel();
+    mousePointer(stage, 'pointerdown', {
+      pointerId: 7, clientX: 200, clientY: 150,
+    });
+    mousePointer(stage, 'pointerup', {
+      pointerId: 7, clientX: 500, clientY: 350,
+    });
+    mousePointer(stage, 'lostpointercapture', {
+      pointerId: 7, clientX: 500, clientY: 350,
+    });
+    expect(pointerButton).toHaveBeenNthCalledWith(1, 'left', true, 0.5, 0.5);
+    expect(pointerButton).toHaveBeenNthCalledWith(2, 'left', false, undefined, undefined);
+    expect(releasePointerButtons).toHaveBeenCalledTimes(1);
+    expect(releaseAll).not.toHaveBeenCalled();
+  });
+
+  it('releases only pointer buttons on pointer cancellation so held modifiers survive', async () => {
+    const { stage } = await renderPanel();
+    mousePointer(stage, 'pointerdown', {
+      pointerId: 8, clientX: 200, clientY: 150,
+    });
+    mousePointer(stage, 'pointercancel', {
+      pointerId: 8, clientX: 200, clientY: 150,
+    });
+    expect(releasePointerButtons).toHaveBeenCalledTimes(1);
+    expect(releaseAll).not.toHaveBeenCalled();
+  });
+
+  it('acknowledges only a browser-presented decoded video frame', async () => {
+    let presentedCallback: VideoFrameRequestCallback | undefined;
+    const requestFrame = vi.fn((callback: VideoFrameRequestCallback) => {
+      presentedCallback = callback;
+      return 41;
+    });
+    const cancelFrame = vi.fn();
+    Object.defineProperties(HTMLVideoElement.prototype, {
+      requestVideoFrameCallback: { configurable: true, value: requestFrame },
+      cancelVideoFrameCallback: { configurable: true, value: cancelFrame },
+    });
+    const rendered = await renderPanel();
+    expect(requestFrame).toHaveBeenCalledTimes(1);
+    act(() => presentedCallback?.(0, {} as VideoFrameCallbackMetadata));
+    expect(acknowledgePresentedFrame).toHaveBeenCalledWith(1920, 1080);
+    expect(requestFrame).toHaveBeenCalledTimes(2);
+    rendered.unmount();
+    expect(cancelFrame).toHaveBeenCalledWith(41);
+    delete (HTMLVideoElement.prototype as Partial<HTMLVideoElement>).requestVideoFrameCallback;
+    delete (HTMLVideoElement.prototype as Partial<HTMLVideoElement>).cancelVideoFrameCallback;
+  });
+
+  it('releases all remote input when the panel loses browser focus', async () => {
+    await renderPanel();
+    act(() => window.dispatchEvent(new Event('blur')));
+    expect(releaseAll).toHaveBeenCalledTimes(1);
+  });
+
+  it('uses drag/pinch for the local viewport and never sends an accidental click', async () => {
+    const { stage, video } = await renderPanel();
+    act(() => {
+      pointer(stage, 'pointerdown', { pointerId: 1, clientX: 120, clientY: 150 });
+      pointer(stage, 'pointerdown', { pointerId: 2, clientX: 280, clientY: 150 });
+      pointer(stage, 'pointermove', { pointerId: 2, clientX: 360, clientY: 150 });
+    });
+    expect(video.style.transform).not.toContain('scale(1)');
+    act(() => {
+      pointer(stage, 'pointerup', { pointerId: 2, clientX: 360, clientY: 150 });
+      pointer(stage, 'pointermove', { pointerId: 1, clientX: 180, clientY: 150 });
+      pointer(stage, 'pointerup', { pointerId: 1, clientX: 180, clientY: 150 });
+    });
+    expect(pointerButton).not.toHaveBeenCalled();
+  });
+
+  it('maps a tap through the transformed video rect after mobile zoom', async () => {
+    const { stage, video } = await renderPanel();
+    act(() => {
+      pointer(stage, 'pointerdown', { pointerId: 1, clientX: 120, clientY: 150 });
+      pointer(stage, 'pointerdown', { pointerId: 2, clientX: 280, clientY: 150 });
+      pointer(stage, 'pointermove', { pointerId: 2, clientX: 440, clientY: 150 });
+      pointer(stage, 'pointerup', { pointerId: 2, clientX: 440, clientY: 150 });
+      pointer(stage, 'pointerup', { pointerId: 1, clientX: 120, clientY: 150 });
+    });
+    expect(video.style.transform).toContain('scale(2)');
+    // At 2x, the 400x300 element has this transformed client rect. The 16:9
+    // video content occupies y=-75..375; this tap is source point 75%,25%.
+    video.getBoundingClientRect = () => ({
+      x: -200, y: -150, left: -200, top: -150, right: 600, bottom: 450,
+      width: 800, height: 600, toJSON: () => ({}),
+    });
+    pointer(stage, 'pointerdown', { pointerId: 3, clientX: 400, clientY: 37.5 });
+    pointer(stage, 'pointerup', { pointerId: 3, clientX: 400, clientY: 37.5 });
+    expect(pointerButton).toHaveBeenNthCalledWith(1, 'left', true, 0.75, 0.25);
+    expect(pointerButton).toHaveBeenNthCalledWith(2, 'left', false, 0.75, 0.25);
+  });
+
+  it('provides a readable auto-zoomed virtual mouse with buttons, wheel, and edge pan', async () => {
+    const { container, stage, video, getByRole } = await renderPanel();
+    act(() => {
+      (getByRole('button', { name: 'remote_desktop.mouse_mode' }) as HTMLButtonElement).click();
+    });
+    expect(video.style.transform).toContain('scale(3.2)');
+
+    for (const [name, button] of [
+      ['remote_desktop.mouse_left', 'left'],
+      ['remote_desktop.mouse_middle', 'middle'],
+      ['remote_desktop.mouse_right', 'right'],
+    ] as const) {
+      const target = getByRole('button', { name });
+      pointer(target, 'pointerdown', { pointerId: 10, clientX: 200, clientY: 150 });
+      pointer(target, 'pointerup', { pointerId: 10, clientX: 200, clientY: 150 });
+      expect(pointerButton).toHaveBeenCalledWith(button, true, 0.5, 0.5);
+      expect(pointerButton).toHaveBeenCalledWith(button, false, 0.5, 0.5);
+    }
+
+    const wheelControl = getByRole('button', { name: 'remote_desktop.mouse_wheel' });
+    act(() => {
+      pointer(wheelControl, 'pointerdown', { pointerId: 20, clientX: 200, clientY: 220 });
+      pointer(wheelControl, 'pointermove', { pointerId: 20, clientX: 200, clientY: 250 });
+      pointer(wheelControl, 'pointerup', { pointerId: 20, clientX: 200, clientY: 250 });
+    });
+    expect(wheel).toHaveBeenCalledWith(0, 240, 0.5, 0.5);
+
+    const handle = getByRole('button', { name: 'remote_desktop.mouse_drag' });
+    act(() => {
+      pointer(handle, 'pointerdown', { pointerId: 30, clientX: 200, clientY: 250 });
+      pointer(handle, 'pointermove', { pointerId: 30, clientX: 400, clientY: 250 });
+      pointer(handle, 'pointerup', { pointerId: 30, clientX: 400, clientY: 250 });
+    });
+    expect(pointerMove).toHaveBeenCalled();
+    expect(video.style.transform).toMatch(/translate3d\(-/);
+    expect(container.querySelector('.remote-desktop-virtual-pointer')).not.toBeNull();
+    expect(stage.textContent).toContain('remote_desktop.mouse_hint');
+  });
+
+  it('recomputes readable mouse zoom when the selected display changes resolution in place', async () => {
+    const { video, getByRole } = await renderPanel();
+    act(() => {
+      (getByRole('button', { name: 'remote_desktop.mouse_mode' }) as HTMLButtonElement).click();
+    });
+    expect(video.style.transform).toContain('scale(3.2)');
+
+    act(() => clientHooks[0]!.onSnapshot({
+      state: REMOTE_DESKTOP_STATE.DIRECT,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
+      inputEpoch: 1,
+      inputEnabled: true,
+      route: 'direct',
+      displays: [{
+        id: 'display-primary', label: 'Display 1', primary: true, available: true,
+        width: 3840, height: 2160, dpiScale: 2.25, rotation: 0,
+      }],
+      selectedDisplayId: 'display-primary',
+      layoutRevision: 2,
+      stream: null,
+    }));
+
+    expect(video.style.transform).toContain('scale(4)');
+  });
+
+  it('recomputes readable mouse zoom when the mobile viewport resizes', async () => {
+    const { stage, video, getByRole } = await renderPanel();
+    act(() => {
+      (getByRole('button', { name: 'remote_desktop.mouse_mode' }) as HTMLButtonElement).click();
+    });
+    expect(video.style.transform).toContain('scale(3.2)');
+
+    Object.defineProperties(stage, {
+      clientWidth: { value: 800, configurable: true },
+      clientHeight: { value: 300, configurable: true },
+    });
+    act(() => window.dispatchEvent(new Event('resize')));
+    expect(video.style.transform).toContain('scale(2.4)');
+  });
+
+  it('bounds transient reconnects and creates a fresh-authority client', async () => {
+    vi.useFakeTimers();
+    const { container } = await renderPanel();
+    expect(clientHooks).toHaveLength(1);
+    act(() => clientHooks[0]!.onSnapshot({
+      state: REMOTE_DESKTOP_STATE.FAILED,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW,
+      inputEpoch: 0,
+      inputEnabled: false,
+      displays: [],
+      layoutRevision: 1,
+      stream: null,
+      terminalReason: REMOTE_DESKTOP_TERMINAL_REASON.PEER_FAILED,
+    }));
+    expect(container.textContent).toContain('remote_desktop.state.reconnecting');
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(
+        REMOTE_DESKTOP_LIMITS.RECONNECT_BACKOFF_BASE_MS - 1,
+      );
+    });
+    expect(clientHooks).toHaveLength(1);
+    await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+    expect(clientHooks).toHaveLength(2);
+  });
+
+  it('renews the bounded retry budget after a stable recovered connection', async () => {
+    vi.useFakeTimers();
+    const { container } = await renderPanel();
+    const failed = {
+      state: REMOTE_DESKTOP_STATE.FAILED,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW,
+      inputEpoch: 0,
+      inputEnabled: false,
+      displays: [],
+      layoutRevision: 1,
+      stream: null,
+      terminalReason: REMOTE_DESKTOP_TERMINAL_REASON.PEER_FAILED,
+    };
+    act(() => clientHooks[0]!.onSnapshot(failed));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(REMOTE_DESKTOP_LIMITS.RECONNECT_BACKOFF_BASE_MS);
+    });
+    expect(clientHooks).toHaveLength(2);
+    await act(async () => { await Promise.resolve(); });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(REMOTE_DESKTOP_LIMITS.RECONNECT_STABILITY_RESET_MS);
+    });
+    expect(container.textContent).toContain('remote_desktop.reconnects');
+    act(() => clientHooks[1]!.onSnapshot(failed));
+    expect(container.textContent).toContain('remote_desktop.state.reconnecting');
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(REMOTE_DESKTOP_LIMITS.RECONNECT_BACKOFF_BASE_MS);
+    });
+    expect(clientHooks).toHaveLength(3);
+  });
+
+  it('stops retrying after the bounded budget for one continuous outage', async () => {
+    vi.useFakeTimers();
+    const { container } = await renderPanel();
+    const failed = {
+      state: REMOTE_DESKTOP_STATE.FAILED,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW,
+      inputEpoch: 0,
+      inputEnabled: false,
+      displays: [],
+      layoutRevision: 1,
+      stream: null,
+      terminalReason: REMOTE_DESKTOP_TERMINAL_REASON.PEER_FAILED,
+    };
+
+    for (let attempt = 0; attempt < REMOTE_DESKTOP_LIMITS.MAX_RECONNECT_ATTEMPTS; attempt++) {
+      act(() => clientHooks[attempt]!.onSnapshot(failed));
+      expect(container.textContent).toContain('remote_desktop.state.reconnecting');
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(
+          REMOTE_DESKTOP_LIMITS.RECONNECT_BACKOFF_BASE_MS * (2 ** attempt),
+        );
+      });
+      expect(clientHooks).toHaveLength(attempt + 2);
+    }
+
+    act(() => clientHooks[REMOTE_DESKTOP_LIMITS.MAX_RECONNECT_ATTEMPTS]!
+      .onSnapshot(failed));
+    expect(container.textContent).toContain('remote_desktop.failed');
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(
+        REMOTE_DESKTOP_LIMITS.RECONNECT_BACKOFF_BASE_MS
+          * (2 ** REMOTE_DESKTOP_LIMITS.MAX_RECONNECT_ATTEMPTS),
+      );
+    });
+    expect(clientHooks).toHaveLength(REMOTE_DESKTOP_LIMITS.MAX_RECONNECT_ATTEMPTS + 1);
+  });
+
+  it('treats a local-user Stop as terminal instead of reconnecting', async () => {
+    vi.useFakeTimers();
+    const { container } = await renderPanel();
+    expect(clientHooks).toHaveLength(1);
+    act(() => clientHooks[0]!.onSnapshot({
+      state: REMOTE_DESKTOP_STATE.FAILED,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW,
+      inputEpoch: 0,
+      inputEnabled: false,
+      displays: [],
+      layoutRevision: 1,
+      stream: null,
+      terminalReason: REMOTE_DESKTOP_TERMINAL_REASON.STOPPED_BY_LOCAL_USER,
+    }));
+    expect(container.textContent).toContain('remote_desktop.failed');
+    await act(async () => { await vi.advanceTimersByTimeAsync(5_000); });
+    expect(clientHooks).toHaveLength(1);
+  });
+});

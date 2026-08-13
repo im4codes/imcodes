@@ -6233,7 +6233,7 @@ export function App() {
           onFocus={() => bringDesktopWindowToFront(DESKTOP_WINDOW_IDS.controlledNodes)}
           className="controlled-nodes-floating-panel"
         >
-          <ControlledNodesPanel />
+          <ControlledNodesPanel ws={wsRef.current} />
         </FloatingPanel>
       )}
 

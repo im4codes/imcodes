@@ -44,6 +44,7 @@ export class AuthenticatedWebSocketClient {
   }
 
   stop(): void {
+    if (this.stopped) return;
     this.stopped = true;
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     if (this.connectTimer) clearTimeout(this.connectTimer);
@@ -54,6 +55,9 @@ export class AuthenticatedWebSocketClient {
     const socket = this.socket;
     this.socket = null;
     socket?.close(1000, 'client_stopped');
+    // The close listener intentionally ignores a socket once stop() clears its
+    // identity, so invoke lifecycle cleanup here exactly once as well.
+    this.options.onClose?.();
   }
 
   send(message: unknown): boolean {

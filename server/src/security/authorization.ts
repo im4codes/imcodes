@@ -10,6 +10,10 @@ import { COOKIE_SESSION } from '../../../shared/cookie-names.js';
 import { AUTH_IDENTITY_ERRORS } from '../../../shared/auth-identity.js';
 import { EXPECTED_USER_ID_HEADER } from '../../../shared/http-header-names.js';
 import { NODE_ROLE, type NodeRole } from '../../../shared/remote-exec.js';
+import {
+  canOperateControlledMachine,
+  resolveControlledMachineAccess,
+} from '../share/machine-access.js';
 
 export type Role = 'owner' | 'admin' | 'member' | 'unauthenticated';
 
@@ -236,6 +240,9 @@ export function requireTeamRole(minRole: 'owner' | 'admin' | 'member' = 'member'
 }
 
 export type ServerRole = 'owner' | 'admin' | 'member' | 'none';
+export type ServerWebSocketAccess =
+  | { kind: 'standard'; role: Exclude<ServerRole, 'none'> }
+  | { kind: 'controlled'; role: 'owner' | 'participant' };
 
 /**
  * Resolve the user's role for a specific server.
@@ -270,6 +277,34 @@ export async function resolveServerRole(
   }
 
   return 'none';
+}
+
+/**
+ * WebSocket admission includes active Owner/Participant controlled-machine
+ * grants, while keeping Viewers and unrelated users out. Returning the target
+ * kind lets WsBridge default-deny every non-remote-desktop browser frame even
+ * while the controlled daemon is offline or reconnecting.
+ */
+export async function resolveServerWebSocketAccess(
+  db: Database,
+  serverId: string,
+  userId: string,
+  now = Date.now(),
+): Promise<ServerWebSocketAccess | null> {
+  const target = await db.queryOne<{ node_role: string | null }>(
+    'SELECT node_role FROM servers WHERE id = $1 AND revoked_at IS NULL',
+    [serverId],
+  );
+  if (!target) return null;
+  if (target.node_role === NODE_ROLE.CONTROLLED) {
+    const controlled = await resolveControlledMachineAccess(db, userId, serverId, now);
+    if (!controlled) return null;
+    return canOperateControlledMachine(controlled.access_role)
+      ? { kind: 'controlled', role: controlled.access_role }
+      : null;
+  }
+  const role = await resolveServerRole(db, serverId, userId);
+  return role === 'none' ? null : { kind: 'standard', role };
 }
 
 /**

@@ -1,4 +1,5 @@
 import net from 'node:net';
+import { EventEmitter } from 'node:events';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -15,6 +16,7 @@ import {
   runComputerUseIpcHelper,
   windowsPipeClientAclCommand,
 } from '../../src/node/computer-use-ipc.js';
+import { allowWindowsNamedPipeClients } from '../../src/node/windows-user-session.js';
 import type { MacosComputerUseRuntime, MacosConsoleUser } from '../../src/node/macos-computer-use.js';
 import { downloadControlledNodeComputerUseHelper } from '../../src/node/self-upgrade.js';
 
@@ -45,6 +47,27 @@ describe('computer use IPC Windows pipe ACL', () => {
       '/grant',
       '*S-1-5-11:F',
     ]);
+  });
+
+  it('awaits the authenticated-user ACL without blocking the event loop', async () => {
+    const calls: Array<{ file: string; args: readonly string[] }> = [];
+    let completed = false;
+    const child = new EventEmitter();
+    const applying = allowWindowsNamedPipeClients('\\\\.\\pipe\\imcodes-remote-desktop-123', ((file, args, _options, callback) => {
+      calls.push({ file, args: args ?? [] });
+      queueMicrotask(() => {
+        completed = true;
+        callback?.(null, '', '');
+      });
+      return child;
+    }) as unknown as typeof import('node:child_process').execFile);
+    expect(completed).toBe(false);
+    await expect(applying).resolves.toBeUndefined();
+    expect(completed).toBe(true);
+    expect(calls).toEqual([{
+      file: 'icacls',
+      args: ['\\\\.\\pipe\\imcodes-remote-desktop-123', '/grant', '*S-1-5-11:F'],
+    }]);
   });
 });
 

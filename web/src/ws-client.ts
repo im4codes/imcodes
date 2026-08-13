@@ -514,6 +514,10 @@ export class WsClient {
     return this._connected;
   }
 
+  targetsServer(serverId: string): boolean {
+    return this.serverId === serverId;
+  }
+
   get connecting(): boolean {
     return this._connecting
       || this.ws?.readyState === WebSocket.CONNECTING

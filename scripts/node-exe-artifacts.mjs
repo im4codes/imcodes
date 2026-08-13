@@ -98,6 +98,9 @@ export async function createNodeExeManifest({
   buildCommit,
   buildVersion,
   nodeArchives,
+  helperPath,
+  helperRelativePath,
+  authenticodeSignerSha256,
 }) {
   if (!SUPPORTED_PLATFORMS.has(os)) throw new Error(`unsupported manifest os: ${os}`);
   if (!SUPPORTED_ARCHES.has(arch)) throw new Error(`unsupported manifest arch: ${arch}`);
@@ -111,6 +114,26 @@ export async function createNodeExeManifest({
 
   const file = await stat(artifactPath);
   if (!file.isFile()) throw new Error(`artifact is not a regular file: ${artifactPath}`);
+  let computerUseHelper;
+  if (helperPath !== undefined || helperRelativePath !== undefined) {
+    if (typeof helperPath !== 'string' || typeof helperRelativePath !== 'string'
+      || helperRelativePath.length === 0 || helperRelativePath.includes('\\')
+      || helperRelativePath.split('/').some((part) => !part || part === '.' || part === '..')) {
+      throw new Error('invalid Computer Use helper path');
+    }
+    const helper = await stat(helperPath);
+    if (!helper.isFile() || helper.size <= 0) throw new Error('Computer Use helper is not a regular file');
+    computerUseHelper = {
+      relativePath: helperRelativePath,
+      size: helper.size,
+      sha256: await sha256File(helperPath),
+      ...(authenticodeSignerSha256 ? { authenticodeSignerSha256 } : {}),
+    };
+  }
+  if (authenticodeSignerSha256 !== undefined
+    && (typeof authenticodeSignerSha256 !== 'string' || !SHA256_RE.test(authenticodeSignerSha256))) {
+    throw new Error('invalid Authenticode signer SHA-256');
+  }
   return {
     schemaVersion: NODE_EXE_MANIFEST_SCHEMA_VERSION,
     artifact: {
@@ -119,7 +142,9 @@ export async function createNodeExeManifest({
       arch,
       size: file.size,
       sha256: await sha256File(artifactPath),
+      ...(authenticodeSignerSha256 ? { authenticodeSignerSha256 } : {}),
     },
+    ...(computerUseHelper ? { computerUseHelper } : {}),
     toolchain: {
       nodeVersion,
       nodeArchive,
@@ -145,12 +170,25 @@ function assertManifestShape(value, manifestPath) {
   const artifact = value.artifact;
   const toolchain = value.toolchain;
   const build = value.build;
+  const computerUseHelper = value.computerUseHelper;
   if (!artifact || typeof artifact !== 'object' || Array.isArray(artifact)) fail('artifact must be an object');
   if (typeof artifact.fileName !== 'string' || basename(artifact.fileName) !== artifact.fileName || artifact.fileName.length === 0) fail('artifact.fileName must be a basename');
   if (!SUPPORTED_PLATFORMS.has(artifact.os)) fail('artifact.os is unsupported');
   if (!SUPPORTED_ARCHES.has(artifact.arch)) fail('artifact.arch is unsupported');
   if (!Number.isSafeInteger(artifact.size) || artifact.size <= 0) fail('artifact.size must be a positive integer');
   if (typeof artifact.sha256 !== 'string' || !SHA256_RE.test(artifact.sha256)) fail('artifact.sha256 must be lowercase SHA-256 hex');
+  if (artifact.authenticodeSignerSha256 !== undefined
+    && (typeof artifact.authenticodeSignerSha256 !== 'string' || !SHA256_RE.test(artifact.authenticodeSignerSha256))) fail('artifact.authenticodeSignerSha256 is invalid');
+  if (computerUseHelper !== undefined) {
+    if (!computerUseHelper || typeof computerUseHelper !== 'object' || Array.isArray(computerUseHelper)) fail('computerUseHelper must be an object');
+    if (typeof computerUseHelper.relativePath !== 'string' || computerUseHelper.relativePath.length === 0
+      || computerUseHelper.relativePath.includes('\\')
+      || computerUseHelper.relativePath.split('/').some((part) => !part || part === '.' || part === '..')) fail('computerUseHelper.relativePath is invalid');
+    if (!Number.isSafeInteger(computerUseHelper.size) || computerUseHelper.size <= 0) fail('computerUseHelper.size is invalid');
+    if (typeof computerUseHelper.sha256 !== 'string' || !SHA256_RE.test(computerUseHelper.sha256)) fail('computerUseHelper.sha256 is invalid');
+    if (computerUseHelper.authenticodeSignerSha256 !== undefined
+      && (typeof computerUseHelper.authenticodeSignerSha256 !== 'string' || !SHA256_RE.test(computerUseHelper.authenticodeSignerSha256))) fail('computerUseHelper.authenticodeSignerSha256 is invalid');
+  }
   if (!toolchain || typeof toolchain !== 'object' || Array.isArray(toolchain)) fail('toolchain must be an object');
   if (typeof toolchain.nodeVersion !== 'string' || !/^v\d+\.\d+\.\d+$/.test(toolchain.nodeVersion)) fail('toolchain.nodeVersion is invalid');
   if (typeof toolchain.nodeArchive !== 'string' || basename(toolchain.nodeArchive) !== toolchain.nodeArchive || toolchain.nodeArchive.length === 0) fail('toolchain.nodeArchive is invalid');
@@ -219,8 +257,18 @@ export async function verifyNodeExeManifestSet(artifactDirectory, expectedFileNa
     if (helperRelativePath) {
       const helperPath = join(artifactDirectory, ...helperRelativePath);
       const helper = await stat(helperPath).catch(() => null);
-      if (!helper?.isFile() || helper.size <= 0) {
+      const expectedRelativePath = helperRelativePath.join('/');
+      if (!helper?.isFile() || helper.size <= 0
+        || manifest.computerUseHelper?.relativePath !== expectedRelativePath
+        || manifest.computerUseHelper?.size !== helper.size
+        || manifest.computerUseHelper?.sha256 !== await sha256File(helperPath)) {
         throw new Error(`controlled-node Computer Use helper is missing or empty for ${fileName}: ${helperPath}`);
+      }
+      if (manifest.artifact.os === 'win32') {
+        const signer = manifest.artifact.authenticodeSignerSha256;
+        if (!signer || manifest.computerUseHelper.authenticodeSignerSha256 !== signer) {
+          throw new Error('Windows controlled-node executable and Computer Use helper do not share one Authenticode signer');
+        }
       }
     }
   }

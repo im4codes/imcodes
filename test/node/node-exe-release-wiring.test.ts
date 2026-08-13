@@ -12,6 +12,27 @@ describe('controlled-node executable release wiring', () => {
     expect(workflow).toContain('imcodes-node-linux imcodes-node-macos imcodes-node.exe');
     expect(workflow).toContain('dist-node-exe/${{ matrix.artifact }}.manifest.json');
     expect(workflow).toContain('dist-node-exe/computer-use-helper/**');
+    expect(workflow).toContain('native\\windows-remote-desktop\\build-worker.ps1');
+    expect(workflow).toContain('IMCODES_WINDOWS_SIGNING_PFX_BASE64');
+    expect(workflow).toContain('-RequireAuthenticodeSignature');
+    expect(workflow).toContain('-CodeSigningTimestampUrl');
+    expect(workflow).toContain('dist-node-exe/remote-desktop-worker/**');
+    expect(workflow).toContain('remote-desktop-worker-artifacts.mjs verify');
+    expect(workflow).toContain('npx tsx scripts/qualify-windows-self-upgrade.ts');
+    const workerBuild = readFileSync('native/windows-remote-desktop/build-worker.ps1', 'utf8');
+    const displayBuild = readFileSync('native/windows-virtual-display/build-virtual-display.ps1', 'utf8');
+    expect(workerBuild).toContain('tools_webrtc\\libs\\generate_licenses.py');
+    expect(workerBuild).toContain('THIRD_PARTY_NOTICES.webrtc.md');
+    expect(workerBuild).toContain('Remove-Item -Force -LiteralPath $ThirdPartyNotices');
+    expect(workerBuild).toContain("Where-Object { $_.Name -match '^\\d+\\.\\d+\\.\\d+\\.\\d+$' }");
+    expect(displayBuild).toContain("'THIRD_PARTY_NOTICES.webrtc.md'");
+    const signDll = displayBuild.indexOf('$Arguments += $DllPath');
+    const buildCatalog = displayBuild.indexOf('& $Inf2Cat');
+    const signCatalog = displayBuild.indexOf('$Arguments += $Catalog');
+    expect(signDll).toBeGreaterThan(-1);
+    expect(signDll).toBeLessThan(buildCatalog);
+    expect(buildCatalog).toBeLessThan(signCatalog);
+    expect(displayBuild).toContain('& $SignTool verify /pa /c $Catalog');
     expect(workflow).toContain("IMCODES_REQUIRE_COMPUTER_USE_HELPER: '1'");
     expect(workflow).toContain('IMCODES_BUILD_VERSION: ${{ needs.release_version.outputs.app_version }}');
     expect(workflow).toContain('APP_VERSION=${{ needs.release_version.outputs.app_version }}');
@@ -29,6 +50,7 @@ describe('controlled-node executable release wiring', () => {
 
     expect(dockerfile).toContain('COPY server/controlled-node-artifacts/ ./controlled-node-executables/');
     expect(dockerfile).toContain('COPY scripts/node-exe-artifacts.mjs ./scripts/node-exe-artifacts.mjs');
+    expect(dockerfile).toContain('COPY scripts/remote-desktop-worker-artifacts.mjs ./scripts/remote-desktop-worker-artifacts.mjs');
     expect(dockerfile).toContain('ENV IMCODES_NODE_EXE_DIR=/app/controlled-node-executables');
   });
 
@@ -55,10 +77,43 @@ describe('controlled-node executable release wiring', () => {
     expect(buildScript).toContain("'process.env.IMCODES_BUILD_VERSION': JSON.stringify(buildVersion)");
     expect(buildScript).not.toContain("'process.env.IMCODES_BUILD_VERSION': JSON.stringify(packageVersion)");
     expect(buildScript).not.toContain("sh('npx', ['-y', 'postject'");
+    expect(buildScript).toContain("postjectApi.inject(destination, 'NODE_SEA_BLOB'");
+    expect(buildScript).toContain('if (isWin) {');
+    expect(buildScript).toContain('sh(process.execPath, [postjectBin, ...args]);');
     expect(packageJson.devDependencies?.postject).toBe('1.0.0-alpha.6');
     expect(buildScript).toContain("await Promise.all(['arm64', 'x64'].map");
     expect(buildScript).toContain("sh('lipo', ['-create'");
     expect(buildScript).toContain("const artifactArch = platform === 'darwin' ? 'universal' : arch");
+  });
+
+  it('strips the upstream signature before SEA injection and signs all final Windows executables before manifest hashing', () => {
+    const buildScript = readFileSync('scripts/build-node-exe.mjs', 'utf8');
+    const signingScript = readFileSync('scripts/windows-sign-release-artifact.ps1', 'utf8');
+
+    expect(buildScript).toContain('function runWindowsReleaseSigning(');
+    expect(buildScript).toContain('IMCODES_WINDOWS_SIGNING_CERT_THUMBPRINT');
+    expect(buildScript).toContain('windows-sign-release-artifact.ps1');
+    expect(buildScript.indexOf("runWindowsReleaseSigning('Remove', destination);"))
+      .toBeLessThan(buildScript.indexOf("postjectApi.inject(destination, 'NODE_SEA_BLOB'"));
+    expect(buildScript).toContain("join(buildDir, 'computer-use-helper', 'win32-x64', 'open-computer-use.exe')");
+    expect(buildScript.indexOf("runWindowsReleaseSigning('Sign', outPath, windowsReleaseSignerSha256);"))
+      .toBeLessThan(buildScript.indexOf('const manifest = await createNodeExeManifest({'));
+    expect(signingScript).toContain("'sign', '/s', 'My', '/sha1', $CodeSigningCertificateThumbprint");
+    expect(signingScript).toContain('& $SignTool remove /s $ResolvedArtifact');
+    expect(signingScript).toContain("'/tr', $TimestampUrl, '/td', 'sha256'");
+    expect(signingScript).toContain('Get-AuthenticodeSignature -LiteralPath $ResolvedArtifact');
+    expect(signingScript).toContain('$Signature.Status -ne [System.Management.Automation.SignatureStatus]::Valid');
+    expect(signingScript).toContain('$ActualSignerSha256 -cne $ExpectedSignerSha256.ToLowerInvariant()');
+    expect(signingScript).toContain('& $SignTool verify /pa /all $ResolvedArtifact');
+
+    for (const workflowPath of ['.github/workflows/build-node-exe.yml', '.github/workflows/ci.yml']) {
+      const workflow = readFileSync(workflowPath, 'utf8');
+      expect(workflow).toContain('Cert:\\LocalMachine\\TrustedPeople');
+      expect(workflow).toContain('Cert:\\LocalMachine\\TrustedPublisher');
+      expect(workflow).not.toContain('Cert:\\LocalMachine\\Root');
+      expect(workflow).toContain('Remove-Item -LiteralPath $pfxPath -Force');
+      expect(workflow).toContain('Windows release-signing material cleanup was incomplete.');
+    }
   });
 
   it('self-hosts the Computer Use helper from a pinned npm package during CI builds', () => {

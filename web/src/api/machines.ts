@@ -22,7 +22,16 @@ import {
 } from '@shared/controlled-node-artifacts.js';
 import { MACHINE_API_PATH } from '@shared/machine-reference.js';
 import { isMachineAccessRole, type MachineAccessRole } from '@shared/remote-exec.js';
-import { apiFetch, getApiBaseUrl, getExpectedUserId } from '../api.js';
+import {
+  validateControlledNodeCapabilities,
+  type ControlledNodeCapability,
+} from '@shared/controlled-node-capabilities.js';
+import {
+  apiFetch,
+  getApiBaseUrl,
+  getExpectedUserId,
+  type AttachmentRefResponse,
+} from '../api.js';
 
 export type { ControlledNodeArtifactArch, ControlledNodeOs };
 
@@ -35,6 +44,7 @@ export interface MachineListItem {
   online: boolean;
   execEnabled: boolean;
   accessRole?: MachineAccessRole;
+  capabilities?: ControlledNodeCapability[];
 }
 
 /** Identifies one downloadable artifact in the canonical OS+arch matrix. */
@@ -67,6 +77,19 @@ export interface ControlledNodeExecutableTicket {
   sha256: string;
   expiresAt: number;
   ownerUserId: string;
+}
+
+export async function createMachineFileHandle(
+  serverId: string,
+  path: string,
+  signal?: AbortSignal,
+): Promise<AttachmentRefResponse> {
+  const result = await apiFetch<{ ok: boolean; attachment: AttachmentRefResponse }>(
+    `/api/server/${encodeURIComponent(serverId)}/machine-file-handle`,
+    { method: 'POST', body: JSON.stringify({ path }), signal },
+  );
+  if (!result.ok || !result.attachment) throw new Error('machine_file_handle_failed');
+  return result.attachment;
 }
 
 const ENROLL_V2_AVAILABILITY_PATH = '/api/enroll/v2/availability';
@@ -143,6 +166,7 @@ function normalizeMachine(raw: unknown): MachineListItem | null {
   const serverId = typeof raw.serverId === 'string' ? raw.serverId : '';
   const refName = typeof raw.refName === 'string' ? raw.refName : '';
   if (!serverId || !refName) return null;
+  const capabilities = validateControlledNodeCapabilities(raw.capabilities);
   return {
     serverId,
     refName,
@@ -156,6 +180,7 @@ function normalizeMachine(raw: unknown): MachineListItem | null {
     accessRole: raw.accessRole === undefined
       ? 'owner'
       : isMachineAccessRole(raw.accessRole) ? raw.accessRole : 'viewer',
+    ...(capabilities.ok && capabilities.value.length > 0 ? { capabilities: capabilities.value } : {}),
   };
 }
 
