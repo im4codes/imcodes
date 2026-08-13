@@ -18,6 +18,7 @@ import {
   normalizeOpenSpecAutoDeliverProjection,
   openSpecAutoDeliverRowFromProjection,
 } from '../openspec-auto-deliver-normalize.js';
+import { loadFsLocalImagePreview } from '../fs-local-image-preview.js';
 
 interface P2pDiscussion {
   id: string;
@@ -459,6 +460,14 @@ export function DiscussionsPage({ ws, initialSelectedId, initialTab = 'team', re
     () => (selected ? discussions.find((d) => d.id === selected) ?? null : null),
     [discussions, selected],
   );
+  const loadDiscussionImagePreview = useCallback((path: string) => {
+    if (!ws) return Promise.reject(new Error(t('file_browser.preview_error')));
+    return loadFsLocalImagePreview(ws, path, {
+      sessionName: stableRequestScope?.sessionName,
+      errorMessage: t('file_browser.preview_error'),
+      timeoutMessage: t('file_browser.timeout'),
+    });
+  }, [stableRequestScope?.sessionName, t, ws]);
   const selectedAutoDeliverRow = useMemo(
     () => (selectedAutoRunId ? autoDeliverRows.find((row) => row.runId === selectedAutoRunId) ?? null : null),
     [autoDeliverRows, selectedAutoRunId],
@@ -680,7 +689,11 @@ export function DiscussionsPage({ ws, initialSelectedId, initialTab = 'team', re
             )}
             {selected && content !== null && (
               <div class="discussions-file-preview">
-                <FilePreviewPane content={content} path={`${selected}.md`} />
+                <FilePreviewPane
+                  content={content}
+                  path={selectedDiscussion?.path ?? `${selected}.md`}
+                  onImagePreview={ws ? loadDiscussionImagePreview : undefined}
+                />
               </div>
             )}
           </div>

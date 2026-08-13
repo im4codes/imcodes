@@ -54,7 +54,21 @@ vi.mock('../../src/components/P2pProgressCard.js', () => ({
 }));
 
 vi.mock('../../src/components/FilePreviewPane.js', () => ({
-  FilePreviewPane: ({ content }: { content: string }) => <div data-testid="discussion-preview">{content}</div>,
+  FilePreviewPane: ({
+    content,
+    path,
+    onImagePreview,
+  }: {
+    content: string;
+    path: string;
+    onImagePreview?: (path: string) => Promise<unknown>;
+  }) => (
+    <div
+      data-testid="discussion-preview"
+      data-path={path}
+      data-image-preview={onImagePreview ? 'enabled' : 'disabled'}
+    >{content}</div>
+  ),
 }));
 
 describe('DiscussionsPage', () => {
@@ -253,6 +267,9 @@ describe('DiscussionsPage', () => {
         content: 'Preview 3',
       } as ServerMessage);
     });
+
+    expect(screen.getByTestId('discussion-preview').getAttribute('data-path')).toBe('/tmp/disc-3.md');
+    expect(screen.getByTestId('discussion-preview').getAttribute('data-image-preview')).toBe('enabled');
 
     fireEvent.click(screen.getByLabelText('common.copy'));
     fireEvent.click(screen.getByText('p2p.discussions.copy_path'));

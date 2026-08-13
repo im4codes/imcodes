@@ -25,6 +25,7 @@ const FilePreviewPane = lazy(() => import('./FilePreviewPane.js'));
 const OfficePreview = lazy(() => import('./OfficePreview.js'));
 import { HtmlFullscreenPreview, openHtmlPreviewInNewWindow, type HtmlFullscreenPreviewState } from './HtmlFullscreenPreview.js';
 import { ImageLightbox } from './ImageLightbox.js';
+import type { ChatLocalImagePreviewLoader } from './ChatLocalImagePreview.js';
 import { buildAttachmentDownloadUrl, downloadAttachment } from '../api.js';
 import {
   getSharedChangesKey,
@@ -37,6 +38,7 @@ import {
 } from '../git-status-store.js';
 import { filePreviewStatesEqual } from '../file-preview-state.js';
 import { FILE_BROWSER_SNAPSHOT_KEY_PREFIX } from '../local-storage-quota.js';
+import { loadFsLocalImagePreview } from '../fs-local-image-preview.js';
 
 const PREF_KEY = 'fb_prefer_editor';
 const WINDOWS_DRIVES_ROOT = '__imcodes_windows_drives__';
@@ -1709,6 +1711,15 @@ export function FileBrowser({
     }
   }, [preview, scopedSessionName, serverId, sessionName, t, ws]);
 
+  const loadMarkdownImagePreview = useCallback<ChatLocalImagePreviewLoader>((path: string) => (
+    loadFsLocalImagePreview(ws, path, {
+      sessionName: scopedSessionName,
+      timeoutMs: PREVIEW_REQUEST_TIMEOUT_MS,
+      errorMessage: t('file_browser.preview_error'),
+      timeoutMessage: t('file_browser.timeout'),
+    })
+  ), [scopedSessionName, t, ws]);
+
   const previewPane = hasInlinePreview ? (
     <div class="fb-preview">
       <div class="fb-preview-header">
@@ -1926,7 +1937,12 @@ export function FileBrowser({
         )}
         {preview.status === 'ok' && !isEditing && (!showDiff || !canRenderDiff) && (
           <Suspense fallback={<div class="fb-preview-loading"><div class="fb-loading-spinner" /></div>}>
-            <FilePreviewPane content={preview.content} path={preview.path} />
+            <FilePreviewPane
+              content={preview.content}
+              path={preview.path}
+              onPathClick={fetchPreview}
+              onImagePreview={loadMarkdownImagePreview}
+            />
           </Suspense>
         )}
         {preview.status === 'ok' && !isEditing && showDiff && canRenderDiff && (

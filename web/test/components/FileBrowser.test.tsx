@@ -11,6 +11,15 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { h } from 'preact';
 import { render, screen, fireEvent, act, cleanup, waitFor } from '@testing-library/preact';
 
+const filePreviewPropsState = vi.hoisted(() => ({
+  current: null as null | {
+    content: string;
+    path: string;
+    onPathClick?: (path: string) => void;
+    onImagePreview?: (path: string) => Promise<{ dataUrl: string; alt?: string } | string>;
+  },
+}));
+
 // Mock FileEditor.js to prevent Vitest's SSR module graph from evaluating
 // 17 CodeMirror/Lezer imports (causes OOM in jsdom). vi.mock is hoisted but
 // Vitest still resolves the module graph for dependency analysis — this mock
@@ -25,7 +34,10 @@ vi.mock('../../src/components/file-editor-lazy.js', () => ({
   FileEditorContent: () => null,
 }));
 vi.mock('../../src/components/FilePreviewPane.js', () => ({
-  default: (props: { content: string }) => <div data-testid="mock-file-preview">{props.content}</div>,
+  default: (props: NonNullable<typeof filePreviewPropsState.current>) => {
+    filePreviewPropsState.current = props;
+    return <div data-testid="mock-file-preview">{props.content}</div>;
+  },
 }));
 
 import { FileBrowser, __resetFileBrowserSharedChangesForTests, mergePreviewState, getParentDir } from '../../src/components/FileBrowser.js';
@@ -165,6 +177,7 @@ function makeWsFactory() {
 describe('FileBrowser', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    filePreviewPropsState.current = null;
     localStorage.clear();
     __resetFileBrowserSharedChangesForTests();
   });
@@ -251,6 +264,45 @@ describe('FileBrowser', () => {
     const nestedTree = Array.from(filesAndChanges!.children).find((child) => child.classList.contains('fb-tree'));
     expect(nestedTree).toBeTruthy();
     expect(nestedTree!.classList.contains('fb-tree-split')).toBe(false);
+  });
+
+  it('wires Markdown file links and inline image reads into the scoped file browser channel', async () => {
+    const { ws, sendMsg } = makeWsFactory();
+    render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user/docs"
+        initialPreview={{ status: 'ok', path: '/home/user/docs/README.md', content: '![Flow](./flow.png)' }}
+        sessionName="deck_project_brain"
+        scopeToSessionRoot
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => expect(filePreviewPropsState.current?.onImagePreview).toBeTypeOf('function'));
+    const imagePromise = filePreviewPropsState.current!.onImagePreview!('/home/user/docs/flow.png');
+    expect(ws.fsReadFile).toHaveBeenLastCalledWith('/home/user/docs/flow.png', 'deck_project_brain');
+
+    await act(async () => {
+      sendMsg({
+        type: 'fs.read_response',
+        requestId: 'mock-read-id',
+        path: '/home/user/docs/flow.png',
+        status: 'ok',
+        encoding: 'base64',
+        mimeType: 'image/png',
+        content: 'cG5n',
+      });
+    });
+    await expect(imagePromise).resolves.toEqual({
+      dataUrl: 'data:image/png;base64,cG5n',
+      alt: 'flow.png',
+    });
+
+    filePreviewPropsState.current!.onPathClick?.('/home/user/GUIDE.md');
+    expect(ws.fsReadFile).toHaveBeenLastCalledWith('/home/user/GUIDE.md', 'deck_project_brain');
   });
 
   it('keeps the changes tree as a direct split child when preview is open', () => {
