@@ -13,6 +13,16 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$SecurityModulePath = Join-Path $PSHOME 'Modules\Microsoft.PowerShell.Security\Microsoft.PowerShell.Security.psd1'
+if (-not (Test-Path -LiteralPath $SecurityModulePath -PathType Leaf)) {
+  throw 'Windows PowerShell security module was not found.'
+}
+# The Node build can be launched by PowerShell 7. Its inherited PSModulePath
+# points at PowerShell 7 modules, which Windows PowerShell 5.1 cannot load.
+# Pin the in-box module belonging to this interpreter before using
+# Get-AuthenticodeSignature so hosted runners and deployed Windows hosts use
+# the same Authenticode implementation.
+Import-Module -Name $SecurityModulePath -ErrorAction Stop
 $ResolvedArtifact = (Resolve-Path -LiteralPath $ArtifactPath).Path
 $KitRoot = 'C:\Program Files (x86)\Windows Kits\10\bin'
 $VersionedSignTools = @(Get-ChildItem $KitRoot -Directory -ErrorAction Stop |

@@ -102,6 +102,8 @@ describe('controlled-node executable release wiring', () => {
     expect(signingScript).toContain('& $SignTool remove /s $ResolvedArtifact');
     expect(signingScript).toContain("'/tr', $TimestampUrl, '/td', 'sha256'");
     expect(signingScript).toContain('Get-AuthenticodeSignature -LiteralPath $ResolvedArtifact');
+    expect(signingScript).toContain("Join-Path $PSHOME 'Modules\\Microsoft.PowerShell.Security\\Microsoft.PowerShell.Security.psd1'");
+    expect(signingScript).toContain('Import-Module -Name $SecurityModulePath -ErrorAction Stop');
     expect(signingScript).toContain('$Signature.Status -ne [System.Management.Automation.SignatureStatus]::Valid');
     expect(signingScript).toContain('$ActualSignerSha256 -cne $ExpectedSignerSha256.ToLowerInvariant()');
     expect(signingScript).toContain('& $SignTool verify /pa /all $ResolvedArtifact');
