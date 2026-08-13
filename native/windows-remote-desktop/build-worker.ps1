@@ -69,6 +69,27 @@ if ($CurrentDepotToolsRevision -ne $DepotToolsRevision) {
   & git -C $DepotTools checkout --detach $DepotToolsRevision
   if ($LASTEXITCODE -ne 0) { throw 'Pinned depot_tools revision checkout failed' }
 }
+$WinToolsBootstrap = Get-Item -LiteralPath (Join-Path $DepotTools 'bootstrap\win_tools.bat')
+if ($WinToolsBootstrap.PSIsContainer -or
+    ($WinToolsBootstrap.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+  throw 'Pinned depot_tools Windows bootstrap is not a regular file.'
+}
+# gclient's pinned git_cache.py invokes git.bat on Windows. Fresh GitHub runner
+# images expose git.exe but no git.bat, and DEPOT_TOOLS_UPDATE=0 deliberately
+# skips the auto-update path that normally creates depot_tools' wrappers. Run
+# the bootstrap from the already-pinned depot_tools checkout, whose pinned CIPD
+# manifest supplies Python and generates wrappers for the discovered system Git.
+& $WinToolsBootstrap.FullName
+if ($LASTEXITCODE -ne 0) { throw 'Pinned depot_tools Windows bootstrap failed' }
+$PostBootstrapDepotToolsRevision = (& git -C $DepotTools rev-parse HEAD 2>$null).Trim()
+if ($LASTEXITCODE -ne 0 -or $PostBootstrapDepotToolsRevision -ne $DepotToolsRevision) {
+  throw "Pinned depot_tools revision changed during Windows bootstrap: $PostBootstrapDepotToolsRevision"
+}
+$DepotGitWrapper = Get-Item -LiteralPath (Join-Path $DepotTools 'git.bat')
+if ($DepotGitWrapper.PSIsContainer -or
+    ($DepotGitWrapper.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+  throw 'Pinned depot_tools Git wrapper is not a regular file.'
+}
 if ([string]::IsNullOrWhiteSpace($VisualStudioRoot)) {
   if (Test-Path 'C:\BuildTools\VC\Auxiliary\Build\Microsoft.VCToolsVersion.default.txt') {
     $VisualStudioRoot = 'C:\BuildTools'

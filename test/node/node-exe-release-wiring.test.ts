@@ -24,6 +24,12 @@ describe('controlled-node executable release wiring', () => {
     expect(workerBuild).toContain('tools_webrtc\\libs\\generate_licenses.py');
     expect(workerBuild).toContain('THIRD_PARTY_NOTICES.webrtc.md');
     expect(workerBuild).toContain('Remove-Item -Force -LiteralPath $ThirdPartyNotices');
+    expect(workerBuild).toContain("Join-Path $DepotTools 'bootstrap\\win_tools.bat'");
+    expect(workerBuild).toContain("Join-Path $DepotTools 'git.bat'");
+    expect(workerBuild).toContain('& $WinToolsBootstrap.FullName');
+    expect(workerBuild).toContain('$PostBootstrapDepotToolsRevision -ne $DepotToolsRevision');
+    expect(workerBuild.indexOf('& $WinToolsBootstrap.FullName'))
+      .toBeLessThan(workerBuild.indexOf('$env:DEPOT_TOOLS_UPDATE'));
     expect(workerBuild).toContain("Where-Object { $_.Name -match '^\\d+\\.\\d+\\.\\d+\\.\\d+$' }");
     expect(displayBuild).toContain("'THIRD_PARTY_NOTICES.webrtc.md'");
     const signDll = displayBuild.indexOf('$Arguments += $DllPath');
