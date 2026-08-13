@@ -4740,6 +4740,41 @@ afterEach(() => {
     expect(gatherCancelCalls(ws)).toEqual([]);
   });
 
+  it('keeps a failed local queue row out of Append and lets Stop remain a real cancel', () => {
+    const ws = makeWs();
+    ws.sendSessionCommand.mockImplementation(() => {
+      throw new Error('WebSocket not connected');
+    });
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeTransportSession({
+          name: 'qwen-session',
+          agentType: 'qwen',
+          state: 'running',
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.textContent = 'failed rows must not append';
+    fireEvent.input(input);
+    fireEvent.keyDown(input, { key: 'Enter', shiftKey: false });
+
+    expect(screen.getByRole('button', { name: 'retrySend' })).toBeDefined();
+    expect(screen.queryByRole('button', { name: 'transport_queue_append' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'transport_queue_append_all' })).toBeNull();
+    const stop = screen.getByRole('button', { name: /^stop$/i });
+    expect(stop.querySelector('.shortcut-btn-stop-queue-count')).toBeNull();
+
+    fireEvent.click(stop);
+    expectUrgentCancelPayload(ws, { sessionName: 'qwen-session' });
+    expect(ws.send).not.toHaveBeenCalledWith(expect.objectContaining({
+      type: 'session.append_queued_messages',
+    }));
+  });
+
   it('uses Stop to cancel when there are no appendable queued messages', () => {
     const ws = makeWs();
     render(

@@ -4134,6 +4134,8 @@ describe('handleWebCommand transport queue behavior', () => {
 
   it('waits for an optimistic queue row even when append arrives before its matching send', async () => {
     enablePreferenceFeature();
+    const setTimeoutSpy = vi.spyOn(globalThis, 'setTimeout');
+    const clearTimeoutSpy = vi.spyOn(globalThis, 'clearTimeout');
     let releasePreferenceLoad!: (value: unknown[]) => void;
     listContextObservationsMock.mockImplementationOnce(() => new Promise((resolve) => {
       releasePreferenceLoad = resolve;
@@ -4214,6 +4216,17 @@ describe('handleWebCommand transport queue behavior', () => {
       status: 'error',
       error: 'Queued message not found',
     }));
+
+    const pollTimerHandles = setTimeoutSpy.mock.calls.flatMap((call, index) => (
+      call[1] === 25 // TRANSPORT_QUEUE_SEND_SYNC_POLL_MS
+        ? [setTimeoutSpy.mock.results[index]?.value]
+        : []
+    )).filter(Boolean);
+    const clearedHandles = new Set(clearTimeoutSpy.mock.calls.map(([handle]) => handle));
+    setTimeoutSpy.mockRestore();
+    clearTimeoutSpy.mockRestore();
+    expect(pollTimerHandles.length).toBeGreaterThan(0);
+    expect(pollTimerHandles.every((handle) => clearedHandles.has(handle))).toBe(true);
   });
 
   it('rejects an oversized active-turn append before invoking the runtime', async () => {

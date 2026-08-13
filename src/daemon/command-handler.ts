@@ -419,12 +419,31 @@ function dispatchSessionSend(cmd: Record<string, unknown>, serverLink: ServerLin
   })();
 }
 
+async function waitForSessionSendProgress(
+  pending: readonly Promise<void>[],
+  waitMs: number,
+): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  try {
+    await Promise.race([
+      ...(pending.length > 0 ? [Promise.all(pending).then(() => undefined)] : []),
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, waitMs);
+        timer.unref?.();
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 async function waitForSelectedSessionSends(
   sessionName: string,
   clientMessageIds: readonly string[],
 ): Promise<void> {
   const ids = [...new Set(clientMessageIds)];
   const deadline = Date.now() + TRANSPORT_QUEUE_SEND_SYNC_WAIT_MS;
+  const observedSendIds = new Set<string>();
 
   // Do not rely solely on an already-populated inFlightSessionSends entry.
   // Browser and bridge frames can briefly overtake each other, so an append
@@ -441,18 +460,21 @@ async function waitForSelectedSessionSends(
 
     const pending = [...new Set(ids.flatMap((clientMessageId) => {
       const tracked = inFlightSessionSends.get(inFlightSessionSendKey(sessionName, clientMessageId));
+      if (tracked) observedSendIds.add(clientMessageId);
       return tracked ? [tracked.settled] : [];
     }))];
+    // Once every matching send has been observed and settled, no later queue
+    // registration can appear from those commands. Exit early so a genuine
+    // direct-send/stale id receives its error promptly instead of paying the
+    // full synchronization budget.
+    if (pending.length === 0 && ids.every((id) => observedSendIds.has(id))) return;
     const waitMs = Math.min(
       TRANSPORT_QUEUE_SEND_SYNC_POLL_MS,
       Math.max(0, deadline - Date.now()),
     );
     if (waitMs <= 0) return;
 
-    await Promise.race([
-      ...(pending.length > 0 ? [Promise.all(pending).then(() => undefined)] : []),
-      new Promise<void>((resolve) => setTimeout(resolve, waitMs)),
-    ]);
+    await waitForSessionSendProgress(pending, waitMs);
   }
 }
 
