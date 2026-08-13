@@ -1,4 +1,5 @@
 import { execFile } from 'node:child_process';
+import { WINDOWS_POWERSHELL_SECURITY_MODULE_PREFLIGHT } from '../../shared/windows-powershell-modules.js';
 
 // Replaced by scripts/build-node-exe.mjs when producing the Windows SEA. An
 // ordinary source/dev runtime deliberately has no release trust anchor and
@@ -42,8 +43,9 @@ export function verifyWindowsAuthenticodeSigners(
     return Promise.resolve(false);
   }
   const pathsBase64 = Buffer.from(JSON.stringify(paths), 'utf8').toString('base64');
-  const script = String.raw`
-$ErrorActionPreference = 'Stop'
+  const script = `$ErrorActionPreference = 'Stop'\r\n`
+    + WINDOWS_POWERSHELL_SECURITY_MODULE_PREFLIGHT
+    + String.raw`
 $paths = @((ConvertFrom-Json ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__PATHS64__')))))
 $expected = '__SIGNER_SHA256__'
 foreach ($path in $paths) {
@@ -69,8 +71,9 @@ export function installWindowsReleasePublisherTrust(
 ): Promise<boolean> {
   if (!SHA256_RE.test(expectedSignerSha256)) return Promise.resolve(false);
   const executableBase64 = Buffer.from(executablePath, 'utf8').toString('base64');
-  const script = String.raw`
-$ErrorActionPreference = 'Stop'
+  const script = `$ErrorActionPreference = 'Stop'\r\n`
+    + WINDOWS_POWERSHELL_SECURITY_MODULE_PREFLIGHT
+    + String.raw`
 $path = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__PATH64__'))
 $expected = '__SIGNER_SHA256__'
 $signature = Get-AuthenticodeSignature -LiteralPath $path

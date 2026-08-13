@@ -30,6 +30,10 @@ describe('legacy Windows controlled-node upgrade rescue', () => {
 
   it('backs up and verifies old bytes, hardens ACLs, verifies the independent task, then publishes the marker last', () => {
     const setup = decodeSetup(buildLegacyWindowsUpgradeRescueCommand(RESCUE_ID).command);
+    expect(setup).toContain("Join-Path $PSHOME 'Modules\\Microsoft.PowerShell.Utility\\Microsoft.PowerShell.Utility.psd1'");
+    expect(setup).toContain('Import-Module -Name $utilityModulePath -ErrorAction Stop');
+    expect(setup.indexOf('Import-Module -Name $utilityModulePath -ErrorAction Stop'))
+      .toBeLessThan(setup.indexOf('$mainSha = (Get-FileHash'));
     const backupAt = setup.indexOf("Copy-Item -Force -LiteralPath $nodePath -Destination $backupMain");
     const backupVerifyAt = setup.indexOf('legacy upgrade rescue main backup verification failed');
     const aclAt = setup.indexOf("'/inheritance:r'");
@@ -52,6 +56,8 @@ describe('legacy Windows controlled-node upgrade rescue', () => {
 
   it('waits beyond the legacy ten-minute hard limit and restores exact main/helper state only when authenticated health is absent', () => {
     const rescue = buildLegacyWindowsUpgradeRescueScript();
+    expect(rescue.indexOf('Import-Module -Name $utilityModulePath -ErrorAction Stop'))
+      .toBeLessThan(rescue.indexOf('(Get-FileHash -Algorithm SHA256'));
     expect(LEGACY_WINDOWS_UPGRADE_RESCUE_GRACE_MS).toBeGreaterThan(10 * 60 * 1000);
     expect(rescue).toContain(`if ($ageMs -lt ${LEGACY_WINDOWS_UPGRADE_RESCUE_GRACE_MS}) { exit 0 }`);
     expect(rescue).toContain("[int]$lease.pid -eq [int]$process.ProcessId");

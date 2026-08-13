@@ -28,6 +28,9 @@ describe('Windows release artifact trust', () => {
       successfulRunner(calls),
     )).resolves.toBe(true);
     const script = decodedScript(calls);
+    expect(script).toContain("Join-Path $PSHOME 'Modules\\Microsoft.PowerShell.Security\\Microsoft.PowerShell.Security.psd1'");
+    expect(script.indexOf('Import-Module -Name $securityModulePath -ErrorAction Stop'))
+      .toBeLessThan(script.indexOf('Get-AuthenticodeSignature'));
     expect(script).toContain('Get-AuthenticodeSignature');
     expect(script).toContain('SignatureStatus]::Valid');
     expect(script).toContain('SignerCertificate.RawData');

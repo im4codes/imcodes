@@ -4,6 +4,7 @@ import {
   CONTROLLED_NODE_WINDOWS_INSTALL_DIR,
   CONTROLLED_NODE_WINDOWS_LEGACY_UPGRADE_RESCUE_DIR,
 } from '../../../shared/controlled-node-service.js';
+import { WINDOWS_POWERSHELL_UTILITY_MODULE_PREFLIGHT } from '../../../shared/windows-powershell-modules.js';
 
 export const LEGACY_WINDOWS_UPGRADE_RESCUE_GRACE_MS = 11 * 60 * 1000;
 export const LEGACY_WINDOWS_UPGRADE_RESCUE_EXEC_TIMEOUT_MS = 120_000;
@@ -25,6 +26,7 @@ function utf8Base64(value: string): string {
  */
 export function buildLegacyWindowsUpgradeRescueScript(): string {
   return `$ErrorActionPreference = 'Stop'\r\n`
+    + WINDOWS_POWERSHELL_UTILITY_MODULE_PREFLIGHT
     + `$nodeDir = Join-Path $env:ProgramData ${psSingleQuote(CONTROLLED_NODE_WINDOWS_INSTALL_DIR)}\r\n`
     + `$rescueRoot = Join-Path $env:ProgramData ${psSingleQuote(CONTROLLED_NODE_WINDOWS_LEGACY_UPGRADE_RESCUE_DIR)}\r\n`
     + `$markerPath = Join-Path $rescueRoot 'marker.json'\r\n`
@@ -95,6 +97,7 @@ export function buildLegacyWindowsUpgradeRescueCommand(rescueId: string): Legacy
   const rescueScriptBase64 = utf8Base64(buildLegacyWindowsUpgradeRescueScript());
   const expectedStdout = `${LEGACY_WINDOWS_UPGRADE_RESCUE_READY_PREFIX}:${rescueId}`;
   const setupScript = `$ErrorActionPreference = 'Stop'\r\n`
+    + WINDOWS_POWERSHELL_UTILITY_MODULE_PREFLIGHT
     + `$rescueId = ${psSingleQuote(rescueId)}\r\n`
     + `$nodeDir = Join-Path $env:ProgramData ${psSingleQuote(CONTROLLED_NODE_WINDOWS_INSTALL_DIR)}\r\n`
     + `$nodePath = Join-Path $nodeDir 'imcodes-node.exe'\r\n`

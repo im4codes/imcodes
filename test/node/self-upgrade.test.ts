@@ -328,6 +328,10 @@ describe('controlled-node self-upgrade', () => {
     expect(script).toContain('Get-AuthenticodeSignature -LiteralPath $srcRemoteDesktopExe');
     expect(script).toContain("Join-Path $PSHOME 'Modules\\Microsoft.PowerShell.Security\\Microsoft.PowerShell.Security.psd1'");
     expect(script).toContain('Import-Module -Name $securityModulePath -ErrorAction Stop');
+    expect(script).toContain("Join-Path $PSHOME 'Modules\\Microsoft.PowerShell.Utility\\Microsoft.PowerShell.Utility.psd1'");
+    expect(script).toContain('Import-Module -Name $utilityModulePath -ErrorAction Stop');
+    expect(script.indexOf('Import-Module -Name $utilityModulePath -ErrorAction Stop'))
+      .toBeLessThan(script.indexOf('$srcHash = (Get-FileHash'));
     expect(script.indexOf('Import-Module -Name $securityModulePath -ErrorAction Stop'))
       .toBeLessThan(script.indexOf('Get-AuthenticodeSignature -LiteralPath $srcRemoteDesktopExe'));
     expect(script).toContain('[System.Management.Automation.SignatureStatus]::Valid');
