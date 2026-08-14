@@ -18,6 +18,7 @@ import {
 const RESCUE_ID = '12345678-1234-4abc-8def-1234567890ab';
 const RESTART_ID = 'abcdef12-3456-4abc-8def-1234567890ab';
 const SIGNER_SHA256 = 'a'.repeat(64);
+const RELEASE_VERSION = '2026.8.3411-dev.3849';
 
 function decodeSetup(command: string): string {
   const encoded = command.match(/FromBase64String\('([^']+)'\)/)?.[1];
@@ -83,7 +84,12 @@ describe('legacy Windows controlled-node upgrade rescue', () => {
   });
 
   it('builds a verified one-shot SYSTEM restart only after the matching rescue and old upgrade task are clear', () => {
-    const built = buildLegacyWindowsUpgradeRestartCommand(RESCUE_ID, RESTART_ID, SIGNER_SHA256);
+    const built = buildLegacyWindowsUpgradeRestartCommand(
+      RESCUE_ID,
+      RESTART_ID,
+      SIGNER_SHA256,
+      RELEASE_VERSION,
+    );
     expect(utf8ByteLength(built.command)).toBeLessThanOrEqual(REMOTE_EXEC_MAX_COMMAND_BYTES);
     expect(built.expectedStdout).toBe(`${LEGACY_WINDOWS_UPGRADE_RESTART_READY_PREFIX}:${RESTART_ID}`);
     expect(built.commandSha256).toMatch(/^[0-9a-f]{64}$/);
@@ -105,10 +111,12 @@ describe('legacy Windows controlled-node upgrade rescue', () => {
     expect(setup).toContain("$candidateOwnerSid -notin @('S-1-5-18','S-1-5-32-544')");
     expect(setup).toContain('$workerDirItem.Attributes -band [IO.FileAttributes]::ReparsePoint');
     expect(setup).toContain("[string]$upgradeResult.status -cne 'preflight_failed'");
-    expect(setup).toContain("[string]$upgradeResult.reason -cne 'remote desktop worker Authenticode verification failed'");
+    expect(setup).toContain("$failureReason -cnotin @('remote desktop worker Authenticode verification failed','remote desktop worker signer is not trusted by this controlled node build')");
     expect(setup).toContain("throw 'legacy upgrade signed staging evidence missing'");
     expect(setup).toContain('Get-FileHash -Algorithm SHA256 -LiteralPath $workerPath');
     expect(setup).toContain(SIGNER_SHA256);
+    expect(setup).toContain(RELEASE_VERSION);
+    expect(setup).toContain('$workerManifest.workerVersion -cne $expectedVersion');
     expect(setup).toContain("Cert:\\LocalMachine\\TrustedPeople");
     expect(setup).toContain("Cert:\\LocalMachine\\TrustedPublisher");
     expect(setup).not.toContain('LocalMachine\\Root');
@@ -127,6 +135,21 @@ describe('legacy Windows controlled-node upgrade rescue', () => {
     expect(setup).toContain('legacy upgrade restart task verification failed');
     expect(setup.indexOf('legacy upgrade restart task verification failed'))
       .toBeLessThan(setup.indexOf('Start-ScheduledTask -TaskName $restartTask'));
+    expect(setup).toContain("throw 'legacy upgrade bridge main manifest mismatch'");
+    expect(setup).toContain("throw 'legacy upgrade bridge helper manifest mismatch'");
+    expect(setup).toContain('& $verifySignedArtifact $mainPath');
+    expect(setup).toContain('& $verifySignedArtifact $helperPath');
+    expect(setup).toContain("$anchorPattern = 'if \\(\\$srcRemoteDesktopSignerSha256");
+    expect(setup).toContain("if ($anchorMatches.Count -ne 1) { throw 'legacy upgrade bridge signer guard shape mismatch' }");
+    expect(setup).toContain("$patchedUpgradeScriptPath = Join-Path $rescueRoot ('upgrade-bridge-' +");
+    expect(setup).toContain("throw 'legacy upgrade bridge patched script verification failed'");
+    expect(setup).toContain("$stagedWorker = $workerPath; $scheduledMode = 'restart'; break");
+    expect(setup).toContain("if (-not $stagedWorker -or $scheduledMode -notin @('restart','upgrade'))");
+    expect(setup).toContain("$settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Seconds 0)");
+    expect(setup).toContain('$settings.AllowHardTerminate = $false');
+    expect(setup).toContain("[bool]$registered.Settings.AllowHardTerminate");
+    expect(setup.indexOf("throw 'legacy upgrade bridge patched script verification failed'"))
+      .toBeLessThan(setup.indexOf('Start-ScheduledTask -TaskName $patchedUpgradeTask'));
 
     const restart = decodeRestartScript(setup);
     expect(restart).toContain(`$mainTask = '${CONTROLLED_NODE_SERVICE.WINDOWS_TASK}'`);
@@ -147,12 +170,14 @@ describe('legacy Windows controlled-node upgrade rescue', () => {
   });
 
   it('rejects malformed rescue or restart correlation ids', () => {
-    expect(() => buildLegacyWindowsUpgradeRestartCommand('not-an-id', RESTART_ID, SIGNER_SHA256))
+    expect(() => buildLegacyWindowsUpgradeRestartCommand('not-an-id', RESTART_ID, SIGNER_SHA256, RELEASE_VERSION))
       .toThrow('invalid_legacy_upgrade_rescue_id');
-    expect(() => buildLegacyWindowsUpgradeRestartCommand(RESCUE_ID, 'not-an-id', SIGNER_SHA256))
+    expect(() => buildLegacyWindowsUpgradeRestartCommand(RESCUE_ID, 'not-an-id', SIGNER_SHA256, RELEASE_VERSION))
       .toThrow('invalid_legacy_upgrade_restart_id');
-    expect(() => buildLegacyWindowsUpgradeRestartCommand(RESCUE_ID, RESTART_ID, 'bad'))
+    expect(() => buildLegacyWindowsUpgradeRestartCommand(RESCUE_ID, RESTART_ID, 'bad', RELEASE_VERSION))
       .toThrow('invalid_legacy_upgrade_release_signer');
+    expect(() => buildLegacyWindowsUpgradeRestartCommand(RESCUE_ID, RESTART_ID, SIGNER_SHA256, 'bad version!'))
+      .toThrow('invalid_legacy_upgrade_release_version');
   });
 
   it('derives one signer anchor from matching current main and worker manifests', async () => {

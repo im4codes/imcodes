@@ -6990,6 +6990,7 @@ export class WsBridge {
         state.preparedRescueId!,
         restartId,
         expectedSignerSha256,
+        targetVersion,
       );
       const checked = validateMachineExecFrame({
         type: DAEMON_COMMAND_TYPES.MACHINE_EXEC,
