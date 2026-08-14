@@ -403,6 +403,89 @@ describe('remote desktop worker artifact and IPC host', () => {
     }));
   });
 
+  it('discards a poisoned worker pipe after a failed write and cold-starts the next session', async () => {
+    const temp = await mkdtemp(join(tmpdir(), 'imcodes-rd-host-write-failure-'));
+    cleanup.push(() => rm(temp, { recursive: true, force: true }));
+    const pipePath = join(temp, 'worker.sock');
+    const helpers: net.Socket[] = [];
+    const launch = vi.fn((_executable: string, argsLine: string) => {
+      if (argsLine === '--release-all-input') return;
+      const args = quotedArgs(argsLine);
+      const helper = net.createConnection(pipePath, () => {
+        helper.write(`${JSON.stringify({
+          type: REMOTE_DESKTOP_WORKER_HELLO_TYPE,
+          ipcVersion: REMOTE_DESKTOP_WORKER_IPC_VERSION,
+          nonce: args[3],
+          pid: 60 + helpers.length,
+        })}\n`);
+      });
+      helpers.push(helper);
+    });
+    const verifyArtifactForLaunch = vi.fn(async () => artifact);
+    const received: RemoteDesktopDaemonMessage[] = [];
+    const host = new RemoteDesktopWorkerHost((message) => received.push(message), {
+      ...trustedHostOptions,
+      verifyArtifactForLaunch,
+      platform: 'win32',
+      artifact,
+      pipePath,
+      allowPipeClients: () => {},
+      launch,
+    });
+    cleanup.push(() => {
+      host.close();
+      for (const helper of helpers) helper.destroy();
+    });
+    const first = {
+      type: REMOTE_DESKTOP_MSG.PREPARE,
+      requestId,
+      sessionId,
+      capability,
+      expiresAt: Date.now() + 60_000,
+      leaseExpiresAt: Date.now() + 15_000,
+      daemonGeneration: 7,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
+      inputEpoch: 1,
+      reconnectAttempt: 0,
+      iceServers: ['stun:stun.example.test:3478'],
+    } as const;
+    await expect(host.handle(first)).resolves.toBe(true);
+
+    const poisonedSocket = (host as unknown as { socket: net.Socket }).socket;
+    vi.spyOn(poisonedSocket, 'write').mockImplementation(((_chunk: unknown, callback: unknown) => {
+      if (typeof callback === 'function') callback(new Error('simulated broken pipe'));
+      return false;
+    }) as never);
+    await expect(host.handle({
+      ...first,
+      requestId: 'request_poisoned',
+      sessionId: 'session_poisoned',
+      capability: 'b'.repeat(43),
+    })).resolves.toBe(true);
+
+    expect(poisonedSocket.destroyed).toBe(true);
+    expect((host as unknown as { socket: net.Socket | null }).socket).toBeNull();
+    expect(received).toContainEqual(expect.objectContaining({
+      type: REMOTE_DESKTOP_MSG.TERMINAL,
+      sessionId: 'session_poisoned',
+      reason: REMOTE_DESKTOP_TERMINAL_REASON.WORKER_FAILED,
+    }));
+    await vi.waitFor(() => expect(launch.mock.calls.some(([, args]) => (
+      args === '--release-all-input'
+    ))).toBe(true));
+
+    await expect(host.handle({
+      ...first,
+      requestId: 'request_recovered',
+      sessionId: 'session_recovered',
+      capability: 'c'.repeat(43),
+    })).resolves.toBe(true);
+    const workerLaunches = launch.mock.calls.filter(([, args]) => args !== '--release-all-input');
+    expect(workerLaunches).toHaveLength(2);
+    expect(verifyArtifactForLaunch).toHaveBeenCalledTimes(3);
+    expect((host as unknown as { socket: net.Socket }).socket).not.toBe(poisonedSocket);
+  });
+
   it('recycles an idle warm worker before a bounded browser reconnect', async () => {
     const temp = await mkdtemp(join(tmpdir(), 'imcodes-rd-host-reconnect-'));
     cleanup.push(() => rm(temp, { recursive: true, force: true }));

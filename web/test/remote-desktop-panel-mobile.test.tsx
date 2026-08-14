@@ -31,6 +31,7 @@ const { uploadFileWithDirectFallback } = vi.hoisted(() => ({
   uploadFileWithDirectFallback: vi.fn(),
 }));
 const clientHooks: Array<{ onSnapshot(value: unknown): void }> = [];
+const clientStarts: number[] = [];
 
 vi.mock('../src/remote-desktop-client.js', () => ({
   RemoteDesktopClient: class {
@@ -57,7 +58,7 @@ vi.mock('../src/remote-desktop-client.js', () => ({
         stream: null,
       }));
     }
-    start = vi.fn(async () => {});
+    start = vi.fn(async (reconnectAttempt = 0) => { clientStarts.push(reconnectAttempt); });
     stop = stop;
     releaseAll = releaseAll;
     releasePointerButtons = releasePointerButtons;
@@ -98,6 +99,7 @@ afterEach(() => {
   vi.clearAllMocks();
   vi.useRealTimers();
   clientHooks.length = 0;
+  clientStarts.length = 0;
   localStorage.removeItem('rcc_float_remote-desktop-server-1');
 });
 
@@ -870,6 +872,7 @@ describe('RemoteDesktopPanel mobile gestures', () => {
       (getByRole('button', { name: 'remote_desktop.retry' }) as HTMLButtonElement).click();
     });
     expect(clientHooks).toHaveLength(REMOTE_DESKTOP_LIMITS.MAX_RECONNECT_ATTEMPTS + 2);
+    expect(clientStarts.at(-1)).toBe(1);
     expect(container.textContent).toContain('remote_desktop.state.reconnecting');
   });
 

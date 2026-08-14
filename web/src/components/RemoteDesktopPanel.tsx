@@ -190,6 +190,7 @@ export function RemoteDesktopPanel({ machine, ws = null, onClose }: RemoteDeskto
   } | null>(null);
   const lastTouchRemotePointRef = useRef<TouchPoint>({ x: 0.5, y: 0.5 });
   const reconnectCountRef = useRef(0);
+  const forceWorkerRecycleRef = useRef(false);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const reconnectStabilityTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const transferControllersRef = useRef(new Map<string, AbortController>());
@@ -255,7 +256,11 @@ export function RemoteDesktopPanel({ machine, ws = null, onClose }: RemoteDeskto
     };
     const client = new RemoteDesktopClient(machine.serverId, { onSnapshot: publishSnapshot });
     clientRef.current = client;
-    void client.start(reconnectCountRef.current).catch(() => publishSnapshot({
+    const reconnectAttempt = forceWorkerRecycleRef.current
+      ? Math.max(1, reconnectCountRef.current)
+      : reconnectCountRef.current;
+    forceWorkerRecycleRef.current = false;
+    void client.start(reconnectAttempt).catch(() => publishSnapshot({
       ...client.current(),
       state: REMOTE_DESKTOP_STATE.FAILED,
       inputEnabled: false,
@@ -456,6 +461,7 @@ export function RemoteDesktopPanel({ machine, ws = null, onClose }: RemoteDeskto
     if (reconnectStabilityTimerRef.current) clearTimeout(reconnectStabilityTimerRef.current);
     reconnectStabilityTimerRef.current = null;
     reconnectCountRef.current = 0;
+    forceWorkerRecycleRef.current = true;
     setSnapshot((current) => ({
       ...current,
       state: REMOTE_DESKTOP_STATE.RECONNECTING,

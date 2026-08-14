@@ -290,17 +290,44 @@ export class RemoteDesktopWorkerHost {
     }
     const socket = this.socket;
     if (!socket || socket.destroyed) return false;
-    const sent = await new Promise<boolean>((resolveSent) => {
-      socket.write(`${JSON.stringify(parsed.value)}\n`, (error) => resolveSent(!error));
-    });
-    if (!sent && parsed.value.type === REMOTE_DESKTOP_MSG.PREPARE) {
-      this.untrack(parsed.value.sessionId);
+    const sent = await this.writeToWorker(socket, parsed.value);
+    if (!sent) {
+      return true;
     }
     if (sent && (parsed.value.type === REMOTE_DESKTOP_MSG.STOP
       || parsed.value.type === REMOTE_DESKTOP_MSG.CANCEL)) {
       this.untrack(parsed.value.sessionId);
     }
     return sent;
+  }
+
+  private async writeToWorker(socket: net.Socket, message: unknown): Promise<boolean> {
+    const sent = await new Promise<boolean>((resolveSent) => {
+      let settled = false;
+      const finish = (success: boolean) => {
+        if (settled) return;
+        settled = true;
+        socket.off('error', onLost);
+        socket.off('close', onLost);
+        resolveSent(success);
+      };
+      const onLost = () => finish(false);
+      socket.once('error', onLost);
+      socket.once('close', onLost);
+      try {
+        socket.write(`${JSON.stringify(message)}\n`, (error) => finish(!error));
+      } catch {
+        finish(false);
+      }
+    });
+    if (sent) return true;
+    // A failed named-pipe write is terminal for this worker connection. Do
+    // not leave the resolved start promise and a poisoned socket in place:
+    // every later session would otherwise reuse it and immediately return
+    // worker_failed until the whole node process was restarted.
+    this.onSocketLost(socket);
+    socket.destroy();
+    return false;
   }
 
   private async recycleIdleWorkerForReconnect(): Promise<void> {
@@ -512,9 +539,7 @@ export class RemoteDesktopWorkerHost {
       if (this.tracked.get(tracked.sessionId) !== tracked
         || !this.socket || this.socket.destroyed) return;
       tracked.usesVirtualDisplay = true;
-      const sent = await new Promise<boolean>((resolveSent) => {
-        this.socket!.write(`${JSON.stringify(tracked.prepare)}\n`, (error) => resolveSent(!error));
-      });
+      const sent = await this.writeToWorker(this.socket, tracked.prepare);
       if (!sent) throw new Error('virtual_display_retry_send_failed');
     } catch {
       if (this.tracked.get(tracked.sessionId) !== tracked) return;
