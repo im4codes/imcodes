@@ -509,6 +509,64 @@ describe('WsBridge', () => {
       expect(ws.sentStrings.some((msg) => msg.includes('"type":"daemon.upgrade"') && msg.includes('2026.7.1234-dev.5'))).toBe(true);
     });
 
+    it('arms rescue and restarts a safe Windows controlled node whose upgrade latch is stale', async () => {
+      vi.useFakeTimers();
+      process.env.APP_VERSION = '2026.7.1234-dev.5';
+
+      const bridge = WsBridge.get(serverId);
+      const ws = new MockWs();
+      bridge.handleDaemonConnection(
+        ws as never,
+        makeDb('valid-hash', 'controlled', CONTROLLED_NODE_OS_WIN),
+        {} as never,
+      );
+      ws.emit('message', JSON.stringify({
+        type: 'auth',
+        serverId,
+        token: 'my-token',
+        daemonVersion: '2026.7.1233-dev.4',
+        capabilities: [CONTROLLED_NODE_SAFE_SELF_UPGRADE_CAPABILITY],
+      }));
+      await flushAsync();
+      await vi.advanceTimersByTimeAsync(5_000);
+      await flushAsync();
+
+      expect(ws.sentStrings.some((message) => message.includes('"type":"daemon.upgrade"'))).toBe(true);
+      expect(ws.sentStrings.some((message) => message.includes('"type":"machine.exec"'))).toBe(false);
+
+      ws.emit('message', JSON.stringify({
+        type: DAEMON_MSG.UPGRADE_BLOCKED,
+        reason: DAEMON_UPGRADE_BLOCK_REASON.ALREADY_IN_PROGRESS,
+      }));
+      await flushAsync();
+
+      const rescue = ws.sentStrings
+        .map((message) => JSON.parse(message) as Record<string, unknown>)
+        .find((message) => typeof message.correlationId === 'string'
+          && message.correlationId.startsWith('upgrade-rescue-'))!;
+      const rescueId = String(rescue.correlationId).replace(/^upgrade-rescue-/, '');
+      expect(rescue).toMatchObject({ shell: 'powershell' });
+
+      ws.emit('message', JSON.stringify({
+        type: DAEMON_MSG.MACHINE_EXEC_RESULT,
+        correlationId: rescue.correlationId,
+        ok: true,
+        exitCode: 0,
+        stdout: `${LEGACY_WINDOWS_UPGRADE_RESCUE_READY_PREFIX}:${rescueId}\r\n`,
+        stderr: '',
+        truncated: false,
+        timedOut: false,
+        durationMs: 100,
+      }));
+      await flushAsync();
+
+      const restart = ws.sentStrings
+        .map((message) => JSON.parse(message) as Record<string, unknown>)
+        .find((message) => typeof message.correlationId === 'string'
+          && message.correlationId.startsWith('upgrade-restart-'));
+      expect(restart).toMatchObject({ shell: 'powershell', timeoutMs: 120_000 });
+    });
+
     it('keeps a controlled node online when it advertises a bounded future capability', async () => {
       const executed: Array<{ sql: string; params: unknown[] }> = [];
       const db = {

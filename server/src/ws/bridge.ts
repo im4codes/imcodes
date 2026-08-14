@@ -1206,6 +1206,10 @@ export class WsBridge {
   private daemonControlledOs: ControlledNodeOs | null = null;
   private daemonOwnerUserId: string | null = null;
   private legacyUpgradeRescuePreparedGeneration: number | null = null;
+  /** A safe-self-upgrade node can still retain its process-local latch when a
+   *  detached task fails before replacing the process. Arm the same verified
+   *  rescue/restart path lazily for that exact connected generation. */
+  private upgradeLatchRescueRequiredGeneration: number | null = null;
   private legacyUpgradeRescuePreparation: {
     generation: number;
     attempts: number;
@@ -6566,13 +6570,16 @@ export class WsBridge {
       return false;
     }
 
-    if (
-      msg.reason === DAEMON_UPGRADE_BLOCK_REASON.ALREADY_IN_PROGRESS
-      && this.requiresLegacyWindowsUpgradeRescue()
-      && this.legacyUpgradeRescuePreparedGeneration === this.daemonGeneration
-    ) {
-      this.ensureLegacyWindowsUpgradeRestart(ws);
-      return true;
+    if (msg.reason === DAEMON_UPGRADE_BLOCK_REASON.ALREADY_IN_PROGRESS) {
+      if (this.requiresLegacyWindowsUpgradeRescue()
+        && this.legacyUpgradeRescuePreparedGeneration === this.daemonGeneration) {
+        this.ensureLegacyWindowsUpgradeRestart(ws);
+        return true;
+      }
+      if (!this.requiresLegacyWindowsUpgradeRescue() && this.canPrepareWindowsUpgradeRescue()) {
+        this.armWindowsUpgradeLatchRescue();
+        return true;
+      }
     }
 
     // Controlled nodes intentionally expose only the minimal { type, reason }
@@ -6766,14 +6773,40 @@ export class WsBridge {
   }
 
   private requiresLegacyWindowsUpgradeRescue(): boolean {
-    return this.daemonNodeRole === NODE_ROLE.CONTROLLED
-      && (this.daemonControlledOs === CONTROLLED_NODE_OS_WIN || this.daemonControlledOs === null)
+    return this.canPrepareWindowsUpgradeRescue()
       && !this.controlledNodeCapabilities.has(CONTROLLED_NODE_SAFE_SELF_UPGRADE_CAPABILITY);
   }
 
+  private canPrepareWindowsUpgradeRescue(): boolean {
+    return this.daemonNodeRole === NODE_ROLE.CONTROLLED
+      && (this.daemonControlledOs === CONTROLLED_NODE_OS_WIN || this.daemonControlledOs === null);
+  }
+
   private needsLegacyWindowsUpgradeRescue(): boolean {
-    return this.requiresLegacyWindowsUpgradeRescue()
+    return (this.requiresLegacyWindowsUpgradeRescue()
+      || this.upgradeLatchRescueRequiredGeneration === this.daemonGeneration)
       && this.legacyUpgradeRescuePreparedGeneration !== this.daemonGeneration;
+  }
+
+  private armWindowsUpgradeLatchRescue(): void {
+    if (!this.canPrepareWindowsUpgradeRescue()) return;
+    const generation = this.daemonGeneration;
+    this.upgradeLatchRescueRequiredGeneration = generation;
+    this.legacyUpgradeRescuePreparedGeneration = null;
+    if (!this.legacyUpgradeRescuePreparation || this.legacyUpgradeRescuePreparation.generation !== generation) {
+      this.legacyUpgradeRescuePreparation = {
+        generation,
+        attempts: 0,
+        inFlight: false,
+        timer: null,
+        preparedRescueId: null,
+        restartAttempts: 0,
+        restartInFlight: false,
+        restartTimer: null,
+        restartCoordinatorPrepared: false,
+      };
+    }
+    this.ensureLegacyWindowsUpgradeRescue();
   }
 
   private resetLegacyUpgradeRescueForGeneration(generation: number): void {
@@ -6783,6 +6816,7 @@ export class WsBridge {
     if (this.legacyUpgradeRescuePreparation?.restartTimer) {
       clearTimeout(this.legacyUpgradeRescuePreparation.restartTimer);
     }
+    this.upgradeLatchRescueRequiredGeneration = null;
     this.legacyUpgradeRescuePreparation = this.requiresLegacyWindowsUpgradeRescue()
       ? {
         generation,
@@ -6906,7 +6940,11 @@ export class WsBridge {
         outcome: 'prepared',
       });
       state.inFlight = false;
-      this.flushPendingDaemonUpgrade(ws);
+      if (this.upgradeLatchRescueRequiredGeneration === generation) {
+        this.ensureLegacyWindowsUpgradeRestart(ws);
+      } else {
+        this.flushPendingDaemonUpgrade(ws);
+      }
     })().catch((error) => {
       state.inFlight = false;
       void this.persistLegacyUpgradeRescueAudit(CONTROLLED_NODE_UPGRADE_RESCUE_AUDIT_ACTION.RESULT, {
