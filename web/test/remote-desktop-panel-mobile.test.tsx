@@ -217,8 +217,10 @@ async function renderPanel(
 
 describe('RemoteDesktopPanel mobile gestures', () => {
   it('opens the same controlled machine in an independent browser window', async () => {
-    const open = vi.spyOn(window, 'open').mockReturnValue({} as Window);
-    const result = await renderPanel();
+    const opened = { opener: window } as unknown as Window;
+    const open = vi.spyOn(window, 'open').mockReturnValue(opened);
+    const onClose = vi.fn();
+    const result = await renderPanel(undefined, [REMOTE_DESKTOP_CAPABILITY], { onClose });
 
     act(() => (result.getByRole('button', {
       name: 'remote_desktop.open_new_window',
@@ -228,7 +230,23 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     const [url, target, features] = open.mock.calls[0] ?? [];
     expect(new URL(String(url)).searchParams.get('remoteDesktopServer')).toBe('server-1');
     expect(target).toBe('_blank');
-    expect(features).toContain('noopener');
+    expect(features).toContain('popup');
+    expect(opened.opener).toBeNull();
+    expect(stop).toHaveBeenCalledTimes(1);
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps the current desktop connected when the standalone popup is blocked', async () => {
+    vi.spyOn(window, 'open').mockReturnValue(null);
+    const onClose = vi.fn();
+    const result = await renderPanel(undefined, [REMOTE_DESKTOP_CAPABILITY], { onClose });
+
+    act(() => (result.getByRole('button', {
+      name: 'remote_desktop.open_new_window',
+    }) as HTMLButtonElement).click());
+
+    expect(stop).not.toHaveBeenCalled();
+    expect(onClose).not.toHaveBeenCalled();
   });
 
   it('uses shared window controls and minimizes without stopping the live desktop', async () => {

@@ -21,9 +21,13 @@ export function buildRemoteDesktopWindowUrl(
 }
 
 export function openRemoteDesktopWindow(serverId: string): Window | null {
-  return window.open(
+  const opened = window.open(
     buildRemoteDesktopWindowUrl(serverId),
     '_blank',
-    'popup,width=1280,height=800,noopener,noreferrer',
+    'popup,width=1280,height=800',
   );
+  if (opened) {
+    try { opened.opener = null; } catch { /* Browser policy may already isolate the popup. */ }
+  }
+  return opened;
 }

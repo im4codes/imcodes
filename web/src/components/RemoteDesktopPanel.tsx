@@ -1331,7 +1331,9 @@ export function RemoteDesktopPanel({
                 class="subsession-minimize-btn remote-desktop-open-window"
                 aria-label={t('remote_desktop.open_new_window')}
                 title={t('remote_desktop.open_new_window')}
-                onClick={() => { openRemoteDesktopWindow(machine.serverId); }}
+                onClick={() => {
+                  if (openRemoteDesktopWindow(machine.serverId)) stopAndClose();
+                }}
               >↗</button>
             )}
             <DesktopWindowMaximizeButton
