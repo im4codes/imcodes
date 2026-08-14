@@ -18,7 +18,6 @@ import {
 const RESCUE_ID = '12345678-1234-4abc-8def-1234567890ab';
 const RESTART_ID = 'abcdef12-3456-4abc-8def-1234567890ab';
 const SIGNER_SHA256 = 'a'.repeat(64);
-const RELEASE_VERSION = '2026.8.3411-dev.3849';
 
 function decodeSetup(command: string): string {
   const encoded = command.match(/FromBase64String\('([^']+)'\)/)?.[1];
@@ -84,12 +83,7 @@ describe('legacy Windows controlled-node upgrade rescue', () => {
   });
 
   it('builds a verified one-shot SYSTEM restart only after the matching rescue and old upgrade task are clear', () => {
-    const built = buildLegacyWindowsUpgradeRestartCommand(
-      RESCUE_ID,
-      RESTART_ID,
-      SIGNER_SHA256,
-      RELEASE_VERSION,
-    );
+    const built = buildLegacyWindowsUpgradeRestartCommand(RESCUE_ID, RESTART_ID, SIGNER_SHA256);
     expect(utf8ByteLength(built.command)).toBeLessThanOrEqual(REMOTE_EXEC_MAX_COMMAND_BYTES);
     expect(built.expectedStdout).toBe(`${LEGACY_WINDOWS_UPGRADE_RESTART_READY_PREFIX}:${RESTART_ID}`);
     expect(built.commandSha256).toMatch(/^[0-9a-f]{64}$/);
@@ -115,8 +109,9 @@ describe('legacy Windows controlled-node upgrade rescue', () => {
     expect(setup).toContain("throw 'legacy upgrade signed staging evidence missing'");
     expect(setup).toContain('Get-FileHash -Algorithm SHA256 -LiteralPath $workerPath');
     expect(setup).toContain(SIGNER_SHA256);
-    expect(setup).toContain(RELEASE_VERSION);
-    expect(setup).toContain('$workerManifest.workerVersion -cne $expectedVersion');
+    expect(setup).toContain('$candidateVersion = [string]$workerManifest.workerVersion');
+    expect(setup).toContain('$mainManifest.build.version -cne $candidateVersion');
+    expect(setup).not.toContain('$expectedVersion');
     expect(setup).toContain("Cert:\\LocalMachine\\TrustedPeople");
     expect(setup).toContain("Cert:\\LocalMachine\\TrustedPublisher");
     expect(setup).not.toContain('LocalMachine\\Root');
@@ -170,14 +165,12 @@ describe('legacy Windows controlled-node upgrade rescue', () => {
   });
 
   it('rejects malformed rescue or restart correlation ids', () => {
-    expect(() => buildLegacyWindowsUpgradeRestartCommand('not-an-id', RESTART_ID, SIGNER_SHA256, RELEASE_VERSION))
+    expect(() => buildLegacyWindowsUpgradeRestartCommand('not-an-id', RESTART_ID, SIGNER_SHA256))
       .toThrow('invalid_legacy_upgrade_rescue_id');
-    expect(() => buildLegacyWindowsUpgradeRestartCommand(RESCUE_ID, 'not-an-id', SIGNER_SHA256, RELEASE_VERSION))
+    expect(() => buildLegacyWindowsUpgradeRestartCommand(RESCUE_ID, 'not-an-id', SIGNER_SHA256))
       .toThrow('invalid_legacy_upgrade_restart_id');
-    expect(() => buildLegacyWindowsUpgradeRestartCommand(RESCUE_ID, RESTART_ID, 'bad', RELEASE_VERSION))
+    expect(() => buildLegacyWindowsUpgradeRestartCommand(RESCUE_ID, RESTART_ID, 'bad'))
       .toThrow('invalid_legacy_upgrade_release_signer');
-    expect(() => buildLegacyWindowsUpgradeRestartCommand(RESCUE_ID, RESTART_ID, SIGNER_SHA256, 'bad version!'))
-      .toThrow('invalid_legacy_upgrade_release_version');
   });
 
   it('derives one signer anchor from matching current main and worker manifests', async () => {

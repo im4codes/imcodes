@@ -252,12 +252,10 @@ export function buildLegacyWindowsUpgradeRestartCommand(
   rescueId: string,
   restartId: string,
   expectedSignerSha256: string,
-  expectedVersion: string,
 ): LegacyWindowsUpgradeRescueCommand {
   if (!/^[0-9a-f-]{36}$/i.test(rescueId)) throw new Error('invalid_legacy_upgrade_rescue_id');
   if (!/^[0-9a-f-]{36}$/i.test(restartId)) throw new Error('invalid_legacy_upgrade_restart_id');
   if (!SHA256_RE.test(expectedSignerSha256)) throw new Error('invalid_legacy_upgrade_release_signer');
-  if (!RELEASE_VERSION_RE.test(expectedVersion)) throw new Error('invalid_legacy_upgrade_release_version');
 
   const restartTask = CONTROLLED_NODE_SERVICE.WINDOWS_LEGACY_UPGRADE_RESTART_TASK;
   const restartScript = `$ErrorActionPreference = 'Stop'\r\n`
@@ -304,7 +302,6 @@ export function buildLegacyWindowsUpgradeRestartCommand(
     + `$patchedUpgradeTask = $null\r\n`
     + `$patchedUpgradeScriptPath = $null\r\n`
     + `$expectedSigner = ${psSingleQuote(expectedSignerSha256)}\r\n`
-    + `$expectedVersion = ${psSingleQuote(expectedVersion)}\r\n`
     + `$verifySignedArtifact = { param([string]$artifactPath)\r\n`
     + `  if (-not (Test-Path -LiteralPath $artifactPath -PathType Leaf)) { throw 'legacy upgrade signed artifact is missing' }\r\n`
     + `  $artifactSignature = Get-AuthenticodeSignature -LiteralPath $artifactPath\r\n`
@@ -339,7 +336,8 @@ export function buildLegacyWindowsUpgradeRestartCommand(
     + `    $failureReason = [string]$upgradeResult.reason\r\n`
     + `    if ([string]$upgradeResult.status -cne ${psSingleQuote(CONTROLLED_NODE_WINDOWS_UPGRADE_PREFLIGHT_FAILED)} -or $failureReason -cnotin @(${psSingleQuote(CONTROLLED_NODE_WINDOWS_RELEASE_TRUST_PREFLIGHT_FAILURE)},${psSingleQuote(CONTROLLED_NODE_WINDOWS_RELEASE_SIGNER_ANCHOR_PREFLIGHT_FAILURE)})) { continue }\r\n`
     + `    $workerManifest = Get-Content -LiteralPath $workerManifestPath -Raw | ConvertFrom-Json\r\n`
-    + `    if ([string]$workerManifest.workerVersion -cne $expectedVersion -or [int]$workerManifest.protocolVersion -notin @(${REMOTE_DESKTOP_LEGACY_UPGRADE_PROTOCOL_VERSION},${REMOTE_DESKTOP_PROTOCOL_VERSION}) -or [string]$workerManifest.os -cne 'win32' -or [string]$workerManifest.arch -cne 'x64' -or [string]$workerManifest.fileName -cne ${psSingleQuote(REMOTE_DESKTOP_WORKER_FILENAME)} -or [string]$workerManifest.authenticodeSignerSha256 -cne $expectedSigner -or [int64]$workerManifest.size -ne [int64]$workerItem.Length -or [string]$workerManifest.sha256 -cne (Get-FileHash -Algorithm SHA256 -LiteralPath $workerPath).Hash.ToLowerInvariant()) { continue }\r\n`
+    + `    $candidateVersion = [string]$workerManifest.workerVersion\r\n`
+    + `    if ($candidateVersion -notmatch ${psSingleQuote(RELEASE_VERSION_RE.source)} -or [int]$workerManifest.protocolVersion -notin @(${REMOTE_DESKTOP_LEGACY_UPGRADE_PROTOCOL_VERSION},${REMOTE_DESKTOP_PROTOCOL_VERSION}) -or [string]$workerManifest.os -cne 'win32' -or [string]$workerManifest.arch -cne 'x64' -or [string]$workerManifest.fileName -cne ${psSingleQuote(REMOTE_DESKTOP_WORKER_FILENAME)} -or [string]$workerManifest.authenticodeSignerSha256 -cne $expectedSigner -or [int64]$workerManifest.size -ne [int64]$workerItem.Length -or [string]$workerManifest.sha256 -cne (Get-FileHash -Algorithm SHA256 -LiteralPath $workerPath).Hash.ToLowerInvariant()) { continue }\r\n`
     + publisherTrustScript
     + `    & $verifySignedArtifact $workerPath\r\n`
     + `    if ($failureReason -ceq ${psSingleQuote(CONTROLLED_NODE_WINDOWS_RELEASE_TRUST_PREFLIGHT_FAILURE)}) { $stagedWorker = $workerPath; $scheduledMode = 'restart'; break }\r\n`
@@ -347,7 +345,7 @@ export function buildLegacyWindowsUpgradeRestartCommand(
     + `    $protectedItems = @($mainPath,$mainManifestPath,$helperPath,$helperManifestPath,$upgradeScriptPath) | ForEach-Object { Get-Item -LiteralPath $_ -Force }\r\n`
     + `    foreach ($protectedItem in $protectedItems) { $protectedOwner = (Get-Acl -LiteralPath $protectedItem.FullName -ErrorAction Stop).GetOwner([System.Security.Principal.SecurityIdentifier]).Value; if (($protectedItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -or $protectedOwner -notin @('S-1-5-18','S-1-5-32-544')) { throw 'legacy upgrade bridge artifact ownership mismatch' } }\r\n`
     + `    $mainManifest = Get-Content -LiteralPath $mainManifestPath -Raw | ConvertFrom-Json\r\n`
-    + `    if ([int]$mainManifest.schemaVersion -ne 1 -or [string]$mainManifest.artifact.fileName -cne 'imcodes-node.exe' -or [string]$mainManifest.artifact.os -cne 'win32' -or [string]$mainManifest.artifact.arch -cne 'x64' -or [int64]$mainManifest.artifact.size -ne (Get-Item -LiteralPath $mainPath).Length -or [string]$mainManifest.artifact.sha256 -cne (Get-FileHash -Algorithm SHA256 -LiteralPath $mainPath).Hash.ToLowerInvariant() -or [string]$mainManifest.build.version -cne $expectedVersion) { throw 'legacy upgrade bridge main manifest mismatch' }\r\n`
+    + `    if ([int]$mainManifest.schemaVersion -ne 1 -or [string]$mainManifest.artifact.fileName -cne 'imcodes-node.exe' -or [string]$mainManifest.artifact.os -cne 'win32' -or [string]$mainManifest.artifact.arch -cne 'x64' -or [int64]$mainManifest.artifact.size -ne (Get-Item -LiteralPath $mainPath).Length -or [string]$mainManifest.artifact.sha256 -cne (Get-FileHash -Algorithm SHA256 -LiteralPath $mainPath).Hash.ToLowerInvariant() -or [string]$mainManifest.build.version -cne $candidateVersion) { throw 'legacy upgrade bridge main manifest mismatch' }\r\n`
     + `    $helperManifest = Get-Content -LiteralPath $helperManifestPath -Raw | ConvertFrom-Json\r\n`
     + `    if ([int]$helperManifest.schemaVersion -ne 1 -or [string]$helperManifest.artifact.fileName -cne ${psSingleQuote(CONTROLLED_NODE_COMPUTER_USE_HELPER_FILENAMES[CONTROLLED_NODE_OS_WIN])} -or [string]$helperManifest.artifact.os -cne 'win32' -or [string]$helperManifest.artifact.arch -cne 'x64' -or [int64]$helperManifest.artifact.size -ne (Get-Item -LiteralPath $helperPath).Length -or [string]$helperManifest.artifact.sha256 -cne (Get-FileHash -Algorithm SHA256 -LiteralPath $helperPath).Hash.ToLowerInvariant()) { throw 'legacy upgrade bridge helper manifest mismatch' }\r\n`
     + `    & $verifySignedArtifact $mainPath\r\n`
