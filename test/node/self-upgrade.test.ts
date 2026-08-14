@@ -33,6 +33,7 @@ import {
 import { WINDOWS_REMOTE_DESKTOP_QUALIFICATION_PLAN } from '../../shared/remote-desktop-qualification.js';
 
 const dirs: string[] = [];
+const WINDOWS_SIGNER_SHA256 = 'c'.repeat(64);
 const execFileAsync = promisify(execFile);
 afterEach(async () => {
   await Promise.all(dirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
@@ -198,6 +199,7 @@ describe('controlled-node self-upgrade', () => {
           [CONTROLLED_NODE_ARTIFACT_HEADERS.SIZE_BYTES]: String(bytes.length),
           [CONTROLLED_NODE_ARTIFACT_HEADERS.FILENAME]: 'imcodes-node.exe',
           [CONTROLLED_NODE_ARTIFACT_HEADERS.VERSION]: '2026.7.1',
+          [CONTROLLED_NODE_ARTIFACT_HEADERS.AUTHENTICODE_SIGNER_SHA256]: WINDOWS_SIGNER_SHA256,
         },
       });
     });
@@ -217,6 +219,10 @@ describe('controlled-node self-upgrade', () => {
     expect(scheduled).toHaveLength(1);
     expect(scheduled[0].taskName).toMatch(/^imcodes-node-upgrade-/);
     expect(scheduled[0].taskXmlPath).toBe(join(dirname(result.scriptPath!), 'upgrade-task.xml'));
+    const stagedManifest = JSON.parse(
+      await readFile(join(dirname(result.scriptPath!), 'imcodes-node.exe.manifest.json'), 'utf8'),
+    ) as { artifact: { authenticodeSignerSha256?: string } };
+    expect(stagedManifest.artifact.authenticodeSignerSha256).toBe(WINDOWS_SIGNER_SHA256);
     const script = await readFile(result.scriptPath!, 'utf8');
     expect(script).toContain('Stop-ScheduledTask');
     expect(script).toContain('Start-ScheduledTask');
@@ -296,6 +302,33 @@ describe('controlled-node self-upgrade', () => {
       spawnDetached: spawned,
     })).rejects.toThrow(/artifact_version_mismatch/);
     expect(spawned).not.toHaveBeenCalled();
+  });
+
+  it('rejects a Windows upgrade when the server omits the release signer binding', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'imcodes-self-upgrade-signer-test-'));
+    dirs.push(dir);
+    const bytes = Buffer.from('signed artifact without signer metadata');
+    const scheduleWindowsUpgrade = vi.fn();
+    await expect(startControlledNodeSelfUpgrade(credential, '2026.7.1', {
+      fetchImpl: (async (url: string) => {
+        if (url.includes('asset=computer-use-helper')) return new Response(null, { status: 404 });
+        return new Response(bytes, {
+          status: 200,
+          headers: {
+            [CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256]: createHash('sha256').update(bytes).digest('hex'),
+            [CONTROLLED_NODE_ARTIFACT_HEADERS.SIZE_BYTES]: String(bytes.length),
+            [CONTROLLED_NODE_ARTIFACT_HEADERS.FILENAME]: 'imcodes-node.exe',
+            [CONTROLLED_NODE_ARTIFACT_HEADERS.VERSION]: '2026.7.1',
+          },
+        });
+      }) as unknown as typeof fetch,
+      platform: 'win32',
+      arch: 'x64',
+      execPath: 'C:\\ProgramData\\imcodes-node\\imcodes-node.exe',
+      tmpdir: () => dir,
+      scheduleWindowsUpgrade,
+    })).rejects.toThrow('missing_artifact_authenticode_signer_sha256');
+    expect(scheduleWindowsUpgrade).not.toHaveBeenCalled();
   });
 
   it('quotes PowerShell paths and applies executable/helper ACLs', () => {

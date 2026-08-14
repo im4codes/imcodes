@@ -3,6 +3,7 @@ import { REMOTE_EXEC_MAX_COMMAND_BYTES, utf8ByteLength } from '../../shared/remo
 import {
   CONTROLLED_NODE_SERVICE,
   CONTROLLED_NODE_WINDOWS_LEGACY_UPGRADE_RESCUE_DIR,
+  CONTROLLED_NODE_WINDOWS_RELEASE_MANIFEST_PREFLIGHT_FAILURE,
   CONTROLLED_NODE_WINDOWS_UPGRADE_TASK_PREFIX,
 } from '../../shared/controlled-node-service.js';
 import {
@@ -105,7 +106,7 @@ describe('legacy Windows controlled-node upgrade rescue', () => {
     expect(setup).toContain("$candidateOwnerSid -notin @('S-1-5-18','S-1-5-32-544')");
     expect(setup).toContain('$workerDirItem.Attributes -band [IO.FileAttributes]::ReparsePoint');
     expect(setup).toContain("[string]$upgradeResult.status -cne 'preflight_failed'");
-    expect(setup).toContain("$failureReason -cnotin @('remote desktop worker Authenticode verification failed','remote desktop worker signer is not trusted by this controlled node build')");
+    expect(setup).toContain(CONTROLLED_NODE_WINDOWS_RELEASE_MANIFEST_PREFLIGHT_FAILURE);
     expect(setup).toContain("throw 'legacy upgrade signed staging evidence missing'");
     expect(setup).toContain('Get-FileHash -Algorithm SHA256 -LiteralPath $workerPath');
     expect(setup).toContain(SIGNER_SHA256);
@@ -138,6 +139,12 @@ describe('legacy Windows controlled-node upgrade rescue', () => {
     expect(setup).toContain("if ($anchorMatches.Count -ne 1) { throw 'legacy upgrade bridge signer guard shape mismatch' }");
     expect(setup).toContain("$patchedUpgradeScriptPath = Join-Path $rescueRoot ('upgrade-bridge-' +");
     expect(setup).toContain("throw 'legacy upgrade bridge patched script verification failed'");
+    expect(setup).toContain("Add-Member -InputObject $mainManifest.artifact -NotePropertyName 'authenticodeSignerSha256'");
+    expect(setup).toContain("throw 'legacy upgrade bridge patched main manifest verification failed'");
+    expect(setup.indexOf("& $verifySignedArtifact $mainPath"))
+      .toBeLessThan(setup.indexOf("Add-Member -InputObject $mainManifest.artifact"));
+    expect(setup.indexOf("Add-Member -InputObject $mainManifest.artifact"))
+      .toBeLessThan(setup.indexOf('Start-ScheduledTask -TaskName $patchedUpgradeTask'));
     expect(setup).toContain("$stagedWorker = $workerPath; $scheduledMode = 'restart'; break");
     expect(setup).toContain("if (-not $stagedWorker -or $scheduledMode -notin @('restart','upgrade'))");
     expect(setup).toContain("$settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Seconds 0)");

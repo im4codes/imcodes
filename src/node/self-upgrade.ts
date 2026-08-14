@@ -19,6 +19,7 @@ import {
 import { DAEMON_UPGRADE_TARGET_LATEST, normalizeDaemonUpgradeTargetVersion } from '../../shared/daemon-upgrade.js';
 import {
   CONTROLLED_NODE_WINDOWS_RELEASE_TRUST_PREFLIGHT_FAILURE,
+  CONTROLLED_NODE_WINDOWS_RELEASE_MANIFEST_PREFLIGHT_FAILURE,
   CONTROLLED_NODE_WINDOWS_UPGRADE_PREFLIGHT_FAILED,
   CONTROLLED_NODE_WINDOWS_UPGRADE_TASK_PREFIX,
 } from '../../shared/controlled-node-service.js';
@@ -136,6 +137,10 @@ async function downloadArtifact(input: {
   if (input.expectedFileName && basename(filename) !== input.expectedFileName) throw new Error('artifact_filename_mismatch');
   const sizeHeader = readHeader(response.headers, CONTROLLED_NODE_ARTIFACT_HEADERS.SIZE_BYTES);
   const versionHeader = readHeader(response.headers, CONTROLLED_NODE_ARTIFACT_HEADERS.VERSION)?.trim();
+  const authenticodeSignerSha256 = readHeader(
+    response.headers,
+    CONTROLLED_NODE_ARTIFACT_HEADERS.AUTHENTICODE_SIGNER_SHA256,
+  )?.trim().toLowerCase();
   if (!expectedSha || !/^[0-9a-f]{64}$/i.test(expectedSha)) throw new Error('missing_artifact_sha256');
   const bytes = Buffer.from(await response.arrayBuffer());
   const actualSha = createHash('sha256').update(bytes).digest('hex');
@@ -143,6 +148,10 @@ async function downloadArtifact(input: {
   const expectedSize = sizeHeader && /^\d+$/.test(sizeHeader) ? Number(sizeHeader) : bytes.length;
   if (!Number.isSafeInteger(expectedSize) || expectedSize !== bytes.length) throw new Error('artifact_size_mismatch');
   if (input.expectedVersion && versionHeader !== input.expectedVersion) throw new Error('artifact_version_mismatch');
+  if (input.target.os === CONTROLLED_NODE_OS_WIN && asset === CONTROLLED_NODE_ARTIFACT_ASSETS.NODE
+    && (!authenticodeSignerSha256 || !/^[0-9a-f]{64}$/.test(authenticodeSignerSha256))) {
+    throw new Error('missing_artifact_authenticode_signer_sha256');
+  }
   const artifactPath = join(input.dir, basename(filename));
   const manifestPath = `${artifactPath}.manifest.json`;
   const fileMode = input.fileMode ?? 0o755;
@@ -162,6 +171,7 @@ async function downloadArtifact(input: {
       arch: input.target.arch,
       size: bytes.length,
       sha256: actualSha,
+      ...(authenticodeSignerSha256 ? { authenticodeSignerSha256 } : {}),
     },
     build: {
       source: 'controlled-node-self-upgrade',
@@ -354,7 +364,7 @@ export function buildWindowsControlledNodeUpgradeScript(input: {
     + `if (-not (Test-Path -LiteralPath $srcManifest -PathType Leaf)) { throw 'controlled node release manifest is missing' }\r\n`
     + `$srcNodeManifest = Get-Content -LiteralPath $srcManifest -Raw | ConvertFrom-Json\r\n`
     + `$srcHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $src).Hash.ToLowerInvariant()\r\n`
-    + `if ([int]$srcNodeManifest.schemaVersion -ne 1 -or [string]$srcNodeManifest.artifact.fileName -cne 'imcodes-node.exe' -or [string]$srcNodeManifest.artifact.os -cne 'win32' -or [string]$srcNodeManifest.artifact.arch -cne 'x64' -or [int64]$srcNodeManifest.artifact.size -ne (Get-Item -LiteralPath $src).Length -or [string]$srcNodeManifest.artifact.sha256 -cne $srcHash -or [string]$srcNodeManifest.artifact.authenticodeSignerSha256 -cne $trustedReleaseSigner) { throw 'controlled node release manifest does not match the staged executable' }\r\n`
+    + `if ([int]$srcNodeManifest.schemaVersion -ne 1 -or [string]$srcNodeManifest.artifact.fileName -cne 'imcodes-node.exe' -or [string]$srcNodeManifest.artifact.os -cne 'win32' -or [string]$srcNodeManifest.artifact.arch -cne 'x64' -or [int64]$srcNodeManifest.artifact.size -ne (Get-Item -LiteralPath $src).Length -or [string]$srcNodeManifest.artifact.sha256 -cne $srcHash -or [string]$srcNodeManifest.artifact.authenticodeSignerSha256 -cne $trustedReleaseSigner) { throw ${psQuote(CONTROLLED_NODE_WINDOWS_RELEASE_MANIFEST_PREFLIGHT_FAILURE)} }\r\n`
     + `$srcManifestHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $srcManifest).Hash.ToLowerInvariant()\r\n`
     + (input.stagedComputerUseHelperDir
       ? `$srcHelper = ${psQuote(input.stagedComputerUseHelperDir)}\r\n`

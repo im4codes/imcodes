@@ -24,6 +24,8 @@ export const CONTROLLED_NODE_WINDOWS_RELEASE_TRUST_PREFLIGHT_FAILURE =
   'remote desktop worker Authenticode verification failed' as const;
 export const CONTROLLED_NODE_WINDOWS_RELEASE_SIGNER_ANCHOR_PREFLIGHT_FAILURE =
   'remote desktop worker signer is not trusted by this controlled node build' as const;
+export const CONTROLLED_NODE_WINDOWS_RELEASE_MANIFEST_PREFLIGHT_FAILURE =
+  'controlled node release manifest does not match the staged executable' as const;
 
 /** New nodes advertise that their own self-upgrade script has backup/health rollback semantics. */
 export const CONTROLLED_NODE_SAFE_SELF_UPGRADE_CAPABILITY = 'controlled-node.safe-self-upgrade.v2' as const;

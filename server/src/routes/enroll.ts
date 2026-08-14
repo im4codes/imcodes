@@ -1029,6 +1029,12 @@ enrollRoutes.get('/v2/node-artifact', async (c) => {
   c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.SIZE_BYTES, String(v.descriptor.sizeBytes));
   c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.FILENAME, v.descriptor.filename);
   c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.VERSION, v.descriptor.version);
+  if (v.descriptor.authenticodeSignerSha256) {
+    c.header(
+      CONTROLLED_NODE_ARTIFACT_HEADERS.AUTHENTICODE_SIGNER_SHA256,
+      v.descriptor.authenticodeSignerSha256,
+    );
+  }
   return c.body(buildBareArtifactStream(opened.handle, v.descriptor.sizeBytes, opened.close) as unknown as ReadableStream, 200);
 });
 

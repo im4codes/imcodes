@@ -37,6 +37,7 @@ export interface ArtifactDescriptor {
   filename: string;
   sizeBytes: number;
   sha256: string;
+  authenticodeSignerSha256?: string;
   version: string;
   /** Manifest + artifact identity + expected digest cache key. */
   fingerprint: string;
@@ -147,6 +148,11 @@ async function probeArtifact(
     if (mappedOs !== os) return null;
     if (typeof artifact.size !== 'number' || !Number.isSafeInteger(artifact.size) || artifact.size <= 0) return null;
     if (typeof artifact.sha256 !== 'string' || !/^[0-9a-f]{64}$/i.test(artifact.sha256)) return null;
+    const authenticodeSignerSha256 = typeof artifact.authenticodeSignerSha256 === 'string'
+      && /^[0-9a-f]{64}$/i.test(artifact.authenticodeSignerSha256)
+      ? artifact.authenticodeSignerSha256.toLowerCase()
+      : null;
+    if (mappedOs === 'win' && !authenticodeSignerSha256) return null;
     let version: string;
     try {
       version = normalizeDaemonUpgradeTargetVersion(raw.build?.version);
@@ -167,6 +173,7 @@ async function probeArtifact(
       manifestStat.mtimeMs,
       manifestDigest,
       artifact.sha256.toLowerCase(),
+      authenticodeSignerSha256 ?? '',
       version,
     ].join(':');
     return {
@@ -176,6 +183,7 @@ async function probeArtifact(
         arch,
         filename,
         sizeBytes: artifact.size,
+        ...(authenticodeSignerSha256 ? { authenticodeSignerSha256 } : {}),
         version,
         fingerprint,
         mtimeMs: identity.mtimeMs,

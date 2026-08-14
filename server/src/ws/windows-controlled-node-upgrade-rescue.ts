@@ -5,6 +5,7 @@ import {
   CONTROLLED_NODE_SERVICE,
   CONTROLLED_NODE_WINDOWS_INSTALL_DIR,
   CONTROLLED_NODE_WINDOWS_LEGACY_UPGRADE_RESCUE_DIR,
+  CONTROLLED_NODE_WINDOWS_RELEASE_MANIFEST_PREFLIGHT_FAILURE,
   CONTROLLED_NODE_WINDOWS_RELEASE_SIGNER_ANCHOR_PREFLIGHT_FAILURE,
   CONTROLLED_NODE_WINDOWS_RELEASE_TRUST_PREFLIGHT_FAILURE,
   CONTROLLED_NODE_WINDOWS_UPGRADE_PREFLIGHT_FAILED,
@@ -334,7 +335,7 @@ export function buildLegacyWindowsUpgradeRestartCommand(
     + `    if (-not $workerDirItem.PSIsContainer -or ($workerDirItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -or ($resultItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -or ($workerItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -or ($workerManifestItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) { continue }\r\n`
     + `    $upgradeResult = Get-Content -LiteralPath $resultPath -Raw | ConvertFrom-Json\r\n`
     + `    $failureReason = [string]$upgradeResult.reason\r\n`
-    + `    if ([string]$upgradeResult.status -cne ${psSingleQuote(CONTROLLED_NODE_WINDOWS_UPGRADE_PREFLIGHT_FAILED)} -or $failureReason -cnotin @(${psSingleQuote(CONTROLLED_NODE_WINDOWS_RELEASE_TRUST_PREFLIGHT_FAILURE)},${psSingleQuote(CONTROLLED_NODE_WINDOWS_RELEASE_SIGNER_ANCHOR_PREFLIGHT_FAILURE)})) { continue }\r\n`
+    + `    if ([string]$upgradeResult.status -cne ${psSingleQuote(CONTROLLED_NODE_WINDOWS_UPGRADE_PREFLIGHT_FAILED)} -or $failureReason -cnotin @(${psSingleQuote(CONTROLLED_NODE_WINDOWS_RELEASE_TRUST_PREFLIGHT_FAILURE)},${psSingleQuote(CONTROLLED_NODE_WINDOWS_RELEASE_SIGNER_ANCHOR_PREFLIGHT_FAILURE)},${psSingleQuote(CONTROLLED_NODE_WINDOWS_RELEASE_MANIFEST_PREFLIGHT_FAILURE)})) { continue }\r\n`
     + `    $workerManifest = Get-Content -LiteralPath $workerManifestPath -Raw | ConvertFrom-Json\r\n`
     + `    $candidateVersion = [string]$workerManifest.workerVersion\r\n`
     + `    if ($candidateVersion -notmatch ${psSingleQuote(RELEASE_VERSION_RE.source)} -or [int]$workerManifest.protocolVersion -notin @(${REMOTE_DESKTOP_LEGACY_UPGRADE_PROTOCOL_VERSION},${REMOTE_DESKTOP_PROTOCOL_VERSION}) -or [string]$workerManifest.os -cne 'win32' -or [string]$workerManifest.arch -cne 'x64' -or [string]$workerManifest.fileName -cne ${psSingleQuote(REMOTE_DESKTOP_WORKER_FILENAME)} -or [string]$workerManifest.authenticodeSignerSha256 -cne $expectedSigner -or [int64]$workerManifest.size -ne [int64]$workerItem.Length -or [string]$workerManifest.sha256 -cne (Get-FileHash -Algorithm SHA256 -LiteralPath $workerPath).Hash.ToLowerInvariant()) { continue }\r\n`
@@ -346,6 +347,8 @@ export function buildLegacyWindowsUpgradeRestartCommand(
     + `    foreach ($protectedItem in $protectedItems) { $protectedOwner = (Get-Acl -LiteralPath $protectedItem.FullName -ErrorAction Stop).GetOwner([System.Security.Principal.SecurityIdentifier]).Value; if (($protectedItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -or $protectedOwner -notin @('S-1-5-18','S-1-5-32-544')) { throw 'legacy upgrade bridge artifact ownership mismatch' } }\r\n`
     + `    $mainManifest = Get-Content -LiteralPath $mainManifestPath -Raw | ConvertFrom-Json\r\n`
     + `    if ([int]$mainManifest.schemaVersion -ne 1 -or [string]$mainManifest.artifact.fileName -cne 'imcodes-node.exe' -or [string]$mainManifest.artifact.os -cne 'win32' -or [string]$mainManifest.artifact.arch -cne 'x64' -or [int64]$mainManifest.artifact.size -ne (Get-Item -LiteralPath $mainPath).Length -or [string]$mainManifest.artifact.sha256 -cne (Get-FileHash -Algorithm SHA256 -LiteralPath $mainPath).Hash.ToLowerInvariant() -or [string]$mainManifest.build.version -cne $candidateVersion) { throw 'legacy upgrade bridge main manifest mismatch' }\r\n`
+    + `    $mainManifestSigner = [string]$mainManifest.artifact.authenticodeSignerSha256\r\n`
+    + `    if ($mainManifestSigner -and $mainManifestSigner -cne $expectedSigner) { throw 'legacy upgrade bridge main manifest signer mismatch' }\r\n`
     + `    $helperManifest = Get-Content -LiteralPath $helperManifestPath -Raw | ConvertFrom-Json\r\n`
     + `    if ([int]$helperManifest.schemaVersion -ne 1 -or [string]$helperManifest.artifact.fileName -cne ${psSingleQuote(CONTROLLED_NODE_COMPUTER_USE_HELPER_FILENAMES[CONTROLLED_NODE_OS_WIN])} -or [string]$helperManifest.artifact.os -cne 'win32' -or [string]$helperManifest.artifact.arch -cne 'x64' -or [int64]$helperManifest.artifact.size -ne (Get-Item -LiteralPath $helperPath).Length -or [string]$helperManifest.artifact.sha256 -cne (Get-FileHash -Algorithm SHA256 -LiteralPath $helperPath).Hash.ToLowerInvariant()) { throw 'legacy upgrade bridge helper manifest mismatch' }\r\n`
     + `    & $verifySignedArtifact $mainPath\r\n`
@@ -355,9 +358,24 @@ export function buildLegacyWindowsUpgradeRestartCommand(
     + `    $anchorMatches = [regex]::Matches($upgradeScript, $anchorPattern, [Text.RegularExpressions.RegexOptions]::CultureInvariant)\r\n`
     + `    if ($anchorMatches.Count -ne 1) { throw 'legacy upgrade bridge signer guard shape mismatch' }\r\n`
     + `    $legacySigner = $anchorMatches[0].Groups[1].Value\r\n`
-    + `    if ($legacySigner -ceq $expectedSigner -or [regex]::Matches($upgradeScript, [regex]::Escape($legacySigner)).Count -ne 1) { throw 'legacy upgrade bridge signer replacement is ambiguous' }\r\n`
-    + `    $replacementGuard = $anchorMatches[0].Value.Replace($legacySigner, $expectedSigner)\r\n`
-    + `    $patchedUpgradeScript = $upgradeScript.Remove($anchorMatches[0].Index, $anchorMatches[0].Length).Insert($anchorMatches[0].Index, $replacementGuard)\r\n`
+    + `    $patchedUpgradeScript = $upgradeScript\r\n`
+    + `    if ($failureReason -ceq ${psSingleQuote(CONTROLLED_NODE_WINDOWS_RELEASE_SIGNER_ANCHOR_PREFLIGHT_FAILURE)}) {\r\n`
+    + `      if ($legacySigner -ceq $expectedSigner -or [regex]::Matches($upgradeScript, [regex]::Escape($legacySigner)).Count -ne 1) { throw 'legacy upgrade bridge signer replacement is ambiguous' }\r\n`
+    + `      $replacementGuard = $anchorMatches[0].Value.Replace($legacySigner, $expectedSigner)\r\n`
+    + `      $patchedUpgradeScript = $upgradeScript.Remove($anchorMatches[0].Index, $anchorMatches[0].Length).Insert($anchorMatches[0].Index, $replacementGuard)\r\n`
+    + `    } elseif ($legacySigner -cne $expectedSigner) { throw 'legacy upgrade bridge signer guard does not match the release publisher' }\r\n`
+    + `    if ($failureReason -ceq ${psSingleQuote(CONTROLLED_NODE_WINDOWS_RELEASE_MANIFEST_PREFLIGHT_FAILURE)}) {\r\n`
+    + `      Add-Member -InputObject $mainManifest.artifact -NotePropertyName 'authenticodeSignerSha256' -NotePropertyValue $expectedSigner -Force\r\n`
+    + `      $mainManifestTmp = "$mainManifestPath.imcodes-patch-$restartId.tmp"\r\n`
+    + `      try {\r\n`
+    + `        $mainManifest | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $mainManifestTmp -Encoding UTF8\r\n`
+    + `        $patchedMainManifest = Get-Content -LiteralPath $mainManifestTmp -Raw | ConvertFrom-Json\r\n`
+    + `        if ([string]$patchedMainManifest.artifact.authenticodeSignerSha256 -cne $expectedSigner -or [string]$patchedMainManifest.artifact.sha256 -cne (Get-FileHash -Algorithm SHA256 -LiteralPath $mainPath).Hash.ToLowerInvariant() -or [int64]$patchedMainManifest.artifact.size -ne (Get-Item -LiteralPath $mainPath).Length) { throw 'legacy upgrade bridge patched main manifest verification failed' }\r\n`
+    + `        Move-Item -Force -LiteralPath $mainManifestTmp -Destination $mainManifestPath\r\n`
+    + `      } finally { Remove-Item -Force -LiteralPath $mainManifestTmp -ErrorAction SilentlyContinue }\r\n`
+    + `      $mainManifestReadback = Get-Content -LiteralPath $mainManifestPath -Raw | ConvertFrom-Json\r\n`
+    + `      if ([string]$mainManifestReadback.artifact.authenticodeSignerSha256 -cne $expectedSigner) { throw 'legacy upgrade bridge patched main manifest readback failed' }\r\n`
+    + `    }\r\n`
     + `    $taskPattern = 'Unregister-ScheduledTask -TaskName ''(imcodes-node-upgrade-[0-9a-f-]{36})'' -Confirm:\\$false -ErrorAction SilentlyContinue'\r\n`
     + `    $taskNames = @([regex]::Matches($upgradeScript, $taskPattern, [Text.RegularExpressions.RegexOptions]::CultureInvariant) | ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique)\r\n`
     + `    if ($taskNames.Count -ne 1 -or $taskNames[0] -in @($rescueTask,$restartTask)) { throw 'legacy upgrade bridge task identity mismatch' }\r\n`
@@ -366,7 +384,8 @@ export function buildLegacyWindowsUpgradeRestartCommand(
     + `    [IO.File]::WriteAllText($patchedUpgradeScriptPath, $patchedUpgradeScript, (New-Object Text.UTF8Encoding($false)))\r\n`
     + `    $patchedReadback = Get-Content -LiteralPath $patchedUpgradeScriptPath -Raw\r\n`
     + `    $patchedMatches = [regex]::Matches($patchedReadback, $anchorPattern, [Text.RegularExpressions.RegexOptions]::CultureInvariant)\r\n`
-    + `    if ($patchedMatches.Count -ne 1 -or $patchedMatches[0].Groups[1].Value -cne $expectedSigner -or $patchedReadback.Contains($legacySigner)) { throw 'legacy upgrade bridge patched script verification failed' }\r\n`
+    + `    if ($patchedMatches.Count -ne 1 -or $patchedMatches[0].Groups[1].Value -cne $expectedSigner) { throw 'legacy upgrade bridge patched script verification failed' }\r\n`
+    + `    if ($failureReason -ceq ${psSingleQuote(CONTROLLED_NODE_WINDOWS_RELEASE_SIGNER_ANCHOR_PREFLIGHT_FAILURE)} -and $patchedReadback.Contains($legacySigner)) { throw 'legacy upgrade bridge retained the previous signer anchor' }\r\n`
     + `    $stagedWorker = $workerPath\r\n`
     + `    $scheduledMode = 'upgrade'\r\n`
     + `    break\r\n`

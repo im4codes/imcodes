@@ -79,6 +79,7 @@ async function writeManifest(
       arch,
       size: bytes.length,
       sha256: sha256(bytes),
+      ...(os === 'win32' ? { authenticodeSignerSha256: 'c'.repeat(64) } : {}),
     },
     toolchain: {
       nodeVersion: 'v22.11.0',
@@ -1519,6 +1520,8 @@ describe('GET /api/enroll/v2/node-artifact (controlled-node self-upgrade)', () =
     expect(response.status).toBe(200);
     expect(response.headers.get('x-imcodes-node-artifact-sha256')).toBe(sha256(FAKE_WINDOWS_SIGNED_PE));
     expect(response.headers.get('x-imcodes-node-artifact-version')).toBe('2026.7.1234-dev.5');
+    expect(response.headers.get(CONTROLLED_NODE_ARTIFACT_HEADERS.AUTHENTICODE_SIGNER_SHA256))
+      .toBe('c'.repeat(64));
     expect(Buffer.from(await response.arrayBuffer())).toEqual(FAKE_WINDOWS_SIGNED_PE);
 
     const helperBytes = Buffer.from('FAKE_OPEN_COMPUTER_USE_HELPER');

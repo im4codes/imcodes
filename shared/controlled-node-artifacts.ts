@@ -122,6 +122,7 @@ export const CONTROLLED_NODE_ARTIFACT_HEADERS = {
   SIZE_BYTES: 'x-imcodes-node-artifact-size-bytes',
   FILENAME: 'x-imcodes-node-artifact-filename',
   VERSION: 'x-imcodes-node-artifact-version',
+  AUTHENTICODE_SIGNER_SHA256: 'x-imcodes-node-artifact-authenticode-signer-sha256',
   REMOTE_DESKTOP_PROTOCOL_VERSION: 'x-imcodes-remote-desktop-protocol-version',
 } as const;
 
