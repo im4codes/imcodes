@@ -3,12 +3,15 @@ import {
   CONTROLLED_NODE_SERVICE,
   CONTROLLED_NODE_WINDOWS_INSTALL_DIR,
   CONTROLLED_NODE_WINDOWS_LEGACY_UPGRADE_RESCUE_DIR,
+  CONTROLLED_NODE_WINDOWS_UPGRADE_TASK_PREFIX,
 } from '../../../shared/controlled-node-service.js';
 import { WINDOWS_POWERSHELL_UTILITY_MODULE_PREFLIGHT } from '../../../shared/windows-powershell-modules.js';
 
 export const LEGACY_WINDOWS_UPGRADE_RESCUE_GRACE_MS = 11 * 60 * 1000;
 export const LEGACY_WINDOWS_UPGRADE_RESCUE_EXEC_TIMEOUT_MS = 120_000;
 export const LEGACY_WINDOWS_UPGRADE_RESCUE_READY_PREFIX = 'IMCODES_UPGRADE_RESCUE_READY' as const;
+export const LEGACY_WINDOWS_UPGRADE_RESTART_EXEC_TIMEOUT_MS = 120_000;
+export const LEGACY_WINDOWS_UPGRADE_RESTART_READY_PREFIX = 'IMCODES_UPGRADE_RESTART_READY' as const;
 
 function psSingleQuote(value: string): string {
   return `'${value.replaceAll("'", "''")}'`;
@@ -16,6 +19,10 @@ function psSingleQuote(value: string): string {
 
 function utf8Base64(value: string): string {
   return Buffer.from(value, 'utf8').toString('base64');
+}
+
+function utf16leBase64(value: string): string {
+  return Buffer.from(value, 'utf16le').toString('base64');
 }
 
 /**
@@ -154,6 +161,74 @@ export function buildLegacyWindowsUpgradeRescueCommand(rescueId: string): Legacy
     + `$markerPath = Join-Path $rescueRoot 'marker.json'\r\n`
     + `$marker | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $markerTmp -Encoding UTF8\r\n`
     + `Move-Item -Force -LiteralPath $markerTmp -Destination $markerPath\r\n`
+    + `Write-Output ${psSingleQuote(expectedStdout)}\r\n`;
+  const encodedSetup = utf8Base64(setupScript);
+  const command = `$script=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${encodedSetup}')); & ([ScriptBlock]::Create($script))`;
+  return {
+    command,
+    commandSha256: createHash('sha256').update(command).digest('hex'),
+    expectedStdout,
+  };
+}
+
+/**
+ * Build a one-shot SYSTEM task that restarts a healthy legacy node process only
+ * after its prior upgrade task has disappeared. The restart clears the old
+ * runtime's process-local `upgradeInFlight` latch; the independent rescue task
+ * remains armed while the Server retries the ordinary artifact upgrade.
+ */
+export function buildLegacyWindowsUpgradeRestartCommand(
+  rescueId: string,
+  restartId: string,
+): LegacyWindowsUpgradeRescueCommand {
+  if (!/^[0-9a-f-]{36}$/i.test(rescueId)) throw new Error('invalid_legacy_upgrade_rescue_id');
+  if (!/^[0-9a-f-]{36}$/i.test(restartId)) throw new Error('invalid_legacy_upgrade_restart_id');
+
+  const restartTask = CONTROLLED_NODE_SERVICE.WINDOWS_LEGACY_UPGRADE_RESTART_TASK;
+  const restartScript = `$ErrorActionPreference = 'Stop'\r\n`
+    + WINDOWS_POWERSHELL_UTILITY_MODULE_PREFLIGHT
+    + `Start-Sleep -Seconds 5\r\n`
+    + `$restartTask = ${psSingleQuote(restartTask)}\r\n`
+    + `$nodeDir = Join-Path $env:ProgramData ${psSingleQuote(CONTROLLED_NODE_WINDOWS_INSTALL_DIR)}\r\n`
+    + `$nodePath = Join-Path $nodeDir 'imcodes-node.exe'\r\n`
+    + `$mainTask = ${psSingleQuote(CONTROLLED_NODE_SERVICE.WINDOWS_TASK)}\r\n`
+    + `$watchdogTask = ${psSingleQuote(CONTROLLED_NODE_SERVICE.WINDOWS_WATCHDOG_TASK)}\r\n`
+    + `Stop-ScheduledTask -TaskName $mainTask -ErrorAction SilentlyContinue\r\n`
+    + `Get-CimInstance Win32_Process -Filter \"Name='imcodes-node.exe'\" -ErrorAction SilentlyContinue | Where-Object { [string]::Equals([string]$_.ExecutablePath, $nodePath, [StringComparison]::OrdinalIgnoreCase) -and $_.CommandLine -notmatch '--computer-use-helper' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }\r\n`
+    + `Start-Sleep -Seconds 2\r\n`
+    + `Enable-ScheduledTask -TaskName $mainTask -ErrorAction SilentlyContinue | Out-Null\r\n`
+    + `Enable-ScheduledTask -TaskName $watchdogTask -ErrorAction SilentlyContinue | Out-Null\r\n`
+    + `Start-ScheduledTask -TaskName $mainTask\r\n`
+    + `Unregister-ScheduledTask -TaskName $restartTask -Confirm:$false -ErrorAction SilentlyContinue\r\n`;
+  const restartScriptBase64 = utf16leBase64(restartScript);
+  const expectedStdout = `${LEGACY_WINDOWS_UPGRADE_RESTART_READY_PREFIX}:${restartId}`;
+  const setupScript = `$ErrorActionPreference = 'Stop'\r\n`
+    + WINDOWS_POWERSHELL_UTILITY_MODULE_PREFLIGHT
+    + `$nodeDir = Join-Path $env:ProgramData ${psSingleQuote(CONTROLLED_NODE_WINDOWS_INSTALL_DIR)}\r\n`
+    + `$nodePath = Join-Path $nodeDir 'imcodes-node.exe'\r\n`
+    + `$rescueRoot = Join-Path $env:ProgramData ${psSingleQuote(CONTROLLED_NODE_WINDOWS_LEGACY_UPGRADE_RESCUE_DIR)}\r\n`
+    + `$markerPath = Join-Path $rescueRoot 'marker.json'\r\n`
+    + `if (-not (Test-Path -LiteralPath $markerPath)) { throw 'legacy upgrade restart rescue marker missing' }\r\n`
+    + `$marker = Get-Content -LiteralPath $markerPath -Raw | ConvertFrom-Json\r\n`
+    + `if ([string]$marker.status -cne 'prepared' -or [string]$marker.rescueId -cne ${psSingleQuote(rescueId)}) { throw 'legacy upgrade restart rescue marker mismatch' }\r\n`
+    + `$process = Get-CimInstance Win32_Process -Filter \"Name='imcodes-node.exe'\" -ErrorAction SilentlyContinue | Where-Object { [string]::Equals([string]$_.ExecutablePath, $nodePath, [StringComparison]::OrdinalIgnoreCase) -and $_.CommandLine -notmatch '--computer-use-helper' } | Select-Object -First 1\r\n`
+    + `if (-not $process) { throw 'legacy upgrade restart source process missing' }\r\n`
+    + `if ((Get-FileHash -Algorithm SHA256 -LiteralPath $nodePath).Hash.ToLowerInvariant() -cne [string]$marker.mainSha256) { throw 'legacy upgrade restart source main hash mismatch' }\r\n`
+    + `$upgradePrefix = ${psSingleQuote(CONTROLLED_NODE_WINDOWS_UPGRADE_TASK_PREFIX)}\r\n`
+    + `$rescueTask = ${psSingleQuote(CONTROLLED_NODE_SERVICE.WINDOWS_LEGACY_UPGRADE_RESCUE_TASK)}\r\n`
+    + `$restartTask = ${psSingleQuote(restartTask)}\r\n`
+    + `$otherUpgradeTasks = @(Get-ScheduledTask -TaskName ($upgradePrefix + '*') -ErrorAction Stop | Where-Object { $_.TaskName.StartsWith($upgradePrefix, [StringComparison]::OrdinalIgnoreCase) -and $_.TaskName -notin @($rescueTask, $restartTask) })\r\n`
+    + `if ($otherUpgradeTasks.Count -gt 0) { throw 'legacy upgrade task still registered' }\r\n`
+    + `Stop-ScheduledTask -TaskName $restartTask -ErrorAction SilentlyContinue\r\n`
+    + `Unregister-ScheduledTask -TaskName $restartTask -Confirm:$false -ErrorAction SilentlyContinue\r\n`
+    + `$powershell = Join-Path $env:SystemRoot 'System32\\WindowsPowerShell\\v1.0\\powershell.exe'\r\n`
+    + `$action = New-ScheduledTaskAction -Execute $powershell -Argument ${psSingleQuote(`-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand ${restartScriptBase64}`)}\r\n`
+    + `$trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(5)\r\n`
+    + `$settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 2) -StartWhenAvailable\r\n`
+    + `Register-ScheduledTask -TaskName $restartTask -Action $action -Trigger $trigger -Settings $settings -User 'SYSTEM' -RunLevel Highest -Force | Out-Null\r\n`
+    + `$registered = Get-ScheduledTask -TaskName $restartTask\r\n`
+    + `if (-not $registered -or -not $registered.Settings.Enabled -or @($registered.Actions).Count -ne 1 -or [string]$registered.Actions[0].Execute -ne $powershell -or [string]$registered.Principal.UserId -notin @('SYSTEM','S-1-5-18')) { throw 'legacy upgrade restart task verification failed' }\r\n`
+    + `Start-ScheduledTask -TaskName $restartTask\r\n`
     + `Write-Output ${psSingleQuote(expectedStdout)}\r\n`;
   const encodedSetup = utf8Base64(setupScript);
   const command = `$script=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${encodedSetup}')); & ([ScriptBlock]::Create($script))`;

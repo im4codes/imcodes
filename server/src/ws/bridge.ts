@@ -81,7 +81,9 @@ import {
 } from '../../../shared/controlled-node-service.js';
 import {
   buildLegacyWindowsUpgradeRescueCommand,
+  buildLegacyWindowsUpgradeRestartCommand,
   LEGACY_WINDOWS_UPGRADE_RESCUE_EXEC_TIMEOUT_MS,
+  LEGACY_WINDOWS_UPGRADE_RESTART_EXEC_TIMEOUT_MS,
 } from './windows-controlled-node-upgrade-rescue.js';
 import { REPO_MSG, REPO_RELAY_TYPES } from '../../../shared/repo-types.js';
 import { TRANSPORT_RELAY_TYPES, TRANSPORT_MSG } from '../../../shared/transport-events.js';
@@ -171,6 +173,7 @@ import {
   DAEMON_UPGRADE_BLOCKED_SYNC_PROTOCOL,
   DAEMON_UPGRADE_BLOCK_REASON,
   DAEMON_UPGRADE_DELIVERY_STATUS,
+  validateControlledNodeUpgradeBlockedMessage,
   type DaemonUpgradeBlockedAckDisposition,
 } from '../../../shared/daemon-upgrade.js';
 import {
@@ -282,7 +285,10 @@ const DAEMON_UPGRADE_BLOCKED_FAILURE_DEDUP_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const DAEMON_UPGRADE_BLOCKED_FAILURE_DEDUP_MAX = 1_000;
 const LEGACY_UPGRADE_RESCUE_RETRY_BASE_MS = 60_000;
 const LEGACY_UPGRADE_RESCUE_RETRY_MAX_MS = 15 * 60_000;
+const LEGACY_UPGRADE_RESTART_RETRY_BASE_MS = 60_000;
+const LEGACY_UPGRADE_RESTART_RETRY_MAX_MS = 5 * 60_000;
 const DAEMON_UPGRADE_TRANSIENT_BLOCK_REASONS = new Set([
+  DAEMON_UPGRADE_BLOCK_REASON.ALREADY_IN_PROGRESS,
   'p2p_active',
   'auto_deliver_active',
   'master_compaction_active',
@@ -1195,6 +1201,11 @@ export class WsBridge {
     attempts: number;
     inFlight: boolean;
     timer: ReturnType<typeof setTimeout> | null;
+    preparedRescueId: string | null;
+    restartAttempts: number;
+    restartInFlight: boolean;
+    restartTimer: ReturnType<typeof setTimeout> | null;
+    restartCoordinatorPrepared: boolean;
   } | null = null;
   private daemonUpgradeCoordinator = new DaemonUpgradeCoordinator();
   private browserSockets = new Set<WebSocket>();
@@ -2950,6 +2961,18 @@ export class WsBridge {
       // trigger APNs/FCM. Client-declared role is irrelevant — `daemonNodeRole` is
       // DB-authoritative (set during auth).
       if (this.daemonNodeRole === NODE_ROLE.CONTROLLED) {
+        if (msg.type === DAEMON_MSG.UPGRADE_BLOCKED) {
+          const blocked = validateControlledNodeUpgradeBlockedMessage(msg);
+          if (!blocked.ok) {
+            WsBridge.controlledInboundDropped++;
+            return;
+          }
+          this.handleDaemonUpgradeBlocked(
+            blocked.value,
+            ws,
+          );
+          return;
+        }
         if (msg.type === DAEMON_MSG.MACHINE_EXEC_CHUNK) {
           if (!this.resolveValidatedMachineExecChunk(msg)) {
             WsBridge.controlledInboundDropped++;
@@ -6533,7 +6556,22 @@ export class WsBridge {
       return false;
     }
 
-    const retryDelayMs = this.daemonUpgradeBlockedRetryDelayMs(msg);
+    if (
+      msg.reason === DAEMON_UPGRADE_BLOCK_REASON.ALREADY_IN_PROGRESS
+      && this.requiresLegacyWindowsUpgradeRescue()
+      && this.legacyUpgradeRescuePreparedGeneration === this.daemonGeneration
+    ) {
+      this.ensureLegacyWindowsUpgradeRestart(ws);
+      return true;
+    }
+
+    // Controlled nodes intentionally expose only the minimal { type, reason }
+    // blocker envelope. They cannot provide the lifecycle identity and ACK
+    // metadata that make terminal failure handling safe for full daemons, so a
+    // short node-side failure must remain automatically retryable.
+    const retryDelayMs = this.daemonNodeRole === NODE_ROLE.CONTROLLED
+      ? DAEMON_UPGRADE_BLOCKED_RETRY_MS
+      : this.daemonUpgradeBlockedRetryDelayMs(msg);
     if (retryDelayMs == null) {
       const replayBeforeSync = this.upgradeBlockedSyncRequiredGeneration === this.daemonGeneration
         && this.upgradeBlockedSyncCompleteGeneration !== this.daemonGeneration;
@@ -6732,8 +6770,21 @@ export class WsBridge {
     if (this.legacyUpgradeRescuePreparation?.timer) {
       clearTimeout(this.legacyUpgradeRescuePreparation.timer);
     }
+    if (this.legacyUpgradeRescuePreparation?.restartTimer) {
+      clearTimeout(this.legacyUpgradeRescuePreparation.restartTimer);
+    }
     this.legacyUpgradeRescuePreparation = this.requiresLegacyWindowsUpgradeRescue()
-      ? { generation, attempts: 0, inFlight: false, timer: null }
+      ? {
+        generation,
+        attempts: 0,
+        inFlight: false,
+        timer: null,
+        preparedRescueId: null,
+        restartAttempts: 0,
+        restartInFlight: false,
+        restartTimer: null,
+        restartCoordinatorPrepared: false,
+      }
       : null;
     this.legacyUpgradeRescuePreparedGeneration = this.requiresLegacyWindowsUpgradeRescue()
       ? null
@@ -6837,6 +6888,7 @@ export class WsBridge {
         || !this.needsLegacyWindowsUpgradeRescue()
       ) throw new Error('legacy_upgrade_rescue_generation_changed_after_dispatch');
       this.legacyUpgradeRescuePreparedGeneration = generation;
+      state.preparedRescueId = rescueId;
       await this.persistLegacyUpgradeRescueAudit(CONTROLLED_NODE_UPGRADE_RESCUE_AUDIT_ACTION.RESULT, {
         generation,
         rescueId,
@@ -6870,6 +6922,140 @@ export class WsBridge {
         this.ensureLegacyWindowsUpgradeRescue();
       }, retryMs);
       state.timer.unref?.();
+    });
+  }
+
+  /**
+   * A deployed legacy runtime keeps `upgradeInFlight` true after it successfully
+   * schedules a detached task, even when that task later fails before replacing
+   * the process. Once the same generation reports `already_in_progress`, use a
+   * separately verified SYSTEM task to restart only the node process. The
+   * rescue backup remains armed and the replacement generation receives the
+   * ordinary signed artifact upgrade again.
+   */
+  private ensureLegacyWindowsUpgradeRestart(ws: WebSocket): void {
+    const state = this.legacyUpgradeRescuePreparation;
+    const generation = this.daemonGeneration;
+    if (
+      !state
+      || state.generation !== generation
+      || this.daemonWs !== ws
+      || !this.authenticated
+      || this.legacyUpgradeRescuePreparedGeneration !== generation
+      || !state.preparedRescueId
+      || state.restartInFlight
+      || state.restartTimer
+    ) return;
+
+    state.restartInFlight = true;
+    state.restartAttempts += 1;
+    const restartId = randomUUID();
+    const prepared = buildLegacyWindowsUpgradeRestartCommand(state.preparedRescueId, restartId);
+    const correlationId = `upgrade-restart-${restartId}`;
+    const checked = validateMachineExecFrame({
+      type: DAEMON_COMMAND_TYPES.MACHINE_EXEC,
+      correlationId,
+      idempotencyKey: correlationId,
+      command: prepared.command,
+      shell: 'powershell',
+      timeoutMs: LEGACY_WINDOWS_UPGRADE_RESTART_EXEC_TIMEOUT_MS,
+    });
+    if (!checked.ok) {
+      state.restartInFlight = false;
+      logger.error({ serverId: this.serverId, error: checked.error }, 'Legacy upgrade restart command failed local validation');
+      return;
+    }
+
+    const scheduleRetry = (): void => {
+      if (
+        this.daemonWs !== ws
+        || this.daemonGeneration !== generation
+        || !this.authenticated
+        || this.legacyUpgradeRescuePreparedGeneration !== generation
+      ) return;
+      const retryMs = Math.min(
+        LEGACY_UPGRADE_RESTART_RETRY_MAX_MS,
+        LEGACY_UPGRADE_RESTART_RETRY_BASE_MS * (2 ** Math.min(2, state.restartAttempts - 1)),
+      );
+      state.restartTimer = setTimeout(() => {
+        state.restartTimer = null;
+        this.ensureLegacyWindowsUpgradeRestart(ws);
+      }, retryMs);
+      state.restartTimer.unref?.();
+    };
+
+    void (async () => {
+      await this.persistLegacyUpgradeRescueAudit(CONTROLLED_NODE_UPGRADE_RESCUE_AUDIT_ACTION.RESTART_INTENT, {
+        generation,
+        rescueId: state.preparedRescueId,
+        restartId,
+        attempt: state.restartAttempts,
+        commandSha256: prepared.commandSha256,
+      });
+      if (
+        this.daemonWs !== ws
+        || this.daemonGeneration !== generation
+        || !this.authenticated
+        || this.legacyUpgradeRescuePreparedGeneration !== generation
+      ) throw new Error('legacy_upgrade_restart_generation_changed_before_dispatch');
+      if (!state.restartCoordinatorPrepared) {
+        if (!this.daemonUpgradeCoordinator.prepareRetryAfterDaemonRestart()) {
+          throw new Error('legacy_upgrade_restart_lifecycle_not_sent');
+        }
+        state.restartCoordinatorPrepared = true;
+      }
+      const pending = registerPendingExec(
+        this.serverId,
+        correlationId,
+        generation,
+        LEGACY_WINDOWS_UPGRADE_RESTART_EXEC_TIMEOUT_MS + 30_000,
+      );
+      const sent = this.trySendMachineExec(
+        JSON.stringify({ type: DAEMON_COMMAND_TYPES.MACHINE_EXEC, ...checked.value }),
+        generation,
+      );
+      if (sent !== 'sent') {
+        cancelPendingExec(correlationId);
+        throw new Error(`legacy_upgrade_restart_${sent}`);
+      }
+      const result = await pending;
+      if (!result) throw new Error('legacy_upgrade_restart_result_missing');
+      if (
+        result.ok !== true
+        || result.exitCode !== 0
+        || result.timedOut === true
+        || result.truncated === true
+        || result.error !== undefined
+        || result.stderr.trim() !== ''
+        || result.stdout.trim() !== prepared.expectedStdout
+      ) throw new Error('legacy_upgrade_restart_verification_failed');
+      if (
+        this.daemonWs !== ws
+        || this.daemonGeneration !== generation
+        || !this.authenticated
+        || this.legacyUpgradeRescuePreparedGeneration !== generation
+      ) throw new Error('legacy_upgrade_restart_generation_changed_after_dispatch');
+      await this.persistLegacyUpgradeRescueAudit(CONTROLLED_NODE_UPGRADE_RESCUE_AUDIT_ACTION.RESTART_RESULT, {
+        generation,
+        rescueId: state.preparedRescueId,
+        restartId,
+        attempt: state.restartAttempts,
+        outcome: 'scheduled',
+      });
+      state.restartInFlight = false;
+      scheduleRetry();
+    })().catch((error) => {
+      state.restartInFlight = false;
+      void this.persistLegacyUpgradeRescueAudit(CONTROLLED_NODE_UPGRADE_RESCUE_AUDIT_ACTION.RESTART_RESULT, {
+        generation,
+        rescueId: state.preparedRescueId,
+        restartId,
+        attempt: state.restartAttempts,
+        outcome: 'failed',
+        reason: error instanceof Error ? error.message : 'legacy_upgrade_restart_failed',
+      }).catch((auditError) => logger.error({ auditError, serverId: this.serverId }, 'Legacy upgrade restart result audit failed'));
+      logger.warn({ error, serverId: this.serverId }, 'Legacy Windows upgrade restart failed; keeping old node online');
+      scheduleRetry();
     });
   }
 

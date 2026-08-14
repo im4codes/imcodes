@@ -256,6 +256,26 @@ export class DaemonUpgradeCoordinator {
   }
 
   /**
+   * A legacy controlled node acknowledged an earlier upgrade but its detached
+   * task failed before replacing the process, leaving a process-local latch set.
+   * The Server is about to restart that exact node generation; keep the same
+   * lifecycle pending and let the replacement generation retry immediately.
+   */
+  prepareRetryAfterDaemonRestart(now = Date.now()): boolean {
+    const state = this.current;
+    if (!state || state.status !== 'sent') return false;
+    if (state.timer) clearTimeout(state.timer);
+    state.timer = null;
+    state.status = 'pending_offline';
+    state.attempt = 0;
+    state.updatedAt = now;
+    state.publicationResumeInput = null;
+    state.publicationCallbackRegistered = false;
+    if (state.source === 'auto') this.lastAutoSentAt = null;
+    return true;
+  }
+
+  /**
    * Cancel any pending send and keep the failed target terminally blocked.
    * Auto/replay requests for the same target remain blocked; an explicit manual
    * request or a different target version creates a fresh lifecycle.

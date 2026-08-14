@@ -56,7 +56,10 @@ import {
 } from '../src/ws/machine-exec-registry.js';
 import { CONTROLLED_NODE_OS_LINUX, CONTROLLED_NODE_OS_WIN, type ControlledNodeOs } from '../../shared/controlled-node-artifacts.js';
 import { CONTROLLED_NODE_SAFE_SELF_UPGRADE_CAPABILITY } from '../../shared/controlled-node-service.js';
-import { LEGACY_WINDOWS_UPGRADE_RESCUE_READY_PREFIX } from '../src/ws/windows-controlled-node-upgrade-rescue.js';
+import {
+  LEGACY_WINDOWS_UPGRADE_RESCUE_READY_PREFIX,
+  LEGACY_WINDOWS_UPGRADE_RESTART_READY_PREFIX,
+} from '../src/ws/windows-controlled-node-upgrade-rescue.js';
 
 // ── Mock WebSocket ─────────────────────────────────────────────────────────────
 
@@ -620,6 +623,190 @@ describe('WsBridge', () => {
       await flushAsync();
       expect(ws.sentStrings.filter((message) => message.includes('"type":"machine.exec"'))).toHaveLength(2);
       expect(ws.sentStrings.some((message) => message.includes('"type":"daemon.upgrade"'))).toBe(false);
+    });
+
+    it('automatically restarts a legacy Windows node with a stale upgrade latch and retries on the replacement generation', async () => {
+      vi.useFakeTimers();
+      process.env.APP_VERSION = '2026.8.3409-dev.3847';
+
+      const bridge = WsBridge.get(serverId);
+      const firstWs = new MockWs();
+      bridge.handleDaemonConnection(
+        firstWs as never,
+        makeDb('valid-hash', 'controlled', CONTROLLED_NODE_OS_WIN),
+        {} as never,
+      );
+      firstWs.emit('message', JSON.stringify({
+        type: 'auth', serverId, token: 'my-token', daemonVersion: '0.1.3-rework.v94', capabilities: [],
+      }));
+      await flushAsync();
+
+      const firstRescue = firstWs.sentStrings
+        .map((message) => JSON.parse(message) as Record<string, unknown>)
+        .find((message) => message.type === DAEMON_COMMAND_TYPES.MACHINE_EXEC)!;
+      const firstRescueId = String(firstRescue.correlationId).replace(/^upgrade-rescue-/, '');
+      firstWs.emit('message', JSON.stringify({
+        type: DAEMON_MSG.UPGRADE_BLOCKED,
+        reason: DAEMON_UPGRADE_BLOCK_REASON.ALREADY_IN_PROGRESS,
+      }));
+      await flushAsync();
+      expect(firstWs.sentStrings
+        .map((message) => JSON.parse(message) as Record<string, unknown>)
+        .filter((message) => typeof message.correlationId === 'string'
+          && message.correlationId.startsWith('upgrade-restart-')))
+        .toHaveLength(0);
+
+      firstWs.emit('message', JSON.stringify({
+        type: DAEMON_MSG.MACHINE_EXEC_RESULT,
+        correlationId: firstRescue.correlationId,
+        ok: true,
+        exitCode: 0,
+        stdout: `${LEGACY_WINDOWS_UPGRADE_RESCUE_READY_PREFIX}:${firstRescueId}\r\n`,
+        stderr: '',
+        truncated: false,
+        timedOut: false,
+        durationMs: 100,
+      }));
+      await flushAsync();
+      await vi.advanceTimersByTimeAsync(5_000);
+      await flushAsync();
+
+      const firstUpgrade = firstWs.sentStrings
+        .map((message) => JSON.parse(message) as Record<string, unknown>)
+        .find((message) => message.type === DAEMON_COMMAND_TYPES.DAEMON_UPGRADE)!;
+      expect(firstUpgrade.upgradeId).toEqual(expect.any(String));
+
+      firstWs.emit('message', JSON.stringify({
+        type: DAEMON_MSG.UPGRADE_BLOCKED,
+        reason: 'fetch failed',
+      }));
+      await flushAsync();
+      expect(firstWs.sentStrings
+        .map((message) => JSON.parse(message) as Record<string, unknown>)
+        .filter((message) => typeof message.correlationId === 'string'
+          && message.correlationId.startsWith('upgrade-restart-')))
+        .toHaveLength(0);
+      await vi.advanceTimersByTimeAsync(60_000);
+      await flushAsync();
+      expect(firstWs.sentStrings
+        .map((message) => JSON.parse(message) as Record<string, unknown>)
+        .filter((message) => message.type === DAEMON_COMMAND_TYPES.DAEMON_UPGRADE))
+        .toEqual([
+          expect.objectContaining({ upgradeId: firstUpgrade.upgradeId }),
+          expect.objectContaining({ upgradeId: firstUpgrade.upgradeId }),
+        ]);
+
+      firstWs.emit('message', JSON.stringify({
+        type: DAEMON_MSG.UPGRADE_BLOCKED,
+        reason: DAEMON_UPGRADE_BLOCK_REASON.ALREADY_IN_PROGRESS,
+      }));
+      await flushAsync();
+      const firstRestartFrame = firstWs.sentStrings
+        .map((message) => JSON.parse(message) as Record<string, unknown>)
+        .find((message) => typeof message.correlationId === 'string'
+          && message.correlationId.startsWith('upgrade-restart-'))!;
+      expect(firstRestartFrame).toMatchObject({ shell: 'powershell', timeoutMs: 120_000 });
+      firstWs.emit('message', JSON.stringify({
+        type: DAEMON_MSG.MACHINE_EXEC_RESULT,
+        correlationId: firstRestartFrame.correlationId,
+        ok: false,
+        exitCode: null,
+        stdout: '',
+        stderr: 'task registration failed',
+        error: 'task registration failed',
+        truncated: false,
+        timedOut: false,
+        durationMs: 100,
+      }));
+      await flushAsync();
+      await vi.advanceTimersByTimeAsync(60_000);
+      await flushAsync();
+
+      const restartFrames = firstWs.sentStrings
+        .map((message) => JSON.parse(message) as Record<string, unknown>)
+        .filter((message) => typeof message.correlationId === 'string'
+          && message.correlationId.startsWith('upgrade-restart-'));
+      expect(restartFrames).toHaveLength(2);
+      const restartFrame = restartFrames[1]!;
+      const restartId = String(restartFrame.correlationId).replace(/^upgrade-restart-/, '');
+      firstWs.emit('message', JSON.stringify({
+        type: DAEMON_MSG.MACHINE_EXEC_RESULT,
+        correlationId: restartFrame.correlationId,
+        ok: true,
+        exitCode: 0,
+        stdout: `${LEGACY_WINDOWS_UPGRADE_RESTART_READY_PREFIX}:${restartId}\r\n`,
+        stderr: '',
+        truncated: false,
+        timedOut: false,
+        durationMs: 100,
+      }));
+      await flushAsync();
+
+      firstWs.emit('close');
+      const replacementWs = new MockWs();
+      bridge.handleDaemonConnection(
+        replacementWs as never,
+        makeDb('valid-hash', 'controlled', CONTROLLED_NODE_OS_WIN),
+        {} as never,
+      );
+      replacementWs.emit('message', JSON.stringify({
+        type: 'auth', serverId, token: 'my-token', daemonVersion: '0.1.3-rework.v94', capabilities: [],
+      }));
+      await flushAsync();
+
+      const replacementRescue = replacementWs.sentStrings
+        .map((message) => JSON.parse(message) as Record<string, unknown>)
+        .find((message) => message.type === DAEMON_COMMAND_TYPES.MACHINE_EXEC)!;
+      const replacementRescueId = String(replacementRescue.correlationId).replace(/^upgrade-rescue-/, '');
+      replacementWs.emit('message', JSON.stringify({
+        type: DAEMON_MSG.MACHINE_EXEC_RESULT,
+        correlationId: replacementRescue.correlationId,
+        ok: true,
+        exitCode: 0,
+        stdout: `${LEGACY_WINDOWS_UPGRADE_RESCUE_READY_PREFIX}:${replacementRescueId}\r\n`,
+        stderr: '',
+        truncated: false,
+        timedOut: false,
+        durationMs: 100,
+      }));
+      await flushAsync();
+      await vi.advanceTimersByTimeAsync(5_000);
+      await flushAsync();
+
+      expect(replacementWs.sentStrings
+        .map((message) => JSON.parse(message) as Record<string, unknown>)
+        .filter((message) => message.type === DAEMON_COMMAND_TYPES.DAEMON_UPGRADE))
+        .toEqual([expect.objectContaining({
+          upgradeId: firstUpgrade.upgradeId,
+          targetVersion: process.env.APP_VERSION,
+        })]);
+    });
+
+    it('drops controlled-node upgrade blocker frames with extra keys', async () => {
+      process.env.APP_VERSION = '2026.8.3409-dev.3847';
+      const before = WsBridge.controlledInboundDropped;
+      const bridge = WsBridge.get(serverId);
+      const ws = new MockWs();
+      bridge.handleDaemonConnection(
+        ws as never,
+        makeDb('valid-hash', 'controlled', CONTROLLED_NODE_OS_WIN),
+        {} as never,
+      );
+      ws.emit('message', JSON.stringify({
+        type: 'auth', serverId, token: 'my-token', daemonVersion: '0.1.3-rework.v94', capabilities: [],
+      }));
+      await flushAsync();
+      const machineExecCount = ws.sentStrings.filter((message) => message.includes('"type":"machine.exec"')).length;
+
+      ws.emit('message', JSON.stringify({
+        type: DAEMON_MSG.UPGRADE_BLOCKED,
+        reason: DAEMON_UPGRADE_BLOCK_REASON.ALREADY_IN_PROGRESS,
+        extra: true,
+      }));
+      await flushAsync();
+
+      expect(WsBridge.controlledInboundDropped).toBe(before + 1);
+      expect(ws.sentStrings.filter((message) => message.includes('"type":"machine.exec"'))).toHaveLength(machineExecCount);
     });
 
     it('sends daemon.upgrade when daemon is newer than server version so versions converge exactly', async () => {

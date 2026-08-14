@@ -1,6 +1,7 @@
 import WebSocket from 'ws';
 import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
 import { DAEMON_MSG } from '../../shared/daemon-events.js';
+import { DAEMON_UPGRADE_BLOCK_REASON } from '../../shared/daemon-upgrade.js';
 import { DAEMON_VERSION } from '../util/version.js';
 import { AuthenticatedWebSocketClient, type AuthenticatedWebSocketFactory } from '../transport/authenticated-websocket.js';
 import { MachineExecWorker } from './machine-exec-worker.js';
@@ -196,7 +197,10 @@ export function createControlledNodeRuntime(
       }
       if (message.type === DAEMON_COMMAND_TYPES.DAEMON_UPGRADE) {
         if (upgradeInFlight) {
-          client.send({ type: DAEMON_MSG.UPGRADE_BLOCKED, reason: 'already_in_progress' });
+          client.send({
+            type: DAEMON_MSG.UPGRADE_BLOCKED,
+            reason: DAEMON_UPGRADE_BLOCK_REASON.ALREADY_IN_PROGRESS,
+          });
           return;
         }
         upgradeInFlight = true;

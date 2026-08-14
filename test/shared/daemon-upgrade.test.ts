@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { normalizeDaemonUpgradeTargetVersion } from '../../shared/daemon-upgrade.js';
+import { DAEMON_MSG } from '../../shared/daemon-events.js';
+import {
+  DAEMON_UPGRADE_BLOCK_REASON,
+  normalizeDaemonUpgradeTargetVersion,
+  validateControlledNodeUpgradeBlockedMessage,
+} from '../../shared/daemon-upgrade.js';
 
 describe('daemon upgrade target validation', () => {
   it('accepts latest, semver, and dev calver targets', () => {
@@ -20,5 +25,44 @@ describe('daemon upgrade target validation', () => {
     ]) {
       expect(() => normalizeDaemonUpgradeTargetVersion(value)).toThrow('invalid_target_version');
     }
+  });
+});
+
+describe('controlled-node upgrade blocker validation', () => {
+  it('accepts only the exact bounded minimal frame', () => {
+    expect(validateControlledNodeUpgradeBlockedMessage({
+      type: DAEMON_MSG.UPGRADE_BLOCKED,
+      reason: DAEMON_UPGRADE_BLOCK_REASON.ALREADY_IN_PROGRESS,
+    })).toEqual({
+      ok: true,
+      value: {
+        type: DAEMON_MSG.UPGRADE_BLOCKED,
+        reason: DAEMON_UPGRADE_BLOCK_REASON.ALREADY_IN_PROGRESS,
+      },
+    });
+
+    expect(validateControlledNodeUpgradeBlockedMessage({
+      type: DAEMON_MSG.UPGRADE_BLOCKED,
+      reason: DAEMON_UPGRADE_BLOCK_REASON.ALREADY_IN_PROGRESS,
+      extra: true,
+    })).toEqual({ ok: false });
+    expect(validateControlledNodeUpgradeBlockedMessage({
+      type: DAEMON_MSG.UPGRADE_BLOCKED,
+      reason: '',
+    })).toEqual({ ok: false });
+    expect(validateControlledNodeUpgradeBlockedMessage({
+      type: DAEMON_MSG.UPGRADE_BLOCKED,
+      reason: 123,
+    })).toEqual({ ok: false });
+    expect(validateControlledNodeUpgradeBlockedMessage({
+      type: DAEMON_MSG.UPGRADE_BLOCKED,
+      reason: 'x'.repeat(129),
+    })).toEqual({
+      ok: true,
+      value: {
+        type: DAEMON_MSG.UPGRADE_BLOCKED,
+        reason: 'x'.repeat(128),
+      },
+    });
   });
 });

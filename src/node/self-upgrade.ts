@@ -17,6 +17,7 @@ import {
   type ControlledNodeOs,
 } from '../../shared/controlled-node-artifacts.js';
 import { DAEMON_UPGRADE_TARGET_LATEST, normalizeDaemonUpgradeTargetVersion } from '../../shared/daemon-upgrade.js';
+import { CONTROLLED_NODE_WINDOWS_UPGRADE_TASK_PREFIX } from '../../shared/controlled-node-service.js';
 import { REMOTE_DESKTOP_PROTOCOL_VERSION } from '../../shared/remote-desktop.js';
 import {
   REMOTE_DESKTOP_WORKER_FILENAME,
@@ -830,7 +831,7 @@ export async function startControlledNodeSelfUpgrade(
     ? join(updateDir, 'upgrade.ps1')
     : join(updateDir, 'upgrade.sh');
   const windowsUpgradeTaskName = platform === 'win32'
-    ? `${CONTROLLED_NODE_SERVICE.WINDOWS_TASK}-upgrade-${randomUUID()}`
+    ? `${CONTROLLED_NODE_WINDOWS_UPGRADE_TASK_PREFIX}${randomUUID()}`
     : undefined;
   const script = platform === 'win32'
     ? buildWindowsControlledNodeUpgradeScript({

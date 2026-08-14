@@ -6,6 +6,8 @@ export const CONTROLLED_NODE_SERVICE = {
   WINDOWS_WATCHDOG_TASK: 'imcodes-node-watchdog',
   /** First-hop rescue task used while a legacy Windows upgrader replaces itself. */
   WINDOWS_LEGACY_UPGRADE_RESCUE_TASK: 'imcodes-node-upgrade-rescue',
+  /** One-shot task that clears a legacy process's stale in-memory upgrade latch. */
+  WINDOWS_LEGACY_UPGRADE_RESTART_TASK: 'imcodes-node-upgrade-restart',
   /** macOS LaunchDaemon label (full daemon uses `imcodes.daemon`). */
   MACOS_LABEL: 'cc.imcodes.node',
   /** Separate periodic authenticated-health supervisor for the macOS daemon. */
@@ -16,6 +18,7 @@ export const CONTROLLED_NODE_SERVICE = {
 
 export const CONTROLLED_NODE_WINDOWS_INSTALL_DIR = 'imcodes-node' as const;
 export const CONTROLLED_NODE_WINDOWS_LEGACY_UPGRADE_RESCUE_DIR = 'imcodes-node-upgrade-rescue' as const;
+export const CONTROLLED_NODE_WINDOWS_UPGRADE_TASK_PREFIX = 'imcodes-node-upgrade-' as const;
 
 /** New nodes advertise that their own self-upgrade script has backup/health rollback semantics. */
 export const CONTROLLED_NODE_SAFE_SELF_UPGRADE_CAPABILITY = 'controlled-node.safe-self-upgrade.v2' as const;
@@ -23,4 +26,6 @@ export const CONTROLLED_NODE_SAFE_SELF_UPGRADE_CAPABILITY = 'controlled-node.saf
 export const CONTROLLED_NODE_UPGRADE_RESCUE_AUDIT_ACTION = {
   INTENT: 'controlled_node.upgrade_rescue.intent',
   RESULT: 'controlled_node.upgrade_rescue.result',
+  RESTART_INTENT: 'controlled_node.upgrade_rescue.restart_intent',
+  RESTART_RESULT: 'controlled_node.upgrade_rescue.restart_result',
 } as const;
