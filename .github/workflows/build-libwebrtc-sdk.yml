@@ -2,14 +2,26 @@ name: build-libwebrtc-sdk
 
 on:
   workflow_dispatch:
-    inputs:
-      source_commit:
-        description: Full source commit represented by this immutable SDK
-        required: true
-        type: string
+  push:
+    branches: [dev]
+    paths:
+      - shared/remote-desktop-native-pins.json
+      - native/windows-remote-desktop/sdk.BUILD.gn
+      - native/windows-remote-desktop/libwebrtc-sdk.gni
+      - native/windows-remote-desktop/sdk_anchor.cc
+      - native/windows-remote-desktop/load-native-pins.ps1
+      - native/windows-remote-desktop/initialize-hermetic-windows-git.ps1
+      - native/windows-remote-desktop/invoke-native-logged.ps1
+      - native/windows-remote-desktop/build-libwebrtc-sdk.ps1
+      - native/windows-remote-desktop/generate-libwebrtc-sdk-notices.py
+      - scripts/libwebrtc-sdk-artifacts.mjs
+      - scripts/promote-libwebrtc-sdk.mjs
+      - scripts/publish-libwebrtc-sdk.mjs
+      - scripts/windows-libwebrtc-sdk-archive.ps1
+      - .github/workflows/build-libwebrtc-sdk.yml
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: build-libwebrtc-sdk-windows-x64
@@ -20,11 +32,13 @@ env:
 
 jobs:
   build:
-    name: Build fixed Windows libwebrtc SDK
+    name: Build immutable Windows libwebrtc foundation SDK
     runs-on: windows-2022
     timeout-minutes: 240
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ env.NODE_VERSION_PRIMARY }}
@@ -32,78 +46,48 @@ jobs:
       - name: Install dependencies
         shell: bash
         run: ./scripts/ci-npm-ci.sh .
+      - name: Resolve SDK foundation cache identity
+        id: sdk_foundation
+        shell: bash
+        run: echo "source_sha256=$(node scripts/libwebrtc-sdk-artifacts.mjs fingerprint)" >> "$GITHUB_OUTPUT"
+      - name: Restore exported libwebrtc foundation SDK
+        id: sdk_foundation_cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/imcodes-libwebrtc-sdk
+          key: imcodes-libwebrtc-foundation-windows-2022-${{ steps.sdk_foundation.outputs.source_sha256 }}-v1
       - name: Restore pinned depot_tools and CIPD bootstrap
+        if: steps.sdk_foundation_cache.outputs.cache-hit != 'true'
         uses: actions/cache@v4
         with:
           path: ${{ runner.temp }}/imcodes-webrtc/depot_tools
-          key: imcodes-depot-tools-windows-2022-a1bda5b6167435ad0666191f0353f242104f5845-v1
-      - name: Import Windows release-signing certificate
-        shell: powershell
-        env:
-          IMCODES_WINDOWS_SIGNING_PFX_BASE64: ${{ secrets.IMCODES_WINDOWS_SIGNING_PFX_BASE64 }}
-          IMCODES_WINDOWS_SIGNING_PFX_PASSWORD: ${{ secrets.IMCODES_WINDOWS_SIGNING_PFX_PASSWORD }}
-        run: |
-          if ([string]::IsNullOrWhiteSpace($env:IMCODES_WINDOWS_SIGNING_PFX_BASE64) -or
-              [string]::IsNullOrWhiteSpace($env:IMCODES_WINDOWS_SIGNING_PFX_PASSWORD)) {
-            throw 'Windows release-signing secrets are required.'
-          }
-          $pfxPath = Join-Path $env:RUNNER_TEMP 'imcodes-windows-release-signing.pfx'
-          [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:IMCODES_WINDOWS_SIGNING_PFX_BASE64))
-          $password = ConvertTo-SecureString $env:IMCODES_WINDOWS_SIGNING_PFX_PASSWORD -AsPlainText -Force
-          $certificate = Import-PfxCertificate -FilePath $pfxPath -CertStoreLocation Cert:\CurrentUser\My -Password $password
-          if (-not $certificate -or -not $certificate.HasPrivateKey) { throw 'Imported signing certificate has no private key.' }
-          Remove-Item -LiteralPath $pfxPath -Force
-          $publicCertificatePath = Join-Path $env:RUNNER_TEMP 'imcodes-windows-release-signing.cer'
-          Export-Certificate -Cert $certificate -FilePath $publicCertificatePath -Force | Out-Null
-          Import-Certificate -FilePath $publicCertificatePath -CertStoreLocation Cert:\LocalMachine\TrustedPeople | Out-Null
-          Import-Certificate -FilePath $publicCertificatePath -CertStoreLocation Cert:\LocalMachine\TrustedPublisher | Out-Null
-          "IMCODES_WINDOWS_SIGNING_CERT_THUMBPRINT=$($certificate.Thumbprint)" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
-          $sha256 = [Security.Cryptography.SHA256]::Create()
-          try { $signerSha256 = [BitConverter]::ToString($sha256.ComputeHash($certificate.RawData)).Replace('-', '').ToLowerInvariant() } finally { $sha256.Dispose() }
-          "IMCODES_WINDOWS_SIGNING_CERT_SHA256=$signerSha256" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
-      - name: Build and test pinned production media stack once
+          key: imcodes-depot-tools-windows-2022-${{ hashFiles('shared/remote-desktop-native-pins.json') }}-v2
+      - name: Build the dependency-only SDK
+        if: steps.sdk_foundation_cache.outputs.cache-hit != 'true'
         shell: powershell
         run: |
-          $arguments = @{
-            CheckoutRoot = "$env:RUNNER_TEMP\imcodes-webrtc"
-            ArtifactRoot = 'dist-node-exe\remote-desktop-worker\win32-x64'
-            Jobs = 4
-            WorkerVersion = '0.0.0-sdk'
-            CodeSigningCertificateThumbprint = $env:IMCODES_WINDOWS_SIGNING_CERT_THUMBPRINT
-            CodeSigningTimestampUrl = 'http://timestamp.digicert.com'
-            RequireAuthenticodeSignature = $true
-            RunNativeTests = $true
-          }
-          & .\native\windows-remote-desktop\build-worker.ps1 @arguments
-      - name: Package immutable libwebrtc SDK and lock
+          & .\native\windows-remote-desktop\build-libwebrtc-sdk.ps1 `
+            -CheckoutRoot "$env:RUNNER_TEMP\imcodes-webrtc" `
+            -ArtifactRoot "$env:RUNNER_TEMP\imcodes-libwebrtc-sdk" `
+            -Jobs 4
+      - name: Verify restored libwebrtc foundation SDK
+        if: steps.sdk_foundation_cache.outputs.cache-hit == 'true'
+        run: node scripts/libwebrtc-sdk-artifacts.mjs verify "${{ runner.temp }}\imcodes-libwebrtc-sdk"
+      - name: Package and verify the immutable SDK
+        id: sdk
         shell: powershell
         run: |
           node scripts/publish-libwebrtc-sdk.mjs `
-            dist-node-exe `
+            "$env:RUNNER_TEMP\imcodes-libwebrtc-sdk" `
             sdk-release `
-            '${{ inputs.source_commit }}'
-          node scripts/libwebrtc-sdk-artifacts.mjs verify-lock sdk-release/libwebrtc-sdk.lock.json sdk-release/imcodes-libwebrtc-sdk-windows-x64.zip
-          $lock = Get-Content -LiteralPath sdk-release\libwebrtc-sdk.lock.json -Raw | ConvertFrom-Json
-          "release_tag=$($lock.releaseTag)" | Out-File $env:GITHUB_OUTPUT -Encoding utf8 -Append
-        id: sdk
-      - name: Verify every SDK binary uses the release publisher
-        shell: powershell
-        run: |
-          $sdk = Join-Path $env:RUNNER_TEMP 'imcodes-libwebrtc-sdk-verify'
-          Expand-Archive -LiteralPath sdk-release\imcodes-libwebrtc-sdk-windows-x64.zip -DestinationPath $sdk -Force
+            $env:GITHUB_SHA
           node scripts/libwebrtc-sdk-artifacts.mjs verify-lock `
             sdk-release/libwebrtc-sdk.lock.json `
             sdk-release/imcodes-libwebrtc-sdk-windows-x64.zip `
-            $sdk
-          $driver = Join-Path $env:RUNNER_TEMP 'imcodes-libwebrtc-sdk-driver-verify'
-          Expand-Archive -LiteralPath (Join-Path $sdk 'imcodes-virtual-display.zip') -DestinationPath $driver -Force
-          foreach ($artifact in @(
-              (Join-Path $sdk 'imcodes-remote-desktop-worker.exe'),
-              (Join-Path $driver 'imcodes-virtual-display.dll'),
-              (Join-Path $driver 'imcodes-virtual-display.cat'))) {
-            & .\scripts\windows-sign-release-artifact.ps1 -Mode Verify -ArtifactPath $artifact -ExpectedSignerSha256 $env:IMCODES_WINDOWS_SIGNING_CERT_SHA256
-          }
-      - name: Upload immutable SDK candidate and repository lock
+            "$env:RUNNER_TEMP\imcodes-libwebrtc-sdk"
+          $lock = Get-Content -LiteralPath sdk-release\libwebrtc-sdk.lock.json -Raw | ConvertFrom-Json
+          "release_tag=$($lock.releaseTag)" | Out-File $env:GITHUB_OUTPUT -Encoding utf8 -Append
+      - name: Upload SDK candidate and generated lock
         uses: actions/upload-artifact@v4
         with:
           name: libwebrtc-sdk-candidate-${{ steps.sdk.outputs.release_tag }}
@@ -112,26 +96,12 @@ jobs:
             sdk-release/libwebrtc-sdk.lock.json
           if-no-files-found: error
           retention-days: 30
-      - name: Remove Windows release-signing material
-        if: always()
-        shell: powershell
-        run: |
-          $certificatePaths = @()
-          if ($env:IMCODES_WINDOWS_SIGNING_CERT_THUMBPRINT) {
-            $certificatePaths = @(
-              "Cert:\CurrentUser\My\$env:IMCODES_WINDOWS_SIGNING_CERT_THUMBPRINT",
-              "Cert:\LocalMachine\TrustedPeople\$env:IMCODES_WINDOWS_SIGNING_CERT_THUMBPRINT",
-              "Cert:\LocalMachine\TrustedPublisher\$env:IMCODES_WINDOWS_SIGNING_CERT_THUMBPRINT"
-            )
-          }
-          foreach ($certificatePath in $certificatePaths) {
-            Remove-Item -LiteralPath $certificatePath -Force -ErrorAction SilentlyContinue
-          }
-          Remove-Item -LiteralPath (Join-Path $env:RUNNER_TEMP 'imcodes-windows-release-signing.pfx') -Force -ErrorAction SilentlyContinue
-          Remove-Item -LiteralPath (Join-Path $env:RUNNER_TEMP 'imcodes-windows-release-signing.cer') -Force -ErrorAction SilentlyContinue
-          $materialPaths = @(
-            (Join-Path $env:RUNNER_TEMP 'imcodes-windows-release-signing.pfx'),
-            (Join-Path $env:RUNNER_TEMP 'imcodes-windows-release-signing.cer')
-          )
-          $leftovers = @(($certificatePaths + $materialPaths) | Where-Object { Test-Path -LiteralPath $_ })
-          if ($leftovers.Count -gt 0) { throw 'Windows release-signing material cleanup was incomplete.' }
+      - name: Publish immutable SDK release and advance repository lock
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          node scripts/promote-libwebrtc-sdk.mjs
+          sdk-release/libwebrtc-sdk.lock.json
+          sdk-release/imcodes-libwebrtc-sdk-windows-x64.zip
+          ${{ github.sha }}
+          dev

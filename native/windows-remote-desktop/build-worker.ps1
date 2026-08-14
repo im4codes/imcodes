@@ -13,9 +13,13 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
-$Revision = 'f20ebb8adbf4fa781830e4384c61f732bd28a217'
-$DepotToolsRevision = 'a1bda5b6167435ad0666191f0353f242104f5845'
 $SourceDirectory = Split-Path -Parent $MyInvocation.MyCommand.Path
+$RepositoryRoot = Split-Path -Parent (Split-Path -Parent $SourceDirectory)
+$NativePins = & (Join-Path $SourceDirectory 'load-native-pins.ps1') -RepositoryRoot $RepositoryRoot
+$Revision = $NativePins.LibwebrtcRevision
+$DepotToolsRevision = $NativePins.DepotToolsRevision
+. (Join-Path $SourceDirectory 'initialize-hermetic-windows-git.ps1') -WorkspaceRoot $CheckoutRoot
+. (Join-Path $SourceDirectory 'invoke-native-logged.ps1')
 $DepotTools = Join-Path $CheckoutRoot 'depot_tools'
 $WebRtcRoot = Join-Path $CheckoutRoot 'src'
 $TargetDirectory = Join-Path $WebRtcRoot 'third_party\imcodes_remote_desktop'
@@ -26,6 +30,9 @@ $RootBuildOriginal = $null
 $ArtifactRoot = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($ArtifactRoot)
 $ExpectedSources = @(
   'BUILD.gn',
+  'libwebrtc-sdk.gni', 'sdk_anchor.cc',
+  'load-native-pins.ps1', 'initialize-hermetic-windows-git.ps1',
+  'invoke-native-logged.ps1',
   'display_capture.cc', 'display_capture.h', 'display_capture_unittest.cc',
   'ice_candidate_queue.cc', 'ice_candidate_queue.h',
   'ice_candidate_queue_unittest.cc',
@@ -96,8 +103,18 @@ if ($WinToolsBootstrap.PSIsContainer -or
 # skips the auto-update path that normally creates depot_tools' wrappers. Run
 # the bootstrap from the already-pinned depot_tools checkout, whose pinned CIPD
 # manifest supplies Python and generates wrappers for the discovered system Git.
-& $WinToolsBootstrap.FullName
-if ($LASTEXITCODE -ne 0) { throw 'Pinned depot_tools Windows bootstrap failed' }
+$BootstrapStdout = Join-Path $CheckoutRoot 'depot-tools-bootstrap.stdout.log'
+$BootstrapStderr = Join-Path $CheckoutRoot 'depot-tools-bootstrap.stderr.log'
+$BootstrapProcess = Start-Process -FilePath $env:ComSpec `
+  -ArgumentList @('/d', '/s', '/c', "`"$($WinToolsBootstrap.FullName)`"") `
+  -RedirectStandardOutput $BootstrapStdout `
+  -RedirectStandardError $BootstrapStderr `
+  -NoNewWindow -Wait -PassThru
+$BootstrapExitCode = $BootstrapProcess.ExitCode
+if ($BootstrapExitCode -ne 0) {
+  $BootstrapError = Get-Content -Raw -LiteralPath $BootstrapStderr -ErrorAction SilentlyContinue
+  throw "Pinned depot_tools Windows bootstrap failed ($BootstrapExitCode): $BootstrapError"
+}
 $PostBootstrapDepotToolsRevision = (& git -C $DepotTools rev-parse HEAD 2>$null).Trim()
 if ($LASTEXITCODE -ne 0 -or $PostBootstrapDepotToolsRevision -ne $DepotToolsRevision) {
   throw "Pinned depot_tools revision changed during Windows bootstrap: $PostBootstrapDepotToolsRevision"
@@ -196,6 +213,11 @@ try {
       throw "Invalid native worker source: $Name"
     }
   }
+  # The legacy full-checkout builder shares BUILD.gn with the SDK producer.
+  # Supply its dependency-only anchor without making it part of the product
+  # source inventory or compiled worker bytes.
+  Copy-Item -LiteralPath (Join-Path $SourceDirectory 'sdk_anchor.cc') `
+    -Destination (Join-Path $TargetDirectory 'sdk_anchor.cc') -Force
 
   # GN only loads BUILD files reachable from the root graph. Attach the
   # product target for generation/build, then restore the pinned upstream file
@@ -243,8 +265,8 @@ try {
     'rtc_enable_protobuf=false'
     'use_rtti=false'
   ) -join ' '
-  & gn gen $BuildDirectory "--args=$GnArgs"
-  if ($LASTEXITCODE -ne 0) { throw 'GN generation failed' }
+  Invoke-NativeLogged -Command { & gn gen $BuildDirectory "--args=$GnArgs" } `
+    -LogRoot $CheckoutRoot -Name 'worker-gn-gen'
   $Targets = @(
     'third_party/imcodes_remote_desktop:imcodes_remote_desktop_worker'
   )
@@ -259,8 +281,8 @@ try {
       'third_party/imcodes_remote_desktop:mf_h264_encoder_unittests'
     )
   }
-  & autoninja -C $BuildDirectory -j $Jobs @Targets
-  if ($LASTEXITCODE -ne 0) { throw 'Native worker build failed' }
+  Invoke-NativeLogged -Command { & autoninja -C $BuildDirectory -j $Jobs @Targets } `
+    -LogRoot $CheckoutRoot -Name 'worker-autoninja'
   if ($RunNativeTests) {
     foreach ($TestName in @(
         'display_capture_unittests',

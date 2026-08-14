@@ -1,4 +1,8 @@
 import { REMOTE_DESKTOP_LIMITS, REMOTE_DESKTOP_QUALITY_LADDER } from './remote-desktop.js';
+import {
+  PINNED_DEPOT_TOOLS_REVISION,
+  PINNED_LIBWEBRTC_REVISION,
+} from './remote-desktop-native-pins.js';
 
 /**
  * Versioned, machine-readable release gate for the Windows remote desktop.
@@ -59,8 +63,8 @@ export const WINDOWS_REMOTE_DESKTOP_QUALIFICATION_PLAN = {
   },
   mediaStackDecision: {
     remoteDesktopMediaStack: 'upstream_libwebrtc',
-    libwebrtcRevision: 'f20ebb8adbf4fa781830e4384c61f732bd28a217',
-    depotToolsRevision: 'a1bda5b6167435ad0666191f0353f242104f5845',
+    libwebrtcRevision: PINNED_LIBWEBRTC_REVISION,
+    depotToolsRevision: PINNED_DEPOT_TOOLS_REVISION,
     chromiumCompatibilityTag: '151.0.7922.110',
     nodeDatachannelPackageVersionEvaluated: '0.32.3',
     libdatachannelVersionEvaluated: '0.24.2',

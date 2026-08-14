@@ -496,6 +496,59 @@ describe('WsBridge', () => {
       expect(ws.sentStrings.some((msg) => msg.includes('"type":"daemon.upgrade"') && msg.includes('2026.7.1234-dev.5'))).toBe(true);
     });
 
+    it('keeps a controlled node online when it advertises a bounded future capability', async () => {
+      const executed: Array<{ sql: string; params: unknown[] }> = [];
+      const db = {
+        queryOne: async () => ({
+          token_hash: 'valid-hash',
+          node_role: 'controlled',
+          revoked_at: null,
+          os: CONTROLLED_NODE_OS_WIN,
+        }),
+        query: async () => [],
+        execute: async (sql: string, params: unknown[] = []) => {
+          executed.push({ sql, params });
+          return { changes: 1 };
+        },
+        exec: async () => {},
+        transaction: async <T>(fn: (tx: import('../src/db/client.js').Database) => Promise<T>) => fn(db as unknown as import('../src/db/client.js').Database),
+        close: () => {},
+      } as unknown as import('../src/db/client.js').Database;
+      const bridge = WsBridge.get(serverId);
+      const ws = new MockWs();
+      bridge.handleDaemonConnection(ws as never, db, {} as never);
+
+      ws.emit('message', JSON.stringify({
+        type: 'auth',
+        serverId,
+        token: 'my-token',
+        daemonVersion: '0.1.2',
+        capabilities: [CONTROLLED_NODE_SAFE_SELF_UPGRADE_CAPABILITY, 'remote.desktop.windows.h264.v3'],
+      }));
+      await flushAsync();
+
+      expect(bridge.isAuthenticated).toBe(true);
+      expect(ws.closed).toBe(false);
+      expect(executed.some(({ sql, params }) => sql.includes('controlled_capabilities')
+        && params.includes(JSON.stringify([CONTROLLED_NODE_SAFE_SELF_UPGRADE_CAPABILITY])))).toBe(true);
+    });
+
+    it('rejects malformed future capability advertisements', async () => {
+      const bridge = WsBridge.get(serverId);
+      const ws = new MockWs();
+      bridge.handleDaemonConnection(ws as never, makeDb('valid-hash', 'controlled'), {} as never);
+
+      ws.emit('message', JSON.stringify({
+        type: 'auth', serverId, token: 'my-token', daemonVersion: '0.1.2', capabilities: ['remote desktop v3'],
+      }));
+      await flushAsync();
+
+      expect(bridge.isAuthenticated).toBe(false);
+      expect(ws.closed).toBe(true);
+      expect(ws.closeCode).toBe(4002);
+      expect(ws.closeReason).toBe('invalid_capabilities');
+    });
+
     it('prepares and verifies an independent rescue before a legacy Windows controlled node auto-upgrades', async () => {
       vi.useFakeTimers();
       process.env.APP_VERSION = '2026.7.1234-dev.5';

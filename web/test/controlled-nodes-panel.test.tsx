@@ -408,6 +408,26 @@ describe('ControlledNodesPanel (12.3)', () => {
     expect(buttons[1]?.closest('li')?.textContent).toContain('Participant Ready');
   });
 
+  it('opens the Remote Desktop panel from the machine action', async () => {
+    machines = [
+      machine({
+        serverId: 'desktop-ready',
+        displayName: 'Desktop Ready',
+        os: 'win',
+        accessRole: 'owner',
+        execEnabled: true,
+        capabilities: [REMOTE_DESKTOP_CAPABILITY],
+      }),
+    ];
+    const { container } = render(<ControlledNodesPanel />);
+    await waitFor(() => expect(container.querySelector('.controlled-nodes-remote-desktop')).not.toBeNull());
+
+    fireEvent.click(container.querySelector('.controlled-nodes-remote-desktop')!);
+
+    await waitFor(() => expect(container.querySelector('.remote-desktop-panel')).not.toBeNull());
+    expect(container.textContent).toContain('Desktop Ready');
+  });
+
   it('renames only the mutable display name and refreshes the list', async () => {
     machines = [machine({ serverId: 'srv-rename', refName: 'stable-ref', displayName: 'Old name' })];
     const { container } = render(<ControlledNodesPanel />);

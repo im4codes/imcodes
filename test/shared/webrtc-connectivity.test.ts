@@ -4,6 +4,9 @@ import {
   REMOTE_DESKTOP_CAPABILITY,
 } from '../../shared/remote-desktop.js';
 import {
+  CONTROLLED_NODE_CAPABILITY_MAX_ITEMS,
+  CONTROLLED_NODE_CAPABILITY_MAX_LENGTH,
+  parseAdvertisedControlledNodeCapabilities,
   validateControlledNodeCapabilities,
 } from '../../shared/controlled-node-capabilities.js';
 import {
@@ -56,6 +59,25 @@ describe('controlled-node capability version boundary', () => {
       .toEqual({ ok: true, value: [REMOTE_DESKTOP_CAPABILITY] });
     expect(validateControlledNodeCapabilities(['remote.desktop.windows.h264.v3'])).toEqual({ ok: false });
     expect(validateControlledNodeCapabilities(['unknown.feature.v1'])).toEqual({ ok: false });
+  });
+
+  it('ignores bounded future advertisements without granting them', () => {
+    expect(parseAdvertisedControlledNodeCapabilities([
+      REMOTE_DESKTOP_CAPABILITY,
+      'remote.desktop.windows.h264.v3',
+      'unknown.feature.v1',
+    ])).toEqual({ ok: true, value: [REMOTE_DESKTOP_CAPABILITY] });
+  });
+
+  it('rejects malformed or unbounded capability advertisements', () => {
+    expect(parseAdvertisedControlledNodeCapabilities(['remote desktop v3'])).toEqual({ ok: false });
+    expect(parseAdvertisedControlledNodeCapabilities([1])).toEqual({ ok: false });
+    expect(parseAdvertisedControlledNodeCapabilities([
+      `a${'b'.repeat(CONTROLLED_NODE_CAPABILITY_MAX_LENGTH)}`,
+    ])).toEqual({ ok: false });
+    expect(parseAdvertisedControlledNodeCapabilities(
+      Array.from({ length: CONTROLLED_NODE_CAPABILITY_MAX_ITEMS + 1 }, () => 'future.feature.v1'),
+    )).toEqual({ ok: false });
   });
 });
 

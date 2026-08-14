@@ -31,6 +31,10 @@ import {
 } from '../../shared/remote-desktop.js';
 import { WINDOWS_REMOTE_DESKTOP_QUALIFICATION_PLAN } from '../../shared/remote-desktop-qualification.js';
 import { isRemoteDesktopFeatureEnabled } from '../../shared/remote-desktop-feature.js';
+import {
+  PINNED_DEPOT_TOOLS_REVISION,
+  PINNED_LIBWEBRTC_REVISION,
+} from '../../shared/remote-desktop-native-pins.js';
 
 const requestId = 'request_12345678';
 const sessionId = 'session_12345678';
@@ -113,8 +117,8 @@ describe('remote desktop production contract', () => {
     });
     expect(WINDOWS_REMOTE_DESKTOP_QUALIFICATION_PLAN.mediaStackDecision).toEqual({
       remoteDesktopMediaStack: 'upstream_libwebrtc',
-      libwebrtcRevision: 'f20ebb8adbf4fa781830e4384c61f732bd28a217',
-      depotToolsRevision: 'a1bda5b6167435ad0666191f0353f242104f5845',
+      libwebrtcRevision: PINNED_LIBWEBRTC_REVISION,
+      depotToolsRevision: PINNED_DEPOT_TOOLS_REVISION,
       chromiumCompatibilityTag: '151.0.7922.110',
       nodeDatachannelPackageVersionEvaluated: '0.32.3',
       libdatachannelVersionEvaluated: '0.24.2',

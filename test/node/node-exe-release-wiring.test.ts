@@ -18,8 +18,14 @@ describe('controlled-node executable release wiring', () => {
     expect(workflow).toContain('npx tsx scripts/qualify-windows-self-upgrade.ts');
     expect(workflow).toContain('runner: windows-2022');
     expect(workflow).toContain('node scripts/resolve-libwebrtc-sdk-release.mjs');
+    expect(workflow).toContain('resolve-libwebrtc-sdk-release.mjs --wait-seconds 15000');
+    expect(workflow).toContain('steps.libwebrtc_sdk_cache.outputs.cache-hit');
+    expect(workflow).toContain('steps.libwebrtc_sdk.outputs.sha256');
+    expect(workflow).toContain('Verify cached fixed libwebrtc foundation SDK');
     expect(workflow).toContain('gh release download');
     expect(workflow).toContain('node scripts/install-libwebrtc-sdk.mjs');
+    expect(workflow).toContain('build-worker-from-sdk.ps1');
+    expect(workflow).toContain('RunNativeTests = $true');
     expect(workflow).not.toContain('imcodes-webrtc-checkout-windows-x64-');
     expect(workflow).not.toContain('imcodes-webrtc-build-${{ steps.windows_native_cache.outputs.identity }}');
     const workerBuild = readFileSync('native/windows-remote-desktop/build-worker.ps1', 'utf8');
@@ -31,8 +37,10 @@ describe('controlled-node executable release wiring', () => {
     expect(workerBuild).toContain('Remove-Item -Force -LiteralPath $ThirdPartyNotices');
     expect(workerBuild).toContain("Join-Path $DepotTools 'bootstrap\\win_tools.bat'");
     expect(workerBuild).toContain("Join-Path $DepotTools 'git.bat'");
-    expect(workerBuild).toContain('& $WinToolsBootstrap.FullName');
+    expect(workerBuild).toContain('Start-Process -FilePath $env:ComSpec');
+    expect(workerBuild).toContain('-RedirectStandardError $BootstrapStderr');
     expect(workerBuild).toContain('$PostBootstrapDepotToolsRevision -ne $DepotToolsRevision');
+    expect(workerBuild).toContain('$BootstrapExitCode -ne 0');
     expect(workerBuild).toContain("$env:GIT_CONFIG_COUNT = '4'");
     expect(workerBuild).toContain("url.https://chromium.googlesource.com/external/github.com/llvm/llvm-project/.insteadOf");
     expect(workerBuild).toContain("$env:GIT_CONFIG_VALUE_0 = 'https://chromium.googlesource.com/external/github.com/llvm/llvm-project/'");
@@ -75,36 +83,132 @@ describe('controlled-node executable release wiring', () => {
     const standaloneWorkflow = readFileSync('.github/workflows/build-node-exe.yml', 'utf8');
     expect(standaloneWorkflow).toContain('- os: windows-2022');
     expect(standaloneWorkflow).toContain('node scripts/resolve-libwebrtc-sdk-release.mjs');
+    expect(standaloneWorkflow).toContain('resolve-libwebrtc-sdk-release.mjs --wait-seconds 15000');
+    expect(standaloneWorkflow).toContain('steps.libwebrtc_sdk_cache.outputs.cache-hit');
+    expect(standaloneWorkflow).toContain('Verify cached fixed libwebrtc foundation SDK');
     expect(standaloneWorkflow).toContain('gh release download');
     expect(standaloneWorkflow).toContain('node scripts/install-libwebrtc-sdk.mjs');
+    expect(standaloneWorkflow).toContain('build-worker-from-sdk.ps1');
     expect(standaloneWorkflow).not.toContain('imcodes-webrtc-checkout-windows-x64-');
+    const sdkConsumer = readFileSync('native/windows-remote-desktop/build-worker-from-sdk.ps1', 'utf8');
+    expect(sdkConsumer).toContain("'-fmsc-version=1934'");
+    expect(sdkConsumer).toContain('if ($ExtraDefines.Count -ne 0)');
+    expect(sdkConsumer).toContain('& $Compiler @SourceArguments');
+    expect(sdkConsumer).toContain("Invoke-NativeLogged -Command { & $Executable }");
+    expect(sdkConsumer).toContain("'third_party\\googletest\\src\\googletest\\include'");
+    expect(sdkConsumer).toContain('$TestSdk,');
+    expect(sdkConsumer).toContain('$ProductionSdk,');
+    expect(sdkConsumer).toContain("'toolchain\\manifest\\as_invoker.manifest'");
+    expect(sdkConsumer).toContain("'toolchain\\manifest\\common_controls.manifest'");
+    expect(sdkConsumer).toContain("'toolchain\\manifest\\compatibility.manifest'");
+    expect(sdkConsumer).toContain("'/MANIFEST:EMBED'");
+    expect(sdkConsumer).toContain("'/MANIFESTUAC:NO'");
+    expect(sdkConsumer).toContain('"/MANIFESTINPUT:$_"');
+    expect(sdkConsumer.indexOf('$TestSdk,'))
+      .toBeLessThan(sdkConsumer.lastIndexOf('$ProductionSdk,'));
 
     const sdkWorkflow = readFileSync('.github/workflows/build-libwebrtc-sdk.yml', 'utf8');
     expect(sdkWorkflow).toContain('workflow_dispatch:');
-    expect(sdkWorkflow).toContain('source_commit:');
-    expect(sdkWorkflow).toContain("'${{ inputs.source_commit }}'");
+    expect(sdkWorkflow).toContain('shared/remote-desktop-native-pins.json');
+    expect(sdkWorkflow).toContain('native/windows-remote-desktop/sdk.BUILD.gn');
+    expect(sdkWorkflow).toContain('native/windows-remote-desktop/libwebrtc-sdk.gni');
+    expect(sdkWorkflow).not.toContain('- native/windows-remote-desktop/BUILD.gn');
+    expect(sdkWorkflow).toContain('native/windows-remote-desktop/generate-libwebrtc-sdk-notices.py');
+    expect(sdkWorkflow).not.toContain('native/windows-remote-desktop/**');
+    expect(sdkWorkflow).toContain('scripts/libwebrtc-sdk-artifacts.mjs');
+    expect(sdkWorkflow).toContain('${{ github.sha }}');
+    expect(sdkWorkflow).not.toContain('inputs.source_commit');
     expect(sdkWorkflow).toContain('group: build-libwebrtc-sdk-windows-x64');
     expect(sdkWorkflow).toContain('Restore pinned depot_tools and CIPD bootstrap');
-    expect(sdkWorkflow).toContain('native\\windows-remote-desktop\\build-worker.ps1');
-    expect(sdkWorkflow).toContain('RequireAuthenticodeSignature = $true');
-    expect(sdkWorkflow).toContain("CodeSigningTimestampUrl = 'http://timestamp.digicert.com'");
+    expect(sdkWorkflow).toContain('Restore exported libwebrtc foundation SDK');
+    expect(sdkWorkflow).toContain("steps.sdk_foundation_cache.outputs.cache-hit != 'true'");
+    expect(sdkWorkflow).toContain("steps.sdk_foundation_cache.outputs.cache-hit == 'true'");
+    expect(sdkWorkflow).toContain('native\\windows-remote-desktop\\build-libwebrtc-sdk.ps1');
+    const sdkProducer = readFileSync('native/windows-remote-desktop/build-libwebrtc-sdk.ps1', 'utf8');
+    const sdkNoticeGenerator = readFileSync(
+      'native/windows-remote-desktop/generate-libwebrtc-sdk-notices.py',
+      'utf8',
+    );
+    expect(sdkProducer).toContain("Join-Path $SourceDirectory 'generate-libwebrtc-sdk-notices.py'");
+    expect(sdkProducer).toContain("@{ Source = 'sdk.BUILD.gn'; Destination = 'BUILD.gn' }");
+    expect(sdkProducer).toContain("@{ Source = 'libwebrtc-sdk.gni'; Destination = 'libwebrtc-sdk.gni' }");
+    expect(sdkProducer).toContain("'--root-target=//third_party/imcodes_remote_desktop'");
+    expect(sdkProducer).not.toContain('$RootBuildText.Replace');
+    expect(sdkProducer).toContain("Sort-Object FullName");
+    expect(sdkProducer).toContain("initialize-hermetic-windows-git.ps1') -WorkspaceRoot $CheckoutRoot");
+    const hermeticGit = readFileSync(
+      'native/windows-remote-desktop/initialize-hermetic-windows-git.ps1',
+      'utf8',
+    );
+    expect(hermeticGit).toContain('$env:GIT_CONFIG_GLOBAL = $GlobalConfig.FullName');
+    expect(hermeticGit).toContain('$GlobalConfig.Length -ne 0');
+    const nativeLogged = readFileSync(
+      'native/windows-remote-desktop/invoke-native-logged.ps1',
+      'utf8',
+    );
+    expect(nativeLogged).toContain('$NativeExitCode -ne 0');
+    expect(nativeLogged).toContain("$ErrorActionPreference = 'Continue'");
+    expect(sdkProducer).toContain("-Name 'sdk-autoninja'");
+    const sdkGni = readFileSync('native/windows-remote-desktop/libwebrtc-sdk.gni', 'utf8');
+    const sdkBuild = readFileSync('native/windows-remote-desktop/sdk.BUILD.gn', 'utf8');
+    expect(sdkGni).not.toContain('rtc_static_library(');
+    expect(sdkBuild).toContain('import("//webrtc.gni")');
+    expect(sdkBuild).toContain('rtc_static_library("imcodes_libwebrtc_sdk")');
+    expect(sdkProducer).toContain("$HeaderRoot -like '*libc++*'");
+    expect(sdkProducer).toContain("'logging', 'media', 'modules'");
+    expect(sdkProducer).toContain("'testing\\gmock', 'testing\\gtest'");
+    expect(sdkProducer).toContain("'third_party\\googletest'");
+    expect(sdkProducer).toContain("'third_party\\libc++\\src\\include\\__config'");
+    expect(sdkProducer).toContain("[string]::IsNullOrEmpty($_.Extension)");
+    expect(sdkProducer).toContain("'third_party\\llvm-build\\Release+Asserts\\lib\\clang\\23\\include'");
+    expect(sdkProducer).toContain("'__stddef_max_align_t.h'");
+    expect(sdkProducer).toContain('imcodes_libcxx_runtime_sdk.lib');
+    expect(sdkNoticeGenerator).toContain('SDK_TARGETS');
+    expect(sdkNoticeGenerator).toContain('imcodes_libwebrtc_test_sdk');
+    expect(sdkNoticeGenerator).toContain('REQUIRED_REDISTRIBUTED_LIBRARIES');
+    expect(sdkNoticeGenerator).toContain('Redistributed SDK license file is missing');
+    expect(sdkNoticeGenerator).toContain('llvm-toolchain');
+    expect(sdkNoticeGenerator).toContain('googletest');
+    expect(sdkNoticeGenerator).not.toContain('"--format=json"');
+    expect(nativeLogged).toContain('$global:LASTEXITCODE = $null');
+    expect(hermeticGit).toContain("$env:GIT_CONFIG_NOSYSTEM = '1'");
+    expect(hermeticGit).toContain("[version]'2.32.0'");
+    expect(sdkWorkflow).not.toContain('IMCODES_WINDOWS_SIGNING_PFX_BASE64');
     expect(sdkWorkflow).toContain('node scripts/publish-libwebrtc-sdk.mjs');
+    expect(sdkWorkflow).toContain('node scripts/promote-libwebrtc-sdk.mjs');
     expect(sdkWorkflow).toContain('node scripts/libwebrtc-sdk-artifacts.mjs verify-lock');
     expect(sdkWorkflow).toContain('name: libwebrtc-sdk-candidate-${{ steps.sdk.outputs.release_tag }}');
     expect(sdkWorkflow).toContain('sdk-release/imcodes-libwebrtc-sdk-windows-x64.zip');
-    expect(sdkWorkflow).not.toContain('gh release create');
-    expect(sdkWorkflow).toContain('Windows release-signing material cleanup was incomplete.');
+    expect(sdkWorkflow).toContain('contents: write');
+    expect(sdkWorkflow).not.toContain('build-worker.ps1');
     const sdkArchiveScript = readFileSync('scripts/windows-libwebrtc-sdk-archive.ps1', 'utf8');
     const sdkInstallScript = readFileSync('scripts/install-libwebrtc-sdk.mjs', 'utf8');
     const sdkPublishScript = readFileSync('scripts/publish-libwebrtc-sdk.mjs', 'utf8');
     expect(sdkArchiveScript).toContain("[ValidateSet('Compress', 'Expand')]");
     expect(sdkArchiveScript).toContain("'imcodes-libwebrtc-sdk.manifest.json'");
-    expect(sdkArchiveScript).toContain('Compress-Archive -LiteralPath @($Entries.FullName)');
+    expect(sdkArchiveScript).toContain('[IO.Compression.ZipArchiveMode]::Create');
+    expect(sdkArchiveScript).toContain(
+      'Sort-Object { $_.FullName.Substring($Source.FullName.Length).ToLowerInvariant() }',
+    );
+    expect(sdkArchiveScript).toContain(
+      'New-Object DateTimeOffset(1980, 1, 1, 0, 0, 0, [TimeSpan]::Zero)',
+    );
+    expect(sdkArchiveScript).toContain('[IO.FileShare]::Read');
+    expect(sdkArchiveScript).toContain('imcodes-libwebrtc-sdk-$MutexDigest.lock');
+    expect(sdkArchiveScript).toContain('[IO.FileShare]::None');
+    expect(sdkArchiveScript).toContain('catch [IO.IOException]');
+    expect(sdkArchiveScript).toContain('$ArchiveLock.Dispose()');
     expect(sdkArchiveScript).toContain('Expand-Archive -LiteralPath $Archive.FullName');
     expect(sdkArchiveScript).toContain('[IO.Compression.ZipFile]::OpenRead($Archive.FullName)');
-    expect(sdkArchiveScript).toContain("'imcodes-remote-desktop-worker.exe' = 268435456");
+    expect(sdkArchiveScript).toContain("$_.FullName.Replace('\\', '/')");
+    expect(sdkArchiveScript).toContain('$DuplicateArchiveNames.Count -ne 0');
+    expect(sdkArchiveScript).toContain('$ReservedWindowsNames');
+    expect(sdkArchiveScript).toContain("'lib/imcodes_libwebrtc_sdk.lib'");
+    expect(sdkArchiveScript).toContain("'lib/imcodes_libcxx_runtime_sdk.lib'");
+    expect(sdkArchiveScript).toContain('$ExpandedSize -gt 4GB');
     expect(sdkInstallScript).toContain("'-Mode', 'Expand'");
     expect(sdkPublishScript).toContain("'-Mode', 'Compress'");
+    expect(sdkPublishScript).toContain('process.exitCode = 0');
     expect(sdkInstallScript).not.toContain("'-Command'");
     expect(sdkPublishScript).not.toContain("'-Command'");
   });

@@ -1,4 +1,5 @@
 import("//webrtc.gni")
+import("libwebrtc-sdk.gni")
 
 # This directory is copied verbatim into a pinned libwebrtc checkout at
 # //third_party/imcodes_remote_desktop by build-worker.ps1.  The worker links
@@ -30,49 +31,8 @@ rtc_executable("imcodes_remote_desktop_worker") {
     "worker_main.cc",
   ]
 
-  defines = [
-    "NOMINMAX",
-    "WIN32_LEAN_AND_MEAN",
-    "UNICODE",
-    "_UNICODE",
-  ]
-
-  deps = [
-    "//api:create_modular_peer_connection_factory",
-    "//api:data_channel_interface",
-    "//api:enable_media",
-    "//api/audio_codecs:builtin_audio_decoder_factory",
-    "//api/audio_codecs:builtin_audio_encoder_factory",
-    "//api/environment",
-    "//api/environment:environment_factory",
-    "//api:jsep",
-    "//api:make_ref_counted",
-    "//api:media_stream_interface",
-    "//api:peer_connection_interface",
-    "//api:rtc_error",
-    "//api:rtc_stats_api",
-    "//api:rtp_sender_interface",
-    "//api:scoped_refptr",
-    "//api:set_local_description_observer_interface",
-    "//api:set_remote_description_observer_interface",
-    "//api/video:video_frame",
-    "//api/video:encoded_image",
-    "//api/video_codecs:scalability_mode",
-    "//api/video_codecs:builtin_video_decoder_factory",
-    "//api/video_codecs:video_codecs_api",
-    "//media:rtc_audio_video",
-    "//media:rtc_media_base",
-    "//modules/video_coding:video_codec_interface",
-    "//pc:video_track_source",
-    "//rtc_base:buffer",
-    "//rtc_base:logging",
-    "//rtc_base:ssl_adapter",
-    "//rtc_base:threading",
-    "//rtc_base:win32_socket_init",
-    "//system_wrappers",
-    "//third_party/jsoncpp",
-    "//third_party/libyuv",
-  ]
+  defines = imcodes_remote_desktop_defines
+  deps = imcodes_remote_desktop_deps
 
   libs = [
     "d3d11.lib",

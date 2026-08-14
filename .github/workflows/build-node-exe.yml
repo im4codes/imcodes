@@ -95,9 +95,16 @@ jobs:
       - name: Resolve fixed libwebrtc SDK release
         if: runner.os == 'Windows'
         id: libwebrtc_sdk
-        run: node scripts/resolve-libwebrtc-sdk-release.mjs
-      - name: Download and materialize fixed libwebrtc SDK
+        run: node scripts/resolve-libwebrtc-sdk-release.mjs --wait-seconds 15000
+      - name: Restore fixed libwebrtc foundation SDK
         if: runner.os == 'Windows'
+        id: libwebrtc_sdk_cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/imcodes-libwebrtc-sdk
+          key: imcodes-libwebrtc-foundation-${{ runner.os }}-${{ steps.libwebrtc_sdk.outputs.sha256 }}-v1
+      - name: Download fixed libwebrtc foundation SDK
+        if: runner.os == 'Windows' && steps.libwebrtc_sdk_cache.outputs.cache-hit != 'true'
         shell: powershell
         env:
           GH_TOKEN: ${{ github.token }}
@@ -112,8 +119,29 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Fixed libwebrtc SDK download failed.' }
           node scripts/install-libwebrtc-sdk.mjs `
             (Join-Path $download '${{ steps.libwebrtc_sdk.outputs.asset_name }}') `
-            dist-node-exe `
-            $env:IMCODES_BUILD_VERSION
+            (Join-Path $env:RUNNER_TEMP 'imcodes-libwebrtc-sdk')
+      - name: Verify cached fixed libwebrtc foundation SDK
+        if: runner.os == 'Windows'
+        run: >-
+          node scripts/libwebrtc-sdk-artifacts.mjs verify-sdk-lock
+          native/windows-remote-desktop/libwebrtc-sdk.lock.json
+          "${{ runner.temp }}\imcodes-libwebrtc-sdk"
+      - name: Build and test current remote-desktop sources from SDK
+        if: runner.os == 'Windows'
+        timeout-minutes: 30
+        shell: powershell
+        run: |
+          $buildArguments = @{
+            SdkRoot = "$env:RUNNER_TEMP\imcodes-libwebrtc-sdk"
+            ArtifactRoot = 'dist-node-exe\remote-desktop-worker\win32-x64'
+            WorkerVersion = $env:IMCODES_BUILD_VERSION
+            CodeSigningCertificateThumbprint = $env:IMCODES_WINDOWS_SIGNING_CERT_THUMBPRINT
+            ExpectedSignerSha256 = $env:IMCODES_WINDOWS_SIGNING_CERT_SHA256
+            CodeSigningTimestampUrl = 'http://timestamp.digicert.com'
+            RequireAuthenticodeSignature = $true
+            RunNativeTests = $true
+          }
+          & .\native\windows-remote-desktop\build-worker-from-sdk.ps1 @buildArguments
       - name: Verify production remote-desktop worker artifact
         if: runner.os == 'Windows'
         run: node scripts/remote-desktop-worker-artifacts.mjs verify dist-node-exe "${{ env.IMCODES_BUILD_VERSION }}"

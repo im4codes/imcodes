@@ -65,7 +65,7 @@ import {
   validateMachineDirectUploadResponse,
 } from '../../../shared/machine-direct-file-transfer.js';
 import {
-  validateControlledNodeCapabilities,
+  parseAdvertisedControlledNodeCapabilities,
   type ControlledNodeCapability,
 } from '../../../shared/controlled-node-capabilities.js';
 import {
@@ -2757,7 +2757,7 @@ export class WsBridge {
           ? null
           : connectionGeneration;
         const controlledCapabilities = this.daemonNodeRole === NODE_ROLE.CONTROLLED
-          ? validateControlledNodeCapabilities(msg.capabilities)
+          ? parseAdvertisedControlledNodeCapabilities(msg.capabilities)
           : { ok: true as const, value: [] };
         if (!controlledCapabilities.ok) {
           logger.warn({ serverId: this.serverId }, 'Controlled daemon auth rejected: invalid capabilities');

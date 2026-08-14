@@ -5,12 +5,19 @@ import { lstat, readFile, readdir } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import nativePins from '../shared/remote-desktop-native-pins.json' with { type: 'json' };
+
 export const REMOTE_DESKTOP_WORKER_FILENAME = 'imcodes-remote-desktop-worker.exe';
 export const REMOTE_DESKTOP_WORKER_MANIFEST_SUFFIX = '.manifest.json';
 export const REMOTE_DESKTOP_VIRTUAL_DISPLAY_ARCHIVE_FILENAME = 'imcodes-virtual-display.zip';
 export const REMOTE_DESKTOP_VIRTUAL_DISPLAY_MANIFEST_FILENAME = 'imcodes-virtual-display.manifest.json';
-export const PINNED_LIBWEBRTC_REVISION = 'f20ebb8adbf4fa781830e4384c61f732bd28a217';
-export const PINNED_DEPOT_TOOLS_REVISION = 'a1bda5b6167435ad0666191f0353f242104f5845';
+const GIT_REVISION_RE = /^[a-f0-9]{40}$/;
+if (!GIT_REVISION_RE.test(nativePins.libwebrtcRevision)
+  || !GIT_REVISION_RE.test(nativePins.depotToolsRevision)) {
+  throw new Error('invalid remote desktop native revision pins');
+}
+export const PINNED_LIBWEBRTC_REVISION = nativePins.libwebrtcRevision;
+export const PINNED_DEPOT_TOOLS_REVISION = nativePins.depotToolsRevision;
 
 const SHA256_RE = /^[a-f0-9]{64}$/;
 const VERSION_RE = /^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$/;

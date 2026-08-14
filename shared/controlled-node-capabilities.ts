@@ -22,6 +22,8 @@ export const CONTROLLED_NODE_CAPABILITIES = [
 
 export type ControlledNodeCapability = typeof CONTROLLED_NODE_CAPABILITIES[number];
 export const CONTROLLED_NODE_CAPABILITY_MAX_ITEMS = 16;
+export const CONTROLLED_NODE_CAPABILITY_MAX_LENGTH = 128;
+const CONTROLLED_NODE_CAPABILITY_ADVERTISEMENT_PATTERN = /^[a-z0-9][a-z0-9._-]*$/;
 
 export function isControlledNodeCapability(value: unknown): value is ControlledNodeCapability {
   return typeof value === 'string'
@@ -38,4 +40,20 @@ export function validateControlledNodeCapabilities(value: unknown): ControlledNo
   if (!Array.isArray(value) || value.length > CONTROLLED_NODE_CAPABILITY_MAX_ITEMS) return { ok: false };
   if (!value.every(isControlledNodeCapability)) return { ok: false };
   return { ok: true, value: [...new Set(value)] };
+}
+
+/**
+ * Parses a daemon's forward-compatible capability advertisement. Unknown,
+ * well-formed versions are ignored and never become authorization grants;
+ * malformed or unbounded advertisements still reject the authentication.
+ */
+export function parseAdvertisedControlledNodeCapabilities(value: unknown): ControlledNodeCapabilitiesValidation {
+  if (value === undefined) return { ok: true, value: [] };
+  if (!Array.isArray(value) || value.length > CONTROLLED_NODE_CAPABILITY_MAX_ITEMS) return { ok: false };
+  if (!value.every((item) => typeof item === 'string'
+    && item.length <= CONTROLLED_NODE_CAPABILITY_MAX_LENGTH
+    && CONTROLLED_NODE_CAPABILITY_ADVERTISEMENT_PATTERN.test(item))) {
+    return { ok: false };
+  }
+  return { ok: true, value: [...new Set(value.filter(isControlledNodeCapability))] };
 }
