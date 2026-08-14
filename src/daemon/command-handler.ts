@@ -597,8 +597,8 @@ function buildAttachmentRetentionPreamble(text: string, now = Date.now()): strin
     labels.push(label);
   }
   if (labels.length === 0) return undefined;
-  if (labels.length === 1) return `${labels[0]} expires in 24h. Copy to keep.`;
-  return `${labels.join(', ')} expire in 24h. Copy to keep.`;
+  if (labels.length === 1) return `${labels[0]} expires in 24h. Copy only if necessary.`;
+  return `${labels.join(', ')} expire in 24h. Copy only if necessary.`;
 }
 
 function mergeAgentMessagePreambles(...parts: Array<string | undefined>): string | undefined {

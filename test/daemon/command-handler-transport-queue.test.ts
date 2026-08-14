@@ -1794,7 +1794,7 @@ describe('handleWebCommand transport queue behavior', () => {
       text,
       'cmd-upload-retention-transport',
       undefined,
-      '#1, #2 expire in 24h. Copy to keep.',
+      '#1, #2 expire in 24h. Copy only if necessary.',
     );
     const userMessage = emitMock.mock.calls.find(([session, type, payload]) => (
       session === 'deck_transport_brain'
@@ -1802,7 +1802,7 @@ describe('handleWebCommand transport queue behavior', () => {
       && (payload as { commandId?: string } | undefined)?.commandId === 'cmd-upload-retention-transport'
     ));
     expect(userMessage?.[2]).toMatchObject({ text });
-    expect(JSON.stringify(userMessage?.[2] ?? '')).not.toContain('Copy to keep');
+    expect(JSON.stringify(userMessage?.[2] ?? '')).not.toContain('Copy only if necessary');
   });
 
   it('injects no upload reminder when numbered paths are not live registered uploads', async () => {
@@ -3234,7 +3234,7 @@ describe('handleWebCommand transport queue behavior', () => {
       .find((candidate) => candidate.commandId === 'cmd-offline-upload-retention');
     expect(entry).toMatchObject({
       text,
-      messagePreamble: '#1 expires in 24h. Copy to keep.',
+      messagePreamble: '#1 expires in 24h. Copy only if necessary.',
     });
     const userMessages = emitMock.mock.calls.filter(([session, type, payload]) => (
       session === 'deck_transport_brain'

@@ -808,8 +808,8 @@ describe('structured P2P routing via WS fields', () => {
 
     await vi.waitFor(() => expect(sendKeysDelayedEnter).toHaveBeenCalled());
     const sentText = String(vi.mocked(sendKeysDelayedEnter).mock.calls.at(-1)?.[1] ?? '');
-    expect(sentText).toContain('#1 expires in 24h. Copy to keep.');
-    expect(sentText.match(/#1 expires in 24h\. Copy to keep\./g)).toHaveLength(1);
+    expect(sentText).toContain('#1 expires in 24h. Copy only if necessary.');
+    expect(sentText.match(/#1 expires in 24h\. Copy only if necessary\./g)).toHaveLength(1);
     expect(sentText).toContain(text);
 
     const userMessage = emitMock.mock.calls.find(([session, type, payload]) => (
@@ -818,7 +818,7 @@ describe('structured P2P routing via WS fields', () => {
       && (payload as { commandId?: string } | undefined)?.commandId === 'cmd-process-upload-retention'
     ));
     expect(userMessage?.[2]).toMatchObject({ text });
-    expect(JSON.stringify(userMessage?.[2] ?? '')).not.toContain('Copy to keep');
+    expect(JSON.stringify(userMessage?.[2] ?? '')).not.toContain('Copy only if necessary');
   });
 
 
