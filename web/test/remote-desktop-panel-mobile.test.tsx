@@ -131,13 +131,19 @@ function pointer(
 
 function mousePointer(
   target: Element,
-  type: 'pointerdown' | 'pointerup' | 'pointercancel' | 'lostpointercapture',
+  type: 'pointerdown' | 'pointermove' | 'pointerup' | 'pointercancel' | 'pointerenter' | 'pointerleave' | 'lostpointercapture',
   values: { pointerId: number; clientX: number; clientY: number; button?: number },
 ): void {
   const eventName = type === 'pointerdown' && !('onpointerdown' in target)
     ? 'PointerDown'
+    : type === 'pointermove' && !('onpointermove' in target)
+      ? 'PointerMove'
     : type === 'pointerup' && !('onpointerup' in target)
       ? 'PointerUp'
+      : type === 'pointerenter' && !('onpointerenter' in target)
+        ? 'PointerEnter'
+        : type === 'pointerleave' && !('onpointerleave' in target)
+          ? 'PointerLeave'
       : type === 'pointercancel' && !('onpointercancel' in target)
         ? 'PointerCancel'
         : type === 'lostpointercapture' && !('onlostpointercapture' in target)
@@ -588,6 +594,30 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     });
     expect(releasePointerButtons).toHaveBeenCalledTimes(1);
     expect(releaseAll).not.toHaveBeenCalled();
+  });
+
+  it('shows a remote pointer target that follows the local desktop pointer without hiding it', async () => {
+    const { container, stage } = await renderPanel();
+    pointerMove.mockClear();
+    act(() => {
+      mousePointer(stage, 'pointermove', {
+        pointerId: 18, clientX: 200, clientY: 150,
+      });
+    });
+
+    expect(pointerMove).toHaveBeenCalledWith(0.5, 0.5);
+    const pointerTarget = container.querySelector('.remote-desktop-pointer-follow') as HTMLDivElement;
+    expect(pointerTarget.hidden).toBe(false);
+    expect(pointerTarget.style.left).toBe('200px');
+    expect(pointerTarget.style.top).toBe('150px');
+    expect(getComputedStyle(stage).cursor).not.toBe('none');
+
+    act(() => {
+      mousePointer(stage, 'pointerleave', {
+        pointerId: 18, clientX: 401, clientY: 150,
+      });
+    });
+    expect(pointerTarget.hidden).toBe(true);
   });
 
   it('acknowledges only a browser-presented decoded video frame', async () => {

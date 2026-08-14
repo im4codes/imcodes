@@ -166,9 +166,11 @@ export function RemoteDesktopPanel({ machine, ws = null, onClose }: RemoteDeskto
   const [mobileTextOpen, setMobileTextOpen] = useState(false);
   const [displayModeMenu, setDisplayModeMenu] = useState<DisplayModeMenuState | null>(null);
   const [clipboardStatus, setClipboardStatus] = useState<ClipboardStatus>('idle');
+  const [desktopPointerVisible, setDesktopPointerVisible] = useState(false);
   const clientRef = useRef<RemoteDesktopClient | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const stageRef = useRef<HTMLDivElement | null>(null);
+  const desktopPointerRef = useRef<HTMLDivElement | null>(null);
   const panelRef = useRef<HTMLDivElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const mobileTextInputRef = useRef<HTMLTextAreaElement | null>(null);
@@ -918,7 +920,21 @@ export function RemoteDesktopPanel({ machine, ws = null, onClose }: RemoteDeskto
       return;
     }
     const point = normalizedPoint(event);
-    if (point) clientRef.current?.pointerMove(point.x, point.y);
+    if (!point) {
+      setDesktopPointerVisible(false);
+      return;
+    }
+    const stage = stageRef.current;
+    const pointer = desktopPointerRef.current;
+    if (stage && pointer && snapshot.inputEnabled) {
+      const rect = stage.getBoundingClientRect();
+      pointer.style.left = `${event.clientX - rect.left}px`;
+      pointer.style.top = `${event.clientY - rect.top}px`;
+      setDesktopPointerVisible(true);
+    } else {
+      setDesktopPointerVisible(false);
+    }
+    clientRef.current?.pointerMove(point.x, point.y);
   };
 
   const onPointerButton = (event: PointerEvent, down: boolean) => {
@@ -1354,6 +1370,9 @@ export function RemoteDesktopPanel({ machine, ws = null, onClose }: RemoteDeskto
           tabIndex={snapshot.inputEnabled ? 0 : -1}
           onPointerMove={onPointerMove}
           onPointerEnter={onPointerMove}
+          onPointerLeave={(event) => {
+            if (event.pointerType !== 'touch') setDesktopPointerVisible(false);
+          }}
           onPointerDown={(event) => onPointerButton(event, true)}
           onPointerUp={(event) => onPointerButton(event, false)}
           onPointerCancel={(event) => {
@@ -1403,6 +1422,14 @@ export function RemoteDesktopPanel({ machine, ws = null, onClose }: RemoteDeskto
             }}
             aria-label={t('remote_desktop.video_label', { machine: machine.displayName })}
           />
+          {mobileInputMode !== 'mouse' && (
+            <div
+              ref={desktopPointerRef}
+              class="remote-desktop-virtual-pointer remote-desktop-pointer-follow"
+              hidden={!snapshot.inputEnabled || !desktopPointerVisible}
+              aria-hidden="true"
+            />
+          )}
           {mobileTextOpen && (
             <div class="remote-desktop-mobile-keyboard" role="group" aria-label={t('remote_desktop.mobile_keyboard')}>
               <div class="remote-desktop-mobile-keyboard-head">
