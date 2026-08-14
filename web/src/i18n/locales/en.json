@@ -2945,6 +2945,7 @@
   },
   "remote_desktop": {
     "open": "Remote Desktop",
+    "open_new_window": "Open in new window",
     "title": "Remote Desktop — {{machine}}",
     "stop": "Stop",
     "displays": "Displays",

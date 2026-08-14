@@ -2945,6 +2945,7 @@
   },
   "remote_desktop": {
     "open": "遠端桌面",
+    "open_new_window": "在新視窗開啟",
     "title": "遠端桌面 — {{machine}}",
     "stop": "停止",
     "displays": "顯示器",

@@ -216,6 +216,21 @@ async function renderPanel(
 }
 
 describe('RemoteDesktopPanel mobile gestures', () => {
+  it('opens the same controlled machine in an independent browser window', async () => {
+    const open = vi.spyOn(window, 'open').mockReturnValue({} as Window);
+    const result = await renderPanel();
+
+    act(() => (result.getByRole('button', {
+      name: 'remote_desktop.open_new_window',
+    }) as HTMLButtonElement).click());
+
+    expect(open).toHaveBeenCalledTimes(1);
+    const [url, target, features] = open.mock.calls[0] ?? [];
+    expect(new URL(String(url)).searchParams.get('remoteDesktopServer')).toBe('server-1');
+    expect(target).toBe('_blank');
+    expect(features).toContain('noopener');
+  });
+
   it('uses shared window controls and minimizes without stopping the live desktop', async () => {
     const onMinimize = vi.fn();
     const onRestore = vi.fn();

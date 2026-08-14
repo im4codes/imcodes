@@ -35,6 +35,7 @@ import {
 } from '../remote-desktop-keyboard.js';
 import { copyToClipboard } from '../util/clipboard.js';
 import type { WsClient } from '../ws-client.js';
+import { openRemoteDesktopWindow } from '../remote-desktop-window.js';
 import { FloatingPanel } from './FloatingPanel.js';
 import { DesktopWindowMaximizeButton } from './DesktopWindowMaximizeButton.js';
 import { FileBrowser } from './FileBrowser.js';
@@ -183,6 +184,7 @@ export interface RemoteDesktopPanelProps {
   machine: MachineListItem;
   ws?: WsClient | null;
   minimized?: boolean;
+  standalone?: boolean;
   onMinimize?(): void;
   onRestore?(): void;
   onClose(): void;
@@ -200,6 +202,7 @@ export function RemoteDesktopPanel({
   machine,
   ws = null,
   minimized = false,
+  standalone = false,
   onMinimize,
   onRestore,
   onClose,
@@ -1322,18 +1325,29 @@ export function RemoteDesktopPanel({
             <span>{t('remote_desktop.controllers', { count: snapshot.controllerCount ?? (snapshot.mode === 'control' ? 1 : 0) })}</span>
           </div>
           <div class="remote-desktop-window-actions">
+            {!standalone && (
+              <button
+                type="button"
+                class="subsession-minimize-btn remote-desktop-open-window"
+                aria-label={t('remote_desktop.open_new_window')}
+                title={t('remote_desktop.open_new_window')}
+                onClick={() => { openRemoteDesktopWindow(machine.serverId); }}
+              >↗</button>
+            )}
             <DesktopWindowMaximizeButton
               maximized={desktopMaximized}
               class="subsession-minimize-btn remote-desktop-maximize"
               onClick={() => setDesktopMaximized((current) => !current)}
             />
-            <button
-              type="button"
-              class="subsession-minimize-btn remote-desktop-minimize"
-              aria-label={t('window.minimize')}
-              title={t('window.minimize')}
-              onClick={minimizePanel}
-            >▾</button>
+            {onMinimize && (
+              <button
+                type="button"
+                class="subsession-minimize-btn remote-desktop-minimize"
+                aria-label={t('window.minimize')}
+                title={t('window.minimize')}
+                onClick={minimizePanel}
+              >▾</button>
+            )}
             <button
               type="button"
               class="subsession-close-btn remote-desktop-stop"

@@ -2944,6 +2944,7 @@
   },
   "remote_desktop": {
     "open": "원격 데스크톱",
+    "open_new_window": "새 창에서 열기",
     "title": "원격 데스크톱 — {{machine}}",
     "stop": "중지",
     "displays": "디스플레이",

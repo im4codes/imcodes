@@ -2944,6 +2944,7 @@
   },
   "remote_desktop": {
     "open": "リモートデスクトップ",
+    "open_new_window": "新しいウィンドウで開く",
     "title": "リモートデスクトップ — {{machine}}",
     "stop": "停止",
     "displays": "ディスプレイ",

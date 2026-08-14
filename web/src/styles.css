@@ -7750,6 +7750,25 @@ button.quick-agent-delegation-preset.active {
   display: none;
 }
 
+.remote-desktop-standalone-root,
+.remote-desktop-standalone-root body,
+.remote-desktop-standalone-root #app {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+  background: #050b13;
+}
+
+.remote-desktop-standalone-status {
+  min-height: 100%;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  color: #aac0d3;
+  background: radial-gradient(circle at 50% 35%, rgb(15 62 89 / 38%), transparent 45%), #050b13;
+}
+
 .remote-desktop-minimized-dock {
   position: fixed;
   right: calc(14px + env(safe-area-inset-right, 0px));

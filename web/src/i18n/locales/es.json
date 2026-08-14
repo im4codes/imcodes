@@ -2945,6 +2945,7 @@
   },
   "remote_desktop": {
     "open": "Escritorio remoto",
+    "open_new_window": "Abrir en una ventana nueva",
     "title": "Escritorio remoto — {{machine}}",
     "stop": "Detener",
     "displays": "Pantallas",
