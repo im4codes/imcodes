@@ -5168,6 +5168,41 @@ afterEach(() => {
     expect(ws.sendInput).not.toHaveBeenCalled();
   });
 
+  it('uses Escape to append a queued message without canceling the active transport turn', () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({
+          name: 'qwen-session',
+          agentType: 'qwen',
+          runtimeType: 'transport',
+          state: 'running',
+          transportPendingMessageEntries: [
+            { clientMessageId: 'msg-escape-append', text: 'append from Escape' },
+          ],
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.focus();
+    fireEvent.keyDown(input, { key: 'Escape' });
+
+    expect(ws.send.mock.calls.filter(([payload]) => (
+      (payload as { type?: string }).type === 'session.append_queued_messages'
+    ))).toEqual([[expect.objectContaining({
+      sessionName: 'qwen-session',
+      clientMessageIds: ['msg-escape-append'],
+      commandId: expect.any(String),
+    })]]);
+    expect(gatherCancelCalls(ws)).toEqual([]);
+    expect(screen.queryByText('append from Escape')).toBeNull();
+    const notice = screen.getByText('Queued messages appended; the session is still running.');
+    expect(notice.closest('[role="status"]')?.classList.contains('queue-append-success-toast')).toBe(true);
+  });
+
   it('pressing Escape with window focus sends direct cancel for the active transport surface', () => {
     const ws = makeWs();
     render(

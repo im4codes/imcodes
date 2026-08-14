@@ -3687,30 +3687,6 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     return false;
   }, [escapeKeyboardOwnerOpen]);
 
-  const handleTransportEscapeCancel = useCallback((e: KeyboardEvent): boolean => {
-    if (
-      effectiveRuntimeType !== 'transport'
-      || !isRunningSessionState(activeSession?.state)
-      || shouldProtectTransportEscape(e)
-    ) {
-      return false;
-    }
-    e.preventDefault();
-    e.stopPropagation();
-    handleStopPress();
-    return true;
-  }, [activeSession?.state, effectiveRuntimeType, handleStopPress, shouldProtectTransportEscape]);
-
-  useEffect(() => {
-    const enabled = !compact && (keyboardActive ?? true);
-    if (!enabled) return;
-    const handler = (e: KeyboardEvent) => {
-      handleTransportEscapeCancel(e);
-    };
-    document.addEventListener('keydown', handler);
-    return () => document.removeEventListener('keydown', handler);
-  }, [compact, handleTransportEscapeCancel, keyboardActive]);
-
   // Clear the optimistic state once the turn actually settles (session leaves
   // the running state) or after a safety timeout so a stuck turn re-enables it.
   useEffect(() => {
@@ -3994,6 +3970,33 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     }
     handleStopPress();
   }, [appendableQueuedTransportEntries, handleQueuedMessagesAppend, handleStopPress, showAppendSuccessNotice, t]);
+
+  // Escape and the visible Stop button must share the same queue-first policy.
+  // Keeping a separate direct-cancel path here would let one Escape press skip
+  // queued messages even though the button correctly appends them first.
+  const handleTransportEscapeCancel = useCallback((e: KeyboardEvent): boolean => {
+    if (
+      effectiveRuntimeType !== 'transport'
+      || !isRunningSessionState(activeSession?.state)
+      || shouldProtectTransportEscape(e)
+    ) {
+      return false;
+    }
+    e.preventDefault();
+    e.stopPropagation();
+    handleStopButtonPress();
+    return true;
+  }, [activeSession?.state, effectiveRuntimeType, handleStopButtonPress, shouldProtectTransportEscape]);
+
+  useEffect(() => {
+    const enabled = !compact && (keyboardActive ?? true);
+    if (!enabled) return;
+    const handler = (e: KeyboardEvent) => {
+      handleTransportEscapeCancel(e);
+    };
+    document.addEventListener('keydown', handler);
+    return () => document.removeEventListener('keydown', handler);
+  }, [compact, handleTransportEscapeCancel, keyboardActive]);
 
   const handleQueuedMessageRetry = useCallback((entry: LocalQueuedTransportEntry) => {
     if (entry.status !== 'failed') return;
