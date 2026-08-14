@@ -14,6 +14,7 @@ inline constexpr int kProtocolVersion = 2;
 inline constexpr int kIpcVersion = 1;
 inline constexpr size_t kMaxIpcLineBytes = 512 * 1024;
 inline constexpr size_t kMaxDataMessageBytes = 16 * 1024;
+inline constexpr size_t kMaxClipboardTextBytes = 12 * 1024;
 inline constexpr int kMaxIceCandidates = 128;
 inline constexpr int kMaxDisplays = 16;
 inline constexpr int64_t kLeaseMaxFutureMs = 20'000;
@@ -23,8 +24,8 @@ inline constexpr size_t kMaxCaptureSources = 4;
 inline constexpr size_t kMaxGpuCaptureSurfaces = 4;
 inline constexpr size_t kMaxEncoderQueueFrames = 3;
 inline constexpr size_t kMaxWorkerMemoryBytes = 1024ULL * 1024ULL * 1024ULL;
-inline constexpr uint32_t kMaxVideoBitrateBps = 8'000'000;
-inline constexpr uint32_t kMaxAggregateVideoBitrateBps = 24'000'000;
+inline constexpr uint32_t kMaxVideoBitrateBps = 15'000'000;
+inline constexpr uint32_t kMaxAggregateVideoBitrateBps = 60'000'000;
 
 inline constexpr char kWorkerHelloType[] = "remote_desktop.worker_hello";
 inline constexpr char kPrepareType[] = "remote_desktop.prepare";
@@ -40,6 +41,7 @@ inline constexpr char kTerminalType[] = "remote_desktop.terminal";
 
 inline constexpr char kTopologyType[] = "remote_desktop.data.display_topology";
 inline constexpr char kQualityType[] = "remote_desktop.data.quality";
+inline constexpr char kClipboardType[] = "remote_desktop.data.clipboard";
 inline constexpr char kPointerType[] = "remote_desktop.data.pointer";
 inline constexpr char kKeyboardType[] = "remote_desktop.data.keyboard";
 inline constexpr char kControlType[] = "remote_desktop.data.control";

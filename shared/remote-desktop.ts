@@ -47,6 +47,7 @@ export const REMOTE_DESKTOP_MSG = {
 export const REMOTE_DESKTOP_DATA_MSG = {
   DISPLAY_TOPOLOGY: 'remote_desktop.data.display_topology',
   QUALITY: 'remote_desktop.data.quality',
+  CLIPBOARD: 'remote_desktop.data.clipboard',
   POINTER: 'remote_desktop.data.pointer',
   KEYBOARD: 'remote_desktop.data.keyboard',
   CONTROL: 'remote_desktop.data.control',
@@ -142,15 +143,21 @@ export const REMOTE_DESKTOP_CONTROL_KIND = {
   FRAME_PRESENTED: 'frame_presented',
   SELECT_DISPLAY: 'select_display',
   SET_DISPLAY_MODE: 'set_display_mode',
+  SET_DISPLAY_SCALE: 'set_display_scale',
+  COPY_SELECTION: 'copy_selection',
   KEEPALIVE: 'keepalive',
   INPUT_ACK: 'input_ack',
 } as const;
 
 export const REMOTE_DESKTOP_COMMON_DISPLAY_MODES = [
-  { width: 1280, height: 720, label: '720p' },
-  { width: 1920, height: 1080, label: '1080p' },
-  { width: 2560, height: 1440, label: '1440p' },
-  { width: 3840, height: 2160, label: '4K' },
+  { width: 1280, height: 720, label: '720p', recommendedDpiScalePercent: 125 },
+  { width: 1920, height: 1080, label: '1080p', recommendedDpiScalePercent: 150 },
+  { width: 2560, height: 1440, label: '1440p', recommendedDpiScalePercent: 175 },
+  { width: 3840, height: 2160, label: '4K', recommendedDpiScalePercent: 225 },
+] as const;
+
+export const REMOTE_DESKTOP_DPI_SCALE_PERCENTS = [
+  100, 125, 150, 175, 200, 225, 250, 300,
 ] as const;
 
 export const REMOTE_DESKTOP_DISPLAY_ROTATION = {
@@ -161,7 +168,9 @@ export const REMOTE_DESKTOP_DISPLAY_ROTATION = {
 } as const;
 
 export const REMOTE_DESKTOP_QUALITY_PRESET = {
+  P2160_30: '2160p30',
   P2160_15: '2160p15',
+  P1440_30: '1440p30',
   P1080_30: '1080p30',
   P900_30: '900p30',
   P720_30: '720p30',
@@ -201,6 +210,9 @@ export const REMOTE_DESKTOP_LIMITS = {
   KEY_CODE_BYTES: 64,
   KEY_VALUE_BYTES: 64,
   TEXT_BYTES: 4 * 1024,
+  TEXT_CODE_UNITS: 2 * 1024,
+  PASTE_TEXT_BYTES: 64 * 1024,
+  CLIPBOARD_TEXT_BYTES: 12 * 1024,
   ERROR_DETAIL_BYTES: 512,
   // A cold Windows path includes Authenticode re-verification, active-user
   // worker launch, DXGI's first presentable frame, and ICE.  Production data
@@ -241,8 +253,8 @@ export const REMOTE_DESKTOP_LIMITS = {
   MAX_POINTER_EVENTS_PER_SECOND: 240,
   MAX_KEYBOARD_EVENTS_PER_SECOND: 120,
   MAX_MONITOR_CHANGES_PER_MINUTE: 30,
-  MAX_VIDEO_BITRATE_BPS: 8_000_000,
-  MAX_AGGREGATE_VIDEO_BITRATE_BPS: 24_000_000,
+  MAX_VIDEO_BITRATE_BPS: 15_000_000,
+  MAX_AGGREGATE_VIDEO_BITRATE_BPS: 60_000_000,
   MAX_DISTINCT_CAPTURE_SOURCES: 4,
   MAX_GPU_CAPTURE_SURFACES: 4,
   MAX_WORKER_MEMORY_BYTES: 1024 * 1024 * 1024,
@@ -250,7 +262,9 @@ export const REMOTE_DESKTOP_LIMITS = {
 } as const;
 
 export const REMOTE_DESKTOP_QUALITY_LADDER = [
-  { id: REMOTE_DESKTOP_QUALITY_PRESET.P2160_15, width: 3840, height: 2160, fps: 15, targetBitrateBps: 8_000_000 },
+  { id: REMOTE_DESKTOP_QUALITY_PRESET.P2160_30, width: 3840, height: 2160, fps: 30, targetBitrateBps: 15_000_000 },
+  { id: REMOTE_DESKTOP_QUALITY_PRESET.P2160_15, width: 3840, height: 2160, fps: 15, targetBitrateBps: 12_000_000 },
+  { id: REMOTE_DESKTOP_QUALITY_PRESET.P1440_30, width: 2560, height: 1440, fps: 30, targetBitrateBps: 10_000_000 },
   { id: REMOTE_DESKTOP_QUALITY_PRESET.P1080_30, width: 1920, height: 1080, fps: 30, targetBitrateBps: 6_000_000 },
   { id: REMOTE_DESKTOP_QUALITY_PRESET.P900_30, width: 1600, height: 900, fps: 30, targetBitrateBps: 4_500_000 },
   { id: REMOTE_DESKTOP_QUALITY_PRESET.P720_30, width: 1280, height: 720, fps: 30, targetBitrateBps: 3_000_000 },
@@ -421,6 +435,16 @@ export interface RemoteDesktopQuality {
   rttMs: number;
 }
 
+export interface RemoteDesktopClipboard {
+  type: typeof REMOTE_DESKTOP_DATA_MSG.CLIPBOARD;
+  protocolVersion: typeof REMOTE_DESKTOP_PROTOCOL_VERSION;
+  sessionId: string;
+  sequence: number;
+  requestId: string;
+  available: boolean;
+  text?: string;
+}
+
 interface RemoteDesktopInputBase {
   protocolVersion: typeof REMOTE_DESKTOP_PROTOCOL_VERSION;
   sessionId: string;
@@ -455,6 +479,8 @@ export interface RemoteDesktopControl extends RemoteDesktopInputBase {
   displayId?: string;
   width?: number;
   height?: number;
+  dpiScalePercent?: number;
+  requestId?: string;
   frameWidth?: number;
   frameHeight?: number;
   acknowledgedSequence?: number;
@@ -468,7 +494,7 @@ export type RemoteDesktopBrowserMessage = RemoteDesktopStart | RemoteDesktopOffe
 export type RemoteDesktopDaemonCommand = RemoteDesktopPrepare | RemoteDesktopOffer | RemoteDesktopIce | RemoteDesktopLease | RemoteDesktopModeState | RemoteDesktopCancel | RemoteDesktopStop;
 export type RemoteDesktopDaemonMessage = RemoteDesktopAnswer | RemoteDesktopIce | RemoteDesktopModeState | RemoteDesktopStatus | RemoteDesktopTerminal;
 export type RemoteDesktopServerMessage = RemoteDesktopAuthorized | RemoteDesktopAnswer | RemoteDesktopIce | RemoteDesktopModeState | RemoteDesktopStatus | RemoteDesktopTerminal | RemoteDesktopError;
-export type RemoteDesktopDataMessage = RemoteDesktopDisplayTopology | RemoteDesktopQuality | RemoteDesktopPointer | RemoteDesktopKeyboard | RemoteDesktopControl | RemoteDesktopReleaseAll;
+export type RemoteDesktopDataMessage = RemoteDesktopDisplayTopology | RemoteDesktopQuality | RemoteDesktopClipboard | RemoteDesktopPointer | RemoteDesktopKeyboard | RemoteDesktopControl | RemoteDesktopReleaseAll;
 
 export type RemoteDesktopValidationResult<T> = { ok: true; value: T } | { ok: false; error: typeof REMOTE_DESKTOP_ERROR.INVALID_REQUEST };
 
@@ -814,6 +840,22 @@ function validateQuality(value: Record<string, unknown>): boolean {
     && isFiniteRange(value.rttMs, 0, 3_600_000);
 }
 
+function validateClipboard(value: Record<string, unknown>): boolean {
+  if (!hasExactKeys(
+    value,
+    ['type', 'protocolVersion', 'sessionId', 'sequence', 'requestId', 'available'],
+    ['text'],
+  )
+    || value.protocolVersion !== REMOTE_DESKTOP_PROTOCOL_VERSION
+    || !isId(value.sessionId)
+    || !isSafeNonNegative(value.sequence)
+    || !isId(value.requestId)
+    || typeof value.available !== 'boolean') return false;
+  return value.available
+    ? isBoundedString(value.text, REMOTE_DESKTOP_LIMITS.CLIPBOARD_TEXT_BYTES)
+    : value.text === undefined;
+}
+
 function validatePointer(value: Record<string, unknown>): boolean {
   if (!hasExactKeys(value, ['type', 'protocolVersion', 'sessionId', 'sequence', 'layoutRevision', 'inputEpoch', 'kind'], ['x', 'y', 'button', 'deltaX', 'deltaY'])
     || !hasInputCorrelation(value)
@@ -852,12 +894,13 @@ function validateKeyboard(value: Record<string, unknown>): boolean {
 }
 
 function validateControl(value: Record<string, unknown>): boolean {
-  if (!hasExactKeys(value, ['type', 'protocolVersion', 'sessionId', 'sequence', 'layoutRevision', 'inputEpoch', 'kind'], ['displayId', 'width', 'height', 'frameWidth', 'frameHeight', 'acknowledgedSequence'])
+  if (!hasExactKeys(value, ['type', 'protocolVersion', 'sessionId', 'sequence', 'layoutRevision', 'inputEpoch', 'kind'], ['displayId', 'width', 'height', 'dpiScalePercent', 'requestId', 'frameWidth', 'frameHeight', 'acknowledgedSequence'])
     || !hasInputCorrelation(value)
     || typeof value.kind !== 'string' || !CONTROL_KINDS.has(value.kind)) return false;
   if (value.kind === REMOTE_DESKTOP_CONTROL_KIND.SELECT_DISPLAY) {
     return isBoundedString(value.displayId, REMOTE_DESKTOP_LIMITS.DISPLAY_ID_BYTES)
       && value.width === undefined && value.height === undefined
+      && value.dpiScalePercent === undefined && value.requestId === undefined
       && value.frameWidth === undefined && value.frameHeight === undefined
       && value.acknowledgedSequence === undefined;
   }
@@ -866,6 +909,25 @@ function validateControl(value: Record<string, unknown>): boolean {
       && REMOTE_DESKTOP_COMMON_DISPLAY_MODES.some((mode) => (
         value.width === mode.width && value.height === mode.height
       ))
+      && value.dpiScalePercent === undefined && value.requestId === undefined
+      && value.frameWidth === undefined && value.frameHeight === undefined
+      && value.acknowledgedSequence === undefined;
+  }
+  if (value.kind === REMOTE_DESKTOP_CONTROL_KIND.SET_DISPLAY_SCALE) {
+    return isBoundedString(value.displayId, REMOTE_DESKTOP_LIMITS.DISPLAY_ID_BYTES)
+      && typeof value.dpiScalePercent === 'number'
+      && REMOTE_DESKTOP_DPI_SCALE_PERCENTS.includes(
+        value.dpiScalePercent as typeof REMOTE_DESKTOP_DPI_SCALE_PERCENTS[number],
+      )
+      && value.width === undefined && value.height === undefined
+      && value.requestId === undefined
+      && value.frameWidth === undefined && value.frameHeight === undefined
+      && value.acknowledgedSequence === undefined;
+  }
+  if (value.kind === REMOTE_DESKTOP_CONTROL_KIND.COPY_SELECTION) {
+    return isId(value.requestId)
+      && value.displayId === undefined && value.width === undefined
+      && value.height === undefined && value.dpiScalePercent === undefined
       && value.frameWidth === undefined && value.frameHeight === undefined
       && value.acknowledgedSequence === undefined;
   }
@@ -874,17 +936,20 @@ function validateControl(value: Record<string, unknown>): boolean {
       && isSafePositive(value.frameWidth) && (value.frameWidth as number) <= 16_384
       && isSafePositive(value.frameHeight) && (value.frameHeight as number) <= 16_384
       && value.width === undefined && value.height === undefined
+      && value.dpiScalePercent === undefined && value.requestId === undefined
       && value.acknowledgedSequence === undefined;
   }
   if (value.kind === REMOTE_DESKTOP_CONTROL_KIND.INPUT_ACK) {
     return isSafeNonNegative(value.acknowledgedSequence)
       && value.displayId === undefined && value.width === undefined
       && value.height === undefined && value.frameWidth === undefined
-      && value.frameHeight === undefined;
+      && value.frameHeight === undefined && value.dpiScalePercent === undefined
+      && value.requestId === undefined;
   }
   return value.displayId === undefined && value.width === undefined
     && value.height === undefined && value.frameWidth === undefined
-    && value.frameHeight === undefined && value.acknowledgedSequence === undefined;
+    && value.frameHeight === undefined && value.acknowledgedSequence === undefined
+    && value.dpiScalePercent === undefined && value.requestId === undefined;
 }
 
 export function validateRemoteDesktopDataMessage(value: unknown): RemoteDesktopValidationResult<RemoteDesktopDataMessage> {
@@ -894,6 +959,9 @@ export function validateRemoteDesktopDataMessage(value: unknown): RemoteDesktopV
   }
   if (value.type === REMOTE_DESKTOP_DATA_MSG.QUALITY && validateQuality(value)) {
     return { ok: true, value: value as unknown as RemoteDesktopQuality };
+  }
+  if (value.type === REMOTE_DESKTOP_DATA_MSG.CLIPBOARD && validateClipboard(value)) {
+    return { ok: true, value: value as unknown as RemoteDesktopClipboard };
   }
   if (value.type === REMOTE_DESKTOP_DATA_MSG.POINTER && validatePointer(value)) {
     return { ok: true, value: value as unknown as RemoteDesktopPointer };

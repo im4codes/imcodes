@@ -31,11 +31,11 @@ namespace imcodes::rd {
 struct MfH264RuntimeDiagnostics {
   bool initialized = false;
   bool hardware = false;
-  std::string preset = "720p30";
-  int width = 1280;
-  int height = 720;
+  std::string preset = "1080p30";
+  int width = 1920;
+  int height = 1080;
   int fps = 30;
-  uint32_t bitrate_bps = 3'000'000;
+  uint32_t bitrate_bps = kInitialVideoBitrateBps;
 };
 
 struct MfH264PerformanceDiagnostics {
@@ -114,7 +114,7 @@ class MfH264Encoder final : public webrtc::VideoEncoder {
   int source_width_ = 0;
   int source_height_ = 0;
   int fps_ = 30;
-  uint32_t bitrate_bps_ = 3'000'000;
+  uint32_t bitrate_bps_ = kInitialVideoBitrateBps;
   uint32_t reserved_bitrate_bps_ = 0;
   bool initialized_ = false;
   const bool prefer_hardware_;
@@ -138,7 +138,8 @@ class MfH264Encoder final : public webrtc::VideoEncoder {
   bool reconfigure_pending_ = false;
   int64_t last_encoded_timestamp_us_ = 0;
   MfH264PerformanceDiagnostics performance_;
-  QualitySelection quality_{"720p30", 1280, 720, 30, 3'000'000};
+  QualitySelection quality_{"1080p30", 1920, 1080, 30,
+                            kInitialVideoBitrateBps};
 };
 
 class MfH264EncoderFactory final : public webrtc::VideoEncoderFactory {

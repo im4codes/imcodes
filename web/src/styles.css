@@ -7747,6 +7747,7 @@ button.quick-agent-delegation-preset.active {
 .remote-desktop-mode-switch,
 .remote-desktop-view-switch,
 .remote-desktop-zoom-switch,
+.remote-desktop-clipboard-switch,
 .remote-desktop-mobile-input-switch {
   display: flex;
   align-items: center;
@@ -7844,6 +7845,28 @@ button.quick-agent-delegation-preset.active {
   opacity: .72;
 }
 
+.remote-desktop-dpi-options {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 4px;
+}
+
+.remote-desktop-resolution-menu .remote-desktop-dpi-options button {
+  min-height: 32px;
+  justify-content: center;
+  padding: 5px 3px;
+}
+
+.remote-desktop-clipboard-switch {
+  position: relative;
+}
+
+.remote-desktop-clipboard-status {
+  min-width: 54px;
+  color: #9bdfff;
+  font-size: 11px;
+}
+
 .remote-desktop-stage {
   position: relative;
   min-width: 0;
@@ -7858,7 +7881,7 @@ button.quick-agent-delegation-preset.active {
 }
 
 .remote-desktop-stage.is-controlling {
-  cursor: none;
+  cursor: default;
   box-shadow: inset 0 0 0 2px #46d78d;
 }
 

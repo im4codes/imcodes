@@ -6,6 +6,7 @@ import {
   REMOTE_DESKTOP_COMMON_DISPLAY_MODES,
   REMOTE_DESKTOP_CONTROL_KIND,
   REMOTE_DESKTOP_DATA_MSG,
+  REMOTE_DESKTOP_DPI_SCALE_PERCENTS,
   REMOTE_DESKTOP_DISPLAY_ROTATION,
   REMOTE_DESKTOP_ENCODER_CLASS,
   REMOTE_DESKTOP_ERROR,
@@ -138,9 +139,9 @@ describe('remote desktop production contract', () => {
       KEYBOARD: 'imcodes-rd-keyboard',
       POINTER: 'imcodes-rd-pointer',
     });
-    expect(WINDOWS_REMOTE_DESKTOP_QUALIFICATION_PLAN.qualityLadder).toHaveLength(7);
+    expect(WINDOWS_REMOTE_DESKTOP_QUALIFICATION_PLAN.qualityLadder).toHaveLength(9);
     expect(WINDOWS_REMOTE_DESKTOP_QUALIFICATION_PLAN.qualityLadder[0]).toMatchObject({
-      id: '2160p15', width: 3840, height: 2160, fps: 15,
+      id: '2160p30', width: 3840, height: 2160, fps: 30,
     });
     expect(WINDOWS_REMOTE_DESKTOP_QUALIFICATION_PLAN.scenarios).toContain('native_2160p15');
     expect(WINDOWS_REMOTE_DESKTOP_QUALIFICATION_PLAN.scenarios).toContain('five_minute_stability');
@@ -448,6 +449,12 @@ describe('remote desktop production contract', () => {
     expect(REMOTE_DESKTOP_COMMON_DISPLAY_MODES.map(({ width, height }) => (
       `${width}x${height}`
     ))).toEqual(['1280x720', '1920x1080', '2560x1440', '3840x2160']);
+    expect(REMOTE_DESKTOP_COMMON_DISPLAY_MODES.map((mode) => (
+      mode.recommendedDpiScalePercent
+    ))).toEqual([125, 150, 175, 225]);
+    expect(REMOTE_DESKTOP_DPI_SCALE_PERCENTS).toEqual([
+      100, 125, 150, 175, 200, 225, 250, 300,
+    ]);
     expect(validateRemoteDesktopDataMessage({
       type: REMOTE_DESKTOP_DATA_MSG.CONTROL,
       ...inputBase,
@@ -463,6 +470,44 @@ describe('remote desktop production contract', () => {
       displayId: 'display-second',
       width: 1024,
       height: 768,
+    })).toEqual({ ok: false, error: REMOTE_DESKTOP_ERROR.INVALID_REQUEST });
+    expect(validateRemoteDesktopDataMessage({
+      type: REMOTE_DESKTOP_DATA_MSG.CONTROL,
+      ...inputBase,
+      kind: REMOTE_DESKTOP_CONTROL_KIND.SET_DISPLAY_SCALE,
+      displayId: 'display-second',
+      dpiScalePercent: 150,
+    })).toMatchObject({ ok: true });
+    expect(validateRemoteDesktopDataMessage({
+      type: REMOTE_DESKTOP_DATA_MSG.CONTROL,
+      ...inputBase,
+      kind: REMOTE_DESKTOP_CONTROL_KIND.SET_DISPLAY_SCALE,
+      displayId: 'display-second',
+      dpiScalePercent: 110,
+    })).toEqual({ ok: false, error: REMOTE_DESKTOP_ERROR.INVALID_REQUEST });
+    expect(validateRemoteDesktopDataMessage({
+      type: REMOTE_DESKTOP_DATA_MSG.CONTROL,
+      ...inputBase,
+      kind: REMOTE_DESKTOP_CONTROL_KIND.COPY_SELECTION,
+      requestId: 'clipboard-request-12345678',
+    })).toMatchObject({ ok: true });
+    expect(validateRemoteDesktopDataMessage({
+      type: REMOTE_DESKTOP_DATA_MSG.CLIPBOARD,
+      protocolVersion: REMOTE_DESKTOP_PROTOCOL_VERSION,
+      sessionId,
+      sequence: 2,
+      requestId: 'clipboard-request-12345678',
+      available: true,
+      text: 'remote selection',
+    })).toMatchObject({ ok: true });
+    expect(validateRemoteDesktopDataMessage({
+      type: REMOTE_DESKTOP_DATA_MSG.CLIPBOARD,
+      protocolVersion: REMOTE_DESKTOP_PROTOCOL_VERSION,
+      sessionId,
+      sequence: 2,
+      requestId: 'clipboard-request-12345678',
+      available: false,
+      text: 'stale clipboard',
     })).toEqual({ ok: false, error: REMOTE_DESKTOP_ERROR.INVALID_REQUEST });
     expect(validateRemoteDesktopDataMessage({
       type: REMOTE_DESKTOP_DATA_MSG.CONTROL,

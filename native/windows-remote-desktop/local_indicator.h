@@ -7,6 +7,8 @@
 #include <condition_variable>
 #include <functional>
 #include <mutex>
+#include <optional>
+#include <string>
 #include <thread>
 
 #include "third_party/imcodes_remote_desktop/worker_policy.h"
@@ -32,6 +34,9 @@ class LocalIndicator {
   void Update(int viewers, int controllers);
   UINT DispatchInput(UINT count, LPINPUT inputs, int size);
   bool InputAvailable();
+  DWORD ClipboardSequence() const;
+  std::optional<std::u16string> ReadClipboardText(
+      DWORD previous_sequence);
   void Stop();
 
  private:

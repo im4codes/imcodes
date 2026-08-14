@@ -51,6 +51,11 @@ struct DisplayInfo {
 
 std::vector<DisplayInfo> EnumerateDisplays();
 std::string DisplaySourceKey(const DisplayInfo& display);
+// Windows exposes per-source DPI through DisplayConfig device-info packets.
+// The packet ids remain undocumented, so this helper validates every size,
+// source identity and supported scale before applying a change and otherwise
+// fails closed without changing the display.
+bool SetDisplayDpiScale(const DisplayInfo& display, int percent);
 
 // DXGI Desktop Duplication capture source. Capture is obtained from a D3D11
 // output duplication surface, copied through one reusable staging texture and

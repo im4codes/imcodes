@@ -5,6 +5,7 @@ import {
   REMOTE_DESKTOP_COMMON_DISPLAY_MODES,
   REMOTE_DESKTOP_CONTROL_KIND,
   REMOTE_DESKTOP_DATA_MSG,
+  REMOTE_DESKTOP_DPI_SCALE_PERCENTS,
   REMOTE_DESKTOP_ERROR,
   REMOTE_DESKTOP_KEYBOARD_KIND,
   REMOTE_DESKTOP_LIMITS,
@@ -36,6 +37,7 @@ const DATA_BUFFER_LOW_WATER_BYTES = 64 * 1024;
 const START_TIMEOUT_MS = REMOTE_DESKTOP_LIMITS.NEGOTIATION_TIMEOUT_MS + 5_000;
 const INPUT_ACK_TIMEOUT_MS = 3_000;
 const LAYOUT_TRANSITION_TIMEOUT_MS = 5_000;
+const CLIPBOARD_REQUEST_TIMEOUT_MS = 2_000;
 
 export interface RemoteDesktopSnapshot {
   state: RemoteDesktopState;
@@ -134,6 +136,32 @@ export function isRemoteDesktopKeyAllowed(
   // Windows secure attention is never synthesized. The native worker repeats
   // this denial even if a malicious browser bypasses this client check.
   return !(code === 'Delete' && modifiers.control && modifiers.alt);
+}
+
+export function chunkRemoteDesktopText(value: string): string[] | null {
+  const encoder = new TextEncoder();
+  if (!value || encoder.encode(value).byteLength > REMOTE_DESKTOP_LIMITS.PASTE_TEXT_BYTES) {
+    return null;
+  }
+  const chunks: string[] = [];
+  let chunk = '';
+  let bytes = 0;
+  let codeUnits = 0;
+  for (const symbol of value) {
+    const symbolBytes = encoder.encode(symbol).byteLength;
+    if (chunk && (bytes + symbolBytes > REMOTE_DESKTOP_LIMITS.TEXT_BYTES
+      || codeUnits + symbol.length > REMOTE_DESKTOP_LIMITS.TEXT_CODE_UNITS)) {
+      chunks.push(chunk);
+      chunk = '';
+      bytes = 0;
+      codeUnits = 0;
+    }
+    chunk += symbol;
+    bytes += symbolBytes;
+    codeUnits += symbol.length;
+  }
+  if (chunk) chunks.push(chunk);
+  return chunks;
 }
 
 class RemoteDesktopSignalingSocket {
@@ -247,6 +275,10 @@ export class RemoteDesktopClient {
   private pendingPointerMove: { x: number; y: number } | null = null;
   private pressedCodes = new Set<string>();
   private pressedButtons = new Set<string>();
+  private pendingClipboardRequests = new Map<string, {
+    resolve(value: string | null): void;
+    timer: ReturnType<typeof setTimeout>;
+  }>();
   private snapshot: RemoteDesktopSnapshot = {
     state: REMOTE_DESKTOP_STATE.AUTHORIZING,
     mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
@@ -353,6 +385,50 @@ export class RemoteDesktopClient {
     return sent;
   }
 
+  setDisplayScale(displayId: string, dpiScalePercent: number): boolean {
+    const display = this.snapshot.displays.find((candidate) => (
+      candidate.id === displayId && candidate.available
+    ));
+    if (!this.snapshot.inputEnabled || !display
+      || !REMOTE_DESKTOP_DPI_SCALE_PERCENTS.includes(
+        dpiScalePercent as typeof REMOTE_DESKTOP_DPI_SCALE_PERCENTS[number],
+      )) return false;
+    if (Math.round(display.dpiScale * 100) === dpiScalePercent) return true;
+    this.releaseAll();
+    const sent = this.sendControl({
+      type: REMOTE_DESKTOP_DATA_MSG.CONTROL,
+      ...this.inputBase(),
+      kind: REMOTE_DESKTOP_CONTROL_KIND.SET_DISPLAY_SCALE,
+      displayId,
+      dpiScalePercent,
+    });
+    if (sent) this.beginLayoutTransition();
+    return sent;
+  }
+
+  requestRemoteClipboard(): Promise<string | null> {
+    if (!this.canSendInput()) return Promise.resolve(null);
+    const requestId = randomRequestId();
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        this.pendingClipboardRequests.delete(requestId);
+        resolve(null);
+      }, CLIPBOARD_REQUEST_TIMEOUT_MS);
+      this.pendingClipboardRequests.set(requestId, { resolve, timer });
+      const sent = this.sendControl({
+        type: REMOTE_DESKTOP_DATA_MSG.CONTROL,
+        ...this.inputBase(),
+        kind: REMOTE_DESKTOP_CONTROL_KIND.COPY_SELECTION,
+        requestId,
+      });
+      if (!sent) {
+        clearTimeout(timer);
+        this.pendingClipboardRequests.delete(requestId);
+        resolve(null);
+      }
+    });
+  }
+
   /**
    * Called only from HTMLVideoElement.requestVideoFrameCallback. Receiving
    * topology metadata is not enough: the worker accepts input only after the
@@ -446,13 +522,18 @@ export class RemoteDesktopClient {
   }
 
   text(value: string): boolean {
-    if (!this.canSendInput() || !value) return false;
-    return this.sendKeyboard({
-      type: REMOTE_DESKTOP_DATA_MSG.KEYBOARD,
-      ...this.inputBase(),
-      kind: REMOTE_DESKTOP_KEYBOARD_KIND.TEXT,
-      text: value,
-    });
+    if (!this.canSendInput()) return false;
+    const chunks = chunkRemoteDesktopText(value);
+    if (!chunks) return false;
+    for (const text of chunks) {
+      if (!this.sendKeyboard({
+        type: REMOTE_DESKTOP_DATA_MSG.KEYBOARD,
+        ...this.inputBase(),
+        kind: REMOTE_DESKTOP_KEYBOARD_KIND.TEXT,
+        text,
+      })) return false;
+    }
+    return true;
   }
 
   releaseAll(): void {
@@ -711,6 +792,12 @@ export class RemoteDesktopClient {
     } else if (parsed.value.type === REMOTE_DESKTOP_DATA_MSG.QUALITY) {
       const { type: _type, protocolVersion: _protocol, sessionId: _session, sequence: _sequence, ...quality } = parsed.value;
       this.publish({ quality });
+    } else if (parsed.value.type === REMOTE_DESKTOP_DATA_MSG.CLIPBOARD) {
+      const pending = this.pendingClipboardRequests.get(parsed.value.requestId);
+      if (!pending) return;
+      clearTimeout(pending.timer);
+      this.pendingClipboardRequests.delete(parsed.value.requestId);
+      pending.resolve(parsed.value.available ? parsed.value.text ?? null : null);
     } else if (parsed.value.type === REMOTE_DESKTOP_DATA_MSG.CONTROL
       && parsed.value.kind === REMOTE_DESKTOP_CONTROL_KIND.INPUT_ACK
       && parsed.value.layoutRevision === this.snapshot.layoutRevision
@@ -1020,6 +1107,11 @@ export class RemoteDesktopClient {
     this.lastMediaProgressAt = null;
     this.clearInputAck();
     this.clearLayoutTransitionTimer();
+    for (const pending of this.pendingClipboardRequests.values()) {
+      clearTimeout(pending.timer);
+      pending.resolve(null);
+    }
+    this.pendingClipboardRequests.clear();
     this.pendingPresentedFrame = null;
     this.presentedLayoutRevision = 0;
     this.presentedDisplayId = null;

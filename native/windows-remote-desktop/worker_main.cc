@@ -304,7 +304,12 @@ class WorkerRuntime {
           signal.authority, factory_, std::move(displays),
           [this](const DisplayInfo& display) { return AcquireSource(display); },
           [this](const DisplayInfo& display) { ReleaseSource(display); },
-          &input_, signaling_thread_,
+          &input_,
+          [this] { return indicator_->ClipboardSequence(); },
+          [this](DWORD previous_sequence) {
+            return indicator_->ReadClipboardText(previous_sequence);
+          },
+          signaling_thread_,
           [this](const Json::Value& value) { writer_->Emit(value); });
       if (!session->Initialize()) {
         session->Close("media_unavailable", false);

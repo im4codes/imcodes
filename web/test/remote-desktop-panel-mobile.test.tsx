@@ -20,6 +20,10 @@ const releaseAll = vi.fn();
 const releasePointerButtons = vi.fn();
 const acknowledgePresentedFrame = vi.fn(() => true);
 const setDisplayMode = vi.fn(() => true);
+const setDisplayScale = vi.fn(() => true);
+const key = vi.fn(() => true);
+const text = vi.fn(() => true);
+const requestRemoteClipboard = vi.fn(async () => 'selected remotely');
 const selectDisplay = vi.fn(() => true);
 const stop = vi.fn();
 const { uploadFileWithDirectFallback } = vi.hoisted(() => ({
@@ -60,11 +64,13 @@ vi.mock('../src/remote-desktop-client.js', () => ({
     pointerButton = pointerButton;
     pointerMove = pointerMove;
     wheel = wheel;
-    key = vi.fn();
-    text = vi.fn();
+    key = key;
+    text = text;
     setMode = vi.fn();
     selectDisplay = selectDisplay;
     setDisplayMode = setDisplayMode;
+    setDisplayScale = setDisplayScale;
+    requestRemoteClipboard = requestRemoteClipboard;
   },
 }));
 
@@ -353,7 +359,9 @@ describe('RemoteDesktopPanel mobile gestures', () => {
       }));
     });
     expect(getByRole('menu')).not.toBeNull();
-    const modes = getAllByRole('menuitemradio');
+    const modes = getAllByRole('menuitemradio').filter((mode) => (
+      mode.textContent?.includes('×')
+    ));
     expect(modes.map((mode) => mode.textContent)).toEqual([
       '720p1280×720',
       '1080p1920×1080',
@@ -362,6 +370,17 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     ]);
     act(() => { (modes[3] as HTMLButtonElement).click(); });
     expect(setDisplayMode).toHaveBeenCalledWith('display-primary', 3840, 2160);
+
+    act(() => {
+      displayTab.dispatchEvent(new MouseEvent('contextmenu', {
+        bubbles: true,
+        cancelable: true,
+        clientX: 40,
+        clientY: 50,
+      }));
+    });
+    act(() => { (getByRole('menuitemradio', { name: '150% DPI' }) as HTMLButtonElement).click(); });
+    expect(setDisplayScale).toHaveBeenCalledWith('display-primary', 150);
 
     const secondDisplayTab = getByRole('tab', { name: 'Display 2' });
     act(() => {
@@ -372,9 +391,57 @@ describe('RemoteDesktopPanel mobile gestures', () => {
         clientY: 50,
       }));
     });
-    const secondModes = getAllByRole('menuitemradio');
+    const secondModes = getAllByRole('menuitemradio').filter((mode) => (
+      mode.textContent?.includes('×')
+    ));
     act(() => { (secondModes[0] as HTMLButtonElement).click(); });
     expect(setDisplayMode).toHaveBeenCalledWith('display-second', 1280, 720);
+  });
+
+  it('focuses the stage for physical keyboard input and supports explicit copy and paste', async () => {
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: {
+        readText: vi.fn(async () => 'local clipboard'),
+        writeText: vi.fn(async () => {}),
+      },
+    });
+    const { stage, getByRole } = await renderPanel();
+    mousePointer(stage, 'pointerdown', {
+      pointerId: 60, clientX: 200, clientY: 150,
+    });
+    expect(document.activeElement).toBe(stage);
+    act(() => stage.dispatchEvent(new KeyboardEvent('keydown', {
+      bubbles: true,
+      cancelable: true,
+      code: 'KeyA',
+      key: 'a',
+    })));
+    expect(key).toHaveBeenCalledWith('KeyA', 'a', true, false, {
+      control: false,
+      alt: false,
+    });
+
+    const pasteEvent = new Event('paste', { bubbles: true, cancelable: true });
+    Object.defineProperty(pasteEvent, 'clipboardData', {
+      value: { getData: vi.fn(() => 'pasted from event') },
+    });
+    act(() => stage.dispatchEvent(pasteEvent));
+    expect(text).toHaveBeenCalledWith('pasted from event');
+
+    await act(async () => {
+      (getByRole('button', { name: 'remote_desktop.paste_local_clipboard' }) as HTMLButtonElement).click();
+      await Promise.resolve();
+    });
+    expect(text).toHaveBeenCalledWith('local clipboard');
+
+    await act(async () => {
+      (getByRole('button', { name: 'remote_desktop.copy_remote_selection' }) as HTMLButtonElement).click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(requestRemoteClipboard).toHaveBeenCalledTimes(1);
+    expect(navigator.clipboard.writeText).toHaveBeenCalledWith('selected remotely');
   });
 
   it('opens the focused display resolution menu from the keyboard context-menu gesture', async () => {

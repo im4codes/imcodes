@@ -300,7 +300,11 @@ const contracts: Contract[] = [
       },
       {
         path: 'native/windows-remote-desktop/peer_session.cc',
-        needle: 'webrtc::DegradationPreference::BALANCED',
+        needle: 'bitrate_settings.start_bitrate_bps =',
+      },
+      {
+        path: 'native/windows-remote-desktop/peer_session.cc',
+        needle: 'webrtc::DegradationPreference::MAINTAIN_RESOLUTION',
       },
     ],
   },

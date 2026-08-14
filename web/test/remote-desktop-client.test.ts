@@ -12,7 +12,11 @@ import {
   REMOTE_DESKTOP_STATE,
   REMOTE_DESKTOP_TERMINAL_REASON,
 } from '@shared/remote-desktop.js';
-import { RemoteDesktopClient, isRemoteDesktopKeyAllowed } from '../src/remote-desktop-client.js';
+import {
+  RemoteDesktopClient,
+  chunkRemoteDesktopText,
+  isRemoteDesktopKeyAllowed,
+} from '../src/remote-desktop-client.js';
 
 class FakeSocket extends EventTarget {
   static readonly CONNECTING = 0;
@@ -243,6 +247,23 @@ describe('RemoteDesktopClient', () => {
     await vi.waitFor(() => expect(client.current().inputEnabled).toBe(true));
     intervalSpy.mockRestore();
 
+    const clipboardPromise = client.requestRemoteClipboard();
+    const clipboardRequest = JSON.parse(control.sent.at(-1)!);
+    expect(clipboardRequest).toMatchObject({
+      type: REMOTE_DESKTOP_DATA_MSG.CONTROL,
+      kind: REMOTE_DESKTOP_CONTROL_KIND.COPY_SELECTION,
+    });
+    control.receive({
+      type: REMOTE_DESKTOP_DATA_MSG.CLIPBOARD,
+      protocolVersion: REMOTE_DESKTOP_PROTOCOL_VERSION,
+      sessionId: 'session_12345678',
+      sequence: 4,
+      requestId: clipboardRequest.requestId,
+      available: true,
+      text: 'selected remotely',
+    });
+    await expect(clipboardPromise).resolves.toBe('selected remotely');
+
     expect(client.key('ControlLeft', 'Control', true, false, { control: true, alt: false })).toBe(true);
     expect(client.pointerButton('left', true, 0.4, 0.6)).toBe(true);
     client.releasePointerButtons();
@@ -385,6 +406,9 @@ describe('RemoteDesktopClient', () => {
     const messagesBeforeNoop = control.sent.length;
     expect(client.setDisplayMode('display_12345678', 3840, 2160)).toBe(true);
     expect(control.sent).toHaveLength(messagesBeforeNoop);
+    expect(client.setDisplayScale('display_12345678', 225)).toBe(true);
+    expect(control.sent).toHaveLength(messagesBeforeNoop);
+    expect(client.setDisplayScale('display_12345678', 110)).toBe(false);
     expect(client.setDisplayMode('display_12345678', 1024, 768)).toBe(false);
     expect(client.setDisplayMode('missing-display', 1280, 720)).toBe(false);
     expect(client.setDisplayMode('display_12345678', 1280, 720)).toBe(true);
@@ -541,6 +565,18 @@ describe('RemoteDesktopClient', () => {
       type: REMOTE_DESKTOP_MSG.STOP,
       aggregateBytesReceived: 54_321,
     });
+  });
+
+  it('chunks paste text on UTF-8 and UTF-16 boundaries without splitting surrogate pairs', () => {
+    const chunks = chunkRemoteDesktopText(`${'界'.repeat(1_500)}${'😀'.repeat(1_100)}`);
+    expect(chunks).not.toBeNull();
+    expect(chunks!.join('')).toBe(`${'界'.repeat(1_500)}${'😀'.repeat(1_100)}`);
+    expect(chunks!.every((chunk) => (
+      new TextEncoder().encode(chunk).byteLength <= REMOTE_DESKTOP_LIMITS.TEXT_BYTES
+      && chunk.length <= REMOTE_DESKTOP_LIMITS.TEXT_CODE_UNITS
+    ))).toBe(true);
+    expect(chunkRemoteDesktopText('x'.repeat(REMOTE_DESKTOP_LIMITS.PASTE_TEXT_BYTES + 1)))
+      .toBeNull();
   });
 
   it('marks retry starts with a bounded reconnect attempt', async () => {

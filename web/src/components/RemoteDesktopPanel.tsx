@@ -4,6 +4,7 @@ import {
   REMOTE_DESKTOP_ACCESS_MODE,
   REMOTE_DESKTOP_CAPABILITY,
   REMOTE_DESKTOP_COMMON_DISPLAY_MODES,
+  REMOTE_DESKTOP_DPI_SCALE_PERCENTS,
   REMOTE_DESKTOP_ERROR,
   REMOTE_DESKTOP_LIMITS,
   REMOTE_DESKTOP_STATE,
@@ -19,6 +20,7 @@ import {
   type FileUploadTransportMode,
 } from '../direct-file-transfer.js';
 import { RemoteDesktopClient, type RemoteDesktopSnapshot } from '../remote-desktop-client.js';
+import { copyToClipboard } from '../util/clipboard.js';
 import type { WsClient } from '../ws-client.js';
 import { FloatingPanel } from './FloatingPanel.js';
 import {
@@ -32,6 +34,7 @@ import {
 
 type ViewScale = 'fit' | 'actual';
 type MobileInputMode = 'touch' | 'mouse';
+type ClipboardStatus = 'idle' | 'copying' | 'copied' | 'pasting' | 'pasted' | 'empty' | 'failed';
 
 interface TouchPoint {
   x: number;
@@ -138,6 +141,7 @@ export function RemoteDesktopPanel({ machine, ws = null, onClose }: RemoteDeskto
   const [transferError, setTransferError] = useState<string | null>(null);
   const [fetchPath, setFetchPath] = useState('');
   const [displayModeMenu, setDisplayModeMenu] = useState<DisplayModeMenuState | null>(null);
+  const [clipboardStatus, setClipboardStatus] = useState<ClipboardStatus>('idle');
   const clientRef = useRef<RemoteDesktopClient | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const stageRef = useRef<HTMLDivElement | null>(null);
@@ -402,7 +406,7 @@ export function RemoteDesktopPanel({ machine, ws = null, onClose }: RemoteDeskto
     setDisplayModeMenu({
       displayId,
       x: Math.max(8, Math.min(requestedX, window.innerWidth - 224)),
-      y: Math.max(8, Math.min(requestedY, window.innerHeight - 244)),
+      y: Math.max(8, Math.min(requestedY, window.innerHeight - 460)),
     });
   };
 
@@ -772,6 +776,9 @@ export function RemoteDesktopPanel({ machine, ws = null, onClose }: RemoteDeskto
   };
 
   const onPointerButton = (event: PointerEvent, down: boolean) => {
+    if (down && snapshot.inputEnabled) {
+      stageRef.current?.focus({ preventScroll: true });
+    }
     if (event.pointerType === 'touch') {
       if (down) onTouchDown(event);
       else onTouchEnd(event);
@@ -787,7 +794,9 @@ export function RemoteDesktopPanel({ machine, ws = null, onClose }: RemoteDeskto
     const point = normalizedPoint(event);
     if (down && !point) return;
     event.preventDefault();
-    if (down) (event.currentTarget as HTMLElement).setPointerCapture?.(event.pointerId);
+    if (down) {
+      (event.currentTarget as HTMLElement).setPointerCapture?.(event.pointerId);
+    }
     clientRef.current?.pointerButton(button, down, point?.x, point?.y);
   };
 
@@ -810,6 +819,39 @@ export function RemoteDesktopPanel({ machine, ws = null, onClose }: RemoteDeskto
       alt: event.altKey,
     });
     if (sent) event.preventDefault();
+  };
+
+  const sendPastedText = (text: string): boolean => {
+    if (!snapshot.inputEnabled || !text) return false;
+    const sent = clientRef.current?.text(text) ?? false;
+    if (sent) stageRef.current?.focus({ preventScroll: true });
+    return sent;
+  };
+
+  const pasteLocalClipboard = async () => {
+    if (!snapshot.inputEnabled) return;
+    setClipboardStatus('pasting');
+    try {
+      const text = await navigator.clipboard?.readText?.();
+      if (!text) {
+        setClipboardStatus('empty');
+        return;
+      }
+      setClipboardStatus(sendPastedText(text) ? 'pasted' : 'failed');
+    } catch {
+      setClipboardStatus('failed');
+    }
+  };
+
+  const copyRemoteSelection = async () => {
+    if (!snapshot.inputEnabled) return;
+    setClipboardStatus('copying');
+    const text = await clientRef.current?.requestRemoteClipboard();
+    if (!text) {
+      setClipboardStatus('empty');
+      return;
+    }
+    copyToClipboard(text, () => setClipboardStatus('copied'));
   };
 
   const stopAndClose = () => {
@@ -996,6 +1038,21 @@ export function RemoteDesktopPanel({ machine, ws = null, onClose }: RemoteDeskto
             <button type="button" aria-pressed={viewScale === 'actual'} onClick={() => setViewScale('actual')}>{t('remote_desktop.actual_size')}</button>
             <button type="button" onClick={() => { void toggleFullscreen(); }}>{t('remote_desktop.fullscreen')}</button>
           </div>
+          <div class="remote-desktop-clipboard-switch" role="group" aria-label={t('remote_desktop.clipboard_label')}>
+            <button
+              type="button"
+              disabled={!snapshot.inputEnabled || clipboardStatus === 'copying'}
+              onClick={() => { void copyRemoteSelection(); }}
+            >{t('remote_desktop.copy_remote_selection')}</button>
+            <button
+              type="button"
+              disabled={!snapshot.inputEnabled || clipboardStatus === 'pasting'}
+              onClick={() => { void pasteLocalClipboard(); }}
+            >{t('remote_desktop.paste_local_clipboard')}</button>
+            <span class="remote-desktop-clipboard-status" aria-live="polite">
+              {clipboardStatus === 'idle' ? '' : t(`remote_desktop.clipboard_${clipboardStatus}`)}
+            </span>
+          </div>
           <div class="remote-desktop-zoom-switch" role="group" aria-label={t('remote_desktop.zoom_label')}>
             <button type="button" aria-label={t('remote_desktop.zoom_out')} disabled={viewport.scale <= 1} onClick={() => changeZoom(-0.5)}>−</button>
             <button type="button" aria-label={t('remote_desktop.zoom_reset')} disabled={viewport.scale === 1 && viewport.x === 0 && viewport.y === 0} onClick={() => commitViewport(INITIAL_REMOTE_DESKTOP_VIEWPORT)}>{Math.round(viewport.scale * 100)}%</button>
@@ -1043,6 +1100,23 @@ export function RemoteDesktopPanel({ machine, ws = null, onClose }: RemoteDeskto
                   <small>{mode.width}×{mode.height}</small>
                 </button>
               ))}
+              <strong>{t('remote_desktop.dpi_menu')}</strong>
+              <div class="remote-desktop-dpi-options" role="group" aria-label={t('remote_desktop.dpi_menu')}>
+                {REMOTE_DESKTOP_DPI_SCALE_PERCENTS.map((dpiScalePercent) => (
+                  <button
+                    key={dpiScalePercent}
+                    type="button"
+                    role="menuitemradio"
+                    aria-label={`${dpiScalePercent}% DPI`}
+                    aria-checked={Math.round(display.dpiScale * 100) === dpiScalePercent}
+                    disabled={!snapshot.inputEnabled}
+                    onClick={() => {
+                      clientRef.current?.setDisplayScale(display.id, dpiScalePercent);
+                      setDisplayModeMenu(null);
+                    }}
+                  >{dpiScalePercent}%</button>
+                ))}
+              </div>
             </div>
           );
         })()}
@@ -1071,6 +1145,14 @@ export function RemoteDesktopPanel({ machine, ws = null, onClose }: RemoteDeskto
           onContextMenu={(event) => { if (snapshot.inputEnabled) event.preventDefault(); }}
           onCompositionEnd={(event) => {
             if (snapshot.inputEnabled) clientRef.current?.text((event as CompositionEvent).data);
+          }}
+          onPaste={(event) => {
+            if (!snapshot.inputEnabled) return;
+            const text = (event as ClipboardEvent).clipboardData?.getData('text/plain') ?? '';
+            if (sendPastedText(text)) {
+              event.preventDefault();
+              setClipboardStatus('pasted');
+            }
           }}
         >
           <video

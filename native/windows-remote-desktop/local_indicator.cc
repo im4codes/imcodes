@@ -17,6 +17,7 @@ constexpr UINT kUpdateMessage = WM_APP + 1;
 constexpr UINT kStopMessage = WM_APP + 2;
 constexpr UINT kDispatchInputMessage = WM_APP + 3;
 constexpr UINT kProbeInputMessage = WM_APP + 4;
+constexpr UINT kReadClipboardMessage = WM_APP + 5;
 constexpr int kExpandedWidth = 368;
 constexpr int kExpandedHeight = 148;
 constexpr int kCollapsedSize = 38;
@@ -28,6 +29,12 @@ struct InputDispatchRequest {
   int size = 0;
   UINT accepted = 0;
   DWORD error = ERROR_SUCCESS;
+};
+
+struct ClipboardReadRequest {
+  DWORD previous_sequence = 0;
+  std::u16string text;
+  bool available = false;
 };
 
 bool ReadCollapsedPreference() {
@@ -147,6 +154,23 @@ bool LocalIndicator::InputAvailable() {
   return window && SendMessageW(window, kProbeInputMessage, 0, 0) == TRUE;
 }
 
+DWORD LocalIndicator::ClipboardSequence() const {
+  return GetClipboardSequenceNumber();
+}
+
+std::optional<std::u16string> LocalIndicator::ReadClipboardText(
+    DWORD previous_sequence) {
+  const HWND window = window_.load();
+  if (!window) return std::nullopt;
+  ClipboardReadRequest request;
+  request.previous_sequence = previous_sequence;
+  SendMessageW(window, kReadClipboardMessage, 0,
+               reinterpret_cast<LPARAM>(&request));
+  return request.available
+             ? std::optional<std::u16string>(std::move(request.text))
+             : std::nullopt;
+}
+
 void LocalIndicator::Stop() {
   if (!thread_.joinable()) return;
   stopping_ = true;
@@ -261,6 +285,36 @@ LRESULT LocalIndicator::HandleMessage(HWND window, UINT message,
     case kProbeInputMessage: {
       POINT cursor{};
       return GetCursorPos(&cursor) && SetCursorPos(cursor.x, cursor.y);
+    }
+    case kReadClipboardMessage: {
+      auto* request = reinterpret_cast<ClipboardReadRequest*>(lparam);
+      if (!request || GetClipboardSequenceNumber() == 0 ||
+          GetClipboardSequenceNumber() == request->previous_sequence ||
+          !OpenClipboard(window)) {
+        return 0;
+      }
+      const HANDLE data = GetClipboardData(CF_UNICODETEXT);
+      const SIZE_T allocation_bytes = data ? GlobalSize(data) : 0;
+      const auto* value = data
+          ? static_cast<const wchar_t*>(GlobalLock(data))
+          : nullptr;
+      constexpr size_t kMaximumClipboardCodeUnits = 4096;
+      size_t length = 0;
+      if (value && allocation_bytes >= sizeof(wchar_t)) {
+        const size_t allocation_units = allocation_bytes / sizeof(wchar_t);
+        const size_t scan_limit = std::min(
+            allocation_units, kMaximumClipboardCodeUnits + 1);
+        while (length < scan_limit && value[length] != L'\0') ++length;
+        if (length > 0 && length <= kMaximumClipboardCodeUnits &&
+            length < allocation_units) {
+          request->text.assign(
+              reinterpret_cast<const char16_t*>(value), length);
+          request->available = true;
+        }
+      }
+      if (value) GlobalUnlock(data);
+      CloseClipboard();
+      return request->available ? TRUE : FALSE;
     }
     case kStopMessage:
       DestroyWindow(window);

@@ -13,9 +13,13 @@ struct QualitySelection {
   uint32_t bitrate_bps;
 };
 
+// Seed libwebrtc with a crisp desktop prior without turning that prior into a
+// hard floor: congestion feedback may still reduce the stream to 350 kbps.
+// Direct sessions may then probe up to the user-facing 15 Mbps ceiling.
 inline constexpr uint32_t kMinVideoBitrateBps = 350'000;
-inline constexpr uint32_t kPerPeerVideoBitrateBps = 8'000'000;
-inline constexpr uint32_t kAggregateVideoBitrateBps = 24'000'000;
+inline constexpr uint32_t kInitialVideoBitrateBps = 12'000'000;
+inline constexpr uint32_t kPerPeerVideoBitrateBps = 15'000'000;
+inline constexpr uint32_t kAggregateVideoBitrateBps = 60'000'000;
 
 // Returns this encoder's new reservation after accounting for all other live
 // encoders. A zero result means the aggregate budget cannot fit even the

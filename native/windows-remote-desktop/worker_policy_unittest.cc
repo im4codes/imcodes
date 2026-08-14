@@ -76,6 +76,18 @@ TEST(WorkerPolicyTest, AllowsOnlyFixedCommonDisplayModes) {
   EXPECT_FALSE(IsAllowedRemoteDisplayMode(0, 0));
 }
 
+TEST(WorkerPolicyTest, AllowsOnlyFixedDpiScalesAndRecommendsPerResolution) {
+  for (const int percent : {100, 125, 150, 175, 200, 225, 250, 300})
+    EXPECT_TRUE(IsAllowedRemoteDisplayScale(percent));
+  EXPECT_FALSE(IsAllowedRemoteDisplayScale(110));
+  EXPECT_FALSE(IsAllowedRemoteDisplayScale(500));
+  EXPECT_EQ(RecommendedRemoteDisplayScale(1280, 720), 125);
+  EXPECT_EQ(RecommendedRemoteDisplayScale(1920, 1080), 150);
+  EXPECT_EQ(RecommendedRemoteDisplayScale(2560, 1440), 175);
+  EXPECT_EQ(RecommendedRemoteDisplayScale(3840, 2160), 225);
+  EXPECT_EQ(RecommendedRemoteDisplayScale(1024, 768), 100);
+}
+
 TEST(WorkerPolicyTest, RequiresPresentedFrameGeometryForSelectedDisplay) {
   EXPECT_TRUE(PresentedFrameMatchesDisplay(1920, 1080, 3840, 2160));
   EXPECT_TRUE(PresentedFrameMatchesDisplay(1600, 900, 3840, 2160));

@@ -4,6 +4,7 @@
 #include <cmath>
 #include <limits>
 #include <optional>
+#include <thread>
 #include <utility>
 
 #include "api/jsep.h"
@@ -14,6 +15,7 @@
 #include "api/set_remote_description_observer_interface.h"
 #include "api/stats/rtc_stats_collector_callback.h"
 #include "api/stats/rtcstats_objects.h"
+#include "api/transport/bitrate_settings.h"
 #include "rtc_base/logging.h"
 #include "third_party/imcodes_remote_desktop/mf_h264_encoder.h"
 #include "third_party/imcodes_remote_desktop/quality_ladder.h"
@@ -98,6 +100,22 @@ std::u16string Utf8ToUtf16(const std::string& value) {
                         wide.size());
 }
 
+std::string Utf16ToUtf8(const std::u16string& value) {
+  if (value.empty()) return {};
+  const auto* wide = reinterpret_cast<const wchar_t*>(value.data());
+  const int size = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, wide,
+                                       static_cast<int>(value.size()), nullptr,
+                                       0, nullptr, nullptr);
+  if (size <= 0) return {};
+  std::string result(static_cast<size_t>(size), '\0');
+  if (WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, wide,
+                          static_cast<int>(value.size()), result.data(), size,
+                          nullptr, nullptr) != size) {
+    return {};
+  }
+  return result;
+}
+
 bool SameDisplay(const DisplayInfo& left, const DisplayInfo& right) {
   return left.id == right.id && left.label == right.label &&
          left.device_name == right.device_name &&
@@ -174,11 +192,14 @@ std::shared_ptr<PeerSession> PeerSession::Create(
     AcquireSource acquire_source,
     ReleaseSource release_source,
     InputArbiter* input,
+    ClipboardSequence clipboard_sequence,
+    ReadClipboardText read_clipboard_text,
     webrtc::Thread* signaling_thread,
     EmitJson emit) {
   return std::shared_ptr<PeerSession>(new PeerSession(
       std::move(authority), std::move(factory), std::move(displays),
       std::move(acquire_source), std::move(release_source), input,
+      std::move(clipboard_sequence), std::move(read_clipboard_text),
       signaling_thread,
       std::move(emit)));
 }
@@ -190,6 +211,8 @@ PeerSession::PeerSession(
     AcquireSource acquire_source,
     ReleaseSource release_source,
     InputArbiter* input,
+    ClipboardSequence clipboard_sequence,
+    ReadClipboardText read_clipboard_text,
     webrtc::Thread* signaling_thread,
     EmitJson emit)
     : authority_(std::move(authority)),
@@ -198,6 +221,8 @@ PeerSession::PeerSession(
       acquire_source_(std::move(acquire_source)),
       release_source_(std::move(release_source)),
       input_(input),
+      clipboard_sequence_(std::move(clipboard_sequence)),
+      read_clipboard_text_(std::move(read_clipboard_text)),
       signaling_thread_(signaling_thread),
       emit_(std::move(emit)) {
   const auto primary = std::find_if(displays_.begin(), displays_.end(),
@@ -213,6 +238,18 @@ PeerSession::~PeerSession() {
 }
 
 bool PeerSession::Initialize() {
+  const auto startup_virtual_display = std::find_if(
+      displays_.begin(), displays_.end(),
+      [](const DisplayInfo& display) { return display.imcodes_virtual; });
+  if (startup_virtual_display != displays_.end()) {
+    const int recommended = RecommendedRemoteDisplayScale(
+        startup_virtual_display->width, startup_virtual_display->height);
+    if (std::lround(startup_virtual_display->dpi_scale * 100.0) != recommended &&
+        SetDisplayDpiScale(*startup_virtual_display, recommended)) {
+      std::vector<DisplayInfo> refreshed = EnumerateDisplays();
+      if (!refreshed.empty()) displays_ = std::move(refreshed);
+    }
+  }
   if (!factory_ || displays_.empty() || !input_ || !signaling_thread_ ||
       !signaling_thread_->IsCurrent()) {
     return false;
@@ -235,6 +272,14 @@ bool PeerSession::Initialize() {
       config, std::move(dependencies));
   if (!result.ok()) return false;
   peer_ = std::move(result.value());
+  webrtc::BitrateSettings bitrate_settings;
+  bitrate_settings.min_bitrate_bps =
+      static_cast<int>(kMinVideoBitrateBps);
+  bitrate_settings.start_bitrate_bps =
+      static_cast<int>(kInitialVideoBitrateBps);
+  bitrate_settings.max_bitrate_bps =
+      static_cast<int>(kPerPeerVideoBitrateBps);
+  if (!peer_->SetBitrate(bitrate_settings).ok()) return false;
   // An IM.codes virtual display exists only after the real desktop failed its
   // bounded presentability gate. Prefer that exact adapter on the retry; never
   // select a similarly named third-party virtual adapter. Without it, retain
@@ -284,7 +329,7 @@ bool PeerSession::Initialize() {
     encoding.max_framerate = 30.0;
   }
   parameters.degradation_preference =
-      webrtc::DegradationPreference::BALANCED;
+      webrtc::DegradationPreference::MAINTAIN_RESOLUTION;
   if (!added.value()->SetParameters(parameters).ok()) return false;
   Json::Value initial = BaseEnvelope(kModeStateType, authority_);
   initial["mode"] = authority_.mode;
@@ -847,14 +892,17 @@ void PeerSession::HandleControl(const std::string& channel,
                                 const Json::Value& root) {
   if (!ExactKeys(root, {"type", "protocolVersion", "sessionId", "sequence",
                         "layoutRevision", "inputEpoch", "kind"},
-                 {"displayId", "width", "height",
+                 {"displayId", "width", "height", "dpiScalePercent",
+                  "requestId",
                   "frameWidth", "frameHeight", "acknowledgedSequence"}) ||
       !root["kind"].isString()) {
     return;
   }
   const std::string kind = root["kind"].asString();
   uint64_t sequence = 0;
-  if (!ValidateInputBase(root, channel, kind == "set_display_mode",
+  const bool require_control = kind == "set_display_mode" ||
+      kind == "set_display_scale" || kind == "copy_selection";
+  if (!ValidateInputBase(root, channel, require_control,
                          &sequence)) {
     return;
   }
@@ -863,13 +911,15 @@ void PeerSession::HandleControl(const std::string& channel,
     if (root.isMember("displayId") || root.isMember("width") ||
         root.isMember("height") || root.isMember("frameWidth") ||
         root.isMember("frameHeight") ||
+        root.isMember("dpiScalePercent") || root.isMember("requestId") ||
         root.isMember("acknowledgedSequence"))
       return;
   } else if (kind == "frame_presented") {
     if (selection_required_ || selected_display_ >= displays_.size() ||
         !root["displayId"].isString() || !root["frameWidth"].isInt() ||
         !root["frameHeight"].isInt() || root.isMember("width") ||
-        root.isMember("height") || root.isMember("acknowledgedSequence") ||
+        root.isMember("height") || root.isMember("dpiScalePercent") ||
+        root.isMember("requestId") || root.isMember("acknowledgedSequence") ||
         root["displayId"].asString() != displays_[selected_display_].id ||
         !PresentedFrameMatchesDisplay(
             root["frameWidth"].asInt(), root["frameHeight"].asInt(),
@@ -881,6 +931,7 @@ void PeerSession::HandleControl(const std::string& channel,
   } else if (kind == "select_display") {
     if (!root["displayId"].isString() ||
         root.isMember("width") || root.isMember("height") ||
+        root.isMember("dpiScalePercent") || root.isMember("requestId") ||
         root.isMember("frameWidth") || root.isMember("frameHeight") ||
         root.isMember("acknowledgedSequence") ||
         !ConsumeRate("monitor", 30, std::chrono::minutes(1)) ||
@@ -890,11 +941,34 @@ void PeerSession::HandleControl(const std::string& channel,
   } else if (kind == "set_display_mode") {
     if (!root["displayId"].isString() || !root["width"].isInt() ||
         !root["height"].isInt() || root.isMember("frameWidth") ||
-        root.isMember("frameHeight") ||
+        root.isMember("frameHeight") || root.isMember("dpiScalePercent") ||
+        root.isMember("requestId") ||
         root.isMember("acknowledgedSequence") ||
         !ConsumeRate("monitor", 30, std::chrono::minutes(1)) ||
         !SetDisplayMode(root["displayId"].asString(), root["width"].asInt(),
                         root["height"].asInt())) {
+      return;
+    }
+  } else if (kind == "set_display_scale") {
+    if (!root["displayId"].isString() || !root["dpiScalePercent"].isInt() ||
+        root.isMember("width") || root.isMember("height") ||
+        root.isMember("requestId") || root.isMember("frameWidth") ||
+        root.isMember("frameHeight") ||
+        root.isMember("acknowledgedSequence") ||
+        !ConsumeRate("monitor", 30, std::chrono::minutes(1)) ||
+        !SetDisplayScale(root["displayId"].asString(),
+                         root["dpiScalePercent"].asInt())) {
+      return;
+    }
+  } else if (kind == "copy_selection") {
+    if (!root["requestId"].isString() ||
+        !IsSafeId(root["requestId"].asString()) ||
+        root.isMember("displayId") || root.isMember("width") ||
+        root.isMember("height") || root.isMember("dpiScalePercent") ||
+        root.isMember("frameWidth") || root.isMember("frameHeight") ||
+        root.isMember("acknowledgedSequence") ||
+        !ConsumeRate("clipboard", 30, std::chrono::minutes(1)) ||
+        !CopySelection(root["requestId"].asString())) {
       return;
     }
   } else {
@@ -1076,6 +1150,38 @@ void PeerSession::SendInputAck(uint64_t acknowledged_sequence) {
   SendControl(root);
 }
 
+bool PeerSession::CopySelection(const std::string& request_id) {
+  if (!clipboard_sequence_ || !read_clipboard_text_)
+    return SendClipboard(request_id, std::nullopt);
+  const DWORD previous_sequence = clipboard_sequence_();
+  const std::string owner = authority_.session_id + ":clipboard";
+  if (!input_->CopyShortcut(owner))
+    return SendClipboard(request_id, std::nullopt);
+  for (int attempt = 0; attempt < 6; ++attempt) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    const auto text = read_clipboard_text_(previous_sequence);
+    if (text) return SendClipboard(request_id, text);
+  }
+  return SendClipboard(request_id, std::nullopt);
+}
+
+bool PeerSession::SendClipboard(
+    const std::string& request_id,
+    const std::optional<std::u16string>& text) {
+  std::string encoded = text ? Utf16ToUtf8(*text) : std::string{};
+  const bool available = !encoded.empty() &&
+      encoded.size() <= kMaxClipboardTextBytes;
+  Json::Value root(Json::objectValue);
+  root["type"] = kClipboardType;
+  root["protocolVersion"] = kProtocolVersion;
+  root["sessionId"] = authority_.session_id;
+  root["sequence"] = Json::UInt64(outbound_sequence_++);
+  root["requestId"] = request_id;
+  root["available"] = available;
+  if (available) root["text"] = std::move(encoded);
+  return SendControl(root);
+}
+
 void PeerSession::SendStatus(const char* state, bool input_enabled) {
   Json::Value root = BaseEnvelope(kStatusType, authority_);
   root["mode"] = authority_.mode;
@@ -1190,6 +1296,41 @@ bool PeerSession::SetDisplayMode(const std::string& id,
     SendStatus(relayed_ ? "relayed" : "direct", InputReady());
     return false;
   }
+  // Resolution presets carry a readable Windows UI scale.  This is automatic
+  // only after an explicit remote mode change (and on the IM.codes headless
+  // display during startup); arbitrary physical displays are never changed in
+  // the background.
+  SetDisplayDpiScale(
+      *found, RecommendedRemoteDisplayScale(width, height));
+  SendStatus("switching_display", false);
+  return true;
+}
+
+bool PeerSession::SetDisplayScale(const std::string& id, int percent) {
+  if (!IsAllowedRemoteDisplayScale(percent)) return false;
+  const auto found = std::find_if(displays_.begin(), displays_.end(),
+                                  [&](const DisplayInfo& display) {
+                                    return display.id == id && display.available;
+                                  });
+  if (found == displays_.end() || found->device_name.empty()) return false;
+  if (std::lround(found->dpi_scale * 100.0) == percent) {
+    SendStatus(relayed_ ? "relayed" : "direct", InputReady());
+    return true;
+  }
+  ReleaseInput();
+  const bool previous_layout_acknowledged = layout_acknowledged_;
+  layout_acknowledged_ = false;
+  if (!SetDisplayDpiScale(*found, percent)) {
+    layout_acknowledged_ = previous_layout_acknowledged;
+    SendTopology();
+    SendStatus(relayed_ ? "relayed" : "direct", InputReady());
+    return false;
+  }
+  found->dpi_scale = static_cast<double>(percent) / 100.0;
+  ++layout_revision_;
+  last_sequence_by_channel_.clear();
+  SendTopology();
+  SendQuality();
   SendStatus("switching_display", false);
   return true;
 }

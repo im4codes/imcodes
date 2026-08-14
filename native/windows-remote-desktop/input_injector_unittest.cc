@@ -121,5 +121,20 @@ TEST(InputArbiterTest, CrashRecoveryReleasesOnlySupportedKeysAndButtons) {
   }));
 }
 
+TEST(InputArbiterTest, CopyShortcutAlwaysReleasesControlAndC) {
+  std::vector<INPUT> dispatched;
+  InputArbiter input([&](UINT count, LPINPUT values, int size) {
+    EXPECT_EQ(size, static_cast<int>(sizeof(INPUT)));
+    dispatched.insert(dispatched.end(), values, values + count);
+    return count;
+  });
+  EXPECT_TRUE(input.CopyShortcut("clipboard-owner"));
+  ASSERT_EQ(dispatched.size(), 4u);
+  EXPECT_EQ(dispatched[0].ki.dwFlags & KEYEVENTF_KEYUP, 0u);
+  EXPECT_EQ(dispatched[1].ki.dwFlags & KEYEVENTF_KEYUP, 0u);
+  EXPECT_NE(dispatched[2].ki.dwFlags & KEYEVENTF_KEYUP, 0u);
+  EXPECT_NE(dispatched[3].ki.dwFlags & KEYEVENTF_KEYUP, 0u);
+}
+
 }  // namespace
 }  // namespace imcodes::rd

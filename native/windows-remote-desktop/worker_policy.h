@@ -52,6 +52,8 @@ bool DisplaySelectionRequiresExplicitChoice(
     const std::string& previous_id);
 
 bool IsAllowedRemoteDisplayMode(int width, int height);
+bool IsAllowedRemoteDisplayScale(int percent);
+int RecommendedRemoteDisplayScale(int width, int height);
 // A browser may re-enable input only after presenting a decoded frame whose
 // geometry is compatible with the currently selected display. Adaptive
 // encoding may scale the dimensions but must preserve the display aspect.

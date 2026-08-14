@@ -7,6 +7,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <string>
 #include <vector>
@@ -26,6 +27,9 @@ using EmitJson = std::function<void(const Json::Value&)>;
 using AcquireSource = std::function<webrtc::scoped_refptr<DxgiDesktopSource>(
     const DisplayInfo&)>;
 using ReleaseSource = std::function<void(const DisplayInfo&)>;
+using ClipboardSequence = std::function<DWORD()>;
+using ReadClipboardText =
+    std::function<std::optional<std::u16string>(DWORD)>;
 
 class PeerSession;
 
@@ -50,6 +54,8 @@ class PeerSession final : public webrtc::PeerConnectionObserver,
       AcquireSource acquire_source,
       ReleaseSource release_source,
       InputArbiter* input,
+      ClipboardSequence clipboard_sequence,
+      ReadClipboardText read_clipboard_text,
       webrtc::Thread* signaling_thread,
       EmitJson emit);
   ~PeerSession() override;
@@ -101,6 +107,8 @@ class PeerSession final : public webrtc::PeerConnectionObserver,
               AcquireSource acquire_source,
               ReleaseSource release_source,
               InputArbiter* input,
+              ClipboardSequence clipboard_sequence,
+              ReadClipboardText read_clipboard_text,
               webrtc::Thread* signaling_thread,
               EmitJson emit);
 
@@ -119,11 +127,15 @@ class PeerSession final : public webrtc::PeerConnectionObserver,
   void SendTopology();
   void SendQuality();
   void SendInputAck(uint64_t acknowledged_sequence);
+  bool CopySelection(const std::string& request_id);
+  bool SendClipboard(const std::string& request_id,
+                     const std::optional<std::u16string>& text);
   void SendStatus(const char* state, bool input_enabled);
   void EmitIceCandidate(std::string mid, std::string candidate);
   bool FlushPendingRemoteIce();
   bool SelectDisplay(const std::string& id);
   bool SetDisplayMode(const std::string& id, int width, int height);
+  bool SetDisplayScale(const std::string& id, int percent);
   bool SendControl(const Json::Value& value);
   bool ChannelsReady() const;
   bool InputReady() const;
@@ -137,6 +149,8 @@ class PeerSession final : public webrtc::PeerConnectionObserver,
   const AcquireSource acquire_source_;
   const ReleaseSource release_source_;
   InputArbiter* const input_;
+  const ClipboardSequence clipboard_sequence_;
+  const ReadClipboardText read_clipboard_text_;
   webrtc::Thread* const signaling_thread_;
   const EmitJson emit_;
   webrtc::scoped_refptr<webrtc::PeerConnectionInterface> peer_;

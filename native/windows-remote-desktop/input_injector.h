@@ -32,6 +32,7 @@ class InputArbiter {
   bool Move(const DisplayInfo& display, double x, double y);
   bool Wheel(double delta_x, double delta_y);
   bool Text(const std::u16string& value);
+  bool CopyShortcut(const std::string& owner);
   bool ReleaseOwner(const std::string& owner);
   bool RetryPendingReleases();
 

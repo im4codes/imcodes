@@ -240,6 +240,15 @@ bool InputArbiter::Text(const std::u16string& value) {
   return Dispatch(inputs.data(), static_cast<UINT>(inputs.size()));
 }
 
+bool InputArbiter::CopyShortcut(const std::string& owner) {
+  const bool control_down = KeyDown(owner, "ControlLeft", false);
+  const bool copy_down = control_down && KeyDown(owner, "KeyC", false);
+  const bool copy_up = !copy_down || KeyUp(owner, "KeyC");
+  const bool control_up = !control_down || KeyUp(owner, "ControlLeft");
+  const bool released = ReleaseOwner(owner);
+  return control_down && copy_down && copy_up && control_up && released;
+}
+
 bool InputArbiter::ReleaseOwner(const std::string& owner) {
   std::lock_guard<std::mutex> lock(mutex_);
   for (auto iterator = key_owners_.begin(); iterator != key_owners_.end();) {

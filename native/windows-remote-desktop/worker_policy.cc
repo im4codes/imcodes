@@ -86,6 +86,30 @@ bool IsAllowedRemoteDisplayMode(int width, int height) {
          (width == 3840 && height == 2160);
 }
 
+bool IsAllowedRemoteDisplayScale(int percent) {
+  switch (percent) {
+    case 100:
+    case 125:
+    case 150:
+    case 175:
+    case 200:
+    case 225:
+    case 250:
+    case 300:
+      return true;
+    default:
+      return false;
+  }
+}
+
+int RecommendedRemoteDisplayScale(int width, int height) {
+  if (width == 1280 && height == 720) return 125;
+  if (width == 1920 && height == 1080) return 150;
+  if (width == 2560 && height == 1440) return 175;
+  if (width == 3840 && height == 2160) return 225;
+  return 100;
+}
+
 bool PresentedFrameMatchesDisplay(int frame_width,
                                   int frame_height,
                                   int display_width,

@@ -5,9 +5,11 @@
 #include <shellscalingapi.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstring>
 #include <iomanip>
+#include <optional>
 #include <sstream>
 #include <utility>
 
@@ -65,6 +67,58 @@ bool IsImcodesVirtualDisplay(const wchar_t* device_name) {
     return lstrcmpW(device.DeviceString, L"IM.codes Headless Display") == 0 &&
            lstrcmpiW(device.DeviceID, L"ImcodesVirtualDisplay") == 0;
   }
+}
+
+constexpr DISPLAYCONFIG_DEVICE_INFO_TYPE kGetSourceDpiScale =
+    static_cast<DISPLAYCONFIG_DEVICE_INFO_TYPE>(-3);
+constexpr DISPLAYCONFIG_DEVICE_INFO_TYPE kSetSourceDpiScale =
+    static_cast<DISPLAYCONFIG_DEVICE_INFO_TYPE>(-4);
+
+struct DisplayConfigSourceDpiScaleGet {
+  DISPLAYCONFIG_DEVICE_INFO_HEADER header{};
+  int32_t min_scale_relative = 0;
+  int32_t current_scale_relative = 0;
+  int32_t max_scale_relative = 0;
+};
+
+struct DisplayConfigSourceDpiScaleSet {
+  DISPLAYCONFIG_DEVICE_INFO_HEADER header{};
+  int32_t scale_relative = 0;
+};
+
+static_assert(sizeof(DisplayConfigSourceDpiScaleGet) == 32);
+static_assert(sizeof(DisplayConfigSourceDpiScaleSet) == 24);
+
+std::optional<DISPLAYCONFIG_PATH_SOURCE_INFO> FindDisplayConfigSource(
+    const std::wstring& device_name) {
+  for (int attempt = 0; attempt < 3; ++attempt) {
+    UINT32 path_count = 0;
+    UINT32 mode_count = 0;
+    LONG result = GetDisplayConfigBufferSizes(
+        QDC_ONLY_ACTIVE_PATHS, &path_count, &mode_count);
+    if (result != ERROR_SUCCESS || path_count == 0) return std::nullopt;
+    std::vector<DISPLAYCONFIG_PATH_INFO> paths(path_count);
+    std::vector<DISPLAYCONFIG_MODE_INFO> modes(mode_count);
+    result = QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &path_count,
+                                paths.data(), &mode_count, modes.data(),
+                                nullptr);
+    if (result == ERROR_INSUFFICIENT_BUFFER) continue;
+    if (result != ERROR_SUCCESS) return std::nullopt;
+    paths.resize(path_count);
+    for (const auto& path : paths) {
+      DISPLAYCONFIG_SOURCE_DEVICE_NAME source_name{};
+      source_name.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+      source_name.header.size = sizeof(source_name);
+      source_name.header.adapterId = path.sourceInfo.adapterId;
+      source_name.header.id = path.sourceInfo.id;
+      if (DisplayConfigGetDeviceInfo(&source_name.header) == ERROR_SUCCESS &&
+          _wcsicmp(source_name.viewGdiDeviceName, device_name.c_str()) == 0) {
+        return path.sourceInfo;
+      }
+    }
+    return std::nullopt;
+  }
+  return std::nullopt;
 }
 
 libyuv::RotationMode LibyuvRotation(int degrees) {
@@ -140,6 +194,43 @@ std::string DisplaySourceKey(const DisplayInfo& display) {
       << display.desktop_rect.top << ':' << display.desktop_rect.right << ':'
       << display.desktop_rect.bottom << ':' << display.rotation_degrees;
   return key.str();
+}
+
+bool SetDisplayDpiScale(const DisplayInfo& display, int percent) {
+  static constexpr std::array<int, 12> kDpiScalePercents = {
+      100, 125, 150, 175, 200, 225, 250, 300, 350, 400, 450, 500};
+  if (display.device_name.empty()) return false;
+  const auto desired = std::find(kDpiScalePercents.begin(),
+                                 kDpiScalePercents.end(), percent);
+  if (desired == kDpiScalePercents.end()) return false;
+  const auto source = FindDisplayConfigSource(display.device_name);
+  if (!source) return false;
+
+  DisplayConfigSourceDpiScaleGet get{};
+  get.header.type = kGetSourceDpiScale;
+  get.header.size = sizeof(get);
+  get.header.adapterId = source->adapterId;
+  get.header.id = source->id;
+  if (DisplayConfigGetDeviceInfo(&get.header) != ERROR_SUCCESS ||
+      get.min_scale_relative > 0 || get.max_scale_relative < 0) {
+    return false;
+  }
+  const int recommended_index = -get.min_scale_relative;
+  const int desired_index = static_cast<int>(desired - kDpiScalePercents.begin());
+  const int relative = desired_index - recommended_index;
+  if (recommended_index < 0 ||
+      recommended_index >= static_cast<int>(kDpiScalePercents.size()) ||
+      relative < get.min_scale_relative || relative > get.max_scale_relative) {
+    return false;
+  }
+
+  DisplayConfigSourceDpiScaleSet set{};
+  set.header.type = kSetSourceDpiScale;
+  set.header.size = sizeof(set);
+  set.header.adapterId = source->adapterId;
+  set.header.id = source->id;
+  set.scale_relative = relative;
+  return DisplayConfigSetDeviceInfo(&set.header) == ERROR_SUCCESS;
 }
 
 webrtc::scoped_refptr<DxgiDesktopSource> DxgiDesktopSource::Create(
