@@ -57,15 +57,18 @@ vi.mock('../../src/components/FilePreviewPane.js', () => ({
   FilePreviewPane: ({
     content,
     path,
+    allowedRootPath,
     onImagePreview,
   }: {
     content: string;
     path: string;
+    allowedRootPath?: string;
     onImagePreview?: (path: string) => Promise<unknown>;
   }) => (
     <div
       data-testid="discussion-preview"
       data-path={path}
+      data-allowed-root={allowedRootPath ?? ''}
       data-image-preview={onImagePreview ? 'enabled' : 'disabled'}
     >{content}</div>
   ),
@@ -158,6 +161,7 @@ describe('DiscussionsPage', () => {
     });
 
     expect(screen.getByTestId('discussion-preview').textContent).toBe('Updated markdown');
+    expect(screen.getByTestId('discussion-preview').getAttribute('data-image-preview')).toBe('disabled');
     expect((screen.getByLabelText('p2p.discussions.auto_follow_latest') as HTMLInputElement).checked).toBe(true);
     await waitFor(() => expect(scrollEl.scrollTop).toBe(640));
     expect(screen.getByTitle('p2p.discussions.scroll_top')).toBeTruthy();
@@ -248,12 +252,12 @@ describe('DiscussionsPage', () => {
   });
 
   it('copies discussion path from the list action menu', async () => {
-    render(<DiscussionsPage ws={ws} />);
+    render(<DiscussionsPage ws={ws} requestScope={{ projectDir: '/repo' }} />);
 
     await act(async () => {
       handler?.({
         type: 'p2p.list_discussions_response',
-        discussions: [{ id: 'disc-3', fileName: 'disc-3.md', path: '/tmp/disc-3.md', preview: 'Topic 3', mtime: 100 }],
+        discussions: [{ id: 'disc-3', fileName: 'disc-3.md', path: '/repo/docs/disc-3.md', preview: 'Topic 3', mtime: 100 }],
       } as ServerMessage);
     });
 
@@ -268,14 +272,15 @@ describe('DiscussionsPage', () => {
       } as ServerMessage);
     });
 
-    expect(screen.getByTestId('discussion-preview').getAttribute('data-path')).toBe('/tmp/disc-3.md');
+    expect(screen.getByTestId('discussion-preview').getAttribute('data-path')).toBe('/repo/docs/disc-3.md');
+    expect(screen.getByTestId('discussion-preview').getAttribute('data-allowed-root')).toBe('/repo');
     expect(screen.getByTestId('discussion-preview').getAttribute('data-image-preview')).toBe('enabled');
 
     fireEvent.click(screen.getByLabelText('common.copy'));
     fireEvent.click(screen.getByText('p2p.discussions.copy_path'));
 
     await waitFor(() => {
-      expect(clipboardWriteText).toHaveBeenCalledWith('/tmp/disc-3.md');
+      expect(clipboardWriteText).toHaveBeenCalledWith('/repo/docs/disc-3.md');
     });
   });
 

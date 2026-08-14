@@ -107,18 +107,20 @@ export function highlightCode(content: string, filename: string): { html: string
 export interface FilePreviewPaneProps {
   content: string;
   path: string;
+  /** Explicit filesystem boundary for relative Markdown references. Defaults to the file's directory. */
+  allowedRootPath?: string;
   onPathClick?: (path: string) => void;
   onDownload?: ChatPathDownloadHandler;
   onImagePreview?: ChatLocalImagePreviewLoader;
 }
 
 /** Renders highlighted code or markdown. Lazy-loaded by FileBrowser. */
-export function FilePreviewPane({ content, path, onPathClick, onDownload, onImagePreview }: FilePreviewPaneProps) {
+export function FilePreviewPane({ content, path, allowedRootPath, onPathClick, onDownload, onImagePreview }: FilePreviewPaneProps) {
   const filename = pathBasename(path);
   const { html, isMarkdown } = highlightCode(content, filename);
   const resolveReference = useCallback(
-    (reference: string) => resolveMarkdownLocalPath(path, reference),
-    [path],
+    (reference: string) => resolveMarkdownLocalPath(path, reference, allowedRootPath),
+    [allowedRootPath, path],
   );
   const openReferencedPath = useCallback((reference: string) => {
     const resolved = resolveReference(reference);

@@ -1,3 +1,5 @@
+import { FS_SESSION_ROOT_PATH } from '../../../src/shared/transport/fs.js';
+
 /**
  * Cross-platform path utilities for display paths.
  * Handles both Unix (/) and Windows (\) separators.
@@ -35,6 +37,69 @@ export function pathDirname(p: string): string {
   return result;
 }
 
+interface NormalizedDisplayPath {
+  root: string;
+  segments: string[];
+  escapedRoot: boolean;
+  separator: '/' | '\\';
+  render(): string;
+}
+
+function normalizeDisplayPath(input: string, separator: '/' | '\\'): NormalizedDisplayPath | null {
+  const slashPath = input.replace(/\\/g, '/');
+  const unc = slashPath.match(/^\/\/([^/]+)\/([^/]+)(?:\/(.*))?$/);
+  const drive = slashPath.match(/^([A-Za-z]:)(?:\/(.*))?$/);
+  const tilde = slashPath.match(/^~(?:\/(.*))?$/);
+  const unixAbsolute = slashPath.startsWith('/') && !slashPath.startsWith('//');
+  if (slashPath.startsWith('//') && !unc) return null;
+
+  const root = unc
+    ? `unc:${unc[1].toLowerCase()}/${unc[2].toLowerCase()}`
+    : drive
+      ? `drive:${drive[1].toLowerCase()}`
+      : tilde
+        ? 'tilde'
+        : unixAbsolute
+          ? 'unix'
+          : 'relative';
+  const remainder = unc?.[3]
+    ?? drive?.[2]
+    ?? tilde?.[1]
+    ?? (unixAbsolute ? slashPath.slice(1) : slashPath);
+  const segments: string[] = [];
+  let escapedRoot = false;
+
+  for (const segment of remainder.split('/')) {
+    if (!segment || segment === '.') continue;
+    if (segment === '..') {
+      if (segments.length > 0 && segments[segments.length - 1] !== '..') segments.pop();
+      else escapedRoot = true;
+      continue;
+    }
+    segments.push(segment);
+  }
+
+  return {
+    root,
+    segments,
+    escapedRoot,
+    separator,
+    render() {
+      if (unc) {
+        const prefix = `${separator}${separator}${unc[1]}${separator}${unc[2]}`;
+        return segments.length ? `${prefix}${separator}${segments.join(separator)}` : prefix;
+      }
+      if (drive) {
+        const prefix = `${drive[1]}${separator}`;
+        return segments.length ? `${prefix}${segments.join(separator)}` : prefix;
+      }
+      if (tilde) return segments.length ? `~${separator}${segments.join(separator)}` : '~';
+      if (unixAbsolute) return `/${segments.join('/')}`;
+      return segments.join(separator);
+    },
+  };
+}
+
 /**
  * Resolve a local Markdown link relative to the Markdown file that contains it.
  *
@@ -43,7 +108,11 @@ export function pathDirname(p: string): string {
  * deliberately returns a display/daemon path rather than a browser URL: callers
  * must still read it through the existing scoped fs.read channel.
  */
-export function resolveMarkdownLocalPath(markdownPath: string, href: string): string | null {
+export function resolveMarkdownLocalPath(
+  markdownPath: string,
+  href: string,
+  allowedRootPath?: string,
+): string | null {
   const trimmed = href.trim();
   if (!trimmed || trimmed.startsWith('#') || trimmed.startsWith('?')) return null;
 
@@ -59,9 +128,27 @@ export function resolveMarkdownLocalPath(markdownPath: string, href: string): st
   } catch {
     referencePath = encodedPath;
   }
-  if (!referencePath || /[\0\r\n]/.test(referencePath)) return null;
+  if (!referencePath || /[\u0000-\u001f\u007f-\u009f]/u.test(referencePath)) return null;
+  if (/^(?:\/\/|\\\\|~(?:[/\\]|$))/u.test(referencePath)) return null;
+  if (referencePath.split(/[/\\]/).some((segment) => segment === FS_SESSION_ROOT_PATH)) return null;
 
   const separator = detectSeparator(markdownPath);
+  const parent = /[/\\]/.test(markdownPath) ? pathDirname(markdownPath) : '.';
+  const normalizedParent = normalizeDisplayPath(parent, separator);
+  if (!normalizedParent || normalizedParent.escapedRoot) return null;
+  // Never auto-read from a UNC or home-expansion root. An explicitly opened
+  // document on either root remains renderable, but its content cannot trigger
+  // further filesystem/network reads.
+  if (normalizedParent.root.startsWith('unc:') || normalizedParent.root === 'tilde') return null;
+  if (normalizedParent.segments.some((segment) => segment === FS_SESSION_ROOT_PATH)) return null;
+
+  const normalizedRoot = allowedRootPath
+    ? normalizeDisplayPath(allowedRootPath, separator)
+    : normalizedParent;
+  if (!normalizedRoot || normalizedRoot.escapedRoot) return null;
+  if (normalizedRoot.root.startsWith('unc:') || normalizedRoot.root === 'tilde') return null;
+  if (normalizedRoot.segments.some((segment) => segment === FS_SESSION_ROOT_PATH)) return null;
+
   const sourceDrive = /^([A-Za-z]:)[/\\]/.exec(markdownPath)?.[1];
   let candidate: string;
   if (isAbsolutePath(referencePath)) {
@@ -72,36 +159,26 @@ export function resolveMarkdownLocalPath(markdownPath: string, href: string): st
       ? `${sourceDrive}${referencePath}`
       : referencePath;
   } else {
-    const parent = /[/\\]/.test(markdownPath) ? pathDirname(markdownPath) : '.';
     candidate = `${parent}${parent.endsWith('/') || parent.endsWith('\\') ? '' : separator}${referencePath}`;
   }
 
-  const slashPath = candidate.replace(/\\/g, '/');
-  const unc = slashPath.match(/^\/\/([^/]+)\/([^/]+)(?:\/(.*))?$/);
-  const drive = slashPath.match(/^([A-Za-z]:)(?:\/(.*))?$/);
-  const tilde = slashPath.match(/^~(?:\/(.*))?$/);
-  const unixAbsolute = slashPath.startsWith('/') && !slashPath.startsWith('//');
-  const remainder = unc?.[3]
-    ?? drive?.[2]
-    ?? tilde?.[1]
-    ?? (unixAbsolute ? slashPath.slice(1) : slashPath);
-  const segments = unc ? [unc[1], unc[2]] : [];
-  const protectedSegments = segments.length;
-  const rooted = !!unc || !!drive || !!tilde || unixAbsolute;
+  const resolved = normalizeDisplayPath(candidate, separator);
+  if (
+    !resolved
+    || resolved.escapedRoot
+    || resolved.root !== normalizedParent.root
+    || resolved.root !== normalizedRoot.root
+  ) return null;
+  const windowsPath = resolved.root.startsWith('drive:');
+  const sameSegment = (left: string, right: string) => (
+    windowsPath ? left.toLowerCase() === right.toLowerCase() : left === right
+  );
+  if (
+    normalizedParent.segments.length < normalizedRoot.segments.length
+    || normalizedRoot.segments.some((segment, index) => !sameSegment(segment, normalizedParent.segments[index]))
+    || resolved.segments.length < normalizedRoot.segments.length
+    || normalizedRoot.segments.some((segment, index) => !sameSegment(segment, resolved.segments[index]))
+  ) return null;
 
-  for (const segment of remainder.split('/')) {
-    if (!segment || segment === '.') continue;
-    if (segment === '..') {
-      if (segments.length > protectedSegments) segments.pop();
-      else if (!rooted) segments.push(segment);
-      continue;
-    }
-    segments.push(segment);
-  }
-
-  if (unc) return `${separator}${separator}${segments.join(separator)}`;
-  if (drive) return `${drive[1]}${separator}${segments.join(separator)}`;
-  if (tilde) return `~${segments.length ? separator : ''}${segments.join(separator)}`;
-  if (unixAbsolute) return `/${segments.join('/')}`;
-  return segments.join(separator);
+  return resolved.render();
 }

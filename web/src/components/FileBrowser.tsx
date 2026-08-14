@@ -483,6 +483,9 @@ export function FileBrowser({
   const startPath = scopeToSessionRoot && (!initialPath || initialPath === '~')
     ? FS_SESSION_ROOT_PATH
     : (initialPath || '~');
+  const markdownReferenceRoot = [changesRootPath, startPath].find((path) => (
+    !!path && path !== '~' && path !== FS_SESSION_ROOT_PATH && path !== WINDOWS_DRIVES_PATH
+  ));
   const initialTreeSnapshot = loadFileBrowserSnapshot(startPath, includeFiles, DEFAULT_SHOW_HIDDEN_FILES, serverId);
   const [data, setData] = useState<FsNode[]>([
     {
@@ -1940,6 +1943,7 @@ export function FileBrowser({
             <FilePreviewPane
               content={preview.content}
               path={preview.path}
+              allowedRootPath={markdownReferenceRoot}
               onPathClick={fetchPreview}
               onImagePreview={loadMarkdownImagePreview}
             />

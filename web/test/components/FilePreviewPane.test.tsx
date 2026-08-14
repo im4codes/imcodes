@@ -3,6 +3,7 @@ import { cleanup, fireEvent, render, waitFor } from '@testing-library/preact';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { FilePreviewPane } from '../../src/components/FilePreviewPane.js';
 import { resolveMarkdownLocalPath } from '../../src/util/path-utils.js';
+import { isLocalChatPath } from '../../src/chat-path-actions.js';
 
 vi.mock('react-i18next', () => {
   const t = (key: string, fallback?: string) => fallback ?? key;
@@ -17,18 +18,45 @@ afterEach(() => {
 describe('resolveMarkdownLocalPath', () => {
   it.each([
     ['/repo/docs/README.md', './images/flow.png', '/repo/docs/images/flow.png'],
-    ['/repo/docs/README.md', '../assets/My%20Image.png#preview', '/repo/assets/My Image.png'],
+    ['/repo/docs/README.md', './assets/My%20Image%23final.png?preview=1', '/repo/docs/assets/My Image#final.png'],
+    ['/repo/docs/README.md', '/repo/docs/images/flow.png', '/repo/docs/images/flow.png'],
     ['README.md', 'images/flow.png', 'images/flow.png'],
-    ['C:\\repo\\docs\\README.md', '..\\assets\\flow.png?raw=1', 'C:\\repo\\assets\\flow.png'],
-    ['C:\\repo\\docs\\README.md', '/assets/flow.png', 'C:\\assets\\flow.png'],
-    ['\\\\host\\share\\docs\\README.md', '..\\flow.png', '\\\\host\\share\\flow.png'],
+    ['C:\\repo\\docs\\README.md', '.\\assets\\flow.png?raw=1', 'C:\\repo\\docs\\assets\\flow.png'],
+    ['C:\\repo\\docs\\README.md', 'C:\\repo\\docs\\flow.png', 'C:\\repo\\docs\\flow.png'],
   ])('resolves %s + %s to %s', (markdownPath, href, expected) => {
     expect(resolveMarkdownLocalPath(markdownPath, href)).toBe(expected);
   });
 
-  it('does not turn document-only fragments or malformed control paths into file reads', () => {
-    expect(resolveMarkdownLocalPath('/repo/README.md', '#usage')).toBeNull();
-    expect(resolveMarkdownLocalPath('/repo/README.md', './bad\nname.png')).toBeNull();
+  it('allows parent references inside an explicit project root but not outside it', () => {
+    expect(resolveMarkdownLocalPath('/repo/docs/README.md', '../assets/logo.png', '/repo'))
+      .toBe('/repo/assets/logo.png');
+    expect(resolveMarkdownLocalPath('/repo/docs/README.md', '../../etc/shadow', '/repo'))
+      .toBeNull();
+    expect(resolveMarkdownLocalPath('C:\\Repo\\docs\\README.md', '..\\assets\\logo.png', 'c:\\repo'))
+      .toBe('C:\\Repo\\assets\\logo.png');
+    expect(resolveMarkdownLocalPath('/repo-other/docs/README.md', './logo.png', '/repo'))
+      .toBeNull();
+  });
+
+  it.each([
+    ['#usage'],
+    ['./bad\nname.png'],
+    ['//attacker.example/share/logo.png'],
+    ['\\\\attacker.example\\share\\logo.png'],
+    ['../outside.png'],
+    ['..%2f..%2fetc%2fshadow'],
+    ['%2e%2e%5cWindows%5cwin.ini'],
+    ['~/.ssh/id_rsa'],
+    ['%7e%2f.ssh%2fid_rsa'],
+    [':session-root:/secret.png'],
+    ['\\\\?\\C:\\Windows\\win.ini'],
+  ])('rejects unsafe local reference %s', (href) => {
+    expect(resolveMarkdownLocalPath('/repo/docs/README.md', href)).toBeNull();
+  });
+
+  it('never classifies protocol-relative web URLs or UNC paths as local chat paths', () => {
+    expect(isLocalChatPath('//cdn.example.com/logo.png')).toBe(false);
+    expect(isLocalChatPath('\\\\server\\share\\logo.png')).toBe(false);
   });
 });
 
@@ -39,6 +67,7 @@ describe('FilePreviewPane Markdown references', () => {
       <FilePreviewPane
         content="[Guide](../GUIDE.md#install)"
         path="/repo/docs/README.md"
+        allowedRootPath="/repo"
         onPathClick={onPathClick}
       />,
     );
@@ -78,6 +107,20 @@ describe('FilePreviewPane Markdown references', () => {
     );
 
     expect(container.querySelector('img')?.getAttribute('src')).toBe('https://example.com/remote.png');
+    expect(onImagePreview).not.toHaveBeenCalled();
+  });
+
+  it('keeps protocol-relative images on the browser path without invoking local file reads', () => {
+    const onImagePreview = vi.fn();
+    const { container } = render(
+      <FilePreviewPane
+        content="![CDN](//cdn.example.com/logo.png)"
+        path="C:\\repo\\docs\\README.md"
+        onImagePreview={onImagePreview}
+      />,
+    );
+
+    expect(container.querySelector('img')?.getAttribute('src')).toBe('//cdn.example.com/logo.png');
     expect(onImagePreview).not.toHaveBeenCalled();
   });
 

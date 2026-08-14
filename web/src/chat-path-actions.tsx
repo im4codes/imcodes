@@ -63,6 +63,10 @@ export function isLikelyDomainPath(value: string): boolean {
 export function isLocalChatPath(path: string): boolean {
   const value = path.trim().replace(/^`+|`+$/g, '');
   if (!value) return false;
+  // `//host/path` is a protocol-relative web URL, while `\\host\share` is
+  // a Windows UNC path. Neither may enter the automatic local-file preview
+  // path: doing so could turn rendered Markdown into a zero-click SMB read.
+  if (/^(?:\/\/|\\\\)/.test(value)) return false;
   if (isLikelyDomainPath(value)) return false;
   if (/^https?:\/\//i.test(value)) return false;
   if (/^mailto:/i.test(value)) return false;

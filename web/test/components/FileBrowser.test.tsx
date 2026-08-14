@@ -15,6 +15,7 @@ const filePreviewPropsState = vi.hoisted(() => ({
   current: null as null | {
     content: string;
     path: string;
+    allowedRootPath?: string;
     onPathClick?: (path: string) => void;
     onImagePreview?: (path: string) => Promise<{ dataUrl: string; alt?: string } | string>;
   },
@@ -274,6 +275,7 @@ describe('FileBrowser', () => {
         mode="file-single"
         layout="panel"
         initialPath="/home/user/docs"
+        changesRootPath="/home/user"
         initialPreview={{ status: 'ok', path: '/home/user/docs/README.md', content: '![Flow](./flow.png)' }}
         sessionName="deck_project_brain"
         scopeToSessionRoot
@@ -282,6 +284,7 @@ describe('FileBrowser', () => {
     );
 
     await waitFor(() => expect(filePreviewPropsState.current?.onImagePreview).toBeTypeOf('function'));
+    expect(filePreviewPropsState.current?.allowedRootPath).toBe('/home/user');
     const imagePromise = filePreviewPropsState.current!.onImagePreview!('/home/user/docs/flow.png');
     expect(ws.fsReadFile).toHaveBeenLastCalledWith('/home/user/docs/flow.png', 'deck_project_brain');
 

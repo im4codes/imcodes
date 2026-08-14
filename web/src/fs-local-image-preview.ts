@@ -16,7 +16,7 @@ export function loadFsLocalImagePreview(
   options: LoadFsLocalImagePreviewOptions = {},
 ): Promise<ChatLocalImagePreviewResult> {
   return new Promise((resolve, reject) => {
-    let requestId = '';
+    let requestId: string | null = null;
     let settled = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
     let unsubscribe: () => void = () => {};
@@ -29,15 +29,17 @@ export function loadFsLocalImagePreview(
     };
 
     unsubscribe = ws.onMessage((message) => {
-      if (message.type !== 'fs.read_response' || message.requestId !== requestId) return;
+      if (message.type !== 'fs.read_response' || requestId === null || message.requestId !== requestId) return;
       if (
         message.status === 'ok'
         && message.encoding === 'base64'
         && typeof message.mimeType === 'string'
         && message.mimeType.startsWith('image/')
+        && typeof message.content === 'string'
+        && message.content.length > 0
       ) {
         finish(() => resolve({
-          dataUrl: `data:${message.mimeType};base64,${message.content ?? ''}`,
+          dataUrl: `data:${message.mimeType};base64,${message.content}`,
           alt: pathBasename(path),
         }));
         return;

@@ -692,7 +692,12 @@ export function DiscussionsPage({ ws, initialSelectedId, initialTab = 'team', re
                 <FilePreviewPane
                   content={content}
                   path={selectedDiscussion?.path ?? `${selected}.md`}
-                  onImagePreview={ws ? loadDiscussionImagePreview : undefined}
+                  allowedRootPath={selectedDiscussion?.path ? stableRequestScope?.projectDir : undefined}
+                  // A synthetic filename is sufficient for Markdown syntax
+                  // detection, but it is not an authoritative filesystem
+                  // location. Only let document content trigger a local image
+                  // read when the discussion list supplied the real path.
+                  onImagePreview={ws && selectedDiscussion?.path ? loadDiscussionImagePreview : undefined}
                 />
               </div>
             )}
