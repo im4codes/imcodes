@@ -162,6 +162,7 @@ class PeerSession final : public webrtc::PeerConnectionObserver,
   bool selection_required_ = false;
   int layout_revision_ = 1;
   uint64_t outbound_sequence_ = 0;
+  uint64_t last_pointer_sequence_ = 0;
   std::map<std::string, uint64_t> last_sequence_by_channel_;
   std::map<std::string, webrtc::scoped_refptr<webrtc::DataChannelInterface>>
       channels_;

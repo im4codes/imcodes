@@ -458,7 +458,10 @@ bool PeerSession::SetMode(const Authority& update, const std::string& reason) {
       (update.mode != kViewMode && update.mode != kControlMode)) {
     return false;
   }
-  if (mode_changed) ReleaseInput();
+  if (mode_changed) {
+    ReleaseInput();
+    last_pointer_sequence_ = 0;
+  }
   authority_.mode = update.mode;
   authority_.input_epoch = update.input_epoch;
   Json::Value response = BaseEnvelope(kModeStateType, authority_);
@@ -993,7 +996,7 @@ void PeerSession::HandlePointer(const std::string& channel,
   }
   uint64_t sequence = 0;
   if (!ValidateInputBase(root, channel, true, &sequence) ||
-      authority_.input_epoch <= 0) return;
+      authority_.input_epoch <= 0 || sequence <= last_pointer_sequence_) return;
   const std::string kind = root["kind"].asString();
   bool accepted = false;
   if (kind == "move" && root["x"].isNumeric() && root["y"].isNumeric() &&
@@ -1030,10 +1033,16 @@ void PeerSession::HandlePointer(const std::string& channel,
               root["x"].asDouble() >= 0.0 && root["x"].asDouble() <= 1.0)) &&
              (!root.isMember("y") || (root["y"].isNumeric() &&
               root["y"].asDouble() >= 0.0 && root["y"].asDouble() <= 1.0))) {
+    if (root.isMember("x") && root.isMember("y") &&
+        !input_->Move(displays_[selected_display_], root["x"].asDouble(),
+                      root["y"].asDouble())) {
+      return;
+    }
     accepted = input_->Wheel(root["deltaX"].asDouble(),
                              root["deltaY"].asDouble());
   }
   if (accepted) {
+    last_pointer_sequence_ = sequence;
     last_sequence_by_channel_[channel] = sequence;
     TouchActivity();
     if (channel == kControlChannel &&

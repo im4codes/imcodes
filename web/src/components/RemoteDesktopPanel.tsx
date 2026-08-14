@@ -41,14 +41,18 @@ interface TouchPoint {
   y: number;
 }
 
-type TouchGesture = {
+type TouchSingleGesture = {
   kind: 'single';
   pointerId: number;
   start: TouchPoint;
   startedAt: number;
   moved: boolean;
+  longPressFired: boolean;
+  longPressTimer: ReturnType<typeof setTimeout> | null;
   viewport: RemoteDesktopViewport;
-} | {
+};
+
+type TouchGesture = TouchSingleGesture | {
   kind: 'pinch';
   initialCenter: TouchPoint;
   initialDistance: number;
@@ -95,6 +99,9 @@ const INITIAL_SNAPSHOT: RemoteDesktopSnapshot = {
 };
 
 const MAX_REMOTE_DESKTOP_RECONNECTS = REMOTE_DESKTOP_LIMITS.MAX_RECONNECT_ATTEMPTS;
+const TOUCH_LONG_PRESS_MS = 550;
+const TOUCH_DOUBLE_TAP_MS = 400;
+const TOUCH_DOUBLE_TAP_DISTANCE_PX = 32;
 const RECONNECTABLE_REMOTE_DESKTOP_FAILURES = new Set<string>([
   REMOTE_DESKTOP_ERROR.DAEMON_OFFLINE,
   REMOTE_DESKTOP_ERROR.NEGOTIATION_TIMEOUT,
@@ -156,6 +163,12 @@ export function RemoteDesktopPanel({ machine, ws = null, onClose }: RemoteDeskto
   const heldVirtualButtonsRef = useRef(new Map<number, VirtualMouseButton>());
   const touchPointsRef = useRef(new Map<number, TouchPoint>());
   const touchGestureRef = useRef<TouchGesture | null>(null);
+  const lastTouchTapRef = useRef<{
+    at: number;
+    point: TouchPoint;
+    normalized: TouchPoint;
+  } | null>(null);
+  const lastTouchRemotePointRef = useRef<TouchPoint>({ x: 0.5, y: 0.5 });
   const reconnectCountRef = useRef(0);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const reconnectStabilityTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -245,6 +258,10 @@ export function RemoteDesktopPanel({ machine, ws = null, onClose }: RemoteDeskto
       virtualMouseEdgeFrameRef.current = null;
     }
     heldVirtualButtonsRef.current.clear();
+    if (touchGestureRef.current?.kind === 'single' && touchGestureRef.current.longPressTimer) {
+      clearTimeout(touchGestureRef.current.longPressTimer);
+    }
+    touchGestureRef.current = null;
     if (displayTabLongPressRef.current) clearTimeout(displayTabLongPressRef.current.timer);
     displayTabLongPressRef.current = null;
     if (suppressDisplayTabClickTimerRef.current) {
@@ -331,6 +348,9 @@ export function RemoteDesktopPanel({ machine, ws = null, onClose }: RemoteDeskto
     clientRef.current?.releaseAll();
     heldVirtualButtonsRef.current.clear();
     touchPointsRef.current.clear();
+    if (touchGestureRef.current?.kind === 'single' && touchGestureRef.current.longPressTimer) {
+      clearTimeout(touchGestureRef.current.longPressTimer);
+    }
     touchGestureRef.current = null;
     virtualMouseDragRef.current = null;
     stopVirtualMouseEdgePan();
@@ -359,6 +379,9 @@ export function RemoteDesktopPanel({ machine, ws = null, onClose }: RemoteDeskto
       setVirtualMouse(nextMouse);
     }
     touchPointsRef.current.clear();
+    if (touchGestureRef.current?.kind === 'single' && touchGestureRef.current.longPressTimer) {
+      clearTimeout(touchGestureRef.current.longPressTimer);
+    }
     touchGestureRef.current = null;
     virtualMouseDragRef.current = null;
     virtualMouseEdgePointRef.current = null;
@@ -520,7 +543,12 @@ export function RemoteDesktopPanel({ machine, ws = null, onClose }: RemoteDeskto
       previous = now;
       if (result.active) {
         commitViewport(result.viewport);
-        sendVirtualMouseMove(point);
+      }
+      // Send once more after the viewport reaches its clamp. The previous
+      // frame's transform is then visible in the DOM, so source coordinates
+      // can reach the exact 0/1 edges instead of stopping a few pixels short.
+      sendVirtualMouseMove(point);
+      if (result.active) {
         virtualMouseEdgeFrameRef.current = scheduleAnimationFrame(tick);
       }
     };
@@ -582,9 +610,9 @@ export function RemoteDesktopPanel({ machine, ws = null, onClose }: RemoteDeskto
       return;
     }
     const next = {
-      x: Math.max(12, Math.min(stage.clientWidth - 12,
+      x: Math.max(0, Math.min(stage.clientWidth,
         drag.origin.x + point.x - drag.start.x)),
-      y: Math.max(12, Math.min(stage.clientHeight - 12,
+      y: Math.max(0, Math.min(stage.clientHeight,
         drag.origin.y + point.y - drag.start.y)),
     };
     commitVirtualMouse(next);
@@ -657,6 +685,9 @@ export function RemoteDesktopPanel({ machine, ws = null, onClose }: RemoteDeskto
   };
 
   const beginPinch = () => {
+    if (touchGestureRef.current?.kind === 'single' && touchGestureRef.current.longPressTimer) {
+      clearTimeout(touchGestureRef.current.longPressTimer);
+    }
     const points = [...touchPointsRef.current.values()];
     if (points.length < 2) return;
     const [first, second] = points;
@@ -675,14 +706,33 @@ export function RemoteDesktopPanel({ machine, ws = null, onClose }: RemoteDeskto
     (event.currentTarget as HTMLElement).setPointerCapture?.(event.pointerId);
     touchPointsRef.current.set(event.pointerId, point);
     if (touchPointsRef.current.size === 1) {
-      touchGestureRef.current = {
+      const gesture: TouchSingleGesture = {
         kind: 'single',
         pointerId: event.pointerId,
         start: point,
         startedAt: performance.now(),
         moved: false,
+        longPressFired: false,
+        longPressTimer: null,
         viewport: viewportRef.current,
       };
+      gesture.longPressTimer = setTimeout(() => {
+        const current = touchGestureRef.current;
+        const stage = stageRef.current;
+        if (current !== gesture || current.moved || !stage || !snapshot.inputEnabled) return;
+        const rect = stage.getBoundingClientRect();
+        const normalized = normalizedClientPoint(
+          rect.left + current.start.x,
+          rect.top + current.start.y,
+        );
+        if (!normalized) return;
+        current.longPressFired = true;
+        lastTouchTapRef.current = null;
+        lastTouchRemotePointRef.current = normalized;
+        clientRef.current?.pointerButton('right', true, normalized.x, normalized.y);
+        clientRef.current?.pointerButton('right', false, normalized.x, normalized.y);
+      }, TOUCH_LONG_PRESS_MS);
+      touchGestureRef.current = gesture;
     } else {
       beginPinch();
     }
@@ -712,7 +762,10 @@ export function RemoteDesktopPanel({ machine, ws = null, onClose }: RemoteDeskto
       && gesture.pointerId === event.pointerId) {
       const dx = point.x - gesture.start.x;
       const dy = point.y - gesture.start.y;
-      if (Math.hypot(dx, dy) > 6) gesture.moved = true;
+      if (Math.hypot(dx, dy) > 6 && !gesture.moved) {
+        gesture.moved = true;
+        if (gesture.longPressTimer) clearTimeout(gesture.longPressTimer);
+      }
       if (gesture.moved) {
         commitViewport(clampRemoteDesktopViewport({
           ...gesture.viewport,
@@ -726,16 +779,33 @@ export function RemoteDesktopPanel({ machine, ws = null, onClose }: RemoteDeskto
   const onTouchEnd = (event: PointerEvent, canceled = false) => {
     const point = localTouchPoint(event);
     const gesture = touchGestureRef.current;
+    if (gesture?.kind === 'single' && gesture.longPressTimer) {
+      clearTimeout(gesture.longPressTimer);
+    }
     const shouldClick = !canceled && point && gesture?.kind === 'single'
       && gesture.pointerId === event.pointerId
       && !gesture.moved
+      && !gesture.longPressFired
       && performance.now() - gesture.startedAt <= 600;
     touchPointsRef.current.delete(event.pointerId);
     if (shouldClick) {
       const normalized = normalizedPoint(event);
       if (normalized) {
-        clientRef.current?.pointerButton('left', true, normalized.x, normalized.y);
-        clientRef.current?.pointerButton('left', false, normalized.x, normalized.y);
+        const now = performance.now();
+        const previous = lastTouchTapRef.current;
+        const doubleTap = previous
+          && now - previous.at <= TOUCH_DOUBLE_TAP_MS
+          && Math.hypot(point.x - previous.point.x, point.y - previous.point.y)
+            <= TOUCH_DOUBLE_TAP_DISTANCE_PX;
+        const target = doubleTap ? previous.normalized : normalized;
+        lastTouchRemotePointRef.current = target;
+        clientRef.current?.pointerButton('left', true, target.x, target.y);
+        clientRef.current?.pointerButton('left', false, target.x, target.y);
+        lastTouchTapRef.current = doubleTap ? null : {
+          at: now,
+          point,
+          normalized,
+        };
       }
     }
     const remaining = [...touchPointsRef.current.entries()];
@@ -747,6 +817,8 @@ export function RemoteDesktopPanel({ machine, ws = null, onClose }: RemoteDeskto
         start: remainingPoint,
         startedAt: performance.now(),
         moved: true,
+        longPressFired: false,
+        longPressTimer: null,
         viewport: viewportRef.current,
       };
     } else if (remaining.length >= 2) {
@@ -754,6 +826,23 @@ export function RemoteDesktopPanel({ machine, ws = null, onClose }: RemoteDeskto
     } else {
       touchGestureRef.current = null;
     }
+  };
+
+  const onTouchRightButton = (event: PointerEvent, down: boolean) => {
+    event.preventDefault();
+    event.stopPropagation();
+    const point = lastTouchRemotePointRef.current;
+    if (down) {
+      if (!snapshot.inputEnabled || heldVirtualButtonsRef.current.has(event.pointerId)) return;
+      if (clientRef.current?.pointerButton('right', true, point.x, point.y)) {
+        heldVirtualButtonsRef.current.set(event.pointerId, 'right');
+        (event.currentTarget as HTMLElement).setPointerCapture?.(event.pointerId);
+      }
+      return;
+    }
+    if (heldVirtualButtonsRef.current.get(event.pointerId) !== 'right') return;
+    heldVirtualButtonsRef.current.delete(event.pointerId);
+    clientRef.current?.pointerButton('right', false, point.x, point.y);
   };
 
   const changeZoom = (delta: number) => {
@@ -1126,6 +1215,7 @@ export function RemoteDesktopPanel({ machine, ws = null, onClose }: RemoteDeskto
           class={`remote-desktop-stage is-${viewScale} ${snapshot.inputEnabled ? 'is-controlling' : 'is-viewing'}`}
           tabIndex={snapshot.inputEnabled ? 0 : -1}
           onPointerMove={onPointerMove}
+          onPointerEnter={onPointerMove}
           onPointerDown={(event) => onPointerButton(event, true)}
           onPointerUp={(event) => onPointerButton(event, false)}
           onPointerCancel={(event) => {
@@ -1187,7 +1277,7 @@ export function RemoteDesktopPanel({ machine, ws = null, onClose }: RemoteDeskto
                 onLostPointerCapture={cancelVirtualMousePointer}
               >
                 <div class="remote-desktop-virtual-mouse-buttons">
-                  {(['left', 'middle', 'right'] as const).map((button) => (
+                  {(['left', 'right'] as const).map((button) => (
                     <button
                       key={button}
                       type="button"
@@ -1199,23 +1289,34 @@ export function RemoteDesktopPanel({ machine, ws = null, onClose }: RemoteDeskto
                       onLostPointerCapture={(event) => onVirtualMouseButton(event, button, false)}
                     >{t(`remote_desktop.mouse_${button}_short`)}</button>
                   ))}
+                  <button
+                    type="button"
+                    class="remote-desktop-virtual-wheel"
+                    aria-label={t('remote_desktop.mouse_wheel')}
+                    disabled={!snapshot.inputEnabled}
+                    onPointerDown={beginVirtualMouseWheel}
+                  ><span aria-hidden="true" /></button>
                 </div>
-                <button
-                  type="button"
-                  class="remote-desktop-virtual-wheel"
-                  aria-label={t('remote_desktop.mouse_wheel')}
-                  disabled={!snapshot.inputEnabled}
-                  onPointerDown={beginVirtualMouseWheel}
-                >↕</button>
                 <button
                   type="button"
                   class="remote-desktop-virtual-mouse-handle"
                   aria-label={t('remote_desktop.mouse_drag')}
                   disabled={!snapshot.inputEnabled}
                   onPointerDown={beginVirtualMouseMove}
-                >⌖</button>
+                ><span aria-hidden="true">✥</span></button>
               </div>
             </>
+          )}
+          {mobileInputMode === 'touch' && snapshot.inputEnabled && (
+            <button
+              type="button"
+              class="remote-desktop-touch-right-button"
+              aria-label={t('remote_desktop.touch_right_click')}
+              onPointerDown={(event) => onTouchRightButton(event, true)}
+              onPointerUp={(event) => onTouchRightButton(event, false)}
+              onPointerCancel={(event) => onTouchRightButton(event, false)}
+              onLostPointerCapture={(event) => onTouchRightButton(event, false)}
+            >{t('remote_desktop.mouse_right_short')}</button>
           )}
           {!snapshot.stream && (
             <div class="remote-desktop-stage-placeholder" role="status">

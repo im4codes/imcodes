@@ -591,6 +591,47 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     expect(pointerButton).toHaveBeenNthCalledWith(2, 'left', false, 0.75, 0.25);
   });
 
+  it('turns a long press into right-click and snaps a nearby double tap to one Windows target', async () => {
+    const { stage } = await renderPanel();
+    pointerButton.mockClear();
+    vi.useFakeTimers();
+
+    pointer(stage, 'pointerdown', { pointerId: 40, clientX: 200, clientY: 150 });
+    act(() => { vi.advanceTimersByTime(550); });
+    pointer(stage, 'pointerup', { pointerId: 40, clientX: 200, clientY: 150 });
+    expect(pointerButton.mock.calls).toEqual([
+      ['right', true, 0.5, 0.5],
+      ['right', false, 0.5, 0.5],
+    ]);
+
+    pointerButton.mockClear();
+    pointer(stage, 'pointerdown', { pointerId: 41, clientX: 200, clientY: 150 });
+    pointer(stage, 'pointerup', { pointerId: 41, clientX: 200, clientY: 150 });
+    act(() => { vi.advanceTimersByTime(180); });
+    pointer(stage, 'pointerdown', { pointerId: 42, clientX: 218, clientY: 158 });
+    pointer(stage, 'pointerup', { pointerId: 42, clientX: 218, clientY: 158 });
+    expect(pointerButton.mock.calls).toEqual([
+      ['left', true, 0.5, 0.5],
+      ['left', false, 0.5, 0.5],
+      ['left', true, 0.5, 0.5],
+      ['left', false, 0.5, 0.5],
+    ]);
+  });
+
+  it('offers a dedicated touch-mode right-click button at the last touch position', async () => {
+    const { stage, getByRole } = await renderPanel();
+    pointer(stage, 'pointerdown', { pointerId: 43, clientX: 300, clientY: 150 });
+    pointer(stage, 'pointerup', { pointerId: 43, clientX: 300, clientY: 150 });
+    pointerButton.mockClear();
+    const rightClick = getByRole('button', { name: 'remote_desktop.touch_right_click' });
+    pointer(rightClick, 'pointerdown', { pointerId: 44, clientX: 360, clientY: 260 });
+    pointer(rightClick, 'pointerup', { pointerId: 44, clientX: 360, clientY: 260 });
+    expect(pointerButton.mock.calls).toEqual([
+      ['right', true, 0.75, 0.5],
+      ['right', false, 0.75, 0.5],
+    ]);
+  });
+
   it('provides a readable auto-zoomed virtual mouse with buttons, wheel, and edge pan', async () => {
     const { container, stage, video, getByRole } = await renderPanel();
     act(() => {
@@ -600,7 +641,6 @@ describe('RemoteDesktopPanel mobile gestures', () => {
 
     for (const [name, button] of [
       ['remote_desktop.mouse_left', 'left'],
-      ['remote_desktop.mouse_middle', 'middle'],
       ['remote_desktop.mouse_right', 'right'],
     ] as const) {
       const target = getByRole('button', { name });
@@ -625,6 +665,7 @@ describe('RemoteDesktopPanel mobile gestures', () => {
       pointer(handle, 'pointerup', { pointerId: 30, clientX: 400, clientY: 250 });
     });
     expect(pointerMove).toHaveBeenCalled();
+    expect(pointerMove).toHaveBeenCalledWith(1, 0.5);
     expect(video.style.transform).toMatch(/translate3d\(-/);
     expect(container.querySelector('.remote-desktop-virtual-pointer')).not.toBeNull();
     expect(stage.textContent).toContain('remote_desktop.mouse_hint');

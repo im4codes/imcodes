@@ -7909,18 +7909,26 @@ button.quick-agent-delegation-preset.active {
 .remote-desktop-virtual-pointer {
   position: absolute;
   z-index: 5;
-  width: 18px;
-  height: 24px;
-  translate: -3px -3px;
+  width: 20px;
+  height: 27px;
+  translate: -2px -2px;
   pointer-events: none;
-  filter: drop-shadow(0 1px 2px #000);
+  filter: drop-shadow(0 2px 3px #000) drop-shadow(0 0 5px rgb(65 211 255 / 65%));
 }
 
 .remote-desktop-virtual-pointer::before {
   content: "";
   position: absolute;
   inset: 0;
-  background: #f5fbff;
+  background: #03131e;
+  clip-path: polygon(0 0, 0 90%, 25% 68%, 42% 100%, 57% 92%, 40% 61%, 72% 60%);
+}
+
+.remote-desktop-virtual-pointer::after {
+  content: "";
+  position: absolute;
+  inset: 2px 3px 3px 2px;
+  background: linear-gradient(145deg, #f7fdff 20%, #5dd8ff 88%);
   clip-path: polygon(0 0, 0 90%, 25% 68%, 42% 100%, 57% 92%, 40% 61%, 72% 60%);
 }
 
@@ -7930,37 +7938,41 @@ button.quick-agent-delegation-preset.active {
   left: 50%;
   bottom: 12px;
   translate: -50% 0;
-  width: 164px;
-  padding: 7px;
+  width: 178px;
+  padding: 8px;
   display: grid;
-  grid-template-columns: 44px 1fr;
-  grid-template-rows: auto 46px;
-  gap: 6px;
+  grid-template-columns: 1fr;
+  grid-template-rows: 48px 58px;
+  gap: 8px;
   color: #e9f8ff;
-  background: rgb(8 27 43 / 92%);
-  border: 1px solid rgb(118 213 255 / 62%);
-  border-radius: 18px;
-  box-shadow: 0 8px 30px rgb(0 0 0 / 45%);
+  background: linear-gradient(155deg, rgb(13 37 55 / 96%), rgb(4 17 29 / 96%));
+  border: 1px solid rgb(105 220 255 / 72%);
+  border-radius: 28px 28px 20px 20px;
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 12%), 0 10px 34px rgb(0 0 0 / 52%), 0 0 20px rgb(41 190 255 / 12%);
   touch-action: none;
 }
 
 .remote-desktop-virtual-mouse-buttons {
-  grid-column: 1 / -1;
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  gap: 5px;
+  grid-template-columns: 1fr 34px 1fr;
+  gap: 6px;
 }
 
 .remote-desktop-virtual-mouse button {
   min-width: 0;
-  min-height: 38px;
+  min-height: 46px;
   padding: 5px;
   color: #e9f8ff;
-  background: #123651;
-  border: 1px solid #3f789b;
-  border-radius: 9px;
+  background: linear-gradient(180deg, #174360, #0d2c42);
+  border: 1px solid #458cb3;
+  border-radius: 18px 8px 10px 10px;
   font-weight: 700;
   touch-action: none;
+}
+
+.remote-desktop-virtual-mouse-buttons > button:nth-child(2) {
+  grid-column: 3;
+  border-radius: 8px 18px 10px 10px;
 }
 
 .remote-desktop-virtual-mouse button:active {
@@ -7973,19 +7985,66 @@ button.quick-agent-delegation-preset.active {
 }
 
 .remote-desktop-virtual-wheel {
-  grid-column: 1;
-  font-size: 22px;
+  grid-column: 2;
+  grid-row: 1;
+  display: grid;
+  place-items: center;
+  padding: 5px 7px !important;
+  border-radius: 999px !important;
   cursor: ns-resize;
 }
 
+.remote-desktop-virtual-wheel span {
+  width: 8px;
+  height: 27px;
+  border-radius: 999px;
+  background: repeating-linear-gradient(to bottom, #8be7ff 0 3px, #14506c 3px 6px);
+  box-shadow: 0 0 8px rgb(74 211 255 / 55%);
+}
+
 .remote-desktop-virtual-mouse-handle {
-  grid-column: 2;
-  font-size: 23px;
+  width: 100%;
+  min-height: 58px !important;
+  font-size: 27px;
+  border-radius: 14px !important;
+  background: radial-gradient(circle at 50% 48%, #246486 0 16%, #123d59 17% 38%, #09293e 39% 100%) !important;
   cursor: grab;
+}
+
+.remote-desktop-virtual-mouse-handle span {
+  display: inline-grid;
+  place-items: center;
+  width: 38px;
+  height: 38px;
+  color: #a7efff;
+  border: 1px solid rgb(108 221 255 / 48%);
+  border-radius: 50%;
+  box-shadow: inset 0 0 12px rgb(65 200 255 / 22%), 0 0 12px rgb(65 200 255 / 16%);
 }
 
 .remote-desktop-virtual-mouse-handle:active {
   cursor: grabbing;
+}
+
+.remote-desktop-touch-right-button {
+  position: absolute;
+  z-index: 7;
+  right: 12px;
+  bottom: 12px;
+  min-width: 52px;
+  min-height: 44px;
+  color: #eaffff;
+  background: linear-gradient(145deg, rgb(14 57 78 / 96%), rgb(5 27 42 / 96%));
+  border: 1px solid rgb(95 218 255 / 68%);
+  border-radius: 15px;
+  box-shadow: 0 8px 24px rgb(0 0 0 / 42%), inset 0 1px 0 rgb(255 255 255 / 12%);
+  font-weight: 800;
+  touch-action: none;
+}
+
+.remote-desktop-touch-right-button:active {
+  color: #03111a;
+  background: #76dcff;
 }
 
 .remote-desktop-stage-placeholder {

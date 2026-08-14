@@ -31,6 +31,7 @@ import { PendingWebRtcCandidates, toWebRtcIceServers } from '@shared/webrtc-conn
 import { apiFetch, getApiBaseUrl } from './api.js';
 
 const DATA_BUFFER_HIGH_WATER_BYTES = 256 * 1024;
+const POINTER_RELIABLE_SYNC_INTERVAL_MS = 100;
 const DATA_BUFFER_LOW_WATER_BYTES = 64 * 1024;
 // Let the server own the authoritative negotiation deadline and reason.  The
 // browser guard is only a final escape hatch if that terminal frame is lost.
@@ -273,6 +274,7 @@ export class RemoteDesktopClient {
     displayHeight: number;
   } | null = null;
   private pendingPointerMove: { x: number; y: number } | null = null;
+  private lastReliablePointerSyncAt = Number.NEGATIVE_INFINITY;
   private pressedCodes = new Set<string>();
   private pressedButtons = new Set<string>();
   private pendingClipboardRequests = new Map<string, {
@@ -538,6 +540,7 @@ export class RemoteDesktopClient {
 
   releaseAll(): void {
     this.pendingPointerMove = null;
+    this.lastReliablePointerSyncAt = Number.NEGATIVE_INFINITY;
     if (this.pointerFrame !== null) {
       (this.deps.cancelAnimationFrame ?? cancelAnimationFrame)(this.pointerFrame);
       this.pointerFrame = null;
@@ -818,7 +821,22 @@ export class RemoteDesktopClient {
   private flushPointerMove(): void {
     const move = this.pendingPointerMove;
     this.pendingPointerMove = null;
-    if (!move || !this.canSendInput() || !isOpen(this.pointerChannel)) return;
+    if (!move || !this.canSendInput()) return;
+    const now = this.deps.now?.() ?? Date.now();
+    if (now - this.lastReliablePointerSyncAt >= POINTER_RELIABLE_SYNC_INTERVAL_MS
+      && this.sendReliablePointerSync({
+        type: REMOTE_DESKTOP_DATA_MSG.POINTER,
+        ...this.inputBase(),
+        kind: REMOTE_DESKTOP_POINTER_KIND.MOVE,
+        ...move,
+      })) {
+      // The low-latency pointer channel intentionally drops stale packets.
+      // Periodically mirror the newest absolute position on the reliable
+      // control channel so the remote cursor always converges to the local
+      // cursor even when the final unreliable datagram is lost.
+      this.lastReliablePointerSyncAt = now;
+    }
+    if (!isOpen(this.pointerChannel)) return;
     if (this.pointerChannel.bufferedAmount > DATA_BUFFER_HIGH_WATER_BYTES) {
       // Only the superseded motion is dropped. Key/button transitions use a
       // different reliable channel and never enter this queue.
@@ -1003,6 +1021,12 @@ export class RemoteDesktopClient {
 
   private sendPointer(message: object): boolean {
     return this.sendData(this.pointerChannel, message, false);
+  }
+
+  private sendReliablePointerSync(message: object): boolean {
+    if (!isOpen(this.controlChannel)
+      || this.controlChannel.bufferedAmount > DATA_BUFFER_HIGH_WATER_BYTES) return false;
+    return this.sendData(this.controlChannel, message, false);
   }
 
   private sendData(channel: RTCDataChannel | null, message: object, reliableTransition: boolean): boolean {

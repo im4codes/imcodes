@@ -550,15 +550,17 @@ bool DxgiDesktopSource::EnsureCursorSurface(int width, int height) {
 void DxgiDesktopSource::CompositeCursor(uint8_t* bgra, int stride,
                                         int width, int height) {
   if (pointer_position_known_) {
-    if (pointer_visible_ && pointer_shape_valid_)
+    if (!pointer_visible_) return;
+    if (pointer_shape_valid_) {
       CompositeDxgiCursor(bgra, stride, width, height);
-    // DXGI reports Visible=false when the pointer is hidden or already
-    // embedded in the acquired desktop image. Never draw a second cursor.
-    return;
+      return;
+    }
+    // Some adapters report the first visible position before returning a
+    // shape buffer. Fall through to the native cursor until DXGI supplies the
+    // shape instead of making the remote cursor disappear indefinitely.
   }
 
-  // Very first frames can precede DXGI's first pointer metadata update. Use
-  // the current native cursor only until DXGI becomes authoritative.
+  // Very first frames can precede DXGI's first pointer metadata update.
   CURSORINFO cursor{};
   cursor.cbSize = sizeof(cursor);
   if (!GetCursorInfo(&cursor) || !(cursor.flags & CURSOR_SHOWING) ||

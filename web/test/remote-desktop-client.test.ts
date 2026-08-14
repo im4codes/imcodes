@@ -131,6 +131,7 @@ describe('RemoteDesktopClient', () => {
     const timeoutSpy = vi.spyOn(globalThis, 'setTimeout');
     let socket!: FakeSocket;
     let peer!: FakePeer;
+    let now = 0;
     const snapshots: Array<ReturnType<RemoteDesktopClient['current']>> = [];
     const animationFrames: FrameRequestCallback[] = [];
     const client = new RemoteDesktopClient('controlled-win', {
@@ -151,6 +152,7 @@ describe('RemoteDesktopClient', () => {
         return animationFrames.length;
       },
       cancelAnimationFrame: vi.fn(),
+      now: () => now,
     });
 
     await client.start();
@@ -308,18 +310,42 @@ describe('RemoteDesktopClient', () => {
       acknowledgedSequence: keyDown.sequence,
     });
     expect(client.current().lastAcknowledgedInputSequence).toBe(keyDown.sequence);
+    now = 100;
     client.pointerMove(0.1, 0.2);
     client.pointerMove(0.8, 0.9);
     expect(animationFrames).toHaveLength(1);
     animationFrames[0]!(0);
     expect(JSON.parse(pointer.sent.at(-1)!)).toMatchObject({ x: 0.8, y: 0.9, inputEpoch: 1 });
+    expect(JSON.parse(control.sent.at(-1)!)).toMatchObject({
+      kind: REMOTE_DESKTOP_POINTER_KIND.MOVE,
+      x: 0.8,
+      y: 0.9,
+      inputEpoch: 1,
+    });
 
     const sentBeforeBackpressure = pointer.sent.length;
+    const reliableBeforeBackpressure = control.sent.length;
     pointer.bufferedAmount = 1_000_000;
+    now = 150;
     client.pointerMove(0.2, 0.3);
     expect(animationFrames).toHaveLength(2);
     animationFrames[1]!(1);
     expect(pointer.sent).toHaveLength(sentBeforeBackpressure);
+    expect(control.sent).toHaveLength(reliableBeforeBackpressure);
+
+    // Even while the best-effort channel is congested, a bounded reliable
+    // position sample makes the remote Windows cursor converge to the local
+    // pointer instead of getting stuck at the last delivered packet.
+    now = 250;
+    client.pointerMove(0.7, 0.6);
+    expect(animationFrames).toHaveLength(3);
+    animationFrames[2]!(2);
+    expect(pointer.sent).toHaveLength(sentBeforeBackpressure);
+    expect(JSON.parse(control.sent.at(-1)!)).toMatchObject({
+      kind: REMOTE_DESKTOP_POINTER_KIND.MOVE,
+      x: 0.7,
+      y: 0.6,
+    });
     pointer.bufferedAmount = 0;
 
     control.receive({
