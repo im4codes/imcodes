@@ -3061,7 +3061,7 @@ exec "${realGit}" "$@"
     const repairPrompt = await waitForTransportSend((text) =>
       text.includes('OpenSpec Auto Deliver needs the final implementation acceptance audit authoritative result file')
       && text.includes('Problem: missing_repair_completion'),
-      SEND_WAIT_MS,
+      COVERAGE_CONTENDED_SEND_WAIT_MS,
     );
     expect(repairPrompt).toContain(`Authoritative result file: ${origin.authoritativeResultPath}`);
     expect(repairPrompt).toContain('Final acceptance audits must include repair_completion with fields');
