@@ -2,7 +2,12 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
 import { performance } from 'node:perf_hooks';
 import { readFileSync } from 'node:fs';
-import { WsBridge, __setIdlePushSettleMsForTests, __setTimelineDataPlaneQueueConfigForTests } from '../src/ws/bridge.js';
+import {
+  WsBridge,
+  __setIdlePushSettleMsForTests,
+  __setLegacyUpgradePublisherSignerResolverForTests,
+  __setTimelineDataPlaneQueueConfigForTests,
+} from '../src/ws/bridge.js';
 import { getCounter, resetMetricsForTests } from '../src/util/metrics.js';
 import {
   markDaemonUpgradeTargetVersionPublishedForTest,
@@ -346,9 +351,13 @@ async function flushOneBridgeDataPlaneTurn() {
 
 describe('WsBridge', () => {
   let serverId: string;
+  let restoreUpgradePublisherSignerResolver: () => void;
 
   beforeEach(() => {
     serverId = `test-${Math.random().toString(36).slice(2)}`;
+    restoreUpgradePublisherSignerResolver = __setLegacyUpgradePublisherSignerResolverForTests(
+      async () => 'a'.repeat(64),
+    );
     resetDaemonUpgradePublicationGateForTest();
     markDaemonUpgradeTargetVersionPublishedForTest('2026.4.905-dev.877');
     markDaemonUpgradeTargetVersionPublishedForTest('2026.4.905');
@@ -356,6 +365,7 @@ describe('WsBridge', () => {
   });
 
   afterEach(() => {
+    restoreUpgradePublisherSignerResolver();
     WsBridge.getAll().clear();
     resetDaemonUpgradePublicationGateForTest();
     resetMetricsForTests();

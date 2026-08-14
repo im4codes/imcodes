@@ -19,6 +19,9 @@ export const CONTROLLED_NODE_SERVICE = {
 export const CONTROLLED_NODE_WINDOWS_INSTALL_DIR = 'imcodes-node' as const;
 export const CONTROLLED_NODE_WINDOWS_LEGACY_UPGRADE_RESCUE_DIR = 'imcodes-node-upgrade-rescue' as const;
 export const CONTROLLED_NODE_WINDOWS_UPGRADE_TASK_PREFIX = 'imcodes-node-upgrade-' as const;
+export const CONTROLLED_NODE_WINDOWS_UPGRADE_PREFLIGHT_FAILED = 'preflight_failed' as const;
+export const CONTROLLED_NODE_WINDOWS_RELEASE_TRUST_PREFLIGHT_FAILURE =
+  'remote desktop worker Authenticode verification failed' as const;
 
 /** New nodes advertise that their own self-upgrade script has backup/health rollback semantics. */
 export const CONTROLLED_NODE_SAFE_SELF_UPGRADE_CAPABILITY = 'controlled-node.safe-self-upgrade.v2' as const;

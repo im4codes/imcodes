@@ -84,6 +84,7 @@ import {
   buildLegacyWindowsUpgradeRestartCommand,
   LEGACY_WINDOWS_UPGRADE_RESCUE_EXEC_TIMEOUT_MS,
   LEGACY_WINDOWS_UPGRADE_RESTART_EXEC_TIMEOUT_MS,
+  resolveLegacyWindowsUpgradePublisherSignerSha256,
 } from './windows-controlled-node-upgrade-rescue.js';
 import { REPO_MSG, REPO_RELAY_TYPES } from '../../../shared/repo-types.js';
 import { TRANSPORT_RELAY_TYPES, TRANSPORT_MSG } from '../../../shared/transport-events.js';
@@ -287,6 +288,15 @@ const LEGACY_UPGRADE_RESCUE_RETRY_BASE_MS = 60_000;
 const LEGACY_UPGRADE_RESCUE_RETRY_MAX_MS = 15 * 60_000;
 const LEGACY_UPGRADE_RESTART_RETRY_BASE_MS = 60_000;
 const LEGACY_UPGRADE_RESTART_RETRY_MAX_MS = 5 * 60_000;
+let resolveLegacyUpgradePublisherSigner = resolveLegacyWindowsUpgradePublisherSignerSha256;
+
+export function __setLegacyUpgradePublisherSignerResolverForTests(
+  resolver: typeof resolveLegacyWindowsUpgradePublisherSignerSha256,
+): () => void {
+  const previous = resolveLegacyUpgradePublisherSigner;
+  resolveLegacyUpgradePublisherSigner = resolver;
+  return () => { resolveLegacyUpgradePublisherSigner = previous; };
+}
 const DAEMON_UPGRADE_TRANSIENT_BLOCK_REASONS = new Set([
   DAEMON_UPGRADE_BLOCK_REASON.ALREADY_IN_PROGRESS,
   'p2p_active',
@@ -6950,21 +6960,7 @@ export class WsBridge {
     state.restartInFlight = true;
     state.restartAttempts += 1;
     const restartId = randomUUID();
-    const prepared = buildLegacyWindowsUpgradeRestartCommand(state.preparedRescueId, restartId);
     const correlationId = `upgrade-restart-${restartId}`;
-    const checked = validateMachineExecFrame({
-      type: DAEMON_COMMAND_TYPES.MACHINE_EXEC,
-      correlationId,
-      idempotencyKey: correlationId,
-      command: prepared.command,
-      shell: 'powershell',
-      timeoutMs: LEGACY_WINDOWS_UPGRADE_RESTART_EXEC_TIMEOUT_MS,
-    });
-    if (!checked.ok) {
-      state.restartInFlight = false;
-      logger.error({ serverId: this.serverId, error: checked.error }, 'Legacy upgrade restart command failed local validation');
-      return;
-    }
 
     const scheduleRetry = (): void => {
       if (
@@ -6985,6 +6981,25 @@ export class WsBridge {
     };
 
     void (async () => {
+      const targetVersion = process.env.APP_VERSION;
+      if (!targetVersion || targetVersion === '0.0.0') {
+        throw new Error('legacy_upgrade_restart_target_version_unavailable');
+      }
+      const expectedSignerSha256 = await resolveLegacyUpgradePublisherSigner(targetVersion);
+      const prepared = buildLegacyWindowsUpgradeRestartCommand(
+        state.preparedRescueId!,
+        restartId,
+        expectedSignerSha256,
+      );
+      const checked = validateMachineExecFrame({
+        type: DAEMON_COMMAND_TYPES.MACHINE_EXEC,
+        correlationId,
+        idempotencyKey: correlationId,
+        command: prepared.command,
+        shell: 'powershell',
+        timeoutMs: LEGACY_WINDOWS_UPGRADE_RESTART_EXEC_TIMEOUT_MS,
+      });
+      if (!checked.ok) throw new Error(`legacy_upgrade_restart_command_${checked.error}`);
       await this.persistLegacyUpgradeRescueAudit(CONTROLLED_NODE_UPGRADE_RESCUE_AUDIT_ACTION.RESTART_INTENT, {
         generation,
         rescueId: state.preparedRescueId,

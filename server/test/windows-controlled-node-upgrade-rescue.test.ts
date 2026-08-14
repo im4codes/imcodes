@@ -12,10 +12,12 @@ import {
   LEGACY_WINDOWS_UPGRADE_RESCUE_GRACE_MS,
   LEGACY_WINDOWS_UPGRADE_RESCUE_READY_PREFIX,
   LEGACY_WINDOWS_UPGRADE_RESTART_READY_PREFIX,
+  resolveLegacyWindowsUpgradePublisherSignerSha256,
 } from '../src/ws/windows-controlled-node-upgrade-rescue.js';
 
 const RESCUE_ID = '12345678-1234-4abc-8def-1234567890ab';
 const RESTART_ID = 'abcdef12-3456-4abc-8def-1234567890ab';
+const SIGNER_SHA256 = 'a'.repeat(64);
 
 function decodeSetup(command: string): string {
   const encoded = command.match(/FromBase64String\('([^']+)'\)/)?.[1];
@@ -81,7 +83,7 @@ describe('legacy Windows controlled-node upgrade rescue', () => {
   });
 
   it('builds a verified one-shot SYSTEM restart only after the matching rescue and old upgrade task are clear', () => {
-    const built = buildLegacyWindowsUpgradeRestartCommand(RESCUE_ID, RESTART_ID);
+    const built = buildLegacyWindowsUpgradeRestartCommand(RESCUE_ID, RESTART_ID, SIGNER_SHA256);
     expect(utf8ByteLength(built.command)).toBeLessThanOrEqual(REMOTE_EXEC_MAX_COMMAND_BYTES);
     expect(built.expectedStdout).toBe(`${LEGACY_WINDOWS_UPGRADE_RESTART_READY_PREFIX}:${RESTART_ID}`);
     expect(built.commandSha256).toMatch(/^[0-9a-f]{64}$/);
@@ -98,6 +100,29 @@ describe('legacy Windows controlled-node upgrade rescue', () => {
     expect(setup).toContain("throw 'legacy upgrade task still registered'");
     expect(setup.indexOf("throw 'legacy upgrade task still registered'"))
       .toBeLessThan(setup.indexOf('Register-ScheduledTask -TaskName $restartTask'));
+    expect(setup).toContain('$env:TEMP, $env:TMP, [IO.Path]::GetTempPath()');
+    expect(setup).toContain("-Directory -Filter ($upgradePrefix + '*')");
+    expect(setup).toContain("$candidateOwnerSid -notin @('S-1-5-18','S-1-5-32-544')");
+    expect(setup).toContain('$workerDirItem.Attributes -band [IO.FileAttributes]::ReparsePoint');
+    expect(setup).toContain("[string]$upgradeResult.status -cne 'preflight_failed'");
+    expect(setup).toContain("[string]$upgradeResult.reason -cne 'remote desktop worker Authenticode verification failed'");
+    expect(setup).toContain("throw 'legacy upgrade signed staging evidence missing'");
+    expect(setup).toContain('Get-FileHash -Algorithm SHA256 -LiteralPath $workerPath');
+    expect(setup).toContain(SIGNER_SHA256);
+    expect(setup).toContain("Cert:\\LocalMachine\\TrustedPeople");
+    expect(setup).toContain("Cert:\\LocalMachine\\TrustedPublisher");
+    expect(setup).not.toContain('LocalMachine\\Root');
+    expect(setup).toContain('if ($actual -cne $expected)');
+    expect(setup).toContain('if (-not $hasCodeSigningEku)');
+    expect(setup).toContain('$path = [string]$workerPath');
+    expect(setup.indexOf("throw 'release signer does not match the compiled trust anchor'"))
+      .toBeLessThan(setup.indexOf('Import-Certificate'));
+    expect(setup.indexOf("throw 'release signer is not valid for code signing'"))
+      .toBeLessThan(setup.indexOf('Import-Certificate'));
+    expect(setup.indexOf('Import-Certificate'))
+      .toBeLessThan(setup.indexOf('$stagedWorker = $workerPath'));
+    expect(setup.indexOf("throw 'legacy upgrade task still registered'"))
+      .toBeLessThan(setup.indexOf("Cert:\\LocalMachine\\TrustedPeople"));
     expect(setup).toContain("-User 'SYSTEM' -RunLevel Highest -Force");
     expect(setup).toContain('legacy upgrade restart task verification failed');
     expect(setup.indexOf('legacy upgrade restart task verification failed'))
@@ -122,9 +147,58 @@ describe('legacy Windows controlled-node upgrade rescue', () => {
   });
 
   it('rejects malformed rescue or restart correlation ids', () => {
-    expect(() => buildLegacyWindowsUpgradeRestartCommand('not-an-id', RESTART_ID))
+    expect(() => buildLegacyWindowsUpgradeRestartCommand('not-an-id', RESTART_ID, SIGNER_SHA256))
       .toThrow('invalid_legacy_upgrade_rescue_id');
-    expect(() => buildLegacyWindowsUpgradeRestartCommand(RESCUE_ID, 'not-an-id'))
+    expect(() => buildLegacyWindowsUpgradeRestartCommand(RESCUE_ID, 'not-an-id', SIGNER_SHA256))
       .toThrow('invalid_legacy_upgrade_restart_id');
+    expect(() => buildLegacyWindowsUpgradeRestartCommand(RESCUE_ID, RESTART_ID, 'bad'))
+      .toThrow('invalid_legacy_upgrade_release_signer');
+  });
+
+  it('derives one signer anchor from matching current main and worker manifests', async () => {
+    const version = '2026.8.3411-dev.3849';
+    const worker = JSON.stringify({
+      manifestVersion: 2,
+      workerVersion: version,
+      protocolVersion: 2,
+      ipcVersion: 1,
+      os: 'win32',
+      arch: 'x64',
+      fileName: 'imcodes-remote-desktop-worker.exe',
+      size: 123,
+      sha256: 'b'.repeat(64),
+      authenticodeSignerSha256: SIGNER_SHA256,
+      libwebrtcRevision: 'f20ebb8adbf4fa781830e4384c61f732bd28a217',
+      virtualDisplay: {
+        archiveFileName: 'imcodes-virtual-display.zip',
+        packageManifestFileName: 'imcodes-virtual-display.manifest.json',
+        size: 456,
+        sha256: 'd'.repeat(64),
+      },
+      toolchain: {
+        msvc: '14.44.35207',
+        windowsSdk: '10.0.26100.0',
+        cmake: 'not-used-sdk',
+        ninja: 'not-used-sdk',
+        depotTools: 'a1bda5b6167435ad0666191f0353f242104f5845',
+      },
+    });
+    const main = JSON.stringify({
+      schemaVersion: 1,
+      artifact: {
+        fileName: 'imcodes-node.exe',
+        os: 'win32',
+        arch: 'x64',
+        authenticodeSignerSha256: SIGNER_SHA256,
+      },
+      build: { version },
+    });
+    const read = (async (path: string) => (
+      path.endsWith('imcodes-node.exe.manifest.json') ? main : worker
+    )) as never;
+    await expect(resolveLegacyWindowsUpgradePublisherSignerSha256(version, 'C:\\artifacts', read))
+      .resolves.toBe(SIGNER_SHA256);
+    await expect(resolveLegacyWindowsUpgradePublisherSignerSha256(`${version}-wrong`, 'C:\\artifacts', read))
+      .rejects.toThrow('windows_release_artifact_signer_manifest_mismatch');
   });
 });

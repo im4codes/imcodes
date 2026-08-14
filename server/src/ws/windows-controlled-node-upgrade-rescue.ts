@@ -1,11 +1,25 @@
 import { createHash } from 'node:crypto';
+import { readFile } from 'node:fs/promises';
+import { join } from 'node:path';
 import {
   CONTROLLED_NODE_SERVICE,
   CONTROLLED_NODE_WINDOWS_INSTALL_DIR,
   CONTROLLED_NODE_WINDOWS_LEGACY_UPGRADE_RESCUE_DIR,
+  CONTROLLED_NODE_WINDOWS_RELEASE_TRUST_PREFLIGHT_FAILURE,
+  CONTROLLED_NODE_WINDOWS_UPGRADE_PREFLIGHT_FAILED,
   CONTROLLED_NODE_WINDOWS_UPGRADE_TASK_PREFIX,
 } from '../../../shared/controlled-node-service.js';
-import { WINDOWS_POWERSHELL_UTILITY_MODULE_PREFLIGHT } from '../../../shared/windows-powershell-modules.js';
+import { REMOTE_DESKTOP_PROTOCOL_VERSION } from '../../../shared/remote-desktop.js';
+import {
+  REMOTE_DESKTOP_WORKER_FILENAME,
+  REMOTE_DESKTOP_WORKER_MANIFEST_SUFFIX,
+  validateRemoteDesktopWorkerManifest,
+} from '../../../shared/remote-desktop-worker.js';
+import {
+  WINDOWS_POWERSHELL_SECURITY_MODULE_PREFLIGHT,
+  WINDOWS_POWERSHELL_UTILITY_MODULE_PREFLIGHT,
+} from '../../../shared/windows-powershell-modules.js';
+import { buildWindowsReleasePublisherTrustScriptForVariable } from '../../../shared/windows-release-publisher-trust.js';
 
 export const LEGACY_WINDOWS_UPGRADE_RESCUE_GRACE_MS = 11 * 60 * 1000;
 export const LEGACY_WINDOWS_UPGRADE_RESCUE_EXEC_TIMEOUT_MS = 120_000;
@@ -23,6 +37,56 @@ function utf8Base64(value: string): string {
 
 function utf16leBase64(value: string): string {
   return Buffer.from(value, 'utf16le').toString('base64');
+}
+
+const SHA256_RE = /^[a-f0-9]{64}$/;
+
+export async function resolveLegacyWindowsUpgradePublisherSignerSha256(
+  expectedVersion: string,
+  artifactDir = process.env.IMCODES_NODE_EXE_DIR,
+  read: typeof readFile = readFile,
+): Promise<string> {
+  if (!artifactDir || !expectedVersion) throw new Error('windows_release_artifact_context_unavailable');
+  const workerManifestPath = join(
+    artifactDir,
+    'remote-desktop-worker',
+    'win32-x64',
+    `${REMOTE_DESKTOP_WORKER_FILENAME}${REMOTE_DESKTOP_WORKER_MANIFEST_SUFFIX}`,
+  );
+  const mainManifestPath = join(artifactDir, 'imcodes-node.exe.manifest.json');
+  let workerRaw: unknown;
+  let mainRaw: unknown;
+  try {
+    [workerRaw, mainRaw] = await Promise.all([
+      read(workerManifestPath, 'utf8').then((value) => JSON.parse(value)),
+      read(mainManifestPath, 'utf8').then((value) => JSON.parse(value)),
+    ]);
+  } catch {
+    throw new Error('windows_release_artifact_manifest_unavailable');
+  }
+  const worker = validateRemoteDesktopWorkerManifest(workerRaw);
+  const main = mainRaw as {
+    schemaVersion?: unknown;
+    artifact?: Record<string, unknown>;
+    build?: Record<string, unknown>;
+  } | null;
+  const signer = worker?.authenticodeSignerSha256;
+  if (!worker
+    || worker.protocolVersion !== REMOTE_DESKTOP_PROTOCOL_VERSION
+    || worker.workerVersion !== expectedVersion
+    || !signer
+    || !SHA256_RE.test(signer)
+    || !main
+    || typeof main !== 'object'
+    || main.schemaVersion !== 1
+    || main.artifact?.fileName !== 'imcodes-node.exe'
+    || main.artifact?.os !== 'win32'
+    || main.artifact?.arch !== 'x64'
+    || main.artifact?.authenticodeSignerSha256 !== signer
+    || main.build?.version !== expectedVersion) {
+    throw new Error('windows_release_artifact_signer_manifest_mismatch');
+  }
+  return signer;
 }
 
 /**
@@ -180,9 +244,11 @@ export function buildLegacyWindowsUpgradeRescueCommand(rescueId: string): Legacy
 export function buildLegacyWindowsUpgradeRestartCommand(
   rescueId: string,
   restartId: string,
+  expectedSignerSha256: string,
 ): LegacyWindowsUpgradeRescueCommand {
   if (!/^[0-9a-f-]{36}$/i.test(rescueId)) throw new Error('invalid_legacy_upgrade_rescue_id');
   if (!/^[0-9a-f-]{36}$/i.test(restartId)) throw new Error('invalid_legacy_upgrade_restart_id');
+  if (!SHA256_RE.test(expectedSignerSha256)) throw new Error('invalid_legacy_upgrade_release_signer');
 
   const restartTask = CONTROLLED_NODE_SERVICE.WINDOWS_LEGACY_UPGRADE_RESTART_TASK;
   const restartScript = `$ErrorActionPreference = 'Stop'\r\n`
@@ -201,9 +267,14 @@ export function buildLegacyWindowsUpgradeRestartCommand(
     + `Start-ScheduledTask -TaskName $mainTask\r\n`
     + `Unregister-ScheduledTask -TaskName $restartTask -Confirm:$false -ErrorAction SilentlyContinue\r\n`;
   const restartScriptBase64 = utf16leBase64(restartScript);
+  const publisherTrustScript = buildWindowsReleasePublisherTrustScriptForVariable(
+    'workerPath',
+    expectedSignerSha256,
+  );
   const expectedStdout = `${LEGACY_WINDOWS_UPGRADE_RESTART_READY_PREFIX}:${restartId}`;
   const setupScript = `$ErrorActionPreference = 'Stop'\r\n`
     + WINDOWS_POWERSHELL_UTILITY_MODULE_PREFLIGHT
+    + WINDOWS_POWERSHELL_SECURITY_MODULE_PREFLIGHT
     + `$nodeDir = Join-Path $env:ProgramData ${psSingleQuote(CONTROLLED_NODE_WINDOWS_INSTALL_DIR)}\r\n`
     + `$nodePath = Join-Path $nodeDir 'imcodes-node.exe'\r\n`
     + `$rescueRoot = Join-Path $env:ProgramData ${psSingleQuote(CONTROLLED_NODE_WINDOWS_LEGACY_UPGRADE_RESCUE_DIR)}\r\n`
@@ -219,6 +290,35 @@ export function buildLegacyWindowsUpgradeRestartCommand(
     + `$restartTask = ${psSingleQuote(restartTask)}\r\n`
     + `$otherUpgradeTasks = @(Get-ScheduledTask -TaskName ($upgradePrefix + '*') -ErrorAction Stop | Where-Object { $_.TaskName.StartsWith($upgradePrefix, [StringComparison]::OrdinalIgnoreCase) -and $_.TaskName -notin @($rescueTask, $restartTask) })\r\n`
     + `if ($otherUpgradeTasks.Count -gt 0) { throw 'legacy upgrade task still registered' }\r\n`
+    + `$stagedWorker = $null\r\n`
+    + `$tempRoots = @($env:TEMP, $env:TMP, [IO.Path]::GetTempPath(), (Join-Path $env:SystemRoot 'Temp')) | Where-Object { $_ -and (Test-Path -LiteralPath $_ -PathType Container) } | ForEach-Object { (Get-Item -LiteralPath $_ -Force).FullName } | Sort-Object -Unique\r\n`
+    + `$upgradeCandidates = @($tempRoots | ForEach-Object { Get-ChildItem -LiteralPath $_ -Directory -Filter ($upgradePrefix + '*') -ErrorAction Stop | Where-Object { -not ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) } }) | Sort-Object LastWriteTimeUtc -Descending\r\n`
+    + `foreach ($candidate in $upgradeCandidates) {\r\n`
+    + `  $resultPath = Join-Path $candidate.FullName 'imcodes-node.exe.upgrade-result.json'\r\n`
+    + `  $workerDir = Join-Path $candidate.FullName 'remote-desktop-worker\\win32-x64'\r\n`
+    + `  $workerPath = Join-Path $workerDir ${psSingleQuote(REMOTE_DESKTOP_WORKER_FILENAME)}\r\n`
+    + `  $workerManifestPath = Join-Path $workerDir ${psSingleQuote(`${REMOTE_DESKTOP_WORKER_FILENAME}${REMOTE_DESKTOP_WORKER_MANIFEST_SUFFIX}`)}\r\n`
+    + `  if (-not (Test-Path -LiteralPath $resultPath -PathType Leaf) -or -not (Test-Path -LiteralPath $workerPath -PathType Leaf) -or -not (Test-Path -LiteralPath $workerManifestPath -PathType Leaf)) { continue }\r\n`
+    + `  try {\r\n`
+    + `    $candidateItem = Get-Item -LiteralPath $candidate.FullName -Force\r\n`
+    + `    $candidateAcl = Get-Acl -LiteralPath $candidateItem.FullName -ErrorAction Stop\r\n`
+    + `    $candidateOwnerSid = $candidateAcl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value\r\n`
+    + `    if (-not $candidateItem.PSIsContainer -or ($candidateItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -or $candidateOwnerSid -notin @('S-1-5-18','S-1-5-32-544')) { continue }\r\n`
+    + `    $workerDirItem = Get-Item -LiteralPath $workerDir -Force\r\n`
+    + `    $resultItem = Get-Item -LiteralPath $resultPath -Force\r\n`
+    + `    $workerItem = Get-Item -LiteralPath $workerPath -Force\r\n`
+    + `    $workerManifestItem = Get-Item -LiteralPath $workerManifestPath -Force\r\n`
+    + `    if (-not $workerDirItem.PSIsContainer -or ($workerDirItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -or ($resultItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -or ($workerItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -or ($workerManifestItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) { continue }\r\n`
+    + `    $upgradeResult = Get-Content -LiteralPath $resultPath -Raw | ConvertFrom-Json\r\n`
+    + `    if ([string]$upgradeResult.status -cne ${psSingleQuote(CONTROLLED_NODE_WINDOWS_UPGRADE_PREFLIGHT_FAILED)} -or [string]$upgradeResult.reason -cne ${psSingleQuote(CONTROLLED_NODE_WINDOWS_RELEASE_TRUST_PREFLIGHT_FAILURE)}) { continue }\r\n`
+    + `    $workerManifest = Get-Content -LiteralPath $workerManifestPath -Raw | ConvertFrom-Json\r\n`
+    + `    if ([string]$workerManifest.fileName -cne ${psSingleQuote(REMOTE_DESKTOP_WORKER_FILENAME)} -or [string]$workerManifest.authenticodeSignerSha256 -cne ${psSingleQuote(expectedSignerSha256)} -or [int64]$workerManifest.size -ne [int64]$workerItem.Length -or [string]$workerManifest.sha256 -cne (Get-FileHash -Algorithm SHA256 -LiteralPath $workerPath).Hash.ToLowerInvariant()) { continue }\r\n`
+    + publisherTrustScript
+    + `    $stagedWorker = $workerPath\r\n`
+    + `    break\r\n`
+    + `  } catch { continue }\r\n`
+    + `}\r\n`
+    + `if (-not $stagedWorker) { throw 'legacy upgrade signed staging evidence missing' }\r\n`
     + `Stop-ScheduledTask -TaskName $restartTask -ErrorAction SilentlyContinue\r\n`
     + `Unregister-ScheduledTask -TaskName $restartTask -Confirm:$false -ErrorAction SilentlyContinue\r\n`
     + `$powershell = Join-Path $env:SystemRoot 'System32\\WindowsPowerShell\\v1.0\\powershell.exe'\r\n`

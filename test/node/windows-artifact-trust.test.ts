@@ -52,6 +52,14 @@ describe('Windows release artifact trust', () => {
     expect(script).not.toContain('LocalMachine\\Root');
     expect(script).not.toContain('Export-PfxCertificate');
     expect(script).toContain('$certificate.RawData');
+    expect(script).toContain('Microsoft.PowerShell.Security\\Microsoft.PowerShell.Security.psd1');
+    expect(script).toContain('Modules\\PKI\\PKI.psd1');
+    expect(script).toContain('if ($actual -cne $expected)');
+    expect(script).toContain('if (-not $hasCodeSigningEku)');
+    expect(script.indexOf("throw 'release signer does not match the compiled trust anchor'"))
+      .toBeLessThan(script.indexOf('Import-Certificate'));
+    expect(script.indexOf("throw 'release signer is not valid for code signing'"))
+      .toBeLessThan(script.indexOf('Import-Certificate'));
     expect(script).toContain('Test-AnchoredCertificateInStore');
     expect(script.indexOf('Test-AnchoredCertificateInStore')).toBeLessThan(script.indexOf('[IO.File]::WriteAllBytes'));
     expect(script).toContain('$trustedPeoplePresent -and $trustedPublisherPresent');

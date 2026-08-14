@@ -17,7 +17,11 @@ import {
   type ControlledNodeOs,
 } from '../../shared/controlled-node-artifacts.js';
 import { DAEMON_UPGRADE_TARGET_LATEST, normalizeDaemonUpgradeTargetVersion } from '../../shared/daemon-upgrade.js';
-import { CONTROLLED_NODE_WINDOWS_UPGRADE_TASK_PREFIX } from '../../shared/controlled-node-service.js';
+import {
+  CONTROLLED_NODE_WINDOWS_RELEASE_TRUST_PREFLIGHT_FAILURE,
+  CONTROLLED_NODE_WINDOWS_UPGRADE_PREFLIGHT_FAILED,
+  CONTROLLED_NODE_WINDOWS_UPGRADE_TASK_PREFIX,
+} from '../../shared/controlled-node-service.js';
 import { REMOTE_DESKTOP_PROTOCOL_VERSION } from '../../shared/remote-desktop.js';
 import {
   REMOTE_DESKTOP_WORKER_FILENAME,
@@ -368,7 +372,7 @@ export function buildWindowsControlledNodeUpgradeScript(input: {
       + `$srcRemoteDesktopHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $srcRemoteDesktopExe).Hash.ToLowerInvariant()\r\n`
       + `if ($srcRemoteDesktopHash -ne [string]$srcRemoteDesktopManifest.sha256) { throw 'remote desktop worker hash verification failed' }\r\n`
       + `$srcRemoteDesktopSignature = Get-AuthenticodeSignature -LiteralPath $srcRemoteDesktopExe\r\n`
-      + `if ($srcRemoteDesktopSignature.Status -ne [System.Management.Automation.SignatureStatus]::Valid -or $null -eq $srcRemoteDesktopSignature.SignerCertificate) { throw 'remote desktop worker Authenticode verification failed' }\r\n`
+      + `if ($srcRemoteDesktopSignature.Status -ne [System.Management.Automation.SignatureStatus]::Valid -or $null -eq $srcRemoteDesktopSignature.SignerCertificate) { throw ${psQuote(CONTROLLED_NODE_WINDOWS_RELEASE_TRUST_PREFLIGHT_FAILURE)} }\r\n`
       + `$srcRemoteDesktopSha256Algorithm = [System.Security.Cryptography.SHA256]::Create()\r\n`
       + `try { $srcRemoteDesktopSignerSha256 = [BitConverter]::ToString($srcRemoteDesktopSha256Algorithm.ComputeHash($srcRemoteDesktopSignature.SignerCertificate.RawData)).Replace('-', '').ToLowerInvariant() } finally { $srcRemoteDesktopSha256Algorithm.Dispose() }\r\n`
       + `if ($srcRemoteDesktopSignerSha256 -ne [string]$srcRemoteDesktopManifest.authenticodeSignerSha256) { throw 'remote desktop worker signer mismatch' }\r\n`
@@ -483,7 +487,7 @@ export function buildWindowsControlledNodeUpgradeScript(input: {
       + `} catch {\r\n`
       + `$failureMessage = [string]$_.Exception.Message\r\n`
       + `if ($failureMessage.Length -gt 240) { $failureMessage = $failureMessage.Substring(0, 240) }\r\n`
-      + `try { @{ status = 'preflight_failed'; reason = $failureMessage; completedAt = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() } | ConvertTo-Json -Compress | Set-Content -LiteralPath $upgradeResult -Encoding utf8 } catch { }\r\n`
+      + `try { @{ status = ${psQuote(CONTROLLED_NODE_WINDOWS_UPGRADE_PREFLIGHT_FAILED)}; reason = $failureMessage; completedAt = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() } | ConvertTo-Json -Compress | Set-Content -LiteralPath $upgradeResult -Encoding utf8 } catch { }\r\n`
       + upgradeTaskCleanup
       + `throw\r\n`
       + `}\r\n`
