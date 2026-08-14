@@ -821,6 +821,20 @@ describe('RemoteDesktopPanel mobile gestures', () => {
       terminalReason: REMOTE_DESKTOP_TERMINAL_REASON.PEER_FAILED,
     }));
     expect(container.textContent).toContain('remote_desktop.state.reconnecting');
+    // The closing client may publish another terminal snapshot after the retry
+    // timer was armed. It must not replace the recovery UI with worker_failed.
+    act(() => clientHooks[0]!.onSnapshot({
+      state: REMOTE_DESKTOP_STATE.FAILED,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW,
+      inputEpoch: 0,
+      inputEnabled: false,
+      displays: [],
+      layoutRevision: 1,
+      stream: null,
+      terminalReason: REMOTE_DESKTOP_TERMINAL_REASON.WORKER_FAILED,
+    }));
+    expect(container.textContent).toContain('remote_desktop.state.reconnecting');
+    expect(container.textContent).not.toContain('remote_desktop.failed');
     await act(async () => {
       await vi.advanceTimersByTimeAsync(
         REMOTE_DESKTOP_LIMITS.RECONNECT_BACKOFF_BASE_MS - 1,

@@ -235,10 +235,15 @@ export function RemoteDesktopPanel({ machine, ws = null, onClose }: RemoteDeskto
         }, REMOTE_DESKTOP_LIMITS.RECONNECT_STABILITY_RESET_MS);
       }
       const reason = next.terminalReason ?? next.error;
-      if (next.state === REMOTE_DESKTOP_STATE.FAILED
-        && reason && RECONNECTABLE_REMOTE_DESKTOP_FAILURES.has(reason)
-        && reconnectCountRef.current < MAX_REMOTE_DESKTOP_RECONNECTS
-        && !reconnectTimerRef.current) {
+      const reconnectableFailure = next.state === REMOTE_DESKTOP_STATE.FAILED
+        && Boolean(reason && RECONNECTABLE_REMOTE_DESKTOP_FAILURES.has(reason));
+      // stop()/terminal cleanup can publish more than one FAILED snapshot for
+      // the same client. Once a retry is scheduled, keep the recovery UI in
+      // place instead of briefly exposing worker_failed (and a dead Retry
+      // button) while the old authority finishes closing.
+      if (reconnectableFailure && reconnectTimerRef.current) return;
+      if (reconnectableFailure
+        && reconnectCountRef.current < MAX_REMOTE_DESKTOP_RECONNECTS) {
         reconnectCountRef.current++;
         const reconnectCount = reconnectCountRef.current;
         setSnapshot({
