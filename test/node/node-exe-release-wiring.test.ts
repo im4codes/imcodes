@@ -225,6 +225,7 @@ describe('controlled-node executable release wiring', () => {
     expect(dockerfile).toContain('COPY server/controlled-node-artifacts/ ./controlled-node-executables/');
     expect(dockerfile).toContain('COPY scripts/node-exe-artifacts.mjs ./scripts/node-exe-artifacts.mjs');
     expect(dockerfile).toContain('COPY scripts/remote-desktop-worker-artifacts.mjs ./scripts/remote-desktop-worker-artifacts.mjs');
+    expect(dockerfile).toContain('COPY shared/remote-desktop-native-pins.json ./shared/remote-desktop-native-pins.json');
     expect(dockerfile).toContain('ENV IMCODES_NODE_EXE_DIR=/app/controlled-node-executables');
   });
 
