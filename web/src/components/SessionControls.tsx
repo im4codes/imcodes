@@ -3630,6 +3630,12 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   // jank keeps the main thread busy) and show a "stopping" pulse instantly.
   const [stopRequested, setStopRequested] = useState(false);
   const stopPressGuardRef = useRef(0);
+  // A pointer activation dispatches pointerdown and then click. Queue append
+  // removes the optimistic rows during pointerdown, so a delayed click must
+  // still be recognized as the same activation instead of seeing an empty
+  // queue and turning into a real cancel. Keep this event-correlated; a time
+  // window is insufficient when streaming work stalls the main thread.
+  const stopPointerActivationRef = useRef(false);
 
   const showStopFeedback = useCallback(() => {
     stopPressGuardRef.current = Date.now();
@@ -4896,8 +4902,21 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                 : `${t('session.stop_plain')} (/stop)`}
               aria-label={t('session.stop_plain')}
               disabled={disabled || activeSession?.state === 'stopped'}
-              onPointerDown={(e) => { e.preventDefault(); handleStopButtonPress(); }}
-              onClick={handleStopButtonPress}
+              onPointerDown={(e) => {
+                e.preventDefault();
+                stopPointerActivationRef.current = true;
+                handleStopButtonPress();
+              }}
+              onClick={(e) => {
+                // Pointer-origin clicks have detail > 0. Keyboard/programmatic
+                // clicks have detail 0 and still need to activate the button.
+                if (stopPointerActivationRef.current && e.detail > 0) {
+                  stopPointerActivationRef.current = false;
+                  return;
+                }
+                stopPointerActivationRef.current = false;
+                handleStopButtonPress();
+              }}
               style={activeSessionLiveStatus.sweep ? { color: '#f87171' } : undefined}
             >
               <span aria-hidden="true">■</span>

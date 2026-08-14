@@ -4658,7 +4658,7 @@ afterEach(() => {
     const stop = screen.getByRole('button', { name: /^stop$/i });
     expect(within(stop).getByText('1').classList.contains('shortcut-btn-stop-queue-count')).toBe(true);
     fireEvent.pointerDown(stop);
-    fireEvent.click(stop);
+    fireEvent.click(stop, { detail: 1 });
 
     expect(ws.send).toHaveBeenCalledWith(expect.objectContaining({
       type: 'session.append_queued_messages',
@@ -4673,6 +4673,43 @@ afterEach(() => {
     const notice = screen.getByRole('status');
     expect(notice.textContent).toContain('Queued messages appended; the session is still running.');
     expect(notice.classList.contains('queue-append-success-toast')).toBe(true);
+  });
+
+  it('never turns the delayed click from a queue-first Stop press into a cancel', () => {
+    const now = vi.spyOn(Date, 'now').mockReturnValue(1_000);
+    try {
+      const ws = makeWs();
+      render(
+        <SessionControls
+          ws={ws as any}
+          activeSession={makeSession({
+            name: 'qwen-session',
+            agentType: 'qwen',
+            runtimeType: 'transport',
+            state: 'running',
+            transportPendingMessageEntries: [
+              { clientMessageId: 'msg-delayed-click', text: 'append despite delayed click' },
+            ],
+          })}
+          quickData={makeQuickData() as any}
+        />,
+      );
+
+      const stop = screen.getByRole('button', { name: /^stop$/i });
+      fireEvent.pointerDown(stop);
+      expect(screen.queryByText('append despite delayed click')).toBeNull();
+
+      // Simulate streaming/main-thread jank beyond the old 600 ms guard.
+      now.mockReturnValue(1_701);
+      fireEvent.click(stop, { detail: 1 });
+
+      expect(ws.send.mock.calls.filter(([payload]) => (
+        (payload as { type?: string }).type === 'session.append_queued_messages'
+      ))).toHaveLength(1);
+      expect(gatherCancelCalls(ws)).toEqual([]);
+    } finally {
+      now.mockRestore();
+    }
   });
 
   it('offers immediate append for a locally queued message before daemon synchronization', () => {
