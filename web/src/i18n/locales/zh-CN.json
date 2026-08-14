@@ -2988,6 +2988,14 @@
     "fullscreen": "全屏",
     "video_label": "{{machine}} 的实时桌面",
     "connecting": "正在连接 Windows 桌面…",
+    "connection_progress": "连接进度",
+    "connection_retrying": "第 {{count}} 次重连已排队，准备重新握手",
+    "connection_steps": {
+      "authorize": "连接信令并请求远程桌面授权",
+      "worker": "启动远程桌面服务",
+      "negotiate": "进行 WebRTC 握手与链路协商",
+      "media": "打开媒体通道并等待第一帧画面"
+    },
     "failed": "远程桌面已停止：{{reason}}",
     "retry": "重试",
     "escape_hint": "按 Esc 返回观看模式",

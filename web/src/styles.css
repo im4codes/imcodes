@@ -8120,6 +8120,7 @@ button.quick-agent-delegation-preset.active {
   z-index: 7;
   right: 12px;
   bottom: 12px;
+  display: none;
   min-width: 52px;
   min-height: 44px;
   color: #eaffff;
@@ -8159,6 +8160,81 @@ button.quick-agent-delegation-preset.active {
   box-shadow: 0 8px 24px rgb(21 151 211 / 24%);
   font-weight: 800;
   pointer-events: auto;
+}
+
+.remote-desktop-connection-progress {
+  width: min(480px, 100%);
+  display: grid;
+  gap: 14px;
+  padding: 18px 20px;
+  text-align: left;
+  background: linear-gradient(145deg, rgb(9 28 43 / 88%), rgb(4 15 26 / 92%));
+  border: 1px solid rgb(84 184 230 / 26%);
+  border-radius: 16px;
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 5%), 0 18px 48px rgb(0 0 0 / 28%);
+}
+
+.remote-desktop-connection-progress > strong {
+  color: #e2f6ff;
+  font-size: 14px;
+  letter-spacing: .01em;
+}
+
+.remote-desktop-connection-progress ol {
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 9px;
+  list-style: none;
+}
+
+.remote-desktop-connection-progress li {
+  display: grid;
+  grid-template-columns: 25px minmax(0, 1fr);
+  gap: 10px;
+  align-items: center;
+  color: #688096;
+  font-size: 13px;
+}
+
+.remote-desktop-connection-progress li > span:first-child {
+  width: 25px;
+  height: 25px;
+  display: grid;
+  place-items: center;
+  color: #7890a2;
+  background: rgb(20 48 68 / 72%);
+  border: 1px solid rgb(79 130 159 / 38%);
+  border-radius: 50%;
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.remote-desktop-connection-progress li.is-complete {
+  color: #9bb7c9;
+}
+
+.remote-desktop-connection-progress li.is-complete > span:first-child {
+  color: #06251d;
+  background: #55d6a1;
+  border-color: #89efc4;
+}
+
+.remote-desktop-connection-progress li.is-current {
+  color: #e5f7ff;
+  font-weight: 700;
+}
+
+.remote-desktop-connection-progress li.is-current > span:first-child {
+  color: #031b29;
+  background: #64d9ff;
+  border-color: #a4edff;
+  box-shadow: 0 0 0 4px rgb(74 205 255 / 11%), 0 0 18px rgb(65 196 255 / 30%);
+  animation: remote-desktop-connection-pulse 1.6s ease-in-out infinite;
+}
+
+@keyframes remote-desktop-connection-pulse {
+  50% { box-shadow: 0 0 0 7px rgb(74 205 255 / 5%), 0 0 24px rgb(65 196 255 / 42%); }
 }
 
 .remote-desktop-capture-hint {
@@ -8486,6 +8562,10 @@ button.quick-agent-delegation-preset.active {
   }
 
   .remote-desktop-touch-hint {
+    display: block;
+  }
+
+  .remote-desktop-touch-right-button {
     display: block;
   }
 

@@ -2987,6 +2987,14 @@
     "fullscreen": "全画面",
     "video_label": "{{machine}} のライブデスクトップ",
     "connecting": "Windows デスクトップに接続中…",
+    "connection_progress": "接続の進行状況",
+    "connection_retrying": "再接続 {{count}} 回目を待機中。ハンドシェイクをやり直します",
+    "connection_steps": {
+      "authorize": "シグナリングに接続してリモートアクセスを要求",
+      "worker": "リモートデスクトップサービスを起動",
+      "negotiate": "WebRTC ハンドシェイクと接続経路をネゴシエート",
+      "media": "メディアチャネルを開いて最初のフレームを待機"
+    },
     "failed": "リモートデスクトップが停止しました: {{reason}}",
     "retry": "再試行",
     "escape_hint": "Escape キーで表示モードに戻ります",

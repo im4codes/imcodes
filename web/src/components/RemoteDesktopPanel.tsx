@@ -124,6 +124,38 @@ const RECONNECTABLE_REMOTE_DESKTOP_FAILURES = new Set<string>([
   REMOTE_DESKTOP_TERMINAL_REASON.WORKER_FAILED,
 ]);
 
+const REMOTE_DESKTOP_CONNECTION_STEPS = [
+  'authorize',
+  'worker',
+  'negotiate',
+  'media',
+] as const;
+
+function activeRemoteDesktopConnectionStep(
+  snapshot: RemoteDesktopSnapshot,
+  mediaPresented: boolean,
+): number {
+  if (snapshot.stream && mediaPresented) return REMOTE_DESKTOP_CONNECTION_STEPS.length;
+  switch (snapshot.state) {
+    case REMOTE_DESKTOP_STATE.PREPARING:
+      return 1;
+    case REMOTE_DESKTOP_STATE.CONNECTING:
+      return 2;
+    case REMOTE_DESKTOP_STATE.DIRECT:
+    case REMOTE_DESKTOP_STATE.RELAYED:
+    case REMOTE_DESKTOP_STATE.SWITCHING_DISPLAY:
+      return 3;
+    case REMOTE_DESKTOP_STATE.RECONNECTING:
+    case REMOTE_DESKTOP_STATE.STOPPING:
+    case REMOTE_DESKTOP_STATE.STOPPED:
+    case REMOTE_DESKTOP_STATE.FAILED:
+      return -1;
+    case REMOTE_DESKTOP_STATE.AUTHORIZING:
+    default:
+      return 0;
+  }
+}
+
 export function canOpenRemoteDesktop(machine: MachineListItem): boolean {
   const role = machine.accessRole ?? 'owner';
   return machine.os === 'win'
@@ -167,6 +199,7 @@ export function RemoteDesktopPanel({ machine, ws = null, onClose }: RemoteDeskto
   const [displayModeMenu, setDisplayModeMenu] = useState<DisplayModeMenuState | null>(null);
   const [clipboardStatus, setClipboardStatus] = useState<ClipboardStatus>('idle');
   const [desktopPointerVisible, setDesktopPointerVisible] = useState(false);
+  const [mediaPresented, setMediaPresented] = useState(false);
   const clientRef = useRef<RemoteDesktopClient | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const stageRef = useRef<HTMLDivElement | null>(null);
@@ -201,6 +234,7 @@ export function RemoteDesktopPanel({ machine, ws = null, onClose }: RemoteDeskto
   const suppressDisplayTabClickRef = useRef(false);
   const suppressDisplayTabClickTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const previousInputEnabledRef = useRef(false);
+  const mediaPresentedRef = useRef(false);
   const forwardedCommandCodesRef = useRef(new Set<string>());
   const syntheticCommandControlRef = useRef(false);
   const forwardedPasteShortcutAtRef = useRef(0);
@@ -337,6 +371,8 @@ export function RemoteDesktopPanel({ machine, ws = null, onClose }: RemoteDeskto
   }, [displayModeMenu]);
 
   useEffect(() => {
+    mediaPresentedRef.current = false;
+    setMediaPresented(false);
     if (videoRef.current && videoRef.current.srcObject !== snapshot.stream) {
       videoRef.current.srcObject = snapshot.stream;
     }
@@ -350,6 +386,10 @@ export function RemoteDesktopPanel({ machine, ws = null, onClose }: RemoteDeskto
     const onPresentedFrame = () => {
       if (disposed) return;
       if (video.videoWidth > 0 && video.videoHeight > 0) {
+        if (!mediaPresentedRef.current) {
+          mediaPresentedRef.current = true;
+          setMediaPresented(true);
+        }
         clientRef.current?.acknowledgePresentedFrame(video.videoWidth, video.videoHeight);
       }
       callbackId = video.requestVideoFrameCallback(onPresentedFrame);
@@ -1174,6 +1214,10 @@ export function RemoteDesktopPanel({ machine, ws = null, onClose }: RemoteDeskto
   const connected = snapshot.state === REMOTE_DESKTOP_STATE.DIRECT
     || snapshot.state === REMOTE_DESKTOP_STATE.RELAYED;
   const selectedDisplay = snapshot.displays.find((display) => display.id === snapshot.selectedDisplayId);
+  const currentStreamPresented = Boolean(snapshot.stream
+    && mediaPresented
+    && videoRef.current?.srcObject === snapshot.stream);
+  const activeConnectionStep = activeRemoteDesktopConnectionStep(snapshot, currentStreamPresented);
 
   return (
     <FloatingPanel
@@ -1418,6 +1462,12 @@ export function RemoteDesktopPanel({ machine, ws = null, onClose }: RemoteDeskto
             playsInline
             muted
             draggable={false}
+            onLoadedData={() => {
+              if (!mediaPresentedRef.current) {
+                mediaPresentedRef.current = true;
+                setMediaPresented(true);
+              }
+            }}
             style={{
               ...(viewScale === 'actual' && selectedDisplay
                 ? { width: `${selectedDisplay.width}px`, height: `${selectedDisplay.height}px` }
@@ -1554,17 +1604,39 @@ export function RemoteDesktopPanel({ machine, ws = null, onClose }: RemoteDeskto
               onLostPointerCapture={(event) => onTouchRightButton(event, false)}
             >{t('remote_desktop.mouse_right_short')}</button>
           )}
-          {!snapshot.stream && (
+          {!currentStreamPresented && (
             <div class="remote-desktop-stage-placeholder" role="status">
-              <span>
-                {snapshot.state === REMOTE_DESKTOP_STATE.FAILED
-                  ? t('remote_desktop.failed', { reason: snapshot.error ?? snapshot.terminalReason ?? '' })
-                  : t('remote_desktop.connecting')}
-              </span>
-              {snapshot.state === REMOTE_DESKTOP_STATE.FAILED && (
-                <button type="button" onClick={retryConnection}>
-                  {t('remote_desktop.retry')}
-                </button>
+              {snapshot.state === REMOTE_DESKTOP_STATE.FAILED ? (
+                <>
+                  <span>{t('remote_desktop.failed', { reason: snapshot.error ?? snapshot.terminalReason ?? '' })}</span>
+                  <button type="button" onClick={retryConnection}>
+                    {t('remote_desktop.retry')}
+                  </button>
+                </>
+              ) : (
+                <div class="remote-desktop-connection-progress">
+                  <strong>
+                    {snapshot.state === REMOTE_DESKTOP_STATE.RECONNECTING
+                      ? t('remote_desktop.connection_retrying', { count: snapshot.reconnectCount ?? 1 })
+                      : t(`remote_desktop.state.${snapshot.state}`)}
+                  </strong>
+                  <ol aria-label={t('remote_desktop.connection_progress')}>
+                    {REMOTE_DESKTOP_CONNECTION_STEPS.map((step, index) => {
+                      const complete = index < activeConnectionStep;
+                      const current = index === activeConnectionStep;
+                      return (
+                        <li
+                          key={step}
+                          class={complete ? 'is-complete' : current ? 'is-current' : 'is-pending'}
+                          aria-current={current ? 'step' : undefined}
+                        >
+                          <span aria-hidden="true">{complete ? '✓' : index + 1}</span>
+                          <span>{t(`remote_desktop.connection_steps.${step}`)}</span>
+                        </li>
+                      );
+                    })}
+                  </ol>
+                </div>
               )}
             </div>
           )}

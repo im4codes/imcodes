@@ -336,6 +336,46 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     expect(diagnostics?.textContent).not.toContain('KeyA');
   });
 
+  it('shows each handshake and media step while the desktop connection advances', async () => {
+    const { container } = await renderPanel();
+    const snapshot = {
+      mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
+      inputEpoch: 0,
+      inputEnabled: false,
+      displays: [],
+      layoutRevision: 1,
+      stream: null,
+    };
+    const assertCurrentStep = (key: string) => {
+      const progress = container.querySelector('.remote-desktop-connection-progress');
+      expect(progress?.querySelectorAll('li')).toHaveLength(4);
+      expect(progress?.querySelector('[aria-current="step"]')?.textContent).toContain(key);
+    };
+
+    act(() => clientHooks[0]!.onSnapshot({ ...snapshot, state: REMOTE_DESKTOP_STATE.AUTHORIZING }));
+    assertCurrentStep('remote_desktop.connection_steps.authorize');
+    act(() => clientHooks[0]!.onSnapshot({ ...snapshot, state: REMOTE_DESKTOP_STATE.PREPARING }));
+    assertCurrentStep('remote_desktop.connection_steps.worker');
+    act(() => clientHooks[0]!.onSnapshot({ ...snapshot, state: REMOTE_DESKTOP_STATE.CONNECTING }));
+    assertCurrentStep('remote_desktop.connection_steps.negotiate');
+    act(() => clientHooks[0]!.onSnapshot({ ...snapshot, state: REMOTE_DESKTOP_STATE.DIRECT, route: 'direct' }));
+    assertCurrentStep('remote_desktop.connection_steps.media');
+
+    const stream = {} as MediaStream;
+    act(() => clientHooks[0]!.onSnapshot({
+      ...snapshot,
+      state: REMOTE_DESKTOP_STATE.DIRECT,
+      route: 'direct',
+      stream,
+    }));
+    assertCurrentStep('remote_desktop.connection_steps.media');
+    act(() => {
+      (container.querySelector('video') as HTMLVideoElement)
+        .dispatchEvent(new Event('loadeddata'));
+    });
+    expect(container.querySelector('.remote-desktop-connection-progress')).toBeNull();
+  });
+
   it('keeps monitor and mode controls keyboard-focusable while viewing', async () => {
     const { getByRole } = await renderPanel();
     act(() => clientHooks[0]!.onSnapshot({

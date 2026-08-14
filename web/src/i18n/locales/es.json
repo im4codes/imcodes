@@ -2988,6 +2988,14 @@
     "fullscreen": "Pantalla completa",
     "video_label": "Escritorio en vivo de {{machine}}",
     "connecting": "Conectando al escritorio de Windows…",
+    "connection_progress": "Progreso de la conexión",
+    "connection_retrying": "Reintento {{count}} en cola; preparando una nueva negociación",
+    "connection_steps": {
+      "authorize": "Conectar a señalización y solicitar acceso remoto",
+      "worker": "Iniciar el servicio de escritorio remoto",
+      "negotiate": "Negociar WebRTC y la ruta de conexión",
+      "media": "Abrir los canales multimedia y esperar el primer fotograma"
+    },
     "failed": "Escritorio remoto detenido: {{reason}}",
     "retry": "Reintentar",
     "escape_hint": "Pulsa Escape para volver al modo Ver",

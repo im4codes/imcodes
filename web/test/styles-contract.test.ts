@@ -174,6 +174,18 @@ describe('styles.css regression contracts', () => {
     expect(relayProgressRule?.[0]).toMatch(/#fbbf24/);
   });
 
+  it('keeps the remote-desktop right-click helper touch-only', () => {
+    const desktopRule = css.match(/\.remote-desktop-touch-right-button\s*\{[^}]*\}/)?.[0];
+    expect(desktopRule).toBeTruthy();
+    expect(desktopRule).toMatch(/display:\s*none/);
+
+    const coarsePointerRule = css.match(
+      /@media\s*\(pointer:\s*coarse\)\s*\{[\s\S]*?\.remote-desktop-touch-right-button\s*\{[^}]*\}/,
+    )?.[0];
+    expect(coarsePointerRule).toBeTruthy();
+    expect(coarsePointerRule).toMatch(/display:\s*block/);
+  });
+
   it('fits portrait videos by available preview height without stretching them to full width', () => {
     const videoContainerRule = css.match(/\.fb-preview-video\s*\{[^}]*\}/);
     expect(videoContainerRule).not.toBeNull();

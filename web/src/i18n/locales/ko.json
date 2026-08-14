@@ -2987,6 +2987,14 @@
     "fullscreen": "전체 화면",
     "video_label": "{{machine}}의 실시간 데스크톱",
     "connecting": "Windows 데스크톱에 연결 중…",
+    "connection_progress": "연결 진행 상황",
+    "connection_retrying": "{{count}}번째 재연결 대기 중 · 핸드셰이크를 다시 시작합니다",
+    "connection_steps": {
+      "authorize": "시그널링에 연결하고 원격 접근 권한 요청",
+      "worker": "원격 데스크톱 서비스 시작",
+      "negotiate": "WebRTC 핸드셰이크 및 연결 경로 협상",
+      "media": "미디어 채널을 열고 첫 데스크톱 프레임 대기"
+    },
     "failed": "원격 데스크톱이 중지됨: {{reason}}",
     "retry": "다시 시도",
     "escape_hint": "Escape 키를 눌러 보기 모드로 전환",

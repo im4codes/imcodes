@@ -2988,6 +2988,14 @@
     "fullscreen": "Fullscreen",
     "video_label": "Live desktop of {{machine}}",
     "connecting": "Connecting to the Windows desktop…",
+    "connection_progress": "Connection progress",
+    "connection_retrying": "Reconnect {{count}} is queued; preparing a new handshake",
+    "connection_steps": {
+      "authorize": "Connect to signaling and request access",
+      "worker": "Authorize and start the remote desktop service",
+      "negotiate": "Negotiate the WebRTC handshake and connection route",
+      "media": "Open media channels and wait for the first desktop frame"
+    },
     "failed": "Remote desktop stopped: {{reason}}",
     "retry": "Retry",
     "escape_hint": "Press Escape to return to View mode",
