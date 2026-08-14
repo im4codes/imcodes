@@ -486,6 +486,85 @@ describe('remote desktop worker artifact and IPC host', () => {
     expect((host as unknown as { socket: net.Socket }).socket).not.toBe(poisonedSocket);
   });
 
+  it('transparently replaces a stale idle worker pipe before admitting the next session', async () => {
+    const temp = await mkdtemp(join(tmpdir(), 'imcodes-rd-host-idle-write-failure-'));
+    cleanup.push(() => rm(temp, { recursive: true, force: true }));
+    const pipePath = join(temp, 'worker.sock');
+    const helpers: net.Socket[] = [];
+    const helperBuffers: string[] = [];
+    const launch = vi.fn((_executable: string, argsLine: string) => {
+      const args = quotedArgs(argsLine);
+      const index = helpers.length;
+      helperBuffers.push('');
+      const helper = net.createConnection(pipePath, () => {
+        helper.write(`${JSON.stringify({
+          type: REMOTE_DESKTOP_WORKER_HELLO_TYPE,
+          ipcVersion: REMOTE_DESKTOP_WORKER_IPC_VERSION,
+          nonce: args[3],
+          pid: 90 + index,
+        })}\n`);
+      });
+      helper.setEncoding('utf8');
+      helper.on('data', (chunk) => { helperBuffers[index] += String(chunk); });
+      helpers.push(helper);
+    });
+    const received: RemoteDesktopDaemonMessage[] = [];
+    const host = new RemoteDesktopWorkerHost((message) => received.push(message), {
+      ...trustedHostOptions,
+      platform: 'win32',
+      artifact,
+      pipePath,
+      allowPipeClients: () => {},
+      launch,
+    });
+    cleanup.push(() => {
+      host.close();
+      for (const helper of helpers) helper.destroy();
+    });
+    const first = {
+      type: REMOTE_DESKTOP_MSG.PREPARE,
+      requestId,
+      sessionId,
+      capability,
+      expiresAt: Date.now() + 60_000,
+      leaseExpiresAt: Date.now() + 15_000,
+      daemonGeneration: 7,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
+      inputEpoch: 1,
+      iceServers: ['stun:stun.example.test:3478'],
+    } as const;
+    await expect(host.handle(first)).resolves.toBe(true);
+    await expect(host.handle({
+      type: REMOTE_DESKTOP_MSG.STOP,
+      requestId,
+      sessionId,
+      capability,
+    })).resolves.toBe(true);
+
+    const staleSocket = (host as unknown as { socket: net.Socket }).socket;
+    vi.spyOn(staleSocket, 'write').mockImplementation(((_chunk: unknown, callback: unknown) => {
+      if (typeof callback === 'function') callback(new Error('simulated stale idle pipe'));
+      return false;
+    }) as never);
+    const recovered = {
+      ...first,
+      requestId: 'request_idle_recovered',
+      sessionId: 'session_idle_recovered',
+      capability: 'd'.repeat(43),
+    } as const;
+    await expect(host.handle(recovered)).resolves.toBe(true);
+
+    expect(staleSocket.destroyed).toBe(true);
+    expect(launch).toHaveBeenCalledTimes(2);
+    expect(received).not.toContainEqual(expect.objectContaining({
+      type: REMOTE_DESKTOP_MSG.TERMINAL,
+      sessionId: recovered.sessionId,
+    }));
+    await vi.waitFor(() => expect(helperBuffers[1]).toContain(recovered.sessionId));
+    expect(JSON.parse(helperBuffers[1]!.trim())).toEqual(recovered);
+    expect((host as unknown as { socket: net.Socket }).socket).not.toBe(staleSocket);
+  });
+
   it('recycles an idle warm worker before a bounded browser reconnect', async () => {
     const temp = await mkdtemp(join(tmpdir(), 'imcodes-rd-host-reconnect-'));
     cleanup.push(() => rm(temp, { recursive: true, force: true }));

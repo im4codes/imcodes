@@ -225,6 +225,7 @@ export class RemoteDesktopWorkerHost {
   private readonly nonce = randomBytes(32).toString('base64url');
   private readonly pipePath: string;
   private readonly tracked = new Map<string, TrackedAuthority>();
+  private readonly recoverableSocketLosses = new WeakMap<net.Socket, Set<string>>();
   private server: net.Server | null = null;
   private socket: net.Socket | null = null;
   private startPromise: Promise<void> | null = null;
@@ -279,7 +280,9 @@ export class RemoteDesktopWorkerHost {
   async handle(message: unknown): Promise<boolean> {
     const parsed = validateRemoteDesktopDaemonCommand(message);
     if (!parsed.ok || !this.available()) return false;
+    let recoverIdlePrepare = false;
     if (parsed.value.type === REMOTE_DESKTOP_MSG.PREPARE) {
+      recoverIdlePrepare = this.tracked.size === 0;
       if ((parsed.value.reconnectAttempt ?? 0) > 0 && this.tracked.size === 0) {
         await this.recycleIdleWorkerForReconnect();
       }
@@ -290,7 +293,29 @@ export class RemoteDesktopWorkerHost {
     }
     const socket = this.socket;
     if (!socket || socket.destroyed) return false;
-    const sent = await this.writeToWorker(socket, parsed.value);
+    let sent = await this.writeToWorker(
+      socket,
+      parsed.value,
+      recoverIdlePrepare && parsed.value.type === REMOTE_DESKTOP_MSG.PREPARE
+        ? parsed.value.sessionId
+        : undefined,
+    );
+    if (!sent && recoverIdlePrepare && parsed.value.type === REMOTE_DESKTOP_MSG.PREPARE
+      && this.tracked.has(parsed.value.sessionId)) {
+      // A warm idle worker can exit between sessions while the service-side
+      // pipe has not observed the close yet. Do not surface that stale-pipe
+      // race as worker_failed: no other authority is alive, so cold-start one
+      // verified replacement and retry this PREPARE exactly once.
+      this.untrack(parsed.value.sessionId);
+      await this.ensureStarted();
+      this.track(parsed.value);
+      const replacement = this.socket;
+      if (!replacement || replacement.destroyed) {
+        this.untrack(parsed.value.sessionId);
+        throw new Error('remote_desktop_worker_recovery_failed');
+      }
+      sent = await this.writeToWorker(replacement, parsed.value);
+    }
     if (!sent) {
       return true;
     }
@@ -301,7 +326,16 @@ export class RemoteDesktopWorkerHost {
     return sent;
   }
 
-  private async writeToWorker(socket: net.Socket, message: unknown): Promise<boolean> {
+  private async writeToWorker(
+    socket: net.Socket,
+    message: unknown,
+    recoverIdleSessionId?: string,
+  ): Promise<boolean> {
+    if (recoverIdleSessionId) {
+      const sessions = this.recoverableSocketLosses.get(socket) ?? new Set<string>();
+      sessions.add(recoverIdleSessionId);
+      this.recoverableSocketLosses.set(socket, sessions);
+    }
     const sent = await new Promise<boolean>((resolveSent) => {
       let settled = false;
       const finish = (success: boolean) => {
@@ -320,13 +354,19 @@ export class RemoteDesktopWorkerHost {
         finish(false);
       }
     });
-    if (sent) return true;
+    if (sent) {
+      const sessions = this.recoverableSocketLosses.get(socket);
+      sessions?.delete(recoverIdleSessionId ?? '');
+      if (sessions?.size === 0) this.recoverableSocketLosses.delete(socket);
+      return true;
+    }
     // A failed named-pipe write is terminal for this worker connection. Do
     // not leave the resolved start promise and a poisoned socket in place:
     // every later session would otherwise reuse it and immediately return
     // worker_failed until the whole node process was restarted.
     this.onSocketLost(socket);
     socket.destroy();
+    this.recoverableSocketLosses.delete(socket);
     return false;
   }
 
@@ -488,13 +528,18 @@ export class RemoteDesktopWorkerHost {
   }
 
   private onSocketLost(socket: net.Socket): void {
+    const recoverableSessions = this.recoverableSocketLosses.get(socket);
+    const recoverable = recoverableSessions?.size === 1
+      && this.tracked.size === 1
+      && this.tracked.has([...recoverableSessions][0]!);
+    this.recoverableSocketLosses.delete(socket);
     if (this.socket !== socket) return;
     this.socket = null;
     this.buffer = '';
     this.server?.close();
     this.server = null;
     this.startPromise = null;
-    if (!this.closing) {
+    if (!this.closing && !recoverable) {
       // If the worker crashed before its normal release-all path, launch the
       // immutable verified binary once in release-only mode on the same active
       // desktop. This command carries no credential, authority, or key history.
