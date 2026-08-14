@@ -549,13 +549,20 @@ jobs:
         run: ./scripts/ci-npm-ci.sh web
       - name: Install server deps
         run: ./scripts/ci-npm-ci.sh server
-      - run: npm run build
       - name: Set version
         run: npm version ${{ needs.docker.outputs.npm_version }} --no-git-tag-version
+      - run: npm run build
+      - name: Pack the already-tested release
+        run: |
+          set -euo pipefail
+          VERSION=${{ needs.docker.outputs.npm_version }}
+          npm pack --pack-destination "$RUNNER_TEMP"
+          test -f "$RUNNER_TEMP/imcodes-${VERSION}.tgz"
       - name: Publish (skip if version already on npm)
         run: |
           set -euo pipefail
           VERSION=${{ needs.docker.outputs.npm_version }}
+          PACKAGE_TARBALL="$RUNNER_TEMP/imcodes-${VERSION}.tgz"
           PUBLISH_ARGS=(--access public)
           if [ "${{ github.ref }}" = "refs/heads/dev" ]; then
             PUBLISH_ARGS=(--tag dev "${PUBLISH_ARGS[@]}")
@@ -567,7 +574,11 @@ jobs:
           fi
 
           set +e
-          npm publish "${PUBLISH_ARGS[@]}" --provenance 2>&1 | tee npm-publish.log
+          # Docker already depends on daemon/server/web/E2E green jobs. Publish
+          # the tarball produced above so npm does not rerun prepublishOnly's
+          # entire test matrix on one contended worker. npm pack still ran the
+          # load-bearing prepack/postpack artifact transformation.
+          npm publish "$PACKAGE_TARBALL" "${PUBLISH_ARGS[@]}" --provenance --ignore-scripts 2>&1 | tee npm-publish.log
           publish_status=${PIPESTATUS[0]}
           set -e
 
@@ -582,7 +593,7 @@ jobs:
 
           if grep -q 'TLOG_CREATE_ENTRY_ERROR' npm-publish.log; then
             echo "::warning::npm provenance transparency-log entry already exists, but ${VERSION} is not published; retrying once without --provenance"
-            npm publish "${PUBLISH_ARGS[@]}"
+            npm publish "$PACKAGE_TARBALL" "${PUBLISH_ARGS[@]}" --ignore-scripts
             exit 0
           fi
 

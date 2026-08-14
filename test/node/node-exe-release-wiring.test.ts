@@ -2,6 +2,18 @@ import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 
 describe('controlled-node executable release wiring', () => {
+  it('packs the versioned, already-tested npm release before publishing without duplicate lifecycle tests', () => {
+    const workflow = readFileSync('.github/workflows/ci.yml', 'utf8');
+    const setVersion = workflow.indexOf('npm version ${{ needs.docker.outputs.npm_version }} --no-git-tag-version');
+    const build = workflow.indexOf('- run: npm run build', setVersion);
+    const pack = workflow.indexOf('npm pack --pack-destination "$RUNNER_TEMP"');
+    const publish = workflow.indexOf('npm publish "$PACKAGE_TARBALL" "${PUBLISH_ARGS[@]}" --provenance --ignore-scripts');
+    expect([setVersion, build, pack, publish].every((position) => position >= 0)).toBe(true);
+    expect(setVersion).toBeLessThan(build);
+    expect(build).toBeLessThan(pack);
+    expect(pack).toBeLessThan(publish);
+  });
+
   it('gates the production image on all three native artifacts including macOS Universal 2', () => {
     const workflow = readFileSync('.github/workflows/ci.yml', 'utf8');
 
