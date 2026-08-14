@@ -29,7 +29,10 @@ import {
   verifyWindowsAuthenticodeSigners,
   type VerifiedRemoteDesktopWorkerArtifact,
 } from '../../src/node/remote-desktop-worker-host.js';
-import { launchWindowsActiveUserCommand } from '../../src/node/windows-user-session.js';
+import {
+  launchWindowsActiveUserCommand,
+  launchWindowsActiveUserElevatedCommand,
+} from '../../src/node/windows-user-session.js';
 
 const requestId = 'request_12345678';
 const sessionId = 'session_12345678';
@@ -220,6 +223,28 @@ describe('remote desktop worker artifact and IPC host', () => {
       .toBeLessThan(script.indexOf('if (s.State == WTSActive)'));
     expect(script).not.toContain('must-not-be-inherited-by-worker');
     expect(script).not.toContain('IMCODES_NODE_TOKEN');
+    expect(script).toContain('[ImcodesUserProc]::Start($exe, $argsLine, $false)');
+  });
+
+  it('uses only the active administrator linked token for the verified desktop worker', () => {
+    let launchArgs: readonly string[] = [];
+    const child = new EventEmitter() as EventEmitter & { unref(): void };
+    child.unref = () => {};
+    launchWindowsActiveUserElevatedCommand(
+      artifact.executablePath,
+      '--pipe "safe" --nonce "ephemeral"',
+      ((_command: string, args: readonly string[]) => {
+        launchArgs = args;
+        return child;
+      }) as never,
+    );
+    const encodedIndex = launchArgs.indexOf('-EncodedCommand') + 1;
+    const script = Buffer.from(launchArgs[encodedIndex]!, 'base64').toString('utf16le');
+    expect(script).toContain('const int TokenLinkedToken = 19;');
+    expect(script).toContain('elevationType == TokenElevationTypeLimited');
+    expect(script).toContain('launchToken = linkedToken;');
+    expect(script).toContain('[ImcodesUserProc]::Start($exe, $argsLine, $true)');
+    expect(script).toContain('if (linkedToken != IntPtr.Zero) CloseHandle(linkedToken);');
   });
 
   it('authenticates one active-user worker and forwards only strict bounded envelopes', async () => {
@@ -376,6 +401,71 @@ describe('remote desktop worker artifact and IPC host', () => {
       type: REMOTE_DESKTOP_MSG.TERMINAL,
       reason: 'worker_failed',
     }));
+  });
+
+  it('recycles an idle warm worker before a bounded browser reconnect', async () => {
+    const temp = await mkdtemp(join(tmpdir(), 'imcodes-rd-host-reconnect-'));
+    cleanup.push(() => rm(temp, { recursive: true, force: true }));
+    const pipePath = join(temp, 'worker.sock');
+    const helpers: net.Socket[] = [];
+    const launch = vi.fn((_executable: string, argsLine: string) => {
+      const args = quotedArgs(argsLine);
+      const helper = net.createConnection(pipePath, () => {
+        helper.write(`${JSON.stringify({
+          type: REMOTE_DESKTOP_WORKER_HELLO_TYPE,
+          ipcVersion: REMOTE_DESKTOP_WORKER_IPC_VERSION,
+          nonce: args[3],
+          pid: 80 + helpers.length,
+        })}\n`);
+      });
+      helpers.push(helper);
+    });
+    const verifyArtifactForLaunch = vi.fn(async () => artifact);
+    const host = new RemoteDesktopWorkerHost(() => {}, {
+      ...trustedHostOptions,
+      verifyArtifactForLaunch,
+      platform: 'win32',
+      artifact,
+      pipePath,
+      allowPipeClients: () => {},
+      launch,
+    });
+    cleanup.push(() => {
+      host.close();
+      for (const helper of helpers) helper.destroy();
+    });
+    const first = {
+      type: REMOTE_DESKTOP_MSG.PREPARE,
+      requestId,
+      sessionId,
+      capability,
+      expiresAt: Date.now() + 60_000,
+      leaseExpiresAt: Date.now() + 15_000,
+      daemonGeneration: 7,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
+      inputEpoch: 1,
+      reconnectAttempt: 0,
+      iceServers: ['stun:stun.example.test:3478'],
+    } as const;
+    await expect(host.handle(first)).resolves.toBe(true);
+    const firstHostSocket = (host as unknown as { socket: net.Socket }).socket;
+    await expect(host.handle({
+      type: REMOTE_DESKTOP_MSG.STOP,
+      requestId,
+      sessionId,
+      capability,
+    })).resolves.toBe(true);
+    await expect(host.handle({
+      ...first,
+      requestId: 'request_reconnect',
+      sessionId: 'session_reconnect',
+      capability: 'b'.repeat(43),
+      reconnectAttempt: 1,
+    })).resolves.toBe(true);
+
+    expect(launch).toHaveBeenCalledTimes(2);
+    expect(verifyArtifactForLaunch).toHaveBeenCalledTimes(2);
+    expect(firstHostSocket.destroyed).toBe(true);
   });
 
   it('retries an enumerated-but-non-presenting desktop once through the shared virtual display', async () => {

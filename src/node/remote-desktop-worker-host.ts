@@ -27,6 +27,7 @@ import { DAEMON_VERSION } from '../util/version.js';
 import {
   allowWindowsNamedPipeClients,
   launchWindowsActiveUserCommand,
+  launchWindowsActiveUserElevatedCommand,
   quoteWindowsArgument,
 } from './windows-user-session.js';
 import {
@@ -35,7 +36,10 @@ import {
 } from './windows-artifact-trust.js';
 export { verifyWindowsAuthenticodeSigners } from './windows-artifact-trust.js';
 
-const CONNECT_TIMEOUT_MS = 15_000;
+// Cold launch performs a fail-closed Authenticode check before CreateProcess.
+// Keep this below the end-to-end negotiation deadline while allowing slow
+// revocation/provider checks on older Windows hosts to finish.
+const CONNECT_TIMEOUT_MS = 30_000;
 const HELLO_TIMEOUT_MS = 2_000;
 const MAX_LINE_BYTES = 512 * 1024;
 const SHA256_RE = /^[a-f0-9]{64}$/;
@@ -266,13 +270,19 @@ export class RemoteDesktopWorkerHost {
 
   private async launchVerified(argsLine: string): Promise<void> {
     const artifact = await this.verifiedArtifactForLaunch();
-    (this.options.launch ?? launchWindowsActiveUserCommand)(artifact.executablePath, argsLine);
+    (this.options.launch ?? launchWindowsActiveUserElevatedCommand)(
+      artifact.executablePath,
+      argsLine,
+    );
   }
 
   async handle(message: unknown): Promise<boolean> {
     const parsed = validateRemoteDesktopDaemonCommand(message);
     if (!parsed.ok || !this.available()) return false;
     if (parsed.value.type === REMOTE_DESKTOP_MSG.PREPARE) {
+      if ((parsed.value.reconnectAttempt ?? 0) > 0 && this.tracked.size === 0) {
+        await this.recycleIdleWorkerForReconnect();
+      }
       await this.ensureStarted();
       this.track(parsed.value);
     } else if (!this.socket || this.socket.destroyed) {
@@ -291,6 +301,19 @@ export class RemoteDesktopWorkerHost {
       this.untrack(parsed.value.sessionId);
     }
     return sent;
+  }
+
+  private async recycleIdleWorkerForReconnect(): Promise<void> {
+    const socket = this.socket;
+    if (!socket || socket.destroyed || this.tracked.size > 0) return;
+    // A browser reconnect follows a failed negotiation or receive-progress
+    // path. With no other authority alive, recycle the process-local WebRTC /
+    // DXGI state instead of repeatedly retrying a poisoned warm worker. Pipe
+    // closure makes the immutable worker perform its normal release/cleanup.
+    await new Promise<void>((resolveClosed) => {
+      socket.once('close', resolveClosed);
+      socket.destroy();
+    });
   }
 
   close(): void {

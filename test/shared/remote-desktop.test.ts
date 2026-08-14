@@ -64,6 +64,10 @@ const inputBase = {
 };
 
 describe('remote desktop production contract', () => {
+  it('keeps the cold Windows negotiation bound above observed startup latency', () => {
+    expect(REMOTE_DESKTOP_LIMITS.NEGOTIATION_TIMEOUT_MS).toBe(45_000);
+  });
+
   it('enables production by default and preserves an explicit kill switch', () => {
     expect(isRemoteDesktopFeatureEnabled(undefined, 'production')).toBe(true);
     expect(isRemoteDesktopFeatureEnabled('1', 'production')).toBe(true);

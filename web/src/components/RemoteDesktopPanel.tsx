@@ -20,6 +20,7 @@ import {
 } from '../direct-file-transfer.js';
 import { RemoteDesktopClient, type RemoteDesktopSnapshot } from '../remote-desktop-client.js';
 import type { WsClient } from '../ws-client.js';
+import { FloatingPanel } from './FloatingPanel.js';
 import {
   INITIAL_REMOTE_DESKTOP_VIEWPORT,
   clampRemoteDesktopViewport,
@@ -901,14 +902,25 @@ export function RemoteDesktopPanel({ machine, ws = null, onClose }: RemoteDeskto
   const selectedDisplay = snapshot.displays.find((display) => display.id === snapshot.selectedDisplayId);
 
   return (
-    <div class="remote-desktop-backdrop" role="presentation" onClick={stopAndClose}>
+    <FloatingPanel
+      id={`remote-desktop-${machine.serverId}`}
+      title={t('remote_desktop.title', { machine: machine.displayName })}
+      onClose={stopAndClose}
+      zIndex={10020}
+      defaultW={1200}
+      defaultH={760}
+      minW={640}
+      minH={420}
+      className="remote-desktop-floating-shell"
+      hideTitleBar
+      dragHandleSelector=".remote-desktop-header"
+    >
       <div
         ref={panelRef}
         class="remote-desktop-panel"
         role="dialog"
-        aria-modal="true"
+        aria-modal="false"
         aria-label={t('remote_desktop.title', { machine: machine.displayName })}
-        onClick={(event) => event.stopPropagation()}
       >
         <header class="remote-desktop-header">
           <div>
@@ -1201,6 +1213,6 @@ export function RemoteDesktopPanel({ machine, ws = null, onClose }: RemoteDeskto
           </div>
         </footer>
       </div>
-    </div>
+    </FloatingPanel>
   );
 }

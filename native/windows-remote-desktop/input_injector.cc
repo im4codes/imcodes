@@ -91,12 +91,17 @@ std::optional<KeyMapping> MapCode(const std::string& code) {
 
 }  // namespace
 
-InputArbiter::InputArbiter(SendInputFn send_input)
+InputArbiter::InputArbiter(SendInputFn send_input,
+                           InputAvailableFn input_available)
     : send_input_(send_input ? std::move(send_input)
                              : SendInputFn([](UINT count, LPINPUT inputs,
                                               int size) {
                                  return ::SendInput(count, inputs, size);
-                               })) {}
+                               })),
+      input_available_(input_available ? std::move(input_available)
+                                       : InputAvailableFn([] { return true; })) {}
+
+bool InputArbiter::Available() const { return input_available_(); }
 
 bool InputArbiter::KeyDown(const std::string& owner,
                            const std::string& code,
@@ -235,7 +240,7 @@ bool InputArbiter::Text(const std::u16string& value) {
   return Dispatch(inputs.data(), static_cast<UINT>(inputs.size()));
 }
 
-void InputArbiter::ReleaseOwner(const std::string& owner) {
+bool InputArbiter::ReleaseOwner(const std::string& owner) {
   std::lock_guard<std::mutex> lock(mutex_);
   for (auto iterator = key_owners_.begin(); iterator != key_owners_.end();) {
     iterator->second.erase(owner);
@@ -260,6 +265,10 @@ void InputArbiter::ReleaseOwner(const std::string& owner) {
       ++iterator;
     }
   }
+  return std::none_of(key_owners_.begin(), key_owners_.end(),
+                      [](const auto& item) { return item.second.empty(); }) &&
+         std::none_of(button_owners_.begin(), button_owners_.end(),
+                      [](const auto& item) { return item.second.empty(); });
 }
 
 bool InputArbiter::RetryPendingReleases() {

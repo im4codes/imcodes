@@ -127,7 +127,7 @@ class PeerSession final : public webrtc::PeerConnectionObserver,
   bool SendControl(const Json::Value& value);
   bool ChannelsReady() const;
   bool InputReady() const;
-  void ReleaseInput();
+  bool ReleaseInput();
   void TouchActivity();
   void ResetMediaProgressWatchdog();
 

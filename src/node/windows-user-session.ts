@@ -58,6 +58,7 @@ export function launchWindowsActiveUserCommand(
   executable: string,
   argsLine: string,
   spawnImpl: typeof spawn = spawn,
+  preferLinkedElevatedToken = false,
 ): void {
   const exe64 = Buffer.from(executable, 'utf8').toString('base64');
   const args64 = Buffer.from(argsLine, 'utf8').toString('base64');
@@ -72,11 +73,14 @@ public static class ImcodesUserProc {
   [StructLayout(LayoutKind.Sequential)] public struct WTS_SESSION_INFO { public int SessionID; public IntPtr pWinStationName; public int State; }
   [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)] public struct STARTUPINFO { public int cb; public string lpReserved; public string lpDesktop; public string lpTitle; public int dwX; public int dwY; public int dwXSize; public int dwYSize; public int dwXCountChars; public int dwYCountChars; public int dwFillAttribute; public int dwFlags; public short wShowWindow; public short cbReserved2; public IntPtr lpReserved2; public IntPtr hStdInput; public IntPtr hStdOutput; public IntPtr hStdError; }
   [StructLayout(LayoutKind.Sequential)] public struct PROCESS_INFORMATION { public IntPtr hProcess; public IntPtr hThread; public int dwProcessId; public int dwThreadId; }
+  [StructLayout(LayoutKind.Sequential)] public struct TOKEN_LINKED_TOKEN { public IntPtr LinkedToken; }
   [DllImport("wtsapi32.dll", SetLastError=true)] static extern bool WTSEnumerateSessions(IntPtr hServer, int reserved, int version, out IntPtr ppSessionInfo, out int count);
   [DllImport("wtsapi32.dll")] static extern void WTSFreeMemory(IntPtr memory);
   [DllImport("wtsapi32.dll", SetLastError=true)] static extern bool WTSQueryUserToken(int sessionId, out IntPtr token);
   [DllImport("kernel32.dll")] static extern uint WTSGetActiveConsoleSessionId();
   [DllImport("advapi32.dll", SetLastError=true)] static extern bool DuplicateTokenEx(IntPtr existing, uint desiredAccess, IntPtr attrs, int impersonationLevel, int tokenType, out IntPtr newToken);
+  [DllImport("advapi32.dll", SetLastError=true)] static extern bool GetTokenInformation(IntPtr token, int tokenInformationClass, out TOKEN_LINKED_TOKEN tokenInformation, int tokenInformationLength, out int returnLength);
+  [DllImport("advapi32.dll", SetLastError=true, EntryPoint="GetTokenInformation")] static extern bool GetTokenInformationInt(IntPtr token, int tokenInformationClass, out int tokenInformation, int tokenInformationLength, out int returnLength);
   [DllImport("userenv.dll", SetLastError=true)] static extern bool CreateEnvironmentBlock(out IntPtr env, IntPtr token, bool inherit);
   [DllImport("userenv.dll", SetLastError=true)] static extern bool DestroyEnvironmentBlock(IntPtr env);
   [DllImport("advapi32.dll", SetLastError=true, CharSet=CharSet.Unicode)] static extern bool CreateProcessAsUser(IntPtr token, string app, string cmd, IntPtr procAttrs, IntPtr threadAttrs, bool inheritHandles, uint flags, IntPtr env, string cwd, ref STARTUPINFO si, out PROCESS_INFORMATION pi);
@@ -88,6 +92,9 @@ public static class ImcodesUserProc {
   const uint TOKEN_ALL_ACCESS = 0xF01FF;
   const int SecurityImpersonation = 2;
   const int TokenPrimary = 1;
+  const int TokenElevationType = 18;
+  const int TokenLinkedToken = 19;
+  const int TokenElevationTypeLimited = 3;
   const uint CREATE_UNICODE_ENVIRONMENT = 0x00000400;
   const uint LOGON_WITH_PROFILE = 0x00000001;
   const int ERROR_PRIVILEGE_NOT_HELD = 1314;
@@ -129,12 +136,26 @@ public static class ImcodesUserProc {
     } finally { WTSFreeMemory(p); }
     throw new Exception("no interactive user session");
   }
-  public static void Start(string exe, string argsLine) {
+  public static void Start(string exe, string argsLine, bool preferLinkedElevatedToken) {
     IntPtr token, primary, env;
+    IntPtr linkedToken = IntPtr.Zero;
     int sid = InteractiveSessionId();
     if (!WTSQueryUserToken(sid, out token)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
     try {
-      if (!DuplicateTokenEx(token, TOKEN_ALL_ACCESS, IntPtr.Zero, SecurityImpersonation, TokenPrimary, out primary)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+      IntPtr launchToken = token;
+      if (preferLinkedElevatedToken) {
+        int elevationType;
+        int returnLength;
+        if (GetTokenInformationInt(token, TokenElevationType, out elevationType, sizeof(int), out returnLength) &&
+            elevationType == TokenElevationTypeLimited) {
+          TOKEN_LINKED_TOKEN linked;
+          if (GetTokenInformation(token, TokenLinkedToken, out linked, Marshal.SizeOf(typeof(TOKEN_LINKED_TOKEN)), out returnLength)) {
+            linkedToken = linked.LinkedToken;
+            launchToken = linkedToken;
+          }
+        }
+      }
+      if (!DuplicateTokenEx(launchToken, TOKEN_ALL_ACCESS, IntPtr.Zero, SecurityImpersonation, TokenPrimary, out primary)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
       try {
         if (!CreateEnvironmentBlock(out env, primary, false)) env = IntPtr.Zero;
         try {
@@ -151,22 +172,43 @@ public static class ImcodesUserProc {
           CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
         } finally { if (env != IntPtr.Zero) DestroyEnvironmentBlock(env); }
       } finally { CloseHandle(primary); }
-    } finally { CloseHandle(token); }
+    } finally {
+      if (linkedToken != IntPtr.Zero) CloseHandle(linkedToken);
+      CloseHandle(token);
+    }
   }
 }
 '@
 Add-Type -TypeDefinition $src
-[ImcodesUserProc]::Start($exe, $argsLine)
+[ImcodesUserProc]::Start($exe, $argsLine, __PREFER_LINKED_TOKEN__)
 `.replace('__EXE64__', exe64).replace('__ARGS64__', args64);
+  const linkedTokenScript = script.replace(
+    '__PREFER_LINKED_TOKEN__',
+    preferLinkedElevatedToken ? '$true' : '$false',
+  );
   const options: SpawnOptions = {
     stdio: 'ignore',
     windowsHide: true,
   };
   const child = spawnImpl(
     'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe',
-    ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', powershellBase64(script)],
+    ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', powershellBase64(linkedTokenScript)],
     options,
   );
   child.on('error', () => {});
   child.unref();
+}
+
+/**
+ * Launch the already-verified immutable remote-desktop worker with the active
+ * administrator's linked token when one exists. This keeps the same user and
+ * profile while allowing SendInput to cross an elevated foreground window;
+ * standard users and non-UAC accounts retain the normal WTS token.
+ */
+export function launchWindowsActiveUserElevatedCommand(
+  executable: string,
+  argsLine: string,
+  spawnImpl: typeof spawn = spawn,
+): void {
+  launchWindowsActiveUserCommand(executable, argsLine, spawnImpl, true);
 }

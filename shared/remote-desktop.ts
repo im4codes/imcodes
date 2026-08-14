@@ -202,7 +202,11 @@ export const REMOTE_DESKTOP_LIMITS = {
   KEY_VALUE_BYTES: 64,
   TEXT_BYTES: 4 * 1024,
   ERROR_DETAIL_BYTES: 512,
-  NEGOTIATION_TIMEOUT_MS: 15_000,
+  // A cold Windows path includes Authenticode re-verification, active-user
+  // worker launch, DXGI's first presentable frame, and ICE.  Production data
+  // showed healthy direct sessions taking about 10s, so the former 15s bound
+  // cut off normal cold starts with almost no scheduling/network headroom.
+  NEGOTIATION_TIMEOUT_MS: 45_000,
   LEASE_DURATION_MS: 15_000,
   LEASE_RENEW_INTERVAL_MS: 5_000,
   KEEPALIVE_TIMEOUT_MS: 15_000,

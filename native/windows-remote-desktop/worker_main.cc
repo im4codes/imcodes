@@ -155,7 +155,15 @@ class WorkerRuntime {
       : signaling_thread_(signaling_thread),
         factory_(std::move(factory)),
         writer_(writer),
-        indicator_(indicator) {}
+        indicator_(indicator),
+        input_(
+            [indicator](UINT count, LPINPUT inputs, int size) {
+              return indicator ? indicator->DispatchInput(count, inputs, size)
+                               : 0;
+            },
+            [indicator] {
+              return indicator && indicator->InputAvailable();
+            }) {}
 
   bool Handle(const Json::Value& root) {
     const int64_t now_ms = NowMs();

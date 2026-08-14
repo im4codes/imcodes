@@ -41,6 +41,20 @@ TEST(InputArbiterTest, KeepsConcurrentControllerKeyOwnershipIndependent) {
   EXPECT_NE(recording.events[1].ki.dwFlags & KEYEVENTF_KEYUP, 0u);
 }
 
+TEST(InputArbiterTest, ReportsInteractiveDesktopAvailability) {
+  RecordingInput recording;
+  bool available = false;
+  InputArbiter input(
+      [&](UINT count, LPINPUT values, int size) {
+        return recording.Send(count, values, size);
+      },
+      [&] { return available; });
+
+  EXPECT_FALSE(input.Available());
+  available = true;
+  EXPECT_TRUE(input.Available());
+}
+
 TEST(InputArbiterTest, RetriesFailedFinalKeyReleaseDuringTeardown) {
   RecordingInput recording;
   InputArbiter input([&](UINT count, LPINPUT values, int size) {
@@ -51,7 +65,7 @@ TEST(InputArbiterTest, RetriesFailedFinalKeyReleaseDuringTeardown) {
   recording.fail_next_ = true;
   EXPECT_FALSE(input.KeyUp("peer-a", "KeyA"));
   EXPECT_EQ(recording.events.size(), 1u);
-  input.ReleaseOwner("peer-a");
+  EXPECT_TRUE(input.ReleaseOwner("peer-a"));
   ASSERT_EQ(recording.events.size(), 2u);
   EXPECT_NE(recording.events[1].ki.dwFlags & KEYEVENTF_KEYUP, 0u);
 }
@@ -81,7 +95,7 @@ TEST(InputArbiterTest, RetainsAndRetriesReleaseThatFailsDuringTeardown) {
 
   ASSERT_TRUE(input.ButtonDown("peer-a", "middle"));
   recording.fail_next_ = true;
-  input.ReleaseOwner("peer-a");
+  EXPECT_FALSE(input.ReleaseOwner("peer-a"));
   ASSERT_EQ(recording.events.size(), 1u);
   EXPECT_TRUE(input.RetryPendingReleases());
   ASSERT_EQ(recording.events.size(), 2u);

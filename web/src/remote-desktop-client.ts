@@ -31,7 +31,9 @@ import { apiFetch, getApiBaseUrl } from './api.js';
 
 const DATA_BUFFER_HIGH_WATER_BYTES = 256 * 1024;
 const DATA_BUFFER_LOW_WATER_BYTES = 64 * 1024;
-const START_TIMEOUT_MS = 20_000;
+// Let the server own the authoritative negotiation deadline and reason.  The
+// browser guard is only a final escape hatch if that terminal frame is lost.
+const START_TIMEOUT_MS = REMOTE_DESKTOP_LIMITS.NEGOTIATION_TIMEOUT_MS + 5_000;
 const INPUT_ACK_TIMEOUT_MS = 3_000;
 const LAYOUT_TRANSITION_TIMEOUT_MS = 5_000;
 

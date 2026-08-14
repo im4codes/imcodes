@@ -90,6 +90,7 @@ afterEach(() => {
   vi.clearAllMocks();
   vi.useRealTimers();
   clientHooks.length = 0;
+  localStorage.removeItem('rcc_float_remote-desktop-server-1');
 });
 
 function pointer(
@@ -186,6 +187,44 @@ async function renderPanel(ws?: { targetsServer(serverId: string): boolean }) {
 }
 
 describe('RemoteDesktopPanel mobile gestures', () => {
+  it('uses the shared desktop window chrome for header drag and eight-way resize', async () => {
+    Object.defineProperties(window, {
+      innerWidth: { value: 1600, configurable: true },
+      innerHeight: { value: 1000, configurable: true },
+    });
+    const { container, getByTestId } = await renderPanel();
+    const shell = getByTestId('floating-panel-remote-desktop-server-1') as HTMLDivElement;
+    const header = container.querySelector('.remote-desktop-header') as HTMLElement;
+    const initialLeft = Number.parseFloat(String(shell.style.left));
+    const initialTop = Number.parseFloat(String(shell.style.top));
+    const initialWidth = Number.parseFloat(String(shell.style.width));
+
+    act(() => {
+      header.dispatchEvent(new MouseEvent('mousedown', {
+        bubbles: true, cancelable: true, clientX: 200, clientY: 100,
+      }));
+      document.dispatchEvent(new MouseEvent('mousemove', {
+        bubbles: true, clientX: 260, clientY: 140,
+      }));
+      document.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+    });
+    expect(Number.parseFloat(String(shell.style.left))).toBe(initialLeft + 60);
+    expect(Number.parseFloat(String(shell.style.top))).toBe(initialTop + 40);
+
+    const southeast = getByTestId('floating-resize-se');
+    act(() => {
+      southeast.dispatchEvent(new MouseEvent('mousedown', {
+        bubbles: true, cancelable: true, clientX: 0, clientY: 0,
+      }));
+      document.dispatchEvent(new MouseEvent('mousemove', {
+        bubbles: true, clientX: 80, clientY: 60,
+      }));
+      document.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+    });
+    expect(Number.parseFloat(String(shell.style.width))).toBe(initialWidth + 80);
+    expect(container.querySelectorAll('[data-testid^="floating-resize-"]')).toHaveLength(8);
+  });
+
   it('reuses direct file transfer progress/mode and cancels without touching the desktop peer', async () => {
     uploadFileWithDirectFallback.mockImplementation(async (options: {
       onMode?(mode: string): void;

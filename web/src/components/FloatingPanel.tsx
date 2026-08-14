@@ -29,12 +29,18 @@ interface Props {
   pinTooltip?: string;
   defaultW?: number;
   defaultH?: number;
+  minW?: number;
+  minH?: number;
   enableMaximize?: boolean;
   isMaximized?: boolean;
   onToggleMaximized?: () => void;
   getMaximizeBounds?: () => WorkspaceBounds | null;
   desktopLayoutCapable?: boolean;
   className?: string;
+  /** Keep resize/window geometry chrome but let the child render its titlebar. */
+  hideTitleBar?: boolean;
+  /** Descendant selector that acts as the drag handle when the titlebar is hidden. */
+  dragHandleSelector?: string;
 }
 
 const MIN_W = 360;
@@ -45,24 +51,34 @@ const MIN_H = 280;
 const MOBILE_FLOATING_PANEL_Z_MIN = 7000;
 const MOBILE_FLOATING_PANEL_Z_OFFSET = 2000;
 
-function currentViewportBounds(): WorkspaceBounds {
+function currentViewportBounds(minW = MIN_W, minH = MIN_H): WorkspaceBounds {
   return reserveWorkspaceBottom(viewportWorkspaceBelowSessionTabs({
     viewportWidth: window.innerWidth,
     viewportHeight: window.innerHeight,
-    minW: MIN_W,
-    minH: MIN_H,
+    minW,
+    minH,
   }));
 }
 
-function clampGeomToViewport(geom: WindowGeometry): WindowGeometry {
-  const bounds = currentViewportBounds();
+function clampGeomToViewport(
+  geom: WindowGeometry,
+  minW = MIN_W,
+  minH = MIN_H,
+): WindowGeometry {
+  const bounds = currentViewportBounds(minW, minH);
   return clampGeometryFullyIntoWorkspace(geom, bounds, {
-    minW: MIN_W,
-    minH: MIN_H,
+    minW,
+    minH,
   });
 }
 
-function loadGeom(id: string, dw: number, dh: number): WindowGeometry {
+function loadGeom(
+  id: string,
+  dw: number,
+  dh: number,
+  minW = MIN_W,
+  minH = MIN_H,
+): WindowGeometry {
   const fallback = {
     x: Math.max(0, (window.innerWidth - dw) / 2),
     y: Math.max(0, (window.innerHeight - dh) / 2 - 40),
@@ -71,17 +87,19 @@ function loadGeom(id: string, dw: number, dh: number): WindowGeometry {
   };
   try {
     const raw = localStorage.getItem(`rcc_float_${id}`);
-    if (raw) return clampGeomToViewport(normalizeWindowGeometry(JSON.parse(raw), fallback));
+    if (raw) return clampGeomToViewport(
+      normalizeWindowGeometry(JSON.parse(raw), fallback), minW, minH,
+    );
   } catch { /* ignore */ }
-  return clampGeomToViewport(fallback);
+  return clampGeomToViewport(fallback, minW, minH);
 }
 
 function saveGeom(id: string, geom: WindowGeometry) {
   try { localStorage.setItem(`rcc_float_${id}`, JSON.stringify(geom)); } catch { /* ignore */ }
 }
 
-function fallbackMaximizedGeometry(): WindowGeometry {
-  return geometryFromWorkspace(currentViewportBounds());
+function fallbackMaximizedGeometry(minW: number, minH: number): WindowGeometry {
+  return geometryFromWorkspace(currentViewportBounds(minW, minH));
 }
 
 export function FloatingPanel({
@@ -95,18 +113,24 @@ export function FloatingPanel({
   pinTooltip,
   defaultW = 700,
   defaultH = 520,
+  minW = MIN_W,
+  minH = MIN_H,
   enableMaximize = false,
   isMaximized = false,
   onToggleMaximized,
   getMaximizeBounds,
   desktopLayoutCapable = true,
   className,
+  hideTitleBar = false,
+  dragHandleSelector,
 }: Props) {
   const { t } = useTranslation();
   const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
   const canUseDesktopMaximize = enableMaximize && desktopLayoutCapable;
   const isDesktopMaximized = canUseDesktopMaximize && isMaximized;
-  const [geom, setGeom] = useState(() => loadGeom(id, defaultW, defaultH));
+  const [geom, setGeom] = useState(() => loadGeom(
+    id, defaultW, defaultH, minW, minH,
+  ));
   const [, forceWorkspaceRender] = useState(0);
   const geomRef = useRef(geom);
   geomRef.current = geom;
@@ -120,19 +144,19 @@ export function FloatingPanel({
         forceWorkspaceRender((n) => n + 1);
         return;
       }
-      setGeom((g) => clampGeomToViewport(g));
+      setGeom((g) => clampGeomToViewport(g, minW, minH));
     };
     window.addEventListener('resize', onResize);
     return () => window.removeEventListener('resize', onResize);
-  }, [isDesktopMaximized]);
+  }, [isDesktopMaximized, minH, minW]);
 
   // ── Drag ─────────────────────────────────────────────────────────────────
   const dragStart = useRef<{ mx: number; my: number; ox: number; oy: number } | null>(null);
 
   const clampPos = useCallback((x: number, y: number, w: number, h = geomRef.current.h) => {
-    const clamped = clampGeomToViewport({ x, y, w, h });
+    const clamped = clampGeomToViewport({ x, y, w, h }, minW, minH);
     return { x: clamped.x, y: clamped.y };
-  }, []);
+  }, [minH, minW]);
 
   const startDrag = useCallback((e: MouseEvent) => {
     if (isDesktopMaximized) {
@@ -178,20 +202,20 @@ export function FloatingPanel({
         let { x, y, w, h } = { ...startG };
         const startRight = startG.x + startG.w;
         const startBottom = startG.y + startG.h;
-        if (dir.includes('e')) w = Math.max(MIN_W, startG.w + dx);
-        if (dir.includes('s')) h = Math.max(MIN_H, startG.h + dy);
+        if (dir.includes('e')) w = Math.max(minW, startG.w + dx);
+        if (dir.includes('s')) h = Math.max(minH, startG.h + dy);
         if (dir.includes('w')) {
           const desiredX = startG.x + dx;
-          x = Math.min(desiredX, startRight - MIN_W);
+          x = Math.min(desiredX, startRight - minW);
           w = startRight - x;
         }
         if (dir.includes('n')) {
-          const bounds = currentViewportBounds();
+          const bounds = currentViewportBounds(minW, minH);
           const desiredY = startG.y + dy;
-          y = Math.max(bounds.y, Math.min(desiredY, startBottom - MIN_H));
+          y = Math.max(bounds.y, Math.min(desiredY, startBottom - minH));
           h = startBottom - y;
         }
-        return clampGeomToViewport({ x, y, w, h });
+        return clampGeomToViewport({ x, y, w, h }, minW, minH);
       });
     };
     const onUp = () => {
@@ -200,12 +224,25 @@ export function FloatingPanel({
     };
     document.addEventListener('mousemove', onMove);
     document.addEventListener('mouseup', onUp);
-  }, [isDesktopMaximized, onFocus]);
+  }, [isDesktopMaximized, minH, minW, onFocus]);
 
   const onMaximizeClick = useCallback(() => {
     onFocus?.();
     onToggleMaximized?.();
   }, [onFocus, onToggleMaximized]);
+
+  const onPanelMouseDown = useCallback((event: MouseEvent) => {
+    const target = event.target as HTMLElement;
+    if (target.closest('button, a, input, select, textarea, [role="button"]')) {
+      onFocus?.();
+      return;
+    }
+    if (dragHandleSelector && target.closest(dragHandleSelector)) {
+      startDrag(event);
+      return;
+    }
+    onFocus?.();
+  }, [dragHandleSelector, onFocus, startDrag]);
 
   // Mobile: fullscreen with title bar
   if (isMobile) {
@@ -216,7 +253,7 @@ export function FloatingPanel({
     return (
       <div className={['floating-panel', className].filter(Boolean).join(' ')} style={{ position: 'fixed', inset: 0, zIndex: mobileZIndex, background: '#0f172a', display: 'flex', flexDirection: 'column' }}>
         <div className="floating-panel-safe-area" style={{ height: 'env(safe-area-inset-top, 0px)', flexShrink: 0, background: '#0f172a' }} />
-        <div className="floating-panel-titlebar" style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px', background: '#1e293b', borderBottom: '1px solid #334155', flexShrink: 0 }}>
+        {!hideTitleBar && <div className="floating-panel-titlebar" style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px', background: '#1e293b', borderBottom: '1px solid #334155', flexShrink: 0 }}>
           <span
             title={title}
             style={{
@@ -238,7 +275,7 @@ export function FloatingPanel({
             aria-label={t('window.close')}
             style={{ background: 'none', border: 'none', color: '#94a3b8', cursor: 'pointer', fontSize: 18, padding: '4px 8px', flexShrink: 0 }}
           >✕</button>
-        </div>
+        </div>}
         <div className="floating-panel-content" style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
           {children}
         </div>
@@ -249,7 +286,9 @@ export function FloatingPanel({
   // Desktop: floating window
   const rh = 5; // resize handle size
   const displayGeom = isDesktopMaximized
-    ? geometryFromWorkspace(getMaximizeBounds?.() ?? fallbackMaximizedGeometry())
+    ? geometryFromWorkspace(
+      getMaximizeBounds?.() ?? fallbackMaximizedGeometry(minW, minH),
+    )
     : geom;
   return (
     <div
@@ -263,10 +302,10 @@ export function FloatingPanel({
         overflow: 'hidden',
         boxSizing: 'border-box',
       }}
-      onMouseDown={() => onFocus?.()}
+      onMouseDown={onPanelMouseDown}
     >
       {/* Title bar — draggable */}
-      <div
+      {!hideTitleBar && <div
         className="floating-panel-titlebar"
         onMouseDown={startDrag}
         style={{
@@ -316,7 +355,7 @@ export function FloatingPanel({
           title={t('window.close')}
           aria-label={t('window.close')}
         >×</button>
-      </div>
+      </div>}
 
       {/* Content */}
       <div className="floating-panel-content" style={{ flex: 1, overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>

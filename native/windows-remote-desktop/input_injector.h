@@ -20,8 +20,11 @@ namespace imcodes::rd {
 class InputArbiter {
  public:
   using SendInputFn = std::function<UINT(UINT, LPINPUT, int)>;
+  using InputAvailableFn = std::function<bool()>;
 
-  explicit InputArbiter(SendInputFn send_input = {});
+  explicit InputArbiter(SendInputFn send_input = {},
+                        InputAvailableFn input_available = {});
+  bool Available() const;
   bool KeyDown(const std::string& owner, const std::string& code, bool repeat);
   bool KeyUp(const std::string& owner, const std::string& code);
   bool ButtonDown(const std::string& owner, const std::string& button);
@@ -29,7 +32,7 @@ class InputArbiter {
   bool Move(const DisplayInfo& display, double x, double y);
   bool Wheel(double delta_x, double delta_y);
   bool Text(const std::u16string& value);
-  void ReleaseOwner(const std::string& owner);
+  bool ReleaseOwner(const std::string& owner);
   bool RetryPendingReleases();
 
  private:
@@ -38,6 +41,7 @@ class InputArbiter {
   bool SendButton(const std::string& button, bool down);
 
   const SendInputFn send_input_;
+  const InputAvailableFn input_available_;
   std::mutex mutex_;
   std::map<std::string, std::set<std::string>> key_owners_;
   std::map<std::string, std::set<std::string>> button_owners_;

@@ -789,10 +789,11 @@ void PeerSession::HandleDataOnSignaling(const std::string& label,
     if (ExactKeys(root, {"type", "protocolVersion", "sessionId", "sequence",
                           "layoutRevision", "inputEpoch"}) &&
         ValidateInputBase(root, label, true, &sequence)) {
-      last_sequence_by_channel_[label] = sequence;
-      ReleaseInput();
-      TouchActivity();
-      SendInputAck(sequence);
+      if (ReleaseInput()) {
+        last_sequence_by_channel_[label] = sequence;
+        TouchActivity();
+        SendInputAck(sequence);
+      }
     }
   } else if (label == kKeyboardChannel && type == kKeyboardType)
     HandleKeyboard(label, root);
@@ -935,9 +936,11 @@ void PeerSession::HandlePointer(const std::string& channel,
               root["x"].asDouble() >= 0.0 && root["x"].asDouble() <= 1.0)) &&
              (!root.isMember("y") || (root["y"].isNumeric() &&
               root["y"].asDouble() >= 0.0 && root["y"].asDouble() <= 1.0))) {
-    if (root.isMember("x") && root.isMember("y"))
-      input_->Move(displays_[selected_display_], root["x"].asDouble(),
-                   root["y"].asDouble());
+    if (root.isMember("x") && root.isMember("y") &&
+        !input_->Move(displays_[selected_display_], root["x"].asDouble(),
+                      root["y"].asDouble())) {
+      return;
+    }
     accepted = kind == "button_down"
                    ? input_->ButtonDown(authority_.session_id,
                                         root["button"].asString())
@@ -1215,12 +1218,13 @@ bool PeerSession::ChannelsReady() const {
 
 bool PeerSession::InputReady() const {
   return controlling() && ChannelsReady() && layout_acknowledged_ &&
-         !selection_required_;
+         !selection_required_ && input_->Available();
 }
 
-void PeerSession::ReleaseInput() {
-  input_->ReleaseOwner(authority_.session_id);
+bool PeerSession::ReleaseInput() {
+  const bool released = input_->ReleaseOwner(authority_.session_id);
   pressed_codes_.clear();
+  return released;
 }
 
 }  // namespace imcodes::rd
