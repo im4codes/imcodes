@@ -17,6 +17,7 @@
 #include "api/stats/rtcstats_objects.h"
 #include "api/transport/bitrate_settings.h"
 #include "rtc_base/logging.h"
+#include "third_party/imcodes_remote_desktop/display_preferences.h"
 #include "third_party/imcodes_remote_desktop/mf_h264_encoder.h"
 #include "third_party/imcodes_remote_desktop/quality_ladder.h"
 #include "third_party/imcodes_remote_desktop/worker_policy.h"
@@ -242,10 +243,17 @@ bool PeerSession::Initialize() {
       displays_.begin(), displays_.end(),
       [](const DisplayInfo& display) { return display.imcodes_virtual; });
   if (startup_virtual_display != displays_.end()) {
-    const int recommended = RecommendedRemoteDisplayScale(
-        startup_virtual_display->width, startup_virtual_display->height);
-    if (std::lround(startup_virtual_display->dpi_scale * 100.0) != recommended &&
-        SetDisplayDpiScale(*startup_virtual_display, recommended)) {
+    VirtualDisplayPreferences preferences;
+    const int desired_scale =
+        LoadVirtualDisplayPreferences(&preferences) &&
+                preferences.width == startup_virtual_display->width &&
+                preferences.height == startup_virtual_display->height
+            ? preferences.dpi_scale_percent
+            : RecommendedRemoteDisplayScale(startup_virtual_display->width,
+                                            startup_virtual_display->height);
+    if (std::lround(startup_virtual_display->dpi_scale * 100.0) !=
+            desired_scale &&
+        SetDisplayDpiScale(*startup_virtual_display, desired_scale)) {
       std::vector<DisplayInfo> refreshed = EnumerateDisplays();
       if (!refreshed.empty()) displays_ = std::move(refreshed);
     }
@@ -1299,7 +1307,8 @@ bool PeerSession::SetDisplayMode(const std::string& id,
   ReleaseInput();
   const bool previous_layout_acknowledged = layout_acknowledged_;
   layout_acknowledged_ = false;
-  if (ChangeDisplaySettingsExW(found->device_name.c_str(), &mode, nullptr, 0,
+  if (ChangeDisplaySettingsExW(found->device_name.c_str(), &mode, nullptr,
+                               CDS_UPDATEREGISTRY,
                                nullptr) != DISP_CHANGE_SUCCESSFUL) {
     layout_acknowledged_ = previous_layout_acknowledged;
     SendStatus(relayed_ ? "relayed" : "direct", InputReady());
@@ -1309,8 +1318,11 @@ bool PeerSession::SetDisplayMode(const std::string& id,
   // only after an explicit remote mode change (and on the IM.codes headless
   // display during startup); arbitrary physical displays are never changed in
   // the background.
-  SetDisplayDpiScale(
-      *found, RecommendedRemoteDisplayScale(width, height));
+  const int recommended_scale = RecommendedRemoteDisplayScale(width, height);
+  SetDisplayDpiScale(*found, recommended_scale);
+  if (found->imcodes_virtual) {
+    SaveVirtualDisplayPreferences({width, height, recommended_scale});
+  }
   SendStatus("switching_display", false);
   return true;
 }
@@ -1336,6 +1348,9 @@ bool PeerSession::SetDisplayScale(const std::string& id, int percent) {
     return false;
   }
   found->dpi_scale = static_cast<double>(percent) / 100.0;
+  if (found->imcodes_virtual) {
+    SaveVirtualDisplayPreferences({found->width, found->height, percent});
+  }
   ++layout_revision_;
   last_sequence_by_channel_.clear();
   SendTopology();

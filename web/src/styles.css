@@ -7662,6 +7662,7 @@ button.quick-agent-delegation-preset.active {
 }
 
 .remote-desktop-panel {
+  position: relative;
   width: 100%;
   height: 100%;
   min-height: 0;
@@ -7756,6 +7757,14 @@ button.quick-agent-delegation-preset.active {
 
 .remote-desktop-mobile-input-switch {
   display: none;
+}
+
+.remote-desktop-keyboard-trigger {
+  width: 38px;
+  padding-inline: 0 !important;
+  display: grid;
+  place-items: center;
+  font-size: 19px;
 }
 
 .remote-desktop-display-tabs {
@@ -7878,6 +7887,86 @@ button.quick-agent-delegation-preset.active {
   background: #02050a;
   outline: none;
   touch-action: none;
+}
+
+.remote-desktop-mobile-keyboard {
+  position: absolute;
+  z-index: 9;
+  left: 50%;
+  bottom: 12px;
+  translate: -50% 0;
+  width: min(720px, calc(100% - 24px));
+  padding: 8px;
+  display: grid;
+  gap: 7px;
+  color: #e8f8ff;
+  background:
+    linear-gradient(145deg, rgb(10 31 48 / 96%), rgb(3 14 25 / 97%)),
+    repeating-linear-gradient(90deg, transparent 0 23px, rgb(94 214 255 / 4%) 24px);
+  border: 1px solid rgb(99 213 255 / 58%);
+  border-radius: 13px;
+  box-shadow: 0 18px 50px rgb(0 0 0 / 58%), inset 0 1px 0 rgb(255 255 255 / 9%), 0 0 25px rgb(34 181 255 / 12%);
+}
+
+.remote-desktop-mobile-keyboard-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  color: #79ddff;
+  font-size: 18px;
+}
+
+.remote-desktop-mobile-keyboard-head button,
+.remote-desktop-file-drawer-head button {
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  color: #cceeff;
+  background: rgb(29 74 101 / 55%);
+  border: 1px solid rgb(101 207 255 / 36%);
+  border-radius: 7px;
+  font-size: 20px;
+}
+
+.remote-desktop-mobile-keyboard textarea {
+  width: 100%;
+  min-height: 38px;
+  max-height: 88px;
+  resize: vertical;
+  padding: 8px 10px;
+  color: #f2fbff;
+  background: rgb(1 9 17 / 82%);
+  border: 1px solid #2d6686;
+  border-radius: 8px;
+  outline: none;
+}
+
+.remote-desktop-mobile-keyboard textarea:focus {
+  border-color: #67d8ff;
+  box-shadow: 0 0 0 2px rgb(99 216 255 / 15%);
+}
+
+.remote-desktop-mobile-shortcuts {
+  display: flex;
+  gap: 6px;
+  overflow-x: auto;
+  padding-bottom: 2px;
+  scrollbar-width: thin;
+}
+
+.remote-desktop-mobile-shortcuts button {
+  flex: 0 0 auto;
+  min-height: 34px;
+  padding: 5px 9px;
+  color: #dff7ff;
+  background: linear-gradient(180deg, #153b54, #0b2639);
+  border: 1px solid #326d8f;
+  border-radius: 8px;
+}
+
+.remote-desktop-mobile-shortcuts button:active {
+  color: #03131d;
+  background: #6bd9ff;
 }
 
 .remote-desktop-stage.is-controlling {
@@ -8050,12 +8139,26 @@ button.quick-agent-delegation-preset.active {
 .remote-desktop-stage-placeholder {
   position: absolute;
   inset: 0;
-  display: grid;
-  place-items: center;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  align-items: center;
+  justify-content: center;
   padding: 24px;
   color: #b8cede;
   text-align: center;
   pointer-events: none;
+}
+
+.remote-desktop-stage-placeholder button {
+  padding: 8px 18px;
+  color: #04151f;
+  background: linear-gradient(135deg, #7cecff, #57a9ff);
+  border: 1px solid rgb(166 244 255 / 82%);
+  border-radius: 9px;
+  box-shadow: 0 8px 24px rgb(21 151 211 / 24%);
+  font-weight: 800;
+  pointer-events: auto;
 }
 
 .remote-desktop-capture-hint {
@@ -8091,6 +8194,152 @@ button.quick-agent-delegation-preset.active {
   justify-content: space-between;
   flex-wrap: wrap;
   border-top: 1px solid rgb(122 178 218 / 14%);
+}
+
+.remote-desktop-file-drawer {
+  position: absolute;
+  z-index: 12;
+  right: 12px;
+  bottom: 58px;
+  width: min(560px, calc(100% - 24px));
+  max-height: min(680px, calc(100% - 108px));
+  overflow: auto;
+  padding: 12px;
+  display: grid;
+  gap: 11px;
+  color: #e7f7ff;
+  background:
+    linear-gradient(145deg, rgb(8 29 45 / 98%), rgb(3 14 24 / 98%)),
+    repeating-linear-gradient(0deg, transparent 0 27px, rgb(87 207 255 / 4%) 28px);
+  border: 1px solid rgb(91 207 255 / 58%);
+  border-radius: 14px;
+  box-shadow: 0 22px 64px rgb(0 0 0 / 64%), inset 0 1px 0 rgb(255 255 255 / 8%), 0 0 30px rgb(31 184 255 / 12%);
+}
+
+.remote-desktop-file-drawer-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.remote-desktop-file-drawer-head > div {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+}
+
+.remote-desktop-file-drawer-head strong {
+  color: #f1fbff;
+  font-size: 15px;
+}
+
+.remote-desktop-file-drawer-head span,
+.remote-desktop-file-compatibility {
+  color: #9ebfd2;
+  font-size: 11px;
+}
+
+.remote-desktop-file-destination {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  padding: 8px;
+  background: rgb(4 17 28 / 72%);
+  border: 1px solid rgb(93 199 239 / 24%);
+  border-radius: 9px;
+}
+
+.remote-desktop-file-destination > span {
+  color: #9ac9df;
+  font-size: 11px;
+}
+
+.remote-desktop-file-destination code {
+  overflow: hidden;
+  color: #8fe7ff;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.remote-desktop-file-drawer button {
+  min-height: 34px;
+  padding: 6px 10px;
+  color: #dff6ff;
+  background: #102d42;
+  border: 1px solid #346b89;
+  border-radius: 8px;
+}
+
+.remote-desktop-file-drawer button:disabled {
+  opacity: .45;
+}
+
+.remote-desktop-file-drop {
+  min-height: 112px !important;
+  display: grid;
+  place-items: center;
+  align-content: center;
+  gap: 3px;
+  color: #bfeeff !important;
+  background: rgb(8 34 52 / 62%) !important;
+  border: 1px dashed rgb(91 208 255 / 58%) !important;
+  transition: border-color .15s ease, background .15s ease, box-shadow .15s ease;
+}
+
+.remote-desktop-file-drop > span {
+  font-size: 26px;
+}
+
+.remote-desktop-file-drop small {
+  color: #91afc1;
+}
+
+.remote-desktop-file-drop.is-active {
+  background: rgb(20 79 104 / 72%) !important;
+  border-color: #75e0ff !important;
+  box-shadow: inset 0 0 28px rgb(61 206 255 / 14%);
+}
+
+.remote-desktop-fetch-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 7px;
+}
+
+.remote-desktop-fetch-row input {
+  min-width: 0;
+  min-height: 34px;
+  padding: 7px 9px;
+  color: #edfaff;
+  background: #05131f;
+  border: 1px solid #2b5872;
+  border-radius: 8px;
+}
+
+.remote-desktop-file-drawer .remote-desktop-transfer-list {
+  max-height: 210px;
+  overflow: auto;
+}
+
+.remote-desktop-directory-picker {
+  position: absolute;
+  z-index: 2;
+  inset: 10px;
+  min-height: 340px;
+  overflow: hidden;
+  background: #06111d;
+  border: 1px solid #3b7898;
+  border-radius: 11px;
+  box-shadow: 0 16px 52px rgb(0 0 0 / 70%);
+}
+
+.remote-desktop-directory-picker > * {
+  width: 100%;
+  height: 100%;
+  min-height: 340px;
 }
 
 .remote-desktop-diagnostics,
@@ -8164,6 +8413,26 @@ button.quick-agent-delegation-preset.active {
   .remote-desktop-toolbar,
   .remote-desktop-footer {
     padding: 8px;
+  }
+
+  .remote-desktop-mobile-keyboard {
+    top: 8px;
+    bottom: auto;
+    width: calc(100% - 16px);
+  }
+
+  .remote-desktop-file-drawer {
+    inset: 92px 8px 8px;
+    width: auto;
+    max-height: none;
+  }
+
+  .remote-desktop-file-destination {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .remote-desktop-file-destination > span {
+    grid-column: 1 / -1;
   }
 
   .remote-desktop-presence {

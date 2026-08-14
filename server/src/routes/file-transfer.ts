@@ -10,6 +10,7 @@ import { WsBridge } from '../ws/bridge.js';
 import { randomHex } from '../security/crypto.js';
 import {
   FILE_TRANSFER_LIMITS,
+  FILE_TRANSFER_DIRECTORY_CAPABILITY,
   FILE_TRANSFER_UPLOAD_ERROR_CODE,
   FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY,
   FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY,
@@ -18,6 +19,7 @@ import {
   FILE_TRANSFER_PATH_MAX_BYTES,
   FILE_TRANSFER_MSG,
   validateFileDeleteRequest,
+  validateFileDirectoryListRequest,
   validateFilePathHandleRequest,
 } from '../../../shared/transport/file-transfer.js';
 import { DIRECT_FILE_TRANSFER_CAPABILITY, isDirectFileTransferClientUploadId } from '../../../shared/direct-file-transfer.js';
@@ -41,6 +43,7 @@ import type {
   FileDownloadRequest,
   FileDownloadStreamRequest,
   FilePathHandleRequest,
+  FileDirectoryListRequest,
   FileDeleteRequest,
   FileUploadFetchRequest,
   FileUploadRequest,
@@ -360,6 +363,7 @@ const authMiddleware = requireAuth();
 
 fileTransferRoutes.use('/:id/upload', authMiddleware);
 fileTransferRoutes.use('/:id/machine-file-handle', authMiddleware);
+fileTransferRoutes.use('/:id/machine-file-list', authMiddleware);
 fileTransferRoutes.use('/:id/machine-direct-upload', authMiddleware);
 fileTransferRoutes.use('/:id/machine-direct-fetch', authMiddleware);
 fileTransferRoutes.use('/:id/uploads/:attachmentId/download-token', authMiddleware);
@@ -399,6 +403,7 @@ async function authorizeControlledFileTarget(
   serverId: string,
   capability: string,
   requireControlled: boolean,
+  allowInteractiveUser = false,
 ): Promise<ControlledTargetGate> {
   const target = await c.env.DB.queryOne(
     'SELECT user_id, node_role, exec_enabled, revoked_at FROM servers WHERE id = $1',
@@ -418,7 +423,13 @@ async function authorizeControlledFileTarget(
   const userId = c.get('userId' as never) as string;
   const nodeRole = c.get('nodeRole' as never) as string | undefined;
   const sourceServerId = c.get('authServerId' as never) as string | undefined;
-  if (nodeRole !== 'full' || !sourceServerId || sourceServerId === serverId) {
+  const authenticatedFullDaemon = nodeRole === 'full'
+    && typeof sourceServerId === 'string'
+    && sourceServerId !== serverId;
+  const authenticatedInteractiveUser = allowInteractiveUser
+    && nodeRole === undefined
+    && sourceServerId === undefined;
+  if (!authenticatedFullDaemon && !authenticatedInteractiveUser) {
     return { ok: false, reason: 'scoped_auth' };
   }
   const access = await resolveControlledMachineAccess(c.env.DB, userId, serverId, Date.now());
@@ -616,7 +627,13 @@ fileTransferRoutes.put('/:id/download-staged/:downloadId', async (c) => {
 // arbitrary filesystem CRUD remain outside this route.
 fileTransferRoutes.post('/:id/machine-file-handle', async (c) => {
   const serverId = c.req.param('id')!;
-  const gate = await authorizeControlledFileTarget(c, serverId, FILE_TRANSFER_PATH_HANDLE_CAPABILITY, true);
+  const gate = await authorizeControlledFileTarget(
+    c,
+    serverId,
+    FILE_TRANSFER_PATH_HANDLE_CAPABILITY,
+    true,
+    true,
+  );
   if (!gate.ok) return controlledTargetGateError(c, gate.reason);
 
   const boundedBody = await readBoundedJsonObject(c.req.raw, MACHINE_FILE_HANDLE_BODY_MAX_BYTES);
@@ -664,6 +681,62 @@ fileTransferRoutes.post('/:id/machine-file-handle', async (c) => {
     if (reason === 'timeout') return c.json({ error: 'timeout' }, 504);
     logger.error({ serverId, err }, 'Controlled node path handle failed');
     return c.json({ error: 'path_handle_failed' }, 500);
+  }
+});
+
+fileTransferRoutes.post('/:id/machine-file-list', async (c) => {
+  const serverId = c.req.param('id')!;
+  const gate = await authorizeControlledFileTarget(
+    c,
+    serverId,
+    FILE_TRANSFER_DIRECTORY_CAPABILITY,
+    true,
+    true,
+  );
+  if (!gate.ok) return controlledTargetGateError(c, gate.reason);
+
+  const boundedBody = await readBoundedJsonObject(c.req.raw, MACHINE_FILE_HANDLE_BODY_MAX_BYTES);
+  if (!boundedBody.ok) {
+    return boundedBody.tooLarge
+      ? c.json({ error: 'request_too_large' }, 413)
+      : c.json({ error: 'invalid_body' }, 400);
+  }
+  const body = boundedBody.value;
+  if (Object.keys(body).length !== 1 || !Object.prototype.hasOwnProperty.call(body, 'path')) {
+    return c.json({ error: FS_GENERIC_ERROR_CODES.INVALID_REQUEST }, 400);
+  }
+  const requestId = randomHex(16);
+  const parsed = validateFileDirectoryListRequest({
+    ...body,
+    type: FILE_TRANSFER_MSG.DIRECTORY_LIST,
+    requestId,
+  });
+  if (!parsed.ok) return c.json({ error: FS_GENERIC_ERROR_CODES.INVALID_REQUEST }, 400);
+
+  try {
+    const result = await gate.bridge.sendFileTransferRequest(
+      requestId,
+      parsed.value as FileDirectoryListRequest as unknown as Record<string, unknown>,
+      FILE_TRANSFER_LIMITS.DOWNLOAD_TIMEOUT_MS,
+      undefined,
+      gate.daemonGeneration,
+    );
+    if (result.type === FILE_TRANSFER_MSG.DIRECTORY_LIST_ERROR) {
+      return c.json({ error: typeof result.error === 'string' ? result.error : 'directory_list_failed' }, 400);
+    }
+    if (result.type !== FILE_TRANSFER_MSG.DIRECTORY_LIST_DONE
+      || !Array.isArray(result.entries)
+      || typeof result.resolvedPath !== 'string') {
+      return c.json({ error: 'invalid_daemon_response' }, 502);
+    }
+    return c.json({ ok: true, resolvedPath: result.resolvedPath, entries: result.entries });
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : 'directory_list_failed';
+    if (reason === 'daemon_offline' || reason === 'daemon_disconnected' || reason === 'daemon_generation_changed') {
+      return c.json({ error: 'daemon_offline' }, 503);
+    }
+    if (reason === 'timeout') return c.json({ error: 'timeout' }, 504);
+    return c.json({ error: 'directory_list_failed' }, 500);
   }
 });
 
@@ -736,16 +809,20 @@ fileTransferRoutes.post('/:id/upload', async (c) => {
   const userId = c.get('userId' as never) as string;
   const serverId = c.req.param('id')!;
 
-  // Permission check
-  const access = await authorizeSessionFileAccess(c, serverId, userId, 'write');
-  if (!access.ok) return c.json({ error: 'forbidden', reason: access.reason }, 403);
   const controlledGate = await authorizeControlledFileTarget(
     c,
     serverId,
     FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY,
     false,
+    true,
   );
   if (!controlledGate.ok) return controlledTargetGateError(c, controlledGate.reason);
+  // Controlled-node shares have their own DB-authoritative Owner/Participant
+  // grants. Standard daemons retain the existing member/session-share check.
+  if (!controlledGate.controlled) {
+    const access = await authorizeSessionFileAccess(c, serverId, userId, 'write');
+    if (!access.ok) return c.json({ error: 'forbidden', reason: access.reason }, 403);
+  }
 
   const contentLengthHeader = c.req.header('content-length');
   const contentLength = contentLengthHeader ? Number.parseInt(contentLengthHeader, 10) : Number.NaN;
@@ -769,6 +846,18 @@ fileTransferRoutes.post('/:id/upload', async (c) => {
   const clientUploadId = typeof rawClientUploadId === 'string' && isDirectFileTransferClientUploadId(rawClientUploadId)
     ? rawClientUploadId
     : undefined;
+  const rawDestinationDirectory = formData.get('destinationDirectory');
+  const destinationDirectory = typeof rawDestinationDirectory === 'string' && rawDestinationDirectory.trim()
+    ? rawDestinationDirectory.trim()
+    : undefined;
+  if (destinationDirectory) {
+    if (Buffer.byteLength(destinationDirectory, 'utf8') > FILE_TRANSFER_PATH_MAX_BYTES) {
+      return c.json({ error: 'invalid_destination_directory' }, 400);
+    }
+    if (!controlledGate.controlled || !controlledGate.bridge.hasDaemonCapability(FILE_TRANSFER_DIRECTORY_CAPABILITY)) {
+      return c.json({ error: 'capability_unavailable' }, 409);
+    }
+  }
 
   // Size check
   if (file.size > FILE_TRANSFER_LIMITS.MAX_FILE_SIZE) {
@@ -849,6 +938,7 @@ fileTransferRoutes.post('/:id/upload', async (c) => {
       size: file.size,
       downloadUrl: buildStagedUploadUrl(c.req.url, c.env.SERVER_URL, serverId, uploadId, token),
       ...(negotiatedClientUploadId ? { clientUploadId: negotiatedClientUploadId } : {}),
+      ...(destinationDirectory ? { destinationDirectory } : {}),
     };
   } else {
     uploadMsg = {
@@ -860,6 +950,7 @@ fileTransferRoutes.post('/:id/upload', async (c) => {
       size: file.size,
       content: (await readFile(stagedPath)).toString('base64'),
       ...(negotiatedClientUploadId ? { clientUploadId: negotiatedClientUploadId } : {}),
+      ...(destinationDirectory ? { destinationDirectory } : {}),
     };
   }
 
@@ -977,10 +1068,18 @@ fileTransferRoutes.delete('/:id/uploads/:attachmentId', async (c) => {
   const serverId = c.req.param('id')!;
   const attachmentId = c.req.param('attachmentId')!;
 
-  const access = await authorizeSessionFileAccess(c, serverId, userId, 'write');
-  if (!access.ok) return c.json({ error: 'forbidden', reason: access.reason }, 403);
-  const gate = await authorizeControlledFileTarget(c, serverId, FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY, false);
+  const gate = await authorizeControlledFileTarget(
+    c,
+    serverId,
+    FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY,
+    false,
+    true,
+  );
   if (!gate.ok) return controlledTargetGateError(c, gate.reason);
+  if (!gate.controlled) {
+    const access = await authorizeSessionFileAccess(c, serverId, userId, 'write');
+    if (!access.ok) return c.json({ error: 'forbidden', reason: access.reason }, 403);
+  }
   if (!gate.bridge.isDaemonConnected()) return c.json({ error: 'daemon_offline' }, 503);
 
   const requestId = randomHex(16);
@@ -1017,15 +1116,18 @@ fileTransferRoutes.post('/:id/uploads/:attachmentId/download-token', async (c) =
   const serverId = c.req.param('id')!;
   const attachmentId = c.req.param('attachmentId')!;
 
-  const access = await authorizeSessionFileAccess(c, serverId, userId, 'read');
-  if (!access.ok) return c.json({ error: 'forbidden', reason: access.reason }, 403);
   const controlledGate = await authorizeControlledFileTarget(
     c,
     serverId,
     FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY,
     false,
+    true,
   );
   if (!controlledGate.ok) return controlledTargetGateError(c, controlledGate.reason);
+  const access = controlledGate.controlled
+    ? { ok: true as const, sessionName: undefined as string | undefined }
+    : await authorizeSessionFileAccess(c, serverId, userId, 'read');
+  if (!access.ok) return c.json({ error: 'forbidden', reason: access.reason }, 403);
 
   if (!/^[a-f0-9]+(\.[a-zA-Z0-9]+)?$/.test(attachmentId)) {
     return c.json({ error: 'invalid_attachment_id' }, 400);
@@ -1067,16 +1169,18 @@ fileTransferRoutes.get('/:id/uploads/:attachmentId/download', async (c) => {
     return c.json({ error: 'token_resource_mismatch' }, 403);
   }
 
-  // Permission check
-  const access = await authorizeSessionFileAccess(c, serverId, userId, 'read');
-  if (!access.ok) return c.json({ error: 'forbidden', reason: access.reason }, 403);
   const controlledGate = await authorizeControlledFileTarget(
     c,
     serverId,
     FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY,
     false,
+    true,
   );
   if (!controlledGate.ok) return controlledTargetGateError(c, controlledGate.reason);
+  if (!controlledGate.controlled) {
+    const access = await authorizeSessionFileAccess(c, serverId, userId, 'read');
+    if (!access.ok) return c.json({ error: 'forbidden', reason: access.reason }, 403);
+  }
 
   // Validate attachment ID format (hex + optional extension)
   if (!/^[a-f0-9]+(\.[a-zA-Z0-9]+)?$/.test(attachmentId)) {

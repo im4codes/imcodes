@@ -116,6 +116,23 @@ describe('controlled-node executable release wiring', () => {
     expect(sdkConsumer).toContain("'/MANIFEST:EMBED'");
     expect(sdkConsumer).toContain("'/MANIFESTUAC:NO'");
     expect(sdkConsumer).toContain('"/MANIFESTINPUT:$_"');
+    expect(sdkConsumer).toContain("'display_preferences.cc'");
+    expect(workerBuild).toContain("'display_preferences.cc', 'display_preferences.h'");
+    const displayPreferences = readFileSync(
+      'native/windows-remote-desktop/display_preferences.cc',
+      'utf8',
+    );
+    const peerSession = readFileSync('native/windows-remote-desktop/peer_session.cc', 'utf8');
+    const virtualDisplayController = readFileSync(
+      'native/windows-remote-desktop/virtual_display_controller.cc',
+      'utf8',
+    );
+    expect(displayPreferences).toContain('schema != kPreferenceSchema');
+    expect(displayPreferences).toContain('IsAllowedRemoteDisplayMode');
+    expect(displayPreferences).toContain('IsAllowedRemoteDisplayScale');
+    expect(peerSession).toContain('CDS_UPDATEREGISTRY');
+    expect(peerSession).toContain('SaveVirtualDisplayPreferences');
+    expect(virtualDisplayController).toContain('LoadVirtualDisplayPreferences');
     expect(sdkConsumer.indexOf('$TestSdk,'))
       .toBeLessThan(sdkConsumer.lastIndexOf('$ProductionSdk,'));
 

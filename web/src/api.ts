@@ -1455,10 +1455,12 @@ export async function uploadFile(
   clientUploadId?: string,
   signal?: AbortSignal,
   sessionName?: string,
+  destinationDirectory?: string,
 ): Promise<{ ok: boolean; attachment: AttachmentRefResponse }> {
   const form = new FormData();
   form.append('file', file);
   if (clientUploadId) form.append('clientUploadId', clientUploadId);
+  if (destinationDirectory) form.append('destinationDirectory', destinationDirectory);
   const browserUploadWeight = 50;
   const daemonDownloadWeight = 50;
 

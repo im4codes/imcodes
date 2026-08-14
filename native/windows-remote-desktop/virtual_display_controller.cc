@@ -6,6 +6,8 @@
 
 #include <atomic>
 
+#include "third_party/imcodes_remote_desktop/display_preferences.h"
+
 namespace imcodes::rd {
 namespace {
 
@@ -175,6 +177,8 @@ int ActivateVirtualDisplayForCurrentUser() {
 
   DEVMODEW mode{};
   mode.dmSize = sizeof(mode);
+  VirtualDisplayPreferences preferences{1920, 1080, 150};
+  LoadVirtualDisplayPreferences(&preferences);
   const bool attached =
       (device.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP) != 0;
   if (!EnumDisplaySettingsExW(
@@ -187,12 +191,13 @@ int ActivateVirtualDisplayForCurrentUser() {
     mode.dmDisplayFrequency = 60;
   }
   if (!attached) mode.dmPosition = SecondaryDisplayPosition(device.DeviceName);
-  if (attached && mode.dmPelsWidth == 1920 && mode.dmPelsHeight == 1080 &&
+  if (attached && mode.dmPelsWidth == static_cast<DWORD>(preferences.width) &&
+      mode.dmPelsHeight == static_cast<DWORD>(preferences.height) &&
       mode.dmDisplayFrequency == 60) {
     return 0;
   }
-  mode.dmPelsWidth = 1920;
-  mode.dmPelsHeight = 1080;
+  mode.dmPelsWidth = static_cast<DWORD>(preferences.width);
+  mode.dmPelsHeight = static_cast<DWORD>(preferences.height);
   mode.dmBitsPerPel = 32;
   mode.dmDisplayFrequency = 60;
   mode.dmFields = DM_POSITION | DM_PELSWIDTH | DM_PELSHEIGHT |

@@ -447,9 +447,10 @@ export async function uploadFileWithDirectFallback(options: {
   onProgress?: (pct: number) => void;
   onMode?: (mode: FileUploadTransportMode) => void;
   signal?: AbortSignal;
+  destinationDirectory?: string;
 }): Promise<{ ok: boolean; attachment: AttachmentRefResponse }> {
   const clientUploadId = crypto.randomUUID();
-  if (options.ws && supportsDirectUpload(options.ws)) {
+  if (options.ws && supportsDirectUpload(options.ws) && !options.destinationDirectory) {
     options.onMode?.(DIRECT_FILE_TRANSFER_STATE.CONNECTING);
     try {
       const result = await uploadFileDirect(
@@ -480,6 +481,17 @@ export async function uploadFileWithDirectFallback(options: {
     throw new DirectFileTransferFailure(DIRECT_FILE_TRANSFER_ERROR.RELAY_SIZE_LIMIT, false);
   }
   options.onMode?.(DIRECT_FILE_TRANSFER_STATE.RELAY);
+  if (options.destinationDirectory !== undefined) {
+    return uploadFile(
+      options.serverId,
+      options.file,
+      options.onProgress,
+      clientUploadId,
+      options.signal,
+      options.sessionName,
+      options.destinationDirectory,
+    );
+  }
   return options.sessionName
     ? uploadFile(options.serverId, options.file, options.onProgress, clientUploadId, options.signal, options.sessionName)
     : uploadFile(options.serverId, options.file, options.onProgress, clientUploadId, options.signal);

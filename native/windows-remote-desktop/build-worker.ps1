@@ -34,6 +34,7 @@ $ExpectedSources = @(
   'load-native-pins.ps1', 'initialize-hermetic-windows-git.ps1',
   'invoke-native-logged.ps1',
   'display_capture.cc', 'display_capture.h', 'display_capture_unittest.cc',
+  'display_preferences.cc', 'display_preferences.h',
   'ice_candidate_queue.cc', 'ice_candidate_queue.h',
   'ice_candidate_queue_unittest.cc',
   'input_injector.cc', 'input_injector.h', 'input_injector_unittest.cc',

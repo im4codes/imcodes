@@ -10,6 +10,7 @@ import { startControlledNodeSelfUpgrade } from './self-upgrade.js';
 import type { ControlledNodeCredential } from './enrollment.js';
 import {
   FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY,
+  FILE_TRANSFER_DIRECTORY_CAPABILITY,
   FILE_TRANSFER_MSG,
   FILE_TRANSFER_PATH_HANDLE_CAPABILITY,
   FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY,
@@ -19,6 +20,7 @@ import {
 import {
   handleFileDownload,
   handleFileDownloadStream,
+  handleFileDirectoryList,
   handleFilePathHandle,
   handleFileUploadFetch,
   handleFileDelete,
@@ -148,6 +150,7 @@ export function createControlledNodeRuntime(
         FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY,
         FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY,
         FILE_TRANSFER_PATH_HANDLE_CAPABILITY,
+        FILE_TRANSFER_DIRECTORY_CAPABILITY,
         MACHINE_DIRECT_FILE_TRANSFER_CAPABILITY,
         MACHINE_DIRECT_FILE_FETCH_CAPABILITY,
         CONTROLLED_NODE_SAFE_SELF_UPGRADE_CAPABILITY,
@@ -306,6 +309,7 @@ export function createControlledNodeRuntime(
       if (message.type === 'file.upload_fetch'
         || message.type === 'file.download'
         || message.type === FILE_TRANSFER_MSG.DOWNLOAD_STREAM
+        || message.type === FILE_TRANSFER_MSG.DIRECTORY_LIST
         || message.type === FILE_TRANSFER_MSG.PATH_HANDLE
         || message.type === FILE_TRANSFER_MSG.DELETE) {
         const parsed = validateControlledFileTransferRequest(message);
@@ -330,6 +334,8 @@ export function createControlledNodeRuntime(
           await handleFileDownloadStream(parsed.value as unknown as Record<string, unknown>, fileSender);
         } else if (parsed.value.type === FILE_TRANSFER_MSG.DELETE) {
           await handleFileDelete(parsed.value as unknown as Record<string, unknown>, fileSender);
+        } else if (parsed.value.type === FILE_TRANSFER_MSG.DIRECTORY_LIST) {
+          await handleFileDirectoryList(parsed.value as unknown as Record<string, unknown>, fileSender);
         } else {
           await handleFilePathHandle(parsed.value as unknown as Record<string, unknown>, fileSender);
         }

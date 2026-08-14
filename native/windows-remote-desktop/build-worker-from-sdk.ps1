@@ -132,7 +132,7 @@ $CompileArguments = @(
 ) + $Imsvc + $Defines + $IncludeArguments
 
 $ProductionSources = @(
-  'display_capture.cc', 'input_injector.cc', 'ice_candidate_queue.cc', 'json_protocol.cc',
+  'display_capture.cc', 'display_preferences.cc', 'input_injector.cc', 'ice_candidate_queue.cc', 'json_protocol.cc',
   'local_indicator.cc', 'mf_h264_encoder.cc', 'peer_session.cc', 'quality_ladder.cc',
   'worker_policy.cc', 'virtual_display_controller.cc', 'worker_main.cc'
 )

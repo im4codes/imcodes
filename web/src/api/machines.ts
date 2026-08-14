@@ -9,6 +9,11 @@
  * machines are included for display; the picker renders them non-selectable.
  */
 import {
+  FILE_TRANSFER_DIRECTORY_MAX_ENTRIES,
+  FILE_TRANSFER_PATH_MAX_BYTES,
+  type FileDirectoryEntry,
+} from '@shared/transport/file-transfer.js';
+import {
   compareControlledNodeArtifactPairs,
   CONTROLLED_NODE_MINT_ERRORS,
   controlledNodeArtifactKey,
@@ -90,6 +95,39 @@ export async function createMachineFileHandle(
   );
   if (!result.ok || !result.attachment) throw new Error('machine_file_handle_failed');
   return result.attachment;
+}
+
+export interface MachineDirectoryList {
+  resolvedPath: string;
+  entries: FileDirectoryEntry[];
+}
+
+export async function listMachineDirectories(
+  serverId: string,
+  path: string,
+  signal?: AbortSignal,
+): Promise<MachineDirectoryList> {
+  const result = await apiFetch<{ ok?: boolean; resolvedPath?: unknown; entries?: unknown }>(
+    `/api/server/${encodeURIComponent(serverId)}/machine-file-list`,
+    { method: 'POST', body: JSON.stringify({ path }), signal },
+  );
+  if (result.ok !== true
+    || typeof result.resolvedPath !== 'string'
+    || new TextEncoder().encode(result.resolvedPath).byteLength > FILE_TRANSFER_PATH_MAX_BYTES
+    || !Array.isArray(result.entries)
+    || result.entries.length > FILE_TRANSFER_DIRECTORY_MAX_ENTRIES) {
+    throw new Error('machine_file_list_failed');
+  }
+  const entries = result.entries.filter((entry): entry is FileDirectoryEntry => {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return false;
+    const candidate = entry as Partial<FileDirectoryEntry>;
+    return typeof candidate.name === 'string'
+      && typeof candidate.path === 'string'
+      && candidate.isDir === true
+      && typeof candidate.hidden === 'boolean';
+  });
+  if (entries.length !== result.entries.length) throw new Error('machine_file_list_failed');
+  return { resolvedPath: result.resolvedPath, entries };
 }
 
 const ENROLL_V2_AVAILABILITY_PATH = '/api/enroll/v2/availability';

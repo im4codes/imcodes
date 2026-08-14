@@ -4,6 +4,7 @@ import {
   FILE_TRANSFER_PATH_MAX_BYTES,
   validateControlledFileTransferRequest,
   validateControlledFileTransferResponse,
+  validateFileDirectoryListRequest,
   validateFilePathHandleRequest,
 } from '../shared/transport/file-transfer.js';
 
@@ -83,6 +84,53 @@ describe('controlled file-transfer trust boundary', () => {
       type: FILE_TRANSFER_MSG.DELETE_ERROR,
       requestId: 'delete-1',
       error: 'arbitrary_error',
+    }).ok).toBe(false);
+  });
+
+  it('strictly validates bounded directory-list requests and responses', () => {
+    expect(validateFileDirectoryListRequest({
+      type: FILE_TRANSFER_MSG.DIRECTORY_LIST,
+      requestId: 'directory-1',
+      path: 'C:\\Users',
+    }).ok).toBe(true);
+    expect(validateFileDirectoryListRequest({
+      type: FILE_TRANSFER_MSG.DIRECTORY_LIST,
+      requestId: 'directory-1',
+      path: 'C:\\Users',
+      recursive: true,
+    })).toEqual({ ok: false, error: 'unknown_field' });
+    expect(validateControlledFileTransferResponse({
+      type: FILE_TRANSFER_MSG.DIRECTORY_LIST_DONE,
+      requestId: 'directory-1',
+      path: 'C:\\Users',
+      resolvedPath: 'C:\\Users',
+      entries: [{ name: 'Public', path: 'C:\\Users\\Public', isDir: true, hidden: false }],
+    }).ok).toBe(true);
+    expect(validateControlledFileTransferResponse({
+      type: FILE_TRANSFER_MSG.DIRECTORY_LIST_DONE,
+      requestId: 'directory-1',
+      path: 'C:\\Users',
+      resolvedPath: 'C:\\Users',
+      entries: [{ name: 'Public', path: 'C:\\Users\\Public', isDir: true, hidden: false, size: 1 }],
+    }).ok).toBe(false);
+  });
+
+  it('accepts a bounded selected destination only on the upload-fetch shape', () => {
+    const base = {
+      type: FILE_TRANSFER_MSG.UPLOAD_FETCH,
+      uploadId: 'upload-destination',
+      filename: 'abcdef1234567890.txt',
+      originalName: 'report.txt',
+      size: 5,
+      downloadUrl: 'https://example.test/staged',
+    } as const;
+    expect(validateControlledFileTransferRequest({
+      ...base,
+      destinationDirectory: 'C:\\Users\\Public',
+    }).ok).toBe(true);
+    expect(validateControlledFileTransferRequest({
+      ...base,
+      destinationDirectory: 'x'.repeat(FILE_TRANSFER_PATH_MAX_BYTES + 1),
     }).ok).toBe(false);
   });
 });

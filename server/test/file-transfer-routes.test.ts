@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { Hono } from 'hono';
 import {
   FILE_TRANSFER_LIMITS,
+  FILE_TRANSFER_DIRECTORY_CAPABILITY,
   FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY,
   FILE_TRANSFER_PATH_HANDLE_CAPABILITY,
   FILE_TRANSFER_PATH_MAX_BYTES,
@@ -430,15 +431,71 @@ describe('file-transfer upload route', () => {
     expect(forwarded.expiresAt).not.toBe(beforeDispatch + offset);
   });
 
-  it('denies controlled-node file access from browser-style auth before dispatch', async () => {
+  it('allows an authorized interactive user to browse a controlled-node directory', async () => {
     queryOneMock.mockResolvedValue({ user_id: 'user-1', node_role: 'controlled', exec_enabled: true, revoked_at: null, access_role: 'owner' });
-    const res = await makeApp().request('/api/server/controlled-1/machine-file-handle', {
+    sendFileTransferRequestMock.mockResolvedValueOnce({
+      type: FILE_TRANSFER_MSG.DIRECTORY_LIST_DONE,
+      requestId: 'a'.repeat(32),
+      path: 'C:\\Users',
+      resolvedPath: 'C:\\Users',
+      entries: [{ name: 'Public', path: 'C:\\Users\\Public', isDir: true, hidden: false }],
+    });
+    const res = await makeApp().request('/api/server/controlled-1/machine-file-list', {
       method: 'POST',
       headers: { Authorization: 'Bearer browser', 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path: '/tmp/report.txt' }),
+      body: JSON.stringify({ path: 'C:\\Users' }),
     });
-    expect(res.status).toBe(403);
-    await expect(res.json()).resolves.toEqual({ error: 'scoped_auth' });
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toEqual({
+      ok: true,
+      resolvedPath: 'C:\\Users',
+      entries: [{ name: 'Public', path: 'C:\\Users\\Public', isDir: true, hidden: false }],
+    });
+    expect(hasDaemonCapabilityMock).toHaveBeenCalledWith(FILE_TRANSFER_DIRECTORY_CAPABILITY);
+    expect(sendFileTransferRequestMock).toHaveBeenCalledWith(
+      'a'.repeat(32),
+      expect.objectContaining({ type: FILE_TRANSFER_MSG.DIRECTORY_LIST, path: 'C:\\Users' }),
+      FILE_TRANSFER_LIMITS.DOWNLOAD_TIMEOUT_MS,
+      undefined,
+      1,
+    );
+  });
+
+  it('uses controlled Owner/Participant grants for interactive uploads instead of ordinary server membership', async () => {
+    mockResolveServerMemberAccessOrShareDeny.mockClear();
+    mockResolveServerMemberAccessOrShareDeny.mockResolvedValue({
+      ok: false,
+      reason: 'not_authorized_for_server',
+    });
+    queryOneMock.mockResolvedValue({
+      user_id: 'machine-owner', node_role: 'controlled', exec_enabled: true,
+      revoked_at: null, access_role: 'participant',
+    });
+    const participantForm = new FormData();
+    participantForm.append('file', new File(['hello'], 'hello.txt', { type: 'text/plain' }));
+    const participant = await makeApp().request('/api/server/controlled-1/upload', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer browser' },
+      body: participantForm,
+    });
+    expect(participant.status).toBe(200);
+    expect(mockResolveServerMemberAccessOrShareDeny).not.toHaveBeenCalled();
+    expect(sendFileTransferRequestMock).toHaveBeenCalledTimes(1);
+
+    sendFileTransferRequestMock.mockClear();
+    queryOneMock.mockResolvedValue({
+      user_id: 'machine-owner', node_role: 'controlled', exec_enabled: true,
+      revoked_at: null, access_role: 'viewer',
+    });
+    const viewerForm = new FormData();
+    viewerForm.append('file', new File(['denied'], 'denied.txt', { type: 'text/plain' }));
+    const viewer = await makeApp().request('/api/server/controlled-1/upload', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer browser' },
+      body: viewerForm,
+    });
+    expect(viewer.status).toBe(403);
+    await expect(viewer.json()).resolves.toEqual({ error: 'target_forbidden' });
     expect(sendFileTransferRequestMock).not.toHaveBeenCalled();
   });
 

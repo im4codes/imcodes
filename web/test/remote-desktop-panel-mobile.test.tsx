@@ -21,6 +21,7 @@ const releasePointerButtons = vi.fn();
 const acknowledgePresentedFrame = vi.fn(() => true);
 const setDisplayMode = vi.fn(() => true);
 const setDisplayScale = vi.fn(() => true);
+const setMode = vi.fn(() => true);
 const key = vi.fn(() => true);
 const text = vi.fn(() => true);
 const requestRemoteClipboard = vi.fn(async () => 'selected remotely');
@@ -66,7 +67,7 @@ vi.mock('../src/remote-desktop-client.js', () => ({
     wheel = wheel;
     key = key;
     text = text;
-    setMode = vi.fn();
+    setMode = setMode;
     selectDisplay = selectDisplay;
     setDisplayMode = setDisplayMode;
     setDisplayScale = setDisplayScale;
@@ -87,6 +88,7 @@ vi.mock('../src/direct-file-transfer.js', () => ({
 
 vi.mock('../src/api/machines.js', () => ({
   createMachineFileHandle: vi.fn(),
+  listMachineDirectories: vi.fn(),
 }));
 
 import { RemoteDesktopPanel } from '../src/components/RemoteDesktopPanel.js';
@@ -153,7 +155,10 @@ function mousePointer(
   target.dispatchEvent(event);
 }
 
-async function renderPanel(ws?: { targetsServer(serverId: string): boolean }) {
+async function renderPanel(
+  ws?: { targetsServer(serverId: string): boolean },
+  capabilities: string[] = [REMOTE_DESKTOP_CAPABILITY],
+) {
   const result = render(<RemoteDesktopPanel
     machine={{
       serverId: 'server-1',
@@ -163,7 +168,7 @@ async function renderPanel(ws?: { targetsServer(serverId: string): boolean }) {
       online: true,
       execEnabled: true,
       accessRole: 'owner',
-      capabilities: [REMOTE_DESKTOP_CAPABILITY],
+      capabilities,
     }}
     ws={ws as never}
     onClose={vi.fn()}
@@ -247,6 +252,7 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     });
     const ws = { targetsServer: vi.fn(() => true) };
     const { container, getByRole } = await renderPanel(ws);
+    act(() => { (getByRole('button', { name: 'remote_desktop.files' }) as HTMLButtonElement).click(); });
     const input = container.querySelector('input[type="file"]') as HTMLInputElement;
     const file = new File(['payload'], 'report.txt', { type: 'text/plain' });
     Object.defineProperty(input, 'files', { value: [file], configurable: true });
@@ -271,7 +277,8 @@ describe('RemoteDesktopPanel mobile gestures', () => {
       options.onProgress?.(100);
       return { ok: true, attachment: { id: 'attachment-1' } };
     });
-    const { container } = await renderPanel();
+    const { container, getByRole } = await renderPanel();
+    act(() => { (getByRole('button', { name: 'remote_desktop.files' }) as HTMLButtonElement).click(); });
     const input = container.querySelector('input[type="file"]') as HTMLInputElement;
     Object.defineProperty(input, 'files', {
       value: [new File(['payload'], 'relay.txt')],
@@ -422,6 +429,36 @@ describe('RemoteDesktopPanel mobile gestures', () => {
       alt: false,
     });
 
+    key.mockClear();
+    const selectAll = new KeyboardEvent('keydown', {
+      bubbles: true,
+      cancelable: true,
+      code: 'KeyA',
+      key: 'a',
+      ctrlKey: true,
+    });
+    act(() => stage.dispatchEvent(selectAll));
+    expect(selectAll.defaultPrevented).toBe(true);
+    expect(key).toHaveBeenCalledWith('KeyA', 'a', true, false, {
+      control: true,
+      alt: false,
+    });
+
+    key.mockClear();
+    const escape = new KeyboardEvent('keydown', {
+      bubbles: true,
+      cancelable: true,
+      code: 'Escape',
+      key: 'Escape',
+    });
+    act(() => stage.dispatchEvent(escape));
+    expect(escape.defaultPrevented).toBe(true);
+    expect(key).toHaveBeenCalledWith('Escape', 'Escape', true, false, {
+      control: false,
+      alt: false,
+    });
+    expect(setMode).not.toHaveBeenCalled();
+
     const pasteEvent = new Event('paste', { bubbles: true, cancelable: true });
     Object.defineProperty(pasteEvent, 'clipboardData', {
       value: { getData: vi.fn(() => 'pasted from event') },
@@ -442,6 +479,32 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     });
     expect(requestRemoteClipboard).toHaveBeenCalledTimes(1);
     expect(navigator.clipboard.writeText).toHaveBeenCalledWith('selected remotely');
+  });
+
+  it('opens an icon-only mobile IME surface and sends common shortcut chords', async () => {
+    const { container, getByRole } = await renderPanel();
+    const keyboardButton = getByRole('button', { name: 'remote_desktop.mobile_keyboard' });
+    expect(keyboardButton.textContent).toBe('⌨');
+    act(() => { (keyboardButton as HTMLButtonElement).click(); });
+
+    const input = getByRole('textbox', { name: 'remote_desktop.mobile_text_input' }) as HTMLTextAreaElement;
+    input.focus();
+    expect(document.activeElement).toBe(input);
+    input.value = '你好';
+    act(() => input.dispatchEvent(new InputEvent('input', { bubbles: true, data: '你好' })));
+    expect(text).toHaveBeenCalledWith('你好');
+
+    key.mockClear();
+    act(() => {
+      (getByRole('button', { name: 'remote_desktop.shortcut_select_all' }) as HTMLButtonElement).click();
+    });
+    expect(key.mock.calls).toEqual([
+      ['ControlLeft', 'Control', true, false, { control: true, alt: false }],
+      ['KeyA', 'a', true, false, { control: true, alt: false }],
+      ['KeyA', 'a', false, false, { control: true, alt: false }],
+      ['ControlLeft', 'Control', false, false, { control: true, alt: false }],
+    ]);
+    expect(container.querySelector('.remote-desktop-mobile-keyboard')).not.toBeNull();
   });
 
   it('opens the focused display resolution menu from the keyboard context-menu gesture', async () => {
@@ -769,7 +832,7 @@ describe('RemoteDesktopPanel mobile gestures', () => {
 
   it('stops retrying after the bounded budget for one continuous outage', async () => {
     vi.useFakeTimers();
-    const { container } = await renderPanel();
+    const { container, getByRole } = await renderPanel();
     const failed = {
       state: REMOTE_DESKTOP_STATE.FAILED,
       mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW,
@@ -802,6 +865,12 @@ describe('RemoteDesktopPanel mobile gestures', () => {
       );
     });
     expect(clientHooks).toHaveLength(REMOTE_DESKTOP_LIMITS.MAX_RECONNECT_ATTEMPTS + 1);
+
+    act(() => {
+      (getByRole('button', { name: 'remote_desktop.retry' }) as HTMLButtonElement).click();
+    });
+    expect(clientHooks).toHaveLength(REMOTE_DESKTOP_LIMITS.MAX_RECONNECT_ATTEMPTS + 2);
+    expect(container.textContent).toContain('remote_desktop.state.reconnecting');
   });
 
   it('treats a local-user Stop as terminal instead of reconnecting', async () => {

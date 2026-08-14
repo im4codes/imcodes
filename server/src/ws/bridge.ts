@@ -7228,6 +7228,7 @@ export class WsBridge {
       || parsedType === FILE_TRANSFER_MSG.DOWNLOAD
       || parsedType === FILE_TRANSFER_MSG.DOWNLOAD_STREAM
       || parsedType === FILE_TRANSFER_MSG.PATH_HANDLE
+      || parsedType === FILE_TRANSFER_MSG.DIRECTORY_LIST
       || parsedType === FILE_TRANSFER_MSG.DELETE
       || parsedType === MACHINE_DIRECT_FILE_TRANSFER_MSG.REQUEST
       || parsedType === MACHINE_DIRECT_FILE_TRANSFER_MSG.FETCH_REQUEST

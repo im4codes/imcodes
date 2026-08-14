@@ -10,6 +10,8 @@ rtc_executable("imcodes_remote_desktop_worker") {
   sources = [
     "display_capture.cc",
     "display_capture.h",
+    "display_preferences.cc",
+    "display_preferences.h",
     "input_injector.cc",
     "input_injector.h",
     "ice_candidate_queue.cc",
