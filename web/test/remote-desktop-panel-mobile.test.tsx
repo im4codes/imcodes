@@ -132,7 +132,7 @@ function pointer(
 function mousePointer(
   target: Element,
   type: 'pointerdown' | 'pointermove' | 'pointerup' | 'pointercancel' | 'pointerenter' | 'pointerleave' | 'lostpointercapture',
-  values: { pointerId: number; clientX: number; clientY: number; button?: number },
+  values: { pointerId: number; clientX: number; clientY: number; button?: number; metaKey?: boolean },
 ): void {
   const eventName = type === 'pointerdown' && !('onpointerdown' in target)
     ? 'PointerDown'
@@ -155,6 +155,7 @@ function mousePointer(
     clientX: values.clientX,
     clientY: values.clientY,
     button: values.button ?? 0,
+    metaKey: values.metaKey ?? false,
   });
   Object.defineProperties(event, {
     pointerId: { value: values.pointerId },
@@ -166,6 +167,12 @@ function mousePointer(
 async function renderPanel(
   ws?: { targetsServer(serverId: string): boolean },
   capabilities: string[] = [REMOTE_DESKTOP_CAPABILITY],
+  panelProps: {
+    minimized?: boolean;
+    onMinimize?: () => void;
+    onRestore?: () => void;
+    onClose?: () => void;
+  } = {},
 ) {
   const result = render(<RemoteDesktopPanel
     machine={{
@@ -179,7 +186,10 @@ async function renderPanel(
       capabilities,
     }}
     ws={ws as never}
-    onClose={vi.fn()}
+    onClose={panelProps.onClose ?? vi.fn()}
+    minimized={panelProps.minimized}
+    onMinimize={panelProps.onMinimize}
+    onRestore={panelProps.onRestore}
   />);
   await act(async () => { await Promise.resolve(); });
   const stage = result.container.querySelector('.remote-desktop-stage') as HTMLDivElement;
@@ -206,6 +216,53 @@ async function renderPanel(
 }
 
 describe('RemoteDesktopPanel mobile gestures', () => {
+  it('uses shared window controls and minimizes without stopping the live desktop', async () => {
+    const onMinimize = vi.fn();
+    const onRestore = vi.fn();
+    const onClose = vi.fn();
+    const result = await renderPanel(undefined, [REMOTE_DESKTOP_CAPABILITY], {
+      onMinimize,
+      onRestore,
+      onClose,
+    });
+
+    const maximize = result.getByRole('button', { name: 'window.maximize' });
+    expect(maximize.classList.contains('subsession-minimize-btn')).toBe(true);
+    act(() => (maximize as HTMLButtonElement).click());
+    expect(result.getByRole('button', { name: 'window.restore' })).toBeTruthy();
+
+    const minimize = result.getByRole('button', { name: 'window.minimize' });
+    expect(minimize.classList.contains('subsession-minimize-btn')).toBe(true);
+    act(() => (minimize as HTMLButtonElement).click());
+    expect(releaseAll).toHaveBeenCalled();
+    expect(stop).not.toHaveBeenCalled();
+    expect(onMinimize).toHaveBeenCalledTimes(1);
+    expect(onClose).not.toHaveBeenCalled();
+
+    result.rerender(<RemoteDesktopPanel
+      machine={{
+        serverId: 'server-1',
+        refName: 'controlled-1',
+        displayName: 'Windows',
+        os: 'win',
+        online: true,
+        execEnabled: true,
+        accessRole: 'owner',
+        capabilities: [REMOTE_DESKTOP_CAPABILITY],
+      }}
+      minimized
+      onMinimize={onMinimize}
+      onRestore={onRestore}
+      onClose={onClose}
+    />);
+    expect(result.container.querySelector('.remote-desktop-window-host')?.hasAttribute('hidden')).toBe(true);
+    act(() => (result.getByRole('button', { name: 'remote_desktop.title' }) as HTMLButtonElement).click());
+    expect(onRestore).toHaveBeenCalledTimes(1);
+
+    const stopButton = result.container.querySelector('.remote-desktop-stop');
+    expect(stopButton?.classList.contains('subsession-close-btn')).toBe(true);
+  });
+
   it('uses the shared desktop window chrome for header drag and eight-way resize', async () => {
     Object.defineProperties(window, {
       innerWidth: { value: 1600, configurable: true },
@@ -636,28 +693,75 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     expect(releaseAll).not.toHaveBeenCalled();
   });
 
-  it('shows a remote pointer target that follows the local desktop pointer without hiding it', async () => {
+  it('maps Mac Command drag to a pure Windows middle-button drag', async () => {
+    const originalPlatform = navigator.platform;
+    Object.defineProperty(navigator, 'platform', {
+      configurable: true,
+      value: 'MacIntel',
+    });
+    try {
+      const { stage } = await renderPanel();
+      act(() => stage.dispatchEvent(new KeyboardEvent('keydown', {
+        bubbles: true,
+        cancelable: true,
+        code: 'MetaLeft',
+        key: 'Meta',
+        metaKey: true,
+      })));
+      expect(key).toHaveBeenCalledWith('ControlLeft', 'Control', true, false, {
+        control: true,
+        alt: false,
+      });
+
+      mousePointer(stage, 'pointerdown', {
+        pointerId: 19, clientX: 200, clientY: 150, metaKey: true,
+      });
+      mousePointer(stage, 'pointermove', {
+        pointerId: 19, clientX: 300, clientY: 150, metaKey: true,
+      });
+      mousePointer(stage, 'pointerup', {
+        pointerId: 19, clientX: 300, clientY: 150, metaKey: false,
+      });
+      act(() => stage.dispatchEvent(new KeyboardEvent('keyup', {
+        bubbles: true,
+        cancelable: true,
+        code: 'MetaLeft',
+        key: 'Meta',
+      })));
+
+      expect(pointerButton).toHaveBeenNthCalledWith(1, 'middle', true, 0.5, 0.5);
+      expect(pointerButton).toHaveBeenNthCalledWith(2, 'middle', false, expect.any(Number), 0.5);
+      expect(pointerButton.mock.calls[1]?.[2]).toBeCloseTo(0.7593, 4);
+      expect(pointerMove).toHaveBeenCalledWith(expect.any(Number), 0.5);
+      expect(pointerMove.mock.calls[0]?.[0]).toBeCloseTo(0.7593, 4);
+      expect(key.mock.calls).toEqual([
+        ['ControlLeft', 'Control', true, false, { control: true, alt: false }],
+        ['ControlLeft', 'Control', false, false, { control: false, alt: false }],
+      ]);
+      expect(pointerButton).not.toHaveBeenCalledWith('left', true, expect.anything(), expect.anything());
+    } finally {
+      Object.defineProperty(navigator, 'platform', {
+        configurable: true,
+        value: originalPlatform,
+      });
+    }
+  });
+
+  it('sends the real remote pointer and keeps a sticky target zone at every video edge', async () => {
     const { container, stage } = await renderPanel();
     pointerMove.mockClear();
     act(() => {
       mousePointer(stage, 'pointermove', {
-        pointerId: 18, clientX: 200, clientY: 150,
+        pointerId: 18, clientX: 4, clientY: 150,
+      });
+      mousePointer(stage, 'pointermove', {
+        pointerId: 18, clientX: 396, clientY: 150,
       });
     });
 
-    expect(pointerMove).toHaveBeenCalledWith(0.5, 0.5);
-    const pointerTarget = container.querySelector('.remote-desktop-pointer-follow') as HTMLDivElement;
-    expect(pointerTarget.hidden).toBe(false);
-    expect(pointerTarget.style.left).toBe('200px');
-    expect(pointerTarget.style.top).toBe('150px');
+    expect(pointerMove.mock.calls).toEqual([[0, 0.5], [1, 0.5]]);
+    expect(container.querySelector('.remote-desktop-pointer-follow')).toBeNull();
     expect(getComputedStyle(stage).cursor).not.toBe('none');
-
-    act(() => {
-      mousePointer(stage, 'pointerleave', {
-        pointerId: 18, clientX: 401, clientY: 150,
-      });
-    });
-    expect(pointerTarget.hidden).toBe(true);
   });
 
   it('acknowledges only a browser-presented decoded video frame', async () => {

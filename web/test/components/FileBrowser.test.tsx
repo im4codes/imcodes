@@ -866,6 +866,38 @@ describe('FileBrowser', () => {
     await waitFor(() => expect(getByText('Copied!')).toBeDefined());
   });
 
+  it('keeps desktop copy-path and select actions visible beside the current path', async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    const onConfirm = vi.fn();
+    const currentPath = '/home/user/projects';
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: { writeText },
+    });
+    const { ws, respond } = makeWsFactory();
+    const { container } = render(
+      <FileBrowser ws={ws} mode="dir-only" layout="panel" initialPath={currentPath} onConfirm={onConfirm} />,
+    );
+
+    await act(async () => {
+      respond([], currentPath);
+    });
+
+    const actions = container.querySelector('.fb-breadcrumb-actions') as HTMLElement;
+    const [copyButton, selectButton] = Array.from(actions.querySelectorAll<HTMLButtonElement>('button'));
+    expect(copyButton?.getAttribute('aria-label')).toBe('Copy path');
+    expect(selectButton?.getAttribute('aria-label')).toBe('Select');
+
+    await act(async () => {
+      copyButton?.click();
+      await Promise.resolve();
+    });
+    selectButton?.click();
+
+    expect(writeText).toHaveBeenCalledWith(currentPath);
+    expect(onConfirm).toHaveBeenCalledWith([currentPath]);
+  });
+
   it('deselects a path when clicked again in multi-select', async () => {
     const { ws, respond } = makeWsFactory();
     const { getByText } = render(

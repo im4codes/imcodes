@@ -409,6 +409,7 @@ describe('ControlledNodesPanel (12.3)', () => {
   });
 
   it('opens the Remote Desktop panel from the machine action', async () => {
+    const onOpenRemoteDesktop = vi.fn();
     machines = [
       machine({
         serverId: 'desktop-ready',
@@ -419,13 +420,19 @@ describe('ControlledNodesPanel (12.3)', () => {
         capabilities: [REMOTE_DESKTOP_CAPABILITY],
       }),
     ];
-    const { container } = render(<ControlledNodesPanel />);
+    const { container } = render(
+      <ControlledNodesPanel onOpenRemoteDesktop={onOpenRemoteDesktop} />,
+    );
     await waitFor(() => expect(container.querySelector('.controlled-nodes-remote-desktop')).not.toBeNull());
 
     fireEvent.click(container.querySelector('.controlled-nodes-remote-desktop')!);
 
-    await waitFor(() => expect(container.querySelector('.remote-desktop-panel')).not.toBeNull());
-    expect(container.textContent).toContain('Desktop Ready');
+    expect(onOpenRemoteDesktop).toHaveBeenCalledTimes(1);
+    expect(onOpenRemoteDesktop).toHaveBeenCalledWith(expect.objectContaining({
+      serverId: 'desktop-ready',
+      displayName: 'Desktop Ready',
+    }));
+    expect(container.querySelector('.remote-desktop-panel')).toBeNull();
   });
 
   it('renames only the mutable display name and refreshes the list', async () => {

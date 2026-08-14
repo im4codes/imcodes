@@ -569,7 +569,28 @@ vi.mock('../src/components/SharedContextManagementPanel.js', () => ({
   ),
 }));
 vi.mock('../src/components/ControlledNodesPanel.js', () => ({
-  ControlledNodesPanel: textComponent('controlled-nodes-panel'),
+  ControlledNodesPanel: ({ onOpenRemoteDesktop }: any) => (
+    <button onClick={() => onOpenRemoteDesktop?.({
+      serverId: 'desktop-1',
+      refName: 'desktop-ref',
+      displayName: 'Desktop One',
+      os: 'win',
+      online: true,
+      execEnabled: true,
+      accessRole: 'owner',
+      capabilities: [],
+    })}>controlled-nodes-panel</button>
+  ),
+}));
+vi.mock('../src/components/RemoteDesktopPanel.js', () => ({
+  RemoteDesktopPanel: ({ minimized, onMinimize, onRestore, onClose }: any) => (
+    <div data-testid="remote-desktop-panel">
+      remote-desktop-panel:{String(minimized)}
+      <button onClick={onMinimize}>remote-desktop-minimize</button>
+      <button onClick={onRestore}>remote-desktop-restore</button>
+      <button onClick={onClose}>remote-desktop-close</button>
+    </div>
+  ),
 }));
 vi.mock('../src/components/ContextDiagnosticsPanel.js', () => ({
   ContextDiagnosticsPanel: ({ onStateChange }: any) => (
@@ -1029,6 +1050,21 @@ describe('App shell', () => {
 
     fireEvent.click(screen.getByText('controlled_nodes.title'));
     await waitFor(() => expect(panelZ()).toBeGreaterThan(subZ()));
+
+    fireEvent.click(screen.getByText('controlled-nodes-panel'));
+    expect(await screen.findByText('remote-desktop-panel:false')).toBeTruthy();
+
+    const closeControlledNodes = Array.from(panel.querySelectorAll('button'))
+      .find((button) => button.textContent === 'floating-close');
+    expect(closeControlledNodes).toBeTruthy();
+    fireEvent.click(closeControlledNodes!);
+    await waitFor(() => expect(screen.queryByTestId('floating-panel-controlled-nodes')).toBeNull());
+    expect(screen.getByText('remote-desktop-panel:false')).toBeTruthy();
+
+    fireEvent.click(screen.getByText('remote-desktop-minimize'));
+    expect(await screen.findByText('remote-desktop-panel:true')).toBeTruthy();
+    fireEvent.click(screen.getByText('remote-desktop-restore'));
+    expect(await screen.findByText('remote-desktop-panel:false')).toBeTruthy();
   }, 20_000);
 
   it('keeps the mobile server menu available on wide-viewport Android browsers', async () => {

@@ -1578,6 +1578,20 @@ export function FileBrowser({
     onConfirm([...selectedPaths]);
   };
 
+  const copyCurrentPath = useCallback(() => {
+    const path = currentLabel;
+    void (async () => {
+      try {
+        await navigator.clipboard.writeText(path);
+        setCopiedPath(path);
+        setTimeout(() => setCopiedPath((cur) => (cur === path ? null : cur)), 1500);
+      } catch {
+        // Clipboard access can be blocked in insecure contexts; keep the
+        // file picker usable and leave the path visible in the title.
+      }
+    })();
+  }, [currentLabel]);
+
   const title = mode === 'dir-only' ? t('file_browser.title_dir') : t('file_browser.title_file');
   const confirmLabel = mode === 'dir-only'
     ? t('file_browser.select')
@@ -1969,19 +1983,7 @@ export function FileBrowser({
       <button
         class="btn btn-secondary fb-footer-copy-path"
         title={currentLabel}
-        onClick={() => {
-          const path = currentLabel;
-          void (async () => {
-            try {
-              await navigator.clipboard.writeText(path);
-              setCopiedPath(path);
-              setTimeout(() => setCopiedPath((cur) => (cur === path ? null : cur)), 1500);
-            } catch {
-              // Clipboard access can be blocked in insecure contexts; keep the
-              // file picker usable and leave the path visible in the title.
-            }
-          })();
-        }}
+        onClick={copyCurrentPath}
       >
         {copiedPath === currentLabel ? t('fileBrowser.copied') : t('fileBrowser.copyPath')}
       </button>
@@ -2185,6 +2187,23 @@ export function FileBrowser({
               </>
             );
           })}
+        </div>
+        <div class="fb-breadcrumb-actions">
+          <button
+            type="button"
+            class="fb-breadcrumb-action"
+            title={currentLabel}
+            aria-label={copiedPath === currentLabel ? t('fileBrowser.copied') : t('fileBrowser.copyPath')}
+            onClick={copyCurrentPath}
+          >{copiedPath === currentLabel ? '✓' : '⧉'}</button>
+          <button
+            type="button"
+            class="fb-breadcrumb-action is-primary"
+            aria-label={confirmLabel}
+            disabled={(mode === 'dir-only' && isAtDrives)
+              || (mode !== 'dir-only' && selectedPaths.size === 0)}
+            onClick={handleConfirm}
+          >✓</button>
         </div>
       </div>
     </div>

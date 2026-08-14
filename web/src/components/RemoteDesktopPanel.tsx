@@ -27,13 +27,16 @@ import {
 import { RemoteDesktopClient, type RemoteDesktopSnapshot } from '../remote-desktop-client.js';
 import {
   REMOTE_DESKTOP_MOBILE_SHORTCUTS,
+  isAppleControllerPlatform,
   mapRemoteDesktopKeyboardEvent,
+  readControllerPlatform,
   remoteDesktopShortcutLabel,
   sendRemoteDesktopChord,
 } from '../remote-desktop-keyboard.js';
 import { copyToClipboard } from '../util/clipboard.js';
 import type { WsClient } from '../ws-client.js';
 import { FloatingPanel } from './FloatingPanel.js';
+import { DesktopWindowMaximizeButton } from './DesktopWindowMaximizeButton.js';
 import { FileBrowser } from './FileBrowser.js';
 import {
   INITIAL_REMOTE_DESKTOP_VIEWPORT,
@@ -114,6 +117,7 @@ const MAX_REMOTE_DESKTOP_RECONNECTS = REMOTE_DESKTOP_LIMITS.MAX_RECONNECT_ATTEMP
 const TOUCH_LONG_PRESS_MS = 550;
 const TOUCH_DOUBLE_TAP_MS = 400;
 const TOUCH_DOUBLE_TAP_DISTANCE_PX = 32;
+const DESKTOP_POINTER_EDGE_STICKY_RATIO = 0.018;
 const RECONNECTABLE_REMOTE_DESKTOP_FAILURES = new Set<string>([
   REMOTE_DESKTOP_ERROR.DAEMON_OFFLINE,
   REMOTE_DESKTOP_ERROR.NEGOTIATION_TIMEOUT,
@@ -156,6 +160,16 @@ function activeRemoteDesktopConnectionStep(
   }
 }
 
+function stickRemoteDesktopPointerToEdges(point: TouchPoint): TouchPoint {
+  const edge = DESKTOP_POINTER_EDGE_STICKY_RATIO;
+  const stick = (value: number) => {
+    if (value <= edge) return 0;
+    if (value >= 1 - edge) return 1;
+    return (value - edge) / (1 - (edge * 2));
+  };
+  return { x: stick(point.x), y: stick(point.y) };
+}
+
 export function canOpenRemoteDesktop(machine: MachineListItem): boolean {
   const role = machine.accessRole ?? 'owner';
   return machine.os === 'win'
@@ -168,6 +182,9 @@ export function canOpenRemoteDesktop(machine: MachineListItem): boolean {
 export interface RemoteDesktopPanelProps {
   machine: MachineListItem;
   ws?: WsClient | null;
+  minimized?: boolean;
+  onMinimize?(): void;
+  onRestore?(): void;
   onClose(): void;
 }
 
@@ -179,7 +196,14 @@ interface RemoteDesktopTransferRow {
   status: 'transferring' | 'done' | 'canceled' | 'error';
 }
 
-export function RemoteDesktopPanel({ machine, ws = null, onClose }: RemoteDesktopPanelProps) {
+export function RemoteDesktopPanel({
+  machine,
+  ws = null,
+  minimized = false,
+  onMinimize,
+  onRestore,
+  onClose,
+}: RemoteDesktopPanelProps) {
   const { t } = useTranslation();
   const [snapshot, setSnapshot] = useState<RemoteDesktopSnapshot>(INITIAL_SNAPSHOT);
   const [viewScale, setViewScale] = useState<ViewScale>('fit');
@@ -198,12 +222,11 @@ export function RemoteDesktopPanel({ machine, ws = null, onClose }: RemoteDeskto
   const [mobileTextOpen, setMobileTextOpen] = useState(false);
   const [displayModeMenu, setDisplayModeMenu] = useState<DisplayModeMenuState | null>(null);
   const [clipboardStatus, setClipboardStatus] = useState<ClipboardStatus>('idle');
-  const [desktopPointerVisible, setDesktopPointerVisible] = useState(false);
   const [mediaPresented, setMediaPresented] = useState(false);
+  const [desktopMaximized, setDesktopMaximized] = useState(false);
   const clientRef = useRef<RemoteDesktopClient | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const stageRef = useRef<HTMLDivElement | null>(null);
-  const desktopPointerRef = useRef<HTMLDivElement | null>(null);
   const panelRef = useRef<HTMLDivElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const mobileTextInputRef = useRef<HTMLTextAreaElement | null>(null);
@@ -236,7 +259,9 @@ export function RemoteDesktopPanel({ machine, ws = null, onClose }: RemoteDeskto
   const previousInputEnabledRef = useRef(false);
   const mediaPresentedRef = useRef(false);
   const forwardedCommandCodesRef = useRef(new Set<string>());
+  const suppressedCommandCodesRef = useRef(new Set<string>());
   const syntheticCommandControlRef = useRef(false);
+  const commandMiddleDragPointerRef = useRef<number | null>(null);
   const forwardedPasteShortcutAtRef = useRef(0);
   const supportsDirectoryTransfer = Boolean(machine.capabilities?.includes(FILE_TRANSFER_DIRECTORY_CAPABILITY));
 
@@ -431,6 +456,10 @@ export function RemoteDesktopPanel({ machine, ws = null, onClose }: RemoteDeskto
     previousInputEnabledRef.current = snapshot.inputEnabled;
     if (snapshot.inputEnabled || !wasEnabled) return;
     clientRef.current?.releaseAll();
+    forwardedCommandCodesRef.current.clear();
+    suppressedCommandCodesRef.current.clear();
+    syntheticCommandControlRef.current = false;
+    commandMiddleDragPointerRef.current = null;
     heldVirtualButtonsRef.current.clear();
     touchPointsRef.current.clear();
     if (touchGestureRef.current?.kind === 'single' && touchGestureRef.current.longPressTimer) {
@@ -497,6 +526,11 @@ export function RemoteDesktopPanel({ machine, ws = null, onClose }: RemoteDeskto
   const normalizedPoint = useCallback((event: PointerEvent | WheelEvent) => (
     normalizedClientPoint(event.clientX, event.clientY)
   ), [normalizedClientPoint]);
+
+  const normalizedDesktopPointerPoint = useCallback((event: PointerEvent) => {
+    const point = normalizedClientPoint(event.clientX, event.clientY);
+    return point ? stickRemoteDesktopPointerToEdges(point) : null;
+  }, [normalizedClientPoint]);
 
   const setMode = (mode: typeof REMOTE_DESKTOP_ACCESS_MODE[keyof typeof REMOTE_DESKTOP_ACCESS_MODE]) => {
     clientRef.current?.setMode(mode);
@@ -964,22 +998,26 @@ export function RemoteDesktopPanel({ machine, ws = null, onClose }: RemoteDeskto
       onTouchMove(event);
       return;
     }
-    const point = normalizedPoint(event);
-    if (!point) {
-      setDesktopPointerVisible(false);
-      return;
-    }
-    const stage = stageRef.current;
-    const pointer = desktopPointerRef.current;
-    if (stage && pointer && snapshot.inputEnabled) {
-      const rect = stage.getBoundingClientRect();
-      pointer.style.left = `${event.clientX - rect.left}px`;
-      pointer.style.top = `${event.clientY - rect.top}px`;
-      setDesktopPointerVisible(true);
-    } else {
-      setDesktopPointerVisible(false);
-    }
+    const point = normalizedDesktopPointerPoint(event);
+    if (!point) return;
     clientRef.current?.pointerMove(point.x, point.y);
+  };
+
+  const suppressCommandControlForMiddleDrag = () => {
+    const client = clientRef.current;
+    if (!client) return;
+    const controlCodes = new Set(forwardedCommandCodesRef.current);
+    if (syntheticCommandControlRef.current) controlCodes.add('ControlLeft');
+    let released = true;
+    for (const code of controlCodes) {
+      suppressedCommandCodesRef.current.add(code);
+      if (!client.key(code, 'Control', false, false, { control: false, alt: false })) {
+        released = false;
+      }
+    }
+    forwardedCommandCodesRef.current.clear();
+    syntheticCommandControlRef.current = false;
+    if (!released) client.releaseAll();
   };
 
   const onPointerButton = (event: PointerEvent, down: boolean) => {
@@ -991,20 +1029,33 @@ export function RemoteDesktopPanel({ machine, ws = null, onClose }: RemoteDeskto
       else onTouchEnd(event);
       return;
     }
-    const button = event.button === 0 ? 'left'
+    const startsCommandMiddleDrag = down
+      && event.button === 0
+      && event.metaKey
+      && isAppleControllerPlatform(readControllerPlatform());
+    const continuingCommandMiddleDrag = !down
+      && commandMiddleDragPointerRef.current === event.pointerId;
+    const button = startsCommandMiddleDrag || continuingCommandMiddleDrag ? 'middle'
+      : event.button === 0 ? 'left'
       : event.button === 1 ? 'middle'
         : event.button === 2 ? 'right'
           : event.button === 3 ? 'back'
             : event.button === 4 ? 'forward'
               : null;
     if (!button) return;
-    const point = normalizedPoint(event);
+    const point = normalizedDesktopPointerPoint(event);
     if (down && !point) return;
     event.preventDefault();
     if (down) {
       (event.currentTarget as HTMLElement).setPointerCapture?.(event.pointerId);
+      if (startsCommandMiddleDrag) {
+        suppressCommandControlForMiddleDrag();
+        commandMiddleDragPointerRef.current = event.pointerId;
+      }
     }
-    clientRef.current?.pointerButton(button, down, point?.x, point?.y);
+    const sent = clientRef.current?.pointerButton(button, down, point?.x, point?.y) ?? false;
+    if (startsCommandMiddleDrag && !sent) commandMiddleDragPointerRef.current = null;
+    if (continuingCommandMiddleDrag) commandMiddleDragPointerRef.current = null;
   };
 
   const onWheel = (event: WheelEvent) => {
@@ -1020,6 +1071,13 @@ export function RemoteDesktopPanel({ machine, ws = null, onClose }: RemoteDeskto
     const mapped = mapRemoteDesktopKeyboardEvent(event);
     if (!client || !mapped) return;
     const commandEvent = event.code === 'MetaLeft' || event.code === 'MetaRight';
+    if (mapped.commandAsControl && commandEvent
+      && suppressedCommandCodesRef.current.has(mapped.code)
+      && !syntheticCommandControlRef.current) {
+      if (!down) suppressedCommandCodesRef.current.delete(mapped.code);
+      event.preventDefault();
+      return;
+    }
     if (mapped.commandAsControl && commandEvent) {
       if (down) forwardedCommandCodesRef.current.add(mapped.code);
       else forwardedCommandCodesRef.current.delete(mapped.code);
@@ -1030,6 +1088,7 @@ export function RemoteDesktopPanel({ machine, ws = null, onClose }: RemoteDeskto
     } else if (mapped.commandAsControl && event.metaKey
       && forwardedCommandCodesRef.current.size === 0
       && !syntheticCommandControlRef.current) {
+      suppressedCommandCodesRef.current.clear();
       syntheticCommandControlRef.current = client.key(
         'ControlLeft',
         'Control',
@@ -1057,7 +1116,9 @@ export function RemoteDesktopPanel({ machine, ws = null, onClose }: RemoteDeskto
 
   const releaseCapturedInput = () => {
     forwardedCommandCodesRef.current.clear();
+    suppressedCommandCodesRef.current.clear();
     syntheticCommandControlRef.current = false;
+    commandMiddleDragPointerRef.current = null;
     forwardedPasteShortcutAtRef.current = 0;
     clientRef.current?.releaseAll();
   };
@@ -1098,6 +1159,12 @@ export function RemoteDesktopPanel({ machine, ws = null, onClose }: RemoteDeskto
   const stopAndClose = () => {
     clientRef.current?.stop();
     onClose();
+  };
+
+  const minimizePanel = () => {
+    releaseCapturedInput();
+    setDesktopMaximized(false);
+    onMinimize?.();
   };
 
   const toggleFullscreen = async () => {
@@ -1220,7 +1287,9 @@ export function RemoteDesktopPanel({ machine, ws = null, onClose }: RemoteDeskto
   const activeConnectionStep = activeRemoteDesktopConnectionStep(snapshot, currentStreamPresented);
 
   return (
-    <FloatingPanel
+    <>
+      <div class="remote-desktop-window-host" hidden={minimized}>
+        <FloatingPanel
       id={`remote-desktop-${machine.serverId}`}
       title={t('remote_desktop.title', { machine: machine.displayName })}
       onClose={stopAndClose}
@@ -1229,6 +1298,9 @@ export function RemoteDesktopPanel({ machine, ws = null, onClose }: RemoteDeskto
       defaultH={760}
       minW={640}
       minH={420}
+      enableMaximize
+      isMaximized={desktopMaximized}
+      onToggleMaximized={() => setDesktopMaximized((current) => !current)}
       className="remote-desktop-floating-shell"
       hideTitleBar
       dragHandleSelector=".remote-desktop-header"
@@ -1249,9 +1321,27 @@ export function RemoteDesktopPanel({ machine, ws = null, onClose }: RemoteDeskto
             <span>{t('remote_desktop.viewers', { count: snapshot.viewerCount ?? 1 })}</span>
             <span>{t('remote_desktop.controllers', { count: snapshot.controllerCount ?? (snapshot.mode === 'control' ? 1 : 0) })}</span>
           </div>
-          <button type="button" class="remote-desktop-stop" onClick={stopAndClose}>
-            {t('remote_desktop.stop')}
-          </button>
+          <div class="remote-desktop-window-actions">
+            <DesktopWindowMaximizeButton
+              maximized={desktopMaximized}
+              class="subsession-minimize-btn remote-desktop-maximize"
+              onClick={() => setDesktopMaximized((current) => !current)}
+            />
+            <button
+              type="button"
+              class="subsession-minimize-btn remote-desktop-minimize"
+              aria-label={t('window.minimize')}
+              title={t('window.minimize')}
+              onClick={minimizePanel}
+            >▾</button>
+            <button
+              type="button"
+              class="subsession-close-btn remote-desktop-stop"
+              aria-label={t('remote_desktop.stop')}
+              title={t('remote_desktop.stop')}
+              onClick={stopAndClose}
+            >×</button>
+          </div>
         </header>
 
         <div class="remote-desktop-toolbar">
@@ -1419,18 +1509,21 @@ export function RemoteDesktopPanel({ machine, ws = null, onClose }: RemoteDeskto
           tabIndex={snapshot.inputEnabled ? 0 : -1}
           onPointerMove={onPointerMove}
           onPointerEnter={onPointerMove}
-          onPointerLeave={(event) => {
-            if (event.pointerType !== 'touch') setDesktopPointerVisible(false);
-          }}
           onPointerDown={(event) => onPointerButton(event, true)}
           onPointerUp={(event) => onPointerButton(event, false)}
           onPointerCancel={(event) => {
             if (event.pointerType === 'touch') onTouchEnd(event, true);
+            if (commandMiddleDragPointerRef.current === event.pointerId) {
+              commandMiddleDragPointerRef.current = null;
+            }
             clientRef.current?.releasePointerButtons();
           }}
           onLostPointerCapture={(event) => {
             if (event.pointerType === 'touch' && touchPointsRef.current.has(event.pointerId)) {
               onTouchEnd(event, true);
+            }
+            if (commandMiddleDragPointerRef.current === event.pointerId) {
+              commandMiddleDragPointerRef.current = null;
             }
             clientRef.current?.releasePointerButtons();
           }}
@@ -1477,14 +1570,6 @@ export function RemoteDesktopPanel({ machine, ws = null, onClose }: RemoteDeskto
             }}
             aria-label={t('remote_desktop.video_label', { machine: machine.displayName })}
           />
-          {mobileInputMode !== 'mouse' && (
-            <div
-              ref={desktopPointerRef}
-              class="remote-desktop-virtual-pointer remote-desktop-pointer-follow"
-              hidden={!snapshot.inputEnabled || !desktopPointerVisible}
-              aria-hidden="true"
-            />
-          )}
           {mobileTextOpen && (
             <div class="remote-desktop-mobile-keyboard" role="group" aria-label={t('remote_desktop.mobile_keyboard')}>
               <div class="remote-desktop-mobile-keyboard-head">
@@ -1804,6 +1889,23 @@ export function RemoteDesktopPanel({ machine, ws = null, onClose }: RemoteDeskto
           </div>
         </footer>
       </div>
-    </FloatingPanel>
+        </FloatingPanel>
+      </div>
+      {minimized && (
+        <button
+          type="button"
+          class="remote-desktop-minimized-dock"
+          aria-label={t('remote_desktop.title', { machine: machine.displayName })}
+          onClick={onRestore}
+        >
+          <span class={`remote-desktop-minimized-status${connected ? ' is-online' : ''}`} aria-hidden="true" />
+          <span class="remote-desktop-minimized-copy">
+            <strong>{machine.displayName}</strong>
+            <small>{t(`remote_desktop.state.${snapshot.state}`)}</small>
+          </span>
+          <span class="remote-desktop-minimized-restore" aria-hidden="true">↗</span>
+        </button>
+      )}
+    </>
   );
 }

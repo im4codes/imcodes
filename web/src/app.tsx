@@ -71,6 +71,8 @@ import { AdminPage } from './pages/AdminPage.js';
 import { CronManager } from './pages/CronManager.js';
 import { SharedContextManagementPanel } from './components/SharedContextManagementPanel.js';
 import { ControlledNodesPanel } from './components/ControlledNodesPanel.js';
+import { RemoteDesktopPanel } from './components/RemoteDesktopPanel.js';
+import type { MachineListItem } from './api/machines.js';
 import { ContextDiagnosticsPanel } from './components/ContextDiagnosticsPanel.js';
 import { NewUserGuide, type NewUserGuideStep } from './components/NewUserGuide.js';
 import { TeamDiscussionGuide } from './components/TeamDiscussionGuide.js';
@@ -1712,6 +1714,8 @@ export function App() {
   const [showAdminPage, setShowAdminPage] = useState(false);
   const [showSharedContextManagement, setShowSharedContextManagement] = useState(false);
   const [showControlledNodes, setShowControlledNodes] = useState(false);
+  const [remoteDesktopMachine, setRemoteDesktopMachine] = useState<MachineListItem | null>(null);
+  const [remoteDesktopMinimized, setRemoteDesktopMinimized] = useState(false);
   const [showSharedContextDiagnostics, setShowSharedContextDiagnostics] = useState(false);
   const [sharedContextManagementProps, setSharedContextManagementProps] = useState<Record<string, unknown>>({});
   const [sharedContextDiagnosticsProps, setSharedContextDiagnosticsProps] = useState<SharedContextDiagnosticsWindowState>({});
@@ -1727,6 +1731,11 @@ export function App() {
     }, { bringToFront: true });
     setShowControlledNodes(true);
   }, [ensureDesktopWindow, selectedServerId]);
+
+  const openRemoteDesktop = useCallback((machine: MachineListItem) => {
+    setRemoteDesktopMachine(machine);
+    setRemoteDesktopMinimized(false);
+  }, []);
 
   // Fetch current user info on auth
   useEffect(() => {
@@ -6233,8 +6242,25 @@ export function App() {
           onFocus={() => bringDesktopWindowToFront(DESKTOP_WINDOW_IDS.controlledNodes)}
           className="controlled-nodes-floating-panel"
         >
-          <ControlledNodesPanel ws={wsRef.current} />
+          <ControlledNodesPanel
+            onOpenRemoteDesktop={openRemoteDesktop}
+          />
         </FloatingPanel>
+      )}
+
+      {remoteDesktopMachine && (
+        <RemoteDesktopPanel
+          key={remoteDesktopMachine.serverId}
+          machine={remoteDesktopMachine}
+          ws={wsRef.current}
+          minimized={remoteDesktopMinimized}
+          onMinimize={() => setRemoteDesktopMinimized(true)}
+          onRestore={() => setRemoteDesktopMinimized(false)}
+          onClose={() => {
+            setRemoteDesktopMachine(null);
+            setRemoteDesktopMinimized(false);
+          }}
+        />
       )}
 
       {showSharedContextDiagnostics && (
