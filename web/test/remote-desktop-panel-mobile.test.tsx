@@ -780,9 +780,9 @@ describe('RemoteDesktopPanel mobile gestures', () => {
 
       expect(pointerButton).toHaveBeenNthCalledWith(1, 'middle', true, 0.5, 0.5);
       expect(pointerButton).toHaveBeenNthCalledWith(2, 'middle', false, expect.any(Number), 0.5);
-      expect(pointerButton.mock.calls[1]?.[2]).toBeCloseTo(0.7593, 4);
+      expect(pointerButton.mock.calls[1]?.[2]).toBeCloseTo(0.75, 4);
       expect(pointerMove).toHaveBeenCalledWith(expect.any(Number), 0.5);
-      expect(pointerMove.mock.calls[0]?.[0]).toBeCloseTo(0.7593, 4);
+      expect(pointerMove.mock.calls[0]?.[0]).toBeCloseTo(0.75, 4);
       expect(key.mock.calls).toEqual([
         ['ControlLeft', 'Control', true, false, { control: true, alt: false }],
         ['ControlLeft', 'Control', false, false, { control: false, alt: false }],

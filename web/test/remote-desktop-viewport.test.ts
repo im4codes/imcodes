@@ -3,6 +3,7 @@ import {
   clampRemoteDesktopViewport,
   panRemoteDesktopViewportAtEdge,
   remoteDesktopMouseModeViewport,
+  stickRemoteDesktopPointerToEdges,
   viewportFromRemoteDesktopPinch,
 } from '../src/remote-desktop-viewport.js';
 
@@ -56,6 +57,13 @@ describe('remote desktop mobile viewport', () => {
       y: 0,
     });
     expect(remoteDesktopMouseModeViewport({ width: 3840, height: 2160 }, geometry).scale).toBe(4);
+  });
+
+  it('snaps only the edge band without rescaling interior desktop clicks', () => {
+    expect(stickRemoteDesktopPointerToEdges({ x: 0.25, y: 0.75 }))
+      .toEqual({ x: 0.25, y: 0.75 });
+    expect(stickRemoteDesktopPointerToEdges({ x: 0.018, y: 0.982 }))
+      .toEqual({ x: 0, y: 1 });
   });
 
   it('auto-pans zoomed content opposite a virtual mouse at the view edge', () => {

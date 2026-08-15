@@ -1,5 +1,6 @@
 export const REMOTE_DESKTOP_MIN_ZOOM = 1;
 export const REMOTE_DESKTOP_MAX_ZOOM = 4;
+export const REMOTE_DESKTOP_POINTER_EDGE_STICKY_RATIO = 0.018;
 
 export interface RemoteDesktopViewport {
   scale: number;
@@ -17,6 +18,23 @@ export interface RemoteDesktopViewportGeometry {
 export interface RemoteDesktopEdgePanResult {
   viewport: RemoteDesktopViewport;
   active: boolean;
+}
+
+/**
+ * Snap only the narrow edge band to an exact display edge. The interior must
+ * remain an identity mapping: rescaling it makes every desktop click drift.
+ */
+export function stickRemoteDesktopPointerToEdges(point: { x: number; y: number }): {
+  x: number;
+  y: number;
+} {
+  const edge = REMOTE_DESKTOP_POINTER_EDGE_STICKY_RATIO;
+  const stick = (value: number) => {
+    if (value <= edge) return 0;
+    if (value >= 1 - edge) return 1;
+    return value;
+  };
+  return { x: stick(point.x), y: stick(point.y) };
 }
 
 export const INITIAL_REMOTE_DESKTOP_VIEWPORT: RemoteDesktopViewport = {

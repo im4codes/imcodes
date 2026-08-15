@@ -44,6 +44,7 @@ import {
   clampRemoteDesktopViewport,
   panRemoteDesktopViewportAtEdge,
   remoteDesktopMouseModeViewport,
+  stickRemoteDesktopPointerToEdges,
   viewportFromRemoteDesktopPinch,
   type RemoteDesktopViewport,
 } from '../remote-desktop-viewport.js';
@@ -118,7 +119,6 @@ const MAX_REMOTE_DESKTOP_RECONNECTS = REMOTE_DESKTOP_LIMITS.MAX_RECONNECT_ATTEMP
 const TOUCH_LONG_PRESS_MS = 550;
 const TOUCH_DOUBLE_TAP_MS = 400;
 const TOUCH_DOUBLE_TAP_DISTANCE_PX = 32;
-const DESKTOP_POINTER_EDGE_STICKY_RATIO = 0.018;
 const RECONNECTABLE_REMOTE_DESKTOP_FAILURES = new Set<string>([
   REMOTE_DESKTOP_ERROR.DAEMON_OFFLINE,
   REMOTE_DESKTOP_ERROR.NEGOTIATION_TIMEOUT,
@@ -159,16 +159,6 @@ function activeRemoteDesktopConnectionStep(
     default:
       return 0;
   }
-}
-
-function stickRemoteDesktopPointerToEdges(point: TouchPoint): TouchPoint {
-  const edge = DESKTOP_POINTER_EDGE_STICKY_RATIO;
-  const stick = (value: number) => {
-    if (value <= edge) return 0;
-    if (value >= 1 - edge) return 1;
-    return (value - edge) / (1 - (edge * 2));
-  };
-  return { x: stick(point.x), y: stick(point.y) };
 }
 
 export function canOpenRemoteDesktop(machine: MachineListItem): boolean {
