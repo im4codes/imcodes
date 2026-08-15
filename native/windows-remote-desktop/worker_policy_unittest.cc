@@ -27,12 +27,27 @@ TEST(WorkerPolicyTest, FailsClosedAcrossDisplaySessionAndPowerChanges) {
             WorkerEnvironmentAction::kStopAndReinitialize);
   EXPECT_EQ(SelectWorkerEnvironmentAction(kEnvironmentSessionAvailable),
             WorkerEnvironmentAction::kStopAndReinitialize);
+  EXPECT_EQ(SelectWorkerEnvironmentAction(kEnvironmentCompositionChanged),
+            WorkerEnvironmentAction::kStopAndReinitialize);
   EXPECT_EQ(SelectWorkerEnvironmentAction(kEnvironmentSuspend |
                                            kEnvironmentDisplayChanged),
             WorkerEnvironmentAction::kStopProtected);
   EXPECT_EQ(SelectWorkerEnvironmentAction(kEnvironmentSessionUnavailable |
                                            kEnvironmentResume),
             WorkerEnvironmentAction::kStopProtected);
+}
+
+TEST(WorkerPolicyTest, DebouncesDisplayTopologyUntilItStabilizes) {
+  int remaining = 0;
+  EXPECT_FALSE(AdvanceTopologyRefreshDebounce(true, &remaining));
+  EXPECT_EQ(remaining, kTopologyRefreshDebounceTicks);
+  for (int tick = 1; tick < kTopologyRefreshDebounceTicks; ++tick) {
+    EXPECT_FALSE(AdvanceTopologyRefreshDebounce(false, &remaining));
+  }
+  EXPECT_TRUE(AdvanceTopologyRefreshDebounce(false, &remaining));
+  EXPECT_EQ(remaining, 0);
+  EXPECT_FALSE(AdvanceTopologyRefreshDebounce(false, &remaining));
+  EXPECT_FALSE(AdvanceTopologyRefreshDebounce(true, nullptr));
 }
 
 TEST(WorkerPolicyTest, SelectsStableThenPrimaryThenAvailableDisplay) {

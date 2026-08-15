@@ -10,6 +10,7 @@ const SOURCE_PATHS = [
   'web/src/remote-desktop-client.ts',
   'web/src/components/RemoteDesktopPanel.tsx',
   'native/windows-remote-desktop/worker_main.cc',
+  'native/windows-remote-desktop/local_indicator.cc',
   'native/windows-remote-desktop/peer_session.cc',
   'native/windows-remote-desktop/display_capture.cc',
   'native/windows-remote-desktop/mf_h264_encoder.cc',
@@ -190,6 +191,27 @@ const contracts: Contract[] = [
       {
         path: 'native/windows-remote-desktop/worker_main.cc',
         needle: 'source->Start();',
+      },
+    ],
+  },
+  {
+    name: 'display-stack reset and bounded worker recovery',
+    guards: [
+      {
+        path: 'native/windows-remote-desktop/local_indicator.cc',
+        needle: 'case WM_DWMCOMPOSITIONCHANGED:',
+      },
+      {
+        path: 'native/windows-remote-desktop/local_indicator.cc',
+        needle: 'environment_changed_(kEnvironmentCompositionChanged);',
+      },
+      {
+        path: 'native/windows-remote-desktop/worker_main.cc',
+        needle: 'AdvanceTopologyRefreshDebounce(topology_refresh_requested,',
+      },
+      {
+        path: 'native/windows-remote-desktop/worker_main.cc',
+        needle: 'TerminateProcess(GetCurrentProcess(), 15);',
       },
     ],
   },
@@ -816,6 +838,30 @@ const mutations: Mutation[] = [
     contract: 'nonblocking named-pipe ACL before active-user launch',
     path: 'src/node/windows-user-session.ts',
     needle: 'return new Promise((resolve, reject) => {',
+  },
+  {
+    name: 'remove DWM restart observation',
+    contract: 'display-stack reset and bounded worker recovery',
+    path: 'native/windows-remote-desktop/local_indicator.cc',
+    needle: 'case WM_DWMCOMPOSITIONCHANGED:',
+  },
+  {
+    name: 'remove DWM media-reset dispatch',
+    contract: 'display-stack reset and bounded worker recovery',
+    path: 'native/windows-remote-desktop/local_indicator.cc',
+    needle: 'environment_changed_(kEnvironmentCompositionChanged);',
+  },
+  {
+    name: 'remove topology stabilization debounce',
+    contract: 'display-stack reset and bounded worker recovery',
+    path: 'native/windows-remote-desktop/worker_main.cc',
+    needle: 'AdvanceTopologyRefreshDebounce(topology_refresh_requested,',
+  },
+  {
+    name: 'remove bounded native worker teardown',
+    contract: 'display-stack reset and bounded worker recovery',
+    path: 'native/windows-remote-desktop/worker_main.cc',
+    needle: 'TerminateProcess(GetCurrentProcess(), 15);',
   },
 ];
 

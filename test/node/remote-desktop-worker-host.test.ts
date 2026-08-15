@@ -718,6 +718,87 @@ describe('remote desktop worker artifact and IPC host', () => {
     expect(controller.stdin.end).toHaveBeenCalledOnce();
   });
 
+  it('cancels an in-flight virtual display start when its only session stops', async () => {
+    const temp = await mkdtemp(join(tmpdir(), 'imcodes-rd-host-cancel-headless-'));
+    cleanup.push(() => rm(temp, { recursive: true, force: true }));
+    const pipePath = join(temp, 'worker.sock');
+    let helper: net.Socket | null = null;
+    let releaseVirtualVerification: (() => void) | undefined;
+    const virtualVerification = new Promise<void>((resolve) => {
+      releaseVirtualVerification = resolve;
+    });
+    let verificationCount = 0;
+    const verifyArtifactForLaunch = vi.fn(async () => {
+      verificationCount++;
+      if (verificationCount > 1) await virtualVerification;
+      return artifact;
+    });
+    const launchVirtualDisplay = vi.fn(() => {
+      throw new Error('cancelled virtual display must not launch');
+    });
+    const activateVirtualDisplay = vi.fn();
+    const host = new RemoteDesktopWorkerHost(() => {}, {
+      ...trustedHostOptions,
+      verifyArtifactForLaunch,
+      platform: 'win32',
+      artifact,
+      pipePath,
+      allowPipeClients: () => {},
+      launchVirtualDisplay,
+      activateVirtualDisplay,
+      launch: (_executable, argsLine) => {
+        const args = quotedArgs(argsLine);
+        helper = net.createConnection(pipePath, () => {
+          helper!.write(`${JSON.stringify({
+            type: REMOTE_DESKTOP_WORKER_HELLO_TYPE,
+            ipcVersion: REMOTE_DESKTOP_WORKER_IPC_VERSION,
+            nonce: args[3],
+            pid: 46,
+          })}\n`);
+        });
+      },
+    });
+    cleanup.push(() => { host.close(); helper?.destroy(); });
+    const prepare = {
+      type: REMOTE_DESKTOP_MSG.PREPARE,
+      requestId,
+      sessionId,
+      capability,
+      expiresAt: Date.now() + 60_000,
+      leaseExpiresAt: Date.now() + 15_000,
+      daemonGeneration: 7,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
+      inputEpoch: 1,
+      iceServers: ['stun:stun.example.test:3478'],
+    } as const;
+    await expect(host.handle(prepare)).resolves.toBe(true);
+    helper!.write(`${JSON.stringify({
+      type: REMOTE_DESKTOP_MSG.TERMINAL,
+      requestId,
+      sessionId,
+      capability,
+      reason: REMOTE_DESKTOP_TERMINAL_REASON.MEDIA_UNAVAILABLE,
+    })}\n`);
+    await vi.waitFor(() => expect(verifyArtifactForLaunch).toHaveBeenCalledTimes(2));
+    await expect(host.handle({
+      type: REMOTE_DESKTOP_MSG.STOP,
+      requestId,
+      sessionId,
+      capability,
+    })).resolves.toBe(true);
+    releaseVirtualVerification!();
+    await new Promise<void>((resolve) => setTimeout(resolve, 10));
+    expect(launchVirtualDisplay).not.toHaveBeenCalled();
+    expect(activateVirtualDisplay).not.toHaveBeenCalled();
+    expect((host as unknown as {
+      virtualDisplayController: unknown;
+      virtualDisplayStartPromise: unknown;
+    })).toMatchObject({
+      virtualDisplayController: null,
+      virtualDisplayStartPromise: null,
+    });
+  });
+
   it('shares one headless controller across concurrent sessions and removes it only after the last session', async () => {
     const temp = await mkdtemp(join(tmpdir(), 'imcodes-rd-host-shared-headless-'));
     cleanup.push(() => rm(temp, { recursive: true, force: true }));

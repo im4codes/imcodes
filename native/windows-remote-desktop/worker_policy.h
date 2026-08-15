@@ -13,6 +13,8 @@ namespace imcodes::rd {
 enum class CaptureAcquireAction { kFrame, kWait, kReset, kDrop };
 
 inline constexpr int kFirstPresentableFrameTimeoutMs = 3'000;
+inline constexpr DWORD kWorkerShutdownGraceMs = 5'000;
+inline constexpr int kTopologyRefreshDebounceTicks = 4;
 // Deliberately shorter than the browser's 10-second receive watchdog so the
 // worker can disqualify a wedged hardware encoder before browser teardown wins
 // the race and immediately recreates the same broken encoder.
@@ -23,6 +25,7 @@ inline constexpr uint32_t kEnvironmentSuspend = 1u << 1;
 inline constexpr uint32_t kEnvironmentResume = 1u << 2;
 inline constexpr uint32_t kEnvironmentSessionUnavailable = 1u << 3;
 inline constexpr uint32_t kEnvironmentSessionAvailable = 1u << 4;
+inline constexpr uint32_t kEnvironmentCompositionChanged = 1u << 5;
 
 enum class WorkerEnvironmentAction {
   kNone,
@@ -33,6 +36,8 @@ enum class WorkerEnvironmentAction {
 
 CaptureAcquireAction ClassifyCaptureAcquireResult(HRESULT result);
 WorkerEnvironmentAction SelectWorkerEnvironmentAction(uint32_t event_mask);
+bool AdvanceTopologyRefreshDebounce(bool refresh_requested,
+                                    int* remaining_ticks);
 
 struct DisplaySelectionCandidate {
   std::string id;

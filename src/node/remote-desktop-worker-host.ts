@@ -231,6 +231,7 @@ export class RemoteDesktopWorkerHost {
   private startPromise: Promise<void> | null = null;
   private virtualDisplayController: VirtualDisplayControllerProcess | null = null;
   private virtualDisplayStartPromise: Promise<void> | null = null;
+  private virtualDisplayGeneration = 0;
   private buffer = '';
   private closing = false;
 
@@ -582,7 +583,10 @@ export class RemoteDesktopWorkerHost {
     try {
       await this.ensureVirtualDisplayController();
       if (this.tracked.get(tracked.sessionId) !== tracked
-        || !this.socket || this.socket.destroyed) return;
+        || !this.socket || this.socket.destroyed) {
+        this.stopVirtualDisplayIfUnused();
+        return;
+      }
       tracked.usesVirtualDisplay = true;
       const sent = await this.writeToWorker(this.socket, tracked.prepare);
       if (!sent) throw new Error('virtual_display_retry_send_failed');
@@ -597,14 +601,22 @@ export class RemoteDesktopWorkerHost {
     if (this.virtualDisplayStartPromise) return await this.virtualDisplayStartPromise;
     if (this.virtualDisplayController?.exitCode === null) return;
     if (!this.artifact?.virtualDisplayDirectory) throw new Error('virtual_display_unavailable');
+    const generation = ++this.virtualDisplayGeneration;
     this.virtualDisplayStartPromise = (async () => {
       const artifact = await this.verifiedArtifactForLaunch();
+      if (generation !== this.virtualDisplayGeneration) {
+        throw new Error('virtual_display_start_cancelled');
+      }
       const controller = (this.options.launchVirtualDisplay ?? ((executable: string) => (
         spawn(executable, ['--virtual-display-controller'], {
           windowsHide: true,
           stdio: ['pipe', 'ignore', 'ignore'],
         }) as unknown as VirtualDisplayControllerProcess
       )))(artifact.executablePath);
+      if (generation !== this.virtualDisplayGeneration) {
+        try { controller.stdin.end(); } catch {}
+        throw new Error('virtual_display_start_cancelled');
+      }
       this.virtualDisplayController = controller;
       let exited = false;
       let exitCode: number | null = null;
@@ -622,17 +634,31 @@ export class RemoteDesktopWorkerHost {
         (resolveWait) => setTimeout(resolveWait, milliseconds),
       ));
       await Promise.race([exit, wait(this.options.virtualDisplayStartupMs ?? 5_000)]);
+      if (generation !== this.virtualDisplayGeneration) {
+        try { controller.stdin.end(); } catch {}
+        throw new Error('virtual_display_start_cancelled');
+      }
       if (exited) throw new Error(`virtual_display_controller_failed_${exitCode ?? 'unknown'}`);
       const activationArtifact = await this.verifiedArtifactForLaunch();
+      if (generation !== this.virtualDisplayGeneration) {
+        try { controller.stdin.end(); } catch {}
+        throw new Error('virtual_display_start_cancelled');
+      }
       (this.options.activateVirtualDisplay ?? ((executable: string) =>
         launchWindowsActiveUserCommand(executable, '--activate-virtual-display')))(activationArtifact.executablePath);
       await Promise.race([
         exit,
         wait(this.options.virtualDisplayActivationMs ?? 2_000),
       ]);
+      if (generation !== this.virtualDisplayGeneration) {
+        try { controller.stdin.end(); } catch {}
+        throw new Error('virtual_display_start_cancelled');
+      }
       if (exited) throw new Error(`virtual_display_controller_failed_${exitCode ?? 'unknown'}`);
     })().finally(() => {
-      this.virtualDisplayStartPromise = null;
+      if (generation === this.virtualDisplayGeneration) {
+        this.virtualDisplayStartPromise = null;
+      }
     });
     return await this.virtualDisplayStartPromise;
   }
@@ -643,6 +669,7 @@ export class RemoteDesktopWorkerHost {
   }
 
   private stopVirtualDisplayController(): void {
+    ++this.virtualDisplayGeneration;
     const controller = this.virtualDisplayController;
     this.virtualDisplayController = null;
     this.virtualDisplayStartPromise = null;

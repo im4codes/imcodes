@@ -179,6 +179,8 @@ class WorkerRuntime {
         StopAllOnSignaling("stopped_by_local_user", true);
       const WorkerEnvironmentAction environment_action =
           SelectWorkerEnvironmentAction(environment_events_.exchange(0));
+      const bool topology_refresh_requested =
+          environment_action == WorkerEnvironmentAction::kRefreshTopology;
       if (environment_action == WorkerEnvironmentAction::kStopProtected) {
         StopAllOnSignaling("protected_desktop", true);
         ResetCaptureSourcesOnSignaling();
@@ -188,6 +190,10 @@ class WorkerRuntime {
         ResetCaptureSourcesOnSignaling();
       } else if (environment_action ==
                  WorkerEnvironmentAction::kRefreshTopology) {
+        topology_scan_ticks_ = 0;
+      }
+      if (AdvanceTopologyRefreshDebounce(topology_refresh_requested,
+                                         &topology_refresh_debounce_ticks_)) {
         RefreshTopologyOnSignaling();
       }
       if (!sessions_.empty()) {
@@ -198,7 +204,8 @@ class WorkerRuntime {
           }
         } else {
           protected_desktop_checks_ = 0;
-          if (++topology_scan_ticks_ >= 8) {
+          if (topology_refresh_debounce_ticks_ == 0 &&
+              ++topology_scan_ticks_ >= 8) {
             topology_scan_ticks_ = 0;
             std::vector<DisplayInfo> displays = EnumerateDisplays();
             if (displays.empty()) {
@@ -446,6 +453,7 @@ class WorkerRuntime {
   std::atomic<uint32_t> environment_events_{0};
   int protected_desktop_checks_ = 0;
   int topology_scan_ticks_ = 0;
+  int topology_refresh_debounce_ticks_ = 0;
 };
 
 std::optional<std::pair<std::wstring, std::string>> ParseArguments() {
@@ -647,6 +655,20 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     }
   }
 
+  // A display-driver or DWM reset can leave a DXGI call permanently blocked.
+  // Once the authenticated pipe is gone there is no authority left to serve,
+  // so bound the entire graceful teardown, including the maintenance join,
+  // and let the next verified launch start clean.
+  HANDLE shutdown_complete = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  std::thread shutdown_watchdog;
+  if (shutdown_complete) {
+    shutdown_watchdog = std::thread([shutdown_complete] {
+      if (WaitForSingleObject(shutdown_complete, kWorkerShutdownGraceMs) ==
+          WAIT_TIMEOUT) {
+        TerminateProcess(GetCurrentProcess(), 15);
+      }
+    });
+  }
   running = false;
   maintenance.join();
   runtime.Shutdown();
@@ -659,5 +681,10 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
   webrtc::CleanupSSL();
   MFShutdown();
   CoUninitialize();
+  if (shutdown_complete) {
+    SetEvent(shutdown_complete);
+    shutdown_watchdog.join();
+    CloseHandle(shutdown_complete);
+  }
   return protocol_ok ? 0 : 11;
 }

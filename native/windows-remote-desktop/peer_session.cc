@@ -1314,12 +1314,11 @@ bool PeerSession::SetDisplayMode(const std::string& id,
     SendStatus(relayed_ ? "relayed" : "direct", InputReady());
     return false;
   }
-  // Resolution presets carry a readable Windows UI scale.  This is automatic
-  // only after an explicit remote mode change (and on the IM.codes headless
-  // display during startup); arbitrary physical displays are never changed in
-  // the background.
+  // Do not drive the undocumented per-monitor DPI packet while DXGI is still
+  // bound to the old mode. On the IM.codes display persist the paired readable
+  // scale; Initialize applies it on the next verified worker session before
+  // capture starts. Physical-display DPI remains an explicit user operation.
   const int recommended_scale = RecommendedRemoteDisplayScale(width, height);
-  SetDisplayDpiScale(*found, recommended_scale);
   if (found->imcodes_virtual) {
     SaveVirtualDisplayPreferences({width, height, recommended_scale});
   }

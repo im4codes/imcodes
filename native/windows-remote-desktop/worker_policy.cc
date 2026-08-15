@@ -24,9 +24,23 @@ WorkerEnvironmentAction SelectWorkerEnvironmentAction(uint32_t event_mask) {
   }
   if (event_mask & (kEnvironmentResume | kEnvironmentSessionAvailable))
     return WorkerEnvironmentAction::kStopAndReinitialize;
+  if (event_mask & kEnvironmentCompositionChanged)
+    return WorkerEnvironmentAction::kStopAndReinitialize;
   if (event_mask & kEnvironmentDisplayChanged)
     return WorkerEnvironmentAction::kRefreshTopology;
   return WorkerEnvironmentAction::kNone;
+}
+
+bool AdvanceTopologyRefreshDebounce(bool refresh_requested,
+                                    int* remaining_ticks) {
+  if (!remaining_ticks) return false;
+  if (refresh_requested) {
+    *remaining_ticks = kTopologyRefreshDebounceTicks;
+    return false;
+  }
+  if (*remaining_ticks <= 0) return false;
+  --*remaining_ticks;
+  return *remaining_ticks == 0;
 }
 
 size_t SelectDisplayAfterTopologyChange(

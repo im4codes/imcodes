@@ -132,6 +132,12 @@ describe('controlled-node executable release wiring', () => {
     expect(displayPreferences).toContain('IsAllowedRemoteDisplayScale');
     expect(peerSession).toContain('CDS_UPDATEREGISTRY');
     expect(peerSession).toContain('SaveVirtualDisplayPreferences');
+    const setDisplayMode = peerSession.slice(
+      peerSession.indexOf('bool PeerSession::SetDisplayMode('),
+      peerSession.indexOf('bool PeerSession::SetDisplayScale('),
+    );
+    expect(setDisplayMode).not.toContain('SetDisplayDpiScale(');
+    expect(setDisplayMode).toContain('SaveVirtualDisplayPreferences');
     expect(virtualDisplayController).toContain('LoadVirtualDisplayPreferences');
     expect(sdkConsumer.indexOf('$TestSdk,'))
       .toBeLessThan(sdkConsumer.lastIndexOf('$ProductionSdk,'));

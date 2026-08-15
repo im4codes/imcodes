@@ -4,6 +4,7 @@
 #include <string>
 
 #include <windowsx.h>
+#include <dwmapi.h>
 #include <wtsapi32.h>
 
 namespace imcodes::rd {
@@ -238,6 +239,15 @@ LRESULT LocalIndicator::HandleMessage(HWND window, UINT message,
       AnchorToCorner(window);
       if (environment_changed_)
         environment_changed_(kEnvironmentDisplayChanged);
+      return 0;
+    case WM_DWMCOMPOSITIONCHANGED:
+      // A DWM restart invalidates more than the output rectangle: active DXGI
+      // duplication and encoder state may remain alive but never progress.
+      // Force the bounded media reinitialization path instead of treating the
+      // compositor restart as an ordinary topology refresh.
+      AnchorToCorner(window);
+      if (environment_changed_)
+        environment_changed_(kEnvironmentCompositionChanged);
       return 0;
     case WM_SETTINGCHANGE:
     case WM_DPICHANGED:
