@@ -92,14 +92,16 @@ std::optional<KeyMapping> MapCode(const std::string& code) {
 }  // namespace
 
 InputArbiter::InputArbiter(SendInputFn send_input,
-                           InputAvailableFn input_available)
+                           InputAvailableFn input_available,
+                           MovePointerFn move_pointer)
     : send_input_(send_input ? std::move(send_input)
                              : SendInputFn([](UINT count, LPINPUT inputs,
                                               int size) {
                                  return ::SendInput(count, inputs, size);
                                })),
       input_available_(input_available ? std::move(input_available)
-                                       : InputAvailableFn([] { return true; })) {}
+                                       : InputAvailableFn([] { return true; })),
+      move_pointer_(std::move(move_pointer)) {}
 
 bool InputArbiter::Available() const { return input_available_(); }
 
@@ -186,6 +188,12 @@ bool InputArbiter::Move(const DisplayInfo& display, double x, double y) {
   const int pixel_y = display.desktop_rect.top +
                       std::min(display.height - 1,
                                static_cast<int>(y * display.height));
+  // The interactive indicator owns the input desktop. Prefer an exact
+  // physical-pixel cursor move on that thread: SendInput's 0..65535 virtual
+  // desktop normalization introduces visible rounding/offset errors on 4K
+  // and mixed-origin multi-monitor layouts. Keep the normalized fallback for
+  // standalone tests and recovery callers that do not supply the UI bridge.
+  if (move_pointer_) return move_pointer_(pixel_x, pixel_y);
   const int virtual_left = GetSystemMetrics(SM_XVIRTUALSCREEN);
   const int virtual_top = GetSystemMetrics(SM_YVIRTUALSCREEN);
   const int virtual_width = GetSystemMetrics(SM_CXVIRTUALSCREEN);

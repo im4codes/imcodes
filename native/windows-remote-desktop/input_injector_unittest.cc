@@ -55,6 +55,33 @@ TEST(InputArbiterTest, ReportsInteractiveDesktopAvailability) {
   EXPECT_TRUE(input.Available());
 }
 
+TEST(InputArbiterTest, MovesPointerInExactSelectedDisplayPixels) {
+  RecordingInput recording;
+  std::vector<POINT> positions;
+  InputArbiter input(
+      [&](UINT count, LPINPUT values, int size) {
+        return recording.Send(count, values, size);
+      },
+      [] { return true; },
+      [&](int x, int y) {
+        positions.push_back(POINT{x, y});
+        return true;
+      });
+  DisplayInfo display;
+  display.desktop_rect = RECT{-3840, 100, 0, 2260};
+  display.width = 3840;
+  display.height = 2160;
+
+  EXPECT_TRUE(input.Move(display, 0.5, 0.5));
+  EXPECT_TRUE(input.Move(display, 1.0, 1.0));
+  ASSERT_EQ(positions.size(), 2u);
+  EXPECT_EQ(positions[0].x, -1920);
+  EXPECT_EQ(positions[0].y, 1180);
+  EXPECT_EQ(positions[1].x, -1);
+  EXPECT_EQ(positions[1].y, 2259);
+  EXPECT_TRUE(recording.events.empty());
+}
+
 TEST(InputArbiterTest, RetriesFailedFinalKeyReleaseDuringTeardown) {
   RecordingInput recording;
   InputArbiter input([&](UINT count, LPINPUT values, int size) {

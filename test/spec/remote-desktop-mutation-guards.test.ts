@@ -11,6 +11,7 @@ const SOURCE_PATHS = [
   'web/src/components/RemoteDesktopPanel.tsx',
   'native/windows-remote-desktop/worker_main.cc',
   'native/windows-remote-desktop/local_indicator.cc',
+  'native/windows-remote-desktop/input_injector.cc',
   'native/windows-remote-desktop/peer_session.cc',
   'native/windows-remote-desktop/display_capture.cc',
   'native/windows-remote-desktop/mf_h264_encoder.cc',
@@ -211,7 +212,38 @@ const contracts: Contract[] = [
       },
       {
         path: 'native/windows-remote-desktop/worker_main.cc',
+        needle: 'CurrentDwmProcessIdForCurrentSession()',
+        minimum: 2,
+      },
+      {
+        path: 'native/windows-remote-desktop/worker_main.cc',
+        needle: 'AdvanceCompositorProcessGeneration(',
+      },
+      {
+        path: 'native/windows-remote-desktop/worker_main.cc',
+        needle: 'TerminateProcess(GetCurrentProcess(), 16);',
+        minimum: 2,
+      },
+      {
+        path: 'native/windows-remote-desktop/worker_main.cc',
         needle: 'TerminateProcess(GetCurrentProcess(), 15);',
+      },
+    ],
+  },
+  {
+    name: 'exact selected-display pointer positioning',
+    guards: [
+      {
+        path: 'native/windows-remote-desktop/input_injector.cc',
+        needle: 'if (move_pointer_) return move_pointer_(pixel_x, pixel_y);',
+      },
+      {
+        path: 'native/windows-remote-desktop/worker_main.cc',
+        needle: 'indicator && indicator->MovePointer(x, y)',
+      },
+      {
+        path: 'native/windows-remote-desktop/local_indicator.cc',
+        needle: 'SetCursorPos(request->x, request->y) == TRUE',
       },
     ],
   },
@@ -862,6 +894,30 @@ const mutations: Mutation[] = [
     contract: 'display-stack reset and bounded worker recovery',
     path: 'native/windows-remote-desktop/worker_main.cc',
     needle: 'TerminateProcess(GetCurrentProcess(), 15);',
+  },
+  {
+    name: 'remove active DWM process restart detection',
+    contract: 'display-stack reset and bounded worker recovery',
+    path: 'native/windows-remote-desktop/worker_main.cc',
+    needle: 'AdvanceCompositorProcessGeneration(',
+  },
+  {
+    name: 'remove bounded DWM recovery teardown',
+    contract: 'display-stack reset and bounded worker recovery',
+    path: 'native/windows-remote-desktop/worker_main.cc',
+    needle: 'TerminateProcess(GetCurrentProcess(), 16);',
+  },
+  {
+    name: 'restore normalized pointer movement on the production path',
+    contract: 'exact selected-display pointer positioning',
+    path: 'native/windows-remote-desktop/input_injector.cc',
+    needle: 'if (move_pointer_) return move_pointer_(pixel_x, pixel_y);',
+  },
+  {
+    name: 'remove exact interactive-desktop pointer dispatch',
+    contract: 'exact selected-display pointer positioning',
+    path: 'native/windows-remote-desktop/local_indicator.cc',
+    needle: 'SetCursorPos(request->x, request->y) == TRUE',
   },
 ];
 

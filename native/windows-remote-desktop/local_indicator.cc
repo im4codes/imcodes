@@ -19,6 +19,7 @@ constexpr UINT kStopMessage = WM_APP + 2;
 constexpr UINT kDispatchInputMessage = WM_APP + 3;
 constexpr UINT kProbeInputMessage = WM_APP + 4;
 constexpr UINT kReadClipboardMessage = WM_APP + 5;
+constexpr UINT kMovePointerMessage = WM_APP + 6;
 constexpr int kExpandedWidth = 368;
 constexpr int kExpandedHeight = 148;
 constexpr int kCollapsedSize = 38;
@@ -36,6 +37,13 @@ struct ClipboardReadRequest {
   DWORD previous_sequence = 0;
   std::u16string text;
   bool available = false;
+};
+
+struct PointerMoveRequest {
+  int x = 0;
+  int y = 0;
+  bool accepted = false;
+  DWORD error = ERROR_SUCCESS;
 };
 
 bool ReadCollapsedPreference() {
@@ -145,6 +153,16 @@ UINT LocalIndicator::DispatchInput(UINT count, LPINPUT inputs, int size) {
   if (!window || !inputs || count == 0 || size != sizeof(INPUT)) return 0;
   InputDispatchRequest request{count, inputs, size};
   SendMessageW(window, kDispatchInputMessage, 0,
+               reinterpret_cast<LPARAM>(&request));
+  SetLastError(request.error);
+  return request.accepted;
+}
+
+bool LocalIndicator::MovePointer(int x, int y) {
+  const HWND window = window_.load();
+  if (!window) return false;
+  PointerMoveRequest request{x, y};
+  SendMessageW(window, kMovePointerMessage, 0,
                reinterpret_cast<LPARAM>(&request));
   SetLastError(request.error);
   return request.accepted;
@@ -295,6 +313,14 @@ LRESULT LocalIndicator::HandleMessage(HWND window, UINT message,
     case kProbeInputMessage: {
       POINT cursor{};
       return GetCursorPos(&cursor) && SetCursorPos(cursor.x, cursor.y);
+    }
+    case kMovePointerMessage: {
+      auto* request = reinterpret_cast<PointerMoveRequest*>(lparam);
+      if (!request) return FALSE;
+      SetLastError(ERROR_SUCCESS);
+      request->accepted = SetCursorPos(request->x, request->y) == TRUE;
+      request->error = GetLastError();
+      return request->accepted ? TRUE : FALSE;
     }
     case kReadClipboardMessage: {
       auto* request = reinterpret_cast<ClipboardReadRequest*>(lparam);

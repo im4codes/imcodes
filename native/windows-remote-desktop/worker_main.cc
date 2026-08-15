@@ -163,7 +163,11 @@ class WorkerRuntime {
             },
             [indicator] {
               return indicator && indicator->InputAvailable();
-            }) {}
+            },
+            [indicator](int x, int y) {
+              return indicator && indicator->MovePointer(x, y);
+            }),
+        dwm_process_id_(CurrentDwmProcessIdForCurrentSession()) {}
 
   bool Handle(const Json::Value& root) {
     const int64_t now_ms = NowMs();
@@ -174,6 +178,35 @@ class WorkerRuntime {
   }
 
   void Maintenance() {
+    bool compositor_restarted = false;
+    if (++compositor_scan_ticks_ >= 4) {
+      compositor_scan_ticks_ = 0;
+      compositor_restarted = AdvanceCompositorProcessGeneration(
+          CurrentDwmProcessIdForCurrentSession(), &dwm_process_id_);
+      if (compositor_restarted) {
+        environment_events_.fetch_or(kEnvironmentCompositionChanged);
+      }
+    }
+
+    // A DWM crash can poison a DXGI or WebRTC call deeply enough that even
+    // signaling-thread cleanup never returns. Once the compositor pid changes,
+    // give the reset a bounded window and let the node relaunch this verified
+    // worker if recovery cannot complete.
+    HANDLE recovery_complete = nullptr;
+    std::thread recovery_watchdog;
+    if (compositor_restarted) {
+      recovery_complete = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+      if (!recovery_complete) {
+        TerminateProcess(GetCurrentProcess(), 16);
+        return;
+      }
+      recovery_watchdog = std::thread([recovery_complete] {
+        if (WaitForSingleObject(recovery_complete, kWorkerShutdownGraceMs) ==
+            WAIT_TIMEOUT) {
+          TerminateProcess(GetCurrentProcess(), 16);
+        }
+      });
+    }
     signaling_thread_->BlockingCall([this] {
       if (local_stop_requested_.exchange(false))
         StopAllOnSignaling("stopped_by_local_user", true);
@@ -235,6 +268,11 @@ class WorkerRuntime {
       RemoveClosedOnSignaling();
       input_.RetryPendingReleases();
     });
+    if (recovery_complete) {
+      SetEvent(recovery_complete);
+      recovery_watchdog.join();
+      CloseHandle(recovery_complete);
+    }
   }
 
   void RequestLocalStopAll() { local_stop_requested_ = true; }
@@ -451,7 +489,9 @@ class WorkerRuntime {
   std::map<std::string, SourceEntry> sources_;
   std::atomic<bool> local_stop_requested_{false};
   std::atomic<uint32_t> environment_events_{0};
+  DWORD dwm_process_id_ = 0;
   int protected_desktop_checks_ = 0;
+  int compositor_scan_ticks_ = 0;
   int topology_scan_ticks_ = 0;
   int topology_refresh_debounce_ticks_ = 0;
 };

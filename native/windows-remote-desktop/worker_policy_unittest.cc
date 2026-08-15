@@ -50,6 +50,22 @@ TEST(WorkerPolicyTest, DebouncesDisplayTopologyUntilItStabilizes) {
   EXPECT_FALSE(AdvanceTopologyRefreshDebounce(true, nullptr));
 }
 
+TEST(WorkerPolicyTest, DetectsOnlyARealCompositorProcessReplacement) {
+  DWORD previous_process_id = 0;
+  EXPECT_FALSE(AdvanceCompositorProcessGeneration(0, &previous_process_id));
+  EXPECT_EQ(previous_process_id, 0u);
+  EXPECT_FALSE(
+      AdvanceCompositorProcessGeneration(101, &previous_process_id));
+  EXPECT_EQ(previous_process_id, 101u);
+  EXPECT_FALSE(
+      AdvanceCompositorProcessGeneration(101, &previous_process_id));
+  EXPECT_FALSE(AdvanceCompositorProcessGeneration(0, &previous_process_id));
+  EXPECT_EQ(previous_process_id, 101u);
+  EXPECT_TRUE(AdvanceCompositorProcessGeneration(202, &previous_process_id));
+  EXPECT_EQ(previous_process_id, 202u);
+  EXPECT_FALSE(AdvanceCompositorProcessGeneration(303, nullptr));
+}
+
 TEST(WorkerPolicyTest, SelectsStableThenPrimaryThenAvailableDisplay) {
   const std::vector<DisplaySelectionCandidate> displays = {
       {"old", false, false}, {"primary", true, true}, {"other", false, true}};

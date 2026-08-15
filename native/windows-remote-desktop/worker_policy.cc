@@ -4,6 +4,7 @@
 #include <cstdlib>
 
 #include <dxgi.h>
+#include <wtsapi32.h>
 
 namespace imcodes::rd {
 
@@ -41,6 +42,40 @@ bool AdvanceTopologyRefreshDebounce(bool refresh_requested,
   if (*remaining_ticks <= 0) return false;
   --*remaining_ticks;
   return *remaining_ticks == 0;
+}
+
+DWORD CurrentDwmProcessIdForCurrentSession() {
+  DWORD session_id = 0;
+  if (!ProcessIdToSessionId(GetCurrentProcessId(), &session_id)) return 0;
+  PWTS_PROCESS_INFOW processes = nullptr;
+  DWORD count = 0;
+  if (!WTSEnumerateProcessesW(WTS_CURRENT_SERVER_HANDLE, 0, 1, &processes,
+                              &count)) {
+    return 0;
+  }
+  DWORD process_id = 0;
+  for (DWORD index = 0; index < count; ++index) {
+    const WTS_PROCESS_INFOW& process = processes[index];
+    if (process.SessionId == session_id && process.pProcessName &&
+        lstrcmpiW(process.pProcessName, L"dwm.exe") == 0) {
+      process_id = process.ProcessId;
+      break;
+    }
+  }
+  WTSFreeMemory(processes);
+  return process_id;
+}
+
+bool AdvanceCompositorProcessGeneration(DWORD current_process_id,
+                                        DWORD* previous_process_id) {
+  if (!previous_process_id || current_process_id == 0) return false;
+  if (*previous_process_id == 0) {
+    *previous_process_id = current_process_id;
+    return false;
+  }
+  if (*previous_process_id == current_process_id) return false;
+  *previous_process_id = current_process_id;
+  return true;
 }
 
 size_t SelectDisplayAfterTopologyChange(

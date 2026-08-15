@@ -244,13 +244,23 @@ bool PeerSession::Initialize() {
       [](const DisplayInfo& display) { return display.imcodes_virtual; });
   if (startup_virtual_display != displays_.end()) {
     VirtualDisplayPreferences preferences;
-    const int desired_scale =
+    // Only honor a persisted DPI scale when the persisted mode matches the
+    // actual mode currently enumerated. A stale entry left behind by a failed
+    // higher-resolution switch (or by another worker that crashed mid-rebind)
+    // is treated as no preference, and the recommended scale for the actual
+    // current resolution is used instead. This prevents a stale scale from
+    // being applied on a display that no longer exposes that resolution, which
+    // would otherwise ship mismatched texture descriptors to the compositor and
+    // cause c00001ad-format dwm crashes during the first media frame.
+    const bool scale_persisted_for_current_mode =
         LoadVirtualDisplayPreferences(&preferences) &&
-                preferences.width == startup_virtual_display->width &&
-                preferences.height == startup_virtual_display->height
-            ? preferences.dpi_scale_percent
-            : RecommendedRemoteDisplayScale(startup_virtual_display->width,
-                                            startup_virtual_display->height);
+        preferences.width == startup_virtual_display->width &&
+        preferences.height == startup_virtual_display->height &&
+        IsAllowedRemoteDisplayScale(preferences.dpi_scale_percent);
+    const int desired_scale = scale_persisted_for_current_mode
+        ? preferences.dpi_scale_percent
+        : RecommendedRemoteDisplayScale(startup_virtual_display->width,
+                                        startup_virtual_display->height);
     if (std::lround(startup_virtual_display->dpi_scale * 100.0) !=
             desired_scale &&
         SetDisplayDpiScale(*startup_virtual_display, desired_scale)) {

@@ -33,6 +33,7 @@ class LocalIndicator {
   bool Start(StopAll stop_all, EnvironmentChanged environment_changed);
   void Update(int viewers, int controllers);
   UINT DispatchInput(UINT count, LPINPUT inputs, int size);
+  bool MovePointer(int x, int y);
   bool InputAvailable();
   DWORD ClipboardSequence() const;
   std::optional<std::u16string> ReadClipboardText(

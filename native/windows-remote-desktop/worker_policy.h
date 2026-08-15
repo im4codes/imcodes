@@ -38,6 +38,12 @@ CaptureAcquireAction ClassifyCaptureAcquireResult(HRESULT result);
 WorkerEnvironmentAction SelectWorkerEnvironmentAction(uint32_t event_mask);
 bool AdvanceTopologyRefreshDebounce(bool refresh_requested,
                                     int* remaining_ticks);
+DWORD CurrentDwmProcessIdForCurrentSession();
+// Tracks the session-local DWM process without treating a temporarily absent
+// compositor as a restart. The first observed pid establishes the baseline;
+// a later nonzero pid change requires capture and peer reinitialization.
+bool AdvanceCompositorProcessGeneration(DWORD current_process_id,
+                                        DWORD* previous_process_id);
 
 struct DisplaySelectionCandidate {
   std::string id;
