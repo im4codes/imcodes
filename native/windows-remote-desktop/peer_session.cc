@@ -670,13 +670,14 @@ bool PeerSession::RefreshDisplays(std::vector<DisplayInfo> displays) {
         break;
       }
     }
-    if (!video_sender || !video_sender->SetTrack(nullptr)) return false;
-    track_ = nullptr;
-    if (source_ && release_source_) release_source_(source_->display());
-    source_ = nullptr;
-
+    // A topology transition is allowed to be noisy: indirect-display drivers
+    // commonly publish the new output before DXGI duplication can open it.
+    // Keep the proven live track attached until the replacement is ready.
+    // Dropping it first turns a transient display change into a terminal
+    // media_unavailable for the whole remote-control session.
+    if (!video_sender) return true;
     auto next_source = acquire_source_(*selected);
-    if (!next_source) return false;
+    if (!next_source) return true;
     next_source->Start();
     auto next_track = factory_->CreateVideoTrack(next_source,
                                                   "imcodes-remote-desktop");
@@ -684,10 +685,13 @@ bool PeerSession::RefreshDisplays(std::vector<DisplayInfo> displays) {
                           video_sender->GenerateKeyFrame({}).ok();
     if (!replaced) {
       if (release_source_) release_source_(next_source->display());
-      return false;
+      return true;
     }
+    const std::optional<DisplayInfo> previous_display =
+        source_ ? std::optional<DisplayInfo>(source_->display()) : std::nullopt;
     source_ = std::move(next_source);
     track_ = std::move(next_track);
+    if (previous_display && release_source_) release_source_(*previous_display);
     ResetMediaProgressWatchdog();
   }
   selected_display_ = static_cast<size_t>(selected - displays.begin());

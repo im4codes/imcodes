@@ -436,12 +436,14 @@ const contracts: Contract[] = [
       {
         path: 'native/windows-remote-desktop/peer_session.cc',
         needle: 'SetTrack(nullptr)',
-        minimum: 2,
       },
       {
         path: 'native/windows-remote-desktop/peer_session.cc',
         needle: 'if (source_ && release_source_) release_source_(source_->display());',
-        minimum: 2,
+      },
+      {
+        path: 'native/windows-remote-desktop/peer_session.cc',
+        needle: 'if (previous_display && release_source_) release_source_(*previous_display);',
       },
     ],
   },
@@ -776,6 +778,12 @@ const mutations: Mutation[] = [
     needle: 'if (source_ && release_source_) release_source_(source_->display());',
   },
   {
+    name: 'remove old capture-source release after successful replacement',
+    contract: 'bounded native media teardown before reconnect',
+    path: 'native/windows-remote-desktop/peer_session.cc',
+    needle: 'if (previous_display && release_source_) release_source_(*previous_display);',
+  },
+  {
     name: 'remove reviewed TURN conversion',
     contract: 'reviewed TURN conversion',
     path: 'web/src/remote-desktop-client.ts',
@@ -948,6 +956,19 @@ describe('remote desktop load-bearing mutation guards', () => {
     const encoder = sources['native/windows-remote-desktop/mf_h264_encoder.cc'];
     const init = encoder.slice(encoder.indexOf('int MfH264Encoder::InitEncode'), encoder.indexOf('int32_t MfH264Encoder::RegisterEncodeCompleteCallback'));
     expect(init).not.toContain('hardware_disqualified_ = false');
+  });
+
+  it('keeps the current video track during a transient display-source replacement failure', () => {
+    const peer = sources['native/windows-remote-desktop/peer_session.cc'];
+    const refresh = peer.slice(
+      peer.indexOf('bool PeerSession::RefreshDisplays'),
+      peer.indexOf('void PeerSession::OnDataChannel'),
+    );
+    expect(refresh).not.toContain('SetTrack(nullptr)');
+    expect(refresh).toContain('if (!video_sender) return true;');
+    expect(refresh).toContain('if (!next_source) return true;');
+    expect(refresh.indexOf('auto next_source = acquire_source_(*selected);'))
+      .toBeLessThan(refresh.indexOf('video_sender->SetTrack(next_track.get())'));
   });
 
   it('never invokes icacls synchronously on the remote-desktop daemon event loop', () => {
