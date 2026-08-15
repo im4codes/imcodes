@@ -185,6 +185,7 @@ export interface RemoteDesktopPanelProps {
   ws?: WsClient | null;
   minimized?: boolean;
   standalone?: boolean;
+  allowStandaloneWindow?: boolean;
   onMinimize?(): void;
   onRestore?(): void;
   onClose(): void;
@@ -203,6 +204,7 @@ export function RemoteDesktopPanel({
   ws = null,
   minimized = false,
   standalone = false,
+  allowStandaloneWindow = false,
   onMinimize,
   onRestore,
   onClose,
@@ -1325,7 +1327,7 @@ export function RemoteDesktopPanel({
             <span>{t('remote_desktop.controllers', { count: snapshot.controllerCount ?? (snapshot.mode === 'control' ? 1 : 0) })}</span>
           </div>
           <div class="remote-desktop-window-actions">
-            {!standalone && (
+            {!standalone && allowStandaloneWindow && (
               <button
                 type="button"
                 class="subsession-minimize-btn remote-desktop-open-window"

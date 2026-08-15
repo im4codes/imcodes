@@ -169,6 +169,7 @@ async function renderPanel(
   capabilities: string[] = [REMOTE_DESKTOP_CAPABILITY],
   panelProps: {
     minimized?: boolean;
+    allowStandaloneWindow?: boolean;
     onMinimize?: () => void;
     onRestore?: () => void;
     onClose?: () => void;
@@ -188,6 +189,7 @@ async function renderPanel(
     ws={ws as never}
     onClose={panelProps.onClose ?? vi.fn()}
     minimized={panelProps.minimized}
+    allowStandaloneWindow={panelProps.allowStandaloneWindow}
     onMinimize={panelProps.onMinimize}
     onRestore={panelProps.onRestore}
   />);
@@ -220,7 +222,10 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     const opened = { opener: window } as unknown as Window;
     const open = vi.spyOn(window, 'open').mockReturnValue(opened);
     const onClose = vi.fn();
-    const result = await renderPanel(undefined, [REMOTE_DESKTOP_CAPABILITY], { onClose });
+    const result = await renderPanel(undefined, [REMOTE_DESKTOP_CAPABILITY], {
+      allowStandaloneWindow: true,
+      onClose,
+    });
 
     act(() => (result.getByRole('button', {
       name: 'remote_desktop.open_new_window',
@@ -239,7 +244,10 @@ describe('RemoteDesktopPanel mobile gestures', () => {
   it('keeps the current desktop connected when the standalone popup is blocked', async () => {
     vi.spyOn(window, 'open').mockReturnValue(null);
     const onClose = vi.fn();
-    const result = await renderPanel(undefined, [REMOTE_DESKTOP_CAPABILITY], { onClose });
+    const result = await renderPanel(undefined, [REMOTE_DESKTOP_CAPABILITY], {
+      allowStandaloneWindow: true,
+      onClose,
+    });
 
     act(() => (result.getByRole('button', {
       name: 'remote_desktop.open_new_window',
@@ -247,6 +255,14 @@ describe('RemoteDesktopPanel mobile gestures', () => {
 
     expect(stop).not.toHaveBeenCalled();
     expect(onClose).not.toHaveBeenCalled();
+  });
+
+  it('does not offer standalone windows on mobile', async () => {
+    const result = await renderPanel();
+
+    expect(result.queryByRole('button', {
+      name: 'remote_desktop.open_new_window',
+    })).toBeNull();
   });
 
   it('uses shared window controls and minimizes without stopping the live desktop', async () => {

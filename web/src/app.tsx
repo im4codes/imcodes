@@ -6254,6 +6254,7 @@ export function App() {
           machine={remoteDesktopMachine}
           ws={wsRef.current}
           minimized={remoteDesktopMinimized}
+          allowStandaloneWindow={!isMobile}
           onMinimize={() => setRemoteDesktopMinimized(true)}
           onRestore={() => setRemoteDesktopMinimized(false)}
           onClose={() => {
