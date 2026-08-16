@@ -41,6 +41,7 @@ export { verifyWindowsAuthenticodeSigners } from './windows-artifact-trust.js';
 // revocation/provider checks on older Windows hosts to finish.
 const CONNECT_TIMEOUT_MS = 30_000;
 const HELLO_TIMEOUT_MS = 2_000;
+const VIRTUAL_DISPLAY_SHUTDOWN_GRACE_MS = 1_000;
 const MAX_LINE_BYTES = 512 * 1024;
 const SHA256_RE = /^[a-f0-9]{64}$/;
 
@@ -191,6 +192,7 @@ interface TrackedAuthority {
 interface VirtualDisplayControllerProcess {
   readonly exitCode: number | null;
   readonly stdin: { end(): void };
+  kill?(): boolean;
   once(event: 'exit', listener: (code: number | null) => void): unknown;
 }
 
@@ -208,6 +210,7 @@ export interface RemoteDesktopWorkerHostOptions {
   connectTimeoutMs?: number;
   virtualDisplayStartupMs?: number;
   virtualDisplayActivationMs?: number;
+  virtualDisplayShutdownGraceMs?: number;
   launchVirtualDisplay?: (executable: string) => VirtualDisplayControllerProcess;
   activateVirtualDisplay?: (executable: string) => void;
   wait?: (milliseconds: number) => Promise<void>;
@@ -673,6 +676,15 @@ export class RemoteDesktopWorkerHost {
     const controller = this.virtualDisplayController;
     this.virtualDisplayController = null;
     this.virtualDisplayStartPromise = null;
-    try { controller?.stdin.end(); } catch {}
+    if (!controller) return;
+    try { controller.stdin.end(); } catch {}
+    // stdin close is the normal SwDevice lifetime signal.  Do not leave an
+    // orphaned controller (and its temporary virtual display) behind if a
+    // Windows pipe close is lost: it poisons the next capture topology.
+    const forceStop = setTimeout(() => {
+      if (controller.exitCode === null) controller.kill?.();
+    }, this.options.virtualDisplayShutdownGraceMs ?? VIRTUAL_DISPLAY_SHUTDOWN_GRACE_MS);
+    forceStop.unref?.();
+    controller.once('exit', () => clearTimeout(forceStop));
   }
 }

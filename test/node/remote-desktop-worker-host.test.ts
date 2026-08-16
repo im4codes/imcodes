@@ -718,6 +718,33 @@ describe('remote desktop worker artifact and IPC host', () => {
     expect(controller.stdin.end).toHaveBeenCalledOnce();
   });
 
+  it('terminates an orphaned virtual-display controller after its pipe-close grace period', async () => {
+    const controller = new EventEmitter() as EventEmitter & {
+      exitCode: number | null;
+      stdin: { end: ReturnType<typeof vi.fn> };
+      kill: ReturnType<typeof vi.fn>;
+    };
+    controller.exitCode = null;
+    controller.stdin = { end: vi.fn() };
+    controller.kill = vi.fn(() => {
+      controller.exitCode = 1;
+      controller.emit('exit', 1);
+      return true;
+    });
+    const host = new RemoteDesktopWorkerHost(() => {}, {
+      platform: 'win32',
+      artifact,
+      virtualDisplayShutdownGraceMs: 0,
+    });
+    (host as unknown as { virtualDisplayController: typeof controller | null })
+      .virtualDisplayController = controller;
+
+    (host as unknown as { stopVirtualDisplayController(): void })
+      .stopVirtualDisplayController();
+    await vi.waitFor(() => expect(controller.kill).toHaveBeenCalledOnce());
+    expect(controller.stdin.end).toHaveBeenCalledOnce();
+  });
+
   it('cancels an in-flight virtual display start when its only session stops', async () => {
     const temp = await mkdtemp(join(tmpdir(), 'imcodes-rd-host-cancel-headless-'));
     cleanup.push(() => rm(temp, { recursive: true, force: true }));
