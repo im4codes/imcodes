@@ -630,7 +630,7 @@ describe('remote desktop worker artifact and IPC host', () => {
     expect(firstHostSocket.destroyed).toBe(true);
   });
 
-  it('retries an enumerated-but-non-presenting desktop once through the shared virtual display', async () => {
+  it('adds a shared virtual display only after an explicit headless result', async () => {
     const temp = await mkdtemp(join(tmpdir(), 'imcodes-rd-host-headless-'));
     cleanup.push(() => rm(temp, { recursive: true, force: true }));
     const pipePath = join(temp, 'worker.sock');
@@ -692,28 +692,52 @@ describe('remote desktop worker artifact and IPC host', () => {
       requestId,
       sessionId,
       capability,
-      reason: 'media_unavailable',
+      reason: REMOTE_DESKTOP_TERMINAL_REASON.MEDIA_UNAVAILABLE,
+    })}\n`);
+    await vi.waitFor(() => expect(received).toEqual([
+      expect.objectContaining({ reason: REMOTE_DESKTOP_TERMINAL_REASON.MEDIA_UNAVAILABLE }),
+    ]));
+    expect(launchVirtualDisplay).not.toHaveBeenCalled();
+    expect(activateVirtualDisplay).not.toHaveBeenCalled();
+
+    const headlessPrepare = {
+      ...prepare,
+      requestId: 'request_headless',
+      sessionId: 'session_headless',
+      capability: 'b'.repeat(43),
+    } as const;
+    await expect(host.handle(headlessPrepare)).resolves.toBe(true);
+    helper!.write(`${JSON.stringify({
+      type: REMOTE_DESKTOP_MSG.TERMINAL,
+      requestId: headlessPrepare.requestId,
+      sessionId: headlessPrepare.sessionId,
+      capability: headlessPrepare.capability,
+      reason: REMOTE_DESKTOP_TERMINAL_REASON.HEADLESS_DISPLAY,
     })}\n`);
     await vi.waitFor(() => {
       expect(helperBuffer.trim().split('\n').map((line) => JSON.parse(line))).toEqual([
         prepare,
-        prepare,
+        headlessPrepare,
+        headlessPrepare,
       ]);
     });
     expect(launchVirtualDisplay).toHaveBeenCalledOnce();
     expect(activateVirtualDisplay).toHaveBeenCalledOnce();
     expect(activateVirtualDisplay).toHaveBeenCalledWith(artifact.executablePath);
-    expect(received).toEqual([]);
+    expect(received).toEqual([
+      expect.objectContaining({ reason: REMOTE_DESKTOP_TERMINAL_REASON.MEDIA_UNAVAILABLE }),
+    ]);
 
     helper!.write(`${JSON.stringify({
       type: REMOTE_DESKTOP_MSG.TERMINAL,
-      requestId,
-      sessionId,
-      capability,
-      reason: 'media_unavailable',
+      requestId: headlessPrepare.requestId,
+      sessionId: headlessPrepare.sessionId,
+      capability: headlessPrepare.capability,
+      reason: REMOTE_DESKTOP_TERMINAL_REASON.MEDIA_UNAVAILABLE,
     })}\n`);
     await vi.waitFor(() => expect(received).toEqual([
-      expect.objectContaining({ reason: 'media_unavailable' }),
+      expect.objectContaining({ reason: REMOTE_DESKTOP_TERMINAL_REASON.MEDIA_UNAVAILABLE }),
+      expect.objectContaining({ reason: REMOTE_DESKTOP_TERMINAL_REASON.MEDIA_UNAVAILABLE }),
     ]));
     expect(controller.stdin.end).toHaveBeenCalledOnce();
   });
@@ -804,7 +828,7 @@ describe('remote desktop worker artifact and IPC host', () => {
       requestId,
       sessionId,
       capability,
-      reason: REMOTE_DESKTOP_TERMINAL_REASON.MEDIA_UNAVAILABLE,
+      reason: REMOTE_DESKTOP_TERMINAL_REASON.HEADLESS_DISPLAY,
     })}\n`);
     await vi.waitFor(() => expect(verifyArtifactForLaunch).toHaveBeenCalledTimes(2));
     await expect(host.handle({
@@ -895,7 +919,7 @@ describe('remote desktop worker artifact and IPC host', () => {
         requestId: prepare.requestId,
         sessionId: prepare.sessionId,
         capability: prepare.capability,
-        reason: REMOTE_DESKTOP_TERMINAL_REASON.MEDIA_UNAVAILABLE,
+        reason: REMOTE_DESKTOP_TERMINAL_REASON.HEADLESS_DISPLAY,
       })}\n`);
     }
     await vi.waitFor(() => {
@@ -980,7 +1004,7 @@ describe('remote desktop worker artifact and IPC host', () => {
       requestId,
       sessionId,
       capability,
-      reason: REMOTE_DESKTOP_TERMINAL_REASON.MEDIA_UNAVAILABLE,
+      reason: REMOTE_DESKTOP_TERMINAL_REASON.HEADLESS_DISPLAY,
     } as const;
     helper!.write(`${JSON.stringify(mediaUnavailable)}\n`);
     await vi.waitFor(() => {
@@ -993,7 +1017,7 @@ describe('remote desktop worker artifact and IPC host', () => {
     await vi.waitFor(() => expect(received).toEqual([
       expect.objectContaining({
         type: REMOTE_DESKTOP_MSG.TERMINAL,
-        reason: REMOTE_DESKTOP_TERMINAL_REASON.MEDIA_UNAVAILABLE,
+        reason: REMOTE_DESKTOP_TERMINAL_REASON.HEADLESS_DISPLAY,
       }),
     ]));
     expect(launchVirtualDisplay).toHaveBeenCalledOnce();

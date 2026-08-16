@@ -73,6 +73,10 @@ export const REMOTE_DESKTOP_TERMINAL_REASON = {
   BROWSER_DISCONNECTED: 'browser_disconnected',
   DAEMON_REPLACED: 'daemon_replaced',
   WORKER_FAILED: 'worker_failed',
+  // Emitted only when the native worker finds no display at all during its
+  // initial prepare. The daemon may create its headless fallback for this
+  // condition, but must not do so for ordinary capture failures.
+  HEADLESS_DISPLAY: 'headless_display',
   MEDIA_UNAVAILABLE: 'media_unavailable',
   NEGOTIATION_TIMEOUT: 'negotiation_timeout',
   PEER_FAILED: 'peer_failed',

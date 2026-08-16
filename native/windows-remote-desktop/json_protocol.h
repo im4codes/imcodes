@@ -38,6 +38,7 @@ inline constexpr char kCancelType[] = "remote_desktop.cancel";
 inline constexpr char kStopType[] = "remote_desktop.stop";
 inline constexpr char kStatusType[] = "remote_desktop.status";
 inline constexpr char kTerminalType[] = "remote_desktop.terminal";
+inline constexpr char kHeadlessDisplayReason[] = "headless_display";
 
 inline constexpr char kTopologyType[] = "remote_desktop.data.display_topology";
 inline constexpr char kQualityType[] = "remote_desktop.data.quality";

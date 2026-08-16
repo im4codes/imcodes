@@ -519,7 +519,10 @@ export class RemoteDesktopWorkerHost {
       if (!tracked || capability.length !== tracked.capability.length
         || !timingSafeEqual(capability, tracked.capability)) continue;
       if (parsed.value.type === REMOTE_DESKTOP_MSG.TERMINAL) {
-        if (parsed.value.reason === REMOTE_DESKTOP_TERMINAL_REASON.MEDIA_UNAVAILABLE
+        // `media_unavailable` also covers transient DXGI/DWM failures while a
+        // physical output is switching. Only the worker's explicit initial
+        // no-display result is allowed to add a third, virtual display.
+        if (parsed.value.reason === REMOTE_DESKTOP_TERMINAL_REASON.HEADLESS_DISPLAY
           && !tracked.virtualRetryAttempted) {
           tracked.virtualRetryAttempted = true;
           void this.retryWithVirtualDisplay(parsed.value, tracked);

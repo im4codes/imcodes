@@ -332,7 +332,7 @@ class WorkerRuntime {
       std::vector<DisplayInfo> displays = EnumerateDisplays();
       if (displays.empty()) {
         writer_->Emit(TerminalEnvelope(signal.authority,
-                                       "media_unavailable"));
+                                       kHeadlessDisplayReason));
         return true;
       }
       int pending_controllers =
