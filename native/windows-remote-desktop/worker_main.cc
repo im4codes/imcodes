@@ -242,8 +242,12 @@ class WorkerRuntime {
             topology_scan_ticks_ = 0;
             std::vector<DisplayInfo> displays = EnumerateDisplays();
             if (displays.empty()) {
-              StopAllOnSignaling("media_unavailable", true);
+              if (AdvanceEmptyTopologyConsecutive(&empty_topology_ticks_)) {
+                StopAllOnSignaling("media_unavailable", true);
+                ResetCaptureSourcesOnSignaling();
+              }
             } else {
+              empty_topology_ticks_ = 0;
               for (auto& [id, session] : sessions_) {
                 if (!session->closed() && !session->RefreshDisplays(displays))
                   session->Close("media_unavailable");
@@ -462,9 +466,16 @@ class WorkerRuntime {
     if (sessions_.empty()) return;
     std::vector<DisplayInfo> displays = EnumerateDisplays();
     if (displays.empty()) {
-      StopAllOnSignaling("media_unavailable", true);
+      // RefreshTopologyOnSignaling() runs on the same signaling thread as the
+      // Maintenance() empty-scan. Reuse the same bounded grace counter so a
+      // single transient DXGI / DWM dip does not terminate every peer.
+      if (AdvanceEmptyTopologyConsecutive(&empty_topology_ticks_)) {
+        StopAllOnSignaling("media_unavailable", true);
+        ResetCaptureSourcesOnSignaling();
+      }
       return;
     }
+    empty_topology_ticks_ = 0;
     for (auto& [id, session] : sessions_) {
       if (!session->closed() && !session->RefreshDisplays(displays))
         session->Close("media_unavailable");
@@ -494,6 +505,7 @@ class WorkerRuntime {
   int compositor_scan_ticks_ = 0;
   int topology_scan_ticks_ = 0;
   int topology_refresh_debounce_ticks_ = 0;
+  int empty_topology_ticks_ = 0;
 };
 
 std::optional<std::pair<std::wstring, std::string>> ParseArguments() {

@@ -192,5 +192,25 @@ TEST(WorkerPolicyTest, OrdersIdleAuthorityAndLeaseExpiry) {
   EXPECT_EQ(SessionExpiryReason(100, 200, 150, false), nullptr);
 }
 
+// REPRODUCTION: prior to the empty-topology-grace fix, the worker had no
+// bounded counter between transient DXGI/DWM dips and the terminal
+// `media_unavailable` emission in Maintenance() / RefreshTopologyOnSignaling()
+// / RefreshDisplays(). This test calls the helper that did not yet exist and
+// the constant that did not yet exist. On the unfixed worker, this file fails
+// to compile (proving the missing bounded grace), then passes once the helper
+// lands in worker_policy.{h,cc} and is wired into worker_main.cc.
+TEST(WorkerPolicyTest, DelaysEmptyTopologyActionUntilGraceExceeded) {
+  EXPECT_EQ(kEmptyTopologyGraceTicks, kTopologyRefreshDebounceTicks);
+
+  int consecutive = 0;
+  for (int tick = 1; tick < kEmptyTopologyGraceTicks; ++tick) {
+    EXPECT_FALSE(AdvanceEmptyTopologyConsecutive(&consecutive));
+  }
+  EXPECT_FALSE(AdvanceEmptyTopologyConsecutive(&consecutive));
+  EXPECT_TRUE(AdvanceEmptyTopologyConsecutive(&consecutive));
+  EXPECT_EQ(consecutive, 0);
+  EXPECT_FALSE(AdvanceEmptyTopologyConsecutive(nullptr));
+}
+
 }  // namespace
 }  // namespace imcodes::rd

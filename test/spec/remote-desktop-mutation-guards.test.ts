@@ -18,6 +18,7 @@ const SOURCE_PATHS = [
   'native/windows-remote-desktop/mf_h264_encoder.h',
   'native/windows-remote-desktop/virtual_display_controller.cc',
   'native/windows-remote-desktop/worker_policy.cc',
+  'native/windows-remote-desktop/worker_policy.h',
   'native/windows-virtual-display/virtual_display_driver.cc',
   'native/windows-virtual-display/imcodes-virtual-display.inf',
   'src/node/remote-desktop-worker-host.ts',
@@ -244,6 +245,32 @@ const contracts: Contract[] = [
       {
         path: 'native/windows-remote-desktop/local_indicator.cc',
         needle: 'SetCursorPos(request->x, request->y) == TRUE',
+      },
+    ],
+  },
+  {
+    name: 'bounded empty-topology grace under transient DXGI dips',
+    guards: [
+      {
+        path: 'native/windows-remote-desktop/worker_policy.h',
+        needle: 'kEmptyTopologyGraceTicks',
+      },
+      {
+        path: 'native/windows-remote-desktop/worker_policy.h',
+        needle: 'AdvanceEmptyTopologyConsecutive(int* consecutive_empty_ticks)',
+      },
+      {
+        path: 'native/windows-remote-desktop/worker_main.cc',
+        needle: 'AdvanceEmptyTopologyConsecutive(&empty_topology_ticks_)',
+        minimum: 2,
+      },
+      {
+        path: 'native/windows-remote-desktop/worker_main.cc',
+        needle: 'empty_topology_ticks_ = 0;',
+      },
+      {
+        path: 'native/windows-remote-desktop/peer_session.cc',
+        needle: 'if (displays.empty()) return true;',
       },
     ],
   },
@@ -926,6 +953,24 @@ const mutations: Mutation[] = [
     contract: 'exact selected-display pointer positioning',
     path: 'native/windows-remote-desktop/local_indicator.cc',
     needle: 'SetCursorPos(request->x, request->y) == TRUE',
+  },
+  {
+    name: 'remove empty-topology grace helper declaration',
+    contract: 'bounded empty-topology grace under transient DXGI dips',
+    path: 'native/windows-remote-desktop/worker_policy.h',
+    needle: 'kEmptyTopologyGraceTicks',
+  },
+  {
+    name: 'remove empty-topology grace wiring in worker_main',
+    contract: 'bounded empty-topology grace under transient DXGI dips',
+    path: 'native/windows-remote-desktop/worker_main.cc',
+    needle: 'AdvanceEmptyTopologyConsecutive(&empty_topology_ticks_)',
+  },
+  {
+    name: 'restore hard-fail on transient empty topology in peer_session',
+    contract: 'bounded empty-topology grace under transient DXGI dips',
+    path: 'native/windows-remote-desktop/peer_session.cc',
+    needle: 'if (displays.empty()) return true;',
   },
 ];
 

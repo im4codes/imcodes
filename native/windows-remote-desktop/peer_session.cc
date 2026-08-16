@@ -625,7 +625,12 @@ bool PeerSession::protected_content_masked() const {
 }
 
 bool PeerSession::RefreshDisplays(std::vector<DisplayInfo> displays) {
-  if (closed_ || displays.empty()) return false;
+  if (closed_) return false;
+  // A transient `displays.empty()` is the same observation the WorkerRuntime
+  // already debounces through AdvanceEmptyTopologyConsecutive(); treating it
+  // as a hard fail here would short-circuit that grace window and surface a
+  // premature `media_unavailable` to the caller.
+  if (displays.empty()) return true;
   if (SameTopology(displays_, displays)) return true;
   const DisplayInfo previous = source_ ? source_->display()
                                        : displays_[selected_display_];

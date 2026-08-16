@@ -15,6 +15,12 @@ enum class CaptureAcquireAction { kFrame, kWait, kReset, kDrop };
 inline constexpr int kFirstPresentableFrameTimeoutMs = 3'000;
 inline constexpr DWORD kWorkerShutdownGraceMs = 5'000;
 inline constexpr int kTopologyRefreshDebounceTicks = 4;
+// Bounded grace window for a transient empty DXGI enumeration (one indirect
+// display driver dipping, a single DWM composition cycle, or a hot-swap that
+// resolves within the next few ticks). Mirrors the topology-refresh debounce
+// semantics so the worker survives a single-tick dip without emitting the
+// terminal `media_unavailable` reason. Sustained loss still terminates.
+inline constexpr int kEmptyTopologyGraceTicks = 4;
 // Deliberately shorter than the browser's 10-second receive watchdog so the
 // worker can disqualify a wedged hardware encoder before browser teardown wins
 // the race and immediately recreates the same broken encoder.
@@ -38,6 +44,12 @@ CaptureAcquireAction ClassifyCaptureAcquireResult(HRESULT result);
 WorkerEnvironmentAction SelectWorkerEnvironmentAction(uint32_t event_mask);
 bool AdvanceTopologyRefreshDebounce(bool refresh_requested,
                                     int* remaining_ticks);
+// Increments the consecutive-empty-topology counter on every call and returns
+// `true` only after the counter strictly exceeds `kEmptyTopologyGraceTicks`.
+// Returns `false` for `nullptr` and for every tick strictly inside the grace
+// window; resets the counter to zero on the tick that fires the action so the
+// next transient dip is debounced again from scratch.
+bool AdvanceEmptyTopologyConsecutive(int* consecutive_empty_ticks);
 DWORD CurrentDwmProcessIdForCurrentSession();
 // Tracks the session-local DWM process without treating a temporarily absent
 // compositor as a restart. The first observed pid establishes the baseline;

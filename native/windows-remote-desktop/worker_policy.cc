@@ -44,6 +44,13 @@ bool AdvanceTopologyRefreshDebounce(bool refresh_requested,
   return *remaining_ticks == 0;
 }
 
+bool AdvanceEmptyTopologyConsecutive(int* consecutive_empty_ticks) {
+  if (!consecutive_empty_ticks) return false;
+  if (++(*consecutive_empty_ticks) <= kEmptyTopologyGraceTicks) return false;
+  *consecutive_empty_ticks = 0;
+  return true;
+}
+
 DWORD CurrentDwmProcessIdForCurrentSession() {
   DWORD session_id = 0;
   if (!ProcessIdToSessionId(GetCurrentProcessId(), &session_id)) return 0;
