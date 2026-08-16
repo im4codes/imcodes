@@ -85,7 +85,7 @@ const DEFAULT_CLAUDE_AUTH_REFRESH_POLL_MS = 500;
 const CLAUDE_AUTH_RECOVERY_GUIDANCE = 'Authentication recovery required: run `/logout`, fully exit Claude Code, then reopen it and run `/login` before retrying.';
 const CLAUDE_SDK_INPUT_PRIORITIES = {
   IMMEDIATE: 'now',
-  AFTER_ACTIVE_TURN: 'next',
+  NEXT_SAFE_BOUNDARY: 'next',
 } as const;
 
 // Claude Code ships native scheduling tools (RemoteTrigger creates a claude.ai
@@ -786,9 +786,9 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       uuid: notification.notificationId,
       // Queue append is not a user interrupt. `now` preempts the current
       // Agent SDK turn (which makes the UI look as if the agent slept); `next`
-      // retains the running turn and starts this queued input afterwards.
+      // drains after the current tool result and before the next model request.
       priority: notification.deliveryKind === PROVIDER_ACTIVE_TURN_DELIVERY_KINDS.QUEUED_MESSAGE
-        ? CLAUDE_SDK_INPUT_PRIORITIES.AFTER_ACTIVE_TURN
+        ? CLAUDE_SDK_INPUT_PRIORITIES.NEXT_SAFE_BOUNDARY
         : CLAUDE_SDK_INPUT_PRIORITIES.IMMEDIATE,
       origin: {
         kind: 'peer',

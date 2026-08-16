@@ -1966,11 +1966,11 @@ export class TransportSessionRuntime implements SessionRuntime {
   }
 
   /**
-   * Deliver selected ordinary queued messages after the provider's active turn.
-   * Providers receive an explicit queued-message delivery kind so they never
-   * mistake this user action for a preemptive delegation reply. Queue ids and
-   * tombstones remain retained for exactly-once UI reconciliation. Unsupported
-   * providers fail closed and keep the FIFO.
+   * Insert selected ordinary queued messages at the provider's next safe
+   * in-turn boundary. Providers receive an explicit queued-message delivery
+   * kind so they never mistake this user action for a preemptive delegation
+   * reply. Queue ids and tombstones remain retained for exactly-once UI
+   * reconciliation. Unsupported providers fail closed and keep the FIFO.
    */
   async appendPendingMessagesToActiveTurn(
     clientMessageIds: string[],

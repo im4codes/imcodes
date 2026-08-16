@@ -234,8 +234,8 @@ export interface ProviderDelegationNotification {
   sourceSessionName: string;
   text: string;
   /**
-   * Delegation replies are time-sensitive; ordinary queued messages must wait
-   * for the active turn instead of preempting it. Omitted means a delegation
+   * Delegation replies may preempt; ordinary queued messages must enter at the
+   * provider's next safe in-turn boundary instead. Omitted means a delegation
    * reply for backwards-compatible provider callers.
    */
   deliveryKind?: ProviderActiveTurnDeliveryKind;

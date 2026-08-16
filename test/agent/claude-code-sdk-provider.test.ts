@@ -177,7 +177,7 @@ describe('ClaudeCodeSdkProvider', () => {
     await sendPromise;
   });
 
-  it('queues an appended message after the active Claude turn instead of preempting it', async () => {
+  it('inserts an appended message at Claude\'s next safe boundary instead of preempting it', async () => {
     sdkMock.setWaitForClose(true);
     const provider = new ClaudeCodeSdkProvider();
     await provider.connect({ binaryPath: 'claude' });
@@ -193,7 +193,7 @@ describe('ClaudeCodeSdkProvider', () => {
       notificationId: 'queued_notification_identity',
       delegationId: 'queue-append:queued_notification_identity',
       sourceSessionName: 'deck_project_brain',
-      text: 'append after the current turn',
+      text: 'append at the next safe boundary',
       deliveryKind: PROVIDER_ACTIVE_TURN_DELIVERY_KINDS.QUEUED_MESSAGE,
     });
 
@@ -202,12 +202,12 @@ describe('ClaudeCodeSdkProvider', () => {
     expect(queue.buffer?.at(-1)).toMatchObject({
       type: 'user',
       uuid: 'queued_notification_identity',
-      // `now` cancels/preempts an Agent SDK turn. Appended user queue rows must
-      // wait for the live turn rather than make MiniMax/Qwen look like it slept.
+      // `now` cancels/preempts an Agent SDK turn. `next` keeps the live turn
+      // running and drains at its next safe boundary.
       priority: 'next',
       shouldQuery: true,
       isSynthetic: true,
-      message: { role: 'user', content: 'append after the current turn' },
+      message: { role: 'user', content: 'append at the next safe boundary' },
     });
     expect(sdkMock.runs[0]?.closed).toBe(false);
 
