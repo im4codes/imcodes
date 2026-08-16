@@ -99,6 +99,7 @@ vi.mock('../../src/util/logger.js', () => ({
 }));
 
 import { ClaudeCodeSdkProvider } from '../../src/agent/providers/claude-code-sdk.js';
+import { PROVIDER_ACTIVE_TURN_DELIVERY_KINDS } from '../../src/agent/transport-provider.js';
 import type { AgentMessage, ToolCallEvent } from '../../shared/agent-message.js';
 import type { ProviderContextPayload } from '../../shared/context-types.js';
 import { MEMORY_MCP_STATUS } from '../../shared/memory-ws.js';
@@ -173,6 +174,44 @@ describe('ClaudeCodeSdkProvider', () => {
     expect(sdkMock.runs[0]?.closed).toBe(false);
 
     await provider.endSession('route-delegation-notify');
+    await sendPromise;
+  });
+
+  it('queues an appended message after the active Claude turn instead of preempting it', async () => {
+    sdkMock.setWaitForClose(true);
+    const provider = new ClaudeCodeSdkProvider();
+    await provider.connect({ binaryPath: 'claude' });
+    await provider.createSession({
+      sessionKey: 'route-queued-message-notify',
+      sessionName: 'deck_project_brain',
+      cwd: '/tmp/project',
+    });
+    const sendPromise = provider.send('route-queued-message-notify', 'foreground work');
+    await waitFor(() => sdkMock.runs.length === 1);
+
+    const result = await provider.notifyActiveDelegation?.('route-queued-message-notify', {
+      notificationId: 'queued_notification_identity',
+      delegationId: 'queue-append:queued_notification_identity',
+      sourceSessionName: 'deck_project_brain',
+      text: 'append after the current turn',
+      deliveryKind: PROVIDER_ACTIVE_TURN_DELIVERY_KINDS.QUEUED_MESSAGE,
+    });
+
+    expect(result).toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    const queue = sdkMock.runs[0]?.promptSource as { buffer?: Array<Record<string, any>> };
+    expect(queue.buffer?.at(-1)).toMatchObject({
+      type: 'user',
+      uuid: 'queued_notification_identity',
+      // `now` cancels/preempts an Agent SDK turn. Appended user queue rows must
+      // wait for the live turn rather than make MiniMax/Qwen look like it slept.
+      priority: 'next',
+      shouldQuery: true,
+      isSynthetic: true,
+      message: { role: 'user', content: 'append after the current turn' },
+    });
+    expect(sdkMock.runs[0]?.closed).toBe(false);
+
+    await provider.endSession('route-queued-message-notify');
     await sendPromise;
   });
 

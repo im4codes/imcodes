@@ -5,7 +5,7 @@ import { RUNTIME_TYPES } from './session-runtime.js';
 import type { AgentStatus } from './detect.js';
 import type { AgentMessage, MessageDelta } from '../../shared/agent-message.js';
 import type { TransportProvider, ProviderDelegationNotification, ProviderError, ProviderRolloutCompletionReconcileOptions, SessionConfig, SessionInfoUpdate, ProviderStatusUpdate, ProviderUsageUpdate, ToolCallEvent, SdkTurnLostRecoveryPhase, SdkTurnLostReplayDecision } from './transport-provider.js';
-import { BACKGROUND_SUBAGENT_WAKE_MODES, PROVIDER_CANCEL_ORIGINS, PROVIDER_ERROR_CODES, SDK_TURN_LOST_RECOVERY_PHASES, SDK_TURN_LOST_RECOVERY_STATUS } from './transport-provider.js';
+import { BACKGROUND_SUBAGENT_WAKE_MODES, PROVIDER_ACTIVE_TURN_DELIVERY_KINDS, PROVIDER_CANCEL_ORIGINS, PROVIDER_ERROR_CODES, SDK_TURN_LOST_RECOVERY_PHASES, SDK_TURN_LOST_RECOVERY_STATUS } from './transport-provider.js';
 import type { ApprovalRequest } from './transport-provider.js';
 import type { TransportEffortLevel } from '../../shared/effort-levels.js';
 import {
@@ -1921,7 +1921,10 @@ export class TransportSessionRuntime implements SessionRuntime {
         return AGENT_DELEGATION_NOTIFICATION_RESULTS.UNSUPPORTED;
       }
       const outcome = await withTimeoutOutcome(
-        this.provider.notifyActiveDelegation(this._providerSessionId, notification),
+        this.provider.notifyActiveDelegation(this._providerSessionId, {
+          ...notification,
+          deliveryKind: PROVIDER_ACTIVE_TURN_DELIVERY_KINDS.DELEGATION_REPLY,
+        }),
         DEFAULT_ACTIVE_DELEGATION_NOTIFICATION_TIMEOUT_MS,
       );
       // Admission must be a short control-plane operation. A provider adapter
@@ -1963,10 +1966,11 @@ export class TransportSessionRuntime implements SessionRuntime {
   }
 
   /**
-   * Steer selected ordinary queued messages into the provider's active turn.
-   * This deliberately reuses the same native, non-cancelling admission path as
-   * delegation replies, while retaining queue ids/tombstones for exactly-once
-   * UI reconciliation. Unsupported providers fail closed and keep the FIFO.
+   * Deliver selected ordinary queued messages after the provider's active turn.
+   * Providers receive an explicit queued-message delivery kind so they never
+   * mistake this user action for a preemptive delegation reply. Queue ids and
+   * tombstones remain retained for exactly-once UI reconciliation. Unsupported
+   * providers fail closed and keep the FIFO.
    */
   async appendPendingMessagesToActiveTurn(
     clientMessageIds: string[],
@@ -2037,6 +2041,7 @@ export class TransportSessionRuntime implements SessionRuntime {
         delegationId: `queue-append:${notificationId}`,
         sourceSessionName: this.sessionKey,
         text: selected.map((entry) => entry.providerText ?? entry.text).join('\n\n'),
+        deliveryKind: PROVIDER_ACTIVE_TURN_DELIVERY_KINDS.QUEUED_MESSAGE,
       });
     } catch (error) {
       restoreReservation();
@@ -2074,8 +2079,8 @@ export class TransportSessionRuntime implements SessionRuntime {
         // ambiguous "commit succeeded, snapshot read failed" case.
         finalized = store.finalizeSentBatch(this.sessionKey, selectedIds, notificationId);
       } catch (error) {
-        // Provider admission is irreversible. Once steer/priority-now accepted
-        // the text, a bookkeeping failure must not be reported as delivery
+        // Provider admission is irreversible. Once the provider accepts the
+        // text, a bookkeeping failure must not be reported as delivery
         // failure: doing so makes the browser restore and resend work the model
         // already received. Reconcile the public queue from runtime truth and
         // emit delivery facts so every viewer settles the selected ids. The

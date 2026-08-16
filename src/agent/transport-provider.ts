@@ -77,6 +77,12 @@ export const PROVIDER_CANCEL_ORIGINS = {
   STALE_WATCHDOG: 'stale_watchdog',
 } as const;
 
+/** Why text is being admitted to an already-active provider turn. */
+export const PROVIDER_ACTIVE_TURN_DELIVERY_KINDS = {
+  DELEGATION_REPLY: 'delegation_reply',
+  QUEUED_MESSAGE: 'queued_message',
+} as const;
+
 // ── Derived types ───────────────────────────────────────────────────────────
 
 /** Connection mode determines how the transport manages the agent lifecycle. */
@@ -88,6 +94,8 @@ export type SessionOwnership = typeof SESSION_OWNERSHIP[keyof typeof SESSION_OWN
 /** Error code from a provider operation. */
 export type ProviderErrorCode = typeof PROVIDER_ERROR_CODES[keyof typeof PROVIDER_ERROR_CODES];
 export type ProviderCancelOrigin = typeof PROVIDER_CANCEL_ORIGINS[keyof typeof PROVIDER_CANCEL_ORIGINS];
+export type ProviderActiveTurnDeliveryKind =
+  typeof PROVIDER_ACTIVE_TURN_DELIVERY_KINDS[keyof typeof PROVIDER_ACTIVE_TURN_DELIVERY_KINDS];
 
 export interface ProviderCancelOptions {
   origin: ProviderCancelOrigin;
@@ -225,6 +233,12 @@ export interface ProviderDelegationNotification {
   delegationId: string;
   sourceSessionName: string;
   text: string;
+  /**
+   * Delegation replies are time-sensitive; ordinary queued messages must wait
+   * for the active turn instead of preempting it. Omitted means a delegation
+   * reply for backwards-compatible provider callers.
+   */
+  deliveryKind?: ProviderActiveTurnDeliveryKind;
 }
 
 /**

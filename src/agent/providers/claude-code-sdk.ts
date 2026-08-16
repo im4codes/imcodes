@@ -24,6 +24,7 @@ import {
   BACKGROUND_SUBAGENT_WAKE_MODES,
   CONNECTION_MODES,
   normalizeProviderPayload,
+  PROVIDER_ACTIVE_TURN_DELIVERY_KINDS,
   SESSION_OWNERSHIP,
   PROVIDER_ERROR_CODES,
 } from '../transport-provider.js';
@@ -82,6 +83,10 @@ const CLAUDE_AUTH_REFRESH_RETRY_LIMIT = 1;
 const DEFAULT_CLAUDE_AUTH_REFRESH_WAIT_MS = 2 * 60 * 1000;
 const DEFAULT_CLAUDE_AUTH_REFRESH_POLL_MS = 500;
 const CLAUDE_AUTH_RECOVERY_GUIDANCE = 'Authentication recovery required: run `/logout`, fully exit Claude Code, then reopen it and run `/login` before retrying.';
+const CLAUDE_SDK_INPUT_PRIORITIES = {
+  IMMEDIATE: 'now',
+  AFTER_ACTIVE_TURN: 'next',
+} as const;
 
 // Claude Code ships native scheduling tools (RemoteTrigger creates a claude.ai
 // routine; the Cron* tools manage them) that bypass IM.codes entirely. We
@@ -779,7 +784,12 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       message: { role: 'user', content: notification.text },
       parent_tool_use_id: null,
       uuid: notification.notificationId,
-      priority: 'now',
+      // Queue append is not a user interrupt. `now` preempts the current
+      // Agent SDK turn (which makes the UI look as if the agent slept); `next`
+      // retains the running turn and starts this queued input afterwards.
+      priority: notification.deliveryKind === PROVIDER_ACTIVE_TURN_DELIVERY_KINDS.QUEUED_MESSAGE
+        ? CLAUDE_SDK_INPUT_PRIORITIES.AFTER_ACTIVE_TURN
+        : CLAUDE_SDK_INPUT_PRIORITIES.IMMEDIATE,
       origin: {
         kind: 'peer',
         from: notification.sourceSessionName,
