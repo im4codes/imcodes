@@ -787,6 +787,12 @@ const contracts: Contract[] = [
         needle: 'bool CurrentSessionIsLocked()',
       },
       {
+        // WTS_SESSIONSTATE_LOCK is 0: a mask test reports every locked machine
+        // as unlocked, which is precisely how this shipped doing nothing.
+        path: 'native/windows-remote-desktop/worker_main.cc',
+        needle: 'SessionFlags == WTS_SESSIONSTATE_LOCK',
+      },
+      {
         path: 'native/windows-remote-desktop/worker_main.cc',
         needle: 'session->SetSignInState(sign_in_screen, unlock_available)',
       },

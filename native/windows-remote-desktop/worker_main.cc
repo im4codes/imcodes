@@ -129,8 +129,11 @@ bool CurrentSessionIsLocked() {
   }
   bool locked = false;
   if (info->Level == 1) {
-    locked = (info->Data.WTSInfoExLevel1.SessionFlags &
-              WTS_SESSIONSTATE_LOCK) != 0;
+    // WTS_SESSIONSTATE_LOCK is 0, so this is a comparison and never a mask
+    // test: `flags & WTS_SESSIONSTATE_LOCK` is always zero and reports every
+    // locked machine as unlocked. Measured on the node: 0x0 while at the lock
+    // screen, 0x1 the instant it unlocks.
+    locked = info->Data.WTSInfoExLevel1.SessionFlags == WTS_SESSIONSTATE_LOCK;
   }
   WTSFreeMemory(info);
   return locked;
