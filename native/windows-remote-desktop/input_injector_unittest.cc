@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cwchar>
 #include <iterator>
+#include <string>
 #include <vector>
 
 #include "test/gtest.h"
@@ -191,10 +192,11 @@ TEST(InputArbiterTest, EncodesTextAsBoundedUnicodeInputPairs) {
   EXPECT_TRUE(input.Text(u"A"));
   ASSERT_EQ(recording.events.size(), 2u);
   EXPECT_EQ(recording.events[0].ki.wScan, static_cast<WORD>(u'A'));
-  EXPECT_EQ(recording.events[0].ki.dwFlags, KEYEVENTF_UNICODE);
+  EXPECT_EQ(recording.events[0].ki.dwFlags,
+            static_cast<DWORD>(KEYEVENTF_UNICODE));
   EXPECT_EQ(recording.events[1].ki.wScan, static_cast<WORD>(u'A'));
   EXPECT_EQ(recording.events[1].ki.dwFlags,
-            KEYEVENTF_UNICODE | KEYEVENTF_KEYUP);
+            static_cast<DWORD>(KEYEVENTF_UNICODE | KEYEVENTF_KEYUP));
 }
 
 TEST(InputArbiterTest, SecureConsoleAcceptsNonTextInputWithoutChangingState) {
