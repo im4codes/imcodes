@@ -8,6 +8,7 @@ import { act, render, cleanup, fireEvent, waitFor } from '@testing-library/preac
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { ControlledNodeAvailability, MachineListItem } from '../src/api/machines.js';
 import { REMOTE_DESKTOP_CAPABILITY } from '@shared/remote-desktop.js';
+import { CONTROLLED_NODE_AUTO_UNLOCK_CAPABILITY } from '@shared/controlled-node-auto-unlock.js';
 
 const translate = (key: string, options?: Record<string, string>) =>
   key === 'controlled_nodes.artifact_meta' && options?.detail ? options.detail : key;
@@ -224,6 +225,27 @@ describe('ControlledNodesPanel (12.3)', () => {
     expect(container.querySelectorAll('.controlled-nodes-version.is-outdated')).toHaveLength(1);
     expect(rows[1]?.querySelector('.controlled-nodes-version.is-outdated')).toBeTruthy();
     expect(rows[2]?.textContent).toContain('controlled_nodes.version_unknown');
+  });
+
+  it('offers auto unlock only on a node whose worker can hold the secret', async () => {
+    machines = [
+      machine({
+        serverId: 'win-capable',
+        refName: 'w1',
+        displayName: 'Windows box',
+        os: 'win',
+        capabilities: [REMOTE_DESKTOP_CAPABILITY, CONTROLLED_NODE_AUTO_UNLOCK_CAPABILITY],
+      }),
+      // Same OS, older build: no advertisement, so no promise of the feature.
+      machine({ serverId: 'win-old', refName: 'w2', displayName: 'Old Windows', os: 'win', capabilities: [REMOTE_DESKTOP_CAPABILITY] }),
+      machine({ serverId: 'linux', refName: 'l1', displayName: 'Linux box', os: 'linux' }),
+    ];
+    const { container } = render(<ControlledNodesPanel />);
+    await waitFor(() => expect(container.textContent).toContain('Windows box'));
+
+    const rows = Array.from(container.querySelectorAll('.controlled-nodes-machine-row'));
+    expect(rows.map((row) => Boolean(row.querySelector('.controlled-nodes-auto-unlock'))))
+      .toEqual([true, false, false]);
   });
 
   it('offers one download button per canonical (os, arch) artifact', async () => {

@@ -16,6 +16,7 @@ import { WsBridge } from '../src/ws/bridge.js';
 import { MACHINE_LIST_MAX_ITEMS, NODE_ROLE } from '../../shared/remote-exec.js';
 import { MACHINE_REASONS } from '../../shared/machine-reference.js';
 import { REMOTE_DESKTOP_CAPABILITY } from '../../shared/remote-desktop.js';
+import { CONTROLLED_NODE_AUTO_UNLOCK_ERROR } from '../../shared/controlled-node-auto-unlock.js';
 import { signJwt } from '../src/security/crypto.js';
 
 let db: Database;
@@ -209,6 +210,44 @@ describe('owner-scoped machine rename', () => {
     expect(denied.status).toBe(404);
     expect(await db.queryOne<{ display_name: string }>('SELECT display_name FROM servers WHERE id = $1', [controlledId]))
       .toEqual({ display_name: 'Old name' });
+  });
+});
+
+describe('auto unlock capability gate', () => {
+  it('refuses a node that never advertised auto unlock instead of waiting it out', async () => {
+    const app = buildApp();
+    const userId = `u_${hex(4)}`;
+    await createUser(db, userId);
+    const owner = await fullCredential(userId);
+    const controlledId = `ctl_${hex(8)}`;
+    // Advertises remote desktop but not auto unlock: an older Windows build.
+    await db.execute(
+      `INSERT INTO servers (id, user_id, name, token_hash, status, created_at, node_role, exec_enabled, ref_name, display_name, os, controlled_capabilities)
+       VALUES ($1,$2,'controlled',$3,'online',$4,$5,true,'win-ref','Win box','win',$6)`,
+      [controlledId, userId, sha256(hex(16)), Date.now(), NODE_ROLE.CONTROLLED,
+        JSON.stringify([REMOTE_DESKTOP_CAPABILITY])],
+    );
+
+    const started = Date.now();
+    const response = await app.request(`/api/machines/${controlledId}/auto-unlock`, {
+      method: 'POST',
+      headers: {
+        'X-Server-Id': owner.serverId,
+        authorization: `Bearer ${owner.token}`,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({ secret: 'hunter2' }),
+    });
+    expect(response.status).toBe(409);
+    expect(await response.json()).toEqual({
+      error: CONTROLLED_NODE_AUTO_UNLOCK_ERROR.UNSUPPORTED_PLATFORM,
+    });
+    // Refused on the spot, not after the node-reply timeout.
+    expect(Date.now() - started).toBeLessThan(2_000);
+    expect(await db.queryOne<{ auto_unlock_configured: boolean }>(
+      'SELECT auto_unlock_configured FROM servers WHERE id = $1',
+      [controlledId],
+    )).toEqual({ auto_unlock_configured: false });
   });
 });
 

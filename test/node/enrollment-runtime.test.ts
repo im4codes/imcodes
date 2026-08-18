@@ -30,6 +30,7 @@ import {
   REMOTE_DESKTOP_MSG,
 } from '../../shared/remote-desktop.js';
 import { CONTROLLED_NODE_SAFE_SELF_UPGRADE_CAPABILITY } from '../../shared/controlled-node-service.js';
+import { CONTROLLED_NODE_AUTO_UNLOCK_CAPABILITY } from '../../shared/controlled-node-auto-unlock.js';
 
 const { receiveMachineDirectUploadMock, sendMachineDirectFetchMock } = vi.hoisted(() => ({
   receiveMachineDirectUploadMock: vi.fn(),
@@ -146,7 +147,10 @@ describe('controlled node enrollment and runtime', () => {
     }, () => socket, { remoteDesktopWorker });
     runtime.start();
     socket.open();
-    expect(JSON.parse(socket.sent[0]!).capabilities).toContain(REMOTE_DESKTOP_CAPABILITY);
+    const advertised = JSON.parse(socket.sent[0]!).capabilities as string[];
+    expect(advertised).toContain(REMOTE_DESKTOP_CAPABILITY);
+    // Auto unlock lives in that same worker, so it is advertised with it.
+    expect(advertised).toContain(CONTROLLED_NODE_AUTO_UNLOCK_CAPABILITY);
 
     const prepare = {
       type: REMOTE_DESKTOP_MSG.PREPARE,
@@ -192,6 +196,7 @@ describe('controlled node enrollment and runtime', () => {
     socket.open();
     const authFrame = JSON.parse(socket.sent[0]!);
     expect(authFrame.capabilities).not.toContain(REMOTE_DESKTOP_CAPABILITY);
+    expect(authFrame.capabilities).not.toContain(CONTROLLED_NODE_AUTO_UNLOCK_CAPABILITY);
     expect(authFrame.capabilities).toEqual(expect.arrayContaining([
       FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY,
       FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY,

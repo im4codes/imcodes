@@ -29,6 +29,8 @@ import { randomUUID } from 'node:crypto';
 import { DAEMON_COMMAND_TYPES } from '../../../shared/daemon-command-types.js';
 import {
   CONTROLLED_NODE_AUTO_UNLOCK_ACTION,
+  CONTROLLED_NODE_AUTO_UNLOCK_CAPABILITY,
+  CONTROLLED_NODE_AUTO_UNLOCK_ERROR,
   CONTROLLED_NODE_AUTO_UNLOCK_LIMITS,
 } from '../../../shared/controlled-node-auto-unlock.js';
 import {
@@ -252,12 +254,20 @@ machinesRoutes.post('/:serverId/auto-unlock', requireAuth(), async (c) => {
   }).safeParse(body);
   if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
 
-  const owned = await c.env.DB.queryOne<{ id: string }>(
-    `SELECT id FROM servers
+  const owned = await c.env.DB.queryOne<{ id: string; controlled_capabilities: unknown }>(
+    `SELECT id, controlled_capabilities FROM servers
       WHERE id = $1 AND user_id = $2 AND node_role = $3 AND revoked_at IS NULL`,
     [serverId, userId, NODE_ROLE.CONTROLLED],
   );
   if (!owned) return c.json({ error: 'not_found' }, 404);
+  // A node that never advertised auto unlock cannot answer this command; it
+  // would simply not reply, and the caller would wait out the whole timeout
+  // for what is really "this build does not have the feature".
+  const capabilities = validateControlledNodeCapabilities(owned.controlled_capabilities);
+  if (!capabilities.ok
+    || !capabilities.value.includes(CONTROLLED_NODE_AUTO_UNLOCK_CAPABILITY)) {
+    return c.json({ error: CONTROLLED_NODE_AUTO_UNLOCK_ERROR.UNSUPPORTED_PLATFORM }, 409);
+  }
 
   const bridge = WsBridge.get(serverId);
   const generation = bridge.daemonConnectionGeneration();

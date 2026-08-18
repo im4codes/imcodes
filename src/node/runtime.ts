@@ -52,6 +52,7 @@ import { CONTROLLED_NODE_SAFE_SELF_UPGRADE_CAPABILITY } from '../../shared/contr
 import { cleanupLegacyWindowsUpgradeRescue } from './legacy-upgrade-rescue.js';
 import {
   CONTROLLED_NODE_AUTO_UNLOCK_ACTION,
+  CONTROLLED_NODE_AUTO_UNLOCK_CAPABILITY,
   CONTROLLED_NODE_AUTO_UNLOCK_ERROR,
   validateControlledNodeAutoUnlockCommand,
   type ControlledNodeAutoUnlockError,
@@ -182,7 +183,12 @@ export function createControlledNodeRuntime(
         MACHINE_DIRECT_FILE_TRANSFER_CAPABILITY,
         MACHINE_DIRECT_FILE_FETCH_CAPABILITY,
         CONTROLLED_NODE_SAFE_SELF_UPGRADE_CAPABILITY,
-        ...(remoteDesktopEnabled ? [REMOTE_DESKTOP_CAPABILITY] : []),
+        // Auto unlock rides on the same worker: without it there is nothing
+        // that can hold a secret or type at the sign-in desktop, so a node
+        // that cannot run the worker must not offer the option at all.
+        ...(remoteDesktopEnabled
+          ? [REMOTE_DESKTOP_CAPABILITY, CONTROLLED_NODE_AUTO_UNLOCK_CAPABILITY]
+          : []),
       ],
     },
     heartbeatMessage: { type: 'heartbeat', daemonVersion: DAEMON_VERSION },

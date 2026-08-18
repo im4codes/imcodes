@@ -17,12 +17,24 @@ import {
   type ControlledNodeArtifactSelection,
   type ControlledNodeOs,
 } from '../api/machines.js';
+import { CONTROLLED_NODE_AUTO_UNLOCK_CAPABILITY } from '@shared/controlled-node-auto-unlock.js';
 import { normalizeMachineDisplayName } from '@shared/machine-reference.js';
 import { useMachines } from '../hooks/useMachines.js';
 import { isNative } from '../native.js';
 import { ShareSessionDialog } from './ShareSessionDialog.js';
 import type { MachineListItem } from '../api/machines.js';
 import { canOpenRemoteDesktop } from './RemoteDesktopPanel.js';
+
+/**
+ * Auto unlock exists only where the remote-desktop worker does: it is that
+ * worker that holds the secret and types it at the sign-in desktop. Offering
+ * it on a node that cannot run one would promise something unreachable.
+ */
+function canConfigureAutoUnlock(machine: MachineListItem): boolean {
+  return (machine.accessRole ?? 'owner') === 'owner'
+    && machine.os === 'win'
+    && Boolean(machine.capabilities?.includes(CONTROLLED_NODE_AUTO_UNLOCK_CAPABILITY));
+}
 
 /**
  * Presence is DB-backed and changes independently of this browser after an
@@ -467,7 +479,7 @@ export function ControlledNodesPanel({
                       <span class="controlled-nodes-toggle-track" aria-hidden="true"><i /></span>
                       <span>{m.execEnabled ? t('controlled_nodes.exec_on') : t('controlled_nodes.exec_off')}</span>
                     </button>
-                    {autoUnlockServerId === m.serverId ? (
+                    {canConfigureAutoUnlock(m) && (autoUnlockServerId === m.serverId ? (
                       <form
                         class="controlled-nodes-auto-unlock-form"
                         onSubmit={(event) => {
@@ -502,7 +514,7 @@ export function ControlledNodesPanel({
                           ? t('controlled_nodes.auto_unlock_clear')
                           : t('controlled_nodes.auto_unlock_set')}
                       </button>
-                    )}
+                    ))}
                     <button
                       type="button"
                       class="controlled-nodes-revoke"
