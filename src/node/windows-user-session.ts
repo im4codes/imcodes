@@ -60,6 +60,7 @@ export function launchWindowsActiveUserCommand(
   spawnImpl: typeof spawn = spawn,
   preferLinkedElevatedToken = false,
   allowSecureDesktopFallback = false,
+  forceSecureConsole = false,
 ): void {
   const exe64 = Buffer.from(executable, 'utf8').toString('base64');
   const args64 = Buffer.from(argsLine, 'utf8').toString('base64');
@@ -69,7 +70,6 @@ $exe = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__EXE64__'))
 $argsLine = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__ARGS64__'))
 $src = @'
 using System;
-using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Security.Principal;
 public static class ImcodesUserProc {
@@ -185,22 +185,18 @@ public static class ImcodesUserProc {
       } finally { CloseHandle(primary); }
     } finally { CloseHandle(token); }
   }
-  static bool SecureConsoleDisplayed() {
-    int sid = unchecked((int)WTSGetActiveConsoleSessionId());
-    if (sid <= 0 || sid == -1) return false;
-    foreach (Process process in Process.GetProcessesByName("LogonUI")) {
-      try {
-        if (process.SessionId == sid) return true;
-      } catch { }
-      finally { process.Dispose(); }
-    }
-    return false;
-  }
-  public static void Start(string exe, string argsLine, bool preferLinkedElevatedToken, bool allowSecureDesktopFallback) {
+  public static void Start(string exe, string argsLine, bool preferLinkedElevatedToken, bool allowSecureDesktopFallback, bool forceSecureConsole) {
     IntPtr token, primary;
     IntPtr linkedToken = IntPtr.Zero;
     int sid;
-    if (allowSecureDesktopFallback && SecureConsoleDisplayed()) {
+    // A LogonUI process is not evidence that the sign-in desktop is displayed:
+    // it lingers after unlock on real machines, and trusting it launched the
+    // privileged Winlogon worker on a fully logged-in desktop, where it can
+    // neither capture nor inject. Only an explicit caller decision, or the
+    // absence of any console user token, selects the secure console now; a
+    // locked session is detected by the worker itself, which owns the only
+    // authoritative view of the input desktop.
+    if (forceSecureConsole) {
       StartSecureConsole(exe, argsLine);
       return;
     }
@@ -236,11 +232,12 @@ public static class ImcodesUserProc {
 }
 '@
 Add-Type -TypeDefinition $src
-[ImcodesUserProc]::Start($exe, $argsLine, __PREFER_LINKED_TOKEN__, __ALLOW_SECURE_DESKTOP__)
+[ImcodesUserProc]::Start($exe, $argsLine, __PREFER_LINKED_TOKEN__, __ALLOW_SECURE_DESKTOP__, __FORCE_SECURE_CONSOLE__)
 `.replace('__EXE64__', exe64).replace('__ARGS64__', args64);
   const linkedTokenScript = script
     .replace('__PREFER_LINKED_TOKEN__', preferLinkedElevatedToken ? '$true' : '$false')
-    .replace('__ALLOW_SECURE_DESKTOP__', allowSecureDesktopFallback ? '$true' : '$false');
+    .replace('__ALLOW_SECURE_DESKTOP__', allowSecureDesktopFallback ? '$true' : '$false')
+    .replace('__FORCE_SECURE_CONSOLE__', forceSecureConsole ? '$true' : '$false');
   const options: SpawnOptions = {
     stdio: 'ignore',
     windowsHide: true,
@@ -271,15 +268,17 @@ export function launchWindowsActiveUserElevatedCommand(
 /**
  * Launch the verified remote-desktop worker on the active user's Default
  * desktop, or as a LOCAL_SYSTEM worker on the active console's Winlogon
- * desktop while LogonUI is displayed or no user token exists. Native secure
- * console mode keeps authorization/input-epoch checks but denies clipboard
- * access and exits when Windows switches back to the Default desktop.
+ * desktop when no console user token exists (sign-in screen) or the caller
+ * explicitly asks for it after the worker reported a protected desktop.
+ * Native secure console mode keeps authorization/input-epoch checks but denies
+ * clipboard access and exits when Windows switches back to the Default desktop.
  */
 export function launchWindowsRemoteDesktopCommand(
   executable: string,
   argsLine: string,
   spawnImpl: typeof spawn = spawn,
   allowSecureDesktopFallback = true,
+  forceSecureConsole = false,
 ): void {
   launchWindowsActiveUserCommand(
     executable,
@@ -287,5 +286,6 @@ export function launchWindowsRemoteDesktopCommand(
     spawnImpl,
     true,
     allowSecureDesktopFallback,
+    forceSecureConsole,
   );
 }

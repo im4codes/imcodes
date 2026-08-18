@@ -189,6 +189,7 @@ interface TrackedAuthority {
   prepare: RemoteDesktopPrepare;
   virtualRetryAttempted: boolean;
   usesVirtualDisplay: boolean;
+  secureConsoleRetryAttempted: boolean;
 }
 
 interface VirtualDisplayControllerProcess {
@@ -208,7 +209,7 @@ export interface RemoteDesktopWorkerHostOptions {
     trustedSignerSha256: string,
   ) => Promise<VerifiedRemoteDesktopWorkerArtifact | null>;
   allowPipeClients?: (path: string) => void | Promise<void>;
-  launch?: (executable: string, argsLine: string) => void;
+  launch?: (executable: string, argsLine: string, forceSecureConsole?: boolean) => void;
   connectTimeoutMs?: number;
   virtualDisplayStartupMs?: number;
   virtualDisplayActivationMs?: number;
@@ -279,16 +280,18 @@ export class RemoteDesktopWorkerHost {
   private async launchVerified(
     argsLine: string,
     allowSecureDesktopFallback = true,
+    forceSecureConsole = false,
   ): Promise<void> {
     const artifact = await this.verifiedArtifactForLaunch();
     if (this.options.launch) {
-      this.options.launch(artifact.executablePath, argsLine);
+      this.options.launch(artifact.executablePath, argsLine, forceSecureConsole);
     } else {
       launchWindowsRemoteDesktopCommand(
         artifact.executablePath,
         argsLine,
         spawn,
         allowSecureDesktopFallback,
+        forceSecureConsole,
       );
     }
   }
@@ -420,10 +423,11 @@ export class RemoteDesktopWorkerHost {
       prepare,
       virtualRetryAttempted: false,
       usesVirtualDisplay: this.virtualDisplayController !== null,
+      secureConsoleRetryAttempted: false,
     });
   }
 
-  private async ensureStarted(): Promise<void> {
+  private async ensureStarted(forceSecureConsole = false): Promise<void> {
     if (this.socket && !this.socket.destroyed) return;
     if (this.startPromise) return await this.startPromise;
     if (!this.artifact) throw new Error('remote_desktop_worker_unavailable');
@@ -463,7 +467,7 @@ export class RemoteDesktopWorkerHost {
             '--pipe', this.pipePath,
             '--nonce', this.nonce,
           ].map(quoteWindowsArgument).join(' ');
-            await this.launchVerified(argsLine);
+            await this.launchVerified(argsLine, true, forceSecureConsole);
           } catch (error) {
             finish(error instanceof Error ? error : new Error(String(error)));
           }
@@ -547,6 +551,17 @@ export class RemoteDesktopWorkerHost {
           void this.retryWithVirtualDisplay(parsed.value, tracked);
           continue;
         }
+        // The worker owns the only authoritative view of the input desktop. A
+        // protected-desktop answer to PREPARE means this worker was launched
+        // onto the wrong one — a session locked, or a lingering LogonUI made a
+        // logged-in machine look like the sign-in screen. Replace it once with
+        // a worker on the privileged desktop instead of failing the session.
+        if (parsed.value.reason === REMOTE_DESKTOP_TERMINAL_REASON.PROTECTED_DESKTOP
+          && !tracked.secureConsoleRetryAttempted) {
+          tracked.secureConsoleRetryAttempted = true;
+          void this.retryOnSecureConsole(parsed.value, tracked);
+          continue;
+        }
         this.untrack(parsed.value.sessionId);
       }
       this.onMessage(parsed.value);
@@ -599,6 +614,30 @@ export class RemoteDesktopWorkerHost {
     authority?.capability.fill(0);
     this.tracked.delete(sessionId);
     this.stopVirtualDisplayIfUnused();
+  }
+
+  private async retryOnSecureConsole(
+    terminal: RemoteDesktopDaemonMessage,
+    tracked: TrackedAuthority,
+  ): Promise<void> {
+    try {
+      // Drop the misplaced worker first: its pipe is the only handle the
+      // replacement can reuse, and a stale one would keep answering. The
+      // authority is only detached from the map here — untrack() would wipe
+      // the capability this same session still has to authenticate with.
+      this.tracked.delete(tracked.sessionId);
+      await this.recycleIdleWorkerForReconnect();
+      await this.ensureStarted(true);
+      this.tracked.set(tracked.sessionId, tracked);
+      const socket = this.socket;
+      if (!socket || socket.destroyed) throw new Error('secure_console_retry_unavailable');
+      const sent = await this.writeToWorker(socket, tracked.prepare);
+      if (!sent) throw new Error('secure_console_retry_send_failed');
+    } catch {
+      this.tracked.set(tracked.sessionId, tracked);
+      this.untrack(tracked.sessionId);
+      this.onMessage(terminal);
+    }
   }
 
   private async retryWithVirtualDisplay(

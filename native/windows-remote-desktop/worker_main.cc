@@ -476,6 +476,15 @@ class WorkerRuntime {
         // from selecting the same process-local hardware path again.
         DisqualifyHardwareEncoderForProcess();
       }
+      // The service picks a desktop when it launches this worker, and that
+      // choice can already be stale: a session locks, or a lingering LogonUI
+      // made the sign-in screen look present on a fully logged-in machine.
+      // Say so immediately instead of building a session that can neither
+      // capture nor inject; the service relaunches on the right desktop.
+      if (!IsInputDesktopNamed(secure_console_ ? L"Winlogon" : L"Default")) {
+        writer_->Emit(TerminalEnvelope(signal.authority, "protected_desktop"));
+        return true;
+      }
       std::vector<DisplayInfo> displays = EnumerateDisplays();
       if (displays.empty()) {
         writer_->Emit(TerminalEnvelope(signal.authority,

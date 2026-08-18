@@ -226,7 +226,7 @@ describe('remote desktop worker artifact and IPC host', () => {
       .toBeLessThan(script.indexOf('if (s.State == WTSActive)'));
     expect(script).not.toContain('must-not-be-inherited-by-worker');
     expect(script).not.toContain('IMCODES_NODE_TOKEN');
-    expect(script).toContain('[ImcodesUserProc]::Start($exe, $argsLine, $false, $false)');
+    expect(script).toContain('[ImcodesUserProc]::Start($exe, $argsLine, $false, $false, $false)');
   });
 
   it('uses only the active administrator linked token for the verified desktop worker', () => {
@@ -246,7 +246,7 @@ describe('remote desktop worker artifact and IPC host', () => {
     expect(script).toContain('const int TokenLinkedToken = 19;');
     expect(script).toContain('elevationType == TokenElevationTypeLimited');
     expect(script).toContain('launchToken = linkedToken;');
-    expect(script).toContain('[ImcodesUserProc]::Start($exe, $argsLine, $true, $false)');
+    expect(script).toContain('[ImcodesUserProc]::Start($exe, $argsLine, $true, $false, $false)');
     expect(script).toContain('if (linkedToken != IntPtr.Zero) CloseHandle(linkedToken);');
   });
 
@@ -264,14 +264,16 @@ describe('remote desktop worker artifact and IPC host', () => {
     );
     const encodedIndex = launchArgs.indexOf('-EncodedCommand') + 1;
     const script = Buffer.from(launchArgs[encodedIndex]!, 'base64').toString('utf16le');
-    expect(script).toContain('Process.GetProcessesByName("LogonUI")');
-    expect(script).toContain('process.SessionId == sid');
     expect(script).toContain('WindowsIdentity.GetCurrent().User.Value != "S-1-5-18"');
     expect(script).toContain('SetTokenInformation(primary, TokenSessionId, ref sid, sizeof(int))');
     expect(script).toContain('argsLine + " --secure-console"');
     expect(script).toContain('"winsta0\\\\Winlogon"');
-    expect(script).toContain('[ImcodesUserProc]::Start($exe, $argsLine, $true, $true)');
-    expect(script.indexOf('allowSecureDesktopFallback && SecureConsoleDisplayed()'))
+    expect(script).toContain('[ImcodesUserProc]::Start($exe, $argsLine, $true, $true, $false)');
+    // A lingering LogonUI process must never decide the desktop again: it kept
+    // logged-in machines on the privileged Winlogon worker, which can neither
+    // capture nor inject there.
+    expect(script).not.toContain('GetProcessesByName');
+    expect(script.indexOf('if (forceSecureConsole)'))
       .toBeLessThan(script.indexOf('TryInteractiveSessionId(out sid)'));
   });
 
@@ -374,6 +376,77 @@ describe('remote desktop worker artifact and IPC host', () => {
     })).resolves.toBe(true);
     expect(tracked.size).toBe(0);
     expect([...capabilityBytes]).toEqual(new Array(capabilityBytes.length).fill(0));
+  });
+
+  it('replaces a worker that answers PREPARE with protected_desktop, exactly once', async () => {
+    const temp = await mkdtemp(join(tmpdir(), 'imcodes-rd-host-desktop-'));
+    cleanup.push(() => rm(temp, { recursive: true, force: true }));
+    const pipePath = join(temp, 'worker.sock');
+    const received: RemoteDesktopDaemonMessage[] = [];
+    const helpers: net.Socket[] = [];
+    const forced: (boolean | undefined)[] = [];
+    let workerNonce = '';
+    const host = new RemoteDesktopWorkerHost((message) => received.push(message), {
+      ...trustedHostOptions,
+      platform: 'win32',
+      artifact,
+      pipePath,
+      allowPipeClients: () => {},
+      launch: (_executable, argsLine, forceSecureConsole) => {
+        if (argsLine === '--release-all-input') return;
+        forced.push(forceSecureConsole);
+        workerNonce = quotedArgs(argsLine)[3]!;
+        const helper = net.createConnection(pipePath, () => {
+          helper.write(`${JSON.stringify({
+            type: REMOTE_DESKTOP_WORKER_HELLO_TYPE,
+            ipcVersion: REMOTE_DESKTOP_WORKER_IPC_VERSION,
+            nonce: workerNonce,
+            pid: 90 + helpers.length,
+          })}\n`);
+        });
+        helpers.push(helper);
+      },
+    });
+    cleanup.push(() => { host.close(); helpers.forEach((helper) => helper.destroy()); });
+
+    const prepare = {
+      type: REMOTE_DESKTOP_MSG.PREPARE,
+      requestId,
+      sessionId,
+      capability,
+      expiresAt: Date.now() + 60_000,
+      leaseExpiresAt: Date.now() + 15_000,
+      daemonGeneration: 7,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW,
+      inputEpoch: 0,
+      iceServers: ['stun:stun.example.test:3478'],
+    } as const;
+    await expect(host.handle(prepare)).resolves.toBe(true);
+    await vi.waitFor(() => expect(helpers).toHaveLength(1));
+
+    const protectedDesktop = {
+      type: REMOTE_DESKTOP_MSG.TERMINAL,
+      requestId,
+      sessionId,
+      capability,
+      reason: REMOTE_DESKTOP_TERMINAL_REASON.PROTECTED_DESKTOP,
+    };
+    helpers[0]!.write(`${JSON.stringify(protectedDesktop)}\n`);
+
+    // The first answer is absorbed: a second worker is launched onto the
+    // privileged desktop and the same PREPARE is replayed to it.
+    await vi.waitFor(() => expect(helpers).toHaveLength(2));
+    expect(forced).toEqual([false, true]);
+    expect(received).toHaveLength(0);
+
+    // A second protected_desktop is terminal: no launch loop.
+    helpers[1]!.write(`${JSON.stringify(protectedDesktop)}\n`);
+    await vi.waitFor(() => expect(received).toHaveLength(1));
+    expect(received[0]).toMatchObject({
+      type: REMOTE_DESKTOP_MSG.TERMINAL,
+      reason: REMOTE_DESKTOP_TERMINAL_REASON.PROTECTED_DESKTOP,
+    });
+    expect(helpers).toHaveLength(2);
   });
 
   it('surfaces a native worker crash frame and ignores forged ones', async () => {
@@ -498,6 +571,7 @@ describe('remote desktop worker artifact and IPC host', () => {
     expect(launch.mock.calls[1]).toEqual([
       artifact.executablePath,
       '--release-all-input',
+      false,
     ]);
     expect(JSON.stringify(launch.mock.calls[1])).not.toContain(capability);
     expect(received).toContainEqual(expect.objectContaining({

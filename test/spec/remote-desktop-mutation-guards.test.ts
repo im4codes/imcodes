@@ -339,7 +339,15 @@ const contracts: Contract[] = [
     guards: [
       {
         path: 'src/node/windows-user-session.ts',
-        needle: 'Process.GetProcessesByName("LogonUI")',
+        needle: 'if (forceSecureConsole)',
+      },
+      {
+        path: 'src/node/remote-desktop-worker-host.ts',
+        needle: 'this.retryOnSecureConsole(parsed.value, tracked)',
+      },
+      {
+        path: 'native/windows-remote-desktop/worker_main.cc',
+        needle: 'TerminalEnvelope(signal.authority, "protected_desktop")',
       },
       {
         path: 'src/node/windows-user-session.ts',
@@ -735,6 +743,18 @@ const contracts: Contract[] = [
 ];
 
 const mutations: Mutation[] = [
+  {
+    name: 'let a stale desktop choice stand',
+    contract: 'pre-login and lock-screen secure console handoff',
+    path: 'src/node/remote-desktop-worker-host.ts',
+    needle: 'this.retryOnSecureConsole(parsed.value, tracked)',
+  },
+  {
+    name: 'stop reporting a wrong-desktop prepare',
+    contract: 'pre-login and lock-screen secure console handoff',
+    path: 'native/windows-remote-desktop/worker_main.cc',
+    needle: 'TerminalEnvelope(signal.authority, "protected_desktop")',
+  },
   {
     name: 'let a desktop that never presents stall capture',
     contract: 'capture falls back to GDI when DXGI never presents',
