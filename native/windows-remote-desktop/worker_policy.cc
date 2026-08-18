@@ -68,6 +68,23 @@ DesktopFollowAction SelectDesktopFollowAction(
                                 : DesktopFollowAction::kFollow;
 }
 
+bool DesktopFollowSettled(const std::wstring& observed,
+                          std::wstring* candidate) {
+  if (!candidate) return !observed.empty();
+  if (observed.empty()) {
+    candidate->clear();
+    return false;
+  }
+  const bool settled = *candidate == observed;
+  *candidate = observed;
+  return settled;
+}
+
+bool ShouldRebindCapture(const std::wstring& input_desktop,
+                         const std::wstring& bound) {
+  return !input_desktop.empty() && input_desktop != bound;
+}
+
 bool ShouldAttemptAutoUnlock(bool secret_configured,
                              bool controller_present,
                              bool on_sign_in_desktop,

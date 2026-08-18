@@ -68,6 +68,38 @@ TEST(WorkerPolicyTest, GivesUpOnlyAfterTheInputDesktopStaysUnreadable) {
             DesktopFollowAction::kStay);
 }
 
+TEST(WorkerPolicyTest, IgnoresTheDesktopFlickerWindowsShowsWhileItLocks) {
+  // Measured on real hardware: locking reports the sign-in desktop for well
+  // under one poll period, drops the curtain back on the user's own desktop,
+  // and only moves for good once a key arrives. Moving on that first sample is
+  // what left capture reading a desktop Windows had stopped displaying.
+  std::wstring candidate;
+  EXPECT_FALSE(DesktopFollowSettled(L"Winlogon", &candidate));
+  EXPECT_FALSE(DesktopFollowSettled(L"Default", &candidate));
+  EXPECT_TRUE(DesktopFollowSettled(L"Default", &candidate));
+  // The real move still lands on the very next agreeing sample.
+  EXPECT_FALSE(DesktopFollowSettled(L"Winlogon", &candidate));
+  EXPECT_TRUE(DesktopFollowSettled(L"Winlogon", &candidate));
+  // An unreadable poll is never a destination and never counts toward one.
+  EXPECT_FALSE(DesktopFollowSettled(L"", &candidate));
+  EXPECT_FALSE(DesktopFollowSettled(L"Winlogon", &candidate));
+  EXPECT_TRUE(DesktopFollowSettled(L"Winlogon", &candidate));
+  // Without somewhere to keep the candidate, any readable desktop is settled.
+  EXPECT_TRUE(DesktopFollowSettled(L"Default", nullptr));
+  EXPECT_FALSE(DesktopFollowSettled(L"", nullptr));
+}
+
+TEST(WorkerPolicyTest, RebindsCaptureWheneverItIsNotOnTheDisplayedDesktop) {
+  // Compared against what the source reports it is reading, so a rebind
+  // Windows refused mid-switch is retried instead of assumed.
+  EXPECT_TRUE(ShouldRebindCapture(L"Winlogon", L"Default"));
+  EXPECT_TRUE(ShouldRebindCapture(L"Default", L""));
+  EXPECT_FALSE(ShouldRebindCapture(L"Default", L"Default"));
+  // An unreadable input desktop is no destination: staying put beats moving
+  // capture somewhere nobody asked for.
+  EXPECT_FALSE(ShouldRebindCapture(L"", L"Default"));
+}
+
 TEST(WorkerPolicyTest, TypesTheStoredSecretOnlyForAWatchingController) {
   EXPECT_TRUE(ShouldAttemptAutoUnlock(true, true, true, 0));
   // Every guard is independently sufficient to refuse.

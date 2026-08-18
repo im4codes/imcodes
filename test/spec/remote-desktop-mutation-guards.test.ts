@@ -764,6 +764,40 @@ const contracts: Contract[] = [
     ],
   },
   {
+    // Locking a session moves the input desktop more than once, and Windows can
+    // refuse the move mid-flight. Capture must therefore be reconciled against
+    // what each source reports it is reading, every tick — assuming a requested
+    // rebind landed is what froze the picture with no way back.
+    name: 'capture follows the displayed desktop across a lock',
+    guards: [
+      {
+        path: 'native/windows-remote-desktop/worker_main.cc',
+        needle: 'ReconcileCaptureDesktopOnSignaling(input_desktop)',
+        minimum: 2,
+      },
+      {
+        path: 'native/windows-remote-desktop/worker_main.cc',
+        needle: 'ShouldRebindCapture(input_desktop, source.source->BoundDesktop())',
+      },
+      {
+        path: 'native/windows-remote-desktop/worker_main.cc',
+        needle: 'DesktopFollowSettled(input_desktop, &desktop_follow_candidate_)',
+      },
+      {
+        path: 'native/windows-remote-desktop/display_capture.cc',
+        needle: 'if (desktop_rebind_requested_.load() &&',
+      },
+      {
+        path: 'native/windows-remote-desktop/display_capture.cc',
+        needle: 'bound_desktop_name_ = requested.empty()',
+      },
+      {
+        path: 'native/windows-remote-desktop/worker_policy.cc',
+        needle: 'bool DesktopFollowSettled(',
+      },
+    ],
+  },
+  {
     name: 'real-display hotplug preference',
     guards: [
       {
@@ -1131,6 +1165,18 @@ const mutations: Mutation[] = [
     contract: 'per-display fixed resolution switching',
     path: 'native/windows-remote-desktop/peer_session.cc',
     needle: 'return restore_current_status(kReject',
+  },
+  {
+    name: 'assume a requested capture rebind landed',
+    contract: 'capture follows the displayed desktop across a lock',
+    path: 'native/windows-remote-desktop/display_capture.cc',
+    needle: 'if (desktop_rebind_requested_.load() &&',
+  },
+  {
+    name: 'follow the desktop flicker Windows shows while locking',
+    contract: 'capture follows the displayed desktop across a lock',
+    path: 'native/windows-remote-desktop/worker_main.cc',
+    needle: 'DesktopFollowSettled(input_desktop, &desktop_follow_candidate_)',
   },
   {
     name: 'remove real-display hotplug preference',

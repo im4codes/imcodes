@@ -381,9 +381,13 @@ class WorkerRuntime {
       const bool topology_refresh_requested =
           environment_action == WorkerEnvironmentAction::kRefreshTopology;
       if (environment_action == WorkerEnvironmentAction::kFollowDesktop) {
-        // Answer the lock/unlock immediately instead of waiting for the poll,
-        // so the picture changes in the same peer within one frame or two.
-        FollowDesktopsOnSignaling();
+        // Deliberately not followed here. A lock notification arrives while
+        // Windows is still moving input around — measured on real hardware it
+        // reports the sign-in desktop, then the curtain on the user's own
+        // desktop again, inside a single poll period. The tick below runs in
+        // this same call: it reconciles capture immediately and moves the
+        // indicator once the desktop has actually settled.
+        desktop_follow_candidate_.clear();
       } else if (environment_action == WorkerEnvironmentAction::kStopProtected) {
         StopAllOnSignaling("protected_desktop", true);
         ResetCaptureSourcesOnSignaling();
@@ -409,7 +413,16 @@ class WorkerRuntime {
         const DesktopFollowAction follow = SelectDesktopFollowAction(
             input_desktop, indicator_->BoundDesktop(),
             &desktop_follow_failures_);
-        if (follow == DesktopFollowAction::kFollow) {
+        // Evaluated every tick, including the ticks that stay put, so the
+        // candidate never carries a desktop from before an unreadable sample.
+        const bool settled =
+            DesktopFollowSettled(input_desktop, &desktop_follow_candidate_);
+        // Capture is reconciled first and on every tick: it must sit on the
+        // desktop Windows is displaying even when the indicator is already
+        // there, because a rebind Windows refused mid-switch would otherwise
+        // never be retried.
+        ReconcileCaptureDesktopOnSignaling(input_desktop);
+        if (follow == DesktopFollowAction::kFollow && settled) {
           FollowDesktopsOnSignaling();
         } else if (follow == DesktopFollowAction::kUnavailable) {
           // The input desktop stayed unreadable for long enough that this
@@ -630,7 +643,9 @@ class WorkerRuntime {
     auto source =
         DxgiDesktopSource::Create(display, CaptureFallback::kDesktopGdi);
     if (!source) return nullptr;
-    source->RequestDesktopRebind(capture_desktop_);
+    // The tick reconciler corrects this the moment Windows disagrees; an
+    // empty name simply means "whatever receives input right now".
+    source->RequestDesktopRebind(CurrentInputDesktopName());
     source->Start();
     sources_.emplace(key, SourceEntry{source, 1});
     return source;
@@ -695,13 +710,20 @@ class WorkerRuntime {
     } else {
       auto_unlock_attempts_ = 0;
     }
-    // Capture goes where input goes: Windows refuses a screen read from any
-    // desktop other than the one it is displaying, so there is exactly one
-    // valid target. While the lock curtain is up nothing can be read at all —
-    // the viewer's own keypress raises the credential UI and both follow.
-    if (input_desktop != capture_desktop_) {
-      capture_desktop_ = input_desktop;
-      for (auto& [id, source] : sources_) {
+    ReconcileCaptureDesktopOnSignaling(input_desktop);
+  }
+
+  // Capture goes where input goes: Windows refuses a screen read from any
+  // desktop other than the one it is displaying, so there is exactly one valid
+  // target at a time. Locking moves that target twice — briefly to the sign-in
+  // desktop, back to the curtain on the user's own desktop, then to the
+  // credential box when a key arrives — so the target is re-checked against
+  // what each source reports it is actually reading, never against what was
+  // last asked for.
+  void ReconcileCaptureDesktopOnSignaling(const std::wstring& input_desktop) {
+    if (input_desktop.empty()) return;
+    for (auto& [id, source] : sources_) {
+      if (ShouldRebindCapture(input_desktop, source.source->BoundDesktop())) {
         source.source->RequestDesktopRebind(input_desktop);
       }
     }
@@ -797,7 +819,7 @@ class WorkerRuntime {
   DWORD dwm_process_id_ = 0;
   int protected_desktop_checks_ = 0;
   int desktop_follow_failures_ = 0;
-  std::wstring capture_desktop_;
+  std::wstring desktop_follow_candidate_;
   int auto_unlock_attempts_ = 0;
   int compositor_scan_ticks_ = 0;
   int topology_scan_ticks_ = 0;

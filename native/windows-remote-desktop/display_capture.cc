@@ -25,6 +25,17 @@
 namespace imcodes::rd {
 namespace {
 
+/** The name Windows gives a desktop handle, empty when it cannot be read. */
+std::wstring DesktopNameOf(HDESK desktop) {
+  wchar_t name[64]{};
+  DWORD needed = 0;
+  if (!GetUserObjectInformationW(desktop, UOI_NAME, name, sizeof(name),
+                                 &needed)) {
+    return {};
+  }
+  return name;
+}
+
 std::string Narrow(const wchar_t* value) {
   if (!value || !*value) return {};
   const int size = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, value,
@@ -335,7 +346,17 @@ void DxgiDesktopSource::RequestDesktopRebind(const std::wstring& desktop_name) {
   desktop_rebind_requested_.store(true);
 }
 
-void DxgiDesktopSource::BindCaptureThreadToRequestedDesktop() {
+std::wstring DxgiDesktopSource::BoundDesktop() const {
+  std::lock_guard<std::mutex> lock(desktop_request_mutex_);
+  return bound_desktop_name_;
+}
+
+// Returns false while the move has not happened yet, so the caller can keep the
+// request pending. Windows refuses the open and the bind for as long as it is
+// mid-switch, and a source that swallowed that failure would sit on a desktop
+// it can no longer read for the rest of the session — a picture frozen with no
+// way back.
+bool DxgiDesktopSource::BindCaptureThreadToRequestedDesktop() {
   std::wstring requested;
   {
     std::lock_guard<std::mutex> lock(desktop_request_mutex_);
@@ -344,17 +365,22 @@ void DxgiDesktopSource::BindCaptureThreadToRequestedDesktop() {
   HDESK target = requested.empty()
       ? OpenInputDesktop(0, FALSE, GENERIC_ALL)
       : OpenDesktopW(requested.c_str(), 0, FALSE, GENERIC_ALL);
-  if (!target) return;
+  if (!target) return false;
   if (!SetThreadDesktop(target)) {
     CloseDesktop(target);
-    return;
+    return false;
   }
   if (bound_desktop_) CloseDesktop(bound_desktop_);
   bound_desktop_ = target;
+  {
+    std::lock_guard<std::mutex> lock(desktop_request_mutex_);
+    bound_desktop_name_ = requested.empty() ? DesktopNameOf(target) : requested;
+  }
   // The duplication and any GDI fallback belong to the desktop left behind.
   ResetDuplication();
   gdi_active_ = false;
   first_frame_waits_ = 0;
+  return true;
 }
 
 void DxgiDesktopSource::CaptureLoop() {
@@ -364,8 +390,11 @@ void DxgiDesktopSource::CaptureLoop() {
   while (running_) {
     {
       std::lock_guard<std::mutex> lock(state_mutex_);
-      if (desktop_rebind_requested_.exchange(false)) {
-        BindCaptureThreadToRequestedDesktop();
+      // Kept pending until the bind actually lands: a switch that is refused
+      // this tick is retried on the next one instead of stranding capture.
+      if (desktop_rebind_requested_.load() &&
+          BindCaptureThreadToRequestedDesktop()) {
+        desktop_rebind_requested_.store(false);
       }
       bool captured = false;
       last_capture_waited_ = false;

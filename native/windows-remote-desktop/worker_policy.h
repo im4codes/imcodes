@@ -63,6 +63,38 @@ DesktopFollowAction SelectDesktopFollowAction(const std::wstring& input_desktop,
 
 inline constexpr int kDesktopFollowFailureLimit = 12;
 
+/**
+ * Whether an observed input desktop has settled enough to move the worker to
+ * it.
+ *
+ * Locking a session does not move input once: Windows reports the sign-in
+ * desktop for a few hundred milliseconds, puts the lock curtain back on the
+ * user's own desktop, and only moves for good when a key finally arrives.
+ * Measured on real hardware, that first excursion lasts under one poll period.
+ * Tearing the indicator down and rebinding capture on that flicker leaves the
+ * worker reading a desktop Windows is no longer displaying, which is a frozen
+ * picture with no way back — so require the same desktop twice before moving.
+ *
+ * `candidate` carries the desktop seen last tick and is updated in place.
+ * An empty observation is never a candidate: an unreadable input desktop is
+ * handled as a failure by SelectDesktopFollowAction, not as a destination.
+ */
+bool DesktopFollowSettled(const std::wstring& observed, std::wstring* candidate);
+
+inline constexpr int kDesktopFollowSettleSamples = 2;
+
+/**
+ * Whether capture must be moved to `input_desktop`.
+ *
+ * Capture is reconciled against the desktop that receives input on every tick,
+ * not only when the worker moves its indicator: the two can disagree after a
+ * refused rebind or a desktop that flickered back, and a `bound` that is merely
+ * assumed rather than reported is how a session ends up streaming a desktop
+ * Windows stopped displaying.
+ */
+bool ShouldRebindCapture(const std::wstring& input_desktop,
+                         const std::wstring& bound);
+
 // Whether the stored sign-in secret may be typed right now. Auto unlock is a
 // convenience for a watching operator, never an unattended door: it requires a
 // controller on the session, the sign-in desktop actually in front of them, a
