@@ -343,11 +343,19 @@ const contracts: Contract[] = [
       },
       {
         path: 'src/node/remote-desktop-worker-host.ts',
-        needle: 'this.retryOnSecureConsole(parsed.value, tracked)',
+        needle: 'this.retryOnOtherDesktop(parsed.value, tracked)',
       },
       {
         path: 'native/windows-remote-desktop/worker_main.cc',
         needle: 'TerminalEnvelope(signal.authority, "protected_desktop")',
+      },
+      {
+        path: 'src/node/remote-desktop-worker-host.ts',
+        needle: 'REMOTE_DESKTOP_MSG.RENEGOTIATE',
+      },
+      {
+        path: 'web/src/remote-desktop-client.ts',
+        needle: 'await this.renegotiate();',
       },
       {
         path: 'src/node/windows-user-session.ts',
@@ -744,10 +752,16 @@ const contracts: Contract[] = [
 
 const mutations: Mutation[] = [
   {
+    name: 'drop the browser side of the desktop handover',
+    contract: 'pre-login and lock-screen secure console handoff',
+    path: 'web/src/remote-desktop-client.ts',
+    needle: 'await this.renegotiate();',
+  },
+  {
     name: 'let a stale desktop choice stand',
     contract: 'pre-login and lock-screen secure console handoff',
     path: 'src/node/remote-desktop-worker-host.ts',
-    needle: 'this.retryOnSecureConsole(parsed.value, tracked)',
+    needle: 'this.retryOnOtherDesktop(parsed.value, tracked)',
   },
   {
     name: 'stop reporting a wrong-desktop prepare',

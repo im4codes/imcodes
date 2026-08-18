@@ -434,19 +434,90 @@ describe('remote desktop worker artifact and IPC host', () => {
     helpers[0]!.write(`${JSON.stringify(protectedDesktop)}\n`);
 
     // The first answer is absorbed: a second worker is launched onto the
-    // privileged desktop and the same PREPARE is replayed to it.
+    // privileged desktop and the same PREPARE is replayed to it. The browser
+    // is asked for a fresh peer on the same grant instead of losing it.
     await vi.waitFor(() => expect(helpers).toHaveLength(2));
     expect(forced).toEqual([false, true]);
-    expect(received).toHaveLength(0);
+    await vi.waitFor(() => expect(received).toHaveLength(1));
+    expect(received[0]).toEqual({
+      type: REMOTE_DESKTOP_MSG.RENEGOTIATE,
+      requestId,
+      sessionId,
+      capability,
+    });
 
     // A second protected_desktop is terminal: no launch loop.
     helpers[1]!.write(`${JSON.stringify(protectedDesktop)}\n`);
-    await vi.waitFor(() => expect(received).toHaveLength(1));
-    expect(received[0]).toMatchObject({
+    await vi.waitFor(() => expect(received).toHaveLength(2));
+    expect(received[1]).toMatchObject({
       type: REMOTE_DESKTOP_MSG.TERMINAL,
       reason: REMOTE_DESKTOP_TERMINAL_REASON.PROTECTED_DESKTOP,
     });
     expect(helpers).toHaveLength(2);
+  });
+
+  it('sends the replacement to the user desktop when the privileged worker reports the switch', async () => {
+    const temp = await mkdtemp(join(tmpdir(), 'imcodes-rd-host-unlock-'));
+    cleanup.push(() => rm(temp, { recursive: true, force: true }));
+    const pipePath = join(temp, 'worker.sock');
+    const received: RemoteDesktopDaemonMessage[] = [];
+    const helpers: net.Socket[] = [];
+    const forced: (boolean | undefined)[] = [];
+    const host = new RemoteDesktopWorkerHost((message) => received.push(message), {
+      ...trustedHostOptions,
+      platform: 'win32',
+      artifact,
+      pipePath,
+      allowPipeClients: () => {},
+      launch: (_executable, argsLine, forceSecureConsole) => {
+        if (argsLine === '--release-all-input') return;
+        forced.push(forceSecureConsole);
+        const nonce = quotedArgs(argsLine)[3]!;
+        // The hello is written from an async connect callback, so the index has
+        // to be captured now rather than read from the growing array later.
+        const index = helpers.length;
+        const helper = net.createConnection(pipePath, () => {
+          helper.write(`${JSON.stringify({
+            type: REMOTE_DESKTOP_WORKER_HELLO_TYPE,
+            ipcVersion: REMOTE_DESKTOP_WORKER_IPC_VERSION,
+            nonce,
+            pid: 70 + index,
+            // This worker owns the sign-in desktop, so its replacement has to
+            // go to the user's desktop — the direction a real sign-in takes.
+            secureConsole: index === 0,
+          })}\n`);
+        });
+        helpers.push(helper);
+      },
+    });
+    cleanup.push(() => { host.close(); helpers.forEach((helper) => helper.destroy()); });
+
+    await expect(host.handle({
+      type: REMOTE_DESKTOP_MSG.PREPARE,
+      requestId,
+      sessionId,
+      capability,
+      expiresAt: Date.now() + 60_000,
+      leaseExpiresAt: Date.now() + 15_000,
+      daemonGeneration: 7,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW,
+      inputEpoch: 0,
+      iceServers: ['stun:stun.example.test:3478'],
+    })).resolves.toBe(true);
+    await vi.waitFor(() => expect(helpers).toHaveLength(1));
+
+    helpers[0]!.write(`${JSON.stringify({
+      type: REMOTE_DESKTOP_MSG.TERMINAL,
+      requestId,
+      sessionId,
+      capability,
+      reason: REMOTE_DESKTOP_TERMINAL_REASON.PROTECTED_DESKTOP,
+    })}\n`);
+
+    await vi.waitFor(() => expect(helpers).toHaveLength(2));
+    expect(forced).toEqual([false, false]);
+    await vi.waitFor(() => expect(received).toHaveLength(1));
+    expect(received[0]).toMatchObject({ type: REMOTE_DESKTOP_MSG.RENEGOTIATE, sessionId });
   });
 
   it('surfaces a native worker crash frame and ignores forged ones', async () => {

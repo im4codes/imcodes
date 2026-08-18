@@ -364,11 +364,11 @@ class WorkerRuntime {
         const WorkerDesktopAction desktop_action = AdvanceWorkerDesktopState(
             secure_console_, expected_desktop, &protected_desktop_checks_);
         if (desktop_action != WorkerDesktopAction::kContinue) {
-          StopAllOnSignaling(
-              desktop_action == WorkerDesktopAction::kTerminateSecureConsole
-                  ? "worker_failed"
-                  : "protected_desktop",
-              true);
+          // Both directions are the same event from the browser's side: the
+          // desktop moved out from under this worker. Say so precisely so the
+          // service can hand the session to a worker on the new desktop
+          // instead of ending it as an anonymous failure.
+          StopAllOnSignaling("protected_desktop", true);
           if (desktop_action ==
               WorkerDesktopAction::kTerminateSecureConsole) {
             // The sign-in/lock desktop has switched to the user's Default
@@ -793,6 +793,10 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
   hello["ipcVersion"] = kIpcVersion;
   hello["nonce"] = arguments->nonce;
   hello["pid"] = static_cast<Json::UInt>(GetCurrentProcessId());
+  // The service has to know which desktop this process actually owns: its own
+  // launch decision can already be stale, and the replacement after a desktop
+  // switch belongs on the other one.
+  hello["secureConsole"] = arguments->secure_console;
   if (!writer.Emit(hello)) {
     CloseHandle(pipe);
     webrtc::CleanupSSL();

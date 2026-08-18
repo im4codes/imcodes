@@ -241,6 +241,7 @@ export class RemoteDesktopWorkerHost {
   private virtualDisplayGeneration = 0;
   private buffer = '';
   private closing = false;
+  private workerSecureConsole = false;
 
   constructor(
     private readonly onMessage: (message: RemoteDesktopDaemonMessage) => void,
@@ -499,6 +500,9 @@ export class RemoteDesktopWorkerHost {
         socket.destroy();
         return;
       }
+      // Which desktop this worker actually owns decides where its replacement
+      // has to go if the desktop switches under it.
+      this.workerSecureConsole = parsed.secureConsole === true;
       const remainder = helloBuffer.slice(newline + 1);
       socket.off('data', onHello);
       socket.setTimeout(0);
@@ -559,7 +563,7 @@ export class RemoteDesktopWorkerHost {
         if (parsed.value.reason === REMOTE_DESKTOP_TERMINAL_REASON.PROTECTED_DESKTOP
           && !tracked.secureConsoleRetryAttempted) {
           tracked.secureConsoleRetryAttempted = true;
-          void this.retryOnSecureConsole(parsed.value, tracked);
+          void this.retryOnOtherDesktop(parsed.value, tracked);
           continue;
         }
         this.untrack(parsed.value.sessionId);
@@ -616,10 +620,15 @@ export class RemoteDesktopWorkerHost {
     this.stopVirtualDisplayIfUnused();
   }
 
-  private async retryOnSecureConsole(
+  private async retryOnOtherDesktop(
     terminal: RemoteDesktopDaemonMessage,
     tracked: TrackedAuthority,
   ): Promise<void> {
+    // Go to the desktop this worker was not on. A privileged Winlogon worker
+    // reports this when the user signs in, and an ordinary worker reports it
+    // when the screen locks; both mean the replacement belongs on the other
+    // side, and the default launch decision alone cannot tell them apart.
+    const forceSecureConsole = !this.workerSecureConsole;
     try {
       // Drop the misplaced worker first: its pipe is the only handle the
       // replacement can reuse, and a stale one would keep answering. The
@@ -627,12 +636,21 @@ export class RemoteDesktopWorkerHost {
       // the capability this same session still has to authenticate with.
       this.tracked.delete(tracked.sessionId);
       await this.recycleIdleWorkerForReconnect();
-      await this.ensureStarted(true);
+      await this.ensureStarted(forceSecureConsole);
       this.tracked.set(tracked.sessionId, tracked);
       const socket = this.socket;
-      if (!socket || socket.destroyed) throw new Error('secure_console_retry_unavailable');
+      if (!socket || socket.destroyed) throw new Error('desktop_handover_unavailable');
       const sent = await this.writeToWorker(socket, tracked.prepare);
-      if (!sent) throw new Error('secure_console_retry_send_failed');
+      if (!sent) throw new Error('desktop_handover_send_failed');
+      // The browser's peer died with the old worker. Its authority, lease and
+      // input epoch all survive, so ask for a fresh peer on the same session
+      // rather than making the viewer restart the whole grant.
+      this.onMessage({
+        type: REMOTE_DESKTOP_MSG.RENEGOTIATE,
+        requestId: tracked.requestId,
+        sessionId: tracked.sessionId,
+        capability: tracked.prepare.capability,
+      });
     } catch {
       this.tracked.set(tracked.sessionId, tracked);
       this.untrack(tracked.sessionId);

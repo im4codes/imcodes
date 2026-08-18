@@ -64,6 +64,13 @@ export interface RemoteDesktopWorkerHello {
   ipcVersion: typeof REMOTE_DESKTOP_WORKER_IPC_VERSION;
   nonce: string;
   pid: number;
+  /**
+   * Which desktop this worker actually landed on. The service decides at launch
+   * but the decision can be stale by the time the process exists, and the
+   * replacement after a desktop switch has to go to the *other* desktop.
+   * Absent from workers built before the handover existed.
+   */
+  secureConsole?: boolean;
 }
 
 export const REMOTE_DESKTOP_VIRTUAL_DISPLAY_FILES = [
@@ -91,8 +98,12 @@ const NONCE_RE = /^[A-Za-z0-9_-]{43}$/;
 const VERSION_RE = /^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$/;
 const CRASH_MODULE_RE = /^[A-Za-z0-9._-]{1,64}$/;
 
-function exactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
-  const wanted = new Set(keys);
+function exactKeys(
+  value: Record<string, unknown>,
+  keys: readonly string[],
+  optional: readonly string[] = [],
+): boolean {
+  const wanted = new Set([...keys, ...optional]);
   return keys.every((key) => Object.prototype.hasOwnProperty.call(value, key))
     && Object.keys(value).every((key) => wanted.has(key));
 }
@@ -216,8 +227,9 @@ export function validateRemoteDesktopWorkerHello(
   expectedNonce: string,
 ): value is RemoteDesktopWorkerHello {
   return record(value)
-    && exactKeys(value, ['type', 'ipcVersion', 'nonce', 'pid'])
+    && exactKeys(value, ['type', 'ipcVersion', 'nonce', 'pid'], ['secureConsole'])
     && value.type === REMOTE_DESKTOP_WORKER_HELLO_TYPE
+    && (value.secureConsole === undefined || typeof value.secureConsole === 'boolean')
     && value.ipcVersion === REMOTE_DESKTOP_WORKER_IPC_VERSION
     && typeof value.nonce === 'string'
     && NONCE_RE.test(value.nonce)

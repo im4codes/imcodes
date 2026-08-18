@@ -605,6 +605,66 @@ describe('RemoteDesktopClient', () => {
       .toBeNull();
   });
 
+  it('rebuilds the peer on the same grant when the node hands the session to another desktop', async () => {
+    let socket!: FakeSocket;
+    const peers: FakePeer[] = [];
+    const snapshots: Array<ReturnType<RemoteDesktopClient['current']>> = [];
+    const client = new RemoteDesktopClient('controlled-win', {
+      onSnapshot: (snapshot) => snapshots.push({ ...snapshot }),
+    }, {
+      fetchTicket: async () => 'ticket-handover',
+      createSocket: () => {
+        socket = new FakeSocket();
+        queueMicrotask(() => socket.open());
+        return socket as unknown as WebSocket;
+      },
+      createPeer: () => {
+        const peer = new FakePeer();
+        peers.push(peer);
+        return peer as unknown as RTCPeerConnection;
+      },
+    });
+
+    await client.start();
+    const start = JSON.parse(socket.sent[0]!) as { requestId: string };
+    const authority = {
+      requestId: start.requestId,
+      sessionId: 'session_12345678',
+      capability: 'a'.repeat(43),
+    };
+    socket.receive({
+      type: REMOTE_DESKTOP_MSG.AUTHORIZED,
+      ...authority,
+      expiresAt: Date.now() + 60_000,
+      leaseExpiresAt: Date.now() + 15_000,
+      daemonGeneration: 7,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW,
+      inputEpoch: 0,
+      iceServers: ['stun:stun.example.test:3478'],
+    });
+    await vi.waitFor(() => expect(peers).toHaveLength(1));
+    await vi.waitFor(() => expect(socket.sent.map((raw) => JSON.parse(raw).type))
+      .toContain(REMOTE_DESKTOP_MSG.OFFER));
+
+    socket.receive({ type: REMOTE_DESKTOP_MSG.RENEGOTIATE, ...authority });
+
+    // A second peer is built and a second offer sent under the same grant: the
+    // session is never failed, so the viewer keeps it without pressing Retry.
+    await vi.waitFor(() => expect(peers).toHaveLength(2));
+    const sentOffers = () => socket.sent
+      .map((raw) => JSON.parse(raw) as { type: string; sessionId?: string; capability?: string })
+      .filter((message) => message.type === REMOTE_DESKTOP_MSG.OFFER);
+    await vi.waitFor(() => expect(sentOffers()).toHaveLength(2));
+    const offers = sentOffers();
+    expect(offers[1]).toMatchObject({
+      sessionId: authority.sessionId,
+      capability: authority.capability,
+    });
+    expect(snapshots.some((snapshot) => snapshot.state === REMOTE_DESKTOP_STATE.FAILED)).toBe(false);
+    expect(snapshots.some((snapshot) => snapshot.state === REMOTE_DESKTOP_STATE.RECONNECTING)).toBe(true);
+    client.stop();
+  });
+
   it('marks retry starts with a bounded reconnect attempt', async () => {
     let socket!: FakeSocket;
     const client = new RemoteDesktopClient('controlled-win', { onSnapshot: vi.fn() }, {

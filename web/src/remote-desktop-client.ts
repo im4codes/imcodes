@@ -234,6 +234,9 @@ export class RemoteDesktopClient {
   private readonly signaling: RemoteDesktopSignalingSocket;
   private readonly pendingRemoteCandidates = new PendingWebRtcCandidates<RTCIceCandidateInit>();
   private peer: RTCPeerConnection | null = null;
+  /** The grant this session was authorized with, replayed on a worker handover. */
+  private authorized: Extract<RemoteDesktopServerMessage, { type: typeof REMOTE_DESKTOP_MSG.AUTHORIZED }> | null = null;
+  private renegotiating = false;
   private controlChannel: RTCDataChannel | null = null;
   private keyboardChannel: RTCDataChannel | null = null;
   private pointerChannel: RTCDataChannel | null = null;
@@ -592,16 +595,67 @@ export class RemoteDesktopClient {
     this.teardown(REMOTE_DESKTOP_TERMINAL_REASON.STOPPED_BY_CONTROLLER);
   }
 
+  /**
+   * The node replaced the worker behind this session because the desktop
+   * switched under it — signing in from the lock screen is the ordinary case.
+   * The grant, lease and input epoch all continue, so rebuild only the peer
+   * instead of tearing the session down and making the viewer start over.
+   */
+  private async renegotiate(): Promise<void> {
+    const authority = this.authorized;
+    if (!authority || this.stopped || this.renegotiating) return;
+    this.renegotiating = true;
+    try {
+      this.clearStartTimer();
+      this.clearDisconnectTimer();
+      this.releaseAll();
+      this.workerInputEnabled = false;
+      this.awaitingAnswer = false;
+      this.pendingRemoteCandidates.clear();
+      if (this.statsTimer) clearInterval(this.statsTimer);
+      this.statsTimer = null;
+      this.previousInboundStats = null;
+      this.lastMediaBytesReceived = null;
+      this.lastMediaProgressAt = null;
+      // Detach before closing: the close handlers fail the session for the
+      // *live* peer, and during a handover the peer being closed is already
+      // the superseded one.
+      const superseded = this.peer;
+      const supersededChannels = [this.controlChannel, this.keyboardChannel, this.pointerChannel];
+      this.peer = null;
+      this.controlChannel = null;
+      this.keyboardChannel = null;
+      this.pointerChannel = null;
+      this.channelsReady = false;
+      for (const channel of supersededChannels) {
+        try { channel?.close(); } catch { /* closed */ }
+      }
+      try { superseded?.close(); } catch { /* closed */ }
+      // The session survives, so the viewer sees a reconnecting frame rather
+      // than a failure card with a Retry button.
+      this.publish({ state: REMOTE_DESKTOP_STATE.RECONNECTING, inputEnabled: false });
+      this.requirePresentedFrameForCurrentTopology();
+      await this.preparePeer(authority);
+    } finally {
+      this.renegotiating = false;
+    }
+  }
+
   private async handleServer(value: unknown): Promise<void> {
     const parsed = validateRemoteDesktopServerMessage(value);
     if (!parsed.ok || !this.requestId || parsed.value.requestId !== this.requestId || this.stopped) return;
     const message = parsed.value;
     if (message.type === REMOTE_DESKTOP_MSG.AUTHORIZED) {
       if (this.sessionId || !validateRemoteDesktopAuthorized(message).ok) return;
+      this.authorized = message;
       await this.preparePeer(message);
       return;
     }
     if (!this.matchesAuthority(message)) return;
+    if (message.type === REMOTE_DESKTOP_MSG.RENEGOTIATE) {
+      await this.renegotiate();
+      return;
+    }
     if (message.type === REMOTE_DESKTOP_MSG.ANSWER) {
       if (!this.peer || !this.awaitingAnswer) return;
       await this.peer.setRemoteDescription({ type: 'answer', sdp: message.sdp });
@@ -697,6 +751,10 @@ export class RemoteDesktopClient {
       channel.bufferedAmountLowThreshold = DATA_BUFFER_LOW_WATER_BYTES;
       channel.addEventListener('open', () => this.updateChannelReadiness());
       channel.addEventListener('close', () => {
+        // A superseded peer closes its channels on the way out. Only the live
+        // peer losing a channel is a real failure; otherwise a desktop handover
+        // would fail the very session it is rescuing.
+        if (this.peer !== peer) return;
         this.releaseAll();
         this.updateChannelReadiness();
         if (!this.stopped) this.fail(REMOTE_DESKTOP_TERMINAL_REASON.PEER_FAILED);
@@ -729,6 +787,7 @@ export class RemoteDesktopClient {
       });
     });
     peer.addEventListener('connectionstatechange', () => {
+      if (this.peer !== peer) return;
       if (peer.connectionState === 'failed' || peer.connectionState === 'closed') {
         if (peer.connectionState === 'failed') void this.restartIce(peer);
         else this.fail(REMOTE_DESKTOP_TERMINAL_REASON.PEER_FAILED);

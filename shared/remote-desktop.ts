@@ -40,6 +40,10 @@ export const REMOTE_DESKTOP_MSG = {
   CANCEL: 'remote_desktop.cancel',
   STOP: 'remote_desktop.stop',
   STATUS: 'remote_desktop.status',
+  // Daemon → browser: the worker behind this session was replaced (the desktop
+  // switched under it), so the same authority needs a fresh peer. Carries no
+  // new grant: the session, lease and input epoch all continue unchanged.
+  RENEGOTIATE: 'remote_desktop.renegotiate',
   TERMINAL: 'remote_desktop.terminal',
   ERROR: 'remote_desktop.error',
 } as const;
@@ -355,6 +359,13 @@ export interface RemoteDesktopModeState {
   reason: RemoteDesktopModeReason;
 }
 
+export interface RemoteDesktopRenegotiate {
+  type: typeof REMOTE_DESKTOP_MSG.RENEGOTIATE;
+  requestId: string;
+  sessionId: string;
+  capability: string;
+}
+
 export interface RemoteDesktopStop {
   type: typeof REMOTE_DESKTOP_MSG.STOP;
   requestId: string;
@@ -496,8 +507,8 @@ export interface RemoteDesktopReleaseAll extends RemoteDesktopInputBase {
 
 export type RemoteDesktopBrowserMessage = RemoteDesktopStart | RemoteDesktopOffer | RemoteDesktopIce | RemoteDesktopModeSet | RemoteDesktopCancel | RemoteDesktopStop;
 export type RemoteDesktopDaemonCommand = RemoteDesktopPrepare | RemoteDesktopOffer | RemoteDesktopIce | RemoteDesktopLease | RemoteDesktopModeState | RemoteDesktopCancel | RemoteDesktopStop;
-export type RemoteDesktopDaemonMessage = RemoteDesktopAnswer | RemoteDesktopIce | RemoteDesktopModeState | RemoteDesktopStatus | RemoteDesktopTerminal;
-export type RemoteDesktopServerMessage = RemoteDesktopAuthorized | RemoteDesktopAnswer | RemoteDesktopIce | RemoteDesktopModeState | RemoteDesktopStatus | RemoteDesktopTerminal | RemoteDesktopError;
+export type RemoteDesktopDaemonMessage = RemoteDesktopAnswer | RemoteDesktopIce | RemoteDesktopModeState | RemoteDesktopStatus | RemoteDesktopRenegotiate | RemoteDesktopTerminal;
+export type RemoteDesktopServerMessage = RemoteDesktopAuthorized | RemoteDesktopAnswer | RemoteDesktopIce | RemoteDesktopModeState | RemoteDesktopStatus | RemoteDesktopRenegotiate | RemoteDesktopTerminal | RemoteDesktopError;
 export type RemoteDesktopDataMessage = RemoteDesktopDisplayTopology | RemoteDesktopQuality | RemoteDesktopClipboard | RemoteDesktopPointer | RemoteDesktopKeyboard | RemoteDesktopControl | RemoteDesktopReleaseAll;
 
 export type RemoteDesktopValidationResult<T> = { ok: true; value: T } | { ok: false; error: typeof REMOTE_DESKTOP_ERROR.INVALID_REQUEST };
@@ -758,6 +769,13 @@ export function validateRemoteDesktopDaemonMessage(value: unknown): RemoteDeskto
         && value.controllerCount > value.viewerCount)
       || (value.inputEnabled && (value.mode !== REMOTE_DESKTOP_ACCESS_MODE.CONTROL || (value.inputEpoch as number) === 0))) return invalid();
     return { ok: true, value: value as unknown as RemoteDesktopStatus };
+  }
+  if (value.type === REMOTE_DESKTOP_MSG.RENEGOTIATE) {
+    // Authority-shaped and nothing else: a replacement worker must not be able
+    // to smuggle a new grant, mode or epoch through the handover.
+    if (!hasExactKeys(value, ['type', 'requestId', 'sessionId', 'capability'])
+      || !hasSessionCorrelation(value)) return invalid();
+    return { ok: true, value: value as unknown as RemoteDesktopRenegotiate };
   }
   if (value.type === REMOTE_DESKTOP_MSG.TERMINAL) {
     if (!hasExactKeys(value, ['type', 'requestId', 'sessionId', 'capability', 'reason'], ['detail'])
