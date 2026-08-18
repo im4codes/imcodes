@@ -52,6 +52,19 @@ inline constexpr char kPointerType[] = "remote_desktop.data.pointer";
 inline constexpr char kKeyboardType[] = "remote_desktop.data.keyboard";
 inline constexpr char kControlType[] = "remote_desktop.data.control";
 inline constexpr char kReleaseAllType[] = "remote_desktop.data.release_all";
+// Worker → browser: a control command was understood but refused. Success is
+// already visible in the topology and status frames; without this, a refusal is
+// indistinguishable from a lost click.
+inline constexpr char kControlRejectedType[] =
+    "remote_desktop.data.control_rejected";
+
+inline constexpr char kRejectNotPermitted[] = "not_permitted";
+inline constexpr char kRejectRateLimited[] = "rate_limited";
+inline constexpr char kRejectDisplayUnavailable[] = "display_unavailable";
+inline constexpr char kRejectModeUnsupported[] = "mode_unsupported";
+inline constexpr char kRejectModeChangeFailed[] = "mode_change_failed";
+inline constexpr char kRejectScaleChangeFailed[] = "scale_change_failed";
+inline constexpr char kRejectCaptureFailed[] = "capture_failed";
 
 inline constexpr char kControlChannel[] = "imcodes-rd-control";
 inline constexpr char kKeyboardChannel[] = "imcodes-rd-keyboard";

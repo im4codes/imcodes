@@ -3,6 +3,7 @@ import {
   REMOTE_DESKTOP_ACCESS_MODE,
   REMOTE_DESKTOP_CHANNEL,
   REMOTE_DESKTOP_CONTROL_KIND,
+  REMOTE_DESKTOP_CONTROL_REJECTION,
   REMOTE_DESKTOP_DATA_MSG,
   REMOTE_DESKTOP_LIMITS,
   REMOTE_DESKTOP_MSG,
@@ -662,6 +663,81 @@ describe('RemoteDesktopClient', () => {
     });
     expect(snapshots.some((snapshot) => snapshot.state === REMOTE_DESKTOP_STATE.FAILED)).toBe(false);
     expect(snapshots.some((snapshot) => snapshot.state === REMOTE_DESKTOP_STATE.RECONNECTING)).toBe(true);
+    client.stop();
+  });
+
+  it('surfaces a refused layout command instead of letting the click vanish', async () => {
+    let socket!: FakeSocket;
+    let peer!: FakePeer;
+    const client = new RemoteDesktopClient('controlled-win', { onSnapshot: vi.fn() }, {
+      fetchTicket: async () => 'ticket-reject',
+      createSocket: () => {
+        socket = new FakeSocket();
+        queueMicrotask(() => socket.open());
+        return socket as unknown as WebSocket;
+      },
+      createPeer: () => {
+        peer = new FakePeer();
+        return peer as unknown as RTCPeerConnection;
+      },
+    });
+
+    await client.start();
+    const start = JSON.parse(socket.sent[0]!) as { requestId: string };
+    socket.receive({
+      type: REMOTE_DESKTOP_MSG.AUTHORIZED,
+      requestId: start.requestId,
+      sessionId: 'session_12345678',
+      capability: 'a'.repeat(43),
+      expiresAt: Date.now() + 60_000,
+      leaseExpiresAt: Date.now() + 15_000,
+      daemonGeneration: 7,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
+      inputEpoch: 1,
+      iceServers: ['stun:stun.example.test:3478'],
+    });
+    await vi.waitFor(() => expect(peer).toBeDefined());
+    const control = peer.channels.get(REMOTE_DESKTOP_CHANNEL.CONTROL)!;
+    control.open();
+
+    // Refused locally: input is not ready, so nothing is sent — but the
+    // operator still learns why the resolution did not change.
+    const sentBefore = control.sent.length;
+    expect(client.setDisplayMode('display_initial1', 1920, 1080)).toBe(false);
+    expect(control.sent).toHaveLength(sentBefore);
+    expect(client.current().controlRejection).toMatchObject({
+      id: 1,
+      kind: REMOTE_DESKTOP_CONTROL_KIND.SET_DISPLAY_MODE,
+      reason: REMOTE_DESKTOP_CONTROL_REJECTION.DISPLAY_UNAVAILABLE,
+      displayId: 'display_initial1',
+    });
+
+    // Refused by the node: a driver with no monitor attached offers no such
+    // mode. The id advances so the same reason can be shown again.
+    control.receive({
+      type: REMOTE_DESKTOP_DATA_MSG.CONTROL_REJECTED,
+      protocolVersion: REMOTE_DESKTOP_PROTOCOL_VERSION,
+      sessionId: 'session_12345678',
+      sequence: 4,
+      kind: REMOTE_DESKTOP_CONTROL_KIND.SET_DISPLAY_MODE,
+      reason: REMOTE_DESKTOP_CONTROL_REJECTION.MODE_UNSUPPORTED,
+      displayId: 'display_initial1',
+    });
+    expect(client.current().controlRejection).toMatchObject({
+      id: 2,
+      reason: REMOTE_DESKTOP_CONTROL_REJECTION.MODE_UNSUPPORTED,
+    });
+
+    // A rejection naming another session is not this session's answer.
+    control.receive({
+      type: REMOTE_DESKTOP_DATA_MSG.CONTROL_REJECTED,
+      protocolVersion: REMOTE_DESKTOP_PROTOCOL_VERSION,
+      sessionId: 'session_87654321',
+      sequence: 5,
+      kind: REMOTE_DESKTOP_CONTROL_KIND.SET_DISPLAY_MODE,
+      reason: REMOTE_DESKTOP_CONTROL_REJECTION.MODE_CHANGE_FAILED,
+    });
+    expect(client.current().controlRejection?.id).toBe(2);
     client.stop();
   });
 

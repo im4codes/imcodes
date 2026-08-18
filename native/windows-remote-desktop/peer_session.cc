@@ -932,6 +932,14 @@ void PeerSession::HandleControl(const std::string& channel,
   uint64_t sequence = 0;
   const bool require_control = kind == "set_display_mode" ||
       kind == "set_display_scale" || kind == "copy_selection";
+  // A command that needs control but arrives without it is the one refusal the
+  // controller cannot see any other way: the picture keeps updating and the
+  // click simply vanishes. Answer it, but only for this session's own frames.
+  if (require_control && !InputReady() && root["sessionId"].isString() &&
+      root["sessionId"].asString() == authority_.session_id) {
+    SendControlRejected(kind.c_str(), kRejectNotPermitted);
+    return;
+  }
   if (!ValidateInputBase(root, channel, require_control,
                          &sequence)) {
     return;
@@ -963,19 +971,30 @@ void PeerSession::HandleControl(const std::string& channel,
         root.isMember("width") || root.isMember("height") ||
         root.isMember("dpiScalePercent") || root.isMember("requestId") ||
         root.isMember("frameWidth") || root.isMember("frameHeight") ||
-        root.isMember("acknowledgedSequence") ||
-        !ConsumeRate("monitor", 30, std::chrono::minutes(1)) ||
-        !SelectDisplay(root["displayId"].asString())) {
+        root.isMember("acknowledgedSequence")) {
       return;
     }
+    const std::string display_id = root["displayId"].asString();
+    if (!ConsumeRate("monitor", 30, std::chrono::minutes(1))) {
+      SendControlRejected(kind.c_str(), kRejectRateLimited, display_id);
+      return;
+    }
+    // The layout operations report their own specific refusal reason.
+    if (!SelectDisplay(display_id)) return;
   } else if (kind == "set_display_mode") {
     if (!root["displayId"].isString() || !root["width"].isInt() ||
         !root["height"].isInt() || root.isMember("frameWidth") ||
         root.isMember("frameHeight") || root.isMember("dpiScalePercent") ||
         root.isMember("requestId") ||
-        root.isMember("acknowledgedSequence") ||
-        !ConsumeRate("monitor", 30, std::chrono::minutes(1)) ||
-        !SetDisplayMode(root["displayId"].asString(), root["width"].asInt(),
+        root.isMember("acknowledgedSequence")) {
+      return;
+    }
+    const std::string display_id = root["displayId"].asString();
+    if (!ConsumeRate("monitor", 30, std::chrono::minutes(1))) {
+      SendControlRejected(kind.c_str(), kRejectRateLimited, display_id);
+      return;
+    }
+    if (!SetDisplayMode(display_id, root["width"].asInt(),
                         root["height"].asInt())) {
       return;
     }
@@ -984,12 +1003,15 @@ void PeerSession::HandleControl(const std::string& channel,
         root.isMember("width") || root.isMember("height") ||
         root.isMember("requestId") || root.isMember("frameWidth") ||
         root.isMember("frameHeight") ||
-        root.isMember("acknowledgedSequence") ||
-        !ConsumeRate("monitor", 30, std::chrono::minutes(1)) ||
-        !SetDisplayScale(root["displayId"].asString(),
-                         root["dpiScalePercent"].asInt())) {
+        root.isMember("acknowledgedSequence")) {
       return;
     }
+    const std::string display_id = root["displayId"].asString();
+    if (!ConsumeRate("monitor", 30, std::chrono::minutes(1))) {
+      SendControlRejected(kind.c_str(), kRejectRateLimited, display_id);
+      return;
+    }
+    if (!SetDisplayScale(display_id, root["dpiScalePercent"].asInt())) return;
   } else if (kind == "copy_selection") {
     if (!root["requestId"].isString() ||
         !IsSafeId(root["requestId"].asString()) ||
@@ -1232,12 +1254,32 @@ void PeerSession::SendStatus(const char* state, bool input_enabled) {
   emit_(root);
 }
 
+bool PeerSession::SendControlRejected(const char* kind,
+                                      const char* reason,
+                                      const std::string& display_id) {
+  // Bounded like every other outbound answer: a controller that floods control
+  // frames must not be able to make this session answer each one.
+  if (!ConsumeRate("reject", 60, std::chrono::minutes(1))) return false;
+  Json::Value root(Json::objectValue);
+  root["type"] = kControlRejectedType;
+  root["protocolVersion"] = kProtocolVersion;
+  root["sessionId"] = authority_.session_id;
+  root["sequence"] = Json::UInt64(outbound_sequence_++);
+  root["kind"] = kind;
+  root["reason"] = reason;
+  if (!display_id.empty()) root["displayId"] = display_id;
+  SendControl(root);
+  return false;
+}
+
 bool PeerSession::SelectDisplay(const std::string& id) {
   const auto found = std::find_if(displays_.begin(), displays_.end(),
                                   [&](const DisplayInfo& display) {
                                     return display.id == id && display.available;
                                   });
-  if (found == displays_.end()) return false;
+  if (found == displays_.end()) {
+    return SendControlRejected("select_display", kRejectDisplayUnavailable, id);
+  }
   const size_t index = static_cast<size_t>(found - displays_.begin());
   if (index == selected_display_ && !selection_required_) return true;
   ReleaseInput();
@@ -1249,7 +1291,7 @@ bool PeerSession::SelectDisplay(const std::string& id) {
     SendTopology();
     SendQuality();
     SendStatus(relayed_ ? "relayed" : "direct", InputReady());
-    return false;
+    return SendControlRejected("select_display", kRejectCaptureFailed, id);
   }
   next_source->Start();
   auto next_track = factory_->CreateVideoTrack(next_source,
@@ -1269,7 +1311,7 @@ bool PeerSession::SelectDisplay(const std::string& id) {
     SendTopology();
     SendQuality();
     SendStatus(relayed_ ? "relayed" : "direct", InputReady());
-    return false;
+    return SendControlRejected("select_display", kRejectCaptureFailed, id);
   }
   const std::optional<DisplayInfo> previous_display =
       source_ ? std::optional<DisplayInfo>(source_->display()) : std::nullopt;
@@ -1290,19 +1332,21 @@ bool PeerSession::SelectDisplay(const std::string& id) {
 bool PeerSession::SetDisplayMode(const std::string& id,
                                  int width,
                                  int height) {
-  if (!IsAllowedRemoteDisplayMode(width, height)) return false;
-  const auto restore_current_status = [&]() {
+  if (!IsAllowedRemoteDisplayMode(width, height)) {
+    return SendControlRejected("set_display_mode", kRejectModeUnsupported, id);
+  }
+  const auto restore_current_status = [&](const char* reason) {
     SendTopology();
     SendQuality();
     SendStatus(relayed_ ? "relayed" : "direct", InputReady());
-    return false;
+    return SendControlRejected("set_display_mode", reason, id);
   };
   const auto found = std::find_if(displays_.begin(), displays_.end(),
                                   [&](const DisplayInfo& display) {
                                     return display.id == id && display.available;
                                   });
   if (found == displays_.end() || found->device_name.empty()) {
-    return restore_current_status();
+    return restore_current_status(kRejectDisplayUnavailable);
   }
   if (found->width == width && found->height == height) {
     SendStatus(relayed_ ? "relayed" : "direct", InputReady());
@@ -1313,14 +1357,17 @@ bool PeerSession::SetDisplayMode(const std::string& id,
   mode.dmSize = sizeof(mode);
   if (!EnumDisplaySettingsExW(found->device_name.c_str(),
                               ENUM_CURRENT_SETTINGS, &mode, EDS_RAWMODE)) {
-    return restore_current_status();
+    return restore_current_status(kRejectDisplayUnavailable);
   }
   mode.dmPelsWidth = static_cast<DWORD>(width);
   mode.dmPelsHeight = static_cast<DWORD>(height);
   mode.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT;
+  // A GPU with no monitor attached exposes only its fallback mode list, so this
+  // is where a headless box refuses every resolution the operator picks — the
+  // reason the controller needs to see rather than a click that does nothing.
   if (ChangeDisplaySettingsExW(found->device_name.c_str(), &mode, nullptr,
                                CDS_TEST, nullptr) != DISP_CHANGE_SUCCESSFUL) {
-    return restore_current_status();
+    return restore_current_status(kRejectModeUnsupported);
   }
 
   ReleaseInput();
@@ -1331,7 +1378,7 @@ bool PeerSession::SetDisplayMode(const std::string& id,
                                nullptr) != DISP_CHANGE_SUCCESSFUL) {
     layout_acknowledged_ = previous_layout_acknowledged;
     SendStatus(relayed_ ? "relayed" : "direct", InputReady());
-    return false;
+    return SendControlRejected("set_display_mode", kRejectModeChangeFailed, id);
   }
   // Do not drive the undocumented per-monitor DPI packet while DXGI is still
   // bound to the old mode. On the IM.codes display persist the paired readable
@@ -1346,12 +1393,18 @@ bool PeerSession::SetDisplayMode(const std::string& id,
 }
 
 bool PeerSession::SetDisplayScale(const std::string& id, int percent) {
-  if (!IsAllowedRemoteDisplayScale(percent)) return false;
+  if (!IsAllowedRemoteDisplayScale(percent)) {
+    return SendControlRejected("set_display_scale", kRejectScaleChangeFailed,
+                               id);
+  }
   const auto found = std::find_if(displays_.begin(), displays_.end(),
                                   [&](const DisplayInfo& display) {
                                     return display.id == id && display.available;
                                   });
-  if (found == displays_.end() || found->device_name.empty()) return false;
+  if (found == displays_.end() || found->device_name.empty()) {
+    return SendControlRejected("set_display_scale", kRejectDisplayUnavailable,
+                               id);
+  }
   if (std::lround(found->dpi_scale * 100.0) == percent) {
     SendStatus(relayed_ ? "relayed" : "direct", InputReady());
     return true;
@@ -1363,7 +1416,8 @@ bool PeerSession::SetDisplayScale(const std::string& id, int percent) {
     layout_acknowledged_ = previous_layout_acknowledged;
     SendTopology();
     SendStatus(relayed_ ? "relayed" : "direct", InputReady());
-    return false;
+    return SendControlRejected("set_display_scale", kRejectScaleChangeFailed,
+                               id);
   }
   found->dpi_scale = static_cast<double>(percent) / 100.0;
   if (found->imcodes_virtual) {

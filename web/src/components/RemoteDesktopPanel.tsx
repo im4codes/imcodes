@@ -116,6 +116,8 @@ const INITIAL_SNAPSHOT: RemoteDesktopSnapshot = {
 };
 
 const MAX_REMOTE_DESKTOP_RECONNECTS = REMOTE_DESKTOP_LIMITS.MAX_RECONNECT_ATTEMPTS;
+/** How long a refused-command notice stays up before it fades on its own. */
+const CONTROL_NOTICE_MS = 6_000;
 const TOUCH_LONG_PRESS_MS = 550;
 const TOUCH_DOUBLE_TAP_MS = 400;
 const TOUCH_DOUBLE_TAP_DISTANCE_PX = 32;
@@ -219,6 +221,7 @@ export function RemoteDesktopPanel({
   const [clipboardStatus, setClipboardStatus] = useState<ClipboardStatus>('idle');
   const [mediaPresented, setMediaPresented] = useState(false);
   const [desktopMaximized, setDesktopMaximized] = useState(false);
+  const [controlNotice, setControlNotice] = useState<{ id: number; text: string } | null>(null);
   const clientRef = useRef<RemoteDesktopClient | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const stageRef = useRef<HTMLDivElement | null>(null);
@@ -368,6 +371,22 @@ export function RemoteDesktopPanel({
       suppressDisplayTabClickTimerRef.current = null;
     }
   }, []);
+
+  // A refused layout command is the only outcome the picture cannot show: the
+  // desktop keeps streaming unchanged. Surface the node's reason and let it
+  // fade, so a second attempt with the same reason still announces itself.
+  useEffect(() => {
+    const rejection = snapshot.controlRejection;
+    if (!rejection) return;
+    setControlNotice({
+      id: rejection.id,
+      text: t(`remote_desktop.control_rejected.${rejection.reason}`),
+    });
+    const timer = setTimeout(() => {
+      setControlNotice((current) => (current?.id === rejection.id ? null : current));
+    }, CONTROL_NOTICE_MS);
+    return () => clearTimeout(timer);
+  }, [snapshot.controlRejection?.id, t]);
 
   useEffect(() => {
     if (!displayModeMenu) return;
@@ -1462,6 +1481,10 @@ export function RemoteDesktopPanel({
           >{t('remote_desktop.files')}</button>
         </div>
 
+        {controlNotice && (
+          <div class="remote-desktop-control-notice" role="alert">{controlNotice.text}</div>
+        )}
+
         {displayModeMenu && (() => {
           const display = snapshot.displays.find((candidate) => candidate.id === displayModeMenu.displayId);
           if (!display?.available) return null;
@@ -1480,7 +1503,10 @@ export function RemoteDesktopPanel({
                   type="button"
                   role="menuitemradio"
                   aria-checked={display.width === mode.width && display.height === mode.height}
-                  disabled={!snapshot.inputEnabled}
+                  // Clickable whenever this viewer holds control: when input is
+                  // not ready the click still gets an explanation, which beats a
+                  // grey button that never says why.
+                  disabled={snapshot.mode !== REMOTE_DESKTOP_ACCESS_MODE.CONTROL}
                   onClick={() => {
                     clientRef.current?.setDisplayMode(display.id, mode.width, mode.height);
                     setDisplayModeMenu(null);
@@ -1499,7 +1525,7 @@ export function RemoteDesktopPanel({
                     role="menuitemradio"
                     aria-label={`${dpiScalePercent}% DPI`}
                     aria-checked={Math.round(display.dpiScale * 100) === dpiScalePercent}
-                    disabled={!snapshot.inputEnabled}
+                    disabled={snapshot.mode !== REMOTE_DESKTOP_ACCESS_MODE.CONTROL}
                     onClick={() => {
                       clientRef.current?.setDisplayScale(display.id, dpiScalePercent);
                       setDisplayModeMenu(null);

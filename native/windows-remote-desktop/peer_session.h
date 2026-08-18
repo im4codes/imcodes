@@ -131,6 +131,11 @@ class PeerSession final : public webrtc::PeerConnectionObserver,
   bool SendClipboard(const std::string& request_id,
                      const std::optional<std::u16string>& text);
   void SendStatus(const char* state, bool input_enabled);
+  // Tell the controller why a control command did nothing. Always returns
+  // false so refusal paths can `return SendControlRejected(...)`.
+  bool SendControlRejected(const char* kind,
+                           const char* reason,
+                           const std::string& display_id = {});
   void EmitIceCandidate(std::string mid, std::string candidate);
   bool FlushPendingRemoteIce();
   bool SelectDisplay(const std::string& id);

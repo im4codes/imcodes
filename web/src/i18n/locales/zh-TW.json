@@ -3068,6 +3068,15 @@
       "stopping": "正在停止",
       "stopped": "已停止",
       "failed": "失敗"
+    },
+    "control_rejected": {
+      "not_permitted": "節點拒絕：目前工作階段沒有該桌面的控制權。",
+      "rate_limited": "節點拒絕：短時間內版面變更過多，請稍後再試。",
+      "display_unavailable": "節點拒絕：該顯示器已無法使用。",
+      "mode_unsupported": "節點拒絕：顯示卡驅動程式不提供該解析度。未接螢幕的顯示卡通常只有一種解析度，請使用 IM.codes 虛擬顯示器自由選擇。",
+      "mode_change_failed": "節點拒絕：Windows 未能套用該解析度。",
+      "scale_change_failed": "節點拒絕：Windows 未能套用該縮放比例。",
+      "capture_failed": "節點拒絕：無法將畫面擷取切換到該顯示器。"
     }
   }
 }

@@ -56,6 +56,10 @@ export const REMOTE_DESKTOP_DATA_MSG = {
   KEYBOARD: 'remote_desktop.data.keyboard',
   CONTROL: 'remote_desktop.data.control',
   RELEASE_ALL: 'remote_desktop.data.release_all',
+  // Worker → browser: a control command was understood but could not be
+  // carried out. Success is already visible through the topology and status
+  // frames; without this, a refusal looks exactly like a lost click.
+  CONTROL_REJECTED: 'remote_desktop.data.control_rejected',
 } as const;
 
 export const REMOTE_DESKTOP_CHANNEL = {
@@ -156,6 +160,36 @@ export const REMOTE_DESKTOP_CONTROL_KIND = {
   KEEPALIVE: 'keepalive',
   INPUT_ACK: 'input_ack',
 } as const;
+
+export type RemoteDesktopControlKind = typeof REMOTE_DESKTOP_CONTROL_KIND[
+  keyof typeof REMOTE_DESKTOP_CONTROL_KIND
+];
+
+/**
+ * Why the worker refused a control command. These are the node's answer to
+ * "nothing happened": each one maps to a distinct thing the operator can do,
+ * so they must stay distinguishable rather than collapse into a generic error.
+ */
+export const REMOTE_DESKTOP_CONTROL_REJECTION = {
+  /** The session holds no input authority, or input is not ready yet. */
+  NOT_PERMITTED: 'not_permitted',
+  /** Too many layout commands in the rate window. */
+  RATE_LIMITED: 'rate_limited',
+  /** No such display, it went away, or Windows exposes no adapter for it. */
+  DISPLAY_UNAVAILABLE: 'display_unavailable',
+  /** The driver rejected the mode — common on a GPU with no monitor attached. */
+  MODE_UNSUPPORTED: 'mode_unsupported',
+  /** The mode tested fine but Windows refused to apply it. */
+  MODE_CHANGE_FAILED: 'mode_change_failed',
+  /** The scale change was refused by Windows. */
+  SCALE_CHANGE_FAILED: 'scale_change_failed',
+  /** The display exists but capture could not be moved to it. */
+  CAPTURE_FAILED: 'capture_failed',
+} as const;
+
+export type RemoteDesktopControlRejection = typeof REMOTE_DESKTOP_CONTROL_REJECTION[
+  keyof typeof REMOTE_DESKTOP_CONTROL_REJECTION
+];
 
 export const REMOTE_DESKTOP_COMMON_DISPLAY_MODES = [
   { width: 1280, height: 720, label: '720p', recommendedDpiScalePercent: 125 },
@@ -460,6 +494,17 @@ export interface RemoteDesktopClipboard {
   text?: string;
 }
 
+export interface RemoteDesktopControlRejected {
+  type: typeof REMOTE_DESKTOP_DATA_MSG.CONTROL_REJECTED;
+  protocolVersion: typeof REMOTE_DESKTOP_PROTOCOL_VERSION;
+  sessionId: string;
+  sequence: number;
+  kind: RemoteDesktopControlKind;
+  reason: RemoteDesktopControlRejection;
+  /** The display the command targeted, when it named one. */
+  displayId?: string;
+}
+
 interface RemoteDesktopInputBase {
   protocolVersion: typeof REMOTE_DESKTOP_PROTOCOL_VERSION;
   sessionId: string;
@@ -509,7 +554,7 @@ export type RemoteDesktopBrowserMessage = RemoteDesktopStart | RemoteDesktopOffe
 export type RemoteDesktopDaemonCommand = RemoteDesktopPrepare | RemoteDesktopOffer | RemoteDesktopIce | RemoteDesktopLease | RemoteDesktopModeState | RemoteDesktopCancel | RemoteDesktopStop;
 export type RemoteDesktopDaemonMessage = RemoteDesktopAnswer | RemoteDesktopIce | RemoteDesktopModeState | RemoteDesktopStatus | RemoteDesktopRenegotiate | RemoteDesktopTerminal;
 export type RemoteDesktopServerMessage = RemoteDesktopAuthorized | RemoteDesktopAnswer | RemoteDesktopIce | RemoteDesktopModeState | RemoteDesktopStatus | RemoteDesktopRenegotiate | RemoteDesktopTerminal | RemoteDesktopError;
-export type RemoteDesktopDataMessage = RemoteDesktopDisplayTopology | RemoteDesktopQuality | RemoteDesktopClipboard | RemoteDesktopPointer | RemoteDesktopKeyboard | RemoteDesktopControl | RemoteDesktopReleaseAll;
+export type RemoteDesktopDataMessage = RemoteDesktopDisplayTopology | RemoteDesktopQuality | RemoteDesktopClipboard | RemoteDesktopPointer | RemoteDesktopKeyboard | RemoteDesktopControl | RemoteDesktopReleaseAll | RemoteDesktopControlRejected;
 
 export type RemoteDesktopValidationResult<T> = { ok: true; value: T } | { ok: false; error: typeof REMOTE_DESKTOP_ERROR.INVALID_REQUEST };
 
@@ -575,6 +620,7 @@ const POINTER_KINDS = new Set<string>(Object.values(REMOTE_DESKTOP_POINTER_KIND)
 const POINTER_BUTTONS = new Set<string>(Object.values(REMOTE_DESKTOP_POINTER_BUTTON));
 const KEYBOARD_KINDS = new Set<string>(Object.values(REMOTE_DESKTOP_KEYBOARD_KIND));
 const CONTROL_KINDS = new Set<string>(Object.values(REMOTE_DESKTOP_CONTROL_KIND));
+const CONTROL_REJECTIONS = new Set<string>(Object.values(REMOTE_DESKTOP_CONTROL_REJECTION));
 
 function invalid<T>(): RemoteDesktopValidationResult<T> {
   return { ok: false, error: REMOTE_DESKTOP_ERROR.INVALID_REQUEST };
@@ -974,6 +1020,17 @@ function validateControl(value: Record<string, unknown>): boolean {
     && value.dpiScalePercent === undefined && value.requestId === undefined;
 }
 
+function validateControlRejected(value: Record<string, unknown>): boolean {
+  return hasExactKeys(value, ['type', 'protocolVersion', 'sessionId', 'sequence', 'kind', 'reason'], ['displayId'])
+    && value.protocolVersion === REMOTE_DESKTOP_PROTOCOL_VERSION
+    && isId(value.sessionId)
+    && isSafeNonNegative(value.sequence)
+    && typeof value.kind === 'string' && CONTROL_KINDS.has(value.kind)
+    && typeof value.reason === 'string' && CONTROL_REJECTIONS.has(value.reason)
+    && (value.displayId === undefined
+      || isBoundedString(value.displayId, REMOTE_DESKTOP_LIMITS.DISPLAY_ID_BYTES));
+}
+
 export function validateRemoteDesktopDataMessage(value: unknown): RemoteDesktopValidationResult<RemoteDesktopDataMessage> {
   if (!isRecord(value) || typeof value.type !== 'string') return invalid();
   if (value.type === REMOTE_DESKTOP_DATA_MSG.DISPLAY_TOPOLOGY && validateDisplayTopology(value)) {
@@ -993,6 +1050,9 @@ export function validateRemoteDesktopDataMessage(value: unknown): RemoteDesktopV
   }
   if (value.type === REMOTE_DESKTOP_DATA_MSG.CONTROL && validateControl(value)) {
     return { ok: true, value: value as unknown as RemoteDesktopControl };
+  }
+  if (value.type === REMOTE_DESKTOP_DATA_MSG.CONTROL_REJECTED && validateControlRejected(value)) {
+    return { ok: true, value: value as unknown as RemoteDesktopControlRejected };
   }
   if (value.type === REMOTE_DESKTOP_DATA_MSG.RELEASE_ALL
     && hasExactKeys(value, ['type', 'protocolVersion', 'sessionId', 'sequence', 'layoutRevision', 'inputEpoch'])

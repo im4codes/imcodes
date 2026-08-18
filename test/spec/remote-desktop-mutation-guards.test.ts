@@ -108,6 +108,55 @@ const contracts: Contract[] = [
     ],
   },
   {
+    // Every layout refusal has to reach the controller: without these, a
+    // command that cannot be carried out is indistinguishable from a lost
+    // click, which is exactly how the resolution switch failed silently.
+    name: 'refused layout commands are answered, not swallowed',
+    guards: [
+      {
+        path: 'native/windows-remote-desktop/peer_session.cc',
+        needle: 'SendControlRejected(kind.c_str(), kRejectNotPermitted)',
+      },
+      {
+        path: 'native/windows-remote-desktop/peer_session.cc',
+        needle: 'SendControlRejected(kind.c_str(), kRejectRateLimited, display_id)',
+        minimum: 3,
+      },
+      {
+        path: 'native/windows-remote-desktop/peer_session.cc',
+        needle: 'return restore_current_status(kRejectModeUnsupported);',
+      },
+      {
+        path: 'native/windows-remote-desktop/peer_session.cc',
+        needle: 'SendControlRejected("set_display_mode", kRejectModeChangeFailed, id)',
+      },
+      {
+        path: 'native/windows-remote-desktop/peer_session.cc',
+        needle: 'SendControlRejected("set_display_scale", kRejectScaleChangeFailed,',
+        minimum: 2,
+      },
+      {
+        path: 'native/windows-remote-desktop/peer_session.cc',
+        needle: 'SendControlRejected("select_display", kRejectCaptureFailed, id)',
+        minimum: 2,
+      },
+      {
+        // Answering is bounded like every other outbound frame.
+        path: 'native/windows-remote-desktop/peer_session.cc',
+        needle: 'if (!ConsumeRate("reject", 60, std::chrono::minutes(1))) return false;',
+      },
+      {
+        path: 'web/src/remote-desktop-client.ts',
+        needle: 'this.publishControlRejection(',
+        minimum: 3,
+      },
+      {
+        path: 'web/src/components/RemoteDesktopPanel.tsx',
+        needle: "t(`remote_desktop.control_rejected.${rejection.reason}`)",
+      },
+    ],
+  },
+  {
     name: 'browser and worker release-all',
     guards: [
       {
@@ -706,8 +755,10 @@ const contracts: Contract[] = [
         minimum: 2,
       },
       {
+        // Each recovery path names why it gave up, so the controller is told
+        // instead of watching the resolution silently stay put.
         path: 'native/windows-remote-desktop/peer_session.cc',
-        needle: 'return restore_current_status();',
+        needle: 'return restore_current_status(kReject',
         minimum: 3,
       },
     ],
@@ -1079,7 +1130,7 @@ const mutations: Mutation[] = [
     name: 'remove native unsupported-mode recovery',
     contract: 'per-display fixed resolution switching',
     path: 'native/windows-remote-desktop/peer_session.cc',
-    needle: 'return restore_current_status();',
+    needle: 'return restore_current_status(kReject',
   },
   {
     name: 'remove real-display hotplug preference',

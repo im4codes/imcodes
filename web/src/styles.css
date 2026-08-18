@@ -7997,6 +7997,17 @@ button.quick-agent-delegation-preset.active {
   font-size: 11px;
 }
 
+.remote-desktop-control-notice {
+  margin: 0 12px 8px;
+  padding: 8px 12px;
+  border: 1px solid rgba(255, 176, 87, 0.45);
+  border-radius: 8px;
+  background: rgba(84, 51, 12, 0.55);
+  color: #ffd7a8;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
 .remote-desktop-stage {
   position: relative;
   min-width: 0;

@@ -3068,6 +3068,15 @@
       "stopping": "Deteniendo",
       "stopped": "Detenido",
       "failed": "Error"
+    },
+    "control_rejected": {
+      "not_permitted": "El nodo lo rechazó: esta sesión no tiene el control de ese escritorio ahora mismo.",
+      "rate_limited": "El nodo lo rechazó: demasiados cambios de disposición en poco tiempo. Inténtalo de nuevo en un momento.",
+      "display_unavailable": "El nodo lo rechazó: esa pantalla ya no está disponible.",
+      "mode_unsupported": "El nodo lo rechazó: el controlador gráfico no ofrece esa resolución. Una GPU sin monitor conectado suele ofrecer solo una: usa la pantalla virtual de IM.codes para elegir libremente.",
+      "mode_change_failed": "El nodo lo rechazó: Windows no aplicó esa resolución.",
+      "scale_change_failed": "El nodo lo rechazó: Windows no aplicó esa escala.",
+      "capture_failed": "El nodo lo rechazó: no se pudo mover la captura a esa pantalla."
     }
   }
 }

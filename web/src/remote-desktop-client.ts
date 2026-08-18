@@ -4,6 +4,7 @@ import {
   REMOTE_DESKTOP_CHANNEL,
   REMOTE_DESKTOP_COMMON_DISPLAY_MODES,
   REMOTE_DESKTOP_CONTROL_KIND,
+  REMOTE_DESKTOP_CONTROL_REJECTION,
   REMOTE_DESKTOP_DATA_MSG,
   REMOTE_DESKTOP_DPI_SCALE_PERCENTS,
   REMOTE_DESKTOP_ERROR,
@@ -21,6 +22,8 @@ import {
   validateRemoteDesktopDataMessage,
   validateRemoteDesktopServerMessage,
   type RemoteDesktopAccessMode,
+  type RemoteDesktopControlKind,
+  type RemoteDesktopControlRejection,
   type RemoteDesktopDisplay,
   type RemoteDesktopQuality,
   type RemoteDesktopRoute,
@@ -59,6 +62,18 @@ export interface RemoteDesktopSnapshot {
   durationMs?: number;
   reconnectCount?: number;
   capabilityVersion?: string;
+  /**
+   * The last control command that was refused, with a monotonic id so the UI
+   * re-shows the same reason when it happens again. Set by the worker's
+   * rejection frame, and by this client when it declines to send at all —
+   * either way the operator gets told instead of watching a click vanish.
+   */
+  controlRejection?: {
+    id: number;
+    kind: RemoteDesktopControlKind;
+    reason: RemoteDesktopControlRejection;
+    displayId?: string;
+  };
 }
 
 export interface RemoteDesktopClientHooks {
@@ -284,6 +299,7 @@ export class RemoteDesktopClient {
     resolve(value: string | null): void;
     timer: ReturnType<typeof setTimeout>;
   }>();
+  private controlRejectionId = 0;
   private snapshot: RemoteDesktopSnapshot = {
     state: REMOTE_DESKTOP_STATE.AUTHORIZING,
     mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
@@ -369,11 +385,21 @@ export class RemoteDesktopClient {
     const display = this.snapshot.displays.find((candidate) => (
       candidate.id === displayId && candidate.available
     ));
-    if (!this.snapshot.inputEnabled
-      || !display
-      || !REMOTE_DESKTOP_COMMON_DISPLAY_MODES.some((mode) => (
-        mode.width === width && mode.height === height
-      ))) return false;
+    if (!REMOTE_DESKTOP_COMMON_DISPLAY_MODES.some((mode) => (
+      mode.width === width && mode.height === height
+    ))) return false;
+    if (!this.snapshot.inputEnabled || !display) {
+      // Refused here rather than on the node, but the operator saw the same
+      // thing — a click that changed nothing — so answer it the same way.
+      this.publishControlRejection(
+        REMOTE_DESKTOP_CONTROL_KIND.SET_DISPLAY_MODE,
+        display
+          ? REMOTE_DESKTOP_CONTROL_REJECTION.NOT_PERMITTED
+          : REMOTE_DESKTOP_CONTROL_REJECTION.DISPLAY_UNAVAILABLE,
+        displayId,
+      );
+      return false;
+    }
     if (display.width === width && display.height === height) return true;
     this.releaseAll();
     const sent = this.sendControl({
@@ -394,10 +420,19 @@ export class RemoteDesktopClient {
     const display = this.snapshot.displays.find((candidate) => (
       candidate.id === displayId && candidate.available
     ));
-    if (!this.snapshot.inputEnabled || !display
-      || !REMOTE_DESKTOP_DPI_SCALE_PERCENTS.includes(
-        dpiScalePercent as typeof REMOTE_DESKTOP_DPI_SCALE_PERCENTS[number],
-      )) return false;
+    if (!REMOTE_DESKTOP_DPI_SCALE_PERCENTS.includes(
+      dpiScalePercent as typeof REMOTE_DESKTOP_DPI_SCALE_PERCENTS[number],
+    )) return false;
+    if (!this.snapshot.inputEnabled || !display) {
+      this.publishControlRejection(
+        REMOTE_DESKTOP_CONTROL_KIND.SET_DISPLAY_SCALE,
+        display
+          ? REMOTE_DESKTOP_CONTROL_REJECTION.NOT_PERMITTED
+          : REMOTE_DESKTOP_CONTROL_REJECTION.DISPLAY_UNAVAILABLE,
+        displayId,
+      );
+      return false;
+    }
     if (Math.round(display.dpiScale * 100) === dpiScalePercent) return true;
     this.releaseAll();
     const sent = this.sendControl({
@@ -821,6 +856,22 @@ export class RemoteDesktopClient {
     });
   }
 
+  private publishControlRejection(
+    kind: RemoteDesktopControlKind,
+    reason: RemoteDesktopControlRejection,
+    displayId?: string,
+  ): void {
+    this.controlRejectionId += 1;
+    this.publish({
+      controlRejection: {
+        id: this.controlRejectionId,
+        kind,
+        reason,
+        ...(displayId === undefined ? {} : { displayId }),
+      },
+    });
+  }
+
   private handleData(raw: unknown): void {
     const text = decodeDataChannelPayload(raw);
     if (!text) return;
@@ -860,6 +911,12 @@ export class RemoteDesktopClient {
       clearTimeout(pending.timer);
       this.pendingClipboardRequests.delete(parsed.value.requestId);
       pending.resolve(parsed.value.available ? parsed.value.text ?? null : null);
+    } else if (parsed.value.type === REMOTE_DESKTOP_DATA_MSG.CONTROL_REJECTED) {
+      this.publishControlRejection(
+        parsed.value.kind,
+        parsed.value.reason,
+        parsed.value.displayId,
+      );
     } else if (parsed.value.type === REMOTE_DESKTOP_DATA_MSG.CONTROL
       && parsed.value.kind === REMOTE_DESKTOP_CONTROL_KIND.INPUT_ACK
       && parsed.value.layoutRevision === this.snapshot.layoutRevision

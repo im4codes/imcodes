@@ -3068,6 +3068,15 @@
       "stopping": "Stopping",
       "stopped": "Stopped",
       "failed": "Failed"
+    },
+    "control_rejected": {
+      "not_permitted": "The node refused: this session does not have control of that desktop right now.",
+      "rate_limited": "The node refused: too many layout changes in a short time. Try again in a moment.",
+      "display_unavailable": "The node refused: that display is no longer available.",
+      "mode_unsupported": "The node refused: the graphics driver does not offer that resolution. A GPU with no monitor attached usually offers only one — use the IM.codes virtual display to pick freely.",
+      "mode_change_failed": "The node refused: Windows would not apply that resolution.",
+      "scale_change_failed": "The node refused: Windows would not apply that scale.",
+      "capture_failed": "The node refused: capture could not be moved to that display."
     }
   }
 }

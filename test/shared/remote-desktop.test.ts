@@ -5,6 +5,7 @@ import {
   REMOTE_DESKTOP_CHANNEL,
   REMOTE_DESKTOP_COMMON_DISPLAY_MODES,
   REMOTE_DESKTOP_CONTROL_KIND,
+  REMOTE_DESKTOP_CONTROL_REJECTION,
   REMOTE_DESKTOP_DATA_MSG,
   REMOTE_DESKTOP_DPI_SCALE_PERCENTS,
   REMOTE_DESKTOP_DISPLAY_ROTATION,
@@ -334,6 +335,28 @@ describe('remote desktop production contract', () => {
     };
     expect(validateRemoteDesktopDataMessage(quality)).toMatchObject({ ok: true });
     expect(validateRemoteDesktopDataMessage({ ...quality, bitrateBps: REMOTE_DESKTOP_LIMITS.MAX_VIDEO_BITRATE_BPS + 1 }))
+      .toEqual({ ok: false, error: REMOTE_DESKTOP_ERROR.INVALID_REQUEST });
+  });
+
+  it('validates a control rejection and refuses unknown reasons or padding', () => {
+    const rejection = {
+      type: REMOTE_DESKTOP_DATA_MSG.CONTROL_REJECTED,
+      protocolVersion: REMOTE_DESKTOP_PROTOCOL_VERSION,
+      sessionId,
+      sequence: 6,
+      kind: REMOTE_DESKTOP_CONTROL_KIND.SET_DISPLAY_MODE,
+      reason: REMOTE_DESKTOP_CONTROL_REJECTION.MODE_UNSUPPORTED,
+      displayId: 'display-primary',
+    };
+    expect(validateRemoteDesktopDataMessage(rejection)).toMatchObject({ ok: true });
+    // displayId is optional: refusals that name no display still arrive.
+    const { displayId: _displayId, ...withoutDisplay } = rejection;
+    expect(validateRemoteDesktopDataMessage(withoutDisplay)).toMatchObject({ ok: true });
+    expect(validateRemoteDesktopDataMessage({ ...rejection, reason: 'because' }))
+      .toEqual({ ok: false, error: REMOTE_DESKTOP_ERROR.INVALID_REQUEST });
+    expect(validateRemoteDesktopDataMessage({ ...rejection, kind: 'set_display_colour' }))
+      .toEqual({ ok: false, error: REMOTE_DESKTOP_ERROR.INVALID_REQUEST });
+    expect(validateRemoteDesktopDataMessage({ ...rejection, unexpected: true }))
       .toEqual({ ok: false, error: REMOTE_DESKTOP_ERROR.INVALID_REQUEST });
   });
 
