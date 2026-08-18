@@ -168,10 +168,16 @@ public static class ImcodesUserProc {
       CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
     } finally { if (env != IntPtr.Zero) DestroyEnvironmentBlock(env); }
   }
-  static void StartSecureConsole(string exe, string argsLine) {
+  // One LOCAL_SYSTEM worker in the console session serves both desktops: it
+  // re-binds its capture and input threads when Windows moves between the
+  // user's desktop and the sign-in/lock desktop, so signing in changes the
+  // picture instead of ending the session. It starts on Default and follows
+  // from there; the --secure-console flag is still passed when the caller
+  // explicitly asks for the sign-in desktop so an older worker keeps behaving.
+  static void StartConsoleSystem(string exe, string argsLine, bool signInDesktop) {
     if (WindowsIdentity.GetCurrent().User == null ||
         WindowsIdentity.GetCurrent().User.Value != "S-1-5-18") {
-      throw new Exception("secure desktop fallback requires LocalSystem");
+      throw new Exception("console session worker requires LocalSystem");
     }
     int sid = unchecked((int)WTSGetActiveConsoleSessionId());
     if (sid <= 0 || sid == -1) throw new Exception("no active console session");
@@ -181,7 +187,10 @@ public static class ImcodesUserProc {
       if (!DuplicateTokenEx(token, TOKEN_ALL_ACCESS, IntPtr.Zero, SecurityImpersonation, TokenPrimary, out primary)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
       try {
         if (!SetTokenInformation(primary, TokenSessionId, ref sid, sizeof(int))) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
-        LaunchPrimary(primary, exe, argsLine + " --secure-console", "winsta0\\Winlogon", false);
+        LaunchPrimary(primary, exe,
+                      signInDesktop ? argsLine + " --secure-console" : argsLine,
+                      signInDesktop ? "winsta0\\Winlogon" : "winsta0\\default",
+                      false);
       } finally { CloseHandle(primary); }
     } finally { CloseHandle(token); }
   }
@@ -189,21 +198,17 @@ public static class ImcodesUserProc {
     IntPtr token, primary;
     IntPtr linkedToken = IntPtr.Zero;
     int sid;
-    // A LogonUI process is not evidence that the sign-in desktop is displayed:
-    // it lingers after unlock on real machines, and trusting it launched the
-    // privileged Winlogon worker on a fully logged-in desktop, where it can
-    // neither capture nor inject. Only an explicit caller decision, or the
-    // absence of any console user token, selects the secure console now; a
-    // locked session is detected by the worker itself, which owns the only
-    // authoritative view of the input desktop.
-    if (forceSecureConsole) {
-      StartSecureConsole(exe, argsLine);
+    // The remote-desktop worker asks for the console-session path so a single
+    // process can follow the desktop; other callers keep the ordinary
+    // active-user launch. A LogonUI process is never consulted: it lingers
+    // after unlock on real machines, and trusting it put the privileged worker
+    // on a desktop where it could neither capture nor inject.
+    if (allowSecureDesktopFallback) {
+      StartConsoleSystem(exe, argsLine, forceSecureConsole || !TryInteractiveSessionId(out sid));
       return;
     }
     if (!TryInteractiveSessionId(out sid)) {
-      if (!allowSecureDesktopFallback) throw new Exception("no interactive user session");
-      StartSecureConsole(exe, argsLine);
-      return;
+      throw new Exception("no interactive user session");
     }
     if (!WTSQueryUserToken(sid, out token)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
     try {

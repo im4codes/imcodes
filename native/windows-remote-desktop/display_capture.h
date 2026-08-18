@@ -81,6 +81,14 @@ class DxgiDesktopSource : public webrtc::VideoTrackSource {
 
   void Start();
   void Stop();
+  /**
+   * Ask the capture thread to move to a named desktop. Windows switches
+   * desktops when a session locks or a user signs in, and a locked session
+   * refuses screen reads from the user's own desktop, so capture and input can
+   * legitimately sit on different ones. Applied on the capture thread so no
+   * lock is held across the switch; an empty name means the input desktop.
+   */
+  void RequestDesktopRebind(const std::wstring& desktop_name);
   // A headless console placeholder can enumerate successfully while DXGI
   // waits forever for its first presented frame. Keep that state out of the
   // WebRTC session with one bounded admission wait.
@@ -112,6 +120,7 @@ class DxgiDesktopSource : public webrtc::VideoTrackSource {
   void CaptureLoop();
   bool CaptureOne();
   bool CaptureDesktopGdi();
+  void BindCaptureThreadToRequestedDesktop();
   bool BroadcastBgraFrame(int width, int height);
   void BroadcastFrame(
       const webrtc::scoped_refptr<webrtc::I420Buffer>& frame);
@@ -133,11 +142,16 @@ class DxgiDesktopSource : public webrtc::VideoTrackSource {
   std::atomic<uint64_t> dirty_regions_{0};
   std::atomic<uint64_t> move_regions_{0};
   std::atomic<uint64_t> pointer_updates_{0};
+  std::atomic<bool> desktop_rebind_requested_{true};
+  std::mutex desktop_request_mutex_;
+  std::wstring requested_desktop_;
+  HDESK bound_desktop_ = nullptr;
   std::atomic<uint64_t> gdi_attempts_{0};
   std::atomic<DWORD> gdi_last_error_{ERROR_SUCCESS};
   std::atomic<bool> protected_content_masked_{false};
   int consecutive_failures_ = 0;
   int first_frame_waits_ = 0;
+  int gdi_dxgi_retry_ticks_ = 0;
   bool gdi_active_ = false;
   bool last_capture_waited_ = false;
 

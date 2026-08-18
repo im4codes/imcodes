@@ -37,65 +37,83 @@ TEST(WorkerPolicyTest, FailsClosedAcrossDisplaySessionAndPowerChanges) {
             WorkerEnvironmentAction::kStopProtected);
 }
 
-TEST(WorkerPolicyTest, KeepsPrivilegedAndUserWorkersOnTheirOwnDesktop) {
-  int mismatches = 0;
-  EXPECT_EQ(AdvanceWorkerDesktopState(true, false, &mismatches),
-            WorkerDesktopAction::kContinue);
-  EXPECT_EQ(mismatches, 1);
-  EXPECT_EQ(AdvanceWorkerDesktopState(true, false, &mismatches),
-            WorkerDesktopAction::kContinue);
-  EXPECT_EQ(AdvanceWorkerDesktopState(true, false, &mismatches),
-            WorkerDesktopAction::kTerminateSecureConsole);
-  EXPECT_EQ(mismatches, 0);
-
-  EXPECT_EQ(AdvanceWorkerDesktopState(false, false, &mismatches),
-            WorkerDesktopAction::kContinue);
-  EXPECT_EQ(AdvanceWorkerDesktopState(false, true, &mismatches),
-            WorkerDesktopAction::kContinue);
-  EXPECT_EQ(mismatches, 0);
-  for (int attempt = 1; attempt < kWorkerDesktopMismatchLimit; ++attempt) {
-    EXPECT_EQ(AdvanceWorkerDesktopState(false, false, &mismatches),
-              WorkerDesktopAction::kContinue);
-  }
-  EXPECT_EQ(AdvanceWorkerDesktopState(false, false, &mismatches),
-            WorkerDesktopAction::kStopProtected);
-  EXPECT_EQ(AdvanceWorkerDesktopState(false, false, nullptr),
-            WorkerDesktopAction::kContinue);
+TEST(WorkerPolicyTest, FollowsTheDesktopThatCurrentlyReceivesInput) {
+  int failures = 0;
+  EXPECT_EQ(SelectDesktopFollowAction(L"Default", L"Default", &failures),
+            DesktopFollowAction::kStay);
+  EXPECT_EQ(SelectDesktopFollowAction(L"Winlogon", L"Default", &failures),
+            DesktopFollowAction::kFollow);
+  EXPECT_EQ(SelectDesktopFollowAction(L"Default", L"Winlogon", &failures),
+            DesktopFollowAction::kFollow);
+  EXPECT_EQ(failures, 0);
 }
 
-TEST(WorkerPolicyTest, EngagesGdiOnlyAfterDxgiNeverPresentsAFirstFrame) {
+TEST(WorkerPolicyTest, GivesUpOnlyAfterTheInputDesktopStaysUnreadable) {
+  int failures = 0;
+  for (int attempt = 1; attempt < kDesktopFollowFailureLimit; ++attempt) {
+    EXPECT_EQ(SelectDesktopFollowAction(L"", L"Default", &failures),
+              DesktopFollowAction::kStay);
+  }
+  EXPECT_EQ(SelectDesktopFollowAction(L"", L"Default", &failures),
+            DesktopFollowAction::kUnavailable);
+  EXPECT_EQ(failures, 0);
+
+  // A single readable poll clears the streak, and a missing counter never
+  // escalates.
+  failures = kDesktopFollowFailureLimit - 1;
+  EXPECT_EQ(SelectDesktopFollowAction(L"Default", L"Default", &failures),
+            DesktopFollowAction::kStay);
+  EXPECT_EQ(failures, 0);
+  EXPECT_EQ(SelectDesktopFollowAction(L"", L"Default", nullptr),
+            DesktopFollowAction::kStay);
+}
+
+TEST(WorkerPolicyTest, KeepsTheClipboardOnTheSignedInDesktopOnly) {
+  EXPECT_TRUE(ClipboardAllowedOnDesktop(L"Default"));
+  EXPECT_FALSE(ClipboardAllowedOnDesktop(L"Winlogon"));
+  EXPECT_FALSE(ClipboardAllowedOnDesktop(L""));
+  EXPECT_FALSE(ClipboardAllowedOnDesktop(L"Screen-saver"));
+}
+
+TEST(WorkerPolicyTest, TreatsLockAndUnlockAsAFollowRatherThanAnEnding) {
+  EXPECT_EQ(SelectWorkerEnvironmentAction(kEnvironmentSessionLocked),
+            WorkerEnvironmentAction::kFollowDesktop);
+  EXPECT_EQ(SelectWorkerEnvironmentAction(kEnvironmentSessionUnlocked),
+            WorkerEnvironmentAction::kFollowDesktop);
+  // A logoff or a suspend arriving with the lock still ends the session.
+  EXPECT_EQ(SelectWorkerEnvironmentAction(kEnvironmentSessionLocked |
+                                          kEnvironmentSessionUnavailable),
+            WorkerEnvironmentAction::kStopProtected);
+  EXPECT_EQ(SelectWorkerEnvironmentAction(kEnvironmentSessionLocked |
+                                          kEnvironmentSuspend),
+            WorkerEnvironmentAction::kStopProtected);
+}
+
+TEST(WorkerPolicyTest, EngagesGdiAfterAnyRunOfFailedCaptures) {
   int waits = 0;
   for (int attempt = 1; attempt < kFirstFrameWaitsBeforeGdiFallback; ++attempt) {
-    EXPECT_FALSE(AdvanceGdiFallbackState(false, true, false, &waits));
+    EXPECT_FALSE(AdvanceGdiFallbackState(false, true, &waits));
   }
-  EXPECT_TRUE(AdvanceGdiFallbackState(false, true, false, &waits));
+  EXPECT_TRUE(AdvanceGdiFallbackState(false, true, &waits));
   EXPECT_EQ(waits, 0);
 
-  // A source that has already delivered a frame never falls back later, and a
-  // capture that succeeds clears the streak.
+  // A capture that succeeds clears the streak. The run of failures counts even
+  // for a source that streamed happily before: locking a session invalidates
+  // DXGI duplication on a desktop that was working a moment earlier.
   waits = 0;
   for (int attempt = 0; attempt < kFirstFrameWaitsBeforeGdiFallback * 2; ++attempt) {
-    EXPECT_FALSE(AdvanceGdiFallbackState(false, true, true, &waits));
+    EXPECT_FALSE(AdvanceGdiFallbackState(true, true, &waits));
   }
   waits = kFirstFrameWaitsBeforeGdiFallback - 1;
-  EXPECT_FALSE(AdvanceGdiFallbackState(true, true, false, &waits));
+  EXPECT_FALSE(AdvanceGdiFallbackState(true, true, &waits));
   EXPECT_EQ(waits, 0);
 
   // Disallowed fallback and a missing counter both stay closed.
   waits = 0;
   for (int attempt = 0; attempt < kFirstFrameWaitsBeforeGdiFallback * 2; ++attempt) {
-    EXPECT_FALSE(AdvanceGdiFallbackState(false, false, false, &waits));
+    EXPECT_FALSE(AdvanceGdiFallbackState(false, false, &waits));
   }
-  EXPECT_FALSE(AdvanceGdiFallbackState(false, true, false, nullptr));
-}
-
-TEST(WorkerPolicyTest, DisablesOnlyClipboardForSecureConsoleWorkers) {
-  EXPECT_TRUE(WorkerInputDesktopAllowed(false, false));
-  EXPECT_TRUE(WorkerInputDesktopAllowed(false, true));
-  EXPECT_TRUE(WorkerInputDesktopAllowed(true, true));
-  EXPECT_FALSE(WorkerInputDesktopAllowed(true, false));
-  EXPECT_TRUE(WorkerClipboardAllowed(false));
-  EXPECT_FALSE(WorkerClipboardAllowed(true));
+  EXPECT_FALSE(AdvanceGdiFallbackState(false, true, nullptr));
 }
 
 TEST(WorkerPolicyTest, DebouncesDisplayTopologyUntilItStabilizes) {

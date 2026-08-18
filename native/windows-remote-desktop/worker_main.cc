@@ -110,17 +110,17 @@ bool ConstantTimeEqual(const std::string& left, const std::string& right) {
   return difference == 0;
 }
 
-bool IsInputDesktopNamed(const wchar_t* expected_name) {
-  HDESK desktop = OpenInputDesktop(
-      0, FALSE, DESKTOP_READOBJECTS | DESKTOP_SWITCHDESKTOP);
-  if (!desktop) return false;
+std::wstring CurrentInputDesktopName() {
+  HDESK desktop = OpenInputDesktop(0, FALSE, GENERIC_ALL);
+  if (!desktop) return {};
   wchar_t name[64]{};
   DWORD needed = 0;
   const bool read = GetUserObjectInformationW(
       desktop, UOI_NAME, name, sizeof(name), &needed) != FALSE;
   CloseDesktop(desktop);
-  return read && expected_name && lstrcmpiW(name, expected_name) == 0;
+  return read ? std::wstring(name) : std::wstring();
 }
+
 
 bool IsLocalSystemProcess() {
   HANDLE token = nullptr;
@@ -150,6 +150,10 @@ class SilentAudioDeviceModule
 // thread may already own, writes one bounded frame that carries no session,
 // capability, media or input data, and always terminates within a bounded
 // wait so a wedged pipe can never keep a dead worker alive.
+// True only while the indicator/input thread owns the desktop that currently
+// receives input. Input during the brief follow is dropped rather than sent to
+// the desktop being left behind.
+std::atomic<bool> g_input_desktop_ready{false};
 std::atomic<HANDLE> g_crash_pipe{nullptr};
 char g_crash_nonce[64] = {};
 char g_crash_line[512] = {};
@@ -263,38 +267,24 @@ class WorkerRuntime {
                 webrtc::scoped_refptr<webrtc::PeerConnectionFactoryInterface>
                     factory,
                 PipeWriter* writer,
-                LocalIndicator* indicator,
-                bool secure_console)
+                LocalIndicator* indicator)
       : signaling_thread_(signaling_thread),
         factory_(std::move(factory)),
         writer_(writer),
         indicator_(indicator),
-        secure_console_(secure_console),
         input_(
-            [indicator, secure_console](UINT count, LPINPUT inputs, int size) {
-              if (!WorkerInputDesktopAllowed(
-                      secure_console,
-                      !secure_console || IsInputDesktopNamed(L"Winlogon"))) {
-                return static_cast<UINT>(0);
-              }
+            [indicator](UINT count, LPINPUT inputs, int size) {
+              if (!g_input_desktop_ready.load()) return static_cast<UINT>(0);
               return indicator ? indicator->DispatchInput(count, inputs, size)
                                : 0;
             },
-            [indicator, secure_console] {
-              if (!WorkerInputDesktopAllowed(
-                      secure_console,
-                      !secure_console || IsInputDesktopNamed(L"Winlogon"))) {
-                return false;
-              }
-              return indicator && indicator->InputAvailable();
+            [indicator] {
+              return g_input_desktop_ready.load() && indicator &&
+                     indicator->InputAvailable();
             },
-            [indicator, secure_console](int x, int y) {
-              if (!WorkerInputDesktopAllowed(
-                      secure_console,
-                      !secure_console || IsInputDesktopNamed(L"Winlogon"))) {
-                return false;
-              }
-              return indicator && indicator->MovePointer(x, y);
+            [indicator](int x, int y) {
+              return g_input_desktop_ready.load() && indicator &&
+                     indicator->MovePointer(x, y);
             }),
         dwm_process_id_(CurrentDwmProcessIdForCurrentSession()) {}
 
@@ -339,11 +329,16 @@ class WorkerRuntime {
     signaling_thread_->BlockingCall([this] {
       if (local_stop_requested_.exchange(false))
         StopAllOnSignaling("stopped_by_local_user", true);
+      const uint32_t environment_mask = environment_events_.exchange(0);
       const WorkerEnvironmentAction environment_action =
-          SelectWorkerEnvironmentAction(environment_events_.exchange(0));
+          SelectWorkerEnvironmentAction(environment_mask);
       const bool topology_refresh_requested =
           environment_action == WorkerEnvironmentAction::kRefreshTopology;
-      if (environment_action == WorkerEnvironmentAction::kStopProtected) {
+      if (environment_action == WorkerEnvironmentAction::kFollowDesktop) {
+        // Answer the lock/unlock immediately instead of waiting for the poll,
+        // so the picture changes in the same peer within one frame or two.
+        FollowDesktopsOnSignaling();
+      } else if (environment_action == WorkerEnvironmentAction::kStopProtected) {
         StopAllOnSignaling("protected_desktop", true);
         ResetCaptureSourcesOnSignaling();
       } else if (environment_action ==
@@ -359,26 +354,26 @@ class WorkerRuntime {
         RefreshTopologyOnSignaling();
       }
       if (!sessions_.empty()) {
-        const bool expected_desktop = IsInputDesktopNamed(
-            secure_console_ ? L"Winlogon" : L"Default");
-        const WorkerDesktopAction desktop_action = AdvanceWorkerDesktopState(
-            secure_console_, expected_desktop, &protected_desktop_checks_);
-        if (desktop_action != WorkerDesktopAction::kContinue) {
-          // Both directions are the same event from the browser's side: the
-          // desktop moved out from under this worker. Say so precisely so the
-          // service can hand the session to a worker on the new desktop
-          // instead of ending it as an anonymous failure.
+        // Windows moves input between the user's desktop and the sign-in/lock
+        // desktop; the lock screen even lives on both at once (the curtain on
+        // Default, the credential box on Winlogon). Follow it in place so the
+        // peer, encoder and grant all survive a sign-in and the viewer just
+        // sees the picture change.
+        const std::wstring input_desktop = CurrentInputDesktopName();
+        const DesktopFollowAction follow = SelectDesktopFollowAction(
+            input_desktop, indicator_->BoundDesktop(),
+            &desktop_follow_failures_);
+        if (follow == DesktopFollowAction::kFollow) {
+          FollowDesktopsOnSignaling();
+        } else if (follow == DesktopFollowAction::kUnavailable) {
+          // The input desktop stayed unreadable for long enough that this
+          // worker cannot know where it is. Hand the session back rather than
+          // streaming a desktop nobody asked for.
           StopAllOnSignaling("protected_desktop", true);
-          if (desktop_action ==
-              WorkerDesktopAction::kTerminateSecureConsole) {
-            // The sign-in/lock desktop has switched to the user's Default
-            // desktop. Never carry the privileged worker, authority, or input
-            // ledger across that boundary; the service/browser will create a
-            // fresh active-user worker and peer.
-            TerminateProcess(GetCurrentProcess(), 17);
-            return;
-          }
         }
+        g_input_desktop_ready.store(!input_desktop.empty() &&
+                                    input_desktop == indicator_->BoundDesktop());
+        const bool expected_desktop = follow != DesktopFollowAction::kUnavailable;
         if (expected_desktop) {
           if (topology_refresh_debounce_ticks_ == 0 &&
               ++topology_scan_ticks_ >= 8) {
@@ -476,15 +471,16 @@ class WorkerRuntime {
         // from selecting the same process-local hardware path again.
         DisqualifyHardwareEncoderForProcess();
       }
-      // The service picks a desktop when it launches this worker, and that
-      // choice can already be stale: a session locks, or a lingering LogonUI
-      // made the sign-in screen look present on a fully logged-in machine.
-      // Say so immediately instead of building a session that can neither
-      // capture nor inject; the service relaunches on the right desktop.
-      if (!IsInputDesktopNamed(secure_console_ ? L"Winlogon" : L"Default")) {
+      // The desktop can already have moved since this worker launched — a
+      // session locked, or the sign-in screen came up. Move to the one that
+      // receives input now instead of refusing the session; only a desktop
+      // this worker cannot read at all is reported back.
+      const std::wstring prepare_desktop = CurrentInputDesktopName();
+      if (prepare_desktop.empty()) {
         writer_->Emit(TerminalEnvelope(signal.authority, "protected_desktop"));
         return true;
       }
+      FollowDesktopsOnSignaling();
       std::vector<DisplayInfo> displays = EnumerateDisplays();
       if (displays.empty()) {
         writer_->Emit(TerminalEnvelope(signal.authority,
@@ -507,12 +503,12 @@ class WorkerRuntime {
           [this](const DisplayInfo& display) { ReleaseSource(display); },
           &input_,
           [this] {
-            return WorkerClipboardAllowed(secure_console_)
+            return ClipboardAllowedOnDesktop(indicator_->BoundDesktop())
                        ? indicator_->ClipboardSequence()
                        : static_cast<DWORD>(0);
           },
           [this](DWORD previous_sequence) {
-            return WorkerClipboardAllowed(secure_console_)
+            return ClipboardAllowedOnDesktop(indicator_->BoundDesktop())
                        ? indicator_->ReadClipboardText(previous_sequence)
                        : std::optional<std::u16string>();
           },
@@ -588,6 +584,7 @@ class WorkerRuntime {
     auto source =
         DxgiDesktopSource::Create(display, CaptureFallback::kDesktopGdi);
     if (!source) return nullptr;
+    source->RequestDesktopRebind(capture_desktop_);
     source->Start();
     sources_.emplace(key, SourceEntry{source, 1});
     return source;
@@ -616,6 +613,45 @@ class WorkerRuntime {
       session->Close(reason, emit_terminal);
     sessions_.clear();
     UpdateIndicatorOnSignaling();
+  }
+
+  // Move this worker to the desktop that now receives input. The peer, the
+  // encoder and every authority stay exactly as they are: only the capture
+  // thread and the indicator/input thread change desktops. Held keys and
+  // buttons are released first, because an input ledger must never survive the
+  // boundary it was pressed on.
+  // Input follows the desktop that receives it; capture follows the one that
+  // can be read. They are the same desktop most of the time, but a locked
+  // session keeps the curtain (and input) on Default while refusing screen
+  // reads there, so capture has to sit on Winlogon until it unlocks.
+  void FollowDesktopsOnSignaling() {
+    const std::wstring input_desktop = CurrentInputDesktopName();
+    if (input_desktop != indicator_->BoundDesktop()) {
+      g_input_desktop_ready.store(false);
+      for (const auto& [id, session] : sessions_) input_.ReleaseOwner(id);
+      indicator_->Stop();
+      if (!indicator_->Start([this] { RequestLocalStopAll(); },
+                             [this](uint32_t event_mask) {
+                               RequestEnvironmentChange(event_mask);
+                             })) {
+        // Without the disclosure indicator there is no visible sign that the
+        // desktop is being streamed, so stop rather than capture silently.
+        StopAllOnSignaling("protected_desktop", true);
+        return;
+      }
+      UpdateIndicatorOnSignaling();
+      g_input_desktop_ready.store(indicator_->BoundDesktop() == input_desktop);
+    }
+    // Capture goes where input goes: Windows refuses a screen read from any
+    // desktop other than the one it is displaying, so there is exactly one
+    // valid target. While the lock curtain is up nothing can be read at all —
+    // the viewer's own keypress raises the credential UI and both follow.
+    if (input_desktop != capture_desktop_) {
+      capture_desktop_ = input_desktop;
+      for (auto& [id, source] : sources_) {
+        source.source->RequestDesktopRebind(input_desktop);
+      }
+    }
   }
 
   void ResetCaptureSourcesOnSignaling() {
@@ -658,7 +694,6 @@ class WorkerRuntime {
   const webrtc::scoped_refptr<webrtc::PeerConnectionFactoryInterface> factory_;
   PipeWriter* const writer_;
   LocalIndicator* const indicator_;
-  const bool secure_console_;
   InputArbiter input_;
   std::map<std::string, std::shared_ptr<PeerSession>> sessions_;
   std::map<std::string, SourceEntry> sources_;
@@ -666,6 +701,8 @@ class WorkerRuntime {
   std::atomic<uint32_t> environment_events_{0};
   DWORD dwm_process_id_ = 0;
   int protected_desktop_checks_ = 0;
+  int desktop_follow_failures_ = 0;
+  std::wstring capture_desktop_;
   int compositor_scan_ticks_ = 0;
   int topology_scan_ticks_ = 0;
   int topology_refresh_debounce_ticks_ = 0;
@@ -858,8 +895,10 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
   }
 
   LocalIndicator indicator;
-  WorkerRuntime runtime(signaling_thread.get(), factory, &writer, &indicator,
-                        arguments->secure_console);
+  // `--secure-console` is still accepted and echoed back for older services,
+  // but it no longer selects behaviour: this worker follows whichever desktop
+  // Windows is showing.
+  WorkerRuntime runtime(signaling_thread.get(), factory, &writer, &indicator);
   if (!indicator.Start(
           [&runtime] { runtime.RequestLocalStopAll(); },
           [&runtime](uint32_t event_mask) {
@@ -873,6 +912,10 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     CoUninitialize();
     return 10;
   }
+
+  g_input_desktop_ready.store(!indicator.BoundDesktop().empty() &&
+                              indicator.BoundDesktop() ==
+                                  CurrentInputDesktopName());
 
   std::atomic<bool> running{true};
   std::thread maintenance([&] {

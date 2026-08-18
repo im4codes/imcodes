@@ -240,7 +240,7 @@ const contracts: Contract[] = [
       },
       {
         path: 'native/windows-remote-desktop/worker_main.cc',
-        needle: 'indicator && indicator->MovePointer(x, y)',
+        needle: 'indicator->MovePointer(x, y)',
       },
       {
         path: 'native/windows-remote-desktop/local_indicator.cc',
@@ -335,11 +335,11 @@ const contracts: Contract[] = [
     ],
   },
   {
-    name: 'pre-login and lock-screen secure console handoff',
+    name: 'one console-session worker that follows the desktop',
     guards: [
       {
         path: 'src/node/windows-user-session.ts',
-        needle: 'if (forceSecureConsole)',
+        needle: 'StartConsoleSystem(exe, argsLine,',
       },
       {
         path: 'src/node/remote-desktop-worker-host.ts',
@@ -366,28 +366,35 @@ const contracts: Contract[] = [
         needle: 'SetTokenInformation(primary, TokenSessionId, ref sid, sizeof(int))',
       },
       {
-        path: 'src/node/windows-user-session.ts',
-        needle: 'argsLine + " --secure-console"',
+        path: 'native/windows-remote-desktop/worker_main.cc',
+        needle: 'FollowDesktopsOnSignaling()',
+        minimum: 3,
       },
       {
-        path: 'native/windows-remote-desktop/worker_main.cc',
-        needle: 'arguments->secure_console && !IsLocalSystemProcess()',
+        path: 'native/windows-remote-desktop/worker_policy.cc',
+        needle: 'SelectDesktopFollowAction',
       },
       {
-        path: 'native/windows-remote-desktop/worker_main.cc',
-        needle: 'secure_console_ ? L"Winlogon" : L"Default"',
+        path: 'native/windows-remote-desktop/local_indicator.cc',
+        needle: 'kEnvironmentSessionLocked',
       },
       {
-        path: 'native/windows-remote-desktop/worker_main.cc',
-        needle: 'TerminateProcess(GetCurrentProcess(), 17)',
+        path: 'native/windows-remote-desktop/display_capture.cc',
+        needle: 'BindCaptureThreadToRequestedDesktop',
+        minimum: 2,
       },
       {
+        // The clipboard is the one capability that must not follow: it belongs
+        // to the signed-in user's desktop only.
         path: 'native/windows-remote-desktop/worker_main.cc',
-        needle: 'WorkerClipboardAllowed(secure_console_)',
+        needle: 'ClipboardAllowedOnDesktop(indicator_->BoundDesktop())',
+        minimum: 2,
       },
       {
+        // Input is refused while the worker is between desktops.
         path: 'native/windows-remote-desktop/worker_main.cc',
-        needle: 'WorkerInputDesktopAllowed(',
+        needle: 'g_input_desktop_ready',
+        minimum: 4,
       },
       {
         path: 'native/windows-remote-desktop/display_capture.cc',
@@ -753,19 +760,19 @@ const contracts: Contract[] = [
 const mutations: Mutation[] = [
   {
     name: 'drop the browser side of the desktop handover',
-    contract: 'pre-login and lock-screen secure console handoff',
+    contract: 'one console-session worker that follows the desktop',
     path: 'web/src/remote-desktop-client.ts',
     needle: 'await this.renegotiate();',
   },
   {
     name: 'let a stale desktop choice stand',
-    contract: 'pre-login and lock-screen secure console handoff',
+    contract: 'one console-session worker that follows the desktop',
     path: 'src/node/remote-desktop-worker-host.ts',
     needle: 'this.retryOnOtherDesktop(parsed.value, tracked)',
   },
   {
     name: 'stop reporting a wrong-desktop prepare',
-    contract: 'pre-login and lock-screen secure console handoff',
+    contract: 'one console-session worker that follows the desktop',
     path: 'native/windows-remote-desktop/worker_main.cc',
     needle: 'TerminalEnvelope(signal.authority, "protected_desktop")',
   },

@@ -32,21 +32,42 @@ inline constexpr uint32_t kEnvironmentResume = 1u << 2;
 inline constexpr uint32_t kEnvironmentSessionUnavailable = 1u << 3;
 inline constexpr uint32_t kEnvironmentSessionAvailable = 1u << 4;
 inline constexpr uint32_t kEnvironmentCompositionChanged = 1u << 5;
+// The session locked or unlocked. Deliberately *not* a session ending: one
+// worker follows the desktops instead, which is what keeps signing in from
+// looking like a dropped connection.
+inline constexpr uint32_t kEnvironmentSessionLocked = 1u << 6;
+inline constexpr uint32_t kEnvironmentSessionUnlocked = 1u << 7;
 
 enum class WorkerEnvironmentAction {
+  kFollowDesktop,
   kNone,
   kRefreshTopology,
   kStopProtected,
   kStopAndReinitialize,
 };
 
-enum class WorkerDesktopAction {
-  kContinue,
-  kStopProtected,
-  kTerminateSecureConsole,
-};
+// What one long-lived worker should do when Windows moves input between the
+// user's desktop and the sign-in/lock desktop. Following keeps the peer, the
+// encoder and the grant alive across a sign-in, so the viewer sees the picture
+// change instead of a reconnect.
+enum class DesktopFollowAction { kStay, kFollow, kUnavailable };
 
-inline constexpr int kWorkerDesktopMismatchLimit = 3;
+// `input_desktop` is the desktop that currently receives input, `bound` the one
+// the worker's indicator/input thread owns. An unreadable input desktop is
+// reported as a failure rather than silently treated as a match, and
+// `consecutive_failures` bounds how long that can last before the caller gives
+// up and lets itself be replaced.
+DesktopFollowAction SelectDesktopFollowAction(const std::wstring& input_desktop,
+                                              const std::wstring& bound,
+                                              int* consecutive_failures);
+
+inline constexpr int kDesktopFollowFailureLimit = 12;
+
+// The clipboard belongs to the signed-in user's own desktop and must never be
+// readable while the sign-in/lock desktop is up, whatever launched the worker.
+bool ClipboardAllowedOnDesktop(const std::wstring& desktop);
+
+
 
 // DXGI can hold a duplication open on an idle, monitor-less desktop and never
 // present a first frame (AcquireNextFrame returns DXGI_ERROR_WAIT_TIMEOUT
@@ -56,25 +77,25 @@ inline constexpr int kWorkerDesktopMismatchLimit = 3;
 // happens inside session setup.
 inline constexpr int kFirstFrameWaitsBeforeGdiFallback = 5;
 
-// True when a source that has never produced a frame should switch to GDI.
-// `consecutive_waits` is advanced in place and reset once the switch is made.
+// True when a source should switch to its GDI fallback. Any run of consecutive
+// non-captures counts, not only a cold start: a session lock invalidates DXGI
+// duplication on a desktop that was streaming happily a moment earlier, and a
+// worker that follows the desktop meets that case on every sign-in.
 bool AdvanceGdiFallbackState(bool captured,
                              bool gdi_fallback_allowed,
-                             bool any_frame_captured,
                              int* consecutive_waits);
+
+// While the GDI fallback is engaged, DXGI is re-probed on this cadence so a
+// desktop that starts presenting again returns to the hardware path instead of
+// staying on the slower fallback for the rest of the session.
+inline constexpr int kGdiFallbackDxgiRetryTicks = 150;
 
 // Keeps the ordinary active-user worker and the privileged Winlogon worker on
 // their own desktops. A secure-console worker must be replaced after unlock;
 // it must never carry authority or input ownership onto the user's desktop.
-WorkerDesktopAction AdvanceWorkerDesktopState(bool secure_console,
-                                               bool expected_desktop_active,
-                                               int* consecutive_mismatches);
 // The ordinary worker still relies on its interactive indicator probe. The
 // privileged worker has an additional per-dispatch gate so no input can cross
 // the short Winlogon-to-Default teardown window after sign-in.
-bool WorkerInputDesktopAllowed(bool secure_console,
-                               bool expected_desktop_active);
-bool WorkerClipboardAllowed(bool secure_console);
 
 CaptureAcquireAction ClassifyCaptureAcquireResult(HRESULT result);
 WorkerEnvironmentAction SelectWorkerEnvironmentAction(uint32_t event_mask);

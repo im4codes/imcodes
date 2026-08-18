@@ -327,6 +327,36 @@ void DxgiDesktopSource::ResetDuplication() {
   last_broadcast_us_ = 0;
 }
 
+void DxgiDesktopSource::RequestDesktopRebind(const std::wstring& desktop_name) {
+  {
+    std::lock_guard<std::mutex> lock(desktop_request_mutex_);
+    requested_desktop_ = desktop_name;
+  }
+  desktop_rebind_requested_.store(true);
+}
+
+void DxgiDesktopSource::BindCaptureThreadToRequestedDesktop() {
+  std::wstring requested;
+  {
+    std::lock_guard<std::mutex> lock(desktop_request_mutex_);
+    requested = requested_desktop_;
+  }
+  HDESK target = requested.empty()
+      ? OpenInputDesktop(0, FALSE, GENERIC_ALL)
+      : OpenDesktopW(requested.c_str(), 0, FALSE, GENERIC_ALL);
+  if (!target) return;
+  if (!SetThreadDesktop(target)) {
+    CloseDesktop(target);
+    return;
+  }
+  if (bound_desktop_) CloseDesktop(bound_desktop_);
+  bound_desktop_ = target;
+  // The duplication and any GDI fallback belong to the desktop left behind.
+  ResetDuplication();
+  gdi_active_ = false;
+  first_frame_waits_ = 0;
+}
+
 void DxgiDesktopSource::CaptureLoop() {
   SetThreadDescription(GetCurrentThread(), L"IM.codes DXGI capture");
   CoInitializeEx(nullptr, COINIT_MULTITHREADED);
@@ -334,6 +364,9 @@ void DxgiDesktopSource::CaptureLoop() {
   while (running_) {
     {
       std::lock_guard<std::mutex> lock(state_mutex_);
+      if (desktop_rebind_requested_.exchange(false)) {
+        BindCaptureThreadToRequestedDesktop();
+      }
       bool captured = false;
       last_capture_waited_ = false;
       if (gdi_active_) {
@@ -343,11 +376,20 @@ void DxgiDesktopSource::CaptureLoop() {
       } else {
         captured = CaptureOne();
       }
+      if (gdi_active_ && ++gdi_dxgi_retry_ticks_ >= kGdiFallbackDxgiRetryTicks) {
+        // Give the hardware path a chance to come back: a desktop that stopped
+        // presenting can start again, and GDI is the slower fallback.
+        gdi_dxgi_retry_ticks_ = 0;
+        if (InitializeDuplication() && CaptureOne()) {
+          gdi_active_ = false;
+          captured = true;
+        }
+      }
       if (AdvanceGdiFallbackState(captured,
                                   fallback_ == CaptureFallback::kDesktopGdi,
-                                  captured_frames_.load() > 0,
                                   &first_frame_waits_)) {
         gdi_active_ = true;
+        gdi_dxgi_retry_ticks_ = 0;
         ResetDuplication();
         captured = CaptureDesktopGdi();
       }

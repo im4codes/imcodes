@@ -197,6 +197,8 @@ void LocalIndicator::Stop() {
   if (window) PostMessageW(window, kStopMessage, 0, 0);
   thread_.join();
   window_ = nullptr;
+  std::lock_guard lock(bound_desktop_mutex_);
+  bound_desktop_.clear();
 }
 
 LRESULT CALLBACK LocalIndicator::WindowProc(HWND window, UINT message,
@@ -283,12 +285,18 @@ LRESULT LocalIndicator::HandleMessage(HWND window, UINT message,
       return TRUE;
     case WM_WTSSESSION_CHANGE:
       if (environment_changed_) {
-        if (wparam == WTS_SESSION_LOCK || wparam == WTS_SESSION_LOGOFF ||
-            wparam == WTS_CONSOLE_DISCONNECT ||
-            wparam == WTS_REMOTE_DISCONNECT) {
+        if (wparam == WTS_SESSION_LOCK) {
+          // Locking moves the desktops; it does not end the session. Reporting
+          // it as unavailable is what used to make signing in look like a
+          // dropped remote-desktop connection.
+          environment_changed_(kEnvironmentSessionLocked);
+        } else if (wparam == WTS_SESSION_UNLOCK) {
+          environment_changed_(kEnvironmentSessionUnlocked);
+        } else if (wparam == WTS_SESSION_LOGOFF ||
+                   wparam == WTS_CONSOLE_DISCONNECT ||
+                   wparam == WTS_REMOTE_DISCONNECT) {
           environment_changed_(kEnvironmentSessionUnavailable);
-        } else if (wparam == WTS_SESSION_UNLOCK ||
-                   wparam == WTS_SESSION_LOGON ||
+        } else if (wparam == WTS_SESSION_LOGON ||
                    wparam == WTS_CONSOLE_CONNECT ||
                    wparam == WTS_REMOTE_CONNECT) {
           environment_changed_(kEnvironmentSessionAvailable);
@@ -363,7 +371,41 @@ LRESULT LocalIndicator::HandleMessage(HWND window, UINT message,
   return DefWindowProcW(window, message, wparam, lparam);
 }
 
+std::wstring LocalIndicator::BoundDesktop() const {
+  std::lock_guard lock(bound_desktop_mutex_);
+  return bound_desktop_;
+}
+
 void LocalIndicator::ThreadMain() {
+  // Bind before creating the window: a thread that already owns windows cannot
+  // change desktops, so the desktop this indicator serves is fixed here. The
+  // worker restarts the indicator to move it, which is how one process follows
+  // Windows across the sign-in/user desktop boundary.
+  {
+    std::wstring bound;
+    HDESK input = OpenInputDesktop(0, FALSE, GENERIC_ALL);
+    if (input && SetThreadDesktop(input)) {
+      wchar_t name[64] = {};
+      DWORD needed = 0;
+      if (GetUserObjectInformationW(input, UOI_NAME, name, sizeof(name),
+                                    &needed)) {
+        bound = name;
+      }
+    } else if (input) {
+      CloseDesktop(input);
+      input = nullptr;
+    }
+    if (bound.empty()) {
+      wchar_t name[64] = {};
+      DWORD needed = 0;
+      if (GetUserObjectInformationW(GetThreadDesktop(GetCurrentThreadId()),
+                                    UOI_NAME, name, sizeof(name), &needed)) {
+        bound = name;
+      }
+    }
+    std::lock_guard lock(bound_desktop_mutex_);
+    bound_desktop_ = bound;
+  }
   const HINSTANCE instance = GetModuleHandleW(nullptr);
   WNDCLASSW window_class{};
   window_class.style = CS_HREDRAW | CS_VREDRAW;

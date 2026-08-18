@@ -31,6 +31,12 @@ class LocalIndicator {
   LocalIndicator& operator=(const LocalIndicator&) = delete;
 
   bool Start(StopAll stop_all, EnvironmentChanged environment_changed);
+  /**
+   * Name of the desktop this indicator's window and input thread are bound to.
+   * Empty until Start() succeeds. The worker compares it against the desktop
+   * that currently receives input to decide when to move.
+   */
+  std::wstring BoundDesktop() const;
   void Update(int viewers, int controllers);
   UINT DispatchInput(UINT count, LPINPUT inputs, int size);
   bool MovePointer(int x, int y);
@@ -58,6 +64,8 @@ class LocalIndicator {
   std::mutex start_mutex_;
   std::condition_variable start_cv_;
   std::atomic<HWND> window_{nullptr};
+  mutable std::mutex bound_desktop_mutex_;
+  std::wstring bound_desktop_;
   bool start_complete_ = false;
   bool start_ok_ = false;
   bool collapsed_ = false;

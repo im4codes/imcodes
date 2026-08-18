@@ -23,6 +23,11 @@ WorkerEnvironmentAction SelectWorkerEnvironmentAction(uint32_t event_mask) {
                     kEnvironmentSessionUnavailable)) {
     return WorkerEnvironmentAction::kStopProtected;
   }
+  // A lock or unlock only moves the desktop, so it is answered by following
+  // rather than by tearing the session down. It is checked after the stop
+  // cases so a logoff that arrives with it still wins.
+  if (event_mask & (kEnvironmentSessionLocked | kEnvironmentSessionUnlocked))
+    return WorkerEnvironmentAction::kFollowDesktop;
   if (event_mask & (kEnvironmentResume | kEnvironmentSessionAvailable))
     return WorkerEnvironmentAction::kStopAndReinitialize;
   if (event_mask & kEnvironmentCompositionChanged)
@@ -32,28 +37,12 @@ WorkerEnvironmentAction SelectWorkerEnvironmentAction(uint32_t event_mask) {
   return WorkerEnvironmentAction::kNone;
 }
 
-WorkerDesktopAction AdvanceWorkerDesktopState(
-    bool secure_console,
-    bool expected_desktop_active,
-    int* consecutive_mismatches) {
-  if (!consecutive_mismatches) return WorkerDesktopAction::kContinue;
-  if (expected_desktop_active) {
-    *consecutive_mismatches = 0;
-    return WorkerDesktopAction::kContinue;
-  }
-  if (++(*consecutive_mismatches) < kWorkerDesktopMismatchLimit)
-    return WorkerDesktopAction::kContinue;
-  *consecutive_mismatches = 0;
-  return secure_console ? WorkerDesktopAction::kTerminateSecureConsole
-                        : WorkerDesktopAction::kStopProtected;
-}
 
 bool AdvanceGdiFallbackState(bool captured,
                              bool gdi_fallback_allowed,
-                             bool any_frame_captured,
                              int* consecutive_waits) {
   if (!consecutive_waits) return false;
-  if (captured || any_frame_captured || !gdi_fallback_allowed) {
+  if (captured || !gdi_fallback_allowed) {
     if (captured) *consecutive_waits = 0;
     return false;
   }
@@ -62,14 +51,28 @@ bool AdvanceGdiFallbackState(bool captured,
   return true;
 }
 
-bool WorkerInputDesktopAllowed(bool secure_console,
-                               bool expected_desktop_active) {
-  return !secure_console || expected_desktop_active;
+DesktopFollowAction SelectDesktopFollowAction(
+    const std::wstring& input_desktop,
+    const std::wstring& bound,
+    int* consecutive_failures) {
+  if (input_desktop.empty()) {
+    if (consecutive_failures &&
+        ++(*consecutive_failures) >= kDesktopFollowFailureLimit) {
+      *consecutive_failures = 0;
+      return DesktopFollowAction::kUnavailable;
+    }
+    return DesktopFollowAction::kStay;
+  }
+  if (consecutive_failures) *consecutive_failures = 0;
+  return input_desktop == bound ? DesktopFollowAction::kStay
+                                : DesktopFollowAction::kFollow;
 }
 
-bool WorkerClipboardAllowed(bool secure_console) {
-  return !secure_console;
+bool ClipboardAllowedOnDesktop(const std::wstring& desktop) {
+  return desktop == L"Default";
 }
+
+
 
 bool AdvanceTopologyRefreshDebounce(bool refresh_requested,
                                     int* remaining_ticks) {
