@@ -11,6 +11,7 @@ import {
   listAvailableExecutables,
   renameMachine,
   revokeMachine,
+  setMachineAutoUnlock,
   setMachineExecEnabled,
   type ControlledNodeArtifactMetadata,
   type ControlledNodeArtifactSelection,
@@ -110,6 +111,9 @@ export function ControlledNodesPanel({
   const [presenceRefreshFailed, setPresenceRefreshFailed] = useState(error != null);
   const [manualPresenceRefresh, setManualPresenceRefresh] = useState(false);
   const [busyServerId, setBusyServerId] = useState<string | null>(null);
+  // The typed secret lives here only until the request returns, then is cleared.
+  const [autoUnlockServerId, setAutoUnlockServerId] = useState<string | null>(null);
+  const [autoUnlockValue, setAutoUnlockValue] = useState('');
   const [editingServerId, setEditingServerId] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState('');
   const [sharingMachine, setSharingMachine] = useState<MachineListItem | null>(null);
@@ -216,6 +220,35 @@ export function ControlledNodesPanel({
       setBusyServerId(null);
       return;
     }
+    await refreshPresence();
+    setBusyServerId(null);
+  };
+
+  const startAutoUnlock = (serverId: string) => {
+    setActionError(null);
+    setAutoUnlockServerId(serverId);
+    setAutoUnlockValue('');
+  };
+
+  const cancelAutoUnlock = () => {
+    setAutoUnlockServerId(null);
+    setAutoUnlockValue('');
+  };
+
+  const submitAutoUnlock = async (serverId: string, secret: string | null) => {
+    setActionError(null);
+    setBusyServerId(serverId);
+    try {
+      await setMachineAutoUnlock(serverId, secret);
+    } catch {
+      setActionError(t('controlled_nodes.error_generic'));
+      setBusyServerId(null);
+      return;
+    } finally {
+      // The typed secret never stays in component state after the request.
+      setAutoUnlockValue('');
+    }
+    setAutoUnlockServerId(null);
     await refreshPresence();
     setBusyServerId(null);
   };
@@ -389,6 +422,12 @@ export function ControlledNodesPanel({
                     )
                     : <span title={t('controlled_nodes.version_unknown')}>{t('controlled_nodes.version_unknown')}</span>}
                   <span>{t('controlled_nodes.access_role', { role: t(`share.role.${machineAccessRole(m)}`) })}</span>
+                  {m.autoUnlockConfigured && (
+                    <span
+                      class="controlled-nodes-auto-unlock-badge"
+                      title={t('controlled_nodes.auto_unlock_badge_hint')}
+                    >{t('controlled_nodes.auto_unlock_badge')}</span>
+                  )}
                 </div>
               </div>
               <div class="controlled-nodes-machine-actions">
@@ -428,6 +467,42 @@ export function ControlledNodesPanel({
                       <span class="controlled-nodes-toggle-track" aria-hidden="true"><i /></span>
                       <span>{m.execEnabled ? t('controlled_nodes.exec_on') : t('controlled_nodes.exec_off')}</span>
                     </button>
+                    {autoUnlockServerId === m.serverId ? (
+                      <form
+                        class="controlled-nodes-auto-unlock-form"
+                        onSubmit={(event) => {
+                          event.preventDefault();
+                          if (autoUnlockValue) void submitAutoUnlock(m.serverId, autoUnlockValue);
+                        }}
+                      >
+                        <input
+                          type="password"
+                          autoComplete="new-password"
+                          value={autoUnlockValue}
+                          placeholder={t('controlled_nodes.auto_unlock_placeholder')}
+                          aria-label={t('controlled_nodes.auto_unlock_placeholder')}
+                          onInput={(event) => setAutoUnlockValue((event.target as HTMLInputElement).value)}
+                        />
+                        <button type="submit" disabled={!autoUnlockValue || busyServerId === m.serverId}>
+                          {t('common.save')}
+                        </button>
+                        <button type="button" onClick={cancelAutoUnlock}>{t('common.cancel')}</button>
+                      </form>
+                    ) : (
+                      <button
+                        type="button"
+                        class="controlled-nodes-auto-unlock"
+                        disabled={busyServerId === m.serverId}
+                        title={t('controlled_nodes.auto_unlock_hint')}
+                        onClick={() => (m.autoUnlockConfigured
+                          ? void submitAutoUnlock(m.serverId, null)
+                          : startAutoUnlock(m.serverId))}
+                      >
+                        {m.autoUnlockConfigured
+                          ? t('controlled_nodes.auto_unlock_clear')
+                          : t('controlled_nodes.auto_unlock_set')}
+                      </button>
+                    )}
                     <button
                       type="button"
                       class="controlled-nodes-revoke"

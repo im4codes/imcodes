@@ -10,6 +10,7 @@ import {
 } from './machine-direct-file-transfer-capabilities.js';
 import { REMOTE_DESKTOP_CAPABILITY } from './remote-desktop.js';
 import { CONTROLLED_NODE_SAFE_SELF_UPGRADE_CAPABILITY } from './controlled-node-service.js';
+import { CONTROLLED_NODE_AUTO_UNLOCK_CAPABILITY } from './controlled-node-auto-unlock.js';
 
 export const CONTROLLED_NODE_CAPABILITIES = [
   FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY,
@@ -20,6 +21,7 @@ export const CONTROLLED_NODE_CAPABILITIES = [
   MACHINE_DIRECT_FILE_FETCH_CAPABILITY,
   REMOTE_DESKTOP_CAPABILITY,
   CONTROLLED_NODE_SAFE_SELF_UPGRADE_CAPABILITY,
+  CONTROLLED_NODE_AUTO_UNLOCK_CAPABILITY,
 ] as const;
 
 export type ControlledNodeCapability = typeof CONTROLLED_NODE_CAPABILITIES[number];

@@ -68,6 +68,20 @@ TEST(WorkerPolicyTest, GivesUpOnlyAfterTheInputDesktopStaysUnreadable) {
             DesktopFollowAction::kStay);
 }
 
+TEST(WorkerPolicyTest, TypesTheStoredSecretOnlyForAWatchingController) {
+  EXPECT_TRUE(ShouldAttemptAutoUnlock(true, true, true, 0));
+  // Every guard is independently sufficient to refuse.
+  EXPECT_FALSE(ShouldAttemptAutoUnlock(false, true, true, 0));
+  EXPECT_FALSE(ShouldAttemptAutoUnlock(true, false, true, 0));
+  EXPECT_FALSE(ShouldAttemptAutoUnlock(true, true, false, 0));
+  // One attempt per lock: a wrong password must never loop an account into a
+  // lockout, and a viewer-only session must never trigger it at all.
+  EXPECT_FALSE(ShouldAttemptAutoUnlock(true, true, true,
+                                       kAutoUnlockAttemptsPerLock));
+  EXPECT_FALSE(ShouldAttemptAutoUnlock(true, true, true,
+                                       kAutoUnlockAttemptsPerLock + 5));
+}
+
 TEST(WorkerPolicyTest, KeepsTheClipboardOnTheSignedInDesktopOnly) {
   EXPECT_TRUE(ClipboardAllowedOnDesktop(L"Default"));
   EXPECT_FALSE(ClipboardAllowedOnDesktop(L"Winlogon"));

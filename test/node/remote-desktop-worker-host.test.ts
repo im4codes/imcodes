@@ -520,6 +520,62 @@ describe('remote desktop worker artifact and IPC host', () => {
     expect(received[0]).toMatchObject({ type: REMOTE_DESKTOP_MSG.RENEGOTIATE, sessionId });
   });
 
+  it('hands the sign-in secret to the worker on stdin, never on a command line', async () => {
+    const spawned: Array<{ args: readonly string[]; stdin: string }> = [];
+    const spawnUnlockSecret = ((_executable: string, args: readonly string[]) => {
+      const child = new EventEmitter() as EventEmitter & {
+        stdin: { end(chunk?: Buffer): void };
+      };
+      let written = '';
+      child.stdin = { end: (chunk?: Buffer) => { written = chunk?.toString('utf8') ?? ''; } };
+      queueMicrotask(() => {
+        spawned.push({ args, stdin: written });
+        child.emit('exit', 0);
+      });
+      return child;
+    }) as never;
+    const host = new RemoteDesktopWorkerHost(() => {}, {
+      ...trustedHostOptions,
+      platform: 'win32',
+      artifact,
+      spawnUnlockSecret,
+    });
+    cleanup.push(() => host.close());
+
+    await expect(host.applyAutoUnlockSecret('hunter2')).resolves.toBe(true);
+    await expect(host.applyAutoUnlockSecret(null)).resolves.toBe(true);
+
+    expect(spawned.map((call) => call.args)).toEqual([
+      ['--set-unlock-secret'],
+      ['--clear-unlock-secret'],
+    ]);
+    // The secret reaches the worker only through stdin: argv is readable by any
+    // local process through WMI.
+    expect(spawned[0]!.stdin).toBe('hunter2');
+    expect(spawned[0]!.args.join(' ')).not.toContain('hunter2');
+    expect(spawned[1]!.stdin).toBe('');
+  });
+
+  it('reports the stored-secret state from the worker exit code alone', async () => {
+    const exitCodes = [0, 22];
+    const spawnUnlockSecret = (() => {
+      const child = new EventEmitter() as EventEmitter & { stdin: null };
+      child.stdin = null;
+      queueMicrotask(() => child.emit('exit', exitCodes.shift() ?? 22));
+      return child;
+    }) as never;
+    const host = new RemoteDesktopWorkerHost(() => {}, {
+      ...trustedHostOptions,
+      platform: 'win32',
+      artifact,
+      spawnUnlockSecret,
+    });
+    cleanup.push(() => host.close());
+
+    await expect(host.autoUnlockConfigured()).resolves.toBe(true);
+    await expect(host.autoUnlockConfigured()).resolves.toBe(false);
+  });
+
   it('surfaces a native worker crash frame and ignores forged ones', async () => {
     const temp = await mkdtemp(join(tmpdir(), 'imcodes-rd-host-fault-'));
     cleanup.push(() => rm(temp, { recursive: true, force: true }));

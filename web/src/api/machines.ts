@@ -54,6 +54,8 @@ export interface MachineListItem {
   daemonVersion?: string;
   /** Server-computed: that release is older than the Server's target. */
   updateAvailable?: boolean;
+  /** The node holds a sign-in secret for auto unlock. Never the secret itself. */
+  autoUnlockConfigured?: boolean;
 }
 
 /** Identifies one downloadable artifact in the canonical OS+arch matrix. */
@@ -225,6 +227,7 @@ function normalizeMachine(raw: unknown): MachineListItem | null {
     ...(capabilities.ok && capabilities.value.length > 0 ? { capabilities: capabilities.value } : {}),
     ...(typeof raw.daemonVersion === 'string' && raw.daemonVersion ? { daemonVersion: raw.daemonVersion } : {}),
     ...(raw.updateAvailable === true ? { updateAvailable: true } : {}),
+    ...(raw.autoUnlockConfigured === true ? { autoUnlockConfigured: true } : {}),
   };
 }
 
@@ -258,6 +261,22 @@ export async function setMachineExecEnabled(serverId: string, enabled: boolean):
 }
 
 /** Rename a controlled machine's render-only display name. */
+/**
+ * Store or clear the node's Windows sign-in secret. Write-only: the value is
+ * sent once and can never be read back, and the response carries only whether
+ * the node now holds one.
+ */
+export async function setMachineAutoUnlock(
+  serverId: string,
+  secret: string | null,
+): Promise<{ autoUnlockConfigured: boolean }> {
+  const response = await apiFetch(`${MACHINE_API_PATH}/${encodeURIComponent(serverId)}/auto-unlock`, {
+    method: 'POST',
+    body: JSON.stringify({ secret }),
+  }) as { autoUnlockConfigured?: boolean };
+  return { autoUnlockConfigured: response?.autoUnlockConfigured === true };
+}
+
 export async function renameMachine(serverId: string, displayName: string): Promise<void> {
   await apiFetch(`${MACHINE_API_PATH}/${encodeURIComponent(serverId)}/display-name`, {
     method: 'POST',

@@ -9,6 +9,11 @@ export const DAEMON_COMMAND_TYPES = {
   MACHINE_EXEC: 'machine.exec',
   /** Server → controlled node: invoke one typed Computer Use tool locally. */
   COMPUTER_USE: 'computer.use',
+  /**
+   * Server → controlled node: store or clear the node's sign-in secret. The
+   * secret only ever travels in this direction and is never read back.
+   */
+  CONTROLLED_NODE_AUTO_UNLOCK: 'controlled_node.auto_unlock',
   // ── Lightweight peer-supervision-audit control plane ──────────────────────
   /** Web → daemon: request the authoritative peer-audit candidate list. */
   PEER_AUDIT_LIST_CANDIDATES: 'peer_audit.list_candidates',

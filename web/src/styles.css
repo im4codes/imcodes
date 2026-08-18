@@ -2867,6 +2867,28 @@ html.native-ios-mac .chat-dl-btn {
   font-weight: 800;
   letter-spacing: 0.05em;
 }
+/* A node that can answer its own sign-in screen is a security-relevant state,
+   so its chip is the one warm marker in the meta row. */
+.controlled-nodes-machine-meta span.controlled-nodes-auto-unlock-badge {
+  border-color: rgba(248, 113, 113, 0.35);
+  background: rgba(220, 38, 38, 0.14);
+  color: #fca5a5;
+}
+.controlled-nodes-auto-unlock-form {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.controlled-nodes-auto-unlock-form input {
+  width: 168px;
+  padding: 4px 8px;
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  border-radius: 6px;
+  background: rgba(15, 23, 42, 0.6);
+  color: inherit;
+  font: inherit;
+}
+
 /* An outdated node has to be findable at a glance in a long list, so the
    version chip switches to the warning ramp instead of the violet meta ramp. */
 .controlled-nodes-machine-meta span.controlled-nodes-version.is-outdated {

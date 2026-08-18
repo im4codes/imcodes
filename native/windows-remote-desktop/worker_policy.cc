@@ -68,6 +68,14 @@ DesktopFollowAction SelectDesktopFollowAction(
                                 : DesktopFollowAction::kFollow;
 }
 
+bool ShouldAttemptAutoUnlock(bool secret_configured,
+                             bool controller_present,
+                             bool on_sign_in_desktop,
+                             int attempts_this_lock) {
+  return secret_configured && controller_present && on_sign_in_desktop &&
+         attempts_this_lock < kAutoUnlockAttemptsPerLock;
+}
+
 bool ClipboardAllowedOnDesktop(const std::wstring& desktop) {
   return desktop == L"Default";
 }

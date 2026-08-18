@@ -218,6 +218,7 @@ export interface RemoteDesktopWorkerHostOptions {
   activateVirtualDisplay?: (executable: string) => void;
   wait?: (milliseconds: number) => Promise<void>;
   onWorkerCrash?: (crash: RemoteDesktopWorkerCrash) => void;
+  spawnUnlockSecret?: typeof spawn;
 }
 
 /**
@@ -295,6 +296,47 @@ export class RemoteDesktopWorkerHost {
         forceSecureConsole,
       );
     }
+  }
+
+  /**
+   * Store or clear the node's sign-in secret by running the verified worker in
+   * its one-shot mode. The secret is written to the child's stdin, never to a
+   * command line: argv is readable by any local process through WMI. It is not
+   * retained here, not logged, and the worker is the only thing that can read
+   * the encrypted result back.
+   */
+  async applyAutoUnlockSecret(secret: string | null): Promise<boolean> {
+    if (!this.available()) throw new Error('remote_desktop_worker_unavailable');
+    const artifact = await this.verifiedArtifactForLaunch();
+    const mode = secret === null ? '--clear-unlock-secret' : '--set-unlock-secret';
+    const child = (this.options.spawnUnlockSecret ?? spawn)(
+      artifact.executablePath,
+      [mode],
+      { windowsHide: true, stdio: ['pipe', 'ignore', 'ignore'] },
+    );
+    const exitCode = await new Promise<number | null>((resolveExit) => {
+      child.once('error', () => resolveExit(null));
+      child.once('exit', (code) => resolveExit(code));
+      if (secret !== null) child.stdin?.end(Buffer.from(secret, 'utf8'));
+      else child.stdin?.end();
+    });
+    return exitCode === 0;
+  }
+
+  /** Whether a sign-in secret is stored, without ever reading its value. */
+  async autoUnlockConfigured(): Promise<boolean> {
+    if (!this.available()) return false;
+    const artifact = await this.verifiedArtifactForLaunch();
+    const child = (this.options.spawnUnlockSecret ?? spawn)(
+      artifact.executablePath,
+      ['--unlock-secret-state'],
+      { windowsHide: true, stdio: ['ignore', 'ignore', 'ignore'] },
+    );
+    const exitCode = await new Promise<number | null>((resolveExit) => {
+      child.once('error', () => resolveExit(null));
+      child.once('exit', (code) => resolveExit(code));
+    });
+    return exitCode === 0;
   }
 
   async handle(message: unknown): Promise<boolean> {

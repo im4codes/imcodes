@@ -74,6 +74,7 @@ describe('shared daemon/server/web wire protocol contracts', () => {
       MACHINE_EXEC_CHUNK: 'machine.exec_chunk',
       MACHINE_EXEC_RESULT: 'machine.exec_result',
       COMPUTER_USE_RESULT: 'computer.use_result',
+      CONTROLLED_NODE_AUTO_UNLOCK_RESULT: 'controlled_node.auto_unlock_result',
     });
 
     expect(DAEMON_COMMAND_TYPES).toEqual({
@@ -85,6 +86,7 @@ describe('shared daemon/server/web wire protocol contracts', () => {
       SUBSESSION_UPDATE_TRANSPORT_CONFIG: 'subsession.update_transport_config',
       MACHINE_EXEC: 'machine.exec',
       COMPUTER_USE: 'computer.use',
+      CONTROLLED_NODE_AUTO_UNLOCK: 'controlled_node.auto_unlock',
       PEER_AUDIT_LIST_CANDIDATES: 'peer_audit.list_candidates',
       PEER_AUDIT_QUICK_START: 'peer_audit.quick_start',
       PEER_AUDIT_CANCEL: 'peer_audit.cancel',

@@ -63,6 +63,18 @@ DesktopFollowAction SelectDesktopFollowAction(const std::wstring& input_desktop,
 
 inline constexpr int kDesktopFollowFailureLimit = 12;
 
+// Whether the stored sign-in secret may be typed right now. Auto unlock is a
+// convenience for a watching operator, never an unattended door: it requires a
+// controller on the session, the sign-in desktop actually in front of them, a
+// stored secret, and a bounded number of attempts per lock so a wrong password
+// can never loop the account into a lockout.
+bool ShouldAttemptAutoUnlock(bool secret_configured,
+                             bool controller_present,
+                             bool on_sign_in_desktop,
+                             int attempts_this_lock);
+
+inline constexpr int kAutoUnlockAttemptsPerLock = 1;
+
 // The clipboard belongs to the signed-in user's own desktop and must never be
 // readable while the sign-in/lock desktop is up, whatever launched the worker.
 bool ClipboardAllowedOnDesktop(const std::wstring& desktop);

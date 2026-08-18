@@ -29,6 +29,10 @@ inline constexpr uint32_t kMaxAggregateVideoBitrateBps = 60'000'000;
 
 inline constexpr char kWorkerHelloType[] = "remote_desktop.worker_hello";
 inline constexpr char kWorkerCrashType[] = "remote_desktop.worker_crash";
+// Worker → service: the node answered its own sign-in screen with the stored
+// secret. Content-free by design; it records that it happened, never what.
+inline constexpr char kAutoUnlockAttemptType[] =
+    "remote_desktop.auto_unlock_attempt";
 inline constexpr char kPrepareType[] = "remote_desktop.prepare";
 inline constexpr char kOfferType[] = "remote_desktop.offer";
 inline constexpr char kAnswerType[] = "remote_desktop.answer";

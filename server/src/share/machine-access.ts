@@ -15,6 +15,7 @@ export interface ControlledMachineAccessRow {
   exec_enabled: boolean;
   os: string | null;
   daemon_version: string | null;
+  auto_unlock_configured: boolean;
   revoked_at: number | null;
   access_role: MachineAccessRole;
   access_expires_at: number | null;
@@ -24,7 +25,7 @@ export interface ControlledMachineAccessRow {
 const CONTROLLED_MACHINE_ACCESS_SELECT = `
   SELECT s.id, s.user_id, s.ref_name, s.display_name, s.status,
          s.last_heartbeat_at, s.exec_enabled, s.os, s.daemon_version, s.revoked_at,
-         s.controlled_capabilities,
+         s.auto_unlock_configured, s.controlled_capabilities,
          CASE WHEN s.user_id = $1 THEN 'owner' ELSE sh.role END AS access_role,
          sh.expires_at AS access_expires_at
     FROM servers s

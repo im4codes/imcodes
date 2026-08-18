@@ -131,6 +131,11 @@ export interface MachineSummary {
   daemonVersion?: string;
   /** Present only when that reported release is older than the Server's target. */
   updateAvailable?: boolean;
+  /**
+   * Present only when the node confirmed it holds a sign-in secret for auto
+   * unlock. The secret itself is never readable from anywhere.
+   */
+  autoUnlockConfigured?: boolean;
 }
 
 export const MACHINE_ACCESS_ROLES = ['owner', 'viewer', 'participant'] as const;

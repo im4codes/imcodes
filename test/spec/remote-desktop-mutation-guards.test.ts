@@ -7,6 +7,7 @@ const ROOT = resolve(__dirname, '..', '..');
 const SOURCE_PATHS = [
   'shared/remote-desktop.ts',
   'server/src/ws/remote-desktop-router.ts',
+  'server/src/routes/machines.ts',
   'web/src/remote-desktop-client.ts',
   'web/src/components/RemoteDesktopPanel.tsx',
   'native/windows-remote-desktop/worker_main.cc',
@@ -18,6 +19,7 @@ const SOURCE_PATHS = [
   'native/windows-remote-desktop/mf_h264_encoder.h',
   'native/windows-remote-desktop/virtual_display_controller.cc',
   'native/windows-remote-desktop/worker_policy.cc',
+  'native/windows-remote-desktop/unlock_secret.cc',
   'native/windows-remote-desktop/worker_policy.h',
   'native/windows-virtual-display/virtual_display_driver.cc',
   'native/windows-virtual-display/imcodes-virtual-display.inf',
@@ -331,6 +333,39 @@ const contracts: Contract[] = [
       {
         path: 'src/node/windows-user-session.ts',
         needle: 'activeCandidate == -2',
+      },
+    ],
+  },
+  {
+    name: 'auto unlock stays write-only and operator-gated',
+    guards: [
+      {
+        // The secret is DPAPI-encrypted machine-scope in a SYSTEM-only file.
+        path: 'native/windows-remote-desktop/unlock_secret.cc',
+        needle: 'CRYPTPROTECT_LOCAL_MACHINE',
+      },
+      {
+        path: 'native/windows-remote-desktop/unlock_secret.cc',
+        needle: 'D:P(A;;FA;;;SY)',
+      },
+      {
+        // Typed only for a watching controller, once per lock.
+        path: 'native/windows-remote-desktop/worker_policy.cc',
+        needle: 'ShouldAttemptAutoUnlock',
+      },
+      {
+        path: 'native/windows-remote-desktop/worker_main.cc',
+        needle: 'ShouldAttemptAutoUnlock(UnlockSecret::Configured()',
+      },
+      {
+        // The secret reaches the worker through stdin, never argv.
+        path: 'src/node/remote-desktop-worker-host.ts',
+        needle: "child.stdin?.end(Buffer.from(secret, 'utf8'))",
+      },
+      {
+        // The Server relays and records a boolean, never the value.
+        path: 'server/src/routes/machines.ts',
+        needle: 'auto_unlock_configured = $3',
       },
     ],
   },
@@ -758,6 +793,18 @@ const contracts: Contract[] = [
 ];
 
 const mutations: Mutation[] = [
+  {
+    name: 'let the stored secret be typed without a watching controller',
+    contract: 'auto unlock stays write-only and operator-gated',
+    path: 'native/windows-remote-desktop/worker_main.cc',
+    needle: 'ShouldAttemptAutoUnlock(UnlockSecret::Configured()',
+  },
+  {
+    name: 'put the sign-in secret on the worker command line',
+    contract: 'auto unlock stays write-only and operator-gated',
+    path: 'src/node/remote-desktop-worker-host.ts',
+    needle: "child.stdin?.end(Buffer.from(secret, 'utf8'))",
+  },
   {
     name: 'drop the browser side of the desktop handover',
     contract: 'one console-session worker that follows the desktop',

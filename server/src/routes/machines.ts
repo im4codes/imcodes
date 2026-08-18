@@ -25,6 +25,19 @@ import {
   parseImcodesVersion,
 } from '../../../shared/imcodes-version.js';
 import { REMOTE_DESKTOP_TERMINAL_REASON } from '../../../shared/remote-desktop.js';
+import { randomUUID } from 'node:crypto';
+import { DAEMON_COMMAND_TYPES } from '../../../shared/daemon-command-types.js';
+import {
+  CONTROLLED_NODE_AUTO_UNLOCK_ACTION,
+  CONTROLLED_NODE_AUTO_UNLOCK_LIMITS,
+} from '../../../shared/controlled-node-auto-unlock.js';
+import {
+  cancelPendingAutoUnlock,
+  registerPendingAutoUnlock,
+} from '../ws/auto-unlock-registry.js';
+
+/** A node only has to reach its own disk, so this stays short. */
+const AUTO_UNLOCK_TIMEOUT_MS = 15_000;
 
 export const machinesRoutes = new Hono<{
   Bindings: Env;
@@ -40,6 +53,7 @@ interface ControlledRow {
   exec_enabled: boolean;
   os: string | null;
   daemon_version: string | null;
+  auto_unlock_configured: boolean;
   access_role: MachineAccessRole;
   controlled_capabilities: unknown;
 }
@@ -92,6 +106,8 @@ export async function listControlledMachines(
       ...(isImcodesVersionOutdated(daemonVersion, process.env.APP_VERSION)
         ? { updateAvailable: true }
         : {}),
+      // Presence of a stored sign-in secret, never the secret itself.
+      ...(r.auto_unlock_configured === true ? { autoUnlockConfigured: true } : {}),
     };
   });
   return { machines, overLimit };
@@ -115,6 +131,7 @@ machinesRoutes.get('/', requireAuth(), async (c) => {
       capabilities: _capabilities,
       daemonVersion: _daemonVersion,
       updateAvailable: _updateAvailable,
+      autoUnlockConfigured: _autoUnlockConfigured,
       ...machine
     }) => machine)
     : machines;
@@ -211,4 +228,76 @@ machinesRoutes.post('/:serverId/exec-enabled', requireAuth(), async (c) => {
     details: { serverId, from: row.was === true, to: parsed.data.enabled },
   }, c.env.DB).catch(() => {});
   return c.json({ ok: true, execEnabled: parsed.data.enabled });
+});
+
+/**
+ * Store or clear the node's Windows sign-in secret so it can answer its own
+ * lock screen while an authorized controller watches.
+ *
+ * The secret is relayed and never retained: it is not written to the database,
+ * not placed in an audit detail, not logged, and not readable back through any
+ * route. Only the boolean outcome the node reports is persisted, so the list
+ * page can mark the node. Owner-only, like every other node mutation here.
+ */
+machinesRoutes.post('/:serverId/auto-unlock', requireAuth(), async (c) => {
+  const userId = c.get('userId' as never) as string;
+  const serverId = c.req.param('serverId');
+  if (!serverId) return c.json({ error: 'invalid_body' }, 400);
+  const body = await c.req.json().catch(() => null);
+  const parsed = z.object({
+    secret: z.string()
+      .min(1)
+      .max(CONTROLLED_NODE_AUTO_UNLOCK_LIMITS.MAX_SECRET_LENGTH)
+      .nullable(),
+  }).safeParse(body);
+  if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
+
+  const owned = await c.env.DB.queryOne<{ id: string }>(
+    `SELECT id FROM servers
+      WHERE id = $1 AND user_id = $2 AND node_role = $3 AND revoked_at IS NULL`,
+    [serverId, userId, NODE_ROLE.CONTROLLED],
+  );
+  if (!owned) return c.json({ error: 'not_found' }, 404);
+
+  const bridge = WsBridge.get(serverId);
+  const generation = bridge.daemonConnectionGeneration();
+  const requestId = randomUUID();
+  const pending = registerPendingAutoUnlock(
+    serverId,
+    requestId,
+    generation,
+    AUTO_UNLOCK_TIMEOUT_MS,
+  );
+  const sent = bridge.trySendAutoUnlock(JSON.stringify({
+    type: DAEMON_COMMAND_TYPES.CONTROLLED_NODE_AUTO_UNLOCK,
+    requestId,
+    action: parsed.data.secret === null
+      ? CONTROLLED_NODE_AUTO_UNLOCK_ACTION.CLEAR
+      : CONTROLLED_NODE_AUTO_UNLOCK_ACTION.SET,
+    ...(parsed.data.secret === null ? {} : { secret: parsed.data.secret }),
+  }), generation);
+  if (sent !== 'sent') {
+    cancelPendingAutoUnlock(requestId);
+    return c.json({ error: 'node_offline' }, 503);
+  }
+  const result = await pending;
+  if (!result) return c.json({ error: 'node_timeout' }, 504);
+
+  await c.env.DB.execute(
+    `UPDATE servers SET auto_unlock_configured = $3
+      WHERE id = $1 AND user_id = $2`,
+    [serverId, userId, result.configured],
+  );
+  const ip = (c.get('clientIp' as never) as string) ?? 'unknown';
+  logAudit({
+    userId,
+    action: 'machine.auto_unlock',
+    ip,
+    // Records the decision, never the secret.
+    details: { serverId, configured: result.configured, ok: result.ok },
+  }, c.env.DB).catch(() => {});
+  if (!result.ok) {
+    return c.json({ error: result.error ?? 'store_failed', configured: result.configured }, 502);
+  }
+  return c.json({ ok: true, autoUnlockConfigured: result.configured });
 });

@@ -50,6 +50,12 @@ import { RemoteDesktopWorkerHost } from './remote-desktop-worker-host.js';
 import { isRemoteDesktopFeatureEnabled } from '../../shared/remote-desktop-feature.js';
 import { CONTROLLED_NODE_SAFE_SELF_UPGRADE_CAPABILITY } from '../../shared/controlled-node-service.js';
 import { cleanupLegacyWindowsUpgradeRescue } from './legacy-upgrade-rescue.js';
+import {
+  CONTROLLED_NODE_AUTO_UNLOCK_ACTION,
+  CONTROLLED_NODE_AUTO_UNLOCK_ERROR,
+  validateControlledNodeAutoUnlockCommand,
+  type ControlledNodeAutoUnlockError,
+} from '../../shared/controlled-node-auto-unlock.js';
 import { incrementCounter } from '../util/metrics.js';
 import logger from '../util/logger.js';
 
@@ -74,6 +80,8 @@ export interface ControlledNodeRuntimeOptions {
   remoteDesktopWorker?: {
     available(): boolean;
     handle(message: RemoteDesktopDaemonCommand): Promise<boolean>;
+    applyAutoUnlockSecret(secret: string | null): Promise<boolean>;
+    autoUnlockConfigured(): Promise<boolean>;
     close(): void;
   };
   cleanupLegacyUpgradeRescue?: () => Promise<void>;
@@ -359,6 +367,42 @@ export function createControlledNodeRuntime(
         } else {
           await handleFilePathHandle(parsed.value as unknown as Record<string, unknown>, fileSender);
         }
+        return;
+      }
+      if (message.type === DAEMON_COMMAND_TYPES.CONTROLLED_NODE_AUTO_UNLOCK) {
+        const command = validateControlledNodeAutoUnlockCommand(
+          message,
+          DAEMON_COMMAND_TYPES.CONTROLLED_NODE_AUTO_UNLOCK,
+        );
+        if (!command) return;
+        // The secret exists in this process only for the length of this call
+        // and only to reach the worker's stdin; nothing here logs or keeps it.
+        let ok = false;
+        let error: ControlledNodeAutoUnlockError | undefined;
+        try {
+          if (!remoteDesktopWorker.available()) {
+            error = CONTROLLED_NODE_AUTO_UNLOCK_ERROR.UNSUPPORTED_PLATFORM;
+          } else {
+            ok = await remoteDesktopWorker.applyAutoUnlockSecret(
+              command.action === CONTROLLED_NODE_AUTO_UNLOCK_ACTION.SET
+                ? command.secret ?? ''
+                : null,
+            );
+            if (!ok) error = CONTROLLED_NODE_AUTO_UNLOCK_ERROR.STORE_FAILED;
+          }
+        } catch {
+          error = CONTROLLED_NODE_AUTO_UNLOCK_ERROR.STORE_FAILED;
+        }
+        const configured = ok
+          ? command.action === CONTROLLED_NODE_AUTO_UNLOCK_ACTION.SET
+          : await remoteDesktopWorker.autoUnlockConfigured().catch(() => false);
+        client.send({
+          type: DAEMON_MSG.CONTROLLED_NODE_AUTO_UNLOCK_RESULT,
+          requestId: command.requestId,
+          ok,
+          configured,
+          ...(error === undefined ? {} : { error }),
+        });
         return;
       }
       if (message.type !== DAEMON_COMMAND_TYPES.MACHINE_EXEC) return;

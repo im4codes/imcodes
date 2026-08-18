@@ -241,7 +241,7 @@ type MachineListItem = MachineSummary & { refName: string; displayName: string; 
 
 const MACHINE_LIST_ITEM_KEYS: ReadonlySet<string> = new Set([
   'serverId', 'name', 'refName', 'displayName', 'online', 'nodeRole', 'execEnabled', 'os', 'lastSeenMs', 'accessRole',
-  'daemonVersion', 'updateAvailable',
+  'daemonVersion', 'updateAvailable', 'autoUnlockConfigured',
 ]);
 
 /** Strict per-item validation: known keys only, controlled role, canonical OS (or absent). */
@@ -262,6 +262,7 @@ function isValidMachineListItem(v: unknown): v is MachineListItem {
   // tool result, but rejecting them would break this node against that Server.
   if (m.daemonVersion !== undefined && typeof m.daemonVersion !== 'string') return false;
   if (m.updateAvailable !== undefined && typeof m.updateAvailable !== 'boolean') return false;
+  if (m.autoUnlockConfigured !== undefined && typeof m.autoUnlockConfigured !== 'boolean') return false;
   return true;
 }
 

@@ -15,6 +15,11 @@ export const DAEMON_MSG = {
   MACHINE_EXEC_RESULT: 'machine.exec_result',
   /** Controlled node → server: result of a typed Computer Use request. */
   COMPUTER_USE_RESULT: 'computer.use_result',
+  /**
+   * Controlled node → server: whether a sign-in secret is now stored. Carries
+   * the boolean only; the secret itself never leaves the node.
+   */
+  CONTROLLED_NODE_AUTO_UNLOCK_RESULT: 'controlled_node.auto_unlock_result',
 } as const;
 
 export type DaemonMessageType = (typeof DAEMON_MSG)[keyof typeof DAEMON_MSG];

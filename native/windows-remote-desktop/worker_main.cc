@@ -38,6 +38,7 @@
 #include "third_party/imcodes_remote_desktop/local_indicator.h"
 #include "third_party/imcodes_remote_desktop/mf_h264_encoder.h"
 #include "third_party/imcodes_remote_desktop/peer_session.h"
+#include "third_party/imcodes_remote_desktop/unlock_secret.h"
 #include "third_party/imcodes_remote_desktop/worker_policy.h"
 #include "third_party/imcodes_remote_desktop/virtual_display_controller.h"
 
@@ -143,6 +144,10 @@ class SilentAudioDeviceModule
     : public webrtc::webrtc_impl::AudioDeviceModuleDefault<
           webrtc::AudioDeviceModule> {};
 
+// Owner id for input the node types on its own behalf. It is separate from any
+// session so a viewer disconnecting cannot release, replay, or inherit it.
+constexpr char kAutoUnlockOwner[] = "imcodes-auto-unlock";
+
 // Crash reporting. A structured exception inside libwebrtc or a platform
 // subsystem would otherwise close the pipe and look exactly like an ordinary
 // disconnect, which is how one Core Audio teardown fault stayed invisible for
@@ -231,6 +236,47 @@ LONG WINAPI ReportCrashToDaemon(EXCEPTION_POINTERS* pointers) {
   }
   TerminateProcess(GetCurrentProcess(), 20);
   return EXCEPTION_EXECUTE_HANDLER;
+}
+
+// Read one UTF-8 line from stdin as the sign-in secret. Bounded, never echoed,
+// and wiped by the caller. Using stdin keeps it out of argv, which any local
+// process can read through WMI.
+bool ReadSecretFromStdin(std::wstring* secret) {
+  if (!secret) return false;
+  const HANDLE input = GetStdHandle(STD_INPUT_HANDLE);
+  if (input == INVALID_HANDLE_VALUE || input == nullptr) return false;
+  std::string utf8;
+  char buffer[512];
+  for (;;) {
+    DWORD read = 0;
+    if (!ReadFile(input, buffer, sizeof(buffer), &read, nullptr) || read == 0) {
+      break;
+    }
+    utf8.append(buffer, read);
+    SecureZeroMemory(buffer, sizeof(buffer));
+    if (utf8.size() > 4096) {
+      SecureZeroMemory(utf8.data(), utf8.size());
+      return false;
+    }
+  }
+  while (!utf8.empty() && (utf8.back() == '\n' || utf8.back() == '\r')) {
+    utf8.pop_back();
+  }
+  if (utf8.empty()) return false;
+  const int wide_size = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+                                            utf8.data(),
+                                            static_cast<int>(utf8.size()),
+                                            nullptr, 0);
+  if (wide_size <= 0) {
+    SecureZeroMemory(utf8.data(), utf8.size());
+    return false;
+  }
+  secret->resize(static_cast<size_t>(wide_size));
+  MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, utf8.data(),
+                      static_cast<int>(utf8.size()), secret->data(),
+                      wide_size);
+  SecureZeroMemory(utf8.data(), utf8.size());
+  return !secret->empty();
 }
 
 class PipeWriter {
@@ -642,6 +688,13 @@ class WorkerRuntime {
       UpdateIndicatorOnSignaling();
       g_input_desktop_ready.store(indicator_->BoundDesktop() == input_desktop);
     }
+    // A sign-in desktop with a controller watching is the only moment the
+    // stored secret may be used, and only once per lock.
+    if (input_desktop == L"Winlogon") {
+      MaybeAutoUnlockOnSignaling();
+    } else {
+      auto_unlock_attempts_ = 0;
+    }
     // Capture goes where input goes: Windows refuses a screen read from any
     // desktop other than the one it is displaying, so there is exactly one
     // valid target. While the lock curtain is up nothing can be read at all —
@@ -652,6 +705,48 @@ class WorkerRuntime {
         source.source->RequestDesktopRebind(input_desktop);
       }
     }
+  }
+
+  // Type the stored sign-in secret once, while an authorized controller is
+  // watching the sign-in desktop. The secret is decrypted for the length of
+  // this call and wiped immediately; it is never logged, echoed, or sent
+  // anywhere. A wrong password is not retried, so this can never walk an
+  // account into a lockout.
+  void MaybeAutoUnlockOnSignaling() {
+    const bool controller_present = std::any_of(
+        sessions_.begin(), sessions_.end(), [](const auto& entry) {
+          return !entry.second->closed() && entry.second->controlling();
+        });
+    if (!ShouldAttemptAutoUnlock(UnlockSecret::Configured(), controller_present,
+                                 g_input_desktop_ready.load(),
+                                 auto_unlock_attempts_)) {
+      return;
+    }
+    ++auto_unlock_attempts_;
+    std::wstring secret;
+    if (!UnlockSecret::Load(&secret)) return;
+    std::u16string typed(secret.begin(), secret.end());
+    SecureZeroMemory(secret.data(), secret.size() * sizeof(wchar_t));
+    secret.clear();
+    // Raise the credential UI first: on a lock curtain the password box does
+    // not exist until a key arrives.
+    input_.KeyDown(kAutoUnlockOwner, "Space", false);
+    input_.KeyUp(kAutoUnlockOwner, "Space");
+    const bool typed_ok = input_.Text(typed);
+    SecureZeroMemory(typed.data(), typed.size() * sizeof(char16_t));
+    typed.clear();
+    if (!typed_ok) return;
+    input_.KeyDown(kAutoUnlockOwner, "Enter", false);
+    input_.KeyUp(kAutoUnlockOwner, "Enter");
+    writer_->Emit(AutoUnlockAttemptEnvelope());
+  }
+
+  Json::Value AutoUnlockAttemptEnvelope() const {
+    // Auditable, and deliberately content-free: an operator can see that the
+    // node answered its own lock screen, never what it typed.
+    Json::Value root(Json::objectValue);
+    root["type"] = kAutoUnlockAttemptType;
+    return root;
   }
 
   void ResetCaptureSourcesOnSignaling() {
@@ -703,6 +798,7 @@ class WorkerRuntime {
   int protected_desktop_checks_ = 0;
   int desktop_follow_failures_ = 0;
   std::wstring capture_desktop_;
+  int auto_unlock_attempts_ = 0;
   int compositor_scan_ticks_ = 0;
   int topology_scan_ticks_ = 0;
   int topology_refresh_debounce_ticks_ = 0;
@@ -781,9 +877,36 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
   const bool activate_virtual_display =
       raw_arguments && raw_count == 2 &&
       lstrcmpW(raw_arguments[1], L"--activate-virtual-display") == 0;
+  const bool set_unlock_secret =
+      raw_arguments && raw_count == 2 &&
+      lstrcmpW(raw_arguments[1], L"--set-unlock-secret") == 0;
+  const bool clear_unlock_secret =
+      raw_arguments && raw_count == 2 &&
+      lstrcmpW(raw_arguments[1], L"--clear-unlock-secret") == 0;
+  const bool report_unlock_secret =
+      raw_arguments && raw_count == 2 &&
+      lstrcmpW(raw_arguments[1], L"--unlock-secret-state") == 0;
   if (raw_arguments) LocalFree(raw_arguments);
   if (release_only) {
     return ReleaseAllSupportedInput() ? 0 : 13;
+  }
+  if (set_unlock_secret) {
+    if (!IsLocalSystemProcess()) return 18;
+    std::wstring secret;
+    const bool read = ReadSecretFromStdin(&secret);
+    const bool stored = read && UnlockSecret::Store(secret);
+    SecureZeroMemory(secret.data(), secret.size() * sizeof(wchar_t));
+    secret.clear();
+    return stored ? 0 : 21;
+  }
+  if (clear_unlock_secret) {
+    if (!IsLocalSystemProcess()) return 18;
+    return UnlockSecret::Clear() ? 0 : 21;
+  }
+  if (report_unlock_secret) {
+    // Exit code only: the secret itself is never readable, not even by the
+    // service that stored it.
+    return UnlockSecret::Configured() ? 0 : 22;
   }
   if (virtual_display_controller) return RunVirtualDisplayController();
   if (activate_virtual_display) {

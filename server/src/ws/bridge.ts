@@ -30,6 +30,8 @@ import {
   resolvePendingExecChunk,
 } from './machine-exec-registry.js';
 import { resolvePendingComputerUse, abandonComputerUsePriorGenerations } from './computer-use-registry.js';
+import { resolvePendingAutoUnlock } from './auto-unlock-registry.js';
+import { validateControlledNodeAutoUnlockResult } from '../../../shared/controlled-node-auto-unlock.js';
 import {
   NODE_ROLE,
   REMOTE_EXEC_MAX_ERROR_BYTES,
@@ -3001,6 +3003,17 @@ export class WsBridge {
         }
         if (msg.type === DAEMON_MSG.COMPUTER_USE_RESULT) {
           if (!this.resolveValidatedComputerUseResult(msg)) {
+            WsBridge.controlledInboundDropped++;
+          }
+          return;
+        }
+        if (msg.type === DAEMON_MSG.CONTROLLED_NODE_AUTO_UNLOCK_RESULT) {
+          const result = validateControlledNodeAutoUnlockResult(
+            msg,
+            DAEMON_MSG.CONTROLLED_NODE_AUTO_UNLOCK_RESULT,
+          );
+          if (!result
+            || !resolvePendingAutoUnlock(this.serverId, this.daemonGeneration, result)) {
             WsBridge.controlledInboundDropped++;
           }
           return;
@@ -7158,6 +7171,25 @@ export class WsBridge {
       return 'sent';
     } catch (err) {
       logger.error({ serverId: this.serverId, err }, 'Failed to send MACHINE_EXEC');
+      return 'send_failed';
+    }
+  }
+
+  /**
+   * Non-queueing, generation-bound send for the node's sign-in secret. This
+   * frame carries the only copy of a password in flight, so it must never be
+   * queued for replay on a later connection: if the socket is not live right
+   * now the caller reports failure and the operator retries deliberately.
+   */
+  trySendAutoUnlock(frameJson: string, expectedGeneration: number): 'sent' | 'offline' | 'generation_changed' | 'send_failed' {
+    if (!this.daemonWs || !this.authenticated || this.daemonWs.readyState !== WebSocket.OPEN) return 'offline';
+    if (this.daemonGeneration !== expectedGeneration) return 'generation_changed';
+    try {
+      this.daemonWs.send(frameJson);
+      return 'sent';
+    } catch (err) {
+      // The frame is never logged: it contains the secret.
+      logger.error({ serverId: this.serverId, err }, 'Failed to send CONTROLLED_NODE_AUTO_UNLOCK');
       return 'send_failed';
     }
   }
