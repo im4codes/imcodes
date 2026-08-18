@@ -7,6 +7,17 @@ const state = vi.hoisted(() => ({
   home: '',
 }));
 
+const loggerWarn = vi.hoisted(() => vi.fn());
+
+vi.mock('../../src/util/logger.js', () => ({
+  default: {
+    warn: loggerWarn,
+    info: vi.fn(),
+    debug: vi.fn(),
+    error: vi.fn(),
+  },
+}));
+
 vi.mock('node:os', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:os')>();
   return {
@@ -17,6 +28,7 @@ vi.mock('node:os', async (importOriginal) => {
 
 describe('cc presets', () => {
   beforeEach(async () => {
+    loggerWarn.mockClear();
     state.home = await mkdtemp(join(tmpdir(), 'imcodes-cc-presets-'));
     await mkdir(join(state.home, '.imcodes'), { recursive: true });
     await writeFile(
@@ -302,4 +314,69 @@ describe('cc presets', () => {
       env: { ANTHROPIC_BASE_URL: 'https://new.example', ANTHROPIC_MODEL: 'new-model' },
     });
   });
+
+  describe('undiscovered preset model guard', () => {
+    // Anthropic-compatible third-party endpoints accept an unknown model id
+    // without an error and silently serve their own default, so a typo like
+    // `MiniMax-M.27` (for `MiniMax-M2.7`) otherwise runs invisibly on the
+    // wrong model.
+    async function writePreset(model: string, availableModels?: { id: string }[]): Promise<void> {
+      await writeFile(
+        join(state.home, '.imcodes', 'cc-presets.json'),
+        JSON.stringify([{
+          name: 'mm',
+          env: { ANTHROPIC_BASE_URL: 'https://api.minimax.io/anthropic', ANTHROPIC_MODEL: model },
+          ...(availableModels ? { availableModels } : {}),
+        }]),
+        'utf8',
+      );
+    }
+
+    const undiscoveredWarnings = () => loggerWarn.mock.calls.filter(
+      (call) => typeof call[1] === 'string' && call[1].includes('discovered model list'),
+    );
+
+    it('warns when the configured model is not among the discovered models', async () => {
+      await writePreset('MiniMax-M.27', [{ id: 'MiniMax-M3' }, { id: 'MiniMax-M2.7' }]);
+      const { getPresetTransportOverrides } = await import('../../src/daemon/cc-presets.js');
+
+      await getPresetTransportOverrides('mm');
+
+      expect(undiscoveredWarnings()).toHaveLength(1);
+      expect(undiscoveredWarnings()[0][0]).toMatchObject({
+        preset: 'mm',
+        configuredModel: 'MiniMax-M.27',
+      });
+    });
+
+    it('warns only once per preset/model pair', async () => {
+      await writePreset('MiniMax-M.27', [{ id: 'MiniMax-M2.7' }]);
+      const { getPresetTransportOverrides } = await import('../../src/daemon/cc-presets.js');
+
+      await getPresetTransportOverrides('mm');
+      await getPresetTransportOverrides('mm');
+      await getPresetTransportOverrides('mm');
+
+      expect(undiscoveredWarnings()).toHaveLength(1);
+    });
+
+    it('stays quiet when the configured model is discovered', async () => {
+      await writePreset('MiniMax-M2.7', [{ id: 'MiniMax-M3' }, { id: 'MiniMax-M2.7' }]);
+      const { getPresetTransportOverrides } = await import('../../src/daemon/cc-presets.js');
+
+      await getPresetTransportOverrides('mm');
+
+      expect(undiscoveredWarnings()).toHaveLength(0);
+    });
+
+    it('stays quiet when the provider advertised no models (nothing to check against)', async () => {
+      await writePreset('some-custom-model');
+      const { getPresetTransportOverrides } = await import('../../src/daemon/cc-presets.js');
+
+      await getPresetTransportOverrides('mm');
+
+      expect(undiscoveredWarnings()).toHaveLength(0);
+    });
+  });
+
 });

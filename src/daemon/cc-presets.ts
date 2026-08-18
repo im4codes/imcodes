@@ -145,6 +145,32 @@ export function getPresetAvailableModelIds(preset: Pick<CcPreset, 'availableMode
   return getCcPresetAvailableModelIds(preset);
 }
 
+/** `${preset}:${model}` pairs already warned about, so launches stay quiet after the first. */
+const warnedUndiscoveredPresetModels = new Set<string>();
+
+/**
+ * Warn when a preset pins a model the provider never advertised.
+ *
+ * Anthropic-compatible third-party endpoints accept an unknown model id without
+ * an error and silently serve their own default — MiniMax answers a request for
+ * `MiniMax-M.27` (a typo for `MiniMax-M2.7`) exactly like a valid one. The
+ * session then runs fine on a model the preset does not name, which is
+ * invisible without this check. Only advisory: an empty discovery list, or a
+ * model the user legitimately knows about, must never block a launch.
+ */
+function warnIfPresetModelUndiscovered(preset: CcPreset, configuredModel: string | undefined): void {
+  if (!configuredModel) return;
+  const discovered = (preset.availableModels ?? []).map((entry) => entry.id);
+  if (discovered.length === 0 || discovered.includes(configuredModel)) return;
+  const key = `${preset.name}:${configuredModel}`;
+  if (warnedUndiscoveredPresetModels.has(key)) return;
+  warnedUndiscoveredPresetModels.add(key);
+  logger.warn(
+    { preset: preset.name, configuredModel, discoveredModels: discovered },
+    'cc-preset: configured model is not in this provider\'s discovered model list — the endpoint may silently serve a different model',
+  );
+}
+
 /**
  * Resolve a preset name to env vars ready for session launch.
  * Auto-fills MODEL_ALIASES from ANTHROPIC_MODEL if set.
@@ -194,6 +220,7 @@ export async function getPresetTransportOverrides(
   const preset = await getPreset(presetName);
   if (!preset) return {};
   const configuredModel = modelOverride?.trim() || getPresetEffectiveModel(preset);
+  warnIfPresetModelUndiscovered(preset, configuredModel);
   const env = await resolvePresetEnv(presetName, undefined, configuredModel);
   const configuredBaseUrl = env['ANTHROPIC_BASE_URL']?.trim() || undefined;
   const runtimeFacts = [
