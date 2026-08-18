@@ -202,6 +202,19 @@ describe('listMachines client — bounded strict, typed control-plane failure', 
       fetchImpl: list200([{ ...items[0], accessRole: 'administrator' }]),
     })).rejects.toBeInstanceOf(MachineControlPlaneError);
   });
+  it('tolerates the display-only version fields a newer Server adds, but not wrong types', async () => {
+    const versioned = [{ ...items[0], daemonVersion: '2026.8.3447-dev.3884', updateAvailable: true }];
+    expect((await listMachines({ ...opts, fetchImpl: list200(versioned) })).map((m) => m.serverId))
+      .toEqual(['a']);
+    await expect(listMachines({
+      ...opts,
+      fetchImpl: list200([{ ...items[0], daemonVersion: 3447 }]),
+    })).rejects.toBeInstanceOf(MachineControlPlaneError);
+    await expect(listMachines({
+      ...opts,
+      fetchImpl: list200([{ ...items[0], updateAvailable: 'yes' }]),
+    })).rejects.toBeInstanceOf(MachineControlPlaneError);
+  });
   it('throws on non-2xx / transport / non-json (never a silent empty list)', async () => {
     await expect(listMachines({ ...opts, fetchImpl: raw(401, '{}') })).rejects.toBeInstanceOf(MachineControlPlaneError);
     await expect(listMachines({ ...opts, fetchImpl: raw(503, 'unavailable') })).rejects.toBeInstanceOf(MachineControlPlaneError);

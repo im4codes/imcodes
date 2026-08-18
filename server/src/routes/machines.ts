@@ -20,6 +20,10 @@ import {
 } from '../../../shared/machine-reference.js';
 import { listAccessibleControlledMachines } from '../share/machine-access.js';
 import { validateControlledNodeCapabilities } from '../../../shared/controlled-node-capabilities.js';
+import {
+  isImcodesVersionOutdated,
+  parseImcodesVersion,
+} from '../../../shared/imcodes-version.js';
 import { REMOTE_DESKTOP_TERMINAL_REASON } from '../../../shared/remote-desktop.js';
 
 export const machinesRoutes = new Hono<{
@@ -35,6 +39,7 @@ interface ControlledRow {
   last_heartbeat_at: number | null;
   exec_enabled: boolean;
   os: string | null;
+  daemon_version: string | null;
   access_role: MachineAccessRole;
   controlled_capabilities: unknown;
 }
@@ -61,6 +66,12 @@ export async function listControlledMachines(
       && typeof r.last_heartbeat_at === 'number'
       && nowMs - r.last_heartbeat_at < MACHINE_PRESENCE_STALENESS_MS;
     const capabilities = validateControlledNodeCapabilities(r.controlled_capabilities);
+    // Only a parseable release is echoed back: the string arrives from the node
+    // itself, so this keeps arbitrary reported text out of every consumer.
+    const daemonVersion = typeof r.daemon_version === 'string'
+      && parseImcodesVersion(r.daemon_version) !== null
+      ? r.daemon_version.trim()
+      : null;
     return {
       serverId: r.id,
       name: r.display_name ?? r.ref_name ?? r.id,
@@ -75,6 +86,12 @@ export async function listControlledMachines(
       ...(capabilities.ok && capabilities.value.length > 0 ? { capabilities: capabilities.value } : {}),
       ...(canonicalMachineOs(r.os) ? { os: canonicalMachineOs(r.os) } : {}),
       ...(typeof r.last_heartbeat_at === 'number' ? { lastSeenMs: r.last_heartbeat_at } : {}),
+      ...(daemonVersion ? { daemonVersion } : {}),
+      // The comparison stays here: only the Server knows its release target,
+      // and a browser must not have to guess what "current" means.
+      ...(isImcodesVersionOutdated(daemonVersion, process.env.APP_VERSION)
+        ? { updateAvailable: true }
+        : {}),
     };
   });
   return { machines, overLimit };
@@ -93,7 +110,13 @@ machinesRoutes.get('/', requireAuth(), async (c) => {
   const authenticatedDaemon = c.get('nodeRole') === NODE_ROLE.FULL
     && typeof c.get('authServerId') === 'string';
   const responseMachines = authenticatedDaemon
-    ? machines.map(({ accessRole: _accessRole, capabilities: _capabilities, ...machine }) => machine)
+    ? machines.map(({
+      accessRole: _accessRole,
+      capabilities: _capabilities,
+      daemonVersion: _daemonVersion,
+      updateAvailable: _updateAvailable,
+      ...machine
+    }) => machine)
     : machines;
   return c.json({ machines: responseMachines });
 });

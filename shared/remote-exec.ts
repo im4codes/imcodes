@@ -124,6 +124,13 @@ export interface MachineSummary {
   accessRole?: MachineAccessRole;
   /** Optional for pre-capability nodes and old Servers. Exact versions only. */
   capabilities?: ControlledNodeCapability[];
+  /**
+   * The node's own reported release, echoed back only when it parses as an
+   * IM.codes version. Absent for a node that has never reported one.
+   */
+  daemonVersion?: string;
+  /** Present only when that reported release is older than the Server's target. */
+  updateAvailable?: boolean;
 }
 
 export const MACHINE_ACCESS_ROLES = ['owner', 'viewer', 'participant'] as const;

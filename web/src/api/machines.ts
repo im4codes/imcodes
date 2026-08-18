@@ -50,6 +50,10 @@ export interface MachineListItem {
   execEnabled: boolean;
   accessRole?: MachineAccessRole;
   capabilities?: ControlledNodeCapability[];
+  /** The node's own reported release. Absent on old Servers and unreported nodes. */
+  daemonVersion?: string;
+  /** Server-computed: that release is older than the Server's target. */
+  updateAvailable?: boolean;
 }
 
 /** Identifies one downloadable artifact in the canonical OS+arch matrix. */
@@ -219,6 +223,8 @@ function normalizeMachine(raw: unknown): MachineListItem | null {
       ? 'owner'
       : isMachineAccessRole(raw.accessRole) ? raw.accessRole : 'viewer',
     ...(capabilities.ok && capabilities.value.length > 0 ? { capabilities: capabilities.value } : {}),
+    ...(typeof raw.daemonVersion === 'string' && raw.daemonVersion ? { daemonVersion: raw.daemonVersion } : {}),
+    ...(raw.updateAvailable === true ? { updateAvailable: true } : {}),
   };
 }
 

@@ -202,6 +202,30 @@ describe('ControlledNodesPanel (12.3)', () => {
     expect(container.querySelector('.controlled-nodes-exec-toggle.is-enabled')?.getAttribute('aria-pressed')).toBe('true');
   });
 
+  it('labels each node with its reported version and marks only the stale one', async () => {
+    machines = [
+      machine({ serverId: 'current', refName: 'cur', displayName: 'Current', online: true, daemonVersion: '2026.8.3447-dev.3884' }),
+      machine({ serverId: 'stale', refName: 'old', displayName: 'Stale', online: true, daemonVersion: '2026.8.3400-dev.3800', updateAvailable: true }),
+      machine({ serverId: 'silent', refName: 'quiet', displayName: 'Silent', online: false }),
+    ];
+    const { container } = render(<ControlledNodesPanel />);
+    await waitFor(() => expect(container.textContent).toContain('Current'));
+
+    const rows = Array.from(container.querySelectorAll('.controlled-nodes-machine-row'));
+    expect(rows).toHaveLength(3);
+    const chipTitles = rows.map((row) => row.querySelector('.controlled-nodes-version')?.getAttribute('title') ?? null);
+    expect(chipTitles).toEqual([
+      'controlled_nodes.version_current',
+      'controlled_nodes.version_outdated',
+      // A node that never reported a version gets no version chip at all
+      // rather than a chip claiming it is current.
+      null,
+    ]);
+    expect(container.querySelectorAll('.controlled-nodes-version.is-outdated')).toHaveLength(1);
+    expect(rows[1]?.querySelector('.controlled-nodes-version.is-outdated')).toBeTruthy();
+    expect(rows[2]?.textContent).toContain('controlled_nodes.version_unknown');
+  });
+
   it('offers one download button per canonical (os, arch) artifact', async () => {
     const { container } = render(<ControlledNodesPanel />);
     await waitFor(() => expect(container.textContent).toContain('controlled_nodes.download_target'));

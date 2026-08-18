@@ -183,6 +183,54 @@ describe('controlled-node sharing reuses grants without becoming a shared Tab', 
   });
 });
 
+describe('controlled-node version reporting', () => {
+  it('shows a parseable node version to browsers, flags stale ones, and hides both from daemons', async () => {
+    const app = buildApp();
+    const ownerId = `owner-${hex(4)}`;
+    await createUser(db, ownerId);
+    const source = await fullCredential(ownerId);
+    const current = await controlledNode(ownerId);
+    const stale = await controlledNode(ownerId);
+    const garbled = await controlledNode(ownerId);
+    const silent = await controlledNode(ownerId);
+    await db.execute('UPDATE servers SET daemon_version = $2 WHERE id = $1', [current, '2026.8.3447-dev.3884']);
+    await db.execute('UPDATE servers SET daemon_version = $2 WHERE id = $1', [stale, '2026.8.3400-dev.3800']);
+    // A node is free to report anything; only a parseable release is echoed on.
+    await db.execute('UPDATE servers SET daemon_version = $2 WHERE id = $1', [garbled, 'not a version']);
+
+    const previousAppVersion = process.env.APP_VERSION;
+    process.env.APP_VERSION = '2026.8.3447-dev.3884';
+    try {
+      const browser = await (await app.request('/api/machines', { headers: webAuth(ownerId) })).json() as {
+        machines: { serverId: string; daemonVersion?: string; updateAvailable?: boolean }[];
+      };
+      const byId = new Map(browser.machines.map((m) => [m.serverId, m]));
+      expect(byId.get(current)).toMatchObject({ daemonVersion: '2026.8.3447-dev.3884' });
+      expect(byId.get(current)!.updateAvailable).toBeUndefined();
+      expect(byId.get(stale)).toMatchObject({
+        daemonVersion: '2026.8.3400-dev.3800',
+        updateAvailable: true,
+      });
+      expect(byId.get(garbled)!.daemonVersion).toBeUndefined();
+      expect(byId.get(silent)!.daemonVersion).toBeUndefined();
+
+      // Older daemons strictly reject unknown machine-list keys, so the
+      // display-only fields must not appear on the daemon-authenticated DTO.
+      const daemon = await (await app.request('/api/machines', {
+        headers: { 'X-Server-Id': source.serverId, authorization: `Bearer ${source.token}` },
+      })).json() as { machines: Record<string, unknown>[] };
+      expect(daemon.machines.length).toBeGreaterThan(0);
+      for (const machine of daemon.machines) {
+        expect(machine).not.toHaveProperty('daemonVersion');
+        expect(machine).not.toHaveProperty('updateAvailable');
+      }
+    } finally {
+      if (previousAppVersion === undefined) delete process.env.APP_VERSION;
+      else process.env.APP_VERSION = previousAppVersion;
+    }
+  });
+});
+
 describe('controlled-node shared action admission', () => {
   it('allows Participant exec/computer-use, denies Viewer, and expires immediately', async () => {
     const app = buildApp();

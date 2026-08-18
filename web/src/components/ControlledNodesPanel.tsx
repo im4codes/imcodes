@@ -376,6 +376,18 @@ export function ControlledNodesPanel({
                 <div class="controlled-nodes-machine-meta">
                   <code>{m.refName}</code>
                   {m.os && <span>{m.os.toUpperCase()}</span>}
+                  {m.daemonVersion
+                    ? (
+                      <span
+                        class={m.updateAvailable ? 'controlled-nodes-version is-outdated' : 'controlled-nodes-version'}
+                        title={m.updateAvailable
+                          ? t('controlled_nodes.version_outdated')
+                          : t('controlled_nodes.version_current')}
+                      >
+                        {t('controlled_nodes.version', { version: m.daemonVersion })}
+                      </span>
+                    )
+                    : <span title={t('controlled_nodes.version_unknown')}>{t('controlled_nodes.version_unknown')}</span>}
                   <span>{t('controlled_nodes.access_role', { role: t(`share.role.${machineAccessRole(m)}`) })}</span>
                 </div>
               </div>

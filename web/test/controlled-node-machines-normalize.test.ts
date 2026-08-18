@@ -58,6 +58,36 @@ describe('controlled-node access-role normalization', () => {
       ]);
   });
 
+  it('surfaces a reported node version and the Server-computed upgrade flag', async () => {
+    apiFetch.mockResolvedValueOnce({
+      machines: [
+        {
+          serverId: 'current', refName: 'current', online: true, execEnabled: true,
+          daemonVersion: '2026.8.3447-dev.3884',
+        },
+        {
+          serverId: 'stale', refName: 'stale', online: true, execEnabled: true,
+          daemonVersion: '2026.8.3400-dev.3800', updateAvailable: true,
+        },
+        { serverId: 'silent', refName: 'silent', online: true, execEnabled: true },
+        {
+          serverId: 'malformed', refName: 'malformed', online: true, execEnabled: true,
+          daemonVersion: 42, updateAvailable: 'yes',
+        },
+      ],
+    });
+
+    const machines = await listControllableMachines();
+    expect(machines.map((m) => [m.serverId, m.daemonVersion, m.updateAvailable])).toEqual([
+      ['current', '2026.8.3447-dev.3884', undefined],
+      ['stale', '2026.8.3400-dev.3800', true],
+      ['silent', undefined, undefined],
+      // A non-string version and a truthy-but-not-true flag both fall away
+      // rather than reaching the row as `42` or a bogus upgrade badge.
+      ['malformed', undefined, undefined],
+    ]);
+  });
+
   it('keeps only an exact, known remote-desktop capability list', async () => {
     apiFetch.mockResolvedValueOnce({
       machines: [

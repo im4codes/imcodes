@@ -2867,6 +2867,13 @@ html.native-ios-mac .chat-dl-btn {
   font-weight: 800;
   letter-spacing: 0.05em;
 }
+/* An outdated node has to be findable at a glance in a long list, so the
+   version chip switches to the warning ramp instead of the violet meta ramp. */
+.controlled-nodes-machine-meta span.controlled-nodes-version.is-outdated {
+  border-color: rgba(251, 191, 36, 0.35);
+  background: rgba(217, 119, 6, 0.14);
+  color: #fbbf24;
+}
 .controlled-nodes-machine-actions {
   display: flex;
   align-items: center;
