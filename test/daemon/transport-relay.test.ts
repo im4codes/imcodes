@@ -1861,6 +1861,99 @@ describe('transport-relay (timeline-emitter based)', () => {
         expect.objectContaining({ source: 'daemon', confidence: 'high' }),
       );
     });
+
+    // Regression: a cc-preset reasoning model (MiniMax-M3) reports live thinking
+    // progress on nearly every reasoning token — measured 3–36 updates/s. Each
+    // one used to become an agent.status frame on the same daemon→server socket
+    // that carries the 40ms streaming-text frames.
+    it('coalesces rapid label churn within one status and keeps the latest label', () => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date('2026-04-08T00:00:00.000Z'));
+
+      const { provider, fireStatus } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      for (let tokens = 1; tokens <= 40; tokens += 1) {
+        fireStatus('sess-status', { status: 'thinking', label: `Thinking (${tokens} tokens)` });
+      }
+
+      const statusCalls = () => emitMock.mock.calls.filter((c) => c[1] === 'agent.status');
+      expect(statusCalls()).toHaveLength(1);
+      expect(statusCalls()[0][2]).toMatchObject({ status: 'thinking', label: 'Thinking (1 tokens)' });
+
+      vi.advanceTimersByTime(249);
+      expect(statusCalls()).toHaveLength(1);
+
+      // Trailing edge carries the newest count, not a stale intermediate one.
+      vi.advanceTimersByTime(1);
+      expect(statusCalls()).toHaveLength(2);
+      expect(statusCalls()[1][2]).toMatchObject({ status: 'thinking', label: 'Thinking (40 tokens)' });
+
+      vi.useRealTimers();
+    });
+
+    it('emits a status NAME transition immediately without reordering it behind coalesced churn', () => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date('2026-04-08T00:00:00.000Z'));
+
+      const { provider, fireStatus } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      fireStatus('sess-status', { status: 'thinking', label: 'Thinking (1 tokens)' });
+      fireStatus('sess-status', { status: 'thinking', label: 'Thinking (2 tokens)' }); // coalesced
+      fireStatus('sess-status', { status: 'compacting', label: 'Compacting conversation...' });
+
+      const statusCalls = () => emitMock.mock.calls.filter((c) => c[1] === 'agent.status');
+      expect(statusCalls()).toHaveLength(2);
+      expect(statusCalls()[1][2]).toMatchObject({ status: 'compacting' });
+
+      // The dropped 'thinking (2 tokens)' frame must never land after it.
+      vi.advanceTimersByTime(1000);
+      expect(statusCalls()).toHaveLength(2);
+
+      vi.useRealTimers();
+    });
+
+    it('discards a coalesced status frame when the turn completes', () => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date('2026-04-08T00:00:00.000Z'));
+
+      const { provider, fireStatus, fireComplete } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      fireStatus('sess-status', { status: 'thinking', label: 'Thinking (1 tokens)' });
+      fireStatus('sess-status', { status: 'thinking', label: 'Thinking (2 tokens)' }); // coalesced
+      fireComplete('sess-status', makeMessage({ id: 'msg-done', content: 'done' }));
+
+      const statusCallCount = () => emitMock.mock.calls.filter((c) => c[1] === 'agent.status').length;
+      expect(statusCallCount()).toBe(1);
+
+      // Would otherwise pin the UI to "Thinking" after the turn already ended.
+      vi.advanceTimersByTime(1000);
+      expect(statusCallCount()).toBe(1);
+
+      vi.useRealTimers();
+    });
+
+    it('treats the first status after a completed turn as a transition (emitted immediately)', () => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date('2026-04-08T00:00:00.000Z'));
+
+      const { provider, fireStatus, fireComplete } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      fireStatus('sess-status', { status: 'thinking', label: 'Thinking (1 tokens)' });
+      fireComplete('sess-status', makeMessage({ id: 'msg-done', content: 'done' }));
+      emitMock.mockClear();
+
+      // Same status name as the previous turn, but the memo was cleared — so it
+      // must not be held back by the window the previous turn opened.
+      fireStatus('sess-status', { status: 'thinking', label: 'Thinking (1 tokens)' });
+
+      expect(emitMock.mock.calls.filter((c) => c[1] === 'agent.status')).toHaveLength(1);
+
+      vi.useRealTimers();
+    });
   });
 
   describe('onApprovalRequest', () => {

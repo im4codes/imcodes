@@ -26,6 +26,7 @@ import { resolveSessionName, isEphemeralProviderSid } from '../agent/session-man
 import { timelineEmitter } from './timeline-emitter.js';
 import { appendTransportEvent } from './transport-history.js';
 import logger from '../util/logger.js';
+import { TrailingThrottle } from '../util/trailing-throttle.js';
 import { resolveContextWindow } from '../util/model-context.js';
 import { getSession } from '../store/session-store.js';
 import { getCachedPresetContextWindow } from './cc-presets.js';
@@ -49,14 +50,31 @@ import {
 
 let sendToServer: ((msg: Record<string, unknown>) => void) | null = null;
 const inFlightMessages = new Map<string, { messageId: string; eventId: string; text: string }>();
-const pendingStreamUpdates = new Map<string, {
-  sessionName: string;
-  eventId: string;
-  lastEmitAt: number;
-  pendingText: string | null;
-  timer: ReturnType<typeof setTimeout> | null;
-}>();
 const STREAM_UPDATE_INTERVAL_MS = 40;
+// Third-party reasoning models reached through a cc preset (MiniMax-M3) report
+// live thinking progress on nearly every reasoning token — measured at 3–36
+// updates/s per session against roughly 1/s from Claude. Each one became an
+// `agent.status` frame on the daemon→server link, competing with the 40 ms
+// streaming-text frames on that same socket, and on a flapping link the text
+// frames are what get dropped (server-link drops timeline events while down,
+// while the final assistant text survives via transport history + backfill —
+// i.e. exactly "the reply arrives but the streaming disappeared"). Coalesce the
+// label churn; status TRANSITIONS still bypass the throttle (see pushNow).
+const STATUS_UPDATE_INTERVAL_MS = 250;
+const streamTextThrottle = new TrailingThrottle<{ sessionName: string; eventId: string; text: string }>(
+  STREAM_UPDATE_INTERVAL_MS,
+  ({ sessionName, eventId, text }) => emitStreamingAssistantText(sessionName, eventId, text),
+);
+const statusThrottle = new TrailingThrottle<{ sessionName: string; payload: Record<string, unknown> }>(
+  STATUS_UPDATE_INTERVAL_MS,
+  ({ sessionName, payload }) => emitAgentStatus(sessionName, payload),
+);
+/**
+ * Last `agent.status` status name emitted per session, to detect transitions.
+ * `null` is a real value (it clears the active status) and is distinct from an
+ * absent entry, so the first status of a turn always counts as a transition.
+ */
+const lastEmittedStatusName = new Map<string, string | null>();
 const pendingFileLikeTools = new Map<string, ToolCallEvent>();
 const completedFileLikeTools = new Set<string>();
 const CHECKLIST_TOOL_NAMES = new Set([
@@ -138,6 +156,10 @@ export function emitSdkTurnLostRecoveryPhase(
     recovery,
   };
 
+  // This status is emitted directly rather than through the coalescing path, so
+  // drop any frame still waiting there — otherwise it lands afterwards and
+  // reverts the UI to the status this recovery phase just replaced.
+  clearPendingStatusUpdate(sessionName);
   timelineEmitter.emit(sessionName, 'agent.status', payload, {
     source: 'daemon',
     confidence: 'high',
@@ -265,11 +287,22 @@ function emitStreamingAssistantText(sessionName: string, eventId: string, text: 
   }, { source: 'daemon', confidence: 'high', eventId });
 }
 
+function emitAgentStatus(sessionName: string, payload: Record<string, unknown>): void {
+  timelineEmitter.emit(sessionName, 'agent.status', payload, { source: 'daemon', confidence: 'high' });
+}
+
 function clearPendingStreamUpdate(eventId: string): void {
-  const pending = pendingStreamUpdates.get(eventId);
-  if (!pending) return;
-  if (pending.timer) clearTimeout(pending.timer);
-  pendingStreamUpdates.delete(eventId);
+  streamTextThrottle.clear(eventId);
+}
+
+/**
+ * Drop a session's coalesced status frame and its transition memo. Called when
+ * a turn settles so the next turn's first status is treated as a transition and
+ * goes out immediately instead of waiting on a stale window.
+ */
+function clearPendingStatusUpdate(sessionName: string): void {
+  statusThrottle.clear(sessionName);
+  lastEmittedStatusName.delete(sessionName);
 }
 
 function normalizeUsageUpdatePayload(
@@ -327,48 +360,26 @@ function normalizeUsageUpdatePayload(
   return payload;
 }
 
-function flushPendingStreamUpdate(eventId: string): void {
-  const pending = pendingStreamUpdates.get(eventId);
-  if (!pending || pending.pendingText == null) return;
-  pending.timer = null;
-  pending.lastEmitAt = Date.now();
-  const nextText = pending.pendingText;
-  pending.pendingText = null;
-  emitStreamingAssistantText(pending.sessionName, pending.eventId, nextText);
+function emitThrottledStreamingAssistantText(sessionName: string, eventId: string, text: string): void {
+  streamTextThrottle.push(eventId, { sessionName, eventId, text });
 }
 
-function emitThrottledStreamingAssistantText(sessionName: string, eventId: string, text: string): void {
-  const now = Date.now();
-  let pending = pendingStreamUpdates.get(eventId);
-  if (!pending) {
-    pending = {
-      sessionName,
-      eventId,
-      lastEmitAt: 0,
-      pendingText: null,
-      timer: null,
-    };
-    pendingStreamUpdates.set(eventId, pending);
-  } else {
-    pending.sessionName = sessionName;
-  }
-
-  if (pending.lastEmitAt === 0 || now - pending.lastEmitAt >= STREAM_UPDATE_INTERVAL_MS) {
-    if (pending.timer) {
-      clearTimeout(pending.timer);
-      pending.timer = null;
-    }
-    pending.pendingText = null;
-    pending.lastEmitAt = now;
-    emitStreamingAssistantText(sessionName, eventId, text);
+/**
+ * Emit `agent.status`, coalescing high-frequency label churn within one status.
+ * A change of the status NAME is a real state transition and bypasses the
+ * throttle so it can never be delayed behind, or reordered after, a coalesced
+ * frame from the status it replaced.
+ */
+function emitThrottledAgentStatus(sessionName: string, payload: Record<string, unknown>, statusName: string | null): void {
+  const value = { sessionName, payload };
+  // An absent entry reads as `undefined`, which differs from every `string | null`
+  // status — so the first status after a reset always takes the transition path.
+  if (lastEmittedStatusName.get(sessionName) !== statusName) {
+    lastEmittedStatusName.set(sessionName, statusName);
+    statusThrottle.pushNow(sessionName, value);
     return;
   }
-
-  pending.pendingText = text;
-  if (pending.timer) return;
-  pending.timer = setTimeout(() => {
-    flushPendingStreamUpdate(eventId);
-  }, STREAM_UPDATE_INTERVAL_MS - (now - pending.lastEmitAt));
+  statusThrottle.push(sessionName, value);
 }
 
 /** Set the send function (called once during server-link setup) */
@@ -450,6 +461,10 @@ export function wireProviderToRelay(provider: TransportProvider): void {
       : `transport:${sessionName}:${message.id}`;
     inFlightMessages.delete(sessionName);
     clearPendingStreamUpdate(stableEventId);
+    // Discard rather than flush: TransportSessionRuntime emits the turn's
+    // terminal state separately, and a coalesced "Thinking (N tokens)" landing
+    // after it would pin the UI to a status the turn already left.
+    clearPendingStatusUpdate(sessionName);
     timelineEmitter.emit(sessionName, 'assistant.text', {
       text: finalText,
       streaming: false,
@@ -494,6 +509,7 @@ export function wireProviderToRelay(provider: TransportProvider): void {
     const tracked = inFlightMessages.get(sessionName);
     inFlightMessages.delete(sessionName);
     if (tracked) clearPendingStreamUpdate(tracked.eventId);
+    clearPendingStatusUpdate(sessionName);
 
     if (isSdkTurnLostRecovery(error)) {
       const details = sanitizeSdkTurnLostRecoveryMetadata(error.details);
@@ -845,10 +861,10 @@ export function wireProviderToRelay(provider: TransportProvider): void {
       return;
     }
 
-    timelineEmitter.emit(sessionName, 'agent.status', {
+    emitThrottledAgentStatus(sessionName, {
       status: status.status,
       ...(status.label !== undefined ? { label: status.label } : {}),
-    }, { source: 'daemon', confidence: 'high' });
+    }, status.status);
   });
 
   provider.onUsage?.((providerSid: string, update: ProviderUsageUpdate) => {
@@ -963,7 +979,9 @@ export const __testing__ = {
    * behavior (the orphan message gets persisted).
    */
   resetRelayState(): void {
-    for (const eventId of [...pendingStreamUpdates.keys()]) clearPendingStreamUpdate(eventId);
+    streamTextThrottle.clearAll();
+    statusThrottle.clearAll();
+    lastEmittedStatusName.clear();
     inFlightMessages.clear();
     pendingFileLikeTools.clear();
     completedFileLikeTools.clear();
