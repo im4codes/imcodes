@@ -384,6 +384,19 @@ const contracts: Contract[] = [
     ],
   },
   {
+    name: 'worker never opens the platform audio device',
+    guards: [
+      {
+        path: 'native/windows-remote-desktop/worker_main.cc',
+        needle: 'dependencies.adm = webrtc::make_ref_counted<SilentAudioDeviceModule>()',
+      },
+      {
+        path: 'native/windows-remote-desktop/worker_main.cc',
+        needle: 'AudioDeviceModuleDefault<',
+      },
+    ],
+  },
+  {
     name: 'Windows 10 and 11 UMDF reflector compatibility',
     guards: [
       {
@@ -691,6 +704,12 @@ const contracts: Contract[] = [
 ];
 
 const mutations: Mutation[] = [
+  {
+    name: 'let the media engine build the platform audio device',
+    contract: 'worker never opens the platform audio device',
+    path: 'native/windows-remote-desktop/worker_main.cc',
+    needle: 'dependencies.adm = webrtc::make_ref_counted<SilentAudioDeviceModule>()',
+  },
   {
     name: 'remove access revalidation',
     contract: 'continuous access revalidation',

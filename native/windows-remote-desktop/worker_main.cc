@@ -17,13 +17,16 @@
 #include <mfapi.h>
 #include <objbase.h>
 
+#include "api/audio/audio_device.h"
 #include "api/audio_codecs/builtin_audio_decoder_factory.h"
 #include "api/audio_codecs/builtin_audio_encoder_factory.h"
 #include "api/create_modular_peer_connection_factory.h"
 #include "api/enable_media.h"
 #include "api/environment/environment_factory.h"
+#include "api/make_ref_counted.h"
 #include "api/peer_connection_interface.h"
 #include "api/video_codecs/builtin_video_decoder_factory.h"
+#include "modules/audio_device/include/audio_device_default.h"
 #include "rtc_base/ssl_adapter.h"
 #include "rtc_base/thread.h"
 #include "rtc_base/win32_socket_init.h"
@@ -130,6 +133,13 @@ bool IsLocalSystemProcess() {
   const auto* user = reinterpret_cast<const TOKEN_USER*>(storage.data());
   return IsWellKnownSid(user->User.Sid, WinLocalSystemSid) != FALSE;
 }
+
+// Remote desktop carries no audio. The media engine would otherwise build the
+// platform Core Audio device, which opens the microphone stack this product
+// never uses.
+class SilentAudioDeviceModule
+    : public webrtc::webrtc_impl::AudioDeviceModuleDefault<
+          webrtc::AudioDeviceModule> {};
 
 class PipeWriter {
  public:
@@ -707,6 +717,12 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
   dependencies.worker_thread = worker_thread.get();
   dependencies.signaling_thread = signaling_thread.get();
   dependencies.env = webrtc::CreateEnvironment();
+  // Remote desktop is video only. Without an explicit module the media engine
+  // builds the platform Core Audio device, which opens the microphone stack
+  // this product never uses and destructs through a dangling COM interface
+  // once the audio endpoints are unavailable, taking the worker down with an
+  // access violation at the sign-in desktop and across a logon transition.
+  dependencies.adm = webrtc::make_ref_counted<SilentAudioDeviceModule>();
   dependencies.audio_encoder_factory =
       webrtc::CreateBuiltinAudioEncoderFactory();
   dependencies.audio_decoder_factory =
