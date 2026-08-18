@@ -18,9 +18,11 @@ import {
   REMOTE_DESKTOP_VIRTUAL_DISPLAY_ARCHIVE_FILENAME,
   REMOTE_DESKTOP_VIRTUAL_DISPLAY_MANIFEST_FILENAME,
   validateRemoteDesktopVirtualDisplayPackageManifest,
+  validateRemoteDesktopWorkerCrash,
   validateRemoteDesktopWorkerHello,
   validateRemoteDesktopWorkerManifest,
   upgradeLegacyRemoteDesktopWorkerManifest,
+  type RemoteDesktopWorkerCrash,
   type RemoteDesktopWorkerManifest,
 } from '../../shared/remote-desktop-worker.js';
 import { DAEMON_VERSION } from '../util/version.js';
@@ -214,6 +216,7 @@ export interface RemoteDesktopWorkerHostOptions {
   launchVirtualDisplay?: (executable: string) => VirtualDisplayControllerProcess;
   activateVirtualDisplay?: (executable: string) => void;
   wait?: (milliseconds: number) => Promise<void>;
+  onWorkerCrash?: (crash: RemoteDesktopWorkerCrash) => void;
 }
 
 /**
@@ -521,6 +524,13 @@ export class RemoteDesktopWorkerHost {
       if (!line) continue;
       let value: unknown;
       try { value = JSON.parse(line); } catch { continue; }
+      if (validateRemoteDesktopWorkerCrash(value, this.nonce)) {
+        // The worker faulted and is already gone. Surface it before the socket
+        // loss turns into an anonymous `worker_failed`; the frame carries no
+        // session, capability, media, or input data.
+        this.options.onWorkerCrash?.(value);
+        continue;
+      }
       const parsed = validateRemoteDesktopDaemonMessage(value);
       if (!parsed.ok) continue;
       const tracked = this.tracked.get(parsed.value.sessionId);

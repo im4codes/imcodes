@@ -28,6 +28,7 @@ inline constexpr uint32_t kMaxVideoBitrateBps = 15'000'000;
 inline constexpr uint32_t kMaxAggregateVideoBitrateBps = 60'000'000;
 
 inline constexpr char kWorkerHelloType[] = "remote_desktop.worker_hello";
+inline constexpr char kWorkerCrashType[] = "remote_desktop.worker_crash";
 inline constexpr char kPrepareType[] = "remote_desktop.prepare";
 inline constexpr char kOfferType[] = "remote_desktop.offer";
 inline constexpr char kAnswerType[] = "remote_desktop.answer";

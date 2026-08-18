@@ -397,6 +397,23 @@ const contracts: Contract[] = [
     ],
   },
   {
+    name: 'native worker faults are reported, never silent',
+    guards: [
+      {
+        path: 'native/windows-remote-desktop/worker_main.cc',
+        needle: 'SetUnhandledExceptionFilter(ReportCrashToDaemon)',
+      },
+      {
+        path: 'native/windows-remote-desktop/worker_main.cc',
+        needle: 'TerminateProcess(GetCurrentProcess(), 20)',
+      },
+      {
+        path: 'src/node/remote-desktop-worker-host.ts',
+        needle: 'validateRemoteDesktopWorkerCrash(value, this.nonce)',
+      },
+    ],
+  },
+  {
     name: 'Windows 10 and 11 UMDF reflector compatibility',
     guards: [
       {
@@ -704,6 +721,18 @@ const contracts: Contract[] = [
 ];
 
 const mutations: Mutation[] = [
+  {
+    name: 'let a native fault look like an ordinary disconnect',
+    contract: 'native worker faults are reported, never silent',
+    path: 'native/windows-remote-desktop/worker_main.cc',
+    needle: 'SetUnhandledExceptionFilter(ReportCrashToDaemon)',
+  },
+  {
+    name: 'drop the daemon side of the crash report',
+    contract: 'native worker faults are reported, never silent',
+    path: 'src/node/remote-desktop-worker-host.ts',
+    needle: 'validateRemoteDesktopWorkerCrash(value, this.nonce)',
+  },
   {
     name: 'let the media engine build the platform audio device',
     contract: 'worker never opens the platform audio device',

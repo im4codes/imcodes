@@ -50,6 +50,8 @@ import { RemoteDesktopWorkerHost } from './remote-desktop-worker-host.js';
 import { isRemoteDesktopFeatureEnabled } from '../../shared/remote-desktop-feature.js';
 import { CONTROLLED_NODE_SAFE_SELF_UPGRADE_CAPABILITY } from '../../shared/controlled-node-service.js';
 import { cleanupLegacyWindowsUpgradeRescue } from './legacy-upgrade-rescue.js';
+import { incrementCounter } from '../util/metrics.js';
+import logger from '../util/logger.js';
 
 /** Server → controlled node: auth succeeded; connection is live (bridge.ts heartbeat path). */
 const CONTROLLED_NODE_AUTH_ACK_TYPE = 'heartbeat_ack' as const;
@@ -87,6 +89,24 @@ export function createControlledNodeRuntime(
   let client!: AuthenticatedWebSocketClient;
   const remoteDesktopWorker = options.remoteDesktopWorker ?? new RemoteDesktopWorkerHost((message) => {
     client.send(message);
+  }, {
+    onWorkerCrash: (crash) => {
+      // A native fault would otherwise reach the browser as a bare
+      // `worker_failed`, indistinguishable from an ordinary disconnect.
+      incrementCounter('remote_desktop.worker_crash', {
+        exception: `0x${crash.exceptionCode.toString(16)}`,
+        module: crash.module,
+      });
+      logger.warn(
+        {
+          pid: crash.pid,
+          exceptionCode: `0x${crash.exceptionCode.toString(16)}`,
+          module: crash.module,
+          moduleOffset: crash.moduleOffset,
+        },
+        'remote desktop worker crashed',
+      );
+    },
   });
   const remoteDesktopEnabled = remoteDesktopWorker.available()
     && isRemoteDesktopFeatureEnabled(

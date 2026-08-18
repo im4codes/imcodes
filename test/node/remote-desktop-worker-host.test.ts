@@ -15,12 +15,14 @@ import {
 } from '../../shared/remote-desktop.js';
 import { WINDOWS_REMOTE_DESKTOP_QUALIFICATION_PLAN } from '../../shared/remote-desktop-qualification.js';
 import {
+  REMOTE_DESKTOP_WORKER_CRASH_TYPE,
   REMOTE_DESKTOP_WORKER_FILENAME,
   REMOTE_DESKTOP_WORKER_HELLO_TYPE,
   REMOTE_DESKTOP_WORKER_IPC_VERSION,
   REMOTE_DESKTOP_VIRTUAL_DISPLAY_FILES,
   REMOTE_DESKTOP_VIRTUAL_DISPLAY_MANIFEST_FILENAME,
   validateRemoteDesktopWorkerManifest,
+  type RemoteDesktopWorkerCrash,
   type RemoteDesktopWorkerManifest,
 } from '../../shared/remote-desktop-worker.js';
 import {
@@ -372,6 +374,81 @@ describe('remote desktop worker artifact and IPC host', () => {
     })).resolves.toBe(true);
     expect(tracked.size).toBe(0);
     expect([...capabilityBytes]).toEqual(new Array(capabilityBytes.length).fill(0));
+  });
+
+  it('surfaces a native worker crash frame and ignores forged ones', async () => {
+    const temp = await mkdtemp(join(tmpdir(), 'imcodes-rd-host-fault-'));
+    cleanup.push(() => rm(temp, { recursive: true, force: true }));
+    const pipePath = join(temp, 'worker.sock');
+    const received: RemoteDesktopDaemonMessage[] = [];
+    const crashes: RemoteDesktopWorkerCrash[] = [];
+    let helper: net.Socket | null = null;
+    let workerNonce = '';
+    const host = new RemoteDesktopWorkerHost((message) => received.push(message), {
+      ...trustedHostOptions,
+      platform: 'win32',
+      artifact,
+      pipePath,
+      allowPipeClients: () => {},
+      onWorkerCrash: (crash) => crashes.push(crash),
+      launch: (_executable, argsLine) => {
+        workerNonce = quotedArgs(argsLine)[3]!;
+        helper = net.createConnection(pipePath, () => {
+          helper!.write(`${JSON.stringify({
+            type: REMOTE_DESKTOP_WORKER_HELLO_TYPE,
+            ipcVersion: REMOTE_DESKTOP_WORKER_IPC_VERSION,
+            nonce: workerNonce,
+            pid: 44,
+          })}\n`);
+        });
+      },
+    });
+    cleanup.push(() => { host.close(); helper?.destroy(); });
+
+    await expect(host.handle({
+      type: REMOTE_DESKTOP_MSG.PREPARE,
+      requestId,
+      sessionId,
+      capability,
+      expiresAt: Date.now() + 60_000,
+      leaseExpiresAt: Date.now() + 15_000,
+      daemonGeneration: 7,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW,
+      inputEpoch: 0,
+      iceServers: [],
+    })).resolves.toBe(true);
+
+    // Another process cannot forge a crash report without the worker nonce.
+    helper!.write(`${JSON.stringify({
+      type: REMOTE_DESKTOP_WORKER_CRASH_TYPE,
+      ipcVersion: REMOTE_DESKTOP_WORKER_IPC_VERSION,
+      nonce: 'c'.repeat(43),
+      pid: 44,
+      exceptionCode: 0xc0000005,
+      module: 'imcodes-remote-desktop-worker.exe',
+      moduleOffset: 4242,
+    })}\n`);
+    await new Promise<void>((resolve) => setTimeout(resolve, 10));
+    expect(crashes).toHaveLength(0);
+
+    helper!.write(`${JSON.stringify({
+      type: REMOTE_DESKTOP_WORKER_CRASH_TYPE,
+      ipcVersion: REMOTE_DESKTOP_WORKER_IPC_VERSION,
+      nonce: workerNonce,
+      pid: 44,
+      exceptionCode: 0xc0000005,
+      module: 'imcodes-remote-desktop-worker.exe',
+      moduleOffset: 4242,
+    })}\n`);
+    await new Promise<void>((resolve) => setTimeout(resolve, 10));
+    expect(crashes).toEqual([expect.objectContaining({
+      exceptionCode: 0xc0000005,
+      module: 'imcodes-remote-desktop-worker.exe',
+      moduleOffset: 4242,
+      pid: 44,
+    })]);
+    // The crash frame is diagnostic only: it never reaches the Server path.
+    expect(received).toHaveLength(0);
   });
 
   it('launches a content-free release-only recovery after an active worker crashes', async () => {

@@ -5,6 +5,8 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
+#include <cstring>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -140,6 +142,92 @@ bool IsLocalSystemProcess() {
 class SilentAudioDeviceModule
     : public webrtc::webrtc_impl::AudioDeviceModuleDefault<
           webrtc::AudioDeviceModule> {};
+
+// Crash reporting. A structured exception inside libwebrtc or a platform
+// subsystem would otherwise close the pipe and look exactly like an ordinary
+// disconnect, which is how one Core Audio teardown fault stayed invisible for
+// a full release. The filter allocates nothing, holds no lock the faulting
+// thread may already own, writes one bounded frame that carries no session,
+// capability, media or input data, and always terminates within a bounded
+// wait so a wedged pipe can never keep a dead worker alive.
+std::atomic<HANDLE> g_crash_pipe{nullptr};
+char g_crash_nonce[64] = {};
+char g_crash_line[512] = {};
+
+DWORD WINAPI WriteCrashLine(LPVOID) {
+  HANDLE pipe = g_crash_pipe.load();
+  if (!pipe || pipe == INVALID_HANDLE_VALUE) return 0;
+  DWORD written = 0;
+  WriteFile(pipe, g_crash_line, static_cast<DWORD>(strlen(g_crash_line)),
+            &written, nullptr);
+  return 0;
+}
+
+void CrashModuleForAddress(const void* address,
+                           char (&name)[64],
+                           unsigned long long* offset) {
+  lstrcpynA(name, "unknown", static_cast<int>(sizeof(name)));
+  *offset = 0;
+  HMODULE module = nullptr;
+  if (!address ||
+      !GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                              GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                          static_cast<LPCWSTR>(address), &module) ||
+      !module) {
+    return;
+  }
+  *offset = static_cast<unsigned long long>(
+      reinterpret_cast<uintptr_t>(address) -
+      reinterpret_cast<uintptr_t>(module));
+  wchar_t path[MAX_PATH] = {};
+  const DWORD length = GetModuleFileNameW(module, path, MAX_PATH);
+  if (length == 0 || length >= MAX_PATH) return;
+  const wchar_t* base = path;
+  for (const wchar_t* cursor = path; *cursor; ++cursor) {
+    if (*cursor == L'\\' || *cursor == L'/') base = cursor + 1;
+  }
+  size_t out = 0;
+  for (; base[out] && out + 1 < sizeof(name); ++out) {
+    const wchar_t value = base[out];
+    const bool safe = (value >= L'a' && value <= L'z') ||
+                      (value >= L'A' && value <= L'Z') ||
+                      (value >= L'0' && value <= L'9') || value == L'.' ||
+                      value == L'_' || value == L'-';
+    name[out] = safe ? static_cast<char>(value) : '_';
+  }
+  name[out] = '\0';
+  if (out == 0) lstrcpynA(name, "unknown", static_cast<int>(sizeof(name)));
+}
+
+LONG WINAPI ReportCrashToDaemon(EXCEPTION_POINTERS* pointers) {
+  if (pointers && pointers->ExceptionRecord &&
+      g_crash_pipe.load() != nullptr) {
+    char module[64] = {};
+    unsigned long long offset = 0;
+    CrashModuleForAddress(pointers->ExceptionRecord->ExceptionAddress, module,
+                          &offset);
+    snprintf(g_crash_line, sizeof(g_crash_line),
+             "\n{\"type\":\"%s\",\"ipcVersion\":%d,\"nonce\":\"%s\","
+             "\"pid\":%lu,\"exceptionCode\":%lu,\"module\":\"%s\","
+             "\"moduleOffset\":%llu}\n",
+             kWorkerCrashType, kIpcVersion, g_crash_nonce,
+             GetCurrentProcessId(),
+             static_cast<unsigned long>(
+                 pointers->ExceptionRecord->ExceptionCode),
+             module, offset);
+    // The pipe handle is synchronous, so a daemon that stopped reading could
+    // block this write forever. Bound it on a helper thread and terminate
+    // either way.
+    const HANDLE writer =
+        CreateThread(nullptr, 0, WriteCrashLine, nullptr, 0, nullptr);
+    if (writer) {
+      WaitForSingleObject(writer, 2000);
+      CloseHandle(writer);
+    }
+  }
+  TerminateProcess(GetCurrentProcess(), 20);
+  return EXCEPTION_EXECUTE_HANDLER;
+}
 
 class PipeWriter {
  public:
@@ -684,6 +772,10 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     return 6;
   }
   PipeWriter writer(pipe);
+  lstrcpynA(g_crash_nonce, arguments->nonce.c_str(),
+            static_cast<int>(sizeof(g_crash_nonce)));
+  g_crash_pipe.store(pipe);
+  SetUnhandledExceptionFilter(ReportCrashToDaemon);
   Json::Value hello(Json::objectValue);
   hello["type"] = kWorkerHelloType;
   hello["ipcVersion"] = kIpcVersion;
@@ -723,6 +815,13 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
   // once the audio endpoints are unavailable, taking the worker down with an
   // access violation at the sign-in desktop and across a logon transition.
   dependencies.adm = webrtc::make_ref_counted<SilentAudioDeviceModule>();
+  if (!dependencies.adm) {
+    CloseHandle(pipe);
+    webrtc::CleanupSSL();
+    MFShutdown();
+    CoUninitialize();
+    return 19;
+  }
   dependencies.audio_encoder_factory =
       webrtc::CreateBuiltinAudioEncoderFactory();
   dependencies.audio_decoder_factory =

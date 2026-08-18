@@ -13,6 +13,11 @@ export const REMOTE_DESKTOP_WORKER_MANIFEST_SUFFIX = '.manifest.json' as const;
 export const REMOTE_DESKTOP_VIRTUAL_DISPLAY_ARCHIVE_FILENAME = 'imcodes-virtual-display.zip' as const;
 export const REMOTE_DESKTOP_VIRTUAL_DISPLAY_MANIFEST_FILENAME = 'imcodes-virtual-display.manifest.json' as const;
 export const REMOTE_DESKTOP_WORKER_HELLO_TYPE = 'remote_desktop.worker_hello' as const;
+// Last words of a worker that hit a structured exception. The worker writes one
+// bounded frame from its unhandled-exception filter and then terminates, so a
+// native fault is diagnosable without a debugger and never looks like a plain
+// disconnect. It carries no session, capability, media, or input data.
+export const REMOTE_DESKTOP_WORKER_CRASH_TYPE = 'remote_desktop.worker_crash' as const;
 
 export interface RemoteDesktopWorkerManifest {
   manifestVersion: 2;
@@ -39,6 +44,19 @@ export interface RemoteDesktopWorkerManifest {
     ninja: string;
     depotTools: string;
   };
+}
+
+export interface RemoteDesktopWorkerCrash {
+  type: typeof REMOTE_DESKTOP_WORKER_CRASH_TYPE;
+  ipcVersion: typeof REMOTE_DESKTOP_WORKER_IPC_VERSION;
+  nonce: string;
+  pid: number;
+  /** Windows structured exception code, e.g. 0xC0000005 access violation. */
+  exceptionCode: number;
+  /** Base name of the module the faulting address belongs to. */
+  module: string;
+  /** Faulting address relative to that module's base. */
+  moduleOffset: number;
 }
 
 export interface RemoteDesktopWorkerHello {
@@ -71,6 +89,7 @@ export interface RemoteDesktopVirtualDisplayPackageManifest {
 const SHA256_RE = /^[a-f0-9]{64}$/;
 const NONCE_RE = /^[A-Za-z0-9_-]{43}$/;
 const VERSION_RE = /^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$/;
+const CRASH_MODULE_RE = /^[A-Za-z0-9._-]{1,64}$/;
 
 function exactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
   const wanted = new Set(keys);
@@ -165,6 +184,31 @@ export function upgradeLegacyRemoteDesktopWorkerManifest(
     ...value,
     protocolVersion: REMOTE_DESKTOP_PROTOCOL_VERSION,
   });
+}
+
+export function validateRemoteDesktopWorkerCrash(
+  value: unknown,
+  expectedNonce: string,
+): value is RemoteDesktopWorkerCrash {
+  return record(value)
+    && exactKeys(value, ['type', 'ipcVersion', 'nonce', 'pid', 'exceptionCode', 'module', 'moduleOffset'])
+    && value.type === REMOTE_DESKTOP_WORKER_CRASH_TYPE
+    && value.ipcVersion === REMOTE_DESKTOP_WORKER_IPC_VERSION
+    && typeof value.nonce === 'string'
+    && NONCE_RE.test(value.nonce)
+    && value.nonce === expectedNonce
+    && typeof value.pid === 'number'
+    && Number.isSafeInteger(value.pid)
+    && value.pid > 0
+    && typeof value.exceptionCode === 'number'
+    && Number.isSafeInteger(value.exceptionCode)
+    && value.exceptionCode >= 0
+    && value.exceptionCode <= 0xffff_ffff
+    && typeof value.module === 'string'
+    && CRASH_MODULE_RE.test(value.module)
+    && typeof value.moduleOffset === 'number'
+    && Number.isSafeInteger(value.moduleOffset)
+    && value.moduleOffset >= 0;
 }
 
 export function validateRemoteDesktopWorkerHello(
