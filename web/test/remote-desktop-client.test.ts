@@ -741,6 +741,69 @@ describe('RemoteDesktopClient', () => {
     client.stop();
   });
 
+  it('offers unlock only when the node says it can answer its own sign-in screen', async () => {
+    let socket!: FakeSocket;
+    let peer!: FakePeer;
+    const client = new RemoteDesktopClient('controlled-win', { onSnapshot: vi.fn() }, {
+      fetchTicket: async () => 'ticket-unlock',
+      createSocket: () => {
+        socket = new FakeSocket();
+        queueMicrotask(() => socket.open());
+        return socket as unknown as WebSocket;
+      },
+      createPeer: () => {
+        peer = new FakePeer();
+        return peer as unknown as RTCPeerConnection;
+      },
+    });
+
+    await client.start();
+    const start = JSON.parse(socket.sent[0]!) as { requestId: string };
+    const authority = {
+      requestId: start.requestId,
+      sessionId: 'session_12345678',
+      capability: 'a'.repeat(43),
+    };
+    socket.receive({
+      type: REMOTE_DESKTOP_MSG.AUTHORIZED,
+      ...authority,
+      expiresAt: Date.now() + 60_000,
+      leaseExpiresAt: Date.now() + 15_000,
+      daemonGeneration: 7,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
+      inputEpoch: 1,
+      iceServers: ['stun:stun.example.test:3478'],
+    });
+    await vi.waitFor(() => expect(peer).toBeDefined());
+    const control = peer.channels.get(REMOTE_DESKTOP_CHANNEL.CONTROL)!;
+    control.open();
+
+    socket.receive({
+      type: REMOTE_DESKTOP_MSG.STATUS,
+      ...authority,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
+      inputEpoch: 1,
+      state: REMOTE_DESKTOP_STATE.DIRECT,
+      route: 'direct',
+      inputEnabled: false,
+      signInScreen: true,
+      unlockAvailable: true,
+    });
+    await vi.waitFor(() => expect(client.current().signInScreen).toBe(true));
+    expect(client.current().unlockAvailable).toBe(true);
+
+    // Without input authority the request is refused here and explained,
+    // rather than sent and silently dropped by the node.
+    const sentBefore = control.sent.length;
+    expect(client.requestUnlock()).toBe(false);
+    expect(control.sent).toHaveLength(sentBefore);
+    expect(client.current().controlRejection).toMatchObject({
+      kind: REMOTE_DESKTOP_CONTROL_KIND.UNLOCK,
+      reason: REMOTE_DESKTOP_CONTROL_REJECTION.NOT_PERMITTED,
+    });
+    client.stop();
+  });
+
   it('marks retry starts with a bounded reconnect attempt', async () => {
     let socket!: FakeSocket;
     const client = new RemoteDesktopClient('controlled-win', { onSnapshot: vi.fn() }, {

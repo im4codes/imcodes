@@ -3076,7 +3076,11 @@
       "mode_unsupported": "The node refused: the graphics driver does not offer that resolution. A GPU with no monitor attached usually offers only one — use the IM.codes virtual display to pick freely.",
       "mode_change_failed": "The node refused: Windows would not apply that resolution.",
       "scale_change_failed": "The node refused: Windows would not apply that scale.",
-      "capture_failed": "The node refused: capture could not be moved to that display."
-    }
+      "capture_failed": "The node refused: capture could not be moved to that display.",
+      "unlock_unavailable": "The node refused: it has no stored sign-in secret, or there is nothing to unlock right now."
+    },
+    "unlock": "Unlock",
+    "unlock_hint": "Ask this node to answer its sign-in screen with the secret it stores.",
+    "unlock_unconfigured": "No sign-in secret is stored on this node."
   }
 }

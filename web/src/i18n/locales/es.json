@@ -3076,7 +3076,11 @@
       "mode_unsupported": "El nodo lo rechazó: el controlador gráfico no ofrece esa resolución. Una GPU sin monitor conectado suele ofrecer solo una: usa la pantalla virtual de IM.codes para elegir libremente.",
       "mode_change_failed": "El nodo lo rechazó: Windows no aplicó esa resolución.",
       "scale_change_failed": "El nodo lo rechazó: Windows no aplicó esa escala.",
-      "capture_failed": "El nodo lo rechazó: no se pudo mover la captura a esa pantalla."
-    }
+      "capture_failed": "El nodo lo rechazó: no se pudo mover la captura a esa pantalla.",
+      "unlock_unavailable": "El nodo lo rechazó: no guarda ninguna clave de inicio de sesión, o no hay nada que desbloquear ahora mismo."
+    },
+    "unlock": "Desbloquear",
+    "unlock_hint": "Pide a este nodo que responda a su pantalla de inicio de sesión con la clave que guarda.",
+    "unlock_unconfigured": "Este nodo no guarda ninguna clave de inicio de sesión."
   }
 }

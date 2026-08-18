@@ -85,12 +85,33 @@ bool ShouldRebindCapture(const std::wstring& input_desktop,
   return !input_desktop.empty() && input_desktop != bound;
 }
 
-bool ShouldAttemptAutoUnlock(bool secret_configured,
-                             bool controller_present,
-                             bool on_sign_in_desktop,
-                             int attempts_this_lock) {
-  return secret_configured && controller_present && on_sign_in_desktop &&
-         attempts_this_lock < kAutoUnlockAttemptsPerLock;
+AutoUnlockStep SelectAutoUnlockStep(bool secret_configured,
+                                    bool controller_present,
+                                    bool input_ready,
+                                    bool session_locked,
+                                    bool on_sign_in_desktop,
+                                    int raise_attempts_this_lock,
+                                    int type_attempts_this_lock) {
+  if (!secret_configured || !controller_present || !input_ready ||
+      !session_locked) {
+    return AutoUnlockStep::kNone;
+  }
+  if (on_sign_in_desktop) {
+    return type_attempts_this_lock < kAutoUnlockAttemptsPerLock
+               ? AutoUnlockStep::kTypeSecret
+               : AutoUnlockStep::kNone;
+  }
+  return raise_attempts_this_lock < kAutoUnlockRaiseAttemptsPerLock
+             ? AutoUnlockStep::kRaiseCredentialUi
+             : AutoUnlockStep::kNone;
+}
+
+bool ShouldAcceptUnlockRequest(bool secret_configured,
+                               bool controller_present,
+                               bool input_ready,
+                               bool session_locked) {
+  return secret_configured && controller_present && input_ready &&
+         session_locked;
 }
 
 bool ClipboardAllowedOnDesktop(const std::wstring& desktop) {

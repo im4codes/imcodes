@@ -95,17 +95,54 @@ inline constexpr int kDesktopFollowSettleSamples = 2;
 bool ShouldRebindCapture(const std::wstring& input_desktop,
                          const std::wstring& bound);
 
-// Whether the stored sign-in secret may be typed right now. Auto unlock is a
-// convenience for a watching operator, never an unattended door: it requires a
-// controller on the session, the sign-in desktop actually in front of them, a
-// stored secret, and a bounded number of attempts per lock so a wrong password
-// can never loop the account into a lockout.
-bool ShouldAttemptAutoUnlock(bool secret_configured,
-                             bool controller_present,
-                             bool on_sign_in_desktop,
-                             int attempts_this_lock);
+/**
+ * What answering the sign-in screen needs next.
+ *
+ * A locked Windows session is not one screen but two. It rests on the lock
+ * curtain, which lives on the user's own desktop and has no password box at
+ * all; only a keystroke moves it to the credential box on the sign-in desktop.
+ * Measured on real hardware, a machine left alone returns to the curtain, so a
+ * session that connects to a locked box finds no password box to type into —
+ * which is exactly why typing was never attempted.
+ */
+enum class AutoUnlockStep {
+  kNone,
+  /** Wake the curtain so the credential box exists. */
+  kRaiseCredentialUi,
+  /** The credential box is up: type the stored secret. */
+  kTypeSecret,
+};
+
+/**
+ * Auto unlock is a convenience for a watching operator, never an unattended
+ * door: it requires a stored secret, a controller on the session, input that
+ * this worker can actually deliver, and a locked session in front of them.
+ * Both steps are bounded per lock, so a swallowed keystroke can be retried
+ * while a wrong password can never loop the account into a lockout.
+ */
+AutoUnlockStep SelectAutoUnlockStep(bool secret_configured,
+                                    bool controller_present,
+                                    bool input_ready,
+                                    bool session_locked,
+                                    bool on_sign_in_desktop,
+                                    int raise_attempts_this_lock,
+                                    int type_attempts_this_lock);
 
 inline constexpr int kAutoUnlockAttemptsPerLock = 1;
+// The curtain can swallow the first keystroke while it is still animating, and
+// waking it costs nothing but a space bar on a screen with no password box.
+inline constexpr int kAutoUnlockRaiseAttemptsPerLock = 3;
+
+/**
+ * Whether a controller's explicit unlock request may run. Unlike the automatic
+ * path it is not once-per-lock — the operator asked for it, and the sign-in UI
+ * is exactly the place where one attempt can silently do nothing — but it still
+ * requires a stored secret, control of the session, and a locked screen.
+ */
+bool ShouldAcceptUnlockRequest(bool secret_configured,
+                               bool controller_present,
+                               bool input_ready,
+                               bool session_locked);
 
 // The clipboard belongs to the signed-in user's own desktop and must never be
 // readable while the sign-in/lock desktop is up, whatever launched the worker.

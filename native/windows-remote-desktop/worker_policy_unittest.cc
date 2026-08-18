@@ -100,18 +100,45 @@ TEST(WorkerPolicyTest, RebindsCaptureWheneverItIsNotOnTheDisplayedDesktop) {
   EXPECT_FALSE(ShouldRebindCapture(L"", L"Default"));
 }
 
-TEST(WorkerPolicyTest, TypesTheStoredSecretOnlyForAWatchingController) {
-  EXPECT_TRUE(ShouldAttemptAutoUnlock(true, true, true, 0));
+TEST(WorkerPolicyTest, WakesTheLockCurtainBeforeItTypesAnything) {
+  // A locked machine rests on the curtain, which has no password box at all,
+  // so a session that connects to it finds nothing to type into. That is why
+  // typing alone never fired: the sign-in desktop is only reached after a key.
+  EXPECT_EQ(SelectAutoUnlockStep(true, true, true, true, false, 0, 0),
+            AutoUnlockStep::kRaiseCredentialUi);
+  EXPECT_EQ(SelectAutoUnlockStep(true, true, true, true, true, 1, 0),
+            AutoUnlockStep::kTypeSecret);
+  // Waking is bounded too: the curtain can swallow a keystroke, but not
+  // forever.
+  EXPECT_EQ(SelectAutoUnlockStep(true, true, true, true, false,
+                                 kAutoUnlockRaiseAttemptsPerLock, 0),
+            AutoUnlockStep::kNone);
+  // One typed attempt per lock: a wrong password must never loop an account
+  // into a lockout.
+  EXPECT_EQ(SelectAutoUnlockStep(true, true, true, true, true, 1,
+                                 kAutoUnlockAttemptsPerLock),
+            AutoUnlockStep::kNone);
   // Every guard is independently sufficient to refuse.
-  EXPECT_FALSE(ShouldAttemptAutoUnlock(false, true, true, 0));
-  EXPECT_FALSE(ShouldAttemptAutoUnlock(true, false, true, 0));
-  EXPECT_FALSE(ShouldAttemptAutoUnlock(true, true, false, 0));
-  // One attempt per lock: a wrong password must never loop an account into a
-  // lockout, and a viewer-only session must never trigger it at all.
-  EXPECT_FALSE(ShouldAttemptAutoUnlock(true, true, true,
-                                       kAutoUnlockAttemptsPerLock));
-  EXPECT_FALSE(ShouldAttemptAutoUnlock(true, true, true,
-                                       kAutoUnlockAttemptsPerLock + 5));
+  EXPECT_EQ(SelectAutoUnlockStep(false, true, true, true, true, 0, 0),
+            AutoUnlockStep::kNone);
+  EXPECT_EQ(SelectAutoUnlockStep(true, false, true, true, true, 0, 0),
+            AutoUnlockStep::kNone);
+  EXPECT_EQ(SelectAutoUnlockStep(true, true, false, true, true, 0, 0),
+            AutoUnlockStep::kNone);
+  // An unlocked session is never typed into, whatever desktop it reports.
+  EXPECT_EQ(SelectAutoUnlockStep(true, true, true, false, true, 0, 0),
+            AutoUnlockStep::kNone);
+}
+
+TEST(WorkerPolicyTest, LetsAControllerRetryTheUnlockItAskedFor) {
+  // Not once-per-lock: the operator asked, and the sign-in UI is exactly where
+  // a single attempt can silently do nothing.
+  EXPECT_TRUE(ShouldAcceptUnlockRequest(true, true, true, true));
+  EXPECT_FALSE(ShouldAcceptUnlockRequest(false, true, true, true));
+  EXPECT_FALSE(ShouldAcceptUnlockRequest(true, false, true, true));
+  EXPECT_FALSE(ShouldAcceptUnlockRequest(true, true, false, true));
+  // Nothing to unlock on a session that is not locked.
+  EXPECT_FALSE(ShouldAcceptUnlockRequest(true, true, true, false));
 }
 
 TEST(WorkerPolicyTest, KeepsTheClipboardOnTheSignedInDesktopOnly) {

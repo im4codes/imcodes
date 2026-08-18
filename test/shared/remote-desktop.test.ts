@@ -338,6 +338,44 @@ describe('remote desktop production contract', () => {
       .toEqual({ ok: false, error: REMOTE_DESKTOP_ERROR.INVALID_REQUEST });
   });
 
+  it('carries the sign-in screen and unlock availability on status, or neither', () => {
+    const status = {
+      type: REMOTE_DESKTOP_MSG.STATUS,
+      requestId,
+      sessionId,
+      capability,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
+      inputEpoch: 1,
+      state: REMOTE_DESKTOP_STATE.DIRECT,
+      inputEnabled: true,
+      signInScreen: true,
+      unlockAvailable: true,
+    };
+    expect(validateRemoteDesktopServerMessage(status)).toMatchObject({ ok: true });
+    // Both are optional: an older node reports neither and stays valid.
+    const { signInScreen: _signIn, unlockAvailable: _unlock, ...bare } = status;
+    expect(validateRemoteDesktopServerMessage(bare)).toMatchObject({ ok: true });
+    expect(validateRemoteDesktopServerMessage({ ...status, signInScreen: 'yes' }))
+      .toEqual({ ok: false, error: REMOTE_DESKTOP_ERROR.INVALID_REQUEST });
+    expect(validateRemoteDesktopServerMessage({ ...status, unlockAvailable: 1 }))
+      .toEqual({ ok: false, error: REMOTE_DESKTOP_ERROR.INVALID_REQUEST });
+  });
+
+  it('accepts an unlock request only as a bare control command', () => {
+    const unlock = {
+      type: REMOTE_DESKTOP_DATA_MSG.CONTROL,
+      ...inputBase,
+      sequence: 21,
+      kind: REMOTE_DESKTOP_CONTROL_KIND.UNLOCK,
+    };
+    expect(validateRemoteDesktopDataMessage(unlock)).toMatchObject({ ok: true });
+    // It names nothing: a secret, a display or a request id has no meaning here.
+    expect(validateRemoteDesktopDataMessage({ ...unlock, displayId: 'display-primary' }))
+      .toEqual({ ok: false, error: REMOTE_DESKTOP_ERROR.INVALID_REQUEST });
+    expect(validateRemoteDesktopDataMessage({ ...unlock, requestId: 'req_12345678' }))
+      .toEqual({ ok: false, error: REMOTE_DESKTOP_ERROR.INVALID_REQUEST });
+  });
+
   it('validates a control rejection and refuses unknown reasons or padding', () => {
     const rejection = {
       type: REMOTE_DESKTOP_DATA_MSG.CONTROL_REJECTED,

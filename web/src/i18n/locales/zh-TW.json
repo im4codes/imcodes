@@ -3076,7 +3076,11 @@
       "mode_unsupported": "節點拒絕：顯示卡驅動程式不提供該解析度。未接螢幕的顯示卡通常只有一種解析度，請使用 IM.codes 虛擬顯示器自由選擇。",
       "mode_change_failed": "節點拒絕：Windows 未能套用該解析度。",
       "scale_change_failed": "節點拒絕：Windows 未能套用該縮放比例。",
-      "capture_failed": "節點拒絕：無法將畫面擷取切換到該顯示器。"
-    }
+      "capture_failed": "節點拒絕：無法將畫面擷取切換到該顯示器。",
+      "unlock_unavailable": "節點拒絕：未儲存登入密碼，或目前沒有需要解鎖的畫面。"
+    },
+    "unlock": "解鎖",
+    "unlock_hint": "讓該節點用本機儲存的密碼應答自己的登入畫面。",
+    "unlock_unconfigured": "該節點未儲存登入密碼。"
   }
 }

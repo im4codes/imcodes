@@ -58,6 +58,10 @@ export interface RemoteDesktopSnapshot {
   error?: string;
   viewerCount?: number;
   controllerCount?: number;
+  /** The node is showing the Windows sign-in/lock screen. */
+  signInScreen?: boolean;
+  /** That node holds a stored secret it can be asked to type. */
+  unlockAvailable?: boolean;
   lastAcknowledgedInputSequence?: number;
   durationMs?: number;
   reconnectCount?: number;
@@ -446,6 +450,29 @@ export class RemoteDesktopClient {
     return sent;
   }
 
+  /**
+   * Ask the node to answer its own sign-in screen with the secret it stores.
+   * Auto unlock already tries this, but the sign-in UI can swallow a keystroke,
+   * so the operator keeps a way to say "try again" — and gets told when the
+   * node refuses instead of watching another click disappear.
+   */
+  requestUnlock(): boolean {
+    if (!this.snapshot.inputEnabled || !this.snapshot.unlockAvailable) {
+      this.publishControlRejection(
+        REMOTE_DESKTOP_CONTROL_KIND.UNLOCK,
+        this.snapshot.inputEnabled
+          ? REMOTE_DESKTOP_CONTROL_REJECTION.UNLOCK_UNAVAILABLE
+          : REMOTE_DESKTOP_CONTROL_REJECTION.NOT_PERMITTED,
+      );
+      return false;
+    }
+    return this.sendControl({
+      type: REMOTE_DESKTOP_DATA_MSG.CONTROL,
+      ...this.inputBase(),
+      kind: REMOTE_DESKTOP_CONTROL_KIND.UNLOCK,
+    });
+  }
+
   requestRemoteClipboard(): Promise<string | null> {
     if (!this.canSendInput()) return Promise.resolve(null);
     const requestId = randomRequestId();
@@ -746,6 +773,8 @@ export class RemoteDesktopClient {
           && message.mode === REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
         viewerCount: message.viewerCount,
         controllerCount: message.controllerCount,
+        signInScreen: message.signInScreen === true,
+        unlockAvailable: message.unlockAvailable === true,
       });
       if (message.state === REMOTE_DESKTOP_STATE.DIRECT || message.state === REMOTE_DESKTOP_STATE.RELAYED) {
         this.clearStartTimer();

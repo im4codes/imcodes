@@ -3076,7 +3076,11 @@
       "mode_unsupported": "节点拒绝：显卡驱动不提供该分辨率。未接显示器的显卡通常只有一种分辨率，请使用 IM.codes 虚拟显示器自由选择。",
       "mode_change_failed": "节点拒绝：Windows 未能应用该分辨率。",
       "scale_change_failed": "节点拒绝：Windows 未能应用该缩放比例。",
-      "capture_failed": "节点拒绝：无法将画面采集切换到该显示器。"
-    }
+      "capture_failed": "节点拒绝：无法将画面采集切换到该显示器。",
+      "unlock_unavailable": "节点拒绝：未保存登录口令，或当前没有需要解锁的界面。"
+    },
+    "unlock": "解锁",
+    "unlock_hint": "让该节点用本机保存的口令应答自己的登录界面。",
+    "unlock_unconfigured": "该节点未保存登录口令。"
   }
 }

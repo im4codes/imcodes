@@ -1472,6 +1472,17 @@ export function RemoteDesktopPanel({
               onClick={openMobileKeyboard}
             ><span aria-hidden="true">⌨</span></button>
           </div>
+          {snapshot.signInScreen && (
+            <button
+              type="button"
+              class="remote-desktop-unlock-trigger"
+              disabled={!snapshot.inputEnabled || !snapshot.unlockAvailable}
+              title={snapshot.unlockAvailable
+                ? t('remote_desktop.unlock_hint')
+                : t('remote_desktop.unlock_unconfigured')}
+              onClick={() => { clientRef.current?.requestUnlock(); }}
+            >{t('remote_desktop.unlock')}</button>
+          )}
           <button
             type="button"
             class="remote-desktop-files-trigger"

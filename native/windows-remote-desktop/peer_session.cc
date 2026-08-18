@@ -195,13 +195,14 @@ std::shared_ptr<PeerSession> PeerSession::Create(
     InputArbiter* input,
     ClipboardSequence clipboard_sequence,
     ReadClipboardText read_clipboard_text,
+    RequestUnlock request_unlock,
     webrtc::Thread* signaling_thread,
     EmitJson emit) {
   return std::shared_ptr<PeerSession>(new PeerSession(
       std::move(authority), std::move(factory), std::move(displays),
       std::move(acquire_source), std::move(release_source), input,
       std::move(clipboard_sequence), std::move(read_clipboard_text),
-      signaling_thread,
+      std::move(request_unlock), signaling_thread,
       std::move(emit)));
 }
 
@@ -214,6 +215,7 @@ PeerSession::PeerSession(
     InputArbiter* input,
     ClipboardSequence clipboard_sequence,
     ReadClipboardText read_clipboard_text,
+    RequestUnlock request_unlock,
     webrtc::Thread* signaling_thread,
     EmitJson emit)
     : authority_(std::move(authority)),
@@ -224,6 +226,7 @@ PeerSession::PeerSession(
       input_(input),
       clipboard_sequence_(std::move(clipboard_sequence)),
       read_clipboard_text_(std::move(read_clipboard_text)),
+      request_unlock_(std::move(request_unlock)),
       signaling_thread_(signaling_thread),
       emit_(std::move(emit)) {
   const auto primary = std::find_if(displays_.begin(), displays_.end(),
@@ -931,7 +934,8 @@ void PeerSession::HandleControl(const std::string& channel,
   const std::string kind = root["kind"].asString();
   uint64_t sequence = 0;
   const bool require_control = kind == "set_display_mode" ||
-      kind == "set_display_scale" || kind == "copy_selection";
+      kind == "set_display_scale" || kind == "copy_selection" ||
+      kind == "unlock";
   // A command that needs control but arrives without it is the one refusal the
   // controller cannot see any other way: the picture keeps updating and the
   // click simply vanishes. Answer it, but only for this session's own frames.
@@ -1012,6 +1016,25 @@ void PeerSession::HandleControl(const std::string& channel,
       return;
     }
     if (!SetDisplayScale(display_id, root["dpiScalePercent"].asInt())) return;
+  } else if (kind == "unlock") {
+    if (root.isMember("displayId") || root.isMember("width") ||
+        root.isMember("height") || root.isMember("dpiScalePercent") ||
+        root.isMember("requestId") || root.isMember("frameWidth") ||
+        root.isMember("frameHeight") ||
+        root.isMember("acknowledgedSequence")) {
+      return;
+    }
+    // Bounded like every other privileged action, and answered either way: a
+    // silent unlock button is exactly the "nothing happened" this session
+    // already suffered from once.
+    if (!ConsumeRate("unlock", 10, std::chrono::minutes(1))) {
+      SendControlRejected(kind.c_str(), kRejectRateLimited);
+      return;
+    }
+    if (!request_unlock_ || !request_unlock_()) {
+      SendControlRejected(kind.c_str(), kRejectUnlockUnavailable);
+      return;
+    }
   } else if (kind == "copy_selection") {
     if (!root["requestId"].isString() ||
         !IsSafeId(root["requestId"].asString()) ||
@@ -1251,7 +1274,20 @@ void PeerSession::SendStatus(const char* state, bool input_enabled) {
     root["layoutRevision"] = layout_revision_;
   }
   root["inputEnabled"] = input_enabled;
+  if (sign_in_screen_) root["signInScreen"] = true;
+  if (unlock_available_) root["unlockAvailable"] = true;
   emit_(root);
+}
+
+void PeerSession::SetSignInState(bool sign_in_screen, bool unlock_available) {
+  if (closed_ ||
+      (sign_in_screen == sign_in_screen_ &&
+       unlock_available == unlock_available_)) {
+    return;
+  }
+  sign_in_screen_ = sign_in_screen;
+  unlock_available_ = unlock_available;
+  SendStatus(relayed_ ? "relayed" : "direct", InputReady());
 }
 
 bool PeerSession::SendControlRejected(const char* kind,

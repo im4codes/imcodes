@@ -157,6 +157,10 @@ export const REMOTE_DESKTOP_CONTROL_KIND = {
   SET_DISPLAY_MODE: 'set_display_mode',
   SET_DISPLAY_SCALE: 'set_display_scale',
   COPY_SELECTION: 'copy_selection',
+  // Ask the node to answer the sign-in screen with its stored secret now.
+  // Auto unlock does this on its own, but the sign-in UI can swallow a
+  // keystroke, so a watching controller keeps a way to say "try again".
+  UNLOCK: 'unlock',
   KEEPALIVE: 'keepalive',
   INPUT_ACK: 'input_ack',
 } as const;
@@ -185,6 +189,8 @@ export const REMOTE_DESKTOP_CONTROL_REJECTION = {
   SCALE_CHANGE_FAILED: 'scale_change_failed',
   /** The display exists but capture could not be moved to it. */
   CAPTURE_FAILED: 'capture_failed',
+  /** No stored sign-in secret, or nothing to unlock right now. */
+  UNLOCK_UNAVAILABLE: 'unlock_unavailable',
 } as const;
 
 export type RemoteDesktopControlRejection = typeof REMOTE_DESKTOP_CONTROL_REJECTION[
@@ -429,6 +435,14 @@ export interface RemoteDesktopStatus {
   inputEnabled: boolean;
   viewerCount?: number;
   controllerCount?: number;
+  /**
+   * The node is showing the Windows sign-in/lock screen rather than a signed-in
+   * desktop. The picture keeps streaming either way; this is what lets the
+   * viewer be told what it is looking at, and what gates the unlock control.
+   */
+  signInScreen?: boolean;
+  /** The node holds a stored sign-in secret it can be asked to type. */
+  unlockAvailable?: boolean;
 }
 
 export interface RemoteDesktopTerminal {
@@ -795,7 +809,9 @@ export function validateRemoteDesktopDaemonMessage(value: unknown): RemoteDeskto
       : invalid();
   }
   if (value.type === REMOTE_DESKTOP_MSG.STATUS) {
-    if (!hasExactKeys(value, ['type', 'requestId', 'sessionId', 'capability', 'mode', 'inputEpoch', 'state', 'inputEnabled'], ['route', 'selectedDisplayId', 'layoutRevision', 'viewerCount', 'controllerCount'])
+    if (!hasExactKeys(value, ['type', 'requestId', 'sessionId', 'capability', 'mode', 'inputEpoch', 'state', 'inputEnabled'], ['route', 'selectedDisplayId', 'layoutRevision', 'viewerCount', 'controllerCount', 'signInScreen', 'unlockAvailable'])
+      || (value.signInScreen !== undefined && typeof value.signInScreen !== 'boolean')
+      || (value.unlockAvailable !== undefined && typeof value.unlockAvailable !== 'boolean')
       || !hasSessionCorrelation(value)
       || typeof value.mode !== 'string' || !ACCESS_MODES.has(value.mode)
       || !isSafeNonNegative(value.inputEpoch)
@@ -998,6 +1014,12 @@ function validateControl(value: Record<string, unknown>): boolean {
       && value.height === undefined && value.dpiScalePercent === undefined
       && value.frameWidth === undefined && value.frameHeight === undefined
       && value.acknowledgedSequence === undefined;
+  }
+  if (value.kind === REMOTE_DESKTOP_CONTROL_KIND.UNLOCK) {
+    return value.displayId === undefined && value.width === undefined
+      && value.height === undefined && value.dpiScalePercent === undefined
+      && value.requestId === undefined && value.frameWidth === undefined
+      && value.frameHeight === undefined && value.acknowledgedSequence === undefined;
   }
   if (value.kind === REMOTE_DESKTOP_CONTROL_KIND.FRAME_PRESENTED) {
     return isBoundedString(value.displayId, REMOTE_DESKTOP_LIMITS.DISPLAY_ID_BYTES)

@@ -1,5 +1,6 @@
 #include <windows.h>
 #include <shellapi.h>
+#include <wtsapi32.h>
 
 #include <algorithm>
 #include <atomic>
@@ -111,6 +112,30 @@ bool ConstantTimeEqual(const std::string& left, const std::string& right) {
   return difference == 0;
 }
 
+/**
+ * Whether this session is locked, asked of Windows rather than guessed from the
+ * desktop name: a locked machine rests on the lock curtain, which lives on the
+ * user's own desktop and is indistinguishable from a signed-in screen by name
+ * alone.
+ */
+bool CurrentSessionIsLocked() {
+  WTSINFOEXW* info = nullptr;
+  DWORD bytes = 0;
+  if (!WTSQuerySessionInformationW(WTS_CURRENT_SERVER_HANDLE,
+                                   WTS_CURRENT_SESSION, WTSSessionInfoEx,
+                                   reinterpret_cast<LPWSTR*>(&info), &bytes) ||
+      !info) {
+    return false;
+  }
+  bool locked = false;
+  if (info->Level == 1) {
+    locked = (info->Data.WTSInfoExLevel1.SessionFlags &
+              WTS_SESSIONSTATE_LOCK) != 0;
+  }
+  WTSFreeMemory(info);
+  return locked;
+}
+
 std::wstring CurrentInputDesktopName() {
   HDESK desktop = OpenInputDesktop(0, FALSE, GENERIC_ALL);
   if (!desktop) return {};
@@ -147,6 +172,9 @@ class SilentAudioDeviceModule
 // Owner id for input the node types on its own behalf. It is separate from any
 // session so a viewer disconnecting cannot release, replay, or inherit it.
 constexpr char kAutoUnlockOwner[] = "imcodes-auto-unlock";
+// The desktop Windows puts the credential box on. The lock curtain is not here
+// — it lives on the user's own desktop until a keystroke arrives.
+constexpr wchar_t kSignInDesktop[] = L"Winlogon";
 
 // Crash reporting. A structured exception inside libwebrtc or a platform
 // subsystem would otherwise close the pipe and look exactly like an ordinary
@@ -422,6 +450,8 @@ class WorkerRuntime {
         // there, because a rebind Windows refused mid-switch would otherwise
         // never be retried.
         ReconcileCaptureDesktopOnSignaling(input_desktop);
+        UpdateSignInStateOnSignaling(input_desktop);
+        MaybeAutoUnlockOnSignaling(input_desktop);
         if (follow == DesktopFollowAction::kFollow && settled) {
           FollowDesktopsOnSignaling();
         } else if (follow == DesktopFollowAction::kUnavailable) {
@@ -571,6 +601,7 @@ class WorkerRuntime {
                        ? indicator_->ReadClipboardText(previous_sequence)
                        : std::optional<std::u16string>();
           },
+          [this] { return RequestUnlockOnSignaling(); },
           signaling_thread_,
           [this](const Json::Value& value) { writer_->Emit(value); });
       if (!session->Initialize()) {
@@ -703,13 +734,6 @@ class WorkerRuntime {
       UpdateIndicatorOnSignaling();
       g_input_desktop_ready.store(indicator_->BoundDesktop() == input_desktop);
     }
-    // A sign-in desktop with a controller watching is the only moment the
-    // stored secret may be used, and only once per lock.
-    if (input_desktop == L"Winlogon") {
-      MaybeAutoUnlockOnSignaling();
-    } else {
-      auto_unlock_attempts_ = 0;
-    }
     ReconcileCaptureDesktopOnSignaling(input_desktop);
   }
 
@@ -729,38 +753,98 @@ class WorkerRuntime {
     }
   }
 
-  // Type the stored sign-in secret once, while an authorized controller is
-  // watching the sign-in desktop. The secret is decrypted for the length of
-  // this call and wiped immediately; it is never logged, echoed, or sent
-  // anywhere. A wrong password is not retried, so this can never walk an
-  // account into a lockout.
-  void MaybeAutoUnlockOnSignaling() {
-    const bool controller_present = std::any_of(
-        sessions_.begin(), sessions_.end(), [](const auto& entry) {
-          return !entry.second->closed() && entry.second->controlling();
-        });
-    if (!ShouldAttemptAutoUnlock(UnlockSecret::Configured(), controller_present,
-                                 g_input_desktop_ready.load(),
-                                 auto_unlock_attempts_)) {
+  /**
+   * Track the lock state and tell every session what it is looking at, so a
+   * viewer sees "sign-in screen" and gets the unlock control instead of
+   * wondering why the desktop it expected is a password box.
+   */
+  void UpdateSignInStateOnSignaling(const std::wstring& input_desktop) {
+    const bool locked = CurrentSessionIsLocked();
+    if (!locked && session_locked_) {
+      // Unlocked: both budgets belong to the lock that just ended.
+      auto_unlock_attempts_ = 0;
+      auto_unlock_raise_attempts_ = 0;
+    }
+    session_locked_ = locked;
+    const bool sign_in_screen = locked || input_desktop == kSignInDesktop;
+    const bool unlock_available = sign_in_screen && UnlockSecret::Configured();
+    for (const auto& [id, session] : sessions_) {
+      session->SetSignInState(sign_in_screen, unlock_available);
+    }
+  }
+
+  bool ControllerPresentOnSignaling() const {
+    return std::any_of(sessions_.begin(), sessions_.end(),
+                       [](const auto& entry) {
+                         return !entry.second->closed() &&
+                                entry.second->controlling();
+                       });
+  }
+
+  // Answer the sign-in screen on behalf of a watching controller. Evaluated on
+  // every tick, not only when the desktop changes: a session that connects to
+  // an already-locked machine never sees a transition, and the machine rests on
+  // the lock curtain — a screen with no password box — so the credential UI has
+  // to be woken before there is anywhere to type.
+  void MaybeAutoUnlockOnSignaling(const std::wstring& input_desktop) {
+    const AutoUnlockStep step = SelectAutoUnlockStep(
+        UnlockSecret::Configured(), ControllerPresentOnSignaling(),
+        g_input_desktop_ready.load(), session_locked_,
+        input_desktop == kSignInDesktop, auto_unlock_raise_attempts_,
+        auto_unlock_attempts_);
+    if (step == AutoUnlockStep::kRaiseCredentialUi) {
+      ++auto_unlock_raise_attempts_;
+      RaiseCredentialUiOnSignaling();
       return;
     }
+    if (step != AutoUnlockStep::kTypeSecret) return;
     ++auto_unlock_attempts_;
+    TypeStoredSecretOnSignaling();
+  }
+
+  /**
+   * Run the controller's explicit unlock request. Unlike the automatic path it
+   * is not once-per-lock: the operator asked for it, and the sign-in UI is
+   * exactly the place where one attempt can silently do nothing. It still needs
+   * a stored secret, control of this session and a locked screen, and it types
+   * only when the credential box is actually up.
+   */
+  bool RequestUnlockOnSignaling() {
+    if (!ShouldAcceptUnlockRequest(UnlockSecret::Configured(),
+                                   ControllerPresentOnSignaling(),
+                                   g_input_desktop_ready.load(),
+                                   session_locked_)) {
+      return false;
+    }
+    if (CurrentInputDesktopName() != kSignInDesktop) {
+      // No password box yet: wake the curtain and let the next tick type.
+      RaiseCredentialUiOnSignaling();
+      return true;
+    }
+    return TypeStoredSecretOnSignaling();
+  }
+
+  void RaiseCredentialUiOnSignaling() {
+    input_.KeyDown(kAutoUnlockOwner, "Space", false);
+    input_.KeyUp(kAutoUnlockOwner, "Space");
+  }
+
+  // The secret is decrypted for the length of this call and wiped immediately;
+  // it is never logged, echoed, or sent anywhere.
+  bool TypeStoredSecretOnSignaling() {
     std::wstring secret;
-    if (!UnlockSecret::Load(&secret)) return;
+    if (!UnlockSecret::Load(&secret)) return false;
     std::u16string typed(secret.begin(), secret.end());
     SecureZeroMemory(secret.data(), secret.size() * sizeof(wchar_t));
     secret.clear();
-    // Raise the credential UI first: on a lock curtain the password box does
-    // not exist until a key arrives.
-    input_.KeyDown(kAutoUnlockOwner, "Space", false);
-    input_.KeyUp(kAutoUnlockOwner, "Space");
     const bool typed_ok = input_.Text(typed);
     SecureZeroMemory(typed.data(), typed.size() * sizeof(char16_t));
     typed.clear();
-    if (!typed_ok) return;
+    if (!typed_ok) return false;
     input_.KeyDown(kAutoUnlockOwner, "Enter", false);
     input_.KeyUp(kAutoUnlockOwner, "Enter");
     writer_->Emit(AutoUnlockAttemptEnvelope());
+    return true;
   }
 
   Json::Value AutoUnlockAttemptEnvelope() const {
@@ -820,6 +904,8 @@ class WorkerRuntime {
   int protected_desktop_checks_ = 0;
   int desktop_follow_failures_ = 0;
   std::wstring desktop_follow_candidate_;
+  bool session_locked_ = false;
+  int auto_unlock_raise_attempts_ = 0;
   int auto_unlock_attempts_ = 0;
   int compositor_scan_ticks_ = 0;
   int topology_scan_ticks_ = 0;

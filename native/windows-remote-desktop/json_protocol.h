@@ -65,6 +65,7 @@ inline constexpr char kRejectModeUnsupported[] = "mode_unsupported";
 inline constexpr char kRejectModeChangeFailed[] = "mode_change_failed";
 inline constexpr char kRejectScaleChangeFailed[] = "scale_change_failed";
 inline constexpr char kRejectCaptureFailed[] = "capture_failed";
+inline constexpr char kRejectUnlockUnavailable[] = "unlock_unavailable";
 
 inline constexpr char kControlChannel[] = "imcodes-rd-control";
 inline constexpr char kKeyboardChannel[] = "imcodes-rd-keyboard";

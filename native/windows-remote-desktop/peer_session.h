@@ -27,6 +27,10 @@ using EmitJson = std::function<void(const Json::Value&)>;
 using AcquireSource = std::function<webrtc::scoped_refptr<DxgiDesktopSource>(
     const DisplayInfo&)>;
 using ReleaseSource = std::function<void(const DisplayInfo&)>;
+// Runs the node's stored-secret unlock on the worker's signaling thread and
+// reports whether it was attempted. The secret itself never crosses this
+// boundary — only the request and the outcome do.
+using RequestUnlock = std::function<bool()>;
 using ClipboardSequence = std::function<DWORD()>;
 using ReadClipboardText =
     std::function<std::optional<std::u16string>(DWORD)>;
@@ -56,6 +60,7 @@ class PeerSession final : public webrtc::PeerConnectionObserver,
       InputArbiter* input,
       ClipboardSequence clipboard_sequence,
       ReadClipboardText read_clipboard_text,
+      RequestUnlock request_unlock,
       webrtc::Thread* signaling_thread,
       EmitJson emit);
   ~PeerSession() override;
@@ -71,6 +76,13 @@ class PeerSession final : public webrtc::PeerConnectionObserver,
   void Close(const char* terminal_reason, bool emit_terminal = true);
   const Authority& authority() const { return authority_; }
   bool controlling() const;
+  /**
+   * Tell this session what the node is showing. A viewer that lands on a lock
+   * screen must be told so — the picture alone cannot say whether a password
+   * box is the desktop or a barrier — and the unlock control only exists while
+   * a stored secret can actually answer it.
+   */
+  void SetSignInState(bool sign_in_screen, bool unlock_available);
   bool protected_content_masked() const;
   bool closed() const { return closed_.load(); }
   void CheckMediaProgress();
@@ -109,6 +121,7 @@ class PeerSession final : public webrtc::PeerConnectionObserver,
               InputArbiter* input,
               ClipboardSequence clipboard_sequence,
               ReadClipboardText read_clipboard_text,
+              RequestUnlock request_unlock,
               webrtc::Thread* signaling_thread,
               EmitJson emit);
 
@@ -156,6 +169,9 @@ class PeerSession final : public webrtc::PeerConnectionObserver,
   InputArbiter* const input_;
   const ClipboardSequence clipboard_sequence_;
   const ReadClipboardText read_clipboard_text_;
+  const RequestUnlock request_unlock_;
+  bool sign_in_screen_ = false;
+  bool unlock_available_ = false;
   webrtc::Thread* const signaling_thread_;
   const EmitJson emit_;
   webrtc::scoped_refptr<webrtc::PeerConnectionInterface> peer_;

@@ -400,11 +400,11 @@ const contracts: Contract[] = [
       {
         // Typed only for a watching controller, once per lock.
         path: 'native/windows-remote-desktop/worker_policy.cc',
-        needle: 'ShouldAttemptAutoUnlock',
+        needle: 'type_attempts_this_lock < kAutoUnlockAttemptsPerLock',
       },
       {
         path: 'native/windows-remote-desktop/worker_main.cc',
-        needle: 'ShouldAttemptAutoUnlock(UnlockSecret::Configured()',
+        needle: 'SelectAutoUnlockStep(\n        UnlockSecret::Configured(), ControllerPresentOnSignaling(),',
       },
       {
         // The secret reaches the worker through stdin, never argv.
@@ -764,6 +764,47 @@ const contracts: Contract[] = [
     ],
   },
   {
+    // A locked machine rests on the lock curtain, which has no password box:
+    // typing without waking it first is what made auto unlock do nothing at
+    // all. The manual control exists because the sign-in UI can still swallow
+    // a keystroke, and it must answer the operator either way.
+    name: 'answering the sign-in screen wakes it, types once, and can be retried',
+    guards: [
+      {
+        path: 'native/windows-remote-desktop/worker_policy.cc',
+        needle: 'AutoUnlockStep SelectAutoUnlockStep(',
+      },
+      {
+        path: 'native/windows-remote-desktop/worker_policy.cc',
+        needle: 'AutoUnlockStep::kRaiseCredentialUi',
+      },
+      {
+        path: 'native/windows-remote-desktop/worker_main.cc',
+        needle: 'MaybeAutoUnlockOnSignaling(input_desktop)',
+      },
+      {
+        path: 'native/windows-remote-desktop/worker_main.cc',
+        needle: 'bool CurrentSessionIsLocked()',
+      },
+      {
+        path: 'native/windows-remote-desktop/worker_main.cc',
+        needle: 'session->SetSignInState(sign_in_screen, unlock_available)',
+      },
+      {
+        path: 'native/windows-remote-desktop/peer_session.cc',
+        needle: 'SendControlRejected(kind.c_str(), kRejectUnlockUnavailable)',
+      },
+      {
+        path: 'shared/remote-desktop.ts',
+        needle: "UNLOCK: 'unlock',",
+      },
+      {
+        path: 'web/src/components/RemoteDesktopPanel.tsx',
+        needle: 'clientRef.current?.requestUnlock()',
+      },
+    ],
+  },
+  {
     // Locking a session moves the input desktop more than once, and Windows can
     // refuse the move mid-flight. Capture must therefore be reconciled against
     // what each source reports it is reading, every tick — assuming a requested
@@ -882,7 +923,7 @@ const mutations: Mutation[] = [
     name: 'let the stored secret be typed without a watching controller',
     contract: 'auto unlock stays write-only and operator-gated',
     path: 'native/windows-remote-desktop/worker_main.cc',
-    needle: 'ShouldAttemptAutoUnlock(UnlockSecret::Configured()',
+    needle: 'SelectAutoUnlockStep(\n        UnlockSecret::Configured(), ControllerPresentOnSignaling(),',
   },
   {
     name: 'put the sign-in secret on the worker command line',
@@ -1165,6 +1206,18 @@ const mutations: Mutation[] = [
     contract: 'per-display fixed resolution switching',
     path: 'native/windows-remote-desktop/peer_session.cc',
     needle: 'return restore_current_status(kReject',
+  },
+  {
+    name: 'type the secret without waking the lock curtain',
+    contract: 'answering the sign-in screen wakes it, types once, and can be retried',
+    path: 'native/windows-remote-desktop/worker_policy.cc',
+    needle: 'AutoUnlockStep::kRaiseCredentialUi',
+  },
+  {
+    name: 'remove the manual unlock control',
+    contract: 'answering the sign-in screen wakes it, types once, and can be retried',
+    path: 'web/src/components/RemoteDesktopPanel.tsx',
+    needle: 'clientRef.current?.requestUnlock()',
   },
   {
     name: 'assume a requested capture rebind landed',
