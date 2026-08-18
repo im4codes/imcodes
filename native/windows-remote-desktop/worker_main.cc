@@ -572,9 +572,12 @@ class WorkerRuntime {
         sources_.size() >= kMaxGpuCaptureSurfaces) {
       return nullptr;
     }
-    auto source = DxgiDesktopSource::Create(
-        display, secure_console_ ? CaptureFallback::kSecureDesktopGdi
-                                 : CaptureFallback::kNone);
+    // Both desktops need the same rescue: DXGI enumerates the output and
+    // opens a duplication, then never presents a first frame on an idle,
+    // monitor-less machine. Without the fallback that surfaces as
+    // media_unavailable and no session can ever start on such a node.
+    auto source =
+        DxgiDesktopSource::Create(display, CaptureFallback::kDesktopGdi);
     if (!source) return nullptr;
     source->Start();
     sources_.emplace(key, SourceEntry{source, 1});

@@ -48,6 +48,21 @@ enum class WorkerDesktopAction {
 
 inline constexpr int kWorkerDesktopMismatchLimit = 3;
 
+// DXGI can hold a duplication open on an idle, monitor-less desktop and never
+// present a first frame (AcquireNextFrame returns DXGI_ERROR_WAIT_TIMEOUT
+// forever). Capture must not stall there: after this many consecutive waits
+// with nothing captured yet, the source switches to its GDI fallback. The
+// budget stays far below PeerSession's first-frame timeout so the switch still
+// happens inside session setup.
+inline constexpr int kFirstFrameWaitsBeforeGdiFallback = 5;
+
+// True when a source that has never produced a frame should switch to GDI.
+// `consecutive_waits` is advanced in place and reset once the switch is made.
+bool AdvanceGdiFallbackState(bool captured,
+                             bool gdi_fallback_allowed,
+                             bool any_frame_captured,
+                             int* consecutive_waits);
+
 // Keeps the ordinary active-user worker and the privileged Winlogon worker on
 // their own desktops. A secure-console worker must be replaced after unlock;
 // it must never carry authority or input ownership onto the user's desktop.

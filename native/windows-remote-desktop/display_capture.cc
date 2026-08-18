@@ -336,19 +336,20 @@ void DxgiDesktopSource::CaptureLoop() {
       std::lock_guard<std::mutex> lock(state_mutex_);
       bool captured = false;
       last_capture_waited_ = false;
-      if (secure_gdi_active_) {
-        captured = CaptureSecureDesktopGdi();
+      if (gdi_active_) {
+        captured = CaptureDesktopGdi();
       } else if (!duplication_ && !InitializeDuplication()) {
         captured = false;
       } else {
         captured = CaptureOne();
       }
-      if (!captured && captured_frames_.load() == 0 &&
-          fallback_ == CaptureFallback::kSecureDesktopGdi &&
-          ++first_frame_waits_ >= 5) {
-        secure_gdi_active_ = true;
+      if (AdvanceGdiFallbackState(captured,
+                                  fallback_ == CaptureFallback::kDesktopGdi,
+                                  captured_frames_.load() > 0,
+                                  &first_frame_waits_)) {
+        gdi_active_ = true;
         ResetDuplication();
-        captured = CaptureSecureDesktopGdi();
+        captured = CaptureDesktopGdi();
       }
       if (captured) {
         consecutive_failures_ = 0;
@@ -360,7 +361,7 @@ void DxgiDesktopSource::CaptureLoop() {
         ++dropped_frames_;
       }
       if (consecutive_failures_ >= 5) {
-        if (!secure_gdi_active_) ResetDuplication();
+        if (!gdi_active_) ResetDuplication();
         consecutive_failures_ = 0;
       }
     }
@@ -448,16 +449,16 @@ bool DxgiDesktopSource::CaptureOne() {
                             static_cast<int>(desc.Height));
 }
 
-bool DxgiDesktopSource::CaptureSecureDesktopGdi() {
-  ++secure_gdi_attempts_;
+bool DxgiDesktopSource::CaptureDesktopGdi() {
+  ++gdi_attempts_;
   if (display_.width <= 0 || display_.height <= 0 ||
       !EnsureCursorSurface(display_.width, display_.height)) {
-    secure_gdi_last_error_ = ERROR_INVALID_DATA;
+    gdi_last_error_ = ERROR_INVALID_DATA;
     return false;
   }
   const HDC screen = GetDC(nullptr);
   if (!screen) {
-    secure_gdi_last_error_ = GetLastError();
+    gdi_last_error_ = GetLastError();
     return false;
   }
   SetLastError(ERROR_SUCCESS);
@@ -467,15 +468,15 @@ bool DxgiDesktopSource::CaptureSecureDesktopGdi() {
       SRCCOPY | CAPTUREBLT);
   ReleaseDC(nullptr, screen);
   if (!copied) {
-    secure_gdi_last_error_ = GetLastError();
+    gdi_last_error_ = GetLastError();
     return false;
   }
   GdiFlush();
   if (!BroadcastBgraFrame(display_.width, display_.height)) {
-    secure_gdi_last_error_ = ERROR_INVALID_PIXEL_FORMAT;
+    gdi_last_error_ = ERROR_INVALID_PIXEL_FORMAT;
     return false;
   }
-  secure_gdi_last_error_ = ERROR_SUCCESS;
+  gdi_last_error_ = ERROR_SUCCESS;
   return true;
 }
 

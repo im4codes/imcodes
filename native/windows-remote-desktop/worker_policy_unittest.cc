@@ -63,6 +63,32 @@ TEST(WorkerPolicyTest, KeepsPrivilegedAndUserWorkersOnTheirOwnDesktop) {
             WorkerDesktopAction::kContinue);
 }
 
+TEST(WorkerPolicyTest, EngagesGdiOnlyAfterDxgiNeverPresentsAFirstFrame) {
+  int waits = 0;
+  for (int attempt = 1; attempt < kFirstFrameWaitsBeforeGdiFallback; ++attempt) {
+    EXPECT_FALSE(AdvanceGdiFallbackState(false, true, false, &waits));
+  }
+  EXPECT_TRUE(AdvanceGdiFallbackState(false, true, false, &waits));
+  EXPECT_EQ(waits, 0);
+
+  // A source that has already delivered a frame never falls back later, and a
+  // capture that succeeds clears the streak.
+  waits = 0;
+  for (int attempt = 0; attempt < kFirstFrameWaitsBeforeGdiFallback * 2; ++attempt) {
+    EXPECT_FALSE(AdvanceGdiFallbackState(false, true, true, &waits));
+  }
+  waits = kFirstFrameWaitsBeforeGdiFallback - 1;
+  EXPECT_FALSE(AdvanceGdiFallbackState(true, true, false, &waits));
+  EXPECT_EQ(waits, 0);
+
+  // Disallowed fallback and a missing counter both stay closed.
+  waits = 0;
+  for (int attempt = 0; attempt < kFirstFrameWaitsBeforeGdiFallback * 2; ++attempt) {
+    EXPECT_FALSE(AdvanceGdiFallbackState(false, false, false, &waits));
+  }
+  EXPECT_FALSE(AdvanceGdiFallbackState(false, true, false, nullptr));
+}
+
 TEST(WorkerPolicyTest, DisablesOnlyClipboardForSecureConsoleWorkers) {
   EXPECT_TRUE(WorkerInputDesktopAllowed(false, false));
   EXPECT_TRUE(WorkerInputDesktopAllowed(false, true));

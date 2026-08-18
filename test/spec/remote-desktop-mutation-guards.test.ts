@@ -374,12 +374,26 @@ const contracts: Contract[] = [
         needle: 'WorkerInputDesktopAllowed(',
       },
       {
+        path: 'native/windows-remote-desktop/display_capture.cc',
+        needle: 'CaptureDesktopGdi()',
+        minimum: 2,
+      },
+    ],
+  },
+  {
+    name: 'capture falls back to GDI when DXGI never presents',
+    guards: [
+      {
         path: 'native/windows-remote-desktop/worker_main.cc',
-        needle: 'CaptureFallback::kSecureDesktopGdi',
+        needle: 'CaptureFallback::kDesktopGdi',
       },
       {
         path: 'native/windows-remote-desktop/display_capture.cc',
-        needle: 'CaptureSecureDesktopGdi()',
+        needle: 'AdvanceGdiFallbackState(',
+      },
+      {
+        path: 'native/windows-remote-desktop/worker_policy.cc',
+        needle: 'kFirstFrameWaitsBeforeGdiFallback',
       },
     ],
   },
@@ -721,6 +735,18 @@ const contracts: Contract[] = [
 ];
 
 const mutations: Mutation[] = [
+  {
+    name: 'let a desktop that never presents stall capture',
+    contract: 'capture falls back to GDI when DXGI never presents',
+    path: 'native/windows-remote-desktop/worker_main.cc',
+    needle: 'CaptureFallback::kDesktopGdi',
+  },
+  {
+    name: 'drop the first-frame fallback decision',
+    contract: 'capture falls back to GDI when DXGI never presents',
+    path: 'native/windows-remote-desktop/display_capture.cc',
+    needle: 'AdvanceGdiFallbackState(',
+  },
   {
     name: 'let a native fault look like an ordinary disconnect',
     contract: 'native worker faults are reported, never silent',

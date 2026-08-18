@@ -48,6 +48,20 @@ WorkerDesktopAction AdvanceWorkerDesktopState(
                         : WorkerDesktopAction::kStopProtected;
 }
 
+bool AdvanceGdiFallbackState(bool captured,
+                             bool gdi_fallback_allowed,
+                             bool any_frame_captured,
+                             int* consecutive_waits) {
+  if (!consecutive_waits) return false;
+  if (captured || any_frame_captured || !gdi_fallback_allowed) {
+    if (captured) *consecutive_waits = 0;
+    return false;
+  }
+  if (++(*consecutive_waits) < kFirstFrameWaitsBeforeGdiFallback) return false;
+  *consecutive_waits = 0;
+  return true;
+}
+
 bool WorkerInputDesktopAllowed(bool secure_console,
                                bool expected_desktop_active) {
   return !secure_console || expected_desktop_active;
