@@ -188,7 +188,7 @@ const contracts: Contract[] = [
     guards: [
       {
         path: 'native/windows-remote-desktop/worker_main.cc',
-        needle: 'DxgiDesktopSource::Create(display)',
+        needle: 'DxgiDesktopSource::Create(',
       },
       {
         path: 'native/windows-remote-desktop/worker_main.cc',
@@ -331,6 +331,55 @@ const contracts: Contract[] = [
       {
         path: 'src/node/windows-user-session.ts',
         needle: 'activeCandidate == -2',
+      },
+    ],
+  },
+  {
+    name: 'pre-login and lock-screen secure console handoff',
+    guards: [
+      {
+        path: 'src/node/windows-user-session.ts',
+        needle: 'Process.GetProcessesByName("LogonUI")',
+      },
+      {
+        path: 'src/node/windows-user-session.ts',
+        needle: 'WindowsIdentity.GetCurrent().User.Value != "S-1-5-18"',
+      },
+      {
+        path: 'src/node/windows-user-session.ts',
+        needle: 'SetTokenInformation(primary, TokenSessionId, ref sid, sizeof(int))',
+      },
+      {
+        path: 'src/node/windows-user-session.ts',
+        needle: 'argsLine + " --secure-console"',
+      },
+      {
+        path: 'native/windows-remote-desktop/worker_main.cc',
+        needle: 'arguments->secure_console && !IsLocalSystemProcess()',
+      },
+      {
+        path: 'native/windows-remote-desktop/worker_main.cc',
+        needle: 'secure_console_ ? L"Winlogon" : L"Default"',
+      },
+      {
+        path: 'native/windows-remote-desktop/worker_main.cc',
+        needle: 'TerminateProcess(GetCurrentProcess(), 17)',
+      },
+      {
+        path: 'native/windows-remote-desktop/worker_main.cc',
+        needle: 'WorkerClipboardAllowed(secure_console_)',
+      },
+      {
+        path: 'native/windows-remote-desktop/worker_main.cc',
+        needle: 'WorkerInputDesktopAllowed(',
+      },
+      {
+        path: 'native/windows-remote-desktop/worker_main.cc',
+        needle: 'CaptureFallback::kSecureDesktopGdi',
+      },
+      {
+        path: 'native/windows-remote-desktop/display_capture.cc',
+        needle: 'CaptureSecureDesktopGdi()',
       },
     ],
   },
@@ -718,7 +767,7 @@ const mutations: Mutation[] = [
     name: 'remove DXGI source creation',
     contract: 'DXGI production capture wiring',
     path: 'native/windows-remote-desktop/worker_main.cc',
-    needle: 'DxgiDesktopSource::Create(display)',
+    needle: 'DxgiDesktopSource::Create(',
   },
   {
     name: 'remove first-frame admission wait',

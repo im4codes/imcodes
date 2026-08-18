@@ -87,6 +87,7 @@ if (rtc_include_tests) {
       "gdi32.lib",
       "shcore.lib",
       "user32.lib",
+      "wtsapi32.lib",
     ]
   }
 
@@ -146,7 +147,7 @@ if (rtc_include_tests) {
       "WIN32_LEAN_AND_MEAN",
     ]
     deps = [ "//test:test_support" ]
-    libs = [ "dxgi.lib" ]
+    libs = [ "dxgi.lib", "wtsapi32.lib" ]
   }
 
   rtc_test("mf_h264_encoder_unittests") {
@@ -183,6 +184,7 @@ if (rtc_include_tests) {
       "ole32.lib",
       "oleaut32.lib",
       "wmcodecdspuuid.lib",
+      "wtsapi32.lib",
     ]
   }
 }

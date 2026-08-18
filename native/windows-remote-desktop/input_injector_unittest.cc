@@ -1,12 +1,32 @@
 #include "third_party/imcodes_remote_desktop/input_injector.h"
 
 #include <algorithm>
+#include <cwchar>
+#include <iterator>
 #include <vector>
 
 #include "test/gtest.h"
 
 namespace imcodes::rd {
 namespace {
+
+bool SecureConsoleInputEnabled() {
+  wchar_t value[8] = {};
+  const DWORD length = GetEnvironmentVariableW(
+      L"IMCODES_RUN_SECURE_CONSOLE_INPUT", value, std::size(value));
+  return length > 0 && length < std::size(value) && value[0] == L'1';
+}
+
+std::wstring CurrentThreadDesktopName() {
+  wchar_t value[64] = {};
+  DWORD needed = 0;
+  const HDESK desktop = GetThreadDesktop(GetCurrentThreadId());
+  if (!desktop || !GetUserObjectInformationW(
+                      desktop, UOI_NAME, value, sizeof(value), &needed)) {
+    return {};
+  }
+  return value;
+}
 
 class RecordingInput {
  public:
@@ -161,6 +181,43 @@ TEST(InputArbiterTest, CopyShortcutAlwaysReleasesControlAndC) {
   EXPECT_EQ(dispatched[1].ki.dwFlags & KEYEVENTF_KEYUP, 0u);
   EXPECT_NE(dispatched[2].ki.dwFlags & KEYEVENTF_KEYUP, 0u);
   EXPECT_NE(dispatched[3].ki.dwFlags & KEYEVENTF_KEYUP, 0u);
+}
+
+TEST(InputArbiterTest, EncodesTextAsBoundedUnicodeInputPairs) {
+  RecordingInput recording;
+  InputArbiter input([&](UINT count, LPINPUT values, int size) {
+    return recording.Send(count, values, size);
+  });
+  EXPECT_TRUE(input.Text(u"A"));
+  ASSERT_EQ(recording.events.size(), 2u);
+  EXPECT_EQ(recording.events[0].ki.wScan, static_cast<WORD>(u'A'));
+  EXPECT_EQ(recording.events[0].ki.dwFlags, KEYEVENTF_UNICODE);
+  EXPECT_EQ(recording.events[1].ki.wScan, static_cast<WORD>(u'A'));
+  EXPECT_EQ(recording.events[1].ki.dwFlags,
+            KEYEVENTF_UNICODE | KEYEVENTF_KEYUP);
+}
+
+TEST(InputArbiterTest, SecureConsoleAcceptsNonTextInputWithoutChangingState) {
+  if (!SecureConsoleInputEnabled()) {
+    GTEST_SKIP() << "set IMCODES_RUN_SECURE_CONSOLE_INPUT=1 on Winlogon";
+  }
+  EXPECT_EQ(CurrentThreadDesktopName(), L"Winlogon");
+
+  POINT original{};
+  ASSERT_TRUE(GetCursorPos(&original));
+  DisplayInfo display;
+  display.desktop_rect.left = GetSystemMetrics(SM_XVIRTUALSCREEN);
+  display.desktop_rect.top = GetSystemMetrics(SM_YVIRTUALSCREEN);
+  display.width = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+  display.height = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+  ASSERT_GT(display.width, 1);
+  ASSERT_GT(display.height, 1);
+
+  InputArbiter input;
+  EXPECT_TRUE(input.KeyDown("secure-console-probe", "ShiftLeft", false));
+  EXPECT_TRUE(input.KeyUp("secure-console-probe", "ShiftLeft"));
+  EXPECT_TRUE(input.Move(display, 0.5, 0.5));
+  EXPECT_TRUE(SetCursorPos(original.x, original.y));
 }
 
 }  // namespace

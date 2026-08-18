@@ -40,6 +40,27 @@ enum class WorkerEnvironmentAction {
   kStopAndReinitialize,
 };
 
+enum class WorkerDesktopAction {
+  kContinue,
+  kStopProtected,
+  kTerminateSecureConsole,
+};
+
+inline constexpr int kWorkerDesktopMismatchLimit = 3;
+
+// Keeps the ordinary active-user worker and the privileged Winlogon worker on
+// their own desktops. A secure-console worker must be replaced after unlock;
+// it must never carry authority or input ownership onto the user's desktop.
+WorkerDesktopAction AdvanceWorkerDesktopState(bool secure_console,
+                                               bool expected_desktop_active,
+                                               int* consecutive_mismatches);
+// The ordinary worker still relies on its interactive indicator probe. The
+// privileged worker has an additional per-dispatch gate so no input can cross
+// the short Winlogon-to-Default teardown window after sign-in.
+bool WorkerInputDesktopAllowed(bool secure_console,
+                               bool expected_desktop_active);
+bool WorkerClipboardAllowed(bool secure_console);
+
 CaptureAcquireAction ClassifyCaptureAcquireResult(HRESULT result);
 WorkerEnvironmentAction SelectWorkerEnvironmentAction(uint32_t event_mask);
 bool AdvanceTopologyRefreshDebounce(bool refresh_requested,

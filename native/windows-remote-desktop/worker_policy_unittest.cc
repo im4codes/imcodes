@@ -37,6 +37,41 @@ TEST(WorkerPolicyTest, FailsClosedAcrossDisplaySessionAndPowerChanges) {
             WorkerEnvironmentAction::kStopProtected);
 }
 
+TEST(WorkerPolicyTest, KeepsPrivilegedAndUserWorkersOnTheirOwnDesktop) {
+  int mismatches = 0;
+  EXPECT_EQ(AdvanceWorkerDesktopState(true, false, &mismatches),
+            WorkerDesktopAction::kContinue);
+  EXPECT_EQ(mismatches, 1);
+  EXPECT_EQ(AdvanceWorkerDesktopState(true, false, &mismatches),
+            WorkerDesktopAction::kContinue);
+  EXPECT_EQ(AdvanceWorkerDesktopState(true, false, &mismatches),
+            WorkerDesktopAction::kTerminateSecureConsole);
+  EXPECT_EQ(mismatches, 0);
+
+  EXPECT_EQ(AdvanceWorkerDesktopState(false, false, &mismatches),
+            WorkerDesktopAction::kContinue);
+  EXPECT_EQ(AdvanceWorkerDesktopState(false, true, &mismatches),
+            WorkerDesktopAction::kContinue);
+  EXPECT_EQ(mismatches, 0);
+  for (int attempt = 1; attempt < kWorkerDesktopMismatchLimit; ++attempt) {
+    EXPECT_EQ(AdvanceWorkerDesktopState(false, false, &mismatches),
+              WorkerDesktopAction::kContinue);
+  }
+  EXPECT_EQ(AdvanceWorkerDesktopState(false, false, &mismatches),
+            WorkerDesktopAction::kStopProtected);
+  EXPECT_EQ(AdvanceWorkerDesktopState(false, false, nullptr),
+            WorkerDesktopAction::kContinue);
+}
+
+TEST(WorkerPolicyTest, DisablesOnlyClipboardForSecureConsoleWorkers) {
+  EXPECT_TRUE(WorkerInputDesktopAllowed(false, false));
+  EXPECT_TRUE(WorkerInputDesktopAllowed(false, true));
+  EXPECT_TRUE(WorkerInputDesktopAllowed(true, true));
+  EXPECT_FALSE(WorkerInputDesktopAllowed(true, false));
+  EXPECT_TRUE(WorkerClipboardAllowed(false));
+  EXPECT_FALSE(WorkerClipboardAllowed(true));
+}
+
 TEST(WorkerPolicyTest, DebouncesDisplayTopologyUntilItStabilizes) {
   int remaining = 0;
   EXPECT_FALSE(AdvanceTopologyRefreshDebounce(true, &remaining));

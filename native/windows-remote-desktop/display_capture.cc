@@ -234,12 +234,16 @@ bool SetDisplayDpiScale(const DisplayInfo& display, int percent) {
 }
 
 webrtc::scoped_refptr<DxgiDesktopSource> DxgiDesktopSource::Create(
-    const DisplayInfo& display) {
-  return webrtc::make_ref_counted<DxgiDesktopSource>(display);
+    const DisplayInfo& display,
+    CaptureFallback fallback) {
+  return webrtc::make_ref_counted<DxgiDesktopSource>(display, fallback);
 }
 
-DxgiDesktopSource::DxgiDesktopSource(DisplayInfo display)
-    : VideoTrackSource(/*remote=*/false), display_(std::move(display)) {}
+DxgiDesktopSource::DxgiDesktopSource(DisplayInfo display,
+                                     CaptureFallback fallback)
+    : VideoTrackSource(/*remote=*/false),
+      display_(std::move(display)),
+      fallback_(fallback) {}
 
 DxgiDesktopSource::~DxgiDesktopSource() {
   Stop();
@@ -330,16 +334,33 @@ void DxgiDesktopSource::CaptureLoop() {
   while (running_) {
     {
       std::lock_guard<std::mutex> lock(state_mutex_);
-      if (!duplication_ && !InitializeDuplication()) {
-        ++consecutive_failures_;
-        ++dropped_frames_;
-      } else if (CaptureOne()) {
-        consecutive_failures_ = 0;
+      bool captured = false;
+      last_capture_waited_ = false;
+      if (secure_gdi_active_) {
+        captured = CaptureSecureDesktopGdi();
+      } else if (!duplication_ && !InitializeDuplication()) {
+        captured = false;
       } else {
+        captured = CaptureOne();
+      }
+      if (!captured && captured_frames_.load() == 0 &&
+          fallback_ == CaptureFallback::kSecureDesktopGdi &&
+          ++first_frame_waits_ >= 5) {
+        secure_gdi_active_ = true;
+        ResetDuplication();
+        captured = CaptureSecureDesktopGdi();
+      }
+      if (captured) {
+        consecutive_failures_ = 0;
+        first_frame_waits_ = 0;
+      } else {
+        // A static desktop normally produces DXGI wait timeouts. Preserve the
+        // duplication in that case; only real capture failures drive reset.
+        if (!last_capture_waited_) ++consecutive_failures_;
         ++dropped_frames_;
       }
       if (consecutive_failures_ >= 5) {
-        ResetDuplication();
+        if (!secure_gdi_active_) ResetDuplication();
         consecutive_failures_ = 0;
       }
     }
@@ -361,6 +382,7 @@ bool DxgiDesktopSource::CaptureOne() {
   const CaptureAcquireAction acquire_action =
       ClassifyCaptureAcquireResult(acquired);
   if (acquire_action == CaptureAcquireAction::kWait) {
+    last_capture_waited_ = true;
     // A completely static desktop may not yield another DXGI frame for a long
     // time. Re-submit the last immutable buffer at a bounded cadence so an
     // upstream PLI/keyframe request can recover without turning capture into a
@@ -369,7 +391,7 @@ bool DxgiDesktopSource::CaptureOne() {
         webrtc::Clock::GetRealTimeClock()->TimeInMicroseconds();
     if (last_frame_ && now_us - last_broadcast_us_ >= 2'000'000)
       BroadcastFrame(last_frame_);
-    return true;
+    return last_frame_ != nullptr;
   }
   if (acquire_action == CaptureAcquireAction::kReset) {
     ResetDuplication();
@@ -422,28 +444,64 @@ bool DxgiDesktopSource::CaptureOne() {
                 static_cast<size_t>(desc.Width) * 4);
   }
   context_->Unmap(staging_.Get(), 0);
-  CompositeCursor(cursor_bits_, static_cast<int>(desc.Width * 4), desc.Width,
-                  desc.Height);
+  return BroadcastBgraFrame(static_cast<int>(desc.Width),
+                            static_cast<int>(desc.Height));
+}
 
-  auto raw = webrtc::I420Buffer::Create(desc.Width, desc.Height);
-  if (libyuv::ARGBToI420(cursor_bits_, static_cast<int>(desc.Width * 4),
+bool DxgiDesktopSource::CaptureSecureDesktopGdi() {
+  ++secure_gdi_attempts_;
+  if (display_.width <= 0 || display_.height <= 0 ||
+      !EnsureCursorSurface(display_.width, display_.height)) {
+    secure_gdi_last_error_ = ERROR_INVALID_DATA;
+    return false;
+  }
+  const HDC screen = GetDC(nullptr);
+  if (!screen) {
+    secure_gdi_last_error_ = GetLastError();
+    return false;
+  }
+  SetLastError(ERROR_SUCCESS);
+  const BOOL copied = BitBlt(
+      cursor_dc_, 0, 0, display_.width, display_.height, screen,
+      display_.desktop_rect.left, display_.desktop_rect.top,
+      SRCCOPY | CAPTUREBLT);
+  ReleaseDC(nullptr, screen);
+  if (!copied) {
+    secure_gdi_last_error_ = GetLastError();
+    return false;
+  }
+  GdiFlush();
+  if (!BroadcastBgraFrame(display_.width, display_.height)) {
+    secure_gdi_last_error_ = ERROR_INVALID_PIXEL_FORMAT;
+    return false;
+  }
+  secure_gdi_last_error_ = ERROR_SUCCESS;
+  return true;
+}
+
+bool DxgiDesktopSource::BroadcastBgraFrame(int width, int height) {
+  if (!cursor_bits_ || width <= 0 || height <= 0) return false;
+  CompositeCursor(cursor_bits_, width * 4, width, height);
+
+  auto raw = webrtc::I420Buffer::Create(width, height);
+  if (libyuv::ARGBToI420(cursor_bits_, width * 4,
                          raw->MutableDataY(), raw->StrideY(),
                          raw->MutableDataU(), raw->StrideU(),
-                         raw->MutableDataV(), raw->StrideV(), desc.Width,
-                         desc.Height) != 0) {
+                         raw->MutableDataV(), raw->StrideV(), width,
+                         height) != 0) {
     return false;
   }
   webrtc::scoped_refptr<webrtc::I420Buffer> output = raw;
   if (display_.rotation_degrees != 0) {
     const bool swap = display_.rotation_degrees == 90 ||
                       display_.rotation_degrees == 270;
-    output = webrtc::I420Buffer::Create(swap ? desc.Height : desc.Width,
-                                        swap ? desc.Width : desc.Height);
+    output = webrtc::I420Buffer::Create(swap ? height : width,
+                                        swap ? width : height);
     if (libyuv::I420Rotate(
             raw->DataY(), raw->StrideY(), raw->DataU(), raw->StrideU(),
             raw->DataV(), raw->StrideV(), output->MutableDataY(),
             output->StrideY(), output->MutableDataU(), output->StrideU(),
-            output->MutableDataV(), output->StrideV(), desc.Width, desc.Height,
+            output->MutableDataV(), output->StrideV(), width, height,
             LibyuvRotation(display_.rotation_degrees)) != 0) {
       return false;
     }

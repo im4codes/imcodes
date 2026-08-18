@@ -32,6 +32,7 @@ import {
 import {
   launchWindowsActiveUserCommand,
   launchWindowsActiveUserElevatedCommand,
+  launchWindowsRemoteDesktopCommand,
 } from '../../src/node/windows-user-session.js';
 
 const requestId = 'request_12345678';
@@ -223,7 +224,7 @@ describe('remote desktop worker artifact and IPC host', () => {
       .toBeLessThan(script.indexOf('if (s.State == WTSActive)'));
     expect(script).not.toContain('must-not-be-inherited-by-worker');
     expect(script).not.toContain('IMCODES_NODE_TOKEN');
-    expect(script).toContain('[ImcodesUserProc]::Start($exe, $argsLine, $false)');
+    expect(script).toContain('[ImcodesUserProc]::Start($exe, $argsLine, $false, $false)');
   });
 
   it('uses only the active administrator linked token for the verified desktop worker', () => {
@@ -243,8 +244,33 @@ describe('remote desktop worker artifact and IPC host', () => {
     expect(script).toContain('const int TokenLinkedToken = 19;');
     expect(script).toContain('elevationType == TokenElevationTypeLimited');
     expect(script).toContain('launchToken = linkedToken;');
-    expect(script).toContain('[ImcodesUserProc]::Start($exe, $argsLine, $true)');
+    expect(script).toContain('[ImcodesUserProc]::Start($exe, $argsLine, $true, $false)');
     expect(script).toContain('if (linkedToken != IntPtr.Zero) CloseHandle(linkedToken);');
+  });
+
+  it('falls back to an authenticated SYSTEM worker on the active Winlogon desktop', () => {
+    let launchArgs: readonly string[] = [];
+    const child = new EventEmitter() as EventEmitter & { unref(): void };
+    child.unref = () => {};
+    launchWindowsRemoteDesktopCommand(
+      artifact.executablePath,
+      '--pipe "safe" --nonce "ephemeral"',
+      ((_command: string, args: readonly string[]) => {
+        launchArgs = args;
+        return child;
+      }) as never,
+    );
+    const encodedIndex = launchArgs.indexOf('-EncodedCommand') + 1;
+    const script = Buffer.from(launchArgs[encodedIndex]!, 'base64').toString('utf16le');
+    expect(script).toContain('Process.GetProcessesByName("LogonUI")');
+    expect(script).toContain('process.SessionId == sid');
+    expect(script).toContain('WindowsIdentity.GetCurrent().User.Value != "S-1-5-18"');
+    expect(script).toContain('SetTokenInformation(primary, TokenSessionId, ref sid, sizeof(int))');
+    expect(script).toContain('argsLine + " --secure-console"');
+    expect(script).toContain('"winsta0\\\\Winlogon"');
+    expect(script).toContain('[ImcodesUserProc]::Start($exe, $argsLine, $true, $true)');
+    expect(script.indexOf('allowSecureDesktopFallback && SecureConsoleDisplayed()'))
+      .toBeLessThan(script.indexOf('TryInteractiveSessionId(out sid)'));
   });
 
   it('authenticates one active-user worker and forwards only strict bounded envelopes', async () => {

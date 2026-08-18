@@ -57,14 +57,25 @@ std::string DisplaySourceKey(const DisplayInfo& display);
 // fails closed without changing the display.
 bool SetDisplayDpiScale(const DisplayInfo& display, int percent);
 
+enum class CaptureFallback {
+  kNone,
+  // LOCAL_SYSTEM on WinSta0\Winlogon only. DXGI can enumerate the sign-in
+  // output yet return no first frame indefinitely; GDI remains able to read
+  // that authenticated secure desktop without persisting pixels.
+  kSecureDesktopGdi,
+};
+
 // DXGI Desktop Duplication capture source. Capture is obtained from a D3D11
 // output duplication surface, copied through one reusable staging texture and
-// delivered as post-rotation I420 frames to libwebrtc. It never calls the
+// delivered as post-rotation I420 frames to libwebrtc. A separately authorized
+// LOCAL_SYSTEM Winlogon worker may fall back to an in-memory GDI frame when
+// DXGI never presents its first secure-desktop frame. It never calls the
 // Computer Use screenshot path and never emits still-image application data.
 class DxgiDesktopSource : public webrtc::VideoTrackSource {
  public:
   static webrtc::scoped_refptr<DxgiDesktopSource> Create(
-      const DisplayInfo& display);
+      const DisplayInfo& display,
+      CaptureFallback fallback = CaptureFallback::kNone);
 
   void Start();
   void Stop();
@@ -78,6 +89,12 @@ class DxgiDesktopSource : public webrtc::VideoTrackSource {
   uint64_t dirty_regions() const { return dirty_regions_.load(); }
   uint64_t move_regions() const { return move_regions_.load(); }
   uint64_t pointer_updates() const { return pointer_updates_.load(); }
+  uint64_t secure_gdi_attempts() const {
+    return secure_gdi_attempts_.load();
+  }
+  DWORD secure_gdi_last_error() const {
+    return secure_gdi_last_error_.load();
+  }
   bool protected_content_masked() const {
     return protected_content_masked_.load();
   }
@@ -85,7 +102,7 @@ class DxgiDesktopSource : public webrtc::VideoTrackSource {
   bool is_screencast() const override { return true; }
 
  protected:
-  explicit DxgiDesktopSource(DisplayInfo display);
+  DxgiDesktopSource(DisplayInfo display, CaptureFallback fallback);
   ~DxgiDesktopSource() override;
   webrtc::VideoSourceInterface<webrtc::VideoFrame>* source() override {
     return &broadcaster_;
@@ -96,6 +113,8 @@ class DxgiDesktopSource : public webrtc::VideoTrackSource {
   void ResetDuplication();
   void CaptureLoop();
   bool CaptureOne();
+  bool CaptureSecureDesktopGdi();
+  bool BroadcastBgraFrame(int width, int height);
   void BroadcastFrame(
       const webrtc::scoped_refptr<webrtc::I420Buffer>& frame);
   bool ConsumeFrameMetadata(const DXGI_OUTDUPL_FRAME_INFO& frame_info);
@@ -104,6 +123,7 @@ class DxgiDesktopSource : public webrtc::VideoTrackSource {
   void CompositeDxgiCursor(uint8_t* bgra, int stride, int width, int height);
 
   const DisplayInfo display_;
+  const CaptureFallback fallback_;
   webrtc::VideoBroadcaster broadcaster_;
   std::mutex state_mutex_;
   std::atomic<bool> running_{false};
@@ -115,8 +135,13 @@ class DxgiDesktopSource : public webrtc::VideoTrackSource {
   std::atomic<uint64_t> dirty_regions_{0};
   std::atomic<uint64_t> move_regions_{0};
   std::atomic<uint64_t> pointer_updates_{0};
+  std::atomic<uint64_t> secure_gdi_attempts_{0};
+  std::atomic<DWORD> secure_gdi_last_error_{ERROR_SUCCESS};
   std::atomic<bool> protected_content_masked_{false};
   int consecutive_failures_ = 0;
+  int first_frame_waits_ = 0;
+  bool secure_gdi_active_ = false;
+  bool last_capture_waited_ = false;
 
   Microsoft::WRL::ComPtr<ID3D11Device> device_;
   Microsoft::WRL::ComPtr<ID3D11DeviceContext> context_;

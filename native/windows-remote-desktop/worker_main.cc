@@ -105,7 +105,7 @@ bool ConstantTimeEqual(const std::string& left, const std::string& right) {
   return difference == 0;
 }
 
-bool IsInteractiveDefaultDesktop() {
+bool IsInputDesktopNamed(const wchar_t* expected_name) {
   HDESK desktop = OpenInputDesktop(
       0, FALSE, DESKTOP_READOBJECTS | DESKTOP_SWITCHDESKTOP);
   if (!desktop) return false;
@@ -114,7 +114,21 @@ bool IsInteractiveDefaultDesktop() {
   const bool read = GetUserObjectInformationW(
       desktop, UOI_NAME, name, sizeof(name), &needed) != FALSE;
   CloseDesktop(desktop);
-  return read && lstrcmpiW(name, L"Default") == 0;
+  return read && expected_name && lstrcmpiW(name, expected_name) == 0;
+}
+
+bool IsLocalSystemProcess() {
+  HANDLE token = nullptr;
+  if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) return false;
+  DWORD needed = 0;
+  GetTokenInformation(token, TokenUser, nullptr, 0, &needed);
+  std::vector<uint8_t> storage(needed);
+  const bool read = needed > 0 &&
+      GetTokenInformation(token, TokenUser, storage.data(), needed, &needed);
+  CloseHandle(token);
+  if (!read) return false;
+  const auto* user = reinterpret_cast<const TOKEN_USER*>(storage.data());
+  return IsWellKnownSid(user->User.Sid, WinLocalSystemSid) != FALSE;
 }
 
 class PipeWriter {
@@ -151,20 +165,37 @@ class WorkerRuntime {
                 webrtc::scoped_refptr<webrtc::PeerConnectionFactoryInterface>
                     factory,
                 PipeWriter* writer,
-                LocalIndicator* indicator)
+                LocalIndicator* indicator,
+                bool secure_console)
       : signaling_thread_(signaling_thread),
         factory_(std::move(factory)),
         writer_(writer),
         indicator_(indicator),
+        secure_console_(secure_console),
         input_(
-            [indicator](UINT count, LPINPUT inputs, int size) {
+            [indicator, secure_console](UINT count, LPINPUT inputs, int size) {
+              if (!WorkerInputDesktopAllowed(
+                      secure_console,
+                      !secure_console || IsInputDesktopNamed(L"Winlogon"))) {
+                return static_cast<UINT>(0);
+              }
               return indicator ? indicator->DispatchInput(count, inputs, size)
                                : 0;
             },
-            [indicator] {
+            [indicator, secure_console] {
+              if (!WorkerInputDesktopAllowed(
+                      secure_console,
+                      !secure_console || IsInputDesktopNamed(L"Winlogon"))) {
+                return false;
+              }
               return indicator && indicator->InputAvailable();
             },
-            [indicator](int x, int y) {
+            [indicator, secure_console](int x, int y) {
+              if (!WorkerInputDesktopAllowed(
+                      secure_console,
+                      !secure_console || IsInputDesktopNamed(L"Winlogon"))) {
+                return false;
+              }
               return indicator && indicator->MovePointer(x, y);
             }),
         dwm_process_id_(CurrentDwmProcessIdForCurrentSession()) {}
@@ -230,13 +261,27 @@ class WorkerRuntime {
         RefreshTopologyOnSignaling();
       }
       if (!sessions_.empty()) {
-        if (!IsInteractiveDefaultDesktop()) {
-          if (++protected_desktop_checks_ >= 3) {
-            StopAllOnSignaling("protected_desktop", true);
-            protected_desktop_checks_ = 0;
+        const bool expected_desktop = IsInputDesktopNamed(
+            secure_console_ ? L"Winlogon" : L"Default");
+        const WorkerDesktopAction desktop_action = AdvanceWorkerDesktopState(
+            secure_console_, expected_desktop, &protected_desktop_checks_);
+        if (desktop_action != WorkerDesktopAction::kContinue) {
+          StopAllOnSignaling(
+              desktop_action == WorkerDesktopAction::kTerminateSecureConsole
+                  ? "worker_failed"
+                  : "protected_desktop",
+              true);
+          if (desktop_action ==
+              WorkerDesktopAction::kTerminateSecureConsole) {
+            // The sign-in/lock desktop has switched to the user's Default
+            // desktop. Never carry the privileged worker, authority, or input
+            // ledger across that boundary; the service/browser will create a
+            // fresh active-user worker and peer.
+            TerminateProcess(GetCurrentProcess(), 17);
+            return;
           }
-        } else {
-          protected_desktop_checks_ = 0;
+        }
+        if (expected_desktop) {
           if (topology_refresh_debounce_ticks_ == 0 &&
               ++topology_scan_ticks_ >= 8) {
             topology_scan_ticks_ = 0;
@@ -354,9 +399,15 @@ class WorkerRuntime {
           [this](const DisplayInfo& display) { return AcquireSource(display); },
           [this](const DisplayInfo& display) { ReleaseSource(display); },
           &input_,
-          [this] { return indicator_->ClipboardSequence(); },
+          [this] {
+            return WorkerClipboardAllowed(secure_console_)
+                       ? indicator_->ClipboardSequence()
+                       : static_cast<DWORD>(0);
+          },
           [this](DWORD previous_sequence) {
-            return indicator_->ReadClipboardText(previous_sequence);
+            return WorkerClipboardAllowed(secure_console_)
+                       ? indicator_->ReadClipboardText(previous_sequence)
+                       : std::optional<std::u16string>();
           },
           signaling_thread_,
           [this](const Json::Value& value) { writer_->Emit(value); });
@@ -423,7 +474,9 @@ class WorkerRuntime {
         sources_.size() >= kMaxGpuCaptureSurfaces) {
       return nullptr;
     }
-    auto source = DxgiDesktopSource::Create(display);
+    auto source = DxgiDesktopSource::Create(
+        display, secure_console_ ? CaptureFallback::kSecureDesktopGdi
+                                 : CaptureFallback::kNone);
     if (!source) return nullptr;
     source->Start();
     sources_.emplace(key, SourceEntry{source, 1});
@@ -495,6 +548,7 @@ class WorkerRuntime {
   const webrtc::scoped_refptr<webrtc::PeerConnectionFactoryInterface> factory_;
   PipeWriter* const writer_;
   LocalIndicator* const indicator_;
+  const bool secure_console_;
   InputArbiter input_;
   std::map<std::string, std::shared_ptr<PeerSession>> sessions_;
   std::map<std::string, SourceEntry> sources_;
@@ -508,14 +562,30 @@ class WorkerRuntime {
   int empty_topology_ticks_ = 0;
 };
 
-std::optional<std::pair<std::wstring, std::string>> ParseArguments() {
+struct WorkerArguments {
+  std::wstring pipe;
+  std::string nonce;
+  bool secure_console = false;
+};
+
+std::optional<WorkerArguments> ParseArguments() {
   int count = 0;
   LPWSTR* arguments = CommandLineToArgvW(GetCommandLineW(), &count);
   if (!arguments) return std::nullopt;
   std::optional<std::wstring> pipe;
   std::optional<std::string> nonce;
-  for (int index = 1; index + 1 < count; index += 2) {
+  bool secure_console = false;
+  for (int index = 1; index < count;) {
     const std::wstring key = arguments[index];
+    if (key == L"--secure-console" && !secure_console) {
+      secure_console = true;
+      ++index;
+      continue;
+    }
+    if (index + 1 >= count) {
+      LocalFree(arguments);
+      return std::nullopt;
+    }
     if (key == L"--pipe" && !pipe) pipe = arguments[index + 1];
     else if (key == L"--nonce" && !nonce)
       nonce = WideToUtf8(arguments[index + 1]);
@@ -523,13 +593,15 @@ std::optional<std::pair<std::wstring, std::string>> ParseArguments() {
       LocalFree(arguments);
       return std::nullopt;
     }
+    index += 2;
   }
   LocalFree(arguments);
-  if (count != 5 || !pipe || !nonce || !IsSafePipePath(*pipe) ||
+  if (!pipe || !nonce || !IsSafePipePath(*pipe) ||
       !IsSafeCapability(*nonce)) {
     return std::nullopt;
   }
-  return std::make_pair(std::move(*pipe), std::move(*nonce));
+  return WorkerArguments{
+      std::move(*pipe), std::move(*nonce), secure_console};
 }
 
 HANDLE ConnectPipe(const std::wstring& path) {
@@ -573,6 +645,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
   }
   const auto arguments = ParseArguments();
   if (!arguments) return 2;
+  if (arguments->secure_console && !IsLocalSystemProcess()) return 18;
   if (!ConfigureResourceJob()) return 12;
 
   // Native libwebrtc embedders own Winsock lifetime. Without this, ICE can
@@ -593,7 +666,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     return 5;
   }
 
-  HANDLE pipe = ConnectPipe(arguments->first);
+  HANDLE pipe = ConnectPipe(arguments->pipe);
   if (pipe == INVALID_HANDLE_VALUE) {
     webrtc::CleanupSSL();
     MFShutdown();
@@ -604,7 +677,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
   Json::Value hello(Json::objectValue);
   hello["type"] = kWorkerHelloType;
   hello["ipcVersion"] = kIpcVersion;
-  hello["nonce"] = arguments->second;
+  hello["nonce"] = arguments->nonce;
   hello["pid"] = static_cast<Json::UInt>(GetCurrentProcessId());
   if (!writer.Emit(hello)) {
     CloseHandle(pipe);
@@ -654,7 +727,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
   }
 
   LocalIndicator indicator;
-  WorkerRuntime runtime(signaling_thread.get(), factory, &writer, &indicator);
+  WorkerRuntime runtime(signaling_thread.get(), factory, &writer, &indicator,
+                        arguments->secure_console);
   if (!indicator.Start(
           [&runtime] { runtime.RequestLocalStopAll(); },
           [&runtime](uint32_t event_mask) {

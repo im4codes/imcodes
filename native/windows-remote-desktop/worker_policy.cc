@@ -32,6 +32,31 @@ WorkerEnvironmentAction SelectWorkerEnvironmentAction(uint32_t event_mask) {
   return WorkerEnvironmentAction::kNone;
 }
 
+WorkerDesktopAction AdvanceWorkerDesktopState(
+    bool secure_console,
+    bool expected_desktop_active,
+    int* consecutive_mismatches) {
+  if (!consecutive_mismatches) return WorkerDesktopAction::kContinue;
+  if (expected_desktop_active) {
+    *consecutive_mismatches = 0;
+    return WorkerDesktopAction::kContinue;
+  }
+  if (++(*consecutive_mismatches) < kWorkerDesktopMismatchLimit)
+    return WorkerDesktopAction::kContinue;
+  *consecutive_mismatches = 0;
+  return secure_console ? WorkerDesktopAction::kTerminateSecureConsole
+                        : WorkerDesktopAction::kStopProtected;
+}
+
+bool WorkerInputDesktopAllowed(bool secure_console,
+                               bool expected_desktop_active) {
+  return !secure_console || expected_desktop_active;
+}
+
+bool WorkerClipboardAllowed(bool secure_console) {
+  return !secure_console;
+}
+
 bool AdvanceTopologyRefreshDebounce(bool refresh_requested,
                                     int* remaining_ticks) {
   if (!remaining_ticks) return false;

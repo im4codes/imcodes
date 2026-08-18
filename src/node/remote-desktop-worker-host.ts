@@ -27,7 +27,7 @@ import { DAEMON_VERSION } from '../util/version.js';
 import {
   allowWindowsNamedPipeClients,
   launchWindowsActiveUserCommand,
-  launchWindowsActiveUserElevatedCommand,
+  launchWindowsRemoteDesktopCommand,
   quoteWindowsArgument,
 } from './windows-user-session.js';
 import {
@@ -273,12 +273,21 @@ export class RemoteDesktopWorkerHost {
     return verified;
   }
 
-  private async launchVerified(argsLine: string): Promise<void> {
+  private async launchVerified(
+    argsLine: string,
+    allowSecureDesktopFallback = true,
+  ): Promise<void> {
     const artifact = await this.verifiedArtifactForLaunch();
-    (this.options.launch ?? launchWindowsActiveUserElevatedCommand)(
-      artifact.executablePath,
-      argsLine,
-    );
+    if (this.options.launch) {
+      this.options.launch(artifact.executablePath, argsLine);
+    } else {
+      launchWindowsRemoteDesktopCommand(
+        artifact.executablePath,
+        argsLine,
+        spawn,
+        allowSecureDesktopFallback,
+      );
+    }
   }
 
   async handle(message: unknown): Promise<boolean> {
@@ -551,7 +560,7 @@ export class RemoteDesktopWorkerHost {
       // immutable verified binary once in release-only mode on the same active
       // desktop. This command carries no credential, authority, or key history.
       if (this.tracked.size > 0 && this.artifact) {
-        void this.launchVerified('--release-all-input').catch(() => {
+        void this.launchVerified('--release-all-input', false).catch(() => {
           // The Server is still notified and the short lease still expires;
           // this best-effort recovery cannot restore a dead worker.
         });

@@ -31,6 +31,14 @@ bool CaptureLivenessEnabled() {
   return length > 0 && length < std::size(value) && value[0] == L'1';
 }
 
+bool SecureConsoleEnabled() {
+  wchar_t value[8] = {};
+  const DWORD length = GetEnvironmentVariableW(
+      L"IMCODES_RUN_SECURE_CONSOLE_CAPTURE", value, std::size(value));
+  return (length > 0 && length < std::size(value) && value[0] == L'1') ||
+         std::wcsstr(GetCommandLineW(), L"--secure-console") != nullptr;
+}
+
 bool RequireImcodesVirtualDisplay() {
   wchar_t value[8] = {};
   const DWORD length = GetEnvironmentVariableW(
@@ -146,7 +154,9 @@ TEST(DisplayCaptureTest, ProducesFramesWithoutPersistingPixels) {
     ASSERT_NE(selected, displays.end());
   }
   RecordProperty("selected_imcodes_virtual", selected->imcodes_virtual);
-  auto source = DxgiDesktopSource::Create(*selected);
+  auto source = DxgiDesktopSource::Create(
+      *selected, SecureConsoleEnabled() ? CaptureFallback::kSecureDesktopGdi
+                                       : CaptureFallback::kNone);
   ASSERT_TRUE(source);
   MetadataOnlyFrameSink sink;
   source->AddOrUpdateSink(&sink, webrtc::VideoSinkWants());
@@ -182,6 +192,10 @@ TEST(DisplayCaptureTest, ProducesFramesWithoutPersistingPixels) {
   RecordProperty("frame_height", sink.height());
   RecordProperty("capture_failures",
                  static_cast<int>(source->dropped_frames()));
+  RecordProperty("secure_gdi_attempts",
+                 static_cast<int>(source->secure_gdi_attempts()));
+  RecordProperty("secure_gdi_last_error",
+                 static_cast<int>(source->secure_gdi_last_error()));
   EXPECT_GT(sink.frames(), 0u);
   EXPECT_EQ(sink.width(), selected->width);
   EXPECT_EQ(sink.height(), selected->height);
