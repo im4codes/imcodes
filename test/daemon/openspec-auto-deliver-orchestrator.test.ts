@@ -106,6 +106,22 @@ async function makeChange(name: string, tasks = '- [ ] first\n- [x] second\n'): 
   await writeFile(join(root, 'specs', 'demo', 'spec.md'), '## ADDED Requirements\n\n### Requirement: Demo\n\n#### Scenario: Demo\n- **WHEN** demo\n- **THEN** demo\n', 'utf8');
 }
 
+function describeOrchestratorActivity(): string {
+  // A bare "not observed" says nothing about what the run did instead, which is
+  // the one thing needed to tell a slow CI worker from a run that branched
+  // somewhere else and is now waiting for an event that will never arrive.
+  const sends = transportSendMock.mock.calls
+    .map((call) => String(call[0] ?? '').replace(/\s+/g, ' ').slice(0, 140))
+    .slice(-5);
+  const projections = serverLinkMock.send.mock.calls
+    .map((call) => call[0] as { type?: string; projection?: { status?: string; stage?: string; lastMessage?: string } })
+    .filter((msg) => !!msg?.projection)
+    .map((msg) => `${msg.type}:${msg.projection?.status ?? '-'}/${msg.projection?.stage ?? '-'}`)
+    .slice(-6);
+  return `\nlast transport sends:\n  ${sends.join('\n  ') || '(none)'}`
+    + `\nlast projections: ${projections.join(', ') || '(none)'}`;
+}
+
 async function waitForSend(predicate: (msg: Record<string, unknown>) => boolean, maxMs = SEND_WAIT_MS): Promise<Record<string, unknown>> {
   const start = Date.now();
   while (Date.now() - start < maxMs) {
@@ -113,7 +129,7 @@ async function waitForSend(predicate: (msg: Record<string, unknown>) => boolean,
     if (found) return found;
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
-  throw new Error('Expected websocket send was not observed');
+  throw new Error(`Expected websocket send was not observed${describeOrchestratorActivity()}`);
 }
 
 async function waitForTransportSend(predicate: (text: string) => boolean, maxMs = SEND_WAIT_MS): Promise<string> {
@@ -129,7 +145,7 @@ async function waitForTransportSend(predicate: (text: string) => boolean, maxMs 
   // because the event loop crossed the wall-clock boundary.
   const found = transportSendMock.mock.calls.map((call) => String(call[0] ?? '')).find(predicate);
   if (found) return found;
-  throw new Error('Expected transport send was not observed');
+  throw new Error(`Expected transport send was not observed${describeOrchestratorActivity()}`);
 }
 
 function transportSendCount(predicate: (text: string) => boolean): number {
@@ -142,7 +158,7 @@ async function waitForTransportSendCount(predicate: (text: string) => boolean, c
     if (transportSendCount(predicate) >= count) return;
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
-  throw new Error('Expected transport send count was not observed');
+  throw new Error(`Expected transport send count was not observed${describeOrchestratorActivity()}`);
 }
 
 async function waitForP2pStartCount(count: number, maxMs = SEND_WAIT_MS): Promise<void> {
