@@ -90,6 +90,16 @@ interface Props {
   sharedSessionName?: string;
   /** Viewer shares can inspect schedules and history but cannot mutate them. */
   readOnly?: boolean;
+  /**
+   * Managed z-index of the owning cron window. The nested form/history/detail
+   * panels sit one band above it; without this they fell back to
+   * FloatingPanel's default 2000 and were trapped in the cron window's
+   * stacking context, so raising any other window buried the dialog you were
+   * editing.
+   */
+  windowZIndex?: number;
+  /** Raise the owning cron window, so clicking a nested dialog lifts both. */
+  onWindowFocus?: () => void;
 }
 
 type CronSendActionView = Extract<CronAction, { type: 'send' }>;
@@ -207,7 +217,8 @@ function isCurrentContextJob(job: Pick<CronJob, 'server_id' | 'project_name'>, s
 
 // ── Component ────────────────────────────────────────────────────────────
 
-export function CronManager({ serverId, projectName, sessions, subSessions = [], activeSession, onBack: _onBack, onViewDiscussion, onNavigateSession, servers = [], ws, sharedSessionName, readOnly = false }: Props) {
+export function CronManager({ serverId, projectName, sessions, subSessions = [], activeSession, onBack: _onBack, onViewDiscussion, onNavigateSession, servers = [], ws, sharedSessionName, readOnly = false, windowZIndex, onWindowFocus }: Props) {
+  const subPanelZIndex = windowZIndex !== undefined ? windowZIndex + 1 : undefined;
   const { t } = useTranslation();
   const [jobs, setJobs] = useState<CronJob[]>([]);
   const [loading, setLoading] = useState(true);
@@ -417,6 +428,8 @@ export function CronManager({ serverId, projectName, sessions, subSessions = [],
       {/* ── Executions tab ── */}
       {tab === 'executions' && (
         <CrossJobExecutionList
+          subPanelZIndex={subPanelZIndex}
+          onWindowFocus={onWindowFocus}
           executions={crossExecs}
           loading={crossExecsLoading}
           serverNameMap={serverNameMap}
@@ -490,6 +503,8 @@ export function CronManager({ serverId, projectName, sessions, subSessions = [],
       {subPanel === 'form' && (
         <FloatingPanel
           id="cron-form"
+          zIndex={subPanelZIndex}
+          onFocus={onWindowFocus}
           title={editingJob ? t('cron.edit') : t('cron.create')}
           onClose={() => { setSubPanel(null); setEditingJob(null); }}
           defaultW={500} defaultH={600}
@@ -514,12 +529,16 @@ export function CronManager({ serverId, projectName, sessions, subSessions = [],
       {historyJobId && historyJob && (
         <FloatingPanel
           id={`cron-history-${historyJobId}`}
+          zIndex={subPanelZIndex}
+          onFocus={onWindowFocus}
           title={`${t('cron.history')} · ${historyJob.name}`}
           onClose={() => setSubPanel(null)}
           defaultW={660} defaultH={580}
           className="cron-floating-panel"
         >
           <CronHistoryPanel
+            subPanelZIndex={subPanelZIndex}
+            onWindowFocus={onWindowFocus}
             executions={historyData[historyJobId] ?? null}
             job={historyJob}
             onViewDiscussion={onViewDiscussion}
@@ -534,7 +553,7 @@ export function CronManager({ serverId, projectName, sessions, subSessions = [],
 
 // ── Cross-Job Execution List ─────────────────────────────────────────────
 
-function CrossJobExecutionList({ executions, loading, serverNameMap, showAllServers, onViewDiscussion, onNavigateSession, t }: {
+function CrossJobExecutionList({ executions, loading, serverNameMap, showAllServers, onViewDiscussion, onNavigateSession, t, subPanelZIndex, onWindowFocus }: {
   executions: CrossJobExecution[] | null;
   loading: boolean;
   serverNameMap: Map<string, string>;
@@ -542,6 +561,8 @@ function CrossJobExecutionList({ executions, loading, serverNameMap, showAllServ
   onViewDiscussion?: (fileId: string) => void;
   onNavigateSession?: (sessionName: string, quote?: string) => void;
   t: (key: string) => string;
+  subPanelZIndex?: number;
+  onWindowFocus?: () => void;
 }) {
   const [detailExec, setDetailExec] = useState<CrossJobExecution | null>(null);
 
@@ -629,6 +650,8 @@ function CrossJobExecutionList({ executions, loading, serverNameMap, showAllServ
       {detailExec && (
         <FloatingPanel
           id={`exec-detail-${detailExec.id}`}
+          zIndex={subPanelZIndex}
+          onFocus={onWindowFocus}
           title={`${detailExec.job_name} · ${fmtTime(detailExec.created_at)}`}
           onClose={() => setDetailExec(null)}
           defaultW={720} defaultH={620}
@@ -650,12 +673,14 @@ const execStatusColor = (status: string): string => {
   return '#fbbf24';
 };
 
-function CronHistoryPanel({ executions, job, onViewDiscussion, onNavigateSession, t }: {
+function CronHistoryPanel({ executions, job, onViewDiscussion, onNavigateSession, t, subPanelZIndex, onWindowFocus }: {
   executions: CronExecution[] | null;
   job: CronJob;
   onViewDiscussion?: (fileId: string) => void;
   onNavigateSession?: (sessionName: string, quote?: string) => void;
   t: (key: string) => string;
+  subPanelZIndex?: number;
+  onWindowFocus?: () => void;
 }) {
   const jobSessionName = job.target_session_name ?? `deck_${job.project_name}_${job.target_role}`;
   const [detailExec, setDetailExec] = useState<CronExecution | null>(null);
@@ -739,6 +764,8 @@ function CronHistoryPanel({ executions, job, onViewDiscussion, onNavigateSession
       {detailExec && (
         <FloatingPanel
           id={`exec-detail-${detailExec.id}`}
+          zIndex={subPanelZIndex}
+          onFocus={onWindowFocus}
           title={`${job.name} · ${fmtTime(detailExec.created_at)}`}
           onClose={() => setDetailExec(null)}
           defaultW={720} defaultH={620}

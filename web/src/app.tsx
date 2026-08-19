@@ -6184,6 +6184,8 @@ export function App() {
             <CronManager
               serverId={selectedServerId}
               projectName={cronProject}
+              windowZIndex={getDesktopWindowZIndex(DESKTOP_WINDOW_IDS.cronManager, 5070)}
+              onWindowFocus={() => bringDesktopWindowToFront(DESKTOP_WINDOW_IDS.cronManager)}
               sessions={sessions}
               subSessions={subSessionsSlim}
               activeSession={activeSession}
