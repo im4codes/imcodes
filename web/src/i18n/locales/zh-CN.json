@@ -660,7 +660,8 @@
       "opencode_sdk": "OpenCode SDK",
       "gemini_sdk": "Gemini SDK",
       "grok_sdk": "Grok Build",
-      "kimi_sdk": "Kimi Code"
+      "kimi_sdk": "Kimi Code",
+      "deepseek_harness": "DeepSeek Harness"
     },
     "agentGroup": {
       "transport_sdk": "SDK",
@@ -2463,6 +2464,7 @@
       "mcpProviderCursorHeadless": "Cursor headless",
       "mcpProviderOpenCodeSdk": "OpenCode SDK",
       "mcpProviderQwen": "Qwen",
+      "mcpProviderDeepseekHarness": "DeepSeek Harness",
       "mcpProviderUnknown": "{{provider}}",
       "mcpDisabledFlag": "禁用标记：{{flag}}",
       "mcpDisabledFlagNone": "未上报禁用标记",
@@ -3082,6 +3084,7 @@
     "unlock": "解锁",
     "unlock_hint": "让该节点用本机保存的口令应答自己的登录界面。",
     "unlock_unconfigured": "该节点未保存登录口令。",
-    "resolution_unreported": "该节点未上报驱动支持的分辨率，这里显示的是通用尺寸。"
+    "resolution_unreported": "该节点未上报驱动支持的分辨率，这里显示的是通用尺寸。",
+    "connection_retrying_reason": "中断原因：{{reason}}"
   }
 }

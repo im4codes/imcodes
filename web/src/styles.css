@@ -7918,6 +7918,13 @@ button.quick-agent-delegation-preset.active {
   opacity: .45;
 }
 
+.remote-desktop-retry-reason {
+  display: block;
+  margin-top: 4px;
+  color: #ffb057;
+  font-size: 11px;
+}
+
 .remote-desktop-resolution-menu {
   position: fixed;
   z-index: 10020;

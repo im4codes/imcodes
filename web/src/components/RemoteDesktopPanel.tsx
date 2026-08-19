@@ -203,6 +203,14 @@ export interface RemoteDesktopPanelProps {
   onMinimize?(): void;
   onRestore?(): void;
   onClose(): void;
+  /**
+   * Managed desktop-stack z-index. Without it the panel sat at a hardcoded
+   * 10020, above every stack-managed window, so no other window could ever be
+   * raised over it however the user clicked.
+   */
+  zIndex?: number;
+  /** Raise this window. Wired to a mousedown anywhere inside the panel. */
+  onFocus?(): void;
 }
 
 interface RemoteDesktopTransferRow {
@@ -222,6 +230,8 @@ export function RemoteDesktopPanel({
   onMinimize,
   onRestore,
   onClose,
+  zIndex,
+  onFocus,
 }: RemoteDesktopPanelProps) {
   const { t } = useTranslation();
   const [snapshot, setSnapshot] = useState<RemoteDesktopSnapshot>(INITIAL_SNAPSHOT);
@@ -1329,7 +1339,8 @@ export function RemoteDesktopPanel({
       id={`remote-desktop-${machine.serverId}`}
       title={t('remote_desktop.title', { machine: machine.displayName })}
       onClose={stopAndClose}
-      zIndex={10020}
+      zIndex={zIndex ?? 10020}
+      onFocus={onFocus}
       defaultW={1200}
       defaultH={760}
       minW={640}
@@ -1777,6 +1788,18 @@ export function RemoteDesktopPanel({
                       ? t('remote_desktop.connection_retrying', { count: snapshot.reconnectCount ?? 1 })
                       : t(`remote_desktop.state.${snapshot.state}`)}
                   </strong>
+                  {snapshot.state === REMOTE_DESKTOP_STATE.RECONNECTING
+                    && (snapshot.terminalReason ?? snapshot.error) && (
+                    // A reconnect with no reason is the same silent failure as
+                    // a click that does nothing: the viewer cannot tell a lost
+                    // network from a node that refused, and neither can anyone
+                    // they report it to.
+                    <small class="remote-desktop-retry-reason">
+                      {t('remote_desktop.connection_retrying_reason', {
+                        reason: snapshot.terminalReason ?? snapshot.error,
+                      })}
+                    </small>
+                  )}
                   <ol aria-label={t('remote_desktop.connection_progress')}>
                     {REMOTE_DESKTOP_CONNECTION_STEPS.map((step, index) => {
                       const complete = index < activeConnectionStep;

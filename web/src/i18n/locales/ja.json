@@ -660,7 +660,8 @@
       "opencode_sdk": "OpenCode SDK",
       "gemini_sdk": "Gemini SDK",
       "grok_sdk": "Grok Build",
-      "kimi_sdk": "Kimi Code"
+      "kimi_sdk": "Kimi Code",
+      "deepseek_harness": "DeepSeek Harness"
     },
     "agentGroup": {
       "transport_sdk": "SDK",
@@ -2462,6 +2463,7 @@
       "mcpProviderCursorHeadless": "Cursor headless",
       "mcpProviderOpenCodeSdk": "OpenCode SDK",
       "mcpProviderQwen": "Qwen",
+      "mcpProviderDeepseekHarness": "DeepSeek Harness",
       "mcpProviderUnknown": "{{provider}}",
       "mcpDisabledFlag": "無効化フラグ: {{flag}}",
       "mcpDisabledFlagNone": "無効化フラグは未報告",
@@ -3081,6 +3083,7 @@
     "unlock": "ロック解除",
     "unlock_hint": "このノードに、保存済みのパスワードでサインイン画面へ応答させます。",
     "unlock_unconfigured": "このノードにはサインインのパスワードが保存されていません。",
-    "resolution_unreported": "このノードはドライバーの解像度を報告していません。ここでは一般的なサイズを表示しています。"
+    "resolution_unreported": "このノードはドライバーの解像度を報告していません。ここでは一般的なサイズを表示しています。",
+    "connection_retrying_reason": "中断の理由: {{reason}}"
   }
 }

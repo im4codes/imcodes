@@ -660,7 +660,8 @@
       "opencode_sdk": "OpenCode SDK",
       "gemini_sdk": "Gemini SDK",
       "grok_sdk": "Grok Build",
-      "kimi_sdk": "Kimi Code"
+      "kimi_sdk": "Kimi Code",
+      "deepseek_harness": "DeepSeek Harness"
     },
     "agentGroup": {
       "transport_sdk": "SDK",
@@ -2463,6 +2464,7 @@
       "mcpProviderCursorHeadless": "Cursor headless",
       "mcpProviderOpenCodeSdk": "OpenCode SDK",
       "mcpProviderQwen": "Qwen",
+      "mcpProviderDeepseekHarness": "DeepSeek Harness",
       "mcpProviderUnknown": "{{provider}}",
       "mcpDisabledFlag": "Disabled flag: {{flag}}",
       "mcpDisabledFlagNone": "No disabled flag reported",
@@ -3082,6 +3084,7 @@
     "unlock": "Unlock",
     "unlock_hint": "Ask this node to answer its sign-in screen with the secret it stores.",
     "unlock_unconfigured": "No sign-in secret is stored on this node.",
-    "resolution_unreported": "This node has not reported its driver’s resolutions; these are the common sizes."
+    "resolution_unreported": "This node has not reported its driver’s resolutions; these are the common sizes.",
+    "connection_retrying_reason": "Interrupted by: {{reason}}"
   }
 }
