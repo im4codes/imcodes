@@ -779,6 +779,14 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     if (!state?.currentQuery || !state.inputQueue || state.cancelled) {
       return AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE;
     }
+    // A queue-appended message is ordinary composer input that merely arrives
+    // mid-turn, so it must keep the provenance it would have had if the queue
+    // had drained normally. Marking it synthetic peer input made the SAME text
+    // human-authored when it drained and "not from the user" when it was
+    // appended. Only genuine runtime notifications (delegation replies, peer
+    // audits) are synthetic peer input.
+    const isQueuedUserMessage = notification.deliveryKind
+      === PROVIDER_ACTIVE_TURN_DELIVERY_KINDS.QUEUED_MESSAGE;
     state.inputQueue.push({
       type: 'user',
       message: { role: 'user', content: notification.text },
@@ -787,16 +795,18 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       // Queue append is not a user interrupt. `now` preempts the current
       // Agent SDK turn (which makes the UI look as if the agent slept); `next`
       // drains after the current tool result and before the next model request.
-      priority: notification.deliveryKind === PROVIDER_ACTIVE_TURN_DELIVERY_KINDS.QUEUED_MESSAGE
+      priority: isQueuedUserMessage
         ? CLAUDE_SDK_INPUT_PRIORITIES.NEXT_SAFE_BOUNDARY
         : CLAUDE_SDK_INPUT_PRIORITIES.IMMEDIATE,
-      origin: {
-        kind: 'peer',
-        from: notification.sourceSessionName,
-        name: notification.delegationId,
-      },
+      origin: isQueuedUserMessage
+        ? { kind: 'human' }
+        : {
+          kind: 'peer',
+          from: notification.sourceSessionName,
+          name: notification.delegationId,
+        },
       shouldQuery: true,
-      isSynthetic: true,
+      ...(isQueuedUserMessage ? {} : { isSynthetic: true }),
     } as SDKUserMessage);
     return AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED;
   }

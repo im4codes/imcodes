@@ -206,9 +206,13 @@ describe('ClaudeCodeSdkProvider', () => {
       // running and drains at its next safe boundary.
       priority: 'next',
       shouldQuery: true,
-      isSynthetic: true,
+      // A queued message is the user's own composer input; appending it
+      // mid-turn must not restamp it as synthetic peer input, or the model
+      // reports it as "not from the user".
+      origin: { kind: 'human' },
       message: { role: 'user', content: 'append at the next safe boundary' },
     });
+    expect(queue.buffer?.at(-1)).not.toHaveProperty('isSynthetic');
     expect(sdkMock.runs[0]?.closed).toBe(false);
 
     await provider.endSession('route-queued-message-notify');
