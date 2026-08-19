@@ -229,7 +229,11 @@ export const SHARE_SCOPED_COMMAND_POLICY = {
   [SHARE_BROWSER_COMMANDS.SUBSESSION_RESTART]: deny('direct-surface', 'share-direct-surface-denied'),
   [SHARE_BROWSER_COMMANDS.QUEUE_EDIT]: deny('direct-surface', 'share-direct-surface-denied'),
   [SHARE_BROWSER_COMMANDS.QUEUE_UNDO]: deny('direct-surface', 'share-direct-surface-denied'),
-  [SHARE_BROWSER_COMMANDS.QUEUE_APPEND]: deny('direct-surface', 'share-direct-surface-denied'),
+  // Append is the one queue mutation a participant may perform. It only steers
+  // already-queued text into the running turn — it cannot edit, reorder or
+  // destroy anything — so it is scoped like SESSION_SEND rather than like the
+  // owner-only queue mutations below.
+  [SHARE_BROWSER_COMMANDS.QUEUE_APPEND]: allowParticipant('concrete-tab'),
   [SHARE_BROWSER_COMMANDS.QUEUE_CANCEL]: deny('direct-surface', 'share-direct-surface-denied'),
   [SHARE_BROWSER_COMMANDS.QUEUE_REMOVE]: deny('direct-surface', 'share-direct-surface-denied'),
   [SHARE_BROWSER_COMMANDS.QUEUE_REORDER]: deny('direct-surface', 'share-direct-surface-denied'),

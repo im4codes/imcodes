@@ -4090,8 +4090,24 @@ export class WsBridge {
     reason: ShareReason,
   ): void {
     const sessionName = commandSessionName(msg);
-    if ((msg.type === 'session.send' || msg.type === DAEMON_COMMAND_TYPES.SESSION_CANCEL) && typeof msg.commandId === 'string' && sessionName) {
-      this.emitCommandFailed(ws, msg.commandId, sessionName, reason);
+    const commandId = typeof msg.commandId === 'string' ? msg.commandId.trim() : '';
+    if ((msg.type === 'session.send' || msg.type === DAEMON_COMMAND_TYPES.SESSION_CANCEL) && commandId && sessionName) {
+      this.emitCommandFailed(ws, commandId, sessionName, reason);
+      return;
+    }
+    if (commandId) {
+      // Every other command that carries a commandId — queue append/edit/undo —
+      // has an optimistic UI mutation waiting on an ack keyed by that id. A bare
+      // `error` frame carries no commandId, so the browser could never roll the
+      // mutation back: the row vanished, nothing reached the daemon, and no
+      // timeline event ever arrived. Deny it the same way the daemon denies it.
+      safeSend(ws, JSON.stringify({
+        type: MSG_COMMAND_ACK,
+        commandId,
+        ...(sessionName ? { session: sessionName, sessionName } : {}),
+        status: 'error',
+        error: reason,
+      }));
       return;
     }
     safeSend(ws, JSON.stringify({

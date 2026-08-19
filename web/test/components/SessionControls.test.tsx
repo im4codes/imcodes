@@ -8333,6 +8333,37 @@ afterEach(() => {
     });
   });
 
+  it('exposes the model picker for deepseek-harness despite its empty catalogue', async () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({
+          name: 'deepseek-harness-session',
+          agentType: 'deepseek-harness',
+          runtimeType: 'transport',
+          activeModel: 'deepseek-reasoner',
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    const request = ws.send.mock.calls.find((call) => call[0]?.type === 'transport.list_models')?.[0];
+    expect(request).toMatchObject({ type: 'transport.list_models', agentType: 'deepseek-harness' });
+
+    // `dsh` resolves provider routes from its own ~/.dsh config, so the daemon
+    // always answers with an empty catalogue. The picker must still surface the
+    // effective model — otherwise the daemon's /model plumbing is unreachable.
+    act(() => ws.emit({
+      type: 'transport.models_response',
+      agentType: 'deepseek-harness',
+      requestId: request?.requestId,
+      models: [],
+    }));
+
+    expect(screen.getByRole('button', { name: /^deepseek-reasoner$/i })).toBeDefined();
+  });
+
   it('shows only dynamically discovered grok-sdk models and sends /model', async () => {
     const ws = makeWs();
     render(
@@ -8392,4 +8423,33 @@ afterEach(() => {
       expect(screen.queryByTestId('exec-menu-set-session')).toBeNull();
     });
   });
+
+  it.each([
+    ['participant', 'participant', true],
+    ['viewer', 'viewer', false],
+  ] as const)('offers queue append to a share %s: %s', (_label, effectiveRole, expected) => {
+    // Appending steers already-queued text into the running turn. A
+    // participant may do it (the bridge forwards it); a viewer cannot dispatch
+    // anything, so offering the control would only produce a rollback and a
+    // raw denial code.
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeTransportSession({
+          name: 'qwen-session',
+          agentType: 'qwen',
+          state: 'running',
+          sharedState: { effectiveRole, status: 'active' },
+          transportPendingMessageEntries: [
+            { clientMessageId: 'msg-1', text: 'queued while shared' },
+          ],
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+    const appendButtons = screen.queryAllByRole('button', { name: 'transport_queue_append' });
+    expect(appendButtons.length > 0).toBe(expected);
+  });
+
 });

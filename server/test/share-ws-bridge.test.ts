@@ -25,6 +25,8 @@ import { FS_SESSION_ROOT_PATH } from '../../src/shared/transport/fs.js';
 import { resetSharedCommandRateLimitsForTests } from '../src/share/share-rate-limit.js';
 import { TIMELINE_MESSAGES } from '../../shared/timeline-protocol.js';
 import { DIRECT_FILE_TRANSFER_MSG } from '../../shared/direct-file-transfer.js';
+import { MSG_COMMAND_ACK } from '../../shared/ack-protocol.js';
+import { TRANSPORT_QUEUE_COMMANDS } from '../../shared/transport-queue-types.js';
 
 class MockWs extends EventEmitter {
   sent: Array<string | Buffer> = [];
@@ -365,6 +367,64 @@ describe('WsBridge share-scoped sockets', () => {
 
     expect(member.sentJson.some((msg) => msg.type === 'unlisted.daemon.message')).toBe(true);
     expect(shared.sentJson.some((msg) => msg.type === 'unlisted.daemon.message')).toBe(false);
+  });
+
+  it('forwards a participant queue append and keeps it away from viewers', async () => {
+    const bridge = WsBridge.get(serverId);
+    const target: ShareTarget = { kind: 'main', serverId, sessionName: 'deck_proj_brain' };
+    bridge.setShareCoverageResolverForTests(async () => coverage(target, 'participant', now));
+    const daemon = new MockWs();
+    bridge.handleDaemonConnection(daemon as never, makeDb(), {} as never);
+    daemon.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+    await flushAsync();
+    daemon.sent.length = 0;
+
+    const participant = new MockWs();
+    bridge.handleShareBrowserConnection(participant as never, 'shared-user', makeDb(), {
+      ticketId: 'share-ticket-append-participant',
+      target,
+      snapshot: coverage(target, 'participant', now),
+    });
+    participant.emit('message', JSON.stringify({
+      type: TRANSPORT_QUEUE_COMMANDS.APPEND_MESSAGES,
+      commandId: 'cmd-append-participant',
+      sessionName: 'deck_proj_brain',
+      clientMessageIds: ['queued-1'],
+    }));
+    await flushAsync();
+
+    // A participant may steer already-queued text into the running turn.
+    expect(daemon.sentJson.some((msg) => (
+      msg.type === TRANSPORT_QUEUE_COMMANDS.APPEND_MESSAGES && msg.commandId === 'cmd-append-participant'
+    ))).toBe(true);
+
+    // A viewer may not, and the denial must carry the commandId so the browser
+    // can roll its optimistic queue mutation back instead of silently losing
+    // the row: a bare `error` frame has no commandId to match on.
+    bridge.setShareCoverageResolverForTests(async () => coverage(target, 'viewer', now));
+    const viewer = new MockWs();
+    bridge.handleShareBrowserConnection(viewer as never, 'viewer-user', makeDb(), {
+      ticketId: 'share-ticket-append-viewer',
+      target,
+      snapshot: coverage(target, 'viewer', now),
+    });
+    daemon.sent.length = 0;
+    viewer.emit('message', JSON.stringify({
+      type: TRANSPORT_QUEUE_COMMANDS.APPEND_MESSAGES,
+      commandId: 'cmd-append-viewer',
+      sessionName: 'deck_proj_brain',
+      clientMessageIds: ['queued-1'],
+    }));
+    await flushAsync();
+
+    expect(viewer.sentJson).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: MSG_COMMAND_ACK,
+        commandId: 'cmd-append-viewer',
+        status: 'error',
+      }),
+    ]));
+    expect(daemon.sentJson.some((msg) => msg.type === TRANSPORT_QUEUE_COMMANDS.APPEND_MESSAGES)).toBe(false);
   });
 
   it('denies unknown commands, terminal resize, and viewer sends before daemon forwarding', async () => {

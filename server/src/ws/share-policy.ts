@@ -108,6 +108,7 @@ const SHARE_MODEL_CATALOG_AGENT_TYPES = new Set([
   'gemini-sdk',
   'grok-sdk',
   'kimi-sdk',
+  'deepseek-harness',
 ]);
 
 function denyFromShared(sharedCommand: string): ShareCommandPolicy {
@@ -157,7 +158,7 @@ export const SHARE_WS_COMMAND_POLICY_INVENTORY: readonly ShareBridgeCommandInven
   { bridgeCommand: 'session.resize', sharedCommand: SHARE_BROWSER_COMMANDS.TERMINAL_RESIZE, policy: denyFromShared(SHARE_BROWSER_COMMANDS.TERMINAL_RESIZE) },
   { bridgeCommand: 'session.edit_queued_message', sharedCommand: SHARE_BROWSER_COMMANDS.QUEUE_EDIT, policy: denyFromShared(SHARE_BROWSER_COMMANDS.QUEUE_EDIT) },
   { bridgeCommand: 'session.undo_queued_message', sharedCommand: SHARE_BROWSER_COMMANDS.QUEUE_UNDO, policy: denyFromShared(SHARE_BROWSER_COMMANDS.QUEUE_UNDO) },
-  { bridgeCommand: TRANSPORT_QUEUE_COMMANDS.APPEND_MESSAGES, sharedCommand: SHARE_BROWSER_COMMANDS.QUEUE_APPEND, policy: denyFromShared(SHARE_BROWSER_COMMANDS.QUEUE_APPEND) },
+  { bridgeCommand: TRANSPORT_QUEUE_COMMANDS.APPEND_MESSAGES, sharedCommand: SHARE_BROWSER_COMMANDS.QUEUE_APPEND, policy: { kind: 'participant-covered-action' } },
   { bridgeCommand: 'subsession.start', sharedCommand: SHARE_BROWSER_COMMANDS.SUBSESSION_START, policy: denyFromShared(SHARE_BROWSER_COMMANDS.SUBSESSION_START) },
   { bridgeCommand: 'subsession.stop', sharedCommand: SHARE_BROWSER_COMMANDS.SUBSESSION_STOP, policy: denyFromShared(SHARE_BROWSER_COMMANDS.SUBSESSION_STOP) },
   { bridgeCommand: 'subsession.restart', sharedCommand: SHARE_BROWSER_COMMANDS.SUBSESSION_RESTART, policy: denyFromShared(SHARE_BROWSER_COMMANDS.SUBSESSION_RESTART) },

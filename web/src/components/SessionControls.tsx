@@ -1374,9 +1374,16 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     return raw;
   }, [t]);
   const queuedTransportMessages = queuedTransportEntries.map((entry) => entry.text);
-  const appendableQueuedTransportEntries = queuedTransportEntries.filter((entry) => (
-    entry.status !== 'failed'
-  ));
+  const sharedState = activeSession?.sharedState ?? null;
+  const isShareScopedSession = !!sharedState;
+  const canSharedSessionSend = !isShareScopedSession
+    || (sharedState?.status === 'active' && sharedState.effectiveRole === 'participant');
+  // A share viewer cannot dispatch anything, so appending is denied at the
+  // bridge too. Offering the control would only produce a rollback plus a raw
+  // denial code; participants and owners keep it.
+  const appendableQueuedTransportEntries = canSharedSessionSend
+    ? queuedTransportEntries.filter((entry) => entry.status !== 'failed')
+    : [];
   const queuedTransportLatestMessage = queuedTransportMessages[queuedTransportMessages.length - 1] ?? '';
   const editingQueuedEntry = editingQueuedMessageId
     ? queuedTransportEntries.find((entry) => entry.clientMessageId === editingQueuedMessageId) ?? null
@@ -1729,10 +1736,6 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     && !subSessionId
     && !compact
     && !!onToggleSessionPin;
-  const sharedState = activeSession?.sharedState ?? null;
-  const isShareScopedSession = !!sharedState;
-  const canSharedSessionSend = !isShareScopedSession
-    || (sharedState?.status === 'active' && sharedState.effectiveRole === 'participant');
   // Input only disabled when there's no session or the active share cannot dispatch messages.
   const inputDisabled = !hasSession || !canSharedSessionSend;
   // Owner-only controls stay disabled for shared sessions. Participant-scoped
@@ -1763,11 +1766,12 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const isQwen = activeSession?.agentType === 'qwen';
   const isCopilot = activeSession?.agentType === 'copilot-sdk';
   const isCursorHeadless = activeSession?.agentType === 'cursor-headless';
+  const isDeepseekHarness = activeSession?.agentType === 'deepseek-harness';
   const isGeminiSdk = activeSession?.agentType === 'gemini-sdk';
   const isGrokSdk = activeSession?.agentType === 'grok-sdk';
   const isKimiSdk = activeSession?.agentType === 'kimi-sdk';
   const isOpenCodeSdk = activeSession?.agentType === 'opencode-sdk';
-  const supportsGenericTransportModelSelect = isCopilot || isCursorHeadless || isGeminiSdk || isGrokSdk || isKimiSdk || isOpenCodeSdk;
+  const supportsGenericTransportModelSelect = isCopilot || isCursorHeadless || isDeepseekHarness || isGeminiSdk || isGrokSdk || isKimiSdk || isOpenCodeSdk;
   // Source-of-truth priority for the model picker:
   //   1. `useTransportModels` — live daemon probe via `transport.list_models`
   //      WS round-trip. Works uniformly for main sessions AND sub-sessions
@@ -6649,7 +6653,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                 const sharedActorLabel = formatSharedActorLabel(t, entry.sharedActor);
                 return (
                 <div class="controls-queued-item" key={entry.clientMessageId}>
-                  {entry.status !== 'failed' && isEditableQueuedEntry(entry) && (
+                  {canSharedSessionSend && entry.status !== 'failed' && isEditableQueuedEntry(entry) && (
                     <button type="button" class="controls-queued-action controls-queued-action-append" onClick={() => handleQueuedMessagesAppend([entry])}>
                       {t('session.transport_queue_append')}
                     </button>
