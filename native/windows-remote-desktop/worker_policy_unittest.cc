@@ -103,6 +103,40 @@ TEST(WorkerPolicyTest, RebindsCaptureWheneverItIsNotOnTheDisplayedDesktop) {
   EXPECT_FALSE(ShouldRebindCapture(L"", L"Default"));
 }
 
+TEST(WorkerPolicyTest, PointerFreshnessIsPerChannelSoOneStreamCannotSilenceAnother) {
+  // Motion travels on the unreliable channel; clicks and the reliable position
+  // sample travel on the ordered one. They are one stream of sequence numbers
+  // but two independent deliveries, so freshness has to be judged per channel.
+  // Judging it against a single shared counter is what stopped the remote
+  // cursor following: every click raised the bar above the motion already in
+  // flight, and that motion was discarded on arrival.
+  bool control_seen = false;
+  uint64_t control_last = 0;
+  bool pointer_seen = false;
+  uint64_t pointer_last = 0;
+
+  EXPECT_TRUE(InputSequenceIsFresh(pointer_seen, pointer_last, 10));
+  pointer_seen = true;
+  pointer_last = 10;
+
+  EXPECT_TRUE(InputSequenceIsFresh(control_seen, control_last, 11));
+  control_seen = true;
+  control_last = 11;
+
+  // The next motion still lands, even though a higher sequence was just
+  // accepted on the other channel.
+  EXPECT_TRUE(InputSequenceIsFresh(pointer_seen, pointer_last, 12));
+  pointer_last = 12;
+
+  // A genuine replay on that same channel is still refused.
+  EXPECT_FALSE(InputSequenceIsFresh(pointer_seen, pointer_last, 12));
+  EXPECT_FALSE(InputSequenceIsFresh(pointer_seen, pointer_last, 11));
+
+  // And the reliable channel keeps its own ordering.
+  EXPECT_FALSE(InputSequenceIsFresh(control_seen, control_last, 11));
+  EXPECT_TRUE(InputSequenceIsFresh(control_seen, control_last, 13));
+}
+
 TEST(WorkerPolicyTest, WakesTheLockCurtainBeforeItTypesAnything) {
   // A locked machine rests on the curtain, which has no password box at all,
   // so a session that connects to it finds nothing to type into. That is why
