@@ -28,8 +28,10 @@ import { RemoteDesktopClient, type RemoteDesktopSnapshot } from '../remote-deskt
 import {
   REMOTE_DESKTOP_MOBILE_SHORTCUTS,
   isAppleControllerPlatform,
+  detectRemoteDesktopClipboardShortcut,
   mapRemoteDesktopKeyboardEvent,
   readControllerPlatform,
+  REMOTE_DESKTOP_CLIPBOARD_SHORTCUT,
   remoteDesktopShortcutLabel,
   sendRemoteDesktopChord,
 } from '../remote-desktop-keyboard.js';
@@ -1116,6 +1118,30 @@ export function RemoteDesktopPanel({
     const client = clientRef.current;
     const mapped = mapRemoteDesktopKeyboardEvent(event);
     if (!client || !mapped) return;
+    // Copy and paste are answered by the clipboard bridge rather than forwarded
+    // blind: the two machines have separate clipboards, so the keystroke alone
+    // copies where the operator cannot reach and pastes what they never copied.
+    // Copy still reaches the remote — the bridge sends it there to make the
+    // selection — so an interrupt in a remote console keeps working.
+    const clipboardShortcut = detectRemoteDesktopClipboardShortcut(event);
+    if (clipboardShortcut === REMOTE_DESKTOP_CLIPBOARD_SHORTCUT.PASTE
+      && !navigator.clipboard?.readText) {
+      // No clipboard read here (Firefox, non-secure contexts): leave the key
+      // alone so the browser raises its own paste event, which carries the text
+      // without needing permission. Not forwarding it keeps the remote from
+      // pasting its own clipboard on top.
+      return;
+    }
+    if (clipboardShortcut) {
+      event.preventDefault();
+      if (!down) return;
+      if (clipboardShortcut === REMOTE_DESKTOP_CLIPBOARD_SHORTCUT.COPY) {
+        void copyRemoteSelection();
+      } else {
+        void pasteLocalClipboard();
+      }
+      return;
+    }
     const commandEvent = event.code === 'MetaLeft' || event.code === 'MetaRight';
     if (mapped.commandAsControl && commandEvent
       && suppressedCommandCodesRef.current.has(mapped.code)

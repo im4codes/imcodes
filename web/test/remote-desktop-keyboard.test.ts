@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
+  detectRemoteDesktopClipboardShortcut,
   mapRemoteDesktopKeyboardEvent,
+  REMOTE_DESKTOP_CLIPBOARD_SHORTCUT,
   sendRemoteDesktopChord,
 } from '../src/remote-desktop-keyboard.js';
 
@@ -61,3 +63,28 @@ describe('remote desktop keyboard mapping', () => {
     expect(releaseAll).toHaveBeenCalledTimes(1);
   });
 });
+
+describe('clipboard shortcuts', () => {
+  const key = (over: Partial<{ code: string; ctrlKey: boolean; metaKey: boolean; altKey: boolean; shiftKey: boolean }>) => ({
+    code: 'KeyC', key: 'c', ctrlKey: false, altKey: false, metaKey: false, shiftKey: false, ...over,
+  });
+
+  it('reads copy and paste in the controller platform own terms', () => {
+    // The two clipboards are separate, so these are the shortcuts the bridge
+    // has to answer rather than forward.
+    expect(detectRemoteDesktopClipboardShortcut(key({ ctrlKey: true }), 'Win32'))
+      .toBe(REMOTE_DESKTOP_CLIPBOARD_SHORTCUT.COPY);
+    expect(detectRemoteDesktopClipboardShortcut(key({ code: 'KeyV', metaKey: true }), 'MacIntel'))
+      .toBe(REMOTE_DESKTOP_CLIPBOARD_SHORTCUT.PASTE);
+    // The other platform's modifier is not the operator's shortcut.
+    expect(detectRemoteDesktopClipboardShortcut(key({ metaKey: true }), 'Win32')).toBeNull();
+    expect(detectRemoteDesktopClipboardShortcut(key({ ctrlKey: true }), 'MacIntel')).toBeNull();
+    // Anything else held means a different command (paste-special, column
+    // copy); those keep going to the remote untouched.
+    expect(detectRemoteDesktopClipboardShortcut(key({ ctrlKey: true, shiftKey: true }), 'Win32')).toBeNull();
+    expect(detectRemoteDesktopClipboardShortcut(key({ ctrlKey: true, altKey: true }), 'Win32')).toBeNull();
+    expect(detectRemoteDesktopClipboardShortcut(key({ code: 'KeyX', ctrlKey: true }), 'Win32')).toBeNull();
+    expect(detectRemoteDesktopClipboardShortcut(key({}), 'Win32')).toBeNull();
+  });
+});
+

@@ -91,6 +91,41 @@ export function mapRemoteDesktopKeyboardEvent(
   };
 }
 
+export const REMOTE_DESKTOP_CLIPBOARD_SHORTCUT = {
+  COPY: 'copy',
+  PASTE: 'paste',
+} as const;
+
+export type RemoteDesktopClipboardShortcut = typeof REMOTE_DESKTOP_CLIPBOARD_SHORTCUT[
+  keyof typeof REMOTE_DESKTOP_CLIPBOARD_SHORTCUT
+];
+
+/**
+ * The copy/paste the operator actually meant, in their own platform's terms:
+ * Command on an Apple controller, Control everywhere else.
+ *
+ * These two are special among shortcuts because the clipboards are not shared.
+ * Forwarding the keystroke alone copies into the remote machine's clipboard,
+ * which the operator cannot reach, and pastes from it, which is never what they
+ * just copied locally — so the intent has to be recognised here and answered by
+ * the clipboard bridge instead.
+ *
+ * Shift or Alt held means something else entirely (paste-special, column copy),
+ * so those keep going to the remote untouched.
+ */
+export function detectRemoteDesktopClipboardShortcut(
+  event: RemoteDesktopKeyboardEventLike & { shiftKey?: boolean },
+  platform = readControllerPlatform(),
+): RemoteDesktopClipboardShortcut | null {
+  const primaryHeld = isAppleControllerPlatform(platform)
+    ? event.metaKey && !event.ctrlKey
+    : event.ctrlKey && !event.metaKey;
+  if (!primaryHeld || event.altKey || event.shiftKey === true) return null;
+  if (event.code === 'KeyC') return REMOTE_DESKTOP_CLIPBOARD_SHORTCUT.COPY;
+  if (event.code === 'KeyV') return REMOTE_DESKTOP_CLIPBOARD_SHORTCUT.PASTE;
+  return null;
+}
+
 export function sendRemoteDesktopChord(
   keys: readonly RemoteDesktopChordKey[],
   send: (
