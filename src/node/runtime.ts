@@ -47,6 +47,7 @@ import {
   type RemoteDesktopDaemonCommand,
 } from '../../shared/remote-desktop.js';
 import { RemoteDesktopWorkerHost } from './remote-desktop-worker-host.js';
+import { dispatchRemoteDesktopCommand } from './remote-desktop-dispatch.js';
 import { isRemoteDesktopFeatureEnabled } from '../../shared/remote-desktop-feature.js';
 import { CONTROLLED_NODE_SAFE_SELF_UPGRADE_CAPABILITY } from '../../shared/controlled-node-service.js';
 import { cleanupLegacyWindowsUpgradeRescue } from './legacy-upgrade-rescue.js';
@@ -264,37 +265,12 @@ export function createControlledNodeRuntime(
         return;
       }
       if (isRemoteDesktopMessageType(message.type)) {
-        const parsed = validateRemoteDesktopDaemonCommand(message);
-        if (!parsed.ok) return;
-        if (!remoteDesktopEnabled) {
-          if (parsed.value.type !== REMOTE_DESKTOP_MSG.STOP
-            && parsed.value.type !== REMOTE_DESKTOP_MSG.CANCEL) {
-            client.send({
-              type: REMOTE_DESKTOP_MSG.TERMINAL,
-              requestId: parsed.value.requestId,
-              sessionId: parsed.value.sessionId,
-              capability: parsed.value.capability,
-              reason: REMOTE_DESKTOP_TERMINAL_REASON.CAPABILITY_UNAVAILABLE,
-            });
-          }
-          return;
-        }
-        try {
-          if (await remoteDesktopWorker.handle(parsed.value)) return;
-        } catch {
-          // Fall through to a bounded terminal frame. The worker never receives
-          // the long-lived node credential and no error detail is reflected.
-        }
-        if (parsed.value.type !== REMOTE_DESKTOP_MSG.STOP
-          && parsed.value.type !== REMOTE_DESKTOP_MSG.CANCEL) {
-          client.send({
-            type: REMOTE_DESKTOP_MSG.TERMINAL,
-            requestId: parsed.value.requestId,
-            sessionId: parsed.value.sessionId,
-            capability: parsed.value.capability,
-            reason: REMOTE_DESKTOP_TERMINAL_REASON.WORKER_FAILED,
-          });
-        }
+        await dispatchRemoteDesktopCommand({
+          message,
+          enabled: remoteDesktopEnabled,
+          target: remoteDesktopWorker,
+          send: (reply) => client.send(reply),
+        });
         return;
       }
       if (message.type === MACHINE_DIRECT_FILE_TRANSFER_MSG.REQUEST) {

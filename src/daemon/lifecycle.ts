@@ -4,6 +4,8 @@ import { sessionExists, isPaneAlive, BACKEND, killSession } from '../agent/tmux.
 import { detectRepo } from '../repo/detector.js';
 import { repoCache, RepoCache } from '../repo/cache.js';
 import { ServerLink, setServerLinkReconnectResyncHandler } from './server-link.js';
+import { DaemonRemoteDesktop } from './remote-desktop-daemon.js';
+import { closeDaemonRemoteDesktop, setDaemonRemoteDesktop } from './remote-desktop-registry.js';
 import { handleWebCommand, setRouterContext, refreshCodexQuotaMetadata, refreshClaudeSdkSubQuotaMetadata } from './command-handler.js';
 import { dispatchSessionMessageByName } from './session-dispatch.js';
 import { initFileTransfer, startCleanupTimer } from './file-transfer-handler.js';
@@ -721,6 +723,15 @@ export async function startup(): Promise<DaemonContext> {
       // snapshots), but it is a robustness fix, not that bug's fix.
       scheduleServerLinkRestoreBroadcast?.();
     });
+    // Remote control on a normal Windows daemon. The host advertises
+    // `installable` on any Windows x64 daemon and the capability itself only
+    // once the signed native worker has been downloaded and verified, so a
+    // machine that cannot serve it never claims it can.
+    const link = serverLink;
+    setDaemonRemoteDesktop(new DaemonRemoteDesktop({
+      send: (message) => link.send(message as never),
+      onCapabilityChange: () => link.refreshDaemonCapabilities(),
+    }));
     serverLink.onMessage((msg) => {
       handleWebCommand(msg, serverLink!);
     });
@@ -1397,6 +1408,10 @@ export async function shutdown(exitCode = 0): Promise<void> {
   await shutdownDirectFileTransfers().catch((err) => {
     logger.warn({ err }, 'Daemon shutdown direct file transfer cleanup failed');
   });
+
+  // The native worker is a separate process; leaving it running would keep a
+  // capture session and its named pipe alive past the daemon that owns it.
+  closeDaemonRemoteDesktop();
 
   // Kill all ConPTY sessions (they don't survive daemon exit like tmux)
   if ((BACKEND as string) === 'conpty') {

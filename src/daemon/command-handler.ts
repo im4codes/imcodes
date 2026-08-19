@@ -1123,6 +1123,9 @@ import { FS_TRANSPORT_MSG } from '../../shared/fs-transport-messages.js';
 import { FS_WRITE_MAX_BYTES } from '../../shared/fs-write-limits.js';
 import { FILE_TRANSFER_MSG } from '../../shared/transport/file-transfer.js';
 import { isDirectFileTransferMessageType } from '../../shared/direct-file-transfer.js';
+import { isRemoteDesktopMessageType } from '../../shared/remote-desktop.js';
+import { REMOTE_DESKTOP_INSTALL_MSG } from '../../shared/remote-desktop-install.js';
+import { handleDaemonRemoteDesktopMessage } from './remote-desktop-registry.js';
 import { handleDirectFileTransferCommand } from './direct-file-transfer.js';
 import { REPO_MSG } from '../shared/repo-types.js';
 import { handlePreviewCommand } from './preview-relay.js';
@@ -1554,6 +1557,15 @@ export function handleWebCommand(msg: unknown, serverLink: ServerLink): void {
 
   if (isDirectFileTransferMessageType(cmd.type)) {
     void handleDirectFileTransferCommand(cmd, serverLink);
+    return;
+  }
+
+  // Remote desktop is served by the native worker host, not the session
+  // machinery below: signalling, worker install and their replies never touch a
+  // session. The host reports back whether the message was one of its own.
+  if (typeof cmd.type === 'string'
+    && (isRemoteDesktopMessageType(cmd.type) || cmd.type === REMOTE_DESKTOP_INSTALL_MSG.REQUEST)) {
+    void handleDaemonRemoteDesktopMessage(cmd);
     return;
   }
 

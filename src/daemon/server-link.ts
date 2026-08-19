@@ -48,6 +48,7 @@ import {
   stringifyForServerSend,
 } from './latency-tracer.js';
 import { getDaemonBuildInfo } from './build-info.js';
+import { daemonRemoteDesktopCapabilities } from './remote-desktop-registry.js';
 import { incrementCounter } from '../util/metrics.js';
 import {
   TIMELINE_DELIVERY_METRICS,
@@ -831,6 +832,16 @@ export class ServerLink {
     this.sendDaemonHello();
   }
 
+  /**
+   * Re-advertise capabilities after a runtime-conditional one changed — the
+   * remote-desktop worker being installed, for example. The server keys the
+   * feature off the advertised set, so an install that never re-advertises
+   * leaves the daemon able to serve remote control but never asked to.
+   */
+  refreshDaemonCapabilities(): void {
+    this.sendDaemonHello();
+  }
+
   getP2pWorkflowCapabilities(): readonly string[] {
     return [...this.p2pWorkflowCapabilities];
   }
@@ -840,6 +851,7 @@ export class ServerLink {
       ...this.p2pWorkflowCapabilities,
       ...DAEMON_STATIC_CAPABILITIES,
       ...directFileTransferDaemonCapabilities(isDirectFileTransferAvailable()),
+      ...daemonRemoteDesktopCapabilities(),
     ])];
   }
 

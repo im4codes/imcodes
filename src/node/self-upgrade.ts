@@ -114,7 +114,7 @@ function readHeader(headers: Headers, name: string): string | null {
 }
 
 async function downloadArtifact(input: {
-  credential: ControlledNodeCredential;
+  credential: ArtifactDownloadCredential;
   target: ControlledNodeArtifactTarget;
   dir: string;
   fetchImpl: typeof fetch;
@@ -228,8 +228,15 @@ export async function downloadControlledNodeComputerUseHelper(input: {
   }
 }
 
+/**
+ * The credential fields an artifact download actually needs. A normal daemon
+ * holds these too, and downloads the remote-desktop worker with them — it just
+ * has no controlled-node role to claim.
+ */
+export type ArtifactDownloadCredential = Pick<ControlledNodeCredential, 'serverId' | 'token' | 'serverUrl'>;
+
 export async function downloadControlledNodeRemoteDesktopWorker(input: {
-  credential: ControlledNodeCredential;
+  credential: ArtifactDownloadCredential;
   target: ControlledNodeArtifactTarget;
   dir: string;
   fetchImpl: typeof fetch;
