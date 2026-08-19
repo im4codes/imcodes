@@ -1611,6 +1611,49 @@ exec "${realGit}" "$@"
     expect(implementationReminderCount()).toBe(OPENSPEC_AUTO_DELIVER_MAX_IMPLEMENTATION_MARKER_REMINDERS);
   });
 
+  it('does not exhaust the marker reminder cap while a slow session has not answered the implementation prompt yet', async () => {
+    // Regression (CI-only flake): the marker poll re-checked every poll interval
+    // and, once the first grace window had passed, nudged on EVERY poll. With
+    // tasks already fully checked there is no task progress left to reset the
+    // reminder counter, so a session that was merely slow to answer (a loaded
+    // CI worker) had the whole capped ladder spent on it within a few hundred
+    // milliseconds and the run terminalized as needs_human before it had said
+    // anything. Poll-driven nudges must cost a real quiet window each.
+    await makeChange('demo-change', '- [x] first\n- [x] second\n');
+    const launchAck = await (async () => {
+      await handleOpenSpecAutoDeliverCommand({
+        type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
+        requestId: 'req-implementation-marker-poll-grace',
+        sessionName: 'deck_demo_brain',
+        changeName: 'demo-change',
+        presetId: 'fast',
+      }, serverLinkMock as never);
+      return serverLinkMock.send.mock.calls
+        .map((call) => call[0])
+        .find((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.LAUNCH_ACK);
+    })();
+
+    await waitForTransportSend((text) =>
+      text.includes('Implementation completion marker (required):')
+      && text.includes('write this exact JSON marker to:'),
+      SEND_WAIT_MS,
+    );
+
+    // Stall far longer than the entire poll-driven ladder used to survive, but
+    // without ever going idle: the run must still be waiting in implementation.
+    await new Promise((resolve) => setTimeout(resolve, 800));
+    const run = getOpenSpecAutoDeliverRun(String(launchAck?.projection?.runId ?? ''));
+    expect(run?.status).toBe('implementation_task_loop');
+
+    // The late answer must still be accepted and advance the run.
+    await emitDeckDemoIdle();
+    await waitForSend((msg) =>
+      msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
+      && msg.projection?.stage === 'implementation_audit_repair',
+      SEND_WAIT_MS,
+    );
+  });
+
   it('throttles bursty idle reminders to the minimum interval', async () => {
     // Regression: reminders used to fire on every idle. A burst of idles within
     // the cooldown window must collapse to a single (deferred) reminder.
