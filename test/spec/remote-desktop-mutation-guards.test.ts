@@ -65,11 +65,32 @@ function occurrences(source: string, needle: string): number {
 
 const contracts: Contract[] = [
   {
+    // The daemon exemptions must never leak to a controlled node: `exec_enabled`
+    // is that node's operator switch, `os` is its enrolled platform and
+    // `controlled_capabilities` is its advertised set. A daemon proves those
+    // three live instead, by advertising the capability at all.
+    name: 'controlled-node admission checks stay controlled-node only',
+    guards: [
+      {
+        path: 'server/src/ws/remote-desktop-router.ts',
+        needle: 'const controlledNode = access.node_role === NODE_ROLE.CONTROLLED;',
+      },
+      {
+        path: 'server/src/ws/remote-desktop-router.ts',
+        needle: 'if (controlledNode && !access.exec_enabled)',
+      },
+      {
+        path: 'server/src/ws/remote-desktop-router.ts',
+        needle: "if (controlledNode && access.os !== 'win')",
+      },
+    ],
+  },
+  {
     name: 'continuous access revalidation',
     guards: [
       {
         path: 'server/src/ws/remote-desktop-router.ts',
-        needle: 'this.hooks.resolveAccess ?? resolveControlledMachineAccess',
+        needle: 'this.hooks.resolveAccess ?? resolveRemoteDesktopHostAccess',
         minimum: 2,
       },
       {
@@ -1161,10 +1182,22 @@ const mutations: Mutation[] = [
     needle: 'dependencies.adm = webrtc::make_ref_counted<SilentAudioDeviceModule>()',
   },
   {
+    name: 'exempt a controlled node from its exec switch',
+    contract: 'controlled-node admission checks stay controlled-node only',
+    path: 'server/src/ws/remote-desktop-router.ts',
+    needle: 'if (controlledNode && !access.exec_enabled)',
+  },
+  {
+    name: 'stop distinguishing a daemon host from a controlled node',
+    contract: 'controlled-node admission checks stay controlled-node only',
+    path: 'server/src/ws/remote-desktop-router.ts',
+    needle: 'const controlledNode = access.node_role === NODE_ROLE.CONTROLLED;',
+  },
+  {
     name: 'remove access revalidation',
     contract: 'continuous access revalidation',
     path: 'server/src/ws/remote-desktop-router.ts',
-    needle: 'this.hooks.resolveAccess ?? resolveControlledMachineAccess',
+    needle: 'this.hooks.resolveAccess ?? resolveRemoteDesktopHostAccess',
   },
   {
     name: 'remove requester socket binding',
