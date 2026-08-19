@@ -707,18 +707,16 @@ bool DxgiDesktopSource::EnsureCursorSurface(int width, int height) {
 
 void DxgiDesktopSource::CompositeCursor(uint8_t* bgra, int stride,
                                         int width, int height) {
-  if (pointer_position_known_) {
-    if (!pointer_visible_) return;
-    if (pointer_shape_valid_) {
-      CompositeDxgiCursor(bgra, stride, width, height);
-      return;
-    }
-    // Some adapters report the first visible position before returning a
-    // shape buffer. Fall through to the native cursor until DXGI supplies the
-    // shape instead of making the remote cursor disappear indefinitely.
+  if (pointer_position_known_ && pointer_visible_ && pointer_shape_valid_) {
+    CompositeDxgiCursor(bgra, stride, width, height);
+    return;
   }
-
-  // Very first frames can precede DXGI's first pointer metadata update.
+  // Everything else falls through to what Windows itself reports. DXGI calls a
+  // pointer invisible whenever it is suppressed — measured on a node with no
+  // mouse, that is its resting state (CURSOR_SHOWING=0, CURSOR_SUPPRESSED=1)
+  // even while a viewer is driving it — and some adapters report a position
+  // before they ever send a shape. Trusting DXGI's visibility alone is what
+  // left the remote cursor out of the picture entirely.
   CURSORINFO cursor{};
   cursor.cbSize = sizeof(cursor);
   // A suppressed pointer is one Windows is hiding because nothing physical has
