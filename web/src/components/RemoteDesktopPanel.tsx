@@ -1096,8 +1096,14 @@ export function RemoteDesktopPanel({
 
   useEffect(() => {
     const timer = setInterval(() => {
-      setPointerMovesSeen(pointerMovesSeenRef.current);
-      setPointerMovesUnmapped(pointerMovesUnmappedRef.current);
+      // Only on change. An idle panel that re-rendered every second kept
+      // scheduling render work forever, for a number nobody was watching move.
+      setPointerMovesSeen((current) => (
+        current === pointerMovesSeenRef.current ? current : pointerMovesSeenRef.current
+      ));
+      setPointerMovesUnmapped((current) => (
+        current === pointerMovesUnmappedRef.current ? current : pointerMovesUnmappedRef.current
+      ));
     }, 1_000);
     return () => clearInterval(timer);
   }, []);
