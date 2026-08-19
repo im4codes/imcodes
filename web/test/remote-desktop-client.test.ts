@@ -900,6 +900,158 @@ describe('RemoteDesktopClient', () => {
     intervalSpy.mockRestore();
   });
 
+  it('waits out a slow first frame instead of failing a peer that never started', async () => {
+    const intervalSpy = vi.spyOn(globalThis, 'setInterval');
+    let socket!: FakeSocket;
+    let peer!: FakePeer;
+    let now = 0;
+    const client = new RemoteDesktopClient('controlled-win', { onSnapshot: vi.fn() }, {
+      fetchTicket: async () => 'ticket-first-media',
+      createSocket: () => {
+        socket = new FakeSocket();
+        queueMicrotask(() => socket.open());
+        return socket as unknown as WebSocket;
+      },
+      createPeer: () => {
+        peer = new FakePeer();
+        return peer as unknown as RTCPeerConnection;
+      },
+      now: () => now,
+      isDocumentVisible: () => true,
+    });
+
+    await client.start();
+    const start = JSON.parse(socket.sent[0]!) as { requestId: string };
+    socket.receive({
+      type: REMOTE_DESKTOP_MSG.AUTHORIZED,
+      requestId: start.requestId,
+      sessionId: 'session_firstmed',
+      capability: 'f'.repeat(43),
+      expiresAt: 60_000,
+      leaseExpiresAt: 15_000,
+      daemonGeneration: 1,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
+      inputEpoch: 1,
+      iceServers: ['stun:stun.example.test:3478'],
+    });
+    await vi.waitFor(() => expect(peer).toBeDefined());
+    const control = peer.channels.get(REMOTE_DESKTOP_CHANNEL.CONTROL)!;
+    control.receive({
+      type: REMOTE_DESKTOP_DATA_MSG.QUALITY,
+      protocolVersion: REMOTE_DESKTOP_PROTOCOL_VERSION,
+      sessionId: 'session_firstmed',
+      sequence: 1,
+      preset: '720p30',
+      encoderClass: 'hardware',
+      width: 1280,
+      height: 720,
+      fps: 30,
+      bitrateBps: 3_000_000,
+      droppedFrames: 0,
+      rttMs: 1,
+    });
+    // An inbound-rtp report exists as soon as the transceiver does, pinned at
+    // zero bytes: this is a relayed path still setting up, not a dead peer.
+    peer.stats = [{
+      type: 'inbound-rtp', kind: 'video', bytesReceived: 0, timestamp: 1_000,
+    }];
+    peer.connect();
+    const statsTick = intervalSpy.mock.calls.find((call) => call[1] === 1_000)?.[0] as (() => void);
+    expect(statsTick).toBeTypeOf('function');
+
+    // Well past the stall window, which used to kill exactly this connection.
+    for (const at of [1_000, 5_000, REMOTE_DESKTOP_LIMITS.MEDIA_PROGRESS_TIMEOUT_MS + 4_000]) {
+      now = at;
+      statsTick();
+      await Promise.resolve();
+      expect(client.current().state).not.toBe(REMOTE_DESKTOP_STATE.FAILED);
+    }
+
+    // Media arrives late and the session simply continues.
+    peer.stats = [{
+      type: 'inbound-rtp', kind: 'video', bytesReceived: 12_000, timestamp: 20_000,
+    }];
+    now = REMOTE_DESKTOP_LIMITS.MEDIA_PROGRESS_TIMEOUT_MS + 6_000;
+    statsTick();
+    await vi.waitFor(() => expect(client.current().quality?.bitrateBps).toBeGreaterThan(0));
+    expect(client.current().state).not.toBe(REMOTE_DESKTOP_STATE.FAILED);
+
+    // Once started, a stall is still a failure — the old rule keeps its job.
+    now += REMOTE_DESKTOP_LIMITS.MEDIA_PROGRESS_TIMEOUT_MS + 1_000;
+    statsTick();
+    await vi.waitFor(() => expect(client.current()).toMatchObject({
+      state: REMOTE_DESKTOP_STATE.FAILED,
+      terminalReason: REMOTE_DESKTOP_TERMINAL_REASON.PEER_FAILED,
+    }));
+    intervalSpy.mockRestore();
+  });
+
+  it('gives up on a peer that never delivers a first frame at all', async () => {
+    const intervalSpy = vi.spyOn(globalThis, 'setInterval');
+    let socket!: FakeSocket;
+    let peer!: FakePeer;
+    let now = 0;
+    const client = new RemoteDesktopClient('controlled-win', { onSnapshot: vi.fn() }, {
+      fetchTicket: async () => 'ticket-no-media',
+      createSocket: () => {
+        socket = new FakeSocket();
+        queueMicrotask(() => socket.open());
+        return socket as unknown as WebSocket;
+      },
+      createPeer: () => {
+        peer = new FakePeer();
+        return peer as unknown as RTCPeerConnection;
+      },
+      now: () => now,
+      isDocumentVisible: () => true,
+    });
+
+    await client.start();
+    const start = JSON.parse(socket.sent[0]!) as { requestId: string };
+    socket.receive({
+      type: REMOTE_DESKTOP_MSG.AUTHORIZED,
+      requestId: start.requestId,
+      sessionId: 'session_nomedia1',
+      capability: 'n'.repeat(43),
+      expiresAt: 600_000,
+      leaseExpiresAt: 150_000,
+      daemonGeneration: 1,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
+      inputEpoch: 1,
+      iceServers: ['stun:stun.example.test:3478'],
+    });
+    await vi.waitFor(() => expect(peer).toBeDefined());
+    peer.channels.get(REMOTE_DESKTOP_CHANNEL.CONTROL)!.receive({
+      type: REMOTE_DESKTOP_DATA_MSG.QUALITY,
+      protocolVersion: REMOTE_DESKTOP_PROTOCOL_VERSION,
+      sessionId: 'session_nomedia1',
+      sequence: 1,
+      preset: '720p30',
+      encoderClass: 'hardware',
+      width: 1280,
+      height: 720,
+      fps: 30,
+      bitrateBps: 3_000_000,
+      droppedFrames: 0,
+      rttMs: 1,
+    });
+    peer.stats = [{
+      type: 'inbound-rtp', kind: 'video', bytesReceived: 0, timestamp: 1_000,
+    }];
+    peer.connect();
+    const statsTick = intervalSpy.mock.calls.find((call) => call[1] === 1_000)?.[0] as (() => void);
+    now = 1_000;
+    statsTick();
+    await Promise.resolve();
+    now = 1_000 + REMOTE_DESKTOP_LIMITS.FIRST_MEDIA_TIMEOUT_MS;
+    statsTick();
+    await vi.waitFor(() => expect(client.current()).toMatchObject({
+      state: REMOTE_DESKTOP_STATE.FAILED,
+      terminalReason: REMOTE_DESKTOP_TERMINAL_REASON.PEER_FAILED,
+    }));
+    intervalSpy.mockRestore();
+  });
+
   it('denies unknown keys and secure-attention input before the DataChannel', () => {
     expect(isRemoteDesktopKeyAllowed('KeyA', { control: false, alt: false })).toBe(true);
     expect(isRemoteDesktopKeyAllowed('MetaLeft', { control: false, alt: false })).toBe(false);

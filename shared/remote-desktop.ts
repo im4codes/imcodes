@@ -287,6 +287,16 @@ export const REMOTE_DESKTOP_LIMITS = {
   KEEPALIVE_TIMEOUT_MS: 15_000,
   DATA_KEEPALIVE_INTERVAL_MS: 30_000,
   MEDIA_PROGRESS_TIMEOUT_MS: 10_000,
+  /**
+   * How long a connected peer may take to deliver its first video bytes.
+   *
+   * The stall rule above measures media that stopped; it cannot measure media
+   * that has not started, and applying it before the first byte kills healthy
+   * connections. A relayed path (TURN over TCP, which is what a node behind
+   * blocked UDP actually gets) plus a cold worker — signature check, WebRTC
+   * init, first keyframe — routinely needs longer than the stall window.
+   */
+  FIRST_MEDIA_TIMEOUT_MS: 30_000,
   IDLE_TIMEOUT_MS: 15 * 60_000,
   ABSOLUTE_LIFETIME_MS: 2 * 60 * 60_000,
   MAX_PER_BROWSER: 1,

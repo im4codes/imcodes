@@ -281,6 +281,9 @@ export class RemoteDesktopClient {
   private previousInboundStats: { bytes: number; timestamp: number } | null = null;
   private lastMediaBytesReceived: number | null = null;
   private lastMediaProgressAt: number | null = null;
+  /** Media that never started is a different failure from media that stopped. */
+  private mediaStarted = false;
+  private firstMediaWaitStartedAt: number | null = null;
   private aggregateBytesReceived = 0;
   private pendingInputAckSequence: number | null = null;
   private inputAckTimer: ReturnType<typeof setTimeout> | null = null;
@@ -682,6 +685,8 @@ export class RemoteDesktopClient {
       this.previousInboundStats = null;
       this.lastMediaBytesReceived = null;
       this.lastMediaProgressAt = null;
+      this.mediaStarted = false;
+      this.firstMediaWaitStartedAt = null;
       // Detach before closing: the close handlers fail the session for the
       // *live* peer, and during a handover the peer being closed is already
       // the superseded one.
@@ -1071,9 +1076,24 @@ export class RemoteDesktopClient {
         const now = this.deps.now?.() ?? Date.now();
         const visible = this.deps.isDocumentVisible?.()
           ?? (typeof document === 'undefined' || document.visibilityState === 'visible');
+        if (inbound.bytesReceived > 0) this.mediaStarted = true;
         if (!visible) {
           this.lastMediaBytesReceived = inbound.bytesReceived;
           this.lastMediaProgressAt = null;
+          this.firstMediaWaitStartedAt = null;
+        } else if (!this.mediaStarted) {
+          // Still waiting for the first byte. `inbound-rtp` exists from the
+          // moment the transceiver does, with bytesReceived pinned at 0, so the
+          // stall rule would otherwise declare a peer dead while it is still
+          // legitimately setting up a relayed path.
+          this.firstMediaWaitStartedAt ??= now;
+          this.lastMediaBytesReceived = inbound.bytesReceived;
+          this.lastMediaProgressAt = now;
+          if (now - this.firstMediaWaitStartedAt
+            >= REMOTE_DESKTOP_LIMITS.FIRST_MEDIA_TIMEOUT_MS) {
+            this.fail(REMOTE_DESKTOP_TERMINAL_REASON.PEER_FAILED);
+            return;
+          }
         } else if (this.lastMediaBytesReceived === null
           || inbound.bytesReceived !== this.lastMediaBytesReceived
           || this.lastMediaProgressAt === null) {

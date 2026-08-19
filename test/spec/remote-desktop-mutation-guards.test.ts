@@ -814,6 +814,27 @@ const contracts: Contract[] = [
     ],
   },
   {
+    // `inbound-rtp` exists from the moment the transceiver does, with zero
+    // bytes, so the stall rule cannot be applied before the first byte: on a
+    // relayed path with a cold worker it kills healthy connections, which is
+    // what made almost every first connect reconnect.
+    name: 'media that has not started is not treated as media that stalled',
+    guards: [
+      {
+        path: 'web/src/remote-desktop-client.ts',
+        needle: 'if (inbound.bytesReceived > 0) this.mediaStarted = true;',
+      },
+      {
+        path: 'web/src/remote-desktop-client.ts',
+        needle: 'REMOTE_DESKTOP_LIMITS.FIRST_MEDIA_TIMEOUT_MS',
+      },
+      {
+        path: 'shared/remote-desktop.ts',
+        needle: 'FIRST_MEDIA_TIMEOUT_MS:',
+      },
+    ],
+  },
+  {
     // A locked machine rests on the lock curtain, which has no password box:
     // typing without waking it first is what made auto unlock do nothing at
     // all. The manual control exists because the sign-in UI can still swallow
@@ -1274,6 +1295,12 @@ const mutations: Mutation[] = [
     contract: 'the remote pointer stays visible while it is driven',
     path: 'native/windows-remote-desktop/local_indicator.cc',
     needle: 'if (request->accepted && PointerSuppressed())',
+  },
+  {
+    name: 'apply the stall rule before media has started',
+    contract: 'media that has not started is not treated as media that stalled',
+    path: 'web/src/remote-desktop-client.ts',
+    needle: 'if (inbound.bytesReceived > 0) this.mediaStarted = true;',
   },
   {
     name: 'type the secret without waking the lock curtain',
