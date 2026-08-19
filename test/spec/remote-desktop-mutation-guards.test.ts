@@ -735,7 +735,7 @@ const contracts: Contract[] = [
       },
       {
         path: 'web/src/remote-desktop-client.ts',
-        needle: 'const LAYOUT_TRANSITION_TIMEOUT_MS = 5_000;',
+        needle: 'const LAYOUT_TRANSITION_TIMEOUT_MS =',
       },
       {
         path: 'web/src/components/RemoteDesktopPanel.tsx',
@@ -1279,7 +1279,7 @@ const mutations: Mutation[] = [
     name: 'remove bounded layout-transition timer',
     contract: 'per-display fixed resolution switching',
     path: 'web/src/remote-desktop-client.ts',
-    needle: 'const LAYOUT_TRANSITION_TIMEOUT_MS = 5_000;',
+    needle: 'const LAYOUT_TRANSITION_TIMEOUT_MS =',
   },
   {
     name: 'remove display-tab context menu gesture',

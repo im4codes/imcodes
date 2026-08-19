@@ -40,7 +40,18 @@ const DATA_BUFFER_LOW_WATER_BYTES = 64 * 1024;
 // browser guard is only a final escape hatch if that terminal frame is lost.
 const START_TIMEOUT_MS = REMOTE_DESKTOP_LIMITS.NEGOTIATION_TIMEOUT_MS + 5_000;
 const INPUT_ACK_TIMEOUT_MS = 3_000;
-const LAYOUT_TRANSITION_TIMEOUT_MS = 5_000;
+/**
+ * How long a display-mode, scale or monitor change may take before the session
+ * is declared dead.
+ *
+ * Changing a mode tears the capture stack down and rebuilds it: Windows applies
+ * the mode, DXGI duplication is re-created and re-probed, and a node whose
+ * adapter never presents falls back to GDI before the first frame of the new
+ * layout exists. Measured on such a node that is seconds of work, and five of
+ * them was short enough to turn an ordinary resolution switch into a peer
+ * failure and a reconnect.
+ */
+const LAYOUT_TRANSITION_TIMEOUT_MS = 20_000;
 const CLIPBOARD_REQUEST_TIMEOUT_MS = 2_000;
 
 export interface RemoteDesktopSnapshot {
@@ -1335,6 +1346,13 @@ export class RemoteDesktopClient {
     this.pendingPresentedFrame = null;
     this.presentedLayoutRevision = 0;
     this.presentedDisplayId = null;
+    // The picture legitimately stops while the new layout is built, so the
+    // stall rule — which exists for media that died — must not be the thing
+    // that judges it. This is a first frame again, bounded by the transition
+    // budget below.
+    this.mediaStarted = false;
+    this.firstMediaWaitStartedAt = null;
+    this.lastMediaProgressAt = null;
     this.clearLayoutTransitionTimer();
     this.layoutTransitionTimer = setTimeout(() => {
       this.layoutTransitionTimer = null;

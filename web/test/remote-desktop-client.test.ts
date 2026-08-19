@@ -452,7 +452,10 @@ describe('RemoteDesktopClient', () => {
       state: REMOTE_DESKTOP_STATE.SWITCHING_DISPLAY,
       inputEnabled: false,
     });
-    expect(timeoutSpy.mock.calls.some((call) => call[1] === 5_000)).toBe(true);
+    // A layout change gets a budget sized for rebuilding the capture stack,
+    // not the few seconds that used to turn a resolution switch into a peer
+    // failure.
+    expect(timeoutSpy.mock.calls.some((call) => call[1] === 20_000)).toBe(true);
     control.receive({
       type: REMOTE_DESKTOP_DATA_MSG.DISPLAY_TOPOLOGY,
       protocolVersion: REMOTE_DESKTOP_PROTOCOL_VERSION,
