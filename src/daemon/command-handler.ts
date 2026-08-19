@@ -7,6 +7,7 @@ import { buildTransportResumeLaunchOpts } from '../agent/transport-resume-opts.j
 import { isTransportAgent, type AgentType } from '../agent/detect.js';
 import { aliasExpansionModeFor, expandForAgent } from '../../shared/alias-expand.js';
 import { ALIAS_REASONS } from '../../shared/alias-types.js';
+import { classifyCodexFastCommand, isCodexFastServiceTier } from '../../shared/codex-service-tier.js';
 import type { AliasSendAudit, SendAliasNotes, SendAliasResolution } from '../../shared/alias-types.js';
 import { buildAliasSendAudit } from './alias-audit.js';
 import { sendKeys, sendKeysDelayedEnter, sendRawInput, resizeSession, sendKey, getPaneStartCommand, preparePrivateInputWriter } from '../agent/tmux.js';
@@ -4135,6 +4136,42 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     try {
       const modelMatch = trimmedText.match(/^\/model\s+(\S+)(?:\s+.*)?$/);
       const effortMatch = trimmedText.match(/^\/(?:thinking|effort)\s+(\S+)\s*$/);
+      // `/fast on|off` is this product's switch, not Codex's own toggle: bare
+      // `/fast` stays untouched so it still reaches the agent unchanged.
+      const requestedServiceTier = classifyCodexFastCommand(trimmedText);
+      if (requestedServiceTier && transportRuntime) {
+        try {
+          await transportRuntime.setServiceTier(requestedServiceTier);
+        } catch (err) {
+          const reason = err instanceof Error ? err.message : 'service_tier_failed';
+          emitTransportUserMessage(text);
+          timelineEmitter.emit(sessionName, 'assistant.text', {
+            text: `⚠️ Could not change the service tier: ${reason}`,
+            streaming: false,
+            memoryExcluded: true,
+          }, { source: 'daemon', confidence: 'high' });
+          timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error: reason });
+          emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: 'error', error: reason });
+          return;
+        }
+        const nextRecord = { ...record, serviceTier: requestedServiceTier, updatedAt: Date.now() };
+        upsertSession(nextRecord);
+        persistSessionRecord(nextRecord, sessionName);
+        await handleGetSessions(serverLink);
+        syncSubSessionIfNeeded(sessionName, serverLink);
+        emitTransportUserMessage(text);
+        timelineEmitter.emit(sessionName, 'assistant.text', {
+          text: isCodexFastServiceTier(requestedServiceTier)
+            ? 'Fast mode is on for this session (1.5x speed, increased plan usage).'
+            : 'Fast mode is off for this session.',
+          streaming: false,
+          automation: true,
+          memoryExcluded: true,
+        }, { source: 'daemon', confidence: 'high' });
+        timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'accepted' });
+        emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: 'accepted' });
+        return;
+      }
       if (record?.agentType === 'qwen' && modelMatch) {
         const nextModel = modelMatch[1];
           const runtimeConfig = await getQwenRuntimeConfig(true).catch(() => null);

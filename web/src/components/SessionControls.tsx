@@ -25,6 +25,7 @@ import { insertMachineMarkerAtCaret } from '../util/machine-insert.js';
 import { buildMachineSendExtra } from '../util/machine-send.js';
 import { matchInlineMachineTrigger, stripInlineMachineTrigger } from '../util/machine-trigger.js';
 import { parseAliasMarkers } from '@shared/alias-types.js';
+import { CODEX_FAST_OFF_COMMAND, isCodexFastServiceTier } from '@shared/codex-service-tier.js';
 import { isInsufficientCapacityError } from '../upload-error.js';
 import { MobileDpad, DPAD_ARROW_SEQUENCES } from './MobileDpad.js';
 import { P2pConfigPanel, buildP2pWorkflowLaunchEnvelopeFromConfig } from './P2pConfigPanel.js';
@@ -5369,6 +5370,22 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
               </div>
             )}
           </div>
+        )}
+        {/* Codex keeps Fast on the thread, so a session switched to it anywhere
+            stays there through every resume. Say so where the model is shown,
+            and make the same chip the way back out. */}
+        {isCodex && isCodexFastServiceTier(activeSession?.serviceTier) && (
+          <button
+            class="shortcut-btn shortcut-btn-fast-warning"
+            onClick={() => {
+              sendSessionMessage(CODEX_FAST_OFF_COMMAND);
+              onAfterAction?.();
+            }}
+            title={t('session.codex_fast_mode_hint')}
+          >
+            <span aria-hidden="true">⚡</span>
+            {t('session.codex_fast_mode')}
+          </button>
         )}
         {isQwen && (
           <div class="shortcuts-model" ref={modelRef}>

@@ -804,7 +804,9 @@
       "warn_title": "CLI (process) mode: reduced maintenance.",
       "warn_body": "This backend is now lower priority and gets fewer fixes and updates. Pick an SDK option above for real-time streaming and better stability."
     },
-    "history_step_empty_hint": "No copy of this conversation is stored on this device yet, so it has to be fetched before anything can be shown."
+    "history_step_empty_hint": "No copy of this conversation is stored on this device yet, so it has to be fetched before anything can be shown.",
+    "codex_fast_mode": "Fast",
+    "codex_fast_mode_hint": "Codex Fast mode is on for this session: 1.5x speed for increased plan usage. It stays on across resumes until turned off — click to turn it off."
   },
   "server": {
     "upgrade_daemon": "↑ Upgrade Daemon",

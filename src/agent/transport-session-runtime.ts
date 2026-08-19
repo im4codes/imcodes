@@ -905,6 +905,20 @@ export class TransportSessionRuntime implements SessionRuntime {
     }
   }
 
+  /**
+   * Switches this session's provider service tier -- Codex's "Fast" being the
+   * one that spends plan usage faster. Rejects rather than pretending when the
+   * provider has no tier or the session has not been created yet, so a viewer's
+   * "turn it off" never reports success it cannot deliver.
+   */
+  async setServiceTier(tier: string): Promise<void> {
+    if (!this.provider.capabilities.serviceTier || !this.provider.setServiceTier) {
+      throw new Error('service_tier_unsupported');
+    }
+    if (!this._providerSessionId) throw new Error('service_tier_no_session');
+    await this.provider.setServiceTier(this._providerSessionId, tier);
+  }
+
   get providerSessionId(): string | null { return this._providerSessionId; }
   get sending(): boolean { return this._sending; }
   get lastProviderError(): { code: string; message: string; recoverable: boolean; at: number } | null {

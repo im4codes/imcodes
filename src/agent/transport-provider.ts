@@ -216,6 +216,11 @@ export interface ProviderCapabilities {
   attachments: boolean;
   /** Provider supports configurable reasoning/thinking effort. */
   reasoningEffort?: boolean;
+  /**
+   * Provider exposes a service tier that a viewer can switch per session --
+   * Codex's "Fast" (`priority`) tier being the one that spends plan usage faster.
+   */
+  serviceTier?: boolean;
   /** Supported effort levels when reasoningEffort is true. */
   supportedEffortLevels?: readonly TransportEffortLevel[];
   /** How well this provider can honor normalized shared-context payloads. */
@@ -418,6 +423,12 @@ export interface SessionInfoUpdate extends SessionContextBootstrapState {
   quotaMeta?: ProviderQuotaMeta;
   /** Current reasoning/thinking effort, if known. */
   effort?: TransportEffortLevel;
+  /**
+   * Provider service tier for this session, when the provider has one. Codex
+   * calls its `priority` tier "Fast"; it is reported so a viewer can see that a
+   * session is spending plan usage faster than they may have intended.
+   */
+  serviceTier?: string;
 }
 
 /** Provider-reported transient execution status (e.g. compacting). */
@@ -504,6 +515,13 @@ export interface TransportProvider {
 
   /** Declare which optional capabilities this provider supports. */
   readonly capabilities: ProviderCapabilities;
+
+  /**
+   * Switch this session's service tier. Only meaningful when the provider
+   * declares the `serviceTier` capability; the tier belongs to the session, so
+   * this never changes the machine's defaults.
+   */
+  setServiceTier?(sessionId: string, tier: string): Promise<void>;
 
   // ── Core methods — all providers must implement ──────────────────────────
 

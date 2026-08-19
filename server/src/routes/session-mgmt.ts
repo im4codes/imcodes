@@ -173,6 +173,7 @@ sessionMgmtRoutes.put('/:id/sessions/:name', async (c) => {
     activeModel,
     effort,
     transportConfig,
+    serviceTier,
   } = body;
   if (!projectName || !projectRole || !agentType || !projectDir || !state) {
     return c.json({ error: 'missing_fields' }, 400);
@@ -205,6 +206,7 @@ sessionMgmtRoutes.put('/:id/sessions/:name', async (c) => {
     typeof activeModel === 'string' ? activeModel : null,
     typeof effort === 'string' ? effort : null,
     transportConfig && typeof transportConfig === 'object' ? transportConfig as Record<string, unknown> : null,
+    typeof serviceTier === 'string' ? serviceTier : null,
   );
   return c.json({ ok: true });
 });

@@ -804,7 +804,9 @@
       "warn_title": "CLI（行程）模式：維護已降級。",
       "warn_body": "此後端已降為低優先級，修復與更新會減少。建議在上方改用 SDK 選項，獲得即時串流輸出與更穩定的體驗。"
     },
-    "history_step_empty_hint": "本裝置尚未快取這個工作階段，因此必須等擷取完成才有內容可顯示。"
+    "history_step_empty_hint": "本裝置尚未快取這個工作階段，因此必須等擷取完成才有內容可顯示。",
+    "codex_fast_mode": "Fast 計費加速",
+    "codex_fast_mode_hint": "本工作階段的 Codex Fast 模式已開啟：1.5 倍速度，額度消耗更快。它記在執行緒上，重連後仍然生效，點擊可關閉。"
   },
   "server": {
     "upgrade_daemon": "↑ 升級 Daemon",

@@ -18,6 +18,7 @@ export interface WorkerSessionPersistBody {
   activeModel: string | null;
   effort: SessionRecord['effort'] | null;
   transportConfig: Record<string, unknown> | null;
+  serviceTier: string | null;
 }
 
 export function buildWorkerSessionPersistBody(record: SessionRecord): WorkerSessionPersistBody {
@@ -37,6 +38,7 @@ export function buildWorkerSessionPersistBody(record: SessionRecord): WorkerSess
     activeModel: record.activeModel ?? record.modelDisplay ?? null,
     effort: record.effort ?? null,
     transportConfig: record.transportConfig ?? null,
+    serviceTier: record.serviceTier ?? null,
   };
 }
 

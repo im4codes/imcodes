@@ -868,6 +868,7 @@ export interface SubSessionData {
   quotaUsageLabel?: string | null;
   quotaMeta?: import('../../shared/provider-quota.js').ProviderQuotaMeta | null;
   effort?: import('../../shared/effort-levels.js').TransportEffortLevel | null;
+  serviceTier?: string | null;
   contextNamespace?: import('../../shared/session-context-bootstrap.js').SessionContextBootstrapState['contextNamespace'] | null;
   contextNamespaceDiagnostics?: string[] | null;
   transportConfig?: Record<string, unknown> | null;

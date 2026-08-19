@@ -806,6 +806,12 @@ interface CodexSdkSessionState {
   mcpConfig?: Record<string, unknown>;
   model?: string;
   effort?: TransportEffortLevel;
+  /**
+   * Codex's service tier for this thread. It is read rather than assumed: the
+   * tier is thread state, so a thread switched to Fast elsewhere comes back
+   * Fast on every resume.
+   */
+  serviceTier?: string;
   threadId?: string;
   loaded: boolean;
   runningTurnId?: string;
@@ -2305,6 +2311,7 @@ export class CodexSdkProvider implements TransportProvider {
     multiTurn: true,
     attachments: false,
     reasoningEffort: true,
+    serviceTier: true,
     supportedEffortLevels: CODEX_SDK_EFFORT_LEVELS,
     contextSupport: 'degraded-message-side-context-mapping',
     backgroundSubagentWake: BACKGROUND_SUBAGENT_WAKE_MODES.RUNTIME,
@@ -4221,7 +4228,26 @@ export class CodexSdkProvider implements TransportProvider {
       if (!state) return;
       state.threadId = threadId;
       state.loaded = true;
-      this.emitSessionInfo(sessionId, { resumeId: threadId, ...(state.model ? { model: state.model } : {}) });
+      this.adoptServiceTier(sessionId, state, params.thread?.serviceTier);
+      this.emitSessionInfo(sessionId, {
+        resumeId: threadId,
+        ...(state.model ? { model: state.model } : {}),
+        ...(state.serviceTier ? { serviceTier: state.serviceTier } : {}),
+      });
+      return;
+    }
+
+    if (method === 'thread/settings/updated') {
+      const threadId = readParamThreadId(params);
+      const sessionId = threadId ? this.threadToSession.get(threadId) : undefined;
+      const state = sessionId ? this.sessions.get(sessionId) : null;
+      if (!sessionId || !state) return;
+      // Fast can be switched on from the Codex TUI or the ChatGPT app while this
+      // session is live; without following the notification the viewer would be
+      // told the old tier for the rest of the thread.
+      const tier = (params.settings as Record<string, unknown> | undefined)?.serviceTier
+        ?? (params as Record<string, unknown>).serviceTier;
+      this.adoptServiceTier(sessionId, state, tier);
       return;
     }
 
@@ -5701,6 +5727,35 @@ export class CodexSdkProvider implements TransportProvider {
   private rejectPending(err: Error): void {
     for (const pending of this.pendingRequests.values()) pending.reject(err);
     this.pendingRequests.clear();
+  }
+
+  /**
+   * Records a tier reported by Codex and tells the app when it changed. Silent
+   * about repeats: this arrives on every settings notification, and a viewer
+   * warning that re-renders on unchanged state is noise.
+   */
+  private adoptServiceTier(sessionId: string, state: CodexSdkSessionState, reported: unknown): void {
+    if (typeof reported !== 'string' || !reported) return;
+    if (state.serviceTier === reported) return;
+    state.serviceTier = reported;
+    this.emitSessionInfo(sessionId, { serviceTier: reported });
+  }
+
+  /**
+   * Leaves or enters Codex's Fast tier for this thread only. Codex keeps the
+   * tier on the thread, so this is what makes the switch reversible from here;
+   * the machine's own default in ~/.codex/config.toml is never touched.
+   */
+  async setServiceTier(sessionId: string, tier: string): Promise<void> {
+    const state = this.sessions.get(sessionId);
+    if (!state) throw new Error('codex_service_tier_unknown_session');
+    await this.ensureThreadLoaded(sessionId, state);
+    if (!state.threadId) throw new Error('codex_service_tier_no_thread');
+    await this.request('thread/settings/update', {
+      threadId: state.threadId,
+      serviceTier: tier,
+    });
+    this.adoptServiceTier(sessionId, state, tier);
   }
 
   private emitSessionInfo(sessionId: string, info: SessionInfoUpdate): void {

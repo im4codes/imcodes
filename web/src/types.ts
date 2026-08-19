@@ -65,6 +65,12 @@ export interface SessionInfo {
   quotaUsageLabel?: string;
   quotaMeta?: import('../../shared/provider-quota.js').ProviderQuotaMeta | null;
   effort?: import('../../shared/effort-levels.js').TransportEffortLevel;
+  /**
+   * Provider service tier for this session. Codex reports `priority` while its
+   * Fast mode is on, which costs plan usage at 1.5x and is set on the thread --
+   * so it survives every resume until something turns it back.
+   */
+  serviceTier?: string | null;
   contextNamespace?: SessionContextBootstrapState['contextNamespace'];
   contextNamespaceDiagnostics?: string[];
   transportConfig?: Record<string, unknown> | null;

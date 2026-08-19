@@ -804,7 +804,9 @@
       "warn_title": "CLI（进程）模式：维护已降级。",
       "warn_body": "该后端已降为低优先级，修复与更新会减少。建议在上方改用 SDK 选项，获得实时流式输出与更稳定的体验。"
     },
-    "history_step_empty_hint": "本设备尚未缓存这个会话，所以只能等拉取完成后才有内容可显示。"
+    "history_step_empty_hint": "本设备尚未缓存这个会话，所以只能等拉取完成后才有内容可显示。",
+    "codex_fast_mode": "Fast 计费加速",
+    "codex_fast_mode_hint": "本会话的 Codex Fast 模式已开启：1.5 倍速度，额度消耗更快。它记在线程上，重连后依然生效，点击可关闭。"
   },
   "server": {
     "upgrade_daemon": "↑ 升级 Daemon",

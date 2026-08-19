@@ -1061,7 +1061,7 @@ export async function relaunchSessionWithSettings(
     requestedModel: targetRequestedModel ?? undefined,
     effort: targetEffort ?? undefined,
     transportConfig: targetTransportConfig ?? undefined,
-    ccPreset: (targetAgentType === 'claude-code' || targetAgentType === 'claude-code-sdk' || targetAgentType === 'qwen')
+    ccPreset: (targetAgentType === 'claude-code' || targetAgentType === 'claude-code-sdk' || targetAgentType === 'qwen' || targetAgentType === 'deepseek-harness')
       ? (targetCcPreset ?? undefined)
       : undefined,
     ...(preserveTransportBinding ? {
@@ -1306,7 +1306,7 @@ async function recoverTransportRuntimeAfterError(
       requestedModel: record.requestedModel,
       effort: record.effort,
       transportConfig: record.transportConfig,
-      ccPreset: (record.agentType === 'claude-code-sdk' || record.agentType === 'qwen') ? record.ccPreset : undefined,
+      ccPreset: (record.agentType === 'claude-code-sdk' || record.agentType === 'qwen' || record.agentType === 'deepseek-harness') ? record.ccPreset : undefined,
       // Qwen-compatible API providers can reject a resumed conversation when
       // their persisted tool-call chain is invalid (e.g. "tool call result
       // does not follow tool call"). Auto-recovery must rotate the provider
@@ -1879,6 +1879,11 @@ function wireTransportSessionInfo(
 
     if (typeof info.effort === 'string' && next.effort !== info.effort) {
       next.effort = info.effort;
+      changed = true;
+    }
+
+    if (typeof info.serviceTier === 'string' && next.serviceTier !== info.serviceTier) {
+      next.serviceTier = info.serviceTier;
       changed = true;
     }
 
