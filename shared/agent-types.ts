@@ -14,6 +14,7 @@ export const SESSION_AGENT_TYPES = [
   'qwen',
   'openclaw',
   'kimi-sdk',
+  'deepseek-harness',
   'shell',
   'script',
 ] as const;
@@ -32,6 +33,7 @@ export const TRANSPORT_SESSION_AGENT_TYPES = [
   'gemini-sdk',
   'grok-sdk',
   'kimi-sdk',
+  'deepseek-harness',
   'qwen',
   'openclaw',
 ] as const;

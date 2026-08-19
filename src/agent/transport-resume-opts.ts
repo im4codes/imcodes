@@ -10,7 +10,8 @@ export function usesProviderResumeId(agentType: string | undefined): boolean {
     || agentType === 'copilot-sdk'
     || agentType === 'kimi-sdk'
     || agentType === 'grok-sdk'
-    || agentType === 'opencode-sdk';
+    || agentType === 'opencode-sdk'
+    || agentType === 'deepseek-harness';
 }
 
 /** Providers whose remote session namespace is partitioned by working directory. */

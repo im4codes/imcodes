@@ -126,6 +126,7 @@ export const DELEGATION_REPLY_CAPABLE_AGENT_TYPES = [
   'qwen',
   'openclaw',
   'kimi-sdk',
+  'deepseek-harness',
 ] as const;
 export type DelegationReplyCapableAgentType = typeof DELEGATION_REPLY_CAPABLE_AGENT_TYPES[number];
 

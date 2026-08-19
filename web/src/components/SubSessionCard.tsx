@@ -50,6 +50,7 @@ const TYPE_ICON: Record<string, string> = {
   'gemini-sdk': '♊',
   'grok-sdk': '𝕏',
   'kimi-sdk': '月',
+  'deepseek-harness': '🐳',
   'shell': '🐚',
   'script': '🔄',
 };

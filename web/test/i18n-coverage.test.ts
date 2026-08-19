@@ -554,4 +554,16 @@ describe('generic i18n coverage guard', () => {
       expect((mcpLabel as string).trim().length).toBeGreaterThan(0);
     }
   });
+
+  it('keeps the DeepSeek Harness agent label present in every locale', () => {
+    for (const locale of SUPPORTED_LOCALES) {
+      const messages = JSON.parse(readFileSync(join(WEB_ROOT, 'src/i18n/locales', `${locale}.json`), 'utf8')) as unknown;
+      const label = readPath(messages, 'session.agentType.deepseek_harness');
+      expect(label, `${locale}:session.agentType.deepseek_harness`).toEqual(expect.any(String));
+      expect((label as string).trim().length).toBeGreaterThan(0);
+      // The runtime is a brand name, so every locale intentionally keeps the
+      // English spelling rather than transliterating it.
+      expect(label, `${locale}:session.agentType.deepseek_harness`).toBe('DeepSeek Harness');
+    }
+  });
 });

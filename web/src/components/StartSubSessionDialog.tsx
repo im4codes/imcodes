@@ -296,7 +296,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
     if (desc) extra.description = desc;
     if (ccPreset && (type === 'claude-code' || type === 'claude-code-sdk' || type === 'qwen')) extra.ccPreset = ccPreset;
     if (ccInitPrompt.trim() && type === 'claude-code') extra.ccInitPrompt = ccInitPrompt.trim();
-    if ((type === 'claude-code-sdk' || type === 'codex-sdk' || type === 'copilot-sdk' || type === 'cursor-headless' || type === 'opencode-sdk' || type === 'gemini-sdk' || type === 'grok-sdk' || type === 'kimi-sdk' || type === 'qwen') && requestedModel.trim()) extra.requestedModel = requestedModel.trim();
+    if ((type === 'claude-code-sdk' || type === 'codex-sdk' || type === 'copilot-sdk' || type === 'cursor-headless' || type === 'opencode-sdk' || type === 'gemini-sdk' || type === 'grok-sdk' || type === 'kimi-sdk' || type === 'deepseek-harness' || type === 'qwen') && requestedModel.trim()) extra.requestedModel = requestedModel.trim();
     if (type === 'claude-code-sdk' || type === 'codex-sdk' || type === 'copilot-sdk' || type === 'qwen') extra.thinking = thinking;
     onStart(type, selectedShell, cwd || undefined, label || undefined, Object.keys(extra).length > 0 ? extra : undefined);
   };
@@ -324,7 +324,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
     dynamicModelsAgentType,
     type === 'claude-code-sdk' ? ccPreset : undefined,
   );
-  const supportsModelSelection = type === 'claude-code-sdk' || type === 'codex-sdk' || type === 'copilot-sdk' || type === 'cursor-headless' || type === 'opencode-sdk' || type === 'gemini-sdk' || type === 'grok-sdk' || type === 'kimi-sdk' || (type === 'qwen' && !!selectedCcPreset);
+  const supportsModelSelection = type === 'claude-code-sdk' || type === 'codex-sdk' || type === 'copilot-sdk' || type === 'cursor-headless' || type === 'opencode-sdk' || type === 'gemini-sdk' || type === 'grok-sdk' || type === 'kimi-sdk' || type === 'deepseek-harness' || (type === 'qwen' && !!selectedCcPreset);
   const modelSuggestions = useMemo(() => (
     (type === 'qwen' || type === 'claude-code-sdk') && selectedCcPreset
       ? mergeModelSuggestions(

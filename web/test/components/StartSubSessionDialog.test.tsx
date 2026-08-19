@@ -35,7 +35,7 @@ describe('StartSubSessionDialog', () => {
     cleanup();
   });
 
-  it('shows Claude, Codex, Qoder, OpenCode, and Grok SDK options', () => {
+  it('shows Claude, Codex, Qoder, OpenCode, Grok, and DeepSeek Harness options', () => {
     render(
       <StartSubSessionDialog
         ws={makeWs() as any}
@@ -53,6 +53,7 @@ describe('StartSubSessionDialog', () => {
     expect(screen.getByRole('button', { name: /qoder_sdk/i })).toBeDefined();
     expect(screen.getByRole('button', { name: /opencode_sdk/i })).toBeDefined();
     expect(screen.getByRole('button', { name: /grok_sdk/i })).toBeDefined();
+    expect(screen.getByRole('button', { name: /deepseek_harness/i })).toBeDefined();
   });
 
   it('defaults to claude-code-sdk and renders transport/process groups separately', () => {
@@ -593,6 +594,30 @@ describe('StartSubSessionDialog', () => {
 
     expect(onStart).toHaveBeenCalledWith('kimi-sdk', undefined, '/tmp', undefined, {
       requestedModel: 'moonshot-v1-auto,thinking',
+    });
+  });
+
+  it('passes requestedModel for deepseek-harness sub-sessions', () => {
+    const onStart = vi.fn();
+    render(
+      <StartSubSessionDialog
+        ws={makeWs() as any}
+        defaultCwd="/tmp"
+        isProviderConnected={() => false}
+        getRemoteSessions={() => []}
+        refreshSessions={vi.fn()}
+        onStart={onStart}
+        onClose={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /deepseek_harness/i }));
+    // The daemon catalogue for `dsh` is always empty, so the picker is free text.
+    fireEvent.input(screen.getByPlaceholderText('selectModel'), { target: { value: 'deepseek-reasoner' } });
+    fireEvent.click(screen.getByRole('button', { name: /launch/i }));
+
+    expect(onStart).toHaveBeenCalledWith('deepseek-harness', undefined, '/tmp', undefined, {
+      requestedModel: 'deepseek-reasoner',
     });
   });
 

@@ -41,6 +41,7 @@ const DEFAULT_COMMANDS: Record<string, string[]> = {
   'qwen':        ['/compact', '/stop', '/clear', '/model', '/thinking'],
   'grok-sdk':    ['/compact', '/clear', '/model'],
   'kimi-sdk':    ['/compact', '/clear', '/model'],
+  'deepseek-harness': ['/clear', '/model'],
   'openclaw':    ['/compact', '/stop', '/clear', '/thinking'],
 };
 const DEFAULT_PHRASES = ['continue', 'fix', 'explain', 'refactor this', 'write tests', 'check errors', 'pull', 'commit&push', 'CI failed, fix', 'test & push', 'yes'];

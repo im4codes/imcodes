@@ -12,6 +12,7 @@ describe('agent display helpers', () => {
     expect(formatLabel('copilot-sdk3')).toBe('Co3');
     expect(formatLabel('cursor-headless4')).toBe('Cu4');
     expect(formatLabel('opencode-sdk5')).toBe('OC5');
+    expect(formatLabel('deepseek-harness6')).toBe('Ds6');
   });
 
   it('uses short auto label prefixes for sdk session creation', () => {
@@ -21,5 +22,6 @@ describe('agent display helpers', () => {
     expect(getAutoSessionLabelPrefix('cursor-headless')).toBe('Cu');
     expect(getAutoSessionLabelPrefix('grok-sdk')).toBe('Gr');
     expect(getAutoSessionLabelPrefix('opencode-sdk')).toBe('OC');
+    expect(getAutoSessionLabelPrefix('deepseek-harness')).toBe('Ds');
   });
 });

@@ -931,7 +931,7 @@ function supportsEffort(agentType: string | undefined): agentType is 'claude-cod
     || agentType === 'qwen';
 }
 
-function supportsTransportClear(agentType: string | undefined): agentType is 'claude-code-sdk' | 'codex-sdk' | 'copilot-sdk' | 'cursor-headless' | 'opencode-sdk' | 'openclaw' | 'qwen' | 'kimi-sdk' | 'grok-sdk' {
+function supportsTransportClear(agentType: string | undefined): agentType is 'claude-code-sdk' | 'codex-sdk' | 'copilot-sdk' | 'cursor-headless' | 'opencode-sdk' | 'openclaw' | 'qwen' | 'kimi-sdk' | 'grok-sdk' | 'deepseek-harness' {
   return agentType === 'claude-code-sdk'
     || agentType === 'codex-sdk'
     || agentType === 'copilot-sdk'
@@ -940,7 +940,8 @@ function supportsTransportClear(agentType: string | undefined): agentType is 'cl
     || agentType === 'openclaw'
     || agentType === 'qwen'
     || agentType === 'kimi-sdk'
-    || agentType === 'grok-sdk';
+    || agentType === 'grok-sdk'
+    || agentType === 'deepseek-harness';
 }
 
 // `/compact` is provider-dispatched, not daemon-synthesized. Provider adapters
@@ -2249,7 +2250,7 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
         label,
         effort,
       });
-    } else if (agentType === 'opencode-sdk' || agentType === 'gemini-sdk' || agentType === 'kimi-sdk' || agentType === 'grok-sdk') {
+    } else if (agentType === 'opencode-sdk' || agentType === 'gemini-sdk' || agentType === 'kimi-sdk' || agentType === 'grok-sdk' || agentType === 'deepseek-harness') {
       // ACP SDK providers share the codex-sdk shape: fresh launch, optional
       // requested model, no ccPreset. The provider emits a durable resume id
       // after the first real ACP session is created.
@@ -2258,7 +2259,7 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
         name: `deck_${project}_brain`,
         projectName: project,
         role: 'brain',
-        agentType: agentType as 'opencode-sdk' | 'gemini-sdk' | 'kimi-sdk' | 'grok-sdk',
+        agentType: agentType as 'opencode-sdk' | 'gemini-sdk' | 'kimi-sdk' | 'grok-sdk' | 'deepseek-harness',
         projectDir: dir,
         fresh: true,
         ...(requestedModel ? { requestedModel } : {}),
@@ -4323,7 +4324,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
           return;
         }
       }
-      if ((record?.agentType === 'copilot-sdk' || record?.agentType === 'cursor-headless' || record?.agentType === 'opencode-sdk' || record?.agentType === 'gemini-sdk' || record?.agentType === 'kimi-sdk' || record?.agentType === 'grok-sdk') && modelMatch) {
+      if ((record?.agentType === 'copilot-sdk' || record?.agentType === 'cursor-headless' || record?.agentType === 'opencode-sdk' || record?.agentType === 'gemini-sdk' || record?.agentType === 'kimi-sdk' || record?.agentType === 'grok-sdk' || record?.agentType === 'deepseek-harness') && modelMatch) {
         const nextModel = modelMatch[1];
         transportRuntime.setAgentId(nextModel);
         const nextRecord = {
@@ -6176,7 +6177,7 @@ async function handleSubSessionStart(cmd: Record<string, unknown>, serverLink: S
         bindExistingKey,
         ...(ccPreset ? { ccPreset } : {}),
         ...(type === 'claude-code-sdk' ? { ccSessionId: randomUUID(), fresh: true } : {}),
-        ...(type === 'codex-sdk' || type === 'opencode-sdk' || type === 'kimi-sdk' || type === 'grok-sdk' ? { fresh: true } : {}),
+        ...(type === 'codex-sdk' || type === 'opencode-sdk' || type === 'kimi-sdk' || type === 'grok-sdk' || type === 'deepseek-harness' ? { fresh: true } : {}),
         ...(effort ? { effort } : {}),
         userCreated: true,
         parentSession: parentSession || undefined,
@@ -10753,7 +10754,10 @@ async function loadPassiveTransportListModels(agentType: string): Promise<Transp
       defaultModel: COPILOT_FALLBACK_MODEL_IDS[0],
     };
   }
-  if (agentType === 'cursor-headless' || agentType === 'kimi-sdk' || agentType === 'grok-sdk') {
+  if (agentType === 'cursor-headless' || agentType === 'kimi-sdk' || agentType === 'grok-sdk'
+    || agentType === 'deepseek-harness') {
+    // DeepSeek Harness resolves provider routes and model catalogues from its
+    // own `~/.dsh` configuration; IM.codes advertises no static list.
     return { models: [] };
   }
   return { models: [], error: `Unsupported agentType: ${agentType || '(missing)'}` };

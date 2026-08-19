@@ -91,6 +91,14 @@ const SESSION_AGENT_CHOICES: SessionAgentChoice[] = [
     surfaces: ['new-session', 'sub-session'],
   },
   {
+    id: 'deepseek-harness',
+    icon: '🐳',
+    fallbackLabel: 'DeepSeek Harness',
+    labelKey: 'session.agentType.deepseek_harness',
+    group: 'transport',
+    surfaces: ['new-session', 'sub-session'],
+  },
+  {
     id: 'qwen',
     icon: '千',
     fallbackLabel: 'Qwen Code',

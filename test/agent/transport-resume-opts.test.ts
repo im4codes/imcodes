@@ -30,6 +30,7 @@ describe('buildTransportResumeLaunchOpts', () => {
     expect(usesProviderResumeId('grok-sdk')).toBe(true);
     expect(usesProviderResumeId('kimi-sdk')).toBe(true);
     expect(usesProviderResumeId('opencode-sdk')).toBe(true);
+    expect(usesProviderResumeId('deepseek-harness')).toBe(true);
     expect(usesProviderResumeId('gemini-sdk')).toBe(false);
   });
 

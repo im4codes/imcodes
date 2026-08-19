@@ -173,6 +173,7 @@ const BADGE_MAP: Record<string, string> = {
   'gemini-sdk': 'gm',
   'grok-sdk': 'gr',
   'kimi-sdk': 'km',
+  'deepseek-harness': 'ds',
   'shell': 'sh',
   'script': 'sc',
 };

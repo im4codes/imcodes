@@ -628,6 +628,36 @@ describe('QuickInputPanel history scope', () => {
     expect(commands).toEqual(expect.arrayContaining(['/compact', '/clear', '/model']));
     expect(commands).not.toContain('/thinking');
   });
+
+  it('offers /model for DeepSeek Harness without unsupported compact/thinking controls', () => {
+    render(
+      <QuickInputPanel
+        open
+        onClose={vi.fn()}
+        onSelect={vi.fn()}
+        onSend={vi.fn()}
+        agentType="deepseek-harness"
+        sessionName="session-dsh"
+        data={{ history: [], sessionHistory: {}, commands: [], phrases: [] }}
+        loaded
+        onAddCommand={vi.fn()}
+        onAddPhrase={vi.fn()}
+        onRemoveCommand={vi.fn()}
+        onRemovePhrase={vi.fn()}
+        onRemoveHistory={vi.fn()}
+        onRemoveSessionHistory={vi.fn()}
+        onClearHistory={vi.fn()}
+        onClearSessionHistory={vi.fn()}
+      />,
+    );
+
+    // The empty model catalogue makes `/model <id>` the free-text entry point
+    // for the daemon's DeepSeek Harness model plumbing.
+    const commands = Array.from(document.querySelectorAll('.qp-section-header + .qp-pills .qp-pill-default')).map((el) => el.textContent?.trim());
+    expect(commands).toEqual(expect.arrayContaining(['/clear', '/model']));
+    expect(commands).not.toContain('/compact');
+    expect(commands).not.toContain('/thinking');
+  });
 });
 
 describe('useQuickData persistence guard', () => {

@@ -1396,6 +1396,7 @@ const MCP_PROVIDER_LABEL_KEY: Record<MemoryMcpProviderId, string> = {
   'cursor-headless': 'sharedContext.management.mcpProviderCursorHeadless',
   'opencode-sdk': 'sharedContext.management.mcpProviderOpenCodeSdk',
   qwen: 'sharedContext.management.mcpProviderQwen',
+  'deepseek-harness': 'sharedContext.management.mcpProviderDeepseekHarness',
 };
 
 function isManagedMcpProviderId(providerId: string): providerId is MemoryMcpProviderId {

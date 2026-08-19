@@ -18,12 +18,12 @@ export interface TransportModelState {
 }
 
 /** Agent types that support dynamic model discovery via `transport.list_models`. */
-export type TransportAgentTypeWithModels = 'claude-code-sdk' | 'copilot-sdk' | 'cursor-headless' | 'codex-sdk' | 'opencode-sdk' | 'gemini-sdk' | 'grok-sdk' | 'kimi-sdk';
+export type TransportAgentTypeWithModels = 'claude-code-sdk' | 'copilot-sdk' | 'cursor-headless' | 'codex-sdk' | 'opencode-sdk' | 'gemini-sdk' | 'grok-sdk' | 'kimi-sdk' | 'deepseek-harness';
 
 export function supportsDynamicTransportModels(
   agentType: string | undefined | null,
 ): agentType is TransportAgentTypeWithModels {
-  return agentType === 'claude-code-sdk' || agentType === 'copilot-sdk' || agentType === 'cursor-headless' || agentType === 'codex-sdk' || agentType === 'opencode-sdk' || agentType === 'gemini-sdk' || agentType === 'grok-sdk' || agentType === 'kimi-sdk';
+  return agentType === 'claude-code-sdk' || agentType === 'copilot-sdk' || agentType === 'cursor-headless' || agentType === 'codex-sdk' || agentType === 'opencode-sdk' || agentType === 'gemini-sdk' || agentType === 'grok-sdk' || agentType === 'kimi-sdk' || agentType === 'deepseek-harness';
 }
 
 /** Fetch and cache the list of available models for a transport agent type.
@@ -124,6 +124,10 @@ export function useTransportModels(
     // provider catalogs are the authoritative binary/authentication check, so
     // the first picker load must actively connect instead of asking for the
     // passive fallback (which is intentionally empty for these providers).
+    // DeepSeek Harness deliberately stays off this list: `dsh` resolves its
+    // provider routes and model ids from its own `~/.dsh` config, so the
+    // daemon's catalog is a constant empty list and a forced probe would only
+    // spend a round trip to re-learn that. Its picker is free text, like Kimi.
     if (wsConnected) fetchModels(agentType === 'grok-sdk' || agentType === 'opencode-sdk');
     return unsub;
   }, [ws, wsConnected, agentType, ccPreset, catalogIdentity, fetchModels]);

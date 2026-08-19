@@ -106,7 +106,7 @@ describe('NewSessionDialog', () => {
     const optgroups = Array.from(select.querySelectorAll('optgroup'));
     expect(optgroups.map((group) => group.label)).toEqual(['SDK', 'CLI']);
     const options = Array.from(select.options).map((o) => o.value);
-    expect(options.slice(0, 11)).toEqual([
+    expect(options.slice(0, 12)).toEqual([
       'claude-code-sdk',
       'codex-sdk',
       'qoder-sdk',
@@ -116,10 +116,11 @@ describe('NewSessionDialog', () => {
       'gemini-sdk',
       'grok-sdk',
       'kimi-sdk',
+      'deepseek-harness',
       'qwen',
       'openclaw',
     ]);
-    expect(options.slice(11)).toEqual([
+    expect(options.slice(12)).toEqual([
       'claude-code',
       'codex',
       'opencode',
@@ -803,6 +804,48 @@ describe('NewSessionDialog', () => {
     expect(ws.sendSessionCommand).toHaveBeenCalledWith('start', expect.objectContaining({
       agentType: 'kimi-sdk',
       requestedModel: 'moonshot-v1-auto,thinking',
+    }));
+  });
+
+  it('offers a free-text model input for deepseek-harness and starts with the typed model', async () => {
+    const ws = makeWs();
+    render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
+
+    fireEvent.input(screen.getByPlaceholderText('my-project'), { target: { value: 'my-app' } });
+    fireEvent.input(screen.getByPlaceholderText('~/projects/my-project'), { target: { value: '~/projects/my-app' } });
+    const agentTypeSelect = screen.getAllByRole('combobox')[0] as HTMLSelectElement;
+    agentTypeSelect.value = 'deepseek-harness';
+    fireEvent.input(agentTypeSelect, { target: { value: 'deepseek-harness' } });
+
+    await waitFor(() => {
+      expect(ws.send.mock.calls.some((call) => (
+        call[0]?.type === 'transport.list_models' && call[0]?.agentType === 'deepseek-harness'
+      ))).toBe(true);
+    });
+    const request = ws.send.mock.calls.find((call) => (
+      call[0]?.type === 'transport.list_models' && call[0]?.agentType === 'deepseek-harness'
+    ))?.[0];
+    // `dsh` resolves provider routes from its own ~/.dsh config, so the daemon
+    // catalog is always empty — the first load must not burn a forced probe.
+    expect(request).not.toHaveProperty('force');
+    act(() => ws.emit({
+      type: 'transport.models_response',
+      agentType: 'deepseek-harness',
+      requestId: request?.requestId,
+      models: [],
+    }));
+
+    // Empty catalogue ⇒ free text, exactly like Kimi/Grok with no models.
+    const modelInput = await screen.findByPlaceholderText('selectModel');
+    expect(modelInput.tagName).toBe('INPUT');
+    // Only the agent-type dropdown remains: no populated model <select>.
+    expect(document.querySelectorAll('select')).toHaveLength(1);
+    fireEvent.input(modelInput, { target: { value: 'deepseek-reasoner' } });
+    fireEvent.click(screen.getByRole('button', { name: /start/i }));
+
+    expect(ws.sendSessionCommand).toHaveBeenCalledWith('start', expect.objectContaining({
+      agentType: 'deepseek-harness',
+      requestedModel: 'deepseek-reasoner',
     }));
   });
 

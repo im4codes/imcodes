@@ -84,6 +84,7 @@ type AgentType =
   | "gemini-sdk"
   | "grok-sdk"
   | "kimi-sdk"
+  | "deepseek-harness"
   | "openclaw"
   | "qwen";
 type OpenClawMode = "new" | "bind";
@@ -468,6 +469,7 @@ export function NewSessionDialog({
           || agentType === "gemini-sdk"
           || agentType === "grok-sdk"
           || agentType === "kimi-sdk"
+          || agentType === "deepseek-harness"
           || agentType === "qwen") &&
         requestedModel.trim()
       ) {
@@ -492,7 +494,7 @@ export function NewSessionDialog({
   const agentFlavor =
     agentType === "claude-code" || agentType === "codex"
       ? "cli"
-      : agentType === "claude-code-sdk" || agentType === "codex-sdk" || agentType === "qoder-sdk" || agentType === "opencode-sdk" || agentType === "grok-sdk" || agentType === "kimi-sdk"
+      : agentType === "claude-code-sdk" || agentType === "codex-sdk" || agentType === "qoder-sdk" || agentType === "opencode-sdk" || agentType === "grok-sdk" || agentType === "kimi-sdk" || agentType === "deepseek-harness"
         ? "sdk"
         : null;
   const qwenCompatibleApiPresetSelected = agentType === "qwen" && !!selectedCcPreset;
@@ -523,6 +525,7 @@ export function NewSessionDialog({
     || agentType === "gemini-sdk"
     || agentType === "grok-sdk"
     || agentType === "kimi-sdk"
+    || agentType === "deepseek-harness"
     || (agentType === "qwen" && !!selectedCcPreset);
   const dynamicModelsAgentType = supportsDynamicTransportModels(agentType)
     ? agentType

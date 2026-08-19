@@ -8,6 +8,7 @@ describe('shared agent type helpers', () => {
     expect(isTransportSessionAgentType('qoder-sdk')).toBe(true);
     expect(isTransportSessionAgentType('kimi-sdk')).toBe(true);
     expect(isTransportSessionAgentType('grok-sdk')).toBe(true);
+    expect(isTransportSessionAgentType('deepseek-harness')).toBe(true);
     expect(isTransportSessionAgentType('opencode-sdk')).toBe(true);
     expect(isTransportSessionAgentType('qwen')).toBe(true);
     expect(isTransportSessionAgentType('openclaw')).toBe(true);
