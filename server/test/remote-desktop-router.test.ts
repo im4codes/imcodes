@@ -422,6 +422,31 @@ describe('RemoteDesktopRouter', () => {
     expect(f.messages(f.browserA)[0]).toMatchObject({ type: REMOTE_DESKTOP_MSG.ERROR, error });
   });
 
+  it('keeps a daemon session alive across revalidation', async () => {
+    // Admission and revalidation used to carry a copy each of these checks: the
+    // daemon was admitted, its worker started, and the first revalidation tick
+    // killed it with execution_disabled.
+    const f = fixture({ access: daemonHostAccess() });
+    await f.router.handleBrowser(f.browserA, 'owner-user', start);
+    expect(f.messages(f.browserA)[0]).toMatchObject({ type: REMOTE_DESKTOP_MSG.AUTHORIZED });
+    await f.router.revalidateUser('owner-user');
+    expect(f.messages(f.browserA).some((message) => (
+      message.type === REMOTE_DESKTOP_MSG.TERMINAL
+    ))).toBe(false);
+    expect(f.router.sessionsForUser('owner-user')).toHaveLength(1);
+  });
+
+  it('still terminates a controlled node whose exec switch is turned off', async () => {
+    const f = fixture();
+    await f.router.handleBrowser(f.browserA, 'owner-user', start);
+    f.setAccess({ ...validAccess(), exec_enabled: false } as ControlledMachineAccessRow);
+    await f.router.revalidateUser('owner-user');
+    expect(f.messages(f.browserA).at(-1)).toMatchObject({
+      type: REMOTE_DESKTOP_MSG.TERMINAL,
+      reason: REMOTE_DESKTOP_TERMINAL_REASON.EXECUTION_DISABLED,
+    });
+  });
+
   it('does not let a controlled node borrow the daemon exemptions', async () => {
     const f = fixture({
       access: { ...validAccess(), exec_enabled: false, controlled_capabilities: null } as ControlledMachineAccessRow,

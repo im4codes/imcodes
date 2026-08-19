@@ -33,6 +33,14 @@ import {
 import { TURN_SERVICE_DEFAULTS } from '../../../shared/turn-service.js';
 import type { TurnIceServerAuthority } from './turn-credentials.js';
 
+/** Why an access row does not permit remote desktop; see `accessFault`. */
+type RemoteDesktopAccessFault =
+  | 'denied'
+  | 'exec_disabled'
+  | 'unsupported_platform'
+  | 'offline'
+  | 'capability';
+
 type AccessResolver = (
   db: Database,
   userId: string,
@@ -536,13 +544,20 @@ export class RemoteDesktopRouter {
     this.publishCollaborationCounts();
   }
 
-  private admissionError(
+  /**
+   * Why a resolved access row does not permit remote desktop, if it does not.
+   *
+   * Admission and continuous revalidation ask the same question and only differ
+   * in how they report the answer, so they share this one classifier. They used
+   * to carry a copy each, and the copies drifted the moment either learned
+   * something new — a daemon host was admitted and then terminated seconds later
+   * by the revalidation copy, which still applied the controlled-node checks.
+   */
+  private accessFault(
     access: ControlledMachineAccessRow | null,
     now: number,
-  ): { error: string; retryable: boolean } | null {
-    if (!access || !canOperateControlledMachine(access.access_role)) {
-      return { error: REMOTE_DESKTOP_ERROR.ACCESS_DENIED, retryable: false };
-    }
+  ): RemoteDesktopAccessFault | null {
+    if (!access || !canOperateControlledMachine(access.access_role)) return 'denied';
     // A normal (FULL) daemon serves remote control from the same native worker,
     // but the controlled-node columns do not describe it: `exec_enabled` is the
     // controlled-node exec switch (and is false on daemon rows predating its
@@ -557,26 +572,36 @@ export class RemoteDesktopRouter {
       && (typeof access.access_expires_at !== 'number'
         || !Number.isSafeInteger(access.access_expires_at)
         || access.access_expires_at <= now)) {
-      return { error: REMOTE_DESKTOP_ERROR.ACCESS_DENIED, retryable: false };
+      return 'denied';
     }
-    if (controlledNode && !access.exec_enabled) {
-      return { error: REMOTE_DESKTOP_ERROR.EXECUTION_DISABLED, retryable: false };
-    }
-    if (controlledNode && access.os !== 'win') {
-      return { error: REMOTE_DESKTOP_ERROR.UNSUPPORTED_PLATFORM, retryable: false };
-    }
+    if (controlledNode && !access.exec_enabled) return 'exec_disabled';
+    if (controlledNode && access.os !== 'win') return 'unsupported_platform';
     if (access.status !== 'online'
       || typeof access.last_heartbeat_at !== 'number'
       || now - access.last_heartbeat_at >= MACHINE_PRESENCE_STALENESS_MS) {
-      return { error: REMOTE_DESKTOP_ERROR.DAEMON_OFFLINE, retryable: true };
+      return 'offline';
     }
     if (controlledNode) {
       const capabilities = validateControlledNodeCapabilities(access.controlled_capabilities);
       if (!capabilities.ok || !capabilities.value.includes(REMOTE_DESKTOP_CAPABILITY)) {
-        return { error: REMOTE_DESKTOP_ERROR.CAPABILITY_UNAVAILABLE, retryable: true };
+        return 'capability';
       }
     }
     return null;
+  }
+
+  private admissionError(
+    access: ControlledMachineAccessRow | null,
+    now: number,
+  ): { error: string; retryable: boolean } | null {
+    switch (this.accessFault(access, now)) {
+      case 'denied': return { error: REMOTE_DESKTOP_ERROR.ACCESS_DENIED, retryable: false };
+      case 'exec_disabled': return { error: REMOTE_DESKTOP_ERROR.EXECUTION_DISABLED, retryable: false };
+      case 'unsupported_platform': return { error: REMOTE_DESKTOP_ERROR.UNSUPPORTED_PLATFORM, retryable: false };
+      case 'offline': return { error: REMOTE_DESKTOP_ERROR.DAEMON_OFFLINE, retryable: true };
+      case 'capability': return { error: REMOTE_DESKTOP_ERROR.CAPABILITY_UNAVAILABLE, retryable: true };
+      default: return null;
+    }
   }
 
   private async forwardBrowserSignal(
@@ -795,29 +820,14 @@ export class RemoteDesktopRouter {
   }
 
   private revalidationFailure(access: ControlledMachineAccessRow | null): RemoteDesktopTerminalReason | null {
-    if (!access || !canOperateControlledMachine(access.access_role)) {
-      return REMOTE_DESKTOP_TERMINAL_REASON.AUTHORITY_REVOKED;
+    switch (this.accessFault(access, this.now())) {
+      case 'denied': return REMOTE_DESKTOP_TERMINAL_REASON.AUTHORITY_REVOKED;
+      case 'exec_disabled': return REMOTE_DESKTOP_TERMINAL_REASON.EXECUTION_DISABLED;
+      case 'unsupported_platform': return REMOTE_DESKTOP_TERMINAL_REASON.UNSUPPORTED_PLATFORM;
+      case 'offline':
+      case 'capability': return REMOTE_DESKTOP_TERMINAL_REASON.CAPABILITY_UNAVAILABLE;
+      default: return null;
     }
-    const now = this.now();
-    if (access.access_role !== 'owner'
-      && access.access_expires_at !== null
-      && (typeof access.access_expires_at !== 'number'
-        || !Number.isSafeInteger(access.access_expires_at)
-        || access.access_expires_at <= now)) {
-      return REMOTE_DESKTOP_TERMINAL_REASON.AUTHORITY_REVOKED;
-    }
-    if (!access.exec_enabled) return REMOTE_DESKTOP_TERMINAL_REASON.EXECUTION_DISABLED;
-    if (access.os !== 'win') return REMOTE_DESKTOP_TERMINAL_REASON.UNSUPPORTED_PLATFORM;
-    if (access.status !== 'online'
-      || typeof access.last_heartbeat_at !== 'number'
-      || now - access.last_heartbeat_at >= MACHINE_PRESENCE_STALENESS_MS) {
-      return REMOTE_DESKTOP_TERMINAL_REASON.CAPABILITY_UNAVAILABLE;
-    }
-    const capabilities = validateControlledNodeCapabilities(access.controlled_capabilities);
-    if (!capabilities.ok || !capabilities.value.includes(REMOTE_DESKTOP_CAPABILITY)) {
-      return REMOTE_DESKTOP_TERMINAL_REASON.CAPABILITY_UNAVAILABLE;
-    }
-    return null;
   }
 
   private consumeStartBudget(socket: WebSocket, userId: string): boolean {
