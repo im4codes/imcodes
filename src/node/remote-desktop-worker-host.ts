@@ -1,6 +1,7 @@
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { existsSync, lstatSync, readFileSync, readdirSync } from 'node:fs';
+import { rm } from 'node:fs/promises';
 import net from 'node:net';
 import { dirname, join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -350,6 +351,17 @@ export class RemoteDesktopWorkerHost {
       }
       await this.ensureStarted();
       this.track(parsed.value);
+      if (recoverIdlePrepare && (!this.socket || this.socket.destroyed)) {
+        // The same stale-idle race as a failed write, one step earlier: a warm
+        // worker exits on its own between sessions, the pipe still looked alive
+        // when it was checked, and the close landed before it could be used.
+        // Returning here would surface that as `worker_failed` on the first
+        // connect after any quiet period — the session is already tracked, so
+        // cold-start one verified replacement instead.
+        this.untrack(parsed.value.sessionId);
+        await this.ensureStarted();
+        this.track(parsed.value);
+      }
     } else if (!this.socket || this.socket.destroyed) {
       return false;
     }
@@ -472,8 +484,28 @@ export class RemoteDesktopWorkerHost {
 
   private async ensureStarted(forceSecureConsole = false): Promise<void> {
     if (this.socket && !this.socket.destroyed) return;
-    if (this.startPromise) return await this.startPromise;
+    if (this.startPromise) {
+      await this.startPromise;
+      if (this.socket && !this.socket.destroyed) return;
+      // The start being awaited already finished, and the pipe it produced is
+      // gone. Keeping that settled promise would make every later start a
+      // silent no-op and report success with no worker behind it.
+      this.startPromise = null;
+    }
     if (!this.artifact) throw new Error('remote_desktop_worker_unavailable');
+    // A previous start may still own the listening pipe: hand it back before
+    // listening again, or the cold start fails on its own leftovers. An
+    // already-accepted worker socket is unaffected by closing the listener.
+    if (this.server) {
+      const previous = this.server;
+      this.server = null;
+      await new Promise<void>((closed) => previous.close(() => closed()));
+    }
+    if (!(this.platform === 'win32' && this.pipePath.startsWith('\\\\.\\pipe\\'))) {
+      // Windows named pipes disappear with their handle; a unix socket path
+      // does not, and the stale file would refuse the new listener.
+      await rm(this.pipePath, { force: true }).catch(() => {});
+    }
     this.startPromise = new Promise<void>((resolveStarted, rejectStarted) => {
       let settled = false;
       const finish = (error?: Error) => {

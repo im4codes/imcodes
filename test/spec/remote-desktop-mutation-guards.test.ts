@@ -814,6 +814,27 @@ const contracts: Contract[] = [
     ],
   },
   {
+    // A warm worker exits between sessions and Windows only reports the dead
+    // pipe on the next write. The recovery for that existed; a settled start
+    // promise made it a no-op, so the first connect after any quiet period
+    // ended as worker_failed.
+    name: 'a dead idle pipe cold-starts a replacement instead of failing the session',
+    guards: [
+      {
+        path: 'src/node/remote-desktop-worker-host.ts',
+        needle: 'silent no-op and report success with no worker behind it.\n      this.startPromise = null;',
+      },
+      {
+        path: 'src/node/remote-desktop-worker-host.ts',
+        needle: 'if (recoverIdlePrepare && (!this.socket || this.socket.destroyed)) {',
+      },
+      {
+        path: 'src/node/remote-desktop-worker-host.ts',
+        needle: 'await new Promise<void>((closed) => previous.close(() => closed()));',
+      },
+    ],
+  },
+  {
     // `inbound-rtp` exists from the moment the transceiver does, with zero
     // bytes, so the stall rule cannot be applied before the first byte: on a
     // relayed path with a cold worker it kills healthy connections, which is
@@ -1295,6 +1316,12 @@ const mutations: Mutation[] = [
     contract: 'the remote pointer stays visible while it is driven',
     path: 'native/windows-remote-desktop/local_indicator.cc',
     needle: 'if (request->accepted && PointerSuppressed())',
+  },
+  {
+    name: 'let a settled start promise stand in for a live worker',
+    contract: 'a dead idle pipe cold-starts a replacement instead of failing the session',
+    path: 'src/node/remote-desktop-worker-host.ts',
+    needle: 'silent no-op and report success with no worker behind it.\n      this.startPromise = null;',
   },
   {
     name: 'apply the stall rule before media has started',

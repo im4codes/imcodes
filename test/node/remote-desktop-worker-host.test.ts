@@ -869,6 +869,97 @@ describe('remote desktop worker artifact and IPC host', () => {
     expect((host as unknown as { socket: net.Socket }).socket).not.toBe(staleSocket);
   });
 
+  it('cold-starts when the idle pipe closes between the check and the write', async () => {
+    // The worker-failed the operator actually saw: after a quiet period the
+    // warm worker has exited, its pipe still looks alive when the host checks
+    // it, and the close lands before the PREPARE can be written. That must
+    // cold-start a replacement, not end the session the browser just opened.
+    const temp = await mkdtemp(join(tmpdir(), 'imcodes-rd-host-idle-close-'));
+    cleanup.push(() => rm(temp, { recursive: true, force: true }));
+    const pipePath = join(temp, 'worker.sock');
+    const helpers: net.Socket[] = [];
+    const helperBuffers: string[] = [];
+    const launch = vi.fn((_executable: string, argsLine: string) => {
+      const args = quotedArgs(argsLine);
+      const index = helpers.length;
+      helperBuffers.push('');
+      const helper = net.createConnection(pipePath, () => {
+        helper.write(`${JSON.stringify({
+          type: REMOTE_DESKTOP_WORKER_HELLO_TYPE,
+          ipcVersion: REMOTE_DESKTOP_WORKER_IPC_VERSION,
+          nonce: args[3],
+          pid: 70 + index,
+        })}\n`);
+      });
+      helper.setEncoding('utf8');
+      helper.on('data', (chunk) => { helperBuffers[index] += String(chunk); });
+      helpers.push(helper);
+    });
+    const received: RemoteDesktopDaemonMessage[] = [];
+    const host = new RemoteDesktopWorkerHost((message) => received.push(message), {
+      ...trustedHostOptions,
+      platform: 'win32',
+      artifact,
+      pipePath,
+      allowPipeClients: () => {},
+      launch,
+    });
+    cleanup.push(() => {
+      host.close();
+      for (const helper of helpers) helper.destroy();
+    });
+    const first = {
+      type: REMOTE_DESKTOP_MSG.PREPARE,
+      requestId,
+      sessionId,
+      capability,
+      expiresAt: Date.now() + 60_000,
+      leaseExpiresAt: Date.now() + 15_000,
+      daemonGeneration: 7,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
+      inputEpoch: 1,
+      iceServers: ['stun:stun.example.test:3478'],
+    } as const;
+    await expect(host.handle(first)).resolves.toBe(true);
+    await expect(host.handle({
+      type: REMOTE_DESKTOP_MSG.STOP, requestId, sessionId, capability,
+    })).resolves.toBe(true);
+
+    const staleSocket = (host as unknown as { socket: net.Socket }).socket;
+    const next = {
+      ...first,
+      requestId: 'request_idle_closed',
+      sessionId: 'session_idle_closed',
+      capability: 'e'.repeat(43),
+    } as const;
+    // Pin the race deterministically: the pipe passes the liveness check and
+    // the close lands before the PREPARE can be written. Only the first start
+    // is sabotaged, so the cold-started replacement is free to succeed.
+    const internals = host as unknown as {
+      ensureStarted(force?: boolean): Promise<void>;
+      socket: net.Socket | null;
+    };
+    const realEnsureStarted = internals.ensureStarted.bind(host);
+    let closeDuringStart = true;
+    vi.spyOn(internals, 'ensureStarted').mockImplementation(async (force?: boolean) => {
+      await realEnsureStarted(force);
+      if (closeDuringStart) {
+        closeDuringStart = false;
+        internals.socket?.destroy();
+      }
+    });
+    await expect(host.handle(next)).resolves.toBe(true);
+
+    expect(launch).toHaveBeenCalledTimes(2);
+    expect(received).not.toContainEqual(expect.objectContaining({
+      type: REMOTE_DESKTOP_MSG.TERMINAL,
+      reason: REMOTE_DESKTOP_TERMINAL_REASON.WORKER_FAILED,
+    }));
+    await vi.waitFor(() => expect(helperBuffers[1]).toContain(next.sessionId));
+    expect(JSON.parse(helperBuffers[1]!.trim())).toEqual(next);
+    expect((host as unknown as { socket: net.Socket }).socket).not.toBe(staleSocket);
+  });
+
   it('recycles an idle warm worker before a bounded browser reconnect', async () => {
     const temp = await mkdtemp(join(tmpdir(), 'imcodes-rd-host-reconnect-'));
     cleanup.push(() => rm(temp, { recursive: true, force: true }));
