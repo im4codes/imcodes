@@ -3092,7 +3092,7 @@
       "select_display": "Сначала выберите дисплей: вводу некуда идти.",
       "input_unavailable": "Узел сейчас не может обратиться к рабочему столу, принимающему ввод."
     },
-    "pointer_moves": "движений указателя: {{count}}",
+    "pointer_moves": "движений указателя: {{count}} (дублей {{mirrored}})",
     "minimize_files": "Свернуть передачи",
     "restore_files": "Показать передачи",
     "transfers_running": "передач: {{count}} · {{progress}}%"

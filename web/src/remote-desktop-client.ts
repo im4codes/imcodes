@@ -94,7 +94,14 @@ export interface RemoteDesktopSnapshot {
    * moves or a node that never applied them, and those need opposite fixes —
    * this is the number that tells the two apart from the session itself.
    */
+  /**
+   * Moves that actually left on the best-effort pointer channel, and the
+   * subset mirrored on the reliable one. Split because "the cursor does not
+   * follow" has two very different causes -- nothing sent at all, or sent on a
+   * channel the link is discarding -- and one total cannot tell them apart.
+   */
   pointerMovesSent?: number;
+  pointerMovesMirrored?: number;
   lastAcknowledgedInputSequence?: number;
   durationMs?: number;
   reconnectCount?: number;
@@ -335,6 +342,7 @@ export class RemoteDesktopClient {
   private lastReliablePointerSyncAt = Number.NEGATIVE_INFINITY;
   private lastPointerFlushAt = Number.NEGATIVE_INFINITY;
   private pointerMovesSent = 0;
+  private pointerMovesMirrored = 0;
   private pressedCodes = new Set<string>();
   private pressedButtons = new Set<string>();
   private pendingClipboardRequests = new Map<string, {
@@ -1045,7 +1053,7 @@ export class RemoteDesktopClient {
       // control channel so the remote cursor always converges to the local
       // cursor even when the final unreliable datagram is lost.
       this.lastReliablePointerSyncAt = now;
-      this.pointerMovesSent += 1;
+      this.pointerMovesMirrored += 1;
     }
     if (!isOpen(this.pointerChannel)) return;
     if (this.pointerChannel.bufferedAmount > DATA_BUFFER_HIGH_WATER_BYTES) {
@@ -1119,7 +1127,14 @@ export class RemoteDesktopClient {
       const quality = this.snapshot.quality;
       const durationMs = Math.max(0, (this.deps.now?.() ?? Date.now()) - this.startedAt);
       if (!inbound || !quality) {
-        this.publish({ durationMs });
+        // The pointer counters are the one diagnostic that matters most before
+        // there is a picture to measure -- "is anything being sent at all" --
+        // so they must not ride along with the quality publish alone.
+        this.publish({
+          durationMs,
+          pointerMovesSent: this.pointerMovesSent,
+          pointerMovesMirrored: this.pointerMovesMirrored,
+        });
         return;
       }
       const width = typeof inbound.frameWidth === 'number' && Number.isFinite(inbound.frameWidth)
@@ -1174,15 +1189,20 @@ export class RemoteDesktopClient {
         }
         this.previousInboundStats = { bytes: inbound.bytesReceived, timestamp: inbound.timestamp };
       }
-      this.publish({ pointerMovesSent: this.pointerMovesSent, quality: {
-        ...quality,
-        width,
-        height,
-        fps,
-        bitrateBps,
-        droppedFrames,
-        ...(rttMs === undefined ? {} : { rttMs }),
-      }, durationMs });
+      this.publish({
+        pointerMovesSent: this.pointerMovesSent,
+        pointerMovesMirrored: this.pointerMovesMirrored,
+        durationMs,
+        quality: {
+          ...quality,
+          width,
+          height,
+          fps,
+          bitrateBps,
+          droppedFrames,
+          ...(rttMs === undefined ? {} : { rttMs }),
+        },
+      });
     } catch {
       // Stats are diagnostics only and never change media/input authority.
     } finally {

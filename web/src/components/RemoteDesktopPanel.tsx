@@ -2138,7 +2138,10 @@ export function RemoteDesktopPanel({
               </>
             )}
             {snapshot.pointerMovesSent !== undefined && (
-              <span>{t('remote_desktop.pointer_moves', { count: snapshot.pointerMovesSent })}</span>
+              <span>{t('remote_desktop.pointer_moves', {
+                count: snapshot.pointerMovesSent,
+                mirrored: snapshot.pointerMovesMirrored ?? 0,
+              })}</span>
             )}
             {/* Belongs with the session's other facts, not in the toolbar
                 between the buttons it explains. */}

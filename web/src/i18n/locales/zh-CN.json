@@ -3093,7 +3093,7 @@
       "select_display": "请先选择一个显示器，否则输入没有目标。",
       "input_unavailable": "节点暂时无法访问当前接收输入的桌面。"
     },
-    "pointer_moves": "指针移动：{{count}}",
+    "pointer_moves": "指针移动：{{count}}（可靠镜像 {{mirrored}}）",
     "minimize_files": "最小化传输窗口",
     "restore_files": "展开传输窗口",
     "transfers_running": "{{count}} 个传输 · {{progress}}%"

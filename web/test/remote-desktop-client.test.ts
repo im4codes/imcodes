@@ -1201,6 +1201,9 @@ describe('RemoteDesktopClient', () => {
     control.open();
     peer.channels.get(REMOTE_DESKTOP_CHANNEL.KEYBOARD)!.open();
     pointer.open();
+    // Channels open means the peer is connected, which is also what starts the
+    // once-a-second diagnostics the footer counter is published on.
+    peer.connect();
     control.receive({
       type: REMOTE_DESKTOP_DATA_MSG.DISPLAY_TOPOLOGY,
       protocolVersion: REMOTE_DESKTOP_PROTOCOL_VERSION,
@@ -1247,6 +1250,16 @@ describe('RemoteDesktopClient', () => {
     // The reliable channel carries them, so following survives a link that
     // drops the fast path entirely.
     expect(movesOn(control)).toBeGreaterThan(5);
+
+    // The footer counter is the only way an operator can tell "nothing is
+    // being sent" from "sent and dropped", so it has to be published even
+    // before there are inbound video stats to report alongside, and it has to
+    // separate the two channels rather than adding them into one number.
+    await vi.waitFor(() => {
+      expect(client.current().pointerMovesMirrored ?? 0).toBeGreaterThan(5);
+    }, { timeout: 3_000 });
+    expect(client.current().pointerMovesSent).toBe(movesOn(pointer));
+    expect(client.current().pointerMovesMirrored).toBe(movesOn(control));
     client.stop();
   });
 
