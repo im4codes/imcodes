@@ -8,6 +8,7 @@ import {
   REMOTE_DESKTOP_DATA_MSG,
   REMOTE_DESKTOP_DPI_SCALE_PERCENTS,
   REMOTE_DESKTOP_ERROR,
+  REMOTE_DESKTOP_INPUT_BLOCKED,
   REMOTE_DESKTOP_KEYBOARD_KIND,
   REMOTE_DESKTOP_LIMITS,
   REMOTE_DESKTOP_MSG,
@@ -25,6 +26,7 @@ import {
   type RemoteDesktopControlKind,
   type RemoteDesktopControlRejection,
   type RemoteDesktopDisplay,
+  type RemoteDesktopInputBlocked,
   type RemoteDesktopQuality,
   type RemoteDesktopRoute,
   type RemoteDesktopServerMessage,
@@ -73,6 +75,8 @@ export interface RemoteDesktopSnapshot {
   signInScreen?: boolean;
   /** That node holds a stored secret it can be asked to type. */
   unlockAvailable?: boolean;
+  /** Present only while input is off, naming what the node is waiting on. */
+  inputBlocked?: RemoteDesktopInputBlocked;
   lastAcknowledgedInputSequence?: number;
   durationMs?: number;
   reconnectCount?: number;
@@ -794,7 +798,16 @@ export class RemoteDesktopClient {
         controllerCount: message.controllerCount,
         signInScreen: message.signInScreen === true,
         unlockAvailable: message.unlockAvailable === true,
+        inputBlocked: message.inputBlocked,
       });
+      if (message.inputBlocked === REMOTE_DESKTOP_INPUT_BLOCKED.AWAITING_FRAME
+        && !this.pendingPresentedFrame) {
+        // The node is waiting for a frame of the current layout and this client
+        // has nothing queued to acknowledge with — a topology whose frame was
+        // already consumed, or one that arrived without a usable selection.
+        // Re-arm from what it knows, or input stays off for the whole session.
+        this.requirePresentedFrameForCurrentTopology();
+      }
       if (message.state === REMOTE_DESKTOP_STATE.DIRECT || message.state === REMOTE_DESKTOP_STATE.RELAYED) {
         this.clearStartTimer();
       }

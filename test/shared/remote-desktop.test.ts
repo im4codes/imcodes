@@ -12,6 +12,7 @@ import {
   REMOTE_DESKTOP_DISPLAY_ROTATION,
   REMOTE_DESKTOP_ENCODER_CLASS,
   REMOTE_DESKTOP_ERROR,
+  REMOTE_DESKTOP_INPUT_BLOCKED,
   REMOTE_DESKTOP_LIMITS,
   REMOTE_DESKTOP_MSG,
   REMOTE_DESKTOP_MODE_REASON,
@@ -423,6 +424,28 @@ describe('remote desktop production contract', () => {
       .toEqual({ ok: false, error: REMOTE_DESKTOP_ERROR.INVALID_REQUEST });
     expect(validateRemoteDesktopServerMessage({ ...status, unlockAvailable: 1 }))
       .toEqual({ ok: false, error: REMOTE_DESKTOP_ERROR.INVALID_REQUEST });
+  });
+
+  it('names what input is waiting on, and only while it is off', () => {
+    const status = {
+      type: REMOTE_DESKTOP_MSG.STATUS,
+      requestId,
+      sessionId,
+      capability,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
+      inputEpoch: 1,
+      state: REMOTE_DESKTOP_STATE.DIRECT,
+      inputEnabled: false,
+      inputBlocked: REMOTE_DESKTOP_INPUT_BLOCKED.AWAITING_FRAME,
+    };
+    expect(validateRemoteDesktopServerMessage(status)).toMatchObject({ ok: true });
+    // Enabled input has nothing to be waiting on: the pair is contradictory.
+    expect(validateRemoteDesktopServerMessage({ ...status, inputEnabled: true }))
+      .toEqual({ ok: false, error: REMOTE_DESKTOP_ERROR.INVALID_REQUEST });
+    expect(validateRemoteDesktopServerMessage({ ...status, inputBlocked: 'because' }))
+      .toEqual({ ok: false, error: REMOTE_DESKTOP_ERROR.INVALID_REQUEST });
+    const { inputBlocked: _blocked, ...silent } = status;
+    expect(validateRemoteDesktopServerMessage(silent)).toMatchObject({ ok: true });
   });
 
   it('accepts an unlock request only as a bare control command', () => {

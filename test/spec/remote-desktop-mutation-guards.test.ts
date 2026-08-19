@@ -879,6 +879,36 @@ const contracts: Contract[] = [
     ],
   },
   {
+    // A connected, controlling session that cannot type is the most opaque
+    // state this protocol has — the whole toolbar greys out with nothing to
+    // explain it — and the viewer only learned about the change on the next
+    // lease renewal, seconds later.
+    name: 'input readiness is explained and published as it changes',
+    guards: [
+      {
+        path: 'native/windows-remote-desktop/peer_session.cc',
+        needle: 'const char* PeerSession::InputBlockedReason() const {',
+      },
+      {
+        path: 'native/windows-remote-desktop/peer_session.cc',
+        needle: 'if (const char* blocked = InputBlockedReason()) root["inputBlocked"] = blocked;',
+      },
+      {
+        path: 'native/windows-remote-desktop/worker_main.cc',
+        needle: 'session->PublishInputReadinessIfChanged();',
+      },
+      {
+        path: 'shared/remote-desktop.ts',
+        needle: 'REMOTE_DESKTOP_INPUT_BLOCKED = {',
+      },
+      {
+        path: 'web/src/remote-desktop-client.ts',
+        needle: 'this.requirePresentedFrameForCurrentTopology();',
+        minimum: 3,
+      },
+    ],
+  },
+  {
     // A locked machine rests on the lock curtain, which has no password box:
     // typing without waking it first is what made auto unlock do nothing at
     // all. The manual control exists because the sign-in UI can still swallow
@@ -1357,6 +1387,12 @@ const mutations: Mutation[] = [
     contract: 'media that has not started is not treated as media that stalled',
     path: 'web/src/remote-desktop-client.ts',
     needle: 'if (inbound.bytesReceived > 0) this.mediaStarted = true;',
+  },
+  {
+    name: 'stop publishing input readiness as it changes',
+    contract: 'input readiness is explained and published as it changes',
+    path: 'native/windows-remote-desktop/worker_main.cc',
+    needle: 'session->PublishInputReadinessIfChanged();',
   },
   {
     name: 'type the secret without waking the lock curtain',

@@ -603,6 +603,19 @@ export function RemoteDesktopPanel({
     setClientGeneration((current) => current + 1);
   };
 
+  /**
+   * Why the input-gated controls are greyed. The node reports what it is
+   * waiting on; without this the whole toolbar simply goes dead and looks
+   * broken — which is exactly how it was reported.
+   */
+  const inputBlockedHint = (): string | undefined => {
+    if (snapshot.inputEnabled) return undefined;
+    if (snapshot.mode !== REMOTE_DESKTOP_ACCESS_MODE.CONTROL) {
+      return t('remote_desktop.input_blocked.no_control');
+    }
+    return t(`remote_desktop.input_blocked.${snapshot.inputBlocked ?? 'channels'}`);
+  };
+
   const openDisplayModeMenu = (
     displayId: string,
     target: HTMLElement,
@@ -1494,15 +1507,19 @@ export function RemoteDesktopPanel({
             <button
               type="button"
               disabled={!snapshot.inputEnabled || clipboardStatus === 'copying'}
+              title={inputBlockedHint()}
               onClick={() => { void copyRemoteSelection(); }}
             >{t('remote_desktop.copy_remote_selection')}</button>
             <button
               type="button"
               disabled={!snapshot.inputEnabled || clipboardStatus === 'pasting'}
+              title={inputBlockedHint()}
               onClick={() => { void pasteLocalClipboard(); }}
             >{t('remote_desktop.paste_local_clipboard')}</button>
             <span class="remote-desktop-clipboard-status" aria-live="polite">
-              {clipboardStatus === 'idle' ? '' : t(`remote_desktop.clipboard_${clipboardStatus}`)}
+              {clipboardStatus !== 'idle'
+                ? t(`remote_desktop.clipboard_${clipboardStatus}`)
+                : inputBlockedHint() ?? ''}
             </span>
           </div>
           <div class="remote-desktop-zoom-switch" role="group" aria-label={t('remote_desktop.zoom_label')}>
@@ -1536,9 +1553,10 @@ export function RemoteDesktopPanel({
               type="button"
               class="remote-desktop-unlock-trigger"
               disabled={!snapshot.inputEnabled || !snapshot.unlockAvailable}
-              title={snapshot.unlockAvailable
-                ? t('remote_desktop.unlock_hint')
-                : t('remote_desktop.unlock_unconfigured')}
+              title={inputBlockedHint()
+                ?? (snapshot.unlockAvailable
+                  ? t('remote_desktop.unlock_hint')
+                  : t('remote_desktop.unlock_unconfigured'))}
               onClick={() => { clientRef.current?.requestUnlock(); }}
             >{t('remote_desktop.unlock')}</button>
           )}

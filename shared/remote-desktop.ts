@@ -165,6 +165,31 @@ export const REMOTE_DESKTOP_CONTROL_KIND = {
   INPUT_ACK: 'input_ack',
 } as const;
 
+/**
+ * Why a connected, controlling session still cannot send input.
+ *
+ * Input goes off for ordinary reasons — a desktop switch, a display change —
+ * and comes back once the viewer acknowledges a frame of the new layout. When
+ * it does not come back, every control in the toolbar is greyed with nothing
+ * to explain it, which is indistinguishable from a broken session.
+ */
+export const REMOTE_DESKTOP_INPUT_BLOCKED = {
+  /** This session is watching, not controlling. */
+  NO_CONTROL: 'no_control',
+  /** The input channels are not open yet. */
+  CHANNELS: 'channels',
+  /** The node is waiting for a frame of the current layout to be acknowledged. */
+  AWAITING_FRAME: 'awaiting_frame',
+  /** No display is selected, so there is nothing to aim input at. */
+  SELECT_DISPLAY: 'select_display',
+  /** The node cannot reach the desktop that currently receives input. */
+  INPUT_UNAVAILABLE: 'input_unavailable',
+} as const;
+
+export type RemoteDesktopInputBlocked = typeof REMOTE_DESKTOP_INPUT_BLOCKED[
+  keyof typeof REMOTE_DESKTOP_INPUT_BLOCKED
+];
+
 export type RemoteDesktopControlKind = typeof REMOTE_DESKTOP_CONTROL_KIND[
   keyof typeof REMOTE_DESKTOP_CONTROL_KIND
 ];
@@ -468,6 +493,8 @@ export interface RemoteDesktopStatus {
   signInScreen?: boolean;
   /** The node holds a stored sign-in secret it can be asked to type. */
   unlockAvailable?: boolean;
+  /** Present only while input is off, naming what it is waiting on. */
+  inputBlocked?: RemoteDesktopInputBlocked;
 }
 
 export interface RemoteDesktopTerminal {
@@ -846,9 +873,12 @@ export function validateRemoteDesktopDaemonMessage(value: unknown): RemoteDeskto
       : invalid();
   }
   if (value.type === REMOTE_DESKTOP_MSG.STATUS) {
-    if (!hasExactKeys(value, ['type', 'requestId', 'sessionId', 'capability', 'mode', 'inputEpoch', 'state', 'inputEnabled'], ['route', 'selectedDisplayId', 'layoutRevision', 'viewerCount', 'controllerCount', 'signInScreen', 'unlockAvailable'])
+    if (!hasExactKeys(value, ['type', 'requestId', 'sessionId', 'capability', 'mode', 'inputEpoch', 'state', 'inputEnabled'], ['route', 'selectedDisplayId', 'layoutRevision', 'viewerCount', 'controllerCount', 'signInScreen', 'unlockAvailable', 'inputBlocked'])
       || (value.signInScreen !== undefined && typeof value.signInScreen !== 'boolean')
       || (value.unlockAvailable !== undefined && typeof value.unlockAvailable !== 'boolean')
+      || (value.inputBlocked !== undefined
+        && !(Object.values(REMOTE_DESKTOP_INPUT_BLOCKED) as string[]).includes(value.inputBlocked as string))
+      || (value.inputBlocked !== undefined && value.inputEnabled === true)
       || !hasSessionCorrelation(value)
       || typeof value.mode !== 'string' || !ACCESS_MODES.has(value.mode)
       || !isSafeNonNegative(value.inputEpoch)

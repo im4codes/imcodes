@@ -488,7 +488,14 @@ class WorkerRuntime {
       }
       const int64_t now_ms = NowMs();
       for (auto& [id, session] : sessions_) {
-        if (!session->closed()) session->CheckMediaProgress();
+        if (!session->closed()) {
+          // Input readiness changes on its own schedule — a layout
+          // acknowledged, a desktop followed — and the viewer used to learn
+          // about it only on the next lease renewal, which is why a fresh
+          // connection ignored clicks for seconds.
+          session->PublishInputReadinessIfChanged();
+          session->CheckMediaProgress();
+        }
         if (!session->closed() && session->protected_content_masked()) {
           session->Close("protected_desktop");
         } else if (!session->closed() && session->Expired(now_ms)) {

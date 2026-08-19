@@ -5,6 +5,7 @@ import {
   REMOTE_DESKTOP_CONTROL_KIND,
   REMOTE_DESKTOP_CONTROL_REJECTION,
   REMOTE_DESKTOP_DATA_MSG,
+  REMOTE_DESKTOP_INPUT_BLOCKED,
   REMOTE_DESKTOP_LIMITS,
   REMOTE_DESKTOP_MSG,
   REMOTE_DESKTOP_MODE_REASON,
@@ -1053,6 +1054,94 @@ describe('RemoteDesktopClient', () => {
       terminalReason: REMOTE_DESKTOP_TERMINAL_REASON.PEER_FAILED,
     }));
     intervalSpy.mockRestore();
+  });
+
+  it('re-arms the frame acknowledgement when the node says it is waiting for one', async () => {
+    // Input goes off across a desktop switch and only returns once a frame of
+    // the new layout is acknowledged. If this client has nothing queued to
+    // acknowledge with, it would stay off for the rest of the session — which
+    // is a whole toolbar greyed out with no way back.
+    let socket!: FakeSocket;
+    let peer!: FakePeer;
+    const client = new RemoteDesktopClient('controlled-win', { onSnapshot: vi.fn() }, {
+      fetchTicket: async () => 'ticket-rearm',
+      createSocket: () => {
+        socket = new FakeSocket();
+        queueMicrotask(() => socket.open());
+        return socket as unknown as WebSocket;
+      },
+      createPeer: () => {
+        peer = new FakePeer();
+        return peer as unknown as RTCPeerConnection;
+      },
+    });
+
+    await client.start();
+    const start = JSON.parse(socket.sent[0]!) as { requestId: string };
+    const authority = {
+      requestId: start.requestId,
+      sessionId: 'session_rearm123',
+      capability: 'r'.repeat(43),
+    };
+    socket.receive({
+      type: REMOTE_DESKTOP_MSG.AUTHORIZED,
+      ...authority,
+      expiresAt: Date.now() + 60_000,
+      leaseExpiresAt: Date.now() + 15_000,
+      daemonGeneration: 7,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
+      inputEpoch: 1,
+      iceServers: ['stun:stun.example.test:3478'],
+    });
+    await vi.waitFor(() => expect(peer).toBeDefined());
+    const control = peer.channels.get(REMOTE_DESKTOP_CHANNEL.CONTROL)!;
+    control.open();
+    peer.channels.get(REMOTE_DESKTOP_CHANNEL.KEYBOARD)!.open();
+    peer.channels.get(REMOTE_DESKTOP_CHANNEL.POINTER)!.open();
+    control.receive({
+      type: REMOTE_DESKTOP_DATA_MSG.DISPLAY_TOPOLOGY,
+      protocolVersion: REMOTE_DESKTOP_PROTOCOL_VERSION,
+      sessionId: authority.sessionId,
+      sequence: 1,
+      layoutRevision: 1,
+      displays: [{
+        id: 'display_rearm001',
+        label: 'DISPLAY1',
+        primary: true,
+        available: true,
+        width: 1920,
+        height: 1080,
+        dpiScale: 1,
+        rotation: 0,
+      }],
+      selectedDisplayId: 'display_rearm001',
+    });
+    // Consume the queued acknowledgement, as a rendered frame does.
+    expect(client.acknowledgePresentedFrame(1920, 1080)).toBe(true);
+    const sentBefore = control.sent.length;
+
+    socket.receive({
+      type: REMOTE_DESKTOP_MSG.STATUS,
+      ...authority,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
+      inputEpoch: 1,
+      state: REMOTE_DESKTOP_STATE.DIRECT,
+      route: 'direct',
+      selectedDisplayId: 'display_rearm001',
+      layoutRevision: 1,
+      inputEnabled: false,
+      inputBlocked: REMOTE_DESKTOP_INPUT_BLOCKED.AWAITING_FRAME,
+    });
+    await vi.waitFor(() => expect(client.current().inputBlocked)
+      .toBe(REMOTE_DESKTOP_INPUT_BLOCKED.AWAITING_FRAME));
+    // Re-armed: the next rendered frame can answer the node again.
+    expect(client.acknowledgePresentedFrame(1920, 1080)).toBe(true);
+    expect(control.sent.length).toBeGreaterThan(sentBefore);
+    expect(JSON.parse(control.sent.at(-1)!)).toMatchObject({
+      kind: REMOTE_DESKTOP_CONTROL_KIND.FRAME_PRESENTED,
+      displayId: 'display_rearm001',
+    });
+    client.stop();
   });
 
   it('denies unknown keys and secure-attention input before the DataChannel', () => {

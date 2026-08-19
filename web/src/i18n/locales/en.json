@@ -3085,6 +3085,13 @@
     "unlock_hint": "Ask this node to answer its sign-in screen with the secret it stores.",
     "unlock_unconfigured": "No sign-in secret is stored on this node.",
     "resolution_unreported": "This node has not reported its driver’s resolutions; these are the common sizes.",
-    "connection_retrying_reason": "Interrupted by: {{reason}}"
+    "connection_retrying_reason": "Interrupted by: {{reason}}",
+    "input_blocked": {
+      "no_control": "This session is watching, not controlling.",
+      "channels": "Still opening the input channel.",
+      "awaiting_frame": "Waiting for the node to confirm the current screen — input resumes on the next frame.",
+      "select_display": "Pick a display first: nothing is selected to aim input at.",
+      "input_unavailable": "The node cannot reach the desktop that receives input right now."
+    }
   }
 }

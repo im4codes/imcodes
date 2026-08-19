@@ -3084,6 +3084,13 @@
     "unlock_hint": "このノードに、保存済みのパスワードでサインイン画面へ応答させます。",
     "unlock_unconfigured": "このノードにはサインインのパスワードが保存されていません。",
     "resolution_unreported": "このノードはドライバーの解像度を報告していません。ここでは一般的なサイズを表示しています。",
-    "connection_retrying_reason": "中断の理由: {{reason}}"
+    "connection_retrying_reason": "中断の理由: {{reason}}",
+    "input_blocked": {
+      "no_control": "このセッションは閲覧のみで、操作権がありません。",
+      "channels": "入力チャネルを準備しています。",
+      "awaiting_frame": "ノードが現在の画面を確認するのを待っています — 次のフレームで操作できます。",
+      "select_display": "先にディスプレイを選んでください。入力先がありません。",
+      "input_unavailable": "ノードが今、入力を受け取るデスクトップに到達できません。"
+    }
   }
 }

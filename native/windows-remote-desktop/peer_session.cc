@@ -1277,6 +1277,7 @@ bool PeerSession::SendClipboard(
 }
 
 void PeerSession::SendStatus(const char* state, bool input_enabled) {
+  reported_input_ready_ = input_enabled;
   Json::Value root = BaseEnvelope(kStatusType, authority_);
   root["mode"] = authority_.mode;
   root["inputEpoch"] = authority_.input_epoch;
@@ -1287,6 +1288,12 @@ void PeerSession::SendStatus(const char* state, bool input_enabled) {
     root["layoutRevision"] = layout_revision_;
   }
   root["inputEnabled"] = input_enabled;
+  if (!input_enabled) {
+    // A session that is connected and controlling but cannot type is the most
+    // opaque state this protocol has: every control greys out with nothing to
+    // explain it. Name what it is waiting on.
+    if (const char* blocked = InputBlockedReason()) root["inputBlocked"] = blocked;
+  }
   if (sign_in_screen_) root["signInScreen"] = true;
   if (unlock_available_) root["unlockAvailable"] = true;
   emit_(root);
@@ -1500,6 +1507,26 @@ bool PeerSession::ChannelsReady() const {
     }
   }
   return true;
+}
+
+void PeerSession::PublishInputReadinessIfChanged() {
+  if (closed_ || !peer_) return;
+  const bool ready = InputReady();
+  if (ready == reported_input_ready_) return;
+  reported_input_ready_ = ready;
+  SendStatus(relayed_ ? "relayed" : "direct", ready);
+}
+
+const char* PeerSession::InputBlockedReason() const {
+  if (!controlling()) return kInputBlockedNoControl;
+  if (!ChannelsReady()) return kInputBlockedChannels;
+  if (selection_required_) return kInputBlockedSelectDisplay;
+  // Input stays off across a layout change until the viewer confirms it is
+  // looking at a frame of the new one — the common reason it is off after a
+  // desktop switch.
+  if (!layout_acknowledged_) return kInputBlockedAwaitingFrame;
+  if (!input_->Available()) return kInputBlockedInputUnavailable;
+  return nullptr;
 }
 
 bool PeerSession::InputReady() const {

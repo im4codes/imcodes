@@ -67,6 +67,14 @@ inline constexpr char kRejectScaleChangeFailed[] = "scale_change_failed";
 inline constexpr char kRejectCaptureFailed[] = "capture_failed";
 inline constexpr char kRejectUnlockUnavailable[] = "unlock_unavailable";
 
+// Why a controlling session still cannot send input. Reported on the status
+// frame so a toolbar full of greyed controls can say what it is waiting on.
+inline constexpr char kInputBlockedNoControl[] = "no_control";
+inline constexpr char kInputBlockedChannels[] = "channels";
+inline constexpr char kInputBlockedAwaitingFrame[] = "awaiting_frame";
+inline constexpr char kInputBlockedSelectDisplay[] = "select_display";
+inline constexpr char kInputBlockedInputUnavailable[] = "input_unavailable";
+
 inline constexpr char kControlChannel[] = "imcodes-rd-control";
 inline constexpr char kKeyboardChannel[] = "imcodes-rd-keyboard";
 inline constexpr char kPointerChannel[] = "imcodes-rd-pointer";

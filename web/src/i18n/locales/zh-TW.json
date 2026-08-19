@@ -3085,6 +3085,13 @@
     "unlock_hint": "讓該節點用本機儲存的密碼應答自己的登入畫面。",
     "unlock_unconfigured": "該節點未儲存登入密碼。",
     "resolution_unreported": "該節點未回報驅動程式支援的解析度，這裡顯示的是通用尺寸。",
-    "connection_retrying_reason": "中斷原因：{{reason}}"
+    "connection_retrying_reason": "中斷原因：{{reason}}",
+    "input_blocked": {
+      "no_control": "目前是觀看模式，沒有控制權。",
+      "channels": "輸入通道還在建立中。",
+      "awaiting_frame": "正在等待節點確認目前畫面——收到下一幀後即可操作。",
+      "select_display": "請先選擇一個顯示器，否則輸入沒有目標。",
+      "input_unavailable": "節點暫時無法存取目前接收輸入的桌面。"
+    }
   }
 }

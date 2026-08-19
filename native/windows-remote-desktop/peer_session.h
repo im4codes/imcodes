@@ -86,6 +86,13 @@ class PeerSession final : public webrtc::PeerConnectionObserver,
   bool protected_content_masked() const;
   bool closed() const { return closed_.load(); }
   void CheckMediaProgress();
+  /**
+   * Push a status the moment input becomes usable (or stops being), instead of
+   * leaving the viewer to discover it on the next lease renewal. Called from
+   * the worker's tick, so the dead window after a connect or a desktop switch
+   * is one tick rather than one renewal interval.
+   */
+  void PublishInputReadinessIfChanged();
   void HandleMediaStats(uint64_t generation,
                         bool has_outbound_video,
                         uint64_t outbound_bytes);
@@ -144,6 +151,8 @@ class PeerSession final : public webrtc::PeerConnectionObserver,
   bool SendClipboard(const std::string& request_id,
                      const std::optional<std::u16string>& text);
   void SendStatus(const char* state, bool input_enabled);
+  /** What input is waiting on, or nullptr when nothing is. */
+  const char* InputBlockedReason() const;
   // Tell the controller why a control command did nothing. Always returns
   // false so refusal paths can `return SendControlRejected(...)`.
   bool SendControlRejected(const char* kind,
@@ -172,6 +181,8 @@ class PeerSession final : public webrtc::PeerConnectionObserver,
   const RequestUnlock request_unlock_;
   bool sign_in_screen_ = false;
   bool unlock_available_ = false;
+  /** Last input readiness reported, so only changes are pushed. */
+  bool reported_input_ready_ = false;
   webrtc::Thread* const signaling_thread_;
   const EmitJson emit_;
   webrtc::scoped_refptr<webrtc::PeerConnectionInterface> peer_;

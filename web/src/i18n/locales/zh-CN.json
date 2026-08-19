@@ -3085,6 +3085,13 @@
     "unlock_hint": "让该节点用本机保存的口令应答自己的登录界面。",
     "unlock_unconfigured": "该节点未保存登录口令。",
     "resolution_unreported": "该节点未上报驱动支持的分辨率，这里显示的是通用尺寸。",
-    "connection_retrying_reason": "中断原因：{{reason}}"
+    "connection_retrying_reason": "中断原因：{{reason}}",
+    "input_blocked": {
+      "no_control": "当前是观看模式，没有控制权。",
+      "channels": "输入通道还在建立中。",
+      "awaiting_frame": "正在等待节点确认当前画面——收到下一帧后即可操作。",
+      "select_display": "请先选择一个显示器，否则输入没有目标。",
+      "input_unavailable": "节点暂时无法访问当前接收输入的桌面。"
+    }
   }
 }
