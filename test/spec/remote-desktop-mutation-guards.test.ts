@@ -14,6 +14,7 @@ const SOURCE_PATHS = [
   'native/windows-remote-desktop/local_indicator.cc',
   'native/windows-remote-desktop/input_injector.cc',
   'native/windows-remote-desktop/peer_session.cc',
+  'native/windows-remote-desktop/pipe_ipc.cc',
   'native/windows-remote-desktop/display_capture.cc',
   'native/windows-remote-desktop/mf_h264_encoder.cc',
   'native/windows-remote-desktop/mf_h264_encoder.h',
@@ -1557,6 +1558,36 @@ const mutations: Mutation[] = [
   },
 ];
 
+contracts.push({
+  // Measured on a real node: with one non-overlapped handle serving both
+  // directions, Windows made every frame the worker emits wait for the daemon's
+  // next message, so a fresh session advanced one lease renewal per hop --
+  // topology after five seconds, input accepted after ten, and hover motion
+  // stranded on the signalling thread in between.
+  name: 'worker IPC writes never wait on the pending read',
+  guards: [
+    {
+      path: 'native/windows-remote-desktop/pipe_ipc.cc',
+      needle: 'FILE_FLAG_OVERLAPPED',
+    },
+    {
+      path: 'native/windows-remote-desktop/pipe_ipc.cc',
+      needle: 'GetOverlappedResult',
+    },
+    {
+      path: 'native/windows-remote-desktop/worker_main.cc',
+      needle: 'pipe_channel.Read(',
+    },
+  ],
+});
+
+mutations.push({
+  name: 'opening the daemon pipe without overlapped I/O',
+  contract: 'worker IPC writes never wait on the pending read',
+  path: 'native/windows-remote-desktop/pipe_ipc.cc',
+  needle: 'FILE_FLAG_OVERLAPPED',
+});
+
 function contractHolds(contract: Contract, sources: Sources): boolean {
   return contract.guards.every((guard) => (
     occurrences(sources[guard.path], guard.needle) >= (guard.minimum ?? 1)
@@ -1597,6 +1628,19 @@ describe('remote desktop load-bearing mutation guards', () => {
     expect(refresh).toContain('if (!next_source) return true;');
     expect(refresh.indexOf('auto next_source = acquire_source_(*selected);'))
       .toBeLessThan(refresh.indexOf('video_sender->SetTrack(next_track.get())'));
+  });
+
+  it('keeps raw blocking pipe I/O out of the worker signalling path', () => {
+    const worker = sources['native/windows-remote-desktop/worker_main.cc'];
+    // The signalling thread emits every status, topology and ICE frame. A plain
+    // WriteFile on the daemon pipe parks it until the daemon happens to speak.
+    expect(worker).not.toContain('WriteFile(pipe');
+    expect(worker).not.toContain('ReadFile(pipe,');
+    const channel = sources['native/windows-remote-desktop/pipe_ipc.cc'];
+    expect(channel).toContain('GetOverlappedResult');
+    // Separate events, or the two directions would still serialise on one.
+    expect(channel).toContain('overlapped.hEvent = write_event_;');
+    expect(channel).toContain('overlapped.hEvent = read_event_;');
   });
 
   it('never invokes icacls synchronously on the remote-desktop daemon event loop', () => {

@@ -24,6 +24,8 @@ rtc_executable("imcodes_remote_desktop_worker") {
     "mf_h264_encoder.h",
     "peer_session.cc",
     "peer_session.h",
+    "pipe_ipc.cc",
+    "pipe_ipc.h",
     "quality_ladder.cc",
     "quality_ladder.h",
     "unlock_secret.cc",
@@ -128,6 +130,19 @@ if (rtc_include_tests) {
       "//test:test_support",
       "//third_party/jsoncpp",
     ]
+  }
+
+  rtc_test("pipe_ipc_unittests") {
+    sources = [
+      "pipe_ipc.cc",
+      "pipe_ipc.h",
+      "pipe_ipc_unittest.cc",
+    ]
+    defines = [
+      "NOMINMAX",
+      "WIN32_LEAN_AND_MEAN",
+    ]
+    deps = [ "//test:test_support" ]
   }
 
   rtc_test("ice_candidate_queue_unittests") {

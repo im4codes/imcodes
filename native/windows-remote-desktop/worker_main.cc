@@ -39,6 +39,7 @@
 #include "third_party/imcodes_remote_desktop/local_indicator.h"
 #include "third_party/imcodes_remote_desktop/mf_h264_encoder.h"
 #include "third_party/imcodes_remote_desktop/peer_session.h"
+#include "third_party/imcodes_remote_desktop/pipe_ipc.h"
 #include "third_party/imcodes_remote_desktop/unlock_secret.h"
 #include "third_party/imcodes_remote_desktop/worker_policy.h"
 #include "third_party/imcodes_remote_desktop/virtual_display_controller.h"
@@ -190,16 +191,14 @@ constexpr wchar_t kSignInDesktop[] = L"Winlogon";
 // receives input. Input during the brief follow is dropped rather than sent to
 // the desktop being left behind.
 std::atomic<bool> g_input_desktop_ready{false};
-std::atomic<HANDLE> g_crash_pipe{nullptr};
+std::atomic<PipeChannel*> g_crash_pipe{nullptr};
 char g_crash_nonce[64] = {};
 char g_crash_line[512] = {};
 
 DWORD WINAPI WriteCrashLine(LPVOID) {
-  HANDLE pipe = g_crash_pipe.load();
-  if (!pipe || pipe == INVALID_HANDLE_VALUE) return 0;
-  DWORD written = 0;
-  WriteFile(pipe, g_crash_line, static_cast<DWORD>(strlen(g_crash_line)),
-            &written, nullptr);
+  PipeChannel* pipe = g_crash_pipe.load();
+  if (!pipe || !pipe->valid()) return 0;
+  pipe->Write(std::string(g_crash_line, strlen(g_crash_line)));
   return 0;
 }
 
@@ -312,30 +311,17 @@ bool ReadSecretFromStdin(std::wstring* secret) {
 
 class PipeWriter {
  public:
-  explicit PipeWriter(HANDLE pipe) : pipe_(pipe) {}
+  explicit PipeWriter(PipeChannel* pipe) : pipe_(pipe) {}
 
   bool Emit(const Json::Value& value) {
     std::string line = WriteJson(value);
     line.push_back('\n');
     if (line.size() > kMaxIpcLineBytes) return false;
-    std::lock_guard lock(mutex_);
-    size_t offset = 0;
-    while (offset < line.size()) {
-      DWORD written = 0;
-      const DWORD remaining = static_cast<DWORD>(
-          std::min<size_t>(line.size() - offset, 64 * 1024));
-      if (!WriteFile(pipe_, line.data() + offset, remaining, &written,
-                     nullptr) || written == 0) {
-        return false;
-      }
-      offset += written;
-    }
-    return true;
+    return pipe_->Write(line);
   }
 
  private:
-  const HANDLE pipe_;
-  std::mutex mutex_;
+  PipeChannel* const pipe_;
 };
 
 class WorkerRuntime {
@@ -965,20 +951,6 @@ std::optional<WorkerArguments> ParseArguments() {
       std::move(*pipe), std::move(*nonce), secure_console};
 }
 
-HANDLE ConnectPipe(const std::wstring& path) {
-  const auto deadline = std::chrono::steady_clock::now() +
-                        std::chrono::seconds(10);
-  do {
-    HANDLE pipe = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE, 0,
-                              nullptr, OPEN_EXISTING,
-                              FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (pipe != INVALID_HANDLE_VALUE) return pipe;
-    if (GetLastError() != ERROR_PIPE_BUSY) return INVALID_HANDLE_VALUE;
-    WaitNamedPipeW(path.c_str(), 250);
-  } while (std::chrono::steady_clock::now() < deadline);
-  return INVALID_HANDLE_VALUE;
-}
-
 }  // namespace
 }  // namespace imcodes::rd
 
@@ -1054,17 +1026,17 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     return 5;
   }
 
-  HANDLE pipe = ConnectPipe(arguments->pipe);
-  if (pipe == INVALID_HANDLE_VALUE) {
+  PipeChannel pipe_channel;
+  if (!pipe_channel.Connect(arguments->pipe, std::chrono::seconds(10))) {
     webrtc::CleanupSSL();
     MFShutdown();
     CoUninitialize();
     return 6;
   }
-  PipeWriter writer(pipe);
+  PipeWriter writer(&pipe_channel);
   lstrcpynA(g_crash_nonce, arguments->nonce.c_str(),
             static_cast<int>(sizeof(g_crash_nonce)));
-  g_crash_pipe.store(pipe);
+  g_crash_pipe.store(&pipe_channel);
   SetUnhandledExceptionFilter(ReportCrashToDaemon);
   Json::Value hello(Json::objectValue);
   hello["type"] = kWorkerHelloType;
@@ -1076,7 +1048,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
   // switch belongs on the other one.
   hello["secureConsole"] = arguments->secure_console;
   if (!writer.Emit(hello)) {
-    CloseHandle(pipe);
+    pipe_channel.Close();
     webrtc::CleanupSSL();
     MFShutdown();
     CoUninitialize();
@@ -1091,7 +1063,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
   signaling_thread->SetName("imcodes-rd-signaling", nullptr);
   if (!network_thread->Start() || !worker_thread->Start() ||
       !signaling_thread->Start()) {
-    CloseHandle(pipe);
+    pipe_channel.Close();
     webrtc::CleanupSSL();
     MFShutdown();
     CoUninitialize();
@@ -1110,7 +1082,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
   // access violation at the sign-in desktop and across a logon transition.
   dependencies.adm = webrtc::make_ref_counted<SilentAudioDeviceModule>();
   if (!dependencies.adm) {
-    CloseHandle(pipe);
+    pipe_channel.Close();
     webrtc::CleanupSSL();
     MFShutdown();
     CoUninitialize();
@@ -1128,7 +1100,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
   auto factory =
       webrtc::CreateModularPeerConnectionFactory(std::move(dependencies));
   if (!factory) {
-    CloseHandle(pipe);
+    pipe_channel.Close();
     webrtc::CleanupSSL();
     MFShutdown();
     CoUninitialize();
@@ -1147,7 +1119,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
           })) {
     runtime.Shutdown();
     factory = nullptr;
-    CloseHandle(pipe);
+    pipe_channel.Close();
     webrtc::CleanupSSL();
     MFShutdown();
     CoUninitialize();
@@ -1170,11 +1142,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
   std::string pending;
   std::vector<char> buffer(8192);
   while (protocol_ok) {
-    DWORD read = 0;
-    if (!ReadFile(pipe, buffer.data(), static_cast<DWORD>(buffer.size()),
-                  &read, nullptr) || read == 0) {
-      break;
-    }
+    const size_t read = pipe_channel.Read(buffer.data(), buffer.size());
+    if (read == 0) break;
     pending.append(buffer.data(), read);
     if (pending.size() > kMaxIpcLineBytes) {
       protocol_ok = false;
@@ -1218,7 +1187,9 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
   signaling_thread->Stop();
   worker_thread->Stop();
   network_thread->Stop();
-  CloseHandle(pipe);
+  // The filter must not reach a channel that is about to go out of scope.
+  g_crash_pipe.store(nullptr);
+  pipe_channel.Close();
   webrtc::CleanupSSL();
   MFShutdown();
   CoUninitialize();
