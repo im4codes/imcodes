@@ -693,8 +693,12 @@ void DxgiDesktopSource::CompositeCursor(uint8_t* bgra, int stride,
   // Very first frames can precede DXGI's first pointer metadata update.
   CURSORINFO cursor{};
   cursor.cbSize = sizeof(cursor);
-  if (!GetCursorInfo(&cursor) || !(cursor.flags & CURSOR_SHOWING) ||
-      !cursor.hCursor) {
+  // A suppressed pointer is one Windows is hiding because nothing physical has
+  // moved it — on a machine with no mouse that is its resting state. The remote
+  // viewer is driving it, so it belongs in the picture; only a pointer hidden
+  // outright (no state at all) stays out.
+  if (!GetCursorInfo(&cursor) || !cursor.hCursor ||
+      (cursor.flags & (CURSOR_SHOWING | CURSOR_SUPPRESSED)) == 0) {
     return;
   }
   ICONINFO icon{};

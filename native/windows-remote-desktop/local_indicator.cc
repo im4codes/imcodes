@@ -39,6 +39,19 @@ struct ClipboardReadRequest {
   bool available = false;
 };
 
+/**
+ * Whether Windows is hiding the pointer because nothing physical has moved it.
+ * Distinct from an application hiding the cursor on purpose, which reports no
+ * state at all and must be left alone.
+ */
+bool PointerSuppressed() {
+  CURSORINFO cursor{};
+  cursor.cbSize = sizeof(cursor);
+  if (!GetCursorInfo(&cursor)) return false;
+  return (cursor.flags & CURSOR_SUPPRESSED) != 0 &&
+         (cursor.flags & CURSOR_SHOWING) == 0;
+}
+
 struct PointerMoveRequest {
   int x = 0;
   int y = 0;
@@ -328,6 +341,18 @@ LRESULT LocalIndicator::HandleMessage(HWND window, UINT message,
       SetLastError(ERROR_SUCCESS);
       request->accepted = SetCursorPos(request->x, request->y) == TRUE;
       request->error = GetLastError();
+      // A machine with no physical mouse keeps its pointer suppressed, and
+      // SetCursorPos moves a suppressed pointer without ever revealing it — the
+      // viewer sees a desktop where the cursor simply is not there. Measured on
+      // such a node: a zero-delta mouse move clears the suppression and leaves
+      // the position exactly where it was put, so the remote pointer stays
+      // pixel-exact and visible.
+      if (request->accepted && PointerSuppressed()) {
+        INPUT reveal{};
+        reveal.type = INPUT_MOUSE;
+        reveal.mi.dwFlags = MOUSEEVENTF_MOVE;
+        SendInput(1, &reveal, sizeof(INPUT));
+      }
       return request->accepted ? TRUE : FALSE;
     }
     case kReadClipboardMessage: {
