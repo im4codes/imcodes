@@ -302,6 +302,9 @@ export function FloatingPanel({
         overflow: 'hidden',
         boxSizing: 'border-box',
       }}
+      // See SubSessionWindow: capture phase so an inner widget that stops
+      // propagation cannot make this window unraisable.
+      onPointerDownCapture={() => onFocus?.()}
       onMouseDown={onPanelMouseDown}
     >
       {/* Title bar — draggable */}

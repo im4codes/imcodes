@@ -879,6 +879,13 @@ export function SubSessionWindow({
       ref={swipeBackRef}
       class={rootClass}
       style={style}
+      // Capture phase: an inner widget (xterm with mouse reporting on, a
+      // canvas, a future third-party embed) may stopPropagation on the way up,
+      // which used to leave a background window unraisable depending on where
+      // you happened to click. Capture runs before any of them. `onMouseDown`
+      // stays for environments without pointer events; raising twice is a
+      // no-op because the stack ignores an already-frontmost window.
+      onPointerDownCapture={onFocus}
       onMouseDown={onFocus}
     >
       {activeIdleFlashToken ? <IdleFlashLayer key={`subwindow-idle-${activeIdleFlashToken}`} variant="frame" /> : null}

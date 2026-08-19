@@ -1735,7 +1735,13 @@ export function App() {
   const openRemoteDesktop = useCallback((machine: MachineListItem) => {
     setRemoteDesktopMachine(machine);
     setRemoteDesktopMinimized(false);
-  }, []);
+    // Join the managed desktop stack so this window can be raised and, just as
+    // importantly, can be covered by another window the user clicks.
+    ensureDesktopWindow(DESKTOP_WINDOW_IDS.remoteDesktop(machine.serverId), {
+      kind: DESKTOP_WINDOW_KINDS.remoteDesktop,
+      serverId: machine.serverId,
+    }, { bringToFront: true });
+  }, [ensureDesktopWindow]);
 
   // Fetch current user info on auth
   useEffect(() => {
@@ -6255,9 +6261,17 @@ export function App() {
           ws={wsRef.current}
           minimized={remoteDesktopMinimized}
           allowStandaloneWindow={!isMobile}
+          zIndex={getDesktopWindowZIndex(
+            DESKTOP_WINDOW_IDS.remoteDesktop(remoteDesktopMachine.serverId),
+            5110,
+          )}
+          onFocus={() => bringDesktopWindowToFront(
+            DESKTOP_WINDOW_IDS.remoteDesktop(remoteDesktopMachine.serverId),
+          )}
           onMinimize={() => setRemoteDesktopMinimized(true)}
           onRestore={() => setRemoteDesktopMinimized(false)}
           onClose={() => {
+            removeDesktopWindow(DESKTOP_WINDOW_IDS.remoteDesktop(remoteDesktopMachine.serverId));
             setRemoteDesktopMachine(null);
             setRemoteDesktopMinimized(false);
           }}
