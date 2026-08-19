@@ -3092,6 +3092,7 @@
       "awaiting_frame": "Waiting for the node to confirm the current screen — input resumes on the next frame.",
       "select_display": "Pick a display first: nothing is selected to aim input at.",
       "input_unavailable": "The node cannot reach the desktop that receives input right now."
-    }
+    },
+    "pointer_moves": "pointer moves: {{count}}"
   }
 }

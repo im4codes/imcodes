@@ -3092,6 +3092,7 @@
       "awaiting_frame": "正在等待節點確認目前畫面——收到下一幀後即可操作。",
       "select_display": "請先選擇一個顯示器，否則輸入沒有目標。",
       "input_unavailable": "節點暫時無法存取目前接收輸入的桌面。"
-    }
+    },
+    "pointer_moves": "指標移動：{{count}}"
   }
 }

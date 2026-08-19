@@ -77,6 +77,13 @@ export interface RemoteDesktopSnapshot {
   unlockAvailable?: boolean;
   /** Present only while input is off, naming what the node is waiting on. */
   inputBlocked?: RemoteDesktopInputBlocked;
+  /**
+   * Pointer moves this client has actually put on the wire. A remote cursor
+   * that only jumps on click is either a browser that never produced the
+   * moves or a node that never applied them, and those need opposite fixes —
+   * this is the number that tells the two apart from the session itself.
+   */
+  pointerMovesSent?: number;
   lastAcknowledgedInputSequence?: number;
   durationMs?: number;
   reconnectCount?: number;
@@ -315,6 +322,7 @@ export class RemoteDesktopClient {
   } | null = null;
   private pendingPointerMove: { x: number; y: number } | null = null;
   private lastReliablePointerSyncAt = Number.NEGATIVE_INFINITY;
+  private pointerMovesSent = 0;
   private pressedCodes = new Set<string>();
   private pressedButtons = new Set<string>();
   private pendingClipboardRequests = new Map<string, {
@@ -1019,12 +1027,14 @@ export class RemoteDesktopClient {
       // different reliable channel and never enter this queue.
       return;
     }
-    this.sendPointer({
+    if (this.sendPointer({
       type: REMOTE_DESKTOP_DATA_MSG.POINTER,
       ...this.inputBase(),
       kind: REMOTE_DESKTOP_POINTER_KIND.MOVE,
       ...move,
-    });
+    })) {
+      this.pointerMovesSent += 1;
+    }
   }
 
   private startStats(peer: RTCPeerConnection): void {
@@ -1138,7 +1148,7 @@ export class RemoteDesktopClient {
         }
         this.previousInboundStats = { bytes: inbound.bytesReceived, timestamp: inbound.timestamp };
       }
-      this.publish({ quality: {
+      this.publish({ pointerMovesSent: this.pointerMovesSent, quality: {
         ...quality,
         width,
         height,

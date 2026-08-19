@@ -2032,6 +2032,9 @@ export function RemoteDesktopPanel({
                 <span>{t('remote_desktop.dropped_frames', { count: snapshot.quality.droppedFrames })}</span>
               </>
             )}
+            {snapshot.pointerMovesSent !== undefined && (
+              <span>{t('remote_desktop.pointer_moves', { count: snapshot.pointerMovesSent })}</span>
+            )}
             <span>{t('remote_desktop.duration', { seconds: Math.floor((snapshot.durationMs ?? 0) / 1000) })}</span>
             <span>{t('remote_desktop.reconnects', { count: snapshot.reconnectCount ?? 0 })}</span>
             <span>{t('remote_desktop.capability', { version: snapshot.capabilityVersion ?? REMOTE_DESKTOP_CAPABILITY })}</span>

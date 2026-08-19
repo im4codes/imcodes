@@ -3092,6 +3092,7 @@
       "awaiting_frame": "Esperando a que el nodo confirme la pantalla actual: la entrada se reanuda con el siguiente fotograma.",
       "select_display": "Elige primero una pantalla: no hay ninguna seleccionada a la que dirigir la entrada.",
       "input_unavailable": "El nodo no puede alcanzar ahora mismo el escritorio que recibe la entrada."
-    }
+    },
+    "pointer_moves": "movimientos del puntero: {{count}}"
   }
 }
