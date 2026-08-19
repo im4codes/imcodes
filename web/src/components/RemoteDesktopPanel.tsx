@@ -1527,9 +1527,7 @@ export function RemoteDesktopPanel({
               onClick={() => { void pasteLocalClipboard(); }}
             >{t('remote_desktop.paste_local_clipboard')}</button>
             <span class="remote-desktop-clipboard-status" aria-live="polite">
-              {clipboardStatus !== 'idle'
-                ? t(`remote_desktop.clipboard_${clipboardStatus}`)
-                : inputBlockedHint() ?? ''}
+              {clipboardStatus === 'idle' ? '' : t(`remote_desktop.clipboard_${clipboardStatus}`)}
             </span>
           </div>
           <div class="remote-desktop-zoom-switch" role="group" aria-label={t('remote_desktop.zoom_label')}>
@@ -2034,6 +2032,11 @@ export function RemoteDesktopPanel({
             )}
             {snapshot.pointerMovesSent !== undefined && (
               <span>{t('remote_desktop.pointer_moves', { count: snapshot.pointerMovesSent })}</span>
+            )}
+            {/* Belongs with the session's other facts, not in the toolbar
+                between the buttons it explains. */}
+            {inputBlockedHint() && (
+              <span class="remote-desktop-input-blocked">{inputBlockedHint()}</span>
             )}
             <span>{t('remote_desktop.duration', { seconds: Math.floor((snapshot.durationMs ?? 0) / 1000) })}</span>
             <span>{t('remote_desktop.reconnects', { count: snapshot.reconnectCount ?? 0 })}</span>
