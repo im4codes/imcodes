@@ -354,8 +354,17 @@ export class RemoteDesktopWorkerHost {
       if ((parsed.value.reconnectAttempt ?? 0) > 0 && this.tracked.size === 0) {
         await this.recycleIdleWorkerForReconnect();
       }
-      await this.ensureStarted();
+      // Tracked before the start, not after: the offer that follows this
+      // PREPARE arrives while the cold start is still running, and it can only
+      // be told to wait for that start if the session it names is already
+      // known here.
       this.track(parsed.value);
+      try {
+        await this.ensureStarted();
+      } catch (error) {
+        this.untrack(parsed.value.sessionId);
+        throw error;
+      }
       if (recoverIdlePrepare && (!this.socket || this.socket.destroyed)) {
         // The same stale-idle race as a failed write, one step earlier: a warm
         // worker exits on its own between sessions, the pipe still looked alive
@@ -376,7 +385,16 @@ export class RemoteDesktopWorkerHost {
         }
       }
     } else if (!this.socket || this.socket.destroyed) {
-      return false;
+      // The rest of a session's negotiation — its offer, its ICE — arrives
+      // within a second of the PREPARE that admitted it, while the cold start
+      // that PREPARE began is still running: verifying the signed artifact
+      // alone takes seconds on a real node before the worker is even spawned.
+      // Declining here is reported as `worker_failed`, which ends a session
+      // that was about to work and is exactly what made a first connect after
+      // any quiet period fail. Wait for the start this session already owns.
+      if (!this.tracked.has(parsed.value.sessionId)) return false;
+      await this.ensureStarted();
+      if (!this.socket || this.socket.destroyed) return false;
     }
     const socket = this.socket;
     if (!socket || socket.destroyed) return false;

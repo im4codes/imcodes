@@ -849,6 +849,12 @@ const contracts: Contract[] = [
         path: 'src/node/remote-desktop-worker-host.ts',
         needle: 'for (const pending of this.pendingHelloSockets) pending.destroy();',
       },
+      {
+        // The offer that follows a PREPARE waits for that PREPARE's cold start
+        // instead of being declined as a dead worker.
+        path: 'src/node/remote-desktop-worker-host.ts',
+        needle: 'if (!this.tracked.has(parsed.value.sessionId)) return false;\n      await this.ensureStarted();',
+      },
     ],
   },
   {
@@ -1333,6 +1339,12 @@ const mutations: Mutation[] = [
     contract: 'the remote pointer stays visible while it is driven',
     path: 'native/windows-remote-desktop/local_indicator.cc',
     needle: 'if (request->accepted && PointerSuppressed())',
+  },
+  {
+    name: 'decline a tracked session message while its worker is still starting',
+    contract: 'a dead idle pipe cold-starts a replacement instead of failing the session',
+    path: 'src/node/remote-desktop-worker-host.ts',
+    needle: 'if (!this.tracked.has(parsed.value.sessionId)) return false;\n      await this.ensureStarted();',
   },
   {
     name: 'let a settled start promise stand in for a live worker',

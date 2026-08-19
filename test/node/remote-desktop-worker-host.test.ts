@@ -1120,6 +1120,89 @@ describe('remote desktop worker artifact and IPC host', () => {
     expect(silent[0]?.destroyed).toBe(true);
   });
 
+  it('waits for its own cold start instead of failing the offer that follows', async () => {
+    // The browser sends its offer about a second after the PREPARE that
+    // admitted the session, while the cold start that PREPARE began is still
+    // running — verifying the signed artifact alone takes seconds on a real
+    // node. Declining the offer is reported as `worker_failed`, which ends a
+    // session that was seconds away from working.
+    const temp = await mkdtemp(join(tmpdir(), 'imcodes-rd-host-offer-race-'));
+    cleanup.push(() => rm(temp, { recursive: true, force: true }));
+    const pipePath = join(temp, 'worker.sock');
+    const helpers: net.Socket[] = [];
+    const helperBuffers: string[] = [];
+    const timers: ReturnType<typeof setTimeout>[] = [];
+    cleanup.push(() => { for (const timer of timers) clearTimeout(timer); });
+    const launch = vi.fn((_executable: string, argsLine: string) => {
+      const args = quotedArgs(argsLine);
+      const index = helpers.length;
+      helperBuffers.push('');
+      // A cold start that takes real time, the way a signed launch does.
+      timers.push(setTimeout(() => {
+        const helper = net.createConnection(pipePath, () => {
+          helper.write(`${JSON.stringify({
+            type: REMOTE_DESKTOP_WORKER_HELLO_TYPE,
+            ipcVersion: REMOTE_DESKTOP_WORKER_IPC_VERSION,
+            nonce: args[3],
+            pid: 80 + index,
+          })}\n`);
+        });
+        helper.setEncoding('utf8');
+        helper.on('data', (chunk) => { helperBuffers[index] += String(chunk); });
+        helpers.push(helper);
+      }, 250));
+    });
+    const received: RemoteDesktopDaemonMessage[] = [];
+    const host = new RemoteDesktopWorkerHost((message) => received.push(message), {
+      ...trustedHostOptions,
+      platform: 'win32',
+      artifact,
+      pipePath,
+      allowPipeClients: () => {},
+      launch,
+    });
+    cleanup.push(() => {
+      host.close();
+      for (const helper of helpers) helper.destroy();
+    });
+    const prepare = {
+      type: REMOTE_DESKTOP_MSG.PREPARE,
+      requestId,
+      sessionId,
+      capability,
+      expiresAt: Date.now() + 60_000,
+      leaseExpiresAt: Date.now() + 15_000,
+      daemonGeneration: 7,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
+      inputEpoch: 1,
+      iceServers: ['stun:stun.example.test:3478'],
+    } as const;
+    const offer = {
+      type: REMOTE_DESKTOP_MSG.OFFER,
+      requestId,
+      sessionId,
+      capability,
+      sdp: 'v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n',
+    } as const;
+
+    // Both in flight together, exactly as they arrive over the link.
+    const [prepared, offered] = await Promise.all([
+      host.handle(prepare),
+      host.handle(offer),
+    ]);
+    expect(prepared).toBe(true);
+    expect(offered).toBe(true);
+    expect(received).not.toContainEqual(expect.objectContaining({
+      type: REMOTE_DESKTOP_MSG.TERMINAL,
+    }));
+    await vi.waitFor(() => expect(helperBuffers[0]).toContain('"sdp"'));
+    const delivered = helperBuffers[0]!.trim().split('\n').map((line) => JSON.parse(line));
+    expect(delivered.map((message) => message.type)).toEqual([
+      REMOTE_DESKTOP_MSG.PREPARE,
+      REMOTE_DESKTOP_MSG.OFFER,
+    ]);
+  });
+
   it('recycles an idle warm worker before a bounded browser reconnect', async () => {
     const temp = await mkdtemp(join(tmpdir(), 'imcodes-rd-host-reconnect-'));
     cleanup.push(() => rm(temp, { recursive: true, force: true }));
