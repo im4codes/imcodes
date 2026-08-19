@@ -133,7 +133,8 @@ $CompileArguments = @(
 
 $ProductionSources = @(
   'display_capture.cc', 'display_preferences.cc', 'input_injector.cc', 'ice_candidate_queue.cc', 'json_protocol.cc',
-  'local_indicator.cc', 'mf_h264_encoder.cc', 'peer_session.cc', 'quality_ladder.cc',
+  'local_indicator.cc', 'mf_h264_encoder.cc', 'peer_session.cc', 'pipe_ipc.cc',
+  'quality_ladder.cc',
   'unlock_secret.cc', 'worker_policy.cc', 'virtual_display_controller.cc', 'worker_main.cc'
 )
 $Tests = [ordered]@{
@@ -142,6 +143,7 @@ $Tests = [ordered]@{
   input_injector_unittests = @('input_injector.cc', 'input_injector_unittest.cc')
   ice_candidate_queue_unittests = @('ice_candidate_queue.cc', 'ice_candidate_queue_unittest.cc')
   json_protocol_unittests = @('json_protocol.cc', 'json_protocol_unittest.cc')
+  pipe_ipc_unittests = @('pipe_ipc.cc', 'pipe_ipc_unittest.cc')
   worker_policy_unittests = @('worker_policy.cc', 'worker_policy_unittest.cc')
   mf_h264_encoder_unittests = @(
     'mf_h264_encoder.cc', 'mf_h264_encoder_unittest.cc', 'quality_ladder.cc', 'worker_policy.cc'

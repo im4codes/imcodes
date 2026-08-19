@@ -42,7 +42,9 @@ $ExpectedSources = @(
   'local_indicator.cc', 'local_indicator.h',
   'mf_h264_encoder.cc', 'mf_h264_encoder.h', 'mf_h264_encoder_unittest.cc',
   'peer_session.cc', 'peer_session.h',
+  'pipe_ipc.cc', 'pipe_ipc.h', 'pipe_ipc_unittest.cc',
   'quality_ladder.cc', 'quality_ladder.h', 'quality_ladder_unittest.cc',
+  'unlock_secret.cc', 'unlock_secret.h',
   'worker_policy.cc', 'worker_policy.h', 'worker_policy_unittest.cc',
   'virtual_display_controller.cc', 'virtual_display_controller.h',
   'worker_main.cc'
