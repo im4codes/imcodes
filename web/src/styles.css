@@ -7866,6 +7866,31 @@ button.quick-agent-delegation-preset.active {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  letter-spacing: .01em;
+}
+
+/* The connection state carries a lamp: link quality is the first thing looked
+   for, and it should be readable before the words are. */
+.remote-desktop-header > div:first-child > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.remote-desktop-header > div:first-child > span::before {
+  content: '';
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #64d2a4;
+  box-shadow: 0 0 8px rgb(100 210 164 / 70%);
+}
+
+/* Relayed and in-progress states are not failures, but they are not a clean
+   direct link either; amber says so without a sentence. */
+.remote-desktop-panel:not(.is-direct) .remote-desktop-header > div:first-child > span::before {
+  background: #e8b667;
+  box-shadow: 0 0 8px rgb(232 182 103 / 65%);
 }
 
 .remote-desktop-header span,
@@ -7976,15 +8001,26 @@ button.quick-agent-delegation-preset.active {
   border-bottom: 1px solid rgb(122 178 218 / 14%);
 }
 
+/* Each toolbar group is one segmented control rather than loose buttons: the
+   grouping becomes visible instead of implied by spacing, and a row of related
+   options reads as a single instrument. */
 .remote-desktop-display-tabs,
 .remote-desktop-mode-switch,
 .remote-desktop-view-switch,
 .remote-desktop-zoom-switch,
 .remote-desktop-clipboard-switch,
 .remote-desktop-mobile-input-switch {
-  display: flex;
-  align-items: center;
-  gap: 5px;
+  display: inline-flex;
+  align-items: stretch;
+  flex: 0 0 auto;
+  border: 1px solid rgb(94 165 214 / 22%);
+  border-radius: 10px;
+  background:
+    linear-gradient(180deg, rgb(20 41 62 / 92%), rgb(12 27 44 / 92%));
+  box-shadow:
+    inset 0 1px 0 rgb(214 240 255 / 6%),
+    0 1px 2px rgb(2 10 20 / 45%);
+  overflow: hidden;
 }
 
 .remote-desktop-mobile-input-switch {
@@ -7992,41 +8028,129 @@ button.quick-agent-delegation-preset.active {
 }
 
 .remote-desktop-keyboard-trigger {
-  width: 38px;
+  width: 44px;
   padding-inline: 0 !important;
   display: grid;
   place-items: center;
   font-size: 19px;
+  line-height: 1;
 }
 
 .remote-desktop-display-tabs {
   min-width: 0;
-  flex: 1 1 300px;
+  max-width: 46vw;
   overflow-x: auto;
-  scrollbar-width: thin;
+  scrollbar-width: none;
 }
 
-.remote-desktop-toolbar button,
-.remote-desktop-files button,
-.controlled-nodes-remote-desktop {
+.remote-desktop-display-tabs::-webkit-scrollbar {
+  display: none;
+}
+
+/* A monitor mark, so the display picker is recognisable before it is read. */
+.remote-desktop-display-tabs button::before {
+  content: '';
+  width: 11px;
+  height: 8px;
+  margin-right: 7px;
+  border: 1.5px solid currentcolor;
+  border-radius: 2px;
+  opacity: .75;
+}
+
+.remote-desktop-display-tabs button {
+  max-width: 22ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Segmented-control skin, for the toolbar only: the file drawer and the node
+   list use standalone buttons and keep their own chip below. */
+.remote-desktop-toolbar button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   min-height: 34px;
-  padding: 6px 10px;
-  color: #cfeaff;
-  background: #102438;
-  border: 1px solid #294a64;
-  border-radius: 7px;
+  padding: 6px 12px;
+  color: #b9d8ef;
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  font-size: 12.5px;
+  font-weight: 500;
+  letter-spacing: .01em;
+  font-variant-numeric: tabular-nums;
   white-space: nowrap;
+  transition: color .12s ease, background-color .12s ease, box-shadow .12s ease;
 }
 
+/* Hairline between segments, never before the first one. */
+.remote-desktop-toolbar :is(
+  .remote-desktop-display-tabs,
+  .remote-desktop-mode-switch,
+  .remote-desktop-view-switch,
+  .remote-desktop-zoom-switch,
+  .remote-desktop-clipboard-switch,
+  .remote-desktop-mobile-input-switch
+) button + button {
+  border-left: 1px solid rgb(94 165 214 / 18%);
+}
+
+.remote-desktop-toolbar button:hover:not(:disabled) {
+  color: #eaf7ff;
+  background: rgb(56 132 186 / 16%);
+}
+
+/* Selected state as a lit segment rather than a filled chip: the toolbar keeps
+   one visual weight, and what is active reads as illuminated. */
 .remote-desktop-toolbar button[aria-pressed="true"],
 .remote-desktop-display-tabs button[aria-selected="true"] {
-  color: #04111d;
-  background: #63c9ff;
-  border-color: #9bddff;
+  color: #e8fbff;
+  background:
+    linear-gradient(180deg, rgb(34 211 238 / 22%), rgb(34 211 238 / 9%));
+  box-shadow:
+    inset 0 -2px 0 rgb(34 211 238 / 70%),
+    inset 0 0 22px rgb(34 211 238 / 12%);
+}
+
+.remote-desktop-toolbar button:focus-visible {
+  outline: 2px solid rgb(103 222 255 / 75%);
+  outline-offset: -2px;
 }
 
 .remote-desktop-toolbar button:disabled {
-  opacity: .45;
+  opacity: .38;
+}
+
+.remote-desktop-files button,
+.controlled-nodes-remote-desktop {
+  min-height: 34px;
+  padding: 6px 12px;
+  color: #cfeaff;
+  background: linear-gradient(180deg, rgb(20 41 62 / 92%), rgb(12 27 44 / 92%));
+  border: 1px solid rgb(94 165 214 / 26%);
+  border-radius: 9px;
+  white-space: nowrap;
+}
+
+/* Standalone actions keep the same skin as a one-segment control. */
+.remote-desktop-files-trigger,
+.remote-desktop-unlock-trigger {
+  border: 1px solid rgb(94 165 214 / 22%) !important;
+  border-radius: 10px !important;
+  background:
+    linear-gradient(180deg, rgb(20 41 62 / 92%), rgb(12 27 44 / 92%)) !important;
+  box-shadow:
+    inset 0 1px 0 rgb(214 240 255 / 6%),
+    0 1px 2px rgb(2 10 20 / 45%);
+}
+
+.remote-desktop-unlock-trigger {
+  color: #ffe9c2 !important;
+  border-color: rgb(245 179 74 / 45%) !important;
+  box-shadow:
+    inset 0 1px 0 rgb(255 236 205 / 10%),
+    0 0 14px rgb(245 179 74 / 18%);
 }
 
 .remote-desktop-file-badge {
@@ -8589,13 +8713,15 @@ button.quick-agent-delegation-preset.active {
   position: absolute;
   right: 10px;
   top: 10px;
-  max-width: min(80%, 360px);
-  padding: 6px 9px;
-  color: #d9edff;
-  background: rgb(5 23 38 / 82%);
-  border: 1px solid rgb(99 201 255 / 38%);
-  border-radius: 7px;
-  font-size: 11px;
+  max-width: min(72%, 320px);
+  padding: 5px 10px;
+  color: #cfe6f8;
+  background: rgb(5 20 34 / 62%);
+  border: 1px solid rgb(99 201 255 / 22%);
+  border-radius: 999px;
+  backdrop-filter: blur(6px);
+  font-size: 10.5px;
+  letter-spacing: .01em;
   pointer-events: none;
 }
 
@@ -8759,6 +8885,36 @@ button.quick-agent-delegation-preset.active {
   gap: 8px;
 }
 
+/* Telemetry reads as instrument fields, not a paragraph: each fact is its own
+   chip with a hairline separator, so a glance can find one number. */
+.remote-desktop-diagnostics {
+  gap: 0 14px;
+  row-gap: 6px;
+  color: #8fb4d0;
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: .01em;
+}
+
+.remote-desktop-diagnostics > span {
+  position: relative;
+  white-space: nowrap;
+}
+
+/* Drawn after each field rather than before the next one: when the row wraps,
+   a mark trailing a line reads as continuation, while one leading a line reads
+   as a mistake. */
+.remote-desktop-diagnostics > span:not(:last-child)::after {
+  content: '';
+  position: absolute;
+  right: -7px;
+  top: 50%;
+  width: 1px;
+  height: 11px;
+  translate: 0 -50%;
+  background: rgb(122 178 218 / 22%);
+}
+
 .remote-desktop-files {
   margin-left: auto;
 }
@@ -8852,13 +9008,45 @@ button.quick-agent-delegation-preset.active {
     display: none;
   }
 
-  .remote-desktop-view-switch {
-    width: 100%;
+  /* One instrument rail instead of four ragged wrapped rows: the controls stay
+     reachable by swiping, and the picture keeps the height they were eating.
+     The mask tells the thumb there is more to the sides without a scrollbar. */
+  .remote-desktop-toolbar {
+    flex-wrap: nowrap;
+    gap: 8px;
+    padding: 8px 10px;
+    padding-right: 22px;
     overflow-x: auto;
+    overscroll-behavior-x: contain;
+    scrollbar-width: none;
+    scroll-snap-type: x proximity;
+    mask-image: linear-gradient(90deg, transparent 0, #000 14px, #000 calc(100% - 26px), transparent 100%);
+  }
+
+  .remote-desktop-toolbar::-webkit-scrollbar {
+    display: none;
+  }
+
+  .remote-desktop-toolbar > * {
+    scroll-snap-align: start;
+  }
+
+  .remote-desktop-view-switch {
+    width: auto;
+    overflow: visible;
+  }
+
+  .remote-desktop-display-tabs {
+    max-width: 40vw;
   }
 
   .remote-desktop-zoom-switch {
-    margin-left: auto;
+    margin-left: 0;
+  }
+
+  .remote-desktop-toolbar button {
+    min-height: 36px;
+    padding-inline: 13px;
   }
 
   .remote-desktop-mobile-input-switch {
@@ -8870,8 +9058,39 @@ button.quick-agent-delegation-preset.active {
   }
 
   .remote-desktop-footer {
-    max-height: 36vh;
+    max-height: 30vh;
+    padding: 7px 10px;
     overflow-y: auto;
+  }
+
+  /* Two columns of fields rather than one stack of half-empty lines, and each
+     field wraps inside itself instead of pushing the row off the screen. */
+  .remote-desktop-diagnostics {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(148px, 1fr));
+    /* Claim the row: as a bare flex item it was sized to less than the phone's
+       width, which left the grid no room for a second column. */
+    flex: 1 1 100%;
+    column-gap: 14px;
+    row-gap: 5px;
+    font-size: 11px;
+  }
+
+  .remote-desktop-diagnostics > span {
+    white-space: normal;
+    /* A capability string has no break opportunity, and one unbreakable token
+       is enough to collapse the grid back to a single column. */
+    overflow-wrap: anywhere;
+  }
+
+  .remote-desktop-diagnostics > span:not(:last-child)::after {
+    display: none;
+  }
+
+  /* The capability string is the one field with no natural break; give it the
+     whole row instead of letting it stagger down a column. */
+  .remote-desktop-diagnostics > span:last-child {
+    grid-column: 1 / -1;
   }
 
   .remote-desktop-files {

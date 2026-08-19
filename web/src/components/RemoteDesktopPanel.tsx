@@ -1477,7 +1477,7 @@ export function RemoteDesktopPanel({
     >
       <div
         ref={panelRef}
-        class="remote-desktop-panel"
+        class={`remote-desktop-panel ${snapshot.route === 'direct' ? 'is-direct' : ''}`.trim()}
         role="dialog"
         aria-modal="false"
         aria-label={t('remote_desktop.title', { machine: machine.displayName })}
