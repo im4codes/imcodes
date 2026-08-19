@@ -780,6 +780,16 @@ void PeerSession::OnConnectionChange(
     return;
   }
   if (state == webrtc::PeerConnectionInterface::PeerConnectionState::kConnected) {
+    // The viewer cannot decode anything until a keyframe arrives, and waiting
+    // for the encoder's own interval puts that delay in front of the first
+    // picture — and so in front of everything that waits on it.
+    for (const auto& sender : peer_->GetSenders()) {
+      if (sender->track() && sender->track()->kind() ==
+                                 webrtc::MediaStreamTrackInterface::kVideoKind) {
+        sender->GenerateKeyFrame({});
+        break;
+      }
+    }
     SendStatus(relayed_ ? "relayed" : "direct", InputReady());
   } else if (state ==
                  webrtc::PeerConnectionInterface::PeerConnectionState::kFailed ||
