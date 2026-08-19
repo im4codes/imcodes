@@ -46,6 +46,8 @@ import {
   clampRemoteDesktopViewport,
   panRemoteDesktopViewportAtEdge,
   remoteDesktopMouseModeViewport,
+  REMOTE_DESKTOP_POINTER_EDGE_STICKY_RATIO,
+  REMOTE_DESKTOP_POINTER_EDGE_STICKY_RATIO_PRECISE,
   stickRemoteDesktopPointerToEdges,
   viewportFromRemoteDesktopPinch,
   type RemoteDesktopViewport,
@@ -577,7 +579,15 @@ export function RemoteDesktopPanel({
 
   const normalizedDesktopPointerPoint = useCallback((event: PointerEvent) => {
     const point = normalizedClientPoint(event.clientX, event.clientY);
-    return point ? stickRemoteDesktopPointerToEdges(point) : null;
+    if (!point) return null;
+    // A mouse lands where it is pointed; only a finger needs the wide edge
+    // tolerance, which on a mouse swallowed every click near a border.
+    return stickRemoteDesktopPointerToEdges(
+      point,
+      event.pointerType === 'touch'
+        ? REMOTE_DESKTOP_POINTER_EDGE_STICKY_RATIO
+        : REMOTE_DESKTOP_POINTER_EDGE_STICKY_RATIO_PRECISE,
+    );
   }, [normalizedClientPoint]);
 
   const setMode = (mode: typeof REMOTE_DESKTOP_ACCESS_MODE[keyof typeof REMOTE_DESKTOP_ACCESS_MODE]) => {

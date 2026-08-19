@@ -1,6 +1,16 @@
 export const REMOTE_DESKTOP_MIN_ZOOM = 1;
 export const REMOTE_DESKTOP_MAX_ZOOM = 4;
+/**
+ * How close to a border a pointer has to be before it snaps to it.
+ *
+ * A finger needs real tolerance to reach a screen edge — the corners and the
+ * taskbar are unreachable otherwise. A mouse does not: it lands where it is
+ * pointed, and 1.8% of a 2560-wide screen is 46 px of the desktop that could
+ * not be clicked at all, which reads as every edge click jumping outward.
+ */
 export const REMOTE_DESKTOP_POINTER_EDGE_STICKY_RATIO = 0.018;
+/** A mouse only snaps on the last sliver, so the edge stays reachable. */
+export const REMOTE_DESKTOP_POINTER_EDGE_STICKY_RATIO_PRECISE = 0.0015;
 
 export interface RemoteDesktopViewport {
   scale: number;
@@ -24,11 +34,16 @@ export interface RemoteDesktopEdgePanResult {
  * Snap only the narrow edge band to an exact display edge. The interior must
  * remain an identity mapping: rescaling it makes every desktop click drift.
  */
-export function stickRemoteDesktopPointerToEdges(point: { x: number; y: number }): {
+export function stickRemoteDesktopPointerToEdges(
+  point: { x: number; y: number },
+  edgeRatio = REMOTE_DESKTOP_POINTER_EDGE_STICKY_RATIO,
+): {
   x: number;
   y: number;
 } {
-  const edge = REMOTE_DESKTOP_POINTER_EDGE_STICKY_RATIO;
+  const edge = Number.isFinite(edgeRatio) && edgeRatio >= 0 && edgeRatio < 0.5
+    ? edgeRatio
+    : REMOTE_DESKTOP_POINTER_EDGE_STICKY_RATIO;
   const stick = (value: number) => {
     if (value <= edge) return 0;
     if (value >= 1 - edge) return 1;

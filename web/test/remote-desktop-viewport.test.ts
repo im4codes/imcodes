@@ -3,6 +3,7 @@ import {
   clampRemoteDesktopViewport,
   panRemoteDesktopViewportAtEdge,
   remoteDesktopMouseModeViewport,
+  REMOTE_DESKTOP_POINTER_EDGE_STICKY_RATIO_PRECISE,
   stickRemoteDesktopPointerToEdges,
   viewportFromRemoteDesktopPinch,
 } from '../src/remote-desktop-viewport.js';
@@ -62,6 +63,20 @@ describe('remote desktop mobile viewport', () => {
   it('snaps only the edge band without rescaling interior desktop clicks', () => {
     expect(stickRemoteDesktopPointerToEdges({ x: 0.25, y: 0.75 }))
       .toEqual({ x: 0.25, y: 0.75 });
+    // A mouse keeps the pixels a finger has to give up: at the same position a
+    // touch snaps to the border, the precise threshold lands where it pointed.
+    expect(stickRemoteDesktopPointerToEdges(
+      { x: 0.018, y: 0.982 },
+      REMOTE_DESKTOP_POINTER_EDGE_STICKY_RATIO_PRECISE,
+    )).toEqual({ x: 0.018, y: 0.982 });
+    expect(stickRemoteDesktopPointerToEdges(
+      { x: 0.0005, y: 0.9995 },
+      REMOTE_DESKTOP_POINTER_EDGE_STICKY_RATIO_PRECISE,
+    )).toEqual({ x: 0, y: 1 });
+    // A nonsense ratio falls back to the documented one rather than snapping
+    // the whole screen to its corners.
+    expect(stickRemoteDesktopPointerToEdges({ x: 0.4, y: 0.6 }, 0.9))
+      .toEqual({ x: 0.4, y: 0.6 });
     expect(stickRemoteDesktopPointerToEdges({ x: 0.018, y: 0.982 }))
       .toEqual({ x: 0, y: 1 });
   });

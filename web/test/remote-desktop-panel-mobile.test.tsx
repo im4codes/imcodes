@@ -796,7 +796,7 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     }
   });
 
-  it('sends the real remote pointer and keeps a sticky target zone at every video edge', async () => {
+  it('sends the real remote pointer without snapping a mouse away from the edges', async () => {
     const { container, stage } = await renderPanel();
     pointerMove.mockClear();
     act(() => {
@@ -808,7 +808,13 @@ describe('RemoteDesktopPanel mobile gestures', () => {
       });
     });
 
-    expect(pointerMove.mock.calls).toEqual([[0, 0.5], [1, 0.5]]);
+    // A mouse lands where it is pointed: 1% in from the edge is a real pixel
+    // column, not something to snap away, which is what made every click near
+    // a border jump outward.
+    expect(pointerMove.mock.calls).toEqual([[0.01, 0.5], [0.99, 0.5]]);
+    // The finger's wide sticky zone is covered where it lives, in
+    // remote-desktop-viewport: both thresholds are asserted against the same
+    // position there.
     expect(container.querySelector('.remote-desktop-pointer-follow')).toBeNull();
     expect(getComputedStyle(stage).cursor).not.toBe('none');
   });
