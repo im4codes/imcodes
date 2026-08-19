@@ -18,6 +18,19 @@ struct QualitySelection {
 // Direct sessions may then probe up to the user-facing 15 Mbps ceiling.
 inline constexpr uint32_t kMinVideoBitrateBps = 350'000;
 inline constexpr uint32_t kInitialVideoBitrateBps = 12'000'000;
+/**
+ * What the bandwidth estimator is told to start from.
+ *
+ * This is not the encoder's target — the estimator drives that — it is how
+ * hard the very first moments of a session push. A node whose UDP is blocked
+ * reaches the viewer over a TURN relay on a single TCP connection, where
+ * everything is strictly in order: opening the session at the encoder's
+ * headroom put a multi-megabit burst in front of the SCTP handshake that the
+ * input channels need, so the picture arrived while input stayed dead for
+ * seconds. Start modestly and let the estimator climb, which it does in about
+ * a second on a link that can take it.
+ */
+inline constexpr uint32_t kInitialTransportBitrateBps = 1'500'000;
 inline constexpr uint32_t kPerPeerVideoBitrateBps = 15'000'000;
 inline constexpr uint32_t kAggregateVideoBitrateBps = 60'000'000;
 

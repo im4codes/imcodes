@@ -297,7 +297,7 @@ bool PeerSession::Initialize() {
   bitrate_settings.min_bitrate_bps =
       static_cast<int>(kMinVideoBitrateBps);
   bitrate_settings.start_bitrate_bps =
-      static_cast<int>(kInitialVideoBitrateBps);
+      static_cast<int>(kInitialTransportBitrateBps);
   bitrate_settings.max_bitrate_bps =
       static_cast<int>(kPerPeerVideoBitrateBps);
   if (!peer_->SetBitrate(bitrate_settings).ok()) return false;
