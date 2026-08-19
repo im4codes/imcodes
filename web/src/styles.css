@@ -5078,15 +5078,126 @@ html.native-ios-mac .chat-dl-btn {
 .subsession-send-btn { flex-shrink: 0; font-size: 12px; padding: 4px 12px; }
 
 /* ── Resize handles ───────────────────────────────────────────────────────── */
+/* Shared by `.subsession-window` and `.floating-panel`. Both used to render
+   4-5px transparent strips whose only styling was a `cursor`, so a window gave
+   no hint it was resizable until the pointer happened to land on one — and even
+   then the cursor was the sole feedback and the frame never reacted.
+   Three things fix that, in layers:
+
+     1. the hit strip is widened (4px → 6px edges, 12px → 16px corners) but kept
+        under the app's 6px scrollbars' comfort zone, so widening never steals
+        drags from a panel's own scrollbar;
+     2. the *drawn* indicator is decoupled from the hit box onto ::after — it
+        stays a thin 2px line so it never crowds content, and is invisible at
+        rest, fading in only on hover/drag;
+     3. the whole window frame lights up (see the outline rule below), so the
+        "resizable" signal is not confined to the few pixels under the cursor. */
 .resize-handle { position: absolute; z-index: 10; }
-.resize-n  { top: 0; left: 8px; right: 8px; height: 4px; cursor: n-resize; }
-.resize-s  { bottom: 0; left: 8px; right: 8px; height: 4px; cursor: s-resize; }
-.resize-e  { right: 0; top: 8px; bottom: 8px; width: 4px; cursor: e-resize; }
-.resize-w  { left: 0; top: 8px; bottom: 8px; width: 4px; cursor: w-resize; }
-.resize-ne { top: 0; right: 0; width: 12px; height: 12px; cursor: ne-resize; }
-.resize-nw { top: 0; left: 0; width: 12px; height: 12px; cursor: nw-resize; }
-.resize-se { bottom: 0; right: 0; width: 12px; height: 12px; cursor: se-resize; }
-.resize-sw { bottom: 0; left: 0; width: 12px; height: 12px; cursor: sw-resize; }
+
+/* The visible mark. Hidden at rest; revealed on hover, and kept lit for the
+   whole drag via `.is-resizing` — during a resize the pointer routinely leaves
+   the 6px strip, and without that class the indicator would flicker off exactly
+   while the user is using it. */
+.resize-handle::after {
+  content: '';
+  position: absolute;
+  opacity: 0;
+  background: var(--subsession-accent-color, #38bdf8);
+  transition: opacity 0.14s ease, box-shadow 0.14s ease;
+  pointer-events: none;
+}
+.resize-handle:hover::after,
+.resize-handle.is-resizing::after {
+  opacity: 0.9;
+  box-shadow: 0 0 10px color-mix(in srgb, var(--subsession-accent-color, #38bdf8) 55%, transparent);
+}
+
+/* Edges: 6px grab strip, 2px lit line pinned to the outer edge. Inset by the
+   corner size so an edge never sits on top of a corner's diagonal target. */
+.resize-n, .resize-s { left: 16px; right: 16px; height: 6px; }
+.resize-e, .resize-w { top: 16px; bottom: 16px; width: 6px; }
+.resize-n  { top: 0; cursor: n-resize; }
+.resize-s  { bottom: 0; cursor: s-resize; }
+.resize-e  { right: 0; cursor: e-resize; }
+.resize-w  { left: 0; cursor: w-resize; }
+.resize-n::after, .resize-s::after { left: 0; right: 0; height: 2px; }
+.resize-e::after, .resize-w::after { top: 0; bottom: 0; width: 2px; }
+.resize-n::after { top: 0; }
+.resize-s::after { bottom: 0; }
+.resize-e::after { right: 0; }
+.resize-w::after { left: 0; }
+
+/* Corners: the largest targets, drawn as an L-bracket so the diagonal grab
+   point reads as a grip instead of two edges crossing. Above the edges in the
+   stack because the two overlap along the first 16px of every side. */
+.resize-ne, .resize-nw, .resize-se, .resize-sw { width: 16px; height: 16px; z-index: 11; }
+.resize-nw { top: 0; left: 0; cursor: nw-resize; }
+.resize-ne { top: 0; right: 0; cursor: ne-resize; }
+.resize-sw { bottom: 0; left: 0; cursor: sw-resize; }
+.resize-se { bottom: 0; right: 0; cursor: se-resize; }
+/* The corner mark is drawn flush to the corner and *thicker* than the frame
+   ring (3px vs 2px) in the same brightened tint, so the corner reads as a
+   heavier, grabbable elbow. An inset accent-coloured bracket was tried first
+   and was unusable: sitting a same-hue 2px line beside the ring made the two
+   indistinguishable. Weight, not position, is what separates them. */
+.resize-ne::after, .resize-nw::after, .resize-se::after, .resize-sw::after {
+  width: 14px; height: 14px;
+  background: none;
+  border: 3px solid color-mix(in srgb, var(--subsession-accent-color, #38bdf8) 45%, #ffffff);
+}
+.resize-nw::after { top: 0; left: 0; border-right: none; border-bottom: none; border-top-left-radius: 8px; }
+.resize-ne::after { top: 0; right: 0; border-left: none; border-bottom: none; border-top-right-radius: 8px; }
+.resize-sw::after { bottom: 0; left: 0; border-right: none; border-top: none; border-bottom-left-radius: 8px; }
+.resize-se::after { bottom: 0; right: 0; border-left: none; border-top: none; border-bottom-right-radius: 8px; }
+
+/* Hovering widens the grab strip inward — 6px → 12px on edges, 16px → 22px on
+   corners — and it stays wide for the whole drag.
+
+   Why not just make it wide all the time: `.chat-view` renders a thin scrollbar
+   flush against the window's right edge, so a permanently fat `.resize-e` would
+   swallow it. Widening only once the pointer is already inside the strip keeps
+   the scrollbar reachable at rest while making the handle far harder to slip
+   off in the moment between seeing the cue and pressing the button.
+
+   The enlarged box is a strict superset of the resting one, so losing hover
+   also means leaving the small box — there is no grow/shrink oscillation.
+
+   Deliberately NOT transitioned: an animated hit area would trail the pointer
+   and reintroduce exactly the slipperiness this is meant to remove. Only the
+   drawn indicator on ::after animates. */
+.resize-n:hover, .resize-s:hover,
+.resize-n.is-resizing, .resize-s.is-resizing { height: 12px; }
+.resize-e:hover, .resize-w:hover,
+.resize-e.is-resizing, .resize-w.is-resizing { width: 12px; }
+.resize-ne:hover, .resize-nw:hover, .resize-se:hover, .resize-sw:hover,
+.resize-ne.is-resizing, .resize-nw.is-resizing,
+.resize-se.is-resizing, .resize-sw.is-resizing { width: 22px; height: 22px; }
+
+/* Frame state. `outline` rather than `border` because `.floating-panel` sets
+   its border inline from the component, which no stylesheet rule could
+   override; outline also draws without reflowing the window, and follows the
+   8px corner radius on its own. `:has()` covers hover; `.is-resizing` keeps the
+   frame lit once the pointer has left the strip mid-drag.
+
+   The ring is 2px and *brightened* toward white rather than plain accent: a
+   `.subsession-window` already draws a 1px accent-coloured border at rest, so a
+   same-hue ring would have been invisible on exactly the window type that
+   needed the cue most. Mixing toward white separates the two states by
+   thickness and luminance instead of hue, which also keeps the change legible
+   on `.floating-panel`, whose resting border is dim slate. */
+.subsession-window:has(.resize-handle:hover),
+.floating-panel:has(.resize-handle:hover),
+.subsession-window.is-resizing,
+.floating-panel.is-resizing {
+  outline: 2px solid color-mix(in srgb, var(--subsession-accent-color, #38bdf8) 45%, #ffffff);
+  outline-offset: -2px;
+}
+
+/* Coarse pointers have no hover and resize by dragging the corner directly;
+   a permanently-lit frame would just be noise there. */
+@media (hover: none) {
+  .resize-handle::after { display: none; }
+}
 
 /* ── Generic dialog overlay ──────────────────────────────────────────────── */
 /* Padding bakes in iOS safe-area insets so the dialog never touches the

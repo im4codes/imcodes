@@ -54,6 +54,7 @@ import { EXECUTION_CLONE_KIND } from '@shared/execution-clone.js';
 import type { SessionSettingsOpenIntent } from '../session-settings-open-intent.js';
 import { useStableCallback } from '../hooks/useStableCallback.js';
 import type { ChatLocalWebPreviewOpenHandler } from './ChatLoopbackLink.js';
+import { RESIZE_DIRS, resizeHandleClass, type ResizeDir } from './window-resize.js';
 
 function isExecutionCloneTemplateLike(sub: { executionCloneKind?: string | null; parentRunId?: string | null }): boolean {
   return sub.executionCloneKind === EXECUTION_CLONE_KIND || typeof sub.parentRunId === 'string';
@@ -624,13 +625,17 @@ export function SubSessionWindow({
   const onHeaderMouseDown = startDrag;
 
   // ── Resizing ──────────────────────────────────────────────────────────────
-  type ResizeDir = 'n' | 's' | 'e' | 'w' | 'ne' | 'nw' | 'se' | 'sw';
+  // Which edge is being dragged, or null. Drives the lit affordance: a resize
+  // routinely drags the pointer off the 6px strip, so `:hover` alone would blink
+  // the indicator out mid-gesture.
+  const [resizingDir, setResizingDir] = useState<ResizeDir | null>(null);
 
   const onResizeMouseDown = useCallback((dir: ResizeDir) => (e: MouseEvent) => {
     e.stopPropagation();
     e.preventDefault();
     if (isDesktopMaximized) return;
     onFocus();
+    setResizingDir(dir);
     const startG = { ...geomRef.current };
     const sx = e.clientX, sy = e.clientY;
     const onMove = (me: MouseEvent) => {
@@ -651,6 +656,7 @@ export function SubSessionWindow({
       });
     };
     const onUp = () => {
+      setResizingDir(null);
       document.removeEventListener('mousemove', onMove);
       document.removeEventListener('mouseup', onUp);
     };
@@ -872,6 +878,7 @@ export function SubSessionWindow({
     'subsession-window',
     isDesktopMaximized ? 'subsession-window-maximized' : '',
     desktopLayoutCapable && !isMobile && active ? 'subsession-window-active' : '',
+    resizingDir ? 'is-resizing' : '',
   ].filter(Boolean).join(' ');
 
   return (
@@ -890,8 +897,8 @@ export function SubSessionWindow({
     >
       {activeIdleFlashToken ? <IdleFlashLayer key={`subwindow-idle-${activeIdleFlashToken}`} variant="frame" /> : null}
       {/* 8-direction resize handles (desktop only) */}
-      {!isMobile && !isDesktopMaximized && (['n','s','e','w','ne','nw','se','sw'] as ResizeDir[]).map((dir) => (
-        <div key={dir} class={`resize-handle resize-${dir}`} onMouseDown={onResizeMouseDown(dir)} />
+      {!isMobile && !isDesktopMaximized && RESIZE_DIRS.map((dir) => (
+        <div key={dir} class={resizeHandleClass(dir, resizingDir)} onMouseDown={onResizeMouseDown(dir)} />
       ))}
 
       {/* Header */}

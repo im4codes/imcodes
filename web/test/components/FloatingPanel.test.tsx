@@ -92,6 +92,47 @@ describe('FloatingPanel', () => {
     expect(onFocus).toHaveBeenCalled();
   });
 
+  // The resize affordance is purely visual, so its whole contract is the class
+  // names `styles.css` hooks onto. Asserting them here is what keeps a future
+  // refactor from silently returning the window to "no hint it can be resized".
+  it('gives every resize handle the shared stylesheet classes', () => {
+    render(
+      <FloatingPanel id="handle-classes" title="Preview" onClose={() => {}}>
+        <div>content</div>
+      </FloatingPanel>,
+    );
+
+    for (const dir of ['n', 's', 'e', 'w', 'ne', 'nw', 'se', 'sw']) {
+      const handle = screen.getByTestId(`floating-resize-${dir}`);
+      expect(handle.className).toContain('resize-handle');
+      expect(handle.className).toContain(`resize-${dir}`);
+    }
+  });
+
+  it('keeps the dragged handle and the frame lit for the whole resize', () => {
+    render(
+      <FloatingPanel id="resize-lit" title="Preview" onClose={() => {}}>
+        <div>content</div>
+      </FloatingPanel>,
+    );
+
+    const handle = screen.getByTestId('floating-resize-se');
+    const panel = screen.getByTestId('floating-panel-resize-lit');
+    expect(handle.className).not.toContain('is-resizing');
+    expect(panel.className).not.toContain('is-resizing');
+
+    fireEvent.mouseDown(handle, { clientX: 0, clientY: 0 });
+    // Pointer has left the 6px strip — the affordance must not blink out.
+    fireEvent.mouseMove(document, { clientX: 400, clientY: 400 });
+    expect(handle.className).toContain('is-resizing');
+    expect(panel.className).toContain('is-resizing');
+    expect(screen.getByTestId('floating-resize-n').className).not.toContain('is-resizing');
+
+    fireEvent.mouseUp(document);
+    expect(handle.className).not.toContain('is-resizing');
+    expect(panel.className).not.toContain('is-resizing');
+  });
+
   it('clamps north resize so the panel cannot move above the viewport top', () => {
     localStorage.setItem('rcc_float_clamp-north', JSON.stringify({ x: 100, y: 40, w: 700, h: 500 }));
     render(

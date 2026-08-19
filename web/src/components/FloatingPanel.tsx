@@ -17,6 +17,7 @@ import {
   type WorkspaceBounds,
   type WindowGeometry,
 } from '../desktop-window-maximize.js';
+import { RESIZE_DIRS, RESIZE_EDGE_PX, resizeHandleClass, type ResizeDir } from './window-resize.js';
 
 interface Props {
   id: string;
@@ -186,13 +187,16 @@ export function FloatingPanel({
   }, [isDesktopMaximized, onFocus, clampPos]);
 
   // ── Resize ───────────────────────────────────────────────────────────────
-  type ResizeDir = 'n' | 's' | 'e' | 'w' | 'ne' | 'nw' | 'se' | 'sw';
+
+  // Which edge is being dragged, or null — see resizeHandleClass().
+  const [resizingDir, setResizingDir] = useState<ResizeDir | null>(null);
 
   const onResizeMouseDown = useCallback((dir: ResizeDir) => (e: MouseEvent) => {
     e.stopPropagation();
     e.preventDefault();
     if (isDesktopMaximized) return;
     onFocus?.();
+    setResizingDir(dir);
     const startG = { ...geomRef.current };
     const sx = e.clientX, sy = e.clientY;
     const onMove = (me: MouseEvent) => {
@@ -219,6 +223,7 @@ export function FloatingPanel({
       });
     };
     const onUp = () => {
+      setResizingDir(null);
       document.removeEventListener('mousemove', onMove);
       document.removeEventListener('mouseup', onUp);
     };
@@ -284,7 +289,6 @@ export function FloatingPanel({
   }
 
   // Desktop: floating window
-  const rh = 5; // resize handle size
   const displayGeom = isDesktopMaximized
     ? geometryFromWorkspace(
       getMaximizeBounds?.() ?? fallbackMaximizedGeometry(minW, minH),
@@ -292,7 +296,7 @@ export function FloatingPanel({
     : geom;
   return (
     <div
-      className={['floating-panel', className].filter(Boolean).join(' ')}
+      className={['floating-panel', resizingDir ? 'is-resizing' : '', className].filter(Boolean).join(' ')}
       data-testid={`floating-panel-${id}`}
       style={{
         position: 'fixed', left: displayGeom.x, top: displayGeom.y, width: displayGeom.w, height: displayGeom.h,
@@ -368,18 +372,18 @@ export function FloatingPanel({
       {/* Resize handles */}
       {!isDesktopMaximized && (
         <>
-          <div data-testid="floating-resize-se" onMouseDown={onResizeMouseDown('se')} style={{ position: 'absolute', right: 0, bottom: 0, width: 16, height: 16, cursor: 'se-resize', zIndex: 3 }} />
-          <div data-testid="floating-resize-e" onMouseDown={onResizeMouseDown('e')} style={{ position: 'absolute', right: 0, top: rh, bottom: rh, width: rh, cursor: 'e-resize', zIndex: 3 }} />
-          <div data-testid="floating-resize-s" onMouseDown={onResizeMouseDown('s')} style={{ position: 'absolute', bottom: 0, left: rh, right: rh, height: rh, cursor: 's-resize', zIndex: 3 }} />
-          <div data-testid="floating-resize-w" onMouseDown={onResizeMouseDown('w')} style={{ position: 'absolute', left: 0, top: rh, bottom: rh, width: rh, cursor: 'w-resize', zIndex: 3 }} />
-          <div data-testid="floating-resize-n" onMouseDown={onResizeMouseDown('n')} style={{ position: 'absolute', top: 0, left: rh, right: rh, height: rh, cursor: 'n-resize', zIndex: 3 }} />
-          <div data-testid="floating-resize-nw" onMouseDown={onResizeMouseDown('nw')} style={{ position: 'absolute', left: 0, top: 0, width: 16, height: 16, cursor: 'nw-resize', zIndex: 3 }} />
-          <div data-testid="floating-resize-ne" onMouseDown={onResizeMouseDown('ne')} style={{ position: 'absolute', right: 0, top: 0, width: 16, height: 16, cursor: 'ne-resize', zIndex: 3 }} />
-          <div data-testid="floating-resize-sw" onMouseDown={onResizeMouseDown('sw')} style={{ position: 'absolute', left: 0, bottom: 0, width: 16, height: 16, cursor: 'sw-resize', zIndex: 3 }} />
+          {RESIZE_DIRS.map((dir) => (
+            <div
+              key={dir}
+              data-testid={`floating-resize-${dir}`}
+              className={resizeHandleClass(dir, resizingDir)}
+              onMouseDown={onResizeMouseDown(dir)}
+            />
+          ))}
           <div
             data-testid="floating-bottom-drag"
             onMouseDown={startDrag}
-            style={{ position: 'absolute', left: 24, right: 24, bottom: rh, height: 14, cursor: 'grab', zIndex: 2 }}
+            style={{ position: 'absolute', left: 24, right: 24, bottom: RESIZE_EDGE_PX, height: 14, cursor: 'grab', zIndex: 2 }}
           />
         </>
       )}
