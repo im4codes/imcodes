@@ -93,6 +93,8 @@ class PeerSession final : public webrtc::PeerConnectionObserver,
    * is one tick rather than one renewal interval.
    */
   void PublishInputReadinessIfChanged();
+  /** Let the video out once the input channels are up, or the wait expires. */
+  void ActivateVideoIfReady();
   void HandleMediaStats(uint64_t generation,
                         bool has_outbound_video,
                         uint64_t outbound_bytes);
@@ -179,6 +181,14 @@ class PeerSession final : public webrtc::PeerConnectionObserver,
   const ClipboardSequence clipboard_sequence_;
   const ReadClipboardText read_clipboard_text_;
   const RequestUnlock request_unlock_;
+  /**
+   * Video is held back until the input channels are open. Their handshake is a
+   * few small packets; the first video is megabits, and on a relayed link that
+   * is one ordered pipe, so whichever goes first decides how long the other
+   * waits. Bounded: a viewer that never opens all three still gets a picture.
+   */
+  bool video_activated_ = false;
+  int64_t video_gate_deadline_ms_ = 0;
   bool sign_in_screen_ = false;
   bool unlock_available_ = false;
   /** Last input readiness reported, so only changes are pushed. */
@@ -194,7 +204,6 @@ class PeerSession final : public webrtc::PeerConnectionObserver,
   bool selection_required_ = false;
   int layout_revision_ = 1;
   uint64_t outbound_sequence_ = 0;
-  uint64_t last_pointer_sequence_ = 0;
   std::map<std::string, uint64_t> last_sequence_by_channel_;
   std::map<std::string, webrtc::scoped_refptr<webrtc::DataChannelInterface>>
       channels_;

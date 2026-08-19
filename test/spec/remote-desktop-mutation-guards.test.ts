@@ -879,6 +879,35 @@ const contracts: Contract[] = [
     ],
   },
   {
+    // On a relayed link everything shares one ordered pipe, so whichever goes
+    // first decides how long the other waits. The input channels' handshake is
+    // a few small packets; the opening video is megabits.
+    name: 'the input channels get the link before the picture does',
+    guards: [
+      {
+        path: 'native/windows-remote-desktop/peer_session.cc',
+        needle: 'void PeerSession::ActivateVideoIfReady() {',
+      },
+      {
+        // The video sender starts inactive and is let out later.
+        path: 'native/windows-remote-desktop/peer_session.cc',
+        needle: 'encoding.active = false;',
+      },
+      {
+        // Bounded: a viewer that never opens all three still gets a picture.
+        path: 'native/windows-remote-desktop/peer_session.cc',
+        needle: 'kVideoGateTimeoutMs',
+      },
+      {
+        // Replay protection stays per channel, or the reliable stream keeps
+        // invalidating the motion in flight on the unreliable one.
+        path: 'native/windows-remote-desktop/peer_session.cc',
+        needle: 'last_sequence_by_channel_[channel] = sequence;',
+        minimum: 2,
+      },
+    ],
+  },
+  {
     // A connected, controlling session that cannot type is the most opaque
     // state this protocol has — the whole toolbar greys out with nothing to
     // explain it — and the viewer only learned about the change on the next
@@ -1387,6 +1416,12 @@ const mutations: Mutation[] = [
     contract: 'media that has not started is not treated as media that stalled',
     path: 'web/src/remote-desktop-client.ts',
     needle: 'if (inbound.bytesReceived > 0) this.mediaStarted = true;',
+  },
+  {
+    name: 'send the picture before the input channels are up',
+    contract: 'the input channels get the link before the picture does',
+    path: 'native/windows-remote-desktop/peer_session.cc',
+    needle: 'encoding.active = false;',
   },
   {
     name: 'stop publishing input readiness as it changes',

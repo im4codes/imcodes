@@ -19,6 +19,10 @@ inline constexpr int kMaxIceCandidates = 128;
 inline constexpr int kMaxDisplays = 16;
 inline constexpr int64_t kLeaseMaxFutureMs = 20'000;
 inline constexpr int64_t kIdleTimeoutMs = 15 * 60 * 1000;
+// How long the picture waits for the input channels before going out anyway.
+// Their handshake is a handful of small packets, so this is a backstop for a
+// viewer that never opens them, not a budget the normal path spends.
+inline constexpr int64_t kVideoGateTimeoutMs = 2'000;
 inline constexpr size_t kMaxSessions = 4;
 inline constexpr size_t kMaxCaptureSources = 4;
 inline constexpr size_t kMaxGpuCaptureSurfaces = 4;

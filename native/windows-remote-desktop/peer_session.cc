@@ -351,6 +351,10 @@ bool PeerSession::Initialize() {
   }
   parameters.degradation_preference =
       webrtc::DegradationPreference::MAINTAIN_RESOLUTION;
+  // Held until the input channels are open — see video_activated_.
+  for (webrtc::RtpEncodingParameters& encoding : parameters.encodings) {
+    encoding.active = false;
+  }
   if (!added.value()->SetParameters(parameters).ok()) return false;
   Json::Value initial = BaseEnvelope(kModeStateType, authority_);
   initial["mode"] = authority_.mode;
@@ -479,10 +483,9 @@ bool PeerSession::SetMode(const Authority& update, const std::string& reason) {
       (update.mode != kViewMode && update.mode != kControlMode)) {
     return false;
   }
-  if (mode_changed) {
-    ReleaseInput();
-    last_pointer_sequence_ = 0;
-  }
+  // The input epoch moves with the mode, and every input frame is bound to it,
+  // so a stale-mode packet is already refused without a separate counter.
+  if (mode_changed) ReleaseInput();
   authority_.mode = update.mode;
   authority_.input_epoch = update.input_epoch;
   Json::Value response = BaseEnvelope(kModeStateType, authority_);
@@ -780,16 +783,15 @@ void PeerSession::OnConnectionChange(
     return;
   }
   if (state == webrtc::PeerConnectionInterface::PeerConnectionState::kConnected) {
-    // The viewer cannot decode anything until a keyframe arrives, and waiting
-    // for the encoder's own interval puts that delay in front of the first
-    // picture — and so in front of everything that waits on it.
-    for (const auto& sender : peer_->GetSenders()) {
-      if (sender->track() && sender->track()->kind() ==
-                                 webrtc::MediaStreamTrackInterface::kVideoKind) {
-        sender->GenerateKeyFrame({});
-        break;
-      }
+    // Start the bounded wait for the input channels here: a viewer that never
+    // opens all three must still end up with a picture.
+    if (video_gate_deadline_ms_ == 0) {
+      video_gate_deadline_ms_ =
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+              std::chrono::steady_clock::now().time_since_epoch())
+              .count() + kVideoGateTimeoutMs;
     }
+    ActivateVideoIfReady();
     SendStatus(relayed_ ? "relayed" : "direct", InputReady());
   } else if (state ==
                  webrtc::PeerConnectionInterface::PeerConnectionState::kFailed ||
@@ -836,6 +838,8 @@ void PeerSession::HandleChannelState(const std::string& label) {
   }
   if (found->second->state() == webrtc::DataChannelInterface::kOpen &&
       ChannelsReady()) {
+    // The channels are up, so the pipe is free for the picture now.
+    ActivateVideoIfReady();
     SendStatus(relayed_ ? "relayed" : "direct", InputReady());
   } else if (found->second->state() ==
              webrtc::DataChannelInterface::kClosed) {
@@ -1077,8 +1081,16 @@ void PeerSession::HandlePointer(const std::string& channel,
     return;
   }
   uint64_t sequence = 0;
+  // Replay protection is per channel, and deliberately so. The pointer channel
+  // is unordered and may drop what it likes; the control channel is reliable
+  // and ordered. A single sequence bar shared between them means every clicked
+  // button and every reliable position sample raises it above the motion
+  // already in flight on the other channel, which is then discarded on
+  // arrival — the remote cursor stops following and only moves when a click
+  // carries a position with it. ValidateInputBase already requires a strict
+  // increase within each channel, which is what stale-packet rejection needs.
   if (!ValidateInputBase(root, channel, true, &sequence) ||
-      authority_.input_epoch <= 0 || sequence <= last_pointer_sequence_) return;
+      authority_.input_epoch <= 0) return;
   const std::string kind = root["kind"].asString();
   bool accepted = false;
   if (kind == "move" && root["x"].isNumeric() && root["y"].isNumeric() &&
@@ -1124,7 +1136,6 @@ void PeerSession::HandlePointer(const std::string& channel,
                              root["deltaY"].asDouble());
   }
   if (accepted) {
-    last_pointer_sequence_ = sequence;
     last_sequence_by_channel_[channel] = sequence;
     TouchActivity();
     if (channel == kControlChannel &&
@@ -1519,8 +1530,33 @@ bool PeerSession::ChannelsReady() const {
   return true;
 }
 
+void PeerSession::ActivateVideoIfReady() {
+  if (video_activated_ || closed_ || !peer_) return;
+  const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now().time_since_epoch())
+                             .count();
+  const bool expired = video_gate_deadline_ms_ > 0 &&
+                       now_ms >= video_gate_deadline_ms_;
+  if (!ChannelsReady() && !expired) return;
+  for (const auto& sender : peer_->GetSenders()) {
+    if (!sender->track() || sender->track()->kind() !=
+                                webrtc::MediaStreamTrackInterface::kVideoKind) {
+      continue;
+    }
+    webrtc::RtpParameters parameters = sender->GetParameters();
+    for (webrtc::RtpEncodingParameters& encoding : parameters.encodings) {
+      encoding.active = true;
+    }
+    if (!sender->SetParameters(parameters).ok()) return;
+    sender->GenerateKeyFrame({});
+    video_activated_ = true;
+    return;
+  }
+}
+
 void PeerSession::PublishInputReadinessIfChanged() {
   if (closed_ || !peer_) return;
+  ActivateVideoIfReady();
   const bool ready = InputReady();
   if (ready == reported_input_ready_) return;
   reported_input_ready_ = ready;
