@@ -197,6 +197,21 @@ export type RemoteDesktopControlRejection = typeof REMOTE_DESKTOP_CONTROL_REJECT
   keyof typeof REMOTE_DESKTOP_CONTROL_REJECTION
 ];
 
+/**
+ * Bounds for a resolution a controller may ask for. The offered list comes from
+ * the node's own driver; this only keeps a request inside sane limits.
+ */
+export const REMOTE_DESKTOP_DISPLAY_MODE_LIMITS = {
+  /** 640x480 is the smallest mode Windows drivers still offer. */
+  MIN_EDGE: 480,
+  MAX_EDGE: 16_384,
+  MAX_MODES: 24,
+} as const;
+
+/**
+ * Fallback list for nodes that do not report their driver's modes yet. A node
+ * that does report them replaces this entirely.
+ */
 export const REMOTE_DESKTOP_COMMON_DISPLAY_MODES = [
   { width: 1280, height: 720, label: '720p', recommendedDpiScalePercent: 125 },
   { width: 1920, height: 1080, label: '1080p', recommendedDpiScalePercent: 150 },
@@ -462,6 +477,12 @@ export interface RemoteDesktopError {
   detail?: string;
 }
 
+/** One resolution a node's display driver actually offers. */
+export interface RemoteDesktopDisplayMode {
+  width: number;
+  height: number;
+}
+
 export interface RemoteDesktopDisplay {
   id: string;
   label: string;
@@ -471,6 +492,12 @@ export interface RemoteDesktopDisplay {
   height: number;
   dpiScale: number;
   rotation: typeof REMOTE_DESKTOP_DISPLAY_ROTATION[keyof typeof REMOTE_DESKTOP_DISPLAY_ROTATION];
+  /**
+   * The resolutions this display's driver reports, largest first. Absent from
+   * older nodes, which is the only reason the common-mode list still exists:
+   * offering a size the driver does not have is a control that cannot work.
+   */
+  modes?: RemoteDesktopDisplayMode[];
 }
 
 export interface RemoteDesktopDisplayTopology {
@@ -878,7 +905,7 @@ export function validateRemoteDesktopServerMessage(value: unknown): RemoteDeskto
 
 function isDisplay(value: unknown): value is RemoteDesktopDisplay {
   if (!isRecord(value)
-    || !hasExactKeys(value, ['id', 'label', 'primary', 'available', 'width', 'height', 'dpiScale', 'rotation'])) return false;
+    || !hasExactKeys(value, ['id', 'label', 'primary', 'available', 'width', 'height', 'dpiScale', 'rotation'], ['modes'])) return false;
   return isBoundedString(value.id, REMOTE_DESKTOP_LIMITS.DISPLAY_ID_BYTES)
     && isBoundedString(value.label, REMOTE_DESKTOP_LIMITS.DISPLAY_LABEL_BYTES)
     && typeof value.primary === 'boolean'
@@ -886,7 +913,28 @@ function isDisplay(value: unknown): value is RemoteDesktopDisplay {
     && isSafePositive(value.width) && value.width <= 16_384
     && isSafePositive(value.height) && value.height <= 16_384
     && isFiniteRange(value.dpiScale, 0.5, 8)
-    && typeof value.rotation === 'number' && ROTATIONS.has(value.rotation);
+    && typeof value.rotation === 'number' && ROTATIONS.has(value.rotation)
+    && (value.modes === undefined || isDisplayModeList(value.modes));
+}
+
+function isDisplayModeList(value: unknown): value is RemoteDesktopDisplayMode[] {
+  if (!Array.isArray(value) || value.length === 0
+    || value.length > REMOTE_DESKTOP_DISPLAY_MODE_LIMITS.MAX_MODES) return false;
+  const seen = new Set<string>();
+  for (const mode of value) {
+    if (!isRecord(mode) || !hasExactKeys(mode, ['width', 'height'])
+      || !isSafePositive(mode.width) || !isSafePositive(mode.height)
+      || (mode.width as number) < REMOTE_DESKTOP_DISPLAY_MODE_LIMITS.MIN_EDGE
+      || (mode.height as number) < REMOTE_DESKTOP_DISPLAY_MODE_LIMITS.MIN_EDGE
+      || (mode.width as number) > REMOTE_DESKTOP_DISPLAY_MODE_LIMITS.MAX_EDGE
+      || (mode.height as number) > REMOTE_DESKTOP_DISPLAY_MODE_LIMITS.MAX_EDGE) {
+      return false;
+    }
+    const key = `${mode.width}x${mode.height}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+  }
+  return true;
 }
 
 function hasUniqueDisplayIds(displays: readonly RemoteDesktopDisplay[]): boolean {
@@ -989,10 +1037,14 @@ function validateControl(value: Record<string, unknown>): boolean {
       && value.acknowledgedSequence === undefined;
   }
   if (value.kind === REMOTE_DESKTOP_CONTROL_KIND.SET_DISPLAY_MODE) {
+    // Bounded, not enumerated: which resolutions exist is the node's answer,
+    // and a wire contract that hardcodes four of them can only ever offer four.
     return isBoundedString(value.displayId, REMOTE_DESKTOP_LIMITS.DISPLAY_ID_BYTES)
-      && REMOTE_DESKTOP_COMMON_DISPLAY_MODES.some((mode) => (
-        value.width === mode.width && value.height === mode.height
-      ))
+      && isSafePositive(value.width) && isSafePositive(value.height)
+      && (value.width as number) >= REMOTE_DESKTOP_DISPLAY_MODE_LIMITS.MIN_EDGE
+      && (value.height as number) >= REMOTE_DESKTOP_DISPLAY_MODE_LIMITS.MIN_EDGE
+      && (value.width as number) <= REMOTE_DESKTOP_DISPLAY_MODE_LIMITS.MAX_EDGE
+      && (value.height as number) <= REMOTE_DESKTOP_DISPLAY_MODE_LIMITS.MAX_EDGE
       && value.dpiScalePercent === undefined && value.requestId === undefined
       && value.frameWidth === undefined && value.frameHeight === undefined
       && value.acknowledgedSequence === undefined;

@@ -30,6 +30,12 @@ struct IDXGIOutputDuplication;
 
 namespace imcodes::rd {
 
+/** One resolution a display's driver actually offers. */
+struct DisplayMode {
+  int width = 0;
+  int height = 0;
+};
+
 struct DisplayInfo {
   std::string id;
   std::string label;
@@ -47,6 +53,13 @@ struct DisplayInfo {
   bool imcodes_virtual = false;
   LUID adapter_luid{};
   UINT output_index = 0;
+  /**
+   * The resolutions this driver reports, largest first and deduplicated across
+   * refresh rates. A GPU with no monitor attached often offers exactly one, so
+   * a fixed menu of common sizes leaves the operator clicking entries that can
+   * never apply.
+   */
+  std::vector<DisplayMode> modes;
 };
 
 std::vector<DisplayInfo> EnumerateDisplays();

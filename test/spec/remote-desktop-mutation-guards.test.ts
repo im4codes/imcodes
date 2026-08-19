@@ -764,6 +764,51 @@ const contracts: Contract[] = [
     ],
   },
   {
+    // Which resolutions exist is the node's answer. A monitor-less GPU often
+    // offers exactly one, so a fixed menu of common sizes is a control that
+    // mostly does nothing — the list has to come from the driver.
+    name: 'resolutions offered are the ones the node reports',
+    guards: [
+      {
+        path: 'native/windows-remote-desktop/display_capture.cc',
+        needle: 'EnumerateDisplayModes(info.device_name)',
+      },
+      {
+        path: 'native/windows-remote-desktop/peer_session.cc',
+        needle: 'value["modes"] = modes;',
+      },
+      {
+        path: 'shared/remote-desktop.ts',
+        needle: 'REMOTE_DESKTOP_DISPLAY_MODE_LIMITS',
+        minimum: 4,
+      },
+      {
+        path: 'web/src/components/RemoteDesktopPanel.tsx',
+        needle: 'displayModeOptions(display).map(',
+      },
+      {
+        path: 'web/src/remote-desktop-client.ts',
+        needle: 'display?.modes ?? REMOTE_DESKTOP_COMMON_DISPLAY_MODES',
+      },
+    ],
+  },
+  {
+    // A machine with no physical mouse keeps its pointer suppressed: moving it
+    // then changes nothing anyone can see, which is a remote cursor that does
+    // not follow.
+    name: 'the remote pointer stays visible while it is driven',
+    guards: [
+      {
+        path: 'native/windows-remote-desktop/local_indicator.cc',
+        needle: 'if (request->accepted && PointerSuppressed())',
+      },
+      {
+        path: 'native/windows-remote-desktop/display_capture.cc',
+        needle: '(cursor.flags & (CURSOR_SHOWING | CURSOR_SUPPRESSED)) == 0',
+      },
+    ],
+  },
+  {
     // A locked machine rests on the lock curtain, which has no password box:
     // typing without waking it first is what made auto unlock do nothing at
     // all. The manual control exists because the sign-in UI can still swallow
@@ -1212,6 +1257,18 @@ const mutations: Mutation[] = [
     contract: 'per-display fixed resolution switching',
     path: 'native/windows-remote-desktop/peer_session.cc',
     needle: 'return restore_current_status(kReject',
+  },
+  {
+    name: 'go back to a fixed resolution menu',
+    contract: 'resolutions offered are the ones the node reports',
+    path: 'web/src/components/RemoteDesktopPanel.tsx',
+    needle: 'displayModeOptions(display).map(',
+  },
+  {
+    name: 'stop revealing the suppressed pointer',
+    contract: 'the remote pointer stays visible while it is driven',
+    path: 'native/windows-remote-desktop/local_indicator.cc',
+    needle: 'if (request->accepted && PointerSuppressed())',
   },
   {
     name: 'type the secret without waking the lock curtain',

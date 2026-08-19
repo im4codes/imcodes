@@ -249,13 +249,18 @@ TEST(WorkerPolicyTest, RequiresExplicitChoiceWhenSelectedDisplayDisappears) {
   EXPECT_FALSE(DisplaySelectionRequiresExplicitChoice(displays, ""));
 }
 
-TEST(WorkerPolicyTest, AllowsOnlyFixedCommonDisplayModes) {
+TEST(WorkerPolicyTest, BoundsDisplayModesInsteadOfEnumeratingThem) {
   EXPECT_TRUE(IsAllowedRemoteDisplayMode(1280, 720));
-  EXPECT_TRUE(IsAllowedRemoteDisplayMode(1920, 1080));
-  EXPECT_TRUE(IsAllowedRemoteDisplayMode(2560, 1440));
   EXPECT_TRUE(IsAllowedRemoteDisplayMode(3840, 2160));
-  EXPECT_FALSE(IsAllowedRemoteDisplayMode(1024, 768));
-  EXPECT_FALSE(IsAllowedRemoteDisplayMode(3840, 1080));
+  // Which resolutions exist is the driver's answer. A monitor-less GPU usually
+  // offers exactly 1024x768, and refusing it here is what left the operator
+  // clicking sizes that could never apply.
+  EXPECT_TRUE(IsAllowedRemoteDisplayMode(1024, 768));
+  EXPECT_TRUE(IsAllowedRemoteDisplayMode(800, 600));
+  EXPECT_TRUE(IsAllowedRemoteDisplayMode(3840, 1080));
+  // Bounds still hold.
+  EXPECT_FALSE(IsAllowedRemoteDisplayMode(320, 240));
+  EXPECT_FALSE(IsAllowedRemoteDisplayMode(kMaxRemoteDisplayEdge + 1, 1080));
   EXPECT_FALSE(IsAllowedRemoteDisplayMode(0, 0));
 }
 
@@ -269,6 +274,9 @@ TEST(WorkerPolicyTest, AllowsOnlyFixedDpiScalesAndRecommendsPerResolution) {
   EXPECT_EQ(RecommendedRemoteDisplayScale(2560, 1440), 175);
   EXPECT_EQ(RecommendedRemoteDisplayScale(3840, 2160), 225);
   EXPECT_EQ(RecommendedRemoteDisplayScale(1024, 768), 100);
+  // An arbitrary driver-reported size still lands in a band.
+  EXPECT_EQ(RecommendedRemoteDisplayScale(1600, 900), 125);
+  EXPECT_EQ(RecommendedRemoteDisplayScale(2048, 1152), 150);
 }
 
 TEST(WorkerPolicyTest, RequiresPresentedFrameGeometryForSelectedDisplay) {

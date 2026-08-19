@@ -6,6 +6,7 @@ import {
   REMOTE_DESKTOP_COMMON_DISPLAY_MODES,
   REMOTE_DESKTOP_CONTROL_KIND,
   REMOTE_DESKTOP_CONTROL_REJECTION,
+  REMOTE_DESKTOP_DISPLAY_MODE_LIMITS,
   REMOTE_DESKTOP_DATA_MSG,
   REMOTE_DESKTOP_DPI_SCALE_PERCENTS,
   REMOTE_DESKTOP_DISPLAY_ROTATION,
@@ -318,6 +319,69 @@ describe('remote desktop production contract', () => {
       .toEqual({ ok: false, error: REMOTE_DESKTOP_ERROR.INVALID_REQUEST });
   });
 
+  it('carries the driver-reported resolutions on a display, bounded and unique', () => {
+    const base = {
+      type: REMOTE_DESKTOP_DATA_MSG.DISPLAY_TOPOLOGY,
+      protocolVersion: REMOTE_DESKTOP_PROTOCOL_VERSION,
+      sessionId,
+      sequence: 3,
+      layoutRevision: 1,
+      displays: [{
+        id: 'display-primary',
+        label: 'Display 1',
+        primary: true,
+        available: true,
+        width: 1024,
+        height: 768,
+        dpiScale: 1,
+        rotation: REMOTE_DESKTOP_DISPLAY_ROTATION.ROTATE_0,
+        modes: [{ width: 1024, height: 768 }, { width: 800, height: 600 }],
+      }],
+      selectedDisplayId: 'display-primary',
+    };
+    expect(validateRemoteDesktopDataMessage(base)).toMatchObject({ ok: true });
+    // A node that reports nothing stays valid: that is what the common list is
+    // still there for.
+    const { modes: _modes, ...withoutModes } = base.displays[0]!;
+    expect(validateRemoteDesktopDataMessage({ ...base, displays: [withoutModes] }))
+      .toMatchObject({ ok: true });
+    const withModes = (modes: unknown) => ({
+      ...base,
+      displays: [{ ...base.displays[0], modes }],
+    });
+    expect(validateRemoteDesktopDataMessage(withModes([])))
+      .toEqual({ ok: false, error: REMOTE_DESKTOP_ERROR.INVALID_REQUEST });
+    expect(validateRemoteDesktopDataMessage(withModes([
+      { width: 1024, height: 768 }, { width: 1024, height: 768 },
+    ]))).toEqual({ ok: false, error: REMOTE_DESKTOP_ERROR.INVALID_REQUEST });
+    expect(validateRemoteDesktopDataMessage(withModes([{ width: 320, height: 240 }])))
+      .toEqual({ ok: false, error: REMOTE_DESKTOP_ERROR.INVALID_REQUEST });
+    expect(validateRemoteDesktopDataMessage(withModes(
+      Array.from({ length: REMOTE_DESKTOP_DISPLAY_MODE_LIMITS.MAX_MODES + 1 }, (_value, index) => (
+        { width: 1024 + index, height: 768 }
+      )),
+    ))).toEqual({ ok: false, error: REMOTE_DESKTOP_ERROR.INVALID_REQUEST });
+  });
+
+  it('accepts any bounded resolution request, since the node owns the list', () => {
+    const request = {
+      type: REMOTE_DESKTOP_DATA_MSG.CONTROL,
+      ...inputBase,
+      sequence: 31,
+      kind: REMOTE_DESKTOP_CONTROL_KIND.SET_DISPLAY_MODE,
+      displayId: 'display-primary',
+      width: 1176,
+      height: 664,
+    };
+    // Not one of the common sizes, and still valid: only the node knows which
+    // resolutions its driver has.
+    expect(validateRemoteDesktopDataMessage(request)).toMatchObject({ ok: true });
+    expect(validateRemoteDesktopDataMessage({ ...request, width: 320 }))
+      .toEqual({ ok: false, error: REMOTE_DESKTOP_ERROR.INVALID_REQUEST });
+    expect(validateRemoteDesktopDataMessage({ ...request, height: 20_000 }))
+      .toEqual({ ok: false, error: REMOTE_DESKTOP_ERROR.INVALID_REQUEST });
+  });
+
   it('validates bounded quality diagnostics', () => {
     const quality = {
       type: REMOTE_DESKTOP_DATA_MSG.QUALITY,
@@ -524,6 +588,8 @@ describe('remote desktop production contract', () => {
       width: 3840,
       height: 2160,
     })).toMatchObject({ ok: true });
+    // 1024x768 is what a monitor-less GPU usually offers, and it is a valid
+    // request: the node's own driver list decides, not this contract.
     expect(validateRemoteDesktopDataMessage({
       type: REMOTE_DESKTOP_DATA_MSG.CONTROL,
       ...inputBase,
@@ -531,6 +597,14 @@ describe('remote desktop production contract', () => {
       displayId: 'display-second',
       width: 1024,
       height: 768,
+    })).toMatchObject({ ok: true });
+    expect(validateRemoteDesktopDataMessage({
+      type: REMOTE_DESKTOP_DATA_MSG.CONTROL,
+      ...inputBase,
+      kind: REMOTE_DESKTOP_CONTROL_KIND.SET_DISPLAY_MODE,
+      displayId: 'display-second',
+      width: 320,
+      height: 240,
     })).toEqual({ ok: false, error: REMOTE_DESKTOP_ERROR.INVALID_REQUEST });
     expect(validateRemoteDesktopDataMessage({
       type: REMOTE_DESKTOP_DATA_MSG.CONTROL,

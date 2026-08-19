@@ -3081,6 +3081,7 @@
     },
     "unlock": "Unlock",
     "unlock_hint": "Ask this node to answer its sign-in screen with the secret it stores.",
-    "unlock_unconfigured": "No sign-in secret is stored on this node."
+    "unlock_unconfigured": "No sign-in secret is stored on this node.",
+    "resolution_unreported": "This node has not reported its driver’s resolutions; these are the common sizes."
   }
 }

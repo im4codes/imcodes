@@ -224,10 +224,12 @@ bool DisplaySelectionRequiresExplicitChoice(
 }
 
 bool IsAllowedRemoteDisplayMode(int width, int height) {
-  return (width == 1280 && height == 720) ||
-         (width == 1920 && height == 1080) ||
-         (width == 2560 && height == 1440) ||
-         (width == 3840 && height == 2160);
+  // A bound, not a menu. Which resolutions exist is the driver's answer — a
+  // machine with no monitor attached often offers exactly one, and pinning four
+  // common sizes here is what left the operator clicking entries that could
+  // never apply. Windows still refuses anything its driver does not have.
+  return width >= kMinRemoteDisplayEdge && height >= kMinRemoteDisplayEdge &&
+         width <= kMaxRemoteDisplayEdge && height <= kMaxRemoteDisplayEdge;
 }
 
 bool IsAllowedRemoteDisplayScale(int percent) {
@@ -246,11 +248,14 @@ bool IsAllowedRemoteDisplayScale(int percent) {
   }
 }
 
-int RecommendedRemoteDisplayScale(int width, int height) {
-  if (width == 1280 && height == 720) return 125;
-  if (width == 1920 && height == 1080) return 150;
-  if (width == 2560 && height == 1440) return 175;
-  if (width == 3840 && height == 2160) return 225;
+int RecommendedRemoteDisplayScale(int width, int /*height*/) {
+  // Banded by width rather than matched against four exact sizes, so any
+  // resolution a driver reports still gets a readable default. The bands
+  // reproduce what the fixed sizes used to return.
+  if (width >= 3840) return 225;
+  if (width >= 2560) return 175;
+  if (width >= 1920) return 150;
+  if (width >= 1280) return 125;
   return 100;
 }
 

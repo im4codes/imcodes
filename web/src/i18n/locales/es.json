@@ -3081,6 +3081,7 @@
     },
     "unlock": "Desbloquear",
     "unlock_hint": "Pide a este nodo que responda a su pantalla de inicio de sesión con la clave que guarda.",
-    "unlock_unconfigured": "Este nodo no guarda ninguna clave de inicio de sesión."
+    "unlock_unconfigured": "Este nodo no guarda ninguna clave de inicio de sesión.",
+    "resolution_unreported": "Este nodo no informó las resoluciones de su controlador; estos son los tamaños comunes."
   }
 }

@@ -116,6 +116,28 @@ const INITIAL_SNAPSHOT: RemoteDesktopSnapshot = {
 };
 
 const MAX_REMOTE_DESKTOP_RECONNECTS = REMOTE_DESKTOP_LIMITS.MAX_RECONNECT_ATTEMPTS;
+/**
+ * The resolutions to offer for a display: the ones its driver reported, or the
+ * common sizes when the node is too old to report any. A node that reports them
+ * decides on its own — offering a size its driver lacks is a control that can
+ * only ever do nothing.
+ */
+function displayModeOptions(
+  display: RemoteDesktopSnapshot['displays'][number],
+): Array<{ width: number; height: number; label?: string }> {
+  if (!display.modes?.length) return [...REMOTE_DESKTOP_COMMON_DISPLAY_MODES];
+  const labels = new Map<string, string>(REMOTE_DESKTOP_COMMON_DISPLAY_MODES.map((mode) => (
+    [`${mode.width}x${mode.height}`, mode.label] as [string, string]
+  )));
+  return display.modes.map((mode) => ({
+    width: mode.width,
+    height: mode.height,
+    ...(labels.has(`${mode.width}x${mode.height}`)
+      ? { label: labels.get(`${mode.width}x${mode.height}`) }
+      : {}),
+  }));
+}
+
 /** How long a refused-command notice stays up before it fades on its own. */
 const CONTROL_NOTICE_MS = 6_000;
 const TOUCH_LONG_PRESS_MS = 550;
@@ -1508,7 +1530,7 @@ export function RemoteDesktopPanel({
               style={{ left: `${displayModeMenu.x}px`, top: `${displayModeMenu.y}px` }}
             >
               <strong>{t('remote_desktop.resolution_menu', { display: display.label })}</strong>
-              {REMOTE_DESKTOP_COMMON_DISPLAY_MODES.map((mode) => (
+              {displayModeOptions(display).map((mode) => (
                 <button
                   key={`${mode.width}x${mode.height}`}
                   type="button"
@@ -1523,10 +1545,15 @@ export function RemoteDesktopPanel({
                     setDisplayModeMenu(null);
                   }}
                 >
-                  <span>{mode.label}</span>
-                  <small>{mode.width}×{mode.height}</small>
+                  <span>{mode.label ?? `${mode.width}×${mode.height}`}</span>
+                  <small>{mode.label ? `${mode.width}×${mode.height}` : ''}</small>
                 </button>
               ))}
+              {display.modes === undefined && (
+                <small class="remote-desktop-resolution-note">
+                  {t('remote_desktop.resolution_unreported')}
+                </small>
+              )}
               <strong>{t('remote_desktop.dpi_menu')}</strong>
               <div class="remote-desktop-dpi-options" role="group" aria-label={t('remote_desktop.dpi_menu')}>
                 {REMOTE_DESKTOP_DPI_SCALE_PERCENTS.map((dpiScalePercent) => (

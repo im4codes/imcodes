@@ -389,9 +389,12 @@ export class RemoteDesktopClient {
     const display = this.snapshot.displays.find((candidate) => (
       candidate.id === displayId && candidate.available
     ));
-    if (!REMOTE_DESKTOP_COMMON_DISPLAY_MODES.some((mode) => (
-      mode.width === width && mode.height === height
-    ))) return false;
+    // Offered by this display if it reported its driver's list; otherwise the
+    // common sizes, which is all an older node can be asked for.
+    const offered = display?.modes ?? REMOTE_DESKTOP_COMMON_DISPLAY_MODES;
+    if (!offered.some((mode) => mode.width === width && mode.height === height)) {
+      return false;
+    }
     if (!this.snapshot.inputEnabled || !display) {
       // Refused here rather than on the node, but the operator saw the same
       // thing — a click that changed nothing — so answer it the same way.

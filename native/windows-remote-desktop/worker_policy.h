@@ -213,6 +213,13 @@ bool DisplaySelectionRequiresExplicitChoice(
     const std::string& previous_id);
 
 bool IsAllowedRemoteDisplayMode(int width, int height);
+
+// Bounds only: the offered resolutions come from the driver's own list.
+inline constexpr int kMinRemoteDisplayEdge = 480;
+inline constexpr int kMaxRemoteDisplayEdge = 16'384;
+// Distinct sizes reported per display. Drivers enumerate hundreds of modes that
+// differ only in refresh rate or colour depth; an operator picks a size.
+inline constexpr size_t kMaxDisplayModes = 24;
 bool IsAllowedRemoteDisplayScale(int percent);
 int RecommendedRemoteDisplayScale(int width, int height);
 // A browser may re-enable input only after presenting a decoded frame whose

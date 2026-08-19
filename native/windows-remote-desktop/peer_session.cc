@@ -1191,6 +1191,19 @@ void PeerSession::SendTopology() {
     value["height"] = display.height;
     value["dpiScale"] = display.dpi_scale;
     value["rotation"] = display.rotation_degrees;
+    if (!display.modes.empty()) {
+      // The resolutions this driver actually offers. Without them the browser
+      // can only guess at a fixed set, and every guess the driver lacks is a
+      // menu entry that does nothing.
+      Json::Value modes(Json::arrayValue);
+      for (const DisplayMode& mode : display.modes) {
+        Json::Value entry(Json::objectValue);
+        entry["width"] = mode.width;
+        entry["height"] = mode.height;
+        modes.append(entry);
+      }
+      value["modes"] = modes;
+    }
     displays.append(value);
   }
   root["displays"] = displays;

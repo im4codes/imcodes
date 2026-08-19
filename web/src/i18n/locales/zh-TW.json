@@ -3081,6 +3081,7 @@
     },
     "unlock": "解鎖",
     "unlock_hint": "讓該節點用本機儲存的密碼應答自己的登入畫面。",
-    "unlock_unconfigured": "該節點未儲存登入密碼。"
+    "unlock_unconfigured": "該節點未儲存登入密碼。",
+    "resolution_unreported": "該節點未回報驅動程式支援的解析度，這裡顯示的是通用尺寸。"
   }
 }
