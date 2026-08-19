@@ -35,6 +35,7 @@ import {
   remoteDesktopShortcutLabel,
   sendRemoteDesktopChord,
 } from '../remote-desktop-keyboard.js';
+import { formatByteRate, formatByteSize } from '../util/byte-size.js';
 import { copyToClipboard } from '../util/clipboard.js';
 import type { WsClient } from '../ws-client.js';
 import { openRemoteDesktopWindow } from '../remote-desktop-window.js';
@@ -223,6 +224,23 @@ interface RemoteDesktopTransferRow {
   progress: number;
   transport: FileUploadTransportMode;
   status: 'transferring' | 'done' | 'canceled' | 'error';
+  /** Known for a file being sent; a fetch learns it only on completion. */
+  sizeBytes?: number;
+  /** Smoothed, so the number is readable rather than twitching every tick. */
+  bytesPerSecond?: number;
+  sampledAt?: number;
+  sampledBytes?: number;
+}
+
+/** Aggregate ring value for the minimized badge: 0 when nothing is running. */
+function activeTransferProgress(rows: readonly RemoteDesktopTransferRow[]): {
+  active: number;
+  progress: number;
+} {
+  const running = rows.filter((row) => row.status === 'transferring');
+  if (running.length === 0) return { active: 0, progress: 0 };
+  const total = running.reduce((sum, row) => sum + row.progress, 0);
+  return { active: running.length, progress: Math.round(total / running.length) };
 }
 
 export function RemoteDesktopPanel({
@@ -249,6 +267,7 @@ export function RemoteDesktopPanel({
   const [transferError, setTransferError] = useState<string | null>(null);
   const [fetchPath, setFetchPath] = useState('');
   const [filePanelOpen, setFilePanelOpen] = useState(false);
+  const [fileDrawerMinimized, setFileDrawerMinimized] = useState(false);
   const [directoryPickerOpen, setDirectoryPickerOpen] = useState(false);
   const [destinationDirectory, setDestinationDirectory] = useState('');
   const [fileDropActive, setFileDropActive] = useState(false);
@@ -1273,6 +1292,35 @@ export function RemoteDesktopPanel({
     )));
   };
 
+  /**
+   * Turn the percentage the upload reports into a rate. Only a file whose size
+   * is known can produce one; a fetch reports progress without a size and
+   * simply shows none rather than an invented number.
+   */
+  const updateTransferProgress = (id: string, progress: number) => {
+    setTransfers((current) => current.map((row) => {
+      if (row.id !== id) return row;
+      const now = Date.now();
+      if (!row.sizeBytes) return { ...row, progress };
+      const bytes = row.sizeBytes * (progress / 100);
+      const elapsed = now - (row.sampledAt ?? now);
+      if (elapsed < 250) return { ...row, progress };
+      const delta = bytes - (row.sampledBytes ?? 0);
+      const instant = delta > 0 ? (delta * 1000) / elapsed : 0;
+      // Smoothed so the figure is readable instead of twitching every tick.
+      const smoothed = row.bytesPerSecond
+        ? row.bytesPerSecond * 0.6 + instant * 0.4
+        : instant;
+      return {
+        ...row,
+        progress,
+        bytesPerSecond: smoothed,
+        sampledAt: now,
+        sampledBytes: bytes,
+      };
+    }));
+  };
+
   const sendFile = async (file: File) => {
     const id = crypto.randomUUID();
     const controller = new AbortController();
@@ -1283,6 +1331,9 @@ export function RemoteDesktopPanel({
       progress: 0,
       transport: DIRECT_FILE_TRANSFER_STATE.CONNECTING,
       status: 'transferring',
+      sizeBytes: file.size,
+      sampledAt: Date.now(),
+      sampledBytes: 0,
     }]);
     setTransferError(null);
     try {
@@ -1292,10 +1343,10 @@ export function RemoteDesktopPanel({
         file,
         ...(supportsDirectoryTransfer && destinationDirectory ? { destinationDirectory } : {}),
         signal: controller.signal,
-        onProgress: (progress) => updateTransfer(id, { progress }),
+        onProgress: (progress) => updateTransferProgress(id, progress),
         onMode: (transport) => updateTransfer(id, { transport }),
       });
-      updateTransfer(id, { progress: 100, status: 'done' });
+      updateTransfer(id, { progress: 100, status: 'done', bytesPerSecond: undefined });
     } catch (error) {
       if (isFileUploadCanceled(error)) {
         updateTransfer(id, { status: 'canceled' });
@@ -1879,21 +1930,70 @@ export function RemoteDesktopPanel({
           </div>
         </div>
 
-        {filePanelOpen && (
+        {filePanelOpen && fileDrawerMinimized && (() => {
+          // Minimized to the corner of the window it belongs to, still showing
+          // what it is doing: a ring rather than a number, because the point of
+          // minimizing is to stop reading and keep watching.
+          const { active, progress } = activeTransferProgress(transfers);
+          const circumference = 2 * Math.PI * 13;
+          return (
+            <button
+              type="button"
+              class="remote-desktop-file-badge"
+              aria-label={active > 0
+                ? t('remote_desktop.transfers_running', { count: active, progress })
+                : t('remote_desktop.restore_files')}
+              title={active > 0
+                ? t('remote_desktop.transfers_running', { count: active, progress })
+                : t('remote_desktop.restore_files')}
+              onClick={() => setFileDrawerMinimized(false)}
+            >
+              <svg viewBox="0 0 32 32" aria-hidden="true">
+                <circle class="remote-desktop-file-badge-track" cx="16" cy="16" r="13" />
+                {active > 0 && (
+                  <circle
+                    class="remote-desktop-file-badge-ring"
+                    cx="16"
+                    cy="16"
+                    r="13"
+                    style={{
+                      strokeDasharray: `${circumference}`,
+                      strokeDashoffset: `${circumference * (1 - progress / 100)}`,
+                    }}
+                  />
+                )}
+              </svg>
+              <span aria-hidden="true">{active > 0 ? `${progress}%` : '⇱'}</span>
+            </button>
+          );
+        })()}
+
+        {filePanelOpen && !fileDrawerMinimized && (
           <aside class="remote-desktop-file-drawer" aria-label={t('remote_desktop.files')}>
             <div class="remote-desktop-file-drawer-head">
               <div>
                 <strong>{t('remote_desktop.files')}</strong>
                 <span>{t('remote_desktop.file_transfer_hint')}</span>
               </div>
-              <button
-                type="button"
-                aria-label={t('remote_desktop.close_files')}
-                onClick={() => {
-                  setDirectoryPickerOpen(false);
-                  setFilePanelOpen(false);
-                }}
-              >×</button>
+              <div class="remote-desktop-file-drawer-actions">
+                <button
+                  type="button"
+                  aria-label={t('remote_desktop.minimize_files')}
+                  title={t('remote_desktop.minimize_files')}
+                  onClick={() => {
+                    setDirectoryPickerOpen(false);
+                    setFileDrawerMinimized(true);
+                  }}
+                >—</button>
+                <button
+                  type="button"
+                  aria-label={t('remote_desktop.close_files')}
+                  onClick={() => {
+                    setDirectoryPickerOpen(false);
+                    setFilePanelOpen(false);
+                  }}
+                >×</button>
+              </div>
             </div>
 
             {supportsDirectoryTransfer ? (
@@ -1979,6 +2079,13 @@ export function RemoteDesktopPanel({
                     max={100}
                     aria-label={t('remote_desktop.transfer_progress', { progress: transfer.progress })}
                   />
+                  <span class="remote-desktop-transfer-meta">
+                    {transfer.progress}%
+                    {transfer.status === 'transferring' && transfer.bytesPerSecond
+                      ? ` · ${formatByteRate(transfer.bytesPerSecond)}`
+                      : ''}
+                    {transfer.sizeBytes ? ` · ${formatByteSize(transfer.sizeBytes)}` : ''}
+                  </span>
                   <span>{t(`remote_desktop.transfer_status_${transfer.status}`)}</span>
                   {transfer.status === 'transferring' && (
                     <button

@@ -3093,6 +3093,9 @@
       "select_display": "Elige primero una pantalla: no hay ninguna seleccionada a la que dirigir la entrada.",
       "input_unavailable": "El nodo no puede alcanzar ahora mismo el escritorio que recibe la entrada."
     },
-    "pointer_moves": "movimientos del puntero: {{count}}"
+    "pointer_moves": "movimientos del puntero: {{count}}",
+    "minimize_files": "Minimizar transferencias",
+    "restore_files": "Mostrar transferencias",
+    "transfers_running": "{{count}} transferencia(s) · {{progress}}%"
   }
 }

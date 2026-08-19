@@ -3092,6 +3092,9 @@
       "select_display": "先にディスプレイを選んでください。入力先がありません。",
       "input_unavailable": "ノードが今、入力を受け取るデスクトップに到達できません。"
     },
-    "pointer_moves": "ポインタ移動: {{count}}"
+    "pointer_moves": "ポインタ移動: {{count}}",
+    "minimize_files": "転送を最小化",
+    "restore_files": "転送を表示",
+    "transfers_running": "{{count}} 件の転送 · {{progress}}%"
   }
 }

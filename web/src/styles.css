@@ -8029,6 +8029,59 @@ button.quick-agent-delegation-preset.active {
   opacity: .45;
 }
 
+.remote-desktop-file-badge {
+  position: absolute;
+  right: 14px;
+  bottom: 14px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 44px;
+  height: 44px;
+  padding: 0;
+  color: #d9edff;
+  background: rgb(5 23 38 / 88%);
+  border: 1px solid rgb(99 201 255 / 45%);
+  border-radius: 50%;
+  box-shadow: 0 6px 18px rgb(2 12 22 / 55%);
+  font-size: 11px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.remote-desktop-file-badge svg {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  transform: rotate(-90deg);
+}
+
+.remote-desktop-file-badge-track {
+  fill: none;
+  stroke: rgb(99 201 255 / 22%);
+  stroke-width: 3;
+}
+
+.remote-desktop-file-badge-ring {
+  fill: none;
+  stroke: #57a9ff;
+  stroke-width: 3;
+  stroke-linecap: round;
+  transition: stroke-dashoffset 200ms linear;
+}
+
+.remote-desktop-file-drawer-actions {
+  display: flex;
+  gap: 4px;
+}
+
+.remote-desktop-transfer-meta {
+  color: #9bdfff;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
 .remote-desktop-input-blocked {
   color: #ffb057;
 }

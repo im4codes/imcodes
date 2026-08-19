@@ -3093,6 +3093,9 @@
       "select_display": "請先選擇一個顯示器，否則輸入沒有目標。",
       "input_unavailable": "節點暫時無法存取目前接收輸入的桌面。"
     },
-    "pointer_moves": "指標移動：{{count}}"
+    "pointer_moves": "指標移動：{{count}}",
+    "minimize_files": "最小化傳輸視窗",
+    "restore_files": "展開傳輸視窗",
+    "transfers_running": "{{count}} 個傳輸 · {{progress}}%"
   }
 }

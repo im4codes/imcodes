@@ -3092,6 +3092,9 @@
       "select_display": "먼저 디스플레이를 선택하세요. 입력을 보낼 대상이 없습니다.",
       "input_unavailable": "노드가 지금 입력을 받는 데스크톱에 접근할 수 없습니다."
     },
-    "pointer_moves": "포인터 이동: {{count}}"
+    "pointer_moves": "포인터 이동: {{count}}",
+    "minimize_files": "전송 최소화",
+    "restore_files": "전송 표시",
+    "transfers_running": "전송 {{count}}건 · {{progress}}%"
   }
 }

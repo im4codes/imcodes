@@ -3093,6 +3093,9 @@
       "select_display": "Pick a display first: nothing is selected to aim input at.",
       "input_unavailable": "The node cannot reach the desktop that receives input right now."
     },
-    "pointer_moves": "pointer moves: {{count}}"
+    "pointer_moves": "pointer moves: {{count}}",
+    "minimize_files": "Minimize transfers",
+    "restore_files": "Show transfers",
+    "transfers_running": "{{count}} transfer(s) · {{progress}}%"
   }
 }

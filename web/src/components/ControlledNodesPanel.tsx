@@ -19,6 +19,7 @@ import {
 } from '../api/machines.js';
 import { CONTROLLED_NODE_AUTO_UNLOCK_CAPABILITY } from '@shared/controlled-node-auto-unlock.js';
 import { normalizeMachineDisplayName } from '@shared/machine-reference.js';
+import { formatByteSize } from '../util/byte-size.js';
 import { useMachines } from '../hooks/useMachines.js';
 import { isNative } from '../native.js';
 import { ShareSessionDialog } from './ShareSessionDialog.js';
@@ -43,13 +44,6 @@ function canConfigureAutoUnlock(machine: MachineListItem): boolean {
  * manual refresh.
  */
 export const CONTROLLED_NODE_PRESENCE_REFRESH_MS = 5_000;
-
-function formatByteSize(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
-}
 
 function formatExpiryTime(expiresAt: number, locale: string): string {
   try {
