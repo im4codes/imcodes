@@ -821,16 +821,33 @@ const contracts: Contract[] = [
     name: 'a dead idle pipe cold-starts a replacement instead of failing the session',
     guards: [
       {
+        // A settled start with no live pipe is retired, so it cannot stand in
+        // for a worker that is not there.
         path: 'src/node/remote-desktop-worker-host.ts',
-        needle: 'silent no-op and report success with no worker behind it.\n      this.startPromise = null;',
+        needle: 'later start a silent no-op that reports success with no worker.\n          this.startPromise = null;',
       },
       {
         path: 'src/node/remote-desktop-worker-host.ts',
         needle: 'if (recoverIdlePrepare && (!this.socket || this.socket.destroyed)) {',
       },
       {
+        // The recovery is verified: a replacement that never came up drops the
+        // authority instead of leaving it tracked forever.
         path: 'src/node/remote-desktop-worker-host.ts',
-        needle: 'await new Promise<void>((closed) => previous.close(() => closed()));',
+        needle: "throw new Error('remote_desktop_worker_recovery_failed');",
+        minimum: 2,
+      },
+      {
+        // One cold start at a time: the memo is set with no await after the
+        // check that decides to start.
+        path: 'src/node/remote-desktop-worker-host.ts',
+        needle: 'const attempt = this.startPromise ?? this.beginWorkerStart(forceSecureConsole);\n    this.startPromise = attempt;',
+      },
+      {
+        // Handing the listener back never waits on connections that may never
+        // end.
+        path: 'src/node/remote-desktop-worker-host.ts',
+        needle: 'for (const pending of this.pendingHelloSockets) pending.destroy();',
       },
     ],
   },
@@ -1321,7 +1338,7 @@ const mutations: Mutation[] = [
     name: 'let a settled start promise stand in for a live worker',
     contract: 'a dead idle pipe cold-starts a replacement instead of failing the session',
     path: 'src/node/remote-desktop-worker-host.ts',
-    needle: 'silent no-op and report success with no worker behind it.\n      this.startPromise = null;',
+    needle: 'later start a silent no-op that reports success with no worker.\n          this.startPromise = null;',
   },
   {
     name: 'apply the stall rule before media has started',

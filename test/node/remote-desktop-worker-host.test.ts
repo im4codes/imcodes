@@ -960,6 +960,166 @@ describe('remote desktop worker artifact and IPC host', () => {
     expect((host as unknown as { socket: net.Socket }).socket).not.toBe(staleSocket);
   });
 
+  it('drops the authority when the replacement worker never comes up', async () => {
+    // Without this, the session stays in `tracked` forever: the Server has
+    // already ended it and will never send STOP, so nothing untracks it, its
+    // capability is never wiped, and every later PREPARE sees a busy host and
+    // skips this very recovery.
+    const temp = await mkdtemp(join(tmpdir(), 'imcodes-rd-host-recovery-fail-'));
+    cleanup.push(() => rm(temp, { recursive: true, force: true }));
+    const pipePath = join(temp, 'worker.sock');
+    const received: RemoteDesktopDaemonMessage[] = [];
+    const host = new RemoteDesktopWorkerHost((message) => received.push(message), {
+      ...trustedHostOptions,
+      platform: 'win32',
+      artifact,
+      pipePath,
+      allowPipeClients: () => {},
+      launch: vi.fn(),
+    });
+    cleanup.push(() => host.close());
+    const internals = host as unknown as {
+      ensureStarted(force?: boolean): Promise<void>;
+      tracked: Map<string, unknown>;
+      socket: net.Socket | null;
+    };
+    // Both starts report success with nothing behind them.
+    vi.spyOn(internals, 'ensureStarted').mockImplementation(async () => {
+      internals.socket = null;
+    });
+
+    await expect(host.handle({
+      type: REMOTE_DESKTOP_MSG.PREPARE,
+      requestId,
+      sessionId,
+      capability,
+      expiresAt: Date.now() + 60_000,
+      leaseExpiresAt: Date.now() + 15_000,
+      daemonGeneration: 7,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
+      inputEpoch: 1,
+      iceServers: ['stun:stun.example.test:3478'],
+    })).rejects.toThrow(/recovery_failed/);
+    expect(internals.tracked.size).toBe(0);
+  });
+
+  it('starts one worker when two sessions are admitted at the same time', async () => {
+    // `handle()` runs once per inbound message with no serialization, so the
+    // check that decides to cold start and the memo that records it must be set
+    // without an await in between — or both callers tear down the listener and
+    // launch their own worker.
+    const temp = await mkdtemp(join(tmpdir(), 'imcodes-rd-host-single-flight-'));
+    cleanup.push(() => rm(temp, { recursive: true, force: true }));
+    const pipePath = join(temp, 'worker.sock');
+    const helpers: net.Socket[] = [];
+    const launch = vi.fn((_executable: string, argsLine: string) => {
+      const args = quotedArgs(argsLine);
+      const helper = net.createConnection(pipePath, () => {
+        helper.write(`${JSON.stringify({
+          type: REMOTE_DESKTOP_WORKER_HELLO_TYPE,
+          ipcVersion: REMOTE_DESKTOP_WORKER_IPC_VERSION,
+          nonce: args[3],
+          pid: 60 + helpers.length,
+        })}\n`);
+      });
+      helper.setEncoding('utf8');
+      helper.on('data', () => {});
+      helpers.push(helper);
+    });
+    const host = new RemoteDesktopWorkerHost(() => {}, {
+      ...trustedHostOptions,
+      platform: 'win32',
+      artifact,
+      pipePath,
+      allowPipeClients: () => {},
+      launch,
+    });
+    cleanup.push(() => {
+      host.close();
+      for (const helper of helpers) helper.destroy();
+    });
+    const prepare = (suffix: string) => ({
+      type: REMOTE_DESKTOP_MSG.PREPARE,
+      requestId: `request_1234567${suffix}`,
+      sessionId: `session_1234567${suffix}`,
+      capability: suffix.repeat(43),
+      expiresAt: Date.now() + 60_000,
+      leaseExpiresAt: Date.now() + 15_000,
+      daemonGeneration: 7,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
+      inputEpoch: 1,
+      iceServers: ['stun:stun.example.test:3478'],
+    } as const);
+
+    const [first, second] = await Promise.all([
+      host.handle(prepare('a')),
+      host.handle(prepare('b')),
+    ]);
+    expect(first).toBe(true);
+    expect(second).toBe(true);
+    expect(launch).toHaveBeenCalledTimes(1);
+    expect(helpers).toHaveLength(1);
+  });
+
+  it('drops a connection that never finishes the handshake', async () => {
+    // The pipe admits any authenticated local process and the hello timer is an
+    // idle timer, so an unfinished handshake must still be bounded — otherwise
+    // it holds the listener's connection count up and the next start with it.
+    const temp = await mkdtemp(join(tmpdir(), 'imcodes-rd-host-handshake-'));
+    cleanup.push(() => rm(temp, { recursive: true, force: true }));
+    const pipePath = join(temp, 'worker.sock');
+    const silent: net.Socket[] = [];
+    const tricklers: ReturnType<typeof setInterval>[] = [];
+    cleanup.push(() => { for (const timer of tricklers) clearInterval(timer); });
+    const launch = vi.fn(() => {
+      const socket = net.createConnection(pipePath, () => {
+        // Trickles a byte well inside the idle window and never completes a
+        // line: the inactivity timer alone never fires, so only a deadline on
+        // the whole handshake can end this.
+        socket.write('{');
+        const timer = setInterval(() => {
+          if (!socket.destroyed) socket.write(' ');
+        }, 200);
+        timer.unref?.();
+        tricklers.push(timer);
+      });
+      socket.on('error', () => {});
+      silent.push(socket);
+    });
+    const host = new RemoteDesktopWorkerHost(() => {}, {
+      ...trustedHostOptions,
+      platform: 'win32',
+      artifact,
+      pipePath,
+      allowPipeClients: () => {},
+      launch,
+      connectTimeoutMs: 1_000,
+    });
+    cleanup.push(() => {
+      host.close();
+      for (const socket of silent) socket.destroy();
+    });
+    const internals = host as unknown as { pendingHelloSockets: Set<net.Socket> };
+
+    await expect(host.handle({
+      type: REMOTE_DESKTOP_MSG.PREPARE,
+      requestId,
+      sessionId,
+      capability,
+      expiresAt: Date.now() + 60_000,
+      leaseExpiresAt: Date.now() + 15_000,
+      daemonGeneration: 7,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
+      inputEpoch: 1,
+      iceServers: ['stun:stun.example.test:3478'],
+    })).rejects.toThrow();
+    // The half-open connection is torn down on its own deadline rather than
+    // left holding the listener.
+    await vi.waitFor(() => expect(internals.pendingHelloSockets.size).toBe(0),
+      { timeout: 6_000, interval: 50 });
+    expect(silent[0]?.destroyed).toBe(true);
+  });
+
   it('recycles an idle warm worker before a bounded browser reconnect', async () => {
     const temp = await mkdtemp(join(tmpdir(), 'imcodes-rd-host-reconnect-'));
     cleanup.push(() => rm(temp, { recursive: true, force: true }));

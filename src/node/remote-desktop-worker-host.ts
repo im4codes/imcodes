@@ -1,7 +1,6 @@
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { spawn } from 'node:child_process';
-import { existsSync, lstatSync, readFileSync, readdirSync } from 'node:fs';
-import { rm } from 'node:fs/promises';
+import { existsSync, lstatSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import net from 'node:net';
 import { dirname, join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -238,6 +237,12 @@ export class RemoteDesktopWorkerHost {
   private server: net.Server | null = null;
   private socket: net.Socket | null = null;
   private startPromise: Promise<void> | null = null;
+  /** Identity of the in-flight start, so only it can retire its own memo. */
+  private startToken: object | null = null;
+  /** Accepted connections that have not completed the handshake yet. */
+  private readonly pendingHelloSockets = new Set<net.Socket>();
+  /** Which start produced a promoted socket, so its loss retires only its own. */
+  private readonly socketStartToken = new WeakMap<net.Socket, object>();
   private virtualDisplayController: VirtualDisplayControllerProcess | null = null;
   private virtualDisplayStartPromise: Promise<void> | null = null;
   private virtualDisplayGeneration = 0;
@@ -361,6 +366,14 @@ export class RemoteDesktopWorkerHost {
         this.untrack(parsed.value.sessionId);
         await this.ensureStarted();
         this.track(parsed.value);
+        if (!this.socket || this.socket.destroyed) {
+          // The replacement did not come up. Drop the authority before giving
+          // up: a tracked session nobody will ever stop again would make every
+          // later PREPARE look like a busy host, disabling this very recovery
+          // for good and leaving its capability unwiped.
+          this.untrack(parsed.value.sessionId);
+          throw new Error('remote_desktop_worker_recovery_failed');
+        }
       }
     } else if (!this.socket || this.socket.destroyed) {
       return false;
@@ -482,31 +495,65 @@ export class RemoteDesktopWorkerHost {
     });
   }
 
+  /**
+   * At most one cold start runs at a time.
+   *
+   * The memo is the mutex: the check below and the assignment that follows it
+   * happen with no await in between, so two inbound messages arriving together
+   * cannot each tear down the listener and launch a worker. A settled attempt
+   * whose pipe is already gone is retired only by the caller that awaited that
+   * exact attempt, so retiring it can never clobber a fresh start someone else
+   * has begun.
+   */
   private async ensureStarted(forceSecureConsole = false): Promise<void> {
     if (this.socket && !this.socket.destroyed) return;
-    if (this.startPromise) {
-      await this.startPromise;
+    const inFlight = this.startPromise;
+    if (inFlight) {
+      try {
+        await inFlight;
+      } finally {
+        if (this.startPromise === inFlight
+          && !(this.socket && !this.socket.destroyed)) {
+          // Settled, with no live pipe behind it. Keeping it would make every
+          // later start a silent no-op that reports success with no worker.
+          this.startPromise = null;
+        }
+      }
       if (this.socket && !this.socket.destroyed) return;
-      // The start being awaited already finished, and the pipe it produced is
-      // gone. Keeping that settled promise would make every later start a
-      // silent no-op and report success with no worker behind it.
-      this.startPromise = null;
     }
-    if (!this.artifact) throw new Error('remote_desktop_worker_unavailable');
+    const attempt = this.startPromise ?? this.beginWorkerStart(forceSecureConsole);
+    this.startPromise = attempt;
+    await attempt;
+  }
+
+  private beginWorkerStart(forceSecureConsole: boolean): Promise<void> {
+    if (!this.artifact) {
+      return Promise.reject(new Error('remote_desktop_worker_unavailable'));
+    }
     // A previous start may still own the listening pipe: hand it back before
-    // listening again, or the cold start fails on its own leftovers. An
-    // already-accepted worker socket is unaffected by closing the listener.
+    // listening again, or the cold start fails on its own leftovers. Closing
+    // the listener is not awaited — that callback waits for every accepted
+    // connection to end, and a client that never finishes the handshake would
+    // hold this start hostage before its own deadline is even armed. Those
+    // half-open connections are dropped here instead.
     if (this.server) {
       const previous = this.server;
       this.server = null;
-      await new Promise<void>((closed) => previous.close(() => closed()));
+      previous.close();
+      for (const pending of this.pendingHelloSockets) pending.destroy();
+      this.pendingHelloSockets.clear();
     }
     if (!(this.platform === 'win32' && this.pipePath.startsWith('\\\\.\\pipe\\'))) {
       // Windows named pipes disappear with their handle; a unix socket path
-      // does not, and the stale file would refuse the new listener.
-      await rm(this.pipePath, { force: true }).catch(() => {});
+      // does not, and the stale file would refuse the new listener. Removed
+      // synchronously so this whole start stays free of await points.
+      try { rmSync(this.pipePath, { force: true }); } catch { /* fresh path */ }
     }
-    this.startPromise = new Promise<void>((resolveStarted, rejectStarted) => {
+    // Identity for this attempt, so a failure can only retire its own memo and
+    // never a start that has since replaced it.
+    const token = {};
+    this.startToken = token;
+    return new Promise<void>((resolveStarted, rejectStarted) => {
       let settled = false;
       const finish = (error?: Error) => {
         if (settled) return;
@@ -515,7 +562,10 @@ export class RemoteDesktopWorkerHost {
         if (error) {
           this.server?.close();
           this.server = null;
-          this.startPromise = null;
+          if (this.startToken === token) {
+            this.startPromise = null;
+            this.startToken = null;
+          }
           rejectStarted(error);
         } else {
           resolveStarted();
@@ -549,12 +599,24 @@ export class RemoteDesktopWorkerHost {
         })();
       });
     });
-    return await this.startPromise;
   }
 
   private accept(socket: net.Socket, ready: () => void): void {
     socket.setEncoding('utf8');
     socket.setTimeout(HELLO_TIMEOUT_MS, () => socket.destroy());
+    // The idle timeout above restarts on every byte, and the pipe admits any
+    // authenticated local process, so a client that trickles data could hold an
+    // accepted connection for as long as it liked — keeping the listener's
+    // connection count above zero and this host's handshake budget open. Bound
+    // the whole handshake, not just the gaps in it.
+    this.pendingHelloSockets.add(socket);
+    const handshakeDeadline = setTimeout(() => socket.destroy(), HELLO_TIMEOUT_MS);
+    handshakeDeadline.unref?.();
+    const finishHandshake = () => {
+      clearTimeout(handshakeDeadline);
+      this.pendingHelloSockets.delete(socket);
+    };
+    socket.once('close', finishHandshake);
     let helloBuffer = '';
     const onHello = (chunk: string | Buffer) => {
       helloBuffer += String(chunk);
@@ -580,8 +642,10 @@ export class RemoteDesktopWorkerHost {
       const remainder = helloBuffer.slice(newline + 1);
       socket.off('data', onHello);
       socket.setTimeout(0);
+      finishHandshake();
       if (this.socket && !this.socket.destroyed) this.socket.destroy();
       this.socket = socket;
+      if (this.startToken) this.socketStartToken.set(socket, this.startToken);
       this.buffer = '';
       socket.on('data', (data) => this.onData(String(data)));
       socket.on('close', () => this.onSocketLost(socket));
@@ -652,12 +716,22 @@ export class RemoteDesktopWorkerHost {
       && this.tracked.size === 1
       && this.tracked.has([...recoverableSessions][0]!);
     this.recoverableSocketLosses.delete(socket);
+    const token = this.socketStartToken.get(socket);
+    this.socketStartToken.delete(socket);
     if (this.socket !== socket) return;
     this.socket = null;
     this.buffer = '';
-    this.server?.close();
-    this.server = null;
-    this.startPromise = null;
+    if (token !== undefined && this.startToken !== token) {
+      // A newer start already owns the listener and the memo. This loss belongs
+      // to the generation before it, so tearing those down here would close a
+      // listener the replacement is still waiting on.
+      this.pendingHelloSockets.delete(socket);
+    } else {
+      this.server?.close();
+      this.server = null;
+      this.startPromise = null;
+      this.startToken = null;
+    }
     if (!this.closing && !recoverable) {
       // If the worker crashed before its normal release-all path, launch the
       // immutable verified binary once in release-only mode on the same active
