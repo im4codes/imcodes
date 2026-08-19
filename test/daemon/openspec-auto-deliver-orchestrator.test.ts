@@ -68,6 +68,7 @@ vi.mock('../../src/daemon/p2p-orchestrator.js', () => ({
 
 import {
   clearOpenSpecAutoDeliverRunsForTests,
+  describeOpenSpecAutoDeliverRunsForTests,
   dropOpenSpecAutoDeliverImplementationMarkerForTests,
   getOpenSpecAutoDeliverRun,
   getOpenSpecAutoDeliverTransitionTarget,
@@ -118,8 +119,16 @@ function describeOrchestratorActivity(): string {
     .filter((msg) => !!msg?.projection)
     .map((msg) => `${msg.type}:${msg.projection?.status ?? '-'}/${msg.projection?.stage ?? '-'}`)
     .slice(-6);
+  // The stage matters most when nothing was sent at all: the idle handler
+  // matches a run by stage, so "which stage was it in" separates a slow worker
+  // from an edge that matched no branch and was dropped.
+  const runs = describeOpenSpecAutoDeliverRunsForTests()
+    .map((run) => `${run.status}${run.hasActiveCommand ? '' : ' (no active command)'}`
+      + `${run.acceptanceAuditStage ? ` audit=${run.acceptanceAuditStage}` : ''}`
+      + `${run.awaitingDispatch ? ' awaiting-dispatch' : ''}`);
   return `\nlast transport sends:\n  ${sends.join('\n  ') || '(none)'}`
-    + `\nlast projections: ${projections.join(', ') || '(none)'}`;
+    + `\nlast projections: ${projections.join(', ') || '(none)'}`
+    + `\nlive runs: ${runs.join(' | ') || '(none)'}`;
 }
 
 async function waitForSend(predicate: (msg: Record<string, unknown>) => boolean, maxMs = SEND_WAIT_MS): Promise<Record<string, unknown>> {

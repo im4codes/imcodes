@@ -4060,6 +4060,34 @@ export function getActiveOpenSpecAutoDeliverRunsBlockingDaemonUpgrade(): OpenSpe
     }));
 }
 
+/**
+ * Stage of every live run, for test diagnostics only.
+ *
+ * A session goes idle once per turn, and the idle handler matches a run by
+ * stage: an edge that lands while a run is between stages matches nothing and
+ * is not retried. When that happens the only visible symptom is a wait that
+ * times out having observed nothing at all, which says nothing about which
+ * stage the run was actually in. This makes that answerable at the point of
+ * failure rather than by re-running until it happens again.
+ */
+export function describeOpenSpecAutoDeliverRunsForTests(): Array<{
+  runId: string;
+  status: string;
+  session: string;
+  hasActiveCommand: boolean;
+  acceptanceAuditStage: string | null;
+  awaitingDispatch: boolean;
+}> {
+  return [...runsById.values()].map((run) => ({
+    runId: run.runId,
+    status: run.status,
+    session: run.targetImplementationSessionName,
+    hasActiveCommand: !!run.activeCommandId,
+    acceptanceAuditStage: run.activeAcceptanceAudit?.stage ?? null,
+    awaitingDispatch: run.activeImplementationPromptAwaitingDispatch === true,
+  }));
+}
+
 export function clearOpenSpecAutoDeliverRunsForTests(): void {
   for (const timer of auditPollTimers.values()) clearTimeout(timer);
   auditPollTimers.clear();
