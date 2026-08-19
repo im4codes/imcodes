@@ -212,7 +212,31 @@ describe('session-mgmt persistence routes', () => {
       'sonnet',
       'high',
       { provider: { mode: 'safe' } },
+      null,
     );
+  });
+
+  it('PUT /sessions/:name persists the service tier a node reports', async () => {
+    // Codex keeps its "Fast" tier on the thread, so a session that came back on
+    // it must survive the round trip to the database -- otherwise a viewer that
+    // reconnects is told the session is on the ordinary tier and never sees the
+    // warning that it is spending plan usage at 1.5x.
+    const app = await buildApp();
+    const res = await app.request('/api/server/srv-1/sessions/deck_proj_brain', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        projectName: 'proj',
+        projectRole: 'brain',
+        agentType: 'codex-sdk',
+        projectDir: '/tmp/proj',
+        state: 'idle',
+        serviceTier: 'priority',
+      }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(mockUpsertDbSession.mock.calls.at(-1)?.at(-1)).toBe('priority');
   });
 
   it('PUT /sessions/:name ignores known test sessions', async () => {
