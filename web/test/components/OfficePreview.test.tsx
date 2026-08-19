@@ -18,6 +18,16 @@ vi.mock('pdfjs-dist', () => ({
   getDocument: (...args: unknown[]) => pdfjsApi.getDocument(...args),
 }));
 
+// The real SheetJS escapes cell text, but the npm package is frozen at 0.18.5
+// (fixes ship only on the SheetJS CDN), so the component must not depend on it.
+// This mock returns markup verbatim to assert OUR sanitization does the work.
+const xlsxApi = vi.hoisted(() => ({ html: '' }));
+
+vi.mock('xlsx', () => ({
+  read: () => ({ SheetNames: ['Sheet1'], Sheets: { Sheet1: {} } }),
+  utils: { sheet_to_html: () => xlsxApi.html },
+}));
+
 function installCreateObjectURL(value: ((blob: Blob) => string) | undefined): void {
   Object.defineProperty(URL, 'createObjectURL', {
     configurable: true,
@@ -166,5 +176,34 @@ describe('OfficePreview PDF worker setup', () => {
 
     expect([...container.querySelectorAll('canvas')].map((canvas) => canvas.dataset.pdfPageNumber)).toEqual(['1', '2', '3']);
     expect([...container.querySelectorAll('canvas')].map((canvas) => canvas.style.width)).toEqual(['360px', '360px', '360px']);
+  });
+});
+
+describe('OfficePreview — XLSX sanitization', () => {
+  const XLSX_MIME = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+
+  afterEach(() => { cleanup(); });
+
+  it('strips scripts and event handlers from spreadsheet-derived markup', async () => {
+    xlsxApi.html = '<table><tr><td><script>window.__pwned = true;</script>'
+      + '<img src=x onerror="window.__pwned = true">cell</td></tr></table>';
+    const { default: OfficePreview } = await import('../../src/components/OfficePreview.js');
+    const { container } = render(<OfficePreview data="" mimeType={XLSX_MIME} path="/tmp/a.xlsx" />);
+
+    await waitFor(() => expect(container.querySelector('table')).not.toBeNull());
+    // A spreadsheet is attacker-controlled input rendered through
+    // dangerouslySetInnerHTML; neither vector may survive.
+    expect(container.querySelector('script')).toBeNull();
+    expect(container.querySelector('img')?.getAttribute('onerror') ?? null).toBeNull();
+    expect(container.innerHTML).not.toContain('__pwned');
+  });
+
+  it('keeps ordinary table content intact', async () => {
+    xlsxApi.html = '<table><tr><td>hello</td><td>42</td></tr></table>';
+    const { default: OfficePreview } = await import('../../src/components/OfficePreview.js');
+    const { container } = render(<OfficePreview data="" mimeType={XLSX_MIME} path="/tmp/a.xlsx" />);
+
+    await waitFor(() => expect(container.textContent).toContain('hello'));
+    expect(container.textContent).toContain('42');
   });
 });

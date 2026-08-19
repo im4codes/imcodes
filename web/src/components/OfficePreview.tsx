@@ -187,11 +187,22 @@ function XlsxPreview({ data }: { data: string }) {
     let cancelled = false;
     (async () => {
       try {
-        const XLSX = await import('xlsx');
+        const [XLSX, { default: DOMPurify }] = await Promise.all([
+          import('xlsx'),
+          import('dompurify'),
+        ]);
         const wb = XLSX.read(data, { type: 'base64' });
         const sheet = wb.Sheets[wb.SheetNames[0]];
         if (!sheet) { setError('Empty workbook'); return; }
-        const tableHtml = XLSX.utils.sheet_to_html(sheet, { editable: false });
+        // `sheet_to_html` builds markup out of attacker-controlled cell text and
+        // the result is injected with dangerouslySetInnerHTML below, so it is a
+        // direct XSS sink for any spreadsheet a user opens. The npm `xlsx`
+        // package is frozen at 0.18.5 (SheetJS publishes fixes only on its own
+        // CDN), so the escaping upstream cannot be relied on — sanitize here.
+        const tableHtml = DOMPurify.sanitize(
+          XLSX.utils.sheet_to_html(sheet, { editable: false }),
+          { USE_PROFILES: { html: true } },
+        );
         if (!cancelled) setHtml(tableHtml);
       } catch (e) {
         if (!cancelled) setError(`XLSX preview failed: ${e instanceof Error ? e.message : String(e)}`);
