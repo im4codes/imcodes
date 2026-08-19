@@ -2,6 +2,9 @@
 
 #include <dxgi.h>
 
+#include <algorithm>
+#include <vector>
+
 #include "test/gtest.h"
 
 namespace imcodes::rd {
@@ -247,6 +250,44 @@ TEST(WorkerPolicyTest, RequiresExplicitChoiceWhenSelectedDisplayDisappears) {
   EXPECT_FALSE(
       DisplaySelectionRequiresExplicitChoice(displays, "new-secondary"));
   EXPECT_FALSE(DisplaySelectionRequiresExplicitChoice(displays, ""));
+}
+
+TEST(WorkerPolicyTest, KeepsTheScreensOwnModeInTheOfferedList) {
+  // Drivers enumerate in their own order and repeat every size once per refresh
+  // rate and colour depth, so the list is deduplicated, sorted and only then
+  // trimmed — and the mode the screen is actually running is never the one
+  // dropped, whatever the driver reported.
+  std::vector<DisplayMode> modes{{1280, 720}, {1280, 720}, {1600, 900},
+                                 {320, 240},  {1024, 768}};
+  FinalizeDisplayModeList(&modes, 1366, 768);
+  ASSERT_EQ(modes.size(), 4u);
+  EXPECT_EQ(modes[0].width, 1600);
+  EXPECT_EQ(modes[1].width, 1366);  // the current mode, absent from the driver
+  EXPECT_EQ(modes[2].width, 1280);
+  EXPECT_EQ(modes[3].width, 1024);
+
+  // Beyond the cap the current mode still survives, at the cost of the
+  // smallest size that would otherwise have made it.
+  std::vector<DisplayMode> many;
+  for (size_t index = 0; index < kMaxDisplayModes + 4; ++index) {
+    many.push_back({3840 - static_cast<int>(index) * 8, 2160});
+  }
+  FinalizeDisplayModeList(&many, 800, 600);
+  EXPECT_EQ(many.size(), kMaxDisplayModes);
+  EXPECT_TRUE(std::any_of(many.begin(), many.end(), [](const DisplayMode& mode) {
+    return mode.width == 800 && mode.height == 600;
+  }));
+
+  // A display whose driver reports nothing still offers what it is running.
+  std::vector<DisplayMode> empty;
+  FinalizeDisplayModeList(&empty, 1920, 1080);
+  ASSERT_EQ(empty.size(), 1u);
+  EXPECT_EQ(empty[0].height, 1080);
+
+  // A current mode outside the bounds is not smuggled in by being current.
+  std::vector<DisplayMode> tiny;
+  FinalizeDisplayModeList(&tiny, 320, 240);
+  EXPECT_TRUE(tiny.empty());
 }
 
 TEST(WorkerPolicyTest, BoundsDisplayModesInsteadOfEnumeratingThem) {

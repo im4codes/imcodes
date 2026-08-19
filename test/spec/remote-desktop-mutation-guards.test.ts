@@ -771,7 +771,12 @@ const contracts: Contract[] = [
     guards: [
       {
         path: 'native/windows-remote-desktop/display_capture.cc',
-        needle: 'EnumerateDisplayModes(info.device_name)',
+        needle: 'EnumerateDisplayModes(info.device_name, info.width, info.height)',
+      },
+      {
+        // The screen's own mode is never the one trimmed away.
+        path: 'native/windows-remote-desktop/worker_policy.cc',
+        needle: 'void FinalizeDisplayModeList(',
       },
       {
         path: 'native/windows-remote-desktop/peer_session.cc',

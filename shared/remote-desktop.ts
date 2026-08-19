@@ -205,7 +205,7 @@ export const REMOTE_DESKTOP_DISPLAY_MODE_LIMITS = {
   /** 640x480 is the smallest mode Windows drivers still offer. */
   MIN_EDGE: 480,
   MAX_EDGE: 16_384,
-  MAX_MODES: 24,
+  MAX_MODES: 32,
 } as const;
 
 /**

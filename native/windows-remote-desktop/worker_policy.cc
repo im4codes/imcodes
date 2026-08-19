@@ -223,6 +223,63 @@ bool DisplaySelectionRequiresExplicitChoice(
                       });
 }
 
+void FinalizeDisplayModeList(std::vector<DisplayMode>* modes,
+                             int current_width,
+                             int current_height) {
+  if (!modes) return;
+  const auto same_size = [](const DisplayMode& left, const DisplayMode& right) {
+    return left.width == right.width && left.height == right.height;
+  };
+  const DisplayMode current{current_width, current_height};
+  const bool current_allowed =
+      IsAllowedRemoteDisplayMode(current_width, current_height);
+  // Deduplicate defensively: enumeration order is the driver's business.
+  std::vector<DisplayMode> distinct;
+  for (const DisplayMode& mode : *modes) {
+    if (!IsAllowedRemoteDisplayMode(mode.width, mode.height)) continue;
+    if (std::any_of(distinct.begin(), distinct.end(),
+                    [&](const DisplayMode& kept) { return same_size(kept, mode); })) {
+      continue;
+    }
+    distinct.push_back(mode);
+  }
+  if (current_allowed &&
+      std::none_of(distinct.begin(), distinct.end(),
+                   [&](const DisplayMode& kept) { return same_size(kept, current); })) {
+    distinct.push_back(current);
+  }
+  std::sort(distinct.begin(), distinct.end(),
+            [](const DisplayMode& left, const DisplayMode& right) {
+              const int64_t left_area =
+                  static_cast<int64_t>(left.width) * left.height;
+              const int64_t right_area =
+                  static_cast<int64_t>(right.width) * right.height;
+              if (left_area != right_area) return left_area > right_area;
+              return left.width > right.width;
+            });
+  if (distinct.size() > kMaxDisplayModes) {
+    const bool current_kept =
+        current_allowed &&
+        std::any_of(distinct.begin(), distinct.begin() + kMaxDisplayModes,
+                    [&](const DisplayMode& kept) { return same_size(kept, current); });
+    distinct.resize(kMaxDisplayModes);
+    if (current_allowed && !current_kept) {
+      // The screen's own mode outranks the smallest one that made the cut.
+      distinct.back() = current;
+      std::sort(distinct.begin(), distinct.end(),
+                [](const DisplayMode& left, const DisplayMode& right) {
+                  const int64_t left_area =
+                      static_cast<int64_t>(left.width) * left.height;
+                  const int64_t right_area =
+                      static_cast<int64_t>(right.width) * right.height;
+                  if (left_area != right_area) return left_area > right_area;
+                  return left.width > right.width;
+                });
+    }
+  }
+  *modes = std::move(distinct);
+}
+
 bool IsAllowedRemoteDisplayMode(int width, int height) {
   // A bound, not a menu. Which resolutions exist is the driver's answer — a
   // machine with no monitor attached often offers exactly one, and pinning four

@@ -7997,6 +7997,11 @@ button.quick-agent-delegation-preset.active {
   font-size: 11px;
 }
 
+.remote-desktop-resolution-menu {
+  max-height: min(70vh, 520px);
+  overflow-y: auto;
+}
+
 .remote-desktop-resolution-note {
   display: block;
   padding: 4px 8px 2px;

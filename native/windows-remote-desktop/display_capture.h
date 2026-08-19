@@ -4,6 +4,8 @@
 #include <windows.h>
 #include <dxgi1_2.h>
 
+#include "third_party/imcodes_remote_desktop/worker_policy.h"
+
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -29,12 +31,6 @@ struct IDXGIOutput1;
 struct IDXGIOutputDuplication;
 
 namespace imcodes::rd {
-
-/** One resolution a display's driver actually offers. */
-struct DisplayMode {
-  int width = 0;
-  int height = 0;
-};
 
 struct DisplayInfo {
   std::string id;

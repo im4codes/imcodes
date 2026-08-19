@@ -153,33 +153,23 @@ libyuv::RotationMode LibyuvRotation(int degrees) {
  * a driver may enumerate hundreds of near-identical modes and the browser only
  * needs the distinct sizes an operator can pick.
  */
-std::vector<DisplayMode> EnumerateDisplayModes(const std::wstring& device_name) {
+std::vector<DisplayMode> EnumerateDisplayModes(const std::wstring& device_name,
+                                              int current_width,
+                                              int current_height) {
   std::vector<DisplayMode> modes;
   if (device_name.empty()) return modes;
   DEVMODEW mode{};
   mode.dmSize = sizeof(mode);
+  // Walks the whole enumeration rather than stopping at the first N: order is
+  // the driver's business, so trimming happens after sorting.
   for (DWORD index = 0;
+       index < kMaxEnumeratedDisplayModes &&
        EnumDisplaySettingsExW(device_name.c_str(), index, &mode, 0);
        ++index) {
-    const int width = static_cast<int>(mode.dmPelsWidth);
-    const int height = static_cast<int>(mode.dmPelsHeight);
-    if (!IsAllowedRemoteDisplayMode(width, height)) continue;
-    const bool known = std::any_of(modes.begin(), modes.end(),
-                                   [&](const DisplayMode& candidate) {
-                                     return candidate.width == width &&
-                                            candidate.height == height;
-                                   });
-    if (known) continue;
-    modes.push_back({width, height});
-    if (modes.size() >= kMaxDisplayModes) break;
+    modes.push_back({static_cast<int>(mode.dmPelsWidth),
+                     static_cast<int>(mode.dmPelsHeight)});
   }
-  std::sort(modes.begin(), modes.end(),
-            [](const DisplayMode& left, const DisplayMode& right) {
-              const int64_t left_area = static_cast<int64_t>(left.width) * left.height;
-              const int64_t right_area = static_cast<int64_t>(right.width) * right.height;
-              if (left_area != right_area) return left_area > right_area;
-              return left.width > right.width;
-            });
+  FinalizeDisplayModeList(&modes, current_width, current_height);
   return modes;
 }
 
@@ -222,7 +212,8 @@ std::vector<DisplayInfo> EnumerateDisplays() {
         info.dpi_scale = std::clamp(static_cast<double>(dpi_x) / 96.0,
                                     0.5, 8.0);
       }
-      info.modes = EnumerateDisplayModes(info.device_name);
+      info.modes =
+          EnumerateDisplayModes(info.device_name, info.width, info.height);
       if (info.width > 0 && info.height > 0) displays.push_back(info);
     }
   }

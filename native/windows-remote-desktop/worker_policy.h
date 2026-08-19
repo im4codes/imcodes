@@ -212,6 +212,26 @@ bool DisplaySelectionRequiresExplicitChoice(
     const std::vector<DisplaySelectionCandidate>& candidates,
     const std::string& previous_id);
 
+/** One resolution a display's driver actually offers. */
+struct DisplayMode {
+  int width = 0;
+  int height = 0;
+};
+
+/**
+ * Turn a driver's raw enumeration into the list a menu should offer: distinct
+ * sizes, largest first, bounded — and always including the mode the display is
+ * running right now, which a plain "keep the first N" would happily drop and
+ * leave the operator looking at a menu that does not contain their own screen.
+ */
+void FinalizeDisplayModeList(std::vector<DisplayMode>* modes,
+                             int current_width,
+                             int current_height);
+
+// How many raw driver modes are worth walking. Drivers enumerate one entry per
+// refresh rate and colour depth, so this is far above any real distinct count.
+inline constexpr size_t kMaxEnumeratedDisplayModes = 1024;
+
 bool IsAllowedRemoteDisplayMode(int width, int height);
 
 // Bounds only: the offered resolutions come from the driver's own list.
@@ -219,7 +239,7 @@ inline constexpr int kMinRemoteDisplayEdge = 480;
 inline constexpr int kMaxRemoteDisplayEdge = 16'384;
 // Distinct sizes reported per display. Drivers enumerate hundreds of modes that
 // differ only in refresh rate or colour depth; an operator picks a size.
-inline constexpr size_t kMaxDisplayModes = 24;
+inline constexpr size_t kMaxDisplayModes = 32;
 bool IsAllowedRemoteDisplayScale(int percent);
 int RecommendedRemoteDisplayScale(int width, int height);
 // A browser may re-enable input only after presenting a decoded frame whose
