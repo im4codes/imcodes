@@ -72,6 +72,7 @@ import { CronManager } from './pages/CronManager.js';
 import { SharedContextManagementPanel } from './components/SharedContextManagementPanel.js';
 import { ControlledNodesPanel } from './components/ControlledNodesPanel.js';
 import { RemoteDesktopPanel } from './components/RemoteDesktopPanel.js';
+import { DaemonRemoteDesktopControl } from './components/DaemonRemoteDesktopControl.js';
 import type { MachineListItem } from './api/machines.js';
 import { ContextDiagnosticsPanel } from './components/ContextDiagnosticsPanel.js';
 import { NewUserGuide, type NewUserGuideStep } from './components/NewUserGuide.js';
@@ -5453,6 +5454,14 @@ export function App() {
                     {viewMode === 'chat' ? '⌨' : '💬'}
                   </button>
                 )}
+                <DaemonRemoteDesktopControl
+                  compact
+                  ws={wsRef.current}
+                  serverId={selectedServerId}
+                  serverName={selectedServerInfo?.name}
+                  daemonOnline={daemonOnline}
+                  onOpen={openRemoteDesktop}
+                />
                 <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 0, lineHeight: 1.2 }}>
                   <span class={`badge ${daemonBadgeState === 'online' ? 'badge-online' : daemonBadgeState === 'connecting' ? 'badge-connecting' : 'badge-offline'}`} style={{ fontSize: 10 }}>
                     {daemonBadgeState === 'online'
@@ -5982,6 +5991,13 @@ export function App() {
                       {daemonUpgradingLabel(daemonUpgrading, trans, formatDaemonVersionShort)}
                     </span>
                   )}
+                  <DaemonRemoteDesktopControl
+                    ws={wsRef.current}
+                    serverId={selectedServerId}
+                    serverName={selectedServerInfo?.name}
+                    daemonOnline={daemonOnline}
+                    onOpen={openRemoteDesktop}
+                  />
                   <button
                     style={{ fontSize: 10, color: '#38bdf8', background: 'none', border: '1px solid #334155', borderRadius: 4, padding: '1px 5px', cursor: 'pointer' }}
                     onClick={async () => {

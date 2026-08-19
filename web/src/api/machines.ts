@@ -26,6 +26,7 @@ import {
   type ControlledNodeOs,
 } from '@shared/controlled-node-artifacts.js';
 import { MACHINE_API_PATH } from '@shared/machine-reference.js';
+import { REMOTE_DESKTOP_CAPABILITY } from '@shared/remote-desktop.js';
 import { isMachineAccessRole, type MachineAccessRole } from '@shared/remote-exec.js';
 import {
   validateControlledNodeCapabilities,
@@ -41,6 +42,31 @@ import {
 export type { ControlledNodeArtifactArch, ControlledNodeOs };
 
 /** One controllable machine as shown in the composer picker. */
+/**
+ * A synthetic machine entry for the daemon's own host.
+ *
+ * The daemon is not a controlled node, so it has no row in the machine list —
+ * but `RemoteDesktopPanel` is keyed by `serverId` and needs a `MachineListItem`.
+ * The fields the panel gates on are asserted here because the daemon already
+ * proved them by advertising the remote-desktop capability, which it only does
+ * on Windows x64 with a verified worker installed.
+ */
+export function daemonRemoteDesktopMachine(
+  serverId: string,
+  displayName: string | null,
+): MachineListItem {
+  return {
+    serverId,
+    refName: serverId,
+    displayName: displayName ?? serverId,
+    os: 'win',
+    online: true,
+    execEnabled: true,
+    accessRole: 'owner',
+    capabilities: [REMOTE_DESKTOP_CAPABILITY],
+  };
+}
+
 export interface MachineListItem {
   serverId: string;
   refName: string;

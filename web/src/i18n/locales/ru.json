@@ -3100,6 +3100,16 @@
     "pointer_moves_seen": "получено движений: {{count}} (без координат {{unmapped}})",
     "minimize_files": "Свернуть передачи",
     "restore_files": "Показать передачи",
-    "transfers_running": "передач: {{count}} · {{progress}}%"
+    "transfers_running": "передач: {{count}} · {{progress}}%",
+    "daemon_control": "Удалённое управление",
+    "install_worker": "Включить удалённое управление",
+    "install_retry": "Повторить загрузку",
+    "installing": "Загрузка…",
+    "install_failed": "Не удалось установить компонент удалённого управления",
+    "install_error_unsupported_platform": "Для удалённого управления нужна Windows x64",
+    "install_error_not_bound": "Этот демон не привязан к серверу",
+    "install_error_download_failed": "Загрузка не удалась — проверьте соединение и повторите",
+    "install_error_verification_failed": "Загруженный компонент не прошёл проверку подписи",
+    "install_error_not_available": "На этом сервере пока нет компонента для этой платформы"
   }
 }

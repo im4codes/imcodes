@@ -150,6 +150,17 @@ vi.mock('../src/ws-client.js', () => ({
       wsInstances.push(this);
     }
 
+    // The real client always exposes the daemon capability snapshot; anything
+    // rendered from `daemon.hello` (remote control, for one) reads it on mount.
+    daemonCapabilitySnapshot: { capabilities: string[] } | null = null;
+    getDaemonCapabilitySnapshot(): { capabilities: string[] } | null {
+      return this.daemonCapabilitySnapshot;
+    }
+
+    onDaemonCapabilitySnapshot(_handler: (snapshot: unknown) => void): () => void {
+      return () => {};
+    }
+
     onMessage(handler: (message: any) => void): () => void {
       this.messageHandlers.push(handler);
       return () => {

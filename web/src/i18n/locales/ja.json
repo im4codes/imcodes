@@ -3100,6 +3100,16 @@
     "pointer_moves_seen": "受信した移動: {{count}}（マップ不可 {{unmapped}}）",
     "minimize_files": "転送を最小化",
     "restore_files": "転送を表示",
-    "transfers_running": "{{count}} 件の転送 · {{progress}}%"
+    "transfers_running": "{{count}} 件の転送 · {{progress}}%",
+    "daemon_control": "リモート操作",
+    "install_worker": "リモート操作を有効化",
+    "install_retry": "ダウンロードし直す",
+    "installing": "ダウンロード中…",
+    "install_failed": "リモート操作コンポーネントのインストールに失敗しました",
+    "install_error_unsupported_platform": "リモート操作には Windows x64 が必要です",
+    "install_error_not_bound": "このデーモンはサーバーに接続されていません",
+    "install_error_download_failed": "ダウンロードに失敗しました。接続を確認して再試行してください",
+    "install_error_verification_failed": "ダウンロードしたコンポーネントの署名検証に失敗しました",
+    "install_error_not_available": "このサーバーにはこのプラットフォーム向けのコンポーネントがまだありません"
   }
 }

@@ -3101,6 +3101,16 @@
     "pointer_moves_seen": "moves seen: {{count}} (unmapped {{unmapped}})",
     "minimize_files": "Minimize transfers",
     "restore_files": "Show transfers",
-    "transfers_running": "{{count}} transfer(s) · {{progress}}%"
+    "transfers_running": "{{count}} transfer(s) · {{progress}}%",
+    "daemon_control": "Remote control",
+    "install_worker": "Enable remote control",
+    "install_retry": "Retry download",
+    "installing": "Downloading…",
+    "install_failed": "Remote control install failed",
+    "install_error_unsupported_platform": "Remote control needs Windows x64",
+    "install_error_not_bound": "This daemon is not bound to a server",
+    "install_error_download_failed": "Download failed — check the connection and retry",
+    "install_error_verification_failed": "The downloaded component failed signature verification",
+    "install_error_not_available": "This server has no remote control component for this platform yet"
   }
 }

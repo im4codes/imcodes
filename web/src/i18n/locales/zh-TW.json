@@ -3101,6 +3101,16 @@
     "pointer_moves_seen": "收到移動：{{count}}（無法對應 {{unmapped}}）",
     "minimize_files": "最小化傳輸視窗",
     "restore_files": "展開傳輸視窗",
-    "transfers_running": "{{count}} 個傳輸 · {{progress}}%"
+    "transfers_running": "{{count}} 個傳輸 · {{progress}}%",
+    "daemon_control": "遠端控制",
+    "install_worker": "啟用遠端控制",
+    "install_retry": "重新下載",
+    "installing": "正在下載…",
+    "install_failed": "遠端控制元件安裝失敗",
+    "install_error_unsupported_platform": "遠端控制需要 Windows x64",
+    "install_error_not_bound": "此守護程式尚未綁定伺服器",
+    "install_error_download_failed": "下載失敗，請檢查網路後重試",
+    "install_error_verification_failed": "下載的元件簽章驗證未通過",
+    "install_error_not_available": "此伺服器尚無適用於此平台的遠端控制元件"
   }
 }
