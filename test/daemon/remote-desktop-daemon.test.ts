@@ -61,6 +61,7 @@ function fixture(overrides: Partial<DaemonRemoteDesktopDeps> & { installed?: boo
     };
   });
   const extractVirtualDisplay = vi.fn(async () => {});
+  const capturedSigners: string[] = [];
   const host = { handle: vi.fn(async () => true), close: vi.fn() };
   const deps: DaemonRemoteDesktopDeps = {
     send: (message) => { sent.push(message); },
@@ -68,6 +69,7 @@ function fixture(overrides: Partial<DaemonRemoteDesktopDeps> & { installed?: boo
     platform: 'win32',
     arch: 'x64',
     root,
+    trustedSignerSha256: 'a'.repeat(64),
     loadCredential: async () => ({
       serverUrl: 'https://example.test',
       serverId: 'server_1',
@@ -75,7 +77,10 @@ function fixture(overrides: Partial<DaemonRemoteDesktopDeps> & { installed?: boo
     }),
     downloadWorker: downloadWorker as unknown as DaemonRemoteDesktopDeps['downloadWorker'],
     extractVirtualDisplay,
-    resolveArtifact: () => resolved,
+    resolveArtifact: (_path: string, signer: string) => {
+      capturedSigners.push(signer);
+      return resolved;
+    },
     createHost: () => host,
     ...overrides,
   };
@@ -85,6 +90,7 @@ function fixture(overrides: Partial<DaemonRemoteDesktopDeps> & { installed?: boo
     capabilityChanges,
     downloadWorker,
     extractVirtualDisplay,
+    capturedSigners,
     host,
     states: () => sent
       .filter((message) => message.type === REMOTE_DESKTOP_INSTALL_MSG.STATE)
@@ -103,6 +109,38 @@ describe('DaemonRemoteDesktop', () => {
   it('offers nothing on Windows arm64, which has no worker build', () => {
     const f = fixture({ arch: 'arm64' });
     expect(f.remoteDesktop.capabilities()).toEqual([]);
+  });
+
+  it('still installs on an npm build, which carries no compiled publisher pin', async () => {
+    // Requiring the pin here would only disable the feature: the bundle comes
+    // from the very server that already drives this machine's agent sessions.
+    const f = fixture({ trustedSignerSha256: '', readInstalledSigner: () => 'b'.repeat(64) });
+    expect(f.remoteDesktop.supported()).toBe(true);
+    await f.remoteDesktop.install();
+    expect(f.remoteDesktop.capabilities()).toContain(REMOTE_DESKTOP_CAPABILITY);
+  });
+
+  it('verifies against the signer the bundle declares when there is no compiled pin', async () => {
+    const f = fixture({ trustedSignerSha256: '', readInstalledSigner: () => 'b'.repeat(64) });
+    await f.remoteDesktop.install();
+    expect(f.capturedSigners).toContain('b'.repeat(64));
+  });
+
+  it('prefers the compiled pin over whatever the bundle declares', async () => {
+    const f = fixture({ readInstalledSigner: () => 'b'.repeat(64) });
+    await f.remoteDesktop.install();
+    // A release build stays pinned; the bundle does not get to nominate itself.
+    expect(f.capturedSigners).toEqual(['a'.repeat(64), 'a'.repeat(64)]);
+  });
+
+  it('rejects a bundle that declares no signer at all', async () => {
+    const f = fixture({ trustedSignerSha256: '', readInstalledSigner: () => '' });
+    await f.remoteDesktop.install();
+    expect(f.sent.at(-1)).toMatchObject({
+      state: REMOTE_DESKTOP_INSTALL_STATE.FAILED,
+      error: REMOTE_DESKTOP_INSTALL_ERROR.VERIFICATION_FAILED,
+    });
+    expect(f.remoteDesktop.capabilities()).not.toContain(REMOTE_DESKTOP_CAPABILITY);
   });
 
   it('claims only installability until the worker is actually installed', () => {

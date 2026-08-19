@@ -1,4 +1,5 @@
 import { execFile } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
@@ -10,6 +11,7 @@ import { isRemoteDesktopFeatureEnabled } from '../../shared/remote-desktop-featu
 import {
   REMOTE_DESKTOP_VIRTUAL_DISPLAY_ARCHIVE_FILENAME,
   REMOTE_DESKTOP_WORKER_FILENAME,
+  REMOTE_DESKTOP_WORKER_MANIFEST_SUFFIX,
 } from '../../shared/remote-desktop-worker.js';
 import {
   REMOTE_DESKTOP_INSTALLABLE_CAPABILITY,
@@ -25,6 +27,7 @@ import {
 } from '../../shared/controlled-node-artifacts.js';
 import { dispatchRemoteDesktopCommand } from '../node/remote-desktop-dispatch.js';
 import {
+  REMOTE_DESKTOP_COMPILED_SIGNER_SHA256,
   RemoteDesktopWorkerHost,
   verifyRemoteDesktopWorkerArtifact,
   type VerifiedRemoteDesktopWorkerArtifact,
@@ -35,6 +38,7 @@ import { loadDaemonCredential, type DaemonCredential } from './machine-mcp-deps.
 import logger from '../util/logger.js';
 
 const execFileAsync = promisify(execFile);
+const SHA256_RE = /^[a-f0-9]{64}$/;
 
 /**
  * Where a normal daemon keeps the worker bundle.
@@ -66,12 +70,19 @@ export interface DaemonRemoteDesktopDeps {
   platform?: NodeJS.Platform;
   arch?: string;
   root?: string;
+  /** Compiled release trust anchor; empty in a build that has none. */
+  trustedSignerSha256?: string;
   loadCredential?: () => Promise<DaemonCredential | null>;
   downloadWorker?: typeof downloadControlledNodeRemoteDesktopWorker;
   fetchImpl?: typeof fetch;
   /** Extract the signed virtual-display archive next to the worker. */
   extractVirtualDisplay?: (archivePath: string, destination: string) => Promise<void>;
-  resolveArtifact?: (executablePath: string) => VerifiedRemoteDesktopWorkerArtifact | null;
+  resolveArtifact?: (
+    executablePath: string,
+    trustedSignerSha256: string,
+  ) => VerifiedRemoteDesktopWorkerArtifact | null;
+  /** The publisher the installed bundle declares for itself. */
+  readInstalledSigner?: (executablePath: string) => string;
   createHost?: (
     artifact: VerifiedRemoteDesktopWorkerArtifact,
     onMessage: (message: Record<string, unknown>) => void,
@@ -91,6 +102,9 @@ export class DaemonRemoteDesktop {
   private readonly platform: NodeJS.Platform;
   private readonly arch: string;
   private readonly root: string;
+  private readonly trustedSignerSha256: string;
+  /** The anchor that actually validated the installed bundle. */
+  private artifactSigner = '';
   private host: RemoteDesktopWorkerLike | null = null;
   private artifact: VerifiedRemoteDesktopWorkerArtifact | null = null;
   private installing: Promise<void> | null = null;
@@ -99,6 +113,7 @@ export class DaemonRemoteDesktop {
     this.platform = deps.platform ?? process.platform;
     this.arch = deps.arch ?? process.arch;
     this.root = deps.root ?? daemonRemoteDesktopRoot();
+    this.trustedSignerSha256 = deps.trustedSignerSha256 ?? REMOTE_DESKTOP_COMPILED_SIGNER_SHA256;
     this.artifact = this.supported() ? this.resolveArtifact() : null;
   }
 
@@ -231,10 +246,32 @@ export class DaemonRemoteDesktop {
     this.deps.onCapabilityChange?.();
   }
 
+  /**
+   * Verify what is installed, anchoring on the bundle's own declared signer when
+   * this build has no compiled pin.
+   *
+   * A release SEA pins the publisher at compile time and keeps doing so. A
+   * daemon installed from npm has no such pin, and requiring one would only
+   * disable the feature: the bundle comes from the very server that already
+   * drives this machine's agent sessions, so a compile-time pin adds no boundary
+   * that server could not already cross. Every other check still runs — exact
+   * directory contents, manifest and per-file hashes, one consistent signer
+   * across worker, driver and catalogue, and a real Authenticode verification of
+   * all three at launch.
+   */
   private resolveArtifact(): VerifiedRemoteDesktopWorkerArtifact | null {
     const executablePath = workerExecutablePath(this.root);
+    const signer = SHA256_RE.test(this.trustedSignerSha256)
+      ? this.trustedSignerSha256
+      : (this.deps.readInstalledSigner ?? installedWorkerSigner)(executablePath);
+    if (!SHA256_RE.test(signer)) return null;
     try {
-      return (this.deps.resolveArtifact ?? verifyRemoteDesktopWorkerArtifact)(executablePath);
+      const artifact = (this.deps.resolveArtifact ?? verifyRemoteDesktopWorkerArtifact)(
+        executablePath,
+        signer,
+      );
+      if (artifact) this.artifactSigner = signer;
+      return artifact;
     } catch {
       return null;
     }
@@ -248,7 +285,7 @@ export class DaemonRemoteDesktop {
       ? this.deps.createHost(artifact, onMessage)
       : new RemoteDesktopWorkerHost(
         (message) => onMessage(message as unknown as Record<string, unknown>),
-        { artifact, platform: this.platform },
+        { artifact, platform: this.platform, trustedSignerSha256: this.artifactSigner },
       );
     return this.host;
   }
@@ -264,6 +301,26 @@ export class DaemonRemoteDesktop {
   close(): void {
     this.host?.close();
     this.host = null;
+  }
+}
+
+/**
+ * The publisher the installed bundle declares for itself.
+ *
+ * This is not proof on its own — it is the value every other check is then held
+ * against: the virtual-display package must declare the same signer, and the
+ * launch path verifies the real Authenticode signature of the worker, driver and
+ * catalogue against it.
+ */
+function installedWorkerSigner(executablePath: string): string {
+  try {
+    const manifest: unknown = JSON.parse(
+      readFileSync(`${executablePath}${REMOTE_DESKTOP_WORKER_MANIFEST_SUFFIX}`, 'utf8'),
+    );
+    const signer = (manifest as { authenticodeSignerSha256?: unknown }).authenticodeSignerSha256;
+    return typeof signer === 'string' ? signer.trim().toLowerCase() : '';
+  } catch {
+    return '';
   }
 }
 
