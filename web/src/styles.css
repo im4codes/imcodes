@@ -9008,27 +9008,25 @@ button.quick-agent-delegation-preset.active {
     display: none;
   }
 
-  /* One instrument rail instead of four ragged wrapped rows: the controls stay
-     reachable by swiping, and the picture keeps the height they were eating.
-     The mask tells the thumb there is more to the sides without a scrollbar. */
+  /* Every control on screen, in full rows. Hiding half of them behind a swipe
+     bought nothing: in portrait the picture is limited by the phone's width, so
+     the height a taller toolbar takes comes out of the letterbox bars, never out
+     of the desktop being shown. */
   .remote-desktop-toolbar {
-    flex-wrap: nowrap;
-    gap: 8px;
+    flex-wrap: wrap;
+    gap: 7px;
     padding: 8px 10px;
-    padding-right: 22px;
-    overflow-x: auto;
-    overscroll-behavior-x: contain;
-    scrollbar-width: none;
-    scroll-snap-type: x proximity;
-    mask-image: linear-gradient(90deg, transparent 0, #000 14px, #000 calc(100% - 26px), transparent 100%);
+    overflow: visible;
   }
 
-  .remote-desktop-toolbar::-webkit-scrollbar {
-    display: none;
-  }
-
+  /* Groups stretch to close the row, and their segments share that width, so a
+     row ends flush instead of trailing off into ragged space. */
   .remote-desktop-toolbar > * {
-    scroll-snap-align: start;
+    flex: 1 1 auto;
+  }
+
+  .remote-desktop-toolbar > * > button {
+    flex: 1 1 auto;
   }
 
   .remote-desktop-view-switch {
@@ -9037,17 +9035,30 @@ button.quick-agent-delegation-preset.active {
   }
 
   .remote-desktop-display-tabs {
-    max-width: 40vw;
+    max-width: none;
+    flex: 1 1 40%;
+  }
+
+  /* The desktop cap on a display name leaves a hole once the group stretches to
+     close a row. */
+  .remote-desktop-display-tabs button {
+    max-width: none;
   }
 
   .remote-desktop-zoom-switch {
     margin-left: 0;
   }
 
-  .remote-desktop-toolbar button {
-    min-height: 36px;
-    padding-inline: 13px;
+  /* The keyboard segment is a glyph, so it must not stretch like a worded one. */
+  .remote-desktop-toolbar .remote-desktop-keyboard-trigger {
+    flex: 0 0 auto;
   }
+
+  .remote-desktop-toolbar button {
+    min-height: 38px;
+    padding-inline: 10px;
+  }
+
 
   .remote-desktop-mobile-input-switch {
     display: flex;
@@ -9109,6 +9120,38 @@ button.quick-agent-delegation-preset.active {
 
   .remote-desktop-transfer-row progress {
     grid-column: 1 / -1;
+  }
+}
+
+/* Sideways, the picture is limited by the short edge instead of the long one,
+   so every toolbar row comes straight out of it. Give the height back and let
+   the controls swipe. */
+@media (max-height: 520px) {
+  .remote-desktop-toolbar {
+    flex-wrap: nowrap;
+    gap: 7px;
+    padding: 6px 10px;
+    overflow-x: auto;
+    overscroll-behavior-x: contain;
+    scrollbar-width: none;
+    mask-image: linear-gradient(90deg, transparent 0, #000 14px, #000 calc(100% - 22px), transparent 100%);
+  }
+
+  .remote-desktop-toolbar::-webkit-scrollbar {
+    display: none;
+  }
+
+  .remote-desktop-toolbar > *,
+  .remote-desktop-toolbar > * > button {
+    flex: 0 0 auto;
+  }
+
+  .remote-desktop-toolbar button {
+    min-height: 32px;
+  }
+
+  .remote-desktop-footer {
+    max-height: 22vh;
   }
 }
 
