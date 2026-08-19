@@ -263,6 +263,17 @@ export function RemoteDesktopPanel({
   const [virtualMouse, setVirtualMouse] = useState<TouchPoint>({ x: 0, y: 0 });
   const [viewportGeometryRevision, setViewportGeometryRevision] = useState(0);
   const [clientGeneration, setClientGeneration] = useState(0);
+  /**
+   * How many hover/drag moves this panel actually received from the browser,
+   * next to how many the client managed to send. Reported side by side because
+   * "the cursor does not follow" has two unrelated causes -- the move never
+   * reaching this handler, or reaching it and never leaving -- and the two are
+   * indistinguishable from the outside. Sampled, not rendered per event.
+   */
+  const [pointerMovesSeen, setPointerMovesSeen] = useState(0);
+  const pointerMovesSeenRef = useRef(0);
+  const pointerMovesUnmappedRef = useRef(0);
+  const [pointerMovesUnmapped, setPointerMovesUnmapped] = useState(0);
   const [transfers, setTransfers] = useState<RemoteDesktopTransferRow[]>([]);
   const [transferError, setTransferError] = useState<string | null>(null);
   const [fetchPath, setFetchPath] = useState('');
@@ -1083,13 +1094,25 @@ export function RemoteDesktopPanel({
     }, geometry));
   };
 
+  useEffect(() => {
+    const timer = setInterval(() => {
+      setPointerMovesSeen(pointerMovesSeenRef.current);
+      setPointerMovesUnmapped(pointerMovesUnmappedRef.current);
+    }, 1_000);
+    return () => clearInterval(timer);
+  }, []);
+
   const onPointerMove = (event: PointerEvent) => {
     if (event.pointerType === 'touch') {
       onTouchMove(event);
       return;
     }
+    pointerMovesSeenRef.current += 1;
     const point = normalizedDesktopPointerPoint(event);
-    if (!point) return;
+    if (!point) {
+      pointerMovesUnmappedRef.current += 1;
+      return;
+    }
     clientRef.current?.pointerMove(point.x, point.y);
   };
 
@@ -2143,6 +2166,10 @@ export function RemoteDesktopPanel({
                 mirrored: snapshot.pointerMovesMirrored ?? 0,
               })}</span>
             )}
+            <span>{t('remote_desktop.pointer_moves_seen', {
+              count: pointerMovesSeen,
+              unmapped: pointerMovesUnmapped,
+            })}</span>
             {/* Belongs with the session's other facts, not in the toolbar
                 between the buttons it explains. */}
             {inputBlockedHint() && (

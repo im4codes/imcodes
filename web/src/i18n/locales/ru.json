@@ -3093,6 +3093,7 @@
       "input_unavailable": "Узел сейчас не может обратиться к рабочему столу, принимающему ввод."
     },
     "pointer_moves": "движений указателя: {{count}} (дублей {{mirrored}})",
+    "pointer_moves_seen": "получено движений: {{count}} (без координат {{unmapped}})",
     "minimize_files": "Свернуть передачи",
     "restore_files": "Показать передачи",
     "transfers_running": "передач: {{count}} · {{progress}}%"

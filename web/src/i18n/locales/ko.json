@@ -3093,6 +3093,7 @@
       "input_unavailable": "노드가 지금 입력을 받는 데스크톱에 접근할 수 없습니다."
     },
     "pointer_moves": "포인터 이동: {{count}} (미러 {{mirrored}})",
+    "pointer_moves_seen": "수신된 이동: {{count}} (매핑 실패 {{unmapped}})",
     "minimize_files": "전송 최소화",
     "restore_files": "전송 표시",
     "transfers_running": "전송 {{count}}건 · {{progress}}%"
