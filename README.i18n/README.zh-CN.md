@@ -132,6 +132,12 @@ IM.codes 可用你自己的 supervisor 提示词对支持的 agent session 做�
 
 把另一台机器注册为受限的受控节点，而不必把它变成完整的 IM.codes source server。输入 `^` 自动补全目标，或直接插入 `^^(name)`；获授权的 agent 随后可以在该节点上执行有作用域的远程命令、传输单个文件，或调用类型化的 Computer Use 工具。执行能力由所有者启用并可随时撤销，受控节点不会混入普通 server/session 列表，每台机器也使用独立凭证。下载链接会过期，但新下载的安装包可长期保留并重复用于注册多台机器。
 
+### 远程桌面控制
+
+具备条件的受控节点可以向获授权的所有者与参与者提供连续的 H.264 远程桌面。浏览器与原生 worker 会优先协商点对点直连，仅在必要时回退到 TURN；画面与鼠标键盘数据不经过应用服务器。默认即为控制模式，允许多个获授权的控制者，每个观看者也可以各自切回观看模式。显示器标签支持右键/长按菜单切换 720p、1080p、1440p 与 4K；手机端支持双指缩放拖动，以及带边缘平移、左中右键和滚轮的虚拟鼠标模式。
+
+Windows 使用签名的预编译 worker，受控节点无需安装编译器或媒体依赖。**目前支持 Windows，macOS 与 Linux 即将支持。**
+
 ### Computer Use 与浏览器自动化
 
 受支持的 SDK agent 可以通过类型化 Computer Use 工具控制桌面应用。跨平台桌面应用控制集成了 Leo（[iFurySt](https://github.com/iFurySt)）开发、采用 [MIT 许可证](https://github.com/iFurySt/open-codex-computer-use/blob/main/LICENSE)的 [Open Computer Use](https://github.com/iFurySt/open-codex-computer-use)；这里明确感谢该项目提供的这项集成能力。

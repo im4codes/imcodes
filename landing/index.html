@@ -378,6 +378,7 @@ footer {
     <div class="feat"><div class="feat-name" data-i18n="f_alias_name">private aliases</div><div class="feat-desc" data-i18n="f_alias_desc">reuse owner-scoped text through visible ;;(name) markers with out-of-band value delivery</div></div>
     <div class="feat"><div class="feat-name" data-i18n="f_node_name">controlled nodes</div><div class="feat-desc" data-i18n="f_node_desc">enroll restricted machines for scoped remote commands, file transfer, and typed Computer Use via ^^(name)</div></div>
     <div class="feat"><div class="feat-name" data-i18n="f_computer_name">Computer Use + browser automation</div><div class="feat-desc" data-i18n="f_computer_desc">integrated <a href="https://github.com/iFurySt/open-codex-computer-use">Open Computer Use</a> desktop control (Leo, MIT) plus IM.codes' own CDP browser tools with optional screenshots and local script access</div></div>
+    <div class="feat"><div class="feat-name" data-i18n="f_rdp_name">remote desktop control</div><div class="feat-desc" data-i18n="f_rdp_desc">watch and control an enrolled machine's screen from a browser or phone over H.264, negotiated peer-to-peer with TURN only as fallback — Windows today, macOS and Linux supported soon</div></div>
     <div class="feat"><div class="feat-name" data-i18n="f_autodeliver_name">OpenSpec Auto Deliver</div><div class="feat-desc" data-i18n="f_autodeliver_desc">proposal/spec audit → implementation → Team audit/rework, with automatic module scoring for spec/tasks/implementation/tests/risk</div></div>
     <div class="feat"><div class="feat-name" data-i18n="f_collab_name">collaborative coding</div><div class="feat-desc" data-i18n="f_collab_desc">scoped sharing for pair or small-group agent programming</div></div>
     <div class="feat"><div class="feat-name" data-i18n="f_auto_name">supervised execution</div><div class="feat-desc" data-i18n="f_auto_desc">turn-level completion checks, auto-continue, and optional audit→rework loops for transport-backed agents</div></div>
@@ -592,6 +593,7 @@ const I18N = {
     f_node_desc: 'enroll restricted machines for scoped remote commands, file transfer, and typed Computer Use via ^^(name)',
     f_computer_name: 'Computer Use + browser automation',
     f_computer_desc: 'integrated <a href="https://github.com/iFurySt/open-codex-computer-use">Open Computer Use</a> desktop control (Leo, MIT) plus IM.codes\' own CDP browser tools with optional screenshots and local script access',
+    f_rdp_name: 'remote desktop control', f_rdp_desc: "watch and control an enrolled machine's screen from a browser or phone over H.264, negotiated peer-to-peer with TURN only as fallback — Windows today, macOS and Linux supported soon",
     f_collab_name: 'collaborative coding',
     f_collab_desc: 'scoped sharing for pair or small-group agent programming',
     f_autodeliver_name: 'OpenSpec Auto Deliver',
@@ -658,6 +660,7 @@ const I18N = {
     f_node_desc: '用 ^^(name) 注册受限机器，执行有作用域的远程命令、文件传输和类型化 Computer Use',
     f_computer_name: 'Computer Use 与浏览器自动化',
     f_computer_desc: '集成 <a href="https://github.com/iFurySt/open-codex-computer-use">Open Computer Use</a> 的桌面控制能力（Leo，MIT），并提供 IM.codes 自己实现的 CDP 浏览器工具、可选截图与本机脚本接入',
+    f_rdp_name: '远程桌面控制', f_rdp_desc: '在浏览器或手机上观看并操作已注册机器的屏幕，H.264 编码、优先点对点直连、TURN 仅作兜底——现支持 Windows，macOS 与 Linux 即将支持',
     f_collab_name: '协作编程',
     f_collab_desc: '有作用域地分享标签页/子会话/source server，支持双人或小团队 agent 编程',
     f_autodeliver_name: 'OpenSpec 自动交付',
@@ -765,6 +768,7 @@ const I18N = {
     f_node_desc: '用 ^^(name) 註冊受限機器，執行有作用域的遠端命令、檔案傳輸與型別化 Computer Use',
     f_computer_name: 'Computer Use 與瀏覽器自動化',
     f_computer_desc: '整合 <a href="https://github.com/iFurySt/open-codex-computer-use">Open Computer Use</a> 的桌面控制能力（Leo，MIT），並提供 IM.codes 自行實作的 CDP 瀏覽器工具、選用螢幕截圖與本機指令碼接入',
+    f_rdp_name: '遠端桌面控制', f_rdp_desc: '在瀏覽器或手機上觀看並操作已註冊機器的畫面，H.264 編碼、優先點對點直連、TURN 僅作備援——現支援 Windows，macOS 與 Linux 即將支援',
     f_collab_name: '協作編程',
     f_collab_desc: '有作用域地分享標籤頁/子 session/source server，支援雙人或小團隊 agent 編程',
     f_autodeliver_name: 'OpenSpec 自動交付',
@@ -873,6 +877,7 @@ const I18N = {
     f_node_desc: '^^(name) で制限付きマシンを登録し、scoped remote command、ファイル転送、型付き Computer Use を実行',
     f_computer_name: 'Computer Use とブラウザ自動化',
     f_computer_desc: '<a href="https://github.com/iFurySt/open-codex-computer-use">Open Computer Use</a> のデスクトップ操作（Leo、MIT）を統合し、IM.codes 独自の CDP ブラウザツール、任意のスクリーンショット、ローカルスクリプト接続も提供',
+    f_rdp_name: 'リモートデスクトップ操作', f_rdp_desc: '登録済みマシンの画面をブラウザやスマホから H.264 で表示・操作。P2P 接続を優先し TURN はフォールバックのみ — 現在は Windows、macOS と Linux は近日対応',
     f_collab_name: '協調プログラミング',
     f_collab_desc: 'tab/sub-session/source server を scoped に共有し、pair または small-team agent programming を支援',
     f_autodeliver_name: 'OpenSpec Auto Deliver',
@@ -981,6 +986,7 @@ const I18N = {
     f_node_desc: '^^(name)으로 제한된 머신을 등록해 범위 지정 원격 명령, 파일 전송, 타입 지정 Computer Use 실행',
     f_computer_name: 'Computer Use 및 브라우저 자동화',
     f_computer_desc: '<a href="https://github.com/iFurySt/open-codex-computer-use">Open Computer Use</a> 데스크톱 제어(Leo, MIT)를 통합하고 IM.codes 자체 CDP 브라우저 도구, 선택적 스크린샷 및 로컬 스크립트 연결을 제공',
+    f_rdp_name: '원격 데스크톱 제어', f_rdp_desc: '등록된 머신의 화면을 브라우저나 휴대폰에서 H.264로 보고 제어. P2P 연결을 우선하고 TURN은 폴백으로만 사용 — 현재 Windows 지원, macOS와 Linux는 곧 지원',
     f_collab_name: '협업 코딩',
     f_collab_desc: 'tab/sub-session/source server를 범위 있게 공유해 pair 또는 소규모 agent programming 지원',
     f_autodeliver_name: 'OpenSpec Auto Deliver',
@@ -1086,6 +1092,7 @@ const I18N = {
     f_node_desc: 'registra máquinas restringidas con ^^(name) para comandos remotos con alcance, archivos y Computer Use tipado',
     f_computer_name: 'Computer Use y automatización del navegador',
     f_computer_desc: 'control de escritorio integrado de <a href="https://github.com/iFurySt/open-codex-computer-use">Open Computer Use</a> (Leo, MIT), más herramientas de navegador CDP propias de IM.codes, capturas opcionales y acceso desde scripts locales',
+    f_rdp_name: 'control de escritorio remoto', f_rdp_desc: 'mira y controla la pantalla de una máquina registrada desde el navegador o el móvil por H.264, negociado punto a punto y con TURN solo como respaldo: hoy Windows, macOS y Linux muy pronto',
     f_collab_name: 'programación colaborativa',
     f_collab_desc: 'sharing con alcance de tabs/sub-sesiones/source servers para pair o small-group agent programming',
     f_autodeliver_name: 'OpenSpec Auto Deliver',
@@ -1191,6 +1198,7 @@ const I18N = {
     f_node_desc: 'регистрация ограниченных машин через ^^(name) для scoped remote commands, файлов и типизированного Computer Use',
     f_computer_name: 'Computer Use и автоматизация браузера',
     f_computer_desc: 'интегрированное desktop-управление <a href="https://github.com/iFurySt/open-codex-computer-use">Open Computer Use</a> (Leo, MIT), а также собственные CDP-инструменты браузера IM.codes, снимки по запросу и доступ локальных скриптов',
+    f_rdp_name: 'удалённое управление рабочим столом', f_rdp_desc: 'смотрите и управляйте экраном зарегистрированной машины из браузера или с телефона по H.264, соединение напрямую, TURN — только как запасной путь: сейчас Windows, macOS и Linux скоро',
     f_collab_name: 'совместное программирование',
     f_collab_desc: 'scoped sharing tabs/sub-sessions/source servers для pair или small-group agent programming',
     f_autodeliver_name: 'OpenSpec Auto Deliver',

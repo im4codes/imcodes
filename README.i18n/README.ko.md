@@ -131,6 +131,12 @@ IM.codes는 직접 작성한 supervisor 지시문으로 지원되는 agent sessi
 
 다른 머신을 완전한 IM.codes source server로 만들지 않고 제한된 controlled node로 등록할 수 있습니다. `^`로 대상을 자동 완성하거나 `^^(name)`을 직접 삽입하면, 권한을 받은 agent가 해당 노드에서 범위가 지정된 원격 명령, 단일 파일 전송, 타입이 지정된 Computer Use tool을 실행할 수 있습니다. 실행 권한은 소유자가 활성화하거나 철회할 수 있고, controlled node는 일반 server/session 목록에 섞이지 않으며 머신마다 독립 자격 증명을 사용합니다. 다운로드 링크는 만료되지만 새로 받은 설치 패키지는 보관해 여러 머신 등록에 재사용할 수 있습니다.
 
+### 원격 데스크톱 제어
+
+조건을 갖춘 controlled node는 인가된 Owner와 Participant에게 연속적인 H.264 원격 데스크톱을 제공합니다. 브라우저와 네이티브 worker는 먼저 직접 WebRTC 경로를 협상하고 TURN은 폴백으로만 사용합니다. 영상과 마우스/키보드 데이터는 애플리케이션 서버를 거치지 않습니다. 기본값이 제어 모드이며 인가된 제어자가 여러 명일 수 있고, 각 시청자는 개별적으로 보기 모드로 전환할 수 있습니다. 디스플레이 탭은 우클릭/길게 누르기 메뉴로 720p, 1080p, 1440p, 4K를 전환하며, 모바일에서는 핀치/드래그와 함께 가장자리 패닝, 좌·중·우 버튼, 휠 스크롤을 갖춘 가상 마우스 모드를 제공합니다.
+
+Windows는 서명된 사전 빌드 worker를 사용하므로 controlled node에 컴파일러나 미디어 의존성을 설치하지 않습니다. **현재 Windows 지원, macOS와 Linux는 곧 지원됩니다.**
+
 ### Computer Use 및 브라우저 자동화
 
 지원되는 SDK agent는 타입이 지정된 Computer Use tool로 데스크톱 앱을 제어할 수 있습니다. 크로스플랫폼 데스크톱 앱 제어에는 Leo([iFurySt](https://github.com/iFurySt))가 개발하고 MIT 라이선스로 배포한 [Open Computer Use](https://github.com/iFurySt/open-codex-computer-use)를 통합했으며, 이 통합 기능에 대해 해당 프로젝트에 명확히 크레딧을 표합니다.
