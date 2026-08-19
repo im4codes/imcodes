@@ -333,7 +333,15 @@ describe('RemoteDesktopClient', () => {
     expect(animationFrames).toHaveLength(2);
     animationFrames[1]!(1);
     expect(pointer.sent).toHaveLength(sentBeforeBackpressure);
-    expect(control.sent).toHaveLength(reliableBeforeBackpressure);
+    // The reliable sample now runs at the cadence following needs, so a
+    // congested fast channel no longer means the cursor stops: this move
+    // leaves on the reliable channel instead of being dropped with it.
+    expect(control.sent).toHaveLength(reliableBeforeBackpressure + 1);
+    expect(JSON.parse(control.sent.at(-1)!)).toMatchObject({
+      kind: REMOTE_DESKTOP_POINTER_KIND.MOVE,
+      x: 0.2,
+      y: 0.3,
+    });
 
     // Even while the best-effort channel is congested, a bounded reliable
     // position sample makes the remote Windows cursor converge to the local
@@ -1141,6 +1149,104 @@ describe('RemoteDesktopClient', () => {
       kind: REMOTE_DESKTOP_CONTROL_KIND.FRAME_PRESENTED,
       displayId: 'display_rearm001',
     });
+    client.stop();
+  });
+
+  it('keeps the remote cursor following when frame callbacks never fire', async () => {
+    // The remote cursor only ever moved when a click carried a position with
+    // it. Moves are coalesced behind a frame callback and sent on a channel
+    // that may drop them, so neither can be the only path: a window whose
+    // frame callbacks are throttled away must still send, and the reliable
+    // mirror is what makes following visible at all on a lossy link.
+    let socket!: FakeSocket;
+    let peer!: FakePeer;
+    let now = 0;
+    const client = new RemoteDesktopClient('controlled-win', { onSnapshot: vi.fn() }, {
+      fetchTicket: async () => 'ticket-follow',
+      createSocket: () => {
+        socket = new FakeSocket();
+        queueMicrotask(() => socket.open());
+        return socket as unknown as WebSocket;
+      },
+      createPeer: () => {
+        peer = new FakePeer();
+        return peer as unknown as RTCPeerConnection;
+      },
+      now: () => now,
+      // A frame callback that is scheduled and never runs.
+      requestAnimationFrame: () => 1,
+      cancelAnimationFrame: vi.fn(),
+    });
+
+    await client.start();
+    const start = JSON.parse(socket.sent[0]!) as { requestId: string };
+    const authority = {
+      requestId: start.requestId,
+      sessionId: 'session_follow01',
+      capability: 'f'.repeat(43),
+    };
+    socket.receive({
+      type: REMOTE_DESKTOP_MSG.AUTHORIZED,
+      ...authority,
+      expiresAt: 600_000,
+      leaseExpiresAt: 150_000,
+      daemonGeneration: 7,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
+      inputEpoch: 1,
+      iceServers: ['stun:stun.example.test:3478'],
+    });
+    await vi.waitFor(() => expect(peer).toBeDefined());
+    const control = peer.channels.get(REMOTE_DESKTOP_CHANNEL.CONTROL)!;
+    const pointer = peer.channels.get(REMOTE_DESKTOP_CHANNEL.POINTER)!;
+    control.open();
+    peer.channels.get(REMOTE_DESKTOP_CHANNEL.KEYBOARD)!.open();
+    pointer.open();
+    control.receive({
+      type: REMOTE_DESKTOP_DATA_MSG.DISPLAY_TOPOLOGY,
+      protocolVersion: REMOTE_DESKTOP_PROTOCOL_VERSION,
+      sessionId: authority.sessionId,
+      sequence: 1,
+      layoutRevision: 1,
+      displays: [{
+        id: 'display_follow001',
+        label: 'DISPLAY1',
+        primary: true,
+        available: true,
+        width: 1920,
+        height: 1080,
+        dpiScale: 1,
+        rotation: 0,
+      }],
+      selectedDisplayId: 'display_follow001',
+    });
+    client.acknowledgePresentedFrame(1920, 1080);
+    socket.receive({
+      type: REMOTE_DESKTOP_MSG.STATUS,
+      ...authority,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
+      inputEpoch: 1,
+      state: REMOTE_DESKTOP_STATE.DIRECT,
+      route: 'direct',
+      selectedDisplayId: 'display_follow001',
+      layoutRevision: 1,
+      inputEnabled: true,
+    });
+    await vi.waitFor(() => expect(client.current().inputEnabled).toBe(true));
+
+    const movesOn = (channel: FakeDataChannel) => channel.sent
+      .map((raw) => JSON.parse(raw) as { kind?: string })
+      .filter((message) => message.kind === REMOTE_DESKTOP_POINTER_KIND.MOVE).length;
+
+    // A hover: many moves, no click, and no frame callback ever running.
+    for (let step = 0; step < 10; step += 1) {
+      now += 50;
+      client.pointerMove(0.1 + step * 0.05, 0.5);
+    }
+    // Every one of them would have been swallowed while waiting for a frame.
+    expect(movesOn(pointer) + movesOn(control)).toBeGreaterThan(5);
+    // The reliable channel carries them, so following survives a link that
+    // drops the fast path entirely.
+    expect(movesOn(control)).toBeGreaterThan(5);
     client.stop();
   });
 

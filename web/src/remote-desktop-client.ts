@@ -36,7 +36,18 @@ import { PendingWebRtcCandidates, toWebRtcIceServers } from '@shared/webrtc-conn
 import { apiFetch, getApiBaseUrl } from './api.js';
 
 const DATA_BUFFER_HIGH_WATER_BYTES = 256 * 1024;
-const POINTER_RELIABLE_SYNC_INTERVAL_MS = 100;
+/**
+ * How often the newest absolute pointer position is mirrored on the reliable
+ * channel.
+ *
+ * The unreliable pointer channel is the fast path, but it is allowed to drop
+ * anything it likes, and on a relayed link it can drop nearly everything —
+ * measured on a node whose cursor only ever moved when a click carried a
+ * position with it. This interval is therefore the floor on how smoothly the
+ * remote cursor can follow, so it is set for following rather than for the
+ * occasional correction.
+ */
+const POINTER_RELIABLE_SYNC_INTERVAL_MS = 40;
 const DATA_BUFFER_LOW_WATER_BYTES = 64 * 1024;
 // Let the server own the authoritative negotiation deadline and reason.  The
 // browser guard is only a final escape hatch if that terminal frame is lost.
@@ -322,6 +333,7 @@ export class RemoteDesktopClient {
   } | null = null;
   private pendingPointerMove: { x: number; y: number } | null = null;
   private lastReliablePointerSyncAt = Number.NEGATIVE_INFINITY;
+  private lastPointerFlushAt = Number.NEGATIVE_INFINITY;
   private pointerMovesSent = 0;
   private pressedCodes = new Set<string>();
   private pressedButtons = new Set<string>();
@@ -562,8 +574,20 @@ export class RemoteDesktopClient {
       x: Math.max(0, Math.min(1, x)),
       y: Math.max(0, Math.min(1, y)),
     };
-    if (this.pointerFrame !== null) return;
-    const request = this.deps.requestAnimationFrame ?? requestAnimationFrame;
+    if (this.pointerFrame !== null) {
+      // A frame callback that never fires — an occluded or throttled window,
+      // a host that batches them away — would otherwise swallow every move
+      // after the first. Fall back to sending on the interval the reliable
+      // mirror already runs at rather than waiting for a frame that is not
+      // coming.
+      const now = this.deps.now?.() ?? Date.now();
+      if (now - this.lastPointerFlushAt >= POINTER_RELIABLE_SYNC_INTERVAL_MS) {
+        this.flushPointerMove();
+      }
+      return;
+    }
+    const request = this.deps.requestAnimationFrame
+      ?? ((callback: FrameRequestCallback) => globalThis.requestAnimationFrame(callback));
     this.pointerFrame = request(() => {
       this.pointerFrame = null;
       this.flushPointerMove();
@@ -1008,6 +1032,7 @@ export class RemoteDesktopClient {
     this.pendingPointerMove = null;
     if (!move || !this.canSendInput()) return;
     const now = this.deps.now?.() ?? Date.now();
+    this.lastPointerFlushAt = now;
     if (now - this.lastReliablePointerSyncAt >= POINTER_RELIABLE_SYNC_INTERVAL_MS
       && this.sendReliablePointerSync({
         type: REMOTE_DESKTOP_DATA_MSG.POINTER,
@@ -1020,6 +1045,7 @@ export class RemoteDesktopClient {
       // control channel so the remote cursor always converges to the local
       // cursor even when the final unreliable datagram is lost.
       this.lastReliablePointerSyncAt = now;
+      this.pointerMovesSent += 1;
     }
     if (!isOpen(this.pointerChannel)) return;
     if (this.pointerChannel.bufferedAmount > DATA_BUFFER_HIGH_WATER_BYTES) {
