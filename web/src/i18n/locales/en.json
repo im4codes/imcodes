@@ -387,6 +387,8 @@
     "image_copy": "Copy image",
     "image_copied": "Image copied",
     "image_copy_failed": "Copy failed",
+    "image_previous": "Previous image",
+    "image_next": "Next image",
     "tool_detail_toggle": "details",
     "tool_detail_input": "input",
     "tool_detail_output": "output",

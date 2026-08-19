@@ -387,6 +387,8 @@
     "image_copy": "复制图片",
     "image_copied": "已复制图片",
     "image_copy_failed": "复制失败",
+    "image_previous": "上一张",
+    "image_next": "下一张",
     "tool_detail_toggle": "详情",
     "tool_detail_input": "输入",
     "tool_detail_output": "输出",

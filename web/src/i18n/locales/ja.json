@@ -387,6 +387,8 @@
     "image_copy": "画像をコピー",
     "image_copied": "画像をコピーしました",
     "image_copy_failed": "コピーに失敗しました",
+    "image_previous": "前の画像",
+    "image_next": "次の画像",
     "tool_detail_toggle": "詳細",
     "tool_detail_input": "入力",
     "tool_detail_output": "出力",

@@ -387,6 +387,8 @@
     "image_copy": "複製圖片",
     "image_copied": "已複製圖片",
     "image_copy_failed": "複製失敗",
+    "image_previous": "上一張",
+    "image_next": "下一張",
     "tool_detail_toggle": "詳情",
     "tool_detail_input": "輸入",
     "tool_detail_output": "輸出",

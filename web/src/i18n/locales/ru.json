@@ -387,6 +387,8 @@
     "image_copy": "Копировать изображение",
     "image_copied": "Изображение скопировано",
     "image_copy_failed": "Не удалось скопировать",
+    "image_previous": "Предыдущее изображение",
+    "image_next": "Следующее изображение",
     "tool_detail_toggle": "подробно",
     "tool_detail_input": "ввод",
     "tool_detail_output": "вывод",

@@ -6243,6 +6243,47 @@ html.native-ios-mac .chat-dl-btn {
 .fb-lightbox { position: fixed; inset: 0; z-index: 9999; background: rgba(0,0,0,0.85); display: flex; align-items: center; justify-content: center; cursor: zoom-out; padding: calc(var(--sat, 0px) + 12px) calc(env(safe-area-inset-right, 0px) + 12px) calc(env(safe-area-inset-bottom, 0px) + 12px) calc(env(safe-area-inset-left, 0px) + 12px); box-sizing: border-box; }
 .fb-lightbox img { max-width: min(92vw, 100%); max-height: min(92vh, 100%); object-fit: contain; border-radius: 6px; cursor: default; }
 .fb-lightbox-close { position: absolute; top: calc(var(--sat, 0px) + 16px); right: calc(env(safe-area-inset-right, 0px) + 16px); background: rgba(255,255,255,0.15); border: none; color: #fff; font-size: 20px; width: 36px; height: 36px; border-radius: 50%; cursor: pointer; display: flex; align-items: center; justify-content: center; }
+/* Paging arrows. Semi-transparent at rest so they never compete with the photo,
+   and reachable at the vertical middle on both pointer and touch. They sit
+   above the image but inside the backdrop, and stop click propagation so
+   pressing one does not also hit the backdrop's close handler. */
+.fb-lightbox-nav {
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 44px;
+  height: 64px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: 10px;
+  background: rgba(15, 23, 42, 0.38);
+  color: rgba(255, 255, 255, 0.82);
+  font-size: 30px;
+  line-height: 1;
+  cursor: pointer;
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  transition: background 0.15s, color 0.15s, opacity 0.15s;
+}
+.fb-lightbox-nav:hover:not(:disabled) {
+  background: rgba(30, 41, 59, 0.72);
+  color: #fff;
+}
+/* Kept mounted rather than hidden at the ends, so the image does not shift and
+   the remaining direction stays where the user last reached for it. */
+.fb-lightbox-nav:disabled { opacity: 0.22; cursor: default; }
+.fb-lightbox-nav-prev { left: calc(env(safe-area-inset-left, 0px) + 10px); }
+.fb-lightbox-nav-next { right: calc(env(safe-area-inset-right, 0px) + 10px); }
+
+/* Coarse pointers get a slightly larger target and a dimmer resting state:
+   there is no hover to reveal them, and they overlap the drag-to-dismiss
+   surface. */
+@media (hover: none) {
+  .fb-lightbox-nav { width: 52px; height: 76px; background: rgba(15, 23, 42, 0.28); }
+}
+
 .fb-lightbox-actions { position: absolute; left: 50%; bottom: calc(env(safe-area-inset-bottom, 0px) + 18px); transform: translateX(-50%); display: inline-flex; align-items: center; gap: 8px; padding: 6px; border-radius: 999px; background: rgba(15, 23, 42, 0.82); border: 1px solid rgba(148, 163, 184, 0.24); box-shadow: 0 12px 32px rgba(0,0,0,0.35); backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px); }
 .fb-lightbox-action { min-width: 82px; height: 32px; padding: 0 13px; border: 1px solid rgba(148, 163, 184, 0.24); border-radius: 999px; background: rgba(30, 41, 59, 0.95); color: #e2e8f0; font-size: 12px; cursor: pointer; }
 .fb-lightbox-action:hover:not(:disabled) { background: rgba(51, 65, 85, 0.98); border-color: rgba(125, 211, 252, 0.42); }
