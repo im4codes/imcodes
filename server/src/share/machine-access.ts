@@ -20,10 +20,12 @@ export interface ControlledMachineAccessRow {
   access_role: MachineAccessRole;
   access_expires_at: number | null;
   controlled_capabilities: ControlledNodeCapability[] | null;
+  /** `controlled` for a controlled node; `full`/NULL for a normal daemon. */
+  node_role: string | null;
 }
 
 const CONTROLLED_MACHINE_ACCESS_SELECT = `
-  SELECT s.id, s.user_id, s.ref_name, s.display_name, s.status,
+  SELECT s.id, s.user_id, s.ref_name, s.display_name, s.status, s.node_role,
          s.last_heartbeat_at, s.exec_enabled, s.os, s.daemon_version, s.revoked_at,
          s.auto_unlock_configured, s.controlled_capabilities,
          CASE WHEN s.user_id = $1 THEN 'owner' ELSE sh.role END AS access_role,
@@ -57,6 +59,29 @@ export async function resolveControlledMachineAccess(
         AND (s.user_id = $1 OR sh.id IS NOT NULL)
       LIMIT 1`,
     [userId, now, serverId, NODE_ROLE.CONTROLLED],
+  );
+}
+
+/**
+ * Resolve current DB-authoritative access to a remote-desktop host, which may
+ * be a controlled node OR a normal (FULL) daemon: on Windows a daemon serves
+ * remote control with the same native worker. Node role is returned rather than
+ * filtered so admission can apply the checks that belong to each role — the
+ * grant read itself (ownership, share, expiry, revocation) is identical.
+ */
+export async function resolveRemoteDesktopHostAccess(
+  db: Database,
+  userId: string,
+  serverId: string,
+  now: number,
+): Promise<ControlledMachineAccessRow | null> {
+  return db.queryOne<ControlledMachineAccessRow>(
+    `${CONTROLLED_MACHINE_ACCESS_SELECT}
+      WHERE s.id = $3
+        AND s.revoked_at IS NULL
+        AND (s.user_id = $1 OR sh.id IS NOT NULL)
+      LIMIT 1`,
+    [userId, now, serverId],
   );
 }
 

@@ -16,6 +16,7 @@ import {
   REMOTE_DESKTOP_STATE,
   REMOTE_DESKTOP_TERMINAL_REASON,
 } from '../../shared/remote-desktop.js';
+import { NODE_ROLE } from '../../shared/remote-exec.js';
 
 const requestId = 'request_12345678';
 const start = {
@@ -38,6 +39,25 @@ function validAccess(now = Date.now()): ControlledMachineAccessRow {
     access_role: 'owner',
     access_expires_at: null,
     controlled_capabilities: [REMOTE_DESKTOP_CAPABILITY],
+    node_role: NODE_ROLE.CONTROLLED,
+  };
+}
+
+/**
+ * A normal Windows daemon serving remote control. None of the controlled-node
+ * columns describe it: `exec_enabled` is the controlled exec switch and is
+ * false on daemon rows created before its default flipped, `os` is only
+ * recorded at controlled-node enrolment, and `controlled_capabilities` is
+ * stored for controlled nodes alone.
+ */
+function daemonHostAccess(now = Date.now()): ControlledMachineAccessRow {
+  return {
+    ...validAccess(now),
+    id: 'daemon-win',
+    node_role: NODE_ROLE.FULL,
+    exec_enabled: false,
+    os: null,
+    controlled_capabilities: null,
   };
 }
 
@@ -384,6 +404,34 @@ describe('RemoteDesktopRouter', () => {
     await f.router.handleBrowser(f.browserA, 'owner-user', start);
     expect(f.daemonMessages).toHaveLength(0);
     expect(f.messages(f.browserA)[0]).toMatchObject({ type: REMOTE_DESKTOP_MSG.ERROR, error });
+  });
+
+  it('admits a normal Windows daemon whose controlled-node columns are unset', async () => {
+    const f = fixture({ access: daemonHostAccess() });
+    await f.router.handleBrowser(f.browserA, 'owner-user', start);
+    expect(f.messages(f.browserA)[0]).toMatchObject({ type: REMOTE_DESKTOP_MSG.AUTHORIZED, requestId });
+  });
+
+  it.each([
+    ['a revoked share', { access_role: 'viewer' }, REMOTE_DESKTOP_ERROR.ACCESS_DENIED],
+    ['stale presence', { last_heartbeat_at: 1 }, REMOTE_DESKTOP_ERROR.DAEMON_OFFLINE],
+  ] as const)('still rejects %s for a normal daemon', async (_label, patch, error) => {
+    const f = fixture({ access: { ...daemonHostAccess(), ...patch } as ControlledMachineAccessRow });
+    await f.router.handleBrowser(f.browserA, 'owner-user', start);
+    expect(f.daemonMessages).toHaveLength(0);
+    expect(f.messages(f.browserA)[0]).toMatchObject({ type: REMOTE_DESKTOP_MSG.ERROR, error });
+  });
+
+  it('does not let a controlled node borrow the daemon exemptions', async () => {
+    const f = fixture({
+      access: { ...validAccess(), exec_enabled: false, controlled_capabilities: null } as ControlledMachineAccessRow,
+    });
+    await f.router.handleBrowser(f.browserA, 'owner-user', start);
+    expect(f.daemonMessages).toHaveLength(0);
+    expect(f.messages(f.browserA)[0]).toMatchObject({
+      type: REMOTE_DESKTOP_MSG.ERROR,
+      error: REMOTE_DESKTOP_ERROR.EXECUTION_DISABLED,
+    });
   });
 
   it('rejects a Participant grant that expires while admission is awaiting the DB', async () => {

@@ -26,6 +26,7 @@ import {
   isControlledNodeArch,
   isControlledNodeRuntimePair,
   isControlledNodeOs,
+  isRemoteDesktopArtifactAsset,
   normalizeControlledNodeArtifactPair,
   type ControlledNodeArtifactArch,
   type ControlledNodeOs,
@@ -946,7 +947,13 @@ enrollRoutes.get('/v2/node-artifact', async (c) => {
   );
   if (!server || server.token_hash !== tokenHash) return c.json({ error: 'unauthorized' }, 401);
   if (server.revoked_at != null) return c.json({ error: 'revoked' }, 403);
-  if (server.node_role !== NODE_ROLE.CONTROLLED) return c.json({ error: 'forbidden' }, 403);
+  // A normal (FULL) daemon may fetch the remote-desktop worker bundle and
+  // nothing else: on Windows it serves remote control with the same native
+  // worker a controlled node runs. `node_role` is NULL on legacy daemon rows,
+  // so "not controlled" is the same test the daemon server list uses.
+  if (server.node_role !== NODE_ROLE.CONTROLLED && !isRemoteDesktopArtifactAsset(asset)) {
+    return c.json({ error: 'forbidden' }, 403);
+  }
   if ((server.os && server.arch
       && !isControlledNodeArtifactCompatibleWithRuntime(artifactTarget.os, artifactTarget.arch, server.os, server.arch))
     || (server.os && !server.arch && server.os !== artifactTarget.os)
@@ -971,9 +978,7 @@ enrollRoutes.get('/v2/node-artifact', async (c) => {
     c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.FILENAME, openedHelper.filename);
     return c.body(buildBareArtifactStream(openedHelper.handle, openedHelper.sizeBytes, openedHelper.close) as unknown as ReadableStream, 200);
   }
-  if (asset === CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER
-    || asset === CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER_MANIFEST
-    || asset === CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_VIRTUAL_DISPLAY) {
+  if (isRemoteDesktopArtifactAsset(asset)) {
     if (artifactTarget.os !== 'win' || artifactTarget.arch !== 'x64') {
       return c.json({ error: 'remote_desktop_worker_unsupported', os: artifactTarget.os, arch: artifactTarget.arch }, 404);
     }

@@ -1356,12 +1356,18 @@ export class WsBridge {
   private readonly remoteDesktopRouter = new RemoteDesktopRouter({
     serverId: () => this.serverId,
     database: () => this.db,
+    // Remote desktop is served either by a controlled node or by a normal
+    // Windows daemon that has the native worker installed. A controlled node
+    // advertises the capability at auth; a FULL daemon advertises it in
+    // `daemon.hello` and withdraws it when the worker is missing — so the
+    // capability, not the node role, is what gates the feature.
     daemonAvailable: () => Boolean(
       this.authenticated
-      && this.daemonNodeRole === NODE_ROLE.CONTROLLED
-      && this.daemonWs?.readyState === WebSocket.OPEN,
+      && this.daemonWs?.readyState === WebSocket.OPEN
+      && (this.daemonNodeRole === NODE_ROLE.CONTROLLED
+        || this.hasDaemonCapability(REMOTE_DESKTOP_CAPABILITY)),
     ),
-    daemonSupportsRemoteDesktop: () => this.controlledNodeCapabilities.has(REMOTE_DESKTOP_CAPABILITY),
+    daemonSupportsRemoteDesktop: () => this.hasDaemonCapability(REMOTE_DESKTOP_CAPABILITY),
     featureEnabled: () => isRemoteDesktopFeatureEnabled(
       process.env.IMCODES_REMOTE_DESKTOP_ENABLED,
       process.env.NODE_ENV,
@@ -7236,12 +7242,11 @@ export class WsBridge {
     }
   }
 
-  /** Remote desktop signaling is CONTROLLED-only, generation-bound, and never queued. */
+  /** Remote desktop signaling is capability-gated, generation-bound, and never queued. */
   private trySendRemoteDesktop(message: Record<string, unknown>, expectedGeneration: number): boolean {
     if (!this.daemonWs || !this.authenticated || this.daemonWs.readyState !== WebSocket.OPEN) return false;
     if (this.daemonGeneration !== expectedGeneration
-      || this.daemonNodeRole !== NODE_ROLE.CONTROLLED
-      || !this.controlledNodeCapabilities.has(REMOTE_DESKTOP_CAPABILITY)) return false;
+      || !this.hasDaemonCapability(REMOTE_DESKTOP_CAPABILITY)) return false;
     try {
       this.daemonWs.send(JSON.stringify(message));
       return true;

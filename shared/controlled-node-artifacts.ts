@@ -107,6 +107,26 @@ export const CONTROLLED_NODE_ARTIFACT_ASSETS = {
   REMOTE_DESKTOP_VIRTUAL_DISPLAY: 'remote-desktop-virtual-display',
 } as const;
 
+/**
+ * Whether `asset` is part of the remote-desktop worker bundle.
+ *
+ * This is the one artifact family a normal (FULL) daemon may download as well:
+ * a Windows daemon serves remote control with the exact same native worker a
+ * controlled node uses, so it fetches it through the same artifact route. Every
+ * other asset — above all the controlled-node runtime itself — stays
+ * CONTROLLED-only.
+ */
+export type RemoteDesktopArtifactAsset =
+  | typeof CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER
+  | typeof CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER_MANIFEST
+  | typeof CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_VIRTUAL_DISPLAY;
+
+export function isRemoteDesktopArtifactAsset(asset: string): asset is RemoteDesktopArtifactAsset {
+  return asset === CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER
+    || asset === CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER_MANIFEST
+    || asset === CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_VIRTUAL_DISPLAY;
+}
+
 export const CONTROLLED_NODE_COMPUTER_USE_HELPER_FILENAMES = {
   [CONTROLLED_NODE_OS_WIN]: 'open-computer-use.exe',
   [CONTROLLED_NODE_OS_MAC]: 'open-computer-use.app.zip',

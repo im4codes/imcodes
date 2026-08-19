@@ -3,11 +3,12 @@ import type WebSocket from 'ws';
 import type { Database } from '../db/client.js';
 import {
   canOperateControlledMachine,
-  resolveControlledMachineAccess,
+  resolveRemoteDesktopHostAccess,
   type ControlledMachineAccessRow,
 } from '../share/machine-access.js';
 import {
   MACHINE_PRESENCE_STALENESS_MS,
+  NODE_ROLE,
   type MachineAccessRole,
 } from '../../../shared/remote-exec.js';
 import { validateControlledNodeCapabilities } from '../../../shared/controlled-node-capabilities.js';
@@ -426,7 +427,7 @@ export class RemoteDesktopRouter {
     const queryStartedAt = this.now();
     let access: ControlledMachineAccessRow | null;
     try {
-      access = await (this.hooks.resolveAccess ?? resolveControlledMachineAccess)(
+      access = await (this.hooks.resolveAccess ?? resolveRemoteDesktopHostAccess)(
         db,
         userId,
         this.hooks.serverId(),
@@ -542,6 +543,15 @@ export class RemoteDesktopRouter {
     if (!access || !canOperateControlledMachine(access.access_role)) {
       return { error: REMOTE_DESKTOP_ERROR.ACCESS_DENIED, retryable: false };
     }
+    // A normal (FULL) daemon serves remote control from the same native worker,
+    // but the controlled-node columns do not describe it: `exec_enabled` is the
+    // controlled-node exec switch (and is false on daemon rows predating its
+    // default flip), `os` is only recorded at controlled-node enrolment, and
+    // `controlled_capabilities` is stored for controlled nodes alone. For a
+    // daemon those three facts are instead proven live — it advertises the
+    // remote-desktop capability only on win32 with the worker installed, which
+    // `daemonSupportsRemoteDesktop()` checks before and after this admission.
+    const controlledNode = access.node_role === NODE_ROLE.CONTROLLED;
     if (access.access_role !== 'owner'
       && access.access_expires_at !== null
       && (typeof access.access_expires_at !== 'number'
@@ -549,10 +559,10 @@ export class RemoteDesktopRouter {
         || access.access_expires_at <= now)) {
       return { error: REMOTE_DESKTOP_ERROR.ACCESS_DENIED, retryable: false };
     }
-    if (!access.exec_enabled) {
+    if (controlledNode && !access.exec_enabled) {
       return { error: REMOTE_DESKTOP_ERROR.EXECUTION_DISABLED, retryable: false };
     }
-    if (access.os !== 'win') {
+    if (controlledNode && access.os !== 'win') {
       return { error: REMOTE_DESKTOP_ERROR.UNSUPPORTED_PLATFORM, retryable: false };
     }
     if (access.status !== 'online'
@@ -560,9 +570,11 @@ export class RemoteDesktopRouter {
       || now - access.last_heartbeat_at >= MACHINE_PRESENCE_STALENESS_MS) {
       return { error: REMOTE_DESKTOP_ERROR.DAEMON_OFFLINE, retryable: true };
     }
-    const capabilities = validateControlledNodeCapabilities(access.controlled_capabilities);
-    if (!capabilities.ok || !capabilities.value.includes(REMOTE_DESKTOP_CAPABILITY)) {
-      return { error: REMOTE_DESKTOP_ERROR.CAPABILITY_UNAVAILABLE, retryable: true };
+    if (controlledNode) {
+      const capabilities = validateControlledNodeCapabilities(access.controlled_capabilities);
+      if (!capabilities.ok || !capabilities.value.includes(REMOTE_DESKTOP_CAPABILITY)) {
+        return { error: REMOTE_DESKTOP_ERROR.CAPABILITY_UNAVAILABLE, retryable: true };
+      }
     }
     return null;
   }
@@ -739,7 +751,7 @@ export class RemoteDesktopRouter {
     route.revalidationInFlight = true;
     let access: ControlledMachineAccessRow | null = null;
     try {
-      access = await (this.hooks.resolveAccess ?? resolveControlledMachineAccess)(
+      access = await (this.hooks.resolveAccess ?? resolveRemoteDesktopHostAccess)(
         db,
         route.userId,
         this.hooks.serverId(),

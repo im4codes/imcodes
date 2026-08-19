@@ -1654,7 +1654,7 @@ describe('GET /api/enroll/v2/node-artifact (controlled-node self-upgrade)', () =
     expect(Buffer.from(await legacyMacHelperResponse.arrayBuffer())).toEqual(macArchiveBytes);
   });
 
-  it('rejects full daemon tokens and platform mismatches', async () => {
+  it('rejects full daemon tokens for the runtime but admits them for the remote-desktop worker', async () => {
     const app = buildApp();
     const userId = `u_${hex(4)}`;
     await createUser(db, userId);
@@ -1663,6 +1663,16 @@ describe('GET /api/enroll/v2/node-artifact (controlled-node self-upgrade)', () =
       headers: { authorization: `Bearer ${full.token}` },
     });
     expect(fullResponse.status).toBe(403);
+
+    // The worker bundle is the one artifact family a normal daemon may fetch:
+    // on Windows it serves remote control with the same native worker. Only the
+    // role gate is asserted here — whether the artifact is built on this host is
+    // a separate concern, so anything but `forbidden` proves the gate opened.
+    const workerResponse = await app.request(
+      `/api/enroll/v2/node-artifact?serverId=${full.serverId}&os=win&arch=x64&asset=remote-desktop-worker`,
+      { headers: { authorization: `Bearer ${full.token}` } },
+    );
+    expect(workerResponse.status).not.toBe(403);
 
     const token = hex(16);
     const serverId = hex(8);
