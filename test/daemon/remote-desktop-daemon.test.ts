@@ -15,6 +15,7 @@ import {
 } from '../../shared/remote-desktop-install.js';
 import {
   DaemonRemoteDesktop,
+  daemonWorkerLaunchOptions,
   type DaemonRemoteDesktopDeps,
 } from '../../src/daemon/remote-desktop-daemon.js';
 import type { VerifiedRemoteDesktopWorkerArtifact } from '../../src/node/remote-desktop-worker-host.js';
@@ -253,6 +254,25 @@ describe('DaemonRemoteDesktop', () => {
     expect(await f.remoteDesktop.handle(prepareCommand())).toBe(true);
     expect(f.host.handle).toHaveBeenCalledTimes(1);
     expect(f.sent).toHaveLength(0);
+  });
+
+  describe('worker launch options', () => {
+    it('starts the worker as an ordinary child, with the args unserialised', () => {
+      const launches: Array<{ executable: string; args: readonly string[] }> = [];
+      const options = daemonWorkerLaunchOptions((executable, args) => {
+        launches.push({ executable, args });
+      });
+      options.launch!('C:\\worker.exe', '--pipe "p" --nonce "n"', false, ['--pipe', 'p', '--nonce', 'n']);
+      // The daemon is already in the session being captured; the session-0
+      // launcher refuses anything but LocalSystem and needs a privilege a user
+      // process does not hold.
+      expect(launches).toEqual([{ executable: 'C:\\worker.exe', args: ['--pipe', 'p', '--nonce', 'n'] }]);
+    });
+
+    it('skips the pipe ACL that only exists to cross the session boundary', async () => {
+      const options = daemonWorkerLaunchOptions(() => {});
+      await expect(Promise.resolve(options.allowPipeClients!('\\\\.\\pipe\\x'))).resolves.toBeUndefined();
+    });
   });
 
   it('installs on request and leaves unrelated messages alone', async () => {

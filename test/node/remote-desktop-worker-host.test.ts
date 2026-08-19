@@ -393,7 +393,7 @@ describe('remote desktop worker artifact and IPC host', () => {
       pipePath,
       allowPipeClients: () => {},
       launch: (_executable, argsLine, forceSecureConsole) => {
-        if (argsLine === '--release-all-input') return;
+        if (argsLine.includes('--release-all-input')) return;
         forced.push(forceSecureConsole);
         workerNonce = quotedArgs(argsLine)[3]!;
         const helper = net.createConnection(pipePath, () => {
@@ -470,7 +470,7 @@ describe('remote desktop worker artifact and IPC host', () => {
       pipePath,
       allowPipeClients: () => {},
       launch: (_executable, argsLine, forceSecureConsole) => {
-        if (argsLine === '--release-all-input') return;
+        if (argsLine.includes('--release-all-input')) return;
         forced.push(forceSecureConsole);
         const nonce = quotedArgs(argsLine)[3]!;
         // The hello is written from an async connect callback, so the index has
@@ -657,7 +657,7 @@ describe('remote desktop worker artifact and IPC host', () => {
     const pipePath = join(temp, 'worker.sock');
     let helper: net.Socket | null = null;
     const launch = vi.fn((_executable: string, argsLine: string) => {
-      if (argsLine === '--release-all-input') return;
+      if (argsLine.includes('--release-all-input')) return;
       const args = quotedArgs(argsLine);
       helper = net.createConnection(pipePath, () => {
         helper!.write(`${JSON.stringify({
@@ -695,10 +695,14 @@ describe('remote desktop worker artifact and IPC host', () => {
     helper!.destroy();
     await vi.waitFor(() => expect(launch).toHaveBeenCalledTimes(2));
     expect(verifyArtifactForLaunch).toHaveBeenCalledTimes(2);
+    // The host now hands the launcher the unserialised args as well, so a
+    // launcher that spawns the worker directly need not re-parse the line this
+    // host just quoted.
     expect(launch.mock.calls[1]).toEqual([
       artifact.executablePath,
-      '--release-all-input',
+      '"--release-all-input"',
       false,
+      ['--release-all-input'],
     ]);
     expect(JSON.stringify(launch.mock.calls[1])).not.toContain(capability);
     expect(received).toContainEqual(expect.objectContaining({
@@ -713,7 +717,7 @@ describe('remote desktop worker artifact and IPC host', () => {
     const pipePath = join(temp, 'worker.sock');
     const helpers: net.Socket[] = [];
     const launch = vi.fn((_executable: string, argsLine: string) => {
-      if (argsLine === '--release-all-input') return;
+      if (argsLine.includes('--release-all-input')) return;
       const args = quotedArgs(argsLine);
       const helper = net.createConnection(pipePath, () => {
         helper.write(`${JSON.stringify({
@@ -774,8 +778,8 @@ describe('remote desktop worker artifact and IPC host', () => {
       sessionId: 'session_poisoned',
       reason: REMOTE_DESKTOP_TERMINAL_REASON.WORKER_FAILED,
     }));
-    await vi.waitFor(() => expect(launch.mock.calls.some(([, args]) => (
-      args === '--release-all-input'
+    await vi.waitFor(() => expect(launch.mock.calls.some(([, argsLine]) => (
+      String(argsLine).includes('--release-all-input')
     ))).toBe(true));
 
     await expect(host.handle({
@@ -784,7 +788,9 @@ describe('remote desktop worker artifact and IPC host', () => {
       sessionId: 'session_recovered',
       capability: 'c'.repeat(43),
     })).resolves.toBe(true);
-    const workerLaunches = launch.mock.calls.filter(([, args]) => args !== '--release-all-input');
+    const workerLaunches = launch.mock.calls.filter(([, argsLine]) => (
+      !String(argsLine).includes('--release-all-input')
+    ));
     expect(workerLaunches).toHaveLength(2);
     expect(verifyArtifactForLaunch).toHaveBeenCalledTimes(3);
     expect((host as unknown as { socket: net.Socket }).socket).not.toBe(poisonedSocket);

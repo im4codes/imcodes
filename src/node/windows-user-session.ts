@@ -278,6 +278,33 @@ export function launchWindowsActiveUserElevatedCommand(
  * Native secure console mode keeps authorization/input-epoch checks but denies
  * clipboard access and exits when Windows switches back to the Default desktop.
  */
+/**
+ * Launch the worker as an ordinary child of this process.
+ *
+ * The session-0 launcher above exists so a LocalSystem service can cross into
+ * the interactive user's session, and it refuses to run as anything else. A
+ * normal daemon is already running in that very session, so it needs none of
+ * that — and holds none of the privileges it requires. The child is detached so
+ * it outlives a daemon restart no more than the pipe does, and inherits no
+ * stdio.
+ *
+ * The sign-in/lock desktop stays out of reach on this path: only a LocalSystem
+ * worker can follow Windows there. Capturing the user's own desktop, which is
+ * what a daemon host is for, does not need it.
+ */
+export function launchWindowsWorkerInCurrentSession(
+  executable: string,
+  args: readonly string[],
+  spawnImpl: typeof spawn = spawn,
+): void {
+  const child = spawnImpl(executable, [...args], {
+    windowsHide: true,
+    detached: true,
+    stdio: 'ignore',
+  });
+  child.unref?.();
+}
+
 export function launchWindowsRemoteDesktopCommand(
   executable: string,
   argsLine: string,

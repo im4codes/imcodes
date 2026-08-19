@@ -209,7 +209,17 @@ export interface RemoteDesktopWorkerHostOptions {
     trustedSignerSha256: string,
   ) => Promise<VerifiedRemoteDesktopWorkerArtifact | null>;
   allowPipeClients?: (path: string) => void | Promise<void>;
-  launch?: (executable: string, argsLine: string, forceSecureConsole?: boolean) => void;
+  /**
+   * `args` is the same command line as `argsLine`, unserialised. A launcher that
+   * spawns the worker directly should use it rather than re-parsing the string
+   * this host just quoted.
+   */
+  launch?: (
+    executable: string,
+    argsLine: string,
+    forceSecureConsole?: boolean,
+    args?: readonly string[],
+  ) => void;
   connectTimeoutMs?: number;
   virtualDisplayStartupMs?: number;
   virtualDisplayActivationMs?: number;
@@ -286,13 +296,14 @@ export class RemoteDesktopWorkerHost {
   }
 
   private async launchVerified(
-    argsLine: string,
+    args: readonly string[],
     allowSecureDesktopFallback = true,
     forceSecureConsole = false,
   ): Promise<void> {
     const artifact = await this.verifiedArtifactForLaunch();
+    const argsLine = args.map(quoteWindowsArgument).join(' ');
     if (this.options.launch) {
-      this.options.launch(artifact.executablePath, argsLine, forceSecureConsole);
+      this.options.launch(artifact.executablePath, argsLine, forceSecureConsole, args);
     } else {
       launchWindowsRemoteDesktopCommand(
         artifact.executablePath,
@@ -606,11 +617,11 @@ export class RemoteDesktopWorkerHost {
               await (this.options.allowPipeClients
                 ?? allowWindowsNamedPipeClients)(this.pipePath);
           }
-          const argsLine = [
-            '--pipe', this.pipePath,
-            '--nonce', this.nonce,
-          ].map(quoteWindowsArgument).join(' ');
-            await this.launchVerified(argsLine, true, forceSecureConsole);
+            await this.launchVerified(
+              ['--pipe', this.pipePath, '--nonce', this.nonce],
+              true,
+              forceSecureConsole,
+            );
           } catch (error) {
             finish(error instanceof Error ? error : new Error(String(error)));
           }
@@ -755,7 +766,7 @@ export class RemoteDesktopWorkerHost {
       // immutable verified binary once in release-only mode on the same active
       // desktop. This command carries no credential, authority, or key history.
       if (this.tracked.size > 0 && this.artifact) {
-        void this.launchVerified('--release-all-input', false).catch(() => {
+        void this.launchVerified(['--release-all-input'], false).catch(() => {
           // The Server is still notified and the short lease still expires;
           // this best-effort recovery cannot restore a dead worker.
         });

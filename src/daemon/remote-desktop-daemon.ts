@@ -30,8 +30,10 @@ import {
   REMOTE_DESKTOP_COMPILED_SIGNER_SHA256,
   RemoteDesktopWorkerHost,
   verifyRemoteDesktopWorkerArtifact,
+  type RemoteDesktopWorkerHostOptions,
   type VerifiedRemoteDesktopWorkerArtifact,
 } from '../node/remote-desktop-worker-host.js';
+import { launchWindowsWorkerInCurrentSession } from '../node/windows-user-session.js';
 import type { RemoteDesktopCommandTarget } from '../node/remote-desktop-dispatch.js';
 import { downloadControlledNodeRemoteDesktopWorker } from '../node/self-upgrade.js';
 import { loadDaemonCredential, type DaemonCredential } from './machine-mcp-deps.js';
@@ -285,7 +287,12 @@ export class DaemonRemoteDesktop {
       ? this.deps.createHost(artifact, onMessage)
       : new RemoteDesktopWorkerHost(
         (message) => onMessage(message as unknown as Record<string, unknown>),
-        { artifact, platform: this.platform, trustedSignerSha256: this.artifactSigner },
+        {
+          artifact,
+          platform: this.platform,
+          trustedSignerSha256: this.artifactSigner,
+          ...daemonWorkerLaunchOptions(),
+        },
       );
     return this.host;
   }
@@ -302,6 +309,29 @@ export class DaemonRemoteDesktop {
     this.host?.close();
     this.host = null;
   }
+}
+
+/**
+ * How a daemon starts and reaches its worker, as opposed to a controlled node.
+ *
+ * Both defaults in the worker host assume the controlled node's shape: it runs
+ * as LocalSystem in session 0, so it launches the worker across the session
+ * boundary and widens the pipe ACL so the child — running as a different user,
+ * in a different session — can connect back. A daemon is already running as the
+ * interactive user, in the session being captured. It cannot take the first
+ * path (the launcher refuses anything but LocalSystem, and the privilege it
+ * needs is not held) and does not need the second (the pipe's default owner ACL
+ * already admits this process's own child).
+ */
+export function daemonWorkerLaunchOptions(
+  launchWorker = launchWindowsWorkerInCurrentSession,
+): Pick<RemoteDesktopWorkerHostOptions, 'launch' | 'allowPipeClients'> {
+  return {
+    launch: (executable, _argsLine, _forceSecureConsole, args) => {
+      launchWorker(executable, args ?? []);
+    },
+    allowPipeClients: () => {},
+  };
 }
 
 /**
