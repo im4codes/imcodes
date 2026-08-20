@@ -4,6 +4,7 @@ import { ApiError, createShare, listSharesForTarget, revokeShare, updateShare } 
 import {
   buildCurrentTabShareTarget,
   isParticipantRole,
+  shareTargetKey,
   type ShareDialogTarget,
   type ShareGrantSummary,
   type ShareRole,
@@ -42,11 +43,24 @@ export function ShareSessionDialog({ target, onClose, onSharesChanged, fixedTarg
   const [sharesLoading, setSharesLoading] = useState(false);
   const [updatingShareId, setUpdatingShareId] = useState<string | null>(null);
 
+  // ControlledNodesPanel refreshes presence in the background and recreates
+  // its inline target objects on every render. Depend on the target identity,
+  // not object identity, or the dialog continuously reloads and can overwrite
+  // a role mutation with a stale list response.
+  const fixedTargetKey = shareTargetKey(fixedTarget);
+
   const selectedTarget = useMemo<ShareTarget>(() => (
     fixedTarget ?? (targetChoice === 'server'
       ? { kind: 'server', serverId: target.serverId }
       : buildCurrentTabShareTarget(target))
-  ), [fixedTarget, target, targetChoice]);
+  ), [
+    fixedTargetKey,
+    target.serverId,
+    target.sessionName,
+    target.subSessionDisplayName,
+    target.subSessionId,
+    targetChoice,
+  ]);
 
   const targetLabel = fixedTarget
     ? target.tabLabel
@@ -215,7 +229,6 @@ export function ShareSessionDialog({ target, onClose, onSharesChanged, fixedTarg
                     value={share.role}
                     disabled={share.status !== 'active' || updatingShareId === share.id}
                     onInput={(e) => void handleRoleChange(share, (e.currentTarget as HTMLSelectElement).value as ShareRole)}
-                    onChange={(e) => void handleRoleChange(share, (e.currentTarget as HTMLSelectElement).value as ShareRole)}
                   >
                     <option value="viewer">{t('share.role.viewer')}</option>
                     <option value="participant">{t('share.role.participant')}</option>
