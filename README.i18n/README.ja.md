@@ -131,6 +131,12 @@ IM.codes は、自分で書いた supervisor の指示で、対応する agent s
 
 別のマシンを完全な IM.codes source server にせず、制限付きの controlled node として登録できます。`^` でターゲットを補完するか、`^^(name)` を直接挿入すると、許可された agent が scoped remote command、単一ファイル転送、型付き Computer Use tool をそのノードで実行できます。実行権限は所有者が有効化・取り消しでき、controlled node は通常の server/session 一覧には表示されず、各マシンは独立した認証情報を持ちます。ダウンロードリンクには有効期限がありますが、新しく取得したインストーラーは保存して複数マシンの登録に再利用できます。
 
+### リモートデスクトップ操作
+
+条件を満たす controlled node は、認可された Owner と Participant に対して連続した H.264 リモートデスクトップを提供します。ブラウザとネイティブ worker はまず WebRTC の直接経路を交渉し、TURN はフォールバックとしてのみ使用します。映像とマウス/キーボードのデータがアプリケーションサーバーを通ることはありません。既定は操作モードで、複数の認可された操作者を許可し、各視聴者は個別に閲覧モードへ切り替えられます。ディスプレイタブは右クリック/長押しメニューから 720p・1080p・1440p・4K を切り替えられ、モバイルではピンチ/ドラッグ操作に加えて、エッジパン・左中右ボタン・ホイールを備えた仮想マウスモードが使えます。
+
+Windows では署名済みのビルド済み worker を使うため、controlled node にコンパイラやメディア依存関係をインストールする必要はありません。**現在は Windows に対応、macOS と Linux は近日対応。**
+
 ### Computer Use とブラウザ自動化
 
 対応 SDK agent は型付き Computer Use tool でデスクトップアプリを操作できます。クロスプラットフォームのデスクトップアプリ操作には、Leo（[iFurySt](https://github.com/iFurySt)）による MIT ライセンスの [Open Computer Use](https://github.com/iFurySt/open-codex-computer-use) を統合しています。この統合機能について同プロジェクトに明確なクレジットを表します。

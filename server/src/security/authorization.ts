@@ -7,7 +7,13 @@ import type { Env } from '../env.js';
 import type { Database } from '../db/client.js';
 import { sha256Hex, verifyJwt } from './crypto.js';
 import { COOKIE_SESSION } from '../../../shared/cookie-names.js';
+import { AUTH_IDENTITY_ERRORS } from '../../../shared/auth-identity.js';
+import { EXPECTED_USER_ID_HEADER } from '../../../shared/http-header-names.js';
 import { NODE_ROLE, type NodeRole } from '../../../shared/remote-exec.js';
+import {
+  canOperateControlledMachine,
+  resolveControlledMachineAccess,
+} from '../share/machine-access.js';
 
 export type Role = 'owner' | 'admin' | 'member' | 'unauthenticated';
 
@@ -100,6 +106,22 @@ function getCookieFromHeader(cookieHeader: string | undefined, name: string): st
   return undefined;
 }
 
+/**
+ * A browser tab can retain account A in memory after another tab replaces the
+ * origin-wide auth cookie with account B. Updated clients attach the account
+ * they believe they are using; reject a mismatch before any route side effect.
+ * The header remains optional here for non-browser/legacy API clients. Routes
+ * that mint durable credentials may additionally require it.
+ */
+function rejectChangedClientIdentity(
+  c: Context<{ Bindings: Env }>,
+  authenticatedUserId: string,
+): Response | null {
+  const expectedUserId = c.req.header(EXPECTED_USER_ID_HEADER)?.trim();
+  if (!expectedUserId || expectedUserId === authenticatedUserId) return null;
+  return c.json({ error: AUTH_IDENTITY_ERRORS.CHANGED }, 409);
+}
+
 // ── Permission matrix ─────────────────────────────────────────────────────────
 
 type Operation = 'read' | 'write' | 'admin' | 'owner';
@@ -125,6 +147,8 @@ export function requireAuth() {
   return async (c: Context<{ Bindings: Env }>, next: Next): Promise<Response | void> => {
     const auth = await resolveAuth(c);
     if (!auth) return c.json({ error: 'unauthorized' }, 401);
+    const identityMismatch = rejectChangedClientIdentity(c, auth.userId);
+    if (identityMismatch) return identityMismatch;
     // Global default-deny: a controlled-node credential may ONLY reach the WS
     // presence/heartbeat + MACHINE_EXEC_RESULT surface, never a normal REST API (10.2).
     if (auth.nodeRole === NODE_ROLE.CONTROLLED) {
@@ -151,6 +175,8 @@ export function requireRole(minRole: Role) {
   return async (c: Context<{ Bindings: Env }>, next: Next): Promise<Response | void> => {
     const auth = await resolveAuth(c);
     if (!auth) return c.json({ error: 'unauthorized' }, 401);
+    const identityMismatch = rejectChangedClientIdentity(c, auth.userId);
+    if (identityMismatch) return identityMismatch;
     if (auth.nodeRole === NODE_ROLE.CONTROLLED) {
       return c.json({ error: 'forbidden', reason: 'controlled_node' }, 403);
     }
@@ -189,6 +215,8 @@ export function requireTeamRole(minRole: 'owner' | 'admin' | 'member' = 'member'
   return async (c: Context<{ Bindings: Env }>, next: Next): Promise<Response | void> => {
     const auth = await resolveAuth(c);
     if (!auth) return c.json({ error: 'unauthorized' }, 401);
+    const identityMismatch = rejectChangedClientIdentity(c, auth.userId);
+    if (identityMismatch) return identityMismatch;
 
     const teamId = c.req.param(paramName);
     const row = await c.env.DB.queryOne<{ role: Role }>(
@@ -212,6 +240,9 @@ export function requireTeamRole(minRole: 'owner' | 'admin' | 'member' = 'member'
 }
 
 export type ServerRole = 'owner' | 'admin' | 'member' | 'none';
+export type ServerWebSocketAccess =
+  | { kind: 'standard'; role: Exclude<ServerRole, 'none'> }
+  | { kind: 'controlled'; role: 'owner' | 'participant' };
 
 /**
  * Resolve the user's role for a specific server.
@@ -246,6 +277,34 @@ export async function resolveServerRole(
   }
 
   return 'none';
+}
+
+/**
+ * WebSocket admission includes active Owner/Participant controlled-machine
+ * grants, while keeping Viewers and unrelated users out. Returning the target
+ * kind lets WsBridge default-deny every non-remote-desktop browser frame even
+ * while the controlled daemon is offline or reconnecting.
+ */
+export async function resolveServerWebSocketAccess(
+  db: Database,
+  serverId: string,
+  userId: string,
+  now = Date.now(),
+): Promise<ServerWebSocketAccess | null> {
+  const target = await db.queryOne<{ node_role: string | null }>(
+    'SELECT node_role FROM servers WHERE id = $1 AND revoked_at IS NULL',
+    [serverId],
+  );
+  if (!target) return null;
+  if (target.node_role === NODE_ROLE.CONTROLLED) {
+    const controlled = await resolveControlledMachineAccess(db, userId, serverId, now);
+    if (!controlled) return null;
+    return canOperateControlledMachine(controlled.access_role)
+      ? { kind: 'controlled', role: controlled.access_role }
+      : null;
+  }
+  const role = await resolveServerRole(db, serverId, userId);
+  return role === 'none' ? null : { kind: 'standard', role };
 }
 
 /**

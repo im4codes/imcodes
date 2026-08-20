@@ -14,6 +14,7 @@ import {
   openComputerUseCallArgs,
   openComputerUseCandidateBinariesForTest,
   openComputerUseEnv,
+  selectOpenComputerUseBinaryForTest,
 } from '../../src/node/computer-use-runner.js';
 
 describe('computer use runner open-computer-use CLI', () => {
@@ -99,6 +100,32 @@ describe('computer use runner open-computer-use CLI', () => {
       if (previousDir === undefined) delete process.env.IMCODES_COMPUTER_USE_HELPER_DIR;
       else process.env.IMCODES_COMPUTER_USE_HELPER_DIR = previousDir;
     }
+  });
+
+  it('production Windows selection rejects PATH and unsigned helpers before choosing the anchored candidate', async () => {
+    const exists = vi.fn(async (path: string) => path !== 'C:\\missing.exe');
+    const verify = vi.fn(async (path: string) => path === 'C:\\signed.exe');
+    await expect(selectOpenComputerUseBinaryForTest([
+      'open-computer-use.exe',
+      'C:\\missing.exe',
+      'C:\\tampered.exe',
+      'C:\\signed.exe',
+    ], {
+      requireReleaseSignature: true,
+      fileExists: exists,
+      verifySignature: verify,
+    })).resolves.toBe('C:\\signed.exe');
+    expect(verify).toHaveBeenCalledWith('C:\\tampered.exe');
+    expect(verify).toHaveBeenCalledWith('C:\\signed.exe');
+    expect(verify).not.toHaveBeenCalledWith('open-computer-use.exe');
+  });
+
+  it('production Windows selection fails closed when no helper has the release signer', async () => {
+    await expect(selectOpenComputerUseBinaryForTest(['C:\\tampered.exe', 'open-computer-use.exe'], {
+      requireReleaseSignature: true,
+      fileExists: async () => true,
+      verifySignature: async () => false,
+    })).rejects.toThrow('signed_open_computer_use_helper_unavailable');
   });
 
   it('enables the Windows text fallback only for type_text on Windows', () => {

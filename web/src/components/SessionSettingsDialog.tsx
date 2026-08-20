@@ -955,6 +955,7 @@ export function SessionSettingsDialog({
       case 'cursor-headless': return t('session.agentType.cursor_headless');
       case 'grok-sdk': return t('session.agentType.grok_sdk');
       case 'kimi-sdk': return t('session.agentType.kimi_sdk');
+      case 'deepseek-harness': return t('session.agentType.deepseek_harness');
       default: return value;
     }
   };

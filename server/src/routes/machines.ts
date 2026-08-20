@@ -11,14 +11,40 @@ import {
   MACHINE_LIST_MAX_ITEMS,
   MACHINE_PRESENCE_STALENESS_MS,
   canonicalMachineOs,
+  type MachineAccessRole,
   type MachineSummary,
 } from '../../../shared/remote-exec.js';
 import {
   MACHINE_REASONS,
   normalizeMachineDisplayName,
 } from '../../../shared/machine-reference.js';
+import { listAccessibleControlledMachines } from '../share/machine-access.js';
+import { validateControlledNodeCapabilities } from '../../../shared/controlled-node-capabilities.js';
+import {
+  isImcodesVersionOutdated,
+  parseImcodesVersion,
+} from '../../../shared/imcodes-version.js';
+import { REMOTE_DESKTOP_TERMINAL_REASON } from '../../../shared/remote-desktop.js';
+import { randomUUID } from 'node:crypto';
+import { DAEMON_COMMAND_TYPES } from '../../../shared/daemon-command-types.js';
+import {
+  CONTROLLED_NODE_AUTO_UNLOCK_ACTION,
+  CONTROLLED_NODE_AUTO_UNLOCK_CAPABILITY,
+  CONTROLLED_NODE_AUTO_UNLOCK_ERROR,
+  CONTROLLED_NODE_AUTO_UNLOCK_LIMITS,
+} from '../../../shared/controlled-node-auto-unlock.js';
+import {
+  cancelPendingAutoUnlock,
+  registerPendingAutoUnlock,
+} from '../ws/auto-unlock-registry.js';
 
-export const machinesRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
+/** A node only has to reach its own disk, so this stays short. */
+const AUTO_UNLOCK_TIMEOUT_MS = 15_000;
+
+export const machinesRoutes = new Hono<{
+  Bindings: Env;
+  Variables: { userId: string; role: string; nodeRole?: string; authServerId?: string };
+}>();
 
 interface ControlledRow {
   id: string;
@@ -28,10 +54,15 @@ interface ControlledRow {
   last_heartbeat_at: number | null;
   exec_enabled: boolean;
   os: string | null;
+  daemon_version: string | null;
+  auto_unlock_configured: boolean;
+  host_server_id: string | null;
+  access_role: MachineAccessRole;
+  controlled_capabilities: unknown;
 }
 
 /**
- * Shared owner-scoped controlled-machine query + DTO mapping (F1: presence is
+ * Shared access-scoped controlled-machine query + DTO mapping (F1: presence is
  * read from the DB `status`/`last_heartbeat_at`, NOT per-pod WsBridge). Both the
  * MCP `list_machines` tool and this HTTP route use this — they do not call each other.
  */
@@ -39,21 +70,25 @@ export async function listControlledMachines(
   db: Database,
   userId: string,
   nowMs: number,
-): Promise<{ machines: (MachineSummary & { refName: string; displayName: string; execEnabled: boolean })[]; overLimit: boolean }> {
-  const rows = await db.query<ControlledRow>(
-    `SELECT id, ref_name, display_name, status, last_heartbeat_at, exec_enabled,
-            os
-       FROM servers
-      WHERE user_id = $1 AND node_role = $2 AND revoked_at IS NULL
-      ORDER BY display_name NULLS LAST, id
-      LIMIT $3`,
-    [userId, NODE_ROLE.CONTROLLED, MACHINE_LIST_MAX_ITEMS + 1],
+): Promise<{ machines: (MachineSummary & { refName: string; displayName: string; execEnabled: boolean; accessRole: MachineAccessRole })[]; overLimit: boolean }> {
+  const rows: ControlledRow[] = await listAccessibleControlledMachines(
+    db,
+    userId,
+    nowMs,
+    MACHINE_LIST_MAX_ITEMS + 1,
   );
   const overLimit = rows.length > MACHINE_LIST_MAX_ITEMS;
   const machines = rows.slice(0, MACHINE_LIST_MAX_ITEMS).map((r) => {
     const online = r.status === 'online'
       && typeof r.last_heartbeat_at === 'number'
       && nowMs - r.last_heartbeat_at < MACHINE_PRESENCE_STALENESS_MS;
+    const capabilities = validateControlledNodeCapabilities(r.controlled_capabilities);
+    // Only a parseable release is echoed back: the string arrives from the node
+    // itself, so this keeps arbitrary reported text out of every consumer.
+    const daemonVersion = typeof r.daemon_version === 'string'
+      && parseImcodesVersion(r.daemon_version) !== null
+      ? r.daemon_version.trim()
+      : null;
     return {
       serverId: r.id,
       name: r.display_name ?? r.ref_name ?? r.id,
@@ -61,22 +96,54 @@ export async function listControlledMachines(
       displayName: r.display_name ?? r.ref_name ?? r.id,
       online,
       nodeRole: NODE_ROLE.CONTROLLED,
-      execEnabled: r.exec_enabled === true,
+      // Viewers may inspect bounded metadata only. Projecting false here also
+      // keeps old MCP resolution logic from presenting a non-operable target.
+      execEnabled: r.exec_enabled === true && r.access_role !== 'viewer',
+      accessRole: r.access_role,
+      ...(capabilities.ok && capabilities.value.length > 0 ? { capabilities: capabilities.value } : {}),
       ...(canonicalMachineOs(r.os) ? { os: canonicalMachineOs(r.os) } : {}),
       ...(typeof r.last_heartbeat_at === 'number' ? { lastSeenMs: r.last_heartbeat_at } : {}),
+      ...(daemonVersion ? { daemonVersion } : {}),
+      // The comparison stays here: only the Server knows its release target,
+      // and a browser must not have to guess what "current" means.
+      ...(isImcodesVersionOutdated(daemonVersion, process.env.APP_VERSION)
+        ? { updateAvailable: true }
+        : {}),
+      // Presence of a stored sign-in secret, never the secret itself.
+      ...(r.auto_unlock_configured === true ? { autoUnlockConfigured: true } : {}),
+      // Same machine as that daemon: the browser keeps one remote-control entry
+      // instead of two that would fight over one desktop.
+      ...(typeof r.host_server_id === 'string' && r.host_server_id
+        ? { hostServerId: r.host_server_id }
+        : {}),
     };
   });
   return { machines, overLimit };
 }
 
-// GET /api/machines — owner-scoped controlled machine list with DB-backed presence.
+// GET /api/machines — owned + actively shared controlled machines with DB-backed presence.
 machinesRoutes.get('/', requireAuth(), async (c) => {
   const userId = c.get('userId' as never) as string;
   const { machines, overLimit } = await listControlledMachines(c.env.DB, userId, Date.now());
   if (overLimit) {
     return c.json({ error: 'machine_list_over_limit', maxItems: MACHINE_LIST_MAX_ITEMS }, 413);
   }
-  return c.json({ machines });
+  // Older daemons strictly reject unknown machine-list keys. Server-authenticated
+  // callers do not need the display-only role because every action is admitted
+  // again against the DB; preserve their legacy DTO during rolling upgrades.
+  const authenticatedDaemon = c.get('nodeRole') === NODE_ROLE.FULL
+    && typeof c.get('authServerId') === 'string';
+  const responseMachines = authenticatedDaemon
+    ? machines.map(({
+      accessRole: _accessRole,
+      capabilities: _capabilities,
+      daemonVersion: _daemonVersion,
+      updateAvailable: _updateAvailable,
+      autoUnlockConfigured: _autoUnlockConfigured,
+      ...machine
+    }) => machine)
+    : machines;
+  return c.json({ machines: responseMachines });
 });
 
 // POST /api/machines/:serverId/display-name — owner-controlled render name.
@@ -128,7 +195,9 @@ machinesRoutes.post('/:serverId/revoke', requireAuth(), async (c) => {
   // abandoned to `null` → the source sees an indeterminate outcome (the command
   // may already have run on the node), never a fabricated success/failure.
   try {
-    WsBridge.get(serverId).kickDaemon();
+    const bridge = WsBridge.get(serverId);
+    bridge.stopAllRemoteDesktop(REMOTE_DESKTOP_TERMINAL_REASON.AUTHORITY_REVOKED);
+    bridge.kickDaemon();
     abandonAllForTarget(serverId);
   } catch { /* offline / other pod */ }
   const ip = (c.get('clientIp' as never) as string) ?? 'unknown';
@@ -154,6 +223,11 @@ machinesRoutes.post('/:serverId/exec-enabled', requireAuth(), async (c) => {
     [serverId, userId, parsed.data.enabled, NODE_ROLE.CONTROLLED],
   );
   if (!row) return c.json({ error: 'not_found' }, 404);
+  if (!parsed.data.enabled) {
+    // This route is pod-sticky by serverId. Terminate every peer immediately
+    // after the DB mutation; worker lease expiry remains the lost-message guard.
+    WsBridge.get(serverId).stopAllRemoteDesktop(REMOTE_DESKTOP_TERMINAL_REASON.EXECUTION_DISABLED);
+  }
   const ip = (c.get('clientIp' as never) as string) ?? 'unknown';
   logAudit({
     userId,
@@ -162,4 +236,84 @@ machinesRoutes.post('/:serverId/exec-enabled', requireAuth(), async (c) => {
     details: { serverId, from: row.was === true, to: parsed.data.enabled },
   }, c.env.DB).catch(() => {});
   return c.json({ ok: true, execEnabled: parsed.data.enabled });
+});
+
+/**
+ * Store or clear the node's Windows sign-in secret so it can answer its own
+ * lock screen while an authorized controller watches.
+ *
+ * The secret is relayed and never retained: it is not written to the database,
+ * not placed in an audit detail, not logged, and not readable back through any
+ * route. Only the boolean outcome the node reports is persisted, so the list
+ * page can mark the node. Owner-only, like every other node mutation here.
+ */
+machinesRoutes.post('/:serverId/auto-unlock', requireAuth(), async (c) => {
+  const userId = c.get('userId' as never) as string;
+  const serverId = c.req.param('serverId');
+  if (!serverId) return c.json({ error: 'invalid_body' }, 400);
+  const body = await c.req.json().catch(() => null);
+  const parsed = z.object({
+    secret: z.string()
+      .min(1)
+      .max(CONTROLLED_NODE_AUTO_UNLOCK_LIMITS.MAX_SECRET_LENGTH)
+      .nullable(),
+  }).safeParse(body);
+  if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
+
+  const owned = await c.env.DB.queryOne<{ id: string; controlled_capabilities: unknown }>(
+    `SELECT id, controlled_capabilities FROM servers
+      WHERE id = $1 AND user_id = $2 AND node_role = $3 AND revoked_at IS NULL`,
+    [serverId, userId, NODE_ROLE.CONTROLLED],
+  );
+  if (!owned) return c.json({ error: 'not_found' }, 404);
+  // A node that never advertised auto unlock cannot answer this command; it
+  // would simply not reply, and the caller would wait out the whole timeout
+  // for what is really "this build does not have the feature".
+  const capabilities = validateControlledNodeCapabilities(owned.controlled_capabilities);
+  if (!capabilities.ok
+    || !capabilities.value.includes(CONTROLLED_NODE_AUTO_UNLOCK_CAPABILITY)) {
+    return c.json({ error: CONTROLLED_NODE_AUTO_UNLOCK_ERROR.UNSUPPORTED_PLATFORM }, 409);
+  }
+
+  const bridge = WsBridge.get(serverId);
+  const generation = bridge.daemonConnectionGeneration();
+  const requestId = randomUUID();
+  const pending = registerPendingAutoUnlock(
+    serverId,
+    requestId,
+    generation,
+    AUTO_UNLOCK_TIMEOUT_MS,
+  );
+  const sent = bridge.trySendAutoUnlock(JSON.stringify({
+    type: DAEMON_COMMAND_TYPES.CONTROLLED_NODE_AUTO_UNLOCK,
+    requestId,
+    action: parsed.data.secret === null
+      ? CONTROLLED_NODE_AUTO_UNLOCK_ACTION.CLEAR
+      : CONTROLLED_NODE_AUTO_UNLOCK_ACTION.SET,
+    ...(parsed.data.secret === null ? {} : { secret: parsed.data.secret }),
+  }), generation);
+  if (sent !== 'sent') {
+    cancelPendingAutoUnlock(requestId);
+    return c.json({ error: 'node_offline' }, 503);
+  }
+  const result = await pending;
+  if (!result) return c.json({ error: 'node_timeout' }, 504);
+
+  await c.env.DB.execute(
+    `UPDATE servers SET auto_unlock_configured = $3
+      WHERE id = $1 AND user_id = $2`,
+    [serverId, userId, result.configured],
+  );
+  const ip = (c.get('clientIp' as never) as string) ?? 'unknown';
+  logAudit({
+    userId,
+    action: 'machine.auto_unlock',
+    ip,
+    // Records the decision, never the secret.
+    details: { serverId, configured: result.configured, ok: result.ok },
+  }, c.env.DB).catch(() => {});
+  if (!result.ok) {
+    return c.json({ error: result.error ?? 'store_failed', configured: result.configured }, 502);
+  }
+  return c.json({ ok: true, autoUnlockConfigured: result.configured });
 });

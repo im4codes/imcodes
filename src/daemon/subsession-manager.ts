@@ -167,7 +167,7 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
       ...(sub.providerSessionId ? { ccSessionId: sub.ccSessionId ?? undefined, codexSessionId: sub.codexSessionId ?? undefined, fresh: sub.fresh } : {}),
       ...(!sub.providerSessionId && agentType === 'claude-code-sdk' ? { ccSessionId: randomUUID(), fresh: true } : {}),
       ...((agentType === 'codex-sdk' && !sub.providerSessionId)
-        || ((agentType === 'kimi-sdk' || agentType === 'grok-sdk') && !providerResumeId)
+        || ((agentType === 'kimi-sdk' || agentType === 'grok-sdk' || agentType === 'deepseek-harness') && !providerResumeId)
         ? { fresh: true }
         : {}),
       ...(sub.effort ? { effort: sub.effort } : {}),

@@ -104,6 +104,19 @@ describe('exec relay authorization matrix', () => {
     expect(b.reason).toBe('completed');
   });
 
+  it('gives an omitted timeout a 900 second node budget plus the 30 second relay buffer', async () => {
+    const app = buildApp(); const u = `u_${hex(4)}`; await createUser(db, u);
+    const src = await fullCredential(u); const tgt = await controlledServer(u);
+    dispatcher = async (_target, frame, deadlineMs) => {
+      expect(frame.timeoutMs).toBeUndefined();
+      expect(deadlineMs).toBe(930_000);
+      return { online: true, result: { requestId: 'x', ok: true, exitCode: 0, stdout: '', stderr: '', durationMs: 1 } };
+    };
+    const response = await post(app, src, tgt.serverId, { command: 'echo default' });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ outcome: 'completed' });
+  });
+
   it('streams ordered stdout/stderr fragments before one authoritative terminal frame', async () => {
     const app = buildApp(); const u = `u_${hex(4)}`; await createUser(db, u);
     const src = await fullCredential(u); const tgt = await controlledServer(u);

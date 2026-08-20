@@ -4,6 +4,7 @@ import type { ComponentChildren } from 'preact';
 import type { WsClient, ServerMessage } from '../ws-client.js';
 import { ChatMarkdown } from '../components/ChatMarkdown.js';
 import { REPO_MSG } from '@shared/repo-types.js';
+import { FS_SESSION_ROOT_PATH } from '../../../src/shared/transport/fs.js';
 import { DAEMON_MSG } from '@shared/daemon-events.js';
 import { forceRefreshSharedChangesForCheckout } from '../git-status-store.js';
 import { ingestSessionRepoContext, getSessionRepoContext } from '../session-repo-context-store.js';
@@ -80,6 +81,8 @@ interface Props {
   onCiEvent?: (run: { name: string; status: string; conclusion?: string; url: string; failedJobName?: string; failedStepName?: string }) => void;
   initialTab?: RepoPageTabKey;
   initialTabToken?: number;
+  scopeToSessionRoot?: boolean;
+  readOnly?: boolean;
 }
 
 export type RepoPageTabKey = 'issues' | 'prs' | 'branches' | 'commits' | 'actions';
@@ -184,8 +187,14 @@ function isTransientWsSendError(err: unknown): boolean {
 
 // ── Component ────────────────────────────────────────────────────────────────
 
-export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEvent, initialTab, initialTabToken }: Props) {
+export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEvent, initialTab, initialTabToken, scopeToSessionRoot = false, readOnly = false }: Props) {
   const { t } = useTranslation();
+  const requestProjectDir = scopeToSessionRoot ? FS_SESSION_ROOT_PATH : projectDir;
+  const sessionScope = scopeToSessionRoot && sessionId ? { sessionName: sessionId } : {};
+  const responseMatchesProject = useCallback(
+    (responseProjectDir: unknown) => scopeToSessionRoot || responseProjectDir === projectDir,
+    [projectDir, scopeToSessionRoot],
+  );
 
   const [context, setContext] = useState<RepoContext | null>(null);
   const [detectLoading, setDetectLoading] = useState(true);
@@ -322,31 +331,31 @@ export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEve
       const branch = tab === 'commits' ? getActiveBranch() : undefined;
       const repoGeneration = tab === 'commits' ? getActiveRepoGeneration() : undefined;
       if (tab === 'commits') {
-        rid = ws.repoCommitDetail(projectDir, id as string);
+        rid = ws.repoCommitDetail(requestProjectDir, id as string, sessionScope);
       } else if (tab === 'prs') {
-        rid = ws.repoPRDetail(projectDir, id as number);
+        rid = ws.repoPRDetail(requestProjectDir, id as number, sessionScope);
       } else {
-        rid = ws.repoIssueDetail(projectDir, id as number);
+        rid = ws.repoIssueDetail(requestProjectDir, id as number, sessionScope);
       }
       pendingRef.current.add(rid);
       detailReqRef.current.set(rid, { key, tab, branch, repoGeneration });
     } catch {
       setDetailState(prev => new Map(prev).set(key, 'error'));
     }
-  }, [ws, projectDir, expandedKey, detailData, getActiveBranch, getActiveRepoGeneration]);
+  }, [ws, requestProjectDir, sessionId, expandedKey, detailData, getActiveBranch, getActiveRepoGeneration]);
 
   const fetchActionDetail = useCallback((runId: number, opts?: { force?: boolean }) => {
     const key = `actions:${runId}`;
     if (detailState.get(key) === 'loading') return;
     setDetailState(prev => new Map(prev).set(key, 'loading'));
     try {
-      const rid = ws.repoActionDetail(projectDir, runId, opts);
+      const rid = ws.repoActionDetail(requestProjectDir, runId, { ...opts, ...sessionScope });
       pendingRef.current.add(rid);
       detailReqRef.current.set(rid, { key, tab: 'actions' });
     } catch {
       setDetailState(prev => new Map(prev).set(key, 'error'));
     }
-  }, [ws, projectDir, detailState]);
+  }, [ws, requestProjectDir, sessionId, detailState]);
 
   // ── Detect on mount ──────────────────────────────────────────────────────
 
@@ -365,7 +374,7 @@ export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEve
 
     let rid: string;
     try {
-      rid = ws.repoDetect(projectDir, { ...(opts?.force ? { force: true } : {}) });
+      rid = ws.repoDetect(requestProjectDir, { ...(opts?.force ? { force: true } : {}), ...sessionScope });
     } catch (err) {
       const nextRetry = detectRetryCountRef.current + 1;
       if (isTransientWsSendError(err) && nextRetry <= MAX_SILENT_RETRIES) {
@@ -410,7 +419,7 @@ export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEve
         }
       }
     }, 10_000);
-  }, [ws, projectDir]);
+  }, [ws, requestProjectDir, sessionId]);
 
   useEffect(() => {
     contextRef.current = null;
@@ -476,19 +485,19 @@ export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEve
       const branch = key === 'commits' ? getActiveBranch() : undefined;
       switch (key) {
         case 'issues':
-          rid = ws.repoListIssues(projectDir, { page, ...(force ? { force: true } : {}) });
+          rid = ws.repoListIssues(requestProjectDir, { page, ...(force ? { force: true } : {}), ...sessionScope });
           break;
         case 'prs':
-          rid = ws.repoListPRs(projectDir, { page, ...(force ? { force: true } : {}) });
+          rid = ws.repoListPRs(requestProjectDir, { page, ...(force ? { force: true } : {}), ...sessionScope });
           break;
         case 'branches':
-          rid = ws.repoListBranches(projectDir, { ...(force ? { force: true } : {}) });
+          rid = ws.repoListBranches(requestProjectDir, { ...(force ? { force: true } : {}), ...sessionScope });
           break;
         case 'commits':
-          rid = ws.repoListCommits(projectDir, { page, ...(branch ? { branch } : {}), ...(force ? { force: true } : {}) });
+          rid = ws.repoListCommits(requestProjectDir, { page, ...(branch ? { branch } : {}), ...(force ? { force: true } : {}), ...sessionScope });
           break;
         case 'actions':
-          rid = ws.repoListActions(projectDir, { page, ...(force ? { force: true } : {}) });
+          rid = ws.repoListActions(requestProjectDir, { page, ...(force ? { force: true } : {}), ...sessionScope });
           break;
       }
     } catch (err) {
@@ -528,7 +537,7 @@ export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEve
       ...(key === 'commits' && getActiveBranch() ? { branch: getActiveBranch() } : {}),
       ...(getActiveRepoGeneration() !== undefined ? { repoGeneration: getActiveRepoGeneration() } : {}),
     });
-  }, [ws, projectDir, updateTab, getActiveBranch, getActiveRepoGeneration]);
+  }, [ws, requestProjectDir, sessionId, updateTab, getActiveBranch, getActiveRepoGeneration]);
 
   // Lazy-load: fetch tab data on first activation
   useEffect(() => {
@@ -598,7 +607,10 @@ export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEve
 
       // Passive detect push — only accept if projectDir matches
       if (msg.type === REPO_MSG.DETECTED) {
-        if (msg.projectDir !== projectDir) return;
+        // Shared views use an opaque virtual root and receive only their own
+        // request-scoped responses; an unsolicited host-path push must not
+        // become a second source of shared repository state.
+        if (scopeToSessionRoot || msg.projectDir !== projectDir) return;
         applyDetectContext(msg.context);
         return;
       }
@@ -702,7 +714,7 @@ export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEve
 
       if (msg.type === REPO_MSG.CHECKOUT_BRANCH_RESPONSE) {
         const m = msg as any;
-        if (m.projectDir !== projectDir) return;
+        if (!responseMatchesProject(m.projectDir)) return;
         if (!m.requestId || m.requestId !== checkoutReqRef.current) return;
         pendingRef.current.delete(m.requestId);
         checkoutReqRef.current = null;
@@ -755,7 +767,12 @@ export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEve
           doDetect({ preserveUi: true, force: true });
           fetchTab('branches', 1, true, { preserveUi: true });
           fetchTab('commits', 1, true, { preserveUi: true });
-          forceRefreshSharedChangesForCheckout(ws, projectDir, generation ?? undefined);
+          forceRefreshSharedChangesForCheckout(
+            ws,
+            requestProjectDir,
+            generation ?? undefined,
+            scopeToSessionRoot ? sessionId ?? undefined : undefined,
+          );
         }
         return;
       }
@@ -763,7 +780,7 @@ export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEve
       // Detail responses
       if (msg.type === REPO_MSG.ACTION_DETAIL_RESPONSE) {
         const m = msg as any;
-        if (m.projectDir !== projectDir) return;
+        if (!responseMatchesProject(m.projectDir)) return;
         if (m.requestId) {
           const meta = detailReqRef.current.get(m.requestId);
           if (!meta || meta.tab !== 'actions') return;
@@ -786,7 +803,7 @@ export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEve
       }
       if (msg.type === REPO_MSG.COMMIT_DETAIL_RESPONSE) {
         const m = msg as any;
-        if (m.projectDir !== projectDir) return;
+        if (!responseMatchesProject(m.projectDir)) return;
         if (!m.requestId) return;
         const meta = detailReqRef.current.get(m.requestId);
         if (!meta || meta.tab !== 'commits' || isCommitDetailRequestStale(meta)) {
@@ -804,7 +821,7 @@ export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEve
       }
       if (msg.type === REPO_MSG.PR_DETAIL_RESPONSE) {
         const m = msg as any;
-        if (m.projectDir !== projectDir) return;
+        if (!responseMatchesProject(m.projectDir)) return;
         if (m.requestId) {
           const meta = detailReqRef.current.get(m.requestId);
           if (!meta || meta.tab !== 'prs') return;
@@ -818,7 +835,7 @@ export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEve
       }
       if (msg.type === REPO_MSG.ISSUE_DETAIL_RESPONSE) {
         const m = msg as any;
-        if (m.projectDir !== projectDir) return;
+        if (!responseMatchesProject(m.projectDir)) return;
         if (m.requestId) {
           const meta = detailReqRef.current.get(m.requestId);
           if (!meta || meta.tab !== 'issues') return;
@@ -856,7 +873,7 @@ export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEve
         if (retryTimer) clearTimeout(retryTimer);
         tabRetryTimersRef.current.delete(tabKey);
         // Stale response check — projectDir must match
-        if (m.projectDir !== projectDir) return;
+        if (!responseMatchesProject(m.projectDir)) return;
         if (isBranchScopedRequestStale(meta)) return;
         setTabs(prev => {
           const existing = prev[tabKey];
@@ -895,7 +912,18 @@ export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEve
         });
       }
     });
-  }, [ws, projectDir, doDetect, onCiEvent, tabs.actions.items, fetchActionDetail]);
+  }, [
+    ws,
+    projectDir,
+    requestProjectDir,
+    sessionId,
+    scopeToSessionRoot,
+    responseMatchesProject,
+    doDetect,
+    onCiEvent,
+    tabs.actions.items,
+    fetchActionDetail,
+  ]);
 
   useEffect(() => {
     if (!tabs.actions.fetched || tabs.actions.items.length === 0) return;
@@ -979,7 +1007,7 @@ export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEve
     setCheckoutPendingBranch(branch);
     checkoutPendingBranchRef.current = branch;
     try {
-      const rid = ws.repoCheckoutBranch(projectDir, branch, { sessionId });
+      const rid = ws.repoCheckoutBranch(requestProjectDir, branch, { sessionId });
       checkoutReqRef.current = rid;
       pendingRef.current.add(rid);
     } catch {
@@ -988,7 +1016,7 @@ export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEve
       setCheckoutPendingBranch(null);
       setCheckoutFeedback({ kind: 'error', error: 'checkout_failed', branch });
     }
-  }, [checkoutPendingBranch, projectDir, sessionId, ws]);
+  }, [checkoutPendingBranch, requestProjectDir, sessionId, ws]);
 
   // ── CI/CD auto-refresh: 10s when running, 30s otherwise (always active) ─
   useEffect(() => {
@@ -1157,7 +1185,7 @@ export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEve
       ? item.checkoutBlockedReason || (!localPresent ? 'invalid_checkout_target' : null)
       : null;
     const isPending = checkoutPendingBranch === name;
-    const canSwitch = checkoutable && !isCurrent && !checkoutPendingBranch;
+    const canSwitch = !readOnly && checkoutable && !isCurrent && !checkoutPendingBranch;
     const disabledTitle = !canSwitch && !isCurrent
       ? disabledReason === 'invalid_checkout_target' && !localPresent
         ? t('repo.checkout_remote_only_disabled')
@@ -1187,7 +1215,7 @@ export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEve
             <span title={t('repo.branch_remote_label')} style={{ fontSize: 10, color: '#c4b5fd', flexShrink: 0 }}>{t('repo.branch_remote_short')}</span>
           )}
           <span style={{ flex: 1 }} />
-          {isCurrent ? null : (
+          {isCurrent || readOnly ? null : (
             <button
               class="btn btn-sm"
               disabled={!canSwitch}
@@ -1231,7 +1259,7 @@ export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEve
       if (filesDetail || detailStateRef.current.get(commitKey) === 'loading') return;
       setDetailState(prev => new Map(prev).set(commitKey, 'loading'));
       try {
-        const rid = ws.repoCommitDetail(projectDir, sha);
+        const rid = ws.repoCommitDetail(requestProjectDir, sha, sessionScope);
         pendingRef.current.add(rid);
         detailReqRef.current.set(rid, {
           key: commitKey,

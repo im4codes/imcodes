@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 // ── Hoisted mocks ─────────────────────────────────────────────────────────────
 
-const { mockConnect, mockDisconnect, MockOpenClawProvider, MockQwenProvider, MockClaudeCodeSdkProvider, MockCodexSdkProvider, MockQoderSdkProvider, MockCursorHeadlessProvider, MockCopilotSdkProvider, MockOpenCodeSdkProvider, MockKimiSdkProvider, MockGrokSdkProvider } = vi.hoisted(() => {
+const { mockConnect, mockDisconnect, MockOpenClawProvider, MockQwenProvider, MockClaudeCodeSdkProvider, MockCodexSdkProvider, MockQoderSdkProvider, MockCursorHeadlessProvider, MockCopilotSdkProvider, MockOpenCodeSdkProvider, MockKimiSdkProvider, MockGrokSdkProvider, MockDeepseekHarnessProvider } = vi.hoisted(() => {
   const mockConnect = vi.fn().mockResolvedValue(undefined);
   const mockDisconnect = vi.fn().mockResolvedValue(undefined);
   const MockOpenClawProvider = vi.fn().mockImplementation(() => ({
@@ -217,7 +217,28 @@ const { mockConnect, mockDisconnect, MockOpenClawProvider, MockQwenProvider, Moc
     createSession: vi.fn().mockResolvedValue('route-grok'),
     endSession: vi.fn().mockResolvedValue(undefined),
   }));
-  return { mockConnect, mockDisconnect, MockOpenClawProvider, MockQwenProvider, MockClaudeCodeSdkProvider, MockCodexSdkProvider, MockQoderSdkProvider, MockCursorHeadlessProvider, MockCopilotSdkProvider, MockOpenCodeSdkProvider, MockKimiSdkProvider, MockGrokSdkProvider };
+  const MockDeepseekHarnessProvider = vi.fn().mockImplementation(() => ({
+    id: 'deepseek-harness',
+    connectionMode: 'local-sdk',
+    sessionOwnership: 'shared',
+    capabilities: {
+      streaming: true,
+      toolCalling: true,
+      approval: false,
+      sessionRestore: true,
+      multiTurn: true,
+      attachments: false,
+    },
+    connect: mockConnect,
+    disconnect: mockDisconnect,
+    send: vi.fn().mockResolvedValue(undefined),
+    onDelta: vi.fn(),
+    onComplete: vi.fn(),
+    onError: vi.fn(),
+    createSession: vi.fn().mockResolvedValue('session-1'),
+    endSession: vi.fn().mockResolvedValue(undefined),
+  }));
+  return { mockConnect, mockDisconnect, MockOpenClawProvider, MockQwenProvider, MockClaudeCodeSdkProvider, MockCodexSdkProvider, MockQoderSdkProvider, MockCursorHeadlessProvider, MockCopilotSdkProvider, MockOpenCodeSdkProvider, MockKimiSdkProvider, MockGrokSdkProvider, MockDeepseekHarnessProvider };
 });
 
 vi.mock('../../src/agent/providers/openclaw.js', () => ({
@@ -246,6 +267,10 @@ vi.mock('../../src/agent/providers/cursor-headless.js', () => ({
 
 vi.mock('../../src/agent/providers/copilot-sdk.js', () => ({
   CopilotSdkProvider: MockCopilotSdkProvider,
+}));
+
+vi.mock('../../src/agent/providers/deepseek-harness.js', () => ({
+  DeepseekHarnessProvider: MockDeepseekHarnessProvider,
 }));
 
 vi.mock('../../src/agent/providers/opencode-sdk.js', () => ({
@@ -353,6 +378,13 @@ describe('getProvider', () => {
     expect(provider!.id).toBe('opencode-sdk');
   });
 
+  it('returns deepseek-harness after connectProvider()', async () => {
+    await connectProvider('deepseek-harness', CONFIG);
+    const provider = getProvider('deepseek-harness');
+    expect(provider).toBeDefined();
+    expect(provider!.id).toBe('deepseek-harness');
+  });
+
   it('returns kimi-sdk after connectProvider()', async () => {
     await connectProvider('kimi-sdk', CONFIG);
     const provider = getProvider('kimi-sdk');
@@ -419,6 +451,12 @@ describe('connectProvider', () => {
   it('instantiates OpenCodeSdkProvider and calls connect()', async () => {
     await connectProvider('opencode-sdk', CONFIG);
     expect(MockOpenCodeSdkProvider).toHaveBeenCalledOnce();
+    expect(mockConnect).toHaveBeenCalledWith(CONFIG);
+  });
+
+  it('instantiates DeepseekHarnessProvider and calls connect()', async () => {
+    await connectProvider('deepseek-harness', CONFIG);
+    expect(MockDeepseekHarnessProvider).toHaveBeenCalledOnce();
     expect(mockConnect).toHaveBeenCalledWith(CONFIG);
   });
 

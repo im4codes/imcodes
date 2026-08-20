@@ -5,6 +5,7 @@ import {
   DIRECT_CONNECTIVITY_ENDPOINT_KIND,
   DIRECT_CONNECTIVITY_ROUTE,
   DIRECT_FILE_TRANSFER_DATA_MSG,
+  DIRECT_FILE_TRANSFER_LIMITS,
   DIRECT_FILE_TRANSFER_MSG,
   DIRECT_FILE_TRANSFER_PURPOSE,
   inferDirectConnectivityEndpointKind,
@@ -31,6 +32,34 @@ describe('direct file transfer protocol', () => {
     };
     expect(validateDirectFileTransferBrowserMessage(valid)).toMatchObject({ ok: true });
     expect(validateDirectFileTransferBrowserMessage({ ...valid, serverId: 'forged' })).toEqual({
+      ok: false,
+      error: 'invalid_request',
+    });
+  });
+
+  it('accepts a bounded browser-only session authorization hint without widening daemon authority schemas', () => {
+    const init = {
+      type: DIRECT_FILE_TRANSFER_MSG.INIT,
+      requestId,
+      clientUploadId,
+      filename: 'shared.bin',
+      size: 100,
+      sessionName: 'deck_project_brain',
+    };
+    expect(validateDirectFileTransferBrowserMessage(init)).toMatchObject({ ok: true });
+    expect(validateDirectFileTransferBrowserMessage({
+      ...init,
+      sessionName: 'x'.repeat(DIRECT_FILE_TRANSFER_LIMITS.SESSION_NAME_BYTES + 1),
+    })).toEqual({ ok: false, error: 'invalid_request' });
+
+    const prepare = {
+      ...init,
+      type: DIRECT_FILE_TRANSFER_MSG.PREPARE,
+      capability,
+      expiresAt: Date.now() + 60_000,
+      iceServers: ['stun:stun.cloudflare.com:3478'],
+    };
+    expect(validateDirectFileTransferDaemonCommand(prepare)).toEqual({
       ok: false,
       error: 'invalid_request',
     });

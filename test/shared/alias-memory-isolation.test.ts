@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { ALIAS_MCP_TOOLS } from '../../shared/alias-types.js';
 import { MEMORY_MCP_TOOL_NAME_LIST } from '../../shared/memory-mcp-contracts.js';
+import { MESSAGE_PIN_MCP_TOOLS } from '../../shared/message-pins.js';
 
 // Task 12.10: the alias store (server-side `user_aliases`) is a distinct store that is
 // NOT indexed by, ingested into, or surfaced through the memory system. The alias MCP
@@ -25,5 +26,12 @@ describe('alias <-> memory isolation (12.10)', () => {
     expect(names.has('delete_alias')).toBe(false);
     expect(names.has('resolve_alias')).toBe(false);
     expect(names.has('list_aliases')).toBe(false);
+  });
+
+  it('keeps the exact message-pin store outside fuzzy memory contracts', () => {
+    const memoryTools = new Set<string>(MEMORY_MCP_TOOL_NAME_LIST as readonly string[]);
+    for (const name of Object.values(MESSAGE_PIN_MCP_TOOLS)) {
+      expect(memoryTools.has(name)).toBe(false);
+    }
   });
 });

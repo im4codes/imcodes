@@ -26,6 +26,7 @@ import { useQuickData } from './QuickInputPanel.js';
 import { useSharedGitChanges } from '../git-status-store.js';
 import type { WsClient } from '../ws-client.js';
 import type { TerminalDiff, SessionInfo } from '../types.js';
+import type { SharedStateSummary } from '../tab-sharing-ui.js';
 import type { SubSession } from '../hooks/useSubSessions.js';
 import { extractLatestUsage } from '../usage-data.js';
 import { IdleFlashLayer } from './IdleFlashLayer.js';
@@ -52,6 +53,8 @@ import { DEFAULT_SUBSESSION_ACCENT_COLOR } from '../subsession-accent-colors.js'
 import { EXECUTION_CLONE_KIND } from '@shared/execution-clone.js';
 import type { SessionSettingsOpenIntent } from '../session-settings-open-intent.js';
 import { useStableCallback } from '../hooks/useStableCallback.js';
+import type { ChatLocalWebPreviewOpenHandler } from './ChatLoopbackLink.js';
+import { RESIZE_DIRS, resizeHandleClass, type ResizeDir } from './window-resize.js';
 
 function isExecutionCloneTemplateLike(sub: { executionCloneKind?: string | null; parentRunId?: string | null }): boolean {
   return sub.executionCloneKind === EXECUTION_CLONE_KIND || typeof sub.parentRunId === 'string';
@@ -85,6 +88,8 @@ interface Props {
   onTransportConfigSaved?: (transportConfig: Record<string, unknown> | null) => void;
   /** Open a file preview in the shared floating preview host. */
   onPreviewFile?: (request: FileBrowserPreviewRequest) => void;
+  /** Open a loopback URL in the shared local-web-preview host. */
+  onOpenLocalWebPreview?: ChatLocalWebPreviewOpenHandler;
   zIndex: number;
   onFocus: () => void;
   /**
@@ -122,6 +127,7 @@ interface Props {
   detectedModelHint?: string;
   /** Whether this sub-session is participating in an active P2P discussion. */
   inP2p?: boolean;
+  sharedState?: SharedStateSummary | null;
   accentColor?: string;
 }
 
@@ -253,7 +259,7 @@ function saveLocal(id: string, geom: WindowGeometry, viewMode: ViewMode) {
 }
 
 export function SubSessionWindow({
-  sub, ws, connected, active, onPendingQuestion, idleFlashToken, onDiff, onHistory, onMinimize, onClose, maximized = false, onToggleMaximized, onRestoreBeforeClose, getMaximizeBounds, desktopLayoutCapable = true, onRestart, onRename, onSettings, onShareSession, onViewRepo, onTransportConfigSaved, onPreviewFile, zIndex, onFocus, desktopFileBrowserZIndex, onDesktopFileBrowserOpen, onDesktopFileBrowserFocus, onDesktopFileBrowserClose, onPin, sessions, subSessions, serverId, pendingPrefillText, onPendingPrefillApplied, onVersionSensitiveAction, detectedModelHint, inP2p, accentColor = DEFAULT_SUBSESSION_ACCENT_COLOR,
+  sub, ws, connected, active, onPendingQuestion, idleFlashToken, onDiff, onHistory, onMinimize, onClose, maximized = false, onToggleMaximized, onRestoreBeforeClose, getMaximizeBounds, desktopLayoutCapable = true, onRestart, onRename, onSettings, onShareSession, onViewRepo, onTransportConfigSaved, onPreviewFile, onOpenLocalWebPreview, zIndex, onFocus, desktopFileBrowserZIndex, onDesktopFileBrowserOpen, onDesktopFileBrowserFocus, onDesktopFileBrowserClose, onPin, sessions, subSessions, serverId, pendingPrefillText, onPendingPrefillApplied, onVersionSensitiveAction, detectedModelHint, inP2p, sharedState, accentColor = DEFAULT_SUBSESSION_ACCENT_COLOR,
 }: Props) {
   const { t } = useTranslation();
   const activeIdleFlashToken = useIdleFlashPlayback(idleFlashToken);
@@ -282,6 +288,7 @@ export function SubSessionWindow({
     loadingOlder,
     hasOlderHistory,
     loadOlderEvents,
+    loadMessageContext,
   } = useTimeline(sub.sessionName, ws, serverId, {
     // Any mounted sub-session window is user-visible work, even when it is not
     // the focused/topmost one. Keep its active history/replay/retry path armed
@@ -461,6 +468,7 @@ export function SubSessionWindow({
     transportPendingMessages: sub.transportPendingMessages ?? undefined,
     transportPendingMessageEntries: sub.transportPendingMessageEntries ?? undefined,
     transportPendingMessageVersion: sub.transportPendingMessageVersion ?? undefined,
+    sharedState,
   };
   // Keep the controls' working sweep on the same reconciled live state as the
   // footer. Transport sub-session metadata can lag the authoritative timeline
@@ -518,6 +526,7 @@ export function SubSessionWindow({
   // identity on every timeline event, defeating ChatView's memo boundary.
   const stableOnViewRepo = useStableCallback(onViewRepo);
   const stableOnPreviewFile = useStableCallback(onPreviewFile);
+  const stableOnOpenLocalWebPreview = useStableCallback(onOpenLocalWebPreview);
 
   // Non-shell window: subscribe raw only while focused (full-fidelity view); when
   // unfocused it falls back to the passive (non-raw) subscription app.tsx keeps.
@@ -616,13 +625,17 @@ export function SubSessionWindow({
   const onHeaderMouseDown = startDrag;
 
   // ── Resizing ──────────────────────────────────────────────────────────────
-  type ResizeDir = 'n' | 's' | 'e' | 'w' | 'ne' | 'nw' | 'se' | 'sw';
+  // Which edge is being dragged, or null. Drives the lit affordance: a resize
+  // routinely drags the pointer off the 6px strip, so `:hover` alone would blink
+  // the indicator out mid-gesture.
+  const [resizingDir, setResizingDir] = useState<ResizeDir | null>(null);
 
   const onResizeMouseDown = useCallback((dir: ResizeDir) => (e: MouseEvent) => {
     e.stopPropagation();
     e.preventDefault();
     if (isDesktopMaximized) return;
     onFocus();
+    setResizingDir(dir);
     const startG = { ...geomRef.current };
     const sx = e.clientX, sy = e.clientY;
     const onMove = (me: MouseEvent) => {
@@ -643,6 +656,7 @@ export function SubSessionWindow({
       });
     };
     const onUp = () => {
+      setResizingDir(null);
       document.removeEventListener('mousemove', onMove);
       document.removeEventListener('mouseup', onUp);
     };
@@ -786,6 +800,11 @@ export function SubSessionWindow({
       }
       const tabBar = document.querySelector<HTMLElement>('.tab-bar');
       if (tabBar) ro.observe(tabBar);
+      // Observe the content column too. When the tab bar is missing at this
+      // moment nothing else would ever re-measure, and the window stays pinned
+      // to the top of the viewport with its title bar under the app header.
+      const mainContent = document.querySelector<HTMLElement>('.main');
+      if (mainContent) ro.observe(mainContent);
     };
 
     observeTargets();
@@ -859,6 +878,7 @@ export function SubSessionWindow({
     'subsession-window',
     isDesktopMaximized ? 'subsession-window-maximized' : '',
     desktopLayoutCapable && !isMobile && active ? 'subsession-window-active' : '',
+    resizingDir ? 'is-resizing' : '',
   ].filter(Boolean).join(' ');
 
   return (
@@ -866,12 +886,19 @@ export function SubSessionWindow({
       ref={swipeBackRef}
       class={rootClass}
       style={style}
+      // Capture phase: an inner widget (xterm with mouse reporting on, a
+      // canvas, a future third-party embed) may stopPropagation on the way up,
+      // which used to leave a background window unraisable depending on where
+      // you happened to click. Capture runs before any of them. `onMouseDown`
+      // stays for environments without pointer events; raising twice is a
+      // no-op because the stack ignores an already-frontmost window.
+      onPointerDownCapture={onFocus}
       onMouseDown={onFocus}
     >
       {activeIdleFlashToken ? <IdleFlashLayer key={`subwindow-idle-${activeIdleFlashToken}`} variant="frame" /> : null}
       {/* 8-direction resize handles (desktop only) */}
-      {!isMobile && !isDesktopMaximized && (['n','s','e','w','ne','nw','se','sw'] as ResizeDir[]).map((dir) => (
-        <div key={dir} class={`resize-handle resize-${dir}`} onMouseDown={onResizeMouseDown(dir)} />
+      {!isMobile && !isDesktopMaximized && RESIZE_DIRS.map((dir) => (
+        <div key={dir} class={resizeHandleClass(dir, resizingDir)} onMouseDown={onResizeMouseDown(dir)} />
       ))}
 
       {/* Header */}
@@ -955,6 +982,7 @@ export function SubSessionWindow({
             loadingOlder={loadingOlder}
             hasOlderHistory={hasOlderHistory}
             onLoadOlder={loadOlderEvents}
+            onLoadMessageContext={loadMessageContext}
             sessionId={sub.sessionName}
             onForceSync={timelineForceRefresh}
             onScrollBottomFn={onChatScrollBottomFn}
@@ -962,10 +990,12 @@ export function SubSessionWindow({
             workdir={sub.cwd ?? null}
             onViewRepo={stableOnViewRepo}
             onPreviewFile={stableOnPreviewFile}
+            onOpenLocalWebPreview={onOpenLocalWebPreview ? stableOnOpenLocalWebPreview : undefined}
             serverId={serverId}
             onQuote={addQuote}
             agentType={sessionInfo?.agentType ?? sub.type}
             onResendFailed={handleResendFailed}
+            messagePinsEnabled
           />
         )}
       </div>

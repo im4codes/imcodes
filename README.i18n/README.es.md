@@ -132,6 +132,12 @@ Guarda fragmentos de texto reutilizables vinculados al propietario y búscalos e
 
 Registra otra máquina como nodo controlado restringido sin convertirla en un source server completo de IM.codes. Escribe `^` para autocompletar el destino o inserta `^^(name)`; los agentes autorizados podrán ejecutar comandos remotos con alcance, transferir archivos individuales o invocar herramientas Computer Use tipadas en ese nodo. El propietario habilita y puede revocar la ejecución, los nodos controlados no aparecen en las listas normales de server/session y cada máquina usa credenciales independientes. El enlace de descarga caduca, pero un instalador recién descargado puede conservarse y reutilizarse para registrar varias máquinas.
 
+### Control de escritorio remoto
+
+Los nodos controlados compatibles ofrecen un escritorio remoto H.264 continuo a los Owners y Participants autorizados. El navegador y el worker nativo negocian primero una ruta WebRTC directa y solo usan TURN como respaldo; el vídeo y los datos de ratón/teclado nunca pasan por el servidor de la aplicación. El modo de control es el predeterminado, se permiten varios controladores autorizados y cada espectador puede cambiar por su cuenta al modo de solo vista. Las pestañas de pantalla ofrecen un menú contextual (clic derecho o pulsación larga) para 720p, 1080p, 1440p y 4K; en móvil hay navegación con pellizco/arrastre y un modo de ratón virtual con desplazamiento por bordes, botones izquierdo/central/derecho y rueda.
+
+En Windows se usa un worker firmado y precompilado: los nodos controlados no instalan compiladores ni dependencias multimedia. **Hoy disponible en Windows; macOS y Linux muy pronto.**
+
 ### Computer Use y automatización del navegador
 
 Los agentes SDK compatibles pueden controlar aplicaciones de escritorio mediante herramientas Computer Use tipadas. La ruta multiplataforma para aplicaciones de escritorio integra [Open Computer Use](https://github.com/iFurySt/open-codex-computer-use), de Leo ([iFurySt](https://github.com/iFurySt)), publicado con licencia MIT; se acredita expresamente a ese proyecto por esta capacidad integrada.

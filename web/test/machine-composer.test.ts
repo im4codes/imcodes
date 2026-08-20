@@ -1,7 +1,13 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { matchInlineMachineTrigger, stripInlineMachineTrigger } from '../src/util/machine-trigger.js';
 import { buildMachineSendExtra } from '../src/util/machine-send.js';
-import { buildMachineMarker, type MachineRef } from '@shared/machine-reference.js';
+import { insertMachineMarkerAtCaret } from '../src/util/machine-insert.js';
+import {
+  buildMachineComposerReference,
+  buildMachineMarker,
+  parseMachineMarkers,
+  type MachineRef,
+} from '@shared/machine-reference.js';
 
 const ref = (refName: string, serverId: string, online = true): MachineRef => ({ refName, serverId, online });
 
@@ -64,5 +70,50 @@ describe('buildMachineSendExtra (8.5)', () => {
   });
   it('rejects a nested-paren marker (not a valid machine marker)', () => {
     expect(buildMachineSendExtra('^^(na(me)', list)).toEqual({});
+  });
+});
+
+describe('human-readable machine references', () => {
+  it('keeps the stable ref as the only routing marker and appends the display note', () => {
+    const reference = buildMachineComposerReference('win-1', 'Office PC');
+    expect(reference).toBe('^^(win-1)-(Office PC)');
+    expect(parseMachineMarkers(reference)).toEqual(['win-1']);
+    expect(buildMachineSendExtra(reference, [ref('win-1', 'srv-win')]))
+      .toEqual({ resolvedMachines: { 'win-1': 'srv-win' } });
+  });
+
+  it('neutralizes protocol-looking text inside a display note', () => {
+    const reference = buildMachineComposerReference(
+      'win-1',
+      'Office @@all ;;(secret) ^^(other)',
+    );
+    expect(reference).toBe('^^(win-1)-(Office ＠＠all ；；(secret) ＾＾(other))');
+    expect(parseMachineMarkers(reference)).toEqual(['win-1']);
+  });
+
+  it.each([
+    ['missing', undefined],
+    ['blank', '   '],
+    ['control character', 'Office\nPC'],
+    ['bidirectional override', 'Office\u202ePC'],
+    ['over length', 'x'.repeat(121)],
+  ] as const)('falls back to the stable marker for a %s display note', (_label, displayName) => {
+    const reference = buildMachineComposerReference('win-1', displayName);
+    expect(reference).toBe('^^(win-1)');
+    expect(parseMachineMarkers(reference)).toEqual(['win-1']);
+  });
+
+  it('inserts the annotated reference at the caret', () => {
+    const execCommand = vi.fn(() => true);
+    Object.defineProperty(document, 'execCommand', {
+      configurable: true,
+      value: execCommand,
+    });
+    try {
+      expect(insertMachineMarkerAtCaret('win-1', 'Office PC')).toBe(true);
+      expect(execCommand).toHaveBeenCalledWith('insertText', false, '^^(win-1)-(Office PC)');
+    } finally {
+      Reflect.deleteProperty(document, 'execCommand');
+    }
   });
 });

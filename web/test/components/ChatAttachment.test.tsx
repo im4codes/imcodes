@@ -89,6 +89,30 @@ describe('ChatView attachment download', () => {
     expect(btn.textContent).toContain('notes.txt');
   });
 
+  it('keeps attachment preview and download scoped to the shared session', async () => {
+    const events = [makeEvent({
+      sessionId: 'deck_project_brain',
+      type: 'user.message',
+      payload: {
+        text: 'shared image',
+        attachments: [{ id: 'shared-image.png', originalName: 'shared.png', mime: 'image/png' }],
+      },
+    })];
+    const { container } = render(
+      <ChatView events={events} loading={false} serverId="srv-1" sessionId="deck_project_brain" />,
+    );
+    const buttons = Array.from(container.querySelectorAll('.chat-attachment-row button'));
+
+    fireEvent.click(buttons[0]);
+    await waitFor(() => expect(previewAttachment).toHaveBeenCalledWith(
+      'srv-1', 'shared-image.png', 'deck_project_brain',
+    ));
+    fireEvent.click(buttons[1]);
+    await waitFor(() => expect(downloadAttachment).toHaveBeenCalledWith(
+      'srv-1', 'shared-image.png', 'deck_project_brain',
+    ));
+  });
+
   it('falls back to id when originalName is missing', () => {
     const events = [makeEvent({
       type: 'user.message',

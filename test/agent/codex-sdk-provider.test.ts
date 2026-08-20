@@ -2482,6 +2482,7 @@ describe('CodexSdkProvider', () => {
   });
 
   it('emits backgrounded SDK sub-agent snapshots from Codex child rollout metadata', async () => {
+    vi.useFakeTimers();
     const codexHome = await mkdtemp(join(tmpdir(), 'codex-child-rollout-'));
     const provider = createCodexProvider();
     try {
@@ -2528,7 +2529,7 @@ describe('CodexSdkProvider', () => {
       ]);
 
       await provider.send('route-child-rollout-subagent', 'spawn a child helper');
-      await waitForCondition(() => tools.length === 1);
+      await advanceFakeTimersWithRealIoUntil(() => tools.length === 1);
 
       const expectedKey = makeCodexSubagentCanonicalKey(
         'route-child-rollout-subagent',
@@ -2564,7 +2565,7 @@ describe('CodexSdkProvider', () => {
         },
       })}\n`);
 
-      await waitForCondition(() => tools.length === 2, 15_000);
+      await advanceFakeTimersWithRealIoUntil(() => tools.length === 2);
       expect(tools[1]).toMatchObject({
         id: expectedKey,
         name: 'Codex Sub-agent',
@@ -2585,7 +2586,7 @@ describe('CodexSdkProvider', () => {
       await provider.disconnect().catch(() => {});
       await rm(codexHome, { recursive: true, force: true });
     }
-  });
+  }, 20_000);
 
   it('completes raw spawn_agent sub-agents from child rollout even when rollout parent id differs', async () => {
     const codexHome = await mkdtemp(join(tmpdir(), 'codex-child-rollout-agent-id-'));

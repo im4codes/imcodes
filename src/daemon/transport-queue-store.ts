@@ -420,13 +420,18 @@ export class TransportQueueStore {
         UPDATE queue_entries
         SET status = 'handoff_inflight', handoff_id = ?, handoff_started_at = ?, handoff_expires_at = ?,
           handoff_attempt = COALESCE(handoff_attempt, 0) + 1, updated_at = ?
-        WHERE session_name = ? AND client_message_id = ?
+        WHERE session_name = ? AND client_message_id = ? AND status = 'queued'
       `);
+      let changed = 0;
       for (const id of clientMessageIds) {
-        update.run(handoffId, now, now + leaseMs, now, sessionName, id);
+        changed += Number(update.run(handoffId, now, now + leaseMs, now, sessionName, id).changes ?? 0);
       }
-      this.bumpVersion(sessionName, now);
-      const rows = this.readRows(sessionName).filter((entry) => clientMessageIds.includes(entry.clientMessageId));
+      if (changed > 0) this.bumpVersion(sessionName, now);
+      const rows = this.readRows(sessionName).filter((entry) => (
+        clientMessageIds.includes(entry.clientMessageId)
+        && entry.status === 'handoff_inflight'
+        && entry.handoffId === handoffId
+      ));
       const materialRows = this.db.prepare(`
         SELECT client_message_id AS clientMessageId, material_json AS materialJson
         FROM queue_private_material WHERE session_name = ?
@@ -438,6 +443,44 @@ export class TransportQueueStore {
         handoffId,
         ...(material.get(entry.clientMessageId) ? { privateMaterialJson: material.get(entry.clientMessageId) } : {}),
       }));
+    } catch (err) {
+      this.db.exec('ROLLBACK');
+      throw err;
+    }
+  }
+
+  /**
+   * Return one failed active-turn append reservation to the ordinary queue.
+   * The handoff id is mandatory: a late failure from an older request must not
+   * release entries already claimed by a newer delivery attempt.
+   */
+  releaseHandoff(
+    sessionNameInput: string,
+    handoffIdInput: string,
+    clientMessageIds: string[],
+    now = Date.now(),
+  ): QueueSnapshot {
+    const sessionName = normalizeSessionName(sessionNameInput);
+    const handoffId = requireNonEmpty(handoffIdInput.trim(), 'handoffId');
+    const ids = [...new Set(clientMessageIds.map((id) => id.trim()).filter(Boolean))];
+    if (ids.length === 0) return this.readSnapshot(sessionName, 'release_handoff_noop');
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      this.ensureMeta(sessionName, now);
+      const update = this.db.prepare(`
+        UPDATE queue_entries
+        SET status = 'queued', handoff_id = NULL, handoff_started_at = NULL,
+          handoff_expires_at = NULL, updated_at = ?
+        WHERE session_name = ? AND client_message_id = ?
+          AND status = 'handoff_inflight' AND handoff_id = ?
+      `);
+      let changed = 0;
+      for (const id of ids) {
+        changed += Number(update.run(now, sessionName, id, handoffId).changes ?? 0);
+      }
+      const version = changed > 0 ? this.bumpVersion(sessionName, now) : undefined;
+      this.db.exec('COMMIT');
+      return this.readSnapshot(sessionName, 'release_handoff', version);
     } catch (err) {
       this.db.exec('ROLLBACK');
       throw err;
@@ -522,14 +565,14 @@ export class TransportQueueStore {
     }
   }
 
-  finalizeSent(sessionNameInput: string, clientMessageIdInput: string, deliveryFrameId = randomUUID(), now = Date.now()): QueueSnapshot {
+  finalizeSent(sessionNameInput: string, clientMessageIdInput: string, deliveryFrameId: string = randomUUID(), now = Date.now()): QueueSnapshot {
     return this.finalizeSentBatch(sessionNameInput, [clientMessageIdInput], deliveryFrameId, now).snapshot;
   }
 
   finalizeSentBatch(
     sessionNameInput: string,
     clientMessageIdInputs: string[],
-    deliveryFrameId = randomUUID(),
+    deliveryFrameId: string = randomUUID(),
     now = Date.now(),
   ): FinalizeTransportQueueSentResult {
     const sessionName = normalizeSessionName(sessionNameInput);

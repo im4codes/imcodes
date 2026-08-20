@@ -44,6 +44,7 @@ export class AuthenticatedWebSocketClient {
   }
 
   stop(): void {
+    if (this.stopped) return;
     this.stopped = true;
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     if (this.connectTimer) clearTimeout(this.connectTimer);
@@ -54,6 +55,9 @@ export class AuthenticatedWebSocketClient {
     const socket = this.socket;
     this.socket = null;
     socket?.close(1000, 'client_stopped');
+    // The close listener intentionally ignores a socket once stop() clears its
+    // identity, so invoke lifecycle cleanup here exactly once as well.
+    this.options.onClose?.();
   }
 
   send(message: unknown): boolean {
@@ -64,10 +68,16 @@ export class AuthenticatedWebSocketClient {
 
   private connect(): void {
     if (this.stopped) return;
-    const socket = this.options.createSocket(this.options.url);
+    let socket: AuthenticatedWebSocketLike;
+    try {
+      socket = this.options.createSocket(this.options.url);
+    } catch {
+      this.scheduleReconnect();
+      return;
+    }
     this.socket = socket;
     const connectTimeoutMs = this.options.connectTimeoutMs ?? 20_000;
-    this.connectTimer = setTimeout(() => socket.terminate?.() ?? socket.close(4000, 'connect_timeout'), connectTimeoutMs);
+    this.connectTimer = setTimeout(() => this.failSocket(socket), connectTimeoutMs);
     this.connectTimer.unref?.();
 
     socket.on('open', () => {
@@ -85,19 +95,38 @@ export class AuthenticatedWebSocketClient {
       this.lastInboundAt = Date.now();
       void Promise.resolve(this.options.onMessage(data)).catch(() => {});
     });
-    socket.on('error', () => {
-      // close is authoritative and schedules the retry.
-    });
+    socket.on('error', () => this.failSocket(socket));
     socket.on('close', () => {
-      if (this.socket !== socket) return;
-      this.socket = null;
-      if (this.watchdogTimer) clearInterval(this.watchdogTimer);
-      this.watchdogTimer = null;
-      if (this.connectTimer) clearTimeout(this.connectTimer);
-      this.connectTimer = null;
-      this.options.onClose?.();
-      this.scheduleReconnect();
+      this.handleSocketLoss(socket);
     });
+  }
+
+  /** Finalize one socket generation exactly once and arm the next attempt. */
+  private handleSocketLoss(socket: AuthenticatedWebSocketLike): boolean {
+    if (this.socket !== socket) return false;
+    this.socket = null;
+    if (this.watchdogTimer) clearInterval(this.watchdogTimer);
+    this.watchdogTimer = null;
+    if (this.connectTimer) clearTimeout(this.connectTimer);
+    this.connectTimer = null;
+    try {
+      this.options.onClose?.();
+    } catch {
+      // A lifecycle observer must not disable the reconnect owner.
+    }
+    this.scheduleReconnect();
+    return true;
+  }
+
+  /** Force a failed socket closed even when its implementation never emits close. */
+  private failSocket(socket: AuthenticatedWebSocketLike): void {
+    if (!this.handleSocketLoss(socket)) return;
+    try {
+      if (socket.terminate) socket.terminate();
+      else socket.close();
+    } catch {
+      // Reconnect was already scheduled by handleSocketLoss().
+    }
   }
 
   private startWatchdog(socket: AuthenticatedWebSocketLike): void {
@@ -108,8 +137,7 @@ export class AuthenticatedWebSocketClient {
     this.watchdogTimer = setInterval(() => {
       if (this.socket !== socket || this.stopped) return;
       if (Date.now() - this.lastInboundAt >= silenceTimeoutMs) {
-        if (socket.terminate) socket.terminate();
-        else socket.close(4001, 'inbound_silence');
+        this.failSocket(socket);
         return;
       }
       if (socket.readyState === 1) socket.send(JSON.stringify(this.options.heartbeatMessage));

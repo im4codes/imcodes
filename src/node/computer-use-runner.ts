@@ -2,7 +2,7 @@ import { execFile, spawn, type ChildProcess, type ChildProcessWithoutNullStreams
 import { access, mkdtemp, rm } from 'node:fs/promises';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, join, resolve, win32 as pathWin32 } from 'node:path';
 import WebSocket from 'ws';
 import {
   COMPUTER_USE_DEFAULT_TIMEOUT_MS,
@@ -20,6 +20,10 @@ import {
   type ComputerUseResult,
   type ComputerUseToolName,
 } from '../../shared/computer-use.js';
+import {
+  WINDOWS_COMPILED_RELEASE_SIGNER_SHA256,
+  verifyWindowsAuthenticodeSigners,
+} from './windows-artifact-trust.js';
 
 export const WINDOWS_DEFAULT_OCU_DIR = 'C:\\ProgramData\\imcodes-node\\computer-use-helper';
 const WINDOWS_DEFAULT_OCU_EXE = `${WINDOWS_DEFAULT_OCU_DIR}\\open-computer-use.exe`;
@@ -116,14 +120,55 @@ function openComputerUseCandidateBinaries(options: { moduleFilePath?: string; en
 
 async function resolveOpenComputerUseBinary(): Promise<string> {
   const candidates = openComputerUseCandidateBinaries();
+  const signedWindowsRelease = process.platform === 'win32'
+    && /^[a-f0-9]{64}$/.test(WINDOWS_COMPILED_RELEASE_SIGNER_SHA256);
+  return selectOpenComputerUseBinaryForTest(candidates, {
+    requireReleaseSignature: signedWindowsRelease,
+    explicitOverride: process.env.IMCODES_COMPUTER_USE_EXE?.trim(),
+    fileExists,
+    verifySignature: (candidate) => verifyWindowsAuthenticodeSigners(
+      [candidate],
+      WINDOWS_COMPILED_RELEASE_SIGNER_SHA256,
+    ),
+  });
+}
+
+export async function selectOpenComputerUseBinaryForTest(
+  candidates: readonly string[],
+  options: {
+    requireReleaseSignature: boolean;
+    explicitOverride?: string;
+    fileExists: (path: string) => Promise<boolean>;
+    verifySignature: (path: string) => Promise<boolean>;
+  },
+): Promise<string> {
   for (let index = 0; index < candidates.length; index++) {
     const candidate = candidates[index]!;
-    // Explicit path/env or final PATH lookup may be returned without probing.
-    if (index === 0 && process.env.IMCODES_COMPUTER_USE_EXE?.trim()) return candidate;
+    if (options.requireReleaseSignature) {
+      // Production Windows builds never execute a PATH-resolved or missing
+      // helper. Every concrete candidate must re-establish the exact release
+      // signer immediately before it can be selected.
+      if (!pathWin32.isAbsolute(candidate) || !await options.fileExists(candidate)) continue;
+      if (await options.verifySignature(candidate)) {
+        return candidate;
+      }
+      continue;
+    }
+    // Development builds preserve explicit/PATH override behavior.
+    if (index === 0 && options.explicitOverride) return candidate;
     if (candidate === OPEN_COMPUTER_USE_BINARY) return candidate;
-    if (await fileExists(candidate)) return candidate;
+    if (await options.fileExists(candidate)) return candidate;
   }
+  if (options.requireReleaseSignature) throw new Error('signed_open_computer_use_helper_unavailable');
   return OPEN_COMPUTER_USE_BINARY;
+}
+
+async function verifyOpenComputerUseBinaryForLaunch(binary: string): Promise<void> {
+  if (process.platform !== 'win32' || !/^[a-f0-9]{64}$/.test(WINDOWS_COMPILED_RELEASE_SIGNER_SHA256)) return;
+  if (!pathWin32.isAbsolute(binary)
+    || !await verifyWindowsAuthenticodeSigners([binary], WINDOWS_COMPILED_RELEASE_SIGNER_SHA256)) {
+    throw new Error('signed_open_computer_use_helper_authenticity_failed');
+  }
 }
 
 interface ComputerUseReturnOptions {
@@ -242,6 +287,7 @@ class OpenComputerUseMcpClient {
 
   private async start(): Promise<void> {
     this.close();
+    await verifyOpenComputerUseBinaryForLaunch(this.binary);
     const env = process.platform === 'win32'
       ? { ...process.env, OPEN_COMPUTER_USE_WINDOWS_ALLOW_UIA_TEXT_FALLBACK: '1' }
       : process.env;

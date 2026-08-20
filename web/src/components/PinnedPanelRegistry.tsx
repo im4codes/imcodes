@@ -17,6 +17,7 @@ import type { PinnedPanel } from '../app.js';
 import type { SubSession } from '../hooks/useSubSessions.js';
 import type { FileBrowserPreviewRequest, FileBrowserPreviewUpdate } from './FileBrowser.js';
 import type { SessionContextBootstrapState } from '@shared/session-context-bootstrap.js';
+import type { ChatLocalWebPreviewOpenHandler } from './ChatLoopbackLink.js';
 
 export interface PanelRenderContext {
   ws: WsClient | null;
@@ -30,12 +31,16 @@ export interface PanelRenderContext {
   onCiEvent?: (run: { name: string; status: string; conclusion?: string | null }) => void;
   /** Open a file preview in a large floating window (used by pinned file browser) */
   onPreviewFile?: (request: FileBrowserPreviewRequest) => void;
+  /** Open a loopback URL in the shared local-web-preview host. */
+  onOpenLocalWebPreview?: ChatLocalWebPreviewOpenHandler;
   /** Sync preview state from a source FileBrowser into the floating preview host/cache. */
   onPreviewStateChange?: (update: FileBrowserPreviewUpdate) => void;
   /** Current active session name — for file browser to follow tab switches */
   activeSession?: string | null;
   /** Current active session's project directory — follows tab switches */
   activeProjectDir?: string;
+  /** Present only while connected through a received share entry. */
+  sharedAccessRole?: 'viewer' | 'participant' | null;
   /** Quote callback — adds quoted text to the main session's input */
   onQuote?: (text: string) => void;
   /** Main sessions list — for panels that need session info (e.g., cron manager) */

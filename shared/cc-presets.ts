@@ -7,6 +7,22 @@ export const CC_PRESET_MSG = {
   DISCOVER_MODELS_RESPONSE: 'cc.presets.discover_models_response',
 } as const;
 
+/**
+ * Agent types that can act as a "custom provider SDK" compatibility layer —
+ * they can be pointed at an arbitrary LLM API endpoint through a CC preset.
+ *
+ * The daemon dispatches preset resolution per provider, but membership is one
+ * concept and must be stated once: a type present here without daemon support
+ * (or the reverse) shows the user an option that silently starts as something
+ * else.
+ */
+export const CUSTOM_PROVIDER_SDK_AGENT_TYPES: ReadonlySet<string> = new Set([
+  'claude-code',
+  'claude-code-sdk',
+  'qwen',
+  'deepseek-harness',
+]);
+
 export interface CcPresetSaveResponse {
   type: typeof CC_PRESET_MSG.SAVE_RESPONSE;
   requestId?: string;

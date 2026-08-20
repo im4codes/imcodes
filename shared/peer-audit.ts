@@ -300,6 +300,8 @@ const PEER_AUDIT_PROVIDER_FAMILY_BY_ID: Readonly<Record<string, string>> = {
   qoder: 'qoder',
   'qoder-sdk': 'qoder',
   openclaw: 'openclaw',
+  deepseek: 'deepseek',
+  'deepseek-harness': 'deepseek',
 };
 
 /** Provider family is independent of model normalization. Authoritative

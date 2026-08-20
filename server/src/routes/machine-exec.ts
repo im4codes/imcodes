@@ -30,6 +30,10 @@ import {
   type RemoteExecOutcome,
   type RemoteExecResult,
 } from '../../../shared/remote-exec.js';
+import {
+  canOperateControlledMachine,
+  resolveControlledMachineAccess,
+} from '../share/machine-access.js';
 
 /** Extra time the relay waits beyond the node's own timeout before giving up (F: deadline ≥ node timeout). */
 const DEFAULT_RELAY_DEADLINE_BUFFER_MS = 30_000;
@@ -153,7 +157,7 @@ function assertHttpEnvelopeWithinCap(envelope: unknown): void {
 
 /**
  * `POST /api/machine/exec?serverId=<target>` — the source (a FULL daemon) runs a
- * one-shot command on a CONTROLLED target it owns. `?serverId=` is the target /
+ * one-shot command on an owned or Participant-shared CONTROLLED target. `?serverId=` is the target /
  * pod-routing key; `X-Server-Id`+Bearer (resolved route-locally) is the source.
  */
 export function createMachineExecRoutes(
@@ -198,14 +202,12 @@ export function createMachineExecRoutes(
     });
     if (!v.ok) return c.json(preDispatchEnvelope('invalid_request'), 400);
 
-    const target = await c.env.DB.queryOne<{ user_id: string; node_role: string; exec_enabled: boolean; revoked_at: number | null }>(
-      'SELECT user_id, node_role, exec_enabled, revoked_at FROM servers WHERE id = $1',
-      [targetId],
-    );
-    // Return 403 (not 404) for cross-account to avoid existence enumeration.
-    if (!target || target.user_id !== userId) return c.json(preDispatchEnvelope('target_forbidden'), 403);
-    if (target.node_role !== NODE_ROLE.CONTROLLED) return c.json(preDispatchEnvelope('target_forbidden'), 403);
-    if (target.revoked_at != null) return c.json(preDispatchEnvelope('target_forbidden'), 403);
+    const target = await resolveControlledMachineAccess(c.env.DB, userId, targetId, Date.now());
+    // Return 403 (not 404) for absent, cross-account, expired/revoked, Viewer,
+    // non-controlled and revoked targets to avoid existence/role enumeration.
+    if (!target || !canOperateControlledMachine(target.access_role)) {
+      return c.json(preDispatchEnvelope('target_forbidden'), 403);
+    }
     if (!target.exec_enabled) return c.json(preDispatchEnvelope('exec_disabled'), 403);
 
     const commandSha256 = sha256Hex(v.value.command);

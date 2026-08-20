@@ -18,6 +18,7 @@ import { build } from 'esbuild';
 import { execFileSync } from 'node:child_process';
 import { mkdir, rm, copyFile, writeFile, chmod, stat, readFile, rename } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import {
@@ -42,8 +43,46 @@ const outName = isWin ? 'imcodes-node.exe' : `imcodes-node-${platform === 'darwi
 const root = resolve(process.cwd());
 const buildDir = join(root, 'dist-node-exe');
 const workDir = join(tmpdir(), `imcodes-node-build-${platform}-${arch}`);
+const require = createRequire(import.meta.url);
 
 function sh(file, args, opts = {}) { return execFileSync(file, args, { stdio: 'inherit', ...opts }); }
+
+function runWindowsReleaseSigning(mode, artifactPath, expectedSignerSha256 = '') {
+  if (!isWin) return;
+  const thumbprint = process.env.IMCODES_WINDOWS_SIGNING_CERT_THUMBPRINT?.trim() ?? '';
+  if (mode === 'Sign' && Boolean(thumbprint) !== Boolean(expectedSignerSha256)) {
+    throw new Error(
+      'Windows node signing requires both IMCODES_WINDOWS_SIGNING_CERT_THUMBPRINT and IMCODES_WINDOWS_SIGNING_CERT_SHA256',
+    );
+  }
+  if (mode === 'Sign' && !thumbprint) return;
+  if (!/^[a-f0-9]{40}$/i.test(thumbprint)) {
+    if (mode === 'Sign') throw new Error('IMCODES_WINDOWS_SIGNING_CERT_THUMBPRINT must be SHA-1 hex');
+  }
+  const systemRoot = process.env.SystemRoot?.trim();
+  if (!systemRoot) throw new Error('SystemRoot is required to locate Windows PowerShell');
+  sh(join(systemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'), [
+    '-NoLogo',
+    '-NoProfile',
+    '-NonInteractive',
+    '-ExecutionPolicy',
+    'Bypass',
+    '-File',
+    join(root, 'scripts', 'windows-sign-release-artifact.ps1'),
+    '-Mode',
+    mode,
+    '-ArtifactPath',
+    artifactPath,
+    ...(mode === 'Sign' ? [
+      '-CodeSigningCertificateThumbprint',
+      thumbprint,
+      '-ExpectedSignerSha256',
+      expectedSignerSha256,
+      '-TimestampUrl',
+      process.env.IMCODES_WINDOWS_SIGNING_TIMESTAMP_URL?.trim() || 'http://timestamp.digicert.com',
+    ] : []),
+  ]);
+}
 
 async function downloadFile(url, destination, redirect = 'follow') {
   const response = await fetch(url, { redirect });
@@ -98,12 +137,21 @@ async function main() {
   const packageJson = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'));
   const packageVersion = typeof packageJson.version === 'string' ? packageJson.version : '0.0.0';
   const buildVersion = normalizeNodeExeBuildVersion(process.env.IMCODES_BUILD_VERSION?.trim() || packageVersion);
+  const windowsReleaseSignerSha256 = process.env.IMCODES_WINDOWS_SIGNING_CERT_SHA256?.trim().toLowerCase() ?? '';
+  if (windowsReleaseSignerSha256 && !/^[a-f0-9]{64}$/.test(windowsReleaseSignerSha256)) {
+    throw new Error('IMCODES_WINDOWS_SIGNING_CERT_SHA256 must be lowercase SHA-256 hex');
+  }
   const bundlePath = join(workDir, 'app.cjs');
   await build({
     entryPoints: [join(root, 'src/node/index.ts')],
     bundle: true, platform: 'node', format: 'cjs', outfile: bundlePath,
     external: ['bufferutil', 'utf8-validate'],
-    define: { 'process.env.IMCODES_BUILD_VERSION': JSON.stringify(buildVersion) },
+    define: {
+      'process.env.IMCODES_BUILD_VERSION': JSON.stringify(buildVersion),
+      __IMCODES_WINDOWS_RELEASE_SIGNER_SHA256__: JSON.stringify(
+        isWin ? windowsReleaseSignerSha256 : '',
+      ),
+    },
     logLevel: 'info',
   });
 
@@ -123,16 +171,36 @@ async function main() {
   const postjectVersion = postjectPackage.version;
   if (typeof postjectVersion !== 'string' || !postjectPackage.bin?.postject) throw new Error('invalid installed postject package');
   const postjectBin = join(root, 'node_modules', 'postject', postjectPackage.bin.postject);
+  // Use the pinned package API only on Windows. On older Windows hosts the CLI
+  // child can finish PE injection yet terminate its execFileSync caller before
+  // mandatory Authenticode signing. macOS/Linux retain the already-qualified
+  // CLI path because postject's native API has different process-exit semantics
+  // on those platforms.
+  const postjectApi = isWin
+    ? require(join(root, 'node_modules', 'postject', 'dist', 'api.js'))
+    : null;
+  if (isWin && typeof postjectApi?.inject !== 'function') throw new Error('invalid installed postject API');
+  const seaBlob = isWin ? await readFile(blobPath) : null;
   const inject = async (nodeBin, destination) => {
     await rm(destination, { force: true });
     await copyFile(nodeBin, destination);
     await chmod(destination, 0o755).catch(() => {});
+    if (isWin) {
+      // Official node.exe is Authenticode-signed. Node's documented SEA flow
+      // requires removing that certificate table before postject rewrites the
+      // PE, otherwise a later SignTool invocation fails with ERROR_BAD_EXE_FORMAT.
+      runWindowsReleaseSigning('Remove', destination);
+    }
     if (platform === 'darwin') {
       try { sh('codesign', ['--remove-signature', destination]); } catch { /* unsigned already */ }
     }
-    const args = [destination, 'NODE_SEA_BLOB', blobPath, '--sentinel-fuse', SEA_FUSE];
-    if (platform === 'darwin') args.push('--macho-segment-name', 'NODE_SEA');
-    sh(process.execPath, [postjectBin, ...args]);
+    if (isWin) {
+      await postjectApi.inject(destination, 'NODE_SEA_BLOB', seaBlob, { sentinelFuse: SEA_FUSE });
+    } else {
+      const args = [destination, 'NODE_SEA_BLOB', blobPath, '--sentinel-fuse', SEA_FUSE];
+      if (platform === 'darwin') args.push('--macho-segment-name', 'NODE_SEA');
+      sh(process.execPath, [postjectBin, ...args]);
+    }
   };
   if (platform === 'darwin') {
     const slices = [];
@@ -147,7 +215,6 @@ async function main() {
     await inject(officialNode.nodeBin, outPath);
   }
 
-  const { size } = await stat(outPath);
   const buildCommit = process.env.GITHUB_SHA ?? execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).trim();
   // Copy the platform Computer Use helper as a sidecar artifact when available.
   // It is not injected into the SEA binary: the helper is an independently
@@ -158,6 +225,25 @@ async function main() {
       ...(platform === 'darwin' ? { IMCODES_COMPUTER_USE_HELPER_TARGET_ARCH: 'universal' } : {}),
     },
   });
+
+  if (isWin) {
+    runWindowsReleaseSigning(
+      'Sign',
+      join(buildDir, 'computer-use-helper', 'win32-x64', 'open-computer-use.exe'),
+      windowsReleaseSignerSha256,
+    );
+  }
+
+  // postject changes the official node.exe bytes and therefore invalidates its
+  // Microsoft signature. Sign the final SEA executable before hashing it into
+  // the release manifest. Formal Windows CI always supplies both signer values;
+  // unsigned local developer builds remain possible when neither is supplied.
+  runWindowsReleaseSigning('Sign', outPath, windowsReleaseSignerSha256);
+
+  const helperRelativePath = platform === 'darwin'
+    ? 'computer-use-helper/darwin-universal/open-computer-use.app.zip'
+    : `computer-use-helper/${platform}-${arch}/open-computer-use${isWin ? '.exe' : ''}`;
+  const helperPath = join(buildDir, ...helperRelativePath.split('/'));
 
   const manifestPath = `${outPath}${NODE_EXE_MANIFEST_SUFFIX}`;
   const manifest = await createNodeExeManifest({
@@ -179,8 +265,14 @@ async function main() {
     postjectVersion,
     buildCommit,
     buildVersion,
+    helperPath,
+    helperRelativePath,
+    ...(isWin && windowsReleaseSignerSha256
+      ? { authenticodeSignerSha256: windowsReleaseSignerSha256 }
+      : {}),
   });
   await writeNodeExeManifest(manifest, manifestPath);
+  const { size } = await stat(outPath);
   console.log(`\n✅ built ${outName} (${(size / 1048576).toFixed(1)} MB) at ${outPath}`);
   console.log(`✅ wrote verified artifact manifest at ${manifestPath}`);
 }

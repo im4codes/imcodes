@@ -19,6 +19,19 @@ import { ChatMarkdown } from '../../src/components/ChatMarkdown';
 import { RICH_TEXT_ENHANCEMENT_CHAR_LIMIT } from '../../src/chat-render-limits';
 
 describe('ChatMarkdown', () => {
+  it('adds preview and direct actions to detected loopback links when the preview host is available', () => {
+    const { container } = render(
+      <ChatMarkdown
+        text="本机访问：http://127.0.0.1:8787/"
+        onOpenLocalWebPreview={() => {}}
+        onUrlClick={() => {}}
+      />,
+    );
+
+    expect(container.querySelector('.chat-loopback-link')).not.toBeNull();
+    expect(container.querySelectorAll('.chat-loopback-action')).toHaveLength(2);
+  });
+
   it('renders oversized text without markdown parsing', () => {
     const text = `# ${'large message '.repeat(Math.ceil(RICH_TEXT_ENHANCEMENT_CHAR_LIMIT / 14))}`;
     const { container } = render(<ChatMarkdown text={text} />);

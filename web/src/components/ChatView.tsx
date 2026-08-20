@@ -31,6 +31,10 @@ import { parseUnifiedDiff } from '@shared/unified-diff.js';
 import { isHtmlPreviewPath, type HtmlPreviewViewMode } from '@shared/html-preview.js';
 import { FileBrowser, type FileBrowserPreviewRequest } from './file-browser-lazy.js';
 import { ChatMarkdown } from './ChatMarkdown.js';
+import {
+  ChatLoopbackLink,
+  type ChatLocalWebPreviewOpenHandler,
+} from './ChatLoopbackLink.js';
 import { AgentTodoList } from './AgentTodoList.js';
 import {
   CHAT_MOUNT_SETTLE_MS,
@@ -43,7 +47,7 @@ import { isLikelyDomainPath, renderChatPathActions, type ChatPathDownloadHandler
 import { FontPrefsDropdown, useFontPrefs, DEFAULT_CHAT_FONT } from './FontPrefsDropdown.js';
 import { SessionRepoBranchSummary } from './SessionRepoBranchSummary.js';
 import { usePref, parseBooleanish } from '../hooks/usePref.js';
-import { PREF_KEY_SHOW_TOOL_CALLS } from '../constants/prefs.js';
+import { PREF_KEY_MESSAGE_PIN_PREVIEW_MODE, PREF_KEY_SHOW_TOOL_CALLS } from '../constants/prefs.js';
 import type { TimelineHistoryStatus, TimelineHistoryStepKey } from '../hooks/useTimeline.js';
 import { positionChatActionMenu } from '../chat-action-menu-position.js';
 import { splitTextByHttpUrls } from '../link-detection.js';
@@ -63,6 +67,20 @@ import { isWorkingSessionState } from '@shared/session-activity-types.js';
 import { isPeerAuditRuntimeDisposition } from '@shared/peer-audit.js';
 import { AGENT_DELEGATION_REPLY_TIMELINE_EVENT } from '@shared/agent-delegation.js';
 import { parseTimelineDisplayText } from '../timeline-display-text.js';
+import {
+  MESSAGE_PIN_LIMITS,
+  isMessagePinEventType,
+  type MessagePin,
+  type MessagePinEventType,
+} from '@shared/message-pins.js';
+import { useMessagePins } from '../hooks/useMessagePins.js';
+import { MessagePinsBar, type MessagePinPreviewMode } from './MessagePinsBar.js';
+import {
+  clearPendingMessagePin,
+  getPendingMessagePin,
+  requestMessagePinNavigation,
+  subscribeMessagePinNavigation,
+} from '../message-pin-navigation.js';
 import {
   deriveSdkSubagentStatusRows,
   type SdkSubagentDiagnostic,
@@ -108,8 +126,22 @@ interface Props {
   agentType?: string | null;
   /** Server ID for file transfer download API. */
   serverId?: string;
+  /** Opens loopback HTTP links in the shared local-web-preview window. */
+  onOpenLocalWebPreview?: ChatLocalWebPreviewOpenHandler;
+  /** Shared viewers may browse/preview/download but cannot mutate files. */
+  readOnlyFiles?: boolean;
+  /** Constrain file operations to this session's canonical project root. */
+  scopeFilesToSession?: boolean;
   /** Retry a failed optimistic send — called with the original commandId and text. */
   onResendFailed?: (commandId: string, text: string) => void;
+  /** Load the bounded timeline window around an old PostgreSQL-backed pin. */
+  onLoadMessageContext?: (eventId: string, eventTs: number) => Promise<boolean>;
+  /** Compact pinned panels reuse ChatView but intentionally omit message-pin chrome. */
+  messagePinsEnabled?: boolean;
+}
+
+function parseMessagePinPreviewMode(raw: unknown): MessagePinPreviewMode | null {
+  return raw === 'rendered' || raw === 'text' ? raw : null;
 }
 
 /** A merged view item — a single event, assistant text, or a tool presentation. */
@@ -119,6 +151,8 @@ interface ViewItem {
   event?: TimelineEvent;
   /** Merged text for assistant-block */
   text?: string;
+  /** Source event ids represented by an assistant block (for old-pin locate). */
+  eventIds?: string[];
   assistantAutomation?: boolean;
   /** All events in a collapsed tool group (first, middle..., last) */
   toolEvents?: TimelineEvent[];
@@ -147,6 +181,7 @@ interface AssistantBlockProps {
   onDownload?: ChatPathDownloadHandler;
   onHtmlPreview?: (path: string) => void;
   onImagePreview?: ChatLocalImagePreviewLoader;
+  onOpenLocalWebPreview?: ChatLocalWebPreviewOpenHandler;
 }
 
 const USER_MESSAGE_COLLAPSE_LINE_LIMIT = 10;
@@ -980,6 +1015,7 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
   let pendingFirstTs = 0;
   let pendingLastTs = 0;
   let pendingKey = '';
+  let pendingEventIds: string[] = [];
   let pendingAssistantAutomation = false;
   let pendingTools: TimelineEvent[] = [];
   let deferredEvents: TimelineEvent[] = [];
@@ -990,11 +1026,13 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
         key: pendingKey,
         type: 'assistant-block',
         text: pendingText.join('\n'),
+        eventIds: [...pendingEventIds],
         assistantAutomation: pendingAssistantAutomation,
         ts: pendingFirstTs,
         lastTs: pendingLastTs,
       });
       pendingText = [];
+      pendingEventIds = [];
       pendingAssistantAutomation = false;
     }
   };
@@ -1043,6 +1081,7 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
       }
       pendingLastTs = event.ts;
       pendingText.push(text);
+      pendingEventIds.push(event.eventId);
     } else if (event.type === 'tool.call' || event.type === 'tool.result') {
       flushPending();
       pendingTools.push(event);
@@ -1070,6 +1109,25 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
   flushTools();
 
   return items;
+}
+
+/** Return the source text represented by a pinnable timeline event.
+ *
+ * Assistant rows can merge several consecutive `assistant.text` events into
+ * one visible bubble. In that case the first event id is attached to the DOM,
+ * so reading only that event's payload would truncate the pinned message. The
+ * merged ViewItem is still source data (including Markdown), unlike text read
+ * back from the rendered DOM, which also contains interactive link controls. */
+function messagePinSourceText(event: TimelineEvent, viewItems: ViewItem[]): string | null {
+  if (event.type === 'assistant.text') {
+    const block = viewItems.find((item) => (
+      item.type === 'assistant-block'
+      && (item.key === event.eventId || item.eventIds?.includes(event.eventId))
+    ));
+    if (typeof block?.text === 'string' && block.text.trim()) return block.text;
+  }
+  const text = event.payload.text;
+  return typeof text === 'string' && text.trim() ? text : null;
 }
 
 function textRevision(text: string | undefined): string {
@@ -1221,6 +1279,23 @@ function findEventElement(root: ParentNode, eventId: string): HTMLElement | null
     if ((el as HTMLElement).dataset.eventId === eventId) return el as HTMLElement;
   }
   return null;
+}
+
+/** Center a message inside the chat's own scroll viewport. `scrollIntoView`
+ * also scrolls every eligible ancestor, which can move a floating chat window
+ * and push its titlebar (including the pin control) out of view. */
+function scrollEventWithinChat(container: HTMLElement, target: HTMLElement, behavior: ScrollBehavior): void {
+  const containerRect = container.getBoundingClientRect();
+  const targetRect = target.getBoundingClientRect();
+  const targetTop = container.scrollTop + targetRect.top - containerRect.top;
+  const centerOffset = Math.max(0, (container.clientHeight - targetRect.height) / 2);
+  const maxTop = Math.max(0, container.scrollHeight - container.clientHeight);
+  const top = Math.min(maxTop, Math.max(0, targetTop - centerOffset));
+  if (typeof container.scrollTo === 'function') {
+    container.scrollTo({ top, behavior });
+  } else {
+    container.scrollTop = top;
+  }
 }
 
 /** Walk up the DOM from `start` and return the nearest ancestor that actually
@@ -1561,9 +1636,10 @@ function SdkAgentsDiagnosticRow({ diagnostic }: { diagnostic: SdkSubagentDiagnos
   );
 }
 
-function ChatViewImpl({ events, loading, refreshing = false, historyStatus, loadingOlder, hasOlderHistory = true, onLoadOlder, sessionState, sessionId, onScrollBottomFn, preview, onPreviewFile, ws, onInsertPath, workdir, onViewRepo, serverId, onQuote, agentType: _agentType, onResendFailed, onForceSync }: Props) {
+function ChatViewImpl({ events, loading, refreshing = false, historyStatus, loadingOlder, hasOlderHistory = true, onLoadOlder, sessionState, sessionId, onScrollBottomFn, preview, onPreviewFile, ws, onInsertPath, workdir, onViewRepo, serverId, onOpenLocalWebPreview, readOnlyFiles = false, scopeFilesToSession = false, onQuote, agentType: _agentType, onResendFailed, onForceSync, onLoadMessageContext, messagePinsEnabled = false }: Props) {
   const { t, i18n } = useTranslation();
   const locale = resolveI18nLocale(i18n);
+  const fileScopeSessionName = scopeFilesToSession ? (sessionId ?? undefined) : undefined;
   const [syncDisabled, setSyncDisabled] = useState(false);
   const handleForceSync = useCallback(() => {
     if (syncDisabled || !onForceSync) return;
@@ -1586,6 +1662,11 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
   highlightElRef.current = highlightEl;
   const [ctxMenu, setCtxMenu] = useState<SelectionMenu | null>(null);
   const ctxMenuRef = useRef<HTMLDivElement>(null);
+  const [pendingPinnedLocate, setPendingPinnedLocate] = useState<MessagePin | null>(null);
+  const pendingPinnedLocateIdRef = useRef<string | null>(null);
+  const timelineEventsRef = useRef(events);
+  timelineEventsRef.current = events;
+  const [pinnedLocateError, setPinnedLocateError] = useState(false);
   const [revealingOlder, setRevealingOlder] = useState(false);
   const revealingOlderTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Scroll anchor preservation: pre-prepend scrollHeight, restored after the
@@ -1601,6 +1682,8 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
   // the portion they want to copy.
   const [zoomText, setZoomText] = useState<string | null>(null);
   const [renderItemLimit, setRenderItemLimit] = useState(CHAT_INITIAL_RENDER_ITEM_LIMIT);
+  const pinsEnabled = messagePinsEnabled && !preview && !!serverId && !!sessionId;
+  const messagePins = useMessagePins(serverId, sessionId, pinsEnabled);
 
   const autoScrollRef = useRef(true);
   const [showScrollBtn, setShowScrollBtn] = useState(false);
@@ -1759,14 +1842,14 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
     const viewMode = previewViewMode ?? (preferDiff ? 'diff' : 'source');
     onPreviewFile({
       path: resolvedPath,
-      sessionName: sessionId ?? undefined,
+      sessionName: fileScopeSessionName,
       preferDiff: viewMode === 'diff' && preferDiff,
       previewViewMode: viewMode,
       preview: { status: 'loading', path: resolvedPath },
       rootPath: workdir ?? undefined,
       sourcePreviewLive: false,
     });
-  }, [onPreviewFile, workdir]);
+  }, [fileScopeSessionName, onPreviewFile, workdir]);
 
   const handlePathClick = useCallback((path: string) => {
     openFilePreview(path, false);
@@ -1795,7 +1878,7 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
       return;
     }
     try {
-      const requestId = ws.fsReadFile(resolvedPath);
+      const requestId = fileScopeSessionName ? ws.fsReadFile(resolvedPath, fileScopeSessionName) : ws.fsReadFile(resolvedPath);
       setHtmlFullscreenPreview({ status: 'loading', path: resolvedPath, requestId });
     } catch (err) {
       setHtmlFullscreenPreview({
@@ -1804,7 +1887,7 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
         error: mapPreviewDispatchError(err),
       });
     }
-  }, [mapPreviewDispatchError, t, workdir, ws]);
+  }, [fileScopeSessionName, mapPreviewDispatchError, t, workdir, ws]);
 
   const closeHtmlFullscreenPreview = useCallback(() => {
     setHtmlFullscreenPreview(null);
@@ -1853,7 +1936,7 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
         unsub?.();
       };
       try {
-        const reqId = ws.fsReadFile(path);
+        const reqId = fileScopeSessionName ? ws.fsReadFile(path, fileScopeSessionName) : ws.fsReadFile(path);
         timer = setTimeout(() => {
           cleanup();
           reject(new Error(t('upload.download_timeout')));
@@ -1876,7 +1959,7 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
         reject(new Error(mapDownloadError(err)));
       }
     })
-  ), [mapDownloadError, t, ws]);
+  ), [fileScopeSessionName, mapDownloadError, t, ws]);
 
   const handleImagePreview = useCallback<ChatLocalImagePreviewLoader>((path: string) => (
     new Promise((resolve, reject) => {
@@ -1897,7 +1980,7 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
 
       getCachedChatLocalImagePreview(cacheKey, () => new Promise<ChatLocalImagePreviewResult>((resolveCached, rejectCached) => {
         try {
-          const reqId = ws.fsReadFile(resolvedPath);
+          const reqId = fileScopeSessionName ? ws.fsReadFile(resolvedPath, fileScopeSessionName) : ws.fsReadFile(resolvedPath);
           timer = setTimeout(() => {
             cleanup();
             rejectCached(new Error(t('upload.download_timeout')));
@@ -1924,7 +2007,7 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
         }
       })).then(resolve, reject);
     })
-  ), [serverId, sessionId, t, workdir, ws]);
+  ), [fileScopeSessionName, serverId, sessionId, t, workdir, ws]);
 
   const handleDownload = useCallback<ChatPathDownloadHandler>(async (path: string) => {
     if (!serverId) throw new Error(t('upload.daemon_offline'));
@@ -1932,19 +2015,21 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
     let downloadId = await requestPathDownloadId(resolvedPath);
     const { downloadAttachment } = await import('../api.js');
     try {
-      await downloadAttachment(serverId, downloadId);
+      if (sessionId) await downloadAttachment(serverId, downloadId, sessionId);
+      else await downloadAttachment(serverId, downloadId);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       const isStaleHandle = msg.includes('410') || msg.includes('expired') || msg.includes('not_found') || msg.includes('404');
       if (!isStaleHandle) throw new Error(mapDownloadError(err));
       downloadId = await requestPathDownloadId(resolvedPath);
       try {
-        await downloadAttachment(serverId, downloadId);
+        if (sessionId) await downloadAttachment(serverId, downloadId, sessionId);
+        else await downloadAttachment(serverId, downloadId);
       } catch (retryErr) {
         throw new Error(mapDownloadError(retryErr));
       }
     }
-  }, [mapDownloadError, requestPathDownloadId, serverId, t, workdir]);
+  }, [mapDownloadError, requestPathDownloadId, serverId, sessionId, t, workdir]);
 
   const pathClickHandler = ws && !preview ? handlePathClick : undefined;
   const htmlPreviewHandler = ws && typeof ws.fsReadFile === 'function' && !preview ? handleHtmlPreview : undefined;
@@ -1952,6 +2037,39 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
   const fileChangeOpenHandler = ws && !preview && onPreviewFile ? handleFileChangeOpen : undefined;
   const urlClickHandler = !preview ? handleUrlClick : undefined;
   const downloadHandler = serverId && ws ? handleDownload : undefined;
+
+  // The presentation choice is account-scoped and shared by every mounted
+  // chat window. Geometry remains device-local in ZoomedTextDialog.
+  const messagePinPreviewModePref = usePref<MessagePinPreviewMode>(
+    messagePinsEnabled ? PREF_KEY_MESSAGE_PIN_PREVIEW_MODE : null,
+    { parse: parseMessagePinPreviewMode },
+  );
+  const messagePinPreviewMode: MessagePinPreviewMode = messagePinPreviewModePref.value === 'text'
+    ? 'text'
+    : 'rendered';
+  const handleMessagePinPreviewModeChange = useCallback((mode: MessagePinPreviewMode) => {
+    if (mode === messagePinPreviewMode) return;
+    void messagePinPreviewModePref.save(mode).catch((error) => {
+      console.warn('[message-pins] failed to save preview mode:', error);
+    });
+  }, [messagePinPreviewMode, messagePinPreviewModePref]);
+  const renderPinnedMessagePreview = useCallback((text: string, closePreview: () => void) => (
+    <ChatMarkdown
+      text={parseTimelineDisplayText(text)}
+      onPathClick={pathClickHandler}
+      onUrlClick={urlClickHandler ? (url) => {
+        closePreview();
+        urlClickHandler(url);
+      } : undefined}
+      onDownload={downloadHandler}
+      onHtmlPreview={htmlPreviewHandler}
+      onImagePreview={imagePreviewHandler}
+      onOpenLocalWebPreview={onOpenLocalWebPreview ? (target) => {
+        closePreview();
+        onOpenLocalWebPreview(target);
+      } : undefined}
+    />
+  ), [downloadHandler, htmlPreviewHandler, imagePreviewHandler, onOpenLocalWebPreview, pathClickHandler, urlClickHandler]);
 
   // Tool-call/detail visibility preference (shared cache via usePref). Tri-state:
   //   value === true  → developer view, show tool/file/thinking rows
@@ -2030,6 +2148,71 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
     () => getRenderedViewRevision(renderedViewItems),
     [renderedViewItems],
   );
+  const resolvePinnedMessageText = useCallback((pin: MessagePin): string => {
+    if (pin.sessionName !== sessionId) return pin.text;
+    const sourceEvent = events.find((event) => event.eventId === pin.eventId);
+    return sourceEvent ? (messagePinSourceText(sourceEvent, viewItems) ?? pin.text) : pin.text;
+  }, [events, sessionId, viewItems]);
+
+  const locatePinnedMessage = useCallback(async (pin: MessagePin) => {
+    if (!sessionId || pin.sessionName !== sessionId) {
+      requestMessagePinNavigation(pin, sessionId);
+      return;
+    }
+    if (pendingPinnedLocateIdRef.current === pin.id) return;
+    pendingPinnedLocateIdRef.current = pin.id;
+    setPinnedLocateError(false);
+    setPendingPinnedLocate(pin);
+    if (timelineEventsRef.current.some((event) => event.eventId === pin.eventId)) return;
+    if (!onLoadMessageContext || !await onLoadMessageContext(pin.eventId, pin.eventTs)) {
+      clearPendingMessagePin(pin.id);
+      pendingPinnedLocateIdRef.current = null;
+      setPendingPinnedLocate(null);
+      setPinnedLocateError(true);
+    }
+  }, [onLoadMessageContext, sessionId]);
+
+  useEffect(() => {
+    if (!pinsEnabled || !sessionId) return undefined;
+    const handleNavigation = (pin: MessagePin) => {
+      if (pin.sessionName === sessionId) void locatePinnedMessage(pin);
+    };
+    const pending = getPendingMessagePin(sessionId);
+    if (pending) void locatePinnedMessage(pending);
+    return subscribeMessagePinNavigation(handleNavigation);
+  }, [locatePinnedMessage, pinsEnabled, sessionId]);
+
+  useEffect(() => {
+    if (!pendingPinnedLocate) return undefined;
+    if (!events.some((event) => event.eventId === pendingPinnedLocate.eventId)) return undefined;
+    const targetItemIndex = viewItems.findIndex((item) => (
+      item.key === pendingPinnedLocate.eventId
+      || item.event?.eventId === pendingPinnedLocate.eventId
+      || item.eventIds?.includes(pendingPinnedLocate.eventId)
+    ));
+    if (targetItemIndex < 0) return undefined;
+    const targetDomEventId = viewItems[targetItemIndex]!.key;
+    // The renderer is tail-limited. Reveal only enough tail items to include
+    // the target instead of mounting a previously expanded 2,000-item history
+    // in one task (which would revive the multi-window freeze this UI avoids).
+    const requiredTailItems = viewItems.length - targetItemIndex;
+    setRenderItemLimit((current) => Math.max(current, requiredTailItems));
+    const frame = requestAnimationFrame(() => {
+      const root = scrollRef.current;
+      if (!root) return;
+      const target = findEventElement(root, targetDomEventId);
+      if (!target) return;
+      const reducedMotion = typeof window.matchMedia === 'function'
+        && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+      scrollEventWithinChat(root, target, reducedMotion ? 'auto' : 'smooth');
+      target.classList.add('chat-pin-located');
+      window.setTimeout(() => target.classList.remove('chat-pin-located'), 1_800);
+      clearPendingMessagePin(pendingPinnedLocate.id);
+      pendingPinnedLocateIdRef.current = null;
+      setPendingPinnedLocate(null);
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [events, pendingPinnedLocate, renderedRevision, viewItems.length]);
 
   useEffect(() => {
     if (revealingOlderTimerRef.current) {
@@ -2038,6 +2221,9 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
     }
     setRevealingOlder(false);
     setRenderItemLimit(CHAT_INITIAL_RENDER_ITEM_LIMIT);
+    pendingPinnedLocateIdRef.current = null;
+    setPendingPinnedLocate(null);
+    setPinnedLocateError(false);
   }, [sessionId]);
 
   useEffect(() => () => {
@@ -2859,6 +3045,19 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
   // `empty` is terminal like `done` — a cold local cache is not still working.
   const showHistoryProgress = !preview && historySteps.some((step) => step.state === 'pending' || step.state === 'running');
   const showRefreshOverlay = !preview && (showHistoryProgress || refreshing);
+  const contextMenuEvent = ctxMenu?.eventId
+    ? events.find((event) => event.eventId === ctxMenu.eventId)
+    : undefined;
+  const contextMenuPinEvent: (TimelineEvent & { type: MessagePinEventType }) | undefined = contextMenuEvent
+    && isMessagePinEventType(contextMenuEvent.type)
+    ? contextMenuEvent as TimelineEvent & { type: MessagePinEventType }
+    : undefined;
+  const contextMenuPin = contextMenuPinEvent
+    ? messagePins.pins.find((pin) => pin.sessionName === sessionId && pin.eventId === contextMenuPinEvent.eventId)
+    : undefined;
+  const contextMenuPinText = contextMenuPinEvent
+    ? (messagePinSourceText(contextMenuPinEvent, viewItems) ?? '')
+    : '';
   return (
     <div class={`chat-view-wrap${hasRightPanel ? ' chat-split' : ''}`}>
       {(canShowAgentsControl || onForceSync || canShowFilePanel) && (
@@ -2921,6 +3120,7 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
               padding: '4px 8px',
               minHeight: 30,
               flexShrink: 0,
+              position: 'relative',
               borderBottom: '1px solid rgba(51,65,85,0.5)',
               background: 'rgba(15,23,42,0.35)',
             }}
@@ -2936,6 +3136,27 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
               onOpenRepo={onViewRepo}
               className="session-repo-branch-summary-chat-titlebar"
             />
+            {pinsEnabled && sessionId && (
+              <MessagePinsBar
+                pins={messagePins.pins}
+                currentSessionName={sessionId}
+                loading={messagePins.loading}
+                mutating={messagePins.mutating}
+                error={messagePins.error}
+                locateError={pinnedLocateError}
+                onLocate={(pin) => { void locatePinnedMessage(pin); }}
+                onQuote={onQuote}
+                previewMode={messagePinPreviewMode}
+                onPreviewModeChange={handleMessagePinPreviewModeChange}
+                renderPreview={renderPinnedMessagePreview}
+                resolvePinText={resolvePinnedMessageText}
+                onUnpin={(pin) => { void messagePins.unpinMessage(pin); }}
+                onDismissError={() => {
+                  messagePins.clearError();
+                  setPinnedLocateError(false);
+                }}
+              />
+            )}
           </div>
         )}
         {showRefreshOverlay && (
@@ -3125,32 +3346,35 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
                   onDownload={downloadHandler}
                   onHtmlPreview={htmlPreviewHandler}
                   onImagePreview={imagePreviewHandler}
+                  onOpenLocalWebPreview={onOpenLocalWebPreview}
                 />
               );
             }
             if (item.type === 'tool-group') {
-              return <ToolCallGroup key={item.key} events={item.toolEvents!} onPathClick={pathClickHandler} onUrlClick={urlClickHandler} onDownload={downloadHandler} onHtmlPreview={htmlPreviewHandler} onImagePreview={imagePreviewHandler} serverId={serverId} />;
+              return <ToolCallGroup key={item.key} events={item.toolEvents!} onPathClick={pathClickHandler} onUrlClick={urlClickHandler} onDownload={downloadHandler} onHtmlPreview={htmlPreviewHandler} onImagePreview={imagePreviewHandler} onOpenLocalWebPreview={onOpenLocalWebPreview} serverId={serverId} />;
             }
             if (item.type === 'tool-activity') {
-              return <ToolActivitySummary key={item.key} events={item.toolEvents!} onPathClick={pathClickHandler} onUrlClick={urlClickHandler} onDownload={downloadHandler} onHtmlPreview={htmlPreviewHandler} onImagePreview={imagePreviewHandler} serverId={serverId} />;
+              return <ToolActivitySummary key={item.key} events={item.toolEvents!} onPathClick={pathClickHandler} onUrlClick={urlClickHandler} onDownload={downloadHandler} onHtmlPreview={htmlPreviewHandler} onImagePreview={imagePreviewHandler} onOpenLocalWebPreview={onOpenLocalWebPreview} serverId={serverId} />;
             }
             const linkedEvents = item.linkedEvents ?? [];
             if (linkedEvents.length === 0) {
-              return <ChatEvent key={item.key} event={item.event!} onPathClick={pathClickHandler} onUrlClick={urlClickHandler} onFileChangeOpen={fileChangeOpenHandler} onDownload={downloadHandler} onHtmlPreview={htmlPreviewHandler} onImagePreview={imagePreviewHandler} serverId={serverId} onResendFailed={onResendFailed} />;
+              return <ChatEvent key={item.key} event={item.event!} sessionName={sessionId ?? undefined} onPathClick={pathClickHandler} onUrlClick={urlClickHandler} onFileChangeOpen={fileChangeOpenHandler} onDownload={downloadHandler} onHtmlPreview={htmlPreviewHandler} onImagePreview={imagePreviewHandler} onOpenLocalWebPreview={onOpenLocalWebPreview} serverId={serverId} onResendFailed={onResendFailed} />;
             }
             return (
               <div key={item.key} class="chat-linked-event-group">
-                <ChatEvent event={item.event!} onPathClick={pathClickHandler} onUrlClick={urlClickHandler} onFileChangeOpen={fileChangeOpenHandler} onDownload={downloadHandler} onHtmlPreview={htmlPreviewHandler} onImagePreview={imagePreviewHandler} serverId={serverId} onResendFailed={onResendFailed} />
+                <ChatEvent event={item.event!} sessionName={sessionId ?? undefined} onPathClick={pathClickHandler} onUrlClick={urlClickHandler} onFileChangeOpen={fileChangeOpenHandler} onDownload={downloadHandler} onHtmlPreview={htmlPreviewHandler} onImagePreview={imagePreviewHandler} onOpenLocalWebPreview={onOpenLocalWebPreview} serverId={serverId} onResendFailed={onResendFailed} />
                 {linkedEvents.map((linkedEvent) => (
                   <ChatEvent
                     key={linkedEvent.eventId}
                     event={linkedEvent}
+                    sessionName={sessionId ?? undefined}
                     onPathClick={pathClickHandler}
                     onUrlClick={urlClickHandler}
                     onFileChangeOpen={fileChangeOpenHandler}
                     onDownload={downloadHandler}
                     onHtmlPreview={htmlPreviewHandler}
                     onImagePreview={imagePreviewHandler}
+                    onOpenLocalWebPreview={onOpenLocalWebPreview}
                     serverId={serverId}
                     onResendFailed={onResendFailed}
                   />
@@ -3255,6 +3479,28 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
               </button>
               </>
             )}
+            {contextMenuPinEvent && contextMenuPinText && (
+              <button
+                class="chat-sel-btn"
+                disabled={messagePins.mutating}
+                onClick={() => {
+                  if (contextMenuPin) {
+                    void messagePins.unpinMessage(contextMenuPin);
+                  } else {
+                    void messagePins.pinMessage({
+                      eventId: contextMenuPinEvent.eventId,
+                      eventTs: contextMenuPinEvent.ts,
+                      eventType: contextMenuPinEvent.type,
+                      text: contextMenuPinText.slice(0, MESSAGE_PIN_LIMITS.TEXT_CHARS),
+                    });
+                  }
+                  setCtxMenu(null);
+                  if (highlightEl) { highlightEl.classList.remove('chat-highlight'); setHighlightEl(null); }
+                }}
+              >
+                {contextMenuPin ? t('messagePins.unpin') : t('messagePins.pin')}
+              </button>
+            )}
             {ctxMenu.eventId && ws && sessionId && (
               <button
                 class="chat-sel-btn"
@@ -3300,6 +3546,8 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
               ws={ws}
               serverId={serverId}
               sessionName={sessionId ?? undefined}
+              scopeToSessionRoot={scopeFilesToSession}
+              readOnly={readOnlyFiles}
               mode="file-single"
               layout="panel"
               initialPath={workdir ?? '~'}
@@ -3395,6 +3643,21 @@ function ToolBlockFold({
     <div class={`chat-tool-block-fold${expanded ? ' is-expanded' : ' is-collapsed'}`}>
       <div class="chat-tool-block-fold-content">
         {children(expanded, toggleExpanded, action)}
+        {expanded && (
+          <div class="chat-tool-fold-footer">
+            <button
+              type="button"
+              class="chat-tool-fold-collapse"
+              aria-expanded={expanded}
+              aria-label={action}
+              title={action}
+              onClick={toggleExpanded}
+            >
+              <span aria-hidden="true">▴</span>
+              <span>{action}</span>
+            </button>
+          </div>
+        )}
       </div>
     </div>
   );
@@ -3619,6 +3882,7 @@ function ToolActivitySummary({
   onDownload,
   onHtmlPreview,
   onImagePreview,
+  onOpenLocalWebPreview,
   serverId,
 }: {
   events: TimelineEvent[];
@@ -3627,6 +3891,7 @@ function ToolActivitySummary({
   onDownload?: ChatPathDownloadHandler;
   onHtmlPreview?: (path: string) => void;
   onImagePreview?: ChatLocalImagePreviewLoader;
+  onOpenLocalWebPreview?: ChatLocalWebPreviewOpenHandler;
   serverId?: string;
 }) {
   const { t } = useTranslation();
@@ -3770,21 +4035,37 @@ function ToolActivitySummary({
       )}
       <span class="chat-tool-activity-live" role="status" aria-live="polite" aria-atomic="true">{summary}</span>
       {expanded && (
-        <div class="chat-tool-activity-details">
-          {events.map((event) => (
-            <ChatEvent
-              key={event.eventId}
-              event={event}
-              onPathClick={onPathClick}
-              onUrlClick={onUrlClick}
-              onDownload={onDownload}
-              onHtmlPreview={onHtmlPreview}
-              onImagePreview={onImagePreview}
-              serverId={serverId}
-              showTime
-            />
-          ))}
-        </div>
+        <>
+          <div class="chat-tool-activity-details">
+            {events.map((event) => (
+              <ChatEvent
+                key={event.eventId}
+                event={event}
+                onPathClick={onPathClick}
+                onUrlClick={onUrlClick}
+                onDownload={onDownload}
+                onHtmlPreview={onHtmlPreview}
+                onImagePreview={onImagePreview}
+                onOpenLocalWebPreview={onOpenLocalWebPreview}
+                serverId={serverId}
+                showTime
+              />
+            ))}
+          </div>
+          <button
+            type="button"
+            class="chat-tool-activity chat-tool-activity-collapse-footer"
+            aria-expanded={expanded}
+            aria-label={action}
+            title={action}
+            onClick={() => { closePeek(); setExpanded(false); }}
+          >
+            <span class="chat-tool-activity-core" aria-hidden="true" />
+            <span class="chat-tool-activity-label">{t('chat.tool_activity_label')}</span>
+            <span class="chat-tool-activity-collapse-label">{action}</span>
+            <span class="chat-tool-activity-collapse-chevron" aria-hidden="true">⌃</span>
+          </button>
+        </>
       )}
     </div>
   );
@@ -3798,6 +4079,7 @@ function ToolCallGroup({
   onDownload,
   onHtmlPreview,
   onImagePreview,
+  onOpenLocalWebPreview,
   serverId,
 }: {
   events: TimelineEvent[];
@@ -3806,6 +4088,7 @@ function ToolCallGroup({
   onDownload?: ChatPathDownloadHandler;
   onHtmlPreview?: (path: string) => void;
   onImagePreview?: ChatLocalImagePreviewLoader;
+  onOpenLocalWebPreview?: ChatLocalWebPreviewOpenHandler;
   serverId?: string;
 }) {
   const { t } = useTranslation();
@@ -3820,18 +4103,18 @@ function ToolCallGroup({
 
   return (
     <div class="chat-tool-group">
-      <ChatEvent event={first} onPathClick={onPathClick} onUrlClick={onUrlClick} onDownload={onDownload} onHtmlPreview={onHtmlPreview} onImagePreview={onImagePreview} serverId={serverId} />
+      <ChatEvent event={first} onPathClick={onPathClick} onUrlClick={onUrlClick} onDownload={onDownload} onHtmlPreview={onHtmlPreview} onImagePreview={onImagePreview} onOpenLocalWebPreview={onOpenLocalWebPreview} serverId={serverId} />
       <div class="chat-tool-group-indent">
         {middle.length > 0 && (
           expanded ? (
-            middle.map((ev) => <ChatEvent key={ev.eventId} event={ev} onPathClick={onPathClick} onUrlClick={onUrlClick} onDownload={onDownload} onHtmlPreview={onHtmlPreview} onImagePreview={onImagePreview} serverId={serverId} />)
+            middle.map((ev) => <ChatEvent key={ev.eventId} event={ev} onPathClick={onPathClick} onUrlClick={onUrlClick} onDownload={onDownload} onHtmlPreview={onHtmlPreview} onImagePreview={onImagePreview} onOpenLocalWebPreview={onOpenLocalWebPreview} serverId={serverId} />)
           ) : (
             <button class="chat-tool-fold-btn" onClick={() => setExpanded(true)}>
               {t('chat.tool_group_more', { count: middle.length })}
             </button>
           )
         )}
-        {last && <ChatEvent event={last} onPathClick={onPathClick} onUrlClick={onUrlClick} onDownload={onDownload} onHtmlPreview={onHtmlPreview} onImagePreview={onImagePreview} serverId={serverId} showTime />}
+        {last && <ChatEvent event={last} onPathClick={onPathClick} onUrlClick={onUrlClick} onDownload={onDownload} onHtmlPreview={onHtmlPreview} onImagePreview={onImagePreview} onOpenLocalWebPreview={onOpenLocalWebPreview} serverId={serverId} showTime />}
         {expanded && middle.length > 0 && (
           <button class="chat-tool-fold-btn" onClick={() => setExpanded(false)}>
             {t('chat.tool_group_collapse')}
@@ -3855,13 +4138,14 @@ const AssistantBlock = memo(function AssistantBlock({
   onDownload,
   onHtmlPreview,
   onImagePreview,
+  onOpenLocalWebPreview,
 }: AssistantBlockProps) {
   return (
     <div
       class={`chat-event chat-assistant${automation ? ' chat-assistant-automation' : ''}`}
       data-event-id={eventId}
     >
-      <ChatMarkdown text={parseTimelineDisplayText(text)} onPathClick={onPathClick} onUrlClick={onUrlClick} onDownload={onDownload} onHtmlPreview={onHtmlPreview} onImagePreview={onImagePreview} />
+      <ChatMarkdown text={parseTimelineDisplayText(text)} onPathClick={onPathClick} onUrlClick={onUrlClick} onDownload={onDownload} onHtmlPreview={onHtmlPreview} onImagePreview={onImagePreview} onOpenLocalWebPreview={onOpenLocalWebPreview} />
       <ChatTime ts={ts} />
     </div>
   );
@@ -3872,11 +4156,13 @@ function AttachmentDownloadButton({
   serverId,
   onPathClick,
   onHtmlPreview,
+  sessionName,
 }: {
   att: { id: string; originalName?: string; size?: number; daemonPath?: string };
   serverId: string;
   onPathClick?: (p: string) => void;
   onHtmlPreview?: (p: string) => void;
+  sessionName?: string;
 }) {
   const { t } = useTranslation();
   const [error, setError] = useState<string | null>(null);
@@ -3905,7 +4191,10 @@ function AttachmentDownloadButton({
             return;
           }
           import('../api.js').then(({ previewAttachment }) => {
-            previewAttachment(serverId, att.id).catch(handleError);
+            const request = sessionName
+              ? previewAttachment(serverId, att.id, sessionName)
+              : previewAttachment(serverId, att.id);
+            request.catch(handleError);
           });
         }}
         title={error || label}
@@ -3917,7 +4206,10 @@ function AttachmentDownloadButton({
         onClick={() => {
           setError(null);
           import('../api.js').then(({ downloadAttachment }) => {
-            downloadAttachment(serverId, att.id).catch(handleError);
+            const request = sessionName
+              ? downloadAttachment(serverId, att.id, sessionName)
+              : downloadAttachment(serverId, att.id);
+            request.catch(handleError);
           });
         }}
         title={t('upload.download_file')}
@@ -3945,23 +4237,27 @@ function AttachmentDownloadButton({
 
 const ChatEvent = memo(function ChatEvent({
   event,
+  sessionName,
   onPathClick,
   onUrlClick,
   onFileChangeOpen,
   onDownload,
   onHtmlPreview,
   onImagePreview,
+  onOpenLocalWebPreview,
   serverId,
   onResendFailed,
   showTime,
 }: {
   event: TimelineEvent;
+  sessionName?: string;
   onPathClick?: (p: string) => void;
   onUrlClick?: (url: string) => void;
   onFileChangeOpen?: (path: string, preferDiff?: boolean) => void;
   onDownload?: ChatPathDownloadHandler;
   onHtmlPreview?: (path: string) => void;
   onImagePreview?: ChatLocalImagePreviewLoader;
+  onOpenLocalWebPreview?: ChatLocalWebPreviewOpenHandler;
   serverId?: string;
   onResendFailed?: (commandId: string, text: string) => void;
   showTime?: boolean;
@@ -3996,7 +4292,7 @@ const ChatEvent = memo(function ChatEvent({
             </div>
           )}
           {attachments && serverId && attachments.map((att) => (
-            <AttachmentDownloadButton key={att.id} att={att} serverId={serverId} onPathClick={onPathClick} onHtmlPreview={onHtmlPreview} />
+            <AttachmentDownloadButton key={att.id} att={att} serverId={serverId} sessionName={sessionName} onPathClick={onPathClick} onHtmlPreview={onHtmlPreview} />
           ))}
           {userText && (
             <UserMessageText
@@ -4006,6 +4302,7 @@ const ChatEvent = memo(function ChatEvent({
               onDownload={onDownload}
               onHtmlPreview={onHtmlPreview}
               onImagePreview={onImagePreview}
+              onOpenLocalWebPreview={onOpenLocalWebPreview}
             />
           )}
           {isPending && (
@@ -4069,7 +4366,7 @@ const ChatEvent = memo(function ChatEvent({
           {findingsPreview && (
             <details>
               <summary>{t('peerAuditResult.findingsPreview')}</summary>
-              <ChatMarkdown text={findingsPreview} />
+              <ChatMarkdown text={findingsPreview} onUrlClick={onUrlClick} onOpenLocalWebPreview={onOpenLocalWebPreview} />
             </details>
           )}
           <ChatTime ts={event.ts} />
@@ -4097,6 +4394,7 @@ const ChatEvent = memo(function ChatEvent({
               onDownload={onDownload}
               onHtmlPreview={onHtmlPreview}
               onImagePreview={onImagePreview}
+              onOpenLocalWebPreview={onOpenLocalWebPreview}
             />
           )}
           <ChatTime ts={event.ts} />
@@ -4139,18 +4437,18 @@ const ChatEvent = memo(function ChatEvent({
                   <span aria-hidden="true">{expanded ? '▾' : '▸'}</span>
                 </button>
                 <span class="chat-tool-name">{toolName}</span>
-                {toolInputFirstLine && <span class="chat-tool-input">{' '}{splitPathsAndUrls(toolInputFirstLine, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'))}</span>}
+                {toolInputFirstLine && <span class="chat-tool-input">{' '}{splitPathsAndUrls(toolInputFirstLine, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'), onOpenLocalWebPreview)}</span>}
                 {isMerged && <span class={`chat-tool-state${toolFailed ? ' is-failed' : ' is-complete'}`} aria-hidden="true">{toolFailed ? '×' : '✓'}</span>}
                 {shouldShowTime && <span class="chat-bubble-time" style={{ display: 'inline', margin: 0 }}>{formatChatDateTime(event.ts, Date.now(), locale)}</span>}
               </div>
               {toolInputRemainingLines !== null && (
                 <div class="chat-event chat-tool chat-tool-fold-continuation">
-                  <span class="chat-tool-input">{splitPathsAndUrls(toolInputRemainingLines, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'))}</span>
+                  <span class="chat-tool-input">{splitPathsAndUrls(toolInputRemainingLines, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'), onOpenLocalWebPreview)}</span>
                 </div>
               )}
               {toolOutput && (
                 <div class="chat-event chat-tool chat-tool-result-preview">
-                  <span class="chat-tool-output">{splitPathsAndUrls(toolOutput, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'))}</span>
+                  <span class="chat-tool-output">{splitPathsAndUrls(toolOutput, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'), onOpenLocalWebPreview)}</span>
                 </div>
               )}
               {expanded && (
@@ -4201,12 +4499,12 @@ const ChatEvent = memo(function ChatEvent({
                 >
                   <span aria-hidden="true">{expanded ? '▾' : '▸'}</span>
                 </button>
-                <span class={resultClass}>{splitPathsAndUrls(resultFirstLine, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'))}</span>
+                <span class={resultClass}>{splitPathsAndUrls(resultFirstLine, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'), onOpenLocalWebPreview)}</span>
                 {showTime && <span class="chat-bubble-time" style={{ display: 'inline', margin: 0 }}>{formatChatDateTime(event.ts, Date.now(), locale)}</span>}
               </div>
               {resultRemainingLines !== null && (
                 <div class="chat-event chat-tool chat-tool-fold-continuation">
-                  <span class={resultClass}>{splitPathsAndUrls(resultRemainingLines, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'))}</span>
+                  <span class={resultClass}>{splitPathsAndUrls(resultRemainingLines, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'), onOpenLocalWebPreview)}</span>
                 </div>
               )}
               {expanded && <ToolResultDetailPanel detail={detail} payloadOutput={event.payload.output} />}
@@ -4660,6 +4958,7 @@ function UserMessageText({
   onDownload,
   onHtmlPreview,
   onImagePreview,
+  onOpenLocalWebPreview,
 }: {
   text: string;
   onPathClick?: (p: string) => void;
@@ -4667,6 +4966,7 @@ function UserMessageText({
   onDownload?: ChatPathDownloadHandler;
   onHtmlPreview?: (path: string) => void;
   onImagePreview?: ChatLocalImagePreviewLoader;
+  onOpenLocalWebPreview?: ChatLocalWebPreviewOpenHandler;
 }) {
   const { t } = useTranslation();
   const lineCount = countHardLines(text);
@@ -4677,7 +4977,7 @@ function UserMessageText({
   return (
     <div class={`chat-user-message-fold${shouldFold ? ' is-foldable' : ''}${folded ? ' is-folded' : ''}`}>
       <div class={`chat-bubble-content chat-user-message-fold-content${folded ? ' is-folded' : ''}`}>
-        {splitPathsAndUrls(text, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'))}
+        {splitPathsAndUrls(text, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'), onOpenLocalWebPreview)}
       </div>
       {shouldFold && (
         <button
@@ -4718,8 +5018,9 @@ function splitPathsAndUrls(
   onImagePreview?: ChatLocalImagePreviewLoader,
   downloadLabel = '',
   htmlPreviewLabel = '',
+  onOpenLocalWebPreview?: ChatLocalWebPreviewOpenHandler,
 ): h.JSX.Element[] {
-  if (!onPathClick && !onUrlClick && !onDownload && !onHtmlPreview && !onImagePreview) return [<span>{text}</span>];
+  if (!onPathClick && !onUrlClick && !onDownload && !onHtmlPreview && !onImagePreview && !onOpenLocalWebPreview) return [<span>{text}</span>];
   if (shouldSkipRichTextEnhancement(text)) return [<span>{text}</span>];
 
   // Step 1: Split by URLs first (URLs take priority over path detection)
@@ -4730,21 +5031,14 @@ function splitPathsAndUrls(
   for (const chunk of chunks) {
     if (chunk.type === 'url') {
       parts.push(
-        <a
+        <ChatLoopbackLink
           key={`u${chunk.start}`}
-          class="chat-external-link"
           href={chunk.value}
-          title={chunk.value}
-          target="_blank"
-          rel="noopener noreferrer"
-          onClick={(e: Event) => {
-            if (!onUrlClick) return;
-            e.preventDefault();
-            onUrlClick(chunk.value);
-          }}
+          onOpenLocalWebPreview={onOpenLocalWebPreview}
+          onUrlClick={onUrlClick}
         >
           {chunk.value}
-        </a>,
+        </ChatLoopbackLink>,
       );
     } else if (onPathClick || onImagePreview) {
       // Apply path detection only on non-URL text

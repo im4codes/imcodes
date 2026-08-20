@@ -2,7 +2,12 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
 import { performance } from 'node:perf_hooks';
 import { readFileSync } from 'node:fs';
-import { WsBridge, __setIdlePushSettleMsForTests, __setTimelineDataPlaneQueueConfigForTests } from '../src/ws/bridge.js';
+import {
+  WsBridge,
+  __setIdlePushSettleMsForTests,
+  __setLegacyUpgradePublisherSignerResolverForTests,
+  __setTimelineDataPlaneQueueConfigForTests,
+} from '../src/ws/bridge.js';
 import { getCounter, resetMetricsForTests } from '../src/util/metrics.js';
 import {
   markDaemonUpgradeTargetVersionPublishedForTest,
@@ -54,6 +59,12 @@ import {
   machineExecRegistryStats,
   registerPendingExec,
 } from '../src/ws/machine-exec-registry.js';
+import { CONTROLLED_NODE_OS_LINUX, CONTROLLED_NODE_OS_WIN, type ControlledNodeOs } from '../../shared/controlled-node-artifacts.js';
+import { CONTROLLED_NODE_SAFE_SELF_UPGRADE_CAPABILITY } from '../../shared/controlled-node-service.js';
+import {
+  LEGACY_WINDOWS_UPGRADE_RESCUE_READY_PREFIX,
+  LEGACY_WINDOWS_UPGRADE_RESTART_READY_PREFIX,
+} from '../src/ws/windows-controlled-node-upgrade-rescue.js';
 
 // ── Mock WebSocket ─────────────────────────────────────────────────────────────
 
@@ -154,12 +165,17 @@ function packFrame(sessionName: string, payload: Buffer): Buffer {
 
 // ── Mock DB ────────────────────────────────────────────────────────────────────
 
-function makeDb(tokenHash: string, nodeRole: 'full' | 'controlled' = 'full') {
+function makeDb(
+  tokenHash: string,
+  nodeRole: 'full' | 'controlled' = 'full',
+  os: ControlledNodeOs | null = nodeRole === 'controlled' ? CONTROLLED_NODE_OS_LINUX : null,
+) {
   const db = {
     queryOne: async () => ({
       token_hash: tokenHash,
       node_role: nodeRole,
       revoked_at: null,
+      os,
     }),
     query: async () => [],
     execute: async () => ({ changes: 1 }),
@@ -335,9 +351,13 @@ async function flushOneBridgeDataPlaneTurn() {
 
 describe('WsBridge', () => {
   let serverId: string;
+  let restoreUpgradePublisherSignerResolver: () => void;
 
   beforeEach(() => {
     serverId = `test-${Math.random().toString(36).slice(2)}`;
+    restoreUpgradePublisherSignerResolver = __setLegacyUpgradePublisherSignerResolverForTests(
+      async () => 'a'.repeat(64),
+    );
     resetDaemonUpgradePublicationGateForTest();
     markDaemonUpgradeTargetVersionPublishedForTest('2026.4.905-dev.877');
     markDaemonUpgradeTargetVersionPublishedForTest('2026.4.905');
@@ -345,6 +365,7 @@ describe('WsBridge', () => {
   });
 
   afterEach(() => {
+    restoreUpgradePublisherSignerResolver();
     WsBridge.getAll().clear();
     resetDaemonUpgradePublicationGateForTest();
     resetMetricsForTests();
@@ -474,12 +495,386 @@ describe('WsBridge', () => {
       const ws = new MockWs();
       bridge.handleDaemonConnection(ws as never, makeDb('valid-hash', 'controlled'), {} as never);
 
-      ws.emit('message', JSON.stringify({ type: 'auth', serverId, token: 'my-token', daemonVersion: '0.1.2' }));
+      ws.emit('message', JSON.stringify({
+        type: 'auth',
+        serverId,
+        token: 'my-token',
+        daemonVersion: '0.1.2',
+        capabilities: [CONTROLLED_NODE_SAFE_SELF_UPGRADE_CAPABILITY],
+      }));
       await flushAsync();
       await vi.advanceTimersByTimeAsync(5000);
       await flushAsync();
 
       expect(ws.sentStrings.some((msg) => msg.includes('"type":"daemon.upgrade"') && msg.includes('2026.7.1234-dev.5'))).toBe(true);
+    });
+
+    it('arms rescue and restarts a safe Windows controlled node whose upgrade latch is stale', async () => {
+      vi.useFakeTimers();
+      process.env.APP_VERSION = '2026.7.1234-dev.5';
+
+      const bridge = WsBridge.get(serverId);
+      const ws = new MockWs();
+      bridge.handleDaemonConnection(
+        ws as never,
+        makeDb('valid-hash', 'controlled', CONTROLLED_NODE_OS_WIN),
+        {} as never,
+      );
+      ws.emit('message', JSON.stringify({
+        type: 'auth',
+        serverId,
+        token: 'my-token',
+        daemonVersion: '2026.7.1233-dev.4',
+        capabilities: [CONTROLLED_NODE_SAFE_SELF_UPGRADE_CAPABILITY],
+      }));
+      await flushAsync();
+      await vi.advanceTimersByTimeAsync(5_000);
+      await flushAsync();
+
+      expect(ws.sentStrings.some((message) => message.includes('"type":"daemon.upgrade"'))).toBe(true);
+      expect(ws.sentStrings.some((message) => message.includes('"type":"machine.exec"'))).toBe(false);
+
+      ws.emit('message', JSON.stringify({
+        type: DAEMON_MSG.UPGRADE_BLOCKED,
+        reason: DAEMON_UPGRADE_BLOCK_REASON.ALREADY_IN_PROGRESS,
+      }));
+      await flushAsync();
+
+      const rescue = ws.sentStrings
+        .map((message) => JSON.parse(message) as Record<string, unknown>)
+        .find((message) => typeof message.correlationId === 'string'
+          && message.correlationId.startsWith('upgrade-rescue-'))!;
+      const rescueId = String(rescue.correlationId).replace(/^upgrade-rescue-/, '');
+      expect(rescue).toMatchObject({ shell: 'powershell' });
+
+      ws.emit('message', JSON.stringify({
+        type: DAEMON_MSG.MACHINE_EXEC_RESULT,
+        correlationId: rescue.correlationId,
+        ok: true,
+        exitCode: 0,
+        stdout: `${LEGACY_WINDOWS_UPGRADE_RESCUE_READY_PREFIX}:${rescueId}\r\n`,
+        stderr: '',
+        truncated: false,
+        timedOut: false,
+        durationMs: 100,
+      }));
+      await flushAsync();
+
+      const restart = ws.sentStrings
+        .map((message) => JSON.parse(message) as Record<string, unknown>)
+        .find((message) => typeof message.correlationId === 'string'
+          && message.correlationId.startsWith('upgrade-restart-'));
+      expect(restart).toMatchObject({ shell: 'powershell', timeoutMs: 120_000 });
+    });
+
+    it('keeps a controlled node online when it advertises a bounded future capability', async () => {
+      const executed: Array<{ sql: string; params: unknown[] }> = [];
+      const db = {
+        queryOne: async () => ({
+          token_hash: 'valid-hash',
+          node_role: 'controlled',
+          revoked_at: null,
+          os: CONTROLLED_NODE_OS_WIN,
+        }),
+        query: async () => [],
+        execute: async (sql: string, params: unknown[] = []) => {
+          executed.push({ sql, params });
+          return { changes: 1 };
+        },
+        exec: async () => {},
+        transaction: async <T>(fn: (tx: import('../src/db/client.js').Database) => Promise<T>) => fn(db as unknown as import('../src/db/client.js').Database),
+        close: () => {},
+      } as unknown as import('../src/db/client.js').Database;
+      const bridge = WsBridge.get(serverId);
+      const ws = new MockWs();
+      bridge.handleDaemonConnection(ws as never, db, {} as never);
+
+      ws.emit('message', JSON.stringify({
+        type: 'auth',
+        serverId,
+        token: 'my-token',
+        daemonVersion: '0.1.2',
+        capabilities: [CONTROLLED_NODE_SAFE_SELF_UPGRADE_CAPABILITY, 'remote.desktop.windows.h264.v3'],
+      }));
+      await flushAsync();
+
+      expect(bridge.isAuthenticated).toBe(true);
+      expect(ws.closed).toBe(false);
+      expect(executed.some(({ sql, params }) => sql.includes('controlled_capabilities')
+        && params.includes(JSON.stringify([CONTROLLED_NODE_SAFE_SELF_UPGRADE_CAPABILITY])))).toBe(true);
+    });
+
+    it('rejects malformed future capability advertisements', async () => {
+      const bridge = WsBridge.get(serverId);
+      const ws = new MockWs();
+      bridge.handleDaemonConnection(ws as never, makeDb('valid-hash', 'controlled'), {} as never);
+
+      ws.emit('message', JSON.stringify({
+        type: 'auth', serverId, token: 'my-token', daemonVersion: '0.1.2', capabilities: ['remote desktop v3'],
+      }));
+      await flushAsync();
+
+      expect(bridge.isAuthenticated).toBe(false);
+      expect(ws.closed).toBe(true);
+      expect(ws.closeCode).toBe(4002);
+      expect(ws.closeReason).toBe('invalid_capabilities');
+    });
+
+    it('prepares and verifies an independent rescue before a legacy Windows controlled node auto-upgrades', async () => {
+      vi.useFakeTimers();
+      process.env.APP_VERSION = '2026.7.1234-dev.5';
+
+      const bridge = WsBridge.get(serverId);
+      const ws = new MockWs();
+      bridge.handleDaemonConnection(ws as never, makeDb('valid-hash', 'controlled', CONTROLLED_NODE_OS_WIN), {} as never);
+      ws.emit('message', JSON.stringify({
+        type: 'auth', serverId, token: 'my-token', daemonVersion: '0.1.2', capabilities: [],
+      }));
+      await flushAsync();
+
+      const rescueFrame = ws.sentStrings
+        .map((message) => JSON.parse(message) as Record<string, unknown>)
+        .find((message) => message.type === DAEMON_COMMAND_TYPES.MACHINE_EXEC);
+      expect(rescueFrame).toMatchObject({ shell: 'powershell', timeoutMs: 120_000 });
+      expect(ws.sentStrings.some((message) => message.includes('"type":"daemon.upgrade"'))).toBe(false);
+      const correlationId = String(rescueFrame?.correlationId);
+      const rescueId = correlationId.replace(/^upgrade-rescue-/, '');
+
+      ws.emit('message', JSON.stringify({
+        type: DAEMON_MSG.MACHINE_EXEC_RESULT,
+        correlationId,
+        ok: true,
+        exitCode: 0,
+        stdout: `${LEGACY_WINDOWS_UPGRADE_RESCUE_READY_PREFIX}:${rescueId}\r\n`,
+        stderr: '',
+        truncated: false,
+        timedOut: false,
+        durationMs: 100,
+      }));
+      await flushAsync();
+      await vi.advanceTimersByTimeAsync(5_000);
+      await flushAsync();
+
+      expect(ws.sentStrings.filter((message) => message.includes('"type":"daemon.upgrade"'))).toHaveLength(1);
+    });
+
+    it('keeps a legacy Windows node online and retries rescue preparation instead of sending an unsafe upgrade', async () => {
+      vi.useFakeTimers();
+      process.env.APP_VERSION = '2026.7.1234-dev.5';
+
+      const bridge = WsBridge.get(serverId);
+      const ws = new MockWs();
+      bridge.handleDaemonConnection(ws as never, makeDb('valid-hash', 'controlled', CONTROLLED_NODE_OS_WIN), {} as never);
+      ws.emit('message', JSON.stringify({
+        type: 'auth', serverId, token: 'my-token', daemonVersion: '0.1.2', capabilities: [],
+      }));
+      await flushAsync();
+      const first = ws.sentStrings
+        .map((message) => JSON.parse(message) as Record<string, unknown>)
+        .find((message) => message.type === DAEMON_COMMAND_TYPES.MACHINE_EXEC)!;
+
+      ws.emit('message', JSON.stringify({
+        type: DAEMON_MSG.MACHINE_EXEC_RESULT,
+        correlationId: first.correlationId,
+        ok: true,
+        exitCode: 1,
+        stdout: '',
+        stderr: 'preparation failed',
+        truncated: false,
+        timedOut: false,
+        durationMs: 100,
+      }));
+      await flushAsync();
+      expect(ws.sentStrings.some((message) => message.includes('"type":"daemon.upgrade"'))).toBe(false);
+
+      await vi.advanceTimersByTimeAsync(60_000);
+      await flushAsync();
+      expect(ws.sentStrings.filter((message) => message.includes('"type":"machine.exec"'))).toHaveLength(2);
+      expect(ws.sentStrings.some((message) => message.includes('"type":"daemon.upgrade"'))).toBe(false);
+    });
+
+    it('automatically restarts a legacy Windows node with a stale upgrade latch and retries on the replacement generation', async () => {
+      vi.useFakeTimers();
+      process.env.APP_VERSION = '2026.8.3409-dev.3847';
+
+      const bridge = WsBridge.get(serverId);
+      const firstWs = new MockWs();
+      bridge.handleDaemonConnection(
+        firstWs as never,
+        makeDb('valid-hash', 'controlled', CONTROLLED_NODE_OS_WIN),
+        {} as never,
+      );
+      firstWs.emit('message', JSON.stringify({
+        type: 'auth', serverId, token: 'my-token', daemonVersion: '0.1.3-rework.v94', capabilities: [],
+      }));
+      await flushAsync();
+
+      const firstRescue = firstWs.sentStrings
+        .map((message) => JSON.parse(message) as Record<string, unknown>)
+        .find((message) => message.type === DAEMON_COMMAND_TYPES.MACHINE_EXEC)!;
+      const firstRescueId = String(firstRescue.correlationId).replace(/^upgrade-rescue-/, '');
+      firstWs.emit('message', JSON.stringify({
+        type: DAEMON_MSG.UPGRADE_BLOCKED,
+        reason: DAEMON_UPGRADE_BLOCK_REASON.ALREADY_IN_PROGRESS,
+      }));
+      await flushAsync();
+      expect(firstWs.sentStrings
+        .map((message) => JSON.parse(message) as Record<string, unknown>)
+        .filter((message) => typeof message.correlationId === 'string'
+          && message.correlationId.startsWith('upgrade-restart-')))
+        .toHaveLength(0);
+
+      firstWs.emit('message', JSON.stringify({
+        type: DAEMON_MSG.MACHINE_EXEC_RESULT,
+        correlationId: firstRescue.correlationId,
+        ok: true,
+        exitCode: 0,
+        stdout: `${LEGACY_WINDOWS_UPGRADE_RESCUE_READY_PREFIX}:${firstRescueId}\r\n`,
+        stderr: '',
+        truncated: false,
+        timedOut: false,
+        durationMs: 100,
+      }));
+      await flushAsync();
+      await vi.advanceTimersByTimeAsync(5_000);
+      await flushAsync();
+
+      const firstUpgrade = firstWs.sentStrings
+        .map((message) => JSON.parse(message) as Record<string, unknown>)
+        .find((message) => message.type === DAEMON_COMMAND_TYPES.DAEMON_UPGRADE)!;
+      expect(firstUpgrade.upgradeId).toEqual(expect.any(String));
+
+      firstWs.emit('message', JSON.stringify({
+        type: DAEMON_MSG.UPGRADE_BLOCKED,
+        reason: 'fetch failed',
+      }));
+      await flushAsync();
+      expect(firstWs.sentStrings
+        .map((message) => JSON.parse(message) as Record<string, unknown>)
+        .filter((message) => typeof message.correlationId === 'string'
+          && message.correlationId.startsWith('upgrade-restart-')))
+        .toHaveLength(0);
+      await vi.advanceTimersByTimeAsync(60_000);
+      await flushAsync();
+      expect(firstWs.sentStrings
+        .map((message) => JSON.parse(message) as Record<string, unknown>)
+        .filter((message) => message.type === DAEMON_COMMAND_TYPES.DAEMON_UPGRADE))
+        .toEqual([
+          expect.objectContaining({ upgradeId: firstUpgrade.upgradeId }),
+          expect.objectContaining({ upgradeId: firstUpgrade.upgradeId }),
+        ]);
+
+      firstWs.emit('message', JSON.stringify({
+        type: DAEMON_MSG.UPGRADE_BLOCKED,
+        reason: DAEMON_UPGRADE_BLOCK_REASON.ALREADY_IN_PROGRESS,
+      }));
+      await flushAsync();
+      const firstRestartFrame = firstWs.sentStrings
+        .map((message) => JSON.parse(message) as Record<string, unknown>)
+        .find((message) => typeof message.correlationId === 'string'
+          && message.correlationId.startsWith('upgrade-restart-'))!;
+      expect(firstRestartFrame).toMatchObject({ shell: 'powershell', timeoutMs: 120_000 });
+      firstWs.emit('message', JSON.stringify({
+        type: DAEMON_MSG.MACHINE_EXEC_RESULT,
+        correlationId: firstRestartFrame.correlationId,
+        ok: false,
+        exitCode: null,
+        stdout: '',
+        stderr: 'task registration failed',
+        error: 'task registration failed',
+        truncated: false,
+        timedOut: false,
+        durationMs: 100,
+      }));
+      await flushAsync();
+      await vi.advanceTimersByTimeAsync(60_000);
+      await flushAsync();
+
+      const restartFrames = firstWs.sentStrings
+        .map((message) => JSON.parse(message) as Record<string, unknown>)
+        .filter((message) => typeof message.correlationId === 'string'
+          && message.correlationId.startsWith('upgrade-restart-'));
+      expect(restartFrames).toHaveLength(2);
+      const restartFrame = restartFrames[1]!;
+      const restartId = String(restartFrame.correlationId).replace(/^upgrade-restart-/, '');
+      firstWs.emit('message', JSON.stringify({
+        type: DAEMON_MSG.MACHINE_EXEC_RESULT,
+        correlationId: restartFrame.correlationId,
+        ok: true,
+        exitCode: 0,
+        stdout: `${LEGACY_WINDOWS_UPGRADE_RESTART_READY_PREFIX}:${restartId}\r\n`,
+        stderr: '',
+        truncated: false,
+        timedOut: false,
+        durationMs: 100,
+      }));
+      await flushAsync();
+
+      firstWs.emit('close');
+      const replacementWs = new MockWs();
+      bridge.handleDaemonConnection(
+        replacementWs as never,
+        makeDb('valid-hash', 'controlled', CONTROLLED_NODE_OS_WIN),
+        {} as never,
+      );
+      replacementWs.emit('message', JSON.stringify({
+        type: 'auth', serverId, token: 'my-token', daemonVersion: '0.1.3-rework.v94', capabilities: [],
+      }));
+      await flushAsync();
+
+      const replacementRescue = replacementWs.sentStrings
+        .map((message) => JSON.parse(message) as Record<string, unknown>)
+        .find((message) => message.type === DAEMON_COMMAND_TYPES.MACHINE_EXEC)!;
+      const replacementRescueId = String(replacementRescue.correlationId).replace(/^upgrade-rescue-/, '');
+      replacementWs.emit('message', JSON.stringify({
+        type: DAEMON_MSG.MACHINE_EXEC_RESULT,
+        correlationId: replacementRescue.correlationId,
+        ok: true,
+        exitCode: 0,
+        stdout: `${LEGACY_WINDOWS_UPGRADE_RESCUE_READY_PREFIX}:${replacementRescueId}\r\n`,
+        stderr: '',
+        truncated: false,
+        timedOut: false,
+        durationMs: 100,
+      }));
+      await flushAsync();
+      await vi.advanceTimersByTimeAsync(5_000);
+      await flushAsync();
+
+      expect(replacementWs.sentStrings
+        .map((message) => JSON.parse(message) as Record<string, unknown>)
+        .filter((message) => message.type === DAEMON_COMMAND_TYPES.DAEMON_UPGRADE))
+        .toEqual([expect.objectContaining({
+          upgradeId: firstUpgrade.upgradeId,
+          targetVersion: process.env.APP_VERSION,
+        })]);
+    });
+
+    it('drops controlled-node upgrade blocker frames with extra keys', async () => {
+      process.env.APP_VERSION = '2026.8.3409-dev.3847';
+      const before = WsBridge.controlledInboundDropped;
+      const bridge = WsBridge.get(serverId);
+      const ws = new MockWs();
+      bridge.handleDaemonConnection(
+        ws as never,
+        makeDb('valid-hash', 'controlled', CONTROLLED_NODE_OS_WIN),
+        {} as never,
+      );
+      ws.emit('message', JSON.stringify({
+        type: 'auth', serverId, token: 'my-token', daemonVersion: '0.1.3-rework.v94', capabilities: [],
+      }));
+      await flushAsync();
+      const machineExecCount = ws.sentStrings.filter((message) => message.includes('"type":"machine.exec"')).length;
+
+      ws.emit('message', JSON.stringify({
+        type: DAEMON_MSG.UPGRADE_BLOCKED,
+        reason: DAEMON_UPGRADE_BLOCK_REASON.ALREADY_IN_PROGRESS,
+        extra: true,
+      }));
+      await flushAsync();
+
+      expect(WsBridge.controlledInboundDropped).toBe(before + 1);
+      expect(ws.sentStrings.filter((message) => message.includes('"type":"machine.exec"'))).toHaveLength(machineExecCount);
     });
 
     it('sends daemon.upgrade when daemon is newer than server version so versions converge exactly', async () => {
@@ -6023,6 +6418,36 @@ describe('WsBridge', () => {
       expect(execSpy).toHaveBeenCalledWith(
         'UPDATE cron_executions SET detail = $1, status = $2 WHERE id = $3',
         ['busy', 'skipped_busy', 'exec-1'],
+      );
+    });
+
+    it('collapses cumulative streaming snapshots sent by an older daemon before persistence', async () => {
+      const execSpy = vi.fn(async () => ({ changes: 1 }));
+      const db = {
+        queryOne: async () => ({ token_hash: 'valid-hash' }),
+        query: async () => [],
+        execute: execSpy,
+        exec: async () => {},
+        close: () => {},
+      } as unknown as import('../src/db/client.js').Database;
+
+      const bridge = WsBridge.get(serverId);
+      const daemonWs = new MockWs();
+      bridge.handleDaemonConnection(daemonWs as never, db, {} as never);
+      daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'cron.command_result',
+        jobId: 'job-stream',
+        executionId: 'exec-stream',
+        detail: ['主人开始今日任务', '主人开始今日任务执行', '主人开始今日任务执行并检查', '主人开始今日任务执行并检查结果', '主人开始今日任务执行并检查结果完成。'].join('\n'),
+      }));
+      await flushAsync();
+
+      expect(execSpy).toHaveBeenCalledWith(
+        'UPDATE cron_executions SET detail = $1 WHERE id = $2',
+        ['主人开始今日任务执行并检查结果完成。', 'exec-stream'],
       );
     });
   });

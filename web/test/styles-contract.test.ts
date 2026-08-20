@@ -14,6 +14,54 @@ describe('styles.css regression contracts', () => {
   const css = readFileSync(resolve(__dirname, '../src/styles.css'), 'utf8');
   const cssWithoutComments = css.replace(/\/\*[\s\S]*?\*\//g, '');
 
+  it('keeps feature announcements visible and dismissible on desktop and mobile', () => {
+    const announcementRule = css.match(/\.feature-announcement\s*\{[^}]*\}/)?.[0];
+    expect(announcementRule).toBeTruthy();
+    expect(announcementRule).toMatch(/position:\s*fixed/);
+    expect(announcementRule).toMatch(/z-index:\s*10004/);
+    expect(announcementRule).not.toMatch(/display:\s*none/);
+
+    const dismissRule = css.match(/\.feature-announcement-dismiss\s*\{[^}]*\}/)?.[0];
+    expect(dismissRule).toBeTruthy();
+    expect(dismissRule).toMatch(/cursor:\s*pointer/);
+  });
+
+  it('keeps pinned messages as a compact titlebar counter with an overlay list', () => {
+    const barRule = css.match(/\.message-pins-bar\s*\{[^}]*\}/)?.[0];
+    expect(barRule).toBeTruthy();
+    expect(barRule).toMatch(/display:\s*inline-flex/);
+    expect(barRule).not.toMatch(/margin:/);
+
+    const triggerRule = css.match(/\.message-pins-summary\s*\{[^}]*\}/)?.[0];
+    expect(triggerRule).toBeTruthy();
+    expect(triggerRule).toMatch(/height:\s*24px/);
+    expect(triggerRule).toMatch(/width:\s*auto/);
+
+    const panelRule = css.match(/\.message-pins-panel\s*\{[^}]*\}/)?.[0];
+    expect(panelRule).toBeTruthy();
+    expect(panelRule).toMatch(/position:\s*absolute/);
+  });
+
+  it('uses half the desktop viewport and full mobile width for pinned-message previews', () => {
+    const previewRule = css.match(/\.zoom-text-dialog-message-preview\s*\{[^}]*\}/)?.[0];
+    expect(previewRule).toBeTruthy();
+    expect(previewRule).toMatch(/width:\s*min\(50vw,\s*calc\(100vw - 24px\)\)/);
+
+    const mobileRule = css.match(/@media\s*\(max-width:\s*640px\)\s*\{[\s\S]*?\.zoom-text-dialog-message-preview\s*\{[^}]*\}/)?.[0];
+    expect(mobileRule).toBeTruthy();
+    expect(mobileRule).toMatch(/width:\s*calc\(100vw - 16px\)/);
+
+    const mobileActionsRule = css.match(/@media\s*\(max-width:\s*520px\)\s*\{[\s\S]*?\.zoom-text-dialog-message-preview \.zoom-text-actions\s*\{[^}]*\}/)?.[0];
+    expect(mobileActionsRule).toBeTruthy();
+    expect(mobileActionsRule).toMatch(/flex-direction:\s*row/);
+    expect(mobileActionsRule).toMatch(/flex-wrap:\s*nowrap/);
+
+    const mobileButtonRule = css.match(/@media\s*\(max-width:\s*520px\)\s*\{[\s\S]*?\.zoom-text-dialog-message-preview \.zoom-text-btn\s*\{[^}]*\}/)?.[0];
+    expect(mobileButtonRule).toBeTruthy();
+    expect(mobileButtonRule).toMatch(/flex:\s*1\s+1\s+0/);
+    expect(mobileButtonRule).toMatch(/width:\s*auto/);
+  });
+
   it('keeps long delegation replies at content height inside the chat flex scroller', () => {
     const rule = cssWithoutComments.match(/\.delegation-reply-card\s*\{[^}]*\}/)?.[0];
     expect(rule).toBeTruthy();
@@ -124,6 +172,18 @@ describe('styles.css regression contracts', () => {
     expect(relayBadgeRule?.[0]).toMatch(/color:\s*#fcd34d/);
     expect(directProgressRule?.[0]).toMatch(/#4ade80/);
     expect(relayProgressRule?.[0]).toMatch(/#fbbf24/);
+  });
+
+  it('keeps the remote-desktop right-click helper touch-only', () => {
+    const desktopRule = css.match(/\.remote-desktop-touch-right-button\s*\{[^}]*\}/)?.[0];
+    expect(desktopRule).toBeTruthy();
+    expect(desktopRule).toMatch(/display:\s*none/);
+
+    const coarsePointerRule = css.match(
+      /@media\s*\(pointer:\s*coarse\)\s*\{[\s\S]*?\.remote-desktop-touch-right-button\s*\{[^}]*\}/,
+    )?.[0];
+    expect(coarsePointerRule).toBeTruthy();
+    expect(coarsePointerRule).toMatch(/display:\s*block/);
   });
 
   it('fits portrait videos by available preview height without stretching them to full width', () => {
@@ -306,9 +366,20 @@ describe('styles.css regression contracts', () => {
 
     const subcardStopRule = css.match(/\.subcard-stop-btn\s*\{[^}]*\}/);
     expect(subcardStopRule).not.toBeNull();
-    expect(subcardStopRule![0]).toMatch(/width:\s*40px/);
-    expect(subcardStopRule![0]).toMatch(/margin-left:\s*-6px/);
-    expect(subcardStopRule![0]).toMatch(/border-radius:\s*0 6px 6px 0/);
+    expect(subcardStopRule![0]).toMatch(/width:\s*28px/);
+    expect(subcardStopRule![0]).toMatch(/min-width:\s*28px/);
+    expect(subcardStopRule![0]).toMatch(/margin-left:\s*0/);
+    expect(subcardStopRule![0]).toMatch(/border-radius:\s*6px/);
+
+    const cardComposerRule = css.match(/\.subcard \.controls-input\s*\{[^}]*\}/);
+    expect(cardComposerRule).not.toBeNull();
+    expect(cardComposerRule![0]).toMatch(/min-height:\s*calc\(1\.45em \+ 10px\)/);
+    expect(cardComposerRule![0]).toMatch(/max-height:\s*calc\(1\.45em \+ 10px\)/);
+
+    const expandedCardComposerRule = css.match(/\.subcard \.controls-composer-mobile-expanded \.controls-input\s*\{[^}]*\}/);
+    expect(expandedCardComposerRule).not.toBeNull();
+    expect(expandedCardComposerRule![0]).toMatch(/min-height:\s*100%/);
+    expect(expandedCardComposerRule![0]).toMatch(/max-height:\s*none/);
   });
 
   it('daemon stats strip keeps the compact tech styling and animated clock digits', () => {
@@ -548,6 +619,20 @@ describe('styles.css regression contracts', () => {
     expect(nameRule![0]).toMatch(/white-space:\s*nowrap/);
   });
 
+  it('mobile shell chrome does not depend solely on the narrow viewport breakpoint', () => {
+    const mobileLayoutBarRule = css.match(/\.layout-mobile\s+\.mobile-server-bar\s*\{[^}]*\}/);
+    expect(mobileLayoutBarRule).not.toBeNull();
+    expect(mobileLayoutBarRule![0]).toMatch(/display:\s*flex/);
+
+    const mobileLayoutToggleRule = css.match(/\.layout-mobile\s+\.mobile-sidebar-toggle\s*\{[^}]*\}/);
+    expect(mobileLayoutToggleRule).not.toBeNull();
+    expect(mobileLayoutToggleRule![0]).toMatch(/display:\s*block/);
+
+    const mobileLayoutSidebarRule = css.match(/\.layout-mobile\s+\.sidebar\s*\{[^}]*\}/);
+    expect(mobileLayoutSidebarRule).not.toBeNull();
+    expect(mobileLayoutSidebarRule![0]).toMatch(/display:\s*none/);
+  });
+
   it('Shared Context management keeps the sci-fi chrome styling hooks', () => {
     const app = readFileSync(resolve(__dirname, '../src/app.tsx'), 'utf8');
     expect(app).toContain('className="shared-context-floating-panel"');
@@ -653,5 +738,74 @@ describe('styles.css regression contracts', () => {
     expect(rule).not.toMatch(/background-size:[^;]*12px/);
     // The card keeps its own gradient — this is about the texture, not the fill.
     expect(rule).toMatch(/linear-gradient\(115deg/);
+  });
+
+  // The desktop composer restack must stay inside its min-width block. The
+  // mobile layout is the 640px override of the same base rules, so a rule that
+  // leaks out of the media query would silently restack the phone composer too
+  // -- and nothing else in the suite renders at a real viewport width to catch
+  // it.
+  it('keeps the desktop composer restack scoped to the desktop breakpoint', () => {
+    const desktopBlock = /@media \(min-width: 641px\) \{([\s\S]*?)\n\}/.exec(css);
+    expect(desktopBlock).not.toBeNull();
+    const inside = desktopBlock![1];
+    expect(inside).toMatch(/\.controls\s*\{[^}]*flex-wrap:\s*wrap/);
+    expect(inside).toMatch(/\.controls-composer\s*\{[^}]*order:\s*-1/);
+
+    // Outside the block, `.controls` must not wrap and the composer must not
+    // claim its own row.
+    const outside = css.replace(desktopBlock![0], '');
+    expect(outside).not.toMatch(/\.controls\s*\{[^}]*flex-wrap:\s*wrap/);
+    expect(outside).not.toMatch(/\.controls-composer\s*\{[^}]*order:\s*-1/);
+  });
+
+  // The hover highlight must not rest on `:has()`. Ancestor `:has(:hover)`
+  // re-evaluation is not dependable across engines, and the reported symptom
+  // was exactly that — the highlight appeared sometimes and not others, in both
+  // main and sub sessions. The strip paints its own line under a plain `:hover`
+  // on the hovered element, which has no such ambiguity; `:has()` only deepens
+  // it when it does fire.
+  it('drives the resize highlight from the strip, not only from :has()', () => {
+    const desktopBlock = /@media \(min-width: 641px\) \{([\s\S]*?)\n\}/.exec(css);
+    expect(desktopBlock).not.toBeNull();
+    const inside = desktopBlock![1];
+
+    expect(inside).toMatch(/\.controls-composer-resize-edge::after\s*\{[^}]*background/);
+    expect(inside).toMatch(/\.controls-composer-resize-edge:hover::after/);
+    // Switching the strip's own indicator off would leave only the fragile path.
+    expect(inside).not.toMatch(/\.controls-composer-resize-edge::after\s*\{[^}]*display:\s*none/);
+  });
+
+  it('routes remote-desktop hover input directly to the stage', () => {
+    const videoRule = css.match(/\.remote-desktop-stage video\s*\{[^}]*\}/)?.[0];
+    expect(videoRule, '.remote-desktop-stage video rule missing').toBeTruthy();
+    expect(videoRule).toMatch(/pointer-events:\s*none/);
+  });
+
+  // Transport sessions zero the toolbar's left padding, and they are the only
+  // sessions that render a Stop button -- so matching `.shortcuts` alone would
+  // leave the exact case this alignment exists for still misaligned.
+  it('aligns the toolbar with the composer box on both shortcut variants', () => {
+    const desktopBlock = /@media \(min-width: 641px\) \{([\s\S]*?)\n\}/.exec(css);
+    const inside = desktopBlock![1];
+    expect(inside).toMatch(/\.shortcuts,\s*\n\s*\.shortcuts-transport\s*\{[^}]*padding-left/);
+  });
+
+  it('has no composer corner-grip styles left', () => {
+    expect(css).not.toMatch(/\.controls-composer-resize-handle/);
+    expect(css).not.toMatch(/\.composer-height-resizing-corner/);
+  });
+
+  // An unbalanced brace does not throw and does not blank the page: the parser
+  // silently swallows everything after it into the unclosed block, so rules
+  // stop applying while still being present in the file and still matching by
+  // selector. That failure mode cost real debugging time; assert it directly.
+  it('has balanced braces', () => {
+    const stripped = css
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .replace(/"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'/g, '');
+    const open = (stripped.match(/\{/g) ?? []).length;
+    const close = (stripped.match(/\}/g) ?? []).length;
+    expect(close - open).toBe(0);
   });
 });

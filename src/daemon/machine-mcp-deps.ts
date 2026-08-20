@@ -27,7 +27,7 @@ export interface DaemonCredential {
 }
 
 /** Read the daemon's own bound credential; null when unbound/unreadable. */
-async function loadDaemonCredential(): Promise<DaemonCredential | null> {
+export async function loadDaemonCredential(): Promise<DaemonCredential | null> {
   try {
     const raw = await readFile(join(homedir(), '.imcodes', 'server.json'), 'utf8');
     const parsed = JSON.parse(raw) as Partial<{ serverId: string; token: string; workerUrl: string }>;

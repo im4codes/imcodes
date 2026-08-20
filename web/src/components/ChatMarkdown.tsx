@@ -23,6 +23,10 @@ import {
   type ChatPathDownloadHandler,
 } from '../chat-path-actions.js';
 import type { ChatLocalImagePreviewLoader } from './ChatLocalImagePreview.js';
+import {
+  ChatLoopbackLink,
+  type ChatLocalWebPreviewOpenHandler,
+} from './ChatLoopbackLink.js';
 
 interface Props {
   text: string;
@@ -32,6 +36,7 @@ interface Props {
   onDownload?: ChatPathDownloadHandler;
   onHtmlPreview?: (path: string) => void;
   onImagePreview?: ChatLocalImagePreviewLoader;
+  onOpenLocalWebPreview?: ChatLocalWebPreviewOpenHandler;
 }
 
 interface RenderContext {
@@ -40,6 +45,7 @@ interface RenderContext {
   onDownload?: ChatPathDownloadHandler;
   onHtmlPreview?: (path: string) => void;
   onImagePreview?: ChatLocalImagePreviewLoader;
+  onOpenLocalWebPreview?: ChatLocalWebPreviewOpenHandler;
   downloadLabel: string;
   htmlPreviewLabel: string;
 }
@@ -54,6 +60,7 @@ function CodeBlock({
   onDownload,
   onHtmlPreview,
   onImagePreview,
+  onOpenLocalWebPreview,
   downloadLabel,
   htmlPreviewLabel,
 }: {
@@ -64,6 +71,7 @@ function CodeBlock({
   onDownload?: ChatPathDownloadHandler;
   onHtmlPreview?: (path: string) => void;
   onImagePreview?: ChatLocalImagePreviewLoader;
+  onOpenLocalWebPreview?: ChatLocalWebPreviewOpenHandler;
   downloadLabel: string;
   htmlPreviewLabel: string;
 }) {
@@ -84,6 +92,7 @@ function CodeBlock({
     onDownload,
     onHtmlPreview,
     onImagePreview,
+    onOpenLocalWebPreview,
     downloadLabel,
     htmlPreviewLabel,
   };
@@ -221,6 +230,7 @@ function renderToken(
           onDownload={ctx.onDownload}
           onHtmlPreview={ctx.onHtmlPreview}
           onImagePreview={ctx.onImagePreview}
+          onOpenLocalWebPreview={ctx.onOpenLocalWebPreview}
           downloadLabel={ctx.downloadLabel}
           htmlPreviewLabel={ctx.htmlPreviewLabel}
         />
@@ -250,40 +260,26 @@ function renderToken(
         : '';
       const linkText = isAutoLinkLike ? sanitizedHref : renderInlineTokens(t.tokens, ctx, true);
       const link = (
-        <a
-          class="chat-external-link"
+        <ChatLoopbackLink
           href={sanitizedHref}
-          title={sanitizedHref}
-          target="_blank"
-          rel="noopener noreferrer"
-          onClick={(e: Event) => {
-            if (!ctx.onUrlClick) return;
-            e.preventDefault();
-            ctx.onUrlClick(sanitizedHref);
-          }}
+          onOpenLocalWebPreview={ctx.onOpenLocalWebPreview}
+          onUrlClick={ctx.onUrlClick}
         >
           {linkText}
-        </a>
+        </ChatLoopbackLink>
       );
       if (trailingText) {
         return <span key={key}>{link}<span>{trailingText}</span></span>;
       }
       return (
-        <a
+        <ChatLoopbackLink
           key={key}
-          class="chat-external-link"
           href={sanitizedHref}
-          title={sanitizedHref}
-          target="_blank"
-          rel="noopener noreferrer"
-          onClick={(e: Event) => {
-            if (!ctx.onUrlClick) return;
-            e.preventDefault();
-            ctx.onUrlClick(sanitizedHref);
-          }}
+          onOpenLocalWebPreview={ctx.onOpenLocalWebPreview}
+          onUrlClick={ctx.onUrlClick}
         >
           {linkText}
-        </a>
+        </ChatLoopbackLink>
       );
     }
 
@@ -395,21 +391,14 @@ function splitPathsAndUrlsInternal(
   for (const chunk of chunks) {
     if (chunk.type === 'url') {
       parts.push(
-        <a
+        <ChatLoopbackLink
           key={`u${chunk.start}`}
-          class="chat-external-link"
           href={chunk.value}
-          title={chunk.value}
-          target="_blank"
-          rel="noopener noreferrer"
-          onClick={(e: Event) => {
-            if (!ctx.onUrlClick) return;
-            e.preventDefault();
-            ctx.onUrlClick(chunk.value);
-          }}
+          onOpenLocalWebPreview={ctx.onOpenLocalWebPreview}
+          onUrlClick={ctx.onUrlClick}
         >
           {chunk.value}
-        </a>,
+        </ChatLoopbackLink>,
       );
     } else if (ctx.onPathClick || ctx.onImagePreview) {
       let pathLast = 0;
@@ -445,7 +434,7 @@ function splitPathsAndUrlsInternal(
 
 // ── Public component ────────────────────────────────────────────────────────
 
-export function ChatMarkdown({ text, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview }: Props) {
+export function ChatMarkdown({ text, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, onOpenLocalWebPreview }: Props) {
   const { t } = useTranslation();
   const skipRichTextEnhancement = shouldSkipRichTextEnhancement(text);
   const tokens = useMemo(() => (
@@ -457,9 +446,10 @@ export function ChatMarkdown({ text, onPathClick, onUrlClick, onDownload, onHtml
     onDownload,
     onHtmlPreview,
     onImagePreview,
+    onOpenLocalWebPreview,
     downloadLabel: t('upload.download_file'),
     htmlPreviewLabel: t('chat.html_preview', 'Render HTML'),
-  }), [onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t]);
+  }), [onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, onOpenLocalWebPreview, t]);
 
   if (skipRichTextEnhancement) {
     return (

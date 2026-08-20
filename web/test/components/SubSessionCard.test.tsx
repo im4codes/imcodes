@@ -481,6 +481,7 @@ describe('SubSessionCard', () => {
     const { container } = render(
       <SubSessionCard
         sub={makeSubSession({ runtimeType: 'transport', state: 'running' } as any)}
+        sharedState={{ effectiveRole: 'participant', status: 'active', activeDispatchId: 'dispatch-sub-1' }}
         ws={ws}
         connected={true}
         isOpen={false}
@@ -498,6 +499,7 @@ describe('SubSessionCard', () => {
       expect(ws.sendSessionCommandUrgent).toHaveBeenCalledWith('cancel', {
         sessionName: 'deck_sub_sub-card-1',
         commandId: expect.any(String),
+        observedDispatchId: 'dispatch-sub-1',
       });
     });
     // Stop must not be represented as a chat send.
@@ -505,7 +507,7 @@ describe('SubSessionCard', () => {
     expect(ws.sendSessionCommand).not.toHaveBeenCalledWith('send', expect.objectContaining({ text: '/stop' }));
   });
 
-  it('renders the stop button when the card uses compact SessionControls', async () => {
+  it('uses SessionControls\' queue-aware Stop instead of a duplicate card Stop in compact mode', async () => {
     const { container } = render(
       <SubSessionCard
         sub={makeSubSession({ runtimeType: 'transport', state: 'running' } as any)}
@@ -520,7 +522,12 @@ describe('SubSessionCard', () => {
     );
 
     await waitFor(() => {
-      expect(container.querySelector('.subcard-stop-btn')).not.toBeNull();
+      expect(sessionControlsSpy).toHaveBeenCalled();
+    });
+    expect(container.querySelector('.subcard-stop-btn')).toBeNull();
+    expect(sessionControlsSpy.mock.calls.at(-1)?.[0].activeSession).toMatchObject({
+      runtimeType: 'transport',
+      state: 'running',
     });
   });
 

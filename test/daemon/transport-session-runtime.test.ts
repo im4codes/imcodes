@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { TransportSessionRuntime, type PendingTransportMessage } from '../../src/agent/transport-session-runtime.js';
 import { RUNTIME_TYPES } from '../../src/agent/session-runtime.js';
-import { PROVIDER_CANCEL_ORIGINS, PROVIDER_ERROR_CODES, SDK_TURN_LOST_RECOVERY_STATUS, type TransportProvider, type ProviderError, type SessionConfig, type ProviderStatusUpdate, type ProviderUsageUpdate, type ToolCallEvent } from '../../src/agent/transport-provider.js';
+import { PROVIDER_ACTIVE_TURN_DELIVERY_KINDS, PROVIDER_CANCEL_ORIGINS, PROVIDER_ERROR_CODES, SDK_TURN_LOST_RECOVERY_STATUS, type TransportProvider, type ProviderError, type SessionConfig, type ProviderStatusUpdate, type ProviderUsageUpdate, type ToolCallEvent } from '../../src/agent/transport-provider.js';
 import type { AgentMessage, MessageDelta } from '../../shared/agent-message.js';
 import type { MemorySearchResult, MemorySearchResultItem } from '../../src/context/memory-search.js';
 import { PREFERENCE_CONTEXT_END, PREFERENCE_CONTEXT_START } from '../../shared/preference-ingest.js';
@@ -274,6 +274,7 @@ describe('TransportSessionRuntime', () => {
     resetTransportQueueStoreForTests();
     resetContextStoreClientForTests();
     vi.unstubAllEnvs();
+    vi.useRealTimers();
   });
 
   it('type is transport', () => {
@@ -380,6 +381,7 @@ describe('TransportSessionRuntime', () => {
       notificationId: 'notify-1',
       delegationId: 'delegation-1',
       text: 'audit complete',
+      deliveryKind: PROVIDER_ACTIVE_TURN_DELIVERY_KINDS.DELEGATION_REPLY,
     }));
     expect(runtime.pendingEntries).toEqual([]);
   });
@@ -402,6 +404,175 @@ describe('TransportSessionRuntime', () => {
     expect(result).toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.UNSUPPORTED);
     expect(runtime.pendingEntries).toEqual([]);
     expect(mock.provider.send).toHaveBeenCalledTimes(1);
+  });
+
+  it('bounds a wedged active delegation notification so the durable ingress can retry it', async () => {
+    const mock = makeMockProvider();
+    mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
+    mock.provider.notifyActiveDelegation = vi.fn(() => new Promise(() => {}));
+    const runtime = new TransportSessionRuntime(mock.provider, 'deck_test_brain');
+    await runtime.initialize(defaultConfig);
+    runtime.send('foreground work', 'foreground-wedged-notification');
+    await flushDispatch();
+    vi.useFakeTimers();
+
+    const delivery = runtime.deliverDelegationNotification({
+      notificationId: 'notify-wedged',
+      delegationId: 'delegation-wedged',
+      sourceSessionName: 'deck_sub_auditor',
+      text: 'audit complete',
+    });
+    let settled = false;
+    void delivery.finally(() => { settled = true; });
+
+    await vi.advanceTimersByTimeAsync(9_999);
+    expect(settled).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    await expect(delivery).resolves.toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE);
+    expect(mock.provider.notifyActiveDelegation).toHaveBeenCalledOnce();
+    expect(runtime.pendingEntries).toEqual([]);
+  });
+
+  it('appends selected queued messages into the active turn without cancelling or draining the rest', async () => {
+    mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
+    mock.provider.notifyActiveDelegation = vi.fn().mockResolvedValue(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    runtime.send('foreground work', 'foreground-append');
+    await flushDispatch();
+    expect(runtime.send('append first', 'queued-append-1')).toBe('queued');
+    expect(runtime.send('leave second queued', 'queued-append-2')).toBe('queued');
+
+    const result = await runtime.appendPendingMessagesToActiveTurn(['queued-append-1'], 'append-command-1');
+
+    expect(result.status).toBe('delivered');
+    expect(mock.provider.notifyActiveDelegation).toHaveBeenCalledWith('sess-1', expect.objectContaining({
+      notificationId: 'append-command-1',
+      sourceSessionName: 'deck_test_brain',
+      text: 'append first',
+      deliveryKind: PROVIDER_ACTIVE_TURN_DELIVERY_KINDS.QUEUED_MESSAGE,
+    }));
+    expect(mock.provider.cancel).not.toHaveBeenCalled();
+    expect(runtime.pendingEntries).toEqual([
+      { clientMessageId: 'queued-append-2', text: 'leave second queued' },
+    ]);
+    expect(getTransportQueueStore().readSnapshot('deck_test_brain').pendingMessageEntries).toEqual([
+      expect.objectContaining({ clientMessageId: 'queued-append-2', text: 'leave second queued' }),
+    ]);
+    if (result.status === 'delivered') {
+      expect(result.deliveryFacts).toEqual([
+        expect.objectContaining({ clientMessageId: 'queued-append-1', deliveryFrameId: 'append-command-1' }),
+      ]);
+    }
+  });
+
+  it('keeps queued messages intact when active-turn append is unsupported', async () => {
+    mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.UNSUPPORTED;
+    runtime.send('foreground work', 'foreground-unsupported');
+    await flushDispatch();
+    expect(runtime.send('stay queued', 'queued-unsupported')).toBe('queued');
+
+    const result = await runtime.appendPendingMessagesToActiveTurn(['queued-unsupported'], 'append-command-unsupported');
+
+    expect(result).toEqual({ status: 'unsupported' });
+    expect(runtime.pendingEntries).toEqual([
+      { clientMessageId: 'queued-unsupported', text: 'stay queued' },
+    ]);
+    expect(getTransportQueueStore().readSnapshot('deck_test_brain').pendingMessageEntries).toEqual([
+      expect.objectContaining({ clientMessageId: 'queued-unsupported', text: 'stay queued' }),
+    ]);
+  });
+
+  it('rejects queued attachments without steering or removing them', async () => {
+    mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
+    mock.provider.notifyActiveDelegation = vi.fn().mockResolvedValue(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    runtime.send('foreground work', 'foreground-attachment');
+    await flushDispatch();
+    expect(runtime.send('image request', 'queued-attachment', [
+      { id: 'att-append', daemonPath: '/tmp/append.png', originalName: 'append.png', type: 'image' },
+    ])).toBe('queued');
+
+    const result = await runtime.appendPendingMessagesToActiveTurn(['queued-attachment'], 'append-attachment');
+
+    expect(result).toEqual({ status: 'attachments_unsupported' });
+    expect(mock.provider.notifyActiveDelegation).not.toHaveBeenCalled();
+    expect(runtime.pendingEntries).toEqual([expect.objectContaining({
+      clientMessageId: 'queued-attachment',
+      text: 'image request',
+      attachments: [expect.objectContaining({ id: 'att-append' })],
+    })]);
+    expect(getTransportQueueStore().readSnapshot('deck_test_brain').pendingMessageEntries).toEqual([
+      expect.objectContaining({ clientMessageId: 'queued-attachment', status: 'queued' }),
+    ]);
+  });
+
+  it('rejects queued slash controls without steering or removing them', async () => {
+    mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
+    mock.provider.notifyActiveDelegation = vi.fn().mockResolvedValue(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    runtime.send('foreground work', 'foreground-control');
+    await flushDispatch();
+    expect(runtime.send('/compact', 'queued-control')).toBe('queued');
+
+    const result = await runtime.appendPendingMessagesToActiveTurn(['queued-control'], 'append-control');
+
+    expect(result).toEqual({ status: 'control_unsupported' });
+    expect(mock.provider.notifyActiveDelegation).not.toHaveBeenCalled();
+    expect(runtime.pendingEntries).toEqual([{ clientMessageId: 'queued-control', text: '/compact' }]);
+    expect(getTransportQueueStore().readSnapshot('deck_test_brain').pendingMessageEntries).toEqual([
+      expect.objectContaining({ clientMessageId: 'queued-control', status: 'queued' }),
+    ]);
+  });
+
+  it('keeps an accepted append delivered when SQLite finalization fails', async () => {
+    mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
+    mock.provider.notifyActiveDelegation = vi.fn().mockResolvedValue(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    runtime.send('foreground work', 'foreground-finalize-failure');
+    await flushDispatch();
+    expect(runtime.send('accepted before sqlite fails', 'queued-finalize-failure')).toBe('queued');
+    const store = getTransportQueueStore();
+    const finalizeSpy = vi.spyOn(store, 'finalizeSentBatch').mockImplementation(() => {
+      throw new Error('sqlite unavailable');
+    });
+
+    const result = await runtime.appendPendingMessagesToActiveTurn(
+      ['queued-finalize-failure'],
+      'append-finalize-failure',
+    );
+
+    expect(finalizeSpy).toHaveBeenCalledTimes(2);
+    expect(result).toMatchObject({
+      status: 'delivered',
+      queueSnapshot: {
+        pendingMessageEntries: [],
+        degraded: true,
+        degradedReason: 'sqlite_finalize_failed_after_provider_delivery',
+      },
+      deliveryFacts: [expect.objectContaining({
+        clientMessageId: 'queued-finalize-failure',
+        deliveryFrameId: 'append-finalize-failure',
+      })],
+    });
+    expect(runtime.pendingEntries).toEqual([]);
+    expect(mock.provider.notifyActiveDelegation).toHaveBeenCalledOnce();
+  });
+
+  it('restores the original FIFO before messages queued during a rejected append', async () => {
+    mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
+    mock.provider.notifyActiveDelegation = vi.fn(async () => {
+      expect(runtime.send('arrived while appending', 'queued-during-append')).toBe('queued');
+      return AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE;
+    });
+    runtime.send('foreground work', 'foreground-restore-order');
+    await flushDispatch();
+    expect(runtime.send('append first', 'queued-restore-1')).toBe('queued');
+    expect(runtime.send('leave between', 'queued-restore-2')).toBe('queued');
+
+    const result = await runtime.appendPendingMessagesToActiveTurn(['queued-restore-1'], 'append-rejected');
+
+    expect(result).toEqual({ status: 'stale' });
+    expect(runtime.pendingEntries).toEqual([
+      { clientMessageId: 'queued-restore-1', text: 'append first' },
+      { clientMessageId: 'queued-restore-2', text: 'leave between' },
+      { clientMessageId: 'queued-during-append', text: 'arrived while appending' },
+    ]);
   });
 
   it('starts a private continuation immediately when the origin runtime is idle', async () => {

@@ -18,6 +18,7 @@ import {
   type CcPreset,
   type CcPresetModelInfo,
 } from '../../shared/cc-presets.js';
+import type { DshLlmConfig } from '../../shared/deepseek-harness.js';
 import logger from '../util/logger.js';
 
 const PRESETS_PATH = join(homedir(), '.imcodes', 'cc-presets.json');
@@ -145,6 +146,32 @@ export function getPresetAvailableModelIds(preset: Pick<CcPreset, 'availableMode
   return getCcPresetAvailableModelIds(preset);
 }
 
+/** `${preset}:${model}` pairs already warned about, so launches stay quiet after the first. */
+const warnedUndiscoveredPresetModels = new Set<string>();
+
+/**
+ * Warn when a preset pins a model the provider never advertised.
+ *
+ * Anthropic-compatible third-party endpoints accept an unknown model id without
+ * an error and silently serve their own default — MiniMax answers a request for
+ * `MiniMax-M.27` (a typo for `MiniMax-M2.7`) exactly like a valid one. The
+ * session then runs fine on a model the preset does not name, which is
+ * invisible without this check. Only advisory: an empty discovery list, or a
+ * model the user legitimately knows about, must never block a launch.
+ */
+function warnIfPresetModelUndiscovered(preset: CcPreset, configuredModel: string | undefined): void {
+  if (!configuredModel) return;
+  const discovered = (preset.availableModels ?? []).map((entry) => entry.id);
+  if (discovered.length === 0 || discovered.includes(configuredModel)) return;
+  const key = `${preset.name}:${configuredModel}`;
+  if (warnedUndiscoveredPresetModels.has(key)) return;
+  warnedUndiscoveredPresetModels.add(key);
+  logger.warn(
+    { preset: preset.name, configuredModel, discoveredModels: discovered },
+    'cc-preset: configured model is not in this provider\'s discovered model list — the endpoint may silently serve a different model',
+  );
+}
+
 /**
  * Resolve a preset name to env vars ready for session launch.
  * Auto-fills MODEL_ALIASES from ANTHROPIC_MODEL if set.
@@ -194,6 +221,7 @@ export async function getPresetTransportOverrides(
   const preset = await getPreset(presetName);
   if (!preset) return {};
   const configuredModel = modelOverride?.trim() || getPresetEffectiveModel(preset);
+  warnIfPresetModelUndiscovered(preset, configuredModel);
   const env = await resolvePresetEnv(presetName, undefined, configuredModel);
   const configuredBaseUrl = env['ANTHROPIC_BASE_URL']?.trim() || undefined;
   const runtimeFacts = [
@@ -295,6 +323,60 @@ export async function getQwenPresetTransportConfig(presetName: string): Promise<
   return {
     env,
     ...(settings ? { settings } : {}),
+    ...(model ? { model } : {}),
+    ...(availableModels.length ? { availableModels } : {}),
+    ...(runtimeFacts ? { systemPrompt: runtimeFacts } : {}),
+    ...(preset.contextWindow ? { contextWindow: preset.contextWindow } : {}),
+  };
+}
+
+export async function getDshPresetTransportConfig(presetName: string): Promise<{
+  env: Record<string, string>;
+  llm?: DshLlmConfig;
+  model?: string;
+  availableModels?: string[];
+  systemPrompt?: string;
+  contextWindow?: number;
+}> {
+  const preset = await getPreset(presetName);
+  if (!preset) return { env: {} };
+
+  const resolvedEnv = await resolvePresetEnv(presetName);
+  const availableModels = getPresetAvailableModelIds(preset);
+  const model = getPresetEffectiveModel(preset) ?? availableModels[0];
+  const baseUrl = resolvedEnv['ANTHROPIC_BASE_URL']?.trim() || undefined;
+  const apiKey = resolvedEnv['ANTHROPIC_API_KEY']?.trim()
+    || resolvedEnv['ANTHROPIC_AUTH_TOKEN']?.trim()
+    || undefined;
+
+  // dsh registers third-party presets through its generic pi-ai adapter. The
+  // API key stays in memory and is passed to the child through a private env
+  // reference; it is never serialized into the generated overlay.
+  const env: Record<string, string> = {};
+  if (model) env['ANTHROPIC_MODEL'] = model;
+
+  const llm = (model || baseUrl)
+    ? {
+        provider: normalizeCcPresetName(preset.name),
+        model: model ?? availableModels[0],
+        ...(baseUrl ? { baseUrl } : {}),
+        ...(apiKey ? { apiKey } : {}),
+        ...(preset.contextWindow ? { contextWindow: preset.contextWindow } : {}),
+      }
+    : undefined;
+
+  const runtimeFacts = (model || baseUrl) ? [
+    `Authoritative runtime fact: this session is routed through the "${preset.name}" API provider preset.`,
+    baseUrl ? `Authoritative provider endpoint: ${baseUrl}.` : undefined,
+    model ? `Authoritative runtime model: ${model}.` : undefined,
+    model ? `If the user asks which model you are using, answer exactly with "${model}".` : undefined,
+    baseUrl ? `If the user asks which provider or endpoint you are using, mention "${baseUrl}".` : undefined,
+    'These runtime facts override any generic default model or provider.',
+  ].filter(Boolean).join(' ') : undefined;
+
+  return {
+    env,
+    ...(llm ? { llm } : {}),
     ...(model ? { model } : {}),
     ...(availableModels.length ? { availableModels } : {}),
     ...(runtimeFacts ? { systemPrompt: runtimeFacts } : {}),

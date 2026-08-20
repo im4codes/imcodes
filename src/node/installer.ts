@@ -12,20 +12,15 @@ import { execFileSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { chmod, lstat, mkdir, mkdtemp, open, readFile, rename, rm, unlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, join, win32 } from 'node:path';
 import type { ServiceReceipt } from './install-journal.js';
+import { CONTROLLED_NODE_SERVICE } from '../../shared/controlled-node-service.js';
 
 /** Controlled-node service identities — distinct from the full daemon's. */
-export const CONTROLLED_NODE_SERVICE = {
-  /** Windows Task Scheduler task name (full daemon uses `imcodes-daemon`). */
-  WINDOWS_TASK: 'imcodes-node',
-  /** macOS LaunchDaemon label (full daemon uses `imcodes.daemon`). */
-  MACOS_LABEL: 'cc.imcodes.node',
-  /** Linux systemd unit name (full daemon uses `imcodes.service`). */
-  LINUX_UNIT: 'imcodes-node.service',
-} as const;
+export { CONTROLLED_NODE_SERVICE } from '../../shared/controlled-node-service.js';
 
 export const MACOS_PLIST_PATH = `/Library/LaunchDaemons/${CONTROLLED_NODE_SERVICE.MACOS_LABEL}.plist`;
+export const MACOS_WATCHDOG_PLIST_PATH = `/Library/LaunchDaemons/${CONTROLLED_NODE_SERVICE.MACOS_WATCHDOG_LABEL}.plist`;
 export const LINUX_UNIT_PATH = `/etc/systemd/system/${CONTROLLED_NODE_SERVICE.LINUX_UNIT}`;
 
 export interface PrivilegeCheckOptions {
@@ -38,9 +33,14 @@ export interface ServiceInstallOptions {
   platform?: NodeJS.Platform;
   runCommand?: (file: string, args: readonly string[]) => unknown;
   macosPlistPath?: string;
+  macosWatchdogPlistPath?: string;
   linuxUnitPath?: string;
   /** Test seam for the Windows watchdog trigger's local start boundary. */
   now?: () => Date;
+  /** Test seam for the protected persistent watchdog script. */
+  writeWindowsWatchdogScript?: (path: string, content: string) => Promise<void>;
+  /** Test seam for side-effect-free watchdog script integrity inspection. */
+  readWindowsWatchdogScript?: (path: string) => Promise<string>;
 }
 
 const WINDOWS_ADMIN_CHECK = [
@@ -86,6 +86,18 @@ function escapeXmlText(value: string): string {
 }
 
 const WINDOWS_WATCHDOG_INTERVAL = 'PT1M';
+const WINDOWS_WATCHDOG_SCRIPT_NAME = 'imcodes-node-health-watchdog.ps1';
+const WINDOWS_HEALTH_LEASE_NAME = 'health-lease.json';
+const WINDOWS_HEALTH_STALE_SECONDS = 180;
+export const WINDOWS_UPGRADE_MARKER_NAME = 'upgrade-in-progress.json';
+const WINDOWS_UPGRADE_MARKER_MAX_AGE_MS = 15 * 60 * 1000;
+
+export function windowsPowerShellExecutablePath(
+  env: { WINDIR?: string } = process.env,
+): string {
+  const windowsDirectory = env.WINDIR?.trim() || 'C:\\Windows';
+  return win32.join(windowsDirectory, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+}
 
 function windowsWatchdogStartBoundary(now: Date): string {
   const start = new Date(now.getTime());
@@ -97,15 +109,13 @@ function windowsWatchdogStartBoundary(now: Date): string {
 }
 
 /**
- * Task Scheduler artifact for boot-time SYSTEM autostart plus a one-minute
- * watchdog. RestartOnFailure does not reliably restart an action terminated by
- * an external force-kill, so the recurring TimeTrigger supplies the durable
- * liveness guarantee; IgnoreNew makes its ticks no-ops while the node is alive.
- * The start boundary is the next local minute so first-run journal handoff can
- * finish before the watchdog becomes eligible.
+ * Task Scheduler artifact for boot-time SYSTEM autostart and process-exit
+ * recovery. Application health is supervised by a separate task below: the
+ * main task cannot distinguish an authenticated node from a live-but-detached
+ * process when MultipleInstancesPolicy is IgnoreNew.
  */
 export function windowsScheduledTaskXml(exePath: string, now: Date = new Date()): string {
-  const watchdogStartBoundary = windowsWatchdogStartBoundary(now);
+  void now;
   return `<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
@@ -115,12 +125,6 @@ export function windowsScheduledTaskXml(exePath: string, now: Date = new Date())
     <BootTrigger>
       <Enabled>true</Enabled>
     </BootTrigger>
-    <TimeTrigger>
-      <StartBoundary>${watchdogStartBoundary}</StartBoundary>
-      <Repetition>
-        <Interval>${WINDOWS_WATCHDOG_INTERVAL}</Interval>
-      </Repetition>
-    </TimeTrigger>
   </Triggers>
   <Principals>
     <Principal id="System">
@@ -155,6 +159,113 @@ export function windowsScheduledTaskXml(exePath: string, now: Date = new Date())
 `;
 }
 
+function powershellSingleQuoted(value: string): string {
+  return `'${value.replaceAll("'", "''")}'`;
+}
+
+export function windowsControlledNodeHealthPaths(exePath: string): {
+  scriptPath: string;
+  leasePath: string;
+  logPath: string;
+  upgradeMarkerPath: string;
+} {
+  const baseDir = win32.dirname(exePath);
+  return {
+    scriptPath: win32.join(baseDir, WINDOWS_WATCHDOG_SCRIPT_NAME),
+    leasePath: win32.join(baseDir, WINDOWS_HEALTH_LEASE_NAME),
+    logPath: win32.join(baseDir, 'health-watchdog.log'),
+    upgradeMarkerPath: win32.join(baseDir, WINDOWS_UPGRADE_MARKER_NAME),
+  };
+}
+
+/**
+ * External application-health supervisor for Windows controlled nodes.
+ *
+ * Task Scheduler's RestartOnFailure and IgnoreNew policy only prove that an
+ * EXE process exists. They cannot detect the observed failure mode where the
+ * process remains alive after its authenticated control channel has wedged.
+ * The runtime therefore publishes a PID-bound lease only after a real server
+ * heartbeat acknowledgement; this script restarts the node when that lease is
+ * absent or stale for three minutes.
+ */
+export function windowsControlledNodeHealthWatchdogScript(exePath: string): string {
+  const paths = windowsControlledNodeHealthPaths(exePath);
+  return `$ErrorActionPreference = 'Stop'\r\n`
+    + `$nodePath = ${powershellSingleQuoted(exePath)}\r\n`
+    + `$nodeTask = ${powershellSingleQuoted(CONTROLLED_NODE_SERVICE.WINDOWS_TASK)}\r\n`
+    + `$leasePath = ${powershellSingleQuoted(paths.leasePath)}\r\n`
+    + `$logPath = ${powershellSingleQuoted(paths.logPath)}\r\n`
+    + `$upgradeMarkerPath = ${powershellSingleQuoted(paths.upgradeMarkerPath)}\r\n`
+    + `$upgradeMarkerMaxAgeMs = ${WINDOWS_UPGRADE_MARKER_MAX_AGE_MS}\r\n`
+    + `$staleSeconds = ${WINDOWS_HEALTH_STALE_SECONDS}\r\n`
+    + `function Write-HealthLog([string]$message) {\r\n`
+    + `  if ((Test-Path -LiteralPath $logPath) -and (Get-Item -LiteralPath $logPath).Length -gt 2MB) { Move-Item -Force -LiteralPath $logPath -Destination ($logPath + '.1') }\r\n`
+    + `  Add-Content -LiteralPath $logPath -Encoding UTF8 -Value (('{0} {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $message))\r\n`
+    + `}\r\n`
+    + `$process = Get-CimInstance Win32_Process -Filter \"Name='imcodes-node.exe'\" -ErrorAction SilentlyContinue | Where-Object { $_.ExecutablePath -eq $nodePath -and $_.CommandLine -notmatch '--computer-use-helper' } | Select-Object -First 1\r\n`
+    + `if (Test-Path -LiteralPath $upgradeMarkerPath) {\r\n`
+    + `  try {\r\n`
+    + `    $upgradeMarker = Get-Content -LiteralPath $upgradeMarkerPath -Raw | ConvertFrom-Json\r\n`
+    + `    $upgradeAgeMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - [int64]$upgradeMarker.startedAt\r\n`
+    + `    if ([int]$upgradeMarker.version -eq 1 -and $upgradeAgeMs -ge -60000 -and $upgradeAgeMs -le $upgradeMarkerMaxAgeMs) { exit 0 }\r\n`
+    + `  } catch { }\r\n`
+    + `  Remove-Item -Force -LiteralPath $upgradeMarkerPath -ErrorAction SilentlyContinue\r\n`
+    + `}\r\n`
+    + `$healthy = $false\r\n`
+    + `$reason = 'process_missing'\r\n`
+    + `if ($process) {\r\n`
+    + `  $reason = 'lease_missing'\r\n`
+    + `  if (Test-Path -LiteralPath $leasePath) {\r\n`
+    + `    try {\r\n`
+    + `      $lease = Get-Content -LiteralPath $leasePath -Raw | ConvertFrom-Json\r\n`
+    + `      $ageMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - [int64]$lease.updatedAt\r\n`
+    + `      if ([int]$lease.version -eq 1 -and [int]$lease.pid -eq [int]$process.ProcessId -and $ageMs -ge -60000 -and $ageMs -le ($staleSeconds * 1000)) { $healthy = $true } else { $reason = 'lease_stale_or_pid_mismatch' }\r\n`
+    + `    } catch { $reason = 'lease_invalid' }\r\n`
+    + `  }\r\n`
+    + `  if (-not $healthy) {\r\n`
+    + `    $processAgeSeconds = ((Get-Date) - $process.CreationDate).TotalSeconds\r\n`
+    + `    if ($processAgeSeconds -lt $staleSeconds) { exit 0 }\r\n`
+    + `  }\r\n`
+    + `}\r\n`
+    + `if ($healthy) { exit 0 }\r\n`
+    + `Write-HealthLog ('restart_begin reason={0} pid={1}' -f $reason, $(if ($process) { $process.ProcessId } else { 0 }))\r\n`
+    + `Stop-ScheduledTask -TaskName $nodeTask -ErrorAction SilentlyContinue\r\n`
+    + `if ($process) { Stop-Process -Id $process.ProcessId -Force -ErrorAction SilentlyContinue }\r\n`
+    + `Start-Sleep -Seconds 2\r\n`
+    + `Start-ScheduledTask -TaskName $nodeTask\r\n`
+    + `Write-HealthLog 'restart_requested'\r\n`;
+}
+
+export function windowsControlledNodeHealthWatchdogTaskXml(scriptPath: string, now: Date = new Date()): string {
+  const startBoundary = windowsWatchdogStartBoundary(now);
+  const argumentsText = `-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "${scriptPath}"`;
+  const powershellPath = windowsPowerShellExecutablePath();
+  return `<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo><Description>IM.codes controlled node authenticated-health watchdog</Description></RegistrationInfo>
+  <Triggers>
+    <TimeTrigger>
+      <StartBoundary>${startBoundary}</StartBoundary>
+      <Repetition><Interval>${WINDOWS_WATCHDOG_INTERVAL}</Interval></Repetition>
+      <Enabled>true</Enabled>
+    </TimeTrigger>
+  </Triggers>
+  <Principals><Principal id="System"><UserId>S-1-5-18</UserId><RunLevel>HighestAvailable</RunLevel></Principal></Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <ExecutionTimeLimit>PT2M</ExecutionTimeLimit>
+    <RestartOnFailure><Interval>PT1M</Interval><Count>3</Count></RestartOnFailure>
+  </Settings>
+  <Actions Context="System"><Exec><Command>${escapeXmlText(powershellPath)}</Command><Arguments>${escapeXmlText(argumentsText)}</Arguments></Exec></Actions>
+</Task>
+`;
+}
+
 export function encodeWindowsScheduledTaskXml(xml: string): Buffer {
   // Task Scheduler's COM XML loader expects the declared UTF-16 encoding to
   // match a BOM-prefixed UTF-16LE file. UTF-8 without a BOM is rejected on
@@ -166,6 +277,13 @@ export function encodeWindowsScheduledTaskXml(xml: string): Buffer {
 export function windowsScheduledTaskArgs(taskXmlPath: string): string[] {
   return [
     '/Create', '/TN', CONTROLLED_NODE_SERVICE.WINDOWS_TASK,
+    '/XML', taskXmlPath, '/F',
+  ];
+}
+
+export function windowsHealthWatchdogTaskArgs(taskXmlPath: string): string[] {
+  return [
+    '/Create', '/TN', CONTROLLED_NODE_SERVICE.WINDOWS_WATCHDOG_TASK,
     '/XML', taskXmlPath, '/F',
   ];
 }
@@ -239,7 +357,14 @@ export function windowsExecutableFileAclCommands(path: string): WindowsAclComman
 
 export function windowsComputerUseHelperAclCommands(path: string): WindowsAclCommand[] {
   return [
-    [path, '/grant:r', `${WINDOWS_AUTHENTICATED_USERS_SID}:(OI)(CI)RX`, '/T'],
+    // Protect only the helper root. Its children must keep inheriting these
+    // explicit root ACEs; recursively stripping inheritance would leave the
+    // helper files unreadable even to the intended interactive controller.
+    [path, '/grant:r', `${WINDOWS_SYSTEM_SID}:(OI)(CI)F`],
+    [path, '/grant:r', `${WINDOWS_ADMINISTRATORS_SID}:(OI)(CI)F`],
+    [path, '/grant:r', `${WINDOWS_AUTHENTICATED_USERS_SID}:(OI)(CI)RX`],
+    [path, '/inheritance:r'],
+    [path, '/setowner', WINDOWS_SYSTEM_SID, '/T'],
   ];
 }
 
@@ -269,6 +394,31 @@ export function macosLaunchDaemonPlist(exePath: string): string {
 `;
 }
 
+/**
+ * Periodic application-health supervisor. launchd's KeepAlive only detects a
+ * dead process; this companion checks the authenticated heartbeat lease and
+ * kickstarts the main daemon when its live process has lost server control.
+ */
+export function macosHealthWatchdogLaunchDaemonPlist(exePath: string): string {
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>${CONTROLLED_NODE_SERVICE.MACOS_WATCHDOG_LABEL}</string>
+  <key>ProgramArguments</key><array>
+    <string>${escapeXmlText(exePath)}</string>
+    <string>--health-watchdog</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>StartInterval</key><integer>60</integer>
+  <key>ProcessType</key><string>Background</string>
+  <key>StandardErrorPath</key><string>/var/log/imcodes-node-watchdog.err.log</string>
+  <key>StandardOutPath</key><string>/var/log/imcodes-node-watchdog.out.log</string>
+</dict>
+</plist>
+`;
+}
+
 /** Linux systemd SYSTEM unit (boot-scoped, restart-on-failure with backoff). */
 export function linuxSystemdUnit(exePath: string): string {
   return `[Unit]
@@ -279,6 +429,8 @@ Wants=network-online.target
 [Service]
 Type=simple
 ExecStart=${exePath}
+NotifyAccess=all
+WatchdogSec=180
 Restart=on-failure
 RestartSec=5
 
@@ -331,22 +483,30 @@ async function installWindowsTaskDefinition(
   exePath: string,
   runCommand: (file: string, args: readonly string[]) => unknown,
   now: Date,
+  writeWatchdogScript: (path: string, content: string) => Promise<void>,
 ): Promise<ServiceReceipt> {
-    const xml = windowsScheduledTaskXml(exePath, now);
-    const artifactDir = await mkdtemp(join(tmpdir(), 'imcodes-node-task-'));
-    const artifactPath = join(artifactDir, 'task.xml');
-    try {
-      await writeFile(artifactPath, encodeWindowsScheduledTaskXml(xml), { mode: 0o600 });
-      runCommand('schtasks', windowsScheduledTaskArgs(artifactPath));
-    } finally {
-      await rm(artifactDir, { recursive: true, force: true });
-    }
-    return {
-      name: CONTROLLED_NODE_SERVICE.WINDOWS_TASK,
-      platform: 'win32',
-      definitionSha256: sha256Text(xml),
-      action: exePath,
-    };
+  const xml = windowsScheduledTaskXml(exePath, now);
+  const healthPaths = windowsControlledNodeHealthPaths(exePath);
+  const watchdogScript = windowsControlledNodeHealthWatchdogScript(exePath);
+  const watchdogXml = windowsControlledNodeHealthWatchdogTaskXml(healthPaths.scriptPath, now);
+  const artifactDir = await mkdtemp(join(tmpdir(), 'imcodes-node-task-'));
+  const artifactPath = join(artifactDir, 'task.xml');
+  const watchdogArtifactPath = join(artifactDir, 'watchdog-task.xml');
+  try {
+    await writeWatchdogScript(healthPaths.scriptPath, watchdogScript);
+    await writeFile(artifactPath, encodeWindowsScheduledTaskXml(xml), { mode: 0o600 });
+    await writeFile(watchdogArtifactPath, encodeWindowsScheduledTaskXml(watchdogXml), { mode: 0o600 });
+    runCommand('schtasks', windowsScheduledTaskArgs(artifactPath));
+    runCommand('schtasks', windowsHealthWatchdogTaskArgs(watchdogArtifactPath));
+  } finally {
+    await rm(artifactDir, { recursive: true, force: true });
+  }
+  return {
+    name: CONTROLLED_NODE_SERVICE.WINDOWS_TASK,
+    platform: 'win32',
+    definitionSha256: sha256Text(xml),
+    action: exePath,
+  };
 }
 
 /**
@@ -396,6 +556,7 @@ interface DefinitionInspection {
   present: boolean;
   action: string | null;
   sha256: string | null;
+  content: string | null;
   matches: boolean;
   errors: string[];
 }
@@ -412,12 +573,12 @@ function decodeXmlText(value: string): string {
 async function inspectDefinitionFile(receipt: ServiceReceipt): Promise<DefinitionInspection> {
   const errors: string[] = [];
   if (!receipt.definitionPath || !receipt.definitionSha256) {
-    return { present: false, action: null, sha256: null, matches: false, errors: ['definition_receipt_incomplete'] };
+    return { present: false, action: null, sha256: null, content: null, matches: false, errors: ['definition_receipt_incomplete'] };
   }
   try {
     const st = await lstat(receipt.definitionPath);
     if (st.isSymbolicLink() || !st.isFile()) {
-      return { present: false, action: null, sha256: null, matches: false, errors: ['definition_not_regular'] };
+      return { present: false, action: null, sha256: null, content: null, matches: false, errors: ['definition_not_regular'] };
     }
     const content = await readFile(receipt.definitionPath, 'utf8');
     const sha256 = sha256Text(content);
@@ -433,12 +594,13 @@ async function inspectDefinitionFile(receipt: ServiceReceipt): Promise<Definitio
       present: true,
       action,
       sha256,
+      content,
       matches: sha256 === receipt.definitionSha256 && action === (receipt.action ?? null),
       errors,
     };
   } catch (error) {
     errors.push(`definition_read_failed:${(error as Error).message}`);
-    return { present: false, action: null, sha256: null, matches: false, errors };
+    return { present: false, action: null, sha256: null, content: null, matches: false, errors };
   }
 }
 
@@ -471,28 +633,41 @@ function inspectWindowsTaskXml(xml: string, expectedAction: string | undefined):
   const restartBlock = /<RestartOnFailure\b[^>]*>[\s\S]*?<\/RestartOnFailure>/i.exec(xml)?.[0] ?? '';
   const restartOnFailure = /<Interval>\s*PT1M\s*<\/Interval>/i.test(restartBlock)
     && /<Count>\s*255\s*<\/Count>/i.test(restartBlock);
-  const watchdogBlock = /<TimeTrigger\b[^>]*>[\s\S]*?<\/TimeTrigger>/i.exec(xml)?.[0] ?? '';
-  const watchdogRepetition = /<Repetition\b[^>]*>[\s\S]*?<\/Repetition>/i.exec(watchdogBlock)?.[0] ?? '';
-  const watchdogEnabled = watchdogBlock.length > 0
-    && !/<Enabled>\s*false\s*<\/Enabled>/i.test(watchdogBlock);
-  // An omitted Duration means the repetition continues indefinitely. A finite
-  // duration would silently remove crash recovery after that window expires.
-  const watchdogRepeatsIndefinitely = watchdogRepetition.length > 0
-    && /<Interval>\s*PT1M\s*<\/Interval>/i.test(watchdogRepetition)
-    && !/<Duration>\s*[^<]+\s*<\/Duration>/i.test(watchdogRepetition);
-  const watchdogStartPresent = /<StartBoundary>\s*[^<]+\s*<\/StartBoundary>/i.test(watchdogBlock);
+  const hasLegacyProcessOnlyWatchdog = /<TimeTrigger\b/i.test(xml);
   const ignoresConcurrentTicks = /<MultipleInstancesPolicy>\s*IgnoreNew\s*<\/MultipleInstancesPolicy>/i.test(settingsBlock);
   const userIdMatch = /<UserId>\s*([^<]+?)\s*<\/UserId>/i.exec(xml);
   return {
     action,
     matches: systemPrincipal && highRunLevel && settingsEnabled && restartOnFailure
-      && bootTrigger && watchdogEnabled && watchdogRepeatsIndefinitely
-      && watchdogStartPresent && ignoresConcurrentTicks
+      && bootTrigger && !hasLegacyProcessOnlyWatchdog && ignoresConcurrentTicks
       && action !== null && action === expectedAction,
     bootEnabled: bootTrigger && settingsEnabled,
     principal: userIdMatch ? userIdMatch[1].trim() : null,
     restartPolicy: restartOnFailure ? 'on-failure' : null,
   };
+}
+
+function inspectWindowsHealthWatchdogTaskXml(xml: string, expectedScriptPath: string): boolean {
+  const command = decodeXmlText(/<Command>([^<]*)<\/Command>/i.exec(xml)?.[1]?.trim() ?? '');
+  const args = decodeXmlText(/<Arguments>([^<]*)<\/Arguments>/i.exec(xml)?.[1]?.trim() ?? '');
+  const trigger = /<TimeTrigger\b[^>]*>[\s\S]*?<\/TimeTrigger>/i.exec(xml)?.[0] ?? '';
+  const repetition = /<Repetition\b[^>]*>[\s\S]*?<\/Repetition>/i.exec(trigger)?.[0] ?? '';
+  const settings = /<Settings\b[^>]*>[\s\S]*?<\/Settings>/i.exec(xml)?.[0] ?? '';
+  const expectedFileArg = `-File "${expectedScriptPath}"`;
+  return /(?:^|\\)powershell(?:\.exe)?$/i.test(command)
+    && args.includes('-NoProfile')
+    && args.includes('-NonInteractive')
+    && args.includes(expectedFileArg)
+    && /<UserId>\s*S-1-5-18\s*<\/UserId>/i.test(xml)
+    && /<RunLevel>\s*HighestAvailable\s*<\/RunLevel>/i.test(xml)
+    && trigger.length > 0
+    && !/<Enabled>\s*false\s*<\/Enabled>/i.test(trigger)
+    && /<StartBoundary>\s*[^<]+\s*<\/StartBoundary>/i.test(trigger)
+    && /<Interval>\s*PT1M\s*<\/Interval>/i.test(repetition)
+    && !/<Duration>\s*[^<]+\s*<\/Duration>/i.test(repetition)
+    && !/<Enabled>\s*false\s*<\/Enabled>/i.test(settings)
+    && /<MultipleInstancesPolicy>\s*IgnoreNew\s*<\/MultipleInstancesPolicy>/i.test(settings)
+    && /<ExecutionTimeLimit>\s*PT2M\s*<\/ExecutionTimeLimit>/i.test(settings);
 }
 
 interface LaunchctlPrintInspection {
@@ -543,6 +718,7 @@ interface SystemctlShowInspection {
   unitFileState: string | null;
   principal: string | null;
   restartPolicy: string | null;
+  watchdogEnabled: boolean;
 }
 
 /**
@@ -564,6 +740,8 @@ function parseSystemctlShow(showOut: string): SystemctlShowInspection {
   }
   const userRaw = prop('User');
   const restartPolicy = prop('Restart');
+  const watchdogRaw = prop('WatchdogUSec');
+  const notifyAccess = prop('NotifyAccess');
   return {
     effectiveAction,
     fragmentPath: prop('FragmentPath'),
@@ -572,7 +750,17 @@ function parseSystemctlShow(showOut: string): SystemctlShowInspection {
     // A systemd SYSTEM unit with no `User=` runs as root.
     principal: userRaw && userRaw.length > 0 ? userRaw : (showOut.trim().length > 0 ? 'root' : null),
     restartPolicy: restartPolicy && restartPolicy.length > 0 ? restartPolicy : null,
+    watchdogEnabled: notifyAccess === 'all'
+      && watchdogRaw !== null
+      && !/^(?:0|0us|infinity)$/i.test(watchdogRaw),
   };
+}
+
+function macosWatchdogPath(options: ServiceInstallOptions, mainPlistPath: string): string {
+  return options.macosWatchdogPlistPath
+    ?? (mainPlistPath === MACOS_PLIST_PATH
+      ? MACOS_WATCHDOG_PLIST_PATH
+      : join(dirname(mainPlistPath), `${CONTROLLED_NODE_SERVICE.MACOS_WATCHDOG_LABEL}.plist`));
 }
 
 /** The manager's live loaded action must be present AND equal the receipt's pin. */
@@ -588,17 +776,33 @@ export async function installDefinition(
   const runCommand = runCommandFromOptions(options);
 
   if (platform === 'win32') {
-    return installWindowsTaskDefinition(exePath, runCommand, options.now?.() ?? new Date());
+    return installWindowsTaskDefinition(
+      exePath,
+      runCommand,
+      options.now?.() ?? new Date(),
+      options.writeWindowsWatchdogScript ?? ((path, content) => writeDurableTextFile(path, content, 0o600)),
+    );
   }
   if (platform === 'darwin') {
     const plistPath = options.macosPlistPath ?? MACOS_PLIST_PATH;
+    const watchdogPath = macosWatchdogPath(options, plistPath);
     const plist = macosLaunchDaemonPlist(exePath);
+    const watchdogPlist = macosHealthWatchdogLaunchDaemonPlist(exePath);
     await writeDurableTextFile(plistPath, plist, 0o644);
+    await writeDurableTextFile(watchdogPath, watchdogPlist, 0o644);
+    try {
+      runCommand('launchctl', ['bootout', `system/${CONTROLLED_NODE_SERVICE.MACOS_WATCHDOG_LABEL}`]);
+    } catch {
+      // Expected on first install; bootstrap below is authoritative.
+    }
+    runCommand('launchctl', ['bootstrap', 'system', watchdogPath]);
     return {
       name: CONTROLLED_NODE_SERVICE.MACOS_LABEL,
       platform,
       definitionPath: plistPath,
       definitionSha256: sha256Text(plist),
+      watchdogDefinitionPath: watchdogPath,
+      watchdogDefinitionSha256: sha256Text(watchdogPlist),
       action: exePath,
     };
   }
@@ -628,12 +832,22 @@ export async function inspectDefinition(
   if (platform === 'win32') {
     // SIDE-EFFECT-FREE: only query, never re-install or run.
     runCommand('schtasks', ['/Query', '/TN', CONTROLLED_NODE_SERVICE.WINDOWS_TASK]);
+    runCommand('schtasks', ['/Query', '/TN', CONTROLLED_NODE_SERVICE.WINDOWS_WATCHDOG_TASK]);
     return receipt;
   }
   if (receipt.definitionPath && receipt.definitionSha256) {
     const content = await readFile(receipt.definitionPath, 'utf8');
     if (sha256Text(content) !== receipt.definitionSha256) {
       throw new Error('controlled node service definition hash mismatch');
+    }
+  }
+  if (platform === 'darwin') {
+    if (!receipt.watchdogDefinitionPath || !receipt.watchdogDefinitionSha256) {
+      throw new Error('controlled node macOS watchdog definition receipt is incomplete');
+    }
+    const content = await readFile(receipt.watchdogDefinitionPath, 'utf8');
+    if (sha256Text(content) !== receipt.watchdogDefinitionSha256) {
+      throw new Error('controlled node macOS watchdog definition hash mismatch');
     }
   }
   return receipt;
@@ -663,6 +877,7 @@ export async function inspectServiceState(
     // current task definition as XML — we parse out the <Command> for parity
     // with the install-time action.
     let queryOut = '';
+    let watchdogQueryOut = '';
     try {
       queryOut = String(
         runCommand('schtasks', ['/Query', '/XML', '/TN', CONTROLLED_NODE_SERVICE.WINDOWS_TASK]),
@@ -671,8 +886,32 @@ export async function inspectServiceState(
       errors.push(`schtasks_query_failed:${(err as Error).message}`);
       return blankInspection(receipt.platform, errors, queryOut);
     }
-    raw = queryOut;
+    try {
+      watchdogQueryOut = String(
+        runCommand('schtasks', ['/Query', '/XML', '/TN', CONTROLLED_NODE_SERVICE.WINDOWS_WATCHDOG_TASK]),
+      );
+    } catch (err) {
+      errors.push(`watchdog_task_query_failed:${(err as Error).message}`);
+    }
+    raw = `${queryOut}\nwatchdog:\n${watchdogQueryOut}`;
     const semantic = inspectWindowsTaskXml(queryOut, receipt.action);
+    const expectedWatchdogPath = receipt.action
+      ? windowsControlledNodeHealthPaths(receipt.action).scriptPath
+      : '';
+    const watchdogMatches = expectedWatchdogPath.length > 0
+      && inspectWindowsHealthWatchdogTaskXml(watchdogQueryOut, expectedWatchdogPath);
+    let watchdogScriptMatches = false;
+    if (receipt.action && expectedWatchdogPath) {
+      try {
+        const readWatchdog = options.readWindowsWatchdogScript
+          ?? ((path: string) => readFile(path, 'utf8'));
+        const watchdogScript = await readWatchdog(expectedWatchdogPath);
+        watchdogScriptMatches = watchdogScript === windowsControlledNodeHealthWatchdogScript(receipt.action);
+        if (!watchdogScriptMatches) errors.push('watchdog_script_mismatch');
+      } catch (err) {
+        errors.push(`watchdog_script_read_failed:${(err as Error).message}`);
+      }
+    }
     const observedHash = sha256Text(queryOut);
     let stateOut = '';
     let runState: ServiceInspection['runState'] = 'unknown';
@@ -686,7 +925,7 @@ export async function inspectServiceState(
     } catch (err) {
       errors.push(`scheduled_task_state_failed:${(err as Error).message}`);
     }
-    raw = `${queryOut}\nstate:${stateOut}`;
+    raw = `${queryOut}\nwatchdog:\n${watchdogQueryOut}\nstate:${stateOut}`;
     return {
       installed: queryOut.length > 0,
       // Task Scheduler's store IS the manager; the /XML query is its live view,
@@ -701,7 +940,7 @@ export async function inspectServiceState(
       observedDefinitionSha256: observedHash,
       // Task Scheduler normalizes exported XML, so compare required semantics
       // rather than unstable whitespace/registration metadata.
-      definitionMatches: semantic.matches,
+      definitionMatches: semantic.matches && watchdogMatches && watchdogScriptMatches,
       runState,
       errors,
       raw,
@@ -720,8 +959,36 @@ export async function inspectServiceState(
     const managerState = parseLaunchctlPrint(printOut);
     const definition = await inspectDefinitionFile(receipt);
     errors.push(...definition.errors);
-    raw = printOut;
-    const installed = printOut.length > 0 && definition.present;
+    const watchdogPath = receipt.watchdogDefinitionPath
+      ?? macosWatchdogPath(options, receipt.definitionPath ?? options.macosPlistPath ?? MACOS_PLIST_PATH);
+    const watchdogReceipt: ServiceReceipt = {
+      name: CONTROLLED_NODE_SERVICE.MACOS_WATCHDOG_LABEL,
+      platform: 'darwin',
+      definitionPath: watchdogPath,
+      definitionSha256: receipt.watchdogDefinitionSha256
+        ?? sha256Text(macosHealthWatchdogLaunchDaemonPlist(receipt.action ?? '')),
+      action: receipt.action,
+    };
+    const watchdogDefinition = await inspectDefinitionFile(watchdogReceipt);
+    errors.push(...watchdogDefinition.errors.map((error) => `watchdog_${error}`));
+    let watchdogPrintOut = '';
+    try {
+      watchdogPrintOut = String(runCommand('launchctl', ['print', `system/${CONTROLLED_NODE_SERVICE.MACOS_WATCHDOG_LABEL}`]));
+    } catch (err) {
+      errors.push(`watchdog_launchctl_print_failed:${(err as Error).message}`);
+    }
+    const watchdogManagerState = parseLaunchctlPrint(watchdogPrintOut);
+    raw = `${printOut}\nwatchdog:\n${watchdogPrintOut}`;
+    const watchdogExpected = receipt.action ? macosHealthWatchdogLaunchDaemonPlist(receipt.action) : null;
+    const watchdogMatches = watchdogExpected !== null
+      && watchdogDefinition.content === watchdogExpected
+      && watchdogDefinition.matches
+      && watchdogManagerState.loaded
+      && watchdogManagerState.loadedPath === watchdogPath
+      && watchdogManagerState.effectiveAction === receipt.action
+      && watchdogPrintOut.includes('--health-watchdog');
+    const installed = printOut.length > 0 && definition.present
+      && watchdogPrintOut.length > 0 && watchdogDefinition.present;
     // /LoadState is shown by `launchctl print` as "running" / "waiting" /
     // "not running" — we accept any of those as the run state.
     let runState: ServiceInspection['runState'] = 'unknown';
@@ -745,7 +1012,7 @@ export async function inspectServiceState(
       principal: managerState.principal,
       restartPolicy: managerState.restartPolicy,
       observedDefinitionSha256: definition.sha256,
-      definitionMatches: definition.matches,
+      definitionMatches: definition.matches && watchdogMatches,
       runState,
       errors,
       raw,
@@ -764,7 +1031,7 @@ export async function inspectServiceState(
       errors.push(`systemctl_is_enabled_failed:${(err as Error).message}`);
     }
     try {
-      showOut = String(runCommand('systemctl', ['show', CONTROLLED_NODE_SERVICE.LINUX_UNIT, '--property=ActiveState,SubState,LoadState,FragmentPath,ExecMainStartTimestamp,ExecStart,User,Restart,UnitFileState']) ?? '');
+      showOut = String(runCommand('systemctl', ['show', CONTROLLED_NODE_SERVICE.LINUX_UNIT, '--property=ActiveState,SubState,LoadState,FragmentPath,ExecMainStartTimestamp,ExecStart,User,Restart,UnitFileState,WatchdogUSec,NotifyAccess']) ?? '');
     } catch (err) {
       errors.push(`systemctl_show_failed:${(err as Error).message}`);
     }
@@ -793,7 +1060,9 @@ export async function inspectServiceState(
       principal: managerState.principal,
       restartPolicy: managerState.restartPolicy,
       observedDefinitionSha256: definition.sha256,
-      definitionMatches: definition.matches,
+      definitionMatches: definition.matches
+        && definition.content === linuxSystemdUnit(receipt.action ?? '')
+        && managerState.watchdogEnabled,
       runState,
       errors,
       raw,

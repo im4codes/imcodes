@@ -36,6 +36,7 @@ import { cronApiRoutes } from './routes/cron-api.js';
 import { pushRoutes } from './routes/push.js';
 import { quickDataRoutes } from './routes/quick-data.js';
 import { watchRoutes } from './routes/watch.js';
+import { messagePinRoutes } from './routes/message-pins.js';
 import { memoryRoutes } from './routes/memory.js';
 import { sessionMgmtRoutes } from './routes/session-mgmt.js';
 import { subSessionRoutes } from './routes/sub-sessions.js';
@@ -44,7 +45,7 @@ import { tabSharingRoutes } from './routes/tab-sharing.js';
 import { preferencesRoutes } from './routes/preferences.js';
 import { aliasRoutes } from './routes/aliases.js';
 import { ALIAS_API_PATH } from '../../shared/alias-types.js';
-import { CLIENT_TIMEZONE_HEADER, DEVICE_TIMEZONE_HEADER } from '../../shared/http-header-names.js';
+import { CLIENT_TIMEZONE_HEADER, DEVICE_TIMEZONE_HEADER, EXPECTED_USER_ID_HEADER } from '../../shared/http-header-names.js';
 import { tokenUsageRoutes } from './routes/token-usage.js';
 import { embeddingRoutes } from './routes/embedding.js';
 import { shutdownEmbeddingPool } from './util/embedding-pool.js';
@@ -60,6 +61,10 @@ import { jobDispatchCron } from './cron/job-dispatch.js';
 import { memoryPruningCron } from './cron/memory-pruning.js';
 import { SERVER_WS_MAX_PAYLOAD_BYTES, WsBridge } from './ws/bridge.js';
 import {
+  REMOTE_DESKTOP_SERVER_ID_QUERY,
+  REMOTE_DESKTOP_SIGNALING_PATH,
+} from '../../shared/remote-desktop.js';
+import {
   SHARE_REASONS,
   SHARE_WS_TICKET_TYPE,
   parseShareWsTicketClaims,
@@ -70,7 +75,7 @@ import { rateLimiter } from './security/lockout.js';
 import { csrfMiddleware } from './security/csrf.js';
 import { cors } from 'hono/cors';
 import { verifyJwt } from './security/crypto.js';
-import { resolveServerRole } from './security/authorization.js';
+import { resolveServerWebSocketAccess } from './security/authorization.js';
 import logger from './util/logger.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -155,7 +160,7 @@ export function buildApp(env: Env) {
       // Non-whitelisted origins get no Access-Control-Allow-Origin header
       return all.includes(origin) ? origin : '';
     },
-    allowHeaders: ['Authorization', 'Content-Type', 'X-CSRF-Token', 'X-Platform', 'X-App-Version', 'X-Bundle-Version', CLIENT_TIMEZONE_HEADER, DEVICE_TIMEZONE_HEADER],
+    allowHeaders: ['Authorization', 'Content-Type', 'X-CSRF-Token', 'X-Platform', 'X-App-Version', 'X-Bundle-Version', CLIENT_TIMEZONE_HEADER, DEVICE_TIMEZONE_HEADER, EXPECTED_USER_ID_HEADER],
     allowMethods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     credentials: true,
   });
@@ -183,6 +188,7 @@ export function buildApp(env: Env) {
   app.route('/api/push', pushRoutes);
   app.route('/api/quick-data', quickDataRoutes);
   app.route('/api', watchRoutes);
+  app.route('/api', messagePinRoutes);
   app.route('/api', tabSharingRoutes);
   app.route('/api', tokenUsageRoutes);
   // Pod-sticky memory routes: serverId is read from the `?serverId=` query
@@ -374,10 +380,21 @@ export function setupWebSocketUpgrade(server: import('node:http').Server, env: E
     }
 
     const match = url.pathname.match(/^\/api\/server\/([^/]+)\/ws$/);
-    if (!match) { socket.destroy(); return; }
+    const remoteDesktopServerId = url.pathname === REMOTE_DESKTOP_SIGNALING_PATH
+      ? url.searchParams.get(REMOTE_DESKTOP_SERVER_ID_QUERY)
+      : null;
+    if (!match && !remoteDesktopServerId) { socket.destroy(); return; }
 
-    const [, serverId] = match;
+    const serverId = remoteDesktopServerId ?? match![1]!;
     const hasBrowserTicket = url.searchParams.has('ticket');
+
+    // The query-routed remote desktop signaling endpoint is browser-only.
+    // Daemons retain the established path-bound endpoint and authentication.
+    if (remoteDesktopServerId && !hasBrowserTicket) {
+      socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+      socket.destroy();
+      return;
+    }
 
     if (!hasBrowserTicket) {
       // Daemon connection — per-IP rate limit + global cap
@@ -438,6 +455,12 @@ export function setupWebSocketUpgrade(server: import('node:http').Server, env: E
           socket.destroy();
           return;
         }
+        // Deliberately NOT single-use, unlike the member ticket below. A share
+        // recipient on a flaky connection must be able to reconnect without a
+        // round trip to mint a new ticket; `share-ws-ticket-upgrade.test.ts`
+        // pins that asymmetry. An audit read the missing `consumeJti` as a
+        // replay defect — it is a design decision, and the coverage re-read on
+        // every upgrade is what actually bounds a stale ticket.
         wss.handleUpgrade(req, socket, head, (ws) => {
           WsBridge.get(serverId).handleShareBrowserConnection(ws, shareTicket.sub, env.DB, {
             ticketId: shareTicket.jti,
@@ -458,16 +481,23 @@ export function setupWebSocketUpgrade(server: import('node:http').Server, env: E
         socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n'); socket.destroy(); return;
       }
 
+      let websocketAccess: Awaited<ReturnType<typeof resolveServerWebSocketAccess>>;
       try {
-        const role = await resolveServerRole(env.DB, serverId, payload.sub as string);
-        if (role === 'none') { socket.write('HTTP/1.1 403 Forbidden\r\n\r\n'); socket.destroy(); return; }
+        websocketAccess = await resolveServerWebSocketAccess(env.DB, serverId, payload.sub as string);
+        if (!websocketAccess) { socket.write('HTTP/1.1 403 Forbidden\r\n\r\n'); socket.destroy(); return; }
       } catch {
         socket.write('HTTP/1.1 500 Internal Server Error\r\n\r\n'); socket.destroy(); return;
       }
 
       const userId = payload.sub as string;
       wss.handleUpgrade(req, socket, head, (ws) => {
-        WsBridge.get(serverId).handleBrowserConnection(ws, userId, env.DB, isMobile);
+        WsBridge.get(serverId).handleBrowserConnection(
+          ws,
+          userId,
+          env.DB,
+          isMobile,
+          websocketAccess?.kind === 'controlled',
+        );
       });
     }
   });

@@ -126,6 +126,30 @@ describe('CronManager', () => {
     expect(deleteBtn.disabled).toBe(true);
   });
 
+  it('scopes shared viewer requests to the covered session and hides mutations', async () => {
+    apiFetch.mockResolvedValueOnce({ jobs: [cronJob()] });
+
+    render(
+      <CronManager
+        serverId="srv-current"
+        projectName="cd"
+        sessions={sessions}
+        subSessions={subSessions}
+        activeSession="deck_cd_brain"
+        sharedSessionName="deck_cd_brain"
+        readOnly
+        onBack={vi.fn()}
+      />,
+    );
+
+    expect(await screen.findByText('Current job')).toBeDefined();
+    expect(apiFetch).toHaveBeenCalledWith(expect.stringContaining('sessionName=deck_cd_brain'));
+    expect(screen.queryByTitle('cron.create')).toBeNull();
+    expect((screen.getByText('▶') as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByText('✎') as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByText('✕') as HTMLButtonElement).disabled).toBe(true);
+  });
+
   it('renders other-tab jobs as read-only', async () => {
     apiFetch.mockResolvedValueOnce({
       jobs: [{
@@ -550,8 +574,75 @@ describe('CronManager', () => {
     fireEvent.click(screen.getAllByText('cron.history').at(-1)!);
     const detailPreview = await screen.findByText((_text, node) => node?.textContent === '## Result\nLine one');
     fireEvent.click(detailPreview);
+    expect(screen.getByText('cron.final_output')).toBeDefined();
     fireEvent.click(screen.getAllByText('cron.go_and_quote →').at(-1)!);
     expect(onNavigateSession).toHaveBeenCalledWith('deck_cd_brain', '## Result\nLine one');
+  });
+
+  it('keeps execution prompts to a compact one-line summary', async () => {
+    const longPrompt = `Inspect the deployment and summarize only the final result ${'without showing this repeated context '.repeat(8)}`;
+    apiFetch
+      .mockResolvedValueOnce({ jobs: [cronJob({ id: 'job-compact', name: 'Compact prompt job' })] })
+      .mockResolvedValueOnce({
+        executions: [{
+          id: 'compact-1',
+          job_id: 'job-compact',
+          job_name: 'Compact prompt job',
+          server_id: 'srv-current',
+          project_name: 'cd',
+          cron_expr: '0 9 * * *',
+          target_role: 'brain',
+          target_session_name: null,
+          action: JSON.stringify({ type: 'command', command: longPrompt }),
+          status: 'dispatched',
+          detail: 'Final result only',
+          created_at: Date.now(),
+        }],
+      });
+
+    render(
+      <CronManager
+        serverId="srv-current"
+        projectName="cd"
+        sessions={sessions}
+        onBack={vi.fn()}
+      />,
+    );
+
+    expect(await screen.findByText('Compact prompt job')).toBeDefined();
+    fireEvent.click(screen.getAllByText('cron.history')[0]);
+    await screen.findByText('Final result only');
+
+    expect(screen.queryByText(longPrompt)).toBeNull();
+    expect(screen.getByText((text) => text.startsWith('Inspect the deployment') && text.endsWith('…'))).toBeDefined();
+  });
+
+  it('shows only the latest snapshot for legacy cumulative execution output', async () => {
+    const snapshots = ['主人开始今日任务', '主人开始今日任务执行', '主人开始今日任务执行并检查', '主人开始今日任务执行并检查结果', '主人开始今日任务执行并检查结果完成。'];
+    apiFetch
+      .mockResolvedValueOnce({ jobs: [cronJob({ id: 'legacy-stream', name: 'Legacy stream' })] })
+      .mockResolvedValueOnce({
+        executions: [{
+          id: 'legacy-stream-exec',
+          status: 'dispatched',
+          detail: snapshots.join('\n'),
+          created_at: Date.now(),
+        }],
+      });
+
+    render(
+      <CronManager
+        serverId="srv-current"
+        projectName="cd"
+        sessions={sessions}
+        onBack={vi.fn()}
+      />,
+    );
+
+    expect(await screen.findByText('Legacy stream')).toBeDefined();
+    fireEvent.click(screen.getAllByText('cron.history').at(-1)!);
+    expect(await screen.findByText(snapshots.at(-1)!)).toBeDefined();
+    expect(screen.queryByText(snapshots.join('\n'))).toBeNull();
   });
 
   it('loads cross-job executions and switches latest/all modes across servers', async () => {

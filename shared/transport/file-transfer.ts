@@ -73,8 +73,14 @@ export const FILE_TRANSFER_LIMITS = {
 export const FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY = 'file.transfer.upload_fetch.v1' as const;
 export const FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY = 'file.transfer.download_stream.v1' as const;
 export const FILE_TRANSFER_PATH_HANDLE_CAPABILITY = 'file.transfer.path_handle.v1' as const;
+export const FILE_TRANSFER_DIRECTORY_CAPABILITY = 'file.transfer.directory.v1' as const;
 export const FILE_TRANSFER_PATH_MAX_BYTES = 4 * 1024;
 export const FILE_TRANSFER_ERROR_MAX_BYTES = 256;
+export const FILE_TRANSFER_DIRECTORY_MAX_ENTRIES = 512;
+export const FILE_TRANSFER_DIRECTORY_PATH = {
+  WINDOWS_DRIVES: ':drives:',
+  WINDOWS_DRIVES_ROOT: '__imcodes_windows_drives__',
+} as const;
 
 /** Machine-readable upload-error codes shared by the daemon (producer), server
  *  (relay) and web (localized display). */
@@ -98,6 +104,9 @@ export const FILE_TRANSFER_MSG = {
   PATH_HANDLE: 'file.path_handle',
   PATH_HANDLE_DONE: 'file.path_handle_done',
   PATH_HANDLE_ERROR: 'file.path_handle_error',
+  DIRECTORY_LIST: 'file.directory_list',
+  DIRECTORY_LIST_DONE: 'file.directory_list_done',
+  DIRECTORY_LIST_ERROR: 'file.directory_list_error',
   DELETE: 'file.delete_attachment',
   DELETE_DONE: 'file.delete_attachment_done',
   DELETE_ERROR: 'file.delete_attachment_error',
@@ -131,6 +140,8 @@ export interface FileUploadRequest {
   content: string; // base64
   /** Stable browser-generated identity shared with an optional direct attempt. */
   clientUploadId?: string;
+  /** Optional user-selected existing directory on a capable controlled node. */
+  destinationDirectory?: string;
 }
 
 export interface FileUploadFetchRequest {
@@ -143,6 +154,8 @@ export interface FileUploadFetchRequest {
   downloadUrl: string;
   /** Stable browser-generated identity shared with an optional direct attempt. */
   clientUploadId?: string;
+  /** Optional user-selected existing directory on a capable controlled node. */
+  destinationDirectory?: string;
 }
 
 export interface FileDownloadRequest {
@@ -163,6 +176,33 @@ export interface FilePathHandleRequest {
   type: typeof FILE_TRANSFER_MSG.PATH_HANDLE;
   requestId: string;
   path: string;
+}
+
+export interface FileDirectoryListRequest {
+  type: typeof FILE_TRANSFER_MSG.DIRECTORY_LIST;
+  requestId: string;
+  path: string;
+}
+
+export interface FileDirectoryEntry {
+  name: string;
+  path: string;
+  isDir: true;
+  hidden: boolean;
+}
+
+export interface FileDirectoryListDone {
+  type: typeof FILE_TRANSFER_MSG.DIRECTORY_LIST_DONE;
+  requestId: string;
+  path: string;
+  resolvedPath: string;
+  entries: FileDirectoryEntry[];
+}
+
+export interface FileDirectoryListError {
+  type: typeof FILE_TRANSFER_MSG.DIRECTORY_LIST_ERROR;
+  requestId: string;
+  error: string;
 }
 
 export interface FileDeleteRequest {
@@ -249,6 +289,8 @@ export type FileTransferDaemonMessage =
   | FileDownloadError
   | FilePathHandleDone
   | FilePathHandleError
+  | FileDirectoryListDone
+  | FileDirectoryListError
   | FileDeleteDone
   | FileDeleteError;
 
@@ -258,6 +300,7 @@ export type FileTransferServerMessage =
   | FileDownloadRequest
   | FileDownloadStreamRequest
   | FilePathHandleRequest
+  | FileDirectoryListRequest
   | FileDeleteRequest;
 
 export type ControlledFileTransferResponse =
@@ -269,6 +312,8 @@ export type ControlledFileTransferResponse =
   | FileDownloadError
   | FilePathHandleDone
   | FilePathHandleError
+  | FileDirectoryListDone
+  | FileDirectoryListError
   | FileDeleteDone
   | FileDeleteError;
 
@@ -277,6 +322,7 @@ export type ControlledFileTransferRequest =
   | FileDownloadRequest
   | FileDownloadStreamRequest
   | FilePathHandleRequest
+  | FileDirectoryListRequest
   | FileDeleteRequest;
 
 export type FileTransferValidationResult<T> =
@@ -347,6 +393,15 @@ export function validateFilePathHandleRequest(value: unknown): FileTransferValid
   return { ok: true, value: value as unknown as FilePathHandleRequest };
 }
 
+export function validateFileDirectoryListRequest(value: unknown): FileTransferValidationResult<FileDirectoryListRequest> {
+  if (!isObject(value)) return { ok: false, error: 'invalid_object' };
+  if (!hasOnlyKeys(value, new Set(['type', 'requestId', 'path']))) return { ok: false, error: 'unknown_field' };
+  if (value.type !== FILE_TRANSFER_MSG.DIRECTORY_LIST) return { ok: false, error: 'invalid_type' };
+  if (!isTransferId(value.requestId)) return { ok: false, error: 'invalid_request_id' };
+  if (!isBoundedString(value.path, FILE_TRANSFER_PATH_MAX_BYTES)) return { ok: false, error: 'invalid_path' };
+  return { ok: true, value: value as unknown as FileDirectoryListRequest };
+}
+
 export function validateFileDeleteRequest(value: unknown): FileTransferValidationResult<FileDeleteRequest> {
   if (!isObject(value)) return { ok: false, error: 'invalid_object' };
   if (!hasOnlyKeys(value, new Set(['type', 'requestId', 'attachmentId']))) return { ok: false, error: 'unknown_field' };
@@ -362,14 +417,16 @@ export function validateControlledFileTransferRequest(
 ): FileTransferValidationResult<ControlledFileTransferRequest> {
   if (!isObject(value) || typeof value.type !== 'string') return { ok: false, error: 'invalid_object' };
   if (value.type === FILE_TRANSFER_MSG.PATH_HANDLE) return validateFilePathHandleRequest(value);
+  if (value.type === FILE_TRANSFER_MSG.DIRECTORY_LIST) return validateFileDirectoryListRequest(value);
   if (value.type === FILE_TRANSFER_MSG.DELETE) return validateFileDeleteRequest(value);
   if (value.type === 'file.upload_fetch') {
-    if (!hasOnlyKeys(value, new Set(['type', 'uploadId', 'filename', 'originalName', 'mime', 'size', 'downloadUrl', 'clientUploadId']))
+    if (!hasOnlyKeys(value, new Set(['type', 'uploadId', 'filename', 'originalName', 'mime', 'size', 'downloadUrl', 'clientUploadId', 'destinationDirectory']))
       || !isTransferId(value.uploadId)
       || typeof value.filename !== 'string' || !/^[a-f0-9]{16,128}(\.[A-Za-z0-9]{1,20})?$/.test(value.filename)
       || (value.originalName !== undefined && !isBoundedString(value.originalName, 1024))
       || (value.mime !== undefined && !isBoundedString(value.mime, 256))
       || (value.clientUploadId !== undefined && !isTransferId(value.clientUploadId))
+      || (value.destinationDirectory !== undefined && !isBoundedString(value.destinationDirectory, FILE_TRANSFER_PATH_MAX_BYTES))
       || !isSafeSize(value.size)
       || !isBoundedString(value.downloadUrl, 8192)) {
       return { ok: false, error: 'invalid_upload_fetch' };
@@ -458,6 +515,47 @@ export function validateControlledFileTransferResponse(
       return { ok: false, error: 'invalid_path_handle_error' };
     }
     return { ok: true, value: v as unknown as FilePathHandleError };
+  }
+  if (v.type === FILE_TRANSFER_MSG.DIRECTORY_LIST_DONE) {
+    if (!hasOnlyKeys(v, new Set(['type', 'requestId', 'path', 'resolvedPath', 'entries']))
+      || !isTransferId(v.requestId)
+      || !isBoundedString(v.path, FILE_TRANSFER_PATH_MAX_BYTES)
+      || !isBoundedString(v.resolvedPath, FILE_TRANSFER_PATH_MAX_BYTES)
+      || !Array.isArray(v.entries)
+      || v.entries.length > FILE_TRANSFER_DIRECTORY_MAX_ENTRIES) {
+      return { ok: false, error: 'invalid_directory_list_done' };
+    }
+    const entries: FileDirectoryEntry[] = [];
+    for (const entry of v.entries) {
+      if (!isObject(entry)
+        || !hasOnlyKeys(entry, new Set(['name', 'path', 'isDir', 'hidden']))
+        || !isBoundedString(entry.name, 1024)
+        || !isBoundedString(entry.path, FILE_TRANSFER_PATH_MAX_BYTES)
+        || entry.isDir !== true
+        || typeof entry.hidden !== 'boolean') {
+        return { ok: false, error: 'invalid_directory_entry' };
+      }
+      entries.push(entry as unknown as FileDirectoryEntry);
+    }
+    return {
+      ok: true,
+      value: {
+        type: FILE_TRANSFER_MSG.DIRECTORY_LIST_DONE,
+        requestId: v.requestId,
+        path: v.path,
+        resolvedPath: v.resolvedPath,
+        entries,
+      },
+    };
+  }
+  if (v.type === FILE_TRANSFER_MSG.DIRECTORY_LIST_ERROR) {
+    if (!hasOnlyKeys(v, new Set(['type', 'requestId', 'error']))
+      || !isTransferId(v.requestId)
+      || !isBoundedString(v.error, FILE_TRANSFER_ERROR_MAX_BYTES)
+      || !FILE_TRANSFER_ERROR_RE.test(v.error)) {
+      return { ok: false, error: 'invalid_directory_list_error' };
+    }
+    return { ok: true, value: v as unknown as FileDirectoryListError };
   }
   if (v.type === FILE_TRANSFER_MSG.DELETE_DONE) {
     if (!hasOnlyKeys(v, new Set(['type', 'requestId'])) || !isTransferId(v.requestId)) {

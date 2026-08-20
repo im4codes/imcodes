@@ -1,7 +1,10 @@
 import { render } from 'preact';
 import { marked } from 'marked';
 import { App } from './app.js';
+import { configure, configureExpectedUserId } from './api.js';
+import { RemoteDesktopStandalone } from './components/RemoteDesktopStandalone.js';
 import { applyNativePlatformClasses } from './native-platform.js';
+import { readRemoteDesktopWindowServerId } from './remote-desktop-window.js';
 import './styles.css';
 import './i18n/index.js';
 // Bundled programmer webfonts (OFL 1.1). JetBrains Mono is the default;
@@ -28,4 +31,16 @@ marked.use({
 
 applyNativePlatformClasses();
 
-render(<App />, document.getElementById('app')!);
+const remoteDesktopServerId = readRemoteDesktopWindowServerId();
+if (remoteDesktopServerId) {
+  try {
+    const raw = localStorage.getItem('rcc_auth');
+    const auth = raw ? JSON.parse(raw) as { userId?: unknown; baseUrl?: unknown } : null;
+    if (typeof auth?.baseUrl === 'string') configure(auth.baseUrl);
+    if (typeof auth?.userId === 'string') configureExpectedUserId(auth.userId);
+  } catch { /* API falls back to same-origin session authentication. */ }
+  document.documentElement.classList.add('remote-desktop-standalone-root');
+  render(<RemoteDesktopStandalone serverId={remoteDesktopServerId} />, document.getElementById('app')!);
+} else {
+  render(<App />, document.getElementById('app')!);
+}

@@ -10,13 +10,13 @@ interface SyncPayload<T> {
 
 const LS_PREFIX = 'rcc_sync_';
 
-function lsKey(key: string): string {
-  return `${LS_PREFIX}${key}`;
+function lsKey(key: string, localScope?: string): string {
+  return `${LS_PREFIX}${localScope ? `${encodeURIComponent(localScope)}:` : ''}${key}`;
 }
 
-function readFromLocalStorage<T>(key: string): SyncPayload<T> | null {
+function readFromLocalStorage<T>(key: string, localScope?: string): SyncPayload<T> | null {
   try {
-    const raw = localStorage.getItem(lsKey(key));
+    const raw = localStorage.getItem(lsKey(key, localScope));
     if (!raw) return null;
     return JSON.parse(raw) as SyncPayload<T>;
   } catch {
@@ -24,12 +24,12 @@ function readFromLocalStorage<T>(key: string): SyncPayload<T> | null {
   }
 }
 
-function writeToLocalStorage<T>(key: string, payload: SyncPayload<T>): void {
+function writeToLocalStorage<T>(key: string, payload: SyncPayload<T>, localScope?: string): void {
   // Timeline/file-preview snapshots can fill the browser quota. Preferences
   // are durable user intent, so route them through the shared quota recovery
   // path which evicts volatile snapshots and retries instead of silently
   // dropping the write.
-  safeLocalStorageSetItem(lsKey(key), JSON.stringify(payload));
+  safeLocalStorageSetItem(lsKey(key, localScope), JSON.stringify(payload));
 }
 
 /**
@@ -40,6 +40,9 @@ function writeToLocalStorage<T>(key: string, payload: SyncPayload<T>): void {
  * - On setValue: updates state + localStorage immediately, then debounces a
  *   server PUT.
  * - On unmount: cancels any pending debounced save.
+ * - The third tuple item becomes true after server reconciliation completes.
+ * - `localScope` isolates browser cache entries for account-specific callers;
+ *   the server preference remains scoped by the authenticated user.
  *
  * Both localStorage and server store the same `{ v: T, t: number }` payload.
  */
@@ -47,17 +50,22 @@ export function useSyncedPreference<T>(
   key: string,
   defaultValue: T,
   debounceMs = 300,
-): [T, (value: T | ((prev: T) => T)) => void] {
+  localScope?: string,
+): [T, (value: T | ((prev: T) => T)) => void, boolean] {
   const [value, setValueState] = useState<T>(() => {
-    const local = readFromLocalStorage<T>(key);
+    const local = readFromLocalStorage<T>(key, localScope);
     return local !== null ? local.v : defaultValue;
   });
 
   const debounceTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [hydrated, setHydrated] = useState(false);
 
   // On mount: fetch server and reconcile timestamps.
   useEffect(() => {
     let cancelled = false;
+    setHydrated(false);
+    const initialLocal = readFromLocalStorage<T>(key, localScope);
+    setValueState(initialLocal !== null ? initialLocal.v : defaultValue);
 
     void (async () => {
       const serverRaw = await getUserPref(key);
@@ -65,7 +73,7 @@ export function useSyncedPreference<T>(
 
       if (serverRaw == null) {
         // No server value — push local value (if any) to server.
-        const local = readFromLocalStorage<T>(key);
+        const local = readFromLocalStorage<T>(key, localScope);
         if (local !== null) {
           try {
             await saveUserPref(key, JSON.stringify(local));
@@ -88,13 +96,13 @@ export function useSyncedPreference<T>(
 
       if (!serverPayload || typeof serverPayload.t !== 'number') return;
 
-      const local = readFromLocalStorage<T>(key);
+      const local = readFromLocalStorage<T>(key, localScope);
 
       if (local === null || serverPayload.t >= local.t) {
         // Server is newer (or no local) — update state and localStorage.
         if (cancelled) return;
         setValueState(serverPayload.v);
-        writeToLocalStorage(key, serverPayload);
+        writeToLocalStorage(key, serverPayload, localScope);
       } else {
         // Local is newer — push to server.
         try {
@@ -107,13 +115,15 @@ export function useSyncedPreference<T>(
       if (!cancelled) {
         console.warn(`[useSyncedPreference] failed to fetch server pref "${key}":`, err);
       }
+    }).finally(() => {
+      if (!cancelled) setHydrated(true);
     });
 
     return () => {
       cancelled = true;
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [key]);
+  }, [key, localScope]);
 
   // Cleanup debounce timer on unmount.
   useEffect(() => {
@@ -131,7 +141,7 @@ export function useSyncedPreference<T>(
         ? (updater as (prev: T) => T)(prev)
         : updater;
 
-      const previousLocal = readFromLocalStorage<T>(key);
+      const previousLocal = readFromLocalStorage<T>(key, localScope);
       const payload: SyncPayload<T> = {
         v: newValue,
         // Preserve strict last-write ordering even for two updates in the same
@@ -142,7 +152,7 @@ export function useSyncedPreference<T>(
       };
 
       // Write to localStorage synchronously (survives page close).
-      writeToLocalStorage(key, payload);
+      writeToLocalStorage(key, payload, localScope);
 
       // Immediate mode is used for discrete, durable actions such as a tab
       // drop. Starting the PUT in the same event prevents page refresh/unmount
@@ -169,5 +179,5 @@ export function useSyncedPreference<T>(
     });
   };
 
-  return [value, setValue];
+  return [value, setValue, hydrated];
 }

@@ -471,7 +471,13 @@ function collectCommandResult(
   options: CronCommandResultCollectorOptions = {},
 ): { cancel(): void } {
   const MAX_DETAIL_LEN = 4000;
-  const collected: string[] = [];
+  // `assistant.text` is an in-place timeline projection: transport providers
+  // emit cumulative streaming snapshots and then a terminal update. Appending
+  // every snapshot produces `H\nHe\nHel\nHello` in cron history (and can fill
+  // MAX_DETAIL_LEN before the real answer arrives). Keep only the newest
+  // projection for this occurrence, preferring the terminal text when present.
+  let latestAssistantText = '';
+  let terminalAssistantText = '';
   let attempt = 1;
   let attemptStartTs = Date.now();
   let toolObserved = false;
@@ -489,7 +495,8 @@ function collectCommandResult(
   const maxWaitMs = Math.max(1_000, options.maxWaitMs ?? CRON_COMMAND_ATTEMPT_TIMEOUT_MS);
 
   const resetAttempt = () => {
-    collected.length = 0;
+    latestAssistantText = '';
+    terminalAssistantText = '';
     attemptStartTs = Date.now();
     toolObserved = false;
     successfulAssistantObserved = false;
@@ -509,7 +516,7 @@ function collectCommandResult(
   const finish = (status?: 'error', fallbackDetail?: string) => {
     if (finished) return;
     finished = true;
-    const detail = (collected.join('\n').trim() || fallbackDetail || `Cron command returned no response from ${sessionId}`)
+    const detail = (terminalAssistantText.trim() || latestAssistantText.trim() || fallbackDetail || `Cron command returned no response from ${sessionId}`)
       .slice(0, MAX_DETAIL_LEN);
     logger.info({ jobId, executionId, sessionId, detailLength: detail.length, status }, 'Cron: command result captured');
     sendCommandResult(serverLink, {
@@ -548,7 +555,8 @@ function collectCommandResult(
       resetAttempt();
       armAttemptTimeout();
       void options.retry!(attempt).catch((error) => {
-        collected.push(`Cron transport retry failed for ${sessionId}: ${formatErr(error)}`);
+        terminalAssistantText = `Cron transport retry failed for ${sessionId}: ${formatErr(error)}`;
+        latestAssistantText = terminalAssistantText;
         providerErrorObserved = true;
         finish('error');
       });
@@ -575,7 +583,8 @@ function collectCommandResult(
     if (e.type === 'tool.call' || e.type === 'tool.result') toolObserved = true;
 
     if (e.type === 'assistant.text' && typeof e.payload.text === 'string') {
-      collected.push(e.payload.text);
+      latestAssistantText = e.payload.text;
+      if (e.payload.streaming !== true) terminalAssistantText = e.payload.text;
       if (typeof e.payload.providerErrorCode === 'string') {
         providerErrorObserved = true;
         recoverableProviderErrorObserved = e.payload.providerErrorRecoverable === true;
@@ -584,7 +593,7 @@ function collectCommandResult(
       }
     }
 
-    if (e.type === 'session.state' && e.payload.state === 'idle' && collected.length > 0) {
+    if (e.type === 'session.state' && e.payload.state === 'idle' && latestAssistantText.trim()) {
       if (recoverableProviderErrorObserved && canRetrySafely()) {
         scheduleRetry('recoverable_provider_error');
         return;

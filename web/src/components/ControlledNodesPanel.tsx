@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'preact/hooks';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import {
   controlledNodeDownloadErrorKey,
@@ -11,21 +11,39 @@ import {
   listAvailableExecutables,
   renameMachine,
   revokeMachine,
+  setMachineAutoUnlock,
   setMachineExecEnabled,
   type ControlledNodeArtifactMetadata,
   type ControlledNodeArtifactSelection,
   type ControlledNodeOs,
 } from '../api/machines.js';
+import { CONTROLLED_NODE_AUTO_UNLOCK_CAPABILITY } from '@shared/controlled-node-auto-unlock.js';
 import { normalizeMachineDisplayName } from '@shared/machine-reference.js';
+import { formatByteSize } from '../util/byte-size.js';
 import { useMachines } from '../hooks/useMachines.js';
 import { isNative } from '../native.js';
+import { ShareSessionDialog } from './ShareSessionDialog.js';
+import type { MachineListItem } from '../api/machines.js';
+import { canOpenRemoteDesktop } from './RemoteDesktopPanel.js';
 
-function formatByteSize(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+/**
+ * Auto unlock exists only where the remote-desktop worker does: it is that
+ * worker that holds the secret and types it at the sign-in desktop. Offering
+ * it on a node that cannot run one would promise something unreachable.
+ */
+function canConfigureAutoUnlock(machine: MachineListItem): boolean {
+  return (machine.accessRole ?? 'owner') === 'owner'
+    && machine.os === 'win'
+    && Boolean(machine.capabilities?.includes(CONTROLLED_NODE_AUTO_UNLOCK_CAPABILITY));
 }
+
+/**
+ * Presence is DB-backed and changes independently of this browser after an
+ * installer starts. Keep the open management panel fresh so a first install
+ * moves from offline to online without requiring a second installer run or a
+ * manual refresh.
+ */
+export const CONTROLLED_NODE_PRESENCE_REFRESH_MS = 5_000;
 
 function formatExpiryTime(expiresAt: number, locale: string): string {
   try {
@@ -64,15 +82,27 @@ function findArtifactForTarget(
   return artifacts.find((a) => a.os === target.os && a.arch === target.arch);
 }
 
+function machineAccessRole(machine: MachineListItem): 'owner' | 'viewer' | 'participant' {
+  // The field is optional on the wire so a newly upgraded Web remains usable
+  // with an older Server, whose machine list was owner-only.
+  return machine.accessRole ?? 'owner';
+}
+
 const PLATFORM_PRESENTATION: Record<ControlledNodeOs, { glyph: string; name: string }> = {
   win: { glyph: '⊞', name: 'Windows' },
   mac: { glyph: '⌘', name: 'macOS' },
   linux: { glyph: '◇', name: 'Linux' },
 };
 
-export function ControlledNodesPanel() {
+export interface ControlledNodesPanelProps {
+  onOpenRemoteDesktop?(machine: MachineListItem): void;
+}
+
+export function ControlledNodesPanel({
+  onOpenRemoteDesktop,
+}: ControlledNodesPanelProps) {
   const { t, i18n } = useTranslation();
-  const { machines, loading, error, refetch } = useMachines();
+  const { machines, loaded, loading, error, refetch } = useMachines();
 
   const [artifacts, setArtifacts] = useState<ControlledNodeArtifactMetadata[]>([]);
   const [downloadTargets, setDownloadTargets] = useState<ControlledNodeArtifactSelection[]>([]);
@@ -84,9 +114,16 @@ export function ControlledNodesPanel() {
   const [ticketExpiryByKey, setTicketExpiryByKey] = useState<Partial<Record<string, number>>>({});
 
   const [actionError, setActionError] = useState<string | null>(null);
+  const [presenceRefreshFailed, setPresenceRefreshFailed] = useState(error != null);
+  const [manualPresenceRefresh, setManualPresenceRefresh] = useState(false);
   const [busyServerId, setBusyServerId] = useState<string | null>(null);
+  // The typed secret lives here only until the request returns, then is cleared.
+  const [autoUnlockServerId, setAutoUnlockServerId] = useState<string | null>(null);
+  const [autoUnlockValue, setAutoUnlockValue] = useState('');
   const [editingServerId, setEditingServerId] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState('');
+  const [sharingMachine, setSharingMachine] = useState<MachineListItem | null>(null);
+  const presenceMountedRef = useRef(true);
 
   const sortedTargets = useMemo(() => downloadTargets, [downloadTargets]);
   const availableOses = useMemo(
@@ -107,6 +144,53 @@ export function ControlledNodesPanel() {
   }, [t]);
 
   useEffect(() => { refreshAvailability(); }, [refreshAvailability]);
+
+  useEffect(() => {
+    presenceMountedRef.current = true;
+    return () => { presenceMountedRef.current = false; };
+  }, []);
+
+  useEffect(() => {
+    if (error) setPresenceRefreshFailed(true);
+  }, [error]);
+
+  const refreshPresence = useCallback(async (): Promise<void> => {
+    try {
+      await refetch();
+      if (presenceMountedRef.current) setPresenceRefreshFailed(false);
+    } catch {
+      // Keep the last known machine list visible and contain the rejection at
+      // this boundary. A failed refresh must never become an operation error
+      // or an unhandled rejection interpreted as a failed app update.
+      if (presenceMountedRef.current) setPresenceRefreshFailed(true);
+    }
+  }, [refetch]);
+
+  useEffect(() => {
+    const refreshQuietly = (): void => {
+      void refreshPresence();
+    };
+    const refreshWhenVisible = (): void => {
+      if (document.visibilityState === 'visible') refreshQuietly();
+    };
+    refreshQuietly();
+    const timer = window.setInterval(refreshQuietly, CONTROLLED_NODE_PRESENCE_REFRESH_MS);
+    document.addEventListener('visibilitychange', refreshWhenVisible);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener('visibilitychange', refreshWhenVisible);
+    };
+  }, [refreshPresence]);
+
+  const refreshPresenceManually = useCallback(async (): Promise<void> => {
+    if (manualPresenceRefresh) return;
+    setManualPresenceRefresh(true);
+    try {
+      await refreshPresence();
+    } finally {
+      setManualPresenceRefresh(false);
+    }
+  }, [manualPresenceRefresh, refreshPresence]);
 
   const onDownload = async (target: ControlledNodeArtifactSelection) => {
     const key = artifactSelectionKey(target);
@@ -137,12 +221,42 @@ export function ControlledNodesPanel() {
     setBusyServerId(serverId);
     try {
       await setMachineExecEnabled(serverId, next);
-      await refetch();
     } catch {
       setActionError(t('controlled_nodes.error_generic'));
-    } finally {
       setBusyServerId(null);
+      return;
     }
+    await refreshPresence();
+    setBusyServerId(null);
+  };
+
+  const startAutoUnlock = (serverId: string) => {
+    setActionError(null);
+    setAutoUnlockServerId(serverId);
+    setAutoUnlockValue('');
+  };
+
+  const cancelAutoUnlock = () => {
+    setAutoUnlockServerId(null);
+    setAutoUnlockValue('');
+  };
+
+  const submitAutoUnlock = async (serverId: string, secret: string | null) => {
+    setActionError(null);
+    setBusyServerId(serverId);
+    try {
+      await setMachineAutoUnlock(serverId, secret);
+    } catch {
+      setActionError(t('controlled_nodes.error_generic'));
+      setBusyServerId(null);
+      return;
+    } finally {
+      // The typed secret never stays in component state after the request.
+      setAutoUnlockValue('');
+    }
+    setAutoUnlockServerId(null);
+    await refreshPresence();
+    setBusyServerId(null);
   };
 
   const startRename = (serverId: string, displayName: string) => {
@@ -167,12 +281,13 @@ export function ControlledNodesPanel() {
     try {
       await renameMachine(serverId, displayName);
       cancelRename();
-      await refetch();
     } catch {
       setActionError(t('controlled_nodes.error_generic'));
-    } finally {
       setBusyServerId(null);
+      return;
     }
+    await refreshPresence();
+    setBusyServerId(null);
   };
 
   const onRevoke = async (serverId: string) => {
@@ -181,12 +296,13 @@ export function ControlledNodesPanel() {
     setBusyServerId(serverId);
     try {
       await revokeMachine(serverId);
-      await refetch();
     } catch {
       setActionError(t('controlled_nodes.error_generic'));
-    } finally {
       setBusyServerId(null);
+      return;
     }
+    await refreshPresence();
+    setBusyServerId(null);
   };
 
   const usageOsKeys: Array<{ os: ControlledNodeOs; key: string }> = [
@@ -235,16 +351,20 @@ export function ControlledNodesPanel() {
           <button
             type="button"
             class="controlled-nodes-refresh"
-            onClick={() => refetch()}
-            disabled={loading}
+            onClick={() => { void refreshPresenceManually(); }}
+            disabled={manualPresenceRefresh || (!loaded && loading)}
           >
-            <span class={loading ? 'controlled-nodes-refresh-icon is-spinning' : 'controlled-nodes-refresh-icon'} aria-hidden="true">↻</span>
+            <span class={manualPresenceRefresh || (!loaded && loading) ? 'controlled-nodes-refresh-icon is-spinning' : 'controlled-nodes-refresh-icon'} aria-hidden="true">↻</span>
             {t('controlled_nodes.refresh')}
           </button>
         </div>
         {actionError && <p class="controlled-nodes-error" role="alert">{actionError}</p>}
-        {error && <p class="controlled-nodes-error" role="alert">{t('controlled_nodes.error_generic')}</p>}
-        {!loading && machines.length === 0 && (
+        {(presenceRefreshFailed || error) && (
+          <p class="controlled-nodes-error controlled-nodes-presence-error" role="alert">
+            {t('controlled_nodes.refresh_error')}
+          </p>
+        )}
+        {loaded && machines.length === 0 && (
           <div class="controlled-nodes-empty">
             <span class="controlled-nodes-empty-radar" aria-hidden="true"><i /></span>
             <p>{t('controlled_nodes.empty')}</p>
@@ -295,34 +415,116 @@ export function ControlledNodesPanel() {
                 <div class="controlled-nodes-machine-meta">
                   <code>{m.refName}</code>
                   {m.os && <span>{m.os.toUpperCase()}</span>}
+                  {m.daemonVersion
+                    ? (
+                      <span
+                        class={m.updateAvailable ? 'controlled-nodes-version is-outdated' : 'controlled-nodes-version'}
+                        title={m.updateAvailable
+                          ? t('controlled_nodes.version_outdated')
+                          : t('controlled_nodes.version_current')}
+                      >
+                        {t('controlled_nodes.version', { version: m.daemonVersion })}
+                      </span>
+                    )
+                    : <span title={t('controlled_nodes.version_unknown')}>{t('controlled_nodes.version_unknown')}</span>}
+                  <span>{t('controlled_nodes.access_role', { role: t(`share.role.${machineAccessRole(m)}`) })}</span>
+                  {m.autoUnlockConfigured && (
+                    <span
+                      class="controlled-nodes-auto-unlock-badge"
+                      title={t('controlled_nodes.auto_unlock_badge_hint')}
+                    >{t('controlled_nodes.auto_unlock_badge')}</span>
+                  )}
                 </div>
               </div>
               <div class="controlled-nodes-machine-actions">
-                <button
-                  type="button"
-                  class="controlled-nodes-rename"
-                  disabled={busyServerId === m.serverId || editingServerId === m.serverId}
-                  title={t('common.rename')}
-                  onClick={() => startRename(m.serverId, m.displayName)}
-                >✎</button>
-                <button
-                  type="button"
-                  class={`controlled-nodes-exec-toggle ${m.execEnabled ? 'is-enabled' : 'is-disabled'}`}
-                  disabled={busyServerId === m.serverId}
-                  aria-pressed={m.execEnabled}
-                  onClick={() => onToggleExec(m.serverId, !m.execEnabled)}
-                >
-                  <span class="controlled-nodes-toggle-track" aria-hidden="true"><i /></span>
-                  <span>{m.execEnabled ? t('controlled_nodes.exec_on') : t('controlled_nodes.exec_off')}</span>
-                </button>
-                <button
-                  type="button"
-                  class="controlled-nodes-revoke"
-                  disabled={busyServerId === m.serverId}
-                  onClick={() => onRevoke(m.serverId)}
-                >
-                  <span aria-hidden="true">×</span> {t('controlled_nodes.revoke')}
-                </button>
+                {canOpenRemoteDesktop(m) && (
+                  <button
+                    type="button"
+                    class="controlled-nodes-remote-desktop"
+                    onClick={() => onOpenRemoteDesktop?.(m)}
+                  >
+                    {t('remote_desktop.open')}
+                  </button>
+                )}
+                {machineAccessRole(m) === 'owner' ? (
+                  <>
+                    <button
+                      type="button"
+                      class="share-revoke-btn"
+                      disabled={busyServerId === m.serverId}
+                      onClick={() => setSharingMachine(m)}
+                    >
+                      {t('share.menu.shareTab')}
+                    </button>
+                    <button
+                      type="button"
+                      class="controlled-nodes-rename"
+                      disabled={busyServerId === m.serverId || editingServerId === m.serverId}
+                      title={t('common.rename')}
+                      onClick={() => startRename(m.serverId, m.displayName)}
+                    >✎</button>
+                    <button
+                      type="button"
+                      class={`controlled-nodes-exec-toggle ${m.execEnabled ? 'is-enabled' : 'is-disabled'}`}
+                      disabled={busyServerId === m.serverId}
+                      aria-pressed={m.execEnabled}
+                      onClick={() => onToggleExec(m.serverId, !m.execEnabled)}
+                    >
+                      <span class="controlled-nodes-toggle-track" aria-hidden="true"><i /></span>
+                      <span>{m.execEnabled ? t('controlled_nodes.exec_on') : t('controlled_nodes.exec_off')}</span>
+                    </button>
+                    {canConfigureAutoUnlock(m) && (autoUnlockServerId === m.serverId ? (
+                      <form
+                        class="controlled-nodes-auto-unlock-form"
+                        onSubmit={(event) => {
+                          event.preventDefault();
+                          if (autoUnlockValue) void submitAutoUnlock(m.serverId, autoUnlockValue);
+                        }}
+                      >
+                        <input
+                          type="password"
+                          autoComplete="new-password"
+                          value={autoUnlockValue}
+                          placeholder={t('controlled_nodes.auto_unlock_placeholder')}
+                          aria-label={t('controlled_nodes.auto_unlock_placeholder')}
+                          onInput={(event) => setAutoUnlockValue((event.target as HTMLInputElement).value)}
+                        />
+                        <button type="submit" disabled={!autoUnlockValue || busyServerId === m.serverId}>
+                          {t('common.save')}
+                        </button>
+                        <button type="button" onClick={cancelAutoUnlock}>{t('common.cancel')}</button>
+                      </form>
+                    ) : (
+                      <button
+                        type="button"
+                        class="controlled-nodes-auto-unlock"
+                        disabled={busyServerId === m.serverId}
+                        title={t('controlled_nodes.auto_unlock_hint')}
+                        onClick={() => (m.autoUnlockConfigured
+                          ? void submitAutoUnlock(m.serverId, null)
+                          : startAutoUnlock(m.serverId))}
+                      >
+                        {m.autoUnlockConfigured
+                          ? t('controlled_nodes.auto_unlock_clear')
+                          : t('controlled_nodes.auto_unlock_set')}
+                      </button>
+                    ))}
+                    <button
+                      type="button"
+                      class="controlled-nodes-revoke"
+                      disabled={busyServerId === m.serverId}
+                      onClick={() => onRevoke(m.serverId)}
+                    >
+                      <span aria-hidden="true">×</span> {t('controlled_nodes.revoke')}
+                    </button>
+                  </>
+                ) : (
+                  <span class="controlled-nodes-muted">
+                    {machineAccessRole(m) === 'participant'
+                      ? (m.execEnabled ? t('controlled_nodes.exec_on') : t('controlled_nodes.exec_off'))
+                      : t('controlled_nodes.share.view_only')}
+                  </span>
+                )}
               </div>
             </li>
           ))}
@@ -410,6 +612,21 @@ export function ControlledNodesPanel() {
           </ul>
         )}
       </section>
+
+      {sharingMachine && (
+        <ShareSessionDialog
+          variant="machine"
+          fixedTarget={{ kind: 'server', serverId: sharingMachine.serverId }}
+          target={{
+            serverId: sharingMachine.serverId,
+            serverLabel: sharingMachine.displayName,
+            sessionName: '',
+            tabLabel: sharingMachine.displayName,
+          }}
+          onClose={() => setSharingMachine(null)}
+          onSharesChanged={() => { void refreshPresence(); }}
+        />
+      )}
     </div>
   );
 }

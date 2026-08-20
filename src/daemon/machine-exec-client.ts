@@ -26,6 +26,7 @@ import {
   MACHINE_EXEC_HTTP_STREAM_MAX_BYTES,
   MACHINE_LIST_MAX_ITEMS,
   NODE_ROLE,
+  isMachineAccessRole,
   type RemoteExecOutcome,
   type RemoteExecOutputChunk,
   type RemoteExecShell,
@@ -239,7 +240,8 @@ export async function execRemote(opts: ExecRemoteOptions): Promise<ExecRemoteRes
 type MachineListItem = MachineSummary & { refName: string; displayName: string; execEnabled: boolean };
 
 const MACHINE_LIST_ITEM_KEYS: ReadonlySet<string> = new Set([
-  'serverId', 'name', 'refName', 'displayName', 'online', 'nodeRole', 'execEnabled', 'os', 'lastSeenMs',
+  'serverId', 'name', 'refName', 'displayName', 'online', 'nodeRole', 'execEnabled', 'os', 'lastSeenMs', 'accessRole',
+  'daemonVersion', 'updateAvailable', 'autoUnlockConfigured',
 ]);
 
 /** Strict per-item validation: known keys only, controlled role, canonical OS (or absent). */
@@ -253,8 +255,14 @@ function isValidMachineListItem(v: unknown): v is MachineListItem {
     || typeof m.displayName !== 'string') return false;
   if (typeof m.online !== 'boolean' || typeof m.execEnabled !== 'boolean') return false;
   if (m.nodeRole !== NODE_ROLE.CONTROLLED) return false;
+  if (m.accessRole !== undefined && !isMachineAccessRole(m.accessRole)) return false;
   if (m.os !== undefined && canonicalMachineOs(m.os) === undefined) return false;
   if (m.lastSeenMs !== undefined && (typeof m.lastSeenMs !== 'number' || !Number.isFinite(m.lastSeenMs))) return false;
+  // Display-only fields a newer Server may add. They never reach the agent-facing
+  // tool result, but rejecting them would break this node against that Server.
+  if (m.daemonVersion !== undefined && typeof m.daemonVersion !== 'string') return false;
+  if (m.updateAvailable !== undefined && typeof m.updateAvailable !== 'boolean') return false;
+  if (m.autoUnlockConfigured !== undefined && typeof m.autoUnlockConfigured !== 'boolean') return false;
   return true;
 }
 

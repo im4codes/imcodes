@@ -19,6 +19,7 @@ export const AGENT_BADGE_CONFIG: Record<string, AgentBadgeConfig> = {
   'gemini-sdk': { label: 'gm', color: '#1d4ed8', autoLabelPrefix: 'Gm' },
   'grok-sdk': { label: 'gr', color: '#64748b', autoLabelPrefix: 'Gr' },
   'kimi-sdk': { label: 'km', color: '#8b5cf6', autoLabelPrefix: 'Km' },
+  'deepseek-harness': { label: 'ds', color: '#4d6bfe', autoLabelPrefix: 'Ds' },
   'shell': { label: 'sh', color: '#475569', autoLabelPrefix: 'Sh' },
   'script': { label: 'sc', color: '#64748b', autoLabelPrefix: 'Sc' },
 };
@@ -32,6 +33,7 @@ const LEGACY_AUTO_LABEL_PATTERNS: Array<{ pattern: RegExp; prefix: string }> = [
   { pattern: /^gemini-sdk(\d+)?$/i, prefix: 'Gm' },
   { pattern: /^grok-sdk(\d+)?$/i, prefix: 'Gr' },
   { pattern: /^kimi-sdk(\d+)?$/i, prefix: 'Km' },
+  { pattern: /^deepseek-harness(\d+)?$/i, prefix: 'Ds' },
 ];
 
 export function getAgentBadgeConfig(agentType: string | null | undefined): AgentBadgeConfig | null {

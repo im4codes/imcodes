@@ -26,7 +26,17 @@ import {
   makeSafeCloseOnce,
   type ArtifactCatalog,
 } from '../src/services/controlled-node-artifact-catalog.js';
-import { NODE_ROLE, decodeEnrollmentTrailer } from '../../shared/remote-exec.js';
+import { NODE_ROLE, decodeEnrollmentTrailer, decodeEnrollmentTrailerWithRange } from '../../shared/remote-exec.js';
+import { inspectWindowsAuthenticodeEnrollmentContainer } from '../../shared/windows-authenticode-enrollment.js';
+import { EXPECTED_USER_ID_HEADER } from '../../shared/http-header-names.js';
+import { AUTH_IDENTITY_ERRORS } from '../../shared/auth-identity.js';
+import { CONTROLLED_NODE_ARTIFACT_HEADERS } from '../../shared/controlled-node-artifacts.js';
+import {
+  REMOTE_DESKTOP_LEGACY_UPGRADE_PROTOCOL_VERSION,
+  REMOTE_DESKTOP_WORKER_FILENAME,
+  REMOTE_DESKTOP_WORKER_MANIFEST_SUFFIX,
+} from '../../shared/remote-desktop-worker.js';
+import { WINDOWS_REMOTE_DESKTOP_QUALIFICATION_PLAN } from '../../shared/remote-desktop-qualification.js';
 
 let db: Database;
 const hex = (n: number) => randomBytes(n).toString('hex');
@@ -35,6 +45,24 @@ const sha256 = (value: string | Buffer) => createHash('sha256').update(value).di
 let exeDir: string;
 let artifactCatalog: ArtifactCatalog;
 const FAKE_BINARY = Buffer.from('IMCODES_FAKE_EXECUTABLE_BINARY_v1');
+function fakeSignedWindowsPe(): Buffer {
+  const certificateOffset = 512;
+  const certificateSize = 16;
+  const file = Buffer.alloc(certificateOffset + certificateSize, 0x5a);
+  file.writeUInt32LE(0x80, 0x3c);
+  file.writeUInt32LE(0x00004550, 0x80);
+  const optional = 0x80 + 24;
+  file.writeUInt16LE(0x20b, optional);
+  file.writeUInt32LE(16, optional + 108);
+  const securityEntry = optional + 112 + 4 * 8;
+  file.writeUInt32LE(certificateOffset, securityEntry);
+  file.writeUInt32LE(certificateSize, securityEntry + 4);
+  file.writeUInt32LE(certificateSize, certificateOffset);
+  file.writeUInt16LE(0x0200, certificateOffset + 4);
+  file.writeUInt16LE(0x0002, certificateOffset + 6);
+  return file;
+}
+const FAKE_WINDOWS_SIGNED_PE = fakeSignedWindowsPe();
 const TEST_ENCRYPTION_KEY = 'test-bot-encryption-key-do-not-use-in-prod';
 
 async function writeManifest(
@@ -51,6 +79,7 @@ async function writeManifest(
       arch,
       size: bytes.length,
       sha256: sha256(bytes),
+      ...(os === 'win32' ? { authenticodeSignerSha256: 'c'.repeat(64) } : {}),
     },
     toolchain: {
       nodeVersion: 'v22.11.0',
@@ -68,7 +97,7 @@ beforeAll(async () => {
   await runMigrations(db);
   exeDir = await mkdtemp(join(tmpdir(), 'imcodes-v2-exe-'));
   await writeFile(join(exeDir, 'imcodes-node-linux'), FAKE_BINARY);
-  await writeFile(join(exeDir, 'imcodes-node.exe'), FAKE_BINARY);
+  await writeFile(join(exeDir, 'imcodes-node.exe'), FAKE_WINDOWS_SIGNED_PE);
   await mkdir(join(exeDir, 'imcodes-node-macos')); // directory, not file
   process.env.IMCODES_NODE_EXE_DIR = exeDir;
 });
@@ -94,7 +123,8 @@ beforeEach(async () => {
     }
   }
   await writeManifest('imcodes-node-linux', 'linux', 'x64');
-  await writeManifest('imcodes-node.exe', 'win32', 'x64');
+  await writeFile(join(exeDir, 'imcodes-node.exe'), FAKE_WINDOWS_SIGNED_PE);
+  await writeManifest('imcodes-node.exe', 'win32', 'x64', FAKE_WINDOWS_SIGNED_PE);
   await rm(join(exeDir, 'imcodes-node-macos'), { recursive: true, force: true });
   await mkdir(join(exeDir, 'imcodes-node-macos'));
   // Restore dev mode by default (overridden per-test when needed).
@@ -126,9 +156,101 @@ async function owner(userId: string): Promise<{ serverId: string; token: string 
   return { serverId, token };
 }
 
+function ticketHeaders(userId: string, auth: { serverId: string; token: string }): Record<string, string> {
+  return {
+    'content-type': 'application/json',
+    'X-Server-Id': auth.serverId,
+    authorization: `Bearer ${auth.token}`,
+    [EXPECTED_USER_ID_HEADER]: userId,
+  };
+}
+
 // ─────────────────────────── POST /v2/ticket ───────────────────────────
 
 describe('POST /api/enroll/v2/ticket (artifact manifest → enrollments_v2 row)', () => {
+  it('requires the caller identity expectation before creating a durable installer', async () => {
+    const app = buildApp();
+    const userId = `u_${hex(4)}`;
+    await createUser(db, userId);
+    const o = await owner(userId);
+
+    const missing = await app.request('/api/enroll/v2/ticket', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'X-Server-Id': o.serverId, authorization: `Bearer ${o.token}` },
+      body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
+    });
+    expect(missing.status).toBe(428);
+    expect(await missing.json()).toEqual({ error: AUTH_IDENTITY_ERRORS.EXPECTATION_REQUIRED });
+
+    const changed = await app.request('/api/enroll/v2/ticket', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'X-Server-Id': o.serverId,
+        authorization: `Bearer ${o.token}`,
+        [EXPECTED_USER_ID_HEADER]: 'different-user',
+      },
+      body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
+    });
+    expect(changed.status).toBe(409);
+    expect(await changed.json()).toEqual({ error: AUTH_IDENTITY_ERRORS.CHANGED });
+
+    const count = await db.queryOne<{ n: string }>('SELECT COUNT(*)::text AS n FROM controlled_node_enrollments_v2');
+    expect(count?.n).toBe('0');
+  });
+
+  it('records the daemon a login-screen enrolment was started from, and refuses another user\'s', async () => {
+    const app = buildApp();
+    const userId = `u_${hex(4)}`;
+    const otherUserId = `u_${hex(4)}`;
+    await createUser(db, userId);
+    await createUser(db, otherUserId);
+    const o = await owner(userId);
+    const stranger = await owner(otherUserId);
+
+    // The host link decides which entry a browser steers remote control to, so
+    // it must not be assignable to a machine this user does not own.
+    const forbidden = await app.request('/api/enroll/v2/ticket', {
+      method: 'POST',
+      headers: ticketHeaders(userId, o),
+      body: JSON.stringify({ version: 2, os: 'win', arch: 'x64', hostServerId: stranger.serverId }),
+    });
+    expect(forbidden.status).toBe(403);
+    expect(await forbidden.json()).toEqual({ error: 'invalid_host_server' });
+
+    const minted = await app.request('/api/enroll/v2/ticket', {
+      method: 'POST',
+      headers: ticketHeaders(userId, o),
+      body: JSON.stringify({ version: 2, os: 'win', arch: 'x64', hostServerId: o.serverId }),
+    });
+    expect(minted.status).toBe(200);
+    const { ticketId } = await minted.json() as { ticketId: string };
+    const stored = await db.queryOne<{ host_server_id: string | null }>(
+      'SELECT host_server_id FROM controlled_node_enrollments_v2 WHERE id = $1',
+      [ticketId],
+    );
+    expect(stored?.host_server_id).toBe(o.serverId);
+  });
+
+  it('leaves the host link unset for an ordinary enrolment', async () => {
+    const app = buildApp();
+    const userId = `u_${hex(4)}`;
+    await createUser(db, userId);
+    const o = await owner(userId);
+    const r = await app.request('/api/enroll/v2/ticket', {
+      method: 'POST',
+      headers: ticketHeaders(userId, o),
+      body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
+    });
+    expect(r.status).toBe(200);
+    const { ticketId } = await r.json() as { ticketId: string };
+    const stored = await db.queryOne<{ host_server_id: string | null }>(
+      'SELECT host_server_id FROM controlled_node_enrollments_v2 WHERE id = $1',
+      [ticketId],
+    );
+    expect(stored?.host_server_id).toBeNull();
+  });
+
   it('mints a ticket; stores encrypted code + artifact sha; returns raw ticket + meta', async () => {
     const app = buildApp();
     const userId = `u_${hex(4)}`;
@@ -137,11 +259,11 @@ describe('POST /api/enroll/v2/ticket (artifact manifest → enrollments_v2 row)'
 
     const r = await app.request('/api/enroll/v2/ticket', {
       method: 'POST',
-      headers: { 'content-type': 'application/json', 'X-Server-Id': o.serverId, authorization: `Bearer ${o.token}` },
+      headers: ticketHeaders(userId, o),
       body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
     });
     expect(r.status).toBe(200);
-    const body = await r.json() as { version: number; ticketId: string; ticket: string; os: string; arch: string; filename: string; sizeBytes: number; sha256: string; maxConsumes: number; expiresAt: number };
+    const body = await r.json() as { version: number; ticketId: string; ticket: string; os: string; arch: string; filename: string; sizeBytes: number; sha256: string; maxConsumes: number; expiresAt: number; ownerUserId: string };
     expect(body.version).toBe(2);
     expect(body.ticketId).toMatch(/^[0-9a-f-]{36}$/);
     expect(body.ticket).toMatch(/^[0-9a-f]{64}$/);
@@ -150,6 +272,7 @@ describe('POST /api/enroll/v2/ticket (artifact manifest → enrollments_v2 row)'
     expect(body.sizeBytes).toBe(FAKE_BINARY.length);
     expect(body.sha256).toMatch(/^[0-9a-f]{64}$/);
     expect(body.maxConsumes).toBe(3);
+    expect(body.ownerUserId).toBe(userId);
 
     // The DB row carries the same sha + a ticket_hash = sha256(ticket) + a
     // code_hash + the encrypted code. The raw ticket / raw code are never
@@ -185,13 +308,13 @@ describe('POST /api/enroll/v2/ticket (artifact manifest → enrollments_v2 row)'
     const o = await owner(userId);
 
     const r1 = await app.request('/api/enroll/v2/ticket', {
-      method: 'POST', headers: { 'content-type': 'application/json', 'X-Server-Id': o.serverId, authorization: `Bearer ${o.token}` },
+      method: 'POST', headers: ticketHeaders(userId, o),
       body: JSON.stringify({ os: 'linux', arch: 'x64' }),
     });
     expect(r1.status).toBe(400);
 
     const r2 = await app.request('/api/enroll/v2/ticket', {
-      method: 'POST', headers: { 'content-type': 'application/json', 'X-Server-Id': o.serverId, authorization: `Bearer ${o.token}` },
+      method: 'POST', headers: ticketHeaders(userId, o),
       body: JSON.stringify({ version: 2, os: 'linux' }),
     });
     expect(r2.status).toBe(400);
@@ -203,7 +326,7 @@ describe('POST /api/enroll/v2/ticket (artifact manifest → enrollments_v2 row)'
     await createUser(db, userId);
     const o = await owner(userId);
     const r = await app.request('/api/enroll/v2/ticket', {
-      method: 'POST', headers: { 'content-type': 'application/json', 'X-Server-Id': o.serverId, authorization: `Bearer ${o.token}` },
+      method: 'POST', headers: ticketHeaders(userId, o),
       body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
     });
     expect(r.status).toBe(200);
@@ -222,7 +345,7 @@ describe('POST /api/enroll/v2/ticket (artifact manifest → enrollments_v2 row)'
     await createUser(db, userId);
     const o = await owner(userId);
     const r = await app.request('/api/enroll/v2/ticket', {
-      method: 'POST', headers: { 'content-type': 'application/json', 'X-Server-Id': o.serverId, authorization: `Bearer ${o.token}` },
+      method: 'POST', headers: ticketHeaders(userId, o),
       body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
     });
     expect(r.status).toBe(503);
@@ -245,7 +368,7 @@ describe('POST /api/enroll/v2/ticket (artifact manifest → enrollments_v2 row)'
     await createUser(db, userId);
     const o = await owner(userId);
     const r = await app.request('/api/enroll/v2/ticket', {
-      method: 'POST', headers: { 'content-type': 'application/json', 'X-Server-Id': o.serverId, authorization: `Bearer ${o.token}` },
+      method: 'POST', headers: ticketHeaders(userId, o),
       body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
     });
     expect(r.status).toBe(503);
@@ -262,7 +385,7 @@ describe('POST /api/enroll/v2/ticket (artifact manifest → enrollments_v2 row)'
       await createUser(db, userId);
       const o = await owner(userId);
       const r = await app.request('/api/enroll/v2/ticket', {
-        method: 'POST', headers: { 'content-type': 'application/json', 'X-Server-Id': o.serverId, authorization: `Bearer ${o.token}` },
+        method: 'POST', headers: ticketHeaders(userId, o),
         body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
       });
       expect(r.status).toBe(503);
@@ -284,7 +407,7 @@ describe('POST /api/enroll/v2/ticket (artifact manifest → enrollments_v2 row)'
       await createUser(db, userId);
       const o = await owner(userId);
       const r = await app.request('/api/enroll/v2/ticket', {
-        method: 'POST', headers: { 'content-type': 'application/json', 'X-Server-Id': o.serverId, authorization: `Bearer ${o.token}` },
+        method: 'POST', headers: ticketHeaders(userId, o),
         body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
       });
       expect(r.status).toBe(503);
@@ -301,7 +424,7 @@ describe('POST /api/enroll/v2/ticket (artifact manifest → enrollments_v2 row)'
     await createUser(db, userId);
     const o = await owner(userId);
     const r = await app.request('/api/enroll/v2/ticket', {
-      method: 'POST', headers: { 'content-type': 'application/json', 'X-Server-Id': o.serverId, authorization: `Bearer ${o.token}` },
+      method: 'POST', headers: ticketHeaders(userId, o),
       body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
     });
     expect(r.status).toBe(503);
@@ -317,7 +440,7 @@ describe('POST /api/enroll/v2/ticket (artifact manifest → enrollments_v2 row)'
     delete process.env.IMCODES_NODE_EXE_DIR;
     try {
       const r = await app.request('/api/enroll/v2/ticket', {
-        method: 'POST', headers: { 'content-type': 'application/json', 'X-Server-Id': o.serverId, authorization: `Bearer ${o.token}` },
+        method: 'POST', headers: ticketHeaders(userId, o),
         body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
       });
       expect(r.status).toBe(503);
@@ -333,7 +456,7 @@ describe('POST /api/enroll/v2/ticket (artifact manifest → enrollments_v2 row)'
     await createUser(db, userId);
     const o = await owner(userId);
     const r = await app.request('/api/enroll/v2/ticket', {
-      method: 'POST', headers: { 'content-type': 'application/json', 'X-Server-Id': o.serverId, authorization: `Bearer ${o.token}` },
+      method: 'POST', headers: ticketHeaders(userId, o),
       body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
     });
     expect(r.status).toBe(403);
@@ -347,7 +470,7 @@ describe('POST /api/enroll/v2/ticket (artifact manifest → enrollments_v2 row)'
     const o = await owner(userId);
     const response = await app.request('https://request-host.example/api/enroll/v2/ticket', {
       method: 'POST',
-      headers: { 'content-type': 'application/json', 'X-Server-Id': o.serverId, authorization: `Bearer ${o.token}` },
+      headers: ticketHeaders(userId, o),
       body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
     });
     expect(response.status).toBe(403);
@@ -362,7 +485,7 @@ describe('POST /api/enroll/v2/ticket (artifact manifest → enrollments_v2 row)'
 
     const mint = await app.request('/api/enroll/v2/ticket', {
       method: 'POST',
-      headers: { 'content-type': 'application/json', 'X-Server-Id': o.serverId, authorization: `Bearer ${o.token}` },
+      headers: ticketHeaders(userId, o),
       body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
     });
     expect(mint.status).toBe(200);
@@ -381,6 +504,40 @@ describe('POST /api/enroll/v2/ticket (artifact manifest → enrollments_v2 row)'
 // ─────────────────────────── GET /v2/download ───────────────────────────
 
 describe('GET|POST /api/enroll/v2/download (ticket + streaming)', () => {
+  it('personalizes a signed Windows PE inside its certificate table and preserves reversible signed bytes', async () => {
+    const app = buildApp();
+    const userId = `u_${hex(4)}`;
+    await createUser(db, userId);
+    const o = await owner(userId);
+    const mint = await app.request('/api/enroll/v2/ticket', {
+      method: 'POST',
+      headers: ticketHeaders(userId, o),
+      body: JSON.stringify({ version: 2, os: 'win', arch: 'x64' }),
+    });
+    expect(mint.status).toBe(200);
+    const { ticket } = await mint.json() as { ticket: string };
+    const response = await app.request('/api/enroll/v2/download', {
+      headers: { authorization: `Bearer ${ticket}` },
+    });
+    expect(response.status).toBe(200);
+    const personalized = Buffer.from(await response.arrayBuffer());
+    expect(Number(response.headers.get('content-length'))).toBe(personalized.length);
+    const decoded = decodeEnrollmentTrailerWithRange(personalized);
+    expect(decoded?.blob.serverUrl).toBe('http://localhost');
+    const restore = inspectWindowsAuthenticodeEnrollmentContainer(
+      personalized.subarray(0, Math.min(personalized.length, 4096)),
+      personalized.length,
+      personalized,
+      0,
+      decoded!.trailerStart,
+      decoded!.trailerLength,
+    );
+    expect(restore).not.toBeNull();
+    const restored = Buffer.from(personalized.subarray(0, restore!.signedArtifactSize));
+    restored.writeUInt32LE(restore!.originalCertificateTableSize, restore!.sizeFieldOffset);
+    expect(restored).toEqual(FAKE_WINDOWS_SIGNED_PE);
+  });
+
   it('admits at most three concurrent streams, hashes once, and closes every pinned handle', async () => {
     const app = buildApp();
     const userId = `u_${hex(4)}`;
@@ -388,7 +545,7 @@ describe('GET|POST /api/enroll/v2/download (ticket + streaming)', () => {
     const o = await owner(userId);
     const mint = await app.request('/api/enroll/v2/ticket', {
       method: 'POST',
-      headers: { 'content-type': 'application/json', 'X-Server-Id': o.serverId, authorization: `Bearer ${o.token}` },
+      headers: ticketHeaders(userId, o),
       body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
     });
     const { ticket } = await mint.json() as { ticket: string };
@@ -423,7 +580,7 @@ describe('GET|POST /api/enroll/v2/download (ticket + streaming)', () => {
     const o = await owner(userId);
     const mint = await app.request('/api/enroll/v2/ticket', {
       method: 'POST',
-      headers: { 'content-type': 'application/json', 'X-Server-Id': o.serverId, authorization: `Bearer ${o.token}` },
+      headers: ticketHeaders(userId, o),
       body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
     });
     const { ticket } = await mint.json() as { ticket: string };
@@ -452,7 +609,7 @@ describe('GET|POST /api/enroll/v2/download (ticket + streaming)', () => {
     const o = await owner(userId);
     const mint = await app.request('/api/enroll/v2/ticket', {
       method: 'POST',
-      headers: { 'content-type': 'application/json', 'X-Server-Id': o.serverId, authorization: `Bearer ${o.token}` },
+      headers: ticketHeaders(userId, o),
       body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
     });
     const { ticket } = await mint.json() as { ticket: string };
@@ -494,7 +651,7 @@ describe('GET|POST /api/enroll/v2/download (ticket + streaming)', () => {
     const o = await owner(userId);
     const mint = await app.request('/api/enroll/v2/ticket', {
       method: 'POST',
-      headers: { 'content-type': 'application/json', 'X-Server-Id': o.serverId, authorization: `Bearer ${o.token}` },
+      headers: ticketHeaders(userId, o),
       body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
     });
     const { ticket } = await mint.json() as { ticket: string };
@@ -539,7 +696,7 @@ describe('GET|POST /api/enroll/v2/download (ticket + streaming)', () => {
     await createUser(db, userId);
     const o = await owner(userId);
     const mint = await app.request('/api/enroll/v2/ticket', {
-      method: 'POST', headers: { 'content-type': 'application/json', 'X-Server-Id': o.serverId, authorization: `Bearer ${o.token}` },
+      method: 'POST', headers: ticketHeaders(userId, o),
       body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
     });
     const { ticket } = await mint.json() as { ticket: string };
@@ -577,7 +734,7 @@ describe('GET|POST /api/enroll/v2/download (ticket + streaming)', () => {
     await createUser(db, userId);
     const o = await owner(userId);
     const mint = await app.request('/api/enroll/v2/ticket', {
-      method: 'POST', headers: { 'content-type': 'application/json', 'X-Server-Id': o.serverId, authorization: `Bearer ${o.token}` },
+      method: 'POST', headers: ticketHeaders(userId, o),
       body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
     });
     const { ticket } = await mint.json() as { ticket: string };
@@ -596,7 +753,7 @@ describe('GET|POST /api/enroll/v2/download (ticket + streaming)', () => {
     await createUser(db, userId);
     const o = await owner(userId);
     const mint = await app.request('/api/enroll/v2/ticket', {
-      method: 'POST', headers: { 'content-type': 'application/json', 'X-Server-Id': o.serverId, authorization: `Bearer ${o.token}` },
+      method: 'POST', headers: ticketHeaders(userId, o),
       body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
     });
     const { ticket } = await mint.json() as { ticket: string };
@@ -631,7 +788,7 @@ describe('GET|POST /api/enroll/v2/download (ticket + streaming)', () => {
     await createUser(db, userId);
     const o = await owner(userId);
     const mint = await app.request('/api/enroll/v2/ticket', {
-      method: 'POST', headers: { 'content-type': 'application/json', 'X-Server-Id': o.serverId, authorization: `Bearer ${o.token}` },
+      method: 'POST', headers: ticketHeaders(userId, o),
       body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
     });
     const { ticket } = await mint.json() as { ticket: string };
@@ -646,7 +803,7 @@ describe('GET|POST /api/enroll/v2/download (ticket + streaming)', () => {
     await createUser(db, userId);
     const o = await owner(userId);
     const mint = await app.request('/api/enroll/v2/ticket', {
-      method: 'POST', headers: { 'content-type': 'application/json', 'X-Server-Id': o.serverId, authorization: `Bearer ${o.token}` },
+      method: 'POST', headers: ticketHeaders(userId, o),
       body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
     });
     const { ticket } = await mint.json() as { ticket: string };
@@ -665,7 +822,7 @@ describe('GET|POST /api/enroll/v2/download (ticket + streaming)', () => {
     const o = await owner(userId);
     const mint = await app.request('/api/enroll/v2/ticket', {
       method: 'POST',
-      headers: { 'content-type': 'application/json', 'X-Server-Id': o.serverId, authorization: `Bearer ${o.token}` },
+      headers: ticketHeaders(userId, o),
       body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
     });
     const { ticket } = await mint.json() as { ticket: string };
@@ -695,7 +852,7 @@ describe('GET|POST /api/enroll/v2/download (ticket + streaming)', () => {
     const o = await owner(userId);
     const mint = await app.request('https://mint-host.invalid/api/enroll/v2/ticket', {
       method: 'POST',
-      headers: { 'content-type': 'application/json', 'X-Server-Id': o.serverId, authorization: `Bearer ${o.token}` },
+      headers: ticketHeaders(userId, o),
       body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
     });
     expect(mint.status).toBe(200);
@@ -719,7 +876,7 @@ describe('GET|POST /api/enroll/v2/download (ticket + streaming)', () => {
     await createUser(db, userId);
     const o = await owner(userId);
     const mint = await app.request('/api/enroll/v2/ticket', {
-      method: 'POST', headers: { 'content-type': 'application/json', 'X-Server-Id': o.serverId, authorization: `Bearer ${o.token}` },
+      method: 'POST', headers: ticketHeaders(userId, o),
       body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
     });
     const { ticket } = await mint.json() as { ticket: string };
@@ -762,7 +919,7 @@ describe('POST /api/enroll/v2/redeem (atomic claim + idempotent + mismatch → 4
     await createUser(db, userId);
     const o = await owner(userId);
     const mint = await app.request('/api/enroll/v2/ticket', {
-      method: 'POST', headers: { 'content-type': 'application/json', 'X-Server-Id': o.serverId, authorization: `Bearer ${o.token}` },
+      method: 'POST', headers: ticketHeaders(userId, o),
       body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
     });
     const { ticket: _t } = await mint.json() as { ticket: string };
@@ -817,7 +974,7 @@ describe('POST /api/enroll/v2/redeem (atomic claim + idempotent + mismatch → 4
     await createUser(db, userId);
     const o = await owner(userId);
     const mint = await app.request('/api/enroll/v2/ticket', {
-      method: 'POST', headers: { 'content-type': 'application/json', 'X-Server-Id': o.serverId, authorization: `Bearer ${o.token}` },
+      method: 'POST', headers: ticketHeaders(userId, o),
       body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
     });
     const { decryptBotConfig } = await import('../src/security/crypto.js');
@@ -857,7 +1014,7 @@ describe('POST /api/enroll/v2/redeem (atomic claim + idempotent + mismatch → 4
     await createUser(db, userId);
     const o = await owner(userId);
     await app.request('/api/enroll/v2/ticket', {
-      method: 'POST', headers: { 'content-type': 'application/json', 'X-Server-Id': o.serverId, authorization: `Bearer ${o.token}` },
+      method: 'POST', headers: ticketHeaders(userId, o),
       body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
     });
     const { decryptBotConfig } = await import('../src/security/crypto.js');
@@ -891,7 +1048,7 @@ describe('POST /api/enroll/v2/redeem (atomic claim + idempotent + mismatch → 4
     await createUser(db, userId);
     const o = await owner(userId);
     await app.request('/api/enroll/v2/ticket', {
-      method: 'POST', headers: { 'content-type': 'application/json', 'X-Server-Id': o.serverId, authorization: `Bearer ${o.token}` },
+      method: 'POST', headers: ticketHeaders(userId, o),
       body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
     });
     const { decryptBotConfig } = await import('../src/security/crypto.js');
@@ -920,7 +1077,7 @@ describe('POST /api/enroll/v2/redeem (atomic claim + idempotent + mismatch → 4
     await createUser(db, userId);
     const o = await owner(userId);
     await app.request('/api/enroll/v2/ticket', {
-      method: 'POST', headers: { 'content-type': 'application/json', 'X-Server-Id': o.serverId, authorization: `Bearer ${o.token}` },
+      method: 'POST', headers: ticketHeaders(userId, o),
       body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
     });
     const { decryptBotConfig } = await import('../src/security/crypto.js');
@@ -959,7 +1116,7 @@ describe('POST /api/enroll/v2/redeem (atomic claim + idempotent + mismatch → 4
     await createUser(db, userId);
     const o = await owner(userId);
     await app.request('/api/enroll/v2/ticket', {
-      method: 'POST', headers: { 'content-type': 'application/json', 'X-Server-Id': o.serverId, authorization: `Bearer ${o.token}` },
+      method: 'POST', headers: ticketHeaders(userId, o),
       body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
     });
     const { decryptBotConfig } = await import('../src/security/crypto.js');
@@ -985,7 +1142,7 @@ describe('POST /api/enroll/v2/redeem (atomic claim + idempotent + mismatch → 4
     await createUser(db, userId);
     const o = await owner(userId);
     await app.request('/api/enroll/v2/ticket', {
-      method: 'POST', headers: { 'content-type': 'application/json', 'X-Server-Id': o.serverId, authorization: `Bearer ${o.token}` },
+      method: 'POST', headers: ticketHeaders(userId, o),
       body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
     });
     const { decryptBotConfig } = await import('../src/security/crypto.js');
@@ -1021,7 +1178,7 @@ describe('POST /api/enroll/v2/redeem (atomic claim + idempotent + mismatch → 4
     await createUser(db, userId);
     const o = await owner(userId);
     await app.request('/api/enroll/v2/ticket', {
-      method: 'POST', headers: { 'content-type': 'application/json', 'X-Server-Id': o.serverId, authorization: `Bearer ${o.token}` },
+      method: 'POST', headers: ticketHeaders(userId, o),
       body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
     });
     const { decryptBotConfig } = await import('../src/security/crypto.js');
@@ -1055,7 +1212,7 @@ describe('POST /api/enroll/v2/redeem (atomic claim + idempotent + mismatch → 4
     await createUser(db, userId);
     const o = await owner(userId);
     await app.request('/api/enroll/v2/ticket', {
-      method: 'POST', headers: { 'content-type': 'application/json', 'X-Server-Id': o.serverId, authorization: `Bearer ${o.token}` },
+      method: 'POST', headers: ticketHeaders(userId, o),
       body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
     });
     const { decryptBotConfig } = await import('../src/security/crypto.js');
@@ -1097,7 +1254,7 @@ describe('POST /api/enroll/v2/redeem (atomic claim + idempotent + mismatch → 4
     await createUser(db, userId);
     const o = await owner(userId);
     await app.request('/api/enroll/v2/ticket', {
-      method: 'POST', headers: { 'content-type': 'application/json', 'X-Server-Id': o.serverId, authorization: `Bearer ${o.token}` },
+      method: 'POST', headers: ticketHeaders(userId, o),
       body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
     });
     const { decryptBotConfig } = await import('../src/security/crypto.js');
@@ -1163,7 +1320,7 @@ describe('GET /api/enroll/v2/availability + retention', () => {
     const userId = `u_${hex(4)}`;
     await createUser(db, userId);
     const o = await owner(userId);
-    const headers = { 'X-Server-Id': o.serverId, authorization: `Bearer ${o.token}` };
+    const headers = { 'X-Server-Id': o.serverId, authorization: `Bearer ${o.token}`, [EXPECTED_USER_ID_HEADER]: userId };
 
     const [firstResponse, secondResponse] = await Promise.all([
       firstApp.request('/api/enroll/v2/availability', { headers }),
@@ -1181,7 +1338,7 @@ describe('GET /api/enroll/v2/availability + retention', () => {
     const userId = `u_${hex(4)}`;
     await createUser(db, userId);
     const o = await owner(userId);
-    const headers = { 'X-Server-Id': o.serverId, authorization: `Bearer ${o.token}` };
+    const headers = { 'X-Server-Id': o.serverId, authorization: `Bearer ${o.token}`, [EXPECTED_USER_ID_HEADER]: userId };
     const responses = await Promise.all(Array.from({ length: 20 }, () => (
       app.request('/api/enroll/v2/availability', { headers })
     )));
@@ -1211,7 +1368,7 @@ describe('GET /api/enroll/v2/availability + retention', () => {
     const userId = `u_${hex(4)}`;
     await createUser(db, userId);
     const o = await owner(userId);
-    const headers = { 'X-Server-Id': o.serverId, authorization: `Bearer ${o.token}` };
+    const headers = { 'X-Server-Id': o.serverId, authorization: `Bearer ${o.token}`, [EXPECTED_USER_ID_HEADER]: userId };
     const available = await app.request('/api/enroll/v2/availability', { headers });
     const catalog = await available.json() as { artifacts: Array<{ os: string; arch: string }> };
     expect(catalog.artifacts).toContainEqual(expect.objectContaining({ os: 'mac', arch: 'universal' }));
@@ -1324,7 +1481,7 @@ describe('GET /api/enroll/v2/availability + retention', () => {
     await createUser(db, userId);
     const o = await owner(userId);
     await app.request('/api/enroll/v2/ticket', {
-      method: 'POST', headers: { 'content-type': 'application/json', 'X-Server-Id': o.serverId, authorization: `Bearer ${o.token}` },
+      method: 'POST', headers: ticketHeaders(userId, o),
       body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
     });
     const { decryptBotConfig } = await import('../src/security/crypto.js');
@@ -1413,9 +1570,11 @@ describe('GET /api/enroll/v2/node-artifact (controlled-node self-upgrade)', () =
       headers: { authorization: `Bearer ${token}` },
     });
     expect(response.status).toBe(200);
-    expect(response.headers.get('x-imcodes-node-artifact-sha256')).toBe(sha256(FAKE_BINARY));
+    expect(response.headers.get('x-imcodes-node-artifact-sha256')).toBe(sha256(FAKE_WINDOWS_SIGNED_PE));
     expect(response.headers.get('x-imcodes-node-artifact-version')).toBe('2026.7.1234-dev.5');
-    expect(Buffer.from(await response.arrayBuffer())).toEqual(FAKE_BINARY);
+    expect(response.headers.get(CONTROLLED_NODE_ARTIFACT_HEADERS.AUTHENTICODE_SIGNER_SHA256))
+      .toBe('c'.repeat(64));
+    expect(Buffer.from(await response.arrayBuffer())).toEqual(FAKE_WINDOWS_SIGNED_PE);
 
     const helperBytes = Buffer.from('FAKE_OPEN_COMPUTER_USE_HELPER');
     await mkdir(join(exeDir, 'computer-use-helper', 'win32-x64'), { recursive: true });
@@ -1427,6 +1586,95 @@ describe('GET /api/enroll/v2/node-artifact (controlled-node self-upgrade)', () =
     expect(helperResponse.headers.get('x-imcodes-node-artifact-filename')).toBe('open-computer-use.exe');
     expect(helperResponse.headers.get('x-imcodes-node-artifact-sha256')).toBe(sha256(helperBytes));
     expect(Buffer.from(await helperResponse.arrayBuffer())).toEqual(helperBytes);
+
+    const workerBytes = Buffer.from('FAKE_PINNED_LIBWEBRTC_WORKER');
+    const virtualDisplayBytes = Buffer.from('SIGNED_VIRTUAL_DISPLAY_ARCHIVE');
+    const workerDir = join(exeDir, 'remote-desktop-worker', 'win32-x64');
+    await mkdir(workerDir, { recursive: true });
+    await writeFile(join(workerDir, REMOTE_DESKTOP_WORKER_FILENAME), workerBytes);
+    const workerManifest = {
+      manifestVersion: 2,
+      workerVersion: '0.1.2',
+      protocolVersion: 2,
+      ipcVersion: 1,
+      os: 'win32',
+      arch: 'x64',
+      fileName: REMOTE_DESKTOP_WORKER_FILENAME,
+      size: workerBytes.length,
+      sha256: sha256(workerBytes),
+      authenticodeSignerSha256: 'c'.repeat(64),
+      libwebrtcRevision: WINDOWS_REMOTE_DESKTOP_QUALIFICATION_PLAN.mediaStackDecision.libwebrtcRevision,
+      virtualDisplay: {
+        archiveFileName: 'imcodes-virtual-display.zip',
+        packageManifestFileName: 'imcodes-virtual-display.manifest.json',
+        size: virtualDisplayBytes.length,
+        sha256: sha256(virtualDisplayBytes),
+      },
+      toolchain: {
+        msvc: '14.44',
+        windowsSdk: '10.0.26100.0',
+        cmake: 'not-used-gn',
+        ninja: '1.13.1',
+        depotTools: WINDOWS_REMOTE_DESKTOP_QUALIFICATION_PLAN.mediaStackDecision.depotToolsRevision,
+      },
+    };
+    const workerManifestBytes = Buffer.from(JSON.stringify(workerManifest));
+    await writeFile(
+      join(workerDir, `${REMOTE_DESKTOP_WORKER_FILENAME}${REMOTE_DESKTOP_WORKER_MANIFEST_SUFFIX}`),
+      workerManifestBytes,
+    );
+    await writeFile(join(workerDir, 'imcodes-virtual-display.zip'), virtualDisplayBytes);
+    const workerResponse = await app.request(`/api/enroll/v2/node-artifact?serverId=${serverId}&os=win&arch=x64&asset=remote-desktop-worker`, {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(workerResponse.status).toBe(200);
+    expect(workerResponse.headers.get('x-imcodes-node-artifact-filename')).toBe(REMOTE_DESKTOP_WORKER_FILENAME);
+    expect(workerResponse.headers.get('x-imcodes-node-artifact-sha256')).toBe(sha256(workerBytes));
+    expect(Buffer.from(await workerResponse.arrayBuffer())).toEqual(workerBytes);
+    const workerManifestResponse = await app.request(`/api/enroll/v2/node-artifact?serverId=${serverId}&os=win&arch=x64&asset=remote-desktop-worker-manifest`, {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(workerManifestResponse.status).toBe(200);
+    expect(workerManifestResponse.headers.get('x-imcodes-node-artifact-filename')).toBe(`${REMOTE_DESKTOP_WORKER_FILENAME}${REMOTE_DESKTOP_WORKER_MANIFEST_SUFFIX}`);
+    const legacyManifestBytes = Buffer.from(await workerManifestResponse.arrayBuffer());
+    expect(JSON.parse(legacyManifestBytes.toString('utf8'))).toEqual({
+      ...workerManifest,
+      protocolVersion: REMOTE_DESKTOP_LEGACY_UPGRADE_PROTOCOL_VERSION,
+    });
+    expect(workerManifestResponse.headers.get('x-imcodes-node-artifact-sha256'))
+      .toBe(sha256(legacyManifestBytes));
+
+    const currentWorkerManifestResponse = await app.request(`/api/enroll/v2/node-artifact?serverId=${serverId}&os=win&arch=x64&asset=remote-desktop-worker-manifest`, {
+      headers: {
+        authorization: `Bearer ${token}`,
+        [CONTROLLED_NODE_ARTIFACT_HEADERS.REMOTE_DESKTOP_PROTOCOL_VERSION]: '2',
+      },
+    });
+    expect(currentWorkerManifestResponse.status).toBe(200);
+    expect(currentWorkerManifestResponse.headers.get('vary'))
+      .toBe(CONTROLLED_NODE_ARTIFACT_HEADERS.REMOTE_DESKTOP_PROTOCOL_VERSION);
+    expect(Buffer.from(await currentWorkerManifestResponse.arrayBuffer())).toEqual(workerManifestBytes);
+    const duplicatedCurrentProtocolResponse = await app.request(`/api/enroll/v2/node-artifact?serverId=${serverId}&os=win&arch=x64&asset=remote-desktop-worker-manifest`, {
+      headers: {
+        authorization: `Bearer ${token}`,
+        [CONTROLLED_NODE_ARTIFACT_HEADERS.REMOTE_DESKTOP_PROTOCOL_VERSION]: '2, 2',
+      },
+    });
+    expect(duplicatedCurrentProtocolResponse.status).toBe(200);
+    expect(Buffer.from(await duplicatedCurrentProtocolResponse.arrayBuffer())).toEqual(workerManifestBytes);
+    const unsupportedWorkerManifestResponse = await app.request(`/api/enroll/v2/node-artifact?serverId=${serverId}&os=win&arch=x64&asset=remote-desktop-worker-manifest`, {
+      headers: {
+        authorization: `Bearer ${token}`,
+        [CONTROLLED_NODE_ARTIFACT_HEADERS.REMOTE_DESKTOP_PROTOCOL_VERSION]: '99',
+      },
+    });
+    expect(unsupportedWorkerManifestResponse.status).toBe(409);
+    const virtualDisplayResponse = await app.request(`/api/enroll/v2/node-artifact?serverId=${serverId}&os=win&arch=x64&asset=remote-desktop-virtual-display`, {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(virtualDisplayResponse.status).toBe(200);
+    expect(virtualDisplayResponse.headers.get('x-imcodes-node-artifact-filename')).toBe('imcodes-virtual-display.zip');
+    expect(Buffer.from(await virtualDisplayResponse.arrayBuffer())).toEqual(virtualDisplayBytes);
 
     const macToken = hex(16);
     const macServerId = hex(8);
@@ -1458,15 +1706,27 @@ describe('GET /api/enroll/v2/node-artifact (controlled-node self-upgrade)', () =
     expect(Buffer.from(await legacyMacHelperResponse.arrayBuffer())).toEqual(macArchiveBytes);
   });
 
-  it('rejects full daemon tokens and platform mismatches', async () => {
+  it('admits full daemon tokens for the remote-desktop bundle and the runtime that hosts it', async () => {
     const app = buildApp();
     const userId = `u_${hex(4)}`;
     await createUser(db, userId);
     const full = await owner(userId);
+    // The runtime carries the elevated remote-desktop helper, which cannot be
+    // executed out of the daemon's user-writable npm directory.
     const fullResponse = await app.request(`/api/enroll/v2/node-artifact?serverId=${full.serverId}&os=win&arch=x64`, {
       headers: { authorization: `Bearer ${full.token}` },
     });
-    expect(fullResponse.status).toBe(403);
+    expect(fullResponse.status).not.toBe(403);
+
+    // The worker bundle is the one artifact family a normal daemon may fetch:
+    // on Windows it serves remote control with the same native worker. Only the
+    // role gate is asserted here — whether the artifact is built on this host is
+    // a separate concern, so anything but `forbidden` proves the gate opened.
+    const workerResponse = await app.request(
+      `/api/enroll/v2/node-artifact?serverId=${full.serverId}&os=win&arch=x64&asset=remote-desktop-worker`,
+      { headers: { authorization: `Bearer ${full.token}` } },
+    );
+    expect(workerResponse.status).not.toBe(403);
 
     const token = hex(16);
     const serverId = hex(8);

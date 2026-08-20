@@ -5,7 +5,7 @@ import { RUNTIME_TYPES } from './session-runtime.js';
 import type { AgentStatus } from './detect.js';
 import type { AgentMessage, MessageDelta } from '../../shared/agent-message.js';
 import type { TransportProvider, ProviderDelegationNotification, ProviderError, ProviderRolloutCompletionReconcileOptions, SessionConfig, SessionInfoUpdate, ProviderStatusUpdate, ProviderUsageUpdate, ToolCallEvent, SdkTurnLostRecoveryPhase, SdkTurnLostReplayDecision } from './transport-provider.js';
-import { BACKGROUND_SUBAGENT_WAKE_MODES, PROVIDER_CANCEL_ORIGINS, PROVIDER_ERROR_CODES, SDK_TURN_LOST_RECOVERY_PHASES, SDK_TURN_LOST_RECOVERY_STATUS } from './transport-provider.js';
+import { BACKGROUND_SUBAGENT_WAKE_MODES, PROVIDER_ACTIVE_TURN_DELIVERY_KINDS, PROVIDER_CANCEL_ORIGINS, PROVIDER_ERROR_CODES, SDK_TURN_LOST_RECOVERY_PHASES, SDK_TURN_LOST_RECOVERY_STATUS } from './transport-provider.js';
 import type { ApprovalRequest } from './transport-provider.js';
 import type { TransportEffortLevel } from '../../shared/effort-levels.js';
 import {
@@ -91,6 +91,7 @@ import logger from '../util/logger.js';
 import { incrementCounter } from '../util/metrics.js';
 import type { SharedActorEnvelope } from '../../shared/tab-sharing.js';
 import { getTransportQueueStore } from '../daemon/transport-queue-store.js';
+import type { QueueDeliveryFact, QueueSnapshot } from '../../shared/transport-queue-types.js';
 import type { PeerAuditCompletedTurnEvidence } from '../../shared/peer-audit.js';
 import {
   AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES,
@@ -135,6 +136,15 @@ export interface PendingTransportMessage {
     delegationId: string;
   };
 }
+
+export type AppendQueuedMessagesResult =
+  | {
+      status: 'delivered';
+      entries: PendingTransportMessage[];
+      queueSnapshot: QueueSnapshot;
+      deliveryFacts: QueueDeliveryFact[];
+    }
+  | { status: 'stale' | 'unsupported' | 'not_found' | 'attachments_unsupported' | 'control_unsupported' };
 
 type SdkTurnLostRecoveryAttemptStatus =
   | 'detected'
@@ -234,6 +244,7 @@ export interface TransportRuntimeDiagnosticSnapshot {
 
 const DEFAULT_TRANSPORT_CONTEXT_BUDGET_MS = 2_500;
 const DEFAULT_TRANSPORT_PROVIDER_SEND_TIMEOUT_MS = 60_000;
+const DEFAULT_ACTIVE_DELEGATION_NOTIFICATION_TIMEOUT_MS = 10_000;
 const DEFAULT_TRANSPORT_STALE_PENDING_RECOVERY_MS = 300_000;
 const DEFAULT_TRANSPORT_STALE_PENDING_CANCEL_FALLBACK_MS = 5_000;
 const MIN_TRANSPORT_CONTEXT_BUDGET_MS = 50;
@@ -892,6 +903,20 @@ export class TransportSessionRuntime implements SessionRuntime {
     if (this._providerSessionId) {
       this.provider.setSessionEffort?.(this._providerSessionId, effort);
     }
+  }
+
+  /**
+   * Switches this session's provider service tier -- Codex's "Fast" being the
+   * one that spends plan usage faster. Rejects rather than pretending when the
+   * provider has no tier or the session has not been created yet, so a viewer's
+   * "turn it off" never reports success it cannot deliver.
+   */
+  async setServiceTier(tier: string): Promise<void> {
+    if (!this.provider.capabilities.serviceTier || !this.provider.setServiceTier) {
+      throw new Error('service_tier_unsupported');
+    }
+    if (!this._providerSessionId) throw new Error('service_tier_no_session');
+    await this.provider.setServiceTier(this._providerSessionId, tier);
   }
 
   get providerSessionId(): string | null { return this._providerSessionId; }
@@ -1909,7 +1934,26 @@ export class TransportSessionRuntime implements SessionRuntime {
         || !this.provider.notifyActiveDelegation) {
         return AGENT_DELEGATION_NOTIFICATION_RESULTS.UNSUPPORTED;
       }
-      const result = await this.provider.notifyActiveDelegation(this._providerSessionId, notification);
+      const outcome = await withTimeoutOutcome(
+        this.provider.notifyActiveDelegation(this._providerSessionId, {
+          ...notification,
+          deliveryKind: PROVIDER_ACTIVE_TURN_DELIVERY_KINDS.DELEGATION_REPLY,
+        }),
+        DEFAULT_ACTIVE_DELEGATION_NOTIFICATION_TIMEOUT_MS,
+      );
+      // Admission must be a short control-plane operation. A provider adapter
+      // that never settles used to pin the delegation_reply MCP call forever;
+      // report stale so the durable delegation outbox retries the SAME
+      // notification id instead of requiring the user to Stop the session.
+      if (outcome.timedOut) {
+        logger.warn({
+          providerSessionId: this._providerSessionId,
+          notificationId: notification.notificationId,
+          timeoutMs: DEFAULT_ACTIVE_DELEGATION_NOTIFICATION_TIMEOUT_MS,
+        }, 'active delegation notification admission timed out; scheduling durable retry');
+        return AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE;
+      }
+      const result = outcome.value;
       if (result !== AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE || this.hasActiveTurnWork()) {
         return result;
       }
@@ -1933,6 +1977,171 @@ export class TransportSessionRuntime implements SessionRuntime {
     // the ordinary user FIFO.
     this.removePendingMessage(notification.notificationId);
     return AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE;
+  }
+
+  /**
+   * Insert selected ordinary queued messages at the provider's next safe
+   * in-turn boundary. Providers receive an explicit queued-message delivery
+   * kind so they never mistake this user action for a preemptive delegation
+   * reply. Queue ids and tombstones remain retained for exactly-once UI
+   * reconciliation. Unsupported providers fail closed and keep the FIFO.
+   */
+  async appendPendingMessagesToActiveTurn(
+    clientMessageIds: string[],
+    notificationId: string,
+  ): Promise<AppendQueuedMessagesResult> {
+    const ids = [...new Set(clientMessageIds.map((id) => id.trim()).filter(Boolean))];
+    if (ids.length === 0 || !this._providerSessionId) return { status: 'not_found' };
+    if (!this.hasActiveTurnWork()) return { status: 'stale' };
+    if (this.provider.capabilities.activeDelegationNotification
+        !== AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE
+      || !this.provider.notifyActiveDelegation) {
+      return { status: 'unsupported' };
+    }
+
+    const idSet = new Set(ids);
+    const originalQueue = [...this._pendingMessages];
+    const selected = originalQueue.filter((entry) => idSet.has(entry.clientMessageId));
+    if (selected.length !== ids.length) return { status: 'not_found' };
+    if (selected.some((entry) => (entry.attachments?.length ?? 0) > 0)) {
+      return { status: 'attachments_unsupported' };
+    }
+    if (selected.some((entry) => entry.text.trim().startsWith('/'))) {
+      return { status: 'control_unsupported' };
+    }
+
+    const store = getTransportQueueStore();
+    const handoffs = store.markHandoffInFlight(this.sessionKey, selected.map((entry) => entry.clientMessageId));
+    if (handoffs.length !== selected.length) {
+      const handoffId = handoffs[0]?.handoffId;
+      if (handoffId) store.releaseHandoff(this.sessionKey, handoffId, handoffs.map((entry) => entry.entry.clientMessageId));
+      return { status: 'not_found' };
+    }
+    const handoffId = handoffs[0]!.handoffId;
+    const reservedVersion = this._pendingVersion + 1;
+    this._pendingMessages = originalQueue.filter((entry) => !idSet.has(entry.clientMessageId));
+    this._pendingVersion = reservedVersion;
+
+    const restoreReservation = (): void => {
+      if (this._pendingVersion === reservedVersion) {
+        this._pendingMessages = originalQueue;
+      } else {
+        const originalIds = new Set(originalQueue.map((entry) => entry.clientMessageId));
+        const entriesAddedWhileAwaitingAdmission = this._pendingMessages.filter(
+          (entry) => !originalIds.has(entry.clientMessageId),
+        );
+        // Restore the exact pre-admission FIFO, then retain any messages that
+        // arrived while the provider admission call was in flight. Prepending
+        // only the selected rows would reorder a failed partial append.
+        this._pendingMessages = [...originalQueue, ...entriesAddedWhileAwaitingAdmission];
+      }
+      try {
+        const snapshot = store.releaseHandoff(
+          this.sessionKey,
+          handoffId,
+          selected.map((entry) => entry.clientMessageId),
+        );
+        this._pendingVersion = Math.max(this._pendingVersion + 1, snapshot.pendingMessageVersion);
+      } catch (error) {
+        this._pendingVersion++;
+        logger.warn({ error, sessionKey: this.sessionKey, handoffId }, 'active-turn queue append handoff release failed');
+      }
+    };
+
+    let admission: AgentDelegationNotificationResult;
+    try {
+      admission = await this.provider.notifyActiveDelegation(this._providerSessionId, {
+        notificationId,
+        delegationId: `queue-append:${notificationId}`,
+        sourceSessionName: this.sessionKey,
+        text: selected.map((entry) => entry.providerText ?? entry.text).join('\n\n'),
+        deliveryKind: PROVIDER_ACTIVE_TURN_DELIVERY_KINDS.QUEUED_MESSAGE,
+      });
+    } catch (error) {
+      restoreReservation();
+      throw error;
+    }
+    if (admission !== AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED) {
+      restoreReservation();
+      return {
+        status: admission === AGENT_DELEGATION_NOTIFICATION_RESULTS.UNSUPPORTED ? 'unsupported' : 'stale',
+      };
+    }
+
+    const historyEntries = selected.filter((entry) => !entry.historyCommitted);
+    if (historyEntries.length > 0) {
+      this._history.push({
+        id: randomUUID(),
+        sessionId: this._providerSessionId,
+        kind: 'text',
+        role: 'user',
+        content: historyEntries.map((entry) => entry.providerText ?? entry.text).join('\n\n'),
+        timestamp: Date.now(),
+        status: 'complete',
+      });
+      for (const entry of historyEntries) entry.historyCommitted = true;
+    }
+
+    const selectedIds = selected.map((entry) => entry.clientMessageId);
+    let finalized: { snapshot: QueueSnapshot; deliveryFacts: QueueDeliveryFact[] };
+    try {
+      finalized = store.finalizeSentBatch(this.sessionKey, selectedIds, notificationId);
+    } catch (firstError) {
+      try {
+        // The transaction is idempotent (replace tombstone + delete by id), so
+        // one bounded retry safely repairs transient SQLite failures and the
+        // ambiguous "commit succeeded, snapshot read failed" case.
+        finalized = store.finalizeSentBatch(this.sessionKey, selectedIds, notificationId);
+      } catch (error) {
+        // Provider admission is irreversible. Once the provider accepts the
+        // text, a bookkeeping failure must not be reported as delivery
+        // failure: doing so makes the browser restore and resend work the model
+        // already received. Reconcile the public queue from runtime truth and
+        // emit delivery facts so every viewer settles the selected ids. The
+        // handoff rows deliberately remain non-replayable in SQLite; a later
+        // repair can finalize them without risking duplicate provider execution.
+        logger.warn(
+          { error, firstError, sessionKey: this.sessionKey, clientMessageIds: selectedIds, notificationId },
+          'transport queue sqlite finalizeSentBatch failed after active-turn append was accepted',
+        );
+        const selectedIdSet = new Set(selectedIds);
+        const persisted = store.readSnapshotSafely(this.sessionKey, 'active_turn_append_finalize_failed');
+        const pendingMessageVersion = Math.max(this._pendingVersion + 1, persisted.pendingMessageVersion);
+        const snapshot: QueueSnapshot = {
+          ...persisted,
+          pendingMessageVersion,
+          pendingMessageEntries: persisted.pendingMessageEntries.filter(
+            (entry) => !selectedIdSet.has(entry.clientMessageId),
+          ),
+          failedMessageEntries: persisted.failedMessageEntries.filter(
+            (entry) => !selectedIdSet.has(entry.clientMessageId),
+          ),
+          source: 'active_turn_append_finalize_failed',
+          degraded: true,
+          degradedReason: 'sqlite_finalize_failed_after_provider_delivery',
+        };
+        finalized = {
+          snapshot,
+          deliveryFacts: selectedIds.map((clientMessageId): QueueDeliveryFact => ({
+            type: 'transport.queue.delivery',
+            sessionName: this.sessionKey,
+            clientMessageId,
+            queueEpoch: snapshot.queueEpoch,
+            queueAuthorityId: snapshot.queueAuthorityId,
+            pendingMessageVersion,
+            deliveryFrameId: notificationId,
+            deliveryFrameVersion: pendingMessageVersion,
+          })),
+        };
+      }
+    }
+    this._pendingVersion = Math.max(this._pendingVersion + 1, finalized.snapshot.pendingMessageVersion);
+    return {
+      status: 'delivered',
+      entries: selected.map((entry) => ({ ...entry })),
+      queueSnapshot: finalized.snapshot,
+      deliveryFacts: finalized.deliveryFacts,
+    };
   }
 
   /**

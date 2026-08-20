@@ -132,6 +132,7 @@ vi.mock('react-i18next', () => ({
         return 'Paste is too large for inline input here. Upload it as a file instead.';
       }
       if (key === 'session.stop_plain') return 'Stop';
+      if (key === 'session.stop_appended_queue') return 'Queued messages appended; the session is still running.';
       if (key === 'session.restart_plain') return 'Restart';
       if (key === 'session.start_fresh') return 'Start fresh';
       if (key === 'session.pin_plain') return 'Pin';
@@ -181,11 +182,13 @@ vi.mock('../../src/components/VoiceInput.js', () => ({
 }));
 
 vi.mock('../../src/components/AtPicker.js', () => ({
-  AtPicker: ({ visible, onSelectAllConfig, onSelectAgent, onSelectDelegateAgent, p2pConfig, sessions, rootSession }: {
+  AtPicker: ({ visible, query, onSelectAllConfig, onSelectAgent, onSelectDelegateAgent, onSelectMachine, p2pConfig, sessions, rootSession }: {
     visible: boolean;
+    query?: string;
     onSelectAllConfig?: (config: unknown, rounds: number, modeOverride: string) => void;
     onSelectAgent?: (session: string, mode: string) => void;
     onSelectDelegateAgent?: (session: string) => void;
+    onSelectMachine?: (refName: string, displayName: string) => void;
     p2pConfig?: { rounds?: number } | null;
     sessions?: Array<{ name: string; label?: string | null; parentSession?: string | null; isSelf?: boolean }>;
     rootSession?: string | null;
@@ -197,9 +200,13 @@ vi.mock('../../src/components/AtPicker.js', () => ({
       return sameRoot;
     });
     if (stage === 'root') {
+      // The real picker leaves the chooser as soon as a query is typed; mirror
+      // that here so a typed query does not look like a chooser render.
+      if (query) return <div data-testid="at-picker-search" data-query={query} />;
       return (
         <div>
           <button onClick={() => onSelectAllConfig?.(p2pConfig, p2pConfig?.rounds ?? 1, 'config')}>mock-select-all-config</button>
+          <button onClick={() => onSelectMachine?.('office-pc', 'Office PC')}>mock-select-machine</button>
           <button>files</button>
           <button onClick={() => setStage('agents')}>agents</button>
         </div>
@@ -248,6 +255,7 @@ const getUserPrefMock = vi.fn().mockResolvedValue(null);
 const saveUserPrefMock = vi.fn().mockResolvedValue(undefined);
 const fetchSupervisorDefaultsMock = vi.fn().mockResolvedValue(null);
 const patchSessionMock = vi.fn().mockResolvedValue(undefined);
+const patchSessionSupervisionMock = vi.fn().mockResolvedValue(null);
 const patchSubSessionMock = vi.fn().mockResolvedValue(undefined);
 const sendSessionViaHttpMock = vi.fn().mockResolvedValue(undefined);
 const onUserPrefChangedMock = vi.fn((cb: (key: string, value: unknown) => void) => {
@@ -275,13 +283,18 @@ vi.mock('../../src/api.js', () => ({
   saveUserPref: (...args: unknown[]) => saveUserPrefMock(...args),
   fetchSupervisorDefaults: (...args: unknown[]) => fetchSupervisorDefaultsMock(...args),
   patchSession: (...args: unknown[]) => patchSessionMock(...args),
+  patchSessionSupervision: (...args: unknown[]) => patchSessionSupervisionMock(...args),
   patchSubSession: (...args: unknown[]) => patchSubSessionMock(...args),
   sendSessionViaHttp: (...args: unknown[]) => sendSessionViaHttpMock(...args),
   onUserPrefChanged: (...args: unknown[]) => onUserPrefChangedMock(...args as Parameters<typeof onUserPrefChangedMock>),
 }));
 
 import { OpenSpecAutoDeliverLauncher } from '../../src/components/OpenSpecAutoDeliver.js';
-import { OPENSPEC_LIST_REQUEST_TIMEOUT_MS, SessionControls } from '../../src/components/SessionControls.js';
+import {
+  COMPOSER_HEIGHT_STORAGE_KEY,
+  OPENSPEC_LIST_REQUEST_TIMEOUT_MS,
+  SessionControls,
+} from '../../src/components/SessionControls.js';
 import { __resetPrefCacheForTests } from '../../src/hooks/usePref.js';
 import type { SessionInfo } from '../../src/types.js';
 import { DAEMON_MSG } from '@shared/daemon-events.js';
@@ -490,6 +503,7 @@ afterEach(() => {
     localStorage.clear();
     fetchSupervisorDefaultsMock.mockResolvedValue(null);
     patchSessionMock.mockResolvedValue(undefined);
+    patchSessionSupervisionMock.mockResolvedValue(null);
     patchSubSessionMock.mockResolvedValue(undefined);
     sendSessionViaHttpMock.mockReset().mockResolvedValue(undefined);
     getUserPrefMock.mockImplementation(async (key: unknown) => {
@@ -510,6 +524,112 @@ afterEach(() => {
     render(<SessionControls ws={makeWs() as any} activeSession={makeSession()} quickData={makeQuickData() as any} />);
     expect(screen.getByRole('textbox')).toBeDefined();
     expect(screen.getByRole('button', { name: /send/i })).toBeDefined();
+  });
+
+  it('shares top-edge desktop resizing across every window and persists it', async () => {
+    render(
+      <>
+        <SessionControls ws={makeWs() as any} activeSession={makeSession({ name: 'main-window' })} quickData={makeQuickData() as any} />
+        <SessionControls ws={makeWs() as any} activeSession={makeSession({ name: 'sub-window' })} quickData={makeQuickData() as any} />
+      </>,
+    );
+    const inputs = screen.getAllByRole('textbox') as HTMLDivElement[];
+    inputs[0].getBoundingClientRect = () => ({
+      width: 600,
+      height: 80,
+      top: 0,
+      right: 600,
+      bottom: 80,
+      left: 0,
+      x: 0,
+      y: 0,
+      toJSON: () => ({}),
+    });
+
+    const topEdge = document.querySelector('.controls-composer-resize-edge') as HTMLDivElement;
+    // Older jsdom releases do not expose `onpointerdown`, so Preact's event
+    // compatibility path registers the listener with the original casing.
+    const pointerDownEventName = 'onpointerdown' in topEdge ? 'pointerdown' : 'PointerDown';
+    fireEvent(topEdge, new MouseEvent(pointerDownEventName, {
+      bubbles: true,
+      cancelable: true,
+      button: 0,
+      clientY: 200,
+    }));
+    expect(document.body.classList.contains('composer-height-resizing')).toBe(true);
+    expect(document.body.classList.contains('composer-height-resizing-top')).toBe(true);
+
+    // Dragging the top edge UP grows the composer: the box keeps its footing on
+    // the bottom and rises, so an upward pointer must add height, not subtract.
+    fireEvent(window, new MouseEvent('pointermove', { clientY: 120 }));
+    await waitFor(() => {
+      for (const input of inputs) {
+        expect(input.style.height).toBe('160px');
+      }
+    });
+    fireEvent(window, new MouseEvent('pointerup', { clientY: 120 }));
+    expect(localStorage.getItem(COMPOSER_HEIGHT_STORAGE_KEY)).toBe('160');
+    expect(document.body.classList.contains('composer-height-resizing')).toBe(false);
+
+    // And dragging back down shrinks it.
+    fireEvent(topEdge, new MouseEvent(pointerDownEventName, {
+      bubbles: true,
+      cancelable: true,
+      button: 0,
+      clientY: 200,
+    }));
+    fireEvent(window, new MouseEvent('pointermove', { clientY: 240 }));
+    await waitFor(() => {
+      for (const input of inputs) {
+        expect(input.style.height).toBe('120px');
+      }
+    });
+    fireEvent(window, new MouseEvent('pointerup', { clientY: 240 }));
+    expect(localStorage.getItem(COMPOSER_HEIGHT_STORAGE_KEY)).toBe('120');
+
+    cleanup();
+    render(<SessionControls ws={makeWs() as any} activeSession={makeSession()} quickData={makeQuickData() as any} />);
+    expect((screen.getByRole('textbox') as HTMLDivElement).style.height).toBe('120px');
+  });
+
+  // The corner grip was removed when the controls moved under the input. If it
+  // ever comes back it will land either stranded mid-box or on top of Send.
+  it('renders no corner resize grip', () => {
+    render(<SessionControls ws={makeWs() as any} activeSession={makeSession()} quickData={makeQuickData() as any} />);
+    expect(document.querySelector('.controls-composer-resize-corner')).toBeNull();
+    expect(document.querySelector('.controls-composer-resize-handle')).toBeNull();
+    expect(document.querySelector('.controls-composer-resize-edge')).not.toBeNull();
+  });
+
+  it('keeps the shared desktop height and resize affordance out of the mobile composer', () => {
+    localStorage.setItem(COMPOSER_HEIGHT_STORAGE_KEY, '180');
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 390 });
+
+    render(<SessionControls ws={makeWs() as any} activeSession={makeSession()} quickData={makeQuickData() as any} />);
+
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    expect(screen.queryByRole('separator', { name: 'Resize message input' })).toBeNull();
+    expect(screen.queryByRole('separator', { name: 'Resize message input from top edge' })).toBeNull();
+    expect(input.style.height).toBe('');
+  });
+
+  it('keeps compact transport cards to one-row input semantics and reuses the left queue-aware Stop toolbar', () => {
+    localStorage.setItem(COMPOSER_HEIGHT_STORAGE_KEY, '180');
+
+    render(
+      <SessionControls
+        ws={makeWs() as any}
+        activeSession={makeSession({ runtimeType: 'transport', state: 'running' })}
+        quickData={makeQuickData() as any}
+        compact
+      />,
+    );
+
+    const stop = screen.getByRole('button', { name: 'Stop' });
+    const shortcuts = document.querySelector('.shortcuts-transport');
+    expect(shortcuts?.firstElementChild).toBe(stop);
+    expect(screen.queryByRole('separator', { name: 'Resize message input from top edge' })).toBeNull();
+    expect((screen.getByRole('textbox') as HTMLDivElement).style.height).toBe('');
   });
 
   it('shows copy group action only for main-session controls and hides it from sub/compact surfaces', () => {
@@ -1074,6 +1194,29 @@ afterEach(() => {
     expect(sent).not.toHaveProperty('p2pAdvancedRounds');
     expect(sent).not.toHaveProperty('p2pAdvancedRunTimeoutMinutes');
     expect(sent).not.toHaveProperty('p2pContextReducer');
+  });
+
+  it('inserts an annotated controlled-node reference from the @ picker', () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({ name: 'my-session' })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.textContent = '@';
+    fireEvent.input(input);
+    fireEvent.click(screen.getByText('mock-select-machine'));
+
+    expect(execCommandMock).toHaveBeenCalledWith(
+      'insertText',
+      false,
+      '^^(office-pc)-(Office PC)',
+    );
+    expect(input.textContent).toBe('^^(office-pc)-(Office PC)');
   });
 
   it('keeps the p2p button in solo mode after triggering a combo from the dropdown', async () => {
@@ -4452,6 +4595,351 @@ afterEach(() => {
     expect(screen.queryByText('2 queued · showing latest only')).toBeNull();
   });
 
+  it('appends one queued message into the active turn without cancelling it', () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({
+          name: 'qwen-session',
+          agentType: 'qwen',
+          runtimeType: 'transport',
+          state: 'running',
+          transportPendingMessageEntries: [
+            { clientMessageId: 'msg-1', text: 'append this' },
+            { clientMessageId: 'msg-2', text: 'leave this queued' },
+          ],
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    const append = screen.getAllByRole('button', { name: 'transport_queue_append' })[0];
+    expect(append.parentElement?.firstElementChild).toBe(append);
+    fireEvent.click(append);
+
+    expect(ws.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'session.append_queued_messages',
+      sessionName: 'qwen-session',
+      clientMessageIds: ['msg-1'],
+      commandId: expect.any(String),
+    }));
+    expect(ws.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'session.cancel' }));
+    expect(screen.queryByText('append this')).toBeNull();
+    expect(screen.getByText('leave this queued')).toBeDefined();
+  });
+
+  it('puts Append all at the far left and appends every queued message', () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({
+          name: 'qwen-session',
+          agentType: 'qwen',
+          runtimeType: 'transport',
+          state: 'running',
+          transportPendingMessageEntries: [
+            { clientMessageId: 'msg-1', text: 'first append' },
+            { clientMessageId: 'msg-2', text: 'second append' },
+          ],
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    const appendAll = screen.getByRole('button', { name: 'transport_queue_append_all' });
+    const hide = screen.getByRole('button', { name: 'hide' });
+    expect(appendAll.parentElement).toBe(hide.parentElement);
+    expect(appendAll.parentElement?.firstElementChild).toBe(appendAll);
+    fireEvent.click(appendAll);
+
+    expect(ws.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'session.append_queued_messages',
+      sessionName: 'qwen-session',
+      clientMessageIds: ['msg-1', 'msg-2'],
+      commandId: expect.any(String),
+    }));
+    expect(screen.queryByText('first append')).toBeNull();
+    expect(screen.queryByText('second append')).toBeNull();
+  });
+
+  it('uses Stop to append the queue first and shows that the session is still running', () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({
+          name: 'qwen-session',
+          agentType: 'qwen',
+          runtimeType: 'transport',
+          state: 'running',
+          transportPendingMessageEntries: [
+            { clientMessageId: 'msg-1', text: 'append before stopping' },
+          ],
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    const stop = screen.getByRole('button', { name: /^stop$/i });
+    expect(within(stop).getByText('1').classList.contains('shortcut-btn-stop-queue-count')).toBe(true);
+    fireEvent.pointerDown(stop);
+    fireEvent.click(stop, { detail: 1 });
+
+    expect(ws.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'session.append_queued_messages',
+      sessionName: 'qwen-session',
+      clientMessageIds: ['msg-1'],
+      commandId: expect.any(String),
+    }));
+    expect(gatherCancelCalls(ws)).toEqual([]);
+    expect(ws.send.mock.calls.filter(([payload]) => (
+      (payload as { type?: string }).type === 'session.append_queued_messages'
+    ))).toHaveLength(1);
+    const notice = screen.getByRole('status');
+    expect(notice.textContent).toContain('Queued messages appended; the session is still running.');
+    expect(notice.classList.contains('queue-append-success-toast')).toBe(true);
+  });
+
+  it('never turns the delayed click from a queue-first Stop press into a cancel', () => {
+    const now = vi.spyOn(Date, 'now').mockReturnValue(1_000);
+    try {
+      const ws = makeWs();
+      render(
+        <SessionControls
+          ws={ws as any}
+          activeSession={makeSession({
+            name: 'qwen-session',
+            agentType: 'qwen',
+            runtimeType: 'transport',
+            state: 'running',
+            transportPendingMessageEntries: [
+              { clientMessageId: 'msg-delayed-click', text: 'append despite delayed click' },
+            ],
+          })}
+          quickData={makeQuickData() as any}
+        />,
+      );
+
+      const stop = screen.getByRole('button', { name: /^stop$/i });
+      fireEvent.pointerDown(stop);
+      expect(screen.queryByText('append despite delayed click')).toBeNull();
+
+      // Simulate streaming/main-thread jank beyond the old 600 ms guard.
+      now.mockReturnValue(1_701);
+      fireEvent.click(stop, { detail: 1 });
+
+      expect(ws.send.mock.calls.filter(([payload]) => (
+        (payload as { type?: string }).type === 'session.append_queued_messages'
+      ))).toHaveLength(1);
+      expect(gatherCancelCalls(ws)).toEqual([]);
+    } finally {
+      now.mockRestore();
+    }
+  });
+
+  it('offers immediate append for a locally queued message before daemon synchronization', () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeTransportSession({
+          name: 'qwen-session',
+          agentType: 'qwen',
+          state: 'running',
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.textContent = 'append before daemon echo';
+    fireEvent.input(input);
+    fireEvent.keyDown(input, { key: 'Enter', shiftKey: false });
+    const send = gatherSendCalls(ws).at(-1);
+    expect(send?.commandId).toEqual(expect.any(String));
+
+    const append = screen.getByRole('button', { name: 'transport_queue_append' });
+    fireEvent.click(append);
+
+    expect(ws.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'session.append_queued_messages',
+      sessionName: 'qwen-session',
+      clientMessageIds: [send?.commandId],
+    }));
+    expect(gatherCancelCalls(ws)).toEqual([]);
+  });
+
+  it('keeps Stop in append mode while a local queue row is still synchronizing', () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeTransportSession({
+          name: 'qwen-session',
+          agentType: 'qwen',
+          state: 'running',
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.textContent = 'stop must append immediately';
+    fireEvent.input(input);
+    fireEvent.keyDown(input, { key: 'Enter', shiftKey: false });
+    const send = gatherSendCalls(ws).at(-1);
+
+    const stop = screen.getByRole('button', { name: /^stop$/i });
+    expect(within(stop).getByText('1')).toBeDefined();
+    fireEvent.pointerDown(stop);
+    fireEvent.click(stop);
+
+    expect(ws.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'session.append_queued_messages',
+      sessionName: 'qwen-session',
+      clientMessageIds: [send?.commandId],
+    }));
+    expect(gatherCancelCalls(ws)).toEqual([]);
+  });
+
+  it('keeps a failed local queue row out of Append and lets Stop remain a real cancel', () => {
+    const ws = makeWs();
+    ws.sendSessionCommand.mockImplementation(() => {
+      throw new Error('WebSocket not connected');
+    });
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeTransportSession({
+          name: 'qwen-session',
+          agentType: 'qwen',
+          state: 'running',
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.textContent = 'failed rows must not append';
+    fireEvent.input(input);
+    fireEvent.keyDown(input, { key: 'Enter', shiftKey: false });
+
+    expect(screen.getByRole('button', { name: 'retrySend' })).toBeDefined();
+    expect(screen.queryByRole('button', { name: 'transport_queue_append' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'transport_queue_append_all' })).toBeNull();
+    const stop = screen.getByRole('button', { name: /^stop$/i });
+    expect(stop.querySelector('.shortcut-btn-stop-queue-count')).toBeNull();
+
+    fireEvent.click(stop);
+    expectUrgentCancelPayload(ws, { sessionName: 'qwen-session' });
+    expect(ws.send).not.toHaveBeenCalledWith(expect.objectContaining({
+      type: 'session.append_queued_messages',
+    }));
+  });
+
+  it('uses Stop to cancel when there are no appendable queued messages', () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({
+          name: 'qwen-session',
+          agentType: 'qwen',
+          runtimeType: 'transport',
+          state: 'running',
+          transportPendingMessageEntries: [],
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    const stop = screen.getByRole('button', { name: /^stop$/i });
+    expect(stop.querySelector('.shortcut-btn-stop-queue-count')).toBeNull();
+    fireEvent.click(stop);
+
+    expectUrgentCancelPayload(ws, { sessionName: 'qwen-session' });
+    expect(ws.send).not.toHaveBeenCalledWith(expect.objectContaining({
+      type: 'session.append_queued_messages',
+    }));
+  });
+
+  it('restores queued messages in their original order when an active-turn append is rejected', async () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({
+          name: 'qwen-session',
+          agentType: 'qwen',
+          runtimeType: 'transport',
+          state: 'running',
+          transportPendingMessageEntries: [
+            { clientMessageId: 'msg-1', text: 'restore after rejection' },
+            { clientMessageId: 'msg-2', text: 'remains queued behind it' },
+          ],
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    fireEvent.click(screen.getAllByRole('button', { name: 'transport_queue_append' })[0]);
+    const mutation = ws.send.mock.calls.at(-1)?.[0] as { commandId: string };
+    expect(screen.queryByText('restore after rejection')).toBeNull();
+
+    await act(async () => {
+      // A newer authoritative snapshot can arrive while provider admission is
+      // pending. It omits the reserved row and adds a newly queued message;
+      // rollback must reconstruct the original prefix before that new tail.
+      ws.emit({
+        type: 'timeline.event',
+        event: {
+          eventId: 'append-inflight-queue-update',
+          sessionId: 'qwen-session',
+          type: 'session.state',
+          ts: Date.now(),
+          seq: 1,
+          epoch: 1,
+          source: 'daemon',
+          confidence: 'high',
+          payload: {
+            state: 'queued',
+            queueEpoch: 'queue-epoch-append',
+            queueAuthorityId: 'queue-authority-append',
+            pendingMessageVersion: 2,
+            pendingMessageEntries: [
+              { clientMessageId: 'msg-2', text: 'remains queued behind it', status: 'queued' },
+              { clientMessageId: 'msg-3', text: 'arrived during append', status: 'queued' },
+            ],
+          },
+        },
+      });
+    });
+    expect([...document.querySelectorAll('.controls-queued-item-text')].map((node) => node.textContent)).toEqual([
+      'remains queued behind it',
+      'arrived during append',
+    ]);
+
+    await act(async () => {
+      ws.emit({
+        type: 'command.ack',
+        session: 'qwen-session',
+        commandId: mutation.commandId,
+        status: 'error',
+        error: 'provider does not support append',
+      });
+    });
+
+    expect(screen.getByText('restore after rejection')).toBeDefined();
+    expect([...document.querySelectorAll('.controls-queued-item-text')].map((node) => node.textContent)).toEqual([
+      'restore after rejection',
+      'remains queued behind it',
+      'arrived during append',
+    ]);
+    expect(screen.getByText('provider does not support append')).toBeDefined();
+  });
+
   it('remembers queued transport message visibility per session and defaults to visible', () => {
     const runningSession = makeSession({
       name: 'qwen-session',
@@ -4705,6 +5193,41 @@ afterEach(() => {
       text: '/stop',
     }));
     expect(ws.sendInput).not.toHaveBeenCalled();
+  });
+
+  it('uses Escape to append a queued message without canceling the active transport turn', () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({
+          name: 'qwen-session',
+          agentType: 'qwen',
+          runtimeType: 'transport',
+          state: 'running',
+          transportPendingMessageEntries: [
+            { clientMessageId: 'msg-escape-append', text: 'append from Escape' },
+          ],
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.focus();
+    fireEvent.keyDown(input, { key: 'Escape' });
+
+    expect(ws.send.mock.calls.filter(([payload]) => (
+      (payload as { type?: string }).type === 'session.append_queued_messages'
+    ))).toEqual([[expect.objectContaining({
+      sessionName: 'qwen-session',
+      clientMessageIds: ['msg-escape-append'],
+      commandId: expect.any(String),
+    })]]);
+    expect(gatherCancelCalls(ws)).toEqual([]);
+    expect(screen.queryByText('append from Escape')).toBeNull();
+    const notice = screen.getByText('Queued messages appended; the session is still running.');
+    expect(notice.closest('[role="status"]')?.classList.contains('queue-append-success-toast')).toBe(true);
   });
 
   it('pressing Escape with window focus sends direct cancel for the active transport surface', () => {
@@ -5881,7 +6404,7 @@ afterEach(() => {
     expect(input.textContent).toBe('pin');
   });
 
-  it('closes @ picker if user keeps typing without making a selection', () => {
+  it('keeps the @ picker open and searches files as soon as the user types', () => {
     render(<SessionControls ws={makeWs() as any} activeSession={makeSession()} quickData={makeQuickData() as any} />);
     const input = screen.getByRole('textbox') as HTMLDivElement;
     const getSelectionSpy = vi.spyOn(window, 'getSelection').mockImplementation(() => ({
@@ -5894,8 +6417,12 @@ afterEach(() => {
 
     input.textContent = '@hello';
     fireEvent.input(input);
-    expect(screen.queryByText('files')).toBeNull();
+    // The chooser is gone, but the picker stays open searching for `hello` —
+    // previously this closed the picker and the user had to reopen it and pick
+    // "files" by hand before any search happened.
     expect(screen.queryByText('agents')).toBeNull();
+    const search = screen.getByTestId('at-picker-search');
+    expect(search.getAttribute('data-query')).toBe('hello');
 
     getSelectionSpy.mockRestore();
   });
@@ -7528,6 +8055,133 @@ afterEach(() => {
     });
   });
 
+  it('lets a shared participant use models, Thinking, Quick Audit, Auto supervision, and Team', async () => {
+    const ws = makeWs();
+    fetchSupervisorDefaultsMock.mockResolvedValue({
+      backend: 'codex-sdk',
+      model: 'gpt-5.4',
+      timeoutMs: 30_000,
+      promptVersion: 'supervision_decision_v1',
+    });
+    patchSessionSupervisionMock.mockResolvedValue({
+      supervision: {
+        mode: 'supervised',
+        backend: 'codex-sdk',
+        model: 'gpt-5.4',
+        timeoutMs: 30_000,
+        promptVersion: 'supervision_decision_v1',
+        maxParseRetries: 1,
+        maxAutoContinueStreak: 2,
+        maxAutoContinueTotal: 0,
+      },
+    });
+    render(
+      <SessionControls
+        ws={ws as any}
+        serverId="srv-shared"
+        activeSession={makeSession({
+          name: 'shared-copilot-session',
+          agentType: 'copilot-sdk',
+          runtimeType: 'transport',
+          activeModel: 'gpt-5.4',
+          effort: 'medium',
+          sharedState: { effectiveRole: 'participant', status: 'active' },
+        })}
+        sessions={[
+          makeSession({
+            name: 'shared-copilot-session',
+            agentType: 'copilot-sdk',
+            runtimeType: 'transport',
+          }),
+        ]}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    const modelButton = screen.getByRole('button', { name: /^gpt-5.4$/i }) as HTMLButtonElement;
+    expect(modelButton.disabled).toBe(false);
+    expect((screen.getByTitle('actions') as HTMLButtonElement).disabled).toBe(true);
+    expect(ws.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: TRANSPORT_MSG.LIST_MODELS,
+      sessionName: 'shared-copilot-session',
+      agentType: 'copilot-sdk',
+    }));
+
+    fireEvent.click(modelButton);
+    fireEvent.click(screen.getByRole('button', { name: /gpt-5.4-mini/i }));
+
+    expectSendPayload(ws, {
+      sessionName: 'shared-copilot-session',
+      text: '/model gpt-5.4-mini',
+    });
+
+    const thinkingButton = screen.getByRole('button', { name: /^medium$/i }) as HTMLButtonElement;
+    expect(thinkingButton.disabled).toBe(false);
+    fireEvent.click(thinkingButton);
+    fireEvent.click(screen.getByRole('button', { name: '○ High' }));
+    expectSendPayload(ws, {
+      sessionName: 'shared-copilot-session',
+      text: '/thinking high',
+    });
+
+    const quickAuditButton = screen.getByTestId('peer-audit-icon') as HTMLButtonElement;
+    expect(quickAuditButton.disabled).toBe(false);
+    fireEvent.click(quickAuditButton);
+    expect(screen.getByTestId('peer-audit-modal')).toBeDefined();
+    fireEvent.click(screen.getByTestId('peer-audit-overlay'));
+
+    const autoButton = screen.getByRole('button', { name: /^Auto$/ }) as HTMLButtonElement;
+    expect(autoButton.disabled).toBe(false);
+    fireEvent.click(autoButton);
+    fireEvent.click(screen.getByRole('button', { name: /supervised$/i }));
+    await waitFor(() => expect(patchSessionSupervisionMock).toHaveBeenCalledWith(
+      'srv-shared',
+      'shared-copilot-session',
+      expect.objectContaining({ mode: 'supervised' }),
+    ));
+    expect(patchSessionMock).not.toHaveBeenCalled();
+    expect(patchSubSessionMock).not.toHaveBeenCalled();
+
+    const teamButton = screen.getByRole('button', { name: /^Team$/ }) as HTMLButtonElement;
+    const teamSettingsButton = screen.getByRole('button', { name: 'settings_button' }) as HTMLButtonElement;
+    expect(teamButton.disabled).toBe(false);
+    expect(teamSettingsButton.disabled).toBe(false);
+    fireEvent.click(teamButton);
+    expect(screen.getByTestId('p2p-dropdown')).toBeDefined();
+  });
+
+  it('keeps participant controls disabled for a shared viewer', () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({
+          name: 'viewer-copilot-session',
+          agentType: 'copilot-sdk',
+          runtimeType: 'transport',
+          activeModel: 'gpt-5.4',
+          effort: 'medium',
+          sharedState: { effectiveRole: 'viewer', status: 'active' },
+        })}
+        serverId="srv-shared"
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    const modelButton = screen.getByRole('button', { name: /^gpt-5.4$/i }) as HTMLButtonElement;
+    expect(modelButton.disabled).toBe(true);
+    expect(ws.send).not.toHaveBeenCalledWith(expect.objectContaining({
+      type: TRANSPORT_MSG.LIST_MODELS,
+    }));
+    expect((screen.getByRole('button', { name: /^medium$/i }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByTestId('peer-audit-icon') as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole('button', { name: /^Auto$/ }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole('button', { name: /^Team$/ }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole('button', { name: 'settings_button' }) as HTMLButtonElement).disabled).toBe(true);
+    expect(document.querySelector('.menu-dropdown')).toBeFalsy();
+    expect(gatherSendCalls(ws)).toHaveLength(0);
+  });
+
   it('shows a model selector for gemini-sdk and sends /model', () => {
     const ws = makeWs();
     render(
@@ -7706,6 +8360,37 @@ afterEach(() => {
     });
   });
 
+  it('exposes the model picker for deepseek-harness despite its empty catalogue', async () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({
+          name: 'deepseek-harness-session',
+          agentType: 'deepseek-harness',
+          runtimeType: 'transport',
+          activeModel: 'deepseek-reasoner',
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    const request = ws.send.mock.calls.find((call) => call[0]?.type === 'transport.list_models')?.[0];
+    expect(request).toMatchObject({ type: 'transport.list_models', agentType: 'deepseek-harness' });
+
+    // `dsh` resolves provider routes from its own ~/.dsh config, so the daemon
+    // always answers with an empty catalogue. The picker must still surface the
+    // effective model — otherwise the daemon's /model plumbing is unreachable.
+    act(() => ws.emit({
+      type: 'transport.models_response',
+      agentType: 'deepseek-harness',
+      requestId: request?.requestId,
+      models: [],
+    }));
+
+    expect(screen.getByRole('button', { name: /^deepseek-reasoner$/i })).toBeDefined();
+  });
+
   it('shows only dynamically discovered grok-sdk models and sends /model', async () => {
     const ws = makeWs();
     render(
@@ -7765,4 +8450,33 @@ afterEach(() => {
       expect(screen.queryByTestId('exec-menu-set-session')).toBeNull();
     });
   });
+
+  it.each([
+    ['participant', 'participant', true],
+    ['viewer', 'viewer', false],
+  ] as const)('offers queue append to a share %s: %s', (_label, effectiveRole, expected) => {
+    // Appending steers already-queued text into the running turn. A
+    // participant may do it (the bridge forwards it); a viewer cannot dispatch
+    // anything, so offering the control would only produce a rollback and a
+    // raw denial code.
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeTransportSession({
+          name: 'qwen-session',
+          agentType: 'qwen',
+          state: 'running',
+          sharedState: { effectiveRole, status: 'active' },
+          transportPendingMessageEntries: [
+            { clientMessageId: 'msg-1', text: 'queued while shared' },
+          ],
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+    const appendButtons = screen.queryAllByRole('button', { name: 'transport_queue_append' });
+    expect(appendButtons.length > 0).toBe(expected);
+  });
+
 });

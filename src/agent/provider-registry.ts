@@ -124,6 +124,10 @@ async function createProvider(id: string): Promise<TransportProvider> {
       const { OpenCodeSdkProvider } = await import('./providers/opencode-sdk.js');
       return new OpenCodeSdkProvider();
     }
+    case 'deepseek-harness': {
+      const { DeepseekHarnessProvider } = await import('./providers/deepseek-harness.js');
+      return new DeepseekHarnessProvider();
+    }
     default:
       throw new Error(`Unknown provider: ${id}`);
   }

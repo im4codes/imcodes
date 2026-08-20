@@ -1,4 +1,4 @@
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { createHash } from 'node:crypto';
@@ -6,6 +6,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { NODE_ROLE } from '../../shared/remote-exec.js';
+import { REMOTE_DESKTOP_PROTOCOL_VERSION } from '../../shared/remote-desktop.js';
 import {
   CONTROLLED_NODE_ARTIFACT_ASSETS,
   CONTROLLED_NODE_ARTIFACT_HEADERS,
@@ -19,13 +20,20 @@ import {
   buildWindowsControlledNodeUpgradeScript,
   controlledNodeArtifactTarget,
   controlledNodeArtifactUpgradeUrl,
+  downloadControlledNodeRemoteDesktopWorker,
   scheduleLinuxControlledNodeUpgrade,
   scheduleWindowsControlledNodeUpgrade,
   startControlledNodeSelfUpgrade,
   windowsControlledNodeUpgradeTaskXml,
 } from '../../src/node/self-upgrade.js';
+import {
+  REMOTE_DESKTOP_WORKER_FILENAME,
+  REMOTE_DESKTOP_WORKER_MANIFEST_SUFFIX,
+} from '../../shared/remote-desktop-worker.js';
+import { WINDOWS_REMOTE_DESKTOP_QUALIFICATION_PLAN } from '../../shared/remote-desktop-qualification.js';
 
 const dirs: string[] = [];
+const WINDOWS_SIGNER_SHA256 = 'c'.repeat(64);
 const execFileAsync = promisify(execFile);
 afterEach(async () => {
   await Promise.all(dirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
@@ -60,6 +68,84 @@ describe('controlled-node self-upgrade', () => {
     expect(helperUrl).toBe(`https://im.example${CONTROLLED_NODE_ARTIFACT_UPGRADE_PATH}?serverId=srv-1&os=win&arch=x64&asset=computer-use-helper`);
   });
 
+  it('downloads the Windows remote-desktop worker only with its matching pinned manifest', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'imcodes-rd-worker-upgrade-test-'));
+    dirs.push(dir);
+    const bytes = Buffer.from('pinned libwebrtc worker');
+    const virtualDisplayBytes = Buffer.from('signed virtual display archive');
+    const digest = createHash('sha256').update(bytes).digest('hex');
+    const manifest = Buffer.from(JSON.stringify({
+      manifestVersion: 2,
+      workerVersion: '0.1.2',
+      protocolVersion: 2,
+      ipcVersion: 1,
+      os: 'win32',
+      arch: 'x64',
+      fileName: REMOTE_DESKTOP_WORKER_FILENAME,
+      size: bytes.length,
+      sha256: digest,
+      authenticodeSignerSha256: 'c'.repeat(64),
+      libwebrtcRevision: WINDOWS_REMOTE_DESKTOP_QUALIFICATION_PLAN.mediaStackDecision.libwebrtcRevision,
+      virtualDisplay: {
+        archiveFileName: 'imcodes-virtual-display.zip',
+        packageManifestFileName: 'imcodes-virtual-display.manifest.json',
+        size: virtualDisplayBytes.length,
+        sha256: createHash('sha256').update(virtualDisplayBytes).digest('hex'),
+      },
+      toolchain: {
+        msvc: '14.44',
+        windowsSdk: '10.0.26100.0',
+        cmake: 'not-used-gn',
+        ninja: '1.13.1',
+        depotTools: WINDOWS_REMOTE_DESKTOP_QUALIFICATION_PLAN.mediaStackDecision.depotToolsRevision,
+      },
+    }));
+    const result = await downloadControlledNodeRemoteDesktopWorker({
+      credential,
+      target: { os: 'win', arch: 'x64' },
+      dir,
+      fetchImpl: (async (url: string, init?: RequestInit) => {
+        expect(init?.headers).toMatchObject({
+          [CONTROLLED_NODE_ARTIFACT_HEADERS.REMOTE_DESKTOP_PROTOCOL_VERSION]: String(REMOTE_DESKTOP_PROTOCOL_VERSION),
+        });
+        const isManifest = url.includes('asset=remote-desktop-worker-manifest');
+        const isVirtualDisplay = url.includes('asset=remote-desktop-virtual-display');
+        const body = isManifest ? manifest : isVirtualDisplay ? virtualDisplayBytes : bytes;
+        return new Response(body, {
+          status: 200,
+          headers: {
+            [CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256]: createHash('sha256').update(body).digest('hex'),
+            [CONTROLLED_NODE_ARTIFACT_HEADERS.SIZE_BYTES]: String(body.length),
+            [CONTROLLED_NODE_ARTIFACT_HEADERS.FILENAME]: isManifest
+              ? `${REMOTE_DESKTOP_WORKER_FILENAME}${REMOTE_DESKTOP_WORKER_MANIFEST_SUFFIX}`
+              : isVirtualDisplay ? 'imcodes-virtual-display.zip' : REMOTE_DESKTOP_WORKER_FILENAME,
+            [CONTROLLED_NODE_ARTIFACT_HEADERS.VERSION]: '0.1.2',
+          },
+        });
+      }) as unknown as typeof fetch,
+    });
+    expect(result).toBeDefined();
+    expect(await readFile(result!.artifactPath)).toEqual(bytes);
+    expect(await readFile(result!.manifestPath)).toEqual(manifest);
+    expect((await readdir(join(dir, 'remote-desktop-worker', 'win32-x64'))).sort()).toEqual([
+      'imcodes-remote-desktop-worker.exe',
+      'imcodes-remote-desktop-worker.exe.manifest.json',
+      'imcodes-virtual-display.zip',
+    ]);
+  });
+
+  it('treats a remote-desktop protocol skew as an optional sidecar miss', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'imcodes-rd-worker-skew-test-'));
+    dirs.push(dir);
+    const result = await downloadControlledNodeRemoteDesktopWorker({
+      credential,
+      target: { os: 'win', arch: 'x64' },
+      dir,
+      fetchImpl: (async () => new Response(null, { status: 409 })) as unknown as typeof fetch,
+    });
+    expect(result).toBeUndefined();
+  });
+
   it('downloads, verifies sha256, writes a staged artifact, and spawns a detached Windows upgrader', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'imcodes-self-upgrade-test-'));
     dirs.push(dir);
@@ -91,7 +177,11 @@ describe('controlled-node self-upgrade', () => {
     }), 'utf8');
     const fetchImpl = vi.fn(async (url: string, init?: RequestInit) => {
       expect(url).toContain(CONTROLLED_NODE_ARTIFACT_UPGRADE_PATH);
-      expect(init?.headers).toMatchObject({ Authorization: 'Bearer secret-token', 'X-Server-Id': 'srv-1' });
+      expect(init?.headers).toMatchObject({
+        Authorization: 'Bearer secret-token',
+        'X-Server-Id': 'srv-1',
+        [CONTROLLED_NODE_ARTIFACT_HEADERS.REMOTE_DESKTOP_PROTOCOL_VERSION]: String(REMOTE_DESKTOP_PROTOCOL_VERSION),
+      });
       if (url.includes('asset=computer-use-helper')) {
         return new Response(helperBytes, {
           status: 200,
@@ -109,6 +199,7 @@ describe('controlled-node self-upgrade', () => {
           [CONTROLLED_NODE_ARTIFACT_HEADERS.SIZE_BYTES]: String(bytes.length),
           [CONTROLLED_NODE_ARTIFACT_HEADERS.FILENAME]: 'imcodes-node.exe',
           [CONTROLLED_NODE_ARTIFACT_HEADERS.VERSION]: '2026.7.1',
+          [CONTROLLED_NODE_ARTIFACT_HEADERS.AUTHENTICODE_SIGNER_SHA256]: WINDOWS_SIGNER_SHA256,
         },
       });
     });
@@ -128,11 +219,19 @@ describe('controlled-node self-upgrade', () => {
     expect(scheduled).toHaveLength(1);
     expect(scheduled[0].taskName).toMatch(/^imcodes-node-upgrade-/);
     expect(scheduled[0].taskXmlPath).toBe(join(dirname(result.scriptPath!), 'upgrade-task.xml'));
+    const stagedManifest = JSON.parse(
+      await readFile(join(dirname(result.scriptPath!), 'imcodes-node.exe.manifest.json'), 'utf8'),
+    ) as { artifact: { authenticodeSignerSha256?: string } };
+    expect(stagedManifest.artifact.authenticodeSignerSha256).toBe(WINDOWS_SIGNER_SHA256);
     const script = await readFile(result.scriptPath!, 'utf8');
     expect(script).toContain('Stop-ScheduledTask');
     expect(script).toContain('Start-ScheduledTask');
+    expect(script).toContain("$upgradeMarker = Join-Path (Split-Path -Parent $dst) 'upgrade-in-progress.json'");
+    expect(script).not.toContain('Disable-ScheduledTask -TaskName $watchdogTask');
+    expect(script).not.toContain('Stop-ScheduledTask -TaskName $watchdogTask');
     expect(script).toContain('Copy-Item -Force $src $dst');
     expect(script).toContain('computer-use-helper');
+    expect(script.match(/Remove-Item -Force \$backupJournal -ErrorAction SilentlyContinue/g)).toHaveLength(2);
     expect(script).toContain('Copy-Item -Recurse -Force -Path (Join-Path $srcHelper');
     expect(script).toContain('install-journal.json');
     expect(script).toContain(`Unregister-ScheduledTask -TaskName '${scheduled[0].taskName}'`);
@@ -205,6 +304,33 @@ describe('controlled-node self-upgrade', () => {
     expect(spawned).not.toHaveBeenCalled();
   });
 
+  it('rejects a Windows upgrade when the server omits the release signer binding', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'imcodes-self-upgrade-signer-test-'));
+    dirs.push(dir);
+    const bytes = Buffer.from('signed artifact without signer metadata');
+    const scheduleWindowsUpgrade = vi.fn();
+    await expect(startControlledNodeSelfUpgrade(credential, '2026.7.1', {
+      fetchImpl: (async (url: string) => {
+        if (url.includes('asset=computer-use-helper')) return new Response(null, { status: 404 });
+        return new Response(bytes, {
+          status: 200,
+          headers: {
+            [CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256]: createHash('sha256').update(bytes).digest('hex'),
+            [CONTROLLED_NODE_ARTIFACT_HEADERS.SIZE_BYTES]: String(bytes.length),
+            [CONTROLLED_NODE_ARTIFACT_HEADERS.FILENAME]: 'imcodes-node.exe',
+            [CONTROLLED_NODE_ARTIFACT_HEADERS.VERSION]: '2026.7.1',
+          },
+        });
+      }) as unknown as typeof fetch,
+      platform: 'win32',
+      arch: 'x64',
+      execPath: 'C:\\ProgramData\\imcodes-node\\imcodes-node.exe',
+      tmpdir: () => dir,
+      scheduleWindowsUpgrade,
+    })).rejects.toThrow('missing_artifact_authenticode_signer_sha256');
+    expect(scheduleWindowsUpgrade).not.toHaveBeenCalled();
+  });
+
   it('quotes PowerShell paths and applies executable/helper ACLs', () => {
     const script = buildWindowsControlledNodeUpgradeScript({
       stagedArtifactPath: "C:\\tmp\\it's\\imcodes-node.exe",
@@ -220,11 +346,87 @@ describe('controlled-node self-upgrade', () => {
     expect(script).toContain('computer-use-helper');
   });
 
+  it('atomically installs the remote desktop worker in its win32-x64 platform directory', () => {
+    const script = buildWindowsControlledNodeUpgradeScript({
+      stagedArtifactPath: 'C:\\tmp\\imcodes-node.exe',
+      stagedManifestPath: 'C:\\tmp\\imcodes-node.exe.manifest.json',
+      stagedRemoteDesktopWorkerDir: 'C:\\tmp\\remote-desktop-worker',
+      destinationPath: 'C:\\ProgramData\\imcodes-node\\imcodes-node.exe',
+      destinationManifestPath: 'C:\\ProgramData\\imcodes-node\\imcodes-node.exe.manifest.json',
+      upgradeTaskName: 'imcodes-node-upgrade-test',
+    });
+    expect(script).toContain("$srcRemoteDesktop = 'C:\\tmp\\remote-desktop-worker'");
+    expect(script).toContain("$dstRemoteDesktop = 'C:\\ProgramData\\imcodes-node\\remote-desktop-worker'");
+    expect(script).toContain('remote-desktop-worker\\win32-x64\\imcodes-remote-desktop-worker.exe');
+    expect(script).toContain('Get-AuthenticodeSignature -LiteralPath $srcRemoteDesktopExe');
+    expect(script).toContain("Join-Path $PSHOME 'Modules\\Microsoft.PowerShell.Security\\Microsoft.PowerShell.Security.psd1'");
+    expect(script).toContain('Import-Module -Name $securityModulePath -ErrorAction Stop');
+    expect(script).toContain("Join-Path $PSHOME 'Modules\\Microsoft.PowerShell.Utility\\Microsoft.PowerShell.Utility.psd1'");
+    expect(script).toContain('Import-Module -Name $utilityModulePath -ErrorAction Stop');
+    expect(script.indexOf('Import-Module -Name $utilityModulePath -ErrorAction Stop'))
+      .toBeLessThan(script.indexOf('$srcHash = (Get-FileHash'));
+    expect(script.indexOf('Import-Module -Name $securityModulePath -ErrorAction Stop'))
+      .toBeLessThan(script.indexOf('Get-AuthenticodeSignature -LiteralPath $srcRemoteDesktopExe'));
+    expect(script).toContain('[System.Management.Automation.SignatureStatus]::Valid');
+    expect(script).toContain('remote desktop worker signer mismatch');
+    expect(script).toContain('authenticodeSignerSha256');
+    expect(script).toContain('THIRD_PARTY_NOTICES.webrtc.md');
+    expect(script.indexOf('remote desktop worker Authenticode verification failed'))
+      .toBeLessThan(script.indexOf('Stop-ScheduledTask -TaskName $task'));
+    expect(script).toContain('remote desktop copied artifact hash mismatch');
+    expect(script).toContain('remote desktop worker signer is not trusted by this controlled node build');
+    expect(script).toContain('remote desktop artifact root contains unexpected entries');
+    expect(script).toContain('virtual display package contains unexpected entries');
+    expect(script).toContain('& $verifyRemoteDesktopArtifactSet $pendingRemoteDesktop');
+    expect(script).toContain('& $verifyRemoteDesktopArtifactSet $dstRemoteDesktop');
+    expect(script.indexOf('& $verifyRemoteDesktopArtifactSet $pendingRemoteDesktop'))
+      .toBeLessThan(script.indexOf('Move-Item -Force $pendingRemoteDesktop $dstRemoteDesktop'));
+    expect(script.indexOf('& $verifyRemoteDesktopArtifactSet $dstRemoteDesktop'))
+      .toBeLessThan(script.indexOf('/add-driver $virtualDisplayInf /install'));
+    expect(script.indexOf("'System32\\icacls.exe') 'C:\\ProgramData\\imcodes-node\\remote-desktop-worker.new' '/inheritance:r'"))
+      .toBeLessThan(script.indexOf("Copy-Item -Recurse -Force -Path (Join-Path $srcRemoteDesktop '*')"));
+    expect(script).toContain("if ($aclExitCode -ne 0) { throw 'Windows ACL hardening failed' }");
+    expect(script).toContain('controlled node release manifest does not match the staged executable');
+    expect(script).toContain('controlled node published manifest hash mismatch');
+    expect(script).toContain('$dstRemoteDesktop.upgrade-old');
+    expect(script).toContain('controlled node upgrade failed authenticated health verification');
+    expect(script).toContain("status = 'success'");
+    expect(script).toContain("{ 'rolled_back' } else { 'rollback_failed' }");
+    expect(script).toContain("status = 'preflight_failed'");
+    expect(script).not.toContain('$verifyLegacyUnsignedArtifact');
+    expect(script).toContain("$currentMainHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $dst).Hash.ToLowerInvariant()");
+    expect(script).toContain('controlled node rollback source hash mismatch');
+    expect(script.indexOf('& $verifyReleaseArtifact $src'))
+      .toBeLessThan(script.indexOf('Stop-ScheduledTask -TaskName $task'));
+    expect(script.indexOf("Unregister-ScheduledTask -TaskName 'imcodes-node-upgrade-test'"))
+      .toBeLessThan(script.indexOf('Stop-ScheduledTask -TaskName $task'));
+    expect(script).toContain('if ($failureMessage.Length -gt 240)');
+    expect(script).toContain('[int64]$lease.updatedAt -ge $upgradeStartedAt');
+    expect(script).toContain('if ($remoteDesktopPublished -and (Test-Path $dstRemoteDesktop))');
+    expect(script).toContain('Move-Item -Force $backupRemoteDesktop $dstRemoteDesktop');
+    expect(script).toContain("Get-WindowsDriver -Online -All | Where-Object { [IO.Path]::GetFileName([string]$_.OriginalFileName) -ceq 'imcodes-virtual-display.inf'");
+    expect(script).toContain("[string]$_.ProviderName -ceq 'IM.codes'");
+    expect(script).toContain('$newVirtualDisplayDrivers.Count -gt 1');
+    expect(script).toContain('$driverInstallExitCode -ne 3010');
+    expect(script).toContain("& $runRecovery 'restore_main'");
+    expect(script).toContain("& $runRecovery 'restore_driver'");
+    expect(script).toContain('controlled node backup hash mismatch');
+    expect(script).toContain('& $verifyRemoteDesktopArtifactSet $dstRemoteDesktop $rollbackRemoteDesktopWorkerHash');
+    expect(script).toContain("status = $rollbackStatus");
+    expect(script).toContain("'rollback_failed'");
+    expect(script).toContain("-cmatch '^oem[0-9]+\\.inf$'");
+    expect(script).toContain('/delete-driver ([string]$newVirtualDisplayDriver.Driver) /uninstall /force');
+    expect(script.indexOf('/delete-driver ([string]$newVirtualDisplayDriver.Driver)'))
+      .toBeLessThan(script.indexOf('/add-driver $rollbackVirtualDisplayInf /install'));
+  });
+
   it('escapes the one-shot upgrade script path in Task Scheduler XML', () => {
     const xml = windowsControlledNodeUpgradeTaskXml('C:\\Windows\\Temp\\a&b<1>\\upgrade.ps1');
     expect(xml).toContain('a&amp;b&lt;1&gt;');
     expect(xml).toContain('<Triggers />');
-    expect(xml).toContain('<ExecutionTimeLimit>PT10M</ExecutionTimeLimit>');
+    expect(xml).toContain('<AllowHardTerminate>false</AllowHardTerminate>');
+    expect(xml).toContain('<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>');
+    expect(xml).toContain('<Command>C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe</Command>');
   });
 
   it('registers and starts the one-shot task, deleting it if start fails', () => {
@@ -269,7 +471,7 @@ describe('controlled-node self-upgrade', () => {
 
   it.each([
     ['linux', 'systemctl stop imcodes-node.service', 'systemctl start imcodes-node.service'],
-    ['darwin', 'launchctl bootout system/cc.imcodes.node', 'launchctl bootstrap system /Library/LaunchDaemons/cc.imcodes.node.plist'],
+    ['darwin', 'launchctl bootout system/cc.imcodes.node', "launchctl bootstrap system '/Library/LaunchDaemons/cc.imcodes.node.plist'"],
   ] as const)('builds a detached %s upgrader that replaces the binary before restarting the boot service', (platform, stop, start) => {
     const script = buildPosixControlledNodeUpgradeScript({
       platform,
@@ -297,6 +499,12 @@ describe('controlled-node self-upgrade', () => {
     expect(script).toContain("chmod 755 '/opt/imcodes-node/imcodes-node.new'");
     // The manifest must not vouch for a binary that never got published.
     expect(script.indexOf('mv -f')).toBeLessThan(script.indexOf('imcodes-node.manifest.json'));
+    if (platform === 'darwin') {
+      expect(script).toContain('launchctl bootout system/cc.imcodes.node.watchdog');
+      expect(script).toContain("launchctl bootstrap system '/Library/LaunchDaemons/cc.imcodes.node.watchdog.plist'");
+      expect(script.indexOf('bootout system/cc.imcodes.node.watchdog'))
+        .toBeLessThan(script.indexOf('bootout system/cc.imcodes.node\n'));
+    }
   });
 
   it('refuses to publish a macOS binary the kernel would kill, and leaves the old one intact', () => {
@@ -355,6 +563,7 @@ describe('controlled-node self-upgrade', () => {
       await writeFile(harnessPath, [
         `function Start-Sleep { param([int]$Seconds) }`,
         `function Stop-ScheduledTask { param($TaskName, $ErrorAction); Add-Content -LiteralPath '${quotedLog}' -Value "stop:$TaskName" }`,
+        `function Enable-ScheduledTask { param($TaskName, $ErrorAction); Add-Content -LiteralPath '${quotedLog}' -Value "enable:$TaskName" }`,
         `function Start-ScheduledTask { param($TaskName); Add-Content -LiteralPath '${quotedLog}' -Value "start:$TaskName" }`,
         'function Get-CimInstance { param($ClassName, $Filter); @() }',
         generated,
@@ -392,8 +601,10 @@ describe('controlled-node self-upgrade', () => {
     });
     const serviceLog = await readFile(logPath, 'utf8');
     if (process.platform === 'darwin') {
+      expect(serviceLog).toContain('bootout system/cc.imcodes.node.watchdog');
       expect(serviceLog).toContain('bootout system/cc.imcodes.node');
       expect(serviceLog).toContain('bootstrap system /Library/LaunchDaemons/cc.imcodes.node.plist');
+      expect(serviceLog).toContain('bootstrap system /Library/LaunchDaemons/cc.imcodes.node.watchdog.plist');
     } else {
       expect(serviceLog).toContain('stop');
       expect(serviceLog).toContain('start');

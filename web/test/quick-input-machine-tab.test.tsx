@@ -75,7 +75,7 @@ describe('QuickInputPanel controlled-node tab', () => {
     const nodeButtons = Array.from(document.body.querySelectorAll<HTMLButtonElement>('.qp-machine-item'));
     expect(nodeButtons[1].disabled).toBe(true);
     fireEvent.click(nodeButtons[0]);
-    expect(onInsertMachine).toHaveBeenCalledWith('office-pc');
+    expect(onInsertMachine).toHaveBeenCalledWith('office-pc', 'Renamed Office PC');
     expect(onClose).toHaveBeenCalledOnce();
   });
 });

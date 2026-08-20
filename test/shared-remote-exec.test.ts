@@ -55,6 +55,7 @@ describe('validateMachineExecFrame', () => {
     expect(validateMachineExecFrame({ ...base, timeoutMs: NaN }).ok).toBe(false);
     expect(validateMachineExecFrame({ ...base, timeoutMs: REMOTE_EXEC_MIN_TIMEOUT_MS - 1 }).ok).toBe(false);
     expect(validateMachineExecFrame({ ...base, timeoutMs: 1.5 }).ok).toBe(false);
+    expect(validateMachineExecFrame({ ...base, timeoutMs: REMOTE_EXEC_MAX_TIMEOUT_MS }).ok).toBe(true);
     expect(validateMachineExecFrame({ ...base, timeoutMs: REMOTE_EXEC_MAX_TIMEOUT_MS + 1 }).ok).toBe(false);
   });
   it('rejects oversized command and correlationId', () => {

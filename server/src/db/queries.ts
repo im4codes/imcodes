@@ -95,6 +95,7 @@ export interface DbSession {
   requested_model: string | null;
   active_model: string | null;
   effort: string | null;
+  service_tier: string | null;
   transport_config: Record<string, unknown> | string | null;
   created_at: number;
   updated_at: number;
@@ -417,8 +418,21 @@ export async function updateServerSharedContextRuntimeConfig(
   return result.changes > 0;
 }
 
-export async function updateServerHeartbeat(db: Database, id: string, daemonVersion?: string | null): Promise<void> {
-  if (daemonVersion) {
+export async function updateServerHeartbeat(
+  db: Database,
+  id: string,
+  daemonVersion?: string | null,
+  controlledCapabilities?: readonly string[],
+): Promise<void> {
+  if (controlledCapabilities !== undefined) {
+    await db.execute(
+      `UPDATE servers
+          SET last_heartbeat_at = $1, status = $2, daemon_version = COALESCE($3, daemon_version),
+              controlled_capabilities = $4::jsonb
+        WHERE id = $5`,
+      [Date.now(), 'online', daemonVersion ?? null, JSON.stringify(controlledCapabilities), id],
+    );
+  } else if (daemonVersion) {
     await db.execute('UPDATE servers SET last_heartbeat_at = $1, status = $2, daemon_version = $3 WHERE id = $4', [Date.now(), 'online', daemonVersion, id]);
   } else {
     await db.execute('UPDATE servers SET last_heartbeat_at = $1, status = $2 WHERE id = $3', [Date.now(), 'online', id]);
@@ -584,6 +598,13 @@ export async function getDbSessionsByServer(db: Database, serverId: string): Pro
   );
 }
 
+export async function getDbSessionByName(db: Database, serverId: string, name: string): Promise<DbSession | null> {
+  return db.queryOne<DbSession>(
+    'SELECT * FROM sessions WHERE server_id = $1 AND name = $2',
+    [serverId, name],
+  );
+}
+
 export async function upsertDbSession(
   db: Database,
   id: string,
@@ -604,11 +625,12 @@ export async function upsertDbSession(
   activeModel?: string | null,
   effort?: string | null,
   transportConfig?: Record<string, unknown> | null,
+  serviceTier?: string | null,
 ): Promise<void> {
   const now = Date.now();
   await db.execute(
-    `INSERT INTO sessions (id, server_id, name, project_name, role, agent_type, agent_version, project_dir, state, label, runtime_type, provider_id, provider_session_id, description, requested_model, active_model, effort, transport_config, created_at, updated_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18::jsonb, $19, $20)
+    `INSERT INTO sessions (id, server_id, name, project_name, role, agent_type, agent_version, project_dir, state, label, runtime_type, provider_id, provider_session_id, description, requested_model, active_model, effort, transport_config, service_tier, created_at, updated_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18::jsonb, $19, $20, $21)
      ON CONFLICT(server_id, name) DO UPDATE SET
        role = excluded.role,
        agent_type = excluded.agent_type,
@@ -624,6 +646,7 @@ export async function upsertDbSession(
        active_model = excluded.active_model,
        effort = excluded.effort,
        transport_config = excluded.transport_config,
+       service_tier = excluded.service_tier,
        updated_at = excluded.updated_at`,
     [
       id,
@@ -644,6 +667,7 @@ export async function upsertDbSession(
       activeModel ?? null,
       effort ?? null,
       JSON.stringify(transportConfig ?? {}),
+      serviceTier ?? null,
       now,
       now,
     ],
@@ -679,6 +703,7 @@ export async function updateSession(
     requested_model?: string | null;
     active_model?: string | null;
     effort?: string | null;
+    serviceTier?: string | null;
     transport_config?: Record<string, unknown> | null;
   },
 ): Promise<void> {
@@ -691,6 +716,7 @@ export async function updateSession(
   if ('requested_model' in fields) { parts.push(`requested_model = $${idx++}`); vals.push(fields.requested_model ?? null); }
   if ('active_model' in fields) { parts.push(`active_model = $${idx++}`); vals.push(fields.active_model ?? null); }
   if ('effort' in fields) { parts.push(`effort = $${idx++}`); vals.push(fields.effort ?? null); }
+  if ('serviceTier' in fields) { parts.push(`service_tier = $${idx++}`); vals.push(fields.serviceTier ?? null); }
   if ('transport_config' in fields) { parts.push(`transport_config = $${idx++}::jsonb`); vals.push(JSON.stringify(fields.transport_config ?? {})); }
   if (parts.length === 0) return;
   parts.push(`updated_at = $${idx++}`);

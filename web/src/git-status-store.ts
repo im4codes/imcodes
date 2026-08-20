@@ -40,6 +40,7 @@ interface SharedChangesEntry {
   status: SharedChangesRequestStatus;
   statusListeners: Set<SharedChangesStatusListener>;
   ws: WsClient | null;
+  sessionName?: string;
 }
 
 export const SHARED_CHANGES_TTL_MS = 5_000;
@@ -155,11 +156,12 @@ function publish(key: string, files: ChangeFile[]): void {
   for (const listener of entry.listeners) listener(files);
 }
 
-export function requestSharedChanges(ws: WsClient, repoPath: string, force = false): void {
+export function requestSharedChanges(ws: WsClient, repoPath: string, force = false, sessionName?: string): void {
   const key = getSharedChangesKey(ws, repoPath);
   const entry = getEntry(key);
   entry.ws = ws;
   entry.repoPath = repoPath;
+  entry.sessionName = sessionName;
   ensureWsBridge(ws);
   const fresh = entry.updatedAt > 0 && (Date.now() - entry.updatedAt) < SHARED_CHANGES_TTL_MS;
   if (!force && fresh) {
@@ -183,7 +185,7 @@ export function requestSharedChanges(ws: WsClient, repoPath: string, force = fal
   }
   let requestId: string;
   try {
-    requestId = ws.fsGitStatus(repoPath, { includeStats: true });
+    requestId = ws.fsGitStatus(repoPath, sessionName ? { includeStats: true, sessionName } : { includeStats: true });
   } catch (error) {
     entry.queued = false;
     publishStatus(key, 'error');
@@ -201,13 +203,14 @@ export function forceRefreshSharedChangesForCheckout(
   ws: WsClient,
   repoPath: string,
   repoGeneration?: number,
+  sessionName?: string,
 ): void {
   const key = getSharedChangesKey(ws, repoPath);
   if (typeof repoGeneration === 'number' && Number.isFinite(repoGeneration)) {
     if (checkoutRefreshGenerationByKey.get(key) === repoGeneration) return;
     checkoutRefreshGenerationByKey.set(key, repoGeneration);
   }
-  requestSharedChanges(ws, repoPath, true);
+  requestSharedChanges(ws, repoPath, true, sessionName);
 }
 
 export function settleSharedChangesRequest(requestId: string, files: ChangeFile[] | null): boolean {
@@ -233,7 +236,7 @@ export function settleSharedChangesRequest(requestId: string, files: ChangeFile[
   }
   if (entry.queued && entry.ws && !entry.inFlightRequestId) {
     entry.queued = false;
-    requestSharedChanges(entry.ws, entry.repoPath, true);
+    requestSharedChanges(entry.ws, entry.repoPath, true, entry.sessionName);
   }
   return true;
 }

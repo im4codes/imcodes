@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import {
   runRemoteExec,
   defaultRemoteExecShell,
@@ -24,6 +24,17 @@ describe('runRemoteExec', () => {
     expect(r.stdout.trim()).toBe('hello');
     expect(r.stderr).toBe('');
     expect(r.timedOut).toBeUndefined();
+  });
+
+  it('arms the 900 second default process timeout when timeoutMs is omitted', async () => {
+    const timeoutSpy = vi.spyOn(globalThis, 'setTimeout');
+    try {
+      const r = await runRemoteExec({ requestId: 'default-timeout', command: 'echo default', shell: SH });
+      expect(r.ok).toBe(true);
+      expect(timeoutSpy.mock.calls.some(([, delay]) => delay === 900_000)).toBe(true);
+    } finally {
+      timeoutSpy.mockRestore();
+    }
   });
 
   it('reports a non-zero exit code but still ok (process ran to completion)', async () => {

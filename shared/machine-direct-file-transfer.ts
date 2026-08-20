@@ -1,12 +1,18 @@
 import { isIP } from 'node:net';
 import {
+  MACHINE_DIRECT_FILE_FETCH_CAPABILITY,
+  MACHINE_DIRECT_FILE_TRANSFER_CAPABILITY,
+} from './machine-direct-file-transfer-capabilities.js';
+import {
   FILE_TRANSFER_PATH_MAX_BYTES,
   type AttachmentRef,
   type FileTransferValidationResult,
 } from './transport/file-transfer.js';
 
-export const MACHINE_DIRECT_FILE_TRANSFER_CAPABILITY = 'file.transfer.machine_direct.v1' as const;
-export const MACHINE_DIRECT_FILE_FETCH_CAPABILITY = 'file.transfer.machine_direct_fetch.v1' as const;
+export {
+  MACHINE_DIRECT_FILE_FETCH_CAPABILITY,
+  MACHINE_DIRECT_FILE_TRANSFER_CAPABILITY,
+};
 
 export const MACHINE_FILE_TRANSFER_TRANSPORT = {
   DIRECT: 'direct',

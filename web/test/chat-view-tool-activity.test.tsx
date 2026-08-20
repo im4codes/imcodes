@@ -147,6 +147,35 @@ describe('ChatView compact tool activity', () => {
     expect(container.querySelectorAll('.chat-tool-activity-segment')).toHaveLength(1);
   });
 
+  it('provides a full-width collapse bar after the expanded tool group', () => {
+    const call = makeEvent('bottom-collapse-call', 'tool.call', {
+      tool: 'Bash',
+      input: { command: 'npm test' },
+    }, 1);
+    const result = makeEvent('bottom-collapse-result', 'tool.result', {
+      output: 'passed',
+    }, 2);
+
+    const { container } = render(<ChatView events={[call, result]} loading={false} />);
+    const activity = container.querySelector('.chat-tool-activity') as HTMLButtonElement;
+
+    fireEvent.click(activity);
+
+    const footer = container.querySelector<HTMLButtonElement>('.chat-tool-activity-collapse-footer');
+    expect(container.querySelector('.chat-tool-activity-details')).not.toBeNull();
+    expect(footer).not.toBeNull();
+    expect(footer?.getAttribute('aria-expanded')).toBe('true');
+    expect(footer?.getAttribute('aria-label')).toBe('Collapse tool details');
+    expect(footer?.textContent).toContain('Tools');
+    expect(footer?.textContent).toContain('Collapse tool details');
+
+    fireEvent.click(footer!);
+
+    expect(activity.getAttribute('aria-expanded')).toBe('false');
+    expect(container.querySelector('.chat-tool-activity-details')).toBeNull();
+    expect(container.querySelector('.chat-tool-activity-collapse-footer')).toBeNull();
+  });
+
   it('keeps failed tools visible in the compact rail', () => {
     const call = makeEvent('failed-call', 'tool.call', {
       tool: 'Write',

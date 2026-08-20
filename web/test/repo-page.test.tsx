@@ -88,6 +88,7 @@ vi.mock('react-i18next', () => ({
 import { RepoPage } from '../src/pages/RepoPage.js';
 import type { WsClient, ServerMessage } from '../src/ws-client.js';
 import { __resetSessionRepoContextStoreForTests } from '../src/session-repo-context-store.js';
+import { FS_SESSION_ROOT_PATH } from '../../src/shared/transport/fs.js';
 
 // ── WsClient mock factory ─────────────────────────────────────────────────
 
@@ -330,6 +331,35 @@ describe('RepoPage', () => {
     });
 
     expect(repoDetect).toHaveBeenCalledTimes(1);
+  });
+
+  it('uses the virtual session root and accepts daemon-owned paths in shared repository responses', async () => {
+    const { ws, repoDetect, respondDetectFlat, respondTab } = makeWs();
+    render(
+      <RepoPage
+        ws={ws}
+        sessionId="deck_proj_brain"
+        projectDir={FS_SESSION_ROOT_PATH}
+        scopeToSessionRoot
+        readOnly
+        onBack={vi.fn()}
+      />,
+    );
+
+    expect(repoDetect).toHaveBeenCalledWith(FS_SESSION_ROOT_PATH, {
+      sessionName: 'deck_proj_brain',
+    });
+
+    await act(async () => {
+      respondDetectFlat({ provider: 'github', owner: 'acme', repo: 'widgets', branch: 'main' }, '/daemon/owned/project');
+    });
+    await act(async () => {
+      respondTab('repo.issues_response', '/daemon/owned/project', [
+        { number: 7, title: 'Shared issue', state: 'open' },
+      ]);
+    });
+
+    expect(screen.getByText('Shared issue')).toBeDefined();
   });
 
   // 2. Tab switching preserves state (no re-fetch)

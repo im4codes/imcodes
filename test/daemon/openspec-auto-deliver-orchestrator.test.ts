@@ -68,6 +68,7 @@ vi.mock('../../src/daemon/p2p-orchestrator.js', () => ({
 
 import {
   clearOpenSpecAutoDeliverRunsForTests,
+  describeOpenSpecAutoDeliverRunsForTests,
   dropOpenSpecAutoDeliverImplementationMarkerForTests,
   getOpenSpecAutoDeliverRun,
   getOpenSpecAutoDeliverTransitionTarget,
@@ -95,6 +96,7 @@ const execFileAsync = promisify(execFile);
 // enough headroom for full-suite contention; a genuinely absent send still
 // fails explicitly at the deadline.
 const SEND_WAIT_MS = 30_000;
+const COVERAGE_CONTENDED_SEND_WAIT_MS = 60_000;
 vi.setConfig({ testTimeout: 120_000, hookTimeout: 60_000 });
 
 async function makeChange(name: string, tasks = '- [ ] first\n- [x] second\n'): Promise<void> {
@@ -105,6 +107,30 @@ async function makeChange(name: string, tasks = '- [ ] first\n- [x] second\n'): 
   await writeFile(join(root, 'specs', 'demo', 'spec.md'), '## ADDED Requirements\n\n### Requirement: Demo\n\n#### Scenario: Demo\n- **WHEN** demo\n- **THEN** demo\n', 'utf8');
 }
 
+function describeOrchestratorActivity(): string {
+  // A bare "not observed" says nothing about what the run did instead, which is
+  // the one thing needed to tell a slow CI worker from a run that branched
+  // somewhere else and is now waiting for an event that will never arrive.
+  const sends = transportSendMock.mock.calls
+    .map((call) => String(call[0] ?? '').replace(/\s+/g, ' ').slice(0, 140))
+    .slice(-5);
+  const projections = serverLinkMock.send.mock.calls
+    .map((call) => call[0] as { type?: string; projection?: { status?: string; stage?: string; lastMessage?: string } })
+    .filter((msg) => !!msg?.projection)
+    .map((msg) => `${msg.type}:${msg.projection?.status ?? '-'}/${msg.projection?.stage ?? '-'}`)
+    .slice(-6);
+  // The stage matters most when nothing was sent at all: the idle handler
+  // matches a run by stage, so "which stage was it in" separates a slow worker
+  // from an edge that matched no branch and was dropped.
+  const runs = describeOpenSpecAutoDeliverRunsForTests()
+    .map((run) => `${run.status}${run.hasActiveCommand ? '' : ' (no active command)'}`
+      + `${run.acceptanceAuditStage ? ` audit=${run.acceptanceAuditStage}` : ''}`
+      + `${run.awaitingDispatch ? ' awaiting-dispatch' : ''}`);
+  return `\nlast transport sends:\n  ${sends.join('\n  ') || '(none)'}`
+    + `\nlast projections: ${projections.join(', ') || '(none)'}`
+    + `\nlive runs: ${runs.join(' | ') || '(none)'}`;
+}
+
 async function waitForSend(predicate: (msg: Record<string, unknown>) => boolean, maxMs = SEND_WAIT_MS): Promise<Record<string, unknown>> {
   const start = Date.now();
   while (Date.now() - start < maxMs) {
@@ -112,7 +138,7 @@ async function waitForSend(predicate: (msg: Record<string, unknown>) => boolean,
     if (found) return found;
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
-  throw new Error('Expected websocket send was not observed');
+  throw new Error(`Expected websocket send was not observed${describeOrchestratorActivity()}`);
 }
 
 async function waitForTransportSend(predicate: (text: string) => boolean, maxMs = SEND_WAIT_MS): Promise<string> {
@@ -128,7 +154,7 @@ async function waitForTransportSend(predicate: (text: string) => boolean, maxMs 
   // because the event loop crossed the wall-clock boundary.
   const found = transportSendMock.mock.calls.map((call) => String(call[0] ?? '')).find(predicate);
   if (found) return found;
-  throw new Error('Expected transport send was not observed');
+  throw new Error(`Expected transport send was not observed${describeOrchestratorActivity()}`);
 }
 
 function transportSendCount(predicate: (text: string) => boolean): number {
@@ -141,7 +167,7 @@ async function waitForTransportSendCount(predicate: (text: string) => boolean, c
     if (transportSendCount(predicate) >= count) return;
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
-  throw new Error('Expected transport send count was not observed');
+  throw new Error(`Expected transport send count was not observed${describeOrchestratorActivity()}`);
 }
 
 async function waitForP2pStartCount(count: number, maxMs = SEND_WAIT_MS): Promise<void> {
@@ -1583,6 +1609,49 @@ exec "${realGit}" "$@"
       .toContain('implementation_marker_reminders_exhausted');
     // No extra reminder beyond the cap was sent.
     expect(implementationReminderCount()).toBe(OPENSPEC_AUTO_DELIVER_MAX_IMPLEMENTATION_MARKER_REMINDERS);
+  });
+
+  it('does not exhaust the marker reminder cap while a slow session has not answered the implementation prompt yet', async () => {
+    // Regression (CI-only flake): the marker poll re-checked every poll interval
+    // and, once the first grace window had passed, nudged on EVERY poll. With
+    // tasks already fully checked there is no task progress left to reset the
+    // reminder counter, so a session that was merely slow to answer (a loaded
+    // CI worker) had the whole capped ladder spent on it within a few hundred
+    // milliseconds and the run terminalized as needs_human before it had said
+    // anything. Poll-driven nudges must cost a real quiet window each.
+    await makeChange('demo-change', '- [x] first\n- [x] second\n');
+    const launchAck = await (async () => {
+      await handleOpenSpecAutoDeliverCommand({
+        type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
+        requestId: 'req-implementation-marker-poll-grace',
+        sessionName: 'deck_demo_brain',
+        changeName: 'demo-change',
+        presetId: 'fast',
+      }, serverLinkMock as never);
+      return serverLinkMock.send.mock.calls
+        .map((call) => call[0])
+        .find((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.LAUNCH_ACK);
+    })();
+
+    await waitForTransportSend((text) =>
+      text.includes('Implementation completion marker (required):')
+      && text.includes('write this exact JSON marker to:'),
+      SEND_WAIT_MS,
+    );
+
+    // Stall far longer than the entire poll-driven ladder used to survive, but
+    // without ever going idle: the run must still be waiting in implementation.
+    await new Promise((resolve) => setTimeout(resolve, 800));
+    const run = getOpenSpecAutoDeliverRun(String(launchAck?.projection?.runId ?? ''));
+    expect(run?.status).toBe('implementation_task_loop');
+
+    // The late answer must still be accepted and advance the run.
+    await emitDeckDemoIdle();
+    await waitForSend((msg) =>
+      msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
+      && msg.projection?.stage === 'implementation_audit_repair',
+      SEND_WAIT_MS,
+    );
   });
 
   it('throttles bursty idle reminders to the minimum interval', async () => {
@@ -3031,7 +3100,7 @@ exec "${realGit}" "$@"
     const repairPrompt = await waitForTransportSend((text) =>
       text.includes('OpenSpec Auto Deliver needs the final implementation acceptance audit authoritative result file')
       && text.includes('Problem: invalid_evidence_summary'),
-      SEND_WAIT_MS,
+      COVERAGE_CONTENDED_SEND_WAIT_MS,
     );
     expect(repairPrompt).toContain(`Authoritative result file: ${origin.authoritativeResultPath}`);
     expect(repairPrompt).toContain('Allowed verdict values: PASS, REWORK, BLOCKED');
@@ -3060,7 +3129,7 @@ exec "${realGit}" "$@"
     const repairPrompt = await waitForTransportSend((text) =>
       text.includes('OpenSpec Auto Deliver needs the final implementation acceptance audit authoritative result file')
       && text.includes('Problem: missing_repair_completion'),
-      SEND_WAIT_MS,
+      COVERAGE_CONTENDED_SEND_WAIT_MS,
     );
     expect(repairPrompt).toContain(`Authoritative result file: ${origin.authoritativeResultPath}`);
     expect(repairPrompt).toContain('Final acceptance audits must include repair_completion with fields');

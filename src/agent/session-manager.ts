@@ -7,6 +7,7 @@ import { ShellDriver } from './drivers/shell.js';
 import { GeminiDriver } from './drivers/gemini.js';
 import type { AgentDriver } from './drivers/base.js';
 import type { AgentType } from './detect.js';
+import type { DshLlmConfig } from '../../shared/deepseek-harness.js';
 import { isTransportAgent } from './detect.js';
 import {
   buildTransportResumeLaunchOpts,
@@ -1061,7 +1062,7 @@ export async function relaunchSessionWithSettings(
     requestedModel: targetRequestedModel ?? undefined,
     effort: targetEffort ?? undefined,
     transportConfig: targetTransportConfig ?? undefined,
-    ccPreset: (targetAgentType === 'claude-code' || targetAgentType === 'claude-code-sdk' || targetAgentType === 'qwen')
+    ccPreset: (targetAgentType === 'claude-code' || targetAgentType === 'claude-code-sdk' || targetAgentType === 'qwen' || targetAgentType === 'deepseek-harness')
       ? (targetCcPreset ?? undefined)
       : undefined,
     ...(preserveTransportBinding ? {
@@ -1306,7 +1307,7 @@ async function recoverTransportRuntimeAfterError(
       requestedModel: record.requestedModel,
       effort: record.effort,
       transportConfig: record.transportConfig,
-      ccPreset: (record.agentType === 'claude-code-sdk' || record.agentType === 'qwen') ? record.ccPreset : undefined,
+      ccPreset: (record.agentType === 'claude-code-sdk' || record.agentType === 'qwen' || record.agentType === 'deepseek-harness') ? record.ccPreset : undefined,
       // Qwen-compatible API providers can reject a resumed conversation when
       // their persisted tool-call chain is invalid (e.g. "tool call result
       // does not follow tool call"). Auto-recovery must rotate the provider
@@ -1879,6 +1880,11 @@ function wireTransportSessionInfo(
 
     if (typeof info.effort === 'string' && next.effort !== info.effort) {
       next.effort = info.effort;
+      changed = true;
+    }
+
+    if (typeof info.serviceTier === 'string' && next.serviceTier !== info.serviceTier) {
+      next.serviceTier = info.serviceTier;
       changed = true;
     }
 
@@ -2503,6 +2509,7 @@ export async function restoreTransportSessions(
       let effectiveRequestedModel = requestedTransportModel;
       let restoredPresetContextWindow = s.presetContextWindow;
       let qwenPresetUsesApiKey = false;
+      let dshLlmConfig: DshLlmConfig | undefined;
       const resolveRuntimeContextBootstrap = () => resolveTransportContextBootstrap({
         projectDir: s.projectDir,
         transportConfig: getSession(s.name)?.transportConfig ?? s.transportConfig ?? {},
@@ -2540,6 +2547,15 @@ export async function restoreTransportSessions(
         // Override the qwen CLI's built-in "I am Qwen Code" identity with the
         // preset's runtime-facts prompt — without this, the model introduces
         // itself as Qwen / 通义千问 even when the turn is served by MiniMax.
+        if (presetConfig.systemPrompt) systemPrompt = presetConfig.systemPrompt;
+      } else if (s.providerId === 'deepseek-harness' && s.ccPreset) {
+        const { getDshPresetTransportConfig } = await import('../daemon/cc-presets.js');
+        const presetConfig = await getDshPresetTransportConfig(s.ccPreset);
+        extraEnv = { ...(extraEnv ?? {}), ...presetConfig.env };
+        dshLlmConfig = presetConfig.llm;
+        const presetPreferredModel = presetConfig.model;
+        if (presetPreferredModel && !effectiveRequestedModel) effectiveRequestedModel = presetPreferredModel;
+        restoredPresetContextWindow = presetConfig.contextWindow ?? restoredPresetContextWindow;
         if (presetConfig.systemPrompt) systemPrompt = presetConfig.systemPrompt;
       }
       if (s.providerId === 'qwen'
@@ -2582,6 +2598,7 @@ export async function restoreTransportSessions(
         contextRetryExhausted: contextBootstrap.retryExhausted,
         contextSharedPolicyOverride: contextBootstrap.sharedPolicyOverride,
         agentId: effectiveRequestedModel,
+        ...(dshLlmConfig ? { llm: dshLlmConfig } : {}),
         resumeId,
         effort: s.effort,
         // Restore path: only re-inject startup memory if the prior run hadn't
@@ -2844,6 +2861,7 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
   let sdkDisplay: Pick<SessionRecord, 'planLabel' | 'quotaLabel' | 'quotaUsageLabel' | 'quotaMeta'> | undefined;
   let transportSystemPrompt: string | undefined;
   let transportSettings: string | Record<string, unknown> | undefined;
+  let dshLlmConfig: DshLlmConfig | undefined;
   const storedRequestedModel = !opts.fresh ? existing?.requestedModel : undefined;
   const storedProviderResumeId = !opts.fresh ? existing?.providerResumeId : undefined;
   let requestedTransportModel = opts.requestedModel ?? storedRequestedModel ?? (agentType === 'qwen' ? (opts.qwenModel ?? existing?.qwenModel) : undefined);
@@ -2978,6 +2996,20 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
     effectiveBindExistingKey = undefined;
     effectiveSkipCreate = false;
     transportResumeId = undefined;
+  } else if (agentType === 'deepseek-harness') {
+    if (effectiveCcPreset) {
+      const { getDshPresetTransportConfig } = await import('../daemon/cc-presets.js');
+      const presetConfig = await getDshPresetTransportConfig(effectiveCcPreset);
+      transportEnv = { ...(transportEnv ?? {}), ...presetConfig.env };
+      dshLlmConfig = presetConfig.llm;
+      if (!requestedTransportModel && presetConfig.model) requestedTransportModel = presetConfig.model;
+      presetContextWindow = presetConfig.contextWindow ?? presetContextWindow;
+      if (presetConfig.systemPrompt) transportSystemPrompt = presetConfig.systemPrompt;
+    }
+    effectiveSessionKey = randomUUID();
+    effectiveBindExistingKey = undefined;
+    transportResumeId = opts.providerResumeId ?? storedProviderResumeId;
+    effectiveSkipCreate = !!transportResumeId;
   } else if (usesProviderResumeId(agentType)) {
     effectiveSessionKey = randomUUID();
     effectiveBindExistingKey = undefined;
@@ -3014,6 +3046,7 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
     // cap. See p2p audit 37bfbb85-430 N-A.
     systemPrompt: transportSystemPrompt,
     ...(transportSettings ? { settings: transportSettings } : {}),
+    ...(dshLlmConfig ? { llm: dshLlmConfig } : {}),
     contextNamespace: contextBootstrap.namespace,
     contextNamespaceDiagnostics: contextBootstrap.diagnostics,
     contextRemoteProcessedFreshness: contextBootstrap.remoteProcessedFreshness,

@@ -126,7 +126,7 @@ describe('FileEditor', () => {
       expect(ws.fsWriteFile).toHaveBeenCalledWith(
         '/home/user/file.txt',
         'edited',
-        1700000000000,
+        { expectedMtime: 1700000000000 },
       );
     });
 
@@ -152,7 +152,7 @@ describe('FileEditor', () => {
       expect(ws.fsWriteFile).toHaveBeenCalledWith(
         '/file.txt',
         '',
-        1000,
+        { expectedMtime: 1000 },
       );
     });
   });
@@ -193,7 +193,7 @@ describe('FileEditor', () => {
       fireEvent.click(screen.getByText('fileBrowser.save'));
 
       // Should use the UPDATED mtime (2000), not stale (1000)
-      expect(ws.fsWriteFile).toHaveBeenCalledWith('/file.txt', 'edited', 2000);
+      expect(ws.fsWriteFile).toHaveBeenCalledWith('/file.txt', 'edited', { expectedMtime: 2000 });
     });
   });
 

@@ -21,6 +21,7 @@ import {
 } from './cc-preset-form.js';
 import {
   CC_PRESET_MSG,
+  CUSTOM_PROVIDER_SDK_AGENT_TYPES,
   getCcPresetAvailableModelIds,
   getCcPresetEffectiveModel,
   normalizeCcPresetName,
@@ -126,7 +127,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
     return preset;
   };
   const selectType = (nextType: string) => {
-    if (customProviderSdk && nextType !== 'claude-code-sdk') return;
+    if (customProviderSdk && !CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(nextType)) return;
     setType(nextType);
     if (!customProviderSdk) setLastUnlockedType(nextType);
     setPresetError('');
@@ -135,8 +136,10 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
     setCustomProviderSdk(enabled);
     setPresetError('');
     if (enabled) {
-      if (type !== 'claude-code-sdk') setLastUnlockedType(type);
-      setType('claude-code-sdk');
+      if (!CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(type)) {
+        setLastUnlockedType(type);
+        setType('claude-code-sdk');
+      }
       return;
     }
     setType(lastUnlockedType);
@@ -239,7 +242,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
 
   useEffect(() => {
     if (!customProviderSdk) return;
-    if (type !== 'claude-code-sdk') setType('claude-code-sdk');
+    if (!CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(type)) setType('claude-code-sdk');
     if (!ccPreset && ccPresets.length > 0) setCcPreset(ccPresets[0].name);
   }, [ccPreset, ccPresets, customProviderSdk, type]);
 
@@ -294,9 +297,9 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
     }
     const extra: Record<string, unknown> = {};
     if (desc) extra.description = desc;
-    if (ccPreset && (type === 'claude-code' || type === 'claude-code-sdk' || type === 'qwen')) extra.ccPreset = ccPreset;
+    if (ccPreset && (type === 'claude-code' || type === 'claude-code-sdk' || type === 'qwen' || type === 'deepseek-harness')) extra.ccPreset = ccPreset;
     if (ccInitPrompt.trim() && type === 'claude-code') extra.ccInitPrompt = ccInitPrompt.trim();
-    if ((type === 'claude-code-sdk' || type === 'codex-sdk' || type === 'copilot-sdk' || type === 'cursor-headless' || type === 'opencode-sdk' || type === 'gemini-sdk' || type === 'grok-sdk' || type === 'kimi-sdk' || type === 'qwen') && requestedModel.trim()) extra.requestedModel = requestedModel.trim();
+    if ((type === 'claude-code-sdk' || type === 'codex-sdk' || type === 'copilot-sdk' || type === 'cursor-headless' || type === 'opencode-sdk' || type === 'gemini-sdk' || type === 'grok-sdk' || type === 'kimi-sdk' || type === 'deepseek-harness' || type === 'qwen') && requestedModel.trim()) extra.requestedModel = requestedModel.trim();
     if (type === 'claude-code-sdk' || type === 'codex-sdk' || type === 'copilot-sdk' || type === 'qwen') extra.thinking = thinking;
     onStart(type, selectedShell, cwd || undefined, label || undefined, Object.keys(extra).length > 0 ? extra : undefined);
   };
@@ -312,7 +315,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
           : type === 'openclaw'
             ? OPENCLAW_THINKING_LEVELS
             : [];
-  const supportsCcPreset = type === 'claude-code' || type === 'claude-code-sdk' || type === 'qwen';
+  const supportsCcPreset = type === 'claude-code' || type === 'claude-code-sdk' || type === 'qwen' || type === 'deepseek-harness';
   const providerPresetLabel = customProviderSdk
     ? t('new_session.custom_provider_preset')
     : type === 'qwen'
@@ -324,7 +327,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
     dynamicModelsAgentType,
     type === 'claude-code-sdk' ? ccPreset : undefined,
   );
-  const supportsModelSelection = type === 'claude-code-sdk' || type === 'codex-sdk' || type === 'copilot-sdk' || type === 'cursor-headless' || type === 'opencode-sdk' || type === 'gemini-sdk' || type === 'grok-sdk' || type === 'kimi-sdk' || (type === 'qwen' && !!selectedCcPreset);
+  const supportsModelSelection = type === 'claude-code-sdk' || type === 'codex-sdk' || type === 'copilot-sdk' || type === 'cursor-headless' || type === 'opencode-sdk' || type === 'gemini-sdk' || type === 'grok-sdk' || type === 'kimi-sdk' || type === 'deepseek-harness' || (type === 'qwen' && !!selectedCcPreset);
   const modelSuggestions = useMemo(() => (
     (type === 'qwen' || type === 'claude-code-sdk') && selectedCcPreset
       ? mergeModelSuggestions(
@@ -392,23 +395,29 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
           <div>
             <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 8 }}>Type</div>
             <div class="subsession-type-groups">
-              {agentGroups.map((group) => (
-                <div key={group.id} class="subsession-type-group">
-                  <div class="subsession-type-group-title">{t(SESSION_AGENT_GROUP_LABEL_KEYS[group.id])}</div>
-                  <div class="subsession-type-grid">
-                    {group.items.map((choice) => (
-                      <button
-                        key={choice.id}
-                        class={`subsession-type-btn${type === choice.id ? ' active' : ''}`}
-                        disabled={customProviderSdk && choice.id !== 'claude-code-sdk'}
-                        onClick={() => selectType(choice.id)}
-                      >
-                        <span>{choice.icon}</span> {getSessionAgentLabel(t, choice)}
-                      </button>
-                    ))}
+              {agentGroups.map((group) => {
+                const visibleItems = customProviderSdk
+                  ? group.items.filter((choice) => CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(choice.id))
+                  : group.items;
+                if (visibleItems.length === 0) return null;
+                return (
+                  <div key={group.id} class="subsession-type-group">
+                    <div class="subsession-type-group-title">{t(SESSION_AGENT_GROUP_LABEL_KEYS[group.id])}</div>
+                    <div class="subsession-type-grid">
+                      {visibleItems.map((choice) => (
+                        <button
+                          key={choice.id}
+                          class={`subsession-type-btn${type === choice.id ? ' active' : ''}`}
+                          disabled={customProviderSdk && !CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(choice.id)}
+                          onClick={() => selectType(choice.id)}
+                        >
+                          <span>{choice.icon}</span> {getSessionAgentLabel(t, choice)}
+                        </button>
+                      ))}
+                    </div>
                   </div>
-                </div>
-              ))}
+                );
+              })}
             </div>
             <SdkModeRecommendation agentType={type} />
             <div style={{ marginTop: 10 }}>

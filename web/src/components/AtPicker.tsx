@@ -41,13 +41,14 @@ interface AtPickerProps {
   rootSession: string;
   wsClient: any;
   projectDir?: string;
+  sessionName?: string;
   onSelectFile: (path: string) => void;
   onSelectAgent: (session: string, mode: string) => void;
   onSelectDelegateAgent: (session: string) => void;
   /** Insert the `;;(name)` marker for the chosen alias (never the value). */
   onSelectAlias?: (name: string) => void;
-  /** Insert the `^^(refName)` marker for the chosen machine (marker only). */
-  onSelectMachine?: (refName: string) => void;
+  /** Insert the stable machine marker plus its human-readable display note. */
+  onSelectMachine?: (refName: string, displayName: string) => void;
   onSelectAllConfig?: (config: P2pSavedConfig, rounds: number, modeOverride: string) => void;
   /** Launch a Team discussion directly with the chosen combo/mode and round count. */
   onLaunchTeam?: (modeKey: string, rounds: number) => void;
@@ -159,6 +160,7 @@ export function AtPicker({
   rootSession,
   wsClient,
   projectDir,
+  sessionName,
   onSelectFile,
   onSelectDelegateAgent,
   onSelectAlias,
@@ -170,6 +172,8 @@ export function AtPicker({
 }: AtPickerProps) {
   const { t } = useTranslation();
   const [category, setCategory] = useState<Category>('choose');
+  /** Previous query, so auto file-search fires on the empty -> typed edge only. */
+  const lastQueryRef = useRef('');
   // Alias list is filtered by the same inline query (name + description) the
   // rest of the picker uses. Selecting one inserts its `;;(name)` marker only.
   const { filtered: aliasResults } = useAliases(category === 'aliases' ? query : undefined);
@@ -246,7 +250,7 @@ export function AtPicker({
       const reqId = crypto.randomUUID();
       requestIdRef.current = reqId;
       try {
-        wsClient.send({ type: 'file.search', requestId: reqId, query, projectDir });
+        wsClient.send({ type: 'file.search', requestId: reqId, query, projectDir, ...(sessionName ? { sessionName } : {}) });
       } catch {
         // WS not connected
       }
@@ -255,7 +259,7 @@ export function AtPicker({
     return () => {
       if (debounceRef.current) clearTimeout(debounceRef.current);
     };
-  }, [query, visible, wsClient, category, projectDir]);
+  }, [query, visible, wsClient, category, projectDir, sessionName]);
 
   // Listen for file search responses
   useEffect(() => {
@@ -294,6 +298,27 @@ export function AtPicker({
     if (!visible) return;
     setHighlightIdx(0);
   }, [query, visible]);
+
+  // Typing right after `@` means "find this file". The chooser only exists to
+  // disambiguate an EMPTY query, so making the user select files by hand
+  // before searching cost a keystroke on the common path. Entering the files
+  // category on the first typed character keeps every other category reachable
+  // from the empty-query chooser.
+  useLayoutEffect(() => {
+    const previousQuery = lastQueryRef.current;
+    lastQueryRef.current = visible ? query : '';
+    if (!visible) return;
+    if (category !== 'choose') return;
+    if (!query) return;
+    // Fire only on the empty -> non-empty transition, i.e. the moment the user
+    // starts typing. Every back/Escape handler returns to the chooser WITHOUT
+    // clearing the query, so a standing "non-empty means files" rule bounced
+    // straight back out and made the chooser unreachable after any typing —
+    // and a once-per-opening guard did not help, because in that flow the
+    // first firing IS the one on the way back.
+    if (previousQuery) return;
+    setCategory('files');
+  }, [visible, category, query]);
 
   useLayoutEffect(() => {
     if (!visible) return;
@@ -358,7 +383,7 @@ export function AtPicker({
           // Snap an offline/out-of-range highlight to the first online row.
           const effIdx = machineResults[highlightIdx]?.online ? highlightIdx : onlineIdx[0];
           const m = machineResults[effIdx];
-          if (m) onSelectMachine?.(m.refName);
+          if (m) onSelectMachine?.(m.refName, m.displayName);
           return;
         }
         return;
@@ -554,7 +579,7 @@ export function AtPicker({
                 ...(hl ? itemHighlightStyle : itemStyle),
                 ...(selectable ? {} : { color: '#64748b', cursor: 'not-allowed', opacity: 0.65 }),
               }}
-              onClick={() => { if (selectable) onSelectMachine?.(m.refName); }}
+              onClick={() => { if (selectable) onSelectMachine?.(m.refName, m.displayName); }}
               onMouseEnter={() => { if (selectable) setHighlightIdx(idx); }}
             >
               <span

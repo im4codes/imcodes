@@ -56,16 +56,15 @@ describe('AtPicker', () => {
     vi.clearAllMocks();
   });
 
-  function renderPicker() {
+  function pickerWithQuery(query: string) {
     const wsClient = {
       connected: true,
       send: vi.fn(),
       onMessage: vi.fn(() => () => {}),
     };
-
-    return render(
+    return (
       <AtPicker
-        query=""
+        query={query}
         sessions={[
           { name: 'deck_proj_brain', agentType: 'claude-code', state: 'idle', parentSession: null, isSelf: true },
           { name: 'deck_sub_worker1', agentType: 'codex', state: 'idle', parentSession: 'deck_proj_brain' },
@@ -81,8 +80,12 @@ describe('AtPicker', () => {
         onSelectDelegateAgent={vi.fn()}
         onClose={vi.fn()}
         visible
-      />,
+      />
     );
+  }
+
+  function renderPicker(query = '') {
+    return render(pickerWithQuery(query));
   }
 
   it('defaults to files in category chooser', () => {
@@ -536,5 +539,77 @@ describe('AtPicker', () => {
     fireEvent.click(screen.getByText('audit › discuss'));
 
     expect(onLaunchTeam).toHaveBeenCalledWith('audit>discuss', 1);
+  });
+  it('drops straight into file search when a query is typed after @', () => {
+    // The chooser only disambiguates an EMPTY query. Requiring the user to
+    // select "files" before searching cost a keystroke on the most common path.
+    renderPicker('src/index');
+
+    // The chooser rows are gone — we are in the files category, searching.
+    expect(screen.queryByText('agents')).toBeNull();
+    expect(screen.queryByText('alias.category')).toBeNull();
+  });
+
+  it('scopes shared-session file search without exposing an absolute project path', async () => {
+    const wsClient = { connected: true, send: vi.fn(), onMessage: vi.fn(() => () => {}) };
+    render(
+      <AtPicker
+        query="readme"
+        sessions={[]}
+        rootSession="deck_project_brain"
+        wsClient={wsClient as any}
+        projectDir=":session-root:"
+        sessionName="deck_project_brain"
+        onSelectFile={vi.fn()}
+        onSelectAgent={vi.fn()}
+        onSelectDelegateAgent={vi.fn()}
+        onClose={vi.fn()}
+        visible
+      />,
+    );
+
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    });
+
+    expect(wsClient.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'file.search',
+      query: 'readme',
+      projectDir: ':session-root:',
+      sessionName: 'deck_project_brain',
+    }));
+  });
+
+  it('still shows the chooser for a bare @ so other categories stay reachable', () => {
+    renderPicker('');
+
+    expect(screen.getByText('files')).toBeDefined();
+    expect(screen.getByText('agents')).toBeDefined();
+  });
+  it('returns to the chooser after Escape even when a filter query is still typed', () => {
+    // Every back/Escape handler returns to the chooser WITHOUT clearing the
+    // query. A standing "non-empty query means files" rule re-fired on the way
+    // back and made the chooser unreachable once the user had typed anything.
+    const { rerender } = renderPicker('');
+
+    fireEvent.click(screen.getByText('agents'));
+    expect(screen.getByText('brain')).toBeDefined();
+
+    // The user filters inside agents — the composer forwards the query.
+    rerender(pickerWithQuery('bra'));
+    fireEvent.keyDown(document, { key: 'Escape' });
+
+    // Chooser, not a file search for "bra".
+    expect(screen.getByText('files')).toBeDefined();
+    expect(screen.getByText('agents')).toBeDefined();
+  });
+
+  it('still auto-enters file search on the first typed character', () => {
+    // The one-shot guard must not disable the feature it guards.
+    const { rerender } = renderPicker('');
+    expect(screen.getByText('agents')).toBeDefined();
+
+    rerender(pickerWithQuery('src/index'));
+    expect(screen.queryByText('agents')).toBeNull();
   });
 });

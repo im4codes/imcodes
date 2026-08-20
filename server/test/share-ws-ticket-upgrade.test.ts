@@ -7,6 +7,10 @@ import { WsBridge } from '../src/ws/bridge.js';
 import type { Database } from '../src/db/client.js';
 import type { Env } from '../src/env.js';
 import type { ShareAuthorizationSnapshot, ShareTarget } from '../../shared/tab-sharing.js';
+import {
+  REMOTE_DESKTOP_SERVER_ID_QUERY,
+  REMOTE_DESKTOP_SIGNALING_PATH,
+} from '../../shared/remote-desktop.js';
 
 type ConnectResult = { opened: true; ws: WebSocket } | { opened: false; statusCode?: number };
 
@@ -54,6 +58,9 @@ function makeDb(serverId: string, options: ShareDbOptions = {}): Database {
       }
       if (normalized.includes('select team_id, user_id from servers where id = $1')) {
         return { team_id: null, user_id: 'member-user' } as T;
+      }
+      if (normalized.includes('select node_role from servers where id = $1 and revoked_at is null')) {
+        return { node_role: 'full' } as T;
       }
       if (normalized.includes('runtime_type')) return { runtime_type: 'transport' } as T;
       return null;
@@ -174,6 +181,12 @@ function wsUrl(port: number, serverId: string, ticket: string): string {
   return `ws://127.0.0.1:${port}/api/server/${serverId}/ws?ticket=${encodeURIComponent(ticket)}`;
 }
 
+function remoteDesktopWsUrl(port: number, serverId: string, ticket?: string): string {
+  const query = new URLSearchParams({ [REMOTE_DESKTOP_SERVER_ID_QUERY]: serverId });
+  if (ticket) query.set('ticket', ticket);
+  return `ws://127.0.0.1:${port}${REMOTE_DESKTOP_SIGNALING_PATH}?${query.toString()}`;
+}
+
 describe('share websocket ticket upgrade semantics', () => {
   let httpServer: HttpServer;
   let port: number;
@@ -268,6 +281,23 @@ describe('share websocket ticket upgrade semantics', () => {
     const memberSecond = await connect(memberUrl);
     expect(memberSecond.opened).toBe(false);
     if (!memberSecond.opened) expect(memberSecond.statusCode).toBe(401);
+  });
+
+  it('routes remote desktop signaling by the explicit serverId query and requires a browser ticket', async () => {
+    const memberTicket = signJwt({
+      type: 'ws-ticket',
+      sub: 'member-user',
+      sid: serverId,
+      jti: `remote-desktop-member-jti-${serverId}`,
+    }, env.JWT_SIGNING_KEY, 30);
+
+    const connected = await connect(remoteDesktopWsUrl(port, serverId, memberTicket));
+    expect(connected.opened).toBe(true);
+    if (connected.opened) await closeWs(connected.ws);
+
+    const withoutTicket = await connect(remoteDesktopWsUrl(port, serverId));
+    expect(withoutTicket.opened).toBe(false);
+    if (!withoutTicket.opened) expect(withoutTicket.statusCode).toBe(401);
   });
 
   it('admits share-only concrete main-tab and sub-session tickets without server membership', async () => {

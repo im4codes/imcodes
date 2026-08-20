@@ -14,6 +14,7 @@ import { listSessions } from '../store/session-store.js';
 import type { ServerLink } from './server-link.js';
 import logger from '../util/logger.js';
 import { REPO_MSG } from '../shared/repo-types.js';
+import { FS_SESSION_ROOT_PATH } from '../shared/transport/fs.js';
 import { bumpRepoGeneration, getRepoGenerationSnapshot } from '../repo/generation.js';
 import {
   assertGitRepository,
@@ -147,6 +148,16 @@ function validateProjectDir(projectDir: unknown): projectDir is string {
   if (typeof projectDir !== 'string' || !projectDir) return false;
   const knownDirs = new Set(listSessions().map((s) => s.projectDir));
   return knownDirs.has(projectDir);
+}
+
+function resolveProjectDir(cmd: Record<string, unknown>): string | null {
+  const rawProjectDir = cmd.projectDir;
+  if (rawProjectDir !== FS_SESSION_ROOT_PATH) {
+    return validateProjectDir(rawProjectDir) ? rawProjectDir : null;
+  }
+  const sessionBinding = cmd.sessionName ?? cmd.sessionId ?? cmd.session ?? cmd.activeSessionName ?? cmd.activeSessionId;
+  if (typeof sessionBinding !== 'string' || !sessionBinding.trim()) return null;
+  return listSessions().find((session) => session.name === sessionBinding.trim())?.projectDir ?? null;
 }
 
 function validateCheckoutProjectContext(cmd: Record<string, unknown>, projectDir: string): boolean {
@@ -669,15 +680,20 @@ function sendError(
 
 export function handleRepoCommand(cmd: Record<string, unknown>, serverLink: ServerLink): void {
   const requestId = cmd.requestId as string | undefined;
-  const projectDir = cmd.projectDir;
+  const requestedProjectDir = cmd.projectDir;
+  const projectDir = resolveProjectDir(cmd);
   const isCheckout = cmd.type === REPO_MSG.CHECKOUT_BRANCH;
 
   // projectDir validation for all commands
-  if (!validateProjectDir(projectDir)) {
-    logger.debug({ projectDir, knownDirs: listSessions().map((s) => s.projectDir) }, 'repo: projectDir validation failed');
-    serverLink.send({ type: REPO_MSG.ERROR, requestId, projectDir, error: 'invalid_params' as RepoError });
+  if (!projectDir) {
+    logger.debug({ projectDir: requestedProjectDir, knownDirs: listSessions().map((s) => s.projectDir) }, 'repo: projectDir validation failed');
+    serverLink.send({ type: REPO_MSG.ERROR, requestId, projectDir: requestedProjectDir, error: 'invalid_params' as RepoError });
     return;
   }
+  // From this point on providers see only the daemon-owned project directory.
+  // Shared browsers send the opaque session-root sentinel and never learn or
+  // choose an arbitrary host path.
+  cmd.projectDir = projectDir;
 
   // Input schema validation
   if (cmd.state !== undefined && !isValidState(cmd.state)) {

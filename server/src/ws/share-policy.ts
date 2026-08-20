@@ -5,6 +5,9 @@ import { DAEMON_COMMAND_TYPES } from '../../../shared/daemon-command-types.js';
 import { TRANSPORT_MSG } from '../../../shared/transport-events.js';
 import { FS_TRANSPORT_MSG } from '../../../shared/fs-transport-messages.js';
 import { P2P_WORKFLOW_MSG } from '../../../shared/p2p-workflow-messages.js';
+import { P2P_CONFIG_MSG } from '../../../shared/p2p-config-events.js';
+import { isP2pSavedConfig, sanitizeP2pSavedConfig } from '../../../shared/p2p-modes.js';
+import { collectRoutedSessionNames } from '../../../shared/p2p-routing-fields.js';
 import {
   SHARE_BROWSER_COMMANDS,
   rawSubSessionIdFromDisplayName,
@@ -18,6 +21,9 @@ import {
   type ShareTarget,
 } from '../../../shared/tab-sharing.js';
 import { REPO_MSG } from '../../../shared/repo-types.js';
+import { TIMELINE_MESSAGES } from '../../../shared/timeline-protocol.js';
+import { DIRECT_FILE_TRANSFER_MSG } from '../../../shared/direct-file-transfer.js';
+import { TRANSPORT_QUEUE_COMMANDS } from '../../../shared/transport-queue-types.js';
 
 export { shareTargetKey };
 export type { EffectiveCoverage, ShareTarget };
@@ -44,6 +50,8 @@ export type ShareScopedSocketState = {
   snapshot: ShareAuthorizationSnapshot;
   connectedAt: number;
   coveredSessionNames?: readonly string[];
+  /** When coverage was last re-resolved from the DB; bounds snapshot staleness. */
+  coverageCheckedAt?: number;
 };
 
 export type ShareCoverageResolver = (input: {
@@ -60,8 +68,13 @@ export type ShareCommandDecision =
 
 type ShareCommandPolicy =
   | { kind: 'allow-covered-read'; requireTarget: boolean }
+  | { kind: 'participant-covered-action' }
+  | { kind: 'participant-bound-action' }
   | { kind: 'participant-discussion-start' }
   | { kind: 'participant-send' }
+  | { kind: 'participant-model-switch' }
+  | { kind: 'participant-model-list' }
+  | { kind: 'participant-p2p-config-save' }
   | { kind: 'participant-cancel' }
   | { kind: 'deny'; reason: ShareReason };
 
@@ -86,6 +99,18 @@ export const SHARE_REASONS = {
   COMMENT_INVALID: 'share-comment-invalid',
 } as const satisfies Record<string, ShareReason>;
 
+const SHARE_MODEL_CATALOG_AGENT_TYPES = new Set([
+  'claude-code-sdk',
+  'copilot-sdk',
+  'cursor-headless',
+  'codex-sdk',
+  'opencode-sdk',
+  'gemini-sdk',
+  'grok-sdk',
+  'kimi-sdk',
+  'deepseek-harness',
+]);
+
 function denyFromShared(sharedCommand: string): ShareCommandPolicy {
   const policy = getShareScopedCommandPolicy(sharedCommand);
   if (policy.disposition !== 'deny' || !policy.reason) {
@@ -101,10 +126,30 @@ export const SHARE_WS_COMMAND_POLICY_INVENTORY: readonly ShareBridgeCommandInven
   { bridgeCommand: TRANSPORT_MSG.CHAT_SUBSCRIBE, sharedCommand: SHARE_BROWSER_COMMANDS.CHAT_HISTORY, policy: { kind: 'allow-covered-read', requireTarget: true } },
   { bridgeCommand: TRANSPORT_MSG.CHAT_UNSUBSCRIBE, sharedCommand: SHARE_BROWSER_COMMANDS.CHAT_HISTORY, policy: { kind: 'allow-covered-read', requireTarget: true } },
   { bridgeCommand: TRANSPORT_MSG.CHAT_HISTORY, sharedCommand: SHARE_BROWSER_COMMANDS.CHAT_HISTORY, policy: { kind: 'allow-covered-read', requireTarget: true } },
+  { bridgeCommand: TIMELINE_MESSAGES.HISTORY_REQUEST, sharedCommand: SHARE_BROWSER_COMMANDS.CHAT_HISTORY, policy: { kind: 'allow-covered-read', requireTarget: true } },
+  { bridgeCommand: TIMELINE_MESSAGES.REPLAY_REQUEST, sharedCommand: SHARE_BROWSER_COMMANDS.CHAT_HISTORY, policy: { kind: 'allow-covered-read', requireTarget: true } },
+  { bridgeCommand: TIMELINE_MESSAGES.PAGE_REQUEST, sharedCommand: SHARE_BROWSER_COMMANDS.CHAT_HISTORY, policy: { kind: 'allow-covered-read', requireTarget: true } },
+  { bridgeCommand: TIMELINE_MESSAGES.DETAIL_REQUEST, sharedCommand: SHARE_BROWSER_COMMANDS.CHAT_HISTORY, policy: { kind: 'allow-covered-read', requireTarget: true } },
   { bridgeCommand: 'discussion.start', sharedCommand: SHARE_BROWSER_COMMANDS.DISCUSSION_START, policy: { kind: 'participant-discussion-start' } },
   { bridgeCommand: 'session.send', sharedCommand: SHARE_BROWSER_COMMANDS.SESSION_SEND, policy: { kind: 'participant-send' } },
+  { bridgeCommand: 'subsession.set_model', sharedCommand: SHARE_BROWSER_COMMANDS.SESSION_MODEL_SWITCH, policy: { kind: 'participant-model-switch' } },
+  { bridgeCommand: TRANSPORT_MSG.LIST_MODELS, sharedCommand: SHARE_BROWSER_COMMANDS.SESSION_MODEL_LIST, policy: { kind: 'participant-model-list' } },
   { bridgeCommand: DAEMON_COMMAND_TYPES.SESSION_CANCEL, sharedCommand: SHARE_BROWSER_COMMANDS.SESSION_CANCEL, policy: { kind: 'participant-cancel' } },
   { bridgeCommand: 'discussion.comment', sharedCommand: SHARE_BROWSER_COMMANDS.DISCUSSION_COMMENT, policy: { kind: 'allow-covered-read', requireTarget: false } },
+  { bridgeCommand: 'fs.ls', sharedCommand: SHARE_BROWSER_COMMANDS.FILE_BROWSE, policy: { kind: 'allow-covered-read', requireTarget: true } },
+  { bridgeCommand: 'fs.read', sharedCommand: SHARE_BROWSER_COMMANDS.FILE_READ, policy: { kind: 'allow-covered-read', requireTarget: true } },
+  { bridgeCommand: 'file.search', sharedCommand: SHARE_BROWSER_COMMANDS.FILE_SEARCH, policy: { kind: 'allow-covered-read', requireTarget: true } },
+  { bridgeCommand: 'fs.git_status', sharedCommand: SHARE_BROWSER_COMMANDS.REPO_STATUS, policy: { kind: 'allow-covered-read', requireTarget: true } },
+  { bridgeCommand: 'fs.git_diff', sharedCommand: SHARE_BROWSER_COMMANDS.REPO_DIFF, policy: { kind: 'allow-covered-read', requireTarget: true } },
+  { bridgeCommand: 'fs.mkdir', sharedCommand: SHARE_BROWSER_COMMANDS.FILE_WRITE, policy: { kind: 'participant-covered-action' } },
+  { bridgeCommand: 'fs.write', sharedCommand: SHARE_BROWSER_COMMANDS.FILE_WRITE, policy: { kind: 'participant-covered-action' } },
+  { bridgeCommand: FS_TRANSPORT_MSG.RENAME, sharedCommand: SHARE_BROWSER_COMMANDS.FILE_EDIT, policy: { kind: 'participant-covered-action' } },
+  { bridgeCommand: FS_TRANSPORT_MSG.DELETE, sharedCommand: SHARE_BROWSER_COMMANDS.FILE_DELETE, policy: { kind: 'participant-covered-action' } },
+  { bridgeCommand: DIRECT_FILE_TRANSFER_MSG.INIT, sharedCommand: SHARE_BROWSER_COMMANDS.FILE_WRITE, policy: { kind: 'participant-covered-action' } },
+  { bridgeCommand: DIRECT_FILE_TRANSFER_MSG.OFFER, sharedCommand: SHARE_BROWSER_COMMANDS.FILE_WRITE, policy: { kind: 'participant-bound-action' } },
+  { bridgeCommand: DIRECT_FILE_TRANSFER_MSG.ICE, sharedCommand: SHARE_BROWSER_COMMANDS.FILE_WRITE, policy: { kind: 'participant-bound-action' } },
+  { bridgeCommand: DIRECT_FILE_TRANSFER_MSG.CANCEL, sharedCommand: SHARE_BROWSER_COMMANDS.FILE_WRITE, policy: { kind: 'participant-bound-action' } },
+  { bridgeCommand: DIRECT_FILE_TRANSFER_MSG.STATUS_QUERY, sharedCommand: SHARE_BROWSER_COMMANDS.FILE_WRITE, policy: { kind: 'participant-bound-action' } },
 
   { bridgeCommand: 'session.start', sharedCommand: SHARE_BROWSER_COMMANDS.SESSION_START, policy: denyFromShared(SHARE_BROWSER_COMMANDS.SESSION_START) },
   { bridgeCommand: 'session.stop', sharedCommand: SHARE_BROWSER_COMMANDS.SESSION_STOP, policy: denyFromShared(SHARE_BROWSER_COMMANDS.SESSION_STOP) },
@@ -113,33 +158,30 @@ export const SHARE_WS_COMMAND_POLICY_INVENTORY: readonly ShareBridgeCommandInven
   { bridgeCommand: 'session.resize', sharedCommand: SHARE_BROWSER_COMMANDS.TERMINAL_RESIZE, policy: denyFromShared(SHARE_BROWSER_COMMANDS.TERMINAL_RESIZE) },
   { bridgeCommand: 'session.edit_queued_message', sharedCommand: SHARE_BROWSER_COMMANDS.QUEUE_EDIT, policy: denyFromShared(SHARE_BROWSER_COMMANDS.QUEUE_EDIT) },
   { bridgeCommand: 'session.undo_queued_message', sharedCommand: SHARE_BROWSER_COMMANDS.QUEUE_UNDO, policy: denyFromShared(SHARE_BROWSER_COMMANDS.QUEUE_UNDO) },
+  { bridgeCommand: TRANSPORT_QUEUE_COMMANDS.APPEND_MESSAGES, sharedCommand: SHARE_BROWSER_COMMANDS.QUEUE_APPEND, policy: { kind: 'participant-covered-action' } },
   { bridgeCommand: 'subsession.start', sharedCommand: SHARE_BROWSER_COMMANDS.SUBSESSION_START, policy: denyFromShared(SHARE_BROWSER_COMMANDS.SUBSESSION_START) },
   { bridgeCommand: 'subsession.stop', sharedCommand: SHARE_BROWSER_COMMANDS.SUBSESSION_STOP, policy: denyFromShared(SHARE_BROWSER_COMMANDS.SUBSESSION_STOP) },
   { bridgeCommand: 'subsession.restart', sharedCommand: SHARE_BROWSER_COMMANDS.SUBSESSION_RESTART, policy: denyFromShared(SHARE_BROWSER_COMMANDS.SUBSESSION_RESTART) },
-  { bridgeCommand: 'p2p.config.save', sharedCommand: SHARE_BROWSER_COMMANDS.P2P_CONFIG_SAVE, policy: denyFromShared(SHARE_BROWSER_COMMANDS.P2P_CONFIG_SAVE) },
+  { bridgeCommand: P2P_CONFIG_MSG.SAVE, sharedCommand: SHARE_BROWSER_COMMANDS.P2P_CONFIG_SAVE, policy: { kind: 'participant-p2p-config-save' } },
   { bridgeCommand: TRANSPORT_MSG.APPROVAL_RESPONSE, sharedCommand: SHARE_BROWSER_COMMANDS.CHAT_APPROVAL_RESPONSE, policy: denyFromShared(SHARE_BROWSER_COMMANDS.CHAT_APPROVAL_RESPONSE) },
   { bridgeCommand: TRANSPORT_MSG.PROVIDER_STATUS, sharedCommand: SHARE_BROWSER_COMMANDS.PROVIDER_STATUS, policy: denyFromShared(SHARE_BROWSER_COMMANDS.PROVIDER_STATUS) },
   { bridgeCommand: TRANSPORT_MSG.LIST_SESSIONS, sharedCommand: SHARE_BROWSER_COMMANDS.PROVIDER_LIST, policy: denyFromShared(SHARE_BROWSER_COMMANDS.PROVIDER_LIST) },
   { bridgeCommand: 'provider.sync_sessions', sharedCommand: SHARE_BROWSER_COMMANDS.PROVIDER_LIST, policy: denyFromShared(SHARE_BROWSER_COMMANDS.PROVIDER_LIST) },
-  { bridgeCommand: 'fs.ls', sharedCommand: SHARE_BROWSER_COMMANDS.FILE_BROWSE, policy: denyFromShared(SHARE_BROWSER_COMMANDS.FILE_BROWSE) },
-  { bridgeCommand: 'fs.read', sharedCommand: SHARE_BROWSER_COMMANDS.FILE_READ, policy: denyFromShared(SHARE_BROWSER_COMMANDS.FILE_READ) },
-  { bridgeCommand: 'fs.write', sharedCommand: SHARE_BROWSER_COMMANDS.FILE_WRITE, policy: denyFromShared(SHARE_BROWSER_COMMANDS.FILE_WRITE) },
-  { bridgeCommand: FS_TRANSPORT_MSG.RENAME, sharedCommand: SHARE_BROWSER_COMMANDS.FILE_EDIT, policy: denyFromShared(SHARE_BROWSER_COMMANDS.FILE_EDIT) },
-  { bridgeCommand: 'fs.edit', sharedCommand: SHARE_BROWSER_COMMANDS.FILE_EDIT, policy: denyFromShared(SHARE_BROWSER_COMMANDS.FILE_EDIT) },
-  { bridgeCommand: 'fs.delete', sharedCommand: SHARE_BROWSER_COMMANDS.FILE_DELETE, policy: denyFromShared(SHARE_BROWSER_COMMANDS.FILE_DELETE) },
-  { bridgeCommand: 'fs.patch', sharedCommand: SHARE_BROWSER_COMMANDS.FILE_PATCH, policy: denyFromShared(SHARE_BROWSER_COMMANDS.FILE_PATCH) },
-  { bridgeCommand: 'fs.git_status', sharedCommand: SHARE_BROWSER_COMMANDS.REPO_STATUS, policy: denyFromShared(SHARE_BROWSER_COMMANDS.REPO_STATUS) },
-  { bridgeCommand: 'fs.git_diff', sharedCommand: SHARE_BROWSER_COMMANDS.REPO_DIFF, policy: denyFromShared(SHARE_BROWSER_COMMANDS.REPO_DIFF) },
-  { bridgeCommand: 'file.search', sharedCommand: SHARE_BROWSER_COMMANDS.FILE_SEARCH, policy: denyFromShared(SHARE_BROWSER_COMMANDS.FILE_SEARCH) },
-  { bridgeCommand: REPO_MSG.DETECT, sharedCommand: SHARE_BROWSER_COMMANDS.REPO_STATUS, policy: denyFromShared(SHARE_BROWSER_COMMANDS.REPO_STATUS) },
-  { bridgeCommand: REPO_MSG.LIST_BRANCHES, sharedCommand: SHARE_BROWSER_COMMANDS.REPO_BRANCH, policy: denyFromShared(SHARE_BROWSER_COMMANDS.REPO_BRANCH) },
-  { bridgeCommand: REPO_MSG.CHECKOUT_BRANCH, sharedCommand: SHARE_BROWSER_COMMANDS.REPO_BRANCH, policy: denyFromShared(SHARE_BROWSER_COMMANDS.REPO_BRANCH) },
-  { bridgeCommand: REPO_MSG.LIST_COMMITS, sharedCommand: SHARE_BROWSER_COMMANDS.REPO_SEARCH, policy: denyFromShared(SHARE_BROWSER_COMMANDS.REPO_SEARCH) },
-  { bridgeCommand: REPO_MSG.LIST_ISSUES, sharedCommand: SHARE_BROWSER_COMMANDS.REPO_SEARCH, policy: denyFromShared(SHARE_BROWSER_COMMANDS.REPO_SEARCH) },
-  { bridgeCommand: REPO_MSG.LIST_PRS, sharedCommand: SHARE_BROWSER_COMMANDS.REPO_SEARCH, policy: denyFromShared(SHARE_BROWSER_COMMANDS.REPO_SEARCH) },
-  { bridgeCommand: REPO_MSG.LIST_ACTIONS, sharedCommand: SHARE_BROWSER_COMMANDS.REPO_SEARCH, policy: denyFromShared(SHARE_BROWSER_COMMANDS.REPO_SEARCH) },
+  { bridgeCommand: 'fs.edit', sharedCommand: SHARE_BROWSER_COMMANDS.FILE_EDIT, policy: { kind: 'deny', reason: SHARE_REASONS.DIRECT_SURFACE_DENIED } },
+  { bridgeCommand: 'fs.patch', sharedCommand: SHARE_BROWSER_COMMANDS.FILE_PATCH, policy: { kind: 'deny', reason: SHARE_REASONS.DIRECT_SURFACE_DENIED } },
+  { bridgeCommand: REPO_MSG.DETECT, sharedCommand: SHARE_BROWSER_COMMANDS.REPO_STATUS, policy: { kind: 'allow-covered-read', requireTarget: true } },
+  { bridgeCommand: REPO_MSG.LIST_BRANCHES, sharedCommand: SHARE_BROWSER_COMMANDS.REPO_SEARCH, policy: { kind: 'allow-covered-read', requireTarget: true } },
+  { bridgeCommand: REPO_MSG.CHECKOUT_BRANCH, sharedCommand: SHARE_BROWSER_COMMANDS.REPO_BRANCH, policy: { kind: 'participant-covered-action' } },
+  { bridgeCommand: REPO_MSG.LIST_COMMITS, sharedCommand: SHARE_BROWSER_COMMANDS.REPO_SEARCH, policy: { kind: 'allow-covered-read', requireTarget: true } },
+  { bridgeCommand: REPO_MSG.LIST_ISSUES, sharedCommand: SHARE_BROWSER_COMMANDS.REPO_SEARCH, policy: { kind: 'allow-covered-read', requireTarget: true } },
+  { bridgeCommand: REPO_MSG.LIST_PRS, sharedCommand: SHARE_BROWSER_COMMANDS.REPO_SEARCH, policy: { kind: 'allow-covered-read', requireTarget: true } },
+  { bridgeCommand: REPO_MSG.LIST_ACTIONS, sharedCommand: SHARE_BROWSER_COMMANDS.REPO_SEARCH, policy: { kind: 'allow-covered-read', requireTarget: true } },
+  { bridgeCommand: REPO_MSG.ACTION_DETAIL, sharedCommand: SHARE_BROWSER_COMMANDS.REPO_SEARCH, policy: { kind: 'allow-covered-read', requireTarget: true } },
+  { bridgeCommand: REPO_MSG.COMMIT_DETAIL, sharedCommand: SHARE_BROWSER_COMMANDS.REPO_SEARCH, policy: { kind: 'allow-covered-read', requireTarget: true } },
+  { bridgeCommand: REPO_MSG.PR_DETAIL, sharedCommand: SHARE_BROWSER_COMMANDS.REPO_SEARCH, policy: { kind: 'allow-covered-read', requireTarget: true } },
+  { bridgeCommand: REPO_MSG.ISSUE_DETAIL, sharedCommand: SHARE_BROWSER_COMMANDS.REPO_SEARCH, policy: { kind: 'allow-covered-read', requireTarget: true } },
   { bridgeCommand: 'memory.skill.query', sharedCommand: SHARE_BROWSER_COMMANDS.MEMORY_QUERY, policy: denyFromShared(SHARE_BROWSER_COMMANDS.MEMORY_QUERY) },
-  { bridgeCommand: 'cron.create', sharedCommand: SHARE_BROWSER_COMMANDS.CRON_MUTATE, policy: denyFromShared(SHARE_BROWSER_COMMANDS.CRON_MUTATE) },
+  { bridgeCommand: 'cron.create', sharedCommand: SHARE_BROWSER_COMMANDS.CRON_MUTATE, policy: { kind: 'participant-covered-action' } },
 ];
 
 function assertShareCommandInventoryEntry(entry: ShareBridgeCommandInventoryEntry): void {
@@ -169,6 +211,18 @@ export const SHARE_SCOPED_COMMAND_POLICY = new Map<string, ShareCommandPolicy>(
 type DaemonMessagePolicy = {
   target: (msg: Record<string, unknown>) => ShareTarget | null;
   redact?: (msg: Record<string, unknown>, state: ShareScopedSocketState) => Record<string, unknown> | null;
+  /**
+   * Set only when `redact` narrows a server-scoped message to what the
+   * receiving socket actually covers.
+   *
+   * A `kind: 'server'` target names no session, so the per-session coverage
+   * check cannot run on it. Without this flag such a message is delivered only
+   * to a socket whose own share is server-scoped. `session_list` opts in
+   * because `redactSessionList` drops the rows a narrower share does not cover;
+   * `discussion.*` and `p2p.run.*` must not, because they carry content from
+   * sessions the receiving socket may have no share for at all.
+   */
+  scopesServerTargetInRedact?: true;
 };
 
 export const SHARE_SCOPED_DAEMON_MESSAGE_POLICY = new Map<string, DaemonMessagePolicy>([
@@ -180,7 +234,7 @@ export const SHARE_SCOPED_DAEMON_MESSAGE_POLICY = new Map<string, DaemonMessageP
   ['session.idle', { target: sessionFieldTarget }],
   ['session.notification', { target: sessionFieldTarget }],
   ['session.tool', { target: sessionFieldTarget }],
-  ['command.ack', { target: sessionFieldTarget }],
+  ['command.ack', { target: sessionFieldTarget, redact: redactActiveDispatchForViewers }],
   ['command.failed', { target: sessionFieldTarget }],
   ['subsession.response', { target: sessionNameFieldTarget }],
   ['subsession.created', { target: subsessionCreatedTarget }],
@@ -191,6 +245,10 @@ export const SHARE_SCOPED_DAEMON_MESSAGE_POLICY = new Map<string, DaemonMessageP
   [TRANSPORT_MSG.CHAT_HISTORY, {
     target: sessionIdFieldTarget,
     redact: redactTransportHistory,
+  }],
+  [TRANSPORT_MSG.MODELS_RESPONSE, {
+    target: sessionNameFieldTarget,
+    redact: redactParticipantModelCatalog,
   }],
   ['chat.delta', { target: sessionIdFieldTarget }],
   ['chat.complete', { target: sessionIdFieldTarget }],
@@ -210,6 +268,9 @@ export const SHARE_SCOPED_DAEMON_MESSAGE_POLICY = new Map<string, DaemonMessageP
   ['session_list', {
     target: serverFieldTarget,
     redact: redactSessionList,
+    // `redactSessionList` drops the rows a narrower share does not cover, so a
+    // tab-scoped socket can safely receive this server-targeted message.
+    scopesServerTargetInRedact: true,
   }],
 ]);
 
@@ -302,6 +363,83 @@ export function evaluateShareCommand(input: {
 
   if (input.state.snapshot.effectiveRole !== 'participant') {
     return { allowed: false, reason: SHARE_REASONS.ROLE_DENIED };
+  }
+
+  if (policy.kind === 'participant-bound-action') {
+    // Follow-up direct-transfer frames are authorized by the router's opaque
+    // request capability. Re-checking the participant role here ensures a
+    // role downgrade/revocation stops an in-flight shared upload immediately.
+    return { allowed: true };
+  }
+
+  if (policy.kind === 'participant-covered-action') {
+    return sessionName && shareStateCoversSession(input.state, sessionName)
+      ? { allowed: true }
+      : { allowed: false, reason: SHARE_REASONS.DIRECT_SURFACE_DENIED };
+  }
+
+  if (policy.kind === 'participant-model-switch') {
+    if (!sessionName || !shareStateCoversSession(input.state, sessionName)) {
+      return { allowed: false, reason: SHARE_REASONS.DIRECT_SURFACE_DENIED };
+    }
+    const model = typeof input.msg.model === 'string' ? input.msg.model.trim() : '';
+    if (!model || model.length > 256) {
+      return { allowed: false, reason: SHARE_REASONS.DIRECT_SURFACE_DENIED };
+    }
+    const { cwd: _untrustedCwd, ...safeMessage } = input.msg;
+    return {
+      allowed: true,
+      stampedMessage: { ...safeMessage, model },
+    };
+  }
+
+  if (policy.kind === 'participant-model-list') {
+    if (!sessionName || !shareStateCoversSession(input.state, sessionName)) {
+      return { allowed: false, reason: SHARE_REASONS.DIRECT_SURFACE_DENIED };
+    }
+    const agentType = typeof input.msg.agentType === 'string' ? input.msg.agentType.trim() : '';
+    const requestId = typeof input.msg.requestId === 'string' ? input.msg.requestId.trim() : '';
+    if (!SHARE_MODEL_CATALOG_AGENT_TYPES.has(agentType) || !requestId || requestId.length > 256) {
+      return { allowed: false, reason: SHARE_REASONS.DIRECT_SURFACE_DENIED };
+    }
+    return {
+      allowed: true,
+      stampedMessage: {
+        type: TRANSPORT_MSG.LIST_MODELS,
+        sessionName,
+        agentType,
+        requestId,
+        ...(input.msg.force === true ? { force: true } : {}),
+      },
+    };
+  }
+
+  if (policy.kind === 'participant-p2p-config-save') {
+    const scopeSession = typeof input.msg.scopeSession === 'string' ? input.msg.scopeSession.trim() : '';
+    const requestId = typeof input.msg.requestId === 'string' ? input.msg.requestId.trim() : '';
+    if (!scopeSession || !shareStateCoversSession(input.state, scopeSession) || !requestId || requestId.length > 256) {
+      return { allowed: false, reason: SHARE_REASONS.DIRECT_SURFACE_DENIED };
+    }
+    if (!isP2pSavedConfig(input.msg.config)) {
+      return { allowed: false, reason: SHARE_REASONS.DIRECT_SURFACE_DENIED };
+    }
+    const config = sanitizeP2pSavedConfig(input.msg.config, { scopeSession });
+    const routedSessions = collectRoutedSessionNames(config);
+    if (
+      Object.keys(config.sessions).some((name) => !shareStateCoversSession(input.state, name))
+      || [...routedSessions].some((name) => !shareStateCoversSession(input.state, name))
+    ) {
+      return { allowed: false, reason: SHARE_REASONS.DIRECT_SURFACE_DENIED };
+    }
+    return {
+      allowed: true,
+      stampedMessage: {
+        type: P2P_CONFIG_MSG.SAVE,
+        requestId,
+        scopeSession,
+        config,
+      },
+    };
   }
 
   if (policy.kind === 'participant-discussion-start') {
@@ -424,7 +562,19 @@ export function filterShareDaemonMessage(
   const target = policy.target(msg);
   if (!target) return null;
   if (target.serverId && target.serverId !== state.target.serverId) return null;
-  if (target.kind !== 'server' && !shareStateCoversSession(state, sessionNameFromTarget(target))) return null;
+  if (target.kind === 'server') {
+    // A server-scoped target names no session, so per-session coverage cannot
+    // be evaluated. Previously that skipped the check entirely and delivered
+    // the message to every share socket on the server — a socket shared a
+    // single tab, in viewer role, received whole-server `discussion.*` and
+    // `p2p.run.*` payloads (round text, participant session names, hop output
+    // paths), neither of which has a redact. Decide on the RECEIVER's scope:
+    // a server-scoped share legitimately covers everything, and a narrower one
+    // may receive this only when the entry's redact re-scopes it.
+    if (state.target.kind !== 'server' && !policy.scopesServerTargetInRedact) return null;
+  } else if (!shareStateCoversSession(state, sessionNameFromTarget(target))) {
+    return null;
+  }
   return policy.redact ? policy.redact(msg, state) : msg;
 }
 
@@ -593,20 +743,80 @@ function subsessionRemovedTarget(msg: Record<string, unknown>): ShareTarget | nu
   return subsessionCreatedTarget(msg);
 }
 
+/**
+ * The only session-row fields a share recipient sees: enough to identify and
+ * follow the conversation, and nothing describing the host machine or the
+ * owner's account.
+ *
+ * An allowlist, not a denylist. The first version of this listed fields to
+ * strip and still leaked `planLabel`, `permissionLabel` and the per-provider
+ * `*AvailableModels` arrays, because `session-list.ts` emits more account
+ * metadata than the list named. On a struct that grows, a denylist leaks every
+ * field added after it — the failure is silent and belongs to whoever adds the
+ * field, not to whoever reads this. Adding a field to the session list now
+ * keeps it hidden from shares until someone deliberately names it here.
+ *
+ * Deliberately absent: `projectDir` (absolute host path), `transportConfig`
+ * (provider blob that can carry env and endpoints), `providerId` /
+ * `providerSessionId`, every `*AuthType` / `*AuthLimit` / `*AvailableModels`,
+ * `planLabel`, `permissionLabel`, `quota*`, `contextNamespace*`, `effort`,
+ * `ccPreset`, `requestedModel`.
+ */
+const SHARE_VISIBLE_SESSION_FIELDS = new Set([
+  'name',
+  'sessionInstanceId',
+  'runtimeEpoch',
+  'project',
+  'role',
+  'agentType',
+  'agentVersion',
+  'runtimeType',
+  'label',
+  'description',
+  'state',
+  'parentSession',
+  'error',
+  'activeModel',
+  'modelDisplay',
+]);
+
+function redactSessionRow(row: Record<string, unknown>, includeActiveDispatch: boolean): Record<string, unknown> {
+  const redacted: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(row)) {
+    if (SHARE_VISIBLE_SESSION_FIELDS.has(key)) redacted[key] = value;
+  }
+  if (includeActiveDispatch && Object.prototype.hasOwnProperty.call(row, 'activeDispatchId')) {
+    redacted.activeDispatchId = row.activeDispatchId;
+  }
+  return redacted;
+}
+
 function redactSessionList(msg: Record<string, unknown>, state: ShareScopedSocketState): Record<string, unknown> | null {
-  if (state.target.kind === 'server') return msg;
-  const sessions = Array.isArray(msg.sessions)
-    ? msg.sessions.filter((item) => {
+  const rows = Array.isArray(msg.sessions) ? msg.sessions : [];
+  // Server-scoped shares cover every session, so they keep every row — but the
+  // host-side fields come off for them too. Previously this returned the whole
+  // message untouched for them.
+  const serverScoped = state.target.kind === 'server';
+  const sessions = rows
+    .filter((item) => {
       if (!item || typeof item !== 'object') return false;
+      if (serverScoped) return true;
       const name = (item as Record<string, unknown>).name;
       return typeof name === 'string' && shareStateCoversSession(state, name);
     })
-    : [];
+    .map((item) => redactSessionRow(
+      item as Record<string, unknown>,
+      state.snapshot.effectiveRole === 'participant',
+    ));
   return { ...msg, sessions };
 }
 
 function redactTransportHistory(msg: Record<string, unknown>, _state: ShareScopedSocketState): Record<string, unknown> | null {
   return msg;
+}
+
+function redactParticipantModelCatalog(msg: Record<string, unknown>, state: ShareScopedSocketState): Record<string, unknown> | null {
+  return state.snapshot.effectiveRole === 'participant' ? msg : null;
 }
 
 function redactActiveDispatchForViewers(msg: Record<string, unknown>, state: ShareScopedSocketState): Record<string, unknown> | null {

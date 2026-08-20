@@ -5,9 +5,11 @@ import { describe, expect, it, vi } from 'vitest';
 import { h } from 'preact';
 import { render, screen, fireEvent, cleanup } from '@testing-library/preact';
 import { afterEach } from 'vitest';
+import { FS_SESSION_ROOT_PATH } from '../../../src/shared/transport/fs.js';
 
 const fileBrowserProps: any[] = [];
 const cronManagerProps: any[] = [];
+const repoPageProps: any[] = [];
 
 vi.mock('../../src/components/file-browser-lazy.js', () => ({
   FileBrowser: (props: any) => {
@@ -26,7 +28,12 @@ vi.mock('../../src/components/file-browser-lazy.js', () => ({
 }));
 vi.mock('../../src/components/ChatView.js', () => ({ ChatView: () => null }));
 vi.mock('../../src/components/TerminalView.js', () => ({ TerminalView: () => null }));
-vi.mock('../../src/pages/RepoPage.js', () => ({ RepoPage: () => null }));
+vi.mock('../../src/pages/RepoPage.js', () => ({
+  RepoPage: (props: any) => {
+    repoPageProps.push(props);
+    return <div data-testid="mock-repo-page" />;
+  },
+}));
 vi.mock('../../src/pages/CronManager.js', () => ({
   CronManager: (props: any) => {
     cronManagerProps.push(props);
@@ -55,6 +62,7 @@ afterEach(() => {
   cleanup();
   fileBrowserProps.length = 0;
   cronManagerProps.length = 0;
+  repoPageProps.length = 0;
 });
 
 describe('pinned cron manager panel', () => {
@@ -112,6 +120,59 @@ describe('pinned file browser panel', () => {
       path: '/repo/src/app.ts',
       preferDiff: false,
       rootPath: '/repo',
+    });
+  });
+
+  it('uses the virtual root and read-only mode for a shared viewer without exposing a host path', () => {
+    render(
+      <>{renderPanelContent(
+        { id: 'filebrowser:shared', type: 'filebrowser', props: { projectDir: '/stale/owner/path' } },
+        {
+          ws: {} as any,
+          connected: true,
+          serverId: 'srv',
+          subSessions: [],
+          activeSession: 'deck_shared_brain',
+          sharedAccessRole: 'viewer',
+          inputRefsMap: { current: new Map() },
+          t: (key: string) => key,
+        },
+      )}</>,
+    );
+
+    expect(fileBrowserProps[0]).toMatchObject({
+      initialPath: FS_SESSION_ROOT_PATH,
+      changesRootPath: FS_SESSION_ROOT_PATH,
+      sessionName: 'deck_shared_brain',
+      scopeToSessionRoot: true,
+      readOnly: true,
+    });
+  });
+});
+
+describe('pinned repository panel', () => {
+  it('opens a shared repository from the virtual root even when no project path is visible', () => {
+    render(
+      <>{renderPanelContent(
+        { id: 'repopage:shared', type: 'repopage', props: {} },
+        {
+          ws: {} as any,
+          connected: true,
+          serverId: 'srv',
+          subSessions: [],
+          activeSession: 'deck_shared_brain',
+          sharedAccessRole: 'participant',
+          t: (key: string) => key,
+        },
+      )}</>,
+    );
+
+    expect(screen.getByTestId('mock-repo-page')).toBeTruthy();
+    expect(repoPageProps[0]).toMatchObject({
+      projectDir: FS_SESSION_ROOT_PATH,
+      sessionId: 'deck_shared_brain',
+      scopeToSessionRoot: true,
+      readOnly: false,
     });
   });
 });

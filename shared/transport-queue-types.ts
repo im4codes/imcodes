@@ -190,6 +190,14 @@ export type QueueEvent =
  */
 export const TRANSPORT_QUEUE_DELIVERY_EVENT_TYPE: QueueDeliveryFact['type'] = 'transport.queue.delivery';
 
+/** Browser → daemon queue mutations shared by the UI, bridge policy, and runtime. */
+export const TRANSPORT_QUEUE_COMMANDS = {
+  APPEND_MESSAGES: 'session.append_queued_messages',
+} as const;
+
+/** Bound one append request even if a malformed client sends an oversized id list. */
+export const TRANSPORT_QUEUE_APPEND_MAX_ENTRIES = 200;
+
 export const LIVE_QUEUE_ENTRY_STATUSES = new Set<QueueEntryStatus>([
   'queued',
   'handoff_inflight',

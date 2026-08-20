@@ -34,6 +34,11 @@ function writeFixture(dir: string, overrides: Record<string, unknown> = {}) {
       size: artifact.length,
       sha256: sha256(artifact),
     },
+    computerUseHelper: {
+      relativePath: 'computer-use-helper/linux-x64/open-computer-use',
+      size: Buffer.byteLength('helper'),
+      sha256: sha256('helper'),
+    },
     toolchain: {
       nodeVersion: 'v22.11.0',
       nodeArchive: 'node-v22.11.0-linux-x64.tar.gz',
@@ -70,6 +75,11 @@ function writeMacosUniversalFixture(dir: string, arch = 'universal'): string {
       arch,
       size: artifact.length,
       sha256: sha256(artifact),
+    },
+    computerUseHelper: {
+      relativePath: 'computer-use-helper/darwin-universal/open-computer-use.app.zip',
+      size: Buffer.byteLength('universal-helper'),
+      sha256: sha256('universal-helper'),
     },
     toolchain: {
       nodeVersion: 'v22.11.0',

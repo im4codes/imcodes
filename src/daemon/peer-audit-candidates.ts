@@ -129,6 +129,8 @@ function peerAuditTypeLabel(agentType: string): string {
       return 'Cp';
     case 'openclaw':
       return 'OC';
+    case 'deepseek-harness':
+      return 'Ds';
     default:
       return 'AI';
   }

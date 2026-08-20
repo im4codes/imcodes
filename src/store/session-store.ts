@@ -102,6 +102,11 @@ export interface SessionRecord extends SessionContextBootstrapState {
   quotaMeta?: ProviderQuotaMeta;
   /** Generic reasoning/thinking effort for supported providers. */
   effort?: TransportEffortLevel;
+  /**
+   * Provider service tier for this session, when it has one. Persisted so a
+   * viewer that reconnects still learns the session is on Codex's Fast tier.
+   */
+  serviceTier?: string;
   /** Provider-specific transport settings that must not expand the top-level schema. */
   transportConfig?: Record<string, unknown>;
   /** Parent main session name (e.g. `deck_proj_brain`) — links sub-sessions to their parent. */

@@ -8,7 +8,7 @@ import {
 } from 'node:crypto';
 import { open, lstat, realpath, rename, unlink, type FileHandle } from 'node:fs/promises';
 import { networkInterfaces } from 'node:os';
-import { createServer, connect, type Server, type Socket } from 'node:net';
+import { createServer, connect, isIP, type Server, type Socket } from 'node:net';
 import { basename, resolve } from 'node:path';
 import {
   MACHINE_DIRECT_FILE_TRANSFER_ERROR,
@@ -212,7 +212,13 @@ function collectPrivateCandidates(port: number): MachineDirectCandidate[] {
   for (const values of Object.values(networkInterfaces())) {
     for (const address of values ?? []) {
       const host = address.address.split('%')[0]!;
-      if (address.internal || !isRoutableMachineDirectAddress(host) || seen.has(host)) continue;
+      // The receiver below intentionally binds an IPv4 wildcard. Advertising
+      // an IPv6 interface here creates a candidate that can never reach that
+      // listener and needlessly delays direct-first transfers.
+      if (address.internal
+        || isIP(host) !== 4
+        || !isRoutableMachineDirectAddress(host)
+        || seen.has(host)) continue;
       seen.add(host);
       candidates.push({ host, port });
       if (candidates.length >= MACHINE_DIRECT_FILE_TRANSFER_LIMITS.MAX_CANDIDATES) return candidates;

@@ -2,8 +2,8 @@
  * Daemon-side file transfer handler.
  * Handles upload persistence, download resolution, and lifecycle cleanup.
  */
-import { createReadStream, createWriteStream, realpathSync } from 'node:fs';
-import { mkdir, writeFile, readFile, readdir, stat, lstat, unlink, realpath as fsRealpath } from 'node:fs/promises';
+import { constants as fsConstants, createReadStream, createWriteStream, realpathSync } from 'node:fs';
+import { copyFile, link, mkdir, open, writeFile, readFile, readdir, stat, lstat, unlink, realpath as fsRealpath } from 'node:fs/promises';
 import * as path from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { homedir } from 'node:os';
@@ -12,6 +12,8 @@ import { pipeline } from 'node:stream/promises';
 import logger from '../util/logger.js';
 import {
   FILE_TRANSFER_LIMITS,
+  FILE_TRANSFER_DIRECTORY_MAX_ENTRIES,
+  FILE_TRANSFER_DIRECTORY_PATH,
   FILE_TRANSFER_MSG,
   FILE_TRANSFER_DELETE_ERROR,
   FILE_TRANSFER_UPLOAD_ERROR_CODE,
@@ -29,12 +31,16 @@ import {
   type FileDownloadError,
   validateFilePathHandleRequest,
   type FilePathHandleErrorReason,
+  type FileDirectoryEntry,
+  type FileDirectoryListDone,
+  type FileDirectoryListError,
   type FileDeleteDone,
   type FileDeleteError,
   validateFileDeleteRequest,
+  validateFileDirectoryListRequest,
 } from '../../shared/transport/file-transfer.js';
 import { FS_GENERIC_ERROR_CODES } from '../../shared/fs-error-codes.js';
-import { validateCanonicalRealPath } from './file-preview-path-policy.js';
+import { resolveCanonical, validateCanonicalRealPath } from './file-preview-path-policy.js';
 import type { ValidatedRealPath } from './file-preview-path-policy.js';
 export type { ValidatedRealPath } from './file-preview-path-policy.js';
 
@@ -238,6 +244,60 @@ export function resolveUploadPath(filename: string): string {
   return resolved;
 }
 
+function validateDestinationFileName(originalName: string): string {
+  const stem = originalName.replace(/[. ]+$/g, '').split('.')[0]?.toUpperCase() ?? '';
+  if (!originalName || originalName === '.' || originalName === '..'
+    || originalName !== path.basename(originalName)
+    || Buffer.byteLength(originalName, 'utf8') > 255
+    || /[\u0000-\u001f<>:"/\\|?*]/.test(originalName)
+    || /[. ]$/.test(originalName)
+    || /^(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$/.test(stem)) {
+    throw new Error('invalid_destination_name');
+  }
+  return originalName;
+}
+
+async function commitUploadedFileToDirectory(
+  stagedPath: string,
+  destinationDirectory: string,
+  originalName: string,
+): Promise<string> {
+  const safeName = validateDestinationFileName(originalName);
+  const requestedDirectory = path.resolve(destinationDirectory);
+  const directoryStat = await lstat(requestedDirectory);
+  if (directoryStat.isSymbolicLink() || !directoryStat.isDirectory()) {
+    throw new Error('invalid_destination_directory');
+  }
+  const directory = await validateProjectFilePath(requestedDirectory);
+  const destination = path.join(directory, safeName);
+  if (path.dirname(destination) !== directory) throw new Error('invalid_destination_name');
+  const existing = await lstat(destination).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === 'ENOENT') return null;
+    throw error;
+  });
+  if (existing) throw new Error('destination_exists');
+
+  const siblingTemp = path.join(directory, `.${safeName}.imcodes-${randomHex(12)}.part`);
+  try {
+    await copyFile(stagedPath, siblingTemp, fsConstants.COPYFILE_EXCL);
+    const handle = await open(siblingTemp, 'r+');
+    try {
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    // The sibling hard-link is the atomic, no-overwrite commit point. It keeps
+    // a complete target invisible until every byte has been written and synced.
+    await link(siblingTemp, destination);
+    await unlink(siblingTemp);
+    await unlink(stagedPath).catch(() => {});
+    return destination;
+  } catch (error) {
+    await unlink(siblingTemp).catch(() => {});
+    throw error;
+  }
+}
+
 async function finalizeUploadedFile(params: {
   uploadId: string;
   filename: string;
@@ -247,8 +307,35 @@ async function finalizeUploadedFile(params: {
   size: number;
   serverLink: FileTransferSender;
   clientUploadId?: string;
+  destinationDirectory?: string;
 }): Promise<void> {
-  const { uploadId, filename, originalName, mime, resolved, size, serverLink, clientUploadId } = params;
+  const {
+    uploadId,
+    filename,
+    originalName,
+    mime,
+    resolved,
+    size,
+    serverLink,
+    clientUploadId,
+    destinationDirectory,
+  } = params;
+
+  if (destinationDirectory) {
+    const destination = await commitUploadedFileToDirectory(resolved, destinationDirectory, originalName ?? '');
+    const destinationStat = await lstat(destination);
+    const attachment = createProjectFileHandleFromValidatedPath(
+      toValidatedRealPath(await fsRealpath(destination)),
+      originalName ?? path.basename(destination),
+      mime,
+      destinationStat.size,
+      { device: destinationStat.dev, inode: destinationStat.ino },
+      clientUploadId,
+    );
+    serverLink.send({ type: FILE_TRANSFER_MSG.UPLOAD_DONE, uploadId, attachment } satisfies FileUploadDone);
+    logger.info({ uploadId, size }, 'File upload committed to selected directory');
+    return;
+  }
 
   const metaPath = resolved + '.meta.json';
   await writeFile(metaPath, JSON.stringify({ originalName: originalName || filename, mime, clientUploadId })).catch(() => {});
@@ -565,6 +652,7 @@ export async function handleFileUpload(cmd: Record<string, unknown>, serverLink:
       size: buffer.length,
       serverLink,
       clientUploadId: msg.clientUploadId,
+      destinationDirectory: msg.destinationDirectory,
     });
   } catch (err) {
     sendUploadError(serverLink, uploadId, filename, err);
@@ -611,6 +699,7 @@ export async function handleFileUploadFetch(cmd: Record<string, unknown>, server
       size,
       serverLink,
       clientUploadId: msg.clientUploadId,
+      destinationDirectory: msg.destinationDirectory,
     });
   } catch (err) {
     sendUploadError(serverLink, uploadId, filename, err);
@@ -780,6 +869,7 @@ export function createProjectFileHandleFromValidatedPath(
   mime?: string,
   size?: number,
   identity?: { device: number; inode: number },
+  clientUploadId?: string,
 ): AttachmentRef {
   const daemonPath = String(validatedRealPath);
   const validated = validateCanonicalRealPath(daemonPath);
@@ -798,6 +888,7 @@ export function createProjectFileHandleFromValidatedPath(
     createdAt: now,
     expiresAt: now + FILE_TRANSFER_LIMITS.HANDLE_TTL_MS,
     ...(identity ? { device: identity.device, inode: identity.inode } : {}),
+    ...(clientUploadId ? { clientUploadId } : {}),
   });
 
   return {
@@ -862,6 +953,79 @@ function stablePathHandleError(err: unknown): FilePathHandleErrorReason {
   if (message === FS_GENERIC_ERROR_CODES.FILE_TOO_LARGE) return FILE_PATH_HANDLE_ERROR.FILE_TOO_LARGE;
   if (message === 'not_regular_file' || message === 'symbolic_link') return FILE_PATH_HANDLE_ERROR.NOT_REGULAR_FILE;
   return FILE_PATH_HANDLE_ERROR.HANDLE_FAILED;
+}
+
+function sendDirectoryListError(sender: FileTransferSender, requestId: string, error: string): void {
+  sender.send({
+    type: FILE_TRANSFER_MSG.DIRECTORY_LIST_ERROR,
+    requestId,
+    error,
+  } satisfies FileDirectoryListError);
+}
+
+/** Controlled-node directory-only browser used by the integrated remote desktop picker. */
+export async function handleFileDirectoryList(cmd: Record<string, unknown>, sender: FileTransferSender): Promise<void> {
+  const parsed = validateFileDirectoryListRequest(cmd);
+  const requestId = typeof cmd.requestId === 'string' ? cmd.requestId : '';
+  if (!parsed.ok) {
+    if (requestId) sendDirectoryListError(sender, requestId, 'invalid_path');
+    return;
+  }
+
+  try {
+    if (process.platform === 'win32' && parsed.value.path === FILE_TRANSFER_DIRECTORY_PATH.WINDOWS_DRIVES) {
+      const entries = (await Promise.all(
+        Array.from({ length: 26 }, (_, index) => `${String.fromCharCode(65 + index)}:\\`)
+          .map(async (drive): Promise<FileDirectoryEntry | null> => {
+            try {
+              await readdir(drive);
+              return { name: drive, path: drive, isDir: true, hidden: false };
+            } catch {
+              return null;
+            }
+          }),
+      )).filter((entry): entry is FileDirectoryEntry => entry !== null);
+      sender.send({
+        type: FILE_TRANSFER_MSG.DIRECTORY_LIST_DONE,
+        requestId: parsed.value.requestId,
+        path: parsed.value.path,
+        resolvedPath: FILE_TRANSFER_DIRECTORY_PATH.WINDOWS_DRIVES_ROOT,
+        entries,
+      } satisfies FileDirectoryListDone);
+      return;
+    }
+
+    const canonical = await resolveCanonical(parsed.value.path, 'strict');
+    if (!canonical) throw new Error(FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH);
+    const directoryStat = await lstat(canonical.realPath);
+    if (directoryStat.isSymbolicLink() || !directoryStat.isDirectory()) {
+      throw new Error('not_directory');
+    }
+    const entries = (await readdir(canonical.realPath, { withFileTypes: true }))
+      .filter((entry) => entry.isDirectory())
+      .map((entry): FileDirectoryEntry => ({
+        name: entry.name,
+        path: path.join(canonical.realPath, entry.name),
+        isDir: true,
+        hidden: entry.name.startsWith('.'),
+      }))
+      .sort((a, b) => a.name === b.name ? 0 : a.name < b.name ? -1 : 1)
+      .slice(0, FILE_TRANSFER_DIRECTORY_MAX_ENTRIES);
+    sender.send({
+      type: FILE_TRANSFER_MSG.DIRECTORY_LIST_DONE,
+      requestId: parsed.value.requestId,
+      path: parsed.value.path,
+      resolvedPath: canonical.realPath,
+      entries,
+    } satisfies FileDirectoryListDone);
+  } catch (error) {
+    const code = isNotFoundError(error)
+      ? 'not_found'
+      : error instanceof Error && /^[a-z0-9_:-]{1,128}$/.test(error.message)
+        ? error.message
+        : 'directory_list_failed';
+    sendDirectoryListError(sender, parsed.value.requestId, code);
+  }
 }
 
 /** Controlled-node explicit-path registration; bytes still use the existing download path. */

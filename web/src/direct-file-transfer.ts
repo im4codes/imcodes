@@ -1,5 +1,4 @@
 import {
-  DIRECT_CONNECTIVITY_CANDIDATE_TYPE,
   DIRECT_CONNECTIVITY_PROBE_STAGE,
   classifyDirectConnectivityRoute,
   DIRECT_FILE_TRANSFER_CAPABILITY,
@@ -18,6 +17,11 @@ import {
   type DirectFileTransferIceServerConfig,
   type DirectFileTransferServerMessage,
 } from '@shared/direct-file-transfer.js';
+import {
+  PendingWebRtcCandidates,
+  readWebRtcCandidateType,
+  toWebRtcIceServers,
+} from '@shared/webrtc-connectivity.js';
 import { FILE_TRANSFER_LIMITS } from '@shared/transport/file-transfer.js';
 import { uploadFile, type AttachmentRefResponse } from './api.js';
 import type { ServerMessage, WsClient } from './ws-client.js';
@@ -42,13 +46,7 @@ export class DirectFileTransferFailure extends Error {
 export function toBrowserIceServers(
   iceServers: readonly DirectFileTransferIceServerConfig[],
 ): RTCIceServer[] {
-  return iceServers.map((entry) => typeof entry === 'string'
-    ? { urls: entry }
-    : {
-        urls: [...entry.urls],
-        ...(entry.username ? { username: entry.username } : {}),
-        ...(entry.credential ? { credential: entry.credential } : {}),
-      });
+  return toWebRtcIceServers(iceServers);
 }
 
 function isDirectMessage(message: ServerMessage, requestId: string): message is DirectFileTransferServerMessage {
@@ -113,6 +111,7 @@ type DirectOperation = {
   kind: 'upload';
   file: File;
   clientUploadId: string;
+  sessionName?: string;
   onProgress?: (pct: number) => void;
   onConnected?: () => void;
   signal?: AbortSignal;
@@ -144,7 +143,7 @@ async function runDirectOperation(ws: WsClient, operation: DirectOperation): Pro
   let timeout: ReturnType<typeof setTimeout> | null = null;
   let pumping = false;
   let uploadFinalizing = false;
-  const pendingCandidates: RTCIceCandidateInit[] = [];
+  const pendingCandidates = new PendingWebRtcCandidates<RTCIceCandidateInit>();
   const browserCandidateTypes = new Set<DirectConnectivityCandidateType>();
   const daemonCandidateTypes = new Set<DirectConnectivityCandidateType>();
   let probeStage: DirectConnectivityProbeDiagnostics['stage'] = DIRECT_CONNECTIVITY_PROBE_STAGE.AUTHORIZING;
@@ -158,12 +157,6 @@ async function runDirectOperation(ws: WsClient, operation: DirectOperation): Pro
     DIRECT_CONNECTIVITY_PROBE_STAGE.COMPLETE,
   ];
 
-  const readCandidateType = (candidate: string, declaredType?: string | null): DirectConnectivityCandidateType | null => {
-    const rawType = declaredType?.toLowerCase() ?? /\btyp\s+([a-z0-9_-]+)/i.exec(candidate)?.[1]?.toLowerCase();
-    return Object.values(DIRECT_CONNECTIVITY_CANDIDATE_TYPE).includes(rawType as DirectConnectivityCandidateType)
-      ? rawType as DirectConnectivityCandidateType
-      : null;
-  };
   const emitProbeDiagnostics = (stage?: DirectConnectivityProbeDiagnostics['stage']) => {
     if (operation.kind !== 'probe') return;
     if (stage && probeStageOrder.indexOf(stage) >= probeStageOrder.indexOf(probeStage)) probeStage = stage;
@@ -238,10 +231,7 @@ async function runDirectOperation(ws: WsClient, operation: DirectOperation): Pro
     };
     const flushRemoteCandidates = async () => {
       if (!peer?.remoteDescription) return;
-      while (pendingCandidates.length > 0) {
-        const candidate = pendingCandidates.shift();
-        if (candidate) await peer.addIceCandidate(candidate);
-      }
+      await pendingCandidates.flush((candidate) => peer?.addIceCandidate(candidate));
     };
     const handleAuthorized = async (message: ServerMessage) => {
       const parsed = validateDirectFileTransferAuthorized(message);
@@ -322,7 +312,7 @@ async function runDirectOperation(ws: WsClient, operation: DirectOperation): Pro
       });
       peer.addEventListener('icecandidate', (event) => {
         if (!event.candidate || !capability) return;
-        const candidateType = readCandidateType(
+        const candidateType = readWebRtcCandidateType(
           event.candidate.candidate,
           (event.candidate as RTCIceCandidate & { type?: string | null }).type,
         );
@@ -371,7 +361,7 @@ async function runDirectOperation(ws: WsClient, operation: DirectOperation): Pro
         return;
       }
       if (message.type === DIRECT_FILE_TRANSFER_MSG.ICE && peer && capability === message.capability) {
-        const candidateType = readCandidateType(message.candidate);
+        const candidateType = readWebRtcCandidateType(message.candidate);
         if (candidateType) daemonCandidateTypes.add(candidateType);
         emitProbeDiagnostics();
         const candidate = { candidate: message.candidate, sdpMid: message.mid };
@@ -421,6 +411,7 @@ async function runDirectOperation(ws: WsClient, operation: DirectOperation): Pro
       filename,
       ...(mime ? { mime } : {}),
       size,
+      ...(operation.kind === 'upload' && operation.sessionName ? { sessionName: operation.sessionName } : {}),
     });
   });
 }
@@ -432,8 +423,9 @@ export async function uploadFileDirect(
   onProgress?: (pct: number) => void,
   onConnected?: () => void,
   signal?: AbortSignal,
+  sessionName?: string,
 ): Promise<{ ok: true; attachment: AttachmentRefResponse }> {
-  const result = await runDirectOperation(ws, { kind: 'upload', file, clientUploadId, onProgress, onConnected, signal });
+  const result = await runDirectOperation(ws, { kind: 'upload', file, clientUploadId, sessionName, onProgress, onConnected, signal });
   if (result.kind !== 'upload') throw new DirectFileTransferFailure(DIRECT_FILE_TRANSFER_ERROR.INTERNAL_ERROR, false);
   return { ok: true, attachment: result.attachment };
 }
@@ -450,13 +442,15 @@ export async function probeDirectConnectivity(
 export async function uploadFileWithDirectFallback(options: {
   ws: WsClient | null;
   serverId: string;
+  sessionName?: string;
   file: File;
   onProgress?: (pct: number) => void;
   onMode?: (mode: FileUploadTransportMode) => void;
   signal?: AbortSignal;
+  destinationDirectory?: string;
 }): Promise<{ ok: boolean; attachment: AttachmentRefResponse }> {
   const clientUploadId = crypto.randomUUID();
-  if (options.ws && supportsDirectUpload(options.ws)) {
+  if (options.ws && supportsDirectUpload(options.ws) && !options.destinationDirectory) {
     options.onMode?.(DIRECT_FILE_TRANSFER_STATE.CONNECTING);
     try {
       const result = await uploadFileDirect(
@@ -466,6 +460,7 @@ export async function uploadFileWithDirectFallback(options: {
         options.onProgress,
         () => options.onMode?.(DIRECT_FILE_TRANSFER_STATE.DIRECT),
         options.signal,
+        options.sessionName,
       );
       return result;
     } catch (error) {
@@ -486,7 +481,20 @@ export async function uploadFileWithDirectFallback(options: {
     throw new DirectFileTransferFailure(DIRECT_FILE_TRANSFER_ERROR.RELAY_SIZE_LIMIT, false);
   }
   options.onMode?.(DIRECT_FILE_TRANSFER_STATE.RELAY);
-  return uploadFile(options.serverId, options.file, options.onProgress, clientUploadId, options.signal);
+  if (options.destinationDirectory !== undefined) {
+    return uploadFile(
+      options.serverId,
+      options.file,
+      options.onProgress,
+      clientUploadId,
+      options.signal,
+      options.sessionName,
+      options.destinationDirectory,
+    );
+  }
+  return options.sessionName
+    ? uploadFile(options.serverId, options.file, options.onProgress, clientUploadId, options.signal, options.sessionName)
+    : uploadFile(options.serverId, options.file, options.onProgress, clientUploadId, options.signal);
 }
 
 export function isFileUploadCanceled(error: unknown): boolean {

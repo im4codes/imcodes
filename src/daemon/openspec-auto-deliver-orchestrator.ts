@@ -1575,14 +1575,28 @@ async function advanceAfterImplementationMarkerPoll(run: AutoDeliverRun): Promis
   const activeMarker = run.activeImplementationMarker;
   if (!activeMarker) return;
   const markerAgeMs = Date.now() - activeMarker.createdAt;
-  if (!isTransportRuntimeBusyForIdleAdvance(run) || markerAgeMs >= OPENSPEC_AUTO_DELIVER_IMPLEMENTATION_MARKER_MISSING_GRACE_MS) {
-    const projection = await dispatchImplementationMarkerReminder(run, markerState.reason);
-    if (isOpenSpecAutoDeliverTerminalStage(projection.status)) {
-      send(run.serverLink, { type: OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, projection: { ...projection, terminal: true } });
-    }
+  // The reminder counter is capped, so poll-driven nudges must never outrun the
+  // session they are nudging. `markerAgeMs` is frozen at contract creation and
+  // is never refreshed by a reminder, so once the first grace window elapsed
+  // every poll went straight back into the reminder path: with all tasks
+  // already checked (nothing left to count as progress, so the counter can
+  // never reset) the poll cadence walked the entire cap and terminalized the
+  // run as needs_human within a few poll intervals of the prompt being sent —
+  // before a session that was simply slow to answer had written anything. Gate
+  // the poll on a quiet window measured from the last thing Auto Deliver
+  // actually sent this session (initial prompt or latest reminder), so each
+  // nudge costs the agent a real grace window.
+  const quietSinceLastDispatchMs = Date.now() - Math.max(activeMarker.createdAt, activeMarker.lastReminderAt ?? 0);
+  const busyDuringPoll = isTransportRuntimeBusyForIdleAdvance(run);
+  if (quietSinceLastDispatchMs < OPENSPEC_AUTO_DELIVER_IMPLEMENTATION_MARKER_MISSING_GRACE_MS
+    || (busyDuringPoll && markerAgeMs < OPENSPEC_AUTO_DELIVER_IMPLEMENTATION_MARKER_MISSING_GRACE_MS)) {
+    scheduleImplementationMarkerPoll(run);
     return;
   }
-  scheduleImplementationMarkerPoll(run);
+  const projection = await dispatchImplementationMarkerReminder(run, markerState.reason);
+  if (isOpenSpecAutoDeliverTerminalStage(projection.status)) {
+    send(run.serverLink, { type: OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, projection: { ...projection, terminal: true } });
+  }
 }
 
 function buildImplementationMarkerReminderPrompt(run: AutoDeliverRun, reason: string): string {
@@ -4058,6 +4072,34 @@ export function getActiveOpenSpecAutoDeliverRunsBlockingDaemonUpgrade(): OpenSpe
       launchedFromSessionName: run.launchedFromSessionName,
       targetImplementationSessionName: run.targetImplementationSessionName,
     }));
+}
+
+/**
+ * Stage of every live run, for test diagnostics only.
+ *
+ * A session goes idle once per turn, and the idle handler matches a run by
+ * stage: an edge that lands while a run is between stages matches nothing and
+ * is not retried. When that happens the only visible symptom is a wait that
+ * times out having observed nothing at all, which says nothing about which
+ * stage the run was actually in. This makes that answerable at the point of
+ * failure rather than by re-running until it happens again.
+ */
+export function describeOpenSpecAutoDeliverRunsForTests(): Array<{
+  runId: string;
+  status: string;
+  session: string;
+  hasActiveCommand: boolean;
+  acceptanceAuditStage: string | null;
+  awaitingDispatch: boolean;
+}> {
+  return [...runsById.values()].map((run) => ({
+    runId: run.runId,
+    status: run.status,
+    session: run.targetImplementationSessionName,
+    hasActiveCommand: !!run.activeCommandId,
+    acceptanceAuditStage: run.activeAcceptanceAudit?.stage ?? null,
+    awaitingDispatch: run.activeImplementationPromptAwaitingDispatch === true,
+  }));
 }
 
 export function clearOpenSpecAutoDeliverRunsForTests(): void {

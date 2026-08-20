@@ -12,8 +12,7 @@ import {
   SESSION_TEXT_TAIL_CACHE_LIMIT,
 } from '../db/queries.js';
 import { requireAuth, resolveServerRole } from '../security/authorization.js';
-import { shareTargetFromSessionName, targetExists } from '../db/tab-sharing.js';
-import { resolveHttpShareAccess } from './share-http-auth.js';
+import { authorizeTimelineSession } from './timeline-session-access.js';
 import { WsBridge } from '../ws/bridge.js';
 import { IMCODES_POD_HEADER } from '../../../shared/http-header-names.js';
 import { TIMELINE_PAYLOAD_BUDGET_BYTES } from '../../../shared/timeline-payload-budget.js';
@@ -309,26 +308,6 @@ function timelineResponseMetadata(response: Record<string, unknown>, visibleEven
   return metadata;
 }
 
-async function authorizeWatchTimelineSession(
-  db: Env['DB'],
-  params: { serverId: string; userId: string; sessionName: string },
-): Promise<{ ok: true } | { ok: false; reason?: string }> {
-  const target = shareTargetFromSessionName(params.serverId, params.sessionName);
-  if (!target) return { ok: false, reason: 'share-target-unavailable' };
-  const access = await resolveHttpShareAccess(db, {
-    serverId: params.serverId,
-    userId: params.userId,
-    target,
-  });
-  if (access.actor.kind === 'server-member') {
-    return await targetExists(db, target)
-      ? { ok: true }
-      : { ok: false };
-  }
-  if (access.actor.kind === 'share') return { ok: true };
-  return { ok: false };
-}
-
 function structuredTimelineCursor(response: Record<string, unknown>): Record<string, unknown> | null {
   return response.nextCursor && typeof response.nextCursor === 'object' && !Array.isArray(response.nextCursor)
     ? response.nextCursor as Record<string, unknown>
@@ -478,7 +457,7 @@ watchRoutes.get('/server/:id/timeline/history', requireAuth(), async (c) => {
   const serverId = c.req.param('id')!;
   const sessionName = c.req.query('sessionName')?.trim();
   if (!sessionName) return c.json({ error: 'session_name_required' }, 400);
-  const authorization = await authorizeWatchTimelineSession(c.env.DB, { serverId, userId, sessionName });
+  const authorization = await authorizeTimelineSession(c.env.DB, { serverId, userId, sessionName });
   if (!authorization.ok) return c.json({ error: 'forbidden', ...(authorization.reason ? { reason: authorization.reason } : {}) }, 403);
 
   const rawLimit = Number(c.req.query('limit') ?? '50');
@@ -556,7 +535,7 @@ watchRoutes.get('/server/:id/timeline/history/full', requireAuth(), async (c) =>
   const serverId = c.req.param('id')!;
   const sessionName = c.req.query('sessionName')?.trim();
   if (!sessionName) return c.json({ error: 'session_name_required' }, 400);
-  const authorization = await authorizeWatchTimelineSession(c.env.DB, { serverId, userId, sessionName });
+  const authorization = await authorizeTimelineSession(c.env.DB, { serverId, userId, sessionName });
   if (!authorization.ok) return c.json({ error: 'forbidden', ...(authorization.reason ? { reason: authorization.reason } : {}) }, 403);
 
   const rawLimit = Number(c.req.query('limit') ?? '50');
@@ -637,7 +616,7 @@ watchRoutes.get('/server/:id/timeline/text-tail', requireAuth(), async (c) => {
   const serverId = c.req.param('id')!;
   const sessionName = c.req.query('sessionName')?.trim();
   if (!sessionName) return c.json({ error: 'session_name_required' }, 400);
-  const authorization = await authorizeWatchTimelineSession(c.env.DB, { serverId, userId, sessionName });
+  const authorization = await authorizeTimelineSession(c.env.DB, { serverId, userId, sessionName });
   if (!authorization.ok) return c.json({ error: 'forbidden', ...(authorization.reason ? { reason: authorization.reason } : {}) }, 403);
 
   try {

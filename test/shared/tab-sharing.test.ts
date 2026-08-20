@@ -148,26 +148,52 @@ describe('shared tab sharing contract', () => {
     });
   });
 
-  it('denies direct filesystem, repo, memory, cron, provider, membership, and admin surfaces for all share roles', () => {
-    const deniedCommands = [
+  it('allows scoped file reads for viewers and requires participant for file mutations', () => {
+    const viewerCommands = [
       SHARE_BROWSER_COMMANDS.FILE_READ,
-      SHARE_BROWSER_COMMANDS.FILE_WRITE,
-      SHARE_BROWSER_COMMANDS.FILE_EDIT,
-      SHARE_BROWSER_COMMANDS.FILE_DELETE,
-      SHARE_BROWSER_COMMANDS.FILE_PATCH,
       SHARE_BROWSER_COMMANDS.FILE_BROWSE,
       SHARE_BROWSER_COMMANDS.FILE_SEARCH,
       SHARE_BROWSER_COMMANDS.REPO_STATUS,
       SHARE_BROWSER_COMMANDS.REPO_DIFF,
+    ];
+    const participantCommands = [
+      SHARE_BROWSER_COMMANDS.FILE_WRITE,
+      SHARE_BROWSER_COMMANDS.FILE_EDIT,
+      SHARE_BROWSER_COMMANDS.FILE_DELETE,
+      SHARE_BROWSER_COMMANDS.FILE_PATCH,
+    ];
+    for (const command of viewerCommands) {
+      expect(getShareScopedCommandPolicy(command), command).toMatchObject({ disposition: 'allow', scope: 'concrete-tab' });
+      expect(isShareCommandAllowed(command, 'viewer'), command).toBe(true);
+      expect(isShareCommandAllowed(command, 'participant'), command).toBe(true);
+    }
+    for (const command of participantCommands) {
+      expect(getShareScopedCommandPolicy(command), command).toMatchObject({ disposition: 'allow', scope: 'concrete-tab', minRole: 'participant' });
+      expect(isShareCommandAllowed(command, 'viewer'), command).toBe(false);
+      expect(isShareCommandAllowed(command, 'participant'), command).toBe(true);
+    }
+  });
+
+  it('allows covered repository and cron views while reserving mutations for participants', () => {
+    for (const command of [SHARE_BROWSER_COMMANDS.REPO_SEARCH, SHARE_BROWSER_COMMANDS.CRON_LIST]) {
+      expect(getShareScopedCommandPolicy(command), command).toMatchObject({ disposition: 'allow', scope: 'concrete-tab' });
+      expect(isShareCommandAllowed(command, 'viewer'), command).toBe(true);
+      expect(isShareCommandAllowed(command, 'participant'), command).toBe(true);
+    }
+    for (const command of [SHARE_BROWSER_COMMANDS.REPO_BRANCH, SHARE_BROWSER_COMMANDS.CRON_MUTATE]) {
+      expect(getShareScopedCommandPolicy(command), command).toMatchObject({ disposition: 'allow', scope: 'concrete-tab', minRole: 'participant' });
+      expect(isShareCommandAllowed(command, 'viewer'), command).toBe(false);
+      expect(isShareCommandAllowed(command, 'participant'), command).toBe(true);
+    }
+  });
+
+  it('denies destructive repo, memory, provider, membership, and admin surfaces for all share roles', () => {
+    const deniedCommands = [
       SHARE_BROWSER_COMMANDS.REPO_COMMIT,
       SHARE_BROWSER_COMMANDS.REPO_PUSH,
       SHARE_BROWSER_COMMANDS.REPO_PULL,
-      SHARE_BROWSER_COMMANDS.REPO_BRANCH,
-      SHARE_BROWSER_COMMANDS.REPO_SEARCH,
       SHARE_BROWSER_COMMANDS.MEMORY_QUERY,
       SHARE_BROWSER_COMMANDS.MEMORY_MUTATE,
-      SHARE_BROWSER_COMMANDS.CRON_LIST,
-      SHARE_BROWSER_COMMANDS.CRON_MUTATE,
       SHARE_BROWSER_COMMANDS.CREDENTIALS,
       SHARE_BROWSER_COMMANDS.BILLING,
       SHARE_BROWSER_COMMANDS.MEMBERSHIP,

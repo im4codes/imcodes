@@ -41,6 +41,7 @@ const DEFAULT_COMMANDS: Record<string, string[]> = {
   'qwen':        ['/compact', '/stop', '/clear', '/model', '/thinking'],
   'grok-sdk':    ['/compact', '/clear', '/model'],
   'kimi-sdk':    ['/compact', '/clear', '/model'],
+  'deepseek-harness': ['/clear', '/model'],
   'openclaw':    ['/compact', '/stop', '/clear', '/thinking'],
 };
 const DEFAULT_PHRASES = ['continue', 'fix', 'explain', 'refactor this', 'write tests', 'check errors', 'pull', 'commit&push', 'CI failed, fix', 'test & push', 'yes'];
@@ -424,8 +425,8 @@ interface Props {
   onInsertAlias?: (name: string) => void;
   /** Controlled nodes shown in the optional machine tab. */
   machines?: readonly MachineListItem[];
-  /** Insert a stable `^^(refName)` marker into the composer. */
-  onInsertMachine?: (refName: string) => void;
+  /** Insert a stable machine marker plus its human-readable display note. */
+  onInsertMachine?: (refName: string, displayName: string) => void;
   anchorRef?: RefObject<HTMLElement>;
 }
 
@@ -756,7 +757,7 @@ export function QuickInputPanel({
                 title={machine.online ? machine.displayName : t('machine.offline_hint')}
                 onClick={() => {
                   if (!machine.online) return;
-                  onInsertMachine?.(machine.refName);
+                  onInsertMachine?.(machine.refName, machine.displayName);
                   onClose();
                 }}
               >

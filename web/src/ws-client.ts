@@ -86,6 +86,8 @@ export interface P2pWorkflowRequestScope {
 
 export interface FsListDirOptions {
   includeOpenSpecTaskStats?: boolean;
+  /** Session whose project directory scopes this request. */
+  sessionName?: string;
 }
 
 /** Snapshot of the most recent `daemon.hello` capability handshake the browser
@@ -180,14 +182,14 @@ export type ServerMessage =
     ts?: number;
   }
   | { type: 'daemon.error'; kind: 'uncaughtException' | 'unhandledRejection' | 'warning'; message: string; stack?: string; ts: number }
-  | { type: 'session_list'; daemonVersion?: string | null; sessions: Array<{ name: string; sessionInstanceId?: string; runtimeEpoch?: string; project: string; role: string; agentType: string; providerId?: string; agentVersion?: string; state: string; error?: string | null; projectDir?: string; runtimeType?: 'process' | 'transport'; label?: string; description?: string; userCreated?: boolean; ccPreset?: string | null; qwenModel?: string; requestedModel?: string; activeModel?: string; qwenAuthType?: string; qwenAuthLimit?: string; qwenAvailableModels?: string[]; copilotAvailableModels?: string[]; cursorAvailableModels?: string[]; codexAvailableModels?: string[]; modelDisplay?: string; planLabel?: string; permissionLabel?: string; quotaLabel?: string; quotaUsageLabel?: string; quotaMeta?: import('../../shared/provider-quota.js').ProviderQuotaMeta | null; effort?: import('../../shared/effort-levels.js').TransportEffortLevel; contextNamespace?: import('../../shared/session-context-bootstrap.js').SessionContextBootstrapState['contextNamespace']; contextNamespaceDiagnostics?: string[]; contextRemoteProcessedFreshness?: import('../../shared/context-types.js').ContextFreshness; contextLocalProcessedFreshness?: import('../../shared/context-types.js').ContextFreshness; contextRetryExhausted?: boolean; contextSharedPolicyOverride?: import('../../shared/context-types.js').SharedScopePolicyOverride; transportConfig?: Record<string, unknown> | null; transportPendingMessages?: string[]; transportPendingMessageEntries?: TransportPendingMessageEntry[]; queueEpoch?: string; queueAuthorityId?: string; failedMessageEntries?: TransportPendingMessageEntry[]; pendingMessageVersion?: number; transportPendingMessageVersion?: number }> }
+  | { type: 'session_list'; daemonVersion?: string | null; sessions: Array<{ name: string; sessionInstanceId?: string; runtimeEpoch?: string; project: string; role: string; agentType: string; providerId?: string; agentVersion?: string; state: string; error?: string | null; projectDir?: string; runtimeType?: 'process' | 'transport'; label?: string; description?: string; userCreated?: boolean; ccPreset?: string | null; qwenModel?: string; requestedModel?: string; activeModel?: string; qwenAuthType?: string; qwenAuthLimit?: string; qwenAvailableModels?: string[]; copilotAvailableModels?: string[]; cursorAvailableModels?: string[]; codexAvailableModels?: string[]; modelDisplay?: string; planLabel?: string; permissionLabel?: string; quotaLabel?: string; quotaUsageLabel?: string; quotaMeta?: import('../../shared/provider-quota.js').ProviderQuotaMeta | null; effort?: import('../../shared/effort-levels.js').TransportEffortLevel; contextNamespace?: import('../../shared/session-context-bootstrap.js').SessionContextBootstrapState['contextNamespace']; contextNamespaceDiagnostics?: string[]; contextRemoteProcessedFreshness?: import('../../shared/context-types.js').ContextFreshness; contextLocalProcessedFreshness?: import('../../shared/context-types.js').ContextFreshness; contextRetryExhausted?: boolean; contextSharedPolicyOverride?: import('../../shared/context-types.js').SharedScopePolicyOverride; transportConfig?: Record<string, unknown> | null; transportPendingMessages?: string[]; transportPendingMessageEntries?: TransportPendingMessageEntry[]; queueEpoch?: string; queueAuthorityId?: string; failedMessageEntries?: TransportPendingMessageEntry[]; pendingMessageVersion?: number; transportPendingMessageVersion?: number; activeDispatchId?: string | null }> }
   | { type: 'outbound'; platform: string; channelId: string; content: string }
   | TimelineEventMessage
   | TimelineReplayResponseMessage
   | TimelineHistoryResponseMessage
   | TimelinePageResponseMessage
   | TimelineDetailResponseMessage
-  | { type: typeof MSG_COMMAND_ACK; commandId: string; status: string; session: string; error?: string }
+  | { type: typeof MSG_COMMAND_ACK; commandId: string; status: string; session: string; error?: string; activeDispatchId?: string | null }
   | { type: typeof PEER_AUDIT_MESSAGES.CANDIDATES; commandId: string; ok: boolean; list?: import('../../shared/peer-audit.js').PeerAuditCandidateList; error?: string }
   | { type: typeof PEER_AUDIT_MESSAGES.QUICK_RESULT; commandId: string; ok: boolean; attemptId?: string; resultEventId?: string; error?: string }
   | { type: typeof PEER_AUDIT_MESSAGES.CANCEL_RESULT; commandId: string; ok: boolean; error?: string }
@@ -510,6 +512,10 @@ export class WsClient {
 
   get connected(): boolean {
     return this._connected;
+  }
+
+  targetsServer(serverId: string): boolean {
+    return this.serverId === serverId;
   }
 
   get connecting(): boolean {
@@ -1104,8 +1110,22 @@ export class WsClient {
     //
     // `rebuildSubSessions` on the daemon upserts per item and prunes nothing,
     // so splitting the list is equivalent to sending it whole.
+    // One undeliverable batch must not starve the ones behind it. A single
+    // entry can exceed the cap on its own — `chunkSubSessionRebuildBatches`
+    // gives it its own batch rather than dropping it silently — and `send`
+    // rejects that locally, before the socket. In a bare loop that throw ends
+    // the loop, so every later batch is lost too and nothing retries until the
+    // next connection. Isolate each batch and keep going.
     for (const batch of chunkSubSessionRebuildBatches(subSessions)) {
-      this.send({ type: 'subsession.rebuild_all', subSessions: batch });
+      try {
+        this.send({ type: 'subsession.rebuild_all', subSessions: batch });
+      } catch (err) {
+        console.warn(
+          '[ws] subsession.rebuild_all batch dropped',
+          { size: batch.length, ids: batch.slice(0, 3).map((sub) => sub.id) },
+          err,
+        );
+      }
     }
   }
 
@@ -1417,14 +1437,15 @@ export class WsClient {
       includeFiles,
       includeMetadata,
       ...(options?.includeOpenSpecTaskStats ? { includeOpenSpecTaskStats: true } : {}),
+      ...(options?.sessionName ? { sessionName: options.sessionName } : {}),
     });
     return requestId;
   }
 
   /** Request a file's content from the daemon. Returns the requestId for matching the response. */
-  fsReadFile(path: string): string {
+  fsReadFile(path: string, sessionName?: string): string {
     const requestId = crypto.randomUUID();
-    this.send({ type: 'fs.read', path, requestId });
+    this.send({ type: 'fs.read', path, requestId, ...(sessionName ? { sessionName } : {}) });
     return requestId;
   }
 
@@ -1445,14 +1466,15 @@ export class WsClient {
       requestId,
       ...(expectedMtime !== undefined ? { expectedMtime } : {}),
       ...(options?.createOnly ? { createOnly: true } : {}),
+      ...(options?.sessionName ? { sessionName: options.sessionName } : {}),
     });
     return requestId;
   }
 
   /** Create a directory on the daemon. Returns requestId. */
-  fsMkdir(path: string): string {
+  fsMkdir(path: string, sessionName?: string): string {
     const requestId = crypto.randomUUID();
-    this.send({ type: 'fs.mkdir', path, requestId });
+    this.send({ type: 'fs.mkdir', path, requestId, ...(sessionName ? { sessionName } : {}) });
     return requestId;
   }
 
@@ -1471,51 +1493,57 @@ export class WsClient {
   }
 
   /** Request git status for a directory. Returns requestId. */
-  fsGitStatus(path: string, opts?: { includeStats?: boolean }): string {
+  fsGitStatus(path: string, opts?: { includeStats?: boolean; sessionName?: string }): string {
     const requestId = crypto.randomUUID();
-    this.send({ type: 'fs.git_status', path, requestId, ...(opts?.includeStats ? { includeStats: true } : {}) });
+    this.send({
+      type: 'fs.git_status',
+      path,
+      requestId,
+      ...(opts?.includeStats ? { includeStats: true } : {}),
+      ...(opts?.sessionName ? { sessionName: opts.sessionName } : {}),
+    });
     return requestId;
   }
 
   /** Request git diff for a file. Returns requestId. */
-  fsGitDiff(path: string): string {
+  fsGitDiff(path: string, sessionName?: string): string {
     const requestId = crypto.randomUUID();
-    this.send({ type: 'fs.git_diff', path, requestId });
+    this.send({ type: 'fs.git_diff', path, requestId, ...(sessionName ? { sessionName } : {}) });
     return requestId;
   }
 
   // ── Repo commands ──────────────────────────────────────────────────────────
 
   /** Detect repo context for a project directory. Returns requestId. */
-  repoDetect(projectDir: string, opts?: { force?: boolean }): string {
+  repoDetect(projectDir: string, opts?: { force?: boolean; sessionName?: string }): string {
     const requestId = crypto.randomUUID();
-    this.send({ type: REPO_MSG.DETECT, requestId, projectDir, ...(opts?.force ? { force: true } : {}) });
+    this.send({ type: REPO_MSG.DETECT, requestId, projectDir, ...(opts?.force ? { force: true } : {}), ...(opts?.sessionName ? { sessionName: opts.sessionName } : {}) });
     return requestId;
   }
 
   /** List issues for a project. Returns requestId. */
-  repoListIssues(projectDir: string, opts?: { state?: string; page?: number; force?: boolean }): string {
+  repoListIssues(projectDir: string, opts?: { state?: string; page?: number; force?: boolean; sessionName?: string }): string {
     const requestId = crypto.randomUUID();
     this.send({ type: REPO_MSG.LIST_ISSUES, requestId, projectDir, ...opts });
     return requestId;
   }
 
   /** List pull requests for a project. Returns requestId. */
-  repoListPRs(projectDir: string, opts?: { state?: string; page?: number; force?: boolean }): string {
+  repoListPRs(projectDir: string, opts?: { state?: string; page?: number; force?: boolean; sessionName?: string }): string {
     const requestId = crypto.randomUUID();
     this.send({ type: REPO_MSG.LIST_PRS, requestId, projectDir, ...opts });
     return requestId;
   }
 
   /** List branches for a project. Returns requestId. */
-  repoListBranches(projectDir: string, opts?: { force?: boolean }): string {
+  repoListBranches(projectDir: string, opts?: { force?: boolean; sessionName?: string }): string {
     const requestId = crypto.randomUUID();
-    this.send({ type: REPO_MSG.LIST_BRANCHES, requestId, projectDir, ...(opts?.force ? { force: true } : {}) });
+    this.send({ type: REPO_MSG.LIST_BRANCHES, requestId, projectDir, ...(opts?.force ? { force: true } : {}), ...(opts?.sessionName ? { sessionName: opts.sessionName } : {}) });
     return requestId;
   }
 
   /** List commits for a project. Returns requestId. */
-  repoListCommits(projectDir: string, opts?: { branch?: string; page?: number; force?: boolean }): string {
+  repoListCommits(projectDir: string, opts?: { branch?: string; page?: number; force?: boolean; sessionName?: string }): string {
     const requestId = crypto.randomUUID();
     this.send({ type: REPO_MSG.LIST_COMMITS, requestId, projectDir, ...opts });
     return requestId;
@@ -1535,37 +1563,37 @@ export class WsClient {
   }
 
   /** List workflow runs (CI/CD actions) for a project. Returns requestId. */
-  repoListActions(projectDir: string, opts?: { page?: number; force?: boolean }): string {
+  repoListActions(projectDir: string, opts?: { page?: number; force?: boolean; sessionName?: string }): string {
     const requestId = crypto.randomUUID();
     this.send({ type: REPO_MSG.LIST_ACTIONS, requestId, projectDir, ...opts });
     return requestId;
   }
 
   /** Get workflow run jobs/steps for a project. Returns requestId. */
-  repoActionDetail(projectDir: string, runId: number, opts?: { force?: boolean }): string {
+  repoActionDetail(projectDir: string, runId: number, opts?: { force?: boolean; sessionName?: string }): string {
     const requestId = crypto.randomUUID();
     this.send({ type: REPO_MSG.ACTION_DETAIL, projectDir, runId, requestId, ...opts });
     return requestId;
   }
 
   /** Get commit detail (diff stats, files). Returns requestId. */
-  repoCommitDetail(projectDir: string, sha: string): string {
+  repoCommitDetail(projectDir: string, sha: string, opts?: { sessionName?: string }): string {
     const requestId = crypto.randomUUID();
-    this.send({ type: REPO_MSG.COMMIT_DETAIL, projectDir, sha, requestId });
+    this.send({ type: REPO_MSG.COMMIT_DETAIL, projectDir, sha, requestId, ...(opts?.sessionName ? { sessionName: opts.sessionName } : {}) });
     return requestId;
   }
 
   /** Get PR detail (body, review, checks, stats). Returns requestId. */
-  repoPRDetail(projectDir: string, number: number): string {
+  repoPRDetail(projectDir: string, number: number, opts?: { sessionName?: string }): string {
     const requestId = crypto.randomUUID();
-    this.send({ type: REPO_MSG.PR_DETAIL, projectDir, number, requestId });
+    this.send({ type: REPO_MSG.PR_DETAIL, projectDir, number, requestId, ...(opts?.sessionName ? { sessionName: opts.sessionName } : {}) });
     return requestId;
   }
 
   /** Get issue detail (body, comments). Returns requestId. */
-  repoIssueDetail(projectDir: string, number: number): string {
+  repoIssueDetail(projectDir: string, number: number, opts?: { sessionName?: string }): string {
     const requestId = crypto.randomUUID();
-    this.send({ type: REPO_MSG.ISSUE_DETAIL, projectDir, number, requestId });
+    this.send({ type: REPO_MSG.ISSUE_DETAIL, projectDir, number, requestId, ...(opts?.sessionName ? { sessionName: opts.sessionName } : {}) });
     return requestId;
   }
 

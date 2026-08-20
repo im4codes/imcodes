@@ -16,6 +16,7 @@ import type { SessionContextBootstrapState } from '../../shared/session-context-
 import type { ProviderQuotaMeta } from '../../shared/provider-quota.js';
 import type { TransportAttachment } from '../../shared/transport-attachments.js';
 import type { MemoryMcpProviderStatusView } from '../../shared/memory-ws.js';
+import type { DshLlmConfig } from '../../shared/deepseek-harness.js';
 import type {
   AgentDelegationActiveNotificationMode,
   AgentDelegationNotificationResult,
@@ -77,6 +78,12 @@ export const PROVIDER_CANCEL_ORIGINS = {
   STALE_WATCHDOG: 'stale_watchdog',
 } as const;
 
+/** Why text is being admitted to an already-active provider turn. */
+export const PROVIDER_ACTIVE_TURN_DELIVERY_KINDS = {
+  DELEGATION_REPLY: 'delegation_reply',
+  QUEUED_MESSAGE: 'queued_message',
+} as const;
+
 // ── Derived types ───────────────────────────────────────────────────────────
 
 /** Connection mode determines how the transport manages the agent lifecycle. */
@@ -88,6 +95,8 @@ export type SessionOwnership = typeof SESSION_OWNERSHIP[keyof typeof SESSION_OWN
 /** Error code from a provider operation. */
 export type ProviderErrorCode = typeof PROVIDER_ERROR_CODES[keyof typeof PROVIDER_ERROR_CODES];
 export type ProviderCancelOrigin = typeof PROVIDER_CANCEL_ORIGINS[keyof typeof PROVIDER_CANCEL_ORIGINS];
+export type ProviderActiveTurnDeliveryKind =
+  typeof PROVIDER_ACTIVE_TURN_DELIVERY_KINDS[keyof typeof PROVIDER_ACTIVE_TURN_DELIVERY_KINDS];
 
 export interface ProviderCancelOptions {
   origin: ProviderCancelOrigin;
@@ -208,6 +217,11 @@ export interface ProviderCapabilities {
   attachments: boolean;
   /** Provider supports configurable reasoning/thinking effort. */
   reasoningEffort?: boolean;
+  /**
+   * Provider exposes a service tier that a viewer can switch per session --
+   * Codex's "Fast" (`priority`) tier being the one that spends plan usage faster.
+   */
+  serviceTier?: boolean;
   /** Supported effort levels when reasoningEffort is true. */
   supportedEffortLevels?: readonly TransportEffortLevel[];
   /** How well this provider can honor normalized shared-context payloads. */
@@ -225,6 +239,12 @@ export interface ProviderDelegationNotification {
   delegationId: string;
   sourceSessionName: string;
   text: string;
+  /**
+   * Delegation replies may preempt; ordinary queued messages must enter at the
+   * provider's next safe in-turn boundary instead. Omitted means a delegation
+   * reply for backwards-compatible provider callers.
+   */
+  deliveryKind?: ProviderActiveTurnDeliveryKind;
 }
 
 /**
@@ -286,6 +306,11 @@ export interface SessionConfig {
   contextAuthoredContextFilePath?: string;
   /** Provider-specific SDK/CLI settings object or settings file path. */
   settings?: string | Record<string, unknown>;
+  /**
+   * DeepSeek Harness (dsh) LLM config. Route metadata is materialized into the
+   * overlay and credential data is supplied only to the child environment.
+   */
+  llm?: DshLlmConfig;
   /** Parent session key for sub-sessions. */
   parentSessionKey?: string;
   /** If binding to an already-existing remote session, use this key directly. */
@@ -404,6 +429,12 @@ export interface SessionInfoUpdate extends SessionContextBootstrapState {
   quotaMeta?: ProviderQuotaMeta;
   /** Current reasoning/thinking effort, if known. */
   effort?: TransportEffortLevel;
+  /**
+   * Provider service tier for this session, when the provider has one. Codex
+   * calls its `priority` tier "Fast"; it is reported so a viewer can see that a
+   * session is spending plan usage faster than they may have intended.
+   */
+  serviceTier?: string;
 }
 
 /** Provider-reported transient execution status (e.g. compacting). */
@@ -490,6 +521,13 @@ export interface TransportProvider {
 
   /** Declare which optional capabilities this provider supports. */
   readonly capabilities: ProviderCapabilities;
+
+  /**
+   * Switch this session's service tier. Only meaningful when the provider
+   * declares the `serviceTier` capability; the tier belongs to the session, so
+   * this never changes the machine's defaults.
+   */
+  setServiceTier?(sessionId: string, tier: string): Promise<void>;
 
   // ── Core methods — all providers must implement ──────────────────────────
 

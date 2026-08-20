@@ -33,6 +33,7 @@ import {
   selectLiveQueueEntries,
   type TransportQueueReducerState,
 } from '@shared/transport-queue-reducer.js';
+import { reduceTimelineActivity } from '@shared/session-activity-types.js';
 import type { QueueEvent, QueueProjectionEntry, QueueSnapshot } from '@shared/transport-queue-types.js';
 import { TIMELINE_SNAPSHOT_STORAGE_PREFIX } from '../local-storage-quota.js';
 
@@ -79,6 +80,7 @@ import {
 } from '../../../src/shared/timeline/merge.js';
 import { TIMELINE_HISTORY_CONTENT_TYPES } from '../../../src/shared/timeline/types.js';
 import { fetchTimelineHistoryHttp, sendSessionViaHttp } from '../api.js';
+import { MESSAGE_PIN_LIMITS } from '@shared/message-pins.js';
 import { runNewestWindowBackfill } from '../timeline/catchup/backfill-pager.js';
 import { buildTransportPendingSyncPatch, normalizeTransportPendingEntries } from '../transport-queue.js';
 
@@ -92,6 +94,17 @@ const TRANSPORT_QUEUE_EVENT_TYPES = new Set([
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+
+function isTimelineHistoryEvent(value: unknown): value is TimelineEvent {
+  if (!isRecord(value) || !isRecord(value.payload)) return false;
+  return typeof value.eventId === 'string'
+    && typeof value.sessionId === 'string'
+    && typeof value.ts === 'number'
+    && Number.isFinite(value.ts)
+    && typeof value.seq === 'number'
+    && typeof value.epoch === 'number'
+    && typeof value.type === 'string';
 }
 
 function isTransportQueueEvent(value: unknown): value is QueueEvent {
@@ -394,6 +407,9 @@ if (typeof document !== 'undefined' && typeof window !== 'undefined') {
 
 const MAX_MEMORY_EVENTS = 300;
 const MAX_HISTORY_EVENTS = 2000;
+const MAX_PIN_CONTEXT_EVENTS = MESSAGE_PIN_LIMITS.CONTEXT_EVENTS_BEFORE
+  + 1
+  + MESSAGE_PIN_LIMITS.CONTEXT_EVENTS_AFTER;
 
 /**
  * The initial window stays small, but once the user has paged older history
@@ -402,10 +418,25 @@ const MAX_HISTORY_EVENTS = 2000;
  * message. Keep the larger bounded history window until the session changes.
  */
 function retainedTimelineMergeLimit(...eventSets: readonly TimelineEvent[][]): number {
+  if (eventSets.some((events) => events.length > MAX_HISTORY_EVENTS)) {
+    return MAX_HISTORY_EVENTS + MAX_PIN_CONTEXT_EVENTS;
+  }
   return eventSets.some((events) => events.length > MAX_MEMORY_EVENTS)
     ? MAX_HISTORY_EVENTS
     : MAX_MEMORY_EVENTS;
 }
+/**
+ * How long a cold timeline may report the daemon fetch as still coming while
+ * the socket is down.
+ *
+ * The bootstrap effect re-runs when `wsConnected` flips, so a real reconnect
+ * resolves this long before the bound. The bound exists because
+ * `requestDaemonHistory` returns early with no deadline when there is no
+ * socket — without it a never-reconnecting client would sit on a spinner
+ * forever, which is worse than the blank pane this whole change is fixing.
+ */
+const DAEMON_CONNECT_WAIT_MS = 15_000;
+
 const MAX_CACHED_SESSIONS = 12;
 
 // A first-paint seed (localStorage tail snapshot, WS-replay tail, or a
@@ -1123,6 +1154,10 @@ export interface UseTimelineResult {
    *  no cooldown. Unlike the global `requestActiveTimelineRefresh`, this is
    *  per-session and surfaces visible feedback. */
   forceRefresh: () => void;
+  /** Load a bounded window around a PostgreSQL-pinned message into the local
+   * timeline, so ChatView can reveal and scroll to an event older than the
+   * current in-memory tail. */
+  loadMessageContext: (eventId: string, eventTs: number) => Promise<boolean>;
 }
 
 export interface UseTimelineOptions {
@@ -1147,6 +1182,12 @@ export interface UseTimelineOptions {
    * hook stays idle and skips daemon/HTTP/text-tail history work entirely.
    */
   disableHistory?: boolean;
+  /**
+   * Session-list state from the daemon. This is an independent authority from
+   * the timeline stream and lets a pane self-heal when it missed the terminal
+   * tool/result/idle frames but the daemon already reports the session idle.
+   */
+  authoritativeSessionState?: string;
 }
 
 export type TimelineHistoryPhase = 'idle' | 'bootstrap' | 'refresh' | 'older';
@@ -1156,7 +1197,7 @@ export type TimelineHistoryPhase = 'idle' | 'bootstrap' | 'refresh' | 'older';
  * cold device rendered a ✓ next to a blank chat, which reads as "your history
  * is cached but we refuse to show it" instead of "this device has no copy yet".
  */
-export type TimelineHistoryStepState = 'pending' | 'running' | 'done' | 'empty' | 'skipped';
+export type TimelineHistoryStepState = 'pending' | 'running' | 'done' | 'empty' | 'offline' | 'skipped';
 export type TimelineHistoryStepKey = 'cache' | 'textTail' | 'daemon' | 'http' | 'older';
 export type TimelineHistoryResponseState = 'ok' | 'empty' | 'partial' | 'deferred' | 'canceled' | 'error' | 'detail';
 
@@ -1204,7 +1245,6 @@ export function createIdleHistoryStatus(): TimelineHistoryStatus {
 }
 
 function createBootstrapHistoryStatus(opts: {
-  canDaemon: boolean;
   canHttp: boolean;
   /** True when mount-time seed already populated `events`; flips `cache` to 'done'. */
   cacheSeeded?: boolean;
@@ -1222,7 +1262,12 @@ function createBootstrapHistoryStatus(opts: {
     steps: {
       cache: opts.cacheSeeded ? 'done' : 'running',
       textTail: 'skipped',
-      daemon: opts.canDaemon ? 'pending' : 'skipped',
+      // `skipped` would claim the daemon fetch will never happen. On a cold
+      // start the socket is usually still connecting, and the bootstrap effect
+      // re-runs once it is up — so the fetch is pending, not skipped. Reporting
+      // it terminal made every step look settled, which is what let the view
+      // show "no messages" while the history was still on its way.
+      daemon: 'pending',
       http: opts.canHttp ? 'pending' : 'skipped',
       older: 'skipped',
     },
@@ -1514,6 +1559,7 @@ export function useTimeline(
   const isActiveSession = options?.isActiveSession ?? true;
   const isVisible = options?.isVisible ?? isActiveSession;
   const disableHistory = options?.disableHistory ?? false;
+  const authoritativeSessionState = options?.authoritativeSessionState;
   const wsConnected = !!ws?.connected;
   const cacheKeyRef = useRef(cacheKey);
   cacheKeyRef.current = cacheKey;
@@ -1569,6 +1615,8 @@ export function useTimeline(
    * first bootstrap keeps the synchronous seed it was built from.
    */
   const localRestoredKeyRef = useRef<string | null>(cacheKey ?? null);
+  /** Bounds how long the daemon step may claim "still coming" with no socket. */
+  const daemonWaitTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   /** Union in a local restore and return the running distinct total. */
   const recordLocalRestore = useCallback((restored: readonly TimelineEvent[]): number => {
     for (const event of restored) localRestoredIdsRef.current.add(event.eventId);
@@ -1597,7 +1645,6 @@ export function useTimeline(
   const [historyStatus, setHistoryStatus] = useState<TimelineHistoryStatus>(() => (
     events.length > 0
       ? createBootstrapHistoryStatus({
-          canDaemon: !!ws?.connected,
           canHttp: false,
           cacheSeeded: true,
         })
@@ -1774,7 +1821,6 @@ export function useTimeline(
     // the cache step done immediately so the bootstrap overlay never flashes
     // "本地缓存…" alongside the just-painted messages.
     setHistoryStatus(createBootstrapHistoryStatus({
-      canDaemon: wsConnected,
       canHttp: false,
       cacheSeeded: localRestoredIdsRef.current.size > 0,
       // Show the number at first paint too — a bare ✓ with no count is the
@@ -2023,6 +2069,25 @@ export function useTimeline(
           requestDaemonHistory(true);
         } else {
           setLoading(false);
+          // Nothing was fetched. Say WHICH it is instead of letting the status
+          // fall back to a blanket idle, which reads as "history settled" and
+          // renders the empty-chat placeholder while the fetch is still coming.
+          if (!isActiveSession) {
+            // Inactive timelines deliberately never issue the request, so this
+            // is terminal now — a spinner here would never resolve.
+            updateHistoryStep('daemon', 'offline', 'bootstrap');
+          } else {
+            // Active but no socket: the bootstrap effect re-runs on connect, so
+            // the fetch really is still coming. Bounded so it cannot hang.
+            updateHistoryStep('daemon', 'pending', 'bootstrap');
+            if (daemonWaitTimerRef.current) clearTimeout(daemonWaitTimerRef.current);
+            daemonWaitTimerRef.current = setTimeout(() => {
+              daemonWaitTimerRef.current = null;
+              if (cacheKeyRef.current !== cacheKey) return;
+              updateHistoryStep('daemon', 'offline', 'bootstrap');
+            }, DAEMON_CONNECT_WAIT_MS);
+            daemonWaitTimerRef.current.unref?.();
+          }
         }
         if (isActiveSession) {
           // IDB came back EMPTY. If a low-completeness seed (localStorage tail
@@ -2758,6 +2823,101 @@ export function useTimeline(
     persistTimelineEvents(key, preferred);
   }, []);
 
+  const loadMessageContext = useCallback(async (eventId: string, eventTs: number): Promise<boolean> => {
+    if (!serverId || !sessionId || disableHistory || !eventId || !Number.isFinite(eventTs)) return false;
+    if (eventsRef.current.some((event) => event.eventId === eventId)) return true;
+    const requestedKey = cacheKeyRef.current;
+    if (!requestedKey) return false;
+
+    try {
+      const beforeResult = await fetchTimelineHistoryHttp(serverId, sessionId, {
+        beforeTs: eventTs + 1,
+        limit: 500,
+        timeoutMs: 12_000,
+      });
+      if (cacheKeyRef.current !== requestedKey || !beforeResult) return false;
+      const preceding = beforeResult.events.filter(isTimelineHistoryEvent);
+
+      // The history API returns the newest N events in a range. To obtain the
+      // events immediately after an old pin, grow a bounded time window until
+      // it contains a successor; if the window itself overflows, shrink it
+      // until all rows fit and the ascending response really starts beside the
+      // anchor rather than at the newest edge of a huge conversation.
+      let following: TimelineEvent[] = [];
+      let spanMs = 60_000;
+      let emptyLowerSpanMs = 0;
+      let overflowingUpperSpanMs: number | null = null;
+      const newestUsefulTs = Math.max(eventTs + 2, Date.now() + 1);
+      for (let attempt = 0; attempt < 32; attempt += 1) {
+        const beforeTs = Math.min(newestUsefulTs, eventTs + spanMs);
+        const afterResult = await fetchTimelineHistoryHttp(serverId, sessionId, {
+          afterTs: Math.max(0, eventTs - 1),
+          beforeTs,
+          limit: 500,
+          timeoutMs: 12_000,
+        });
+        if (cacheKeyRef.current !== requestedKey || !afterResult) break;
+        const inWindow = afterResult.events.filter(isTimelineHistoryEvent);
+        if (afterResult.hasMore) {
+          overflowingUpperSpanMs = spanMs;
+          if (overflowingUpperSpanMs - emptyLowerSpanMs <= 1) break;
+          spanMs = Math.max(
+            emptyLowerSpanMs + 1,
+            Math.floor((emptyLowerSpanMs + overflowingUpperSpanMs) / 2),
+          );
+          continue;
+        }
+        const anchorIndex = inWindow.findIndex((event) => event.eventId === eventId);
+        following = (anchorIndex >= 0
+          ? inWindow.slice(anchorIndex + 1)
+          : inWindow.filter((event) => event.ts > eventTs))
+          .slice(0, MESSAGE_PIN_LIMITS.CONTEXT_EVENTS_AFTER);
+        if (following.length > 0 || beforeTs >= newestUsefulTs) break;
+        emptyLowerSpanMs = spanMs;
+        if (overflowingUpperSpanMs !== null) {
+          if (overflowingUpperSpanMs - emptyLowerSpanMs <= 1) break;
+          spanMs = Math.floor((emptyLowerSpanMs + overflowingUpperSpanMs) / 2);
+        } else {
+          spanMs = Math.min(
+            newestUsefulTs - eventTs,
+            Math.max(spanMs + 1, spanMs * 8),
+          );
+        }
+      }
+
+      const anchorIndex = preceding.findIndex((event) => event.eventId === eventId);
+      if (anchorIndex < 0) return false;
+      const context = [
+        ...preceding.slice(Math.max(0, anchorIndex - MESSAGE_PIN_LIMITS.CONTEXT_EVENTS_BEFORE), anchorIndex + 1),
+        ...following,
+      ];
+      // A normal expanded timeline retains the newest MAX_HISTORY_EVENTS. An
+      // old pin can sit before every one of those rows, so a normal bounded
+      // merge would immediately trim the just-loaded anchor back out. Keep
+      // the recent window plus this one bounded context window; the renderer
+      // remains tail-limited and a later pin replaces, rather than endlessly
+      // accumulating, older context windows.
+      setEvents((previous) => {
+        const shared = getSharedTimelineBase(
+          cacheKeyRef.current,
+          previous,
+          MAX_HISTORY_EVENTS + context.length,
+        );
+        const recent = shared.length > MAX_HISTORY_EVENTS
+          ? shared.slice(shared.length - MAX_HISTORY_EVENTS)
+          : shared;
+        const base = removeReconciledLocalUserMessages(recent, context);
+        const result = mergeTimelineEvents(base, context, MAX_HISTORY_EVENTS + context.length);
+        if (cacheKeyRef.current) setCachedEvents(cacheKeyRef.current, result);
+        return result;
+      });
+      idbPutEvents(context);
+      return true;
+    } catch {
+      return false;
+    }
+  }, [disableHistory, idbPutEvents, serverId, sessionId]);
+
   const pendingRealtimeEventsRef = useRef(new Map<string, TimelineEvent>());
   const pendingRealtimeFlushCancelRef = useRef<(() => void) | null>(null);
 
@@ -3189,6 +3349,7 @@ export function useTimeline(
   // by forceRefresh. `manualLatestWindow` also clears any pending tail backfill,
   // so this does not double-fetch after the mount bootstrap timer.
   const blankSelfHealRef = useRef<string | null>(null);
+  const staleToolSelfHealRef = useRef<string | null>(null);
   const fireBlankPaneRecovery = useCallback((visible: boolean) => {
     const key = cacheKeyRef.current;
     if (!key) return;
@@ -3221,6 +3382,42 @@ export function useTimeline(
     disableHistory,
     fireBlankPaneRecovery,
   ]);
+
+  // Independent-authority self-heal: if the daemon/session list says the turn
+  // is idle while this timeline still contains an unmatched tool.call, the
+  // result/final frames were missed or merged into a different cache segment.
+  // Pull one authoritative newest window automatically instead of leaving the
+  // local elapsed timer running forever until the user force-refreshes.
+  useEffect(() => {
+    const key = cacheKey;
+    if (!key || disableHistory || authoritativeSessionState !== 'idle') {
+      staleToolSelfHealRef.current = null;
+      return;
+    }
+    const activity = reduceTimelineActivity(events);
+    if (activity.openToolCount <= 0) {
+      staleToolSelfHealRef.current = null;
+      return;
+    }
+    if (!isActiveSessionRef.current && !isVisibleRef.current) return;
+    let newestToolCallEventId = 'anonymous';
+    for (let index = events.length - 1; index >= 0; index -= 1) {
+      if (events[index]?.type === 'tool.call') {
+        newestToolCallEventId = events[index]?.eventId ?? newestToolCallEventId;
+        break;
+      }
+    }
+    const signature = `${key}:${newestToolCallEventId}:${activity.openToolCount}`;
+    if (staleToolSelfHealRef.current === signature) return;
+    staleToolSelfHealRef.current = signature;
+    void reloadLocalTimelineRef.current();
+    fireHttpBackfillRef.current(0, {
+      phase: 'refresh',
+      visible: false,
+      force: true,
+      mode: 'manualLatestWindow',
+    });
+  }, [authoritativeSessionState, cacheKey, disableHistory, events]);
 
   const lastActiveRefreshAtRef = useRef(0);
 
@@ -3929,11 +4126,26 @@ export function useTimeline(
 
   useEffect(() => {
     if (loading || refreshing || httpRefreshing || loadingOlder) return;
-    setHistoryStatus((prev) => (prev.phase === 'idle' ? prev : { ...createIdleHistoryStatus(), response: prev.response }));
+    setHistoryStatus((prev) => {
+      if (prev.phase === 'idle') return prev;
+      // These four booleans do not know about a fetch that has not started yet.
+      // A cold start with no socket clears `loading` without requesting, so
+      // resetting here wiped the daemon verdict and claimed the history had
+      // settled. Keep both cold-start verdicts: `pending` (still coming — the
+      // wait is bounded above, so it cannot stall forever) and `offline` (no
+      // request will be made), because a blanket `skipped` cannot tell a
+      // waiting timeline from one that was never going to fetch.
+      if (prev.steps.daemon === 'pending' || prev.steps.daemon === 'offline') return prev;
+      return { ...createIdleHistoryStatus(), response: prev.response };
+    });
   }, [httpRefreshing, loading, loadingOlder, refreshing]);
 
   useEffect(() => {
     return () => {
+      if (daemonWaitTimerRef.current) {
+        clearTimeout(daemonWaitTimerRef.current);
+        daemonWaitTimerRef.current = null;
+      }
       clearForwardHistoryTimeout();
       clearHttpBackfillTimer();
       clearTerminalTailIdleReconcile();
@@ -3969,5 +4181,6 @@ export function useTimeline(
     retryOptimisticMessage,
     loadOlderEvents,
     forceRefresh,
+    loadMessageContext,
   };
 }

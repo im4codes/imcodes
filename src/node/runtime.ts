@@ -1,6 +1,7 @@
 import WebSocket from 'ws';
 import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
 import { DAEMON_MSG } from '../../shared/daemon-events.js';
+import { DAEMON_UPGRADE_BLOCK_REASON } from '../../shared/daemon-upgrade.js';
 import { DAEMON_VERSION } from '../util/version.js';
 import { AuthenticatedWebSocketClient, type AuthenticatedWebSocketFactory } from '../transport/authenticated-websocket.js';
 import { MachineExecWorker } from './machine-exec-worker.js';
@@ -9,6 +10,7 @@ import { startControlledNodeSelfUpgrade } from './self-upgrade.js';
 import type { ControlledNodeCredential } from './enrollment.js';
 import {
   FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY,
+  FILE_TRANSFER_DIRECTORY_CAPABILITY,
   FILE_TRANSFER_MSG,
   FILE_TRANSFER_PATH_HANDLE_CAPABILITY,
   FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY,
@@ -18,6 +20,7 @@ import {
 import {
   handleFileDownload,
   handleFileDownloadStream,
+  handleFileDirectoryList,
   handleFilePathHandle,
   handleFileUploadFetch,
   handleFileDelete,
@@ -35,6 +38,28 @@ import {
   validateMachineDirectUploadRequest,
 } from '../../shared/machine-direct-file-transfer.js';
 import { receiveMachineDirectUpload, sendMachineDirectFetch } from '../daemon/machine-direct-transfer.js';
+import {
+  REMOTE_DESKTOP_CAPABILITY,
+  REMOTE_DESKTOP_MSG,
+  REMOTE_DESKTOP_TERMINAL_REASON,
+  isRemoteDesktopMessageType,
+  validateRemoteDesktopDaemonCommand,
+  type RemoteDesktopDaemonCommand,
+} from '../../shared/remote-desktop.js';
+import { RemoteDesktopWorkerHost } from './remote-desktop-worker-host.js';
+import { dispatchRemoteDesktopCommand } from './remote-desktop-dispatch.js';
+import { isRemoteDesktopFeatureEnabled } from '../../shared/remote-desktop-feature.js';
+import { CONTROLLED_NODE_SAFE_SELF_UPGRADE_CAPABILITY } from '../../shared/controlled-node-service.js';
+import { cleanupLegacyWindowsUpgradeRescue } from './legacy-upgrade-rescue.js';
+import {
+  CONTROLLED_NODE_AUTO_UNLOCK_ACTION,
+  CONTROLLED_NODE_AUTO_UNLOCK_CAPABILITY,
+  CONTROLLED_NODE_AUTO_UNLOCK_ERROR,
+  validateControlledNodeAutoUnlockCommand,
+  type ControlledNodeAutoUnlockError,
+} from '../../shared/controlled-node-auto-unlock.js';
+import { incrementCounter } from '../util/metrics.js';
+import logger from '../util/logger.js';
 
 /** Server → controlled node: auth succeeded; connection is live (bridge.ts heartbeat path). */
 const CONTROLLED_NODE_AUTH_ACK_TYPE = 'heartbeat_ack' as const;
@@ -52,6 +77,16 @@ export function isControlledNodeAuthAck(message: Record<string, unknown>): boole
 export interface ControlledNodeRuntimeOptions {
   onAuthenticated?: () => void | Promise<void>;
   onAuthenticationError?: (error: unknown) => void;
+  /** Called for every authenticated server heartbeat acknowledgement. */
+  onHeartbeatAck?: () => void | Promise<void>;
+  remoteDesktopWorker?: {
+    available(): boolean;
+    handle(message: RemoteDesktopDaemonCommand): Promise<boolean>;
+    applyAutoUnlockSecret(secret: string | null): Promise<boolean>;
+    autoUnlockConfigured(): Promise<boolean>;
+    close(): void;
+  };
+  cleanupLegacyUpgradeRescue?: () => Promise<void>;
 }
 
 export function createControlledNodeRuntime(
@@ -61,9 +96,37 @@ export function createControlledNodeRuntime(
 ): AuthenticatedWebSocketClient {
   const worker = new MachineExecWorker();
   const computerUseWorker = new ComputerUseWorker(credential);
+  let client!: AuthenticatedWebSocketClient;
+  const remoteDesktopWorker = options.remoteDesktopWorker ?? new RemoteDesktopWorkerHost((message) => {
+    client.send(message);
+  }, {
+    onWorkerCrash: (crash) => {
+      // A native fault would otherwise reach the browser as a bare
+      // `worker_failed`, indistinguishable from an ordinary disconnect.
+      incrementCounter('remote_desktop.worker_crash', {
+        exception: `0x${crash.exceptionCode.toString(16)}`,
+        module: crash.module,
+      });
+      logger.warn(
+        {
+          pid: crash.pid,
+          exceptionCode: `0x${crash.exceptionCode.toString(16)}`,
+          module: crash.module,
+          moduleOffset: crash.moduleOffset,
+        },
+        'remote desktop worker crashed',
+      );
+    },
+  });
+  const remoteDesktopEnabled = remoteDesktopWorker.available()
+    && isRemoteDesktopFeatureEnabled(
+      process.env.IMCODES_REMOTE_DESKTOP_ENABLED,
+      process.env.NODE_ENV,
+    );
   let upgradeInFlight = false;
   let authenticationPersisted = false;
   let authenticationPersistenceInFlight = false;
+  let legacyUpgradeRescueCleanupStarted = false;
   const activeMachineDirectTransfers = new Set<string>();
   const reportAuthenticationError = (error: unknown) => {
     try {
@@ -90,7 +153,6 @@ export function createControlledNodeRuntime(
       authenticationPersistenceInFlight = false;
     });
   };
-  let client!: AuthenticatedWebSocketClient;
   const fileSender: FileTransferSender = {
     send(message: unknown): boolean {
       let candidate = message;
@@ -118,8 +180,16 @@ export function createControlledNodeRuntime(
         FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY,
         FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY,
         FILE_TRANSFER_PATH_HANDLE_CAPABILITY,
+        FILE_TRANSFER_DIRECTORY_CAPABILITY,
         MACHINE_DIRECT_FILE_TRANSFER_CAPABILITY,
         MACHINE_DIRECT_FILE_FETCH_CAPABILITY,
+        CONTROLLED_NODE_SAFE_SELF_UPGRADE_CAPABILITY,
+        // Auto unlock rides on the same worker: without it there is nothing
+        // that can hold a secret or type at the sign-in desktop, so a node
+        // that cannot run the worker must not offer the option at all.
+        ...(remoteDesktopEnabled
+          ? [REMOTE_DESKTOP_CAPABILITY, CONTROLLED_NODE_AUTO_UNLOCK_CAPABILITY]
+          : []),
       ],
     },
     heartbeatMessage: { type: 'heartbeat', daemonVersion: DAEMON_VERSION },
@@ -131,6 +201,9 @@ export function createControlledNodeRuntime(
     },
     onClose: () => {
       worker.abortAll();
+      // Remote desktop authority is connection-generation-bound. Unlike the
+      // warm Computer Use helper, every peer must die on Server-link loss.
+      remoteDesktopWorker.close();
       // Keep Computer Use warm across daemon websocket reconnects. The helper owns
       // long-lived OCU/MCP and fast-click subprocesses after first use; closing it
       // here would make every transient network reconnect pay the cold-start cost.
@@ -143,10 +216,29 @@ export function createControlledNodeRuntime(
       } catch {
         return;
       }
-      if (isControlledNodeAuthAck(message)) persistAuthentication();
+      if (isControlledNodeAuthAck(message)) {
+        persistAuthentication();
+        try {
+          void Promise.resolve(options.onHeartbeatAck?.()).then(async () => {
+            if (legacyUpgradeRescueCleanupStarted) return;
+            legacyUpgradeRescueCleanupStarted = true;
+            try {
+              await (options.cleanupLegacyUpgradeRescue ?? cleanupLegacyWindowsUpgradeRescue)();
+            } catch (error) {
+              legacyUpgradeRescueCleanupStarted = false;
+              throw error;
+            }
+          }).catch(reportAuthenticationError);
+        } catch (error) {
+          reportAuthenticationError(error);
+        }
+      }
       if (message.type === DAEMON_COMMAND_TYPES.DAEMON_UPGRADE) {
         if (upgradeInFlight) {
-          client.send({ type: DAEMON_MSG.UPGRADE_BLOCKED, reason: 'already_in_progress' });
+          client.send({
+            type: DAEMON_MSG.UPGRADE_BLOCKED,
+            reason: DAEMON_UPGRADE_BLOCK_REASON.ALREADY_IN_PROGRESS,
+          });
           return;
         }
         upgradeInFlight = true;
@@ -170,6 +262,15 @@ export function createControlledNodeRuntime(
       if (message.type === DAEMON_COMMAND_TYPES.COMPUTER_USE) {
         const reply = await computerUseWorker.handle(message);
         if (reply) client.send({ type: DAEMON_MSG.COMPUTER_USE_RESULT, ...reply });
+        return;
+      }
+      if (isRemoteDesktopMessageType(message.type)) {
+        await dispatchRemoteDesktopCommand({
+          message,
+          enabled: remoteDesktopEnabled,
+          target: remoteDesktopWorker,
+          send: (reply) => client.send(reply),
+        });
         return;
       }
       if (message.type === MACHINE_DIRECT_FILE_TRANSFER_MSG.REQUEST) {
@@ -218,6 +319,7 @@ export function createControlledNodeRuntime(
       if (message.type === 'file.upload_fetch'
         || message.type === 'file.download'
         || message.type === FILE_TRANSFER_MSG.DOWNLOAD_STREAM
+        || message.type === FILE_TRANSFER_MSG.DIRECTORY_LIST
         || message.type === FILE_TRANSFER_MSG.PATH_HANDLE
         || message.type === FILE_TRANSFER_MSG.DELETE) {
         const parsed = validateControlledFileTransferRequest(message);
@@ -242,9 +344,47 @@ export function createControlledNodeRuntime(
           await handleFileDownloadStream(parsed.value as unknown as Record<string, unknown>, fileSender);
         } else if (parsed.value.type === FILE_TRANSFER_MSG.DELETE) {
           await handleFileDelete(parsed.value as unknown as Record<string, unknown>, fileSender);
+        } else if (parsed.value.type === FILE_TRANSFER_MSG.DIRECTORY_LIST) {
+          await handleFileDirectoryList(parsed.value as unknown as Record<string, unknown>, fileSender);
         } else {
           await handleFilePathHandle(parsed.value as unknown as Record<string, unknown>, fileSender);
         }
+        return;
+      }
+      if (message.type === DAEMON_COMMAND_TYPES.CONTROLLED_NODE_AUTO_UNLOCK) {
+        const command = validateControlledNodeAutoUnlockCommand(
+          message,
+          DAEMON_COMMAND_TYPES.CONTROLLED_NODE_AUTO_UNLOCK,
+        );
+        if (!command) return;
+        // The secret exists in this process only for the length of this call
+        // and only to reach the worker's stdin; nothing here logs or keeps it.
+        let ok = false;
+        let error: ControlledNodeAutoUnlockError | undefined;
+        try {
+          if (!remoteDesktopWorker.available()) {
+            error = CONTROLLED_NODE_AUTO_UNLOCK_ERROR.UNSUPPORTED_PLATFORM;
+          } else {
+            ok = await remoteDesktopWorker.applyAutoUnlockSecret(
+              command.action === CONTROLLED_NODE_AUTO_UNLOCK_ACTION.SET
+                ? command.secret ?? ''
+                : null,
+            );
+            if (!ok) error = CONTROLLED_NODE_AUTO_UNLOCK_ERROR.STORE_FAILED;
+          }
+        } catch {
+          error = CONTROLLED_NODE_AUTO_UNLOCK_ERROR.STORE_FAILED;
+        }
+        const configured = ok
+          ? command.action === CONTROLLED_NODE_AUTO_UNLOCK_ACTION.SET
+          : await remoteDesktopWorker.autoUnlockConfigured().catch(() => false);
+        client.send({
+          type: DAEMON_MSG.CONTROLLED_NODE_AUTO_UNLOCK_RESULT,
+          requestId: command.requestId,
+          ok,
+          configured,
+          ...(error === undefined ? {} : { error }),
+        });
         return;
       }
       if (message.type !== DAEMON_COMMAND_TYPES.MACHINE_EXEC) return;

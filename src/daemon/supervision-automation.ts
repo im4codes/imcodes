@@ -1221,6 +1221,7 @@ class SupervisionAutomation {
       const pending = this.pendingTaskIntents.get(event.sessionId);
       const clientMessageId = trimString(event.payload.clientMessageId);
       const automation = event.payload.automation === true;
+      const queueAppended = event.payload.queueAppended === true;
       const text = trimString(event.payload.text);
       const activeRun = this.activeRuns.get(event.sessionId);
       // Structured delegation replies are injected into the origin session as
@@ -1245,14 +1246,14 @@ class SupervisionAutomation {
         this.emitStatus(activeRun.sessionName, 'supervision_audit_waiting', SUPERVISION_AUDIT_WAITING_LABEL);
         this.emitAutomationNote(activeRun.sessionName, 'Auto: the delegated audit reply arrived; waiting for this session to produce the final PASS/REWORK judgment.', 'supervision-audit-reply-received');
       }
-      if (!automation && !delegatedReply && !delegationCompletionNotification && text && !text.startsWith('/')) {
+      if (!automation && !queueAppended && !delegatedReply && !delegationCompletionNotification && text && !text.startsWith('/')) {
         this.recentTaskCandidates.set(event.sessionId, {
           commandId: clientMessageId ?? `implicit:${Date.now()}`,
           text,
           sequence,
         });
       }
-      if (pending && !automation && clientMessageId === pending.commandId) {
+      if (pending && !automation && !queueAppended && clientMessageId === pending.commandId) {
         this.pendingTaskIntents.delete(event.sessionId);
         this.registerTaskIntent(event.sessionId, pending.commandId, pending.text, pending.snapshot);
       }

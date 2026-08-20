@@ -79,8 +79,9 @@ function createWs(capabilities: string[]) {
     send: (message: Record<string, unknown>) => {
       sent.push(message);
       if (message.type === DIRECT_FILE_TRANSFER_MSG.INIT) {
+        const { sessionName: _sessionName, ...authority } = message;
         queueMicrotask(() => emit({
-          ...message,
+          ...authority,
           type: DIRECT_FILE_TRANSFER_MSG.AUTHORIZED,
           capability,
           expiresAt: Date.now() + 60_000,
@@ -165,6 +166,43 @@ describe('direct file upload fallback', () => {
     })).resolves.toMatchObject({ attachment: { id: 'relay' } });
     expect(modes).toEqual(['connecting', 'falling_back', 'relay']);
     expect(uploadFileMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps a shared-session authorization hint on both direct and relay upload attempts', async () => {
+    const { uploadFileWithDirectFallback } = await import('../src/direct-file-transfer.js');
+    const fixture = createWs([DIRECT_FILE_TRANSFER_CAPABILITY]);
+    const sent = fixture.sent;
+    (fixture.ws as unknown as { send: (message: Record<string, unknown>) => void }).send = (message) => {
+      sent.push(message);
+      if (message.type !== DIRECT_FILE_TRANSFER_MSG.INIT) return;
+      queueMicrotask(() => fixture.emit({
+        type: DIRECT_FILE_TRANSFER_MSG.ERROR,
+        requestId: message.requestId as string,
+        error: 'connection_failed',
+        retryable: true,
+      } as ServerMessage));
+    };
+    const file = new File(['shared'], 'shared.txt', { type: 'text/plain' });
+
+    await uploadFileWithDirectFallback({
+      ws: fixture.ws,
+      serverId: 'server-1',
+      sessionName: 'deck_project_brain',
+      file,
+    });
+
+    expect(sent[0]).toMatchObject({
+      type: DIRECT_FILE_TRANSFER_MSG.INIT,
+      sessionName: 'deck_project_brain',
+    });
+    expect(uploadFileMock).toHaveBeenCalledWith(
+      'server-1',
+      file,
+      undefined,
+      expect.stringMatching(/^[0-9a-f-]{36}$/),
+      undefined,
+      'deck_project_brain',
+    );
   });
 
   it('cancels an active direct upload without starting relay fallback', async () => {

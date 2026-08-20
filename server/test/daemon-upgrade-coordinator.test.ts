@@ -181,6 +181,52 @@ describe('DaemonUpgradeCoordinator npm publication gate', () => {
     expect(sent).toHaveLength(2);
   });
 
+  it('keeps the same lifecycle pending and retries immediately after a legacy daemon restart', async () => {
+    vi.useFakeTimers();
+    const coordinator = new DaemonUpgradeCoordinator();
+    const sent: Record<string, unknown>[] = [];
+    let ready = true;
+    const base = {
+      targetVersion: '2026.8.3409-dev.3847',
+      source: 'auto' as const,
+      skipPublicationGate: true,
+      isDaemonReady: () => ready,
+      isStillCurrent: () => true,
+      send: (message: Record<string, unknown>) => sent.push(message),
+    };
+
+    const first = coordinator.request({ ...base, now: 0 });
+    await vi.advanceTimersByTimeAsync(5_000);
+    await flushPromises();
+    expect(sent).toHaveLength(1);
+    for (let cycle = 0; cycle < 4; cycle += 1) {
+      expect(coordinator.prepareRetryAfterDaemonRestart(5_001 + cycle)).toBe(true);
+      expect(coordinator.prepareRetryAfterDaemonRestart(5_101 + cycle)).toBe(false);
+
+      ready = false;
+      const reconnect = coordinator.request({ ...base, now: 5_201 + cycle });
+      expect(reconnect).toMatchObject({
+        upgradeId: first.upgradeId,
+        deliveryStatus: DAEMON_UPGRADE_DELIVERY_STATUS.PENDING_OFFLINE,
+      });
+
+      ready = true;
+      const flushed = coordinator.flushPending({
+        skipPublicationGate: true,
+        isDaemonReady: () => ready,
+        isStillCurrent: () => true,
+        send: base.send,
+      });
+      expect(flushed).toMatchObject({
+        upgradeId: first.upgradeId,
+        deliveryStatus: DAEMON_UPGRADE_DELIVERY_STATUS.SENT,
+      });
+      await vi.advanceTimersByTimeAsync(5_000);
+      await flushPromises();
+      expect(sent).toHaveLength(cycle + 2);
+    }
+  });
+
   it('cancels a scheduled auto send and terminally blocks only that target until manual override', async () => {
     vi.useFakeTimers();
     const coordinator = new DaemonUpgradeCoordinator();

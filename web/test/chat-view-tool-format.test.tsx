@@ -326,6 +326,40 @@ describe('ChatView tool payload formatting', () => {
     expect(detailText).toContain('OUTPUT_TAIL_4c21');
   });
 
+  it('offers a second collapse control at the bottom of an expanded tool call', () => {
+    const events = [
+      makeEvent({
+        eventId: 'transport-tool:test:bottom-collapse:call',
+        type: 'tool.call',
+        payload: {
+          tool: 'Bash',
+          input: { command: 'printf bottom-collapse' },
+          _merged: true,
+          _output: 'line\n'.repeat(120),
+        },
+      }),
+    ];
+
+    const { container } = render(<ChatView events={events} loading={false} />);
+    const fold = container.querySelector('.chat-tool-block-fold');
+
+    fireEvent.click(screen.getByRole('button', { name: 'details' }));
+
+    const footerButton = container.querySelector<HTMLButtonElement>(
+      '.chat-tool-fold-footer .chat-tool-fold-collapse',
+    );
+    expect(fold?.classList.contains('is-expanded')).toBe(true);
+    expect(screen.getAllByRole('button', { name: 'collapse' })).toHaveLength(2);
+    expect(footerButton?.textContent).toContain('collapse');
+    expect(footerButton?.getAttribute('aria-expanded')).toBe('true');
+
+    fireEvent.click(footerButton!);
+
+    expect(fold?.classList.contains('is-collapsed')).toBe(true);
+    expect(container.querySelector('.chat-tool-fold-footer')).toBeNull();
+    expect(screen.getByRole('button', { name: 'details' })).toBeDefined();
+  });
+
   it('keeps only the first Bash command line in the sticky header', () => {
     const command = 'printf first\nprintf second\nprintf third';
     const events = [

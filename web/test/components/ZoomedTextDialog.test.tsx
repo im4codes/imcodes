@@ -21,6 +21,8 @@ afterEach(() => {
   else delete (navigator as unknown as { clipboard?: Clipboard }).clipboard;
   if (originalExecCommandDescriptor) Object.defineProperty(document, 'execCommand', originalExecCommandDescriptor);
   else delete (document as unknown as { execCommand?: (commandId: string) => boolean }).execCommand;
+  localStorage.removeItem('message_pin_preview_height');
+  localStorage.removeItem('message_pin_preview_width');
   cleanup();
 });
 
@@ -32,6 +34,23 @@ function selectText(node: Node, start: number, end: number) {
   selection?.removeAllRanges();
   selection?.addRange(range);
   document.dispatchEvent(new Event('selectionchange'));
+}
+
+function firePointer(
+  target: EventTarget,
+  type: 'pointerdown' | 'pointermove' | 'pointerup',
+  init: MouseEventInit & { pointerId: number },
+) {
+  // jsdom does not provide PointerEvent. A MouseEvent with the same event name
+  // plus pointerId exercises Preact's real pointer-handler wiring.
+  const eventName = type === 'pointerdown'
+    && target instanceof Element
+    && !('onpointerdown' in target)
+    ? 'PointerDown'
+    : type;
+  const event = new MouseEvent(eventName, { bubbles: true, cancelable: true, ...init });
+  Object.defineProperty(event, 'pointerId', { value: init.pointerId });
+  fireEvent(target, event);
 }
 
 describe('ZoomedTextDialog', () => {
@@ -51,7 +70,7 @@ describe('ZoomedTextDialog', () => {
       }),
     });
 
-    const { container } = render(
+    render(
       <>
         <div>attachment and sidebar chrome</div>
         <ZoomedTextDialog text={'Only this message\nwith two lines'} onClose={vi.fn()} />
@@ -68,17 +87,18 @@ describe('ZoomedTextDialog', () => {
       expect(screen.getByText('common.copied')).toBeTruthy();
     });
     expect(document.execCommand).toHaveBeenCalledWith('copy');
-    expect(container.querySelector('textarea')).toBeNull();
+    // Portalled to <body>, so the fallback textarea (if any) would live there.
+    expect(document.querySelector('textarea')).toBeNull();
   });
 
   it('shows Copy and Quote actions for selected text', async () => {
     const onQuote = vi.fn();
     const onClose = vi.fn();
-    const { container } = render(
+    render(
       <ZoomedTextDialog text="Alpha beta gamma" onClose={onClose} onQuote={onQuote} />,
     );
 
-    const content = container.querySelector('.zoom-text-content')!;
+    const content = document.querySelector('.zoom-text-content')!;
     await act(async () => {
       await Promise.resolve();
     });
@@ -95,5 +115,139 @@ describe('ZoomedTextDialog', () => {
 
     expect(onQuote).toHaveBeenCalledWith('beta');
     expect(onClose).toHaveBeenCalledOnce();
+  });
+  it('renders into <body> so the app bar cannot cover it', () => {
+    // The overlay is `position: fixed; z-index: 9999`, but rendered inside the
+    // chat subtree that number only ranks it among its own siblings.
+    // `.mobile-server-bar` sits at z-index 6500 much higher up the tree, so the
+    // dialog — its header and close button included — ended up underneath the
+    // app bar. Only a body-level portal puts the 9999 where it can win.
+    const { container } = render(
+      <ZoomedTextDialog text="hello" onClose={vi.fn()} />,
+    );
+
+    expect(container.querySelector('.zoom-text-dialog')).toBeNull();
+    const overlay = document.querySelector('.zoom-text-overlay');
+    expect(overlay).toBeTruthy();
+    expect(overlay?.parentElement).toBe(document.body);
+    expect(document.querySelector('.zoom-text-close')).toBeTruthy();
+  });
+
+  it('defaults pinned-message previews to 90% of the mobile viewport height', () => {
+    const innerWidthDescriptor = Object.getOwnPropertyDescriptor(window, 'innerWidth');
+    const innerHeightDescriptor = Object.getOwnPropertyDescriptor(window, 'innerHeight');
+    const visualViewportDescriptor = Object.getOwnPropertyDescriptor(window, 'visualViewport');
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 390 });
+    Object.defineProperty(window, 'innerHeight', { configurable: true, value: 800 });
+    Object.defineProperty(window, 'visualViewport', { configurable: true, value: undefined });
+
+    try {
+      render(
+        <ZoomedTextDialog
+          text="mobile preview"
+          onClose={vi.fn()}
+          messagePreviewLayout
+        />,
+      );
+
+      const dialog = document.querySelector<HTMLElement>('.zoom-text-dialog-message-preview')!;
+      expect(dialog.style.height).toBe('720px');
+    } finally {
+      if (innerWidthDescriptor) Object.defineProperty(window, 'innerWidth', innerWidthDescriptor);
+      if (innerHeightDescriptor) Object.defineProperty(window, 'innerHeight', innerHeightDescriptor);
+      if (visualViewportDescriptor) Object.defineProperty(window, 'visualViewport', visualViewportDescriptor);
+      else Reflect.deleteProperty(window, 'visualViewport');
+    }
+  });
+
+  it('persists pinned-preview width and height without closing after resize', async () => {
+    const onClose = vi.fn();
+    render(
+      <ZoomedTextDialog
+        text="resizable preview"
+        onClose={onClose}
+        messagePreviewLayout
+      />,
+    );
+
+    const dialog = document.querySelector<HTMLElement>('.zoom-text-dialog-message-preview')!;
+    const initialWidth = Number.parseInt(dialog.style.width, 10);
+    const initialHeight = Number.parseInt(dialog.style.height, 10);
+    expect(initialWidth).toBeGreaterThanOrEqual(320);
+    expect(initialHeight).toBeGreaterThanOrEqual(280);
+    dialog.getBoundingClientRect = () => ({
+      width: initialWidth,
+      height: initialHeight,
+      top: 0,
+      left: 0,
+      right: initialWidth,
+      bottom: initialHeight,
+      x: 0,
+      y: 0,
+      toJSON: () => ({}),
+    });
+
+    const handle = document.querySelector('.zoom-text-resize-handle.is-corner')!;
+    firePointer(handle, 'pointerdown', { button: 0, pointerId: 7, clientX: 500, clientY: 300 });
+    firePointer(document, 'pointermove', { pointerId: 7, clientX: 540, clientY: 330 });
+    firePointer(document, 'pointerup', { pointerId: 7, clientX: 540, clientY: 330 });
+
+    await waitFor(() => {
+      expect(localStorage.getItem('message_pin_preview_width')).toBe(String(initialWidth + 80));
+      expect(localStorage.getItem('message_pin_preview_height')).toBe(String(initialHeight + 60));
+      expect(dialog.style.width).toBe(`${initialWidth + 80}px`);
+      expect(dialog.style.height).toBe(`${initialHeight + 60}px`);
+    });
+
+    fireEvent.click(document.querySelector('.zoom-text-overlay')!);
+    expect(onClose).not.toHaveBeenCalled();
+    expect(document.querySelector('.zoom-text-dialog')).toBeTruthy();
+  });
+
+  it('still closes on an ordinary outside click', () => {
+    const onClose = vi.fn();
+    render(<ZoomedTextDialog text="outside close" onClose={onClose} messagePreviewLayout />);
+
+    fireEvent.click(document.querySelector('.zoom-text-overlay')!);
+    expect(onClose).toHaveBeenCalledOnce();
+  });
+
+  it('supports independent width-only and height-only resize handles', async () => {
+    render(<ZoomedTextDialog text="axis resize" onClose={vi.fn()} messagePreviewLayout />);
+    const dialog = document.querySelector<HTMLElement>('.zoom-text-dialog-message-preview')!;
+    const rect = () => {
+      const width = Number.parseInt(dialog.style.width, 10);
+      const height = Number.parseInt(dialog.style.height, 10);
+      return {
+        width,
+        height,
+        top: 0,
+        left: 0,
+        right: width,
+        bottom: height,
+        x: 0,
+        y: 0,
+        toJSON: () => ({}),
+      };
+    };
+    dialog.getBoundingClientRect = rect;
+    const initial = rect();
+
+    const rightHandle = document.querySelector('.zoom-text-resize-handle.is-right')!;
+    firePointer(rightHandle, 'pointerdown', { button: 0, pointerId: 8, clientX: 500, clientY: 300 });
+    firePointer(document, 'pointerup', { pointerId: 8, clientX: 530, clientY: 390 });
+    await waitFor(() => {
+      expect(dialog.style.width).toBe(`${initial.width + 60}px`);
+      expect(dialog.style.height).toBe(`${initial.height}px`);
+    });
+
+    const afterWidth = rect();
+    const bottomHandle = document.querySelector('.zoom-text-resize-handle.is-bottom')!;
+    firePointer(bottomHandle, 'pointerdown', { button: 0, pointerId: 9, clientX: 500, clientY: 300 });
+    firePointer(document, 'pointerup', { pointerId: 9, clientX: 380, clientY: 325 });
+    await waitFor(() => {
+      expect(dialog.style.width).toBe(`${afterWidth.width}px`);
+      expect(dialog.style.height).toBe(`${afterWidth.height + 50}px`);
+    });
   });
 });

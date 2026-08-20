@@ -214,6 +214,99 @@ html.native-ios-mac .chat-dl-btn {
 .toast-close:hover { color: #e6edf3; }
 @keyframes toast-in { from { opacity: 0; transform: translateY(12px); } to { opacity: 1; transform: none; } }
 @media (max-width: 640px) { .toast-container { bottom: 130px; right: 8px; left: 8px; } .toast { max-width: 100%; } }
+
+/* Center-screen confirmation for Stop's queue-first action. */
+.queue-append-success-toast {
+  position: fixed;
+  z-index: 12000;
+  top: 50%;
+  left: 50%;
+  width: max-content;
+  max-width: min(520px, calc(100vw - 32px));
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  padding: 13px 18px;
+  color: #e8fbff;
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: .01em;
+  background: linear-gradient(130deg, rgb(7 22 35 / 98%), rgb(9 35 49 / 94%), rgb(5 18 30 / 92%));
+  border: 1px solid rgb(68 222 255 / 78%);
+  border-radius: 999px;
+  box-shadow: 0 0 0 1px rgb(44 170 255 / 14%), 0 14px 48px rgb(0 0 0 / 48%), 0 0 36px rgb(41 200 255 / 26%);
+  backdrop-filter: blur(14px) saturate(145%);
+  -webkit-backdrop-filter: blur(14px) saturate(145%);
+  overflow: hidden;
+  pointer-events: none;
+  animation: queue-append-success-in .24s cubic-bezier(.2, .9, .2, 1) both;
+}
+
+.queue-append-success-toast::before,
+.queue-append-success-toast::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+.queue-append-success-toast::before {
+  background:
+    radial-gradient(circle at 0% 0%, rgba(125 211 252 / 20%) 0%, transparent 42%),
+    radial-gradient(circle at 100% 100%, rgba(56 189 248 / 18%) 0%, transparent 40%);
+  opacity: .85;
+}
+
+.queue-append-success-toast::after {
+  border-radius: 999px;
+  border: 1px solid transparent;
+  background: linear-gradient(120deg, rgb(56 189 248 / 0), rgb(168 85 247 / 0.45), rgb(14 165 233 / 0.25), rgb(56 189 248 / 0)) border-box;
+  -webkit-mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+  -webkit-mask-composite: exclude;
+  mask-composite: exclude;
+  padding: 1px;
+  animation: queue-append-halo 2.2s linear infinite;
+}
+
+.queue-append-success-toast-icon {
+  display: grid;
+  width: 25px;
+  height: 25px;
+  flex: 0 0 25px;
+  place-items: center;
+  color: #07131d;
+  background: linear-gradient(135deg, #67e8f9, #38bdf8);
+  border-radius: 50%;
+  box-shadow: 0 0 16px rgb(56 189 248 / 72%), inset 0 0 12px rgba(14, 165, 233, 0.58);
+  font-size: 15px;
+  font-weight: 900;
+  position: relative;
+  z-index: 1;
+}
+
+.queue-append-success-toast-icon::after {
+  content: '';
+  position: absolute;
+  inset: 2px;
+  border-radius: 50%;
+  background: radial-gradient(circle, rgba(224 242 254 / 88%) 0%, rgba(224 242 254 / 0) 68%);
+}
+
+@keyframes queue-append-success-in {
+  from { opacity: 0; transform: translate(-50%, -42%) scale(.94); filter: blur(4px); }
+  to { opacity: 1; transform: translate(-50%, -50%) scale(1); filter: blur(0); }
+}
+
+@keyframes queue-append-halo {
+  from { transform: translateX(-42%); opacity: 0.45; }
+  to { transform: translateX(42%); opacity: 0.92; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .queue-append-success-toast { animation: none; transform: translate(-50%, -50%); }
+}
 .tab-context-menu { position: fixed; background: #1c2128; border: 1px solid #30363d; border-radius: 6px; min-width: 150px; box-shadow: 0 8px 24px #00000080; z-index: 100; overflow: hidden; }
 .menu-divider { height: 1px; background: #21262d; margin: 2px 0; }
 .share-dialog { max-width: 520px; }
@@ -254,6 +347,19 @@ html.native-ios-mac .chat-dl-btn {
 .shared-entry-title { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; font-weight: 700; }
 .shared-entry-subtitle { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #94a3b8; font-size: 10px; }
 .shared-entry-meta { display: inline-flex; flex-direction: column; align-items: flex-end; gap: 2px; color: #93c5fd; font-size: 10px; white-space: nowrap; }
+.shared-return-guide { position: fixed; top: 56px; left: 54px; z-index: 9800; width: min(270px, calc(100vw - 68px)); padding: 7px; border: 1px solid rgba(34,211,238,0.68); border-radius: 9px; background: linear-gradient(155deg, rgba(8,47,73,0.98), rgba(15,23,42,0.98)); color: #e2e8f0; box-shadow: 0 12px 30px rgba(0,0,0,0.5), 0 0 0 1px rgba(34,211,238,0.1), 0 0 16px rgba(34,211,238,0.12); animation: shared-return-guide-in 0.2s ease-out; }
+.shared-return-guide::before { content: ''; position: absolute; top: 17px; left: -8px; width: 14px; height: 14px; border-left: 1px solid rgba(34,211,238,0.68); border-bottom: 1px solid rgba(34,211,238,0.68); background: #0a3147; transform: rotate(45deg); }
+.shared-return-guide-actions { display: flex; align-items: center; gap: 6px; }
+.shared-return-guide-return, .shared-return-guide-dismiss { min-height: 28px; border-radius: 7px; padding: 0 8px; font: inherit; font-size: 10.5px; font-weight: 700; cursor: pointer; }
+.shared-return-guide-return { flex: 1; border: 1px solid rgba(34,211,238,0.68); background: linear-gradient(135deg, rgba(8,145,178,0.82), rgba(29,78,216,0.78)); color: #fff; animation: shared-return-server-pulse 1.05s ease-in-out infinite; }
+.shared-return-guide-dismiss { border: 1px solid rgba(148,163,184,0.26); background: rgba(15,23,42,0.72); color: #cbd5e1; }
+.server-icon-return-hint, .server-return-hint { position: relative; z-index: 1; animation: shared-return-server-pulse 1.05s ease-in-out infinite; }
+@keyframes shared-return-guide-in { from { opacity: 0; transform: translateX(-10px) scale(0.97); } to { opacity: 1; transform: none; } }
+@keyframes shared-return-server-pulse { 0%, 100% { box-shadow: 0 0 0 1px rgba(34,211,238,0.24), 0 0 8px rgba(34,211,238,0.16); } 50% { box-shadow: 0 0 0 3px rgba(34,211,238,0.46), 0 0 22px rgba(34,211,238,0.46); } }
+@media (max-width: 640px) {
+  .shared-return-guide { top: calc(env(safe-area-inset-top, 0px) + 50px); left: 10px; right: auto; width: min(270px, calc(100vw - 20px)); }
+  .shared-return-guide::before { top: -8px; left: 24px; transform: rotate(135deg); }
+}
 .mobile-server-menu-shared { border-top: 1px solid #334155; padding: 6px 0; }
 .mobile-server-menu-shared-title { padding: 4px 12px; color: #94a3b8; font-size: 11px; font-weight: 800; }
 .chat-shared-actor-label,
@@ -363,6 +469,26 @@ html.native-ios-mac .chat-dl-btn {
 .shortcut-btn { flex-shrink: 0; padding: 4px 8px; background: rgba(15,23,42,0.58); border: 1px solid rgba(125,211,252,0.16); border-radius: 7px; color: #7b8797; font-size: 11px; font-family: inherit; cursor: pointer; transition: color 0.12s, border-color 0.12s, background 0.12s, box-shadow 0.12s; white-space: nowrap; box-shadow: inset 0 1px 0 rgba(255,255,255,0.03); touch-action: manipulation; }
 /* Instant optimistic feedback while a stop is in flight (before the session
    state round-trip + provider interrupt land). */
+/* A warning, not a decoration: Fast is spending the plan faster than the
+   operator may realise, so it reads as amber and stays legible next to the
+   model chip rather than hiding in a menu. */
+.shortcut-btn-fast-warning {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: #fcd34d !important;
+  background: linear-gradient(180deg, rgb(120 74 12 / 55%), rgb(69 42 8 / 55%)) !important;
+  border: 1px solid rgb(251 191 36 / 55%) !important;
+  box-shadow: 0 0 10px rgb(251 191 36 / 18%);
+  font-weight: 600;
+  font-size: 10px;
+}
+
+.shortcut-btn-fast-warning:hover {
+  color: #fde68a !important;
+  border-color: rgb(251 191 36 / 85%) !important;
+}
+
 .shortcut-btn-stop-pending { animation: shortcut-btn-stop-pulse 0.42s ease-in-out infinite; border-color: rgba(248,113,113,0.95) !important; background: rgba(127,29,29,0.72) !important; color: #fecaca !important; text-shadow: 0 0 10px rgba(254,202,202,0.85); position: relative; z-index: 2; }
 @keyframes shortcut-btn-stop-pulse {
   0%, 100% { opacity: 1; transform: scale(1); box-shadow: 0 0 0 0 rgba(239,68,68,0), inset 0 0 0 1px rgba(254,202,202,0.12); }
@@ -394,7 +520,226 @@ html.native-ios-mac .chat-dl-btn {
 .shortcut-btn:disabled { opacity: 0.4; cursor: default; }
 .shortcut-btn-wide { padding-left: 14px; padding-right: 14px; }
 .shortcut-btn-icon { width: 28px; min-width: 28px; padding: 4px 0; display: inline-flex; align-items: center; justify-content: center; }
-.shortcut-btn-stop { width: 44px; min-width: 44px; font-size: 18px; line-height: 1; }
+.shortcut-btn-stop {
+  position: relative;
+  width: 44px;
+  min-width: 44px;
+  font-size: 18px;
+  line-height: 1;
+  border-color: rgba(248,113,113,0.55);
+  color: #fecaca;
+  background: linear-gradient(162deg, rgba(127, 29, 29, 0.72), rgba(30, 41, 59, 0.75));
+  box-shadow: inset 0 0 0 1px rgba(248, 113, 113, 0.18), 0 8px 16px rgba(0, 0, 0, 0.22), 0 0 14px rgba(248, 113, 113, 0.18);
+  text-shadow: 0 0 8px rgba(254, 202, 202, 0.45);
+}
+
+.shortcut-btn-stop::before,
+.shortcut-btn-stop::after {
+  content: '';
+  position: absolute;
+  pointer-events: none;
+  border-radius: inherit;
+  transition: opacity 0.2s ease;
+}
+
+.shortcut-btn-stop::before {
+  inset: 0;
+  background: linear-gradient(125deg, rgba(248, 113, 113, 0.16), rgba(56, 189, 248, 0.06), rgba(255,255,255,0.02), rgba(248, 113, 113, 0.16));
+  background-size: 260% 100%;
+  opacity: 0;
+  animation: shortcut-btn-stop-scan 2.2s linear infinite;
+}
+
+.shortcut-btn-stop::after {
+  inset: 0;
+  border: 1px solid rgba(254, 202, 202, 0.6);
+  box-shadow: 0 0 10px rgba(248, 113, 113, 0.35), inset 0 0 12px rgba(254, 202, 202, 0.17);
+}
+
+.shortcut-btn-stop:hover:not(:disabled) {
+  transform: translateY(-1px);
+  border-color: rgba(252, 165, 165, 0.84);
+  color: #fff7ed;
+  box-shadow: 0 9px 18px rgba(248, 113, 113, 0.4), inset 0 1px 0 rgba(254, 202, 202, 0.22), 0 0 0 1px rgba(252, 165, 165, 0.28);
+}
+
+.shortcut-btn-stop:hover:not(:disabled)::before { opacity: 1; }
+
+@keyframes shortcut-btn-stop-scan {
+  from { background-position: 0% 0; }
+  to { background-position: 100% 0; }
+}
+.shortcut-btn-stop-queue-count {
+  position: absolute;
+  /* Above the ::after ring, which paints after the element's children. */
+  z-index: 1;
+  top: -7px;
+  right: -7px;
+  z-index: 3;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 4px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: #07131d;
+  background: linear-gradient(135deg, #67e8f9, #38bdf8 58%, #22d3ee);
+  border: 1px solid rgba(226, 232, 240, 0.42);
+  border-radius: 999px;
+  box-shadow: 0 0 10px rgba(56, 189, 248, 0.78), 0 0 16px rgba(14, 165, 233, 0.2);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0;
+  line-height: 1;
+  color: #052f4d;
+  text-shadow: none;
+  font-variant-numeric: tabular-nums;
+  transform: translateZ(0);
+}
+
+.mobile-controls {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 8px;
+  border-radius: 14px;
+  background: linear-gradient(155deg, rgba(15, 23, 42, 0.84), rgba(8, 47, 73, 0.22));
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  box-shadow: inset 0 0 0 1px rgba(125, 211, 252, 0.1), 0 12px 24px rgba(0, 0, 0, 0.23);
+  overflow: hidden;
+}
+
+.mobile-controls::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: radial-gradient(circle at 0% 0%, rgba(56, 189, 248, 0.12), transparent 45%);
+}
+
+.session-dots {
+  display: flex;
+  justify-content: center;
+  gap: 8px;
+  padding: 2px 0;
+}
+
+.session-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 999px;
+  border: none;
+  background: rgba(148, 163, 184, 0.35);
+  padding: 0;
+  cursor: pointer;
+  transition: transform 0.16s ease, background-color 0.16s ease;
+}
+
+.session-dot--active {
+  background: #fcd34d;
+  box-shadow: 0 0 10px rgba(251, 191, 36, 0.5), 0 0 16px rgba(251, 191, 36, 0.18);
+  transform: scale(1.25);
+}
+
+.mobile-input-row {
+  display: grid;
+  grid-template-columns: 1fr 48px 58px;
+  gap: 8px;
+  align-items: end;
+}
+
+.mobile-input {
+  min-height: 44px;
+  resize: none;
+  border-radius: 12px;
+  border: 1px solid rgba(125, 211, 252, 0.24);
+  background: rgba(15, 23, 42, 0.82);
+  color: #f8fafc;
+  padding: 10px 10px;
+  font-family: inherit;
+  font-size: 14px;
+  outline: none;
+  position: relative;
+}
+
+.mobile-input:focus-visible {
+  border-color: rgba(56, 189, 248, 0.8);
+  box-shadow: 0 0 0 1px rgba(56, 189, 248, 0.24), 0 0 16px rgba(56, 189, 248, 0.2);
+}
+
+.mobile-input:focus {
+  border-color: rgba(56, 189, 248, 0.68);
+  box-shadow: 0 0 0 1px rgba(56, 189, 248, 0.2), 0 0 16px rgba(56, 189, 248, 0.14);
+}
+
+.btn-mobile-stop,
+.btn-mobile-send {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 12px;
+  font-size: 18px;
+  line-height: 1;
+  border: 1px solid rgba(125, 211, 252, 0.25);
+  background: linear-gradient(155deg, rgba(17, 24, 39, 0.96), rgba(15, 23, 42, 0.75));
+  color: #93c5fd;
+  min-height: 44px;
+  transition: transform 0.16s ease, box-shadow 0.16s ease;
+  position: relative;
+  overflow: hidden;
+  isolation: isolate;
+}
+
+.btn-mobile-stop::before,
+.btn-mobile-send::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.2s ease;
+}
+
+.btn-mobile-stop::before {
+  background: linear-gradient(120deg, transparent 36%, rgba(248, 113, 113, 0.22), transparent 66%);
+}
+
+.btn-mobile-send::before {
+  background: linear-gradient(120deg, transparent 36%, rgba(56, 189, 248, 0.2), transparent 66%);
+}
+
+.btn-mobile-stop {
+  color: #fecaca;
+  border-color: rgba(248, 113, 113, 0.5);
+  background: linear-gradient(155deg, rgba(127, 29, 29, 0.82), rgba(15, 23, 42, 0.7));
+  box-shadow: inset 0 0 0 1px rgba(248, 113, 113, 0.2), 0 0 12px rgba(248, 113, 113, 0.24);
+}
+
+.btn-mobile-stop:hover,
+.btn-mobile-send:hover {
+  transform: translateY(-1px);
+  filter: brightness(1.08);
+}
+
+.btn-mobile-stop:hover { box-shadow: 0 0 16px rgba(248, 113, 113, 0.35); }
+.btn-mobile-send:hover { box-shadow: 0 0 16px rgba(56, 189, 248, 0.35); }
+
+.btn-mobile-stop:hover::before,
+.btn-mobile-send:hover::before {
+  opacity: 1;
+}
+
+.btn-mobile-send {
+  border-color: rgba(56, 189, 248, 0.5);
+  background: linear-gradient(155deg, rgba(8, 145, 178, 0.9), rgba(15, 23, 42, 0.84));
+  color: #cfeafe;
+  box-shadow: inset 0 0 0 1px rgba(34, 211, 238, 0.24), 0 0 12px rgba(34, 211, 238, 0.17);
+}
+
+.btn-mobile-stop:active,
+.btn-mobile-send:active { transform: scale(0.97); }
+
 /* Mobile arrow D-pad — replaces the separate up/down buttons on small screens.
  * Drag toward a direction to send that arrow key. touch-action:none keeps the
  * drag from scrolling the page; the four glyphs sit around a center. */
@@ -603,6 +948,37 @@ html.native-ios-mac .chat-dl-btn {
 .p2p-settings-label { display: none; }
 .controls { padding: 6px 8px; display: flex; gap: 6px; align-items: center; position: relative; z-index: 1; background: linear-gradient(180deg, rgba(8,13,22,0.12), rgba(8,13,22,0.36)); }
 .controls-composer { position: relative; flex: 1; min-width: 0; display: flex; align-items: stretch; }
+.controls-composer-resize-edge {
+  position: absolute;
+  top: -4px;
+  right: 8px;
+  left: 8px;
+  z-index: 3;
+  height: 9px;
+  cursor: ns-resize;
+  touch-action: none;
+  outline: none;
+}
+.controls-composer-resize-edge::after {
+  position: absolute;
+  top: 4px;
+  right: 0;
+  left: 0;
+  height: 1px;
+  border-radius: 1px;
+  background: rgba(103,232,249,0.7);
+  content: '';
+  opacity: 0;
+  transition: opacity 0.14s, box-shadow 0.14s;
+}
+.controls-composer-resize-edge:hover::after,
+.controls-composer-resize-edge:focus-visible::after,
+.composer-height-resizing-top .controls-composer-resize-edge::after {
+  opacity: 0.52;
+  box-shadow: 0 0 5px rgba(34,211,238,0.26);
+}
+.composer-height-resizing { user-select: none !important; }
+.composer-height-resizing-top { cursor: ns-resize !important; }
 .controls-composer-backdrop {
   position: fixed;
   inset: 0;
@@ -649,11 +1025,29 @@ html.native-ios-mac .chat-dl-btn {
   color: #fbbf24;
   font-size: 12px;
   line-height: 1.35;
-  background: rgba(15, 23, 42, 0.92);
-  border: 1px solid rgba(251, 191, 36, 0.35);
-  border-radius: 10px;
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.22);
+  background: linear-gradient(135deg, rgba(30, 41, 59, 0.9), rgba(15, 23, 42, 0.92));
+  border: 1px solid rgba(251, 191, 36, 0.52);
+  border-radius: 12px;
+  box-shadow: 0 6px 16px rgba(0, 0, 0, 0.26), inset 0 0 0 1px rgba(251, 191, 36, 0.15);
+  position: relative;
   pointer-events: auto;
+  overflow: hidden;
+}
+
+.controls-queued-hint::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: 12px;
+  background: linear-gradient(120deg, transparent 45%, rgba(251, 191, 36, 0.13), transparent 62%);
+  transform: translateX(-120%);
+  animation: controls-queued-hint-shine 4.8s linear infinite;
+  pointer-events: none;
+}
+
+@keyframes controls-queued-hint-shine {
+  from { transform: translateX(-120%); }
+  to { transform: translateX(120%); }
 }
 /* Collapsed-state pill: just a count chip, shown only when the user has
    chosen to hide the full queue list. Keeps vertical space above the
@@ -666,14 +1060,16 @@ html.native-ios-mac .chat-dl-btn {
   align-items: center;
   gap: 6px;
   max-width: max-content;
-  background: rgba(15, 23, 42, 0.92);
-  border: 1px solid rgba(251, 191, 36, 0.35);
+  background: linear-gradient(130deg, rgba(15, 23, 42, 0.9), rgba(30, 41, 59, 0.9));
+  border: 1px solid rgba(251, 191, 36, 0.45);
   border-radius: 999px;
   color: #fbbf24;
   font-size: 11px;
   font-weight: 600;
   line-height: 1.35;
   cursor: pointer;
+  position: relative;
+  overflow: hidden;
   pointer-events: auto;
   font-family: inherit;
 }
@@ -684,13 +1080,31 @@ html.native-ios-mac .chat-dl-btn {
   background: #fbbf24;
   flex-shrink: 0;
 }
-.controls-queued-pill:hover { color: #fde68a; border-color: rgba(251, 191, 36, 0.6); }
+.controls-queued-pill::after {
+  content: '';
+  position: absolute;
+  inset: -1px;
+  border-radius: inherit;
+  border: 1px solid rgba(251, 191, 36, 0.55);
+  opacity: 0.45;
+  pointer-events: none;
+  animation: controls-queued-pill-border 2.8s linear infinite;
+}
+
+.controls-queued-pill:hover { color: #fde68a; border-color: rgba(251, 191, 36, 0.7); }
 .controls-queued-pill:hover::before { background: #fde68a; }
+.controls-queued-pill:hover::after { opacity: 0.78; }
 .controls-queued-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 8px;
+}
+.controls-queued-header-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  flex-shrink: 0;
 }
 .controls-queued-toggle {
   border: none;
@@ -719,9 +1133,10 @@ html.native-ios-mac .chat-dl-btn {
   justify-content: space-between;
   gap: 8px;
   padding: 7px 9px;
-  border-radius: 8px;
-  background: rgba(30, 41, 59, 0.88);
-  border: 1px solid rgba(251, 191, 36, 0.18);
+  border-radius: 10px;
+  background: linear-gradient(140deg, rgba(30, 41, 59, 0.9), rgba(15, 23, 42, 0.92));
+  border: 1px solid rgba(251, 191, 36, 0.26);
+  box-shadow: inset 0 0 0 1px rgba(251, 191, 36, 0.08), 0 4px 12px rgba(0, 0, 0, 0.22);
   color: #e2e8f0;
   white-space: pre-wrap;
   word-break: break-word;
@@ -767,10 +1182,21 @@ html.native-ios-mac .chat-dl-btn {
   font-weight: 600;
   cursor: pointer;
   padding: 0;
+  border-radius: 4px;
+  position: relative;
+  z-index: 0;
 }
 .controls-queued-action:hover { color: #fde68a; }
+.controls-queued-action-append { color: #67e8f9; }
+.controls-queued-action-append:hover { color: #a5f3fc; }
 .controls-queued-action-danger { color: #fda4af; }
 .controls-queued-action-danger:hover { color: #fecdd3; }
+.controls-queued-action:active { transform: translateY(1px); }
+
+@keyframes controls-queued-pill-border {
+  0%, 100% { opacity: 0.28; }
+  50% { opacity: 0.72; }
+}
 .controls-queued-editing {
   margin: 0 8px 8px;
   display: flex;
@@ -934,6 +1360,7 @@ html.native-ios-mac .chat-dl-btn {
   white-space: nowrap;
 }
 @media (max-width: 640px) {
+  .controls-composer-resize-edge { display: none; }
   .composer-upload-stats {
     gap: 4px 8px;
   }
@@ -1050,6 +1477,149 @@ html.native-ios-mac .chat-dl-btn {
 .controls-input-p2p { background: linear-gradient(180deg, rgba(44,27,60,0.64), rgba(15,18,32,0.94)); }
 .controls-input-p2p:focus { border-color: inherit; }
 .controls-input-disabled { opacity: 0.4; pointer-events: none; }
+/* ── Desktop composer: one box, controls tucked underneath ────────────────
+   The buttons live in the DOM as SIBLINGS of `.controls-composer`, not inside
+   it, so this needs no markup change: letting `.controls` wrap and giving the
+   composer a full-width row with `order: -1` pushes every button onto a second
+   line by itself. Keeping the DOM untouched matters — the alias and machine
+   pickers are absolutely positioned against `.controls`, and a new positioned
+   wrapper would silently re-anchor them.
+
+   The visible box moves from the input to `.controls` so the input and its
+   controls read as one surface. The input's own border is then transparent,
+   and its focus and file-drag states are mirrored onto the box with `:has()`.
+
+   Scoped to min-width 641px because the mobile layout is the 640px override of
+   this same base, and must keep its side-by-side row untouched. */
+@media (min-width: 641px) {
+  /* The composer box is inset from the wrapper by its own margin, so the
+     toolbar above has to start at the same x or the Stop button hangs out past
+     the box's left edge.
+
+     `.shortcuts-transport` is listed explicitly: transport sessions add that
+     class and it zeroes `padding-left`, which is exactly the case that shows a
+     Stop button. Matching only `.shortcuts` would leave the one session type
+     this is meant to fix still misaligned.
+
+     One variable because the inset and the box margin are only ever correct
+     together. */
+  .controls-wrapper { --composer-inset: 8px; }
+  .shortcuts,
+  .shortcuts-transport { padding-left: var(--composer-inset); }
+
+  .controls {
+    flex-wrap: wrap;
+    row-gap: 6px;
+    align-items: center;
+    padding: 7px 8px;
+    border: 1px solid rgba(125,211,252,0.18);
+    border-radius: 9px;
+    margin: 0 8px 8px;
+    background: linear-gradient(180deg, rgba(15,23,42,0.92), rgba(8,13,22,0.94));
+    box-shadow: inset 0 1px 0 rgba(255,255,255,0.035), inset 0 0 18px rgba(34,211,238,0.025);
+    transition: border-color 0.14s, box-shadow 0.14s, background 0.14s;
+  }
+
+  /* Full width and first, so everything else wraps beneath it. */
+  .controls-composer { flex: 0 0 100%; order: -1; }
+
+  /* The input is now part of the box rather than a box of its own. */
+  .controls-input {
+    background: transparent;
+    border-color: transparent;
+    box-shadow: none;
+    padding: 5px 3px;
+    /* The box rests three rows tall in total, and the control row underneath
+       is the third of them -- so the input itself gets two. Expressed in em so
+       it tracks the font size rather than pinning a pixel count that drifts if
+       the type scale changes. Dragging the top edge moves this. */
+    min-height: calc((2 * 1.45em) + 10px);
+    max-height: 240px;
+  }
+  .controls-input:focus {
+    background: transparent;
+    border-color: transparent;
+    box-shadow: none;
+  }
+
+  /* State feedback moves to the box, since the input no longer draws one. */
+  .controls:has(.controls-input:focus) {
+    border-color: rgba(34,211,238,0.62);
+    box-shadow: 0 0 0 1px rgba(34,211,238,0.14), 0 0 16px rgba(34,211,238,0.12), inset 0 1px 0 rgba(255,255,255,0.055);
+    background: linear-gradient(180deg, rgba(15,40,62,0.72), rgba(8,13,22,0.94));
+  }
+  .controls:has(.controls-input-file-drag-over) {
+    border-color: rgba(96,165,250,0.82);
+    box-shadow: 0 0 0 1px rgba(96,165,250,0.42), 0 0 18px rgba(59,130,246,0.2), inset 0 1px 0 rgba(255,255,255,0.06);
+    background: linear-gradient(180deg, rgba(20,53,82,0.74), rgba(8,13,22,0.94));
+  }
+  .controls:has(.controls-input-p2p) {
+    background: linear-gradient(180deg, rgba(44,27,60,0.64), rgba(15,18,32,0.94));
+  }
+
+  /* Send is the primary action, so it anchors the right end of the row while
+     the utilities stay left. `order` rather than a DOM move, again to leave
+     the markup and its tests alone. */
+  .controls .btn-primary { order: 1; margin-left: auto; }
+
+  /* The resize edge anchors to the whole box, not the input.
+
+     `.controls-composer` drops out of the positioning chain here so the
+     absolutely-positioned edge resolves against `.controls` instead, putting
+     it on the box's own top border. Anchored to the input it would sit inside
+     the box padding, below the border the user is aiming at.
+
+     Nothing else needs `.controls-composer` positioned on desktop: its only
+     other absolute child is the embedded voice button, which is mobile-only. */
+  .controls-composer { position: static; }
+
+  /* The top border is the resize target.
+
+     Two mechanisms draw the same highlight, deliberately:
+
+       - the strip's own ::after, driven by a plain `:hover` on the strip;
+       - `.controls:has(...)`, which restyles the box's real border.
+
+     The `::after` is the one that has to work. Ancestor `:has(:hover)`
+     re-evaluation is not dependable across engines, and the symptom is
+     exactly what was reported here: the highlight appears sometimes and not
+     others, in both main and sub sessions. A plain `:hover` on the hovered
+     element itself has no such ambiguity, so the affordance no longer rests
+     on the fragile one -- `:has()` only deepens it when it does fire.
+
+     The ::after sits at the strip's own midpoint, which is laid over the
+     border, so thickening it reads as the border getting heavier rather than
+     as a separate line floating inside the box. */
+  .controls-composer-resize-edge { top: -5px; right: 0; left: 0; height: 20px; }
+  .controls-composer-resize-edge::after {
+    top: 4px;
+    right: 0;
+    left: 0;
+    height: 1px;
+    border-radius: 0;
+    background: rgba(103,232,249,0.95);
+    opacity: 0;
+    display: block;
+  }
+  .controls-composer-resize-edge:hover::after,
+  .controls-composer-resize-edge:focus-visible::after,
+  .composer-height-resizing-top .controls-composer-resize-edge::after {
+    top: 3px;
+    height: 3px;
+    opacity: 1;
+    box-shadow: 0 0 10px rgba(34,211,238,0.6);
+  }
+
+  .controls:has(.controls-composer-resize-edge:hover),
+  .controls:has(.controls-composer-resize-edge:focus-visible) {
+    border-top-color: rgba(103,232,249,0.95);
+  }
+  .composer-height-resizing-top .controls {
+    border-top-color: rgba(103,232,249,0.95);
+  }
+
+}
+
 /* Placeholder via CSS when empty */
 .controls-input:empty::before { content: attr(data-placeholder); color: #5f7087; pointer-events: none; }
 /* Menu dropdown */
@@ -2277,9 +2847,33 @@ html.native-ios-mac .chat-dl-btn {
 .agent-badge { display: inline-flex; align-items: center; justify-content: center; padding: 1px 5px; border-radius: 999px; font-size: 9px; font-weight: 700; color: #fff; margin-right: 6px; letter-spacing: 0; flex-shrink: 0; box-shadow: 0 0 10px rgba(34,211,238,0.12); }
 .p2p-tag { display: inline-flex; align-items: center; justify-content: center; padding: 1px 5px; border-radius: 999px; font-size: 9px; font-weight: 700; color: #dbeafe; background: linear-gradient(180deg, rgba(59,130,246,0.85), rgba(37,99,235,0.68)); border: 1px solid rgba(125,211,252,0.26); margin-left: 4px; letter-spacing: 0; flex-shrink: 0; box-shadow: 0 0 10px rgba(59,130,246,0.22); }
 
-/* Mobile server bar — only visible on mobile */
-.mobile-server-bar { display: none; }
-.mobile-sidebar-toggle { display: none; }
+/* Mobile server chrome. The UA-selected `.layout-mobile` class is intentional:
+   some Android WebViews expose a CSS viewport wider than the responsive
+   breakpoint, so width alone cannot decide whether the mobile shell exists. */
+.mobile-server-bar { display: none; align-items: center; justify-content: space-between; gap: 8px; padding: 7px 9px; background: linear-gradient(180deg, #0d1422 0%, #09111d 100%); border-bottom: 1px solid rgba(34,211,238,0.18); box-shadow: inset 0 1px 0 rgba(255,255,255,0.04), 0 4px 16px rgba(0,0,0,0.24); flex-shrink: 0; position: relative; z-index: var(--mobile-server-bar-z); }
+.mobile-server-bar::before { content: ''; position: absolute; left: 0; right: 0; top: 0; height: 1px; background: linear-gradient(90deg, transparent, rgba(34,211,238,0.72), rgba(52,211,153,0.55), transparent); pointer-events: none; }
+.mobile-sidebar-toggle { display: none; width: 36px; height: 36px; background: rgba(15,23,42,0.55); border: 1px solid rgba(125,211,252,0.16); border-radius: 10px; color: #94a3b8; font-size: 18px; cursor: pointer; padding: 0; line-height: 1; flex-shrink: 0; }
+.mobile-sidebar-toggle:active { color: var(--chrome-accent); border-color: rgba(34,211,238,0.5); background: rgba(8,145,178,0.16); }
+.mobile-server-switcher-wrap { position: relative; flex: 1 1 auto; min-width: 0; }
+.mobile-server-btn { width: 100%; min-height: 38px; display: flex; align-items: center; gap: 8px; background: linear-gradient(135deg, rgba(8,145,178,0.24), rgba(15,23,42,0.78) 46%, rgba(76,29,149,0.22)); border: 1px solid rgba(125,211,252,0.24); border-radius: 13px; color: #dbeafe; font-family: inherit; font-size: 13px; font-weight: 700; cursor: pointer; padding: 6px 7px 6px 9px; box-shadow: inset 0 1px 0 rgba(255,255,255,0.06), 0 0 18px rgba(34,211,238,0.10); }
+.mobile-server-btn:active { color: var(--chrome-accent); border-color: rgba(34,211,238,0.58); background: linear-gradient(135deg, rgba(8,145,178,0.34), rgba(15,23,42,0.86) 46%, rgba(76,29,149,0.30)); }
+.mobile-server-btn-icon { width: 24px; height: 24px; border-radius: 8px; display: inline-flex; align-items: center; justify-content: center; flex: 0 0 auto; background: rgba(34,211,238,0.12); border: 1px solid rgba(34,211,238,0.18); box-shadow: 0 0 12px rgba(34,211,238,0.16); }
+.mobile-server-btn-name { min-width: 0; flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: left; letter-spacing: 0; }
+.mobile-server-btn > .share-state-indicator { margin-left: 0; flex: 0 0 auto; }
+.mobile-server-btn-chevron { width: 24px; height: 24px; border-radius: 8px; display: inline-flex; align-items: center; justify-content: center; flex: 0 0 auto; color: #67e8f9; background: rgba(15,23,42,0.52); }
+.mobile-server-actions { display: flex; gap: 5px; align-items: center; flex: 0 0 auto; }
+.mobile-server-backdrop { position: fixed; inset: 0; z-index: 6499; }
+.mobile-server-menu { position: absolute; top: calc(100% + 8px); left: 0; width: min(300px, calc(100vw - 18px)); background: #1e293b; border: 1px solid rgba(125,211,252,0.20); border-radius: 12px; min-width: min(240px, calc(100vw - 18px)); box-shadow: 0 14px 34px #00000090, 0 0 20px rgba(34,211,238,0.10); z-index: 50; overflow: hidden; }
+.mobile-server-menu-item { display: flex; align-items: center; gap: 7px; width: 100%; padding: 10px 14px; background: none; border: none; color: #cbd5e1; font-size: 13px; font-family: inherit; text-align: left; cursor: pointer; }
+.mobile-server-menu-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mobile-server-menu-item > .share-state-indicator { margin-left: auto; flex: 0 0 auto; }
+.mobile-server-menu-item:hover, .mobile-server-menu-item:active { background: #334155; }
+.mobile-server-menu-item.active { color: #93c5fd; background: #1d4ed820; }
+.mobile-server-menu-controlled-nodes { color: #67e8f9; border-top: 1px solid #334155; border-bottom: 1px solid #334155; }
+.mobile-server-menu-change { color: #f59e0b !important; border-top: 1px solid #334155; }
+.layout-mobile .sidebar { display: none; }
+.layout-mobile .mobile-server-bar { display: flex; }
+.layout-mobile .mobile-sidebar-toggle { display: block; }
 
 /* Controlled nodes: compact node-grid control surface. */
 .controlled-nodes-floating-panel {
@@ -2692,6 +3286,35 @@ html.native-ios-mac .chat-dl-btn {
   font-size: 8px;
   font-weight: 800;
   letter-spacing: 0.05em;
+}
+/* A node that can answer its own sign-in screen is a security-relevant state,
+   so its chip is the one warm marker in the meta row. */
+.controlled-nodes-machine-meta span.controlled-nodes-auto-unlock-badge {
+  border-color: rgba(248, 113, 113, 0.35);
+  background: rgba(220, 38, 38, 0.14);
+  color: #fca5a5;
+}
+.controlled-nodes-auto-unlock-form {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.controlled-nodes-auto-unlock-form input {
+  width: 168px;
+  padding: 4px 8px;
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  border-radius: 6px;
+  background: rgba(15, 23, 42, 0.6);
+  color: inherit;
+  font: inherit;
+}
+
+/* An outdated node has to be findable at a glance in a long list, so the
+   version chip switches to the warning ramp instead of the violet meta ramp. */
+.controlled-nodes-machine-meta span.controlled-nodes-version.is-outdated {
+  border-color: rgba(251, 191, 36, 0.35);
+  background: rgba(217, 119, 6, 0.14);
+  color: #fbbf24;
 }
 .controlled-nodes-machine-actions {
   display: flex;
@@ -3151,27 +3774,8 @@ html.native-ios-mac .chat-dl-btn {
      here. */
   /* Keep server selection above sub-session windows (6000), but below
      full-screen mobile panels (7000+) and system dialogs (9999+). */
-  .mobile-server-bar { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 7px 9px; background: linear-gradient(180deg, #0d1422 0%, #09111d 100%); border-bottom: 1px solid rgba(34,211,238,0.18); box-shadow: inset 0 1px 0 rgba(255,255,255,0.04), 0 4px 16px rgba(0,0,0,0.24); flex-shrink: 0; position: relative; z-index: var(--mobile-server-bar-z); }
-  .mobile-server-bar::before { content: ''; position: absolute; left: 0; right: 0; top: 0; height: 1px; background: linear-gradient(90deg, transparent, rgba(34,211,238,0.72), rgba(52,211,153,0.55), transparent); pointer-events: none; }
-  .mobile-sidebar-toggle { display: block; width: 36px; height: 36px; background: rgba(15,23,42,0.55); border: 1px solid rgba(125,211,252,0.16); border-radius: 10px; color: #94a3b8; font-size: 18px; cursor: pointer; padding: 0; line-height: 1; flex-shrink: 0; }
-  .mobile-sidebar-toggle:active { color: var(--chrome-accent); border-color: rgba(34,211,238,0.5); background: rgba(8,145,178,0.16); }
-  .mobile-server-switcher-wrap { position: relative; flex: 1 1 auto; min-width: 0; }
-  .mobile-server-btn { width: 100%; min-height: 38px; display: flex; align-items: center; gap: 8px; background: linear-gradient(135deg, rgba(8,145,178,0.24), rgba(15,23,42,0.78) 46%, rgba(76,29,149,0.22)); border: 1px solid rgba(125,211,252,0.24); border-radius: 13px; color: #dbeafe; font-family: inherit; font-size: 13px; font-weight: 700; cursor: pointer; padding: 6px 7px 6px 9px; box-shadow: inset 0 1px 0 rgba(255,255,255,0.06), 0 0 18px rgba(34,211,238,0.10); }
-  .mobile-server-btn:active { color: var(--chrome-accent); border-color: rgba(34,211,238,0.58); background: linear-gradient(135deg, rgba(8,145,178,0.34), rgba(15,23,42,0.86) 46%, rgba(76,29,149,0.30)); }
-  .mobile-server-btn-icon { width: 24px; height: 24px; border-radius: 8px; display: inline-flex; align-items: center; justify-content: center; flex: 0 0 auto; background: rgba(34,211,238,0.12); border: 1px solid rgba(34,211,238,0.18); box-shadow: 0 0 12px rgba(34,211,238,0.16); }
-  .mobile-server-btn-name { min-width: 0; flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: left; letter-spacing: 0; }
-  .mobile-server-btn > .share-state-indicator { margin-left: 0; flex: 0 0 auto; }
-  .mobile-server-btn-chevron { width: 24px; height: 24px; border-radius: 8px; display: inline-flex; align-items: center; justify-content: center; flex: 0 0 auto; color: #67e8f9; background: rgba(15,23,42,0.52); }
-  .mobile-server-actions { display: flex; gap: 5px; align-items: center; flex: 0 0 auto; }
-  .mobile-server-backdrop { position: fixed; inset: 0; z-index: 6499; }
-  .mobile-server-menu { position: absolute; top: calc(100% + 8px); left: 0; width: min(300px, calc(100vw - 18px)); background: #1e293b; border: 1px solid rgba(125,211,252,0.20); border-radius: 12px; min-width: min(240px, calc(100vw - 18px)); box-shadow: 0 14px 34px #00000090, 0 0 20px rgba(34,211,238,0.10); z-index: 50; overflow: hidden; }
-  .mobile-server-menu-item { display: flex; align-items: center; gap: 7px; width: 100%; padding: 10px 14px; background: none; border: none; color: #cbd5e1; font-size: 13px; font-family: inherit; text-align: left; cursor: pointer; }
-  .mobile-server-menu-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .mobile-server-menu-item > .share-state-indicator { margin-left: auto; flex: 0 0 auto; }
-  .mobile-server-menu-item:hover, .mobile-server-menu-item:active { background: #334155; }
-  .mobile-server-menu-item.active { color: #93c5fd; background: #1d4ed820; }
-  .mobile-server-menu-controlled-nodes { color: #67e8f9; border-top: 1px solid #334155; border-bottom: 1px solid #334155; }
-  .mobile-server-menu-change { color: #f59e0b !important; border-top: 1px solid #334155; }
+  .mobile-server-bar { display: flex; }
+  .mobile-sidebar-toggle { display: block; }
   .controls { padding: 5px 6px; gap: 4px; }
   .controls-input { font-size: 16px; } /* prevent iOS zoom on focus */
   .btn { padding: 7px 8px; font-size: 13px; }
@@ -3302,6 +3906,71 @@ html.native-ios-mac .chat-dl-btn {
 .chat-attachment-dl-btn:hover { color: #60a5fa; border-color: #3b82f6; }
 .chat-event { margin: 2px 0; min-width: 0; transition: background 0.15s; border-radius: 6px; }
 .chat-event.chat-highlight { background: rgba(52,211,153,0.12); box-shadow: inset 0 0 0 1.5px rgba(52,211,153,0.5); }
+
+.chat-pin-located { animation: chat-pin-located-pulse 1.8s ease-out; }
+@keyframes chat-pin-located-pulse {
+  0%, 35% { box-shadow: 0 0 0 3px rgba(251, 191, 36, 0.72); }
+  100% { box-shadow: 0 0 0 8px rgba(251, 191, 36, 0); }
+}
+
+.message-pins-bar {
+  flex: 0 0 auto;
+  display: inline-flex;
+}
+.message-pins-summary {
+  width: auto; min-width: 31px; height: 24px; display: inline-flex; align-items: center; justify-content: center; gap: 3px;
+  padding: 0 6px; color: #fcd34d; background: rgba(69, 39, 5, 0.22); border: 1px solid rgba(245, 158, 11, 0.28); border-radius: 6px;
+  cursor: pointer; font: inherit; font-size: 11px; line-height: 22px;
+}
+.message-pins-summary:hover, .message-pins-bar.expanded .message-pins-summary { background: rgba(120, 53, 15, 0.34); border-color: rgba(245, 158, 11, 0.46); }
+.message-pins-count { min-width: 1ch; color: #fde68a; font-size: 10px; font-variant-numeric: tabular-nums; }
+.message-pins-panel {
+  position: absolute; top: calc(100% + 4px); left: 8px; right: 8px; z-index: 30;
+  border: 1px solid rgba(245, 158, 11, 0.28); border-radius: 8px; max-height: min(42vh, 420px);
+  display: flex; flex-direction: column; overflow: hidden;
+  background: rgba(24, 19, 15, 0.98); box-shadow: 0 14px 34px rgba(0, 0, 0, 0.46);
+}
+.message-pins-tabs { display: flex; gap: 4px; padding: 6px 8px; }
+.message-pins-tabs button {
+  flex: 1; padding: 5px 8px; border-radius: 6px; border: 1px solid transparent;
+  background: rgba(15, 23, 42, 0.45); color: #94a3b8; cursor: pointer; font-size: 11px;
+}
+.message-pins-tabs button.active {
+  color: #fef3c7; border-color: rgba(245, 158, 11, 0.4); background: rgba(146, 64, 14, 0.28);
+}
+.message-pins-filters { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 6px; padding: 0 8px 6px; }
+.message-pins-filters input,
+.message-pins-filters select {
+  min-width: 0; height: 28px; border: 1px solid rgba(148, 163, 184, 0.24); border-radius: 6px;
+  background: rgba(15, 23, 42, 0.72); color: #e2e8f0; padding: 0 8px; font: inherit; font-size: 11px;
+}
+.message-pins-filters input:focus,
+.message-pins-filters select:focus { outline: 1px solid rgba(245, 158, 11, 0.62); border-color: rgba(245, 158, 11, 0.58); }
+.message-pins-filters input::placeholder { color: #64748b; }
+.message-pins-list { min-height: 0; overflow-y: auto; padding: 0 6px 6px; }
+.message-pin-row {
+  display: flex; align-items: stretch; margin-top: 4px; border-radius: 6px;
+  background: rgba(15, 23, 42, 0.48);
+}
+.message-pin-open {
+  min-width: 0; flex: 1; display: flex; flex-direction: column; gap: 2px;
+  padding: 7px 8px; border: 0; background: transparent; color: #e2e8f0;
+  text-align: left; cursor: pointer;
+}
+.message-pin-session, .message-pin-meta { color: #94a3b8; font-size: 10px; }
+.message-pin-session { color: #fbbf24; }
+.message-pin-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
+.message-pin-remove {
+  width: 34px; border: 0; border-left: 1px solid rgba(148, 163, 184, 0.14);
+  background: transparent; color: #94a3b8; cursor: pointer;
+}
+.message-pin-remove:hover { color: #f87171; }
+.message-pins-empty, .message-pins-error {
+  padding: 10px; text-align: center; color: #94a3b8; font-size: 11px;
+}
+.message-pins-error {
+  width: 100%; border: 0; background: rgba(127, 29, 29, 0.28); color: #fecaca; cursor: pointer;
+}
 .chat-user { background: #1e3a5f; border-radius: 8px; padding: 6px 12px; align-self: flex-end; max-width: 80%; width: fit-content; text-align: left; word-break: break-all; overflow-wrap: break-word; position: relative; }
 .chat-user.chat-pending { background: #1e3a5f80; color: #94a3b8; }
 .chat-user.chat-failed { background: #3a1a1a; color: #fca5a5; border: 1px solid #7f1d1d; }
@@ -3647,6 +4316,23 @@ html.native-ios-mac .chat-dl-btn {
   margin-left: 6px;
 }
 .chat-tool-activity-details .chat-event { margin: 0; }
+.chat-tool-activity-collapse-footer {
+  margin-top: 2px;
+  justify-content: center;
+  border-color: rgba(52, 211, 153, 0.28);
+  background: linear-gradient(100deg, rgba(6, 78, 59, 0.46), rgba(15, 23, 42, 0.82) 62%, rgba(30, 41, 59, 0.72));
+}
+.chat-tool-activity-collapse-footer:hover {
+  border-color: rgba(110, 231, 183, 0.58);
+  background: linear-gradient(100deg, rgba(6, 95, 70, 0.62), rgba(15, 23, 42, 0.9) 62%, rgba(30, 41, 59, 0.82));
+}
+.chat-tool-activity-collapse-footer .chat-tool-activity-core {
+  border-color: #6ee7b7;
+  background: rgba(16, 185, 129, 0.38);
+  box-shadow: 0 0 7px rgba(52, 211, 153, 0.48);
+}
+.chat-tool-activity-collapse-label { color: #a7f3d0; font-weight: 600; }
+.chat-tool-activity-collapse-chevron { color: #6ee7b7; font-size: 13px; transform: translateY(1px); }
 .chat-tool-activity-live {
   position: absolute;
   width: 1px;
@@ -3742,6 +4428,27 @@ html.native-ios-mac .chat-dl-btn {
 .chat-tool-block-fold-content::-webkit-scrollbar { width: 5px; height: 3px; }
 .chat-tool-block-fold-content::-webkit-scrollbar-track { background: rgba(15, 23, 42, 0.25); }
 .chat-tool-block-fold-content::-webkit-scrollbar-thumb { border-radius: 999px; background: rgba(34, 211, 238, 0.35); }
+.chat-tool-fold-footer {
+  display: flex;
+  justify-content: center;
+  padding: 6px 8px 7px;
+  border-top: 1px solid rgba(34, 211, 238, 0.16);
+  background: rgba(2, 6, 23, 0.28);
+}
+.chat-tool-fold-collapse {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 10px;
+  border: 1px solid rgba(52, 211, 153, 0.38);
+  border-radius: 999px;
+  background: rgba(6, 78, 59, 0.42);
+  color: #6ee7b7;
+  font: 600 11px/1.2 'SF Mono', 'Cascadia Code', 'Fira Code', monospace;
+  cursor: pointer;
+}
+.chat-tool-fold-collapse:hover { border-color: rgba(110, 231, 183, 0.7); color: #d1fae5; background: rgba(6, 95, 70, 0.58); }
+.chat-tool-fold-collapse:focus-visible { outline: 1px solid #6ee7b7; outline-offset: 2px; }
 .chat-tool-block-fold.is-collapsed .chat-tool-command-row::-webkit-scrollbar,
 .chat-tool-block-fold.is-collapsed .chat-tool-result-row::-webkit-scrollbar,
 .chat-tool-block-fold.is-collapsed .chat-tool-result-preview::-webkit-scrollbar {
@@ -4464,7 +5171,15 @@ html.native-ios-mac .chat-dl-btn {
 .subcard-input-area { flex-shrink: 0; border-top: 1px solid rgba(125,211,252,0.12); background: linear-gradient(180deg, #0a101b, #080d16); padding: 5px 6px; display: flex; flex-direction: column; gap: 3px; border-radius: 0 0 8px 8px; }
 .subcard-input-row { display: flex; align-items: stretch; gap: 6px; }
 .subcard-input-main { flex: 1; min-width: 0; }
-.subcard-stop-btn { flex: 0 0 auto; width: 40px; min-width: 40px; margin-left: -6px; border-radius: 0 6px 6px 0; border: 1px solid rgba(239,68,68,0.55); background: rgba(127,29,29,0.32); color: #f87171; cursor: pointer; font-size: 11px; line-height: 1; display: inline-flex; align-items: center; justify-content: center; padding: 0; transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease; }
+/* Card composers deliberately remain a single visible row. Full sessions
+   retain their resizable multi-line composer; compact cards never inherit its
+   saved height or resize affordance. Overflow scrolls rather than expanding. */
+.subcard .controls-input { min-height: calc(1.45em + 10px); max-height: calc(1.45em + 10px); }
+/* A phone user can still explicitly open the existing full-screen composer. */
+.subcard .controls-composer-mobile-expanded .controls-input { min-height: 100%; max-height: none; }
+/* Only used by the plain-input fallback. Cards with SessionControls reuse the
+   ordinary queue-aware Stop in the left toolbar above. */
+.subcard-stop-btn { flex: 0 0 auto; width: 28px; min-width: 28px; margin-left: 0; border-radius: 6px; border: 1px solid rgba(239,68,68,0.55); background: rgba(127,29,29,0.32); color: #f87171; cursor: pointer; font-size: 11px; line-height: 1; display: inline-flex; align-items: center; justify-content: center; padding: 0; transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease; }
 .subcard-stop-btn:hover:not(:disabled) { background: rgba(127,29,29,0.48); border-color: rgba(248,113,113,0.8); color: #fca5a5; }
 .subcard-stop-btn:disabled { opacity: 0.45; cursor: not-allowed; }
 .subcard-input-area .menu-dropdown { z-index: 10000; right: auto; left: 0; max-width: calc(100vw - 24px); }
@@ -4791,15 +5506,126 @@ html.native-ios-mac .chat-dl-btn {
 .subsession-send-btn { flex-shrink: 0; font-size: 12px; padding: 4px 12px; }
 
 /* ── Resize handles ───────────────────────────────────────────────────────── */
+/* Shared by `.subsession-window` and `.floating-panel`. Both used to render
+   4-5px transparent strips whose only styling was a `cursor`, so a window gave
+   no hint it was resizable until the pointer happened to land on one — and even
+   then the cursor was the sole feedback and the frame never reacted.
+   Three things fix that, in layers:
+
+     1. the hit strip is widened (4px → 6px edges, 12px → 16px corners) but kept
+        under the app's 6px scrollbars' comfort zone, so widening never steals
+        drags from a panel's own scrollbar;
+     2. the *drawn* indicator is decoupled from the hit box onto ::after — it
+        stays a thin 2px line so it never crowds content, and is invisible at
+        rest, fading in only on hover/drag;
+     3. the whole window frame lights up (see the outline rule below), so the
+        "resizable" signal is not confined to the few pixels under the cursor. */
 .resize-handle { position: absolute; z-index: 10; }
-.resize-n  { top: 0; left: 8px; right: 8px; height: 4px; cursor: n-resize; }
-.resize-s  { bottom: 0; left: 8px; right: 8px; height: 4px; cursor: s-resize; }
-.resize-e  { right: 0; top: 8px; bottom: 8px; width: 4px; cursor: e-resize; }
-.resize-w  { left: 0; top: 8px; bottom: 8px; width: 4px; cursor: w-resize; }
-.resize-ne { top: 0; right: 0; width: 12px; height: 12px; cursor: ne-resize; }
-.resize-nw { top: 0; left: 0; width: 12px; height: 12px; cursor: nw-resize; }
-.resize-se { bottom: 0; right: 0; width: 12px; height: 12px; cursor: se-resize; }
-.resize-sw { bottom: 0; left: 0; width: 12px; height: 12px; cursor: sw-resize; }
+
+/* The visible mark. Hidden at rest; revealed on hover, and kept lit for the
+   whole drag via `.is-resizing` — during a resize the pointer routinely leaves
+   the 6px strip, and without that class the indicator would flicker off exactly
+   while the user is using it. */
+.resize-handle::after {
+  content: '';
+  position: absolute;
+  opacity: 0;
+  background: var(--subsession-accent-color, #38bdf8);
+  transition: opacity 0.14s ease, box-shadow 0.14s ease;
+  pointer-events: none;
+}
+.resize-handle:hover::after,
+.resize-handle.is-resizing::after {
+  opacity: 0.9;
+  box-shadow: 0 0 10px color-mix(in srgb, var(--subsession-accent-color, #38bdf8) 55%, transparent);
+}
+
+/* Edges: 6px grab strip, 2px lit line pinned to the outer edge. Inset by the
+   corner size so an edge never sits on top of a corner's diagonal target. */
+.resize-n, .resize-s { left: 16px; right: 16px; height: 6px; }
+.resize-e, .resize-w { top: 16px; bottom: 16px; width: 6px; }
+.resize-n  { top: 0; cursor: n-resize; }
+.resize-s  { bottom: 0; cursor: s-resize; }
+.resize-e  { right: 0; cursor: e-resize; }
+.resize-w  { left: 0; cursor: w-resize; }
+.resize-n::after, .resize-s::after { left: 0; right: 0; height: 2px; }
+.resize-e::after, .resize-w::after { top: 0; bottom: 0; width: 2px; }
+.resize-n::after { top: 0; }
+.resize-s::after { bottom: 0; }
+.resize-e::after { right: 0; }
+.resize-w::after { left: 0; }
+
+/* Corners: the largest targets, drawn as an L-bracket so the diagonal grab
+   point reads as a grip instead of two edges crossing. Above the edges in the
+   stack because the two overlap along the first 16px of every side. */
+.resize-ne, .resize-nw, .resize-se, .resize-sw { width: 16px; height: 16px; z-index: 11; }
+.resize-nw { top: 0; left: 0; cursor: nw-resize; }
+.resize-ne { top: 0; right: 0; cursor: ne-resize; }
+.resize-sw { bottom: 0; left: 0; cursor: sw-resize; }
+.resize-se { bottom: 0; right: 0; cursor: se-resize; }
+/* The corner mark is drawn flush to the corner and *thicker* than the frame
+   ring (3px vs 2px) in the same brightened tint, so the corner reads as a
+   heavier, grabbable elbow. An inset accent-coloured bracket was tried first
+   and was unusable: sitting a same-hue 2px line beside the ring made the two
+   indistinguishable. Weight, not position, is what separates them. */
+.resize-ne::after, .resize-nw::after, .resize-se::after, .resize-sw::after {
+  width: 14px; height: 14px;
+  background: none;
+  border: 3px solid color-mix(in srgb, var(--subsession-accent-color, #38bdf8) 45%, #ffffff);
+}
+.resize-nw::after { top: 0; left: 0; border-right: none; border-bottom: none; border-top-left-radius: 8px; }
+.resize-ne::after { top: 0; right: 0; border-left: none; border-bottom: none; border-top-right-radius: 8px; }
+.resize-sw::after { bottom: 0; left: 0; border-right: none; border-top: none; border-bottom-left-radius: 8px; }
+.resize-se::after { bottom: 0; right: 0; border-left: none; border-top: none; border-bottom-right-radius: 8px; }
+
+/* Hovering widens the grab strip inward — 6px → 12px on edges, 16px → 22px on
+   corners — and it stays wide for the whole drag.
+
+   Why not just make it wide all the time: `.chat-view` renders a thin scrollbar
+   flush against the window's right edge, so a permanently fat `.resize-e` would
+   swallow it. Widening only once the pointer is already inside the strip keeps
+   the scrollbar reachable at rest while making the handle far harder to slip
+   off in the moment between seeing the cue and pressing the button.
+
+   The enlarged box is a strict superset of the resting one, so losing hover
+   also means leaving the small box — there is no grow/shrink oscillation.
+
+   Deliberately NOT transitioned: an animated hit area would trail the pointer
+   and reintroduce exactly the slipperiness this is meant to remove. Only the
+   drawn indicator on ::after animates. */
+.resize-n:hover, .resize-s:hover,
+.resize-n.is-resizing, .resize-s.is-resizing { height: 12px; }
+.resize-e:hover, .resize-w:hover,
+.resize-e.is-resizing, .resize-w.is-resizing { width: 12px; }
+.resize-ne:hover, .resize-nw:hover, .resize-se:hover, .resize-sw:hover,
+.resize-ne.is-resizing, .resize-nw.is-resizing,
+.resize-se.is-resizing, .resize-sw.is-resizing { width: 22px; height: 22px; }
+
+/* Frame state. `outline` rather than `border` because `.floating-panel` sets
+   its border inline from the component, which no stylesheet rule could
+   override; outline also draws without reflowing the window, and follows the
+   8px corner radius on its own. `:has()` covers hover; `.is-resizing` keeps the
+   frame lit once the pointer has left the strip mid-drag.
+
+   The ring is 2px and *brightened* toward white rather than plain accent: a
+   `.subsession-window` already draws a 1px accent-coloured border at rest, so a
+   same-hue ring would have been invisible on exactly the window type that
+   needed the cue most. Mixing toward white separates the two states by
+   thickness and luminance instead of hue, which also keeps the change legible
+   on `.floating-panel`, whose resting border is dim slate. */
+.subsession-window:has(.resize-handle:hover),
+.floating-panel:has(.resize-handle:hover),
+.subsession-window.is-resizing,
+.floating-panel.is-resizing {
+  outline: 2px solid color-mix(in srgb, var(--subsession-accent-color, #38bdf8) 45%, #ffffff);
+  outline-offset: -2px;
+}
+
+/* Coarse pointers have no hover and resize by dragging the corner directly;
+   a permanently-lit frame would just be noise there. */
+@media (hover: none) {
+  .resize-handle::after { display: none; }
+}
 
 /* ── Generic dialog overlay ──────────────────────────────────────────────── */
 /* Padding bakes in iOS safe-area insets so the dialog never touches the
@@ -5549,6 +6375,15 @@ html.native-ios-mac .chat-dl-btn {
 .onboarding-step { font-size: 11px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase; color: #60a5fa; }
 .onboarding-title { font-size: 17px; font-weight: 700; color: #f8fafc; }
 .onboarding-body { display: flex; flex-direction: column; gap: 8px; font-size: 13px; line-height: 1.6; color: #cbd5e1; }
+.feature-announcement { position: fixed; left: 50%; bottom: calc(18px + var(--sab, 0px)); transform: translateX(-50%); z-index: 10004; width: min(520px, calc(100vw - 24px)); display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 11px 12px 11px 14px; border: 1px solid rgba(96, 165, 250, 0.42); border-radius: 12px; background: rgba(15, 23, 42, 0.97); color: #dbeafe; box-shadow: 0 18px 48px rgba(2, 6, 23, 0.48), 0 0 24px rgba(37, 99, 235, 0.14); }
+.feature-announcement-message { display: flex; align-items: center; gap: 9px; min-width: 0; font-size: 13px; line-height: 1.45; }
+.feature-announcement-icon { flex: 0 0 auto; font-size: 17px; }
+.feature-announcement-dismiss { flex: 0 0 auto; min-height: 30px; border: 1px solid rgba(96, 165, 250, 0.38); border-radius: 8px; background: rgba(37, 99, 235, 0.24); color: #dbeafe; padding: 5px 10px; font: inherit; font-size: 12px; font-weight: 700; cursor: pointer; }
+.feature-announcement-dismiss:hover { background: rgba(37, 99, 235, 0.38); color: #fff; }
+@media (max-width: 520px) {
+  .feature-announcement { align-items: flex-start; gap: 10px; }
+  .feature-announcement-message { font-size: 12.5px; }
+}
 .team-discussion-guide { position: fixed; z-index: 10003; background: linear-gradient(180deg, rgba(15, 23, 42, 0.98), rgba(17, 24, 39, 0.98)); border: 1px solid rgba(96, 165, 250, 0.42); border-radius: 12px; padding: 14px 14px 12px; color: #dbeafe; box-shadow: 0 18px 48px rgba(2, 6, 23, 0.48), 0 0 0 1px rgba(14, 165, 233, 0.10), 0 0 28px rgba(37, 99, 235, 0.16); }
 .team-discussion-guide::before { content: ''; position: absolute; inset: 0; pointer-events: none; border-radius: inherit; background: linear-gradient(135deg, rgba(125, 211, 252, 0.13), transparent 36%, rgba(168, 85, 247, 0.08)); }
 .team-discussion-guide-arrow { position: absolute; width: 16px; height: 16px; background: rgba(15, 23, 42, 0.98); border: 1px solid rgba(96, 165, 250, 0.42); transform: rotate(45deg); }
@@ -5763,6 +6598,11 @@ html.native-ios-mac .chat-dl-btn {
 .fb-breadcrumb-row { display: flex; align-items: center; min-width: 0; padding: 0 10px 6px; }
 .fb-breadcrumb-segments { display: flex; align-items: center; gap: 2px; overflow-x: auto; overflow-y: hidden; flex: 1; min-width: 0; scrollbar-width: none; }
 .fb-breadcrumb-segments::-webkit-scrollbar { display: none; }
+.fb-breadcrumb-actions { display: flex; align-items: center; gap: 5px; margin-left: 8px; flex-shrink: 0; }
+.fb-breadcrumb-action { min-height: 27px; padding: 3px 9px; color: #bdefff; background: rgba(10, 43, 63, 0.82); border: 1px solid rgba(85, 202, 244, 0.42); border-radius: 6px; cursor: pointer; font-size: 11px; white-space: nowrap; }
+.fb-breadcrumb-action:hover:not(:disabled) { color: #f4fdff; border-color: rgba(107, 220, 255, 0.78); background: rgba(15, 74, 101, 0.9); }
+.fb-breadcrumb-action.is-primary { color: #03131d; background: #67d9ff; border-color: #9ae8ff; font-weight: 700; }
+.fb-breadcrumb-action:disabled { opacity: .38; cursor: default; }
 .fb-breadcrumb-seg { color: #94a3b8; cursor: pointer; padding: 1px 4px; border-radius: 3px; font-size: 12px; white-space: nowrap; max-width: 14ch; overflow: hidden; text-overflow: ellipsis; flex-shrink: 0; }
 .fb-breadcrumb-seg:hover { color: #e2e8f0; background: #1e293b; }
 .fb-breadcrumb-seg.active { color: #e2e8f0; cursor: default; max-width: 22ch; }
@@ -5785,6 +6625,9 @@ html.native-ios-mac .chat-dl-btn {
 .fb-tree { flex: 1; overflow-y: auto; padding: 4px 0; min-height: 0; }
 .fb-footer { display: flex; align-items: center; gap: 8px; padding: 8px 12px; border-top: 1px solid #334155; flex-shrink: 0; flex-wrap: wrap; }
 .fb-footer-copy-path { max-width: min(180px, 45vw); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+@media (pointer: coarse) {
+  .fb-breadcrumb-actions { display: none; }
+}
 .fb-hidden-toggle { display: flex; align-items: center; gap: 4px; font-size: 11px; color: #64748b; cursor: pointer; user-select: none; }
 .fb-count { font-size: 11px; color: #94a3b8; }
 /* tree nodes */
@@ -5828,6 +6671,47 @@ html.native-ios-mac .chat-dl-btn {
 .fb-lightbox { position: fixed; inset: 0; z-index: 9999; background: rgba(0,0,0,0.85); display: flex; align-items: center; justify-content: center; cursor: zoom-out; padding: calc(var(--sat, 0px) + 12px) calc(env(safe-area-inset-right, 0px) + 12px) calc(env(safe-area-inset-bottom, 0px) + 12px) calc(env(safe-area-inset-left, 0px) + 12px); box-sizing: border-box; }
 .fb-lightbox img { max-width: min(92vw, 100%); max-height: min(92vh, 100%); object-fit: contain; border-radius: 6px; cursor: default; }
 .fb-lightbox-close { position: absolute; top: calc(var(--sat, 0px) + 16px); right: calc(env(safe-area-inset-right, 0px) + 16px); background: rgba(255,255,255,0.15); border: none; color: #fff; font-size: 20px; width: 36px; height: 36px; border-radius: 50%; cursor: pointer; display: flex; align-items: center; justify-content: center; }
+/* Paging arrows. Semi-transparent at rest so they never compete with the photo,
+   and reachable at the vertical middle on both pointer and touch. They sit
+   above the image but inside the backdrop, and stop click propagation so
+   pressing one does not also hit the backdrop's close handler. */
+.fb-lightbox-nav {
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 44px;
+  height: 64px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: 10px;
+  background: rgba(15, 23, 42, 0.38);
+  color: rgba(255, 255, 255, 0.82);
+  font-size: 30px;
+  line-height: 1;
+  cursor: pointer;
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  transition: background 0.15s, color 0.15s, opacity 0.15s;
+}
+.fb-lightbox-nav:hover:not(:disabled) {
+  background: rgba(30, 41, 59, 0.72);
+  color: #fff;
+}
+/* Kept mounted rather than hidden at the ends, so the image does not shift and
+   the remaining direction stays where the user last reached for it. */
+.fb-lightbox-nav:disabled { opacity: 0.22; cursor: default; }
+.fb-lightbox-nav-prev { left: calc(env(safe-area-inset-left, 0px) + 10px); }
+.fb-lightbox-nav-next { right: calc(env(safe-area-inset-right, 0px) + 10px); }
+
+/* Coarse pointers get a slightly larger target and a dimmer resting state:
+   there is no hover to reveal them, and they overlap the drag-to-dismiss
+   surface. */
+@media (hover: none) {
+  .fb-lightbox-nav { width: 52px; height: 76px; background: rgba(15, 23, 42, 0.28); }
+}
+
 .fb-lightbox-actions { position: absolute; left: 50%; bottom: calc(env(safe-area-inset-bottom, 0px) + 18px); transform: translateX(-50%); display: inline-flex; align-items: center; gap: 8px; padding: 6px; border-radius: 999px; background: rgba(15, 23, 42, 0.82); border: 1px solid rgba(148, 163, 184, 0.24); box-shadow: 0 12px 32px rgba(0,0,0,0.35); backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px); }
 .fb-lightbox-action { min-width: 82px; height: 32px; padding: 0 13px; border: 1px solid rgba(148, 163, 184, 0.24); border-radius: 999px; background: rgba(30, 41, 59, 0.95); color: #e2e8f0; font-size: 12px; cursor: pointer; }
 .fb-lightbox-action:hover:not(:disabled) { background: rgba(51, 65, 85, 0.98); border-color: rgba(125, 211, 252, 0.42); }
@@ -6093,6 +6977,41 @@ html.native-ios-mac .chat-dl-btn {
 @keyframes chatImagePreviewPulse { 0% { background-position: 100% 0; } 100% { background-position: -100% 0; } }
 .chat-external-link { color: #60a5fa; text-decoration: underline; text-underline-offset: 2px; cursor: pointer; }
 .chat-external-link:hover { color: #93c5fd; }
+.chat-loopback-link {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px;
+  max-width: 100%;
+}
+.chat-loopback-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+}
+.chat-loopback-action {
+  appearance: none;
+  border: 1px solid rgba(100,116,139,0.52);
+  border-radius: 5px;
+  background: rgba(30,41,59,0.72);
+  color: #94a3b8;
+  cursor: pointer;
+  font: inherit;
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1.2;
+  padding: 2px 5px;
+  white-space: nowrap;
+}
+.chat-loopback-action:hover {
+  border-color: rgba(96,165,250,0.62);
+  color: #dbeafe;
+  background: rgba(30,64,175,0.22);
+}
+.chat-loopback-action.is-proxy {
+  border-color: rgba(96,165,250,0.42);
+  color: #bfdbfe;
+}
 .external-link-overlay {
   background:
     radial-gradient(circle at 50% 0%, rgba(59,130,246,0.18), transparent 34%),
@@ -6192,7 +7111,9 @@ html.native-ios-mac .chat-dl-btn {
 }
 .zoom-text-dialog {
   position: relative;
+  box-sizing: border-box;
   width: min(640px, calc(100vw - 24px));
+  max-width: calc(100vw - 24px);
   max-height: calc(100vh - var(--sat, 0px) - env(safe-area-inset-bottom, 0px) - 32px);
   display: flex;
   flex-direction: column;
@@ -6204,8 +7125,12 @@ html.native-ios-mac .chat-dl-btn {
   box-shadow: 0 24px 80px rgba(0,0,0,0.52), inset 0 1px 0 rgba(255,255,255,0.04);
   overflow: hidden;
 }
+.zoom-text-dialog-message-preview {
+  width: min(50vw, calc(100vw - 24px));
+}
 .zoom-text-header { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-shrink: 0; }
 .zoom-text-title { font-size: 13px; font-weight: 600; color: #cbd5e1; letter-spacing: 0.02em; text-transform: uppercase; }
+.zoom-text-subtitle { font-size: 11px; color: #94a3b8; line-height: 1.4; overflow-wrap: anywhere; }
 .zoom-text-close { background: none; border: none; color: #64748b; font-size: 22px; line-height: 1; cursor: pointer; padding: 0 4px; }
 .zoom-text-close:hover { color: #e2e8f0; }
 .zoom-text-body {
@@ -6229,6 +7154,30 @@ html.native-ios-mac .chat-dl-btn {
   word-break: break-word;
   overflow-wrap: anywhere;
 }
+.zoom-text-content-rendered { white-space: normal; }
+.zoom-text-mode-switch {
+  display: inline-flex;
+  align-self: flex-start;
+  gap: 2px;
+  padding: 2px;
+  border: 1px solid rgba(71,85,105,0.72);
+  border-radius: 7px;
+  background: rgba(2,6,23,0.72);
+}
+.zoom-text-mode-switch button {
+  border: 0;
+  border-radius: 5px;
+  padding: 4px 10px;
+  background: transparent;
+  color: #94a3b8;
+  cursor: pointer;
+  font: inherit;
+  font-size: 11px;
+}
+.zoom-text-mode-switch button.active {
+  background: #334155;
+  color: #f8fafc;
+}
 /* Force-enable native selection inside the zoom dialog. The chat view's
    `@media (pointer: coarse)` rule turns off user-select for everything inside
    `.chat-view`, and the dialog is rendered as a sibling — but assistive
@@ -6242,7 +7191,7 @@ html.native-ios-mac .chat-dl-btn {
 }
 .zoom-text-selection-menu { z-index: 2; }
 .zoom-text-hint { font-size: 11px; color: #64748b; line-height: 1.4; flex-shrink: 0; }
-.zoom-text-actions { display: flex; justify-content: flex-end; gap: 8px; flex-shrink: 0; }
+.zoom-text-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; flex-shrink: 0; }
 .zoom-text-btn {
   border: 1px solid rgba(96,165,250,0.5);
   border-radius: 7px;
@@ -6257,10 +7206,82 @@ html.native-ios-mac .chat-dl-btn {
 }
 .zoom-text-btn:hover { background: #1d4ed8; border-color: rgba(147,197,253,0.72); }
 .zoom-text-btn.is-copied { background: #166534; border-color: #16a34a; color: #86efac; }
+.zoom-text-resize-handle {
+  position: absolute;
+  z-index: 3;
+  touch-action: none;
+  -webkit-user-select: none !important;
+  user-select: none !important;
+}
+.zoom-text-resize-handle.is-bottom {
+  left: 14px;
+  right: 14px;
+  bottom: 0;
+  height: 10px;
+  cursor: ns-resize;
+}
+.zoom-text-resize-handle.is-right {
+  top: 14px;
+  right: 0;
+  bottom: 14px;
+  width: 10px;
+  cursor: ew-resize;
+}
+.zoom-text-resize-handle.is-corner {
+  right: 0;
+  bottom: 0;
+  width: 22px;
+  height: 22px;
+  cursor: nwse-resize;
+  z-index: 4;
+}
+.zoom-text-resize-handle.is-bottom::after {
+  content: '';
+  position: absolute;
+  left: 50%;
+  bottom: 3px;
+  width: 40px;
+  height: 3px;
+  transform: translateX(-50%);
+  border-radius: 999px;
+  background: rgba(148,163,184,0.38);
+}
+.zoom-text-resize-handle.is-right::after {
+  content: '';
+  position: absolute;
+  top: 50%;
+  right: 3px;
+  width: 3px;
+  height: 40px;
+  transform: translateY(-50%);
+  border-radius: 999px;
+  background: rgba(148,163,184,0.38);
+}
+.zoom-text-resize-handle.is-corner::after {
+  content: '';
+  position: absolute;
+  right: 4px;
+  bottom: 4px;
+  width: 10px;
+  height: 10px;
+  border-right: 2px solid rgba(148,163,184,0.56);
+  border-bottom: 2px solid rgba(148,163,184,0.56);
+  border-radius: 0 0 4px;
+}
+@media (pointer: coarse) {
+  .zoom-text-resize-handle.is-bottom { height: 16px; }
+  .zoom-text-resize-handle.is-right { width: 16px; }
+  .zoom-text-resize-handle.is-corner { width: 30px; height: 30px; }
+}
 @media (max-width: 520px) {
-  .zoom-text-dialog { width: calc(100vw - 16px); padding: 12px; }
+  .zoom-text-dialog { width: calc(100vw - 16px); max-width: calc(100vw - 16px); padding: 12px; }
   .zoom-text-btn { width: 100%; padding: 10px; font-size: 13px; }
-  .zoom-text-actions { width: 100%; }
+  .zoom-text-actions { width: 100%; flex-direction: column; }
+  .zoom-text-dialog-message-preview .zoom-text-actions { flex-direction: row; flex-wrap: nowrap; gap: 6px; }
+  .zoom-text-dialog-message-preview .zoom-text-btn { flex: 1 1 0; min-width: 0; width: auto; padding: 10px 5px; font-size: 12px; }
+}
+@media (max-width: 640px) {
+  .zoom-text-dialog-message-preview { width: calc(100vw - 16px); max-width: calc(100vw - 16px); }
 }
 /* GFM tables in chat */
 .chat-table { border-collapse: collapse; margin: 8px 0; font-size: 13px; width: auto; max-width: 100%; overflow-x: auto; display: block; }
@@ -6759,5 +7780,1895 @@ button.quick-agent-delegation-preset.active {
 @media (max-width: 380px) {
   .peer-audit-chooser-list {
     grid-template-columns: 1fr;
+  }
+}
+
+/* ── Cron execution history ──────────────────────────────────────────────
+ * Dense operational history: prompt text stays a one-line identifier while
+ * the final response gets the visual weight and scroll space. */
+.cron-manager--history {
+  scrollbar-color: rgba(34, 211, 238, 0.35) transparent;
+}
+
+.cron-manager--history .cron-manager-toolbar {
+  position: sticky;
+  top: -12px;
+  z-index: 3;
+  margin: -12px -8px 12px !important;
+  padding: 12px 8px 9px;
+  border-bottom: 1px solid rgba(51, 65, 85, 0.58);
+  background: linear-gradient(180deg, rgba(2, 6, 23, 0.98) 72%, rgba(2, 6, 23, 0.82));
+  backdrop-filter: blur(14px);
+}
+
+.cron-execution-page {
+  --cron-cyan: #22d3ee;
+  --cron-green: #34d399;
+  position: relative;
+  min-height: 260px;
+}
+
+.cron-execution-page::before {
+  content: '';
+  position: absolute;
+  inset: 50px 12% auto;
+  height: 220px;
+  z-index: -1;
+  border-radius: 50%;
+  background: radial-gradient(circle, rgba(14, 165, 233, 0.12), transparent 68%);
+  filter: blur(22px);
+  pointer-events: none;
+}
+
+.cron-execution-hero {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 12px;
+  padding: 14px 16px;
+  overflow: hidden;
+  border: 1px solid rgba(34, 211, 238, 0.24);
+  border-radius: 14px;
+  background:
+    linear-gradient(120deg, rgba(8, 47, 73, 0.72), rgba(15, 23, 42, 0.82) 52%, rgba(6, 78, 59, 0.3)),
+    repeating-linear-gradient(90deg, transparent 0 31px, rgba(56, 189, 248, 0.025) 31px 32px);
+  box-shadow: inset 0 1px rgba(255, 255, 255, 0.04), 0 14px 34px rgba(2, 8, 23, 0.28);
+}
+
+.cron-execution-hero::after {
+  content: '';
+  position: absolute;
+  right: -34px;
+  top: -55px;
+  width: 160px;
+  height: 160px;
+  border: 1px solid rgba(34, 211, 238, 0.16);
+  border-radius: 50%;
+  box-shadow: 0 0 0 22px rgba(34, 211, 238, 0.025), 0 0 0 44px rgba(34, 211, 238, 0.018);
+}
+
+.cron-execution-hero-icon {
+  display: grid;
+  place-items: center;
+  width: 38px;
+  height: 38px;
+  flex: 0 0 auto;
+  border: 1px solid rgba(34, 211, 238, 0.42);
+  border-radius: 11px;
+  background: rgba(8, 145, 178, 0.14);
+  color: #67e8f9;
+  font-size: 24px;
+  text-shadow: 0 0 14px rgba(34, 211, 238, 0.75);
+}
+
+.cron-execution-hero-copy {
+  display: flex;
+  min-width: 0;
+  flex: 1;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.cron-execution-hero-copy strong {
+  color: #f1f5f9;
+  font-size: 14px;
+  letter-spacing: 0.025em;
+}
+
+.cron-execution-hero-copy span {
+  overflow: hidden;
+  color: #7dd3fc;
+  font-size: 10px;
+  letter-spacing: 0.035em;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cron-execution-count {
+  position: relative;
+  z-index: 1;
+  flex: 0 0 auto;
+  padding: 5px 9px;
+  border: 1px solid rgba(52, 211, 153, 0.24);
+  border-radius: 999px;
+  background: rgba(6, 78, 59, 0.3);
+  color: #6ee7b7;
+  font-size: 10px;
+  letter-spacing: 0.02em;
+}
+
+.cron-execution-count b { font-size: 12px; }
+
+.cron-execution-list,
+.cron-history-list {
+  display: grid;
+  gap: 8px;
+}
+
+.cron-execution-card {
+  position: relative;
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1fr);
+  min-width: 0;
+  overflow: hidden;
+  border: 1px solid rgba(51, 65, 85, 0.66);
+  border-radius: 12px;
+  outline: none;
+  background: linear-gradient(112deg, rgba(15, 23, 42, 0.94), rgba(12, 23, 38, 0.86));
+  box-shadow: inset 0 1px rgba(255, 255, 255, 0.025);
+  transition: border-color 140ms ease, transform 140ms ease, box-shadow 140ms ease;
+}
+
+.cron-execution-card--interactive { cursor: pointer; }
+
+.cron-execution-card--interactive:hover,
+.cron-execution-card--interactive:focus-visible {
+  transform: translateY(-1px);
+  border-color: rgba(34, 211, 238, 0.42);
+  box-shadow: inset 0 1px rgba(255, 255, 255, 0.04), 0 8px 24px rgba(2, 132, 199, 0.11);
+}
+
+.cron-execution-rail {
+  position: relative;
+  display: flex;
+  align-items: center;
+  flex-direction: column;
+  padding-top: 12px;
+  background: linear-gradient(180deg, rgba(30, 41, 59, 0.48), rgba(15, 23, 42, 0.12));
+}
+
+.cron-execution-index {
+  color: #475569;
+  font: 600 8px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+  letter-spacing: 0.08em;
+}
+
+.cron-execution-dot {
+  width: 6px;
+  height: 6px;
+  margin-top: 8px;
+  border-radius: 50%;
+}
+
+.cron-execution-line {
+  width: 1px;
+  min-height: 20px;
+  flex: 1;
+  margin-top: 5px;
+  background: linear-gradient(180deg, rgba(71, 85, 105, 0.72), transparent);
+}
+
+.cron-execution-card-body {
+  min-width: 0;
+  padding: 11px 13px 10px 10px;
+}
+
+.cron-execution-card-title-row,
+.cron-execution-detail-toolbar,
+.cron-execution-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.cron-execution-card-title {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  color: #e2e8f0;
+  font-size: 13px;
+  font-weight: 650;
+  letter-spacing: 0.012em;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cron-execution-status {
+  flex: 0 0 auto;
+  padding: 2px 7px;
+  border: 1px solid;
+  border-radius: 999px;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.cron-execution-meta {
+  display: flex;
+  gap: 5px 12px;
+  flex-wrap: wrap;
+  margin-top: 6px;
+  color: #64748b;
+  font-size: 10px;
+}
+
+.cron-execution-time {
+  color: #94a3b8;
+  font: 500 10px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.cron-execution-prompt-summary {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  gap: 7px;
+  margin-top: 7px;
+  overflow: hidden;
+  color: #64748b;
+  font-size: 10px;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cron-execution-prompt-summary > span {
+  color: #22d3ee;
+  font: 700 15px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.cron-execution-preview {
+  display: -webkit-box;
+  margin-top: 8px;
+  overflow: hidden;
+  color: #a8b4c5;
+  font-size: 11px;
+  line-height: 1.52;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+}
+
+.cron-execution-actions {
+  min-height: 17px;
+  margin-top: 8px;
+}
+
+.cron-execution-link,
+.cron-execution-detail-action {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: #7dd3fc;
+  font: inherit;
+  font-size: 10px;
+  cursor: pointer;
+}
+
+.cron-execution-link:hover,
+.cron-execution-detail-action:hover { color: #cffafe; }
+.cron-execution-link--primary { color: #6ee7b7; }
+
+.cron-execution-open-hint {
+  margin-left: auto;
+  color: #475569;
+  font-size: 9px;
+  letter-spacing: 0.025em;
+}
+
+.cron-history-panel,
+.cron-execution-detail {
+  box-sizing: border-box;
+  height: 100%;
+  min-height: 0;
+  overflow: auto;
+  padding: 14px;
+  background:
+    linear-gradient(180deg, rgba(2, 6, 23, 0.38), rgba(2, 6, 23, 0.7)),
+    repeating-linear-gradient(0deg, transparent 0 31px, rgba(56, 189, 248, 0.018) 31px 32px);
+  scrollbar-color: rgba(34, 211, 238, 0.35) transparent;
+}
+
+.cron-history-summary {
+  margin-bottom: 12px;
+  padding: 12px;
+  border: 1px solid rgba(34, 211, 238, 0.2);
+  border-radius: 12px;
+  background: linear-gradient(110deg, rgba(8, 47, 73, 0.48), rgba(15, 23, 42, 0.8));
+}
+
+.cron-history-summary-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.cron-history-summary-grid > span {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.cron-history-summary-grid small {
+  color: #64748b;
+  font-size: 8px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.cron-history-summary-grid b,
+.cron-history-summary-grid code {
+  overflow: hidden;
+  color: #cbd5e1;
+  font-size: 10px;
+  font-weight: 500;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cron-history-prompt-summary {
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px solid rgba(51, 65, 85, 0.55);
+}
+
+.cron-execution-card--compact .cron-execution-card-body { padding-block: 9px; }
+.cron-execution-card--compact .cron-execution-preview { -webkit-line-clamp: 2; }
+
+.cron-execution-empty {
+  display: flex;
+  min-height: 150px;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+  gap: 10px;
+  color: #64748b;
+  font-size: 12px;
+}
+
+.cron-execution-empty-icon {
+  color: #22d3ee;
+  font-size: 28px;
+  opacity: 0.46;
+}
+
+.cron-execution-empty--loading { flex-direction: row; }
+
+.cron-execution-spinner {
+  width: 12px;
+  height: 12px;
+  border: 1px solid rgba(34, 211, 238, 0.2);
+  border-top-color: #22d3ee;
+  border-radius: 50%;
+  animation: cron-execution-spin 700ms linear infinite;
+}
+
+@keyframes cron-execution-spin { to { transform: rotate(360deg); } }
+
+.cron-execution-detail {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.cron-execution-detail-toolbar {
+  flex: 0 0 auto;
+  min-height: 28px;
+  margin-bottom: 12px;
+}
+
+.cron-execution-detail-action {
+  margin-left: auto;
+  padding: 5px 10px;
+  border: 1px solid rgba(34, 211, 238, 0.25);
+  border-radius: 8px;
+  background: rgba(8, 145, 178, 0.1);
+}
+
+.cron-execution-output {
+  display: flex;
+  min-height: 0;
+  flex: 1;
+  flex-direction: column;
+  overflow: hidden;
+  border: 1px solid rgba(51, 65, 85, 0.76);
+  border-radius: 13px;
+  background: rgba(8, 15, 29, 0.82);
+  box-shadow: inset 0 1px rgba(255, 255, 255, 0.025), 0 16px 38px rgba(0, 0, 0, 0.16);
+}
+
+.cron-execution-output-heading {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 12px;
+  border-bottom: 1px solid rgba(51, 65, 85, 0.62);
+  background: linear-gradient(90deg, rgba(6, 78, 59, 0.18), rgba(15, 23, 42, 0.68));
+  color: #d1fae5;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.cron-execution-output-heading small {
+  margin-left: auto;
+  color: #475569;
+  font-size: 8px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+}
+
+.cron-execution-output-pulse {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #34d399;
+  box-shadow: 0 0 0 3px rgba(52, 211, 153, 0.09), 0 0 12px rgba(52, 211, 153, 0.75);
+}
+
+.cron-execution-output-body {
+  min-height: 0;
+  flex: 1;
+  overflow: auto;
+  padding: 15px 17px 24px;
+  color: #cbd5e1;
+  font-size: 13px;
+  line-height: 1.65;
+  overflow-wrap: anywhere;
+  scrollbar-color: rgba(52, 211, 153, 0.3) transparent;
+}
+
+.cron-execution-output-body .chat-rich-text { white-space: pre-wrap; }
+
+.cron-floating-panel .floating-panel-titlebar {
+  background: linear-gradient(90deg, rgba(8, 47, 73, 0.88), rgba(15, 23, 42, 0.96)) !important;
+  border-bottom-color: rgba(34, 211, 238, 0.22) !important;
+}
+
+@media (max-width: 640px) {
+  .cron-manager--history {
+    width: calc(100% - 18px) !important;
+  }
+
+  .cron-manager--history .cron-manager-toolbar {
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+
+  .cron-manager--history .cron-manager-toolbar::-webkit-scrollbar { display: none; }
+  .cron-execution-hero { padding: 12px; }
+  .cron-execution-hero-copy span { display: none; }
+  .cron-execution-count { padding-inline: 7px; }
+  .cron-execution-card { grid-template-columns: 27px minmax(0, 1fr); }
+  .cron-execution-card-body { padding-right: 10px; }
+  .cron-execution-index { font-size: 7px; }
+  .cron-execution-meta { gap: 4px 9px; }
+  .cron-execution-open-hint { display: none; }
+  .cron-history-panel,
+  .cron-execution-detail { padding: 10px; }
+  .cron-history-summary-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .cron-execution-output-body { padding: 13px 12px 22px; font-size: 12px; }
+}
+/* Production remote desktop: native video, no canvas/frame polling. */
+.remote-desktop-floating-shell {
+  min-width: min(640px, 100vw);
+  min-height: min(420px, 100vh);
+  border-color: rgb(104 196 255 / 45%) !important;
+  background: #07101c !important;
+  box-shadow: 0 28px 90px rgb(0 0 0 / 58%), 0 0 0 1px rgb(74 193 255 / 10%) !important;
+}
+
+.remote-desktop-floating-shell > .floating-panel-content {
+  min-height: 0;
+}
+
+.remote-desktop-panel {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr) auto;
+  overflow: hidden;
+  color: var(--text-primary, #eef5ff);
+  background: #07101c;
+  border: 0;
+  border-radius: inherit;
+}
+
+.remote-desktop-panel:fullscreen {
+  width: 100%;
+  height: 100%;
+  border: 0;
+  border-radius: 0;
+}
+
+.remote-desktop-header,
+.remote-desktop-toolbar,
+.remote-desktop-footer {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 14px;
+  background: rgb(11 24 40 / 96%);
+}
+
+.remote-desktop-header {
+  justify-content: space-between;
+  border-bottom: 1px solid rgb(122 178 218 / 18%);
+  cursor: grab;
+  user-select: none;
+}
+
+.remote-desktop-header:active {
+  cursor: grabbing;
+}
+
+.remote-desktop-header button,
+.remote-desktop-header [role="button"] {
+  cursor: pointer;
+}
+
+.remote-desktop-header > div:first-child {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+
+.remote-desktop-header strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  letter-spacing: .01em;
+}
+
+/* The connection state carries a lamp: link quality is the first thing looked
+   for, and it should be readable before the words are. */
+.remote-desktop-header > div:first-child > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.remote-desktop-header > div:first-child > span::before {
+  content: '';
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #64d2a4;
+  box-shadow: 0 0 8px rgb(100 210 164 / 70%);
+}
+
+/* Relayed and in-progress states are not failures, but they are not a clean
+   direct link either; amber says so without a sentence. */
+.remote-desktop-panel:not(.is-direct) .remote-desktop-header > div:first-child > span::before {
+  background: #e8b667;
+  box-shadow: 0 0 8px rgb(232 182 103 / 65%);
+}
+
+.remote-desktop-header span,
+.remote-desktop-footer span {
+  color: #aac0d3;
+  font-size: 12px;
+}
+
+.remote-desktop-presence {
+  display: flex;
+  gap: 10px;
+  margin-left: auto;
+}
+
+.remote-desktop-window-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.remote-desktop-window-host[hidden] {
+  display: none;
+}
+
+.remote-desktop-standalone-root,
+.remote-desktop-standalone-root body,
+.remote-desktop-standalone-root #app {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+  background: #050b13;
+}
+
+.remote-desktop-standalone-status {
+  min-height: 100%;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  color: #aac0d3;
+  background: radial-gradient(circle at 50% 35%, rgb(15 62 89 / 38%), transparent 45%), #050b13;
+}
+
+.remote-desktop-minimized-dock {
+  position: fixed;
+  right: calc(14px + env(safe-area-inset-right, 0px));
+  bottom: calc(14px + env(safe-area-inset-bottom, 0px));
+  z-index: 10020;
+  width: min(270px, calc(100vw - 28px));
+  min-height: 54px;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 11px;
+  color: #dbeafe;
+  text-align: left;
+  background: linear-gradient(145deg, rgb(11 24 40 / 98%), rgb(5 14 25 / 98%));
+  border: 1px solid rgb(104 196 255 / 42%);
+  border-radius: 10px;
+  box-shadow: 0 14px 40px rgb(0 0 0 / 48%), 0 0 18px rgb(34 211 238 / 10%);
+  cursor: pointer;
+}
+
+.remote-desktop-minimized-dock:hover {
+  border-color: rgb(104 196 255 / 72%);
+  box-shadow: 0 16px 44px rgb(0 0 0 / 55%), 0 0 22px rgb(34 211 238 / 18%);
+}
+
+.remote-desktop-minimized-status {
+  width: 9px;
+  height: 9px;
+  border-radius: 999px;
+  background: #f59e0b;
+  box-shadow: 0 0 10px rgb(245 158 11 / 55%);
+}
+
+.remote-desktop-minimized-status.is-online {
+  background: #22c55e;
+  box-shadow: 0 0 10px rgb(34 197 94 / 60%);
+}
+
+.remote-desktop-minimized-copy {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+
+.remote-desktop-minimized-copy strong,
+.remote-desktop-minimized-copy small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.remote-desktop-minimized-copy small {
+  color: #8ca9be;
+  font-size: 11px;
+}
+
+.remote-desktop-minimized-restore {
+  color: #67d5ff;
+  font-size: 16px;
+}
+
+.remote-desktop-toolbar {
+  flex-wrap: wrap;
+  border-bottom: 1px solid rgb(122 178 218 / 14%);
+}
+
+/* Each toolbar group is one segmented control rather than loose buttons: the
+   grouping becomes visible instead of implied by spacing, and a row of related
+   options reads as a single instrument. */
+.remote-desktop-display-tabs,
+.remote-desktop-mode-switch,
+.remote-desktop-view-switch,
+.remote-desktop-zoom-switch,
+.remote-desktop-clipboard-switch,
+.remote-desktop-mobile-input-switch {
+  display: inline-flex;
+  align-items: stretch;
+  flex: 0 0 auto;
+  border: 1px solid rgb(94 165 214 / 22%);
+  border-radius: 10px;
+  background:
+    linear-gradient(180deg, rgb(20 41 62 / 92%), rgb(12 27 44 / 92%));
+  box-shadow:
+    inset 0 1px 0 rgb(214 240 255 / 6%),
+    0 1px 2px rgb(2 10 20 / 45%);
+  overflow: hidden;
+}
+
+.remote-desktop-mobile-input-switch {
+  display: none;
+}
+
+.remote-desktop-keyboard-trigger {
+  width: 44px;
+  padding-inline: 0 !important;
+  display: grid;
+  place-items: center;
+  font-size: 19px;
+  line-height: 1;
+}
+
+.remote-desktop-display-tabs {
+  min-width: 0;
+  max-width: 46vw;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.remote-desktop-display-tabs::-webkit-scrollbar {
+  display: none;
+}
+
+/* A monitor mark, so the display picker is recognisable before it is read. */
+.remote-desktop-display-tabs button::before {
+  content: '';
+  width: 11px;
+  height: 8px;
+  margin-right: 7px;
+  border: 1.5px solid currentcolor;
+  border-radius: 2px;
+  opacity: .75;
+}
+
+.remote-desktop-display-tabs button {
+  max-width: 22ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Segmented-control skin, for the toolbar only: the file drawer and the node
+   list use standalone buttons and keep their own chip below. */
+.remote-desktop-toolbar button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 34px;
+  padding: 6px 12px;
+  color: #b9d8ef;
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  font-size: 12.5px;
+  font-weight: 500;
+  letter-spacing: .01em;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  transition: color .12s ease, background-color .12s ease, box-shadow .12s ease;
+}
+
+/* Hairline between segments, never before the first one. */
+.remote-desktop-toolbar :is(
+  .remote-desktop-display-tabs,
+  .remote-desktop-mode-switch,
+  .remote-desktop-view-switch,
+  .remote-desktop-zoom-switch,
+  .remote-desktop-clipboard-switch,
+  .remote-desktop-mobile-input-switch
+) button + button {
+  border-left: 1px solid rgb(94 165 214 / 18%);
+}
+
+.remote-desktop-toolbar button:hover:not(:disabled) {
+  color: #eaf7ff;
+  background: rgb(56 132 186 / 16%);
+}
+
+/* Selected state as a lit segment rather than a filled chip: the toolbar keeps
+   one visual weight, and what is active reads as illuminated. */
+.remote-desktop-toolbar button[aria-pressed="true"],
+.remote-desktop-display-tabs button[aria-selected="true"] {
+  color: #e8fbff;
+  background:
+    linear-gradient(180deg, rgb(34 211 238 / 22%), rgb(34 211 238 / 9%));
+  box-shadow:
+    inset 0 -2px 0 rgb(34 211 238 / 70%),
+    inset 0 0 22px rgb(34 211 238 / 12%);
+}
+
+.remote-desktop-toolbar button:focus-visible {
+  outline: 2px solid rgb(103 222 255 / 75%);
+  outline-offset: -2px;
+}
+
+.remote-desktop-toolbar button:disabled {
+  opacity: .38;
+}
+
+.remote-desktop-files button,
+.controlled-nodes-remote-desktop {
+  min-height: 34px;
+  padding: 6px 12px;
+  color: #cfeaff;
+  background: linear-gradient(180deg, rgb(20 41 62 / 92%), rgb(12 27 44 / 92%));
+  border: 1px solid rgb(94 165 214 / 26%);
+  border-radius: 9px;
+  white-space: nowrap;
+}
+
+/* Standalone actions keep the same skin as a one-segment control. */
+.remote-desktop-files-trigger,
+.remote-desktop-unlock-trigger {
+  border: 1px solid rgb(94 165 214 / 22%) !important;
+  border-radius: 10px !important;
+  background:
+    linear-gradient(180deg, rgb(20 41 62 / 92%), rgb(12 27 44 / 92%)) !important;
+  box-shadow:
+    inset 0 1px 0 rgb(214 240 255 / 6%),
+    0 1px 2px rgb(2 10 20 / 45%);
+}
+
+.remote-desktop-unlock-trigger {
+  color: #ffe9c2 !important;
+  border-color: rgb(245 179 74 / 45%) !important;
+  box-shadow:
+    inset 0 1px 0 rgb(255 236 205 / 10%),
+    0 0 14px rgb(245 179 74 / 18%);
+}
+
+.remote-desktop-file-badge {
+  position: absolute;
+  right: 14px;
+  bottom: 14px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 44px;
+  height: 44px;
+  padding: 0;
+  color: #d9edff;
+  background: rgb(5 23 38 / 88%);
+  border: 1px solid rgb(99 201 255 / 45%);
+  border-radius: 50%;
+  box-shadow: 0 6px 18px rgb(2 12 22 / 55%);
+  font-size: 11px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.remote-desktop-file-badge svg {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  transform: rotate(-90deg);
+}
+
+.remote-desktop-file-badge-track {
+  fill: none;
+  stroke: rgb(99 201 255 / 22%);
+  stroke-width: 3;
+}
+
+.remote-desktop-file-badge-ring {
+  fill: none;
+  stroke: #57a9ff;
+  stroke-width: 3;
+  stroke-linecap: round;
+  transition: stroke-dashoffset 200ms linear;
+}
+
+.remote-desktop-file-drawer-actions {
+  display: flex;
+  gap: 4px;
+}
+
+.remote-desktop-transfer-meta {
+  color: #9bdfff;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.remote-desktop-input-blocked {
+  color: #ffb057;
+}
+
+.remote-desktop-retry-reason {
+  display: block;
+  margin-top: 4px;
+  color: #ffb057;
+  font-size: 11px;
+}
+
+.remote-desktop-resolution-menu {
+  position: fixed;
+  z-index: 10020;
+  width: 216px;
+  padding: 7px;
+  color: #e9f7ff;
+  background: rgb(5 19 32 / 98%);
+  border: 1px solid rgb(99 201 255 / 48%);
+  border-radius: 10px;
+  box-shadow: 0 16px 42px rgb(0 0 0 / 58%);
+}
+
+.remote-desktop-resolution-menu > strong {
+  display: block;
+  padding: 5px 7px 8px;
+  overflow: hidden;
+  color: #b9dcf3;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.remote-desktop-resolution-menu button {
+  width: 100%;
+  min-height: 38px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 7px 9px;
+  color: #e9f7ff;
+  background: transparent;
+  border: 0;
+  border-radius: 7px;
+  text-align: left;
+}
+
+.remote-desktop-resolution-menu button:hover,
+.remote-desktop-resolution-menu button:focus-visible {
+  background: rgb(99 201 255 / 14%);
+  outline: none;
+}
+
+.remote-desktop-resolution-menu button[aria-checked="true"] {
+  color: #06131d;
+  background: #63c9ff;
+}
+
+.remote-desktop-resolution-menu button:disabled {
+  opacity: .42;
+}
+
+.remote-desktop-resolution-menu small {
+  color: inherit;
+  opacity: .72;
+}
+
+.remote-desktop-dpi-options {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 4px;
+}
+
+.remote-desktop-resolution-menu .remote-desktop-dpi-options button {
+  min-height: 32px;
+  justify-content: center;
+  padding: 5px 3px;
+}
+
+.remote-desktop-clipboard-switch {
+  position: relative;
+}
+
+.remote-desktop-clipboard-status {
+  min-width: 54px;
+  color: #9bdfff;
+  font-size: 11px;
+}
+
+.remote-desktop-resolution-menu {
+  max-height: min(70vh, 520px);
+  overflow-y: auto;
+}
+
+.remote-desktop-resolution-note {
+  display: block;
+  padding: 4px 8px 2px;
+  color: #9aa7b8;
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.remote-desktop-unlock-trigger {
+  border: 1px solid rgba(255, 176, 87, 0.5);
+  border-radius: 8px;
+  padding: 4px 10px;
+  background: rgba(84, 51, 12, 0.5);
+  color: #ffd7a8;
+  font-size: 12px;
+}
+
+.remote-desktop-unlock-trigger:disabled {
+  opacity: 0.55;
+}
+
+.remote-desktop-control-notice {
+  margin: 0 12px 8px;
+  padding: 8px 12px;
+  border: 1px solid rgba(255, 176, 87, 0.45);
+  border-radius: 8px;
+  background: rgba(84, 51, 12, 0.55);
+  color: #ffd7a8;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.remote-desktop-stage {
+  position: relative;
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #02050a;
+  outline: none;
+  touch-action: none;
+}
+
+.remote-desktop-mobile-keyboard {
+  position: absolute;
+  z-index: 9;
+  left: 50%;
+  bottom: 12px;
+  translate: -50% 0;
+  width: min(720px, calc(100% - 24px));
+  padding: 8px;
+  display: grid;
+  gap: 7px;
+  color: #e8f8ff;
+  background:
+    linear-gradient(145deg, rgb(10 31 48 / 96%), rgb(3 14 25 / 97%)),
+    repeating-linear-gradient(90deg, transparent 0 23px, rgb(94 214 255 / 4%) 24px);
+  border: 1px solid rgb(99 213 255 / 58%);
+  border-radius: 13px;
+  box-shadow: 0 18px 50px rgb(0 0 0 / 58%), inset 0 1px 0 rgb(255 255 255 / 9%), 0 0 25px rgb(34 181 255 / 12%);
+}
+
+.remote-desktop-mobile-keyboard-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  color: #79ddff;
+  font-size: 18px;
+}
+
+.remote-desktop-mobile-keyboard-head button,
+.remote-desktop-file-drawer-head button {
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  color: #cceeff;
+  background: rgb(29 74 101 / 55%);
+  border: 1px solid rgb(101 207 255 / 36%);
+  border-radius: 7px;
+  font-size: 20px;
+}
+
+.remote-desktop-mobile-keyboard textarea {
+  width: 100%;
+  min-height: 38px;
+  max-height: 88px;
+  resize: vertical;
+  padding: 8px 10px;
+  color: #f2fbff;
+  background: rgb(1 9 17 / 82%);
+  border: 1px solid #2d6686;
+  border-radius: 8px;
+  outline: none;
+}
+
+.remote-desktop-mobile-keyboard textarea:focus {
+  border-color: #67d8ff;
+  box-shadow: 0 0 0 2px rgb(99 216 255 / 15%);
+}
+
+.remote-desktop-mobile-shortcuts {
+  display: flex;
+  gap: 6px;
+  overflow-x: auto;
+  padding-bottom: 2px;
+  scrollbar-width: thin;
+}
+
+.remote-desktop-mobile-shortcuts button {
+  flex: 0 0 auto;
+  min-height: 34px;
+  padding: 5px 9px;
+  color: #dff7ff;
+  background: linear-gradient(180deg, #153b54, #0b2639);
+  border: 1px solid #326d8f;
+  border-radius: 8px;
+}
+
+.remote-desktop-mobile-shortcuts button:active {
+  color: #03131d;
+  background: #6bd9ff;
+}
+
+.remote-desktop-stage.is-controlling {
+  cursor: default;
+  box-shadow: inset 0 0 0 2px #46d78d;
+}
+
+.remote-desktop-stage.is-fit video {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+.remote-desktop-stage.is-actual {
+  align-items: flex-start;
+  justify-content: flex-start;
+}
+
+.remote-desktop-stage video {
+  display: block;
+  flex: none;
+  max-width: none;
+  max-height: none;
+  background: #000;
+  /* The video is a presentation surface, never an input surface. Native video
+     elements do not deliver uncaptured hover movement consistently across
+     desktop engines, while pointer capture made drags appear to work. Keep the
+     stage as the direct hit target so hover, click and wheel share one path. */
+  pointer-events: none;
+  user-select: none;
+  -webkit-user-drag: none;
+}
+
+/* Keep a regular HTML hit surface above the native video compositor. Some
+   desktop WebKit/native-video paths only deliver movement over the video while
+   pointer capture is active, which made drag work while ordinary hover froze.
+   Input still bubbles to the single stage handler; this layer owns no events. */
+.remote-desktop-input-surface {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  background: transparent;
+  pointer-events: auto;
+  touch-action: none;
+}
+
+.remote-desktop-virtual-pointer {
+  position: absolute;
+  z-index: 5;
+  width: 20px;
+  height: 27px;
+  translate: -2px -2px;
+  pointer-events: none;
+  filter: drop-shadow(0 2px 3px #000) drop-shadow(0 0 5px rgb(65 211 255 / 65%));
+}
+
+.remote-desktop-virtual-pointer::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: #03131e;
+  clip-path: polygon(0 0, 0 90%, 25% 68%, 42% 100%, 57% 92%, 40% 61%, 72% 60%);
+}
+
+.remote-desktop-virtual-pointer::after {
+  content: "";
+  position: absolute;
+  inset: 2px 3px 3px 2px;
+  background: linear-gradient(145deg, #f7fdff 20%, #5dd8ff 88%);
+  clip-path: polygon(0 0, 0 90%, 25% 68%, 42% 100%, 57% 92%, 40% 61%, 72% 60%);
+}
+
+.remote-desktop-virtual-mouse {
+  position: absolute;
+  z-index: 7;
+  left: 50%;
+  bottom: 12px;
+  translate: -50% 0;
+  width: 178px;
+  padding: 8px;
+  display: grid;
+  grid-template-columns: 1fr;
+  grid-template-rows: 48px 58px;
+  gap: 8px;
+  color: #e9f8ff;
+  background: linear-gradient(155deg, rgb(13 37 55 / 96%), rgb(4 17 29 / 96%));
+  border: 1px solid rgb(105 220 255 / 72%);
+  border-radius: 28px 28px 20px 20px;
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 12%), 0 10px 34px rgb(0 0 0 / 52%), 0 0 20px rgb(41 190 255 / 12%);
+  touch-action: none;
+}
+
+.remote-desktop-virtual-mouse-buttons {
+  display: grid;
+  grid-template-columns: 1fr 34px 1fr;
+  gap: 6px;
+}
+
+.remote-desktop-virtual-mouse button {
+  min-width: 0;
+  min-height: 46px;
+  padding: 5px;
+  color: #e9f8ff;
+  background: linear-gradient(180deg, #174360, #0d2c42);
+  border: 1px solid #458cb3;
+  border-radius: 18px 8px 10px 10px;
+  font-weight: 700;
+  touch-action: none;
+}
+
+.remote-desktop-virtual-mouse-buttons > button:nth-child(2) {
+  grid-column: 3;
+  border-radius: 8px 18px 10px 10px;
+}
+
+.remote-desktop-virtual-mouse button:active {
+  color: #04111d;
+  background: #63c9ff;
+}
+
+.remote-desktop-virtual-mouse button:disabled {
+  opacity: .45;
+}
+
+.remote-desktop-virtual-wheel {
+  grid-column: 2;
+  grid-row: 1;
+  display: grid;
+  place-items: center;
+  padding: 5px 7px !important;
+  border-radius: 999px !important;
+  cursor: ns-resize;
+}
+
+.remote-desktop-virtual-wheel span {
+  width: 8px;
+  height: 27px;
+  border-radius: 999px;
+  background: repeating-linear-gradient(to bottom, #8be7ff 0 3px, #14506c 3px 6px);
+  box-shadow: 0 0 8px rgb(74 211 255 / 55%);
+}
+
+.remote-desktop-virtual-mouse-handle {
+  width: 100%;
+  min-height: 58px !important;
+  font-size: 27px;
+  border-radius: 14px !important;
+  background: radial-gradient(circle at 50% 48%, #246486 0 16%, #123d59 17% 38%, #09293e 39% 100%) !important;
+  cursor: grab;
+}
+
+.remote-desktop-virtual-mouse-handle span {
+  display: inline-grid;
+  place-items: center;
+  width: 38px;
+  height: 38px;
+  color: #a7efff;
+  border: 1px solid rgb(108 221 255 / 48%);
+  border-radius: 50%;
+  box-shadow: inset 0 0 12px rgb(65 200 255 / 22%), 0 0 12px rgb(65 200 255 / 16%);
+}
+
+.remote-desktop-virtual-mouse-handle:active {
+  cursor: grabbing;
+}
+
+.remote-desktop-touch-right-button {
+  position: absolute;
+  z-index: 7;
+  right: 12px;
+  bottom: 12px;
+  display: none;
+  min-width: 52px;
+  min-height: 44px;
+  color: #eaffff;
+  background: linear-gradient(145deg, rgb(14 57 78 / 96%), rgb(5 27 42 / 96%));
+  border: 1px solid rgb(95 218 255 / 68%);
+  border-radius: 15px;
+  box-shadow: 0 8px 24px rgb(0 0 0 / 42%), inset 0 1px 0 rgb(255 255 255 / 12%);
+  font-weight: 800;
+  touch-action: none;
+}
+
+.remote-desktop-touch-right-button:active {
+  color: #03111a;
+  background: #76dcff;
+}
+
+.remote-desktop-stage-placeholder {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  color: #b8cede;
+  text-align: center;
+  pointer-events: none;
+}
+
+.remote-desktop-stage-placeholder button {
+  padding: 8px 18px;
+  color: #04151f;
+  background: linear-gradient(135deg, #7cecff, #57a9ff);
+  border: 1px solid rgb(166 244 255 / 82%);
+  border-radius: 9px;
+  box-shadow: 0 8px 24px rgb(21 151 211 / 24%);
+  font-weight: 800;
+  pointer-events: auto;
+}
+
+.remote-desktop-connection-progress {
+  width: min(480px, 100%);
+  display: grid;
+  gap: 14px;
+  padding: 18px 20px;
+  text-align: left;
+  background: linear-gradient(145deg, rgb(9 28 43 / 88%), rgb(4 15 26 / 92%));
+  border: 1px solid rgb(84 184 230 / 26%);
+  border-radius: 16px;
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 5%), 0 18px 48px rgb(0 0 0 / 28%);
+}
+
+.remote-desktop-connection-progress > strong {
+  color: #e2f6ff;
+  font-size: 14px;
+  letter-spacing: .01em;
+}
+
+.remote-desktop-connection-progress ol {
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 9px;
+  list-style: none;
+}
+
+.remote-desktop-connection-progress li {
+  display: grid;
+  grid-template-columns: 25px minmax(0, 1fr);
+  gap: 10px;
+  align-items: center;
+  color: #688096;
+  font-size: 13px;
+}
+
+.remote-desktop-connection-progress li > span:first-child {
+  width: 25px;
+  height: 25px;
+  display: grid;
+  place-items: center;
+  color: #7890a2;
+  background: rgb(20 48 68 / 72%);
+  border: 1px solid rgb(79 130 159 / 38%);
+  border-radius: 50%;
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.remote-desktop-connection-progress li.is-complete {
+  color: #9bb7c9;
+}
+
+.remote-desktop-connection-progress li.is-complete > span:first-child {
+  color: #06251d;
+  background: #55d6a1;
+  border-color: #89efc4;
+}
+
+.remote-desktop-connection-progress li.is-current {
+  color: #e5f7ff;
+  font-weight: 700;
+}
+
+.remote-desktop-connection-progress li.is-current > span:first-child {
+  color: #031b29;
+  background: #64d9ff;
+  border-color: #a4edff;
+  box-shadow: 0 0 0 4px rgb(74 205 255 / 11%), 0 0 18px rgb(65 196 255 / 30%);
+  animation: remote-desktop-connection-pulse 1.6s ease-in-out infinite;
+}
+
+@keyframes remote-desktop-connection-pulse {
+  50% { box-shadow: 0 0 0 7px rgb(74 205 255 / 5%), 0 0 24px rgb(65 196 255 / 42%); }
+}
+
+.remote-desktop-capture-hint {
+  position: absolute;
+  left: 50%;
+  bottom: 14px;
+  translate: -50% 0;
+  padding: 7px 11px;
+  color: #dfffee;
+  background: rgb(3 41 27 / 88%);
+  border: 1px solid rgb(70 215 141 / 60%);
+  border-radius: 999px;
+  font-size: 12px;
+  pointer-events: none;
+}
+
+.remote-desktop-touch-hint {
+  display: none;
+  position: absolute;
+  right: 10px;
+  top: 10px;
+  max-width: min(72%, 320px);
+  padding: 5px 10px;
+  color: #cfe6f8;
+  background: rgb(5 20 34 / 62%);
+  border: 1px solid rgb(99 201 255 / 22%);
+  border-radius: 999px;
+  backdrop-filter: blur(6px);
+  font-size: 10.5px;
+  letter-spacing: .01em;
+  pointer-events: none;
+}
+
+.remote-desktop-footer {
+  justify-content: space-between;
+  flex-wrap: wrap;
+  border-top: 1px solid rgb(122 178 218 / 14%);
+}
+
+.remote-desktop-file-drawer {
+  position: absolute;
+  z-index: 12;
+  right: 12px;
+  bottom: 58px;
+  width: min(560px, calc(100% - 24px));
+  max-height: min(680px, calc(100% - 108px));
+  overflow: auto;
+  padding: 12px;
+  display: grid;
+  gap: 11px;
+  color: #e7f7ff;
+  background:
+    linear-gradient(145deg, rgb(8 29 45 / 98%), rgb(3 14 24 / 98%)),
+    repeating-linear-gradient(0deg, transparent 0 27px, rgb(87 207 255 / 4%) 28px);
+  border: 1px solid rgb(91 207 255 / 58%);
+  border-radius: 14px;
+  box-shadow: 0 22px 64px rgb(0 0 0 / 64%), inset 0 1px 0 rgb(255 255 255 / 8%), 0 0 30px rgb(31 184 255 / 12%);
+}
+
+.remote-desktop-file-drawer-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.remote-desktop-file-drawer-head > div {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+}
+
+.remote-desktop-file-drawer-head strong {
+  color: #f1fbff;
+  font-size: 15px;
+}
+
+.remote-desktop-file-drawer-head span,
+.remote-desktop-file-compatibility {
+  color: #9ebfd2;
+  font-size: 11px;
+}
+
+.remote-desktop-file-destination {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  padding: 8px;
+  background: rgb(4 17 28 / 72%);
+  border: 1px solid rgb(93 199 239 / 24%);
+  border-radius: 9px;
+}
+
+.remote-desktop-file-destination > span {
+  color: #9ac9df;
+  font-size: 11px;
+}
+
+.remote-desktop-file-destination code {
+  overflow: hidden;
+  color: #8fe7ff;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.remote-desktop-file-drawer button {
+  min-height: 34px;
+  padding: 6px 10px;
+  color: #dff6ff;
+  background: #102d42;
+  border: 1px solid #346b89;
+  border-radius: 8px;
+}
+
+.remote-desktop-file-drawer button:disabled {
+  opacity: .45;
+}
+
+.remote-desktop-file-drop {
+  min-height: 112px !important;
+  display: grid;
+  place-items: center;
+  align-content: center;
+  gap: 3px;
+  color: #bfeeff !important;
+  background: rgb(8 34 52 / 62%) !important;
+  border: 1px dashed rgb(91 208 255 / 58%) !important;
+  transition: border-color .15s ease, background .15s ease, box-shadow .15s ease;
+}
+
+.remote-desktop-file-drop > span {
+  font-size: 26px;
+}
+
+.remote-desktop-file-drop small {
+  color: #91afc1;
+}
+
+.remote-desktop-file-drop.is-active {
+  background: rgb(20 79 104 / 72%) !important;
+  border-color: #75e0ff !important;
+  box-shadow: inset 0 0 28px rgb(61 206 255 / 14%);
+}
+
+.remote-desktop-fetch-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 7px;
+}
+
+.remote-desktop-fetch-row input {
+  min-width: 0;
+  min-height: 34px;
+  padding: 7px 9px;
+  color: #edfaff;
+  background: #05131f;
+  border: 1px solid #2b5872;
+  border-radius: 8px;
+}
+
+.remote-desktop-file-drawer .remote-desktop-transfer-list {
+  max-height: 210px;
+  overflow: auto;
+}
+
+.remote-desktop-directory-picker {
+  position: absolute;
+  z-index: 2;
+  inset: 10px;
+  min-height: 340px;
+  overflow: hidden;
+  background: #06111d;
+  border: 1px solid #3b7898;
+  border-radius: 11px;
+  box-shadow: 0 16px 52px rgb(0 0 0 / 70%);
+}
+
+.remote-desktop-directory-picker > * {
+  width: 100%;
+  height: 100%;
+  min-height: 340px;
+}
+
+.remote-desktop-diagnostics,
+.remote-desktop-files {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+/* Telemetry reads as instrument fields, not a paragraph: each fact is its own
+   chip with a hairline separator, so a glance can find one number. */
+.remote-desktop-diagnostics {
+  gap: 0 14px;
+  row-gap: 6px;
+  color: #8fb4d0;
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: .01em;
+}
+
+.remote-desktop-diagnostics > span {
+  position: relative;
+  white-space: nowrap;
+}
+
+/* Drawn after each field rather than before the next one: when the row wraps,
+   a mark trailing a line reads as continuation, while one leading a line reads
+   as a mistake. */
+.remote-desktop-diagnostics > span:not(:last-child)::after {
+  content: '';
+  position: absolute;
+  right: -7px;
+  top: 50%;
+  width: 1px;
+  height: 11px;
+  translate: 0 -50%;
+  background: rgb(122 178 218 / 22%);
+}
+
+.remote-desktop-files {
+  margin-left: auto;
+}
+
+.remote-desktop-transfer-list {
+  flex: 1 0 100%;
+  display: grid;
+  gap: 6px;
+}
+
+.remote-desktop-transfer-row {
+  display: grid;
+  grid-template-columns: minmax(90px, 1fr) auto minmax(90px, 180px) auto auto;
+  align-items: center;
+  gap: 8px;
+}
+
+.remote-desktop-transfer-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.remote-desktop-transfer-row progress {
+  width: 100%;
+}
+
+.remote-desktop-files input:not([type="file"]) {
+  width: min(290px, 44vw);
+  min-height: 34px;
+  padding: 6px 9px;
+  color: #e8f5ff;
+  background: #06111d;
+  border: 1px solid #294a64;
+  border-radius: 7px;
+}
+
+.controlled-nodes-remote-desktop {
+  color: #062031;
+  background: #69d1ff;
+  border-color: #a3e5ff;
+  font-weight: 700;
+}
+
+@media (max-width: 720px) {
+  .remote-desktop-floating-shell {
+    min-width: 0;
+    min-height: 0;
+    border-radius: 0 !important;
+  }
+
+  .remote-desktop-panel {
+    width: 100%;
+    height: 100%;
+    min-height: 0;
+    border: 0;
+    border-radius: 0;
+  }
+
+  .remote-desktop-header,
+  .remote-desktop-toolbar,
+  .remote-desktop-footer {
+    padding: 8px;
+  }
+
+  .remote-desktop-mobile-keyboard {
+    top: 8px;
+    bottom: auto;
+    width: calc(100% - 16px);
+  }
+
+  .remote-desktop-file-drawer {
+    inset: 92px 8px 8px;
+    width: auto;
+    max-height: none;
+  }
+
+  .remote-desktop-file-destination {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .remote-desktop-file-destination > span {
+    grid-column: 1 / -1;
+  }
+
+  .remote-desktop-presence {
+    display: none;
+  }
+
+  .remote-desktop-maximize {
+    display: none;
+  }
+
+  /* Every control on screen, in full rows. Hiding half of them behind a swipe
+     bought nothing: the picture is limited by the phone's width, so the height
+     a taller toolbar takes comes out of the letterbox bars, never out of the
+     desktop being shown. */
+  .remote-desktop-toolbar {
+    flex-wrap: wrap;
+    gap: 7px;
+    padding: 8px 10px;
+    overflow: visible;
+  }
+
+  /* Groups stretch to close the row, and their segments share that width, so a
+     row ends flush instead of trailing off into ragged space. */
+  .remote-desktop-toolbar > * {
+    flex: 1 1 auto;
+  }
+
+  .remote-desktop-toolbar > * > button {
+    flex: 1 1 auto;
+  }
+
+  .remote-desktop-view-switch {
+    width: auto;
+    overflow: visible;
+  }
+
+  .remote-desktop-display-tabs {
+    max-width: none;
+    flex: 1 1 40%;
+  }
+
+  /* The desktop cap on a display name leaves a hole once the group stretches to
+     close a row. */
+  .remote-desktop-display-tabs button {
+    max-width: none;
+  }
+
+  .remote-desktop-zoom-switch {
+    margin-left: 0;
+  }
+
+  /* The keyboard segment is a glyph, so it must not stretch like a worded one. */
+  .remote-desktop-toolbar .remote-desktop-keyboard-trigger {
+    flex: 0 0 auto;
+  }
+
+  .remote-desktop-toolbar button {
+    min-height: 38px;
+    padding-inline: 10px;
+  }
+
+
+  .remote-desktop-mobile-input-switch {
+    display: flex;
+  }
+
+  .remote-desktop-stage {
+    overflow: hidden;
+  }
+
+  .remote-desktop-footer {
+    max-height: 30vh;
+    padding: 7px 10px;
+    overflow-y: auto;
+  }
+
+  .remote-desktop-diagnostics {
+    gap: 0 12px;
+    row-gap: 5px;
+    font-size: 11px;
+  }
+
+  /* Two columns of fields rather than one stack of half-empty lines, and each
+     field wraps inside itself instead of pushing the row off the screen. */
+  .remote-desktop-diagnostics {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(148px, 1fr));
+    /* Claim the row: as a bare flex item it was sized to less than the phone's
+       width, which left the grid no room for a second column. */
+    flex: 1 1 100%;
+    column-gap: 14px;
+  }
+
+  .remote-desktop-diagnostics > span {
+    white-space: normal;
+    /* A capability string has no break opportunity, and one unbreakable token
+       is enough to collapse the grid back to a single column. */
+    overflow-wrap: anywhere;
+  }
+
+  .remote-desktop-diagnostics > span:not(:last-child)::after {
+    display: none;
+  }
+
+  /* The capability string is the one field with no natural break; give it the
+     whole row instead of letting it stagger down a column. */
+  .remote-desktop-diagnostics > span:last-child {
+    grid-column: 1 / -1;
+  }
+
+  .remote-desktop-files {
+    width: 100%;
+    margin-left: 0;
+  }
+
+  .remote-desktop-files input:not([type="file"]) {
+    flex: 1 1 150px;
+    width: auto;
+  }
+
+  .remote-desktop-transfer-row {
+    grid-template-columns: minmax(80px, 1fr) auto;
+  }
+
+  .remote-desktop-transfer-row progress {
+    grid-column: 1 / -1;
+  }
+}
+
+/* Sideways, the picture is limited by the short edge instead of the long one,
+   so every toolbar row comes straight out of it. Give the height back and let
+   the controls swipe. */
+@media (max-height: 520px) {
+  .remote-desktop-toolbar {
+    flex-wrap: nowrap;
+    gap: 7px;
+    padding: 6px 10px;
+    overflow-x: auto;
+    overscroll-behavior-x: contain;
+    scrollbar-width: none;
+    mask-image: linear-gradient(90deg, transparent 0, #000 14px, #000 calc(100% - 22px), transparent 100%);
+  }
+
+  .remote-desktop-toolbar::-webkit-scrollbar {
+    display: none;
+  }
+
+  .remote-desktop-toolbar > *,
+  .remote-desktop-toolbar > * > button {
+    flex: 0 0 auto;
+  }
+
+  .remote-desktop-toolbar button {
+    min-height: 32px;
+  }
+
+  .remote-desktop-footer {
+    max-height: 22vh;
+  }
+}
+
+@media (pointer: coarse) {
+  .remote-desktop-mobile-input-switch {
+    display: flex;
+  }
+
+  .remote-desktop-touch-hint {
+    display: block;
+  }
+
+  .remote-desktop-touch-right-button {
+    display: block;
+  }
+
+  .remote-desktop-stage.is-controlling {
+    cursor: default;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .remote-desktop-panel,
+  .remote-desktop-panel * {
+    scroll-behavior: auto !important;
+    transition-duration: 0s !important;
+    animation-duration: 0s !important;
   }
 }

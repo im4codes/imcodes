@@ -27,19 +27,30 @@ function newIdempotencyKey(): string {
   return typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : `idem-${Date.now()}-${Math.random()}`;
 }
 
-function formatDate(iso: string | undefined): string {
-  if (!iso) return '';
-  const ts = Date.parse(iso);
-  if (Number.isNaN(ts)) return iso;
+export function formatCodexCreditExpiry(value: string | undefined, locale?: string): string {
+  if (!value) return '';
+  const trimmed = value.trim();
+  const numeric = /^\d{10,13}$/.test(trimmed) ? Number(trimmed) : Number.NaN;
+  const ts = Number.isFinite(numeric)
+    ? (trimmed.length <= 10 ? numeric * 1_000 : numeric)
+    : Date.parse(trimmed);
+  if (Number.isNaN(ts)) return value;
   try {
-    return new Date(ts).toLocaleDateString();
+    return new Intl.DateTimeFormat(locale, {
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+    }).format(new Date(ts));
   } catch {
-    return iso;
+    return new Date(ts).toLocaleString();
   }
 }
 
 export function CodexResetCredits({ wsClient, connected }: { wsClient: WsClient | null; connected: boolean }) {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const [open, setOpen] = useState(false);
   const [loading, setLoading] = useState(false);
   const [credits, setCredits] = useState<CodexResetCredit[] | null>(null);
@@ -192,7 +203,7 @@ export function CodexResetCredits({ wsClient, connected }: { wsClient: WsClient 
             <div key={c.id} class="codex-credits-item" style={{ padding: '4px 0', borderTop: '1px solid #374151' }}>
               <div style={{ color: '#e5e7eb' }}>{c.title || t('codex_credits.item_default_title')}</div>
               <div style={{ color: '#9ca3af', fontSize: 10 }}>
-                {c.status}{c.expiresAt ? ` · ${t('codex_credits.expires', { date: formatDate(c.expiresAt) })}` : ''}
+                {c.status}{c.expiresAt ? ` · ${t('codex_credits.expires', { date: formatCodexCreditExpiry(c.expiresAt, i18n.resolvedLanguage ?? i18n.language) })}` : ''}
               </div>
               {c.status === 'available' && (
                 confirmId === c.id ? (

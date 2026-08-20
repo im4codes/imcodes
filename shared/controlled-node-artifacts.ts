@@ -3,6 +3,8 @@
 // The product ships one downloadable artifact per OS. macOS is a Universal 2
 // binary while the enrolled machine still reports its real runtime architecture.
 
+import { AUTH_IDENTITY_ERRORS } from './auth-identity.js';
+
 export const CONTROLLED_NODE_OS_WIN = 'win' as const;
 export const CONTROLLED_NODE_OS_MAC = 'mac' as const;
 export const CONTROLLED_NODE_OS_LINUX = 'linux' as const;
@@ -88,6 +90,8 @@ export const CONTROLLED_NODE_MINT_ERRORS = {
   EXECUTABLE_NOT_BUILT: 'executable_not_built',
   CANONICAL_SERVER_URL_REQUIRED: 'canonical_server_url_required',
   INVALID_OR_EXPIRED_TICKET: 'invalid_or_expired_ticket',
+  AUTH_IDENTITY_CHANGED: AUTH_IDENTITY_ERRORS.CHANGED,
+  AUTH_IDENTITY_EXPECTATION_REQUIRED: AUTH_IDENTITY_ERRORS.EXPECTATION_REQUIRED,
 } as const;
 
 
@@ -98,7 +102,30 @@ export const CONTROLLED_NODE_ARTIFACT_UPGRADE_PATH = '/api/enroll/v2/node-artifa
 export const CONTROLLED_NODE_ARTIFACT_ASSETS = {
   NODE: 'node',
   COMPUTER_USE_HELPER: 'computer-use-helper',
+  REMOTE_DESKTOP_WORKER: 'remote-desktop-worker',
+  REMOTE_DESKTOP_WORKER_MANIFEST: 'remote-desktop-worker-manifest',
+  REMOTE_DESKTOP_VIRTUAL_DISPLAY: 'remote-desktop-virtual-display',
 } as const;
+
+/**
+ * Whether `asset` is part of the remote-desktop worker bundle.
+ *
+ * This is the one artifact family a normal (FULL) daemon may download as well:
+ * a Windows daemon serves remote control with the exact same native worker a
+ * controlled node uses, so it fetches it through the same artifact route. Every
+ * other asset — above all the controlled-node runtime itself — stays
+ * CONTROLLED-only.
+ */
+export type RemoteDesktopArtifactAsset =
+  | typeof CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER
+  | typeof CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER_MANIFEST
+  | typeof CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_VIRTUAL_DISPLAY;
+
+export function isRemoteDesktopArtifactAsset(asset: string): asset is RemoteDesktopArtifactAsset {
+  return asset === CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER
+    || asset === CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER_MANIFEST
+    || asset === CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_VIRTUAL_DISPLAY;
+}
 
 export const CONTROLLED_NODE_COMPUTER_USE_HELPER_FILENAMES = {
   [CONTROLLED_NODE_OS_WIN]: 'open-computer-use.exe',
@@ -115,6 +142,8 @@ export const CONTROLLED_NODE_ARTIFACT_HEADERS = {
   SIZE_BYTES: 'x-imcodes-node-artifact-size-bytes',
   FILENAME: 'x-imcodes-node-artifact-filename',
   VERSION: 'x-imcodes-node-artifact-version',
+  AUTHENTICODE_SIGNER_SHA256: 'x-imcodes-node-artifact-authenticode-signer-sha256',
+  REMOTE_DESKTOP_PROTOCOL_VERSION: 'x-imcodes-remote-desktop-protocol-version',
 } as const;
 
 export function controlledNodeArtifactKey(os: ControlledNodeOs, arch: ControlledNodeArtifactArch): string {

@@ -76,6 +76,7 @@ export const MEMORY_MCP_PROVIDER_ID = {
   CURSOR_HEADLESS: 'cursor-headless',
   OPENCODE_SDK: 'opencode-sdk',
   QWEN: 'qwen',
+  DEEPSEEK_HARNESS: 'deepseek-harness',
 } as const;
 
 export const MEMORY_MCP_PROVIDER_IDS = [
@@ -89,6 +90,7 @@ export const MEMORY_MCP_PROVIDER_IDS = [
   MEMORY_MCP_PROVIDER_ID.CURSOR_HEADLESS,
   MEMORY_MCP_PROVIDER_ID.OPENCODE_SDK,
   MEMORY_MCP_PROVIDER_ID.QWEN,
+  MEMORY_MCP_PROVIDER_ID.DEEPSEEK_HARNESS,
 ] as const;
 
 export type MemoryMcpProviderId = (typeof MEMORY_MCP_PROVIDER_IDS)[number];

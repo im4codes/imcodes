@@ -19,6 +19,11 @@ import {
   type EnrollmentTrailerRange,
 } from '../../shared/remote-exec.js';
 import {
+  inspectWindowsAuthenticodeEnrollmentContainer,
+  WINDOWS_AUTHENTICODE_ENROLLMENT_OVERHEAD_MAX,
+  type WindowsAuthenticodeEnrollmentRestore,
+} from '../../shared/windows-authenticode-enrollment.js';
+import {
   applyWindowsAclCommands,
   windowsCredentialDir,
   windowsExecutableFileAclCommands,
@@ -72,7 +77,11 @@ export interface VerifiedEnrollmentSource {
   statSize(): Promise<number>;
   readExactly(position: number, length: number): Promise<Buffer>;
   readEnrollmentBlobWithRange(): Promise<EnrollmentTrailerRange | null>;
-  stageTrailerFreeExecutable(destPath: string, trailerStart: number): Promise<StagedExecutableReceipt>;
+  stageTrailerFreeExecutable(
+    destPath: string,
+    trailerStart: number,
+    windowsAuthenticode?: WindowsAuthenticodeEnrollmentRestore,
+  ): Promise<StagedExecutableReceipt>;
   cleanupEnrollmentSource(trailerStart: number, trailerLength: number): Promise<SourceCleanupStatus>;
   close(): Promise<void>;
 }
@@ -217,17 +226,43 @@ class VerifiedEnrollmentSourceImpl implements VerifiedEnrollmentSource {
 
   async readEnrollmentBlobWithRange(): Promise<EnrollmentTrailerRange | null> {
     const size = await this.statSize();
-    const tailFileOffset = Math.max(0, size - ENROLLMENT_MAX_TRAILER_BYTES);
+    const tailFileOffset = Math.max(
+      0,
+      size - ENROLLMENT_MAX_TRAILER_BYTES - WINDOWS_AUTHENTICODE_ENROLLMENT_OVERHEAD_MAX,
+    );
     const length = size - tailFileOffset;
     if (length <= 0) return null;
     const buf = await this.readExactly(tailFileOffset, length);
-    return decodeEnrollmentTrailerWithRange(buf, tailFileOffset);
+    const decoded = decodeEnrollmentTrailerWithRange(buf, tailFileOffset);
+    if (!decoded || process.platform !== 'win32') return decoded;
+    const header = await this.readExactly(0, Math.min(size, 4096));
+    const restore = inspectWindowsAuthenticodeEnrollmentContainer(
+      header,
+      size,
+      buf,
+      tailFileOffset,
+      decoded.trailerStart,
+      decoded.trailerLength,
+    );
+    if (!restore) throw new Error('windows enrollment package is not Authenticode-preserving');
+    return { ...decoded, windowsAuthenticode: restore };
   }
 
-  async stageTrailerFreeExecutable(destPath: string, trailerStart: number): Promise<StagedExecutableReceipt> {
+  async stageTrailerFreeExecutable(
+    destPath: string,
+    trailerStart: number,
+    windowsAuthenticode?: WindowsAuthenticodeEnrollmentRestore,
+  ): Promise<StagedExecutableReceipt> {
     if (trailerStart <= 0) throw new Error('invalid_trailer_start');
     const currentSize = await this.statSize();
     if (trailerStart > currentSize) throw new Error('trailer_start_exceeds_source_size');
+    const stableSize = windowsAuthenticode?.signedArtifactSize ?? trailerStart;
+    if (stableSize <= 0 || stableSize > trailerStart) throw new Error('invalid_stable_executable_size');
+    if (windowsAuthenticode
+      && (windowsAuthenticode.sizeFieldOffset < 0
+        || windowsAuthenticode.sizeFieldOffset + 4 > stableSize)) {
+      throw new Error('invalid_windows_authenticode_restore_offset');
+    }
     await this.stagingFs.mkdir(dirname(destPath), { recursive: true, mode: 0o700 });
     if (process.platform !== 'win32') await this.stagingFs.chmod(dirname(destPath), 0o700);
     const temp = `${destPath}.${process.pid}.${randomUUID()}.tmp`;
@@ -238,9 +273,19 @@ class VerifiedEnrollmentSourceImpl implements VerifiedEnrollmentSource {
     try {
       dst = await this.stagingFs.openDestination(temp, 'wx', 0o700);
       const chunkSize = 64 * 1024;
-      while (written < trailerStart) {
-        const toRead = Math.min(chunkSize, trailerStart - written);
+      while (written < stableSize) {
+        const toRead = Math.min(chunkSize, stableSize - written);
         const buf = await this.readExactly(written, toRead);
+        if (windowsAuthenticode) {
+          const patchOffset = windowsAuthenticode.sizeFieldOffset;
+          const patch = Buffer.alloc(4);
+          patch.writeUInt32LE(windowsAuthenticode.originalCertificateTableSize, 0);
+          const overlapStart = Math.max(written, patchOffset);
+          const overlapEnd = Math.min(written + buf.length, patchOffset + patch.length);
+          if (overlapStart < overlapEnd) {
+            patch.copy(buf, overlapStart - written, overlapStart - patchOffset, overlapEnd - patchOffset);
+          }
+        }
         await writeExactly(dst, buf, written);
         hash.update(buf);
         written += buf.length;
@@ -266,7 +311,7 @@ class VerifiedEnrollmentSourceImpl implements VerifiedEnrollmentSource {
     if (!stagedStat.isFile() || stagedStat.isSymbolicLink()) throw new Error('staged_executable_not_regular');
     return {
       path: destPath,
-      size: trailerStart,
+      size: stableSize,
       sha256: hash.digest('hex'),
       sourceIdentity: this.identity,
       stagedIdentity: fileIdentityFromStat(stagedStat),

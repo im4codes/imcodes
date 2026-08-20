@@ -1,0 +1,208 @@
+import("//webrtc.gni")
+import("libwebrtc-sdk.gni")
+
+# This directory is copied verbatim into a pinned libwebrtc checkout at
+# //third_party/imcodes_remote_desktop by build-worker.ps1.  The worker links
+# libwebrtc and Windows system media APIs into one immutable executable; it
+# never downloads executable code or codecs at runtime.
+rtc_executable("imcodes_remote_desktop_worker") {
+  configs += [ "//build/config/win:windowed" ]
+  sources = [
+    "display_capture.cc",
+    "display_capture.h",
+    "display_preferences.cc",
+    "display_preferences.h",
+    "input_injector.cc",
+    "input_injector.h",
+    "ice_candidate_queue.cc",
+    "ice_candidate_queue.h",
+    "json_protocol.cc",
+    "json_protocol.h",
+    "local_indicator.cc",
+    "local_indicator.h",
+    "mf_h264_encoder.cc",
+    "mf_h264_encoder.h",
+    "peer_session.cc",
+    "peer_session.h",
+    "pipe_ipc.cc",
+    "pipe_ipc.h",
+    "quality_ladder.cc",
+    "quality_ladder.h",
+    "unlock_secret.cc",
+    "unlock_secret.h",
+    "worker_policy.cc",
+    "worker_policy.h",
+    "virtual_display_controller.cc",
+    "virtual_display_controller.h",
+    "worker_main.cc",
+  ]
+
+  defines = imcodes_remote_desktop_defines
+  deps = imcodes_remote_desktop_deps
+
+  libs = [
+    "d3d11.lib",
+    "dxgi.lib",
+    "gdi32.lib",
+    "mf.lib",
+    "mfplat.lib",
+    "mfuuid.lib",
+    "ole32.lib",
+    "oleaut32.lib",
+    "propsys.lib",
+    "advapi32.lib",
+    "crypt32.lib",
+    "shcore.lib",
+    "shell32.lib",
+    "user32.lib",
+    "swdevice.lib",
+    "wtsapi32.lib",
+    "wmcodecdspuuid.lib",
+  ]
+}
+
+if (rtc_include_tests) {
+  rtc_test("display_capture_unittests") {
+    sources = [
+      "display_capture.cc",
+      "display_capture.h",
+      "display_capture_unittest.cc",
+      "worker_policy.cc",
+      "worker_policy.h",
+    ]
+    defines = [
+      "NOMINMAX",
+      "WIN32_LEAN_AND_MEAN",
+    ]
+    deps = [
+      "//api:make_ref_counted",
+      "//api:media_stream_interface",
+      "//api/video:video_frame",
+      "//media:rtc_media_base",
+      "//pc:video_track_source",
+      "//rtc_base:logging",
+      "//system_wrappers",
+      "//test:test_support",
+      "//third_party/jsoncpp",
+      "//third_party/libyuv",
+    ]
+    libs = [
+      "d3d11.lib",
+      "dxgi.lib",
+      "gdi32.lib",
+      "shcore.lib",
+      "user32.lib",
+      "wtsapi32.lib",
+    ]
+  }
+
+  rtc_test("quality_ladder_unittests") {
+    sources = [
+      "quality_ladder.cc",
+      "quality_ladder.h",
+      "quality_ladder_unittest.cc",
+    ]
+    deps = [ "//test:test_support" ]
+  }
+
+  rtc_test("input_injector_unittests") {
+    sources = [
+      "display_capture.h",
+      "input_injector.cc",
+      "input_injector.h",
+      "input_injector_unittest.cc",
+    ]
+    defines = [
+      "NOMINMAX",
+      "WIN32_LEAN_AND_MEAN",
+    ]
+    deps = [ "//test:test_support" ]
+    libs = [ "user32.lib" ]
+  }
+
+  rtc_test("json_protocol_unittests") {
+    sources = [
+      "json_protocol.cc",
+      "json_protocol.h",
+      "json_protocol_unittest.cc",
+    ]
+    deps = [
+      "//test:test_support",
+      "//third_party/jsoncpp",
+    ]
+  }
+
+  rtc_test("pipe_ipc_unittests") {
+    sources = [
+      "pipe_ipc.cc",
+      "pipe_ipc.h",
+      "pipe_ipc_unittest.cc",
+    ]
+    defines = [
+      "NOMINMAX",
+      "WIN32_LEAN_AND_MEAN",
+    ]
+    deps = [ "//test:test_support" ]
+  }
+
+  rtc_test("ice_candidate_queue_unittests") {
+    sources = [
+      "ice_candidate_queue.cc",
+      "ice_candidate_queue.h",
+      "ice_candidate_queue_unittest.cc",
+    ]
+    deps = [ "//test:test_support" ]
+  }
+
+  rtc_test("worker_policy_unittests") {
+    sources = [
+      "worker_policy.cc",
+      "worker_policy.h",
+      "worker_policy_unittest.cc",
+    ]
+    defines = [
+      "NOMINMAX",
+      "WIN32_LEAN_AND_MEAN",
+    ]
+    deps = [ "//test:test_support" ]
+    libs = [ "dxgi.lib", "wtsapi32.lib" ]
+  }
+
+  rtc_test("mf_h264_encoder_unittests") {
+    sources = [
+      "mf_h264_encoder.cc",
+      "mf_h264_encoder.h",
+      "mf_h264_encoder_unittest.cc",
+      "quality_ladder.cc",
+      "quality_ladder.h",
+      "worker_policy.cc",
+      "worker_policy.h",
+    ]
+    defines = [
+      "IMCODES_REMOTE_DESKTOP_ENCODER_BENCHMARKS",
+      "NOMINMAX",
+      "WIN32_LEAN_AND_MEAN",
+    ]
+    deps = [
+      "//api/environment",
+      "//api:make_ref_counted",
+      "//api/video:encoded_image",
+      "//api/video:video_frame",
+      "//api/video_codecs:scalability_mode",
+      "//api/video_codecs:video_codecs_api",
+      "//modules/video_coding:video_codec_interface",
+      "//rtc_base:logging",
+      "//test:test_support",
+      "//third_party/jsoncpp",
+    ]
+    libs = [
+      "mf.lib",
+      "mfplat.lib",
+      "mfuuid.lib",
+      "ole32.lib",
+      "oleaut32.lib",
+      "wmcodecdspuuid.lib",
+      "wtsapi32.lib",
+    ]
+  }
+}

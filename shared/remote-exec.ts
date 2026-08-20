@@ -1,5 +1,7 @@
 import { DAEMON_MSG } from './daemon-events.js';
 import { DAEMON_COMMAND_TYPES } from './daemon-command-types.js';
+import type { ControlledNodeCapability } from './controlled-node-capabilities.js';
+import type { WindowsAuthenticodeEnrollmentRestore } from './windows-authenticode-enrollment.js';
 
 // Remote-exec / controlled-node protocol shared by daemon (source + controlled
 // node), server relay, and the exe build pipeline.
@@ -33,9 +35,11 @@ export function isNodeRole(value: unknown): value is NodeRole {
 export const REMOTE_EXEC_SHELLS = ['powershell', 'cmd', 'bash', 'sh'] as const;
 export type RemoteExecShell = (typeof REMOTE_EXEC_SHELLS)[number];
 
-export const REMOTE_EXEC_DEFAULT_TIMEOUT_MS = 120_000;
+/** Default one-shot command timeout: 15 minutes. */
+export const REMOTE_EXEC_DEFAULT_TIMEOUT_MS = 900_000;
 export const REMOTE_EXEC_MIN_TIMEOUT_MS = 1_000;
-export const REMOTE_EXEC_MAX_TIMEOUT_MS = 600_000;
+/** Hard ceiling accepted by every remote-exec boundary: 1 hour. */
+export const REMOTE_EXEC_MAX_TIMEOUT_MS = 3_600_000;
 /** Hard cap on captured stdout/stderr each; excess is truncated (flagged). */
 export const REMOTE_EXEC_MAX_OUTPUT_BYTES = 1_000_000;
 /** Per-frame stdout/stderr payload cap; large process chunks are split before WS dispatch. */
@@ -116,6 +120,29 @@ export interface MachineSummary {
   online: boolean;
   nodeRole: NodeRole;
   lastSeenMs?: number;
+  /** Optional for compatibility with owner-only Servers released before machine sharing. */
+  accessRole?: MachineAccessRole;
+  /** Optional for pre-capability nodes and old Servers. Exact versions only. */
+  capabilities?: ControlledNodeCapability[];
+  /**
+   * The node's own reported release, echoed back only when it parses as an
+   * IM.codes version. Absent for a node that has never reported one.
+   */
+  daemonVersion?: string;
+  /** Present only when that reported release is older than the Server's target. */
+  updateAvailable?: boolean;
+  /**
+   * Present only when the node confirmed it holds a sign-in secret for auto
+   * unlock. The secret itself is never readable from anywhere.
+   */
+  autoUnlockConfigured?: boolean;
+}
+
+export const MACHINE_ACCESS_ROLES = ['owner', 'viewer', 'participant'] as const;
+export type MachineAccessRole = (typeof MACHINE_ACCESS_ROLES)[number];
+
+export function isMachineAccessRole(value: unknown): value is MachineAccessRole {
+  return typeof value === 'string' && (MACHINE_ACCESS_ROLES as readonly string[]).includes(value);
 }
 
 export function canonicalMachineOs(value: unknown): EnrollmentOs | undefined {
@@ -188,6 +215,8 @@ export interface EnrollmentTrailerRange {
   trailerStart: number;
   /** Trailer byte length (JSON body + footer). */
   trailerLength: number;
+  /** Present for signed Windows downloads personalized inside the PE certificate table. */
+  windowsAuthenticode?: WindowsAuthenticodeEnrollmentRestore;
 }
 
 /** Validate a normalized lowercase hex sha256 nodeTokenHash. */

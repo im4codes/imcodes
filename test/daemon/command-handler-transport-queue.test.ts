@@ -6,6 +6,10 @@ import { COMMAND_ACK_ERROR_DUPLICATE_COMMAND_ID } from '../../shared/ack-protoco
 import { TRANSPORT_SESSION_AGENT_TYPES } from '../../shared/agent-types.js';
 import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
 import {
+  TRANSPORT_QUEUE_APPEND_MAX_ENTRIES,
+  TRANSPORT_QUEUE_COMMANDS,
+} from '../../shared/transport-queue-types.js';
+import {
   SESSION_CONTROL_TIMELINE_REASON_USER_CANCEL,
   SESSION_CONTROL_TIMELINE_STATE_STOPPING,
 } from '../../shared/session-control-commands.js';
@@ -80,6 +84,7 @@ const {
   getProviderMock,
   ensureProviderConnectedMock,
   getPresetModelCatalogMock,
+  lookupAttachmentMock,
 } = vi.hoisted(() => ({
   getSessionMock: vi.fn(),
   upsertSessionMock: vi.fn(),
@@ -132,6 +137,7 @@ const {
   getProviderMock: vi.fn(),
   ensureProviderConnectedMock: vi.fn(),
   getPresetModelCatalogMock: vi.fn(),
+  lookupAttachmentMock: vi.fn(() => undefined),
 }));
 
 vi.mock('../../src/store/session-store.js', () => ({
@@ -239,7 +245,7 @@ vi.mock('../../src/daemon/file-transfer-handler.js', () => ({
   createProjectFileHandle: vi.fn(),
   createProjectFileHandleFromValidatedPath: vi.fn(),
   tryCreateProjectFileHandle: vi.fn(),
-  lookupAttachment: vi.fn(() => undefined),
+  lookupAttachment: lookupAttachmentMock,
 }));
 
 vi.mock('../../src/daemon/preview-relay.js', () => ({
@@ -505,6 +511,8 @@ describe('handleWebCommand transport queue behavior', () => {
     getProviderMock.mockReset();
     ensureProviderConnectedMock.mockReset();
     getPresetModelCatalogMock.mockReset();
+    lookupAttachmentMock.mockReset();
+    lookupAttachmentMock.mockReturnValue(undefined);
     __resetTransportListModelsCacheForTests();
     clearAllTransportQueueRevisions();
     resetTransportQueueStoreForTests();
@@ -1754,6 +1762,73 @@ describe('handleWebCommand transport queue behavior', () => {
       expect.objectContaining({ state: 'queued' }),
       expect.anything(),
     );
+  });
+
+  it('injects a numbered temporary-upload reminder for the agent without changing the transport timeline', async () => {
+    const send = vi.fn(() => 'sent');
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'route-transport',
+      send,
+      pendingCount: 0,
+    });
+    lookupAttachmentMock.mockImplementation((daemonPath: string) => {
+      if (daemonPath !== '/tmp/a.png' && daemonPath !== '/tmp/b.pdf') return undefined;
+      return {
+        id: daemonPath,
+        daemonPath,
+        source: 'upload',
+        expiresAt: Date.now() + 60_000,
+      };
+    });
+    const text = '#1:(/tmp/a.png) #2:(/tmp/b.pdf) compare #1 and #2';
+
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_transport_brain',
+      text,
+      commandId: 'cmd-upload-retention-transport',
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(send).toHaveBeenCalledWith(
+      text,
+      'cmd-upload-retention-transport',
+      undefined,
+      '#1, #2 expire in 24h. Copy only if necessary.',
+    );
+    const userMessage = emitMock.mock.calls.find(([session, type, payload]) => (
+      session === 'deck_transport_brain'
+      && type === 'user.message'
+      && (payload as { commandId?: string } | undefined)?.commandId === 'cmd-upload-retention-transport'
+    ));
+    expect(userMessage?.[2]).toMatchObject({ text });
+    expect(JSON.stringify(userMessage?.[2] ?? '')).not.toContain('Copy only if necessary');
+  });
+
+  it('injects no upload reminder when numbered paths are not live registered uploads', async () => {
+    const send = vi.fn(() => 'sent');
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'route-transport',
+      send,
+      pendingCount: 0,
+    });
+    lookupAttachmentMock.mockImplementation((daemonPath: string) => ({
+      id: daemonPath,
+      daemonPath,
+      source: daemonPath.includes('local') ? 'local' : 'upload',
+      expiresAt: daemonPath.includes('expired') ? 0 : Date.now() + 60_000,
+    }));
+    const text = '#1:(/tmp/local.txt) #2:(/tmp/expired.txt) inspect these';
+
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_transport_brain',
+      text,
+      commandId: 'cmd-no-upload-retention',
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(send).toHaveBeenCalledWith(text, 'cmd-no-upload-retention');
   });
 
   it('emits ordinary send ack synchronously before the first async delivery boundary', async () => {
@@ -3126,6 +3201,49 @@ describe('handleWebCommand transport queue behavior', () => {
     expect(JSON.stringify(entry?.aliasAudit)).not.toContain('read replica only');
   });
 
+  it('carries the numbered-upload reminder through the offline resend queue', async () => {
+    const { clearAllResend, getResendEntries } = await import('../../src/daemon/transport-resend-queue.js');
+    clearAllResend();
+    getSessionMock.mockReturnValue({
+      name: 'deck_transport_brain',
+      projectName: 'transport',
+      role: 'brain',
+      agentType: 'claude-code-sdk',
+      runtimeType: 'transport',
+      providerId: 'claude-code-sdk',
+      state: 'idle',
+    });
+    getTransportRuntimeMock.mockReturnValue(undefined);
+    lookupAttachmentMock.mockReturnValue({
+      id: 'offline.png',
+      daemonPath: '/tmp/offline.png',
+      source: 'upload',
+      expiresAt: Date.now() + 60_000,
+    });
+    const text = '#1:(/tmp/offline.png) inspect #1';
+
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_transport_brain',
+      text,
+      commandId: 'cmd-offline-upload-retention',
+    }, serverLink as any);
+    await flushAsync();
+
+    const entry = getResendEntries('deck_transport_brain')
+      .find((candidate) => candidate.commandId === 'cmd-offline-upload-retention');
+    expect(entry).toMatchObject({
+      text,
+      messagePreamble: '#1 expires in 24h. Copy only if necessary.',
+    });
+    const userMessages = emitMock.mock.calls.filter(([session, type, payload]) => (
+      session === 'deck_transport_brain'
+      && type === 'user.message'
+      && (payload as { commandId?: string } | undefined)?.commandId === 'cmd-offline-upload-retention'
+    ));
+    expect(userMessages).toHaveLength(0);
+  });
+
   it('carries the anchor on the missing-providerSessionId branch too', async () => {
     // The no-runtime branch had a test; this one did not, so deleting its
     // anchor wiring would not have gone red.
@@ -4048,6 +4166,212 @@ describe('handleWebCommand transport queue behavior', () => {
     );
     expect(stateCall?.[2]).not.toHaveProperty('pendingCount');
     expect(stateCall?.[2]).not.toHaveProperty('pendingMessages');
+  });
+
+  it('appends selected queued messages to the active turn and emits authoritative delivery facts', async () => {
+    const store = getTransportQueueStore();
+    store.enqueue({
+      sessionName: 'deck_transport_brain',
+      clientMessageId: 'cmd-append-1',
+      text: 'append now',
+      now: 100,
+    });
+    store.enqueue({
+      sessionName: 'deck_transport_brain',
+      clientMessageId: 'cmd-append-2',
+      text: 'leave queued',
+      now: 101,
+    });
+    const appendPendingMessagesToActiveTurn = vi.fn(async (ids: string[], notificationId: string) => {
+      const finalized = store.finalizeSentBatch('deck_transport_brain', ids, notificationId, 200);
+      return {
+        status: 'delivered' as const,
+        entries: [{ clientMessageId: 'cmd-append-1', text: 'append now' }],
+        queueSnapshot: finalized.snapshot,
+        deliveryFacts: finalized.deliveryFacts,
+      };
+    });
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'route-transport',
+      appendPendingMessagesToActiveTurn,
+      sending: true,
+      pendingCount: 2,
+      pendingMessages: ['append now', 'leave queued'],
+      pendingEntries: [
+        { clientMessageId: 'cmd-append-1', text: 'append now' },
+        { clientMessageId: 'cmd-append-2', text: 'leave queued' },
+      ],
+    });
+
+    handleWebCommand({
+      type: TRANSPORT_QUEUE_COMMANDS.APPEND_MESSAGES,
+      sessionName: 'deck_transport_brain',
+      clientMessageIds: ['cmd-append-1'],
+      commandId: 'cmd-append-action',
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(appendPendingMessagesToActiveTurn).toHaveBeenCalledWith(['cmd-append-1'], 'cmd-append-action');
+    expect(removeQueuedTaskIntentMock).toHaveBeenCalledWith('deck_transport_brain', 'cmd-append-1');
+    expect(emitMock).toHaveBeenCalledWith(
+      'deck_transport_brain',
+      'user.message',
+      expect.objectContaining({
+        text: 'append now',
+        clientMessageId: 'cmd-append-1',
+        queueAppended: true,
+        pendingMessageVersion: expect.any(Number),
+      }),
+      expect.objectContaining({ eventId: 'transport-user:cmd-append-1' }),
+    );
+    expect(emitMock).toHaveBeenCalledWith(
+      'deck_transport_brain',
+      'transport.queue.delivery',
+      expect.objectContaining({ clientMessageId: 'cmd-append-1', deliveryFrameId: 'cmd-append-action' }),
+      expect.any(Object),
+    );
+    expect(emitMock).toHaveBeenCalledWith(
+      'deck_transport_brain',
+      'session.state',
+      expect.objectContaining({
+        state: 'queued',
+        pendingMessageEntries: [expect.objectContaining({ clientMessageId: 'cmd-append-2' })],
+      }),
+      expect.any(Object),
+    );
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'command.ack',
+      commandId: 'cmd-append-action',
+      status: 'accepted',
+    }));
+  });
+
+  it('waits for an optimistic queue row even when append arrives before its matching send', async () => {
+    enablePreferenceFeature();
+    const setTimeoutSpy = vi.spyOn(globalThis, 'setTimeout');
+    const clearTimeoutSpy = vi.spyOn(globalThis, 'clearTimeout');
+    let releasePreferenceLoad!: (value: unknown[]) => void;
+    listContextObservationsMock.mockImplementationOnce(() => new Promise((resolve) => {
+      releasePreferenceLoad = resolve;
+    }) as any);
+
+    const store = getTransportQueueStore();
+    let queued = false;
+    const transportSend = vi.fn((text: string, clientMessageId: string) => {
+      store.enqueue({
+        sessionName: 'deck_transport_brain',
+        clientMessageId,
+        text,
+        now: 100,
+      });
+      queued = true;
+      return 'queued' as const;
+    });
+    const appendPendingMessagesToActiveTurn = vi.fn(async (ids: string[], notificationId: string) => {
+      if (!queued) return { status: 'not_found' as const };
+      const finalized = store.finalizeSentBatch('deck_transport_brain', ids, notificationId, 200);
+      return {
+        status: 'delivered' as const,
+        entries: [{ clientMessageId: 'cmd-sync-race', text: 'append after registration' }],
+        queueSnapshot: finalized.snapshot,
+        deliveryFacts: finalized.deliveryFacts,
+      };
+    });
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'route-transport',
+      send: transportSend,
+      appendPendingMessagesToActiveTurn,
+      sending: true,
+      get pendingCount() { return queued ? 1 : 0; },
+      get pendingMessages() { return queued ? ['append after registration'] : []; },
+      get pendingEntries() {
+        return queued
+          ? [{ clientMessageId: 'cmd-sync-race', text: 'append after registration' }]
+          : [];
+      },
+    });
+
+    // Exercise the harder ordering: the append frame reaches the daemon before
+    // session.send has installed its in-flight barrier or registered the row.
+    handleWebCommand({
+      type: TRANSPORT_QUEUE_COMMANDS.APPEND_MESSAGES,
+      sessionName: 'deck_transport_brain',
+      clientMessageIds: ['cmd-sync-race'],
+      commandId: 'cmd-sync-race-append',
+    }, serverLink as any);
+    handleWebCommand({
+      type: 'session.send',
+      sessionName: 'deck_transport_brain',
+      text: 'append after registration',
+      commandId: 'cmd-sync-race',
+      origin: 'user_keyboard',
+      userId: 'user-1',
+    }, serverLink as any);
+
+    await flushAsync();
+    expect(transportSend).not.toHaveBeenCalled();
+    expect(appendPendingMessagesToActiveTurn).not.toHaveBeenCalled();
+
+    releasePreferenceLoad([]);
+    await waitForAsync(() => serverLink.send.mock.calls.some(([payload]) => (
+      payload?.type === 'command.ack'
+      && payload?.commandId === 'cmd-sync-race-append'
+      && payload?.status === 'accepted'
+    )));
+
+    expect(transportSend).toHaveBeenCalledOnce();
+    expect(appendPendingMessagesToActiveTurn).toHaveBeenCalledOnce();
+    expect(appendPendingMessagesToActiveTurn).toHaveBeenCalledWith(
+      ['cmd-sync-race'],
+      'cmd-sync-race-append',
+    );
+    expect(serverLink.send).not.toHaveBeenCalledWith(expect.objectContaining({
+      commandId: 'cmd-sync-race-append',
+      status: 'error',
+      error: 'Queued message not found',
+    }));
+
+    const pollTimerHandles = setTimeoutSpy.mock.calls.flatMap((call, index) => (
+      call[1] === 25 // TRANSPORT_QUEUE_SEND_SYNC_POLL_MS
+        ? [setTimeoutSpy.mock.results[index]?.value]
+        : []
+    )).filter(Boolean);
+    const clearedHandles = new Set(clearTimeoutSpy.mock.calls.map(([handle]) => handle));
+    setTimeoutSpy.mockRestore();
+    clearTimeoutSpy.mockRestore();
+    expect(pollTimerHandles.length).toBeGreaterThan(0);
+    expect(pollTimerHandles.every((handle) => clearedHandles.has(handle))).toBe(true);
+  });
+
+  it('rejects an oversized active-turn append before invoking the runtime', async () => {
+    const appendPendingMessagesToActiveTurn = vi.fn();
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'route-transport',
+      appendPendingMessagesToActiveTurn,
+      sending: true,
+      pendingCount: 1,
+      pendingMessages: ['queued'],
+      pendingEntries: [{ clientMessageId: 'queued-1', text: 'queued' }],
+    });
+
+    handleWebCommand({
+      type: TRANSPORT_QUEUE_COMMANDS.APPEND_MESSAGES,
+      sessionName: 'deck_transport_brain',
+      clientMessageIds: Array.from(
+        { length: TRANSPORT_QUEUE_APPEND_MAX_ENTRIES + 1 },
+        (_, index) => `queued-${index}`,
+      ),
+      commandId: 'cmd-append-oversized',
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(appendPendingMessagesToActiveTurn).not.toHaveBeenCalled();
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'command.ack',
+      commandId: 'cmd-append-oversized',
+      status: 'error',
+      error: 'Invalid queued message selection',
+    }));
   });
 
   it('deduplicates concurrent session.restart requests for the same transport session', async () => {

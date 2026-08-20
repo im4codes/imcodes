@@ -42,6 +42,7 @@ export const ALIAS_EXPANSION_MODE_BY_AGENT: Record<SessionAgentType, AliasExpans
   'qwen': 'legend',
   'openclaw': 'legend',
   'kimi-sdk': 'legend',
+  'deepseek-harness': 'legend',
   'shell': 'inline',
   'script': 'inline',
 };

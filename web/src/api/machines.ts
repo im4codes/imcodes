@@ -9,7 +9,13 @@
  * machines are included for display; the picker renders them non-selectable.
  */
 import {
+  FILE_TRANSFER_DIRECTORY_MAX_ENTRIES,
+  FILE_TRANSFER_PATH_MAX_BYTES,
+  type FileDirectoryEntry,
+} from '@shared/transport/file-transfer.js';
+import {
   compareControlledNodeArtifactPairs,
+  CONTROLLED_NODE_MINT_ERRORS,
   controlledNodeArtifactKey,
   isCanonicalControlledNodePair,
   isControlledNodeArtifactArch,
@@ -20,11 +26,47 @@ import {
   type ControlledNodeOs,
 } from '@shared/controlled-node-artifacts.js';
 import { MACHINE_API_PATH } from '@shared/machine-reference.js';
-import { apiFetch, getApiBaseUrl } from '../api.js';
+import { REMOTE_DESKTOP_CAPABILITY } from '@shared/remote-desktop.js';
+import { isMachineAccessRole, type MachineAccessRole } from '@shared/remote-exec.js';
+import {
+  validateControlledNodeCapabilities,
+  type ControlledNodeCapability,
+} from '@shared/controlled-node-capabilities.js';
+import {
+  apiFetch,
+  getApiBaseUrl,
+  getExpectedUserId,
+  type AttachmentRefResponse,
+} from '../api.js';
 
 export type { ControlledNodeArtifactArch, ControlledNodeOs };
 
 /** One controllable machine as shown in the composer picker. */
+/**
+ * A synthetic machine entry for the daemon's own host.
+ *
+ * The daemon is not a controlled node, so it has no row in the machine list —
+ * but `RemoteDesktopPanel` is keyed by `serverId` and needs a `MachineListItem`.
+ * The fields the panel gates on are asserted here because the daemon already
+ * proved them by advertising the remote-desktop capability, which it only does
+ * on Windows x64 with a verified worker installed.
+ */
+export function daemonRemoteDesktopMachine(
+  serverId: string,
+  displayName: string | null,
+): MachineListItem {
+  return {
+    serverId,
+    refName: serverId,
+    displayName: displayName ?? serverId,
+    os: 'win',
+    online: true,
+    execEnabled: true,
+    accessRole: 'owner',
+    capabilities: [REMOTE_DESKTOP_CAPABILITY],
+  };
+}
+
 export interface MachineListItem {
   serverId: string;
   refName: string;
@@ -32,6 +74,20 @@ export interface MachineListItem {
   os?: string;
   online: boolean;
   execEnabled: boolean;
+  accessRole?: MachineAccessRole;
+  capabilities?: ControlledNodeCapability[];
+  /** The node's own reported release. Absent on old Servers and unreported nodes. */
+  daemonVersion?: string;
+  /** Server-computed: that release is older than the Server's target. */
+  updateAvailable?: boolean;
+  /** The node holds a sign-in secret for auto unlock. Never the secret itself. */
+  autoUnlockConfigured?: boolean;
+  /**
+   * The daemon this node shares a machine with, when it was enrolled to give
+   * that daemon login-screen control. The remote-control button on that daemon
+   * steers here rather than opening a second session on the same desktop.
+   */
+  hostServerId?: string;
 }
 
 /** Identifies one downloadable artifact in the canonical OS+arch matrix. */
@@ -63,6 +119,53 @@ export interface ControlledNodeExecutableTicket {
   sizeBytes: number;
   sha256: string;
   expiresAt: number;
+  ownerUserId: string;
+}
+
+export async function createMachineFileHandle(
+  serverId: string,
+  path: string,
+  signal?: AbortSignal,
+): Promise<AttachmentRefResponse> {
+  const result = await apiFetch<{ ok: boolean; attachment: AttachmentRefResponse }>(
+    `/api/server/${encodeURIComponent(serverId)}/machine-file-handle`,
+    { method: 'POST', body: JSON.stringify({ path }), signal },
+  );
+  if (!result.ok || !result.attachment) throw new Error('machine_file_handle_failed');
+  return result.attachment;
+}
+
+export interface MachineDirectoryList {
+  resolvedPath: string;
+  entries: FileDirectoryEntry[];
+}
+
+export async function listMachineDirectories(
+  serverId: string,
+  path: string,
+  signal?: AbortSignal,
+): Promise<MachineDirectoryList> {
+  const result = await apiFetch<{ ok?: boolean; resolvedPath?: unknown; entries?: unknown }>(
+    `/api/server/${encodeURIComponent(serverId)}/machine-file-list`,
+    { method: 'POST', body: JSON.stringify({ path }), signal },
+  );
+  if (result.ok !== true
+    || typeof result.resolvedPath !== 'string'
+    || new TextEncoder().encode(result.resolvedPath).byteLength > FILE_TRANSFER_PATH_MAX_BYTES
+    || !Array.isArray(result.entries)
+    || result.entries.length > FILE_TRANSFER_DIRECTORY_MAX_ENTRIES) {
+    throw new Error('machine_file_list_failed');
+  }
+  const entries = result.entries.filter((entry): entry is FileDirectoryEntry => {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return false;
+    const candidate = entry as Partial<FileDirectoryEntry>;
+    return typeof candidate.name === 'string'
+      && typeof candidate.path === 'string'
+      && candidate.isDir === true
+      && typeof candidate.hidden === 'boolean';
+  });
+  if (entries.length !== result.entries.length) throw new Error('machine_file_list_failed');
+  return { resolvedPath: result.resolvedPath, entries };
 }
 
 const ENROLL_V2_AVAILABILITY_PATH = '/api/enroll/v2/availability';
@@ -100,7 +203,7 @@ function normalizeAvailability(res: unknown): ControlledNodeAvailability {
   return { available, artifacts };
 }
 
-function normalizeTicket(res: unknown): ControlledNodeExecutableTicket {
+function normalizeTicket(res: unknown, expectedOwnerUserId: string): ControlledNodeExecutableTicket {
   if (!isRecord(res)) throw new Error('invalid_ticket_response');
   if (res.version !== 2) throw new Error('invalid_ticket_response');
   const ticket = typeof res.ticket === 'string' ? res.ticket : '';
@@ -115,11 +218,15 @@ function normalizeTicket(res: unknown): ControlledNodeExecutableTicket {
   const sizeBytes = typeof res.sizeBytes === 'number' && Number.isFinite(res.sizeBytes) ? res.sizeBytes : null;
   const sha256 = typeof res.sha256 === 'string' && isControlledNodeArtifactSha256(res.sha256) ? res.sha256 : null;
   const expiresAt = typeof res.expiresAt === 'number' && Number.isFinite(res.expiresAt) ? res.expiresAt : null;
-  if (!ticket || !ticketId || !os || !arch || !filename || sizeBytes === null || !sha256 || expiresAt === null) {
+  const ownerUserId = typeof res.ownerUserId === 'string' ? res.ownerUserId : '';
+  if (ownerUserId && ownerUserId !== expectedOwnerUserId) {
+    throw new Error(CONTROLLED_NODE_MINT_ERRORS.AUTH_IDENTITY_CHANGED);
+  }
+  if (!ticket || !ticketId || !os || !arch || !filename || sizeBytes === null || !sha256 || expiresAt === null || !ownerUserId) {
     throw new Error('invalid_ticket_response');
   }
   if (!isCanonicalControlledNodePair(os, arch)) throw new Error('invalid_ticket_response');
-  return { version: 2, ticket, ticketId, os, arch, filename, sizeBytes, sha256, expiresAt };
+  return { version: 2, ticket, ticketId, os, arch, filename, sizeBytes, sha256, expiresAt, ownerUserId };
 }
 
 /** Build download targets: one per canonical (os, arch) artifact with explicit arch. */
@@ -135,6 +242,7 @@ function normalizeMachine(raw: unknown): MachineListItem | null {
   const serverId = typeof raw.serverId === 'string' ? raw.serverId : '';
   const refName = typeof raw.refName === 'string' ? raw.refName : '';
   if (!serverId || !refName) return null;
+  const capabilities = validateControlledNodeCapabilities(raw.capabilities);
   return {
     serverId,
     refName,
@@ -142,6 +250,19 @@ function normalizeMachine(raw: unknown): MachineListItem | null {
     ...(typeof raw.os === 'string' && raw.os ? { os: raw.os } : {}),
     online: raw.online === true,
     execEnabled: raw.execEnabled === true,
+    // Old Servers return owned machines only and omit this field. A present but
+    // malformed role fails closed in the UI; Server-side action checks remain
+    // authoritative either way.
+    accessRole: raw.accessRole === undefined
+      ? 'owner'
+      : isMachineAccessRole(raw.accessRole) ? raw.accessRole : 'viewer',
+    ...(capabilities.ok && capabilities.value.length > 0 ? { capabilities: capabilities.value } : {}),
+    ...(typeof raw.daemonVersion === 'string' && raw.daemonVersion ? { daemonVersion: raw.daemonVersion } : {}),
+    ...(raw.updateAvailable === true ? { updateAvailable: true } : {}),
+    ...(raw.autoUnlockConfigured === true ? { autoUnlockConfigured: true } : {}),
+    ...(typeof raw.hostServerId === 'string' && raw.hostServerId
+      ? { hostServerId: raw.hostServerId }
+      : {}),
   };
 }
 
@@ -175,6 +296,22 @@ export async function setMachineExecEnabled(serverId: string, enabled: boolean):
 }
 
 /** Rename a controlled machine's render-only display name. */
+/**
+ * Store or clear the node's Windows sign-in secret. Write-only: the value is
+ * sent once and can never be read back, and the response carries only whether
+ * the node now holds one.
+ */
+export async function setMachineAutoUnlock(
+  serverId: string,
+  secret: string | null,
+): Promise<{ autoUnlockConfigured: boolean }> {
+  const response = await apiFetch(`${MACHINE_API_PATH}/${encodeURIComponent(serverId)}/auto-unlock`, {
+    method: 'POST',
+    body: JSON.stringify({ secret }),
+  }) as { autoUnlockConfigured?: boolean };
+  return { autoUnlockConfigured: response?.autoUnlockConfigured === true };
+}
+
 export async function renameMachine(serverId: string, displayName: string): Promise<void> {
   await apiFetch(`${MACHINE_API_PATH}/${encodeURIComponent(serverId)}/display-name`, {
     method: 'POST',
@@ -206,16 +343,31 @@ export async function listAvailableExecutableOses(): Promise<string[]> {
 /** Mint a one-time download ticket (POST /api/enroll/v2/ticket). */
 export async function mintControlledNodeExecutableTicket(
   selection: ControlledNodeArtifactSelection,
+  /**
+   * The daemon whose machine this install is for, when enrolling to give that
+   * machine login-screen control. Recorded on the enrolment so both installs are
+   * known to share a machine and the browser keeps offering one entry.
+   */
+  hostServerId?: string,
 ): Promise<ControlledNodeExecutableTicket> {
   if (!isCanonicalControlledNodePair(selection.os, selection.arch)) {
     throw new Error('controlled_node_non_canonical_pair');
   }
+  const expectedOwnerUserId = getExpectedUserId();
+  if (!expectedOwnerUserId) {
+    throw new Error(CONTROLLED_NODE_MINT_ERRORS.AUTH_IDENTITY_EXPECTATION_REQUIRED);
+  }
   const res = await apiFetch<unknown>(ENROLL_V2_TICKET_PATH, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ version: 2, os: selection.os, arch: selection.arch }),
+    body: JSON.stringify({
+      version: 2,
+      os: selection.os,
+      arch: selection.arch,
+      ...(hostServerId ? { hostServerId } : {}),
+    }),
   });
-  return normalizeTicket(res);
+  return normalizeTicket(res, expectedOwnerUserId);
 }
 
 /**

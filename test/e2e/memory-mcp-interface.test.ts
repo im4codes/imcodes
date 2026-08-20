@@ -11,6 +11,7 @@ import {
   MEMORY_MCP_TOOL_NAMES,
 } from '../../shared/memory-mcp-contracts.js';
 import { ALIAS_MCP_TOOLS } from '../../shared/alias-types.js';
+import { MESSAGE_PIN_MCP_TOOLS } from '../../shared/message-pins.js';
 import { MEMORY_FEATURE_FLAGS_BY_NAME, memoryFeatureFlagEnvKey } from '../../shared/feature-flags.js';
 import { MEMORY_MCP_ENV_KEYS, buildMemoryMcpServerEnv } from '../../shared/memory-mcp-env.js';
 import { makeMemoryShortRef } from '../../src/context/memory-short-ref.js';
@@ -111,9 +112,8 @@ describe('memory MCP interface e2e', () => {
     await withStdioClient(childEnv(), async (client) => {
       const listed = await client.listTools();
       const listedNames = listed.tools.map((tool) => tool.name);
-      // The memory MCP process hosts the memory tools PLUS the full alias CRUD
-      // tool set (resolve_alias / list_aliases / save_alias / delete_alias);
-      // assert the memory set and all four alias tools are present
+      // The MCP process hosts memory plus exact server-backed alias and pin
+      // stores; assert each independent surface is present
       // (order-independent). Mirrors test/daemon/memory-mcp-server.test.ts.
       expect(listedNames).toEqual(expect.arrayContaining([...MEMORY_MCP_TOOL_NAME_LIST]));
       expect(listedNames).toEqual(expect.arrayContaining([
@@ -121,6 +121,10 @@ describe('memory MCP interface e2e', () => {
         ALIAS_MCP_TOOLS.LIST,
         ALIAS_MCP_TOOLS.SAVE,
         ALIAS_MCP_TOOLS.DELETE,
+        MESSAGE_PIN_MCP_TOOLS.LIST,
+        MESSAGE_PIN_MCP_TOOLS.GET,
+        MESSAGE_PIN_MCP_TOOLS.SAVE,
+        MESSAGE_PIN_MCP_TOOLS.DELETE,
       ]));
 
       const saved = structured(await client.callTool({

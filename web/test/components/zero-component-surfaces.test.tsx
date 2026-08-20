@@ -431,6 +431,7 @@ describe('previously uncovered component surfaces', () => {
           { id: 'srv-2', name: '', status: 'offline', lastHeartbeatAt: null, createdAt: Date.now() },
         ]}
         activeServerId="srv-1"
+        returnHintServerId="srv-1"
         onSelectServer={onSelectServer}
         onServerContextMenu={onServerContextMenu}
         sidebarCollapsed
@@ -443,6 +444,7 @@ describe('previously uncovered component surfaces', () => {
     );
     fireEvent.click(screen.getByTitle('sidebar.expand'));
     fireEvent.click(screen.getByLabelText('Prod'));
+    expect(screen.getByLabelText('Prod').classList.contains('server-icon-return-hint')).toBe(true);
     fireEvent.contextMenu(screen.getByLabelText('Prod'), { clientX: 12, clientY: 34 });
     fireEvent.click(screen.getByTitle('Admin'));
     fireEvent.click(screen.getByTitle('Settings'));

@@ -2186,6 +2186,29 @@ describe('SupervisionAutomation', () => {
     });
   });
 
+  it('does not seed a second implicit run from a queued message appended to the active turn', async () => {
+    const snapshot = await seedSession('supervised');
+    supervisionAutomation.init();
+    supervisionAutomation.queueTaskIntent('deck_supervision_brain', 'cmd-original', 'implement original task', snapshot);
+    beginRun('cmd-original', 'implement original task');
+
+    timelineEmitter.emit('deck_supervision_brain', 'user.message', {
+      text: 'also handle this queued follow-up',
+      clientMessageId: 'cmd-appended',
+      queueAppended: true,
+      allowDuplicate: true,
+    });
+    completeTurn('implemented both requests');
+    await sleep(25);
+
+    expect(mockSupervisionDecide).toHaveBeenCalledTimes(1);
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
+
+    timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'idle' });
+    await sleep(25);
+    expect(mockSupervisionDecide).toHaveBeenCalledTimes(1);
+  });
+
   it('does not evaluate a stale assistant response from before the most recent user task', async () => {
     await seedSession('supervised');
     supervisionAutomation.init();

@@ -39,6 +39,7 @@ const ticketResponse = {
   sizeBytes: 1000,
   sha256: VALID_SHA256,
   expiresAt: Date.now() + 60_000,
+  ownerUserId: 'user-rock',
 };
 
 describe('buildControlledNodeDownloadTargets', () => {
@@ -92,6 +93,10 @@ describe('controlledNodeDownloadErrorKey', () => {
       .toBe('controlled_nodes.mint_canonical_server_url_required');
     expect(controlledNodeDownloadErrorKey(new ApiError(401, '{"error":"invalid_or_expired_ticket"}')))
       .toBe('controlled_nodes.ticket_expired');
+    expect(controlledNodeDownloadErrorKey(new ApiError(409, '{"error":"auth_identity_changed"}')))
+      .toBe('controlled_nodes.auth_identity_changed');
+    expect(controlledNodeDownloadErrorKey(new ApiError(428, '{"error":"auth_identity_expectation_required"}')))
+      .toBe('controlled_nodes.auth_identity_expectation_required');
     expect(controlledNodeDownloadErrorKey(new Error('popup_blocked')))
       .toBe('controlled_nodes.download_popup_blocked');
   });

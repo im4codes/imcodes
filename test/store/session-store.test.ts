@@ -174,11 +174,31 @@ describe('session-store', () => {
 
   describe('loadStore reconcile (runtimeType backfill + error recovery)', () => {
     async function writeSessionsFixture(content: object): Promise<void> {
-      const { mkdir, writeFile } = await import('node:fs/promises');
+      // Full-suite workers can be reused after files that register partial
+      // `node:fs/promises` mocks. A normal dynamic import can inherit that
+      // worker-local mock, turning this fixture write into a no-op while the
+      // fresh child process below correctly uses the real filesystem. Bypass
+      // Vitest's mock registry so the parent and child always observe the same
+      // on-disk sessions.json.
+      const { mkdir, writeFile } = await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises');
       const dir = join(tempDir, '.imcodes');
       await mkdir(dir, { recursive: true });
       await writeFile(join(dir, 'sessions.json'), JSON.stringify(content), 'utf8');
     }
+
+    it('writes fixtures through the real filesystem when a worker-local fs mock is registered', async () => {
+      vi.doMock('node:fs/promises', () => ({
+        mkdir: vi.fn().mockResolvedValue(undefined),
+        writeFile: vi.fn().mockResolvedValue(undefined),
+      }));
+      try {
+        await writeSessionsFixture({ sessions: { persisted: { name: 'persisted' } } });
+        const raw = await readFile(join(tempDir, '.imcodes', 'sessions.json'), 'utf8');
+        expect(JSON.parse(raw)).toEqual({ sessions: { persisted: { name: 'persisted' } } });
+      } finally {
+        vi.doUnmock('node:fs/promises');
+      }
+    });
 
     it('backfills runtimeType=transport for SDK sessions persisted before the field existed', async () => {
       // Mirror the on-disk shape we observed on the 211 deployment: brain

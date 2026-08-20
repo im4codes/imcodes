@@ -4,11 +4,15 @@ import { COMMAND_ACK_ERROR_DUPLICATE_COMMAND_ID } from '../../shared/ack-protoco
 const {
   getSessionMock,
   relaunchSessionWithSettingsMock,
+  startSubSessionMock,
+  stopSubSessionMock,
   emitMock,
   buildSessionListMock,
 } = vi.hoisted(() => ({
   getSessionMock: vi.fn(),
   relaunchSessionWithSettingsMock: vi.fn().mockResolvedValue(undefined),
+  startSubSessionMock: vi.fn().mockResolvedValue(undefined),
+  stopSubSessionMock: vi.fn().mockResolvedValue(undefined),
   emitMock: vi.fn(),
   buildSessionListMock: vi.fn(async () => []),
 }));
@@ -46,7 +50,7 @@ vi.mock('../../src/router/message-router.js', () => ({ routeMessage: vi.fn() }))
 vi.mock('../../src/daemon/terminal-streamer.js', () => ({ terminalStreamer: { subscribe: vi.fn(), unsubscribe: vi.fn(), start: vi.fn(), stop: vi.fn() } }));
 vi.mock('../../src/daemon/timeline-emitter.js', () => ({ timelineEmitter: { emit: emitMock, on: vi.fn(() => () => {}), off: vi.fn(), epoch: 0, replay: vi.fn(() => ({ events: [], truncated: false })) } }));
 vi.mock('../../src/daemon/timeline-store.js', () => ({ timelineStore: { append: vi.fn(), read: vi.fn(() => []), clear: vi.fn() } }));
-vi.mock('../../src/daemon/subsession-manager.js', () => ({ startSubSession: vi.fn(), stopSubSession: vi.fn(), rebuildSubSessions: vi.fn(), detectShells: vi.fn().mockResolvedValue([]), readSubSessionResponse: vi.fn(), subSessionName: (id: string) => `deck_sub_${id}` }));
+vi.mock('../../src/daemon/subsession-manager.js', () => ({ startSubSession: startSubSessionMock, stopSubSession: stopSubSessionMock, rebuildSubSessions: vi.fn(), detectShells: vi.fn().mockResolvedValue([]), readSubSessionResponse: vi.fn(), subSessionName: (id: string) => `deck_sub_${id}` }));
 vi.mock('../../src/daemon/p2p-orchestrator.js', () => ({ startP2pRun: vi.fn(), cancelP2pRun: vi.fn(), getP2pRun: vi.fn(() => undefined), listP2pRuns: vi.fn(() => []), serializeP2pRun: vi.fn() }));
 vi.mock('../../src/daemon/session-list.js', () => ({ buildSessionList: buildSessionListMock }));
 vi.mock('../../src/daemon/repo-handler.js', () => ({ handleRepoCommand: vi.fn() }));
@@ -73,6 +77,34 @@ describe('process session /clear handling', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     buildSessionListMock.mockResolvedValue([]);
+  });
+
+  it('restarts a Codex sub-session in its stored directory when changing models', async () => {
+    getSessionMock.mockReturnValue({
+      name: 'deck_sub_child',
+      projectName: 'proj',
+      role: 'w1',
+      agentType: 'codex',
+      runtimeType: 'process',
+      state: 'idle',
+      projectDir: '/authoritative/project',
+    });
+
+    handleWebCommand({
+      type: 'subsession.set_model',
+      sessionName: 'deck_sub_child',
+      model: 'gpt-5.4',
+      cwd: '/untrusted/browser/path',
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(stopSubSessionMock).toHaveBeenCalledWith('deck_sub_child', serverLink);
+    expect(startSubSessionMock).toHaveBeenCalledWith({
+      id: 'child',
+      type: 'codex',
+      cwd: '/authoritative/project',
+      codexModel: 'gpt-5.4',
+    });
   });
 
   it('relaunches claude-code sessions fresh instead of forwarding /clear to tmux', async () => {

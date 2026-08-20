@@ -71,6 +71,27 @@ export function buildMachineMarker(name: string): string {
 }
 
 /**
+ * Build the human-readable reference inserted by machine pickers.
+ *
+ * The stable marker remains the only routing identity. The mutable display name
+ * is an explanatory suffix so two opaque refs are easy to distinguish in the
+ * composer and timeline. Protocol-looking runs in the display name are rendered
+ * with full-width sigils so an owner-authored note cannot forge another machine,
+ * alias, or P2P target when the message is later parsed.
+ */
+export function buildMachineComposerReference(name: string, displayName?: string): string {
+  const marker = buildMachineMarker(name);
+  if (displayName == null) return marker;
+  const normalized = normalizeMachineDisplayName(displayName);
+  if (!normalized) return marker;
+  const safeNote = normalized
+    .split('^^(').join('＾＾(')
+    .split(';;(').join('；；(')
+    .split('@@').join('＠＠');
+  return `${marker}-(${safeNote})`;
+}
+
+/**
  * Single-pass marker regex: `^^(` then any run without parens, then the first `)`.
  * `[^()]*` structurally rejects an inner `(`, so `^^(na(me)` is not a marker.
  */

@@ -141,6 +141,7 @@ describe('agent delegation shared contract', () => {
       'qwen',
       'openclaw',
       'kimi-sdk',
+      'deepseek-harness',
     ]);
     expect(DELEGATION_REPLY_CAPABLE_PROCESS_AGENT_TYPES).toBe(DELEGATION_REPLY_CAPABLE_AGENT_TYPES);
     for (const agentType of DELEGATION_REPLY_CAPABLE_AGENT_TYPES) {

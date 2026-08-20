@@ -9,6 +9,7 @@ import {
   SHARE_REASONS,
   SHARE_SCOPED_COMMAND_POLICY,
   SHARE_WS_COMMAND_POLICY_INVENTORY,
+  evaluateShareCommand,
   filterShareDaemonMessage,
   shareTargetKey,
   type EffectiveCoverage,
@@ -17,9 +18,15 @@ import {
 import { TRANSPORT_MSG } from '../../shared/transport-events.js';
 import { FS_TRANSPORT_MSG } from '../../shared/fs-transport-messages.js';
 import { P2P_WORKFLOW_MSG } from '../../shared/p2p-workflow-messages.js';
+import { P2P_CONFIG_MSG } from '../../shared/p2p-config-events.js';
 import { getShareScopedCommandPolicy } from '../../shared/tab-sharing.js';
 import { REPO_MSG } from '../../shared/repo-types.js';
+import { FS_SESSION_ROOT_PATH } from '../../src/shared/transport/fs.js';
 import { resetSharedCommandRateLimitsForTests } from '../src/share/share-rate-limit.js';
+import { TIMELINE_MESSAGES } from '../../shared/timeline-protocol.js';
+import { DIRECT_FILE_TRANSFER_MSG } from '../../shared/direct-file-transfer.js';
+import { MSG_COMMAND_ACK } from '../../shared/ack-protocol.js';
+import { TRANSPORT_QUEUE_COMMANDS } from '../../shared/transport-queue-types.js';
 
 class MockWs extends EventEmitter {
   sent: Array<string | Buffer> = [];
@@ -173,6 +180,48 @@ describe('WsBridge share-scoped sockets', () => {
     resetSharedCommandRateLimitsForTests();
   });
 
+  it('allows direct upload initiation only for participants inside the covered session', () => {
+    const target: ShareTarget = { kind: 'main', serverId, sessionName: 'deck_proj_brain' };
+    const makeState = (role: 'viewer' | 'participant') => ({
+      userId: 'shared-user',
+      actorDisplayName: 'Shared User',
+      ticketId: `ticket-${role}`,
+      target,
+      snapshot: coverage(target, role, now),
+      connectedAt: now,
+    });
+    const init = {
+      type: DIRECT_FILE_TRANSFER_MSG.INIT,
+      requestId: '123e4567-e89b-12d3-a456-426614174000',
+      clientUploadId: '123e4567-e89b-12d3-a456-426614174001',
+      filename: 'shared.bin',
+      size: 10,
+      sessionName: 'deck_proj_brain',
+    };
+
+    expect(evaluateShareCommand({
+      msg: init,
+      state: makeState('participant'),
+      now,
+      runtimeType: 'transport',
+      activeDispatchId: null,
+    })).toMatchObject({ allowed: true });
+    expect(evaluateShareCommand({
+      msg: init,
+      state: makeState('viewer'),
+      now,
+      runtimeType: 'transport',
+      activeDispatchId: null,
+    })).toEqual({ allowed: false, reason: SHARE_REASONS.ROLE_DENIED });
+    expect(evaluateShareCommand({
+      msg: { ...init, sessionName: 'deck_other_brain' },
+      state: makeState('participant'),
+      now,
+      runtimeType: 'transport',
+      activeDispatchId: null,
+    })).toEqual({ allowed: false, reason: SHARE_REASONS.DIRECT_SURFACE_DENIED });
+  });
+
   afterEach(() => {
     WsBridge.getAll().clear();
     __setShareBridgeClockForTests(null);
@@ -320,6 +369,64 @@ describe('WsBridge share-scoped sockets', () => {
     expect(shared.sentJson.some((msg) => msg.type === 'unlisted.daemon.message')).toBe(false);
   });
 
+  it('forwards a participant queue append and keeps it away from viewers', async () => {
+    const bridge = WsBridge.get(serverId);
+    const target: ShareTarget = { kind: 'main', serverId, sessionName: 'deck_proj_brain' };
+    bridge.setShareCoverageResolverForTests(async () => coverage(target, 'participant', now));
+    const daemon = new MockWs();
+    bridge.handleDaemonConnection(daemon as never, makeDb(), {} as never);
+    daemon.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+    await flushAsync();
+    daemon.sent.length = 0;
+
+    const participant = new MockWs();
+    bridge.handleShareBrowserConnection(participant as never, 'shared-user', makeDb(), {
+      ticketId: 'share-ticket-append-participant',
+      target,
+      snapshot: coverage(target, 'participant', now),
+    });
+    participant.emit('message', JSON.stringify({
+      type: TRANSPORT_QUEUE_COMMANDS.APPEND_MESSAGES,
+      commandId: 'cmd-append-participant',
+      sessionName: 'deck_proj_brain',
+      clientMessageIds: ['queued-1'],
+    }));
+    await flushAsync();
+
+    // A participant may steer already-queued text into the running turn.
+    expect(daemon.sentJson.some((msg) => (
+      msg.type === TRANSPORT_QUEUE_COMMANDS.APPEND_MESSAGES && msg.commandId === 'cmd-append-participant'
+    ))).toBe(true);
+
+    // A viewer may not, and the denial must carry the commandId so the browser
+    // can roll its optimistic queue mutation back instead of silently losing
+    // the row: a bare `error` frame has no commandId to match on.
+    bridge.setShareCoverageResolverForTests(async () => coverage(target, 'viewer', now));
+    const viewer = new MockWs();
+    bridge.handleShareBrowserConnection(viewer as never, 'viewer-user', makeDb(), {
+      ticketId: 'share-ticket-append-viewer',
+      target,
+      snapshot: coverage(target, 'viewer', now),
+    });
+    daemon.sent.length = 0;
+    viewer.emit('message', JSON.stringify({
+      type: TRANSPORT_QUEUE_COMMANDS.APPEND_MESSAGES,
+      commandId: 'cmd-append-viewer',
+      sessionName: 'deck_proj_brain',
+      clientMessageIds: ['queued-1'],
+    }));
+    await flushAsync();
+
+    expect(viewer.sentJson).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: MSG_COMMAND_ACK,
+        commandId: 'cmd-append-viewer',
+        status: 'error',
+      }),
+    ]));
+    expect(daemon.sentJson.some((msg) => msg.type === TRANSPORT_QUEUE_COMMANDS.APPEND_MESSAGES)).toBe(false);
+  });
+
   it('denies unknown commands, terminal resize, and viewer sends before daemon forwarding', async () => {
     const bridge = WsBridge.get(serverId);
     const target: ShareTarget = { kind: 'main', serverId, sessionName: 'deck_proj_brain' };
@@ -361,14 +468,21 @@ describe('WsBridge share-scoped sockets', () => {
       expect(actualPolicy).toEqual(entry.policy);
 
       if (actualPolicy?.kind === 'deny') {
-        expect(sharedPolicy).toMatchObject({
-          disposition: 'deny',
-          reason: actualPolicy.reason,
-        });
+        if (sharedPolicy.disposition === 'deny') {
+          expect(sharedPolicy.reason).toBe(actualPolicy.reason);
+        } else {
+          // A conceptual surface may be shared while one legacy bridge command
+          // for that surface remains intentionally unsupported.
+          expect(sharedPolicy.disposition).toBe('allow');
+        }
       } else if (
         actualPolicy?.kind === 'participant-send'
+        || actualPolicy?.kind === 'participant-model-switch'
+        || actualPolicy?.kind === 'participant-model-list'
         || actualPolicy?.kind === 'participant-cancel'
         || actualPolicy?.kind === 'participant-discussion-start'
+        || actualPolicy?.kind === 'participant-covered-action'
+        || actualPolicy?.kind === 'participant-bound-action'
       ) {
         expect(sharedPolicy).toMatchObject({
           disposition: 'allow',
@@ -407,6 +521,10 @@ describe('WsBridge share-scoped sockets', () => {
       TRANSPORT_MSG.CHAT_SUBSCRIBE,
       TRANSPORT_MSG.CHAT_UNSUBSCRIBE,
       TRANSPORT_MSG.CHAT_HISTORY,
+      TIMELINE_MESSAGES.HISTORY_REQUEST,
+      TIMELINE_MESSAGES.REPLAY_REQUEST,
+      TIMELINE_MESSAGES.PAGE_REQUEST,
+      TIMELINE_MESSAGES.DETAIL_REQUEST,
     ];
     for (const [index, type] of targetlessReadCommands.entries()) {
       shared.emit('message', JSON.stringify({ type, requestId: `targetless-${index}` }));
@@ -475,7 +593,7 @@ describe('WsBridge share-scoped sockets', () => {
     expect(daemon.sentJson.some((msg) => deniedCommands.some((entry) => entry.bridgeCommand === msg.type) || msg.type === 'future.unclassified.command')).toBe(false);
   });
 
-  it('denies direct filesystem, repo, memory, and provider surfaces before request registration or daemon forwarding', async () => {
+  it('allows covered participant file operations while keeping unsupported and global repo surfaces denied', async () => {
     const bridge = WsBridge.get(serverId);
     const target: ShareTarget = { kind: 'main', serverId, sessionName: 'deck_proj_brain' };
     bridge.setShareCoverageResolverForTests(async () => coverage(target, 'participant', now));
@@ -493,16 +611,17 @@ describe('WsBridge share-scoped sockets', () => {
     });
 
     for (const msg of [
-      { type: 'fs.ls', requestId: 'fs-ls-1', session: 'deck_proj_brain' },
-      { type: 'fs.read', requestId: 'fs-read-1', session: 'deck_proj_brain' },
-      { type: 'fs.write', requestId: 'fs-write-1', session: 'deck_proj_brain' },
-      { type: FS_TRANSPORT_MSG.RENAME, requestId: 'fs-rename-1', session: 'deck_proj_brain' },
-      { type: 'fs.edit', requestId: 'fs-edit-1', session: 'deck_proj_brain' },
-      { type: 'fs.delete', requestId: 'fs-delete-1', session: 'deck_proj_brain' },
-      { type: 'fs.patch', requestId: 'fs-patch-1', session: 'deck_proj_brain' },
-      { type: 'fs.git_status', requestId: 'git-status-1', session: 'deck_proj_brain' },
-      { type: 'fs.git_diff', requestId: 'git-diff-1', session: 'deck_proj_brain' },
-      { type: 'file.search', requestId: 'file-search-1', session: 'deck_proj_brain' },
+      { type: 'fs.ls', requestId: 'fs-ls-1', sessionName: 'deck_proj_brain', path: '/repo' },
+      { type: 'fs.read', requestId: 'fs-read-1', sessionName: 'deck_proj_brain', path: '/repo/a.ts' },
+      { type: 'fs.write', requestId: 'fs-write-1', sessionName: 'deck_proj_brain', path: '/repo/a.ts', content: 'x' },
+      { type: FS_TRANSPORT_MSG.RENAME, requestId: 'fs-rename-1', sessionName: 'deck_proj_brain', path: '/repo/a.ts', newPath: '/repo/b.ts' },
+      { type: 'fs.mkdir', requestId: 'fs-mkdir-1', sessionName: 'deck_proj_brain', path: '/repo/new' },
+      { type: 'fs.edit', requestId: 'fs-edit-1', sessionName: 'deck_proj_brain' },
+      { type: FS_TRANSPORT_MSG.DELETE, requestId: 'fs-delete-1', sessionName: 'deck_proj_brain', path: '/repo/a.ts' },
+      { type: 'fs.patch', requestId: 'fs-patch-1', sessionName: 'deck_proj_brain' },
+      { type: 'fs.git_status', requestId: 'git-status-1', sessionName: 'deck_proj_brain', path: '/repo' },
+      { type: 'fs.git_diff', requestId: 'git-diff-1', sessionName: 'deck_proj_brain', path: '/repo/a.ts' },
+      { type: 'file.search', requestId: 'file-search-1', sessionName: 'deck_proj_brain', projectDir: '/repo', query: 'a' },
       { type: REPO_MSG.DETECT, requestId: 'repo-detect-1' },
       { type: REPO_MSG.LIST_BRANCHES, requestId: 'repo-branches-1' },
       { type: REPO_MSG.CHECKOUT_BRANCH, requestId: 'repo-checkout-1', branch: 'main' },
@@ -518,16 +637,8 @@ describe('WsBridge share-scoped sockets', () => {
     }
 
     expect(shared.sentJson).toEqual(expect.arrayContaining([
-      expect.objectContaining({ type: 'error', code: SHARE_REASONS.DIRECT_SURFACE_DENIED, originalType: 'fs.ls' }),
-      expect.objectContaining({ type: 'error', code: SHARE_REASONS.DIRECT_SURFACE_DENIED, originalType: 'fs.read' }),
-      expect.objectContaining({ type: 'error', code: SHARE_REASONS.DIRECT_SURFACE_DENIED, originalType: 'fs.write' }),
-      expect.objectContaining({ type: 'error', code: SHARE_REASONS.DIRECT_SURFACE_DENIED, originalType: FS_TRANSPORT_MSG.RENAME }),
       expect.objectContaining({ type: 'error', code: SHARE_REASONS.DIRECT_SURFACE_DENIED, originalType: 'fs.edit' }),
-      expect.objectContaining({ type: 'error', code: SHARE_REASONS.DIRECT_SURFACE_DENIED, originalType: 'fs.delete' }),
       expect.objectContaining({ type: 'error', code: SHARE_REASONS.DIRECT_SURFACE_DENIED, originalType: 'fs.patch' }),
-      expect.objectContaining({ type: 'error', code: SHARE_REASONS.DIRECT_SURFACE_DENIED, originalType: 'fs.git_status' }),
-      expect.objectContaining({ type: 'error', code: SHARE_REASONS.DIRECT_SURFACE_DENIED, originalType: 'fs.git_diff' }),
-      expect.objectContaining({ type: 'error', code: SHARE_REASONS.DIRECT_SURFACE_DENIED, originalType: 'file.search' }),
       expect.objectContaining({ type: 'error', code: SHARE_REASONS.DIRECT_SURFACE_DENIED, originalType: REPO_MSG.DETECT }),
       expect.objectContaining({ type: 'error', code: SHARE_REASONS.DIRECT_SURFACE_DENIED, originalType: REPO_MSG.LIST_BRANCHES }),
       expect.objectContaining({ type: 'error', code: SHARE_REASONS.DIRECT_SURFACE_DENIED, originalType: REPO_MSG.CHECKOUT_BRANCH }),
@@ -539,16 +650,8 @@ describe('WsBridge share-scoped sockets', () => {
       expect.objectContaining({ type: 'error', code: SHARE_REASONS.DIRECT_SURFACE_DENIED, originalType: 'provider.sync_sessions' }),
     ]));
     expect(daemon.sentJson.some((msg) => [
-      'fs.ls',
-      'fs.read',
-      'fs.write',
-      FS_TRANSPORT_MSG.RENAME,
       'fs.edit',
-      'fs.delete',
       'fs.patch',
-      'fs.git_status',
-      'fs.git_diff',
-      'file.search',
       REPO_MSG.DETECT,
       REPO_MSG.LIST_BRANCHES,
       REPO_MSG.CHECKOUT_BRANCH,
@@ -559,6 +662,126 @@ describe('WsBridge share-scoped sockets', () => {
       'memory.skill.query',
       'provider.sync_sessions',
     ].includes(String(msg.type)))).toBe(false);
+    expect(daemon.sentJson).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: 'fs.ls', requestId: 'fs-ls-1', sessionName: 'deck_proj_brain' }),
+      expect.objectContaining({ type: 'fs.read', requestId: 'fs-read-1', sessionName: 'deck_proj_brain' }),
+      expect.objectContaining({ type: 'fs.write', requestId: 'fs-write-1', sessionName: 'deck_proj_brain' }),
+      expect.objectContaining({ type: FS_TRANSPORT_MSG.RENAME, requestId: 'fs-rename-1', sessionName: 'deck_proj_brain' }),
+      expect.objectContaining({ type: 'fs.mkdir', requestId: 'fs-mkdir-1', sessionName: 'deck_proj_brain' }),
+      expect.objectContaining({ type: FS_TRANSPORT_MSG.DELETE, requestId: 'fs-delete-1', sessionName: 'deck_proj_brain' }),
+      expect.objectContaining({ type: 'fs.git_status', requestId: 'git-status-1', sessionName: 'deck_proj_brain' }),
+      expect.objectContaining({ type: 'fs.git_diff', requestId: 'git-diff-1', sessionName: 'deck_proj_brain' }),
+      expect.objectContaining({ type: 'file.search', requestId: 'file-search-1', sessionName: 'deck_proj_brain' }),
+    ]));
+  });
+
+  it('allows covered viewer file reads but rejects writes and out-of-scope reads', async () => {
+    const bridge = WsBridge.get(serverId);
+    const target: ShareTarget = { kind: 'main', serverId, sessionName: 'deck_proj_brain' };
+    bridge.setShareCoverageResolverForTests(async () => coverage(target, 'viewer', now));
+    const daemon = new MockWs();
+    bridge.handleDaemonConnection(daemon as never, makeDb(), {} as never);
+    daemon.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+    await flushAsync();
+    daemon.sent.length = 0;
+
+    const shared = new MockWs();
+    bridge.handleShareBrowserConnection(shared as never, 'viewer-user', makeDb(), {
+      ticketId: 'share-ticket-viewer-files',
+      target,
+      snapshot: coverage(target, 'viewer', now),
+    });
+    shared.emit('message', JSON.stringify({ type: 'fs.ls', requestId: 'viewer-list', sessionName: 'deck_proj_brain', path: '/repo' }));
+    shared.emit('message', JSON.stringify({ type: 'fs.write', requestId: 'viewer-write', sessionName: 'deck_proj_brain', path: '/repo/a.ts', content: 'x' }));
+    shared.emit('message', JSON.stringify({ type: 'fs.read', requestId: 'viewer-outside', sessionName: 'deck_other_brain', path: '/other/a.ts' }));
+    await flushAsync();
+
+    expect(daemon.sentJson).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: 'fs.ls', requestId: 'viewer-list', sessionName: 'deck_proj_brain' }),
+    ]));
+    expect(daemon.sentJson.some((msg) => msg.requestId === 'viewer-write' || msg.requestId === 'viewer-outside')).toBe(false);
+    expect(shared.sentJson).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: 'error', code: SHARE_REASONS.ROLE_DENIED, originalType: 'fs.write' }),
+      expect.objectContaining({ type: 'error', code: SHARE_REASONS.DIRECT_SURFACE_DENIED, originalType: 'fs.read' }),
+    ]));
+  });
+
+  it('single-casts covered repository reads and permits checkout only for participants', async () => {
+    const bridge = WsBridge.get(serverId);
+    const target: ShareTarget = { kind: 'main', serverId, sessionName: 'deck_proj_brain' };
+    bridge.setShareCoverageResolverForTests(async () => coverage(target, 'participant', now));
+    const daemon = new MockWs();
+    bridge.handleDaemonConnection(daemon as never, makeDb(), {} as never);
+    daemon.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+    await flushAsync();
+    daemon.sent.length = 0;
+
+    const participant = new MockWs();
+    bridge.handleShareBrowserConnection(participant as never, 'participant-user', makeDb(), {
+      ticketId: 'repo-participant', target, snapshot: coverage(target, 'participant', now),
+    });
+    const member = new MockWs();
+    bridge.handleBrowserConnection(member as never, 'member-user', makeDb());
+    member.sent.length = 0;
+
+    participant.emit('message', JSON.stringify({
+      type: REPO_MSG.DETECT,
+      requestId: 'repo-shared-detect',
+      projectDir: FS_SESSION_ROOT_PATH,
+      sessionName: 'deck_proj_brain',
+    }));
+    participant.emit('message', JSON.stringify({
+      type: REPO_MSG.CHECKOUT_BRANCH,
+      requestId: 'repo-shared-checkout',
+      projectDir: FS_SESSION_ROOT_PATH,
+      sessionId: 'deck_proj_brain',
+      branch: 'feature/shared',
+    }));
+    participant.emit('message', JSON.stringify({
+      type: REPO_MSG.LIST_COMMITS,
+      requestId: 'repo-host-path-bypass',
+      projectDir: '/owner/other-project',
+      sessionName: 'deck_proj_brain',
+    }));
+    await flushAsync();
+
+    expect(daemon.sentJson).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: REPO_MSG.DETECT, requestId: 'repo-shared-detect' }),
+      expect.objectContaining({ type: REPO_MSG.CHECKOUT_BRANCH, requestId: 'repo-shared-checkout' }),
+    ]));
+    expect(daemon.sentJson.some((msg) => msg.requestId === 'repo-host-path-bypass')).toBe(false);
+    expect(participant.sentJson).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: 'error', code: SHARE_REASONS.DIRECT_SURFACE_DENIED, originalType: REPO_MSG.LIST_COMMITS }),
+    ]));
+
+    daemon.emit('message', JSON.stringify({
+      type: REPO_MSG.DETECT_RESPONSE,
+      requestId: 'repo-shared-detect',
+      projectDir: '/owner/project',
+      status: 'ok',
+    }));
+    await flushAsync();
+    expect(participant.sentJson).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: REPO_MSG.DETECT_RESPONSE, requestId: 'repo-shared-detect' }),
+    ]));
+    expect(member.sentJson.some((msg) => msg.requestId === 'repo-shared-detect')).toBe(false);
+
+    bridge.setShareCoverageResolverForTests(async () => coverage(target, 'viewer', now));
+    const viewer = new MockWs();
+    bridge.handleShareBrowserConnection(viewer as never, 'viewer-user', makeDb(), {
+      ticketId: 'repo-viewer', target, snapshot: coverage(target, 'viewer', now),
+    });
+    viewer.emit('message', JSON.stringify({
+      type: REPO_MSG.CHECKOUT_BRANCH,
+      requestId: 'repo-viewer-checkout',
+      projectDir: FS_SESSION_ROOT_PATH,
+      sessionId: 'deck_proj_brain',
+      branch: 'main',
+    }));
+    await flushAsync();
+    expect(viewer.sentJson).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: 'error', code: SHARE_REASONS.ROLE_DENIED, originalType: REPO_MSG.CHECKOUT_BRANCH }),
+    ]));
   });
 
   it('allows participant send for a covered concrete tab and stamps a server-authored actor envelope', async () => {
@@ -583,7 +806,7 @@ describe('WsBridge share-scoped sockets', () => {
       type: 'session.send',
       commandId: 'cmd-participant',
       sessionName: 'deck_proj_brain',
-      text: 'hello',
+      text: '/model gpt-5.4',
       sharedActor: { actorUserId: 'spoofed' },
     }));
     await flushAsync();
@@ -591,6 +814,7 @@ describe('WsBridge share-scoped sockets', () => {
     const forwarded = daemon.sentJson.find((msg) => msg.type === 'session.send');
     expect(forwarded).toMatchObject({
       commandId: 'cmd-participant',
+      text: '/model gpt-5.4',
       sharedActor: {
         actorUserId: 'shared-user',
         actorDisplayName: 'Shared User',
@@ -599,6 +823,134 @@ describe('WsBridge share-scoped sockets', () => {
         origin: 'shared-tab',
       },
     });
+  });
+
+  it('allows only participants to switch a covered sub-session model and strips client paths', async () => {
+    const bridge = WsBridge.get(serverId);
+    const target: ShareTarget = { kind: 'subsession', serverId, subSessionId: 'child_1' };
+    const auditRows: AuditInsert[] = [];
+    const db = makeDb(null, auditRows);
+    bridge.setShareCoverageResolverForTests(async ({ userId }) => coverage(
+      target,
+      userId === 'viewer-user' ? 'viewer' : 'participant',
+      now,
+    ));
+    const daemon = new MockWs();
+    bridge.handleDaemonConnection(daemon as never, db, {} as never);
+    daemon.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+    await flushAsync();
+    daemon.sent.length = 0;
+
+    const participant = new MockWs();
+    bridge.handleShareBrowserConnection(participant as never, 'participant-user', db, {
+      ticketId: 'model-participant',
+      target,
+      snapshot: coverage(target, 'participant', now),
+    });
+    await flushAsync();
+
+    participant.emit('message', JSON.stringify({
+      type: 'subsession.set_model',
+      sessionName: 'deck_sub_child_1',
+      model: ' gpt-5.4 ',
+      cwd: '/untrusted/browser/path',
+    }));
+    participant.emit('message', JSON.stringify({
+      type: 'subsession.set_model',
+      sessionName: 'deck_sub_outside',
+      model: 'gpt-5.4',
+    }));
+    await flushAsync();
+
+    expect(daemon.sentJson).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: 'subsession.set_model',
+        sessionName: 'deck_sub_child_1',
+        model: 'gpt-5.4',
+      }),
+    ]));
+    const forwarded = daemon.sentJson.find((msg) => msg.type === 'subsession.set_model');
+    expect(forwarded).not.toHaveProperty('cwd');
+    expect(daemon.sentJson.some((msg) => msg.sessionName === 'deck_sub_outside')).toBe(false);
+    expect(participant.sentJson).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: 'error',
+        code: SHARE_REASONS.DIRECT_SURFACE_DENIED,
+        originalType: 'subsession.set_model',
+      }),
+    ]));
+
+    const viewer = new MockWs();
+    bridge.handleShareBrowserConnection(viewer as never, 'viewer-user', db, {
+      ticketId: 'model-viewer',
+      target,
+      snapshot: coverage(target, 'viewer', now),
+    });
+    viewer.emit('message', JSON.stringify({
+      type: 'subsession.set_model',
+      sessionName: 'deck_sub_child_1',
+      model: 'gpt-5.4',
+    }));
+    await flushAsync();
+
+    expect(viewer.sentJson).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: 'error',
+        code: SHARE_REASONS.ROLE_DENIED,
+        originalType: 'subsession.set_model',
+      }),
+    ]));
+    expect(daemon.sentJson.filter((msg) => msg.type === 'subsession.set_model')).toHaveLength(1);
+
+    participant.emit('message', JSON.stringify({
+      type: TRANSPORT_MSG.LIST_MODELS,
+      sessionName: 'deck_sub_child_1',
+      agentType: 'grok-sdk',
+      requestId: 'models-participant',
+      force: true,
+      ccPreset: 'must-not-cross-share-boundary',
+      unexpected: 'drop-me',
+    }));
+    viewer.emit('message', JSON.stringify({
+      type: TRANSPORT_MSG.LIST_MODELS,
+      sessionName: 'deck_sub_child_1',
+      agentType: 'grok-sdk',
+      requestId: 'models-viewer',
+    }));
+    await flushAsync();
+
+    const modelRequests = daemon.sentJson.filter((msg) => msg.type === TRANSPORT_MSG.LIST_MODELS);
+    expect(modelRequests).toEqual([{
+      type: TRANSPORT_MSG.LIST_MODELS,
+      sessionName: 'deck_sub_child_1',
+      agentType: 'grok-sdk',
+      requestId: 'models-participant',
+      force: true,
+    }]);
+    participant.sent.length = 0;
+    viewer.sent.length = 0;
+    daemon.emit('message', JSON.stringify({
+      type: TRANSPORT_MSG.MODELS_RESPONSE,
+      sessionName: 'deck_sub_child_1',
+      agentType: 'grok-sdk',
+      requestId: 'models-participant',
+      models: [{ id: 'grok-code-fast-1' }],
+    }));
+    await flushAsync();
+
+    expect(participant.sentJson).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: TRANSPORT_MSG.MODELS_RESPONSE,
+        requestId: 'models-participant',
+        models: [{ id: 'grok-code-fast-1' }],
+      }),
+    ]));
+    expect(viewer.sentJson.some((msg) => msg.type === TRANSPORT_MSG.MODELS_RESPONSE)).toBe(false);
+    expect(auditRows).toEqual(expect.arrayContaining([
+      expect.objectContaining({ actionType: 'session.send', decision: 'accepted', actorUserId: 'participant-user' }),
+      expect.objectContaining({ actionType: 'session.send', decision: 'rejected', actorUserId: 'participant-user', reason: SHARE_REASONS.DIRECT_SURFACE_DENIED }),
+      expect.objectContaining({ actionType: 'session.send', decision: 'rejected', actorUserId: 'viewer-user', reason: SHARE_REASONS.ROLE_DENIED }),
+    ]));
   });
 
   it('treats a shared main tab as covering its existing child sub-sessions over WS', async () => {
@@ -657,6 +1009,62 @@ describe('WsBridge share-scoped sockets', () => {
         type: 'chat.delta',
         sessionId: 'deck_sub_child_1',
         text: 'child output',
+      }),
+    ]));
+
+    const requestId = 'shared-child-history';
+    shared.sent.length = 0;
+    shared.emit('message', JSON.stringify({
+      type: TIMELINE_MESSAGES.HISTORY_REQUEST,
+      requestId,
+      sessionName: 'deck_sub_child_1',
+      limit: 50,
+    }));
+    await flushAsync();
+
+    expect(daemon.sentJson).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: TIMELINE_MESSAGES.HISTORY_REQUEST,
+        requestId,
+        sessionName: 'deck_sub_child_1',
+      }),
+    ]));
+
+    daemon.emit('message', JSON.stringify({
+      type: TIMELINE_MESSAGES.HISTORY,
+      requestId,
+      sessionName: 'deck_sub_child_1',
+      epoch: 1,
+      events: [{ eventId: 'child-history-1', sessionId: 'deck_sub_child_1', ts: 1, type: 'assistant.text', payload: { text: 'history' } }],
+    }));
+    await flushAsync();
+    await flushAsync();
+
+    expect(shared.sentJson).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: TIMELINE_MESSAGES.HISTORY,
+        requestId,
+        sessionName: 'deck_sub_child_1',
+        events: [expect.objectContaining({ eventId: 'child-history-1' })],
+      }),
+    ]));
+
+    daemon.sent.length = 0;
+    shared.sent.length = 0;
+    shared.emit('message', JSON.stringify({
+      type: TIMELINE_MESSAGES.HISTORY_REQUEST,
+      requestId: 'outside-history',
+      sessionName: 'deck_sub_outside',
+    }));
+    await flushAsync();
+
+    expect(daemon.sentJson.some((msg) => msg.requestId === 'outside-history')).toBe(false);
+    expect(shared.sentJson).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: 'error',
+        code: SHARE_REASONS.DIRECT_SURFACE_DENIED,
+        originalType: TIMELINE_MESSAGES.HISTORY_REQUEST,
+        requestId: 'outside-history',
       }),
     ]));
   });
@@ -859,6 +1267,131 @@ describe('WsBridge share-scoped sockets', () => {
       expect.objectContaining({ type: 'discussion.started', discussionId: 'discussion-1' }),
     ]));
     expect(otherShared.sentJson.some((msg) => msg.type === 'discussion.started')).toBe(false);
+  });
+
+  it('allows participants to save only covered Team config and denies viewers or outside session entries', async () => {
+    const bridge = WsBridge.get(serverId);
+    const target: ShareTarget = { kind: 'main', serverId, sessionName: 'deck_proj_brain' };
+    const auditRows: AuditInsert[] = [];
+    let role: 'viewer' | 'participant' = 'participant';
+    bridge.setShareCoverageResolverForTests(async () => coverage(target, role, now));
+    const db = makeDb(null, auditRows, {
+      subSessions: [{ id: 'child_1', parent_session: 'deck_proj_brain' }],
+    });
+    const daemon = new MockWs();
+    bridge.handleDaemonConnection(daemon as never, db, {} as never);
+    daemon.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+    await flushAsync();
+    daemon.sent.length = 0;
+
+    const participant = new MockWs();
+    bridge.handleShareBrowserConnection(participant as never, 'participant-user', db, {
+      ticketId: 'share-team-config',
+      target,
+      snapshot: coverage(target, 'participant', now),
+    });
+    participant.emit('message', JSON.stringify({
+      type: P2P_CONFIG_MSG.SAVE,
+      requestId: 'team-config-covered',
+      scopeSession: 'deck_proj_brain',
+      config: {
+        sessions: { deck_sub_child_1: { enabled: true, mode: 'review' } },
+        rounds: 2,
+      },
+      sharedActor: { actorUserId: 'spoofed' },
+      unexpected: 'drop-me',
+    }));
+    await flushAsync();
+
+    expect(daemon.sentJson).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: P2P_CONFIG_MSG.SAVE,
+        requestId: 'team-config-covered',
+        scopeSession: 'deck_proj_brain',
+        config: {
+          sessions: { deck_sub_child_1: { enabled: true, mode: 'review' } },
+          rounds: 2,
+        },
+      }),
+    ]));
+    const forwarded = daemon.sentJson.find((msg) => msg.requestId === 'team-config-covered');
+    expect(forwarded).not.toHaveProperty('unexpected');
+    expect(forwarded).not.toHaveProperty('sharedActor');
+    expect(auditRows).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        actorUserId: 'participant-user',
+        actionType: 'p2p.orchestration',
+        decision: 'accepted',
+        actionId: 'team-config-covered',
+      }),
+    ]));
+
+    daemon.sent.length = 0;
+    participant.emit('message', JSON.stringify({
+      type: P2P_CONFIG_MSG.SAVE,
+      requestId: 'team-config-outside',
+      scopeSession: 'deck_proj_brain',
+      config: {
+        sessions: { deck_other_worker: { enabled: true, mode: 'review' } },
+        rounds: 1,
+      },
+    }));
+    await flushAsync();
+    expect(participant.sentJson).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: 'error',
+        code: SHARE_REASONS.DIRECT_SURFACE_DENIED,
+        originalType: P2P_CONFIG_MSG.SAVE,
+      }),
+    ]));
+    expect(daemon.sentJson.some((msg) => msg.requestId === 'team-config-outside')).toBe(false);
+
+    participant.emit('message', JSON.stringify({
+      type: P2P_CONFIG_MSG.SAVE,
+      requestId: 'team-config-nested-outside',
+      scopeSession: 'deck_proj_brain',
+      config: {
+        sessions: {},
+        rounds: 1,
+        workflowDraft: {
+          participants: [{ sessionName: 'deck_other_worker' }],
+        },
+      },
+    }));
+    await flushAsync();
+    expect(participant.sentJson).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: 'error',
+        code: SHARE_REASONS.DIRECT_SURFACE_DENIED,
+        originalType: P2P_CONFIG_MSG.SAVE,
+        requestId: 'team-config-nested-outside',
+      }),
+    ]));
+    expect(daemon.sentJson.some((msg) => msg.requestId === 'team-config-nested-outside')).toBe(false);
+
+    role = 'viewer';
+    now += 1;
+    const viewer = new MockWs();
+    bridge.handleShareBrowserConnection(viewer as never, 'viewer-user', db, {
+      ticketId: 'share-team-config-viewer',
+      target,
+      snapshot: coverage(target, 'viewer', now),
+    });
+    viewer.emit('message', JSON.stringify({
+      type: P2P_CONFIG_MSG.SAVE,
+      requestId: 'team-config-viewer',
+      scopeSession: 'deck_proj_brain',
+      config: { sessions: {}, rounds: 1 },
+    }));
+    await flushAsync();
+    expect(viewer.sentJson).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: 'error',
+        code: SHARE_REASONS.ROLE_DENIED,
+        originalType: P2P_CONFIG_MSG.SAVE,
+      }),
+    ]));
+    expect(daemon.sentJson.some((msg) => msg.requestId === 'team-config-viewer')).toBe(false);
   });
 
   it('denies viewer and out-of-scope share Team discussion starts before daemon forwarding', async () => {

@@ -1,6 +1,9 @@
 import type { FsReadErrorCode, FsReadPreviewReason } from '../../../shared/fs-read-error-codes.js';
 import { FS_TRANSPORT_MSG } from '../../../shared/fs-transport-messages.js';
 
+/** Virtual path used by shared clients that are not allowed to learn projectDir before browsing. */
+export const FS_SESSION_ROOT_PATH = ':session-root:';
+
 export interface FsEntry {
   name: string;
   /** Absolute path for this entry when the parent is a virtual root (e.g. Windows drives). */
@@ -73,6 +76,8 @@ export interface FsWriteRequest {
   expectedMtime?: number;
   /** Create a new file only; fail if the target already exists. */
   createOnly?: boolean;
+  /** Session whose project directory scopes this write, when available. */
+  sessionName?: string;
 }
 
 export interface FsWriteOptions {
@@ -80,6 +85,8 @@ export interface FsWriteOptions {
   expectedMtime?: number;
   /** Create a new file only; fail if the target already exists. */
   createOnly?: boolean;
+  /** Session whose project directory scopes this write, when available. */
+  sessionName?: string;
 }
 
 export interface FsWriteResponse extends Omit<FsBaseResponse, 'status'> {

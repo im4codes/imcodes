@@ -35,7 +35,7 @@ describe('StartSubSessionDialog', () => {
     cleanup();
   });
 
-  it('shows Claude, Codex, Qoder, OpenCode, and Grok SDK options', () => {
+  it('shows Claude, Codex, Qoder, OpenCode, Grok, and DeepSeek Harness options', () => {
     render(
       <StartSubSessionDialog
         ws={makeWs() as any}
@@ -53,6 +53,7 @@ describe('StartSubSessionDialog', () => {
     expect(screen.getByRole('button', { name: /qoder_sdk/i })).toBeDefined();
     expect(screen.getByRole('button', { name: /opencode_sdk/i })).toBeDefined();
     expect(screen.getByRole('button', { name: /grok_sdk/i })).toBeDefined();
+    expect(screen.getByRole('button', { name: /deepseek_harness/i })).toBeDefined();
   });
 
   it('defaults to claude-code-sdk and renders transport/process groups separately', () => {
@@ -388,7 +389,7 @@ describe('StartSubSessionDialog', () => {
     });
   });
 
-  it('custom provider SDK locks sub-sessions to claude-code-sdk and passes the selected preset', async () => {
+  it('custom provider SDK allows selecting dsh from the SDK-compatible types and passes the selected preset', async () => {
     const onStart = vi.fn();
     const ws = makeWs();
     ws.onMessage.mockImplementation((handler: (msg: unknown) => void) => {
@@ -421,12 +422,18 @@ describe('StartSubSessionDialog', () => {
     fireEvent.click(screen.getByLabelText(/custom_provider_sdk/i));
 
     await waitFor(() => expect(screen.getByRole('button', { name: /claude_code_sdk/i }).className).toContain('active'));
-    expect((screen.getByRole('button', { name: /codex_sdk/i }) as HTMLButtonElement).disabled).toBe(true);
+    // Non-SDK types (e.g., codex-sdk) are filtered out and no longer rendered.
+    expect(screen.queryByRole('button', { name: /codex_sdk/i })).toBeNull();
+    // dsh (deepseek-harness) is now a visible, selectable button when custom provider SDK is on.
+    const dshBtn = screen.getByRole('button', { name: /deepseek_harness/i }) as HTMLButtonElement;
+    expect(dshBtn.disabled).toBe(false);
     expect(screen.getByText('custom_provider_preset')).toBeDefined();
 
+    // Select dsh and launch the sub-session; the preset should still be passed through.
+    fireEvent.click(dshBtn);
     fireEvent.click(screen.getByRole('button', { name: /launch/i }));
 
-    expect(onStart).toHaveBeenCalledWith('claude-code-sdk', undefined, '/tmp', undefined, expect.objectContaining({
+    expect(onStart).toHaveBeenCalledWith('deepseek-harness', undefined, '/tmp', undefined, expect.objectContaining({
       ccPreset: 'MiniMax',
     }));
   });
@@ -593,6 +600,30 @@ describe('StartSubSessionDialog', () => {
 
     expect(onStart).toHaveBeenCalledWith('kimi-sdk', undefined, '/tmp', undefined, {
       requestedModel: 'moonshot-v1-auto,thinking',
+    });
+  });
+
+  it('passes requestedModel for deepseek-harness sub-sessions', () => {
+    const onStart = vi.fn();
+    render(
+      <StartSubSessionDialog
+        ws={makeWs() as any}
+        defaultCwd="/tmp"
+        isProviderConnected={() => false}
+        getRemoteSessions={() => []}
+        refreshSessions={vi.fn()}
+        onStart={onStart}
+        onClose={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /deepseek_harness/i }));
+    // The daemon catalogue for `dsh` is always empty, so the picker is free text.
+    fireEvent.input(screen.getByPlaceholderText('selectModel'), { target: { value: 'deepseek-reasoner' } });
+    fireEvent.click(screen.getByRole('button', { name: /launch/i }));
+
+    expect(onStart).toHaveBeenCalledWith('deepseek-harness', undefined, '/tmp', undefined, {
+      requestedModel: 'deepseek-reasoner',
     });
   });
 

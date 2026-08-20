@@ -24,6 +24,7 @@ import {
   BACKGROUND_SUBAGENT_WAKE_MODES,
   CONNECTION_MODES,
   normalizeProviderPayload,
+  PROVIDER_ACTIVE_TURN_DELIVERY_KINDS,
   SESSION_OWNERSHIP,
   PROVIDER_ERROR_CODES,
 } from '../transport-provider.js';
@@ -82,6 +83,10 @@ const CLAUDE_AUTH_REFRESH_RETRY_LIMIT = 1;
 const DEFAULT_CLAUDE_AUTH_REFRESH_WAIT_MS = 2 * 60 * 1000;
 const DEFAULT_CLAUDE_AUTH_REFRESH_POLL_MS = 500;
 const CLAUDE_AUTH_RECOVERY_GUIDANCE = 'Authentication recovery required: run `/logout`, fully exit Claude Code, then reopen it and run `/login` before retrying.';
+const CLAUDE_SDK_INPUT_PRIORITIES = {
+  IMMEDIATE: 'now',
+  NEXT_SAFE_BOUNDARY: 'next',
+} as const;
 
 // Claude Code ships native scheduling tools (RemoteTrigger creates a claude.ai
 // routine; the Cron* tools manage them) that bypass IM.codes entirely. We
@@ -745,6 +750,10 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
         state.pendingComplete = undefined;
         state.pendingError = undefined;
         this.clearTaskNotificationWake(state);
+        // A new visible turn starts here without going through startQuery, so
+        // none of its per-turn resets run. Finished subagent rows from the
+        // previous turn would otherwise stay and be re-notified later.
+        this.pruneTerminalSubagentTasks(state);
         state.inputQueue.push(queued.assembledMessage);
         return;
       }
@@ -770,19 +779,34 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     if (!state?.currentQuery || !state.inputQueue || state.cancelled) {
       return AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE;
     }
+    // A queue-appended message is ordinary composer input that merely arrives
+    // mid-turn, so it must keep the provenance it would have had if the queue
+    // had drained normally. Marking it synthetic peer input made the SAME text
+    // human-authored when it drained and "not from the user" when it was
+    // appended. Only genuine runtime notifications (delegation replies, peer
+    // audits) are synthetic peer input.
+    const isQueuedUserMessage = notification.deliveryKind
+      === PROVIDER_ACTIVE_TURN_DELIVERY_KINDS.QUEUED_MESSAGE;
     state.inputQueue.push({
       type: 'user',
       message: { role: 'user', content: notification.text },
       parent_tool_use_id: null,
       uuid: notification.notificationId,
-      priority: 'now',
-      origin: {
-        kind: 'peer',
-        from: notification.sourceSessionName,
-        name: notification.delegationId,
-      },
+      // Queue append is not a user interrupt. `now` preempts the current
+      // Agent SDK turn (which makes the UI look as if the agent slept); `next`
+      // drains after the current tool result and before the next model request.
+      priority: isQueuedUserMessage
+        ? CLAUDE_SDK_INPUT_PRIORITIES.NEXT_SAFE_BOUNDARY
+        : CLAUDE_SDK_INPUT_PRIORITIES.IMMEDIATE,
+      origin: isQueuedUserMessage
+        ? { kind: 'human' }
+        : {
+          kind: 'peer',
+          from: notification.sourceSessionName,
+          name: notification.delegationId,
+        },
       shouldQuery: true,
-      isSynthetic: true,
+      ...(isQueuedUserMessage ? {} : { isSynthetic: true }),
     } as SDKUserMessage);
     return AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED;
   }
@@ -829,6 +853,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     this.clearResultCompletionFallback(state);
     this.clearTaskNotificationWake(state);
     state.retainedSubagentMode = false;
+    this.pruneTerminalSubagentTasks(state);
     state.toolCalls.clear();
     state.runtimeAgentToolCalls.clear();
     state.emittedToolStates.clear();
@@ -1320,8 +1345,16 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
         // with the previous message's full text. Without this, the new bubble
         // briefly shows "<prev message text><new delta>" and only snaps to the
         // correct text when the message completes — visible flicker/bleed.
-        state.currentText = '';
-        state.currentMessageId = event.message?.id ? String(event.message.id) : null;
+        //
+        // Foreground only: subagent messages ride this same stream, and
+        // `currentText` / `currentMessageId` describe the foreground message.
+        // A Task's message_start resetting them wiped the main bubble's text
+        // mid-turn. Usage below is NOT gated — a subagent's tokens are still
+        // this session's tokens.
+        if (msg.parent_tool_use_id == null) {
+          state.currentText = '';
+          state.currentMessageId = event.message?.id ? String(event.message.id) : null;
+        }
         // Anthropic-compatible streaming responses publish the authoritative
         // prompt-cache split on message_start. MiniMax follows that contract,
         // while its trailing Claude Agent SDK result frame can contain an
@@ -1350,6 +1383,14 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
           this.emitClaudeRuntimeSubagentSnapshot(sessionId, state, runtimeSubagentPayload);
           return;
         }
+        // Foreground text only. A subagent's deltas used to append here and go
+        // out under the foreground `currentMessageId`, so the main bubble's
+        // text was progressively replaced by the Task's output — first spliced
+        // onto the end of the real sentence, then overwritten wholesale as the
+        // subagent's own message boundaries reset the shared buffer. Subagent
+        // progress reaches the UI through the runtime-subagent snapshots
+        // instead, so dropping it from this accumulator loses nothing.
+        if (msg.parent_tool_use_id != null) return;
         state.currentText += event.delta.text;
         const messageId = makeMessageId(state);
         state.currentMessageId = messageId;
@@ -2297,6 +2338,28 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       }, 'Claude SDK subagent task(s) stale without terminal update; closing provider active-work evidence');
     }
     return expired;
+  }
+
+  /**
+   * Drop subagent rows that already reached a terminal state.
+   *
+   * `subagentTasks` was append-only: nothing ever removed an entry, and the map
+   * survives session re-create (`subagentTasks: existing?.subagentTasks ?? …`).
+   * Rows from a finished turn therefore sat in it forever, and two turn-blind
+   * paths kept acting on them — the 15-minute stale sweep and cancel both flip
+   * such a row terminal AND emit a snapshot for it. That snapshot is what
+   * reaches the session as a completion notice naming a task the current turn
+   * never started; the dedupe that would have suppressed a repeat
+   * (`emittedSubagentStates`) is cleared on every real query start, so the
+   * ghost's re-emission passes it.
+   *
+   * Only terminal rows go. A retained query exists precisely because live
+   * subagents are still running, and those must keep their bookkeeping.
+   */
+  private pruneTerminalSubagentTasks(state: ClaudeSdkSessionState): void {
+    for (const [taskId, task] of state.subagentTasks) {
+      if (task.terminal || !task.active) state.subagentTasks.delete(taskId);
+    }
   }
 
   private activeClaudeSubagentTasks(state: ClaudeSdkSessionState): ClaudeTaskState[] {

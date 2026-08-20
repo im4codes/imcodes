@@ -19,6 +19,26 @@ import {
   writeExactly,
 } from '../../src/node/enrollment.js';
 import { NODE_ROLE } from '../../shared/remote-exec.js';
+import {
+  buildWindowsAuthenticodeEnrollmentPlan,
+  inspectWindowsAuthenticodeEnrollmentContainer,
+} from '../../shared/windows-authenticode-enrollment.js';
+
+function fakeSignedPe(): Buffer {
+  const file = Buffer.alloc(528, 0x5a);
+  file.writeUInt32LE(0x80, 0x3c);
+  file.writeUInt32LE(0x00004550, 0x80);
+  const optional = 0x80 + 24;
+  file.writeUInt16LE(0x20b, optional);
+  file.writeUInt32LE(16, optional + 108);
+  const securityEntry = optional + 112 + 4 * 8;
+  file.writeUInt32LE(512, securityEntry);
+  file.writeUInt32LE(16, securityEntry + 4);
+  file.writeUInt32LE(16, 512);
+  file.writeUInt16LE(0x0200, 516);
+  file.writeUInt16LE(0x0002, 518);
+  return file;
+}
 
 function redeemResponse(
   value: unknown,
@@ -177,6 +197,33 @@ describe('copyCleanExecutable', () => {
     expect(receipt.sha256).toMatch(/^[a-f0-9]{64}$/);
     if (process.platform !== 'win32') {
       expect(((await stat(dest)).mode & 0o777) & 0o002).toBe(0);
+    }
+  });
+
+  it('restores a personalized Windows certificate-table package to byte-identical signed bytes', async () => {
+    const original = fakeSignedPe();
+    const blob = encodeEnrollmentBlob({ serverUrl: 'https://im.example', enrollToken: 'once' });
+    const plan = buildWindowsAuthenticodeEnrollmentPlan(original, original.length, blob)!;
+    const personalized = Buffer.concat([Buffer.from(original), plan.certificateEntry]);
+    plan.patchedCertificateTableSize.copy(personalized, plan.sizeFieldOffset);
+    const restore = inspectWindowsAuthenticodeEnrollmentContainer(
+      personalized,
+      personalized.length,
+      personalized,
+      0,
+      plan.trailerStart,
+      blob.length,
+    )!;
+    const sourcePath = join(dir, 'signed-personalized.exe');
+    const destPath = join(dir, 'signed-staged.exe');
+    await writeFile(sourcePath, personalized);
+    const source = await openVerifiedEnrollmentSource(sourcePath);
+    try {
+      const receipt = await source.stageTrailerFreeExecutable(destPath, plan.trailerStart, restore);
+      expect(receipt.size).toBe(original.length);
+      await expect(readFile(destPath)).resolves.toEqual(original);
+    } finally {
+      await source.close();
     }
   });
 

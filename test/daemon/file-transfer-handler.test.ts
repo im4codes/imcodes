@@ -371,6 +371,80 @@ describe('file-transfer local handle hardening', () => {
     }));
   });
 
+  it('lists only child directories through the bounded directory picker', async () => {
+    const parent = path.join(rootDir, 'directory-picker');
+    await mkdir(path.join(parent, 'visible'), { recursive: true });
+    await mkdir(path.join(parent, '.hidden'), { recursive: true });
+    await writeFile(path.join(parent, 'ignored.txt'), 'not a directory');
+    const transfer = await loadFileTransferHandler(fakeHome);
+    const result = createServerLinkMock();
+
+    await transfer.handleFileDirectoryList({
+      type: FILE_TRANSFER_MSG.DIRECTORY_LIST,
+      requestId: 'directory-list-1',
+      path: parent,
+    }, result.serverLink);
+
+    expect(result.sent).toEqual([{
+      type: FILE_TRANSFER_MSG.DIRECTORY_LIST_DONE,
+      requestId: 'directory-list-1',
+      path: parent,
+      resolvedPath: await realpath(parent),
+      entries: [
+        { name: '.hidden', path: path.join(await realpath(parent), '.hidden'), isDir: true, hidden: true },
+        { name: 'visible', path: path.join(await realpath(parent), 'visible'), isDir: true, hidden: false },
+      ],
+    }]);
+  });
+
+  it('commits a relay upload into the selected existing directory without overwrite', async () => {
+    const destinationDirectory = path.join(rootDir, 'remote-destination');
+    await mkdir(destinationDirectory, { recursive: true });
+    const transfer = await loadFileTransferHandler(fakeHome);
+    const fetchMock = vi.fn().mockResolvedValue(new Response('hello', { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+    const done = createServerLinkMock();
+
+    await transfer.handleFileUploadFetch({
+      type: FILE_TRANSFER_MSG.UPLOAD_FETCH,
+      uploadId: 'upload-to-directory',
+      clientUploadId: 'client-upload-to-directory',
+      filename: 'abcdef1234567890.txt',
+      originalName: 'report.txt',
+      mime: 'text/plain',
+      size: 5,
+      downloadUrl: 'https://relay.example/staged',
+      destinationDirectory,
+    }, done.serverLink as never);
+
+    await expect(stat(path.join(destinationDirectory, 'report.txt'))).resolves.toMatchObject({ size: 5 });
+    expect(done.sent).toContainEqual(expect.objectContaining({
+      type: FILE_TRANSFER_MSG.UPLOAD_DONE,
+      uploadId: 'upload-to-directory',
+      attachment: expect.objectContaining({
+        source: 'local',
+        daemonPath: await realpath(path.join(destinationDirectory, 'report.txt')),
+        originalName: 'report.txt',
+      }),
+    }));
+
+    const refused = createServerLinkMock();
+    await transfer.handleFileUploadFetch({
+      type: FILE_TRANSFER_MSG.UPLOAD_FETCH,
+      uploadId: 'upload-existing-destination',
+      filename: 'abcdef1234567891.txt',
+      originalName: 'report.txt',
+      size: 5,
+      downloadUrl: 'https://relay.example/staged-again',
+      destinationDirectory,
+    }, refused.serverLink as never);
+    expect(refused.sent).toContainEqual(expect.objectContaining({
+      type: FILE_TRANSFER_MSG.UPLOAD_ERROR,
+      uploadId: 'upload-existing-destination',
+    }));
+    await expect(stat(path.join(destinationDirectory, 'report.txt'))).resolves.toMatchObject({ size: 5 });
+  });
+
   it('deletes a completed upload and its metadata while refusing local project handles', async () => {
     const transfer = await loadFileTransferHandler(fakeHome);
     const uploaded = createServerLinkMock();

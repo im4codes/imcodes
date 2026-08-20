@@ -23,6 +23,7 @@ describe('computer-use shared protocol', () => {
     expect(computerUseDocs('browser')).toContain('Playwright connect_over_cdp');
     expect(computerUseDocs('browser')).toContain('127.0.0.1 only');
     expect(computerUseDocs('browser')).toContain("browser_* is IM.codes' built-in CDP path");
+    expect(computerUseDocs('browser')).toContain('Search fallback: Bing /search?q=<keywords>; then Google or DuckDuckGo.');
     expect(computerUseDocs('overview')).toContain('Open Computer Use (OCU) supplies the integrated cross-platform desktop-app control path');
     expect(computerUseDocs('overview')).toContain('do not probe for or install a separate Playwright runtime');
   });

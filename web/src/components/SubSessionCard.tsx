@@ -50,6 +50,7 @@ const TYPE_ICON: Record<string, string> = {
   'gemini-sdk': '♊',
   'grok-sdk': '𝕏',
   'kimi-sdk': '月',
+  'deepseek-harness': '🐳',
   'shell': '🐚',
   'script': '🔄',
 };
@@ -234,7 +235,10 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
   }, [connected, retryOptimisticMessage, sub.sessionName, ws]);
 
   // Build a SessionInfo for SessionControls compact mode
-  const sessionInfo = useMemo<SessionInfo>(() => buildCompactSessionInfo(sub), [sub]);
+  const sessionInfo = useMemo<SessionInfo>(() => ({
+    ...buildCompactSessionInfo(sub),
+    sharedState,
+  }), [sharedState, sub]);
 
   const forceFollowLatest = useCallback(() => {
     if (isShell) termScrollRef.current?.();
@@ -293,6 +297,7 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
     const payload = {
       sessionName: sub.sessionName,
       commandId: globalThis.crypto?.randomUUID?.() ?? `cancel-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+      ...(sharedState?.activeDispatchId ? { observedDispatchId: sharedState.activeDispatchId } : {}),
     };
     let wsThrown: unknown = null;
     if (ws) {
@@ -315,7 +320,7 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
     // No WS, no serverId → nowhere to send. Surface so it's not invisible.
     // eslint-disable-next-line no-console
     console.warn('handleTransportStop: no transport available', { wsThrown });
-  }, [ws, sub.sessionName, sub.state, serverId]);
+  }, [ws, sub.sessionName, sub.state, serverId, sharedState?.activeDispatchId]);
 
   const busy = useMemo(() => isVisuallyBusy(sub.state, !!getActiveThinkingTs(events)), [events, sub.state]);
   // Preview cards always follow the latest content.
@@ -469,7 +474,10 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
       {/* Compact input — reuses SessionControls with @picker, ⚡, 📎, paste upload */}
       <div class="subcard-input-area" onClick={(e) => e.stopPropagation()}>
         <div class="subcard-input-row">
-          {isTransportRuntime(sub) && (
+          {/* Fallback cards do not mount SessionControls. Keep their direct
+              cancel, while compact SessionControls uses the ordinary
+              queue-aware Stop button in its left toolbar. */}
+          {isTransportRuntime(sub) && !quickData && (
             <button
               class="subcard-stop-btn"
               type="button"

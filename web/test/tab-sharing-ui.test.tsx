@@ -52,6 +52,12 @@ const messages: Record<string, string> = {
   'share.roleHelp.participant': 'Can send.',
   'share.trust.title': 'Participant trust disclosure',
   'share.trust.body': 'Agents are not sandboxed.',
+  'controlled_nodes.share.title': 'Share controlled node',
+  'controlled_nodes.share.subtitle': 'Grant access to {{target}}',
+  'controlled_nodes.share.role_help.viewer': 'Can view this node.',
+  'controlled_nodes.share.role_help.participant': 'Can control this node.',
+  'controlled_nodes.share.trust_title': 'Machine control disclosure',
+  'controlled_nodes.share.trust_body': 'Only share with someone you trust.',
   'share.recipient.label': 'Recipient',
   'share.recipient.placeholder': 'User ID or email',
   'share.list.label': 'Shared users',
@@ -410,6 +416,43 @@ describe('collaborative tab sharing UI', () => {
     expect(screen.queryByText('share-1')).toBeNull();
   });
 
+  it('uses the same grant API for a fixed controlled-node target without Tab scope choices', async () => {
+    apiMocks.listSharesForTarget.mockResolvedValue([]);
+    apiMocks.createShare.mockResolvedValue({
+      id: 'machine-share',
+      targetUserId: 'recipient-1',
+      targetUserDisplayName: 'Recipient One',
+      role: 'participant',
+      status: 'active',
+    });
+    render(
+      <ShareSessionDialog
+        variant="machine"
+        fixedTarget={{ kind: 'server', serverId: 'machine-1' }}
+        target={{
+          serverId: 'machine-1',
+          serverLabel: 'Office Node',
+          sessionName: '',
+          tabLabel: 'Office Node',
+        }}
+        onClose={() => {}}
+      />,
+    );
+
+    expect(await screen.findByText('Share controlled node')).not.toBeNull();
+    expect(screen.queryByLabelText('Target')).toBeNull();
+    fireEvent.click(screen.getByLabelText('Participant'));
+    expect(screen.getByText('Machine control disclosure')).not.toBeNull();
+    fireEvent.input(screen.getByLabelText('Recipient'), { target: { value: 'recipient-1' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Create share' }));
+
+    await waitFor(() => expect(apiMocks.createShare).toHaveBeenCalledWith('machine-1', {
+      target: { kind: 'server', serverId: 'machine-1' },
+      targetUserId: 'recipient-1',
+      role: 'participant',
+    }));
+  });
+
   it('lets managers update and revoke existing shares from the share dialog', async () => {
     vi.stubGlobal('confirm', vi.fn(() => true));
     apiMocks.listSharesForTarget.mockResolvedValue([
@@ -457,6 +500,56 @@ describe('collaborative tab sharing UI', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Revoke' }));
     await waitFor(() => expect(apiMocks.revokeShare).toHaveBeenCalledWith('srv-1', 'share-1'));
     expect(await screen.findByText('Revoked')).not.toBeNull();
+  });
+
+  it('keeps an equivalent machine target stable across presence refreshes and saves a role once', async () => {
+    apiMocks.listSharesForTarget.mockResolvedValue([
+      {
+        id: 'share-1',
+        targetUserId: 'user-1',
+        targetUserDisplayName: 'User One',
+        role: 'viewer',
+        status: 'active',
+      },
+    ]);
+    apiMocks.updateShare.mockResolvedValue({
+      id: 'share-1',
+      targetUserId: 'user-1',
+      targetUserDisplayName: 'User One',
+      role: 'participant',
+      status: 'active',
+    });
+
+    const renderDialog = () => (
+      <ShareSessionDialog
+        variant="machine"
+        fixedTarget={{ kind: 'server', serverId: 'machine-1' }}
+        target={{
+          serverId: 'machine-1',
+          serverLabel: 'Office Node',
+          sessionName: '',
+          tabLabel: 'Office Node',
+        }}
+        onClose={() => {}}
+      />
+    );
+    const view = render(renderDialog());
+
+    expect(await screen.findByText('User One')).not.toBeNull();
+    expect(apiMocks.listSharesForTarget).toHaveBeenCalledTimes(1);
+
+    // Simulate the machine presence poll rerendering its parent with fresh but
+    // semantically identical inline objects.
+    view.rerender(renderDialog());
+    await Promise.resolve();
+    expect(apiMocks.listSharesForTarget).toHaveBeenCalledTimes(1);
+
+    const roleSelect = screen.getByLabelText('Role for User One') as HTMLSelectElement;
+    fireEvent.input(roleSelect, { target: { value: 'participant' } });
+    await waitFor(() => expect(apiMocks.updateShare).toHaveBeenCalledTimes(1));
+    expect(apiMocks.updateShare).toHaveBeenCalledWith('machine-1', 'share-1', { role: 'participant' });
+    await waitFor(() => expect(roleSelect.value).toBe('participant'));
+    expect(apiMocks.listSharesForTarget).toHaveBeenCalledTimes(1);
   });
 
   it('renders recipient shared entries and opens the selected target', () => {

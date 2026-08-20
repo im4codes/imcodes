@@ -6,7 +6,7 @@ import { createUser, getUserById, getUserByUsername, getSetting, updateUserStatu
 import { randomHex, sha256Hex, signJwt, verifyJwt, hashPassword, verifyPassword } from '../security/crypto.js';
 import { checkIdempotency, recordIdempotency } from '../security/replay.js';
 import { checkAuthLockout, recordAuthFailure } from '../security/lockout.js';
-import { resolveServerRole } from '../security/authorization.js';
+import { resolveServerWebSocketAccess } from '../security/authorization.js';
 import { WsBridge } from '../ws/bridge.js';
 import { COOKIE_SESSION, COOKIE_CSRF } from '../../../shared/cookie-names.js';
 import { deleteTokenUsageFactsForUser } from '../db/token-usage-queries.js';
@@ -395,8 +395,8 @@ authRoutes.post('/ws-ticket', async (c) => {
   if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
 
   // Check server access
-  const role = await resolveServerRole(c.env.DB, parsed.data.serverId, userId);
-  if (role === 'none') return c.json({ error: 'forbidden' }, 403);
+  const access = await resolveServerWebSocketAccess(c.env.DB, parsed.data.serverId, userId);
+  if (!access) return c.json({ error: 'forbidden' }, 403);
 
   const jti = randomHex(16);
   const ticket = signJwt(

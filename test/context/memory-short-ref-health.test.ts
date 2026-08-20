@@ -73,20 +73,54 @@ describe('memory short refs — persistence failure leaves the process', () => {
   });
 
   it('stays set after the failure so a later reader still sees it', async () => {
-    // Sticky, not edge-triggered: whoever reconnects after the incident has to
-    // be able to learn that handles stopped persisting.
-    runMock.mockRejectedValue(new Error('ENOSPC: no space left on device'));
-    registerMemoryShortRefs([entry]);
-    await vi.waitFor(() => expect(getMemoryShortRefHealth()).toBeDefined());
+    vi.useFakeTimers();
+    try {
+      // Sticky while unresolved: whoever reconnects after the incident has to
+      // be able to learn that handles stopped persisting.
+      runMock.mockRejectedValue(new Error('ENOSPC: no space left on device'));
+      registerMemoryShortRefs([entry]);
+      await vi.waitFor(() => expect(getMemoryShortRefHealth()).toBeDefined());
 
-    // Any number of later reads report the same standing failure.
-    expect(getMemoryShortRefHealth()).toBeDefined();
-    expect(getMemoryShortRefHealth()).toBeDefined();
+      // Any number of later reads report the same standing failure.
+      expect(getMemoryShortRefHealth()).toBeDefined();
+      expect(getMemoryShortRefHealth()).toBeDefined();
 
-    // A second failure accumulates rather than resetting, so a stuck disk is
-    // distinguishable from a single blip.
-    registerMemoryShortRefs([{ ...entry, id: 'second-id' }]);
-    await vi.waitFor(() => expect(getMemoryShortRefHealth()!.failures).toBeGreaterThan(1));
+      // A retry failure accumulates rather than resetting, so a stuck disk is
+      // distinguishable from a single blip.
+      registerMemoryShortRefs([{ ...entry, id: 'second-id' }]);
+      await vi.runOnlyPendingTimersAsync();
+      await vi.waitFor(() => expect(getMemoryShortRefHealth()!.failures).toBeGreaterThan(1));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('retries failed rows and clears the heartbeat only after they are durable', async () => {
+    vi.useFakeTimers();
+    try {
+      runMock
+        .mockRejectedValueOnce(new Error('context-store worker unavailable for op: upsertMemoryShortRefs'))
+        .mockResolvedValueOnce(1);
+
+      registerMemoryShortRefs([entry]);
+      await vi.waitFor(() => expect(getMemoryShortRefHealth()).toMatchObject({ stage: 'persist_store' }));
+      const queuedWhileDown = { ...entry, id: 'queued-while-worker-down' };
+      registerMemoryShortRefs([queuedWhileDown]);
+
+      await vi.runOnlyPendingTimersAsync();
+      await vi.waitFor(() => expect(runMock).toHaveBeenCalledTimes(2));
+
+      expect(runMock.mock.calls[1]).toEqual([
+        'upsertMemoryShortRefs',
+        [expect.arrayContaining([
+          expect.objectContaining({ id: entry.id }),
+          expect.objectContaining({ id: queuedWhileDown.id }),
+        ])],
+      ]);
+      expect(getMemoryShortRefHealth()).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('reports a failed warm-load too, not only writes', async () => {

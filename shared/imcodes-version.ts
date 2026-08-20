@@ -88,6 +88,20 @@ export function compareImcodesVersions(a: string, b: string): number | null {
   return 0;
 }
 
+/**
+ * True when `current` is strictly older than `target`. Both must be parseable
+ * IM.codes versions; anything unknown (missing report, local dev build, target
+ * unset) is reported as up to date so a display never invents an upgrade.
+ */
+export function isImcodesVersionOutdated(
+  current: string | null | undefined,
+  target: string | null | undefined,
+): boolean {
+  if (!current || !target) return false;
+  const compared = compareImcodesVersions(current, target);
+  return compared !== null && compared < 0;
+}
+
 export function isLocalDevImcodesVersion(version: string): boolean {
   return version.trim().startsWith('0.');
 }

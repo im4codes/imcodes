@@ -1,3 +1,4 @@
+import { P2P_ROUTING_FIELDS } from './p2p-routing-fields.js';
 import { isSessionAgentType } from './agent-types.js';
 import { isValidImcodesSessionName } from './session-scope.js';
 
@@ -125,6 +126,7 @@ export const DELEGATION_REPLY_CAPABLE_AGENT_TYPES = [
   'qwen',
   'openclaw',
   'kimi-sdk',
+  'deepseek-harness',
 ] as const;
 export type DelegationReplyCapableAgentType = typeof DELEGATION_REPLY_CAPABLE_AGENT_TYPES[number];
 
@@ -164,24 +166,15 @@ export const AGENT_DELEGATION_FORBIDDEN_COMMAND_FIELDS = [
 
 export type AgentDelegationForbiddenCommandField = typeof AGENT_DELEGATION_FORBIDDEN_COMMAND_FIELDS[number];
 
+/**
+ * Derived from `P2P_ROUTING_FIELDS` so the delegation rejection and the share
+ * scope check cannot drift. `p2pExcludeSameType` is delegation-only — it tunes
+ * a fan-out rather than naming a target — so it is appended here rather than
+ * added to the routing list the share checker sweeps.
+ */
 export const AGENT_DELEGATION_MIXED_P2P_FIELDS = [
-  'p2pAtTargets',
-  'directTargetSession',
-  'directTargetMode',
-  'p2pMode',
-  'p2pSessionConfig',
-  'p2pWorkflowLaunchEnvelope',
-  'workflowLaunchEnvelope',
-  'p2pRounds',
-  'p2pExtraPrompt',
-  'p2pLocale',
-  'p2pHopTimeoutMs',
+  ...P2P_ROUTING_FIELDS,
   'p2pExcludeSameType',
-  'p2pAdvancedPresetKey',
-  'p2pAdvancedRounds',
-  'p2pAdvancedRunTimeoutMinutes',
-  'p2pContextReducer',
-  'dedicatedExecutionRouting',
 ] as const;
 
 export type AgentDelegationMixedP2pField = typeof AGENT_DELEGATION_MIXED_P2P_FIELDS[number] | `p2p${string}`;

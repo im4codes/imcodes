@@ -19,6 +19,7 @@ const mockPreviewCoordinator = vi.hoisted(() => ({
   handle: vi.fn(),
   invalidate: vi.fn(),
 }));
+const mockLookupAttachment = vi.hoisted(() => vi.fn());
 
 // ── Mock fs/promises ───────────────────────────────────────────────────────
 vi.mock('node:fs/promises', () => ({
@@ -38,10 +39,19 @@ vi.mock('../../src/daemon/file-preview-read-coordinator.js', () => ({
   __resetPreviewReadCoordinatorForTests: vi.fn(),
 }), { virtual: true });
 
+vi.mock('../../src/daemon/file-transfer-handler.js', async (importOriginal) => ({
+  ...await importOriginal<typeof import('../../src/daemon/file-transfer-handler.js')>(),
+  lookupAttachment: mockLookupAttachment,
+}));
+
 // ── Pull the handler function out of command-handler indirectly ────────────
 // We test via handleWebCommand to keep the test at the public API level.
 import { handleWebCommand } from '../../src/daemon/command-handler.js';
+import * as sessionStore from '../../src/store/session-store.js';
 import { FS_GENERIC_ERROR_CODES } from '../../shared/fs-error-codes.js';
+import { FS_SESSION_ROOT_PATH } from '../../src/shared/transport/fs.js';
+import { __resetSessionFileReadGrantsForTests } from '../../src/daemon/session-file-read-grants.js';
+import { timelineStore } from '../../src/daemon/timeline-store.js';
 
 // Helper: make a Dirent-like object
 function makeDirent(name: string, isDir: boolean) {
@@ -62,7 +72,10 @@ describe('fs.ls handler', () => {
     // Restore send implementation after clearAllMocks resets it
     mockServerLink.send.mockImplementation((msg: unknown) => { sent.push(msg); });
     mockPreviewCoordinator.handle.mockImplementation(() => {});
+    mockLookupAttachment.mockReturnValue(undefined);
     mockStat.mockResolvedValue({ mtimeMs: 1, size: 0 } as any);
+    vi.spyOn(timelineStore, 'readByTypesPreferred').mockResolvedValue([]);
+    __resetSessionFileReadGrantsForTests();
   });
 
   afterEach(() => {
@@ -134,6 +147,324 @@ describe('fs.ls handler', () => {
     } finally {
       Object.defineProperty(process, 'platform', { value: origPlatform });
     }
+  });
+
+  it('confines shared-session directory browsing to the owning project root', async () => {
+    const projectDir = path.join(homedir(), 'project');
+    const outsideDir = path.join(homedir(), 'other');
+    vi.spyOn(sessionStore, 'getSession').mockReturnValue({ name: 'deck_project_brain', projectDir } as never);
+    mockRealpath.mockImplementation(async (target) => String(target));
+
+    handleWebCommand({
+      type: 'fs.ls',
+      path: outsideDir,
+      requestId: 'req-session-outside',
+      sessionName: 'deck_project_brain',
+    }, mockServerLink as any);
+    await flushAsync();
+
+    expect(mockReaddir).not.toHaveBeenCalled();
+    expect(sent[0]).toMatchObject({
+      type: 'fs.ls_response',
+      requestId: 'req-session-outside',
+      status: 'error',
+      error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH,
+    });
+  });
+
+  it('resolves the virtual shared-session root without requiring projectDir in the browser payload', async () => {
+    const projectDir = path.join(homedir(), 'private-project');
+    vi.spyOn(sessionStore, 'getSession').mockReturnValue({ name: 'deck_project_brain', projectDir } as never);
+    mockRealpath.mockImplementation(async (target) => String(target));
+    mockReaddir.mockResolvedValue([makeDirent('src', true)] as any);
+
+    handleWebCommand({
+      type: 'fs.ls',
+      path: FS_SESSION_ROOT_PATH,
+      requestId: 'req-session-root',
+      sessionName: 'deck_project_brain',
+    }, mockServerLink as any);
+    await flushAsync();
+
+    expect(mockReaddir).toHaveBeenCalledWith(projectDir, { withFileTypes: true });
+    expect(sent[0]).toMatchObject({
+      type: 'fs.ls_response',
+      requestId: 'req-session-root',
+      path: FS_SESSION_ROOT_PATH,
+      resolvedPath: projectDir,
+      status: 'ok',
+      entries: [expect.objectContaining({ name: 'src', isDir: true })],
+    });
+  });
+
+  it('confines shared-session file previews to the owning project root', async () => {
+    const projectDir = path.join(homedir(), 'project');
+    const outsideFile = path.join(homedir(), 'other', 'secret.png');
+    vi.spyOn(sessionStore, 'getSession').mockReturnValue({ name: 'deck_project_brain', projectDir } as never);
+    mockRealpath.mockImplementation(async (target) => String(target));
+    vi.mocked(fsp.lstat).mockResolvedValue({ isSymbolicLink: () => false } as fsp.Stats);
+
+    handleWebCommand({
+      type: 'fs.read',
+      path: outsideFile,
+      requestId: 'read-session-outside',
+      sessionName: 'deck_project_brain',
+    }, mockServerLink as any);
+    await flushAsync();
+
+    expect(mockPreviewCoordinator.handle).not.toHaveBeenCalled();
+    expect(sent[0]).toMatchObject({
+      type: 'fs.read_response',
+      requestId: 'read-session-outside',
+      status: 'error',
+      error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH,
+    });
+  });
+
+  it('allows an exact live registered upload to be previewed from a shared session', async () => {
+    const projectDir = path.join(homedir(), 'project');
+    const uploadRoot = path.join(homedir(), '.imcodes', 'uploads');
+    const uploadPath = path.join(uploadRoot, '392836a75fc67a4ff38c2dcedc9afe32.png');
+    vi.spyOn(sessionStore, 'getSession').mockReturnValue({ name: 'deck_project_brain', projectDir } as never);
+    mockLookupAttachment.mockReturnValue({
+      id: path.basename(uploadPath),
+      daemonPath: uploadPath,
+      source: 'upload',
+      createdAt: Date.now(),
+      expiresAt: Date.now() + 60_000,
+    });
+    vi.mocked(fsp.lstat).mockResolvedValue({ isSymbolicLink: () => false, isFile: () => true } as fsp.Stats);
+    mockRealpath.mockImplementation(async (target) => String(target));
+
+    handleWebCommand({
+      type: 'fs.read',
+      path: uploadPath,
+      requestId: 'read-shared-upload',
+      sessionName: 'deck_project_brain',
+    }, mockServerLink as any);
+    await flushAsync();
+
+    expect(sent).toEqual([]);
+    expect(mockPreviewCoordinator.handle).toHaveBeenCalledWith(uploadPath, 'read-shared-upload', expect.any(Function));
+  });
+
+  it('keeps unregistered files in the upload directory outside shared-session reach', async () => {
+    const projectDir = path.join(homedir(), 'project');
+    const uploadPath = path.join(homedir(), '.imcodes', 'uploads', 'not-registered.png');
+    vi.spyOn(sessionStore, 'getSession').mockReturnValue({ name: 'deck_project_brain', projectDir } as never);
+    vi.mocked(fsp.lstat).mockResolvedValue({ isSymbolicLink: () => false, isFile: () => true } as fsp.Stats);
+    mockRealpath.mockImplementation(async (target) => String(target));
+
+    handleWebCommand({
+      type: 'fs.read',
+      path: uploadPath,
+      requestId: 'read-unregistered-upload',
+      sessionName: 'deck_project_brain',
+    }, mockServerLink as any);
+    await flushAsync();
+
+    expect(mockPreviewCoordinator.handle).not.toHaveBeenCalled();
+    expect(sent[0]).toMatchObject({
+      type: 'fs.read_response',
+      requestId: 'read-unregistered-upload',
+      status: 'error',
+      error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH,
+    });
+  });
+
+  it('previews one exact file path published by the assistant in the shared session', async () => {
+    const projectDir = path.join(homedir(), 'project');
+    const publishedFile = path.join(homedir(), 'worktrees', 'release', 'public', 'templates', '承诺书.pdf');
+    vi.spyOn(sessionStore, 'getSession').mockReturnValue({ name: 'deck_project_brain', projectDir } as never);
+    vi.spyOn(timelineStore, 'readByTypesPreferred').mockResolvedValue([{
+      eventId: 'assistant-file-path',
+      sessionId: 'deck_project_brain',
+      ts: Date.now(),
+      seq: 1,
+      epoch: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'assistant.text',
+      payload: { text: `Word 下载和 PDF 预览：\`${publishedFile}\`` },
+    }] as never);
+    vi.mocked(fsp.lstat).mockResolvedValue({ isSymbolicLink: () => false, isFile: () => true } as fsp.Stats);
+    mockRealpath.mockImplementation(async (target) => String(target));
+
+    handleWebCommand({
+      type: 'fs.read',
+      path: publishedFile,
+      requestId: 'read-assistant-published-file',
+      sessionName: 'deck_project_brain',
+    }, mockServerLink as any);
+    await flushAsync();
+
+    expect(sent).toEqual([]);
+    expect(mockPreviewCoordinator.handle).toHaveBeenCalledWith(
+      publishedFile,
+      'read-assistant-published-file',
+      expect.any(Function),
+    );
+  });
+
+  it('does not grant neighboring paths or paths written only by a participant', async () => {
+    const projectDir = path.join(homedir(), 'project');
+    const mentionedFile = path.join(homedir(), 'worktrees', 'release', 'public', 'templates', '承诺书.pdf');
+    const neighboringFile = path.join(path.dirname(mentionedFile), '其他合同.pdf');
+    vi.spyOn(sessionStore, 'getSession').mockReturnValue({ name: 'deck_project_brain', projectDir } as never);
+    vi.spyOn(timelineStore, 'readByTypesPreferred').mockResolvedValue([{
+      eventId: 'participant-file-path',
+      sessionId: 'deck_project_brain',
+      ts: Date.now(),
+      seq: 1,
+      epoch: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'user.message',
+      payload: { text: `打开 \`${neighboringFile}\`` },
+    }, {
+      eventId: 'assistant-other-file-path',
+      sessionId: 'deck_project_brain',
+      ts: Date.now(),
+      seq: 2,
+      epoch: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'assistant.text',
+      payload: { text: `已提供：\`${mentionedFile}\`` },
+    }] as never);
+    vi.mocked(fsp.lstat).mockResolvedValue({ isSymbolicLink: () => false, isFile: () => true } as fsp.Stats);
+    mockRealpath.mockImplementation(async (target) => String(target));
+
+    handleWebCommand({
+      type: 'fs.read',
+      path: neighboringFile,
+      requestId: 'read-neighboring-file',
+      sessionName: 'deck_project_brain',
+    }, mockServerLink as any);
+    await flushAsync();
+
+    expect(mockPreviewCoordinator.handle).not.toHaveBeenCalled();
+    expect(sent[0]).toMatchObject({
+      type: 'fs.read_response',
+      requestId: 'read-neighboring-file',
+      status: 'error',
+      error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH,
+    });
+  });
+
+  it('does not turn an assistant-published directory into a readable root', async () => {
+    const projectDir = path.join(homedir(), 'project');
+    const publishedDirectory = path.join(homedir(), 'worktrees', 'release', 'public', 'templates');
+    vi.spyOn(sessionStore, 'getSession').mockReturnValue({ name: 'deck_project_brain', projectDir } as never);
+    vi.spyOn(timelineStore, 'readByTypesPreferred').mockResolvedValue([{
+      eventId: 'assistant-directory-path',
+      sessionId: 'deck_project_brain',
+      ts: Date.now(),
+      seq: 1,
+      epoch: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'assistant.text',
+      payload: { text: `模板目录：\`${publishedDirectory}\`` },
+    }] as never);
+    vi.mocked(fsp.lstat).mockResolvedValue({ isSymbolicLink: () => false, isFile: () => false } as fsp.Stats);
+    mockRealpath.mockImplementation(async (target) => String(target));
+
+    handleWebCommand({
+      type: 'fs.read',
+      path: publishedDirectory,
+      requestId: 'read-assistant-published-directory',
+      sessionName: 'deck_project_brain',
+    }, mockServerLink as any);
+    await flushAsync();
+
+    expect(mockPreviewCoordinator.handle).not.toHaveBeenCalled();
+    expect(sent[0]).toMatchObject({
+      type: 'fs.read_response',
+      requestId: 'read-assistant-published-directory',
+      status: 'error',
+      error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH,
+    });
+  });
+
+  it('rejects an upload-labeled registry entry outside the daemon upload root', async () => {
+    const projectDir = path.join(homedir(), 'project');
+    const outsidePath = path.join(homedir(), 'other', 'registry-poisoned.png');
+    vi.spyOn(sessionStore, 'getSession').mockReturnValue({ name: 'deck_project_brain', projectDir } as never);
+    mockLookupAttachment.mockReturnValue({
+      id: path.basename(outsidePath),
+      daemonPath: outsidePath,
+      source: 'upload',
+      createdAt: Date.now(),
+      expiresAt: Date.now() + 60_000,
+    });
+    vi.mocked(fsp.lstat).mockResolvedValue({ isSymbolicLink: () => false, isFile: () => true } as fsp.Stats);
+    mockRealpath.mockImplementation(async (target) => String(target));
+
+    handleWebCommand({
+      type: 'fs.read',
+      path: outsidePath,
+      requestId: 'read-poisoned-upload',
+      sessionName: 'deck_project_brain',
+    }, mockServerLink as any);
+    await flushAsync();
+
+    expect(mockPreviewCoordinator.handle).not.toHaveBeenCalled();
+    expect(sent[0]).toMatchObject({
+      type: 'fs.read_response',
+      requestId: 'read-poisoned-upload',
+      status: 'error',
+      error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH,
+    });
+  });
+
+  it('confines shared-session file search to the owning project root', async () => {
+    const projectDir = path.join(homedir(), 'project');
+    const outsideDir = path.join(homedir(), 'other');
+    vi.spyOn(sessionStore, 'getSession').mockReturnValue({ name: 'deck_project_brain', projectDir } as never);
+    mockRealpath.mockImplementation(async (target) => String(target));
+
+    handleWebCommand({
+      type: 'file.search',
+      query: 'secret',
+      projectDir: outsideDir,
+      requestId: 'search-session-outside',
+      sessionName: 'deck_project_brain',
+    }, mockServerLink as any);
+    await flushAsync();
+
+    expect(mockReaddir).not.toHaveBeenCalled();
+    expect(sent[0]).toEqual({
+      type: 'file.search_response',
+      requestId: 'search-session-outside',
+      results: [],
+      error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH,
+    });
+  });
+
+  it('resolves the virtual shared-session root for file search', async () => {
+    const projectDir = path.join(homedir(), 'private-search-project');
+    vi.spyOn(sessionStore, 'getSession').mockReturnValue({ name: 'deck_project_brain', projectDir } as never);
+    mockRealpath.mockImplementation(async (target) => String(target));
+    mockReaddir.mockImplementation(async (target) => (
+      String(target) === projectDir ? [makeDirent('README.md', false)] as any : [] as any
+    ));
+
+    handleWebCommand({
+      type: 'file.search',
+      query: '',
+      projectDir: FS_SESSION_ROOT_PATH,
+      requestId: 'search-session-root',
+      sessionName: 'deck_project_brain',
+    }, mockServerLink as any);
+    await flushAsync();
+
+    expect(mockReaddir).toHaveBeenCalledWith(projectDir, { withFileTypes: true });
+    expect(sent[0]).toEqual({
+      type: 'file.search_response',
+      requestId: 'search-session-root',
+      results: ['README.md'],
+    });
   });
 
   it(':drives: sentinel returns error on non-Windows platforms', async () => {

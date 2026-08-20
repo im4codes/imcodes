@@ -7,6 +7,7 @@ import { buildTransportResumeLaunchOpts } from '../agent/transport-resume-opts.j
 import { isTransportAgent, type AgentType } from '../agent/detect.js';
 import { aliasExpansionModeFor, expandForAgent } from '../../shared/alias-expand.js';
 import { ALIAS_REASONS } from '../../shared/alias-types.js';
+import { classifyCodexFastCommand, isCodexFastServiceTier } from '../../shared/codex-service-tier.js';
 import type { AliasSendAudit, SendAliasNotes, SendAliasResolution } from '../../shared/alias-types.js';
 import { buildAliasSendAudit } from './alias-audit.js';
 import { sendKeys, sendKeysDelayedEnter, sendRawInput, resizeSession, sendKey, getPaneStartCommand, preparePrivateInputWriter } from '../agent/tmux.js';
@@ -17,6 +18,7 @@ import type { ServerLink } from './server-link.js';
 import { timelineEmitter } from './timeline-emitter.js';
 import { emitTransportUserMessage as emitTransportUserMessageEvent } from './transport-relay.js';
 import { TimelinePreferredReadError, timelineStore } from './timeline-store.js';
+import { hasAssistantFileReadGrant } from './session-file-read-grants.js';
 import {
   recordFsWorkerMetric,
   recordTimelineBudgetShape,
@@ -183,7 +185,7 @@ import {
 } from '../../shared/memory-ws.js';
 import { buildMemoryProjectionFallbackSource } from '../../shared/memory-projection-source-fallback.js';
 import { parseOpenSpecTasksMarkdown } from '../../shared/openspec-auto-deliver-validators.js';
-import { FS_WRITE_ERROR } from '../shared/transport/fs.js';
+import { FS_SESSION_ROOT_PATH, FS_WRITE_ERROR } from '../shared/transport/fs.js';
 import { P2P_CONFIG_ERROR, P2P_CONFIG_MSG, MAX_P2P_PARTICIPANTS } from '../../shared/p2p-config-events.js';
 import { P2P_PRESET_DEFAULT_SUMMARY_PROMPT, P2P_WORKFLOW_SCHEMA_VERSION } from '../../shared/p2p-workflow-constants.js';
 import { makeP2pWorkflowDiagnostic, type P2pWorkflowDiagnostic } from '../../shared/p2p-workflow-diagnostics.js';
@@ -225,6 +227,10 @@ import type {
 import { bindP2pCompiledWorkflow } from './p2p-workflow-bind.js';
 import { readP2pDiscussionWithOffset } from './p2p-workflow-discussion-offsets.js';
 import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
+import {
+  TRANSPORT_QUEUE_APPEND_MAX_ENTRIES,
+  TRANSPORT_QUEUE_COMMANDS,
+} from '../../shared/transport-queue-types.js';
 import {
   PEER_AUDIT_MESSAGES,
   decodePeerAuditCancelCommand,
@@ -358,6 +364,121 @@ import {
 import { getProvider } from '../agent/provider-registry.js';
 
 const MAX_P2P_FILE_PULL_COUNT = 20;
+const TRANSPORT_QUEUE_SEND_SYNC_WAIT_MS = 15_000;
+const TRANSPORT_QUEUE_SEND_SYNC_POLL_MS = 25;
+
+interface InFlightSessionSend {
+  settled: Promise<void>;
+  settle: () => void;
+}
+
+// A browser renders an optimistic queued row as soon as session.send receives
+// its receipt ack. The send handler may still be awaiting preference/context
+// work before it reaches TransportSessionRuntime.send(), so a quick follow-up
+// append command can otherwise overtake it and observe a false "not found".
+// Track the exact send command until its handler settles so append can wait for
+// the relevant queue registration without serializing unrelated messages.
+const inFlightSessionSends = new Map<string, InFlightSessionSend>();
+
+function inFlightSessionSendKey(sessionName: string, clientMessageId: string): string {
+  return `${sessionName}\u0000${clientMessageId}`;
+}
+
+function dispatchSessionSend(cmd: Record<string, unknown>, serverLink: ServerLink): void {
+  const sessionName = typeof (cmd.sessionName ?? cmd.session) === 'string'
+    ? String(cmd.sessionName ?? cmd.session).trim()
+    : '';
+  const clientMessageId = typeof cmd.commandId === 'string' ? cmd.commandId.trim() : '';
+  if (!sessionName || !clientMessageId) {
+    void handleSend(cmd, serverLink);
+    return;
+  }
+
+  const key = inFlightSessionSendKey(sessionName, clientMessageId);
+  // A bridge retry can reuse a command id while the original handler is still
+  // active. Keep the original barrier; the dedup path may finish first.
+  if (inFlightSessionSends.has(key)) {
+    void handleSend(cmd, serverLink);
+    return;
+  }
+
+  let settle!: () => void;
+  const settled = new Promise<void>((resolve) => {
+    settle = resolve;
+  });
+  const tracked = { settled, settle };
+  inFlightSessionSends.set(key, tracked);
+  void (async () => {
+    try {
+      await handleSend(cmd, serverLink);
+    } finally {
+      if (inFlightSessionSends.get(key) === tracked) {
+        inFlightSessionSends.delete(key);
+      }
+      tracked.settle();
+    }
+  })();
+}
+
+async function waitForSessionSendProgress(
+  pending: readonly Promise<void>[],
+  waitMs: number,
+): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  try {
+    await Promise.race([
+      ...(pending.length > 0 ? [Promise.all(pending).then(() => undefined)] : []),
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, waitMs);
+        timer.unref?.();
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+async function waitForSelectedSessionSends(
+  sessionName: string,
+  clientMessageIds: readonly string[],
+): Promise<void> {
+  const ids = [...new Set(clientMessageIds)];
+  const deadline = Date.now() + TRANSPORT_QUEUE_SEND_SYNC_WAIT_MS;
+  const observedSendIds = new Set<string>();
+
+  // Do not rely solely on an already-populated inFlightSessionSends entry.
+  // Browser and bridge frames can briefly overtake each other, so an append
+  // may reach the daemon before the matching session.send has even installed
+  // its barrier. Polling runtime truth while also observing known send
+  // promises closes both orderings without exposing a transient not_found to
+  // the user. The wait is bounded so genuinely stale client ids still fail.
+  while (Date.now() < deadline) {
+    const runtime = getTransportRuntime(sessionName);
+    if (runtime) {
+      const queuedIds = new Set((runtime.pendingEntries ?? []).map((entry) => entry.clientMessageId));
+      if (ids.every((id) => queuedIds.has(id))) return;
+    }
+
+    const pending = [...new Set(ids.flatMap((clientMessageId) => {
+      const tracked = inFlightSessionSends.get(inFlightSessionSendKey(sessionName, clientMessageId));
+      if (tracked) observedSendIds.add(clientMessageId);
+      return tracked ? [tracked.settled] : [];
+    }))];
+    // Once every matching send has been observed and settled, no later queue
+    // registration can appear from those commands. Exit early so a genuine
+    // direct-send/stale id receives its error promptly instead of paying the
+    // full synchronization budget.
+    if (pending.length === 0 && ids.every((id) => observedSendIds.has(id))) return;
+    const waitMs = Math.min(
+      TRANSPORT_QUEUE_SEND_SYNC_POLL_MS,
+      Math.max(0, deadline - Date.now()),
+    );
+    if (waitMs <= 0) return;
+
+    await waitForSessionSendProgress(pending, waitMs);
+  }
+}
+
 const processRecallRepositoryIdentityService = new GitOriginRepositoryIdentityService();
 const DAEMON_LOCAL_PREFERENCE_USER_ID = 'daemon-local';
 
@@ -451,6 +572,39 @@ function prepareProcessPreferenceProviderText(input: {
   }
   processPreferenceContextSignatures.set(input.sessionName, signature);
   return prependPreferenceProviderContext(input.providerText, context);
+}
+
+const TAGGED_ATTACHMENT_REFERENCE_RE = /#(\d+):\(([^)\r\n]+)\)/g;
+
+/**
+ * Build a short, agent-only retention reminder for the numbered upload
+ * references that are actually registered on this daemon. The browser writes
+ * the mapping into the message as `#N:(daemonPath)`; validating the path here
+ * prevents arbitrary user text from manufacturing a reminder for a file that
+ * is not one of this message's live temporary uploads.
+ */
+function buildAttachmentRetentionPreamble(text: string, now = Date.now()): string | undefined {
+  const labels: string[] = [];
+  const seen = new Set<string>();
+  for (const match of text.matchAll(TAGGED_ATTACHMENT_REFERENCE_RE)) {
+    const sequence = match[1];
+    const daemonPath = match[2];
+    if (!sequence || !daemonPath) continue;
+    const entry = lookupAttachment(daemonPath);
+    if (!entry || entry.source !== 'upload' || entry.expiresAt <= now) continue;
+    const label = `#${sequence}`;
+    if (seen.has(label)) continue;
+    seen.add(label);
+    labels.push(label);
+  }
+  if (labels.length === 0) return undefined;
+  if (labels.length === 1) return `${labels[0]} expires in 24h. Copy only if necessary.`;
+  return `${labels.join(', ')} expire in 24h. Copy only if necessary.`;
+}
+
+function mergeAgentMessagePreambles(...parts: Array<string | undefined>): string | undefined {
+  const resolved = parts.map((part) => part?.trim()).filter((part): part is string => !!part);
+  return resolved.join('\n\n') || undefined;
 }
 
 /**
@@ -778,7 +932,7 @@ function supportsEffort(agentType: string | undefined): agentType is 'claude-cod
     || agentType === 'qwen';
 }
 
-function supportsTransportClear(agentType: string | undefined): agentType is 'claude-code-sdk' | 'codex-sdk' | 'copilot-sdk' | 'cursor-headless' | 'opencode-sdk' | 'openclaw' | 'qwen' | 'kimi-sdk' | 'grok-sdk' {
+function supportsTransportClear(agentType: string | undefined): agentType is 'claude-code-sdk' | 'codex-sdk' | 'copilot-sdk' | 'cursor-headless' | 'opencode-sdk' | 'openclaw' | 'qwen' | 'kimi-sdk' | 'grok-sdk' | 'deepseek-harness' {
   return agentType === 'claude-code-sdk'
     || agentType === 'codex-sdk'
     || agentType === 'copilot-sdk'
@@ -787,7 +941,8 @@ function supportsTransportClear(agentType: string | undefined): agentType is 'cl
     || agentType === 'openclaw'
     || agentType === 'qwen'
     || agentType === 'kimi-sdk'
-    || agentType === 'grok-sdk';
+    || agentType === 'grok-sdk'
+    || agentType === 'deepseek-harness';
 }
 
 // `/compact` is provider-dispatched, not daemon-synthesized. Provider adapters
@@ -968,6 +1123,10 @@ import { FS_TRANSPORT_MSG } from '../../shared/fs-transport-messages.js';
 import { FS_WRITE_MAX_BYTES } from '../../shared/fs-write-limits.js';
 import { FILE_TRANSFER_MSG } from '../../shared/transport/file-transfer.js';
 import { isDirectFileTransferMessageType } from '../../shared/direct-file-transfer.js';
+import { isRemoteDesktopMessageType } from '../../shared/remote-desktop.js';
+import { REMOTE_DESKTOP_INSTALL_MSG } from '../../shared/remote-desktop-install.js';
+import { REMOTE_DESKTOP_LOGIN_SCREEN_MSG } from '../../shared/remote-desktop-login-screen.js';
+import { handleDaemonRemoteDesktopMessage } from './remote-desktop-registry.js';
 import { handleDirectFileTransferCommand } from './direct-file-transfer.js';
 import { REPO_MSG } from '../shared/repo-types.js';
 import { handlePreviewCommand } from './preview-relay.js';
@@ -1402,6 +1561,17 @@ export function handleWebCommand(msg: unknown, serverLink: ServerLink): void {
     return;
   }
 
+  // Remote desktop is served by the native worker host, not the session
+  // machinery below: signalling, worker install and their replies never touch a
+  // session. The host reports back whether the message was one of its own.
+  if (typeof cmd.type === 'string'
+    && (isRemoteDesktopMessageType(cmd.type)
+      || cmd.type === REMOTE_DESKTOP_INSTALL_MSG.REQUEST
+      || cmd.type === REMOTE_DESKTOP_LOGIN_SCREEN_MSG.REQUEST)) {
+    void handleDaemonRemoteDesktopMessage(cmd);
+    return;
+  }
+
   // Top-level isolation: any synchronous throw inside a handler — e.g.
   // a TypeError from `cmd.foo.bar` when `foo` is undefined, or a
   // validation throw before the first await of an async function —
@@ -1472,13 +1642,16 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
       void handleSessionTransportConfigUpdate(cmd, serverLink);
       break;
     case 'session.send':
-      void handleSend(cmd, serverLink);
+      dispatchSessionSend(cmd, serverLink);
       break;
     case 'session.edit_queued_message':
       void handleEditQueuedTransportMessage(cmd, serverLink);
       break;
     case 'session.undo_queued_message':
       void handleUndoQueuedTransportMessage(cmd, serverLink);
+      break;
+    case TRANSPORT_QUEUE_COMMANDS.APPEND_MESSAGES:
+      void handleAppendQueuedTransportMessages(cmd, serverLink);
       break;
     case TIMELINE_MESSAGES.DELETE:
       void handleDeleteTimelineMessage(cmd, serverLink);
@@ -2093,7 +2266,7 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
         label,
         effort,
       });
-    } else if (agentType === 'opencode-sdk' || agentType === 'gemini-sdk' || agentType === 'kimi-sdk' || agentType === 'grok-sdk') {
+    } else if (agentType === 'opencode-sdk' || agentType === 'gemini-sdk' || agentType === 'kimi-sdk' || agentType === 'grok-sdk' || agentType === 'deepseek-harness') {
       // ACP SDK providers share the codex-sdk shape: fresh launch, optional
       // requested model, no ccPreset. The provider emits a durable resume id
       // after the first real ACP session is created.
@@ -2102,7 +2275,7 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
         name: `deck_${project}_brain`,
         projectName: project,
         role: 'brain',
-        agentType: agentType as 'opencode-sdk' | 'gemini-sdk' | 'kimi-sdk' | 'grok-sdk',
+        agentType: agentType as 'opencode-sdk' | 'gemini-sdk' | 'kimi-sdk' | 'grok-sdk' | 'deepseek-harness',
         projectDir: dir,
         fresh: true,
         ...(requestedModel ? { requestedModel } : {}),
@@ -3003,24 +3176,6 @@ function replayDelegationTerminalAckIfPresent(
   return true;
 }
 
-const DELEGATION_MIXED_P2P_FIELDS = [
-  'p2pAtTargets',
-  'directTargetSession',
-  'directTargetMode',
-  'p2pMode',
-  'p2pSessionConfig',
-  'p2pWorkflowLaunchEnvelope',
-  'workflowLaunchEnvelope',
-  'p2pRounds',
-  'p2pExtraPrompt',
-  'p2pLocale',
-  'p2pHopTimeoutMs',
-  'p2pAdvancedPresetKey',
-  'p2pAdvancedRounds',
-  'p2pAdvancedRunTimeoutMinutes',
-  'p2pContextReducer',
-  'dedicatedExecutionRouting',
-] as const;
 
 const DELEGATION_UNSUPPORTED_TOP_LEVEL_FIELDS = [
   'replyTo',
@@ -3753,6 +3908,11 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     userId: preferenceUserId,
     currentRecords: preferenceIngest.records,
   });
+  const attachmentRetentionPreamble = buildAttachmentRetentionPreamble(displayText);
+  const agentMessagePreamble = mergeAgentMessagePreambles(
+    preferenceMessagePreamble,
+    attachmentRetentionPreamble,
+  );
   schedulePreferencePersistence({
     userId: preferenceUserId,
     commandId: effectiveId,
@@ -3794,7 +3954,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       // offline-queued send still delivers the alias VALUE to the provider on
       // reconnect while the timeline records nothing about what was delivered.
       ...(aliasAudit ? { aliasAudit } : {}),
-      ...(preferenceMessagePreamble ? { messagePreamble: preferenceMessagePreamble } : {}),
+      ...(agentMessagePreamble ? { messagePreamble: agentMessagePreamble } : {}),
       ...(sharedActor ? { sharedActor } : {}),
       commandId: effectiveId,
       ...(inboundClientMessageId ? { clientMessageId: inboundClientMessageId } : {}),
@@ -3884,7 +4044,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       // Same reason as the no-runtime branch above: the anchor must accompany
       // the expansion, or this delivery lands unauditable.
       ...(aliasAudit ? { aliasAudit } : {}),
-      ...(preferenceMessagePreamble ? { messagePreamble: preferenceMessagePreamble } : {}),
+      ...(agentMessagePreamble ? { messagePreamble: agentMessagePreamble } : {}),
       ...(sharedActor ? { sharedActor } : {}),
       commandId: effectiveId,
       ...(inboundClientMessageId ? { clientMessageId: inboundClientMessageId } : {}),
@@ -3991,6 +4151,42 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     try {
       const modelMatch = trimmedText.match(/^\/model\s+(\S+)(?:\s+.*)?$/);
       const effortMatch = trimmedText.match(/^\/(?:thinking|effort)\s+(\S+)\s*$/);
+      // `/fast on|off` is this product's switch, not Codex's own toggle: bare
+      // `/fast` stays untouched so it still reaches the agent unchanged.
+      const requestedServiceTier = classifyCodexFastCommand(trimmedText);
+      if (requestedServiceTier && transportRuntime) {
+        try {
+          await transportRuntime.setServiceTier(requestedServiceTier);
+        } catch (err) {
+          const reason = err instanceof Error ? err.message : 'service_tier_failed';
+          emitTransportUserMessage(text);
+          timelineEmitter.emit(sessionName, 'assistant.text', {
+            text: `⚠️ Could not change the service tier: ${reason}`,
+            streaming: false,
+            memoryExcluded: true,
+          }, { source: 'daemon', confidence: 'high' });
+          timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error: reason });
+          emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: 'error', error: reason });
+          return;
+        }
+        const nextRecord = { ...record, serviceTier: requestedServiceTier, updatedAt: Date.now() };
+        upsertSession(nextRecord);
+        persistSessionRecord(nextRecord, sessionName);
+        await handleGetSessions(serverLink);
+        syncSubSessionIfNeeded(sessionName, serverLink);
+        emitTransportUserMessage(text);
+        timelineEmitter.emit(sessionName, 'assistant.text', {
+          text: isCodexFastServiceTier(requestedServiceTier)
+            ? 'Fast mode is on for this session (1.5x speed, increased plan usage).'
+            : 'Fast mode is off for this session.',
+          streaming: false,
+          automation: true,
+          memoryExcluded: true,
+        }, { source: 'daemon', confidence: 'high' });
+        timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'accepted' });
+        emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: 'accepted' });
+        return;
+      }
       if (record?.agentType === 'qwen' && modelMatch) {
         const nextModel = modelMatch[1];
           const runtimeConfig = await getQwenRuntimeConfig(true).catch(() => null);
@@ -4180,7 +4376,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
           return;
         }
       }
-      if ((record?.agentType === 'copilot-sdk' || record?.agentType === 'cursor-headless' || record?.agentType === 'opencode-sdk' || record?.agentType === 'gemini-sdk' || record?.agentType === 'kimi-sdk' || record?.agentType === 'grok-sdk') && modelMatch) {
+      if ((record?.agentType === 'copilot-sdk' || record?.agentType === 'cursor-headless' || record?.agentType === 'opencode-sdk' || record?.agentType === 'gemini-sdk' || record?.agentType === 'kimi-sdk' || record?.agentType === 'grok-sdk' || record?.agentType === 'deepseek-harness') && modelMatch) {
         const nextModel = modelMatch[1];
         transportRuntime.setAgentId(nextModel);
         const nextRecord = {
@@ -4276,20 +4472,20 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
             ...(aliasAudit ? { aliasAudit } : {}),
           }
         : undefined;
-      const result = preferenceMessagePreamble
+      const result = agentMessagePreamble
         ? (sendMetadata
             ? transportRuntime.send(
               displayText,
               effectiveId,
               attachments.length > 0 ? attachments : undefined,
-              preferenceMessagePreamble,
+              agentMessagePreamble,
               sendMetadata,
             )
             : transportRuntime.send(
               displayText,
               effectiveId,
               attachments.length > 0 ? attachments : undefined,
-              preferenceMessagePreamble,
+              agentMessagePreamble,
             ))
         : (attachments.length > 0
             ? (sendMetadata
@@ -4415,6 +4611,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   try {
     await sendProcessSessionMessage(sessionName, finalText, attachments, {
       originalText: displayText,
+      ...(attachmentRetentionPreamble ? { agentMessagePreamble: attachmentRetentionPreamble } : {}),
       commandId: effectiveId,
       isLegacy,
       ackAlreadySent: receiptAcked,
@@ -4469,6 +4666,8 @@ async function sendProcessSessionMessage(
     serverLink?: Pick<ServerLink, 'send'>;
     /** RV-C non-displayed audit anchor for an alias-bearing send (no plaintext). */
     aliasAudit?: AliasSendAudit;
+    /** Per-turn agent-only context that must never be projected to the timeline. */
+    agentMessagePreamble?: string;
     /** Trusted daemon-owned metadata for automation surfaces such as P2P.
      * Values are projected only to the local user.message event. */
     userMessageMetadata?: Readonly<{
@@ -4531,6 +4730,11 @@ async function sendProcessSessionMessage(
     memoryRecallCancelled = true;
     rollbackSummarySyncReservation(memoryContext.summaryReservation);
     logger.warn({ sessionName, timeoutMs: PROCESS_MEMORY_RECALL_DEADLINE_MS, err: recallErr }, 'memory recall skipped — sending without memory injection');
+  }
+
+  const agentMessagePreamble = options?.agentMessagePreamble?.trim();
+  if (agentMessagePreamble) {
+    sendText = `${agentMessagePreamble}\n\n${sendText}`;
   }
 
   // ── Step 3: Serialize only the actual stdin write ──────────────────────────
@@ -4756,6 +4960,93 @@ async function handleUndoQueuedTransportMessage(cmd: Record<string, unknown>, se
     }, { source: 'daemon', confidence: 'high' });
     timelineEmitter.emit(sessionName, 'command.ack', { commandId, status: 'accepted' });
     emitCommandAckReliable(serverLink, { commandId, sessionName, status: 'accepted' });
+  } finally {
+    release();
+  }
+}
+
+async function handleAppendQueuedTransportMessages(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
+  const sessionName = typeof cmd.sessionName === 'string' ? cmd.sessionName.trim() : '';
+  const commandId = typeof cmd.commandId === 'string' && cmd.commandId.trim()
+    ? cmd.commandId.trim()
+    : `append-queued-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const clientMessageIds = Array.isArray(cmd.clientMessageIds)
+    ? [...new Set(cmd.clientMessageIds.flatMap((value) => (
+        typeof value === 'string' && value.trim() ? [value.trim()] : []
+      )))]
+    : [];
+  const reject = (error: string): void => {
+    timelineEmitter.emit(sessionName, 'command.ack', { commandId, status: 'error', error });
+    emitCommandAckReliable(serverLink, { commandId, sessionName, status: 'error', error });
+  };
+  if (!sessionName || clientMessageIds.length === 0 || clientMessageIds.length > TRANSPORT_QUEUE_APPEND_MAX_ENTRIES) {
+    reject('Invalid queued message selection');
+    return;
+  }
+
+  // session.send emits its receipt ack before all asynchronous preparation is
+  // complete. If this append targets one of those optimistic rows, let that
+  // exact send reach the runtime/store before deciding that the id is absent.
+  await waitForSelectedSessionSends(sessionName, clientMessageIds);
+
+  const runtime = getTransportRuntime(sessionName);
+  const record = getSession(sessionName);
+  if (!runtime || record?.runtimeType !== 'transport') {
+    reject('Transport session unavailable');
+    return;
+  }
+
+  const release = await getMutex(sessionName).acquire();
+  try {
+    const result = await runtime.appendPendingMessagesToActiveTurn(clientMessageIds, commandId);
+    if (result.status !== 'delivered') {
+      const error = result.status === 'unsupported'
+        ? 'Active-turn append is not supported by this provider'
+        : result.status === 'attachments_unsupported'
+          ? 'Queued messages with attachments cannot be appended to an active turn'
+          : result.status === 'control_unsupported'
+            ? 'Queued control commands cannot be appended to an active turn'
+            : result.status === 'stale'
+              ? 'The active turn already finished'
+              : 'Queued message not found';
+      reject(error);
+      return;
+    }
+
+    for (const entry of result.entries) {
+      supervisionAutomation.removeQueuedTaskIntent(sessionName, entry.clientMessageId);
+      timelineEmitter.emit(
+        sessionName,
+        'user.message',
+        {
+          text: entry.text,
+          clientMessageId: entry.clientMessageId,
+          allowDuplicate: true,
+          // This row records an in-turn queue steer. It extends the currently
+          // supervised task and must not seed a second implicit run at idle.
+          queueAppended: true,
+          pendingMessageVersion: result.queueSnapshot.pendingMessageVersion,
+          ...(entry.sharedActor ? { sharedActor: entry.sharedActor } : {}),
+          ...(entry.aliasAudit ? { aliasAudit: entry.aliasAudit } : {}),
+        },
+        { source: 'daemon', confidence: 'high', eventId: `transport-user:${entry.clientMessageId}` },
+      );
+    }
+    for (const fact of result.deliveryFacts) {
+      timelineEmitter.emit(sessionName, 'transport.queue.delivery', { ...fact }, {
+        source: 'daemon',
+        confidence: 'high',
+      });
+    }
+    timelineEmitter.emit(sessionName, 'session.state', {
+      state: runtime.pendingCount > 0 ? 'queued' : (runtime.sending ? 'running' : 'idle'),
+      ...transportQueueSnapshotToPayload(result.queueSnapshot),
+    }, { source: 'daemon', confidence: 'high' });
+    timelineEmitter.emit(sessionName, 'command.ack', { commandId, status: 'accepted' });
+    emitCommandAckReliable(serverLink, { commandId, sessionName, status: 'accepted' });
+  } catch (error) {
+    logger.warn({ error, sessionName, clientMessageIds }, 'active-turn queue append failed');
+    reject('Failed to append queued messages');
   } finally {
     release();
   }
@@ -5938,7 +6229,7 @@ async function handleSubSessionStart(cmd: Record<string, unknown>, serverLink: S
         bindExistingKey,
         ...(ccPreset ? { ccPreset } : {}),
         ...(type === 'claude-code-sdk' ? { ccSessionId: randomUUID(), fresh: true } : {}),
-        ...(type === 'codex-sdk' || type === 'opencode-sdk' || type === 'kimi-sdk' || type === 'grok-sdk' ? { fresh: true } : {}),
+        ...(type === 'codex-sdk' || type === 'opencode-sdk' || type === 'kimi-sdk' || type === 'grok-sdk' || type === 'deepseek-harness' ? { fresh: true } : {}),
         ...(effort ? { effort } : {}),
         userCreated: true,
         parentSession: parentSession || undefined,
@@ -6091,7 +6382,6 @@ async function handleSubSessionDetectShells(serverLink: ServerLink): Promise<voi
 async function handleSubSessionSetModel(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
   const sessionName = cmd.sessionName as string | undefined;
   const model = cmd.model as string | undefined;
-  const cwd = cmd.cwd as string | undefined;
 
   if (!sessionName || !model) {
     logger.warn('subsession.set_model: missing sessionName or model');
@@ -6106,10 +6396,19 @@ async function handleSubSessionSetModel(cmd: Record<string, unknown>, serverLink
     return;
   }
 
+  // The session store is authoritative for the working directory. In
+  // particular, share-scoped participants may switch the model but must not
+  // be able to smuggle an arbitrary host path through the browser payload.
+  const existing = getSession(sessionName);
+  if (!existing) {
+    logger.warn({ sessionName }, 'subsession.set_model: session not found');
+    return;
+  }
+
   logger.info({ sessionName, model }, 'Restarting Codex sub-session with new model');
   await stopSubSession(sessionName, serverLink).catch(() => {});
   try {
-    await startSubSession({ id, type: 'codex', cwd: cwd ?? null, codexModel: model });
+    await startSubSession({ id, type: 'codex', cwd: existing.projectDir, codexModel: model });
     // Sync restarted sub-session to server DB
     try {
       await sendSubSessionSync(serverLink, id, undefined, getSubSessionSyncOptions(sessionName));
@@ -8173,7 +8472,70 @@ function isSameOrInsidePath(root: string, candidate: string): boolean {
   return relative === '' || (!!relative && !relative.startsWith('..') && !nodePath.isAbsolute(relative));
 }
 
-async function resolveFsMutationSessionRoot(cmd: Record<string, unknown>): Promise<
+/**
+ * Shared file reads are normally confined to the session project root. Chat
+ * attachments are the one deliberate exception: uploads live under the
+ * daemon-owned ~/.imcodes/uploads directory, outside every project root.
+ *
+ * Keep the exception capability-based rather than directory-based. The exact
+ * path must still be a live upload entry in the attachment registry, must be a
+ * regular non-symlink file, and must remain inside the canonical upload root.
+ * This permits previews/download-handle minting without exposing directory
+ * listing or arbitrary files beside an attachment.
+ */
+async function resolveRegisteredUploadReadTarget(rawPath: string): Promise<string | null> {
+  const entry = lookupAttachment(rawPath);
+  if (!entry || entry.source !== 'upload' || Date.now() > entry.expiresAt) return null;
+
+  const uploadRoot = nodePath.resolve(homedir(), '.imcodes', 'uploads');
+  const registeredPath = nodePath.resolve(entry.daemonPath);
+  if (registeredPath === uploadRoot || !isSameOrInsidePath(uploadRoot, registeredPath)) return null;
+
+  try {
+    const linkStats = await fsLstat(registeredPath);
+    if (linkStats.isSymbolicLink() || !linkStats.isFile()) return null;
+    const [realRoot, realTarget] = await Promise.all([
+      fsRealpath(uploadRoot),
+      fsRealpath(registeredPath),
+    ]);
+    if (!isSameOrInsidePath(realRoot, realTarget) || !isPathAllowed(realTarget)) return null;
+    return realTarget;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * A shared participant may follow an exact local file path that the assistant
+ * explicitly published in that same session. This is a read-only capability,
+ * not another root: directory listing/search and every write path continue to
+ * use the session project root exclusively.
+ */
+async function resolveAssistantPublishedReadTarget(sessionName: string, rawPath: string): Promise<string | null> {
+  let granted = false;
+  try {
+    granted = await hasAssistantFileReadGrant(sessionName, rawPath, async () => (
+      await timelineStore.readByTypesPreferred(sessionName, ['assistant.text'], { limit: 500 })
+    ));
+  } catch {
+    // Projection/history unavailable must fail closed.
+    return null;
+  }
+  if (!granted) return null;
+
+  const requestedPath = nodePath.resolve(rawPath);
+  try {
+    const linkStats = await fsLstat(requestedPath);
+    if (linkStats.isSymbolicLink() || !linkStats.isFile()) return null;
+    const realTarget = await fsRealpath(requestedPath);
+    if (realTarget !== requestedPath || !isPathAllowed(realTarget)) return null;
+    return realTarget;
+  } catch {
+    return null;
+  }
+}
+
+async function resolveFsSessionRoot(cmd: Record<string, unknown>): Promise<
   | { ok: true; realRoot?: string }
   | { ok: false; error: string }
 > {
@@ -8461,8 +8823,18 @@ async function handleFileSearch(cmd: Record<string, unknown>, serverLink: Server
   if (!requestId || !projectDir) return;
 
   try {
-    const canonical = await resolveCanonical(projectDir, 'strict');
-    if (!canonical) {
+    const sessionRoot = await resolveFsSessionRoot(cmd);
+    if (!sessionRoot.ok) {
+      try { serverLink.send({ type: 'file.search_response', requestId, results: [], error: sessionRoot.error }); } catch { /* ignore */ }
+      return;
+    }
+    if (projectDir === FS_SESSION_ROOT_PATH && !sessionRoot.realRoot) {
+      try { serverLink.send({ type: 'file.search_response', requestId, results: [], error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH }); } catch { /* ignore */ }
+      return;
+    }
+    const searchRoot = projectDir === FS_SESSION_ROOT_PATH ? sessionRoot.realRoot! : projectDir;
+    const canonical = await resolveCanonical(searchRoot, 'strict');
+    if (!canonical || (sessionRoot.realRoot && !isSameOrInsidePath(sessionRoot.realRoot, canonical.realPath))) {
       try { serverLink.send({ type: 'file.search_response', requestId, results: [], error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH }); } catch { /* ignore */ }
       return;
     }
@@ -8933,9 +9305,26 @@ async function handleFsList(cmd: Record<string, unknown>, serverLink: ServerLink
   const includeOpenSpecTaskStats = cmd.includeOpenSpecTaskStats === true;
   if (!rawPath || !requestId) return;
 
+  const sessionRoot = await resolveFsSessionRoot(cmd);
+  if (!sessionRoot.ok) {
+    try { serverLink.send({ type: 'fs.ls_response', requestId, path: rawPath, status: 'error', error: sessionRoot.error }); } catch { /* ignore */ }
+    return;
+  }
+
+  if (rawPath === FS_SESSION_ROOT_PATH && !sessionRoot.realRoot) {
+    try { serverLink.send({ type: 'fs.ls_response', requestId, path: rawPath, status: 'error', error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH }); } catch { /* ignore */ }
+    return;
+  }
+
   // Special sentinel paths bypass normal path resolution
   const isDrivesSentinel = rawPath === WINDOWS_DRIVES_PATH;
-  const expanded = isDrivesSentinel
+  if (isDrivesSentinel && sessionRoot.realRoot) {
+    try { serverLink.send({ type: 'fs.ls_response', requestId, path: rawPath, status: 'error', error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH }); } catch { /* ignore */ }
+    return;
+  }
+  const expanded = rawPath === FS_SESSION_ROOT_PATH
+    ? sessionRoot.realRoot!
+    : isDrivesSentinel
     ? rawPath
     : (rawPath.startsWith('~') ? rawPath.replace(/^~/, homedir()) : rawPath);
   const resolved = isDrivesSentinel ? rawPath : nodePath.resolve(expanded);
@@ -8948,7 +9337,7 @@ async function handleFsList(cmd: Record<string, unknown>, serverLink: ServerLink
   });
 
   try {
-    await Promise.race([handleFsListInner(resolved, rawPath, requestId, includeFiles, includeMetadata, includeOpenSpecTaskStats, requestContext), deadline]);
+    await Promise.race([handleFsListInner(resolved, rawPath, requestId, includeFiles, includeMetadata, includeOpenSpecTaskStats, requestContext, sessionRoot.realRoot), deadline]);
   } catch (err) {
     const msg = fsListErrorCode(err);
     if (msg === FS_GENERIC_ERROR_CODES.FS_LIST_TIMEOUT || msg === FS_GENERIC_ERROR_CODES.FS_LIST_WORKER_TIMEOUT) {
@@ -8973,6 +9362,7 @@ async function handleFsListInner(
   includeMetadata: boolean,
   includeOpenSpecTaskStats: boolean,
   requestContext: FsListRequestContext,
+  sessionRealRoot?: string,
 ): Promise<void> {
   // Windows drive picker — only triggered by the explicit `:drives:` path,
   // NOT by `~` (which always means the user's home directory on every OS).
@@ -9001,7 +9391,7 @@ async function handleFsListInner(
   }
 
   const canonical = await resolveCanonical(resolved, includeMetadata ? 'lenient' : 'strict');
-  if (!canonical) {
+  if (!canonical || (sessionRealRoot && (canonical.usedFallback || !isSameOrInsidePath(sessionRealRoot, canonical.realPath)))) {
     requestContext.send({ type: 'fs.ls_response', requestId, path: rawPath, status: 'error', error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH });
     return;
   }
@@ -9017,7 +9407,38 @@ async function handleFsListInner(
 const REPO_CONTEXT_CACHE_TTL_MS = 5_000;
 
 async function handleFsRead(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
-  getDefaultPreviewReadCoordinator().handle(cmd.path, cmd.requestId, (message) => serverLink.send(message));
+  const rawPath = typeof cmd.path === 'string' ? cmd.path : '';
+  const requestId = typeof cmd.requestId === 'string' ? cmd.requestId : '';
+  if (!rawPath || !requestId) return;
+  const sessionRoot = await resolveFsSessionRoot(cmd);
+  if (!sessionRoot.ok) {
+    try { serverLink.send({ type: 'fs.read_response', requestId, path: rawPath, status: 'error', error: sessionRoot.error }); } catch { /* ignore */ }
+    return;
+  }
+  if (sessionRoot.realRoot) {
+    const target = await resolveExistingFsMutationTarget(rawPath, sessionRoot.realRoot);
+    if (!target.ok) {
+      const registeredUpload = target.error === FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH
+        ? await resolveRegisteredUploadReadTarget(rawPath)
+        : null;
+      const assistantPublished = !registeredUpload && target.error === FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH
+        ? await resolveAssistantPublishedReadTarget(
+          typeof cmd.sessionName === 'string' ? cmd.sessionName : typeof cmd.session === 'string' ? cmd.session : '',
+          rawPath,
+        )
+        : null;
+      const exactReadTarget = registeredUpload ?? assistantPublished;
+      if (exactReadTarget) {
+        getDefaultPreviewReadCoordinator().handle(exactReadTarget, requestId, (message) => serverLink.send(message));
+        return;
+      }
+      try { serverLink.send({ type: 'fs.read_response', requestId, path: rawPath, status: 'error', error: target.error }); } catch { /* ignore */ }
+      return;
+    }
+    getDefaultPreviewReadCoordinator().handle(target.real, requestId, (message) => serverLink.send(message));
+    return;
+  }
+  getDefaultPreviewReadCoordinator().handle(rawPath, requestId, (message) => serverLink.send(message));
 }
 
 const GIT_STATUS_CACHE_TTL_MS = 5_000;
@@ -9737,6 +10158,12 @@ async function handleFsGitStatus(cmd: Record<string, unknown>, serverLink: Serve
   const includeStats = cmd.includeStats === true;
   if (!rawPath || !requestId) return;
 
+  const sessionRoot = await resolveFsSessionRoot(cmd);
+  if (!sessionRoot.ok) {
+    try { serverLink.send({ type: 'fs.git_status_response', requestId, path: rawPath, status: 'error', files: [], error: sessionRoot.error }); } catch { /* ignore */ }
+    return;
+  }
+
   const expanded = rawPath.startsWith('~') ? rawPath.replace(/^~/, homedir()) : rawPath;
   const resolved = nodePath.resolve(expanded);
   const requestContext = createFsListRequestContext(serverLink);
@@ -9747,7 +10174,7 @@ async function handleFsGitStatus(cmd: Record<string, unknown>, serverLink: Serve
     deadlineTimer.unref?.();
   });
   try {
-    await Promise.race([handleFsGitStatusInner(resolved, rawPath, requestId, includeStats, requestContext), deadline]);
+    await Promise.race([handleFsGitStatusInner(resolved, rawPath, requestId, includeStats, requestContext, sessionRoot.realRoot), deadline]);
   } catch (err) {
     const msg = fsGitStatusErrorCode(err);
     if (msg === FS_GENERIC_ERROR_CODES.FS_LIST_WORKER_TIMEOUT) {
@@ -9768,9 +10195,10 @@ async function handleFsGitStatusInner(
   requestId: string,
   includeStats: boolean,
   requestContext: FsListRequestContext,
+  sessionRealRoot?: string,
 ): Promise<void> {
   const real = await fsRealpath(resolved);
-  const allowed = isPathAllowed(real);
+  const allowed = isPathAllowed(real) && (!sessionRealRoot || isSameOrInsidePath(sessionRealRoot, real));
   if (!allowed) {
     requestContext.send({ type: 'fs.git_status_response', requestId, path: rawPath, status: 'error', error: FS_READ_ERROR_CODES.FORBIDDEN_PATH });
     return;
@@ -9792,6 +10220,12 @@ async function handleFsGitDiff(cmd: Record<string, unknown>, serverLink: ServerL
   const requestId = cmd.requestId as string | undefined;
   if (!rawPath || !requestId) return;
 
+  const sessionRoot = await resolveFsSessionRoot(cmd);
+  if (!sessionRoot.ok) {
+    try { serverLink.send({ type: 'fs.git_diff_response', requestId, path: rawPath, status: 'error', error: sessionRoot.error }); } catch { /* ignore */ }
+    return;
+  }
+
   const expanded = rawPath.startsWith('~') ? rawPath.replace(/^~/, homedir()) : rawPath;
   const resolved = nodePath.resolve(expanded);
 
@@ -9807,7 +10241,8 @@ async function handleFsGitDiff(cmd: Record<string, unknown>, serverLink: ServerL
         allowedProbe = parent;
       }
     }
-    const allowed = isPathAllowed(allowedProbe);
+    const allowed = isPathAllowed(allowedProbe)
+      && (!sessionRoot.realRoot || isSameOrInsidePath(sessionRoot.realRoot, allowedProbe));
     if (!allowed) {
       try { serverLink.send({ type: 'fs.git_diff_response', requestId, path: rawPath, status: 'error', error: FS_READ_ERROR_CODES.FORBIDDEN_PATH }); } catch { /* ignore */ }
       return;
@@ -9827,6 +10262,12 @@ async function handleFsMkdir(cmd: Record<string, unknown>, serverLink: ServerLin
   const requestId = cmd.requestId as string | undefined;
   if (!rawPath || !requestId) return;
 
+  const sessionRoot = await resolveFsSessionRoot(cmd);
+  if (!sessionRoot.ok) {
+    try { serverLink.send({ type: 'fs.mkdir_response', requestId, path: rawPath, status: 'error', error: sessionRoot.error }); } catch { /* ignore */ }
+    return;
+  }
+
   const expanded = rawPath.startsWith('~') ? rawPath.replace(/^~/, homedir()) : rawPath;
   const resolved = nodePath.resolve(expanded);
 
@@ -9834,7 +10275,8 @@ async function handleFsMkdir(cmd: Record<string, unknown>, serverLink: ServerLin
   const parent = nodePath.dirname(resolved);
   try {
     const realParent = await fsRealpath(parent);
-    const allowed = isPathAllowed(realParent);
+    const allowed = isPathAllowed(realParent)
+      && (!sessionRoot.realRoot || isSameOrInsidePath(sessionRoot.realRoot, realParent));
     if (!allowed) {
       try { serverLink.send({ type: 'fs.mkdir_response', requestId, path: rawPath, status: 'error', error: FS_READ_ERROR_CODES.FORBIDDEN_PATH }); } catch { /* ignore */ }
       return;
@@ -9848,6 +10290,10 @@ async function handleFsMkdir(cmd: Record<string, unknown>, serverLink: ServerLin
     const { mkdir } = await import('fs/promises');
     await mkdir(resolved, { recursive: true });
     const real = await fsRealpath(resolved);
+    if (!isPathAllowed(real) || (sessionRoot.realRoot && !isSameOrInsidePath(sessionRoot.realRoot, real))) {
+      try { serverLink.send({ type: 'fs.mkdir_response', requestId, path: rawPath, status: 'error', error: FS_READ_ERROR_CODES.FORBIDDEN_PATH }); } catch { /* ignore */ }
+      return;
+    }
     invalidateFsListCachesForPath(real);
     invalidateFileSearchCachesForPath(real);
     try { serverLink.send({ type: 'fs.mkdir_response', requestId, path: rawPath, resolvedPath: real, status: 'ok' }); } catch { /* ignore */ }
@@ -9879,6 +10325,12 @@ async function handleFsWrite(cmd: Record<string, unknown>, serverLink: ServerLin
   const expectedMtime = typeof cmd.expectedMtime === 'number' ? cmd.expectedMtime : undefined;
   const createOnly = cmd.createOnly === true;
 
+  const sessionRoot = await resolveFsSessionRoot(cmd);
+  if (!sessionRoot.ok) {
+    try { serverLink.send({ type: 'fs.write_response', requestId, path: rawPath, status: 'error', error: sessionRoot.error }); } catch { /* ignore */ }
+    return;
+  }
+
   const expanded = rawPath.startsWith('~') ? rawPath.replace(/^~/, homedir()) : rawPath;
   const resolved = nodePath.resolve(expanded);
 
@@ -9901,7 +10353,8 @@ async function handleFsWrite(cmd: Record<string, unknown>, serverLink: ServerLin
     // Existing file: realpath of target must be within FS_ALLOWED_ROOTS
     try {
       const real = await fsRealpath(resolved);
-      const allowed = isPathAllowed(real);
+      const allowed = isPathAllowed(real)
+        && (!sessionRoot.realRoot || isSameOrInsidePath(sessionRoot.realRoot, real));
       if (!allowed) {
         try { serverLink.send({ type: 'fs.write_response', requestId, path: rawPath, resolvedPath: real, status: 'error', error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH }); } catch { /* ignore */ }
         return;
@@ -9945,7 +10398,8 @@ async function handleFsWrite(cmd: Record<string, unknown>, serverLink: ServerLin
     const parent = nodePath.dirname(resolved);
     try {
       const realParent = await fsRealpath(parent);
-      const allowed = isPathAllowed(realParent);
+      const allowed = isPathAllowed(realParent)
+        && (!sessionRoot.realRoot || isSameOrInsidePath(sessionRoot.realRoot, realParent));
       if (!allowed) {
         try { serverLink.send({ type: 'fs.write_response', requestId, path: rawPath, status: 'error', error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH }); } catch { /* ignore */ }
         return;
@@ -10039,7 +10493,7 @@ async function handleFsRename(cmd: Record<string, unknown>, serverLink: ServerLi
     return;
   }
 
-  const sessionRoot = await resolveFsMutationSessionRoot(cmd);
+  const sessionRoot = await resolveFsSessionRoot(cmd);
   if (!sessionRoot.ok) {
     try { serverLink.send({ type: FS_TRANSPORT_MSG.RENAME_RESPONSE, requestId, path: rawPath, newPath: rawNewPath, status: 'error', error: sessionRoot.error }); } catch { /* ignore */ }
     return;
@@ -10090,7 +10544,7 @@ async function handleFsDelete(cmd: Record<string, unknown>, serverLink: ServerLi
     return;
   }
 
-  const sessionRoot = await resolveFsMutationSessionRoot(cmd);
+  const sessionRoot = await resolveFsSessionRoot(cmd);
   if (!sessionRoot.ok) {
     try { serverLink.send({ type: FS_TRANSPORT_MSG.DELETE_RESPONSE, requestId, path: rawPath, status: 'error', error: sessionRoot.error }); } catch { /* ignore */ }
     return;
@@ -10210,6 +10664,7 @@ async function handleTransportListModels(
 ): Promise<void> {
   const agentType = typeof cmd.agentType === 'string' ? cmd.agentType : '';
   const ccPreset = typeof cmd.ccPreset === 'string' ? cmd.ccPreset.trim() : '';
+  const sessionName = typeof cmd.sessionName === 'string' ? cmd.sessionName.trim() : '';
   const requestId = typeof cmd.requestId === 'string' ? cmd.requestId : undefined;
   const force = cmd.force === true;
   const reply = (payload: {
@@ -10222,6 +10677,7 @@ async function handleTransportListModels(
       serverLink.send({
         type: TRANSPORT_MSG.MODELS_RESPONSE,
         agentType,
+        ...(sessionName ? { sessionName } : {}),
         ...(ccPreset ? { ccPreset } : {}),
         ...(requestId ? { requestId } : {}),
         ...payload,
@@ -10350,7 +10806,10 @@ async function loadPassiveTransportListModels(agentType: string): Promise<Transp
       defaultModel: COPILOT_FALLBACK_MODEL_IDS[0],
     };
   }
-  if (agentType === 'cursor-headless' || agentType === 'kimi-sdk' || agentType === 'grok-sdk') {
+  if (agentType === 'cursor-headless' || agentType === 'kimi-sdk' || agentType === 'grok-sdk'
+    || agentType === 'deepseek-harness') {
+    // DeepSeek Harness resolves provider routes and model catalogues from its
+    // own `~/.dsh` configuration; IM.codes advertises no static list.
     return { models: [] };
   }
   return { models: [], error: `Unsupported agentType: ${agentType || '(missing)'}` };

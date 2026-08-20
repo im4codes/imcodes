@@ -1,6 +1,6 @@
 import { Hono, type Context } from 'hono';
 import type { Env } from '../env.js';
-import { getServerById, getDbSessionsByServer, getSubSessionsByServer, upsertDbSession, deleteDbSession, updateSessionLabel, updateProjectName, updateSession } from '../db/queries.js';
+import { getServerById, getDbSessionByName, getDbSessionsByServer, getSubSessionById, getSubSessionsByServer, upsertDbSession, deleteDbSession, updateSessionLabel, updateProjectName, updateSession, updateSubSession } from '../db/queries.js';
 import { requireAuth } from '../security/authorization.js';
 import type { ServerRole } from '../security/authorization.js';
 import { randomHex } from '../security/crypto.js';
@@ -17,7 +17,7 @@ import {
   type ShareDenialReason,
   type ShareTarget,
 } from '../db/tab-sharing.js';
-import { resolveHttpShareAccess, resolveServerMemberAccessOrShareDeny } from './share-http-auth.js';
+import { resolveHttpShareAccess, resolveHttpShareAccessForCoveredSession, resolveServerMemberAccessOrShareDeny } from './share-http-auth.js';
 import { buildCoversSessionPredicate, resolveCoveredSessionNames } from '../share/covered-sessions.js';
 import { evaluateP2pSendTargetScope } from '../share/p2p-send-scope.js';
 import { IMCODES_POD_HEADER } from '../../../shared/http-header-names.js';
@@ -43,6 +43,14 @@ import {
 } from '../../../shared/session-group-clone.js';
 import { GIT_REMOTE_CLONE_CAPABILITY_V1 } from '../../../shared/git-remote-url.js';
 import type { SharedActorEnvelope } from '../../../shared/tab-sharing.js';
+import {
+  buildTransportConfigWithSupervision,
+  extractSessionSupervisionSnapshot,
+  isSupportedSupervisionTargetSessionType,
+  parseSessionSupervisionSnapshot,
+  SUPERVISION_MODE,
+  type SessionSupervisionSnapshot,
+} from '../../../shared/supervision-config.js';
 
 export const sessionMgmtRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
 
@@ -62,6 +70,19 @@ export const sessionMgmtRoutes = new Hono<{ Bindings: Env; Variables: { userId: 
 
 // Apply auth middleware globally to all session routes
 sessionMgmtRoutes.use('/*', requireAuth());
+
+function parseStoredTransportConfig(value: Record<string, unknown> | string | null): Record<string, unknown> | null {
+  if (value && typeof value === 'object' && !Array.isArray(value)) return value;
+  if (typeof value !== 'string') return null;
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : null;
+  } catch {
+    return null;
+  }
+}
 
 // ── Session persistence (daemon syncs these) ───────────────────────────────
 
@@ -152,6 +173,7 @@ sessionMgmtRoutes.put('/:id/sessions/:name', async (c) => {
     activeModel,
     effort,
     transportConfig,
+    serviceTier,
   } = body;
   if (!projectName || !projectRole || !agentType || !projectDir || !state) {
     return c.json({ error: 'missing_fields' }, 400);
@@ -184,6 +206,7 @@ sessionMgmtRoutes.put('/:id/sessions/:name', async (c) => {
     typeof activeModel === 'string' ? activeModel : null,
     typeof effort === 'string' ? effort : null,
     transportConfig && typeof transportConfig === 'object' ? transportConfig as Record<string, unknown> : null,
+    typeof serviceTier === 'string' ? serviceTier : null,
   );
   return c.json({ ok: true });
 });
@@ -215,6 +238,152 @@ sessionMgmtRoutes.patch('/:id/sessions/:name/label', async (c) => {
     logger.warn({ serverId, sessionName, err }, 'WsBridge session relabel relay failed');
   }
   return c.json({ ok: true });
+});
+
+/** PATCH /api/server/:id/sessions/:name/supervision — scoped supervision control without generic settings access. */
+sessionMgmtRoutes.patch('/:id/sessions/:name/supervision', async (c) => {
+  const userId = c.get('userId' as never) as string;
+  const serverId = c.req.param('id')!;
+  const sessionName = c.req.param('name')!;
+  const target = shareTargetFromSessionName(serverId, sessionName);
+  if (!target || target.kind === 'server') return c.json({ error: 'invalid_session' }, 400);
+
+  let body: { supervision?: unknown; actionId?: unknown };
+  try {
+    body = await c.req.json() as typeof body;
+  } catch {
+    return c.json({ error: 'invalid_json' }, 400);
+  }
+  const proposed = parseSessionSupervisionSnapshot(body.supervision);
+  if (!proposed) return c.json({ error: 'invalid_supervision' }, 400);
+
+  const access = await resolveHttpShareAccessForCoveredSession(c.env.DB, { serverId, userId, target });
+  if (access.actor.kind === 'none') {
+    return c.json({ error: 'forbidden', reason: 'not_authorized_for_server' }, 403);
+  }
+
+  const now = Date.now();
+  const actionId = actionIdFromBody(body as Record<string, unknown>);
+  if (access.actor.kind === 'share' && access.actor.effectiveActorRole !== 'participant') {
+    await auditHttpShareCommand(c, {
+      userId,
+      target,
+      coverage: access.actor.coverage,
+      actionType: 'session.supervision',
+      decision: 'rejected',
+      reason: 'share-role-denied',
+      actionId,
+      now,
+    });
+    return c.json({ error: 'forbidden', reason: 'share-role-denied' }, 403);
+  }
+
+  let row;
+  let agentType: string;
+  if (target.kind === 'subsession') {
+    row = await getSubSessionById(c.env.DB, target.subSessionId, serverId);
+    if (!row) return c.json({ error: 'not_found' }, 404);
+    agentType = row.type;
+  } else {
+    row = await getDbSessionByName(c.env.DB, serverId, target.sessionName);
+    if (!row) return c.json({ error: 'not_found' }, 404);
+    agentType = row.agent_type;
+  }
+  if (!isSupportedSupervisionTargetSessionType(agentType)) {
+    return c.json({ error: 'unsupported_session_type' }, 400);
+  }
+
+  const existingTransportConfig = parseStoredTransportConfig(row.transport_config);
+  const existingSnapshot = extractSessionSupervisionSnapshot(existingTransportConfig);
+  const nextSnapshot: SessionSupervisionSnapshot = existingSnapshot
+    ? { ...existingSnapshot, mode: proposed.mode }
+    : proposed;
+  if (nextSnapshot.mode === SUPERVISION_MODE.SUPERVISED_AUDIT && !nextSnapshot.auditTargetSessionName) {
+    return c.json({ error: 'audit_target_required' }, 409);
+  }
+  const nextTransportConfig = buildTransportConfigWithSupervision(existingTransportConfig, nextSnapshot);
+
+  if (access.actor.kind === 'share') {
+    if (nextSnapshot.mode === SUPERVISION_MODE.SUPERVISED_AUDIT && nextSnapshot.auditTargetSessionName) {
+      const p2pScopeTarget = await httpP2pScopeTarget(c.env.DB, {
+        userId,
+        serverId,
+        requestedTarget: target,
+        coverage: access.actor.coverage,
+        now,
+      });
+      const coveredSessionNames = await resolveCoveredSessionNames(c.env.DB, p2pScopeTarget);
+      if (!buildCoversSessionPredicate(p2pScopeTarget, coveredSessionNames)(nextSnapshot.auditTargetSessionName)) {
+        await auditHttpShareCommand(c, {
+          userId,
+          target,
+          coverage: access.actor.coverage,
+          actionType: 'session.supervision',
+          decision: 'rejected',
+          reason: 'share-direct-surface-denied',
+          actionId,
+          now,
+        });
+        return c.json({ error: 'forbidden', reason: 'share-direct-surface-denied' }, 403);
+      }
+    }
+    const rateLimitReason = evaluateHttpShareRateLimit({
+      bridge: WsBridge.get(serverId),
+      userId,
+      serverId,
+      sessionName,
+      commandType: 'session.send',
+      now,
+    });
+    if (rateLimitReason) {
+      await auditHttpShareCommand(c, {
+        userId,
+        target,
+        coverage: access.actor.coverage,
+        actionType: 'session.supervision',
+        decision: 'rejected',
+        reason: rateLimitReason,
+        actionId,
+        now,
+      });
+      return c.json({ error: 'forbidden', reason: rateLimitReason }, 429);
+    }
+  }
+
+  if (target.kind === 'subsession') {
+    await updateSubSession(c.env.DB, target.subSessionId, serverId, { transport_config: nextTransportConfig });
+  } else {
+    await updateSession(c.env.DB, serverId, target.sessionName, { transport_config: nextTransportConfig });
+  }
+
+  try {
+    WsBridge.get(serverId).sendToDaemon(JSON.stringify({
+      type: target.kind === 'subsession'
+        ? DAEMON_COMMAND_TYPES.SUBSESSION_UPDATE_TRANSPORT_CONFIG
+        : DAEMON_COMMAND_TYPES.SESSION_UPDATE_TRANSPORT_CONFIG,
+      sessionName,
+      transportConfig: nextTransportConfig,
+    }));
+  } catch (err) {
+    logger.error({ serverId, sessionName, err }, 'WsBridge session supervision relay failed');
+    return c.json({ error: 'relay_failed' }, 502);
+  }
+
+  if (access.actor.kind === 'share') {
+    await auditHttpShareCommand(c, {
+      userId,
+      target,
+      coverage: access.actor.coverage,
+      actionType: 'session.supervision',
+      decision: 'accepted',
+      actionId,
+      now,
+    });
+  }
+  const responseTransportConfig = access.actor.kind === 'share'
+    ? buildTransportConfigWithSupervision(null, nextSnapshot)
+    : nextTransportConfig;
+  return c.json({ ok: true, transportConfig: responseTransportConfig });
 });
 
 /** PATCH /api/server/:id/sessions/:name — update session settings (label, description, cwd) */
@@ -831,7 +1000,7 @@ async function auditHttpShareCommand(
     userId: string;
     target: ShareTarget;
     coverage: EffectiveCoverage;
-    actionType: Extract<ShareAuditActionType, 'session.send' | 'session.cancel'>;
+    actionType: Extract<ShareAuditActionType, 'session.send' | 'session.supervision' | 'session.cancel'>;
     decision: 'accepted' | 'rejected';
     reason?: ShareDenialReason | null;
     actionId: string;

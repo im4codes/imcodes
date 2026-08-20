@@ -1,7 +1,7 @@
 {
   "name": "imcodes",
   "version": "0.1.2",
-  "description": "A chat interface for AI coding agents \u2014 control Claude Code, Codex, Gemini CLI, OpenCode from browser and mobile",
+  "description": "A chat interface for AI coding agents — control Claude Code, Codex, Gemini CLI, OpenCode from browser and mobile",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -29,20 +29,20 @@
     "postpack": "node scripts/restore-package-json-after-pack.mjs",
     "dev": "tsx src/index.ts",
     "start": "node dist/index.ts",
-    "test": "vitest run",
+    "test": "node --max-old-space-size=8192 ./node_modules/vitest/vitest.mjs run",
     "lint:no-sync-context-store": "node scripts/lint-no-sync-context-store.mjs",
-    "test:unit": "vitest run --minWorkers=1 --maxWorkers=3 --project daemon",
-    "test:server": "vitest run --project server",
-    "test:web": "vitest run --project web",
-    "test:e2e": "vitest run --project e2e",
-    "test:integration": "vitest run --workspace vitest.integration.config.ts",
+    "test:unit": "node --max-old-space-size=8192 ./node_modules/vitest/vitest.mjs run --minWorkers=1 --maxWorkers=3 --project daemon",
+    "test:server": "node --max-old-space-size=8192 ./node_modules/vitest/vitest.mjs run --project server",
+    "test:web": "node --max-old-space-size=8192 ./node_modules/vitest/vitest.mjs run --project web",
+    "test:e2e": "node --max-old-space-size=8192 ./node_modules/vitest/vitest.mjs run --project e2e",
+    "test:integration": "node --max-old-space-size=8192 ./node_modules/vitest/vitest.mjs run --config vitest.integration.config.ts",
     "test:preview-dist": "node scripts/run-preview-dist-smoke.mjs",
     "test:grok-acp-smoke": "node scripts/smoke-grok-acp.mjs",
     "test:grok-auth-smoke": "tsx scripts/smoke-grok-sdk-auth.ts",
-    "test:coverage": "vitest run --coverage --coverage.reporter=text --coverage.reporter=html --coverage.reporter=json --coverage.reporter=json-summary --testTimeout=120000 --hookTimeout=120000 --teardownTimeout=60000 --minWorkers=1 --maxWorkers=3 --project daemon --project web --project server && node scripts/write-coverage-summary.mjs && node scripts/check-coverage-thresholds.mjs",
+    "test:coverage": "node --max-old-space-size=8192 ./node_modules/vitest/vitest.mjs run --coverage --coverage.reporter=text --coverage.reporter=html --coverage.reporter=json --coverage.reporter=json-summary --testTimeout=120000 --hookTimeout=120000 --teardownTimeout=60000 --minWorkers=1 --maxWorkers=3 --project daemon --project web --project server && node scripts/write-coverage-summary.mjs && node scripts/check-coverage-thresholds.mjs",
     "coverage:summary": "node scripts/write-coverage-summary.mjs",
     "coverage:check": "node scripts/check-coverage-thresholds.mjs",
-    "test:watch": "vitest",
+    "test:watch": "node --max-old-space-size=8192 ./node_modules/vitest/vitest.mjs",
     "lint": "eslint src/",
     "typecheck": "tsc --noEmit",
     "typecheck:legacy": "tsc6 --noEmit",
@@ -76,12 +76,12 @@
     "zod": "^4.3.6"
   },
   "devDependencies": {
-    "@typescript/native": "npm:typescript@^7.0.2",
     "@types/node": "^24.0.0",
     "@types/ws": "^8.5.13",
     "@typescript-eslint/eslint-plugin": "^8.0.0",
     "@typescript-eslint/parser": "^8.0.0",
-    "@vitest/coverage-v8": "^2.1.0",
+    "@typescript/native": "npm:typescript@^7.0.2",
+    "@vitest/coverage-v8": "^3.2.7",
     "eslint": "^9.0.0",
     "hono": "^4.12.5",
     "husky": "^9.1.7",
@@ -91,7 +91,7 @@
     "postject": "1.0.0-alpha.6",
     "tsx": "^4.19.0",
     "typescript": "npm:@typescript/typescript6@^6.0.2",
-    "vitest": "^2.1.0"
+    "vitest": "^3.2.7"
   },
   "lint-staged": {
     "**/*": "grep -qvE 'API_KEY|SECRET|PASSWORD|TOKEN|PRIVATE_KEY' || (echo 'Error: Potential sensitive information detected in your commit!' && exit 1)"

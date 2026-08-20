@@ -11,6 +11,7 @@ import { CODEX_MODEL_IDS } from '../../src/shared/models/options.js';
 import {
   fetchSupervisorDefaults,
   patchSession,
+  patchSessionSupervision,
   patchSubSession,
   saveSupervisorDefaults,
 } from '../src/api.js';
@@ -144,6 +145,35 @@ describe('supervision API helpers', () => {
           activeModel: 'sonnet',
           effort: 'medium',
           transportConfig: { supervision: { mode: 'supervised_audit' } },
+        }),
+      }),
+    );
+  });
+
+  it('patches only supervision through the covered-session endpoint', async () => {
+    const transportConfig = { supervision: { mode: 'supervised' } };
+    fetchMock.mockResolvedValueOnce(jsonResponse({ ok: true, transportConfig }));
+
+    await expect(patchSessionSupervision('srv-1', 'deck_sub_child', {
+      mode: 'supervised',
+      backend: 'codex-sdk',
+      model: 'gpt-5.4',
+      timeoutMs: 30_000,
+      promptVersion: 'supervision_decision_v1',
+    })).resolves.toEqual(transportConfig);
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/server/srv-1/sessions/deck_sub_child/supervision',
+      expect.objectContaining({
+        method: 'PATCH',
+        body: JSON.stringify({
+          supervision: {
+            mode: 'supervised',
+            backend: 'codex-sdk',
+            model: 'gpt-5.4',
+            timeoutMs: 30_000,
+            promptVersion: 'supervision_decision_v1',
+          },
         }),
       }),
     );

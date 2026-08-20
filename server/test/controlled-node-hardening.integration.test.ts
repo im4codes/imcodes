@@ -15,8 +15,12 @@ import { machinesRoutes } from '../src/routes/machines.js';
 import { WsBridge } from '../src/ws/bridge.js';
 import { MACHINE_LIST_MAX_ITEMS, NODE_ROLE } from '../../shared/remote-exec.js';
 import { MACHINE_REASONS } from '../../shared/machine-reference.js';
+import { REMOTE_DESKTOP_CAPABILITY } from '../../shared/remote-desktop.js';
+import { CONTROLLED_NODE_AUTO_UNLOCK_ERROR } from '../../shared/controlled-node-auto-unlock.js';
+import { signJwt } from '../src/security/crypto.js';
 
 let db: Database;
+const JWT_KEY = 'test-signing-key-32chars-padding!!';
 const hex = (n: number) => randomBytes(n).toString('hex');
 const sha256 = (s: string) => createHash('sha256').update(s).digest('hex');
 
@@ -29,7 +33,7 @@ afterAll(async () => { await db.close(); });
 function buildApp() {
   const app = new Hono();
   app.use('*', async (c, next) => {
-    (c as unknown as { env: { DB: Database } }).env = { DB: db };
+    (c as unknown as { env: { DB: Database; JWT_SIGNING_KEY: string } }).env = { DB: db, JWT_SIGNING_KEY: JWT_KEY };
     await next();
   });
   app.route('/api/enroll', enrollRoutes);
@@ -209,6 +213,44 @@ describe('owner-scoped machine rename', () => {
   });
 });
 
+describe('auto unlock capability gate', () => {
+  it('refuses a node that never advertised auto unlock instead of waiting it out', async () => {
+    const app = buildApp();
+    const userId = `u_${hex(4)}`;
+    await createUser(db, userId);
+    const owner = await fullCredential(userId);
+    const controlledId = `ctl_${hex(8)}`;
+    // Advertises remote desktop but not auto unlock: an older Windows build.
+    await db.execute(
+      `INSERT INTO servers (id, user_id, name, token_hash, status, created_at, node_role, exec_enabled, ref_name, display_name, os, controlled_capabilities)
+       VALUES ($1,$2,'controlled',$3,'online',$4,$5,true,'win-ref','Win box','win',$6)`,
+      [controlledId, userId, sha256(hex(16)), Date.now(), NODE_ROLE.CONTROLLED,
+        JSON.stringify([REMOTE_DESKTOP_CAPABILITY])],
+    );
+
+    const started = Date.now();
+    const response = await app.request(`/api/machines/${controlledId}/auto-unlock`, {
+      method: 'POST',
+      headers: {
+        'X-Server-Id': owner.serverId,
+        authorization: `Bearer ${owner.token}`,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({ secret: 'hunter2' }),
+    });
+    expect(response.status).toBe(409);
+    expect(await response.json()).toEqual({
+      error: CONTROLLED_NODE_AUTO_UNLOCK_ERROR.UNSUPPORTED_PLATFORM,
+    });
+    // Refused on the spot, not after the node-reply timeout.
+    expect(Date.now() - started).toBeLessThan(2_000);
+    expect(await db.queryOne<{ auto_unlock_configured: boolean }>(
+      'SELECT auto_unlock_configured FROM servers WHERE id = $1',
+      [controlledId],
+    )).toEqual({ auto_unlock_configured: false });
+  });
+});
+
 describe('owner-scoped machine listing (DB presence)', () => {
   it('returns an empty list when the owner has zero controlled machines', async () => {
     const app = buildApp();
@@ -231,19 +273,34 @@ describe('owner-scoped machine listing (DB presence)', () => {
     const other = await fullCredential(otherId);
     const code = `tok_${hex(6)}`;
     await seedV2Enrollment(code, userId);
-    await app.request('/api/enroll/v2/redeem', {
+    const redeem = await app.request('/api/enroll/v2/redeem', {
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ version: 2, enrollToken: code, installId: 'i1', nodeTokenHash: sha256(hex(16)), hostname: 'mybox', os: 'linux', arch: 'x64' }),
     });
+    const controlledId = (await redeem.json() as { serverId: string }).serverId;
+    await db.execute(
+      'UPDATE servers SET controlled_capabilities = $2::jsonb WHERE id = $1',
+      [controlledId, JSON.stringify([REMOTE_DESKTOP_CAPABILITY])],
+    );
+
+    const browser = await app.request('/api/machines', {
+      headers: { authorization: `Bearer ${signJwt({ sub: userId, type: 'web' }, JWT_KEY, 3_600)}` },
+    });
+    expect(browser.status).toBe(200);
+    const browserList = (await browser.json() as { machines: { capabilities?: string[]; accessRole?: string }[] }).machines;
+    expect(browserList[0]?.capabilities).toEqual([REMOTE_DESKTOP_CAPABILITY]);
+    expect(browserList[0]?.accessRole).toBe('owner');
 
     const mine = await app.request('/api/machines', { headers: { 'X-Server-Id': owner.serverId, authorization: `Bearer ${owner.token}` } });
     expect(mine.status).toBe(200);
-    const list = (await mine.json() as { machines: { serverId: string; online: boolean; execEnabled: boolean; os?: string; nodeRole: string }[] }).machines;
+    const list = (await mine.json() as { machines: { serverId: string; online: boolean; execEnabled: boolean; os?: string; nodeRole: string; accessRole?: string }[] }).machines;
     expect(list.length).toBe(1);
     expect(list[0].online).toBe(false); // no heartbeat yet
     expect(list[0].execEnabled).toBe(true); // installation is explicit consent; owner can still disable later
     expect(list[0].nodeRole).toBe(NODE_ROLE.CONTROLLED);
     expect(list[0].os).toBe('linux');
+    expect(list[0]).not.toHaveProperty('accessRole'); // rolling-upgrade compatibility with strict old daemons
+    expect(list[0]).not.toHaveProperty('capabilities');
 
     const theirs = await app.request('/api/machines', { headers: { 'X-Server-Id': other.serverId, authorization: `Bearer ${other.token}` } });
     expect(((await theirs.json() as { machines: unknown[] }).machines).length).toBe(0);

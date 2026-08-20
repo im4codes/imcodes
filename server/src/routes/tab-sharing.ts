@@ -24,6 +24,7 @@ import {
   type ShareTarget,
   type ShareTargetInput,
 } from '../db/tab-sharing.js';
+import { NODE_ROLE } from '../../../shared/remote-exec.js';
 
 export const tabSharingRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
 
@@ -91,7 +92,13 @@ async function recipientShareEntry(db: Env['DB'], share: Awaited<ReturnType<type
   let serverName: string | null = null;
   let targetLabel: string | null = null;
   if (share.target.kind === 'server') {
-    const row = await db.queryOne<{ name: string }>('SELECT name FROM servers WHERE id = $1', [share.serverId]);
+    const row = await db.queryOne<{ name: string; node_role: string | null }>(
+      'SELECT name, node_role FROM servers WHERE id = $1',
+      [share.serverId],
+    );
+    // A controlled server uses the same FK-backed grant store, but is consumed
+    // only by /api/machines. Never turn it into a shared daemon/session entry.
+    if (row?.node_role === NODE_ROLE.CONTROLLED) return null;
     serverName = row?.name ?? null;
     targetLabel = row?.name ?? null;
   } else if (share.target.kind === 'main') {
@@ -131,7 +138,24 @@ async function recipientShareEntry(db: Env['DB'], share: Awaited<ReturnType<type
   };
 }
 
-async function requireServerManager(db: Env['DB'], serverId: string, userId: string): Promise<boolean> {
+async function isControlledNodeShareTarget(db: Env['DB'], target: ShareTarget): Promise<boolean> {
+  const row = await db.queryOne<{ node_role: string | null }>(
+    'SELECT node_role FROM servers WHERE id = $1',
+    [target.serverId],
+  );
+  return row?.node_role === NODE_ROLE.CONTROLLED;
+}
+
+async function requireShareManager(db: Env['DB'], serverId: string, userId: string): Promise<boolean> {
+  const server = await db.queryOne<{ user_id: string; node_role: string | null }>(
+    'SELECT user_id, node_role FROM servers WHERE id = $1 AND revoked_at IS NULL',
+    [serverId],
+  );
+  if (!server) return false;
+  // Team admins may manage ordinary Tab shares, but a controlled node is a
+  // personal root/SYSTEM-capable credential. Only its direct owner may grant,
+  // change or revoke access to it.
+  if (server.node_role === NODE_ROLE.CONTROLLED) return server.user_id === userId;
   const role = await resolveServerRole(db, serverId, userId);
   return role === 'owner' || role === 'admin';
 }
@@ -188,7 +212,8 @@ async function auditShareLifecycle(c: Context<{ Bindings: Env; Variables: { user
 tabSharingRoutes.get('/shares', requireAuth(), async (c) => {
   const userId = c.get('userId' as never) as string;
   const shares = await listActiveSharesForUser(c.env.DB, userId, Date.now());
-  return c.json({ shares: await Promise.all(shares.map((share) => recipientShareEntry(c.env.DB, share))) });
+  const entries = await Promise.all(shares.map((share) => recipientShareEntry(c.env.DB, share)));
+  return c.json({ shares: entries.filter((entry) => entry !== null) });
 });
 
 tabSharingRoutes.post('/shares/open', requireAuth(), async (c) => {
@@ -198,6 +223,9 @@ tabSharingRoutes.post('/shares/open', requireAuth(), async (c) => {
   if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
   const target = await normalizeExistingShareTarget(c.env.DB, parsed.data.target as ShareTargetInput);
   if (!target) return c.json({ error: 'forbidden', reason: 'share-target-unavailable' }, 403);
+  if (await isControlledNodeShareTarget(c.env.DB, target)) {
+    return c.json({ error: 'forbidden', reason: 'share-target-unavailable' }, 403);
+  }
   const coverage = await resolveEffectiveShareCoverage(c.env.DB, { userId, target, now: Date.now() });
   if (!coverage) return c.json({ error: 'forbidden', reason: 'share-revoked' }, 403);
 
@@ -221,6 +249,8 @@ tabSharingRoutes.post('/shares/open', requireAuth(), async (c) => {
     : target.kind === 'main'
       ? mainRows.filter((session) => session.name === target.sessionName)
       : mainRows.filter((session) => subSessions.some((subSession) => subSession.parent_session === session.name));
+  const bridge = WsBridge.get(target.serverId);
+  const includeActiveDispatch = coverage.effectiveRole === 'participant';
 
   return c.json({
     server: {
@@ -236,6 +266,9 @@ tabSharingRoutes.post('/shares/open', requireAuth(), async (c) => {
       title: session.label?.trim() || session.project_name,
       state: session.state,
       agentType: session.agent_type,
+      ...(includeActiveDispatch
+        ? { activeDispatchId: bridge.getActiveDispatchIdForSession(session.name) }
+        : {}),
     })),
     subSessions: subSessions.map((subSession) => ({
       subSessionId: subSession.id,
@@ -243,6 +276,9 @@ tabSharingRoutes.post('/shares/open', requireAuth(), async (c) => {
       title: subSession.label?.trim() || subSession.type,
       type: subSession.type,
       parentSessionName: subSession.parent_session,
+      ...(includeActiveDispatch
+        ? { activeDispatchId: bridge.getActiveDispatchIdForSession(`deck_sub_${subSession.id}`) }
+        : {}),
     })),
   });
 });
@@ -254,6 +290,9 @@ tabSharingRoutes.post('/shares/ws-ticket', requireAuth(), async (c) => {
   if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
   const target = await normalizeExistingShareTarget(c.env.DB, parsed.data.target as ShareTargetInput);
   if (!target) return c.json({ error: 'forbidden', reason: 'share-target-unavailable' }, 403);
+  if (await isControlledNodeShareTarget(c.env.DB, target)) {
+    return c.json({ error: 'forbidden', reason: 'share-target-unavailable' }, 403);
+  }
   const issuedAt = Date.now();
   const snapshot = await resolveEffectiveShareCoverage(c.env.DB, { userId, target, now: issuedAt });
   if (!snapshot) return c.json({ error: 'forbidden', reason: 'share-revoked' }, 403);
@@ -281,7 +320,7 @@ tabSharingRoutes.post('/shares/ws-ticket', requireAuth(), async (c) => {
 tabSharingRoutes.get('/server/:serverId/shares', requireAuth(), async (c) => {
   const userId = c.get('userId' as never) as string;
   const serverId = c.req.param('serverId') ?? '';
-  if (!await requireServerManager(c.env.DB, serverId, userId)) return c.json({ error: 'forbidden' }, 403);
+  if (!await requireShareManager(c.env.DB, serverId, userId)) return c.json({ error: 'forbidden' }, 403);
   const targetKind = c.req.query('targetKind');
   const requestedTarget = targetKind === 'server'
     ? normalizeShareTargetInput({ kind: 'server', serverId })
@@ -314,7 +353,7 @@ tabSharingRoutes.post('/server/:serverId/shares', requireAuth(), async (c) => {
   const normalizedTarget = normalizeShareTargetInput(parsed.data.target as ShareTargetInput);
   const now = Date.now();
   if (!normalizedTarget) return c.json({ error: 'invalid_body', reason: 'invalid_target' }, 400);
-  if (!await requireServerManager(c.env.DB, serverId, userId)) {
+  if (!await requireShareManager(c.env.DB, serverId, userId)) {
     await auditShareLifecycle(c, {
       actionType: 'share.create',
       decision: 'rejected',
@@ -359,7 +398,7 @@ tabSharingRoutes.post('/server/:serverId/shares', requireAuth(), async (c) => {
 tabSharingRoutes.patch('/server/:serverId/shares/:shareId', requireAuth(), async (c) => {
   const userId = c.get('userId' as never) as string;
   const serverId = c.req.param('serverId') ?? '';
-  if (!await requireServerManager(c.env.DB, serverId, userId)) return c.json({ error: 'forbidden' }, 403);
+  if (!await requireShareManager(c.env.DB, serverId, userId)) return c.json({ error: 'forbidden' }, 403);
   const body = await c.req.json().catch(() => null);
   const parsed = updateShareSchema.safeParse(body);
   if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
@@ -389,7 +428,7 @@ tabSharingRoutes.patch('/server/:serverId/shares/:shareId', requireAuth(), async
 tabSharingRoutes.delete('/server/:serverId/shares/:shareId', requireAuth(), async (c) => {
   const userId = c.get('userId' as never) as string;
   const serverId = c.req.param('serverId') ?? '';
-  if (!await requireServerManager(c.env.DB, serverId, userId)) return c.json({ error: 'forbidden' }, 403);
+  if (!await requireShareManager(c.env.DB, serverId, userId)) return c.json({ error: 'forbidden' }, 403);
   const now = Date.now();
   const share = await revokeShare(c.env.DB, { shareId: c.req.param('shareId') ?? '', serverId, now });
   if (!share) return c.json({ error: 'not_found' }, 404);
@@ -410,7 +449,7 @@ tabSharingRoutes.delete('/server/:serverId/shares/:shareId', requireAuth(), asyn
 tabSharingRoutes.get('/server/:serverId/share-audit', requireAuth(), async (c) => {
   const userId = c.get('userId' as never) as string;
   const serverId = c.req.param('serverId') ?? '';
-  if (!await requireServerManager(c.env.DB, serverId, userId)) return c.json({ error: 'forbidden' }, 403);
+  if (!await requireShareManager(c.env.DB, serverId, userId)) return c.json({ error: 'forbidden' }, 403);
   const limit = Math.min(Math.max(Number(c.req.query('limit') ?? 50), 1), 100);
   const rows = await c.env.DB.query<Record<string, unknown>>(
     `SELECT id, server_id, actor_kind, actor_user_id, target_user_id, effective_actor_role,

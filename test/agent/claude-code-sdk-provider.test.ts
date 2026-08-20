@@ -99,6 +99,7 @@ vi.mock('../../src/util/logger.js', () => ({
 }));
 
 import { ClaudeCodeSdkProvider } from '../../src/agent/providers/claude-code-sdk.js';
+import { PROVIDER_ACTIVE_TURN_DELIVERY_KINDS } from '../../src/agent/transport-provider.js';
 import type { AgentMessage, ToolCallEvent } from '../../shared/agent-message.js';
 import type { ProviderContextPayload } from '../../shared/context-types.js';
 import { MEMORY_MCP_STATUS } from '../../shared/memory-ws.js';
@@ -173,6 +174,48 @@ describe('ClaudeCodeSdkProvider', () => {
     expect(sdkMock.runs[0]?.closed).toBe(false);
 
     await provider.endSession('route-delegation-notify');
+    await sendPromise;
+  });
+
+  it('inserts an appended message at Claude\'s next safe boundary instead of preempting it', async () => {
+    sdkMock.setWaitForClose(true);
+    const provider = new ClaudeCodeSdkProvider();
+    await provider.connect({ binaryPath: 'claude' });
+    await provider.createSession({
+      sessionKey: 'route-queued-message-notify',
+      sessionName: 'deck_project_brain',
+      cwd: '/tmp/project',
+    });
+    const sendPromise = provider.send('route-queued-message-notify', 'foreground work');
+    await waitFor(() => sdkMock.runs.length === 1);
+
+    const result = await provider.notifyActiveDelegation?.('route-queued-message-notify', {
+      notificationId: 'queued_notification_identity',
+      delegationId: 'queue-append:queued_notification_identity',
+      sourceSessionName: 'deck_project_brain',
+      text: 'append at the next safe boundary',
+      deliveryKind: PROVIDER_ACTIVE_TURN_DELIVERY_KINDS.QUEUED_MESSAGE,
+    });
+
+    expect(result).toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    const queue = sdkMock.runs[0]?.promptSource as { buffer?: Array<Record<string, any>> };
+    expect(queue.buffer?.at(-1)).toMatchObject({
+      type: 'user',
+      uuid: 'queued_notification_identity',
+      // `now` cancels/preempts an Agent SDK turn. `next` keeps the live turn
+      // running and drains at its next safe boundary.
+      priority: 'next',
+      shouldQuery: true,
+      // A queued message is the user's own composer input; appending it
+      // mid-turn must not restamp it as synthetic peer input, or the model
+      // reports it as "not from the user".
+      origin: { kind: 'human' },
+      message: { role: 'user', content: 'append at the next safe boundary' },
+    });
+    expect(queue.buffer?.at(-1)).not.toHaveProperty('isSynthetic');
+    expect(sdkMock.runs[0]?.closed).toBe(false);
+
+    await provider.endSession('route-queued-message-notify');
     await sendPromise;
   });
 
@@ -266,6 +309,70 @@ describe('ClaudeCodeSdkProvider', () => {
     expect(completed).toEqual(['Hello']);
     expect(sessionInfo.some((info) => info.resumeId === 'session-1')).toBe(true);
     expect(sessionInfo.some((info) => info.model === 'claude-sonnet-4-6')).toBe(true);
+  });
+
+  it('does not carry finished subagent rows into the next turn', async () => {
+    // `subagentTasks` was append-only and survives session re-create, so rows
+    // from a finished turn stayed forever. The 15-minute stale sweep and cancel
+    // are both turn-blind: they flip such a row terminal and emit a snapshot
+    // for it, which reaches the session as a completion notice naming a task
+    // the current turn never started ("bvmpd67sr 在本会话不存在"). Live rows
+    // must survive — a retained query exists because subagents are running.
+    const provider = new ClaudeCodeSdkProvider();
+    const state = {
+      subagentTasks: new Map<string, { terminal: boolean; active: boolean }>([
+        ['done-1', { terminal: true, active: false }],
+        ['stopped-1', { terminal: false, active: false }],
+        ['running-1', { terminal: false, active: true }],
+      ]),
+    };
+
+    (provider as unknown as { pruneTerminalSubagentTasks: (s: unknown) => void })
+      .pruneTerminalSubagentTasks(state);
+
+    expect([...state.subagentTasks.keys()]).toEqual(['running-1']);
+  });
+
+  it('keeps a subagent stream out of the foreground message', async () => {
+    // A Task subagent's stream_events ride the SAME session stream, tagged with
+    // `parent_tool_use_id`. `currentText` / `currentMessageId` describe the
+    // FOREGROUND message only, and neither the accumulator reset nor the text
+    // deltas checked that tag — so a running subagent first spliced its output
+    // onto the end of the foreground sentence, then wiped it entirely when its
+    // own message_start reset the shared buffer. Observed live: a bubble
+    // reading "I'll begin searching across the categories." was replaced by
+    // successive slices of a subagent's unrelated report under the same id.
+    sdkMock.setNextMessages([
+      { type: 'system', subtype: 'init', session_id: 'session-sub', model: 'claude-sonnet-4-6' },
+      { type: 'stream_event', session_id: 'session-sub', event: { type: 'message_start', message: { id: 'fg-1' } } },
+      { type: 'stream_event', session_id: 'session-sub', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: "I'll begin" } } },
+      // Subagent starts and streams while the foreground message is still open.
+      { type: 'stream_event', session_id: 'session-sub', parent_tool_use_id: 'toolu_sub_1', event: { type: 'message_start', message: { id: 'sub-1' } } },
+      { type: 'stream_event', session_id: 'session-sub', parent_tool_use_id: 'toolu_sub_1', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'SUBAGENT REPORT' } } },
+      { type: 'stream_event', session_id: 'session-sub', parent_tool_use_id: 'toolu_sub_1', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: ' CONTINUED' } } },
+      // Foreground resumes; it must continue from its own text, not the Task's.
+      { type: 'stream_event', session_id: 'session-sub', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: ' searching.' } } },
+      { type: 'assistant', session_id: 'session-sub', message: { content: [{ type: 'text', text: "I'll begin searching." }] } },
+      { type: 'result', session_id: 'session-sub', subtype: 'success', is_error: false, result: "I'll begin searching.", usage: { input_tokens: 10, output_tokens: 5, cache_read_input_tokens: 0 } },
+    ]);
+
+    const provider = new ClaudeCodeSdkProvider();
+    await provider.connect({ binaryPath: 'claude' });
+    await provider.createSession({ sessionKey: 'route-sub', cwd: '/tmp/project', resumeId: 'session-sub' });
+
+    const deltas: Array<{ id: string; text: string }> = [];
+    provider.onDelta((_sid, delta) => deltas.push({ id: delta.messageId, text: delta.delta }));
+
+    await provider.send('route-sub', 'hello');
+    await flush();
+
+    // No subagent text may appear in any emitted delta, under any id.
+    for (const d of deltas) {
+      expect(d.text, 'subagent text leaked into a foreground delta').not.toContain('SUBAGENT');
+    }
+    // The foreground message accumulates only its own text, uninterrupted.
+    const foreground = deltas.filter((d) => d.id === 'fg-1').map((d) => d.text);
+    expect(foreground).toEqual(["I'll begin", "I'll begin searching."]);
   });
 
   it('resets the streaming accumulator across messages so a second message is not prefixed with the first', async () => {

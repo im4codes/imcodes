@@ -63,6 +63,7 @@ export interface IncomingSessionListEntry {
   quotaUsageLabel?: string | null;
   quotaMeta?: SessionInfo['quotaMeta'];
   effort?: SessionInfo['effort'];
+  serviceTier?: SessionInfo['serviceTier'];
   contextNamespace?: SessionInfo['contextNamespace'];
   contextNamespaceDiagnostics?: string[];
   transportConfig?: Record<string, unknown> | null;
@@ -174,6 +175,7 @@ export function mergeSessionListEntry(
     quotaUsageLabel: incoming.quotaUsageLabel ?? (preservesProviderQuota ? existing?.quotaUsageLabel : undefined),
     quotaMeta: incoming.quotaMeta ?? (preservesProviderQuota ? existing?.quotaMeta : undefined),
     effort: incoming.effort ?? existing?.effort,
+    serviceTier: incoming.serviceTier ?? existing?.serviceTier,
     contextNamespace: incoming.contextNamespace ?? existing?.contextNamespace,
     contextNamespaceDiagnostics: incoming.contextNamespaceDiagnostics ?? existing?.contextNamespaceDiagnostics,
     transportConfig: mergeTransportConfigPreservingSupervision(

@@ -8,7 +8,12 @@ import {
   advertisedMcpToolNames,
 } from '../../shared/memory-mcp-contracts.js';
 import { MCP_ERROR_REASONS } from '../../shared/memory-mcp-errors.js';
-import { NODE_ROLE, REMOTE_EXEC_SHELLS, REMOTE_EXEC_MAX_TIMEOUT_MS } from '../../shared/remote-exec.js';
+import {
+  NODE_ROLE,
+  REMOTE_EXEC_DEFAULT_TIMEOUT_MS,
+  REMOTE_EXEC_SHELLS,
+  REMOTE_EXEC_MAX_TIMEOUT_MS,
+} from '../../shared/remote-exec.js';
 import {
   MACHINE_NAME_PATTERN,
   MACHINE_REF_NAME_MAX,
@@ -28,8 +33,12 @@ describe('machine MCP tools join the contract surface (10.12)', () => {
     const c = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE];
     const shell = c.inputSchema.properties?.shell;
     const timeout = c.inputSchema.properties?.timeoutMs;
+    expect(REMOTE_EXEC_DEFAULT_TIMEOUT_MS).toBe(900_000);
+    expect(REMOTE_EXEC_MAX_TIMEOUT_MS).toBe(3_600_000);
     expect(shell?.enum).toEqual([...REMOTE_EXEC_SHELLS]);
     expect(timeout?.maximum).toBe(REMOTE_EXEC_MAX_TIMEOUT_MS);
+    expect(timeout?.description).toContain('defaults to 900000');
+    expect(timeout?.description).toContain('3600000');
   });
 
   it('treats list_machines as discovery only and publishes bounded direct ref_name inputs', () => {

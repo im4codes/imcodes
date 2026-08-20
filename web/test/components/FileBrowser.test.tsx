@@ -11,6 +11,16 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { h } from 'preact';
 import { render, screen, fireEvent, act, cleanup, waitFor } from '@testing-library/preact';
 
+const filePreviewPropsState = vi.hoisted(() => ({
+  current: null as null | {
+    content: string;
+    path: string;
+    allowedRootPath?: string;
+    onPathClick?: (path: string) => void;
+    onImagePreview?: (path: string) => Promise<{ dataUrl: string; alt?: string } | string>;
+  },
+}));
+
 // Mock FileEditor.js to prevent Vitest's SSR module graph from evaluating
 // 17 CodeMirror/Lezer imports (causes OOM in jsdom). vi.mock is hoisted but
 // Vitest still resolves the module graph for dependency analysis — this mock
@@ -25,7 +35,10 @@ vi.mock('../../src/components/file-editor-lazy.js', () => ({
   FileEditorContent: () => null,
 }));
 vi.mock('../../src/components/FilePreviewPane.js', () => ({
-  default: (props: { content: string }) => <div data-testid="mock-file-preview">{props.content}</div>,
+  default: (props: NonNullable<typeof filePreviewPropsState.current>) => {
+    filePreviewPropsState.current = props;
+    return <div data-testid="mock-file-preview">{props.content}</div>;
+  },
 }));
 
 import { FileBrowser, __resetFileBrowserSharedChangesForTests, mergePreviewState, getParentDir } from '../../src/components/FileBrowser.js';
@@ -165,6 +178,7 @@ function makeWsFactory() {
 describe('FileBrowser', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    filePreviewPropsState.current = null;
     localStorage.clear();
     __resetFileBrowserSharedChangesForTests();
   });
@@ -253,6 +267,47 @@ describe('FileBrowser', () => {
     expect(nestedTree!.classList.contains('fb-tree-split')).toBe(false);
   });
 
+  it('wires Markdown file links and inline image reads into the scoped file browser channel', async () => {
+    const { ws, sendMsg } = makeWsFactory();
+    render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user/docs"
+        changesRootPath="/home/user"
+        initialPreview={{ status: 'ok', path: '/home/user/docs/README.md', content: '![Flow](./flow.png)' }}
+        sessionName="deck_project_brain"
+        scopeToSessionRoot
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => expect(filePreviewPropsState.current?.onImagePreview).toBeTypeOf('function'));
+    expect(filePreviewPropsState.current?.allowedRootPath).toBe('/home/user');
+    const imagePromise = filePreviewPropsState.current!.onImagePreview!('/home/user/docs/flow.png');
+    expect(ws.fsReadFile).toHaveBeenLastCalledWith('/home/user/docs/flow.png', 'deck_project_brain');
+
+    await act(async () => {
+      sendMsg({
+        type: 'fs.read_response',
+        requestId: 'mock-read-id',
+        path: '/home/user/docs/flow.png',
+        status: 'ok',
+        encoding: 'base64',
+        mimeType: 'image/png',
+        content: 'cG5n',
+      });
+    });
+    await expect(imagePromise).resolves.toEqual({
+      dataUrl: 'data:image/png;base64,cG5n',
+      alt: 'flow.png',
+    });
+
+    filePreviewPropsState.current!.onPathClick?.('/home/user/GUIDE.md');
+    expect(ws.fsReadFile).toHaveBeenLastCalledWith('/home/user/GUIDE.md', 'deck_project_brain');
+  });
+
   it('keeps the changes tree as a direct split child when preview is open', () => {
     const { ws } = makeWsFactory();
     render(
@@ -313,6 +368,74 @@ describe('FileBrowser', () => {
       <FileBrowser ws={ws} mode="dir-only" layout="modal" initialPath="~/projects" onConfirm={vi.fn()} onClose={vi.fn()} />,
     );
     expect(fsListDir).toHaveBeenCalledWith('~/projects', false, false);
+  });
+
+  it('scopes shared-session browsing and keeps viewer file management read-only', async () => {
+    const { ws, fsListDir, fsMkdir, fsWriteFile, fsRename, fsDelete, respond } = makeWsFactory();
+    render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user/project"
+        sessionName="deck_project_brain"
+        scopeToSessionRoot
+        readOnly
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    expect(fsListDir).toHaveBeenCalledWith('/home/user/project', true, false, {
+      sessionName: 'deck_project_brain',
+    });
+    expect(screen.queryByTitle('New file')).toBeNull();
+    expect(screen.queryByTitle('New folder')).toBeNull();
+
+    await act(async () => { respond([{ name: 'shared.png', isDir: false }], '/home/user/project'); });
+    const row = screen.getByText('shared.png').closest('.fb-node');
+    expect(row).not.toBeNull();
+    fireEvent.contextMenu(row!);
+    expect(screen.queryByText('Rename')).toBeNull();
+    expect(screen.queryByText('Delete')).toBeNull();
+    expect(fsMkdir).not.toHaveBeenCalled();
+    expect(fsWriteFile).not.toHaveBeenCalled();
+    expect(fsRename).not.toHaveBeenCalled();
+    expect(fsDelete).not.toHaveBeenCalled();
+  });
+
+  it('does not narrow ordinary owned-session browsing to the project root', () => {
+    const { ws, fsListDir } = makeWsFactory();
+    render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        sessionName="deck_owned_brain"
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    expect(fsListDir).toHaveBeenCalledWith('/home/user', true, false);
+    expect(fsListDir).not.toHaveBeenCalledWith('/home/user', true, false, expect.anything());
+  });
+
+  it('opens a shared file manager at the virtual session root when projectDir is hidden', () => {
+    const { ws, fsListDir } = makeWsFactory();
+    render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        sessionName="deck_project_brain"
+        scopeToSessionRoot
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    expect(fsListDir).toHaveBeenCalledWith(':session-root:', true, false, {
+      sessionName: 'deck_project_brain',
+    });
   });
 
   it('does NOT include files for dir-only mode', () => {
@@ -741,6 +864,38 @@ describe('FileBrowser', () => {
 
     expect(writeText).toHaveBeenCalledWith(currentPath);
     await waitFor(() => expect(getByText('Copied!')).toBeDefined());
+  });
+
+  it('keeps desktop copy-path and select actions visible beside the current path', async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    const onConfirm = vi.fn();
+    const currentPath = '/home/user/projects';
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: { writeText },
+    });
+    const { ws, respond } = makeWsFactory();
+    const { container } = render(
+      <FileBrowser ws={ws} mode="dir-only" layout="panel" initialPath={currentPath} onConfirm={onConfirm} />,
+    );
+
+    await act(async () => {
+      respond([], currentPath);
+    });
+
+    const actions = container.querySelector('.fb-breadcrumb-actions') as HTMLElement;
+    const [copyButton, selectButton] = Array.from(actions.querySelectorAll<HTMLButtonElement>('button'));
+    expect(copyButton?.getAttribute('aria-label')).toBe('Copy path');
+    expect(selectButton?.getAttribute('aria-label')).toBe('Select');
+
+    await act(async () => {
+      copyButton?.click();
+      await Promise.resolve();
+    });
+    selectButton?.click();
+
+    expect(writeText).toHaveBeenCalledWith(currentPath);
+    expect(onConfirm).toHaveBeenCalledWith([currentPath]);
   });
 
   it('deselects a path when clicked again in multi-select', async () => {
