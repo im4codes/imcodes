@@ -3111,6 +3111,16 @@
     "install_error_not_bound": "Este daemon no está vinculado a ningún servidor",
     "install_error_download_failed": "Fallo en la descarga: revisa la conexión y reinténtalo",
     "install_error_verification_failed": "El componente descargado no superó la verificación de firma",
-    "install_error_not_available": "Este servidor aún no tiene componente de control remoto para esta plataforma"
+    "install_error_not_available": "Este servidor aún no tiene componente de control remoto para esta plataforma",
+    "login_screen_enable": "Activar pantalla de inicio de sesión",
+    "login_screen_retry": "Reintentar la configuración",
+    "login_screen_hint": "Controla también la pantalla de inicio de sesión y de bloqueo. Instala el componente de nodo controlado y pide aprobación de administrador una vez en esa máquina.",
+    "login_screen_downloading": "Descargando el instalador…",
+    "login_screen_waiting": "Esperando aprobación…",
+    "login_screen_failed": "Fallo al configurar la pantalla de inicio de sesión",
+    "login_screen_error_unsupported_platform": "Requiere Windows x64",
+    "login_screen_error_not_bound": "Este daemon no está vinculado a ningún servidor",
+    "login_screen_error_download_failed": "No se pudo obtener el instalador: revisa la conexión y reinténtalo",
+    "login_screen_error_elevation_declined": "No se concedió la aprobación de administrador en esa máquina"
   }
 }

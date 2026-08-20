@@ -25,7 +25,16 @@ import {
   CONTROLLED_NODE_ARCH_X64,
   CONTROLLED_NODE_OS_WIN,
 } from '../../shared/controlled-node-artifacts.js';
+import {
+  REMOTE_DESKTOP_LOGIN_SCREEN_ERROR,
+  REMOTE_DESKTOP_LOGIN_SCREEN_MSG,
+  REMOTE_DESKTOP_LOGIN_SCREEN_STATE,
+  readRemoteDesktopLoginScreenTicket,
+  type RemoteDesktopLoginScreenError,
+  type RemoteDesktopLoginScreenState,
+} from '../../shared/remote-desktop-login-screen.js';
 import { dispatchRemoteDesktopCommand } from '../node/remote-desktop-dispatch.js';
+import { installLoginScreenControl } from './remote-desktop-login-screen.js';
 import {
   REMOTE_DESKTOP_COMPILED_SIGNER_SHA256,
   RemoteDesktopWorkerHost,
@@ -89,6 +98,7 @@ export interface DaemonRemoteDesktopDeps {
     artifact: VerifiedRemoteDesktopWorkerArtifact,
     onMessage: (message: Record<string, unknown>) => void,
   ) => RemoteDesktopWorkerLike;
+  installLoginScreen?: typeof installLoginScreenControl;
 }
 
 /**
@@ -110,6 +120,7 @@ export class DaemonRemoteDesktop {
   private host: RemoteDesktopWorkerLike | null = null;
   private artifact: VerifiedRemoteDesktopWorkerArtifact | null = null;
   private installing: Promise<void> | null = null;
+  private installingLoginScreen: Promise<void> | null = null;
 
   constructor(private readonly deps: DaemonRemoteDesktopDeps) {
     this.platform = deps.platform ?? process.platform;
@@ -158,6 +169,10 @@ export class DaemonRemoteDesktop {
   async handle(message: Record<string, unknown>): Promise<boolean> {
     if (message.type === REMOTE_DESKTOP_INSTALL_MSG.REQUEST) {
       await this.install();
+      return true;
+    }
+    if (message.type === REMOTE_DESKTOP_LOGIN_SCREEN_MSG.REQUEST) {
+      await this.installLoginScreen(readRemoteDesktopLoginScreenTicket(message));
       return true;
     }
     if (typeof message.type !== 'string' || !isRemoteDesktopMessageType(message.type)) return false;
@@ -300,6 +315,69 @@ export class DaemonRemoteDesktop {
   private publish(state: RemoteDesktopInstallState, error?: RemoteDesktopInstallError): void {
     this.deps.send({
       type: REMOTE_DESKTOP_INSTALL_MSG.STATE,
+      state,
+      ...(error ? { error } : {}),
+    });
+  }
+
+  /**
+   * Install the controlled node on this machine so it can serve the sign-in and
+   * lock screen, which a daemon running as the interactive user cannot.
+   *
+   * Concurrent requests join the attempt in flight rather than raising a second
+   * UAC prompt on the machine's screen.
+   */
+  async installLoginScreen(ticket: string | null): Promise<void> {
+    if (!this.supported()) {
+      this.publishLoginScreen(
+        REMOTE_DESKTOP_LOGIN_SCREEN_STATE.FAILED,
+        REMOTE_DESKTOP_LOGIN_SCREEN_ERROR.UNSUPPORTED_PLATFORM,
+      );
+      return;
+    }
+    if (!ticket) {
+      this.publishLoginScreen(
+        REMOTE_DESKTOP_LOGIN_SCREEN_STATE.FAILED,
+        REMOTE_DESKTOP_LOGIN_SCREEN_ERROR.DOWNLOAD_FAILED,
+      );
+      return;
+    }
+    if (this.installingLoginScreen) return this.installingLoginScreen;
+    this.installingLoginScreen = this.runLoginScreenInstall(ticket)
+      .finally(() => { this.installingLoginScreen = null; });
+    return this.installingLoginScreen;
+  }
+
+  private async runLoginScreenInstall(ticket: string): Promise<void> {
+    let failure: RemoteDesktopLoginScreenError | null;
+    try {
+      failure = await (this.deps.installLoginScreen ?? installLoginScreenControl)({
+        ticket,
+        root: this.root,
+        loadCredential: this.deps.loadCredential ?? loadDaemonCredential,
+        ...(this.deps.fetchImpl ? { fetchImpl: this.deps.fetchImpl } : {}),
+        onState: (state) => this.publishLoginScreen(
+          state === 'downloading'
+            ? REMOTE_DESKTOP_LOGIN_SCREEN_STATE.DOWNLOADING
+            : REMOTE_DESKTOP_LOGIN_SCREEN_STATE.ELEVATING,
+        ),
+      });
+    } catch (err) {
+      logger.warn({ err }, 'login screen control install failed');
+      failure = REMOTE_DESKTOP_LOGIN_SCREEN_ERROR.DOWNLOAD_FAILED;
+    }
+    this.publishLoginScreen(
+      failure ? REMOTE_DESKTOP_LOGIN_SCREEN_STATE.FAILED : REMOTE_DESKTOP_LOGIN_SCREEN_STATE.COMPLETED,
+      failure ?? undefined,
+    );
+  }
+
+  private publishLoginScreen(
+    state: RemoteDesktopLoginScreenState,
+    error?: RemoteDesktopLoginScreenError,
+  ): void {
+    this.deps.send({
+      type: REMOTE_DESKTOP_LOGIN_SCREEN_MSG.STATE,
       state,
       ...(error ? { error } : {}),
     });

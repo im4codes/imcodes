@@ -3110,6 +3110,16 @@
     "install_error_not_bound": "이 데몬은 서버에 연결되어 있지 않습니다",
     "install_error_download_failed": "다운로드에 실패했습니다. 연결을 확인한 뒤 다시 시도하세요",
     "install_error_verification_failed": "다운로드한 구성 요소의 서명 검증에 실패했습니다",
-    "install_error_not_available": "이 서버에는 아직 이 플랫폼용 구성 요소가 없습니다"
+    "install_error_not_available": "이 서버에는 아직 이 플랫폼용 구성 요소가 없습니다",
+    "login_screen_enable": "로그인 화면 사용",
+    "login_screen_retry": "로그인 화면 설정 다시 시도",
+    "login_screen_hint": "로그인 및 잠금 화면도 제어합니다. 해당 컴퓨터에 제어 대상 노드 구성 요소를 설치하고 관리자 승인이 한 번 필요합니다.",
+    "login_screen_downloading": "설치 프로그램 다운로드 중…",
+    "login_screen_waiting": "승인 대기 중…",
+    "login_screen_failed": "로그인 화면 설정에 실패했습니다",
+    "login_screen_error_unsupported_platform": "로그인 화면 제어에는 Windows x64가 필요합니다",
+    "login_screen_error_not_bound": "이 데몬은 서버에 연결되어 있지 않습니다",
+    "login_screen_error_download_failed": "설치 프로그램을 가져오지 못했습니다. 연결을 확인한 뒤 다시 시도하세요",
+    "login_screen_error_elevation_declined": "해당 컴퓨터에서 관리자 승인을 받지 못했습니다"
   }
 }

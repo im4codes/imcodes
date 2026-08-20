@@ -199,6 +199,58 @@ describe('POST /api/enroll/v2/ticket (artifact manifest → enrollments_v2 row)'
     expect(count?.n).toBe('0');
   });
 
+  it('records the daemon a login-screen enrolment was started from, and refuses another user\'s', async () => {
+    const app = buildApp();
+    const userId = `u_${hex(4)}`;
+    const otherUserId = `u_${hex(4)}`;
+    await createUser(db, userId);
+    await createUser(db, otherUserId);
+    const o = await owner(userId);
+    const stranger = await owner(otherUserId);
+
+    // The host link decides which entry a browser steers remote control to, so
+    // it must not be assignable to a machine this user does not own.
+    const forbidden = await app.request('/api/enroll/v2/ticket', {
+      method: 'POST',
+      headers: ticketHeaders(userId, o),
+      body: JSON.stringify({ version: 2, os: 'win', arch: 'x64', hostServerId: stranger.serverId }),
+    });
+    expect(forbidden.status).toBe(403);
+    expect(await forbidden.json()).toEqual({ error: 'invalid_host_server' });
+
+    const minted = await app.request('/api/enroll/v2/ticket', {
+      method: 'POST',
+      headers: ticketHeaders(userId, o),
+      body: JSON.stringify({ version: 2, os: 'win', arch: 'x64', hostServerId: o.serverId }),
+    });
+    expect(minted.status).toBe(200);
+    const { ticketId } = await minted.json() as { ticketId: string };
+    const stored = await db.queryOne<{ host_server_id: string | null }>(
+      'SELECT host_server_id FROM controlled_node_enrollments_v2 WHERE id = $1',
+      [ticketId],
+    );
+    expect(stored?.host_server_id).toBe(o.serverId);
+  });
+
+  it('leaves the host link unset for an ordinary enrolment', async () => {
+    const app = buildApp();
+    const userId = `u_${hex(4)}`;
+    await createUser(db, userId);
+    const o = await owner(userId);
+    const r = await app.request('/api/enroll/v2/ticket', {
+      method: 'POST',
+      headers: ticketHeaders(userId, o),
+      body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
+    });
+    expect(r.status).toBe(200);
+    const { ticketId } = await r.json() as { ticketId: string };
+    const stored = await db.queryOne<{ host_server_id: string | null }>(
+      'SELECT host_server_id FROM controlled_node_enrollments_v2 WHERE id = $1',
+      [ticketId],
+    );
+    expect(stored?.host_server_id).toBeNull();
+  });
+
   it('mints a ticket; stores encrypted code + artifact sha; returns raw ticket + meta', async () => {
     const app = buildApp();
     const userId = `u_${hex(4)}`;

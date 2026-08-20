@@ -12,6 +12,12 @@ import { describe, it, expect, vi, afterEach } from 'vitest';
 import { h } from 'preact';
 import { render, cleanup, act, fireEvent } from '@testing-library/preact';
 
+const mintTicket = vi.fn(async () => ({ ticket: 'ticket_minted_value' }));
+vi.mock('../../src/api/machines.js', async (importOriginal) => ({
+  ...(await importOriginal() as Record<string, unknown>),
+  mintControlledNodeExecutableTicket: (...args: unknown[]) => mintTicket(...args as []),
+}));
+
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
     // Returns the key so assertions read as "which string was chosen"; every
@@ -27,6 +33,11 @@ const {
   REMOTE_DESKTOP_INSTALL_STATE,
   REMOTE_DESKTOP_INSTALL_ERROR,
 } = await import('@shared/remote-desktop-install.js');
+const {
+  REMOTE_DESKTOP_LOGIN_SCREEN_MSG,
+  REMOTE_DESKTOP_LOGIN_SCREEN_STATE,
+  REMOTE_DESKTOP_LOGIN_SCREEN_ERROR,
+} = await import('@shared/remote-desktop-login-screen.js');
 const { DaemonRemoteDesktopControl } = await import('../../src/components/DaemonRemoteDesktopControl.js');
 
 type MessageHandler = (message: Record<string, unknown>) => void;
@@ -60,6 +71,7 @@ function mount(capabilities: string[], overrides: Record<string, unknown> = {}) 
     serverName: 'winbox',
     daemonOnline: true,
     onOpen,
+    machines: [],
     ...overrides,
   }));
   return { ...ws, onOpen, view };
@@ -119,6 +131,77 @@ describe('DaemonRemoteDesktopControl', () => {
     const button = view.container.querySelector('button')!;
     expect(button.hasAttribute('disabled')).toBe(false);
     expect(button.getAttribute('title')).toBe('remote_desktop.install_error_not_available');
+  });
+
+  describe('login-screen control', () => {
+    const ready = [REMOTE_DESKTOP_INSTALLABLE_CAPABILITY, REMOTE_DESKTOP_CAPABILITY];
+    const sharedMachine = {
+      serverId: 'controlled_1',
+      refName: 'winbox-node',
+      displayName: 'winbox',
+      os: 'win',
+      online: true,
+      execEnabled: true,
+      accessRole: 'owner',
+      capabilities: [REMOTE_DESKTOP_CAPABILITY],
+      hostServerId: 'server_1',
+    };
+
+    it('offers the one-time setup beside the control on the status card', () => {
+      const { view } = mount(ready);
+      expect([...view.container.querySelectorAll('button')].map((b) => b.getAttribute('title')))
+        .toEqual(['remote_desktop.daemon_control', 'remote_desktop.login_screen_hint']);
+    });
+
+    it('keeps the compact status bar to a single button', () => {
+      const { view } = mount(ready, { compact: true });
+      expect(view.container.querySelectorAll('button')).toHaveLength(1);
+    });
+
+    it('opens the controlled node that shares this machine, not the daemon', () => {
+      const { view, onOpen } = mount(ready, { machines: [sharedMachine] });
+      const buttons = [...view.container.querySelectorAll('button')];
+      // One button, and it steers to the machine that can also serve the
+      // sign-in screen — two entries would put two workers on one desktop.
+      expect(buttons).toHaveLength(1);
+      fireEvent.click(buttons[0]!);
+      expect(onOpen).toHaveBeenCalledWith(expect.objectContaining({ serverId: 'controlled_1' }));
+    });
+
+    it('ignores a controlled node that shares some other machine', () => {
+      const { view, onOpen } = mount(ready, {
+        machines: [{ ...sharedMachine, hostServerId: 'server_other' }],
+      });
+      fireEvent.click(view.container.querySelectorAll('button')[0]!);
+      expect(onOpen).toHaveBeenCalledWith(expect.objectContaining({ serverId: 'server_1' }));
+    });
+
+    it('mints a ticket bound to this daemon and hands it over', async () => {
+      const { view, sent } = mount(ready);
+      fireEvent.click(view.container.querySelectorAll('button')[1]!);
+      await act(async () => { await Promise.resolve(); });
+      expect(mintTicket).toHaveBeenCalledWith({ os: 'win', arch: 'x64' }, 'server_1');
+      expect(sent).toEqual([{
+        type: REMOTE_DESKTOP_LOGIN_SCREEN_MSG.REQUEST,
+        ticket: 'ticket_minted_value',
+      }]);
+    });
+
+    it('reports a dismissed prompt without losing the retry', async () => {
+      const { view, emit } = mount(ready);
+      fireEvent.click(view.container.querySelectorAll('button')[1]!);
+      await act(async () => {
+        emit({
+          type: REMOTE_DESKTOP_LOGIN_SCREEN_MSG.STATE,
+          state: REMOTE_DESKTOP_LOGIN_SCREEN_STATE.FAILED,
+          error: REMOTE_DESKTOP_LOGIN_SCREEN_ERROR.ELEVATION_DECLINED,
+        });
+      });
+      const retry = view.container.querySelectorAll('button')[1]!;
+      expect(retry.hasAttribute('disabled')).toBe(false);
+      expect(retry.getAttribute('title'))
+        .toBe('remote_desktop.login_screen_error_elevation_declined');
+    });
   });
 
   it('ignores a malformed install state instead of rendering it', async () => {

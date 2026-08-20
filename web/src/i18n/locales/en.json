@@ -3111,6 +3111,16 @@
     "install_error_not_bound": "This daemon is not bound to a server",
     "install_error_download_failed": "Download failed — check the connection and retry",
     "install_error_verification_failed": "The downloaded component failed signature verification",
-    "install_error_not_available": "This server has no remote control component for this platform yet"
+    "install_error_not_available": "This server has no remote control component for this platform yet",
+    "login_screen_enable": "Enable login screen",
+    "login_screen_retry": "Retry login screen setup",
+    "login_screen_hint": "Also control the sign-in and lock screen. Installs the controlled-node component and asks for administrator approval on that machine once.",
+    "login_screen_downloading": "Downloading installer…",
+    "login_screen_waiting": "Waiting for approval…",
+    "login_screen_failed": "Login screen setup failed",
+    "login_screen_error_unsupported_platform": "Login screen control needs Windows x64",
+    "login_screen_error_not_bound": "This daemon is not bound to a server",
+    "login_screen_error_download_failed": "Could not fetch the installer — check the connection and retry",
+    "login_screen_error_elevation_declined": "Administrator approval was not given on that machine"
   }
 }

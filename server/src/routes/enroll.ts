@@ -89,7 +89,18 @@ function isAllowedServerUrl(value: string): boolean {
 // ── POST /api/enroll/v2/ticket ──────────────────────────────────────────────
 
 const TICKET_BODY = z
-  .object({ version: z.literal(2), os: z.string(), arch: z.string() })
+  .object({
+    version: z.literal(2),
+    os: z.string(),
+    arch: z.string(),
+    /**
+     * The daemon whose machine this node is being enrolled on, when the enrolment
+     * is the "give this machine login-screen control" flow. Recorded so the
+     * browser can tell the two installs are one machine and keep pointing at a
+     * single entry.
+     */
+    hostServerId: z.string().min(1).max(128).optional(),
+  })
   .strict();
 
 export function createEnrollRoutes(
@@ -116,9 +127,20 @@ enrollRoutes.post('/v2/ticket', requireAuth(), async (c) => {
   const body = await c.req.json().catch(() => null);
   const parsed = TICKET_BODY.safeParse(body);
   if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
-  const { os, arch } = parsed.data;
+  const { os, arch, hostServerId } = parsed.data;
   if (!isControlledNodeOs(os) || !isControlledNodeArtifactArch(arch) || !isCanonicalControlledNodePair(os, arch)) {
     return c.json({ error: 'invalid_body' }, 400);
+  }
+  if (hostServerId !== undefined) {
+    // Only over a daemon this same user owns: the host link decides which entry
+    // a browser will steer remote control to, so it must not be assignable to
+    // someone else's machine.
+    const host = await (c.env.DB as Database).queryOne<{ id: string }>(
+      `SELECT id FROM servers
+        WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL AND node_role IS DISTINCT FROM $3`,
+      [hostServerId, userId, NODE_ROLE.CONTROLLED],
+    );
+    if (!host) return c.json({ error: 'invalid_host_server' }, 403);
   }
 
   const dir = process.env.IMCODES_NODE_EXE_DIR;
@@ -152,11 +174,11 @@ enrollRoutes.post('/v2/ticket', requireAuth(), async (c) => {
     `INSERT INTO controlled_node_enrollments_v2
        (ticket_hash, code_hash, owner_user_id, os, arch, artifact_sha256,
         encrypted_code, consumed_count, max_consumes, ticket_expires_at,
-        expires_at, reusable, created_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, 0, $8, $9, NULL, TRUE, $10)
+        expires_at, reusable, created_at, host_server_id)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, 0, $8, $9, NULL, TRUE, $10, $11)
      RETURNING id`,
     [ticketHash, codeHash, userId, os, arch, v.descriptor.sha256,
-     encryptedCode, TICKET_MAX_CONSUMES, ticketExpiresAt, now],
+     encryptedCode, TICKET_MAX_CONSUMES, ticketExpiresAt, now, hostServerId ?? null],
   );
   if (!inserted) {
     return c.json({ error: 'ticket_mint_failed' }, 500);
@@ -1124,13 +1146,14 @@ async function insertControlledServer(
   hostname: string,
   os: string,
   arch: string,
+  hostServerId: string | null = null,
 ): Promise<{ refName: string; displayName: string }> {
   const refName = deriveRefName(hostname, serverId);
   const displayName = deriveDisplayName(hostname, os);
   await tx.execute(
-    `INSERT INTO servers (id, user_id, name, token_hash, status, created_at, node_role, exec_enabled, ref_name, display_name, os, arch)
-     VALUES ($1, $2, $3, $4, 'offline', $5, $6, true, $7, $8, $9, $10)`,
-    [serverId, userId, displayName, tokenHash, Date.now(), NODE_ROLE.CONTROLLED, refName, displayName, os, arch],
+    `INSERT INTO servers (id, user_id, name, token_hash, status, created_at, node_role, exec_enabled, ref_name, display_name, os, arch, host_server_id)
+     VALUES ($1, $2, $3, $4, 'offline', $5, $6, true, $7, $8, $9, $10, $11)`,
+    [serverId, userId, displayName, tokenHash, Date.now(), NODE_ROLE.CONTROLLED, refName, displayName, os, arch, hostServerId],
   );
   return { refName, displayName };
 }
@@ -1170,9 +1193,10 @@ enrollRoutes.post('/v2/redeem', async (c) => {
         node_token_hash: string | null;
         os: string;
         arch: string;
+        host_server_id: string | null;
       }>(
         `SELECT id, owner_user_id, expires_at, reusable, revoked_at,
-                used_at, redeemed_server_id,
+                used_at, redeemed_server_id, host_server_id,
                 install_id, node_token_hash, os, arch
            FROM controlled_node_enrollments_v2
           WHERE code_hash = $1
@@ -1233,6 +1257,7 @@ enrollRoutes.post('/v2/redeem', async (c) => {
       const serverId = randomHex(16);
       const { refName, displayName } = await insertControlledServer(
         tx, serverId, row.owner_user_id, nodeTokenHash, hostname, os, arch,
+        row.host_server_id,
       );
       await tx.execute(
         `INSERT INTO controlled_node_enrollment_installs

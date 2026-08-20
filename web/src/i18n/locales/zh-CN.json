@@ -3111,6 +3111,16 @@
     "install_error_not_bound": "该守护进程尚未绑定服务器",
     "install_error_download_failed": "下载失败，请检查网络后重试",
     "install_error_verification_failed": "下载的组件签名校验未通过",
-    "install_error_not_available": "该服务器暂无适配此平台的远程控制组件"
+    "install_error_not_available": "该服务器暂无适配此平台的远程控制组件",
+    "login_screen_enable": "启用登录界面",
+    "login_screen_retry": "重新设置登录界面",
+    "login_screen_hint": "同时控制登录和锁屏界面。会在那台机器上安装受控节点组件，并需要确认一次管理员授权。",
+    "login_screen_downloading": "正在下载安装程序…",
+    "login_screen_waiting": "等待授权确认…",
+    "login_screen_failed": "登录界面控制设置失败",
+    "login_screen_error_unsupported_platform": "登录界面控制需要 Windows x64",
+    "login_screen_error_not_bound": "该守护进程尚未绑定服务器",
+    "login_screen_error_download_failed": "安装程序获取失败，请检查网络后重试",
+    "login_screen_error_elevation_declined": "那台机器上没有确认管理员授权"
   }
 }

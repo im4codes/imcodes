@@ -82,6 +82,12 @@ export interface MachineListItem {
   updateAvailable?: boolean;
   /** The node holds a sign-in secret for auto unlock. Never the secret itself. */
   autoUnlockConfigured?: boolean;
+  /**
+   * The daemon this node shares a machine with, when it was enrolled to give
+   * that daemon login-screen control. The remote-control button on that daemon
+   * steers here rather than opening a second session on the same desktop.
+   */
+  hostServerId?: string;
 }
 
 /** Identifies one downloadable artifact in the canonical OS+arch matrix. */
@@ -254,6 +260,9 @@ function normalizeMachine(raw: unknown): MachineListItem | null {
     ...(typeof raw.daemonVersion === 'string' && raw.daemonVersion ? { daemonVersion: raw.daemonVersion } : {}),
     ...(raw.updateAvailable === true ? { updateAvailable: true } : {}),
     ...(raw.autoUnlockConfigured === true ? { autoUnlockConfigured: true } : {}),
+    ...(typeof raw.hostServerId === 'string' && raw.hostServerId
+      ? { hostServerId: raw.hostServerId }
+      : {}),
   };
 }
 
@@ -334,6 +343,12 @@ export async function listAvailableExecutableOses(): Promise<string[]> {
 /** Mint a one-time download ticket (POST /api/enroll/v2/ticket). */
 export async function mintControlledNodeExecutableTicket(
   selection: ControlledNodeArtifactSelection,
+  /**
+   * The daemon whose machine this install is for, when enrolling to give that
+   * machine login-screen control. Recorded on the enrolment so both installs are
+   * known to share a machine and the browser keeps offering one entry.
+   */
+  hostServerId?: string,
 ): Promise<ControlledNodeExecutableTicket> {
   if (!isCanonicalControlledNodePair(selection.os, selection.arch)) {
     throw new Error('controlled_node_non_canonical_pair');
@@ -345,7 +360,12 @@ export async function mintControlledNodeExecutableTicket(
   const res = await apiFetch<unknown>(ENROLL_V2_TICKET_PATH, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ version: 2, os: selection.os, arch: selection.arch }),
+    body: JSON.stringify({
+      version: 2,
+      os: selection.os,
+      arch: selection.arch,
+      ...(hostServerId ? { hostServerId } : {}),
+    }),
   });
   return normalizeTicket(res, expectedOwnerUserId);
 }

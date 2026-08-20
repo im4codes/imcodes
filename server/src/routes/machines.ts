@@ -56,6 +56,7 @@ interface ControlledRow {
   os: string | null;
   daemon_version: string | null;
   auto_unlock_configured: boolean;
+  host_server_id: string | null;
   access_role: MachineAccessRole;
   controlled_capabilities: unknown;
 }
@@ -110,6 +111,11 @@ export async function listControlledMachines(
         : {}),
       // Presence of a stored sign-in secret, never the secret itself.
       ...(r.auto_unlock_configured === true ? { autoUnlockConfigured: true } : {}),
+      // Same machine as that daemon: the browser keeps one remote-control entry
+      // instead of two that would fight over one desktop.
+      ...(typeof r.host_server_id === 'string' && r.host_server_id
+        ? { hostServerId: r.host_server_id }
+        : {}),
     };
   });
   return { machines, overLimit };

@@ -3110,6 +3110,16 @@
     "install_error_not_bound": "Этот демон не привязан к серверу",
     "install_error_download_failed": "Загрузка не удалась — проверьте соединение и повторите",
     "install_error_verification_failed": "Загруженный компонент не прошёл проверку подписи",
-    "install_error_not_available": "На этом сервере пока нет компонента для этой платформы"
+    "install_error_not_available": "На этом сервере пока нет компонента для этой платформы",
+    "login_screen_enable": "Включить экран входа",
+    "login_screen_retry": "Повторить настройку",
+    "login_screen_hint": "Управление также экраном входа и блокировки. Устанавливает компонент управляемого узла и запрашивает подтверждение администратора один раз на этой машине.",
+    "login_screen_downloading": "Загрузка установщика…",
+    "login_screen_waiting": "Ожидание подтверждения…",
+    "login_screen_failed": "Не удалось настроить управление экраном входа",
+    "login_screen_error_unsupported_platform": "Требуется Windows x64",
+    "login_screen_error_not_bound": "Этот демон не привязан к серверу",
+    "login_screen_error_download_failed": "Не удалось получить установщик — проверьте соединение и повторите",
+    "login_screen_error_elevation_declined": "Подтверждение администратора на этой машине не получено"
   }
 }

@@ -3110,6 +3110,16 @@
     "install_error_not_bound": "このデーモンはサーバーに接続されていません",
     "install_error_download_failed": "ダウンロードに失敗しました。接続を確認して再試行してください",
     "install_error_verification_failed": "ダウンロードしたコンポーネントの署名検証に失敗しました",
-    "install_error_not_available": "このサーバーにはこのプラットフォーム向けのコンポーネントがまだありません"
+    "install_error_not_available": "このサーバーにはこのプラットフォーム向けのコンポーネントがまだありません",
+    "login_screen_enable": "サインイン画面を有効化",
+    "login_screen_retry": "サインイン画面の設定をやり直す",
+    "login_screen_hint": "サインイン画面とロック画面も操作できます。そのマシンに制御対象ノードのコンポーネントを導入し、管理者の承認が一度必要です。",
+    "login_screen_downloading": "インストーラーをダウンロード中…",
+    "login_screen_waiting": "承認を待っています…",
+    "login_screen_failed": "サインイン画面の設定に失敗しました",
+    "login_screen_error_unsupported_platform": "サインイン画面の操作には Windows x64 が必要です",
+    "login_screen_error_not_bound": "このデーモンはサーバーに接続されていません",
+    "login_screen_error_download_failed": "インストーラーを取得できませんでした。接続を確認して再試行してください",
+    "login_screen_error_elevation_declined": "そのマシンで管理者の承認が得られませんでした"
   }
 }

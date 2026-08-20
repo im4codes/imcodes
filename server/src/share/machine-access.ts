@@ -22,10 +22,12 @@ export interface ControlledMachineAccessRow {
   controlled_capabilities: ControlledNodeCapability[] | null;
   /** `controlled` for a controlled node; `full`/NULL for a normal daemon. */
   node_role: string | null;
+  /** The daemon this node was enrolled from, when it shares that machine. */
+  host_server_id: string | null;
 }
 
 const CONTROLLED_MACHINE_ACCESS_SELECT = `
-  SELECT s.id, s.user_id, s.ref_name, s.display_name, s.status, s.node_role,
+  SELECT s.id, s.user_id, s.ref_name, s.display_name, s.status, s.node_role, s.host_server_id,
          s.last_heartbeat_at, s.exec_enabled, s.os, s.daemon_version, s.revoked_at,
          s.auto_unlock_configured, s.controlled_capabilities,
          CASE WHEN s.user_id = $1 THEN 'owner' ELSE sh.role END AS access_role,
