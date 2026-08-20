@@ -3099,6 +3099,8 @@
     },
     "pointer_moves": "pointer moves: {{count}} (mirrored {{mirrored}})",
     "pointer_moves_seen": "moves seen: {{count}} (unmapped {{unmapped}})",
+    "pointer_move_browser": "browser capture: {{ingress}} (inside {{accepted}} / unmapped {{unmapped}} / outside {{outside}})",
+    "pointer_move_connection": "current connection: {{calls}} calls (sent {{sent}} / reliable {{mirrored}} / gated {{gate}} / channel {{channel}} / backpressure {{backpressure}} / failed {{failed}})",
     "minimize_files": "Minimize transfers",
     "restore_files": "Show transfers",
     "transfers_running": "{{count}} transfer(s) · {{progress}}%",

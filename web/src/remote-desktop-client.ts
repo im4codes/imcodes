@@ -102,6 +102,12 @@ export interface RemoteDesktopSnapshot {
    */
   pointerMovesSent?: number;
   pointerMovesMirrored?: number;
+  /** Pointer move calls accepted/rejected before a channel send is attempted. */
+  pointerMoveCalls?: number;
+  pointerMoveGateRejected?: number;
+  pointerMoveChannelUnavailable?: number;
+  pointerMoveBackpressureDrops?: number;
+  pointerMoveSendFailures?: number;
   lastAcknowledgedInputSequence?: number;
   durationMs?: number;
   reconnectCount?: number;
@@ -343,6 +349,11 @@ export class RemoteDesktopClient {
   private lastPointerFlushAt = Number.NEGATIVE_INFINITY;
   private pointerMovesSent = 0;
   private pointerMovesMirrored = 0;
+  private pointerMoveCalls = 0;
+  private pointerMoveGateRejected = 0;
+  private pointerMoveChannelUnavailable = 0;
+  private pointerMoveBackpressureDrops = 0;
+  private pointerMoveSendFailures = 0;
   private pressedCodes = new Set<string>();
   private pressedButtons = new Set<string>();
   private pendingClipboardRequests = new Map<string, {
@@ -577,7 +588,11 @@ export class RemoteDesktopClient {
   }
 
   pointerMove(x: number, y: number): void {
-    if (!this.canSendInput() || !Number.isFinite(x) || !Number.isFinite(y)) return;
+    this.pointerMoveCalls += 1;
+    if (!this.canSendInput() || !Number.isFinite(x) || !Number.isFinite(y)) {
+      this.pointerMoveGateRejected += 1;
+      return;
+    }
     this.pendingPointerMove = {
       x: Math.max(0, Math.min(1, x)),
       y: Math.max(0, Math.min(1, y)),
@@ -1038,7 +1053,11 @@ export class RemoteDesktopClient {
   private flushPointerMove(): void {
     const move = this.pendingPointerMove;
     this.pendingPointerMove = null;
-    if (!move || !this.canSendInput()) return;
+    if (!move) return;
+    if (!this.canSendInput()) {
+      this.pointerMoveGateRejected += 1;
+      return;
+    }
     const now = this.deps.now?.() ?? Date.now();
     this.lastPointerFlushAt = now;
     if (now - this.lastReliablePointerSyncAt >= POINTER_RELIABLE_SYNC_INTERVAL_MS
@@ -1055,10 +1074,14 @@ export class RemoteDesktopClient {
       this.lastReliablePointerSyncAt = now;
       this.pointerMovesMirrored += 1;
     }
-    if (!isOpen(this.pointerChannel)) return;
+    if (!isOpen(this.pointerChannel)) {
+      this.pointerMoveChannelUnavailable += 1;
+      return;
+    }
     if (this.pointerChannel.bufferedAmount > DATA_BUFFER_HIGH_WATER_BYTES) {
       // Only the superseded motion is dropped. Key/button transitions use a
       // different reliable channel and never enter this queue.
+      this.pointerMoveBackpressureDrops += 1;
       return;
     }
     if (this.sendPointer({
@@ -1068,6 +1091,8 @@ export class RemoteDesktopClient {
       ...move,
     })) {
       this.pointerMovesSent += 1;
+    } else {
+      this.pointerMoveSendFailures += 1;
     }
   }
 
@@ -1134,6 +1159,11 @@ export class RemoteDesktopClient {
           durationMs,
           pointerMovesSent: this.pointerMovesSent,
           pointerMovesMirrored: this.pointerMovesMirrored,
+          pointerMoveCalls: this.pointerMoveCalls,
+          pointerMoveGateRejected: this.pointerMoveGateRejected,
+          pointerMoveChannelUnavailable: this.pointerMoveChannelUnavailable,
+          pointerMoveBackpressureDrops: this.pointerMoveBackpressureDrops,
+          pointerMoveSendFailures: this.pointerMoveSendFailures,
         });
         return;
       }
@@ -1192,6 +1222,11 @@ export class RemoteDesktopClient {
       this.publish({
         pointerMovesSent: this.pointerMovesSent,
         pointerMovesMirrored: this.pointerMovesMirrored,
+        pointerMoveCalls: this.pointerMoveCalls,
+        pointerMoveGateRejected: this.pointerMoveGateRejected,
+        pointerMoveChannelUnavailable: this.pointerMoveChannelUnavailable,
+        pointerMoveBackpressureDrops: this.pointerMoveBackpressureDrops,
+        pointerMoveSendFailures: this.pointerMoveSendFailures,
         durationMs,
         quality: {
           ...quality,

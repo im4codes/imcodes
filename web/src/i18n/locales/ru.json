@@ -3098,6 +3098,8 @@
     },
     "pointer_moves": "движений указателя: {{count}} (дублей {{mirrored}})",
     "pointer_moves_seen": "получено движений: {{count}} (без координат {{unmapped}})",
+    "pointer_move_browser": "ввод браузера: {{ingress}} (внутри {{accepted}} / без координат {{unmapped}} / снаружи {{outside}})",
+    "pointer_move_connection": "текущее соединение: вызовов {{calls}} (отправлено {{sent}} / надёжных {{mirrored}} / отклонено {{gate}} / канал {{channel}} / перегрузка {{backpressure}} / ошибок {{failed}})",
     "minimize_files": "Свернуть передачи",
     "restore_files": "Показать передачи",
     "transfers_running": "передач: {{count}} · {{progress}}%",

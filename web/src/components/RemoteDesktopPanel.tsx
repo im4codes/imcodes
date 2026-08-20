@@ -57,6 +57,7 @@ import {
 type ViewScale = 'fit' | 'actual';
 type MobileInputMode = 'touch' | 'mouse';
 type ClipboardStatus = 'idle' | 'copying' | 'copied' | 'pasting' | 'pasted' | 'empty' | 'failed';
+type DesktopPointerMoveSource = 'window-mouse' | 'window-pointer' | 'stage-mouse' | 'stage-pointer';
 
 interface TouchPoint {
   x: number;
@@ -273,8 +274,21 @@ export function RemoteDesktopPanel({
   const [pointerMovesSeen, setPointerMovesSeen] = useState(0);
   const pointerMovesSeenRef = useRef(0);
   const pointerMovesUnmappedRef = useRef(0);
+  const pointerMovesIngressRef = useRef(0);
+  const pointerMovesOutsideRef = useRef(0);
+  const pointerMoveIngressBySourceRef = useRef<Record<DesktopPointerMoveSource, number>>({
+    'window-mouse': 0,
+    'window-pointer': 0,
+    'stage-mouse': 0,
+    'stage-pointer': 0,
+  });
   const lastDesktopPointerMoveRef = useRef<{ x: number; y: number; at: number } | null>(null);
   const [pointerMovesUnmapped, setPointerMovesUnmapped] = useState(0);
+  const [pointerMovesIngress, setPointerMovesIngress] = useState(0);
+  const [pointerMovesOutside, setPointerMovesOutside] = useState(0);
+  const [pointerMoveIngressBySource, setPointerMoveIngressBySource] = useState(
+    pointerMoveIngressBySourceRef.current,
+  );
   const [transfers, setTransfers] = useState<RemoteDesktopTransferRow[]>([]);
   const [transferError, setTransferError] = useState<string | null>(null);
   const [fetchPath, setFetchPath] = useState('');
@@ -1105,11 +1119,29 @@ export function RemoteDesktopPanel({
       setPointerMovesUnmapped((current) => (
         current === pointerMovesUnmappedRef.current ? current : pointerMovesUnmappedRef.current
       ));
+      setPointerMovesIngress((current) => (
+        current === pointerMovesIngressRef.current ? current : pointerMovesIngressRef.current
+      ));
+      setPointerMovesOutside((current) => (
+        current === pointerMovesOutsideRef.current ? current : pointerMovesOutsideRef.current
+      ));
+      setPointerMoveIngressBySource((current) => {
+        const next = pointerMoveIngressBySourceRef.current;
+        return (Object.keys(next) as DesktopPointerMoveSource[]).every(
+          (source) => current[source] === next[source],
+        ) ? current : { ...next };
+      });
     }, 1_000);
     return () => clearInterval(timer);
   }, []);
 
-  const sendDesktopPointerMove = useCallback((clientX: number, clientY: number) => {
+  const sendDesktopPointerMove = useCallback((
+    clientX: number,
+    clientY: number,
+    source: DesktopPointerMoveSource,
+  ) => {
+    pointerMovesIngressRef.current += 1;
+    pointerMoveIngressBySourceRef.current[source] += 1;
     const now = performance.now();
     const lastMove = lastDesktopPointerMoveRef.current;
     if (lastMove && lastMove.x === clientX && lastMove.y === clientY && now - lastMove.at < 16) {
@@ -1120,7 +1152,10 @@ export function RemoteDesktopPanel({
     if (!stage) return;
     const stageRect = stage.getBoundingClientRect();
     if (clientX < stageRect.left || clientY < stageRect.top
-      || clientX > stageRect.right || clientY > stageRect.bottom) return;
+      || clientX > stageRect.right || clientY > stageRect.bottom) {
+      pointerMovesOutsideRef.current += 1;
+      return;
+    }
     pointerMovesSeenRef.current += 1;
     const normalized = normalizedClientPoint(clientX, clientY);
     const point = normalized && stickRemoteDesktopPointerToEdges(
@@ -1136,11 +1171,11 @@ export function RemoteDesktopPanel({
 
   useEffect(() => {
     const onWindowMouseMove = (event: globalThis.MouseEvent) => {
-      sendDesktopPointerMove(event.clientX, event.clientY);
+      sendDesktopPointerMove(event.clientX, event.clientY, 'window-mouse');
     };
     const onWindowPointerMove = (event: globalThis.PointerEvent) => {
       if (event.pointerType === 'touch') return;
-      sendDesktopPointerMove(event.clientX, event.clientY);
+      sendDesktopPointerMove(event.clientX, event.clientY, 'window-pointer');
     };
     // Capture before floating-window drag/gesture owners or descendants can
     // stop propagation. Coordinates, not event.target ownership, decide
@@ -1167,11 +1202,11 @@ export function RemoteDesktopPanel({
     // The stage owns ordinary desktop hover. Some WebKit/native-wrapper
     // combinations only deliver window-level pointer/mouse moves while a
     // button is captured, which made hover stop while drag still worked.
-    sendDesktopPointerMove(event.clientX, event.clientY);
+    sendDesktopPointerMove(event.clientX, event.clientY, 'stage-pointer');
   };
 
   const onStageMouseMove = (event: MouseEvent) => {
-    sendDesktopPointerMove(event.clientX, event.clientY);
+    sendDesktopPointerMove(event.clientX, event.clientY, 'stage-mouse');
   };
 
   const suppressCommandControlForMiddleDrag = () => {
@@ -1838,6 +1873,13 @@ export function RemoteDesktopPanel({
             }}
             aria-label={t('remote_desktop.video_label', { machine: machine.displayName })}
           />
+          {currentStreamPresented && (
+            <div
+              class="remote-desktop-input-surface"
+              data-testid="remote-desktop-input-surface"
+              aria-hidden="true"
+            />
+          )}
           {mobileTextOpen && (
             <div class="remote-desktop-mobile-keyboard" role="group" aria-label={t('remote_desktop.mobile_keyboard')}>
               <div class="remote-desktop-mobile-keyboard-head">
@@ -2220,15 +2262,24 @@ export function RemoteDesktopPanel({
               </>
             )}
             {snapshot.pointerMovesSent !== undefined && (
-              <span>{t('remote_desktop.pointer_moves', {
-                count: snapshot.pointerMovesSent,
+              <span>{t('remote_desktop.pointer_move_connection', {
+                calls: snapshot.pointerMoveCalls ?? 0,
+                sent: snapshot.pointerMovesSent,
                 mirrored: snapshot.pointerMovesMirrored ?? 0,
+                gate: snapshot.pointerMoveGateRejected ?? 0,
+                channel: snapshot.pointerMoveChannelUnavailable ?? 0,
+                backpressure: snapshot.pointerMoveBackpressureDrops ?? 0,
+                failed: snapshot.pointerMoveSendFailures ?? 0,
               })}</span>
             )}
-            <span>{t('remote_desktop.pointer_moves_seen', {
-              count: pointerMovesSeen,
-              unmapped: pointerMovesUnmapped,
-            })}</span>
+            <span title={`window mouse ${pointerMoveIngressBySource['window-mouse']} · window pointer ${pointerMoveIngressBySource['window-pointer']} · stage mouse ${pointerMoveIngressBySource['stage-mouse']} · stage pointer ${pointerMoveIngressBySource['stage-pointer']}`}>
+              {t('remote_desktop.pointer_move_browser', {
+                ingress: pointerMovesIngress,
+                accepted: pointerMovesSeen,
+                unmapped: pointerMovesUnmapped,
+                outside: pointerMovesOutside,
+              })}
+            </span>
             {/* Belongs with the session's other facts, not in the toolbar
                 between the buttons it explains. */}
             {inputBlockedHint() && (

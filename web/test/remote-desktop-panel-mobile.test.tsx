@@ -509,6 +509,14 @@ describe('RemoteDesktopPanel mobile gestures', () => {
         .dispatchEvent(new Event('loadeddata'));
     });
     expect(container.querySelector('.remote-desktop-connection-progress')).toBeNull();
+    const inputSurface = container.querySelector('[data-testid="remote-desktop-input-surface"]');
+    expect(inputSurface).not.toBeNull();
+    pointerMove.mockClear();
+    act(() => {
+      nativeMouseMove(inputSurface!, { clientX: 200, clientY: 150 });
+      nativeMouseMove(inputSurface!, { clientX: 300, clientY: 150 });
+    });
+    expect(pointerMove.mock.calls).toEqual([[0.5, 0.5], [0.75, 0.5]]);
   });
 
   it('keeps monitor and mode controls keyboard-focusable while viewing', async () => {

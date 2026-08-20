@@ -8926,6 +8926,19 @@ button.quick-agent-delegation-preset.active {
   -webkit-user-drag: none;
 }
 
+/* Keep a regular HTML hit surface above the native video compositor. Some
+   desktop WebKit/native-video paths only deliver movement over the video while
+   pointer capture is active, which made drag work while ordinary hover froze.
+   Input still bubbles to the single stage handler; this layer owns no events. */
+.remote-desktop-input-surface {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  background: transparent;
+  pointer-events: auto;
+  touch-action: none;
+}
+
 .remote-desktop-virtual-pointer {
   position: absolute;
   z-index: 5;

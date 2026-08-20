@@ -3099,6 +3099,8 @@
     },
     "pointer_moves": "指標移動：{{count}}（可靠鏡像 {{mirrored}}）",
     "pointer_moves_seen": "收到移動：{{count}}（無法對應 {{unmapped}}）",
+    "pointer_move_browser": "瀏覽器擷取：{{ingress}}（畫面內 {{accepted}} / 無法對應 {{unmapped}} / 畫面外 {{outside}}）",
+    "pointer_move_connection": "目前連線：呼叫 {{calls}}（傳送 {{sent}} / 可靠 {{mirrored}} / 門禁 {{gate}} / 通道 {{channel}} / 背壓 {{backpressure}} / 失敗 {{failed}}）",
     "minimize_files": "最小化傳輸視窗",
     "restore_files": "展開傳輸視窗",
     "transfers_running": "{{count}} 個傳輸 · {{progress}}%",

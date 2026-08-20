@@ -3098,6 +3098,8 @@
     },
     "pointer_moves": "ポインタ移動: {{count}}（ミラー {{mirrored}}）",
     "pointer_moves_seen": "受信した移動: {{count}}（マップ不可 {{unmapped}}）",
+    "pointer_move_browser": "ブラウザー取得: {{ingress}}（内側 {{accepted}} / マップ不可 {{unmapped}} / 外側 {{outside}}）",
+    "pointer_move_connection": "現在の接続: {{calls}} 呼び出し（送信 {{sent}} / 可靠 {{mirrored}} / 拒否 {{gate}} / チャネル {{channel}} / 背圧 {{backpressure}} / 失敗 {{failed}}）",
     "minimize_files": "転送を最小化",
     "restore_files": "転送を表示",
     "transfers_running": "{{count}} 件の転送 · {{progress}}%",

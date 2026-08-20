@@ -3099,6 +3099,8 @@
     },
     "pointer_moves": "指针移动：{{count}}（可靠镜像 {{mirrored}}）",
     "pointer_moves_seen": "收到移动：{{count}}（无法映射 {{unmapped}}）",
+    "pointer_move_browser": "浏览器采集：{{ingress}}（画面内 {{accepted}} / 无法映射 {{unmapped}} / 画面外 {{outside}}）",
+    "pointer_move_connection": "当前连接：调用 {{calls}}（发送 {{sent}} / 可靠 {{mirrored}} / 门禁 {{gate}} / 通道 {{channel}} / 背压 {{backpressure}} / 失败 {{failed}}）",
     "minimize_files": "最小化传输窗口",
     "restore_files": "展开传输窗口",
     "transfers_running": "{{count}} 个传输 · {{progress}}%",

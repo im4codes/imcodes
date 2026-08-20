@@ -588,6 +588,15 @@ describe('RemoteDesktopClient', () => {
     }];
     peer.connect();
     await vi.waitFor(() => expect(client.current().quality).toBeDefined());
+    await vi.waitFor(() => expect(client.current()).toMatchObject({
+      pointerMoveCalls: 4,
+      pointerMoveGateRejected: 0,
+      pointerMoveChannelUnavailable: 0,
+      pointerMoveBackpressureDrops: 2,
+      pointerMoveSendFailures: 0,
+      pointerMovesSent: 1,
+      pointerMovesMirrored: 3,
+    }));
     peer.connectionState = 'failed';
     peer.dispatchEvent(new Event('connectionstatechange'));
     await vi.waitFor(() => expect(socket.sent.filter((raw) => (

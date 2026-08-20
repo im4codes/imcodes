@@ -3098,6 +3098,8 @@
     },
     "pointer_moves": "포인터 이동: {{count}} (미러 {{mirrored}})",
     "pointer_moves_seen": "수신된 이동: {{count}} (매핑 실패 {{unmapped}})",
+    "pointer_move_browser": "브라우저 캡처: {{ingress}} (내부 {{accepted}} / 매핑 실패 {{unmapped}} / 외부 {{outside}})",
+    "pointer_move_connection": "현재 연결: 호출 {{calls}} (전송 {{sent}} / 신뢰 {{mirrored}} / 차단 {{gate}} / 채널 {{channel}} / 백프레셔 {{backpressure}} / 실패 {{failed}})",
     "minimize_files": "전송 최소화",
     "restore_files": "전송 표시",
     "transfers_running": "전송 {{count}}건 · {{progress}}%",
