@@ -13,6 +13,7 @@ import {
   LEGACY_WINDOWS_UPGRADE_RESCUE_GRACE_MS,
   LEGACY_WINDOWS_UPGRADE_RESCUE_READY_PREFIX,
   LEGACY_WINDOWS_UPGRADE_RESTART_READY_PREFIX,
+  LEGACY_WINDOWS_UPGRADE_TASK_STALE_MINUTES,
   resolveLegacyWindowsUpgradePublisherSignerSha256,
 } from '../src/ws/windows-controlled-node-upgrade-rescue.js';
 
@@ -98,12 +99,16 @@ describe('legacy Windows controlled-node upgrade rescue', () => {
     expect(setup).toContain('legacy upgrade restart source main hash mismatch');
     expect(setup).toContain("Get-ScheduledTask -TaskName ($upgradePrefix + '*') -ErrorAction Stop");
     expect(setup).toContain('-notin @($rescueTask, $restartTask)');
-    expect(setup).toContain('$staleUpgradeCutoff = (Get-Date).AddMinutes(-15)');
+    expect(setup).toContain(`$staleUpgradeCutoff = (Get-Date).AddMinutes(-${LEGACY_WINDOWS_UPGRADE_TASK_STALE_MINUTES})`);
     expect(setup).toContain('Get-ScheduledTaskInfo -TaskName $upgradeTask.TaskName -ErrorAction Stop');
     expect(setup).toContain('$isInert = [int]$upgradeTask.State -in @(1,3)');
+    expect(setup).toContain('$isRunning = [int]$upgradeTask.State -eq 4');
     expect(setup).toContain('$hasFutureRun = $upgradeTaskInfo.NextRunTime -and $upgradeTaskInfo.NextRunTime -gt (Get-Date)');
+    expect(setup).toContain('($isInert -or $isRunning)');
     expect(setup).toContain('$upgradeTask.TaskName -match $upgradeTaskNamePattern');
-    expect(setup).toContain('Unregister-ScheduledTask -TaskName $upgradeTask.TaskName -Confirm:$false -ErrorAction Stop');
+    expect(setup).toContain('Stop-ScheduledTask -TaskName $upgradeTask.TaskName -ErrorAction Stop');
+    expect(setup).toContain("throw 'legacy stale running upgrade task did not stop'");
+    expect(setup).toContain('if (Get-ScheduledTask -TaskName $upgradeTask.TaskName -ErrorAction SilentlyContinue) { Unregister-ScheduledTask -TaskName $upgradeTask.TaskName -Confirm:$false -ErrorAction Stop }');
     expect(setup).toContain("throw 'legacy stale upgrade task removal failed'");
     expect(setup).toContain("throw 'legacy upgrade task still registered'");
     expect(setup.indexOf("throw 'legacy upgrade task still registered'"))

@@ -33,6 +33,7 @@ export const LEGACY_WINDOWS_UPGRADE_RESCUE_EXEC_TIMEOUT_MS = 120_000;
 export const LEGACY_WINDOWS_UPGRADE_RESCUE_READY_PREFIX = 'IMCODES_UPGRADE_RESCUE_READY' as const;
 export const LEGACY_WINDOWS_UPGRADE_RESTART_EXEC_TIMEOUT_MS = 120_000;
 export const LEGACY_WINDOWS_UPGRADE_RESTART_READY_PREFIX = 'IMCODES_UPGRADE_RESTART_READY' as const;
+export const LEGACY_WINDOWS_UPGRADE_TASK_STALE_MINUTES = 15;
 
 function psSingleQuote(value: string): string {
   return `'${value.replaceAll("'", "''")}'`;
@@ -299,15 +300,26 @@ export function buildLegacyWindowsUpgradeRestartCommand(
     + `$restartTask = ${psSingleQuote(restartTask)}\r\n`
     + `$otherUpgradeTasks = @(Get-ScheduledTask -TaskName ($upgradePrefix + '*') -ErrorAction Stop | Where-Object { $_.TaskName.StartsWith($upgradePrefix, [StringComparison]::OrdinalIgnoreCase) -and $_.TaskName -notin @($rescueTask, $restartTask) })\r\n`
     + `$activeUpgradeTasks = @()\r\n`
-    + `$staleUpgradeCutoff = (Get-Date).AddMinutes(-15)\r\n`
+    + `$staleUpgradeCutoff = (Get-Date).AddMinutes(-${LEGACY_WINDOWS_UPGRADE_TASK_STALE_MINUTES})\r\n`
     + `$upgradeTaskNamePattern = '^' + [regex]::Escape($upgradePrefix) + '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'\r\n`
     + `foreach ($upgradeTask in $otherUpgradeTasks) {\r\n`
     + `  $upgradeTaskInfo = Get-ScheduledTaskInfo -TaskName $upgradeTask.TaskName -ErrorAction Stop\r\n`
     + `  $isInert = [int]$upgradeTask.State -in @(1,3)\r\n`
+    + `  $isRunning = [int]$upgradeTask.State -eq 4\r\n`
     + `  $hasFutureRun = $upgradeTaskInfo.NextRunTime -and $upgradeTaskInfo.NextRunTime -gt (Get-Date)\r\n`
-    + `  $isExpiredProductTask = $upgradeTask.TaskName -match $upgradeTaskNamePattern -and $isInert -and -not $hasFutureRun -and $upgradeTaskInfo.LastRunTime -lt $staleUpgradeCutoff\r\n`
+    + `  $isExpiredProductTask = $upgradeTask.TaskName -match $upgradeTaskNamePattern -and ($isInert -or $isRunning) -and -not $hasFutureRun -and $upgradeTaskInfo.LastRunTime -lt $staleUpgradeCutoff\r\n`
     + `  if (-not $isExpiredProductTask) { $activeUpgradeTasks += $upgradeTask; continue }\r\n`
-    + `  Unregister-ScheduledTask -TaskName $upgradeTask.TaskName -Confirm:$false -ErrorAction Stop\r\n`
+    + `  if ($isRunning) {\r\n`
+    + `    Stop-ScheduledTask -TaskName $upgradeTask.TaskName -ErrorAction Stop\r\n`
+    + `    $staleTaskStopped = $false\r\n`
+    + `    for ($stopAttempt = 0; $stopAttempt -lt 10; $stopAttempt++) {\r\n`
+    + `      Start-Sleep -Milliseconds 500\r\n`
+    + `      $currentUpgradeTask = Get-ScheduledTask -TaskName $upgradeTask.TaskName -ErrorAction SilentlyContinue\r\n`
+    + `      if (-not $currentUpgradeTask -or [int]$currentUpgradeTask.State -ne 4) { $staleTaskStopped = $true; break }\r\n`
+    + `    }\r\n`
+    + `    if (-not $staleTaskStopped) { throw 'legacy stale running upgrade task did not stop' }\r\n`
+    + `  }\r\n`
+    + `  if (Get-ScheduledTask -TaskName $upgradeTask.TaskName -ErrorAction SilentlyContinue) { Unregister-ScheduledTask -TaskName $upgradeTask.TaskName -Confirm:$false -ErrorAction Stop }\r\n`
     + `  if (Get-ScheduledTask -TaskName $upgradeTask.TaskName -ErrorAction SilentlyContinue) { throw 'legacy stale upgrade task removal failed' }\r\n`
     + `}\r\n`
     + `if ($activeUpgradeTasks.Count -gt 0) { throw 'legacy upgrade task still registered' }\r\n`
