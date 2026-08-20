@@ -1,7 +1,7 @@
 import { execFile } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { promisify } from 'node:util';
 import {
   REMOTE_DESKTOP_CAPABILITY,
@@ -25,7 +25,18 @@ import {
   CONTROLLED_NODE_ARCH_X64,
   CONTROLLED_NODE_OS_WIN,
 } from '../../shared/controlled-node-artifacts.js';
+import {
+  REMOTE_DESKTOP_ELEVATED_CAPABILITY,
+  REMOTE_DESKTOP_ELEVATED_ERROR,
+  REMOTE_DESKTOP_ELEVATED_INSTALL_MSG,
+  REMOTE_DESKTOP_ELEVATED_STATE,
+  type RemoteDesktopElevatedError,
+  type RemoteDesktopElevatedState,
+} from '../../shared/remote-desktop-elevated.js';
 import { dispatchRemoteDesktopCommand } from '../node/remote-desktop-dispatch.js';
+import { readElevatedRemoteDesktopSecret } from '../node/remote-desktop-elevated-install.js';
+import { ElevatedRemoteDesktopRelay } from './remote-desktop-elevated-relay.js';
+import { enableElevatedRemoteDesktop } from './remote-desktop-elevated-enable.js';
 import {
   REMOTE_DESKTOP_COMPILED_SIGNER_SHA256,
   RemoteDesktopWorkerHost,
@@ -85,6 +96,13 @@ export interface DaemonRemoteDesktopDeps {
   ) => VerifiedRemoteDesktopWorkerArtifact | null;
   /** The publisher the installed bundle declares for itself. */
   readInstalledSigner?: (executablePath: string) => string;
+  /** The secret the elevated helper wrote, or '' when it is not installed. */
+  readElevatedSecret?: () => string;
+  enableElevated?: typeof enableElevatedRemoteDesktop;
+  createElevatedRelay?: (
+    onMessage: (message: Record<string, unknown>) => void,
+    readSecret: () => Promise<string>,
+  ) => RemoteDesktopWorkerLike;
   createHost?: (
     artifact: VerifiedRemoteDesktopWorkerArtifact,
     onMessage: (message: Record<string, unknown>) => void,
@@ -110,6 +128,7 @@ export class DaemonRemoteDesktop {
   private host: RemoteDesktopWorkerLike | null = null;
   private artifact: VerifiedRemoteDesktopWorkerArtifact | null = null;
   private installing: Promise<void> | null = null;
+  private enabling: Promise<void> | null = null;
 
   constructor(private readonly deps: DaemonRemoteDesktopDeps) {
     this.platform = deps.platform ?? process.platform;
@@ -141,9 +160,34 @@ export class DaemonRemoteDesktop {
    */
   capabilities(): readonly string[] {
     if (!this.supported()) return [];
-    return this.available()
-      ? [REMOTE_DESKTOP_INSTALLABLE_CAPABILITY, REMOTE_DESKTOP_CAPABILITY]
-      : [REMOTE_DESKTOP_INSTALLABLE_CAPABILITY];
+    if (!this.available()) return [REMOTE_DESKTOP_INSTALLABLE_CAPABILITY];
+    return this.elevatedInstalled()
+      ? [
+        REMOTE_DESKTOP_INSTALLABLE_CAPABILITY,
+        REMOTE_DESKTOP_CAPABILITY,
+        REMOTE_DESKTOP_ELEVATED_CAPABILITY,
+      ]
+      : [REMOTE_DESKTOP_INSTALLABLE_CAPABILITY, REMOTE_DESKTOP_CAPABILITY];
+  }
+
+  /**
+   * Whether the LocalSystem helper is installed and this daemon may drive it.
+   *
+   * Presence of the secret is the test: it is written by the privileged side and
+   * readable only by the account the helper was installed for, so being able to
+   * read it is exactly the permission being checked.
+   */
+  elevatedInstalled(): boolean {
+    if (!this.supported()) return false;
+    return Boolean((this.deps.readElevatedSecret ?? readElevatedRemoteDesktopSecret)());
+  }
+
+  elevatedState(): RemoteDesktopElevatedState {
+    if (!this.supported() || !this.available()) return REMOTE_DESKTOP_ELEVATED_STATE.UNSUPPORTED;
+    if (this.enabling) return REMOTE_DESKTOP_ELEVATED_STATE.ELEVATING;
+    return this.elevatedInstalled()
+      ? REMOTE_DESKTOP_ELEVATED_STATE.INSTALLED
+      : REMOTE_DESKTOP_ELEVATED_STATE.AVAILABLE;
   }
 
   installState(): RemoteDesktopInstallState {
@@ -158,6 +202,10 @@ export class DaemonRemoteDesktop {
   async handle(message: Record<string, unknown>): Promise<boolean> {
     if (message.type === REMOTE_DESKTOP_INSTALL_MSG.REQUEST) {
       await this.install();
+      return true;
+    }
+    if (message.type === REMOTE_DESKTOP_ELEVATED_INSTALL_MSG.REQUEST) {
+      await this.enableElevated();
       return true;
     }
     if (typeof message.type !== 'string' || !isRemoteDesktopMessageType(message.type)) return false;
@@ -283,6 +331,18 @@ export class DaemonRemoteDesktop {
     const artifact = this.artifact;
     if (!artifact) return null;
     const onMessage = (message: Record<string, unknown>): void => { this.deps.send(message); };
+    // With the helper installed the worker must be started by it, not here: only
+    // a LocalSystem launch can follow Windows onto the sign-in desktop, and two
+    // hosts for one machine would fight over the same worker.
+    if (this.elevatedInstalled()) {
+      const readSecret = async (): Promise<string> => (
+        (this.deps.readElevatedSecret ?? readElevatedRemoteDesktopSecret)()
+      );
+      this.host = this.deps.createElevatedRelay
+        ? this.deps.createElevatedRelay(onMessage, readSecret)
+        : new ElevatedRemoteDesktopRelay({ send: onMessage, readSecret });
+      return this.host;
+    }
     this.host = this.deps.createHost
       ? this.deps.createHost(artifact, onMessage)
       : new RemoteDesktopWorkerHost(
@@ -300,6 +360,67 @@ export class DaemonRemoteDesktop {
   private publish(state: RemoteDesktopInstallState, error?: RemoteDesktopInstallError): void {
     this.deps.send({
       type: REMOTE_DESKTOP_INSTALL_MSG.STATE,
+      state,
+      ...(error ? { error } : {}),
+    });
+  }
+
+  /**
+   * Enable login-screen control. Concurrent requests join the in-flight attempt
+   * rather than raising a second UAC prompt.
+   */
+  async enableElevated(): Promise<void> {
+    if (!this.supported() || !this.available()) {
+      this.publishElevated(
+        REMOTE_DESKTOP_ELEVATED_STATE.UNSUPPORTED,
+        this.supported()
+          ? REMOTE_DESKTOP_ELEVATED_ERROR.WORKER_MISSING
+          : REMOTE_DESKTOP_ELEVATED_ERROR.UNSUPPORTED_PLATFORM,
+      );
+      return;
+    }
+    if (this.elevatedInstalled()) {
+      this.publishElevated(REMOTE_DESKTOP_ELEVATED_STATE.INSTALLED);
+      return;
+    }
+    if (this.enabling) return this.enabling;
+    this.publishElevated(REMOTE_DESKTOP_ELEVATED_STATE.ELEVATING);
+    this.enabling = this.runEnableElevated().finally(() => { this.enabling = null; });
+    return this.enabling;
+  }
+
+  private async runEnableElevated(): Promise<void> {
+    let failure: RemoteDesktopElevatedError | null;
+    try {
+      failure = await (this.deps.enableElevated ?? enableElevatedRemoteDesktop)({
+        root: this.root,
+        workerDirectory: dirname(workerExecutablePath(this.root)),
+        loadCredential: this.deps.loadCredential ?? loadDaemonCredential,
+        ...(this.deps.fetchImpl ? { fetchImpl: this.deps.fetchImpl } : {}),
+        isInstalled: () => this.elevatedInstalled(),
+      });
+    } catch (err) {
+      logger.warn({ err }, 'remote desktop elevated helper install failed');
+      failure = REMOTE_DESKTOP_ELEVATED_ERROR.INSTALL_FAILED;
+    }
+    if (failure) {
+      this.publishElevated(REMOTE_DESKTOP_ELEVATED_STATE.FAILED, failure);
+      return;
+    }
+    // The backend changes with this, so drop the in-session worker: the next
+    // session must be served by the privileged helper.
+    this.host?.close();
+    this.host = null;
+    this.publishElevated(REMOTE_DESKTOP_ELEVATED_STATE.INSTALLED);
+    this.deps.onCapabilityChange?.();
+  }
+
+  private publishElevated(
+    state: RemoteDesktopElevatedState,
+    error?: RemoteDesktopElevatedError,
+  ): void {
+    this.deps.send({
+      type: REMOTE_DESKTOP_ELEVATED_INSTALL_MSG.STATE,
       state,
       ...(error ? { error } : {}),
     });

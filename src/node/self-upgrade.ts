@@ -197,6 +197,42 @@ function controlledNodePlatformArchKey(target: ControlledNodeArtifactTarget): st
   return `${platform}-${target.arch}`;
 }
 
+/**
+ * Download the signed runtime executable.
+ *
+ * A normal daemon uses this to obtain the carrier for its elevated
+ * remote-desktop helper: its own code lives in a user-writable npm directory,
+ * and nothing user-writable may be what a LocalSystem service executes.
+ * Integrity comes from the server's pinned digest, and authenticity from the
+ * publisher Windows names in the UAC prompt that installs it.
+ */
+export async function downloadControlledNodeExecutable(input: {
+  credential: ArtifactDownloadCredential;
+  target: ControlledNodeArtifactTarget;
+  dir: string;
+  fetchImpl: typeof fetch;
+}): Promise<{ artifactPath: string; sha256: string; sizeBytes: number } | undefined> {
+  await mkdir(input.dir, { recursive: true });
+  try {
+    const downloaded = await downloadArtifact({
+      credential: input.credential,
+      target: input.target,
+      dir: input.dir,
+      fetchImpl: input.fetchImpl,
+      asset: CONTROLLED_NODE_ARTIFACT_ASSETS.NODE,
+    });
+    return {
+      artifactPath: downloaded.artifactPath,
+      sha256: downloaded.sha256,
+      sizeBytes: downloaded.sizeBytes,
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (/^download_failed_(403|404|503)$/.test(message)) return undefined;
+    throw error;
+  }
+}
+
 export async function downloadControlledNodeComputerUseHelper(input: {
   credential: ControlledNodeCredential;
   target: ControlledNodeArtifactTarget;

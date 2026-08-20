@@ -14,6 +14,12 @@ import {
   REMOTE_DESKTOP_INSTALL_STATE,
 } from '../../shared/remote-desktop-install.js';
 import {
+  REMOTE_DESKTOP_ELEVATED_CAPABILITY,
+  REMOTE_DESKTOP_ELEVATED_ERROR,
+  REMOTE_DESKTOP_ELEVATED_INSTALL_MSG,
+  REMOTE_DESKTOP_ELEVATED_STATE,
+} from '../../shared/remote-desktop-elevated.js';
+import {
   DaemonRemoteDesktop,
   daemonWorkerLaunchOptions,
   type DaemonRemoteDesktopDeps,
@@ -64,6 +70,7 @@ function fixture(overrides: Partial<DaemonRemoteDesktopDeps> & { installed?: boo
   const extractVirtualDisplay = vi.fn(async () => {});
   const capturedSigners: string[] = [];
   const host = { handle: vi.fn(async () => true), close: vi.fn() };
+  const elevatedRelay = { handle: vi.fn(async () => true), close: vi.fn() };
   const deps: DaemonRemoteDesktopDeps = {
     send: (message) => { sent.push(message); },
     onCapabilityChange: () => { capabilityChanges.push(Date.now()); },
@@ -71,6 +78,7 @@ function fixture(overrides: Partial<DaemonRemoteDesktopDeps> & { installed?: boo
     arch: 'x64',
     root,
     trustedSignerSha256: 'a'.repeat(64),
+    readElevatedSecret: () => '',
     loadCredential: async () => ({
       serverUrl: 'https://example.test',
       serverId: 'server_1',
@@ -83,6 +91,7 @@ function fixture(overrides: Partial<DaemonRemoteDesktopDeps> & { installed?: boo
       return resolved;
     },
     createHost: () => host,
+    createElevatedRelay: () => elevatedRelay,
     ...overrides,
   };
   return {
@@ -93,6 +102,7 @@ function fixture(overrides: Partial<DaemonRemoteDesktopDeps> & { installed?: boo
     extractVirtualDisplay,
     capturedSigners,
     host,
+    elevatedRelay,
     states: () => sent
       .filter((message) => message.type === REMOTE_DESKTOP_INSTALL_MSG.STATE)
       .map((message) => message.state),
@@ -254,6 +264,84 @@ describe('DaemonRemoteDesktop', () => {
     expect(await f.remoteDesktop.handle(prepareCommand())).toBe(true);
     expect(f.host.handle).toHaveBeenCalledTimes(1);
     expect(f.sent).toHaveLength(0);
+  });
+
+  describe('login-screen control', () => {
+    it('does not claim it before the helper is installed', () => {
+      const f = fixture({ installed: true });
+      expect(f.remoteDesktop.capabilities()).not.toContain(REMOTE_DESKTOP_ELEVATED_CAPABILITY);
+      expect(f.remoteDesktop.elevatedState()).toBe(REMOTE_DESKTOP_ELEVATED_STATE.AVAILABLE);
+    });
+
+    it('claims it once the helper secret is readable', () => {
+      // Being able to read that secret IS the permission: the privileged side
+      // wrote it for exactly one account.
+      const f = fixture({ installed: true, readElevatedSecret: () => 'b'.repeat(43) });
+      expect(f.remoteDesktop.capabilities()).toContain(REMOTE_DESKTOP_ELEVATED_CAPABILITY);
+      expect(f.remoteDesktop.elevatedState()).toBe(REMOTE_DESKTOP_ELEVATED_STATE.INSTALLED);
+    });
+
+    it('routes signalling through the helper once installed', async () => {
+      const f = fixture({ installed: true, readElevatedSecret: () => 'b'.repeat(43) });
+      await f.remoteDesktop.handle(prepareCommand());
+      // Only a LocalSystem launch reaches the sign-in desktop, so the in-session
+      // worker must not also be started.
+      expect(f.elevatedRelay.handle).toHaveBeenCalledTimes(1);
+      expect(f.host.handle).not.toHaveBeenCalled();
+    });
+
+    it('refuses to enable before the worker itself is installed', async () => {
+      const f = fixture();
+      await f.remoteDesktop.handle({ type: REMOTE_DESKTOP_ELEVATED_INSTALL_MSG.REQUEST });
+      expect(f.sent.at(-1)).toMatchObject({
+        state: REMOTE_DESKTOP_ELEVATED_STATE.UNSUPPORTED,
+        error: REMOTE_DESKTOP_ELEVATED_ERROR.WORKER_MISSING,
+      });
+    });
+
+    it('reports a dismissed UAC prompt as declined, not as a failure', async () => {
+      const f = fixture({
+        installed: true,
+        enableElevated: async () => REMOTE_DESKTOP_ELEVATED_ERROR.ELEVATION_DECLINED,
+      });
+      await f.remoteDesktop.enableElevated();
+      expect(f.sent.map((message) => message.state)).toEqual([
+        REMOTE_DESKTOP_ELEVATED_STATE.ELEVATING,
+        REMOTE_DESKTOP_ELEVATED_STATE.FAILED,
+      ]);
+      expect(f.sent.at(-1)).toMatchObject({
+        error: REMOTE_DESKTOP_ELEVATED_ERROR.ELEVATION_DECLINED,
+      });
+      expect(f.capabilityChanges).toHaveLength(0);
+    });
+
+    it('re-advertises and switches backend once the helper is up', async () => {
+      let installed = false;
+      const f = fixture({
+        installed: true,
+        readElevatedSecret: () => (installed ? 'b'.repeat(43) : ''),
+        enableElevated: async () => { installed = true; return null; },
+      });
+      await f.remoteDesktop.handle(prepareCommand());
+      expect(f.host.handle).toHaveBeenCalledTimes(1);
+
+      await f.remoteDesktop.enableElevated();
+      expect(f.sent.at(-1)).toMatchObject({ state: REMOTE_DESKTOP_ELEVATED_STATE.INSTALLED });
+      expect(f.capabilityChanges).toHaveLength(1);
+      // The in-session worker has to go: the next session belongs to the helper.
+      expect(f.host.close).toHaveBeenCalledTimes(1);
+
+      await f.remoteDesktop.handle(prepareCommand());
+      expect(f.elevatedRelay.handle).toHaveBeenCalledTimes(1);
+      expect(f.host.handle).toHaveBeenCalledTimes(1);
+    });
+
+    it('joins a concurrent enable rather than raising a second prompt', async () => {
+      const enableElevated = vi.fn(async () => null);
+      const f = fixture({ installed: true, enableElevated: enableElevated as never });
+      await Promise.all([f.remoteDesktop.enableElevated(), f.remoteDesktop.enableElevated()]);
+      expect(enableElevated).toHaveBeenCalledTimes(1);
+    });
   });
 
   describe('worker launch options', () => {
