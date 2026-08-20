@@ -1503,6 +1503,80 @@ html.native-ios-mac .chat-dl-btn {
 .controls-input-p2p { background: linear-gradient(180deg, rgba(44,27,60,0.64), rgba(15,18,32,0.94)); }
 .controls-input-p2p:focus { border-color: inherit; }
 .controls-input-disabled { opacity: 0.4; pointer-events: none; }
+/* ── Desktop composer: one box, controls tucked underneath ────────────────
+   The buttons live in the DOM as SIBLINGS of `.controls-composer`, not inside
+   it, so this needs no markup change: letting `.controls` wrap and giving the
+   composer a full-width row with `order: -1` pushes every button onto a second
+   line by itself. Keeping the DOM untouched matters — the alias and machine
+   pickers are absolutely positioned against `.controls`, and a new positioned
+   wrapper would silently re-anchor them.
+
+   The visible box moves from the input to `.controls` so the input and its
+   controls read as one surface. The input's own border is then transparent,
+   and its focus and file-drag states are mirrored onto the box with `:has()`.
+
+   Scoped to min-width 641px because the mobile layout is the 640px override of
+   this same base, and must keep its side-by-side row untouched. */
+@media (min-width: 641px) {
+  .controls {
+    flex-wrap: wrap;
+    row-gap: 6px;
+    align-items: center;
+    padding: 7px 8px;
+    border: 1px solid rgba(125,211,252,0.18);
+    border-radius: 9px;
+    margin: 0 8px 8px;
+    background: linear-gradient(180deg, rgba(15,23,42,0.92), rgba(8,13,22,0.94));
+    box-shadow: inset 0 1px 0 rgba(255,255,255,0.035), inset 0 0 18px rgba(34,211,238,0.025);
+    transition: border-color 0.14s, box-shadow 0.14s, background 0.14s;
+  }
+
+  /* Full width and first, so everything else wraps beneath it. */
+  .controls-composer { flex: 0 0 100%; order: -1; }
+
+  /* The input is now part of the box rather than a box of its own. */
+  .controls-input {
+    background: transparent;
+    border-color: transparent;
+    box-shadow: none;
+    padding: 5px 3px;
+    /* Three rows at rest. Expressed in em so it tracks the font size rather
+       than pinning a pixel count that drifts if the type scale changes. */
+    min-height: calc((3 * 1.45em) + 10px);
+    max-height: 240px;
+  }
+  .controls-input:focus {
+    background: transparent;
+    border-color: transparent;
+    box-shadow: none;
+  }
+
+  /* State feedback moves to the box, since the input no longer draws one. */
+  .controls:has(.controls-input:focus) {
+    border-color: rgba(34,211,238,0.62);
+    box-shadow: 0 0 0 1px rgba(34,211,238,0.14), 0 0 16px rgba(34,211,238,0.12), inset 0 1px 0 rgba(255,255,255,0.055);
+    background: linear-gradient(180deg, rgba(15,40,62,0.72), rgba(8,13,22,0.94));
+  }
+  .controls:has(.controls-input-file-drag-over) {
+    border-color: rgba(96,165,250,0.82);
+    box-shadow: 0 0 0 1px rgba(96,165,250,0.42), 0 0 18px rgba(59,130,246,0.2), inset 0 1px 0 rgba(255,255,255,0.06);
+    background: linear-gradient(180deg, rgba(20,53,82,0.74), rgba(8,13,22,0.94));
+  }
+  .controls:has(.controls-input-p2p) {
+    background: linear-gradient(180deg, rgba(44,27,60,0.64), rgba(15,18,32,0.94));
+  }
+
+  /* Send is the primary action, so it anchors the right end of the row while
+     the utilities stay left. `order` rather than a DOM move, again to leave
+     the markup and its tests alone. */
+  .controls .btn-primary { order: 1; margin-left: auto; }
+
+  /* The corner grip sits at the bottom-right of the input, which is now the
+     middle of the box. Pull it to the input's own trailing edge so it does not
+     hover over the button row underneath. */
+  .controls-composer-resize-handle { bottom: 1px; right: 1px; }
+}
+
 /* Placeholder via CSS when empty */
 .controls-input:empty::before { content: attr(data-placeholder); color: #5f7087; pointer-events: none; }
 /* Menu dropdown */

@@ -728,4 +728,23 @@ describe('styles.css regression contracts', () => {
     // The card keeps its own gradient — this is about the texture, not the fill.
     expect(rule).toMatch(/linear-gradient\(115deg/);
   });
+
+  // The desktop composer restack must stay inside its min-width block. The
+  // mobile layout is the 640px override of the same base rules, so a rule that
+  // leaks out of the media query would silently restack the phone composer too
+  // -- and nothing else in the suite renders at a real viewport width to catch
+  // it.
+  it('keeps the desktop composer restack scoped to the desktop breakpoint', () => {
+    const desktopBlock = /@media \(min-width: 641px\) \{([\s\S]*?)\n\}/.exec(css);
+    expect(desktopBlock).not.toBeNull();
+    const inside = desktopBlock![1];
+    expect(inside).toMatch(/\.controls\s*\{[^}]*flex-wrap:\s*wrap/);
+    expect(inside).toMatch(/\.controls-composer\s*\{[^}]*order:\s*-1/);
+
+    // Outside the block, `.controls` must not wrap and the composer must not
+    // claim its own row.
+    const outside = css.replace(desktopBlock![0], '');
+    expect(outside).not.toMatch(/\.controls\s*\{[^}]*flex-wrap:\s*wrap/);
+    expect(outside).not.toMatch(/\.controls-composer\s*\{[^}]*order:\s*-1/);
+  });
 });

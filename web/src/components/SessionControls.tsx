@@ -115,7 +115,25 @@ import {
 } from '../session-settings-open-intent.js';
 
 export const COMPOSER_HEIGHT_STORAGE_KEY = 'imcodes_composer_height_v1';
-export const COMPOSER_HEIGHT_MIN_PX = 32;
+/**
+ * Floor for the shared desktop composer height, matching the three-row resting
+ * size the desktop stylesheet sets.
+ *
+ * It has to be enforced here as well as in CSS, not instead of it: once the
+ * user has resized, the pinned height is written as an inline `minHeight` on
+ * the input, and an inline style beats any stylesheet rule. A lower floor here
+ * would let a drag — or a height stored before this floor existed — shrink the
+ * composer back below three rows. `readStoredComposerHeight` re-clamps on read,
+ * so raising this migrates older stored values on its own.
+ *
+ * Desktop-only in effect: the pinned height is not applied on mobile, and the
+ * resize affordances that write it are hidden there.
+ *
+ * The value is the computed three-row height from `styles.css`:
+ * `(3 x 1.45em) + 10px` at the composer's 13px font size = 67px. If either the
+ * type scale or the composer padding changes, both must move together.
+ */
+export const COMPOSER_HEIGHT_MIN_PX = 67;
 export const COMPOSER_HEIGHT_MAX_PX = 360;
 const COMPOSER_HEIGHT_STEP_PX = 16;
 const COMPOSER_HEIGHT_EVENT = 'imcodes:composer-height';
