@@ -765,6 +765,12 @@ describe('styles.css regression contracts', () => {
     expect(inside).not.toMatch(/\.controls-composer-resize-edge::after\s*\{[^}]*display:\s*none/);
   });
 
+  it('routes remote-desktop hover input directly to the stage', () => {
+    const videoRule = css.match(/\.remote-desktop-stage video\s*\{[^}]*\}/)?.[0];
+    expect(videoRule, '.remote-desktop-stage video rule missing').toBeTruthy();
+    expect(videoRule).toMatch(/pointer-events:\s*none/);
+  });
+
   // Transport sessions zero the toolbar's left padding, and they are the only
   // sessions that render a Stop button -- so matching `.shortcuts` alone would
   // leave the exact case this alignment exists for still misaligned.

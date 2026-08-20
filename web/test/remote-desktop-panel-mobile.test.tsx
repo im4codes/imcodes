@@ -796,17 +796,16 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     }
   });
 
-  it('follows a hover that lands on the video, not just one dispatched at the stage', async () => {
-    // A real hover targets the topmost element under the cursor -- the video --
-    // and only reaches the stage by bubbling. A drag looks different because
-    // pointerdown takes pointer capture, which retargets every later move to
-    // the stage: that is exactly the reported "dragging follows, hovering does
-    // not", so the hover path has to be exercised where it actually lands.
-    const { video } = await renderPanel();
+  it('keeps the stage as the direct hover target instead of relying on native video bubbling', async () => {
+    // Real desktop engines did not consistently bubble uncaptured hover moves
+    // from their native video surface. Drags appeared to work only because a
+    // preceding pointerdown captured the pointer on the stage. The video is
+    // presentation-only, so the stage must own the hit path without capture.
+    const { stage } = await renderPanel();
     pointerMove.mockClear();
     act(() => {
-      mousePointer(video, 'pointermove', { pointerId: 21, clientX: 200, clientY: 150 });
-      mousePointer(video, 'pointermove', { pointerId: 21, clientX: 300, clientY: 150 });
+      mousePointer(stage, 'pointermove', { pointerId: 21, clientX: 200, clientY: 150 });
+      mousePointer(stage, 'pointermove', { pointerId: 21, clientX: 300, clientY: 150 });
     });
     expect(pointerMove.mock.calls).toEqual([[0.5, 0.5], [0.75, 0.5]]);
   });

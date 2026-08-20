@@ -8909,6 +8909,11 @@ button.quick-agent-delegation-preset.active {
   max-width: none;
   max-height: none;
   background: #000;
+  /* The video is a presentation surface, never an input surface. Native video
+     elements do not deliver uncaptured hover movement consistently across
+     desktop engines, while pointer capture made drags appear to work. Keep the
+     stage as the direct hit target so hover, click and wheel share one path. */
+  pointer-events: none;
   user-select: none;
   -webkit-user-drag: none;
 }
