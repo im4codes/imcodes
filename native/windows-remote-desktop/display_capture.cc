@@ -25,6 +25,13 @@
 namespace imcodes::rd {
 namespace {
 
+// The viewer already has an authoritative local system cursor. Embedding the
+// Windows cursor in the video creates a second cursor which visibly freezes
+// whenever browser hover delivery stalls, while clicks still move it. Keep the
+// captured desktop cursor-free so the viewer never presents conflicting cursor
+// positions.
+constexpr bool kEmbedRemoteCursorInVideo = false;
+
 /** The name Windows gives a desktop handle, empty when it cannot be read. */
 std::wstring DesktopNameOf(HDESK desktop) {
   wchar_t name[64]{};
@@ -518,11 +525,13 @@ bool DxgiDesktopSource::CaptureOne() {
       ClassifyCaptureAcquireResult(acquired);
   if (acquire_action == CaptureAcquireAction::kWait) {
     last_capture_waited_ = true;
-    const CursorSnapshot cursor = ReadCursorSnapshot();
-    if (cursor.available &&
-        CursorSnapshotChanged(last_cursor_snapshot_, cursor) &&
-        BroadcastStagingFrame()) {
-      return true;
+    if constexpr (kEmbedRemoteCursorInVideo) {
+      const CursorSnapshot cursor = ReadCursorSnapshot();
+      if (cursor.available &&
+          CursorSnapshotChanged(last_cursor_snapshot_, cursor) &&
+          BroadcastStagingFrame()) {
+        return true;
+      }
     }
     // A completely static desktop may not yield another DXGI frame for a long
     // time. Re-submit the last immutable buffer at a bounded cadence so an
@@ -628,7 +637,8 @@ bool DxgiDesktopSource::CaptureDesktopGdi() {
 
 bool DxgiDesktopSource::BroadcastBgraFrame(int width, int height) {
   if (!cursor_bits_ || width <= 0 || height <= 0) return false;
-  CompositeCursor(cursor_bits_, width * 4, width, height);
+  if constexpr (kEmbedRemoteCursorInVideo)
+    CompositeCursor(cursor_bits_, width * 4, width, height);
 
   auto raw = webrtc::I420Buffer::Create(width, height);
   if (libyuv::ARGBToI420(cursor_bits_, width * 4,

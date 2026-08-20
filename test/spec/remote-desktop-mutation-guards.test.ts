@@ -820,29 +820,14 @@ const contracts: Contract[] = [
     ],
   },
   {
-    // A machine with no physical mouse keeps its pointer suppressed: moving it
-    // then changes nothing anyone can see, which is a remote cursor that does
-    // not follow.
-    name: 'the remote pointer stays visible while it is driven',
+    // The browser already presents the operator's local cursor. Compositing a
+    // second Windows cursor into the video makes stale hover delivery visible
+    // as a frozen duplicate cursor.
+    name: 'captured video omits the duplicate remote pointer',
     guards: [
       {
-        path: 'native/windows-remote-desktop/local_indicator.cc',
-        needle: 'if (request->accepted && PointerSuppressed())',
-      },
-      {
         path: 'native/windows-remote-desktop/display_capture.cc',
-        needle: '(cursor.flags & (CURSOR_SHOWING | CURSOR_SUPPRESSED)) != 0',
-      },
-      {
-        path: 'native/windows-remote-desktop/display_capture.cc',
-        needle: 'SelectCursorSnapshotSource(native_available, dxgi_available)',
-      },
-      {
-        // Some display stacks do not surface a synthetic hover as a new DXGI
-        // frame after the first click. Re-composite the live USER32 cursor on
-        // the last cursor-free staging texture instead of freezing the image.
-        path: 'native/windows-remote-desktop/display_capture.cc',
-        needle: 'CursorSnapshotChanged(last_cursor_snapshot_, cursor) &&\n        BroadcastStagingFrame()',
+        needle: 'constexpr bool kEmbedRemoteCursorInVideo = false;',
       },
     ],
   },
@@ -1439,22 +1424,10 @@ const mutations: Mutation[] = [
     needle: 'displayModeOptions(display).map(',
   },
   {
-    name: 'stop revealing the suppressed pointer',
-    contract: 'the remote pointer stays visible while it is driven',
-    path: 'native/windows-remote-desktop/local_indicator.cc',
-    needle: 'if (request->accepted && PointerSuppressed())',
-  },
-  {
-    name: 'stop preferring the live native pointer over a stale DXGI snapshot',
-    contract: 'the remote pointer stays visible while it is driven',
+    name: 'put the duplicate remote pointer back into captured video',
+    contract: 'captured video omits the duplicate remote pointer',
     path: 'native/windows-remote-desktop/display_capture.cc',
-    needle: 'SelectCursorSnapshotSource(native_available, dxgi_available)',
-  },
-  {
-    name: 'stop publishing cursor-only movement after a DXGI timeout',
-    contract: 'the remote pointer stays visible while it is driven',
-    path: 'native/windows-remote-desktop/display_capture.cc',
-    needle: 'CursorSnapshotChanged(last_cursor_snapshot_, cursor) &&\n        BroadcastStagingFrame()',
+    needle: 'constexpr bool kEmbedRemoteCursorInVideo = false;',
   },
   {
     name: 'decline a tracked session message while its worker is still starting',
