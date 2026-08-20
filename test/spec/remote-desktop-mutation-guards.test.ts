@@ -939,7 +939,13 @@ const contracts: Contract[] = [
         // The offer that follows a PREPARE waits for that PREPARE's cold start
         // instead of being declined as a dead worker.
         path: 'src/node/remote-desktop-worker-host.ts',
-        needle: 'if (!this.tracked.has(parsed.value.sessionId)) return false;\n      await this.ensureStarted();',
+        needle: 'if (!this.tracked.has(command.sessionId)) return false;\n      await this.ensureStarted();',
+      },
+      {
+        // Waiting for process start alone is insufficient: concurrent
+        // continuations may otherwise write OFFER before PREPARE.
+        path: 'src/node/remote-desktop-worker-host.ts',
+        needle: 'await this.preparing.get(command.sessionId);',
       },
     ],
   },
@@ -1501,7 +1507,13 @@ const mutations: Mutation[] = [
     name: 'decline a tracked session message while its worker is still starting',
     contract: 'a dead idle pipe cold-starts a replacement instead of failing the session',
     path: 'src/node/remote-desktop-worker-host.ts',
-    needle: 'if (!this.tracked.has(parsed.value.sessionId)) return false;\n      await this.ensureStarted();',
+    needle: 'if (!this.tracked.has(command.sessionId)) return false;\n      await this.ensureStarted();',
+  },
+  {
+    name: 'allow an offer to overtake its prepare after a cold start',
+    contract: 'a dead idle pipe cold-starts a replacement instead of failing the session',
+    path: 'src/node/remote-desktop-worker-host.ts',
+    needle: 'await this.preparing.get(command.sessionId);',
   },
   {
     name: 'let a settled start promise stand in for a live worker',
