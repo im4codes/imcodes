@@ -21,6 +21,32 @@ export interface RemoteDesktopChordKey {
   key: string;
 }
 
+const MOBILE_BACKWARD_DELETE_INPUT_TYPES = new Set([
+  'deleteContentBackward',
+  'deleteWordBackward',
+  'deleteSoftLineBackward',
+  'deleteHardLineBackward',
+]);
+
+const MOBILE_FORWARD_DELETE_INPUT_TYPES = new Set([
+  'deleteContentForward',
+  'deleteWordForward',
+  'deleteSoftLineForward',
+  'deleteHardLineForward',
+]);
+
+export function remoteDesktopMobileDeletionKey(
+  inputType: string,
+): RemoteDesktopChordKey | null {
+  if (MOBILE_BACKWARD_DELETE_INPUT_TYPES.has(inputType)) {
+    return { code: 'Backspace', key: 'Backspace' };
+  }
+  if (MOBILE_FORWARD_DELETE_INPUT_TYPES.has(inputType)) {
+    return { code: 'Delete', key: 'Delete' };
+  }
+  return null;
+}
+
 export const REMOTE_DESKTOP_MOBILE_SHORTCUTS = [
   { id: 'select_all', keys: [{ code: 'ControlLeft', key: 'Control' }, { code: 'KeyA', key: 'a' }] },
   { id: 'copy', keys: [{ code: 'ControlLeft', key: 'Control' }, { code: 'KeyC', key: 'c' }] },

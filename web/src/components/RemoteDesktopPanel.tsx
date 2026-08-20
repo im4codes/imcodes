@@ -33,6 +33,7 @@ import {
   mapRemoteDesktopKeyboardEvent,
   readControllerPlatform,
   REMOTE_DESKTOP_CLIPBOARD_SHORTCUT,
+  remoteDesktopMobileDeletionKey,
   remoteDesktopShortcutLabel,
   sendRemoteDesktopChord,
 } from '../remote-desktop-keyboard.js';
@@ -2030,6 +2031,15 @@ export function RemoteDesktopPanel({
                     mobileTextLastCompositionCommitRef.current = value;
                     submitMobileText(value);
                   }
+                }}
+                onBeforeInput={(event) => {
+                  event.stopPropagation();
+                  const input = event.currentTarget as HTMLTextAreaElement;
+                  if (mobileTextComposingRef.current || event.isComposing || input.value) return;
+                  const deletionKey = remoteDesktopMobileDeletionKey(event.inputType);
+                  if (!deletionKey) return;
+                  event.preventDefault();
+                  sendMobileShortcut([deletionKey]);
                 }}
                 onInput={(event) => {
                   event.stopPropagation();

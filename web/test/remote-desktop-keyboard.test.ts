@@ -3,6 +3,7 @@ import {
   detectRemoteDesktopClipboardShortcut,
   mapRemoteDesktopKeyboardEvent,
   REMOTE_DESKTOP_CLIPBOARD_SHORTCUT,
+  remoteDesktopMobileDeletionKey,
   sendRemoteDesktopChord,
 } from '../src/remote-desktop-keyboard.js';
 
@@ -62,6 +63,20 @@ describe('remote desktop keyboard mapping', () => {
     ], send, releaseAll)).toBe(false);
     expect(releaseAll).toHaveBeenCalledTimes(1);
   });
+
+  it('maps mobile beforeinput deletion commands to remote editing keys', () => {
+    expect(remoteDesktopMobileDeletionKey('deleteContentBackward')).toEqual({
+      code: 'Backspace', key: 'Backspace',
+    });
+    expect(remoteDesktopMobileDeletionKey('deleteWordBackward')).toEqual({
+      code: 'Backspace', key: 'Backspace',
+    });
+    expect(remoteDesktopMobileDeletionKey('deleteContentForward')).toEqual({
+      code: 'Delete', key: 'Delete',
+    });
+    expect(remoteDesktopMobileDeletionKey('insertText')).toBeNull();
+    expect(remoteDesktopMobileDeletionKey('deleteByCut')).toBeNull();
+  });
 });
 
 describe('clipboard shortcuts', () => {
@@ -87,4 +102,3 @@ describe('clipboard shortcuts', () => {
     expect(detectRemoteDesktopClipboardShortcut(key({}), 'Win32')).toBeNull();
   });
 });
-

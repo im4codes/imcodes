@@ -703,6 +703,15 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     })));
     expect(text).not.toHaveBeenCalled();
     expect(input.value).toBe('ni');
+    const composingDelete = new InputEvent('beforeinput', {
+      bubbles: true,
+      cancelable: true,
+      inputType: 'deleteContentBackward',
+      isComposing: true,
+    });
+    act(() => input.dispatchEvent(composingDelete));
+    expect(composingDelete.defaultPrevented).toBe(false);
+    expect(key).not.toHaveBeenCalled();
 
     input.value = '你';
     await act(async () => {
@@ -715,6 +724,21 @@ describe('RemoteDesktopPanel mobile gestures', () => {
 
     input.value = 'b';
     act(() => input.dispatchEvent(new InputEvent('input', { bubbles: true, data: 'b' })));
+    expect(text.mock.calls).toEqual([['你'], ['b']]);
+    expect(document.activeElement).toBe(input);
+
+    key.mockClear();
+    const deleteBackward = new InputEvent('beforeinput', {
+      bubbles: true,
+      cancelable: true,
+      inputType: 'deleteContentBackward',
+    });
+    act(() => input.dispatchEvent(deleteBackward));
+    expect(deleteBackward.defaultPrevented).toBe(true);
+    expect(key.mock.calls).toEqual([
+      ['Backspace', 'Backspace', true, false, { control: false, alt: false }],
+      ['Backspace', 'Backspace', false, false, { control: false, alt: false }],
+    ]);
     expect(text.mock.calls).toEqual([['你'], ['b']]);
     expect(document.activeElement).toBe(input);
 
