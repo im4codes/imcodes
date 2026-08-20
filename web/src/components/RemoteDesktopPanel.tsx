@@ -57,13 +57,7 @@ import {
 type ViewScale = 'fit' | 'actual';
 type MobileInputMode = 'touch' | 'mouse';
 type ClipboardStatus = 'idle' | 'copying' | 'copied' | 'pasting' | 'pasted' | 'empty' | 'failed';
-type DesktopPointerMoveSource =
-  | 'window-mouse'
-  | 'window-pointer'
-  | 'stage-mouse'
-  | 'stage-pointer'
-  | 'surface-mouse'
-  | 'surface-pointer';
+type DesktopPointerMoveSource = 'window-mouse' | 'window-pointer' | 'stage-mouse' | 'stage-pointer';
 
 interface TouchPoint {
   x: number;
@@ -287,8 +281,6 @@ export function RemoteDesktopPanel({
     'window-pointer': 0,
     'stage-mouse': 0,
     'stage-pointer': 0,
-    'surface-mouse': 0,
-    'surface-pointer': 0,
   });
   const lastDesktopPointerMoveRef = useRef<{ x: number; y: number; at: number } | null>(null);
   const [pointerMovesUnmapped, setPointerMovesUnmapped] = useState(0);
@@ -1217,23 +1209,6 @@ export function RemoteDesktopPanel({
     sendDesktopPointerMove(event.clientX, event.clientY, 'stage-mouse');
   };
 
-  const onInputSurfacePointerMove = (event: PointerEvent) => {
-    if (event.pointerType === 'touch') {
-      onTouchMove(event);
-    } else {
-      sendDesktopPointerMove(event.clientX, event.clientY, 'surface-pointer');
-    }
-    // This is the browser hit surface above the native video compositor. Own
-    // the target phase here; window capture remains a fallback and the stage
-    // must not consume the same compatibility event a third time.
-    event.stopPropagation();
-  };
-
-  const onInputSurfaceMouseMove = (event: MouseEvent) => {
-    sendDesktopPointerMove(event.clientX, event.clientY, 'surface-mouse');
-    event.stopPropagation();
-  };
-
   const suppressCommandControlForMiddleDrag = () => {
     const client = clientRef.current;
     if (!client) return;
@@ -1913,9 +1888,6 @@ export function RemoteDesktopPanel({
               class="remote-desktop-input-surface"
               data-testid="remote-desktop-input-surface"
               aria-hidden="true"
-              onPointerMove={onInputSurfacePointerMove}
-              onMouseMove={onInputSurfaceMouseMove}
-              onMouseEnter={onInputSurfaceMouseMove}
             />
           )}
           {mobileTextOpen && (
@@ -2310,7 +2282,7 @@ export function RemoteDesktopPanel({
                 failed: snapshot.pointerMoveSendFailures ?? 0,
               })}</span>
             )}
-            <span title={`surface mouse ${pointerMoveIngressBySource['surface-mouse']} · surface pointer ${pointerMoveIngressBySource['surface-pointer']} · window mouse ${pointerMoveIngressBySource['window-mouse']} · window pointer ${pointerMoveIngressBySource['window-pointer']} · stage mouse ${pointerMoveIngressBySource['stage-mouse']} · stage pointer ${pointerMoveIngressBySource['stage-pointer']}`}>
+            <span title={`window mouse ${pointerMoveIngressBySource['window-mouse']} · window pointer ${pointerMoveIngressBySource['window-pointer']} · stage mouse ${pointerMoveIngressBySource['stage-mouse']} · stage pointer ${pointerMoveIngressBySource['stage-pointer']}`}>
               {t('remote_desktop.pointer_move_browser', {
                 ingress: pointerMovesIngress,
                 accepted: pointerMovesSeen,

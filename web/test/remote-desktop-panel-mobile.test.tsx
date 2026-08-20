@@ -752,6 +752,15 @@ describe('RemoteDesktopPanel mobile gestures', () => {
 
   it('releases a captured mouse button even when pointer-up is outside video content', async () => {
     const { stage } = await renderPanel();
+    let capturedPointerId: number | null = null;
+    const releasePointerCapture = vi.fn((pointerId: number) => {
+      if (capturedPointerId === pointerId) capturedPointerId = null;
+    });
+    Object.assign(stage, {
+      setPointerCapture: (pointerId: number) => { capturedPointerId = pointerId; },
+      hasPointerCapture: (pointerId: number) => capturedPointerId === pointerId,
+      releasePointerCapture,
+    });
     mousePointer(stage, 'pointerdown', {
       pointerId: 7, clientX: 200, clientY: 150,
     });
@@ -763,6 +772,7 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     });
     expect(pointerButton).toHaveBeenNthCalledWith(1, 'left', true, 0.5, 0.5);
     expect(pointerButton).toHaveBeenNthCalledWith(2, 'left', false, undefined, undefined);
+    expect(releasePointerCapture).toHaveBeenCalledWith(7);
     expect(releasePointerButtons).toHaveBeenCalledTimes(1);
     expect(releaseAll).not.toHaveBeenCalled();
   });
@@ -908,41 +918,6 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     act(() => {
       nativeMouseMove(rendered.stage, { clientX: 200, clientY: 150 });
       nativeMouseMove(rendered.stage, { clientX: 300, clientY: 150 });
-    });
-
-    expect(pointerMove.mock.calls).toEqual([[0.5, 0.5], [0.75, 0.5]]);
-  });
-
-  it('owns uncaptured hover on the compositor input surface without relying on bubbling', async () => {
-    const { container, video } = await renderPanel();
-    act(() => clientHooks[0]!.onSnapshot({
-      state: REMOTE_DESKTOP_STATE.DIRECT,
-      mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
-      inputEpoch: 2,
-      inputEnabled: true,
-      route: 'direct',
-      displays: [],
-      layoutRevision: 1,
-      stream: {} as MediaStream,
-    }));
-    act(() => video.dispatchEvent(new Event('loadeddata')));
-    const inputSurface = container.querySelector('[data-testid="remote-desktop-input-surface"]');
-    expect(inputSurface).not.toBeNull();
-    pointerMove.mockClear();
-
-    act(() => {
-      inputSurface!.dispatchEvent(new MouseEvent('mousemove', {
-        bubbles: false,
-        cancelable: true,
-        clientX: 200,
-        clientY: 150,
-      }));
-      inputSurface!.dispatchEvent(new MouseEvent('mousemove', {
-        bubbles: false,
-        cancelable: true,
-        clientX: 300,
-        clientY: 150,
-      }));
     });
 
     expect(pointerMove.mock.calls).toEqual([[0.5, 0.5], [0.75, 0.5]]);
