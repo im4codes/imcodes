@@ -10,6 +10,7 @@ import {
   REMOTE_DESKTOP_STATE,
   REMOTE_DESKTOP_TERMINAL_REASON,
   mapRemoteDesktopVideoPoint,
+  type RemoteDesktopNormalizedPoint,
 } from '@shared/remote-desktop.js';
 import { DIRECT_FILE_TRANSFER_STATE } from '@shared/direct-file-transfer.js';
 import {
@@ -840,6 +841,21 @@ export function RemoteDesktopPanel({
     return { x: event.clientX - rect.left, y: event.clientY - rect.top };
   };
 
+  const sendTouchClick = (
+    button: DesktopPointerButton,
+    point: RemoteDesktopNormalizedPoint,
+  ): boolean => {
+    const client = clientRef.current;
+    if (!client) return false;
+    if (snapshot.atomicButtonClick) {
+      return client.pointerClick(button, point.x, point.y);
+    }
+    if (!client.pointerButton(button, true, point.x, point.y)) return false;
+    if (client.pointerButton(button, false, point.x, point.y)) return true;
+    client.releasePointerButtons();
+    return false;
+  };
+
   const beginVirtualMouseMove = (event: PointerEvent) => {
     const point = localTouchPoint(event);
     if (!point || !snapshot.inputEnabled) return;
@@ -1007,8 +1023,7 @@ export function RemoteDesktopPanel({
         current.longPressFired = true;
         lastTouchTapRef.current = null;
         lastTouchRemotePointRef.current = normalized;
-        clientRef.current?.pointerButton('right', true, normalized.x, normalized.y);
-        clientRef.current?.pointerButton('right', false, normalized.x, normalized.y);
+        sendTouchClick('right', normalized);
       }, TOUCH_LONG_PRESS_MS);
       touchGestureRef.current = gesture;
     } else {
@@ -1077,8 +1092,7 @@ export function RemoteDesktopPanel({
             <= TOUCH_DOUBLE_TAP_DISTANCE_PX;
         const target = doubleTap ? previous.normalized : normalized;
         lastTouchRemotePointRef.current = target;
-        clientRef.current?.pointerButton('left', true, target.x, target.y);
-        clientRef.current?.pointerButton('left', false, target.x, target.y);
+        sendTouchClick('left', target);
         lastTouchTapRef.current = doubleTap ? null : {
           at: now,
           point,

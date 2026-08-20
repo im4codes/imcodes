@@ -747,12 +747,25 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     expect(selectDisplay).toHaveBeenCalledWith('display-second');
   });
 
-  it('turns a touch tap into one remote left click without DPI multiplication', async () => {
+  it('turns a touch tap into one atomic remote left click without DPI multiplication', async () => {
     const { stage } = await renderPanel();
     pointer(stage, 'pointerdown', { pointerId: 1, clientX: 200, clientY: 150 });
     pointer(stage, 'pointerup', { pointerId: 1, clientX: 200, clientY: 150 });
-    expect(pointerButton).toHaveBeenNthCalledWith(1, 'left', true, 0.5, 0.5);
-    expect(pointerButton).toHaveBeenNthCalledWith(2, 'left', false, 0.5, 0.5);
+    expect(pointerClick).toHaveBeenCalledOnce();
+    expect(pointerClick).toHaveBeenCalledWith('left', 0.5, 0.5);
+    expect(pointerButton).not.toHaveBeenCalled();
+  });
+
+  it('keeps the legacy touch down/up click for an older worker', async () => {
+    atomicButtonClickAdvertised = false;
+    const { stage } = await renderPanel();
+    pointer(stage, 'pointerdown', { pointerId: 2, clientX: 200, clientY: 150 });
+    pointer(stage, 'pointerup', { pointerId: 2, clientX: 200, clientY: 150 });
+    expect(pointerClick).not.toHaveBeenCalled();
+    expect(pointerButton.mock.calls).toEqual([
+      ['left', true, 0.5, 0.5],
+      ['left', false, 0.5, 0.5],
+    ]);
   });
 
   it('releases a captured mouse button even when pointer-up is outside video content', async () => {
@@ -1071,8 +1084,8 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     });
     pointer(stage, 'pointerdown', { pointerId: 3, clientX: 400, clientY: 37.5 });
     pointer(stage, 'pointerup', { pointerId: 3, clientX: 400, clientY: 37.5 });
-    expect(pointerButton).toHaveBeenNthCalledWith(1, 'left', true, 0.75, 0.25);
-    expect(pointerButton).toHaveBeenNthCalledWith(2, 'left', false, 0.75, 0.25);
+    expect(pointerClick).toHaveBeenCalledWith('left', 0.75, 0.25);
+    expect(pointerButton).not.toHaveBeenCalled();
   });
 
   it('turns a long press into right-click and snaps a nearby double tap to one Windows target', async () => {
@@ -1083,23 +1096,20 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     pointer(stage, 'pointerdown', { pointerId: 40, clientX: 200, clientY: 150 });
     act(() => { vi.advanceTimersByTime(550); });
     pointer(stage, 'pointerup', { pointerId: 40, clientX: 200, clientY: 150 });
-    expect(pointerButton.mock.calls).toEqual([
-      ['right', true, 0.5, 0.5],
-      ['right', false, 0.5, 0.5],
-    ]);
+    expect(pointerClick.mock.calls).toEqual([['right', 0.5, 0.5]]);
 
     pointerButton.mockClear();
+    pointerClick.mockClear();
     pointer(stage, 'pointerdown', { pointerId: 41, clientX: 200, clientY: 150 });
     pointer(stage, 'pointerup', { pointerId: 41, clientX: 200, clientY: 150 });
     act(() => { vi.advanceTimersByTime(180); });
     pointer(stage, 'pointerdown', { pointerId: 42, clientX: 218, clientY: 158 });
     pointer(stage, 'pointerup', { pointerId: 42, clientX: 218, clientY: 158 });
-    expect(pointerButton.mock.calls).toEqual([
-      ['left', true, 0.5, 0.5],
-      ['left', false, 0.5, 0.5],
-      ['left', true, 0.5, 0.5],
-      ['left', false, 0.5, 0.5],
+    expect(pointerClick.mock.calls).toEqual([
+      ['left', 0.5, 0.5],
+      ['left', 0.5, 0.5],
     ]);
+    expect(pointerButton).not.toHaveBeenCalled();
   });
 
   it('offers a dedicated touch-mode right-click button at the last touch position', async () => {
