@@ -316,6 +316,51 @@ describe('RemoteDesktopRouter', () => {
       error: REMOTE_DESKTOP_ERROR.INVALID_REQUEST,
     });
   });
+
+  it('records bounded signaling progress when negotiation fails', async () => {
+    const f = fixture();
+    const authority = await authorize(f);
+    await f.router.handleBrowser(f.browserA, 'owner-user', {
+      type: REMOTE_DESKTOP_MSG.OFFER,
+      ...authority,
+      sdp: 'v=0\r\na=ice-ufrag:diagnostic-offer',
+    });
+    await f.router.handleBrowser(f.browserA, 'owner-user', {
+      type: REMOTE_DESKTOP_MSG.ICE,
+      ...authority,
+      candidate: 'candidate:browser-diagnostic',
+      mid: '0',
+    });
+    expect(f.router.handleDaemon({
+      type: REMOTE_DESKTOP_MSG.ANSWER,
+      ...authority,
+      sdp: 'v=0\r\na=ice-ufrag:diagnostic-answer',
+    }, 7)).toBe(true);
+    expect(f.router.handleDaemon({
+      type: REMOTE_DESKTOP_MSG.ICE,
+      ...authority,
+      candidate: 'candidate:daemon-diagnostic',
+      mid: '0',
+    }, 7)).toBe(true);
+
+    f.router.stopAll(REMOTE_DESKTOP_TERMINAL_REASON.NEGOTIATION_TIMEOUT);
+
+    expect(f.audits.at(-1)).toMatchObject({
+      event: REMOTE_DESKTOP_AUDIT_EVENT.FAILED,
+      fields: expect.objectContaining({
+        reason: REMOTE_DESKTOP_TERMINAL_REASON.NEGOTIATION_TIMEOUT,
+        state: REMOTE_DESKTOP_STATE.CONNECTING,
+        offerCount: 1,
+        answerCount: 1,
+        browserIceCandidates: 1,
+        daemonIceCandidates: 1,
+      }),
+    });
+    const serializedAudit = JSON.stringify(f.audits.at(-1));
+    expect(serializedAudit).not.toContain('diagnostic-offer');
+    expect(serializedAudit).not.toContain('diagnostic-answer');
+    expect(serializedAudit).not.toContain('candidate:');
+  });
   it('admits an exact Owner authority and singlecasts prepare/signaling/status', async () => {
     const f = fixture();
     const authority = await authorize(f);

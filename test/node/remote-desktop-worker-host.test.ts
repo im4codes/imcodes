@@ -999,13 +999,13 @@ describe('remote desktop worker artifact and IPC host', () => {
     });
     await expect(host.handle(next)).resolves.toBe(true);
 
-    expect(launch).toHaveBeenCalledTimes(2);
+    expect(launch).toHaveBeenCalledTimes(3);
     expect(received).not.toContainEqual(expect.objectContaining({
       type: REMOTE_DESKTOP_MSG.TERMINAL,
       reason: REMOTE_DESKTOP_TERMINAL_REASON.WORKER_FAILED,
     }));
-    await vi.waitFor(() => expect(helperBuffers[1]).toContain(next.sessionId));
-    expect(JSON.parse(helperBuffers[1]!.trim())).toEqual(next);
+    await vi.waitFor(() => expect(helperBuffers[2]).toContain(next.sessionId));
+    expect(JSON.parse(helperBuffers[2]!.trim())).toEqual(next);
     expect((host as unknown as { socket: net.Socket }).socket).not.toBe(staleSocket);
   });
 
@@ -1252,7 +1252,7 @@ describe('remote desktop worker artifact and IPC host', () => {
     ]);
   });
 
-  it('recycles an idle warm worker before a bounded browser reconnect', async () => {
+  it('recycles an idle warm worker before every new session', async () => {
     const temp = await mkdtemp(join(tmpdir(), 'imcodes-rd-host-reconnect-'));
     cleanup.push(() => rm(temp, { recursive: true, force: true }));
     const pipePath = join(temp, 'worker.sock');
@@ -1309,7 +1309,7 @@ describe('remote desktop worker artifact and IPC host', () => {
       requestId: 'request_reconnect',
       sessionId: 'session_reconnect',
       capability: 'b'.repeat(43),
-      reconnectAttempt: 1,
+      reconnectAttempt: 0,
     })).resolves.toBe(true);
 
     expect(launch).toHaveBeenCalledTimes(2);

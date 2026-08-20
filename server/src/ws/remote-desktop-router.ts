@@ -945,7 +945,14 @@ export class RemoteDesktopRouter {
         ? REMOTE_DESKTOP_AUDIT_EVENT.REVOKED
         : REMOTE_DESKTOP_AUDIT_EVENT.FAILED,
       route,
-      { reason },
+      {
+        reason,
+        state: route.state,
+        offerCount: route.offerCount,
+        answerCount: route.answerCount,
+        browserIceCandidates: route.browserIceCandidates,
+        daemonIceCandidates: route.daemonIceCandidates,
+      },
     );
     this.deleteRoute(route);
   }

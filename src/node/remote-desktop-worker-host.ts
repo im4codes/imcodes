@@ -10,6 +10,7 @@ import {
   validateRemoteDesktopDaemonCommand,
   validateRemoteDesktopDaemonMessage,
   type RemoteDesktopDaemonMessage,
+  type RemoteDesktopDaemonCommand,
   type RemoteDesktopPrepare,
 } from '../../shared/remote-desktop.js';
 import {
@@ -243,6 +244,8 @@ export class RemoteDesktopWorkerHost {
   private readonly nonce = randomBytes(32).toString('base64url');
   private readonly pipePath: string;
   private readonly tracked = new Map<string, TrackedAuthority>();
+  /** PREPARE must reach the worker before its immediately-following OFFER/ICE. */
+  private readonly preparing = new Map<string, Promise<void>>();
   private readonly recoverableSocketLosses = new WeakMap<net.Socket, Set<string>>();
   private server: net.Server | null = null;
   private socket: net.Socket | null = null;
@@ -359,21 +362,52 @@ export class RemoteDesktopWorkerHost {
   async handle(message: unknown): Promise<boolean> {
     const parsed = validateRemoteDesktopDaemonCommand(message);
     if (!parsed.ok || !this.available()) return false;
-    let recoverIdlePrepare = false;
-    if (parsed.value.type === REMOTE_DESKTOP_MSG.PREPARE) {
-      recoverIdlePrepare = this.tracked.size === 0;
-      if ((parsed.value.reconnectAttempt ?? 0) > 0 && this.tracked.size === 0) {
-        await this.recycleIdleWorkerForReconnect();
+    const command = parsed.value;
+    if (command.type === REMOTE_DESKTOP_MSG.PREPARE) {
+      let finishPreparing!: () => void;
+      const ready = new Promise<void>((resolveReady) => { finishPreparing = resolveReady; });
+      this.preparing.set(command.sessionId, ready);
+      try {
+        return await this.handleValidated(command);
+      } finally {
+        finishPreparing();
+        if (this.preparing.get(command.sessionId) === ready) {
+          this.preparing.delete(command.sessionId);
+        }
       }
+    }
+    if (command.type !== REMOTE_DESKTOP_MSG.STOP
+      && command.type !== REMOTE_DESKTOP_MSG.CANCEL) {
+      // The Server sends signaling as soon as PREPARE is admitted. A verified
+      // Windows cold start can take seconds, and several callers can enter
+      // handle() concurrently. Waiting for the PREPARE write (not merely the
+      // shared start promise) preserves the worker protocol's required order.
+      await this.preparing.get(command.sessionId);
+    }
+    return this.handleValidated(command);
+  }
+
+  private async handleValidated(command: RemoteDesktopDaemonCommand): Promise<boolean> {
+    let recoverIdlePrepare = false;
+    if (command.type === REMOTE_DESKTOP_MSG.PREPARE) {
+      recoverIdlePrepare = this.tracked.size === 0;
       // Tracked before the start, not after: the offer that follows this
       // PREPARE arrives while the cold start is still running, and it can only
       // be told to wait for that start if the session it names is already
       // known here.
-      this.track(parsed.value);
+      this.track(command);
       try {
+        if (recoverIdlePrepare) {
+          // A completed peer leaves process-local ICE, encoder and DXGI
+          // teardown behind the pipe becoming idle. Reusing that process made
+          // the first session work and a later attempt remain in negotiation
+          // until the Server's 45-second timeout. The authority is tracked
+          // first so its immediately-following OFFER waits for this recycle.
+          await this.recycleWorkerSocket(command.sessionId);
+        }
         await this.ensureStarted();
       } catch (error) {
-        this.untrack(parsed.value.sessionId);
+        this.untrack(command.sessionId);
         throw error;
       }
       if (recoverIdlePrepare && (!this.socket || this.socket.destroyed)) {
@@ -383,15 +417,15 @@ export class RemoteDesktopWorkerHost {
         // Returning here would surface that as `worker_failed` on the first
         // connect after any quiet period — the session is already tracked, so
         // cold-start one verified replacement instead.
-        this.untrack(parsed.value.sessionId);
+        this.untrack(command.sessionId);
         await this.ensureStarted();
-        this.track(parsed.value);
+        this.track(command);
         if (!this.socket || this.socket.destroyed) {
           // The replacement did not come up. Drop the authority before giving
           // up: a tracked session nobody will ever stop again would make every
           // later PREPARE look like a busy host, disabling this very recovery
           // for good and leaving its capability unwiped.
-          this.untrack(parsed.value.sessionId);
+          this.untrack(command.sessionId);
           throw new Error('remote_desktop_worker_recovery_failed');
         }
       }
@@ -403,7 +437,7 @@ export class RemoteDesktopWorkerHost {
       // Declining here is reported as `worker_failed`, which ends a session
       // that was about to work and is exactly what made a first connect after
       // any quiet period fail. Wait for the start this session already owns.
-      if (!this.tracked.has(parsed.value.sessionId)) return false;
+      if (!this.tracked.has(command.sessionId)) return false;
       await this.ensureStarted();
       if (!this.socket || this.socket.destroyed) return false;
     }
@@ -411,33 +445,33 @@ export class RemoteDesktopWorkerHost {
     if (!socket || socket.destroyed) return false;
     let sent = await this.writeToWorker(
       socket,
-      parsed.value,
-      recoverIdlePrepare && parsed.value.type === REMOTE_DESKTOP_MSG.PREPARE
-        ? parsed.value.sessionId
+      command,
+      recoverIdlePrepare && command.type === REMOTE_DESKTOP_MSG.PREPARE
+        ? command.sessionId
         : undefined,
     );
-    if (!sent && recoverIdlePrepare && parsed.value.type === REMOTE_DESKTOP_MSG.PREPARE
-      && this.tracked.has(parsed.value.sessionId)) {
+    if (!sent && recoverIdlePrepare && command.type === REMOTE_DESKTOP_MSG.PREPARE
+      && this.tracked.has(command.sessionId)) {
       // A warm idle worker can exit between sessions while the service-side
       // pipe has not observed the close yet. Do not surface that stale-pipe
       // race as worker_failed: no other authority is alive, so cold-start one
       // verified replacement and retry this PREPARE exactly once.
-      this.untrack(parsed.value.sessionId);
+      this.untrack(command.sessionId);
       await this.ensureStarted();
-      this.track(parsed.value);
+      this.track(command);
       const replacement = this.socket;
       if (!replacement || replacement.destroyed) {
-        this.untrack(parsed.value.sessionId);
+        this.untrack(command.sessionId);
         throw new Error('remote_desktop_worker_recovery_failed');
       }
-      sent = await this.writeToWorker(replacement, parsed.value);
+      sent = await this.writeToWorker(replacement, command);
     }
     if (!sent) {
       return true;
     }
-    if (sent && (parsed.value.type === REMOTE_DESKTOP_MSG.STOP
-      || parsed.value.type === REMOTE_DESKTOP_MSG.CANCEL)) {
-      this.untrack(parsed.value.sessionId);
+    if (sent && (command.type === REMOTE_DESKTOP_MSG.STOP
+      || command.type === REMOTE_DESKTOP_MSG.CANCEL)) {
+      this.untrack(command.sessionId);
     }
     return sent;
   }
@@ -486,13 +520,24 @@ export class RemoteDesktopWorkerHost {
     return false;
   }
 
-  private async recycleIdleWorkerForReconnect(): Promise<void> {
+  private async recycleWorkerSocket(recoveringSessionId?: string): Promise<void> {
     const socket = this.socket;
-    if (!socket || socket.destroyed || this.tracked.size > 0) return;
+    if (!socket || socket.destroyed) return;
+    if (recoveringSessionId === undefined) {
+      if (this.tracked.size > 0) return;
+    } else if (this.tracked.size !== 1 || !this.tracked.has(recoveringSessionId)) {
+      return;
+    }
     // A browser reconnect follows a failed negotiation or receive-progress
-    // path. With no other authority alive, recycle the process-local WebRTC /
-    // DXGI state instead of repeatedly retrying a poisoned warm worker. Pipe
-    // closure makes the immutable worker perform its normal release/cleanup.
+    // path, and an independent new session must not inherit its predecessor's
+    // process-local WebRTC / DXGI state either. Mark this deliberate socket
+    // loss recoverable before closing it, otherwise onSocketLost would fail
+    // the authority which is already tracked to serialize its following OFFER.
+    if (recoveringSessionId !== undefined) {
+      const recoverable = this.recoverableSocketLosses.get(socket) ?? new Set<string>();
+      recoverable.add(recoveringSessionId);
+      this.recoverableSocketLosses.set(socket, recoverable);
+    }
     await new Promise<void>((resolveClosed) => {
       socket.once('close', resolveClosed);
       socket.destroy();
@@ -812,7 +857,7 @@ export class RemoteDesktopWorkerHost {
       // authority is only detached from the map here — untrack() would wipe
       // the capability this same session still has to authenticate with.
       this.tracked.delete(tracked.sessionId);
-      await this.recycleIdleWorkerForReconnect();
+      await this.recycleWorkerSocket();
       await this.ensureStarted(forceSecureConsole);
       this.tracked.set(tracked.sessionId, tracked);
       const socket = this.socket;
