@@ -83,7 +83,7 @@ describe('legacy Windows controlled-node upgrade rescue', () => {
       .toBeLessThan(rescue.indexOf('Start-ScheduledTask -TaskName $mainTask'));
   });
 
-  it('builds a verified one-shot SYSTEM restart only after the matching rescue and old upgrade task are clear', () => {
+  it('builds a verified one-shot SYSTEM restart after active tasks clear and expired product tasks self-heal', () => {
     const built = buildLegacyWindowsUpgradeRestartCommand(RESCUE_ID, RESTART_ID, SIGNER_SHA256);
     expect(utf8ByteLength(built.command)).toBeLessThanOrEqual(REMOTE_EXEC_MAX_COMMAND_BYTES);
     expect(built.expectedStdout).toBe(`${LEGACY_WINDOWS_UPGRADE_RESTART_READY_PREFIX}:${RESTART_ID}`);
@@ -98,6 +98,13 @@ describe('legacy Windows controlled-node upgrade rescue', () => {
     expect(setup).toContain('legacy upgrade restart source main hash mismatch');
     expect(setup).toContain("Get-ScheduledTask -TaskName ($upgradePrefix + '*') -ErrorAction Stop");
     expect(setup).toContain('-notin @($rescueTask, $restartTask)');
+    expect(setup).toContain('$staleUpgradeCutoff = (Get-Date).AddMinutes(-15)');
+    expect(setup).toContain('Get-ScheduledTaskInfo -TaskName $upgradeTask.TaskName -ErrorAction Stop');
+    expect(setup).toContain('$isInert = [int]$upgradeTask.State -in @(1,3)');
+    expect(setup).toContain('$hasFutureRun = $upgradeTaskInfo.NextRunTime -and $upgradeTaskInfo.NextRunTime -gt (Get-Date)');
+    expect(setup).toContain('$upgradeTask.TaskName -match $upgradeTaskNamePattern');
+    expect(setup).toContain('Unregister-ScheduledTask -TaskName $upgradeTask.TaskName -Confirm:$false -ErrorAction Stop');
+    expect(setup).toContain("throw 'legacy stale upgrade task removal failed'");
     expect(setup).toContain("throw 'legacy upgrade task still registered'");
     expect(setup.indexOf("throw 'legacy upgrade task still registered'"))
       .toBeLessThan(setup.indexOf('Register-ScheduledTask -TaskName $restartTask'));

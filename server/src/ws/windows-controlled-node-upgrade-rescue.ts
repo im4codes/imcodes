@@ -245,9 +245,10 @@ export function buildLegacyWindowsUpgradeRescueCommand(rescueId: string): Legacy
 
 /**
  * Build a one-shot SYSTEM task that restarts a healthy legacy node process only
- * after its prior upgrade task has disappeared. The restart clears the old
- * runtime's process-local `upgradeInFlight` latch; the independent rescue task
- * remains armed while the Server retries the ordinary artifact upgrade.
+ * after its prior active upgrade task has disappeared. A completed, triggerless
+ * product task is removed after a grace period so a crashed legacy upgrader
+ * cannot permanently wedge `upgradeInFlight`; the independent rescue task stays
+ * armed while the Server retries the ordinary artifact upgrade.
  */
 export function buildLegacyWindowsUpgradeRestartCommand(
   rescueId: string,
@@ -297,7 +298,19 @@ export function buildLegacyWindowsUpgradeRestartCommand(
     + `$rescueTask = ${psSingleQuote(CONTROLLED_NODE_SERVICE.WINDOWS_LEGACY_UPGRADE_RESCUE_TASK)}\r\n`
     + `$restartTask = ${psSingleQuote(restartTask)}\r\n`
     + `$otherUpgradeTasks = @(Get-ScheduledTask -TaskName ($upgradePrefix + '*') -ErrorAction Stop | Where-Object { $_.TaskName.StartsWith($upgradePrefix, [StringComparison]::OrdinalIgnoreCase) -and $_.TaskName -notin @($rescueTask, $restartTask) })\r\n`
-    + `if ($otherUpgradeTasks.Count -gt 0) { throw 'legacy upgrade task still registered' }\r\n`
+    + `$activeUpgradeTasks = @()\r\n`
+    + `$staleUpgradeCutoff = (Get-Date).AddMinutes(-15)\r\n`
+    + `$upgradeTaskNamePattern = '^' + [regex]::Escape($upgradePrefix) + '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'\r\n`
+    + `foreach ($upgradeTask in $otherUpgradeTasks) {\r\n`
+    + `  $upgradeTaskInfo = Get-ScheduledTaskInfo -TaskName $upgradeTask.TaskName -ErrorAction Stop\r\n`
+    + `  $isInert = [int]$upgradeTask.State -in @(1,3)\r\n`
+    + `  $hasFutureRun = $upgradeTaskInfo.NextRunTime -and $upgradeTaskInfo.NextRunTime -gt (Get-Date)\r\n`
+    + `  $isExpiredProductTask = $upgradeTask.TaskName -match $upgradeTaskNamePattern -and $isInert -and -not $hasFutureRun -and $upgradeTaskInfo.LastRunTime -lt $staleUpgradeCutoff\r\n`
+    + `  if (-not $isExpiredProductTask) { $activeUpgradeTasks += $upgradeTask; continue }\r\n`
+    + `  Unregister-ScheduledTask -TaskName $upgradeTask.TaskName -Confirm:$false -ErrorAction Stop\r\n`
+    + `  if (Get-ScheduledTask -TaskName $upgradeTask.TaskName -ErrorAction SilentlyContinue) { throw 'legacy stale upgrade task removal failed' }\r\n`
+    + `}\r\n`
+    + `if ($activeUpgradeTasks.Count -gt 0) { throw 'legacy upgrade task still registered' }\r\n`
     + `$stagedWorker = $null\r\n`
     + `$scheduledMode = $null\r\n`
     + `$patchedUpgradeTask = $null\r\n`
