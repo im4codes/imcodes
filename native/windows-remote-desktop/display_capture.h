@@ -154,7 +154,8 @@ class DxgiDesktopSource : public webrtc::VideoTrackSource {
   bool InitializeDuplication();
   void ResetDuplication();
   void CaptureLoop();
-  bool CaptureOne();
+  bool CaptureOne(
+      CaptureWaitPolicy wait_policy = CaptureWaitPolicy::kReuseLastFrame);
   bool CaptureDesktopGdi();
   bool BroadcastStagingFrame();
   bool BindCaptureThreadToRequestedDesktop();

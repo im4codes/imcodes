@@ -477,7 +477,7 @@ void DxgiDesktopSource::CaptureLoop() {
         // Probe beside GDI for a bounded window and promote only after DXGI
         // has delivered a real frame.
         if (duplication_ && gdi_dxgi_probe_ticks_remaining_ > 0) {
-          if (CaptureOne()) {
+          if (CaptureOne(CaptureWaitPolicy::kRequireFreshFrame)) {
             gdi_active_ = false;
             gdi_dxgi_probe_ticks_remaining_ = 0;
             captured = true;
@@ -533,7 +533,7 @@ void DxgiDesktopSource::CaptureLoop() {
   CoUninitialize();
 }
 
-bool DxgiDesktopSource::CaptureOne() {
+bool DxgiDesktopSource::CaptureOne(CaptureWaitPolicy wait_policy) {
   DXGI_OUTDUPL_FRAME_INFO frame_info{};
   Microsoft::WRL::ComPtr<IDXGIResource> resource;
   const HRESULT acquired =
@@ -542,6 +542,12 @@ bool DxgiDesktopSource::CaptureOne() {
       ClassifyCaptureAcquireResult(acquired);
   if (acquire_action == CaptureAcquireAction::kWait) {
     last_capture_waited_ = true;
+    // A GDI recovery probe starts with the fallback's last_frame_. Reusing it
+    // here would falsely declare DXGI recovered and then freeze the session on
+    // that immutable GDI image. Only the ordinary active-DXGI path may reuse a
+    // cached frame while Desktop Duplication reports no desktop change.
+    if (!CanReuseCaptureFrameAfterWait(wait_policy, last_frame_ != nullptr))
+      return false;
     if constexpr (kEmbedRemoteCursorInVideo) {
       const CursorSnapshot cursor = ReadCursorSnapshot();
       if (cursor.available &&
@@ -558,7 +564,7 @@ bool DxgiDesktopSource::CaptureOne() {
         webrtc::Clock::GetRealTimeClock()->TimeInMicroseconds();
     if (last_frame_ && now_us - last_broadcast_us_ >= 2'000'000)
       BroadcastFrame(last_frame_);
-    return last_frame_ != nullptr;
+    return true;
   }
   if (acquire_action == CaptureAcquireAction::kReset) {
     ResetDuplication();
