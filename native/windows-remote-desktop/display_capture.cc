@@ -242,6 +242,33 @@ CursorSnapshotSource SelectCursorSnapshotSource(bool native_available,
   return CursorSnapshotSource::kNone;
 }
 
+bool CursorSnapshotChanged(const CursorSnapshot& previous,
+                           const CursorSnapshot& current) {
+  return previous.available != current.available ||
+         (current.available &&
+          (previous.position.x != current.position.x ||
+           previous.position.y != current.position.y ||
+           previous.handle != current.handle ||
+           previous.flags != current.flags));
+}
+
+namespace {
+
+CursorSnapshot ReadCursorSnapshot() {
+  CURSORINFO cursor{};
+  cursor.cbSize = sizeof(cursor);
+  CursorSnapshot snapshot;
+  snapshot.available = GetCursorInfo(&cursor) == TRUE;
+  if (snapshot.available) {
+    snapshot.position = cursor.ptScreenPos;
+    snapshot.handle = cursor.hCursor;
+    snapshot.flags = cursor.flags;
+  }
+  return snapshot;
+}
+
+}  // namespace
+
 bool SetDisplayDpiScale(const DisplayInfo& display, int percent) {
   static constexpr std::array<int, 12> kDpiScalePercents = {
       100, 125, 150, 175, 200, 225, 250, 300, 350, 400, 450, 500};
@@ -369,6 +396,7 @@ void DxgiDesktopSource::ResetDuplication() {
   device_.Reset();
   surface_width_ = 0;
   surface_height_ = 0;
+  last_cursor_snapshot_ = {};
   last_frame_ = nullptr;
   last_broadcast_us_ = 0;
 }
@@ -490,6 +518,12 @@ bool DxgiDesktopSource::CaptureOne() {
       ClassifyCaptureAcquireResult(acquired);
   if (acquire_action == CaptureAcquireAction::kWait) {
     last_capture_waited_ = true;
+    const CursorSnapshot cursor = ReadCursorSnapshot();
+    if (cursor.available &&
+        CursorSnapshotChanged(last_cursor_snapshot_, cursor) &&
+        BroadcastStagingFrame()) {
+      return true;
+    }
     // A completely static desktop may not yield another DXGI frame for a long
     // time. Re-submit the last immutable buffer at a bounded cadence so an
     // upstream PLI/keyframe request can recover without turning capture into a
@@ -536,23 +570,29 @@ bool DxgiDesktopSource::CaptureOne() {
     surface_height_ = desc.Height;
   }
   context_->CopyResource(staging_.Get(), texture.Get());
+  return BroadcastStagingFrame();
+}
+
+bool DxgiDesktopSource::BroadcastStagingFrame() {
+  if (!staging_ || !context_ || surface_width_ == 0 || surface_height_ == 0)
+    return false;
   D3D11_MAPPED_SUBRESOURCE mapped{};
   if (FAILED(context_->Map(staging_.Get(), 0, D3D11_MAP_READ, 0, &mapped)))
     return false;
-  const bool cursor_ready = EnsureCursorSurface(desc.Width, desc.Height);
+  const bool cursor_ready = EnsureCursorSurface(surface_width_, surface_height_);
   if (!cursor_ready) {
     context_->Unmap(staging_.Get(), 0);
     return false;
   }
-  for (UINT row = 0; row < desc.Height; ++row) {
-    std::memcpy(cursor_bits_ + static_cast<size_t>(row) * desc.Width * 4,
+  for (UINT row = 0; row < surface_height_; ++row) {
+    std::memcpy(cursor_bits_ + static_cast<size_t>(row) * surface_width_ * 4,
                 static_cast<const uint8_t*>(mapped.pData) +
                     static_cast<size_t>(row) * mapped.RowPitch,
-                static_cast<size_t>(desc.Width) * 4);
+                static_cast<size_t>(surface_width_) * 4);
   }
   context_->Unmap(staging_.Get(), 0);
-  return BroadcastBgraFrame(static_cast<int>(desc.Width),
-                            static_cast<int>(desc.Height));
+  return BroadcastBgraFrame(static_cast<int>(surface_width_),
+                            static_cast<int>(surface_height_));
 }
 
 bool DxgiDesktopSource::CaptureDesktopGdi() {
@@ -614,6 +654,7 @@ bool DxgiDesktopSource::BroadcastBgraFrame(int width, int height) {
     }
   }
   last_frame_ = output;
+  last_cursor_snapshot_ = ReadCursorSnapshot();
   BroadcastFrame(output);
   return true;
 }

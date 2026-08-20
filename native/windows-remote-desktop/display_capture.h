@@ -68,6 +68,13 @@ bool SetDisplayDpiScale(const DisplayInfo& display, int percent);
 
 enum class CursorSnapshotSource { kNone, kNative, kDxgi };
 
+struct CursorSnapshot {
+  bool available = false;
+  POINT position{};
+  HCURSOR handle = nullptr;
+  DWORD flags = 0;
+};
+
 // Prefer the live USER32 cursor whenever it is available. Some display
 // drivers stop advancing Desktop Duplication's cached pointer position after
 // a synthesized click even though SetCursorPos continues to move the real
@@ -75,6 +82,8 @@ enum class CursorSnapshotSource { kNone, kNative, kDxgi };
 // desktops where USER32 cannot expose one.
 CursorSnapshotSource SelectCursorSnapshotSource(bool native_available,
                                                 bool dxgi_available);
+bool CursorSnapshotChanged(const CursorSnapshot& previous,
+                           const CursorSnapshot& current);
 
 enum class CaptureFallback {
   kNone,
@@ -147,6 +156,7 @@ class DxgiDesktopSource : public webrtc::VideoTrackSource {
   void CaptureLoop();
   bool CaptureOne();
   bool CaptureDesktopGdi();
+  bool BroadcastStagingFrame();
   bool BindCaptureThreadToRequestedDesktop();
   bool BroadcastBgraFrame(int width, int height);
   void BroadcastFrame(
@@ -196,6 +206,7 @@ class DxgiDesktopSource : public webrtc::VideoTrackSource {
   bool pointer_shape_valid_ = false;
   bool pointer_position_known_ = false;
   bool pointer_visible_ = false;
+  CursorSnapshot last_cursor_snapshot_{};
   webrtc::scoped_refptr<webrtc::I420Buffer> last_frame_;
   int64_t last_broadcast_us_ = 0;
 

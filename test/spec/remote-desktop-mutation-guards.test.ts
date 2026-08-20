@@ -837,6 +837,13 @@ const contracts: Contract[] = [
         path: 'native/windows-remote-desktop/display_capture.cc',
         needle: 'SelectCursorSnapshotSource(native_available, dxgi_available)',
       },
+      {
+        // Some display stacks do not surface a synthetic hover as a new DXGI
+        // frame after the first click. Re-composite the live USER32 cursor on
+        // the last cursor-free staging texture instead of freezing the image.
+        path: 'native/windows-remote-desktop/display_capture.cc',
+        needle: 'CursorSnapshotChanged(last_cursor_snapshot_, cursor) &&\n        BroadcastStagingFrame()',
+      },
     ],
   },
   {
@@ -1442,6 +1449,12 @@ const mutations: Mutation[] = [
     contract: 'the remote pointer stays visible while it is driven',
     path: 'native/windows-remote-desktop/display_capture.cc',
     needle: 'SelectCursorSnapshotSource(native_available, dxgi_available)',
+  },
+  {
+    name: 'stop publishing cursor-only movement after a DXGI timeout',
+    contract: 'the remote pointer stays visible while it is driven',
+    path: 'native/windows-remote-desktop/display_capture.cc',
+    needle: 'CursorSnapshotChanged(last_cursor_snapshot_, cursor) &&\n        BroadcastStagingFrame()',
   },
   {
     name: 'decline a tracked session message while its worker is still starting',

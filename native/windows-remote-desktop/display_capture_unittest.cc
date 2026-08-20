@@ -118,6 +118,29 @@ TEST(DisplayCaptureTest, PrefersLiveNativeCursorOverCachedDxgiPosition) {
             CursorSnapshotSource::kNone);
 }
 
+TEST(DisplayCaptureTest, RequestsFrameWhenLiveCursorStateChanges) {
+  CursorSnapshot unavailable;
+  CursorSnapshot previous;
+  previous.available = true;
+  previous.position = POINT{10, 20};
+  previous.handle = reinterpret_cast<HCURSOR>(1);
+  previous.flags = CURSOR_SHOWING;
+
+  EXPECT_FALSE(CursorSnapshotChanged(unavailable, unavailable));
+  EXPECT_TRUE(CursorSnapshotChanged(unavailable, previous));
+  EXPECT_TRUE(CursorSnapshotChanged(previous, unavailable));
+  EXPECT_FALSE(CursorSnapshotChanged(previous, previous));
+  CursorSnapshot moved = previous;
+  moved.position.x = 11;
+  EXPECT_TRUE(CursorSnapshotChanged(previous, moved));
+  CursorSnapshot shape_changed = previous;
+  shape_changed.handle = reinterpret_cast<HCURSOR>(2);
+  EXPECT_TRUE(CursorSnapshotChanged(previous, shape_changed));
+  CursorSnapshot hidden = previous;
+  hidden.flags = 0;
+  EXPECT_TRUE(CursorSnapshotChanged(previous, hidden));
+}
+
 TEST(DisplayCaptureTest, ReportsSanitizedInteractiveTopology) {
   if (!InventoryEnabled()) {
     GTEST_SKIP() << "set IMCODES_RUN_DISPLAY_INVENTORY=1 in the active session";
