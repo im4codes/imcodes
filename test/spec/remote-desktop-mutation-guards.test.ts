@@ -831,7 +831,11 @@ const contracts: Contract[] = [
       },
       {
         path: 'native/windows-remote-desktop/display_capture.cc',
-        needle: '(cursor.flags & (CURSOR_SHOWING | CURSOR_SUPPRESSED)) == 0',
+        needle: '(cursor.flags & (CURSOR_SHOWING | CURSOR_SUPPRESSED)) != 0',
+      },
+      {
+        path: 'native/windows-remote-desktop/display_capture.cc',
+        needle: 'SelectCursorSnapshotSource(native_available, dxgi_available)',
       },
     ],
   },
@@ -1432,6 +1436,12 @@ const mutations: Mutation[] = [
     contract: 'the remote pointer stays visible while it is driven',
     path: 'native/windows-remote-desktop/local_indicator.cc',
     needle: 'if (request->accepted && PointerSuppressed())',
+  },
+  {
+    name: 'stop preferring the live native pointer over a stale DXGI snapshot',
+    contract: 'the remote pointer stays visible while it is driven',
+    path: 'native/windows-remote-desktop/display_capture.cc',
+    needle: 'SelectCursorSnapshotSource(native_available, dxgi_available)',
   },
   {
     name: 'decline a tracked session message while its worker is still starting',
