@@ -1127,32 +1127,18 @@ export function RemoteDesktopPanel({
       }
       clientRef.current?.pointerMove(point.x, point.y);
     };
-    const onWindowMouseMove = (event: globalThis.MouseEvent) => {
-      sendDesktopPointerMove(event.clientX, event.clientY);
-    };
     const onWindowPointerMove = (event: globalThis.PointerEvent) => {
-      // Mouse hardware emits the long-established mousemove event as well as a
-      // pointer event. Use mousemove as its single source: after a floating
-      // window receives focus Chromium/WebKit may retarget pointer events to a
-      // gesture or drag owner, which made event.target-based hover freeze after
-      // the first click. Pens do not have that compatibility stream.
-      if (event.pointerType === 'pen') {
-        sendDesktopPointerMove(event.clientX, event.clientY);
-      }
+      if (event.pointerType === 'touch') return;
+      sendDesktopPointerMove(event.clientX, event.clientY);
     };
     // Capture before floating-window drag/gesture owners or descendants can
     // stop propagation. Coordinates, not event.target ownership, decide
     // whether the pointer is over the presented desktop.
-    window.addEventListener('mousemove', onWindowMouseMove, {
-      capture: true,
-      passive: true,
-    });
     window.addEventListener('pointermove', onWindowPointerMove, {
       capture: true,
       passive: true,
     });
     return () => {
-      window.removeEventListener('mousemove', onWindowMouseMove, true);
       window.removeEventListener('pointermove', onWindowPointerMove, true);
     };
   }, [normalizedClientPoint]);
