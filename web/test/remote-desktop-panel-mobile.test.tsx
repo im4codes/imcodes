@@ -164,22 +164,16 @@ function mousePointer(
   target.dispatchEvent(event);
 }
 
-function nativeMousePointerMove(
-  target: Element,
-  values: { pointerId: number; clientX: number; clientY: number; metaKey?: boolean },
+function nativeMouseMove(
+  target: EventTarget,
+  values: { clientX: number; clientY: number },
 ): void {
-  const event = new MouseEvent('pointermove', {
+  target.dispatchEvent(new MouseEvent('mousemove', {
     bubbles: true,
     cancelable: true,
     clientX: values.clientX,
     clientY: values.clientY,
-    metaKey: values.metaKey ?? false,
-  });
-  Object.defineProperties(event, {
-    pointerId: { value: values.pointerId },
-    pointerType: { value: 'mouse' },
-  });
-  target.dispatchEvent(event);
+  }));
 }
 
 async function renderPanel(
@@ -783,9 +777,7 @@ describe('RemoteDesktopPanel mobile gestures', () => {
       mousePointer(stage, 'pointerdown', {
         pointerId: 19, clientX: 200, clientY: 150, metaKey: true,
       });
-      nativeMousePointerMove(stage, {
-        pointerId: 19, clientX: 300, clientY: 150, metaKey: true,
-      });
+      nativeMouseMove(stage, { clientX: 300, clientY: 150 });
       mousePointer(stage, 'pointerup', {
         pointerId: 19, clientX: 300, clientY: 150, metaKey: false,
       });
@@ -817,20 +809,44 @@ describe('RemoteDesktopPanel mobile gestures', () => {
   it('keeps sending desktop hover through the window capture path after a click', async () => {
     // A real desktop engine can stop the native video event before it bubbles
     // to the stage after pointer capture is released. The window capture path
-    // must see the move first, otherwise reconnecting briefly fixes hover until
-    // the first click and then the remote cursor freezes again.
+    // must see the compatibility mouse move first, otherwise reconnecting
+    // briefly fixes hover until the first click and then the cursor freezes.
     const { container, stage } = await renderPanel();
     const video = container.querySelector('video');
     expect(video).not.toBeNull();
-    video?.addEventListener('pointermove', (event) => event.stopPropagation());
+    video?.addEventListener('mousemove', (event) => event.stopPropagation());
     pointerMove.mockClear();
     act(() => {
       mousePointer(stage, 'pointerdown', { pointerId: 21, clientX: 200, clientY: 150 });
       mousePointer(stage, 'pointerup', { pointerId: 21, clientX: 200, clientY: 150 });
       mousePointer(stage, 'lostpointercapture', { pointerId: 21, clientX: 200, clientY: 150 });
-      nativeMousePointerMove(video!, { pointerId: 21, clientX: 200, clientY: 150 });
-      nativeMousePointerMove(video!, { pointerId: 21, clientX: 300, clientY: 150 });
+      nativeMouseMove(video!, { clientX: 200, clientY: 150 });
+      nativeMouseMove(video!, { clientX: 300, clientY: 150 });
     });
+    expect(pointerMove.mock.calls).toEqual([[0.5, 0.5], [0.75, 0.5]]);
+  });
+
+  it('keeps sending hover when focus retargets mouse movement outside the stage', async () => {
+    const { container } = await renderPanel();
+    const header = container.querySelector('.remote-desktop-header');
+    expect(header).not.toBeNull();
+    pointerMove.mockClear();
+
+    act(() => {
+      header!.dispatchEvent(new MouseEvent('mousedown', {
+        bubbles: true,
+        cancelable: true,
+        clientX: 20,
+        clientY: 20,
+      }));
+      document.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+      // Focused floating windows and native gesture layers may retarget the
+      // desktop mouse event to document even though its coordinates are over
+      // the video. Hit-testing by event.target freezes hover after that click.
+      nativeMouseMove(document, { clientX: 200, clientY: 150 });
+      nativeMouseMove(document, { clientX: 300, clientY: 150 });
+    });
+
     expect(pointerMove.mock.calls).toEqual([[0.5, 0.5], [0.75, 0.5]]);
   });
 
@@ -838,12 +854,8 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     const { container, stage } = await renderPanel();
     pointerMove.mockClear();
     act(() => {
-      nativeMousePointerMove(stage, {
-        pointerId: 18, clientX: 4, clientY: 150,
-      });
-      nativeMousePointerMove(stage, {
-        pointerId: 18, clientX: 396, clientY: 150,
-      });
+      nativeMouseMove(stage, { clientX: 4, clientY: 150 });
+      nativeMouseMove(stage, { clientX: 396, clientY: 150 });
     });
 
     // A mouse lands where it is pointed: 1% in from the edge is a real pixel

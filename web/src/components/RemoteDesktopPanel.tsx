@@ -1109,30 +1109,53 @@ export function RemoteDesktopPanel({
   }, []);
 
   useEffect(() => {
-    const onWindowPointerMove = (event: globalThis.PointerEvent) => {
-      if (event.pointerType === 'touch') return;
+    const sendDesktopPointerMove = (clientX: number, clientY: number) => {
       const stage = stageRef.current;
-      const target = event.target;
-      if (!stage || !(target instanceof Node) || !stage.contains(target)) return;
+      if (!stage) return;
+      const stageRect = stage.getBoundingClientRect();
+      if (clientX < stageRect.left || clientY < stageRect.top
+        || clientX > stageRect.right || clientY > stageRect.bottom) return;
       pointerMovesSeenRef.current += 1;
-      const point = normalizedDesktopPointerPoint(event);
+      const normalized = normalizedClientPoint(clientX, clientY);
+      const point = normalized && stickRemoteDesktopPointerToEdges(
+        normalized,
+        REMOTE_DESKTOP_POINTER_EDGE_STICKY_RATIO_PRECISE,
+      );
       if (!point) {
         pointerMovesUnmappedRef.current += 1;
         return;
       }
       clientRef.current?.pointerMove(point.x, point.y);
     };
-    // Capture before descendants or browser-native video handling can stop the
-    // event. In particular, pointer capture is released after a click and some
-    // desktop engines then stop delivering the stage's bubbling hover handler.
-    // A window capture listener keeps absolute mouse motion alive across that
-    // transition without changing the mobile touch gesture path.
+    const onWindowMouseMove = (event: globalThis.MouseEvent) => {
+      sendDesktopPointerMove(event.clientX, event.clientY);
+    };
+    const onWindowPointerMove = (event: globalThis.PointerEvent) => {
+      // Mouse hardware emits the long-established mousemove event as well as a
+      // pointer event. Use mousemove as its single source: after a floating
+      // window receives focus Chromium/WebKit may retarget pointer events to a
+      // gesture or drag owner, which made event.target-based hover freeze after
+      // the first click. Pens do not have that compatibility stream.
+      if (event.pointerType === 'pen') {
+        sendDesktopPointerMove(event.clientX, event.clientY);
+      }
+    };
+    // Capture before floating-window drag/gesture owners or descendants can
+    // stop propagation. Coordinates, not event.target ownership, decide
+    // whether the pointer is over the presented desktop.
+    window.addEventListener('mousemove', onWindowMouseMove, {
+      capture: true,
+      passive: true,
+    });
     window.addEventListener('pointermove', onWindowPointerMove, {
       capture: true,
       passive: true,
     });
-    return () => window.removeEventListener('pointermove', onWindowPointerMove, true);
-  }, [normalizedDesktopPointerPoint]);
+    return () => {
+      window.removeEventListener('mousemove', onWindowMouseMove, true);
+      window.removeEventListener('pointermove', onWindowPointerMove, true);
+    };
+  }, [normalizedClientPoint]);
 
   const onStagePointerMove = (event: PointerEvent) => {
     if (event.pointerType === 'touch') onTouchMove(event);
