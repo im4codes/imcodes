@@ -8,6 +8,13 @@ import {
   validateRemoteDesktopInstallStateMessage,
   type RemoteDesktopInstallState,
 } from '@shared/remote-desktop-install.js';
+import {
+  REMOTE_DESKTOP_ELEVATED_CAPABILITY,
+  REMOTE_DESKTOP_ELEVATED_INSTALL_MSG,
+  REMOTE_DESKTOP_ELEVATED_STATE,
+  validateRemoteDesktopElevatedStateMessage,
+  type RemoteDesktopElevatedState,
+} from '@shared/remote-desktop-elevated.js';
 import type { WsClient } from '../ws-client.js';
 import { daemonRemoteDesktopMachine, type MachineListItem } from '../api/machines.js';
 
@@ -41,6 +48,7 @@ export function DaemonRemoteDesktopControl({
   const { t } = useTranslation();
   const [capabilities, setCapabilities] = useState<readonly string[]>([]);
   const [install, setInstall] = useState<{ state: RemoteDesktopInstallState; error?: string } | null>(null);
+  const [elevated, setElevated] = useState<{ state: RemoteDesktopElevatedState; error?: string } | null>(null);
 
   useEffect(() => {
     if (!ws) {
@@ -58,6 +66,13 @@ export function DaemonRemoteDesktopControl({
     return ws.onMessage((message) => {
       const state = validateRemoteDesktopInstallStateMessage(message);
       if (state) setInstall({ state: state.state, ...(state.error ? { error: state.error } : {}) });
+      const elevatedState = validateRemoteDesktopElevatedStateMessage(message);
+      if (elevatedState) {
+        setElevated({
+          state: elevatedState.state,
+          ...(elevatedState.error ? { error: elevatedState.error } : {}),
+        });
+      }
     });
   }, [ws]);
 
@@ -66,7 +81,7 @@ export function DaemonRemoteDesktopControl({
   if (!serverId || !daemonOnline || (!ready && !installable)) return null;
 
   if (ready) {
-    return (
+    const control = (
       <button
         class="view-toggle daemon-remote-desktop-btn"
         title={t('remote_desktop.daemon_control')}
@@ -74,6 +89,36 @@ export function DaemonRemoteDesktopControl({
       >
         🖥{compact ? '' : ` ${t('remote_desktop.daemon_control')}`}
       </button>
+    );
+    const elevatedReady = capabilities.includes(REMOTE_DESKTOP_ELEVATED_CAPABILITY)
+      || elevated?.state === REMOTE_DESKTOP_ELEVATED_STATE.INSTALLED;
+    // Offered on the status card only: the status bar has no room for a second
+    // button, and this is a one-time setup step rather than a daily action.
+    if (compact || elevatedReady) return control;
+    const elevating = elevated?.state === REMOTE_DESKTOP_ELEVATED_STATE.ELEVATING;
+    const elevateFailed = elevated?.state === REMOTE_DESKTOP_ELEVATED_STATE.FAILED;
+    return (
+      <>
+        {control}
+        <button
+          class="view-toggle daemon-remote-desktop-btn"
+          style={elevateFailed ? { color: '#f87171', borderColor: '#7f1d1d' } : undefined}
+          disabled={elevating}
+          title={elevateFailed
+            ? t(`remote_desktop.elevated_error_${elevated?.error ?? 'install_failed'}`, {
+              defaultValue: t('remote_desktop.elevated_failed'),
+            })
+            : t('remote_desktop.elevated_hint')}
+          onClick={() => {
+            setElevated({ state: REMOTE_DESKTOP_ELEVATED_STATE.ELEVATING });
+            ws?.send({ type: REMOTE_DESKTOP_ELEVATED_INSTALL_MSG.REQUEST });
+          }}
+        >
+          {elevating
+            ? <><span class="connecting-dot" />{` ${t('remote_desktop.elevated_waiting')}`}</>
+            : `🔒 ${t(elevateFailed ? 'remote_desktop.elevated_retry' : 'remote_desktop.elevated_enable')}`}
+        </button>
+      </>
     );
   }
 

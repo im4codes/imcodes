@@ -3110,6 +3110,15 @@
     "install_error_not_bound": "このデーモンはサーバーに接続されていません",
     "install_error_download_failed": "ダウンロードに失敗しました。接続を確認して再試行してください",
     "install_error_verification_failed": "ダウンロードしたコンポーネントの署名検証に失敗しました",
-    "install_error_not_available": "このサーバーにはこのプラットフォーム向けのコンポーネントがまだありません"
+    "install_error_not_available": "このサーバーにはこのプラットフォーム向けのコンポーネントがまだありません",
+    "elevated_enable": "サインイン画面を有効化",
+    "elevated_retry": "サインイン画面の設定をやり直す",
+    "elevated_hint": "サインイン画面とロック画面も操作できます。そのマシンで管理者の承認が一度必要です。",
+    "elevated_waiting": "承認を待っています…",
+    "elevated_failed": "サインイン画面の設定に失敗しました",
+    "elevated_error_unsupported_platform": "サインイン画面の操作には Windows x64 が必要です",
+    "elevated_error_worker_missing": "まずリモート操作を有効にしてください",
+    "elevated_error_install_failed": "特権ヘルパーが起動しませんでした",
+    "elevated_error_elevation_declined": "そのマシンで管理者の承認が得られませんでした"
   }
 }
