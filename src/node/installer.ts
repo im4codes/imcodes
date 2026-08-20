@@ -114,12 +114,16 @@ function windowsWatchdogStartBoundary(now: Date): string {
  * main task cannot distinguish an authenticated node from a live-but-detached
  * process when MultipleInstancesPolicy is IgnoreNew.
  */
-export function windowsScheduledTaskXml(exePath: string, now: Date = new Date()): string {
+export function windowsScheduledTaskXml(
+  exePath: string,
+  now: Date = new Date(),
+  options: { description?: string; arguments?: readonly string[] } = {},
+): string {
   void now;
   return `<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
-    <Description>IM.codes controlled node</Description>
+    <Description>${escapeXmlText(options.description ?? 'IM.codes controlled node')}</Description>
   </RegistrationInfo>
   <Triggers>
     <BootTrigger>
@@ -152,7 +156,10 @@ export function windowsScheduledTaskXml(exePath: string, now: Date = new Date())
   </Settings>
   <Actions Context="System">
     <Exec>
-      <Command>${escapeXmlText(exePath)}</Command>
+      <Command>${escapeXmlText(exePath)}</Command>${options.arguments?.length
+        ? `
+      <Arguments>${escapeXmlText(options.arguments.join(' '))}</Arguments>`
+        : ''}
     </Exec>
   </Actions>
 </Task>
@@ -274,9 +281,12 @@ export function encodeWindowsScheduledTaskXml(xml: string): Buffer {
 }
 
 /** Windows `schtasks /Create` args for an XML task definition. */
-export function windowsScheduledTaskArgs(taskXmlPath: string): string[] {
+export function windowsScheduledTaskArgs(
+  taskXmlPath: string,
+  taskName: string = CONTROLLED_NODE_SERVICE.WINDOWS_TASK,
+): string[] {
   return [
-    '/Create', '/TN', CONTROLLED_NODE_SERVICE.WINDOWS_TASK,
+    '/Create', '/TN', taskName,
     '/XML', taskXmlPath, '/F',
   ];
 }

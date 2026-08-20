@@ -1654,15 +1654,17 @@ describe('GET /api/enroll/v2/node-artifact (controlled-node self-upgrade)', () =
     expect(Buffer.from(await legacyMacHelperResponse.arrayBuffer())).toEqual(macArchiveBytes);
   });
 
-  it('rejects full daemon tokens for the runtime but admits them for the remote-desktop worker', async () => {
+  it('admits full daemon tokens for the remote-desktop bundle and the runtime that hosts it', async () => {
     const app = buildApp();
     const userId = `u_${hex(4)}`;
     await createUser(db, userId);
     const full = await owner(userId);
+    // The runtime carries the elevated remote-desktop helper, which cannot be
+    // executed out of the daemon's user-writable npm directory.
     const fullResponse = await app.request(`/api/enroll/v2/node-artifact?serverId=${full.serverId}&os=win&arch=x64`, {
       headers: { authorization: `Bearer ${full.token}` },
     });
-    expect(fullResponse.status).toBe(403);
+    expect(fullResponse.status).not.toBe(403);
 
     // The worker bundle is the one artifact family a normal daemon may fetch:
     // on Windows it serves remote control with the same native worker. Only the

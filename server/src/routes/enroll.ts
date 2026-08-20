@@ -947,11 +947,22 @@ enrollRoutes.get('/v2/node-artifact', async (c) => {
   );
   if (!server || server.token_hash !== tokenHash) return c.json({ error: 'unauthorized' }, 401);
   if (server.revoked_at != null) return c.json({ error: 'revoked' }, 403);
-  // A normal (FULL) daemon may fetch the remote-desktop worker bundle and
-  // nothing else: on Windows it serves remote control with the same native
-  // worker a controlled node runs. `node_role` is NULL on legacy daemon rows,
-  // so "not controlled" is the same test the daemon server list uses.
-  if (server.node_role !== NODE_ROLE.CONTROLLED && !isRemoteDesktopArtifactAsset(asset)) {
+  // A normal (FULL) daemon may fetch the remote-desktop bundle, and the runtime
+  // executable that carries its elevated helper.
+  //
+  // The worker is the same native binary a controlled node runs. The runtime is
+  // needed because a daemon's own code lives in a user-writable npm directory,
+  // and nothing user-writable may be what a LocalSystem service executes — so
+  // enabling login-screen control installs this signed, Authenticode-verified
+  // executable into a SYSTEM-owned directory and runs the helper out of that.
+  // Both cross the same trust boundary the daemon already accepts: this server
+  // can run commands on that machine through its own sessions.
+  //
+  // `node_role` is NULL on legacy daemon rows, so "not controlled" is the same
+  // test the daemon server list uses.
+  if (server.node_role !== NODE_ROLE.CONTROLLED
+    && !isRemoteDesktopArtifactAsset(asset)
+    && asset !== CONTROLLED_NODE_ARTIFACT_ASSETS.NODE) {
     return c.json({ error: 'forbidden' }, 403);
   }
   if ((server.os && server.arch
