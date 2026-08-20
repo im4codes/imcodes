@@ -45,8 +45,9 @@ export function allowWindowsNamedPipeClients(
   });
 }
 
-function powershellBase64(value: string): string {
-  return Buffer.from(value, 'utf16le').toString('base64');
+function powershellStdinCommand(value: string): string {
+  const encoded = Buffer.from(value, 'utf8').toString('base64');
+  return `$script = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${encoded}')); & ([ScriptBlock]::Create($script))`;
 }
 
 /**
@@ -295,15 +296,21 @@ Add-Type -TypeDefinition $src
     .replace('__ALLOW_SECURE_DESKTOP__', allowSecureDesktopFallback ? '$true' : '$false')
     .replace('__FORCE_SECURE_CONSOLE__', forceSecureConsole ? '$true' : '$false');
   const options: SpawnOptions = {
-    stdio: 'ignore',
+    // The embedded launcher is larger than Windows' 32,767-character process
+    // command-line limit. Feeding it through stdin keeps argv bounded while
+    // preserving the same immutable script and avoids exposing its arguments
+    // through process inspection.
+    stdio: ['pipe', 'ignore', 'ignore'],
     windowsHide: true,
   };
   const child = spawnImpl(
     'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe',
-    ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', powershellBase64(linkedTokenScript)],
+    ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', '-'],
     options,
   );
   child.on('error', () => {});
+  child.stdin?.on('error', () => {});
+  child.stdin?.end(powershellStdinCommand(linkedTokenScript), 'utf8');
   child.unref();
 }
 

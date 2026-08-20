@@ -88,6 +88,12 @@ function quotedArgs(argsLine: string): string[] {
   return [...argsLine.matchAll(/"([^"]*)"/g)].map((match) => match[1]!);
 }
 
+function decodePowerShellStdinCommand(value: string): string {
+  const encoded = value.match(/FromBase64String\('([^']+)'\)/)?.[1];
+  if (!encoded) throw new Error('PowerShell stdin command did not contain the launcher');
+  return Buffer.from(encoded, 'base64').toString('utf8');
+}
+
 describe('remote desktop worker artifact and IPC host', () => {
   it('accepts only the exact pinned immutable manifest contract', () => {
     expect(validateRemoteDesktopWorkerManifest(manifest)).toEqual(manifest);
@@ -196,7 +202,15 @@ describe('remote desktop worker artifact and IPC host', () => {
 
   it('launches from a non-inherited active-user environment without daemon credentials', () => {
     let launchArgs: readonly string[] = [];
-    const child = new EventEmitter() as EventEmitter & { unref(): void };
+    let script = '';
+    const child = new EventEmitter() as EventEmitter & {
+      stdin: EventEmitter & { end(value: string, encoding: BufferEncoding): void };
+      unref(): void;
+    };
+    child.stdin = new EventEmitter() as typeof child.stdin;
+    child.stdin.end = (value, encoding) => {
+      script = decodePowerShellStdinCommand(Buffer.from(value, encoding).toString('utf8'));
+    };
     child.unref = () => {};
     const previous = process.env.IMCODES_NODE_TOKEN;
     process.env.IMCODES_NODE_TOKEN = 'must-not-be-inherited-by-worker';
@@ -213,8 +227,9 @@ describe('remote desktop worker artifact and IPC host', () => {
       if (previous === undefined) delete process.env.IMCODES_NODE_TOKEN;
       else process.env.IMCODES_NODE_TOKEN = previous;
     }
-    const encodedIndex = launchArgs.indexOf('-EncodedCommand') + 1;
-    const script = Buffer.from(launchArgs[encodedIndex]!, 'base64').toString('utf16le');
+    expect(launchArgs).toEqual([
+      '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', '-',
+    ]);
     expect(script).toContain('CreateEnvironmentBlock(out env, primary, false)');
     expect(script).toContain('WTSGetActiveConsoleSessionId');
     expect(script).toContain('s.State == WTSDisconnected');
@@ -231,7 +246,15 @@ describe('remote desktop worker artifact and IPC host', () => {
 
   it('uses only the active administrator linked token for the verified desktop worker', () => {
     let launchArgs: readonly string[] = [];
-    const child = new EventEmitter() as EventEmitter & { unref(): void };
+    let script = '';
+    const child = new EventEmitter() as EventEmitter & {
+      stdin: EventEmitter & { end(value: string, encoding: BufferEncoding): void };
+      unref(): void;
+    };
+    child.stdin = new EventEmitter() as typeof child.stdin;
+    child.stdin.end = (value, encoding) => {
+      script = decodePowerShellStdinCommand(Buffer.from(value, encoding).toString('utf8'));
+    };
     child.unref = () => {};
     launchWindowsActiveUserElevatedCommand(
       artifact.executablePath,
@@ -241,8 +264,9 @@ describe('remote desktop worker artifact and IPC host', () => {
         return child;
       }) as never,
     );
-    const encodedIndex = launchArgs.indexOf('-EncodedCommand') + 1;
-    const script = Buffer.from(launchArgs[encodedIndex]!, 'base64').toString('utf16le');
+    expect(launchArgs).toEqual([
+      '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', '-',
+    ]);
     expect(script).toContain('const int TokenLinkedToken = 19;');
     expect(script).toContain('elevationType == TokenElevationTypeLimited');
     expect(script).toContain('launchToken = linkedToken;');
@@ -252,7 +276,15 @@ describe('remote desktop worker artifact and IPC host', () => {
 
   it('launches the authenticated SYSTEM worker in the selected user session before falling back to console', () => {
     let launchArgs: readonly string[] = [];
-    const child = new EventEmitter() as EventEmitter & { unref(): void };
+    let script = '';
+    const child = new EventEmitter() as EventEmitter & {
+      stdin: EventEmitter & { end(value: string, encoding: BufferEncoding): void };
+      unref(): void;
+    };
+    child.stdin = new EventEmitter() as typeof child.stdin;
+    child.stdin.end = (value, encoding) => {
+      script = decodePowerShellStdinCommand(Buffer.from(value, encoding).toString('utf8'));
+    };
     child.unref = () => {};
     launchWindowsRemoteDesktopCommand(
       artifact.executablePath,
@@ -262,8 +294,9 @@ describe('remote desktop worker artifact and IPC host', () => {
         return child;
       }) as never,
     );
-    const encodedIndex = launchArgs.indexOf('-EncodedCommand') + 1;
-    const script = Buffer.from(launchArgs[encodedIndex]!, 'base64').toString('utf16le');
+    expect(launchArgs).toEqual([
+      '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', '-',
+    ]);
     expect(script).toContain('WindowsIdentity.GetCurrent().User.Value != "S-1-5-18"');
     expect(script).toContain('SetTokenInformation(primary, TokenSessionId, ref sid, sizeof(int))');
     expect(script).toContain('if (TryInteractiveSessionId(out sid))');

@@ -500,6 +500,10 @@ const contracts: Contract[] = [
     guards: [
       {
         path: 'src/node/windows-user-session.ts',
+        needle: "child.stdin?.end(powershellStdinCommand(linkedTokenScript), 'utf8');",
+      },
+      {
+        path: 'src/node/windows-user-session.ts',
         needle: 'StartSystemInSession(exe, argsLine, sid,',
       },
       {
