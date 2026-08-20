@@ -34,6 +34,8 @@ import {
   DSH_BRIDGE_RESUME_ENV,
   DSH_BRIDGE_TOOL_STATUS,
   DSH_BRIDGE_TURN_REASON,
+  DSH_LLM_PI_AI_ROW_ID,
+  DSH_PROVIDER_API_KEY_ENV,
   type DshBridgeEvent,
 } from '../../shared/deepseek-harness.js';
 import {
@@ -405,6 +407,22 @@ describe('DeepseekHarnessProvider', () => {
     expect(env[DSH_BRIDGE_MODEL_ENV]).toBe('deepseek-reasoner');
   });
 
+  it('passes a ccPreset credential only through the private child environment', async () => {
+    const llm = {
+      provider: 'minimax',
+      model: 'MiniMax-M3',
+      baseUrl: 'https://api.minimax.io/anthropic',
+      apiKey: 'sk-child-only',
+    };
+    const sessionId = await startSession({ agentId: llm.model, llm });
+    await provider.send(sessionId, 'hi');
+    await flush();
+
+    expect(writeDshOverlayMock).toHaveBeenCalledWith(expect.objectContaining({ llm }));
+    const env = (spawnMock.mock.calls[0][2] as { env: Record<string, string> }).env;
+    expect(env[DSH_PROVIDER_API_KEY_ENV]).toBe('sk-child-only');
+  });
+
   it('keeps the requested model pinned when the harness reports a different one', async () => {
     const sessionId = await startSession({ agentId: 'deepseek-reasoner' });
     await provider.send(sessionId, 'hi');
@@ -474,7 +492,9 @@ describe('DeepseekHarnessProvider', () => {
       return child;
     });
     const sessionId = await startSession();
-    await expect(provider.send(sessionId, 'hi')).rejects.toThrow(/ENOENT/);
+    await expect(provider.send(sessionId, 'hi')).rejects.toThrow(
+      /npm install -g @deepseek-ai\/dsh@0\.1\.0-rc\.7/,
+    );
 
     const healthy = new FakeChild();
     spawnMock.mockImplementation(() => {
@@ -599,23 +619,32 @@ describe('buildDshOverlay', () => {
     expect(rows.some((row) => row.id === 'agent-default-model')).toBe(false);
   });
 
-  it('emits a top-level agent-default-model row when a ccPreset LLM config is supplied', () => {
+  it('registers a ccPreset route without serializing its credential', () => {
     const rows = buildDshOverlay({
       llm: {
         provider: 'minimax',
         model: 'MiniMax-M.27',
         baseUrl: 'https://api.minimax.io/anthropic',
         apiKey: 'sk-test-key',
+        contextWindow: 1_000_000,
       },
     });
-    // The model row is a TOP-LEVEL row, not inside `insert`.
+    const adapterRow = rows.find((row) => row.id === DSH_LLM_PI_AI_ROW_ID);
+    expect(adapterRow?.config).toEqual({
+      providers: {
+        minimax: {
+          api: 'anthropic-messages',
+          baseURL: 'https://api.minimax.io/anthropic',
+          apiKeyEnv: DSH_PROVIDER_API_KEY_ENV,
+          models: [{ id: 'MiniMax-M.27', contextWindow: 1_000_000 }],
+        },
+      },
+    });
     const modelRow = rows.find((row) => row.id === DSH_AGENT_DEFAULT_MODEL_ROW_ID);
-    expect(modelRow).toBeDefined();
-    expect(modelRow?.config).toMatchObject({
+    expect(modelRow?.config).toEqual({
       provider: 'minimax',
       model: 'MiniMax-M.27',
-      baseUrl: 'https://api.minimax.io/anthropic',
-      apiKey: 'sk-test-key',
     });
+    expect(JSON.stringify(rows)).not.toContain('sk-test-key');
   });
 });

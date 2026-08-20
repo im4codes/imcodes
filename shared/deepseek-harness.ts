@@ -174,9 +174,16 @@ export const DSH_BRIDGE_PLUGIN_ID = 'imcodes-dsh-bridge';
 /** Cordis loader row id of the agent's default model selection. */
 export const DSH_AGENT_DEFAULT_MODEL_ROW_ID = 'agent-default-model';
 
+/** Cordis loader row id of dsh's generic provider adapter. */
+export const DSH_LLM_PI_AI_ROW_ID = 'llm-pi-ai';
+
+/** Private child-process credential reference used by the generated overlay. */
+export const DSH_PROVIDER_API_KEY_ENV = 'IMCODES_DSH_PROVIDER_API_KEY';
+
 /**
- * LLM config the daemon writes into the overlay so dsh talks to the
- * ccPreset's endpoint on the first turn (settings-based, not env).
+ * LLM config the daemon maps onto dsh's generic provider adapter so it talks
+ * to the ccPreset endpoint on the first turn. The key itself is passed only
+ * through the child environment; generated overlay files contain its env ref.
  */
 export interface DshLlmConfig {
   /** Registered provider route key (e.g. the normalized preset name 'minimax'). */
@@ -187,6 +194,8 @@ export interface DshLlmConfig {
   baseUrl?: string;
   /** API key / auth token for the provider. */
   apiKey?: string;
+  /** Context capacity advertised for the selected model. */
+  contextWindow?: number;
 }
 
 /** Environment variable carrying the session id the bridge should resume. */
@@ -198,11 +207,9 @@ export const DSH_BRIDGE_CWD_ENV = 'IMCODES_DSH_CWD';
 /**
  * Environment variable pinning the model for the agent the bridge creates.
  *
- * The model rides here rather than in the loader overlay because the harness's
- * `agent-default-model` row needs a provider ROUTE as well, and that route is
- * only knowable after a first boot. `agents.create()` takes the model directly,
- * so the bridge can honour IM.codes' choice on the very first turn while the
- * route still comes from the user's own `~/.dsh` selection.
+ * This remains as a model-only fallback for sessions without a ccPreset. With
+ * a ccPreset, the generated overlay registers both its route and model before
+ * the bridge creates the agent.
  */
 export const DSH_BRIDGE_MODEL_ENV = 'IMCODES_DSH_MODEL';
 

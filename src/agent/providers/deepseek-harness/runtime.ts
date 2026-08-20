@@ -33,6 +33,8 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import {
   DSH_AGENT_DEFAULT_MODEL_ROW_ID,
   DSH_BRIDGE_PLUGIN_ID,
+  DSH_LLM_PI_AI_ROW_ID,
+  DSH_PROVIDER_API_KEY_ENV,
   type DshLlmConfig,
 } from '../../../../shared/deepseek-harness.js';
 import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../../../shared/memory-mcp-server-name.js';
@@ -55,8 +57,30 @@ export const DSH_BINARY_ENV = 'IMCODES_DSH_BIN';
 /** Default executable looked up on PATH. */
 export const DSH_DEFAULT_BINARY = 'dsh';
 
+/** Harness release whose bridge/profile contract this adapter targets. */
+export const DSH_SUPPORTED_PACKAGE = '@deepseek-ai/dsh@0.1.0-rc.7';
+
+/** User-facing repair command when the external Harness CLI is absent. */
+export const DSH_INSTALL_COMMAND = `npm install -g ${DSH_SUPPORTED_PACKAGE}`;
+
 export function resolveDshBinary(): string {
   return process.env[DSH_BINARY_ENV]?.trim() || DSH_DEFAULT_BINARY;
+}
+
+/**
+ * Turn a missing external CLI into an actionable error without silently
+ * downloading third-party code.  `dsh` intentionally remains an external
+ * prerequisite; users decide when to install it on the daemon host.
+ */
+export function formatDshLaunchError(error: unknown, binary = resolveDshBinary()): string {
+  const code = error && typeof error === 'object' && 'code' in error
+    ? String((error as NodeJS.ErrnoException).code ?? '')
+    : '';
+  const detail = error instanceof Error ? error.message : String(error);
+  if (code === 'ENOENT' || /\bENOENT\b|not found/i.test(detail)) {
+    return `DeepSeek Harness (dsh) is not installed on this daemon host. Install it, then retry: ${DSH_INSTALL_COMMAND}`;
+  }
+  return `failed to launch ${binary}: ${detail}`;
 }
 
 /**
@@ -84,7 +108,7 @@ export interface DshOverlayOptions {
   sessionKey: string;
   /** IM.codes memory MCP server, mounted so the agent gets memory/send/cron tools. */
   memoryMcp?: DshMcpServer;
-  /** LLM config written into the `agent-default-model` row (settings-based). */
+  /** LLM route registered with dsh's generic provider adapter. */
   llm?: DshLlmConfig;
 }
 
@@ -99,11 +123,10 @@ interface DshPatchRow {
 /**
  * Compose the overlay rows.
  *
- * When a ccPreset supplies an LLM config (`options.llm`), the `agent-default-model`
- * row carries the full `{provider, model, baseUrl?, apiKey?}` — the settings-based
- * equivalent of the env-var mechanism CC SDK and qwen use. Without a preset, no model
- * row is emitted: a requested model then rides to the bridge as an env var and is
- * applied at `agents.create()` (see DSH_BRIDGE_MODEL_ENV).
+ * When a ccPreset supplies an LLM config (`options.llm`), `llm-pi-ai` registers
+ * its Anthropic-compatible provider route and `agent-default-model` selects it.
+ * The credential is represented only by an environment-variable reference;
+ * its value must never be serialized into this on-disk overlay.
  */
 export function buildDshOverlay(
   options: Pick<DshOverlayOptions, 'memoryMcp' | 'llm'>,
@@ -129,13 +152,22 @@ export function buildDshOverlay(
   insert.push({ id: DSH_BRIDGE_PLUGIN_ID, name: resolveBridgeEntry() });
   rows.push({ insert });
   if (options.llm) {
-    const llmConfig: Record<string, unknown> = {
-      provider: options.llm.provider,
-      model: options.llm.model,
+    const modelConfig: Record<string, unknown> = { id: options.llm.model };
+    if (options.llm.contextWindow) modelConfig.contextWindow = options.llm.contextWindow;
+    const providerConfig: Record<string, unknown> = {
+      api: 'anthropic-messages',
+      ...(options.llm.baseUrl ? { baseURL: options.llm.baseUrl } : {}),
+      ...(options.llm.apiKey ? { apiKeyEnv: DSH_PROVIDER_API_KEY_ENV } : {}),
+      models: [modelConfig],
     };
-    if (options.llm.baseUrl) llmConfig.baseUrl = options.llm.baseUrl;
-    if (options.llm.apiKey) llmConfig.apiKey = options.llm.apiKey;
-    rows.push({ id: DSH_AGENT_DEFAULT_MODEL_ROW_ID, config: llmConfig });
+    rows.push({
+      id: DSH_LLM_PI_AI_ROW_ID,
+      config: { providers: { [options.llm.provider]: providerConfig } },
+    });
+    rows.push({
+      id: DSH_AGENT_DEFAULT_MODEL_ROW_ID,
+      config: { provider: options.llm.provider, model: options.llm.model },
+    });
   }
   return rows;
 }

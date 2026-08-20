@@ -307,9 +307,8 @@ export interface SessionConfig {
   /** Provider-specific SDK/CLI settings object or settings file path. */
   settings?: string | Record<string, unknown>;
   /**
-   * DeepSeek Harness (dsh) LLM config, materialized into the dsh overlay's
-   * `agent-default-model` row (settings-based, not env vars). Consumed only
-   * by the `deepseek-harness` provider.
+   * DeepSeek Harness (dsh) LLM config. Route metadata is materialized into the
+   * overlay and credential data is supplied only to the child environment.
    */
   llm?: DshLlmConfig;
   /** Parent session key for sub-sessions. */

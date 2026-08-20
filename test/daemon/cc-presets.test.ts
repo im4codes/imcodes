@@ -222,6 +222,26 @@ describe('cc presets', () => {
     expect(result.systemPrompt).toMatch(/not running on Qwen/i);
   });
 
+  it('builds a dsh route config without placing the preset key in generic env', async () => {
+    const { getDshPresetTransportConfig } = await import('../../src/daemon/cc-presets.js');
+
+    const result = await getDshPresetTransportConfig('MiniMax');
+    expect(result).toMatchObject({
+      env: { ANTHROPIC_MODEL: 'MiniMax-M2.7' },
+      model: 'MiniMax-M2.7',
+      contextWindow: 200_000,
+      llm: {
+        provider: 'minimax',
+        model: 'MiniMax-M2.7',
+        baseUrl: 'https://api.minimax.io/anthropic',
+        apiKey: 'test-token',
+        contextWindow: 200_000,
+      },
+    });
+    expect(result.env).not.toHaveProperty('ANTHROPIC_API_KEY');
+    expect(result.env).not.toHaveProperty('ANTHROPIC_AUTH_TOKEN');
+  });
+
   it('uses discovered compatible-api models when building qwen transport config', async () => {
     const { savePresets, getQwenPresetTransportConfig } = await import('../../src/daemon/cc-presets.js');
 

@@ -349,10 +349,9 @@ export async function getDshPresetTransportConfig(presetName: string): Promise<{
     || resolvedEnv['ANTHROPIC_AUTH_TOKEN']?.trim()
     || undefined;
 
-  // DeepSeek Harness (dsh) is settings-based, not env-var based: the LLM
-  // config (provider route + model + endpoint + key) rides in the dsh
-  // overlay's `agent-default-model` row (carried here as `llm`), so only the
-  // model is mirrored into env as a fallback for any env-reading path.
+  // dsh registers third-party presets through its generic pi-ai adapter. The
+  // API key stays in memory and is passed to the child through a private env
+  // reference; it is never serialized into the generated overlay.
   const env: Record<string, string> = {};
   if (model) env['ANTHROPIC_MODEL'] = model;
 
@@ -362,6 +361,7 @@ export async function getDshPresetTransportConfig(presetName: string): Promise<{
         model: model ?? availableModels[0],
         ...(baseUrl ? { baseUrl } : {}),
         ...(apiKey ? { apiKey } : {}),
+        ...(preset.contextWindow ? { contextWindow: preset.contextWindow } : {}),
       }
     : undefined;
 

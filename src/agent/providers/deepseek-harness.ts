@@ -48,6 +48,7 @@ import {
   DSH_BRIDGE_EVENT,
   DSH_BRIDGE_RESUME_ENV,
   DSH_BRIDGE_TURN_REASON,
+  DSH_PROVIDER_API_KEY_ENV,
   parseDshBridgeEvent,
   type DshBridgeCommand,
   type DshBridgeEvent,
@@ -56,6 +57,7 @@ import {
 } from '../../../shared/deepseek-harness.js';
 import {
   buildDshArgs,
+  formatDshLaunchError,
   removeDshOverlay,
   resolveDshBinary,
   writeDshOverlay,
@@ -93,9 +95,8 @@ interface DeepseekHarnessSessionState {
   requestedModel?: string;
   provider?: string;
   /**
-   * LLM config materialized from a ccPreset — written into the dsh overlay's
-   * `agent-default-model` row (settings-based, not env). Distinct from
-   * `requestedModel`, which is only the model name for the env fallback.
+   * LLM config materialized from a ccPreset. Public route metadata is written
+   * into the dsh overlay; the credential value is child-env-only.
    */
   llmConfig?: DshLlmConfig;
   /** Durable harness session id, used to resume after a restart. */
@@ -415,11 +416,12 @@ export class DeepseekHarnessProvider implements TransportProvider {
         [DSH_BRIDGE_CWD_ENV]: state.cwd,
         ...(resumeId ? { [DSH_BRIDGE_RESUME_ENV]: resumeId } : {}),
         // The harness picks the model when it creates the agent, so IM.codes
-        // pins it here too. A ccPreset's LLM config (route + model + endpoint + key)
-        // rides the overlay's `agent-default-model` row (settings-based, via
-        // `state.llmConfig`); this env var is only the bare model name for the
-        // env-reading path, and remains for a model-only pin without a preset.
+        // pins it here too. A ccPreset's route metadata rides the overlay while
+        // its credential stays out of that file and enters only this child.
         ...(state.requestedModel ? { [DSH_BRIDGE_MODEL_ENV]: state.requestedModel } : {}),
+        ...(state.llmConfig?.apiKey
+          ? { [DSH_PROVIDER_API_KEY_ENV]: state.llmConfig.apiKey }
+          : {}),
       },
       stdio: ['pipe', 'pipe', 'pipe'],
       windowsHide: true,
@@ -448,7 +450,7 @@ export class DeepseekHarnessProvider implements TransportProvider {
 
     child.on('error', (err) => {
       // spawn failures (ENOENT) surface here and never produce an 'exit'.
-      this.failStartup(state, child, `failed to launch ${resolveDshBinary()}: ${err.message}`);
+      this.failStartup(state, child, formatDshLaunchError(err));
     });
     // stdin errors are asynchronous: an EPIPE from writing to an exiting child
     // arrives as an 'error' event, which is an uncaught exception without a
