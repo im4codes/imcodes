@@ -16,6 +16,18 @@ TEST(QualityLadderTest, MapsOnlyUpstreamBitrateToFixedPresets) {
   EXPECT_STREQ(SelectQuality(1, 1920, 1080).id, "360p5");
 }
 
+TEST(QualityLadderTest, SeedsDirectLinksHighWithoutRaisingCongestionFloor) {
+  const TransportBitratePolicy direct = SelectTransportBitratePolicy(true);
+  EXPECT_EQ(direct.min_bps, 350'000u);
+  EXPECT_EQ(direct.start_bps, 12'000'000u);
+  EXPECT_EQ(direct.max_bps, 15'000'000u);
+
+  const TransportBitratePolicy relayed = SelectTransportBitratePolicy(false);
+  EXPECT_EQ(relayed.min_bps, direct.min_bps);
+  EXPECT_EQ(relayed.start_bps, 1'500'000u);
+  EXPECT_EQ(relayed.max_bps, direct.max_bps);
+}
+
 TEST(QualityLadderTest, NeverUpscalesAndPreservesAspect) {
   const QualitySelection small = SelectQuality(15'000'000, 1366, 768);
   EXPECT_EQ(small.width, 1280);

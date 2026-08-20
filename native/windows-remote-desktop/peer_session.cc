@@ -293,14 +293,7 @@ bool PeerSession::Initialize() {
       config, std::move(dependencies));
   if (!result.ok()) return false;
   peer_ = std::move(result.value());
-  webrtc::BitrateSettings bitrate_settings;
-  bitrate_settings.min_bitrate_bps =
-      static_cast<int>(kMinVideoBitrateBps);
-  bitrate_settings.start_bitrate_bps =
-      static_cast<int>(kInitialTransportBitrateBps);
-  bitrate_settings.max_bitrate_bps =
-      static_cast<int>(kPerPeerVideoBitrateBps);
-  if (!peer_->SetBitrate(bitrate_settings).ok()) return false;
+  if (!ApplyTransportBitratePolicy(false)) return false;
   // An IM.codes virtual display exists only after the real desktop failed its
   // bounded presentability gate. Prefer that exact adapter on the retry; never
   // select a similarly named third-party virtual adapter. Without it, retain
@@ -361,6 +354,28 @@ bool PeerSession::Initialize() {
   initial["inputEpoch"] = authority_.input_epoch;
   initial["reason"] = "initial";
   emit_(initial);
+  return true;
+}
+
+bool PeerSession::ApplyTransportBitratePolicy(bool direct) {
+  if (!peer_) return false;
+  if (direct_bitrate_policy_.has_value() &&
+      *direct_bitrate_policy_ == direct) {
+    return true;
+  }
+  const TransportBitratePolicy policy =
+      SelectTransportBitratePolicy(direct);
+  webrtc::BitrateSettings bitrate_settings;
+  bitrate_settings.min_bitrate_bps = static_cast<int>(policy.min_bps);
+  bitrate_settings.start_bitrate_bps = static_cast<int>(policy.start_bps);
+  bitrate_settings.max_bitrate_bps = static_cast<int>(policy.max_bps);
+  const webrtc::RTCError result = peer_->SetBitrate(bitrate_settings);
+  if (!result.ok()) {
+    RTC_LOG(LS_WARNING) << "remote desktop bitrate reseed failed: "
+                        << result.message();
+    return false;
+  }
+  direct_bitrate_policy_ = direct;
   return true;
 }
 
@@ -811,6 +826,7 @@ void PeerSession::OnIceSelectedCandidatePairChanged(
     signaling_thread_->PostTask([weak, relayed] {
       if (auto session = weak.lock()) {
         session->relayed_ = relayed;
+        session->ApplyTransportBitratePolicy(!relayed);
         session->SendStatus(relayed ? "relayed" : "direct",
                             session->InputReady());
       }
@@ -818,6 +834,7 @@ void PeerSession::OnIceSelectedCandidatePairChanged(
     return;
   }
   relayed_ = relayed;
+  ApplyTransportBitratePolicy(!relayed);
   SendStatus(relayed ? "relayed" : "direct", InputReady());
 }
 

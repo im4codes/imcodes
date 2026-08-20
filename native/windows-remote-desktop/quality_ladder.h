@@ -13,6 +13,12 @@ struct QualitySelection {
   uint32_t bitrate_bps;
 };
 
+struct TransportBitratePolicy {
+  uint32_t min_bps;
+  uint32_t start_bps;
+  uint32_t max_bps;
+};
+
 // Seed libwebrtc with a crisp desktop prior without turning that prior into a
 // hard floor: congestion feedback may still reduce the stream to 350 kbps.
 // Direct sessions may then probe up to the user-facing 15 Mbps ceiling.
@@ -33,6 +39,12 @@ inline constexpr uint32_t kInitialVideoBitrateBps = 12'000'000;
 inline constexpr uint32_t kInitialTransportBitrateBps = 1'500'000;
 inline constexpr uint32_t kPerPeerVideoBitrateBps = 15'000'000;
 inline constexpr uint32_t kAggregateVideoBitrateBps = 60'000'000;
+
+// Keep relay startup conservative so video cannot starve the input-channel
+// handshake on a shared ordered TURN/TCP path. Once ICE proves the session is
+// direct, reseed libwebrtc with the crisp desktop prior. The minimum remains
+// 350 kbps in both cases, so congestion feedback can always back off.
+TransportBitratePolicy SelectTransportBitratePolicy(bool direct);
 
 // Returns this encoder's new reservation after accounting for all other live
 // encoders. A zero result means the aggregate budget cannot fit even the

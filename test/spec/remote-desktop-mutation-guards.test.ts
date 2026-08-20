@@ -16,6 +16,7 @@ const SOURCE_PATHS = [
   'native/windows-remote-desktop/peer_session.cc',
   'native/windows-remote-desktop/pipe_ipc.cc',
   'native/windows-remote-desktop/display_capture.cc',
+  'native/windows-remote-desktop/quality_ladder.cc',
   'native/windows-remote-desktop/mf_h264_encoder.cc',
   'native/windows-remote-desktop/mf_h264_encoder.h',
   'native/windows-remote-desktop/virtual_display_controller.cc',
@@ -604,6 +605,15 @@ const contracts: Contract[] = [
       {
         path: 'native/windows-remote-desktop/peer_session.cc',
         needle: 'bitrate_settings.start_bitrate_bps =',
+      },
+      {
+        path: 'native/windows-remote-desktop/peer_session.cc',
+        needle: 'ApplyTransportBitratePolicy(!relayed)',
+        minimum: 2,
+      },
+      {
+        path: 'native/windows-remote-desktop/quality_ladder.cc',
+        needle: 'direct ? kInitialVideoBitrateBps : kInitialTransportBitrateBps',
       },
       {
         path: 'native/windows-remote-desktop/peer_session.cc',

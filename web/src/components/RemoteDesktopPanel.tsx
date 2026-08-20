@@ -94,6 +94,14 @@ type VirtualMouseDrag = {
 };
 
 type VirtualMouseButton = 'left' | 'middle' | 'right';
+type DesktopPointerButton = VirtualMouseButton | 'back' | 'forward';
+
+interface DesktopPointerPress {
+  button: DesktopPointerButton;
+  clientPoint: TouchPoint;
+  normalized: TouchPoint;
+  snappedDoubleClick: boolean;
+}
 
 interface DisplayModeMenuState {
   displayId: string;
@@ -148,6 +156,11 @@ function displayModeOptions(
 const CONTROL_NOTICE_MS = 6_000;
 const TOUCH_LONG_PRESS_MS = 550;
 const TOUCH_DOUBLE_TAP_MS = 400;
+const DESKTOP_DOUBLE_CLICK_MS = 500;
+// CSS pixels on the controller, not remote 4K pixels. A tiny local hand
+// movement can otherwise expand beyond Windows' double-click rectangle after
+// scaling and turn an intended double-click into two singles.
+const DESKTOP_DOUBLE_CLICK_DISTANCE_PX = 8;
 const TOUCH_DOUBLE_TAP_DISTANCE_PX = 32;
 const RECONNECTABLE_REMOTE_DESKTOP_FAILURES = new Set<string>([
   REMOTE_DESKTOP_ERROR.DAEMON_OFFLINE,
@@ -318,6 +331,13 @@ export function RemoteDesktopPanel({
   const virtualMouseEdgePointRef = useRef<TouchPoint | null>(null);
   const virtualMouseEdgeFrameRef = useRef<number | null>(null);
   const heldVirtualButtonsRef = useRef(new Map<number, VirtualMouseButton>());
+  const desktopPointerPressesRef = useRef(new Map<number, DesktopPointerPress>());
+  const lastDesktopClickRef = useRef<{
+    at: number;
+    button: DesktopPointerButton;
+    point: TouchPoint;
+    normalized: TouchPoint;
+  } | null>(null);
   const touchPointsRef = useRef(new Map<number, TouchPoint>());
   const touchGestureRef = useRef<TouchGesture | null>(null);
   const lastTouchTapRef = useRef<{
@@ -441,6 +461,8 @@ export function RemoteDesktopPanel({
       virtualMouseEdgeFrameRef.current = null;
     }
     heldVirtualButtonsRef.current.clear();
+    desktopPointerPressesRef.current.clear();
+    lastDesktopClickRef.current = null;
     if (touchGestureRef.current?.kind === 'single' && touchGestureRef.current.longPressTimer) {
       clearTimeout(touchGestureRef.current.longPressTimer);
     }
@@ -556,6 +578,8 @@ export function RemoteDesktopPanel({
     syntheticCommandControlRef.current = false;
     commandMiddleDragPointerRef.current = null;
     heldVirtualButtonsRef.current.clear();
+    desktopPointerPressesRef.current.clear();
+    lastDesktopClickRef.current = null;
     touchPointsRef.current.clear();
     if (touchGestureRef.current?.kind === 'single' && touchGestureRef.current.longPressTimer) {
       clearTimeout(touchGestureRef.current.longPressTimer);
@@ -1241,16 +1265,35 @@ export function RemoteDesktopPanel({
       && isAppleControllerPlatform(readControllerPlatform());
     const continuingCommandMiddleDrag = !down
       && commandMiddleDragPointerRef.current === event.pointerId;
-    const button = startsCommandMiddleDrag || continuingCommandMiddleDrag ? 'middle'
+    const eventButton: DesktopPointerButton | null = startsCommandMiddleDrag || continuingCommandMiddleDrag ? 'middle'
       : event.button === 0 ? 'left'
       : event.button === 1 ? 'middle'
         : event.button === 2 ? 'right'
           : event.button === 3 ? 'back'
             : event.button === 4 ? 'forward'
               : null;
+    const activePress = down
+      ? undefined
+      : desktopPointerPressesRef.current.get(event.pointerId);
+    const button = activePress?.button ?? eventButton;
     if (!button) return;
     const point = normalizedDesktopPointerPoint(event);
     if (down && !point) return;
+    const now = performance.now();
+    const clientPoint = { x: event.clientX, y: event.clientY };
+    const previous = lastDesktopClickRef.current;
+    const snappedDoubleClick = Boolean(down && point && previous
+      && previous.button === button
+      && now - previous.at <= DESKTOP_DOUBLE_CLICK_MS
+      && Math.hypot(
+        clientPoint.x - previous.point.x,
+        clientPoint.y - previous.point.y,
+      ) <= DESKTOP_DOUBLE_CLICK_DISTANCE_PX);
+    const sendPoint = activePress?.snappedDoubleClick
+      ? activePress.normalized
+      : snappedDoubleClick
+        ? previous!.normalized
+        : point;
     event.preventDefault();
     if (down) {
       (event.currentTarget as HTMLElement).setPointerCapture?.(event.pointerId);
@@ -1259,8 +1302,37 @@ export function RemoteDesktopPanel({
         commandMiddleDragPointerRef.current = event.pointerId;
       }
     }
-    const sent = clientRef.current?.pointerButton(button, down, point?.x, point?.y) ?? false;
+    const sent = clientRef.current?.pointerButton(
+      button,
+      down,
+      sendPoint?.x,
+      sendPoint?.y,
+    ) ?? false;
+    if (down && sent && sendPoint) {
+      desktopPointerPressesRef.current.set(event.pointerId, {
+        button,
+        clientPoint,
+        normalized: sendPoint,
+        snappedDoubleClick,
+      });
+      if (snappedDoubleClick) lastDesktopClickRef.current = null;
+    }
     if (!down) {
+      desktopPointerPressesRef.current.delete(event.pointerId);
+      if (sent && activePress) {
+        const stayedNearTarget = Math.hypot(
+          clientPoint.x - activePress.clientPoint.x,
+          clientPoint.y - activePress.clientPoint.y,
+        ) <= DESKTOP_DOUBLE_CLICK_DISTANCE_PX;
+        lastDesktopClickRef.current = !activePress.snappedDoubleClick && stayedNearTarget
+          ? {
+              at: now,
+              button: activePress.button,
+              point: activePress.clientPoint,
+              normalized: activePress.normalized,
+            }
+          : null;
+      }
       const target = event.currentTarget as HTMLElement;
       try {
         if (target.hasPointerCapture?.(event.pointerId)) {
@@ -1826,6 +1898,10 @@ export function RemoteDesktopPanel({
           onPointerUp={(event) => onPointerButton(event, false)}
           onPointerCancel={(event) => {
             if (event.pointerType === 'touch') onTouchEnd(event, true);
+            if (event.pointerType !== 'touch'
+              && desktopPointerPressesRef.current.delete(event.pointerId)) {
+              lastDesktopClickRef.current = null;
+            }
             if (commandMiddleDragPointerRef.current === event.pointerId) {
               commandMiddleDragPointerRef.current = null;
             }
@@ -1834,6 +1910,10 @@ export function RemoteDesktopPanel({
           onLostPointerCapture={(event) => {
             if (event.pointerType === 'touch' && touchPointsRef.current.has(event.pointerId)) {
               onTouchEnd(event, true);
+            }
+            if (event.pointerType !== 'touch'
+              && desktopPointerPressesRef.current.delete(event.pointerId)) {
+              lastDesktopClickRef.current = null;
             }
             if (commandMiddleDragPointerRef.current === event.pointerId) {
               commandMiddleDragPointerRef.current = null;

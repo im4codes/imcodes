@@ -777,6 +777,33 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     expect(releaseAll).not.toHaveBeenCalled();
   });
 
+  it('snaps a nearby desktop double-click to one remote pixel target', async () => {
+    const { stage } = await renderPanel();
+    vi.useFakeTimers();
+    pointerButton.mockClear();
+
+    mousePointer(stage, 'pointerdown', {
+      pointerId: 70, clientX: 200, clientY: 150,
+    });
+    mousePointer(stage, 'pointerup', {
+      pointerId: 70, clientX: 200, clientY: 150,
+    });
+    act(() => { vi.advanceTimersByTime(120); });
+    mousePointer(stage, 'pointerdown', {
+      pointerId: 71, clientX: 206, clientY: 154,
+    });
+    mousePointer(stage, 'pointerup', {
+      pointerId: 71, clientX: 206, clientY: 154,
+    });
+
+    expect(pointerButton.mock.calls).toEqual([
+      ['left', true, 0.5, 0.5],
+      ['left', false, 0.5, 0.5],
+      ['left', true, 0.5, 0.5],
+      ['left', false, 0.5, 0.5],
+    ]);
+  });
+
   it('releases only pointer buttons on pointer cancellation so held modifiers survive', async () => {
     const { stage } = await renderPanel();
     mousePointer(stage, 'pointerdown', {

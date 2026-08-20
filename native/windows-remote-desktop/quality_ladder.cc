@@ -33,6 +33,14 @@ int EvenAtLeastTwo(int value) {
 
 }  // namespace
 
+TransportBitratePolicy SelectTransportBitratePolicy(bool direct) {
+  return TransportBitratePolicy{
+      kMinVideoBitrateBps,
+      direct ? kInitialVideoBitrateBps : kInitialTransportBitrateBps,
+      kPerPeerVideoBitrateBps,
+  };
+}
+
 uint32_t ClampAggregateVideoBitrate(uint32_t requested_bps,
                                     uint32_t previous_reservation_bps,
                                     uint64_t aggregate_reserved_bps) {
