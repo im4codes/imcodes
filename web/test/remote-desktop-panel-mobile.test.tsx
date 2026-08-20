@@ -164,6 +164,24 @@ function mousePointer(
   target.dispatchEvent(event);
 }
 
+function nativeMousePointerMove(
+  target: Element,
+  values: { pointerId: number; clientX: number; clientY: number; metaKey?: boolean },
+): void {
+  const event = new MouseEvent('pointermove', {
+    bubbles: true,
+    cancelable: true,
+    clientX: values.clientX,
+    clientY: values.clientY,
+    metaKey: values.metaKey ?? false,
+  });
+  Object.defineProperties(event, {
+    pointerId: { value: values.pointerId },
+    pointerType: { value: 'mouse' },
+  });
+  target.dispatchEvent(event);
+}
+
 async function renderPanel(
   ws?: { targetsServer(serverId: string): boolean },
   capabilities: string[] = [REMOTE_DESKTOP_CAPABILITY],
@@ -765,7 +783,7 @@ describe('RemoteDesktopPanel mobile gestures', () => {
       mousePointer(stage, 'pointerdown', {
         pointerId: 19, clientX: 200, clientY: 150, metaKey: true,
       });
-      mousePointer(stage, 'pointermove', {
+      nativeMousePointerMove(stage, {
         pointerId: 19, clientX: 300, clientY: 150, metaKey: true,
       });
       mousePointer(stage, 'pointerup', {
@@ -810,8 +828,8 @@ describe('RemoteDesktopPanel mobile gestures', () => {
       mousePointer(stage, 'pointerdown', { pointerId: 21, clientX: 200, clientY: 150 });
       mousePointer(stage, 'pointerup', { pointerId: 21, clientX: 200, clientY: 150 });
       mousePointer(stage, 'lostpointercapture', { pointerId: 21, clientX: 200, clientY: 150 });
-      mousePointer(video!, 'pointermove', { pointerId: 21, clientX: 200, clientY: 150 });
-      mousePointer(video!, 'pointermove', { pointerId: 21, clientX: 300, clientY: 150 });
+      nativeMousePointerMove(video!, { pointerId: 21, clientX: 200, clientY: 150 });
+      nativeMousePointerMove(video!, { pointerId: 21, clientX: 300, clientY: 150 });
     });
     expect(pointerMove.mock.calls).toEqual([[0.5, 0.5], [0.75, 0.5]]);
   });
@@ -820,10 +838,10 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     const { container, stage } = await renderPanel();
     pointerMove.mockClear();
     act(() => {
-      mousePointer(stage, 'pointermove', {
+      nativeMousePointerMove(stage, {
         pointerId: 18, clientX: 4, clientY: 150,
       });
-      mousePointer(stage, 'pointermove', {
+      nativeMousePointerMove(stage, {
         pointerId: 18, clientX: 396, clientY: 150,
       });
     });
