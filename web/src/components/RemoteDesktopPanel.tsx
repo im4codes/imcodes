@@ -1108,18 +1108,34 @@ export function RemoteDesktopPanel({
     return () => clearInterval(timer);
   }, []);
 
-  const onPointerMove = (event: PointerEvent) => {
-    if (event.pointerType === 'touch') {
-      onTouchMove(event);
-      return;
-    }
-    pointerMovesSeenRef.current += 1;
-    const point = normalizedDesktopPointerPoint(event);
-    if (!point) {
-      pointerMovesUnmappedRef.current += 1;
-      return;
-    }
-    clientRef.current?.pointerMove(point.x, point.y);
+  useEffect(() => {
+    const onWindowPointerMove = (event: globalThis.PointerEvent) => {
+      if (event.pointerType === 'touch') return;
+      const stage = stageRef.current;
+      const target = event.target;
+      if (!stage || !(target instanceof Node) || !stage.contains(target)) return;
+      pointerMovesSeenRef.current += 1;
+      const point = normalizedDesktopPointerPoint(event);
+      if (!point) {
+        pointerMovesUnmappedRef.current += 1;
+        return;
+      }
+      clientRef.current?.pointerMove(point.x, point.y);
+    };
+    // Capture before descendants or browser-native video handling can stop the
+    // event. In particular, pointer capture is released after a click and some
+    // desktop engines then stop delivering the stage's bubbling hover handler.
+    // A window capture listener keeps absolute mouse motion alive across that
+    // transition without changing the mobile touch gesture path.
+    window.addEventListener('pointermove', onWindowPointerMove, {
+      capture: true,
+      passive: true,
+    });
+    return () => window.removeEventListener('pointermove', onWindowPointerMove, true);
+  }, [normalizedDesktopPointerPoint]);
+
+  const onStagePointerMove = (event: PointerEvent) => {
+    if (event.pointerType === 'touch') onTouchMove(event);
   };
 
   const suppressCommandControlForMiddleDrag = () => {
@@ -1722,8 +1738,7 @@ export function RemoteDesktopPanel({
           ref={stageRef}
           class={`remote-desktop-stage is-${viewScale} ${snapshot.inputEnabled ? 'is-controlling' : 'is-viewing'}`}
           tabIndex={snapshot.inputEnabled ? 0 : -1}
-          onPointerMove={onPointerMove}
-          onPointerEnter={onPointerMove}
+          onPointerMove={onStagePointerMove}
           onPointerDown={(event) => onPointerButton(event, true)}
           onPointerUp={(event) => onPointerButton(event, false)}
           onPointerCancel={(event) => {

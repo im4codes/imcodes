@@ -796,16 +796,22 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     }
   });
 
-  it('keeps the stage as the direct hover target instead of relying on native video bubbling', async () => {
-    // Real desktop engines did not consistently bubble uncaptured hover moves
-    // from their native video surface. Drags appeared to work only because a
-    // preceding pointerdown captured the pointer on the stage. The video is
-    // presentation-only, so the stage must own the hit path without capture.
-    const { stage } = await renderPanel();
+  it('keeps sending desktop hover through the window capture path after a click', async () => {
+    // A real desktop engine can stop the native video event before it bubbles
+    // to the stage after pointer capture is released. The window capture path
+    // must see the move first, otherwise reconnecting briefly fixes hover until
+    // the first click and then the remote cursor freezes again.
+    const { container, stage } = await renderPanel();
+    const video = container.querySelector('video');
+    expect(video).not.toBeNull();
+    video?.addEventListener('pointermove', (event) => event.stopPropagation());
     pointerMove.mockClear();
     act(() => {
-      mousePointer(stage, 'pointermove', { pointerId: 21, clientX: 200, clientY: 150 });
-      mousePointer(stage, 'pointermove', { pointerId: 21, clientX: 300, clientY: 150 });
+      mousePointer(stage, 'pointerdown', { pointerId: 21, clientX: 200, clientY: 150 });
+      mousePointer(stage, 'pointerup', { pointerId: 21, clientX: 200, clientY: 150 });
+      mousePointer(stage, 'lostpointercapture', { pointerId: 21, clientX: 200, clientY: 150 });
+      mousePointer(video!, 'pointermove', { pointerId: 21, clientX: 200, clientY: 150 });
+      mousePointer(video!, 'pointermove', { pointerId: 21, clientX: 300, clientY: 150 });
     });
     expect(pointerMove.mock.calls).toEqual([[0.5, 0.5], [0.75, 0.5]]);
   });
