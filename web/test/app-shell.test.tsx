@@ -153,12 +153,22 @@ vi.mock('../src/ws-client.js', () => ({
     // The real client always exposes the daemon capability snapshot; anything
     // rendered from `daemon.hello` (remote control, for one) reads it on mount.
     daemonCapabilitySnapshot: { capabilities: string[] } | null = null;
+    daemonCapabilityHandlers: Array<(snapshot: unknown) => void> = [];
     getDaemonCapabilitySnapshot(): { capabilities: string[] } | null {
       return this.daemonCapabilitySnapshot;
     }
 
-    onDaemonCapabilitySnapshot(_handler: (snapshot: unknown) => void): () => void {
-      return () => {};
+    onDaemonCapabilitySnapshot(handler: (snapshot: unknown) => void): () => void {
+      this.daemonCapabilityHandlers.push(handler);
+      return () => {
+        this.daemonCapabilityHandlers = this.daemonCapabilityHandlers.filter((h) => h !== handler);
+      };
+    }
+
+    /** Announce a `daemon.hello` capability set, as the real client does. */
+    emitDaemonCapabilities(capabilities: string[]): void {
+      this.daemonCapabilitySnapshot = { capabilities };
+      for (const handler of [...this.daemonCapabilityHandlers]) handler(this.daemonCapabilitySnapshot);
     }
 
     onMessage(handler: (message: any) => void): () => void {
@@ -1077,6 +1087,38 @@ describe('App shell', () => {
     fireEvent.click(screen.getByText('remote-desktop-restore'));
     expect(await screen.findByText('remote-desktop-panel:false')).toBeTruthy();
   }, 20_000);
+
+  it('puts remote control in the desktop toolbar, not only on mobile', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+    const { App } = await importApp();
+    const view = render(<App />);
+    const ws = await getActiveWsClient();
+
+    const toolbar = () => view.container.querySelector('.desktop-view-toggle');
+    await waitFor(() => expect(toolbar()).toBeTruthy());
+    // Nothing claimed yet, so nothing offered.
+    expect(toolbar()!.querySelector('.daemon-remote-desktop-btn')).toBeNull();
+
+    await act(async () => {
+      // An offline daemon offers nothing, so it has to be heard from first.
+      ws.emit({
+        type: 'daemon.stats',
+        daemonVersion: '2026.8.1',
+        cpu: 1, memUsed: 1, memTotal: 2, load1: 0, load5: 0, load15: 0, uptime: 10,
+      });
+      ws.emitDaemonCapabilities([
+        'remote.desktop.windows.installable.v1',
+        'remote.desktop.windows.h264.v2',
+      ]);
+    });
+
+    // The desktop layout has no daemon status bar at all, so without this the
+    // button existed on mobile only.
+    await waitFor(() => expect(toolbar()!.querySelector('.daemon-remote-desktop-btn')).toBeTruthy());
+  });
 
   it('keeps the mobile server menu available on wide-viewport Android browsers', async () => {
     const originalUserAgent = navigator.userAgent;

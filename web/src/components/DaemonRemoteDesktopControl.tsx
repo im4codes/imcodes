@@ -28,7 +28,15 @@ export interface DaemonRemoteDesktopControlProps {
   serverName?: string | null;
   daemonOnline: boolean;
   onOpen(machine: MachineListItem): void;
+  /** Icon only, for a toolbar that labels nothing else either. */
   compact?: boolean;
+  /**
+   * Whether this mount point has room for the one-time login-screen setup
+   * beside the control. Separate from `compact`, which is only about labels: a
+   * desktop toolbar shows icons and still has room, the mobile status bar has
+   * labels neither way and no room at all.
+   */
+  offerLoginScreenSetup?: boolean;
   /**
    * Controlled machines this user can reach. Supplied by a caller that already
    * has them; otherwise looked up here, and only for a daemon that can actually
@@ -54,6 +62,7 @@ export function DaemonRemoteDesktopControl({
   daemonOnline,
   onOpen,
   compact = false,
+  offerLoginScreenSetup = true,
   machines,
 }: DaemonRemoteDesktopControlProps) {
   const { t } = useTranslation();
@@ -126,10 +135,9 @@ export function DaemonRemoteDesktopControl({
     );
     const installing = loginScreen?.state === REMOTE_DESKTOP_LOGIN_SCREEN_STATE.DOWNLOADING
       || loginScreen?.state === REMOTE_DESKTOP_LOGIN_SCREEN_STATE.ELEVATING;
-    // Offered on the status card only, and only while no controlled node shares
-    // this machine: the status bar has no room for a second button, and this is
-    // a one-time setup step rather than a daily action.
-    if (compact || sharedMachine || !ready) return control;
+    // Only where there is room, and only while no controlled node already shares
+    // this machine — in which case that node serves the sign-in screen already.
+    if (!offerLoginScreenSetup || sharedMachine || !ready) return control;
     const failed = loginScreen?.state === REMOTE_DESKTOP_LOGIN_SCREEN_STATE.FAILED;
     return (
       <>
@@ -161,10 +169,10 @@ export function DaemonRemoteDesktopControl({
           }}
         >
           {installing
-            ? <><span class="connecting-dot" />{` ${loginScreen?.state === REMOTE_DESKTOP_LOGIN_SCREEN_STATE.ELEVATING
+            ? <><span class="connecting-dot" />{compact ? '' : ` ${loginScreen?.state === REMOTE_DESKTOP_LOGIN_SCREEN_STATE.ELEVATING
               ? t('remote_desktop.login_screen_waiting')
               : t('remote_desktop.login_screen_downloading')}`}</>
-            : `🔒 ${t(failed ? 'remote_desktop.login_screen_retry' : 'remote_desktop.login_screen_enable')}`}
+            : `🔒${compact ? '' : ` ${t(failed ? 'remote_desktop.login_screen_retry' : 'remote_desktop.login_screen_enable')}`}`}
         </button>
       </>
     );

@@ -153,9 +153,21 @@ describe('DaemonRemoteDesktopControl', () => {
         .toEqual(['remote_desktop.daemon_control', 'remote_desktop.login_screen_hint']);
     });
 
-    it('keeps the compact status bar to a single button', () => {
-      const { view } = mount(ready, { compact: true });
+    it('keeps a mount point with no room to a single button', () => {
+      const { view } = mount(ready, { compact: true, offerLoginScreenSetup: false });
       expect(view.container.querySelectorAll('button')).toHaveLength(1);
+    });
+
+    it('still offers the setup in a toolbar that only lacks labels', () => {
+      // `compact` is about labels, not room: a desktop toolbar shows icons and
+      // still has space for the one-time setup, and would otherwise be the one
+      // place it could never be reached from.
+      const { view } = mount(ready, { compact: true });
+      const buttons = [...view.container.querySelectorAll('button')];
+      expect(buttons).toHaveLength(2);
+      expect(buttons[1]!.getAttribute('title')).toBe('remote_desktop.login_screen_hint');
+      // Icon only, matching the toolbar around it.
+      expect(buttons[1]!.textContent).toBe('🔒');
     });
 
     it('opens the controlled node that shares this machine, not the daemon', () => {

@@ -5456,6 +5456,7 @@ export function App() {
                 )}
                 <DaemonRemoteDesktopControl
                   compact
+                  offerLoginScreenSetup={false}
                   ws={wsRef.current}
                   serverId={selectedServerId}
                   serverName={selectedServerInfo?.name}
@@ -5530,6 +5531,14 @@ export function App() {
                 >
                   🌐
                 </button>
+                <DaemonRemoteDesktopControl
+                  compact
+                  ws={wsRef.current}
+                  serverId={selectedServerId}
+                  serverName={selectedServerInfo?.name}
+                  daemonOnline={daemonOnline}
+                  onOpen={openRemoteDesktop}
+                />
               </div>
             )}
 
@@ -5567,6 +5576,14 @@ export function App() {
                     {viewMode === 'chat' ? '⌨ Terminal' : '💬 Chat'}
                   </button>
                 )}
+                <DaemonRemoteDesktopControl
+                  compact
+                  ws={wsRef.current}
+                  serverId={selectedServerId}
+                  serverName={selectedServerInfo?.name}
+                  daemonOnline={daemonOnline}
+                  onOpen={openRemoteDesktop}
+                />
               </div>
             )}
 
