@@ -449,6 +449,7 @@ bool DxgiDesktopSource::BindCaptureThreadToRequestedDesktop() {
   // The duplication and any GDI fallback belong to the desktop left behind.
   ResetDuplication();
   gdi_active_ = false;
+  gdi_dxgi_probe_ticks_remaining_ = 0;
   first_frame_waits_ = 0;
   return true;
 }
@@ -470,25 +471,41 @@ void DxgiDesktopSource::CaptureLoop() {
       last_capture_waited_ = false;
       if (gdi_active_) {
         captured = CaptureDesktopGdi();
+        // Do not replace a healthy fallback with a one-shot 16 ms DXGI probe.
+        // Desktop Duplication is change-driven, so a newly created interface
+        // commonly returns WAIT_TIMEOUT until DWM or the pointer next changes.
+        // Probe beside GDI for a bounded window and promote only after DXGI
+        // has delivered a real frame.
+        if (duplication_ && gdi_dxgi_probe_ticks_remaining_ > 0) {
+          if (CaptureOne()) {
+            gdi_active_ = false;
+            gdi_dxgi_probe_ticks_remaining_ = 0;
+            captured = true;
+          } else if (!duplication_ ||
+                     --gdi_dxgi_probe_ticks_remaining_ <= 0) {
+            ResetDuplication();
+            gdi_dxgi_probe_ticks_remaining_ = 0;
+          }
+        }
       } else if (!duplication_ && !InitializeDuplication()) {
         captured = false;
       } else {
         captured = CaptureOne();
       }
-      if (gdi_active_ && ++gdi_dxgi_retry_ticks_ >= kGdiFallbackDxgiRetryTicks) {
+      if (gdi_active_ && !duplication_ &&
+          ++gdi_dxgi_retry_ticks_ >= kGdiFallbackDxgiRetryTicks) {
         // Give the hardware path a chance to come back: a desktop that stopped
         // presenting can start again, and GDI is the slower fallback.
         gdi_dxgi_retry_ticks_ = 0;
-        if (InitializeDuplication() && CaptureOne()) {
-          gdi_active_ = false;
-          captured = true;
-        }
+        if (InitializeDuplication())
+          gdi_dxgi_probe_ticks_remaining_ = kGdiFallbackDxgiProbeTicks;
       }
       if (AdvanceGdiFallbackState(captured,
                                   fallback_ == CaptureFallback::kDesktopGdi,
                                   &first_frame_waits_)) {
         gdi_active_ = true;
         gdi_dxgi_retry_ticks_ = 0;
+        gdi_dxgi_probe_ticks_remaining_ = 0;
         ResetDuplication();
         captured = CaptureDesktopGdi();
       }

@@ -66,6 +66,27 @@ function occurrences(source: string, needle: string): number {
 
 const contracts: Contract[] = [
   {
+    description: 'GDI fallback keeps a bounded multi-frame DXGI recovery probe',
+    guards: [
+      {
+        path: 'native/windows-remote-desktop/display_capture.cc',
+        needle: 'if (duplication_ && gdi_dxgi_probe_ticks_remaining_ > 0)',
+      },
+      {
+        path: 'native/windows-remote-desktop/display_capture.cc',
+        needle: 'gdi_dxgi_probe_ticks_remaining_ = kGdiFallbackDxgiProbeTicks;',
+      },
+      {
+        path: 'native/windows-remote-desktop/display_capture.cc',
+        needle: 'if (CaptureOne()) {\n            gdi_active_ = false;',
+      },
+      {
+        path: 'native/windows-remote-desktop/worker_policy.h',
+        needle: 'inline constexpr int kGdiFallbackDxgiProbeTicks = 30;',
+      },
+    ],
+  },
+  {
     // The daemon exemptions must never leak to a controlled node: `exec_enabled`
     // is that node's operator switch, `os` is its enrolled platform and
     // `controlled_capabilities` is its advertised set. A daemon proves those
@@ -427,6 +448,18 @@ const contracts: Contract[] = [
         path: 'src/node/windows-user-session.ts',
         needle: 'activeCandidate == -2',
       },
+      {
+        path: 'src/node/windows-user-session.ts',
+        needle: 'if (TryDisconnectedUserSessionId(out sid)) {\n        ReconnectSessionToConsole(sid);',
+      },
+      {
+        path: 'src/node/windows-user-session.ts',
+        needle: 'ambiguous disconnected user sessions',
+      },
+      {
+        path: 'src/node/windows-user-session.ts',
+        needle: 'Path.Combine(Environment.SystemDirectory, "tscon.exe")',
+      },
     ],
   },
   {
@@ -467,7 +500,7 @@ const contracts: Contract[] = [
     guards: [
       {
         path: 'src/node/windows-user-session.ts',
-        needle: 'StartConsoleSystem(exe, argsLine,',
+        needle: 'StartSystemInSession(exe, argsLine, sid,',
       },
       {
         path: 'src/node/remote-desktop-worker-host.ts',

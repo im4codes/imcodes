@@ -151,6 +151,48 @@ public static class ImcodesUserProc {
     } finally { WTSFreeMemory(p); }
     return false;
   }
+  // mstsc leaves the user's real desktop in a disconnected WTS session when
+  // the physical console returns to Winlogon. That session still owns Explorer,
+  // DWM and every GPU surface the operator expects to capture, but neither GDI
+  // nor Desktop Duplication can read it until Windows routes it back to an
+  // active output. Select only one authenticated candidate: choosing among
+  // several logged-in users would expose the wrong desktop.
+  public static bool TryDisconnectedUserSessionId(out int selectedSessionId) {
+    selectedSessionId = -1;
+    IntPtr p; int count;
+    if (!WTSEnumerateSessions(IntPtr.Zero, 0, 1, out p, out count)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+    try {
+      int size = Marshal.SizeOf(typeof(WTS_SESSION_INFO));
+      for (int i = 0; i < count; i++) {
+        WTS_SESSION_INFO s = (WTS_SESSION_INFO)Marshal.PtrToStructure(IntPtr.Add(p, i * size), typeof(WTS_SESSION_INFO));
+        if (s.SessionID <= 0 || s.State != WTSDisconnected ||
+            !HasUserToken(s.SessionID)) continue;
+        if (selectedSessionId >= 0 && selectedSessionId != s.SessionID) {
+          throw new Exception("ambiguous disconnected user sessions");
+        }
+        selectedSessionId = s.SessionID;
+      }
+    } finally { WTSFreeMemory(p); }
+    return selectedSessionId >= 0;
+  }
+  static void ReconnectSessionToConsole(int sid) {
+    string tscon = System.IO.Path.Combine(Environment.SystemDirectory, "tscon.exe");
+    var start = new System.Diagnostics.ProcessStartInfo();
+    start.FileName = tscon;
+    start.Arguments = sid.ToString(System.Globalization.CultureInfo.InvariantCulture) + " /dest:console";
+    start.UseShellExecute = false;
+    start.CreateNoWindow = true;
+    using (var process = System.Diagnostics.Process.Start(start)) {
+      if (process == null) throw new Exception("failed to start session reconnect");
+      if (!process.WaitForExit(15000)) {
+        try { process.Kill(); } catch { }
+        throw new Exception("session reconnect timed out");
+      }
+      if (process.ExitCode != 0) {
+        throw new Exception("failed to reconnect disconnected user session");
+      }
+    }
+  }
   static void LaunchPrimary(IntPtr primary, string exe, string argsLine, string desktop, bool allowTokenFallback) {
     IntPtr env;
     if (!CreateEnvironmentBlock(out env, primary, false)) env = IntPtr.Zero;
@@ -174,13 +216,12 @@ public static class ImcodesUserProc {
   // picture instead of ending the session. It starts on Default and follows
   // from there; the --secure-console flag is still passed when the caller
   // explicitly asks for the sign-in desktop so an older worker keeps behaving.
-  static void StartConsoleSystem(string exe, string argsLine, bool signInDesktop) {
+  static void StartSystemInSession(string exe, string argsLine, int sid, bool signInDesktop) {
     if (WindowsIdentity.GetCurrent().User == null ||
         WindowsIdentity.GetCurrent().User.Value != "S-1-5-18") {
       throw new Exception("console session worker requires LocalSystem");
     }
-    int sid = unchecked((int)WTSGetActiveConsoleSessionId());
-    if (sid <= 0 || sid == -1) throw new Exception("no active console session");
+    if (sid <= 0 || sid == -1) throw new Exception("no target desktop session");
     IntPtr token, primary;
     if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ALL_ACCESS, out token)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
     try {
@@ -204,7 +245,17 @@ public static class ImcodesUserProc {
     // after unlock on real machines, and trusting it put the privileged worker
     // on a desktop where it could neither capture nor inject.
     if (allowSecureDesktopFallback) {
-      StartConsoleSystem(exe, argsLine, forceSecureConsole || !TryInteractiveSessionId(out sid));
+      if (TryInteractiveSessionId(out sid)) {
+        StartSystemInSession(exe, argsLine, sid, forceSecureConsole);
+        return;
+      }
+      if (TryDisconnectedUserSessionId(out sid)) {
+        ReconnectSessionToConsole(sid);
+        StartSystemInSession(exe, argsLine, sid, false);
+        return;
+      }
+      sid = unchecked((int)WTSGetActiveConsoleSessionId());
+      StartSystemInSession(exe, argsLine, sid, true);
       return;
     }
     if (!TryInteractiveSessionId(out sid)) {

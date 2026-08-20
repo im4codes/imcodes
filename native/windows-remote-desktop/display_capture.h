@@ -190,6 +190,7 @@ class DxgiDesktopSource : public webrtc::VideoTrackSource {
   int consecutive_failures_ = 0;
   int first_frame_waits_ = 0;
   int gdi_dxgi_retry_ticks_ = 0;
+  int gdi_dxgi_probe_ticks_remaining_ = 0;
   bool gdi_active_ = false;
   bool last_capture_waited_ = false;
 

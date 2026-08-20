@@ -171,6 +171,13 @@ bool AdvanceGdiFallbackState(bool captured,
 // staying on the slower fallback for the rest of the session.
 inline constexpr int kGdiFallbackDxgiRetryTicks = 150;
 
+// A recreated duplication is change-driven and therefore need not return a
+// frame during the single 16 ms call that opened it. Keep probing it alongside
+// the still-live GDI fallback for a bounded window. This is long enough to see
+// the first DWM/pointer update after an RDP-to-console transition, while a
+// genuinely headless output returns to the cheap periodic retry cadence.
+inline constexpr int kGdiFallbackDxgiProbeTicks = 30;
+
 // Keeps the ordinary active-user worker and the privileged Winlogon worker on
 // their own desktops. A secure-console worker must be replaced after unlock;
 // it must never carry authority or input ownership onto the user's desktop.

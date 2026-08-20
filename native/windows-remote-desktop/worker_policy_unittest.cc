@@ -200,6 +200,8 @@ TEST(WorkerPolicyTest, TreatsLockAndUnlockAsAFollowRatherThanAnEnding) {
 }
 
 TEST(WorkerPolicyTest, EngagesGdiAfterAnyRunOfFailedCaptures) {
+  EXPECT_GT(kGdiFallbackDxgiProbeTicks, kFirstFrameWaitsBeforeGdiFallback);
+  EXPECT_LT(kGdiFallbackDxgiProbeTicks, kGdiFallbackDxgiRetryTicks);
   int waits = 0;
   for (int attempt = 1; attempt < kFirstFrameWaitsBeforeGdiFallback; ++attempt) {
     EXPECT_FALSE(AdvanceGdiFallbackState(false, true, &waits));

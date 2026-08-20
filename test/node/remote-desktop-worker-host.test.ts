@@ -250,7 +250,7 @@ describe('remote desktop worker artifact and IPC host', () => {
     expect(script).toContain('if (linkedToken != IntPtr.Zero) CloseHandle(linkedToken);');
   });
 
-  it('falls back to an authenticated SYSTEM worker on the active Winlogon desktop', () => {
+  it('launches the authenticated SYSTEM worker in the selected user session before falling back to console', () => {
     let launchArgs: readonly string[] = [];
     const child = new EventEmitter() as EventEmitter & { unref(): void };
     child.unref = () => {};
@@ -266,6 +266,14 @@ describe('remote desktop worker artifact and IPC host', () => {
     const script = Buffer.from(launchArgs[encodedIndex]!, 'base64').toString('utf16le');
     expect(script).toContain('WindowsIdentity.GetCurrent().User.Value != "S-1-5-18"');
     expect(script).toContain('SetTokenInformation(primary, TokenSessionId, ref sid, sizeof(int))');
+    expect(script).toContain('if (TryInteractiveSessionId(out sid))');
+    expect(script).toContain('if (TryDisconnectedUserSessionId(out sid))');
+    expect(script).toContain('ReconnectSessionToConsole(sid);');
+    expect(script).toContain('StartSystemInSession(exe, argsLine, sid,');
+    expect(script).toContain('Path.Combine(Environment.SystemDirectory, "tscon.exe")');
+    expect(script).toContain('sid.ToString(System.Globalization.CultureInfo.InvariantCulture) + " /dest:console"');
+    expect(script).toContain('process.WaitForExit(15000)');
+    expect(script).toContain('try { process.Kill(); } catch { }');
     expect(script).toContain('argsLine + " --secure-console"');
     expect(script).toContain('"winsta0\\\\Winlogon"');
     expect(script).toContain('[ImcodesUserProc]::Start($exe, $argsLine, $true, $true, $false)');
@@ -273,8 +281,10 @@ describe('remote desktop worker artifact and IPC host', () => {
     // logged-in machines on the privileged Winlogon worker, which can neither
     // capture nor inject there.
     expect(script).not.toContain('GetProcessesByName');
-    expect(script.indexOf('if (forceSecureConsole)'))
-      .toBeLessThan(script.indexOf('TryInteractiveSessionId(out sid)'));
+    expect(script.indexOf('if (TryInteractiveSessionId(out sid))'))
+      .toBeLessThan(script.indexOf('if (TryDisconnectedUserSessionId(out sid))'));
+    expect(script.indexOf('if (TryDisconnectedUserSessionId(out sid))'))
+      .toBeLessThan(script.lastIndexOf('WTSGetActiveConsoleSessionId()'));
   });
 
   it('authenticates one active-user worker and forwards only strict bounded envelopes', async () => {
