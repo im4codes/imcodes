@@ -181,6 +181,18 @@ function nativeMousePointerMove(
   target.dispatchEvent(event);
 }
 
+function nativeMouseMove(
+  target: EventTarget,
+  values: { clientX: number; clientY: number },
+): void {
+  target.dispatchEvent(new MouseEvent('mousemove', {
+    bubbles: true,
+    cancelable: true,
+    clientX: values.clientX,
+    clientY: values.clientY,
+  }));
+}
+
 async function renderPanel(
   ws?: { targetsServer(serverId: string): boolean },
   capabilities: string[] = [REMOTE_DESKTOP_CAPABILITY],
@@ -853,6 +865,30 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     });
 
     expect(pointerMove.mock.calls).toEqual([[0.5, 0.5], [0.75, 0.5]]);
+  });
+
+  it('keeps sending mouse-only hover when the browser reserves pointermove for dragging', async () => {
+    const { stage } = await renderPanel();
+    pointerMove.mockClear();
+
+    act(() => {
+      nativeMouseMove(stage, { clientX: 200, clientY: 150 });
+      nativeMouseMove(stage, { clientX: 300, clientY: 150 });
+    });
+
+    expect(pointerMove.mock.calls).toEqual([[0.5, 0.5], [0.75, 0.5]]);
+  });
+
+  it('deduplicates compatibility mousemove paired with pointermove', async () => {
+    const { stage } = await renderPanel();
+    pointerMove.mockClear();
+
+    act(() => {
+      nativeMousePointerMove(stage, { clientX: 200, clientY: 150 });
+      nativeMouseMove(stage, { clientX: 200, clientY: 150 });
+    });
+
+    expect(pointerMove.mock.calls).toEqual([[0.5, 0.5]]);
   });
 
   it('sends the real remote pointer without snapping a mouse away from the edges', async () => {

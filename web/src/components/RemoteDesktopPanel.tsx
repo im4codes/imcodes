@@ -1109,7 +1109,13 @@ export function RemoteDesktopPanel({
   }, []);
 
   useEffect(() => {
+    let lastMove: { x: number; y: number; at: number } | null = null;
     const sendDesktopPointerMove = (clientX: number, clientY: number) => {
+      const now = performance.now();
+      if (lastMove && lastMove.x === clientX && lastMove.y === clientY && now - lastMove.at < 16) {
+        return;
+      }
+      lastMove = { x: clientX, y: clientY, at: now };
       const stage = stageRef.current;
       if (!stage) return;
       const stageRect = stage.getBoundingClientRect();
@@ -1127,6 +1133,9 @@ export function RemoteDesktopPanel({
       }
       clientRef.current?.pointerMove(point.x, point.y);
     };
+    const onWindowMouseMove = (event: globalThis.MouseEvent) => {
+      sendDesktopPointerMove(event.clientX, event.clientY);
+    };
     const onWindowPointerMove = (event: globalThis.PointerEvent) => {
       if (event.pointerType === 'touch') return;
       sendDesktopPointerMove(event.clientX, event.clientY);
@@ -1134,11 +1143,16 @@ export function RemoteDesktopPanel({
     // Capture before floating-window drag/gesture owners or descendants can
     // stop propagation. Coordinates, not event.target ownership, decide
     // whether the pointer is over the presented desktop.
+    window.addEventListener('mousemove', onWindowMouseMove, {
+      capture: true,
+      passive: true,
+    });
     window.addEventListener('pointermove', onWindowPointerMove, {
       capture: true,
       passive: true,
     });
     return () => {
+      window.removeEventListener('mousemove', onWindowMouseMove, true);
       window.removeEventListener('pointermove', onWindowPointerMove, true);
     };
   }, [normalizedClientPoint]);
