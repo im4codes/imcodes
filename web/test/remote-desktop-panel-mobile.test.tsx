@@ -677,7 +677,7 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     expect(navigator.clipboard.writeText).toHaveBeenCalledWith('selected remotely');
   });
 
-  it('opens an icon-only mobile IME surface and sends common shortcut chords', async () => {
+  it('keeps the mobile IME focused, commits composed text once, and sends shortcut chords', async () => {
     const { container, getByRole } = await renderPanel();
     const keyboardButton = getByRole('button', { name: 'remote_desktop.mobile_keyboard' });
     expect(keyboardButton.textContent).toBe('⌨');
@@ -686,9 +686,37 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     const input = getByRole('textbox', { name: 'remote_desktop.mobile_text_input' }) as HTMLTextAreaElement;
     input.focus();
     expect(document.activeElement).toBe(input);
-    input.value = '你好';
-    act(() => input.dispatchEvent(new InputEvent('input', { bubbles: true, data: '你好' })));
-    expect(text).toHaveBeenCalledWith('你好');
+
+    input.value = 'a';
+    act(() => input.dispatchEvent(new InputEvent('input', { bubbles: true, data: 'a' })));
+    expect(text).toHaveBeenCalledWith('a');
+    expect(input.value).toBe('');
+    expect(document.activeElement).toBe(input);
+
+    text.mockClear();
+    act(() => input.dispatchEvent(new CompositionEvent('compositionstart', { bubbles: true })));
+    input.value = 'ni';
+    act(() => input.dispatchEvent(new InputEvent('input', {
+      bubbles: true,
+      data: 'ni',
+      isComposing: true,
+    })));
+    expect(text).not.toHaveBeenCalled();
+    expect(input.value).toBe('ni');
+
+    input.value = '你';
+    await act(async () => {
+      input.dispatchEvent(new CompositionEvent('compositionend', { bubbles: true, data: '你' }));
+      await Promise.resolve();
+    });
+    expect(text.mock.calls).toEqual([['你']]);
+    expect(input.value).toBe('');
+    expect(document.activeElement).toBe(input);
+
+    input.value = 'b';
+    act(() => input.dispatchEvent(new InputEvent('input', { bubbles: true, data: 'b' })));
+    expect(text.mock.calls).toEqual([['你'], ['b']]);
+    expect(document.activeElement).toBe(input);
 
     key.mockClear();
     act(() => {

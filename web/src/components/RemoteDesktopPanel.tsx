@@ -324,6 +324,7 @@ export function RemoteDesktopPanel({
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const mobileTextInputRef = useRef<HTMLTextAreaElement | null>(null);
   const mobileTextComposingRef = useRef(false);
+  const mobileTextLastCompositionCommitRef = useRef<string | null>(null);
   const machineDirectoryAdapterRef = useRef<MachineDirectoryWsAdapter | null>(null);
   const displayModeMenuRef = useRef<HTMLDivElement | null>(null);
   const viewportRef = useRef<RemoteDesktopViewport>(INITIAL_REMOTE_DESKTOP_VIEWPORT);
@@ -1593,8 +1594,12 @@ export function RemoteDesktopPanel({
 
   const submitMobileText = (value: string) => {
     if (!value || !snapshot.inputEnabled) return;
-    if (sendPastedText(value) && mobileTextInputRef.current) {
-      mobileTextInputRef.current.value = '';
+    const input = mobileTextInputRef.current;
+    if ((clientRef.current?.text(value) ?? false) && input) {
+      input.value = '';
+      if (document.activeElement !== input) {
+        input.focus({ preventScroll: true });
+      }
     }
   };
 
@@ -2006,24 +2011,38 @@ export function RemoteDesktopPanel({
                 ref={mobileTextInputRef}
                 rows={1}
                 inputMode="text"
-                enterkeyhint="done"
+                enterkeyhint="enter"
                 autocapitalize="none"
                 autocomplete="off"
                 spellcheck={false}
                 aria-label={t('remote_desktop.mobile_text_input')}
                 placeholder={t('remote_desktop.mobile_text_input')}
-                onCompositionStart={() => { mobileTextComposingRef.current = true; }}
-                onCompositionEnd={() => {
+                onCompositionStart={(event) => {
+                  event.stopPropagation();
+                  mobileTextComposingRef.current = true;
+                  mobileTextLastCompositionCommitRef.current = null;
+                }}
+                onCompositionEnd={(event) => {
+                  event.stopPropagation();
                   mobileTextComposingRef.current = false;
-                  queueMicrotask(() => {
-                    const input = mobileTextInputRef.current;
-                    if (input?.value) submitMobileText(input.value);
-                  });
+                  const value = (event.currentTarget as HTMLTextAreaElement).value;
+                  if (value && mobileTextLastCompositionCommitRef.current !== value) {
+                    mobileTextLastCompositionCommitRef.current = value;
+                    submitMobileText(value);
+                  }
                 }}
                 onInput={(event) => {
-                  if (!mobileTextComposingRef.current) {
-                    submitMobileText((event.currentTarget as HTMLTextAreaElement).value);
+                  event.stopPropagation();
+                  if (mobileTextComposingRef.current || event.isComposing) return;
+                  const input = event.currentTarget as HTMLTextAreaElement;
+                  const lastCompositionCommit = mobileTextLastCompositionCommitRef.current;
+                  if (lastCompositionCommit !== null
+                    && (input.value === '' || input.value === lastCompositionCommit)) {
+                    input.value = '';
+                    return;
                   }
+                  mobileTextLastCompositionCommitRef.current = null;
+                  submitMobileText(input.value);
                 }}
                 onKeyDown={(event) => event.stopPropagation()}
                 onKeyUp={(event) => event.stopPropagation()}
