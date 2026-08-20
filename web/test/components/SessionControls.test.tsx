@@ -613,6 +613,25 @@ afterEach(() => {
     expect(input.style.height).toBe('');
   });
 
+  it('keeps compact transport cards to one-row input semantics and reuses the left queue-aware Stop toolbar', () => {
+    localStorage.setItem(COMPOSER_HEIGHT_STORAGE_KEY, '180');
+
+    render(
+      <SessionControls
+        ws={makeWs() as any}
+        activeSession={makeSession({ runtimeType: 'transport', state: 'running' })}
+        quickData={makeQuickData() as any}
+        compact
+      />,
+    );
+
+    const stop = screen.getByRole('button', { name: 'Stop' });
+    const shortcuts = document.querySelector('.shortcuts-transport');
+    expect(shortcuts?.firstElementChild).toBe(stop);
+    expect(screen.queryByRole('separator', { name: 'Resize message input from top edge' })).toBeNull();
+    expect((screen.getByRole('textbox') as HTMLDivElement).style.height).toBe('');
+  });
+
   it('shows copy group action only for main-session controls and hides it from sub/compact surfaces', () => {
     render(
       <SessionControls

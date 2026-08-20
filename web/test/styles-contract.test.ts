@@ -366,9 +366,20 @@ describe('styles.css regression contracts', () => {
 
     const subcardStopRule = css.match(/\.subcard-stop-btn\s*\{[^}]*\}/);
     expect(subcardStopRule).not.toBeNull();
-    expect(subcardStopRule![0]).toMatch(/width:\s*40px/);
-    expect(subcardStopRule![0]).toMatch(/margin-left:\s*-6px/);
-    expect(subcardStopRule![0]).toMatch(/border-radius:\s*0 6px 6px 0/);
+    expect(subcardStopRule![0]).toMatch(/width:\s*28px/);
+    expect(subcardStopRule![0]).toMatch(/min-width:\s*28px/);
+    expect(subcardStopRule![0]).toMatch(/margin-left:\s*0/);
+    expect(subcardStopRule![0]).toMatch(/border-radius:\s*6px/);
+
+    const cardComposerRule = css.match(/\.subcard \.controls-input\s*\{[^}]*\}/);
+    expect(cardComposerRule).not.toBeNull();
+    expect(cardComposerRule![0]).toMatch(/min-height:\s*calc\(1\.45em \+ 10px\)/);
+    expect(cardComposerRule![0]).toMatch(/max-height:\s*calc\(1\.45em \+ 10px\)/);
+
+    const expandedCardComposerRule = css.match(/\.subcard \.controls-composer-mobile-expanded \.controls-input\s*\{[^}]*\}/);
+    expect(expandedCardComposerRule).not.toBeNull();
+    expect(expandedCardComposerRule![0]).toMatch(/min-height:\s*100%/);
+    expect(expandedCardComposerRule![0]).toMatch(/max-height:\s*none/);
   });
 
   it('daemon stats strip keeps the compact tech styling and animated clock digits', () => {

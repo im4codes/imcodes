@@ -5171,7 +5171,15 @@ html.native-ios-mac .chat-dl-btn {
 .subcard-input-area { flex-shrink: 0; border-top: 1px solid rgba(125,211,252,0.12); background: linear-gradient(180deg, #0a101b, #080d16); padding: 5px 6px; display: flex; flex-direction: column; gap: 3px; border-radius: 0 0 8px 8px; }
 .subcard-input-row { display: flex; align-items: stretch; gap: 6px; }
 .subcard-input-main { flex: 1; min-width: 0; }
-.subcard-stop-btn { flex: 0 0 auto; width: 40px; min-width: 40px; margin-left: -6px; border-radius: 0 6px 6px 0; border: 1px solid rgba(239,68,68,0.55); background: rgba(127,29,29,0.32); color: #f87171; cursor: pointer; font-size: 11px; line-height: 1; display: inline-flex; align-items: center; justify-content: center; padding: 0; transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease; }
+/* Card composers deliberately remain a single visible row. Full sessions
+   retain their resizable multi-line composer; compact cards never inherit its
+   saved height or resize affordance. Overflow scrolls rather than expanding. */
+.subcard .controls-input { min-height: calc(1.45em + 10px); max-height: calc(1.45em + 10px); }
+/* A phone user can still explicitly open the existing full-screen composer. */
+.subcard .controls-composer-mobile-expanded .controls-input { min-height: 100%; max-height: none; }
+/* Only used by the plain-input fallback. Cards with SessionControls reuse the
+   ordinary queue-aware Stop in the left toolbar above. */
+.subcard-stop-btn { flex: 0 0 auto; width: 28px; min-width: 28px; margin-left: 0; border-radius: 6px; border: 1px solid rgba(239,68,68,0.55); background: rgba(127,29,29,0.32); color: #f87171; cursor: pointer; font-size: 11px; line-height: 1; display: inline-flex; align-items: center; justify-content: center; padding: 0; transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease; }
 .subcard-stop-btn:hover:not(:disabled) { background: rgba(127,29,29,0.48); border-color: rgba(248,113,113,0.8); color: #fca5a5; }
 .subcard-stop-btn:disabled { opacity: 0.45; cursor: not-allowed; }
 .subcard-input-area .menu-dropdown { z-index: 10000; right: auto; left: 0; max-width: calc(100vw - 24px); }

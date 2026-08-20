@@ -4900,9 +4900,10 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           onContinue={() => { openSpecAutoDeliver.continueRun(); }}
         />
       )}
-      {/* Header control row — compact mode keeps meta controls but still hides terminal shortcuts */}
-      {!hideShortcuts && (!compact || showCompactMetaControls) && <div class="shortcuts-row">
-        {!compact && <div class={`shortcuts${isTransport ? ' shortcuts-transport' : ''}`}>
+      {/* Header control row — compact mode keeps meta controls and the
+          queue-aware transport Stop, but hides terminal shortcuts. */}
+      {!hideShortcuts && (!compact || showCompactMetaControls || isTransport) && <div class="shortcuts-row">
+        {(!compact || isTransport) && <div class={`shortcuts${isTransport ? ' shortcuts-transport' : ''}`}>
           {/* Quick input trigger — shown here (before Esc) when shell terminal hides input row */}
           {isShellLike && (
             <button
@@ -6302,7 +6303,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         */}
         {mobileComposerExpanded && <div class="controls-composer-backdrop" onClick={() => setMobileComposerExpanded(false)} />}
         <div class={`controls-composer${showEmbeddedVoiceButton ? ' controls-composer-with-voice' : ''}${mobileComposerExpanded ? ' controls-composer-mobile-expanded' : ''}`}>
-          {!isMobileLayout && (
+          {!isMobileLayout && !compact && (
             <>
               <div
                 class="controls-composer-resize-edge"
@@ -6331,7 +6332,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
             enterkeyhint={isMobileLayout ? 'send' : undefined}
             style={{
               ...(p2pMode !== 'solo' ? { borderColor: getP2pModeColor(p2pMode), boxShadow: `0 0 0 1px ${getP2pModeColor(p2pMode)}40` } : {}),
-              ...(sharedComposerHeight !== null && !isMobileLayout ? {
+              ...(sharedComposerHeight !== null && !isMobileLayout && !compact ? {
                 height: `${sharedComposerHeight}px`,
                 minHeight: `${sharedComposerHeight}px`,
                 maxHeight: `${sharedComposerHeight}px`,

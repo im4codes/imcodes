@@ -474,7 +474,10 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
       {/* Compact input — reuses SessionControls with @picker, ⚡, 📎, paste upload */}
       <div class="subcard-input-area" onClick={(e) => e.stopPropagation()}>
         <div class="subcard-input-row">
-          {isTransportRuntime(sub) && (
+          {/* Fallback cards do not mount SessionControls. Keep their direct
+              cancel, while compact SessionControls uses the ordinary
+              queue-aware Stop button in its left toolbar. */}
+          {isTransportRuntime(sub) && !quickData && (
             <button
               class="subcard-stop-btn"
               type="button"

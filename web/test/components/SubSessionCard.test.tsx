@@ -507,7 +507,7 @@ describe('SubSessionCard', () => {
     expect(ws.sendSessionCommand).not.toHaveBeenCalledWith('send', expect.objectContaining({ text: '/stop' }));
   });
 
-  it('renders the stop button when the card uses compact SessionControls', async () => {
+  it('uses SessionControls\' queue-aware Stop instead of a duplicate card Stop in compact mode', async () => {
     const { container } = render(
       <SubSessionCard
         sub={makeSubSession({ runtimeType: 'transport', state: 'running' } as any)}
@@ -522,7 +522,12 @@ describe('SubSessionCard', () => {
     );
 
     await waitFor(() => {
-      expect(container.querySelector('.subcard-stop-btn')).not.toBeNull();
+      expect(sessionControlsSpy).toHaveBeenCalled();
+    });
+    expect(container.querySelector('.subcard-stop-btn')).toBeNull();
+    expect(sessionControlsSpy.mock.calls.at(-1)?.[0].activeSession).toMatchObject({
+      runtimeType: 'transport',
+      state: 'running',
     });
   });
 
