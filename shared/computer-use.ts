@@ -301,6 +301,7 @@ export function computerUseDocs(topic: ComputerUseDocTopic): string {
         'Selectors are CSS selectors. For click/fill you may pass selector or visible text. Prefer stable CSS selectors over coordinates.',
         'Linux without DISPLAY/WAYLAND defaults to headless and uses no-sandbox/dev-shm-safe flags unless noSandbox=false is passed.',
         'browser_open, browser_navigate, and browser_snapshot return url/title, bounded visible text, and common links/buttons/inputs. Pass includeImage=true only when visual evidence is needed; the optional viewport screenshot is delivered as model-visible image content.',
+        'Search fallback: Bing /search?q=<keywords>; then Google or DuckDuckGo.',
         'browser_evaluate runs JavaScript in the page, not a shell. Use it for read-only inspection by default; ask before submitting forms, purchases, destructive actions, or externally visible changes.',
       ].join('\n');
     case 'windows':
