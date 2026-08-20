@@ -8934,7 +8934,11 @@ button.quick-agent-delegation-preset.active {
   position: absolute;
   inset: 0;
   z-index: 1;
-  background: transparent;
+  /* A non-zero alpha and its own compositor layer keep Chromium/Edge from
+     pruning this otherwise empty transparent element out of native-video
+     hover hit testing. The alpha is visually imperceptible. */
+  background: rgb(0 0 0 / 0.1%);
+  transform: translateZ(0);
   pointer-events: auto;
   touch-action: none;
 }
