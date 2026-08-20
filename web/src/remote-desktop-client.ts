@@ -72,6 +72,8 @@ export interface RemoteDesktopSnapshot {
   mode: RemoteDesktopAccessMode;
   inputEpoch: number;
   inputEnabled: boolean;
+  /** Capability advertised by the current worker; absent on older workers. */
+  atomicButtonClick?: boolean;
   route?: RemoteDesktopRoute;
   displays: RemoteDesktopDisplay[];
   selectedDisplayId?: string;
@@ -634,6 +636,20 @@ export class RemoteDesktopClient {
     return sent;
   }
 
+  /** Complete a click atomically on the worker so Windows can recognize the
+   * second half of a double-click even when data-channel scheduling is busy. */
+  pointerClick(button: 'left' | 'middle' | 'right' | 'back' | 'forward', x?: number, y?: number): boolean {
+    if (!this.canSendInput()) return false;
+    return this.sendControl({
+      type: REMOTE_DESKTOP_DATA_MSG.POINTER,
+      ...this.inputBase(),
+      kind: REMOTE_DESKTOP_POINTER_KIND.BUTTON_CLICK,
+      button,
+      ...(x === undefined ? {} : { x: Math.max(0, Math.min(1, x)) }),
+      ...(y === undefined ? {} : { y: Math.max(0, Math.min(1, y)) }),
+    });
+  }
+
   wheel(deltaX: number, deltaY: number, x?: number, y?: number): boolean {
     if (!this.canSendInput()) return false;
     return this.sendPointer({
@@ -849,6 +865,7 @@ export class RemoteDesktopClient {
         inputEnabled: this.channelsReady
           && this.workerInputEnabled
           && message.mode === REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
+        atomicButtonClick: message.atomicButtonClick === true,
         viewerCount: message.viewerCount,
         controllerCount: message.controllerCount,
         signInScreen: message.signInScreen === true,
@@ -1333,7 +1350,8 @@ export class RemoteDesktopClient {
       || parsed.value.type === REMOTE_DESKTOP_DATA_MSG.RELEASE_ALL
       || (parsed.value.type === REMOTE_DESKTOP_DATA_MSG.POINTER
         && (parsed.value.kind === REMOTE_DESKTOP_POINTER_KIND.BUTTON_DOWN
-          || parsed.value.kind === REMOTE_DESKTOP_POINTER_KIND.BUTTON_UP))
+          || parsed.value.kind === REMOTE_DESKTOP_POINTER_KIND.BUTTON_UP
+          || parsed.value.kind === REMOTE_DESKTOP_POINTER_KIND.BUTTON_CLICK))
     )) {
       this.pendingInputAckSequence = parsed.value.sequence;
       if (this.inputAckTimer) clearTimeout(this.inputAckTimer);

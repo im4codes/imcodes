@@ -270,6 +270,14 @@ describe('RemoteDesktopClient', () => {
 
     expect(client.key('ControlLeft', 'Control', true, false, { control: true, alt: false })).toBe(true);
     expect(client.pointerButton('left', true, 0.4, 0.6)).toBe(true);
+    expect(client.pointerClick('left', 0.4, 0.6)).toBe(true);
+    expect(JSON.parse(control.sent.at(-1)!)).toMatchObject({
+      type: REMOTE_DESKTOP_DATA_MSG.POINTER,
+      kind: REMOTE_DESKTOP_POINTER_KIND.BUTTON_CLICK,
+      button: 'left',
+      x: 0.4,
+      y: 0.6,
+    });
     client.releasePointerButtons();
     expect(JSON.parse(control.sent.at(-1)!)).toMatchObject({
       type: REMOTE_DESKTOP_DATA_MSG.POINTER,

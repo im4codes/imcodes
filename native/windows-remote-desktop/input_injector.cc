@@ -177,6 +177,16 @@ bool InputArbiter::ButtonUp(const std::string& owner,
   return false;
 }
 
+bool InputArbiter::Click(const std::string& button) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  const auto pending = button_owners_.find(button);
+  if (pending != button_owners_.end()) {
+    if (!pending->second.empty() || !SendButton(button, false)) return false;
+    button_owners_.erase(pending);
+  }
+  return SendClick(button);
+}
+
 bool InputArbiter::Move(const DisplayInfo& display, double x, double y) {
   if (!std::isfinite(x) || !std::isfinite(y) || x < 0 || x > 1 || y < 0 ||
       y > 1) {
@@ -340,6 +350,36 @@ bool InputArbiter::SendButton(const std::string& button, bool down) {
     return false;
   }
   return Dispatch(&input, 1);
+}
+
+bool InputArbiter::SendClick(const std::string& button) {
+  std::array<INPUT, 2> inputs{};
+  DWORD down = 0;
+  DWORD up = 0;
+  DWORD mouse_data = 0;
+  if (button == "left") {
+    down = MOUSEEVENTF_LEFTDOWN;
+    up = MOUSEEVENTF_LEFTUP;
+  } else if (button == "middle") {
+    down = MOUSEEVENTF_MIDDLEDOWN;
+    up = MOUSEEVENTF_MIDDLEUP;
+  } else if (button == "right") {
+    down = MOUSEEVENTF_RIGHTDOWN;
+    up = MOUSEEVENTF_RIGHTUP;
+  } else if (button == "back" || button == "forward") {
+    down = MOUSEEVENTF_XDOWN;
+    up = MOUSEEVENTF_XUP;
+    mouse_data = button == "back" ? XBUTTON1 : XBUTTON2;
+  } else {
+    return false;
+  }
+  inputs[0].type = INPUT_MOUSE;
+  inputs[0].mi.dwFlags = down;
+  inputs[0].mi.mouseData = mouse_data;
+  inputs[1].type = INPUT_MOUSE;
+  inputs[1].mi.dwFlags = up;
+  inputs[1].mi.mouseData = mouse_data;
+  return Dispatch(inputs.data(), static_cast<UINT>(inputs.size()));
 }
 
 bool InputArbiter::Dispatch(INPUT* inputs, UINT count) {

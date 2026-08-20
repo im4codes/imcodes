@@ -415,14 +415,22 @@ describe('remote desktop production contract', () => {
       inputEnabled: true,
       signInScreen: true,
       unlockAvailable: true,
+      atomicButtonClick: true,
     };
     expect(validateRemoteDesktopServerMessage(status)).toMatchObject({ ok: true });
     // Both are optional: an older node reports neither and stays valid.
-    const { signInScreen: _signIn, unlockAvailable: _unlock, ...bare } = status;
+    const {
+      signInScreen: _signIn,
+      unlockAvailable: _unlock,
+      atomicButtonClick: _atomicButtonClick,
+      ...bare
+    } = status;
     expect(validateRemoteDesktopServerMessage(bare)).toMatchObject({ ok: true });
     expect(validateRemoteDesktopServerMessage({ ...status, signInScreen: 'yes' }))
       .toEqual({ ok: false, error: REMOTE_DESKTOP_ERROR.INVALID_REQUEST });
     expect(validateRemoteDesktopServerMessage({ ...status, unlockAvailable: 1 }))
+      .toEqual({ ok: false, error: REMOTE_DESKTOP_ERROR.INVALID_REQUEST });
+    expect(validateRemoteDesktopServerMessage({ ...status, atomicButtonClick: 'yes' }))
       .toEqual({ ok: false, error: REMOTE_DESKTOP_ERROR.INVALID_REQUEST });
   });
 
@@ -495,6 +503,17 @@ describe('remote desktop production contract', () => {
       y: 1,
     };
     expect(validateRemoteDesktopDataMessage(move)).toMatchObject({ ok: true });
+    expect(validateRemoteDesktopDataMessage({
+      ...move,
+      sequence: 10,
+      kind: REMOTE_DESKTOP_POINTER_KIND.BUTTON_CLICK,
+      button: 'left',
+    })).toMatchObject({ ok: true });
+    expect(validateRemoteDesktopDataMessage({
+      ...move,
+      sequence: 11,
+      kind: REMOTE_DESKTOP_POINTER_KIND.BUTTON_CLICK,
+    })).toEqual({ ok: false, error: REMOTE_DESKTOP_ERROR.INVALID_REQUEST });
     expect(validateRemoteDesktopDataMessage({ ...move, x: -0.01 })).toEqual({ ok: false, error: REMOTE_DESKTOP_ERROR.INVALID_REQUEST });
     expect(validateRemoteDesktopDataMessage({ ...move, button: 'left' })).toEqual({ ok: false, error: REMOTE_DESKTOP_ERROR.INVALID_REQUEST });
     expect(validateRemoteDesktopDataMessage({ ...move, sequence: Number.MAX_SAFE_INTEGER + 1 })).toEqual({ ok: false, error: REMOTE_DESKTOP_ERROR.INVALID_REQUEST });

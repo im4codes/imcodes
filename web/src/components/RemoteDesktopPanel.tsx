@@ -1302,12 +1302,20 @@ export function RemoteDesktopPanel({
         commandMiddleDragPointerRef.current = event.pointerId;
       }
     }
-    const sent = clientRef.current?.pointerButton(
-      button,
-      down,
-      sendPoint?.x,
-      sendPoint?.y,
-    ) ?? false;
+    // The first click has already completed. Finish the recognized double
+    // click as one native down/up batch so SCTP scheduling or a late hover
+    // packet cannot split its second half. Its physical pointer-up is then a
+    // local lifecycle event only.
+    const sent = down && snappedDoubleClick && snapshot.atomicButtonClick
+      ? (clientRef.current?.pointerClick(button, sendPoint?.x, sendPoint?.y) ?? false)
+      : !down && activePress?.snappedDoubleClick && snapshot.atomicButtonClick
+        ? true
+        : (clientRef.current?.pointerButton(
+            button,
+            down,
+            sendPoint?.x,
+            sendPoint?.y,
+          ) ?? false);
     if (down && sent && sendPoint) {
       desktopPointerPressesRef.current.set(event.pointerId, {
         button,

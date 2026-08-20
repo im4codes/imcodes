@@ -212,6 +212,27 @@ const contracts: Contract[] = [
     ],
   },
   {
+    name: 'desktop double-click completes its second click atomically',
+    guards: [
+      {
+        path: 'shared/remote-desktop.ts',
+        needle: "BUTTON_CLICK: 'button_click',",
+      },
+      {
+        path: 'web/src/components/RemoteDesktopPanel.tsx',
+        needle: 'clientRef.current?.pointerClick(button, sendPoint?.x, sendPoint?.y)',
+      },
+      {
+        path: 'native/windows-remote-desktop/input_injector.cc',
+        needle: 'return Dispatch(inputs.data(), static_cast<UINT>(inputs.size()));',
+      },
+      {
+        path: 'native/windows-remote-desktop/peer_session.cc',
+        needle: 'root["atomicButtonClick"] = true;',
+      },
+    ],
+  },
+  {
     name: 'layout-correlated input enable and explicit removed-display choice',
     guards: [
       {

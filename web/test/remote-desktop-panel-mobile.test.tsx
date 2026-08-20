@@ -14,6 +14,7 @@ vi.mock('react-i18next', () => ({
 }));
 
 const pointerButton = vi.fn(() => true);
+const pointerClick = vi.fn(() => true);
 const pointerMove = vi.fn();
 const wheel = vi.fn(() => true);
 const releaseAll = vi.fn();
@@ -32,6 +33,7 @@ const { uploadFileWithDirectFallback } = vi.hoisted(() => ({
 }));
 const clientHooks: Array<{ onSnapshot(value: unknown): void }> = [];
 const clientStarts: number[] = [];
+let atomicButtonClickAdvertised = true;
 
 vi.mock('../src/remote-desktop-client.js', () => ({
   RemoteDesktopClient: class {
@@ -42,6 +44,7 @@ vi.mock('../src/remote-desktop-client.js', () => ({
         mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
         inputEpoch: 1,
         inputEnabled: true,
+        atomicButtonClick: atomicButtonClickAdvertised,
         route: 'direct',
         displays: [
           {
@@ -64,6 +67,7 @@ vi.mock('../src/remote-desktop-client.js', () => ({
     releasePointerButtons = releasePointerButtons;
     acknowledgePresentedFrame = acknowledgePresentedFrame;
     pointerButton = pointerButton;
+    pointerClick = pointerClick;
     pointerMove = pointerMove;
     wheel = wheel;
     key = key;
@@ -100,6 +104,7 @@ afterEach(() => {
   vi.useRealTimers();
   clientHooks.length = 0;
   clientStarts.length = 0;
+  atomicButtonClickAdvertised = true;
   localStorage.removeItem('rcc_float_remote-desktop-server-1');
 });
 
@@ -781,6 +786,7 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     const { stage } = await renderPanel();
     vi.useFakeTimers();
     pointerButton.mockClear();
+    pointerClick.mockClear();
 
     mousePointer(stage, 'pointerdown', {
       pointerId: 70, clientX: 200, clientY: 150,
@@ -796,6 +802,28 @@ describe('RemoteDesktopPanel mobile gestures', () => {
       pointerId: 71, clientX: 206, clientY: 154,
     });
 
+    expect(pointerButton.mock.calls).toEqual([
+      ['left', true, 0.5, 0.5],
+      ['left', false, 0.5, 0.5],
+    ]);
+    expect(pointerClick).toHaveBeenCalledOnce();
+    expect(pointerClick).toHaveBeenCalledWith('left', 0.5, 0.5);
+  });
+
+  it('keeps the legacy down/up double-click sequence for an older worker', async () => {
+    atomicButtonClickAdvertised = false;
+    const { stage } = await renderPanel();
+    vi.useFakeTimers();
+    pointerButton.mockClear();
+    pointerClick.mockClear();
+
+    mousePointer(stage, 'pointerdown', { pointerId: 72, clientX: 200, clientY: 150 });
+    mousePointer(stage, 'pointerup', { pointerId: 72, clientX: 200, clientY: 150 });
+    act(() => { vi.advanceTimersByTime(120); });
+    mousePointer(stage, 'pointerdown', { pointerId: 73, clientX: 206, clientY: 154 });
+    mousePointer(stage, 'pointerup', { pointerId: 73, clientX: 206, clientY: 154 });
+
+    expect(pointerClick).not.toHaveBeenCalled();
     expect(pointerButton.mock.calls).toEqual([
       ['left', true, 0.5, 0.5],
       ['left', false, 0.5, 0.5],

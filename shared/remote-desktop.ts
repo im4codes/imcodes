@@ -133,6 +133,7 @@ export const REMOTE_DESKTOP_POINTER_KIND = {
   MOVE: 'move',
   BUTTON_DOWN: 'button_down',
   BUTTON_UP: 'button_up',
+  BUTTON_CLICK: 'button_click',
   WHEEL: 'wheel',
 } as const;
 
@@ -483,6 +484,8 @@ export interface RemoteDesktopStatus {
   selectedDisplayId?: string;
   layoutRevision?: number;
   inputEnabled: boolean;
+  /** This worker can atomically inject the second click of a desktop double-click. */
+  atomicButtonClick?: boolean;
   viewerCount?: number;
   controllerCount?: number;
   /**
@@ -873,9 +876,10 @@ export function validateRemoteDesktopDaemonMessage(value: unknown): RemoteDeskto
       : invalid();
   }
   if (value.type === REMOTE_DESKTOP_MSG.STATUS) {
-    if (!hasExactKeys(value, ['type', 'requestId', 'sessionId', 'capability', 'mode', 'inputEpoch', 'state', 'inputEnabled'], ['route', 'selectedDisplayId', 'layoutRevision', 'viewerCount', 'controllerCount', 'signInScreen', 'unlockAvailable', 'inputBlocked'])
+    if (!hasExactKeys(value, ['type', 'requestId', 'sessionId', 'capability', 'mode', 'inputEpoch', 'state', 'inputEnabled'], ['route', 'selectedDisplayId', 'layoutRevision', 'viewerCount', 'controllerCount', 'signInScreen', 'unlockAvailable', 'inputBlocked', 'atomicButtonClick'])
       || (value.signInScreen !== undefined && typeof value.signInScreen !== 'boolean')
       || (value.unlockAvailable !== undefined && typeof value.unlockAvailable !== 'boolean')
+      || (value.atomicButtonClick !== undefined && typeof value.atomicButtonClick !== 'boolean')
       || (value.inputBlocked !== undefined
         && !(Object.values(REMOTE_DESKTOP_INPUT_BLOCKED) as string[]).includes(value.inputBlocked as string))
       || (value.inputBlocked !== undefined && value.inputEnabled === true)
@@ -1037,7 +1041,9 @@ function validatePointer(value: Record<string, unknown>): boolean {
     return isFiniteRange(value.x, 0, 1) && isFiniteRange(value.y, 0, 1)
       && value.button === undefined && value.deltaX === undefined && value.deltaY === undefined;
   }
-  if (value.kind === REMOTE_DESKTOP_POINTER_KIND.BUTTON_DOWN || value.kind === REMOTE_DESKTOP_POINTER_KIND.BUTTON_UP) {
+  if (value.kind === REMOTE_DESKTOP_POINTER_KIND.BUTTON_DOWN
+    || value.kind === REMOTE_DESKTOP_POINTER_KIND.BUTTON_UP
+    || value.kind === REMOTE_DESKTOP_POINTER_KIND.BUTTON_CLICK) {
     return typeof value.button === 'string' && POINTER_BUTTONS.has(value.button)
       && (value.x === undefined || isFiniteRange(value.x, 0, 1))
       && (value.y === undefined || isFiniteRange(value.y, 0, 1))

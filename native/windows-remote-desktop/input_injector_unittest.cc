@@ -37,11 +37,13 @@ class RecordingInput {
       return 0;
     }
     events.insert(events.end(), inputs, inputs + count);
+    batch_sizes.push_back(count);
     return count;
   }
 
   bool fail_next_ = false;
   std::vector<INPUT> events;
+  std::vector<UINT> batch_sizes;
 };
 
 TEST(InputArbiterTest, KeepsConcurrentControllerKeyOwnershipIndependent) {
@@ -148,6 +150,25 @@ TEST(InputArbiterTest, RetainsAndRetriesReleaseThatFailsDuringTeardown) {
   EXPECT_TRUE(input.RetryPendingReleases());
   ASSERT_EQ(recording.events.size(), 2u);
   EXPECT_NE(recording.events[1].mi.dwFlags & MOUSEEVENTF_MIDDLEUP, 0u);
+}
+
+TEST(InputArbiterTest, CompletesClickAsOneNativeInputBatch) {
+  RecordingInput recording;
+  InputArbiter input([&](UINT count, LPINPUT values, int size) {
+    return recording.Send(count, values, size);
+  });
+
+  ASSERT_TRUE(input.Click("left"));
+  ASSERT_EQ(recording.events.size(), 2u);
+  ASSERT_EQ(recording.batch_sizes.size(), 1u);
+  EXPECT_EQ(recording.batch_sizes[0], 2u);
+  EXPECT_NE(recording.events[0].mi.dwFlags & MOUSEEVENTF_LEFTDOWN, 0u);
+  EXPECT_NE(recording.events[1].mi.dwFlags & MOUSEEVENTF_LEFTUP, 0u);
+
+  ASSERT_TRUE(input.ButtonDown("peer-a", "left"));
+  EXPECT_FALSE(input.Click("left"));
+  EXPECT_TRUE(input.ButtonUp("peer-a", "left"));
+  EXPECT_FALSE(input.Click("sixth"));
 }
 
 TEST(InputArbiterTest, CrashRecoveryReleasesOnlySupportedKeysAndButtons) {

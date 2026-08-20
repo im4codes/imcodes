@@ -1117,7 +1117,8 @@ void PeerSession::HandlePointer(const std::string& channel,
       root["y"].asDouble() <= 1.0) {
     accepted = input_->Move(displays_[selected_display_], root["x"].asDouble(),
                             root["y"].asDouble());
-  } else if ((kind == "button_down" || kind == "button_up") &&
+  } else if ((kind == "button_down" || kind == "button_up" ||
+              kind == "button_click") &&
              root["button"].isString() && !root.isMember("deltaX") &&
              !root.isMember("deltaY") &&
              (!root.isMember("x") || (root["x"].isNumeric() &&
@@ -1129,11 +1130,15 @@ void PeerSession::HandlePointer(const std::string& channel,
                       root["y"].asDouble())) {
       return;
     }
-    accepted = kind == "button_down"
-                   ? input_->ButtonDown(authority_.session_id,
-                                        root["button"].asString())
-                   : input_->ButtonUp(authority_.session_id,
-                                      root["button"].asString());
+    if (kind == "button_down") {
+      accepted = input_->ButtonDown(authority_.session_id,
+                                    root["button"].asString());
+    } else if (kind == "button_up") {
+      accepted = input_->ButtonUp(authority_.session_id,
+                                  root["button"].asString());
+    } else {
+      accepted = input_->Click(root["button"].asString());
+    }
   } else if (kind == "wheel" && root["deltaX"].isNumeric() &&
              root["deltaY"].isNumeric() && !root.isMember("button") &&
              root["deltaX"].asDouble() >= -10000.0 &&
@@ -1156,7 +1161,8 @@ void PeerSession::HandlePointer(const std::string& channel,
     last_sequence_by_channel_[channel] = sequence;
     TouchActivity();
     if (channel == kControlChannel &&
-        (kind == "button_down" || kind == "button_up")) {
+        (kind == "button_down" || kind == "button_up" ||
+         kind == "button_click")) {
       SendInputAck(sequence);
     }
   }
@@ -1326,6 +1332,7 @@ void PeerSession::SendStatus(const char* state, bool input_enabled) {
     root["layoutRevision"] = layout_revision_;
   }
   root["inputEnabled"] = input_enabled;
+  root["atomicButtonClick"] = true;
   if (!input_enabled) {
     // A session that is connected and controlling but cannot type is the most
     // opaque state this protocol has: every control greys out with nothing to

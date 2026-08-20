@@ -31,6 +31,7 @@ class InputArbiter {
   bool KeyUp(const std::string& owner, const std::string& code);
   bool ButtonDown(const std::string& owner, const std::string& button);
   bool ButtonUp(const std::string& owner, const std::string& button);
+  bool Click(const std::string& button);
   bool Move(const DisplayInfo& display, double x, double y);
   bool Wheel(double delta_x, double delta_y);
   bool Text(const std::u16string& value);
@@ -42,6 +43,7 @@ class InputArbiter {
   bool Dispatch(INPUT* inputs, UINT count);
   bool SendKey(const std::string& code, bool down);
   bool SendButton(const std::string& button, bool down);
+  bool SendClick(const std::string& button);
 
   const SendInputFn send_input_;
   const InputAvailableFn input_available_;
