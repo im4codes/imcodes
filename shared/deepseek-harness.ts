@@ -171,6 +171,24 @@ export const DSH_CHUNK_TYPE = {
 /** Cordis plugin id of the bridge row the daemon inserts into the overlay. */
 export const DSH_BRIDGE_PLUGIN_ID = 'imcodes-dsh-bridge';
 
+/** Cordis loader row id of the agent's default model selection. */
+export const DSH_AGENT_DEFAULT_MODEL_ROW_ID = 'agent-default-model';
+
+/**
+ * LLM config the daemon writes into the overlay so dsh talks to the
+ * ccPreset's endpoint on the first turn (settings-based, not env).
+ */
+export interface DshLlmConfig {
+  /** Registered provider route key (e.g. the normalized preset name 'minimax'). */
+  provider: string;
+  /** Provider-owned model id. */
+  model: string;
+  /** Endpoint / base URL of the provider. */
+  baseUrl?: string;
+  /** API key / auth token for the provider. */
+  apiKey?: string;
+}
+
 /** Environment variable carrying the session id the bridge should resume. */
 export const DSH_BRIDGE_RESUME_ENV = 'IMCODES_DSH_RESUME_SESSION_ID';
 

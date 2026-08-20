@@ -16,6 +16,7 @@ import type { SessionContextBootstrapState } from '../../shared/session-context-
 import type { ProviderQuotaMeta } from '../../shared/provider-quota.js';
 import type { TransportAttachment } from '../../shared/transport-attachments.js';
 import type { MemoryMcpProviderStatusView } from '../../shared/memory-ws.js';
+import type { DshLlmConfig } from '../../shared/deepseek-harness.js';
 import type {
   AgentDelegationActiveNotificationMode,
   AgentDelegationNotificationResult,
@@ -305,6 +306,12 @@ export interface SessionConfig {
   contextAuthoredContextFilePath?: string;
   /** Provider-specific SDK/CLI settings object or settings file path. */
   settings?: string | Record<string, unknown>;
+  /**
+   * DeepSeek Harness (dsh) LLM config, materialized into the dsh overlay's
+   * `agent-default-model` row (settings-based, not env vars). Consumed only
+   * by the `deepseek-harness` provider.
+   */
+  llm?: DshLlmConfig;
   /** Parent session key for sub-sessions. */
   parentSessionKey?: string;
   /** If binding to an already-existing remote session, use this key directly. */

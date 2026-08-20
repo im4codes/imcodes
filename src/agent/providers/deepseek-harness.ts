@@ -52,6 +52,7 @@ import {
   type DshBridgeCommand,
   type DshBridgeEvent,
   type DshBridgeTurnReason,
+  type DshLlmConfig,
 } from '../../../shared/deepseek-harness.js';
 import {
   buildDshArgs,
@@ -91,6 +92,12 @@ interface DeepseekHarnessSessionState {
   /** Model IM.codes asked for; pinned across respawns until the user changes it. */
   requestedModel?: string;
   provider?: string;
+  /**
+   * LLM config materialized from a ccPreset — written into the dsh overlay's
+   * `agent-default-model` row (settings-based, not env). Distinct from
+   * `requestedModel`, which is only the model name for the env fallback.
+   */
+  llmConfig?: DshLlmConfig;
   /** Durable harness session id, used to resume after a restart. */
   harnessSessionId?: string;
   child: ChildProcess | null;
@@ -214,6 +221,7 @@ export class DeepseekHarnessProvider implements TransportProvider {
       lastStatusSignature: null,
       disposed: false,
       memoryMcp: this.buildMemoryMcp(config),
+      llmConfig: config.llm,
     });
     return routeId;
   }
@@ -392,6 +400,7 @@ export class DeepseekHarnessProvider implements TransportProvider {
     const overlayPath = await writeDshOverlay({
       sessionKey: state.routeId,
       ...(state.memoryMcp ? { memoryMcp: state.memoryMcp } : {}),
+      ...(state.llmConfig ? { llm: state.llmConfig } : {}),
     });
     const resumeId = state.harnessSessionId;
     // On Windows `dsh` is an npm .cmd shim, which bare spawn() cannot execute;
@@ -406,9 +415,10 @@ export class DeepseekHarnessProvider implements TransportProvider {
         [DSH_BRIDGE_CWD_ENV]: state.cwd,
         ...(resumeId ? { [DSH_BRIDGE_RESUME_ENV]: resumeId } : {}),
         // The harness picks the model when it creates the agent, so IM.codes
-        // overrides it there rather than through the overlay: the provider
-        // ROUTE is only knowable after a first boot, and a model without its
-        // route is exactly the half-specified pair buildDshOverlay refuses.
+        // pins it here too. A ccPreset's LLM config (route + model + endpoint + key)
+        // rides the overlay's `agent-default-model` row (settings-based, via
+        // `state.llmConfig`); this env var is only the bare model name for the
+        // env-reading path, and remains for a model-only pin without a preset.
         ...(state.requestedModel ? { [DSH_BRIDGE_MODEL_ENV]: state.requestedModel } : {}),
       },
       stdio: ['pipe', 'pipe', 'pipe'],

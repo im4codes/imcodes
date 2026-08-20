@@ -27,6 +27,7 @@ vi.mock('../../src/agent/providers/deepseek-harness/runtime.js', async (importOr
 
 import { DeepseekHarnessProvider } from '../../src/agent/providers/deepseek-harness.js';
 import {
+  DSH_AGENT_DEFAULT_MODEL_ROW_ID,
   DSH_BRIDGE_COMMAND,
   DSH_BRIDGE_EVENT,
   DSH_BRIDGE_MODEL_ENV,
@@ -596,5 +597,25 @@ describe('buildDshOverlay', () => {
     // ever produce the unroutable half-specified pair.
     const rows = buildDshOverlay({});
     expect(rows.some((row) => row.id === 'agent-default-model')).toBe(false);
+  });
+
+  it('emits a top-level agent-default-model row when a ccPreset LLM config is supplied', () => {
+    const rows = buildDshOverlay({
+      llm: {
+        provider: 'minimax',
+        model: 'MiniMax-M.27',
+        baseUrl: 'https://api.minimax.io/anthropic',
+        apiKey: 'sk-test-key',
+      },
+    });
+    // The model row is a TOP-LEVEL row, not inside `insert`.
+    const modelRow = rows.find((row) => row.id === DSH_AGENT_DEFAULT_MODEL_ROW_ID);
+    expect(modelRow).toBeDefined();
+    expect(modelRow?.config).toMatchObject({
+      provider: 'minimax',
+      model: 'MiniMax-M.27',
+      baseUrl: 'https://api.minimax.io/anthropic',
+      apiKey: 'sk-test-key',
+    });
   });
 });

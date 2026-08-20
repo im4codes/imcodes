@@ -30,7 +30,11 @@ import { mkdir, rm, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { DSH_BRIDGE_PLUGIN_ID } from '../../../../shared/deepseek-harness.js';
+import {
+  DSH_AGENT_DEFAULT_MODEL_ROW_ID,
+  DSH_BRIDGE_PLUGIN_ID,
+  type DshLlmConfig,
+} from '../../../../shared/deepseek-harness.js';
 import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../../../shared/memory-mcp-server-name.js';
 
 /** Stock profile we overlay. `dsh` owns its bootstrap and dependency install. */
@@ -80,6 +84,8 @@ export interface DshOverlayOptions {
   sessionKey: string;
   /** IM.codes memory MCP server, mounted so the agent gets memory/send/cron tools. */
   memoryMcp?: DshMcpServer;
+  /** LLM config written into the `agent-default-model` row (settings-based). */
+  llm?: DshLlmConfig;
 }
 
 interface DshPatchRow {
@@ -93,12 +99,15 @@ interface DshPatchRow {
 /**
  * Compose the overlay rows.
  *
- * Model selection is deliberately NOT here. The harness's `agent-default-model`
- * row needs a provider ROUTE as well as a model, and that route is only
- * knowable after a first boot — so a requested model rides to the bridge as an
- * env var and is applied at `agents.create()` instead (see DSH_BRIDGE_MODEL_ENV).
+ * When a ccPreset supplies an LLM config (`options.llm`), the `agent-default-model`
+ * row carries the full `{provider, model, baseUrl?, apiKey?}` — the settings-based
+ * equivalent of the env-var mechanism CC SDK and qwen use. Without a preset, no model
+ * row is emitted: a requested model then rides to the bridge as an env var and is
+ * applied at `agents.create()` (see DSH_BRIDGE_MODEL_ENV).
  */
-export function buildDshOverlay(options: Pick<DshOverlayOptions, 'memoryMcp'>): DshPatchRow[] {
+export function buildDshOverlay(
+  options: Pick<DshOverlayOptions, 'memoryMcp' | 'llm'>,
+): DshPatchRow[] {
   const rows: DshPatchRow[] = DSH_DISABLED_ROW_IDS.map((id) => ({ id, disabled: true }));
   const insert: DshPatchRow[] = [];
   if (options.memoryMcp) {
@@ -119,6 +128,15 @@ export function buildDshOverlay(options: Pick<DshOverlayOptions, 'memoryMcp'>): 
   }
   insert.push({ id: DSH_BRIDGE_PLUGIN_ID, name: resolveBridgeEntry() });
   rows.push({ insert });
+  if (options.llm) {
+    const llmConfig: Record<string, unknown> = {
+      provider: options.llm.provider,
+      model: options.llm.model,
+    };
+    if (options.llm.baseUrl) llmConfig.baseUrl = options.llm.baseUrl;
+    if (options.llm.apiKey) llmConfig.apiKey = options.llm.apiKey;
+    rows.push({ id: DSH_AGENT_DEFAULT_MODEL_ROW_ID, config: llmConfig });
+  }
   return rows;
 }
 

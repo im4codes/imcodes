@@ -18,6 +18,7 @@ import {
   type CcPreset,
   type CcPresetModelInfo,
 } from '../../shared/cc-presets.js';
+import type { DshLlmConfig } from '../../shared/deepseek-harness.js';
 import logger from '../util/logger.js';
 
 const PRESETS_PATH = join(homedir(), '.imcodes', 'cc-presets.json');
@@ -322,6 +323,60 @@ export async function getQwenPresetTransportConfig(presetName: string): Promise<
   return {
     env,
     ...(settings ? { settings } : {}),
+    ...(model ? { model } : {}),
+    ...(availableModels.length ? { availableModels } : {}),
+    ...(runtimeFacts ? { systemPrompt: runtimeFacts } : {}),
+    ...(preset.contextWindow ? { contextWindow: preset.contextWindow } : {}),
+  };
+}
+
+export async function getDshPresetTransportConfig(presetName: string): Promise<{
+  env: Record<string, string>;
+  llm?: DshLlmConfig;
+  model?: string;
+  availableModels?: string[];
+  systemPrompt?: string;
+  contextWindow?: number;
+}> {
+  const preset = await getPreset(presetName);
+  if (!preset) return { env: {} };
+
+  const resolvedEnv = await resolvePresetEnv(presetName);
+  const availableModels = getPresetAvailableModelIds(preset);
+  const model = getPresetEffectiveModel(preset) ?? availableModels[0];
+  const baseUrl = resolvedEnv['ANTHROPIC_BASE_URL']?.trim() || undefined;
+  const apiKey = resolvedEnv['ANTHROPIC_API_KEY']?.trim()
+    || resolvedEnv['ANTHROPIC_AUTH_TOKEN']?.trim()
+    || undefined;
+
+  // DeepSeek Harness (dsh) is settings-based, not env-var based: the LLM
+  // config (provider route + model + endpoint + key) rides in the dsh
+  // overlay's `agent-default-model` row (carried here as `llm`), so only the
+  // model is mirrored into env as a fallback for any env-reading path.
+  const env: Record<string, string> = {};
+  if (model) env['ANTHROPIC_MODEL'] = model;
+
+  const llm = (model || baseUrl)
+    ? {
+        provider: normalizeCcPresetName(preset.name),
+        model: model ?? availableModels[0],
+        ...(baseUrl ? { baseUrl } : {}),
+        ...(apiKey ? { apiKey } : {}),
+      }
+    : undefined;
+
+  const runtimeFacts = (model || baseUrl) ? [
+    `Authoritative runtime fact: this session is routed through the "${preset.name}" API provider preset.`,
+    baseUrl ? `Authoritative provider endpoint: ${baseUrl}.` : undefined,
+    model ? `Authoritative runtime model: ${model}.` : undefined,
+    model ? `If the user asks which model you are using, answer exactly with "${model}".` : undefined,
+    baseUrl ? `If the user asks which provider or endpoint you are using, mention "${baseUrl}".` : undefined,
+    'These runtime facts override any generic default model or provider.',
+  ].filter(Boolean).join(' ') : undefined;
+
+  return {
+    env,
+    ...(llm ? { llm } : {}),
     ...(model ? { model } : {}),
     ...(availableModels.length ? { availableModels } : {}),
     ...(runtimeFacts ? { systemPrompt: runtimeFacts } : {}),

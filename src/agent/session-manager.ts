@@ -7,6 +7,7 @@ import { ShellDriver } from './drivers/shell.js';
 import { GeminiDriver } from './drivers/gemini.js';
 import type { AgentDriver } from './drivers/base.js';
 import type { AgentType } from './detect.js';
+import type { DshLlmConfig } from '../../shared/deepseek-harness.js';
 import { isTransportAgent } from './detect.js';
 import {
   buildTransportResumeLaunchOpts,
@@ -2508,6 +2509,7 @@ export async function restoreTransportSessions(
       let effectiveRequestedModel = requestedTransportModel;
       let restoredPresetContextWindow = s.presetContextWindow;
       let qwenPresetUsesApiKey = false;
+      let dshLlmConfig: DshLlmConfig | undefined;
       const resolveRuntimeContextBootstrap = () => resolveTransportContextBootstrap({
         projectDir: s.projectDir,
         transportConfig: getSession(s.name)?.transportConfig ?? s.transportConfig ?? {},
@@ -2545,6 +2547,15 @@ export async function restoreTransportSessions(
         // Override the qwen CLI's built-in "I am Qwen Code" identity with the
         // preset's runtime-facts prompt — without this, the model introduces
         // itself as Qwen / 通义千问 even when the turn is served by MiniMax.
+        if (presetConfig.systemPrompt) systemPrompt = presetConfig.systemPrompt;
+      } else if (s.providerId === 'deepseek-harness' && s.ccPreset) {
+        const { getDshPresetTransportConfig } = await import('../daemon/cc-presets.js');
+        const presetConfig = await getDshPresetTransportConfig(s.ccPreset);
+        extraEnv = { ...(extraEnv ?? {}), ...presetConfig.env };
+        dshLlmConfig = presetConfig.llm;
+        const presetPreferredModel = presetConfig.model;
+        if (presetPreferredModel && !effectiveRequestedModel) effectiveRequestedModel = presetPreferredModel;
+        restoredPresetContextWindow = presetConfig.contextWindow ?? restoredPresetContextWindow;
         if (presetConfig.systemPrompt) systemPrompt = presetConfig.systemPrompt;
       }
       if (s.providerId === 'qwen'
@@ -2587,6 +2598,7 @@ export async function restoreTransportSessions(
         contextRetryExhausted: contextBootstrap.retryExhausted,
         contextSharedPolicyOverride: contextBootstrap.sharedPolicyOverride,
         agentId: effectiveRequestedModel,
+        ...(dshLlmConfig ? { llm: dshLlmConfig } : {}),
         resumeId,
         effort: s.effort,
         // Restore path: only re-inject startup memory if the prior run hadn't

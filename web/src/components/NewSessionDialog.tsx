@@ -87,6 +87,15 @@ type AgentType =
   | "deepseek-harness"
   | "openclaw"
   | "qwen";
+
+// Transports that can act as a "custom provider SDK" compatibility layer —
+// i.e. they can point at an arbitrary LLM API endpoint via a CC preset.
+const CUSTOM_PROVIDER_SDK_AGENT_TYPES = new Set<AgentType>([
+  "claude-code",
+  "claude-code-sdk",
+  "qwen",
+  "deepseek-harness",
+]);
 type OpenClawMode = "new" | "bind";
 
 interface RemoteSession {
@@ -399,6 +408,15 @@ export function NewSessionDialog({
     if (!ccPreset && ccPresets.length > 0) setCcPreset(ccPresets[0].name);
   }, [agentType, ccPreset, ccPresets, customProviderSdk]);
 
+  // If the selected transport can't act as a custom-provider layer, clear
+  // the checkbox (and its preset) so the UI doesn't carry stale state.
+  useEffect(() => {
+    if (!CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(agentType) && customProviderSdk) {
+      setCustomProviderSdk(false);
+      setCcPreset("");
+    }
+  }, [agentType, customProviderSdk]);
+
   const handleStart = () => {
     if (!project.trim()) {
       setError(t("new_session.project_required"));
@@ -456,7 +474,7 @@ export function NewSessionDialog({
       });
     } else {
       const extra: Record<string, unknown> = {};
-      if (ccPreset && (agentType === "claude-code" || agentType === "claude-code-sdk" || agentType === "qwen"))
+      if (ccPreset && CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(agentType))
         extra.ccPreset = ccPreset;
       if (ccInitPrompt.trim() && agentType === "claude-code")
         extra.ccInitPrompt = ccInitPrompt.trim();
@@ -510,7 +528,7 @@ export function NewSessionDialog({
             : agentType === "openclaw"
               ? OPENCLAW_THINKING_LEVELS
               : [];
-  const supportsCcPreset = agentType === "claude-code" || agentType === "claude-code-sdk" || agentType === "qwen";
+  const supportsCcPreset = CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(agentType);
   const providerPresetLabel = customProviderSdk
     ? t("new_session.custom_provider_preset")
     : agentType === "qwen"
@@ -750,61 +768,63 @@ export function NewSessionDialog({
            * on parent .form-group width (which is correctly responsive
            * via `.dialog`'s width:100%; max-width:calc(100vw - ...)`).
            */}
-          <div style={{ marginTop: 10 }}>
-            <label
-              style={{
-                display: "flex",
-                alignItems: "center",
-                gap: 8,
-                cursor: starting ? "not-allowed" : "pointer",
-              }}
-            >
-              {/*
-               * width:auto is REQUIRED to override the global
-               * `.form-group input { width: 100% }` rule. Without it the
-               * checkbox stretches to the full label width (≈340 px),
-               * pushing the span past the dialog's right edge. The span
-               * then inherits `overflow-wrap: anywhere` from the dialog
-               * root and wraps the "Custom provider SDK" label as a
-               * one-character-per-line vertical strip on the screen edge.
-               * Setting margin:0 is paired defense in case form-group ever
-               * grows side margins on inputs.
-               */}
-              <input
-                type="checkbox"
-                checked={customProviderSdk}
-                disabled={starting}
-                onChange={(e) =>
-                  toggleCustomProviderSdk((e.target as HTMLInputElement).checked)
-                }
-                style={{ flex: "0 0 auto", width: "auto", margin: 0 }}
-              />
-              <span
+          {supportsCcPreset && (
+            <div style={{ marginTop: 10 }}>
+              <label
                 style={{
-                  color: "#e2e8f0",
-                  fontSize: 13,
-                  // Match the help text: break at word boundaries, not
-                  // characters, in case the label ever grows to overflow.
-                  overflowWrap: "break-word",
-                  minWidth: 0,
-                  flex: "1 1 auto",
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 8,
+                  cursor: starting ? "not-allowed" : "pointer",
                 }}
               >
-                {t("new_session.custom_provider_sdk")}
-              </span>
-            </label>
-            <div
-              style={{
-                marginLeft: 24,
-                marginTop: 4,
-                color: "#94a3b8",
-                fontSize: 12,
-                lineHeight: 1.35,
-              }}
-            >
-              {t("new_session.custom_provider_sdk_help")}
+                {/*
+                 * width:auto is REQUIRED to override the global
+                 * `.form-group input { width: 100% }` rule. Without it the
+                 * checkbox stretches to the full label width (≈340 px),
+                 * pushing the span past the dialog's right edge. The span
+                 * then inherits `overflow-wrap: anywhere` from the dialog
+                 * root and wraps the "Custom provider SDK" label as a
+                 * one-character-per-line vertical strip on the screen edge.
+                 * Setting margin:0 is paired defense in case form-group ever
+                 * grows side margins on inputs.
+                 */}
+                <input
+                  type="checkbox"
+                  checked={customProviderSdk}
+                  disabled={starting}
+                  onChange={(e) =>
+                    toggleCustomProviderSdk((e.target as HTMLInputElement).checked)
+                  }
+                  style={{ flex: "0 0 auto", width: "auto", margin: 0 }}
+                />
+                <span
+                  style={{
+                    color: "#e2e8f0",
+                    fontSize: 13,
+                    // Match the help text: break at word boundaries, not
+                    // characters, in case the label ever grows to overflow.
+                    overflowWrap: "break-word",
+                    minWidth: 0,
+                    flex: "1 1 auto",
+                  }}
+                >
+                  {t("new_session.custom_provider_sdk")}
+                </span>
+              </label>
+              <div
+                style={{
+                  marginLeft: 24,
+                  marginTop: 4,
+                  color: "#94a3b8",
+                  fontSize: 12,
+                  lineHeight: 1.35,
+                }}
+              >
+                {t("new_session.custom_provider_sdk_help")}
+              </div>
             </div>
-          </div>
+          )}
           {agentFlavor && (
             <div
               style={{

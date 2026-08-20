@@ -231,13 +231,43 @@ html.native-ios-mac .chat-dl-btn {
   font-size: 13px;
   font-weight: 600;
   letter-spacing: .01em;
-  background: linear-gradient(135deg, rgb(7 24 38 / 94%), rgb(10 38 52 / 92%));
-  border: 1px solid rgb(68 222 255 / 68%);
+  background: linear-gradient(130deg, rgb(7 22 35 / 98%), rgb(9 35 49 / 94%), rgb(5 18 30 / 92%));
+  border: 1px solid rgb(68 222 255 / 78%);
   border-radius: 999px;
-  box-shadow: 0 0 0 1px rgb(44 170 255 / 12%), 0 14px 48px rgb(0 0 0 / 48%), 0 0 28px rgb(41 200 255 / 20%);
+  box-shadow: 0 0 0 1px rgb(44 170 255 / 14%), 0 14px 48px rgb(0 0 0 / 48%), 0 0 36px rgb(41 200 255 / 26%);
   backdrop-filter: blur(14px) saturate(145%);
+  -webkit-backdrop-filter: blur(14px) saturate(145%);
+  overflow: hidden;
   pointer-events: none;
   animation: queue-append-success-in .24s cubic-bezier(.2, .9, .2, 1) both;
+}
+
+.queue-append-success-toast::before,
+.queue-append-success-toast::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+.queue-append-success-toast::before {
+  background:
+    radial-gradient(circle at 0% 0%, rgba(125 211 252 / 20%) 0%, transparent 42%),
+    radial-gradient(circle at 100% 100%, rgba(56 189 248 / 18%) 0%, transparent 40%);
+  opacity: .85;
+}
+
+.queue-append-success-toast::after {
+  border-radius: 999px;
+  border: 1px solid transparent;
+  background: linear-gradient(120deg, rgb(56 189 248 / 0), rgb(168 85 247 / 0.45), rgb(14 165 233 / 0.25), rgb(56 189 248 / 0)) border-box;
+  -webkit-mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+  -webkit-mask-composite: exclude;
+  mask-composite: exclude;
+  padding: 1px;
+  animation: queue-append-halo 2.2s linear infinite;
 }
 
 .queue-append-success-toast-icon {
@@ -249,14 +279,29 @@ html.native-ios-mac .chat-dl-btn {
   color: #07131d;
   background: linear-gradient(135deg, #67e8f9, #38bdf8);
   border-radius: 50%;
-  box-shadow: 0 0 16px rgb(56 189 248 / 72%);
+  box-shadow: 0 0 16px rgb(56 189 248 / 72%), inset 0 0 12px rgba(14, 165, 233, 0.58);
   font-size: 15px;
   font-weight: 900;
+  position: relative;
+  z-index: 1;
+}
+
+.queue-append-success-toast-icon::after {
+  content: '';
+  position: absolute;
+  inset: 2px;
+  border-radius: 50%;
+  background: radial-gradient(circle, rgba(224 242 254 / 88%) 0%, rgba(224 242 254 / 0) 68%);
 }
 
 @keyframes queue-append-success-in {
   from { opacity: 0; transform: translate(-50%, -42%) scale(.94); filter: blur(4px); }
   to { opacity: 1; transform: translate(-50%, -50%) scale(1); filter: blur(0); }
+}
+
+@keyframes queue-append-halo {
+  from { transform: translateX(-42%); opacity: 0.45; }
+  to { transform: translateX(42%); opacity: 0.92; }
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -475,7 +520,55 @@ html.native-ios-mac .chat-dl-btn {
 .shortcut-btn:disabled { opacity: 0.4; cursor: default; }
 .shortcut-btn-wide { padding-left: 14px; padding-right: 14px; }
 .shortcut-btn-icon { width: 28px; min-width: 28px; padding: 4px 0; display: inline-flex; align-items: center; justify-content: center; }
-.shortcut-btn-stop { position: relative; width: 44px; min-width: 44px; font-size: 18px; line-height: 1; }
+.shortcut-btn-stop {
+  position: relative;
+  width: 44px;
+  min-width: 44px;
+  font-size: 18px;
+  line-height: 1;
+  border-color: rgba(248,113,113,0.55);
+  color: #fecaca;
+  background: linear-gradient(162deg, rgba(127, 29, 29, 0.72), rgba(30, 41, 59, 0.75));
+  box-shadow: inset 0 0 0 1px rgba(248, 113, 113, 0.18), 0 8px 16px rgba(0, 0, 0, 0.22), 0 0 14px rgba(248, 113, 113, 0.18);
+  overflow: hidden;
+  text-shadow: 0 0 8px rgba(254, 202, 202, 0.45);
+}
+
+.shortcut-btn-stop::before,
+.shortcut-btn-stop::after {
+  content: '';
+  position: absolute;
+  pointer-events: none;
+  border-radius: inherit;
+  transition: opacity 0.2s ease;
+}
+
+.shortcut-btn-stop::before {
+  inset: -1px;
+  background: linear-gradient(125deg, rgba(248, 113, 113, 0.16), rgba(56, 189, 248, 0.06), rgba(255,255,255,0.02), rgba(248, 113, 113, 0.16));
+  opacity: 0;
+  animation: shortcut-btn-stop-scan 2.2s linear infinite;
+}
+
+.shortcut-btn-stop::after {
+  inset: 0;
+  border: 1px solid rgba(254, 202, 202, 0.6);
+  box-shadow: 0 0 10px rgba(248, 113, 113, 0.35), inset 0 0 12px rgba(254, 202, 202, 0.17);
+}
+
+.shortcut-btn-stop:hover:not(:disabled) {
+  transform: translateY(-1px);
+  border-color: rgba(252, 165, 165, 0.84);
+  color: #fff7ed;
+  box-shadow: 0 9px 18px rgba(248, 113, 113, 0.4), inset 0 1px 0 rgba(254, 202, 202, 0.22), 0 0 0 1px rgba(252, 165, 165, 0.28);
+}
+
+.shortcut-btn-stop:hover:not(:disabled)::before { opacity: 1; }
+
+@keyframes shortcut-btn-stop-scan {
+  from { transform: translateX(-55%); }
+  to { transform: translateX(55%); }
+}
 .shortcut-btn-stop-queue-count {
   position: absolute;
   top: -7px;
@@ -488,15 +581,163 @@ html.native-ios-mac .chat-dl-btn {
   align-items: center;
   justify-content: center;
   color: #07131d;
-  background: linear-gradient(135deg, #67e8f9, #38bdf8);
-  border: 2px solid #0b1220;
+  background: linear-gradient(135deg, #67e8f9, #38bdf8 58%, #22d3ee);
+  border: 1px solid rgba(226, 232, 240, 0.42);
   border-radius: 999px;
-  box-shadow: 0 0 12px rgb(56 189 248 / 64%);
+  box-shadow: 0 0 10px rgba(56, 189, 248, 0.78), 0 0 16px rgba(14, 165, 233, 0.2);
   font-size: 10px;
   font-weight: 800;
+  letter-spacing: 0;
   line-height: 1;
+  color: #052f4d;
+  text-shadow: none;
   font-variant-numeric: tabular-nums;
+  transform: translateZ(0);
 }
+
+.mobile-controls {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 8px;
+  border-radius: 14px;
+  background: linear-gradient(155deg, rgba(15, 23, 42, 0.84), rgba(8, 47, 73, 0.22));
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  box-shadow: inset 0 0 0 1px rgba(125, 211, 252, 0.1), 0 12px 24px rgba(0, 0, 0, 0.23);
+  overflow: hidden;
+}
+
+.mobile-controls::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: radial-gradient(circle at 0% 0%, rgba(56, 189, 248, 0.12), transparent 45%);
+}
+
+.session-dots {
+  display: flex;
+  justify-content: center;
+  gap: 8px;
+  padding: 2px 0;
+}
+
+.session-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 999px;
+  border: none;
+  background: rgba(148, 163, 184, 0.35);
+  padding: 0;
+  cursor: pointer;
+  transition: transform 0.16s ease, background-color 0.16s ease;
+}
+
+.session-dot--active {
+  background: #fcd34d;
+  box-shadow: 0 0 10px rgba(251, 191, 36, 0.5), 0 0 16px rgba(251, 191, 36, 0.18);
+  transform: scale(1.25);
+}
+
+.mobile-input-row {
+  display: grid;
+  grid-template-columns: 1fr 48px 58px;
+  gap: 8px;
+  align-items: end;
+}
+
+.mobile-input {
+  min-height: 44px;
+  resize: none;
+  border-radius: 12px;
+  border: 1px solid rgba(125, 211, 252, 0.24);
+  background: rgba(15, 23, 42, 0.82);
+  color: #f8fafc;
+  padding: 10px 10px;
+  font-family: inherit;
+  font-size: 14px;
+  outline: none;
+  position: relative;
+}
+
+.mobile-input:focus-visible {
+  border-color: rgba(56, 189, 248, 0.8);
+  box-shadow: 0 0 0 1px rgba(56, 189, 248, 0.24), 0 0 16px rgba(56, 189, 248, 0.2);
+}
+
+.mobile-input:focus {
+  border-color: rgba(56, 189, 248, 0.68);
+  box-shadow: 0 0 0 1px rgba(56, 189, 248, 0.2), 0 0 16px rgba(56, 189, 248, 0.14);
+}
+
+.btn-mobile-stop,
+.btn-mobile-send {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 12px;
+  font-size: 18px;
+  line-height: 1;
+  border: 1px solid rgba(125, 211, 252, 0.25);
+  background: linear-gradient(155deg, rgba(17, 24, 39, 0.96), rgba(15, 23, 42, 0.75));
+  color: #93c5fd;
+  min-height: 44px;
+  transition: transform 0.16s ease, box-shadow 0.16s ease;
+  position: relative;
+  overflow: hidden;
+  isolation: isolate;
+}
+
+.btn-mobile-stop::before,
+.btn-mobile-send::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.2s ease;
+}
+
+.btn-mobile-stop::before {
+  background: linear-gradient(120deg, transparent 36%, rgba(248, 113, 113, 0.22), transparent 66%);
+}
+
+.btn-mobile-send::before {
+  background: linear-gradient(120deg, transparent 36%, rgba(56, 189, 248, 0.2), transparent 66%);
+}
+
+.btn-mobile-stop {
+  color: #fecaca;
+  border-color: rgba(248, 113, 113, 0.5);
+  background: linear-gradient(155deg, rgba(127, 29, 29, 0.82), rgba(15, 23, 42, 0.7));
+  box-shadow: inset 0 0 0 1px rgba(248, 113, 113, 0.2), 0 0 12px rgba(248, 113, 113, 0.24);
+}
+
+.btn-mobile-stop:hover,
+.btn-mobile-send:hover {
+  transform: translateY(-1px);
+  filter: brightness(1.08);
+}
+
+.btn-mobile-stop:hover { box-shadow: 0 0 16px rgba(248, 113, 113, 0.35); }
+.btn-mobile-send:hover { box-shadow: 0 0 16px rgba(56, 189, 248, 0.35); }
+
+.btn-mobile-stop:hover::before,
+.btn-mobile-send:hover::before {
+  opacity: 1;
+}
+
+.btn-mobile-send {
+  border-color: rgba(56, 189, 248, 0.5);
+  background: linear-gradient(155deg, rgba(8, 145, 178, 0.9), rgba(15, 23, 42, 0.84));
+  color: #cfeafe;
+  box-shadow: inset 0 0 0 1px rgba(34, 211, 238, 0.24), 0 0 12px rgba(34, 211, 238, 0.17);
+}
+
+.btn-mobile-stop:active,
+.btn-mobile-send:active { transform: scale(0.97); }
+
 /* Mobile arrow D-pad — replaces the separate up/down buttons on small screens.
  * Drag toward a direction to send that arrow key. touch-action:none keeps the
  * drag from scrolling the page; the four glyphs sit around a center. */
@@ -809,11 +1050,29 @@ html.native-ios-mac .chat-dl-btn {
   color: #fbbf24;
   font-size: 12px;
   line-height: 1.35;
-  background: rgba(15, 23, 42, 0.92);
-  border: 1px solid rgba(251, 191, 36, 0.35);
-  border-radius: 10px;
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.22);
+  background: linear-gradient(135deg, rgba(30, 41, 59, 0.9), rgba(15, 23, 42, 0.92));
+  border: 1px solid rgba(251, 191, 36, 0.52);
+  border-radius: 12px;
+  box-shadow: 0 6px 16px rgba(0, 0, 0, 0.26), inset 0 0 0 1px rgba(251, 191, 36, 0.15);
+  position: relative;
   pointer-events: auto;
+  overflow: hidden;
+}
+
+.controls-queued-hint::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: 12px;
+  background: linear-gradient(120deg, transparent 45%, rgba(251, 191, 36, 0.13), transparent 62%);
+  transform: translateX(-120%);
+  animation: controls-queued-hint-shine 4.8s linear infinite;
+  pointer-events: none;
+}
+
+@keyframes controls-queued-hint-shine {
+  from { transform: translateX(-120%); }
+  to { transform: translateX(120%); }
 }
 /* Collapsed-state pill: just a count chip, shown only when the user has
    chosen to hide the full queue list. Keeps vertical space above the
@@ -826,14 +1085,16 @@ html.native-ios-mac .chat-dl-btn {
   align-items: center;
   gap: 6px;
   max-width: max-content;
-  background: rgba(15, 23, 42, 0.92);
-  border: 1px solid rgba(251, 191, 36, 0.35);
+  background: linear-gradient(130deg, rgba(15, 23, 42, 0.9), rgba(30, 41, 59, 0.9));
+  border: 1px solid rgba(251, 191, 36, 0.45);
   border-radius: 999px;
   color: #fbbf24;
   font-size: 11px;
   font-weight: 600;
   line-height: 1.35;
   cursor: pointer;
+  position: relative;
+  overflow: hidden;
   pointer-events: auto;
   font-family: inherit;
 }
@@ -844,8 +1105,20 @@ html.native-ios-mac .chat-dl-btn {
   background: #fbbf24;
   flex-shrink: 0;
 }
-.controls-queued-pill:hover { color: #fde68a; border-color: rgba(251, 191, 36, 0.6); }
+.controls-queued-pill::after {
+  content: '';
+  position: absolute;
+  inset: -1px;
+  border-radius: inherit;
+  border: 1px solid rgba(251, 191, 36, 0.55);
+  opacity: 0.45;
+  pointer-events: none;
+  animation: controls-queued-pill-border 2.8s linear infinite;
+}
+
+.controls-queued-pill:hover { color: #fde68a; border-color: rgba(251, 191, 36, 0.7); }
 .controls-queued-pill:hover::before { background: #fde68a; }
+.controls-queued-pill:hover::after { opacity: 0.78; }
 .controls-queued-header {
   display: flex;
   align-items: center;
@@ -885,9 +1158,10 @@ html.native-ios-mac .chat-dl-btn {
   justify-content: space-between;
   gap: 8px;
   padding: 7px 9px;
-  border-radius: 8px;
-  background: rgba(30, 41, 59, 0.88);
-  border: 1px solid rgba(251, 191, 36, 0.18);
+  border-radius: 10px;
+  background: linear-gradient(140deg, rgba(30, 41, 59, 0.9), rgba(15, 23, 42, 0.92));
+  border: 1px solid rgba(251, 191, 36, 0.26);
+  box-shadow: inset 0 0 0 1px rgba(251, 191, 36, 0.08), 0 4px 12px rgba(0, 0, 0, 0.22);
   color: #e2e8f0;
   white-space: pre-wrap;
   word-break: break-word;
@@ -933,12 +1207,21 @@ html.native-ios-mac .chat-dl-btn {
   font-weight: 600;
   cursor: pointer;
   padding: 0;
+  border-radius: 4px;
+  position: relative;
+  z-index: 0;
 }
 .controls-queued-action:hover { color: #fde68a; }
 .controls-queued-action-append { color: #67e8f9; }
 .controls-queued-action-append:hover { color: #a5f3fc; }
 .controls-queued-action-danger { color: #fda4af; }
 .controls-queued-action-danger:hover { color: #fecdd3; }
+.controls-queued-action:active { transform: translateY(1px); }
+
+@keyframes controls-queued-pill-border {
+  0%, 100% { opacity: 0.28; }
+  50% { opacity: 0.72; }
+}
 .controls-queued-editing {
   margin: 0 8px 8px;
   display: flex;
@@ -9070,9 +9353,9 @@ button.quick-agent-delegation-preset.active {
   }
 
   /* Every control on screen, in full rows. Hiding half of them behind a swipe
-     bought nothing: in portrait the picture is limited by the phone's width, so
-     the height a taller toolbar takes comes out of the letterbox bars, never out
-     of the desktop being shown. */
+     bought nothing: the picture is limited by the phone's width, so the height
+     a taller toolbar takes comes out of the letterbox bars, never out of the
+     desktop being shown. */
   .remote-desktop-toolbar {
     flex-wrap: wrap;
     gap: 7px;
@@ -9135,6 +9418,12 @@ button.quick-agent-delegation-preset.active {
     overflow-y: auto;
   }
 
+  .remote-desktop-diagnostics {
+    gap: 0 12px;
+    row-gap: 5px;
+    font-size: 11px;
+  }
+
   /* Two columns of fields rather than one stack of half-empty lines, and each
      field wraps inside itself instead of pushing the row off the screen. */
   .remote-desktop-diagnostics {
@@ -9144,8 +9433,6 @@ button.quick-agent-delegation-preset.active {
        width, which left the grid no room for a second column. */
     flex: 1 1 100%;
     column-gap: 14px;
-    row-gap: 5px;
-    font-size: 11px;
   }
 
   .remote-desktop-diagnostics > span {
