@@ -66,6 +66,16 @@ std::string DisplaySourceKey(const DisplayInfo& display);
 // fails closed without changing the display.
 bool SetDisplayDpiScale(const DisplayInfo& display, int percent);
 
+enum class CursorSnapshotSource { kNone, kNative, kDxgi };
+
+// Prefer the live USER32 cursor whenever it is available. Some display
+// drivers stop advancing Desktop Duplication's cached pointer position after
+// a synthesized click even though SetCursorPos continues to move the real
+// cursor. The native snapshot is authoritative; DXGI remains a fallback for
+// desktops where USER32 cannot expose one.
+CursorSnapshotSource SelectCursorSnapshotSource(bool native_available,
+                                                bool dxgi_available);
+
 enum class CaptureFallback {
   kNone,
   // DXGI can hold a duplication open yet never present a first frame: the

@@ -107,6 +107,17 @@ class BoundedDesktopStimulus final {
   int origin_y_ = 0;
 };
 
+TEST(DisplayCaptureTest, PrefersLiveNativeCursorOverCachedDxgiPosition) {
+  EXPECT_EQ(SelectCursorSnapshotSource(true, true),
+            CursorSnapshotSource::kNative);
+  EXPECT_EQ(SelectCursorSnapshotSource(true, false),
+            CursorSnapshotSource::kNative);
+  EXPECT_EQ(SelectCursorSnapshotSource(false, true),
+            CursorSnapshotSource::kDxgi);
+  EXPECT_EQ(SelectCursorSnapshotSource(false, false),
+            CursorSnapshotSource::kNone);
+}
+
 TEST(DisplayCaptureTest, ReportsSanitizedInteractiveTopology) {
   if (!InventoryEnabled()) {
     GTEST_SKIP() << "set IMCODES_RUN_DISPLAY_INVENTORY=1 in the active session";

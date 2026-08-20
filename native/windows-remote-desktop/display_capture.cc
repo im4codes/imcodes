@@ -235,6 +235,13 @@ std::string DisplaySourceKey(const DisplayInfo& display) {
   return key.str();
 }
 
+CursorSnapshotSource SelectCursorSnapshotSource(bool native_available,
+                                                bool dxgi_available) {
+  if (native_available) return CursorSnapshotSource::kNative;
+  if (dxgi_available) return CursorSnapshotSource::kDxgi;
+  return CursorSnapshotSource::kNone;
+}
+
 bool SetDisplayDpiScale(const DisplayInfo& display, int percent) {
   static constexpr std::array<int, 12> kDpiScalePercents = {
       100, 125, 150, 175, 200, 225, 250, 300, 350, 400, 450, 500};
@@ -707,35 +714,36 @@ bool DxgiDesktopSource::EnsureCursorSurface(int width, int height) {
 
 void DxgiDesktopSource::CompositeCursor(uint8_t* bgra, int stride,
                                         int width, int height) {
-  if (pointer_position_known_ && pointer_visible_ && pointer_shape_valid_) {
-    CompositeDxgiCursor(bgra, stride, width, height);
-    return;
-  }
-  // Everything else falls through to what Windows itself reports. DXGI calls a
-  // pointer invisible whenever it is suppressed — measured on a node with no
-  // mouse, that is its resting state (CURSOR_SHOWING=0, CURSOR_SUPPRESSED=1)
-  // even while a viewer is driving it — and some adapters report a position
-  // before they ever send a shape. Trusting DXGI's visibility alone is what
-  // left the remote cursor out of the picture entirely.
   CURSORINFO cursor{};
   cursor.cbSize = sizeof(cursor);
-  // A suppressed pointer is one Windows is hiding because nothing physical has
-  // moved it — on a machine with no mouse that is its resting state. The remote
-  // viewer is driving it, so it belongs in the picture; only a pointer hidden
-  // outright (no state at all) stays out.
-  if (!GetCursorInfo(&cursor) || !cursor.hCursor ||
-      (cursor.flags & (CURSOR_SHOWING | CURSOR_SUPPRESSED)) == 0) {
-    return;
+  const bool native_available = GetCursorInfo(&cursor) && cursor.hCursor &&
+      (cursor.flags & (CURSOR_SHOWING | CURSOR_SUPPRESSED)) != 0;
+  const bool dxgi_available =
+      pointer_position_known_ && pointer_visible_ && pointer_shape_valid_;
+
+  // A click injected through SendInput can make Desktop Duplication report a
+  // visible pointer and then leave its position cached forever on some display
+  // stacks. Hover movement uses SetCursorPos, so continuing to prefer that DXGI
+  // snapshot makes the viewer's cursor freeze immediately after the first
+  // click. USER32 owns the actual cursor and reports its current screen
+  // position on every frame, including suppressed pointers on headless nodes.
+  if (SelectCursorSnapshotSource(native_available, dxgi_available) ==
+      CursorSnapshotSource::kNative) {
+    ICONINFO icon{};
+    if (GetIconInfo(cursor.hCursor, &icon)) {
+      const int x = cursor.ptScreenPos.x - display_.desktop_rect.left -
+                    static_cast<int>(icon.xHotspot);
+      const int y = cursor.ptScreenPos.y - display_.desktop_rect.top -
+                    static_cast<int>(icon.yHotspot);
+      const BOOL drawn = DrawIconEx(cursor_dc_, x, y, cursor.hCursor, 0, 0, 0,
+                                    nullptr, DI_NORMAL);
+      if (icon.hbmColor) DeleteObject(icon.hbmColor);
+      if (icon.hbmMask) DeleteObject(icon.hbmMask);
+      if (drawn) return;
+    }
   }
-  ICONINFO icon{};
-  if (!GetIconInfo(cursor.hCursor, &icon)) return;
-  const int x = cursor.ptScreenPos.x - display_.desktop_rect.left -
-                static_cast<int>(icon.xHotspot);
-  const int y = cursor.ptScreenPos.y - display_.desktop_rect.top -
-                static_cast<int>(icon.yHotspot);
-  DrawIconEx(cursor_dc_, x, y, cursor.hCursor, 0, 0, 0, nullptr, DI_NORMAL);
-  if (icon.hbmColor) DeleteObject(icon.hbmColor);
-  if (icon.hbmMask) DeleteObject(icon.hbmMask);
+
+  if (dxgi_available) CompositeDxgiCursor(bgra, stride, width, height);
 }
 
 void DxgiDesktopSource::CompositeDxgiCursor(uint8_t* bgra, int stride,
