@@ -345,6 +345,27 @@ export function windowsSecretFileAclCommands(path: string): WindowsAclCommand[] 
  * interactive user token. Keep secrets sealed while allowing authenticated
  * local users to read/execute only the binary.
  */
+/**
+ * The secret a user-level daemon presents to the elevated remote-desktop helper.
+ *
+ * Readable by exactly one interactive user, on top of the usual SYSTEM and
+ * Administrators. That user is who enabled the feature and who the helper will
+ * act for; anyone else on the machine must not be able to read the secret and
+ * drive a LocalSystem worker with it.
+ */
+export function windowsElevatedRemoteDesktopSecretAclCommands(
+  path: string,
+  userSid: string,
+): WindowsAclCommand[] {
+  return [
+    [path, '/grant:r', `${WINDOWS_SYSTEM_SID}:F`],
+    [path, '/grant:r', `${WINDOWS_ADMINISTRATORS_SID}:F`],
+    [path, '/grant:r', `*${userSid}:R`],
+    [path, '/inheritance:r'],
+    [path, '/setowner', WINDOWS_SYSTEM_SID],
+  ];
+}
+
 export function windowsExecutableFileAclCommands(path: string): WindowsAclCommand[] {
   return [
     [path, '/grant:r', `${WINDOWS_SYSTEM_SID}:F`],
