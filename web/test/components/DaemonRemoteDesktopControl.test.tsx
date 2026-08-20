@@ -27,12 +27,6 @@ const {
   REMOTE_DESKTOP_INSTALL_STATE,
   REMOTE_DESKTOP_INSTALL_ERROR,
 } = await import('@shared/remote-desktop-install.js');
-const {
-  REMOTE_DESKTOP_ELEVATED_CAPABILITY,
-  REMOTE_DESKTOP_ELEVATED_INSTALL_MSG,
-  REMOTE_DESKTOP_ELEVATED_STATE,
-  REMOTE_DESKTOP_ELEVATED_ERROR,
-} = await import('@shared/remote-desktop-elevated.js');
 const { DaemonRemoteDesktopControl } = await import('../../src/components/DaemonRemoteDesktopControl.js');
 
 type MessageHandler = (message: Record<string, unknown>) => void;
@@ -125,60 +119,6 @@ describe('DaemonRemoteDesktopControl', () => {
     const button = view.container.querySelector('button')!;
     expect(button.hasAttribute('disabled')).toBe(false);
     expect(button.getAttribute('title')).toBe('remote_desktop.install_error_not_available');
-  });
-
-  describe('login-screen control', () => {
-    const ready = [REMOTE_DESKTOP_INSTALLABLE_CAPABILITY, REMOTE_DESKTOP_CAPABILITY];
-
-    it('offers the one-time setup beside the control on the status card', () => {
-      const { view } = mount(ready);
-      const buttons = [...view.container.querySelectorAll('button')];
-      expect(buttons.map((button) => button.getAttribute('title'))).toEqual([
-        'remote_desktop.daemon_control',
-        'remote_desktop.elevated_hint',
-      ]);
-    });
-
-    it('keeps the compact status bar to a single button', () => {
-      const { view } = mount(ready, { compact: true });
-      expect(view.container.querySelectorAll('button')).toHaveLength(1);
-    });
-
-    it('stops offering it once the capability is advertised', () => {
-      const { view } = mount([...ready, REMOTE_DESKTOP_ELEVATED_CAPABILITY]);
-      const buttons = [...view.container.querySelectorAll('button')];
-      expect(buttons).toHaveLength(1);
-      expect(buttons[0]!.getAttribute('title')).toBe('remote_desktop.daemon_control');
-    });
-
-    it('requests the setup and waits for approval on the machine', async () => {
-      const { view, sent, emit } = mount(ready);
-      fireEvent.click(view.container.querySelectorAll('button')[1]!);
-      expect(sent).toEqual([{ type: REMOTE_DESKTOP_ELEVATED_INSTALL_MSG.REQUEST }]);
-      expect(view.container.querySelectorAll('button')[1]!.hasAttribute('disabled')).toBe(true);
-
-      await act(async () => {
-        emit({
-          type: REMOTE_DESKTOP_ELEVATED_INSTALL_MSG.STATE,
-          state: REMOTE_DESKTOP_ELEVATED_STATE.FAILED,
-          error: REMOTE_DESKTOP_ELEVATED_ERROR.ELEVATION_DECLINED,
-        });
-      });
-      const retry = view.container.querySelectorAll('button')[1]!;
-      expect(retry.hasAttribute('disabled')).toBe(false);
-      expect(retry.getAttribute('title')).toBe('remote_desktop.elevated_error_elevation_declined');
-    });
-
-    it('drops the offer as soon as the daemon reports it installed', async () => {
-      const { view, emit } = mount(ready);
-      await act(async () => {
-        emit({
-          type: REMOTE_DESKTOP_ELEVATED_INSTALL_MSG.STATE,
-          state: REMOTE_DESKTOP_ELEVATED_STATE.INSTALLED,
-        });
-      });
-      expect(view.container.querySelectorAll('button')).toHaveLength(1);
-    });
   });
 
   it('ignores a malformed install state instead of rendering it', async () => {

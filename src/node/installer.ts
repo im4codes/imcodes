@@ -114,16 +114,12 @@ function windowsWatchdogStartBoundary(now: Date): string {
  * main task cannot distinguish an authenticated node from a live-but-detached
  * process when MultipleInstancesPolicy is IgnoreNew.
  */
-export function windowsScheduledTaskXml(
-  exePath: string,
-  now: Date = new Date(),
-  options: { description?: string; arguments?: readonly string[] } = {},
-): string {
+export function windowsScheduledTaskXml(exePath: string, now: Date = new Date()): string {
   void now;
   return `<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
-    <Description>${escapeXmlText(options.description ?? 'IM.codes controlled node')}</Description>
+    <Description>IM.codes controlled node</Description>
   </RegistrationInfo>
   <Triggers>
     <BootTrigger>
@@ -156,10 +152,7 @@ export function windowsScheduledTaskXml(
   </Settings>
   <Actions Context="System">
     <Exec>
-      <Command>${escapeXmlText(exePath)}</Command>${options.arguments?.length
-        ? `
-      <Arguments>${escapeXmlText(options.arguments.join(' '))}</Arguments>`
-        : ''}
+      <Command>${escapeXmlText(exePath)}</Command>
     </Exec>
   </Actions>
 </Task>
@@ -281,12 +274,9 @@ export function encodeWindowsScheduledTaskXml(xml: string): Buffer {
 }
 
 /** Windows `schtasks /Create` args for an XML task definition. */
-export function windowsScheduledTaskArgs(
-  taskXmlPath: string,
-  taskName: string = CONTROLLED_NODE_SERVICE.WINDOWS_TASK,
-): string[] {
+export function windowsScheduledTaskArgs(taskXmlPath: string): string[] {
   return [
-    '/Create', '/TN', taskName,
+    '/Create', '/TN', CONTROLLED_NODE_SERVICE.WINDOWS_TASK,
     '/XML', taskXmlPath, '/F',
   ];
 }
@@ -355,27 +345,6 @@ export function windowsSecretFileAclCommands(path: string): WindowsAclCommand[] 
  * interactive user token. Keep secrets sealed while allowing authenticated
  * local users to read/execute only the binary.
  */
-/**
- * The secret a user-level daemon presents to the elevated remote-desktop helper.
- *
- * Readable by exactly one interactive user, on top of the usual SYSTEM and
- * Administrators. That user is who enabled the feature and who the helper will
- * act for; anyone else on the machine must not be able to read the secret and
- * drive a LocalSystem worker with it.
- */
-export function windowsElevatedRemoteDesktopSecretAclCommands(
-  path: string,
-  userSid: string,
-): WindowsAclCommand[] {
-  return [
-    [path, '/grant:r', `${WINDOWS_SYSTEM_SID}:F`],
-    [path, '/grant:r', `${WINDOWS_ADMINISTRATORS_SID}:F`],
-    [path, '/grant:r', `*${userSid}:R`],
-    [path, '/inheritance:r'],
-    [path, '/setowner', WINDOWS_SYSTEM_SID],
-  ];
-}
-
 export function windowsExecutableFileAclCommands(path: string): WindowsAclCommand[] {
   return [
     [path, '/grant:r', `${WINDOWS_SYSTEM_SID}:F`],

@@ -3110,15 +3110,6 @@
     "install_error_not_bound": "이 데몬은 서버에 연결되어 있지 않습니다",
     "install_error_download_failed": "다운로드에 실패했습니다. 연결을 확인한 뒤 다시 시도하세요",
     "install_error_verification_failed": "다운로드한 구성 요소의 서명 검증에 실패했습니다",
-    "install_error_not_available": "이 서버에는 아직 이 플랫폼용 구성 요소가 없습니다",
-    "elevated_enable": "로그인 화면 사용",
-    "elevated_retry": "로그인 화면 설정 다시 시도",
-    "elevated_hint": "로그인 및 잠금 화면도 제어합니다. 해당 컴퓨터에서 관리자 승인이 한 번 필요합니다.",
-    "elevated_waiting": "승인 대기 중…",
-    "elevated_failed": "로그인 화면 설정에 실패했습니다",
-    "elevated_error_unsupported_platform": "로그인 화면 제어에는 Windows x64가 필요합니다",
-    "elevated_error_worker_missing": "먼저 원격 제어를 사용하도록 설정하세요",
-    "elevated_error_install_failed": "권한 도우미가 시작되지 않았습니다",
-    "elevated_error_elevation_declined": "해당 컴퓨터에서 관리자 승인을 받지 못했습니다"
+    "install_error_not_available": "이 서버에는 아직 이 플랫폼용 구성 요소가 없습니다"
   }
 }

@@ -3111,15 +3111,6 @@
     "install_error_not_bound": "This daemon is not bound to a server",
     "install_error_download_failed": "Download failed — check the connection and retry",
     "install_error_verification_failed": "The downloaded component failed signature verification",
-    "install_error_not_available": "This server has no remote control component for this platform yet",
-    "elevated_enable": "Enable login screen",
-    "elevated_retry": "Retry login screen setup",
-    "elevated_hint": "Also control the sign-in and lock screen. Asks for administrator approval on that machine once.",
-    "elevated_waiting": "Waiting for approval…",
-    "elevated_failed": "Login screen setup failed",
-    "elevated_error_unsupported_platform": "Login screen control needs Windows x64",
-    "elevated_error_worker_missing": "Enable remote control first",
-    "elevated_error_elevation_declined": "Administrator approval was not given on that machine",
-    "elevated_error_install_failed": "The privileged helper did not start"
+    "install_error_not_available": "This server has no remote control component for this platform yet"
   }
 }

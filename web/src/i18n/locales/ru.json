@@ -3110,15 +3110,6 @@
     "install_error_not_bound": "Этот демон не привязан к серверу",
     "install_error_download_failed": "Загрузка не удалась — проверьте соединение и повторите",
     "install_error_verification_failed": "Загруженный компонент не прошёл проверку подписи",
-    "install_error_not_available": "На этом сервере пока нет компонента для этой платформы",
-    "elevated_enable": "Включить экран входа",
-    "elevated_retry": "Повторить настройку",
-    "elevated_hint": "Управление также экраном входа и блокировки. Требуется одно подтверждение администратора на этой машине.",
-    "elevated_waiting": "Ожидание подтверждения…",
-    "elevated_failed": "Не удалось настроить управление экраном входа",
-    "elevated_error_unsupported_platform": "Требуется Windows x64",
-    "elevated_error_worker_missing": "Сначала включите удалённое управление",
-    "elevated_error_install_failed": "Привилегированный компонент не запустился",
-    "elevated_error_elevation_declined": "Подтверждение администратора на этой машине не получено"
+    "install_error_not_available": "На этом сервере пока нет компонента для этой платформы"
   }
 }

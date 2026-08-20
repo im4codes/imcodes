@@ -11,11 +11,6 @@ import {
   runMacosControlledNodeHealthWatchdog,
 } from './health-lease.js';
 import { CONTROLLED_NODE_SERVICE } from './installer.js';
-import {
-  REMOTE_DESKTOP_ELEVATED_SERVICE,
-  installElevatedRemoteDesktopHost,
-} from './remote-desktop-elevated-install.js';
-import { runElevatedRemoteDesktopHost } from './remote-desktop-elevated-runtime.js';
 
 async function main(): Promise<void> {
   if (process.argv[2] === '--version') {
@@ -27,30 +22,6 @@ async function main(): Promise<void> {
     const pipe = pipeFlag >= 0 ? process.argv[pipeFlag + 1] : undefined;
     if (!pipe) throw new Error('missing --pipe for computer-use helper');
     await runComputerUseIpcHelper(pipe);
-    return;
-  }
-  // Login-screen control. Both modes are deliberately handled before bootstrap:
-  // this executable is reused here purely as a signed carrier for the privileged
-  // helper, and must not enrol, read a node credential or reach the server.
-  if (process.argv[2] === REMOTE_DESKTOP_ELEVATED_SERVICE.HOST_FLAG) {
-    await runElevatedRemoteDesktopHost();
-    return;
-  }
-  if (process.argv[2] === REMOTE_DESKTOP_ELEVATED_SERVICE.INSTALL_FLAG) {
-    const workerFlag = process.argv.indexOf('--worker-dir');
-    const sidFlag = process.argv.indexOf('--user-sid');
-    const sourceWorkerDirectory = workerFlag >= 0 ? process.argv[workerFlag + 1] : undefined;
-    const userSid = sidFlag >= 0 ? process.argv[sidFlag + 1] : undefined;
-    if (!sourceWorkerDirectory || !userSid) {
-      throw new Error('missing --worker-dir or --user-sid for the elevated helper install');
-    }
-    // This process is the signed runtime Windows just named in the UAC prompt,
-    // so it is also what gets staged.
-    await installElevatedRemoteDesktopHost({
-      sourceExecutable: process.execPath,
-      sourceWorkerDirectory,
-      userSid,
-    });
     return;
   }
   if (process.argv[2] === '--health-watchdog') {

@@ -3111,15 +3111,6 @@
     "install_error_not_bound": "该守护进程尚未绑定服务器",
     "install_error_download_failed": "下载失败，请检查网络后重试",
     "install_error_verification_failed": "下载的组件签名校验未通过",
-    "install_error_not_available": "该服务器暂无适配此平台的远程控制组件",
-    "elevated_enable": "启用登录界面",
-    "elevated_retry": "重新设置登录界面",
-    "elevated_hint": "同时控制登录和锁屏界面。需要在那台机器上确认一次管理员授权。",
-    "elevated_waiting": "等待授权确认…",
-    "elevated_failed": "登录界面控制设置失败",
-    "elevated_error_unsupported_platform": "登录界面控制需要 Windows x64",
-    "elevated_error_worker_missing": "请先启用远程控制",
-    "elevated_error_install_failed": "特权助手未能启动",
-    "elevated_error_elevation_declined": "那台机器上没有确认管理员授权"
+    "install_error_not_available": "该服务器暂无适配此平台的远程控制组件"
   }
 }

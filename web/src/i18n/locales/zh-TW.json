@@ -3111,15 +3111,6 @@
     "install_error_not_bound": "此守護程式尚未綁定伺服器",
     "install_error_download_failed": "下載失敗，請檢查網路後重試",
     "install_error_verification_failed": "下載的元件簽章驗證未通過",
-    "install_error_not_available": "此伺服器尚無適用於此平台的遠端控制元件",
-    "elevated_enable": "啟用登入畫面",
-    "elevated_retry": "重新設定登入畫面",
-    "elevated_hint": "同時控制登入與鎖定畫面。需要在該機器上確認一次管理員授權。",
-    "elevated_waiting": "等待授權確認…",
-    "elevated_failed": "登入畫面控制設定失敗",
-    "elevated_error_unsupported_platform": "登入畫面控制需要 Windows x64",
-    "elevated_error_worker_missing": "請先啟用遠端控制",
-    "elevated_error_install_failed": "特權助手未能啟動",
-    "elevated_error_elevation_declined": "該機器上未確認管理員授權"
+    "install_error_not_available": "此伺服器尚無適用於此平台的遠端控制元件"
   }
 }
