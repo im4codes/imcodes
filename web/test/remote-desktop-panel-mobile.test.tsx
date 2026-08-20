@@ -879,6 +879,32 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     expect(pointerMove.mock.calls).toEqual([[0.5, 0.5], [0.75, 0.5]]);
   });
 
+  it('uses the stage mousemove path when window hover listeners receive nothing', async () => {
+    const nativeWindowAddEventListener = window.addEventListener.bind(window);
+    const addEventListener = vi.spyOn(window, 'addEventListener').mockImplementation((
+      type: string,
+      listener: EventListenerOrEventListenerObject,
+      options?: boolean | AddEventListenerOptions,
+    ) => {
+      if (type === 'mousemove' || type === 'pointermove') return;
+      nativeWindowAddEventListener(type, listener, options);
+    });
+    let rendered: Awaited<ReturnType<typeof renderPanel>>;
+    try {
+      rendered = await renderPanel();
+    } finally {
+      addEventListener.mockRestore();
+    }
+    pointerMove.mockClear();
+
+    act(() => {
+      nativeMouseMove(rendered.stage, { clientX: 200, clientY: 150 });
+      nativeMouseMove(rendered.stage, { clientX: 300, clientY: 150 });
+    });
+
+    expect(pointerMove.mock.calls).toEqual([[0.5, 0.5], [0.75, 0.5]]);
+  });
+
   it('deduplicates compatibility mousemove paired with pointermove', async () => {
     const { stage } = await renderPanel();
     pointerMove.mockClear();

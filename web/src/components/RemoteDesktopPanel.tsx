@@ -273,6 +273,7 @@ export function RemoteDesktopPanel({
   const [pointerMovesSeen, setPointerMovesSeen] = useState(0);
   const pointerMovesSeenRef = useRef(0);
   const pointerMovesUnmappedRef = useRef(0);
+  const lastDesktopPointerMoveRef = useRef<{ x: number; y: number; at: number } | null>(null);
   const [pointerMovesUnmapped, setPointerMovesUnmapped] = useState(0);
   const [transfers, setTransfers] = useState<RemoteDesktopTransferRow[]>([]);
   const [transferError, setTransferError] = useState<string | null>(null);
@@ -1108,31 +1109,32 @@ export function RemoteDesktopPanel({
     return () => clearInterval(timer);
   }, []);
 
+  const sendDesktopPointerMove = useCallback((clientX: number, clientY: number) => {
+    const now = performance.now();
+    const lastMove = lastDesktopPointerMoveRef.current;
+    if (lastMove && lastMove.x === clientX && lastMove.y === clientY && now - lastMove.at < 16) {
+      return;
+    }
+    lastDesktopPointerMoveRef.current = { x: clientX, y: clientY, at: now };
+    const stage = stageRef.current;
+    if (!stage) return;
+    const stageRect = stage.getBoundingClientRect();
+    if (clientX < stageRect.left || clientY < stageRect.top
+      || clientX > stageRect.right || clientY > stageRect.bottom) return;
+    pointerMovesSeenRef.current += 1;
+    const normalized = normalizedClientPoint(clientX, clientY);
+    const point = normalized && stickRemoteDesktopPointerToEdges(
+      normalized,
+      REMOTE_DESKTOP_POINTER_EDGE_STICKY_RATIO_PRECISE,
+    );
+    if (!point) {
+      pointerMovesUnmappedRef.current += 1;
+      return;
+    }
+    clientRef.current?.pointerMove(point.x, point.y);
+  }, [normalizedClientPoint]);
+
   useEffect(() => {
-    let lastMove: { x: number; y: number; at: number } | null = null;
-    const sendDesktopPointerMove = (clientX: number, clientY: number) => {
-      const now = performance.now();
-      if (lastMove && lastMove.x === clientX && lastMove.y === clientY && now - lastMove.at < 16) {
-        return;
-      }
-      lastMove = { x: clientX, y: clientY, at: now };
-      const stage = stageRef.current;
-      if (!stage) return;
-      const stageRect = stage.getBoundingClientRect();
-      if (clientX < stageRect.left || clientY < stageRect.top
-        || clientX > stageRect.right || clientY > stageRect.bottom) return;
-      pointerMovesSeenRef.current += 1;
-      const normalized = normalizedClientPoint(clientX, clientY);
-      const point = normalized && stickRemoteDesktopPointerToEdges(
-        normalized,
-        REMOTE_DESKTOP_POINTER_EDGE_STICKY_RATIO_PRECISE,
-      );
-      if (!point) {
-        pointerMovesUnmappedRef.current += 1;
-        return;
-      }
-      clientRef.current?.pointerMove(point.x, point.y);
-    };
     const onWindowMouseMove = (event: globalThis.MouseEvent) => {
       sendDesktopPointerMove(event.clientX, event.clientY);
     };
@@ -1155,10 +1157,21 @@ export function RemoteDesktopPanel({
       window.removeEventListener('mousemove', onWindowMouseMove, true);
       window.removeEventListener('pointermove', onWindowPointerMove, true);
     };
-  }, [normalizedClientPoint]);
+  }, [sendDesktopPointerMove]);
 
   const onStagePointerMove = (event: PointerEvent) => {
-    if (event.pointerType === 'touch') onTouchMove(event);
+    if (event.pointerType === 'touch') {
+      onTouchMove(event);
+      return;
+    }
+    // The stage owns ordinary desktop hover. Some WebKit/native-wrapper
+    // combinations only deliver window-level pointer/mouse moves while a
+    // button is captured, which made hover stop while drag still worked.
+    sendDesktopPointerMove(event.clientX, event.clientY);
+  };
+
+  const onStageMouseMove = (event: MouseEvent) => {
+    sendDesktopPointerMove(event.clientX, event.clientY);
   };
 
   const suppressCommandControlForMiddleDrag = () => {
@@ -1762,6 +1775,8 @@ export function RemoteDesktopPanel({
           class={`remote-desktop-stage is-${viewScale} ${snapshot.inputEnabled ? 'is-controlling' : 'is-viewing'}`}
           tabIndex={snapshot.inputEnabled ? 0 : -1}
           onPointerMove={onStagePointerMove}
+          onMouseMove={onStageMouseMove}
+          onMouseEnter={onStageMouseMove}
           onPointerDown={(event) => onPointerButton(event, true)}
           onPointerUp={(event) => onPointerButton(event, false)}
           onPointerCancel={(event) => {
