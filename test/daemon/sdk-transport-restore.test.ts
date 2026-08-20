@@ -17,6 +17,20 @@ const mocks = vi.hoisted(() => {
 
 const timelineEmitterEmitMock = vi.hoisted(() => vi.fn());
 const timelineReadByTypesPreferredMock = vi.hoisted(() => vi.fn(async () => []));
+const getDshPresetTransportConfigMock = vi.hoisted(() => vi.fn(async () => ({
+  env: { ANTHROPIC_MODEL: 'MiniMax-M3' },
+  llm: {
+    provider: 'minimax',
+    model: 'MiniMax-M3',
+    baseUrl: 'https://api.minimax.io/anthropic',
+    apiKey: 'test-dsh-key',
+    contextWindow: 1_000_000,
+  },
+  model: 'MiniMax-M3',
+  availableModels: ['MiniMax-M3'],
+  systemPrompt: 'Runtime facts: MiniMax-M3 through minimax.',
+  contextWindow: 1_000_000,
+})));
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -168,6 +182,10 @@ vi.mock('../../src/agent/sdk-runtime-config.js', async (importOriginal) => ({
   getClaudeSdkRuntimeConfig: vi.fn(async () => ({})),
 }));
 vi.mock('../../src/agent/codex-runtime-config.js', () => ({ getCodexRuntimeConfig: vi.fn(async () => ({})) }));
+vi.mock('../../src/daemon/cc-presets.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../src/daemon/cc-presets.js')>()),
+  getDshPresetTransportConfig: getDshPresetTransportConfigMock,
+}));
 vi.mock('../../src/agent/provider-display.js', () => ({ getQwenDisplayMetadata: vi.fn(() => ({})) }));
 vi.mock('../../src/agent/provider-quota.js', () => ({ getQwenOAuthQuotaUsageLabel: vi.fn(() => '') }));
 vi.mock('../../src/agent/agent-version.js', () => ({ getAgentVersion: vi.fn(async () => 'test') }));
@@ -177,6 +195,7 @@ vi.mock('../../src/repo/cache.js', () => ({ repoCache: { invalidate: vi.fn() } }
 vi.mock('../../src/agent/brain-dispatcher.js', () => ({ BrainDispatcher: vi.fn().mockImplementation(() => ({ start: vi.fn(), stop: vi.fn() })) }));
 
 import { connectProvider, disconnectAll } from '../../src/agent/provider-registry.js';
+import { DeepseekHarnessProvider } from '../../src/agent/providers/deepseek-harness.js';
 import { openCodeSdkRuntimeHooks } from '../../src/agent/providers/opencode-sdk.js';
 import {
   ensureTransportRuntimeAvailable,
@@ -366,6 +385,7 @@ describe('sdk transport session restore', () => {
     mocks.claudeRuns.length = 0;
     mocks.codexRuns.length = 0;
     mocks.claudeFailures.clear();
+    getDshPresetTransportConfigMock.mockClear();
     clearAllResend();
     timelineEmitterEmitMock.mockClear();
     timelineReadByTypesPreferredMock.mockReset();
@@ -1873,6 +1893,42 @@ describe('sdk transport session restore', () => {
       IMCODES_SESSION_LABEL: 'CC1',
     });
     expect(String(run?.options.appendSystemPrompt ?? '')).toContain('Display label: CC1');
+  });
+
+  it('passes a ccPreset route into a newly launched dsh session', async () => {
+    const createSessionSpy = vi.spyOn(DeepseekHarnessProvider.prototype, 'createSession');
+    try {
+      await connectProvider('deepseek-harness', {});
+      await launchTransportSession({
+        name: 'deck_dsh_preset_brain',
+        projectName: 'dshpreset',
+        role: 'brain',
+        agentType: 'deepseek-harness',
+        projectDir: '/tmp/dsh-preset',
+        ccPreset: 'minimax',
+        requestedModel: 'MiniMax-M3',
+      });
+
+      expect(getDshPresetTransportConfigMock).toHaveBeenCalledWith('minimax');
+      expect(createSessionSpy).toHaveBeenCalledWith(expect.objectContaining({
+        agentId: 'MiniMax-M3',
+        env: expect.objectContaining({ ANTHROPIC_MODEL: 'MiniMax-M3' }),
+        llm: {
+          provider: 'minimax',
+          model: 'MiniMax-M3',
+          baseUrl: 'https://api.minimax.io/anthropic',
+          apiKey: 'test-dsh-key',
+          contextWindow: 1_000_000,
+        },
+      }));
+      expect(mocks.store.get('deck_dsh_preset_brain')).toMatchObject({
+        ccPreset: 'minimax',
+        requestedModel: 'MiniMax-M3',
+        presetContextWindow: 1_000_000,
+      });
+    } finally {
+      createSessionSpy.mockRestore();
+    }
   });
 
   it('does not auto-restart ordinary provider errors', async () => {

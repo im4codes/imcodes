@@ -2861,6 +2861,7 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
   let sdkDisplay: Pick<SessionRecord, 'planLabel' | 'quotaLabel' | 'quotaUsageLabel' | 'quotaMeta'> | undefined;
   let transportSystemPrompt: string | undefined;
   let transportSettings: string | Record<string, unknown> | undefined;
+  let dshLlmConfig: DshLlmConfig | undefined;
   const storedRequestedModel = !opts.fresh ? existing?.requestedModel : undefined;
   const storedProviderResumeId = !opts.fresh ? existing?.providerResumeId : undefined;
   let requestedTransportModel = opts.requestedModel ?? storedRequestedModel ?? (agentType === 'qwen' ? (opts.qwenModel ?? existing?.qwenModel) : undefined);
@@ -2995,6 +2996,20 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
     effectiveBindExistingKey = undefined;
     effectiveSkipCreate = false;
     transportResumeId = undefined;
+  } else if (agentType === 'deepseek-harness') {
+    if (effectiveCcPreset) {
+      const { getDshPresetTransportConfig } = await import('../daemon/cc-presets.js');
+      const presetConfig = await getDshPresetTransportConfig(effectiveCcPreset);
+      transportEnv = { ...(transportEnv ?? {}), ...presetConfig.env };
+      dshLlmConfig = presetConfig.llm;
+      if (!requestedTransportModel && presetConfig.model) requestedTransportModel = presetConfig.model;
+      presetContextWindow = presetConfig.contextWindow ?? presetContextWindow;
+      if (presetConfig.systemPrompt) transportSystemPrompt = presetConfig.systemPrompt;
+    }
+    effectiveSessionKey = randomUUID();
+    effectiveBindExistingKey = undefined;
+    transportResumeId = opts.providerResumeId ?? storedProviderResumeId;
+    effectiveSkipCreate = !!transportResumeId;
   } else if (usesProviderResumeId(agentType)) {
     effectiveSessionKey = randomUUID();
     effectiveBindExistingKey = undefined;
@@ -3031,6 +3046,7 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
     // cap. See p2p audit 37bfbb85-430 N-A.
     systemPrompt: transportSystemPrompt,
     ...(transportSettings ? { settings: transportSettings } : {}),
+    ...(dshLlmConfig ? { llm: dshLlmConfig } : {}),
     contextNamespace: contextBootstrap.namespace,
     contextNamespaceDiagnostics: contextBootstrap.diagnostics,
     contextRemoteProcessedFreshness: contextBootstrap.remoteProcessedFreshness,
