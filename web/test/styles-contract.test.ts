@@ -747,4 +747,47 @@ describe('styles.css regression contracts', () => {
     expect(outside).not.toMatch(/\.controls\s*\{[^}]*flex-wrap:\s*wrap/);
     expect(outside).not.toMatch(/\.controls-composer\s*\{[^}]*order:\s*-1/);
   });
+
+  // The resize edge must restyle the box's own border, not draw a line of its
+  // own. A separately-drawn line reads as a stray rule floating inside the box
+  // -- which is exactly what shipped once -- and its position depends on offset
+  // arithmetic that silently drifts whenever the composer's padding changes.
+  it('highlights the real top border rather than drawing a second line', () => {
+    const desktopBlock = /@media \(min-width: 641px\) \{([\s\S]*?)\n\}/.exec(css);
+    expect(desktopBlock).not.toBeNull();
+    const inside = desktopBlock![1];
+
+    // The strip itself draws nothing.
+    expect(inside).toMatch(/\.controls-composer-resize-edge::after\s*\{[^}]*display:\s*none/);
+    // Hover and drag both restyle the box's own top border.
+    expect(inside).toMatch(/\.controls:has\(\.controls-composer-resize-edge:hover\)[\s\S]{0,220}?border-top-color/);
+    expect(inside).toMatch(/\.composer-height-resizing-top \.controls\s*\{[^}]*border-top-color/);
+  });
+
+  // Transport sessions zero the toolbar's left padding, and they are the only
+  // sessions that render a Stop button -- so matching `.shortcuts` alone would
+  // leave the exact case this alignment exists for still misaligned.
+  it('aligns the toolbar with the composer box on both shortcut variants', () => {
+    const desktopBlock = /@media \(min-width: 641px\) \{([\s\S]*?)\n\}/.exec(css);
+    const inside = desktopBlock![1];
+    expect(inside).toMatch(/\.shortcuts,\s*\n\s*\.shortcuts-transport\s*\{[^}]*padding-left/);
+  });
+
+  it('has no composer corner-grip styles left', () => {
+    expect(css).not.toMatch(/\.controls-composer-resize-handle/);
+    expect(css).not.toMatch(/\.composer-height-resizing-corner/);
+  });
+
+  // An unbalanced brace does not throw and does not blank the page: the parser
+  // silently swallows everything after it into the unclosed block, so rules
+  // stop applying while still being present in the file and still matching by
+  // selector. That failure mode cost real debugging time; assert it directly.
+  it('has balanced braces', () => {
+    const stripped = css
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .replace(/"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'/g, '');
+    const open = (stripped.match(/\{/g) ?? []).length;
+    const close = (stripped.match(/\}/g) ?? []).length;
+    expect(close - open).toBe(0);
+  });
 });

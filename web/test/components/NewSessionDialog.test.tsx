@@ -511,7 +511,7 @@ describe('NewSessionDialog', () => {
     }));
   });
 
-  it('custom provider SDK locks the main-session agent to claude-code-sdk and uses a preset', async () => {
+  it('custom provider SDK allows selecting dsh from the SDK-compatible types and uses a preset', async () => {
     const ws = makeWs();
     ws.onMessage.mockImplementation((handler: (msg: unknown) => void) => {
       handler({
@@ -534,19 +534,34 @@ describe('NewSessionDialog', () => {
     fireEvent.click(screen.getByLabelText(/custom_provider_sdk/i));
 
     await waitFor(() => expect(agentTypeSelect.value).toBe('claude-code-sdk'));
-    expect(agentTypeSelect.disabled).toBe(true);
+    expect(agentTypeSelect.disabled).toBe(false);
     expect(screen.getByText('custom_provider_preset')).toBeDefined();
+
+    // dsh (deepseek-harness) is now a selectable option when custom provider SDK is on.
+    expect(screen.getByRole('option', { name: /deepseek_harness/i })).toBeDefined();
+    // Non-SDK types (e.g., codex-sdk) are filtered out and no longer shown.
+    expect(screen.queryByRole('option', { name: /codex_sdk/i })).toBeNull();
+
+    // Select dsh from the agent type dropdown (drives onInput →
+    // selectAgentType → setAgentType), then start the session.
+    agentTypeSelect.value = 'deepseek-harness';
+    fireEvent.input(agentTypeSelect, { target: { value: 'deepseek-harness' } });
+    // Confirm the agent-type state actually changed to dsh by checking the
+    // resulting side effect (a transport.list_models request for dsh), not the
+    // controlled <select>'s DOM value, which can revert to the React state.
+    await waitFor(() => {
+      expect(ws.send.mock.calls.some((call) => (
+        call[0]?.type === 'transport.list_models' && call[0]?.agentType === 'deepseek-harness'
+      ))).toBe(true);
+    });
 
     fireEvent.input(screen.getByPlaceholderText('my-project'), { target: { value: 'my-app' } });
     fireEvent.input(screen.getByPlaceholderText('~/projects/my-project'), { target: { value: '~/projects/my-app' } });
     fireEvent.click(screen.getByRole('button', { name: /start/i }));
 
     expect(ws.sendSessionCommand).toHaveBeenCalledWith('start', expect.objectContaining({
-      agentType: 'claude-code-sdk',
+      agentType: 'deepseek-harness',
       ccPreset: 'MiniMax',
-    }));
-    expect(ws.sendSessionCommand).not.toHaveBeenCalledWith('start', expect.objectContaining({
-      agentType: 'custom-provider-sdk',
     }));
   });
 

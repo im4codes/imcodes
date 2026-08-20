@@ -389,7 +389,7 @@ describe('StartSubSessionDialog', () => {
     });
   });
 
-  it('custom provider SDK locks sub-sessions to claude-code-sdk and passes the selected preset', async () => {
+  it('custom provider SDK allows selecting dsh from the SDK-compatible types and passes the selected preset', async () => {
     const onStart = vi.fn();
     const ws = makeWs();
     ws.onMessage.mockImplementation((handler: (msg: unknown) => void) => {
@@ -422,12 +422,18 @@ describe('StartSubSessionDialog', () => {
     fireEvent.click(screen.getByLabelText(/custom_provider_sdk/i));
 
     await waitFor(() => expect(screen.getByRole('button', { name: /claude_code_sdk/i }).className).toContain('active'));
-    expect((screen.getByRole('button', { name: /codex_sdk/i }) as HTMLButtonElement).disabled).toBe(true);
+    // Non-SDK types (e.g., codex-sdk) are filtered out and no longer rendered.
+    expect(screen.queryByRole('button', { name: /codex_sdk/i })).toBeNull();
+    // dsh (deepseek-harness) is now a visible, selectable button when custom provider SDK is on.
+    const dshBtn = screen.getByRole('button', { name: /deepseek_harness/i }) as HTMLButtonElement;
+    expect(dshBtn.disabled).toBe(false);
     expect(screen.getByText('custom_provider_preset')).toBeDefined();
 
+    // Select dsh and launch the sub-session; the preset should still be passed through.
+    fireEvent.click(dshBtn);
     fireEvent.click(screen.getByRole('button', { name: /launch/i }));
 
-    expect(onStart).toHaveBeenCalledWith('claude-code-sdk', undefined, '/tmp', undefined, expect.objectContaining({
+    expect(onStart).toHaveBeenCalledWith('deepseek-harness', undefined, '/tmp', undefined, expect.objectContaining({
       ccPreset: 'MiniMax',
     }));
   });

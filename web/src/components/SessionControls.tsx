@@ -129,11 +129,12 @@ export const COMPOSER_HEIGHT_STORAGE_KEY = 'imcodes_composer_height_v1';
  * Desktop-only in effect: the pinned height is not applied on mobile, and the
  * resize affordances that write it are hidden there.
  *
- * The value is the computed three-row height from `styles.css`:
- * `(3 x 1.45em) + 10px` at the composer's 13px font size = 67px. If either the
+ * The value is the computed input height from `styles.css`: `(2 x 1.45em) +
+ * 10px` at the composer's 13px font size = 48px. The box rests three rows tall
+ * in total, with the control row underneath making up the third. If either the
  * type scale or the composer padding changes, both must move together.
  */
-export const COMPOSER_HEIGHT_MIN_PX = 67;
+export const COMPOSER_HEIGHT_MIN_PX = 48;
 export const COMPOSER_HEIGHT_MAX_PX = 360;
 const COMPOSER_HEIGHT_STEP_PX = 16;
 const COMPOSER_HEIGHT_EVENT = 'imcodes:composer-height';
@@ -1418,9 +1419,12 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     composerResizeCleanupRef.current = null;
   }, []);
 
-  const startComposerResize = useCallback((
+  // Only the top edge resizes now. The corner grip was removed when the
+  // controls moved under the input: it had nowhere to sit that was not either
+  // stranded mid-box or fighting Send for the bottom-right corner, and the top
+  // border is the edge that actually moves when the composer grows.
+  const startComposerTopResize = useCallback((
     event: JSX.TargetedPointerEvent<HTMLDivElement>,
-    edge: 'top' | 'corner',
   ) => {
     if (event.button !== 0 || window.innerWidth <= 640) return;
     event.preventDefault();
@@ -1431,12 +1435,10 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       sharedComposerHeight ?? divRef.current?.getBoundingClientRect().height ?? COMPOSER_HEIGHT_MIN_PX,
     );
     let latestHeight = startHeight;
-    document.body.classList.add('composer-height-resizing', `composer-height-resizing-${edge}`);
+    document.body.classList.add('composer-height-resizing', 'composer-height-resizing-top');
 
     const handlePointerMove = (moveEvent: PointerEvent) => {
-      const delta = edge === 'top'
-        ? startY - moveEvent.clientY
-        : moveEvent.clientY - startY;
+      const delta = startY - moveEvent.clientY;
       latestHeight = clampComposerHeight(startHeight + delta);
       broadcastComposerHeight(latestHeight);
     };
@@ -1444,11 +1446,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       window.removeEventListener('pointermove', handlePointerMove);
       window.removeEventListener('pointerup', handlePointerEnd);
       window.removeEventListener('pointercancel', handlePointerEnd);
-      document.body.classList.remove(
-        'composer-height-resizing',
-        'composer-height-resizing-top',
-        'composer-height-resizing-corner',
-      );
+      document.body.classList.remove('composer-height-resizing', 'composer-height-resizing-top');
     };
     const handlePointerEnd = () => {
       cleanupResize();
@@ -1461,12 +1459,6 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     window.addEventListener('pointercancel', handlePointerEnd);
     composerResizeCleanupRef.current = cleanupResize;
   }, [sharedComposerHeight, stopComposerResize]);
-  const startComposerCornerResize = useCallback((event: JSX.TargetedPointerEvent<HTMLDivElement>) => {
-    startComposerResize(event, 'corner');
-  }, [startComposerResize]);
-  const startComposerTopResize = useCallback((event: JSX.TargetedPointerEvent<HTMLDivElement>) => {
-    startComposerResize(event, 'top');
-  }, [startComposerResize]);
 
   const handleComposerResizeKeyDown = useCallback((event: JSX.TargetedKeyboardEvent<HTMLDivElement>) => {
     const current = sharedComposerHeight
@@ -6312,18 +6304,6 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         <div class={`controls-composer${showEmbeddedVoiceButton ? ' controls-composer-with-voice' : ''}${mobileComposerExpanded ? ' controls-composer-mobile-expanded' : ''}`}>
           {!isMobileLayout && (
             <>
-              <div
-                class="controls-composer-resize-handle controls-composer-resize-corner"
-                role="separator"
-                tabIndex={0}
-                aria-orientation="horizontal"
-                aria-label="Resize message input"
-                aria-valuemin={COMPOSER_HEIGHT_MIN_PX}
-                aria-valuemax={COMPOSER_HEIGHT_MAX_PX}
-                aria-valuenow={sharedComposerHeight ?? undefined}
-                onPointerDown={startComposerCornerResize}
-                onKeyDown={handleComposerResizeKeyDown}
-              />
               <div
                 class="controls-composer-resize-edge"
                 role="separator"

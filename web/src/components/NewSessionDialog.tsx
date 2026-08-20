@@ -34,6 +34,7 @@ import {
 } from "./cc-preset-form.js";
 import { CC_PRESET_MSG } from "@shared/cc-presets.js";
 import {
+  CUSTOM_PROVIDER_SDK_AGENT_TYPES,
   getCcPresetAvailableModelIds,
   getCcPresetEffectiveModel,
   normalizeCcPresetName,
@@ -88,14 +89,6 @@ type AgentType =
   | "openclaw"
   | "qwen";
 
-// Transports that can act as a "custom provider SDK" compatibility layer —
-// i.e. they can point at an arbitrary LLM API endpoint via a CC preset.
-const CUSTOM_PROVIDER_SDK_AGENT_TYPES = new Set<AgentType>([
-  "claude-code",
-  "claude-code-sdk",
-  "qwen",
-  "deepseek-harness",
-]);
 type OpenClawMode = "new" | "bind";
 
 interface RemoteSession {
@@ -200,6 +193,7 @@ export function NewSessionDialog({
     return preset;
   };
   const selectAgentType = (nextAgentType: AgentType) => {
+    if (customProviderSdk && !CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(nextAgentType)) return;
     setAgentType(nextAgentType);
     if (!customProviderSdk) setLastUnlockedAgentType(nextAgentType);
     setError("");
@@ -209,8 +203,10 @@ export function NewSessionDialog({
     setError("");
     setPresetError("");
     if (enabled) {
-      if (agentType !== "claude-code-sdk") setLastUnlockedAgentType(agentType);
-      setAgentType("claude-code-sdk");
+      if (!CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(agentType)) {
+        setLastUnlockedAgentType(agentType);
+        setAgentType("claude-code-sdk");
+      }
       return;
     }
     setAgentType(lastUnlockedAgentType);
@@ -404,7 +400,13 @@ export function NewSessionDialog({
 
   useEffect(() => {
     if (!customProviderSdk) return;
-    if (agentType !== "claude-code-sdk") setAgentType("claude-code-sdk");
+    // Snap only when the current type cannot act as a custom-provider layer.
+    // Forcing `claude-code-sdk` unconditionally here re-locked the dropdown:
+    // picking another supported type set the state and then this effect, which
+    // re-runs on every `agentType` change, immediately reverted it — so the
+    // session still started as `claude-code-sdk` while the UI had briefly shown
+    // otherwise. Mirrors the same guard in StartSubSessionDialog.
+    if (!CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(agentType)) setAgentType("claude-code-sdk");
     if (!ccPreset && ccPresets.length > 0) setCcPreset(ccPresets[0].name);
   }, [agentType, ccPreset, ccPresets, customProviderSdk]);
 
@@ -732,7 +734,7 @@ export function NewSessionDialog({
           <label>{t("new_session.agent_type")}</label>
           <select
             value={agentType}
-            disabled={starting || customProviderSdk}
+            disabled={starting}
             onInput={(e) =>
               selectAgentType((e.target as HTMLSelectElement).value as AgentType)
             }
@@ -746,15 +748,21 @@ export function NewSessionDialog({
               fontFamily: "inherit",
             }}
           >
-            {agentGroups.map((group) => (
-              <optgroup key={group.id} label={t(SESSION_AGENT_GROUP_LABEL_KEYS[group.id])}>
-                {group.items.map((choice) => (
-                  <option key={choice.id} value={choice.id}>
-                    {getSessionAgentLabel(t, choice)}
-                  </option>
-                ))}
-              </optgroup>
-            ))}
+            {agentGroups.map((group) => {
+              const visibleItems = customProviderSdk
+                ? group.items.filter((choice) => CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(choice.id))
+                : group.items;
+              if (visibleItems.length === 0) return null;
+              return (
+                <optgroup key={group.id} label={t(SESSION_AGENT_GROUP_LABEL_KEYS[group.id])}>
+                  {visibleItems.map((choice) => (
+                    <option key={choice.id} value={choice.id}>
+                      {getSessionAgentLabel(t, choice)}
+                    </option>
+                  ))}
+                </optgroup>
+              );
+            })}
           </select>
           <SdkModeRecommendation agentType={agentType} />
           {/*

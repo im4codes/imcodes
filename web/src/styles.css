@@ -530,7 +530,6 @@ html.native-ios-mac .chat-dl-btn {
   color: #fecaca;
   background: linear-gradient(162deg, rgba(127, 29, 29, 0.72), rgba(30, 41, 59, 0.75));
   box-shadow: inset 0 0 0 1px rgba(248, 113, 113, 0.18), 0 8px 16px rgba(0, 0, 0, 0.22), 0 0 14px rgba(248, 113, 113, 0.18);
-  overflow: hidden;
   text-shadow: 0 0 8px rgba(254, 202, 202, 0.45);
 }
 
@@ -544,8 +543,9 @@ html.native-ios-mac .chat-dl-btn {
 }
 
 .shortcut-btn-stop::before {
-  inset: -1px;
+  inset: 0;
   background: linear-gradient(125deg, rgba(248, 113, 113, 0.16), rgba(56, 189, 248, 0.06), rgba(255,255,255,0.02), rgba(248, 113, 113, 0.16));
+  background-size: 260% 100%;
   opacity: 0;
   animation: shortcut-btn-stop-scan 2.2s linear infinite;
 }
@@ -566,11 +566,13 @@ html.native-ios-mac .chat-dl-btn {
 .shortcut-btn-stop:hover:not(:disabled)::before { opacity: 1; }
 
 @keyframes shortcut-btn-stop-scan {
-  from { transform: translateX(-55%); }
-  to { transform: translateX(55%); }
+  from { background-position: 0% 0; }
+  to { background-position: 100% 0; }
 }
 .shortcut-btn-stop-queue-count {
   position: absolute;
+  /* Above the ::after ring, which paints after the element's children. */
+  z-index: 1;
   top: -7px;
   right: -7px;
   z-index: 3;
@@ -946,32 +948,6 @@ html.native-ios-mac .chat-dl-btn {
 .p2p-settings-label { display: none; }
 .controls { padding: 6px 8px; display: flex; gap: 6px; align-items: center; position: relative; z-index: 1; background: linear-gradient(180deg, rgba(8,13,22,0.12), rgba(8,13,22,0.36)); }
 .controls-composer { position: relative; flex: 1; min-width: 0; display: flex; align-items: stretch; }
-.controls-composer-resize-handle {
-  position: absolute;
-  right: 3px;
-  bottom: 3px;
-  z-index: 3;
-  width: 20px;
-  height: 20px;
-  border: 0;
-  border-radius: 0 0 5px 0;
-  background:
-    linear-gradient(135deg, transparent 0 49%, rgba(103,232,249,0.36) 50% 55%, transparent 56%) 8px 8px / 9px 9px no-repeat,
-    linear-gradient(135deg, transparent 0 49%, rgba(103,232,249,0.58) 50% 55%, transparent 56%) 3px 3px / 14px 14px no-repeat;
-  cursor: nwse-resize;
-  user-select: none;
-  touch-action: none;
-  outline: none;
-  opacity: 0.62;
-  transition: opacity 0.14s, filter 0.14s, background-color 0.14s;
-}
-.controls-composer-resize-handle:hover,
-.controls-composer-resize-handle:focus-visible,
-.composer-height-resizing-corner .controls-composer-resize-handle {
-  opacity: 1;
-  background-color: rgba(34,211,238,0.07);
-  filter: drop-shadow(0 0 4px rgba(34,211,238,0.32));
-}
 .controls-composer-resize-edge {
   position: absolute;
   top: -4px;
@@ -1002,7 +978,6 @@ html.native-ios-mac .chat-dl-btn {
   box-shadow: 0 0 5px rgba(34,211,238,0.26);
 }
 .composer-height-resizing { user-select: none !important; }
-.composer-height-resizing-corner { cursor: nwse-resize !important; }
 .composer-height-resizing-top { cursor: ns-resize !important; }
 .controls-composer-backdrop {
   position: fixed;
@@ -1385,7 +1360,6 @@ html.native-ios-mac .chat-dl-btn {
   white-space: nowrap;
 }
 @media (max-width: 640px) {
-  .controls-composer-resize-handle,
   .controls-composer-resize-edge { display: none; }
   .composer-upload-stats {
     gap: 4px 8px;
@@ -1518,6 +1492,21 @@ html.native-ios-mac .chat-dl-btn {
    Scoped to min-width 641px because the mobile layout is the 640px override of
    this same base, and must keep its side-by-side row untouched. */
 @media (min-width: 641px) {
+  /* The composer box is inset from the wrapper by its own margin, so the
+     toolbar above has to start at the same x or the Stop button hangs out past
+     the box's left edge.
+
+     `.shortcuts-transport` is listed explicitly: transport sessions add that
+     class and it zeroes `padding-left`, which is exactly the case that shows a
+     Stop button. Matching only `.shortcuts` would leave the one session type
+     this is meant to fix still misaligned.
+
+     One variable because the inset and the box margin are only ever correct
+     together. */
+  .controls-wrapper { --composer-inset: 8px; }
+  .shortcuts,
+  .shortcuts-transport { padding-left: var(--composer-inset); }
+
   .controls {
     flex-wrap: wrap;
     row-gap: 6px;
@@ -1540,9 +1529,11 @@ html.native-ios-mac .chat-dl-btn {
     border-color: transparent;
     box-shadow: none;
     padding: 5px 3px;
-    /* Three rows at rest. Expressed in em so it tracks the font size rather
-       than pinning a pixel count that drifts if the type scale changes. */
-    min-height: calc((3 * 1.45em) + 10px);
+    /* The box rests three rows tall in total, and the control row underneath
+       is the third of them -- so the input itself gets two. Expressed in em so
+       it tracks the font size rather than pinning a pixel count that drifts if
+       the type scale changes. Dragging the top edge moves this. */
+    min-height: calc((2 * 1.45em) + 10px);
     max-height: 240px;
   }
   .controls-input:focus {
@@ -1571,10 +1562,51 @@ html.native-ios-mac .chat-dl-btn {
      the markup and its tests alone. */
   .controls .btn-primary { order: 1; margin-left: auto; }
 
-  /* The corner grip sits at the bottom-right of the input, which is now the
-     middle of the box. Pull it to the input's own trailing edge so it does not
-     hover over the button row underneath. */
-  .controls-composer-resize-handle { bottom: 1px; right: 1px; }
+  /* The resize edge anchors to the whole box, not the input.
+
+     `.controls-composer` drops out of the positioning chain here so the
+     absolutely-positioned edge resolves against `.controls` instead, putting
+     it on the box's own top border. Anchored to the input it would sit inside
+     the box padding, below the border the user is aiming at.
+
+     Nothing else needs `.controls-composer` positioned on desktop: its only
+     other absolute child is the embedded voice button, which is mobile-only. */
+  .controls-composer { position: static; }
+
+  /* The top border itself is the resize target.
+
+     The strip is an 18px invisible band straddling the border -- roughly a
+     pointer-height either side, because a 9px line is effectively unhittable.
+     It draws nothing: hovering restyles the box's real `border-top`, so the
+     thing that highlights is literally the border being grabbed, with no
+     second line and no offset arithmetic to drift out of alignment.
+
+     Thickening is an inset shadow rather than a wider border, since growing
+     the border would reflow the composer under the cursor mid-hover. */
+  /* Weighted downward: the band still reaches above the border far enough to
+     catch an approaching pointer, but only just, because everything above it
+     is the toolbar and an over-tall strip swallows the bottom edge of the Stop
+     button. The extra reach goes below instead, into the composer's own
+     padding, where it costs nothing. */
+  .controls-composer-resize-edge { top: -5px; right: 0; left: 0; height: 20px; }
+  .controls-composer-resize-edge::after { display: none; }
+
+  .controls:has(.controls-composer-resize-edge:hover),
+  .controls:has(.controls-composer-resize-edge:focus-visible) {
+    border-top-color: rgba(103,232,249,0.95);
+    box-shadow:
+      inset 0 3px 0 -1px rgba(103,232,249,0.9),
+      0 -3px 12px rgba(34,211,238,0.22),
+      inset 0 1px 0 rgba(255,255,255,0.035);
+  }
+  .composer-height-resizing-top .controls {
+    border-top-color: rgba(103,232,249,0.95);
+    box-shadow:
+      inset 0 3px 0 -1px rgba(103,232,249,0.9),
+      0 -3px 12px rgba(34,211,238,0.22),
+      inset 0 1px 0 rgba(255,255,255,0.035);
+  }
+
 }
 
 /* Placeholder via CSS when empty */

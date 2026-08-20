@@ -526,7 +526,7 @@ afterEach(() => {
     expect(screen.getByRole('button', { name: /send/i })).toBeDefined();
   });
 
-  it('shares corner and top-edge desktop resizing across every window and persists it', async () => {
+  it('shares top-edge desktop resizing across every window and persists it', async () => {
     render(
       <>
         <SessionControls ws={makeWs() as any} activeSession={makeSession({ name: 'main-window' })} quickData={makeQuickData() as any} />
@@ -546,39 +546,39 @@ afterEach(() => {
       toJSON: () => ({}),
     });
 
-    const handle = document.querySelector('.controls-composer-resize-corner') as HTMLDivElement;
+    const topEdge = document.querySelector('.controls-composer-resize-edge') as HTMLDivElement;
     // Older jsdom releases do not expose `onpointerdown`, so Preact's event
     // compatibility path registers the listener with the original casing.
-    const pointerDownEventName = 'onpointerdown' in handle ? 'pointerdown' : 'PointerDown';
-    fireEvent(handle, new MouseEvent(pointerDownEventName, {
+    const pointerDownEventName = 'onpointerdown' in topEdge ? 'pointerdown' : 'PointerDown';
+    fireEvent(topEdge, new MouseEvent(pointerDownEventName, {
       bubbles: true,
       cancelable: true,
       button: 0,
       clientY: 200,
     }));
     expect(document.body.classList.contains('composer-height-resizing')).toBe(true);
-    fireEvent(window, new MouseEvent('pointermove', { clientY: 280 }));
+    expect(document.body.classList.contains('composer-height-resizing-top')).toBe(true);
 
+    // Dragging the top edge UP grows the composer: the box keeps its footing on
+    // the bottom and rises, so an upward pointer must add height, not subtract.
+    fireEvent(window, new MouseEvent('pointermove', { clientY: 120 }));
     await waitFor(() => {
       for (const input of inputs) {
         expect(input.style.height).toBe('160px');
       }
     });
-    fireEvent(window, new MouseEvent('pointerup', { clientY: 280 }));
+    fireEvent(window, new MouseEvent('pointerup', { clientY: 120 }));
     expect(localStorage.getItem(COMPOSER_HEIGHT_STORAGE_KEY)).toBe('160');
     expect(document.body.classList.contains('composer-height-resizing')).toBe(false);
 
-    const topEdge = document.querySelector('.controls-composer-resize-edge') as HTMLDivElement;
-    const topPointerDownEventName = 'onpointerdown' in topEdge ? 'pointerdown' : 'PointerDown';
-    fireEvent(topEdge, new MouseEvent(topPointerDownEventName, {
+    // And dragging back down shrinks it.
+    fireEvent(topEdge, new MouseEvent(pointerDownEventName, {
       bubbles: true,
       cancelable: true,
       button: 0,
       clientY: 200,
     }));
-    expect(document.body.classList.contains('composer-height-resizing-top')).toBe(true);
     fireEvent(window, new MouseEvent('pointermove', { clientY: 240 }));
-
     await waitFor(() => {
       for (const input of inputs) {
         expect(input.style.height).toBe('120px');
@@ -586,11 +586,19 @@ afterEach(() => {
     });
     fireEvent(window, new MouseEvent('pointerup', { clientY: 240 }));
     expect(localStorage.getItem(COMPOSER_HEIGHT_STORAGE_KEY)).toBe('120');
-    expect(document.body.classList.contains('composer-height-resizing')).toBe(false);
 
     cleanup();
     render(<SessionControls ws={makeWs() as any} activeSession={makeSession()} quickData={makeQuickData() as any} />);
     expect((screen.getByRole('textbox') as HTMLDivElement).style.height).toBe('120px');
+  });
+
+  // The corner grip was removed when the controls moved under the input. If it
+  // ever comes back it will land either stranded mid-box or on top of Send.
+  it('renders no corner resize grip', () => {
+    render(<SessionControls ws={makeWs() as any} activeSession={makeSession()} quickData={makeQuickData() as any} />);
+    expect(document.querySelector('.controls-composer-resize-corner')).toBeNull();
+    expect(document.querySelector('.controls-composer-resize-handle')).toBeNull();
+    expect(document.querySelector('.controls-composer-resize-edge')).not.toBeNull();
   });
 
   it('keeps the shared desktop height and resize affordance out of the mobile composer', () => {
