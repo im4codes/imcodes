@@ -1573,38 +1573,49 @@ html.native-ios-mac .chat-dl-btn {
      other absolute child is the embedded voice button, which is mobile-only. */
   .controls-composer { position: static; }
 
-  /* The top border itself is the resize target.
+  /* The top border is the resize target.
 
-     The strip is an 18px invisible band straddling the border -- roughly a
-     pointer-height either side, because a 9px line is effectively unhittable.
-     It draws nothing: hovering restyles the box's real `border-top`, so the
-     thing that highlights is literally the border being grabbed, with no
-     second line and no offset arithmetic to drift out of alignment.
+     Two mechanisms draw the same highlight, deliberately:
 
-     Thickening is an inset shadow rather than a wider border, since growing
-     the border would reflow the composer under the cursor mid-hover. */
-  /* Weighted downward: the band still reaches above the border far enough to
-     catch an approaching pointer, but only just, because everything above it
-     is the toolbar and an over-tall strip swallows the bottom edge of the Stop
-     button. The extra reach goes below instead, into the composer's own
-     padding, where it costs nothing. */
+       - the strip's own ::after, driven by a plain `:hover` on the strip;
+       - `.controls:has(...)`, which restyles the box's real border.
+
+     The `::after` is the one that has to work. Ancestor `:has(:hover)`
+     re-evaluation is not dependable across engines, and the symptom is
+     exactly what was reported here: the highlight appears sometimes and not
+     others, in both main and sub sessions. A plain `:hover` on the hovered
+     element itself has no such ambiguity, so the affordance no longer rests
+     on the fragile one -- `:has()` only deepens it when it does fire.
+
+     The ::after sits at the strip's own midpoint, which is laid over the
+     border, so thickening it reads as the border getting heavier rather than
+     as a separate line floating inside the box. */
   .controls-composer-resize-edge { top: -5px; right: 0; left: 0; height: 20px; }
-  .controls-composer-resize-edge::after { display: none; }
+  .controls-composer-resize-edge::after {
+    top: 4px;
+    right: 0;
+    left: 0;
+    height: 1px;
+    border-radius: 0;
+    background: rgba(103,232,249,0.95);
+    opacity: 0;
+    display: block;
+  }
+  .controls-composer-resize-edge:hover::after,
+  .controls-composer-resize-edge:focus-visible::after,
+  .composer-height-resizing-top .controls-composer-resize-edge::after {
+    top: 3px;
+    height: 3px;
+    opacity: 1;
+    box-shadow: 0 0 10px rgba(34,211,238,0.6);
+  }
 
   .controls:has(.controls-composer-resize-edge:hover),
   .controls:has(.controls-composer-resize-edge:focus-visible) {
     border-top-color: rgba(103,232,249,0.95);
-    box-shadow:
-      inset 0 3px 0 -1px rgba(103,232,249,0.9),
-      0 -3px 12px rgba(34,211,238,0.22),
-      inset 0 1px 0 rgba(255,255,255,0.035);
   }
   .composer-height-resizing-top .controls {
     border-top-color: rgba(103,232,249,0.95);
-    box-shadow:
-      inset 0 3px 0 -1px rgba(103,232,249,0.9),
-      0 -3px 12px rgba(34,211,238,0.22),
-      inset 0 1px 0 rgba(255,255,255,0.035);
   }
 
 }

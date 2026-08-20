@@ -748,20 +748,21 @@ describe('styles.css regression contracts', () => {
     expect(outside).not.toMatch(/\.controls-composer\s*\{[^}]*order:\s*-1/);
   });
 
-  // The resize edge must restyle the box's own border, not draw a line of its
-  // own. A separately-drawn line reads as a stray rule floating inside the box
-  // -- which is exactly what shipped once -- and its position depends on offset
-  // arithmetic that silently drifts whenever the composer's padding changes.
-  it('highlights the real top border rather than drawing a second line', () => {
+  // The hover highlight must not rest on `:has()`. Ancestor `:has(:hover)`
+  // re-evaluation is not dependable across engines, and the reported symptom
+  // was exactly that — the highlight appeared sometimes and not others, in both
+  // main and sub sessions. The strip paints its own line under a plain `:hover`
+  // on the hovered element, which has no such ambiguity; `:has()` only deepens
+  // it when it does fire.
+  it('drives the resize highlight from the strip, not only from :has()', () => {
     const desktopBlock = /@media \(min-width: 641px\) \{([\s\S]*?)\n\}/.exec(css);
     expect(desktopBlock).not.toBeNull();
     const inside = desktopBlock![1];
 
-    // The strip itself draws nothing.
-    expect(inside).toMatch(/\.controls-composer-resize-edge::after\s*\{[^}]*display:\s*none/);
-    // Hover and drag both restyle the box's own top border.
-    expect(inside).toMatch(/\.controls:has\(\.controls-composer-resize-edge:hover\)[\s\S]{0,220}?border-top-color/);
-    expect(inside).toMatch(/\.composer-height-resizing-top \.controls\s*\{[^}]*border-top-color/);
+    expect(inside).toMatch(/\.controls-composer-resize-edge::after\s*\{[^}]*background/);
+    expect(inside).toMatch(/\.controls-composer-resize-edge:hover::after/);
+    // Switching the strip's own indicator off would leave only the fragile path.
+    expect(inside).not.toMatch(/\.controls-composer-resize-edge::after\s*\{[^}]*display:\s*none/);
   });
 
   // Transport sessions zero the toolbar's left padding, and they are the only
