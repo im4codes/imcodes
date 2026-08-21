@@ -79,6 +79,12 @@ export function matchQuickPhraseTrigger(text: string): string | null {
   return match ? match[1] : null;
 }
 
+/** Match the second level of `/model`, including its initial trailing space. */
+export function matchModelCommandTrigger(text: string): string | null {
+  const match = /^\/model\s+([^\r\n]*)$/iu.exec(text);
+  return match ? match[1] : null;
+}
+
 export function getSlashCommandSuggestions(
   agentType: string,
   customCommands: readonly string[],
@@ -98,4 +104,11 @@ export function getQuickPhraseSuggestions(
   return uniqueCommands([...DEFAULT_QUICK_PHRASES, ...customPhrases])
     .filter((phrase) => phrase.length > 0 && !/[\r\n]/u.test(phrase))
     .filter((phrase) => phrase.toLocaleLowerCase().includes(normalizedQuery));
+}
+
+export function getModelCommandSuggestions(models: readonly string[], query: string): string[] {
+  const normalizedQuery = query.toLocaleLowerCase();
+  return uniqueCommands(models)
+    .filter((model) => model.length > 0 && !/[\r\n]/u.test(model))
+    .filter((model) => model.toLocaleLowerCase().includes(normalizedQuery));
 }

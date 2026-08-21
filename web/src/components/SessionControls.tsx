@@ -8,8 +8,10 @@ import { QuickInputPanel } from './QuickInputPanel.js';
 import { getNavigableHistory } from './QuickInputPanel.js';
 import type { UseQuickDataResult } from './QuickInputPanel.js';
 import {
+  getModelCommandSuggestions,
   getQuickPhraseSuggestions,
   getSlashCommandSuggestions,
+  matchModelCommandTrigger,
   matchQuickPhraseTrigger,
   matchSlashCommandTrigger,
 } from '../quick-commands.js';
@@ -108,7 +110,7 @@ import {
   type SupervisionMode,
 } from '@shared/supervision-config.js';
 import { FILE_TRANSFER_LIMITS } from '@shared/transport/file-transfer.js';
-import { shouldHideOptimisticUserMessageForSessionControl } from '@shared/session-control-commands.js';
+import { SESSION_MODEL_COMMAND, shouldHideOptimisticUserMessageForSessionControl } from '@shared/session-control-commands.js';
 import type { SharedActorEnvelope } from '@shared/tab-sharing.js';
 import { EXECUTION_CLONE_KIND } from '@shared/execution-clone.js';
 import {
@@ -1131,8 +1133,8 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   // in `;name` never opens the inline alias picker (paste must not trigger).
   const aliasPasteSuppressRef = useRef(false);
   // Inline `^` machine autocomplete — mirrors the inline `;` alias trigger, but
-  // for a `^^(name)` machine target marker. Offline machines are shown but
-  // non-selectable (skipped in nav + no-op select).
+  // for a `^^(name)` machine target marker. Connectivity is informational;
+  // offline nodes remain selectable so a request can target their stable ref.
   const [machinePickerOpen, setMachinePickerOpen] = useState(false);
   const [machineQuery, setMachineQuery] = useState('');
   const [machineHighlightIdx, setMachineHighlightIdx] = useState(0);
@@ -1140,7 +1142,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   // Set for the input event immediately following a paste so pasted text ending
   // in `^name` never opens the inline machine picker (paste must not trigger).
   const machinePasteSuppressRef = useRef(false);
-  const [quickSuggestionKind, setQuickSuggestionKind] = useState<'command' | 'phrase' | null>(null);
+  const [quickSuggestionKind, setQuickSuggestionKind] = useState<'command' | 'phrase' | 'model' | null>(null);
   const [quickSuggestionQuery, setQuickSuggestionQuery] = useState('');
   const [quickSuggestionHighlightIdx, setQuickSuggestionHighlightIdx] = useState(0);
   const [modelOpen, setModelOpen] = useState(false);
@@ -1483,20 +1485,6 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     machines: machineAll,
     filtered: machineFiltered,
   } = useMachines(machineQuery);
-  const quickSuggestions = useMemo(
-    () => quickSuggestionKind === 'phrase'
-      ? getQuickPhraseSuggestions(quickData.data.phrases, quickSuggestionQuery)
-      : getSlashCommandSuggestions(activeSession?.agentType ?? 'claude-code', quickData.data.commands, quickSuggestionQuery),
-    [activeSession?.agentType, quickData.data.commands, quickData.data.phrases, quickSuggestionKind, quickSuggestionQuery],
-  );
-  const quickSuggestionPickerRef = useRef<HTMLDivElement>(null);
-  useEffect(() => {
-    if (quickSuggestionKind === null || quickSuggestions.length === 0) return;
-    const highlighted = quickSuggestionPickerRef.current?.querySelector<HTMLElement>('[data-hl="true"]');
-    if (typeof highlighted?.scrollIntoView === 'function') {
-      highlighted.scrollIntoView({ block: 'nearest' });
-    }
-  }, [quickSuggestionHighlightIdx, quickSuggestionKind, quickSuggestions]);
   const publishComposerText = useCallback((text: string) => {
     onComposerTextChange?.(text);
   }, [onComposerTextChange]);
@@ -1924,6 +1912,43 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       description: known.find((model) => model.id === id)?.description ?? getKnownQwenModelDescription(id),
     }));
   }, [activeSession?.qwenAuthType, activeSession?.qwenAvailableModels, detectedModel, qwenModel, qwenTier]);
+  const availableModelSuggestions: readonly string[] = isClaudeCode
+    ? claudeModelSuggestions
+    : isCodex
+      ? codexModelSuggestions
+      : isQwen
+        ? qwenChoices.map((choice) => choice.id)
+        : supportsGenericTransportModelSelect
+          ? genericTransportModelSuggestions
+          : [];
+  const quickSuggestions = useMemo(() => {
+    if (quickSuggestionKind === 'phrase') {
+      return getQuickPhraseSuggestions(quickData.data.phrases, quickSuggestionQuery);
+    }
+    if (quickSuggestionKind === 'model') {
+      return getModelCommandSuggestions(availableModelSuggestions, quickSuggestionQuery);
+    }
+    return getSlashCommandSuggestions(
+      activeSession?.agentType ?? 'claude-code',
+      quickData.data.commands,
+      quickSuggestionQuery,
+    );
+  }, [
+    activeSession?.agentType,
+    availableModelSuggestions,
+    quickData.data.commands,
+    quickData.data.phrases,
+    quickSuggestionKind,
+    quickSuggestionQuery,
+  ]);
+  const quickSuggestionPickerRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (quickSuggestionKind === null || quickSuggestions.length === 0) return;
+    const highlighted = quickSuggestionPickerRef.current?.querySelector<HTMLElement>('[data-hl="true"]');
+    if (typeof highlighted?.scrollIntoView === 'function') {
+      highlighted.scrollIntoView({ block: 'nearest' });
+    }
+  }, [quickSuggestionHighlightIdx, quickSuggestionKind, quickSuggestions]);
   const { allCombos } = useP2pCustomCombos();
   const comboMenuItems = useMemo(
     () => [...allCombos.presets.map((combo) => combo.key), ...allCombos.custom],
@@ -2582,9 +2607,19 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   };
 
   const selectQuickSuggestion = (value: string) => {
+    if (quickSuggestionKind === 'command' && value.toLocaleLowerCase() === SESSION_MODEL_COMMAND) {
+      setQuickSuggestionKind('model');
+      setQuickSuggestionQuery('');
+      setQuickSuggestionHighlightIdx(0);
+      fillInput(`${SESSION_MODEL_COMMAND} `);
+      if (supportsDynamicTransportModels(activeSession?.agentType)) {
+        dynamicTransportModels.refresh();
+      }
+      return;
+    }
     setQuickSuggestionKind(null);
     setQuickSuggestionQuery('');
-    fillInput(value);
+    fillInput(quickSuggestionKind === 'model' ? `${SESSION_MODEL_COMMAND} ${value}` : value);
   };
 
   const appendToInput = (paths: string[]) => {
@@ -4253,6 +4288,17 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         setQuickSuggestionQuery('');
         return;
       }
+      const exactCommand = quickSuggestionKind === 'command'
+        ? quickSuggestions.find(
+            (command) => command.toLocaleLowerCase() === `/${quickSuggestionQuery}`.toLocaleLowerCase(),
+          )
+        : undefined;
+      if (e.key === 'Enter' && exactCommand?.toLocaleLowerCase() === SESSION_MODEL_COMMAND) {
+        e.preventDefault();
+        e.stopPropagation();
+        selectQuickSuggestion(exactCommand);
+        return;
+      }
       if (quickSuggestionKind === 'command' && e.key === 'Enter' && quickSuggestions.some(
         (command) => command.toLocaleLowerCase() === `/${quickSuggestionQuery}`.toLocaleLowerCase(),
       )) {
@@ -4306,28 +4352,17 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     }
 
     // When the inline `^` machine picker is open, it owns Enter/Tab/Arrow/Escape,
-    // mirroring the alias picker. OFFLINE machines are shown but non-selectable:
-    // Arrow navigation skips them and Enter/Tab only accepts an online row.
+    // mirroring the alias picker. Online state never changes selectability.
     if (machinePickerOpen) {
-      // Indices of the currently selectable (online) rows, in list order.
-      const onlineIdx = machineFiltered.reduce<number[]>((acc, m, i) => {
-        if (m.online) acc.push(i);
-        return acc;
-      }, []);
-      const stepMachine = (h: number, dir: 1 | -1): number => {
-        if (onlineIdx.length === 0) return h;
-        const pos = onlineIdx.indexOf(h);
-        if (pos === -1) return dir === 1 ? onlineIdx[0] : onlineIdx[onlineIdx.length - 1];
-        return onlineIdx[(pos + dir + onlineIdx.length) % onlineIdx.length];
-      };
+      const count = machineFiltered.length;
       if (e.key === 'ArrowDown') {
         e.preventDefault();
-        if (onlineIdx.length > 0) setMachineHighlightIdx((h) => stepMachine(h, 1));
+        if (count > 0) setMachineHighlightIdx((h) => (h + 1) % count);
         return;
       }
       if (e.key === 'ArrowUp') {
         e.preventDefault();
-        if (onlineIdx.length > 0) setMachineHighlightIdx((h) => stepMachine(h, -1));
+        if (count > 0) setMachineHighlightIdx((h) => (h - 1 + count) % count);
         return;
       }
       if (e.key === 'Escape') {
@@ -4337,13 +4372,10 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         setMachineQuery('');
         return;
       }
-      if ((e.key === 'Tab' || e.key === 'Enter') && onlineIdx.length > 0) {
+      if ((e.key === 'Tab' || e.key === 'Enter') && count > 0) {
         e.preventDefault();
         e.stopPropagation();
-        // Insert the highlighted row when it is online; otherwise snap to the
-        // first online row so an offline highlight never accidentally sends.
-        const effIdx = machineFiltered[machineHighlightIdx]?.online ? machineHighlightIdx : onlineIdx[0];
-        const chosen = machineFiltered[effIdx];
+        const chosen = machineFiltered[Math.min(machineHighlightIdx, count - 1)];
         setMachinePickerOpen(false);
         setMachineQuery('');
         machineJustClosedRef.current = true;
@@ -4826,7 +4858,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     ? basePlaceholder
     : compact
       ? basePlaceholder
-      : t('session.send_placeholder_desktop_upload', { placeholder: basePlaceholder });
+      : t('session.send_placeholder_desktop_shortcuts', { placeholder: basePlaceholder });
 
   const dropOverlayStyle = (() => {
     if (!fileDragActive) return null;
@@ -6231,15 +6263,27 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
             ref={quickSuggestionPickerRef}
             class="controls-slash-picker"
             role="listbox"
-            aria-label={t(quickSuggestionKind === 'command' ? 'quick_input.commands' : 'quick_input.phrases')}
+            aria-label={t(quickSuggestionKind === 'command'
+              ? 'quick_input.commands'
+              : quickSuggestionKind === 'phrase'
+                ? 'quick_input.phrases'
+                : 'quick_input.models')}
             style={aliasPickerContainerStyle}
           >
             <div style={aliasPickerGroupLabelStyle}>
-              {t(quickSuggestionKind === 'command' ? 'quick_input.commands' : 'quick_input.phrases')}
+              {t(quickSuggestionKind === 'command'
+                ? 'quick_input.commands'
+                : quickSuggestionKind === 'phrase'
+                  ? 'quick_input.phrases'
+                  : 'quick_input.models')}
             </div>
             {quickSuggestions.length === 0 && (
               <div style={aliasPickerEmptyStyle}>
-                {t(quickSuggestionKind === 'command' ? 'quick_input.no_command_matches' : 'quick_input.no_phrase_matches')}
+                {t(quickSuggestionKind === 'command'
+                  ? 'quick_input.no_command_matches'
+                  : quickSuggestionKind === 'phrase'
+                    ? 'quick_input.no_phrase_matches'
+                    : 'quick_input.no_model_matches')}
               </div>
             )}
             {quickSuggestions.map((suggestion, idx) => {
@@ -6252,11 +6296,12 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                   data-hl={highlighted ? 'true' : undefined}
                   data-slash-command={quickSuggestionKind === 'command' ? suggestion : undefined}
                   data-quick-phrase={quickSuggestionKind === 'phrase' ? suggestion : undefined}
+                  data-model-command={quickSuggestionKind === 'model' ? suggestion : undefined}
                   style={highlighted ? aliasPickerItemHighlightStyle : aliasPickerItemStyle}
                   onMouseDown={(event) => event.preventDefault()}
                   onClick={() => selectQuickSuggestion(suggestion)}
                 >
-                  {quickSuggestionKind === 'command' ? <code>{suggestion}</code> : <span>{suggestion}</span>}
+                  {quickSuggestionKind === 'phrase' ? <span>{suggestion}</span> : <code>{suggestion}</code>}
                 </div>
               );
             })}
@@ -6303,17 +6348,10 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         )}
 
         {/* Inline `^` machine autocomplete dropdown. Mirrors the alias dropdown;
-            owns Enter/Tab/Arrow/Escape via handleKeyDown while open. Offline
-            machines are shown but dimmed + non-selectable (skipped in nav and a
-            no-op on select) — the marker is a visible hint, the server
-            re-validates the target. */}
+            owns Enter/Tab/Arrow/Escape via handleKeyDown while open. Connectivity
+            remains visible but does not prevent inserting a stable marker. */}
         {machinePickerOpen && activeSession && (() => {
-          // Keep the rendered highlight on a selectable (online) row: if the
-          // stored highlight lands on an offline machine (or is out of range),
-          // fall back to the first online row so the picker never visibly
-          // highlights something the user cannot pick.
-          const firstOnline = machineFiltered.findIndex((m) => m.online);
-          const effHighlight = machineFiltered[machineHighlightIdx]?.online ? machineHighlightIdx : firstOnline;
+          const effHighlight = Math.min(machineHighlightIdx, Math.max(0, machineFiltered.length - 1));
           return (
             <div class="controls-machine-picker" role="listbox" aria-label={t('machine.category')} style={aliasPickerContainerStyle}>
               <div style={aliasPickerGroupLabelStyle}>
@@ -6326,30 +6364,23 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
               )}
               {machineFiltered.map((m, idx) => {
                 const hl = idx === effHighlight;
-                const selectable = m.online;
                 return (
                   <div
                     key={m.serverId}
                     role="option"
                     aria-selected={hl ? 'true' : 'false'}
-                    aria-disabled={selectable ? undefined : 'true'}
                     data-machine-ref={m.refName}
                     data-machine-online={m.online ? 'true' : 'false'}
                     data-hl={hl ? 'true' : undefined}
-                    style={{
-                      ...(hl ? aliasPickerItemHighlightStyle : aliasPickerItemStyle),
-                      ...(selectable ? {} : { color: '#64748b', cursor: 'not-allowed', opacity: 0.65 }),
-                    }}
+                    style={hl ? aliasPickerItemHighlightStyle : aliasPickerItemStyle}
                     // Use mousedown so selecting doesn't blur the composer first.
-                    // Offline machines are non-selectable — the handler is a no-op.
                     onMouseDown={(e) => {
                       e.preventDefault();
-                      if (!selectable) return;
                       setMachinePickerOpen(false);
                       setMachineQuery('');
                       insertMachineMarker(m.refName, m.displayName);
                     }}
-                    onMouseEnter={() => { if (selectable) setMachineHighlightIdx(idx); }}
+                    onMouseEnter={() => setMachineHighlightIdx(idx)}
                   >
                     <span
                       style={{
@@ -6361,7 +6392,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                       }}
                       title={m.online ? undefined : t('machine.offline')}
                     />
-                    <span style={{ fontWeight: 500, color: selectable ? '#e2e8f0' : '#64748b' }}>{m.displayName}</span>
+                    <span style={{ fontWeight: 500, color: '#e2e8f0' }}>{m.displayName}</span>
                     <span style={aliasPickerDimStyle}>{m.refName}</span>
                     {!m.online && <span style={aliasPickerDimStyle}>{t('machine.offline_hint')}</span>}
                   </div>
@@ -6427,8 +6458,13 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
               // Detect @/@@: use end of text (contentEditable anchorOffset is unreliable)
               const text = currentText;
 
+              const modelTrigger = imeComposingRef.current ? null : matchModelCommandTrigger(text);
               const slashTrigger = imeComposingRef.current ? null : matchSlashCommandTrigger(text);
-              if (slashTrigger !== null) {
+              if (modelTrigger !== null) {
+                setQuickSuggestionKind('model');
+                setQuickSuggestionQuery(modelTrigger);
+                setQuickSuggestionHighlightIdx(0);
+              } else if (slashTrigger !== null) {
                 setQuickSuggestionKind('command');
                 setQuickSuggestionQuery(slashTrigger);
                 setQuickSuggestionHighlightIdx(0);

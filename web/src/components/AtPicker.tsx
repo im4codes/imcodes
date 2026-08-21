@@ -177,9 +177,9 @@ export function AtPicker({
   // Alias list is filtered by the same inline query (name + description) the
   // rest of the picker uses. Selecting one inserts its `;;(name)` marker only.
   const { filtered: aliasResults } = useAliases(category === 'aliases' ? query : undefined);
-  // Machine list, filtered by the same inline query. Selecting an ONLINE machine
-  // inserts its `^^(refName)` marker; offline machines are shown but not
-  // selectable (skipped in nav + no-op click).
+  // Machine list, filtered by the same inline query. Online state is status
+  // context only: both online and offline nodes can be referenced for a task
+  // that may run after the node reconnects.
   const { filtered: machineResults } = useMachines(category === 'machines' ? query : undefined);
   const [fileResults, setFileResults] = useState<Array<{ path: string; basename: string; dir: string }>>([]);
   const [highlightIdx, setHighlightIdx] = useState(0);
@@ -362,27 +362,16 @@ export function AtPicker({
         return;
       }
 
-      // Machines: ↑↓ move (skipping offline), Enter/Tab insert the highlighted
-      // ONLINE marker. Offline machines are shown but non-selectable.
+      // Machines: ↑↓ move, Enter/Tab insert the highlighted marker. Connectivity
+      // is informational and never prevents composing a stable node reference.
       if (category === 'machines') {
-        const onlineIdx = machineResults.reduce<number[]>((acc, m, i) => {
-          if (m.online) acc.push(i);
-          return acc;
-        }, []);
-        const step = (h: number, dir: 1 | -1): number => {
-          if (onlineIdx.length === 0) return h;
-          const pos = onlineIdx.indexOf(h);
-          if (pos === -1) return dir === 1 ? onlineIdx[0] : onlineIdx[onlineIdx.length - 1];
-          return onlineIdx[(pos + dir + onlineIdx.length) % onlineIdx.length];
-        };
+        const count = machineResults.length;
         if (e.key === 'Escape') { consumeEscapeKey(e); setCategory('choose'); setHighlightIdx(4); return; }
-        if (e.key === 'ArrowUp') { e.preventDefault(); if (onlineIdx.length > 0) setHighlightIdx((h) => step(h, -1)); return; }
-        if (e.key === 'ArrowDown') { e.preventDefault(); if (onlineIdx.length > 0) setHighlightIdx((h) => step(h, 1)); return; }
-        if ((e.key === 'Enter' || e.key === 'Tab') && onlineIdx.length > 0) {
+        if (e.key === 'ArrowUp') { e.preventDefault(); if (count > 0) setHighlightIdx((h) => (h - 1 + count) % count); return; }
+        if (e.key === 'ArrowDown') { e.preventDefault(); if (count > 0) setHighlightIdx((h) => (h + 1) % count); return; }
+        if ((e.key === 'Enter' || e.key === 'Tab') && count > 0) {
           e.preventDefault(); e.stopPropagation();
-          // Snap an offline/out-of-range highlight to the first online row.
-          const effIdx = machineResults[highlightIdx]?.online ? highlightIdx : onlineIdx[0];
-          const m = machineResults[effIdx];
+          const m = machineResults[Math.min(highlightIdx, count - 1)];
           if (m) onSelectMachine?.(m.refName, m.displayName);
           return;
         }
@@ -551,11 +540,9 @@ export function AtPicker({
     );
   }
 
-  // ── Machines list ── Offline machines are shown but non-selectable.
+  // ── Machines list ── Online state is informational; every row is selectable.
   if (category === 'machines') {
-    // Keep the visible highlight on a selectable (online) row.
-    const firstOnline = machineResults.findIndex((m) => m.online);
-    const effHighlight = machineResults[highlightIdx]?.online ? highlightIdx : firstOnline;
+    const effHighlight = Math.min(highlightIdx, Math.max(0, machineResults.length - 1));
     return (
       <div ref={containerRef} style={containerStyle}>
         <div style={backBtnStyle} onClick={() => { setCategory('choose'); setHighlightIdx(4); }}>← {t('p2p.picker.back')}</div>
@@ -569,18 +556,13 @@ export function AtPicker({
         )}
         {machineResults.map((m, idx) => {
           const hl = idx === effHighlight;
-          const selectable = m.online;
           return (
             <div
               key={m.serverId}
               data-hl={hl ? 'true' : undefined}
-              aria-disabled={selectable ? undefined : 'true'}
-              style={{
-                ...(hl ? itemHighlightStyle : itemStyle),
-                ...(selectable ? {} : { color: '#64748b', cursor: 'not-allowed', opacity: 0.65 }),
-              }}
-              onClick={() => { if (selectable) onSelectMachine?.(m.refName, m.displayName); }}
-              onMouseEnter={() => { if (selectable) setHighlightIdx(idx); }}
+              style={hl ? itemHighlightStyle : itemStyle}
+              onClick={() => onSelectMachine?.(m.refName, m.displayName)}
+              onMouseEnter={() => setHighlightIdx(idx)}
             >
               <span
                 style={{
@@ -592,7 +574,7 @@ export function AtPicker({
                 }}
                 title={m.online ? undefined : t('machine.offline')}
               />
-              <span style={{ fontWeight: 500, color: selectable ? '#e2e8f0' : '#64748b' }}>{m.displayName}</span>
+              <span style={{ fontWeight: 500, color: '#e2e8f0' }}>{m.displayName}</span>
               <span style={dimStyle}>{m.refName}</span>
               {!m.online && <span style={dimStyle}>{t('machine.offline_hint')}</span>}
             </div>

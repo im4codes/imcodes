@@ -2241,28 +2241,39 @@ export function RemoteDesktopPanel({
         {filePanelOpen && !fileDrawerMinimized && (
           <aside class="remote-desktop-file-drawer" aria-label={t('remote_desktop.files')}>
             <div class="remote-desktop-file-drawer-head">
-              <div>
+              <div class="remote-desktop-file-drawer-copy">
                 <strong>{t('remote_desktop.files')}</strong>
                 <span>{t('remote_desktop.file_transfer_hint')}</span>
               </div>
               <div class="remote-desktop-file-drawer-actions">
                 <button
                   type="button"
+                  class="remote-desktop-file-control"
                   aria-label={t('remote_desktop.minimize_files')}
                   title={t('remote_desktop.minimize_files')}
                   onClick={() => {
                     setDirectoryPickerOpen(false);
                     setFileDrawerMinimized(true);
                   }}
-                >—</button>
+                >
+                  <svg viewBox="0 0 16 16" aria-hidden="true">
+                    <path d="M3.5 8h9" />
+                  </svg>
+                </button>
                 <button
                   type="button"
+                  class="remote-desktop-file-control is-close"
                   aria-label={t('remote_desktop.close_files')}
+                  title={t('remote_desktop.close_files')}
                   onClick={() => {
                     setDirectoryPickerOpen(false);
                     setFilePanelOpen(false);
                   }}
-                >×</button>
+                >
+                  <svg viewBox="0 0 16 16" aria-hidden="true">
+                    <path d="m4.5 4.5 7 7m0-7-7 7" />
+                  </svg>
+                </button>
               </div>
             </div>
 

@@ -3,9 +3,8 @@
  *
  * AtPicker "machine" category (tasks 8.4 + 10.13). Verifies the machine category
  * appears in the chooser, entering it lists the account's controllable machines
- * with online/offline state, selecting an ONLINE machine asks the host to insert
- * its annotated `^^(refName)-(displayName)` reference, and an OFFLINE machine
- * is shown but NOT selectable.
+ * with online/offline state. Connectivity is informational: either row inserts
+ * its annotated `^^(refName)-(displayName)` reference.
  */
 import { render, cleanup, fireEvent, waitFor } from '@testing-library/preact';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -119,12 +118,22 @@ describe('AtPicker — machine category (10.13)', () => {
     expect(onSelectMachine).toHaveBeenCalledWith('winbox-a1', 'Win Box');
   });
 
-  it('does NOT select an OFFLINE machine on click (offline shown but not selectable)', async () => {
+  it('selects an OFFLINE machine on click while preserving its offline status', async () => {
     const onSelectMachine = vi.fn();
     const { container } = render(<AtPicker {...baseProps({ onSelectMachine })} />);
     openMachineCategory(container);
     const span = await waitFor(() => nameSpan(container, 'Mac Mini'));
     fireEvent.click(span.parentElement as HTMLElement);
-    expect(onSelectMachine).not.toHaveBeenCalled();
+    expect(onSelectMachine).toHaveBeenCalledWith('macmini-b2', 'Mac Mini');
+  });
+
+  it('includes OFFLINE machines in keyboard navigation', async () => {
+    const onSelectMachine = vi.fn();
+    const { container } = render(<AtPicker {...baseProps({ onSelectMachine })} />);
+    openMachineCategory(container);
+    await waitFor(() => expect(container.textContent).toContain('Mac Mini'));
+    fireEvent.keyDown(document, { key: 'ArrowDown' });
+    fireEvent.keyDown(document, { key: 'Enter' });
+    expect(onSelectMachine).toHaveBeenCalledWith('macmini-b2', 'Mac Mini');
   });
 });

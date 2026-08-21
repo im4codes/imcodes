@@ -14,6 +14,15 @@ describe('styles.css regression contracts', () => {
   const css = readFileSync(resolve(__dirname, '../src/styles.css'), 'utf8');
   const cssWithoutComments = css.replace(/\/\*[\s\S]*?\*\//g, '');
 
+  it('keeps remote desktop file window controls compact and horizontal', () => {
+    const actionsRule = css.match(/\.remote-desktop-file-drawer \.remote-desktop-file-drawer-actions\s*\{[^}]*\}/)?.[0];
+    expect(actionsRule).toMatch(/display:\s*flex/);
+    const controlRule = css.match(/\.remote-desktop-file-drawer \.remote-desktop-file-control\s*\{[^}]*\}/)?.[0];
+    expect(controlRule).toMatch(/width:\s*30px/);
+    expect(controlRule).toMatch(/height:\s*30px/);
+    expect(controlRule).toMatch(/border-radius:\s*999px/);
+  });
+
   it('keeps feature announcements visible and dismissible on desktop and mobile', () => {
     const announcementRule = css.match(/\.feature-announcement\s*\{[^}]*\}/)?.[0];
     expect(announcementRule).toBeTruthy();

@@ -9245,10 +9245,54 @@ button.quick-agent-delegation-preset.active {
   gap: 12px;
 }
 
-.remote-desktop-file-drawer-head > div {
+.remote-desktop-file-drawer-copy {
   min-width: 0;
   display: grid;
   gap: 3px;
+}
+
+.remote-desktop-file-drawer .remote-desktop-file-drawer-actions {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 6px;
+}
+
+.remote-desktop-file-drawer .remote-desktop-file-control {
+  width: 30px;
+  min-width: 30px;
+  height: 30px;
+  min-height: 30px;
+  padding: 0;
+  display: inline-grid;
+  place-items: center;
+  color: #a9d9ed;
+  background: rgb(12 42 60 / 66%);
+  border: 1px solid rgb(87 184 224 / 30%);
+  border-radius: 999px;
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 6%);
+  transition: color .15s ease, background .15s ease, border-color .15s ease, transform .15s ease;
+}
+
+.remote-desktop-file-drawer .remote-desktop-file-control svg {
+  width: 15px;
+  height: 15px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.7;
+  stroke-linecap: round;
+}
+
+.remote-desktop-file-drawer .remote-desktop-file-control:hover {
+  color: #e6f9ff;
+  background: rgb(25 76 102 / 80%);
+  border-color: rgb(102 210 251 / 58%);
+  transform: translateY(-1px);
+}
+
+.remote-desktop-file-drawer .remote-desktop-file-control.is-close:hover {
+  color: #ffd7dc;
+  background: rgb(118 33 48 / 60%);
+  border-color: rgb(251 113 133 / 60%);
 }
 
 .remote-desktop-file-drawer-head strong {

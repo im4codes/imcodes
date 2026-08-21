@@ -1,8 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import {
   getDefaultQuickCommands,
+  getModelCommandSuggestions,
   getQuickPhraseSuggestions,
   getSlashCommandSuggestions,
+  matchModelCommandTrigger,
   matchQuickPhraseTrigger,
   matchSlashCommandTrigger,
 } from '../src/quick-commands.js';
@@ -43,5 +45,19 @@ describe('quick phrase suggestions', () => {
   it('combines built-in and custom phrases with case-insensitive filtering and deduplication', () => {
     expect(getQuickPhraseSuggestions(['check errors', 'inspect errors', 'CHECK ERRORS', ''], 'ERR'))
       .toEqual(['check errors', 'inspect errors']);
+  });
+});
+
+describe('model command suggestions', () => {
+  it('opens the second level only for a leading /model command with a space', () => {
+    expect(matchModelCommandTrigger('/model ')).toBe('');
+    expect(matchModelCommandTrigger('/MODEL gpt')).toBe('gpt');
+    expect(matchModelCommandTrigger('text /model ')).toBeNull();
+    expect(matchModelCommandTrigger('/model')).toBeNull();
+  });
+
+  it('filters the current supported model list without duplicates', () => {
+    expect(getModelCommandSuggestions(['gpt-5.4', 'GPT-5.4', 'gpt-5.4-mini'], 'mini'))
+      .toEqual(['gpt-5.4-mini']);
   });
 });

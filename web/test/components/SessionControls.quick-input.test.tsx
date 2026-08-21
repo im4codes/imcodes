@@ -11,6 +11,7 @@ vi.mock('react-i18next', () => ({
       if (key === 'quick_input.title') return 'Quick input';
       if (key === 'session.send_placeholder') return `Send to ${String(opts?.name ?? 'session')}…`;
       if (key === 'session.send_placeholder_desktop_upload') return String(opts?.placeholder ?? '');
+      if (key === 'session.send_placeholder_desktop_shortcuts') return `${String(opts?.placeholder ?? '')}\n/ ! @ ; ^ shortcuts`;
       const parts = key.split('.');
       return parts[parts.length - 1];
     },
@@ -40,6 +41,27 @@ vi.mock('../../src/components/p2p-combos.js', () => ({
 
 vi.mock('../../src/hooks/useSwipeBack.js', () => ({
   useSwipeBack: () => ({ current: null }),
+}));
+
+vi.mock('../../src/hooks/useMachines.js', () => ({
+  useMachines: (query = '') => {
+    const machines = [
+      { serverId: 'srv-online', refName: 'online-node', displayName: 'Online Node', os: 'windows', online: true, execEnabled: true },
+      { serverId: 'srv-offline', refName: 'offline-node', displayName: 'Offline Node', os: 'windows', online: false, execEnabled: true },
+    ];
+    const normalized = query.toLocaleLowerCase();
+    return {
+      machines,
+      filtered: machines.filter((machine) => (
+        machine.refName.includes(normalized) || machine.displayName.toLocaleLowerCase().includes(normalized)
+      )),
+      loaded: true,
+      loading: false,
+      error: null,
+      stale: false,
+      refetch: vi.fn(),
+    };
+  },
 }));
 
 vi.mock('../../src/api.js', () => ({
@@ -114,6 +136,21 @@ describe('SessionControls quick input integration', () => {
     fireEvent.click(screen.getByTitle('Quick input'));
 
     expect(document.querySelector('.qp')).toBeTruthy();
+  });
+
+  it('shows shortcut triggers on the second desktop placeholder line', () => {
+    render(
+      <SessionControls
+        ws={{ connected: true, send: vi.fn(), onMessage: vi.fn(() => () => {}) } as any}
+        activeSession={makeSession()}
+        quickData={makeQuickData()}
+        sessions={[]}
+        subSessions={[]}
+        serverId="srv-1"
+      />,
+    );
+    expect(screen.getByRole('textbox').getAttribute('data-placeholder'))
+      .toContain('\n/ ! @ ; ^ shortcuts');
   });
 
   it('preserves visual newlines from the composer when sending and recording history', () => {
@@ -280,6 +317,69 @@ describe('SessionControls quick input integration', () => {
     expect(input.textContent).toBe('/fast on');
     expect(container.querySelector('.controls-slash-picker')).toBeNull();
     expect(ws.sendSessionCommand).not.toHaveBeenCalled();
+  });
+
+  it('opens supported models as a second level after selecting /model', () => {
+    const ws = {
+      connected: true,
+      send: vi.fn(),
+      sendSessionCommand: vi.fn(),
+      sendInput: vi.fn(),
+      subSessionSetModel: vi.fn(),
+      fsListDir: vi.fn(),
+      onMessage: vi.fn(() => () => {}),
+    } as any;
+    const { container } = render(
+      <SessionControls
+        ws={ws}
+        activeSession={makeSession({ agentType: 'claude-code-sdk' })}
+        quickData={makeQuickData()}
+        sessions={[]}
+        subSessions={[]}
+        serverId="srv-1"
+      />,
+    );
+    const input = screen.getByRole('textbox');
+    input.textContent = '/mo';
+    fireEvent.input(input);
+    fireEvent.click(container.querySelector('[data-slash-command="/model"]')!);
+
+    expect(input.textContent).toBe('/model ');
+    expect(container.querySelector('[data-model-command="sonnet"]')).toBeTruthy();
+    expect(container.querySelector('[data-model-command="opus[1M]"]')).toBeTruthy();
+
+    fireEvent.click(container.querySelector('[data-model-command="opus[1M]"]')!);
+    expect(input.textContent).toBe('/model opus[1M]');
+    expect(container.querySelector('.controls-slash-picker')).toBeNull();
+    expect(ws.sendSessionCommand).not.toHaveBeenCalled();
+  });
+
+  it('allows an offline controlled node to be selected from the inline caret picker', () => {
+    const { container } = render(
+      <SessionControls
+        ws={{ connected: true, send: vi.fn(), sendSessionCommand: vi.fn(), onMessage: vi.fn(() => () => {}) } as any}
+        activeSession={makeSession()}
+        quickData={makeQuickData()}
+        sessions={[]}
+        subSessions={[]}
+        serverId="srv-1"
+      />,
+    );
+    const input = screen.getByRole('textbox');
+    input.textContent = '^offline';
+    fireEvent.input(input);
+    input.focus();
+    const selection = window.getSelection();
+    const range = document.createRange();
+    range.selectNodeContents(input);
+    range.collapse(false);
+    selection?.removeAllRanges();
+    selection?.addRange(range);
+    const offline = container.querySelector('[data-machine-ref="offline-node"]') as HTMLElement;
+    expect(offline.getAttribute('data-machine-online')).toBe('false');
+    expect(offline.getAttribute('aria-disabled')).toBeNull();
+    fireEvent.mouseDown(offline);
+    expect(container.querySelector('.controls-machine-picker')).toBeNull();
   });
 
   it('filters built-in and user quick phrases from a leading exclamation mark', () => {
