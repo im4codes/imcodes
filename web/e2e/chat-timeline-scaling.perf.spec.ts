@@ -24,6 +24,17 @@ const SIZES = [500, 2_000, 8_000] as const;
 const UPDATES = 40;
 
 /**
+ * Discarded updates before each sample.
+ *
+ * The first size measured pays for cold JIT of the whole app on that host. On a
+ * GitHub runner that was enough to make the SHORTEST session look slower than a
+ * 4x longer one (4.70ms at 500 rows against 2.40ms at 2,000) — the baseline was
+ * measuring warm-up, not history. That inflated baseline is dangerous rather
+ * than merely untidy; see `growthRatio`.
+ */
+const WARMUP_UPDATES = 25;
+
+/**
  * How much growth across a 16x longer session still counts as flat.
  *
  * Chosen from both states rather than guessed. Measured in Chromium under 4x
@@ -45,6 +56,23 @@ const FLATNESS_LIMIT = 4;
  * because it has to hold on whatever host CI gives us.
  */
 const WORST_CASE_UPDATE_MS = 12;
+
+/**
+ * Growth across the measured sizes, divided by the FASTEST size rather than the
+ * first one.
+ *
+ * Dividing by the first size lets a slow baseline hide a real regression: if
+ * cold-start noise inflates the 500-row sample to 4.70ms, a regressed 8,000-row
+ * sample at 15ms scores 3.2x and passes a limit of 4. Taking the minimum makes
+ * the comparison conservative in the safe direction — noise on any one point
+ * can only make this ratio larger, never smaller, so the guard errs toward
+ * complaining rather than toward silence.
+ */
+function growthRatio(medians: number[]): { ratio: number; baseline: number; largest: number } {
+  const baseline = Math.max(Math.min(...medians), 0.01);
+  const largest = medians[medians.length - 1]!;
+  return { ratio: largest / baseline, baseline, largest };
+}
 
 interface UpdateCost {
   medianMs: number;
@@ -136,7 +164,7 @@ test('streaming stays flat as the conversation grows', async ({ page }) => {
   for (const size of SIZES) {
     await page.goto(`${FIXTURE}?size=${size}`);
     await waitForHarness(page);
-    await measureStreamingUpdates(page, 5); // warm-up, discarded
+    await measureStreamingUpdates(page, WARMUP_UPDATES); // warm-up, discarded
     results.push({ size, cost: await measureStreamingUpdates(page, UPDATES) });
   }
 
@@ -146,16 +174,15 @@ test('streaming stays flat as the conversation grows', async ({ page }) => {
   // eslint-disable-next-line no-console
   console.log(`[streaming] ${table}`);
 
-  const smallest = results[0]!.cost.medianMs;
-  const largest = results[results.length - 1]!.cost.medianMs;
   // A sample that never reached the DOM describes nothing; fail loudly rather
   // than reporting a fast number for an update that did not happen.
   for (const result of results) {
     expect(result.cost.reflected, `${result.size} updates reached the DOM`).toBeGreaterThan(0.9);
   }
+  const { ratio, baseline, largest } = growthRatio(results.map((r) => r.cost.medianMs));
   expect(
-    largest / Math.max(smallest, 0.01),
-    `per-chunk work grew from ${smallest.toFixed(2)}ms at ${SIZES[0]} rows to ${largest.toFixed(2)}ms at ${SIZES[SIZES.length - 1]} rows`,
+    ratio,
+    `per-chunk work grew from ${baseline.toFixed(2)}ms at its fastest size to ${largest.toFixed(2)}ms at ${SIZES[SIZES.length - 1]} rows`,
   ).toBeLessThanOrEqual(FLATNESS_LIMIT);
   expect(largest, 'per-chunk work in the longest session').toBeLessThanOrEqual(WORST_CASE_UPDATE_MS);
 });
@@ -165,7 +192,7 @@ test('message arrival stays flat as the conversation grows', async ({ page }) =>
   for (const size of SIZES) {
     await page.goto(`${FIXTURE}?size=${size}`);
     await waitForHarness(page);
-    await measureAppendUpdates(page, 5);
+    await measureAppendUpdates(page, WARMUP_UPDATES); // warm-up, discarded
     results.push({ size, cost: await measureAppendUpdates(page, UPDATES) });
   }
 
@@ -175,14 +202,13 @@ test('message arrival stays flat as the conversation grows', async ({ page }) =>
   // eslint-disable-next-line no-console
   console.log(`[arrival] ${table}`);
 
-  const smallest = results[0]!.cost.medianMs;
-  const largest = results[results.length - 1]!.cost.medianMs;
   for (const result of results) {
     expect(result.cost.reflected, `${result.size} updates reached the DOM`).toBeGreaterThan(0.9);
   }
+  const { ratio, baseline, largest } = growthRatio(results.map((r) => r.cost.medianMs));
   expect(
-    largest / Math.max(smallest, 0.01),
-    `per-arrival work grew from ${smallest.toFixed(2)}ms at ${SIZES[0]} rows to ${largest.toFixed(2)}ms at ${SIZES[SIZES.length - 1]} rows`,
+    ratio,
+    `per-arrival work grew from ${baseline.toFixed(2)}ms at its fastest size to ${largest.toFixed(2)}ms at ${SIZES[SIZES.length - 1]} rows`,
   ).toBeLessThanOrEqual(FLATNESS_LIMIT);
   expect(largest, 'per-arrival work in the longest session').toBeLessThanOrEqual(WORST_CASE_UPDATE_MS);
 });
