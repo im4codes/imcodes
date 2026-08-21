@@ -281,4 +281,80 @@ describe('SessionControls quick input integration', () => {
     expect(container.querySelector('.controls-slash-picker')).toBeNull();
     expect(ws.sendSessionCommand).not.toHaveBeenCalled();
   });
+
+  it('filters built-in and user quick phrases from a leading exclamation mark', () => {
+    const ws = {
+      connected: true,
+      send: vi.fn(),
+      sendSessionCommand: vi.fn(),
+      sendInput: vi.fn(),
+      subSessionSetModel: vi.fn(),
+      fsListDir: vi.fn(),
+      onMessage: vi.fn(() => () => {}),
+    } as any;
+    const quickData = {
+      ...makeQuickData(),
+      data: {
+        history: [],
+        sessionHistory: {},
+        commands: [],
+        phrases: ['inspect errors', 'custom release checklist'],
+      },
+    };
+
+    const { container } = render(
+      <SessionControls
+        ws={ws}
+        activeSession={makeSession()}
+        quickData={quickData}
+        sessions={[]}
+        subSessions={[]}
+        serverId="srv-1"
+      />,
+    );
+
+    const input = screen.getByRole('textbox');
+    input.textContent = '!err';
+    fireEvent.input(input);
+    expect(container.querySelector('[data-quick-phrase="check errors"]')).toBeTruthy();
+    expect(container.querySelector('[data-quick-phrase="inspect errors"]')).toBeTruthy();
+    expect(container.querySelector('[data-quick-phrase="custom release checklist"]')).toBeNull();
+
+    fireEvent.keyDown(input, { key: 'ArrowDown' });
+    fireEvent.keyDown(input, { key: 'Enter' });
+    expect(input.textContent).toBe('inspect errors');
+    expect(container.querySelector('.controls-slash-picker')).toBeNull();
+    expect(ws.sendSessionCommand).not.toHaveBeenCalled();
+  });
+
+  it('does not open command or phrase suggestions when the trigger is not the first character', () => {
+    const ws = {
+      connected: true,
+      send: vi.fn(),
+      sendSessionCommand: vi.fn(),
+      sendInput: vi.fn(),
+      subSessionSetModel: vi.fn(),
+      fsListDir: vi.fn(),
+      onMessage: vi.fn(() => () => {}),
+    } as any;
+    const { container } = render(
+      <SessionControls
+        ws={ws}
+        activeSession={makeSession()}
+        quickData={makeQuickData()}
+        sessions={[]}
+        subSessions={[]}
+        serverId="srv-1"
+      />,
+    );
+    const input = screen.getByRole('textbox');
+
+    input.textContent = 'text /co';
+    fireEvent.input(input);
+    expect(container.querySelector('.controls-slash-picker')).toBeNull();
+
+    input.textContent = 'text !err';
+    fireEvent.input(input);
+    expect(container.querySelector('.controls-slash-picker')).toBeNull();
+  });
 });

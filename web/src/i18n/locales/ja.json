@@ -825,6 +825,7 @@
     "title": "クイック入力",
     "commands": "クイックコマンド",
     "no_command_matches": "一致するコマンドはありません",
+    "no_phrase_matches": "一致するフレーズはありません",
     "phrases": "クイックフレーズ",
     "history": "履歴",
     "this_session": "このセッション",

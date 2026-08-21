@@ -34,6 +34,20 @@ const DEFAULT_QUICK_COMMANDS: Readonly<Record<string, readonly string[]>> = {
   openclaw: [SESSION_COMPACT_COMMAND, SESSION_CLEAR_COMMAND, '/thinking'],
 };
 
+export const DEFAULT_QUICK_PHRASES = [
+  'continue',
+  'fix',
+  'explain',
+  'refactor this',
+  'write tests',
+  'check errors',
+  'pull',
+  'commit&push',
+  'CI failed, fix',
+  'test & push',
+  'yes',
+] as const;
+
 function uniqueCommands(commands: readonly string[]): string[] {
   const seen = new Set<string>();
   return commands.filter((command) => {
@@ -59,6 +73,12 @@ export function matchSlashCommandTrigger(text: string): string | null {
   return match ? match[1] : null;
 }
 
+/** Match a quick phrase query only when `!` is the first composer character. */
+export function matchQuickPhraseTrigger(text: string): string | null {
+  const match = /^!([^\r\n]*)$/u.exec(text);
+  return match ? match[1] : null;
+}
+
 export function getSlashCommandSuggestions(
   agentType: string,
   customCommands: readonly string[],
@@ -68,4 +88,14 @@ export function getSlashCommandSuggestions(
   return uniqueCommands([...getDefaultQuickCommands(agentType), ...customCommands])
     .filter((command) => command.startsWith('/') && !/[\r\n]/u.test(command))
     .filter((command) => command.toLocaleLowerCase().startsWith(prefix));
+}
+
+export function getQuickPhraseSuggestions(
+  customPhrases: readonly string[],
+  query: string,
+): string[] {
+  const normalizedQuery = query.toLocaleLowerCase();
+  return uniqueCommands([...DEFAULT_QUICK_PHRASES, ...customPhrases])
+    .filter((phrase) => phrase.length > 0 && !/[\r\n]/u.test(phrase))
+    .filter((phrase) => phrase.toLocaleLowerCase().includes(normalizedQuery));
 }

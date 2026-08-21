@@ -825,6 +825,7 @@
     "title": "Quick input",
     "commands": "Quick Commands",
     "no_command_matches": "No matching commands",
+    "no_phrase_matches": "No matching phrases",
     "phrases": "Quick Phrases",
     "history": "History",
     "this_session": "This Session",

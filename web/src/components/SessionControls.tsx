@@ -7,7 +7,12 @@ import type { SessionInfo } from '../types.js';
 import { QuickInputPanel } from './QuickInputPanel.js';
 import { getNavigableHistory } from './QuickInputPanel.js';
 import type { UseQuickDataResult } from './QuickInputPanel.js';
-import { getSlashCommandSuggestions, matchSlashCommandTrigger } from '../quick-commands.js';
+import {
+  getQuickPhraseSuggestions,
+  getSlashCommandSuggestions,
+  matchQuickPhraseTrigger,
+  matchSlashCommandTrigger,
+} from '../quick-commands.js';
 import { FileBrowser } from './file-browser-lazy.js';
 import { CloneSessionGroupDialog } from './CloneSessionGroupDialog.js';
 import { useSwipeBack } from '../hooks/useSwipeBack.js';
@@ -1135,9 +1140,9 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   // Set for the input event immediately following a paste so pasted text ending
   // in `^name` never opens the inline machine picker (paste must not trigger).
   const machinePasteSuppressRef = useRef(false);
-  const [slashPickerOpen, setSlashPickerOpen] = useState(false);
-  const [slashQuery, setSlashQuery] = useState('');
-  const [slashHighlightIdx, setSlashHighlightIdx] = useState(0);
+  const [quickSuggestionKind, setQuickSuggestionKind] = useState<'command' | 'phrase' | null>(null);
+  const [quickSuggestionQuery, setQuickSuggestionQuery] = useState('');
+  const [quickSuggestionHighlightIdx, setQuickSuggestionHighlightIdx] = useState(0);
   const [modelOpen, setModelOpen] = useState(false);
   const [autoOpen, setAutoOpen] = useState(false);
   const [peerAuditOpen, setPeerAuditOpen] = useState(false);
@@ -1478,18 +1483,20 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     machines: machineAll,
     filtered: machineFiltered,
   } = useMachines(machineQuery);
-  const slashSuggestions = useMemo(
-    () => getSlashCommandSuggestions(activeSession?.agentType ?? 'claude-code', quickData.data.commands, slashQuery),
-    [activeSession?.agentType, quickData.data.commands, slashQuery],
+  const quickSuggestions = useMemo(
+    () => quickSuggestionKind === 'phrase'
+      ? getQuickPhraseSuggestions(quickData.data.phrases, quickSuggestionQuery)
+      : getSlashCommandSuggestions(activeSession?.agentType ?? 'claude-code', quickData.data.commands, quickSuggestionQuery),
+    [activeSession?.agentType, quickData.data.commands, quickData.data.phrases, quickSuggestionKind, quickSuggestionQuery],
   );
-  const slashPickerRef = useRef<HTMLDivElement>(null);
+  const quickSuggestionPickerRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
-    if (!slashPickerOpen || slashSuggestions.length === 0) return;
-    const highlighted = slashPickerRef.current?.querySelector<HTMLElement>('[data-hl="true"]');
+    if (quickSuggestionKind === null || quickSuggestions.length === 0) return;
+    const highlighted = quickSuggestionPickerRef.current?.querySelector<HTMLElement>('[data-hl="true"]');
     if (typeof highlighted?.scrollIntoView === 'function') {
       highlighted.scrollIntoView({ block: 'nearest' });
     }
-  }, [slashHighlightIdx, slashPickerOpen, slashSuggestions]);
+  }, [quickSuggestionHighlightIdx, quickSuggestionKind, quickSuggestions]);
   const publishComposerText = useCallback((text: string) => {
     onComposerTextChange?.(text);
   }, [onComposerTextChange]);
@@ -2574,10 +2581,10 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     syncMobileComposerMetrics();
   };
 
-  const selectSlashCommand = (command: string) => {
-    setSlashPickerOpen(false);
-    setSlashQuery('');
-    fillInput(command);
+  const selectQuickSuggestion = (value: string) => {
+    setQuickSuggestionKind(null);
+    setQuickSuggestionQuery('');
+    fillInput(value);
   };
 
   const appendToInput = (paths: string[]) => {
@@ -3661,7 +3668,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const escapeKeyboardOwnerOpen = atPickerOpen
     || aliasPickerOpen
     || machinePickerOpen
-    || slashPickerOpen
+    || quickSuggestionKind !== null
     || quickOpen
     || modelOpen
     || autoOpen
@@ -3796,8 +3803,8 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       atSelectionSnapshotRef.current = '';
       setAliasPickerOpen(false);
       setAliasQuery('');
-      setSlashPickerOpen(false);
-      setSlashQuery('');
+      setQuickSuggestionKind(null);
+      setQuickSuggestionQuery('');
       histIdxRef.current = -1;
       draftRef.current = '';
       if (draftKey) sessionStorage.removeItem(draftKey);
@@ -4228,36 +4235,36 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       return;
     }
 
-    if (slashPickerOpen) {
+    if (quickSuggestionKind !== null) {
       if (e.key === 'ArrowDown') {
         e.preventDefault();
-        if (slashSuggestions.length > 0) setSlashHighlightIdx((idx) => (idx + 1) % slashSuggestions.length);
+        if (quickSuggestions.length > 0) setQuickSuggestionHighlightIdx((idx) => (idx + 1) % quickSuggestions.length);
         return;
       }
       if (e.key === 'ArrowUp') {
         e.preventDefault();
-        if (slashSuggestions.length > 0) setSlashHighlightIdx((idx) => (idx - 1 + slashSuggestions.length) % slashSuggestions.length);
+        if (quickSuggestions.length > 0) setQuickSuggestionHighlightIdx((idx) => (idx - 1 + quickSuggestions.length) % quickSuggestions.length);
         return;
       }
       if (e.key === 'Escape') {
         e.preventDefault();
         e.stopPropagation();
-        setSlashPickerOpen(false);
-        setSlashQuery('');
+        setQuickSuggestionKind(null);
+        setQuickSuggestionQuery('');
         return;
       }
-      if (e.key === 'Enter' && slashSuggestions.some(
-        (command) => command.toLocaleLowerCase() === `/${slashQuery}`.toLocaleLowerCase(),
+      if (quickSuggestionKind === 'command' && e.key === 'Enter' && quickSuggestions.some(
+        (command) => command.toLocaleLowerCase() === `/${quickSuggestionQuery}`.toLocaleLowerCase(),
       )) {
         // A fully typed command keeps the established one-Enter send behavior.
         // Only incomplete queries (or Tab) are claimed as autocomplete picks.
-        setSlashPickerOpen(false);
-        setSlashQuery('');
-      } else if ((e.key === 'Tab' || e.key === 'Enter') && slashSuggestions.length > 0) {
+        setQuickSuggestionKind(null);
+        setQuickSuggestionQuery('');
+      } else if ((e.key === 'Tab' || e.key === 'Enter') && quickSuggestions.length > 0) {
         e.preventDefault();
         e.stopPropagation();
-        const command = slashSuggestions[Math.min(slashHighlightIdx, slashSuggestions.length - 1)];
-        if (command) selectSlashCommand(command);
+        const suggestion = quickSuggestions[Math.min(quickSuggestionHighlightIdx, quickSuggestions.length - 1)];
+        if (suggestion) selectQuickSuggestion(suggestion);
         return;
       }
     }
@@ -6219,32 +6226,37 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           />
         )}
 
-        {slashPickerOpen && activeSession && (
+        {quickSuggestionKind !== null && activeSession && (
           <div
-            ref={slashPickerRef}
+            ref={quickSuggestionPickerRef}
             class="controls-slash-picker"
             role="listbox"
-            aria-label={t('quick_input.commands')}
+            aria-label={t(quickSuggestionKind === 'command' ? 'quick_input.commands' : 'quick_input.phrases')}
             style={aliasPickerContainerStyle}
           >
-            <div style={aliasPickerGroupLabelStyle}>{t('quick_input.commands')}</div>
-            {slashSuggestions.length === 0 && (
-              <div style={aliasPickerEmptyStyle}>{t('quick_input.no_command_matches')}</div>
+            <div style={aliasPickerGroupLabelStyle}>
+              {t(quickSuggestionKind === 'command' ? 'quick_input.commands' : 'quick_input.phrases')}
+            </div>
+            {quickSuggestions.length === 0 && (
+              <div style={aliasPickerEmptyStyle}>
+                {t(quickSuggestionKind === 'command' ? 'quick_input.no_command_matches' : 'quick_input.no_phrase_matches')}
+              </div>
             )}
-            {slashSuggestions.map((command, idx) => {
-              const highlighted = idx === Math.min(slashHighlightIdx, slashSuggestions.length - 1);
+            {quickSuggestions.map((suggestion, idx) => {
+              const highlighted = idx === Math.min(quickSuggestionHighlightIdx, quickSuggestions.length - 1);
               return (
                 <div
-                  key={command}
+                  key={suggestion}
                   role="option"
                   aria-selected={highlighted}
                   data-hl={highlighted ? 'true' : undefined}
-                  data-slash-command={command}
+                  data-slash-command={quickSuggestionKind === 'command' ? suggestion : undefined}
+                  data-quick-phrase={quickSuggestionKind === 'phrase' ? suggestion : undefined}
                   style={highlighted ? aliasPickerItemHighlightStyle : aliasPickerItemStyle}
                   onMouseDown={(event) => event.preventDefault()}
-                  onClick={() => selectSlashCommand(command)}
+                  onClick={() => selectQuickSuggestion(suggestion)}
                 >
-                  <code>{command}</code>
+                  {quickSuggestionKind === 'command' ? <code>{suggestion}</code> : <span>{suggestion}</span>}
                 </div>
               );
             })}
@@ -6417,12 +6429,19 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
 
               const slashTrigger = imeComposingRef.current ? null : matchSlashCommandTrigger(text);
               if (slashTrigger !== null) {
-                setSlashQuery(slashTrigger);
-                setSlashHighlightIdx(0);
-                setSlashPickerOpen(true);
-              } else if (slashPickerOpen) {
-                setSlashPickerOpen(false);
-                setSlashQuery('');
+                setQuickSuggestionKind('command');
+                setQuickSuggestionQuery(slashTrigger);
+                setQuickSuggestionHighlightIdx(0);
+              } else {
+                const phraseTrigger = imeComposingRef.current ? null : matchQuickPhraseTrigger(text);
+                if (phraseTrigger !== null) {
+                  setQuickSuggestionKind('phrase');
+                  setQuickSuggestionQuery(phraseTrigger);
+                  setQuickSuggestionHighlightIdx(0);
+                } else if (quickSuggestionKind !== null) {
+                  setQuickSuggestionKind(null);
+                  setQuickSuggestionQuery('');
+                }
               }
 
               // @@ → open the TEAM dropdown (combos / workflows). Selecting one

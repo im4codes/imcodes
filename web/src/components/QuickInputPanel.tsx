@@ -17,7 +17,7 @@ import {
 import type { WsClient } from '../ws-client.js';
 import type { MachineListItem } from '../api/machines.js';
 import type { JSX, RefObject } from 'preact';
-import { getDefaultQuickCommands } from '../quick-commands.js';
+import { DEFAULT_QUICK_PHRASES, getDefaultQuickCommands } from '../quick-commands.js';
 
 export interface QuickData {
   history: string[];                        // cross-session
@@ -29,8 +29,6 @@ export interface QuickData {
 export const EMPTY_QUICK_DATA: QuickData = { history: [], sessionHistory: {}, commands: [], phrases: [] };
 
 // ── Built-in defaults (not stored in D1, cannot be deleted) ───────────────
-
-const DEFAULT_PHRASES = ['continue', 'fix', 'explain', 'refactor this', 'write tests', 'check errors', 'pull', 'commit&push', 'CI failed, fix', 'test & push', 'yes'];
 
 const SESSION_HISTORY_MAX = 50;
 const GLOBAL_HISTORY_MAX = 50;
@@ -928,7 +926,7 @@ export function QuickInputPanel({
             <>
               <div class="qp-section-header">{t('quick_input.phrases')}</div>
               <div class="qp-pills">
-                {DEFAULT_PHRASES.map((phrase) => (
+                {DEFAULT_QUICK_PHRASES.map((phrase) => (
                   <button key={phrase} class="qp-pill qp-pill-default" onClick={() => handleSend(phrase)}>{phrase}</button>
                 ))}
                 {data.phrases.map((phrase) => (

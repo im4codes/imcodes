@@ -825,6 +825,7 @@
     "title": "빠른 입력",
     "commands": "빠른 명령",
     "no_command_matches": "일치하는 명령이 없습니다",
+    "no_phrase_matches": "일치하는 문구가 없습니다",
     "phrases": "빠른 문구",
     "history": "기록",
     "this_session": "이 세션",

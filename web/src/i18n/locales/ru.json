@@ -825,6 +825,7 @@
     "title": "Быстрый ввод",
     "commands": "Быстрые команды",
     "no_command_matches": "Нет подходящих команд",
+    "no_phrase_matches": "Нет подходящих фраз",
     "phrases": "Быстрые фразы",
     "history": "История",
     "this_session": "Эта сессия",

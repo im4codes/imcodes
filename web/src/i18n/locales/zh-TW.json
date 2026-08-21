@@ -825,6 +825,7 @@
     "title": "快速輸入",
     "commands": "快速指令",
     "no_command_matches": "找不到相符指令",
+    "no_phrase_matches": "找不到相符短語",
     "phrases": "快速短語",
     "history": "歷史記錄",
     "this_session": "本 Session",

@@ -825,6 +825,7 @@
     "title": "Entrada rápida",
     "commands": "Comandos rápidos",
     "no_command_matches": "No hay comandos coincidentes",
+    "no_phrase_matches": "No hay frases coincidentes",
     "phrases": "Frases rápidas",
     "history": "Historial",
     "this_session": "Esta sesión",

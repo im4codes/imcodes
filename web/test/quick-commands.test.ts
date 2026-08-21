@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import {
   getDefaultQuickCommands,
+  getQuickPhraseSuggestions,
   getSlashCommandSuggestions,
+  matchQuickPhraseTrigger,
   matchSlashCommandTrigger,
 } from '../src/quick-commands.js';
 
@@ -26,5 +28,20 @@ describe('slash command suggestions', () => {
       '/fast off',
       '/fast status',
     ]));
+  });
+});
+
+describe('quick phrase suggestions', () => {
+  it('opens only when an exclamation mark is the first composer character', () => {
+    expect(matchQuickPhraseTrigger('!')).toBe('');
+    expect(matchQuickPhraseTrigger('!err')).toBe('err');
+    expect(matchQuickPhraseTrigger('please !err')).toBeNull();
+    expect(matchQuickPhraseTrigger(' !err')).toBeNull();
+    expect(matchQuickPhraseTrigger('!err\nnext')).toBeNull();
+  });
+
+  it('combines built-in and custom phrases with case-insensitive filtering and deduplication', () => {
+    expect(getQuickPhraseSuggestions(['check errors', 'inspect errors', 'CHECK ERRORS', ''], 'ERR'))
+      .toEqual(['check errors', 'inspect errors']);
   });
 });
