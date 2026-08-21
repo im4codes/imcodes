@@ -52,14 +52,23 @@ type PeerConnection = import('node-datachannel').PeerConnection;
 type DataChannel = import('node-datachannel').DataChannel;
 type NodeDataChannelIceServer = string | import('node-datachannel').IceServer;
 
+interface PendingLeaseCandidate {
+  requestId: string;
+  candidate: string;
+  mid: string;
+}
+
 interface DirectLease {
   binding: Omit<DirectFileTransferLeasePrepare, 'type' | 'protocolVersion' | 'requestId' | 'iceServers'>;
   peer: PeerConnection;
+  /** Retained so an abandoned browser peer can be replaced on the same lease. */
+  iceServers: NodeDataChannelIceServer[];
   sender: FileTransferSender;
   expiresAt: number;
   idleTimer: ReturnType<typeof setTimeout> | null;
   remoteDescriptionSet: boolean;
-  pendingRemoteCandidates: Array<{ candidate: string; mid: string }>;
+  /** Candidates are scoped to the SDP exchange that produced them. */
+  pendingRemoteCandidates: PendingLeaseCandidate[];
   negotiationRequestId: string | null;
   activeAttempts: Set<string>;
 }
@@ -829,10 +838,11 @@ async function prepareLease(command: DirectFileTransferLeasePrepare, sender: Fil
     });
     return;
   }
+  const iceServers = toNodeDataChannelIceServers(command.iceServers);
   let peer: PeerConnection;
   try {
     peer = new rtc.PeerConnection(`imcodes-file-lease-${command.leaseId}`, {
-      iceServers: toNodeDataChannelIceServers(command.iceServers),
+      iceServers,
       maxMessageSize: DIRECT_FILE_TRANSFER_LIMITS.DATA_CHUNK_BYTES,
     });
   } catch {
@@ -849,6 +859,7 @@ async function prepareLease(command: DirectFileTransferLeasePrepare, sender: Fil
       expiresAt: command.expiresAt,
     },
     peer,
+    iceServers,
     sender,
     expiresAt: command.expiresAt,
     idleTimer: null,
@@ -941,18 +952,68 @@ function findLeaseForSignal(command: DirectFileTransferLeaseOffer | DirectFileTr
   return lease;
 }
 
+/**
+ * A browser refresh loses its RTCPeerConnection but intentionally retains the
+ * tab id and lease ticket.  The next offer therefore belongs to the same
+ * lease, not to the daemon's old peer.  Recreate the inert peer before
+ * accepting it; never do this while a file channel is active.
+ */
+function replaceInactiveLeasePeer(lease: DirectLease): boolean {
+  if (!rtc || lease.activeAttempts.size > 0) return false;
+  let peer: PeerConnection;
+  try {
+    peer = new rtc.PeerConnection(`imcodes-file-lease-${lease.binding.leaseId}`, {
+      iceServers: lease.iceServers,
+      maxMessageSize: DIRECT_FILE_TRANSFER_LIMITS.DATA_CHUNK_BYTES,
+    });
+  } catch {
+    return false;
+  }
+  const previous = lease.peer;
+  lease.peer = peer;
+  lease.remoteDescriptionSet = false;
+  lease.negotiationRequestId = null;
+  attachLeasePeer(lease);
+  try { previous.close(); } catch { /* already closed */ }
+  return true;
+}
+
+function sendLeaseSignalFailure(lease: DirectLease, requestId: string): void {
+  sendControl(lease, {
+    type: DIRECT_FILE_TRANSFER_MSG.ERROR,
+    protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+    scope: DIRECT_FILE_TRANSFER_ERROR_SCOPE.LEASE,
+    requestId,
+    error: DIRECT_FILE_TRANSFER_ERROR.CONNECTION_FAILED,
+    retryable: true,
+  });
+}
+
 async function receiveLeaseOffer(command: DirectFileTransferLeaseOffer): Promise<void> {
   const lease = findLeaseForSignal(command);
   if (!lease) return;
+  if (lease.remoteDescriptionSet && lease.negotiationRequestId === command.requestId) return;
+  if (lease.negotiationRequestId !== null && lease.negotiationRequestId !== command.requestId
+    && !replaceInactiveLeasePeer(lease)) {
+    // An active file channel cannot be silently replaced. Let the browser
+    // retry after its authoritative operation outcome instead of stranding it
+    // behind an 8-second answer timeout.
+    sendLeaseSignalFailure(lease, command.requestId);
+    return;
+  }
   try {
     lease.negotiationRequestId = command.requestId;
     lease.peer.setRemoteDescription(command.sdp, 'offer');
     lease.remoteDescriptionSet = true;
-    for (const candidate of lease.pendingRemoteCandidates.splice(0)) {
+    const pending = lease.pendingRemoteCandidates.splice(0)
+      .filter((candidate) => candidate.requestId === command.requestId);
+    for (const candidate of pending) {
       lease.peer.addRemoteCandidate(candidate.candidate, candidate.mid);
     }
   } catch {
+    lease.remoteDescriptionSet = false;
     logger.warn({ event: 'direct_file_v2.lease_offer_failed' }, 'Failed to accept direct file lease offer');
+    sendLeaseSignalFailure(lease, command.requestId);
   }
 }
 
@@ -960,8 +1021,16 @@ async function receiveLeaseIce(command: DirectFileTransferLeaseIce): Promise<voi
   const lease = findLeaseForSignal(command);
   if (!lease) return;
   try {
-    if (!lease.remoteDescriptionSet) lease.pendingRemoteCandidates.push({ candidate: command.candidate, mid: command.mid });
-    else lease.peer.addRemoteCandidate(command.candidate, command.mid);
+    if (!lease.remoteDescriptionSet || lease.negotiationRequestId !== command.requestId) {
+      // setLocalDescription() can emit a trickle candidate before the browser
+      // has posted its matching offer. Preserve it for that request, but keep
+      // the queue bounded and discard every nonmatching request at offer time.
+      if (lease.pendingRemoteCandidates.length < DIRECT_FILE_TRANSFER_LIMITS.PENDING_ICE_CANDIDATE_LIMIT) {
+        lease.pendingRemoteCandidates.push({ requestId: command.requestId, candidate: command.candidate, mid: command.mid });
+      }
+      return;
+    }
+    lease.peer.addRemoteCandidate(command.candidate, command.mid);
   } catch {
     logger.warn({ event: 'direct_file_v2.lease_ice_failed' }, 'Failed to add direct file lease ICE candidate');
   }

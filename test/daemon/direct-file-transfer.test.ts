@@ -232,6 +232,54 @@ describe('daemon direct file transfer v2 lease broker', () => {
     await direct.shutdownDirectFileTransfers();
   });
 
+  it('replaces an inactive lease peer for a fresh browser offer and drops stale ICE', async () => {
+    const { direct, sent, sender } = await readyLease();
+    const previous = FakePeerConnection.latest!;
+    const retryRequestId = 'lease-retry-request-0001';
+
+    // A browser may trickle before its offer is delivered. It must be held for
+    // that new request rather than added to the old peer.
+    await direct.handleDirectFileTransferCommand({
+      type: DIRECT_FILE_TRANSFER_MSG.LEASE_ICE,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      serverId, browserTabId, leaseId, leaseGeneration: 1, daemonGeneration: 1,
+      requestId: retryRequestId,
+      candidate: 'candidate:retry 1 udp 1 192.168.1.10 4000 typ host', mid: '0',
+    }, sender);
+    expect(previous.addRemoteCandidate).not.toHaveBeenCalled();
+
+    await direct.handleDirectFileTransferCommand({
+      type: DIRECT_FILE_TRANSFER_MSG.LEASE_OFFER,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      serverId, browserTabId, leaseId, leaseGeneration: 1, daemonGeneration: 1,
+      requestId: retryRequestId, sdp: 'browser-retry-offer',
+    }, sender);
+
+    const replacement = FakePeerConnection.latest!;
+    expect(replacement).not.toBe(previous);
+    expect(previous.close).toHaveBeenCalledOnce();
+    expect(replacement.setRemoteDescription).toHaveBeenCalledWith('browser-retry-offer', 'offer');
+    expect(sent).toContainEqual(expect.objectContaining({
+      type: DIRECT_FILE_TRANSFER_MSG.LEASE_ANSWER,
+      requestId: retryRequestId,
+      sdp: 'daemon-lease-answer',
+    }));
+    expect(replacement.addRemoteCandidate).toHaveBeenCalledWith(
+      'candidate:retry 1 udp 1 192.168.1.10 4000 typ host',
+      '0',
+    );
+
+    await direct.handleDirectFileTransferCommand({
+      type: DIRECT_FILE_TRANSFER_MSG.LEASE_ICE,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      serverId, browserTabId, leaseId, leaseGeneration: 1, daemonGeneration: 1,
+      requestId,
+      candidate: 'candidate:stale 1 udp 1 192.168.1.11 4001 typ host', mid: '0',
+    }, sender);
+    expect(replacement.addRemoteCandidate).toHaveBeenCalledTimes(1);
+    await direct.shutdownDirectFileTransfers();
+  });
+
   it('commits an upload once on a ready lease and exposes it through exact status recovery', async () => {
     const { direct, sent, sender } = await readyLease();
     const authority = uploadPrepare();
