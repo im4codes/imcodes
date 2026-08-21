@@ -84,7 +84,6 @@ const DEFAULT_CLAUDE_AUTH_REFRESH_WAIT_MS = 2 * 60 * 1000;
 const DEFAULT_CLAUDE_AUTH_REFRESH_POLL_MS = 500;
 const CLAUDE_AUTH_RECOVERY_GUIDANCE = 'Authentication recovery required: run `/logout`, fully exit Claude Code, then reopen it and run `/login` before retrying.';
 const CLAUDE_SDK_INPUT_PRIORITIES = {
-  IMMEDIATE: 'now',
   NEXT_SAFE_BOUNDARY: 'next',
 } as const;
 
@@ -792,12 +791,12 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       message: { role: 'user', content: notification.text },
       parent_tool_use_id: null,
       uuid: notification.notificationId,
-      // Queue append is not a user interrupt. `now` preempts the current
-      // Agent SDK turn (which makes the UI look as if the agent slept); `next`
-      // drains after the current tool result and before the next model request.
-      priority: isQueuedUserMessage
-        ? CLAUDE_SDK_INPUT_PRIORITIES.NEXT_SAFE_BOUNDARY
-        : CLAUDE_SDK_INPUT_PRIORITIES.IMMEDIATE,
+      // `now` preempts the current Agent SDK turn. A delegation/audit reply is
+      // new information for the live task, not a request to stop that task, so
+      // it must take the same non-preemptive path as an explicit queue append.
+      // `next` is still injected into the active query after its current tool
+      // result — it does not wait for the normal idle FIFO to drain.
+      priority: CLAUDE_SDK_INPUT_PRIORITIES.NEXT_SAFE_BOUNDARY,
       origin: isQueuedUserMessage
         ? { kind: 'human' }
         : {
