@@ -1,0 +1,19 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>chat-timeline fixture harness</title>
+    <!-- Test-only entry: excluded from the production build unless Vite is
+         invoked with `--mode fixtures` (see `build:fixtures` in
+         web/package.json and the mode check in web/vite.config.ts). -->
+    <style>
+      html, body, #fixture-root { height: 100%; margin: 0; }
+      body { background: #0a0e1a; }
+    </style>
+  </head>
+  <body>
+    <div id="fixture-root"></div>
+    <script type="module" src="/src/fixtures/chat-timeline/main.tsx"></script>
+  </body>
+</html>
