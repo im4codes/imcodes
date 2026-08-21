@@ -5,6 +5,7 @@ import {
   DIRECT_FILE_TRANSFER_DIRECTION,
   DIRECT_FILE_TRANSFER_FAILURE_DISPOSITION,
   DIRECT_FILE_TRANSFER_ERROR,
+  DIRECT_FILE_TRANSFER_HEALTH_CHANNEL_PREFIX,
   DIRECT_FILE_TRANSFER_LEASE_CAPABILITY,
   DIRECT_FILE_TRANSFER_LIMITS,
   DIRECT_FILE_TRANSFER_MSG,
@@ -139,6 +140,7 @@ type Lease = {
   expiresAt: number;
   iceServers: readonly DirectFileTransferIceServerConfig[];
   peer: RTCPeerConnection | null;
+  bootstrapChannel: RTCDataChannel | null;
   peerState: RTCPeerConnectionState | null;
   refs: number;
   idleTimer: ReturnType<typeof setTimeout> | null;
@@ -284,6 +286,7 @@ function getBroker(ws: WsClient, serverId: string): Lease {
     expiresAt: 0,
     iceServers: [],
     peer: null,
+    bootstrapChannel: null,
     peerState: null,
     refs: 0,
     idleTimer: null,
@@ -324,9 +327,7 @@ function disposeLease(lease: Lease): void {
   lease.active.clear();
   for (const grace of lease.terminalGrace.values()) clearTimeout(grace.timer);
   lease.terminalGrace.clear();
-  try { lease.peer?.close(); } catch { /* best effort */ }
-  lease.peer = null;
-  lease.peerState = null;
+  closePeer(lease);
   lease.leaseId = null;
   lease.leaseGeneration = null;
   lease.daemonGeneration = null;
@@ -625,6 +626,8 @@ function currentBinding(lease: Lease, active: ActiveAttempt) {
 }
 
 function closePeer(lease: Lease): void {
+  try { lease.bootstrapChannel?.close(); } catch { /* best effort */ }
+  lease.bootstrapChannel = null;
   try { lease.peer?.close(); } catch { /* best effort */ }
   lease.peer = null;
   lease.peerState = null;
@@ -687,6 +690,14 @@ async function ensureLeasePeer(lease: Lease): Promise<void> {
       const createdPeer = peer;
       lease.peer = createdPeer;
       lease.peerState = createdPeer.connectionState;
+      // A cold RTCPeerConnection has no application m-line until a data
+      // channel exists. Creating this authority-free lease channel before the
+      // first offer makes the initial SDP acceptable to node-datachannel and
+      // lets later operation channels open without a second negotiation.
+      lease.bootstrapChannel = createdPeer.createDataChannel(
+        `${DIRECT_FILE_TRANSFER_HEALTH_CHANNEL_PREFIX}${crypto.randomUUID()}`,
+        { ordered: true },
+      );
       createdPeer.addEventListener('connectionstatechange', () => { lease.peerState = createdPeer.connectionState; });
       createdPeer.addEventListener('icecandidate', (event) => {
         if (!event.candidate || !hasLeaseBinding(lease)) return;
@@ -1463,7 +1474,7 @@ export async function probeDirectConnectivity(
   try {
     await ensureLease(lease);
     const peer = lease.peer;
-    if (!peer || peer.connectionState !== 'connected' || !lease.leaseId || !lease.leaseGeneration || !lease.daemonGeneration) {
+    if (!peer || !lease.leaseId || !lease.leaseGeneration || !lease.daemonGeneration) {
       throw directError(DIRECT_FILE_TRANSFER_ERROR.CAPABILITY_UNAVAILABLE, false);
     }
     onDiagnostics?.({
@@ -1471,7 +1482,7 @@ export async function probeDirectConnectivity(
       browserCandidateTypes: [],
       daemonCandidateTypes: [],
     });
-    const channel = peer.createDataChannel(`imcodes-health-${crypto.randomUUID()}`, { ordered: true });
+    const channel = peer.createDataChannel(`${DIRECT_FILE_TRANSFER_HEALTH_CHANNEL_PREFIX}${crypto.randomUUID()}`, { ordered: true });
     await waitForChannelOpen(channel);
     const nonce = crypto.randomUUID();
     const started = performance.now();

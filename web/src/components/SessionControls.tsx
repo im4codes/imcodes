@@ -5821,15 +5821,14 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                     transferred: formatTransferBytes(transferredBytes),
                     total: formatTransferBytes(item.totalBytes),
                   })}</span>
-                  <span>{item.speedBps > 0
-                    ? t('upload.speed', { speed: formatTransferBytes(item.speedBps) })
-                    : t('upload.speed_calculating')}</span>
+                  {item.speedBps > 0 && (
+                    <span>{t('upload.speed', { speed: formatTransferBytes(item.speedBps) })}</span>
+                  )}
                   <span>{t('upload.elapsed', { time: formatTransferDuration(elapsedSeconds) })}</span>
-                  <span>{etaSeconds !== null && item.progress < 100
-                    ? t('upload.eta', { time: formatTransferDuration(etaSeconds) })
-                    : item.progress >= 100
-                      ? t('upload.eta_done')
-                      : t('upload.eta_calculating')}</span>
+                  {etaSeconds !== null && item.progress < 100 && (
+                    <span>{t('upload.eta', { time: formatTransferDuration(etaSeconds) })}</span>
+                  )}
+                  {item.progress >= 100 && <span>{t('upload.eta_done')}</span>}
                 </div>
               </div>
             );

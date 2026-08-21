@@ -1588,6 +1588,7 @@
     "collapse": "Contraer descargas",
     "clear_finished": "Borrar finalizadas",
     "cancel": "Cancelar",
+    "retry": "Reintentar",
     "dismiss": "Quitar",
     "progress_aria": "Progreso de descarga de {{name}}",
     "transferred": "{{transferred}} / {{total}}",

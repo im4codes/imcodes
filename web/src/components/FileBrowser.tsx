@@ -43,6 +43,7 @@ import {
   completeDownloadTransfer,
   failDownloadTransfer,
   reportDownloadTransferProgress,
+  setDownloadTransferRetry,
   updateDownloadTransfer,
 } from '../download-transfer-store.js';
 import {
@@ -1740,81 +1741,104 @@ export function FileBrowser({
       return;
     }
     const transfer = beginDownloadTransfer(selectedPath.split(/[/\\]/).pop() || selectedPath);
-    const download = async (handle: string) => downloadPreviewWithDirectFallback({
-      ws,
-      serverId,
-      previewHandle: handle,
-      suggestedName: selectedPath.split(/[/\\]/).pop() || undefined,
-      sessionName,
-      destination,
-      // HTTP remains the documented fallback only.  The direct helper owns
-      // retry classification and calls this at most once when it is eligible.
-      httpFallback: () => downloadAttachment(serverId, handle, sessionName, transfer.signal),
-      signal: transfer.signal,
-      onProgress: ({ loadedBytes, totalBytes }) => {
-        reportDownloadTransferProgress(transfer.id, loadedBytes, totalBytes);
-      },
-      onMode: (mode) => {
-        if (mode === FILE_DOWNLOAD_TRANSPORT_MODE.CONNECTING) {
-          updateDownloadTransfer(transfer.id, DOWNLOAD_TRANSFER_ROUTE.PENDING, DOWNLOAD_TRANSFER_STATUS.CONNECTING);
-        } else if (mode === FILE_DOWNLOAD_TRANSPORT_MODE.DIRECT) {
-          updateDownloadTransfer(transfer.id, DOWNLOAD_TRANSFER_ROUTE.DIRECT, DOWNLOAD_TRANSFER_STATUS.TRANSFERRING);
-        } else if (mode === FILE_DOWNLOAD_TRANSPORT_MODE.FALLING_BACK) {
-          updateDownloadTransfer(transfer.id, DOWNLOAD_TRANSFER_ROUTE.HTTP, DOWNLOAD_TRANSFER_STATUS.FALLING_BACK);
-        } else if (mode === FILE_DOWNLOAD_TRANSPORT_MODE.HTTP) {
-          updateDownloadTransfer(transfer.id, DOWNLOAD_TRANSFER_ROUTE.HTTP, DOWNLOAD_TRANSFER_STATUS.TRANSFERRING);
-        } else {
-          updateDownloadTransfer(transfer.id, DOWNLOAD_TRANSFER_ROUTE.BROWSER, DOWNLOAD_TRANSFER_STATUS.PREPARING);
-        }
-      },
-    });
-    try {
-      await download(selectedHandle);
-      completeDownloadTransfer(transfer.id, destination === null);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      const isStaleHandle = isDirectFileTransferStaleHandleError(err)
-        || msg.includes('410') || msg.includes('expired') || msg.includes('not_found') || msg.includes('404');
-      if (isStaleHandle) {
-        try {
-          const freshId = await new Promise<string>((resolve, reject) => {
-            const requestId = scopedSessionName ? ws.fsReadFile(selectedPath, scopedSessionName) : ws.fsReadFile(selectedPath);
-            const timer = setTimeout(() => reject(new Error('timeout')), 10_000);
-            const off = ws.onMessage((m) => {
-              if (m.type !== 'fs.read_response' || !('requestId' in m) || m.requestId !== requestId) return;
-              off();
-              clearTimeout(timer);
-              if ('downloadId' in m && typeof m.downloadId === 'string') resolve(m.downloadId);
-              else reject(new Error('no_handle'));
-            });
-          });
-          // A selection/path switch during the refresh makes this action a
-          // no-op rather than accidentally saving another preview's file.
-          const stillSelected = previewRef.current;
-          if (stillSelected.status === 'idle' || !('downloadId' in stillSelected)
-            || stillSelected.path !== selectedPath || stillSelected.downloadId !== selectedHandle) {
-            failDownloadTransfer(transfer.id, true);
-            return;
+    let authorizedHandle = selectedHandle;
+    const runTransfer = async (signal: AbortSignal, requireCurrentSelection: boolean): Promise<void> => {
+      const download = async (handle: string) => downloadPreviewWithDirectFallback({
+        ws,
+        serverId,
+        previewHandle: handle,
+        suggestedName: selectedPath.split(/[/\\]/).pop() || undefined,
+        sessionName,
+        destination,
+        // HTTP remains the documented fallback only.  The direct helper owns
+        // retry classification and calls this at most once when it is eligible.
+        httpFallback: () => downloadAttachment(serverId, handle, sessionName, signal),
+        signal,
+        onProgress: ({ loadedBytes, totalBytes }) => {
+          reportDownloadTransferProgress(transfer.id, loadedBytes, totalBytes);
+        },
+        onMode: (mode) => {
+          if (mode === FILE_DOWNLOAD_TRANSPORT_MODE.CONNECTING) {
+            updateDownloadTransfer(transfer.id, DOWNLOAD_TRANSFER_ROUTE.PENDING, DOWNLOAD_TRANSFER_STATUS.CONNECTING);
+          } else if (mode === FILE_DOWNLOAD_TRANSPORT_MODE.DIRECT) {
+            updateDownloadTransfer(transfer.id, DOWNLOAD_TRANSFER_ROUTE.DIRECT, DOWNLOAD_TRANSFER_STATUS.TRANSFERRING);
+          } else if (mode === FILE_DOWNLOAD_TRANSPORT_MODE.FALLING_BACK) {
+            updateDownloadTransfer(transfer.id, DOWNLOAD_TRANSFER_ROUTE.HTTP, DOWNLOAD_TRANSFER_STATUS.FALLING_BACK);
+          } else if (mode === FILE_DOWNLOAD_TRANSPORT_MODE.HTTP) {
+            updateDownloadTransfer(transfer.id, DOWNLOAD_TRANSFER_ROUTE.HTTP, DOWNLOAD_TRANSFER_STATUS.TRANSFERRING);
+          } else {
+            updateDownloadTransfer(transfer.id, DOWNLOAD_TRANSFER_ROUTE.BROWSER, DOWNLOAD_TRANSFER_STATUS.PREPARING);
           }
-          setPreview((prev) => {
-            if (prev.status === 'idle' || !('downloadId' in prev) || prev.path !== selectedPath || prev.downloadId !== selectedHandle) return prev;
-            return { ...prev, downloadId: freshId } as typeof prev;
-          });
-          await download(freshId);
-          completeDownloadTransfer(transfer.id, destination === null);
-          return;
-        } catch { /* one refresh only — fall through to the visible error */ }
+        },
+      });
+      try {
+        await download(authorizedHandle);
+        completeDownloadTransfer(transfer.id, destination === null);
+        return;
+      } catch (error) {
+        let failure = error;
+        let msg = failure instanceof Error ? failure.message : String(failure);
+        const staleHandle = isDirectFileTransferStaleHandleError(failure)
+          || msg.includes('410') || msg.includes('expired') || msg.includes('not_found') || msg.includes('404');
+        if (staleHandle) {
+          let refreshed = false;
+          try {
+            const previousHandle = authorizedHandle;
+            const freshId = await new Promise<string>((resolve, reject) => {
+              const requestId = scopedSessionName ? ws.fsReadFile(selectedPath, scopedSessionName) : ws.fsReadFile(selectedPath);
+              const timer = setTimeout(() => reject(new Error('timeout')), 10_000);
+              const off = ws.onMessage((m) => {
+                if (m.type !== 'fs.read_response' || !('requestId' in m) || m.requestId !== requestId) return;
+                off();
+                clearTimeout(timer);
+                if ('downloadId' in m && typeof m.downloadId === 'string') resolve(m.downloadId);
+                else reject(new Error('no_handle'));
+              });
+            });
+            if (requireCurrentSelection) {
+              // A selection/path switch during the initial refresh makes this
+              // action a no-op. An explicit retry is already bound to this
+              // exact path, handle, destination and session.
+              const stillSelected = previewRef.current;
+              if (stillSelected.status === 'idle' || !('downloadId' in stillSelected)
+                || stillSelected.path !== selectedPath || stillSelected.downloadId !== previousHandle) {
+                failDownloadTransfer(transfer.id, true);
+                return;
+              }
+            }
+            authorizedHandle = freshId;
+            refreshed = true;
+            if (mountedRef.current) {
+              setPreview((prev) => {
+                if (prev.status === 'idle' || !('downloadId' in prev) || prev.path !== selectedPath || prev.downloadId !== previousHandle) return prev;
+                return { ...prev, downloadId: freshId } as typeof prev;
+              });
+            }
+            await download(freshId);
+            completeDownloadTransfer(transfer.id, destination === null);
+            return;
+          } catch (refreshError) {
+            if (refreshed) failure = refreshError;
+          }
+        }
+        msg = failure instanceof Error ? failure.message : String(failure);
+        const canceled = isFileUploadCanceled(failure) || signal.aborted;
+        failDownloadTransfer(transfer.id, canceled);
+        if (canceled) return;
+        if (mountedRef.current) {
+          if (msg.includes('daemon_offline') || msg.includes('503')) setDownloadError(t('upload.daemon_offline'));
+          else if (staleHandle) setDownloadError(t('upload.download_expired'));
+          else if (msg.includes('504') || msg.includes('timeout')) setDownloadError(t('upload.download_timeout'));
+          else setDownloadError(t('upload.download_failed'));
+          setTimeout(() => {
+            if (mountedRef.current) setDownloadError(null);
+          }, 5000);
+        }
+        throw failure;
       }
-      const canceled = isFileUploadCanceled(err) || transfer.signal.aborted;
-      failDownloadTransfer(transfer.id, canceled);
-      if (canceled) return;
-      if (msg.includes('daemon_offline') || msg.includes('503')) setDownloadError(t('upload.daemon_offline'));
-      else if (isStaleHandle) setDownloadError(t('upload.download_expired'));
-      else if (msg.includes('504') || msg.includes('timeout')) setDownloadError(t('upload.download_timeout'));
-      else setDownloadError(t('upload.download_failed'));
-      setTimeout(() => setDownloadError(null), 5000);
-      throw err;
-    }
+    };
+    setDownloadTransferRetry(transfer.id, (signal) => runTransfer(signal, false));
+    await runTransfer(transfer.signal, true);
   }, [preview, scopedSessionName, serverId, sessionName, t, ws]);
 
   const loadMarkdownImagePreview = useCallback<ChatLocalImagePreviewLoader>((path: string) => (

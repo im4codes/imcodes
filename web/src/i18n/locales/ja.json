@@ -1587,6 +1587,7 @@
     "collapse": "ダウンロードを折りたたむ",
     "clear_finished": "完了項目を消去",
     "cancel": "キャンセル",
+    "retry": "再試行",
     "dismiss": "削除",
     "progress_aria": "{{name}} のダウンロード進捗",
     "transferred": "{{transferred}} / {{total}}",

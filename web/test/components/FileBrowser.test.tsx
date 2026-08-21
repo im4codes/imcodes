@@ -60,6 +60,7 @@ import { FS_READ_ERROR_CODES } from '../../../shared/fs-read-error-codes.js';
 import {
   __resetDownloadTransfersForTests,
   getDownloadTransfers,
+  retryDownloadTransfer,
 } from '../../src/download-transfer-store.js';
 
 // Cleanup DOM/timers after each test
@@ -301,6 +302,41 @@ describe('FileBrowser', () => {
 
     finish();
     await waitFor(() => expect(getDownloadTransfers()[0]?.status).toBe('handed_off'));
+  });
+
+  it('retries a failed download with the same destination and a fresh signal', async () => {
+    const destination = { handle: { createWritable: vi.fn() } };
+    const failure = new Error('connection_failed');
+    const signals: AbortSignal[] = [];
+    directFileTransferMocks.selectPreviewDownloadDestination.mockResolvedValue(destination);
+    directFileTransferMocks.downloadPreviewWithDirectFallback.mockImplementation(async (options: { signal: AbortSignal }) => {
+      signals.push(options.signal);
+      if (signals.length === 1) throw failure;
+    });
+    const { ws } = makeWsFactory();
+    const view = render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        serverId="srv-1"
+        initialPreview={{ status: 'ok', path: '/home/user/retry.iso', content: 'preview', downloadId: 'preview-handle' }}
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(view.getByRole('button', { name: 'upload.download_file' }));
+    await waitFor(() => expect(getDownloadTransfers()[0]?.status).toBe('failed'));
+    const transferId = getDownloadTransfers()[0]!.id;
+    await retryDownloadTransfer(transferId);
+
+    expect(directFileTransferMocks.selectPreviewDownloadDestination).toHaveBeenCalledOnce();
+    expect(directFileTransferMocks.downloadPreviewWithDirectFallback).toHaveBeenCalledTimes(2);
+    expect(signals).toHaveLength(2);
+    expect(signals[1]).not.toBe(signals[0]);
+    expect(getDownloadTransfers()).toHaveLength(1);
+    expect(getDownloadTransfers()[0]).toMatchObject({ id: transferId, status: 'completed' });
   });
 
   it('refreshes an expired direct preview handle exactly once and reuses the selected destination', async () => {

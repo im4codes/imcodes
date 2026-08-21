@@ -13,6 +13,7 @@ export const DIRECT_FILE_TRANSFER_RESUME_TICKET_TYPE = 'direct_file.v2.resume_ti
 export const DIRECT_FILE_TRANSFER_LEASE_CAPABILITY = 'file.transfer.direct.lease.v2' as const;
 export const DIRECT_FILE_TRANSFER_UPLOAD_RECOVERY_CAPABILITY = 'file.transfer.direct.upload_recovery.v2' as const;
 export const DIRECT_FILE_TRANSFER_PREVIEW_DOWNLOAD_CAPABILITY = 'file.transfer.direct.preview_download.v2' as const;
+export const DIRECT_FILE_TRANSFER_HEALTH_CHANNEL_PREFIX = 'imcodes-health-' as const;
 
 export const DIRECT_FILE_TRANSFER_REQUIRED_CAPABILITIES = [
   DIRECT_FILE_TRANSFER_LEASE_CAPABILITY,

@@ -1588,6 +1588,7 @@
     "collapse": "Collapse downloads",
     "clear_finished": "Clear finished",
     "cancel": "Cancel",
+    "retry": "Retry",
     "dismiss": "Dismiss",
     "progress_aria": "Download progress for {{name}}",
     "transferred": "{{transferred}} / {{total}}",

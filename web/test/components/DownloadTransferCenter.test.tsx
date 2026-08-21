@@ -6,8 +6,10 @@ import {
   __resetDownloadTransfersForTests,
   beginDownloadTransfer,
   completeDownloadTransfer,
+  failDownloadTransfer,
   getDownloadTransfers,
   reportDownloadTransferProgress,
+  setDownloadTransferRetry,
   updateDownloadTransfer,
 } from '../../src/download-transfer-store.js';
 import { DownloadTransferCenter } from '../../src/components/DownloadTransferCenter.js';
@@ -66,5 +68,20 @@ describe('DownloadTransferCenter', () => {
     expect(screen.getByText('downloads.status.completed')).toBeTruthy();
     fireEvent.click(screen.getByText('downloads.dismiss'));
     expect(screen.queryByText('done.zip')).toBeNull();
+  });
+
+  it('retries a failed download in place and omits fake speed measurement text', async () => {
+    const transfer = beginDownloadTransfer('retry.iso');
+    const retry = vi.fn(async () => completeDownloadTransfer(transfer.id));
+    setDownloadTransferRetry(transfer.id, retry);
+    failDownloadTransfer(transfer.id);
+    render(<DownloadTransferCenter />);
+
+    expect(screen.queryByText('downloads.speed_calculating')).toBeNull();
+    fireEvent.click(screen.getByText('downloads.retry'));
+
+    await vi.waitFor(() => expect(retry).toHaveBeenCalledOnce());
+    expect(getDownloadTransfers()[0]?.status).toBe(DOWNLOAD_TRANSFER_STATUS.COMPLETED);
+    expect(screen.getByText('downloads.status.completed')).toBeTruthy();
   });
 });

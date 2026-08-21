@@ -9,6 +9,7 @@ import {
   DIRECT_FILE_TRANSFER_DATA_MSG,
   DIRECT_FILE_TRANSFER_DIRECTION,
   DIRECT_FILE_TRANSFER_ERROR,
+  DIRECT_FILE_TRANSFER_HEALTH_CHANNEL_PREFIX,
   DIRECT_FILE_TRANSFER_ERROR_SCOPE,
   DIRECT_FILE_TRANSFER_LEASE_CAPABILITY,
   DIRECT_FILE_TRANSFER_LIMITS,
@@ -397,7 +398,7 @@ function channelMatches(transfer: ActiveDirectTransfer, channel: DataChannel): b
 }
 
 function isLeaseHealthChannel(channel: DataChannel): boolean {
-  try { return channel.getLabel().startsWith('imcodes-health-'); } catch { return false; }
+  try { return channel.getLabel().startsWith(DIRECT_FILE_TRANSFER_HEALTH_CHANNEL_PREFIX); } catch { return false; }
 }
 
 function toCandidateInfo(value: unknown): DirectConnectivityCandidateInfo | null {

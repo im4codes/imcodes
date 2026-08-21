@@ -143,8 +143,10 @@ class IntegratedNodePeerConnection {
 class IntegratedBrowserPeerConnection extends EventTarget {
   connectionState: RTCPeerConnectionState = 'new';
   remoteDescription: RTCSessionDescription | null = null;
+  private channelCount = 0;
 
   createDataChannel(label: string): RTCDataChannel {
+    this.channelCount++;
     const browser = new IntegratedBrowserDataChannel(label);
     const node = new IntegratedNodeDataChannel(label);
     browser.node = node;
@@ -154,7 +156,10 @@ class IntegratedBrowserPeerConnection extends EventTarget {
     return browser as unknown as RTCDataChannel;
   }
 
-  async createOffer(): Promise<RTCSessionDescriptionInit> { return { type: 'offer', sdp: 'integrated-browser-offer' }; }
+  async createOffer(): Promise<RTCSessionDescriptionInit> {
+    if (this.channelCount === 0) throw new Error('cold offer has no data-channel application section');
+    return { type: 'offer', sdp: 'integrated-browser-offer' };
+  }
   async setLocalDescription(): Promise<void> {}
   async setRemoteDescription(description: RTCSessionDescriptionInit): Promise<void> {
     this.remoteDescription = description as RTCSessionDescription;

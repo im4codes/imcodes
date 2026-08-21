@@ -52,9 +52,11 @@ class FakePeerConnection extends EventTarget {
   static instances: FakePeerConnection[] = [];
   static onDataChannel: ((channel: FakeDataChannel, value: unknown) => void) | null = null;
   static selectedCandidateType = 'host';
+  static keepConnectingAfterAnswer = false;
   remoteDescription: RTCSessionDescription | null = null;
   connectionState: RTCPeerConnectionState = 'new';
   channels: FakeDataChannel[] = [];
+  offerChannelLabels: string[][] = [];
 
   constructor() {
     super();
@@ -70,14 +72,18 @@ class FakePeerConnection extends EventTarget {
   }
 
   async createOffer(): Promise<RTCSessionDescriptionInit> {
+    this.offerChannelLabels.push(this.channels.map((channel) => channel.label));
+    if (this.channels.length === 0) throw new Error('cold offer has no data-channel application section');
     return { type: 'offer', sdp: 'browser-lease-offer' };
   }
 
   async setLocalDescription(): Promise<void> {}
   async setRemoteDescription(description: RTCSessionDescriptionInit): Promise<void> {
     this.remoteDescription = description as RTCSessionDescription;
-    this.connectionState = 'connected';
-    this.dispatchEvent(new Event('connectionstatechange'));
+    if (!FakePeerConnection.keepConnectingAfterAnswer) {
+      this.connectionState = 'connected';
+      this.dispatchEvent(new Event('connectionstatechange'));
+    }
   }
   async addIceCandidate(): Promise<void> {}
   async getStats(): Promise<RTCStatsReport> {
@@ -352,6 +358,7 @@ describe('direct file transfer v2 browser broker', () => {
     sessionStorage.clear();
     FakePeerConnection.instances = [];
     FakePeerConnection.selectedCandidateType = 'host';
+    FakePeerConnection.keepConnectingAfterAnswer = false;
     vi.stubGlobal('RTCPeerConnection', FakePeerConnection);
     apiMocks.uploadFile.mockResolvedValue({
       ok: true,
@@ -388,6 +395,21 @@ describe('direct file transfer v2 browser broker', () => {
 
     expect(sent).toHaveLength(0);
     expect(apiMocks.uploadFile).toHaveBeenCalledTimes(1);
+  });
+
+  it('creates an authority-free data channel before the cold lease offer', async () => {
+    const { uploadFileDirect } = await import('../src/direct-file-transfer.js');
+    const { ws } = createWs(directCapabilities);
+    const file = new File(['direct'], 'direct.txt', { type: 'text/plain' });
+
+    await uploadFileDirect(ws, file, id(), undefined, undefined, undefined, undefined, 'server-1');
+
+    const peer = FakePeerConnection.instances.at(-1)!;
+    expect(peer.offerChannelLabels).toHaveLength(1);
+    expect(peer.offerChannelLabels[0]).toHaveLength(1);
+    expect(peer.offerChannelLabels[0]?.[0]).toMatch(/^imcodes-health-/);
+    expect(peer.offerChannelLabels[0]?.some((label) => label.startsWith('imcodes-op-'))).toBe(false);
+    expect(peer.channels.some((channel) => channel.label.startsWith('imcodes-op-'))).toBe(true);
   });
 
   it('prewarms one lease-only peer and reuses it for two uploads without authority in SDP/ICE', async () => {
@@ -725,6 +747,15 @@ describe('direct file transfer v2 browser broker', () => {
       expect(message).not.toHaveProperty('previewHandle');
       expect(message).not.toHaveProperty('sessionName');
     }
+  });
+
+  it('does not misreport a lagging peer connection state as an unavailable runtime', async () => {
+    const { probeDirectConnectivity } = await import('../src/direct-file-transfer.js');
+    const { ws } = createWs(directCapabilities);
+    FakePeerConnection.keepConnectingAfterAnswer = true;
+
+    await expect(probeDirectConnectivity(ws, undefined, 'server-1')).resolves.toMatchObject({ route: 'lan_direct' });
+    expect(FakePeerConnection.instances.at(-1)?.connectionState).toBe('new');
   });
 
   it('tears down an idle prewarm after five minutes and initializes a new lease on the next click', async () => {

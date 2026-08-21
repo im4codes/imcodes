@@ -1587,6 +1587,7 @@
     "collapse": "다운로드 접기",
     "clear_finished": "완료 항목 지우기",
     "cancel": "취소",
+    "retry": "다시 시도",
     "dismiss": "제거",
     "progress_aria": "{{name}} 다운로드 진행률",
     "transferred": "{{transferred}} / {{total}}",

@@ -33,8 +33,10 @@ export interface DownloadTransferItem {
 
 type Listener = () => void;
 type ProgressSample = { loadedBytes: number; totalBytes: number | null; now: number };
+type RetryHandler = (signal: AbortSignal) => Promise<void>;
 type Runtime = {
-  readonly controller: AbortController;
+  controller: AbortController;
+  retry: RetryHandler | null;
   lastSampleAt: number;
   lastSampleBytes: number;
   speedBps: number;
@@ -117,6 +119,7 @@ export function beginDownloadTransfer(name: string, now = Date.now()): { id: str
   const controller = new AbortController();
   runtimeById.set(id, {
     controller,
+    retry: null,
     lastSampleAt: now,
     lastSampleBytes: 0,
     speedBps: 0,
@@ -136,6 +139,45 @@ export function beginDownloadTransfer(name: string, now = Date.now()): { id: str
     updatedAt: now,
   }, ...snapshot]);
   return { id, signal: controller.signal };
+}
+
+export function setDownloadTransferRetry(id: string, retry: RetryHandler): void {
+  const runtime = runtimeById.get(id);
+  if (runtime) runtime.retry = retry;
+}
+
+export function canRetryDownloadTransfer(id: string): boolean {
+  const runtime = runtimeById.get(id);
+  const item = snapshot.find((entry) => entry.id === id);
+  return !!runtime?.retry && item?.status === DOWNLOAD_TRANSFER_STATUS.FAILED;
+}
+
+export async function retryDownloadTransfer(id: string, now = Date.now()): Promise<void> {
+  const runtime = runtimeById.get(id);
+  const item = snapshot.find((entry) => entry.id === id);
+  if (!runtime?.retry || item?.status !== DOWNLOAD_TRANSFER_STATUS.FAILED) return;
+  clearRuntimeTimer(runtime);
+  runtime.controller = new AbortController();
+  runtime.lastSampleAt = now;
+  runtime.lastSampleBytes = 0;
+  runtime.speedBps = 0;
+  runtime.lastPublishedAt = now;
+  runtime.pending = null;
+  updateItem(id, (current) => ({
+    ...current,
+    status: DOWNLOAD_TRANSFER_STATUS.PREPARING,
+    route: DOWNLOAD_TRANSFER_ROUTE.PENDING,
+    loadedBytes: 0,
+    speedBps: 0,
+    startedAt: now,
+    updatedAt: now,
+  }));
+  try {
+    await runtime.retry(runtime.controller.signal);
+  } catch {
+    const current = snapshot.find((entry) => entry.id === id);
+    if (current && !isTerminal(current.status)) failDownloadTransfer(id);
+  }
 }
 
 export function updateDownloadTransfer(

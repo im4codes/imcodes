@@ -1587,6 +1587,7 @@
     "collapse": "Свернуть загрузки",
     "clear_finished": "Очистить завершённые",
     "cancel": "Отменить",
+    "retry": "Повторить",
     "dismiss": "Убрать",
     "progress_aria": "Ход загрузки {{name}}",
     "transferred": "{{transferred}} / {{total}}",

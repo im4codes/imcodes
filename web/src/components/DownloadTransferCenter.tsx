@@ -2,10 +2,12 @@ import { useEffect, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import {
   DOWNLOAD_TRANSFER_STATUS,
+  canRetryDownloadTransfer,
   cancelDownloadTransfer,
   clearFinishedDownloadTransfers,
   dismissDownloadTransfer,
   getDownloadTransfers,
+  retryDownloadTransfer,
   subscribeDownloadTransfers,
   type DownloadTransferItem,
 } from '../download-transfer-store.js';
@@ -113,14 +115,19 @@ export function DownloadTransferCenter() {
                       })}
                   </span>
                   {!isTerminal && (
-                    <span>{item.speedBps > 0
-                      ? t('downloads.speed', { speed: formatTransferBytes(item.speedBps) })
-                      : t('downloads.speed_calculating')}</span>
+                    item.speedBps > 0
+                      ? <span>{t('downloads.speed', { speed: formatTransferBytes(item.speedBps) })}</span>
+                      : null
                   )}
                 </div>
                 <div class="download-transfer-actions">
                   {isTerminal ? (
-                    <button type="button" onClick={() => dismissDownloadTransfer(item.id)}>{t('downloads.dismiss')}</button>
+                    <>
+                      {canRetryDownloadTransfer(item.id) && (
+                        <button type="button" onClick={() => void retryDownloadTransfer(item.id)}>{t('downloads.retry')}</button>
+                      )}
+                      <button type="button" onClick={() => dismissDownloadTransfer(item.id)}>{t('downloads.dismiss')}</button>
+                    </>
                   ) : (
                     <button type="button" onClick={() => cancelDownloadTransfer(item.id)}>{t('downloads.cancel')}</button>
                   )}

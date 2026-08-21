@@ -7062,6 +7062,8 @@ afterEach(() => {
 
     await waitFor(() => expect(uploadFileMock).toHaveBeenCalledTimes(2));
     expect(pendingUploads.map((entry) => entry.file.name)).toEqual(['alpha.txt', 'beta.txt']);
+    expect(screen.queryByText('Measuring speed')).toBeNull();
+    expect(screen.queryByText('Calculating ETA')).toBeNull();
 
     await new Promise((resolve) => setTimeout(resolve, 300));
     await act(async () => {

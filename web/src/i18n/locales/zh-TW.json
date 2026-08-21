@@ -1588,6 +1588,7 @@
     "collapse": "收合下載清單",
     "clear_finished": "清除已結束",
     "cancel": "取消",
+    "retry": "重試",
     "dismiss": "移除",
     "progress_aria": "{{name}} 的下載進度",
     "transferred": "{{transferred}} / {{total}}",
