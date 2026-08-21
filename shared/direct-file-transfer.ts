@@ -189,6 +189,11 @@ export const DIRECT_FILE_TRANSFER_LIMITS = {
   DATA_CREDIT_BYTES: 8 * 1024 * 1024,
   DATA_BUFFER_HIGH_WATER_BYTES: 8 * 1024 * 1024,
   DATA_BUFFER_LOW_WATER_BYTES: 2 * 1024 * 1024,
+  // Keep daemon-to-browser bulk data from filling the shared SCTP send queue.
+  // Operation START/ACCEPTED frames use sibling channels on the same peer and
+  // must not wait behind the full upload/receiver backpressure window.
+  DOWNLOAD_CHANNEL_BUFFER_HIGH_WATER_BYTES: 256 * 1024,
+  DOWNLOAD_CHANNEL_BUFFER_LOW_WATER_BYTES: 64 * 1024,
   DISK_RESERVE_BYTES: 64 * 1024 * 1024,
   /** Attempt authority is deliberately longer-lived than a resume ticket. */
   AUTHORITY_TTL_MS: 2 * 60 * 60 * 1000,

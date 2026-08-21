@@ -621,8 +621,8 @@ async function finishUpload(transfer: ActiveDirectTransfer, totalBytes: number, 
 }
 
 async function waitForChannelBuffer(channel: DataChannel): Promise<void> {
-  if (channel.bufferedAmount() <= DIRECT_FILE_TRANSFER_LIMITS.DATA_BUFFER_HIGH_WATER_BYTES) return;
-  channel.setBufferedAmountLowThreshold(DIRECT_FILE_TRANSFER_LIMITS.DATA_BUFFER_LOW_WATER_BYTES);
+  if (channel.bufferedAmount() <= DIRECT_FILE_TRANSFER_LIMITS.DOWNLOAD_CHANNEL_BUFFER_HIGH_WATER_BYTES) return;
+  channel.setBufferedAmountLowThreshold(DIRECT_FILE_TRANSFER_LIMITS.DOWNLOAD_CHANNEL_BUFFER_LOW_WATER_BYTES);
   await new Promise<void>((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error('buffer_timeout')), DIRECT_FILE_TRANSFER_LIMITS.NO_PROGRESS_TIMEOUT_MS);
     timer.unref?.();

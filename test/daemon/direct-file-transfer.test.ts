@@ -557,7 +557,7 @@ describe('daemon direct file transfer v2 lease broker', () => {
     });
     await direct.handleDirectFileTransferCommand(authority, sender);
     const channel = new FakeDataChannel(authority.channelLabel as string);
-    channel.bufferedAmountValue = DIRECT_FILE_TRANSFER_LIMITS.DATA_BUFFER_HIGH_WATER_BYTES + 1;
+    channel.bufferedAmountValue = DIRECT_FILE_TRANSFER_LIMITS.DOWNLOAD_CHANNEL_BUFFER_HIGH_WATER_BYTES + 1;
     FakePeerConnection.latest!.emitDataChannel(channel);
     const downloadBinding = binding({
       direction: DIRECT_FILE_TRANSFER_DIRECTION.DOWNLOAD,
@@ -579,7 +579,7 @@ describe('daemon direct file transfer v2 lease broker', () => {
       creditBytes: DIRECT_FILE_TRANSFER_LIMITS.DATA_CREDIT_BYTES,
     }));
     await vi.waitFor(() => expect(channel.setBufferedAmountLowThreshold).toHaveBeenCalledWith(
-      DIRECT_FILE_TRANSFER_LIMITS.DATA_BUFFER_LOW_WATER_BYTES,
+      DIRECT_FILE_TRANSFER_LIMITS.DOWNLOAD_CHANNEL_BUFFER_LOW_WATER_BYTES,
     ));
     expect(channel.sent.some((message) => message instanceof Uint8Array)).toBe(false);
 
@@ -592,6 +592,94 @@ describe('daemon direct file transfer v2 lease broker', () => {
       ...downloadBinding,
       totalBytes: 8,
     }));
+    await direct.shutdownDirectFileTransfers();
+  });
+
+  it('bounds a saturated download queue while a sibling upload is accepted', async () => {
+    const largeDownloadSize = DIRECT_FILE_TRANSFER_LIMITS.DOWNLOAD_CHANNEL_BUFFER_HIGH_WATER_BYTES
+      + (DIRECT_FILE_TRANSFER_LIMITS.DATA_CHUNK_BYTES * 4);
+    await writeFile(sourcePath, Buffer.alloc(largeDownloadSize, 0x44));
+    resolveDirectFileDownloadSource.mockResolvedValueOnce({
+      attachmentId: 'preview-handle-0001',
+      readPath: sourcePath,
+      filename: 'source.bin',
+      size: largeDownloadSize,
+      mime: 'application/octet-stream',
+    });
+    const { direct, sender } = await readyLease();
+    const download = downloadPrepare({
+      operationId: 'concurrent-download-operation',
+      attemptId: 'concurrent-download-attempt',
+      requestId: 'concurrent-download-request',
+    });
+    await direct.handleDirectFileTransferCommand(download, sender);
+    const downloadChannel = new FakeDataChannel(download.channelLabel as string);
+    downloadChannel.sendMessageBinary.mockImplementation((message: Uint8Array) => {
+      downloadChannel.sent.push(message);
+      downloadChannel.bufferedAmountValue += message.byteLength;
+      return true;
+    });
+    FakePeerConnection.latest!.emitDataChannel(downloadChannel);
+    const downloadBinding = binding({
+      direction: DIRECT_FILE_TRANSFER_DIRECTION.DOWNLOAD,
+      operationId: download.operationId,
+      attemptId: download.attemptId,
+      requestId: download.requestId,
+    });
+    downloadChannel.emit(JSON.stringify({
+      type: DIRECT_FILE_TRANSFER_DATA_MSG.START,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      ...downloadBinding,
+      authority: download.authority,
+    }));
+    await vi.waitFor(() => expect(downloadChannel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED)));
+    downloadChannel.emit(JSON.stringify({
+      type: DIRECT_FILE_TRANSFER_DATA_MSG.CREDIT,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      ...downloadBinding,
+      creditBytes: DIRECT_FILE_TRANSFER_LIMITS.DATA_CREDIT_BYTES,
+    }));
+    await vi.waitFor(() => expect(downloadChannel.setBufferedAmountLowThreshold).toHaveBeenCalledWith(
+      DIRECT_FILE_TRANSFER_LIMITS.DOWNLOAD_CHANNEL_BUFFER_LOW_WATER_BYTES,
+    ));
+
+    const queuedDownloadBytes = downloadChannel.sent.reduce(
+      (total, message) => total + (message instanceof Uint8Array ? message.byteLength : 0),
+      0,
+    );
+    expect(queuedDownloadBytes).toBeLessThanOrEqual(
+      DIRECT_FILE_TRANSFER_LIMITS.DOWNLOAD_CHANNEL_BUFFER_HIGH_WATER_BYTES
+        + DIRECT_FILE_TRANSFER_LIMITS.DATA_CHUNK_BYTES,
+    );
+    expect(queuedDownloadBytes).toBeLessThan(DIRECT_FILE_TRANSFER_LIMITS.DATA_BUFFER_HIGH_WATER_BYTES);
+
+    const upload = uploadPrepare({
+      ...binding({
+        operationId: 'concurrent-upload-operation',
+        attemptId: 'concurrent-upload-attempt',
+        requestId: 'concurrent-upload-request',
+      }),
+      clientUploadId: 'concurrent-upload-operation',
+      channelLabel: 'imcodes-file-concurrent-upload',
+    });
+    await direct.handleDirectFileTransferCommand(upload, sender);
+    const uploadChannel = new FakeDataChannel(upload.channelLabel as string);
+    FakePeerConnection.latest!.emitDataChannel(uploadChannel);
+    uploadChannel.emit(JSON.stringify({
+      type: DIRECT_FILE_TRANSFER_DATA_MSG.START,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      ...binding({
+        operationId: upload.operationId,
+        attemptId: upload.attemptId,
+        requestId: upload.requestId,
+      }),
+      authority: upload.authority,
+    }));
+    await vi.waitFor(() => expect(uploadChannel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED)));
+    expect(downloadChannel.bufferedAmountValue).toBeGreaterThan(
+      DIRECT_FILE_TRANSFER_LIMITS.DOWNLOAD_CHANNEL_BUFFER_HIGH_WATER_BYTES,
+    );
+
     await direct.shutdownDirectFileTransfers();
   });
 
