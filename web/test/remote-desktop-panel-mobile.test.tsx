@@ -623,12 +623,16 @@ describe('RemoteDesktopPanel mobile gestures', () => {
       pointerId: 60, clientX: 200, clientY: 150,
     });
     expect(document.activeElement).toBe(stage);
+    const escapedRemoteKey = vi.fn();
+    document.addEventListener('keydown', escapedRemoteKey);
     act(() => stage.dispatchEvent(new KeyboardEvent('keydown', {
       bubbles: true,
       cancelable: true,
       code: 'KeyA',
       key: 'a',
     })));
+    document.removeEventListener('keydown', escapedRemoteKey);
+    expect(escapedRemoteKey).not.toHaveBeenCalled();
     expect(key).toHaveBeenCalledWith('KeyA', 'a', true, false, {
       control: false,
       alt: false,

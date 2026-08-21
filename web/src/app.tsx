@@ -4225,6 +4225,7 @@ export function App() {
   // Global keyboard passthrough
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
+      if (e.defaultPrevented) return;
       if (isImeComposingKeyEvent(e)) return;
       const ws = wsRef.current;
       // If a sub-session window is frontmost (desktop only), keystrokes —

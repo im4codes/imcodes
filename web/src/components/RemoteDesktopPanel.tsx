@@ -1379,6 +1379,11 @@ export function RemoteDesktopPanel({
 
   const onKey = (event: KeyboardEvent, down: boolean) => {
     if (!snapshot.inputEnabled) return;
+    // The stage owns physical keyboard input while control is active. Without
+    // this boundary the same key bubbles into App's document-level keyboard
+    // passthrough, which focuses a chat composer and inserts the character a
+    // second time (observed consistently in Safari).
+    event.stopPropagation();
     const client = clientRef.current;
     const mapped = mapRemoteDesktopKeyboardEvent(event);
     if (!client || !mapped) return;
