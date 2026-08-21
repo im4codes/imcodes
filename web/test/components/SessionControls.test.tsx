@@ -5345,11 +5345,14 @@ afterEach(() => {
     }
   });
 
-  it('stops the active transport and lets an image lightbox close on Escape', () => {
+  it('does not send direct cancel on Escape while an image lightbox owns the keyboard', () => {
     const ws = makeWs();
     const lightbox = document.createElement('div');
     lightbox.className = 'fb-lightbox';
     document.body.appendChild(lightbox);
+    // ImageLightbox handles Escape on window. Keep this listener here to pin
+    // both sides of the contract: the running session is untouched and the
+    // event is still allowed through to close the preview.
     const closeLightbox = vi.fn();
     window.addEventListener('keydown', closeLightbox);
     try {
@@ -5370,7 +5373,7 @@ afterEach(() => {
       input.focus();
       fireEvent.keyDown(input, { key: 'Escape' });
 
-      expectUrgentCancelPayload(ws, { sessionName: 'qwen-session' });
+      expect(gatherCancelCalls(ws)).toEqual([]);
       expect(closeLightbox).toHaveBeenCalledTimes(1);
       expect(ws.sendInput).not.toHaveBeenCalled();
     } finally {
