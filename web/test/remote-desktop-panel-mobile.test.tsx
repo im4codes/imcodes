@@ -85,6 +85,15 @@ vi.mock('../src/api.js', () => ({
 }));
 
 vi.mock('../src/direct-file-transfer.js', () => ({
+  // Keep this mock aligned with the panel's presentation-state import. The
+  // production helper owns these strings; the test only substitutes transport
+  // execution, not the panel's transfer-row state machine.
+  FILE_UPLOAD_TRANSPORT_MODE: {
+    CONNECTING: 'connecting',
+    DIRECT: 'direct',
+    FALLING_BACK: 'falling_back',
+    RELAY: 'relay',
+  },
   uploadFileWithDirectFallback,
   isFileUploadCanceled: (error: unknown) => (
     typeof error === 'object' && error !== null && 'name' in error && error.name === 'AbortError'
