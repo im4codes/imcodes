@@ -347,6 +347,18 @@ const directCapabilities = [
   DIRECT_FILE_TRANSFER_PREVIEW_DOWNLOAD_CAPABILITY,
 ];
 
+function createUploadFile(name: string, content: string): File {
+  const bytes = new TextEncoder().encode(content);
+  return {
+    name,
+    type: 'text/plain',
+    size: bytes.byteLength,
+    slice: (start: number, end: number) => ({
+      arrayBuffer: async () => bytes.slice(start, end).buffer,
+    }),
+  } as unknown as File;
+}
+
 describe('direct file transfer v2 browser broker', () => {
   afterEach(() => {
     vi.useRealTimers();
@@ -400,7 +412,7 @@ describe('direct file transfer v2 browser broker', () => {
   it('creates an authority-free data channel before the cold lease offer', async () => {
     const { uploadFileDirect } = await import('../src/direct-file-transfer.js');
     const { ws } = createWs(directCapabilities);
-    const file = new File(['direct'], 'direct.txt', { type: 'text/plain' });
+    const file = createUploadFile('direct.txt', 'direct');
 
     await uploadFileDirect(ws, file, id(), undefined, undefined, undefined, undefined, 'server-1');
 
