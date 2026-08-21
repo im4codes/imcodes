@@ -148,7 +148,7 @@
     },
     "roleHelp": {
       "viewer": "Puede ver el estado del alcance y participar en debates del alcance sin dirigir al agente.",
-      "participant": "Puede ver el estado del alcance y enviar indicaciones a pestañas concretas cubiertas."
+      "participant": "Puede colaborar plenamente dentro del ámbito compartido, incluido OpenSpec y nuevas subsesiones, pero no cerrar sesiones."
     },
     "trust": {
       "title": "Aviso de confianza para participantes",

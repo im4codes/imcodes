@@ -8681,10 +8681,10 @@ export class WsBridge {
     const shareState = this.browserShareStates.get(ws);
     if (shareState) {
       if (!shareStateCoversSession(shareState, sessionName)) return { ok: false };
-      // Shared viewers can inspect/recover state scoped to the shared session,
-      // but they must not start or stop Auto Deliver runs.
+      // Shared viewers can inspect/recover state scoped to the shared session.
+      // Participants may control Auto Deliver within that same covered scope.
       if (messageType === OPENSPEC_AUTO_DELIVER_MSG.LAUNCH || messageType === OPENSPEC_AUTO_DELIVER_MSG.STOP) {
-        return { ok: false };
+        return shareState.snapshot.effectiveRole === 'participant' ? { ok: true } : { ok: false };
       }
       return { ok: true };
     }

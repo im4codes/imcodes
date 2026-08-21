@@ -8100,7 +8100,13 @@ afterEach(() => {
 
     const modelButton = screen.getByRole('button', { name: /^gpt-5.4$/i }) as HTMLButtonElement;
     expect(modelButton.disabled).toBe(false);
-    expect((screen.getByTitle('actions') as HTMLButtonElement).disabled).toBe(true);
+    const actionsButton = screen.getByTitle('actions') as HTMLButtonElement;
+    expect(actionsButton.disabled).toBe(false);
+    fireEvent.click(actionsButton);
+    const participantMenu = document.querySelector('.session-actions-menu') as HTMLElement;
+    expect(within(participantMenu).getByRole('button', { name: 'Restart' })).toBeTruthy();
+    expect(within(participantMenu).queryByRole('button', { name: 'Stop' })).toBeNull();
+    fireEvent.click(actionsButton);
     expect(ws.send).toHaveBeenCalledWith(expect.objectContaining({
       type: TRANSPORT_MSG.LIST_MODELS,
       sessionName: 'shared-copilot-session',

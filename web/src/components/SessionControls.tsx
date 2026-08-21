@@ -1748,10 +1748,10 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     && !!onToggleSessionPin;
   // Input only disabled when there's no session or the active share cannot dispatch messages.
   const inputDisabled = !hasSession || !canSharedSessionSend;
-  // Owner-only controls stay disabled for shared sessions. Participant-scoped
-  // controls use the narrower gate below.
-  const disabled = !connected || !hasSession || isShareScopedSession;
   const participantControlDisabled = !connected || !hasSession || !canSharedSessionSend;
+  // A participant can use every session-scoped action except stopping the
+  // session. Viewers and inactive shares remain read-only.
+  const disabled = participantControlDisabled;
   const modelSwitchDisabled = participantControlDisabled;
   const isClaudeCode = activeSession?.agentType === 'claude-code' || activeSession?.agentType === 'claude-code-sdk';
   const isShellLike = activeSession?.agentType === 'shell' || activeSession?.agentType === 'script';
@@ -6615,22 +6615,26 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                   <span class="session-action-menu-label">{t('share.menu.shareTab')}</span>
                 </button>
               )}
-              <div class="menu-divider" />
-              <button
-                class={`menu-item session-action-menu-item ${stopBlockedByPinned || confirm === 'stop' ? 'menu-item-danger' : ''}`}
-                disabled={stopBlockedByPinned}
-                title={stopBlockedByPinned ? t('session.unpin_to_stop') : undefined}
-                onClick={() => handleMenuAction('stop')}
-              >
-                <SessionActionMenuIcon kind={stopBlockedByPinned ? 'unpin' : 'stop'} />
-                <span class="session-action-menu-label">
-                  {stopBlockedByPinned
-                    ? t('session.unpin_to_stop')
-                    : confirm === 'stop'
-                      ? (confirmLevel >= 2 ? t('session.confirm_sub_stop_2', { label: activeSession?.label || activeSession?.name }) : t('session.confirm_stop'))
-                      : t('session.stop_plain')}
-                </span>
-              </button>
+              {!isShareScopedSession && (
+                <>
+                  <div class="menu-divider" />
+                  <button
+                    class={`menu-item session-action-menu-item ${stopBlockedByPinned || confirm === 'stop' ? 'menu-item-danger' : ''}`}
+                    disabled={stopBlockedByPinned}
+                    title={stopBlockedByPinned ? t('session.unpin_to_stop') : undefined}
+                    onClick={() => handleMenuAction('stop')}
+                  >
+                    <SessionActionMenuIcon kind={stopBlockedByPinned ? 'unpin' : 'stop'} />
+                    <span class="session-action-menu-label">
+                      {stopBlockedByPinned
+                        ? t('session.unpin_to_stop')
+                        : confirm === 'stop'
+                          ? (confirmLevel >= 2 ? t('session.confirm_sub_stop_2', { label: activeSession?.label || activeSession?.name }) : t('session.confirm_stop'))
+                          : t('session.stop_plain')}
+                    </span>
+                  </button>
+                </>
+              )}
             </div>
           )}
         </div>}

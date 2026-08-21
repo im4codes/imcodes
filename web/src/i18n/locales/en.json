@@ -148,7 +148,7 @@
     },
     "roleHelp": {
       "viewer": "Can view scoped state and join scoped discussion without driving the agent.",
-      "participant": "Can view scoped state and send prompts to covered concrete tabs."
+      "participant": "Can fully collaborate within the shared scope, including OpenSpec and new sub-sessions, but cannot close sessions."
     },
     "trust": {
       "title": "Participant trust disclosure",

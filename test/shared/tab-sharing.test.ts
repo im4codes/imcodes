@@ -143,9 +143,12 @@ describe('shared tab sharing contract', () => {
       transportOnly: true,
     });
     expect(getShareScopedCommandPolicy(SHARE_BROWSER_COMMANDS.TERMINAL_RESIZE)).toMatchObject({
-      disposition: 'deny',
-      reason: 'share-direct-surface-denied',
+      disposition: 'allow',
+      minRole: 'participant',
+      scope: 'concrete-tab',
     });
+    expect(isShareCommandAllowed(SHARE_BROWSER_COMMANDS.TERMINAL_RESIZE, 'viewer')).toBe(false);
+    expect(isShareCommandAllowed(SHARE_BROWSER_COMMANDS.TERMINAL_RESIZE, 'participant')).toBe(true);
   });
 
   it('allows scoped file reads for viewers and requires participant for file mutations', () => {
@@ -187,12 +190,34 @@ describe('shared tab sharing contract', () => {
     }
   });
 
-  it('denies destructive repo, memory, provider, membership, and admin surfaces for all share roles', () => {
+  it('grants covered collaboration controls to participants while retaining account and close denials', () => {
+    const participantCommands = [
+      SHARE_BROWSER_COMMANDS.OPENSPEC_CONTROL,
+      SHARE_BROWSER_COMMANDS.SUBSESSION_START,
+      SHARE_BROWSER_COMMANDS.SUBSESSION_RESTART,
+      SHARE_BROWSER_COMMANDS.TERMINAL_INPUT,
+      SHARE_BROWSER_COMMANDS.TERMINAL_RESIZE,
+      SHARE_BROWSER_COMMANDS.QUEUE_EDIT,
+      SHARE_BROWSER_COMMANDS.QUEUE_UNDO,
+      SHARE_BROWSER_COMMANDS.CHAT_APPROVAL_RESPONSE,
+      SHARE_BROWSER_COMMANDS.MEMORY_QUERY,
+    ];
+    for (const command of participantCommands) {
+      expect(getShareScopedCommandPolicy(command), command).toMatchObject({
+        disposition: 'allow',
+        minRole: 'participant',
+        scope: 'concrete-tab',
+      });
+      expect(isShareCommandAllowed(command, 'viewer'), command).toBe(false);
+      expect(isShareCommandAllowed(command, 'participant'), command).toBe(true);
+    }
+
     const deniedCommands = [
+      SHARE_BROWSER_COMMANDS.SESSION_STOP,
+      SHARE_BROWSER_COMMANDS.SUBSESSION_STOP,
       SHARE_BROWSER_COMMANDS.REPO_COMMIT,
       SHARE_BROWSER_COMMANDS.REPO_PUSH,
       SHARE_BROWSER_COMMANDS.REPO_PULL,
-      SHARE_BROWSER_COMMANDS.MEMORY_QUERY,
       SHARE_BROWSER_COMMANDS.MEMORY_MUTATE,
       SHARE_BROWSER_COMMANDS.CREDENTIALS,
       SHARE_BROWSER_COMMANDS.BILLING,
@@ -200,9 +225,6 @@ describe('shared tab sharing contract', () => {
       SHARE_BROWSER_COMMANDS.ADMIN_SETTINGS,
       SHARE_BROWSER_COMMANDS.PROVIDER_STATUS,
       SHARE_BROWSER_COMMANDS.PROVIDER_LIST,
-      SHARE_BROWSER_COMMANDS.CHAT_APPROVAL_RESPONSE,
-      SHARE_BROWSER_COMMANDS.P2P_RUN_START,
-      SHARE_BROWSER_COMMANDS.P2P_CANCEL,
     ];
 
     for (const command of deniedCommands) {

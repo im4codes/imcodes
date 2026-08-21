@@ -6,6 +6,8 @@ const createSubSessionMock = vi.fn();
 const updateSubSessionMock = vi.fn();
 const sendToDaemonMock = vi.fn();
 const mockResolveServerMemberAccessOrShareDeny = vi.fn();
+const mockResolveHttpShareAccess = vi.fn();
+const mockResolveHttpShareAccessForCoveredSession = vi.fn();
 
 vi.mock('../src/security/authorization.js', () => ({
   requireAuth: () => async (c: any, next: any) => {
@@ -17,6 +19,8 @@ vi.mock('../src/security/authorization.js', () => ({
 
 vi.mock('../src/routes/share-http-auth.js', () => ({
   resolveServerMemberAccessOrShareDeny: (...args: unknown[]) => mockResolveServerMemberAccessOrShareDeny(...args),
+  resolveHttpShareAccess: (...args: unknown[]) => mockResolveHttpShareAccess(...args),
+  resolveHttpShareAccessForCoveredSession: (...args: unknown[]) => mockResolveHttpShareAccessForCoveredSession(...args),
 }));
 
 vi.mock('../src/db/queries.js', () => ({
@@ -76,16 +80,24 @@ describe('sub-session routes', () => {
     }));
   });
 
-  it('denies share-only sub-session listing with the direct-surface reason', async () => {
+  it('returns only covered sub-sessions to a share-only user', async () => {
+    const { getSubSessionsByServer } = await import('../src/db/queries.js');
+    vi.mocked(getSubSessionsByServer).mockResolvedValueOnce([
+      { id: 'covered' },
+      { id: 'private' },
+    ] as any);
     mockResolveServerMemberAccessOrShareDeny.mockResolvedValueOnce({
       ok: false,
       reason: 'share-direct-surface-denied',
     });
+    mockResolveHttpShareAccessForCoveredSession
+      .mockResolvedValueOnce({ membership: 'none', actor: { kind: 'share', effectiveActorRole: 'viewer' } })
+      .mockResolvedValueOnce({ membership: 'none', actor: { kind: 'none' } });
 
     const res = await app.request('/api/server/srv1/sub-sessions');
 
-    expect(res.status).toBe(403);
-    await expect(res.json()).resolves.toEqual({ error: 'forbidden', reason: 'share-direct-surface-denied' });
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toEqual({ subSessions: [{ id: 'covered' }] });
   });
 
   it('accepts claude-code-sdk sub-session type', async () => {
@@ -237,6 +249,61 @@ describe('sub-session routes', () => {
       sessionName: 'deck_sub_sub12345',
       label: 'Worker Label',
     });
+  });
+
+  it('allows a covered share participant to update a sub-session', async () => {
+    const { getSubSessionById } = await import('../src/db/queries.js');
+    vi.mocked(getSubSessionById).mockResolvedValue({
+      id: 'sub12345',
+      server_id: 'srv1',
+      type: 'codex-sdk',
+    } as any);
+    mockResolveServerMemberAccessOrShareDeny.mockResolvedValueOnce({
+      ok: false,
+      reason: 'share-direct-surface-denied',
+    });
+    mockResolveHttpShareAccessForCoveredSession.mockResolvedValueOnce({
+      membership: 'none',
+      actor: { kind: 'share', effectiveActorRole: 'participant' },
+    });
+
+    const res = await app.request('/api/server/srv1/sub-sessions/sub12345', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ label: 'Participant Label' }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(updateSubSessionMock).toHaveBeenCalledWith({}, 'sub12345', 'srv1', {
+      label: 'Participant Label',
+    });
+  });
+
+  it('denies a shared viewer updating a sub-session', async () => {
+    const { getSubSessionById } = await import('../src/db/queries.js');
+    vi.mocked(getSubSessionById).mockResolvedValue({
+      id: 'sub12345',
+      server_id: 'srv1',
+      type: 'codex-sdk',
+    } as any);
+    mockResolveServerMemberAccessOrShareDeny.mockResolvedValueOnce({
+      ok: false,
+      reason: 'share-direct-surface-denied',
+    });
+    mockResolveHttpShareAccessForCoveredSession.mockResolvedValueOnce({
+      membership: 'none',
+      actor: { kind: 'share', effectiveActorRole: 'viewer' },
+    });
+
+    const res = await app.request('/api/server/srv1/sub-sessions/sub12345', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ label: 'Denied Label' }),
+    });
+
+    expect(res.status).toBe(403);
+    expect(await res.json()).toEqual({ error: 'forbidden', reason: 'share-role-denied' });
+    expect(updateSubSessionMock).not.toHaveBeenCalled();
   });
 
   it('PATCH /sub-sessions/:id relays transport-config updates without a restart', async () => {

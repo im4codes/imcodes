@@ -9,7 +9,11 @@ import {
   reorderSubSessions,
 } from '../db/queries.js';
 import { requireAuth } from '../security/authorization.js';
-import { resolveServerMemberAccessOrShareDeny } from './share-http-auth.js';
+import {
+  resolveHttpShareAccess,
+  resolveHttpShareAccessForCoveredSession,
+  resolveServerMemberAccessOrShareDeny,
+} from './share-http-auth.js';
 import { WsBridge } from '../ws/bridge.js';
 import logger from '../util/logger.js';
 import { isSessionAgentType } from '../../../shared/agent-types.js';
@@ -31,24 +35,29 @@ async function resolveSubSessionRouteAccess(c: SubSessionRouteContext, serverId:
 subSessionRoutes.get('/:id/sub-sessions', async (c) => {
   const userId = c.get('userId' as never) as string;
   const serverId = c.req.param('id')!;
-  const access = await resolveSubSessionRouteAccess(c, serverId, userId);
-  if (!access.ok) return access.response;
-
+  const member = await resolveServerMemberAccessOrShareDeny(c.env.DB, { serverId, userId });
+  if (!member.ok && member.reason !== 'share-direct-surface-denied') {
+    return c.json({ error: 'forbidden', reason: member.reason }, 403);
+  }
   // Normal sub-session listing surface: execution clones are excluded (default)
   // so ephemeral clone workers never clutter the normal sub-session list.
-  const subSessions = await getSubSessionsByServer(c.env.DB, serverId, { includeExecutionClones: false });
-  return c.json({ subSessions });
+  const subSessions = (await getSubSessionsByServer(c.env.DB, serverId, { includeExecutionClones: false })) ?? [];
+  if (member.ok) return c.json({ subSessions });
+  const visible = (await Promise.all(subSessions.map(async (sub) => {
+    const access = await resolveHttpShareAccessForCoveredSession(c.env.DB, {
+      serverId,
+      userId,
+      target: { kind: 'subsession', serverId, subSessionId: sub.id },
+    });
+    return access.actor.kind === 'share' ? sub : null;
+  }))).filter((sub): sub is NonNullable<typeof sub> => sub !== null);
+  return c.json({ subSessions: visible });
 });
 
 /** POST /api/server/:id/sub-sessions — create sub-session */
 subSessionRoutes.post('/:id/sub-sessions', async (c) => {
   const userId = c.get('userId' as never) as string;
   const serverId = c.req.param('id')!;
-  const access = await resolveSubSessionRouteAccess(c, serverId, userId);
-  if (!access.ok) return access.response;
-  const role = access.role;
-  if (role !== 'owner' && role !== 'admin') return c.json({ error: 'forbidden' }, 403);
-
   let body: {
     type?: string;
     shellBin?: string;
@@ -78,7 +87,22 @@ subSessionRoutes.post('/:id/sub-sessions', async (c) => {
   })) {
     return c.json({ error: 'test_session_blocked' }, 400);
   }
-
+  const parentSession = typeof body.parent_session === 'string' ? body.parent_session.trim() : '';
+  const member = await resolveServerMemberAccessOrShareDeny(c.env.DB, { serverId, userId });
+  const memberMayCreate = member.ok && (member.role === 'owner' || member.role === 'admin');
+  const access = !member.ok && parentSession
+    ? await resolveHttpShareAccess(c.env.DB, {
+      serverId,
+      userId,
+      target: { kind: 'main', serverId, sessionName: parentSession },
+    })
+    : null;
+  const mayCreate = memberMayCreate
+    || (access?.actor.kind === 'share' && access.actor.effectiveActorRole === 'participant');
+  if (!mayCreate) {
+    const reason = access?.actor.kind === 'share' ? 'share-role-denied' : (member.ok ? 'share-role-denied' : member.reason);
+    return c.json({ error: 'forbidden', reason }, 403);
+  }
   // Generate 8-char id
   const id = Array.from(crypto.getRandomValues(new Uint8Array(6)))
     .map((b) => b.toString(36).padStart(2, '0'))
@@ -95,7 +119,7 @@ subSessionRoutes.post('/:id/sub-sessions', async (c) => {
     body.label ?? null,
     body.cc_session_id ?? null,
     body.gemini_session_id ?? null,
-    body.parent_session ?? null,
+    parentSession || null,
     null, null, null,
     body.description ?? null,
     body.cc_preset_id ?? null,
@@ -136,11 +160,21 @@ subSessionRoutes.patch('/:id/sub-sessions/:subId', async (c) => {
   const userId = c.get('userId' as never) as string;
   const serverId = c.req.param('id')!;
   const subId = c.req.param('subId')!;
-  const access = await resolveSubSessionRouteAccess(c, serverId, userId);
-  if (!access.ok) return access.response;
-  const role = access.role;
-  if (role !== 'owner' && role !== 'admin') return c.json({ error: 'forbidden' }, 403);
-
+  const member = await resolveServerMemberAccessOrShareDeny(c.env.DB, { serverId, userId });
+  const memberMayUpdate = member.ok && (member.role === 'owner' || member.role === 'admin');
+  const access = !member.ok
+    ? await resolveHttpShareAccessForCoveredSession(c.env.DB, {
+      serverId,
+      userId,
+      target: { kind: 'subsession', serverId, subSessionId: subId },
+    })
+    : null;
+  const mayUpdate = memberMayUpdate
+    || (access?.actor.kind === 'share' && access.actor.effectiveActorRole === 'participant');
+  if (!mayUpdate) {
+    const reason = access?.actor.kind === 'share' ? 'share-role-denied' : (member.ok ? 'share-role-denied' : member.reason);
+    return c.json({ error: 'forbidden', reason }, 403);
+  }
   const existing = await getSubSessionById(c.env.DB, subId, serverId);
   if (!existing) return c.json({ error: 'not_found' }, 404);
 

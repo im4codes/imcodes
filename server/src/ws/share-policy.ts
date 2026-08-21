@@ -27,6 +27,7 @@ import {
   DIRECT_FILE_TRANSFER_MSG,
 } from '../../../shared/direct-file-transfer.js';
 import { TRANSPORT_QUEUE_COMMANDS } from '../../../shared/transport-queue-types.js';
+import { OPENSPEC_AUTO_DELIVER_MSG } from '../../../shared/openspec-auto-deliver-constants.js';
 
 export { shareTargetKey };
 export type { EffectiveCoverage, ShareTarget };
@@ -140,6 +141,10 @@ export const SHARE_WS_COMMAND_POLICY_INVENTORY: readonly ShareBridgeCommandInven
   { bridgeCommand: TIMELINE_MESSAGES.PAGE_REQUEST, sharedCommand: SHARE_BROWSER_COMMANDS.CHAT_HISTORY, policy: { kind: 'allow-covered-read', requireTarget: true } },
   { bridgeCommand: TIMELINE_MESSAGES.DETAIL_REQUEST, sharedCommand: SHARE_BROWSER_COMMANDS.CHAT_HISTORY, policy: { kind: 'allow-covered-read', requireTarget: true } },
   { bridgeCommand: 'discussion.start', sharedCommand: SHARE_BROWSER_COMMANDS.DISCUSSION_START, policy: { kind: 'participant-discussion-start' } },
+  { bridgeCommand: OPENSPEC_AUTO_DELIVER_MSG.STATUS_REQUEST, sharedCommand: SHARE_BROWSER_COMMANDS.OPENSPEC_VIEW, policy: { kind: 'allow-covered-read', requireTarget: true } },
+  { bridgeCommand: OPENSPEC_AUTO_DELIVER_MSG.LIST_REQUEST, sharedCommand: SHARE_BROWSER_COMMANDS.OPENSPEC_VIEW, policy: { kind: 'allow-covered-read', requireTarget: true } },
+  { bridgeCommand: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH, sharedCommand: SHARE_BROWSER_COMMANDS.OPENSPEC_CONTROL, policy: { kind: 'participant-covered-action' } },
+  { bridgeCommand: OPENSPEC_AUTO_DELIVER_MSG.STOP, sharedCommand: SHARE_BROWSER_COMMANDS.OPENSPEC_CONTROL, policy: { kind: 'participant-covered-action' } },
   { bridgeCommand: 'session.send', sharedCommand: SHARE_BROWSER_COMMANDS.SESSION_SEND, policy: { kind: 'participant-send' } },
   { bridgeCommand: 'subsession.set_model', sharedCommand: SHARE_BROWSER_COMMANDS.SESSION_MODEL_SWITCH, policy: { kind: 'participant-model-switch' } },
   { bridgeCommand: TRANSPORT_MSG.LIST_MODELS, sharedCommand: SHARE_BROWSER_COMMANDS.SESSION_MODEL_LIST, policy: { kind: 'participant-model-list' } },
@@ -170,24 +175,24 @@ export const SHARE_WS_COMMAND_POLICY_INVENTORY: readonly ShareBridgeCommandInven
   { bridgeCommand: DIRECT_FILE_TRANSFER_MSG.CANCEL, sharedCommand: SHARE_BROWSER_COMMANDS.FILE_READ, policy: { kind: 'direct-file-bound-operation' } },
   { bridgeCommand: DIRECT_FILE_TRANSFER_MSG.STATUS_QUERY, sharedCommand: SHARE_BROWSER_COMMANDS.FILE_READ, policy: { kind: 'direct-file-bound-operation' } },
 
-  { bridgeCommand: 'session.start', sharedCommand: SHARE_BROWSER_COMMANDS.SESSION_START, policy: denyFromShared(SHARE_BROWSER_COMMANDS.SESSION_START) },
+  { bridgeCommand: 'session.start', sharedCommand: SHARE_BROWSER_COMMANDS.SESSION_START, policy: { kind: 'participant-covered-action' } },
   { bridgeCommand: 'session.stop', sharedCommand: SHARE_BROWSER_COMMANDS.SESSION_STOP, policy: denyFromShared(SHARE_BROWSER_COMMANDS.SESSION_STOP) },
-  { bridgeCommand: 'session.restart', sharedCommand: SHARE_BROWSER_COMMANDS.SESSION_RESTART, policy: denyFromShared(SHARE_BROWSER_COMMANDS.SESSION_RESTART) },
-  { bridgeCommand: 'session.input', sharedCommand: SHARE_BROWSER_COMMANDS.TERMINAL_INPUT, policy: denyFromShared(SHARE_BROWSER_COMMANDS.TERMINAL_INPUT) },
-  { bridgeCommand: 'session.resize', sharedCommand: SHARE_BROWSER_COMMANDS.TERMINAL_RESIZE, policy: denyFromShared(SHARE_BROWSER_COMMANDS.TERMINAL_RESIZE) },
-  { bridgeCommand: 'session.edit_queued_message', sharedCommand: SHARE_BROWSER_COMMANDS.QUEUE_EDIT, policy: denyFromShared(SHARE_BROWSER_COMMANDS.QUEUE_EDIT) },
-  { bridgeCommand: 'session.undo_queued_message', sharedCommand: SHARE_BROWSER_COMMANDS.QUEUE_UNDO, policy: denyFromShared(SHARE_BROWSER_COMMANDS.QUEUE_UNDO) },
+  { bridgeCommand: 'session.restart', sharedCommand: SHARE_BROWSER_COMMANDS.SESSION_RESTART, policy: { kind: 'participant-covered-action' } },
+  { bridgeCommand: 'session.input', sharedCommand: SHARE_BROWSER_COMMANDS.TERMINAL_INPUT, policy: { kind: 'participant-covered-action' } },
+  { bridgeCommand: 'session.resize', sharedCommand: SHARE_BROWSER_COMMANDS.TERMINAL_RESIZE, policy: { kind: 'participant-covered-action' } },
+  { bridgeCommand: 'session.edit_queued_message', sharedCommand: SHARE_BROWSER_COMMANDS.QUEUE_EDIT, policy: { kind: 'participant-covered-action' } },
+  { bridgeCommand: 'session.undo_queued_message', sharedCommand: SHARE_BROWSER_COMMANDS.QUEUE_UNDO, policy: { kind: 'participant-covered-action' } },
   { bridgeCommand: TRANSPORT_QUEUE_COMMANDS.APPEND_MESSAGES, sharedCommand: SHARE_BROWSER_COMMANDS.QUEUE_APPEND, policy: { kind: 'participant-covered-action' } },
-  { bridgeCommand: 'subsession.start', sharedCommand: SHARE_BROWSER_COMMANDS.SUBSESSION_START, policy: denyFromShared(SHARE_BROWSER_COMMANDS.SUBSESSION_START) },
+  { bridgeCommand: 'subsession.start', sharedCommand: SHARE_BROWSER_COMMANDS.SUBSESSION_START, policy: { kind: 'participant-covered-action' } },
   { bridgeCommand: 'subsession.stop', sharedCommand: SHARE_BROWSER_COMMANDS.SUBSESSION_STOP, policy: denyFromShared(SHARE_BROWSER_COMMANDS.SUBSESSION_STOP) },
-  { bridgeCommand: 'subsession.restart', sharedCommand: SHARE_BROWSER_COMMANDS.SUBSESSION_RESTART, policy: denyFromShared(SHARE_BROWSER_COMMANDS.SUBSESSION_RESTART) },
+  { bridgeCommand: 'subsession.restart', sharedCommand: SHARE_BROWSER_COMMANDS.SUBSESSION_RESTART, policy: { kind: 'participant-covered-action' } },
   { bridgeCommand: P2P_CONFIG_MSG.SAVE, sharedCommand: SHARE_BROWSER_COMMANDS.P2P_CONFIG_SAVE, policy: { kind: 'participant-p2p-config-save' } },
-  { bridgeCommand: TRANSPORT_MSG.APPROVAL_RESPONSE, sharedCommand: SHARE_BROWSER_COMMANDS.CHAT_APPROVAL_RESPONSE, policy: denyFromShared(SHARE_BROWSER_COMMANDS.CHAT_APPROVAL_RESPONSE) },
+  { bridgeCommand: TRANSPORT_MSG.APPROVAL_RESPONSE, sharedCommand: SHARE_BROWSER_COMMANDS.CHAT_APPROVAL_RESPONSE, policy: { kind: 'participant-covered-action' } },
   { bridgeCommand: TRANSPORT_MSG.PROVIDER_STATUS, sharedCommand: SHARE_BROWSER_COMMANDS.PROVIDER_STATUS, policy: denyFromShared(SHARE_BROWSER_COMMANDS.PROVIDER_STATUS) },
   { bridgeCommand: TRANSPORT_MSG.LIST_SESSIONS, sharedCommand: SHARE_BROWSER_COMMANDS.PROVIDER_LIST, policy: denyFromShared(SHARE_BROWSER_COMMANDS.PROVIDER_LIST) },
   { bridgeCommand: 'provider.sync_sessions', sharedCommand: SHARE_BROWSER_COMMANDS.PROVIDER_LIST, policy: denyFromShared(SHARE_BROWSER_COMMANDS.PROVIDER_LIST) },
-  { bridgeCommand: 'fs.edit', sharedCommand: SHARE_BROWSER_COMMANDS.FILE_EDIT, policy: { kind: 'deny', reason: SHARE_REASONS.DIRECT_SURFACE_DENIED } },
-  { bridgeCommand: 'fs.patch', sharedCommand: SHARE_BROWSER_COMMANDS.FILE_PATCH, policy: { kind: 'deny', reason: SHARE_REASONS.DIRECT_SURFACE_DENIED } },
+  { bridgeCommand: 'fs.edit', sharedCommand: SHARE_BROWSER_COMMANDS.FILE_EDIT, policy: { kind: 'participant-covered-action' } },
+  { bridgeCommand: 'fs.patch', sharedCommand: SHARE_BROWSER_COMMANDS.FILE_PATCH, policy: { kind: 'participant-covered-action' } },
   { bridgeCommand: REPO_MSG.DETECT, sharedCommand: SHARE_BROWSER_COMMANDS.REPO_STATUS, policy: { kind: 'allow-covered-read', requireTarget: true } },
   { bridgeCommand: REPO_MSG.LIST_BRANCHES, sharedCommand: SHARE_BROWSER_COMMANDS.REPO_SEARCH, policy: { kind: 'allow-covered-read', requireTarget: true } },
   { bridgeCommand: REPO_MSG.CHECKOUT_BRANCH, sharedCommand: SHARE_BROWSER_COMMANDS.REPO_BRANCH, policy: { kind: 'participant-covered-action' } },
@@ -199,7 +204,7 @@ export const SHARE_WS_COMMAND_POLICY_INVENTORY: readonly ShareBridgeCommandInven
   { bridgeCommand: REPO_MSG.COMMIT_DETAIL, sharedCommand: SHARE_BROWSER_COMMANDS.REPO_SEARCH, policy: { kind: 'allow-covered-read', requireTarget: true } },
   { bridgeCommand: REPO_MSG.PR_DETAIL, sharedCommand: SHARE_BROWSER_COMMANDS.REPO_SEARCH, policy: { kind: 'allow-covered-read', requireTarget: true } },
   { bridgeCommand: REPO_MSG.ISSUE_DETAIL, sharedCommand: SHARE_BROWSER_COMMANDS.REPO_SEARCH, policy: { kind: 'allow-covered-read', requireTarget: true } },
-  { bridgeCommand: 'memory.skill.query', sharedCommand: SHARE_BROWSER_COMMANDS.MEMORY_QUERY, policy: denyFromShared(SHARE_BROWSER_COMMANDS.MEMORY_QUERY) },
+  { bridgeCommand: 'memory.skill.query', sharedCommand: SHARE_BROWSER_COMMANDS.MEMORY_QUERY, policy: { kind: 'participant-covered-action' } },
   { bridgeCommand: 'cron.create', sharedCommand: SHARE_BROWSER_COMMANDS.CRON_MUTATE, policy: { kind: 'participant-covered-action' } },
 ];
 
@@ -577,7 +582,7 @@ export function evaluateShareCommand(input: {
 }
 
 export function commandSessionName(msg: Record<string, unknown>): string | null {
-  for (const key of ['sessionName', 'session', 'sessionId']) {
+  for (const key of ['sessionName', 'session', 'sessionId', 'parentSession']) {
     const value = msg[key];
     if (typeof value === 'string' && value.trim()) return value.trim();
   }

@@ -31,6 +31,7 @@ import {
 } from '../../shared/direct-file-transfer.js';
 import { MSG_COMMAND_ACK } from '../../shared/ack-protocol.js';
 import { TRANSPORT_QUEUE_COMMANDS } from '../../shared/transport-queue-types.js';
+import { OPENSPEC_AUTO_DELIVER_MSG } from '../../shared/openspec-auto-deliver-constants.js';
 
 class MockWs extends EventEmitter {
   sent: Array<string | Buffer> = [];
@@ -458,7 +459,7 @@ describe('WsBridge share-scoped sockets', () => {
     expect(daemon.sentJson.some((msg) => msg.type === TRANSPORT_QUEUE_COMMANDS.APPEND_MESSAGES)).toBe(false);
   });
 
-  it('denies unknown commands, terminal resize, and viewer sends before daemon forwarding', async () => {
+  it('denies unknown commands and participant-only controls to viewers before daemon forwarding', async () => {
     const bridge = WsBridge.get(serverId);
     const target: ShareTarget = { kind: 'main', serverId, sessionName: 'deck_proj_brain' };
     bridge.setShareCoverageResolverForTests(async () => coverage(target, 'viewer', now));
@@ -482,10 +483,79 @@ describe('WsBridge share-scoped sockets', () => {
 
     expect(shared.sentJson).toEqual(expect.arrayContaining([
       expect.objectContaining({ type: 'error', code: SHARE_REASONS.DIRECT_SURFACE_DENIED, originalType: 'unknown.command' }),
-      expect.objectContaining({ type: 'error', code: SHARE_REASONS.DIRECT_SURFACE_DENIED, originalType: 'session.resize' }),
+      expect.objectContaining({ type: 'error', code: SHARE_REASONS.ROLE_DENIED, originalType: 'session.resize' }),
       expect.objectContaining({ type: 'command.failed', commandId: 'cmd-viewer', reason: SHARE_REASONS.ROLE_DENIED }),
     ]));
     expect(daemon.sentJson.some((msg) => msg.type === 'unknown.command' || msg.type === 'session.resize' || msg.type === 'session.send')).toBe(false);
+  });
+
+  it('allows a participant to start a covered sub-session and OpenSpec run while denying viewers', async () => {
+    const bridge = WsBridge.get(serverId);
+    const target: ShareTarget = { kind: 'main', serverId, sessionName: 'deck_proj_brain' };
+    const daemon = new MockWs();
+    bridge.handleDaemonConnection(daemon as never, makeDb(), {} as never);
+    daemon.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+    await flushAsync();
+    daemon.sent.length = 0;
+
+    bridge.setShareCoverageResolverForTests(async () => coverage(target, 'participant', now));
+    const participant = new MockWs();
+    bridge.handleShareBrowserConnection(participant as never, 'participant-user', makeDb(), {
+      ticketId: 'share-ticket-participant-controls',
+      target,
+      snapshot: coverage(target, 'participant', now),
+    });
+    participant.emit('message', JSON.stringify({
+      type: 'subsession.start',
+      id: 'new-child',
+      sessionType: 'codex-sdk',
+      parentSession: 'deck_proj_brain',
+    }));
+    participant.emit('message', JSON.stringify({
+      type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
+      requestId: 'openspec-launch-participant',
+      sessionName: 'deck_proj_brain',
+      changeName: 'participant-change',
+    }));
+    await flushAsync();
+
+    expect(daemon.sentJson).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: 'subsession.start', id: 'new-child', parentSession: 'deck_proj_brain' }),
+      expect.objectContaining({
+        type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
+        requestId: 'openspec-launch-participant',
+        sessionName: 'deck_proj_brain',
+        serverId,
+      }),
+    ]));
+
+    bridge.setShareCoverageResolverForTests(async () => coverage(target, 'viewer', now));
+    const viewer = new MockWs();
+    bridge.handleShareBrowserConnection(viewer as never, 'viewer-user', makeDb(), {
+      ticketId: 'share-ticket-viewer-controls',
+      target,
+      snapshot: coverage(target, 'viewer', now),
+    });
+    daemon.sent.length = 0;
+    viewer.emit('message', JSON.stringify({
+      type: 'subsession.start',
+      id: 'blocked-child',
+      sessionType: 'codex-sdk',
+      parentSession: 'deck_proj_brain',
+    }));
+    viewer.emit('message', JSON.stringify({
+      type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
+      requestId: 'openspec-launch-viewer',
+      sessionName: 'deck_proj_brain',
+      changeName: 'blocked-change',
+    }));
+    await flushAsync();
+
+    expect(daemon.sentJson.some((msg) => msg.id === 'blocked-child' || msg.requestId === 'openspec-launch-viewer')).toBe(false);
+    expect(viewer.sentJson).toEqual(expect.arrayContaining([
+      expect.objectContaining({ originalType: 'subsession.start', code: SHARE_REASONS.ROLE_DENIED }),
+      expect.objectContaining({ originalType: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH, code: SHARE_REASONS.ROLE_DENIED }),
+    ]));
   });
 
   it('keeps the bridge command policy inventory aligned with the shared share policy', () => {
@@ -624,7 +694,7 @@ describe('WsBridge share-scoped sockets', () => {
     expect(daemon.sentJson.some((msg) => deniedCommands.some((entry) => entry.bridgeCommand === msg.type) || msg.type === 'future.unclassified.command')).toBe(false);
   });
 
-  it('allows covered participant file operations while keeping unsupported and global repo surfaces denied', async () => {
+  it('allows covered participant file operations while keeping unscoped and global surfaces denied', async () => {
     const bridge = WsBridge.get(serverId);
     const target: ShareTarget = { kind: 'main', serverId, sessionName: 'deck_proj_brain' };
     bridge.setShareCoverageResolverForTests(async () => coverage(target, 'participant', now));
@@ -668,8 +738,6 @@ describe('WsBridge share-scoped sockets', () => {
     }
 
     expect(shared.sentJson).toEqual(expect.arrayContaining([
-      expect.objectContaining({ type: 'error', code: SHARE_REASONS.DIRECT_SURFACE_DENIED, originalType: 'fs.edit' }),
-      expect.objectContaining({ type: 'error', code: SHARE_REASONS.DIRECT_SURFACE_DENIED, originalType: 'fs.patch' }),
       expect.objectContaining({ type: 'error', code: SHARE_REASONS.DIRECT_SURFACE_DENIED, originalType: REPO_MSG.DETECT }),
       expect.objectContaining({ type: 'error', code: SHARE_REASONS.DIRECT_SURFACE_DENIED, originalType: REPO_MSG.LIST_BRANCHES }),
       expect.objectContaining({ type: 'error', code: SHARE_REASONS.DIRECT_SURFACE_DENIED, originalType: REPO_MSG.CHECKOUT_BRANCH }),
@@ -681,8 +749,6 @@ describe('WsBridge share-scoped sockets', () => {
       expect.objectContaining({ type: 'error', code: SHARE_REASONS.DIRECT_SURFACE_DENIED, originalType: 'provider.sync_sessions' }),
     ]));
     expect(daemon.sentJson.some((msg) => [
-      'fs.edit',
-      'fs.patch',
       REPO_MSG.DETECT,
       REPO_MSG.LIST_BRANCHES,
       REPO_MSG.CHECKOUT_BRANCH,
@@ -699,6 +765,8 @@ describe('WsBridge share-scoped sockets', () => {
       expect.objectContaining({ type: 'fs.write', requestId: 'fs-write-1', sessionName: 'deck_proj_brain' }),
       expect.objectContaining({ type: FS_TRANSPORT_MSG.RENAME, requestId: 'fs-rename-1', sessionName: 'deck_proj_brain' }),
       expect.objectContaining({ type: 'fs.mkdir', requestId: 'fs-mkdir-1', sessionName: 'deck_proj_brain' }),
+      expect.objectContaining({ type: 'fs.edit', requestId: 'fs-edit-1', sessionName: 'deck_proj_brain' }),
+      expect.objectContaining({ type: 'fs.patch', requestId: 'fs-patch-1', sessionName: 'deck_proj_brain' }),
       expect.objectContaining({ type: FS_TRANSPORT_MSG.DELETE, requestId: 'fs-delete-1', sessionName: 'deck_proj_brain' }),
       expect.objectContaining({ type: 'fs.git_status', requestId: 'git-status-1', sessionName: 'deck_proj_brain' }),
       expect.objectContaining({ type: 'fs.git_diff', requestId: 'git-diff-1', sessionName: 'deck_proj_brain' }),
