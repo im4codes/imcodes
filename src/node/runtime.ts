@@ -117,6 +117,13 @@ export function createControlledNodeRuntime(
         'remote desktop worker crashed',
       );
     },
+    onPrepareTimeout: () => {
+      // No session/capability/desktop detail is logged. This exists to
+      // distinguish a native pre-offer wedge from ordinary ICE negotiation
+      // failures while the host recycles the authenticated worker.
+      incrementCounter('remote_desktop.prepare_timeout');
+      logger.warn('remote desktop worker did not complete prepare; recycling');
+    },
   });
   const remoteDesktopEnabled = remoteDesktopWorker.available()
     && isRemoteDesktopFeatureEnabled(

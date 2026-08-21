@@ -44,6 +44,13 @@ export { verifyWindowsAuthenticodeSigners } from './windows-artifact-trust.js';
 // revocation/provider checks on older Windows hosts to finish.
 const CONNECT_TIMEOUT_MS = 30_000;
 const HELLO_TIMEOUT_MS = 2_000;
+// PREPARE creates the capture source before the native worker can read an
+// OFFER. A broken D3D/DXGI call can block that signaling-thread operation
+// forever, which used to leave a live worker and a browser permanently at
+// "handshaking". Normal first-frame admission is bounded to three seconds per
+// display, so this leaves ample headroom without consuming the browser's
+// 45-second negotiation budget.
+const PREPARE_READY_TIMEOUT_MS = 15_000;
 const VIRTUAL_DISPLAY_SHUTDOWN_GRACE_MS = 1_000;
 const MAX_LINE_BYTES = 512 * 1024;
 const SHA256_RE = /^[a-f0-9]{64}$/;
@@ -191,6 +198,9 @@ interface TrackedAuthority {
   virtualRetryAttempted: boolean;
   usesVirtualDisplay: boolean;
   secureConsoleRetryAttempted: boolean;
+  /** Guards the write→response race before the readiness watchdog is armed. */
+  prepareReady: boolean;
+  prepareReadyTimer: ReturnType<typeof setTimeout> | null;
 }
 
 interface VirtualDisplayControllerProcess {
@@ -225,6 +235,12 @@ export interface RemoteDesktopWorkerHostOptions {
   virtualDisplayStartupMs?: number;
   virtualDisplayActivationMs?: number;
   virtualDisplayShutdownGraceMs?: number;
+  /** Bound a native PREPARE that otherwise prevents the pipe from reading OFFER. */
+  prepareReadyTimeoutMs?: number;
+  /** Injectable only so the watchdog's process boundary is verifiable in tests. */
+  terminateProcess?: (pid: number) => void;
+  /** Emits only a redacted lifecycle signal; the authority never leaves this host. */
+  onPrepareTimeout?: () => void;
   launchVirtualDisplay?: (executable: string) => VirtualDisplayControllerProcess;
   activateVirtualDisplay?: (executable: string) => void;
   wait?: (milliseconds: number) => Promise<void>;
@@ -256,6 +272,8 @@ export class RemoteDesktopWorkerHost {
   private readonly pendingHelloSockets = new Set<net.Socket>();
   /** Which start produced a promoted socket, so its loss retires only its own. */
   private readonly socketStartToken = new WeakMap<net.Socket, object>();
+  /** Authenticated worker pid for the socket; never inferred from its path. */
+  private readonly workerPidBySocket = new WeakMap<net.Socket, number>();
   private virtualDisplayController: VirtualDisplayControllerProcess | null = null;
   private virtualDisplayStartPromise: Promise<void> | null = null;
   private virtualDisplayGeneration = 0;
@@ -469,6 +487,9 @@ export class RemoteDesktopWorkerHost {
     if (!sent) {
       return true;
     }
+    if (command.type === REMOTE_DESKTOP_MSG.PREPARE) {
+      this.armPrepareReadyTimer(command.sessionId, this.socket);
+    }
     if (sent && (command.type === REMOTE_DESKTOP_MSG.STOP
       || command.type === REMOTE_DESKTOP_MSG.CANCEL)) {
       this.untrack(command.sessionId);
@@ -558,6 +579,8 @@ export class RemoteDesktopWorkerHost {
   }
 
   private track(prepare: RemoteDesktopPrepare): void {
+    const previous = this.tracked.get(prepare.sessionId);
+    if (previous) this.clearPrepareReadyTimer(previous);
     this.tracked.set(prepare.sessionId, {
       requestId: prepare.requestId,
       sessionId: prepare.sessionId,
@@ -566,7 +589,57 @@ export class RemoteDesktopWorkerHost {
       virtualRetryAttempted: false,
       usesVirtualDisplay: this.virtualDisplayController !== null,
       secureConsoleRetryAttempted: false,
+      prepareReady: false,
+      prepareReadyTimer: null,
     });
+  }
+
+  /**
+   * The native process emits MODE_STATE once PREPARE has actually completed.
+   * Until then its pipe reader may be blocked inside D3D/DXGI initialization,
+   * so neither OFFER nor STOP can make progress. Kill only the authenticated
+   * worker process and report a normal worker_failed terminal: the panel's
+   * existing bounded retry starts a fresh worker/pipe generation.
+   */
+  private armPrepareReadyTimer(sessionId: string, socket: net.Socket | null): void {
+    const tracked = this.tracked.get(sessionId);
+    if (!tracked || !socket || socket.destroyed) return;
+    this.clearPrepareReadyTimer(tracked);
+    // A fast worker can emit MODE_STATE in the same turn as the pipe write.
+    // Never arm a late watchdog after that already-observed acknowledgement.
+    if (tracked.prepareReady) return;
+    const workerPid = this.workerPidBySocket.get(socket);
+    tracked.prepareReadyTimer = setTimeout(() => {
+      if (this.tracked.get(sessionId) !== tracked) return;
+      const terminal = {
+        type: REMOTE_DESKTOP_MSG.TERMINAL,
+        requestId: tracked.requestId,
+        sessionId: tracked.sessionId,
+        capability: tracked.capability.toString('utf8'),
+        reason: REMOTE_DESKTOP_TERMINAL_REASON.WORKER_FAILED,
+      } as const;
+      // Drop the authority before destroying the pipe so onSocketLost cannot
+      // emit this terminal a second time. Other sessions sharing a genuinely
+      // wedged worker are still failed by onSocketLost.
+      this.untrack(sessionId);
+      try { this.options.onPrepareTimeout?.(); } catch { /* diagnostics never affect recovery */ }
+      try {
+        if (workerPid && workerPid > 0) {
+          (this.options.terminateProcess ?? ((pid: number) => process.kill(pid)))(workerPid);
+        }
+      } catch {
+        // The pipe close below still tears down the stale authority. The PID is
+        // authenticated in worker_hello but the process may already have died.
+      }
+      if (this.socket === socket && !socket.destroyed) socket.destroy();
+      this.onMessage(terminal);
+    }, this.options.prepareReadyTimeoutMs ?? PREPARE_READY_TIMEOUT_MS);
+    tracked.prepareReadyTimer.unref?.();
+  }
+
+  private clearPrepareReadyTimer(tracked: TrackedAuthority): void {
+    if (tracked.prepareReadyTimer) clearTimeout(tracked.prepareReadyTimer);
+    tracked.prepareReadyTimer = null;
   }
 
   /**
@@ -713,6 +786,7 @@ export class RemoteDesktopWorkerHost {
       // Which desktop this worker actually owns decides where its replacement
       // has to go if the desktop switches under it.
       this.workerSecureConsole = parsed.secureConsole === true;
+      this.workerPidBySocket.set(socket, parsed.pid);
       const remainder = helloBuffer.slice(newline + 1);
       socket.off('data', onHello);
       socket.setTimeout(0);
@@ -757,6 +831,11 @@ export class RemoteDesktopWorkerHost {
       const capability = Buffer.from(parsed.value.capability, 'utf8');
       if (!tracked || capability.length !== tracked.capability.length
         || !timingSafeEqual(capability, tracked.capability)) continue;
+      // MODE_STATE is the normal first response to PREPARE. Any authenticated
+      // session frame proves the native signaling thread escaped initial
+      // capture setup, so subsequent OFFER/ICE are no longer hostage to it.
+      tracked.prepareReady = true;
+      this.clearPrepareReadyTimer(tracked);
       if (parsed.value.type === REMOTE_DESKTOP_MSG.TERMINAL) {
         // `media_unavailable` also covers transient DXGI/DWM failures while a
         // physical output is switching. Only the worker's explicit initial
@@ -792,6 +871,7 @@ export class RemoteDesktopWorkerHost {
     this.recoverableSocketLosses.delete(socket);
     const token = this.socketStartToken.get(socket);
     this.socketStartToken.delete(socket);
+    this.workerPidBySocket.delete(socket);
     if (this.socket !== socket) return;
     this.socket = null;
     this.buffer = '';
@@ -822,6 +902,7 @@ export class RemoteDesktopWorkerHost {
 
   private failTracked(reason: typeof REMOTE_DESKTOP_TERMINAL_REASON[keyof typeof REMOTE_DESKTOP_TERMINAL_REASON]): void {
     for (const authority of this.tracked.values()) {
+      this.clearPrepareReadyTimer(authority);
       this.onMessage({
         type: REMOTE_DESKTOP_MSG.TERMINAL,
         requestId: authority.requestId,
@@ -837,6 +918,7 @@ export class RemoteDesktopWorkerHost {
 
   private untrack(sessionId: string): void {
     const authority = this.tracked.get(sessionId);
+    if (authority) this.clearPrepareReadyTimer(authority);
     authority?.capability.fill(0);
     this.tracked.delete(sessionId);
     this.stopVirtualDisplayIfUnused();
@@ -856,6 +938,8 @@ export class RemoteDesktopWorkerHost {
       // replacement can reuse, and a stale one would keep answering. The
       // authority is only detached from the map here — untrack() would wipe
       // the capability this same session still has to authenticate with.
+      this.clearPrepareReadyTimer(tracked);
+      tracked.prepareReady = false;
       this.tracked.delete(tracked.sessionId);
       await this.recycleWorkerSocket();
       await this.ensureStarted(forceSecureConsole);
@@ -864,6 +948,7 @@ export class RemoteDesktopWorkerHost {
       if (!socket || socket.destroyed) throw new Error('desktop_handover_unavailable');
       const sent = await this.writeToWorker(socket, tracked.prepare);
       if (!sent) throw new Error('desktop_handover_send_failed');
+      this.armPrepareReadyTimer(tracked.sessionId, socket);
       // The browser's peer died with the old worker. Its authority, lease and
       // input epoch all survive, so ask for a fresh peer on the same session
       // rather than making the viewer restart the whole grant.
@@ -892,8 +977,10 @@ export class RemoteDesktopWorkerHost {
         return;
       }
       tracked.usesVirtualDisplay = true;
+      tracked.prepareReady = false;
       const sent = await this.writeToWorker(this.socket, tracked.prepare);
       if (!sent) throw new Error('virtual_display_retry_send_failed');
+      this.armPrepareReadyTimer(tracked.sessionId, this.socket);
     } catch {
       if (this.tracked.get(tracked.sessionId) !== tracked) return;
       this.untrack(tracked.sessionId);
