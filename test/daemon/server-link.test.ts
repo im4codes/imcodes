@@ -37,10 +37,7 @@ import { TIMELINE_MESSAGES, TIMELINE_PROTOCOL_CAPABILITY } from '../../shared/ti
 import { TRANSPORT_EVENT } from '../../shared/transport-events.js';
 import { FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY } from '../../shared/transport/file-transfer.js';
 import { DAEMON_MSG } from '../../shared/daemon-events.js';
-import {
-  DIRECT_FILE_TRANSFER_AUTHENTICATED_ICE_CAPABILITY,
-  DIRECT_FILE_TRANSFER_CAPABILITY,
-} from '../../shared/direct-file-transfer.js';
+import { DIRECT_FILE_TRANSFER_REQUIRED_CAPABILITIES } from '../../shared/direct-file-transfer.js';
 import {
   DAEMON_UPGRADE_BLOCKED_ACK_DISPOSITION,
   DAEMON_UPGRADE_BLOCKED_SYNC_PROTOCOL,
@@ -181,12 +178,9 @@ describe('ServerLink', () => {
     expect(link.getDaemonCapabilities()).toContain(FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY);
   });
 
-  it('advertises authenticated ICE only together with an available direct-transfer runtime', () => {
+  it('advertises the complete direct-file v2 lease capability set only with an available runtime', () => {
     expect(directFileTransferDaemonCapabilities(false)).toEqual([]);
-    expect(directFileTransferDaemonCapabilities(true)).toEqual([
-      DIRECT_FILE_TRANSFER_CAPABILITY,
-      DIRECT_FILE_TRANSFER_AUTHENTICATED_ICE_CAPABILITY,
-    ]);
+    expect(directFileTransferDaemonCapabilities(true)).toEqual(DIRECT_FILE_TRANSFER_REQUIRED_CAPABILITIES);
   });
 
   it('send() adds monotonic seq counter', () => {

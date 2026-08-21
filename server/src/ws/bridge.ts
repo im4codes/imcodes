@@ -50,8 +50,7 @@ import { DirectFileTransferRouter } from './direct-file-transfer-router.js';
 import { RemoteDesktopRouter } from './remote-desktop-router.js';
 import { createTurnIceServerAuthority } from './turn-credentials.js';
 import {
-  DIRECT_FILE_TRANSFER_AUTHENTICATED_ICE_CAPABILITY,
-  DIRECT_FILE_TRANSFER_CAPABILITY,
+  DIRECT_FILE_TRANSFER_REQUIRED_CAPABILITIES,
   isDirectConnectivityRuntimeStatus,
 } from '../../../shared/direct-file-transfer.js';
 import { FS_TRANSPORT_MSG } from '../../../shared/fs-transport-messages.js';
@@ -1192,6 +1191,8 @@ export class WsBridge {
   private daemonWs: WebSocket | null = null;
   /** Bumped on every new daemon connection; binds pending MACHINE_EXEC results to a generation. */
   private daemonGeneration = 0;
+  /** Persistent JWT key used only for stateless direct-file lease resume tickets. */
+  private directFileTransferTicketSigningKey: string | null = null;
 
   /** Count of inbound frames dropped from CONTROLLED nodes by the 10.2 allowlist (diagnostics/tests). */
   static controlledInboundDropped = 0;
@@ -1340,13 +1341,11 @@ export class WsBridge {
       && this.daemonNodeRole === NODE_ROLE.FULL
       && this.daemonWs?.readyState === WebSocket.OPEN,
     ),
-    daemonSupportsDirect: () => this.daemonP2pWorkflowCapabilities?.capabilities.includes(
-      DIRECT_FILE_TRANSFER_CAPABILITY,
-    ) ?? false,
-    daemonSupportsAuthenticatedIce: () => this.daemonP2pWorkflowCapabilities?.capabilities.includes(
-      DIRECT_FILE_TRANSFER_AUTHENTICATED_ICE_CAPABILITY,
-    ) ?? false,
+    daemonSupportsDirect: () => DIRECT_FILE_TRANSFER_REQUIRED_CAPABILITIES.every((capability) => (
+      this.daemonP2pWorkflowCapabilities?.capabilities.includes(capability) ?? false
+    )),
     daemonGeneration: () => this.daemonGeneration,
+    resumeTicketSigningKey: () => this.directFileTransferTicketSigningKey,
     iceServers: (userId) => createTurnIceServerAuthority(userId),
     sendDaemon: (message, generation) => this.trySendDirectFileTransfer(message, generation),
     sendBrowser: (socket, message) => { safeSend(socket, JSON.stringify(message)); },
@@ -2613,6 +2612,7 @@ export class WsBridge {
 
   handleDaemonConnection(ws: WebSocket, db: Database, env: Env, onAuthenticated?: () => void): void {
     this.db = db;
+    this.directFileTransferTicketSigningKey = env.JWT_SIGNING_KEY;
     // Replace existing daemon connection
     if (this.daemonWs) {
       // `ws.close()` completes asynchronously in production. Reject the old

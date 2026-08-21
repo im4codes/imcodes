@@ -9,7 +9,7 @@ import {
   FILE_TRANSFER_MSG,
   FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY,
 } from '../../shared/transport/file-transfer.js';
-import { DIRECT_FILE_TRANSFER_CAPABILITY } from '../../shared/direct-file-transfer.js';
+import { DIRECT_FILE_TRANSFER_UPLOAD_RECOVERY_CAPABILITY } from '../../shared/direct-file-transfer.js';
 import {
   MACHINE_DIRECT_FILE_TRANSFER_CAPABILITY,
   MACHINE_DIRECT_FILE_FETCH_CAPABILITY,
@@ -686,7 +686,7 @@ describe('file-transfer upload route', () => {
     });
 
     expect(res.status).toBe(200);
-    expect(hasDaemonCapabilityMock).toHaveBeenCalledWith(DIRECT_FILE_TRANSFER_CAPABILITY);
+    expect(hasDaemonCapabilityMock).toHaveBeenCalledWith(DIRECT_FILE_TRANSFER_UPLOAD_RECOVERY_CAPABILITY);
     expect(sendFileTransferRequestMock.mock.calls[0]?.[1]).toEqual(expect.objectContaining({
       type: FILE_TRANSFER_MSG.UPLOAD_FETCH,
     }));

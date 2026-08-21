@@ -88,6 +88,18 @@ interface DownloadTarget {
   size: number;
 }
 
+/**
+ * A daemon-validated source for the direct-file data plane.  It deliberately
+ * contains the resolved daemon path only after the existing attachment-handle
+ * and file-preview checks have run; callers must never accept a browser path.
+ */
+export interface DirectFileDownloadSource {
+  readPath: string;
+  filename: string;
+  mime?: string;
+  size: number;
+}
+
 const attachmentRegistry = new Map<string, AttachmentEntry>();
 const clientUploadClaims = new Map<string, {
   token: symbol;
@@ -169,45 +181,23 @@ function sendDownloadError(
   serverLink.send(response);
 }
 
-async function resolveDownloadTarget(
-  attachmentId: string,
-  serverLink: FileTransferSender,
-  downloadId: string,
-): Promise<DownloadTarget | null> {
+export async function resolveDirectFileDownloadSource(attachmentId: string): Promise<DirectFileDownloadSource> {
   const entry = attachmentRegistry.get(attachmentId);
 
   if (!entry) {
-    const response: FileDownloadError = {
-      type: 'file.download_error',
-      downloadId,
-      message: 'not_found',
-    };
-    serverLink.send(response);
-    return null;
+    throw new Error('not_found');
   }
 
   if (Date.now() > entry.expiresAt) {
     attachmentRegistry.delete(attachmentId);
-    const response: FileDownloadError = {
-      type: 'file.download_error',
-      downloadId,
-      message: 'expired',
-    };
-    serverLink.send(response);
-    return null;
+    throw new Error('expired');
   }
 
   const resolved = path.resolve(entry.daemonPath);
   const uploadDirResolved = path.resolve(UPLOAD_DIR);
   const isUpload = resolved.startsWith(uploadDirResolved + path.sep);
   if (!isUpload && entry.source !== 'local') {
-    const response: FileDownloadError = {
-      type: 'file.download_error',
-      downloadId,
-      message: 'not_found',
-    };
-    serverLink.send(response);
-    return null;
+    throw new Error('not_found');
   }
 
   if (entry.source === 'local') {
@@ -227,12 +217,35 @@ async function resolveDownloadTarget(
   if (!fileStat.isFile()) throw new Error('download_failed');
 
   return {
-    entry,
     readPath,
     filename: entry.originalName || attachmentId,
     mime: entry.mime,
     size: fileStat.size,
   };
+}
+
+async function resolveDownloadTarget(
+  attachmentId: string,
+  serverLink: FileTransferSender,
+  downloadId: string,
+): Promise<DownloadTarget | null> {
+  const entry = attachmentRegistry.get(attachmentId);
+  try {
+    const source = await resolveDirectFileDownloadSource(attachmentId);
+    return { entry: entry!, ...source };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (message === 'not_found' || message === 'expired') {
+      serverLink.send({
+        type: 'file.download_error',
+        downloadId,
+        message,
+      } satisfies FileDownloadError);
+      return null;
+    }
+    sendDownloadError(serverLink, downloadId, attachmentId, entry, err);
+    return null;
+  }
 }
 
 export function resolveUploadPath(filename: string): string {

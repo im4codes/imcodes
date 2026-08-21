@@ -283,7 +283,6 @@ describe('shared-context and file API contracts', () => {
     const fetchMock = vi.mocked(fetch);
     fetchMock
       .mockResolvedValueOnce(jsonResponse({ ok: true }))
-      .mockResolvedValueOnce(blobResponse('download'))
       .mockResolvedValueOnce(blobResponse('preview'));
     Object.defineProperty(URL, 'createObjectURL', { configurable: true, value: vi.fn(() => 'blob:shared') });
     Object.defineProperty(URL, 'revokeObjectURL', { configurable: true, value: vi.fn() });
@@ -305,7 +304,6 @@ describe('shared-context and file API contracts', () => {
 
     expect(fetchMock.mock.calls.map(([url]) => String(url))).toEqual([
       'https://api.example/api/server/srv-1/uploads/att-delete?sessionName=deck_project_brain',
-      'https://api.example/api/server/srv-1/uploads/att-download/download?sessionName=deck_project_brain',
       'https://api.example/api/server/srv-1/uploads/att-preview/download?sessionName=deck_project_brain',
     ]);
   });
@@ -314,9 +312,6 @@ describe('shared-context and file API contracts', () => {
     vi.useFakeTimers();
     const fetchMock = vi.mocked(fetch);
     fetchMock
-      .mockResolvedValueOnce(blobResponse('desktop', {
-        'Content-Disposition': "attachment; filename*=UTF-8''report%20final.txt",
-      }))
       .mockResolvedValueOnce(blobResponse('preview'))
       .mockResolvedValueOnce(jsonResponse({ token: 'x'.repeat(32) }))
       .mockResolvedValueOnce(jsonResponse({ token: 'y'.repeat(32) }));
@@ -359,6 +354,25 @@ describe('shared-context and file API contracts', () => {
     await expect(buildAttachmentDownloadUrl('srv-1', 'att-media')).resolves.toBe(
       `https://api.example/api/server/srv-1/uploads/att-media/download?token=${'y'.repeat(32)}`,
     );
-    expect(objectUrlSpy).toHaveBeenCalledTimes(2);
+    expect(objectUrlSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('streams File Browser fallback bytes into its provided writable without creating a Blob', async () => {
+    const fetchMock = vi.mocked(fetch);
+    fetchMock.mockResolvedValueOnce(new Response(new Uint8Array([1, 2, 3, 4]), { status: 200 }));
+    const write = vi.fn().mockResolvedValue(undefined);
+    const objectUrlSpy = vi.fn();
+    Object.defineProperty(URL, 'createObjectURL', { configurable: true, value: objectUrlSpy });
+    const { configure, streamAttachmentDownloadToWritable } = await import('../src/api.js');
+    configure('https://api.example');
+
+    await streamAttachmentDownloadToWritable('srv-1', 'att-stream', { write }, 'deck_project_brain');
+
+    expect((write.mock.calls[0]?.[0] as Uint8Array | undefined)?.byteLength).toBe(4);
+    expect(objectUrlSpy).not.toHaveBeenCalled();
+    expect(fetchMock).toHaveBeenCalledWith(
+      'https://api.example/api/server/srv-1/uploads/att-stream/download?sessionName=deck_project_brain',
+      expect.any(Object),
+    );
   });
 });

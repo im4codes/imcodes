@@ -12,7 +12,6 @@ import {
   mapRemoteDesktopVideoPoint,
   type RemoteDesktopNormalizedPoint,
 } from '@shared/remote-desktop.js';
-import { DIRECT_FILE_TRANSFER_STATE } from '@shared/direct-file-transfer.js';
 import {
   FILE_TRANSFER_DIRECTORY_CAPABILITY,
   FILE_TRANSFER_DIRECTORY_PATH,
@@ -21,6 +20,7 @@ import { downloadAttachment } from '../api.js';
 import { createMachineFileHandle, type MachineListItem } from '../api/machines.js';
 import { MachineDirectoryWsAdapter } from '../machine-directory-ws-adapter.js';
 import {
+  FILE_UPLOAD_TRANSPORT_MODE,
   isFileUploadCanceled,
   uploadFileWithDirectFallback,
   type FileUploadTransportMode,
@@ -1551,7 +1551,7 @@ export function RemoteDesktopPanel({
       id,
       name: file.name || 'file',
       progress: 0,
-      transport: DIRECT_FILE_TRANSFER_STATE.CONNECTING,
+      transport: FILE_UPLOAD_TRANSPORT_MODE.CONNECTING,
       status: 'transferring',
       sizeBytes: file.size,
       sampledAt: Date.now(),
@@ -1625,7 +1625,7 @@ export function RemoteDesktopPanel({
       id,
       name: path,
       progress: 0,
-      transport: DIRECT_FILE_TRANSFER_STATE.RELAY,
+      transport: FILE_UPLOAD_TRANSPORT_MODE.RELAY,
       status: 'transferring',
     }]);
     setTransferError(null);

@@ -1596,23 +1596,23 @@ export async function deleteAttachment(serverId: string, attachmentId: string, s
   });
 }
 
-export async function downloadAttachment(
+export interface AttachmentDownloadWritable {
+  write(data: BufferSource): Promise<void>;
+}
+
+/**
+ * Stream an attachment response into a caller-owned writable sink.  This is
+ * used by File Browser's direct-download HTTP fallback so multi-GiB files
+ * never accumulate in a Blob.
+ */
+export async function streamAttachmentDownloadToWritable(
   serverId: string,
   attachmentId: string,
+  writable: AttachmentDownloadWritable,
   sessionName?: string,
   signal?: AbortSignal,
 ): Promise<void> {
   if (signal?.aborted) throw new DOMException('download_canceled', 'AbortError');
-  // Native: skip blob fetch — WebViews can't reliably trigger downloads from blob URLs.
-  // Get a one-time token and open in system browser which handles save natively.
-  if (isNative()) {
-    const downloadUrl = await buildAttachmentDownloadUrl(serverId, attachmentId, sessionName);
-    const { Browser } = await import('@capacitor/browser');
-    await Browser.open({ url: downloadUrl });
-    return;
-  }
-
-  // Desktop: fetch blob and trigger <a download>
   const res = await rawFetch(
     withSessionName(`/api/server/${encodeURIComponent(serverId)}/uploads/${encodeURIComponent(attachmentId)}/download`, sessionName),
     { signal },
@@ -1621,33 +1621,52 @@ export async function downloadAttachment(
     const body = await res.text().catch(() => '');
     throw new ApiError(res.status, body);
   }
-  const blob = await res.blob();
-  if (signal?.aborted) throw new DOMException('download_canceled', 'AbortError');
-  const disposition = res.headers.get('Content-Disposition');
-  let filename = attachmentId;
-  if (disposition) {
-    const starMatch = disposition.match(/filename\*\s*=\s*UTF-8''([^\s;]+)/i);
-    if (starMatch) {
-      try { filename = decodeURIComponent(starMatch[1]); } catch { /* keep default */ }
-    } else {
-      const plainMatch = disposition.match(/filename="([^"]+)"/);
-      if (plainMatch) filename = plainMatch[1];
+  if (!res.body) throw new ApiError(res.status, 'download_stream_unavailable');
+  const reader = res.body.getReader();
+  try {
+    for (;;) {
+      if (signal?.aborted) throw new DOMException('download_canceled', 'AbortError');
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value?.byteLength) await writable.write(value);
     }
+  } catch (error) {
+    await reader.cancel(error).catch(() => undefined);
+    throw error;
+  } finally {
+    reader.releaseLock();
   }
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = filename;
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  URL.revokeObjectURL(url);
 }
 
-/**
- * Synchronously pre-open an isolated desktop download window while the user
- * gesture is still active. Call this at click entry before any await.
- */
+export async function downloadAttachment(
+  serverId: string,
+  attachmentId: string,
+  sessionName?: string,
+  signal?: AbortSignal,
+): Promise<void> {
+  if (signal?.aborted) throw new DOMException('download_canceled', 'AbortError');
+  // Native: acquire a one-time token and hand off to the system browser.
+  if (isNative()) {
+    const downloadUrl = await buildAttachmentDownloadUrl(serverId, attachmentId, sessionName);
+    const { Browser } = await import('@capacitor/browser');
+    await Browser.open({ url: downloadUrl });
+    return;
+  }
+
+  // Let the browser stream the authenticated HTTP response itself.  The old
+  // fetch→Blob→object-URL path made a large fallback consume the entire file
+  // in renderer memory.
+  const url = await buildAttachmentDownloadUrl(serverId, attachmentId, sessionName);
+  if (signal?.aborted) throw new DOMException('download_canceled', 'AbortError');
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = '';
+  anchor.style.display = 'none';
+  document.body.appendChild(anchor);
+  anchor.click();
+  document.body.removeChild(anchor);
+}
+
 export function beginControlledNodeDesktopDownload(): Window {
   // Including `noopener` in windowFeatures makes some browsers deliberately
   // return null even when the tab opens, which is indistinguishable from a

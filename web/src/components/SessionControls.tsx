@@ -53,7 +53,7 @@ import { useSupervisorDefaults } from '../hooks/useSupervisorDefaults.js';
 import { PREF_KEY_P2P_COMBO_CONFIRM_SKIP, PREF_KEY_P2P_DROPDOWN_TAB, p2pSessionConfigLegacyPrefKeys, p2pSessionConfigPrefKey } from '../constants/prefs.js';
 import { parseP2pSavedConfig, serializeP2pSavedConfig } from '../preferences/p2p-config-pref.js';
 import { sendSessionViaHttp, cancelSessionViaHttp, deleteAttachment } from '../api.js';
-import { DirectFileTransferFailure, isFileUploadCanceled, uploadFileWithDirectFallback, type FileUploadTransportMode } from '../direct-file-transfer.js';
+import { DirectFileTransferFailure, FILE_UPLOAD_TRANSPORT_MODE, isFileUploadCanceled, uploadFileWithDirectFallback, type FileUploadTransportMode } from '../direct-file-transfer.js';
 import { patchSession, patchSessionSupervision, patchSubSession } from '../api.js';
 import { isImeComposingKeyEvent } from '../ime-keyboard.js';
 import { deriveSessionLiveStatus, isRunningSessionState } from '../session-live-status.js';
@@ -101,7 +101,6 @@ import {
   type SupervisionMode,
 } from '@shared/supervision-config.js';
 import { FILE_TRANSFER_LIMITS } from '@shared/transport/file-transfer.js';
-import { DIRECT_FILE_TRANSFER_STATE } from '@shared/direct-file-transfer.js';
 import { shouldHideOptimisticUserMessageForSessionControl } from '@shared/session-control-commands.js';
 import type { SharedActorEnvelope } from '@shared/tab-sharing.js';
 import { EXECUTION_CLONE_KIND } from '@shared/execution-clone.js';
@@ -772,10 +771,10 @@ function updateComposerUploadTransport(
   updateComposerUploadSnapshot(key, {
     uploads: entry.snapshot.uploads.map((item) => {
       if (item.id !== id || item.transport === transport) return item;
-      const enteringDirect = transport === DIRECT_FILE_TRANSFER_STATE.DIRECT;
-      const restartingForRelay = transport === DIRECT_FILE_TRANSFER_STATE.FALLING_BACK
-        || (transport === DIRECT_FILE_TRANSFER_STATE.RELAY
-          && item.transport !== DIRECT_FILE_TRANSFER_STATE.FALLING_BACK);
+      const enteringDirect = transport === FILE_UPLOAD_TRANSPORT_MODE.DIRECT;
+      const restartingForRelay = transport === FILE_UPLOAD_TRANSPORT_MODE.FALLING_BACK
+        || (transport === FILE_UPLOAD_TRANSPORT_MODE.RELAY
+          && item.transport !== FILE_UPLOAD_TRANSPORT_MODE.FALLING_BACK);
       const resetPhase = enteringDirect || restartingForRelay;
       return {
         ...item,
@@ -4416,7 +4415,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         name: file.name || 'file',
         progress: 0,
         status: 'uploading' as const,
-        transport: DIRECT_FILE_TRANSFER_STATE.CONNECTING,
+        transport: FILE_UPLOAD_TRANSPORT_MODE.CONNECTING,
         totalBytes: file.size,
         startedAt: now,
         lastSampleAt: now,

@@ -22,7 +22,10 @@ import {
 } from '../../../shared/tab-sharing.js';
 import { REPO_MSG } from '../../../shared/repo-types.js';
 import { TIMELINE_MESSAGES } from '../../../shared/timeline-protocol.js';
-import { DIRECT_FILE_TRANSFER_MSG } from '../../../shared/direct-file-transfer.js';
+import {
+  DIRECT_FILE_TRANSFER_DIRECTION,
+  DIRECT_FILE_TRANSFER_MSG,
+} from '../../../shared/direct-file-transfer.js';
 import { TRANSPORT_QUEUE_COMMANDS } from '../../../shared/transport-queue-types.js';
 
 export { shareTargetKey };
@@ -76,6 +79,12 @@ type ShareCommandPolicy =
   | { kind: 'participant-model-list' }
   | { kind: 'participant-p2p-config-save' }
   | { kind: 'participant-cancel' }
+  /** An inert lease contains no file authority and is deliberately role-neutral. */
+  | { kind: 'direct-file-lease' }
+  /** Direction selects FILE_WRITE (upload) or FILE_READ (preview download). */
+  | { kind: 'direct-file-operation' }
+  /** Router-owned, exact bound-operation follow-up (cancel/status). */
+  | { kind: 'direct-file-bound-operation' }
   | { kind: 'deny'; reason: ShareReason };
 
 export type ShareBridgeCommandInventoryEntry = {
@@ -145,11 +154,21 @@ export const SHARE_WS_COMMAND_POLICY_INVENTORY: readonly ShareBridgeCommandInven
   { bridgeCommand: 'fs.write', sharedCommand: SHARE_BROWSER_COMMANDS.FILE_WRITE, policy: { kind: 'participant-covered-action' } },
   { bridgeCommand: FS_TRANSPORT_MSG.RENAME, sharedCommand: SHARE_BROWSER_COMMANDS.FILE_EDIT, policy: { kind: 'participant-covered-action' } },
   { bridgeCommand: FS_TRANSPORT_MSG.DELETE, sharedCommand: SHARE_BROWSER_COMMANDS.FILE_DELETE, policy: { kind: 'participant-covered-action' } },
-  { bridgeCommand: DIRECT_FILE_TRANSFER_MSG.INIT, sharedCommand: SHARE_BROWSER_COMMANDS.FILE_WRITE, policy: { kind: 'participant-covered-action' } },
-  { bridgeCommand: DIRECT_FILE_TRANSFER_MSG.OFFER, sharedCommand: SHARE_BROWSER_COMMANDS.FILE_WRITE, policy: { kind: 'participant-bound-action' } },
-  { bridgeCommand: DIRECT_FILE_TRANSFER_MSG.ICE, sharedCommand: SHARE_BROWSER_COMMANDS.FILE_WRITE, policy: { kind: 'participant-bound-action' } },
-  { bridgeCommand: DIRECT_FILE_TRANSFER_MSG.CANCEL, sharedCommand: SHARE_BROWSER_COMMANDS.FILE_WRITE, policy: { kind: 'participant-bound-action' } },
-  { bridgeCommand: DIRECT_FILE_TRANSFER_MSG.STATUS_QUERY, sharedCommand: SHARE_BROWSER_COMMANDS.FILE_WRITE, policy: { kind: 'participant-bound-action' } },
+  // A v2 lease is deliberately inert: it contains no session, preview handle,
+  // upload metadata, or file authority.  Do not accidentally turn prewarm or
+  // rebind into FILE_READ/FILE_WRITE authorization here.
+  { bridgeCommand: DIRECT_FILE_TRANSFER_MSG.LEASE_INIT, sharedCommand: SHARE_BROWSER_COMMANDS.FILE_READ, policy: { kind: 'direct-file-lease' } },
+  { bridgeCommand: DIRECT_FILE_TRANSFER_MSG.LEASE_REBIND, sharedCommand: SHARE_BROWSER_COMMANDS.FILE_READ, policy: { kind: 'direct-file-lease' } },
+  { bridgeCommand: DIRECT_FILE_TRANSFER_MSG.LEASE_OFFER, sharedCommand: SHARE_BROWSER_COMMANDS.FILE_READ, policy: { kind: 'direct-file-lease' } },
+  { bridgeCommand: DIRECT_FILE_TRANSFER_MSG.LEASE_ICE, sharedCommand: SHARE_BROWSER_COMMANDS.FILE_READ, policy: { kind: 'direct-file-lease' } },
+  // This entry names FILE_READ for inventory coverage; evaluation below maps
+  // upload to FILE_WRITE and preview download to FILE_READ from the validated
+  // direction field before the frame reaches the direct-file router.
+  { bridgeCommand: DIRECT_FILE_TRANSFER_MSG.OPERATION_INIT, sharedCommand: SHARE_BROWSER_COMMANDS.FILE_READ, policy: { kind: 'direct-file-operation' } },
+  // These frames carry no operation selector beyond router-owned exact
+  // bindings.  The router rechecks user/tab/lease/attempt before forwarding.
+  { bridgeCommand: DIRECT_FILE_TRANSFER_MSG.CANCEL, sharedCommand: SHARE_BROWSER_COMMANDS.FILE_READ, policy: { kind: 'direct-file-bound-operation' } },
+  { bridgeCommand: DIRECT_FILE_TRANSFER_MSG.STATUS_QUERY, sharedCommand: SHARE_BROWSER_COMMANDS.FILE_READ, policy: { kind: 'direct-file-bound-operation' } },
 
   { bridgeCommand: 'session.start', sharedCommand: SHARE_BROWSER_COMMANDS.SESSION_START, policy: denyFromShared(SHARE_BROWSER_COMMANDS.SESSION_START) },
   { bridgeCommand: 'session.stop', sharedCommand: SHARE_BROWSER_COMMANDS.SESSION_STOP, policy: denyFromShared(SHARE_BROWSER_COMMANDS.SESSION_STOP) },
@@ -193,6 +212,22 @@ function assertShareCommandInventoryEntry(entry: ShareBridgeCommandInventoryEntr
   if (entry.policy.kind === 'allow-covered-read') {
     if (entry.policy.requireTarget !== (sharedPolicy.scope === 'concrete-tab')) {
       throw new Error(`Share WS command ${entry.bridgeCommand} target requirement does not match shared policy`);
+    }
+    return;
+  }
+  if (entry.policy.kind === 'direct-file-lease' || entry.policy.kind === 'direct-file-bound-operation') {
+    if (sharedPolicy.minRole !== undefined) {
+      throw new Error(`Inert/bound direct-file frame ${entry.bridgeCommand} must not grant participant-only file access`);
+    }
+    return;
+  }
+  if (entry.policy.kind === 'direct-file-operation') {
+    if (sharedPolicy.minRole !== undefined) {
+      throw new Error('Direct preview download must retain viewer FILE_READ policy');
+    }
+    const writePolicy = getShareScopedCommandPolicy(SHARE_BROWSER_COMMANDS.FILE_WRITE);
+    if (writePolicy.disposition !== 'allow' || writePolicy.minRole !== 'participant') {
+      throw new Error('Direct upload must be covered by participant FILE_WRITE policy');
     }
     return;
   }
@@ -359,6 +394,35 @@ export function evaluateShareCommand(input: {
     return shareStateCoversSession(input.state, sessionName)
       ? { allowed: true }
       : { allowed: false, reason: SHARE_REASONS.DIRECT_SURFACE_DENIED };
+  }
+
+  if (policy.kind === 'direct-file-lease') {
+    // The lease is intentionally capability-free.  A viewer may prewarm it,
+    // but it never grants access to an upload or preview source.
+    return { allowed: true };
+  }
+
+  if (policy.kind === 'direct-file-bound-operation') {
+    // Cancel/status do not carry a session name; the direct-file router binds
+    // them to the authenticated socket's previously authorized exact attempt.
+    // Allowing them here does not create a file authority or disclose a path.
+    return { allowed: true };
+  }
+
+  if (policy.kind === 'direct-file-operation') {
+    const direction = input.msg.direction;
+    if (direction !== DIRECT_FILE_TRANSFER_DIRECTION.UPLOAD && direction !== DIRECT_FILE_TRANSFER_DIRECTION.DOWNLOAD) {
+      return { allowed: false, reason: SHARE_REASONS.DIRECT_SURFACE_DENIED };
+    }
+    if (!sessionName || !shareStateCoversSession(input.state, sessionName)) {
+      return { allowed: false, reason: SHARE_REASONS.DIRECT_SURFACE_DENIED };
+    }
+    // Preview download is FILE_READ: viewers with covered scope may use it.
+    // Upload is FILE_WRITE and therefore remains participant-only.
+    if (direction === DIRECT_FILE_TRANSFER_DIRECTION.UPLOAD && input.state.snapshot.effectiveRole !== 'participant') {
+      return { allowed: false, reason: SHARE_REASONS.ROLE_DENIED };
+    }
+    return { allowed: true };
   }
 
   if (input.state.snapshot.effectiveRole !== 'participant') {

@@ -24,7 +24,11 @@ import { REPO_MSG } from '../../shared/repo-types.js';
 import { FS_SESSION_ROOT_PATH } from '../../src/shared/transport/fs.js';
 import { resetSharedCommandRateLimitsForTests } from '../src/share/share-rate-limit.js';
 import { TIMELINE_MESSAGES } from '../../shared/timeline-protocol.js';
-import { DIRECT_FILE_TRANSFER_MSG } from '../../shared/direct-file-transfer.js';
+import {
+  DIRECT_FILE_TRANSFER_DIRECTION,
+  DIRECT_FILE_TRANSFER_MSG,
+  DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+} from '../../shared/direct-file-transfer.js';
 import { MSG_COMMAND_ACK } from '../../shared/ack-protocol.js';
 import { TRANSPORT_QUEUE_COMMANDS } from '../../shared/transport-queue-types.js';
 
@@ -180,7 +184,7 @@ describe('WsBridge share-scoped sockets', () => {
     resetSharedCommandRateLimitsForTests();
   });
 
-  it('allows direct upload initiation only for participants inside the covered session', () => {
+  it('maps direct upload to covered participant FILE_WRITE and preview download to covered FILE_READ', () => {
     const target: ShareTarget = { kind: 'main', serverId, sessionName: 'deck_proj_brain' };
     const makeState = (role: 'viewer' | 'participant') => ({
       userId: 'shared-user',
@@ -191,8 +195,18 @@ describe('WsBridge share-scoped sockets', () => {
       connectedAt: now,
     });
     const init = {
-      type: DIRECT_FILE_TRANSFER_MSG.INIT,
+      type: DIRECT_FILE_TRANSFER_MSG.OPERATION_INIT,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      serverId,
+      browserTabId: 'browser-tab-a1',
+      leaseId: 'lease-id-a1',
+      leaseGeneration: 1,
+      daemonGeneration: 1,
       requestId: '123e4567-e89b-12d3-a456-426614174000',
+      attemptId: '123e4567-e89b-12d3-a456-426614174002',
+      attempt: 1,
+      direction: DIRECT_FILE_TRANSFER_DIRECTION.UPLOAD,
+      operationId: '123e4567-e89b-12d3-a456-426614174001',
       clientUploadId: '123e4567-e89b-12d3-a456-426614174001',
       filename: 'shared.bin',
       size: 10,
@@ -220,6 +234,23 @@ describe('WsBridge share-scoped sockets', () => {
       runtimeType: 'transport',
       activeDispatchId: null,
     })).toEqual({ allowed: false, reason: SHARE_REASONS.DIRECT_SURFACE_DENIED });
+
+    const download = {
+      ...init,
+      direction: DIRECT_FILE_TRANSFER_DIRECTION.DOWNLOAD,
+      clientDownloadId: init.operationId,
+      previewHandle: 'preview-handle-1',
+    };
+    delete (download as { clientUploadId?: string; filename?: string; size?: number }).clientUploadId;
+    delete (download as { filename?: string }).filename;
+    delete (download as { size?: number }).size;
+    expect(evaluateShareCommand({
+      msg: download,
+      state: makeState('viewer'),
+      now,
+      runtimeType: 'transport',
+      activeDispatchId: null,
+    })).toEqual({ allowed: true });
   });
 
   afterEach(() => {

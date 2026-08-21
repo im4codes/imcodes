@@ -40,7 +40,12 @@ import { TIMELINE_PAYLOAD_BUDGET_BYTES } from '../../shared/timeline-payload-bud
 import { OPENSPEC_AUTO_DELIVER_MSG } from '../../shared/openspec-auto-deliver-constants.js';
 import { EXECUTION_CLONE_KIND } from '../../shared/execution-clone.js';
 import { DAEMON_MSG } from '../../shared/daemon-events.js';
-import { DIRECT_FILE_TRANSFER_CAPABILITY, DIRECT_FILE_TRANSFER_MSG } from '../../shared/direct-file-transfer.js';
+import {
+  DIRECT_FILE_TRANSFER_DIRECTION,
+  DIRECT_FILE_TRANSFER_MSG,
+  DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+  DIRECT_FILE_TRANSFER_REQUIRED_CAPABILITIES,
+} from '../../shared/direct-file-transfer.js';
 import {
   DAEMON_UPGRADE_BLOCKED_ACK_DISPOSITION,
   DAEMON_UPGRADE_BLOCKED_SYNC_PROTOCOL,
@@ -321,6 +326,17 @@ function makeTimelineOwnershipDb(options: {
 vi.mock('../src/security/crypto.js', () => ({
   sha256Hex: (_s: string) => 'valid-hash',
   randomHex: (bytes: number) => 'a'.repeat(bytes * 2),
+  // The bridge fixture replaces crypto globally; keep its ticket seam
+  // structurally valid so the direct-file route tests the actual rebind flow.
+  signJwt: (payload: Record<string, unknown>) => `header.${Buffer.from(JSON.stringify(payload)).toString('base64url')}.signature`,
+  verifyJwt: (ticket: string) => {
+    try {
+      const payload = ticket.split('.')[1];
+      return payload ? JSON.parse(Buffer.from(payload, 'base64url').toString('utf8')) as Record<string, unknown> : null;
+    } catch {
+      return null;
+    }
+  },
 }));
 
 vi.mock('../src/routes/push.js', () => ({
@@ -7420,13 +7436,13 @@ describe('WsBridge', () => {
       const browserA = new MockWs();
       const browserB = new MockWs();
       const db = makeDb('valid-hash');
-      bridge.handleDaemonConnection(daemonWs as never, db, {} as never);
+      bridge.handleDaemonConnection(daemonWs as never, db, { JWT_SIGNING_KEY: 'test-direct-file-resume-signing-key' } as never);
       daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
       await flushAsync();
       daemonWs.emit('message', JSON.stringify({
         type: P2P_WORKFLOW_MSG.DAEMON_HELLO,
         daemonId: serverId,
-        capabilities: [DIRECT_FILE_TRANSFER_CAPABILITY],
+        capabilities: [...DIRECT_FILE_TRANSFER_REQUIRED_CAPABILITIES],
         helloEpoch: 1,
         sentAt: Date.now(),
       }));
@@ -7439,9 +7455,74 @@ describe('WsBridge', () => {
 
       const requestId = '123e4567-e89b-12d3-a456-426614174000';
       const clientUploadId = '123e4567-e89b-12d3-a456-426614174001';
+      const browserTabId = 'browser-tab-a1';
       browserA.emit('message', JSON.stringify({
-        type: DIRECT_FILE_TRANSFER_MSG.INIT,
+        type: DIRECT_FILE_TRANSFER_MSG.LEASE_INIT,
+        protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
         requestId,
+        serverId,
+        browserTabId,
+      }));
+      await flushAsync();
+      const leasePrepare = daemonWs.sentStrings.map((row) => JSON.parse(row)).find((row) => row.type === DIRECT_FILE_TRANSFER_MSG.LEASE_PREPARE);
+      expect(leasePrepare).toMatchObject({ requestId, serverId, browserTabId });
+      expect(browserA.sentStrings.some((row) => row.includes(DIRECT_FILE_TRANSFER_MSG.LEASE_READY))).toBe(false);
+
+      daemonWs.emit('message', JSON.stringify({
+        type: DIRECT_FILE_TRANSFER_MSG.LEASE_PREPARED,
+        protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+        requestId,
+        serverId,
+        browserTabId,
+        leaseId: leasePrepare.leaseId,
+        leaseGeneration: leasePrepare.leaseGeneration,
+        daemonGeneration: leasePrepare.daemonGeneration,
+      }));
+      await flushAsync();
+      const ready = browserA.sentStrings.map((row) => JSON.parse(row)).find((row) => row.type === DIRECT_FILE_TRANSFER_MSG.LEASE_READY);
+      expect(ready).toMatchObject({ requestId, serverId, leaseId: leasePrepare.leaseId });
+
+      browserA.emit('message', JSON.stringify({
+        type: DIRECT_FILE_TRANSFER_MSG.LEASE_OFFER,
+        protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+        requestId: '123e4567-e89b-12d3-a456-426614174003',
+        serverId,
+        browserTabId,
+        leaseId: ready.leaseId,
+        leaseGeneration: ready.leaseGeneration,
+        daemonGeneration: ready.daemonGeneration,
+        sdp: 'browser-offer',
+      }));
+      await flushAsync();
+      expect(daemonWs.sentStrings.some((row) => row.includes('browser-offer'))).toBe(true);
+      daemonWs.emit('message', JSON.stringify({
+        type: DIRECT_FILE_TRANSFER_MSG.LEASE_ANSWER,
+        protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+        requestId: '123e4567-e89b-12d3-a456-426614174004',
+        serverId,
+        browserTabId,
+        leaseId: ready.leaseId,
+        leaseGeneration: ready.leaseGeneration,
+        daemonGeneration: ready.daemonGeneration,
+        sdp: 'daemon-answer',
+      }));
+      await flushAsync();
+      expect(browserA.sentStrings.some((row) => row.includes('daemon-answer'))).toBe(true);
+      expect(browserB.sentStrings.some((row) => row.includes('daemon-answer'))).toBe(false);
+
+      browserA.emit('message', JSON.stringify({
+        type: DIRECT_FILE_TRANSFER_MSG.OPERATION_INIT,
+        protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+        serverId,
+        browserTabId,
+        leaseId: ready.leaseId,
+        leaseGeneration: ready.leaseGeneration,
+        daemonGeneration: ready.daemonGeneration,
+        requestId: '123e4567-e89b-12d3-a456-426614174005',
+        attemptId: '123e4567-e89b-12d3-a456-426614174006',
+        attempt: 1,
+        direction: DIRECT_FILE_TRANSFER_DIRECTION.UPLOAD,
+        operationId: clientUploadId,
         clientUploadId,
         filename: 'large.bin',
         size: 5 * 1024 * 1024 * 1024,
@@ -7449,18 +7530,8 @@ describe('WsBridge', () => {
       await flushAsync();
       const prepare = daemonWs.sentStrings.map((row) => JSON.parse(row)).find((row) => row.type === DIRECT_FILE_TRANSFER_MSG.PREPARE);
       const authorized = browserA.sentStrings.map((row) => JSON.parse(row)).find((row) => row.type === DIRECT_FILE_TRANSFER_MSG.AUTHORIZED);
-      expect(prepare).toMatchObject({ requestId, clientUploadId, size: 5 * 1024 * 1024 * 1024 });
-      expect(authorized).toMatchObject({ requestId, clientUploadId });
-
-      daemonWs.emit('message', JSON.stringify({
-        type: DIRECT_FILE_TRANSFER_MSG.ANSWER,
-        requestId,
-        capability: authorized.capability,
-        sdp: 'daemon-answer',
-      }));
-      await flushAsync();
-      expect(browserA.sentStrings.some((row) => row.includes('daemon-answer'))).toBe(true);
-      expect(browserB.sentStrings.some((row) => row.includes('daemon-answer'))).toBe(false);
+      expect(prepare).toMatchObject({ clientUploadId, size: 5 * 1024 * 1024 * 1024 });
+      expect(authorized).toMatchObject({ clientUploadId });
     });
   });
 });

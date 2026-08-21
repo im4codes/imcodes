@@ -28,6 +28,12 @@ import { ImageLightbox } from './ImageLightbox.js';
 import type { ChatLocalImagePreviewLoader } from './ChatLocalImagePreview.js';
 import { buildAttachmentDownloadUrl, downloadAttachment } from '../api.js';
 import {
+  downloadPreviewWithDirectFallback,
+  isDirectFileTransferStaleHandleError,
+  prewarmDirectFileLease,
+  selectPreviewDownloadDestination,
+} from '../direct-file-transfer.js';
+import {
   getSharedChangesKey,
   subscribeSharedChanges,
   subscribeSharedChangesStatus,
@@ -1332,6 +1338,16 @@ export function FileBrowser({
     fetchDir(startPath);
   }, [clearAllPendingPreviewRequests, fetchDir, includeFiles, serverId, showHidden, startPath]);
 
+  // Opening a File Browser is the only eager direct-file action.  This creates
+  // an inert tab+daemon lease (no path, handle, session scope, or file
+  // authority), so the first explicit upload/download does not pay a second
+  // WebRTC setup round trip.  A chat/conversation by itself never mounts this
+  // component and therefore cannot allocate a file-transfer peer.
+  useEffect(() => {
+    if (!serverId) return;
+    return prewarmDirectFileLease(ws, serverId);
+  }, [serverId, ws]);
+
   useEffect(() => {
     if (!changesRootPath) return;
     const cacheKey = getSharedChangesKey(ws, changesRootPath);
@@ -1690,18 +1706,40 @@ export function FileBrowser({
   }, [canRenderHtml, isEditing, isHtmlRenderMode, preview]);
 
   const downloadCurrentPreview = useCallback(async () => {
-    if (!serverId || preview.status === 'idle' || !('downloadId' in preview) || !preview.downloadId) return;
+    if (!serverId || preview.status === 'idle' || !('downloadId' in preview) || !preview.downloadId || !('path' in preview)) return;
+    // Keep the exact preview identity that the click authorized.  A stale
+    // handle refresh is permitted once, but it must never download a file the
+    // user navigated away from while the read request was in flight.
+    const selectedPath = preview.path;
+    const selectedHandle = preview.downloadId;
     setDownloadError(null);
+    // The picker must run inside this click handler.  We retain the approved
+    // handle through the one stale-preview refresh so it never prompts twice
+    // and every direct/HTTP retry streams into the same user-selected file.
+    const destination = await selectPreviewDownloadDestination(
+      selectedPath.split(/[/\\]/).pop() || undefined,
+    );
+    const download = async (handle: string) => downloadPreviewWithDirectFallback({
+      ws,
+      serverId,
+      previewHandle: handle,
+      suggestedName: selectedPath.split(/[/\\]/).pop() || undefined,
+      sessionName,
+      destination,
+      // HTTP remains the documented fallback only.  The direct helper owns
+      // retry classification and calls this at most once when it is eligible.
+      httpFallback: () => downloadAttachment(serverId, handle, sessionName),
+    });
     try {
-      await downloadAttachment(serverId, preview.downloadId, sessionName);
+      await download(selectedHandle);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      const isStaleHandle = msg.includes('410') || msg.includes('expired') || msg.includes('not_found') || msg.includes('404');
-      // Stale handle: silently re-request file to get a fresh downloadId, then auto-retry.
-      if (isStaleHandle && 'path' in preview) {
+      const isStaleHandle = isDirectFileTransferStaleHandleError(err)
+        || msg.includes('410') || msg.includes('expired') || msg.includes('not_found') || msg.includes('404');
+      if (isStaleHandle) {
         try {
           const freshId = await new Promise<string>((resolve, reject) => {
-            const requestId = scopedSessionName ? ws.fsReadFile(preview.path, scopedSessionName) : ws.fsReadFile(preview.path);
+            const requestId = scopedSessionName ? ws.fsReadFile(selectedPath, scopedSessionName) : ws.fsReadFile(selectedPath);
             const timer = setTimeout(() => reject(new Error('timeout')), 10_000);
             const off = ws.onMessage((m) => {
               if (m.type !== 'fs.read_response' || !('requestId' in m) || m.requestId !== requestId) return;
@@ -1711,13 +1749,20 @@ export function FileBrowser({
               else reject(new Error('no_handle'));
             });
           });
+          // A selection/path switch during the refresh makes this action a
+          // no-op rather than accidentally saving another preview's file.
+          const stillSelected = previewRef.current;
+          if (stillSelected.status === 'idle' || !('downloadId' in stillSelected)
+            || stillSelected.path !== selectedPath || stillSelected.downloadId !== selectedHandle) {
+            return;
+          }
           setPreview((prev) => {
-            if (prev.status === 'idle' || !('path' in prev)) return prev;
+            if (prev.status === 'idle' || !('downloadId' in prev) || prev.path !== selectedPath || prev.downloadId !== selectedHandle) return prev;
             return { ...prev, downloadId: freshId } as typeof prev;
           });
-          await downloadAttachment(serverId, freshId, sessionName);
+          await download(freshId);
           return;
-        } catch { /* retry failed — fall through to show error */ }
+        } catch { /* one refresh only — fall through to the visible error */ }
       }
       if (msg.includes('daemon_offline') || msg.includes('503')) setDownloadError(t('upload.daemon_offline'));
       else if (isStaleHandle) setDownloadError(t('upload.download_expired'));

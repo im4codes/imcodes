@@ -44,7 +44,7 @@ import {
   DIRECT_CONNECTIVITY_PROBE_STAGE,
   DIRECT_CONNECTIVITY_ROUTE,
   DIRECT_CONNECTIVITY_RUNTIME_STATE,
-  DIRECT_FILE_TRANSFER_CAPABILITY,
+  DIRECT_FILE_TRANSFER_LEASE_CAPABILITY,
   DIRECT_FILE_TRANSFER_ERROR,
   inferDirectConnectivityEndpointKind,
   inferDirectConnectivityEndpointKindFromTypes,
@@ -389,12 +389,14 @@ function DaemonStatsModal({
   stats,
   ws,
   localClockText,
+  serverId,
   onClose,
   t,
 }: {
   stats: DaemonStats;
   ws: WsClient | null;
   localClockText: string;
+  serverId?: string;
   onClose: () => void;
   t: (key: string, vars?: Record<string, unknown>) => string;
 }) {
@@ -413,7 +415,7 @@ function DaemonStatsModal({
     ? `embedding.status_${stats.embedding.state}`
     : 'embedding.status_unknown';
   const shortRefHealth = stats.shortRefHealth;
-  const capabilityReady = Boolean(ws?.getDaemonCapabilitySnapshot?.()?.capabilities.includes(DIRECT_FILE_TRANSFER_CAPABILITY));
+  const capabilityReady = Boolean(ws?.getDaemonCapabilitySnapshot?.()?.capabilities.includes(DIRECT_FILE_TRANSFER_LEASE_CAPABILITY));
   const runtimeUnavailable = stats.directConnectivity?.state === DIRECT_CONNECTIVITY_RUNTIME_STATE.RUNTIME_UNAVAILABLE;
 
   const runProbe = useCallback(async () => {
@@ -427,7 +429,7 @@ function DaemonStatsModal({
     });
     setProbeErrorKey(null);
     try {
-      const result = await probeDirectConnectivity(ws, setProbeDiagnostics);
+      const result = await probeDirectConnectivity(ws, setProbeDiagnostics, serverId);
       setProbeResult(result);
       setProbeDiagnostics((current) => ({
         stage: DIRECT_CONNECTIVITY_PROBE_STAGE.COMPLETE,
@@ -447,7 +449,7 @@ function DaemonStatsModal({
       setProbeErrorKey(key);
       setProbeState(PROBE_VIEW_STATE.FAILED);
     }
-  }, [capabilityReady, runtimeUnavailable, ws]);
+  }, [capabilityReady, runtimeUnavailable, serverId, ws]);
 
   useEffect(() => {
     if (autoProbeStarted.current || !capabilityReady || runtimeUnavailable) return;
@@ -1729,6 +1731,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
           stats={stats}
           ws={ws}
           localClockText={localClockText}
+          serverId={serverId}
           onClose={() => setShowDaemonDetails(false)}
           t={t}
         />

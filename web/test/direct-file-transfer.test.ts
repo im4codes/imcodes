@@ -1,25 +1,34 @@
 // @vitest-environment jsdom
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
-  DIRECT_CONNECTIVITY_ROUTE,
-  DIRECT_FILE_TRANSFER_CAPABILITY,
   DIRECT_FILE_TRANSFER_DATA_MSG,
+  DIRECT_FILE_TRANSFER_DIRECTION,
+  DIRECT_FILE_TRANSFER_ERROR,
+  DIRECT_FILE_TRANSFER_ERROR_SCOPE,
+  DIRECT_FILE_TRANSFER_LEASE_CAPABILITY,
+  DIRECT_FILE_TRANSFER_LIMITS,
   DIRECT_FILE_TRANSFER_MSG,
-  DIRECT_FILE_TRANSFER_PURPOSE,
+  DIRECT_FILE_TRANSFER_PREVIEW_DOWNLOAD_CAPABILITY,
+  DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+  DIRECT_FILE_TRANSFER_UPLOAD_RECOVERY_CAPABILITY,
 } from '../../shared/direct-file-transfer.js';
 import type { ServerMessage, WsClient } from '../src/ws-client.js';
 
-const uploadFileMock = vi.fn();
-vi.mock('../src/api.js', () => ({
-  uploadFile: uploadFileMock,
+const apiMocks = vi.hoisted(() => ({
+  uploadFile: vi.fn(),
+  downloadAttachment: vi.fn(),
+  streamAttachmentDownloadToWritable: vi.fn(),
 }));
 
-const capability = 'A'.repeat(43);
+vi.mock('../src/api.js', () => apiMocks);
 
 class FakeDataChannel extends EventTarget {
+  constructor(readonly label = '') { super(); }
+
   binaryType = 'arraybuffer';
   bufferedAmount = 0;
   bufferedAmountLowThreshold = 0;
+  readyState: RTCDataChannelState = 'connecting';
   sent: unknown[] = [];
   onSend: ((value: unknown) => void) | null = null;
 
@@ -28,386 +37,714 @@ class FakeDataChannel extends EventTarget {
     this.onSend?.(value);
   }
 
-  close(): void {}
+  open(): void {
+    this.readyState = 'open';
+    this.dispatchEvent(new Event('open'));
+  }
+
+  close(): void {
+    this.readyState = 'closed';
+    this.dispatchEvent(new Event('close'));
+  }
 }
 
 class FakePeerConnection extends EventTarget {
-  static latest: FakePeerConnection | null = null;
-  readonly channel = new FakeDataChannel();
+  static instances: FakePeerConnection[] = [];
+  static onDataChannel: ((channel: FakeDataChannel, value: unknown) => void) | null = null;
+  static selectedCandidateType = 'host';
   remoteDescription: RTCSessionDescription | null = null;
   connectionState: RTCPeerConnectionState = 'new';
+  channels: FakeDataChannel[] = [];
 
   constructor() {
     super();
-    FakePeerConnection.latest = this;
+    FakePeerConnection.instances.push(this);
   }
 
-  createDataChannel(): RTCDataChannel {
-    return this.channel as unknown as RTCDataChannel;
+  createDataChannel(label?: string): RTCDataChannel {
+    const channel = new FakeDataChannel(label);
+    this.channels.push(channel);
+    channel.onSend = (value) => FakePeerConnection.onDataChannel?.(channel, value);
+    queueMicrotask(() => channel.open());
+    return channel as unknown as RTCDataChannel;
   }
 
   async createOffer(): Promise<RTCSessionDescriptionInit> {
-    return { type: 'offer', sdp: 'browser-offer' };
+    return { type: 'offer', sdp: 'browser-lease-offer' };
   }
 
-  async setLocalDescription(): Promise<void> {
-    queueMicrotask(() => this.channel.dispatchEvent(new Event('open')));
-  }
-
+  async setLocalDescription(): Promise<void> {}
   async setRemoteDescription(description: RTCSessionDescriptionInit): Promise<void> {
     this.remoteDescription = description as RTCSessionDescription;
+    this.connectionState = 'connected';
+    this.dispatchEvent(new Event('connectionstatechange'));
   }
-
   async addIceCandidate(): Promise<void> {}
-  close(): void {}
+  async getStats(): Promise<RTCStatsReport> {
+    return new Map([
+      ['selected-pair', {
+        type: 'candidate-pair', selected: true, state: 'succeeded',
+        localCandidateId: 'local-candidate', remoteCandidateId: 'remote-candidate',
+      }],
+      ['local-candidate', { type: 'local-candidate', candidateType: FakePeerConnection.selectedCandidateType }],
+      ['remote-candidate', { type: 'remote-candidate', candidateType: 'host' }],
+    ]) as unknown as RTCStatsReport;
+  }
+  restartIce(): void {}
+  close(): void { this.connectionState = 'closed'; }
 }
 
-function createWs(capabilities: string[]) {
-  const handlers = new Set<(message: ServerMessage) => void>();
-  const sent: Array<Record<string, unknown>> = [];
-  const emit = (message: ServerMessage) => {
-    for (const handler of handlers) handler(message);
+const opaque = (char: string) => char.repeat(32);
+const id = () => crypto.randomUUID();
+
+function controlBinding(message: Record<string, unknown>) {
+  return {
+    serverId: message.serverId,
+    browserTabId: message.browserTabId,
+    leaseId: message.leaseId,
+    leaseGeneration: message.leaseGeneration,
+    daemonGeneration: message.daemonGeneration,
+    requestId: message.requestId,
+    attemptId: message.attemptId,
+    attempt: message.attempt,
+    direction: message.direction,
+    operationId: message.operationId,
   };
+}
+
+function createWs(
+  capabilities: string[],
+  mode: 'success' | 'operation_failure' | 'hold' | 'authorized_hold' | 'status_committed' | 'terminal_committed' | 'ack_then_late_terminal' | 'download_hold_rebind' | 'error_after_expiry' = 'success',
+  leaseTiming: { readyDelayMs?: number; idleWindowMs?: number; terminalDelayMs?: number; rebindDaemonGeneration?: number } = {},
+) {
+  const handlers = new Set<(message: ServerMessage) => void>();
+  const capabilityHandlers = new Set<(snapshot: { capabilities: string[] } | null) => void>();
+  const sent: Array<Record<string, unknown>> = [];
+  const emit = (message: Record<string, unknown>) => {
+    for (const handler of handlers) handler(message as ServerMessage);
+  };
+  const completedDownloads = new WeakSet<FakeDataChannel>();
+  let leaseInitCount = 0;
+  const handleData = (channel: FakeDataChannel, value: unknown) => {
+    if (typeof value !== 'string') return;
+    const payload = JSON.parse(value) as Record<string, unknown>;
+    if (payload.type === DIRECT_FILE_TRANSFER_DATA_MSG.HEALTH_PROBE) {
+      queueMicrotask(() => channel.dispatchEvent(new MessageEvent('message', {
+        data: JSON.stringify({
+          type: DIRECT_FILE_TRANSFER_DATA_MSG.HEALTH_PONG,
+          protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+          serverId: payload.serverId,
+          browserTabId: payload.browserTabId,
+          leaseId: payload.leaseId,
+          leaseGeneration: payload.leaseGeneration,
+          daemonGeneration: payload.daemonGeneration,
+          nonce: payload.nonce,
+          rttMs: 1,
+          localCandidate: { address: '192.168.1.20', port: 5000, type: 'host', transportType: 'udp' },
+          remoteCandidate: { address: '192.168.1.21', port: 5001, type: 'host', transportType: 'udp' },
+        }),
+      })));
+      return;
+    }
+    if (payload.type === DIRECT_FILE_TRANSFER_DATA_MSG.START) {
+      if (mode === 'error_after_expiry') {
+        const common = controlBinding(payload);
+        setTimeout(() => emit({
+          type: DIRECT_FILE_TRANSFER_MSG.ERROR,
+          protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+          scope: DIRECT_FILE_TRANSFER_ERROR_SCOPE.OPERATION,
+          ...common,
+          error: DIRECT_FILE_TRANSFER_ERROR.CONNECTION_FAILED,
+          retryable: false,
+          idleExpiresAt: Date.now() + (leaseTiming.idleWindowMs ?? DIRECT_FILE_TRANSFER_LIMITS.LEASE_IDLE_TTL_MS),
+        }), leaseTiming.terminalDelayMs ?? 0);
+        return;
+      }
+      if (mode === 'terminal_committed') {
+        const common = controlBinding(payload);
+        setTimeout(() => emit({
+          type: DIRECT_FILE_TRANSFER_MSG.TERMINAL,
+          protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+          ...common,
+          state: 'committed',
+          idleExpiresAt: Date.now() + (leaseTiming.idleWindowMs ?? DIRECT_FILE_TRANSFER_LIMITS.LEASE_IDLE_TTL_MS),
+          attachment: {
+            id: 'terminal-committed', source: 'upload', serverId: 'server-1', daemonPath: '/tmp/terminal.txt',
+            createdAt: '2026-01-01T00:00:00.000Z', downloadable: true,
+          },
+        }), leaseTiming.terminalDelayMs ?? 0);
+        return;
+      }
+      if (mode === 'authorized_hold' || mode === 'status_committed') return;
+      const common = controlBinding(payload);
+      if (payload.direction === DIRECT_FILE_TRANSFER_DIRECTION.UPLOAD) {
+        queueMicrotask(() => channel.dispatchEvent(new MessageEvent('message', {
+          data: JSON.stringify({
+            type: DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED,
+            protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+            ...common,
+          }),
+        })));
+      } else {
+        queueMicrotask(() => channel.dispatchEvent(new MessageEvent('message', {
+          data: JSON.stringify({
+            type: DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED,
+            protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+            ...common,
+            filename: 'preview.bin',
+            size: 3,
+          }),
+        })));
+      }
+      return;
+    }
+    if (payload.type === DIRECT_FILE_TRANSFER_DATA_MSG.FINISH && payload.direction === DIRECT_FILE_TRANSFER_DIRECTION.UPLOAD) {
+      const common = controlBinding(payload);
+      queueMicrotask(() => channel.dispatchEvent(new MessageEvent('message', {
+        data: JSON.stringify({
+          type: DIRECT_FILE_TRANSFER_DATA_MSG.UPLOAD_COMMITTED,
+          protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+          ...common,
+          attachment: { id: 'direct-attachment', source: 'upload', serverId: 'server-1', daemonPath: '/tmp/direct.txt', createdAt: '2026-01-01T00:00:00.000Z', downloadable: true },
+        }),
+      })));
+      if (mode === 'ack_then_late_terminal') {
+        setTimeout(() => emit({
+          type: DIRECT_FILE_TRANSFER_MSG.TERMINAL,
+          protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+          ...common,
+          state: 'committed',
+          idleExpiresAt: Date.now() + (leaseTiming.idleWindowMs ?? DIRECT_FILE_TRANSFER_LIMITS.LEASE_IDLE_TTL_MS),
+          attachment: { id: 'direct-attachment', source: 'upload', serverId: 'server-1', daemonPath: '/tmp/direct.txt', createdAt: '2026-01-01T00:00:00.000Z', downloadable: true },
+        }), leaseTiming.terminalDelayMs ?? 0);
+      }
+      return;
+    }
+    if (payload.type === DIRECT_FILE_TRANSFER_DATA_MSG.CREDIT && payload.direction === DIRECT_FILE_TRANSFER_DIRECTION.DOWNLOAD) {
+      if (mode === 'download_hold_rebind') return;
+      if (completedDownloads.has(channel)) return;
+      completedDownloads.add(channel);
+      const common = controlBinding(payload);
+      queueMicrotask(() => channel.dispatchEvent(new MessageEvent('message', { data: new Uint8Array([1, 2, 3]) })));
+      setTimeout(() => channel.dispatchEvent(new MessageEvent('message', {
+        data: JSON.stringify({
+          type: DIRECT_FILE_TRANSFER_DATA_MSG.FINISH,
+          protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+          ...common,
+          totalBytes: 3,
+        }),
+      })), 0);
+    }
+  };
+  FakePeerConnection.onDataChannel = handleData;
   const ws = {
     getDaemonCapabilitySnapshot: () => ({
       daemonId: 'daemon-1', capabilities, helloEpoch: 1, sentAt: Date.now(), observedAt: Date.now(),
     }),
+    onDaemonCapabilitySnapshot: (handler: (snapshot: { capabilities: string[] } | null) => void) => {
+      capabilityHandlers.add(handler);
+      return () => capabilityHandlers.delete(handler);
+    },
     onMessage: (handler: (message: ServerMessage) => void) => {
       handlers.add(handler);
       return () => handlers.delete(handler);
     },
     send: (message: Record<string, unknown>) => {
       sent.push(message);
-      if (message.type === DIRECT_FILE_TRANSFER_MSG.INIT) {
-        const { sessionName: _sessionName, ...authority } = message;
-        queueMicrotask(() => emit({
-          ...authority,
-          type: DIRECT_FILE_TRANSFER_MSG.AUTHORIZED,
-          capability,
-          expiresAt: Date.now() + 60_000,
-          iceServers: [],
-        } as ServerMessage));
-      }
-      if (message.type === DIRECT_FILE_TRANSFER_MSG.OFFER) {
-        queueMicrotask(() => emit({
-          type: DIRECT_FILE_TRANSFER_MSG.ANSWER,
+      if (message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_INIT) {
+        // The idle deadline is issued at LEASE_INIT, not when the browser
+        // receives the delayed READY. This makes the test catch a browser
+        // implementation that incorrectly starts a fresh five-minute timer
+        // after SDP/ICE negotiation.
+        const issuedAt = Date.now();
+        const respond = () => emit({
+          type: DIRECT_FILE_TRANSFER_MSG.LEASE_READY,
+          protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
           requestId: message.requestId,
-          capability,
-          sdp: 'daemon-answer',
-        } as ServerMessage));
+          serverId: message.serverId,
+          browserTabId: message.browserTabId,
+          leaseId: id(),
+          leaseGeneration: 1,
+          daemonGeneration: 1,
+          resumeTicket: `${opaque('r')}.${opaque('s')}.${opaque('t')}`,
+          idleExpiresAt: issuedAt + (leaseTiming.idleWindowMs ?? DIRECT_FILE_TRANSFER_LIMITS.LEASE_IDLE_TTL_MS),
+          expiresAt: issuedAt + 10 * 60_000,
+          iceServers: [],
+        });
+        if (++leaseInitCount === 1 && leaseTiming.readyDelayMs) setTimeout(respond, leaseTiming.readyDelayMs);
+        else queueMicrotask(respond);
+      } else if (message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_OFFER) {
+        queueMicrotask(() => emit({ ...message, type: DIRECT_FILE_TRANSFER_MSG.LEASE_ANSWER, sdp: 'daemon-lease-answer' }));
+      } else if (message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_REBIND) {
+        queueMicrotask(() => emit({
+          type: DIRECT_FILE_TRANSFER_MSG.LEASE_REBOUND,
+          protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+          requestId: message.requestId,
+          serverId: message.serverId,
+          browserTabId: message.browserTabId,
+          leaseId: message.leaseId,
+          leaseGeneration: message.leaseGeneration,
+          daemonGeneration: leaseTiming.rebindDaemonGeneration ?? 1,
+          resumeTicket: `${opaque('u')}.${opaque('v')}.${opaque('w')}`,
+          idleExpiresAt: Date.now() + DIRECT_FILE_TRANSFER_LIMITS.LEASE_IDLE_TTL_MS,
+          expiresAt: Date.now() + 10 * 60_000,
+          iceServers: [],
+        }));
+      } else if (message.type === DIRECT_FILE_TRANSFER_MSG.STATUS_QUERY && mode === 'status_committed') {
+        queueMicrotask(() => emit({
+          type: DIRECT_FILE_TRANSFER_MSG.STATUS,
+          protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+          ...controlBinding(message),
+          state: 'committed',
+          idleExpiresAt: Date.now() + DIRECT_FILE_TRANSFER_LIMITS.LEASE_IDLE_TTL_MS,
+          attachment: {
+            id: 'status-committed', source: 'upload', serverId: 'server-1', daemonPath: '/tmp/status.txt',
+            createdAt: '2026-01-01T00:00:00.000Z', downloadable: true,
+          },
+        }));
+      } else if (message.type === DIRECT_FILE_TRANSFER_MSG.OPERATION_INIT) {
+        if (mode === 'operation_failure') {
+          queueMicrotask(() => emit({
+            type: DIRECT_FILE_TRANSFER_MSG.ERROR,
+            protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+            scope: DIRECT_FILE_TRANSFER_ERROR_SCOPE.OPERATION,
+            ...controlBinding(message),
+            error: DIRECT_FILE_TRANSFER_ERROR.CONNECTION_FAILED,
+            retryable: true,
+          }));
+        } else if (mode !== 'hold') {
+          queueMicrotask(() => emit({
+            ...message,
+            type: DIRECT_FILE_TRANSFER_MSG.AUTHORIZED,
+            authority: opaque('a'),
+            authorityExpiresAt: Date.now() + 60_000,
+            channelLabel: `imcodes-op-${String(message.operationId)}`,
+            iceServers: [],
+          }));
+        }
       }
     },
   } as unknown as WsClient;
-  return { ws, sent, emit };
+  return {
+    ws,
+    sent,
+    emit,
+    emitCapabilitySnapshot: () => {
+      for (const handler of capabilityHandlers) handler({ capabilities });
+    },
+  };
 }
 
-describe('direct file upload fallback', () => {
+const directCapabilities = [
+  DIRECT_FILE_TRANSFER_LEASE_CAPABILITY,
+  DIRECT_FILE_TRANSFER_UPLOAD_RECOVERY_CAPABILITY,
+  DIRECT_FILE_TRANSFER_PREVIEW_DOWNLOAD_CAPABILITY,
+];
+
+describe('direct file transfer v2 browser broker', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
   beforeEach(() => {
     vi.clearAllMocks();
-    FakePeerConnection.latest = null;
+    FakePeerConnection.instances = [];
+    FakePeerConnection.selectedCandidateType = 'host';
     vi.stubGlobal('RTCPeerConnection', FakePeerConnection);
-    uploadFileMock.mockResolvedValue({
+    apiMocks.uploadFile.mockResolvedValue({
       ok: true,
-      attachment: { id: 'relay', daemonPath: '/relay/file', serverId: 'server-1' },
+      attachment: { id: 'relay-attachment', serverId: 'server-1', daemonPath: '/tmp/relay.txt' },
     });
   });
 
-  it('uses the existing relay with the stable upload identity when direct is unavailable', async () => {
+  it('uses HTTP relay directly when the v2 upload capabilities are unavailable', async () => {
     const { uploadFileWithDirectFallback } = await import('../src/direct-file-transfer.js');
-    const { ws } = createWs([]);
-    const modes: string[] = [];
-    const file = new File(['hello'], 'hello.txt', { type: 'text/plain' });
-    await expect(uploadFileWithDirectFallback({
+    const { ws, sent } = createWs([]);
+    const file = new File(['relay'], 'relay.txt', { type: 'text/plain' });
+
+    await expect(uploadFileWithDirectFallback({ ws, serverId: 'server-1', file })).resolves.toMatchObject({
+      attachment: { id: 'relay-attachment' },
+    });
+
+    expect(sent).toHaveLength(0);
+    expect(apiMocks.uploadFile).toHaveBeenCalledTimes(1);
+  });
+
+  it('prewarms one lease-only peer and reuses it for two uploads without authority in SDP/ICE', async () => {
+    const { prewarmDirectFileLease, uploadFileDirect } = await import('../src/direct-file-transfer.js');
+    const { ws, sent } = createWs(directCapabilities);
+    const release = prewarmDirectFileLease(ws, 'server-1');
+    await vi.waitFor(() => expect(sent.some((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_OFFER)).toBe(true));
+
+    const file = (name: string, content: string) => {
+      const bytes = new TextEncoder().encode(content);
+      return {
+        name,
+        type: 'text/plain',
+        size: bytes.byteLength,
+        slice: (start: number, end: number) => ({ arrayBuffer: async () => bytes.slice(start, end).buffer }),
+      } as unknown as File;
+    };
+    await uploadFileDirect(ws, file('first.txt', 'first'), id(), undefined, undefined, undefined, undefined, 'server-1');
+    await uploadFileDirect(ws, file('second.txt', 'second'), id(), undefined, undefined, undefined, undefined, 'server-1');
+
+    expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_INIT)).toHaveLength(1);
+    expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_OFFER)).toHaveLength(1);
+    expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.OPERATION_INIT)).toHaveLength(2);
+    expect(FakePeerConnection.instances).toHaveLength(1);
+    for (const message of sent.filter((entry) => entry.type === DIRECT_FILE_TRANSFER_MSG.LEASE_OFFER || entry.type === DIRECT_FILE_TRANSFER_MSG.LEASE_ICE)) {
+      expect(message).not.toHaveProperty('authority');
+      expect(message).not.toHaveProperty('previewHandle');
+      expect(message).not.toHaveProperty('sessionName');
+    }
+    release?.();
+  });
+
+  it('streams a direct preview into a File System Access writer without Blob/HTTP fallback', async () => {
+    const { downloadPreviewWithDirectFallback } = await import('../src/direct-file-transfer.js');
+    const writer = { write: vi.fn().mockResolvedValue(undefined), close: vi.fn().mockResolvedValue(undefined), abort: vi.fn().mockResolvedValue(undefined) };
+    const destination = { handle: { createWritable: vi.fn().mockResolvedValue(writer) } };
+    const { ws } = createWs(directCapabilities);
+
+    await downloadPreviewWithDirectFallback({
       ws,
       serverId: 'server-1',
-      file,
-      onMode: (mode) => modes.push(mode),
-    })).resolves.toMatchObject({ attachment: { id: 'relay' } });
-    expect(modes).toEqual(['relay']);
-    expect(uploadFileMock).toHaveBeenCalledWith(
-      'server-1',
-      file,
-      undefined,
-      expect.stringMatching(/^[0-9a-f-]{36}$/),
-      undefined,
-    );
-  });
-
-  it('does not make a doomed relay request for an oversized file without direct capability', async () => {
-    const { DirectFileTransferFailure, uploadFileWithDirectFallback } = await import('../src/direct-file-transfer.js');
-    const { ws } = createWs([]);
-    const huge = { name: 'huge.bin', type: 'application/octet-stream', size: 3 * 1024 * 1024 * 1024 } as File;
-    await expect(uploadFileWithDirectFallback({ ws, serverId: 'server-1', file: huge })).rejects.toMatchObject({
-      name: DirectFileTransferFailure.name,
-      code: 'relay_size_limit',
-    });
-    expect(uploadFileMock).not.toHaveBeenCalled();
-  });
-
-  it('falls back to relay in the same upload after direct negotiation fails', async () => {
-    const { uploadFileWithDirectFallback } = await import('../src/direct-file-transfer.js');
-    const fixture = createWs([DIRECT_FILE_TRANSFER_CAPABILITY]);
-    (fixture.ws as unknown as { send: (message: Record<string, unknown>) => void }).send = (message) => {
-      if (message.type !== DIRECT_FILE_TRANSFER_MSG.INIT) return;
-      queueMicrotask(() => fixture.emit({
-        type: DIRECT_FILE_TRANSFER_MSG.ERROR,
-        requestId: message.requestId as string,
-        error: 'connection_failed',
-        retryable: true,
-      } as ServerMessage));
-    };
-    const modes: string[] = [];
-    const file = new File(['fallback'], 'fallback.txt', { type: 'text/plain' });
-    await expect(uploadFileWithDirectFallback({
-      ws: fixture.ws,
-      serverId: 'server-1',
-      file,
-      onMode: (mode) => modes.push(mode),
-    })).resolves.toMatchObject({ attachment: { id: 'relay' } });
-    expect(modes).toEqual(['connecting', 'falling_back', 'relay']);
-    expect(uploadFileMock).toHaveBeenCalledTimes(1);
-  });
-
-  it('keeps a shared-session authorization hint on both direct and relay upload attempts', async () => {
-    const { uploadFileWithDirectFallback } = await import('../src/direct-file-transfer.js');
-    const fixture = createWs([DIRECT_FILE_TRANSFER_CAPABILITY]);
-    const sent = fixture.sent;
-    (fixture.ws as unknown as { send: (message: Record<string, unknown>) => void }).send = (message) => {
-      sent.push(message);
-      if (message.type !== DIRECT_FILE_TRANSFER_MSG.INIT) return;
-      queueMicrotask(() => fixture.emit({
-        type: DIRECT_FILE_TRANSFER_MSG.ERROR,
-        requestId: message.requestId as string,
-        error: 'connection_failed',
-        retryable: true,
-      } as ServerMessage));
-    };
-    const file = new File(['shared'], 'shared.txt', { type: 'text/plain' });
-
-    await uploadFileWithDirectFallback({
-      ws: fixture.ws,
-      serverId: 'server-1',
-      sessionName: 'deck_project_brain',
-      file,
+      previewHandle: 'preview-handle-1',
+      destination,
     });
 
-    expect(sent[0]).toMatchObject({
-      type: DIRECT_FILE_TRANSFER_MSG.INIT,
-      sessionName: 'deck_project_brain',
-    });
-    expect(uploadFileMock).toHaveBeenCalledWith(
-      'server-1',
-      file,
-      undefined,
-      expect.stringMatching(/^[0-9a-f-]{36}$/),
-      undefined,
-      'deck_project_brain',
-    );
+    expect(writer.write).toHaveBeenCalledTimes(1);
+    expect(writer.close).toHaveBeenCalledTimes(1);
+    expect(apiMocks.streamAttachmentDownloadToWritable).not.toHaveBeenCalled();
   });
 
-  it('cancels an active direct upload without starting relay fallback', async () => {
-    const { uploadFileWithDirectFallback } = await import('../src/direct-file-transfer.js');
-    const { ws, sent } = createWs([DIRECT_FILE_TRANSFER_CAPABILITY]);
-    const controller = new AbortController();
-    const pending = uploadFileWithDirectFallback({
-      ws,
-      serverId: 'server-1',
-      file: new File(['cancel me'], 'cancel.txt', { type: 'text/plain' }),
-      signal: controller.signal,
-    });
-
-    await vi.waitFor(() => expect(FakePeerConnection.latest).not.toBeNull());
-    controller.abort();
-
-    await expect(pending).rejects.toMatchObject({ code: 'canceled', retryable: false });
-    expect(sent).toContainEqual(expect.objectContaining({ type: DIRECT_FILE_TRANSFER_MSG.CANCEL, reason: 'canceled' }));
-    expect(uploadFileMock).not.toHaveBeenCalled();
+  it('classifies daemon preview-handle expiry as the File Browser one-refresh condition', async () => {
+    const { DirectFileTransferFailure, isDirectFileTransferStaleHandleError } = await import('../src/direct-file-transfer.js');
+    expect(isDirectFileTransferStaleHandleError(new DirectFileTransferFailure(
+      DIRECT_FILE_TRANSFER_ERROR.PREVIEW_HANDLE_INVALID,
+      false,
+    ))).toBe(true);
+    expect(isDirectFileTransferStaleHandleError(new DirectFileTransferFailure(
+      DIRECT_FILE_TRANSFER_ERROR.CANCELED,
+      false,
+    ))).toBe(false);
   });
 
-  it('streams bytes over the data channel and reports P2P direct mode without invoking relay', async () => {
-    const { uploadFileWithDirectFallback } = await import('../src/direct-file-transfer.js');
-    const { ws, emit } = createWs([DIRECT_FILE_TRANSFER_CAPABILITY]);
-    const modes: string[] = [];
-    const progress: number[] = [];
-    const bytes = new TextEncoder().encode('hello direct');
+  it('records a redacted relay route when the selected peer pair uses TURN', async () => {
+    const { uploadFileDirect, DIRECT_FILE_TRANSFER_CLIENT_METRIC } = await import('../src/direct-file-transfer.js');
+    const { ws } = createWs(directCapabilities);
+    const debug = vi.spyOn(console, 'debug').mockImplementation(() => undefined);
+    FakePeerConnection.selectedCandidateType = 'relay';
+    const bytes = new TextEncoder().encode('relay');
     const file = {
-      name: 'hello.txt',
-      type: 'text/plain',
-      size: bytes.byteLength,
-      slice: (start: number, end: number) => ({
-        arrayBuffer: async () => bytes.slice(start, end).buffer,
-      }),
+      name: 'relay.txt', type: 'text/plain', size: bytes.byteLength,
+      slice: (start: number, end: number) => ({ arrayBuffer: async () => bytes.slice(start, end).buffer }),
     } as unknown as File;
-    const pending = uploadFileWithDirectFallback({
-      ws,
-      serverId: 'server-1',
-      file,
-      onMode: (mode) => modes.push(mode),
-      onProgress: (value) => progress.push(value),
-    });
-
-    await vi.waitFor(() => expect(FakePeerConnection.latest?.channel.sent.length).toBeGreaterThan(0));
-    const peer = FakePeerConnection.latest!;
-    peer.channel.onSend = (value) => {
-      if (typeof value !== 'string') return;
-      const payload = JSON.parse(value) as { type: string; requestId: string };
-      if (payload.type === 'direct_file.data.start') {
-        queueMicrotask(() => peer.channel.dispatchEvent(new MessageEvent('message', {
-          data: JSON.stringify({ type: DIRECT_FILE_TRANSFER_MSG.AUTHORIZED.replace('authorized', 'data.accepted'), requestId: payload.requestId }),
-        })));
+    try {
+      await uploadFileDirect(ws, file, id(), undefined, undefined, undefined, undefined, 'server-1');
+      const metrics = debug.mock.calls
+        .filter(([prefix]) => prefix === '[direct-file-transfer]')
+        .map(([, fields]) => fields as Record<string, unknown>);
+      expect(metrics).toContainEqual(expect.objectContaining({
+        metric: DIRECT_FILE_TRANSFER_CLIENT_METRIC.DIRECT_SUCCESS,
+        direction: DIRECT_FILE_TRANSFER_DIRECTION.UPLOAD,
+        route: 'relay',
+      }));
+      for (const metric of metrics) {
+        expect(metric).not.toHaveProperty('serverId');
+        expect(metric).not.toHaveProperty('operationId');
+        expect(metric).not.toHaveProperty('authority');
+        expect(metric).not.toHaveProperty('path');
       }
-      if (payload.type === 'direct_file.data.finish') {
-        emit({
-          type: DIRECT_FILE_TRANSFER_MSG.PROGRESS,
-          requestId: payload.requestId,
-          capability,
-          loaded: Math.floor(file.size / 4),
-          total: file.size,
-        } as ServerMessage);
-        queueMicrotask(() => emit({
-          type: DIRECT_FILE_TRANSFER_MSG.DONE,
-          requestId: payload.requestId,
-          capability,
-          clientUploadId: 'ignored-by-client',
-          attachment: {
-            id: 'direct', source: 'upload', serverId: 'server-1', daemonPath: '/direct/file',
-            size: file.size, createdAt: new Date().toISOString(), downloadable: true,
-          },
-        } as ServerMessage));
-      }
-    };
-    // The START may have been sent before the hook above was installed.
-    const start = peer.channel.sent.find((value) => typeof value === 'string') as string;
-    const startPayload = JSON.parse(start) as { requestId: string };
-    peer.channel.dispatchEvent(new MessageEvent('message', {
-      data: JSON.stringify({ type: 'direct_file.data.accepted', requestId: startPayload.requestId }),
-    }));
-
-    await expect(pending).resolves.toMatchObject({ attachment: { id: 'direct' } });
-    expect(modes).toContain('direct');
-    expect(progress).toContain(25);
-    expect(progress).toContain(100);
-    expect(progress).toEqual([...progress].sort((a, b) => a - b));
-    expect(uploadFileMock).not.toHaveBeenCalled();
-    expect(peer.channel.sent.some((value) => typeof value !== 'string')).toBe(true);
+    } finally {
+      debug.mockRestore();
+    }
   });
 
-  it('does not restart through relay when the data channel closes after FINISH before DONE arrives', async () => {
+  it('retries direct transport three times then performs exactly one relay fallback', async () => {
     const { uploadFileWithDirectFallback } = await import('../src/direct-file-transfer.js');
-    const { ws, emit } = createWs([DIRECT_FILE_TRANSFER_CAPABILITY]);
-    const modes: string[] = [];
-    const bytes = new TextEncoder().encode('committed direct upload');
-    const file = {
-      name: 'committed.txt',
-      type: 'text/plain',
-      size: bytes.byteLength,
-      slice: (start: number, end: number) => ({
-        arrayBuffer: async () => bytes.slice(start, end).buffer,
-      }),
-    } as unknown as File;
-    const pending = uploadFileWithDirectFallback({
-      ws,
-      serverId: 'server-1',
-      file,
-      onMode: (mode) => modes.push(mode),
+    const { ws, sent } = createWs(directCapabilities, 'operation_failure');
+    const file = new File(['retry'], 'retry.txt', { type: 'text/plain' });
+
+    await expect(uploadFileWithDirectFallback({ ws, serverId: 'server-1', file })).resolves.toMatchObject({
+      attachment: { id: 'relay-attachment' },
     });
 
-    await vi.waitFor(() => expect(FakePeerConnection.latest?.channel.sent.length).toBeGreaterThan(0));
-    const peer = FakePeerConnection.latest!;
-    const start = peer.channel.sent.find((value) => typeof value === 'string') as string;
-    const startPayload = JSON.parse(start) as { requestId: string };
-    peer.channel.onSend = (value) => {
-      if (typeof value !== 'string') return;
-      const payload = JSON.parse(value) as { type: string; requestId: string };
-      if (payload.type !== DIRECT_FILE_TRANSFER_DATA_MSG.FINISH) return;
-      peer.channel.dispatchEvent(new Event('close'));
-      queueMicrotask(() => emit({
-        type: DIRECT_FILE_TRANSFER_MSG.DONE,
-        requestId: payload.requestId,
-        capability,
-        clientUploadId: 'ignored-by-client',
-        attachment: {
-          id: 'direct-after-close', source: 'upload', serverId: 'server-1', daemonPath: '/direct/committed',
-          size: file.size, createdAt: new Date().toISOString(), downloadable: true,
-        },
-      } as ServerMessage));
-    };
-    peer.channel.dispatchEvent(new MessageEvent('message', {
-      data: JSON.stringify({ type: DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED, requestId: startPayload.requestId }),
-    }));
+    expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.OPERATION_INIT)).toHaveLength(3);
+    expect(apiMocks.uploadFile).toHaveBeenCalledTimes(1);
+  }, 10_000);
 
-    await expect(pending).resolves.toMatchObject({ attachment: { id: 'direct-after-close' } });
-    expect(modes).toEqual(['connecting', 'direct']);
-    expect(uploadFileMock).not.toHaveBeenCalled();
+  it('rebind recovery settles a committed status without retransmitting START or authority', async () => {
+    const { uploadFileDirect } = await import('../src/direct-file-transfer.js');
+    const { ws, sent, emitCapabilitySnapshot } = createWs(directCapabilities, 'status_committed');
+    const pending = uploadFileDirect(
+      ws,
+      new File(['hold'], 'hold.txt'),
+      id(),
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      'server-1',
+    );
+    await vi.waitFor(() => expect(
+      FakePeerConnection.instances.at(-1)?.channels.some((channel) => channel.sent.some((value) => (
+        typeof value === 'string' && JSON.parse(value).type === DIRECT_FILE_TRANSFER_DATA_MSG.START
+      ))),
+    ).toBe(true));
+
+    emitCapabilitySnapshot();
+    await vi.waitFor(() => expect(sent.some((message) => message.type === DIRECT_FILE_TRANSFER_MSG.STATUS_QUERY)).toBe(true));
+    const statusQuery = sent.find((message) => message.type === DIRECT_FILE_TRANSFER_MSG.STATUS_QUERY)!;
+    expect(statusQuery).not.toHaveProperty('authority');
+    await expect(pending).resolves.toMatchObject({ attachment: { id: 'status-committed' } });
+    expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.OPERATION_INIT)).toHaveLength(1);
+    expect(FakePeerConnection.instances.at(-1)?.channels.filter((channel) => channel.label.startsWith('imcodes-op-'))).toHaveLength(1);
   });
 
-  it('probes a routed private path over the data channel without uploading a file', async () => {
+
+  it('establishes and then reuses an inert v2 lease for explicit diagnostics without file authority', async () => {
     const { probeDirectConnectivity } = await import('../src/direct-file-transfer.js');
-    const { ws, sent, emit } = createWs([DIRECT_FILE_TRANSFER_CAPABILITY]);
-    const diagnostics: Array<{
-      stage: string;
-      browserCandidateTypes: string[];
-      daemonCandidateTypes: string[];
-    }> = [];
-    const pending = probeDirectConnectivity(ws, (snapshot) => diagnostics.push(snapshot));
+    const { ws, sent } = createWs(directCapabilities);
 
-    await vi.waitFor(() => expect(FakePeerConnection.latest?.channel.sent.length).toBeGreaterThan(0));
-    const peer = FakePeerConnection.latest!;
-    const init = sent.find((message) => message.type === DIRECT_FILE_TRANSFER_MSG.INIT)!;
-    peer.dispatchEvent(Object.assign(new Event('icecandidate'), {
-      candidate: {
-        candidate: 'candidate:1 1 UDP 1686052863 203.0.113.8 28167 typ srflx raddr 0.0.0.0 rport 0',
-        sdpMid: '0',
-        type: 'srflx',
-      },
-    }));
-    emit({
-      type: DIRECT_FILE_TRANSFER_MSG.ICE,
-      requestId: init.requestId as string,
-      capability,
-      candidate: 'candidate:2 1 UDP 2114977535 172.16.253.111 51907 typ host',
-      mid: '0',
-    } as ServerMessage);
-    const probeRaw = peer.channel.sent.find((value) => typeof value === 'string') as string;
-    const probe = JSON.parse(probeRaw) as { requestId: string; nonce: string };
-    peer.channel.dispatchEvent(new MessageEvent('message', {
+    await expect(probeDirectConnectivity(ws, undefined, 'server-1')).resolves.toMatchObject({ route: 'lan_direct' });
+    await expect(probeDirectConnectivity(ws, undefined, 'server-1')).resolves.toMatchObject({ route: 'lan_direct' });
+
+    expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_INIT)).toHaveLength(1);
+    for (const message of sent.filter((entry) => entry.type === DIRECT_FILE_TRANSFER_MSG.LEASE_OFFER || entry.type === DIRECT_FILE_TRANSFER_MSG.LEASE_ICE)) {
+      expect(message).not.toHaveProperty('authority');
+      expect(message).not.toHaveProperty('previewHandle');
+      expect(message).not.toHaveProperty('sessionName');
+    }
+  });
+
+  it('tears down an idle prewarm after five minutes and initializes a new lease on the next click', async () => {
+    vi.useFakeTimers();
+    const { prewarmDirectFileLease, uploadFileDirect } = await import('../src/direct-file-transfer.js');
+    const { ws, sent } = createWs(directCapabilities);
+    const release = prewarmDirectFileLease(ws, 'server-1');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_INIT)).toHaveLength(1);
+
+    await vi.advanceTimersByTimeAsync(5 * 60 * 1000);
+    const bytes = new TextEncoder().encode('after-idle');
+    const file = {
+      name: 'after-idle.txt', type: 'text/plain', size: bytes.byteLength,
+      slice: (start: number, end: number) => ({ arrayBuffer: async () => bytes.slice(start, end).buffer }),
+    } as unknown as File;
+    const pending = uploadFileDirect(ws, file, id(), undefined, undefined, undefined, undefined, 'server-1');
+    await vi.advanceTimersByTimeAsync(0);
+    await expect(pending).resolves.toMatchObject({ ok: true });
+
+    expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_INIT)).toHaveLength(2);
+    expect(FakePeerConnection.instances).toHaveLength(2);
+    release?.();
+  });
+
+  it('uses the server idle deadline from LEASE_INIT even when READY/SDP are delayed', async () => {
+    vi.useFakeTimers();
+    const { prewarmDirectFileLease, uploadFileDirect } = await import('../src/direct-file-transfer.js');
+    const { ws, sent } = createWs(directCapabilities, 'success', {
+      readyDelayMs: 4 * 60 * 1000,
+      idleWindowMs: 5 * 60 * 1000,
+    });
+    const release = prewarmDirectFileLease(ws, 'server-1');
+    // READY reaches the browser after four minutes, leaving only one minute
+    // of server authority. A client-relative timer here would incorrectly
+    // keep this lease alive until minute nine.
+    await vi.advanceTimersByTimeAsync(4 * 60 * 1000);
+    await vi.advanceTimersByTimeAsync(60_000);
+
+    const bytes = new TextEncoder().encode('fresh-authority');
+    const file = {
+      name: 'fresh-authority.txt', type: 'text/plain', size: bytes.byteLength,
+      slice: (start: number, end: number) => ({ arrayBuffer: async () => bytes.slice(start, end).buffer }),
+    } as unknown as File;
+    const pending = uploadFileDirect(ws, file, id(), undefined, undefined, undefined, undefined, 'server-1');
+    await vi.advanceTimersByTimeAsync(0);
+    await expect(pending).resolves.toMatchObject({ ok: true });
+
+    expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_INIT)).toHaveLength(2);
+    release?.();
+  });
+
+  it('retains a reusable peer through a fresh terminal idle deadline after a long active operation', async () => {
+    vi.useFakeTimers();
+    const { uploadFileDirect } = await import('../src/direct-file-transfer.js');
+    const { ws, sent } = createWs(directCapabilities, 'terminal_committed', {
+      // A short window models the real >5-minute case without allowing the
+      // no-progress watchdog to fire during this focused fake-timer test.
+      idleWindowMs: 100,
+      terminalDelayMs: 101,
+    });
+    const makeFile = (name: string) => {
+      const bytes = new TextEncoder().encode(name);
+      return {
+        name, type: 'text/plain', size: bytes.byteLength,
+        slice: (start: number, end: number) => ({ arrayBuffer: async () => bytes.slice(start, end).buffer }),
+      } as unknown as File;
+    };
+
+    const first = uploadFileDirect(ws, makeFile('long.txt'), id(), undefined, undefined, undefined, undefined, 'server-1');
+    await vi.advanceTimersByTimeAsync(101);
+    await expect(first).resolves.toMatchObject({ attachment: { id: 'terminal-committed' } });
+
+    // The original authority expired at t=100 while the operation was active.
+    // The terminal's fresh t=201 deadline must preserve the current lease for
+    // this next click rather than clearing it from the initial READY deadline.
+    await vi.advanceTimersByTimeAsync(49);
+    const second = uploadFileDirect(ws, makeFile('reused.txt'), id(), undefined, undefined, undefined, undefined, 'server-1');
+    await vi.advanceTimersByTimeAsync(101);
+    await expect(second).resolves.toMatchObject({ attachment: { id: 'terminal-committed' } });
+
+    expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_INIT)).toHaveLength(1);
+    expect(FakePeerConnection.instances).toHaveLength(1);
+  });
+
+  it('keeps the lease alive for a late Server terminal after a data-plane upload ACK', async () => {
+    vi.useFakeTimers();
+    const { uploadFileDirect } = await import('../src/direct-file-transfer.js');
+    const { ws, sent } = createWs(directCapabilities, 'ack_then_late_terminal', {
+      idleWindowMs: 100,
+      terminalDelayMs: 101,
+    });
+    const makeFile = (name: string) => {
+      const bytes = new TextEncoder().encode(name);
+      return {
+        name, type: 'text/plain', size: bytes.byteLength,
+        slice: (start: number, end: number) => ({ arrayBuffer: async () => bytes.slice(start, end).buffer }),
+      } as unknown as File;
+    };
+
+    const first = uploadFileDirect(ws, makeFile('ack.txt'), id(), undefined, undefined, undefined, undefined, 'server-1');
+    await vi.advanceTimersByTimeAsync(0);
+    await expect(first).resolves.toMatchObject({ attachment: { id: 'direct-attachment' } });
+    // The data-plane ACK has already removed its per-attempt control listener.
+    // The grace observer must own the terminal at t=101, after the original
+    // authority deadline at t=100.
+    await vi.advanceTimersByTimeAsync(101);
+
+    const second = uploadFileDirect(ws, makeFile('reused-after-terminal.txt'), id(), undefined, undefined, undefined, undefined, 'server-1');
+    await vi.advanceTimersByTimeAsync(0);
+    await expect(second).resolves.toMatchObject({ attachment: { id: 'direct-attachment' } });
+
+    expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_INIT)).toHaveLength(1);
+    expect(FakePeerConnection.instances).toHaveLength(1);
+  });
+
+  it('keeps authorized data-plane generation while rebind status uses the new control generation', async () => {
+    const { downloadPreviewWithDirectFallback } = await import('../src/direct-file-transfer.js');
+    const writer = { write: vi.fn().mockResolvedValue(undefined), close: vi.fn().mockResolvedValue(undefined), abort: vi.fn().mockResolvedValue(undefined) };
+    const destination = { handle: { createWritable: vi.fn().mockResolvedValue(writer) } };
+    const { ws, sent, emitCapabilitySnapshot } = createWs(directCapabilities, 'download_hold_rebind', {
+      rebindDaemonGeneration: 2,
+    });
+    const pending = downloadPreviewWithDirectFallback({
+      ws, serverId: 'server-1', previewHandle: 'preview-old-generation', destination,
+    });
+    await vi.waitFor(() => expect(
+      FakePeerConnection.instances.at(-1)?.channels.some((channel) => channel.label.startsWith('imcodes-op-') && channel.sent.some((value) => (
+        typeof value === 'string' && JSON.parse(value).type === DIRECT_FILE_TRANSFER_DATA_MSG.CREDIT
+      ))),
+    ).toBe(true));
+    const init = sent.find((message) => message.type === DIRECT_FILE_TRANSFER_MSG.OPERATION_INIT)!;
+    const channel = FakePeerConnection.instances.at(-1)!.channels.find((candidate) => candidate.label.startsWith('imcodes-op-'))!;
+
+    emitCapabilitySnapshot();
+    await vi.waitFor(() => expect(sent.some((message) => message.type === DIRECT_FILE_TRANSFER_MSG.STATUS_QUERY)).toBe(true));
+    const status = sent.find((message) => message.type === DIRECT_FILE_TRANSFER_MSG.STATUS_QUERY)!;
+    expect(status.daemonGeneration).toBe(2);
+
+    // The old daemon peer continues the in-flight channel. A new control
+    // generation must not rewrite its authority-bound CREDIT/COMMIT binding.
+    channel.dispatchEvent(new MessageEvent('message', { data: new Uint8Array([1, 2, 3]) }));
+    await vi.waitFor(() => expect(writer.write).toHaveBeenCalledOnce());
+    channel.dispatchEvent(new MessageEvent('message', {
       data: JSON.stringify({
-        type: DIRECT_FILE_TRANSFER_DATA_MSG.PONG,
-        requestId: probe.requestId,
-        nonce: probe.nonce,
-        rttMs: 1.4,
-        localCandidate: { address: '192.168.2.145', port: 49153, type: 'host', transportType: 'udp' },
-        remoteCandidate: { address: '192.168.2.59', port: 59074, type: 'prflx', transportType: 'udp' },
+        type: DIRECT_FILE_TRANSFER_DATA_MSG.FINISH,
+        protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+        ...controlBinding(init),
+        totalBytes: 3,
       }),
     }));
+    await expect(pending).resolves.toBeUndefined();
 
-    await expect(pending).resolves.toMatchObject({
-      route: DIRECT_CONNECTIVITY_ROUTE.LAN_DIRECT,
-      rttMs: 1.4,
-    });
-    expect(sent[0]).toMatchObject({
-      type: DIRECT_FILE_TRANSFER_MSG.INIT,
-      purpose: DIRECT_FILE_TRANSFER_PURPOSE.PROBE,
-      filename: 'connectivity-probe',
-      size: 0,
-    });
-    expect(sent).toContainEqual(expect.objectContaining({
-      type: DIRECT_FILE_TRANSFER_MSG.CANCEL,
-      reason: 'canceled',
+    const dataMessages = channel.sent
+      .filter((value): value is string => typeof value === 'string')
+      .map((value) => JSON.parse(value) as Record<string, unknown>);
+    expect(dataMessages.filter((message) => message.type === DIRECT_FILE_TRANSFER_DATA_MSG.CREDIT)).toEqual(
+      expect.arrayContaining([expect.objectContaining({ daemonGeneration: 1 })]),
+    );
+    expect(dataMessages).toContainEqual(expect.objectContaining({
+      type: DIRECT_FILE_TRANSFER_DATA_MSG.DOWNLOAD_COMMITTED,
+      daemonGeneration: 1,
     }));
-    expect(init.requestId).toBe(probe.requestId);
-    expect(diagnostics.map((snapshot) => snapshot.stage)).toEqual(expect.arrayContaining([
-      'authorizing',
-      'creating_offer',
-      'exchanging_candidates',
-      'verifying',
-      'complete',
-    ]));
-    expect(diagnostics.at(-1)).toMatchObject({
-      stage: 'complete',
-      browserCandidateTypes: ['srflx'],
-      daemonCandidateTypes: ['host'],
-    });
-    expect(uploadFileMock).not.toHaveBeenCalled();
   });
+
+  it('keeps cancellation grace through the original expiry for a late canceled terminal', async () => {
+    vi.useFakeTimers();
+    const { downloadPreviewWithDirectFallback, uploadFileDirect } = await import('../src/direct-file-transfer.js');
+    const writer = { write: vi.fn().mockResolvedValue(undefined), close: vi.fn().mockResolvedValue(undefined), abort: vi.fn().mockResolvedValue(undefined) };
+    const destination = { handle: { createWritable: vi.fn().mockResolvedValue(writer) } };
+    const { ws, sent, emit } = createWs(directCapabilities, 'download_hold_rebind', { idleWindowMs: 100 });
+    const controller = new AbortController();
+    const canceled = downloadPreviewWithDirectFallback({
+      ws, serverId: 'server-1', previewHandle: 'cancel-preview', destination, signal: controller.signal,
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.waitFor(() => expect(sent.some((message) => message.type === DIRECT_FILE_TRANSFER_MSG.OPERATION_INIT)).toBe(true));
+    controller.abort();
+    await expect(canceled).rejects.toMatchObject({ code: DIRECT_FILE_TRANSFER_ERROR.CANCELED });
+    const cancel = sent.find((message) => message.type === DIRECT_FILE_TRANSFER_MSG.CANCEL)!;
+    expect(cancel.daemonGeneration).toBe(1);
+
+    await vi.advanceTimersByTimeAsync(101);
+    emit({
+      type: DIRECT_FILE_TRANSFER_MSG.TERMINAL,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      ...controlBinding(cancel),
+      state: 'canceled',
+      idleExpiresAt: Date.now() + 100,
+    });
+
+    const bytes = new TextEncoder().encode('after-cancel');
+    const file = {
+      name: 'after-cancel.txt', type: 'text/plain', size: bytes.byteLength,
+      slice: (start: number, end: number) => ({ arrayBuffer: async () => bytes.slice(start, end).buffer }),
+    } as unknown as File;
+    const next = uploadFileDirect(ws, file, id(), undefined, undefined, undefined, undefined, 'server-1');
+    await vi.advanceTimersByTimeAsync(0);
+    await expect(next).resolves.toMatchObject({ attachment: { id: 'direct-attachment' } });
+    expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_INIT)).toHaveLength(1);
+  });
+
+  it('applies a server operation-error idle deadline before failing the attempt', async () => {
+    vi.useFakeTimers();
+    const { uploadFileDirect } = await import('../src/direct-file-transfer.js');
+    const { ws, sent } = createWs(directCapabilities, 'error_after_expiry', {
+      idleWindowMs: 100,
+      terminalDelayMs: 101,
+    });
+    const makeFile = (name: string) => {
+      const bytes = new TextEncoder().encode(name);
+      return {
+        name, type: 'text/plain', size: bytes.byteLength,
+        slice: (start: number, end: number) => ({ arrayBuffer: async () => bytes.slice(start, end).buffer }),
+      } as unknown as File;
+    };
+
+    const first = uploadFileDirect(ws, makeFile('first-error.txt'), id(), undefined, undefined, undefined, undefined, 'server-1');
+    // Attach the rejection assertion before advancing fake time: the server error
+    // is intentionally delivered by the timer below.
+    const firstRejected = expect(first).rejects.toMatchObject({ code: DIRECT_FILE_TRANSFER_ERROR.CONNECTION_FAILED });
+    await vi.advanceTimersByTimeAsync(101);
+    await firstRejected;
+
+    const second = uploadFileDirect(ws, makeFile('reuse-after-error.txt'), id(), undefined, undefined, undefined, undefined, 'server-1');
+    const secondRejected = expect(second).rejects.toMatchObject({ code: DIRECT_FILE_TRANSFER_ERROR.CONNECTION_FAILED });
+    await vi.advanceTimersByTimeAsync(101);
+    await secondRejected;
+    expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_INIT)).toHaveLength(1);
+  });
+
 });

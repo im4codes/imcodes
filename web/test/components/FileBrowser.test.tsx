@@ -21,6 +21,13 @@ const filePreviewPropsState = vi.hoisted(() => ({
   },
 }));
 
+const directFileTransferMocks = vi.hoisted(() => ({
+  downloadPreviewWithDirectFallback: vi.fn().mockResolvedValue(undefined),
+  prewarmDirectFileLease: vi.fn(() => undefined),
+  selectPreviewDownloadDestination: vi.fn().mockResolvedValue(null),
+  isDirectFileTransferStaleHandleError: vi.fn(() => false),
+}));
+
 // Mock FileEditor.js to prevent Vitest's SSR module graph from evaluating
 // 17 CodeMirror/Lezer imports (causes OOM in jsdom). vi.mock is hoisted but
 // Vitest still resolves the module graph for dependency analysis — this mock
@@ -40,6 +47,8 @@ vi.mock('../../src/components/FilePreviewPane.js', () => ({
     return <div data-testid="mock-file-preview">{props.content}</div>;
   },
 }));
+
+vi.mock('../../src/direct-file-transfer.js', () => directFileTransferMocks);
 
 import { FileBrowser, __resetFileBrowserSharedChangesForTests, mergePreviewState, getParentDir } from '../../src/components/FileBrowser.js';
 import type { WsClient, ServerMessage } from '../../src/ws-client.js';
@@ -178,9 +187,99 @@ function makeWsFactory() {
 describe('FileBrowser', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    directFileTransferMocks.downloadPreviewWithDirectFallback.mockResolvedValue(undefined);
+    directFileTransferMocks.prewarmDirectFileLease.mockReturnValue(undefined);
+    directFileTransferMocks.selectPreviewDownloadDestination.mockResolvedValue(null);
+    directFileTransferMocks.isDirectFileTransferStaleHandleError.mockReturnValue(false);
     filePreviewPropsState.current = null;
     localStorage.clear();
     __resetFileBrowserSharedChangesForTests();
+  });
+
+  it('prewarms only after a File Browser with a target daemon opens, and releases on close', () => {
+    const { ws } = makeWsFactory();
+    const release = vi.fn();
+    directFileTransferMocks.prewarmDirectFileLease.mockReturnValueOnce(release);
+    const view = render(
+      <FileBrowser ws={ws} mode="file-single" layout="panel" initialPath="/home/user" serverId="srv-1" onConfirm={vi.fn()} />,
+    );
+    expect(directFileTransferMocks.prewarmDirectFileLease).toHaveBeenCalledWith(ws, 'srv-1');
+    view.unmount();
+    expect(release).toHaveBeenCalledOnce();
+  });
+
+  it('does not create an inert direct-file lease without a selected daemon', () => {
+    const { ws } = makeWsFactory();
+    render(<FileBrowser ws={ws} mode="file-single" layout="panel" initialPath="/home/user" onConfirm={vi.fn()} />);
+    expect(directFileTransferMocks.prewarmDirectFileLease).not.toHaveBeenCalled();
+  });
+
+  it('starts preview download only from the clicked preview handle', async () => {
+    const { ws } = makeWsFactory();
+    const view = render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        serverId="srv-1"
+        sessionName="deck_project_brain"
+        initialPreview={{ status: 'ok', path: '/home/user/report.pdf', content: 'preview', downloadId: 'preview-handle' }}
+        onConfirm={vi.fn()}
+      />,
+    );
+    fireEvent.click(view.getByRole('button', { name: 'upload.download_file' }));
+    await waitFor(() => expect(directFileTransferMocks.downloadPreviewWithDirectFallback).toHaveBeenCalledWith(expect.objectContaining({
+      ws,
+      serverId: 'srv-1',
+      previewHandle: 'preview-handle',
+      suggestedName: 'report.pdf',
+      sessionName: 'deck_project_brain',
+      destination: null,
+    })));
+    expect(directFileTransferMocks.selectPreviewDownloadDestination).toHaveBeenCalledWith('report.pdf');
+  });
+
+  it('refreshes an expired direct preview handle exactly once and reuses the selected destination', async () => {
+    const { ws, sendMsg } = makeWsFactory();
+    const destination = { handle: { createWritable: vi.fn() } };
+    const stale = new Error('preview_handle_invalid');
+    directFileTransferMocks.selectPreviewDownloadDestination.mockResolvedValue(destination);
+    directFileTransferMocks.downloadPreviewWithDirectFallback
+      .mockRejectedValueOnce(stale)
+      .mockResolvedValueOnce(undefined);
+    directFileTransferMocks.isDirectFileTransferStaleHandleError.mockImplementation((error: unknown) => error === stale);
+    const view = render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        serverId="srv-1"
+        initialPreview={{ status: 'ok', path: '/home/user/report.pdf', content: 'preview', downloadId: 'expired-handle' }}
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(view.getByRole('button', { name: 'upload.download_file' }));
+    await waitFor(() => expect(directFileTransferMocks.downloadPreviewWithDirectFallback).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(ws.fsReadFile).toHaveBeenCalledWith('/home/user/report.pdf'));
+    act(() => sendMsg({
+      type: 'fs.read_response',
+      requestId: 'mock-read-id',
+      path: '/home/user/report.pdf',
+      status: 'ok',
+      content: 'refreshed preview',
+      downloadId: 'fresh-handle',
+    } as unknown as ServerMessage));
+    await waitFor(() => expect(directFileTransferMocks.downloadPreviewWithDirectFallback).toHaveBeenCalledTimes(2));
+
+    expect(directFileTransferMocks.downloadPreviewWithDirectFallback).toHaveBeenNthCalledWith(2, expect.objectContaining({
+      previewHandle: 'fresh-handle',
+      destination,
+    }));
+    expect(directFileTransferMocks.selectPreviewDownloadDestination).toHaveBeenCalledOnce();
+    expect(ws.fsReadFile).toHaveBeenCalledOnce();
   });
 
   it('does not regress an existing preview back to loading for the same file', () => {
