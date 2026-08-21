@@ -9672,3 +9672,162 @@ button.quick-agent-delegation-preset.active {
     animation-duration: 0s !important;
   }
 }
+/* Main-window download visibility. The transfer state is page-global, so this
+ * surface remains available when the File Browser panel is closed. */
+.download-transfer-center {
+  position: fixed;
+  right: 16px;
+  bottom: 16px;
+  z-index: 10040;
+  width: min(410px, calc(100vw - 32px));
+  overflow: hidden;
+  color: #e2e8f0;
+  background: rgba(15, 23, 42, 0.98);
+  border: 1px solid #334155;
+  border-radius: 12px;
+  box-shadow: 0 18px 44px rgba(0, 0, 0, 0.48);
+}
+
+.download-transfer-header,
+.download-transfer-row-heading,
+.download-transfer-status-line,
+.download-transfer-details,
+.download-transfer-actions {
+  display: flex;
+  align-items: center;
+}
+
+.download-transfer-header {
+  min-height: 44px;
+  padding: 0 10px;
+  border-bottom: 1px solid #273449;
+}
+
+.download-transfer-toggle,
+.download-transfer-clear,
+.download-transfer-actions button {
+  color: inherit;
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+}
+
+.download-transfer-toggle {
+  display: flex;
+  flex: 1;
+  gap: 8px;
+  align-items: center;
+  min-width: 0;
+  padding: 10px 2px;
+  font-weight: 700;
+  text-align: left;
+}
+
+.download-transfer-count {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 20px;
+  height: 20px;
+  padding: 0 6px;
+  font-size: 11px;
+  color: #082f49;
+  background: #38bdf8;
+  border-radius: 999px;
+}
+
+.download-transfer-clear,
+.download-transfer-actions button {
+  padding: 5px 7px;
+  font-size: 11px;
+  color: #7dd3fc;
+}
+
+.download-transfer-list {
+  max-height: min(55vh, 430px);
+  overflow: auto;
+}
+
+.download-transfer-row {
+  display: grid;
+  gap: 7px;
+  padding: 11px 12px;
+  border-bottom: 1px solid rgba(51, 65, 85, 0.65);
+}
+
+.download-transfer-row:last-child { border-bottom: 0; }
+.download-transfer-row-heading { gap: 8px; }
+
+.download-transfer-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  font-size: 12px;
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.download-transfer-route {
+  flex: none;
+  padding: 2px 6px;
+  font-size: 10px;
+  color: #cbd5e1;
+  background: #1e293b;
+  border-radius: 999px;
+}
+
+.download-transfer-route.route-direct { color: #86efac; }
+.download-transfer-route.route-http { color: #fde68a; }
+.download-transfer-route.route-browser { color: #c4b5fd; }
+
+.download-transfer-status-line,
+.download-transfer-details {
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 11px;
+  color: #94a3b8;
+}
+
+.download-transfer-progress {
+  position: relative;
+  height: 5px;
+  overflow: hidden;
+  background: #1e293b;
+  border-radius: 999px;
+}
+
+.download-transfer-progress > span {
+  display: block;
+  height: 100%;
+  background: #38bdf8;
+  border-radius: inherit;
+}
+
+.download-transfer-progress.indeterminate > span {
+  width: 35%;
+  animation: download-transfer-indeterminate 1.2s ease-in-out infinite;
+}
+
+.download-transfer-actions { justify-content: flex-end; }
+.download-transfer-actions button:hover,
+.download-transfer-clear:hover { color: #e0f2fe; }
+.download-transfer-row[data-status='failed'] .download-transfer-status-line { color: #fca5a5; }
+.download-transfer-row[data-status='completed'] .download-transfer-status-line { color: #86efac; }
+
+@keyframes download-transfer-indeterminate {
+  from { transform: translateX(-110%); }
+  to { transform: translateX(300%); }
+}
+
+@media (max-width: 640px) {
+  .download-transfer-center {
+    right: 8px;
+    bottom: calc(8px + env(safe-area-inset-bottom));
+    width: calc(100vw - 16px);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .download-transfer-progress.indeterminate > span { animation: none; }
+}

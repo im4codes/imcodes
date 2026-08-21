@@ -1581,6 +1581,29 @@
     "propose_from_discussion_prompt": "Сгенерируй изменение OpenSpec на основе недавнего обсуждения. Выдели цель, scope, ключевые требования и критерии приемки, неясные места перечисли как вопросы на уточнение и запиши реальные артефакты в openspec/changes/ (proposal, design, specs и tasks), а не останавливайся на черновой заметке.",
     "propose_from_description_prompt": "Сгенерируй изменение OpenSpec на основе описания ниже. Сформируй цель, scope, ключевые требования и критерии приемки, недостающие детали перечисли как вопросы на уточнение и запиши реальные артефакты в openspec/changes/ (proposal, design, specs и tasks), а не останавливайся на черновой заметке."
   },
+  "downloads": {
+    "title": "Загрузки",
+    "expand": "Развернуть загрузки",
+    "collapse": "Свернуть загрузки",
+    "clear_finished": "Очистить завершённые",
+    "cancel": "Отменить",
+    "dismiss": "Убрать",
+    "progress_aria": "Ход загрузки {{name}}",
+    "transferred": "{{transferred}} / {{total}}",
+    "speed": "{{speed}}/с",
+    "speed_calculating": "Измерение скорости…",
+    "status": {
+      "preparing": "Подготовка",
+      "connecting": "Подключение",
+      "transferring": "Загрузка",
+      "falling_back": "Переход на HTTP",
+      "handed_off": "Передано браузеру",
+      "completed": "Завершено",
+      "canceled": "Отменено",
+      "failed": "Ошибка"
+    },
+    "route": { "pending": "Ожидание", "direct": "Напрямую", "http": "HTTP", "browser": "Браузер" }
+  },
   "upload": {
     "upload_file": "Загрузить файл",
     "uploading": "Загрузка...",

@@ -401,21 +401,87 @@ describe('direct file transfer v2 browser broker', () => {
   });
 
   it('streams a direct preview into a File System Access writer without Blob/HTTP fallback', async () => {
-    const { downloadPreviewWithDirectFallback } = await import('../src/direct-file-transfer.js');
+    const { downloadPreviewWithDirectFallback, FILE_DOWNLOAD_TRANSPORT_MODE } = await import('../src/direct-file-transfer.js');
     const writer = { write: vi.fn().mockResolvedValue(undefined), close: vi.fn().mockResolvedValue(undefined), abort: vi.fn().mockResolvedValue(undefined) };
     const destination = { handle: { createWritable: vi.fn().mockResolvedValue(writer) } };
     const { ws } = createWs(directCapabilities);
+    const onProgress = vi.fn();
+    const onMode = vi.fn();
 
     await downloadPreviewWithDirectFallback({
       ws,
       serverId: 'server-1',
       previewHandle: 'preview-handle-1',
       destination,
+      onProgress,
+      onMode,
     });
 
     expect(writer.write).toHaveBeenCalledTimes(1);
     expect(writer.close).toHaveBeenCalledTimes(1);
+    expect(onMode).toHaveBeenCalledWith(FILE_DOWNLOAD_TRANSPORT_MODE.CONNECTING);
+    expect(onMode).toHaveBeenCalledWith(FILE_DOWNLOAD_TRANSPORT_MODE.DIRECT);
+    expect(onProgress).toHaveBeenCalledWith({ loadedBytes: 0, totalBytes: 3 });
+    expect(onProgress).toHaveBeenLastCalledWith({ loadedBytes: 3, totalBytes: 3 });
     expect(apiMocks.streamAttachmentDownloadToWritable).not.toHaveBeenCalled();
+  });
+
+  it('reports direct exhaustion and HTTP sink progress through the same download callbacks', async () => {
+    const { downloadPreviewWithDirectFallback, FILE_DOWNLOAD_TRANSPORT_MODE } = await import('../src/direct-file-transfer.js');
+    const writers = Array.from({ length: 4 }, () => ({
+      write: vi.fn().mockResolvedValue(undefined),
+      close: vi.fn().mockResolvedValue(undefined),
+      abort: vi.fn().mockResolvedValue(undefined),
+    }));
+    const destination = { handle: { createWritable: vi.fn().mockImplementation(() => Promise.resolve(writers.shift()!)) } };
+    const { ws } = createWs(directCapabilities, 'operation_failure');
+    const onProgress = vi.fn();
+    const onMode = vi.fn();
+    apiMocks.streamAttachmentDownloadToWritable.mockImplementationOnce(async (...args: unknown[]) => {
+      const progress = args[5] as ((value: { loadedBytes: number; totalBytes: number | null }) => void) | undefined;
+      progress?.({ loadedBytes: 0, totalBytes: 8 });
+      progress?.({ loadedBytes: 8, totalBytes: 8 });
+    });
+
+    await downloadPreviewWithDirectFallback({
+      ws,
+      serverId: 'server-1',
+      previewHandle: 'preview-handle-1',
+      destination,
+      onProgress,
+      onMode,
+    });
+
+    expect(destination.handle.createWritable).toHaveBeenCalledTimes(4);
+    expect(onMode.mock.calls.map(([mode]) => mode)).toEqual([
+      FILE_DOWNLOAD_TRANSPORT_MODE.CONNECTING,
+      FILE_DOWNLOAD_TRANSPORT_MODE.FALLING_BACK,
+      FILE_DOWNLOAD_TRANSPORT_MODE.HTTP,
+    ]);
+    expect(onProgress).toHaveBeenLastCalledWith({ loadedBytes: 8, totalBytes: 8 });
+    expect(apiMocks.streamAttachmentDownloadToWritable).toHaveBeenCalledOnce();
+  });
+
+  it('labels an unobservable native/browser download as handed off without fabricated progress', async () => {
+    const { downloadPreviewWithDirectFallback, FILE_DOWNLOAD_TRANSPORT_MODE } = await import('../src/direct-file-transfer.js');
+    const { ws } = createWs([]);
+    const httpFallback = vi.fn().mockResolvedValue(undefined);
+    const onProgress = vi.fn();
+    const onMode = vi.fn();
+
+    await downloadPreviewWithDirectFallback({
+      ws,
+      serverId: 'server-1',
+      previewHandle: 'preview-handle-1',
+      destination: null,
+      httpFallback,
+      onProgress,
+      onMode,
+    });
+
+    expect(onMode).toHaveBeenCalledOnce();
+    expect(onMode).toHaveBeenCalledWith(FILE_DOWNLOAD_TRANSPORT_MODE.BROWSER);
+    expect(onProgress).not.toHaveBeenCalled();
   });
 
   it('classifies daemon preview-handle expiry as the File Browser one-refresh condition', async () => {

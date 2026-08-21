@@ -1582,6 +1582,29 @@
     "propose_from_discussion_prompt": "根據最近的討論生成一個 OpenSpec 變更。提煉目標、範圍、關鍵需求和驗收標準；不明確的部分明確列為待確認項；並直接把 proposal、design、specs、tasks 寫到 openspec/changes/ 下，而不是只停留在草稿說明。",
     "propose_from_description_prompt": "根據下面的描述生成一個 OpenSpec 變更。整理目標、範圍、關鍵需求和驗收標準；缺失資訊明確列為待確認項；並直接把 proposal、design、specs、tasks 寫到 openspec/changes/ 下，而不是只停留在草稿說明。"
   },
+  "downloads": {
+    "title": "下載",
+    "expand": "展開下載清單",
+    "collapse": "收合下載清單",
+    "clear_finished": "清除已結束",
+    "cancel": "取消",
+    "dismiss": "移除",
+    "progress_aria": "{{name}} 的下載進度",
+    "transferred": "{{transferred}} / {{total}}",
+    "speed": "{{speed}}/秒",
+    "speed_calculating": "測速中…",
+    "status": {
+      "preparing": "準備中",
+      "connecting": "正在連線",
+      "transferring": "下載中",
+      "falling_back": "正在切換 HTTP",
+      "handed_off": "已交給瀏覽器",
+      "completed": "已完成",
+      "canceled": "已取消",
+      "failed": "下載失敗"
+    },
+    "route": { "pending": "等待中", "direct": "直連", "http": "HTTP", "browser": "瀏覽器" }
+  },
   "upload": {
     "upload_file": "上傳檔案",
     "uploading": "上傳中...",

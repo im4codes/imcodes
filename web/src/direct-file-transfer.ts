@@ -56,6 +56,17 @@ export const FILE_UPLOAD_TRANSPORT_MODE = {
 
 export type FileUploadTransportMode = typeof FILE_UPLOAD_TRANSPORT_MODE[keyof typeof FILE_UPLOAD_TRANSPORT_MODE];
 
+export const FILE_DOWNLOAD_TRANSPORT_MODE = {
+  CONNECTING: 'connecting',
+  DIRECT: 'direct',
+  FALLING_BACK: 'falling_back',
+  HTTP: 'http',
+  BROWSER: 'browser',
+} as const;
+
+export type FileDownloadTransportMode = typeof FILE_DOWNLOAD_TRANSPORT_MODE[keyof typeof FILE_DOWNLOAD_TRANSPORT_MODE];
+export type FileDownloadProgress = { loadedBytes: number; totalBytes: number | null };
+
 /** Redacted browser observability: never include ids, names, paths, SDP, or authority. */
 export const DIRECT_FILE_TRANSFER_CLIENT_METRIC = {
   LEASE_REUSED: 'lease_reused',
@@ -185,6 +196,8 @@ type DirectDownloadAttempt = {
   operationId: string;
   sessionName?: string;
   writer: FileSystemWritableFileStreamLike;
+  onProgress?: (progress: FileDownloadProgress) => void;
+  onConnected?: () => void;
   signal?: AbortSignal;
 };
 
@@ -1006,6 +1019,7 @@ async function runAttempt(lease: Lease, op: DirectAttempt, attempt: number): Pro
           direction: DIRECT_FILE_TRANSFER_DIRECTION.DOWNLOAD,
           bytes: received,
         });
+        downloadOp.onProgress?.({ loadedBytes: received, totalBytes: expected });
         sendData(channel, {
           type: DIRECT_FILE_TRANSFER_DATA_MSG.DOWNLOAD_COMMITTED,
           protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
@@ -1042,6 +1056,7 @@ async function runAttempt(lease: Lease, op: DirectAttempt, attempt: number): Pro
               throw directError(DIRECT_FILE_TRANSFER_ERROR.WRITE_FAILED, false, error instanceof Error ? error.message : undefined);
             }
             received += bytes.byteLength;
+            op.onProgress?.({ loadedBytes: received, totalBytes: expected });
             arm();
             sendData(channel, {
               type: DIRECT_FILE_TRANSFER_DATA_MSG.CREDIT,
@@ -1080,6 +1095,8 @@ async function runAttempt(lease: Lease, op: DirectAttempt, attempt: number): Pro
         if (data.type === DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED && !started && data.direction === DIRECT_FILE_TRANSFER_DIRECTION.DOWNLOAD) {
           started = true;
           expected = data.size;
+          op.onConnected?.();
+          op.onProgress?.({ loadedBytes: 0, totalBytes: expected });
           sendData(channel, {
             type: DIRECT_FILE_TRANSFER_DATA_MSG.CREDIT,
             protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
@@ -1338,6 +1355,8 @@ export async function downloadPreviewWithDirectFallback(options: {
   /** Kept for the non-FSA/native browser fallback only. */
   httpFallback?: () => Promise<void>;
   signal?: AbortSignal;
+  onProgress?: (progress: FileDownloadProgress) => void;
+  onMode?: (mode: FileDownloadTransportMode) => void;
 }): Promise<void> {
   const destination = options.destination === undefined
     ? await selectPreviewDownloadDestination(options.suggestedName)
@@ -1346,10 +1365,12 @@ export async function downloadPreviewWithDirectFallback(options: {
     // No File System Access API means no safe streaming sink.  Keep the
     // established HTTP browser download as the only fallback and do not start
     // an unbounded Blob/direct transfer.
-    await (options.httpFallback ?? (() => downloadAttachment(options.serverId, options.previewHandle, options.sessionName))());
+    options.onMode?.(FILE_DOWNLOAD_TRANSPORT_MODE.BROWSER);
+    await (options.httpFallback ?? (() => downloadAttachment(options.serverId, options.previewHandle, options.sessionName, options.signal))());
     return;
   }
   if (supportsPreviewDownload(options.ws)) {
+    options.onMode?.(FILE_DOWNLOAD_TRANSPORT_MODE.CONNECTING);
     const { lease, release } = acquireLease(options.ws, options.serverId);
     try {
       const operationId = crypto.randomUUID();
@@ -1359,6 +1380,8 @@ export async function downloadPreviewWithDirectFallback(options: {
         operationId,
         sessionName: options.sessionName,
         writer: await createPreviewWriter(destination),
+        onProgress: options.onProgress,
+        onConnected: () => options.onMode?.(FILE_DOWNLOAD_TRANSPORT_MODE.DIRECT),
         signal: options.signal,
       }), options.signal);
       recordDirectFileTransferMetric(DIRECT_FILE_TRANSFER_CLIENT_METRIC.DIRECT_SUCCESS, {
@@ -1373,7 +1396,22 @@ export async function downloadPreviewWithDirectFallback(options: {
       // of constructing a Blob.
       const writer = await createPreviewWriter(destination);
       try {
-        await streamAttachmentDownloadToWritable(options.serverId, options.previewHandle, writer, options.sessionName, options.signal);
+        options.onMode?.(FILE_DOWNLOAD_TRANSPORT_MODE.FALLING_BACK);
+        let httpStarted = false;
+        await streamAttachmentDownloadToWritable(
+          options.serverId,
+          options.previewHandle,
+          writer,
+          options.sessionName,
+          options.signal,
+          (progress) => {
+            if (!httpStarted) {
+              httpStarted = true;
+              options.onMode?.(FILE_DOWNLOAD_TRANSPORT_MODE.HTTP);
+            }
+            options.onProgress?.(progress);
+          },
+        );
         await writer.close();
         return;
       } catch (fallbackError) {
@@ -1386,7 +1424,8 @@ export async function downloadPreviewWithDirectFallback(options: {
   }
   const writer = await createPreviewWriter(destination);
   try {
-    await streamAttachmentDownloadToWritable(options.serverId, options.previewHandle, writer, options.sessionName, options.signal);
+    options.onMode?.(FILE_DOWNLOAD_TRANSPORT_MODE.HTTP);
+    await streamAttachmentDownloadToWritable(options.serverId, options.previewHandle, writer, options.sessionName, options.signal, options.onProgress);
     await writer.close();
   } catch (error) {
     await writer.abort(error).catch(() => undefined);

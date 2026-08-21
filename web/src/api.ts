@@ -1600,6 +1600,11 @@ export interface AttachmentDownloadWritable {
   write(data: BufferSource): Promise<void>;
 }
 
+export interface AttachmentDownloadProgress {
+  loadedBytes: number;
+  totalBytes: number | null;
+}
+
 /**
  * Stream an attachment response into a caller-owned writable sink.  This is
  * used by File Browser's direct-download HTTP fallback so multi-GiB files
@@ -1611,6 +1616,7 @@ export async function streamAttachmentDownloadToWritable(
   writable: AttachmentDownloadWritable,
   sessionName?: string,
   signal?: AbortSignal,
+  onProgress?: (progress: AttachmentDownloadProgress) => void,
 ): Promise<void> {
   if (signal?.aborted) throw new DOMException('download_canceled', 'AbortError');
   const res = await rawFetch(
@@ -1622,13 +1628,22 @@ export async function streamAttachmentDownloadToWritable(
     throw new ApiError(res.status, body);
   }
   if (!res.body) throw new ApiError(res.status, 'download_stream_unavailable');
+  const contentLength = res.headers.get('content-length');
+  const parsedLength = contentLength === null ? Number.NaN : Number(contentLength);
+  const totalBytes = Number.isSafeInteger(parsedLength) && parsedLength >= 0 ? parsedLength : null;
+  let loadedBytes = 0;
+  onProgress?.({ loadedBytes, totalBytes });
   const reader = res.body.getReader();
   try {
     for (;;) {
       if (signal?.aborted) throw new DOMException('download_canceled', 'AbortError');
       const { done, value } = await reader.read();
       if (done) break;
-      if (value?.byteLength) await writable.write(value);
+      if (value?.byteLength) {
+        await writable.write(value);
+        loadedBytes += value.byteLength;
+        onProgress?.({ loadedBytes, totalBytes });
+      }
     }
   } catch (error) {
     await reader.cancel(error).catch(() => undefined);

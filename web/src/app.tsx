@@ -78,6 +78,7 @@ import { ContextDiagnosticsPanel } from './components/ContextDiagnosticsPanel.js
 import { NewUserGuide, type NewUserGuideStep } from './components/NewUserGuide.js';
 import { TeamDiscussionGuide } from './components/TeamDiscussionGuide.js';
 import { FeatureAnnouncementHost } from './components/FeatureAnnouncement.js';
+import { DownloadTransferCenter } from './components/DownloadTransferCenter.js';
 import { mergeUsageUpdate } from './usage-data.js';
 import { ServerIconBar } from './components/ServerIconBar.js';
 import { Sidebar, loadSidebarCollapsed, saveSidebarCollapsed } from './components/Sidebar.js';
@@ -6739,6 +6740,8 @@ export function App() {
           </div>
         </div>
       )}
+
+      <DownloadTransferCenter />
 
       {/* Toasts: idle completions + CC notifications */}
       {toasts.length > 0 && (

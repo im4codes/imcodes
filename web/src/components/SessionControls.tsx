@@ -53,6 +53,7 @@ import { useSupervisorDefaults } from '../hooks/useSupervisorDefaults.js';
 import { PREF_KEY_P2P_COMBO_CONFIRM_SKIP, PREF_KEY_P2P_DROPDOWN_TAB, p2pSessionConfigLegacyPrefKeys, p2pSessionConfigPrefKey } from '../constants/prefs.js';
 import { parseP2pSavedConfig, serializeP2pSavedConfig } from '../preferences/p2p-config-pref.js';
 import { sendSessionViaHttp, cancelSessionViaHttp, deleteAttachment } from '../api.js';
+import { formatTransferBytes, formatTransferDuration } from '../util/transfer-format.js';
 import { DirectFileTransferFailure, FILE_UPLOAD_TRANSPORT_MODE, isFileUploadCanceled, uploadFileWithDirectFallback, type FileUploadTransportMode } from '../direct-file-transfer.js';
 import { patchSession, patchSessionSupervision, patchSubSession } from '../api.js';
 import { isImeComposingKeyEvent } from '../ime-keyboard.js';
@@ -789,34 +790,6 @@ function updateComposerUploadTransport(
       };
     }),
   });
-}
-
-function formatUploadBytes(bytes: number): string {
-  const safeBytes = Math.max(0, Number.isFinite(bytes) ? bytes : 0);
-  const units: Array<{ size: number; unit: Intl.NumberFormatOptions['unit'] }> = [
-    { size: 1024 ** 4, unit: 'terabyte' },
-    { size: 1024 ** 3, unit: 'gigabyte' },
-    { size: 1024 ** 2, unit: 'megabyte' },
-    { size: 1024, unit: 'kilobyte' },
-    { size: 1, unit: 'byte' },
-  ];
-  const selected = units.find((entry) => safeBytes >= entry.size) ?? units[units.length - 1];
-  return new Intl.NumberFormat(undefined, {
-    style: 'unit',
-    unit: selected.unit,
-    unitDisplay: 'short',
-    maximumFractionDigits: selected.size === 1 ? 0 : 1,
-  }).format(safeBytes / selected.size);
-}
-
-function formatUploadDuration(seconds: number): string {
-  const totalSeconds = Math.max(0, Math.round(Number.isFinite(seconds) ? seconds : 0));
-  const hours = Math.floor(totalSeconds / 3600);
-  const minutes = Math.floor((totalSeconds % 3600) / 60);
-  const remainder = totalSeconds % 60;
-  return hours > 0
-    ? `${hours}:${String(minutes).padStart(2, '0')}:${String(remainder).padStart(2, '0')}`
-    : `${minutes}:${String(remainder).padStart(2, '0')}`;
 }
 
 function removeComposerUploadItems(key: string, ids: readonly string[]): void {
@@ -5845,15 +5818,15 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                 <span data-testid="composer-upload-progress" class="composer-upload-progress-value">{item.progress}%</span>
                 <div data-testid="composer-upload-stats" class="composer-upload-stats">
                   <span>{t('upload.transferred', {
-                    transferred: formatUploadBytes(transferredBytes),
-                    total: formatUploadBytes(item.totalBytes),
+                    transferred: formatTransferBytes(transferredBytes),
+                    total: formatTransferBytes(item.totalBytes),
                   })}</span>
                   <span>{item.speedBps > 0
-                    ? t('upload.speed', { speed: formatUploadBytes(item.speedBps) })
+                    ? t('upload.speed', { speed: formatTransferBytes(item.speedBps) })
                     : t('upload.speed_calculating')}</span>
-                  <span>{t('upload.elapsed', { time: formatUploadDuration(elapsedSeconds) })}</span>
+                  <span>{t('upload.elapsed', { time: formatTransferDuration(elapsedSeconds) })}</span>
                   <span>{etaSeconds !== null && item.progress < 100
-                    ? t('upload.eta', { time: formatUploadDuration(etaSeconds) })
+                    ? t('upload.eta', { time: formatTransferDuration(etaSeconds) })
                     : item.progress >= 100
                       ? t('upload.eta_done')
                       : t('upload.eta_calculating')}</span>

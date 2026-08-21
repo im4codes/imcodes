@@ -28,11 +28,22 @@ import { ImageLightbox } from './ImageLightbox.js';
 import type { ChatLocalImagePreviewLoader } from './ChatLocalImagePreview.js';
 import { buildAttachmentDownloadUrl, downloadAttachment } from '../api.js';
 import {
+  FILE_DOWNLOAD_TRANSPORT_MODE,
   downloadPreviewWithDirectFallback,
   isDirectFileTransferStaleHandleError,
+  isFileUploadCanceled,
   prewarmDirectFileLease,
   selectPreviewDownloadDestination,
 } from '../direct-file-transfer.js';
+import {
+  DOWNLOAD_TRANSFER_ROUTE,
+  DOWNLOAD_TRANSFER_STATUS,
+  beginDownloadTransfer,
+  completeDownloadTransfer,
+  failDownloadTransfer,
+  reportDownloadTransferProgress,
+  updateDownloadTransfer,
+} from '../download-transfer-store.js';
 import {
   getSharedChangesKey,
   subscribeSharedChanges,
@@ -1719,6 +1730,7 @@ export function FileBrowser({
     const destination = await selectPreviewDownloadDestination(
       selectedPath.split(/[/\\]/).pop() || undefined,
     );
+    const transfer = beginDownloadTransfer(selectedPath.split(/[/\\]/).pop() || selectedPath);
     const download = async (handle: string) => downloadPreviewWithDirectFallback({
       ws,
       serverId,
@@ -1728,10 +1740,28 @@ export function FileBrowser({
       destination,
       // HTTP remains the documented fallback only.  The direct helper owns
       // retry classification and calls this at most once when it is eligible.
-      httpFallback: () => downloadAttachment(serverId, handle, sessionName),
+      httpFallback: () => downloadAttachment(serverId, handle, sessionName, transfer.signal),
+      signal: transfer.signal,
+      onProgress: ({ loadedBytes, totalBytes }) => {
+        reportDownloadTransferProgress(transfer.id, loadedBytes, totalBytes);
+      },
+      onMode: (mode) => {
+        if (mode === FILE_DOWNLOAD_TRANSPORT_MODE.CONNECTING) {
+          updateDownloadTransfer(transfer.id, DOWNLOAD_TRANSFER_ROUTE.PENDING, DOWNLOAD_TRANSFER_STATUS.CONNECTING);
+        } else if (mode === FILE_DOWNLOAD_TRANSPORT_MODE.DIRECT) {
+          updateDownloadTransfer(transfer.id, DOWNLOAD_TRANSFER_ROUTE.DIRECT, DOWNLOAD_TRANSFER_STATUS.TRANSFERRING);
+        } else if (mode === FILE_DOWNLOAD_TRANSPORT_MODE.FALLING_BACK) {
+          updateDownloadTransfer(transfer.id, DOWNLOAD_TRANSFER_ROUTE.HTTP, DOWNLOAD_TRANSFER_STATUS.FALLING_BACK);
+        } else if (mode === FILE_DOWNLOAD_TRANSPORT_MODE.HTTP) {
+          updateDownloadTransfer(transfer.id, DOWNLOAD_TRANSFER_ROUTE.HTTP, DOWNLOAD_TRANSFER_STATUS.TRANSFERRING);
+        } else {
+          updateDownloadTransfer(transfer.id, DOWNLOAD_TRANSFER_ROUTE.BROWSER, DOWNLOAD_TRANSFER_STATUS.PREPARING);
+        }
+      },
     });
     try {
       await download(selectedHandle);
+      completeDownloadTransfer(transfer.id, destination === null);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       const isStaleHandle = isDirectFileTransferStaleHandleError(err)
@@ -1754,6 +1784,7 @@ export function FileBrowser({
           const stillSelected = previewRef.current;
           if (stillSelected.status === 'idle' || !('downloadId' in stillSelected)
             || stillSelected.path !== selectedPath || stillSelected.downloadId !== selectedHandle) {
+            failDownloadTransfer(transfer.id, true);
             return;
           }
           setPreview((prev) => {
@@ -1761,9 +1792,13 @@ export function FileBrowser({
             return { ...prev, downloadId: freshId } as typeof prev;
           });
           await download(freshId);
+          completeDownloadTransfer(transfer.id, destination === null);
           return;
         } catch { /* one refresh only — fall through to the visible error */ }
       }
+      const canceled = isFileUploadCanceled(err) || transfer.signal.aborted;
+      failDownloadTransfer(transfer.id, canceled);
+      if (canceled) return;
       if (msg.includes('daemon_offline') || msg.includes('503')) setDownloadError(t('upload.daemon_offline'));
       else if (isStaleHandle) setDownloadError(t('upload.download_expired'));
       else if (msg.includes('504') || msg.includes('timeout')) setDownloadError(t('upload.download_timeout'));

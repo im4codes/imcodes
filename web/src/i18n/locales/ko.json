@@ -1581,6 +1581,29 @@
     "propose_from_discussion_prompt": "최근 논의를 바탕으로 OpenSpec 변경을 생성하세요. 목표, 범위, 핵심 요구사항, 승인 기준을 정리하고, 불명확한 부분은 확인 필요 항목으로 남긴 뒤, 초안 메모에서 멈추지 말고 openspec/changes/ 아래에 proposal, design, specs, tasks를 실제로 작성하세요.",
     "propose_from_description_prompt": "아래 설명을 바탕으로 OpenSpec 변경을 생성하세요. 목표, 범위, 핵심 요구사항, 승인 기준을 정리하고, 빠진 정보는 확인 필요 항목으로 남긴 뒤, 초안 메모에서 멈추지 말고 openspec/changes/ 아래에 proposal, design, specs, tasks를 실제로 작성하세요."
   },
+  "downloads": {
+    "title": "다운로드",
+    "expand": "다운로드 펼치기",
+    "collapse": "다운로드 접기",
+    "clear_finished": "완료 항목 지우기",
+    "cancel": "취소",
+    "dismiss": "제거",
+    "progress_aria": "{{name}} 다운로드 진행률",
+    "transferred": "{{transferred}} / {{total}}",
+    "speed": "{{speed}}/초",
+    "speed_calculating": "속도 측정 중…",
+    "status": {
+      "preparing": "준비 중",
+      "connecting": "연결 중",
+      "transferring": "다운로드 중",
+      "falling_back": "HTTP로 전환 중",
+      "handed_off": "브라우저로 전달됨",
+      "completed": "완료됨",
+      "canceled": "취소됨",
+      "failed": "실패"
+    },
+    "route": { "pending": "대기 중", "direct": "직접", "http": "HTTP", "browser": "브라우저" }
+  },
   "upload": {
     "upload_file": "파일 업로드",
     "uploading": "업로드 중...",

@@ -1582,6 +1582,29 @@
     "propose_from_discussion_prompt": "Genera un cambio de OpenSpec a partir de la discusión reciente. Extrae el objetivo, el alcance, los requisitos clave y los criterios de aceptación, deja los puntos poco claros como pendientes y escribe los artefactos reales bajo openspec/changes/ (proposal, design, specs y tasks) en lugar de quedarte en una nota borrador.",
     "propose_from_description_prompt": "Genera un cambio de OpenSpec a partir de la descripción de abajo. Organiza el objetivo, el alcance, los requisitos clave y los criterios de aceptación, deja los detalles faltantes como pendientes y escribe los artefactos reales bajo openspec/changes/ (proposal, design, specs y tasks) en lugar de quedarte en una nota borrador."
   },
+  "downloads": {
+    "title": "Descargas",
+    "expand": "Expandir descargas",
+    "collapse": "Contraer descargas",
+    "clear_finished": "Borrar finalizadas",
+    "cancel": "Cancelar",
+    "dismiss": "Quitar",
+    "progress_aria": "Progreso de descarga de {{name}}",
+    "transferred": "{{transferred}} / {{total}}",
+    "speed": "{{speed}}/s",
+    "speed_calculating": "Midiendo velocidad…",
+    "status": {
+      "preparing": "Preparando",
+      "connecting": "Conectando",
+      "transferring": "Descargando",
+      "falling_back": "Cambiando a HTTP",
+      "handed_off": "Enviada al navegador",
+      "completed": "Completada",
+      "canceled": "Cancelada",
+      "failed": "Fallida"
+    },
+    "route": { "pending": "Pendiente", "direct": "Directa", "http": "HTTP", "browser": "Navegador" }
+  },
   "upload": {
     "upload_file": "Subir archivo",
     "uploading": "Subiendo...",

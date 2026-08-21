@@ -1582,6 +1582,29 @@
     "propose_from_discussion_prompt": "Generate an OpenSpec change from the recent discussion. Extract the goal, scope, key requirements, and acceptance criteria, list unclear points as follow-ups, and write the actual change artifacts under openspec/changes/ (proposal, design, specs, tasks) instead of stopping at a draft note.",
     "propose_from_description_prompt": "Generate an OpenSpec change from the description below. Organize the goal, scope, key requirements, and acceptance criteria, list missing details as follow-ups, and write the actual change artifacts under openspec/changes/ (proposal, design, specs, tasks) instead of stopping at a draft note."
   },
+  "downloads": {
+    "title": "Downloads",
+    "expand": "Expand downloads",
+    "collapse": "Collapse downloads",
+    "clear_finished": "Clear finished",
+    "cancel": "Cancel",
+    "dismiss": "Dismiss",
+    "progress_aria": "Download progress for {{name}}",
+    "transferred": "{{transferred}} / {{total}}",
+    "speed": "{{speed}}/s",
+    "speed_calculating": "Measuring speed…",
+    "status": {
+      "preparing": "Preparing",
+      "connecting": "Connecting",
+      "transferring": "Downloading",
+      "falling_back": "Switching to HTTP",
+      "handed_off": "Handed to browser",
+      "completed": "Completed",
+      "canceled": "Canceled",
+      "failed": "Failed"
+    },
+    "route": { "pending": "Pending", "direct": "Direct", "http": "HTTP", "browser": "Browser" }
+  },
   "upload": {
     "upload_file": "Upload file",
     "uploading": "Uploading...",

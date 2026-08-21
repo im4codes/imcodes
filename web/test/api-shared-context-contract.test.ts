@@ -359,16 +359,35 @@ describe('shared-context and file API contracts', () => {
 
   it('streams File Browser fallback bytes into its provided writable without creating a Blob', async () => {
     const fetchMock = vi.mocked(fetch);
-    fetchMock.mockResolvedValueOnce(new Response(new Uint8Array([1, 2, 3, 4]), { status: 200 }));
-    const write = vi.fn().mockResolvedValue(undefined);
+    fetchMock.mockResolvedValueOnce(new Response(new Uint8Array([1, 2, 3, 4]), {
+      status: 200,
+      headers: { 'Content-Length': '4' },
+    }));
+    let releaseWrite!: () => void;
+    const writeSettled = new Promise<void>((resolve) => { releaseWrite = resolve; });
+    const write = vi.fn().mockReturnValue(writeSettled);
+    const onProgress = vi.fn();
     const objectUrlSpy = vi.fn();
     Object.defineProperty(URL, 'createObjectURL', { configurable: true, value: objectUrlSpy });
     const { configure, streamAttachmentDownloadToWritable } = await import('../src/api.js');
     configure('https://api.example');
 
-    await streamAttachmentDownloadToWritable('srv-1', 'att-stream', { write }, 'deck_project_brain');
+    const pending = streamAttachmentDownloadToWritable(
+      'srv-1',
+      'att-stream',
+      { write },
+      'deck_project_brain',
+      undefined,
+      onProgress,
+    );
+
+    await vi.waitFor(() => expect(write).toHaveBeenCalledOnce());
+    expect(onProgress).toHaveBeenLastCalledWith({ loadedBytes: 0, totalBytes: 4 });
+    releaseWrite();
+    await pending;
 
     expect((write.mock.calls[0]?.[0] as Uint8Array | undefined)?.byteLength).toBe(4);
+    expect(onProgress).toHaveBeenLastCalledWith({ loadedBytes: 4, totalBytes: 4 });
     expect(objectUrlSpy).not.toHaveBeenCalled();
     expect(fetchMock).toHaveBeenCalledWith(
       'https://api.example/api/server/srv-1/uploads/att-stream/download?sessionName=deck_project_brain',
