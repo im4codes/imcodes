@@ -46,6 +46,18 @@ describe('DownloadTransferCenter', () => {
     expect(screen.getByText('downloads.status.canceled')).toBeTruthy();
   });
 
+  it('middle-truncates a long filename while exposing the complete name on hover', () => {
+    const name = '355e6ce9c3b8a7a757370f07c41dced1.zh-CN.subtitled.mp4';
+    beginDownloadTransfer(name);
+    render(<DownloadTransferCenter />);
+
+    const filename = screen.getByTestId('download-transfer-name');
+    expect(filename.getAttribute('title')).toBe(name);
+    expect(filename.textContent).toBe(name);
+    expect(filename.querySelector('.download-transfer-name-leading')).toBeTruthy();
+    expect(filename.querySelector('.download-transfer-name-trailing')?.textContent).toBe('.zh-CN.subtitled.mp4');
+  });
+
   it('keeps a completed row visible until it is dismissed', () => {
     const transfer = beginDownloadTransfer('done.zip');
     completeDownloadTransfer(transfer.id);

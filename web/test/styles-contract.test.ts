@@ -174,6 +174,26 @@ describe('styles.css regression contracts', () => {
     expect(relayProgressRule?.[0]).toMatch(/#fbbf24/);
   });
 
+  it('keeps long download rows constrained while preserving right-side metadata and actions', () => {
+    const rowRule = css.match(/\.download-transfer-row\s*\{[^}]*\}/)?.[0];
+    expect(rowRule).toBeTruthy();
+    expect(rowRule).toMatch(/grid-template-columns:\s*minmax\(0,\s*1fr\)\s+max-content/);
+    expect(rowRule).toMatch(/min-width:\s*0/);
+    expect(rowRule).toMatch(/max-width:\s*100%/);
+
+    const headingRule = css.match(/\.download-transfer-row-heading,\s*\.download-transfer-status-line\s*\{[^}]*\}/)?.[0];
+    expect(headingRule).toBeTruthy();
+    expect(headingRule).toMatch(/grid-template-columns:\s*minmax\(0,\s*1fr\)\s+max-content/);
+
+    const leadingNameRule = css.match(/\.download-transfer-name-leading\s*\{[^}]*\}/)?.[0];
+    expect(leadingNameRule).toBeTruthy();
+    expect(leadingNameRule).toMatch(/text-overflow:\s*ellipsis/);
+
+    const listRule = css.match(/\.download-transfer-list\s*\{[^}]*\}/)?.[0];
+    expect(listRule).toBeTruthy();
+    expect(listRule).toMatch(/overflow-x:\s*hidden/);
+  });
+
   it('keeps the remote-desktop right-click helper touch-only', () => {
     const desktopRule = css.match(/\.remote-desktop-touch-right-button\s*\{[^}]*\}/)?.[0];
     expect(desktopRule).toBeTruthy();

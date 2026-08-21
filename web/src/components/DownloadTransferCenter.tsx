@@ -11,6 +11,20 @@ import {
 } from '../download-transfer-store.js';
 import { formatTransferBytes } from '../util/transfer-format.js';
 
+const DOWNLOAD_NAME_MIDDLE_ELLIPSIS_THRESHOLD = 36;
+const DOWNLOAD_NAME_TRAILING_CHARACTERS = 20;
+
+function splitDownloadName(name: string): { leading: string; trailing: string | null } {
+  const characters = Array.from(name);
+  if (characters.length <= DOWNLOAD_NAME_MIDDLE_ELLIPSIS_THRESHOLD) {
+    return { leading: name, trailing: null };
+  }
+  return {
+    leading: characters.slice(0, -DOWNLOAD_NAME_TRAILING_CHARACTERS).join(''),
+    trailing: characters.slice(-DOWNLOAD_NAME_TRAILING_CHARACTERS).join(''),
+  };
+}
+
 function terminal(item: DownloadTransferItem): boolean {
   return item.status === DOWNLOAD_TRANSFER_STATUS.HANDED_OFF
     || item.status === DOWNLOAD_TRANSFER_STATUS.COMPLETED
@@ -43,7 +57,8 @@ export function DownloadTransferCenter() {
           onClick={() => setCollapsed((value) => !value)}
           title={t(collapsed ? 'downloads.expand' : 'downloads.collapse')}
         >
-          <span>{t('downloads.title')}</span>
+          <span class="download-transfer-title-icon" aria-hidden="true">⇩</span>
+          <span class="download-transfer-title">{t('downloads.title')}</span>
           {running > 0 && <span class="download-transfer-count">{running}</span>}
           <span aria-hidden="true">{collapsed ? '▴' : '▾'}</span>
         </button>
@@ -59,10 +74,16 @@ export function DownloadTransferCenter() {
             const isTerminal = terminal(item);
             const knownTotal = item.totalBytes !== null && item.totalBytes > 0;
             const percent = knownTotal ? Math.min(100, Math.round((item.loadedBytes / item.totalBytes!) * 100)) : null;
+            const displayName = splitDownloadName(item.name);
             return (
               <article class="download-transfer-row" key={item.id} data-status={item.status}>
                 <div class="download-transfer-row-heading">
-                  <span class="download-transfer-name" title={item.name}>{item.name}</span>
+                  <span class="download-transfer-name" title={item.name} data-testid="download-transfer-name">
+                    <span class="download-transfer-name-leading">{displayName.leading}</span>
+                    {displayName.trailing !== null && (
+                      <span class="download-transfer-name-trailing">{displayName.trailing}</span>
+                    )}
+                  </span>
                   <span class={`download-transfer-route route-${item.route}`}>{t(`downloads.route.${item.route}`)}</span>
                 </div>
                 <div class="download-transfer-status-line">
