@@ -1008,29 +1008,15 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
   if (arguments->secure_console && !IsLocalSystemProcess()) return 18;
   if (!ConfigureResourceJob()) return 12;
 
-  // Native libwebrtc embedders own Winsock lifetime. Without this, ICE can
-  // expose TCP-active placeholders but cannot bind a real UDP host/STUN/TURN
-  // socket, leaving every browser peer permanently in `new`.
-  webrtc::WinsockInitializer winsock;
-  if (winsock.error() != 0) return 14;
-
-  SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-  if (FAILED(CoInitializeEx(nullptr, COINIT_MULTITHREADED))) return 3;
-  if (FAILED(MFStartup(MF_VERSION, MFSTARTUP_FULL))) {
-    CoUninitialize();
-    return 4;
-  }
-  if (!webrtc::InitializeSSL()) {
-    MFShutdown();
-    CoUninitialize();
-    return 5;
-  }
-
+  // Authenticate the worker and publish its PID before initializing platform
+  // media. MFStartup and graphics/media providers are third-party OS code and
+  // can block indefinitely on a damaged per-session stack. If that happens
+  // before HELLO, the service cannot identify the launched process and its
+  // PREPARE watchdog can neither observe nor recycle it. Once HELLO is sent,
+  // the already-queued PREPARE arms that watchdog while initialization below
+  // proceeds; a stall is therefore bounded to this authenticated process.
   PipeChannel pipe_channel;
   if (!pipe_channel.Connect(arguments->pipe, std::chrono::seconds(10))) {
-    webrtc::CleanupSSL();
-    MFShutdown();
-    CoUninitialize();
     return 6;
   }
   PipeWriter writer(&pipe_channel);
@@ -1049,10 +1035,33 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
   hello["secureConsole"] = arguments->secure_console;
   if (!writer.Emit(hello)) {
     pipe_channel.Close();
-    webrtc::CleanupSSL();
+    return 7;
+  }
+
+  // Native libwebrtc embedders own Winsock lifetime. Without this, ICE can
+  // expose TCP-active placeholders but cannot bind a real UDP host/STUN/TURN
+  // socket, leaving every browser peer permanently in `new`.
+  webrtc::WinsockInitializer winsock;
+  if (winsock.error() != 0) {
+    pipe_channel.Close();
+    return 14;
+  }
+
+  SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+  if (FAILED(CoInitializeEx(nullptr, COINIT_MULTITHREADED))) {
+    pipe_channel.Close();
+    return 3;
+  }
+  if (FAILED(MFStartup(MF_VERSION, MFSTARTUP_FULL))) {
+    pipe_channel.Close();
+    CoUninitialize();
+    return 4;
+  }
+  if (!webrtc::InitializeSSL()) {
+    pipe_channel.Close();
     MFShutdown();
     CoUninitialize();
-    return 7;
+    return 5;
   }
 
   auto network_thread = webrtc::Thread::CreateWithSocketServer();

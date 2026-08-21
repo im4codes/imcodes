@@ -124,6 +124,10 @@ export function createControlledNodeRuntime(
       incrementCounter('remote_desktop.prepare_timeout');
       logger.warn('remote desktop worker did not complete prepare; recycling');
     },
+    onOfferTimeout: () => {
+      incrementCounter('remote_desktop.offer_timeout');
+      logger.warn('remote desktop worker did not answer offer; recycling');
+    },
   });
   const remoteDesktopEnabled = remoteDesktopWorker.available()
     && isRemoteDesktopFeatureEnabled(
