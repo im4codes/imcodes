@@ -5345,11 +5345,13 @@ afterEach(() => {
     }
   });
 
-  it('does not send direct cancel on Escape while an image lightbox owns the keyboard', () => {
+  it('stops the active transport and lets an image lightbox close on Escape', () => {
     const ws = makeWs();
     const lightbox = document.createElement('div');
     lightbox.className = 'fb-lightbox';
     document.body.appendChild(lightbox);
+    const closeLightbox = vi.fn();
+    window.addEventListener('keydown', closeLightbox);
     try {
       render(
         <SessionControls
@@ -5368,9 +5370,11 @@ afterEach(() => {
       input.focus();
       fireEvent.keyDown(input, { key: 'Escape' });
 
-      expect(gatherCancelCalls(ws)).toEqual([]);
+      expectUrgentCancelPayload(ws, { sessionName: 'qwen-session' });
+      expect(closeLightbox).toHaveBeenCalledTimes(1);
       expect(ws.sendInput).not.toHaveBeenCalled();
     } finally {
+      window.removeEventListener('keydown', closeLightbox);
       lightbox.remove();
     }
   });

@@ -450,7 +450,11 @@ function writeTransportQueueHidden(storageKey: string | null, hidden: boolean): 
 
 function isModalKeyboardOwnerOpen(): boolean {
   if (typeof document === 'undefined') return false;
-  return !!document.querySelector('[role="dialog"][aria-modal="true"], .fb-lightbox, .html-fullscreen-preview');
+  // A lightbox is intentionally not a transport-Escape owner. Esc must still
+  // reach Stop while an image is being previewed; its own window listener then
+  // closes the image as well. True modals and the HTML fullscreen preview keep
+  // their exclusive keyboard ownership.
+  return !!document.querySelector('[role="dialog"][aria-modal="true"], .html-fullscreen-preview');
 }
 
 function isTextEntryKeyboardOwner(node: EventTarget | Node | null | undefined): boolean {
@@ -4037,7 +4041,11 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       return false;
     }
     e.preventDefault();
-    e.stopPropagation();
+    // Image previews close from a window-level Escape listener. Do not swallow
+    // this event at the transport layer: one Esc should stop the active turn
+    // and still dismiss the preview. Other keyboard owners were filtered by
+    // shouldProtectTransportEscape above, so they retain exclusive ownership.
+    if (!document.querySelector('.fb-lightbox')) e.stopPropagation();
     handleStopButtonPress();
     return true;
   }, [activeSession?.state, effectiveRuntimeType, handleStopButtonPress, shouldProtectTransportEscape]);
