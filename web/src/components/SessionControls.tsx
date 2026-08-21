@@ -1486,7 +1486,9 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   useEffect(() => {
     if (!slashPickerOpen || slashSuggestions.length === 0) return;
     const highlighted = slashPickerRef.current?.querySelector<HTMLElement>('[data-hl="true"]');
-    highlighted?.scrollIntoView({ block: 'nearest' });
+    if (typeof highlighted?.scrollIntoView === 'function') {
+      highlighted.scrollIntoView({ block: 'nearest' });
+    }
   }, [slashHighlightIdx, slashPickerOpen, slashSuggestions]);
   const publishComposerText = useCallback((text: string) => {
     onComposerTextChange?.(text);
