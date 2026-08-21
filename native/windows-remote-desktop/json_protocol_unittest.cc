@@ -71,6 +71,18 @@ TEST(JsonProtocolTest, RejectsExpiredAndOverlongLeaseAuthorities) {
   EXPECT_FALSE(ParseServiceSignal(root, kNowMs).has_value());
 }
 
+TEST(JsonProtocolTest, AcceptsTheBoundedSixtySecondControllerLease) {
+  Json::Value root = AuthorityBase(kLeaseType);
+  root["leaseExpiresAt"] = Json::Int64(kNowMs + 60'000);
+  root["daemonGeneration"] = 7;
+  root["mode"] = kViewMode;
+  root["inputEpoch"] = 0;
+
+  const auto parsed = ParseServiceSignal(root, kNowMs);
+  ASSERT_TRUE(parsed.has_value());
+  EXPECT_EQ(parsed->authority.lease_expires_at_ms, kNowMs + 60'000);
+}
+
 TEST(JsonProtocolTest, RejectsUnknownModeReasonAndMalformedCapability) {
   Json::Value root = AuthorityBase(kModeStateType);
   root["mode"] = kControlMode;

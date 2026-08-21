@@ -17,7 +17,10 @@ inline constexpr size_t kMaxDataMessageBytes = 16 * 1024;
 inline constexpr size_t kMaxClipboardTextBytes = 12 * 1024;
 inline constexpr int kMaxIceCandidates = 128;
 inline constexpr int kMaxDisplays = 16;
-inline constexpr int64_t kLeaseMaxFutureMs = 20'000;
+// The Server grants a 60 s controller lease and renews it every 15 s.  Accept
+// bounded clock/skew and IPC scheduling headroom beyond the normal lease, but
+// never let a malformed authority turn into an unbounded worker lifetime.
+inline constexpr int64_t kLeaseMaxFutureMs = 75'000;
 inline constexpr int64_t kIdleTimeoutMs = 15 * 60 * 1000;
 // How long the picture waits for the input channels before going out anyway.
 // Their handshake is a handful of small packets, so this is a backstop for a
