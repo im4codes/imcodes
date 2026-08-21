@@ -15,10 +15,59 @@ import {
   REMOTE_DESKTOP_TERMINAL_REASON,
 } from '@shared/remote-desktop.js';
 import {
+  applyH264ReceiveCodecPreference,
   RemoteDesktopClient,
   chunkRemoteDesktopText,
   isRemoteDesktopKeyAllowed,
+  prioritizeH264ReceiveCodecs,
 } from '../src/remote-desktop-client.js';
+
+function videoCodec(mimeType: string, sdpFmtpLine?: string): RTCRtpCodec {
+  return { mimeType, clockRate: 90_000, sdpFmtpLine };
+}
+
+describe('remote desktop receive codec compatibility', () => {
+  it('prefers H.264 without removing codecs or their repair payloads', () => {
+    const codecs = [
+      videoCodec('video/VP8'),
+      videoCodec('video/rtx', 'apt=96'),
+      videoCodec('video/H264', 'packetization-mode=0'),
+      videoCodec('video/red'),
+      videoCodec('video/H264', 'packetization-mode=1'),
+      videoCodec('video/VP9'),
+    ];
+
+    const preferred = prioritizeH264ReceiveCodecs(codecs);
+
+    expect(preferred).toEqual([
+      codecs[2],
+      codecs[4],
+      codecs[0],
+      codecs[1],
+      codecs[3],
+      codecs[5],
+    ]);
+    expect(new Set(preferred)).toEqual(new Set(codecs));
+  });
+
+  it('leaves browser defaults alone when H.264 is unavailable', () => {
+    expect(prioritizeH264ReceiveCodecs([
+      videoCodec('video/VP8'),
+      videoCodec('video/rtx', 'apt=96'),
+    ])).toBeNull();
+  });
+
+  it('falls back to browser codec negotiation when preference application throws', () => {
+    const setCodecPreferences = vi.fn(() => {
+      throw new DOMException('unsupported codec preferences', 'OperationError');
+    });
+    const transceiver = { setCodecPreferences } as unknown as RTCRtpTransceiver;
+    const codecs = [videoCodec('video/VP8'), videoCodec('video/H264')];
+
+    expect(() => applyH264ReceiveCodecPreference(transceiver, codecs)).not.toThrow();
+    expect(setCodecPreferences).toHaveBeenCalledWith([codecs[1], codecs[0]]);
+  });
+});
 
 class FakeSocket extends EventTarget {
   static readonly CONNECTING = 0;

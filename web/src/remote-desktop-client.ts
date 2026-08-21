@@ -178,20 +178,28 @@ function decodeDataChannelPayload(value: unknown): string | null {
   return null;
 }
 
-function h264ReceiveCodecs(): RTCRtpCodec[] | null {
-  const capabilities = typeof RTCRtpReceiver !== 'undefined'
-    ? RTCRtpReceiver.getCapabilities?.('video')
-    : null;
-  if (!capabilities) return null;
-  const h264 = capabilities.codecs.filter((codec) => codec.mimeType.toLowerCase() === 'video/h264');
+export function prioritizeH264ReceiveCodecs(codecs: readonly RTCRtpCodec[]): RTCRtpCodec[] | null {
+  const h264 = codecs.filter((codec) => codec.mimeType.toLowerCase() === 'video/h264');
   if (h264.length === 0) return null;
-  const recovery = capabilities.codecs.filter((codec) => (
-    codec.mimeType.toLowerCase() === 'video/rtx'
-    || codec.mimeType.toLowerCase() === 'video/red'
-    || codec.mimeType.toLowerCase() === 'video/ulpfec'
-    || codec.mimeType.toLowerCase() === 'video/flexfec-03'
-  ));
-  return [...h264, ...recovery];
+  return [
+    ...h264,
+    ...codecs.filter((codec) => codec.mimeType.toLowerCase() !== 'video/h264'),
+  ];
+}
+
+export function applyH264ReceiveCodecPreference(
+  transceiver: RTCRtpTransceiver,
+  codecs: readonly RTCRtpCodec[],
+): void {
+  const preferred = prioritizeH264ReceiveCodecs(codecs);
+  if (!preferred || typeof transceiver.setCodecPreferences !== 'function') return;
+  try {
+    transceiver.setCodecPreferences(preferred);
+  } catch {
+    // A browser with an incomplete codec-preference implementation can still
+    // negotiate H.264 from its default offer because the worker only advertises
+    // H.264. Do not turn that recoverable compatibility gap into protocol_error.
+  }
 }
 
 export function isRemoteDesktopKeyAllowed(
@@ -909,8 +917,10 @@ export class RemoteDesktopClient {
     });
     this.peer = peer;
     const transceiver = peer.addTransceiver('video', { direction: 'recvonly' });
-    const codecs = h264ReceiveCodecs();
-    if (codecs && typeof transceiver.setCodecPreferences === 'function') transceiver.setCodecPreferences(codecs);
+    const capabilities = typeof RTCRtpReceiver !== 'undefined'
+      ? RTCRtpReceiver.getCapabilities?.('video')
+      : null;
+    if (capabilities) applyH264ReceiveCodecPreference(transceiver, capabilities.codecs);
     this.controlChannel = peer.createDataChannel(REMOTE_DESKTOP_CHANNEL.CONTROL, { ordered: true });
     this.keyboardChannel = peer.createDataChannel(REMOTE_DESKTOP_CHANNEL.KEYBOARD, { ordered: true });
     this.pointerChannel = peer.createDataChannel(REMOTE_DESKTOP_CHANNEL.POINTER, { ordered: false, maxRetransmits: 0 });
