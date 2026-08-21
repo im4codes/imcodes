@@ -1042,10 +1042,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
   // expose TCP-active placeholders but cannot bind a real UDP host/STUN/TURN
   // socket, leaving every browser peer permanently in `new`.
   webrtc::WinsockInitializer winsock;
-  if (winsock.error() != 0) {
-    pipe_channel.Close();
-    return 14;
-  }
+  if (winsock.error() != 0) return 14;
 
   SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
   if (FAILED(CoInitializeEx(nullptr, COINIT_MULTITHREADED))) {
