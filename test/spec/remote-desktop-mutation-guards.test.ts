@@ -66,7 +66,7 @@ function occurrences(source: string, needle: string): number {
 
 const contracts: Contract[] = [
   {
-    description: 'GDI fallback keeps a bounded multi-frame DXGI recovery probe',
+    name: 'GDI fallback keeps a bounded multi-frame DXGI recovery probe',
     guards: [
       {
         path: 'native/windows-remote-desktop/display_capture.cc',
@@ -78,7 +78,7 @@ const contracts: Contract[] = [
       },
       {
         path: 'native/windows-remote-desktop/display_capture.cc',
-        needle: 'if (CaptureOne()) {\n            gdi_active_ = false;',
+        needle: 'if (CaptureOne(CaptureWaitPolicy::kRequireFreshFrame)) {\n            gdi_active_ = false;',
       },
       {
         path: 'native/windows-remote-desktop/worker_policy.h',
@@ -1191,6 +1191,12 @@ const contracts: Contract[] = [
 ];
 
 const mutations: Mutation[] = [
+  {
+    name: 'let a cached GDI frame impersonate DXGI recovery',
+    contract: 'GDI fallback keeps a bounded multi-frame DXGI recovery probe',
+    path: 'native/windows-remote-desktop/display_capture.cc',
+    needle: 'CaptureWaitPolicy::kRequireFreshFrame',
+  },
   {
     name: 'let the stored secret be typed without a watching controller',
     contract: 'auto unlock stays write-only and operator-gated',

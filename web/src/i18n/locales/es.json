@@ -148,7 +148,7 @@
     },
     "roleHelp": {
       "viewer": "Puede ver el estado del alcance y participar en debates del alcance sin dirigir al agente.",
-      "participant": "Puede ver el estado del alcance y enviar indicaciones a pestañas concretas cubiertas."
+      "participant": "Puede colaborar plenamente dentro del ámbito compartido, incluido OpenSpec y nuevas subsesiones, pero no cerrar sesiones."
     },
     "trust": {
       "title": "Aviso de confianza para participantes",
@@ -542,6 +542,7 @@
     "stop_appended_queue": "Los mensajes en cola se añadieron; la sesión sigue en ejecución.",
     "send_placeholder": "Enviar a {{name}}…",
     "send_placeholder_desktop_upload": "{{placeholder}} Admite carga rápida pegando o arrastrando varios archivos",
+    "send_placeholder_desktop_shortcuts": "{{placeholder}}\n/ comandos · ! frases · @ archivos/agentes · ; alias · ^ nodos · pega o arrastra archivos",
     "composer_target_label": "Enviando a",
     "composer_target_aria": "Destino del mensaje: {{name}}",
     "actions": "Acciones de sesión",
@@ -824,6 +825,10 @@
   "quick_input": {
     "title": "Entrada rápida",
     "commands": "Comandos rápidos",
+    "no_command_matches": "No hay comandos coincidentes",
+    "no_phrase_matches": "No hay frases coincidentes",
+    "models": "Modelos",
+    "no_model_matches": "No hay modelos coincidentes",
     "phrases": "Frases rápidas",
     "history": "Historial",
     "this_session": "Esta sesión",
@@ -1581,6 +1586,30 @@
     "achieve_prompt": "Lleva {{reference}} hasta completarlo usando el flujo completo de OpenSpec. Revisa todas las tareas y artefactos pendientes, completa el trabajo necesario de implementación y especificación, actualiza directamente proposal, design, specs y tasks bajo {{reference}} cuando haga falta, cierra los huecos abiertos, sincroniza las especificaciones afectadas si hace falta y archiva el cambio cuando cumpla los criterios de finalización. No te quedes en el reporte de estado.",
     "propose_from_discussion_prompt": "Genera un cambio de OpenSpec a partir de la discusión reciente. Extrae el objetivo, el alcance, los requisitos clave y los criterios de aceptación, deja los puntos poco claros como pendientes y escribe los artefactos reales bajo openspec/changes/ (proposal, design, specs y tasks) en lugar de quedarte en una nota borrador.",
     "propose_from_description_prompt": "Genera un cambio de OpenSpec a partir de la descripción de abajo. Organiza el objetivo, el alcance, los requisitos clave y los criterios de aceptación, deja los detalles faltantes como pendientes y escribe los artefactos reales bajo openspec/changes/ (proposal, design, specs y tasks) en lugar de quedarte en una nota borrador."
+  },
+  "downloads": {
+    "title": "Descargas",
+    "expand": "Expandir descargas",
+    "collapse": "Contraer descargas",
+    "clear_finished": "Borrar finalizadas",
+    "cancel": "Cancelar",
+    "retry": "Reintentar",
+    "dismiss": "Quitar",
+    "progress_aria": "Progreso de descarga de {{name}}",
+    "transferred": "{{transferred}} / {{total}}",
+    "speed": "{{speed}}/s",
+    "speed_calculating": "Midiendo velocidad…",
+    "status": {
+      "preparing": "Preparando",
+      "connecting": "Conectando",
+      "transferring": "Descargando",
+      "falling_back": "Cambiando a HTTP",
+      "handed_off": "Enviada al navegador",
+      "completed": "Completada",
+      "canceled": "Cancelada",
+      "failed": "Fallida"
+    },
+    "route": { "pending": "Pendiente", "direct": "Directa", "http": "HTTP", "browser": "Navegador" }
   },
   "upload": {
     "upload_file": "Subir archivo",

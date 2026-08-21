@@ -148,7 +148,7 @@
     },
     "roleHelp": {
       "viewer": "スコープ内の状態を閲覧し、エージェントを操作せずにスコープ内の議論へ参加できます。",
-      "participant": "スコープ内の状態を閲覧し、対象の具体的なタブへプロンプトを送信できます。"
+      "participant": "共有範囲内で OpenSpec や新規サブセッションを含む共同作業ができますが、セッションを閉じることはできません。"
     },
     "trust": {
       "title": "参加者への信頼に関する開示",
@@ -542,6 +542,7 @@
     "stop_appended_queue": "キューのメッセージを追加しました。セッションは実行中です。",
     "send_placeholder": "{{name}} へ送信…",
     "send_placeholder_desktop_upload": "{{placeholder}} 複数ファイルの貼り付け/ドラッグによる高速アップロードに対応",
+    "send_placeholder_desktop_shortcuts": "{{placeholder}}\n/ コマンド · ! フレーズ · @ ファイル/Agent · ; エイリアス · ^ ノード · ファイルを貼り付け/ドラッグ",
     "composer_target_label": "送信先",
     "composer_target_aria": "メッセージの送信先: {{name}}",
     "actions": "セッション操作",
@@ -824,6 +825,10 @@
   "quick_input": {
     "title": "クイック入力",
     "commands": "クイックコマンド",
+    "no_command_matches": "一致するコマンドはありません",
+    "no_phrase_matches": "一致するフレーズはありません",
+    "models": "モデル",
+    "no_model_matches": "一致するモデルはありません",
     "phrases": "クイックフレーズ",
     "history": "履歴",
     "this_session": "このセッション",
@@ -1580,6 +1585,30 @@
     "achieve_prompt": "完全な OpenSpec ワークフローで {{reference}} を done まで持っていってください。残っているタスクと成果物をすべて確認し、必要な実装と仕様の作業を完了し、必要に応じて {{reference}} 配下の proposal・design・specs・tasks を直接更新し、未解決事項を閉じ、必要なら影響するメイン仕様を同期し、完了条件を満たしたら変更をアーカイブしてください。進捗報告だけで止まらないでください。",
     "propose_from_discussion_prompt": "直近の議論から OpenSpec 変更を生成してください。目的、スコープ、主要要件、受け入れ基準を整理し、不明点は確認事項として明示したうえで、draft note で止めずに openspec/changes/ 配下へ proposal・design・specs・tasks を実際に書き出してください。",
     "propose_from_description_prompt": "下の説明から OpenSpec 変更を生成してください。目的、スコープ、主要要件、受け入れ基準を整理し、不足情報は確認事項として明示したうえで、draft note で止めずに openspec/changes/ 配下へ proposal・design・specs・tasks を実際に書き出してください。"
+  },
+  "downloads": {
+    "title": "ダウンロード",
+    "expand": "ダウンロードを展開",
+    "collapse": "ダウンロードを折りたたむ",
+    "clear_finished": "完了項目を消去",
+    "cancel": "キャンセル",
+    "retry": "再試行",
+    "dismiss": "削除",
+    "progress_aria": "{{name}} のダウンロード進捗",
+    "transferred": "{{transferred}} / {{total}}",
+    "speed": "{{speed}}/秒",
+    "speed_calculating": "速度を測定中…",
+    "status": {
+      "preparing": "準備中",
+      "connecting": "接続中",
+      "transferring": "ダウンロード中",
+      "falling_back": "HTTP に切り替え中",
+      "handed_off": "ブラウザーに引き渡し済み",
+      "completed": "完了",
+      "canceled": "キャンセル済み",
+      "failed": "失敗"
+    },
+    "route": { "pending": "待機中", "direct": "直接", "http": "HTTP", "browser": "ブラウザー" }
   },
   "upload": {
     "upload_file": "ファイルをアップロード",

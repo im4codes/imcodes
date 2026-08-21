@@ -78,6 +78,7 @@ import { ContextDiagnosticsPanel } from './components/ContextDiagnosticsPanel.js
 import { NewUserGuide, type NewUserGuideStep } from './components/NewUserGuide.js';
 import { TeamDiscussionGuide } from './components/TeamDiscussionGuide.js';
 import { FeatureAnnouncementHost } from './components/FeatureAnnouncement.js';
+import { DownloadTransferCenter } from './components/DownloadTransferCenter.js';
 import { mergeUsageUpdate } from './usage-data.js';
 import { ServerIconBar } from './components/ServerIconBar.js';
 import { Sidebar, loadSidebarCollapsed, saveSidebarCollapsed } from './components/Sidebar.js';
@@ -4225,6 +4226,7 @@ export function App() {
   // Global keyboard passthrough
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
+      if (e.defaultPrevented) return;
       if (isImeComposingKeyEvent(e)) return;
       const ws = wsRef.current;
       // If a sub-session window is frontmost (desktop only), keystrokes —
@@ -4635,6 +4637,8 @@ export function App() {
   const sharedAccessRole = selectedShareTarget
     ? (activeSessionInfo?.sharedState?.effectiveRole ?? 'viewer')
     : null;
+  const canCreateSubSession = !selectedShareTarget
+    || (sharedAccessRole === 'participant' && selectedShareTarget.kind !== 'subsession');
 
   const resolveRepoProjectDir = useCallback((sessionId?: string | null) => {
     if (!sessionId) return activeSessionInfo?.projectDir ?? undefined;
@@ -5192,7 +5196,7 @@ export function App() {
                 selectSubSessionFromTree(sub);
               }}
               onNewSession={selectedShareTarget ? undefined : () => setShowNewSession(true)}
-              onNewSubSession={selectedShareTarget ? undefined : () => setShowSubDialog(true)}
+              onNewSubSession={canCreateSubSession ? () => setShowSubDialog(true) : undefined}
             />}
 
             {/* P2P ring progress — show active P2P runs */}
@@ -5774,7 +5778,7 @@ export function App() {
                 onRestore={restoreSubSession}
                 onRestoreThenClose={minimizeSubSessionWindow}
                 onRestart={restartSubSession}
-                onNew={selectedShareTarget ? undefined : () => setShowSubDialog(true)}
+                onNew={canCreateSubSession ? () => setShowSubDialog(true) : undefined}
                 onViewAutoDeliver={() => runVersionSensitiveAction(trans('openspec.auto.list_title'), () => { setDiscussionInitialId(null); setDiscussionInitialTab('auto'); setShowDiscussionsPage(true); })}
                 openSpecAutoProjection={appOpenSpecAutoRunbarVisible ? appOpenSpecAutoProjection : null}
                 openSpecAutoStopPending={appOpenSpecAutoDeliver.stopPending}
@@ -5935,7 +5939,7 @@ export function App() {
                   closeSidebar();
                 }}
                 onNewSession={selectedShareTarget ? undefined : () => { setShowNewSession(true); closeSidebar(); }}
-                onNewSubSession={selectedShareTarget ? undefined : () => { setShowSubDialog(true); closeSidebar(); }}
+                onNewSubSession={canCreateSubSession ? () => { setShowSubDialog(true); closeSidebar(); } : undefined}
                 height={sessionTreeHeight}
                 onResizeHeight={saveSessionTreeHeight}
               />}
@@ -6563,7 +6567,7 @@ export function App() {
         />
       )}
 
-      {showSubDialog && !selectedShareTarget && (
+      {showSubDialog && canCreateSubSession && (
         <StartSubSessionDialog
           ws={wsRef.current}
           defaultCwd={activeSessionInfo?.projectDir}
@@ -6736,6 +6740,8 @@ export function App() {
           </div>
         </div>
       )}
+
+      <DownloadTransferCenter />
 
       {/* Toasts: idle completions + CC notifications */}
       {toasts.length > 0 && (

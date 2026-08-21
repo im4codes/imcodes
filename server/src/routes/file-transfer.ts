@@ -22,7 +22,10 @@ import {
   validateFileDirectoryListRequest,
   validateFilePathHandleRequest,
 } from '../../../shared/transport/file-transfer.js';
-import { DIRECT_FILE_TRANSFER_CAPABILITY, isDirectFileTransferClientUploadId } from '../../../shared/direct-file-transfer.js';
+import {
+  DIRECT_FILE_TRANSFER_UPLOAD_RECOVERY_CAPABILITY,
+  isDirectFileTransferClientUploadId,
+} from '../../../shared/direct-file-transfer.js';
 import {
   MACHINE_DIRECT_FILE_TRANSFER_CAPABILITY,
   MACHINE_DIRECT_FILE_FETCH_CAPABILITY,
@@ -872,10 +875,10 @@ fileTransferRoutes.post('/:id/upload', async (c) => {
   if (!bridge.isDaemonConnected()) {
     return c.json({ error: 'daemon_offline' }, 503);
   }
-  // Old controlled daemons use an exact-key request validator. Only include
-  // the new dedupe field when this daemon explicitly advertised direct-v1.
+  // The request has an exact-key daemon validator. Include the dedupe field
+  // only when the current clean v2 upload-recovery capability is advertised.
   const negotiatedClientUploadId = (
-    bridge.hasDaemonCapability(DIRECT_FILE_TRANSFER_CAPABILITY)
+    bridge.hasDaemonCapability(DIRECT_FILE_TRANSFER_UPLOAD_RECOVERY_CAPABILITY)
     || bridge.hasDaemonCapability(MACHINE_DIRECT_FILE_TRANSFER_CAPABILITY)
   )
     ? clientUploadId

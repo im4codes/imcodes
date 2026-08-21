@@ -204,6 +204,38 @@ describe('file-transfer local handle hardening', () => {
     });
   });
 
+  it('resolves a direct source only from a minted handle after revalidating its canonical file', async () => {
+    const filePath = path.join(rootDir, 'project', 'direct.bin');
+    await mkdir(path.dirname(filePath), { recursive: true });
+    await writeFile(filePath, 'direct bytes');
+
+    const transfer = await loadFileTransferHandler(fakeHome);
+    const handle = transfer.createProjectFileHandle(filePath, 'direct.bin', 'application/octet-stream', 12);
+
+    await expect(transfer.resolveDirectFileDownloadSource(handle.id)).resolves.toMatchObject({
+      readPath: await realpath(filePath),
+      filename: 'direct.bin',
+      mime: 'application/octet-stream',
+      size: 12,
+    });
+    await expect(transfer.resolveDirectFileDownloadSource('/etc/passwd')).rejects.toThrow('not_found');
+  });
+
+  it('fails closed when a minted direct source is replaced before the stream starts', async () => {
+    const filePath = path.join(rootDir, 'project', 'replaced.bin');
+    await mkdir(path.dirname(filePath), { recursive: true });
+    await writeFile(filePath, 'before');
+
+    const transfer = await loadFileTransferHandler(fakeHome);
+    const handle = transfer.createProjectFileHandle(filePath, 'replaced.bin', 'application/octet-stream', 6);
+    await unlink(filePath);
+    // Filesystems may reuse an inode immediately, so make the replacement
+    // size differ as well; the minted handle binds both identity components.
+    await writeFile(filePath, 'after!!');
+
+    await expect(transfer.resolveDirectFileDownloadSource(handle.id)).rejects.toThrow('download_failed');
+  });
+
   it('returns small files inline (file.download_done) instead of using the relay', async () => {
     const filePath = path.join(rootDir, 'project', 'small.txt');
     await mkdir(path.dirname(filePath), { recursive: true });

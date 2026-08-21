@@ -85,6 +85,15 @@ vi.mock('../src/api.js', () => ({
 }));
 
 vi.mock('../src/direct-file-transfer.js', () => ({
+  // Keep this mock aligned with the panel's presentation-state import. The
+  // production helper owns these strings; the test only substitutes transport
+  // execution, not the panel's transfer-row state machine.
+  FILE_UPLOAD_TRANSPORT_MODE: {
+    CONNECTING: 'connecting',
+    DIRECT: 'direct',
+    FALLING_BACK: 'falling_back',
+    RELAY: 'relay',
+  },
   uploadFileWithDirectFallback,
   isFileUploadCanceled: (error: unknown) => (
     typeof error === 'object' && error !== null && 'name' in error && error.name === 'AbortError'
@@ -614,12 +623,16 @@ describe('RemoteDesktopPanel mobile gestures', () => {
       pointerId: 60, clientX: 200, clientY: 150,
     });
     expect(document.activeElement).toBe(stage);
+    const escapedRemoteKey = vi.fn();
+    document.addEventListener('keydown', escapedRemoteKey);
     act(() => stage.dispatchEvent(new KeyboardEvent('keydown', {
       bubbles: true,
       cancelable: true,
       code: 'KeyA',
       key: 'a',
     })));
+    document.removeEventListener('keydown', escapedRemoteKey);
+    expect(escapedRemoteKey).not.toHaveBeenCalled();
     expect(key).toHaveBeenCalledWith('KeyA', 'a', true, false, {
       control: false,
       alt: false,
@@ -677,7 +690,7 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     expect(navigator.clipboard.writeText).toHaveBeenCalledWith('selected remotely');
   });
 
-  it('opens an icon-only mobile IME surface and sends common shortcut chords', async () => {
+  it('keeps the mobile IME focused, commits composed text once, and sends shortcut chords', async () => {
     const { container, getByRole } = await renderPanel();
     const keyboardButton = getByRole('button', { name: 'remote_desktop.mobile_keyboard' });
     expect(keyboardButton.textContent).toBe('⌨');
@@ -686,9 +699,61 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     const input = getByRole('textbox', { name: 'remote_desktop.mobile_text_input' }) as HTMLTextAreaElement;
     input.focus();
     expect(document.activeElement).toBe(input);
-    input.value = '你好';
-    act(() => input.dispatchEvent(new InputEvent('input', { bubbles: true, data: '你好' })));
-    expect(text).toHaveBeenCalledWith('你好');
+
+    input.value = 'a';
+    act(() => input.dispatchEvent(new InputEvent('input', { bubbles: true, data: 'a' })));
+    expect(text).toHaveBeenCalledWith('a');
+    expect(input.value).toBe('');
+    expect(document.activeElement).toBe(input);
+
+    text.mockClear();
+    act(() => input.dispatchEvent(new CompositionEvent('compositionstart', { bubbles: true })));
+    input.value = 'ni';
+    act(() => input.dispatchEvent(new InputEvent('input', {
+      bubbles: true,
+      data: 'ni',
+      isComposing: true,
+    })));
+    expect(text).not.toHaveBeenCalled();
+    expect(input.value).toBe('ni');
+    const composingDelete = new InputEvent('beforeinput', {
+      bubbles: true,
+      cancelable: true,
+      inputType: 'deleteContentBackward',
+      isComposing: true,
+    });
+    act(() => input.dispatchEvent(composingDelete));
+    expect(composingDelete.defaultPrevented).toBe(false);
+    expect(key).not.toHaveBeenCalled();
+
+    input.value = '你';
+    await act(async () => {
+      input.dispatchEvent(new CompositionEvent('compositionend', { bubbles: true, data: '你' }));
+      await Promise.resolve();
+    });
+    expect(text.mock.calls).toEqual([['你']]);
+    expect(input.value).toBe('');
+    expect(document.activeElement).toBe(input);
+
+    input.value = 'b';
+    act(() => input.dispatchEvent(new InputEvent('input', { bubbles: true, data: 'b' })));
+    expect(text.mock.calls).toEqual([['你'], ['b']]);
+    expect(document.activeElement).toBe(input);
+
+    key.mockClear();
+    const deleteBackward = new InputEvent('beforeinput', {
+      bubbles: true,
+      cancelable: true,
+      inputType: 'deleteContentBackward',
+    });
+    act(() => input.dispatchEvent(deleteBackward));
+    expect(deleteBackward.defaultPrevented).toBe(true);
+    expect(key.mock.calls).toEqual([
+      ['Backspace', 'Backspace', true, false, { control: false, alt: false }],
+      ['Backspace', 'Backspace', false, false, { control: false, alt: false }],
+    ]);
+    expect(text.mock.calls).toEqual([['你'], ['b']]);
+    expect(document.activeElement).toBe(input);
 
     key.mockClear();
     act(() => {

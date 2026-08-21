@@ -12,7 +12,6 @@ import {
   mapRemoteDesktopVideoPoint,
   type RemoteDesktopNormalizedPoint,
 } from '@shared/remote-desktop.js';
-import { DIRECT_FILE_TRANSFER_STATE } from '@shared/direct-file-transfer.js';
 import {
   FILE_TRANSFER_DIRECTORY_CAPABILITY,
   FILE_TRANSFER_DIRECTORY_PATH,
@@ -21,6 +20,7 @@ import { downloadAttachment } from '../api.js';
 import { createMachineFileHandle, type MachineListItem } from '../api/machines.js';
 import { MachineDirectoryWsAdapter } from '../machine-directory-ws-adapter.js';
 import {
+  FILE_UPLOAD_TRANSPORT_MODE,
   isFileUploadCanceled,
   uploadFileWithDirectFallback,
   type FileUploadTransportMode,
@@ -33,6 +33,7 @@ import {
   mapRemoteDesktopKeyboardEvent,
   readControllerPlatform,
   REMOTE_DESKTOP_CLIPBOARD_SHORTCUT,
+  remoteDesktopMobileDeletionKey,
   remoteDesktopShortcutLabel,
   sendRemoteDesktopChord,
 } from '../remote-desktop-keyboard.js';
@@ -324,6 +325,7 @@ export function RemoteDesktopPanel({
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const mobileTextInputRef = useRef<HTMLTextAreaElement | null>(null);
   const mobileTextComposingRef = useRef(false);
+  const mobileTextLastCompositionCommitRef = useRef<string | null>(null);
   const machineDirectoryAdapterRef = useRef<MachineDirectoryWsAdapter | null>(null);
   const displayModeMenuRef = useRef<HTMLDivElement | null>(null);
   const viewportRef = useRef<RemoteDesktopViewport>(INITIAL_REMOTE_DESKTOP_VIEWPORT);
@@ -1377,6 +1379,11 @@ export function RemoteDesktopPanel({
 
   const onKey = (event: KeyboardEvent, down: boolean) => {
     if (!snapshot.inputEnabled) return;
+    // The stage owns physical keyboard input while control is active. Without
+    // this boundary the same key bubbles into App's document-level keyboard
+    // passthrough, which focuses a chat composer and inserts the character a
+    // second time (observed consistently in Safari).
+    event.stopPropagation();
     const client = clientRef.current;
     const mapped = mapRemoteDesktopKeyboardEvent(event);
     if (!client || !mapped) return;
@@ -1549,7 +1556,7 @@ export function RemoteDesktopPanel({
       id,
       name: file.name || 'file',
       progress: 0,
-      transport: DIRECT_FILE_TRANSFER_STATE.CONNECTING,
+      transport: FILE_UPLOAD_TRANSPORT_MODE.CONNECTING,
       status: 'transferring',
       sizeBytes: file.size,
       sampledAt: Date.now(),
@@ -1593,8 +1600,12 @@ export function RemoteDesktopPanel({
 
   const submitMobileText = (value: string) => {
     if (!value || !snapshot.inputEnabled) return;
-    if (sendPastedText(value) && mobileTextInputRef.current) {
-      mobileTextInputRef.current.value = '';
+    const input = mobileTextInputRef.current;
+    if ((clientRef.current?.text(value) ?? false) && input) {
+      input.value = '';
+      if (document.activeElement !== input) {
+        input.focus({ preventScroll: true });
+      }
     }
   };
 
@@ -1619,7 +1630,7 @@ export function RemoteDesktopPanel({
       id,
       name: path,
       progress: 0,
-      transport: DIRECT_FILE_TRANSFER_STATE.RELAY,
+      transport: FILE_UPLOAD_TRANSPORT_MODE.RELAY,
       status: 'transferring',
     }]);
     setTransferError(null);
@@ -2006,24 +2017,47 @@ export function RemoteDesktopPanel({
                 ref={mobileTextInputRef}
                 rows={1}
                 inputMode="text"
-                enterkeyhint="done"
+                enterkeyhint="enter"
                 autocapitalize="none"
                 autocomplete="off"
                 spellcheck={false}
                 aria-label={t('remote_desktop.mobile_text_input')}
                 placeholder={t('remote_desktop.mobile_text_input')}
-                onCompositionStart={() => { mobileTextComposingRef.current = true; }}
-                onCompositionEnd={() => {
+                onCompositionStart={(event) => {
+                  event.stopPropagation();
+                  mobileTextComposingRef.current = true;
+                  mobileTextLastCompositionCommitRef.current = null;
+                }}
+                onCompositionEnd={(event) => {
+                  event.stopPropagation();
                   mobileTextComposingRef.current = false;
-                  queueMicrotask(() => {
-                    const input = mobileTextInputRef.current;
-                    if (input?.value) submitMobileText(input.value);
-                  });
+                  const value = (event.currentTarget as HTMLTextAreaElement).value;
+                  if (value && mobileTextLastCompositionCommitRef.current !== value) {
+                    mobileTextLastCompositionCommitRef.current = value;
+                    submitMobileText(value);
+                  }
+                }}
+                onBeforeInput={(event) => {
+                  event.stopPropagation();
+                  const input = event.currentTarget as HTMLTextAreaElement;
+                  if (mobileTextComposingRef.current || event.isComposing || input.value) return;
+                  const deletionKey = remoteDesktopMobileDeletionKey(event.inputType);
+                  if (!deletionKey) return;
+                  event.preventDefault();
+                  sendMobileShortcut([deletionKey]);
                 }}
                 onInput={(event) => {
-                  if (!mobileTextComposingRef.current) {
-                    submitMobileText((event.currentTarget as HTMLTextAreaElement).value);
+                  event.stopPropagation();
+                  if (mobileTextComposingRef.current || event.isComposing) return;
+                  const input = event.currentTarget as HTMLTextAreaElement;
+                  const lastCompositionCommit = mobileTextLastCompositionCommitRef.current;
+                  if (lastCompositionCommit !== null
+                    && (input.value === '' || input.value === lastCompositionCommit)) {
+                    input.value = '';
+                    return;
                   }
+                  mobileTextLastCompositionCommitRef.current = null;
+                  submitMobileText(input.value);
                 }}
                 onKeyDown={(event) => event.stopPropagation()}
                 onKeyUp={(event) => event.stopPropagation()}
@@ -2207,28 +2241,39 @@ export function RemoteDesktopPanel({
         {filePanelOpen && !fileDrawerMinimized && (
           <aside class="remote-desktop-file-drawer" aria-label={t('remote_desktop.files')}>
             <div class="remote-desktop-file-drawer-head">
-              <div>
+              <div class="remote-desktop-file-drawer-copy">
                 <strong>{t('remote_desktop.files')}</strong>
                 <span>{t('remote_desktop.file_transfer_hint')}</span>
               </div>
               <div class="remote-desktop-file-drawer-actions">
                 <button
                   type="button"
+                  class="remote-desktop-file-control"
                   aria-label={t('remote_desktop.minimize_files')}
                   title={t('remote_desktop.minimize_files')}
                   onClick={() => {
                     setDirectoryPickerOpen(false);
                     setFileDrawerMinimized(true);
                   }}
-                >—</button>
+                >
+                  <svg viewBox="0 0 16 16" aria-hidden="true">
+                    <path d="M3.5 8h9" />
+                  </svg>
+                </button>
                 <button
                   type="button"
+                  class="remote-desktop-file-control is-close"
                   aria-label={t('remote_desktop.close_files')}
+                  title={t('remote_desktop.close_files')}
                   onClick={() => {
                     setDirectoryPickerOpen(false);
                     setFilePanelOpen(false);
                   }}
-                >×</button>
+                >
+                  <svg viewBox="0 0 16 16" aria-hidden="true">
+                    <path d="m4.5 4.5 7 7m0-7-7 7" />
+                  </svg>
+                </button>
               </div>
             </div>
 

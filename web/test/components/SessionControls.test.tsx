@@ -104,6 +104,9 @@ vi.mock('react-i18next', () => ({
       if (key === 'session.send_placeholder_desktop_upload') {
         return `${String(opts?.placeholder ?? '')} Supports fast multi-file paste or drag upload`;
       }
+      if (key === 'session.send_placeholder_desktop_shortcuts') {
+        return `${String(opts?.placeholder ?? '')}\n/ commands · ! phrases · @ files/agents · ; aliases · ^ nodes · paste or drag files`;
+      }
       if (key === 'session.composer_target_label') return 'Sending to';
       if (key === 'session.composer_target_aria') {
         return `Message target: ${String(opts?.name ?? '')}`;
@@ -839,10 +842,10 @@ afterEach(() => {
     expect(onOverlayOpenChange).toHaveBeenLastCalledWith(false);
   });
 
-  it('shows the desktop upload hint in the placeholder on desktop', () => {
+  it('shows shortcut triggers and the upload hint on the second desktop placeholder line', () => {
     Object.defineProperty(window, 'innerWidth', { configurable: true, value: DEFAULT_INNER_WIDTH });
     render(<SessionControls ws={makeWs() as any} activeSession={makeSession({ name: 'my-session' })} quickData={makeQuickData() as any} />);
-    expect(document.querySelector('.controls-input')?.getAttribute('data-placeholder')).toBe('Send to my-project… Supports fast multi-file paste or drag upload');
+    expect(document.querySelector('.controls-input')?.getAttribute('data-placeholder')).toBe('Send to my-project…\n/ commands · ! phrases · @ files/agents · ; aliases · ^ nodes · paste or drag files');
   });
 
   it('keeps the placeholder short on mobile', () => {
@@ -982,7 +985,7 @@ afterEach(() => {
         quickData={makeQuickData() as any}
       />,
     );
-    expect(document.querySelector('.controls-input')?.getAttribute('data-placeholder')).toBe('Send to my-project… Supports fast multi-file paste or drag upload');
+    expect(document.querySelector('.controls-input')?.getAttribute('data-placeholder')).toBe('Send to my-project…\n/ commands · ! phrases · @ files/agents · ; aliases · ^ nodes · paste or drag files');
   });
 
   it('hides the send button on mobile and shows the embedded voice button when empty', () => {
@@ -5347,6 +5350,11 @@ afterEach(() => {
     const lightbox = document.createElement('div');
     lightbox.className = 'fb-lightbox';
     document.body.appendChild(lightbox);
+    // ImageLightbox handles Escape on window. Keep this listener here to pin
+    // both sides of the contract: the running session is untouched and the
+    // event is still allowed through to close the preview.
+    const closeLightbox = vi.fn();
+    window.addEventListener('keydown', closeLightbox);
     try {
       render(
         <SessionControls
@@ -5366,8 +5374,10 @@ afterEach(() => {
       fireEvent.keyDown(input, { key: 'Escape' });
 
       expect(gatherCancelCalls(ws)).toEqual([]);
+      expect(closeLightbox).toHaveBeenCalledTimes(1);
       expect(ws.sendInput).not.toHaveBeenCalled();
     } finally {
+      window.removeEventListener('keydown', closeLightbox);
       lightbox.remove();
     }
   });
@@ -7062,6 +7072,8 @@ afterEach(() => {
 
     await waitFor(() => expect(uploadFileMock).toHaveBeenCalledTimes(2));
     expect(pendingUploads.map((entry) => entry.file.name)).toEqual(['alpha.txt', 'beta.txt']);
+    expect(screen.queryByText('Measuring speed')).toBeNull();
+    expect(screen.queryByText('Calculating ETA')).toBeNull();
 
     await new Promise((resolve) => setTimeout(resolve, 300));
     await act(async () => {
@@ -8100,7 +8112,13 @@ afterEach(() => {
 
     const modelButton = screen.getByRole('button', { name: /^gpt-5.4$/i }) as HTMLButtonElement;
     expect(modelButton.disabled).toBe(false);
-    expect((screen.getByTitle('actions') as HTMLButtonElement).disabled).toBe(true);
+    const actionsButton = screen.getByTitle('actions') as HTMLButtonElement;
+    expect(actionsButton.disabled).toBe(false);
+    fireEvent.click(actionsButton);
+    const participantMenu = document.querySelector('.session-actions-menu') as HTMLElement;
+    expect(within(participantMenu).getByRole('button', { name: 'Restart' })).toBeTruthy();
+    expect(within(participantMenu).queryByRole('button', { name: 'Stop' })).toBeNull();
+    fireEvent.click(actionsButton);
     expect(ws.send).toHaveBeenCalledWith(expect.objectContaining({
       type: TRANSPORT_MSG.LIST_MODELS,
       sessionName: 'shared-copilot-session',

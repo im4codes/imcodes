@@ -434,6 +434,41 @@ describe('session-mgmt persistence routes', () => {
     });
   });
 
+  it('allows a covered share participant to relabel a session', async () => {
+    mockResolveHttpShareAccessForCoveredSession.mockResolvedValueOnce({
+      membership: 'none',
+      actor: { kind: 'share', effectiveActorRole: 'participant' },
+    });
+    const { updateSessionLabel } = await import('../src/db/queries.js');
+    const app = await buildApp();
+    const res = await app.request('/api/server/srv-1/sessions/deck_proj_brain/label', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ label: 'Shared Label' }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(updateSessionLabel).toHaveBeenCalledWith(mockDb, 'srv-1', 'deck_proj_brain', 'Shared Label');
+  });
+
+  it('denies a shared viewer relabeling a session', async () => {
+    mockResolveHttpShareAccessForCoveredSession.mockResolvedValueOnce({
+      membership: 'none',
+      actor: { kind: 'share', effectiveActorRole: 'viewer' },
+    });
+    const { updateSessionLabel } = await import('../src/db/queries.js');
+    const app = await buildApp();
+    const res = await app.request('/api/server/srv-1/sessions/deck_proj_brain/label', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ label: 'Denied Label' }),
+    });
+
+    expect(res.status).toBe(403);
+    expect(await res.json()).toEqual({ error: 'forbidden', reason: 'share-role-denied' });
+    expect(updateSessionLabel).not.toHaveBeenCalled();
+  });
+
   it('PATCH /sessions/:name/label allows clearing the label and still relays session.relabel', async () => {
     const { updateSessionLabel } = await import('../src/db/queries.js');
     const app = await buildApp();

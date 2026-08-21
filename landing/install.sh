@@ -110,7 +110,10 @@ probe() {  # open-internet check: exactly HTTP 204 within 3s (curl). Any other
 # or nothing if absent. Pure (no I/O) so it can be unit-tested directly —
 # see test/install/install-sh.test.ts.
 node_shasum_for() {
-  printf '%s\n' "$1" | awk -v f="$2" '$2==f {print $1; exit}'
+  # Read the complete manifest even after the first match. With `pipefail`, an
+  # early awk exit can close the pipe while printf is still writing a large
+  # SHASUMS body, turning a correct match into SIGPIPE (exit 141).
+  printf '%s\n' "$1" | awk -v f="$2" '!found && $2==f {print $1; found=1}'
 }
 
 # Test hook: when sourced with IMCODES_INSTALL_LIB=1 (unit tests), stop here so

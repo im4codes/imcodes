@@ -178,6 +178,17 @@ inline constexpr int kGdiFallbackDxgiRetryTicks = 150;
 // genuinely headless output returns to the cheap periodic retry cadence.
 inline constexpr int kGdiFallbackDxgiProbeTicks = 30;
 
+enum class CaptureWaitPolicy {
+  kReuseLastFrame,
+  kRequireFreshFrame,
+};
+
+inline constexpr bool CanReuseCaptureFrameAfterWait(
+    CaptureWaitPolicy policy,
+    bool has_last_frame) {
+  return policy == CaptureWaitPolicy::kReuseLastFrame && has_last_frame;
+}
+
 // Keeps the ordinary active-user worker and the privileged Winlogon worker on
 // their own desktops. A secure-console worker must be replaced after unlock;
 // it must never carry authority or input ownership onto the user's desktop.

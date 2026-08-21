@@ -14,6 +14,15 @@ describe('styles.css regression contracts', () => {
   const css = readFileSync(resolve(__dirname, '../src/styles.css'), 'utf8');
   const cssWithoutComments = css.replace(/\/\*[\s\S]*?\*\//g, '');
 
+  it('keeps remote desktop file window controls compact and horizontal', () => {
+    const actionsRule = css.match(/\.remote-desktop-file-drawer \.remote-desktop-file-drawer-actions\s*\{[^}]*\}/)?.[0];
+    expect(actionsRule).toMatch(/display:\s*flex/);
+    const controlRule = css.match(/\.remote-desktop-file-drawer \.remote-desktop-file-control\s*\{[^}]*\}/)?.[0];
+    expect(controlRule).toMatch(/width:\s*30px/);
+    expect(controlRule).toMatch(/height:\s*30px/);
+    expect(controlRule).toMatch(/border-radius:\s*999px/);
+  });
+
   it('keeps feature announcements visible and dismissible on desktop and mobile', () => {
     const announcementRule = css.match(/\.feature-announcement\s*\{[^}]*\}/)?.[0];
     expect(announcementRule).toBeTruthy();
@@ -172,6 +181,26 @@ describe('styles.css regression contracts', () => {
     expect(relayBadgeRule?.[0]).toMatch(/color:\s*#fcd34d/);
     expect(directProgressRule?.[0]).toMatch(/#4ade80/);
     expect(relayProgressRule?.[0]).toMatch(/#fbbf24/);
+  });
+
+  it('keeps long download rows constrained while preserving right-side metadata and actions', () => {
+    const rowRule = css.match(/\.download-transfer-row\s*\{[^}]*\}/)?.[0];
+    expect(rowRule).toBeTruthy();
+    expect(rowRule).toMatch(/grid-template-columns:\s*minmax\(0,\s*1fr\)\s+max-content/);
+    expect(rowRule).toMatch(/min-width:\s*0/);
+    expect(rowRule).toMatch(/max-width:\s*100%/);
+
+    const headingRule = css.match(/\.download-transfer-row-heading,\s*\.download-transfer-status-line\s*\{[^}]*\}/)?.[0];
+    expect(headingRule).toBeTruthy();
+    expect(headingRule).toMatch(/grid-template-columns:\s*minmax\(0,\s*1fr\)\s+max-content/);
+
+    const leadingNameRule = css.match(/\.download-transfer-name-leading\s*\{[^}]*\}/)?.[0];
+    expect(leadingNameRule).toBeTruthy();
+    expect(leadingNameRule).toMatch(/text-overflow:\s*ellipsis/);
+
+    const listRule = css.match(/\.download-transfer-list\s*\{[^}]*\}/)?.[0];
+    expect(listRule).toBeTruthy();
+    expect(listRule).toMatch(/overflow-x:\s*hidden/);
   });
 
   it('keeps the remote-desktop right-click helper touch-only', () => {

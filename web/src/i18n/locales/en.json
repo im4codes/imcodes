@@ -148,7 +148,7 @@
     },
     "roleHelp": {
       "viewer": "Can view scoped state and join scoped discussion without driving the agent.",
-      "participant": "Can view scoped state and send prompts to covered concrete tabs."
+      "participant": "Can fully collaborate within the shared scope, including OpenSpec and new sub-sessions, but cannot close sessions."
     },
     "trust": {
       "title": "Participant trust disclosure",
@@ -542,6 +542,7 @@
     "stop_appended_queue": "Queued messages appended; the session is still running.",
     "send_placeholder": "Send to {{name}}…",
     "send_placeholder_desktop_upload": "{{placeholder}} Supports fast multi-file paste or drag upload",
+    "send_placeholder_desktop_shortcuts": "{{placeholder}}\n/ commands · ! phrases · @ files/agents · ; aliases · ^ nodes · paste or drag files",
     "composer_target_label": "Sending to",
     "composer_target_aria": "Message target: {{name}}",
     "actions": "Session actions",
@@ -824,6 +825,10 @@
   "quick_input": {
     "title": "Quick input",
     "commands": "Quick Commands",
+    "no_command_matches": "No matching commands",
+    "no_phrase_matches": "No matching phrases",
+    "models": "Models",
+    "no_model_matches": "No matching models",
     "phrases": "Quick Phrases",
     "history": "History",
     "this_session": "This Session",
@@ -1581,6 +1586,30 @@
     "achieve_prompt": "Take {{reference}} to done using the full OpenSpec workflow. Inspect all remaining tasks and artifacts, complete the required implementation and spec work, directly update proposal/design/specs/tasks under {{reference}} where needed, close outstanding gaps, sync affected specs if needed, and archive the change once it meets completion criteria. Do not stop at status reporting.",
     "propose_from_discussion_prompt": "Generate an OpenSpec change from the recent discussion. Extract the goal, scope, key requirements, and acceptance criteria, list unclear points as follow-ups, and write the actual change artifacts under openspec/changes/ (proposal, design, specs, tasks) instead of stopping at a draft note.",
     "propose_from_description_prompt": "Generate an OpenSpec change from the description below. Organize the goal, scope, key requirements, and acceptance criteria, list missing details as follow-ups, and write the actual change artifacts under openspec/changes/ (proposal, design, specs, tasks) instead of stopping at a draft note."
+  },
+  "downloads": {
+    "title": "Downloads",
+    "expand": "Expand downloads",
+    "collapse": "Collapse downloads",
+    "clear_finished": "Clear finished",
+    "cancel": "Cancel",
+    "retry": "Retry",
+    "dismiss": "Dismiss",
+    "progress_aria": "Download progress for {{name}}",
+    "transferred": "{{transferred}} / {{total}}",
+    "speed": "{{speed}}/s",
+    "speed_calculating": "Measuring speed…",
+    "status": {
+      "preparing": "Preparing",
+      "connecting": "Connecting",
+      "transferring": "Downloading",
+      "falling_back": "Switching to HTTP",
+      "handed_off": "Handed to browser",
+      "completed": "Completed",
+      "canceled": "Canceled",
+      "failed": "Failed"
+    },
+    "route": { "pending": "Pending", "direct": "Direct", "http": "HTTP", "browser": "Browser" }
   },
   "upload": {
     "upload_file": "Upload file",

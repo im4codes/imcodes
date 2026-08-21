@@ -228,6 +228,15 @@ TEST(WorkerPolicyTest, EngagesGdiAfterAnyRunOfFailedCaptures) {
   EXPECT_FALSE(AdvanceGdiFallbackState(false, true, nullptr));
 }
 
+TEST(WorkerPolicyTest, RequiresANewDxgiFrameBeforeLeavingGdiFallback) {
+  EXPECT_TRUE(CanReuseCaptureFrameAfterWait(
+      CaptureWaitPolicy::kReuseLastFrame, true));
+  EXPECT_FALSE(CanReuseCaptureFrameAfterWait(
+      CaptureWaitPolicy::kReuseLastFrame, false));
+  EXPECT_FALSE(CanReuseCaptureFrameAfterWait(
+      CaptureWaitPolicy::kRequireFreshFrame, true));
+}
+
 TEST(WorkerPolicyTest, DebouncesDisplayTopologyUntilItStabilizes) {
   int remaining = 0;
   EXPECT_FALSE(AdvanceTopologyRefreshDebounce(true, &remaining));

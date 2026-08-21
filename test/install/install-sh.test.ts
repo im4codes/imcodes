@@ -73,6 +73,18 @@ describe.skipIf(process.platform === 'win32')('landing/install.sh helpers', () =
         .toBe('aaaa1111');
     });
 
+    it('does not fail under pipefail when a match precedes a large manifest tail', () => {
+      const command = [
+        'payload=$( {',
+        'printf "aaaa1111  node-v24.0.0-linux-x64.tar.gz\\n";',
+        'head -c 1048576 /dev/zero | tr "\\0" x;',
+        'printf "  filler.tar.gz\\n";',
+        '} );',
+        'node_shasum_for "$payload" "node-v24.0.0-linux-x64.tar.gz"',
+      ].join(' ');
+      expect(sourced(command)).toBe('aaaa1111');
+    });
+
     it('returns nothing when the tarball is absent', () => {
       expect(sourced('node_shasum_for "$SH" "node-v99.9.9-linux-x64.tar.gz"', { SH: SHASUMS }))
         .toBe('');

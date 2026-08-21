@@ -148,7 +148,7 @@
     },
     "roleHelp": {
       "viewer": "可檢視範圍內狀態並加入範圍內討論，但不能驅動代理。",
-      "participant": "可檢視範圍內狀態，並向涵蓋的具體標籤傳送提示。"
+      "participant": "可在分享範圍內完整協作，包括 OpenSpec 和建立子會話，但不能關閉會話。"
     },
     "trust": {
       "title": "參與者信任說明",
@@ -542,6 +542,7 @@
     "stop_appended_queue": "已追加佇列訊息，本次未停止工作階段。",
     "send_placeholder": "傳送給 {{name}}…",
     "send_placeholder_desktop_upload": "{{placeholder}} 支援多檔案貼上或拖曳快速上傳",
+    "send_placeholder_desktop_shortcuts": "{{placeholder}}\n/ 指令 · ! 短語 · @ 檔案/Agent · ; 別名 · ^ 受控節點 · 可貼上或拖入檔案",
     "composer_target_label": "傳送至",
     "composer_target_aria": "訊息將傳送至 {{name}}",
     "actions": "Session 操作",
@@ -824,6 +825,10 @@
   "quick_input": {
     "title": "快速輸入",
     "commands": "快速指令",
+    "no_command_matches": "找不到相符指令",
+    "no_phrase_matches": "找不到相符短語",
+    "models": "模型",
+    "no_model_matches": "找不到相符模型",
     "phrases": "快速短語",
     "history": "歷史記錄",
     "this_session": "本 Session",
@@ -1581,6 +1586,30 @@
     "achieve_prompt": "依照完整 OpenSpec 工作流程把 {{reference}} 推到完成。檢查所有剩餘任務與產物，完成必要的實作與規格工作，按需直接更新 {{reference}} 下的 proposal、design、specs、tasks，關閉未完成項，必要時同步受影響的主規格，並在符合完成條件後封存此變更。不要只回報狀態，直接把它做完。",
     "propose_from_discussion_prompt": "根據最近的討論生成一個 OpenSpec 變更。提煉目標、範圍、關鍵需求和驗收標準；不明確的部分明確列為待確認項；並直接把 proposal、design、specs、tasks 寫到 openspec/changes/ 下，而不是只停留在草稿說明。",
     "propose_from_description_prompt": "根據下面的描述生成一個 OpenSpec 變更。整理目標、範圍、關鍵需求和驗收標準；缺失資訊明確列為待確認項；並直接把 proposal、design、specs、tasks 寫到 openspec/changes/ 下，而不是只停留在草稿說明。"
+  },
+  "downloads": {
+    "title": "下載",
+    "expand": "展開下載清單",
+    "collapse": "收合下載清單",
+    "clear_finished": "清除已結束",
+    "cancel": "取消",
+    "retry": "重試",
+    "dismiss": "移除",
+    "progress_aria": "{{name}} 的下載進度",
+    "transferred": "{{transferred}} / {{total}}",
+    "speed": "{{speed}}/秒",
+    "speed_calculating": "測速中…",
+    "status": {
+      "preparing": "準備中",
+      "connecting": "正在連線",
+      "transferring": "下載中",
+      "falling_back": "正在切換 HTTP",
+      "handed_off": "已交給瀏覽器",
+      "completed": "已完成",
+      "canceled": "已取消",
+      "failed": "下載失敗"
+    },
+    "route": { "pending": "等待中", "direct": "直連", "http": "HTTP", "browser": "瀏覽器" }
   },
   "upload": {
     "upload_file": "上傳檔案",

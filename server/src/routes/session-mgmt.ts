@@ -216,8 +216,13 @@ sessionMgmtRoutes.patch('/:id/sessions/:name/label', async (c) => {
   const userId = c.get('userId' as never) as string;
   const serverId = c.req.param('id')!;
   const sessionName = c.req.param('name')!;
-  const access = await resolveServerMemberAccessOrShareDeny(c.env.DB, { serverId, userId });
-  if (!access.ok) return c.json({ error: 'forbidden', reason: access.reason }, 403);
+  const target = shareTargetFromSessionName(serverId, sessionName);
+  if (!target || target.kind === 'server') return c.json({ error: 'invalid_session' }, 400);
+  const access = await resolveHttpShareAccessForCoveredSession(c.env.DB, { serverId, userId, target });
+  if (access.actor.kind === 'none') return c.json({ error: 'forbidden', reason: 'not_authorized_for_server' }, 403);
+  if (access.actor.kind === 'share' && access.actor.effectiveActorRole !== 'participant') {
+    return c.json({ error: 'forbidden', reason: 'share-role-denied' }, 403);
+  }
 
   let body: { label?: string | null };
   try {
@@ -391,8 +396,13 @@ sessionMgmtRoutes.patch('/:id/sessions/:name', async (c) => {
   const userId = c.get('userId' as never) as string;
   const serverId = c.req.param('id')!;
   const sessionName = c.req.param('name')!;
-  const access = await resolveServerMemberAccessOrShareDeny(c.env.DB, { serverId, userId });
-  if (!access.ok) return c.json({ error: 'forbidden', reason: access.reason }, 403);
+  const target = shareTargetFromSessionName(serverId, sessionName);
+  if (!target || target.kind === 'server') return c.json({ error: 'invalid_session' }, 400);
+  const access = await resolveHttpShareAccessForCoveredSession(c.env.DB, { serverId, userId, target });
+  if (access.actor.kind === 'none') return c.json({ error: 'forbidden', reason: 'not_authorized_for_server' }, 403);
+  if (access.actor.kind === 'share' && access.actor.effectiveActorRole !== 'participant') {
+    return c.json({ error: 'forbidden', reason: 'share-role-denied' }, 403);
+  }
 
   let body: {
     label?: string | null;
@@ -485,8 +495,13 @@ sessionMgmtRoutes.patch('/:id/sessions/:name/rename', async (c) => {
   const userId = c.get('userId' as never) as string;
   const serverId = c.req.param('id')!;
   const sessionName = c.req.param('name')!;
-  const access = await resolveServerMemberAccessOrShareDeny(c.env.DB, { serverId, userId });
-  if (!access.ok) return c.json({ error: 'forbidden', reason: access.reason }, 403);
+  const target = shareTargetFromSessionName(serverId, sessionName);
+  if (!target || target.kind === 'server') return c.json({ error: 'invalid_session' }, 400);
+  const access = await resolveHttpShareAccessForCoveredSession(c.env.DB, { serverId, userId, target });
+  if (access.actor.kind === 'none') return c.json({ error: 'forbidden', reason: 'not_authorized_for_server' }, 403);
+  if (access.actor.kind === 'share' && access.actor.effectiveActorRole !== 'participant') {
+    return c.json({ error: 'forbidden', reason: 'share-role-denied' }, 403);
+  }
 
   let body: { name?: string };
   try {

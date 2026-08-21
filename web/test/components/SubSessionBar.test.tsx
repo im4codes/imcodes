@@ -360,7 +360,7 @@ describe('SubSessionBar', () => {
   });
 
   it('auto-probes direct connectivity in daemon details and supports a manual refresh', async () => {
-    const statsWs = makeStatsWs(['file.transfer.direct.v1']);
+    const statsWs = makeStatsWs(['file.transfer.direct.lease.v2']);
     const view = render(
       <SubSessionBar
         subSessions={[makeSubSession()]}
@@ -417,7 +417,7 @@ describe('SubSessionBar', () => {
       });
       return new Promise((resolve) => { finishProbe = resolve; });
     });
-    const statsWs = makeStatsWs(['file.transfer.direct.v1']);
+    const statsWs = makeStatsWs(['file.transfer.direct.lease.v2']);
     const view = render(
       <SubSessionBar
         subSessions={[makeSubSession()]}
