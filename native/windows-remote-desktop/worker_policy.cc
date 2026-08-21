@@ -8,6 +8,11 @@
 
 namespace imcodes::rd {
 
+bool DisplayOutputIsPresentable(bool imcodes_virtual,
+                                bool has_active_monitor_target) {
+  return imcodes_virtual || has_active_monitor_target;
+}
+
 CaptureAcquireAction ClassifyCaptureAcquireResult(HRESULT result) {
   if (result == S_OK) return CaptureAcquireAction::kFrame;
   if (result == DXGI_ERROR_WAIT_TIMEOUT) return CaptureAcquireAction::kWait;

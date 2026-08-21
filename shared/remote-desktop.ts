@@ -308,8 +308,15 @@ export const REMOTE_DESKTOP_LIMITS = {
   // showed healthy direct sessions taking about 10s, so the former 15s bound
   // cut off normal cold starts with almost no scheduling/network headroom.
   NEGOTIATION_TIMEOUT_MS: 45_000,
-  LEASE_DURATION_MS: 15_000,
-  LEASE_RENEW_INTERVAL_MS: 5_000,
+  // The lease remains a fail-closed backstop: if the Server can no longer
+  // revalidate the controller, the native worker stops itself without relying
+  // on a best-effort STOP frame.  Fifteen seconds, however, left only two
+  // renewal opportunities after a normal 5 s tick.  A brief database stall,
+  // daemon reconnect, or Windows scheduling pause could therefore end a live
+  // session as `lease_expired`.  Keep the bound short enough to contain an
+  // orphaned session, while leaving three full renewal windows for recovery.
+  LEASE_DURATION_MS: 60_000,
+  LEASE_RENEW_INTERVAL_MS: 15_000,
   KEEPALIVE_TIMEOUT_MS: 15_000,
   DATA_KEEPALIVE_INTERVAL_MS: 30_000,
   MEDIA_PROGRESS_TIMEOUT_MS: 10_000,

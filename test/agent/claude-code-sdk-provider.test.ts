@@ -137,7 +137,7 @@ describe('ClaudeCodeSdkProvider', () => {
     childProcessMock.spawn.mockClear();
   });
 
-  it('pushes a correlated peer notification into the live Claude query without closing it', async () => {
+  it('queues a correlated peer notification at Claude\'s next safe boundary without closing the live query', async () => {
     sdkMock.setWaitForClose(true);
     const provider = new ClaudeCodeSdkProvider();
     await provider.connect({ binaryPath: 'claude' });
@@ -161,7 +161,9 @@ describe('ClaudeCodeSdkProvider', () => {
     expect(queue.buffer?.at(-1)).toMatchObject({
       type: 'user',
       uuid: 'notification_identity',
-      priority: 'now',
+      // `now` preempts the Agent SDK turn; a completed audit/delegation reply
+      // must arrive during the active query without stopping its work.
+      priority: 'next',
       shouldQuery: true,
       isSynthetic: true,
       origin: {

@@ -728,7 +728,9 @@ export function QuickInputPanel({
           )}
         </div>
 
-        {/* Controlled-node tab — display names are mutable, ref names are stable. */}
+        {/* Controlled-node tab — display names are mutable, ref names are
+            stable. Connectivity is informational: an offline node can still
+            be referenced in a task and resolve once it reconnects. */}
         {activeTab === 'machines' && machines.length > 0 && (
           <div class="qp-machine-items" role="listbox" aria-label={t('quick_input.tab_machines')}>
             <div class="qp-alias-hint">{t('machine.usage_hint')}</div>
@@ -737,10 +739,9 @@ export function QuickInputPanel({
                 key={machine.serverId}
                 type="button"
                 class={`qp-machine-item${machine.online ? '' : ' is-offline'}`}
-                disabled={!machine.online || !onInsertMachine}
+                disabled={!onInsertMachine}
                 title={machine.online ? machine.displayName : t('machine.offline_hint')}
                 onClick={() => {
-                  if (!machine.online) return;
                   onInsertMachine?.(machine.refName, machine.displayName);
                   onClose();
                 }}

@@ -1,8 +1,8 @@
 /**
  * @vitest-environment jsdom
  *
- * Controlled nodes appear in Quick Input only when available. Selecting an
- * online node inserts its stable ref marker; offline nodes are not selectable.
+ * Controlled nodes appear in Quick Input only when available. Selecting any
+ * node inserts its stable ref marker; offline is an informational state.
  */
 import { cleanup, fireEvent, render } from '@testing-library/preact';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -54,7 +54,7 @@ describe('QuickInputPanel controlled-node tab', () => {
     expect(document.body.textContent).not.toContain('quick_input.tab_machines');
   });
 
-  it('inserts the stable ref of an online node and disables offline nodes', () => {
+  it('inserts stable refs for online and offline nodes while preserving offline status', () => {
     const onInsertMachine = vi.fn();
     const onClose = vi.fn();
     render(<QuickInputPanel {...props({
@@ -73,9 +73,12 @@ describe('QuickInputPanel controlled-node tab', () => {
     expect(document.body.textContent).toContain('^^(office-pc)');
 
     const nodeButtons = Array.from(document.body.querySelectorAll<HTMLButtonElement>('.qp-machine-item'));
-    expect(nodeButtons[1].disabled).toBe(true);
+    expect(nodeButtons[1].disabled).toBe(false);
+    expect(nodeButtons[1].classList.contains('is-offline')).toBe(true);
+    fireEvent.click(nodeButtons[1]);
+    expect(onInsertMachine).toHaveBeenCalledWith('lab-pc', 'Lab PC');
     fireEvent.click(nodeButtons[0]);
     expect(onInsertMachine).toHaveBeenCalledWith('office-pc', 'Renamed Office PC');
-    expect(onClose).toHaveBeenCalledOnce();
+    expect(onClose).toHaveBeenCalledTimes(2);
   });
 });

@@ -779,6 +779,62 @@ describe('RemoteDesktopRouter', () => {
     }
   });
 
+  it('keeps the bounded controller lease alive through a brief revalidation stall', async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(1_800_000_000_000);
+      let resolveRenewal!: (value: ControlledMachineAccessRow | null) => void;
+      let calls = 0;
+      const f = fixture({
+        resolveAccess: async () => {
+          calls++;
+          if (calls === 1) return validAccess(Date.now());
+          return new Promise<ControlledMachineAccessRow | null>((resolve) => {
+            resolveRenewal = resolve;
+          });
+        },
+      });
+      const authority = await authorize(f);
+      const authorized = f.messages(f.browserA)[0]!;
+      expect(authorized.leaseExpiresAt)
+        .toBe(Date.now() + REMOTE_DESKTOP_LIMITS.LEASE_DURATION_MS);
+      f.router.handleDaemon({
+        type: REMOTE_DESKTOP_MSG.STATUS,
+        ...authority,
+        mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
+        inputEpoch: 1,
+        state: REMOTE_DESKTOP_STATE.DIRECT,
+        route: 'direct',
+        inputEnabled: false,
+      }, 7);
+
+      // A slow permission lookup must not make a healthy controller lose its
+      // worker lease before the lookup has a chance to complete.  This crossed
+      // the old 15 s lease (and therefore caught the production failure) while
+      // remaining below the new one-minute fail-closed bound.
+      await vi.advanceTimersByTimeAsync(REMOTE_DESKTOP_LIMITS.LEASE_RENEW_INTERVAL_MS);
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(f.router.stats().active).toBe(1);
+      expect(f.messages(f.browserA)).not.toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          type: REMOTE_DESKTOP_MSG.TERMINAL,
+          reason: REMOTE_DESKTOP_TERMINAL_REASON.LEASE_EXPIRED,
+        }),
+      ]));
+
+      resolveRenewal(validAccess(Date.now()));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(f.daemonMessages.at(-1)).toMatchObject({
+        type: REMOTE_DESKTOP_MSG.LEASE,
+        ...authority,
+        leaseExpiresAt: Date.now() + REMOTE_DESKTOP_LIMITS.LEASE_DURATION_MS,
+      });
+      f.router.stopAll();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('caps lifetime before TURN expiry and lets the worker fail closed on Server registry loss', async () => {
     vi.useFakeTimers();
     try {
