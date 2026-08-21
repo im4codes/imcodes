@@ -21,6 +21,8 @@ export type CodexServiceTier = typeof CODEX_SERVICE_TIER[keyof typeof CODEX_SERV
 export const CODEX_FAST_OFF_COMMAND = '/fast off' as const;
 /** The matching opt-in, so the control is a switch rather than a one-way door. */
 export const CODEX_FAST_ON_COMMAND = '/fast on' as const;
+/** Query the current Codex Fast state without changing it. */
+export const CODEX_FAST_STATUS_COMMAND = '/fast status' as const;
 
 const FAST_COMMAND_PATTERN = /^\/fast\s+(on|off)$/i;
 

@@ -198,4 +198,87 @@ describe('SessionControls quick input integration', () => {
       text: multiline,
     }));
   });
+
+  it('opens slash suggestions, filters provider and user commands, and fills the selected command', () => {
+    const ws = {
+      connected: true,
+      send: vi.fn(),
+      sendSessionCommand: vi.fn(),
+      sendInput: vi.fn(),
+      subSessionSetModel: vi.fn(),
+      fsListDir: vi.fn(),
+      onMessage: vi.fn(() => () => {}),
+    } as any;
+    const quickData = {
+      ...makeQuickData(),
+      data: {
+        history: [],
+        sessionHistory: {},
+        commands: ['/code-review'],
+        phrases: [],
+      },
+    };
+
+    const { container } = render(
+      <SessionControls
+        ws={ws}
+        activeSession={makeSession({ agentType: 'codex-sdk' })}
+        quickData={quickData}
+        sessions={[]}
+        subSessions={[]}
+        serverId="srv-1"
+      />,
+    );
+
+    const input = screen.getByRole('textbox');
+    input.textContent = '/';
+    fireEvent.input(input);
+    expect(container.querySelector('[data-slash-command="/stop"]')).toBeTruthy();
+    expect(container.querySelector('[data-slash-command="/fast on"]')).toBeTruthy();
+    expect(container.querySelector('[data-slash-command="/code-review"]')).toBeTruthy();
+
+    input.textContent = '/co';
+    fireEvent.input(input);
+    expect(container.querySelector('[data-slash-command="/compact"]')).toBeTruthy();
+    expect(container.querySelector('[data-slash-command="/code-review"]')).toBeTruthy();
+    expect(container.querySelector('[data-slash-command="/fast on"]')).toBeNull();
+
+    fireEvent.click(container.querySelector('[data-slash-command="/code-review"]')!);
+    expect(input.textContent).toBe('/code-review');
+    expect(container.querySelector('.controls-slash-picker')).toBeNull();
+    expect(ws.sendSessionCommand).not.toHaveBeenCalled();
+  });
+
+  it('accepts the highlighted slash command with Enter without sending it immediately', () => {
+    const ws = {
+      connected: true,
+      send: vi.fn(),
+      sendSessionCommand: vi.fn(),
+      sendInput: vi.fn(),
+      subSessionSetModel: vi.fn(),
+      fsListDir: vi.fn(),
+      onMessage: vi.fn(() => () => {}),
+    } as any;
+
+    const { container } = render(
+      <SessionControls
+        ws={ws}
+        activeSession={makeSession({ agentType: 'codex-sdk' })}
+        quickData={makeQuickData()}
+        sessions={[]}
+        subSessions={[]}
+        serverId="srv-1"
+      />,
+    );
+
+    const input = screen.getByRole('textbox');
+    input.textContent = '/fa';
+    fireEvent.input(input);
+    expect(container.querySelector('[data-slash-command="/fast on"]')?.getAttribute('aria-selected')).toBe('true');
+
+    fireEvent.keyDown(input, { key: 'Enter' });
+    expect(input.textContent).toBe('/fast on');
+    expect(container.querySelector('.controls-slash-picker')).toBeNull();
+    expect(ws.sendSessionCommand).not.toHaveBeenCalled();
+  });
 });

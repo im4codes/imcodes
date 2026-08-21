@@ -824,6 +824,7 @@
   "quick_input": {
     "title": "クイック入力",
     "commands": "クイックコマンド",
+    "no_command_matches": "一致するコマンドはありません",
     "phrases": "クイックフレーズ",
     "history": "履歴",
     "this_session": "このセッション",

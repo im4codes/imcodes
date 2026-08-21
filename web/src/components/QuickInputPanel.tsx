@@ -17,6 +17,7 @@ import {
 import type { WsClient } from '../ws-client.js';
 import type { MachineListItem } from '../api/machines.js';
 import type { JSX, RefObject } from 'preact';
+import { getDefaultQuickCommands } from '../quick-commands.js';
 
 export interface QuickData {
   history: string[];                        // cross-session
@@ -29,21 +30,6 @@ export const EMPTY_QUICK_DATA: QuickData = { history: [], sessionHistory: {}, co
 
 // ── Built-in defaults (not stored in D1, cannot be deleted) ───────────────
 
-const DEFAULT_COMMANDS: Record<string, string[]> = {
-  'claude-code': ['/compact', '/clear', '/usage', '/cost', '/status', '/help'],
-  'claude-code-sdk': ['/compact', '/clear', '/model', '/thinking'],
-  'copilot-sdk': ['/compact', '/clear', '/model', '/thinking'],
-  'codex':       ['/compact', '/help', '/model', '/approval', '/clear'],
-  'codex-sdk':   ['/compact', '/clear', '/model', '/thinking'],
-  'cursor-headless': ['/compact', '/clear', '/model'],
-  'opencode-sdk': ['/clear', '/model'],
-  'opencode':    ['/compact', '/clear', '/model', '/help'],
-  'qwen':        ['/compact', '/stop', '/clear', '/model', '/thinking'],
-  'grok-sdk':    ['/compact', '/clear', '/model'],
-  'kimi-sdk':    ['/compact', '/clear', '/model'],
-  'deepseek-harness': ['/clear', '/model'],
-  'openclaw':    ['/compact', '/stop', '/clear', '/thinking'],
-};
 const DEFAULT_PHRASES = ['continue', 'fix', 'explain', 'refactor this', 'write tests', 'check errors', 'pull', 'commit&push', 'CI failed, fix', 'test & push', 'yes'];
 
 const SESSION_HISTORY_MAX = 50;
@@ -588,7 +574,7 @@ export function QuickInputPanel({
 
   if (!open) return null;
 
-  const defaultCmds = DEFAULT_COMMANDS[agentType] ?? DEFAULT_COMMANDS['claude-code'];
+  const defaultCmds = getDefaultQuickCommands(agentType);
   const activeHistory = historyScope === 'session'
     ? (data.sessionHistory[sessionName] ?? [])
     : getAccountHistory(data);

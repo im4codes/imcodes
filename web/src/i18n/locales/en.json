@@ -824,6 +824,7 @@
   "quick_input": {
     "title": "Quick input",
     "commands": "Quick Commands",
+    "no_command_matches": "No matching commands",
     "phrases": "Quick Phrases",
     "history": "History",
     "this_session": "This Session",

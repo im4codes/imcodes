@@ -824,6 +824,7 @@
   "quick_input": {
     "title": "快捷输入",
     "commands": "快捷命令",
+    "no_command_matches": "无匹配命令",
     "phrases": "快捷短语",
     "history": "历史记录",
     "this_session": "本 Session",

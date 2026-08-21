@@ -7,6 +7,7 @@ import type { SessionInfo } from '../types.js';
 import { QuickInputPanel } from './QuickInputPanel.js';
 import { getNavigableHistory } from './QuickInputPanel.js';
 import type { UseQuickDataResult } from './QuickInputPanel.js';
+import { getSlashCommandSuggestions, matchSlashCommandTrigger } from '../quick-commands.js';
 import { FileBrowser } from './file-browser-lazy.js';
 import { CloneSessionGroupDialog } from './CloneSessionGroupDialog.js';
 import { useSwipeBack } from '../hooks/useSwipeBack.js';
@@ -1134,6 +1135,9 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   // Set for the input event immediately following a paste so pasted text ending
   // in `^name` never opens the inline machine picker (paste must not trigger).
   const machinePasteSuppressRef = useRef(false);
+  const [slashPickerOpen, setSlashPickerOpen] = useState(false);
+  const [slashQuery, setSlashQuery] = useState('');
+  const [slashHighlightIdx, setSlashHighlightIdx] = useState(0);
   const [modelOpen, setModelOpen] = useState(false);
   const [autoOpen, setAutoOpen] = useState(false);
   const [peerAuditOpen, setPeerAuditOpen] = useState(false);
@@ -1474,6 +1478,16 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     machines: machineAll,
     filtered: machineFiltered,
   } = useMachines(machineQuery);
+  const slashSuggestions = useMemo(
+    () => getSlashCommandSuggestions(activeSession?.agentType ?? 'claude-code', quickData.data.commands, slashQuery),
+    [activeSession?.agentType, quickData.data.commands, slashQuery],
+  );
+  const slashPickerRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!slashPickerOpen || slashSuggestions.length === 0) return;
+    const highlighted = slashPickerRef.current?.querySelector<HTMLElement>('[data-hl="true"]');
+    highlighted?.scrollIntoView({ block: 'nearest' });
+  }, [slashHighlightIdx, slashPickerOpen, slashSuggestions]);
   const publishComposerText = useCallback((text: string) => {
     onComposerTextChange?.(text);
   }, [onComposerTextChange]);
@@ -2558,6 +2572,12 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     syncMobileComposerMetrics();
   };
 
+  const selectSlashCommand = (command: string) => {
+    setSlashPickerOpen(false);
+    setSlashQuery('');
+    fillInput(command);
+  };
+
   const appendToInput = (paths: string[]) => {
     if (!paths.length) return;
     const suffix = paths.join(' ');
@@ -3639,6 +3659,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const escapeKeyboardOwnerOpen = atPickerOpen
     || aliasPickerOpen
     || machinePickerOpen
+    || slashPickerOpen
     || quickOpen
     || modelOpen
     || autoOpen
@@ -3773,6 +3794,8 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       atSelectionSnapshotRef.current = '';
       setAliasPickerOpen(false);
       setAliasQuery('');
+      setSlashPickerOpen(false);
+      setSlashQuery('');
       histIdxRef.current = -1;
       draftRef.current = '';
       if (draftKey) sessionStorage.removeItem(draftKey);
@@ -4201,6 +4224,40 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       e.preventDefault();
       e.stopPropagation();
       return;
+    }
+
+    if (slashPickerOpen) {
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        if (slashSuggestions.length > 0) setSlashHighlightIdx((idx) => (idx + 1) % slashSuggestions.length);
+        return;
+      }
+      if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        if (slashSuggestions.length > 0) setSlashHighlightIdx((idx) => (idx - 1 + slashSuggestions.length) % slashSuggestions.length);
+        return;
+      }
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        e.stopPropagation();
+        setSlashPickerOpen(false);
+        setSlashQuery('');
+        return;
+      }
+      if (e.key === 'Enter' && slashSuggestions.some(
+        (command) => command.toLocaleLowerCase() === `/${slashQuery}`.toLocaleLowerCase(),
+      )) {
+        // A fully typed command keeps the established one-Enter send behavior.
+        // Only incomplete queries (or Tab) are claimed as autocomplete picks.
+        setSlashPickerOpen(false);
+        setSlashQuery('');
+      } else if ((e.key === 'Tab' || e.key === 'Enter') && slashSuggestions.length > 0) {
+        e.preventDefault();
+        e.stopPropagation();
+        const command = slashSuggestions[Math.min(slashHighlightIdx, slashSuggestions.length - 1)];
+        if (command) selectSlashCommand(command);
+        return;
+      }
     }
 
     // When the inline `;` alias picker is open, it owns Enter/Tab/Arrow/Escape.
@@ -6160,6 +6217,38 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           />
         )}
 
+        {slashPickerOpen && activeSession && (
+          <div
+            ref={slashPickerRef}
+            class="controls-slash-picker"
+            role="listbox"
+            aria-label={t('quick_input.commands')}
+            style={aliasPickerContainerStyle}
+          >
+            <div style={aliasPickerGroupLabelStyle}>{t('quick_input.commands')}</div>
+            {slashSuggestions.length === 0 && (
+              <div style={aliasPickerEmptyStyle}>{t('quick_input.no_command_matches')}</div>
+            )}
+            {slashSuggestions.map((command, idx) => {
+              const highlighted = idx === Math.min(slashHighlightIdx, slashSuggestions.length - 1);
+              return (
+                <div
+                  key={command}
+                  role="option"
+                  aria-selected={highlighted}
+                  data-hl={highlighted ? 'true' : undefined}
+                  data-slash-command={command}
+                  style={highlighted ? aliasPickerItemHighlightStyle : aliasPickerItemStyle}
+                  onMouseDown={(event) => event.preventDefault()}
+                  onClick={() => selectSlashCommand(command)}
+                >
+                  <code>{command}</code>
+                </div>
+              );
+            })}
+          </div>
+        )}
+
         {/* Inline `;` alias autocomplete dropdown. Mirrors the @ picker's
             positioning; owns Enter/Tab/Arrow/Escape via handleKeyDown while open. */}
         {aliasPickerOpen && activeSession && (
@@ -6323,6 +6412,16 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
               }
               // Detect @/@@: use end of text (contentEditable anchorOffset is unreliable)
               const text = currentText;
+
+              const slashTrigger = imeComposingRef.current ? null : matchSlashCommandTrigger(text);
+              if (slashTrigger !== null) {
+                setSlashQuery(slashTrigger);
+                setSlashHighlightIdx(0);
+                setSlashPickerOpen(true);
+              } else if (slashPickerOpen) {
+                setSlashPickerOpen(false);
+                setSlashQuery('');
+              }
 
               // @@ → open the TEAM dropdown (combos / workflows). Selecting one
               // launches a team discussion immediately with the current composer
