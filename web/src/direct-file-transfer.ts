@@ -948,6 +948,12 @@ async function runAttempt(lease: Lease, op: DirectAttempt, attempt: number): Pro
       });
     } catch { /* best effort */ }
   };
+  let downloadWriterAborted = false;
+  const abortDownloadWriter = async (error: unknown) => {
+    if (op.kind !== 'download' || downloadWriterAborted) return;
+    downloadWriterAborted = true;
+    await op.writer.abort(error).catch(() => undefined);
+  };
   try {
     const init = makeOperationInit(lease, active, op);
     const authorizedPromise = waitForControl(
@@ -999,17 +1005,19 @@ async function runAttempt(lease: Lease, op: DirectAttempt, attempt: number): Pro
       };
       const fail = (error: unknown) => {
         if (op.kind === 'download') {
-          void op.writer.abort(error).catch(() => undefined).finally(() => finish(error));
+          void abortDownloadWriter(error).finally(() => finish(error));
         } else finish(error);
       };
       const onAbort = () => fail(directError(DIRECT_FILE_TRANSFER_ERROR.CANCELED, false));
       const onClose = () => fail(directError(DIRECT_FILE_TRANSFER_ERROR.CHANNEL_CLOSED));
       const onError = () => fail(directError(DIRECT_FILE_TRANSFER_ERROR.CONNECTION_FAILED));
       const downloadOp = op.kind === 'download' ? op : null;
-      const completeDownload = async () => {
+      const completeDownload = async (declaredTotalBytes: number) => {
         if (!downloadOp) throw directError(DIRECT_FILE_TRANSFER_ERROR.INTERNAL_ERROR, false);
         await writeChain;
-        if (expected < 0 || received !== expected) throw directError(DIRECT_FILE_TRANSFER_ERROR.SIZE_MISMATCH, false);
+        if (expected < 0 || declaredTotalBytes !== expected || received !== expected) {
+          throw directError(DIRECT_FILE_TRANSFER_ERROR.SIZE_MISMATCH, false);
+        }
         try {
           await downloadOp.writer.close();
         } catch (error) {
@@ -1106,11 +1114,7 @@ async function runAttempt(lease: Lease, op: DirectAttempt, attempt: number): Pro
           return;
         }
         if (data.type === DIRECT_FILE_TRANSFER_DATA_MSG.FINISH && data.direction === DIRECT_FILE_TRANSFER_DIRECTION.DOWNLOAD) {
-          if (data.totalBytes !== expected || data.totalBytes !== received) {
-            fail(directError(DIRECT_FILE_TRANSFER_ERROR.SIZE_MISMATCH, false));
-            return;
-          }
-          void completeDownload().catch(fail);
+          void completeDownload(data.totalBytes).catch(fail);
         }
       };
       const offControl = lease.ws.onMessage((raw) => {
@@ -1186,7 +1190,7 @@ async function runAttempt(lease: Lease, op: DirectAttempt, attempt: number): Pro
       if (active.authority) retainTerminalGrace(lease, active);
     }
     cancel();
-    if (op.kind === 'download') await op.writer.abort(error).catch(() => undefined);
+    await abortDownloadWriter(error);
     throw error;
   } finally {
     cleanup();

@@ -34,6 +34,7 @@ import {
   isFileUploadCanceled,
   prewarmDirectFileLease,
   selectPreviewDownloadDestination,
+  type DirectPreviewDownloadDestination,
 } from '../direct-file-transfer.js';
 import {
   DOWNLOAD_TRANSFER_ROUTE,
@@ -1727,9 +1728,17 @@ export function FileBrowser({
     // The picker must run inside this click handler.  We retain the approved
     // handle through the one stale-preview refresh so it never prompts twice
     // and every direct/HTTP retry streams into the same user-selected file.
-    const destination = await selectPreviewDownloadDestination(
-      selectedPath.split(/[/\\]/).pop() || undefined,
-    );
+    let destination: DirectPreviewDownloadDestination | null;
+    try {
+      destination = await selectPreviewDownloadDestination(
+        selectedPath.split(/[/\\]/).pop() || undefined,
+      );
+    } catch (error) {
+      if (isFileUploadCanceled(error)) return;
+      setDownloadError(t('upload.download_failed'));
+      setTimeout(() => setDownloadError(null), 5000);
+      return;
+    }
     const transfer = beginDownloadTransfer(selectedPath.split(/[/\\]/).pop() || selectedPath);
     const download = async (handle: string) => downloadPreviewWithDirectFallback({
       ws,

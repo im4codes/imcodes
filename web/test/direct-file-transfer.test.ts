@@ -114,7 +114,7 @@ function controlBinding(message: Record<string, unknown>) {
 
 function createWs(
   capabilities: string[],
-  mode: 'success' | 'operation_failure' | 'hold' | 'authorized_hold' | 'status_committed' | 'terminal_committed' | 'ack_then_late_terminal' | 'download_hold_rebind' | 'error_after_expiry' = 'success',
+  mode: 'success' | 'operation_failure' | 'hold' | 'authorized_hold' | 'status_committed' | 'terminal_committed' | 'ack_then_late_terminal' | 'download_hold_rebind' | 'download_size_mismatch' | 'error_after_expiry' = 'success',
   leaseTiming: { readyDelayMs?: number; idleWindowMs?: number; terminalDelayMs?: number; rebindDaemonGeneration?: number } = {},
 ) {
   const handlers = new Set<(message: ServerMessage) => void>();
@@ -231,7 +231,7 @@ function createWs(
           type: DIRECT_FILE_TRANSFER_DATA_MSG.FINISH,
           protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
           ...common,
-          totalBytes: 3,
+          totalBytes: mode === 'download_size_mismatch' ? 2 : 3,
         }),
       })), 0);
     }
@@ -344,10 +344,12 @@ const directCapabilities = [
 describe('direct file transfer v2 browser broker', () => {
   afterEach(() => {
     vi.useRealTimers();
+    vi.unstubAllGlobals();
   });
 
   beforeEach(() => {
     vi.clearAllMocks();
+    sessionStorage.clear();
     FakePeerConnection.instances = [];
     FakePeerConnection.selectedCandidateType = 'host';
     vi.stubGlobal('RTCPeerConnection', FakePeerConnection);
@@ -355,6 +357,24 @@ describe('direct file transfer v2 browser broker', () => {
       ok: true,
       attachment: { id: 'relay-attachment', serverId: 'server-1', daemonPath: '/tmp/relay.txt' },
     });
+  });
+
+  it('acquires the File System Access destination during the user action and classifies picker cancellation', async () => {
+    const { selectPreviewDownloadDestination } = await import('../src/direct-file-transfer.js');
+    const handle = { createWritable: vi.fn() };
+    const picker = vi.fn().mockResolvedValueOnce(handle);
+    vi.stubGlobal('showSaveFilePicker', picker);
+
+    await expect(selectPreviewDownloadDestination('report.pdf')).resolves.toEqual({ handle });
+    expect(picker).toHaveBeenCalledWith({ suggestedName: 'report.pdf' });
+    expect(FakePeerConnection.instances).toHaveLength(0);
+
+    picker.mockRejectedValueOnce(new DOMException('canceled', 'AbortError'));
+    await expect(selectPreviewDownloadDestination('report.pdf')).rejects.toMatchObject({
+      code: DIRECT_FILE_TRANSFER_ERROR.CANCELED,
+      retryable: false,
+    });
+    expect(FakePeerConnection.instances).toHaveLength(0);
   });
 
   it('uses HTTP relay directly when the v2 upload capabilities are unavailable', async () => {
@@ -400,6 +420,37 @@ describe('direct file transfer v2 browser broker', () => {
     release?.();
   });
 
+  it('reuses one lease peer for an upload followed by a preview download', async () => {
+    const { uploadFileDirect, downloadPreviewWithDirectFallback } = await import('../src/direct-file-transfer.js');
+    const { ws, sent } = createWs(directCapabilities);
+    const uploadBytes = new TextEncoder().encode('upload');
+    const file = {
+      name: 'upload.txt',
+      type: 'text/plain',
+      size: uploadBytes.byteLength,
+      slice: (start: number, end: number) => ({ arrayBuffer: async () => uploadBytes.slice(start, end).buffer }),
+    } as unknown as File;
+    await uploadFileDirect(ws, file, id(), undefined, undefined, undefined, undefined, 'server-1');
+
+    const writer = {
+      write: vi.fn().mockResolvedValue(undefined),
+      close: vi.fn().mockResolvedValue(undefined),
+      abort: vi.fn().mockResolvedValue(undefined),
+    };
+    await downloadPreviewWithDirectFallback({
+      ws,
+      serverId: 'server-1',
+      previewHandle: 'preview-handle-1',
+      destination: { handle: { createWritable: vi.fn().mockResolvedValue(writer) } },
+    });
+
+    expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_INIT)).toHaveLength(1);
+    expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_OFFER)).toHaveLength(1);
+    expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.OPERATION_INIT)).toHaveLength(2);
+    expect(FakePeerConnection.instances).toHaveLength(1);
+    expect(writer.close).toHaveBeenCalledOnce();
+  });
+
   it('streams a direct preview into a File System Access writer without Blob/HTTP fallback', async () => {
     const { downloadPreviewWithDirectFallback, FILE_DOWNLOAD_TRANSPORT_MODE } = await import('../src/direct-file-transfer.js');
     const writer = { write: vi.fn().mockResolvedValue(undefined), close: vi.fn().mockResolvedValue(undefined), abort: vi.fn().mockResolvedValue(undefined) };
@@ -423,6 +474,72 @@ describe('direct file transfer v2 browser broker', () => {
     expect(onMode).toHaveBeenCalledWith(FILE_DOWNLOAD_TRANSPORT_MODE.DIRECT);
     expect(onProgress).toHaveBeenCalledWith({ loadedBytes: 0, totalBytes: 3 });
     expect(onProgress).toHaveBeenLastCalledWith({ loadedBytes: 3, totalBytes: 3 });
+    expect(apiMocks.streamAttachmentDownloadToWritable).not.toHaveBeenCalled();
+  });
+
+  it('waits for a slow writer before replenishing credit or committing a finished download', async () => {
+    const { downloadPreviewWithDirectFallback } = await import('../src/direct-file-transfer.js');
+    let resolveWrite!: () => void;
+    const writeSettled = new Promise<void>((resolve) => { resolveWrite = resolve; });
+    const writer = {
+      write: vi.fn(() => writeSettled),
+      close: vi.fn().mockResolvedValue(undefined),
+      abort: vi.fn().mockResolvedValue(undefined),
+    };
+    const { ws } = createWs(directCapabilities);
+    vi.stubGlobal('Blob', class BlobForbidden {
+      constructor() { throw new Error('direct download must not construct a Blob'); }
+    });
+
+    const pending = downloadPreviewWithDirectFallback({
+      ws,
+      serverId: 'server-1',
+      previewHandle: 'slow-preview-handle',
+      destination: { handle: { createWritable: vi.fn().mockResolvedValue(writer) } },
+    });
+    await vi.waitFor(() => expect(writer.write).toHaveBeenCalledOnce());
+    const channel = FakePeerConnection.instances.at(-1)!.channels.find((candidate) => candidate.label.startsWith('imcodes-op-'))!;
+    const messagesBeforeWrite = channel.sent
+      .filter((value): value is string => typeof value === 'string')
+      .map((value) => JSON.parse(value) as Record<string, unknown>);
+    expect(messagesBeforeWrite.filter((message) => message.type === DIRECT_FILE_TRANSFER_DATA_MSG.CREDIT)).toHaveLength(1);
+    expect(messagesBeforeWrite).not.toContainEqual(expect.objectContaining({
+      type: DIRECT_FILE_TRANSFER_DATA_MSG.DOWNLOAD_COMMITTED,
+    }));
+    expect(writer.close).not.toHaveBeenCalled();
+
+    resolveWrite();
+    await expect(pending).resolves.toBeUndefined();
+    const messagesAfterWrite = channel.sent
+      .filter((value): value is string => typeof value === 'string')
+      .map((value) => JSON.parse(value) as Record<string, unknown>);
+    expect(messagesAfterWrite.filter((message) => message.type === DIRECT_FILE_TRANSFER_DATA_MSG.CREDIT)).toHaveLength(2);
+    expect(messagesAfterWrite).toContainEqual(expect.objectContaining({
+      type: DIRECT_FILE_TRANSFER_DATA_MSG.DOWNLOAD_COMMITTED,
+      totalBytes: 3,
+    }));
+    expect(writer.close).toHaveBeenCalledOnce();
+  });
+
+  it('rejects a download whose FINISH byte count differs from accepted and written bytes', async () => {
+    const { downloadPreviewWithDirectFallback } = await import('../src/direct-file-transfer.js');
+    const writer = {
+      write: vi.fn().mockResolvedValue(undefined),
+      close: vi.fn().mockResolvedValue(undefined),
+      abort: vi.fn().mockResolvedValue(undefined),
+    };
+    const { ws } = createWs(directCapabilities, 'download_size_mismatch');
+
+    await expect(downloadPreviewWithDirectFallback({
+      ws,
+      serverId: 'server-1',
+      previewHandle: 'mismatched-preview',
+      destination: { handle: { createWritable: vi.fn().mockResolvedValue(writer) } },
+    })).rejects.toMatchObject({ code: DIRECT_FILE_TRANSFER_ERROR.SIZE_MISMATCH, retryable: false });
+
+    expect(writer.write).toHaveBeenCalledOnce();
+    expect(writer.close).not.toHaveBeenCalled();
+    expect(writer.abort).toHaveBeenCalledOnce();
     expect(apiMocks.streamAttachmentDownloadToWritable).not.toHaveBeenCalled();
   });
 
@@ -464,7 +581,7 @@ describe('direct file transfer v2 browser broker', () => {
 
   it('labels an unobservable native/browser download as handed off without fabricated progress', async () => {
     const { downloadPreviewWithDirectFallback, FILE_DOWNLOAD_TRANSPORT_MODE } = await import('../src/direct-file-transfer.js');
-    const { ws } = createWs([]);
+    const { ws, sent } = createWs([]);
     const httpFallback = vi.fn().mockResolvedValue(undefined);
     const onProgress = vi.fn();
     const onMode = vi.fn();
@@ -482,6 +599,7 @@ describe('direct file transfer v2 browser broker', () => {
     expect(onMode).toHaveBeenCalledOnce();
     expect(onMode).toHaveBeenCalledWith(FILE_DOWNLOAD_TRANSPORT_MODE.BROWSER);
     expect(onProgress).not.toHaveBeenCalled();
+    expect(sent).toHaveLength(0);
   });
 
   it('classifies daemon preview-handle expiry as the File Browser one-refresh condition', async () => {
@@ -531,14 +649,39 @@ describe('direct file transfer v2 browser broker', () => {
     const { uploadFileWithDirectFallback } = await import('../src/direct-file-transfer.js');
     const { ws, sent } = createWs(directCapabilities, 'operation_failure');
     const file = new File(['retry'], 'retry.txt', { type: 'text/plain' });
+    const random = vi.spyOn(Math, 'random').mockReturnValue(0);
+    const timeout = vi.spyOn(globalThis, 'setTimeout');
+    try {
+      await expect(uploadFileWithDirectFallback({ ws, serverId: 'server-1', file })).resolves.toMatchObject({
+        attachment: { id: 'relay-attachment' },
+      });
 
-    await expect(uploadFileWithDirectFallback({ ws, serverId: 'server-1', file })).resolves.toMatchObject({
-      attachment: { id: 'relay-attachment' },
-    });
-
-    expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.OPERATION_INIT)).toHaveLength(3);
-    expect(apiMocks.uploadFile).toHaveBeenCalledTimes(1);
+      expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.OPERATION_INIT)).toHaveLength(3);
+      expect(apiMocks.uploadFile).toHaveBeenCalledTimes(1);
+      const delays = timeout.mock.calls.map((call) => call[1]);
+      expect(delays).toContain(DIRECT_FILE_TRANSFER_LIMITS.RETRY_BACKOFF_MS[0]);
+      expect(delays).toContain(DIRECT_FILE_TRANSFER_LIMITS.RETRY_BACKOFF_MS[1]);
+    } finally {
+      random.mockRestore();
+      timeout.mockRestore();
+    }
   }, 10_000);
+
+  it('isolates daemon scopes and disposes released peers at the authoritative idle deadline', async () => {
+    vi.useFakeTimers();
+    const { prewarmDirectFileLease } = await import('../src/direct-file-transfer.js');
+    const { ws, sent } = createWs(directCapabilities);
+    const releaseA = prewarmDirectFileLease(ws, 'server-a');
+    const releaseB = prewarmDirectFileLease(ws, 'server-b');
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_INIT)).toHaveLength(2);
+    expect(FakePeerConnection.instances).toHaveLength(2);
+    releaseA?.();
+    releaseB?.();
+    await vi.advanceTimersByTimeAsync(DIRECT_FILE_TRANSFER_LIMITS.LEASE_IDLE_TTL_MS);
+    expect(FakePeerConnection.instances.every((peer) => peer.connectionState === 'closed')).toBe(true);
+  });
 
   it('rebind recovery settles a committed status without retransmitting START or authority', async () => {
     const { uploadFileDirect } = await import('../src/direct-file-transfer.js');

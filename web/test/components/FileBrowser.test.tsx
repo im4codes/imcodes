@@ -250,6 +250,29 @@ describe('FileBrowser', () => {
     expect(directFileTransferMocks.selectPreviewDownloadDestination).toHaveBeenCalledWith('report.pdf');
   });
 
+  it('treats save-picker cancellation as a no-op before creating a download entry', async () => {
+    const canceled = new DOMException('canceled', 'AbortError');
+    directFileTransferMocks.selectPreviewDownloadDestination.mockRejectedValueOnce(canceled);
+    directFileTransferMocks.isFileUploadCanceled.mockImplementationOnce((error: unknown) => error === canceled);
+    const { ws } = makeWsFactory();
+    const view = render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        serverId="srv-1"
+        initialPreview={{ status: 'ok', path: '/home/user/report.pdf', content: 'preview', downloadId: 'preview-handle' }}
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(view.getByRole('button', { name: 'upload.download_file' }));
+    await waitFor(() => expect(directFileTransferMocks.selectPreviewDownloadDestination).toHaveBeenCalledOnce());
+    expect(directFileTransferMocks.downloadPreviewWithDirectFallback).not.toHaveBeenCalled();
+    expect(getDownloadTransfers()).toHaveLength(0);
+  });
+
   it('keeps an active download in the page store after File Browser closes', async () => {
     let finish!: () => void;
     directFileTransferMocks.downloadPreviewWithDirectFallback.mockImplementationOnce((options: {
@@ -322,6 +345,54 @@ describe('FileBrowser', () => {
     expect(ws.fsReadFile).toHaveBeenCalledOnce();
     expect(getDownloadTransfers()).toHaveLength(1);
     expect(getDownloadTransfers()[0]).toMatchObject({ name: 'report.pdf', status: 'completed' });
+  });
+
+  it('does not download a refreshed handle after the selected preview changes', async () => {
+    const { ws, sendMsg } = makeWsFactory();
+    const destination = { handle: { createWritable: vi.fn() } };
+    const stale = new Error('preview_handle_invalid');
+    directFileTransferMocks.selectPreviewDownloadDestination.mockResolvedValue(destination);
+    directFileTransferMocks.downloadPreviewWithDirectFallback.mockRejectedValueOnce(stale);
+    directFileTransferMocks.isDirectFileTransferStaleHandleError.mockImplementation((error: unknown) => error === stale);
+    const onConfirm = vi.fn();
+    const view = render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        serverId="srv-1"
+        initialPreview={{ status: 'ok', path: '/home/user/report.pdf', content: 'preview', downloadId: 'expired-handle' }}
+        onConfirm={onConfirm}
+      />,
+    );
+
+    fireEvent.click(view.getByRole('button', { name: 'upload.download_file' }));
+    await waitFor(() => expect(ws.fsReadFile).toHaveBeenCalledWith('/home/user/report.pdf'));
+    view.rerender(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        serverId="srv-1"
+        initialPreview={{ status: 'ok', path: '/home/user/other.pdf', content: 'other', downloadId: 'other-handle' }}
+        onConfirm={onConfirm}
+      />,
+    );
+    await waitFor(() => expect(filePreviewPropsState.current?.path).toBe('/home/user/other.pdf'));
+    act(() => sendMsg({
+      type: 'fs.read_response',
+      requestId: 'mock-read-id',
+      path: '/home/user/report.pdf',
+      status: 'ok',
+      content: 'refreshed preview',
+      downloadId: 'fresh-handle',
+    } as unknown as ServerMessage));
+
+    await waitFor(() => expect(getDownloadTransfers()[0]?.status).toBe('canceled'));
+    expect(directFileTransferMocks.downloadPreviewWithDirectFallback).toHaveBeenCalledOnce();
+    expect(directFileTransferMocks.selectPreviewDownloadDestination).toHaveBeenCalledOnce();
   });
 
   it('does not regress an existing preview back to loading for the same file', () => {

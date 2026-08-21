@@ -1,11 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { access, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import {
   DIRECT_FILE_TRANSFER_DATA_MSG,
   DIRECT_FILE_TRANSFER_DIRECTION,
   DIRECT_FILE_TRANSFER_ERROR,
+  DIRECT_FILE_TRANSFER_LIMITS,
   DIRECT_FILE_TRANSFER_MSG,
   DIRECT_FILE_TRANSFER_OPERATION_STATE,
   DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
@@ -16,25 +17,32 @@ class FakeDataChannel {
   private messageHandler: ((message: string | Buffer | ArrayBuffer) => void) | null = null;
   private closedHandler: (() => void) | null = null;
   private errorHandler: ((error: string) => void) | null = null;
+  private bufferedAmountLowHandler: (() => void) | null = null;
+  bufferedAmountValue = 0;
   sent: Array<string | Uint8Array> = [];
   close = vi.fn(() => this.closedHandler?.());
   sendMessage = vi.fn((message: string) => { this.sent.push(message); return true; });
   sendMessageBinary = vi.fn((message: Uint8Array) => { this.sent.push(message); return true; });
-  bufferedAmount = () => 0;
+  bufferedAmount = () => this.bufferedAmountValue;
   setBufferedAmountLowThreshold = vi.fn();
   onClosed = (handler: () => void) => { this.closedHandler = handler; };
   onError = (handler: (error: string) => void) => { this.errorHandler = handler; };
-  onBufferedAmountLow = vi.fn();
+  onBufferedAmountLow = (handler: () => void) => { this.bufferedAmountLowHandler = handler; };
   onMessage = (handler: (message: string | Buffer | ArrayBuffer) => void) => { this.messageHandler = handler; };
 
   constructor(private readonly label: string) {}
 
   getLabel = () => this.label;
   emit(message: string | Buffer | ArrayBuffer): void { this.messageHandler?.(message); }
+  releaseBufferedAmount(): void {
+    this.bufferedAmountValue = 0;
+    this.bufferedAmountLowHandler?.();
+  }
 }
 
 class FakePeerConnection {
   static latest: FakePeerConnection | null = null;
+  static instances: FakePeerConnection[] = [];
   private dataChannelHandler: ((channel: FakeDataChannel) => void) | null = null;
   private localDescriptionHandler: ((sdp: string, type: string) => void) | null = null;
   private localCandidateHandler: ((candidate: string, mid: string) => void) | null = null;
@@ -50,7 +58,10 @@ class FakePeerConnection {
     remote: { address: '192.168.1.3', port: 5000, type: 'prflx', transportType: 'udp' },
   }));
 
-  constructor() { FakePeerConnection.latest = this; }
+  constructor() {
+    FakePeerConnection.latest = this;
+    FakePeerConnection.instances.push(this);
+  }
 
   onDataChannel = (handler: (channel: FakeDataChannel) => void) => { this.dataChannelHandler = handler; };
   onLocalDescription = (handler: (sdp: string, type: string) => void) => { this.localDescriptionHandler = handler; };
@@ -114,16 +125,42 @@ function uploadPrepare(overrides: Record<string, unknown> = {}) {
   };
 }
 
+function downloadPrepare(overrides: Record<string, unknown> = {}) {
+  const downloadOperationId = typeof overrides.operationId === 'string' ? overrides.operationId : 'download-operation-0001';
+  const downloadAttemptId = typeof overrides.attemptId === 'string' ? overrides.attemptId : 'download-attempt-0001';
+  const downloadRequestId = typeof overrides.requestId === 'string' ? overrides.requestId : 'download-request-0001';
+  return {
+    type: DIRECT_FILE_TRANSFER_MSG.PREPARE,
+    protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+    ...binding({
+      direction: DIRECT_FILE_TRANSFER_DIRECTION.DOWNLOAD,
+      operationId: downloadOperationId,
+      attemptId: downloadAttemptId,
+      requestId: downloadRequestId,
+    }),
+    clientDownloadId: downloadOperationId,
+    previewHandle: 'preview-handle-0001',
+    authority: 'D'.repeat(43),
+    authorityExpiresAt: Date.now() + 60_000,
+    channelLabel: `imcodes-file-${downloadAttemptId}`,
+    iceServers: [],
+    ...overrides,
+  };
+}
+
 describe('daemon direct file transfer v2 lease broker', () => {
   let root: string;
   let storedPath: string;
   let sourcePath: string;
   let finalizeDirectUploadedFile: ReturnType<typeof vi.fn>;
+  let lookupAttachmentByClientUploadId: ReturnType<typeof vi.fn>;
   let resolveDirectFileDownloadSource: ReturnType<typeof vi.fn>;
   let directLogger: { info: ReturnType<typeof vi.fn>; warn: ReturnType<typeof vi.fn>; error: ReturnType<typeof vi.fn>; debug: ReturnType<typeof vi.fn> };
 
   beforeEach(async () => {
     vi.resetModules();
+    FakePeerConnection.latest = null;
+    FakePeerConnection.instances = [];
     root = await mkdtemp(path.join(tmpdir(), 'imcodes-direct-file-v2-'));
     storedPath = path.join(root, 'stored.bin');
     sourcePath = path.join(root, 'source.bin');
@@ -132,6 +169,7 @@ describe('daemon direct file transfer v2 lease broker', () => {
       id: 'stored-id', source: 'upload', serverId: '', daemonPath: storedPath,
       originalName: 'source.bin', size: params.size, createdAt: new Date().toISOString(), downloadable: true,
     }));
+    lookupAttachmentByClientUploadId = vi.fn(() => undefined);
     resolveDirectFileDownloadSource = vi.fn(async (previewHandle: string) => {
       if (previewHandle !== 'preview-handle-0001') throw new Error('not_found');
       return { attachmentId: 'preview-handle-0001', readPath: sourcePath, filename: 'source.bin', size: 8, mime: 'application/octet-stream' };
@@ -142,7 +180,7 @@ describe('daemon direct file transfer v2 lease broker', () => {
       initFileTransfer: vi.fn(),
       createDirectUploadFilename: () => 'stored.bin',
       resolveUploadPath: () => storedPath,
-      lookupAttachmentByClientUploadId: vi.fn(() => undefined),
+      lookupAttachmentByClientUploadId,
       tryClaimClientUpload: vi.fn(() => Symbol('claim')),
       releaseClientUploadClaim: vi.fn(),
       finalizeDirectUploadedFile,
@@ -152,6 +190,7 @@ describe('daemon direct file transfer v2 lease broker', () => {
   });
 
   afterEach(async () => {
+    vi.useRealTimers();
     vi.doUnmock('node-datachannel');
     vi.doUnmock('../../src/daemon/file-transfer-handler.js');
     vi.doUnmock('../../src/util/logger.js');
@@ -239,6 +278,164 @@ describe('daemon direct file transfer v2 lease broker', () => {
     await direct.shutdownDirectFileTransfers();
   });
 
+  it('rejects a data START whose exact authority binding differs from the prepared attempt', async () => {
+    const { direct, sent, sender } = await readyLease();
+    const authority = uploadPrepare();
+    await direct.handleDirectFileTransferCommand(authority, sender);
+    const channel = new FakeDataChannel(authority.channelLabel as string);
+    FakePeerConnection.latest!.emitDataChannel(channel);
+    channel.emit(JSON.stringify({
+      type: DIRECT_FILE_TRANSFER_DATA_MSG.START,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      ...binding({ requestId: 'forged-request-0001' }),
+      authority: authority.authority,
+    }));
+
+    await vi.waitFor(() => expect(sent).toContainEqual(expect.objectContaining({
+      type: DIRECT_FILE_TRANSFER_MSG.ERROR,
+      attemptId,
+      error: DIRECT_FILE_TRANSFER_ERROR.INVALID_AUTHORITY,
+      retryable: false,
+    })));
+    expect(finalizeDirectUploadedFile).not.toHaveBeenCalled();
+    await direct.shutdownDirectFileTransfers();
+  });
+
+  it('rejects a mismatched declared upload byte count and removes the partial file', async () => {
+    const { direct, sent, sender } = await readyLease();
+    const authority = uploadPrepare();
+    await direct.handleDirectFileTransferCommand(authority, sender);
+    const channel = new FakeDataChannel(authority.channelLabel as string);
+    FakePeerConnection.latest!.emitDataChannel(channel);
+    channel.emit(JSON.stringify({
+      type: DIRECT_FILE_TRANSFER_DATA_MSG.START,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      ...binding(),
+      authority: authority.authority,
+    }));
+    await vi.waitFor(() => expect(channel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED)));
+    channel.emit(Buffer.from('hello'));
+    channel.emit(JSON.stringify({
+      type: DIRECT_FILE_TRANSFER_DATA_MSG.FINISH,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      ...binding(),
+      totalBytes: 4,
+    }));
+
+    await vi.waitFor(() => expect(sent).toContainEqual(expect.objectContaining({
+      type: DIRECT_FILE_TRANSFER_MSG.ERROR,
+      attemptId,
+      error: DIRECT_FILE_TRANSFER_ERROR.SIZE_MISMATCH,
+      retryable: false,
+    })));
+    expect(finalizeDirectUploadedFile).not.toHaveBeenCalled();
+    await expect(access(`${storedPath}.${attemptId}.part`)).rejects.toThrow();
+    await direct.shutdownDirectFileTransfers();
+  });
+
+  it('reuses one ready peer for an upload followed by a preview download', async () => {
+    const { direct, sent, sender } = await readyLease();
+    const uploadAuthority = uploadPrepare();
+    await direct.handleDirectFileTransferCommand(uploadAuthority, sender);
+    const uploadChannel = new FakeDataChannel(uploadAuthority.channelLabel as string);
+    FakePeerConnection.latest!.emitDataChannel(uploadChannel);
+    uploadChannel.emit(JSON.stringify({
+      type: DIRECT_FILE_TRANSFER_DATA_MSG.START,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      ...binding(),
+      authority: uploadAuthority.authority,
+    }));
+    await vi.waitFor(() => expect(uploadChannel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED)));
+    uploadChannel.emit(Buffer.from('hello'));
+    uploadChannel.emit(JSON.stringify({
+      type: DIRECT_FILE_TRANSFER_DATA_MSG.FINISH,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      ...binding(),
+      totalBytes: 5,
+    }));
+    await vi.waitFor(() => expect(finalizeDirectUploadedFile).toHaveBeenCalledOnce());
+
+    const downloadAuthority = downloadPrepare();
+    await direct.handleDirectFileTransferCommand(downloadAuthority, sender);
+    const downloadChannel = new FakeDataChannel(downloadAuthority.channelLabel as string);
+    FakePeerConnection.latest!.emitDataChannel(downloadChannel);
+    const downloadBinding = binding({
+      direction: DIRECT_FILE_TRANSFER_DIRECTION.DOWNLOAD,
+      operationId: downloadAuthority.operationId,
+      attemptId: downloadAuthority.attemptId,
+      requestId: downloadAuthority.requestId,
+    });
+    downloadChannel.emit(JSON.stringify({
+      type: DIRECT_FILE_TRANSFER_DATA_MSG.START,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      ...downloadBinding,
+      authority: downloadAuthority.authority,
+    }));
+    await vi.waitFor(() => expect(downloadChannel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED)));
+    downloadChannel.emit(JSON.stringify({
+      type: DIRECT_FILE_TRANSFER_DATA_MSG.CREDIT,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      ...downloadBinding,
+      creditBytes: 8,
+    }));
+    await vi.waitFor(() => expect(downloadChannel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.FINISH)));
+    downloadChannel.emit(JSON.stringify({
+      type: DIRECT_FILE_TRANSFER_DATA_MSG.DOWNLOAD_COMMITTED,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      ...downloadBinding,
+      totalBytes: 8,
+    }));
+    await vi.waitFor(() => expect(sent).toContainEqual(expect.objectContaining({
+      type: DIRECT_FILE_TRANSFER_MSG.TERMINAL,
+      operationId: downloadAuthority.operationId,
+      state: DIRECT_FILE_TRANSFER_TERMINAL_STATE.COMMITTED,
+    })));
+
+    expect(FakePeerConnection.instances).toHaveLength(1);
+    expect(resolveDirectFileDownloadSource).toHaveBeenCalledOnce();
+    await direct.shutdownDirectFileTransfers();
+  });
+
+  it('returns an existing upload result for a duplicate stable operation id without committing again', async () => {
+    const { direct, sent, sender } = await readyLease();
+    const first = uploadPrepare();
+    await direct.handleDirectFileTransferCommand(first, sender);
+    const channel = new FakeDataChannel(first.channelLabel as string);
+    FakePeerConnection.latest!.emitDataChannel(channel);
+    channel.emit(JSON.stringify({
+      type: DIRECT_FILE_TRANSFER_DATA_MSG.START,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      ...binding(),
+      authority: first.authority,
+    }));
+    await vi.waitFor(() => expect(channel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED)));
+    channel.emit(Buffer.from('hello'));
+    channel.emit(JSON.stringify({
+      type: DIRECT_FILE_TRANSFER_DATA_MSG.FINISH,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      ...binding(),
+      totalBytes: 5,
+    }));
+    await vi.waitFor(() => expect(finalizeDirectUploadedFile).toHaveBeenCalledOnce());
+
+    const existing = await finalizeDirectUploadedFile.mock.results[0]!.value;
+    lookupAttachmentByClientUploadId.mockReturnValue(existing);
+    const duplicate = uploadPrepare({
+      ...binding({ requestId: 'request-duplicate-0002', attemptId: 'attempt-duplicate-0002' }),
+      authority: 'B'.repeat(43),
+      channelLabel: 'imcodes-file-upload-duplicate-0002',
+    });
+    await direct.handleDirectFileTransferCommand(duplicate, sender);
+
+    expect(finalizeDirectUploadedFile).toHaveBeenCalledOnce();
+    expect(sent.filter((message) => (
+      message.type === DIRECT_FILE_TRANSFER_MSG.TERMINAL
+      && message.operationId === operationId
+      && message.state === DIRECT_FILE_TRANSFER_TERMINAL_STATE.COMMITTED
+    ))).toHaveLength(2);
+    await direct.shutdownDirectFileTransfers();
+  });
+
   it('re-prepares an existing live lease at a new daemon generation without stranding its channel or status query', async () => {
     const { direct, sent, sender } = await readyLease();
     const authority = uploadPrepare();
@@ -286,6 +483,44 @@ describe('daemon direct file transfer v2 lease broker', () => {
     await direct.shutdownDirectFileTransfers();
   });
 
+  it('enforces the shared active-channel quota and rejects an overflow channel', async () => {
+    const { direct, sender } = await readyLease();
+    for (let index = 0; index < DIRECT_FILE_TRANSFER_LIMITS.MAX_ACTIVE_CHANNELS_PER_LEASE; index += 1) {
+      const suffix = String(index + 1).padStart(4, '0');
+      const authority = uploadPrepare({
+        ...binding({
+          requestId: `quota-request-${suffix}`,
+          attemptId: `quota-attempt-${suffix}`,
+          operationId: `quota-operation-${suffix}`,
+        }),
+        clientUploadId: `quota-operation-${suffix}`,
+        authority: String.fromCharCode(65 + index).repeat(43),
+        channelLabel: `imcodes-file-quota-${suffix}`,
+      });
+      await direct.handleDirectFileTransferCommand(authority, sender);
+      const channel = new FakeDataChannel(authority.channelLabel as string);
+      FakePeerConnection.latest!.emitDataChannel(channel);
+      expect(channel.close).not.toHaveBeenCalled();
+    }
+
+    const overflow = uploadPrepare({
+      ...binding({
+        requestId: 'quota-request-overflow',
+        attemptId: 'quota-attempt-overflow',
+        operationId: 'quota-operation-overflow',
+      }),
+      clientUploadId: 'quota-operation-overflow',
+      authority: 'Z'.repeat(43),
+      channelLabel: 'imcodes-file-quota-overflow',
+    });
+    await direct.handleDirectFileTransferCommand(overflow, sender);
+    const overflowChannel = new FakeDataChannel(overflow.channelLabel as string);
+    FakePeerConnection.latest!.emitDataChannel(overflowChannel);
+
+    expect(overflowChannel.close).toHaveBeenCalledOnce();
+    await direct.shutdownDirectFileTransfers();
+  });
+
   it('streams only the daemon-resolved preview handle after receive credit and waits for browser commit', async () => {
     const { direct, sent, sender } = await readyLease();
     const authority = uploadPrepare({
@@ -303,12 +538,158 @@ describe('daemon direct file transfer v2 lease broker', () => {
     const downloadBinding = binding({ direction: DIRECT_FILE_TRANSFER_DIRECTION.DOWNLOAD, operationId: 'download-op-0001', attemptId: 'download-attempt-0001' });
     channel.emit(JSON.stringify({ type: DIRECT_FILE_TRANSFER_DATA_MSG.START, protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION, ...downloadBinding, authority: authority.authority }));
     await vi.waitFor(() => expect(channel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED)));
+    expect(channel.sent.some((message) => message instanceof Uint8Array)).toBe(false);
     channel.emit(JSON.stringify({ type: DIRECT_FILE_TRANSFER_DATA_MSG.CREDIT, protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION, ...downloadBinding, creditBytes: 8 }));
     await vi.waitFor(() => expect(channel.sent.some((message) => message instanceof Uint8Array && Buffer.from(message).toString() === 'download')).toBe(true));
     await vi.waitFor(() => expect(channel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.FINISH)));
     channel.emit(JSON.stringify({ type: DIRECT_FILE_TRANSFER_DATA_MSG.DOWNLOAD_COMMITTED, protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION, ...downloadBinding, totalBytes: 8 }));
     await vi.waitFor(() => expect(sent).toContainEqual(expect.objectContaining({ type: DIRECT_FILE_TRANSFER_MSG.TERMINAL, operationId: 'download-op-0001', state: DIRECT_FILE_TRANSFER_TERMINAL_STATE.COMMITTED })));
     expect(resolveDirectFileDownloadSource).toHaveBeenCalledWith('preview-handle-0001');
+    await direct.shutdownDirectFileTransfers();
+  });
+
+  it('withholds download bytes while the data-channel buffer is above the shared high-water mark', async () => {
+    const { direct, sender } = await readyLease();
+    const authority = downloadPrepare({
+      operationId: 'slow-download-operation',
+      attemptId: 'slow-download-attempt',
+      requestId: 'slow-download-request',
+    });
+    await direct.handleDirectFileTransferCommand(authority, sender);
+    const channel = new FakeDataChannel(authority.channelLabel as string);
+    channel.bufferedAmountValue = DIRECT_FILE_TRANSFER_LIMITS.DATA_BUFFER_HIGH_WATER_BYTES + 1;
+    FakePeerConnection.latest!.emitDataChannel(channel);
+    const downloadBinding = binding({
+      direction: DIRECT_FILE_TRANSFER_DIRECTION.DOWNLOAD,
+      operationId: authority.operationId,
+      attemptId: authority.attemptId,
+      requestId: authority.requestId,
+    });
+    channel.emit(JSON.stringify({
+      type: DIRECT_FILE_TRANSFER_DATA_MSG.START,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      ...downloadBinding,
+      authority: authority.authority,
+    }));
+    await vi.waitFor(() => expect(channel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED)));
+    channel.emit(JSON.stringify({
+      type: DIRECT_FILE_TRANSFER_DATA_MSG.CREDIT,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      ...downloadBinding,
+      creditBytes: DIRECT_FILE_TRANSFER_LIMITS.DATA_CREDIT_BYTES,
+    }));
+    await vi.waitFor(() => expect(channel.setBufferedAmountLowThreshold).toHaveBeenCalledWith(
+      DIRECT_FILE_TRANSFER_LIMITS.DATA_BUFFER_LOW_WATER_BYTES,
+    ));
+    expect(channel.sent.some((message) => message instanceof Uint8Array)).toBe(false);
+
+    channel.releaseBufferedAmount();
+    await vi.waitFor(() => expect(channel.sent.some((message) => message instanceof Uint8Array)).toBe(true));
+    await vi.waitFor(() => expect(channel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.FINISH)));
+    channel.emit(JSON.stringify({
+      type: DIRECT_FILE_TRANSFER_DATA_MSG.DOWNLOAD_COMMITTED,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      ...downloadBinding,
+      totalBytes: 8,
+    }));
+    await direct.shutdownDirectFileTransfers();
+  });
+
+  it('fails an inactive attempt at the shared no-progress deadline', async () => {
+    vi.useFakeTimers();
+    const { direct, sent, sender } = await readyLease();
+    const authority = uploadPrepare({
+      ...binding({ requestId: 'timeout-request-0001', attemptId: 'timeout-attempt-0001', operationId: 'timeout-operation-0001' }),
+      clientUploadId: 'timeout-operation-0001',
+      channelLabel: 'imcodes-file-timeout-0001',
+    });
+    await direct.handleDirectFileTransferCommand(authority, sender);
+
+    await vi.advanceTimersByTimeAsync(DIRECT_FILE_TRANSFER_LIMITS.NO_PROGRESS_TIMEOUT_MS);
+    await vi.waitFor(() => expect(sent).toContainEqual(expect.objectContaining({
+      type: DIRECT_FILE_TRANSFER_MSG.ERROR,
+      attemptId: 'timeout-attempt-0001',
+      error: DIRECT_FILE_TRANSFER_ERROR.NO_PROGRESS_TIMEOUT,
+      retryable: true,
+    })));
+    await direct.shutdownDirectFileTransfers();
+  });
+
+  it('cancels atomically, removes the partial file, and ignores late frames from the stale attempt', async () => {
+    const { direct, sent, sender } = await readyLease();
+    const first = uploadPrepare({
+      ...binding({ requestId: 'cancel-request-0001', attemptId: 'cancel-attempt-0001', operationId: 'cancel-operation-0001' }),
+      clientUploadId: 'cancel-operation-0001',
+      channelLabel: 'imcodes-file-cancel-0001',
+    });
+    await direct.handleDirectFileTransferCommand(first, sender);
+    const firstChannel = new FakeDataChannel(first.channelLabel as string);
+    FakePeerConnection.latest!.emitDataChannel(firstChannel);
+    const firstBinding = binding({
+      requestId: first.requestId,
+      attemptId: first.attemptId,
+      operationId: first.operationId,
+    });
+    firstChannel.emit(JSON.stringify({
+      type: DIRECT_FILE_TRANSFER_DATA_MSG.START,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      ...firstBinding,
+      authority: first.authority,
+    }));
+    await vi.waitFor(() => expect(firstChannel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED)));
+    const partialPath = `${storedPath}.${first.attemptId}.part`;
+    await expect(access(partialPath)).resolves.toBeUndefined();
+    await direct.handleDirectFileTransferCommand({
+      type: DIRECT_FILE_TRANSFER_MSG.CANCEL,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      ...firstBinding,
+      authority: first.authority,
+      reason: DIRECT_FILE_TRANSFER_ERROR.CANCELED,
+    }, sender);
+    await expect(access(partialPath)).rejects.toThrow();
+    expect(sent).toContainEqual(expect.objectContaining({
+      type: DIRECT_FILE_TRANSFER_MSG.ERROR,
+      attemptId: first.attemptId,
+      error: DIRECT_FILE_TRANSFER_ERROR.CANCELED,
+    }));
+
+    const second = uploadPrepare({
+      ...binding({ requestId: 'cancel-request-0002', attemptId: 'cancel-attempt-0002', operationId: 'cancel-operation-0001' }),
+      clientUploadId: 'cancel-operation-0001',
+      authority: 'E'.repeat(43),
+      channelLabel: 'imcodes-file-cancel-0002',
+    });
+    await direct.handleDirectFileTransferCommand(second, sender);
+    const secondChannel = new FakeDataChannel(second.channelLabel as string);
+    FakePeerConnection.latest!.emitDataChannel(secondChannel);
+    const secondBinding = binding({
+      requestId: second.requestId,
+      attemptId: second.attemptId,
+      operationId: second.operationId,
+    });
+    secondChannel.emit(JSON.stringify({
+      type: DIRECT_FILE_TRANSFER_DATA_MSG.START,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      ...secondBinding,
+      authority: second.authority,
+    }));
+    await vi.waitFor(() => expect(secondChannel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED)));
+
+    firstChannel.emit(JSON.stringify({
+      type: DIRECT_FILE_TRANSFER_DATA_MSG.FINISH,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      ...firstBinding,
+      totalBytes: 0,
+    }));
+    secondChannel.emit(Buffer.from('hello'));
+    secondChannel.emit(JSON.stringify({
+      type: DIRECT_FILE_TRANSFER_DATA_MSG.FINISH,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      ...secondBinding,
+      totalBytes: 5,
+    }));
+    await vi.waitFor(() => expect(finalizeDirectUploadedFile).toHaveBeenCalledOnce());
+    await expect(readFile(storedPath, 'utf8')).resolves.toBe('hello');
     await direct.shutdownDirectFileTransfers();
   });
 
@@ -347,6 +728,47 @@ describe('daemon direct file transfer v2 lease broker', () => {
       type: DIRECT_FILE_TRANSFER_MSG.ERROR,
       error: DIRECT_FILE_TRANSFER_ERROR.AUTHORITY_EXPIRED,
     }));
+    await direct.shutdownDirectFileTransfers();
+  });
+
+  it('maps preview identity or policy rejection to a terminal policy-denied error', async () => {
+    resolveDirectFileDownloadSource.mockRejectedValueOnce(new Error('canonical_identity_changed'));
+    const { direct, sent, sender } = await readyLease();
+    const authority = downloadPrepare({
+      operationId: 'policy-download-operation',
+      attemptId: 'policy-download-attempt',
+      requestId: 'policy-download-request',
+      previewHandle: 'policy-preview-handle',
+    });
+    await direct.handleDirectFileTransferCommand(authority, sender);
+    const channel = new FakeDataChannel(authority.channelLabel as string);
+    FakePeerConnection.latest!.emitDataChannel(channel);
+    channel.emit(JSON.stringify({
+      type: DIRECT_FILE_TRANSFER_DATA_MSG.START,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      ...binding({
+        direction: DIRECT_FILE_TRANSFER_DIRECTION.DOWNLOAD,
+        operationId: authority.operationId,
+        attemptId: authority.attemptId,
+        requestId: authority.requestId,
+      }),
+      authority: authority.authority,
+    }));
+
+    await vi.waitFor(() => expect(sent).toContainEqual(expect.objectContaining({
+      type: DIRECT_FILE_TRANSFER_MSG.ERROR,
+      error: DIRECT_FILE_TRANSFER_ERROR.PREVIEW_POLICY_DENIED,
+      retryable: false,
+    })));
+    await direct.shutdownDirectFileTransfers();
+  });
+
+  it('rejects a browser-supplied source path before resolving a preview handle', async () => {
+    const { direct, sender } = await readyLease();
+    const malicious = { ...downloadPrepare(), path: '/etc/shadow' };
+
+    await expect(direct.handleDirectFileTransferCommand(malicious, sender)).resolves.toBe(false);
+    expect(resolveDirectFileDownloadSource).not.toHaveBeenCalled();
     await direct.shutdownDirectFileTransfers();
   });
 });
