@@ -174,6 +174,7 @@ const BADGE_MAP: Record<string, string> = {
   'grok-sdk': 'gr',
   'kimi-sdk': 'km',
   'deepseek-harness': 'ds',
+  pi: 'pi',
   'shell': 'sh',
   'script': 'sc',
 };

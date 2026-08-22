@@ -128,6 +128,10 @@ async function createProvider(id: string): Promise<TransportProvider> {
       const { DeepseekHarnessProvider } = await import('./providers/deepseek-harness.js');
       return new DeepseekHarnessProvider();
     }
+    case 'pi': {
+      const { PiProvider } = await import('./providers/pi.js');
+      return new PiProvider();
+    }
     default:
       throw new Error(`Unknown provider: ${id}`);
   }

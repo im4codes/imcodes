@@ -8,6 +8,7 @@ export const CLAUDE_SDK_EFFORT_LEVELS = ['low', 'medium', 'high', 'max'] as cons
 export const CODEX_SDK_EFFORT_LEVELS = ['minimal', 'low', 'medium', 'high', 'xhigh'] as const satisfies readonly TransportEffortLevel[];
 export const COPILOT_SDK_EFFORT_LEVELS = ['low', 'medium', 'high', 'max'] as const satisfies readonly TransportEffortLevel[];
 export const QWEN_EFFORT_LEVELS = ['off', 'low', 'medium', 'high'] as const satisfies readonly TransportEffortLevel[];
+export const PI_EFFORT_LEVELS = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const satisfies readonly TransportEffortLevel[];
 export const OPENCLAW_THINKING_LEVELS = ['off', 'minimal', 'low', 'medium', 'high', 'adaptive'] as const satisfies readonly TransportEffortLevel[];
 
 export function isTransportEffortLevel(value: unknown): value is TransportEffortLevel {

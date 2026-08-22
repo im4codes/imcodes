@@ -22,6 +22,7 @@ describe('isTransportAgent()', () => {
   it('returns true for qoder-sdk', () => {
     expect(isTransportAgent('qoder-sdk')).toBe(true);
     expect(isTransportAgent('deepseek-harness')).toBe(true);
+    expect(isTransportAgent('pi')).toBe(true);
   });
 
   it('returns false for claude-code', () => {
@@ -96,6 +97,7 @@ describe('TRANSPORT_AGENTS set', () => {
 
   it('contains qoder-sdk', () => {
     expect(TRANSPORT_AGENTS.has('qoder-sdk')).toBe(true);
+    expect(TRANSPORT_AGENTS.has('pi')).toBe(true);
   });
 
   it('has at least 1 entry', () => {

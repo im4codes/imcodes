@@ -98,6 +98,7 @@ import { getKnownQwenModelDescription, getKnownQwenModelOptions } from '@shared/
 import { CLAUDE_CODE_MODEL_IDS, CODEX_MODEL_IDS, GEMINI_MODEL_IDS, mergeModelSuggestions, normalizeClaudeCodeModelId } from '../../../src/shared/models/options.js';
 import { CLAUDE_SDK_EFFORT_LEVELS, CODEX_SDK_EFFORT_LEVELS, COPILOT_SDK_EFFORT_LEVELS, OPENCLAW_THINKING_LEVELS, QWEN_EFFORT_LEVELS, formatEffortLevel, type TransportEffortLevel } from '@shared/effort-levels.js';
 import { resolveEffectiveSessionModel } from '@shared/session-model.js';
+import { CUSTOM_PROVIDER_SDK_AGENT_TYPES } from '@shared/cc-presets.js';
 import { useTransportModels, supportsDynamicTransportModels } from '../hooks/useTransportModels.js';
 import { loadCodexModelPreference, loadLegacyCodexModelPreferenceForModelessSession, saveCodexModelPreference } from '../codex-model-preference.js';
 import {
@@ -1765,11 +1766,12 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const isCopilot = activeSession?.agentType === 'copilot-sdk';
   const isCursorHeadless = activeSession?.agentType === 'cursor-headless';
   const isDeepseekHarness = activeSession?.agentType === 'deepseek-harness';
+  const isPi = activeSession?.agentType === 'pi';
   const isGeminiSdk = activeSession?.agentType === 'gemini-sdk';
   const isGrokSdk = activeSession?.agentType === 'grok-sdk';
   const isKimiSdk = activeSession?.agentType === 'kimi-sdk';
   const isOpenCodeSdk = activeSession?.agentType === 'opencode-sdk';
-  const supportsGenericTransportModelSelect = isCopilot || isCursorHeadless || isDeepseekHarness || isGeminiSdk || isGrokSdk || isKimiSdk || isOpenCodeSdk;
+  const supportsGenericTransportModelSelect = isCopilot || isCursorHeadless || isDeepseekHarness || isPi || isGeminiSdk || isGrokSdk || isKimiSdk || isOpenCodeSdk;
   // Source-of-truth priority for the model picker:
   //   1. `useTransportModels` — live daemon probe via `transport.list_models`
   //      WS round-trip. Works uniformly for main sessions AND sub-sessions
@@ -1785,7 +1787,9 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const dynamicTransportModels = useTransportModels(
     ws,
     dynamicModelsAgentType,
-    activeSession?.agentType === 'claude-code-sdk' ? activeSession.ccPreset : undefined,
+    activeSession && CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(activeSession.agentType)
+      ? activeSession.ccPreset
+      : undefined,
     activeSession?.name,
   );
   const genericTransportModelSuggestions: readonly string[] = useMemo(() => {

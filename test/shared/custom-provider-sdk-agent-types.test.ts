@@ -58,5 +58,8 @@ describe('custom provider SDK agent types', () => {
     if (presets.includes('getDshPresetTransportConfig')) {
       expect(CUSTOM_PROVIDER_SDK_AGENT_TYPES.has('deepseek-harness')).toBe(true);
     }
+    if (presets.includes('getPiPresetTransportConfig')) {
+      expect(CUSTOM_PROVIDER_SDK_AGENT_TYPES.has('pi')).toBe(true);
+    }
   });
 });

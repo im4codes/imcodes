@@ -131,6 +131,8 @@ function peerAuditTypeLabel(agentType: string): string {
       return 'OC';
     case 'deepseek-harness':
       return 'Ds';
+    case 'pi':
+      return 'Pi';
     default:
       return 'AI';
   }

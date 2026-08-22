@@ -93,6 +93,7 @@ describe('buildProviderContextPayload', () => {
       'cursor-headless',
       'opencode-sdk',
       'qwen',
+      'pi',
     ];
 
     for (const providerId of providerIds) {

@@ -119,6 +119,7 @@ const SHARE_MODEL_CATALOG_AGENT_TYPES = new Set([
   'grok-sdk',
   'kimi-sdk',
   'deepseek-harness',
+  'pi',
 ]);
 
 function denyFromShared(sharedCommand: string): ShareCommandPolicy {

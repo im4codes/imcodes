@@ -52,6 +52,7 @@ const TYPE_ICON: Record<string, string> = {
   'grok-sdk': '𝕏',
   'kimi-sdk': '月',
   'deepseek-harness': '🐳',
+  pi: 'π',
   'shell': '🐚',
   'script': '🔄',
 };

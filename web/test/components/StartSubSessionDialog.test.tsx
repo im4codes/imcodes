@@ -35,7 +35,7 @@ describe('StartSubSessionDialog', () => {
     cleanup();
   });
 
-  it('shows Claude, Codex, Qoder, OpenCode, Grok, and DeepSeek Harness options', () => {
+  it('shows Claude, Codex, Qoder, OpenCode, Grok, DeepSeek Harness, and Pi options', () => {
     render(
       <StartSubSessionDialog
         ws={makeWs() as any}
@@ -54,6 +54,7 @@ describe('StartSubSessionDialog', () => {
     expect(screen.getByRole('button', { name: /opencode_sdk/i })).toBeDefined();
     expect(screen.getByRole('button', { name: /grok_sdk/i })).toBeDefined();
     expect(screen.getByRole('button', { name: /deepseek_harness/i })).toBeDefined();
+    expect(screen.getByRole('button', { name: /^pi$/i })).toBeDefined();
   });
 
   it('defaults to claude-code-sdk and renders transport/process groups separately', () => {
@@ -69,13 +70,13 @@ describe('StartSubSessionDialog', () => {
       />,
     );
 
-    const activeBtn = container.querySelector('.subsession-type-btn.active') as HTMLButtonElement | null;
+    const activeBtn = container.querySelector('.session-agent-card.active') as HTMLButtonElement | null;
     expect(activeBtn?.textContent).toMatch(/claude_code_sdk/i);
 
-    const groupTitles = Array.from(container.querySelectorAll('.subsession-type-group-title')).map((el) => el.textContent?.trim());
+    const groupTitles = Array.from(container.querySelectorAll('.session-agent-group-title')).map((el) => el.textContent?.trim());
     expect(groupTitles).toEqual(['SDK', 'CLI']);
 
-    const groups = Array.from(container.querySelectorAll('.subsession-type-group'));
+    const groups = Array.from(container.querySelectorAll('.session-agent-group'));
     expect(groups).toHaveLength(2);
     expect(groups[0].textContent).toMatch(/claude_code_sdk/i);
     expect(groups[0].textContent).toMatch(/codex_sdk/i);

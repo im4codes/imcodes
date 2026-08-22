@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 // ── Hoisted mocks ─────────────────────────────────────────────────────────────
 
-const { mockConnect, mockDisconnect, MockOpenClawProvider, MockQwenProvider, MockClaudeCodeSdkProvider, MockCodexSdkProvider, MockQoderSdkProvider, MockCursorHeadlessProvider, MockCopilotSdkProvider, MockOpenCodeSdkProvider, MockKimiSdkProvider, MockGrokSdkProvider, MockDeepseekHarnessProvider } = vi.hoisted(() => {
+const { mockConnect, mockDisconnect, MockOpenClawProvider, MockQwenProvider, MockClaudeCodeSdkProvider, MockCodexSdkProvider, MockQoderSdkProvider, MockCursorHeadlessProvider, MockCopilotSdkProvider, MockOpenCodeSdkProvider, MockKimiSdkProvider, MockGrokSdkProvider, MockDeepseekHarnessProvider, MockPiProvider } = vi.hoisted(() => {
   const mockConnect = vi.fn().mockResolvedValue(undefined);
   const mockDisconnect = vi.fn().mockResolvedValue(undefined);
   const MockOpenClawProvider = vi.fn().mockImplementation(() => ({
@@ -238,7 +238,28 @@ const { mockConnect, mockDisconnect, MockOpenClawProvider, MockQwenProvider, Moc
     createSession: vi.fn().mockResolvedValue('session-1'),
     endSession: vi.fn().mockResolvedValue(undefined),
   }));
-  return { mockConnect, mockDisconnect, MockOpenClawProvider, MockQwenProvider, MockClaudeCodeSdkProvider, MockCodexSdkProvider, MockQoderSdkProvider, MockCursorHeadlessProvider, MockCopilotSdkProvider, MockOpenCodeSdkProvider, MockKimiSdkProvider, MockGrokSdkProvider, MockDeepseekHarnessProvider };
+  const MockPiProvider = vi.fn().mockImplementation(() => ({
+    id: 'pi',
+    connectionMode: 'local-sdk',
+    sessionOwnership: 'shared',
+    capabilities: {
+      streaming: true,
+      toolCalling: true,
+      approval: false,
+      sessionRestore: true,
+      multiTurn: true,
+      attachments: false,
+    },
+    connect: mockConnect,
+    disconnect: mockDisconnect,
+    send: vi.fn().mockResolvedValue(undefined),
+    onDelta: vi.fn(),
+    onComplete: vi.fn(),
+    onError: vi.fn(),
+    createSession: vi.fn().mockResolvedValue('session-pi'),
+    endSession: vi.fn().mockResolvedValue(undefined),
+  }));
+  return { mockConnect, mockDisconnect, MockOpenClawProvider, MockQwenProvider, MockClaudeCodeSdkProvider, MockCodexSdkProvider, MockQoderSdkProvider, MockCursorHeadlessProvider, MockCopilotSdkProvider, MockOpenCodeSdkProvider, MockKimiSdkProvider, MockGrokSdkProvider, MockDeepseekHarnessProvider, MockPiProvider };
 });
 
 vi.mock('../../src/agent/providers/openclaw.js', () => ({
@@ -271,6 +292,10 @@ vi.mock('../../src/agent/providers/copilot-sdk.js', () => ({
 
 vi.mock('../../src/agent/providers/deepseek-harness.js', () => ({
   DeepseekHarnessProvider: MockDeepseekHarnessProvider,
+}));
+
+vi.mock('../../src/agent/providers/pi.js', () => ({
+  PiProvider: MockPiProvider,
 }));
 
 vi.mock('../../src/agent/providers/opencode-sdk.js', () => ({
@@ -385,6 +410,13 @@ describe('getProvider', () => {
     expect(provider!.id).toBe('deepseek-harness');
   });
 
+  it('returns pi after connectProvider()', async () => {
+    await connectProvider('pi', CONFIG);
+    const provider = getProvider('pi');
+    expect(provider).toBeDefined();
+    expect(provider!.id).toBe('pi');
+  });
+
   it('returns kimi-sdk after connectProvider()', async () => {
     await connectProvider('kimi-sdk', CONFIG);
     const provider = getProvider('kimi-sdk');
@@ -457,6 +489,12 @@ describe('connectProvider', () => {
   it('instantiates DeepseekHarnessProvider and calls connect()', async () => {
     await connectProvider('deepseek-harness', CONFIG);
     expect(MockDeepseekHarnessProvider).toHaveBeenCalledOnce();
+    expect(mockConnect).toHaveBeenCalledWith(CONFIG);
+  });
+
+  it('instantiates PiProvider and calls connect()', async () => {
+    await connectProvider('pi', CONFIG);
+    expect(MockPiProvider).toHaveBeenCalledOnce();
     expect(mockConnect).toHaveBeenCalledWith(CONFIG);
   });
 

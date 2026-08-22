@@ -8,6 +8,7 @@ import { GeminiDriver } from './drivers/gemini.js';
 import type { AgentDriver } from './drivers/base.js';
 import type { AgentType } from './detect.js';
 import type { DshLlmConfig } from '../../shared/deepseek-harness.js';
+import type { PiLlmConfig } from '../../shared/pi-agent.js';
 import { isTransportAgent } from './detect.js';
 import {
   buildTransportResumeLaunchOpts,
@@ -1062,7 +1063,7 @@ export async function relaunchSessionWithSettings(
     requestedModel: targetRequestedModel ?? undefined,
     effort: targetEffort ?? undefined,
     transportConfig: targetTransportConfig ?? undefined,
-    ccPreset: (targetAgentType === 'claude-code' || targetAgentType === 'claude-code-sdk' || targetAgentType === 'qwen' || targetAgentType === 'deepseek-harness')
+    ccPreset: (targetAgentType === 'claude-code' || targetAgentType === 'claude-code-sdk' || targetAgentType === 'qwen' || targetAgentType === 'deepseek-harness' || targetAgentType === 'pi')
       ? (targetCcPreset ?? undefined)
       : undefined,
     ...(preserveTransportBinding ? {
@@ -1307,7 +1308,7 @@ async function recoverTransportRuntimeAfterError(
       requestedModel: record.requestedModel,
       effort: record.effort,
       transportConfig: record.transportConfig,
-      ccPreset: (record.agentType === 'claude-code-sdk' || record.agentType === 'qwen' || record.agentType === 'deepseek-harness') ? record.ccPreset : undefined,
+      ccPreset: (record.agentType === 'claude-code-sdk' || record.agentType === 'qwen' || record.agentType === 'deepseek-harness' || record.agentType === 'pi') ? record.ccPreset : undefined,
       // Qwen-compatible API providers can reject a resumed conversation when
       // their persisted tool-call chain is invalid (e.g. "tool call result
       // does not follow tool call"). Auto-recovery must rotate the provider
@@ -2510,6 +2511,7 @@ export async function restoreTransportSessions(
       let restoredPresetContextWindow = s.presetContextWindow;
       let qwenPresetUsesApiKey = false;
       let dshLlmConfig: DshLlmConfig | undefined;
+      let piLlmConfig: PiLlmConfig | undefined;
       const resolveRuntimeContextBootstrap = () => resolveTransportContextBootstrap({
         projectDir: s.projectDir,
         transportConfig: getSession(s.name)?.transportConfig ?? s.transportConfig ?? {},
@@ -2550,11 +2552,19 @@ export async function restoreTransportSessions(
         if (presetConfig.systemPrompt) systemPrompt = presetConfig.systemPrompt;
       } else if (s.providerId === 'deepseek-harness' && s.ccPreset) {
         const { getDshPresetTransportConfig } = await import('../daemon/cc-presets.js');
-        const presetConfig = await getDshPresetTransportConfig(s.ccPreset);
+        const presetConfig = await getDshPresetTransportConfig(s.ccPreset, effectiveRequestedModel);
         extraEnv = { ...(extraEnv ?? {}), ...presetConfig.env };
         dshLlmConfig = presetConfig.llm;
         const presetPreferredModel = presetConfig.model;
-        if (presetPreferredModel && !effectiveRequestedModel) effectiveRequestedModel = presetPreferredModel;
+        if (presetPreferredModel) effectiveRequestedModel = presetPreferredModel;
+        restoredPresetContextWindow = presetConfig.contextWindow ?? restoredPresetContextWindow;
+        if (presetConfig.systemPrompt) systemPrompt = presetConfig.systemPrompt;
+      } else if (s.providerId === 'pi' && s.ccPreset) {
+        const { getPiPresetTransportConfig } = await import('../daemon/cc-presets.js');
+        const presetConfig = await getPiPresetTransportConfig(s.ccPreset, effectiveRequestedModel);
+        extraEnv = { ...(extraEnv ?? {}), ...presetConfig.env };
+        piLlmConfig = presetConfig.piLlm;
+        if (presetConfig.model) effectiveRequestedModel = presetConfig.model;
         restoredPresetContextWindow = presetConfig.contextWindow ?? restoredPresetContextWindow;
         if (presetConfig.systemPrompt) systemPrompt = presetConfig.systemPrompt;
       }
@@ -2599,6 +2609,7 @@ export async function restoreTransportSessions(
         contextSharedPolicyOverride: contextBootstrap.sharedPolicyOverride,
         agentId: effectiveRequestedModel,
         ...(dshLlmConfig ? { llm: dshLlmConfig } : {}),
+        ...(piLlmConfig ? { piLlm: piLlmConfig } : {}),
         resumeId,
         effort: s.effort,
         // Restore path: only re-inject startup memory if the prior run hadn't
@@ -2862,6 +2873,7 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
   let transportSystemPrompt: string | undefined;
   let transportSettings: string | Record<string, unknown> | undefined;
   let dshLlmConfig: DshLlmConfig | undefined;
+  let piLlmConfig: PiLlmConfig | undefined;
   const storedRequestedModel = !opts.fresh ? existing?.requestedModel : undefined;
   const storedProviderResumeId = !opts.fresh ? existing?.providerResumeId : undefined;
   let requestedTransportModel = opts.requestedModel ?? storedRequestedModel ?? (agentType === 'qwen' ? (opts.qwenModel ?? existing?.qwenModel) : undefined);
@@ -2999,10 +3011,24 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
   } else if (agentType === 'deepseek-harness') {
     if (effectiveCcPreset) {
       const { getDshPresetTransportConfig } = await import('../daemon/cc-presets.js');
-      const presetConfig = await getDshPresetTransportConfig(effectiveCcPreset);
+      const presetConfig = await getDshPresetTransportConfig(effectiveCcPreset, requestedTransportModel);
       transportEnv = { ...(transportEnv ?? {}), ...presetConfig.env };
       dshLlmConfig = presetConfig.llm;
-      if (!requestedTransportModel && presetConfig.model) requestedTransportModel = presetConfig.model;
+      if (presetConfig.model) requestedTransportModel = presetConfig.model;
+      presetContextWindow = presetConfig.contextWindow ?? presetContextWindow;
+      if (presetConfig.systemPrompt) transportSystemPrompt = presetConfig.systemPrompt;
+    }
+    effectiveSessionKey = randomUUID();
+    effectiveBindExistingKey = undefined;
+    transportResumeId = opts.providerResumeId ?? storedProviderResumeId;
+    effectiveSkipCreate = !!transportResumeId;
+  } else if (agentType === 'pi') {
+    if (effectiveCcPreset) {
+      const { getPiPresetTransportConfig } = await import('../daemon/cc-presets.js');
+      const presetConfig = await getPiPresetTransportConfig(effectiveCcPreset, requestedTransportModel);
+      transportEnv = { ...(transportEnv ?? {}), ...presetConfig.env };
+      piLlmConfig = presetConfig.piLlm;
+      if (presetConfig.model) requestedTransportModel = presetConfig.model;
       presetContextWindow = presetConfig.contextWindow ?? presetContextWindow;
       if (presetConfig.systemPrompt) transportSystemPrompt = presetConfig.systemPrompt;
     }
@@ -3047,6 +3073,7 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
     systemPrompt: transportSystemPrompt,
     ...(transportSettings ? { settings: transportSettings } : {}),
     ...(dshLlmConfig ? { llm: dshLlmConfig } : {}),
+    ...(piLlmConfig ? { piLlm: piLlmConfig } : {}),
     contextNamespace: contextBootstrap.namespace,
     contextNamespaceDiagnostics: contextBootstrap.diagnostics,
     contextRemoteProcessedFreshness: contextBootstrap.remoteProcessedFreshness,

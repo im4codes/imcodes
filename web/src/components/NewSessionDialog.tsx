@@ -16,6 +16,7 @@ import {
   CODEX_SDK_EFFORT_LEVELS,
   COPILOT_SDK_EFFORT_LEVELS,
   OPENCLAW_THINKING_LEVELS,
+  PI_EFFORT_LEVELS,
   QWEN_EFFORT_LEVELS,
   formatEffortLevel,
   type TransportEffortLevel,
@@ -24,6 +25,7 @@ import {
   useTransportModels,
   supportsDynamicTransportModels,
 } from "../hooks/useTransportModels.js";
+import { usePresetModelSelection } from "../hooks/usePresetModelSelection.js";
 import { QwenCodingPlanHint } from "./QwenCodingPlanHint.js";
 import {
   buildCcPresetFromDraft,
@@ -55,7 +57,7 @@ const responsiveDialogStyle = {
   // iOS can still render a 380px fixed-ish dialog inside a 390px viewport,
   // which clips the custom-provider help text into one-character columns.
   width: "calc(100vw - env(safe-area-inset-left, 0px) - env(safe-area-inset-right, 0px) - 32px)",
-  maxWidth: 380,
+  maxWidth: 660,
   minWidth: 0,
   boxSizing: "border-box",
   // Long help/preset labels (e.g. Qwen provider URLs) must wrap inside the
@@ -86,6 +88,7 @@ type AgentType =
   | "grok-sdk"
   | "kimi-sdk"
   | "deepseek-harness"
+  | "pi"
   | "openclaw"
   | "qwen";
 
@@ -490,6 +493,7 @@ export function NewSessionDialog({
           || agentType === "grok-sdk"
           || agentType === "kimi-sdk"
           || agentType === "deepseek-harness"
+          || agentType === "pi"
           || agentType === "qwen") &&
         requestedModel.trim()
       ) {
@@ -504,6 +508,7 @@ export function NewSessionDialog({
         ...(agentType === "claude-code-sdk" ||
         agentType === "codex-sdk" ||
         agentType === "copilot-sdk" ||
+        agentType === "pi" ||
         agentType === "qwen"
           ? { thinking }
           : {}),
@@ -514,7 +519,7 @@ export function NewSessionDialog({
   const agentFlavor =
     agentType === "claude-code" || agentType === "codex"
       ? "cli"
-      : agentType === "claude-code-sdk" || agentType === "codex-sdk" || agentType === "qoder-sdk" || agentType === "opencode-sdk" || agentType === "grok-sdk" || agentType === "kimi-sdk" || agentType === "deepseek-harness"
+      : agentType === "claude-code-sdk" || agentType === "codex-sdk" || agentType === "qoder-sdk" || agentType === "opencode-sdk" || agentType === "grok-sdk" || agentType === "kimi-sdk" || agentType === "deepseek-harness" || agentType === "pi"
         ? "sdk"
         : null;
   const qwenCompatibleApiPresetSelected = agentType === "qwen" && !!selectedCcPreset;
@@ -527,6 +532,8 @@ export function NewSessionDialog({
           ? COPILOT_SDK_EFFORT_LEVELS
           : agentType === "qwen"
             ? (qwenCompatibleApiPresetSelected ? ["high"] : QWEN_EFFORT_LEVELS)
+            : agentType === "pi"
+              ? PI_EFFORT_LEVELS
             : agentType === "openclaw"
               ? OPENCLAW_THINKING_LEVELS
               : [];
@@ -546,6 +553,7 @@ export function NewSessionDialog({
     || agentType === "grok-sdk"
     || agentType === "kimi-sdk"
     || agentType === "deepseek-harness"
+    || agentType === "pi"
     || (agentType === "qwen" && !!selectedCcPreset);
   const dynamicModelsAgentType = supportsDynamicTransportModels(agentType)
     ? agentType
@@ -553,10 +561,10 @@ export function NewSessionDialog({
   const transportModels = useTransportModels(
     ws,
     dynamicModelsAgentType,
-    agentType === "claude-code-sdk" ? ccPreset : undefined,
+    CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(agentType) ? ccPreset : undefined,
   );
   const modelSuggestions = useMemo(() => {
-    if ((agentType === "qwen" || agentType === "claude-code-sdk") && selectedCcPreset) {
+    if (CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(agentType) && selectedCcPreset) {
       return mergeModelSuggestions(
         selectedPresetModels,
         transportModels.models.map((model) => model.id),
@@ -575,6 +583,13 @@ export function NewSessionDialog({
     if (agentType === "gemini-sdk") return [...GEMINI_SDK_MODEL_FALLBACK];
     return [] as string[];
   }, [transportModels.models, agentType, selectedPresetModels, selectedCcPreset]);
+
+  usePresetModelSelection({
+    agentType,
+    preset: selectedCcPreset,
+    suggestions: modelSuggestions,
+    setRequestedModel,
+  });
 
   useEffect(() => {
     if (agentType !== "codex-sdk") return;
@@ -596,38 +611,13 @@ export function NewSessionDialog({
     setThinking("high");
   }, [agentType, qwenCompatibleApiPresetSelected]);
 
-  useEffect(() => {
-    if (
-      (agentType !== "qwen" && agentType !== "claude-code-sdk")
-      || !selectedCcPreset
-    ) return;
-    const fallbackModel = selectedCcPreset ? (getCcPresetEffectiveModel(selectedCcPreset) ?? "") : "";
-    setRequestedModel((current) => {
-      if (modelSuggestions.length === 0) {
-        return current || fallbackModel;
-      }
-      if (
-        fallbackModel
-        && current === selectedCcPreset?.env.ANTHROPIC_MODEL
-        && current !== fallbackModel
-        && modelSuggestions.includes(fallbackModel)
-      ) {
-        return fallbackModel;
-      }
-      if (!current || !modelSuggestions.includes(current)) {
-        return modelSuggestions.includes(fallbackModel) ? fallbackModel : modelSuggestions[0];
-      }
-      return current;
-    });
-  }, [agentType, modelSuggestions, selectedCcPreset]);
-
   const handleKey = (e: KeyboardEvent) => {
     if (e.key === "Enter" && !starting) handleStart();
   };
 
   return (
     <div class="dialog-overlay" onKeyDown={handleKey} role="dialog">
-      <div class="dialog" style={responsiveDialogStyle}>
+      <div class="dialog session-launch-dialog" style={responsiveDialogStyle}>
         <div class="dialog-header">
           <h2>{t("new_session.title")}</h2>
           <button
@@ -730,40 +720,37 @@ export function NewSessionDialog({
           </div>
         </div>
 
-        <div class="form-group">
+        <div class="form-group session-agent-selector">
           <label>{t("new_session.agent_type")}</label>
-          <select
-            value={agentType}
-            disabled={starting}
-            onInput={(e) =>
-              selectAgentType((e.target as HTMLSelectElement).value as AgentType)
-            }
-            style={{
-              width: "100%",
-              background: "#0f172a",
-              border: "1px solid #334155",
-              color: "#e2e8f0",
-              padding: "8px 12px",
-              borderRadius: 4,
-              fontFamily: "inherit",
-            }}
-          >
+          <div class="session-agent-groups">
             {agentGroups.map((group) => {
               const visibleItems = customProviderSdk
                 ? group.items.filter((choice) => CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(choice.id))
                 : group.items;
               if (visibleItems.length === 0) return null;
               return (
-                <optgroup key={group.id} label={t(SESSION_AGENT_GROUP_LABEL_KEYS[group.id])}>
+                <div key={group.id} class="session-agent-group">
+                  <div class="session-agent-group-title">{t(SESSION_AGENT_GROUP_LABEL_KEYS[group.id])}</div>
+                  <div class="session-agent-grid">
                   {visibleItems.map((choice) => (
-                    <option key={choice.id} value={choice.id}>
-                      {getSessionAgentLabel(t, choice)}
-                    </option>
+                    <button
+                      type="button"
+                      key={choice.id}
+                      data-agent-type={choice.id}
+                      class={`session-agent-card${agentType === choice.id ? " active" : ""}`}
+                      disabled={starting || (customProviderSdk && !CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(choice.id))}
+                      aria-pressed={agentType === choice.id}
+                      onClick={() => selectAgentType(choice.id as AgentType)}
+                    >
+                      <span class="session-agent-card-icon" aria-hidden="true">{choice.icon}</span>
+                      <span>{getSessionAgentLabel(t, choice)}</span>
+                    </button>
                   ))}
-                </optgroup>
+                  </div>
+                </div>
               );
             })}
-          </select>
+          </div>
           <SdkModeRecommendation agentType={agentType} />
           {/*
            * R-3-cycle-N — drop the nested flex layout for the help text.

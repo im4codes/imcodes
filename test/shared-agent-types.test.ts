@@ -9,6 +9,7 @@ describe('shared agent type helpers', () => {
     expect(isTransportSessionAgentType('kimi-sdk')).toBe(true);
     expect(isTransportSessionAgentType('grok-sdk')).toBe(true);
     expect(isTransportSessionAgentType('deepseek-harness')).toBe(true);
+    expect(isTransportSessionAgentType('pi')).toBe(true);
     expect(isTransportSessionAgentType('opencode-sdk')).toBe(true);
     expect(isTransportSessionAgentType('qwen')).toBe(true);
     expect(isTransportSessionAgentType('openclaw')).toBe(true);
@@ -22,6 +23,7 @@ describe('shared agent type helpers', () => {
     expect(getSessionRuntimeType('kimi-sdk')).toBe('transport');
     expect(getSessionRuntimeType('grok-sdk')).toBe('transport');
     expect(getSessionRuntimeType('opencode-sdk')).toBe('transport');
+    expect(getSessionRuntimeType('pi')).toBe('transport');
     expect(getSessionRuntimeType('opencode')).toBe('process');
     expect(getSessionRuntimeType('claude-code')).toBe('process');
     expect(getSessionRuntimeType('shell')).toBe('process');

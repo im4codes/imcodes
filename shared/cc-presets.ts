@@ -21,6 +21,7 @@ export const CUSTOM_PROVIDER_SDK_AGENT_TYPES: ReadonlySet<string> = new Set([
   'claude-code-sdk',
   'qwen',
   'deepseek-harness',
+  'pi',
 ]);
 
 export interface CcPresetSaveResponse {

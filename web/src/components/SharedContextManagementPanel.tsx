@@ -1397,6 +1397,7 @@ const MCP_PROVIDER_LABEL_KEY: Record<MemoryMcpProviderId, string> = {
   'opencode-sdk': 'sharedContext.management.mcpProviderOpenCodeSdk',
   qwen: 'sharedContext.management.mcpProviderQwen',
   'deepseek-harness': 'sharedContext.management.mcpProviderDeepseekHarness',
+  pi: 'sharedContext.management.mcpProviderPi',
 };
 
 function isManagedMcpProviderId(providerId: string): providerId is MemoryMcpProviderId {

@@ -242,6 +242,40 @@ describe('cc presets', () => {
     expect(result.env).not.toHaveProperty('ANTHROPIC_AUTH_TOKEN');
   });
 
+  it('builds a Pi provider route without exposing the preset key in argv or generic env', async () => {
+    const { getPiPresetTransportConfig } = await import('../../src/daemon/cc-presets.js');
+
+    const result = await getPiPresetTransportConfig('MiniMax');
+    expect(result).toMatchObject({
+      env: { ANTHROPIC_MODEL: 'MiniMax-M2.7' },
+      model: 'MiniMax-M2.7',
+      contextWindow: 200_000,
+      piLlm: {
+        provider: 'minimax',
+        model: 'MiniMax-M2.7',
+        baseUrl: 'https://api.minimax.io/anthropic',
+        apiKey: 'test-token',
+        contextWindow: 200_000,
+      },
+    });
+    expect(result.env).not.toHaveProperty('ANTHROPIC_API_KEY');
+    expect(result.env).not.toHaveProperty('ANTHROPIC_AUTH_TOKEN');
+  });
+
+  it('clamps a previous provider model to the newly selected preset catalogue', async () => {
+    const { selectPresetModel } = await import('../../src/daemon/cc-presets.js');
+    const nextPreset = {
+      env: { ANTHROPIC_MODEL: 'next-default' },
+      defaultModel: 'next-default',
+      availableModels: [{ id: 'shared-model' }, { id: 'next-default' }],
+    };
+
+    expect(selectPresetModel(nextPreset, 'old-provider-only')).toBe('next-default');
+    // A deliberately selected overlapping id is valid inside this preset; the
+    // web route-identity hook is responsible for resetting it at switch time.
+    expect(selectPresetModel(nextPreset, 'shared-model')).toBe('shared-model');
+  });
+
   it('uses discovered compatible-api models when building qwen transport config', async () => {
     const { savePresets, getQwenPresetTransportConfig } = await import('../../src/daemon/cc-presets.js');
 

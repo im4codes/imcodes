@@ -31,6 +31,7 @@ describe('buildTransportResumeLaunchOpts', () => {
     expect(usesProviderResumeId('kimi-sdk')).toBe(true);
     expect(usesProviderResumeId('opencode-sdk')).toBe(true);
     expect(usesProviderResumeId('deepseek-harness')).toBe(true);
+    expect(usesProviderResumeId('pi')).toBe(true);
     expect(usesProviderResumeId('gemini-sdk')).toBe(false);
   });
 
@@ -49,9 +50,16 @@ describe('buildTransportResumeLaunchOpts', () => {
     expect(buildTransportResumeLaunchOpts(rec({ agentType: 'claude-code-sdk', codexSessionId: 'cx-1' })).codexSessionId).toBeUndefined();
   });
 
-  it('threads providerResumeId for cursor-headless / copilot-sdk / OpenCode SDK / Kimi / Grok', () => {
-    for (const agentType of ['cursor-headless', 'copilot-sdk', 'opencode-sdk', 'kimi-sdk', 'grok-sdk'] as const) {
+  it('threads providerResumeId for cursor-headless / copilot-sdk / OpenCode SDK / Kimi / Grok / DSH / Pi', () => {
+    for (const agentType of ['cursor-headless', 'copilot-sdk', 'opencode-sdk', 'kimi-sdk', 'grok-sdk', 'deepseek-harness', 'pi'] as const) {
       expect(buildTransportResumeLaunchOpts(rec({ agentType, providerResumeId: 'pr-1' }))).toMatchObject({ providerResumeId: 'pr-1' });
+    }
+  });
+
+  it('preserves third-party preset routing for DSH and Pi resumes', () => {
+    for (const agentType of ['deepseek-harness', 'pi'] as const) {
+      expect(buildTransportResumeLaunchOpts(rec({ agentType, ccPreset: 'MiniMax' })))
+        .toMatchObject({ ccPreset: 'MiniMax' });
     }
   });
 

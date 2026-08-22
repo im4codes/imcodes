@@ -13,6 +13,7 @@ describe('agent display helpers', () => {
     expect(formatLabel('cursor-headless4')).toBe('Cu4');
     expect(formatLabel('opencode-sdk5')).toBe('OC5');
     expect(formatLabel('deepseek-harness6')).toBe('Ds6');
+    expect(formatLabel('pi7')).toBe('Pi7');
   });
 
   it('uses short auto label prefixes for sdk session creation', () => {
@@ -23,5 +24,6 @@ describe('agent display helpers', () => {
     expect(getAutoSessionLabelPrefix('grok-sdk')).toBe('Gr');
     expect(getAutoSessionLabelPrefix('opencode-sdk')).toBe('OC');
     expect(getAutoSessionLabelPrefix('deepseek-harness')).toBe('Ds');
+    expect(getAutoSessionLabelPrefix('pi')).toBe('Pi');
   });
 });

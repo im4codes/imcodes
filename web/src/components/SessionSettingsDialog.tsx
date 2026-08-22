@@ -956,6 +956,7 @@ export function SessionSettingsDialog({
       case 'grok-sdk': return t('session.agentType.grok_sdk');
       case 'kimi-sdk': return t('session.agentType.kimi_sdk');
       case 'deepseek-harness': return t('session.agentType.deepseek_harness');
+      case 'pi': return t('session.agentType.pi');
       default: return value;
     }
   };

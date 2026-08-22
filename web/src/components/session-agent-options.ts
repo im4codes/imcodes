@@ -99,6 +99,14 @@ const SESSION_AGENT_CHOICES: SessionAgentChoice[] = [
     surfaces: ['new-session', 'sub-session'],
   },
   {
+    id: 'pi',
+    icon: 'π',
+    fallbackLabel: 'Pi',
+    labelKey: 'session.agentType.pi',
+    group: 'transport',
+    surfaces: ['new-session', 'sub-session'],
+  },
+  {
     id: 'qwen',
     icon: '千',
     fallbackLabel: 'Qwen Code',

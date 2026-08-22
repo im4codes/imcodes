@@ -664,7 +664,8 @@
       "gemini_sdk": "Gemini SDK",
       "grok_sdk": "Grok Build",
       "kimi_sdk": "Kimi Code",
-      "deepseek_harness": "DeepSeek Harness"
+      "deepseek_harness": "DeepSeek Harness",
+      "pi": "Pi"
     },
     "agentGroup": {
       "transport_sdk": "SDK",
@@ -2497,6 +2498,7 @@
       "mcpProviderOpenCodeSdk": "OpenCode SDK",
       "mcpProviderQwen": "Qwen",
       "mcpProviderDeepseekHarness": "DeepSeek Harness",
+      "mcpProviderPi": "Pi",
       "mcpProviderUnknown": "{{provider}}",
       "mcpDisabledFlag": "無効化フラグ: {{flag}}",
       "mcpDisabledFlagNone": "無効化フラグは未報告",

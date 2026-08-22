@@ -46,6 +46,7 @@ interface DshAgent {
   session: DshSession;
   whenIdle(): Promise<void>;
   followup(message: unknown): void;
+  steer(message: unknown): void;
   cancel?(): void;
 }
 
@@ -156,6 +157,34 @@ function buildUserMessage(text: string): unknown {
     content: Object.freeze([Object.freeze({ type: 'text', text })]),
     source: Object.freeze({ kind: 'user' }),
   });
+}
+
+/** Execute one validated daemon command against the live Harness agent. */
+export function dispatchDshBridgeCommand(
+  agent: DshAgent,
+  command: DshBridgeCommand,
+  requestExit: (code: number) => void,
+): void {
+  switch (command.type) {
+    case DSH_BRIDGE_COMMAND.PROMPT:
+      if (typeof command.text === 'string' && command.text) {
+        agent.followup(buildUserMessage(command.text));
+      }
+      return;
+    case DSH_BRIDGE_COMMAND.STEER:
+      if (typeof command.text === 'string' && command.text) {
+        agent.steer(buildUserMessage(command.text));
+      }
+      return;
+    case DSH_BRIDGE_COMMAND.CANCEL:
+      agent.cancel?.();
+      return;
+    case DSH_BRIDGE_COMMAND.SHUTDOWN:
+      requestExit(0);
+      return;
+    default:
+      warn('ignored unknown command');
+  }
 }
 
 function subscribe(ctx: DshPluginContext, agent: DshAgent): void {
@@ -342,21 +371,7 @@ async function start(ctx: DshPluginContext): Promise<void> {
       warn('ignored malformed command line');
       return;
     }
-    switch (command.type) {
-      case DSH_BRIDGE_COMMAND.PROMPT:
-        if (typeof command.text === 'string' && command.text) {
-          agent.followup(buildUserMessage(command.text));
-        }
-        return;
-      case DSH_BRIDGE_COMMAND.CANCEL:
-        agent.cancel?.();
-        return;
-      case DSH_BRIDGE_COMMAND.SHUTDOWN:
-        requestExit(0);
-        return;
-      default:
-        warn(`ignored unknown command`);
-    }
+    dispatchDshBridgeCommand(agent, command, requestExit);
   });
   // The daemon closing stdin is a terminal signal: flush and leave rather than
   // lingering as an orphan holding the session lock.
