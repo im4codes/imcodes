@@ -104,6 +104,7 @@ describe('controlled-node self-upgrade', () => {
       credential,
       target: { os: 'win', arch: 'x64' },
       dir,
+      expectedVersion: '0.1.2',
       fetchImpl: (async (url: string, init?: RequestInit) => {
         expect(init?.headers).toMatchObject({
           [CONTROLLED_NODE_ARTIFACT_HEADERS.REMOTE_DESKTOP_PROTOCOL_VERSION]: String(REMOTE_DESKTOP_PROTOCOL_VERSION),
@@ -134,16 +135,37 @@ describe('controlled-node self-upgrade', () => {
     ]);
   });
 
-  it('treats a remote-desktop protocol skew as an optional sidecar miss', async () => {
+  it.each([404, 409, 503])('refuses to split a Windows release when the worker endpoint returns %s', async (status) => {
     const dir = await mkdtemp(join(tmpdir(), 'imcodes-rd-worker-skew-test-'));
     dirs.push(dir);
-    const result = await downloadControlledNodeRemoteDesktopWorker({
+    await expect(downloadControlledNodeRemoteDesktopWorker({
       credential,
       target: { os: 'win', arch: 'x64' },
       dir,
-      fetchImpl: (async () => new Response(null, { status: 409 })) as unknown as typeof fetch,
-    });
-    expect(result).toBeUndefined();
+      expectedVersion: '0.1.2',
+      fetchImpl: (async () => new Response(null, { status })) as unknown as typeof fetch,
+    })).rejects.toThrow(`download_failed_${status}`);
+  });
+
+  it('rejects a worker artifact from a different Node release', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'imcodes-rd-worker-version-test-'));
+    dirs.push(dir);
+    const bytes = Buffer.from('stale remote desktop worker');
+    await expect(downloadControlledNodeRemoteDesktopWorker({
+      credential,
+      target: { os: 'win', arch: 'x64' },
+      dir,
+      expectedVersion: '2026.7.2',
+      fetchImpl: (async () => new Response(bytes, {
+        status: 200,
+        headers: {
+          [CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256]: createHash('sha256').update(bytes).digest('hex'),
+          [CONTROLLED_NODE_ARTIFACT_HEADERS.SIZE_BYTES]: String(bytes.length),
+          [CONTROLLED_NODE_ARTIFACT_HEADERS.FILENAME]: REMOTE_DESKTOP_WORKER_FILENAME,
+          [CONTROLLED_NODE_ARTIFACT_HEADERS.VERSION]: '2026.7.1',
+        },
+      })) as unknown as typeof fetch,
+    })).rejects.toThrow('artifact_version_mismatch');
   });
 
   it('downloads, verifies sha256, writes a staged artifact, and spawns a detached Windows upgrader', async () => {
@@ -153,6 +175,34 @@ describe('controlled-node self-upgrade', () => {
     const sha256 = createHash('sha256').update(bytes).digest('hex');
     const helperBytes = Buffer.from('new open computer use helper');
     const helperSha256 = createHash('sha256').update(helperBytes).digest('hex');
+    const workerBytes = Buffer.from('same-release remote desktop worker');
+    const virtualDisplayBytes = Buffer.from('same-release virtual display archive');
+    const workerManifest = Buffer.from(JSON.stringify({
+      manifestVersion: 2,
+      workerVersion: '2026.7.1',
+      protocolVersion: REMOTE_DESKTOP_PROTOCOL_VERSION,
+      ipcVersion: 1,
+      os: 'win32',
+      arch: 'x64',
+      fileName: REMOTE_DESKTOP_WORKER_FILENAME,
+      size: workerBytes.length,
+      sha256: createHash('sha256').update(workerBytes).digest('hex'),
+      authenticodeSignerSha256: WINDOWS_SIGNER_SHA256,
+      libwebrtcRevision: WINDOWS_REMOTE_DESKTOP_QUALIFICATION_PLAN.mediaStackDecision.libwebrtcRevision,
+      virtualDisplay: {
+        archiveFileName: 'imcodes-virtual-display.zip',
+        packageManifestFileName: 'imcodes-virtual-display.manifest.json',
+        size: virtualDisplayBytes.length,
+        sha256: createHash('sha256').update(virtualDisplayBytes).digest('hex'),
+      },
+      toolchain: {
+        msvc: '14.44',
+        windowsSdk: '10.0.26100.0',
+        cmake: 'not-used-gn',
+        ninja: '1.13.1',
+        depotTools: WINDOWS_REMOTE_DESKTOP_QUALIFICATION_PLAN.mediaStackDecision.depotToolsRevision,
+      },
+    }));
     const journalPath = join(dir, 'install-journal.json');
     await writeFile(journalPath, JSON.stringify({
       version: 1,
@@ -189,6 +239,23 @@ describe('controlled-node self-upgrade', () => {
             [CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256]: helperSha256,
             [CONTROLLED_NODE_ARTIFACT_HEADERS.SIZE_BYTES]: String(helperBytes.length),
             [CONTROLLED_NODE_ARTIFACT_HEADERS.FILENAME]: 'open-computer-use.exe',
+          },
+        });
+      }
+      const isWorkerManifest = url.includes('asset=remote-desktop-worker-manifest');
+      const isVirtualDisplay = url.includes('asset=remote-desktop-virtual-display');
+      const isWorker = url.includes('asset=remote-desktop-worker');
+      if (isWorkerManifest || isVirtualDisplay || isWorker) {
+        const body = isWorkerManifest ? workerManifest : isVirtualDisplay ? virtualDisplayBytes : workerBytes;
+        return new Response(body, {
+          status: 200,
+          headers: {
+            [CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256]: createHash('sha256').update(body).digest('hex'),
+            [CONTROLLED_NODE_ARTIFACT_HEADERS.SIZE_BYTES]: String(body.length),
+            [CONTROLLED_NODE_ARTIFACT_HEADERS.FILENAME]: isWorkerManifest
+              ? `${REMOTE_DESKTOP_WORKER_FILENAME}${REMOTE_DESKTOP_WORKER_MANIFEST_SUFFIX}`
+              : isVirtualDisplay ? 'imcodes-virtual-display.zip' : REMOTE_DESKTOP_WORKER_FILENAME,
+            [CONTROLLED_NODE_ARTIFACT_HEADERS.VERSION]: '2026.7.1',
           },
         });
       }
@@ -242,6 +309,10 @@ describe('controlled-node self-upgrade', () => {
     expect(taskXml).toContain(result.scriptPath!);
     const helperPath = join(dirname(result.scriptPath!), 'computer-use-helper', 'win32-x64', 'open-computer-use.exe');
     expect(await readFile(helperPath, 'utf8')).toBe('new open computer use helper');
+    expect(await readFile(
+      join(dirname(result.scriptPath!), 'remote-desktop-worker', 'win32-x64', REMOTE_DESKTOP_WORKER_FILENAME),
+      'utf8',
+    )).toBe('same-release remote desktop worker');
     const nextJournal = JSON.parse(await readFile(join(dirname(result.scriptPath!), 'install-journal.json'), 'utf8')) as {
       updatedAt: number;
       stagedReceipt: { path: string; size: number; sha256: string; stagedIdentity: { size: number } };
@@ -253,6 +324,35 @@ describe('controlled-node self-upgrade', () => {
       sha256,
     });
     expect(nextJournal.stagedReceipt.stagedIdentity.size).toBe(bytes.length);
+  });
+
+  it('does not schedule the main executable when its Windows worker bundle is unavailable', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'imcodes-self-upgrade-worker-missing-'));
+    dirs.push(dir);
+    const bytes = Buffer.from('new controlled node exe');
+    const scheduleWindowsUpgrade = vi.fn();
+    await expect(startControlledNodeSelfUpgrade(credential, '2026.7.1', {
+      fetchImpl: (async (url: string) => {
+        if (url.includes('asset=computer-use-helper')) return new Response(null, { status: 404 });
+        if (url.includes('asset=remote-desktop-worker')) return new Response(null, { status: 503 });
+        return new Response(bytes, {
+          status: 200,
+          headers: {
+            [CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256]: createHash('sha256').update(bytes).digest('hex'),
+            [CONTROLLED_NODE_ARTIFACT_HEADERS.SIZE_BYTES]: String(bytes.length),
+            [CONTROLLED_NODE_ARTIFACT_HEADERS.FILENAME]: 'imcodes-node.exe',
+            [CONTROLLED_NODE_ARTIFACT_HEADERS.VERSION]: '2026.7.1',
+            [CONTROLLED_NODE_ARTIFACT_HEADERS.AUTHENTICODE_SIGNER_SHA256]: WINDOWS_SIGNER_SHA256,
+          },
+        });
+      }) as unknown as typeof fetch,
+      platform: 'win32',
+      arch: 'x64',
+      execPath: 'C:\\ProgramData\\imcodes-node\\imcodes-node.exe',
+      tmpdir: () => dir,
+      scheduleWindowsUpgrade,
+    })).rejects.toThrow('download_failed_503');
+    expect(scheduleWindowsUpgrade).not.toHaveBeenCalled();
   });
 
   it('rejects artifact checksum mismatches before spawning', async () => {

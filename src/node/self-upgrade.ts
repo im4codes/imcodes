@@ -276,6 +276,7 @@ export async function downloadControlledNodeRemoteDesktopWorker(input: {
   target: ControlledNodeArtifactTarget;
   dir: string;
   fetchImpl: typeof fetch;
+  expectedVersion?: string;
 }): Promise<{ workerDir: string; artifactPath: string; manifestPath: string; sha256: string } | undefined> {
   if (input.target.os !== CONTROLLED_NODE_OS_WIN || input.target.arch !== CONTROLLED_NODE_ARCH_X64) return undefined;
   const workerDir = join(input.dir, 'remote-desktop-worker', 'win32-x64');
@@ -288,6 +289,7 @@ export async function downloadControlledNodeRemoteDesktopWorker(input: {
       fetchImpl: input.fetchImpl,
       asset: CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER,
       expectedFileName: REMOTE_DESKTOP_WORKER_FILENAME,
+      expectedVersion: input.expectedVersion,
       fileMode: 0o755,
     });
     const manifestFilename = `${REMOTE_DESKTOP_WORKER_FILENAME}${REMOTE_DESKTOP_WORKER_MANIFEST_SUFFIX}`;
@@ -298,12 +300,14 @@ export async function downloadControlledNodeRemoteDesktopWorker(input: {
       fetchImpl: input.fetchImpl,
       asset: CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER_MANIFEST,
       expectedFileName: manifestFilename,
+      expectedVersion: input.expectedVersion,
       fileMode: 0o644,
     });
     const manifest = validateRemoteDesktopWorkerManifest(
       JSON.parse(await readFile(manifestDownload.artifactPath, 'utf8')),
     );
     if (!manifest
+      || (input.expectedVersion !== undefined && manifest.workerVersion !== input.expectedVersion)
       || manifest.sha256 !== executable.sha256
       || manifest.size !== executable.sizeBytes
       || manifest.fileName !== executable.filename) {
@@ -316,6 +320,7 @@ export async function downloadControlledNodeRemoteDesktopWorker(input: {
       fetchImpl: input.fetchImpl,
       asset: CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_VIRTUAL_DISPLAY,
       expectedFileName: REMOTE_DESKTOP_VIRTUAL_DISPLAY_ARCHIVE_FILENAME,
+      expectedVersion: input.expectedVersion,
       fileMode: 0o644,
     });
     if (virtualDisplay.sha256 !== manifest.virtualDisplay.sha256
@@ -339,10 +344,14 @@ export async function downloadControlledNodeRemoteDesktopWorker(input: {
     };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    // The media sidecar is optional for a Node upgrade. A rolling protocol
-    // mismatch must never prevent the signed main executable from upgrading to
-    // the version that can speak the server's current protocol.
-    if (/^download_failed_(404|409|503)$/.test(message) || message === 'artifact_filename_mismatch') return undefined;
+    // An on-demand npm-daemon install has no runtime upgrade to publish and may
+    // report an absent optional capability. A controlled-node self-upgrade
+    // always supplies expectedVersion, making the same failures fatal before
+    // its main executable can be scheduled.
+    if (input.expectedVersion === undefined
+      && (/^download_failed_(404|409|503)$/.test(message) || message === 'artifact_filename_mismatch')) {
+      return undefined;
+    }
     throw error;
   }
 }
@@ -870,8 +879,18 @@ export async function startControlledNodeSelfUpgrade(
     fetchImpl,
     ...(targetVersion === DAEMON_UPGRADE_TARGET_LATEST ? {} : { expectedVersion: targetVersion }),
   });
+  if (!downloaded.version) throw new Error('missing_artifact_version');
   const helper = await downloadControlledNodeComputerUseHelper({ credential, target, dir: updateDir, fetchImpl });
-  const remoteDesktopWorker = await downloadControlledNodeRemoteDesktopWorker({ credential, target, dir: updateDir, fetchImpl });
+  // A Windows release is one publication unit. Installing the runtime without
+  // its same-version worker bundle strands the node after its runtime version
+  // converges, because version-based auto-upgrade will no longer retry.
+  const remoteDesktopWorker = await downloadControlledNodeRemoteDesktopWorker({
+    credential,
+    target,
+    dir: updateDir,
+    fetchImpl,
+    expectedVersion: downloaded.version,
+  });
   const destinationPath = deps.execPath ?? defaultStagedExecutablePath(platform);
   const destinationManifestPath = `${destinationPath}.manifest.json`;
   const destinationJournalPath = deps.journalPath ?? join(dirname(defaultCredentialPath(platform)), 'install-journal.json');

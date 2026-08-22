@@ -91,6 +91,54 @@ async function writeManifest(
   }));
 }
 
+async function writeRemoteDesktopRelease(workerVersion: string): Promise<{
+  workerBytes: Buffer;
+  virtualDisplayBytes: Buffer;
+  workerManifest: Record<string, unknown>;
+  workerManifestBytes: Buffer;
+}> {
+  const workerBytes = Buffer.from('FAKE_PINNED_LIBWEBRTC_WORKER');
+  const virtualDisplayBytes = Buffer.from('SIGNED_VIRTUAL_DISPLAY_ARCHIVE');
+  const workerDir = join(exeDir, 'remote-desktop-worker', 'win32-x64');
+  await mkdir(workerDir, { recursive: true });
+  const workerManifest = {
+    manifestVersion: 2,
+    workerVersion,
+    protocolVersion: 2,
+    ipcVersion: 1,
+    os: 'win32',
+    arch: 'x64',
+    fileName: REMOTE_DESKTOP_WORKER_FILENAME,
+    size: workerBytes.length,
+    sha256: sha256(workerBytes),
+    authenticodeSignerSha256: 'c'.repeat(64),
+    libwebrtcRevision: WINDOWS_REMOTE_DESKTOP_QUALIFICATION_PLAN.mediaStackDecision.libwebrtcRevision,
+    virtualDisplay: {
+      archiveFileName: 'imcodes-virtual-display.zip',
+      packageManifestFileName: 'imcodes-virtual-display.manifest.json',
+      size: virtualDisplayBytes.length,
+      sha256: sha256(virtualDisplayBytes),
+    },
+    toolchain: {
+      msvc: '14.44',
+      windowsSdk: '10.0.26100.0',
+      cmake: 'not-used-gn',
+      ninja: '1.13.1',
+      depotTools: WINDOWS_REMOTE_DESKTOP_QUALIFICATION_PLAN.mediaStackDecision.depotToolsRevision,
+    },
+  };
+  const workerManifestBytes = Buffer.from(JSON.stringify(workerManifest));
+  await Promise.all([
+    writeFile(join(workerDir, REMOTE_DESKTOP_WORKER_FILENAME), workerBytes),
+    writeFile(
+      join(workerDir, `${REMOTE_DESKTOP_WORKER_FILENAME}${REMOTE_DESKTOP_WORKER_MANIFEST_SUFFIX}`),
+      workerManifestBytes,
+    ),
+    writeFile(join(workerDir, 'imcodes-virtual-display.zip'), virtualDisplayBytes),
+  ]);
+  return { workerBytes, virtualDisplayBytes, workerManifest, workerManifestBytes };
+}
+
 beforeAll(async () => {
   process.env.NODE_ENV = 'development'; // default for HTTPS-off tests; per-test overrides
   db = createDatabase(process.env.TEST_DATABASE_URL!);
@@ -118,7 +166,7 @@ beforeEach(async () => {
   for (const e of entries) {
     if (e.endsWith('.manifest.json')) {
       await rm(join(exeDir, e), { force: true });
-    } else if (e === 'computer-use-helper') {
+    } else if (e === 'computer-use-helper' || e === 'remote-desktop-worker') {
       await rm(join(exeDir, e), { recursive: true, force: true });
     }
   }
@@ -1566,6 +1614,22 @@ describe('GET /api/enroll/v2/node-artifact (controlled-node self-upgrade)', () =
       [serverId, userId, sha256(token), Date.now(), NODE_ROLE.CONTROLLED],
     );
 
+    const missingWorkerResponse = await app.request(`/api/enroll/v2/node-artifact?serverId=${serverId}&os=win&arch=x64`, {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(missingWorkerResponse.status).toBe(503);
+    expect(await missingWorkerResponse.json()).toMatchObject({ error: 'remote_desktop_worker_not_built' });
+
+    await writeRemoteDesktopRelease('0.1.2');
+    const mismatchedWorkerResponse = await app.request(`/api/enroll/v2/node-artifact?serverId=${serverId}&os=win&arch=x64`, {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(mismatchedWorkerResponse.status).toBe(503);
+    expect(await mismatchedWorkerResponse.json()).toEqual({ error: 'windows_release_version_mismatch' });
+
+    const { workerBytes, virtualDisplayBytes, workerManifest, workerManifestBytes } = await writeRemoteDesktopRelease(
+      '2026.7.1234-dev.5',
+    );
     const response = await app.request(`/api/enroll/v2/node-artifact?serverId=${serverId}&os=win&arch=x64`, {
       headers: { authorization: `Bearer ${token}` },
     });
@@ -1587,43 +1651,6 @@ describe('GET /api/enroll/v2/node-artifact (controlled-node self-upgrade)', () =
     expect(helperResponse.headers.get('x-imcodes-node-artifact-sha256')).toBe(sha256(helperBytes));
     expect(Buffer.from(await helperResponse.arrayBuffer())).toEqual(helperBytes);
 
-    const workerBytes = Buffer.from('FAKE_PINNED_LIBWEBRTC_WORKER');
-    const virtualDisplayBytes = Buffer.from('SIGNED_VIRTUAL_DISPLAY_ARCHIVE');
-    const workerDir = join(exeDir, 'remote-desktop-worker', 'win32-x64');
-    await mkdir(workerDir, { recursive: true });
-    await writeFile(join(workerDir, REMOTE_DESKTOP_WORKER_FILENAME), workerBytes);
-    const workerManifest = {
-      manifestVersion: 2,
-      workerVersion: '0.1.2',
-      protocolVersion: 2,
-      ipcVersion: 1,
-      os: 'win32',
-      arch: 'x64',
-      fileName: REMOTE_DESKTOP_WORKER_FILENAME,
-      size: workerBytes.length,
-      sha256: sha256(workerBytes),
-      authenticodeSignerSha256: 'c'.repeat(64),
-      libwebrtcRevision: WINDOWS_REMOTE_DESKTOP_QUALIFICATION_PLAN.mediaStackDecision.libwebrtcRevision,
-      virtualDisplay: {
-        archiveFileName: 'imcodes-virtual-display.zip',
-        packageManifestFileName: 'imcodes-virtual-display.manifest.json',
-        size: virtualDisplayBytes.length,
-        sha256: sha256(virtualDisplayBytes),
-      },
-      toolchain: {
-        msvc: '14.44',
-        windowsSdk: '10.0.26100.0',
-        cmake: 'not-used-gn',
-        ninja: '1.13.1',
-        depotTools: WINDOWS_REMOTE_DESKTOP_QUALIFICATION_PLAN.mediaStackDecision.depotToolsRevision,
-      },
-    };
-    const workerManifestBytes = Buffer.from(JSON.stringify(workerManifest));
-    await writeFile(
-      join(workerDir, `${REMOTE_DESKTOP_WORKER_FILENAME}${REMOTE_DESKTOP_WORKER_MANIFEST_SUFFIX}`),
-      workerManifestBytes,
-    );
-    await writeFile(join(workerDir, 'imcodes-virtual-display.zip'), virtualDisplayBytes);
     const workerResponse = await app.request(`/api/enroll/v2/node-artifact?serverId=${serverId}&os=win&arch=x64&asset=remote-desktop-worker`, {
       headers: { authorization: `Bearer ${token}` },
     });
