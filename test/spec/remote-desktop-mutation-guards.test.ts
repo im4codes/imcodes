@@ -573,6 +573,28 @@ const contracts: Contract[] = [
     ],
   },
   {
+    name: 'cross-session handover keeps the mounted browser peer',
+    guards: [
+      {
+        path: 'web/src/remote-desktop-client.ts',
+        needle: 'private seamlessHandover = false;',
+      },
+      {
+        path: 'web/src/remote-desktop-client.ts',
+        needle: 'const peer = this.peer;',
+      },
+      {
+        path: 'web/src/remote-desktop-client.ts',
+        needle: 'const offer = await peer.createOffer({ iceRestart: true });',
+        minimum: 2,
+      },
+      {
+        path: 'web/src/remote-desktop-client.ts',
+        needle: 'if (!this.peer?.remoteDescription || this.awaitingAnswer)',
+      },
+    ],
+  },
+  {
     name: 'capture falls back to GDI when DXGI never presents',
     guards: [
       {
@@ -1218,6 +1240,12 @@ const mutations: Mutation[] = [
     contract: 'one console-session worker that follows the desktop',
     path: 'web/src/remote-desktop-client.ts',
     needle: 'await this.renegotiate();',
+  },
+  {
+    name: 'replace the mounted browser peer during a Windows console handover',
+    contract: 'cross-session handover keeps the mounted browser peer',
+    path: 'web/src/remote-desktop-client.ts',
+    needle: 'private seamlessHandover = false;',
   },
   {
     name: 'end the peer when Windows logs on or off',

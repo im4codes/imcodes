@@ -312,6 +312,8 @@ export class RemoteDesktopClient {
   /** The grant this session was authorized with, replayed on a worker handover. */
   private authorized: Extract<RemoteDesktopServerMessage, { type: typeof REMOTE_DESKTOP_MSG.AUTHORIZED }> | null = null;
   private renegotiating = false;
+  /** Keep the last decoded frame visible while a new Windows session takes over. */
+  private seamlessHandover = false;
   private controlChannel: RTCDataChannel | null = null;
   private keyboardChannel: RTCDataChannel | null = null;
   private pointerChannel: RTCDataChannel | null = null;
@@ -758,21 +760,27 @@ export class RemoteDesktopClient {
   }
 
   /**
-   * The node replaced the worker behind this session because the desktop
-   * switched under it — signing in from the lock screen is the ordinary case.
-   * The grant, lease and input epoch all continue, so rebuild only the peer
-   * instead of tearing the session down and making the viewer start over.
+   * A real Windows logoff destroys the console session that owns DXGI, so the
+   * node must move capture to a worker in the next console session. Keep this
+   * browser PeerConnection and its last decoded frame, ICE-restart it against
+   * the replacement worker, and rebuild only its data channels. The grant,
+   * stream element and visible state all survive the handover.
    */
   private async renegotiate(): Promise<void> {
     const authority = this.authorized;
-    if (!authority || this.stopped || this.renegotiating) return;
+    const peer = this.peer;
+    if (!authority || !peer || this.stopped || this.renegotiating) return;
     this.renegotiating = true;
+    this.seamlessHandover = true;
     try {
       this.clearStartTimer();
       this.clearDisconnectTimer();
       this.releaseAll();
       this.workerInputEnabled = false;
       this.awaitingAnswer = false;
+      this.iceRestartInFlight = true;
+      this.localIceCandidates = 0;
+      this.remoteIceCandidates = 0;
       this.pendingRemoteCandidates.clear();
       if (this.statsTimer) clearInterval(this.statsTimer);
       this.statsTimer = null;
@@ -781,12 +789,7 @@ export class RemoteDesktopClient {
       this.lastMediaProgressAt = null;
       this.mediaStarted = false;
       this.firstMediaWaitStartedAt = null;
-      // Detach before closing: the close handlers fail the session for the
-      // *live* peer, and during a handover the peer being closed is already
-      // the superseded one.
-      const superseded = this.peer;
       const supersededChannels = [this.controlChannel, this.keyboardChannel, this.pointerChannel];
-      this.peer = null;
       this.controlChannel = null;
       this.keyboardChannel = null;
       this.pointerChannel = null;
@@ -794,12 +797,29 @@ export class RemoteDesktopClient {
       for (const channel of supersededChannels) {
         try { channel?.close(); } catch { /* closed */ }
       }
-      try { superseded?.close(); } catch { /* closed */ }
-      // The session survives, so the viewer sees a reconnecting frame rather
-      // than a failure card with a Retry button.
-      this.publish({ state: REMOTE_DESKTOP_STATE.RECONNECTING, inputEnabled: false });
+      this.createDataChannels(peer);
+      // Do not publish PREPARING/CONNECTING/RECONNECTING: the existing stream
+      // and its last frame remain mounted until the replacement sends frames.
+      this.publish({ inputEnabled: false });
       this.requirePresentedFrameForCurrentTopology();
-      await this.preparePeer(authority);
+      const offer = await peer.createOffer({ iceRestart: true });
+      if (this.stopped || this.peer !== peer || !this.authorityReady()) return;
+      await peer.setLocalDescription(offer);
+      if (!peer.localDescription?.sdp) throw new Error('missing_handover_sdp');
+      this.awaitingAnswer = true;
+      if (!this.signaling.send({
+        type: REMOTE_DESKTOP_MSG.OFFER,
+        ...this.authorityFields(),
+        sdp: peer.localDescription.sdp,
+      })) throw new Error('handover_signal_failed');
+      this.startTimer = setTimeout(
+        () => this.fail(REMOTE_DESKTOP_TERMINAL_REASON.NEGOTIATION_TIMEOUT),
+        START_TIMEOUT_MS,
+      );
+    } catch {
+      this.seamlessHandover = false;
+      this.iceRestartInFlight = false;
+      this.fail(REMOTE_DESKTOP_TERMINAL_REASON.PEER_FAILED);
     } finally {
       this.renegotiating = false;
     }
@@ -834,7 +854,9 @@ export class RemoteDesktopClient {
         return;
       }
       const candidate = { candidate: message.candidate, sdpMid: message.mid };
-      if (!this.peer?.remoteDescription) this.pendingRemoteCandidates.push(candidate);
+      if (!this.peer?.remoteDescription || this.awaitingAnswer) {
+        this.pendingRemoteCandidates.push(candidate);
+      }
       else await this.peer.addIceCandidate(candidate);
       return;
     }
@@ -921,31 +943,7 @@ export class RemoteDesktopClient {
       ? RTCRtpReceiver.getCapabilities?.('video')
       : null;
     if (capabilities) applyH264ReceiveCodecPreference(transceiver, capabilities.codecs);
-    this.controlChannel = peer.createDataChannel(REMOTE_DESKTOP_CHANNEL.CONTROL, { ordered: true });
-    this.keyboardChannel = peer.createDataChannel(REMOTE_DESKTOP_CHANNEL.KEYBOARD, { ordered: true });
-    this.pointerChannel = peer.createDataChannel(REMOTE_DESKTOP_CHANNEL.POINTER, { ordered: false, maxRetransmits: 0 });
-    for (const channel of [this.controlChannel, this.keyboardChannel, this.pointerChannel]) {
-      channel.binaryType = 'arraybuffer';
-      channel.bufferedAmountLowThreshold = DATA_BUFFER_LOW_WATER_BYTES;
-      channel.addEventListener('open', () => this.updateChannelReadiness());
-      channel.addEventListener('close', () => {
-        // A superseded peer closes its channels on the way out. Only the live
-        // peer losing a channel is a real failure; otherwise a desktop handover
-        // would fail the very session it is rescuing.
-        if (this.peer !== peer) return;
-        this.releaseAll();
-        this.updateChannelReadiness();
-        if (!this.stopped) this.fail(REMOTE_DESKTOP_TERMINAL_REASON.PEER_FAILED);
-      });
-    }
-    this.controlChannel.addEventListener('message', (event) => this.handleData(event.data));
-    this.controlChannel.addEventListener('open', () => {
-      this.sendControl({
-        type: REMOTE_DESKTOP_DATA_MSG.CONTROL,
-        ...this.inputBase(),
-        kind: REMOTE_DESKTOP_CONTROL_KIND.HELLO,
-      });
-    });
+    this.createDataChannels(peer);
     peer.addEventListener('track', (event) => {
       const stream = event.streams[0] ?? new MediaStream([event.track]);
       this.publish({ stream });
@@ -977,9 +975,12 @@ export class RemoteDesktopClient {
         }, 1_500);
       } else if (peer.connectionState === 'connecting') {
         this.clearDisconnectTimer();
-        this.publish({ state: REMOTE_DESKTOP_STATE.CONNECTING });
+        if (!this.seamlessHandover) {
+          this.publish({ state: REMOTE_DESKTOP_STATE.CONNECTING });
+        }
       } else if (peer.connectionState === 'connected') {
         this.clearDisconnectTimer();
+        this.seamlessHandover = false;
         this.iceRestartInFlight = false;
         this.startStats(peer);
       }
@@ -996,6 +997,38 @@ export class RemoteDesktopClient {
       type: REMOTE_DESKTOP_MSG.OFFER,
       ...this.authorityFields(),
       sdp: peer.localDescription.sdp,
+    });
+  }
+
+  private createDataChannels(peer: RTCPeerConnection): void {
+    const control = peer.createDataChannel(REMOTE_DESKTOP_CHANNEL.CONTROL, { ordered: true });
+    const keyboard = peer.createDataChannel(REMOTE_DESKTOP_CHANNEL.KEYBOARD, { ordered: true });
+    const pointer = peer.createDataChannel(REMOTE_DESKTOP_CHANNEL.POINTER, { ordered: false, maxRetransmits: 0 });
+    this.controlChannel = control;
+    this.keyboardChannel = keyboard;
+    this.pointerChannel = pointer;
+    for (const channel of [control, keyboard, pointer]) {
+      channel.binaryType = 'arraybuffer';
+      channel.bufferedAmountLowThreshold = DATA_BUFFER_LOW_WATER_BYTES;
+      channel.addEventListener('open', () => this.updateChannelReadiness());
+      channel.addEventListener('close', () => {
+        // The old SCTP association closes its channels during an in-place ICE
+        // handover. Only a channel that is still current may fail the session.
+        if (this.peer !== peer || ![
+          this.controlChannel, this.keyboardChannel, this.pointerChannel,
+        ].includes(channel)) return;
+        this.releaseAll();
+        this.updateChannelReadiness();
+        if (!this.stopped) this.fail(REMOTE_DESKTOP_TERMINAL_REASON.PEER_FAILED);
+      });
+    }
+    control.addEventListener('message', (event) => this.handleData(event.data));
+    control.addEventListener('open', () => {
+      this.sendControl({
+        type: REMOTE_DESKTOP_DATA_MSG.CONTROL,
+        ...this.inputBase(),
+        kind: REMOTE_DESKTOP_CONTROL_KIND.HELLO,
+      });
     });
   }
 
