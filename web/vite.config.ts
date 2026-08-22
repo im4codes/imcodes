@@ -15,7 +15,7 @@ const webBuildId = process.env.WEB_BUILD_ID
     .digest('hex')
     .slice(0, 12);
 
-export default defineConfig({
+export default defineConfig(({ mode }) => ({
   define: {
     __BUILD_TIME__: JSON.stringify(buildTime),
     __WEB_BUILD_ID__: JSON.stringify(webBuildId),
@@ -59,6 +59,21 @@ export default defineConfig({
     outDir: 'dist',
     target: 'es2020',
     rollupOptions: {
+      // Fixture harness entry is added ONLY for the dedicated fixtures build
+      // (`vite build --mode fixtures`, see the `build:fixtures` npm script).
+      // The real deploy build (`npm run build`, mode=production) must never
+      // emit it — the chat-timeline browser harness is test infrastructure,
+      // not shipped product surface. `vite build` defaults `mode` to
+      // 'production', so this is a no-op change for every existing build
+      // command.
+      ...(mode === 'fixtures'
+        ? {
+          input: {
+            main: path.resolve(__dirname, 'index.html'),
+            'chat-timeline-fixture': path.resolve(__dirname, 'src/fixtures/chat-timeline/index.html'),
+          },
+        }
+        : {}),
       output: {
         manualChunks(id) {
           if (!id.includes('node_modules')) return undefined;
@@ -86,4 +101,4 @@ export default defineConfig({
       },
     },
   },
-});
+}));

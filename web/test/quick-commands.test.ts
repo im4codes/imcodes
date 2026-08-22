@@ -34,12 +34,13 @@ describe('slash command suggestions', () => {
 });
 
 describe('quick phrase suggestions', () => {
-  it('opens only when an exclamation mark is the first composer character', () => {
-    expect(matchQuickPhraseTrigger('!')).toBe('');
-    expect(matchQuickPhraseTrigger('!err')).toBe('err');
-    expect(matchQuickPhraseTrigger('please !err')).toBeNull();
-    expect(matchQuickPhraseTrigger(' !err')).toBeNull();
-    expect(matchQuickPhraseTrigger('!err\nnext')).toBeNull();
+  it('opens only when a hash is the first composer character', () => {
+    expect(matchQuickPhraseTrigger('#')).toBe('');
+    expect(matchQuickPhraseTrigger('#err')).toBe('err');
+    expect(matchQuickPhraseTrigger('please #err')).toBeNull();
+    expect(matchQuickPhraseTrigger(' #err')).toBeNull();
+    expect(matchQuickPhraseTrigger('#err\nnext')).toBeNull();
+    expect(matchQuickPhraseTrigger('!err')).toBeNull();
   });
 
   it('combines built-in and custom phrases with case-insensitive filtering and deduplication', () => {

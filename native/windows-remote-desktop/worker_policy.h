@@ -220,21 +220,6 @@ struct DisplaySelectionCandidate {
   bool imcodes_virtual = false;
 };
 
-/**
- * Whether a DXGI output represents a desktop that Windows is actually
- * presenting to a monitor target.
- *
- * A disconnected GPU output can remain `AttachedToDesktop` and continue to
- * yield Desktop Duplication frames even though EnumDisplayDevices reports no
- * monitor beneath the source. DWM may then omit DirectComposition surfaces,
- * producing a deceptively live but incomplete desktop. Treat that
- * half-headless source as unavailable so initial preparation requests the
- * in-box virtual display. The exact IM.codes virtual display is allowed while
- * its monitor target is still settling after activation.
- */
-bool DisplayOutputIsPresentable(bool imcodes_virtual,
-                                bool has_active_monitor_target);
-
 // Prefers the still-available selected real display. If the selected output is
 // the exact IM.codes headless display and a real output appears, prefer a real
 // primary/available output. Returns candidates.size() when none is usable.

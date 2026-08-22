@@ -542,7 +542,7 @@
     "stop_appended_queue": "Сообщения из очереди добавлены; сессия продолжает работу.",
     "send_placeholder": "Отправить в {{name}}…",
     "send_placeholder_desktop_upload": "{{placeholder}} Поддерживается быстрая загрузка нескольких файлов вставкой или перетаскиванием",
-    "send_placeholder_desktop_shortcuts": "{{placeholder}}\n/ команды · ! фразы · @ файлы/агенты · ; псевдонимы · ^ узлы · вставка/перетаскивание файлов",
+    "send_placeholder_desktop_shortcuts": "{{placeholder}}\n/ команды · # фразы · @ файлы/агенты · ; псевдонимы · ^ узлы · вставка/перетаскивание файлов",
     "composer_target_label": "Отправка в",
     "composer_target_aria": "Получатель сообщения: {{name}}",
     "actions": "Действия с сессией",

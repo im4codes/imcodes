@@ -421,6 +421,214 @@ describe('remote desktop worker artifact and IPC host', () => {
     expect([...capabilityBytes]).toEqual(new Array(capabilityBytes.length).fill(0));
   });
 
+  it('kills and reports a worker that never completes PREPARE, so the panel can retry', async () => {
+    const temp = await mkdtemp(join(tmpdir(), 'imcodes-rd-host-prepare-watchdog-'));
+    cleanup.push(() => rm(temp, { recursive: true, force: true }));
+    const pipePath = join(temp, 'worker.sock');
+    const received: RemoteDesktopDaemonMessage[] = [];
+    const terminated: number[] = [];
+    const timedOut = vi.fn();
+    let helper: net.Socket | null = null;
+    const host = new RemoteDesktopWorkerHost((message) => received.push(message), {
+      ...trustedHostOptions,
+      platform: 'win32',
+      artifact,
+      pipePath,
+      allowPipeClients: () => {},
+      prepareReadyTimeoutMs: 20,
+      terminateProcess: (pid) => terminated.push(pid),
+      onPrepareTimeout: timedOut,
+      launch: (_executable, argsLine) => {
+        const args = quotedArgs(argsLine);
+        const nonce = args[3]!;
+        helper = net.createConnection(pipePath, () => {
+          helper!.write(`${JSON.stringify({
+            type: REMOTE_DESKTOP_WORKER_HELLO_TYPE,
+            ipcVersion: REMOTE_DESKTOP_WORKER_IPC_VERSION,
+            nonce,
+            pid: 91,
+          })}\n`);
+        });
+      },
+    });
+    cleanup.push(() => { host.close(); helper?.destroy(); });
+
+    await expect(host.handle({
+      type: REMOTE_DESKTOP_MSG.PREPARE,
+      requestId,
+      sessionId,
+      capability,
+      expiresAt: Date.now() + 60_000,
+      leaseExpiresAt: Date.now() + 15_000,
+      daemonGeneration: 7,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW,
+      inputEpoch: 0,
+      iceServers: [],
+    })).resolves.toBe(true);
+
+    // Do not write MODE_STATE: this models a D3D/DXGI call wedging the native
+    // signaling thread before it can read the browser's OFFER or STOP.
+    await vi.waitFor(() => expect(received).toEqual([
+      expect.objectContaining({
+        type: REMOTE_DESKTOP_MSG.TERMINAL,
+        requestId,
+        sessionId,
+        reason: REMOTE_DESKTOP_TERMINAL_REASON.WORKER_FAILED,
+      }),
+    ]), { timeout: 1_000 });
+    expect(terminated).toEqual([91]);
+    expect(timedOut).toHaveBeenCalledTimes(1);
+    const tracked = (host as unknown as { tracked: Map<string, unknown> }).tracked;
+    expect(tracked.size).toBe(0);
+  });
+
+  it('does not arm a late PREPARE watchdog after an immediate MODE_STATE', async () => {
+    const temp = await mkdtemp(join(tmpdir(), 'imcodes-rd-host-prepare-ready-'));
+    cleanup.push(() => rm(temp, { recursive: true, force: true }));
+    const pipePath = join(temp, 'worker.sock');
+    const received: RemoteDesktopDaemonMessage[] = [];
+    const terminated: number[] = [];
+    let helper: net.Socket | null = null;
+    let buffered = '';
+    const host = new RemoteDesktopWorkerHost((message) => received.push(message), {
+      ...trustedHostOptions,
+      platform: 'win32',
+      artifact,
+      pipePath,
+      allowPipeClients: () => {},
+      prepareReadyTimeoutMs: 20,
+      terminateProcess: (pid) => terminated.push(pid),
+      launch: (_executable, argsLine) => {
+        const nonce = quotedArgs(argsLine)[3]!;
+        helper = net.createConnection(pipePath, () => {
+          helper!.write(`${JSON.stringify({
+            type: REMOTE_DESKTOP_WORKER_HELLO_TYPE,
+            ipcVersion: REMOTE_DESKTOP_WORKER_IPC_VERSION,
+            nonce,
+            pid: 92,
+          })}\n`);
+        });
+        helper.setEncoding('utf8');
+        helper.on('data', (chunk) => {
+          buffered += String(chunk);
+          if (!buffered.includes('\n')) return;
+          buffered = '';
+          helper!.write(`${JSON.stringify({
+            type: REMOTE_DESKTOP_MSG.MODE_STATE,
+            requestId,
+            sessionId,
+            capability,
+            mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW,
+            inputEpoch: 0,
+            reason: REMOTE_DESKTOP_MODE_REASON.INITIAL,
+          })}\n`);
+        });
+      },
+    });
+    cleanup.push(() => { host.close(); helper?.destroy(); });
+
+    await expect(host.handle({
+      type: REMOTE_DESKTOP_MSG.PREPARE,
+      requestId,
+      sessionId,
+      capability,
+      expiresAt: Date.now() + 60_000,
+      leaseExpiresAt: Date.now() + 15_000,
+      daemonGeneration: 7,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW,
+      inputEpoch: 0,
+      iceServers: [],
+    })).resolves.toBe(true);
+    await vi.waitFor(() => expect(received).toEqual([
+      expect.objectContaining({ type: REMOTE_DESKTOP_MSG.MODE_STATE, sessionId }),
+    ]));
+    await new Promise<void>((resolve) => setTimeout(resolve, 60));
+    expect(terminated).toEqual([]);
+  });
+
+  it('recycles the authenticated worker when PREPARE completes but OFFER never gets an ANSWER', async () => {
+    const temp = await mkdtemp(join(tmpdir(), 'imcodes-rd-host-offer-watchdog-'));
+    cleanup.push(() => rm(temp, { recursive: true, force: true }));
+    const pipePath = join(temp, 'worker.sock');
+    const received: RemoteDesktopDaemonMessage[] = [];
+    const terminated: number[] = [];
+    const timedOut = vi.fn();
+    let helper: net.Socket | null = null;
+    let buffered = '';
+    const host = new RemoteDesktopWorkerHost((message) => received.push(message), {
+      ...trustedHostOptions,
+      platform: 'win32',
+      artifact,
+      pipePath,
+      allowPipeClients: () => {},
+      offerAnswerTimeoutMs: 20,
+      terminateProcess: (pid) => terminated.push(pid),
+      onOfferTimeout: timedOut,
+      launch: (_executable, argsLine) => {
+        const nonce = quotedArgs(argsLine)[3]!;
+        helper = net.createConnection(pipePath, () => {
+          helper!.write(`${JSON.stringify({
+            type: REMOTE_DESKTOP_WORKER_HELLO_TYPE,
+            ipcVersion: REMOTE_DESKTOP_WORKER_IPC_VERSION,
+            nonce,
+            pid: 93,
+          })}\n`);
+        });
+        helper.setEncoding('utf8');
+        helper.on('data', (chunk) => {
+          buffered += String(chunk);
+          const lines = buffered.split('\n');
+          buffered = lines.pop() ?? '';
+          for (const line of lines) {
+            const command = JSON.parse(line) as { type: string };
+            if (command.type !== REMOTE_DESKTOP_MSG.PREPARE) continue;
+            helper!.write(`${JSON.stringify({
+              type: REMOTE_DESKTOP_MSG.MODE_STATE,
+              requestId,
+              sessionId,
+              capability,
+              mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW,
+              inputEpoch: 0,
+              reason: REMOTE_DESKTOP_MODE_REASON.INITIAL,
+            })}\n`);
+          }
+        });
+      },
+    });
+    cleanup.push(() => { host.close(); helper?.destroy(); });
+
+    await expect(host.handle({
+      type: REMOTE_DESKTOP_MSG.PREPARE,
+      requestId,
+      sessionId,
+      capability,
+      expiresAt: Date.now() + 60_000,
+      leaseExpiresAt: Date.now() + 15_000,
+      daemonGeneration: 7,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW,
+      inputEpoch: 0,
+      iceServers: [],
+    })).resolves.toBe(true);
+    await vi.waitFor(() => expect(received).toContainEqual(
+      expect.objectContaining({ type: REMOTE_DESKTOP_MSG.MODE_STATE, sessionId }),
+    ));
+    await expect(host.handle({
+      type: REMOTE_DESKTOP_MSG.OFFER,
+      requestId,
+      sessionId,
+      capability,
+      sdp: 'v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n',
+    })).resolves.toBe(true);
+
+    await vi.waitFor(() => expect(received).toContainEqual(expect.objectContaining({
+      type: REMOTE_DESKTOP_MSG.TERMINAL,
+      sessionId,
+      reason: REMOTE_DESKTOP_TERMINAL_REASON.WORKER_FAILED,
+    })), { timeout: 1_000 });
+    expect(terminated).toEqual([93]);
+    expect(timedOut).toHaveBeenCalledTimes(1);
+  });
+
   it('replaces a worker that answers PREPARE with protected_desktop, exactly once', async () => {
     const temp = await mkdtemp(join(tmpdir(), 'imcodes-rd-host-desktop-'));
     cleanup.push(() => rm(temp, { recursive: true, force: true }));

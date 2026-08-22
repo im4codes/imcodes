@@ -53,6 +53,8 @@ class FakePeerConnection extends EventTarget {
   static onDataChannel: ((channel: FakeDataChannel, value: unknown) => void) | null = null;
   static selectedCandidateType = 'host';
   static keepConnectingAfterAnswer = false;
+  /** How long a newly created data channel takes to report `open`. */
+  static channelOpenDelayMs = 0;
   remoteDescription: RTCSessionDescription | null = null;
   connectionState: RTCPeerConnectionState = 'new';
   channels: FakeDataChannel[] = [];
@@ -67,7 +69,13 @@ class FakePeerConnection extends EventTarget {
     const channel = new FakeDataChannel(label);
     this.channels.push(channel);
     channel.onSend = (value) => FakePeerConnection.onDataChannel?.(channel, value);
-    queueMicrotask(() => channel.open());
+    // A LAN channel opens as good as immediately; a relayed one has to finish
+    // ICE checks and a DTLS handshake first, which is what the delay models.
+    if (FakePeerConnection.channelOpenDelayMs > 0) {
+      setTimeout(() => channel.open(), FakePeerConnection.channelOpenDelayMs);
+    } else {
+      queueMicrotask(() => channel.open());
+    }
     return channel as unknown as RTCDataChannel;
   }
 
@@ -85,7 +93,10 @@ class FakePeerConnection extends EventTarget {
       this.dispatchEvent(new Event('connectionstatechange'));
     }
   }
-  async addIceCandidate(): Promise<void> {}
+  addedCandidates: RTCIceCandidateInit[] = [];
+  async addIceCandidate(candidate?: RTCIceCandidateInit): Promise<void> {
+    if (candidate) this.addedCandidates.push(candidate);
+  }
   async getStats(): Promise<RTCStatsReport> {
     return new Map([
       ['selected-pair', {
@@ -120,7 +131,7 @@ function controlBinding(message: Record<string, unknown>) {
 
 function createWs(
   capabilities: string[],
-  mode: 'success' | 'operation_failure' | 'hold' | 'authorized_hold' | 'status_committed' | 'terminal_committed' | 'ack_then_late_terminal' | 'download_hold_rebind' | 'download_size_mismatch' | 'error_after_expiry' = 'success',
+  mode: 'success' | 'operation_failure' | 'lease_signal_failure' | 'hold' | 'authorized_hold' | 'status_committed' | 'terminal_committed' | 'ack_then_late_terminal' | 'download_hold_rebind' | 'download_size_mismatch' | 'error_after_expiry' | 'drop_first_lease_ready' = 'success',
   leaseTiming: { readyDelayMs?: number; idleWindowMs?: number; terminalDelayMs?: number; rebindDaemonGeneration?: number } = {},
 ) {
   const handlers = new Set<(message: ServerMessage) => void>();
@@ -258,6 +269,7 @@ function createWs(
     send: (message: Record<string, unknown>) => {
       sent.push(message);
       if (message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_INIT) {
+        if (++leaseInitCount === 1 && mode === 'drop_first_lease_ready') return;
         // The idle deadline is issued at LEASE_INIT, not when the browser
         // receives the delayed READY. This makes the test catch a browser
         // implementation that incorrectly starts a fresh five-minute timer
@@ -277,10 +289,21 @@ function createWs(
           expiresAt: issuedAt + 10 * 60_000,
           iceServers: [],
         });
-        if (++leaseInitCount === 1 && leaseTiming.readyDelayMs) setTimeout(respond, leaseTiming.readyDelayMs);
+        if (leaseInitCount === 1 && leaseTiming.readyDelayMs) setTimeout(respond, leaseTiming.readyDelayMs);
         else queueMicrotask(respond);
       } else if (message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_OFFER) {
-        queueMicrotask(() => emit({ ...message, type: DIRECT_FILE_TRANSFER_MSG.LEASE_ANSWER, sdp: 'daemon-lease-answer' }));
+        if (mode === 'lease_signal_failure') {
+          queueMicrotask(() => emit({
+            type: DIRECT_FILE_TRANSFER_MSG.ERROR,
+            protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+            scope: DIRECT_FILE_TRANSFER_ERROR_SCOPE.LEASE,
+            requestId: message.requestId,
+            error: DIRECT_FILE_TRANSFER_ERROR.STALE_DAEMON_GENERATION,
+            retryable: true,
+          }));
+        } else {
+          queueMicrotask(() => emit({ ...message, type: DIRECT_FILE_TRANSFER_MSG.LEASE_ANSWER, sdp: 'daemon-lease-answer' }));
+        }
       } else if (message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_REBIND) {
         queueMicrotask(() => emit({
           type: DIRECT_FILE_TRANSFER_MSG.LEASE_REBOUND,
@@ -371,6 +394,7 @@ describe('direct file transfer v2 browser broker', () => {
     FakePeerConnection.instances = [];
     FakePeerConnection.selectedCandidateType = 'host';
     FakePeerConnection.keepConnectingAfterAnswer = false;
+    FakePeerConnection.channelOpenDelayMs = 0;
     vi.stubGlobal('RTCPeerConnection', FakePeerConnection);
     apiMocks.uploadFile.mockResolvedValue({
       ok: true,
@@ -424,6 +448,21 @@ describe('direct file transfer v2 browser broker', () => {
     expect(peer.channels.some((channel) => channel.label.startsWith('imcodes-op-'))).toBe(true);
   });
 
+  it('retries lease initialization when the first READY is lost after daemon preparation', async () => {
+    vi.useFakeTimers();
+    const { uploadFileDirect } = await import('../src/direct-file-transfer.js');
+    const { ws, sent } = createWs(directCapabilities, 'drop_first_lease_ready');
+    const upload = uploadFileDirect(ws, createUploadFile('retry.txt', 'retry'), id(), undefined, undefined, undefined, undefined, 'server-1');
+
+    await vi.advanceTimersByTimeAsync(
+      DIRECT_FILE_TRANSFER_LIMITS.NEGOTIATION_TIMEOUT_MS + DIRECT_FILE_TRANSFER_LIMITS.RETRY_BACKOFF_MS[0] + 1_000,
+    );
+
+    await expect(upload).resolves.toMatchObject({ attachment: { id: 'direct-attachment' } });
+    expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_INIT)).toHaveLength(2);
+    expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_OFFER)).toHaveLength(1);
+  });
+
   it('prewarms one lease-only peer and reuses it for two uploads without authority in SDP/ICE', async () => {
     const { prewarmDirectFileLease, uploadFileDirect } = await import('../src/direct-file-transfer.js');
     const { ws, sent } = createWs(directCapabilities);
@@ -451,6 +490,159 @@ describe('direct file transfer v2 browser broker', () => {
       expect(message).not.toHaveProperty('previewHandle');
       expect(message).not.toHaveProperty('sessionName');
     }
+    release?.();
+  });
+
+  it('opens a relayed data channel that needs longer than the signalling budget', async () => {
+    // A phone on a carrier network reaches the daemon through TURN. The
+    // allocation, permission, connectivity checks and DTLS handshake routinely
+    // outlast the eight seconds a signalling round trip needs, and reusing that
+    // budget here is what made every relayed transfer time out while the same
+    // build worked on a LAN.
+    const { uploadFileDirect } = await import('../src/direct-file-transfer.js');
+    FakePeerConnection.channelOpenDelayMs = 12_000;
+    expect(FakePeerConnection.channelOpenDelayMs)
+      .toBeGreaterThan(DIRECT_FILE_TRANSFER_LIMITS.NEGOTIATION_TIMEOUT_MS);
+    expect(FakePeerConnection.channelOpenDelayMs)
+      .toBeLessThan(DIRECT_FILE_TRANSFER_LIMITS.CHANNEL_OPEN_TIMEOUT_MS);
+
+    vi.useFakeTimers();
+    try {
+      const { ws } = createWs(directCapabilities);
+      const bytes = new TextEncoder().encode('relayed');
+      const file = {
+        name: 'relayed.txt',
+        type: 'text/plain',
+        size: bytes.byteLength,
+        slice: (start: number, end: number) => ({ arrayBuffer: async () => bytes.slice(start, end).buffer }),
+      } as unknown as File;
+
+      const upload = uploadFileDirect(ws, file, id(), undefined, undefined, undefined, undefined, 'server-1');
+      const settled = vi.fn();
+      void upload.then(() => settled('resolved'), () => settled('rejected'));
+
+      await vi.advanceTimersByTimeAsync(DIRECT_FILE_TRANSFER_LIMITS.NEGOTIATION_TIMEOUT_MS + 500);
+      expect(settled).not.toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(FakePeerConnection.channelOpenDelayMs);
+      await expect(upload).resolves.toBeDefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('abandons a data channel as soon as the peer reports failed, without spending the open budget', async () => {
+    // The long open budget is only affordable because a path that cannot work
+    // says so immediately. If this wait ignored the peer state it would hold
+    // every doomed transfer for the full window before a retry or HTTP was
+    // allowed, which is why the assertion is about how soon the next attempt
+    // begins rather than about the upload's eventual outcome.
+    const { uploadFileDirect } = await import('../src/direct-file-transfer.js');
+    FakePeerConnection.channelOpenDelayMs = 10 * DIRECT_FILE_TRANSFER_LIMITS.CHANNEL_OPEN_TIMEOUT_MS;
+
+    vi.useFakeTimers();
+    try {
+      const { ws } = createWs(directCapabilities);
+      const bytes = new TextEncoder().encode('doomed');
+      const file = {
+        name: 'doomed.txt',
+        type: 'text/plain',
+        size: bytes.byteLength,
+        slice: (start: number, end: number) => ({ arrayBuffer: async () => bytes.slice(start, end).buffer }),
+      } as unknown as File;
+
+      const upload = uploadFileDirect(ws, file, id(), undefined, undefined, undefined, undefined, 'server-1');
+      // Nothing here awaits the upload itself: with every channel held shut it
+      // only settles after the whole retry budget, which is not what is
+      // under test. Swallow it so the rejection is not unhandled.
+      upload.catch(() => undefined);
+
+      // vi.waitFor cannot be used here: it polls on real time while the clock
+      // driving this flow is fake, so it would starve rather than wait.
+      for (let tick = 0; tick < 200; tick++) {
+        if ((FakePeerConnection.instances.at(-1)?.channels.length ?? 0) > 1) break;
+        await vi.advanceTimersByTimeAsync(10);
+      }
+      const peer = FakePeerConnection.instances.at(-1)!;
+      expect(peer.channels.length).toBeGreaterThan(1);
+      const channelsBefore = FakePeerConnection.instances
+        .reduce((total, instance) => total + instance.channels.length, 0);
+
+      peer.connectionState = 'failed';
+      peer.dispatchEvent(new Event('connectionstatechange'));
+
+      // Well inside the open budget the attempt must already have been given
+      // up and the next one begun — a retry reuses the peer with an ICE
+      // restart, so the observable is a freshly allocated channel.
+      await vi.advanceTimersByTimeAsync(DIRECT_FILE_TRANSFER_LIMITS.NEGOTIATION_TIMEOUT_MS);
+      const channelsAfter = FakePeerConnection.instances
+        .reduce((total, instance) => total + instance.channels.length, 0);
+      expect(channelsAfter).toBeGreaterThan(channelsBefore);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('accepts a daemon ICE candidate that arrives after the answer', async () => {
+    // Host candidates come from local interfaces and arrive with the answer; a
+    // server-reflexive candidate costs a STUN round trip and a relay candidate
+    // a TURN allocation, so both land later. Dropping them left the remote peer
+    // holding nothing but private addresses, which a LAN can route and a phone
+    // cannot — the connection then failed with no visible cause.
+    const { prewarmDirectFileLease } = await import('../src/direct-file-transfer.js');
+    const { ws, sent, emit } = createWs(directCapabilities);
+    const release = prewarmDirectFileLease(ws, 'server-1');
+
+    await vi.waitFor(() => expect(sent.some((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_OFFER)).toBe(true));
+    const offer = sent.find((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_OFFER)!;
+    // The answer must already be applied: this pins what happens *after* it.
+    await vi.waitFor(() => expect(FakePeerConnection.instances.at(-1)?.remoteDescription).toBeTruthy());
+
+    const relay = 'candidate:11 1 UDP 1046015 43.248.99.95 49201 typ relay raddr 0.0.0.0 rport 0';
+    emit({
+      type: DIRECT_FILE_TRANSFER_MSG.LEASE_ICE,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      serverId: offer.serverId,
+      browserTabId: offer.browserTabId,
+      leaseId: offer.leaseId,
+      leaseGeneration: offer.leaseGeneration,
+      daemonGeneration: offer.daemonGeneration,
+      requestId: offer.requestId,
+      candidate: relay,
+      mid: '0',
+    });
+
+    await vi.waitFor(() => expect(FakePeerConnection.instances.at(-1)!.addedCandidates)
+      .toContainEqual(expect.objectContaining({ candidate: relay })));
+
+    // And it must survive an operation. Every transfer waits on its own control
+    // messages; if that shared wait tore the ICE subscription down, the daemon's
+    // late candidates would start being dropped again from the first upload on
+    // — which is precisely the state this fix exists to prevent.
+    const { uploadFileDirect } = await import('../src/direct-file-transfer.js');
+    const bytes = new TextEncoder().encode('after');
+    await uploadFileDirect(ws, {
+      name: 'after.txt',
+      type: 'text/plain',
+      size: bytes.byteLength,
+      slice: (start: number, end: number) => ({ arrayBuffer: async () => bytes.slice(start, end).buffer }),
+    } as unknown as File, id(), undefined, undefined, undefined, undefined, 'server-1');
+
+    const srflx = 'candidate:10 1 UDP 1678767871 124.90.108.198 55944 typ srflx raddr 0.0.0.0 rport 0';
+    emit({
+      type: DIRECT_FILE_TRANSFER_MSG.LEASE_ICE,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      serverId: offer.serverId,
+      browserTabId: offer.browserTabId,
+      leaseId: offer.leaseId,
+      leaseGeneration: offer.leaseGeneration,
+      daemonGeneration: offer.daemonGeneration,
+      requestId: offer.requestId,
+      candidate: srflx,
+      mid: '0',
+    });
+    await vi.waitFor(() => expect(FakePeerConnection.instances.at(-1)!.addedCandidates)
+      .toContainEqual(expect.objectContaining({ candidate: srflx })));
     release?.();
   });
 
@@ -698,6 +890,26 @@ describe('direct file transfer v2 browser broker', () => {
     } finally {
       random.mockRestore();
       timeout.mockRestore();
+    }
+  }, 10_000);
+
+  it('falls back once after three retryable lease-signal races instead of multiplying lease retries', async () => {
+    const { uploadFileWithDirectFallback } = await import('../src/direct-file-transfer.js');
+    const { ws, sent } = createWs(directCapabilities, 'lease_signal_failure');
+    const file = new File(['retry'], 'retry.txt', { type: 'text/plain' });
+    const random = vi.spyOn(Math, 'random').mockReturnValue(0);
+    try {
+      await expect(uploadFileWithDirectFallback({ ws, serverId: 'server-1', file })).resolves.toMatchObject({
+        attachment: { id: 'relay-attachment' },
+      });
+      // The first direct attempt initializes the lease. Each of the three
+      // bounded transport attempts offers against that same matching lease;
+      // after the shared budget the normal HTTP upload is invoked exactly once.
+      expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_INIT)).toHaveLength(1);
+      expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_OFFER)).toHaveLength(3);
+      expect(apiMocks.uploadFile).toHaveBeenCalledTimes(1);
+    } finally {
+      random.mockRestore();
     }
   }, 10_000);
 

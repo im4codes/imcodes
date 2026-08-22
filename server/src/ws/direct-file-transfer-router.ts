@@ -752,13 +752,21 @@ export class DirectFileTransferRouter {
 
   private forwardLeaseSignal(socket: WebSocket, userId: string, message: LeaseBrowserSignal): void {
     const lease = this.leases.get(message.leaseId);
+    // Keep ownership and lease identity fail-closed: a different browser, user,
+    // server, tab, or lease generation must never learn whether a daemon peer
+    // exists.  A matching lease that is merely between PREPARE/REBIND is a
+    // transport race, however.  Reporting that as invalid_authority made the
+    // browser treat a recoverable renegotiation as terminal and skip its
+    // documented retry-then-HTTP fallback.
     if (!lease || lease.socket !== socket || lease.userId !== userId
-      || !lease.prepared || lease.needsRebind
       || message.serverId !== this.hooks.serverId()
       || message.browserTabId !== lease.browserTabId
-      || message.leaseGeneration !== lease.leaseGeneration
-      || message.daemonGeneration !== lease.daemonGeneration) {
+      || message.leaseGeneration !== lease.leaseGeneration) {
       this.sendLeaseError(socket, message.requestId, DIRECT_FILE_TRANSFER_ERROR.INVALID_AUTHORITY, false);
+      return;
+    }
+    if (!lease.prepared || lease.needsRebind || message.daemonGeneration !== lease.daemonGeneration) {
+      this.sendLeaseError(socket, message.requestId, DIRECT_FILE_TRANSFER_ERROR.STALE_DAEMON_GENERATION, true);
       return;
     }
     if (!this.hooks.sendDaemon(message as unknown as Record<string, unknown>, lease.daemonGeneration)) {

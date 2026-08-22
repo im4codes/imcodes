@@ -13,6 +13,10 @@
     "typecheck:legacy": "tsc6 --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
+    "build:fixtures": "vite build --mode fixtures --outDir dist-fixtures --emptyOutDir",
+    "serve:fixtures": "vite preview --outDir dist-fixtures --port 4300 --strictPort",
+    "test:browser:install": "playwright install --with-deps chromium",
+    "test:browser:perf": "playwright test --project=performance",
     "postinstall": "npx patch-package"
   },
   "dependencies": {
@@ -66,6 +70,7 @@
   "devDependencies": {
     "@aparajita/capacitor-biometric-auth": "^7.0.0",
     "@capacitor/cli": "^8.2.0",
+    "@playwright/test": "1.62.1",
     "@preact/preset-vite": "^2.10.6",
     "@testing-library/preact": "^3.2.4",
     "@types/codemirror": "^5.60.17",

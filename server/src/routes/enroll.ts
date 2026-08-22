@@ -1049,6 +1049,25 @@ enrollRoutes.get('/v2/node-artifact', async (c) => {
   }
   const v = await artifactCatalog.ensureVerified(dir, artifactTarget.os, artifactTarget.arch);
   if (!v.ok) return c.json({ error: 'executable_not_built', os: artifactTarget.os, arch: artifactTarget.arch }, 503);
+  if (artifactTarget.os === CONTROLLED_NODE_OS_WIN && artifactTarget.arch === 'x64') {
+    // Old deployed upgraders download the main executable first and used to
+    // treat a missing worker as optional. Refuse to publish the executable
+    // until the complete same-version Windows release unit is available, so
+    // those clients cannot converge the Node version while leaving stale media
+    // sidecars behind.
+    const workerRelease = await openRemoteDesktopWorkerArtifact(
+      dir,
+      CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER_MANIFEST,
+    );
+    if (!workerRelease) {
+      return c.json({ error: 'remote_desktop_worker_not_built', os: artifactTarget.os, arch: artifactTarget.arch }, 503);
+    }
+    const workerVersionMatches = workerRelease.version === v.descriptor.version;
+    await workerRelease.close();
+    if (!workerVersionMatches) {
+      return c.json({ error: 'windows_release_version_mismatch' }, 503);
+    }
+  }
   await artifactCatalog.persistDescriptor(c.env.DB as Database, v.descriptor).catch(() => {});
   const opened = await artifactCatalog.openPinned(dir, v.descriptor);
   if (!opened) {

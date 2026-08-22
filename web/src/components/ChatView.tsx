@@ -835,6 +835,69 @@ export function __resetMergedToolEventCacheForTests(): void {
  * unreliable here (the count moves for unrelated reasons and stays flat when the
  * memo does miss), so the property is asserted directly on the objects.
  */
+/**
+ * Presentation items for the tail of a conversation, derived from a bounded
+ * window of events.
+ *
+ * `buildViewItems` is O(events) and runs on every update — a streamed chunk, a
+ * new message. In an 8,000-row session that was measured at 3.0ms per update
+ * and rising linearly, which is most of what made a long session feel worse
+ * than a short one. Almost all of it is waste: the renderer only ever shows the
+ * last `wantItems` of what it derives.
+ *
+ * The window is grown until it yields enough items or reaches the beginning, so
+ * the caller always gets at least what it asked for when the history can supply
+ * it. `windowStartIndex` tells the caller whether anything was left out, which
+ * is what "there is more to show locally" is decided from.
+ *
+ * Boundary effects are real and deliberately tolerated: a tool result whose
+ * call fell outside the window cannot merge with it, and an assistant block cut
+ * by the window edge starts short. Both land in the OLDEST items of the window,
+ * and the caller renders the newest `wantItems` — so the margin below is what
+ * keeps them off screen.
+ */
+interface DerivedViewTail {
+  items: ViewItem[];
+  /** Where the window started in `events`; 0 means the whole history. */
+  windowStartIndex: number;
+}
+
+/** Extra items derived beyond what the caller shows, absorbing window-edge artefacts. */
+const VIEW_TAIL_MARGIN_ITEMS = 24;
+/** First guess at events-per-item. Tool groups collapse many events into one. */
+const VIEW_TAIL_EVENTS_PER_ITEM = 4;
+
+function buildViewItemsTail(
+  events: TimelineEvent[],
+  showToolCalls: boolean,
+  wantItems: number,
+): DerivedViewTail {
+  const target = wantItems + VIEW_TAIL_MARGIN_ITEMS;
+  let windowSize = Math.min(events.length, Math.max(target * VIEW_TAIL_EVENTS_PER_ITEM, 200));
+  for (;;) {
+    const startIndex = Math.max(0, events.length - windowSize);
+    const items = buildViewItems(startIndex === 0 ? events : events.slice(startIndex), showToolCalls);
+    // Enough, or there is nothing older to widen into.
+    if (items.length >= target || startIndex === 0) {
+      return { items, windowStartIndex: startIndex };
+    }
+    // A tool-heavy stretch can collapse hundreds of events into a handful of
+    // items, so widening by a constant factor rather than a constant count.
+    windowSize = Math.min(events.length, windowSize * 4);
+  }
+}
+
+/** Test seam for the windowed derivation; production goes through the memo. */
+export function __buildViewItemsTailForTests(
+  events: TimelineEvent[],
+  showToolCalls: boolean,
+  wantItems: number,
+): { items: ViewItem[]; windowStartIndex: number } {
+  return buildViewItemsTail(events, showToolCalls, wantItems);
+}
+
+
+
 export function __buildViewItemsForTests(events: TimelineEvent[], showToolCalls: boolean): ViewItem[] {
   return buildViewItems(events, showToolCalls);
 }
@@ -2133,13 +2196,57 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
       : events),
     [preview, events],
   );
-  const viewItems = useMemo(() => buildViewItems(sourceEvents, showToolCalls), [sourceEvents, showToolCalls]);
-  const finalVisibleEventIds = useMemo(
-    () => getFinalVisibleEventIds(sourceEvents, showToolCalls),
-    [sourceEvents, showToolCalls],
-  );
   const effectiveRenderLimit = preview ? PREVIEW_RENDER_ITEM_LIMIT : renderItemLimit;
-  const hiddenRenderedItemCount = Math.max(0, viewItems.length - effectiveRenderLimit);
+  // Derived from a window of recent events, not the whole session: the renderer
+  // only ever shows `effectiveRenderLimit` items, and deriving thousands to
+  // discard all but a hundred was the largest per-update cost in a long
+  // conversation. See `buildViewItemsTail`.
+  const derivedTail = useMemo(
+    () => buildViewItemsTail(sourceEvents, showToolCalls, effectiveRenderLimit),
+    [sourceEvents, showToolCalls, effectiveRenderLimit],
+  );
+  const viewItems = derivedTail.items;
+  /** Loaded history the derivation window left out entirely. */
+  const hasOlderOutsideWindow = derivedTail.windowStartIndex > 0;
+  /**
+   * Finalized visible events, scanned over the same window.
+   *
+   * This feeds the unread badge, and the badge only ever asks about the recent
+   * end: a message finalized thousands of turns ago cannot become news.
+   * Scanning everything meant filtering every event, building a map of every
+   * event ID and walking it again on every streamed chunk.
+   *
+   * Widening the window later would make old messages look newly finalized, so
+   * the effect below absorbs them as already-counted instead.
+   */
+  const finalVisibleEventIds = useMemo(
+    () => getFinalVisibleEventIds(
+      derivedTail.windowStartIndex === 0
+        ? sourceEvents
+        : sourceEvents.slice(derivedTail.windowStartIndex),
+      showToolCalls,
+    ),
+    [sourceEvents, showToolCalls, derivedTail.windowStartIndex],
+  );
+  const previousWindowStartRef = useRef(derivedTail.windowStartIndex);
+  useEffect(() => {
+    const previous = previousWindowStartRef.current;
+    previousWindowStartRef.current = derivedTail.windowStartIndex;
+    if (derivedTail.windowStartIndex >= previous) return;
+    // The window grew backwards — revealing older history, not receiving it.
+    // Counting those as arrivals would make the unread badge jump every time
+    // the reader scrolled up.
+    const counted = countedFinalEventIdsRef.current;
+    for (const eventId of finalVisibleEventIds) counted.add(eventId);
+  }, [derivedTail.windowStartIndex, finalVisibleEventIds]);
+  // Items the reader could see but is not being shown: the ones the window
+  // holds beyond the cap, plus — if the window itself stopped short — whatever
+  // is older than it. The exact count of the latter is unknown by design; the
+  // reveal path only needs to know whether there is more.
+  const hiddenInsideWindow = Math.max(0, viewItems.length - effectiveRenderLimit);
+  const hiddenRenderedItemCount = hasOlderOutsideWindow
+    ? Math.max(1, hiddenInsideWindow)
+    : hiddenInsideWindow;
   const renderedViewItems = useMemo(
     () => (hiddenRenderedItemCount > 0 ? viewItems.slice(-effectiveRenderLimit) : viewItems),
     [hiddenRenderedItemCount, effectiveRenderLimit, viewItems],
@@ -2190,7 +2297,17 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
       || item.event?.eventId === pendingPinnedLocate.eventId
       || item.eventIds?.includes(pendingPinnedLocate.eventId)
     ));
-    if (targetItemIndex < 0) return undefined;
+    if (targetItemIndex < 0) {
+      // The event is in the session but older than the derivation window, so it
+      // has no presentation item yet. Widening the render limit widens the
+      // window with it, and this effect re-runs on the rebuilt list — without
+      // this the navigation would silently do nothing for any message older
+      // than the window, which is precisely the ones a pin is used for.
+      if (hasOlderOutsideWindow) {
+        setRenderItemLimit((current) => current + CHAT_RENDER_ITEM_INCREMENT);
+      }
+      return undefined;
+    }
     const targetDomEventId = viewItems[targetItemIndex]!.key;
     // The renderer is tail-limited. Reveal only enough tail items to include
     // the target instead of mounting a previously expanded 2,000-item history

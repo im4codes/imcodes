@@ -542,7 +542,7 @@
     "stop_appended_queue": "Los mensajes en cola se añadieron; la sesión sigue en ejecución.",
     "send_placeholder": "Enviar a {{name}}…",
     "send_placeholder_desktop_upload": "{{placeholder}} Admite carga rápida pegando o arrastrando varios archivos",
-    "send_placeholder_desktop_shortcuts": "{{placeholder}}\n/ comandos · ! frases · @ archivos/agentes · ; alias · ^ nodos · pega o arrastra archivos",
+    "send_placeholder_desktop_shortcuts": "{{placeholder}}\n/ comandos · # frases · @ archivos/agentes · ; alias · ^ nodos · pega o arrastra archivos",
     "composer_target_label": "Enviando a",
     "composer_target_aria": "Destino del mensaje: {{name}}",
     "actions": "Acciones de sesión",

@@ -64,3 +64,8 @@ tmp/
 
 docs/
 dist-node-exe
+
+# Chat-timeline performance harness: build output and Playwright run artifacts.
+web/dist-fixtures/
+web/test-results/
+web/playwright-report/

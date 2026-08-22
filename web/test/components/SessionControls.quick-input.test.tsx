@@ -382,7 +382,7 @@ describe('SessionControls quick input integration', () => {
     expect(container.querySelector('.controls-machine-picker')).toBeNull();
   });
 
-  it('filters built-in and user quick phrases from a leading exclamation mark', () => {
+  it('filters built-in and user quick phrases from a leading hash', () => {
     const ws = {
       connected: true,
       send: vi.fn(),
@@ -414,7 +414,7 @@ describe('SessionControls quick input integration', () => {
     );
 
     const input = screen.getByRole('textbox');
-    input.textContent = '!err';
+    input.textContent = '#err';
     fireEvent.input(input);
     expect(container.querySelector('[data-quick-phrase="check errors"]')).toBeTruthy();
     expect(container.querySelector('[data-quick-phrase="inspect errors"]')).toBeTruthy();
@@ -425,6 +425,10 @@ describe('SessionControls quick input integration', () => {
     expect(input.textContent).toBe('inspect errors');
     expect(container.querySelector('.controls-slash-picker')).toBeNull();
     expect(ws.sendSessionCommand).not.toHaveBeenCalled();
+
+    input.textContent = '!err';
+    fireEvent.input(input);
+    expect(container.querySelector('.controls-slash-picker')).toBeNull();
   });
 
   it('does not open command or phrase suggestions when the trigger is not the first character', () => {
@@ -453,7 +457,7 @@ describe('SessionControls quick input integration', () => {
     fireEvent.input(input);
     expect(container.querySelector('.controls-slash-picker')).toBeNull();
 
-    input.textContent = 'text !err';
+    input.textContent = 'text #err';
     fireEvent.input(input);
     expect(container.querySelector('.controls-slash-picker')).toBeNull();
   });
