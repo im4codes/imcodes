@@ -299,8 +299,8 @@ describe('ClaudeCodeSdkProvider', () => {
     expect(run.options.resume).toBeUndefined();
     expect(run.options.includePartialMessages).toBe(true);
     expect(run.options.permissionMode).toBe('bypassPermissions');
-    expect(run.options.settings).toMatchObject({ workflowSizeGuideline: 'small' });
-    expect(run.options.appendSubagentSystemPrompt).toContain('Do not spawn additional subagents');
+    expect(run.options.settings).toBeUndefined();
+    expect(run.options.appendSubagentSystemPrompt).toBeUndefined();
     // Native scheduling tools are disabled so the agent uses our imcodes-memory
     // MCP cron instead of creating claude.ai routines via RemoteTrigger.
     expect(run.options.disallowedTools).toContain('RemoteTrigger');
@@ -2073,7 +2073,7 @@ describe('ClaudeCodeSdkProvider', () => {
     await provider.endSession('route-local-bash-task');
   });
 
-  it('does not wake a retained parent for child Bash completions while a real agent is still active', async () => {
+  it('routes recursive task lifecycle to its direct parent instead of the main session', async () => {
     vi.useFakeTimers();
     sdkMock.setWaitForClose(true);
     let finishAgent!: (message: unknown) => void;
@@ -2082,8 +2082,25 @@ describe('ClaudeCodeSdkProvider', () => {
       { type: 'system', subtype: 'init', session_id: 'session-nested-bash', model: 'claude-sonnet-4-6' },
       {
         type: 'system', subtype: 'task_started', session_id: 'session-nested-bash',
+        task_id: 'agent-research-1', tool_use_id: 'agent-tool-1', task_type: 'local_agent', spawn_depth: 1,
+        description: 'Research buyers',
+      },
+      // This tool block came from inside agent-research-1. Its subsequent
+      // local_bash lifecycle is owned by that agent even though local_bash
+      // messages do not carry spawn_depth themselves.
+      {
+        type: 'stream_event', session_id: 'session-nested-bash', parent_tool_use_id: 'agent-tool-1',
+        event: { type: 'content_block_start', index: 4, content_block: { type: 'tool_use', id: 'bash-tool-1', name: 'Bash', input: {} } },
+      },
+      {
+        type: 'system', subtype: 'task_started', session_id: 'session-nested-bash',
         task_id: 'bash-search-1', tool_use_id: 'bash-tool-1', task_type: 'local_bash',
         description: 'Run one child search',
+      },
+      {
+        type: 'system', subtype: 'task_started', session_id: 'session-nested-bash',
+        task_id: 'agent-grandchild-1', tool_use_id: 'agent-tool-2', task_type: 'local_agent', spawn_depth: 2,
+        description: 'Grandchild research',
       },
       {
         type: 'assistant', session_id: 'session-nested-bash', parent_tool_use_id: null,
@@ -2093,13 +2110,9 @@ describe('ClaudeCodeSdkProvider', () => {
         type: 'system', subtype: 'task_notification', session_id: 'session-nested-bash',
         task_id: 'bash-search-1', status: 'completed', summary: 'Child search complete',
       },
-      // The SDK can register the owning agent after the detached Bash terminal
-      // was observed. The fallback timer must re-evaluate ownership rather than
-      // trusting that earlier ordering and waking the parent once per command.
       {
-        type: 'system', subtype: 'task_started', session_id: 'session-nested-bash',
-        task_id: 'agent-research-1', tool_use_id: 'agent-tool-1', task_type: 'local_agent',
-        description: 'Research buyers',
+        type: 'system', subtype: 'task_notification', session_id: 'session-nested-bash',
+        task_id: 'agent-grandchild-1', status: 'completed', summary: 'Grandchild complete',
       },
       agentTerminal,
     ]);
@@ -2112,6 +2125,8 @@ describe('ClaudeCodeSdkProvider', () => {
       cwd: '/tmp/project',
       resumeId: 'session-nested-bash',
     });
+    const tools: ToolCallEvent[] = [];
+    provider.onToolCall?.((_sid, tool) => tools.push(tool));
 
     const sendPromise = provider.send('route-nested-bash', 'deep research');
     await vi.advanceTimersByTimeAsync(0);
@@ -2128,6 +2143,9 @@ describe('ClaudeCodeSdkProvider', () => {
       retainedSubagentMode: true,
       currentQueryActive: true,
     });
+    expect(sdkSubagentTools(tools).map((tool) => tool.detail?.meta?.taskId)).toEqual([
+      'agent-research-1',
+    ]);
 
     finishAgent({
       type: 'system', subtype: 'task_notification', session_id: 'session-nested-bash',

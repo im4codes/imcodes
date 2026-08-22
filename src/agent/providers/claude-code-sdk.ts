@@ -83,11 +83,6 @@ const CLAUDE_AUTH_REFRESH_RETRY_LIMIT = 1;
 const DEFAULT_CLAUDE_AUTH_REFRESH_WAIT_MS = 2 * 60 * 1000;
 const DEFAULT_CLAUDE_AUTH_REFRESH_POLL_MS = 500;
 const CLAUDE_AUTH_RECOVERY_GUIDANCE = 'Authentication recovery required: run `/logout`, fully exit Claude Code, then reopen it and run `/login` before retrying.';
-const CLAUDE_DEFAULT_WORKFLOW_SIZE_GUIDELINE = 'small' as const;
-const CLAUDE_SUBAGENT_DELEGATION_GUIDANCE = [
-  'Complete the assigned subtask directly.',
-  'Do not spawn additional subagents or dynamic workflows; return the result to the parent agent.',
-].join(' ');
 const CLAUDE_SDK_INPUT_PRIORITIES = {
   NEXT_SAFE_BOUNDARY: 'next',
 } as const;
@@ -121,19 +116,6 @@ function getClaudeMcpServers(config: SessionConfig): Record<string, unknown> {
   };
 }
 
-function withDefaultClaudeWorkflowSize(
-  settings: string | Record<string, unknown> | undefined,
-): string | Record<string, unknown> {
-  if (typeof settings === 'string') return settings;
-  return {
-    ...settings,
-    // Claude's native default is "medium" (fewer than 15 agents). That is far
-    // too wide for an embedded chat session and, because agents can delegate
-    // recursively, can turn a small top-level fan-out into dozens of workers.
-    // Preserve an explicit user choice, but make the IM.codes default small.
-    workflowSizeGuideline: settings?.workflowSizeGuideline ?? CLAUDE_DEFAULT_WORKFLOW_SIZE_GUIDELINE,
-  };
-}
 const CLAUDE_RUNTIME_SUBAGENT_SYSTEM_SUBTYPES = new Set([
   'subagent_notification',
   'subagent_status',
@@ -216,6 +198,9 @@ interface ClaudeSdkSessionState {
   runtimeSubagentStartedAtByKey: Map<string, number>;
   emittedToolStates: Map<string, string>;
   subagentTasks: Map<string, ClaudeTaskState>;
+  /** Tool-use ids observed inside a subagent stream. Their lifecycle belongs
+   *  to that subagent, not to this session's foreground timeline. */
+  nestedClaudeToolUseIds: Set<string>;
   emittedSubagentStates: Map<string, string>;
   lastStatusSignature: string | null;
   /** Streaming-input channel for the live query (see SdkInputQueue). Lets a new
@@ -336,6 +321,8 @@ interface ClaudeTaskState {
   startedAtMs: number;
   lastUpdatedAt: number;
   parentWakeHandled?: boolean;
+  spawnDepth?: number;
+  nested: boolean;
 }
 
 const CLAUDE_LOCAL_BASH_TASK_TYPE = SDK_SUBAGENT_TASK_TYPES.LOCAL_BASH;
@@ -576,6 +563,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       runtimeSubagentStartedAtByKey: existing?.runtimeSubagentStartedAtByKey ?? new Map(),
       emittedToolStates: new Map(),
       subagentTasks: existing?.subagentTasks ?? new Map(),
+      nestedClaudeToolUseIds: existing?.nestedClaudeToolUseIds ?? new Set(),
       emittedSubagentStates: new Map(),
       lastStatusSignature: null,
     });
@@ -903,7 +891,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       forwardSubagentText: false,
       ...(startedAsResume ? { resume: state.resumeId } : { sessionId: state.resumeId }),
       ...(state.model ? { model: state.model } : {}),
-      settings: withDefaultClaudeWorkflowSize(state.settings),
+      ...(state.settings ? { settings: state.settings } : {}),
       ...(state.effort ? { effort: state.effort } : {}),
       mcpServers: getClaudeMcpServers({
         sessionKey: state.routeId,
@@ -917,11 +905,6 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       ...(baseSystemPrompt ? {
         appendSystemPrompt: baseSystemPrompt,
       } : {}),
-      // Dynamic-workflow size is advisory in the Claude SDK. Prevent the
-      // multiplicative case explicitly as well: top-level agents may split a
-      // task, but their children must execute their bounded assignment rather
-      // than recursively creating another research team.
-      appendSubagentSystemPrompt: CLAUDE_SUBAGENT_DELEGATION_GUIDANCE,
     };
     options.spawnClaudeCodeProcess = (req: { command: string; args: string[]; cwd?: string; env?: Record<string, string>; signal?: AbortSignal }) => {
       const child = spawn(req.command, req.args, {
@@ -1399,7 +1382,16 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
         // child WebFetch/Bash in the parent's timeline and could overwrite a
         // real foreground tool at the same index. Lifecycle snapshots are the
         // only public representation of child work.
-        if (msg.parent_tool_use_id != null) return;
+        if (msg.parent_tool_use_id != null) {
+          const nestedToolUseId = this.pickString(event.content_block.id);
+          if (nestedToolUseId) {
+            state.nestedClaudeToolUseIds.add(nestedToolUseId);
+            const nestedTask = [...state.subagentTasks.values()]
+              .find((task) => task.toolUseId === nestedToolUseId);
+            if (nestedTask) nestedTask.nested = true;
+          }
+          return;
+        }
         const tool = this.normalizeToolCall(event.content_block);
         state.toolCalls.set(event.index, { ...tool, partialInputJson: undefined });
         this.emitToolCall(sessionId, state, tool);
@@ -1944,9 +1936,21 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     task.taskType = this.pickShortString(msg.task_type) ?? task.taskType;
 
     const toolUseId = this.pickString(msg.tool_use_id);
-    if (toolUseId) task.toolUseId = toolUseId;
+    if (toolUseId) {
+      task.toolUseId = toolUseId;
+      if (state.nestedClaudeToolUseIds.has(toolUseId)) task.nested = true;
+    }
 
     if (msg.subtype === 'task_started') {
+      const spawnDepth = typeof msg.spawn_depth === 'number'
+        && Number.isInteger(msg.spawn_depth)
+        && msg.spawn_depth >= 1
+        ? msg.spawn_depth
+        : undefined;
+      if (spawnDepth !== undefined) {
+        task.spawnDepth = spawnDepth;
+        if (spawnDepth > 1) task.nested = true;
+      }
       task.description = this.pickShortString(msg.description) ?? task.description;
       task.model = this.readRuntimeSubagentModel(msg) ?? task.model;
       task.workflowName = this.pickShortString(msg.workflow_name) ?? task.workflowName;
@@ -1991,6 +1995,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
 
     if (task.terminal && !task.parentWakeHandled) {
       task.parentWakeHandled = true;
+      if (task.nested) return;
       const isNestedBashCompletion = task.taskType === CLAUDE_LOCAL_BASH_TASK_TYPE
         && this.hasActiveClaudeAgentTask(state);
       if (!isNestedBashCompletion && state.currentQuery && state.completed && state.retainedSubagentMode) {
@@ -2013,7 +2018,8 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
 
   private hasActiveClaudeAgentTask(state: ClaudeSdkSessionState): boolean {
     return [...state.subagentTasks.values()].some((task) => (
-      task.active
+      !task.nested
+      && task.active
       && !task.terminal
       && task.taskType !== CLAUDE_LOCAL_BASH_TASK_TYPE
     ));
@@ -2364,6 +2370,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       active: true,
       startedAtMs: Date.now(),
       lastUpdatedAt: Date.now(),
+      nested: false,
     };
   }
 
@@ -2419,12 +2426,17 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
    */
   private pruneTerminalSubagentTasks(state: ClaudeSdkSessionState): void {
     for (const [taskId, task] of state.subagentTasks) {
-      if (task.terminal || !task.active) state.subagentTasks.delete(taskId);
+      if (task.terminal || !task.active) {
+        state.subagentTasks.delete(taskId);
+        if (task.toolUseId) state.nestedClaudeToolUseIds.delete(task.toolUseId);
+      }
     }
   }
 
   private activeClaudeSubagentTasks(state: ClaudeSdkSessionState): ClaudeTaskState[] {
-    return Array.from(state.subagentTasks.values()).filter((task) => task.active && !task.terminal);
+    return Array.from(state.subagentTasks.values()).filter((task) => (
+      !task.nested && task.active && !task.terminal
+    ));
   }
 
   /**
@@ -2646,6 +2658,12 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     state: ClaudeSdkSessionState,
     task: ClaudeTaskState,
   ): void {
+    // Claude reports the whole recursive workflow on one SDK iterator. Only a
+    // depth-1 task is owned by this session; depth>1 tasks and tools observed
+    // inside a child stream belong to that child's private transcript. Claude
+    // already routes their final result to their direct parent, so projecting
+    // them here duplicates ownership and floods the main conversation.
+    if (task.nested) return;
     const isBashTask = task.taskType === CLAUDE_LOCAL_BASH_TASK_TYPE;
     const summary = sanitizeSdkSubagentText(task.summary) ?? (isBashTask ? 'Claude Bash task' : 'Claude task');
     const meta = this.buildClaudeSubagentMeta(state, task);
