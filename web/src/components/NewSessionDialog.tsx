@@ -206,6 +206,7 @@ export function NewSessionDialog({
     setError("");
     setPresetError("");
     if (enabled) {
+      if (!ccPreset && ccPresets.length > 0) setCcPreset(ccPresets[0].name);
       if (!CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(agentType)) {
         setLastUnlockedAgentType(agentType);
         setAgentType("claude-code-sdk");
@@ -413,15 +414,6 @@ export function NewSessionDialog({
     if (!ccPreset && ccPresets.length > 0) setCcPreset(ccPresets[0].name);
   }, [agentType, ccPreset, ccPresets, customProviderSdk]);
 
-  // If the selected transport can't act as a custom-provider layer, clear
-  // the checkbox (and its preset) so the UI doesn't carry stale state.
-  useEffect(() => {
-    if (!CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(agentType) && customProviderSdk) {
-      setCustomProviderSdk(false);
-      setCcPreset("");
-    }
-  }, [agentType, customProviderSdk]);
-
   const handleStart = () => {
     if (!project.trim()) {
       setError(t("new_session.project_required"));
@@ -538,6 +530,11 @@ export function NewSessionDialog({
               ? OPENCLAW_THINKING_LEVELS
               : [];
   const supportsCcPreset = CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(agentType);
+  // The third-party SDK switch is a launch mode, not an attribute of the
+  // currently highlighted card. Keep its controls mounted while the mode
+  // transition selects a compatible transport so users can always enter or
+  // leave the mode from any model/provider selection.
+  const showCcPresetControls = customProviderSdk || supportsCcPreset;
   const providerPresetLabel = customProviderSdk
     ? t("new_session.custom_provider_preset")
     : agentType === "qwen"
@@ -763,8 +760,7 @@ export function NewSessionDialog({
            * on parent .form-group width (which is correctly responsive
            * via `.dialog`'s width:100%; max-width:calc(100vw - ...)`).
            */}
-          {supportsCcPreset && (
-            <div style={{ marginTop: 10 }}>
+          <div style={{ marginTop: 10 }}>
               <label
                 style={{
                   display: "flex",
@@ -818,8 +814,7 @@ export function NewSessionDialog({
               >
                 {t("new_session.custom_provider_sdk_help")}
               </div>
-            </div>
-          )}
+          </div>
           {agentFlavor && (
             <div
               style={{
@@ -931,7 +926,7 @@ export function NewSessionDialog({
         )}
 
         {/* CC env preset selector + editor */}
-        {supportsCcPreset && (
+        {showCcPresetControls && (
           <>
             <div class="form-group">
               <label

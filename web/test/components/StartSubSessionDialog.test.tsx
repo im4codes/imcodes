@@ -439,6 +439,54 @@ describe('StartSubSessionDialog', () => {
     }));
   });
 
+  it('opens third-party API selection from an incompatible sub-session agent and keeps the switch mounted', async () => {
+    const onStart = vi.fn();
+    const ws = makeWs();
+    ws.onMessage.mockImplementation((handler: (msg: unknown) => void) => {
+      handler({
+        type: 'cc.presets.list_response',
+        presets: [
+          { name: 'Provider A', env: { ANTHROPIC_MODEL: 'a-model' }, defaultModel: 'a-model' },
+          { name: 'Provider B', env: { ANTHROPIC_MODEL: 'b-model' }, defaultModel: 'b-model' },
+        ],
+      });
+      return () => {};
+    });
+
+    render(
+      <StartSubSessionDialog
+        ws={ws as any}
+        defaultCwd="/tmp"
+        isProviderConnected={() => false}
+        getRemoteSessions={() => []}
+        refreshSessions={vi.fn()}
+        onStart={onStart}
+        onClose={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /codex_sdk/i }));
+    const toggle = screen.getByLabelText(/custom_provider_sdk/i) as HTMLInputElement;
+    expect(toggle.checked).toBe(false);
+    fireEvent.click(toggle);
+
+    const presetSelect = await waitFor(() => {
+      const candidate = (screen.getAllByRole('combobox') as HTMLSelectElement[])
+        .find((select) => Array.from(select.options).some((option) => option.value === 'Provider B'));
+      expect(candidate).toBeDefined();
+      expect((screen.getByLabelText(/custom_provider_sdk/i) as HTMLInputElement).checked).toBe(true);
+      return candidate!;
+    });
+    fireEvent.input(presetSelect, { target: { value: 'Provider B' } });
+    fireEvent.click(screen.getByRole('button', { name: /^pi$/i }));
+    fireEvent.click(screen.getByRole('button', { name: /launch/i }));
+
+    expect(onStart).toHaveBeenCalledWith('pi', undefined, '/tmp', undefined, expect.objectContaining({
+      ccPreset: 'Provider B',
+      requestedModel: 'b-model',
+    }));
+  });
+
   it('shows a toast when qwen sub-session preset JSON is copied to the clipboard', async () => {
     const clipboardWriteText = vi.fn().mockResolvedValue(undefined);
     Object.defineProperty(navigator, 'clipboard', {

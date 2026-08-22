@@ -137,6 +137,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
     setCustomProviderSdk(enabled);
     setPresetError('');
     if (enabled) {
+      if (!ccPreset && ccPresets.length > 0) setCcPreset(ccPresets[0].name);
       if (!CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(type)) {
         setLastUnlockedType(type);
         setType('claude-code-sdk');
@@ -297,6 +298,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
             ? OPENCLAW_THINKING_LEVELS
             : [];
   const supportsCcPreset = type === 'claude-code' || CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(type);
+  const showCcPresetControls = customProviderSdk || supportsCcPreset;
   const providerPresetLabel = customProviderSdk
     ? t('new_session.custom_provider_preset')
     : type === 'qwen'
@@ -579,7 +581,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
           )}
 
           {/* CC env preset selector + editor */}
-          {supportsCcPreset && (
+          {showCcPresetControls && (
             <>
               <div>
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>

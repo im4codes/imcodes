@@ -562,6 +562,34 @@ describe('NewSessionDialog', () => {
     }));
   });
 
+  it('keeps the third-party SDK switch available from every agent selection', async () => {
+    const ws = makeWs();
+    ws.onMessage.mockImplementation((handler: (msg: unknown) => void) => {
+      handler({
+        type: 'cc.presets.list_response',
+        presets: [{
+          name: 'MiniMax',
+          env: { ANTHROPIC_MODEL: 'MiniMax-M2.7' },
+          defaultModel: 'MiniMax-M2.7',
+        }],
+      });
+      return () => {};
+    });
+
+    render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
+    selectAgent('codex-sdk');
+
+    const toggle = screen.getByLabelText(/custom_provider_sdk/i) as HTMLInputElement;
+    expect(toggle.checked).toBe(false);
+    fireEvent.click(toggle);
+
+    await waitFor(() => {
+      expect(getAgentButton('claude-code-sdk').getAttribute('aria-pressed')).toBe('true');
+      expect(screen.getByText('custom_provider_preset')).toBeDefined();
+      expect((screen.getByLabelText(/custom_provider_sdk/i) as HTMLInputElement).checked).toBe(true);
+    });
+  });
+
   it('resets the model when switching third-party provider presets even if catalogs overlap', async () => {
     const ws = makeWs();
     ws.onMessage.mockImplementation((handler: (msg: unknown) => void) => {
