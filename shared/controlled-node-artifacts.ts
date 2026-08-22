@@ -99,6 +99,9 @@ export const CONTROLLED_NODE_MINT_ERRORS = {
 /** Controlled node runtime self-upgrade artifact endpoint (node-token authenticated). */
 export const CONTROLLED_NODE_ARTIFACT_UPGRADE_PATH = '/api/enroll/v2/node-artifact' as const;
 
+/** HTTP content coding used for on-the-fly controlled-node artifact downloads. */
+export const CONTROLLED_NODE_ARTIFACT_COMPRESSION_ENCODING = 'gzip' as const;
+
 export const CONTROLLED_NODE_ARTIFACT_ASSETS = {
   NODE: 'node',
   COMPUTER_USE_HELPER: 'computer-use-helper',

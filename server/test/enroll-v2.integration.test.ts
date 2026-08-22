@@ -14,6 +14,7 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach, vi } from 'vitest';
 import { Hono } from 'hono';
 import { randomBytes, createHash } from 'node:crypto';
+import { gunzipSync } from 'node:zlib';
 import { mkdtemp, writeFile, mkdir, rm, readdir, rename, symlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -28,9 +29,16 @@ import {
 } from '../src/services/controlled-node-artifact-catalog.js';
 import { NODE_ROLE, decodeEnrollmentTrailer, decodeEnrollmentTrailerWithRange } from '../../shared/remote-exec.js';
 import { inspectWindowsAuthenticodeEnrollmentContainer } from '../../shared/windows-authenticode-enrollment.js';
-import { EXPECTED_USER_ID_HEADER } from '../../shared/http-header-names.js';
+import {
+  ACCEPT_ENCODING_HEADER,
+  CONTENT_ENCODING_HEADER,
+  EXPECTED_USER_ID_HEADER,
+} from '../../shared/http-header-names.js';
 import { AUTH_IDENTITY_ERRORS } from '../../shared/auth-identity.js';
-import { CONTROLLED_NODE_ARTIFACT_HEADERS } from '../../shared/controlled-node-artifacts.js';
+import {
+  CONTROLLED_NODE_ARTIFACT_COMPRESSION_ENCODING,
+  CONTROLLED_NODE_ARTIFACT_HEADERS,
+} from '../../shared/controlled-node-artifacts.js';
 import {
   REMOTE_DESKTOP_LEGACY_UPGRADE_PROTOCOL_VERSION,
   REMOTE_DESKTOP_WORKER_FILENAME,
@@ -45,6 +53,7 @@ const sha256 = (value: string | Buffer) => createHash('sha256').update(value).di
 let exeDir: string;
 let artifactCatalog: ArtifactCatalog;
 const FAKE_BINARY = Buffer.from('IMCODES_FAKE_EXECUTABLE_BINARY_v1');
+const COMPRESSIBLE_FAKE_BINARY = Buffer.alloc(4096, 0x41);
 function fakeSignedWindowsPe(): Buffer {
   const certificateOffset = 512;
   const certificateSize = 16;
@@ -170,6 +179,7 @@ beforeEach(async () => {
       await rm(join(exeDir, e), { recursive: true, force: true });
     }
   }
+  await writeFile(join(exeDir, 'imcodes-node-linux'), FAKE_BINARY);
   await writeManifest('imcodes-node-linux', 'linux', 'x64');
   await writeFile(join(exeDir, 'imcodes-node.exe'), FAKE_WINDOWS_SIGNED_PE);
   await writeManifest('imcodes-node.exe', 'win32', 'x64', FAKE_WINDOWS_SIGNED_PE);
@@ -552,6 +562,37 @@ describe('POST /api/enroll/v2/ticket (artifact manifest → enrollments_v2 row)'
 // ─────────────────────────── GET /v2/download ───────────────────────────
 
 describe('GET|POST /api/enroll/v2/download (ticket + streaming)', () => {
+  it('gzip-encodes the personalized stream on demand without changing the downloaded executable', async () => {
+    const app = buildApp();
+    await writeFile(join(exeDir, 'imcodes-node-linux'), COMPRESSIBLE_FAKE_BINARY);
+    await writeManifest('imcodes-node-linux', 'linux', 'x64', COMPRESSIBLE_FAKE_BINARY);
+    const userId = `u_${hex(4)}`;
+    await createUser(db, userId);
+    const o = await owner(userId);
+    const mint = await app.request('/api/enroll/v2/ticket', {
+      method: 'POST',
+      headers: ticketHeaders(userId, o),
+      body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
+    });
+    expect(mint.status).toBe(200);
+    const { ticket } = await mint.json() as { ticket: string };
+
+    const response = await app.request('/api/enroll/v2/download', {
+      headers: {
+        authorization: `Bearer ${ticket}`,
+        [ACCEPT_ENCODING_HEADER]: CONTROLLED_NODE_ARTIFACT_COMPRESSION_ENCODING,
+      },
+    });
+    expect(response.status).toBe(200);
+    expect(response.headers.get(CONTENT_ENCODING_HEADER)).toBe(CONTROLLED_NODE_ARTIFACT_COMPRESSION_ENCODING);
+    expect(response.headers.get('content-length')).toBeNull();
+    expect(response.headers.get('vary')).toContain(ACCEPT_ENCODING_HEADER);
+
+    const downloaded = gunzipSync(Buffer.from(await response.arrayBuffer()));
+    expect(downloaded.subarray(0, COMPRESSIBLE_FAKE_BINARY.length)).toEqual(COMPRESSIBLE_FAKE_BINARY);
+    expect(decodeEnrollmentTrailer(downloaded)?.serverUrl).toBe('http://localhost');
+  });
+
   it('personalizes a signed Windows PE inside its certificate table and preserves reversible signed bytes', async () => {
     const app = buildApp();
     const userId = `u_${hex(4)}`;
@@ -1602,6 +1643,35 @@ describe('GET /api/enroll/v2/availability + retention', () => {
 // ─────────────────────────── GET /v2/node-artifact ───────────────────────────
 
 describe('GET /api/enroll/v2/node-artifact (controlled-node self-upgrade)', () => {
+  it('gzip-encodes self-upgrade bytes on demand while retaining decoded size and digest metadata', async () => {
+    const app = buildApp();
+    await writeFile(join(exeDir, 'imcodes-node-linux'), COMPRESSIBLE_FAKE_BINARY);
+    await writeManifest('imcodes-node-linux', 'linux', 'x64', COMPRESSIBLE_FAKE_BINARY);
+    const userId = `u_${hex(4)}`;
+    await createUser(db, userId);
+    const token = hex(16);
+    const serverId = hex(8);
+    await db.execute(
+      `INSERT INTO servers (id, user_id, name, token_hash, status, created_at, node_role, exec_enabled, os, arch)
+       VALUES ($1, $2, 'controlled-linux', $3, 'online', $4, $5, TRUE, 'linux', 'x64')`,
+      [serverId, userId, sha256(token), Date.now(), NODE_ROLE.CONTROLLED],
+    );
+
+    const response = await app.request(`/api/enroll/v2/node-artifact?serverId=${serverId}&os=linux&arch=x64`, {
+      headers: {
+        authorization: `Bearer ${token}`,
+        [ACCEPT_ENCODING_HEADER]: CONTROLLED_NODE_ARTIFACT_COMPRESSION_ENCODING,
+      },
+    });
+    expect(response.status).toBe(200);
+    expect(response.headers.get(CONTENT_ENCODING_HEADER)).toBe(CONTROLLED_NODE_ARTIFACT_COMPRESSION_ENCODING);
+    expect(response.headers.get('content-length')).toBeNull();
+    expect(response.headers.get('vary')).toContain(ACCEPT_ENCODING_HEADER);
+    expect(response.headers.get(CONTROLLED_NODE_ARTIFACT_HEADERS.SIZE_BYTES)).toBe(String(COMPRESSIBLE_FAKE_BINARY.length));
+    expect(response.headers.get(CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256)).toBe(sha256(COMPRESSIBLE_FAKE_BINARY));
+    expect(gunzipSync(Buffer.from(await response.arrayBuffer()))).toEqual(COMPRESSIBLE_FAKE_BINARY);
+  });
+
   it('streams the bare pinned artifact to an authenticated controlled node', async () => {
     const app = buildApp();
     const userId = `u_${hex(4)}`;
