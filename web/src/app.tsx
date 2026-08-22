@@ -3033,16 +3033,18 @@ export function App() {
   // re-mounts all of them in one render pass — which is why reloading to escape
   // a frozen tab just freezes it again. Mount them one frame at a time instead;
   // the work is the same, but it becomes interruptible (see useProgressiveMount
-  // for the measurements). Window stacking comes from explicit z-index values,
-  // never DOM order, so the focused window can safely jump the queue and paint
-  // in the first frame.
+  // for the measurements).
+  //
+  // Keep this array in the stable visible-sub-session order. Stacking is owned
+  // exclusively by the explicit z-index stack above. Moving the focused keyed
+  // window to the front of this array also moves its live DOM node; Blink and
+  // WebKit then re-run scroll anchoring/compositing for both chat scrollers,
+  // which makes the window losing focus visibly jump even though Preact keeps
+  // the component instance alive.
   const openWindowSubs = useMemo(() => {
-    const open = visibleSubSessions.filter((sub) => openSubIds.has(sub.id)
+    return visibleSubSessions.filter((sub) => openSubIds.has(sub.id)
       && (isMobile || !pinnedPanels.some((p) => p.type === 'subsession' && p.props?.sessionName === sub.sessionName)));
-    const focusedIndex = open.findIndex((sub) => sub.id === focusedSubId);
-    if (focusedIndex <= 0) return open;
-    return [open[focusedIndex], ...open.slice(0, focusedIndex), ...open.slice(focusedIndex + 1)];
-  }, [visibleSubSessions, openSubIds, isMobile, pinnedPanels, focusedSubId]);
+  }, [visibleSubSessions, openSubIds, isMobile, pinnedPanels]);
   const mountedWindowCount = useProgressiveMount(openWindowSubs.length);
   const defaultViewMode: ViewMode = isMobile ? 'chat' : 'terminal';
   // Per-session view mode: Record<sessionName, ViewMode>

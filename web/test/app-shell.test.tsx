@@ -2196,10 +2196,9 @@ describe('App shell', () => {
     fireEvent.click(screen.getByText('subbar-open-sub-3'));
 
     // The just-opened sub-3 is active; the earlier two are open but inactive.
-    // Windows mount one animation frame apart (useProgressiveMount), and the
-    // focused one jumps the queue, so wait for all three to exist before
-    // comparing their active flags — otherwise this races the mount schedule
-    // rather than testing it.
+    // Windows mount one animation frame apart (useProgressiveMount), so wait
+    // for all three to exist before comparing their active flags — otherwise
+    // this races the mount schedule rather than testing it.
     await waitFor(() => {
       expect(screen.getByTestId('sub-session-window-sub-1')).toBeTruthy();
       expect(screen.getByTestId('sub-session-window-sub-2')).toBeTruthy();
@@ -2208,12 +2207,20 @@ describe('App shell', () => {
     expect(screen.getByTestId('sub-session-window-sub-1').getAttribute('data-active')).toBe('false');
     expect(screen.getByTestId('sub-session-window-sub-2').getAttribute('data-active')).toBe('false');
 
-    // Re-activating an older window flips active over to it (and only it).
+    const windowDomOrder = () => screen.getAllByTestId(/^sub-session-window-sub-/)
+      .map((node) => node.getAttribute('data-testid'));
+    const orderBeforeFocusChange = windowDomOrder();
+
+    // Re-activating an older window flips active over to it (and only it), but
+    // must not move either live window in the DOM. Reordering keyed siblings
+    // makes Blink/WebKit re-anchor the chat scrollers and visibly jolts the
+    // window that just lost focus.
     fireEvent.mouseDown(screen.getByTestId('sub-session-window-sub-1'));
     await waitFor(() => {
       expect(screen.getByTestId('sub-session-window-sub-1').getAttribute('data-active')).toBe('true');
     });
     expect(screen.getByTestId('sub-session-window-sub-3').getAttribute('data-active')).toBe('false');
+    expect(windowDomOrder()).toEqual(orderBeforeFocusChange);
   }, 20_000);
 
   it('executes app-level shell callbacks and websocket message reducers', async () => {
