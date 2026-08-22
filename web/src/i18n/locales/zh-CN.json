@@ -542,7 +542,7 @@
     "stop_appended_queue": "已追加队列消息，本次未停止会话。",
     "send_placeholder": "发送到 {{name}}…",
     "send_placeholder_desktop_upload": "{{placeholder}} 支持多文件粘贴或拖拽快速上传",
-    "send_placeholder_desktop_shortcuts": "{{placeholder}}\n/ 命令 · ! 短语 · @ 文件/Agent · ; 别名 · ^ 受控节点 · 可粘贴或拖入文件",
+    "send_placeholder_desktop_shortcuts": "{{placeholder}}\n/ 命令 · # 短语 · @ 文件/Agent · ; 别名 · ^ 受控节点 · 可粘贴或拖入文件",
     "composer_target_label": "发送至",
     "composer_target_aria": "消息将发送至 {{name}}",
     "actions": "会话操作",

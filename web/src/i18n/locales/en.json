@@ -542,7 +542,7 @@
     "stop_appended_queue": "Queued messages appended; the session is still running.",
     "send_placeholder": "Send to {{name}}…",
     "send_placeholder_desktop_upload": "{{placeholder}} Supports fast multi-file paste or drag upload",
-    "send_placeholder_desktop_shortcuts": "{{placeholder}}\n/ commands · ! phrases · @ files/agents · ; aliases · ^ nodes · paste or drag files",
+    "send_placeholder_desktop_shortcuts": "{{placeholder}}\n/ commands · # phrases · @ files/agents · ; aliases · ^ nodes · paste or drag files",
     "composer_target_label": "Sending to",
     "composer_target_aria": "Message target: {{name}}",
     "actions": "Session actions",

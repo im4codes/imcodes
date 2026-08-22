@@ -105,7 +105,7 @@ vi.mock('react-i18next', () => ({
         return `${String(opts?.placeholder ?? '')} Supports fast multi-file paste or drag upload`;
       }
       if (key === 'session.send_placeholder_desktop_shortcuts') {
-        return `${String(opts?.placeholder ?? '')}\n/ commands · ! phrases · @ files/agents · ; aliases · ^ nodes · paste or drag files`;
+        return `${String(opts?.placeholder ?? '')}\n/ commands · # phrases · @ files/agents · ; aliases · ^ nodes · paste or drag files`;
       }
       if (key === 'session.composer_target_label') return 'Sending to';
       if (key === 'session.composer_target_aria') {
@@ -845,7 +845,7 @@ afterEach(() => {
   it('shows shortcut triggers and the upload hint on the second desktop placeholder line', () => {
     Object.defineProperty(window, 'innerWidth', { configurable: true, value: DEFAULT_INNER_WIDTH });
     render(<SessionControls ws={makeWs() as any} activeSession={makeSession({ name: 'my-session' })} quickData={makeQuickData() as any} />);
-    expect(document.querySelector('.controls-input')?.getAttribute('data-placeholder')).toBe('Send to my-project…\n/ commands · ! phrases · @ files/agents · ; aliases · ^ nodes · paste or drag files');
+    expect(document.querySelector('.controls-input')?.getAttribute('data-placeholder')).toBe('Send to my-project…\n/ commands · # phrases · @ files/agents · ; aliases · ^ nodes · paste or drag files');
   });
 
   it('keeps the placeholder short on mobile', () => {
@@ -985,7 +985,7 @@ afterEach(() => {
         quickData={makeQuickData() as any}
       />,
     );
-    expect(document.querySelector('.controls-input')?.getAttribute('data-placeholder')).toBe('Send to my-project…\n/ commands · ! phrases · @ files/agents · ; aliases · ^ nodes · paste or drag files');
+    expect(document.querySelector('.controls-input')?.getAttribute('data-placeholder')).toBe('Send to my-project…\n/ commands · # phrases · @ files/agents · ; aliases · ^ nodes · paste or drag files');
   });
 
   it('hides the send button on mobile and shows the embedded voice button when empty', () => {

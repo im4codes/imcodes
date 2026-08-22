@@ -73,9 +73,9 @@ export function matchSlashCommandTrigger(text: string): string | null {
   return match ? match[1] : null;
 }
 
-/** Match a quick phrase query only when `!` is the first composer character. */
+/** Match a quick phrase query only when `#` is the first composer character. */
 export function matchQuickPhraseTrigger(text: string): string | null {
-  const match = /^!([^\r\n]*)$/u.exec(text);
+  const match = /^#([^\r\n]*)$/u.exec(text);
   return match ? match[1] : null;
 }
 
