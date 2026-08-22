@@ -512,14 +512,6 @@ function waitForControl<T extends DirectFileTransferServerMessage>(
       else resolve(message!);
     };
     const onAbort = () => finish(directError(DIRECT_FILE_TRANSFER_ERROR.CANCELED, false));
-    // This subscription must outlive the answer. Host candidates come from
-    // local interfaces and arrive at once, but a server-reflexive candidate
-    // costs a STUN round trip and a relay candidate a TURN allocation, so both
-    // land well after the answer has been applied. Unsubscribing there dropped
-    // exactly the candidates a relayed path depends on, leaving the remote peer
-    // with nothing but unroutable private addresses — which is why a LAN
-    // connected and a phone never could.
-    lease.leaseIceOff?.();
     const off = lease.ws.onMessage((raw) => {
       const message = parseMatchingControl(raw, requestId);
       if (!message) return;
@@ -746,6 +738,14 @@ async function ensureLeasePeer(lease: Lease): Promise<void> {
       ),
       DIRECT_FILE_TRANSFER_LIMITS.NEGOTIATION_TIMEOUT_MS,
     );
+    // This subscription must outlive the answer. Host candidates come from
+    // local interfaces and arrive at once, but a server-reflexive candidate
+    // costs a STUN round trip and a relay candidate a TURN allocation, so both
+    // land well after the answer has been applied. Unsubscribing there dropped
+    // exactly the candidates a relayed path depends on, leaving the remote peer
+    // with nothing but unroutable private addresses — which is why a LAN
+    // connected and a phone never could.
+    lease.leaseIceOff?.();
     const off = lease.ws.onMessage((raw) => {
       const message = parseMatchingControl(raw, requestId);
       if (!message || message.type !== DIRECT_FILE_TRANSFER_MSG.LEASE_ICE || !leaseSignalMatches(message, lease, requestId)) return;

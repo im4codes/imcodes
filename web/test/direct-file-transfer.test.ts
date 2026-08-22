@@ -614,6 +614,35 @@ describe('direct file transfer v2 browser broker', () => {
 
     await vi.waitFor(() => expect(FakePeerConnection.instances.at(-1)!.addedCandidates)
       .toContainEqual(expect.objectContaining({ candidate: relay })));
+
+    // And it must survive an operation. Every transfer waits on its own control
+    // messages; if that shared wait tore the ICE subscription down, the daemon's
+    // late candidates would start being dropped again from the first upload on
+    // — which is precisely the state this fix exists to prevent.
+    const { uploadFileDirect } = await import('../src/direct-file-transfer.js');
+    const bytes = new TextEncoder().encode('after');
+    await uploadFileDirect(ws, {
+      name: 'after.txt',
+      type: 'text/plain',
+      size: bytes.byteLength,
+      slice: (start: number, end: number) => ({ arrayBuffer: async () => bytes.slice(start, end).buffer }),
+    } as unknown as File, id(), undefined, undefined, undefined, undefined, 'server-1');
+
+    const srflx = 'candidate:10 1 UDP 1678767871 124.90.108.198 55944 typ srflx raddr 0.0.0.0 rport 0';
+    emit({
+      type: DIRECT_FILE_TRANSFER_MSG.LEASE_ICE,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      serverId: offer.serverId,
+      browserTabId: offer.browserTabId,
+      leaseId: offer.leaseId,
+      leaseGeneration: offer.leaseGeneration,
+      daemonGeneration: offer.daemonGeneration,
+      requestId: offer.requestId,
+      candidate: srflx,
+      mid: '0',
+    });
+    await vi.waitFor(() => expect(FakePeerConnection.instances.at(-1)!.addedCandidates)
+      .toContainEqual(expect.objectContaining({ candidate: srflx })));
     release?.();
   });
 
