@@ -93,7 +93,10 @@ class FakePeerConnection extends EventTarget {
       this.dispatchEvent(new Event('connectionstatechange'));
     }
   }
-  async addIceCandidate(): Promise<void> {}
+  addedCandidates: RTCIceCandidateInit[] = [];
+  async addIceCandidate(candidate?: RTCIceCandidateInit): Promise<void> {
+    if (candidate) this.addedCandidates.push(candidate);
+  }
   async getStats(): Promise<RTCStatsReport> {
     return new Map([
       ['selected-pair', {
@@ -578,6 +581,40 @@ describe('direct file transfer v2 browser broker', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it('accepts a daemon ICE candidate that arrives after the answer', async () => {
+    // Host candidates come from local interfaces and arrive with the answer; a
+    // server-reflexive candidate costs a STUN round trip and a relay candidate
+    // a TURN allocation, so both land later. Dropping them left the remote peer
+    // holding nothing but private addresses, which a LAN can route and a phone
+    // cannot — the connection then failed with no visible cause.
+    const { prewarmDirectFileLease } = await import('../src/direct-file-transfer.js');
+    const { ws, sent, emit } = createWs(directCapabilities);
+    const release = prewarmDirectFileLease(ws, 'server-1');
+
+    await vi.waitFor(() => expect(sent.some((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_OFFER)).toBe(true));
+    const offer = sent.find((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_OFFER)!;
+    // The answer must already be applied: this pins what happens *after* it.
+    await vi.waitFor(() => expect(FakePeerConnection.instances.at(-1)?.remoteDescription).toBeTruthy());
+
+    const relay = 'candidate:11 1 UDP 1046015 43.248.99.95 49201 typ relay raddr 0.0.0.0 rport 0';
+    emit({
+      type: DIRECT_FILE_TRANSFER_MSG.LEASE_ICE,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      serverId: offer.serverId,
+      browserTabId: offer.browserTabId,
+      leaseId: offer.leaseId,
+      leaseGeneration: offer.leaseGeneration,
+      daemonGeneration: offer.daemonGeneration,
+      requestId: offer.requestId,
+      candidate: relay,
+      mid: '0',
+    });
+
+    await vi.waitFor(() => expect(FakePeerConnection.instances.at(-1)!.addedCandidates)
+      .toContainEqual(expect.objectContaining({ candidate: relay })));
+    release?.();
   });
 
   it('reuses one lease peer for an upload followed by a preview download', async () => {
