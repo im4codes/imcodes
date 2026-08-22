@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
+import { saveBlobViaDownloadAnchor } from '../browser-download.js';
 
 interface Props {
   src: string;
@@ -62,21 +63,6 @@ function ensureImageFileName(fileName: string, mimeType: string | null): string 
   return /\.[A-Za-z0-9]{2,5}$/.test(fileName) ? fileName : `${fileName}${extensionForMimeType(mimeType)}`;
 }
 
-function saveBlobViaAnchor(blob: Blob, fileName: string) {
-  const objectUrl = URL.createObjectURL(blob);
-  const revokeObjectURL = URL.revokeObjectURL;
-  const link = document.createElement('a');
-  link.href = objectUrl;
-  link.download = fileName;
-  link.rel = 'noopener';
-  document.body.appendChild(link);
-  link.click();
-  link.remove();
-  if (typeof revokeObjectURL === 'function') {
-    setTimeout(() => revokeObjectURL.call(URL, objectUrl), 0);
-  }
-}
-
 async function readImageBlob(src: string): Promise<Blob> {
   const response = await fetch(src);
   return response.blob();
@@ -95,7 +81,7 @@ function shouldUseMobileImageActions(): boolean {
 async function downloadImage(src: string, fileName: string) {
   const inferredMimeType = getMimeTypeFromDataUrl(src);
   const blob = await readImageBlob(src);
-  saveBlobViaAnchor(blob, ensureImageFileName(fileName, blob.type || inferredMimeType));
+  saveBlobViaDownloadAnchor(blob, ensureImageFileName(fileName, blob.type || inferredMimeType));
 }
 
 async function copyImageToClipboard(src: string) {

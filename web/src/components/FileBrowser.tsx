@@ -1744,6 +1744,7 @@ export function FileBrowser({
     const transfer = beginDownloadTransfer(selectedPath.split(/[/\\]/).pop() || selectedPath);
     let authorizedHandle = selectedHandle;
     const runTransfer = async (signal: AbortSignal, requireCurrentSelection: boolean): Promise<void> => {
+      let handedOffToBrowser = false;
       const download = async (handle: string) => downloadPreviewWithDirectFallback({
         ws,
         serverId,
@@ -1768,13 +1769,14 @@ export function FileBrowser({
           } else if (mode === FILE_DOWNLOAD_TRANSPORT_MODE.HTTP) {
             updateDownloadTransfer(transfer.id, DOWNLOAD_TRANSFER_ROUTE.HTTP, DOWNLOAD_TRANSFER_STATUS.TRANSFERRING);
           } else {
+            handedOffToBrowser = true;
             updateDownloadTransfer(transfer.id, DOWNLOAD_TRANSFER_ROUTE.BROWSER, DOWNLOAD_TRANSFER_STATUS.PREPARING);
           }
         },
       });
       try {
         await download(authorizedHandle);
-        completeDownloadTransfer(transfer.id, destination === null);
+        completeDownloadTransfer(transfer.id, handedOffToBrowser);
         return;
       } catch (error) {
         let failure = error;
@@ -1816,7 +1818,7 @@ export function FileBrowser({
               });
             }
             await download(freshId);
-            completeDownloadTransfer(transfer.id, destination === null);
+            completeDownloadTransfer(transfer.id, handedOffToBrowser);
             return;
           } catch (refreshError) {
             if (refreshed) failure = refreshError;

@@ -42,6 +42,8 @@ import {
   uploadFile,
   type AttachmentRefResponse,
 } from './api.js';
+import { saveBlobViaDownloadAnchor } from './browser-download.js';
+import { isNative } from './native.js';
 import type { ServerMessage, WsClient } from './ws-client.js';
 
 /**
@@ -1440,6 +1442,36 @@ export async function selectPreviewDownloadDestination(suggestedName?: string): 
   }
 }
 
+async function downloadNativeHttpBlob(options: {
+  serverId: string;
+  previewHandle: string;
+  suggestedName?: string;
+  sessionName?: string;
+  signal?: AbortSignal;
+  onProgress?: (progress: FileDownloadProgress) => void;
+}): Promise<void> {
+  const chunks: ArrayBuffer[] = [];
+  await streamAttachmentDownloadToWritable(
+    options.serverId,
+    options.previewHandle,
+    {
+      async write(data) {
+        const bytes = data instanceof ArrayBuffer
+          ? new Uint8Array(data)
+          : new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+        const copy = new Uint8Array(bytes.byteLength);
+        copy.set(bytes);
+        chunks.push(copy.buffer);
+      },
+    },
+    options.sessionName,
+    options.signal,
+    options.onProgress,
+  );
+  if (options.signal?.aborted) throw new DOMException('download_canceled', 'AbortError');
+  saveBlobViaDownloadAnchor(new Blob(chunks), options.suggestedName?.trim() || 'download');
+}
+
 async function createPreviewWriter(destination: DirectPreviewDownloadDestination): Promise<FileSystemWritableFileStreamLike> {
   try {
     return await destination.handle.createWritable();
@@ -1455,7 +1487,7 @@ export async function downloadPreviewWithDirectFallback(options: {
   suggestedName?: string;
   sessionName?: string;
   destination?: DirectPreviewDownloadDestination | null;
-  /** Kept for the non-FSA/native browser fallback only. */
+  /** Kept for desktop browsers without File System Access. */
   httpFallback?: () => Promise<void>;
   signal?: AbortSignal;
   onProgress?: (progress: FileDownloadProgress) => void;
@@ -1465,6 +1497,14 @@ export async function downloadPreviewWithDirectFallback(options: {
     ? await selectPreviewDownloadDestination(options.suggestedName)
     : options.destination;
   if (!destination) {
+    if (isNative()) {
+      // Capacitor WebViews do not expose File System Access. Keep mobile on
+      // authenticated HTTP for now, but retain observable progress and save
+      // completion inside the current WebView instead of handing off a URL.
+      options.onMode?.(FILE_DOWNLOAD_TRANSPORT_MODE.HTTP);
+      await downloadNativeHttpBlob(options);
+      return;
+    }
     // No File System Access API means no safe streaming sink.  Keep the
     // established HTTP browser download as the only fallback and do not start
     // an unbounded Blob/direct transfer.

@@ -20,7 +20,12 @@ const apiMocks = vi.hoisted(() => ({
   streamAttachmentDownloadToWritable: vi.fn(),
 }));
 
+const browserDownloadMocks = vi.hoisted(() => ({
+  saveBlobViaDownloadAnchor: vi.fn(),
+}));
+
 vi.mock('../src/api.js', () => apiMocks);
+vi.mock('../src/browser-download.js', () => browserDownloadMocks);
 
 class FakeDataChannel extends EventTarget {
   constructor(readonly label = '') { super(); }
@@ -870,6 +875,49 @@ describe('direct file transfer v2 browser broker', () => {
     expect(onMode).toHaveBeenCalledWith(FILE_DOWNLOAD_TRANSPORT_MODE.BROWSER);
     expect(onProgress).not.toHaveBeenCalled();
     expect(sent).toHaveLength(0);
+  });
+
+  it('uses observable HTTP download inside the native WebView without starting P2P or browser handoff', async () => {
+    vi.stubGlobal('Capacitor', { isNativePlatform: () => true });
+    apiMocks.streamAttachmentDownloadToWritable.mockImplementationOnce(async (...args: unknown[]) => {
+      const writable = args[2] as { write(data: BufferSource): Promise<void> };
+      const progress = args[5] as ((value: { loadedBytes: number; totalBytes: number | null }) => void) | undefined;
+      progress?.({ loadedBytes: 0, totalBytes: 3 });
+      await writable.write(new Uint8Array([1, 2, 3]));
+      progress?.({ loadedBytes: 3, totalBytes: 3 });
+    });
+    const { downloadPreviewWithDirectFallback, FILE_DOWNLOAD_TRANSPORT_MODE } = await import('../src/direct-file-transfer.js');
+    const { ws, sent } = createWs(directCapabilities);
+    const onProgress = vi.fn();
+    const onMode = vi.fn();
+    const httpFallback = vi.fn();
+
+    await downloadPreviewWithDirectFallback({
+      ws,
+      serverId: 'server-1',
+      previewHandle: 'preview-handle-1',
+      suggestedName: 'mobile-report.pdf',
+      destination: null,
+      httpFallback,
+      onProgress,
+      onMode,
+    });
+
+    expect(onMode).toHaveBeenCalledOnce();
+    expect(onMode).toHaveBeenCalledWith(FILE_DOWNLOAD_TRANSPORT_MODE.HTTP);
+    expect(onProgress.mock.calls).toEqual([
+      [{ loadedBytes: 0, totalBytes: 3 }],
+      [{ loadedBytes: 3, totalBytes: 3 }],
+    ]);
+    expect(browserDownloadMocks.saveBlobViaDownloadAnchor).toHaveBeenCalledOnce();
+    const [blob, fileName] = browserDownloadMocks.saveBlobViaDownloadAnchor.mock.calls[0]!;
+    expect(blob).toBeInstanceOf(Blob);
+    expect(blob.size).toBe(3);
+    expect(fileName).toBe('mobile-report.pdf');
+    expect(apiMocks.downloadAttachment).not.toHaveBeenCalled();
+    expect(httpFallback).not.toHaveBeenCalled();
+    expect(sent).toHaveLength(0);
+    expect(FakePeerConnection.instances).toHaveLength(0);
   });
 
   it('classifies daemon preview-handle expiry as the File Browser one-refresh condition', async () => {

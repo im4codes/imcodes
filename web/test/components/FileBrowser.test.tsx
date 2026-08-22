@@ -278,7 +278,9 @@ describe('FileBrowser', () => {
     let finish!: () => void;
     directFileTransferMocks.downloadPreviewWithDirectFallback.mockImplementationOnce((options: {
       onProgress?: (progress: { loadedBytes: number; totalBytes: number | null }) => void;
+      onMode?: (mode: string) => void;
     }) => {
+      options.onMode?.(directFileTransferMocks.FILE_DOWNLOAD_TRANSPORT_MODE.BROWSER);
       options.onProgress?.({ loadedBytes: 256, totalBytes: 1_024 });
       return new Promise<void>((resolve) => { finish = resolve; });
     });
@@ -302,6 +304,39 @@ describe('FileBrowser', () => {
 
     finish();
     await waitFor(() => expect(getDownloadTransfers()[0]?.status).toBe('handed_off'));
+  });
+
+  it('marks a native HTTP download complete instead of handed off when no picker destination exists', async () => {
+    directFileTransferMocks.downloadPreviewWithDirectFallback.mockImplementationOnce(async (options: {
+      onProgress?: (progress: { loadedBytes: number; totalBytes: number | null }) => void;
+      onMode?: (mode: string) => void;
+    }) => {
+      options.onMode?.(directFileTransferMocks.FILE_DOWNLOAD_TRANSPORT_MODE.HTTP);
+      options.onProgress?.({ loadedBytes: 0, totalBytes: 3 });
+      options.onProgress?.({ loadedBytes: 3, totalBytes: 3 });
+    });
+    const { ws } = makeWsFactory();
+    const view = render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        serverId="srv-1"
+        initialPreview={{ status: 'ok', path: '/home/user/mobile.pdf', content: 'preview', downloadId: 'preview-handle' }}
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(view.getByRole('button', { name: 'upload.download_file' }));
+
+    await waitFor(() => expect(getDownloadTransfers()[0]).toMatchObject({
+      name: 'mobile.pdf',
+      route: 'http',
+      status: 'completed',
+      loadedBytes: 3,
+      totalBytes: 3,
+    }));
   });
 
   it('retries a failed download with the same destination and a fresh signal', async () => {
