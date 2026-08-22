@@ -120,7 +120,7 @@ function controlBinding(message: Record<string, unknown>) {
 
 function createWs(
   capabilities: string[],
-  mode: 'success' | 'operation_failure' | 'hold' | 'authorized_hold' | 'status_committed' | 'terminal_committed' | 'ack_then_late_terminal' | 'download_hold_rebind' | 'download_size_mismatch' | 'error_after_expiry' | 'drop_first_lease_ready' = 'success',
+  mode: 'success' | 'operation_failure' | 'lease_signal_failure' | 'hold' | 'authorized_hold' | 'status_committed' | 'terminal_committed' | 'ack_then_late_terminal' | 'download_hold_rebind' | 'download_size_mismatch' | 'error_after_expiry' | 'drop_first_lease_ready' = 'success',
   leaseTiming: { readyDelayMs?: number; idleWindowMs?: number; terminalDelayMs?: number; rebindDaemonGeneration?: number } = {},
 ) {
   const handlers = new Set<(message: ServerMessage) => void>();
@@ -281,7 +281,18 @@ function createWs(
         if (leaseInitCount === 1 && leaseTiming.readyDelayMs) setTimeout(respond, leaseTiming.readyDelayMs);
         else queueMicrotask(respond);
       } else if (message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_OFFER) {
-        queueMicrotask(() => emit({ ...message, type: DIRECT_FILE_TRANSFER_MSG.LEASE_ANSWER, sdp: 'daemon-lease-answer' }));
+        if (mode === 'lease_signal_failure') {
+          queueMicrotask(() => emit({
+            type: DIRECT_FILE_TRANSFER_MSG.ERROR,
+            protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+            scope: DIRECT_FILE_TRANSFER_ERROR_SCOPE.LEASE,
+            requestId: message.requestId,
+            error: DIRECT_FILE_TRANSFER_ERROR.STALE_DAEMON_GENERATION,
+            retryable: true,
+          }));
+        } else {
+          queueMicrotask(() => emit({ ...message, type: DIRECT_FILE_TRANSFER_MSG.LEASE_ANSWER, sdp: 'daemon-lease-answer' }));
+        }
       } else if (message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_REBIND) {
         queueMicrotask(() => emit({
           type: DIRECT_FILE_TRANSFER_MSG.LEASE_REBOUND,
@@ -714,6 +725,26 @@ describe('direct file transfer v2 browser broker', () => {
     } finally {
       random.mockRestore();
       timeout.mockRestore();
+    }
+  }, 10_000);
+
+  it('falls back once after three retryable lease-signal races instead of multiplying lease retries', async () => {
+    const { uploadFileWithDirectFallback } = await import('../src/direct-file-transfer.js');
+    const { ws, sent } = createWs(directCapabilities, 'lease_signal_failure');
+    const file = new File(['retry'], 'retry.txt', { type: 'text/plain' });
+    const random = vi.spyOn(Math, 'random').mockReturnValue(0);
+    try {
+      await expect(uploadFileWithDirectFallback({ ws, serverId: 'server-1', file })).resolves.toMatchObject({
+        attachment: { id: 'relay-attachment' },
+      });
+      // The first direct attempt initializes the lease. Each of the three
+      // bounded transport attempts offers against that same matching lease;
+      // after the shared budget the normal HTTP upload is invoked exactly once.
+      expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_INIT)).toHaveLength(1);
+      expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_OFFER)).toHaveLength(3);
+      expect(apiMocks.uploadFile).toHaveBeenCalledTimes(1);
+    } finally {
+      random.mockRestore();
     }
   }, 10_000);
 

@@ -169,10 +169,14 @@ describe('DirectFileTransferRouter v2', () => {
     };
     f.router.handleBrowser(f.browserA, 'user-a', earlyOffer);
     expect(f.daemonMessages).toHaveLength(1);
+    // A signal from the bound lease before PREPARE completes is not an
+    // authority forgery. It must be retryable so the browser reaches the
+    // guaranteed retry-then-HTTP fallback instead of terminally stalling.
     expect(f.messages(f.browserA).at(-1)).toMatchObject({
       type: DIRECT_FILE_TRANSFER_MSG.ERROR,
       scope: DIRECT_FILE_TRANSFER_ERROR_SCOPE.LEASE,
-      error: DIRECT_FILE_TRANSFER_ERROR.INVALID_AUTHORITY,
+      error: DIRECT_FILE_TRANSFER_ERROR.STALE_DAEMON_GENERATION,
+      retryable: true,
     });
 
     f.router.handleDaemon({
@@ -192,6 +196,34 @@ describe('DirectFileTransferRouter v2', () => {
     expect(f.daemonMessages).toHaveLength(2);
     expect(f.daemonMessages.at(-1)).toMatchObject({ type: DIRECT_FILE_TRANSFER_MSG.LEASE_OFFER, sdp: earlyOffer.sdp });
     expect(f.daemonMessages.at(-1)).not.toHaveProperty('authority');
+  });
+
+  it('marks matching lease signaling during daemon rebind as retryable without forwarding it', () => {
+    const f = fixture();
+    const lease = readyLease(f);
+    f.setGeneration((lease.daemonGeneration ?? 0) + 1);
+    const staleOffer = {
+      type: DIRECT_FILE_TRANSFER_MSG.LEASE_OFFER,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      requestId: 'offer-during-rebind',
+      serverId: SERVER_ID,
+      browserTabId: TAB_A,
+      leaseId: lease.leaseId,
+      leaseGeneration: lease.leaseGeneration,
+      daemonGeneration: lease.daemonGeneration,
+      sdp: 'v=0\r\no=browser 1 1 IN IP4 127.0.0.1',
+    } as const;
+    const daemonCount = f.daemonMessages.length;
+    f.router.handleBrowser(f.browserA, 'user-a', staleOffer);
+
+    expect(f.daemonMessages).toHaveLength(daemonCount);
+    expect(f.messages(f.browserA).at(-1)).toMatchObject({
+      type: DIRECT_FILE_TRANSFER_MSG.ERROR,
+      scope: DIRECT_FILE_TRANSFER_ERROR_SCOPE.LEASE,
+      requestId: staleOffer.requestId,
+      error: DIRECT_FILE_TRANSFER_ERROR.STALE_DAEMON_GENERATION,
+      retryable: true,
+    });
   });
 
   it('relays validated lease answer only to the bound browser socket', () => {

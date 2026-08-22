@@ -537,34 +537,28 @@ async function ensureLease(lease: Lease): Promise<void> {
   if (lease.creating) return lease.creating;
   lease.creating = (async () => {
     if (!supportsLease(lease.ws)) throw directError(DIRECT_FILE_TRANSFER_ERROR.CAPABILITY_UNAVAILABLE, false);
-    let lastError: unknown = directError(DIRECT_FILE_TRANSFER_ERROR.INTERNAL_ERROR);
-    for (let attempt = 1; attempt <= DIRECT_FILE_TRANSFER_LIMITS.MAX_ATTEMPTS; attempt++) {
-      if (attempt > 1) await wait(retryDelay(attempt - 1));
-      const requestId = crypto.randomUUID();
-      const ready = waitForControl(
-        lease,
-        requestId,
-        (message): message is DirectFileTransferLeaseReady => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_READY,
-        DIRECT_FILE_TRANSFER_LIMITS.NEGOTIATION_TIMEOUT_MS,
-      );
-      lease.ws.send({
-        type: DIRECT_FILE_TRANSFER_MSG.LEASE_INIT,
-        protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
-        requestId,
-        serverId: lease.serverId,
-        browserTabId: lease.browserTabId,
-      });
-      try {
-        leaseFromReady(lease, await ready);
-        if (!lease.leaseId) throw directError(DIRECT_FILE_TRANSFER_ERROR.LEASE_EXPIRED);
-        await ensureLeasePeer(lease);
-        return;
-      } catch (error) {
-        lastError = error;
-        if (failureDisposition(error, attempt) !== DIRECT_FILE_TRANSFER_FAILURE_DISPOSITION.RETRY_DIRECT) throw error;
-      }
-    }
-    throw lastError;
+    // retryDirect owns the three-attempt transport budget. Retrying here as
+    // well multiplied one stalled lease negotiation into nine long waits
+    // before HTTP was allowed (3 lease attempts × 3 operation attempts).
+    // One LEASE_INIT/offer per direct attempt keeps the total bounded and
+    // guarantees the documented three attempts then exactly one relay path.
+    const requestId = crypto.randomUUID();
+    const ready = waitForControl(
+      lease,
+      requestId,
+      (message): message is DirectFileTransferLeaseReady => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_READY,
+      DIRECT_FILE_TRANSFER_LIMITS.NEGOTIATION_TIMEOUT_MS,
+    );
+    lease.ws.send({
+      type: DIRECT_FILE_TRANSFER_MSG.LEASE_INIT,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      requestId,
+      serverId: lease.serverId,
+      browserTabId: lease.browserTabId,
+    });
+    leaseFromReady(lease, await ready);
+    if (!lease.leaseId) throw directError(DIRECT_FILE_TRANSFER_ERROR.LEASE_EXPIRED);
+    await ensureLeasePeer(lease);
   })().finally(() => {
     lease.creating = null;
   });
