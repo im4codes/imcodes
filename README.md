@@ -8,7 +8,7 @@
 > But minds in concert don't answer fate, they author it.<br>
 > — IM.codes
 
-IM.codes connects AI agents not only to coding sessions, but also to the computers where work happens. Enroll supported machines as restricted **Controlled Nodes**, then let an authorized agent operate one computer or coordinate work across many with scoped commands, file transfer, and typed Computer Use. When a person needs to see or take over, capable Windows nodes also provide browser-based remote desktop from desktop or mobile.
+IM.codes connects AI agents not only to coding sessions, but also to the computers where work happens. Enroll supported machines as restricted **Controlled Nodes**, then let an authorized agent directly operate one or many computers with scoped commands, file transfer, and typed Computer Use. When a person needs to see or take over, capable Windows nodes also provide browser-based remote desktop from desktop or mobile.
 
 Alongside machine control, IM.codes gives coding agents one shared memory layer and one managed MCP tool surface across providers. It turns completed work into reusable context across [Claude Code](https://github.com/anthropics/claude-code), [Codex](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), GitHub Copilot, Cursor, OpenCode, [OpenClaw](https://openclaw.com), [Qwen](https://github.com/QwenLM/qwen-agent), and more. Terminal access, file and Git views, localhost preview, notifications, multi-agent workflows, OpenSpec Auto Deliver, Auto supervision, and cross-provider Team audit keep both human and agent work visible and connected.
 
@@ -18,7 +18,7 @@ Alongside machine control, IM.codes gives coding agents one shared memory layer 
 
 Turn supported computers into AI-operated nodes without making each machine a full IM.codes source server.
 
-- **One AI, multiple computers.** Enroll multiple machines and let one agent—or a team of agents—coordinate tasks across the fleet.
+- **One AI, multiple computers.** Enroll multiple machines and let one agent—or a team of agents—operate them directly to get work done.
 - **Real computer actions.** Run scoped commands, move individual files, and control desktop applications through typed Computer Use tools.
 - **Remote desktop when humans need it.** Open a capable Windows node from a browser or mobile device to view the screen or take control directly.
 - **Scoped and revocable.** Every node has independent credentials, remains separate from normal server/session lists, and can have execution access disabled or revoked by its owner.
@@ -139,7 +139,7 @@ Save owner-scoped reusable text snippets and insert them from the composer by ty
 
 ### Controlled Nodes
 
-Enroll one or many computers, type `^` to choose a target (or insert `^^(name)` directly), and let authorized agents carry out work on the selected machine. Agents can run scoped commands, transfer individual files, and use typed Computer Use tools—making it practical to operate and coordinate a fleet of computers from the same conversation. Execution remains owner-gated and revocable, every node receives independent credentials, and controlled nodes stay separate from normal server/session lists. Download links expire, but a downloaded installer can be kept and reused to enroll multiple machines.
+Enroll one or many computers, type `^` to choose a target (or insert `^^(name)` directly), and let authorized agents carry out work on the selected machine. Agents can run scoped commands, transfer individual files, and use typed Computer Use tools—making it practical to operate a fleet of computers directly from the same conversation. Execution remains owner-gated and revocable, every node receives independent credentials, and controlled nodes stay separate from normal server/session lists. Download links expire, but a downloaded installer can be kept and reused to enroll multiple machines.
 
 ### Windows Remote Desktop
 

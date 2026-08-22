@@ -9,7 +9,7 @@
 > 허나 세 명의 제갈량, 담소 속에 천하를 정한다.<br>
 > — IM.codes
 
-IM.codes는 AI agent를 coding session뿐 아니라 실제 작업이 수행되는 컴퓨터에도 연결합니다. 지원되는 머신을 제한된 **제어 노드(Controlled Nodes)** 로 등록하면 권한 있는 agent가 범위 지정 명령, 파일 전송, 타입 지정 Computer Use로 한 대를 조작하거나 여러 컴퓨터의 작업을 조율할 수 있습니다. 사람이 화면을 보거나 인계받아야 할 때는 지원되는 Windows 노드를 브라우저나 휴대폰에서 원격 데스크톱으로 열 수 있습니다.
+IM.codes는 AI agent를 coding session뿐 아니라 실제 작업이 수행되는 컴퓨터에도 연결합니다. 지원되는 머신을 제한된 **제어 노드(Controlled Nodes)** 로 등록하면 권한 있는 agent가 범위 지정 명령, 파일 전송, 타입 지정 Computer Use로 한 대 또는 여러 대의 컴퓨터를 직접 조작할 수 있습니다. 사람이 화면을 보거나 인계받아야 할 때는 지원되는 Windows 노드를 브라우저나 휴대폰에서 원격 데스크톱으로 열 수 있습니다.
 
 머신 제어와 함께 IM.codes는 provider를 가로지르는 공유 메모리 레이어와 관리형 MCP tool surface를 coding agent에 제공합니다. 완료된 작업을 Claude Code, Codex, Gemini CLI, GitHub Copilot, Cursor, OpenCode, OpenClaw, Qwen 등에서 재사용 가능한 컨텍스트로 활용합니다. 터미널, 파일과 Git, localhost 미리보기, 알림, 멀티 에이전트 워크플로우, OpenSpec Auto Deliver, Auto supervision, Team 감사가 사람과 agent의 작업을 계속 보이고 연결된 상태로 유지합니다.
 
@@ -21,7 +21,7 @@ IM.codes는 AI agent를 coding session뿐 아니라 실제 작업이 수행되�
 
 각 머신을 완전한 IM.codes source server로 만들지 않고 지원되는 컴퓨터를 AI가 조작할 수 있는 제어 노드로 등록합니다.
 
-- **하나의 AI로 여러 컴퓨터.** 여러 머신을 등록하고 한 agent 또는 agent 팀이 전체 플릿의 작업을 조율할 수 있습니다.
+- **하나의 AI로 여러 컴퓨터.** 여러 머신을 등록하고 한 agent 또는 agent 팀이 해당 컴퓨터를 직접 조작해 작업을 수행할 수 있습니다.
 - **실제 컴퓨터 작업.** 범위 지정 명령 실행, 개별 파일 전송, 타입 지정 Computer Use를 통한 데스크톱 앱 조작을 지원합니다.
 - **필요할 때 사람이 원격 인계.** 지원되는 Windows 노드를 브라우저나 휴대폰에서 열어 화면을 보거나 직접 제어할 수 있습니다.
 - **제한되고 철회 가능한 권한.** 노드마다 독립 자격 증명을 사용하고 일반 server/session 목록과 분리되며, 소유자가 실행 권한을 끄거나 노드를 철회할 수 있습니다.

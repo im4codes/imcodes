@@ -9,7 +9,7 @@
 > 三個諸葛亮，談笑定陰陽。<br>
 > — IM.codes
 
-IM.codes 不只連接 AI agent 的 coding session，也把 agent 連接到真正執行工作的電腦。把支援的機器註冊成受限的**受控節點（Controlled Nodes）**，一個 AI 或一組 AI 就能透過有作用域的命令、檔案傳輸和 Computer Use 操作一台或協調多台電腦；需要人工查看或接管時，具備條件的 Windows 節點還能直接從桌面瀏覽器或手機開啟遠端桌面。
+IM.codes 不只連接 AI agent 的 coding session，也把 agent 連接到真正執行工作的電腦。把支援的機器註冊成受限的**受控節點（Controlled Nodes）**，一個 AI 或一組 AI 就能透過有作用域的命令、檔案傳輸和 Computer Use 直接操作一台或多台電腦；需要人工查看或接管時，具備條件的 Windows 節點還能直接從桌面瀏覽器或手機開啟遠端桌面。
 
 在機器控制之外，IM.codes 也為 coding agent 提供跨 provider 共享的記憶層和託管 MCP 工具面，把已完成工作沉澱成可重用上下文，貫通 [Claude Code](https://github.com/anthropics/claude-code)、[Codex](https://github.com/openai/codex)、[Gemini CLI](https://github.com/google-gemini/gemini-cli)、GitHub Copilot、Cursor、OpenCode、[OpenClaw](https://openclaw.com)、[Qwen](https://github.com/QwenLM/qwen-agent) 等。終端、檔案與 Git 視圖、localhost 預覽、通知、多 agent 工作流、OpenSpec 自動交付、Auto supervision 和跨模型 Team 審計，讓人與 AI 的工作保持可見、可控、可銜接。
 
@@ -21,7 +21,7 @@ IM.codes 不只連接 AI agent 的 coding session，也把 agent 連接到真正
 
 不必把每台電腦都設成完整的 IM.codes source server，就能把支援的機器接入為 AI 可操作的受控節點。
 
-- **一個 AI，控制多台電腦。** 註冊多台機器，讓一個 agent 或一組 agent 在多台電腦之間協調與分派任務。
+- **一個 AI，控制多台電腦。** 註冊多台機器，讓一個 agent 或一組 agent 直接操作這些電腦完成工作。
 - **執行真實電腦操作。** 執行有作用域的命令、傳輸單一檔案，並透過型別化 Computer Use 工具操作桌面應用程式。
 - **需要人工時隨時遠端接管。** 從瀏覽器或手機開啟具備條件的 Windows 節點，直接查看畫面或進行遠端控制。
 - **權限明確，隨時可撤銷。** 每台節點使用獨立憑證，不混入一般 server/session 清單，擁有者可關閉執行權限或直接撤銷節點。

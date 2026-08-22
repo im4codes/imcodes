@@ -9,7 +9,7 @@
 > されど三人の孔明、談笑のうちに天下を定む。<br>
 > — IM.codes
 
-IM.codes は AI agent を coding session だけでなく、実際に作業するコンピューターにも接続します。対応マシンを制限付きの **制御対象ノード（Controlled Nodes）** として登録すると、認可された agent が scoped command、ファイル転送、型付き Computer Use を使って 1 台を操作したり、複数台の作業を連携させたりできます。人が画面を確認・引き継ぐ必要があるときは、対応する Windows ノードをブラウザやスマートフォンからリモートデスクトップで操作できます。
+IM.codes は AI agent を coding session だけでなく、実際に作業するコンピューターにも接続します。対応マシンを制限付きの **制御対象ノード（Controlled Nodes）** として登録すると、認可された agent が scoped command、ファイル転送、型付き Computer Use を使って 1 台でも複数台でも直接操作できます。人が画面を確認・引き継ぐ必要があるときは、対応する Windows ノードをブラウザやスマートフォンからリモートデスクトップで操作できます。
 
 マシン制御に加え、IM.codes は provider をまたぐ共有メモリレイヤーと管理対象 MCP tool surface を coding agent に提供します。完了した作業を再利用可能なコンテキストとして Claude Code、Codex、Gemini CLI、GitHub Copilot、Cursor、OpenCode、OpenClaw、Qwen などで活用できます。ターミナル、ファイルと Git、localhost プレビュー、通知、マルチエージェント連携、OpenSpec Auto Deliver、Auto supervision、Team 監査により、人と agent の作業を見える状態でつなぎます。
 
@@ -21,7 +21,7 @@ IM.codes は AI agent を coding session だけでなく、実際に作業する
 
 各マシンを完全な IM.codes source server にせず、対応コンピューターを AI が操作できる制御対象ノードとして登録できます。
 
-- **1 つの AI で複数の PC。** 複数マシンを登録し、1 つの agent または agent チームでフリート全体のタスクを調整できます。
+- **1 つの AI で複数の PC。** 複数マシンを登録し、1 つの agent または agent チームがそれらを直接操作して作業を実行できます。
 - **実際のコンピューター操作。** scoped command、個別ファイル転送、型付き Computer Use によるデスクトップアプリ操作に対応します。
 - **必要なときは人がリモート操作。** 対応する Windows ノードをブラウザやスマートフォンから開き、画面の確認や操作の引き継ぎができます。
 - **権限を限定し、いつでも取り消し可能。** ノードごとに独立した認証情報を使い、通常の server/session 一覧から分離し、所有者が実行権限を無効化・取り消しできます。

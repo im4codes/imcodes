@@ -9,7 +9,7 @@
 > But minds in concert don't answer fate, they author it.<br>
 > — IM.codes
 
-IM.codes conecta a los agentes de IA no solo con sesiones de código, sino también con los ordenadores donde se realiza el trabajo. Registra máquinas compatibles como **nodos controlados** restringidos y permite que un agente autorizado opere un equipo o coordine tareas en varios mediante comandos con alcance, transferencia de archivos y Computer Use tipado. Cuando una persona necesita ver o tomar el control, los nodos Windows compatibles también ofrecen escritorio remoto desde el navegador o el móvil.
+IM.codes conecta a los agentes de IA no solo con sesiones de código, sino también con los ordenadores donde se realiza el trabajo. Registra máquinas compatibles como **nodos controlados** restringidos y permite que un agente autorizado opere directamente uno o varios equipos mediante comandos con alcance, transferencia de archivos y Computer Use tipado. Cuando una persona necesita ver o tomar el control, los nodos Windows compatibles también ofrecen escritorio remoto desde el navegador o el móvil.
 
 Además del control de máquinas, IM.codes ofrece a los coding agents una memoria compartida entre proveedores y una superficie MCP gestionada. Convierte el trabajo completado en contexto reutilizable para [Claude Code](https://github.com/anthropics/claude-code), [Codex](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), GitHub Copilot, Cursor, OpenCode, [OpenClaw](https://openclaw.com), [Qwen](https://github.com/QwenLM/qwen-agent) y más. Terminal, archivos y Git, localhost preview, notificaciones, flujos multiagente, OpenSpec Auto Deliver, Auto supervision y auditoría Team mantienen visible y conectado el trabajo de personas y agentes.
 
@@ -21,7 +21,7 @@ Varios agentes admiten dos modos de integración: CLI y SDK.
 
 Convierte ordenadores compatibles en nodos operados por IA sin configurar cada máquina como un source server completo de IM.codes.
 
-- **Una IA, varios ordenadores.** Registra varias máquinas y deja que un agente —o un equipo de agentes— coordine tareas en toda la flota.
+- **Una IA, varios ordenadores.** Registra varias máquinas y deja que un agente —o un equipo de agentes— las opere directamente para realizar el trabajo.
 - **Acciones reales en el ordenador.** Ejecuta comandos con alcance, mueve archivos individuales y controla aplicaciones mediante herramientas Computer Use tipadas.
 - **Escritorio remoto para intervención humana.** Abre un nodo Windows compatible desde el navegador o el móvil para ver la pantalla o tomar el control.
 - **Acceso limitado y revocable.** Cada nodo usa credenciales independientes, queda fuera de las listas normales de server/session y su propietario puede desactivar o revocar la ejecución.
