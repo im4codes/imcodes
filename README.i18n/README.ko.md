@@ -2,18 +2,29 @@
 
 [English](../README.md) | [简体中文](README.zh-CN.md) | [繁體中文](README.zh-TW.md) | [Español](README.es.md) | [Русский](README.ru.md) | [日本語](README.ja.md) | [한국어](README.ko.md)
 
-**에이전트를 위한 IM. 공유 메모리, OpenSpec Auto Deliver, 관리형 MCP 도구, 감독된 실행, 사람 간 협업, 그리고 AI 제공자 전반의 교차 감사.**
+**에이전트를 위한 IM. AI 다중 PC 제어, 원격 데스크톱, 공유 메모리, OpenSpec Auto Deliver, 관리형 MCP 도구, 감독 실행, 교차 모델 감사.**
 
 <!-- TODO(native-review): KO hero couplet — 第一句「백지장도 맞들면 낫다」承接弱,待母语者重写;默认「천하」 -->
 > 백지장도 맞들면 낫다.<br>
 > 허나 세 명의 제갈량, 담소 속에 천하를 정한다.<br>
 > — IM.codes
 
-IM.codes는 coding agent를 위한, provider를 가로지르는 공유 메모리 레이어이자 관리형 MCP tool surface입니다. 완료된 작업을 재사용 가능한 컨텍스트로 축적하고, 적절한 기록을 이후 session에 주입하거나 recall합니다. Claude Code, Codex, Gemini CLI, GitHub Copilot, Cursor, OpenCode, OpenClaw, Qwen 등을 지원하며, 터미널, 파일 브라우징, Git 보기, localhost 미리보기, 알림, 멀티 에이전트 워크플로우, transport 기반 agent의 네이티브 스트리밍 출력도 함께 제공합니다. OpenSpec Auto Deliver는 변경을 proposal/spec 감사부터 구현, 검증 힌트, Team 감사/재작업, 자동 모듈 채점, 최종 quality gate까지 진행할 수 있습니다. 세션 공유도 live agent session 중심의 pair 또는 multi-person 협업 코딩을 지원합니다. 내장된 Auto supervision은 완료된 턴을 판정하고, 자동 계속과 감사/재작업 루프까지 수행한 뒤 제어를 돌려줄 수 있습니다. Team 토론 기능 내장 — 여러 모델이 서로의 계획과 구현을 리뷰하고 감사하여, 단일 모델의 누락·맹점·편향을 효과적으로 줄입니다.
+IM.codes는 AI agent를 coding session뿐 아니라 실제 작업이 수행되는 컴퓨터에도 연결합니다. 지원되는 머신을 제한된 **제어 노드(Controlled Nodes)** 로 등록하면 권한 있는 agent가 범위 지정 명령, 파일 전송, 타입 지정 Computer Use로 한 대를 조작하거나 여러 컴퓨터의 작업을 조율할 수 있습니다. 사람이 화면을 보거나 인계받아야 할 때는 지원되는 Windows 노드를 브라우저나 휴대폰에서 원격 데스크톱으로 열 수 있습니다.
+
+머신 제어와 함께 IM.codes는 provider를 가로지르는 공유 메모리 레이어와 관리형 MCP tool surface를 coding agent에 제공합니다. 완료된 작업을 Claude Code, Codex, Gemini CLI, GitHub Copilot, Cursor, OpenCode, OpenClaw, Qwen 등에서 재사용 가능한 컨텍스트로 활용합니다. 터미널, 파일과 Git, localhost 미리보기, 알림, 멀티 에이전트 워크플로우, OpenSpec Auto Deliver, Auto supervision, Team 감사가 사람과 agent의 작업을 계속 보이고 연결된 상태로 유지합니다.
 
 > 이 문서는 번역본입니다. **기준 문서는 영어 README(`../README.md`)입니다.** 차이가 있으면 영어판을 우선합니다.
 
 여러 에이전트가 CLI와 SDK 두 방식 모두로 연결될 수 있습니다.
+
+## 제어 노드: AI로 여러 컴퓨터 제어
+
+각 머신을 완전한 IM.codes source server로 만들지 않고 지원되는 컴퓨터를 AI가 조작할 수 있는 제어 노드로 등록합니다.
+
+- **하나의 AI로 여러 컴퓨터.** 여러 머신을 등록하고 한 agent 또는 agent 팀이 전체 플릿의 작업을 조율할 수 있습니다.
+- **실제 컴퓨터 작업.** 범위 지정 명령 실행, 개별 파일 전송, 타입 지정 Computer Use를 통한 데스크톱 앱 조작을 지원합니다.
+- **필요할 때 사람이 원격 인계.** 지원되는 Windows 노드를 브라우저나 휴대폰에서 열어 화면을 보거나 직접 제어할 수 있습니다.
+- **제한되고 철회 가능한 권한.** 노드마다 독립 자격 증명을 사용하고 일반 server/session 목록과 분리되며, 소유자가 실행 권한을 끄거나 노드를 철회할 수 있습니다.
 
 ## 스크린샷
 
@@ -129,13 +140,13 @@ IM.codes는 직접 작성한 supervisor 지시문으로 지원되는 agent sessi
 
 ### 제어 노드
 
-다른 머신을 완전한 IM.codes source server로 만들지 않고 제한된 controlled node로 등록할 수 있습니다. `^`로 대상을 자동 완성하거나 `^^(name)`을 직접 삽입하면, 권한을 받은 agent가 해당 노드에서 범위가 지정된 원격 명령, 단일 파일 전송, 타입이 지정된 Computer Use tool을 실행할 수 있습니다. 실행 권한은 소유자가 활성화하거나 철회할 수 있고, controlled node는 일반 server/session 목록에 섞이지 않으며 머신마다 독립 자격 증명을 사용합니다. 다운로드 링크는 만료되지만 새로 받은 설치 패키지는 보관해 여러 머신 등록에 재사용할 수 있습니다.
+한 대 또는 여러 컴퓨터를 등록하고 `^`로 대상을 선택하거나 `^^(name)`을 직접 삽입하면, 권한 있는 agent가 선택한 머신에서 작업할 수 있습니다. 범위 지정 명령, 개별 파일 전송, 타입 지정 Computer Use를 같은 대화에서 사용해 컴퓨터 플릿을 조작하고 조율할 수 있습니다. 실행 권한은 소유자가 관리하고 철회할 수 있으며, 노드마다 독립 자격 증명을 사용하고 일반 server/session 목록과 분리됩니다. 다운로드 링크는 만료되지만 설치 패키지는 보관해 재사용할 수 있습니다.
 
 ### 원격 데스크톱 제어
 
-조건을 갖춘 controlled node는 인가된 Owner와 Participant에게 연속적인 H.264 원격 데스크톱을 제공합니다. 브라우저와 네이티브 worker는 먼저 직접 WebRTC 경로를 협상하고 TURN은 폴백으로만 사용합니다. 영상과 마우스/키보드 데이터는 애플리케이션 서버를 거치지 않습니다. 기본값이 제어 모드이며 인가된 제어자가 여러 명일 수 있고, 각 시청자는 개별적으로 보기 모드로 전환할 수 있습니다. 디스플레이 탭은 우클릭/길게 누르기 메뉴로 720p, 1080p, 1440p, 4K를 전환하며, 모바일에서는 핀치/드래그와 함께 가장자리 패닝, 좌·중·우 버튼, 휠 스크롤을 갖춘 가상 마우스 모드를 제공합니다.
+지원되는 Windows 제어 노드는 권한 있는 Owner와 Participant에게 브라우저 원격 데스크톱을 제공합니다. 제어/보기 모드, 디스플레이와 화질 전환, 여러 권한 사용자의 공동 보기와 제어를 지원합니다. 모바일에서는 터치 탐색과 가상 마우스로 휴대폰이나 태블릿에서 데스크톱을 조작할 수 있습니다.
 
-Windows는 서명된 사전 빌드 worker를 사용하므로 controlled node에 컴파일러나 미디어 의존성을 설치하지 않습니다. **현재 Windows 지원, macOS와 Linux는 곧 지원됩니다.**
+원격 데스크톱은 사용 가능한 연결을 자동으로 선택하며 권한은 언제든 철회할 수 있습니다. **현재 Windows를 지원합니다. macOS와 Linux 노드는 다른 기능을 계속 사용할 수 있고, 원격 데스크톱 지원은 계획 중입니다.**
 
 ### Computer Use 및 브라우저 자동화
 

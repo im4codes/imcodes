@@ -2,15 +2,26 @@
 
 [English](README.md) | [简体中文](README.i18n/README.zh-CN.md) | [繁體中文](README.i18n/README.zh-TW.md) | [Español](README.i18n/README.es.md) | [Русский](README.i18n/README.ru.md) | [日本語](README.i18n/README.ja.md) | [한국어](README.i18n/README.ko.md)
 
-**The IM for agents. Shared memory, OpenSpec Auto Deliver, managed MCP tools, supervised execution, and cross-agent audit across AI providers.**
+**The IM for agents. AI fleet control, remote desktop, shared memory, OpenSpec Auto Deliver, managed MCP tools, supervised execution, and cross-agent audit across AI providers.**
 
 > Two heads are better than one.<br>
 > But minds in concert don't answer fate, they author it.<br>
 > — IM.codes
 
-IM.codes gives coding agents one shared memory layer and one managed MCP tool surface across providers. It turns completed work into reusable context, then injects or recalls the right history in future sessions across [Claude Code](https://github.com/anthropics/claude-code), [Codex](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), GitHub Copilot, Cursor, OpenCode, [OpenClaw](https://openclaw.com), [Qwen](https://github.com/QwenLM/qwen-agent), and more — with terminal access, file browsing, git views, localhost preview, notifications, multi-agent workflows, and native streaming output for transport-backed agents. For spec-driven work, OpenSpec Auto Deliver can take a change from proposal/spec audit through implementation, validation hints, Team audit/rework, automatic module scoring, and final quality gates. Session sharing also supports pair or multi-person collaborative coding around live agent sessions. Built-in Auto supervision can judge completed turns, continue work autonomously, and optionally run an audit/rework loop before handing control back. Team discussion lets multiple models review and audit each other's plans and implementations — an effective way to reduce single-model misses, blind spots, and biases.
+IM.codes connects AI agents not only to coding sessions, but also to the computers where work happens. Enroll supported machines as restricted **Controlled Nodes**, then let an authorized agent operate one computer or coordinate work across many with scoped commands, file transfer, and typed Computer Use. When a person needs to see or take over, capable Windows nodes also provide browser-based remote desktop from desktop or mobile.
+
+Alongside machine control, IM.codes gives coding agents one shared memory layer and one managed MCP tool surface across providers. It turns completed work into reusable context across [Claude Code](https://github.com/anthropics/claude-code), [Codex](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), GitHub Copilot, Cursor, OpenCode, [OpenClaw](https://openclaw.com), [Qwen](https://github.com/QwenLM/qwen-agent), and more. Terminal access, file and Git views, localhost preview, notifications, multi-agent workflows, OpenSpec Auto Deliver, Auto supervision, and cross-provider Team audit keep both human and agent work visible and connected.
 
 > **Disclaimer:** This is an actively developed personal open-source project. There are no warranties, no SLA, and no guarantees of stability, security, or backward compatibility. Use at your own risk.
+
+## Controlled Nodes: AI Fleet Control
+
+Turn supported computers into AI-operated nodes without making each machine a full IM.codes source server.
+
+- **One AI, multiple computers.** Enroll multiple machines and let one agent—or a team of agents—coordinate tasks across the fleet.
+- **Real computer actions.** Run scoped commands, move individual files, and control desktop applications through typed Computer Use tools.
+- **Remote desktop when humans need it.** Open a capable Windows node from a browser or mobile device to view the screen or take control directly.
+- **Scoped and revocable.** Every node has independent credentials, remains separate from normal server/session lists, and can have execution access disabled or revoked by its owner.
 
 ## Screenshots
 
@@ -128,19 +139,13 @@ Save owner-scoped reusable text snippets and insert them from the composer by ty
 
 ### Controlled Nodes
 
-Enroll another machine as a restricted controlled node without turning it into a full IM.codes source server. Type `^` to autocomplete a target or insert `^^(name)` directly, then authorized agents can run scoped remote commands, transfer individual files, or invoke typed Computer Use tools on that node. Execution remains owner-gated and revocable, controlled nodes stay out of normal server/session lists, and each enrolled machine receives independent credentials. Download links expire, but a newly downloaded installer can be kept and reused to enroll multiple machines.
+Enroll one or many computers, type `^` to choose a target (or insert `^^(name)` directly), and let authorized agents carry out work on the selected machine. Agents can run scoped commands, transfer individual files, and use typed Computer Use tools—making it practical to operate and coordinate a fleet of computers from the same conversation. Execution remains owner-gated and revocable, every node receives independent credentials, and controlled nodes stay separate from normal server/session lists. Download links expire, but a downloaded installer can be kept and reused to enroll multiple machines.
 
 ### Windows Remote Desktop
 
-Capable Windows controlled nodes expose a continuous H.264 remote desktop to authorized Owners and Participants. The browser and native worker negotiate a direct WebRTC route first and use TURN UDP/TCP only as fallback; video and mouse/keyboard data never pass through the application Server. Control is the default mode, multiple authorized controllers are allowed, and each viewer can switch independently to View mode. Display tabs support a context menu (right-click, keyboard context-menu key, or mobile long-press) for 720p, 1080p, 1440p, and 4K modes. Mobile includes pinch/drag navigation plus a zoomed virtual-mouse mode with edge pan, left/middle/right buttons, and wheel scrolling.
+Capable Windows controlled nodes provide remote desktop to authorized Owners and Participants directly in the browser. Use Control or View mode, switch displays and resolution, and invite multiple authorized viewers or controllers when collaboration is needed. On mobile, touch navigation and a virtual mouse make full desktop control practical from a phone or tablet.
 
-macOS and Linux controlled nodes are supported soon; today the feature is offered only by capable Windows nodes, and a node that cannot serve it simply does not advertise the capability.
-
-The Windows package is a signed, prebuilt worker: controlled nodes do not install compilers or media dependencies. Capture uses DXGI Desktop Duplication and encoding uses a low-latency Media Foundation H.264 transform. Hardware encoding is preferred when it passes its runtime gate; the qualified Windows software transform keeps integrated-only, AMD, NVIDIA-without-NVENC, and headless systems eligible without a GPU-vendor requirement. A signed on-demand virtual display is used only when no presentable real display exists and is removed after the last session. Protected video, the lock screen, and UAC secure desktop are intentionally not bypassed.
-
-Operators should expose TURN TCP and UDP on `TURN_PORT` (default `3479`) and UDP relay ports `TURN_RELAY_MIN_PORT`–`TURN_RELAY_MAX_PORT` (defaults `49160`–`49200`), set `TURN_HOST`, `TURN_EXTERNAL_IP`, and a strong `TURN_SHARED_SECRET`, and monitor relay bandwidth. `IMCODES_REMOTE_DESKTOP_ENABLED=0` is the fail-closed kill switch for new sessions; omitting it enables the feature only when the node advertises a verified worker. Revocation, execution disable, browser/daemon loss, lease expiry, local Stop, or worker failure closes input and releases pressed keys/buttons. Existing Computer Use, exec, heartbeat, and file-transfer functions remain available when remote desktop is disabled.
-
-Troubleshooting starts with the panel's bounded route/RTT/FPS/bitrate/encoder diagnostics and the node's worker health status. A missing capability means the signed worker or manifest did not verify; `media_unavailable` usually means no presentable desktop or compliant encoder; repeated TURN use means direct ICE is unavailable. Roll back with the normal controlled-node upgrade path—the installer restores the prior node, worker, manifest, and only the exact IM.codes virtual-display package added by that attempt.
+Remote desktop automatically uses the best available connection and falls back when a direct route is unavailable. Access remains permission-controlled and revocable. Remote desktop is currently available on supported Windows nodes; macOS and Linux controlled nodes can still use their other node capabilities, with remote desktop support planned.
 
 ### Computer Use & Browser Automation
 

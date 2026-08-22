@@ -3,17 +3,28 @@
 [English](../README.md) | [簡體中文](README.zh-CN.md) | [繁體中文](README.zh-TW.md) | [Español](README.es.md) | [Русский](README.ru.md) | [日本語](README.ja.md) | [한국어](README.ko.md)
 
 
-**給 AI agent 的 IM。共享記憶、OpenSpec 自動交付、託管 MCP 工具、受監督執行，以及跨模型審計。**
+**給 AI agent 的 IM。AI 群控、遠端桌面、共享記憶、OpenSpec 自動交付、託管 MCP 工具、受監督執行，以及跨模型審計。**
 
 > 三個臭皮匠，頂個諸葛亮。<br>
 > 三個諸葛亮，談笑定陰陽。<br>
 > — IM.codes
 
-IM.codes 為 coding agent 提供一套跨 provider 共享的記憶層和託管 MCP 工具面。它會把已完成的工作沉澱成可重用上下文，再把合適的歷史注入或召回到後續 session，貫通 [Claude Code](https://github.com/anthropics/claude-code)、[Codex](https://github.com/openai/codex)、[Gemini CLI](https://github.com/google-gemini/gemini-cli)、GitHub Copilot、Cursor、OpenCode、[OpenClaw](https://openclaw.com)、[Qwen](https://github.com/QwenLM/qwen-agent) 等，同時提供終端存取、檔案瀏覽、Git 視圖、localhost 預覽、通知、多 agent 工作流，以及 transport 型 agent 的原生串流輸出。OpenSpec 自動交付可以把一個變更從提案/規格審計推進到實作、驗證建議、團隊審計/返工、自動模組打分和最終品質門控。Session 分享也支援圍繞即時 agent session 的雙人或多人協作編程。內建 Auto supervision 可在每輪完成後判斷任務是否完成、是否繼續自動執行，並可選進入審計/返工閉環後再把控制權交還給你。內建團隊討論功能，讓多個模型互相審閱對方的方案和實作，能有效減少單模型的遺漏、盲點和偏差。
+IM.codes 不只連接 AI agent 的 coding session，也把 agent 連接到真正執行工作的電腦。把支援的機器註冊成受限的**受控節點（Controlled Nodes）**，一個 AI 或一組 AI 就能透過有作用域的命令、檔案傳輸和 Computer Use 操作一台或協調多台電腦；需要人工查看或接管時，具備條件的 Windows 節點還能直接從桌面瀏覽器或手機開啟遠端桌面。
+
+在機器控制之外，IM.codes 也為 coding agent 提供跨 provider 共享的記憶層和託管 MCP 工具面，把已完成工作沉澱成可重用上下文，貫通 [Claude Code](https://github.com/anthropics/claude-code)、[Codex](https://github.com/openai/codex)、[Gemini CLI](https://github.com/google-gemini/gemini-cli)、GitHub Copilot、Cursor、OpenCode、[OpenClaw](https://openclaw.com)、[Qwen](https://github.com/QwenLM/qwen-agent) 等。終端、檔案與 Git 視圖、localhost 預覽、通知、多 agent 工作流、OpenSpec 自動交付、Auto supervision 和跨模型 Team 審計，讓人與 AI 的工作保持可見、可控、可銜接。
 
 > **說明：** 本文件是繁體中文翻譯版。**英文 README（`../README.md`）是規範版本。** 若內容有出入，以英文版為準。
 
 支援多個 agent 透過 CLI 和 SDK 兩種方式接入。
+
+## AI 群控與受控節點
+
+不必把每台電腦都設成完整的 IM.codes source server，就能把支援的機器接入為 AI 可操作的受控節點。
+
+- **一個 AI，控制多台電腦。** 註冊多台機器，讓一個 agent 或一組 agent 在多台電腦之間協調與分派任務。
+- **執行真實電腦操作。** 執行有作用域的命令、傳輸單一檔案，並透過型別化 Computer Use 工具操作桌面應用程式。
+- **需要人工時隨時遠端接管。** 從瀏覽器或手機開啟具備條件的 Windows 節點，直接查看畫面或進行遠端控制。
+- **權限明確，隨時可撤銷。** 每台節點使用獨立憑證，不混入一般 server/session 清單，擁有者可關閉執行權限或直接撤銷節點。
 
 ## 截圖
 
@@ -130,13 +141,13 @@ IM.codes 可用你自己的 supervisor 提示詞對支援的 agent session 做�
 
 ### 受控節點
 
-把另一台機器註冊為受限的受控節點，而不必將它變成完整的 IM.codes source server。輸入 `^` 自動完成目標，或直接插入 `^^(name)`；獲授權的 agent 隨後可在該節點執行有作用域的遠端命令、傳輸單一檔案，或呼叫型別化的 Computer Use 工具。執行能力由擁有者啟用並可隨時撤銷，受控節點不會混入一般 server/session 清單，每台機器也使用獨立憑證。下載連結會過期，但新下載的安裝套件可長期保留並重複用來註冊多台機器。
+註冊一台或多台電腦，輸入 `^` 選擇目標（或直接插入 `^^(name)`），獲授權的 agent 就能在選定的機器上執行任務。它可以執行有作用域的命令、傳輸單一檔案，並呼叫型別化 Computer Use 工具，適合在同一段對話中操作與協調一組電腦。執行能力由擁有者啟用並可隨時撤銷，每台節點使用獨立憑證，也不會混入一般 server/session 清單。下載連結會過期，但已下載的安裝套件可以保留並重複用來註冊多台機器。
 
 ### 遠端桌面控制
 
-具備條件的受控節點可以向獲授權的擁有者與參與者提供連續的 H.264 遠端桌面。瀏覽器與原生 worker 會優先協商點對點直連，僅在必要時回退到 TURN；畫面與滑鼠鍵盤資料不經過應用伺服器。預設即為控制模式，允許多個獲授權的控制者，每個觀看者也可以各自切回觀看模式。顯示器分頁支援右鍵/長按選單切換 720p、1080p、1440p 與 4K；手機端支援雙指縮放拖曳，以及帶邊緣平移、左中右鍵與滾輪的虛擬滑鼠模式。
+具備條件的 Windows 受控節點可向獲授權的擁有者與參與者提供瀏覽器遠端桌面。支援控制/觀看模式、顯示器與清晰度切換，也允許多個獲授權使用者共同查看或控制；手機端提供觸控導覽與虛擬滑鼠，方便從手機或平板完整操作桌面。
 
-Windows 使用簽章的預編譯 worker，受控節點無需安裝編譯器或媒體相依套件。**目前支援 Windows，macOS 與 Linux 即將支援。**
+遠端桌面會自動選擇可用連線，權限可隨時撤銷。**目前遠端桌面支援 Windows；macOS 與 Linux 受控節點仍可使用其他節點能力，遠端桌面支援正在規劃中。**
 
 ### Computer Use 與瀏覽器自動化
 
