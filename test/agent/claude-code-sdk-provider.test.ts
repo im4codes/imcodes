@@ -299,6 +299,8 @@ describe('ClaudeCodeSdkProvider', () => {
     expect(run.options.resume).toBeUndefined();
     expect(run.options.includePartialMessages).toBe(true);
     expect(run.options.permissionMode).toBe('bypassPermissions');
+    expect(run.options.settings).toMatchObject({ workflowSizeGuideline: 'small' });
+    expect(run.options.appendSubagentSystemPrompt).toContain('Do not spawn additional subagents');
     // Native scheduling tools are disabled so the agent uses our imcodes-memory
     // MCP cron instead of creating claude.ai routines via RemoteTrigger.
     expect(run.options.disallowedTools).toContain('RemoteTrigger');
@@ -346,10 +348,32 @@ describe('ClaudeCodeSdkProvider', () => {
       { type: 'system', subtype: 'init', session_id: 'session-sub', model: 'claude-sonnet-4-6' },
       { type: 'stream_event', session_id: 'session-sub', event: { type: 'message_start', message: { id: 'fg-1' } } },
       { type: 'stream_event', session_id: 'session-sub', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: "I'll begin" } } },
+      // A real foreground tool remains open while a child happens to reuse the
+      // same content-block index. The child must not replace or complete it.
+      {
+        type: 'stream_event', session_id: 'session-sub',
+        event: { type: 'content_block_start', index: 1, content_block: { type: 'tool_use', id: 'fg-tool-1', name: 'Read', input: {} } },
+      },
+      {
+        type: 'stream_event', session_id: 'session-sub',
+        event: { type: 'content_block_delta', index: 1, delta: { type: 'input_json_delta', partial_json: '{"file_path":"main.ts"}' } },
+      },
       // Subagent starts and streams while the foreground message is still open.
       { type: 'stream_event', session_id: 'session-sub', parent_tool_use_id: 'toolu_sub_1', event: { type: 'message_start', message: { id: 'sub-1' } } },
       { type: 'stream_event', session_id: 'session-sub', parent_tool_use_id: 'toolu_sub_1', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'SUBAGENT REPORT' } } },
       { type: 'stream_event', session_id: 'session-sub', parent_tool_use_id: 'toolu_sub_1', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: ' CONTINUED' } } },
+      {
+        type: 'stream_event', session_id: 'session-sub', parent_tool_use_id: 'toolu_sub_1',
+        event: { type: 'content_block_start', index: 1, content_block: { type: 'tool_use', id: 'sub-stream-tool-1', name: 'Bash', input: {} } },
+      },
+      {
+        type: 'stream_event', session_id: 'session-sub', parent_tool_use_id: 'toolu_sub_1',
+        event: { type: 'content_block_delta', index: 1, delta: { type: 'input_json_delta', partial_json: '{"command":"private"}' } },
+      },
+      {
+        type: 'stream_event', session_id: 'session-sub', parent_tool_use_id: 'toolu_sub_1',
+        event: { type: 'content_block_stop', index: 1 },
+      },
       // The SDK also flushes a full assistant frame for the subagent. Filtering
       // only its stream_event frames is insufficient: this frame used to
       // replace the foreground accumulator with the subagent's final text.
@@ -373,6 +397,7 @@ describe('ClaudeCodeSdkProvider', () => {
           stop_reason: 'end_turn',
         },
       },
+      { type: 'stream_event', session_id: 'session-sub', event: { type: 'content_block_stop', index: 1 } },
       // Foreground resumes; it must continue from its own text, not the Task's.
       { type: 'stream_event', session_id: 'session-sub', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: ' searching.' } } },
       { type: 'assistant', session_id: 'session-sub', message: { content: [{ type: 'text', text: "I'll begin searching." }] } },
@@ -398,7 +423,10 @@ describe('ClaudeCodeSdkProvider', () => {
     // The foreground message accumulates only its own text, uninterrupted.
     const foreground = deltas.filter((d) => d.id === 'fg-1').map((d) => d.text);
     expect(foreground).toEqual(["I'll begin", "I'll begin searching."]);
-    expect(tools).not.toContainEqual({ id: 'sub-tool-1', name: 'Bash' });
+    expect(tools).toEqual([
+      { id: 'fg-tool-1', name: 'Read' },
+      { id: 'fg-tool-1', name: 'Read' },
+    ]);
   });
 
   it('resets the streaming accumulator across messages so a second message is not prefixed with the first', async () => {
@@ -2043,6 +2071,78 @@ describe('ClaudeCodeSdkProvider', () => {
       currentQueryActive: true,
     });
     await provider.endSession('route-local-bash-task');
+  });
+
+  it('does not wake a retained parent for child Bash completions while a real agent is still active', async () => {
+    vi.useFakeTimers();
+    sdkMock.setWaitForClose(true);
+    let finishAgent!: (message: unknown) => void;
+    const agentTerminal = new Promise((resolve) => { finishAgent = resolve; });
+    sdkMock.setNextMessages([
+      { type: 'system', subtype: 'init', session_id: 'session-nested-bash', model: 'claude-sonnet-4-6' },
+      {
+        type: 'system', subtype: 'task_started', session_id: 'session-nested-bash',
+        task_id: 'bash-search-1', tool_use_id: 'bash-tool-1', task_type: 'local_bash',
+        description: 'Run one child search',
+      },
+      {
+        type: 'assistant', session_id: 'session-nested-bash', parent_tool_use_id: null,
+        message: { content: [{ type: 'text', text: 'Waiting for the research agent.' }], stop_reason: 'end_turn' },
+      },
+      {
+        type: 'system', subtype: 'task_notification', session_id: 'session-nested-bash',
+        task_id: 'bash-search-1', status: 'completed', summary: 'Child search complete',
+      },
+      // The SDK can register the owning agent after the detached Bash terminal
+      // was observed. The fallback timer must re-evaluate ownership rather than
+      // trusting that earlier ordering and waking the parent once per command.
+      {
+        type: 'system', subtype: 'task_started', session_id: 'session-nested-bash',
+        task_id: 'agent-research-1', tool_use_id: 'agent-tool-1', task_type: 'local_agent',
+        description: 'Research buyers',
+      },
+      agentTerminal,
+    ]);
+
+    const provider = new ClaudeCodeSdkProvider();
+    await provider.connect({ binaryPath: 'claude' });
+    await provider.createSession({
+      sessionKey: 'route-nested-bash',
+      sessionName: 'deck_project_claude_nested_bash',
+      cwd: '/tmp/project',
+      resumeId: 'session-nested-bash',
+    });
+
+    const sendPromise = provider.send('route-nested-bash', 'deep research');
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(1_500);
+
+    const queuedCompletionTexts = () => ((sdkMock.runs[0]?.promptSource as {
+      buffer?: Array<{ message?: { content?: unknown } }>;
+    })?.buffer ?? [])
+      .map((entry) => entry.message?.content)
+      .filter((content): content is string => typeof content === 'string' && content.includes('# IM.codes background task completion'));
+    expect(queuedCompletionTexts()).toEqual([]);
+    expect(provider.getSessionDiagnostics('route-nested-bash')).toMatchObject({
+      completed: true,
+      retainedSubagentMode: true,
+      currentQueryActive: true,
+    });
+
+    finishAgent({
+      type: 'system', subtype: 'task_notification', session_id: 'session-nested-bash',
+      task_id: 'agent-research-1', status: 'completed', summary: 'Research complete',
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(1_500);
+
+    expect(queuedCompletionTexts()).toHaveLength(1);
+    expect(queuedCompletionTexts()[0]).toContain('"taskId":"agent-research-1"');
+    expect(queuedCompletionTexts()[0]).toContain('"kind":"agent"');
+    expect(queuedCompletionTexts()[0]).not.toContain('bash-search-1');
+
+    await provider.endSession('route-nested-bash');
+    await sendPromise;
   });
 
   it('closes stale Claude task snapshots so background monitor evidence cannot block forever', async () => {
