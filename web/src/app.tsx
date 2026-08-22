@@ -71,6 +71,7 @@ import { AdminPage } from './pages/AdminPage.js';
 import { CronManager } from './pages/CronManager.js';
 import { SharedContextManagementPanel } from './components/SharedContextManagementPanel.js';
 import { ControlledNodesPanel } from './components/ControlledNodesPanel.js';
+import { ControlledNodeQuickMenu } from './components/ControlledNodeQuickMenu.js';
 import { RemoteDesktopPanel } from './components/RemoteDesktopPanel.js';
 import { DaemonRemoteDesktopControl } from './components/DaemonRemoteDesktopControl.js';
 import type { MachineListItem } from './api/machines.js';
@@ -5154,13 +5155,15 @@ export function App() {
               >
                 {trans('sharedContext.diagnostics.title')}
               </button>
-              <button
-                class="btn"
-                style={{ background: '#334155', color: '#e2e8f0', fontSize: 12 }}
-                onClick={openControlledNodes}
-              >
-                {trans('controlled_nodes.title')}
-              </button>
+              <div class="controlled-nodes-shortcut-group">
+                <button
+                  class="btn controlled-nodes-shortcut-main"
+                  onClick={openControlledNodes}
+                >
+                  {trans('controlled_nodes.title')}
+                </button>
+                <ControlledNodeQuickMenu onOpenRemoteDesktop={openRemoteDesktop} />
+              </div>
               {/* Session-list show/hide toggle — same as the mobile sidebar ⊞ button */}
               <button
                 class="btn"

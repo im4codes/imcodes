@@ -603,6 +603,23 @@ vi.mock('../src/components/ControlledNodesPanel.js', () => ({
     })}>controlled-nodes-panel</button>
   ),
 }));
+vi.mock('../src/components/ControlledNodeQuickMenu.js', () => ({
+  ControlledNodeQuickMenu: ({ onOpenRemoteDesktop }: any) => (
+    <button
+      data-testid="controlled-node-quick-trigger"
+      onClick={() => onOpenRemoteDesktop?.({
+        serverId: 'desktop-quick',
+        refName: 'desktop-quick-ref',
+        displayName: 'Desktop Quick',
+        os: 'win',
+        online: true,
+        execEnabled: true,
+        accessRole: 'owner',
+        capabilities: [],
+      })}
+    >controlled-node-quick-trigger</button>
+  ),
+}));
 vi.mock('../src/components/RemoteDesktopPanel.js', () => ({
   RemoteDesktopPanel: ({ minimized, onMinimize, onRestore, onClose }: any) => (
     <div data-testid="remote-desktop-panel">
@@ -1086,6 +1103,20 @@ describe('App shell', () => {
     expect(await screen.findByText('remote-desktop-panel:true')).toBeTruthy();
     fireEvent.click(screen.getByText('remote-desktop-restore'));
     expect(await screen.findByText('remote-desktop-panel:false')).toBeTruthy();
+  }, 20_000);
+
+  it('opens remote control from the sidebar chevron without opening node management', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+    const { App } = await importApp();
+    render(<App />);
+    await waitFor(() => expect(wsInstances.length).toBe(1));
+
+    fireEvent.click(await screen.findByTestId('controlled-node-quick-trigger'));
+    expect(await screen.findByText('remote-desktop-panel:false')).toBeTruthy();
+    expect(screen.queryByTestId('floating-panel-controlled-nodes')).toBeNull();
   }, 20_000);
 
   it('puts remote control in the desktop toolbar, not only on mobile', async () => {
