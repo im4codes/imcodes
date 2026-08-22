@@ -335,15 +335,13 @@ describe('ClaudeCodeSdkProvider', () => {
     expect([...state.subagentTasks.keys()]).toEqual(['running-1']);
   });
 
-  it('keeps a subagent stream out of the foreground message', async () => {
-    // A Task subagent's stream_events ride the SAME session stream, tagged with
+  it('keeps subagent stream and full assistant frames out of the foreground message', async () => {
+    // A Task subagent's frames ride the SAME session stream, tagged with
     // `parent_tool_use_id`. `currentText` / `currentMessageId` describe the
-    // FOREGROUND message only, and neither the accumulator reset nor the text
-    // deltas checked that tag — so a running subagent first spliced its output
-    // onto the end of the foreground sentence, then wiped it entirely when its
-    // own message_start reset the shared buffer. Observed live: a bubble
-    // reading "I'll begin searching across the categories." was replaced by
-    // successive slices of a subagent's unrelated report under the same id.
+    // FOREGROUND message only. The token-stream path already checks that tag,
+    // but the trailing full assistant frames did not: a text frame replaced
+    // the foreground body, while a tool-only frame reset it to an empty string.
+    // The next foreground token then rendered only the suffix after that reset.
     sdkMock.setNextMessages([
       { type: 'system', subtype: 'init', session_id: 'session-sub', model: 'claude-sonnet-4-6' },
       { type: 'stream_event', session_id: 'session-sub', event: { type: 'message_start', message: { id: 'fg-1' } } },
@@ -352,6 +350,29 @@ describe('ClaudeCodeSdkProvider', () => {
       { type: 'stream_event', session_id: 'session-sub', parent_tool_use_id: 'toolu_sub_1', event: { type: 'message_start', message: { id: 'sub-1' } } },
       { type: 'stream_event', session_id: 'session-sub', parent_tool_use_id: 'toolu_sub_1', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'SUBAGENT REPORT' } } },
       { type: 'stream_event', session_id: 'session-sub', parent_tool_use_id: 'toolu_sub_1', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: ' CONTINUED' } } },
+      // The SDK also flushes a full assistant frame for the subagent. Filtering
+      // only its stream_event frames is insufficient: this frame used to
+      // replace the foreground accumulator with the subagent's final text.
+      {
+        type: 'assistant',
+        session_id: 'session-sub',
+        parent_tool_use_id: 'toolu_sub_1',
+        message: {
+          id: 'sub-1-tools',
+          content: [{ type: 'tool_use', id: 'sub-tool-1', name: 'Bash', input: { command: 'private subagent command' } }],
+          stop_reason: 'tool_use',
+        },
+      },
+      {
+        type: 'assistant',
+        session_id: 'session-sub',
+        parent_tool_use_id: 'toolu_sub_1',
+        message: {
+          id: 'sub-1-final',
+          content: [{ type: 'text', text: 'SUBAGENT FULL REPORT' }],
+          stop_reason: 'end_turn',
+        },
+      },
       // Foreground resumes; it must continue from its own text, not the Task's.
       { type: 'stream_event', session_id: 'session-sub', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: ' searching.' } } },
       { type: 'assistant', session_id: 'session-sub', message: { content: [{ type: 'text', text: "I'll begin searching." }] } },
@@ -363,7 +384,9 @@ describe('ClaudeCodeSdkProvider', () => {
     await provider.createSession({ sessionKey: 'route-sub', cwd: '/tmp/project', resumeId: 'session-sub' });
 
     const deltas: Array<{ id: string; text: string }> = [];
+    const tools: Array<{ id: string; name: string }> = [];
     provider.onDelta((_sid, delta) => deltas.push({ id: delta.messageId, text: delta.delta }));
+    provider.onToolCall((_sid, tool) => tools.push({ id: tool.id, name: tool.name }));
 
     await provider.send('route-sub', 'hello');
     await flush();
@@ -375,6 +398,7 @@ describe('ClaudeCodeSdkProvider', () => {
     // The foreground message accumulates only its own text, uninterrupted.
     const foreground = deltas.filter((d) => d.id === 'fg-1').map((d) => d.text);
     expect(foreground).toEqual(["I'll begin", "I'll begin searching."]);
+    expect(tools).not.toContainEqual({ id: 'sub-tool-1', name: 'Bash' });
   });
 
   it('resets the streaming accumulator across messages so a second message is not prefixed with the first', async () => {

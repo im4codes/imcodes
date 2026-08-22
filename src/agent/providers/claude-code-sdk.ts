@@ -1453,28 +1453,38 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
 
     if (msg.type === 'assistant') {
       const isTopLevelMessage = !('parent_tool_use_id' in msg) || msg.parent_tool_use_id == null;
+      // A Task subagent's trailing FULL assistant frame rides the same SDK
+      // iterator as the foreground conversation, just like its stream_event
+      // frames above. The streaming path already rejects those frames, but the
+      // full-message path used to continue below and overwrite currentText
+      // under the foreground message id. On the next foreground delta the UI
+      // therefore jumped from "<main prefix>" to "<subagent tail><new token>",
+      // which looked exactly like the beginning of the streamed reply vanished.
+      //
+      // Subagent lifecycle/progress is projected through the dedicated task
+      // snapshots; its private assistant text and internal tool blocks must
+      // never mutate or render as the foreground assistant message.
+      if (!isTopLevelMessage) return;
       const assistantMessageId = typeof msg.message?.id === 'string' && msg.message.id
         ? msg.message.id
         : undefined;
-      if (isTopLevelMessage && !state.completed && assistantMessageId && !state.currentMessageId) {
+      if (!state.completed && assistantMessageId && !state.currentMessageId) {
         state.currentMessageId = assistantMessageId;
       }
       const assistantUsage = msg.message?.usage as ClaudeUsageSnapshot | undefined;
-      if (isTopLevelMessage) {
-        this.recordClaudeUsage(
-          sessionId,
-          state,
-          assistantUsage,
-          assistantMessageId ?? state.currentMessageId ?? undefined,
-          state.completed,
-        );
-      }
+      this.recordClaudeUsage(
+        sessionId,
+        state,
+        assistantUsage,
+        assistantMessageId ?? state.currentMessageId ?? undefined,
+        state.completed,
+      );
       // includePartialMessages can emit message_delta(end_turn) and then flush
       // the matching full assistant frame. The stream boundary already emitted
       // and cleared the foreground, so the full frame is metadata-only; do not
       // re-emit its text as a duplicate bubble/completion. A genuine retained
       // task wake resets completed=false before its first assistant frame.
-      if (isTopLevelMessage && state.completed) return;
+      if (state.completed) return;
       const collectedAssistantText = collectAssistantText(msg);
       const transientCredentialRefresh403 = isClaudeCredentialRefresh403(collectedAssistantText);
       const rawAssistantText = transientCredentialRefresh403
@@ -1533,7 +1543,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       const isTerminalForegroundStop = typeof stopReason === 'string'
         && stopReason !== 'tool_use'
         && stopReason !== 'pause_turn';
-      if (isTopLevelMessage && !hasToolBlock && isTerminalForegroundStop) {
+      if (!hasToolBlock && isTerminalForegroundStop) {
         this.completeTerminalAssistantForeground(sessionId, state);
       }
       return;
