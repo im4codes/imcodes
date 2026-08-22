@@ -708,6 +708,13 @@ function attachChannel(transfer: ActiveDirectTransfer, channel: DataChannel): vo
     return;
   }
   transfer.channel = channel;
+  // A channel arriving is progress, so the no-progress window restarts here.
+  // It is armed at authorization, before any channel exists, which means the
+  // browser's ICE and DTLS work was being charged against a timer meant to
+  // measure a stalled transfer. That was harmless while the browser gave up
+  // after a few seconds; now that a relayed path is allowed to take longer to
+  // open, keep the two independent rather than merely far enough apart.
+  resetTransferIdleTimer(transfer);
   channel.onMessage((message) => {
     if (typeof message !== 'string') {
       const bytes = message instanceof ArrayBuffer

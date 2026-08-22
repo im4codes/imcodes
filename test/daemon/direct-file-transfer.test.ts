@@ -751,6 +751,45 @@ describe('daemon direct file transfer v2 lease broker', () => {
     await direct.shutdownDirectFileTransfers();
   });
 
+  it('restarts the no-progress window when a slow relayed channel finally attaches', async () => {
+    // The window is armed at authorization, before any channel exists, so a
+    // browser still completing ICE and DTLS was spending it. A relayed path is
+    // allowed to take tens of seconds to open; the attempt must not be failed
+    // for a stall that has not happened yet.
+    vi.useFakeTimers();
+    const { direct, sent, sender } = await readyLease();
+    const authority = uploadPrepare({
+      ...binding({ requestId: 'slow-request-00000001', attemptId: 'slow-attempt-00000001', operationId: 'slow-operation-000001' }),
+      clientUploadId: 'slow-operation-000001',
+      channelLabel: 'imcodes-file-slowopen-0001',
+    });
+    await direct.handleDirectFileTransferCommand(authority, sender);
+
+    const beforeAttach = DIRECT_FILE_TRANSFER_LIMITS.NO_PROGRESS_TIMEOUT_MS - 5_000;
+    await vi.advanceTimersByTimeAsync(beforeAttach);
+    const channel = new FakeDataChannel(authority.channelLabel as string);
+    FakePeerConnection.latest!.emitDataChannel(channel);
+    await vi.advanceTimersByTimeAsync(0);
+
+    // Past the deadline measured from authorization, but well inside a window
+    // measured from the channel arriving.
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(sent).not.toContainEqual(expect.objectContaining({
+      attemptId: 'slow-attempt-00000001',
+      error: DIRECT_FILE_TRANSFER_ERROR.NO_PROGRESS_TIMEOUT,
+    }));
+
+    // A channel that then goes quiet is still a stall, and still fails.
+    await vi.advanceTimersByTimeAsync(DIRECT_FILE_TRANSFER_LIMITS.NO_PROGRESS_TIMEOUT_MS);
+    await vi.waitFor(() => expect(sent).toContainEqual(expect.objectContaining({
+      type: DIRECT_FILE_TRANSFER_MSG.ERROR,
+      attemptId: 'slow-attempt-00000001',
+      error: DIRECT_FILE_TRANSFER_ERROR.NO_PROGRESS_TIMEOUT,
+      retryable: true,
+    })));
+    await direct.shutdownDirectFileTransfers();
+  });
+
   it('cancels atomically, removes the partial file, and ignores late frames from the stale attempt', async () => {
     const { direct, sent, sender } = await readyLease();
     const first = uploadPrepare({
