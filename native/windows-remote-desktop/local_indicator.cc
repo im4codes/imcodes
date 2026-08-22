@@ -308,10 +308,15 @@ LRESULT LocalIndicator::HandleMessage(HWND window, UINT message,
         } else if (wparam == WTS_SESSION_LOGOFF ||
                    wparam == WTS_CONSOLE_DISCONNECT ||
                    wparam == WTS_REMOTE_DISCONNECT) {
+          // "Unavailable" describes the user session, not this LocalSystem
+          // worker or its peer. The runtime keeps the peer and waits for the
+          // Winlogon desktop to become readable.
           environment_changed_(kEnvironmentSessionUnavailable);
         } else if (wparam == WTS_SESSION_LOGON ||
                    wparam == WTS_CONSOLE_CONNECT ||
                    wparam == WTS_REMOTE_CONNECT) {
+          // Logon/connect is the other half of the same in-place desktop
+          // transition; it must not request a fresh media process.
           environment_changed_(kEnvironmentSessionAvailable);
         }
       }

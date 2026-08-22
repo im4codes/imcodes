@@ -540,6 +540,10 @@ const contracts: Contract[] = [
         needle: 'SelectDesktopFollowAction',
       },
       {
+        path: 'native/windows-remote-desktop/worker_policy.cc',
+        needle: 'kEnvironmentSessionUnavailable |\n                    kEnvironmentSessionAvailable',
+      },
+      {
         path: 'native/windows-remote-desktop/local_indicator.cc',
         needle: 'kEnvironmentSessionLocked',
       },
@@ -1214,6 +1218,12 @@ const mutations: Mutation[] = [
     contract: 'one console-session worker that follows the desktop',
     path: 'web/src/remote-desktop-client.ts',
     needle: 'await this.renegotiate();',
+  },
+  {
+    name: 'end the peer when Windows logs on or off',
+    contract: 'one console-session worker that follows the desktop',
+    path: 'native/windows-remote-desktop/worker_policy.cc',
+    needle: 'kEnvironmentSessionUnavailable |\n                    kEnvironmentSessionAvailable',
   },
   {
     name: 'let a stale desktop choice stand',

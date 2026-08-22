@@ -19,19 +19,24 @@ CaptureAcquireAction ClassifyCaptureAcquireResult(HRESULT result) {
 }
 
 WorkerEnvironmentAction SelectWorkerEnvironmentAction(uint32_t event_mask) {
-  if (event_mask & (kEnvironmentSuspend |
-                    kEnvironmentSessionUnavailable)) {
+  if (event_mask & kEnvironmentSuspend) {
     return WorkerEnvironmentAction::kStopProtected;
   }
-  // A lock or unlock only moves the desktop, so it is answered by following
-  // rather than by tearing the session down. It is checked after the stop
-  // cases so a logoff that arrives with it still wins.
-  if (event_mask & (kEnvironmentSessionLocked | kEnvironmentSessionUnlocked))
+  // Power/compositor recovery may invalidate the encoder and duplication, not
+  // merely move them to another desktop, so it still needs a fresh media
+  // process even when Windows reports a session transition beside it.
+  if (event_mask & (kEnvironmentResume | kEnvironmentCompositionChanged))
+    return WorkerEnvironmentAction::kStopAndReinitialize;
+  // Lock, unlock, logoff, logon and console connect/disconnect all move the
+  // visible/input desktop. One LocalSystem worker can follow every one of those
+  // boundaries in place; classifying logon/logoff as availability changes is
+  // what tore down a healthy peer while the picture itself was switching.
+  if (event_mask & (kEnvironmentSessionLocked |
+                    kEnvironmentSessionUnlocked |
+                    kEnvironmentSessionUnavailable |
+                    kEnvironmentSessionAvailable)) {
     return WorkerEnvironmentAction::kFollowDesktop;
-  if (event_mask & (kEnvironmentResume | kEnvironmentSessionAvailable))
-    return WorkerEnvironmentAction::kStopAndReinitialize;
-  if (event_mask & kEnvironmentCompositionChanged)
-    return WorkerEnvironmentAction::kStopAndReinitialize;
+  }
   if (event_mask & kEnvironmentDisplayChanged)
     return WorkerEnvironmentAction::kRefreshTopology;
   return WorkerEnvironmentAction::kNone;
@@ -54,8 +59,13 @@ bool AdvanceGdiFallbackState(bool captured,
 DesktopFollowAction SelectDesktopFollowAction(
     const std::wstring& input_desktop,
     const std::wstring& bound,
+    bool session_transition_pending,
     int* consecutive_failures) {
   if (input_desktop.empty()) {
+    if (session_transition_pending) {
+      if (consecutive_failures) *consecutive_failures = 0;
+      return DesktopFollowAction::kStay;
+    }
     if (consecutive_failures &&
         ++(*consecutive_failures) >= kDesktopFollowFailureLimit) {
       *consecutive_failures = 0;

@@ -404,6 +404,9 @@ class WorkerRuntime {
         // desktop again, inside a single poll period. The tick below runs in
         // this same call: it reconciles capture immediately and moves the
         // indicator once the desktop has actually settled.
+        session_transition_pending_ = true;
+        g_input_desktop_ready.store(false);
+        ReleaseAllInputOnSignaling();
         desktop_follow_candidate_.clear();
       } else if (environment_action == WorkerEnvironmentAction::kStopProtected) {
         StopAllOnSignaling("protected_desktop", true);
@@ -429,6 +432,7 @@ class WorkerRuntime {
         const std::wstring input_desktop = CurrentInputDesktopName();
         const DesktopFollowAction follow = SelectDesktopFollowAction(
             input_desktop, indicator_->BoundDesktop(),
+            session_transition_pending_,
             &desktop_follow_failures_);
         // Evaluated every tick, including the ticks that stay put, so the
         // candidate never carries a desktop from before an unreadable sample.
@@ -449,9 +453,16 @@ class WorkerRuntime {
           // streaming a desktop nobody asked for.
           StopAllOnSignaling("protected_desktop", true);
         }
-        g_input_desktop_ready.store(!input_desktop.empty() &&
+        if (session_transition_pending_ && settled &&
+            !input_desktop.empty()) {
+          session_transition_pending_ = false;
+        }
+        g_input_desktop_ready.store(!session_transition_pending_ &&
+                                    !input_desktop.empty() &&
                                     input_desktop == indicator_->BoundDesktop());
-        const bool expected_desktop = follow != DesktopFollowAction::kUnavailable;
+        const bool expected_desktop =
+            !session_transition_pending_ &&
+            follow != DesktopFollowAction::kUnavailable;
         if (expected_desktop) {
           if (topology_refresh_debounce_ticks_ == 0 &&
               ++topology_scan_ticks_ >= 8) {
@@ -716,7 +727,7 @@ class WorkerRuntime {
     const std::wstring input_desktop = CurrentInputDesktopName();
     if (input_desktop != indicator_->BoundDesktop()) {
       g_input_desktop_ready.store(false);
-      for (const auto& [id, session] : sessions_) input_.ReleaseOwner(id);
+      ReleaseAllInputOnSignaling();
       indicator_->Stop();
       if (!indicator_->Start([this] { RequestLocalStopAll(); },
                              [this](uint32_t event_mask) {
@@ -731,6 +742,10 @@ class WorkerRuntime {
       g_input_desktop_ready.store(indicator_->BoundDesktop() == input_desktop);
     }
     ReconcileCaptureDesktopOnSignaling(input_desktop);
+  }
+
+  void ReleaseAllInputOnSignaling() {
+    for (const auto& [id, session] : sessions_) input_.ReleaseOwner(id);
   }
 
   // Capture goes where input goes: Windows refuses a screen read from any
@@ -900,6 +915,7 @@ class WorkerRuntime {
   int protected_desktop_checks_ = 0;
   int desktop_follow_failures_ = 0;
   std::wstring desktop_follow_candidate_;
+  bool session_transition_pending_ = false;
   bool session_locked_ = false;
   int auto_unlock_raise_attempts_ = 0;
   int auto_unlock_attempts_ = 0;

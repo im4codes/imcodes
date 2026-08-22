@@ -21,14 +21,12 @@ TEST(WorkerPolicyTest, ClassifiesBoundedDxgiDeviceRecovery) {
   EXPECT_EQ(ClassifyCaptureAcquireResult(E_FAIL), CaptureAcquireAction::kDrop);
 }
 
-TEST(WorkerPolicyTest, FailsClosedAcrossDisplaySessionAndPowerChanges) {
+TEST(WorkerPolicyTest, FailsClosedAcrossDisplayAndPowerChanges) {
   EXPECT_EQ(SelectWorkerEnvironmentAction(0),
             WorkerEnvironmentAction::kNone);
   EXPECT_EQ(SelectWorkerEnvironmentAction(kEnvironmentDisplayChanged),
             WorkerEnvironmentAction::kRefreshTopology);
   EXPECT_EQ(SelectWorkerEnvironmentAction(kEnvironmentResume),
-            WorkerEnvironmentAction::kStopAndReinitialize);
-  EXPECT_EQ(SelectWorkerEnvironmentAction(kEnvironmentSessionAvailable),
             WorkerEnvironmentAction::kStopAndReinitialize);
   EXPECT_EQ(SelectWorkerEnvironmentAction(kEnvironmentCompositionChanged),
             WorkerEnvironmentAction::kStopAndReinitialize);
@@ -37,16 +35,16 @@ TEST(WorkerPolicyTest, FailsClosedAcrossDisplaySessionAndPowerChanges) {
             WorkerEnvironmentAction::kStopProtected);
   EXPECT_EQ(SelectWorkerEnvironmentAction(kEnvironmentSessionUnavailable |
                                            kEnvironmentResume),
-            WorkerEnvironmentAction::kStopProtected);
+            WorkerEnvironmentAction::kStopAndReinitialize);
 }
 
 TEST(WorkerPolicyTest, FollowsTheDesktopThatCurrentlyReceivesInput) {
   int failures = 0;
-  EXPECT_EQ(SelectDesktopFollowAction(L"Default", L"Default", &failures),
+  EXPECT_EQ(SelectDesktopFollowAction(L"Default", L"Default", false, &failures),
             DesktopFollowAction::kStay);
-  EXPECT_EQ(SelectDesktopFollowAction(L"Winlogon", L"Default", &failures),
+  EXPECT_EQ(SelectDesktopFollowAction(L"Winlogon", L"Default", false, &failures),
             DesktopFollowAction::kFollow);
-  EXPECT_EQ(SelectDesktopFollowAction(L"Default", L"Winlogon", &failures),
+  EXPECT_EQ(SelectDesktopFollowAction(L"Default", L"Winlogon", false, &failures),
             DesktopFollowAction::kFollow);
   EXPECT_EQ(failures, 0);
 }
@@ -54,21 +52,33 @@ TEST(WorkerPolicyTest, FollowsTheDesktopThatCurrentlyReceivesInput) {
 TEST(WorkerPolicyTest, GivesUpOnlyAfterTheInputDesktopStaysUnreadable) {
   int failures = 0;
   for (int attempt = 1; attempt < kDesktopFollowFailureLimit; ++attempt) {
-    EXPECT_EQ(SelectDesktopFollowAction(L"", L"Default", &failures),
+    EXPECT_EQ(SelectDesktopFollowAction(L"", L"Default", false, &failures),
               DesktopFollowAction::kStay);
   }
-  EXPECT_EQ(SelectDesktopFollowAction(L"", L"Default", &failures),
+  EXPECT_EQ(SelectDesktopFollowAction(L"", L"Default", false, &failures),
             DesktopFollowAction::kUnavailable);
   EXPECT_EQ(failures, 0);
 
   // A single readable poll clears the streak, and a missing counter never
   // escalates.
   failures = kDesktopFollowFailureLimit - 1;
-  EXPECT_EQ(SelectDesktopFollowAction(L"Default", L"Default", &failures),
+  EXPECT_EQ(SelectDesktopFollowAction(L"Default", L"Default", false, &failures),
             DesktopFollowAction::kStay);
   EXPECT_EQ(failures, 0);
-  EXPECT_EQ(SelectDesktopFollowAction(L"", L"Default", nullptr),
+  EXPECT_EQ(SelectDesktopFollowAction(L"", L"Default", false, nullptr),
             DesktopFollowAction::kStay);
+}
+
+TEST(WorkerPolicyTest, WaitsForDesktopWhileWindowsChangesUserSession) {
+  int failures = kDesktopFollowFailureLimit - 1;
+  for (int sample = 0; sample < kDesktopFollowFailureLimit * 2; ++sample) {
+    EXPECT_EQ(SelectDesktopFollowAction(L"", L"Default", true, &failures),
+              DesktopFollowAction::kStay);
+    EXPECT_EQ(failures, 0);
+  }
+  EXPECT_EQ(SelectDesktopFollowAction(L"Winlogon", L"Default", true,
+                                      &failures),
+            DesktopFollowAction::kFollow);
 }
 
 TEST(WorkerPolicyTest, IgnoresTheDesktopFlickerWindowsShowsWhileItLocks) {
@@ -185,15 +195,24 @@ TEST(WorkerPolicyTest, KeepsTheClipboardOnTheSignedInDesktopOnly) {
   EXPECT_FALSE(ClipboardAllowedOnDesktop(L"Screen-saver"));
 }
 
-TEST(WorkerPolicyTest, TreatsLockAndUnlockAsAFollowRatherThanAnEnding) {
+TEST(WorkerPolicyTest, FollowsEveryWindowsSessionBoundaryWithoutEndingPeer) {
   EXPECT_EQ(SelectWorkerEnvironmentAction(kEnvironmentSessionLocked),
             WorkerEnvironmentAction::kFollowDesktop);
   EXPECT_EQ(SelectWorkerEnvironmentAction(kEnvironmentSessionUnlocked),
             WorkerEnvironmentAction::kFollowDesktop);
-  // A logoff or a suspend arriving with the lock still ends the session.
+  EXPECT_EQ(SelectWorkerEnvironmentAction(kEnvironmentSessionUnavailable),
+            WorkerEnvironmentAction::kFollowDesktop);
+  EXPECT_EQ(SelectWorkerEnvironmentAction(kEnvironmentSessionAvailable),
+            WorkerEnvironmentAction::kFollowDesktop);
+  // Windows often coalesces unlock with logon/connect, and lock with
+  // logoff/disconnect. Every combination remains an in-place picture switch.
+  EXPECT_EQ(SelectWorkerEnvironmentAction(kEnvironmentSessionUnlocked |
+                                          kEnvironmentSessionAvailable),
+            WorkerEnvironmentAction::kFollowDesktop);
   EXPECT_EQ(SelectWorkerEnvironmentAction(kEnvironmentSessionLocked |
                                           kEnvironmentSessionUnavailable),
-            WorkerEnvironmentAction::kStopProtected);
+            WorkerEnvironmentAction::kFollowDesktop);
+  // A real power boundary still wins over a coincident WTS notification.
   EXPECT_EQ(SelectWorkerEnvironmentAction(kEnvironmentSessionLocked |
                                           kEnvironmentSuspend),
             WorkerEnvironmentAction::kStopProtected);
