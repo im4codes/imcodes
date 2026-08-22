@@ -119,22 +119,24 @@ describe('windowed view-item derivation', () => {
     expect(tail.items.some((item) => item.type === 'tool-group' || item.type === 'tool-activity')).toBe(true);
   });
 
-  it('costs the same whether the conversation is short or long', () => {
-    const short = mixedSession(200);
-    const long = mixedSession(4_000);
-    const time = (events: TimelineEvent[]): number => {
-      const started = performance.now();
-      for (let i = 0; i < 5; i++) __buildViewItemsTailForTests(events, true, 150);
-      return performance.now() - started;
+  it('examines the same number of events no matter how long the conversation is', () => {
+    // The property that matters is that derivation reads a bounded window
+    // rather than the whole session. Asserting that structurally rather than by
+    // wall clock keeps it deterministic: timing sub-10ms work on a shared CI
+    // host measures the host's mood, and a single slow sample on either side of
+    // a ratio decides the result. The real end-to-end cost is guarded in a
+    // browser by e2e/chat-timeline-scaling.perf.spec.ts.
+    const examined = (events: TimelineEvent[]): number => {
+      const { windowStartIndex } = __buildViewItemsTailForTests(events, true, 150);
+      return events.length - windowStartIndex;
     };
-    time(short);
-    time(long);
-    const shortMs = time(short);
-    const longMs = time(long);
 
-    // The whole point. A generous bound because this runs on a shared CI host,
-    // but linear growth over a 20x longer conversation would be nowhere near it.
-    expect(longMs).toBeLessThan(Math.max(shortMs, 0.5) * 4);
+    const long = examined(mixedSession(4_000));
+    const muchLonger = examined(mixedSession(16_000));
+
+    expect(muchLonger).toBe(long);
+    // Non-vacuous: a window that covered everything would also be "the same".
+    expect(muchLonger).toBeLessThan(4_000);
   });
 });
 
