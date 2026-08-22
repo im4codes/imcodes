@@ -961,7 +961,11 @@ async function pumpUpload(
 }
 
 async function runAttempt(lease: Lease, op: DirectAttempt, attempt: number): Promise<OperationSuccess> {
-  await ensureLease(lease);
+  // Lease creation used to ignore the upload AbortSignal. A user could press
+  // Stop during negotiation, but the composer row survived until the shared
+  // setup's full timeout elapsed.
+  if (op.signal?.aborted) throw directError(DIRECT_FILE_TRANSFER_ERROR.CANCELED, false);
+  await waitForCaller(ensureLease(lease), op.signal);
   const active: ActiveAttempt = {
     requestId: crypto.randomUUID(),
     attemptId: crypto.randomUUID(),
@@ -1021,7 +1025,8 @@ async function runAttempt(lease: Lease, op: DirectAttempt, attempt: number): Pro
     // The peer was established from lease-only SDP/ICE during File Browser
     // prewarm. Operation authorization merely allocates a data channel on that
     // reusable peer, so no file authority ever appears in an offer or ICE.
-    await ensureLeasePeer(lease);
+    if (op.signal?.aborted) throw directError(DIRECT_FILE_TRANSFER_ERROR.CANCELED, false);
+    await waitForCaller(ensureLeasePeer(lease), op.signal);
     const peer = lease.peer;
     if (!peer) throw directError(DIRECT_FILE_TRANSFER_ERROR.CONNECTION_FAILED);
     const channel = peer.createDataChannel(parsed.value.channelLabel, { ordered: true });
@@ -1265,6 +1270,28 @@ function wait(ms: number, signal?: AbortSignal): Promise<void> {
   });
 }
 
+/**
+ * Lease/peer setup can be shared with a prewarm or another transfer, so
+ * canceling one upload must not abort that authority-free shared work. Race
+ * only this caller against its signal; the setup may finish for later reuse.
+ */
+function waitForCaller<T>(pending: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return pending;
+  if (signal.aborted) return Promise.reject(directError(DIRECT_FILE_TRANSFER_ERROR.CANCELED, false));
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const finish = (error?: unknown, value?: T) => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener('abort', onAbort);
+      if (error) reject(error); else resolve(value as T);
+    };
+    const onAbort = () => finish(directError(DIRECT_FILE_TRANSFER_ERROR.CANCELED, false));
+    signal.addEventListener('abort', onAbort, { once: true });
+    pending.then((value) => finish(undefined, value), (error) => finish(error));
+  });
+}
+
 function failureDisposition(error: unknown, attemptsUsed: number) {
   if (!(error instanceof DirectFileTransferFailure)) {
     return attemptsUsed < DIRECT_FILE_TRANSFER_LIMITS.MAX_ATTEMPTS
@@ -1344,24 +1371,47 @@ export async function uploadFileWithDirectFallback(options: {
   const clientUploadId = crypto.randomUUID();
   if (options.ws && supportsUpload(options.ws) && !options.destinationDirectory) {
     options.onMode?.(FILE_UPLOAD_TRANSPORT_MODE.CONNECTING);
+    const directAbort = new AbortController();
+    let directConnectTimedOut = false;
+    let directConnected = false;
+    const abortDirect = () => directAbort.abort();
+    if (options.signal?.aborted) abortDirect();
+    else options.signal?.addEventListener('abort', abortDirect, { once: true });
+    const connectTimer = setTimeout(() => {
+      if (directConnected) return;
+      directConnectTimedOut = true;
+      directAbort.abort();
+    }, DIRECT_FILE_TRANSFER_LIMITS.UPLOAD_DIRECT_CONNECT_FALLBACK_MS);
     try {
       const direct = await uploadFileDirect(
         options.ws,
         options.file,
         clientUploadId,
         options.onProgress,
-        () => options.onMode?.(FILE_UPLOAD_TRANSPORT_MODE.DIRECT),
-        options.signal,
+        () => {
+          directConnected = true;
+          clearTimeout(connectTimer);
+          options.onMode?.(FILE_UPLOAD_TRANSPORT_MODE.DIRECT);
+        },
+        directAbort.signal,
         options.sessionName,
         options.serverId,
       );
       return direct;
     } catch (error) {
-      if (options.signal?.aborted || isFileUploadCanceled(error) || isTerminalDirectFailure(error)) throw error;
+      // User cancellation is terminal. The internal 20-second deadline uses
+      // the same abort machinery, but intentionally continues through HTTP.
+      const forcedFallbackCancellation = directConnectTimedOut && isFileUploadCanceled(error);
+      if (options.signal?.aborted
+        || (!forcedFallbackCancellation
+          && (isFileUploadCanceled(error) || isTerminalDirectFailure(error)))) throw error;
       if (options.file.size > FILE_TRANSFER_LIMITS.MAX_FILE_SIZE) {
         throw directError(DIRECT_FILE_TRANSFER_ERROR.INTERNAL_ERROR, false, 'relay_size_limit');
       }
       options.onMode?.(FILE_UPLOAD_TRANSPORT_MODE.FALLING_BACK);
+    } finally {
+      clearTimeout(connectTimer);
+      options.signal?.removeEventListener('abort', abortDirect);
     }
   } else if (options.file.size > FILE_TRANSFER_LIMITS.MAX_FILE_SIZE) {
     throw directError(DIRECT_FILE_TRANSFER_ERROR.INTERNAL_ERROR, false, 'relay_size_limit');

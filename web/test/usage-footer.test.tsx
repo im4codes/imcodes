@@ -57,6 +57,10 @@ vi.mock('../src/hooks/usePref.js', () => ({
   }),
 }));
 
+vi.mock('../src/api/usage-summary.js', () => ({
+  fetchUsageSummary: vi.fn(() => new Promise(() => undefined)),
+}));
+
 import { UsageFooter } from '../src/components/UsageFooter.js';
 import { USAGE_CONTEXT_WINDOW_SOURCES } from '@shared/usage-context-window.js';
 
@@ -74,6 +78,19 @@ afterEach(() => {
 });
 
 describe('UsageFooter', () => {
+  it('portals the Token usage dialog above floating-window stacking contexts', () => {
+    const { container } = render(
+      <UsageFooter
+        usage={{ inputTokens: 1000, cacheTokens: 2000, contextWindow: 1_000_000 }}
+        sessionName="deck_test_brain"
+      />,
+    );
+
+    fireEvent.click(screen.getByLabelText('sessionUsage.open'));
+    expect(document.body.querySelector('.session-usage-backdrop')).toBeTruthy();
+    expect(container.querySelector('.session-usage-backdrop')).toBeNull();
+  });
+
   it('renders the execution-clone launcher and calls its handler', () => {
     const onRunExecutionClones = vi.fn();
     render(

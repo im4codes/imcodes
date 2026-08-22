@@ -433,6 +433,50 @@ describe('direct file transfer v2 browser broker', () => {
     expect(apiMocks.uploadFile).toHaveBeenCalledTimes(1);
   });
 
+  it('forces one HTTP fallback when direct upload has not connected within 20 seconds', async () => {
+    vi.useFakeTimers();
+    const { uploadFileWithDirectFallback } = await import('../src/direct-file-transfer.js');
+    const { ws, sent } = createWs(directCapabilities, 'hold');
+    const modes: string[] = [];
+    const upload = uploadFileWithDirectFallback({
+      ws,
+      serverId: 'server-1',
+      file: new File(['relay'], 'relay.txt', { type: 'text/plain' }),
+      onMode: (mode) => modes.push(mode),
+    });
+
+    await vi.advanceTimersByTimeAsync(DIRECT_FILE_TRANSFER_LIMITS.UPLOAD_DIRECT_CONNECT_FALLBACK_MS - 1);
+    expect(apiMocks.uploadFile).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+
+    await expect(upload).resolves.toMatchObject({ attachment: { id: 'relay-attachment' } });
+    const directAttempts = sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.OPERATION_INIT);
+    expect(directAttempts.length).toBeGreaterThan(0);
+    expect(directAttempts.length).toBeLessThanOrEqual(DIRECT_FILE_TRANSFER_LIMITS.MAX_ATTEMPTS);
+    expect(apiMocks.uploadFile).toHaveBeenCalledTimes(1);
+    expect(modes).toEqual(['connecting', 'falling_back', 'relay']);
+  });
+
+  it('cancels immediately while authority-free lease setup is still pending', async () => {
+    vi.useFakeTimers();
+    const { uploadFileWithDirectFallback } = await import('../src/direct-file-transfer.js');
+    const { ws } = createWs(directCapabilities, 'success', {
+      readyDelayMs: DIRECT_FILE_TRANSFER_LIMITS.NEGOTIATION_TIMEOUT_MS - 1,
+    });
+    const controller = new AbortController();
+    const upload = uploadFileWithDirectFallback({
+      ws,
+      serverId: 'server-1',
+      file: new File(['cancel'], 'cancel.txt', { type: 'text/plain' }),
+      signal: controller.signal,
+    });
+
+    await vi.advanceTimersByTimeAsync(0);
+    controller.abort();
+    await expect(upload).rejects.toMatchObject({ code: DIRECT_FILE_TRANSFER_ERROR.CANCELED });
+    expect(apiMocks.uploadFile).not.toHaveBeenCalled();
+  });
+
   it('creates an authority-free data channel before the cold lease offer', async () => {
     const { uploadFileDirect } = await import('../src/direct-file-transfer.js');
     const { ws } = createWs(directCapabilities);

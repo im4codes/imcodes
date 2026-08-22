@@ -209,6 +209,13 @@ export const DIRECT_FILE_TRANSFER_LIMITS = {
   OPERATION_LEDGER_TTL_MS: 60 * 60 * 1000,
   OPERATION_LEDGER_CAPACITY: 256,
   MAX_ACTIVE_CHANNELS_PER_LEASE: 4,
+  /**
+   * Uploads are direct-first, but the composer must not remain stuck in the
+   * connection phase on a path that is still negotiating. This deadline is
+   * measured only until the direct data plane accepts the upload; once bytes
+   * start flowing, the normal no-progress watchdog owns the transfer.
+   */
+  UPLOAD_DIRECT_CONNECT_FALLBACK_MS: 20 * 1000,
   NEGOTIATION_TIMEOUT_MS: 8 * 1000,
   /**
    * How long a data channel may take to report `open`.
