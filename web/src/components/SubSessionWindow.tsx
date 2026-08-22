@@ -54,7 +54,7 @@ import { EXECUTION_CLONE_KIND } from '@shared/execution-clone.js';
 import type { SessionSettingsOpenIntent } from '../session-settings-open-intent.js';
 import { useStableCallback } from '../hooks/useStableCallback.js';
 import type { ChatLocalWebPreviewOpenHandler } from './ChatLoopbackLink.js';
-import { RESIZE_DIRS, resizeHandleClass, type ResizeDir } from './window-resize.js';
+import { RESIZE_DIRS, resizeHandleClass, resizeHandleHoverEvents, type ResizeDir } from './window-resize.js';
 
 function isExecutionCloneTemplateLike(sub: { executionCloneKind?: string | null; parentRunId?: string | null }): boolean {
   return sub.executionCloneKind === EXECUTION_CLONE_KIND || typeof sub.parentRunId === 'string';
@@ -898,7 +898,7 @@ export function SubSessionWindow({
       {activeIdleFlashToken ? <IdleFlashLayer key={`subwindow-idle-${activeIdleFlashToken}`} variant="frame" /> : null}
       {/* 8-direction resize handles (desktop only) */}
       {!isMobile && !isDesktopMaximized && RESIZE_DIRS.map((dir) => (
-        <div key={dir} class={resizeHandleClass(dir, resizingDir)} onMouseDown={onResizeMouseDown(dir)} />
+        <div key={dir} class={resizeHandleClass(dir, resizingDir)} {...resizeHandleHoverEvents} onMouseDown={onResizeMouseDown(dir)} />
       ))}
 
       {/* Header */}

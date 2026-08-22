@@ -58,6 +58,7 @@ import {
 import { filePreviewStatesEqual } from '../file-preview-state.js';
 import { FILE_BROWSER_SNAPSHOT_KEY_PREFIX } from '../local-storage-quota.js';
 import { loadFsLocalImagePreview } from '../fs-local-image-preview.js';
+import { resizeHandleHoverEvents } from './window-resize.js';
 
 const PREF_KEY = 'fb_prefer_editor';
 const WINDOWS_DRIVES_ROOT = '__imcodes_windows_drives__';
@@ -2399,7 +2400,8 @@ export function FileBrowser({
             </div>
             {hasPreview && (
               <div
-                class="fb-resize-handle"
+                class="fb-resize-handle resize-hover-surface"
+                {...resizeHandleHoverEvents}
                 onMouseDown={(e) => {
                   e.preventDefault();
                   const startX = e.clientX;

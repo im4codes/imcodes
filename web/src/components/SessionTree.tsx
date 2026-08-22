@@ -29,6 +29,7 @@ import { SharedStateIndicator } from './SharedStateIndicator.js';
 import { useVerticalResize } from '../hooks/useVerticalResize.js';
 import { isWorkingSessionState } from '@shared/session-activity-types.js';
 import { onExecutionCloneGroupReveal } from '../execution-clone-ui.js';
+import { resizeHandleHoverEvents } from './window-resize.js';
 
 interface Props {
   serverId?: string | null;
@@ -469,7 +470,8 @@ function SessionTreeInner({
       </div>
       {resizable && (
         <div
-          class="sidebar-pinned-resize-handle"
+          class="sidebar-pinned-resize-handle resize-hover-surface"
+          {...resizeHandleHoverEvents}
           onMouseDown={onResizeMouseDown}
           onTouchStart={onResizeTouchStart}
           aria-hidden="true"

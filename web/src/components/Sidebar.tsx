@@ -3,6 +3,7 @@ import type { ComponentChildren } from 'preact';
 import { useTranslation } from 'react-i18next';
 import type { PinnedPanel } from '../app.js';
 import { LanguageSwitcher } from './LanguageSwitcher.js';
+import { resizeHandleHoverEvents } from './window-resize.js';
 
 const LS_COLLAPSED = 'sidebar_collapsed';
 const LS_WIDTH = 'sidebar_width_';
@@ -194,7 +195,8 @@ export function Sidebar({ collapsed, serverId, pinnedPanels: _pinnedPanels, onDr
       {/* Resize grip — visible pill on the right border edge */}
       {!collapsed && (
         <div
-          class="sidebar-resize-grip"
+          class="sidebar-resize-grip resize-hover-surface"
+          {...resizeHandleHoverEvents}
           onMouseDown={handleResizeMouseDown}
           onTouchStart={handleResizeTouchStart}
           title={t('sidebar.drag_to_resize', 'Drag to resize')}
@@ -206,7 +208,8 @@ export function Sidebar({ collapsed, serverId, pinnedPanels: _pinnedPanels, onDr
       {/* Right-edge resize handle — invisible drag strip */}
       {!collapsed && (
         <div
-          class="sidebar-resize-handle"
+          class="sidebar-resize-handle resize-hover-surface"
+          {...resizeHandleHoverEvents}
           onMouseDown={handleResizeMouseDown}
           onTouchStart={handleResizeTouchStart}
           aria-hidden="true"

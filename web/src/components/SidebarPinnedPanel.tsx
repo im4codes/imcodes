@@ -14,6 +14,7 @@ import type { PinnedPanel } from '../app.js';
 import { getPanelTitle, renderPanelContent } from './PinnedPanelRegistry.js';
 import type { PanelRenderContext } from './PinnedPanelRegistry.js';
 import { useVerticalResize } from '../hooks/useVerticalResize.js';
+import { resizeHandleHoverEvents } from './window-resize.js';
 
 interface SidebarPinnedPanelProps {
   panel: PinnedPanel;
@@ -58,7 +59,8 @@ export function SidebarPinnedPanel({
 
       {/* Bottom resize handle */}
       <div
-        class="sidebar-pinned-resize-handle"
+        class="sidebar-pinned-resize-handle resize-hover-surface"
+        {...resizeHandleHoverEvents}
         onMouseDown={onMouseDown}
         onTouchStart={onTouchStart}
         aria-hidden="true"

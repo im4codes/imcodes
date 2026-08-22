@@ -86,6 +86,7 @@ import {
   type SdkSubagentDiagnostic,
   type SdkSubagentStatusRow,
 } from '../timeline/sdk-subagent-aggregator.js';
+import { resizeHandleHoverEvents } from './window-resize.js';
 
 interface Props {
   events: TimelineEvent[];
@@ -3653,7 +3654,7 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
       )}
       {canShowFilePanel && showFilePanel && ws && (
         <>
-          <div class="chat-panel-drag" onMouseDown={onDragStart} />
+          <div class="chat-panel-drag resize-hover-surface" {...resizeHandleHoverEvents} onMouseDown={onDragStart} />
           <div class="chat-file-panel" style={{ width: `${filePanelWidth}px`, flexShrink: 0 }}>
             <div style={{ display: 'flex', alignItems: 'center', padding: '4px 8px', background: '#1e293b', borderBottom: '1px solid #334155' }}>
               <span style={{ flex: 1, fontSize: 11, color: '#64748b' }}>{t('picker.files')}</span>

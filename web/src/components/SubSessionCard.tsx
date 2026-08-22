@@ -6,6 +6,7 @@
 import { useRef, useState, useCallback, useMemo, useEffect } from 'preact/hooks';
 import type { JSX } from 'preact';
 import { useTranslation } from 'react-i18next';
+import { resizeHandleHoverEvents } from './window-resize.js';
 import { ChatView } from './ChatView.js';
 import { resolveContextWindow } from '../model-context.js';
 import { bestModelLabel } from '../model-label.js';
@@ -560,7 +561,8 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
 
       {/* Resize handle — uses pointer capture to bypass parent's HTML5 draggable */}
       <div
-        class="subcard-resize-handle"
+        class="subcard-resize-handle resize-hover-surface"
+        {...resizeHandleHoverEvents}
         onPointerDown={onResizePointerDown}
         onClick={(e) => e.stopPropagation()}
       />

@@ -788,27 +788,28 @@ describe('styles.css regression contracts', () => {
     expect(outside).not.toMatch(/\.controls-composer\s*\{[^}]*order:\s*-1/);
   });
 
-  // The hover highlight must not rest on `:has()`. Ancestor `:has(:hover)`
-  // re-evaluation is not dependable across engines, and the reported symptom
-  // was exactly that — the highlight appeared sometimes and not others, in both
-  // main and sub sessions. The strip paints its own line under a plain `:hover`
-  // on the hovered element, which has no such ambiguity; `:has()` only deepens
-  // it when it does fire.
-  it('drives the resize highlight from the strip, not only from :has()', () => {
+  // Compositor-backed drag targets can fail to repaint native :hover. The
+  // visual state therefore also accepts an explicit target-phase class.
+  it('drives the resize highlight from an explicit composited hover surface', () => {
     const desktopBlock = /@media \(min-width: 641px\) \{([\s\S]*?)\n\}/.exec(css);
     expect(desktopBlock).not.toBeNull();
     const inside = desktopBlock![1];
 
     expect(inside).toMatch(/\.controls-composer-resize-edge::after\s*\{[^}]*background/);
     expect(inside).toMatch(/\.controls-composer-resize-edge:hover::after/);
-    // Switching the strip's own indicator off would leave only the fragile path.
+    expect(inside).toMatch(/\.controls-composer-resize-edge\.is-pointer-hovered::after/);
     expect(inside).not.toMatch(/\.controls-composer-resize-edge::after\s*\{[^}]*display:\s*none/);
+    expect(css).toMatch(/\.resize-hover-surface\s*\{[^}]*transform:\s*translateZ\(0\)/);
   });
 
-  it('routes remote-desktop hover input directly to the stage', () => {
+  it('routes remote-desktop hover through a painted HTML surface above video', () => {
     const videoRule = css.match(/\.remote-desktop-stage video\s*\{[^}]*\}/)?.[0];
     expect(videoRule, '.remote-desktop-stage video rule missing').toBeTruthy();
     expect(videoRule).toMatch(/pointer-events:\s*none/);
+    const surfaceRule = css.match(/\.remote-desktop-input-surface\s*\{[^}]*\}/)?.[0];
+    expect(surfaceRule, '.remote-desktop-input-surface rule missing').toBeTruthy();
+    expect(surfaceRule).toMatch(/background:\s*rgb\(0 0 0 \/ 0\.1%\)/);
+    expect(surfaceRule).toMatch(/pointer-events:\s*auto/);
   });
 
   // Transport sessions zero the toolbar's left padding, and they are the only
