@@ -287,13 +287,6 @@ TEST(WorkerPolicyTest, LeavesTheHeadlessDisplayWhenARealDisplayAppears) {
             0u);
 }
 
-TEST(WorkerPolicyTest, RejectsHalfHeadlessPhysicalOutput) {
-  EXPECT_FALSE(DisplayOutputIsPresentable(false, false));
-  EXPECT_TRUE(DisplayOutputIsPresentable(false, true));
-  EXPECT_TRUE(DisplayOutputIsPresentable(true, false));
-  EXPECT_TRUE(DisplayOutputIsPresentable(true, true));
-}
-
 TEST(WorkerPolicyTest, RequiresExplicitChoiceWhenSelectedDisplayDisappears) {
   const std::vector<DisplaySelectionCandidate> displays = {
       {"new-primary", true, true, false},

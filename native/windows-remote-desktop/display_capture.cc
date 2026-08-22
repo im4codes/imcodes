@@ -87,16 +87,6 @@ bool IsImcodesVirtualDisplay(const wchar_t* device_name) {
   }
 }
 
-bool HasActiveMonitorTarget(const wchar_t* device_name) {
-  if (!device_name || !*device_name) return false;
-  for (DWORD index = 0;; ++index) {
-    DISPLAY_DEVICEW monitor{};
-    monitor.cb = sizeof(monitor);
-    if (!EnumDisplayDevicesW(device_name, index, &monitor, 0)) return false;
-    if ((monitor.StateFlags & DISPLAY_DEVICE_ACTIVE) != 0) return true;
-  }
-}
-
 constexpr DISPLAYCONFIG_DEVICE_INFO_TYPE kGetSourceDpiScale =
     static_cast<DISPLAYCONFIG_DEVICE_INFO_TYPE>(-3);
 constexpr DISPLAYCONFIG_DEVICE_INFO_TYPE kSetSourceDpiScale =
@@ -219,14 +209,6 @@ std::vector<DisplayInfo> EnumerateDisplays() {
       info.primary = desc.DesktopCoordinates.left == 0 &&
                      desc.DesktopCoordinates.top == 0;
       info.imcodes_virtual = IsImcodesVirtualDisplay(desc.DeviceName);
-      if (!DisplayOutputIsPresentable(
-              info.imcodes_virtual,
-              HasActiveMonitorTarget(desc.DeviceName))) {
-        RTC_LOG(LS_WARNING)
-            << "Ignoring attached DXGI output without an active monitor target: "
-            << info.label;
-        continue;
-      }
       if (info.imcodes_virtual) info.label = "IM.codes Headless Display";
       info.adapter_luid = adapter_desc.AdapterLuid;
       info.output_index = output_index;
