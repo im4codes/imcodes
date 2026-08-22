@@ -1,6 +1,8 @@
 export const IMCODES_POD_HEADER = 'x-imcodes-pod';
 export const CLIENT_TIMEZONE_HEADER = 'x-client-timezone';
 export const DEVICE_TIMEZONE_HEADER = 'x-device-timezone';
+export const ACCEPT_ENCODING_HEADER = 'Accept-Encoding';
+export const CONTENT_ENCODING_HEADER = 'Content-Encoding';
 
 /**
  * Browser-side identity snapshot. The server compares this with the credential

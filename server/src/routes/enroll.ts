@@ -1,4 +1,5 @@
 import { Hono, type Context } from 'hono';
+import { compress } from 'hono/compress';
 import { z } from 'zod';
 import { lstat, open, type FileHandle } from 'node:fs/promises';
 import { createHash, randomBytes } from 'node:crypto';
@@ -17,6 +18,7 @@ import { buildWindowsAuthenticodeEnrollmentPlan } from '../../../shared/windows-
 import { deriveRefName, deriveDisplayName } from '../../../shared/machine-reference.js';
 import {
   isCanonicalControlledNodePair,
+  CONTROLLED_NODE_ARTIFACT_COMPRESSION_ENCODING,
   CONTROLLED_NODE_ARTIFACT_ASSETS,
   CONTROLLED_NODE_ARTIFACT_HEADERS,
   CONTROLLED_NODE_OS_WIN,
@@ -107,6 +109,18 @@ export function createEnrollRoutes(
   artifactCatalog: ArtifactCatalog = createArtifactCatalog(),
 ): EnrollRouter {
   const enrollRoutes: EnrollRouter = new Hono();
+
+  // Compress the streamed representation only when the client opts into gzip.
+  // The artifact remains an ordinary executable/helper on disk and all custom
+  // digest/size headers continue to describe the decoded bytes. Hono removes
+  // Content-Length for the encoded response and adds Vary: Accept-Encoding.
+  const compressArtifactDownload = compress({
+    encoding: CONTROLLED_NODE_ARTIFACT_COMPRESSION_ENCODING,
+    threshold: 1024,
+    contentTypeFilter: (contentType) => contentType === 'application/octet-stream',
+  });
+  enrollRoutes.use('/v2/download', compressArtifactDownload);
+  enrollRoutes.use('/v2/node-artifact', compressArtifactDownload);
 
 enrollRoutes.post('/v2/ticket', requireAuth(), async (c) => {
   const originCheck = checkOrigin(c);
