@@ -947,6 +947,11 @@ html.native-ios-mac .chat-dl-btn {
 .p2p-settings-icon { font-size: 12px; line-height: 1; }
 .p2p-settings-label { display: none; }
 .controls { padding: 6px 8px; display: flex; gap: 6px; align-items: center; position: relative; z-index: 1; background: linear-gradient(180deg, rgba(8,13,22,0.12), rgba(8,13,22,0.36)); }
+.resize-hover-surface {
+  /* Keep the drag target on its own compositor layer. Its visible background
+     remains owned by the specific handle so hover colours are not overridden. */
+  transform: translateZ(0);
+}
 .controls-composer { position: relative; flex: 1; min-width: 0; display: flex; align-items: stretch; }
 .controls-composer-resize-edge {
   position: absolute;
@@ -972,6 +977,7 @@ html.native-ios-mac .chat-dl-btn {
   transition: opacity 0.14s, box-shadow 0.14s;
 }
 .controls-composer-resize-edge:hover::after,
+.controls-composer-resize-edge.is-pointer-hovered::after,
 .controls-composer-resize-edge:focus-visible::after,
 .composer-height-resizing-top .controls-composer-resize-edge::after {
   opacity: 0.52;
@@ -1602,6 +1608,7 @@ html.native-ios-mac .chat-dl-btn {
     display: block;
   }
   .controls-composer-resize-edge:hover::after,
+  .controls-composer-resize-edge.is-pointer-hovered::after,
   .controls-composer-resize-edge:focus-visible::after,
   .composer-height-resizing-top .controls-composer-resize-edge::after {
     top: 3px;
@@ -1611,6 +1618,7 @@ html.native-ios-mac .chat-dl-btn {
   }
 
   .controls:has(.controls-composer-resize-edge:hover),
+  .controls:has(.controls-composer-resize-edge.is-pointer-hovered),
   .controls:has(.controls-composer-resize-edge:focus-visible) {
     border-top-color: rgba(103,232,249,0.95);
   }
@@ -3848,7 +3856,7 @@ html.native-ios-mac .chat-dl-btn {
 .chat-sdk-agents-toggle.active:hover { background: rgba(20,83,45,0.42); border-color: rgba(74,222,128,0.78); color: #bbf7d0; }
 /* Drag handle between chat and file panel */
 .chat-panel-drag { width: 4px; flex-shrink: 0; cursor: col-resize; background: #1e293b; transition: background .15s; }
-.chat-panel-drag:hover { background: #6366f1; }
+.chat-panel-drag:hover, .chat-panel-drag.is-pointer-hovered { background: #6366f1; }
 /* Split file panel container */
 .chat-file-panel { display: flex; flex-direction: column; border-left: 1px solid #334155; background: #0f172a; overflow: hidden; min-width: 220px; }
 .chat-sdk-agents-panel { display: flex; flex-direction: column; width: clamp(260px, 28vw, 360px); min-width: 240px; flex-shrink: 0; border-left: 1px solid #334155; background: #0f172a; overflow: hidden; }
@@ -5166,8 +5174,8 @@ html.native-ios-mac .chat-dl-btn {
 .subcard-scroll-bottom:hover { opacity: 1; background: #3b82f6; border-color: #3b82f6; }
 .subcard-resize-handle { position: absolute; top: 0; right: -8px; width: 20px; height: 100%; cursor: ew-resize; background: transparent; z-index: 10; transition: background 0.15s; touch-action: none; }
 .subcard-resize-handle::after { content: '⋮'; position: absolute; right: 8px; top: 50%; transform: translateY(-50%); font-size: 12px; color: #334155; pointer-events: none; line-height: 1; }
-.subcard-resize-handle:hover { background: rgba(59,130,246,0.4); }
-.subcard-resize-handle:hover::after { color: #60a5fa; }
+.subcard-resize-handle:hover, .subcard-resize-handle.is-pointer-hovered { background: rgba(59,130,246,0.4); }
+.subcard-resize-handle:hover::after, .subcard-resize-handle.is-pointer-hovered::after { color: #60a5fa; }
 .subcard-input-area { flex-shrink: 0; border-top: 1px solid rgba(125,211,252,0.12); background: linear-gradient(180deg, #0a101b, #080d16); padding: 5px 6px; display: flex; flex-direction: column; gap: 3px; border-radius: 0 0 8px 8px; }
 .subcard-input-row { display: flex; align-items: stretch; gap: 6px; }
 .subcard-input-main { flex: 1; min-width: 0; }
@@ -5535,6 +5543,7 @@ html.native-ios-mac .chat-dl-btn {
   pointer-events: none;
 }
 .resize-handle:hover::after,
+.resize-handle.is-pointer-hovered::after,
 .resize-handle.is-resizing::after {
   opacity: 0.9;
   box-shadow: 0 0 10px color-mix(in srgb, var(--subsession-accent-color, #38bdf8) 55%, transparent);
@@ -5594,10 +5603,14 @@ html.native-ios-mac .chat-dl-btn {
    and reintroduce exactly the slipperiness this is meant to remove. Only the
    drawn indicator on ::after animates. */
 .resize-n:hover, .resize-s:hover,
+.resize-n.is-pointer-hovered, .resize-s.is-pointer-hovered,
 .resize-n.is-resizing, .resize-s.is-resizing { height: 12px; }
 .resize-e:hover, .resize-w:hover,
+.resize-e.is-pointer-hovered, .resize-w.is-pointer-hovered,
 .resize-e.is-resizing, .resize-w.is-resizing { width: 12px; }
 .resize-ne:hover, .resize-nw:hover, .resize-se:hover, .resize-sw:hover,
+.resize-ne.is-pointer-hovered, .resize-nw.is-pointer-hovered,
+.resize-se.is-pointer-hovered, .resize-sw.is-pointer-hovered,
 .resize-ne.is-resizing, .resize-nw.is-resizing,
 .resize-se.is-resizing, .resize-sw.is-resizing { width: 22px; height: 22px; }
 
@@ -5615,6 +5628,8 @@ html.native-ios-mac .chat-dl-btn {
    on `.floating-panel`, whose resting border is dim slate. */
 .subsession-window:has(.resize-handle:hover),
 .floating-panel:has(.resize-handle:hover),
+.subsession-window:has(.resize-handle.is-pointer-hovered),
+.floating-panel:has(.resize-handle.is-pointer-hovered),
 .subsession-window.is-resizing,
 .floating-panel.is-resizing {
   outline: 2px solid color-mix(in srgb, var(--subsession-accent-color, #38bdf8) 45%, #ffffff);
@@ -6425,15 +6440,41 @@ html.native-ios-mac .chat-dl-btn {
 .sidebar-toggle { background: rgba(15,23,42,0.42); border: 1px solid rgba(125,211,252,0.14); color: #7b8797; cursor: pointer; font-size: 16px; padding: 2px 6px; line-height: 1; border-radius: 6px; transition: color 0.15s, background 0.15s, border-color 0.15s, box-shadow 0.15s; }
 .sidebar-toggle:hover { color: var(--chrome-accent); background: rgba(8,145,178,0.16); border-color: rgba(34,211,238,0.42); box-shadow: 0 0 12px rgba(34,211,238,0.14); }
 .sidebar-resize-handle { position: absolute; top: 0; right: 0; width: 4px; height: 100%; cursor: ew-resize; background: transparent; z-index: 10; transition: background 0.15s; touch-action: none; }
-.sidebar-resize-handle:hover { background: rgba(34,211,238,0.38); box-shadow: 0 0 12px rgba(34,211,238,0.22); }
+.sidebar-resize-handle:hover, .sidebar-resize-handle.is-pointer-hovered { background: rgba(34,211,238,0.38); box-shadow: 0 0 12px rgba(34,211,238,0.22); }
 @media (pointer: coarse) { .sidebar-resize-handle { width: 12px; right: -4px; } }
 .sidebar-resize-grip { position: absolute; right: -10px; bottom: 80px; z-index: 12; cursor: ew-resize; user-select: none; touch-action: none; font-size: 10px; letter-spacing: 2px; color: #7b8797; background: linear-gradient(180deg, rgba(15,23,42,0.96), rgba(8,13,22,0.96)); border: 1px solid rgba(125,211,252,0.18); border-radius: 7px; padding: 4px 2px; line-height: 1; display: flex; align-items: center; opacity: 0.62; transition: opacity 0.15s, color 0.15s, border-color 0.15s, box-shadow 0.15s; box-shadow: 0 6px 16px rgba(0,0,0,0.28), inset 0 1px 0 rgba(255,255,255,0.04); }
 .sidebar-resize-grip::after { content: ''; position: absolute; top: -12px; bottom: -12px; left: -12px; right: -12px; } /* larger touch target */
-.sidebar-resize-grip:hover { color: var(--chrome-accent); border-color: rgba(34,211,238,0.52); opacity: 1; box-shadow: 0 0 14px rgba(34,211,238,0.18), inset 0 1px 0 rgba(255,255,255,0.06); }
+.sidebar-resize-grip:hover, .sidebar-resize-grip.is-pointer-hovered { color: var(--chrome-accent); border-color: rgba(34,211,238,0.52); opacity: 1; box-shadow: 0 0 14px rgba(34,211,238,0.18), inset 0 1px 0 rgba(255,255,255,0.06); }
 .sidebar-resize-grip:active { color: #67e8f9; border-color: rgba(103,232,249,0.68); opacity: 1; }
 .sidebar-footer { flex-shrink: 0; padding: 6px 8px; display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: 2px 6px; border-top: 1px solid rgba(34,211,238,0.13); background: rgba(8,13,22,0.42); box-shadow: inset 0 1px 0 rgba(255,255,255,0.025); }
 .sidebar-build-time { font-size: 9px; color: #7b8797; white-space: nowrap; }
 .sidebar-copyright { font-size: 9px; color: #7b8797; white-space: nowrap; }
+
+/* Controlled-node split shortcut. The main half opens management; the narrow
+   chevron opens a body-portaled quick remote-control list. */
+.controlled-nodes-shortcut-group { display: inline-flex; min-width: 0; flex-shrink: 0; }
+.controlled-nodes-shortcut-main { background: #334155; color: #e2e8f0; font-size: 12px; border-radius: 6px 0 0 6px; border-right-color: rgba(148,163,184,0.2); }
+.controlled-nodes-shortcut { display: inline-flex; }
+.controlled-nodes-quick-trigger { width: 25px; min-width: 25px; padding: 0; justify-content: center; background: #334155; color: #cbd5e1; font-size: 11px; border-radius: 0 6px 6px 0; border-left: 0; }
+.controlled-nodes-shortcut-main:hover,
+.controlled-nodes-quick-trigger:hover,
+.controlled-nodes-quick-trigger[aria-expanded='true'] { background: #42536d; color: #f8fafc; border-color: rgba(103,232,249,0.5); }
+.controlled-node-quick-menu { position: fixed; z-index: 2147483000; overflow: auto; box-sizing: border-box; padding: 7px; border: 1px solid rgba(103,232,249,0.34); border-radius: 10px; background: linear-gradient(180deg, rgba(15,23,42,0.99), rgba(7,12,22,0.99)); box-shadow: 0 18px 48px rgba(0,0,0,0.58), 0 0 22px rgba(34,211,238,0.1); backdrop-filter: blur(14px); }
+.controlled-node-quick-menu-head { display: flex; align-items: center; justify-content: space-between; padding: 4px 5px 8px; color: #dbeafe; font-size: 11px; font-weight: 700; letter-spacing: 0.05em; text-transform: uppercase; }
+.controlled-node-quick-count { display: inline-flex; min-width: 18px; height: 18px; align-items: center; justify-content: center; border-radius: 9px; background: rgba(34,211,238,0.14); color: #67e8f9; font-variant-numeric: tabular-nums; }
+.controlled-node-quick-list { display: flex; flex-direction: column; gap: 5px; margin: 0; padding: 0; list-style: none; }
+.controlled-node-quick-row { display: grid; grid-template-columns: 8px minmax(0,1fr) auto; gap: 8px; align-items: center; padding: 7px; border: 1px solid rgba(148,163,184,0.13); border-radius: 8px; background: rgba(30,41,59,0.58); }
+.controlled-node-quick-row:hover { border-color: rgba(103,232,249,0.3); background: rgba(30,58,83,0.68); }
+.controlled-node-quick-presence { width: 7px; height: 7px; border-radius: 50%; background: #475569; box-shadow: 0 0 0 2px rgba(71,85,105,0.16); }
+.controlled-node-quick-presence.is-online { background: #4ade80; box-shadow: 0 0 8px rgba(74,222,128,0.62); }
+.controlled-node-quick-identity { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.controlled-node-quick-identity strong { overflow: hidden; color: #e2e8f0; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+.controlled-node-quick-identity code { overflow: hidden; color: #64748b; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+.controlled-node-quick-remote { display: inline-flex; align-items: center; gap: 5px; min-height: 28px; padding: 4px 8px; border: 1px solid rgba(59,130,246,0.5); border-radius: 6px; background: rgba(30,64,175,0.26); color: #bfdbfe; cursor: pointer; font-size: 11px; white-space: nowrap; }
+.controlled-node-quick-remote:hover:not(:disabled) { border-color: #60a5fa; background: rgba(37,99,235,0.42); color: #eff6ff; box-shadow: 0 0 12px rgba(59,130,246,0.24); }
+.controlled-node-quick-remote:disabled { border-color: rgba(71,85,105,0.35); background: rgba(30,41,59,0.32); color: #526071; cursor: not-allowed; }
+.controlled-node-quick-state { padding: 18px 10px; color: #64748b; font-size: 11px; text-align: center; }
+.controlled-node-quick-state.is-error { color: #fca5a5; }
 
 /* ── Session Tree (task 2.1–2.5) ─────────────────────────────────────────── */
 .session-tree { display: flex; flex-direction: column; padding: 6px 0; }
@@ -6513,7 +6554,7 @@ html.native-ios-mac .chat-dl-btn {
 /* When keyboard is open, constrain the focused panel to fit above the keyboard */
 .kb-open .sidebar-pinned-panel:focus-within { max-height: calc(var(--vvh, 100vh) - 80px); }
 .sidebar-pinned-resize-handle { position: absolute; bottom: 0; left: 0; right: 0; height: 6px; cursor: ns-resize; background: rgba(30,41,59,0.62); transition: background 0.15s, box-shadow 0.15s; touch-action: none; z-index: 5; }
-.sidebar-pinned-resize-handle:hover { background: rgba(34,211,238,0.28); box-shadow: 0 0 12px rgba(34,211,238,0.16); }
+.sidebar-pinned-resize-handle:hover, .sidebar-pinned-resize-handle.is-pointer-hovered { background: rgba(34,211,238,0.28); box-shadow: 0 0 12px rgba(34,211,238,0.16); }
 @media (pointer: coarse) { .sidebar-pinned-resize-handle { height: 14px; } .sidebar-pinned-resize-handle::before { content: ''; position: absolute; left: 50%; top: 50%; transform: translate(-50%,-50%); width: 32px; height: 3px; border-radius: 2px; background: rgba(125,211,252,0.28); } }
 
 /* Language switcher */
@@ -6529,7 +6570,7 @@ html.native-ios-mac .chat-dl-btn {
 .fb-panel .fb-body-split > .fb-tree { max-width: none; }
 /* Draggable resize handle between tree and preview */
 .fb-resize-handle { width: 4px; cursor: col-resize; background: transparent; flex-shrink: 0; transition: background .15s; position: relative; z-index: 1; }
-.fb-resize-handle:hover, .fb-resize-handle:active { background: #3b82f6; }
+.fb-resize-handle:hover, .fb-resize-handle.is-pointer-hovered, .fb-resize-handle:active { background: #3b82f6; }
 /* Panel tabs (Files | Changes) */
 .fb-panel-tabs { display: flex; border-bottom: 1px solid rgba(125,211,252,0.14); flex-shrink: 0; background: linear-gradient(180deg, rgba(15,23,42,0.76), rgba(8,13,22,0.62)); }
 .fb-panel-tab { flex: 1; background: none; border: none; border-bottom: 2px solid transparent; color: #64748b; cursor: pointer; padding: 7px 10px; font-size: 12px; font-weight: 600; transition: color .15s, background .15s, border-color .15s; display: flex; align-items: center; justify-content: center; gap: 4px; position: relative; }
@@ -7267,6 +7308,10 @@ html.native-ios-mac .chat-dl-btn {
   border-right: 2px solid rgba(148,163,184,0.56);
   border-bottom: 2px solid rgba(148,163,184,0.56);
   border-radius: 0 0 4px;
+}
+.zoom-text-resize-handle:hover::after,
+.zoom-text-resize-handle.is-pointer-hovered::after {
+  filter: brightness(1.7) drop-shadow(0 0 5px rgba(96,165,250,0.58));
 }
 @media (pointer: coarse) {
   .zoom-text-resize-handle.is-bottom { height: 16px; }
@@ -8592,7 +8637,8 @@ button.quick-agent-delegation-preset.active {
 }
 
 .remote-desktop-files button,
-.controlled-nodes-remote-desktop {
+.controlled-nodes-remote-desktop,
+.controlled-nodes-install-worker {
   min-height: 34px;
   padding: 6px 12px;
   color: #cfeaff;
@@ -8934,7 +8980,11 @@ button.quick-agent-delegation-preset.active {
   position: absolute;
   inset: 0;
   z-index: 1;
-  background: transparent;
+  /* A non-zero alpha and its own compositor layer keep Chromium/Edge from
+     pruning this otherwise empty transparent element out of native-video
+     hover hit testing. The alpha is visually imperceptible. */
+  background: rgb(0 0 0 / 0.1%);
+  transform: translateZ(0);
   pointer-events: auto;
   touch-action: none;
 }
@@ -9488,6 +9538,18 @@ button.quick-agent-delegation-preset.active {
   background: #69d1ff;
   border-color: #a3e5ff;
   font-weight: 700;
+}
+
+.controlled-nodes-install-worker {
+  color: #ffe7b0;
+  background: linear-gradient(180deg, rgb(83 55 15 / 94%), rgb(48 31 10 / 94%));
+  border-color: rgb(245 179 74 / 55%);
+  font-weight: 700;
+}
+
+.controlled-nodes-install-worker:hover:not(:disabled) {
+  border-color: rgb(255 207 112 / 85%);
+  box-shadow: 0 0 14px rgb(245 179 74 / 18%);
 }
 
 @media (max-width: 720px) {

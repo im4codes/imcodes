@@ -19,6 +19,7 @@ import { positionChatActionMenu } from '../chat-action-menu-position.js';
 import { copyToClipboard } from '../util/clipboard.js';
 import { selectionToPlainText } from '../util/dom-to-text.js';
 import { selectionSignature } from '../util/selection-signature.js';
+import { resizeHandleHoverEvents } from './window-resize.js';
 
 interface Props {
   /** Plain-text content to display. Newlines and indentation are honoured. */
@@ -395,19 +396,22 @@ export function ZoomedTextDialog({
         {messagePreviewLayout && (
           <>
             <div
-              class="zoom-text-resize-handle is-bottom"
+              class="zoom-text-resize-handle resize-hover-surface is-bottom"
+              {...resizeHandleHoverEvents}
               onPointerDown={(event) => startMessagePreviewResize(event, 'height')}
               onClick={(event) => { event.preventDefault(); event.stopPropagation(); }}
               aria-hidden="true"
             />
             <div
-              class="zoom-text-resize-handle is-right"
+              class="zoom-text-resize-handle resize-hover-surface is-right"
+              {...resizeHandleHoverEvents}
               onPointerDown={(event) => startMessagePreviewResize(event, 'width')}
               onClick={(event) => { event.preventDefault(); event.stopPropagation(); }}
               aria-hidden="true"
             />
             <div
-              class="zoom-text-resize-handle is-corner"
+              class="zoom-text-resize-handle resize-hover-surface is-corner"
+              {...resizeHandleHoverEvents}
               onPointerDown={(event) => startMessagePreviewResize(event, 'both')}
               onClick={(event) => { event.preventDefault(); event.stopPropagation(); }}
               aria-hidden="true"

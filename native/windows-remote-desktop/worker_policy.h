@@ -29,12 +29,13 @@ inline constexpr int64_t kMediaProgressTimeoutMs = 7'000;
 inline constexpr uint32_t kEnvironmentDisplayChanged = 1u << 0;
 inline constexpr uint32_t kEnvironmentSuspend = 1u << 1;
 inline constexpr uint32_t kEnvironmentResume = 1u << 2;
+// WTS logoff/disconnect and logon/connect do not end remote control. The
+// LocalSystem worker survives the user-session boundary and follows Winlogon
+// or Default in place, keeping the peer and grant alive.
 inline constexpr uint32_t kEnvironmentSessionUnavailable = 1u << 3;
 inline constexpr uint32_t kEnvironmentSessionAvailable = 1u << 4;
 inline constexpr uint32_t kEnvironmentCompositionChanged = 1u << 5;
-// The session locked or unlocked. Deliberately *not* a session ending: one
-// worker follows the desktops instead, which is what keeps signing in from
-// looking like a dropped connection.
+// Lock and unlock have the same rule: they switch desktops, not peers.
 inline constexpr uint32_t kEnvironmentSessionLocked = 1u << 6;
 inline constexpr uint32_t kEnvironmentSessionUnlocked = 1u << 7;
 
@@ -53,12 +54,13 @@ enum class WorkerEnvironmentAction {
 enum class DesktopFollowAction { kStay, kFollow, kUnavailable };
 
 // `input_desktop` is the desktop that currently receives input, `bound` the one
-// the worker's indicator/input thread owns. An unreadable input desktop is
-// reported as a failure rather than silently treated as a match, and
-// `consecutive_failures` bounds how long that can last before the caller gives
-// up and lets itself be replaced.
+// the worker's indicator/input thread owns. During a WTS session transition,
+// Windows can temporarily expose no input desktop at all; that is a wait with
+// input disabled, not a reason to replace the peer. Outside such a transition,
+// `consecutive_failures` still bounds how long an unreadable desktop can last.
 DesktopFollowAction SelectDesktopFollowAction(const std::wstring& input_desktop,
                                               const std::wstring& bound,
+                                              bool session_transition_pending,
                                               int* consecutive_failures);
 
 inline constexpr int kDesktopFollowFailureLimit = 12;
@@ -189,12 +191,9 @@ inline constexpr bool CanReuseCaptureFrameAfterWait(
   return policy == CaptureWaitPolicy::kReuseLastFrame && has_last_frame;
 }
 
-// Keeps the ordinary active-user worker and the privileged Winlogon worker on
-// their own desktops. A secure-console worker must be replaced after unlock;
-// it must never carry authority or input ownership onto the user's desktop.
-// The ordinary worker still relies on its interactive indicator probe. The
-// privileged worker has an additional per-dispatch gate so no input can cross
-// the short Winlogon-to-Default teardown window after sign-in.
+// The LocalSystem worker owns one machine-scoped authority and follows the
+// currently visible desktop. Every boundary releases its input ledger before
+// rebinding, and input stays gated until the indicator owns the new desktop.
 
 CaptureAcquireAction ClassifyCaptureAcquireResult(HRESULT result);
 WorkerEnvironmentAction SelectWorkerEnvironmentAction(uint32_t event_mask);

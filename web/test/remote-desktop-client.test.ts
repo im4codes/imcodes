@@ -684,7 +684,7 @@ describe('RemoteDesktopClient', () => {
       .toBeNull();
   });
 
-  it('rebuilds the peer on the same grant when the node hands the session to another desktop', async () => {
+  it('keeps the browser peer and visible state while Windows hands off to a new console session', async () => {
     let socket!: FakeSocket;
     const peers: FakePeer[] = [];
     const snapshots: Array<ReturnType<RemoteDesktopClient['current']>> = [];
@@ -724,12 +724,33 @@ describe('RemoteDesktopClient', () => {
     await vi.waitFor(() => expect(peers).toHaveLength(1));
     await vi.waitFor(() => expect(socket.sent.map((raw) => JSON.parse(raw).type))
       .toContain(REMOTE_DESKTOP_MSG.OFFER));
+    const peer = peers[0]!;
+    socket.receive({
+      type: REMOTE_DESKTOP_MSG.ANSWER,
+      ...authority,
+      sdp: 'v=0\r\nold-worker',
+    });
+    await vi.waitFor(() => expect(peer.remoteDescription?.sdp).toContain('old-worker'));
+    socket.receive({
+      type: REMOTE_DESKTOP_MSG.STATUS,
+      ...authority,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW,
+      inputEpoch: 0,
+      state: REMOTE_DESKTOP_STATE.DIRECT,
+      route: 'direct',
+      inputEnabled: false,
+      viewerCount: 1,
+      controllerCount: 0,
+    });
+    await vi.waitFor(() => expect(client.current().state).toBe(REMOTE_DESKTOP_STATE.DIRECT));
+    const firstControl = peer.channels.get(REMOTE_DESKTOP_CHANNEL.CONTROL);
 
     socket.receive({ type: REMOTE_DESKTOP_MSG.RENEGOTIATE, ...authority });
 
-    // A second peer is built and a second offer sent under the same grant: the
-    // session is never failed, so the viewer keeps it without pressing Retry.
-    await vi.waitFor(() => expect(peers).toHaveLength(2));
+    // The same PeerConnection ICE-restarts against the replacement native
+    // worker. Only SCTP channels are rebuilt; the mounted stream/last frame and
+    // current visible state never enter the reconnecting UI.
+    await vi.waitFor(() => expect(peers).toHaveLength(1));
     const sentOffers = () => socket.sent
       .map((raw) => JSON.parse(raw) as { type: string; sessionId?: string; capability?: string })
       .filter((message) => message.type === REMOTE_DESKTOP_MSG.OFFER);
@@ -739,8 +760,32 @@ describe('RemoteDesktopClient', () => {
       sessionId: authority.sessionId,
       capability: authority.capability,
     });
+    expect(peer.offerOptions.at(-1)).toEqual({ iceRestart: true });
+    expect(peer.channels.get(REMOTE_DESKTOP_CHANNEL.CONTROL)).not.toBe(firstControl);
+    peer.connectionState = 'connecting';
+    peer.dispatchEvent(new Event('connectionstatechange'));
+    expect(client.current().state).toBe(REMOTE_DESKTOP_STATE.DIRECT);
+    socket.receive({
+      type: REMOTE_DESKTOP_MSG.ICE,
+      ...authority,
+      candidate: 'candidate:new-worker',
+      mid: '0',
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    // The old remoteDescription remains installed until the replacement
+    // ANSWER, but its new-generation candidate must still wait for that answer.
+    expect(peer.candidates).toHaveLength(0);
+    socket.receive({
+      type: REMOTE_DESKTOP_MSG.ANSWER,
+      ...authority,
+      sdp: 'v=0\r\nnew-worker',
+    });
+    await vi.waitFor(() => expect(peer.candidates).toEqual([{
+      candidate: 'candidate:new-worker',
+      sdpMid: '0',
+    }]));
     expect(snapshots.some((snapshot) => snapshot.state === REMOTE_DESKTOP_STATE.FAILED)).toBe(false);
-    expect(snapshots.some((snapshot) => snapshot.state === REMOTE_DESKTOP_STATE.RECONNECTING)).toBe(true);
+    expect(snapshots.some((snapshot) => snapshot.state === REMOTE_DESKTOP_STATE.RECONNECTING)).toBe(false);
     client.stop();
   });
 

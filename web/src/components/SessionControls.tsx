@@ -111,6 +111,7 @@ import {
 } from '@shared/supervision-config.js';
 import { FILE_TRANSFER_LIMITS } from '@shared/transport/file-transfer.js';
 import { SESSION_MODEL_COMMAND, shouldHideOptimisticUserMessageForSessionControl } from '@shared/session-control-commands.js';
+import { resizeHandleHoverEvents } from './window-resize.js';
 import type { SharedActorEnvelope } from '@shared/tab-sharing.js';
 import { EXECUTION_CLONE_KIND } from '@shared/execution-clone.js';
 import {
@@ -6414,7 +6415,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           {!isMobileLayout && !compact && (
             <>
               <div
-                class="controls-composer-resize-edge"
+                class="controls-composer-resize-edge resize-hover-surface"
                 role="separator"
                 tabIndex={0}
                 aria-orientation="horizontal"
@@ -6422,6 +6423,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                 aria-valuemin={COMPOSER_HEIGHT_MIN_PX}
                 aria-valuemax={COMPOSER_HEIGHT_MAX_PX}
                 aria-valuenow={sharedComposerHeight ?? undefined}
+                {...resizeHandleHoverEvents}
                 onPointerDown={startComposerTopResize}
                 onKeyDown={handleComposerResizeKeyDown}
               />

@@ -1,11 +1,11 @@
 /**
  * Remote-desktop worker installation on a normal (FULL) daemon.
  *
- * A controlled node ships the native worker alongside its runtime and stages it
- * through the self-upgrade script. A normal daemon is installed from npm and has
- * no worker at all, so it fetches the same signed bundle on demand and reports
- * what happened. These types carry that request and its outcome; the signalling
- * protocol in `remote-desktop.ts` is untouched by them.
+ * A controlled node release stages the native worker through the atomic
+ * self-upgrade script, but the first-install executable is intentionally a
+ * single file and may need to fetch its same-version sidecars. A normal daemon
+ * installed from npm has the same on-demand need. These types carry that request
+ * and its outcome; the signalling protocol in `remote-desktop.ts` is untouched.
  */
 
 /**

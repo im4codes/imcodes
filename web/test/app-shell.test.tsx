@@ -603,6 +603,23 @@ vi.mock('../src/components/ControlledNodesPanel.js', () => ({
     })}>controlled-nodes-panel</button>
   ),
 }));
+vi.mock('../src/components/ControlledNodeQuickMenu.js', () => ({
+  ControlledNodeQuickMenu: ({ onOpenRemoteDesktop }: any) => (
+    <button
+      data-testid="controlled-node-quick-trigger"
+      onClick={() => onOpenRemoteDesktop?.({
+        serverId: 'desktop-quick',
+        refName: 'desktop-quick-ref',
+        displayName: 'Desktop Quick',
+        os: 'win',
+        online: true,
+        execEnabled: true,
+        accessRole: 'owner',
+        capabilities: [],
+      })}
+    >controlled-node-quick-trigger</button>
+  ),
+}));
 vi.mock('../src/components/RemoteDesktopPanel.js', () => ({
   RemoteDesktopPanel: ({ minimized, onMinimize, onRestore, onClose }: any) => (
     <div data-testid="remote-desktop-panel">
@@ -1086,6 +1103,20 @@ describe('App shell', () => {
     expect(await screen.findByText('remote-desktop-panel:true')).toBeTruthy();
     fireEvent.click(screen.getByText('remote-desktop-restore'));
     expect(await screen.findByText('remote-desktop-panel:false')).toBeTruthy();
+  }, 20_000);
+
+  it('opens remote control from the sidebar chevron without opening node management', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+    const { App } = await importApp();
+    render(<App />);
+    await waitFor(() => expect(wsInstances.length).toBe(1));
+
+    fireEvent.click(await screen.findByTestId('controlled-node-quick-trigger'));
+    expect(await screen.findByText('remote-desktop-panel:false')).toBeTruthy();
+    expect(screen.queryByTestId('floating-panel-controlled-nodes')).toBeNull();
   }, 20_000);
 
   it('puts remote control in the desktop toolbar, not only on mobile', async () => {
@@ -2165,10 +2196,9 @@ describe('App shell', () => {
     fireEvent.click(screen.getByText('subbar-open-sub-3'));
 
     // The just-opened sub-3 is active; the earlier two are open but inactive.
-    // Windows mount one animation frame apart (useProgressiveMount), and the
-    // focused one jumps the queue, so wait for all three to exist before
-    // comparing their active flags — otherwise this races the mount schedule
-    // rather than testing it.
+    // Windows mount one animation frame apart (useProgressiveMount), so wait
+    // for all three to exist before comparing their active flags — otherwise
+    // this races the mount schedule rather than testing it.
     await waitFor(() => {
       expect(screen.getByTestId('sub-session-window-sub-1')).toBeTruthy();
       expect(screen.getByTestId('sub-session-window-sub-2')).toBeTruthy();
@@ -2177,12 +2207,20 @@ describe('App shell', () => {
     expect(screen.getByTestId('sub-session-window-sub-1').getAttribute('data-active')).toBe('false');
     expect(screen.getByTestId('sub-session-window-sub-2').getAttribute('data-active')).toBe('false');
 
-    // Re-activating an older window flips active over to it (and only it).
+    const windowDomOrder = () => screen.getAllByTestId(/^sub-session-window-sub-/)
+      .map((node) => node.getAttribute('data-testid'));
+    const orderBeforeFocusChange = windowDomOrder();
+
+    // Re-activating an older window flips active over to it (and only it), but
+    // must not move either live window in the DOM. Reordering keyed siblings
+    // makes Blink/WebKit re-anchor the chat scrollers and visibly jolts the
+    // window that just lost focus.
     fireEvent.mouseDown(screen.getByTestId('sub-session-window-sub-1'));
     await waitFor(() => {
       expect(screen.getByTestId('sub-session-window-sub-1').getAttribute('data-active')).toBe('true');
     });
     expect(screen.getByTestId('sub-session-window-sub-3').getAttribute('data-active')).toBe('false');
+    expect(windowDomOrder()).toEqual(orderBeforeFocusChange);
   }, 20_000);
 
   it('executes app-level shell callbacks and websocket message reducers', async () => {

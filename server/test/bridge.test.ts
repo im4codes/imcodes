@@ -67,6 +67,10 @@ import {
 import { CONTROLLED_NODE_OS_LINUX, CONTROLLED_NODE_OS_WIN, type ControlledNodeOs } from '../../shared/controlled-node-artifacts.js';
 import { CONTROLLED_NODE_SAFE_SELF_UPGRADE_CAPABILITY } from '../../shared/controlled-node-service.js';
 import {
+  REMOTE_DESKTOP_INSTALLABLE_CAPABILITY,
+  REMOTE_DESKTOP_INSTALL_MSG,
+} from '../../shared/remote-desktop-install.js';
+import {
   LEGACY_WINDOWS_UPGRADE_RESCUE_READY_PREFIX,
   LEGACY_WINDOWS_UPGRADE_RESTART_READY_PREFIX,
 } from '../src/ws/windows-controlled-node-upgrade-rescue.js';
@@ -405,6 +409,34 @@ describe('WsBridge', () => {
       ws.emit('message', JSON.stringify({ type: 'auth', serverId, token: 'my-token' }));
       await flushAsync();
       expect(bridge.isAuthenticated).toBe(true);
+    });
+
+    it('sends an exact generation-bound worker repair request to an installable controlled node', async () => {
+      const bridge = WsBridge.get(serverId);
+      const ws = new MockWs();
+      bridge.handleDaemonConnection(
+        ws as never,
+        makeDb('valid-hash', 'controlled', CONTROLLED_NODE_OS_WIN),
+        {} as never,
+      );
+      ws.emit('message', JSON.stringify({
+        type: 'auth',
+        serverId,
+        token: 'my-token',
+        capabilities: [REMOTE_DESKTOP_INSTALLABLE_CAPABILITY],
+      }));
+      await flushAsync();
+
+      const result = bridge.tryInstallControlledNodeRemoteDesktopWorker(
+        bridge.daemonConnectionGeneration(),
+      );
+      expect(result).toBe('sent');
+      expect(ws.sentStrings.map((value) => JSON.parse(value))).toContainEqual({
+        type: REMOTE_DESKTOP_INSTALL_MSG.REQUEST,
+      });
+      expect(bridge.tryInstallControlledNodeRemoteDesktopWorker(
+        bridge.daemonConnectionGeneration() - 1,
+      )).toBe('generation_changed');
     });
 
     it('closes on auth timeout', async () => {

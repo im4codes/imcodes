@@ -40,9 +40,10 @@ export const REMOTE_DESKTOP_MSG = {
   CANCEL: 'remote_desktop.cancel',
   STOP: 'remote_desktop.stop',
   STATUS: 'remote_desktop.status',
-  // Daemon → browser: the worker behind this session was replaced (the desktop
-  // switched under it), so the same authority needs a fresh peer. Carries no
-  // new grant: the session, lease and input epoch all continue unchanged.
+  // Daemon → browser: the native worker/peer behind this session was replaced
+  // (a real Windows logoff destroys its console session). The browser keeps
+  // its mounted PeerConnection and ICE-restarts it toward the replacement.
+  // Carries no new grant: session, lease and input epoch all continue unchanged.
   RENEGOTIATE: 'remote_desktop.renegotiate',
   TERMINAL: 'remote_desktop.terminal',
   ERROR: 'remote_desktop.error',

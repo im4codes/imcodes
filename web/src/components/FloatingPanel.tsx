@@ -17,7 +17,7 @@ import {
   type WorkspaceBounds,
   type WindowGeometry,
 } from '../desktop-window-maximize.js';
-import { RESIZE_DIRS, RESIZE_EDGE_PX, resizeHandleClass, type ResizeDir } from './window-resize.js';
+import { RESIZE_DIRS, RESIZE_EDGE_PX, resizeHandleClass, resizeHandleHoverEvents, type ResizeDir } from './window-resize.js';
 
 interface Props {
   id: string;
@@ -377,6 +377,7 @@ export function FloatingPanel({
               key={dir}
               data-testid={`floating-resize-${dir}`}
               className={resizeHandleClass(dir, resizingDir)}
+              {...resizeHandleHoverEvents}
               onMouseDown={onResizeMouseDown(dir)}
             />
           ))}

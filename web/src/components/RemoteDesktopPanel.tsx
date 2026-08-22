@@ -59,7 +59,13 @@ import {
 type ViewScale = 'fit' | 'actual';
 type MobileInputMode = 'touch' | 'mouse';
 type ClipboardStatus = 'idle' | 'copying' | 'copied' | 'pasting' | 'pasted' | 'empty' | 'failed';
-type DesktopPointerMoveSource = 'window-mouse' | 'window-pointer' | 'stage-mouse' | 'stage-pointer';
+type DesktopPointerMoveSource =
+  | 'window-mouse'
+  | 'window-pointer'
+  | 'stage-mouse'
+  | 'stage-pointer'
+  | 'surface-mouse'
+  | 'surface-pointer';
 
 interface TouchPoint {
   x: number;
@@ -296,6 +302,8 @@ export function RemoteDesktopPanel({
     'window-pointer': 0,
     'stage-mouse': 0,
     'stage-pointer': 0,
+    'surface-mouse': 0,
+    'surface-pointer': 0,
   });
   const lastDesktopPointerMoveRef = useRef<{ x: number; y: number; at: number } | null>(null);
   const [pointerMovesUnmapped, setPointerMovesUnmapped] = useState(0);
@@ -1249,6 +1257,23 @@ export function RemoteDesktopPanel({
     sendDesktopPointerMove(event.clientX, event.clientY, 'stage-mouse');
   };
 
+  const onInputSurfacePointerMove = (event: PointerEvent) => {
+    if (event.pointerType === 'touch') {
+      onTouchMove(event);
+    } else {
+      sendDesktopPointerMove(event.clientX, event.clientY, 'surface-pointer');
+    }
+    // This is the browser hit surface above the native video compositor. Own
+    // the target phase here; window capture remains a fallback and the stage
+    // must not consume the same compatibility event a third time.
+    event.stopPropagation();
+  };
+
+  const onInputSurfaceMouseMove = (event: MouseEvent) => {
+    sendDesktopPointerMove(event.clientX, event.clientY, 'surface-mouse');
+    event.stopPropagation();
+  };
+
   const suppressCommandControlForMiddleDrag = () => {
     const client = clientRef.current;
     if (!client) return;
@@ -1275,6 +1300,21 @@ export function RemoteDesktopPanel({
       else onTouchEnd(event);
       return;
     }
+    // Release before interpreting the changed button. Pointer Events says
+    // pointerup should carry the changed button, but compatibility layers have
+    // emitted -1 here. Returning first leaves capture stuck on the desktop
+    // stage, which suppresses hover hit-testing everywhere else in Blink and
+    // WebKit until another interaction happens.
+    if (!down) {
+      const target = event.currentTarget as HTMLElement;
+      try {
+        if (target.hasPointerCapture?.(event.pointerId)) {
+          target.releasePointerCapture?.(event.pointerId);
+        }
+      } catch {
+        // Pointer capture may already have been released implicitly.
+      }
+    }
     const startsCommandMiddleDrag = down
       && event.button === 0
       && event.metaKey
@@ -1292,7 +1332,13 @@ export function RemoteDesktopPanel({
       ? undefined
       : desktopPointerPressesRef.current.get(event.pointerId);
     const button = activePress?.button ?? eventButton;
-    if (!button) return;
+    if (!button) {
+      if (!down && desktopPointerPressesRef.current.delete(event.pointerId)) {
+        lastDesktopClickRef.current = null;
+        clientRef.current?.releasePointerButtons();
+      }
+      return;
+    }
     const point = normalizedDesktopPointerPoint(event);
     if (down && !point) return;
     const now = performance.now();
@@ -1356,14 +1402,6 @@ export function RemoteDesktopPanel({
               normalized: activePress.normalized,
             }
           : null;
-      }
-      const target = event.currentTarget as HTMLElement;
-      try {
-        if (target.hasPointerCapture?.(event.pointerId)) {
-          target.releasePointerCapture?.(event.pointerId);
-        }
-      } catch {
-        // Pointer capture may already have been released implicitly.
       }
     }
     if (startsCommandMiddleDrag && !sent) commandMiddleDragPointerRef.current = null;
@@ -2001,6 +2039,9 @@ export function RemoteDesktopPanel({
               class="remote-desktop-input-surface"
               data-testid="remote-desktop-input-surface"
               aria-hidden="true"
+              onPointerMove={onInputSurfacePointerMove}
+              onMouseMove={onInputSurfaceMouseMove}
+              onMouseEnter={onInputSurfaceMouseMove}
             />
           )}
           {mobileTextOpen && (

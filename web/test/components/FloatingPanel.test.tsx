@@ -105,8 +105,24 @@ describe('FloatingPanel', () => {
     for (const dir of ['n', 's', 'e', 'w', 'ne', 'nw', 'se', 'sw']) {
       const handle = screen.getByTestId(`floating-resize-${dir}`);
       expect(handle.className).toContain('resize-handle');
+      expect(handle.className).toContain('resize-hover-surface');
       expect(handle.className).toContain(`resize-${dir}`);
     }
+  });
+
+  it('mirrors target-phase mouse hover into an explicit cross-engine class', () => {
+    render(
+      <FloatingPanel id="handle-hover" title="Preview" onClose={() => {}}>
+        <div>content</div>
+      </FloatingPanel>,
+    );
+
+    const handle = screen.getByTestId('floating-resize-e');
+    expect(handle.className).not.toContain('is-pointer-hovered');
+    fireEvent.mouseEnter(handle);
+    expect(handle.className).toContain('is-pointer-hovered');
+    fireEvent.mouseLeave(handle);
+    expect(handle.className).not.toContain('is-pointer-hovered');
   });
 
   it('keeps the dragged handle and the frame lit for the whole resize', () => {

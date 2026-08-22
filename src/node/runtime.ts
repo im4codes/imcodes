@@ -49,6 +49,10 @@ import {
 import { RemoteDesktopWorkerHost } from './remote-desktop-worker-host.js';
 import { dispatchRemoteDesktopCommand } from './remote-desktop-dispatch.js';
 import { isRemoteDesktopFeatureEnabled } from '../../shared/remote-desktop-feature.js';
+import {
+  REMOTE_DESKTOP_INSTALLABLE_CAPABILITY,
+  REMOTE_DESKTOP_INSTALL_MSG,
+} from '../../shared/remote-desktop-install.js';
 import { CONTROLLED_NODE_SAFE_SELF_UPGRADE_CAPABILITY } from '../../shared/controlled-node-service.js';
 import { cleanupLegacyWindowsUpgradeRescue } from './legacy-upgrade-rescue.js';
 import {
@@ -87,7 +91,22 @@ export interface ControlledNodeRuntimeOptions {
     close(): void;
   };
   cleanupLegacyUpgradeRescue?: () => Promise<void>;
+  /**
+   * First-install repair seam. The downloadable node executable is a single
+   * file, so a freshly enrolled Windows node may initially have no native
+   * worker beside it even when its main version already matches the Server.
+   */
+  repairMissingRemoteDesktopWorker?: (targetVersion: string) => ReturnType<typeof startControlledNodeSelfUpgrade>;
+  platform?: NodeJS.Platform;
+  arch?: string;
+  now?: () => number;
 }
+
+const REMOTE_DESKTOP_WORKER_REPAIR_RETRY_MS = 5 * 60_000;
+// Server-side version convergence is deliberately scheduled five seconds after
+// authentication. Wait through that window before attempting a same-version
+// repair so an actually stale node performs one atomic upgrade, not two.
+const REMOTE_DESKTOP_WORKER_REPAIR_AUTH_GRACE_MS = 10_000;
 
 export function createControlledNodeRuntime(
   credential: ControlledNodeCredential,
@@ -129,12 +148,19 @@ export function createControlledNodeRuntime(
       logger.warn('remote desktop worker did not answer offer; recycling');
     },
   });
-  const remoteDesktopEnabled = remoteDesktopWorker.available()
-    && isRemoteDesktopFeatureEnabled(
-      process.env.IMCODES_REMOTE_DESKTOP_ENABLED,
-      process.env.NODE_ENV,
-    );
+  const remoteDesktopFeatureEnabled = isRemoteDesktopFeatureEnabled(
+    process.env.IMCODES_REMOTE_DESKTOP_ENABLED,
+    process.env.NODE_ENV,
+  );
+  const remoteDesktopWorkerAvailable = remoteDesktopWorker.available();
+  const remoteDesktopEnabled = remoteDesktopWorkerAvailable && remoteDesktopFeatureEnabled;
+  const missingRemoteDesktopWorkerCanRepair = (options.platform ?? process.platform) === 'win32'
+    && (options.arch ?? process.arch) === 'x64'
+    && remoteDesktopFeatureEnabled
+    && !remoteDesktopWorkerAvailable;
   let upgradeInFlight = false;
+  let remoteDesktopWorkerRepairEligibleAt: number | null = null;
+  let remoteDesktopWorkerRepairNextAttemptAt = 0;
   let authenticationPersisted = false;
   let authenticationPersistenceInFlight = false;
   let legacyUpgradeRescueCleanupStarted = false;
@@ -163,6 +189,39 @@ export function createControlledNodeRuntime(
     ).finally(() => {
       authenticationPersistenceInFlight = false;
     });
+  };
+  const repairMissingRemoteDesktopWorker = (force = false) => {
+    if (!missingRemoteDesktopWorkerCanRepair || upgradeInFlight) return false;
+    const now = options.now?.() ?? Date.now();
+    if (!force && (remoteDesktopWorkerRepairEligibleAt === null
+      || now < remoteDesktopWorkerRepairEligibleAt)) return false;
+    if (!force && now < remoteDesktopWorkerRepairNextAttemptAt) return false;
+    // Claim the shared upgrade gate synchronously so a simultaneous Server
+    // version upgrade and this same-version repair cannot stage two tasks.
+    upgradeInFlight = true;
+    remoteDesktopWorkerRepairNextAttemptAt = now + REMOTE_DESKTOP_WORKER_REPAIR_RETRY_MS;
+    const repair = options.repairMissingRemoteDesktopWorker
+      ?? ((targetVersion: string) => startControlledNodeSelfUpgrade(credential, targetVersion));
+    void repair(DAEMON_VERSION).then((result) => {
+      if (result.ok) {
+        client.send({
+          type: DAEMON_MSG.UPGRADING,
+          targetVersion: DAEMON_VERSION,
+          ...(result.artifactSha256 ? { artifactSha256: result.artifactSha256 } : {}),
+        });
+        logger.info('staged same-version controlled-node repair for missing remote desktop worker');
+        // Keep the gate claimed. The detached upgrade task replaces the
+        // artifact set and restarts this process; clearing it here could admit
+        // a second task during that handoff window.
+        return;
+      }
+      upgradeInFlight = false;
+      logger.warn({ reason: result.reason }, 'could not stage missing remote desktop worker repair');
+    }, (error) => {
+      upgradeInFlight = false;
+      logger.warn({ err: error }, 'missing remote desktop worker repair failed; will retry');
+    });
+    return true;
   };
   const fileSender: FileTransferSender = {
     send(message: unknown): boolean {
@@ -201,6 +260,9 @@ export function createControlledNodeRuntime(
         ...(remoteDesktopEnabled
           ? [REMOTE_DESKTOP_CAPABILITY, CONTROLLED_NODE_AUTO_UNLOCK_CAPABILITY]
           : []),
+        ...(missingRemoteDesktopWorkerCanRepair
+          ? [REMOTE_DESKTOP_INSTALLABLE_CAPABILITY]
+          : []),
       ],
     },
     heartbeatMessage: { type: 'heartbeat', daemonVersion: DAEMON_VERSION },
@@ -229,6 +291,11 @@ export function createControlledNodeRuntime(
       }
       if (isControlledNodeAuthAck(message)) {
         persistAuthentication();
+        if (remoteDesktopWorkerRepairEligibleAt === null) {
+          remoteDesktopWorkerRepairEligibleAt = (options.now?.() ?? Date.now())
+            + REMOTE_DESKTOP_WORKER_REPAIR_AUTH_GRACE_MS;
+        }
+        repairMissingRemoteDesktopWorker();
         try {
           void Promise.resolve(options.onHeartbeatAck?.()).then(async () => {
             if (legacyUpgradeRescueCleanupStarted) return;
@@ -273,6 +340,12 @@ export function createControlledNodeRuntime(
       if (message.type === DAEMON_COMMAND_TYPES.COMPUTER_USE) {
         const reply = await computerUseWorker.handle(message);
         if (reply) client.send({ type: DAEMON_MSG.COMPUTER_USE_RESULT, ...reply });
+        return;
+      }
+      if (message.type === REMOTE_DESKTOP_INSTALL_MSG.REQUEST) {
+        // The request deliberately has no caller-controlled fields. Exactness
+        // prevents this from becoming a generic upgrade endpoint.
+        if (Object.keys(message).length === 1) repairMissingRemoteDesktopWorker(true);
         return;
       }
       if (isRemoteDesktopMessageType(message.type)) {

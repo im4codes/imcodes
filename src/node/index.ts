@@ -11,6 +11,7 @@ import {
   runMacosControlledNodeHealthWatchdog,
 } from './health-lease.js';
 import { CONTROLLED_NODE_SERVICE } from './installer.js';
+import { controlledNodeInstallStatus, isWindowsInstallerLaunch } from './windows-install-ui.js';
 
 async function main(): Promise<void> {
   if (process.argv[2] === '--version') {
@@ -41,6 +42,10 @@ async function main(): Promise<void> {
   }
   const now = Date.now();
   const deps = defaultBootstrapDeps(now);
+  if (isWindowsInstallerLaunch(process.platform, deps.sourceExecutablePath, deps.stagedExecutablePath)) {
+    const locale = Intl.DateTimeFormat().resolvedOptions().locale;
+    process.stdout.write(`${controlledNodeInstallStatus(locale)}\n`);
+  }
   const bootstrap = await bootstrapControlledNodeWithDisposition(deps);
   if (bootstrap.disposition === 'handoff_complete') return;
   const reportHealthError = (err: unknown): void => {

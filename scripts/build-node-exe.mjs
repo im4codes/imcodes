@@ -148,6 +148,13 @@ async function main() {
     external: ['bufferutil', 'utf8-validate'],
     define: {
       'process.env.IMCODES_BUILD_VERSION': JSON.stringify(buildVersion),
+      // `ws` probes these optional native accelerators with a caught
+      // `require()` when they are not explicitly disabled. A SEA's injected
+      // require can only load built-ins, so the harmless probe prints a large
+      // warning before first-run installation begins. The bundled JS fallbacks
+      // are already production-supported; compile the unavailable probes out.
+      'process.env.WS_NO_BUFFER_UTIL': JSON.stringify('1'),
+      'process.env.WS_NO_UTF_8_VALIDATE': JSON.stringify('1'),
       __IMCODES_WINDOWS_RELEASE_SIGNER_SHA256__: JSON.stringify(
         isWin ? windowsReleaseSignerSha256 : '',
       ),

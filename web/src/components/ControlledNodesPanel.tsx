@@ -8,6 +8,7 @@ import {
 import {
   artifactSelectionKey,
   buildControlledNodeDownloadTargets,
+  installMachineRemoteDesktopWorker,
   listAvailableExecutables,
   renameMachine,
   revokeMachine,
@@ -18,6 +19,8 @@ import {
   type ControlledNodeOs,
 } from '../api/machines.js';
 import { CONTROLLED_NODE_AUTO_UNLOCK_CAPABILITY } from '@shared/controlled-node-auto-unlock.js';
+import { REMOTE_DESKTOP_INSTALLABLE_CAPABILITY } from '@shared/remote-desktop-install.js';
+import { REMOTE_DESKTOP_CAPABILITY } from '@shared/remote-desktop.js';
 import { normalizeMachineDisplayName } from '@shared/machine-reference.js';
 import { formatByteSize } from '../util/byte-size.js';
 import { useMachines } from '../hooks/useMachines.js';
@@ -35,6 +38,15 @@ function canConfigureAutoUnlock(machine: MachineListItem): boolean {
   return (machine.accessRole ?? 'owner') === 'owner'
     && machine.os === 'win'
     && Boolean(machine.capabilities?.includes(CONTROLLED_NODE_AUTO_UNLOCK_CAPABILITY));
+}
+
+function canInstallRemoteDesktopWorker(machine: MachineListItem): boolean {
+  return machineAccessRole(machine) === 'owner'
+    && machine.online
+    && !machine.updateAvailable
+    && machine.os === 'win'
+    && Boolean(machine.capabilities?.includes(REMOTE_DESKTOP_INSTALLABLE_CAPABILITY))
+    && !machine.capabilities?.includes(REMOTE_DESKTOP_CAPABILITY);
 }
 
 /**
@@ -223,6 +235,20 @@ export function ControlledNodesPanel({
       await setMachineExecEnabled(serverId, next);
     } catch {
       setActionError(t('controlled_nodes.error_generic'));
+      setBusyServerId(null);
+      return;
+    }
+    await refreshPresence();
+    setBusyServerId(null);
+  };
+
+  const onInstallRemoteDesktopWorker = async (serverId: string) => {
+    setActionError(null);
+    setBusyServerId(serverId);
+    try {
+      await installMachineRemoteDesktopWorker(serverId);
+    } catch {
+      setActionError(t('remote_desktop.install_failed'));
       setBusyServerId(null);
       return;
     }
@@ -437,6 +463,18 @@ export function ControlledNodesPanel({
                 </div>
               </div>
               <div class="controlled-nodes-machine-actions">
+                {canInstallRemoteDesktopWorker(m) && (
+                  <button
+                    type="button"
+                    class="controlled-nodes-install-worker"
+                    disabled={busyServerId === m.serverId}
+                    onClick={() => { void onInstallRemoteDesktopWorker(m.serverId); }}
+                  >
+                    {busyServerId === m.serverId
+                      ? t('remote_desktop.installing')
+                      : t('remote_desktop.install_worker')}
+                  </button>
+                )}
                 {canOpenRemoteDesktop(m) && (
                   <button
                     type="button"

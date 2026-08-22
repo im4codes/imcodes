@@ -540,6 +540,10 @@ const contracts: Contract[] = [
         needle: 'SelectDesktopFollowAction',
       },
       {
+        path: 'native/windows-remote-desktop/worker_policy.cc',
+        needle: 'kEnvironmentSessionUnavailable |\n                    kEnvironmentSessionAvailable',
+      },
+      {
         path: 'native/windows-remote-desktop/local_indicator.cc',
         needle: 'kEnvironmentSessionLocked',
       },
@@ -565,6 +569,28 @@ const contracts: Contract[] = [
         path: 'native/windows-remote-desktop/display_capture.cc',
         needle: 'CaptureDesktopGdi()',
         minimum: 2,
+      },
+    ],
+  },
+  {
+    name: 'cross-session handover keeps the mounted browser peer',
+    guards: [
+      {
+        path: 'web/src/remote-desktop-client.ts',
+        needle: 'private seamlessHandover = false;',
+      },
+      {
+        path: 'web/src/remote-desktop-client.ts',
+        needle: 'const peer = this.peer;',
+      },
+      {
+        path: 'web/src/remote-desktop-client.ts',
+        needle: 'const offer = await peer.createOffer({ iceRestart: true });',
+        minimum: 2,
+      },
+      {
+        path: 'web/src/remote-desktop-client.ts',
+        needle: 'if (!this.peer?.remoteDescription || this.awaitingAnswer)',
       },
     ],
   },
@@ -1214,6 +1240,18 @@ const mutations: Mutation[] = [
     contract: 'one console-session worker that follows the desktop',
     path: 'web/src/remote-desktop-client.ts',
     needle: 'await this.renegotiate();',
+  },
+  {
+    name: 'replace the mounted browser peer during a Windows console handover',
+    contract: 'cross-session handover keeps the mounted browser peer',
+    path: 'web/src/remote-desktop-client.ts',
+    needle: 'private seamlessHandover = false;',
+  },
+  {
+    name: 'end the peer when Windows logs on or off',
+    contract: 'one console-session worker that follows the desktop',
+    path: 'native/windows-remote-desktop/worker_policy.cc',
+    needle: 'kEnvironmentSessionUnavailable |\n                    kEnvironmentSessionAvailable',
   },
   {
     name: 'let a stale desktop choice stand',

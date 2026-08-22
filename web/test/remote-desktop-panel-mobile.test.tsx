@@ -533,6 +533,41 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     expect(pointerMove.mock.calls).toEqual([[0.5, 0.5], [0.75, 0.5]]);
   });
 
+  it('owns non-bubbling hover movement on the painted video input surface', async () => {
+    const { container, video } = await renderPanel();
+    act(() => clientHooks[0]!.onSnapshot({
+      state: REMOTE_DESKTOP_STATE.DIRECT,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
+      inputEpoch: 2,
+      inputEnabled: true,
+      route: 'direct',
+      displays: [],
+      layoutRevision: 1,
+      stream: {} as MediaStream,
+    }));
+    act(() => video.dispatchEvent(new Event('loadeddata')));
+    const inputSurface = container.querySelector('[data-testid="remote-desktop-input-surface"]');
+    expect(inputSurface).not.toBeNull();
+    pointerMove.mockClear();
+
+    act(() => {
+      inputSurface!.dispatchEvent(new MouseEvent('mousemove', {
+        bubbles: false,
+        cancelable: true,
+        clientX: 200,
+        clientY: 150,
+      }));
+      inputSurface!.dispatchEvent(new MouseEvent('mousemove', {
+        bubbles: false,
+        cancelable: true,
+        clientX: 300,
+        clientY: 150,
+      }));
+    });
+
+    expect(pointerMove.mock.calls).toEqual([[0.5, 0.5], [0.75, 0.5]]);
+  });
+
   it('keeps monitor and mode controls keyboard-focusable while viewing', async () => {
     const { getByRole } = await renderPanel();
     act(() => clientHooks[0]!.onSnapshot({
@@ -858,6 +893,32 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     expect(releasePointerCapture).toHaveBeenCalledWith(7);
     expect(releasePointerButtons).toHaveBeenCalledTimes(1);
     expect(releaseAll).not.toHaveBeenCalled();
+  });
+
+  it('releases capture before interpreting a compatibility pointer-up button', async () => {
+    const { stage } = await renderPanel();
+    let capturedPointerId: number | null = null;
+    const releasePointerCapture = vi.fn((pointerId: number) => {
+      if (capturedPointerId === pointerId) capturedPointerId = null;
+    });
+    Object.assign(stage, {
+      setPointerCapture: (pointerId: number) => { capturedPointerId = pointerId; },
+      hasPointerCapture: (pointerId: number) => capturedPointerId === pointerId,
+      releasePointerCapture,
+    });
+
+    mousePointer(stage, 'pointerdown', {
+      pointerId: 17, clientX: 200, clientY: 150,
+    });
+    mousePointer(stage, 'pointerup', {
+      pointerId: 17, clientX: 200, clientY: 150, button: -1,
+    });
+
+    expect(releasePointerCapture).toHaveBeenCalledWith(17);
+    expect(capturedPointerId).toBeNull();
+    // The remembered press supplies the real button, so remote input is also
+    // released instead of leaving a separate stuck-button failure behind.
+    expect(pointerButton).toHaveBeenNthCalledWith(2, 'left', false, 0.5, 0.5);
   });
 
   it('snaps a nearby desktop double-click to one remote pixel target', async () => {

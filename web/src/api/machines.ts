@@ -295,6 +295,13 @@ export async function setMachineExecEnabled(serverId: string, enabled: boolean):
   });
 }
 
+/** Ask a supported, online controlled node to fetch its missing signed worker bundle. */
+export async function installMachineRemoteDesktopWorker(serverId: string): Promise<void> {
+  await apiFetch(`${MACHINE_API_PATH}/${encodeURIComponent(serverId)}/remote-desktop-worker`, {
+    method: 'POST',
+  });
+}
+
 /** Rename a controlled machine's render-only display name. */
 /**
  * Store or clear the node's Windows sign-in secret. Write-only: the value is

@@ -75,6 +75,10 @@ import {
   type RemoteDesktopTerminalReason,
 } from '../../../shared/remote-desktop.js';
 import { isRemoteDesktopFeatureEnabled } from '../../../shared/remote-desktop-feature.js';
+import {
+  REMOTE_DESKTOP_INSTALLABLE_CAPABILITY,
+  REMOTE_DESKTOP_INSTALL_MSG,
+} from '../../../shared/remote-desktop-install.js';
 import { CONTROLLED_NODE_OS_WIN, isControlledNodeOs, type ControlledNodeOs } from '../../../shared/controlled-node-artifacts.js';
 import {
   CONTROLLED_NODE_SAFE_SELF_UPGRADE_CAPABILITY,
@@ -7212,6 +7216,21 @@ export class WsBridge {
     } catch (err) {
       // The frame is never logged: it contains the secret.
       logger.error({ serverId: this.serverId, err }, 'Failed to send CONTROLLED_NODE_AUTO_UNLOCK');
+      return 'send_failed';
+    }
+  }
+
+  /** Request same-version worker repair without queueing or replaying it. */
+  tryInstallControlledNodeRemoteDesktopWorker(expectedGeneration: number): 'sent' | 'offline' | 'generation_changed' | 'send_failed' {
+    if (!this.daemonWs || !this.authenticated || this.daemonWs.readyState !== WebSocket.OPEN) return 'offline';
+    if (this.daemonGeneration !== expectedGeneration) return 'generation_changed';
+    if (this.daemonNodeRole !== NODE_ROLE.CONTROLLED
+      || !this.hasDaemonCapability(REMOTE_DESKTOP_INSTALLABLE_CAPABILITY)) return 'offline';
+    try {
+      this.daemonWs.send(JSON.stringify({ type: REMOTE_DESKTOP_INSTALL_MSG.REQUEST }));
+      return 'sent';
+    } catch (err) {
+      logger.error({ serverId: this.serverId, err }, 'Failed to request remote desktop worker repair');
       return 'send_failed';
     }
   }
