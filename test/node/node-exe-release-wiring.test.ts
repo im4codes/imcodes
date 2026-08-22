@@ -254,6 +254,18 @@ describe('controlled-node executable release wiring', () => {
     expect(entry).toContain('process.stdout.write(`${DAEMON_VERSION}\\n`)');
   });
 
+  it('keeps first-run Windows installation output quiet and user-facing', () => {
+    const entry = readFileSync('src/node/index.ts', 'utf8');
+    const installUi = readFileSync('src/node/windows-install-ui.ts', 'utf8');
+    const buildScript = readFileSync('scripts/build-node-exe.mjs', 'utf8');
+
+    expect(installUi).toContain("'IM.codes 安装中，请稍候...'");
+    expect(entry).toContain('isWindowsInstallerLaunch(process.platform, deps.sourceExecutablePath, deps.stagedExecutablePath)');
+    expect(buildScript).toContain("'process.env.WS_NO_BUFFER_UTIL': JSON.stringify('1')");
+    expect(buildScript).toContain("'process.env.WS_NO_UTF_8_VALIDATE': JSON.stringify('1')");
+    expect(buildScript).not.toContain("execArgv: ['--no-warnings']");
+  });
+
   it('copies the artifacts into the image and configures the serving directory', () => {
     const dockerfile = readFileSync('server/Dockerfile', 'utf8');
 
