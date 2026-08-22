@@ -210,6 +210,26 @@ export const DIRECT_FILE_TRANSFER_LIMITS = {
   OPERATION_LEDGER_CAPACITY: 256,
   MAX_ACTIVE_CHANNELS_PER_LEASE: 4,
   NEGOTIATION_TIMEOUT_MS: 8 * 1000,
+  /**
+   * How long a data channel may take to report `open`.
+   *
+   * This is deliberately NOT `NEGOTIATION_TIMEOUT_MS`. That budget covers a
+   * signalling round trip through the Server, which is fast and bounded by the
+   * websocket. Opening a channel additionally requires ICE connectivity checks
+   * and a DTLS handshake over whichever path wins. On a LAN the host pair is
+   * nominated in tens of milliseconds; a relayed path — TURN, which is what a
+   * phone on a carrier network actually gets — routinely needs several seconds
+   * for the allocation, permission, checks and handshake. Reusing the eight
+   * second signalling budget therefore worked on a LAN and timed out over
+   * relay, which is the same asymmetry `REMOTE_DESKTOP_LIMITS` documents when
+   * it allows 45s for negotiation and 30s for first media.
+   *
+   * A long budget does not delay the HTTP fallback, because the wait also ends
+   * as soon as the peer connection reports `failed`: a path that cannot work
+   * says so in well under a second, and only a path still making progress ever
+   * reaches the tail of this window.
+   */
+  CHANNEL_OPEN_TIMEOUT_MS: 30 * 1000,
   PROBE_NONCE_BYTES: 128,
   PROBE_CANDIDATE_ADDRESS_BYTES: 512,
   PROBE_CANDIDATE_TYPE_BYTES: 64,

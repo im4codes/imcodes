@@ -849,23 +849,44 @@ function makeOperationInit(lease: Lease, active: ActiveAttempt, op: DirectAttemp
   };
 }
 
-function waitForChannelOpen(channel: RTCDataChannel, signal?: AbortSignal): Promise<void> {
+/**
+ * Wait for a data channel to open, on a budget that a relayed path can meet.
+ *
+ * `peer` is watched as well as the channel: ICE reports `failed` as soon as
+ * every candidate pair is exhausted, so a genuinely dead path surfaces at once
+ * instead of holding the caller until the timeout. That is what makes the long
+ * window safe — it is spent only on connections still making progress, and the
+ * HTTP fallback is still reached promptly when direct cannot work at all.
+ */
+function waitForChannelOpen(
+  channel: RTCDataChannel,
+  peer: RTCPeerConnection,
+  signal?: AbortSignal,
+): Promise<void> {
   if (channel.readyState === 'open') return Promise.resolve();
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => finish(directError(DIRECT_FILE_TRANSFER_ERROR.NEGOTIATION_TIMEOUT)), DIRECT_FILE_TRANSFER_LIMITS.NEGOTIATION_TIMEOUT_MS);
+    const timer = setTimeout(() => finish(directError(DIRECT_FILE_TRANSFER_ERROR.NEGOTIATION_TIMEOUT)), DIRECT_FILE_TRANSFER_LIMITS.CHANNEL_OPEN_TIMEOUT_MS);
     const finish = (error?: unknown) => {
       clearTimeout(timer);
       channel.removeEventListener('open', onOpen);
       channel.removeEventListener('close', onClose);
+      peer.removeEventListener('connectionstatechange', onPeerState);
       signal?.removeEventListener('abort', onAbort);
       if (error) reject(error); else resolve();
     };
     const onOpen = () => finish();
     const onClose = () => finish(directError(DIRECT_FILE_TRANSFER_ERROR.CHANNEL_CLOSED));
     const onAbort = () => finish(directError(DIRECT_FILE_TRANSFER_ERROR.CANCELED, false));
+    const onPeerState = () => {
+      if (peer.connectionState === 'failed' || peer.connectionState === 'closed') {
+        finish(directError(DIRECT_FILE_TRANSFER_ERROR.CONNECTION_FAILED));
+      }
+    };
     channel.addEventListener('open', onOpen, { once: true });
     channel.addEventListener('close', onClose, { once: true });
+    peer.addEventListener('connectionstatechange', onPeerState);
     signal?.addEventListener('abort', onAbort, { once: true });
+    onPeerState();
   });
 }
 
@@ -994,7 +1015,7 @@ async function runAttempt(lease: Lease, op: DirectAttempt, attempt: number): Pro
     const channel = peer.createDataChannel(parsed.value.channelLabel, { ordered: true });
     channel.binaryType = 'arraybuffer';
     active.channel = channel;
-    await waitForChannelOpen(channel, op.signal);
+    await waitForChannelOpen(channel, peer, op.signal);
 
     const result = await new Promise<OperationSuccess>((resolve, reject) => {
       let timer: ReturnType<typeof setTimeout> | null = null;
@@ -1488,7 +1509,7 @@ export async function probeDirectConnectivity(
       daemonCandidateTypes: [],
     });
     const channel = peer.createDataChannel(`${DIRECT_FILE_TRANSFER_HEALTH_CHANNEL_PREFIX}${crypto.randomUUID()}`, { ordered: true });
-    await waitForChannelOpen(channel);
+    await waitForChannelOpen(channel, peer);
     const nonce = crypto.randomUUID();
     const started = performance.now();
     const result = await new Promise<DirectConnectivityProbeResult>((resolve, reject) => {

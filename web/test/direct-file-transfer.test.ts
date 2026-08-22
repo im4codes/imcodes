@@ -53,6 +53,8 @@ class FakePeerConnection extends EventTarget {
   static onDataChannel: ((channel: FakeDataChannel, value: unknown) => void) | null = null;
   static selectedCandidateType = 'host';
   static keepConnectingAfterAnswer = false;
+  /** How long a newly created data channel takes to report `open`. */
+  static channelOpenDelayMs = 0;
   remoteDescription: RTCSessionDescription | null = null;
   connectionState: RTCPeerConnectionState = 'new';
   channels: FakeDataChannel[] = [];
@@ -67,7 +69,13 @@ class FakePeerConnection extends EventTarget {
     const channel = new FakeDataChannel(label);
     this.channels.push(channel);
     channel.onSend = (value) => FakePeerConnection.onDataChannel?.(channel, value);
-    queueMicrotask(() => channel.open());
+    // A LAN channel opens as good as immediately; a relayed one has to finish
+    // ICE checks and a DTLS handshake first, which is what the delay models.
+    if (FakePeerConnection.channelOpenDelayMs > 0) {
+      setTimeout(() => channel.open(), FakePeerConnection.channelOpenDelayMs);
+    } else {
+      queueMicrotask(() => channel.open());
+    }
     return channel as unknown as RTCDataChannel;
   }
 
@@ -383,6 +391,7 @@ describe('direct file transfer v2 browser broker', () => {
     FakePeerConnection.instances = [];
     FakePeerConnection.selectedCandidateType = 'host';
     FakePeerConnection.keepConnectingAfterAnswer = false;
+    FakePeerConnection.channelOpenDelayMs = 0;
     vi.stubGlobal('RTCPeerConnection', FakePeerConnection);
     apiMocks.uploadFile.mockResolvedValue({
       ok: true,
@@ -479,6 +488,96 @@ describe('direct file transfer v2 browser broker', () => {
       expect(message).not.toHaveProperty('sessionName');
     }
     release?.();
+  });
+
+  it('opens a relayed data channel that needs longer than the signalling budget', async () => {
+    // A phone on a carrier network reaches the daemon through TURN. The
+    // allocation, permission, connectivity checks and DTLS handshake routinely
+    // outlast the eight seconds a signalling round trip needs, and reusing that
+    // budget here is what made every relayed transfer time out while the same
+    // build worked on a LAN.
+    const { uploadFileDirect } = await import('../src/direct-file-transfer.js');
+    FakePeerConnection.channelOpenDelayMs = 12_000;
+    expect(FakePeerConnection.channelOpenDelayMs)
+      .toBeGreaterThan(DIRECT_FILE_TRANSFER_LIMITS.NEGOTIATION_TIMEOUT_MS);
+    expect(FakePeerConnection.channelOpenDelayMs)
+      .toBeLessThan(DIRECT_FILE_TRANSFER_LIMITS.CHANNEL_OPEN_TIMEOUT_MS);
+
+    vi.useFakeTimers();
+    try {
+      const { ws } = createWs(directCapabilities);
+      const bytes = new TextEncoder().encode('relayed');
+      const file = {
+        name: 'relayed.txt',
+        type: 'text/plain',
+        size: bytes.byteLength,
+        slice: (start: number, end: number) => ({ arrayBuffer: async () => bytes.slice(start, end).buffer }),
+      } as unknown as File;
+
+      const upload = uploadFileDirect(ws, file, id(), undefined, undefined, undefined, undefined, 'server-1');
+      const settled = vi.fn();
+      void upload.then(() => settled('resolved'), () => settled('rejected'));
+
+      await vi.advanceTimersByTimeAsync(DIRECT_FILE_TRANSFER_LIMITS.NEGOTIATION_TIMEOUT_MS + 500);
+      expect(settled).not.toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(FakePeerConnection.channelOpenDelayMs);
+      await expect(upload).resolves.toBeDefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('abandons a data channel as soon as the peer reports failed, without spending the open budget', async () => {
+    // The long open budget is only affordable because a path that cannot work
+    // says so immediately. If this wait ignored the peer state it would hold
+    // every doomed transfer for the full window before a retry or HTTP was
+    // allowed, which is why the assertion is about how soon the next attempt
+    // begins rather than about the upload's eventual outcome.
+    const { uploadFileDirect } = await import('../src/direct-file-transfer.js');
+    FakePeerConnection.channelOpenDelayMs = 10 * DIRECT_FILE_TRANSFER_LIMITS.CHANNEL_OPEN_TIMEOUT_MS;
+
+    vi.useFakeTimers();
+    try {
+      const { ws } = createWs(directCapabilities);
+      const bytes = new TextEncoder().encode('doomed');
+      const file = {
+        name: 'doomed.txt',
+        type: 'text/plain',
+        size: bytes.byteLength,
+        slice: (start: number, end: number) => ({ arrayBuffer: async () => bytes.slice(start, end).buffer }),
+      } as unknown as File;
+
+      const upload = uploadFileDirect(ws, file, id(), undefined, undefined, undefined, undefined, 'server-1');
+      // Nothing here awaits the upload itself: with every channel held shut it
+      // only settles after the whole retry budget, which is not what is
+      // under test. Swallow it so the rejection is not unhandled.
+      upload.catch(() => undefined);
+
+      // vi.waitFor cannot be used here: it polls on real time while the clock
+      // driving this flow is fake, so it would starve rather than wait.
+      for (let tick = 0; tick < 200; tick++) {
+        if ((FakePeerConnection.instances.at(-1)?.channels.length ?? 0) > 1) break;
+        await vi.advanceTimersByTimeAsync(10);
+      }
+      const peer = FakePeerConnection.instances.at(-1)!;
+      expect(peer.channels.length).toBeGreaterThan(1);
+      const channelsBefore = FakePeerConnection.instances
+        .reduce((total, instance) => total + instance.channels.length, 0);
+
+      peer.connectionState = 'failed';
+      peer.dispatchEvent(new Event('connectionstatechange'));
+
+      // Well inside the open budget the attempt must already have been given
+      // up and the next one begun — a retry reuses the peer with an ICE
+      // restart, so the observable is a freshly allocated channel.
+      await vi.advanceTimersByTimeAsync(DIRECT_FILE_TRANSFER_LIMITS.NEGOTIATION_TIMEOUT_MS);
+      const channelsAfter = FakePeerConnection.instances
+        .reduce((total, instance) => total + instance.channels.length, 0);
+      expect(channelsAfter).toBeGreaterThan(channelsBefore);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('reuses one lease peer for an upload followed by a preview download', async () => {
