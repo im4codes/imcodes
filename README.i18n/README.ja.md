@@ -2,7 +2,7 @@
 
 [English](../README.md) | [简体中文](README.zh-CN.md) | [繁體中文](README.zh-TW.md) | [Español](README.es.md) | [Русский](README.ru.md) | [日本語](README.ja.md) | [한국어](README.ko.md)
 
-**エージェントのための IM。AI による複数 PC 制御、リモートデスクトップ、共有メモリ、OpenSpec Auto Deliver、管理対象 MCP ツール、監督付き実行、クロスモデル監査。**
+**エージェントのための IM。AI リモートデスクトップ、共有メモリ、OpenSpec Auto Deliver、管理対象 MCP ツール、監督付き実行、クロスモデル監査。**
 
 <!-- TODO(native-review): JA hero couplet — 默认「天下」(可换「乾坤」);「三人の孔明」措辞待母语者确认 -->
 > 三人寄れば文殊の知恵。<br>
@@ -17,7 +17,7 @@ IM.codes は AI agent を coding session だけでなく、実際に作業する
 
 複数のエージェントが CLI と SDK の両方で接続できます。
 
-## 制御対象ノード：AI で複数の PC を操作
+## 制御対象ノード：AI リモートデスクトップ
 
 各マシンを完全な IM.codes source server にせず、対応コンピューターを AI が操作できる制御対象ノードとして登録できます。
 

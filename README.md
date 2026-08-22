@@ -2,7 +2,7 @@
 
 [English](README.md) | [简体中文](README.i18n/README.zh-CN.md) | [繁體中文](README.i18n/README.zh-TW.md) | [Español](README.i18n/README.es.md) | [Русский](README.i18n/README.ru.md) | [日本語](README.i18n/README.ja.md) | [한국어](README.i18n/README.ko.md)
 
-**The IM for agents. AI fleet control, remote desktop, shared memory, OpenSpec Auto Deliver, managed MCP tools, supervised execution, and cross-agent audit across AI providers.**
+**The IM for agents. AI remote desktop, shared memory, OpenSpec Auto Deliver, managed MCP tools, supervised execution, and cross-agent audit across AI providers.**
 
 > Two heads are better than one.<br>
 > But minds in concert don't answer fate, they author it.<br>
@@ -14,7 +14,7 @@ Alongside machine control, IM.codes gives coding agents one shared memory layer 
 
 > **Disclaimer:** This is an actively developed personal open-source project. There are no warranties, no SLA, and no guarantees of stability, security, or backward compatibility. Use at your own risk.
 
-## Controlled Nodes: AI Fleet Control
+## Controlled Nodes: AI Remote Desktop
 
 Turn supported computers into AI-operated nodes without making each machine a full IM.codes source server.
 

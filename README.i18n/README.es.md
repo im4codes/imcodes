@@ -3,7 +3,7 @@
 [English](../README.md) | [简体中文](README.zh-CN.md) | [繁體中文](README.zh-TW.md) | [Español](README.es.md) | [Русский](README.ru.md) | [日本語](README.ja.md) | [한국어](README.ko.md)
 
 
-**El IM para agentes. Control de flotas por IA, escritorio remoto, memoria compartida, OpenSpec Auto Deliver, herramientas MCP gestionadas, ejecución supervisada y auditoría cruzada.**
+**El IM para agentes. Escritorio remoto con IA, memoria compartida, OpenSpec Auto Deliver, herramientas MCP gestionadas, ejecución supervisada y auditoría cruzada.**
 
 > Two heads are better than one.<br>
 > But minds in concert don't answer fate, they author it.<br>
@@ -17,7 +17,7 @@ Además del control de máquinas, IM.codes ofrece a los coding agents una memori
 
 Varios agentes admiten dos modos de integración: CLI y SDK.
 
-## Nodos controlados: flota operada por IA
+## Nodos controlados: escritorio remoto con IA
 
 Convierte ordenadores compatibles en nodos operados por IA sin configurar cada máquina como un source server completo de IM.codes.
 

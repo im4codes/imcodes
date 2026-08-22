@@ -3,7 +3,7 @@
 [English](../README.md) | [简体中文](README.zh-CN.md) | [繁體中文](README.zh-TW.md) | [Español](README.es.md) | [Русский](README.ru.md) | [日本語](README.ja.md) | [한국어](README.ko.md)
 
 
-**给 AI agent 的 IM。AI 群控、远程桌面、共享记忆、OpenSpec 自动交付、托管 MCP 工具、受监督执行，以及跨模型审计。**
+**给 AI agent 的 IM。AI 远程桌面、共享记忆、OpenSpec 自动交付、托管 MCP 工具、受监督执行，以及跨模型审计。**
 
 > 三个臭皮匠，顶个诸葛亮。<br>
 > 三个诸葛亮，谈笑定阴阳。<br>
@@ -17,7 +17,7 @@ IM.codes 不只连接 AI agent 的 coding session，也把 agent 连接到真正
 
 支持多个 agent 通过 CLI 和 SDK 两种方式接入。
 
-## AI 群控与被控节点
+## 被控节点：AI 远程桌面
 
 无需把每台电脑都配置成完整的 IM.codes source server，就能把支持的机器接入为 AI 可操作的被控节点。
 

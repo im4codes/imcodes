@@ -2,7 +2,7 @@
 
 [English](../README.md) | [简体中文](README.zh-CN.md) | [繁體中文](README.zh-TW.md) | [Español](README.es.md) | [Русский](README.ru.md) | [日本語](README.ja.md) | [한국어](README.ko.md)
 
-**에이전트를 위한 IM. AI 다중 PC 제어, 원격 데스크톱, 공유 메모리, OpenSpec Auto Deliver, 관리형 MCP 도구, 감독 실행, 교차 모델 감사.**
+**에이전트를 위한 IM. AI 원격 데스크톱, 공유 메모리, OpenSpec Auto Deliver, 관리형 MCP 도구, 감독 실행, 교차 모델 감사.**
 
 <!-- TODO(native-review): KO hero couplet — 第一句「백지장도 맞들면 낫다」承接弱,待母语者重写;默认「천하」 -->
 > 백지장도 맞들면 낫다.<br>
@@ -17,7 +17,7 @@ IM.codes는 AI agent를 coding session뿐 아니라 실제 작업이 수행되�
 
 여러 에이전트가 CLI와 SDK 두 방식 모두로 연결될 수 있습니다.
 
-## 제어 노드: AI로 여러 컴퓨터 제어
+## 제어 노드: AI 원격 데스크톱
 
 각 머신을 완전한 IM.codes source server로 만들지 않고 지원되는 컴퓨터를 AI가 조작할 수 있는 제어 노드로 등록합니다.
 
