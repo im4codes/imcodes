@@ -17,6 +17,7 @@ import { MACHINE_LIST_MAX_ITEMS, NODE_ROLE } from '../../shared/remote-exec.js';
 import { MACHINE_REASONS } from '../../shared/machine-reference.js';
 import { REMOTE_DESKTOP_CAPABILITY } from '../../shared/remote-desktop.js';
 import { CONTROLLED_NODE_AUTO_UNLOCK_ERROR } from '../../shared/controlled-node-auto-unlock.js';
+import { REMOTE_DESKTOP_INSTALLABLE_CAPABILITY } from '../../shared/remote-desktop-install.js';
 import { signJwt } from '../src/security/crypto.js';
 
 let db: Database;
@@ -248,6 +249,78 @@ describe('auto unlock capability gate', () => {
       'SELECT auto_unlock_configured FROM servers WHERE id = $1',
       [controlledId],
     )).toEqual({ auto_unlock_configured: false });
+  });
+});
+
+describe('remote desktop worker quick install', () => {
+  it('dispatches only for an owned, fresh Windows node that advertised repair support', async () => {
+    const originalAppVersion = process.env.APP_VERSION;
+    process.env.APP_VERSION = '2026.8.4000-dev.1';
+    const app = buildApp();
+    const userId = `u_${hex(4)}`;
+    const otherUserId = `u_${hex(4)}`;
+    await createUser(db, userId);
+    await createUser(db, otherUserId);
+    const owner = await fullCredential(userId);
+    const other = await fullCredential(otherUserId);
+    const controlledId = `ctl_${hex(8)}`;
+    await db.execute(
+      `INSERT INTO servers
+         (id, user_id, name, token_hash, status, last_heartbeat_at, created_at,
+          node_role, exec_enabled, ref_name, display_name, os, daemon_version, controlled_capabilities)
+       VALUES ($1,$2,'controlled',$3,'online',$4,$4,$5,true,'win-ref','Win box','win','2026.8.4000-dev.1',$6)`,
+      [controlledId, userId, sha256(hex(16)), Date.now(), NODE_ROLE.CONTROLLED,
+        JSON.stringify([REMOTE_DESKTOP_INSTALLABLE_CAPABILITY])],
+    );
+    const bridge = WsBridge.get(controlledId);
+    const install = vi.spyOn(bridge, 'tryInstallControlledNodeRemoteDesktopWorker')
+      .mockReturnValue('sent');
+    try {
+      const headers = {
+        'X-Server-Id': owner.serverId,
+        authorization: `Bearer ${owner.token}`,
+      };
+      const response = await app.request(`/api/machines/${controlledId}/remote-desktop-worker`, {
+        method: 'POST', headers,
+      });
+      expect(response.status).toBe(202);
+      expect(await response.json()).toEqual({ ok: true });
+      expect(install).toHaveBeenCalledWith(bridge.daemonConnectionGeneration());
+
+      const denied = await app.request(`/api/machines/${controlledId}/remote-desktop-worker`, {
+        method: 'POST',
+        headers: {
+          'X-Server-Id': other.serverId,
+          authorization: `Bearer ${other.token}`,
+        },
+      });
+      expect(denied.status).toBe(404);
+
+      await db.execute(
+        'UPDATE servers SET controlled_capabilities = $2 WHERE id = $1',
+        [controlledId, JSON.stringify([])],
+      );
+      const unsupported = await app.request(`/api/machines/${controlledId}/remote-desktop-worker`, {
+        method: 'POST', headers,
+      });
+      expect(unsupported.status).toBe(409);
+      expect(install).toHaveBeenCalledTimes(1);
+
+      await db.execute(
+        'UPDATE servers SET controlled_capabilities = $2, daemon_version = $3 WHERE id = $1',
+        [controlledId, JSON.stringify([REMOTE_DESKTOP_INSTALLABLE_CAPABILITY]), '2026.8.3999-dev.1'],
+      );
+      const updating = await app.request(`/api/machines/${controlledId}/remote-desktop-worker`, {
+        method: 'POST', headers,
+      });
+      expect(updating.status).toBe(409);
+      expect(await updating.json()).toEqual({ error: 'node_update_pending' });
+      expect(install).toHaveBeenCalledTimes(1);
+    } finally {
+      install.mockRestore();
+      if (originalAppVersion === undefined) delete process.env.APP_VERSION;
+      else process.env.APP_VERSION = originalAppVersion;
+    }
   });
 });
 

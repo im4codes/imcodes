@@ -31,6 +31,11 @@ import {
 } from '../../shared/remote-desktop.js';
 import { CONTROLLED_NODE_SAFE_SELF_UPGRADE_CAPABILITY } from '../../shared/controlled-node-service.js';
 import { CONTROLLED_NODE_AUTO_UNLOCK_CAPABILITY } from '../../shared/controlled-node-auto-unlock.js';
+import {
+  REMOTE_DESKTOP_INSTALLABLE_CAPABILITY,
+  REMOTE_DESKTOP_INSTALL_MSG,
+} from '../../shared/remote-desktop-install.js';
+import { DAEMON_VERSION } from '../../src/util/version.js';
 
 const { receiveMachineDirectUploadMock, sendMachineDirectFetchMock } = vi.hoisted(() => ({
   receiveMachineDirectUploadMock: vi.fn(),
@@ -85,6 +90,7 @@ describe('controlled node enrollment and runtime', () => {
     }, () => socket, { onAuthenticated, onHeartbeatAck, cleanupLegacyUpgradeRescue });
     runtime.start();
     socket.open();
+
     const authFrame = JSON.parse(socket.sent[0]!);
     expect(authFrame).toMatchObject({ type: 'auth', serverId: 'controlled-1' });
     expect(authFrame.nodeRole).toBeUndefined();
@@ -174,6 +180,147 @@ describe('controlled node enrollment and runtime', () => {
     expect(remoteDesktopWorker.close).toHaveBeenCalled();
   });
 
+  it('self-repairs a missing Windows worker even when the main version already matches', async () => {
+    const socket = new MockSocket();
+    let now = 10_000;
+    const repairMissingRemoteDesktopWorker = vi.fn(async () => ({
+      ok: true as const,
+      targetVersion: 'current',
+      artifactSha256: 'a'.repeat(64),
+    }));
+    const remoteDesktopWorker = {
+      available: vi.fn(() => false),
+      handle: vi.fn(async () => false),
+      applyAutoUnlockSecret: vi.fn(async () => false),
+      autoUnlockConfigured: vi.fn(async () => false),
+      close: vi.fn(),
+    };
+    const runtime = createControlledNodeRuntime({
+      serverUrl: 'https://im.example',
+      serverId: 'controlled-1',
+      token: 'secret',
+      nodeRole: NODE_ROLE.CONTROLLED,
+    }, () => socket, {
+      platform: 'win32',
+      arch: 'x64',
+      remoteDesktopWorker,
+      repairMissingRemoteDesktopWorker,
+      now: () => now,
+    });
+    runtime.start();
+    socket.open();
+
+    expect((JSON.parse(socket.sent[0]!).capabilities as string[])).toContain(
+      REMOTE_DESKTOP_INSTALLABLE_CAPABILITY,
+    );
+
+    expect(repairMissingRemoteDesktopWorker).not.toHaveBeenCalled();
+    socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
+    await Promise.resolve();
+    expect(repairMissingRemoteDesktopWorker).not.toHaveBeenCalled();
+    now += 10_000;
+    socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
+    await vi.waitFor(() => expect(repairMissingRemoteDesktopWorker).toHaveBeenCalledOnce());
+    expect(repairMissingRemoteDesktopWorker).toHaveBeenCalledWith(DAEMON_VERSION);
+    expect(socket.sent.map((raw) => JSON.parse(raw))).toContainEqual({
+      type: DAEMON_MSG.UPGRADING,
+      targetVersion: DAEMON_VERSION,
+      artifactSha256: 'a'.repeat(64),
+    });
+
+    socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
+    await Promise.resolve();
+    expect(repairMissingRemoteDesktopWorker).toHaveBeenCalledOnce();
+    runtime.stop();
+  });
+
+  it('backs off a failed missing-worker repair and retries on a later authenticated heartbeat', async () => {
+    const socket = new MockSocket();
+    let now = 10_000;
+    const repairMissingRemoteDesktopWorker = vi.fn()
+      .mockRejectedValueOnce(new Error('artifact temporarily unavailable'))
+      .mockResolvedValueOnce({ ok: true, targetVersion: 'current', artifactSha256: 'b'.repeat(64) });
+    const remoteDesktopWorker = {
+      available: vi.fn(() => false),
+      handle: vi.fn(async () => false),
+      applyAutoUnlockSecret: vi.fn(async () => false),
+      autoUnlockConfigured: vi.fn(async () => false),
+      close: vi.fn(),
+    };
+    const runtime = createControlledNodeRuntime({
+      serverUrl: 'https://im.example',
+      serverId: 'controlled-1',
+      token: 'secret',
+      nodeRole: NODE_ROLE.CONTROLLED,
+    }, () => socket, {
+      platform: 'win32',
+      arch: 'x64',
+      now: () => now,
+      remoteDesktopWorker,
+      repairMissingRemoteDesktopWorker,
+    });
+    runtime.start();
+    socket.open();
+
+    socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
+    now += 10_000;
+    socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
+    await vi.waitFor(() => expect(repairMissingRemoteDesktopWorker).toHaveBeenCalledOnce());
+    socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
+    await Promise.resolve();
+    expect(repairMissingRemoteDesktopWorker).toHaveBeenCalledOnce();
+
+    now += 5 * 60_000;
+    socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
+    await vi.waitFor(() => expect(repairMissingRemoteDesktopWorker).toHaveBeenCalledTimes(2));
+    runtime.stop();
+  });
+
+  it('lets an exact quick-install request bypass repair backoff without widening the command', async () => {
+    const socket = new MockSocket();
+    let rejectFirst!: (error: Error) => void;
+    const repairMissingRemoteDesktopWorker = vi.fn()
+      .mockImplementationOnce(() => new Promise((_, reject) => { rejectFirst = reject; }))
+      .mockResolvedValueOnce({ ok: true, targetVersion: DAEMON_VERSION });
+    const remoteDesktopWorker = {
+      available: vi.fn(() => false),
+      handle: vi.fn(async () => false),
+      applyAutoUnlockSecret: vi.fn(async () => false),
+      autoUnlockConfigured: vi.fn(async () => false),
+      close: vi.fn(),
+    };
+    const runtime = createControlledNodeRuntime({
+      serverUrl: 'https://im.example',
+      serverId: 'controlled-1',
+      token: 'secret',
+      nodeRole: NODE_ROLE.CONTROLLED,
+    }, () => socket, {
+      platform: 'win32',
+      arch: 'x64',
+      remoteDesktopWorker,
+      repairMissingRemoteDesktopWorker,
+      now: () => 10_000,
+    });
+    runtime.start();
+    socket.open();
+    socket.emit('message', JSON.stringify({ type: REMOTE_DESKTOP_INSTALL_MSG.REQUEST }));
+    await vi.waitFor(() => expect(repairMissingRemoteDesktopWorker).toHaveBeenCalledOnce());
+    rejectFirst(new Error('temporary'));
+    await Promise.resolve();
+
+    socket.emit('message', JSON.stringify({
+      type: REMOTE_DESKTOP_INSTALL_MSG.REQUEST,
+      targetVersion: 'attacker-controlled',
+    }));
+    await Promise.resolve();
+    expect(repairMissingRemoteDesktopWorker).toHaveBeenCalledOnce();
+
+    socket.emit('message', JSON.stringify({ type: REMOTE_DESKTOP_INSTALL_MSG.REQUEST }));
+    await vi.waitFor(() => expect(repairMissingRemoteDesktopWorker).toHaveBeenCalledTimes(2));
+    expect(repairMissingRemoteDesktopWorker).toHaveBeenLastCalledWith(DAEMON_VERSION);
+    runtime.stop();
+  });
+
   it('keeps heartbeat, exec, and file transfer available when the remote-desktop kill switch is off', async () => {
     process.env.IMCODES_REMOTE_DESKTOP_ENABLED = '0';
     const dir = await mkdtemp(join(tmpdir(), 'imcodes-node-rd-disabled-'));
@@ -181,8 +328,9 @@ describe('controlled node enrollment and runtime', () => {
     const filePath = join(dir, 'still-available.txt');
     await writeFile(filePath, 'available');
     const socket = new MockSocket();
+    const repairMissingRemoteDesktopWorker = vi.fn(async () => ({ ok: true as const }));
     const remoteDesktopWorker = {
-      available: vi.fn(() => true),
+      available: vi.fn(() => false),
       handle: vi.fn(async () => true),
       close: vi.fn(),
     };
@@ -191,18 +339,27 @@ describe('controlled node enrollment and runtime', () => {
       serverId: 'controlled-1',
       token: 'secret',
       nodeRole: NODE_ROLE.CONTROLLED,
-    }, () => socket, { remoteDesktopWorker });
+    }, () => socket, {
+      platform: 'win32',
+      arch: 'x64',
+      remoteDesktopWorker,
+      repairMissingRemoteDesktopWorker,
+    });
     runtime.start();
     socket.open();
     const authFrame = JSON.parse(socket.sent[0]!);
     expect(authFrame.capabilities).not.toContain(REMOTE_DESKTOP_CAPABILITY);
     expect(authFrame.capabilities).not.toContain(CONTROLLED_NODE_AUTO_UNLOCK_CAPABILITY);
+    expect(authFrame.capabilities).not.toContain(REMOTE_DESKTOP_INSTALLABLE_CAPABILITY);
     expect(authFrame.capabilities).toEqual(expect.arrayContaining([
       FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY,
       FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY,
       FILE_TRANSFER_PATH_HANDLE_CAPABILITY,
     ]));
     expect(JSON.parse(socket.sent[1]!)).toMatchObject({ type: 'heartbeat' });
+    socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
+    await Promise.resolve();
+    expect(repairMissingRemoteDesktopWorker).not.toHaveBeenCalled();
 
     const prepare = {
       type: REMOTE_DESKTOP_MSG.PREPARE,

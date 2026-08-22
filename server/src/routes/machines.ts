@@ -24,7 +24,10 @@ import {
   isImcodesVersionOutdated,
   parseImcodesVersion,
 } from '../../../shared/imcodes-version.js';
-import { REMOTE_DESKTOP_TERMINAL_REASON } from '../../../shared/remote-desktop.js';
+import {
+  REMOTE_DESKTOP_CAPABILITY,
+  REMOTE_DESKTOP_TERMINAL_REASON,
+} from '../../../shared/remote-desktop.js';
 import { randomUUID } from 'node:crypto';
 import { DAEMON_COMMAND_TYPES } from '../../../shared/daemon-command-types.js';
 import {
@@ -37,6 +40,7 @@ import {
   cancelPendingAutoUnlock,
   registerPendingAutoUnlock,
 } from '../ws/auto-unlock-registry.js';
+import { REMOTE_DESKTOP_INSTALLABLE_CAPABILITY } from '../../../shared/remote-desktop-install.js';
 
 /** A node only has to reach its own disk, so this stays short. */
 const AUTO_UNLOCK_TIMEOUT_MS = 15_000;
@@ -316,4 +320,53 @@ machinesRoutes.post('/:serverId/auto-unlock', requireAuth(), async (c) => {
     return c.json({ error: result.error ?? 'store_failed', configured: result.configured }, 502);
   }
   return c.json({ ok: true, autoUnlockConfigured: result.configured });
+});
+
+// POST /api/machines/:serverId/remote-desktop-worker — owner-only quick repair.
+machinesRoutes.post('/:serverId/remote-desktop-worker', requireAuth(), async (c) => {
+  const userId = c.get('userId' as never) as string;
+  const serverId = c.req.param('serverId');
+  if (!serverId) return c.json({ error: 'invalid_body' }, 400);
+  const owned = await c.env.DB.queryOne<{
+    id: string;
+    os: string | null;
+    status: string | null;
+    last_heartbeat_at: number | null;
+    daemon_version: string | null;
+    controlled_capabilities: unknown;
+  }>(
+    `SELECT id, os, status, last_heartbeat_at, daemon_version, controlled_capabilities FROM servers
+      WHERE id = $1 AND user_id = $2 AND node_role = $3 AND revoked_at IS NULL`,
+    [serverId, userId, NODE_ROLE.CONTROLLED],
+  );
+  if (!owned) return c.json({ error: 'not_found' }, 404);
+  const capabilities = validateControlledNodeCapabilities(owned.controlled_capabilities);
+  if (canonicalMachineOs(owned.os) !== 'win'
+    || !capabilities.ok
+    || !capabilities.value.includes(REMOTE_DESKTOP_INSTALLABLE_CAPABILITY)
+    || capabilities.value.includes(REMOTE_DESKTOP_CAPABILITY)) {
+    return c.json({ error: 'remote_desktop_worker_not_installable' }, 409);
+  }
+  if (isImcodesVersionOutdated(owned.daemon_version, process.env.APP_VERSION)) {
+    return c.json({ error: 'node_update_pending' }, 409);
+  }
+  const now = Date.now();
+  if (owned.status !== 'online'
+    || typeof owned.last_heartbeat_at !== 'number'
+    || now - owned.last_heartbeat_at >= MACHINE_PRESENCE_STALENESS_MS) {
+    return c.json({ error: 'node_offline' }, 503);
+  }
+  const bridge = WsBridge.get(serverId);
+  const generation = bridge.daemonConnectionGeneration();
+  if (bridge.tryInstallControlledNodeRemoteDesktopWorker(generation) !== 'sent') {
+    return c.json({ error: 'node_offline' }, 503);
+  }
+  const ip = (c.get('clientIp' as never) as string) ?? 'unknown';
+  logAudit({
+    userId,
+    action: 'machine.remote_desktop_worker_install',
+    ip,
+    details: { serverId },
+  }, c.env.DB).catch(() => {});
+  return c.json({ ok: true }, 202);
 });

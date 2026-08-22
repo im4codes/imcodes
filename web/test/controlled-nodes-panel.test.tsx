@@ -9,6 +9,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { ControlledNodeAvailability, MachineListItem } from '../src/api/machines.js';
 import { REMOTE_DESKTOP_CAPABILITY } from '@shared/remote-desktop.js';
 import { CONTROLLED_NODE_AUTO_UNLOCK_CAPABILITY } from '@shared/controlled-node-auto-unlock.js';
+import { REMOTE_DESKTOP_INSTALLABLE_CAPABILITY } from '@shared/remote-desktop-install.js';
 
 const translate = (key: string, options?: Record<string, string>) =>
   key === 'controlled_nodes.artifact_meta' && options?.detail ? options.detail : key;
@@ -31,6 +32,7 @@ vi.mock('../src/hooks/useMachines.js', () => ({
 const setMachineExecEnabled = vi.fn(async () => {});
 const revokeMachine = vi.fn(async () => {});
 const renameMachine = vi.fn(async () => {});
+const installMachineRemoteDesktopWorker = vi.fn(async () => {});
 const listAvailableExecutables = vi.fn(async (): Promise<ControlledNodeAvailability> => ({
   available: ['win', 'mac', 'linux'],
   artifacts: [
@@ -46,6 +48,7 @@ vi.mock('../src/api/machines.js', async (importOriginal) => {
     setMachineExecEnabled: (...a: unknown[]) => setMachineExecEnabled(...a),
     revokeMachine: (...a: unknown[]) => revokeMachine(...a),
     renameMachine: (...a: unknown[]) => renameMachine(...a),
+    installMachineRemoteDesktopWorker: (...a: unknown[]) => installMachineRemoteDesktopWorker(...a),
     listAvailableExecutables: () => listAvailableExecutables(),
   };
 });
@@ -452,6 +455,49 @@ describe('ControlledNodesPanel (12.3)', () => {
     expect(buttons).toHaveLength(2);
     expect(buttons[0]?.closest('li')?.textContent).toContain('Owner Ready');
     expect(buttons[1]?.closest('li')?.textContent).toContain('Participant Ready');
+  });
+
+  it('offers quick worker installation only for an online supported Owner node', async () => {
+    machines = [
+      machine({ serverId: 'missing', displayName: 'Missing Worker', os: 'win', accessRole: 'owner', online: true, capabilities: [REMOTE_DESKTOP_INSTALLABLE_CAPABILITY] }),
+      machine({ serverId: 'viewer', displayName: 'Shared Viewer', os: 'win', accessRole: 'viewer', online: true, capabilities: [REMOTE_DESKTOP_INSTALLABLE_CAPABILITY] }),
+      machine({ serverId: 'offline', displayName: 'Offline Win', os: 'win', accessRole: 'owner', online: false, capabilities: [REMOTE_DESKTOP_INSTALLABLE_CAPABILITY] }),
+      machine({ serverId: 'linux', displayName: 'Linux', os: 'linux', accessRole: 'owner', online: true, capabilities: [REMOTE_DESKTOP_INSTALLABLE_CAPABILITY] }),
+      machine({ serverId: 'already-ready', displayName: 'Already Ready', os: 'win', accessRole: 'owner', online: true, capabilities: [REMOTE_DESKTOP_INSTALLABLE_CAPABILITY, REMOTE_DESKTOP_CAPABILITY] }),
+      machine({ serverId: 'updating', displayName: 'Updating', os: 'win', accessRole: 'owner', online: true, updateAvailable: true, capabilities: [REMOTE_DESKTOP_INSTALLABLE_CAPABILITY] }),
+    ];
+    const { container } = render(<ControlledNodesPanel />);
+    const button = await waitFor(() => {
+      const candidate = container.querySelector('.controlled-nodes-install-worker');
+      if (!(candidate instanceof HTMLButtonElement)) throw new Error('install button not found');
+      return candidate;
+    });
+
+    expect(container.querySelectorAll('.controlled-nodes-install-worker')).toHaveLength(1);
+    expect(button.closest('li')?.textContent).toContain('Missing Worker');
+    expect(button.textContent).toBe('remote_desktop.install_worker');
+    fireEvent.click(button);
+    await waitFor(() => expect(installMachineRemoteDesktopWorker).toHaveBeenCalledWith('missing'));
+    expect(refetch).toHaveBeenCalled();
+  });
+
+  it('keeps the quick-install action visible after a bounded install failure', async () => {
+    installMachineRemoteDesktopWorker.mockRejectedValueOnce(new Error('unavailable'));
+    machines = [machine({
+      serverId: 'repair-failed',
+      displayName: 'Repair Me',
+      os: 'win',
+      accessRole: 'owner',
+      online: true,
+      capabilities: [REMOTE_DESKTOP_INSTALLABLE_CAPABILITY],
+    })];
+    const { container } = render(<ControlledNodesPanel />);
+    const button = await waitFor(() => container.querySelector('.controlled-nodes-install-worker') as HTMLButtonElement);
+    fireEvent.click(button);
+
+    await waitFor(() => expect(container.textContent).toContain('remote_desktop.install_failed'));
+    expect(container.querySelector('.controlled-nodes-install-worker')).not.toBeNull();
+    expect((container.querySelector('.controlled-nodes-install-worker') as HTMLButtonElement).disabled).toBe(false);
   });
 
   it('opens the Remote Desktop panel from the machine action', async () => {

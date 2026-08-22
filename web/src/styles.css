@@ -8637,7 +8637,8 @@ button.quick-agent-delegation-preset.active {
 }
 
 .remote-desktop-files button,
-.controlled-nodes-remote-desktop {
+.controlled-nodes-remote-desktop,
+.controlled-nodes-install-worker {
   min-height: 34px;
   padding: 6px 12px;
   color: #cfeaff;
@@ -9537,6 +9538,18 @@ button.quick-agent-delegation-preset.active {
   background: #69d1ff;
   border-color: #a3e5ff;
   font-weight: 700;
+}
+
+.controlled-nodes-install-worker {
+  color: #ffe7b0;
+  background: linear-gradient(180deg, rgb(83 55 15 / 94%), rgb(48 31 10 / 94%));
+  border-color: rgb(245 179 74 / 55%);
+  font-weight: 700;
+}
+
+.controlled-nodes-install-worker:hover:not(:disabled) {
+  border-color: rgb(255 207 112 / 85%);
+  box-shadow: 0 0 14px rgb(245 179 74 / 18%);
 }
 
 @media (max-width: 720px) {
