@@ -120,7 +120,7 @@ function controlBinding(message: Record<string, unknown>) {
 
 function createWs(
   capabilities: string[],
-  mode: 'success' | 'operation_failure' | 'hold' | 'authorized_hold' | 'status_committed' | 'terminal_committed' | 'ack_then_late_terminal' | 'download_hold_rebind' | 'download_size_mismatch' | 'error_after_expiry' = 'success',
+  mode: 'success' | 'operation_failure' | 'hold' | 'authorized_hold' | 'status_committed' | 'terminal_committed' | 'ack_then_late_terminal' | 'download_hold_rebind' | 'download_size_mismatch' | 'error_after_expiry' | 'drop_first_lease_ready' = 'success',
   leaseTiming: { readyDelayMs?: number; idleWindowMs?: number; terminalDelayMs?: number; rebindDaemonGeneration?: number } = {},
 ) {
   const handlers = new Set<(message: ServerMessage) => void>();
@@ -258,6 +258,7 @@ function createWs(
     send: (message: Record<string, unknown>) => {
       sent.push(message);
       if (message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_INIT) {
+        if (++leaseInitCount === 1 && mode === 'drop_first_lease_ready') return;
         // The idle deadline is issued at LEASE_INIT, not when the browser
         // receives the delayed READY. This makes the test catch a browser
         // implementation that incorrectly starts a fresh five-minute timer
@@ -277,7 +278,7 @@ function createWs(
           expiresAt: issuedAt + 10 * 60_000,
           iceServers: [],
         });
-        if (++leaseInitCount === 1 && leaseTiming.readyDelayMs) setTimeout(respond, leaseTiming.readyDelayMs);
+        if (leaseInitCount === 1 && leaseTiming.readyDelayMs) setTimeout(respond, leaseTiming.readyDelayMs);
         else queueMicrotask(respond);
       } else if (message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_OFFER) {
         queueMicrotask(() => emit({ ...message, type: DIRECT_FILE_TRANSFER_MSG.LEASE_ANSWER, sdp: 'daemon-lease-answer' }));
@@ -422,6 +423,21 @@ describe('direct file transfer v2 browser broker', () => {
     expect(peer.offerChannelLabels[0]?.[0]).toMatch(/^imcodes-health-/);
     expect(peer.offerChannelLabels[0]?.some((label) => label.startsWith('imcodes-op-'))).toBe(false);
     expect(peer.channels.some((channel) => channel.label.startsWith('imcodes-op-'))).toBe(true);
+  });
+
+  it('retries lease initialization when the first READY is lost after daemon preparation', async () => {
+    vi.useFakeTimers();
+    const { uploadFileDirect } = await import('../src/direct-file-transfer.js');
+    const { ws, sent } = createWs(directCapabilities, 'drop_first_lease_ready');
+    const upload = uploadFileDirect(ws, createUploadFile('retry.txt', 'retry'), id(), undefined, undefined, undefined, undefined, 'server-1');
+
+    await vi.advanceTimersByTimeAsync(
+      DIRECT_FILE_TRANSFER_LIMITS.NEGOTIATION_TIMEOUT_MS + DIRECT_FILE_TRANSFER_LIMITS.RETRY_BACKOFF_MS[0] + 1_000,
+    );
+
+    await expect(upload).resolves.toMatchObject({ attachment: { id: 'direct-attachment' } });
+    expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_INIT)).toHaveLength(2);
+    expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_OFFER)).toHaveLength(1);
   });
 
   it('prewarms one lease-only peer and reuses it for two uploads without authority in SDP/ICE', async () => {
