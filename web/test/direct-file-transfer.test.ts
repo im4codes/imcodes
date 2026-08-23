@@ -113,7 +113,7 @@ class FakePeerConnection extends EventTarget {
       ['remote-candidate', { type: 'remote-candidate', candidateType: 'host' }],
     ]) as unknown as RTCStatsReport;
   }
-  restartIce(): void {}
+  restartIce = vi.fn();
   close(): void { this.connectionState = 'closed'; }
 }
 
@@ -137,7 +137,7 @@ function controlBinding(message: Record<string, unknown>) {
 
 function createWs(
   capabilities: string[],
-  mode: 'success' | 'operation_failure' | 'lease_signal_failure' | 'hold' | 'authorized_hold' | 'status_committed' | 'terminal_committed' | 'ack_then_late_terminal' | 'download_hold_rebind' | 'download_size_mismatch' | 'error_after_expiry' | 'drop_first_lease_ready' = 'success',
+  mode: 'success' | 'operation_failure' | 'lease_signal_failure' | 'hold' | 'authorized_hold' | 'status_committed' | 'commit_ack_lost_status_committed' | 'terminal_committed' | 'ack_then_late_terminal' | 'download_hold_rebind' | 'download_size_mismatch' | 'error_after_expiry' | 'drop_first_lease_ready' = 'success',
   leaseTiming: { readyDelayMs?: number; idleWindowMs?: number; terminalDelayMs?: number; rebindDaemonGeneration?: number } = {},
 ) {
   const handlers = new Set<(message: ServerMessage) => void>();
@@ -222,6 +222,7 @@ function createWs(
       return;
     }
     if (payload.type === DIRECT_FILE_TRANSFER_DATA_MSG.FINISH && payload.direction === DIRECT_FILE_TRANSFER_DIRECTION.UPLOAD) {
+      if (mode === 'commit_ack_lost_status_committed') return;
       const common = controlBinding(payload);
       queueMicrotask(() => channel.dispatchEvent(new MessageEvent('message', {
         data: JSON.stringify({
@@ -325,7 +326,8 @@ function createWs(
           expiresAt: Date.now() + 10 * 60_000,
           iceServers: [],
         }));
-      } else if (message.type === DIRECT_FILE_TRANSFER_MSG.STATUS_QUERY && mode === 'status_committed') {
+      } else if (message.type === DIRECT_FILE_TRANSFER_MSG.STATUS_QUERY
+        && (mode === 'status_committed' || mode === 'commit_ack_lost_status_committed')) {
         queueMicrotask(() => emit({
           type: DIRECT_FILE_TRANSFER_MSG.STATUS,
           protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
@@ -1103,6 +1105,32 @@ describe('direct file transfer v2 browser broker', () => {
     expect(FakePeerConnection.instances.at(-1)?.channels.filter((channel) => channel.label.startsWith('imcodes-op-'))).toHaveLength(1);
   });
 
+  it('holds upload progress below 100 and recovers a lost commit ACK before HTTP retransmission', async () => {
+    vi.useFakeTimers();
+    const { uploadFileWithDirectFallback } = await import('../src/direct-file-transfer.js');
+    const { ws, sent } = createWs(directCapabilities, 'commit_ack_lost_status_committed');
+    const progress: number[] = [];
+
+    const pending = uploadFileWithDirectFallback({
+      ws,
+      serverId: 'server-1',
+      file: createUploadFile('commit-recovery.txt', 'already durable'),
+      onProgress: (value) => progress.push(value),
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.waitFor(() => expect(progress).toContain(99));
+    expect(progress).not.toContain(100);
+    expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.STATUS_QUERY)).toHaveLength(0);
+
+    await vi.advanceTimersByTimeAsync(DIRECT_FILE_TRANSFER_LIMITS.STATUS_RECOVERY_DEADLINE_MS);
+    await expect(pending).resolves.toMatchObject({ attachment: { id: 'status-committed' } });
+
+    expect(progress.at(-1)).toBe(100);
+    expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.STATUS_QUERY)).toHaveLength(1);
+    expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.OPERATION_INIT)).toHaveLength(1);
+    expect(apiMocks.uploadFile).not.toHaveBeenCalled();
+  });
+
 
   it('establishes and then reuses an inert v2 lease for explicit diagnostics without file authority', async () => {
     const { probeDirectConnectivity } = await import('../src/direct-file-transfer.js');
@@ -1117,6 +1145,22 @@ describe('direct file transfer v2 browser broker', () => {
       expect(message).not.toHaveProperty('previewHandle');
       expect(message).not.toHaveProperty('sessionName');
     }
+  });
+
+  it('ICE-restarts a disconnected long-lived mobile peer instead of reusing its dead channel path', async () => {
+    const { probeDirectConnectivity } = await import('../src/direct-file-transfer.js');
+    const { ws, sent } = createWs(directCapabilities);
+
+    await expect(probeDirectConnectivity(ws, undefined, 'server-1')).resolves.toMatchObject({ route: 'lan_direct' });
+    const peer = FakePeerConnection.instances.at(-1)!;
+    peer.connectionState = 'disconnected';
+    peer.dispatchEvent(new Event('connectionstatechange'));
+
+    await expect(probeDirectConnectivity(ws, undefined, 'server-1')).resolves.toMatchObject({ route: 'lan_direct' });
+
+    expect(peer.restartIce).toHaveBeenCalledOnce();
+    expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_OFFER)).toHaveLength(2);
+    expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_INIT)).toHaveLength(1);
   });
 
   it('does not misreport a lagging peer connection state as an unavailable runtime', async () => {
