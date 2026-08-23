@@ -1595,6 +1595,7 @@
     "clear_finished": "Borrar finalizadas",
     "cancel": "Cancelar",
     "retry": "Reintentar",
+    "save_share": "Guardar/compartir",
     "dismiss": "Quitar",
     "progress_aria": "Progreso de descarga de {{name}}",
     "transferred": "{{transferred}} / {{total}}",
@@ -1606,6 +1607,7 @@
       "transferring": "Descargando",
       "falling_back": "Cambiando a HTTP",
       "handed_off": "Enviada al navegador",
+      "ready_to_save": "Lista para guardar",
       "completed": "Completada",
       "canceled": "Cancelada",
       "failed": "Fallida"

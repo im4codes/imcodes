@@ -1594,6 +1594,7 @@
     "clear_finished": "Очистить завершённые",
     "cancel": "Отменить",
     "retry": "Повторить",
+    "save_share": "Сохранить/поделиться",
     "dismiss": "Убрать",
     "progress_aria": "Ход загрузки {{name}}",
     "transferred": "{{transferred}} / {{total}}",
@@ -1605,6 +1606,7 @@
       "transferring": "Загрузка",
       "falling_back": "Переход на HTTP",
       "handed_off": "Передано браузеру",
+      "ready_to_save": "Готово к сохранению",
       "completed": "Завершено",
       "canceled": "Отменено",
       "failed": "Ошибка"

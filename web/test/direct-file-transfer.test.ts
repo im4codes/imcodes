@@ -921,6 +921,34 @@ describe('direct file transfer v2 browser broker', () => {
     expect(FakePeerConnection.instances).toHaveLength(0);
   });
 
+  it('keeps completed native HTTP bytes for a fresh save tap when automatic sharing loses activation', async () => {
+    vi.stubGlobal('Capacitor', { isNativePlatform: () => true });
+    apiMocks.streamAttachmentDownloadToWritable.mockImplementationOnce(async (...args: unknown[]) => {
+      const writable = args[2] as { write(data: BufferSource): Promise<void> };
+      await writable.write(new Uint8Array([1, 2, 3]));
+    });
+    browserDownloadMocks.shareBlobOrDownload
+      .mockRejectedValueOnce(new DOMException('gesture expired', 'NotAllowedError'))
+      .mockResolvedValueOnce('shared');
+    const { downloadPreviewWithDirectFallback } = await import('../src/direct-file-transfer.js');
+    const { ws } = createWs(directCapabilities);
+    let save: (() => Promise<void>) | undefined;
+
+    await expect(downloadPreviewWithDirectFallback({
+      ws,
+      serverId: 'server-1',
+      previewHandle: 'preview-handle-1',
+      suggestedName: 'mobile-report.pdf',
+      destination: null,
+      onSaveReady: (action) => { save = action; },
+    })).resolves.toBeUndefined();
+
+    expect(save).toBeTypeOf('function');
+    await expect(save!()).resolves.toBeUndefined();
+    expect(browserDownloadMocks.shareBlobOrDownload).toHaveBeenCalledTimes(2);
+    expect(browserDownloadMocks.shareBlobOrDownload.mock.calls[1]?.[1]).toBe('mobile-report.pdf');
+  });
+
   it('classifies daemon preview-handle expiry as the File Browser one-refresh condition', async () => {
     const { DirectFileTransferFailure, isDirectFileTransferStaleHandleError } = await import('../src/direct-file-transfer.js');
     expect(isDirectFileTransferStaleHandleError(new DirectFileTransferFailure(

@@ -1449,6 +1449,7 @@ async function downloadNativeHttpBlob(options: {
   sessionName?: string;
   signal?: AbortSignal;
   onProgress?: (progress: FileDownloadProgress) => void;
+  onSaveReady?: (save: () => Promise<void>) => void;
 }): Promise<void> {
   const chunks: ArrayBuffer[] = [];
   await streamAttachmentDownloadToWritable(
@@ -1469,7 +1470,18 @@ async function downloadNativeHttpBlob(options: {
     options.onProgress,
   );
   if (options.signal?.aborted) throw new DOMException('download_canceled', 'AbortError');
-  await shareBlobOrDownload(new Blob(chunks), options.suggestedName?.trim() || 'download');
+  const blob = new Blob(chunks);
+  const fileName = options.suggestedName?.trim() || 'download';
+  try {
+    await shareBlobOrDownload(blob, fileName);
+  } catch (error) {
+    // Web Share requires a live user gesture. An HTTP transfer necessarily
+    // finishes after that gesture has expired in WKWebView. Keep the completed
+    // payload and let the transfer center invoke the same share operation from
+    // a fresh explicit tap instead of misreporting a network failure.
+    if (!options.onSaveReady) throw error;
+    options.onSaveReady(() => shareBlobOrDownload(blob, fileName).then(() => undefined));
+  }
 }
 
 async function createPreviewWriter(destination: DirectPreviewDownloadDestination): Promise<FileSystemWritableFileStreamLike> {
@@ -1492,6 +1504,7 @@ export async function downloadPreviewWithDirectFallback(options: {
   signal?: AbortSignal;
   onProgress?: (progress: FileDownloadProgress) => void;
   onMode?: (mode: FileDownloadTransportMode) => void;
+  onSaveReady?: (save: () => Promise<void>) => void;
 }): Promise<void> {
   const destination = options.destination === undefined
     ? await selectPreviewDownloadDestination(options.suggestedName)

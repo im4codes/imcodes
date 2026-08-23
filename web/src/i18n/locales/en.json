@@ -1595,6 +1595,7 @@
     "clear_finished": "Clear finished",
     "cancel": "Cancel",
     "retry": "Retry",
+    "save_share": "Save / Share",
     "dismiss": "Dismiss",
     "progress_aria": "Download progress for {{name}}",
     "transferred": "{{transferred}} / {{total}}",
@@ -1606,6 +1607,7 @@
       "transferring": "Downloading",
       "falling_back": "Switching to HTTP",
       "handed_off": "Handed to browser",
+      "ready_to_save": "Ready to save",
       "completed": "Completed",
       "canceled": "Canceled",
       "failed": "Failed"

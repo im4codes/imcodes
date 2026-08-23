@@ -1595,6 +1595,7 @@
     "clear_finished": "清除已結束",
     "cancel": "取消",
     "retry": "重試",
+    "save_share": "儲存/轉發",
     "dismiss": "移除",
     "progress_aria": "{{name}} 的下載進度",
     "transferred": "{{transferred}} / {{total}}",
@@ -1606,6 +1607,7 @@
       "transferring": "下載中",
       "falling_back": "正在切換 HTTP",
       "handed_off": "已交給瀏覽器",
+      "ready_to_save": "等待儲存",
       "completed": "已完成",
       "canceled": "已取消",
       "failed": "下載失敗"

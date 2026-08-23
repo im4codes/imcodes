@@ -339,6 +339,40 @@ describe('FileBrowser', () => {
     }));
   });
 
+  it('does not misreport downloaded mobile bytes as failed when they need a fresh save tap', async () => {
+    const save = vi.fn().mockResolvedValue(undefined);
+    directFileTransferMocks.downloadPreviewWithDirectFallback.mockImplementationOnce(async (options: {
+      onProgress?: (progress: { loadedBytes: number; totalBytes: number | null }) => void;
+      onMode?: (mode: string) => void;
+      onSaveReady?: (action: () => Promise<void>) => void;
+    }) => {
+      options.onMode?.(directFileTransferMocks.FILE_DOWNLOAD_TRANSPORT_MODE.HTTP);
+      options.onProgress?.({ loadedBytes: 3, totalBytes: 3 });
+      options.onSaveReady?.(save);
+    });
+    const { ws } = makeWsFactory();
+    const view = render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        serverId="srv-1"
+        initialPreview={{ status: 'ok', path: '/home/user/mobile.docx', content: 'preview', downloadId: 'preview-handle' }}
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(view.getByRole('button', { name: 'upload.download_file' }));
+
+    await waitFor(() => expect(getDownloadTransfers()[0]).toMatchObject({
+      route: 'http',
+      status: 'ready_to_save',
+      loadedBytes: 3,
+      totalBytes: 3,
+    }));
+  });
+
   it('retries a failed download with the same destination and a fresh signal', async () => {
     const destination = { handle: { createWritable: vi.fn() } };
     const failure = new Error('connection_failed');
