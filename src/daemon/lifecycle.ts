@@ -555,13 +555,30 @@ export async function startup(): Promise<DaemonContext> {
   logger.info('File transfer initialized');
   await initializeDirectFileTransfer();
 
+  const useContextStoreWorker = !(process.env.VITEST || process.env.NODE_ENV === 'test');
+  if (useContextStoreWorker) {
+    // Start the context-store worker BEFORE any context-store-backed warm-load.
+    // Regression: the short-ref warm-load used to fire above this point, so a
+    // production daemon could open the SQLite store on the main thread before the
+    // worker became the single owner. That poisoned the worker-only invariant and
+    // showed up later as repeated worker timeouts plus failed short-ref persists.
+    getContextStoreClient().start();
+    // The worker is now the single long-lived DB owner — let it (not the
+    // main-thread connection) run the archive-backfill timer.
+    setArchiveBackfillSchedulingEnabled(false);
+  }
+
   // Warm the memory short-ref index so handles injected before this restart
   // still resolve. Resolution is synchronous (it runs inside render paths), so
-  // the durable map is read once here rather than per lookup. Best-effort: a
-  // cold index only means a handle re-registers on its next injection.
-  void loadMemoryShortRefsFromStore()
-    .then((loaded) => { if (loaded > 0) logger.info({ loaded }, 'Memory short-ref index warmed'); })
-    .catch(() => { /* non-fatal: handles are a pure function of the id */ });
+  // the durable map is read once here rather than per lookup. In production this
+  // must wait for the worker owner instead of falling back to an in-process
+  // SQLite connection; tests/CLI keep the original in-process path. Best-effort:
+  // a cold index only means a handle re-registers on its next injection.
+  void (async () => {
+    if (useContextStoreWorker) await getContextStoreClient().whenReady();
+    const loaded = await loadMemoryShortRefsFromStore();
+    if (loaded > 0) logger.info({ loaded }, 'Memory short-ref index warmed');
+  })().catch(() => { /* non-fatal: handles are a pure function of the id */ });
 
   // Clean up old timeline files (>7 days) and truncate oversized ones.
   //
@@ -608,16 +625,6 @@ export async function startup(): Promise<DaemonContext> {
   const serverId = creds?.serverId ?? '';
   const token = creds?.token ?? '';
   configureSharedContextRuntime(creds ? { workerUrl: workerUrl!, serverId, token } : null);
-  // Warm the context-store worker at boot so front-of-turn recall + store access
-  // run off the daemon main thread. Skipped under test (the in-process path is
-  // used there, matching the embedding engine's test behavior); recall callers
-  // fall back to in-process automatically until the worker reports ready.
-  if (!(process.env.VITEST || process.env.NODE_ENV === 'test')) {
-    getContextStoreClient().start();
-    // The worker is now the single long-lived DB owner — let it (not the
-    // main-thread connection) run the archive-backfill timer.
-    setArchiveBackfillSchedulingEnabled(false);
-  }
   if (creds) {
     cleanupAbandonedCapabilityQuarantine();
     try {

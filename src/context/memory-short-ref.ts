@@ -1,6 +1,7 @@
 import type { ContextNamespace } from '../../shared/context-types.js';
 import { isMemoryScope, validateMemoryScopeIdentity } from '../../shared/memory-scope.js';
 import { normalizeDaemonLocalMemoryNamespace } from '../../shared/memory-namespace.js';
+import { CONTEXT_STORE_RPC_TIMEOUT_MS } from '../../shared/context-store-rpc.js';
 import { MEMORY_SHORT_REF_HEALTH_ERROR_MAX_CHARS, type MemoryShortRefHealth } from '../../shared/memory-short-ref-health.js';
 import { createHash } from 'node:crypto';
 import { encodeBase32 } from '../util/base32.js';
@@ -431,7 +432,11 @@ function flushPendingStoreRows(): void {
   let succeeded = false;
   let operation!: Promise<void>;
   operation = getContextStoreClient()
-    .run('upsertMemoryShortRefs', [batch.map(([, row]) => row)])
+    .run(
+      'upsertMemoryShortRefs',
+      [batch.map(([, row]) => row)],
+      { timeoutMs: CONTEXT_STORE_RPC_TIMEOUT_MS.r4Background },
+    )
     .then(() => {
       if (generation !== shortRefStateGeneration) return;
       succeeded = true;
@@ -590,7 +595,11 @@ export async function loadMemoryShortRefsFromStore(): Promise<number> {
   if (shortRefStorePath()) return 0;
   try {
     const rows = await getContextStoreClient()
-      .run<Array<Record<string, unknown>>>('listMemoryShortRefs', [MAX_SHORT_REF_ENTRIES]);
+      .run<Array<Record<string, unknown>>>(
+        'listMemoryShortRefs',
+        [MAX_SHORT_REF_ENTRIES],
+        { timeoutMs: CONTEXT_STORE_RPC_TIMEOUT_MS.r4Background },
+      );
     if (!Array.isArray(rows)) {
       // Contract violation rather than an ordinary failure, but the effect is
       // the same as a failed load — report instead of returning a 0 that reads

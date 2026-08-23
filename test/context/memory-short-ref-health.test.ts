@@ -116,6 +116,7 @@ describe('memory short refs — persistence failure leaves the process', () => {
           expect.objectContaining({ id: entry.id }),
           expect.objectContaining({ id: queuedWhileDown.id }),
         ])],
+        { timeoutMs: 30_000 },
       ]);
       expect(getMemoryShortRefHealth()).toBeUndefined();
     } finally {
@@ -126,6 +127,11 @@ describe('memory short refs — persistence failure leaves the process', () => {
   it('reports a failed warm-load too, not only writes', async () => {
     runMock.mockRejectedValue(new Error('context_store_unavailable'));
     await loadMemoryShortRefsFromStore();
+    expect(runMock).toHaveBeenCalledWith(
+      'listMemoryShortRefs',
+      [expect.any(Number)],
+      { timeoutMs: 30_000 },
+    );
     expect(getMemoryShortRefHealth()).toMatchObject({ stage: 'warm_load' });
   });
   it('reports discarded rows too, since those handles are lost the same way', async () => {

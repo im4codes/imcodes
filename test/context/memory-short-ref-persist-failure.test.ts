@@ -98,7 +98,7 @@ describe('memory short refs — persistence failures stay observable', () => {
       await vi.waitFor(() => expect(runMock).toHaveBeenCalled());
       expect(runMock).toHaveBeenCalledWith('upsertMemoryShortRefs', [
         expect.arrayContaining([expect.objectContaining({ id: entry.id, kind: 'projection' })]),
-      ]);
+      ], { timeoutMs: 30_000 });
       // The file branch must stay dormant without an explicit path override.
       expect(writeFileSyncMock).not.toHaveBeenCalled();
     } finally {
@@ -140,6 +140,11 @@ describe('memory short refs — persistence failures stay observable', () => {
     const { loadMemoryShortRefsFromStore } = await import('../../src/context/memory-short-ref.js');
 
     await expect(loadMemoryShortRefsFromStore()).resolves.toBe(0);
+    expect(runMock).toHaveBeenCalledWith(
+      'listMemoryShortRefs',
+      [expect.any(Number)],
+      { timeoutMs: 30_000 },
+    );
     expect(incrementCounterMock).toHaveBeenCalledWith(
       'mem.short_ref.persist_failure',
       { stage: 'warm_load' },
