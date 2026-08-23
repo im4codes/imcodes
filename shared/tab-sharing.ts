@@ -145,6 +145,7 @@ export const SHARE_BROWSER_COMMANDS = {
   SESSION_SEND: 'session.send',
   SESSION_MODEL_SWITCH: 'session.model_switch',
   SESSION_MODEL_LIST: 'session.model_list',
+  SESSION_PRESET_LIST: 'session.preset_list',
   SESSION_SUPERVISION: 'session.supervision',
   SESSION_CANCEL: 'session.cancel',
   SESSION_STOP: 'session.stop',
@@ -216,6 +217,7 @@ export const SHARE_SCOPED_COMMAND_POLICY = {
   [SHARE_BROWSER_COMMANDS.SESSION_SEND]: allowParticipant('concrete-tab'),
   [SHARE_BROWSER_COMMANDS.SESSION_MODEL_SWITCH]: allowParticipant('concrete-tab'),
   [SHARE_BROWSER_COMMANDS.SESSION_MODEL_LIST]: allowParticipant('concrete-tab'),
+  [SHARE_BROWSER_COMMANDS.SESSION_PRESET_LIST]: allowParticipant('concrete-tab'),
   [SHARE_BROWSER_COMMANDS.SESSION_SUPERVISION]: allowParticipant('concrete-tab'),
   [SHARE_BROWSER_COMMANDS.SESSION_CANCEL]: {
     ...allowParticipant('concrete-tab'),

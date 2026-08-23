@@ -6,6 +6,7 @@ import { createPortal } from 'preact/compat';
 import { useTranslation } from 'react-i18next';
 import { patchSession, patchSubSession } from '../api.js';
 import { useSupervisorDefaults } from '../hooks/useSupervisorDefaults.js';
+import { useTransportModels } from '../hooks/useTransportModels.js';
 import type { WsClient } from '../ws-client.js';
 import { SESSION_AGENT_TYPES, TRANSPORT_SESSION_AGENT_TYPES, getSessionRuntimeType, type SessionAgentType } from '@shared/agent-types.js';
 import { CODEBUDDY_PROVIDER_IDS } from '@shared/codebuddy.js';
@@ -56,6 +57,7 @@ import {
   RuntimeModelPresetSelector,
   type RuntimeModelPresetEntry,
 } from './RuntimeModelPresetSelector.js';
+import { mergeModelSuggestions } from '../../../src/shared/models/options.js';
 
 interface Props {
   serverId: string;
@@ -554,6 +556,7 @@ export function SessionSettingsDialog({
     initialSupervision.auditTargetSessionName ?? null,
   );
   const peerAuditTargetRef = useRef<HTMLDivElement>(null);
+  const ccPresetListRequestIdRef = useRef<string | null>(null);
   const [supervisorDefaults, setSupervisorDefaults] = useState<SupervisionRuntimeDraft>(() => normalizeSupervisorDefaultConfig(null));
   const [initialSupervisorDefaults, setInitialSupervisorDefaults] = useState<SupervisionRuntimeDraft>(() => normalizeSupervisorDefaultConfig(null));
   const supervisorDefaultsDirtyRef = useRef(false);
@@ -589,14 +592,26 @@ export function SessionSettingsDialog({
   useEffect(() => {
     if (!ws) return;
     const unsub = ws.onMessage((msg) => {
-      const m = msg as { type?: string; presets?: CcPresetSummary[] };
-      if (m.type === CC_PRESET_MSG.LIST_RESPONSE) {
+      const m = msg as { type?: string; requestId?: string; presets?: CcPresetSummary[] };
+      if (
+        m.type === CC_PRESET_MSG.LIST_RESPONSE
+        && (!m.requestId || m.requestId === ccPresetListRequestIdRef.current)
+      ) {
         setCcPresets(m.presets ?? []);
       }
     });
-    try { ws.send({ type: CC_PRESET_MSG.LIST }); } catch { /* ws may not support send in tests */ }
+    const requestId = globalThis.crypto?.randomUUID?.()
+      ?? `cc-presets-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    ccPresetListRequestIdRef.current = requestId;
+    try {
+      ws.send({
+        type: CC_PRESET_MSG.LIST,
+        requestId,
+        sessionName,
+      });
+    } catch { /* ws may not support send in tests */ }
     return unsub;
-  }, [ws]);
+  }, [sessionName, ws]);
 
   useEffect(() => {
     if (ccPresets.length === 0) return;
@@ -708,28 +723,50 @@ export function SessionSettingsDialog({
   const taskRunPromptVersion = supervision.taskRunPromptVersion ?? TASK_RUN_PROMPT_VERSION;
   const supervisorDefaultsBackend = normalizeBackendValue(String(supervisorDefaults.backend ?? ''));
   const supervisorDefaultsModel = typeof supervisorDefaults.model === 'string' ? supervisorDefaults.model : '';
+  const supervisorDefaultsPreset = typeof supervisorDefaults.preset === 'string' ? supervisorDefaults.preset : '';
   const supervisorDefaultsTimeout = supervisorDefaults.timeoutMs ?? DEFAULT_SUPERVISION_TIMEOUT_MS;
   const supervisorDefaultsTimeoutSeconds = timeoutMsToUiSeconds(supervisorDefaultsTimeout);
   const supervisorDefaultsPromptVersion = supervisorDefaults.promptVersion ?? SUPERVISION_PROMPT_VERSION;
   const supervisorDefaultsPresetEntry = ccPresets.find((p) => p.name === (typeof supervisorDefaults.preset === 'string' ? supervisorDefaults.preset.trim() : ''));
   const supervisorDefaultsPresetModelOptions = getPresetModelOptions(ccPresets, supervisorDefaults.preset);
+  const supervisorDefaultsDynamicModels = useTransportModels(
+    ws ?? null,
+    supervisorDefaultsBackend && supervisorDefaultsPreset && doesSharedContextBackendSupportPresets(supervisorDefaultsBackend)
+      ? supervisorDefaultsBackend
+      : null,
+    supervisorDefaultsPreset || undefined,
+    sessionName,
+  );
   const supervisorDefaultsModelOptions = supervisorDefaultsBackend
-    ? (supervisorDefaultsPresetEntry && supervisorDefaultsPresetModelOptions.length > 0
-        ? supervisorDefaultsPresetModelOptions
+    ? (supervisorDefaultsPresetEntry
+        ? mergeModelSuggestions(
+            supervisorDefaultsPresetModelOptions,
+            supervisorDefaultsDynamicModels.models.map((entry) => entry.id),
+          )
         : getSupervisionModelOptions(supervisorDefaultsBackend))
     : [];
   const supervisorDefaultsCustomInstructions = typeof supervisorDefaults.customInstructions === 'string' ? supervisorDefaults.customInstructions : '';
   const supervisorDefaultsAutoContinueStreak = supervisorDefaults.maxAutoContinueStreak ?? DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_STREAK;
   const supervisorDefaultsAutoContinueTotal = supervisorDefaults.maxAutoContinueTotal ?? DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_TOTAL;
-  const supervisorDefaultsPreset = typeof supervisorDefaults.preset === 'string' ? supervisorDefaults.preset : '';
   const supervisorDefaultsBackupBackend = normalizeBackendValue(String(supervisorDefaults.backupBackend ?? ''));
   const supervisorDefaultsBackupModel = typeof supervisorDefaults.backupModel === 'string' ? supervisorDefaults.backupModel : '';
   const supervisorDefaultsBackupPreset = typeof supervisorDefaults.backupPreset === 'string' ? supervisorDefaults.backupPreset : '';
   const supervisorDefaultsBackupPresetEntry = ccPresets.find((p) => p.name === supervisorDefaultsBackupPreset.trim());
   const supervisorDefaultsBackupPresetModelOptions = getPresetModelOptions(ccPresets, supervisorDefaultsBackupPreset);
+  const supervisorDefaultsBackupDynamicModels = useTransportModels(
+    ws ?? null,
+    supervisorDefaultsBackupBackend && supervisorDefaultsBackupPreset && doesSharedContextBackendSupportPresets(supervisorDefaultsBackupBackend)
+      ? supervisorDefaultsBackupBackend
+      : null,
+    supervisorDefaultsBackupPreset || undefined,
+    sessionName,
+  );
   const supervisorDefaultsBackupModelOptions = supervisorDefaultsBackupBackend
-    ? (supervisorDefaultsBackupPresetEntry && supervisorDefaultsBackupPresetModelOptions.length > 0
-        ? supervisorDefaultsBackupPresetModelOptions
+    ? (supervisorDefaultsBackupPresetEntry
+        ? mergeModelSuggestions(
+            supervisorDefaultsBackupPresetModelOptions,
+            supervisorDefaultsBackupDynamicModels.models.map((entry) => entry.id),
+          )
         : getSupervisionModelOptions(supervisorDefaultsBackupBackend))
     : [];
   // Preset persistence is valid only for runtime backends that can resolve the

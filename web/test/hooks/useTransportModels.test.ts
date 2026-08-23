@@ -24,6 +24,7 @@ describe('supportsDynamicTransportModels', () => {
       'kimi-sdk',
       'deepseek-harness',
       'pi',
+      'qwen',
       CODEBUDDY_PROVIDER_IDS.CHINA,
       CODEBUDDY_PROVIDER_IDS.INTERNATIONAL,
     ];
@@ -41,7 +42,7 @@ describe('supportsDynamicTransportModels', () => {
   });
 
   it('rejects agents with no daemon model plumbing', () => {
-    const unsupported = ['claude-code', 'codex', 'opencode', 'gemini', 'shell', 'script', 'openclaw', 'qwen', 'qoder-sdk', '', undefined, null];
+    const unsupported = ['claude-code', 'codex', 'opencode', 'gemini', 'shell', 'script', 'openclaw', 'qoder-sdk', '', undefined, null];
     for (const agentType of unsupported) {
       expect(supportsDynamicTransportModels(agentType), String(agentType)).toBe(false);
     }

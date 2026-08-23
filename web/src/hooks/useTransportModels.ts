@@ -19,12 +19,12 @@ export interface TransportModelState {
 }
 
 /** Agent types that support dynamic model discovery via `transport.list_models`. */
-export type TransportAgentTypeWithModels = 'claude-code-sdk' | 'copilot-sdk' | 'cursor-headless' | 'codex-sdk' | 'opencode-sdk' | 'gemini-sdk' | 'grok-sdk' | 'kimi-sdk' | 'deepseek-harness' | 'pi' | typeof CODEBUDDY_PROVIDER_IDS.CHINA | typeof CODEBUDDY_PROVIDER_IDS.INTERNATIONAL;
+export type TransportAgentTypeWithModels = 'claude-code-sdk' | 'copilot-sdk' | 'cursor-headless' | 'codex-sdk' | 'opencode-sdk' | 'gemini-sdk' | 'grok-sdk' | 'kimi-sdk' | 'deepseek-harness' | 'pi' | 'qwen' | typeof CODEBUDDY_PROVIDER_IDS.CHINA | typeof CODEBUDDY_PROVIDER_IDS.INTERNATIONAL;
 
 export function supportsDynamicTransportModels(
   agentType: string | undefined | null,
 ): agentType is TransportAgentTypeWithModels {
-  return agentType === 'claude-code-sdk' || agentType === 'copilot-sdk' || agentType === 'cursor-headless' || agentType === 'codex-sdk' || agentType === 'opencode-sdk' || agentType === 'gemini-sdk' || agentType === 'grok-sdk' || agentType === 'kimi-sdk' || agentType === 'deepseek-harness' || agentType === 'pi' || isCodeBuddyProviderId(agentType ?? undefined);
+  return agentType === 'claude-code-sdk' || agentType === 'copilot-sdk' || agentType === 'cursor-headless' || agentType === 'codex-sdk' || agentType === 'opencode-sdk' || agentType === 'gemini-sdk' || agentType === 'grok-sdk' || agentType === 'kimi-sdk' || agentType === 'deepseek-harness' || agentType === 'pi' || agentType === 'qwen' || isCodeBuddyProviderId(agentType ?? undefined);
 }
 
 /** Fetch and cache the list of available models for a transport agent type.

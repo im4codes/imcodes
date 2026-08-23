@@ -129,10 +129,7 @@ describe('session_list row redaction', () => {
   it.each([
     ['a tab-scoped share', tabScoped],
     ['a server-scoped share', serverScoped],
-  ])('strips host-side fields for %s', (_label, target) => {
-    // Row filtering only ever chose which rows to send. Every covered row
-    // shipped the host's absolute paths and provider config in full, and for a
-    // server-scoped share the whole message was returned untouched.
+  ])('preserves the project directory but strips private host/provider fields for %s', (_label, target) => {
     const delivered = filterShareDaemonMessage(
       { type: 'session_list', serverId, sessions: [row] },
       socket(target),
@@ -140,10 +137,11 @@ describe('session_list row redaction', () => {
     const [out] = delivered?.sessions as Array<Record<string, unknown>>;
     expect(out.name).toBe('deck_proj_brain');
     expect(out.state).toBe('idle');
+    expect(out.projectDir).toBe('/Users/host/private/project');
     // Allowlist, so assert the complement: nothing outside the visible set may
     // survive. A denylist version of this test passed while planLabel,
     // permissionLabel and the *AvailableModels arrays still went out.
-    const allowed = new Set(['name', 'state']);
+    const allowed = new Set(['name', 'state', 'projectDir']);
     for (const key of Object.keys(out)) {
       expect(allowed.has(key), `${key} must not reach a share recipient`).toBe(true);
     }

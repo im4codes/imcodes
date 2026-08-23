@@ -32,6 +32,7 @@ import {
 import { MSG_COMMAND_ACK } from '../../shared/ack-protocol.js';
 import { TRANSPORT_QUEUE_COMMANDS } from '../../shared/transport-queue-types.js';
 import { OPENSPEC_AUTO_DELIVER_MSG } from '../../shared/openspec-auto-deliver-constants.js';
+import { CC_PRESET_MSG } from '../../shared/cc-presets.js';
 
 class MockWs extends EventEmitter {
   sent: Array<string | Buffer> = [];
@@ -290,7 +291,7 @@ describe('WsBridge share-scoped sockets', () => {
     daemon.emit('message', JSON.stringify({
       type: 'session_list',
       sessions: [
-        { name: 'deck_proj_brain', runtimeType: 'transport' },
+        { name: 'deck_proj_brain', runtimeType: 'transport', projectDir: '/owner/project' },
         { name: 'deck_other_brain', runtimeType: 'transport' },
       ],
     }));
@@ -299,7 +300,11 @@ describe('WsBridge share-scoped sockets', () => {
     const memberList = member.sentJson.find((msg) => msg.type === 'session_list');
     const sharedList = shared.sentJson.find((msg) => msg.type === 'session_list');
     expect((memberList?.sessions as unknown[])).toHaveLength(2);
-    expect(sharedList?.sessions).toEqual([{ name: 'deck_proj_brain', runtimeType: 'transport' }]);
+    expect(sharedList?.sessions).toEqual([{
+      name: 'deck_proj_brain',
+      runtimeType: 'transport',
+      projectDir: '/owner/project',
+    }]);
   });
 
   it('persists and broadcasts share discussion comments without daemon relay', async () => {
@@ -580,6 +585,7 @@ describe('WsBridge share-scoped sockets', () => {
         actualPolicy?.kind === 'participant-send'
         || actualPolicy?.kind === 'participant-model-switch'
         || actualPolicy?.kind === 'participant-model-list'
+        || actualPolicy?.kind === 'participant-preset-list'
         || actualPolicy?.kind === 'participant-cancel'
         || actualPolicy?.kind === 'participant-discussion-start'
         || actualPolicy?.kind === 'participant-covered-action'
@@ -1004,10 +1010,10 @@ describe('WsBridge share-scoped sockets', () => {
     participant.emit('message', JSON.stringify({
       type: TRANSPORT_MSG.LIST_MODELS,
       sessionName: 'deck_sub_child_1',
-      agentType: 'grok-sdk',
+      agentType: 'qwen',
       requestId: 'models-participant',
       force: true,
-      ccPreset: 'must-not-cross-share-boundary',
+      ccPreset: 'MiniMax Owner Preset',
       unexpected: 'drop-me',
     }));
     viewer.emit('message', JSON.stringify({
@@ -1022,8 +1028,9 @@ describe('WsBridge share-scoped sockets', () => {
     expect(modelRequests).toEqual([{
       type: TRANSPORT_MSG.LIST_MODELS,
       sessionName: 'deck_sub_child_1',
-      agentType: 'grok-sdk',
+      agentType: 'qwen',
       requestId: 'models-participant',
+      ccPreset: 'MiniMax Owner Preset',
       force: true,
     }]);
     participant.sent.length = 0;
@@ -1031,20 +1038,81 @@ describe('WsBridge share-scoped sockets', () => {
     daemon.emit('message', JSON.stringify({
       type: TRANSPORT_MSG.MODELS_RESPONSE,
       sessionName: 'deck_sub_child_1',
-      agentType: 'grok-sdk',
+      agentType: 'qwen',
+      ccPreset: 'MiniMax Owner Preset',
       requestId: 'models-participant',
-      models: [{ id: 'grok-code-fast-1' }],
+      models: [{ id: 'MiniMax-M2.7' }],
+      error: 'private endpoint https://private.example failed',
+      unexpected: 'drop-me',
     }));
     await flushAsync();
 
     expect(participant.sentJson).toEqual(expect.arrayContaining([
-      expect.objectContaining({
+      {
         type: TRANSPORT_MSG.MODELS_RESPONSE,
+        sessionName: 'deck_sub_child_1',
+        agentType: 'qwen',
+        ccPreset: 'MiniMax Owner Preset',
         requestId: 'models-participant',
-        models: [{ id: 'grok-code-fast-1' }],
-      }),
+        models: [{ id: 'MiniMax-M2.7' }],
+      },
     ]));
+    expect(JSON.stringify(participant.sentJson)).not.toContain('private endpoint');
     expect(viewer.sentJson.some((msg) => msg.type === TRANSPORT_MSG.MODELS_RESPONSE)).toBe(false);
+
+    participant.sent.length = 0;
+    viewer.sent.length = 0;
+    participant.emit('message', JSON.stringify({
+      type: CC_PRESET_MSG.LIST,
+      sessionName: 'deck_sub_child_1',
+      requestId: 'presets-participant',
+      unexpected: 'drop-me',
+    }));
+    viewer.emit('message', JSON.stringify({
+      type: CC_PRESET_MSG.LIST,
+      sessionName: 'deck_sub_child_1',
+      requestId: 'presets-viewer',
+    }));
+    await flushAsync();
+
+    expect(daemon.sentJson.filter((msg) => msg.type === CC_PRESET_MSG.LIST)).toEqual([{
+      type: CC_PRESET_MSG.LIST,
+      sessionName: 'deck_sub_child_1',
+      requestId: 'presets-participant',
+    }]);
+    daemon.emit('message', JSON.stringify({
+      type: CC_PRESET_MSG.LIST_RESPONSE,
+      sessionName: 'deck_sub_child_1',
+      requestId: 'presets-participant',
+      presets: [{
+        name: 'MiniMax Owner Preset',
+        env: {
+          ANTHROPIC_API_KEY: 'owner-secret',
+          ANTHROPIC_BASE_URL: 'https://private.example',
+          ANTHROPIC_MODEL: 'MiniMax-M2.7',
+        },
+        availableModels: [{ id: 'MiniMax-M2.7', name: 'MiniMax 2.7' }],
+        initMessage: 'private owner prompt',
+        modelDiscoveryError: 'private endpoint detail',
+      }],
+    }));
+    await flushAsync();
+
+    expect(participant.sentJson).toContainEqual({
+      type: CC_PRESET_MSG.LIST_RESPONSE,
+      sessionName: 'deck_sub_child_1',
+      requestId: 'presets-participant',
+      presets: [{
+        name: 'MiniMax Owner Preset',
+        env: {},
+        defaultModel: 'MiniMax-M2.7',
+        availableModels: [{ id: 'MiniMax-M2.7', name: 'MiniMax 2.7' }],
+      }],
+    });
+    expect(JSON.stringify(participant.sentJson)).not.toContain('owner-secret');
+    expect(JSON.stringify(participant.sentJson)).not.toContain('private.example');
+    expect(JSON.stringify(participant.sentJson)).not.toContain('private owner prompt');
+    expect(viewer.sentJson.some((msg) => msg.type === CC_PRESET_MSG.LIST_RESPONSE)).toBe(false);
     expect(auditRows).toEqual(expect.arrayContaining([
       expect.objectContaining({ actionType: 'session.send', decision: 'accepted', actorUserId: 'participant-user' }),
       expect.objectContaining({ actionType: 'session.send', decision: 'rejected', actorUserId: 'participant-user', reason: SHARE_REASONS.DIRECT_SURFACE_DENIED }),

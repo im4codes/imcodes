@@ -42,7 +42,7 @@ describe('summary-compressor provider session config', () => {
       },
       agentId: 'qwen-preset-model',
     });
-    expect(getQwenPresetTransportConfigMock).toHaveBeenCalledWith('Qwen Team');
+    expect(getQwenPresetTransportConfigMock).toHaveBeenCalledWith('Qwen Team', 'qwen3-coder-plus');
   });
 
   it('falls back to the configured model when no qwen preset is selected', async () => {
@@ -75,7 +75,7 @@ describe('summary-compressor provider session config', () => {
       },
       agentId: 'MiniMax-M3',
     });
-    expect(resolvePresetEnvMock).toHaveBeenCalledWith('minimax');
+    expect(resolvePresetEnvMock).toHaveBeenCalledWith('minimax', undefined, 'sonnet');
     expect(getQwenPresetTransportConfigMock).not.toHaveBeenCalled();
   });
 

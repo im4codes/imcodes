@@ -226,6 +226,17 @@ describe('cc presets', () => {
     expect(result.systemPrompt).toMatch(/not running on Qwen/i);
   });
 
+  it('routes a deliberately selected model from the preset catalog', async () => {
+    const { getQwenPresetTransportConfig } = await import('../../src/daemon/cc-presets.js');
+
+    const result = await getQwenPresetTransportConfig('MiniMax', 'MiniMax-M2.5');
+
+    expect(result.model).toBe('MiniMax-M2.5');
+    expect(result.env).toMatchObject({ ANTHROPIC_MODEL: 'MiniMax-M2.5' });
+    expect(result.settings).toMatchObject({ model: { name: 'MiniMax-M2.5' } });
+    expect(result.systemPrompt).toContain('MiniMax-M2.5');
+  });
+
   it('builds a dsh route config without placing the preset key in generic env', async () => {
     const { getDshPresetTransportConfig } = await import('../../src/daemon/cc-presets.js');
 

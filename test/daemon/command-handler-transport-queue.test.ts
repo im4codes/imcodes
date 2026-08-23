@@ -84,6 +84,7 @@ const {
   getProviderMock,
   ensureProviderConnectedMock,
   getPresetModelCatalogMock,
+  loadPresetsMock,
   lookupAttachmentMock,
 } = vi.hoisted(() => ({
   getSessionMock: vi.fn(),
@@ -137,6 +138,7 @@ const {
   getProviderMock: vi.fn(),
   ensureProviderConnectedMock: vi.fn(),
   getPresetModelCatalogMock: vi.fn(),
+  loadPresetsMock: vi.fn().mockResolvedValue([]),
   lookupAttachmentMock: vi.fn(() => undefined),
 }));
 
@@ -268,6 +270,7 @@ vi.mock('../../src/agent/provider-registry.js', () => ({
 vi.mock('../../src/daemon/cc-presets.js', async (importOriginal) => ({
   ...await importOriginal<typeof import('../../src/daemon/cc-presets.js')>(),
   getPresetModelCatalog: getPresetModelCatalogMock,
+  loadPresets: loadPresetsMock,
 }));
 
 vi.mock('../../src/context/memory-search.js', () => ({
@@ -2803,6 +2806,34 @@ describe('handleWebCommand transport queue behavior', () => {
       models: [{ id: 'MiniMax-M3' }, { id: 'MiniMax-M2.7' }],
       defaultModel: 'MiniMax-M3',
       isAuthenticated: true,
+    });
+  });
+
+  it('echoes request and session scope when listing owner CC presets', async () => {
+    loadPresetsMock.mockResolvedValueOnce([{
+      name: 'MiniMax Owner Preset',
+      env: { ANTHROPIC_API_KEY: 'owner-secret' },
+      defaultModel: 'MiniMax-M2.7',
+    }]);
+
+    handleWebCommand({
+      type: 'cc.presets.list',
+      requestId: 'presets-participant',
+      sessionName: 'deck_transport_brain',
+    }, serverLink as any);
+    await waitForAsync(() => serverLink.send.mock.calls.some((call) => (
+      (call[0] as Record<string, unknown>).requestId === 'presets-participant'
+    )));
+
+    expect(serverLink.send).toHaveBeenCalledWith({
+      type: 'cc.presets.list_response',
+      requestId: 'presets-participant',
+      sessionName: 'deck_transport_brain',
+      presets: [{
+        name: 'MiniMax Owner Preset',
+        env: { ANTHROPIC_API_KEY: 'owner-secret' },
+        defaultModel: 'MiniMax-M2.7',
+      }],
     });
   });
 

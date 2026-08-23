@@ -28,6 +28,7 @@ import {
 } from '../../../shared/direct-file-transfer.js';
 import { TRANSPORT_QUEUE_COMMANDS } from '../../../shared/transport-queue-types.js';
 import { OPENSPEC_AUTO_DELIVER_MSG } from '../../../shared/openspec-auto-deliver-constants.js';
+import { CC_PRESET_MSG } from '../../../shared/cc-presets.js';
 
 export { shareTargetKey };
 export type { EffectiveCoverage, ShareTarget };
@@ -78,6 +79,7 @@ type ShareCommandPolicy =
   | { kind: 'participant-send' }
   | { kind: 'participant-model-switch' }
   | { kind: 'participant-model-list' }
+  | { kind: 'participant-preset-list' }
   | { kind: 'participant-p2p-config-save' }
   | { kind: 'participant-cancel' }
   /** An inert lease contains no file authority and is deliberately role-neutral. */
@@ -120,6 +122,12 @@ const SHARE_MODEL_CATALOG_AGENT_TYPES = new Set([
   'kimi-sdk',
   'deepseek-harness',
   'pi',
+  'qwen',
+]);
+
+const SHARE_PRESET_MODEL_CATALOG_AGENT_TYPES = new Set([
+  'claude-code-sdk',
+  'qwen',
 ]);
 
 function denyFromShared(sharedCommand: string): ShareCommandPolicy {
@@ -149,6 +157,7 @@ export const SHARE_WS_COMMAND_POLICY_INVENTORY: readonly ShareBridgeCommandInven
   { bridgeCommand: 'session.send', sharedCommand: SHARE_BROWSER_COMMANDS.SESSION_SEND, policy: { kind: 'participant-send' } },
   { bridgeCommand: 'subsession.set_model', sharedCommand: SHARE_BROWSER_COMMANDS.SESSION_MODEL_SWITCH, policy: { kind: 'participant-model-switch' } },
   { bridgeCommand: TRANSPORT_MSG.LIST_MODELS, sharedCommand: SHARE_BROWSER_COMMANDS.SESSION_MODEL_LIST, policy: { kind: 'participant-model-list' } },
+  { bridgeCommand: CC_PRESET_MSG.LIST, sharedCommand: SHARE_BROWSER_COMMANDS.SESSION_PRESET_LIST, policy: { kind: 'participant-preset-list' } },
   { bridgeCommand: DAEMON_COMMAND_TYPES.SESSION_CANCEL, sharedCommand: SHARE_BROWSER_COMMANDS.SESSION_CANCEL, policy: { kind: 'participant-cancel' } },
   { bridgeCommand: 'discussion.comment', sharedCommand: SHARE_BROWSER_COMMANDS.DISCUSSION_COMMENT, policy: { kind: 'allow-covered-read', requireTarget: false } },
   { bridgeCommand: 'fs.ls', sharedCommand: SHARE_BROWSER_COMMANDS.FILE_BROWSE, policy: { kind: 'allow-covered-read', requireTarget: true } },
@@ -290,6 +299,10 @@ export const SHARE_SCOPED_DAEMON_MESSAGE_POLICY = new Map<string, DaemonMessageP
   [TRANSPORT_MSG.MODELS_RESPONSE, {
     target: sessionNameFieldTarget,
     redact: redactParticipantModelCatalog,
+  }],
+  [CC_PRESET_MSG.LIST_RESPONSE, {
+    target: sessionNameFieldTarget,
+    redact: redactParticipantPresetCatalog,
   }],
   ['chat.delta', { target: sessionIdFieldTarget }],
   ['chat.complete', { target: sessionIdFieldTarget }],
@@ -472,6 +485,10 @@ export function evaluateShareCommand(input: {
     if (!SHARE_MODEL_CATALOG_AGENT_TYPES.has(agentType) || !requestId || requestId.length > 256) {
       return { allowed: false, reason: SHARE_REASONS.DIRECT_SURFACE_DENIED };
     }
+    const ccPreset = typeof input.msg.ccPreset === 'string' ? input.msg.ccPreset.trim() : '';
+    if (ccPreset && (!SHARE_PRESET_MODEL_CATALOG_AGENT_TYPES.has(agentType) || ccPreset.length > 256)) {
+      return { allowed: false, reason: SHARE_REASONS.DIRECT_SURFACE_DENIED };
+    }
     return {
       allowed: true,
       stampedMessage: {
@@ -479,7 +496,26 @@ export function evaluateShareCommand(input: {
         sessionName,
         agentType,
         requestId,
+        ...(ccPreset ? { ccPreset } : {}),
         ...(input.msg.force === true ? { force: true } : {}),
+      },
+    };
+  }
+
+  if (policy.kind === 'participant-preset-list') {
+    if (!sessionName || !shareStateCoversSession(input.state, sessionName)) {
+      return { allowed: false, reason: SHARE_REASONS.DIRECT_SURFACE_DENIED };
+    }
+    const requestId = typeof input.msg.requestId === 'string' ? input.msg.requestId.trim() : '';
+    if (!requestId || requestId.length > 256) {
+      return { allowed: false, reason: SHARE_REASONS.DIRECT_SURFACE_DENIED };
+    }
+    return {
+      allowed: true,
+      stampedMessage: {
+        type: CC_PRESET_MSG.LIST,
+        sessionName,
+        requestId,
       },
     };
   }
@@ -826,8 +862,10 @@ function subsessionRemovedTarget(msg: Record<string, unknown>): ShareTarget | nu
  * field, not to whoever reads this. Adding a field to the session list now
  * keeps it hidden from shares until someone deliberately names it here.
  *
- * Deliberately absent: `projectDir` (absolute host path), `transportConfig`
- * (provider blob that can carry env and endpoints), `providerId` /
+ * `projectDir` is deliberately visible: it identifies the shared project's
+ * working tree and is required for OpenSpec and project-scoped file actions.
+ * Deliberately absent: `transportConfig` (provider blob that can carry env and
+ * endpoints), `providerId` /
  * `providerSessionId`, every `*AuthType` / `*AuthLimit` / `*AvailableModels`,
  * `planLabel`, `permissionLabel`, `quota*`, `contextNamespace*`, `effort`,
  * `ccPreset`, `requestedModel`.
@@ -837,6 +875,7 @@ const SHARE_VISIBLE_SESSION_FIELDS = new Set([
   'sessionInstanceId',
   'runtimeEpoch',
   'project',
+  'projectDir',
   'role',
   'agentType',
   'agentVersion',
@@ -886,7 +925,76 @@ function redactTransportHistory(msg: Record<string, unknown>, _state: ShareScope
 }
 
 function redactParticipantModelCatalog(msg: Record<string, unknown>, state: ShareScopedSocketState): Record<string, unknown> | null {
-  return state.snapshot.effectiveRole === 'participant' ? msg : null;
+  if (state.snapshot.effectiveRole !== 'participant') return null;
+  const models = Array.isArray(msg.models) ? msg.models : [];
+  return {
+    type: TRANSPORT_MSG.MODELS_RESPONSE,
+    ...(typeof msg.sessionName === 'string' ? { sessionName: msg.sessionName } : {}),
+    ...(typeof msg.agentType === 'string' ? { agentType: msg.agentType } : {}),
+    ...(typeof msg.requestId === 'string' ? { requestId: msg.requestId } : {}),
+    ...(typeof msg.ccPreset === 'string' ? { ccPreset: msg.ccPreset } : {}),
+    models: models.flatMap((value) => {
+      if (!value || typeof value !== 'object' || Array.isArray(value)) return [];
+      const model = value as Record<string, unknown>;
+      const id = typeof model.id === 'string' ? model.id.trim() : '';
+      if (!id || id.length > 256) return [];
+      const name = typeof model.name === 'string' ? model.name.trim() : '';
+      return [{
+        id,
+        ...(name && name.length <= 256 ? { name } : {}),
+        ...(typeof model.supportsReasoningEffort === 'boolean'
+          ? { supportsReasoningEffort: model.supportsReasoningEffort }
+          : {}),
+      }];
+    }),
+    ...(typeof msg.defaultModel === 'string' && msg.defaultModel.trim().length <= 256
+      ? { defaultModel: msg.defaultModel.trim() }
+      : {}),
+    ...(typeof msg.isAuthenticated === 'boolean' ? { isAuthenticated: msg.isAuthenticated } : {}),
+  };
+}
+
+function redactParticipantPresetCatalog(msg: Record<string, unknown>, state: ShareScopedSocketState): Record<string, unknown> | null {
+  if (state.snapshot.effectiveRole !== 'participant') return null;
+  const presets = Array.isArray(msg.presets) ? msg.presets : [];
+  return {
+    type: CC_PRESET_MSG.LIST_RESPONSE,
+    ...(typeof msg.requestId === 'string' ? { requestId: msg.requestId } : {}),
+    ...(typeof msg.sessionName === 'string' ? { sessionName: msg.sessionName } : {}),
+    presets: presets.flatMap((value) => {
+      if (!value || typeof value !== 'object' || Array.isArray(value)) return [];
+      const preset = value as Record<string, unknown>;
+      const name = typeof preset.name === 'string' ? preset.name.trim() : '';
+      if (!name || name.length > 256) return [];
+      const availableModels = Array.isArray(preset.availableModels)
+        ? preset.availableModels.flatMap((model) => {
+            if (!model || typeof model !== 'object' || Array.isArray(model)) return [];
+            const entry = model as Record<string, unknown>;
+            const id = typeof entry.id === 'string' ? entry.id.trim() : '';
+            if (!id || id.length > 256) return [];
+            const modelName = typeof entry.name === 'string' ? entry.name.trim() : '';
+            return [{ id, ...(modelName && modelName.length <= 256 ? { name: modelName } : {}) }];
+          })
+        : [];
+      const env = preset.env && typeof preset.env === 'object' && !Array.isArray(preset.env)
+        ? preset.env as Record<string, unknown>
+        : {};
+      const defaultModel = (
+        typeof preset.defaultModel === 'string' ? preset.defaultModel
+          : typeof env.ANTHROPIC_MODEL === 'string' ? env.ANTHROPIC_MODEL
+            : typeof env.OPENAI_MODEL === 'string' ? env.OPENAI_MODEL
+              : ''
+      ).trim();
+      return [{
+        name,
+        // Preserve the existing browser contract without exposing any owner
+        // environment values, endpoints, API keys, or other preset metadata.
+        env: {},
+        ...(availableModels.length > 0 ? { availableModels } : {}),
+        ...(defaultModel && defaultModel.length <= 256 ? { defaultModel } : {}),
+      }];
+    }),
+  };
 }
 
 function redactActiveDispatchForViewers(msg: Record<string, unknown>, state: ShareScopedSocketState): Record<string, unknown> | null {

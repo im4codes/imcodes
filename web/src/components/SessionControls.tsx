@@ -2747,10 +2747,11 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   }, [activeSession?.projectDir]);
 
   const openSpecChangesPath = useMemo(() => {
-    const cwd = activeSession?.projectDir;
+    const cwd = activeSession?.projectDir
+      ?? (isShareScopedSession ? FS_SESSION_ROOT_PATH : undefined);
     if (!cwd) return null;
     return `${cwd.replace(/[\\/]+$/, '')}/openspec/changes`;
-  }, [activeSession?.projectDir]);
+  }, [activeSession?.projectDir, isShareScopedSession]);
   const openSpecChangeListCacheKey = useMemo(() => (
     openSpecChangesPath ? buildOpenSpecChangeListCacheKey(serverId, openSpecChangesPath) : null
   ), [openSpecChangesPath, serverId]);

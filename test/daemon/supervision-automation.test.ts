@@ -526,6 +526,8 @@ describe('SupervisionAutomation', () => {
 
   it('passes recent task turns and structured peer-audit results to the supervisor model', async () => {
     const snapshot = await seedSession('supervised');
+    const sessionInstanceId = getSession('deck_supervision_brain')?.sessionInstanceId;
+    expect(sessionInstanceId).toBeTruthy();
     supervisionAutomation.init();
     supervisionAutomation.registerTaskIntent(
       'deck_supervision_brain',
@@ -550,6 +552,7 @@ describe('SupervisionAutomation', () => {
     await sleep(25);
 
     expect(mockSupervisionDecide).toHaveBeenCalledWith(expect.objectContaining({
+      targetSessionId: sessionInstanceId,
       recentEvidence: expect.arrayContaining([
         expect.objectContaining({ kind: 'user', text: 'Also verify the audit result before finishing.' }),
         expect.objectContaining({

@@ -1,6 +1,10 @@
 import { useTranslation } from 'react-i18next';
 import type { SharedContextRuntimeBackend } from '@shared/context-types.js';
-import { getCcPresetEffectiveModel, type CcPreset } from '@shared/cc-presets.js';
+import {
+  getCcPresetAvailableModelIds,
+  getCcPresetEffectiveModel,
+  type CcPreset,
+} from '@shared/cc-presets.js';
 import { doesSharedContextBackendSupportPresets } from '@shared/shared-context-runtime-config.js';
 
 export type RuntimeModelPresetEntry = Pick<
@@ -11,8 +15,9 @@ export type RuntimeModelPresetEntry = Pick<
 /**
  * Shared model/preset picker for memory processing and automatic supervision.
  * A preset is an endpoint/env bundle, not merely another model name, so the
- * two dimensions remain visible while selection is kept mutually consistent.
- * Select controls keep the layout stable as model and preset catalogs grow.
+ * two dimensions remain visible. Its discovered model catalog stays
+ * selectable just like the New Session dialog; choosing a model must not
+ * silently clear the provider route.
  */
 export function RuntimeModelPresetSelector({
   backend,
@@ -40,7 +45,13 @@ export function RuntimeModelPresetSelector({
   const activePreset = supportsPresets
     ? presets.find((entry) => entry.name === trimmedPreset)
     : undefined;
-  const presetPinnedModel = activePreset ? (getCcPresetEffectiveModel(activePreset) ?? '') : '';
+  const presetModelOptions = activePreset
+    ? getCcPresetAvailableModelIds(activePreset)
+    : [];
+  const selectableModels = [...new Set([
+    ...(activePreset ? presetModelOptions : []),
+    ...modelOptions,
+  ])];
   const handlePresetSelect = (event: Event) => {
     const nextPreset = (event.target as HTMLSelectElement).value;
     const entry = presets.find((candidate) => candidate.name === nextPreset);
@@ -51,7 +62,7 @@ export function RuntimeModelPresetSelector({
   };
   const handleModelSelect = (event: Event) => onChange({
     model: (event.target as HTMLSelectElement).value,
-    preset: '',
+    preset: activePreset ? trimmedPreset : '',
   });
   if (modelOptions.length === 0 && (!supportsPresets || presets.length === 0)) return null;
 
@@ -84,20 +95,19 @@ export function RuntimeModelPresetSelector({
         <select
           class="input"
           aria-label={`${idPrefix}:model`}
-          value={activePreset ? presetPinnedModel : trimmedModel}
-          disabled={disabled || !!activePreset}
-          title={activePreset ? t('sharedContext.management.processingModelPresetTitle') : undefined}
+          value={trimmedModel}
+          disabled={disabled}
           onInput={handleModelSelect}
           onChange={handleModelSelect}
           style={{ width: '100%' }}
         >
-          {activePreset && !presetPinnedModel ? (
+          {activePreset && selectableModels.length === 0 ? (
             <option value="">{t('sharedContext.management.processingModelDefinedByPreset')}</option>
           ) : null}
-          {!activePreset && trimmedModel && !modelOptions.includes(trimmedModel) ? (
+          {trimmedModel && !selectableModels.includes(trimmedModel) ? (
             <option value={trimmedModel}>{trimmedModel}</option>
           ) : null}
-          {(activePreset && presetPinnedModel ? [presetPinnedModel] : modelOptions).map((modelId) => (
+          {selectableModels.map((modelId) => (
             <option key={`${idPrefix}:model:${backend}:${modelId}`} value={modelId}>{modelId}</option>
           ))}
         </select>

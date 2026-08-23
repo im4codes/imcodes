@@ -98,6 +98,12 @@ const MIN_ACTIONABLE_NEXT_ACTION_LENGTH = 12;
 
 export interface SupervisionBrokerRequest {
   snapshot: SessionSupervisionSnapshot | null | undefined;
+  /**
+   * Stable identity of the supervised session instance. The broker keeps one
+   * private provider conversation per identity so consecutive decisions have
+   * context without ever sharing a UUID across different sessions.
+   */
+  targetSessionId?: string;
   taskRequest: string;
   assistantResponse?: string;
   /**
@@ -135,6 +141,7 @@ const AUDIT_DEPTHS = new Set<SupervisionAuditDepth>(['standard', 'narrow']);
 const MIN_SUPERVISION_EXECUTION_BUDGET_MS = 5;
 const MAX_RECOVERABLE_PROVIDER_RETRIES = 2;
 const PROVIDER_RETRY_DELAYS_MS = [250, 750] as const;
+const SUPERVISOR_SESSION_IDLE_TTL_MS = 48 * 60 * 60 * 1_000;
 const NON_RETRYABLE_PROVIDER_ERROR_CODES = new Set<string>([
   PROVIDER_ERROR_CODES.AUTH_FAILED,
   PROVIDER_ERROR_CODES.CONFIG_ERROR,
@@ -149,6 +156,18 @@ type SupervisionExecutionError = Error & {
   supervisionProviderRetryable?: boolean;
   supervisionProviderAttempts?: number;
 };
+
+interface RetainedSupervisorRuntime {
+  provider: TransportProvider;
+  providerSessionId: string;
+  configKey: string;
+}
+
+interface RetainedSupervisorTarget {
+  sessionKey: string;
+  lastUsedAt: number;
+  runtimes: Map<string, RetainedSupervisorRuntime>;
+}
 
 function errorRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' && !Array.isArray(value)
@@ -439,6 +458,7 @@ export class SupervisionBroker {
   private readonly now: () => number;
   private readonly waitForRetry: (delayMs: number) => Promise<void>;
   private readonly queueChains = new Map<string, Promise<void>>();
+  private readonly retainedTargets = new Map<string, RetainedSupervisorTarget>();
 
   constructor(deps: SupervisionBrokerDeps = {}) {
     this.resolveProvider = deps.resolveProvider ?? ((backend) => ensureProviderConnected(backend, {}));
@@ -600,7 +620,7 @@ export class SupervisionBroker {
     while (true) {
       providerAttempts += 1;
       try {
-        return await this.evaluateInFreshProviderSession({
+        return await this.evaluateInProviderSession({
           provider,
           request,
           snapshot,
@@ -630,7 +650,7 @@ export class SupervisionBroker {
           providerErrorMessage: sanitizeMcpErrorMessage(normalized, 'provider error'),
           providerAttempt: providerAttempts,
           retryDelayMs: delayMs,
-        }, 'Supervisor provider decision failed; retrying in a fresh session');
+        }, 'Supervisor provider decision failed; retrying');
         await this.waitForRetry(delayMs);
       }
     }
@@ -642,7 +662,49 @@ export class SupervisionBroker {
     return remaining;
   }
 
-  private async evaluateInFreshProviderSession(input: {
+  private async releaseRetainedTarget(target: RetainedSupervisorTarget): Promise<void> {
+    await Promise.all([...target.runtimes.values()].map(async (runtime) => {
+      await runtime.provider.endSession(runtime.providerSessionId).catch(() => {});
+    }));
+    target.runtimes.clear();
+  }
+
+  private async getRetainedTarget(targetSessionId: string): Promise<RetainedSupervisorTarget> {
+    const now = this.now();
+    // Expiration is lazy but global: the next supervision decision releases
+    // every conversation that has been idle for 48 hours. Do not impose a
+    // lower arbitrary count cap — doing so would make an otherwise-active
+    // session unexpectedly lose context merely because many other sessions
+    // were supervised.
+    for (const [retainedSessionId, target] of this.retainedTargets) {
+      if (now - target.lastUsedAt < SUPERVISOR_SESSION_IDLE_TTL_MS) continue;
+      this.retainedTargets.delete(retainedSessionId);
+      await this.releaseRetainedTarget(target);
+    }
+    const existing = this.retainedTargets.get(targetSessionId);
+    if (existing && now - existing.lastUsedAt < SUPERVISOR_SESSION_IDLE_TTL_MS) {
+      existing.lastUsedAt = now;
+      // Keep insertion order aligned with recent use for diagnostics and
+      // predictable cleanup traversal.
+      this.retainedTargets.delete(targetSessionId);
+      this.retainedTargets.set(targetSessionId, existing);
+      return existing;
+    }
+    if (existing) {
+      this.retainedTargets.delete(targetSessionId);
+      await this.releaseRetainedTarget(existing);
+    }
+
+    const created: RetainedSupervisorTarget = {
+      sessionKey: randomUUID(),
+      lastUsedAt: now,
+      runtimes: new Map(),
+    };
+    this.retainedTargets.set(targetSessionId, created);
+    return created;
+  }
+
+  private async evaluateInProviderSession(input: {
     provider: TransportProvider;
     request: SupervisionBrokerRequest;
     snapshot: SessionSupervisionSnapshot;
@@ -652,17 +714,52 @@ export class SupervisionBroker {
     deadlineAt: number;
   }): Promise<SupervisionDecision> {
     const { provider, request, snapshot, cwd, resolved, effectiveAgentId, deadlineAt } = input;
-    const sessionKey = `deck_supervision_${randomUUID()}`;
+    const targetSessionId = request.targetSessionId?.trim();
+    const retainedTarget = targetSessionId
+      ? await this.getRetainedTarget(targetSessionId)
+      : undefined;
+    // Claude Code forwards sessionKey to `--session-id`, whose CLI contract
+    // requires an exact UUID. A supervised session instance retains this UUID
+    // for up to 48 idle hours; different instances never share one.
+    const sessionKey = retainedTarget?.sessionKey ?? randomUUID();
+    const configKey = JSON.stringify({
+      providerId: provider.id,
+      backend: snapshot.backend,
+      model: effectiveAgentId,
+      preset: snapshot.preset ?? '',
+      resolved: resolved.cacheKey,
+      cwd: cwd ?? '',
+    });
+    const retainedRuntime = retainedTarget?.runtimes.get(provider.id);
     let providerSessionId: string | undefined;
+    let shouldEndProviderSession = !retainedTarget;
     try {
-      providerSessionId = await provider.createSession({
-        sessionKey,
-        fresh: true,
-        cwd,
-        ...(effectiveAgentId ? { agentId: effectiveAgentId } : {}),
-        ...(resolved.env ? { env: resolved.env } : {}),
-        ...(resolved.settings ? { settings: resolved.settings } : {}),
-      });
+      if (retainedRuntime && retainedRuntime.configKey === configKey) {
+        providerSessionId = retainedRuntime.providerSessionId;
+      } else {
+        if (retainedRuntime) {
+          await retainedRuntime.provider.endSession(retainedRuntime.providerSessionId).catch(() => {});
+          retainedTarget?.runtimes.delete(provider.id);
+        }
+        providerSessionId = await provider.createSession({
+          sessionKey,
+          // Retained supervisor conversations own their provider state across
+          // decisions. Transient callers keep the historical fresh behaviour.
+          fresh: !retainedTarget,
+          cwd,
+          ...(effectiveAgentId ? { agentId: effectiveAgentId } : {}),
+          ...(resolved.env ? { env: resolved.env } : {}),
+          ...(resolved.settings ? { settings: resolved.settings } : {}),
+        });
+        if (retainedTarget) {
+          retainedTarget.runtimes.set(provider.id, {
+            provider,
+            providerSessionId,
+            configKey,
+          });
+          shouldEndProviderSession = false;
+        }
+      }
       // Supervision runs its own per-call onComplete/onError filtered by sid;
       // mark the sid so transport-relay's global onDelta drops its events
       // silently instead of per-delta "unresolved route" warnings.
@@ -695,7 +792,9 @@ export class SupervisionBroker {
     } finally {
       if (providerSessionId) {
         unmarkEphemeralProviderSid(providerSessionId);
-        await provider.endSession(providerSessionId).catch(() => {});
+        if (shouldEndProviderSession) {
+          await provider.endSession(providerSessionId).catch(() => {});
+        }
       }
     }
   }

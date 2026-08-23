@@ -2632,6 +2632,32 @@ afterEach(() => {
     expect(screen.getByRole('button', { name: 'propose_action' })).toBeDefined();
   });
 
+  it('shows OpenSpec to a shared participant using the owner project path', async () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        serverId="srv-shared"
+        activeSession={makeSession({
+          name: 'deck_shared_brain',
+          projectDir: '/owner/project',
+          agentType: 'codex-sdk',
+          runtimeType: 'transport',
+          sharedState: { effectiveRole: 'participant', status: 'active' },
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /openspec/i }));
+
+    expect(ws.fsListDir).toHaveBeenCalledWith(
+      '/owner/project/openspec/changes',
+      false,
+      false,
+    );
+  });
+
   it('limits openspec dropdown height to the visible space above the trigger', async () => {
     const rectSpy = vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function mockRect() {
       const el = this as HTMLElement;

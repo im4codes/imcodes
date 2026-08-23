@@ -715,6 +715,7 @@ describe('SessionSettingsDialog supervision', () => {
     const sent: Array<Record<string, unknown>> = [];
     const handlers = new Set<(message: unknown) => void>();
     const wsStub = {
+      connected: true,
       send(message: Record<string, unknown>) { sent.push(message); },
       onMessage(handler: (message: unknown) => void) {
         handlers.add(handler);
@@ -746,7 +747,11 @@ describe('SessionSettingsDialog supervision', () => {
 
     await waitFor(() => {
       expect(fetchSupervisorDefaultsMock).toHaveBeenCalled();
-      expect(sent.some((m) => m.type === 'cc.presets.list')).toBe(true);
+      expect(sent).toContainEqual(expect.objectContaining({
+        type: 'cc.presets.list',
+        requestId: expect.any(String),
+        sessionName: 'deck_proj_brain',
+      }));
     });
 
     // Dispatch the preset list inside `act` so preact flushes the state update
@@ -803,6 +808,7 @@ describe('SessionSettingsDialog supervision', () => {
     const sent: Array<Record<string, unknown>> = [];
     const handlers = new Set<(message: unknown) => void>();
     const wsStub = {
+      connected: true,
       send(message: Record<string, unknown>) { sent.push(message); },
       onMessage(handler: (message: unknown) => void) {
         handlers.add(handler);
@@ -835,7 +841,11 @@ describe('SessionSettingsDialog supervision', () => {
 
     await waitFor(() => {
       expect(fetchSupervisorDefaultsMock).toHaveBeenCalled();
-      expect(sent.some((m) => m.type === 'cc.presets.list')).toBe(true);
+      expect(sent).toContainEqual(expect.objectContaining({
+        type: 'cc.presets.list',
+        requestId: expect.any(String),
+        sessionName: 'deck_proj_brain',
+      }));
     });
 
     await act(async () => {
@@ -845,7 +855,7 @@ describe('SessionSettingsDialog supervision', () => {
           presets: [
             {
               name: 'MiniMax',
-              env: { ANTHROPIC_MODEL: 'MiniMax-M2.5' },
+              env: {},
               defaultModel: 'MiniMax-M2.5',
               availableModels: [
                 { id: 'MiniMax-M2.5' },
@@ -861,17 +871,50 @@ describe('SessionSettingsDialog supervision', () => {
       expect((screen.getByLabelText('supervision-defaults:preset') as HTMLSelectElement).value).toBe('MiniMax');
     });
     const globalSelector = within(screen.getByTestId('supervision-defaults-runtime-model-preset-selector'));
-    const pinnedModel = globalSelector.getByLabelText('supervision-defaults:model') as HTMLSelectElement;
-    expect(pinnedModel.value).toBe('MiniMax-M2.5');
-    expect(pinnedModel.disabled).toBe(true);
-    expect([...pinnedModel.options].some((option) => option.value === 'qwen3-coder-plus')).toBe(false);
+    const modelSelect = globalSelector.getByLabelText('supervision-defaults:model') as HTMLSelectElement;
+    expect(modelSelect.value).toBe('MiniMax-M2.5');
+    expect(modelSelect.disabled).toBe(false);
+    expect([...modelSelect.options].some((option) => option.value === 'MiniMax-M2.7')).toBe(true);
+    expect([...modelSelect.options].some((option) => option.value === 'qwen3-coder-plus')).toBe(false);
+
+    const modelRequest = await waitFor(() => {
+      const request = sent.find((message) => (
+        message.type === 'transport.list_models'
+        && message.agentType === 'qwen'
+        && message.ccPreset === 'MiniMax'
+      ));
+      expect(request).toBeDefined();
+      return request!;
+    });
+    expect(modelRequest.sessionName).toBe('deck_proj_brain');
+    await act(async () => {
+      for (const handler of handlers) {
+        handler({
+          type: 'transport.models_response',
+          requestId: modelRequest.requestId,
+          agentType: 'qwen',
+          ccPreset: 'MiniMax',
+          models: [
+            { id: 'MiniMax-M2.5' },
+            { id: 'MiniMax-M2.7' },
+            { id: 'MiniMax-M2.8' },
+          ],
+          defaultModel: 'MiniMax-M2.5',
+        });
+      }
+    });
+    await waitFor(() => {
+      expect([...modelSelect.options].some((option) => option.value === 'MiniMax-M2.8')).toBe(true);
+    });
+    changeSelect(modelSelect, 'MiniMax-M2.8');
+    expect((screen.getByLabelText('supervision-defaults:preset') as HTMLSelectElement).value).toBe('MiniMax');
 
     fireEvent.click(screen.getByRole('button', { name: /save/i }));
 
     await waitFor(() => {
       expect(saveSupervisorDefaultsMock).toHaveBeenCalledWith(expect.objectContaining({
         backend: 'qwen',
-        model: 'MiniMax-M2.5',
+        model: 'MiniMax-M2.8',
         preset: 'MiniMax',
       }));
     });

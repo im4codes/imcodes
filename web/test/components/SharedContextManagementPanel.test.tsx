@@ -621,6 +621,7 @@ describe('SharedContextManagementPanel', () => {
     const sent: Array<Record<string, unknown>> = [];
     const messageHandlers = new Set<(message: unknown) => void>();
     const ws = {
+      connected: true,
       send(message: Record<string, unknown>) {
         sent.push(message);
       },
@@ -665,13 +666,44 @@ describe('SharedContextManagementPanel', () => {
       expect((screen.getByLabelText('primary:model') as HTMLSelectElement).value).toBe('qwen-team-model');
     });
 
+    const modelRequest = await waitFor(() => {
+      const request = sent.find((message) => (
+        message.type === 'transport.list_models'
+        && message.agentType === 'qwen'
+        && message.ccPreset === 'Qwen Team'
+      ));
+      expect(request).toBeDefined();
+      return request!;
+    });
+    await act(async () => {
+      for (const handler of messageHandlers) {
+        handler({
+          type: 'transport.models_response',
+          requestId: modelRequest.requestId,
+          agentType: 'qwen',
+          ccPreset: 'Qwen Team',
+          models: [
+            { id: 'qwen-team-model' },
+            { id: 'qwen-team-model-v2' },
+          ],
+          defaultModel: 'qwen-team-model',
+        });
+      }
+    });
+    const primaryModel = screen.getByLabelText('primary:model') as HTMLSelectElement;
+    await waitFor(() => {
+      expect([...primaryModel.options].some((option) => option.value === 'qwen-team-model-v2')).toBe(true);
+    });
+    fireEvent.input(primaryModel, { target: { value: 'qwen-team-model-v2' } });
+    expect((screen.getByLabelText('primary:preset') as HTMLSelectElement).value).toBe('Qwen Team');
+
     await act(async () => {
       fireEvent.click(screen.getByText('sharedContext.management.processingSave'));
     });
 
     await waitFor(() => expect(updateSharedContextRuntimeConfigMock).toHaveBeenCalledWith('srv-1', {
       primaryContextBackend: 'qwen',
-      primaryContextModel: 'qwen-team-model',
+      primaryContextModel: 'qwen-team-model-v2',
       primaryContextPreset: 'Qwen Team',
       backupContextBackend: undefined,
       backupContextModel: undefined,

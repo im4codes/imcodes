@@ -1909,7 +1909,7 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
       void traceCommandAsync(cmd, 'web_command.openspec_auto_deliver', () => handleOpenSpecAutoDeliverCommand(cmd, serverLink));
       break;
     case CC_PRESET_MSG.LIST:
-      void handleCcPresetsList(serverLink);
+      void handleCcPresetsList(cmd, serverLink);
       break;
     case CC_PRESET_MSG.SAVE:
       void handleCcPresetsSave(cmd, serverLink).catch((err) => {
@@ -10951,10 +10951,17 @@ export async function listProviderSessions(providerId: string): Promise<Array<{ 
 
 // ── CC env presets ────────────────────────────────────────────────────────
 
-async function handleCcPresetsList(serverLink: ServerLink): Promise<void> {
+async function handleCcPresetsList(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
   const { loadPresets } = await import('./cc-presets.js');
   const presets = await loadPresets();
-  serverLink.send({ type: CC_PRESET_MSG.LIST_RESPONSE, presets });
+  const requestId = typeof cmd.requestId === 'string' ? cmd.requestId.trim() : '';
+  const sessionName = typeof cmd.sessionName === 'string' ? cmd.sessionName.trim() : '';
+  serverLink.send({
+    type: CC_PRESET_MSG.LIST_RESPONSE,
+    ...(requestId ? { requestId } : {}),
+    ...(sessionName ? { sessionName } : {}),
+    presets,
+  });
 }
 
 async function handleCcPresetsSave(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {

@@ -159,11 +159,15 @@ export function selectPresetModel(
   preset: Pick<CcPreset, 'availableModels' | 'defaultModel' | 'env'>,
   requestedModel?: string,
 ): string | undefined {
-  const availableModels = getPresetAvailableModelIds(preset);
-  const fallback = getPresetEffectiveModel(preset) ?? availableModels[0];
+  // Only a discovered catalogue is authoritative for membership. The helper
+  // also includes the preset's current default/env model, which made its list
+  // non-empty even when discovery had never run and accidentally rejected
+  // every deliberate model override as "not available".
+  const discoveredModels = (preset.availableModels ?? []).map((entry) => entry.id);
+  const fallback = getPresetEffectiveModel(preset) ?? discoveredModels[0];
   const requested = requestedModel?.trim();
   if (!requested) return fallback;
-  if (availableModels.length === 0 || availableModels.includes(requested)) return requested;
+  if (discoveredModels.length === 0 || discoveredModels.includes(requested)) return requested;
   return fallback;
 }
 
@@ -261,7 +265,7 @@ export async function getPresetTransportOverrides(
   };
 }
 
-export async function getQwenPresetTransportConfig(presetName: string): Promise<{
+export async function getQwenPresetTransportConfig(presetName: string, requestedModel?: string): Promise<{
   env: Record<string, string>;
   settings?: Record<string, unknown>;
   model?: string;
@@ -272,9 +276,9 @@ export async function getQwenPresetTransportConfig(presetName: string): Promise<
   const preset = await getPreset(presetName);
   if (!preset) return { env: {} };
 
-  const resolvedEnv = await resolvePresetEnv(presetName);
   const availableModels = getPresetAvailableModelIds(preset);
-  const model = getPresetEffectiveModel(preset) ?? availableModels[0];
+  const model = selectPresetModel(preset, requestedModel);
+  const resolvedEnv = await resolvePresetEnv(presetName, undefined, model);
   const baseUrl = resolvedEnv['ANTHROPIC_BASE_URL']?.trim() || undefined;
   const apiKey = resolvedEnv['ANTHROPIC_API_KEY']?.trim()
     || resolvedEnv['ANTHROPIC_AUTH_TOKEN']?.trim()

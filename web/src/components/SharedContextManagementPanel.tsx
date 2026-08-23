@@ -100,7 +100,8 @@ import { CapabilityInventoryPanel } from './CapabilityInventoryPanel.js';
 import { CAPABILITY_KIND } from '@shared/capability-management.js';
 import { ChatMarkdown } from './ChatMarkdown.js';
 import type { WsClient } from '../ws-client.js';
-import { CLAUDE_CODE_MODEL_IDS, CODEX_MODEL_IDS } from '../../../src/shared/models/options.js';
+import { useTransportModels } from '../hooks/useTransportModels.js';
+import { CLAUDE_CODE_MODEL_IDS, CODEX_MODEL_IDS, mergeModelSuggestions } from '../../../src/shared/models/options.js';
 import type { MemoryScoringWeights } from '@shared/memory-scoring.js';
 
 // ── Mobile detection ────────────────────────────────────────────────────────
@@ -1362,6 +1363,28 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
   const [memoryAdvancedVisible, setMemoryAdvancedVisible] = useState(false);
   const [processingPersonalSyncEnabled, setProcessingPersonalSyncEnabled] = useState(false);
   const [processingPresets, setProcessingPresets] = useState<RuntimeModelPresetEntry[]>([]);
+  const processingPrimaryDynamicModels = useTransportModels(
+    ws ?? null,
+    processingPrimaryPreset && doesSharedContextBackendSupportPresets(processingPrimaryBackend)
+      ? processingPrimaryBackend
+      : null,
+    processingPrimaryPreset || undefined,
+  );
+  const processingBackupDynamicModels = useTransportModels(
+    ws ?? null,
+    processingBackupPreset && doesSharedContextBackendSupportPresets(processingBackupBackend)
+      ? processingBackupBackend
+      : null,
+    processingBackupPreset || undefined,
+  );
+  const processingPrimaryModelOptions = useMemo(() => mergeModelSuggestions(
+    processingPrimaryPreset ? [] : (PROCESSING_MODEL_OPTIONS_BY_BACKEND[processingPrimaryBackend] ?? []),
+    processingPrimaryDynamicModels.models.map((entry) => entry.id),
+  ), [processingPrimaryBackend, processingPrimaryDynamicModels.models, processingPrimaryPreset]);
+  const processingBackupModelOptions = useMemo(() => mergeModelSuggestions(
+    processingBackupPreset ? [] : (PROCESSING_MODEL_OPTIONS_BY_BACKEND[processingBackupBackend] ?? []),
+    processingBackupDynamicModels.models.map((entry) => entry.id),
+  ), [processingBackupBackend, processingBackupDynamicModels.models, processingBackupPreset]);
   const [memoryLoading, setMemoryLoading] = useState(false);
   const [memoryProjectId, setMemoryProjectId] = useState('');
   const [selectedMemoryProjectId, setSelectedMemoryProjectId] = useState('');
@@ -3629,7 +3652,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                         model={processingPrimaryModel}
                         preset={processingPrimaryPreset}
                         presets={processingPresets}
-                        modelOptions={PROCESSING_MODEL_OPTIONS_BY_BACKEND[processingPrimaryBackend] ?? []}
+                        modelOptions={processingPrimaryModelOptions}
                         idPrefix="primary"
                         onChange={({ model, preset }) => {
                           setProcessingPrimaryModel(model);
@@ -3664,7 +3687,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                         model={processingBackupModel}
                         preset={processingBackupPreset}
                         presets={processingPresets}
-                        modelOptions={PROCESSING_MODEL_OPTIONS_BY_BACKEND[processingBackupBackend] ?? []}
+                        modelOptions={processingBackupModelOptions}
                         idPrefix="backup"
                         onChange={({ model, preset }) => {
                           setProcessingBackupModel(model);
