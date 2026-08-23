@@ -3,7 +3,6 @@ import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { describe, expect, it, vi } from 'vitest';
 import type { CapabilityService } from '../../shared/capability-management.js';
 import {
-  CAPABILITY_AI_SYSTEM_INSTRUCTIONS,
   CAPABILITY_ERROR,
   CAPABILITY_MCP_TOOL_CONTRACTS,
   CAPABILITY_MCP_TOOL_NAMES,
@@ -65,8 +64,6 @@ describe('capability MCP tools', () => {
   it('advertises exactly the four capability tools to an authenticated owner', async () => {
     await withClient(caller(), service(), async (client) => {
       const tools = (await client.listTools()).tools;
-      expect(client.getInstructions()).toBe(CAPABILITY_AI_SYSTEM_INSTRUCTIONS);
-      expect(client.getInstructions()).toContain('user asks in chat');
       const names = tools.map((tool) => tool.name);
       expect(names.filter((name) => name.startsWith('capability_'))).toEqual([...CAPABILITY_MCP_TOOL_NAMES]);
       for (const name of CAPABILITY_MCP_TOOL_NAMES) {

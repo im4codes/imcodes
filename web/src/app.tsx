@@ -6177,6 +6177,21 @@ export function App() {
             username={username}
             hasPassword={userHasPassword}
             serverUrl={auth?.baseUrl ?? nativeServerUrl}
+            serverId={selectedServerId}
+            canAskAi={Boolean(activeSession)}
+            onAskAi={(source) => {
+              const targetSession = focusedSubIdRef.current ? `deck_sub_${focusedSubIdRef.current}` : activeSession;
+              setShowSettingsPage(false);
+              if (!targetSession) return;
+              requestAnimationFrame(() => {
+                const input = inputRefsMap.current.get(targetSession);
+                if (!input) return;
+                appendContentEditableTextPreservingNewlines(
+                  input,
+                  `${input.textContent?.trim() ? '\n' : ''}${trans('capabilities.askAiPrompt', { source })}`,
+                );
+              });
+            }}
             onBack={() => setShowSettingsPage(false)}
             onDisplayNameChanged={(name) => setUserDisplayName(name)}
             onUserAuthUpdated={(next) => {

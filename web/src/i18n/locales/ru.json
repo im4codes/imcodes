@@ -2268,8 +2268,7 @@
         "knowledge": "Знания",
         "processing": "Обработка",
         "memory": "Память",
-        "mcp": "MCP",
-        "skills": "Skills"
+        "mcp": "MCP"
       },
       "policyTitle": "Project policy",
       "policyLoading": "Loading saved policy…",
@@ -2482,22 +2481,6 @@
       "memoryToolTabSkills": "Skills",
       "memoryToolTabMdIngest": "Markdown",
       "memoryToolTabObservations": "Observations",
-      "capabilityInventoryLoadError": "Не удалось загрузить установленные возможности.",
-      "capabilityBindingTarget": "{{scope}} · {{target}}",
-      "capabilityDeleteConfirm": "Удалить {{name}} из {{binding}}? Будет удалена только эта точная привязка.",
-      "capabilityDeleteIntent": "Удалить из общего контекста точную установленную привязку {{name}}.",
-      "capabilityDeleteError": "Не удалось удалить установленную привязку.",
-      "capabilityInventory": {
-        "chatInstallHint": "Чтобы установить или изменить MCP-сервис или Skill, попросите ИИ прямо в чате. Эта страница предназначена только для просмотра и удаления точных привязок.",
-        "noServer": "Выберите подключённый сервер, чтобы увидеть установленные возможности.",
-        "searchPlaceholder": "Поиск по именам, источникам, версиям или инструментам",
-        "searchLabel": "Поиск установленных возможностей",
-        "bindingActive": "Активная привязка",
-        "bindingInactive": "Неактивная привязка",
-        "delete": "Удалить",
-        "mcp": { "title": "Установленные MCP-сервисы", "description": "MCP-сервисы из управляемого реестра возможностей этого сервера.", "empty": "MCP-сервисы не установлены. Чтобы добавить сервис, попросите ИИ в чате." },
-        "skills": { "title": "Установленные Skills", "description": "Проверенные Agent Skills из управляемого реестра возможностей этого сервера.", "empty": "Управляемые Skills не установлены. Чтобы добавить Skill, попросите ИИ в чате." }
-      },
       "mcpTitle": "Model Context Protocol",
       "mcpSummaryLine1": "Управляемые провайдеры могут открывать одиннадцать runtime-scoped MCP tools через server под контролем daemon: memory search, recent summaries, source lookup, observation/preference writes, scoped Send и Cron scheduling.",
       "mcpSummaryLine2": "Memory tools возвращают compact hits с ref и projectionId; list_memory_summaries получает recent digests, а get_memory_sources разворачивает relevant hits, когда важны точные прошлые инструкции, bug details или source evidence.",

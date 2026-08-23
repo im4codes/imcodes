@@ -2269,8 +2269,7 @@
         "knowledge": "지식",
         "processing": "처리",
         "memory": "메모리",
-        "mcp": "MCP",
-        "skills": "Skills"
+        "mcp": "MCP"
       },
       "policyTitle": "Project policy",
       "policyLoading": "Loading saved policy…",
@@ -2483,22 +2482,6 @@
       "memoryToolTabSkills": "Skills",
       "memoryToolTabMdIngest": "Markdown",
       "memoryToolTabObservations": "Observations",
-      "capabilityInventoryLoadError": "설치된 기능을 불러올 수 없습니다.",
-      "capabilityBindingTarget": "{{scope}} · {{target}}",
-      "capabilityDeleteConfirm": "{{binding}}에서 {{name}}을(를) 삭제할까요? 해당 정확한 바인딩만 제거됩니다.",
-      "capabilityDeleteIntent": "공유 컨텍스트에서 {{name}}의 정확한 설치 바인딩을 삭제합니다.",
-      "capabilityDeleteError": "설치된 바인딩을 삭제할 수 없습니다.",
-      "capabilityInventory": {
-        "chatInstallHint": "MCP 서비스나 Skill을 설치하거나 변경하려면 AI 채팅에서 직접 요청하세요. 이 페이지는 목록 확인과 정확한 바인딩 삭제 전용입니다.",
-        "noServer": "연결된 서버를 선택해 설치된 기능을 확인하세요.",
-        "searchPlaceholder": "설치된 이름, 소스, 버전 또는 도구 검색",
-        "searchLabel": "설치된 기능 검색",
-        "bindingActive": "활성 바인딩",
-        "bindingInactive": "비활성 바인딩",
-        "delete": "삭제",
-        "mcp": { "title": "설치된 MCP 서비스", "description": "이 서버의 관리형 capability registry에서 사용할 수 있는 MCP 서비스입니다.", "empty": "설치된 MCP 서비스가 없습니다. 추가하려면 채팅에서 AI에게 요청하세요." },
-        "skills": { "title": "설치된 Skills", "description": "이 서버의 관리형 capability registry에서 사용할 수 있는 감사된 Agent Skills입니다.", "empty": "설치된 관리형 Skill이 없습니다. 추가하려면 채팅에서 AI에게 요청하세요." }
-      },
       "mcpTitle": "Model Context Protocol",
       "mcpSummaryLine1": "관리형 provider는 daemon-controlled MCP server를 통해 11개의 runtime-scoped tools를 노출할 수 있습니다: memory search/recent summaries/source lookup, observation/preference writes, scoped Send, Cron scheduling.",
       "mcpSummaryLine2": "Memory tools는 ref와 projectionId가 포함된 compact hits를 반환합니다. list_memory_summaries는 recent digests를 가져오고, 정확한 과거 지시, bug details, source evidence가 필요할 때 get_memory_sources가 relevant hits를 확장할 수 있습니다.",

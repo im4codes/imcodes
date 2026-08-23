@@ -2346,8 +2346,7 @@
         "knowledge": "Knowledge",
         "processing": "Processing",
         "memory": "Memory",
-        "mcp": "MCP",
-        "skills": "Skills"
+        "mcp": "MCP"
       },
       "policyTitle": "Project policy",
       "policyLoading": "Loading saved policy…",
@@ -2560,22 +2559,6 @@
       "memoryToolTabSkills": "Skills",
       "memoryToolTabMdIngest": "Markdown",
       "memoryToolTabObservations": "Observations",
-      "capabilityInventoryLoadError": "Installed capabilities could not be loaded.",
-      "capabilityBindingTarget": "{{scope}} · {{target}}",
-      "capabilityDeleteConfirm": "Delete {{name}} from {{binding}}? This removes only that exact binding.",
-      "capabilityDeleteIntent": "Delete the exact installed binding for {{name}} from Shared Context.",
-      "capabilityDeleteError": "The installed binding could not be deleted.",
-      "capabilityInventory": {
-        "chatInstallHint": "To install or change an MCP service or Skill, ask the AI directly in its chat. This page is only for inventory and exact-binding deletion.",
-        "noServer": "Select a connected server to view installed capabilities.",
-        "searchPlaceholder": "Search installed names, sources, versions, or tools",
-        "searchLabel": "Search installed capabilities",
-        "bindingActive": "Active binding",
-        "bindingInactive": "Inactive binding",
-        "delete": "Delete",
-        "mcp": { "title": "Installed MCP services", "description": "MCP services available through the managed capability registry on this server.", "empty": "No MCP services are installed. Ask the AI in chat when you want to add one." },
-        "skills": { "title": "Installed Skills", "description": "Audited Agent Skills available through the managed capability registry on this server.", "empty": "No managed Skills are installed. Ask the AI in chat when you want to add one." }
-      },
       "mcpTitle": "Model Context Protocol",
       "mcpSummaryLine1": "Managed providers can expose eleven runtime-scoped MCP tools through the daemon-controlled server: memory search/recent summaries/source lookup, observation and preference writes, scoped Send, and Cron scheduling.",
       "mcpSummaryLine2": "Memory tools return compact hits with refs and projectionId values; list_memory_summaries pulls recent digests, and get_memory_sources expands relevant hits when exact prior instructions, bug details, or source evidence matter.",

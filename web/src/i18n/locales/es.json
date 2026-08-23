@@ -2273,8 +2273,7 @@
         "knowledge": "Conocimiento",
         "processing": "Procesamiento",
         "memory": "Memoria",
-        "mcp": "MCP",
-        "skills": "Skills"
+        "mcp": "MCP"
       },
       "policyTitle": "Project policy",
       "policyLoading": "Loading saved policy…",
@@ -2487,22 +2486,6 @@
       "memoryToolTabSkills": "Skills",
       "memoryToolTabMdIngest": "Markdown",
       "memoryToolTabObservations": "Observations",
-      "capabilityInventoryLoadError": "No se pudieron cargar las capacidades instaladas.",
-      "capabilityBindingTarget": "{{scope}} · {{target}}",
-      "capabilityDeleteConfirm": "¿Eliminar {{name}} de {{binding}}? Solo se quitará esa vinculación exacta.",
-      "capabilityDeleteIntent": "Eliminar de Contexto compartido la vinculación instalada exacta de {{name}}.",
-      "capabilityDeleteError": "No se pudo eliminar la vinculación instalada.",
-      "capabilityInventory": {
-        "chatInstallHint": "Para instalar o cambiar un servicio MCP o Skill, pídeselo directamente a la IA en el chat. Esta página solo muestra el inventario y permite borrar vinculaciones exactas.",
-        "noServer": "Selecciona un servidor conectado para ver las capacidades instaladas.",
-        "searchPlaceholder": "Buscar nombres, fuentes, versiones o herramientas instaladas",
-        "searchLabel": "Buscar capacidades instaladas",
-        "bindingActive": "Vinculación activa",
-        "bindingInactive": "Vinculación inactiva",
-        "delete": "Eliminar",
-        "mcp": { "title": "Servicios MCP instalados", "description": "Servicios MCP disponibles en el registro de capacidades gestionado de este servidor.", "empty": "No hay servicios MCP instalados. Pídeselo a la IA en el chat cuando quieras añadir uno." },
-        "skills": { "title": "Skills instalados", "description": "Agent Skills auditados disponibles en el registro de capacidades gestionado de este servidor.", "empty": "No hay Skills gestionados instalados. Pídeselo a la IA en el chat cuando quieras añadir uno." }
-      },
       "mcpTitle": "Protocolo de contexto de modelo",
       "mcpSummaryLine1": "Los providers gestionados pueden exponer once herramientas MCP con alcance de runtime mediante el servidor controlado por el daemon: búsqueda de memoria, summaries recientes, fuentes, escrituras de observaciones y preferencias, Send con alcance y programación Cron.",
       "mcpSummaryLine2": "Las herramientas de memoria devuelven hits compactos con ref y projectionId; list_memory_summaries trae resúmenes recientes y get_memory_sources expande hits cuando importan instrucciones previas exactas, detalles de bugs o evidencia fuente.",

@@ -2314,8 +2314,7 @@
         "knowledge": "知识库",
         "processing": "处理",
         "memory": "记忆",
-        "mcp": "MCP",
-        "skills": "Skills"
+        "mcp": "MCP"
       },
       "policyTitle": "项目策略",
       "policyLoading": "正在加载已保存策略…",
@@ -2528,22 +2527,6 @@
       "memoryToolTabSkills": "技能",
       "memoryToolTabMdIngest": "Markdown",
       "memoryToolTabObservations": "观察记录",
-      "capabilityInventoryLoadError": "无法加载已安装能力。",
-      "capabilityBindingTarget": "{{scope}} · {{target}}",
-      "capabilityDeleteConfirm": "从 {{binding}} 删除 {{name}}？只会移除这个精确绑定。",
-      "capabilityDeleteIntent": "从共享上下文删除 {{name}} 的精确已安装绑定。",
-      "capabilityDeleteError": "无法删除这个已安装绑定。",
-      "capabilityInventory": {
-        "chatInstallHint": "要安装或修改 MCP 服务、Skill，请直接在对应 AI 的聊天框里提出。此页面只用于查看库存和删除精确绑定。",
-        "noServer": "请选择已连接的服务器以查看已安装能力。",
-        "searchPlaceholder": "搜索已安装名称、来源、版本或工具",
-        "searchLabel": "搜索已安装能力",
-        "bindingActive": "绑定已启用",
-        "bindingInactive": "绑定未启用",
-        "delete": "删除",
-        "mcp": { "title": "已安装 MCP 服务", "description": "当前服务器上由托管能力注册表提供的 MCP 服务。", "empty": "尚未安装 MCP 服务。需要添加时，请直接在聊天中告诉 AI。" },
-        "skills": { "title": "已安装 Skills", "description": "当前服务器上由托管能力注册表提供的、已审计 Agent Skills。", "empty": "尚未安装托管 Skill。需要添加时，请直接在聊天中告诉 AI。" }
-      },
       "mcpTitle": "模型上下文协议",
       "mcpSummaryLine1": "托管 provider 可通过 daemon 控制的 MCP 服务器暴露十一个运行时作用域工具：记忆搜索/最近 summary/来源查看、观察记录和偏好写入、Scoped Send，以及 Cron 调度。",
       "mcpSummaryLine2": "记忆工具会返回带 ref 和 projectionId 的紧凑命中；list_memory_summaries 可拉取最近摘要，当需要精确历史指令、bug 细节或来源证据时，get_memory_sources 可展开相关命中。",
