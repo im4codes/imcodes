@@ -66,6 +66,8 @@ vi.mock('../../src/hooks/useMachines.js', () => ({
 
 vi.mock('../../src/api.js', () => ({
   uploadFile: vi.fn(),
+  fetchSessionSupervisorDefaults: vi.fn().mockResolvedValue(null),
+  saveSessionSupervisorDefaults: vi.fn().mockResolvedValue({}),
   getUserPref: vi.fn().mockResolvedValue(null),
   saveUserPref: vi.fn().mockResolvedValue(undefined),
   onUserPrefChanged: vi.fn(() => () => {}),
