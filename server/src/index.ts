@@ -37,6 +37,7 @@ import { pushRoutes } from './routes/push.js';
 import { quickDataRoutes } from './routes/quick-data.js';
 import { watchRoutes } from './routes/watch.js';
 import { messagePinRoutes } from './routes/message-pins.js';
+import { capabilityRoutes } from './routes/capabilities.js';
 import { memoryRoutes } from './routes/memory.js';
 import { sessionMgmtRoutes } from './routes/session-mgmt.js';
 import { subSessionRoutes } from './routes/sub-sessions.js';
@@ -59,6 +60,11 @@ import { COOKIE_SESSION, COOKIE_PREVIEW_ACCESS } from '../../shared/cookie-names
 import { healthCheckCron } from './cron/health-check.js';
 import { jobDispatchCron } from './cron/job-dispatch.js';
 import { memoryPruningCron } from './cron/memory-pruning.js';
+import {
+  expireCapabilityPendingActivations,
+  sweepExpiredCapabilityHistory,
+  sweepExpiredCapabilityPreActivationOperations,
+} from './db/capabilities.js';
 import { SERVER_WS_MAX_PAYLOAD_BYTES, WsBridge } from './ws/bridge.js';
 import {
   REMOTE_DESKTOP_SERVER_ID_QUERY,
@@ -189,6 +195,7 @@ export function buildApp(env: Env) {
   app.route('/api/quick-data', quickDataRoutes);
   app.route('/api', watchRoutes);
   app.route('/api', messagePinRoutes);
+  app.route('/api', capabilityRoutes);
   app.route('/api', tabSharingRoutes);
   app.route('/api', tokenUsageRoutes);
   // Pod-sticky memory routes: serverId is read from the `?serverId=` query
@@ -678,6 +685,12 @@ function scheduleCrons(env: Env) {
   });
   cron.schedule('* * * * *', () => {
     jobDispatchCron(env).catch((err) => logger.error({ err }, 'Job dispatch cron failed'));
+    sweepExpiredCapabilityPreActivationOperations(env.DB)
+      .catch((err) => logger.error({ err }, 'Capability pre-activation expiry sweep failed'));
+    expireCapabilityPendingActivations(env.DB)
+      .catch((err) => logger.error({ err }, 'Capability candidate expiry sweep failed'));
+    sweepExpiredCapabilityHistory(env.DB)
+      .catch((err) => logger.error({ err }, 'Capability retention sweep failed'));
   });
   logger.info({}, 'Cron jobs scheduled');
 }

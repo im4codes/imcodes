@@ -21,6 +21,41 @@ import { MemoryRateLimiter } from './rate-limiter.js';
 import { randomHex, sha256Hex } from '../security/crypto.js';
 import { resolveServerRole } from '../security/authorization.js';
 import { DAEMON_MSG } from '../../../shared/daemon-events.js';
+import type {
+  CapabilityFinding,
+  CapabilityInstallState,
+  CapabilityOperationActivateFrame,
+  CapabilityOperationCommitAckFrame,
+  CapabilityOperationCommitAbortFrame,
+  CapabilityOperationCommitResultFrame,
+  CapabilityOperationCancelFrame,
+  CapabilityOperationConfirmFrame,
+  CapabilityOperationInstallFrame,
+  CapabilityOperationProgressFrame,
+  CapabilityOperationManageFrame,
+  CapabilityOperationManageAckFrame,
+  CapabilityOperationManageResultFrame,
+} from '../../../shared/capability-management.js';
+import {
+  CAPABILITY_BLOB_ACTION,
+  CAPABILITY_AUDIT_VERDICT,
+  CAPABILITY_ERROR,
+  CAPABILITY_FINDING_SEVERITY,
+  CAPABILITY_KIND,
+  CAPABILITY_INSTALL_STATE,
+  CAPABILITY_LIMITS,
+  CAPABILITY_MANAGE_ACTION,
+  CAPABILITY_MANAGE_PHASE,
+  CAPABILITY_MANAGE_RESULT_PHASE,
+  CAPABILITY_OPERATION_MSG,
+  CAPABILITY_READINESS,
+  CAPABILITY_SCOPE,
+  CAPABILITY_SOURCE_KIND,
+  CAPABILITY_SYNC_MSG,
+  isCapabilityInstallState,
+  normalizeCapabilityMcpDefinition,
+} from '../../../shared/capability-management.js';
+import { issueCapabilityBlobAccess } from '../services/capability-package-storage.js';
 import { CRON_MSG, normalizeCronExecutionDetail } from '../../../shared/cron-types.js';
 import {
   abandonPriorGenerations,
@@ -161,9 +196,41 @@ import { isStreamingResponse } from '../../../shared/preview-stream-policy.js';
 import { getSessionRuntimeType } from '../../../shared/agent-types.js';
 import { LocalWebPreviewRegistry, setPreviewActiveRelayHook, setPreviewEvictedHook } from '../preview/registry.js';
 import { updateServerHeartbeat, updateServerStatus, upsertDiscussion, insertDiscussionRound, createSubSession, getSubSessionById, updateSubSession, upsertOrchestrationRun, updateProviderStatus, clearProviderStatus, updateProviderRemoteSessions, upsertSessionTextTailCacheEvent, getUserPref, setUserPref, deleteUserPref, getDbSessionsByServer, getUserById, insertDiscussionComment } from '../db/queries.js';
+import {
+  activateCapabilityVersion,
+  advanceCapabilityOperation,
+  updateCapabilityOperation,
+  acknowledgeCapabilityReadiness,
+  completeCapabilityCommit,
+  expireCapabilityPendingActivations,
+  expireCapabilityPreActivationOperations,
+  failCapabilityOperationsForDisconnectedServer,
+  getCapabilityOperation,
+  getCapabilitySyncSnapshot,
+  getCapabilityAuthorityRecordSet,
+  getPendingCapabilityAuthorization,
+  listPendingCapabilityAuthorizations,
+  listPendingCapabilityBlobUploads,
+  failCapabilityPendingActivation,
+  advanceLocalCapabilityManageResult,
+  markLocalCapabilityManageCommitSent,
+  listReplayableLocalCapabilityManageRequests,
+  manageCapability,
+  type LocalCapabilityManageRequestView,
+} from '../db/capabilities.js';
 import { toDiscussionCommentView } from '../share/discussion-comment-view.js';
 import { resolveCoveredSessionNames } from '../share/covered-sessions.js';
 import logger from '../util/logger.js';
+import {
+  toCapabilityOperationAuthorizeFrame,
+  toCapabilitySummary,
+  toCapabilitySyncSnapshot,
+  toCapabilitySyncAuthorityFrame,
+} from '../services/capability-wire.js';
+import {
+  createCapabilityAuthorizationSigner,
+  type CapabilityAuthorizationSigner,
+} from '../services/capability-authorization.js';
 import {
   TIMELINE_DELIVERY_METRICS,
   countableTimelineEventType,
@@ -1189,6 +1256,74 @@ export function __setShareBridgeClockForTests(clock: (() => number) | null): voi
  */
 const SHARE_COVERAGE_MAX_STALENESS_MS = 60_000;
 
+function capabilityOpaqueId(value: unknown): string | null {
+  return typeof value === 'string' && value.trim() && value.length <= 128 ? value : null;
+}
+
+function capabilityDigest(value: unknown): string | null {
+  return typeof value === 'string' && /^[0-9a-f]{64}$/.test(value) ? value : null;
+}
+
+function capabilityStringList(value: unknown, max: number): string[] | null {
+  if (!Array.isArray(value) || value.length > max) return null;
+  const output: string[] = [];
+  for (const entry of value) {
+    if (typeof entry !== 'string' || entry.length > CAPABILITY_LIMITS.FINDING_TEXT_BYTES) return null;
+    output.push(entry);
+  }
+  return output;
+}
+
+function sanitizeCapabilityFindings(value: unknown): CapabilityFinding[] | null {
+  if (!Array.isArray(value) || value.length > CAPABILITY_LIMITS.FINDINGS) return null;
+  const output: CapabilityFinding[] = [];
+  for (const raw of value) {
+    if (typeof raw !== 'object' || raw === null) return null;
+    const finding = raw as Record<string, unknown>;
+    if (typeof finding.code !== 'string'
+      || finding.code.length > 128
+      || typeof finding.message !== 'string'
+      || finding.message.length > CAPABILITY_LIMITS.FINDING_TEXT_BYTES
+      || typeof finding.severity !== 'string'
+      || !Object.values(CAPABILITY_FINDING_SEVERITY).includes(finding.severity as CapabilityFinding['severity'])
+      || typeof finding.source !== 'string'
+      || !['scanner', 'auditor', 'runtime'].includes(finding.source)
+      || typeof finding.blocking !== 'boolean') return null;
+    output.push({
+      code: finding.code,
+      severity: finding.severity as CapabilityFinding['severity'],
+      message: finding.message,
+      ...(typeof finding.path === 'string' ? { path: finding.path.slice(0, CAPABILITY_LIMITS.PATH_BYTES) } : {}),
+      ...(typeof finding.remediation === 'string'
+        ? { remediation: finding.remediation.slice(0, CAPABILITY_LIMITS.FINDING_TEXT_BYTES) }
+        : {}),
+      source: finding.source as CapabilityFinding['source'],
+      blocking: finding.blocking,
+    });
+  }
+  return output;
+}
+
+function toCapabilityManageJournalFrame(
+  request: LocalCapabilityManageRequestView,
+  phase: typeof CAPABILITY_MANAGE_PHASE[keyof typeof CAPABILITY_MANAGE_PHASE],
+): CapabilityOperationManageFrame {
+  return {
+    type: CAPABILITY_OPERATION_MSG.MANAGE,
+    requestId: request.requestId,
+    phase,
+    ownerId: request.ownerUserId,
+    serverId: request.serverId,
+    capabilityId: request.itemId,
+    bindingId: request.bindingId,
+    action: request.action,
+    expectedRevision: request.expectedRevision,
+    authorityRevision: request.authorityRevision,
+    ...(request.targetVersionId ? { versionId: request.targetVersionId } : {}),
+    ...(request.authorization ? { authorization: request.authorization } : {}),
+  };
+}
+
 export class WsBridge {
   private static instances = new Map<string, WsBridge>();
 
@@ -1197,6 +1332,14 @@ export class WsBridge {
   private daemonGeneration = 0;
   /** Persistent JWT key used only for stateless direct-file lease resume tickets. */
   private directFileTransferTicketSigningKey: string | null = null;
+  private capabilityBlobSigningKey: string | null = null;
+  private capabilityAuthorizationSigner: CapabilityAuthorizationSigner | null = null;
+  private pendingCapabilityManage = new Map<string, {
+    ownerUserId: string;
+    frame: CapabilityOperationManageFrame;
+    resolve: (result: CapabilityOperationManageResultFrame | null) => void;
+    timer: ReturnType<typeof setTimeout>;
+  }>();
 
   /** Count of inbound frames dropped from CONTROLLED nodes by the 10.2 allowlist (diagnostics/tests). */
   static controlledInboundDropped = 0;
@@ -1212,6 +1355,8 @@ export class WsBridge {
   private daemonVersion: string | null = null;
   private daemonControlledOs: ControlledNodeOs | null = null;
   private daemonOwnerUserId: string | null = null;
+  private lastCapabilityRevisionSent = 0;
+  private capabilitySyncInitialized = false;
   private legacyUpgradeRescuePreparedGeneration: number | null = null;
   /** A safe-self-upgrade node can still retain its process-local latch when a
    *  detached task fails before replacing the process. Arm the same verified
@@ -1538,6 +1683,1055 @@ export class WsBridge {
 
   static getAll(): Map<string, WsBridge> {
     return WsBridge.instances;
+  }
+
+  /** Immediate same-process fan-out; heartbeat revision checks cover other pods. */
+  static async broadcastCapabilitySync(
+    ownerUserId: string,
+    db: Database,
+    afterRevision: number,
+  ): Promise<number> {
+    const record = await getCapabilitySyncSnapshot(db, {
+      ownerUserId,
+      maxItems: CAPABILITY_LIMITS.LIST_MAX,
+      afterRevision,
+    });
+    let delivered = 0;
+    for (const bridge of WsBridge.instances.values()) {
+      if (!bridge.canAcceptCapabilityOperation(ownerUserId)
+        || !bridge.daemonWs
+        || !bridge.capabilitySyncInitialized) continue;
+      try {
+        const keys = bridge.capabilityAuthorizationSigner ? [bridge.capabilityAuthorizationSigner.key] : [];
+        bridge.daemonWs.send(JSON.stringify(toCapabilitySyncSnapshot(
+          record,
+          CAPABILITY_SYNC_MSG.DELTA,
+          keys,
+        )));
+        const authority = await getCapabilityAuthorityRecordSet(db, {
+          ownerUserId,
+          serverId: bridge.serverId,
+        });
+        bridge.daemonWs.send(JSON.stringify(toCapabilitySyncAuthorityFrame(authority, keys)));
+        bridge.lastCapabilityRevisionSent = record.revision;
+        delivered += 1;
+      } catch (error) {
+        logger.warn({ error, serverId: bridge.serverId }, 'Capability sync fan-out failed');
+      }
+    }
+    return delivered;
+  }
+
+  static async dispatchPendingCapabilityAuthorization(
+    ownerUserId: string,
+    db: Database,
+    operationId: string,
+  ): Promise<boolean> {
+    const pending = await getPendingCapabilityAuthorization(db, { ownerUserId, operationId });
+    if (!pending) return false;
+    const bridge = WsBridge.instances.get(pending.targetServerId);
+    if (!bridge?.canAcceptCapabilityOperation(ownerUserId)
+      || !bridge.daemonWs
+      || !bridge.capabilityAuthorizationSigner) return false;
+    try {
+      bridge.daemonWs.send(JSON.stringify(toCapabilityOperationAuthorizeFrame(
+        pending,
+        [bridge.capabilityAuthorizationSigner.key],
+      )));
+      return true;
+    } catch (error) {
+      logger.warn({ error, serverId: pending.targetServerId, operationId }, 'Capability authorization dispatch failed');
+      return false;
+    }
+  }
+
+  /**
+   * True only for the authenticated same-account FULL daemon currently bound
+   * to this bridge. HTTP capability intake uses this before creating durable
+   * queued work so an offline/wrong-account/controlled target fails fast.
+   */
+  canAcceptCapabilityOperation(ownerUserId: string): boolean {
+    return this.authenticated
+      && this.daemonNodeRole === NODE_ROLE.FULL
+      && this.daemonOwnerUserId === ownerUserId
+      && this.daemonWs?.readyState === WebSocket.OPEN;
+  }
+
+  /** Operation install frames are live-generation control messages, never replayed. */
+  dispatchCapabilityInstall(ownerUserId: string, frame: CapabilityOperationInstallFrame): boolean {
+    if (!this.canAcceptCapabilityOperation(ownerUserId) || !this.daemonWs) return false;
+    try {
+      this.daemonWs.send(JSON.stringify(frame));
+      return true;
+    } catch (error) {
+      logger.warn({ error, serverId: this.serverId }, 'Capability install dispatch failed');
+      return false;
+    }
+  }
+
+  /** Browser confirmation is delivered live to the same owner daemon only. */
+  dispatchCapabilityConfirmation(ownerUserId: string, frame: CapabilityOperationConfirmFrame): boolean {
+    if (!this.canAcceptCapabilityOperation(ownerUserId) || !this.daemonWs) return false;
+    try {
+      this.daemonWs.send(JSON.stringify(frame));
+      return true;
+    } catch (error) {
+      logger.warn({ error, serverId: this.serverId }, 'Capability confirmation dispatch failed');
+      return false;
+    }
+  }
+
+  /** Owner cancellation is authoritative server-side; delivery only cleans up live work. */
+  dispatchCapabilityCancellation(ownerUserId: string, frame: CapabilityOperationCancelFrame): boolean {
+    if (!this.canAcceptCapabilityOperation(ownerUserId) || !this.daemonWs) return false;
+    try {
+      this.daemonWs.send(JSON.stringify(frame));
+      return true;
+    } catch (error) {
+      logger.warn({ error, serverId: this.serverId }, 'Capability cancellation dispatch failed');
+      return false;
+    }
+  }
+
+  /** Local authority mutates only after the exact daemon reports durable success. */
+  dispatchCapabilityManage(
+    ownerUserId: string,
+    frame: CapabilityOperationManageFrame,
+    timeoutMs = 10_000,
+  ): Promise<CapabilityOperationManageResultFrame | null> {
+    if (!this.canAcceptCapabilityOperation(ownerUserId) || !this.daemonWs) return Promise.resolve(null);
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        const pending = this.pendingCapabilityManage.get(frame.requestId);
+        if (!pending) return;
+        this.pendingCapabilityManage.delete(frame.requestId);
+        pending.resolve(null);
+      }, timeoutMs);
+      timer.unref?.();
+      this.pendingCapabilityManage.set(frame.requestId, { ownerUserId, frame, resolve, timer });
+      try {
+        this.daemonWs!.send(JSON.stringify(frame));
+      } catch (error) {
+        clearTimeout(timer);
+        this.pendingCapabilityManage.delete(frame.requestId);
+        logger.warn({ error, serverId: this.serverId, requestId: frame.requestId }, 'Capability manage dispatch failed');
+        resolve(null);
+      }
+    });
+  }
+
+  private rejectPendingCapabilityManage(): void {
+    for (const [requestId, pending] of this.pendingCapabilityManage) {
+      clearTimeout(pending.timer);
+      this.pendingCapabilityManage.delete(requestId);
+      pending.resolve(null);
+    }
+  }
+
+  private failDisconnectedCapabilityOperations(db: Database, ownerUserId: string): void {
+    this.rejectPendingCapabilityManage();
+    void failCapabilityOperationsForDisconnectedServer(db, {
+      ownerUserId,
+      serverId: this.serverId,
+    }).then((operations) => {
+      for (const operation of operations) {
+        this.broadcastToBrowsers(JSON.stringify({
+          type: CAPABILITY_OPERATION_MSG.PROGRESS,
+          operationId: operation.id,
+          revision: operation.revision,
+          state: operation.state,
+          errorCode: operation.errorCode,
+        }));
+      }
+    }).catch((error: unknown) => {
+      logger.warn({ error, serverId: this.serverId }, 'Failed to terminate disconnected capability operations');
+    });
+  }
+
+  private async sendCapabilitySnapshot(
+    db: Database,
+    socket: WebSocket,
+    expectedGeneration: number,
+    afterRevision?: number,
+  ): Promise<void> {
+    const ownerUserId = this.daemonOwnerUserId;
+    if (!ownerUserId || !this.canAcceptCapabilityOperation(ownerUserId)) return;
+    await this.expirePreActivationCapabilityOperations(
+      db,
+      socket,
+      expectedGeneration,
+      ownerUserId,
+    );
+    const record = await getCapabilitySyncSnapshot(db, {
+      ownerUserId,
+      maxItems: CAPABILITY_LIMITS.LIST_MAX,
+      afterRevision,
+    });
+    if (this.daemonWs !== socket || this.daemonGeneration !== expectedGeneration) return;
+    socket.send(JSON.stringify(toCapabilitySyncSnapshot(
+      record,
+      afterRevision === undefined ? CAPABILITY_SYNC_MSG.SNAPSHOT : CAPABILITY_SYNC_MSG.DELTA,
+      this.capabilityAuthorizationSigner ? [this.capabilityAuthorizationSigner.key] : [],
+    )));
+    const authority = await getCapabilityAuthorityRecordSet(db, {
+      ownerUserId,
+      serverId: this.serverId,
+    });
+    if (this.daemonWs !== socket || this.daemonGeneration !== expectedGeneration) return;
+    socket.send(JSON.stringify(toCapabilitySyncAuthorityFrame(
+      authority,
+      this.capabilityAuthorizationSigner ? [this.capabilityAuthorizationSigner.key] : [],
+    )));
+    this.lastCapabilityRevisionSent = record.revision;
+    this.capabilitySyncInitialized = true;
+    await this.replayPendingCapabilityBlobUploads(db, socket, expectedGeneration, ownerUserId);
+    await this.replayPendingCapabilityAuthorizations(db, socket, expectedGeneration, ownerUserId);
+    await this.replayLocalCapabilityManageRequests(db, socket, expectedGeneration, ownerUserId);
+  }
+
+  private async refreshCapabilitySyncOnHeartbeat(
+    db: Database,
+    socket: WebSocket,
+    expectedGeneration: number,
+  ): Promise<void> {
+    const ownerUserId = this.daemonOwnerUserId;
+    if (!ownerUserId
+      || !this.capabilitySyncInitialized
+      || !this.canAcceptCapabilityOperation(ownerUserId)) return;
+    await this.expirePreActivationCapabilityOperations(
+      db,
+      socket,
+      expectedGeneration,
+      ownerUserId,
+    );
+    const expired = await expireCapabilityPendingActivations(db, {
+      ownerUserId,
+      targetServerId: this.serverId,
+    });
+    for (const entry of expired) {
+      this.broadcastToBrowsers(JSON.stringify({
+        type: CAPABILITY_OPERATION_MSG.PROGRESS,
+        operationId: entry.operation.id,
+        revision: entry.operation.revision,
+        state: entry.operation.state,
+        errorCode: entry.operation.errorCode,
+      }));
+      if (this.daemonWs === socket && this.daemonGeneration === expectedGeneration) {
+        socket.send(JSON.stringify({
+          type: CAPABILITY_OPERATION_MSG.COMMIT_ABORT,
+          operationId: entry.operation.id,
+          capabilityId: entry.capabilityId,
+          versionId: entry.versionId,
+          bindingId: entry.bindingId,
+          authorityRevision: entry.authorityRevision,
+          errorCode: CAPABILITY_ERROR.RUNTIME_PENDING,
+        } satisfies CapabilityOperationCommitAbortFrame));
+      }
+    }
+    const record = await getCapabilitySyncSnapshot(db, {
+      ownerUserId,
+      maxItems: CAPABILITY_LIMITS.LIST_MAX,
+      afterRevision: this.lastCapabilityRevisionSent,
+    });
+    if (record.revision <= this.lastCapabilityRevisionSent
+      || this.daemonWs !== socket
+      || this.daemonGeneration !== expectedGeneration) return;
+    socket.send(JSON.stringify(toCapabilitySyncSnapshot(
+      record,
+      CAPABILITY_SYNC_MSG.DELTA,
+      this.capabilityAuthorizationSigner ? [this.capabilityAuthorizationSigner.key] : [],
+    )));
+    const authority = await getCapabilityAuthorityRecordSet(db, {
+      ownerUserId,
+      serverId: this.serverId,
+    });
+    if (this.daemonWs !== socket || this.daemonGeneration !== expectedGeneration) return;
+    socket.send(JSON.stringify(toCapabilitySyncAuthorityFrame(
+      authority,
+      this.capabilityAuthorizationSigner ? [this.capabilityAuthorizationSigner.key] : [],
+    )));
+    this.lastCapabilityRevisionSent = record.revision;
+  }
+
+  private async expirePreActivationCapabilityOperations(
+    db: Database,
+    socket: WebSocket,
+    expectedGeneration: number,
+    ownerUserId: string,
+  ): Promise<void> {
+    // A few non-capability bridge embedders intentionally expose a read-only
+    // Database-shaped test seam. Expiry requires a real transactional store;
+    // skipping it there keeps the snapshot itself available.
+    if (typeof db.transaction !== 'function') return;
+    const expired = await expireCapabilityPreActivationOperations(db, {
+      ownerUserId,
+      serverId: this.serverId,
+    });
+    for (const operation of expired) {
+      this.broadcastToBrowsers(JSON.stringify({
+        type: CAPABILITY_OPERATION_MSG.PROGRESS,
+        operationId: operation.id,
+        revision: operation.revision,
+        state: operation.state,
+        errorCode: operation.errorCode,
+      }));
+      if (this.daemonWs === socket && this.daemonGeneration === expectedGeneration) {
+        socket.send(JSON.stringify({
+          type: CAPABILITY_OPERATION_MSG.CANCEL,
+          operationId: operation.id,
+          expectedRevision: operation.revision,
+        } satisfies CapabilityOperationCancelFrame));
+      }
+    }
+  }
+
+  private async replayPendingCapabilityAuthorizations(
+    db: Database,
+    socket: WebSocket,
+    expectedGeneration: number,
+    ownerUserId: string,
+  ): Promise<void> {
+    if (!this.capabilityAuthorizationSigner) return;
+    const expired = await expireCapabilityPendingActivations(db, {
+      ownerUserId,
+      targetServerId: this.serverId,
+    });
+    for (const entry of expired) {
+      const { operation } = entry;
+      this.broadcastToBrowsers(JSON.stringify({
+        type: CAPABILITY_OPERATION_MSG.PROGRESS,
+        operationId: operation.id,
+        revision: operation.revision,
+        state: operation.state,
+        errorCode: operation.errorCode,
+      }));
+      if (entry.targetServerId === this.serverId
+        && this.daemonWs === socket && this.daemonGeneration === expectedGeneration) {
+        socket.send(JSON.stringify({
+          type: CAPABILITY_OPERATION_MSG.COMMIT_ABORT,
+          operationId: operation.id,
+          capabilityId: entry.capabilityId,
+          versionId: entry.versionId,
+          bindingId: entry.bindingId,
+          authorityRevision: entry.authorityRevision,
+          errorCode: CAPABILITY_ERROR.RUNTIME_PENDING,
+        } satisfies CapabilityOperationCommitAbortFrame));
+      }
+    }
+    const pending = await listPendingCapabilityAuthorizations(db, {
+      ownerUserId,
+      serverId: this.serverId,
+    });
+    for (const entry of pending) {
+      if (this.daemonWs !== socket || this.daemonGeneration !== expectedGeneration) return;
+      socket.send(JSON.stringify(toCapabilityOperationAuthorizeFrame(
+        entry,
+        [this.capabilityAuthorizationSigner.key],
+      )));
+    }
+  }
+
+  private async replayPendingCapabilityBlobUploads(
+    db: Database,
+    socket: WebSocket,
+    expectedGeneration: number,
+    ownerUserId: string,
+  ): Promise<void> {
+    if (!this.capabilityBlobSigningKey) return;
+    const pending = await listPendingCapabilityBlobUploads(db, {
+      ownerUserId,
+      serverId: this.serverId,
+    });
+    for (const entry of pending) {
+      if (this.daemonWs !== socket || this.daemonGeneration !== expectedGeneration) return;
+      const access = await issueCapabilityBlobAccess(db, {
+        ownerUserId,
+        serverId: this.serverId,
+        capabilityId: entry.capabilityId,
+        versionId: entry.versionId,
+        action: CAPABILITY_BLOB_ACTION.UPLOAD,
+        signingKey: this.capabilityBlobSigningKey,
+      });
+      if (access) socket.send(JSON.stringify({
+        type: CAPABILITY_SYNC_MSG.BLOB_CAPABILITY,
+        operationId: entry.operationId,
+        expectedRevision: entry.expectedRevision,
+        access,
+      }));
+    }
+  }
+
+  private async replayLocalCapabilityManageRequests(
+    db: Database,
+    socket: WebSocket,
+    expectedGeneration: number,
+    ownerUserId: string,
+  ): Promise<void> {
+    const requests = await listReplayableLocalCapabilityManageRequests(db, {
+      ownerUserId,
+      serverId: this.serverId,
+    });
+    for (const request of requests) {
+      if (this.daemonWs !== socket || this.daemonGeneration !== expectedGeneration) return;
+      if (request.phase === 'committed') {
+        socket.send(JSON.stringify({
+          type: CAPABILITY_OPERATION_MSG.MANAGE_ACK,
+          requestId: request.requestId,
+          capabilityId: request.itemId,
+          bindingId: request.bindingId,
+          authorityRevision: request.authorityRevision,
+        } satisfies CapabilityOperationManageAckFrame));
+        continue;
+      }
+      if (request.phase === 'aborted') {
+        socket.send(JSON.stringify({
+          type: CAPABILITY_OPERATION_MSG.MANAGE_ACK,
+          requestId: request.requestId,
+          capabilityId: request.itemId,
+          bindingId: request.bindingId,
+          authorityRevision: request.authorityRevision,
+        } satisfies CapabilityOperationManageAckFrame));
+        continue;
+      }
+      const phase = request.phase === 'prepare_sent'
+        ? CAPABILITY_MANAGE_PHASE.PREPARE
+        : CAPABILITY_MANAGE_PHASE.COMMIT;
+      socket.send(JSON.stringify(toCapabilityManageJournalFrame(request, phase)));
+    }
+  }
+
+  private async handleCapabilityDaemonMessage(
+    msg: Record<string, unknown>,
+    db: Database,
+    socket: WebSocket,
+    expectedGeneration: number,
+  ): Promise<boolean> {
+    const ownerUserId = this.daemonOwnerUserId;
+    if (!ownerUserId || !this.canAcceptCapabilityOperation(ownerUserId)) return false;
+
+    if (msg.type === CAPABILITY_SYNC_MSG.REQUEST) {
+      const afterRevision = msg.afterRevision === undefined
+        ? undefined
+        : Number.isSafeInteger(msg.afterRevision) && (msg.afterRevision as number) >= 0
+          ? msg.afterRevision as number
+          : null;
+      if (afterRevision === null) return true;
+      await this.sendCapabilitySnapshot(db, socket, expectedGeneration, afterRevision);
+      return true;
+    }
+
+    if (msg.type === CAPABILITY_SYNC_MSG.READINESS) {
+      const capabilityId = capabilityOpaqueId(msg.capabilityId);
+      const revision = Number.isSafeInteger(msg.revision) && (msg.revision as number) >= 0
+        ? msg.revision as number
+        : null;
+      const readiness = Object.values(CAPABILITY_READINESS).find((candidate) => candidate === msg.readiness);
+      const reasons = capabilityStringList(msg.reasons, CAPABILITY_LIMITS.FINDINGS);
+      if (!capabilityId || revision === null || !readiness || !reasons) return true;
+      const result = await acknowledgeCapabilityReadiness(db, {
+        ownerUserId,
+        itemId: capabilityId,
+        serverId: this.serverId,
+        state: readiness,
+        reasonCode: reasons[0] ?? null,
+        accountRevision: revision,
+        manifestDigest: msg.manifestDigest === undefined ? null : capabilityDigest(msg.manifestDigest),
+      });
+      if (result && this.daemonWs === socket && this.daemonGeneration === expectedGeneration) {
+        socket.send(JSON.stringify({
+          type: CAPABILITY_SYNC_MSG.ACK,
+          revision,
+          digest: sha256Hex(JSON.stringify({ capabilityId, readiness, revision })),
+        }));
+      }
+      return true;
+    }
+
+    if (msg.type === CAPABILITY_OPERATION_MSG.MANAGE_RESULT) {
+      const frame = msg as unknown as CapabilityOperationManageResultFrame;
+      const requestId = capabilityOpaqueId(frame.requestId);
+      const capabilityId = capabilityOpaqueId(frame.capabilityId);
+      const bindingId = capabilityOpaqueId(frame.bindingId);
+      const expectedRevision = Number.isSafeInteger(frame.expectedRevision) && frame.expectedRevision >= 1
+        ? frame.expectedRevision
+        : null;
+      const authorityRevision = Number.isSafeInteger(frame.authorityRevision) && frame.authorityRevision >= 1
+        ? frame.authorityRevision
+        : null;
+      const resultPhase = Object.values(CAPABILITY_MANAGE_RESULT_PHASE)
+        .find((candidate) => candidate === frame.phase);
+      const action = Object.values(CAPABILITY_MANAGE_ACTION).find((candidate) => candidate === frame.action);
+      if (!requestId || !capabilityId || !bindingId || expectedRevision === null
+        || authorityRevision === null || !resultPhase || !action
+        || action === CAPABILITY_MANAGE_ACTION.DELETE_CREDENTIALS
+        || action === CAPABILITY_MANAGE_ACTION.CANCEL_OPERATION
+        || typeof frame.ok !== 'boolean') return true;
+      const pending = this.pendingCapabilityManage.get(requestId);
+      if (pending && (pending.ownerUserId !== ownerUserId
+        || pending.frame.capabilityId !== capabilityId
+        || pending.frame.bindingId !== bindingId
+        || pending.frame.action !== frame.action
+        || pending.frame.expectedRevision !== expectedRevision
+        || pending.frame.authorityRevision !== authorityRevision)) return true;
+      const journal = await advanceLocalCapabilityManageResult(db, {
+        requestId,
+        ownerUserId,
+        serverId: this.serverId,
+        itemId: capabilityId,
+        bindingId,
+        action,
+        expectedRevision,
+        authorityRevision,
+        resultPhase,
+        ok: frame.ok,
+        errorCode: frame.errorCode,
+      });
+      if (!journal) return true;
+      if (resultPhase === CAPABILITY_MANAGE_RESULT_PHASE.ABORTED) {
+        if (this.daemonWs === socket && this.daemonGeneration === expectedGeneration) {
+          socket.send(JSON.stringify({
+            type: CAPABILITY_OPERATION_MSG.MANAGE_ACK,
+            requestId,
+            capabilityId,
+            bindingId,
+            authorityRevision,
+          } satisfies CapabilityOperationManageAckFrame));
+        }
+        if (pending) {
+          clearTimeout(pending.timer);
+          this.pendingCapabilityManage.delete(requestId);
+          pending.resolve(frame);
+        }
+        return true;
+      }
+      if (!frame.ok) {
+        if (this.daemonWs === socket && this.daemonGeneration === expectedGeneration) {
+          socket.send(JSON.stringify(toCapabilityManageJournalFrame(journal, CAPABILITY_MANAGE_PHASE.ABORT)));
+        }
+        if (pending) {
+          clearTimeout(pending.timer);
+          this.pendingCapabilityManage.delete(requestId);
+          pending.resolve(frame);
+        }
+        return true;
+      }
+      if (resultPhase === CAPABILITY_MANAGE_RESULT_PHASE.PREPARED) {
+        const commit = await markLocalCapabilityManageCommitSent(db, {
+          requestId,
+          ownerUserId,
+          serverId: this.serverId,
+        });
+        if (commit && this.daemonWs === socket && this.daemonGeneration === expectedGeneration) {
+          socket.send(JSON.stringify(toCapabilityManageJournalFrame(commit, CAPABILITY_MANAGE_PHASE.COMMIT)));
+        }
+        return true;
+      }
+      if (!this.capabilityAuthorizationSigner) return true;
+      const committed = await manageCapability(db, {
+        ownerUserId,
+        itemId: capabilityId,
+        expectedRevision,
+        action,
+        bindingId,
+        targetVersionId: journal.targetVersionId,
+        scope: CAPABILITY_SCOPE.LOCAL,
+        serverId: this.serverId,
+        localRequestId: requestId,
+        authorizationSigner: this.capabilityAuthorizationSigner,
+      });
+      if (committed.status !== 'ok') {
+        logger.warn({ serverId: this.serverId, requestId, status: committed.status }, 'Capability local manage commit rejected');
+        const aborted = await advanceLocalCapabilityManageResult(db, {
+          requestId,
+          ownerUserId,
+          serverId: this.serverId,
+          itemId: capabilityId,
+          bindingId,
+          action,
+          expectedRevision,
+          authorityRevision,
+          resultPhase: CAPABILITY_MANAGE_RESULT_PHASE.ABORTED,
+          ok: false,
+          errorCode: CAPABILITY_ERROR.CONFLICT,
+        });
+        if (aborted && this.daemonWs === socket && this.daemonGeneration === expectedGeneration) {
+          socket.send(JSON.stringify(toCapabilityManageJournalFrame(aborted, CAPABILITY_MANAGE_PHASE.ABORT)));
+        }
+        return true;
+      }
+      if (this.daemonWs === socket && this.daemonGeneration === expectedGeneration) {
+        socket.send(JSON.stringify({
+          type: CAPABILITY_OPERATION_MSG.MANAGE_ACK,
+          requestId,
+          capabilityId,
+          bindingId,
+          authorityRevision,
+        } satisfies CapabilityOperationManageAckFrame));
+      }
+      await WsBridge.broadcastCapabilitySync(
+        ownerUserId,
+        db,
+        Math.max(0, committed.accountRevision - 1),
+      );
+      if (pending) {
+        clearTimeout(pending.timer);
+        this.pendingCapabilityManage.delete(requestId);
+        pending.resolve(frame);
+      }
+      return true;
+    }
+
+    if (msg.type === CAPABILITY_OPERATION_MSG.PROGRESS) {
+      const frame = msg as unknown as CapabilityOperationProgressFrame;
+      const operationId = capabilityOpaqueId(frame.operationId);
+      const expectedRevision = Number.isSafeInteger(frame.expectedRevision) && frame.expectedRevision >= 1
+        ? frame.expectedRevision
+        : null;
+      const state = isCapabilityInstallState(frame.state) ? frame.state : null;
+      const artifactDigest = frame.artifactDigest === undefined ? undefined : capabilityDigest(frame.artifactDigest);
+      const auditDigest = frame.auditDigest === undefined ? undefined : capabilityDigest(frame.auditDigest);
+      const findings = frame.findings === undefined ? [] : sanitizeCapabilityFindings(frame.findings);
+      const auditVerdict = frame.auditVerdict === undefined
+        ? undefined
+        : Object.values(CAPABILITY_AUDIT_VERDICT).find((candidate) => candidate === frame.auditVerdict);
+      const errorCode = frame.errorCode === undefined
+        ? undefined
+        : Object.values(CAPABILITY_ERROR).find((candidate) => candidate === frame.errorCode);
+      const stdioCommand = frame.stdioCommand === undefined
+        ? undefined
+        : capabilityStringList(frame.stdioCommand, CAPABILITY_LIMITS.PATH_BYTES);
+      const tools = frame.tools === undefined
+        ? undefined
+        : capabilityStringList(frame.tools, CAPABILITY_LIMITS.FINDINGS);
+      const permissions = frame.permissions === undefined
+        ? undefined
+        : capabilityStringList(frame.permissions, CAPABILITY_LIMITS.FINDINGS);
+      const updateDiff = frame.updateDiff === undefined
+        ? undefined
+        : capabilityStringList(frame.updateDiff, CAPABILITY_LIMITS.FINDINGS);
+      const allowedProgressFrom: Partial<Record<CapabilityInstallState, CapabilityInstallState[]>> = {
+        [CAPABILITY_INSTALL_STATE.ACQUIRING]: [CAPABILITY_INSTALL_STATE.QUEUED],
+        [CAPABILITY_INSTALL_STATE.SCANNING]: [CAPABILITY_INSTALL_STATE.ACQUIRING],
+        [CAPABILITY_INSTALL_STATE.AUDITING]: [CAPABILITY_INSTALL_STATE.SCANNING],
+        // Current daemon versions may run the full local acquisition/scan/audit
+        // pipeline and emit only the terminal pre-confirmation frame.
+        [CAPABILITY_INSTALL_STATE.AWAITING_CONFIRMATION]: [
+          CAPABILITY_INSTALL_STATE.QUEUED,
+          CAPABILITY_INSTALL_STATE.AUDITING,
+        ],
+        [CAPABILITY_INSTALL_STATE.SYNCING]: [CAPABILITY_INSTALL_STATE.INSTALLING],
+        [CAPABILITY_INSTALL_STATE.REWORK]: [
+          CAPABILITY_INSTALL_STATE.QUEUED,
+          CAPABILITY_INSTALL_STATE.SCANNING,
+          CAPABILITY_INSTALL_STATE.AUDITING,
+        ],
+        [CAPABILITY_INSTALL_STATE.FAILED]: [
+          CAPABILITY_INSTALL_STATE.QUEUED,
+          CAPABILITY_INSTALL_STATE.ACQUIRING,
+          CAPABILITY_INSTALL_STATE.SCANNING,
+          CAPABILITY_INSTALL_STATE.AUDITING,
+          CAPABILITY_INSTALL_STATE.INSTALLING,
+          CAPABILITY_INSTALL_STATE.SYNCING,
+        ],
+      };
+      const allowedCurrentStates = state ? allowedProgressFrom[state] : undefined;
+      if (!operationId || expectedRevision === null || !state || !allowedCurrentStates || findings === null
+        || (frame.artifactDigest !== undefined && !artifactDigest)
+        || (frame.auditDigest !== undefined && !auditDigest)
+        || (frame.auditVerdict !== undefined && !auditVerdict)
+        || (frame.errorCode !== undefined && !errorCode)
+        || (frame.stdioCommand !== undefined && !stdioCommand)
+        || (frame.tools !== undefined && !tools)
+        || (frame.permissions !== undefined && !permissions)
+        || (frame.updateDiff !== undefined && !updateDiff)
+        || (state === CAPABILITY_INSTALL_STATE.AWAITING_CONFIRMATION
+          && (!artifactDigest || !auditDigest || auditVerdict !== CAPABILITY_AUDIT_VERDICT.PASS))) return true;
+
+      const evidence = auditVerdict && artifactDigest && auditDigest
+        ? {
+          kind: 'audit',
+          evidenceDigest: auditDigest,
+          artifactDigest,
+          policyVersion: 'daemon-isolated-auditor-v1',
+          verdict: auditVerdict,
+          findings,
+        } as const
+        : findings.length > 0 && artifactDigest
+          ? {
+          kind: 'scan',
+          evidenceDigest: sha256Hex(JSON.stringify({
+            policyVersion: 'daemon-deterministic-scan-v1',
+            artifactDigest,
+            findings,
+          })),
+          artifactDigest,
+          policyVersion: 'daemon-deterministic-scan-v1',
+          verdict: null,
+          findings,
+          } as const
+          : undefined;
+
+      const updated = await advanceCapabilityOperation(db, {
+        ownerUserId,
+        operationId,
+        expectedRevision,
+        state,
+        artifactDigest,
+        auditDigest,
+        errorCode,
+        allowedCurrentStates,
+        evidence,
+        requestSummaryPatch: {
+          ...(typeof frame.displayName === 'string'
+            ? { displayName: frame.displayName.slice(0, CAPABILITY_LIMITS.DISPLAY_NAME_CHARS) }
+            : {}),
+          ...(frame.hasScripts !== undefined ? { hasScripts: frame.hasScripts === true } : {}),
+          ...(frame.hasExecutables !== undefined ? { hasExecutables: frame.hasExecutables === true } : {}),
+          ...(stdioCommand ? { stdioCommand } : {}),
+          ...(tools ? { tools } : {}),
+          ...(permissions ? { permissions } : {}),
+          ...(updateDiff ? { updateDiff } : {}),
+        },
+      });
+      if (!updated) {
+        // A reviewed candidate is durable on the daemon before this progress
+        // frame is sent.  After reconnect it may replay the same exact frame
+        // whether or not the first write reached us.  Treat only the precise
+        // already-applied awaiting-confirmation transition as idempotent;
+        // every other stale revision remains rejected.
+        if (state === CAPABILITY_INSTALL_STATE.AWAITING_CONFIRMATION) {
+          const current = await getCapabilityOperation(db, { ownerUserId, operationId });
+          if (current?.state === CAPABILITY_INSTALL_STATE.AWAITING_CONFIRMATION
+            && current.revision === expectedRevision + 1
+            && current.artifactDigest === artifactDigest
+            && current.auditDigest === auditDigest) {
+            this.broadcastToBrowsers(JSON.stringify({ ...frame, revision: current.revision }));
+            return true;
+          }
+        }
+        logger.warn({ serverId: this.serverId, operationId, expectedRevision }, 'Dropped stale capability progress');
+        return true;
+      }
+      this.broadcastToBrowsers(JSON.stringify({ ...frame, revision: updated.revision }));
+      return true;
+    }
+
+    if (msg.type === CAPABILITY_OPERATION_MSG.ACTIVATE) {
+      const frame = msg as unknown as CapabilityOperationActivateFrame;
+      const operationId = capabilityOpaqueId(frame.operationId);
+      const capabilityId = capabilityOpaqueId(frame.capability?.id);
+      const versionId = capabilityOpaqueId(frame.version?.id);
+      const bindingId = capabilityOpaqueId(frame.binding?.id);
+      const expectedRevision = Number.isSafeInteger(frame.expectedRevision) && frame.expectedRevision >= 1
+        ? frame.expectedRevision
+        : null;
+      const artifactDigest = capabilityDigest(frame.version?.artifactDigest);
+      const blobDigest = frame.version?.blobDigest === undefined
+        ? undefined
+        : capabilityDigest(frame.version.blobDigest);
+      const blobByteSize = frame.version?.blobByteSize === undefined
+        ? undefined
+        : Number.isSafeInteger(frame.version.blobByteSize)
+          && frame.version.blobByteSize > 0
+          && frame.version.blobByteSize <= CAPABILITY_LIMITS.PACKAGE_BYTES
+          ? frame.version.blobByteSize
+          : null;
+      const auditDigest = capabilityDigest(frame.version?.auditDigest);
+      const scope = Object.values(CAPABILITY_SCOPE).find((candidate) => candidate === frame.binding?.scope);
+      const sourceKind = Object.values(CAPABILITY_SOURCE_KIND).find((candidate) => candidate === frame.version?.sourceKind);
+      const name = typeof frame.capability?.name === 'string'
+        && frame.capability.name.trim()
+        && frame.capability.name.length <= CAPABILITY_LIMITS.DISPLAY_NAME_CHARS
+        ? frame.capability.name.trim()
+        : null;
+      const providers = capabilityStringList(frame.binding?.providers, CAPABILITY_LIMITS.PROVIDERS);
+      const machines = capabilityStringList(frame.binding?.machines, CAPABILITY_LIMITS.MACHINES);
+      const tools = capabilityStringList(frame.capability?.tools ?? [], CAPABILITY_LIMITS.FINDINGS);
+      const permissions = capabilityStringList(frame.capability?.permissions ?? [], CAPABILITY_LIMITS.FINDINGS);
+      const activationFindings = sanitizeCapabilityFindings(frame.capability?.findings ?? []);
+      const scopeId = frame.binding?.scopeId === undefined
+        ? undefined
+        : capabilityOpaqueId(frame.binding.scopeId);
+      const normalizedDefinition = frame.capability?.kind === CAPABILITY_KIND.MCP && frame.definition
+        ? normalizeCapabilityMcpDefinition({
+          kind: CAPABILITY_SOURCE_KIND.MCP_CONFIG,
+          mcpConfig: frame.definition as unknown as Record<string, unknown>,
+        })
+        : null;
+      const synchronizedSkill = frame.capability?.kind === CAPABILITY_KIND.SKILL
+        && scope !== CAPABILITY_SCOPE.LOCAL;
+      if (!operationId || !capabilityId || !versionId || !bindingId || expectedRevision === null
+        || !artifactDigest || !auditDigest || !scope || !sourceKind || !name
+        || !providers || !machines || !tools || !permissions || !activationFindings
+        || (frame.binding?.scopeId !== undefined && !scopeId)
+        || frame.version.capabilityId !== capabilityId
+        || frame.binding.capabilityId !== capabilityId
+        || frame.binding.versionId !== versionId
+        || frame.version.auditVerdict !== CAPABILITY_AUDIT_VERDICT.PASS
+        || frame.capability.artifactDigest !== artifactDigest
+        || frame.capability.kind !== CAPABILITY_KIND.SKILL && frame.capability.kind !== CAPABILITY_KIND.MCP
+        || (frame.capability.kind === CAPABILITY_KIND.MCP && !normalizedDefinition)
+        || (frame.capability.kind === CAPABILITY_KIND.SKILL && frame.definition !== undefined)
+        || (frame.version.blobDigest !== undefined && !blobDigest)
+        || (frame.version.blobByteSize !== undefined && blobByteSize === null)
+        || (synchronizedSkill && (!blobDigest || blobByteSize === undefined))
+        || (!synchronizedSkill && (blobDigest !== undefined || blobByteSize !== undefined))) return true;
+
+      if (!this.capabilityAuthorizationSigner) return true;
+      let activationError: unknown = null;
+      const activated = await activateCapabilityVersion(db, {
+        ownerUserId,
+        targetServerId: this.serverId,
+        operationId,
+        expectedOperationRevision: expectedRevision,
+        requestedItemId: capabilityId,
+        requestedBindingId: bindingId,
+        name,
+        kind: frame.capability.kind,
+        sourceKind,
+        sourceSummary: frame.capability.sourceLabel?.slice(0, CAPABILITY_LIMITS.SOURCE_CHARS) ?? '',
+        artifactDigest,
+        blobDigest,
+        blobByteSize,
+        auditDigest,
+        manifest: {
+          findings: activationFindings,
+          scripts: frame.capability.hasScripts ? ['declared'] : [],
+          executables: frame.capability.hasExecutables ? ['declared'] : [],
+          tools,
+        },
+        definition: frame.capability.kind === CAPABILITY_KIND.MCP
+          ? normalizedDefinition!
+          : null,
+        permissionSummary: permissions,
+        scope,
+        projectKey: scope === CAPABILITY_SCOPE.PROJECT ? scopeId ?? null : null,
+        sessionKey: scope === CAPABILITY_SCOPE.SESSION ? scopeId ?? null : null,
+        serverId: scope === CAPABILITY_SCOPE.LOCAL ? this.serverId : null,
+        providerFilter: providers,
+        machineFilter: machines,
+        authorizationSigner: this.capabilityAuthorizationSigner,
+      }).catch((error: unknown) => {
+        activationError = error;
+        logger.warn({ error, serverId: this.serverId, operationId }, 'Capability activation rejected');
+        return null;
+      });
+      if (!activated) {
+        const errorCode = activationError instanceof Error
+          && activationError.message === 'capability_sync_item_quota_exceeded'
+          ? CAPABILITY_ERROR.CONFLICT
+          : CAPABILITY_ERROR.INTEGRITY_FAILED;
+        const failed = await updateCapabilityOperation(db, {
+          ownerUserId,
+          operationId,
+          expectedRevision,
+          state: CAPABILITY_INSTALL_STATE.FAILED,
+          errorCode,
+          allowedCurrentStates: [CAPABILITY_INSTALL_STATE.INSTALLING],
+        });
+        if (failed) {
+          if (this.daemonWs === socket && this.daemonGeneration === expectedGeneration) {
+            socket.send(JSON.stringify({
+              type: CAPABILITY_OPERATION_MSG.CANCEL,
+              operationId,
+              expectedRevision: failed.revision,
+            } satisfies CapabilityOperationCancelFrame));
+          }
+          this.broadcastToBrowsers(JSON.stringify({
+            type: CAPABILITY_OPERATION_MSG.PROGRESS,
+            operationId,
+            revision: failed.revision,
+            state: failed.state,
+            errorCode: failed.errorCode,
+          }));
+        } else {
+          // A periodic expiry sweep may already have failed this durable
+          // daemon journal while it was offline. Its replay is still useful:
+          // answer with the current authoritative revision so the daemon can
+          // discard the stale candidate instead of replaying forever.
+          const current = await getCapabilityOperation(db, { ownerUserId, operationId });
+          if (current
+            && current.requestSummary.targetServerId === this.serverId
+            && this.daemonWs === socket
+            && this.daemonGeneration === expectedGeneration) {
+            socket.send(JSON.stringify({
+              type: CAPABILITY_OPERATION_MSG.CANCEL,
+              operationId,
+              expectedRevision: current.revision,
+            } satisfies CapabilityOperationCancelFrame));
+          }
+        }
+        return true;
+      }
+      if (activated.pendingBlob && this.capabilityBlobSigningKey) {
+        const access = await issueCapabilityBlobAccess(db, {
+          ownerUserId,
+          serverId: this.serverId,
+          capabilityId: activated.item.id,
+          versionId: activated.candidate.versionId,
+          action: CAPABILITY_BLOB_ACTION.UPLOAD,
+          signingKey: this.capabilityBlobSigningKey,
+        }).catch((error: unknown) => {
+          logger.warn({ error, serverId: this.serverId, operationId }, 'Capability blob upload access failed');
+          return null;
+        });
+        if (access && this.daemonWs === socket && this.daemonGeneration === expectedGeneration) {
+          socket.send(JSON.stringify({
+            type: CAPABILITY_SYNC_MSG.BLOB_CAPABILITY,
+            operationId,
+            expectedRevision: activated.operation.revision,
+            access,
+          }));
+        } else if (!access) {
+          const failed = await failCapabilityPendingActivation(db, {
+            ownerUserId,
+            operationId,
+            errorCode: CAPABILITY_ERROR.RUNTIME_PENDING,
+            expectedRevision: activated.operation.revision,
+            capabilityId: activated.item.id,
+            versionId: activated.candidate.versionId,
+            bindingId: activated.candidate.bindingId,
+            targetServerId: this.serverId,
+          });
+          if (failed) this.broadcastToBrowsers(JSON.stringify({
+            type: CAPABILITY_OPERATION_MSG.PROGRESS,
+            operationId,
+            revision: failed.revision,
+            state: failed.state,
+            errorCode: failed.errorCode,
+          }));
+          return true;
+        }
+      } else if (this.capabilityAuthorizationSigner) {
+        const pending = await getPendingCapabilityAuthorization(db, { ownerUserId, operationId });
+        if (pending && this.daemonWs === socket && this.daemonGeneration === expectedGeneration) {
+          socket.send(JSON.stringify(toCapabilityOperationAuthorizeFrame(
+            pending,
+            [this.capabilityAuthorizationSigner.key],
+          )));
+        }
+      }
+      this.broadcastToBrowsers(JSON.stringify({
+        type: CAPABILITY_OPERATION_MSG.PROGRESS,
+        operationId,
+        revision: activated.operation.revision,
+        state: activated.operation.state,
+      }));
+      return true;
+    }
+
+    if (msg.type === CAPABILITY_OPERATION_MSG.COMMIT_RESULT) {
+      const frame = msg as unknown as CapabilityOperationCommitResultFrame;
+      const operationId = capabilityOpaqueId(frame.operationId);
+      const capabilityId = capabilityOpaqueId(frame.capabilityId);
+      const versionId = capabilityOpaqueId(frame.versionId);
+      const bindingId = capabilityOpaqueId(frame.bindingId);
+      const expectedRevision = Number.isSafeInteger(frame.expectedRevision) && frame.expectedRevision >= 1
+        ? frame.expectedRevision
+        : null;
+      const authorityRevision = Number.isSafeInteger(frame.authorityRevision) && frame.authorityRevision >= 1
+        ? frame.authorityRevision
+        : null;
+      const errorCode = frame.errorCode === undefined
+        ? CAPABILITY_ERROR.RUNTIME_PENDING
+        : Object.values(CAPABILITY_ERROR).find((candidate) => candidate === frame.errorCode);
+      if (!operationId || !capabilityId || !versionId || !bindingId || expectedRevision === null
+        || authorityRevision === null
+        || typeof frame.ok !== 'boolean' || !errorCode) return true;
+      if (!frame.ok) {
+        const failed = await failCapabilityPendingActivation(db, {
+          ownerUserId,
+          operationId,
+          errorCode,
+          expectedRevision,
+          capabilityId,
+          versionId,
+          bindingId,
+          authorityRevision,
+          targetServerId: this.serverId,
+        });
+        if (this.daemonWs === socket && this.daemonGeneration === expectedGeneration) {
+          socket.send(JSON.stringify({
+            type: CAPABILITY_OPERATION_MSG.COMMIT_ABORT,
+            operationId,
+            capabilityId,
+            versionId,
+            bindingId,
+            authorityRevision,
+            errorCode,
+          } satisfies CapabilityOperationCommitAbortFrame));
+        }
+        if (failed) this.broadcastToBrowsers(JSON.stringify({
+          type: CAPABILITY_OPERATION_MSG.PROGRESS,
+          operationId,
+          revision: failed.revision,
+          state: failed.state,
+          errorCode: failed.errorCode,
+        }));
+        return true;
+      }
+      const completed = await completeCapabilityCommit(db, {
+        ownerUserId,
+        targetServerId: this.serverId,
+        operationId,
+        expectedRevision,
+        capabilityId,
+        versionId,
+        bindingId,
+        authorityRevision,
+      });
+      if (completed.status !== 'ok') {
+        logger.warn({ serverId: this.serverId, operationId, status: completed.status }, 'Capability commit rejected');
+        if (this.daemonWs === socket && this.daemonGeneration === expectedGeneration) {
+          socket.send(JSON.stringify({
+            type: CAPABILITY_OPERATION_MSG.COMMIT_ABORT,
+            operationId,
+            capabilityId,
+            versionId,
+            bindingId,
+            authorityRevision,
+            errorCode: CAPABILITY_ERROR.RUNTIME_PENDING,
+          } satisfies CapabilityOperationCommitAbortFrame));
+        }
+        return true;
+      }
+      if (this.daemonWs === socket && this.daemonGeneration === expectedGeneration) {
+        socket.send(JSON.stringify({
+          type: CAPABILITY_OPERATION_MSG.COMMIT_ACK,
+          operationId,
+          capabilityId,
+          versionId,
+          bindingId,
+          authorityRevision,
+        } satisfies CapabilityOperationCommitAckFrame));
+      }
+      await WsBridge.broadcastCapabilitySync(
+        ownerUserId,
+        db,
+        Math.max(0, completed.accountRevision - 1),
+      ).catch((error: unknown) => {
+        logger.warn({ error, serverId: this.serverId, operationId }, 'Capability commit sync fan-out failed');
+        return 0;
+      });
+      this.broadcastToBrowsers(JSON.stringify({
+        type: CAPABILITY_OPERATION_MSG.ACTIVATE,
+        operationId,
+        capability: toCapabilitySummary(completed.item),
+      }));
+      return true;
+    }
+
+    return false;
+  }
+
+  /** Narrow test seam for validated daemon capability frames. */
+  async handleCapabilityDaemonMessageForTests(
+    msg: Record<string, unknown>,
+    db: Database,
+    socket: WebSocket,
+    expectedGeneration: number,
+  ): Promise<boolean> {
+    return this.handleCapabilityDaemonMessage(msg, db, socket, expectedGeneration);
   }
 
   /**
@@ -2617,8 +3811,22 @@ export class WsBridge {
   handleDaemonConnection(ws: WebSocket, db: Database, env: Env, onAuthenticated?: () => void): void {
     this.db = db;
     this.directFileTransferTicketSigningKey = env.JWT_SIGNING_KEY;
+    // Production startup already enforces a strong JWT_SIGNING_KEY. Some
+    // narrowly-scoped bridge tests and embedded callers intentionally omit it;
+    // keep unrelated daemon transport alive while capability signing remains
+    // fail-closed unavailable instead of deriving from an undefined value.
+    const capabilitySigningKey = typeof env.JWT_SIGNING_KEY === 'string' && env.JWT_SIGNING_KEY.length > 0
+      ? env.JWT_SIGNING_KEY
+      : null;
+    this.capabilityBlobSigningKey = capabilitySigningKey;
+    this.capabilityAuthorizationSigner = capabilitySigningKey
+      ? createCapabilityAuthorizationSigner(capabilitySigningKey)
+      : null;
     // Replace existing daemon connection
     if (this.daemonWs) {
+      if (this.daemonOwnerUserId) {
+        this.failDisconnectedCapabilityOperations(db, this.daemonOwnerUserId);
+      }
       // `ws.close()` completes asynchronously in production. Reject the old
       // generation's request waiters before swapping `daemonWs`; otherwise the
       // old socket's identity-guarded close handler cannot see or drain them.
@@ -2640,6 +3848,8 @@ export class WsBridge {
     this.peerAuditRouter.setDaemonGeneration(this.daemonGeneration);
     abandonComputerUsePriorGenerations(this.serverId, this.daemonGeneration);
     this.authenticated = false;
+    this.lastCapabilityRevisionSent = 0;
+    this.capabilitySyncInitialized = false;
     this.controlledNodeCapabilities.clear();
     // New connection: drop any auth promise from a prior connection so
     // late-arriving messages don't await a stale (and possibly resolved
@@ -2833,6 +4043,20 @@ export class WsBridge {
             this.sendMemoryFeatureConfigApply(memoryFeatureFlags);
           } catch (err) {
             logger.warn({ err, serverId: this.serverId }, 'failed to push global memory feature config on daemon auth');
+          }
+          if (!isCurrentAuthConnection()) {
+            finishLocalAuth();
+            return;
+          }
+        }
+        if (this.daemonNodeRole === NODE_ROLE.FULL) {
+          try {
+            await this.sendCapabilitySnapshot(db, ws, connectionGeneration);
+          } catch (error) {
+            // Capability sync is fail-closed and independent from core daemon
+            // liveness. Keep the connection, report the unavailable slice, and
+            // let the daemon retry with CAPABILITY_SYNC_MSG.REQUEST.
+            logger.warn({ error, serverId: this.serverId }, 'Initial capability snapshot failed');
           }
           if (!isCurrentAuthConnection()) {
             finishLocalAuth();
@@ -3071,6 +4295,15 @@ export class WsBridge {
         return;
       }
 
+      // Preserve the synchronous ordering of every established daemon message
+      // family (notably preview RESPONSE_START followed immediately by binary
+      // body frames). Only capability frames may cross this async DB boundary;
+      // unknown capability frames are default-denied rather than broadcast.
+      if (typeof msg.type === 'string' && msg.type.startsWith('capability.')) {
+        await this.handleCapabilityDaemonMessage(msg, db, ws, connectionGeneration);
+        return;
+      }
+
       if (msg.type === DAEMON_MSG.UPGRADE_BLOCKED_SYNC) {
         if (
           this.daemonWs === ws
@@ -3127,6 +4360,9 @@ export class WsBridge {
         );
         // Ack heartbeat so daemon watchdog doesn't consider the connection dead
         try { ws.send(JSON.stringify({ type: 'heartbeat_ack' })); } catch { /* ignore */ }
+        void this.refreshCapabilitySyncOnHeartbeat(db, ws, connectionGeneration).catch((error: unknown) => {
+          logger.warn({ error, serverId: this.serverId }, 'Capability heartbeat sync refresh failed');
+        });
       }
 
       this.relayToBrowsers(msg);
@@ -3183,6 +4419,7 @@ export class WsBridge {
 
     ws.on('close', () => {
       if (this.daemonWs === ws) {
+        const disconnectedOwnerUserId = this.daemonOwnerUserId;
         this.daemonWs = null;
         this.authenticated = false;
         // Audit fix (78-server reconnect-storm) — drop the auth promise
@@ -3214,6 +4451,9 @@ export class WsBridge {
         this.controlledNodeCapabilities.clear();
         this.daemonControlledOs = null;
         this.daemonOwnerUserId = null;
+        if (disconnectedOwnerUserId) {
+          this.failDisconnectedCapabilityOperations(db, disconnectedOwnerUserId);
+        }
         this.resetLegacyUpgradeRescueForGeneration(this.daemonGeneration);
         this.remoteDesktopRouter.stopAll(REMOTE_DESKTOP_TERMINAL_REASON.DAEMON_REPLACED);
         this.openspecAutoDeliverProjectionCache.clearActive();
@@ -7163,6 +8403,9 @@ export class WsBridge {
   /** Force-close the daemon WebSocket. Use after token rotation to evict the stale connection. */
   kickDaemon(): void {
     if (this.daemonWs) {
+      if (this.db && this.daemonOwnerUserId) {
+        this.failDisconnectedCapabilityOperations(this.db, this.daemonOwnerUserId);
+      }
       // Production WebSocket close is asynchronous. Drain request waiters before
       // clearing the socket identity, or the guarded close handler cannot do it.
       this.rejectAllPendingFileTransfers('daemon_disconnected');

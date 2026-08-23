@@ -205,6 +205,7 @@ import { isImeComposingKeyEvent } from './ime-keyboard.js';
 import { markServerDaemonActivity, markServerOffline, touchServerHeartbeat } from './server-online-state.js';
 import { MSG_DAEMON_ONLINE, MSG_DAEMON_OFFLINE } from '@shared/ack-protocol.js';
 import { markSessionRunningIfNeeded } from './session-state-updates.js';
+import { CapabilityOperationNotice } from './components/CapabilityOperationNotice.js';
 import {
   APP_UPDATE_REQUIRED_EVENT,
   fetchCurrentAppBuildInfo,
@@ -6176,6 +6177,21 @@ export function App() {
             username={username}
             hasPassword={userHasPassword}
             serverUrl={auth?.baseUrl ?? nativeServerUrl}
+            serverId={selectedServerId}
+            canAskAi={Boolean(activeSession)}
+            onAskAi={(source) => {
+              const targetSession = focusedSubIdRef.current ? `deck_sub_${focusedSubIdRef.current}` : activeSession;
+              setShowSettingsPage(false);
+              if (!targetSession) return;
+              requestAnimationFrame(() => {
+                const input = inputRefsMap.current.get(targetSession);
+                if (!input) return;
+                appendContentEditableTextPreservingNewlines(
+                  input,
+                  `${input.textContent?.trim() ? '\n' : ''}${trans('capabilities.askAiPrompt', { source })}`,
+                );
+              });
+            }}
             onBack={() => setShowSettingsPage(false)}
             onDisplayNameChanged={(name) => setUserDisplayName(name)}
             onUserAuthUpdated={(next) => {
@@ -6732,6 +6748,8 @@ export function App() {
       )}
 
       <DownloadTransferCenter />
+
+      <CapabilityOperationNotice serverId={selectedServerId} />
 
       {/* Toasts: idle completions + CC notifications */}
       {toasts.length > 0 && (

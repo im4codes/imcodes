@@ -19,6 +19,7 @@ import {
   type StartupMemoryCandidate,
 } from '../context/startup-memory.js';
 import { collectSkillStartupCandidates } from '../context/skill-startup-context.js';
+import { getAuthenticatedCapabilityOwner } from '../capability/capability-authorization.js';
 import { selectStartupMemoryForBootstrap } from '../context/memory-recall-client.js';
 import { getContextStoreClient } from '../store/context-store-worker-client.js';
 import {
@@ -33,6 +34,13 @@ import { attachMemoryShortRefs } from '../context/memory-recall-refs.js';
 
 export interface TransportContextBootstrapInput {
   projectDir?: string;
+  /** Exact IM.codes session identity for session-scoped managed Skill bindings. */
+  sessionId?: string;
+  /** Exact provider and bound daemon identities for managed Skill bindings. */
+  providerId?: string;
+  serverId?: string;
+  /** Account owner learned from the current authenticated ServerLink. */
+  trustedOwnerId?: string;
   transportConfig?: Record<string, unknown> | null;
   /** When true, skip the expensive startup-memory build step entirely. */
   startupMemoryAlreadyInjected?: boolean;
@@ -58,7 +66,7 @@ export async function resolveTransportContextBootstrap(
   if (explicitNamespace) {
     return await buildBootstrapResult(explicitNamespace, {
       diagnostics: ['namespace:explicit'],
-    }, input.startupMemoryAlreadyInjected, projectDir);
+    }, input.startupMemoryAlreadyInjected, projectDir, input.sessionId, input.providerId, input.serverId, input.trustedOwnerId);
   }
 
   let originUrl: string | null | undefined;
@@ -86,7 +94,7 @@ export async function resolveTransportContextBootstrap(
             remoteProcessedFreshness: resolved.remoteProcessedFreshness,
             retryExhausted: resolved.retryExhausted,
             sharedPolicyOverride: resolved.sharedPolicyOverride,
-          }, input.startupMemoryAlreadyInjected, projectDir);
+          }, input.startupMemoryAlreadyInjected, projectDir, input.sessionId, input.providerId, input.serverId, input.trustedOwnerId);
         }
         const personalNamespace: ContextNamespace = {
           scope: 'personal',
@@ -96,7 +104,7 @@ export async function resolveTransportContextBootstrap(
           diagnostics: ['namespace:server-personal-fallback', ...(resolved?.diagnostics ?? [])],
           remoteProcessedFreshness: resolved?.remoteProcessedFreshness,
           retryExhausted: resolved?.retryExhausted,
-        }, input.startupMemoryAlreadyInjected, projectDir);
+        }, input.startupMemoryAlreadyInjected, projectDir, input.sessionId, input.providerId, input.serverId, input.trustedOwnerId);
       } catch {
         const personalNamespace: ContextNamespace = {
           scope: 'personal',
@@ -104,7 +112,7 @@ export async function resolveTransportContextBootstrap(
         };
         return await buildBootstrapResult(personalNamespace, {
           diagnostics: ['namespace:server-resolution-failed', 'namespace:git-origin'],
-        }, input.startupMemoryAlreadyInjected, projectDir);
+        }, input.startupMemoryAlreadyInjected, projectDir, input.sessionId, input.providerId, input.serverId, input.trustedOwnerId);
       }
     }
   }
@@ -115,7 +123,7 @@ export async function resolveTransportContextBootstrap(
   };
   return await buildBootstrapResult(fallbackNamespace, {
     diagnostics: [`namespace:${canonical.kind}`],
-  }, input.startupMemoryAlreadyInjected, projectDir);
+  }, input.startupMemoryAlreadyInjected, projectDir, input.sessionId, input.providerId, input.serverId, input.trustedOwnerId);
 }
 
 async function buildBootstrapResult(
@@ -123,8 +131,20 @@ async function buildBootstrapResult(
   extras: Omit<TransportContextBootstrap, 'namespace' | 'localProcessedFreshness' | 'startupMemory'>,
   skipStartupMemory = false,
   projectDir?: string,
+  sessionId?: string,
+  providerId?: string,
+  serverId?: string,
+  trustedOwnerId?: string,
 ): Promise<TransportContextBootstrap> {
-  const startupMemory = skipStartupMemory ? undefined : await buildTransportStartupMemoryForBootstrap(namespace, projectDir);
+  // Provider conversations retain ordinary startup memory across cold restore,
+  // but managed Skill authority/generation can change while they are offline.
+  // Rebuild only the bounded managed catalog/policy in that case.
+  const startupMemory = skipStartupMemory
+    ? await buildTransportStartupMemory(namespace, {
+        projectDir, sessionId, providerId, serverId, trustedOwnerId,
+        managedSkillsOnly: true,
+      })
+    : await buildTransportStartupMemoryForBootstrap(namespace, projectDir, sessionId, providerId, serverId, trustedOwnerId);
   let localProcessedFreshness: ContextFreshness | undefined;
   const diagnostics = [...(extras.diagnostics ?? [])];
   try {
@@ -146,6 +166,10 @@ async function buildBootstrapResult(
 async function buildTransportStartupMemoryForBootstrap(
   namespace: ContextNamespace,
   projectDir?: string,
+  sessionId?: string,
+  providerId?: string,
+  serverId?: string,
+  trustedOwnerId?: string,
 ): Promise<TransportMemoryRecallArtifact | undefined> {
   const credentials = getSharedContextRuntimeCredentials();
   const remoteItems = credentials
@@ -153,6 +177,10 @@ async function buildTransportStartupMemoryForBootstrap(
     : [];
   return buildTransportStartupMemory(namespace, {
     projectDir,
+    sessionId,
+    providerId,
+    serverId,
+    trustedOwnerId,
     remoteItems,
   });
 }
@@ -163,7 +191,13 @@ export async function buildTransportStartupMemory(
     limit?: number;
     projectDir?: string;
     homeDir?: string;
+    sessionId?: string;
+    providerId?: string;
+    serverId?: string;
+    trustedOwnerId?: string;
     skillsFeatureEnabled?: boolean;
+    /** Cold restore: refresh only current managed Skill metadata/policy. */
+    managedSkillsOnly?: boolean;
     remoteItems?: readonly MemorySearchResultItem[];
   } = STARTUP_MEMORY_TOTAL_LIMIT,
 ): Promise<TransportMemoryRecallArtifact | undefined> {
@@ -172,20 +206,29 @@ export async function buildTransportStartupMemory(
       ? { limit: limitOrOptions }
       : limitOrOptions;
     const limit = options.limit ?? STARTUP_MEMORY_TOTAL_LIMIT;
-    const remoteItems = options.remoteItems ?? [];
+    const remoteItems = options.managedSkillsOnly ? [] : (options.remoteItems ?? []);
     const remoteIds = new Set(remoteItems.map((item) => item.id));
     const selectionOptions = { totalLimit: limit, extraItems: remoteItems };
     // Startup memory selection runs in the context-store worker (bounded L3
     // RPC), off the daemon main thread; falls back to the in-process selection
     // when the worker is not warm so startup never blocks the post-ack dispatch.
-    const processedItems = await selectStartupMemoryForBootstrap(namespace, selectionOptions).catch(() => remoteItems);
-    const observationItems = await selectStartupObservationItems(namespace).catch(() => []);
+    const processedItems = options.managedSkillsOnly
+      ? []
+      : await selectStartupMemoryForBootstrap(namespace, selectionOptions).catch(() => remoteItems);
+    const observationItems = options.managedSkillsOnly
+      ? []
+      : await selectStartupObservationItems(namespace).catch(() => []);
     const memoryById = new Map([...processedItems, ...observationItems].map((item) => [item.id, item]));
     const processedById = new Map(processedItems.map((item) => [item.id, item]));
     const skillCandidates = collectSkillStartupCandidates({
       namespace,
       projectDir: options.projectDir,
       homeDir: options.homeDir,
+      sessionId: options.sessionId,
+      providerId: options.providerId,
+      serverId: options.serverId,
+      trustedOwnerId: options.trustedOwnerId
+        ?? (options.serverId ? getAuthenticatedCapabilityOwner(options.serverId) : undefined),
       featureEnabled: options.skillsFeatureEnabled,
     });
     const selected = selectStartupMemoryByPolicy([
@@ -309,7 +352,7 @@ function renderStartupMemoryText(
     sections.push([
       STARTUP_SKILL_INDEX_HEADER,
       '<startup-skills-index advisory="true">',
-      'Read a listed skill file only when it is relevant to the current task; do not treat this index as the skill body.',
+      'Managed entries are bounded metadata only. When a user invokes one, call capability_status with the exact capabilityId and activate:true. If the named Skill is absent from this budgeted catalog, call capability_list with a narrow query first; legacy entries remain read-on-demand hints.',
       ...skillBlocks.map((candidate) => [
         `- [skill] ${formatRelatedPastWorkSummary(candidate.id, 120)}`,
         candidate.text,

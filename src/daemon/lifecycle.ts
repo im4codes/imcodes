@@ -3,7 +3,7 @@ import { restoreFromStore, setSessionEventCallback, setSessionPersistCallback, r
 import { sessionExists, isPaneAlive, BACKEND, killSession } from '../agent/tmux.js';
 import { detectRepo } from '../repo/detector.js';
 import { repoCache, RepoCache } from '../repo/cache.js';
-import { ServerLink, setServerLinkReconnectResyncHandler } from './server-link.js';
+import { ServerLink, setServerLinkDisconnectSecurityHandler, setServerLinkReconnectResyncHandler } from './server-link.js';
 import { DaemonRemoteDesktop } from './remote-desktop-daemon.js';
 import { closeDaemonRemoteDesktop, setDaemonRemoteDesktop } from './remote-desktop-registry.js';
 import { handleWebCommand, setRouterContext, refreshCodexQuotaMetadata, refreshClaudeSdkSubQuotaMetadata } from './command-handler.js';
@@ -68,6 +68,16 @@ import { buildTransportQueueSnapshotPayload } from './transport-queue-projection
 import { getStaleSessionCompressionRun, resolveSessionCompressionWatchRuns } from '../context/summary-compressor.js';
 import { isServerLinkResyncStatePayload, normalizeActivityGeneration } from '../../shared/session-activity-types.js';
 import type { TransportRuntimeDiagnosticSnapshot } from '../agent/transport-session-runtime.js';
+import { CAPABILITY_OPERATION_MSG, CAPABILITY_SYNC_MSG } from '../../shared/capability-management.js';
+import { CapabilityOperationHandler } from '../capability/capability-operation-handler.js';
+import { clearCapabilityAuthorizationKeys } from '../capability/capability-authorization.js';
+import { DaemonCapabilityServiceAdapter } from '../capability/capability-service-adapter.js';
+import { createCapabilityBlobHttpClient } from '../capability/capability-blob-http-client.js';
+import { CapabilitySyncService } from '../capability/capability-sync-service.js';
+import { createCapabilitySyncRuntime } from '../capability/capability-sync-runtime.js';
+import { CapabilitySyncFrameHandler } from '../capability/capability-sync-handler.js';
+import { CapabilitySourceConvergenceStore } from '../capability/capability-source-convergence.js';
+import { cleanupAbandonedCapabilityQuarantine } from '../capability/skill-acquisition.js';
 
 function latestAssistantTextFromEvents(events: Array<{ type?: unknown; payload?: unknown }>): string | undefined {
   for (let i = events.length - 1; i >= 0; i--) {
@@ -609,6 +619,7 @@ export async function startup(): Promise<DaemonContext> {
     setArchiveBackfillSchedulingEnabled(false);
   }
   if (creds) {
+    cleanupAbandonedCapabilityQuarantine();
     try {
       const runtimeConfig = await fetchBackendSharedContextRuntimeConfig({ workerUrl: workerUrl!, serverId, token });
       setContextModelRuntimeConfig(runtimeConfig);
@@ -684,6 +695,9 @@ export async function startup(): Promise<DaemonContext> {
       }
       return resolveTransportContextBootstrap({
         projectDir: latest.projectDir,
+        sessionId: latest.name,
+        providerId: latest.providerId ?? latest.agentType,
+        serverId: serverId || undefined,
         transportConfig: latest.transportConfig ?? {},
         startupMemoryAlreadyInjected: true,
       });
@@ -697,6 +711,91 @@ export async function startup(): Promise<DaemonContext> {
   let scheduleServerLinkRestoreBroadcast: (() => void) | null = null;
   if (creds) {
     serverLink = new ServerLink({ workerUrl: workerUrl!, serverId, token });
+    const capabilityBlobClient = createCapabilityBlobHttpClient({
+      serverId,
+      loadCredentials: async () => ({ serverId, token, workerUrl: workerUrl! }),
+    });
+    const capabilitySourceConvergenceStore = new CapabilitySourceConvergenceStore();
+    const capabilityServicesByOwner = new Map<string, DaemonCapabilityServiceAdapter>();
+    const capabilitySyncServicesByOwner = new Map<string, CapabilitySyncService>();
+    setServerLinkDisconnectSecurityHandler(() => {
+      for (const ownerId of new Set([...capabilityServicesByOwner.keys(), ...capabilitySyncServicesByOwner.keys()])) {
+        clearCapabilityAuthorizationKeys(ownerId, serverId);
+      }
+    });
+    const capabilitySyncServiceForOwner = (ownerId: string): CapabilitySyncService => {
+      let service = capabilitySyncServicesByOwner.get(ownerId);
+      if (!service) {
+        const runtime = createCapabilitySyncRuntime({
+          ownerId,
+          serverId,
+          blobClient: capabilityBlobClient,
+          convergenceStore: capabilitySourceConvergenceStore,
+        });
+        service = new CapabilitySyncService({
+          ownerId,
+          serverId,
+          loadSkillContent: runtime.loadSkillContent,
+          publishSkill: runtime.publishSkill,
+          reconcileSkill: runtime.reconcileSkill,
+          send: (frame) => serverLink!.send(frame),
+        });
+        capabilitySyncServicesByOwner.set(ownerId, service);
+      }
+      return service;
+    };
+    const capabilityOperationHandler = new CapabilityOperationHandler({
+      isFullDaemon: true,
+      serverId,
+      serviceForOwner: (ownerId) => {
+        let service = capabilityServicesByOwner.get(ownerId);
+        if (!service) {
+          service = new DaemonCapabilityServiceAdapter({
+            ownerId,
+            serverId,
+            conversationIdentity: `imcodes-server-capability:${serverId}`,
+          });
+          capabilityServicesByOwner.set(ownerId, service);
+        }
+        return service;
+      },
+      send: (frame) => serverLink!.send(frame),
+      blobClient: capabilityBlobClient,
+      convergenceStore: capabilitySourceConvergenceStore,
+      onBlobUploadFailure: (failure) => {
+        logger.warn({
+          capabilityId: failure.capabilityId,
+          versionId: failure.versionId,
+          readiness: failure.readiness,
+          errorCode: failure.errorCode,
+        }, 'Capability source blob upload failed closed');
+      },
+    });
+    if (capabilityCandidateCleanupTimer) clearInterval(capabilityCandidateCleanupTimer);
+    capabilityCandidateCleanupTimer = setInterval(() => {
+      void capabilityOperationHandler.cleanupExpiredCandidates().catch((error) => {
+        logger.warn({ error }, 'Expired capability candidate cleanup failed closed');
+      });
+    }, 60_000);
+    capabilityCandidateCleanupTimer.unref?.();
+    serverLink.onOpen(() => {
+      void capabilityOperationHandler.replayPending().catch((error) => {
+        logger.warn({ error }, 'Capability operation outbox replay failed');
+      });
+    });
+    const capabilitySyncHandler = new CapabilitySyncFrameHandler({
+      serviceForOwner: capabilitySyncServiceForOwner,
+      requestFullSnapshot: () => serverLink!.send({ type: CAPABILITY_SYNC_MSG.REQUEST }),
+      onError: (error, context) => {
+        if (context.ownerId) clearCapabilityAuthorizationKeys(context.ownerId, serverId);
+        else {
+          for (const ownerId of capabilitySyncServicesByOwner.keys()) {
+            clearCapabilityAuthorizationKeys(ownerId, serverId);
+          }
+        }
+        logger.warn({ error, ...context }, 'Capability synchronization failed closed');
+      },
+    });
     // Heal the exact loss window observed on deck_sub_26624c1t: an
     // authoritative `session.state: idle` emitted while the ServerLink socket
     // was down is silently dropped (control-plane, no replay), leaving the
@@ -733,6 +832,28 @@ export async function startup(): Promise<DaemonContext> {
       onCapabilityChange: () => link.refreshDaemonCapabilities(),
     }));
     serverLink.onMessage((msg) => {
+      const type = msg && typeof msg === 'object' && 'type' in msg ? (msg as { type?: unknown }).type : undefined;
+      if (type === CAPABILITY_OPERATION_MSG.INSTALL
+        || type === CAPABILITY_OPERATION_MSG.CONFIRM
+        || type === CAPABILITY_OPERATION_MSG.CANCEL
+        || type === CAPABILITY_OPERATION_MSG.AUTHORIZE
+        || type === CAPABILITY_OPERATION_MSG.COMMIT_ACK
+        || type === CAPABILITY_OPERATION_MSG.COMMIT_ABORT
+        || type === CAPABILITY_OPERATION_MSG.MANAGE
+        || type === CAPABILITY_OPERATION_MSG.MANAGE_ACK
+        || type === CAPABILITY_SYNC_MSG.BLOB_CAPABILITY) {
+        void capabilityOperationHandler.handle(msg).catch((error) => {
+          logger.warn({ error, type }, 'Capability operation handler failed closed');
+        });
+        return;
+      }
+      if (type === CAPABILITY_SYNC_MSG.SNAPSHOT
+        || type === CAPABILITY_SYNC_MSG.DELTA
+        || type === CAPABILITY_SYNC_MSG.TOMBSTONE
+        || type === CAPABILITY_SYNC_MSG.AUTHORITY) {
+        void capabilitySyncHandler.handle(msg);
+        return;
+      }
       handleWebCommand(msg, serverLink!);
     });
     serverLink.onBinaryMessage((data) => {
@@ -1522,6 +1643,10 @@ export async function shutdown(exitCode = 0): Promise<void> {
     if (contextMaterializationTimer) clearInterval(contextMaterializationTimer);
     if (gcTimer) clearInterval(gcTimer);
     if (eventLoopDelayTimer) clearInterval(eventLoopDelayTimer);
+    if (capabilityCandidateCleanupTimer) {
+      clearInterval(capabilityCandidateCleanupTimer);
+      capabilityCandidateCleanupTimer = null;
+    }
     workerSessionSyncRetrier?.stop();
     workerSessionSyncRetrier = null;
     hookServer?.close();
@@ -1569,6 +1694,7 @@ let usageSyncWorker: UsageSyncWorker | null = null;
 let contextMaterializationTimer: ReturnType<typeof setInterval> | null = null;
 let gcTimer: ReturnType<typeof setInterval> | null = null;
 let eventLoopDelayTimer: ReturnType<typeof setInterval> | null = null;
+let capabilityCandidateCleanupTimer: ReturnType<typeof setInterval> | null = null;
 let hookServer: http.Server | null = null;
 
 /** Mark an execution clone whose tmux pane has died as completed so the GC

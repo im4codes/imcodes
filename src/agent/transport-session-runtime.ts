@@ -50,6 +50,7 @@ import type { MemoryContextTimelinePayload, MemoryContextTimelinePreferenceItem 
 import { buildMemoryContextTimelinePayload, buildMemoryContextStatusPayload } from '../daemon/memory-context-timeline.js';
 import { appendTransportEvent } from '../daemon/transport-history.js';
 import { timelineEmitter } from '../daemon/timeline-emitter.js';
+import { mintCapabilityRuntimeToken, revokeCapabilityRuntimeToken } from '../capability/capability-runtime-token.js';
 import {
   buildSdkSubagentWakePrompt,
   isBackgroundedSdkSubagentTool,
@@ -420,6 +421,8 @@ export class TransportSessionRuntime implements SessionRuntime {
   private _status: AgentStatus = 'idle';
   private _history: AgentMessage[] = [];
   private _providerSessionId: string | null = null;
+  private _capabilityRuntimeToken: string | undefined;
+  private _capabilityRuntimeSessionId: string | undefined;
   /** Route id expected while provider.createSession() is still resolving.
    *  Some providers synchronously publish the durable resume id before that
    *  promise returns; retain those exact-session updates instead of dropping
@@ -1751,9 +1754,28 @@ export class TransportSessionRuntime implements SessionRuntime {
       this._startupMemory = null;
     }
 
+    let providerConfig = config;
+    if (config.sessionName && config.providerId && config.serverId && config.capabilityOwnerId) {
+      const token = mintCapabilityRuntimeToken({
+        ownerId: config.capabilityOwnerId,
+        sessionId: config.sessionName,
+        providerId: config.providerId,
+        serverId: config.serverId,
+      });
+      this._capabilityRuntimeToken = token;
+      this._capabilityRuntimeSessionId = config.sessionName;
+      providerConfig = { ...config, capabilityRuntimeToken: token };
+    }
     this._initializingProviderSessionId = config.bindExistingKey ?? config.sessionKey;
     try {
-      this._providerSessionId = await this.provider.createSession(config);
+      this._providerSessionId = await this.provider.createSession(providerConfig);
+    } catch (error) {
+      if (this._capabilityRuntimeSessionId) {
+        revokeCapabilityRuntimeToken(this._capabilityRuntimeSessionId, this._capabilityRuntimeToken);
+      }
+      this._capabilityRuntimeToken = undefined;
+      this._capabilityRuntimeSessionId = undefined;
+      throw error;
     } finally {
       this._initializingProviderSessionId = null;
     }
@@ -2325,6 +2347,11 @@ export class TransportSessionRuntime implements SessionRuntime {
     preserveTransportQueue?: boolean;
     detachProviderSession?: boolean;
   } = {}): Promise<void> {
+    if (this._capabilityRuntimeSessionId) {
+      revokeCapabilityRuntimeToken(this._capabilityRuntimeSessionId, this._capabilityRuntimeToken);
+      this._capabilityRuntimeToken = undefined;
+      this._capabilityRuntimeSessionId = undefined;
+    }
     this.stopCodexRolloutBackstop();
     if (this._backgroundSubagentWakeTimer) clearTimeout(this._backgroundSubagentWakeTimer);
     this._backgroundSubagentWakeTimer = null;

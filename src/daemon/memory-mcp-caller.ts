@@ -14,6 +14,8 @@ export interface McpRuntimeCaller {
   projectName: string | null;
   projectRoot: string | null;
   serverId: string | null;
+  providerId: string | null;
+  capabilityToken?: string | null;
   transport: MemoryMcpTransport;
 }
 
@@ -97,6 +99,8 @@ export function parseMcpRuntimeCallerFromEnv(
     projectName: optionalString(env[MEMORY_MCP_ENV_KEYS.PROJECT_NAME]),
     projectRoot: optionalString(env[MEMORY_MCP_ENV_KEYS.PROJECT_ROOT]),
     serverId: optionalString(env[MEMORY_MCP_ENV_KEYS.SERVER_ID]),
+    providerId: optionalString(env[MEMORY_MCP_ENV_KEYS.PROVIDER_ID]),
+    capabilityToken: optionalString(env[MEMORY_MCP_ENV_KEYS.CAPABILITY_TOKEN]),
     transport,
   });
 }

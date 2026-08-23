@@ -36,6 +36,10 @@ import {
   AGENT_DELEGATION_REPLY_ERRORS,
   AGENT_DELEGATION_REPLY_TOTAL_BYTES,
 } from '../../shared/agent-delegation.js';
+import { getAuthenticatedCapabilityOwner } from '../capability/capability-authorization.js';
+import { isMemoryScope, validateMemoryScopeIdentity } from '../../shared/memory-scope.js';
+import type { ContextNamespace } from '../../shared/context-types.js';
+import { verifyCapabilityRuntimeToken } from '../capability/capability-runtime-token.js';
 
 export { DEFAULT_HOOK_PORT };
 
@@ -53,6 +57,34 @@ const RATE_LIMIT_MAX = 10;
 const RATE_LIMIT_WINDOW_MS = 60 * 1000;
 /** Max broadcast recipients */
 const MAX_BROADCAST_RECIPIENTS = 8;
+
+function validCapabilityNamespace(value: unknown): value is ContextNamespace {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const namespace = value as ContextNamespace;
+  if (!isMemoryScope(namespace.scope)) return false;
+  return validateMemoryScopeIdentity(namespace.scope, {
+    user_id: namespace.userId,
+    project_id: namespace.projectId,
+    workspace_id: namespace.workspaceId,
+    org_id: namespace.enterpriseId,
+    tenant_id: namespace.localTenant,
+  }).ok;
+}
+
+function capabilityNamespaceForSession(session: SessionRecord, ownerId: string): ContextNamespace {
+  const rawNamespace: unknown = session.contextNamespace;
+  if (validCapabilityNamespace(rawNamespace)) {
+    return { ...rawNamespace, userId: ownerId };
+  }
+  const candidateProjectId = rawNamespace && typeof rawNamespace === 'object'
+    ? (rawNamespace as Record<string, unknown>).projectId
+    : undefined;
+  const priorProjectId = typeof candidateProjectId === 'string'
+    && Buffer.byteLength(candidateProjectId, 'utf8') <= 512
+    ? candidateProjectId
+    : undefined;
+  return { scope: 'personal', userId: ownerId, ...(priorProjectId ? { projectId: priorProjectId } : {}) };
+}
 
 /** The port the hook server is currently listening on. Set after startHookServer() resolves. */
 export let activeHookPort: number = DEFAULT_HOOK_PORT;
@@ -539,6 +571,38 @@ export async function startHookServer(onHook: HookCallback): Promise<{ server: h
     }
 
     const url = req.url;
+
+    if (url === '/capability-identity') {
+      const senderHeader = req.headers['x-imcodes-session'];
+      const senderSessionName = Array.isArray(senderHeader) ? senderHeader[0] : senderHeader;
+      try {
+        const body = JSON.parse(await readBody(req, 4096)) as Record<string, unknown>;
+        const providerId = typeof body.providerId === 'string' ? body.providerId.trim() : '';
+        const serverId = typeof body.serverId === 'string' ? body.serverId.trim() : '';
+        const capabilityToken = typeof body.capabilityToken === 'string' ? body.capabilityToken.trim() : '';
+        const session = senderSessionName ? getSession(senderSessionName) : null;
+        const sessionProviderId = session?.providerId ?? session?.agentType;
+        const ownerId = serverId ? getAuthenticatedCapabilityOwner(serverId) : undefined;
+        const projectDir = session?.projectDir?.trim();
+        if (!session || !providerId || !serverId || !capabilityToken || sessionProviderId !== providerId || !ownerId
+          || !verifyCapabilityRuntimeToken({ ownerId, sessionId: session.name, providerId, serverId, token: capabilityToken })
+          || (projectDir && Buffer.byteLength(projectDir, 'utf8') > 4096)) {
+          res.writeHead(403, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'capability_identity_unavailable' }));
+          return;
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          ok: true, ownerId, providerId, serverId, sessionId: session.name,
+          namespace: capabilityNamespaceForSession(session, ownerId),
+          ...(projectDir ? { projectDir } : {}),
+        }));
+      } catch {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'malformed' }));
+      }
+      return;
+    }
 
     if (url === '/audit-reply') {
       const contentType = req.headers['content-type'] ?? '';

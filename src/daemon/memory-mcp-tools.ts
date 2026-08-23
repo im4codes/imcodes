@@ -94,6 +94,8 @@ import {
   type AgentDelegationAuditRequest,
   type AgentDelegationReplyEnvelope,
 } from '../../shared/agent-delegation.js';
+import type { CapabilityService } from '../../shared/capability-management.js';
+import type { CapabilityRuntimeIdentity } from './capability-mcp-tools.js';
 import { decodePeerAuditReplyCommandStructure } from './peer-audit-reply-ingress.js';
 import { deriveMemoryToolCaller, type McpRuntimeCaller } from './memory-mcp-caller.js';
 import { memoryGetSources } from '../context/memory-read-tools.js';
@@ -146,6 +148,11 @@ type MemoryMcpListSummaries = (query: {
 const repositoryIdentityService = new GitOriginRepositoryIdentityService();
 
 export interface MemoryMcpToolDeps {
+  /** Owner-only AI-managed MCP/Skill service. Capability tools are absent when unavailable. */
+  capabilityService?: CapabilityService;
+  /** Additional authoritative owner check for capability discovery and dispatch. */
+  isCapabilityOwner?: (caller: McpRuntimeCaller) => boolean;
+  resolveCapabilityIdentity?: (caller: McpRuntimeCaller) => Promise<CapabilityRuntimeIdentity | null>;
   featureFlags?: MCPFeatureFlagValues;
   isMemoryFeatureEnabled?: (flag: MemoryFeatureFlag) => boolean;
   searchMemory?: MemoryMcpSearch;

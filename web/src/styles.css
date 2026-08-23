@@ -10140,3 +10140,470 @@ button.quick-agent-delegation-preset.active {
 @media (prefers-reduced-motion: reduce) {
   .download-transfer-progress.indeterminate > span { animation: none; }
 }
+.capabilities-panel {
+  margin: 0 0 16px;
+  padding: 20px;
+  border: 1px solid rgba(56, 189, 248, 0.24);
+  border-radius: 14px;
+  background:
+    radial-gradient(circle at 100% 0, rgba(14, 165, 233, 0.12), transparent 38%),
+    #111827;
+  color: #e2e8f0;
+}
+
+.capabilities-panel *,
+.capability-confirm-dialog * {
+  box-sizing: border-box;
+}
+
+.capabilities-panel-header h2,
+.capability-operation-header h3,
+.capability-item h3,
+.capability-confirm-dialog h3 {
+  margin: 0;
+  color: #f8fafc;
+}
+
+.capabilities-panel-header p,
+.capability-status-detail,
+.capability-confirm-dialog p {
+  margin: 7px 0 0;
+  color: #a8b6c9;
+  line-height: 1.55;
+}
+
+.capability-eyebrow,
+.capability-kind {
+  display: block;
+  margin-bottom: 5px;
+  color: #67e8f9;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: .09em;
+  text-transform: uppercase;
+}
+
+.capability-ask-ai,
+.capability-manual-form,
+.capability-operation-card {
+  margin-top: 16px;
+  padding: 16px;
+  border: 1px solid #27364d;
+  border-radius: 12px;
+  background: rgba(15, 23, 42, .88);
+}
+
+.capability-ask-ai > label,
+.capability-manual-form label,
+.capability-confirm-dialog label {
+  display: grid;
+  gap: 7px;
+  color: #cbd5e1;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.capability-source-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.capability-source-row input,
+.capability-manual-form textarea,
+.capability-manual-form select,
+.capability-inventory-toolbar input,
+.capability-inventory-toolbar select,
+.capability-confirm-dialog select {
+  width: 100%;
+  min-width: 0;
+  border: 1px solid #334155;
+  border-radius: 8px;
+  background: #090f1d;
+  color: #e2e8f0;
+  padding: 9px 11px;
+  font: inherit;
+}
+
+.capability-source-row input:focus-visible,
+.capability-manual-form textarea:focus-visible,
+.capability-manual-form select:focus-visible,
+.capability-inventory-toolbar input:focus-visible,
+.capability-inventory-toolbar select:focus-visible,
+.capability-confirm-dialog select:focus-visible,
+.capability-button:focus-visible,
+.capability-link-button:focus-visible {
+  outline: 2px solid #38bdf8;
+  outline-offset: 2px;
+}
+
+.capability-form-grid,
+.capability-inventory-toolbar {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.capability-manual-form {
+  display: grid;
+  gap: 12px;
+}
+
+.capability-update-target,
+.capability-file-import {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-width: 0;
+}
+
+.capability-update-target {
+  border: 1px solid rgba(56, 189, 248, .32);
+  border-radius: 8px;
+  background: rgba(14, 116, 144, .15);
+  color: #bae6fd;
+  padding: 9px 11px;
+  font-size: 12px;
+}
+
+.capability-file-import input[type="file"] {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+.capability-digest {
+  overflow-wrap: anywhere;
+  word-break: break-all;
+}
+
+.capability-muted {
+  margin: 8px 0;
+  color: #8493a9;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.capability-button,
+.capability-link-button {
+  min-height: 36px;
+  border: 1px solid #3b4c66;
+  border-radius: 8px;
+  background: #263449;
+  color: #e5edf7;
+  padding: 8px 13px;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.capability-link-button {
+  min-height: auto;
+  border: 0;
+  background: transparent;
+  color: #7dd3fc;
+  padding: 6px 0;
+}
+
+.capability-button-primary {
+  border-color: #0284c7;
+  background: linear-gradient(135deg, #0284c7, #2563eb);
+  color: white;
+}
+
+.capability-button-danger {
+  border-color: rgba(248, 113, 113, .55);
+  background: rgba(127, 29, 29, .5);
+  color: #fecaca;
+}
+
+.capability-button:disabled,
+.capability-link-button:disabled {
+  cursor: not-allowed;
+  opacity: .48;
+}
+
+.capability-operation-header,
+.capability-item > header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 12px;
+}
+
+.capability-state {
+  flex: 0 0 auto;
+  border: 1px solid #475569;
+  border-radius: 999px;
+  padding: 4px 8px;
+  color: #cbd5e1;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.capability-state-active,
+.capability-state-installed {
+  border-color: rgba(74, 222, 128, .45);
+  background: rgba(20, 83, 45, .35);
+  color: #86efac;
+}
+
+.capability-state-rework,
+.capability-state-failed,
+.capability-state-degraded {
+  border-color: rgba(248, 113, 113, .5);
+  background: rgba(127, 29, 29, .28);
+  color: #fca5a5;
+}
+
+.capability-state-awaiting_confirmation,
+.capability-state-runtime_pending {
+  border-color: rgba(251, 191, 36, .45);
+  background: rgba(120, 53, 15, .28);
+  color: #fde68a;
+}
+
+.capability-progress {
+  height: 5px;
+  margin-top: 13px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: #1e293b;
+}
+
+.capability-progress span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #06b6d4, #3b82f6);
+  transition: width .2s ease;
+}
+
+.capability-inline-alert,
+.capability-risk-summary,
+.capability-credential-note {
+  margin-top: 12px;
+  border: 1px solid rgba(251, 191, 36, .35);
+  border-radius: 8px;
+  background: rgba(120, 53, 15, .2);
+  color: #fde68a;
+  padding: 9px 11px;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.capability-inline-alert {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+}
+
+.capability-facts {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 6px 12px;
+  margin: 13px 0 0;
+  font-size: 12px;
+}
+
+.capability-facts dt {
+  color: #7f8ea4;
+}
+
+.capability-facts dd {
+  min-width: 0;
+  margin: 0;
+  color: #cbd5e1;
+  overflow-wrap: anywhere;
+}
+
+.capability-card-section {
+  margin-top: 14px;
+}
+
+.capability-card-section h4 {
+  margin: 0 0 7px;
+  color: #cbd5e1;
+  font-size: 12px;
+}
+
+.capability-card-section ul {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding-left: 20px;
+}
+
+.capability-risk-section {
+  border-left: 3px solid #f59e0b;
+  padding-left: 11px;
+}
+
+.capability-warning,
+.capability-finding {
+  color: #e2e8f0;
+  font-size: 12px;
+}
+
+.capability-warning span,
+.capability-finding-summary,
+.capability-warning code,
+.capability-finding code {
+  display: block;
+  margin-top: 3px;
+}
+
+.capability-finding-severity {
+  margin-right: 6px;
+  color: #fecaca;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.capability-command {
+  overflow-x: auto;
+  border: 1px solid #475569;
+  border-radius: 6px;
+  background: #020617;
+  color: #fda4af;
+  padding: 7px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.capability-chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 10px;
+}
+
+.capability-chip-row > * {
+  border: 1px solid #334155;
+  border-radius: 999px;
+  background: #0b1220;
+  color: #bae6fd;
+  padding: 3px 7px;
+  font-size: 11px;
+}
+
+.capability-operation-actions,
+.capability-item-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 15px;
+}
+
+.capability-inventory-toolbar {
+  margin-top: 18px;
+}
+
+.capability-inventory {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.capability-item {
+  min-width: 0;
+  border: 1px solid #28364b;
+  border-radius: 11px;
+  background: rgba(9, 15, 29, .72);
+  padding: 14px;
+}
+
+.capability-item h3 {
+  overflow-wrap: anywhere;
+  font-size: 15px;
+}
+
+.capability-empty {
+  margin-top: 12px;
+  border: 1px dashed #334155;
+  border-radius: 10px;
+  color: #8493a9;
+  padding: 24px;
+  text-align: center;
+}
+
+.capability-confirm-overlay {
+  position: fixed;
+  z-index: 10020;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  background: rgba(2, 6, 23, .8);
+  padding: max(16px, env(safe-area-inset-top)) max(16px, env(safe-area-inset-right)) max(16px, env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left));
+}
+
+.capability-confirm-dialog {
+  width: min(440px, 100%);
+  max-height: min(620px, calc(100vh - 32px));
+  overflow-y: auto;
+  border: 1px solid #475569;
+  border-radius: 14px;
+  background: #111827;
+  color: #e2e8f0;
+  padding: 20px;
+  box-shadow: 0 24px 80px rgba(0, 0, 0, .5);
+}
+
+.capability-global-operation {
+  position: fixed;
+  z-index: 9300;
+  right: max(16px, env(safe-area-inset-right));
+  bottom: max(16px, env(safe-area-inset-bottom));
+  width: min(440px, calc(100vw - 32px));
+  max-height: min(720px, calc(100vh - 32px));
+  overflow-y: auto;
+  border-radius: 15px;
+  box-shadow: 0 24px 80px rgba(0, 0, 0, .58);
+}
+
+.capability-global-operation > .capability-inline-alert {
+  margin: 0 0 8px;
+}
+
+.capability-global-operation .capability-operation-card {
+  margin: 0;
+  background: rgba(9, 15, 29, .98);
+  backdrop-filter: blur(16px);
+}
+
+@media (max-width: 640px) {
+  .capability-global-operation {
+    right: max(8px, env(safe-area-inset-right));
+    bottom: max(72px, calc(env(safe-area-inset-bottom) + 64px));
+    width: calc(100vw - max(16px, env(safe-area-inset-left) + env(safe-area-inset-right)));
+    max-height: min(68vh, 620px);
+  }
+
+  .capabilities-panel {
+    padding: 14px;
+  }
+
+  .capability-source-row,
+  .capability-form-grid,
+  .capability-inventory-toolbar,
+  .capability-inventory {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .capability-source-row .capability-button {
+    width: 100%;
+  }
+
+  .capability-operation-header,
+  .capability-item > header {
+    align-items: flex-start;
+  }
+}

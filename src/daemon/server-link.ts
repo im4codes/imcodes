@@ -207,6 +207,17 @@ let serverLinkReconnectResyncHandler: (() => void) | null = null;
 export function setServerLinkReconnectResyncHandler(handler: (() => void) | null): void {
   serverLinkReconnectResyncHandler = handler;
 }
+let serverLinkDisconnectSecurityHandler: (() => void) | null = null;
+export function setServerLinkDisconnectSecurityHandler(handler: (() => void) | null): void {
+  serverLinkDisconnectSecurityHandler = handler;
+}
+function clearServerLinkSecurity(reason: string): void {
+  try {
+    serverLinkDisconnectSecurityHandler?.();
+  } catch (err) {
+    logger.warn({ err, reason }, 'ServerLink: disconnect security cleanup failed');
+  }
+}
 const DAEMON_STATIC_CAPABILITIES = [
   SESSION_GROUP_CLONE_CAPABILITY_V1,
   // Distinct from session-group-clone — gates the dedicated execution-clone
@@ -290,6 +301,7 @@ export function __setServerLinkDataPlaneQueueConfigForTests(options: {
 export class ServerLink {
   private ws: WebSocket | null = null;
   private handlers: MessageHandler[] = [];
+  private openHandlers: Array<() => void> = [];
   private binaryHandlers: BinaryMessageHandler[] = [];
   private heartbeatTimer?: ReturnType<typeof setInterval>;
   private statsTimer?: ReturnType<typeof setInterval>;
@@ -341,6 +353,9 @@ export class ServerLink {
   }
 
   connect(): void {
+    // A new authentication attempt replaces all authority learned over the
+    // prior socket, even if that socket never delivers a close event.
+    clearServerLinkSecurity('connect_replacement');
     // Clean up previous connection if any
     this.stopHeartbeat();
     this.stopWatchdog();
@@ -416,6 +431,9 @@ export class ServerLink {
           DAEMON_UPGRADE_BLOCKED_SYNC_PROTOCOL.REVISION,
       }));
       this.sendDaemonHello();
+      for (const handler of this.openHandlers) {
+        try { handler(); } catch (err) { logger.warn({ err }, 'ServerLink: open handler failed'); }
+      }
       // Wire transport relay so provider callbacks can send events to browsers via this socket.
       setTransportRelaySend((msg) => {
         try {
@@ -503,6 +521,7 @@ export class ServerLink {
       if (this.ws !== ws) return; // stale socket — a newer connection already took over
       clearConnectTimeout();
       const errorMessage = (event as ErrorEvent).message ?? 'unknown';
+      clearServerLinkSecurity('socket_error');
       logger.warn({ error: errorMessage }, 'ServerLink: error');
       this.recordRuntimeLinkStatus({
         state: 'disconnected',
@@ -572,6 +591,7 @@ export class ServerLink {
       if (this.ws !== ws) return;
       clearConnectTimeout();
       logger.info({ code: event.code, reason: event.reason }, 'ServerLink: closed');
+      clearServerLinkSecurity('socket_close');
       this.recordRuntimeLinkStatus({
         state: 'disconnected',
         lastDisconnectedAt: Date.now(),
@@ -595,6 +615,7 @@ export class ServerLink {
 
   trySend(msg: unknown): boolean {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      clearServerLinkSecurity('send_without_open_socket');
       // Best-effort: silently drop messages when the link isn't up. Throwing
       // here would become an unhandled rejection in any fire-and-forget
       // caller (handleP2pConfigSave, repo-handler, command-handler, etc.)
@@ -643,6 +664,7 @@ export class ServerLink {
       });
       return true;
     } catch (err) {
+      clearServerLinkSecurity('socket_send_error');
       recordServerSend({
         msgType: typeof (msg as { type?: unknown })?.type === 'string' ? (msg as { type: string }).type : undefined,
         commandId: typeof (msg as { commandId?: unknown })?.commandId === 'string' ? (msg as { commandId: string }).commandId : undefined,
@@ -952,11 +974,17 @@ export class ServerLink {
     this.handlers.push(handler);
   }
 
+  /** Runs after the auth frame is queued on every initial/replacement socket. */
+  onOpen(handler: () => void): void {
+    this.openHandlers.push(handler);
+  }
+
   onBinaryMessage(handler: BinaryMessageHandler): void {
     this.binaryHandlers.push(handler);
   }
 
   disconnect(): void {
+    clearServerLinkSecurity('explicit_disconnect');
     this.stopping = true;
     this.stopHeartbeat();
     this.stopWatchdog();
@@ -1086,6 +1114,7 @@ export class ServerLink {
 
   /** Kill current connection and force immediate reconnect */
   private forceReconnect(reason = 'watchdog_forced_reconnect'): void {
+    clearServerLinkSecurity(reason);
     this.stopHeartbeat();
     this.stopWatchdog();
     if (this.reconnectTimer) { clearTimeout(this.reconnectTimer); this.reconnectTimer = undefined; }

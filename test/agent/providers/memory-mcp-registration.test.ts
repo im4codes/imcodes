@@ -10,6 +10,8 @@ import {
   IMCODES_DAEMON_NAMESPACE_ENV,
   IMCODES_DAEMON_PROJECT_NAME_ENV,
   IMCODES_DAEMON_PROJECT_ROOT_ENV,
+  IMCODES_DAEMON_PROVIDER_ID_ENV,
+  IMCODES_DAEMON_CAPABILITY_TOKEN_ENV,
   IMCODES_DAEMON_SERVER_ID_ENV,
   IMCODES_DAEMON_SESSION_NAME_ENV,
   IMCODES_DAEMON_USER_ID_ENV,
@@ -31,6 +33,8 @@ const sessionConfig = {
   sessionName: 'deck_alpha_worker',
   projectName: 'alpha',
   serverId: 'srv-bound',
+  providerId: 'codex-sdk',
+  capabilityRuntimeToken: 'runtime-token-registration',
   cwd: '/tmp/project',
   env: {
     [IMCODES_SESSION_ENV]: 'deck_alpha_worker',
@@ -90,6 +94,8 @@ describe('managed provider MCP registration helpers', () => {
     expect(server.env[IMCODES_DAEMON_PROJECT_NAME_ENV]).toBe('alpha');
     expect(server.env[IMCODES_DAEMON_PROJECT_ROOT_ENV]).toBe('/tmp/project');
     expect(server.env[IMCODES_DAEMON_SERVER_ID_ENV]).toBe('srv-bound');
+    expect(server.env[IMCODES_DAEMON_PROVIDER_ID_ENV]).toBe('codex-sdk');
+    expect(server.env[IMCODES_DAEMON_CAPABILITY_TOKEN_ENV]).toBe('runtime-token-registration');
     expect(server.env.IMCODES_SERVER_TOKEN).toBeUndefined();
     expect(server.env.OAUTH_TOKEN).toBeUndefined();
     expect(Object.keys(server.env).every(isMemoryMcpAllowedEnvKey)).toBe(true);

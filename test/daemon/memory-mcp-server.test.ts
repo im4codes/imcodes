@@ -196,9 +196,11 @@ describe('memory MCP stdio server', () => {
       // size here. This keeps the fixed tools/list prompt bounded while
       // allowing the complete message-pin CRUD/search schemas.
       // Explicit-path machine file-transfer tools plus the strict structured
-      // peer-audit reply envelope and recurring-cron completion policy add
-      // safety contracts to the fixed surface.
-      expect(JSON.stringify(listed.tools).length).toBeLessThanOrEqual(33_000);
+      // peer-audit reply envelope, recurring-cron completion policy, and the
+      // four unified capability-management contracts add safety contracts to
+      // the fixed surface. Keep explicit headroom bounded rather than silently
+      // dropping those schemas from managed providers.
+      expect(JSON.stringify(listed.tools).length).toBeLessThanOrEqual(40_000);
       expect(JSON.stringify(listed)).not.toContain('server-secret');
       expect(JSON.stringify(listed)).not.toContain('api-secret');
     } finally {
@@ -604,11 +606,17 @@ describe('mergeDefaultToolDeps per-field composition', () => {
     expect(typeof merged.sendDeps?.cancelSession).toBe('function');
     expect(typeof merged.sendDeps?.resolveExecutionCloneLimits).toBe('function');
     expect(typeof merged.sendDeps?.isExecutionCloneCapabilityEnabled).toBe('function');
+    expect(merged.capabilityService).toBeDefined();
 
     // The composed limit resolver is backed by the daemon resolver (mocked cap=1),
     // proving it is wired without a manual inject.
     expect(merged.sendDeps?.resolveExecutionCloneLimits?.('run-x')).toMatchObject({
       maxParallelClones: 1,
     });
+  });
+
+  it('keeps capability management absent when the scoped daemon identity is unavailable', () => {
+    const merged = mergeDefaultToolDeps({ ...caller, serverId: null }, {});
+    expect(merged.capabilityService).toBeUndefined();
   });
 });

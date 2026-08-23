@@ -1722,6 +1722,25 @@
       }
     }
   },
+  "capabilities": {
+    "eyebrow": "跨 Agent 的 AI 能力", "globalNoticeLabel": "MCP 與 Skill 安裝狀態", "title": "MCP 與 Skills", "description": "在 IM.codes 新增一次，即可在支援的 Agent 與電腦使用同一份已稽核能力。",
+    "askAiLabel": "告訴 AI 要新增什麼", "askAiPlaceholder": "貼上 URL、儲存庫、本機路徑或 MCP 資訊", "askAiAction": "讓 AI 新增", "askAiNeedsSession": "請先開啟聊天工作階段，再把資訊交給 AI。",
+    "askAiPrompt": "請透過 IM.codes 安全新增下列 MCP 或 Skill，並嚴格完成自動掃描與獨立 AI 稽核：\n{{source}}",
+    "showManual": "改用手動設定", "hideManual": "收起手動設定", "manualSourceLabel": "來源或設定", "manualSourcePlaceholder": "URL、儲存庫、本機路徑或 MCP JSON/JSONC/TOML",
+    "manualSafetyHint": "IM.codes 不會執行腳本或 stdio 命令；系統會先掃描，再由隔離 AI 稽核完全相同的內容，最後由你確認。", "mcpConfigInvalid": "請輸入有效的 HTTPS MCP 位址或不含密鑰的 JSON、JSONC、TOML；不支援、含密鑰或格式錯誤的內容不會提交。", "skillSourceInvalid": "請輸入 HTTPS 下載位址、不含憑據的 HTTPS Git 儲存庫或絕對本機路徑。不接受 SSH 儲存庫和純文字。", "manualNeedsServer": "開始手動安裝前，請先選擇一台上線的受控電腦。", "scanAndReview": "掃描並稽核", "scanUpdateAndReview": "掃描更新並稽核", "manualInstallIntent": "手動安裝 MCP 或 Skill", "manualUpdateIntent": "使用使用者提供的內容更新 {{name}}", "updateTarget": "正在更新 {{name}}。請提供新的來源或設定；IM.codes 不會重用僅供顯示的來源標籤。", "cancelUpdate": "取消更新", "updateSingleSource": "一次更新只能包含一個 MCP 定義；批次內容請拆分安裝。", "importFileLabel": "選擇 MCP JSON、JSONC 或 TOML 檔案", "importFileAction": "選擇設定檔", "importTooLarge": "該設定檔超過安全匯入上限。", "importReadError": "無法讀取該設定檔，未提交任何內容。", "importPartial": "已啟動 {{installed}} 個有效匯入；{{failed}} 個無效或失敗項目未安裝。",
+    "operationTitle": "安裝狀態", "pendingName": "正在準備能力", "progressLabel": "安裝進度：{{progress}}%", "offlineKeepingState": "目前離線。狀態已保留，重新連線後會從伺服器繼續。", "operationError": "操作已停止：{{code}}",
+    "loadError": "無法載入 MCP 與 Skills，未進行任何變更。", "statusRefreshError": "無法重新整理目前操作，仍顯示最後確認的狀態。", "installStartError": "無法開始安裝，沒有安裝任何內容。", "confirmationError": "確認未被接受，請重新整理後再檢查。", "confirmationEvidenceMissing": "伺服器未提供完整的雜湊綁定稽核證據，因此安裝已停用。", "manageError": "管理操作失敗，原狀態保持不變。",
+    "kindLabel": "類型", "scopeLabel": "範圍", "sourceLabel": "來源", "versionLabel": "版本", "readinessLabel": "可用狀態", "artifactDigestLabel": "工件摘要", "providersLabel": "Agent 提供方", "machinesLabel": "目標電腦", "allCompatibleProviders": "所有相容的 Agent 提供方", "allAllowedMachines": "所有獲准電腦", "updateChanges": "本次更新內容", "riskDetails": "重要執行資訊", "blockingFindings": "嚴重或高風險發現", "otherFindings": "其他稽核發現", "toolsLabel": "工具", "permissionsLabel": "請求的權限",
+    "installConfirm": "安裝", "working": "處理中…", "retry": "重試", "searchPlaceholder": "搜尋名稱、來源、工具或狀態", "searchLabel": "搜尋 MCP 與 Skills", "filterLabel": "篩選 MCP 與 Skills", "empty": "尚未安裝 MCP 服務或受管 Skill。", "noMatches": "沒有符合條件的能力。",
+    "warningCount_one": "{{count}} 項執行警告", "warningCount_other": "{{count}} 項執行警告", "rollbackVersion": "恢復版本", "chooseVersion": "選擇版本", "chooseBinding": "目標綁定", "chooseBindingPlaceholder": "選擇一個範圍", "manageBindingMissing": "此操作沒有精確的綁定目標，請重新整理後再試。", "chooseUpdateBinding": "選擇 {{name}} 的更新範圍", "continueUpdate": "繼續更新", "credentialsRetained": "解除安裝預設保留獨立憑據庫中的憑據，只有專門操作才會刪除。",
+    "kind": { "skill": "Skill", "mcp": "MCP", "unknown": "能力" }, "scope": { "account": "帳號 · 同步到相容電腦", "local": "僅此電腦", "project": "專案", "session": "工作階段", "unknown": "未知" },
+    "state": { "queued": "已排隊", "acquiring": "正在取得", "scanning": "安全掃描", "auditing": "安全稽核", "awaiting_confirmation": "等待檢查並安裝", "installing": "正在安裝", "syncing": "正在同步", "installed": "已安裝", "rework": "需要修改", "failed": "失敗", "cancelled": "已取消", "pending": "待處理", "active": "已啟用", "disabled": "已停用", "runtime_pending": "執行環境待就緒", "tombstoned": "已解除安裝", "removed": "已移除", "degraded": "能力降級", "unknown": "未知" },
+    "readiness": { "ready": "可用", "runtime_pending": "已儲存；執行環境尚未就緒", "degraded": "能力降級", "offline": "電腦離線", "unknown": "未回報", "content_missing": "內容缺失", "integrity_failed": "完整性失敗", "dependency_missing": "相依項目缺失", "provider_unsupported": "Provider 不支援", "machine_offline": "電腦離線" }, "severity": { "critical": "嚴重", "high": "高", "medium": "中", "low": "低", "info": "資訊", "unknown": "未知" },
+    "warning": { "scripts": "包含腳本", "executables": "包含可執行檔", "stdio": "會執行本機 stdio 命令", "unknown": "執行警告" }, "filter": { "all": "全部", "skill": "Skills", "mcp": "MCP", "degraded": "降級", "runtime_pending": "執行環境待就緒" },
+    "action": { "update": "更新", "enable": "啟用", "disable": "停用", "rollback": "回復版本", "uninstall": "解除安裝", "restore": "還原", "delete_credentials": "刪除憑據", "cancel_operation": "取消操作" },
+    "manageTitle": { "enable": "啟用 {{name}}？", "disable": "停用 {{name}}？", "rollback": "回復 {{name}}？", "uninstall": "解除安裝 {{name}}？", "restore": "還原 {{name}}？", "delete_credentials": "刪除 {{name}} 的憑據？", "cancel_operation": "取消目前操作？" },
+    "manageHint": { "enable": "{{scope}} 內的新工作階段可再次使用。", "disable": "停止 {{scope}} 內的新使用，保留安裝資料。", "rollback": "將 {{scope}} 切換到較早的已稽核版本。", "uninstall": "移除 {{scope}} 的活動綁定，保留期內仍可還原。", "restore": "把可還原項目重新放回 {{scope}}。", "delete_credentials": "永久刪除獨立保存的憑據，不刪除能力定義。", "cancel_operation": "停止待處理操作，不安裝任何內容。" }
+  },
   "admin": {
     "title": "管理面板",
     "back": "← 返回",

@@ -87,6 +87,7 @@ import { appendTransportEvent, replayTransportHistory } from '../daemon/transpor
 import { materializeMasterSummary } from '../context/materialization-coordinator.js';
 import { serializeContextNamespace } from '../context/context-keys.js';
 import { clearSummarySyncHistory, getSummarySyncFingerprints } from '../context/summary-sync-history.js';
+import { getAuthenticatedCapabilityOwner } from '../capability/capability-authorization.js';
 import { registerMasterCompaction } from '../daemon/master-compaction-registry.js';
 import type { DaemonTransportQueuesSnapshot } from '../util/daemon-status.js';
 
@@ -2512,8 +2513,14 @@ export async function restoreTransportSessions(
       let qwenPresetUsesApiKey = false;
       let dshLlmConfig: DshLlmConfig | undefined;
       let piLlmConfig: PiLlmConfig | undefined;
+      const boundServerId = await loadBoundServerIdForManagedMcp();
+      const capabilityOwnerId = boundServerId ? getAuthenticatedCapabilityOwner(boundServerId) : undefined;
       const resolveRuntimeContextBootstrap = () => resolveTransportContextBootstrap({
         projectDir: s.projectDir,
+        sessionId: s.name,
+        providerId: provider.id,
+        serverId: boundServerId,
+        trustedOwnerId: capabilityOwnerId,
         transportConfig: getSession(s.name)?.transportConfig ?? s.transportConfig ?? {},
         startupMemoryAlreadyInjected: preserveStartupMemoryOnRestore,
       });
@@ -2573,7 +2580,6 @@ export async function restoreTransportSessions(
         && (!effectiveRequestedModel || (availableQwenModels.length > 0 && !availableQwenModels.includes(effectiveRequestedModel)))) {
         effectiveRequestedModel = availableQwenModels[0] ?? effectiveRequestedModel;
       }
-      const boundServerId = await loadBoundServerIdForManagedMcp();
       if (rejectStaleRestoreInstance('before_runtime_initialize')) {
         await runtime.kill({ detachProviderSession: true }).catch(() => {});
         return;
@@ -2583,6 +2589,8 @@ export async function restoreTransportSessions(
         sessionName: s.name,
         projectName: s.projectName,
         serverId: boundServerId,
+        capabilityOwnerId,
+        providerId: provider.id,
         fresh: freshOnRestore,
         bindExistingKey: freshOnRestore ? undefined : (needsEphemeralRouteKey ? s.providerSessionId : s.providerSessionId),
         skipCreate: !freshOnRestore && !!s.providerSessionId,
@@ -2917,8 +2925,14 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
   // below, causing a TDZ `Cannot access before initialization` at launch —
   // see commit f13c511 which moved the read site without moving the decl.
   const preserveStartupMemoryInject = !opts.fresh && existing?.startupMemoryInjected === true;
+  const boundServerId = await loadBoundServerIdForManagedMcp();
+  const capabilityOwnerId = boundServerId ? getAuthenticatedCapabilityOwner(boundServerId) : undefined;
   const resolveRuntimeContextBootstrap = () => resolveTransportContextBootstrap({
     projectDir,
+    sessionId: name,
+    providerId: provider.id,
+    serverId: boundServerId,
+    trustedOwnerId: capabilityOwnerId,
     transportConfig: getSession(name)?.transportConfig ?? effectiveTransportConfig ?? {},
     startupMemoryAlreadyInjected: preserveStartupMemoryInject,
   });
@@ -3054,12 +3068,13 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
   // authoritative "force fresh" signal from /clear or explicit user action.
 
   // Create session on provider
-  const boundServerId = await loadBoundServerIdForManagedMcp();
   await runtime.initialize({
     sessionKey: effectiveSessionKey,
     sessionName: name,
     projectName,
     serverId: boundServerId,
+    capabilityOwnerId,
+    providerId: provider.id,
     fresh: !!opts.fresh,
     env: buildTransportSessionEnv(name, label, transportEnv),
     cwd: projectDir,

@@ -28,6 +28,10 @@ import { invalidateSkillRegistryCache } from './skill-registry.js';
 import { incrementCounter } from '../util/metrics.js';
 import { warnOncePerHour } from '../util/rate-limited-warn.js';
 import { assertManagedSkillPathSync } from './managed-skill-path.js';
+import {
+  MANAGED_SKILL_DIRECTORY,
+  isManagedSkillStoreEstablished,
+} from '../capability/managed-skill-paths.js';
 
 const MAX_SKILL_FILES = 64;
 const MAX_SCAN_DEPTH = 4;
@@ -37,7 +41,11 @@ function sha256(value: string): string {
   return createHash('sha256').update(value).digest('hex');
 }
 
-function listMarkdownFiles(root: string, options: { maxFiles?: number; maxDepth?: number } = {}): string[] {
+function listMarkdownFiles(root: string, options: {
+  maxFiles?: number;
+  maxDepth?: number;
+  excludeRootDirectories?: readonly string[];
+} = {}): string[] {
   const maxFiles = Math.max(1, options.maxFiles ?? MAX_SKILL_FILES);
   const maxDepth = Math.max(0, options.maxDepth ?? MAX_SCAN_DEPTH);
   const files: string[] = [];
@@ -51,6 +59,7 @@ function listMarkdownFiles(root: string, options: { maxFiles?: number; maxDepth?
     }
     for (const entry of entries) {
       if (files.length >= maxFiles) break;
+      if (depth === 0 && options.excludeRootDirectories?.includes(entry)) continue;
       const fullPath = join(dir, entry);
       let stat;
       try {
@@ -150,7 +159,8 @@ export function buildUserSkillRegistry(input: { homeDir?: string; context?: Skil
   const homeDir = input.homeDir ?? homedir();
   const root = getUserSkillRoot(homeDir);
   const entries: SkillRegistryEntry[] = [];
-  for (const path of listMarkdownFiles(root)) {
+  const excludeRootDirectories = isManagedSkillStoreEstablished(homeDir) ? [MANAGED_SKILL_DIRECTORY] : [];
+  for (const path of listMarkdownFiles(root, { excludeRootDirectories })) {
     try {
       assertManagedSkillPathSync({ path, homeDir, maxBytes: SKILL_MAX_BYTES });
     } catch {

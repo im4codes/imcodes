@@ -275,6 +275,12 @@ export interface SessionConfig {
   projectName?: string;
   /** Runtime-bound server id for daemon-dependent managed MCP tools. */
   serverId?: string;
+  /** Account owner learned from the current authenticated ServerLink. */
+  capabilityOwnerId?: string;
+  /** Exact provider identity injected into managed MCP authorization context. */
+  providerId?: string;
+  /** Ephemeral daemon-minted capability bound to this exact provider generation. */
+  capabilityRuntimeToken?: string;
   /** Force a brand-new provider conversation; do not reuse provider-side continuity. */
   fresh?: boolean;
   /** Environment variables to pass through for SDK-backed local providers. */

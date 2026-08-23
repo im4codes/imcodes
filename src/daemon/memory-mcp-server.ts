@@ -15,6 +15,16 @@ import { loadStore, type SessionRecord } from '../store/session-store.js';
 import { isDaemonCapabilityAdvertised } from './server-link.js';
 import { EXECUTION_CLONE_CAPABILITY_V1 } from '../../shared/execution-clone.js';
 import { resolveExecutionCloneLimitsForParentRun } from './execution-clone-limits-resolver.js';
+import {
+  registerCapabilityMcpTools,
+  type CapabilityMcpRegistrationController,
+  type CapabilityRuntimeIdentity,
+} from './capability-mcp-tools.js';
+import { createServerCapabilityService } from '../capability/server-capability-service.js';
+import { activateCapabilitySkill } from '../capability/capability-skill-activation.js';
+import { CAPABILITY_ERROR, type CapabilityErrorResult } from '../../shared/capability-management.js';
+import { isMemoryScope, validateMemoryScopeIdentity } from '../../shared/memory-scope.js';
+import type { ContextNamespace } from '../../shared/context-types.js';
 
 export interface MemoryMcpServerOptions {
   env?: Record<string, string | undefined>;
@@ -32,11 +42,81 @@ export function createMemoryMcpServer(
     version: '0.1.0',
   });
   registerMemoryMcpTools(server, caller, toolDeps);
+  const capabilityController = registerCapabilityMcpTools(server, caller, toolDeps);
+  if (capabilityController) capabilityControllers.set(server, capabilityController);
   // Exact server-backed stores share this MCP server surface but stay outside
   // the fuzzy-memory contract list and schema firewall.
   registerAliasMcpTools(server, caller);
   registerMessagePinMcpTools(server, caller, messagePinToolDeps);
   return server;
+}
+
+const capabilityControllers = new WeakMap<McpServer, CapabilityMcpRegistrationController>();
+const CAPABILITY_IDENTITY_REFRESH_MS = 1_000;
+
+function capabilityError(message: string): CapabilityErrorResult {
+  return { status: 'error', reason: CAPABILITY_ERROR.FORBIDDEN, error: message, retryable: false };
+}
+
+export async function resolveDaemonCapabilityIdentity(caller: McpRuntimeCaller): Promise<CapabilityRuntimeIdentity | null> {
+  if (!caller.sessionName || !caller.providerId || !caller.serverId || !caller.capabilityToken) return null;
+  const port = await resolveLiveHookPort();
+  if (!port) return null;
+  try {
+    const response = await postHookSend(port, {
+      providerId: caller.providerId,
+      serverId: caller.serverId,
+      capabilityToken: caller.capabilityToken,
+    }, '/capability-identity', caller.sessionName, 2_000);
+    const namespace = response.namespace;
+    const validNamespace = Boolean(namespace && typeof namespace === 'object' && !Array.isArray(namespace)
+      && isMemoryScope((namespace as ContextNamespace).scope)
+      && validateMemoryScopeIdentity((namespace as ContextNamespace).scope, {
+        user_id: (namespace as ContextNamespace).userId,
+        project_id: (namespace as ContextNamespace).projectId,
+        workspace_id: (namespace as ContextNamespace).workspaceId,
+        org_id: (namespace as ContextNamespace).enterpriseId,
+        tenant_id: (namespace as ContextNamespace).localTenant,
+      }).ok);
+    return response.ok === true
+      && typeof response.ownerId === 'string'
+      && response.providerId === caller.providerId
+      && response.serverId === caller.serverId
+      && response.sessionId === caller.sessionName
+      && validNamespace
+      && (response.projectDir === undefined
+        || (typeof response.projectDir === 'string'
+          && response.projectDir.length > 0
+          && Buffer.byteLength(response.projectDir, 'utf8') <= 4096))
+      ? {
+          ownerId: response.ownerId,
+          providerId: caller.providerId,
+          serverId: caller.serverId,
+          sessionId: caller.sessionName,
+          namespace: namespace as ContextNamespace,
+          ...(typeof response.projectDir === 'string' ? { projectDir: response.projectDir } : {}),
+        }
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Start dynamic tools/list gating after the MCP transport is connected. */
+export function startCapabilityIdentityRefresh(server: McpServer): () => void {
+  const controller = capabilityControllers.get(server);
+  if (!controller) return () => {};
+  void controller.refresh();
+  const timer = setInterval(() => { void controller.refresh(); }, CAPABILITY_IDENTITY_REFRESH_MS);
+  timer.unref?.();
+  return () => {
+    clearInterval(timer);
+    controller.stop();
+  };
+}
+
+export async function refreshCapabilityIdentity(server: McpServer): Promise<boolean> {
+  return capabilityControllers.get(server)?.refresh() ?? false;
 }
 
 const DELEGATION_REPLY_HOOK_TIMEOUT_MS = 10_000;
@@ -99,8 +179,32 @@ export async function postHookSend(
  * production seam without a full stdio harness.
  */
 export function mergeDefaultToolDeps(caller: McpRuntimeCaller, toolDeps: MemoryMcpToolDeps): MemoryMcpToolDeps {
+  const usesDefaultCapabilityService = !toolDeps.capabilityService && Boolean(caller.serverId);
+  const resolveCapabilityIdentity = toolDeps.resolveCapabilityIdentity
+    ?? (usesDefaultCapabilityService ? resolveDaemonCapabilityIdentity : undefined);
   return {
     ...toolDeps,
+    // The stdio MCP process is intentionally a thin client of the
+    // server-authoritative operation store. Keeping the executor in the main
+    // daemon avoids splitting one install operation across two processes.
+    capabilityService: toolDeps.capabilityService
+      ?? (caller.serverId ? createServerCapabilityService({
+        serverId: caller.serverId,
+        activateSkill: async (capability) => {
+          const identity = await resolveCapabilityIdentity!(caller);
+          return identity
+            ? activateCapabilitySkill(capability, {
+                ownerId: identity.ownerId,
+                namespace: identity.namespace,
+                sessionId: identity.sessionId,
+                projectDir: identity.projectDir,
+                providerId: identity.providerId,
+                serverId: identity.serverId,
+              })
+            : capabilityError('Current authenticated Skill activation context is unavailable');
+        },
+      }) : undefined),
+    ...(resolveCapabilityIdentity ? { resolveCapabilityIdentity } : {}),
     peerAuditReply: toolDeps.peerAuditReply ?? (async (envelope) => {
       const port = await resolveLiveHookPort();
       if (!port) throw new Error('daemon peer audit ingress is unavailable');
@@ -192,6 +296,7 @@ export async function runMemoryMcpServer(options: MemoryMcpServerOptions = {}): 
     await loadStore();
     const server = createMemoryMcpServerFromEnv(options);
     await server.connect(new StdioServerTransport());
+    startCapabilityIdentityRefresh(server);
   } catch (err) {
     if (err instanceof MemoryMcpCallerEnvError) {
       process.stderr.write(`${err.message}\n`);
