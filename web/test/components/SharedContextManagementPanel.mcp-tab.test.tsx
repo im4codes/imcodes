@@ -10,6 +10,12 @@ import { TRANSPORT_MSG } from '@shared/transport-events.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mcpTranslations = vi.hoisted(() => ({
+  session: {
+    agentType: {
+      codebuddy_china: 'CodeBuddy China',
+      codebuddy_international: 'CodeBuddy International',
+    },
+  },
   sharedContext: {
     refresh: 'Refresh',
     management: {
@@ -226,6 +232,8 @@ describe('SharedContextManagementPanel MCP tab', () => {
 
     expect(await screen.findByText('Model Context Protocol')).toBeDefined();
     expect(screen.queryByText('sharedContext.management.mcpTitle')).toBeNull();
+    expect(screen.getByText('CodeBuddy China')).toBeDefined();
+    expect(screen.getByText('CodeBuddy International')).toBeDefined();
     await waitFor(() => expect(sent.some((message) => message.type === MEMORY_WS.MCP_STATUS_QUERY)).toBe(true));
 
     const requestId = [...sent].reverse().find((message) => message.type === MEMORY_WS.MCP_STATUS_QUERY)?.requestId as string | undefined;

@@ -3,6 +3,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks'
 import { useTranslation } from 'react-i18next';
 import type { ContextMemoryProjectView, ContextMemoryView, SharedContextRuntimeBackend } from '@shared/context-types.js';
 import { QWEN_MODEL_IDS } from '@shared/qwen-models.js';
+import { CODEBUDDY_PROVIDER_IDS } from '@shared/codebuddy.js';
 import {
   MEMORY_MCP_DEGRADED_REASON,
   MEMORY_MCP_PROVIDER_IDS,
@@ -1398,6 +1399,8 @@ const MCP_PROVIDER_LABEL_KEY: Record<MemoryMcpProviderId, string> = {
   qwen: 'sharedContext.management.mcpProviderQwen',
   'deepseek-harness': 'sharedContext.management.mcpProviderDeepseekHarness',
   pi: 'sharedContext.management.mcpProviderPi',
+  [CODEBUDDY_PROVIDER_IDS.CHINA]: 'session.agentType.codebuddy_china',
+  [CODEBUDDY_PROVIDER_IDS.INTERNATIONAL]: 'session.agentType.codebuddy_international',
 };
 
 function isManagedMcpProviderId(providerId: string): providerId is MemoryMcpProviderId {

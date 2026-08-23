@@ -45,7 +45,7 @@ const sessionConfig = {
 };
 
 describe('managed provider MCP registration helpers', () => {
-  it('pins the exact twelve managed provider matrix and excludes process/OpenClaw providers', () => {
+  it('pins the exact fourteen managed provider matrix and excludes process/OpenClaw providers', () => {
     expect(MEMORY_MCP_PROVIDER_IDS).toEqual([
       MEMORY_MCP_PROVIDER_ID.CLAUDE_CODE_SDK,
       MEMORY_MCP_PROVIDER_ID.GEMINI_SDK,
@@ -59,6 +59,8 @@ describe('managed provider MCP registration helpers', () => {
       MEMORY_MCP_PROVIDER_ID.QWEN,
       MEMORY_MCP_PROVIDER_ID.DEEPSEEK_HARNESS,
       MEMORY_MCP_PROVIDER_ID.PI,
+      MEMORY_MCP_PROVIDER_ID.CODEBUDDY_CHINA,
+      MEMORY_MCP_PROVIDER_ID.CODEBUDDY_INTERNATIONAL,
     ]);
 
     expect(TRANSPORT_SESSION_AGENT_TYPES.filter((agentType) => (
