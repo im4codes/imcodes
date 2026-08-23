@@ -6,6 +6,7 @@ import {
 } from '../../src/agent/transport-runtime-assembly.js';
 import type { TransportProvider } from '../../src/agent/transport-provider.js';
 import type { TransportMemoryRecallArtifact } from '../../shared/context-types.js';
+import { CAPABILITY_AI_SYSTEM_INSTRUCTIONS } from '../../shared/capability-management.js';
 
 function makeProvider(
   contextSupport: NonNullable<TransportProvider['capabilities']['contextSupport']>,
@@ -571,6 +572,7 @@ describe('buildProviderContextPayload', () => {
       expect(systemText).toContain('Display label: My App Brain');
       expect(systemText).toContain('imcodes send');
       expect(systemText).toContain('full absolute filesystem path');
+      expect(systemText).toContain(CAPABILITY_AI_SYSTEM_INSTRUCTIONS);
       expect(systemText).toContain(MCP_MEMORY_SEARCH_SYSTEM_GUIDANCE);
     });
 
@@ -618,7 +620,7 @@ describe('buildProviderContextPayload', () => {
       // Order matters for prefix-cache friendliness: stable session-level
       // blocks should appear in a deterministic order so the model's
       // prompt cache hits across turns. The assembly order is:
-      //   description -> systemPrompt -> identity -> memory-search
+      //   description -> systemPrompt -> identity -> capability tools -> memory-search
       //   guidance -> agent progress guidance.
       const payload = buildProviderContextPayload(makeProvider('full-normalized-context-injection'), {
         userMessage: 'hi',
@@ -631,12 +633,14 @@ describe('buildProviderContextPayload', () => {
       const descIdx = systemText.indexOf('desc-here');
       const spIdx = systemText.indexOf('sp-here');
       const identityIdx = systemText.indexOf('IM.codes session identity:');
+      const capabilityIdx = systemText.indexOf('When the user asks in chat to install');
       const memoryIdx = systemText.indexOf('Use the available memory MCP tools');
       const progressIdx = systemText.indexOf('Keep work updates sparse and high-signal.');
       expect(descIdx).toBeGreaterThanOrEqual(0);
       expect(spIdx).toBeGreaterThan(descIdx);
       expect(identityIdx).toBeGreaterThan(spIdx);
-      expect(memoryIdx).toBeGreaterThan(identityIdx);
+      expect(capabilityIdx).toBeGreaterThan(identityIdx);
+      expect(memoryIdx).toBeGreaterThan(capabilityIdx);
       expect(progressIdx).toBeGreaterThan(memoryIdx);
     });
   });

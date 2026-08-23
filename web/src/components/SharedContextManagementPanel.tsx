@@ -96,6 +96,8 @@ import {
   RuntimeModelPresetSelector,
   type RuntimeModelPresetEntry,
 } from './RuntimeModelPresetSelector.js';
+import { CapabilityInventoryPanel } from './CapabilityInventoryPanel.js';
+import { CAPABILITY_KIND } from '@shared/capability-management.js';
 import { ChatMarkdown } from './ChatMarkdown.js';
 import type { WsClient } from '../ws-client.js';
 import { CLAUDE_CODE_MODEL_IDS, CODEX_MODEL_IDS } from '../../../src/shared/models/options.js';
@@ -735,7 +737,7 @@ const deleteButtonStyle = {
 } as const;
 
 type KindOption = SharedDocument['kind'];
-type ManagementTab = 'enterprise' | 'members' | 'projects' | 'knowledge' | 'processing' | 'memory' | 'mcp';
+type ManagementTab = 'enterprise' | 'members' | 'projects' | 'knowledge' | 'processing' | 'memory' | 'mcp' | 'skills';
 type MemoryTopTab = 'personal' | 'enterprise-memory';
 type MemoryPersonalSubTab = 'unprocessed' | 'processed' | 'cloud';
 type MemoryEnterpriseSubTab = 'shared-memory' | 'authored-context';
@@ -1799,6 +1801,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
     { id: 'processing', label: t('sharedContext.management.tabs.processing') },
     { id: 'memory', label: t('sharedContext.management.tabs.memory') },
     { id: 'mcp', label: t('sharedContext.management.tabs.mcp') },
+    { id: 'skills', label: t('sharedContext.management.tabs.skills') },
   ], [t]);
 
   const memoryTopTabs = useMemo(() => [
@@ -3731,6 +3734,8 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
 
       {activeTab === 'mcp' && (
         <>
+          <CapabilityInventoryPanel kind={CAPABILITY_KIND.MCP} serverId={serverId} />
+
           <InfoCard title={t('sharedContext.management.mcpTitle')}>
             <div>{t('sharedContext.management.mcpSummaryLine1')}</div>
             <div>{t('sharedContext.management.mcpSummaryLine2')}</div>
@@ -3859,6 +3864,10 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
             )}
           </div>
         </>
+      )}
+
+      {activeTab === 'skills' && (
+        <CapabilityInventoryPanel kind={CAPABILITY_KIND.SKILL} serverId={serverId} />
       )}
 
       {activeTab === 'memory' && (

@@ -4,22 +4,18 @@ import { startAuthentication } from '@simplewebauthn/browser';
 import { ApiError, passwordChange, passkeyVerifyBegin, passwordSetupWithPasskey, updateDisplayName } from '../api.js';
 import { isNative } from '../native.js';
 import { validatePasswordComplexity } from '@shared/password-rules.js';
-import { McpSkillsPanel } from '../components/McpSkillsPanel.js';
 
 interface Props {
   displayName: string | null;
   username: string | null;
   hasPassword: boolean;
   serverUrl?: string | null;
-  serverId?: string | null;
-  canAskAi?: boolean;
-  onAskAi?: (source: string) => void;
   onBack: () => void;
   onDisplayNameChanged: (name: string) => void;
   onUserAuthUpdated: (next: { username: string | null; hasPassword: boolean }) => void;
 }
 
-export function SettingsPage({ displayName, username, hasPassword, serverUrl, serverId, canAskAi, onAskAi, onBack, onDisplayNameChanged, onUserAuthUpdated }: Props) {
+export function SettingsPage({ displayName, username, hasPassword, serverUrl, onBack, onDisplayNameChanged, onUserAuthUpdated }: Props) {
   const { t } = useTranslation();
 
   const [editingName, setEditingName] = useState(false);
@@ -280,8 +276,6 @@ export function SettingsPage({ displayName, username, hasPassword, serverUrl, se
             </div>
           </div>
         </div>
-
-        <McpSkillsPanel serverId={serverId} canAskAi={canAskAi} onAskAi={onAskAi} />
 
         <div style={cardStyle}>
           <h2 style={{ fontSize: '16px', fontWeight: '600', marginBottom: '12px', color: '#94a3b8' }}>

@@ -2269,7 +2269,8 @@
         "knowledge": "ナレッジ",
         "processing": "処理",
         "memory": "メモリ",
-        "mcp": "MCP"
+        "mcp": "MCP",
+        "skills": "Skills"
       },
       "policyTitle": "Project policy",
       "policyLoading": "Loading saved policy…",
@@ -2482,6 +2483,22 @@
       "memoryToolTabSkills": "Skills",
       "memoryToolTabMdIngest": "Markdown",
       "memoryToolTabObservations": "Observations",
+      "capabilityInventoryLoadError": "インストール済み機能を読み込めませんでした。",
+      "capabilityBindingTarget": "{{scope}} · {{target}}",
+      "capabilityDeleteConfirm": "{{binding}} から {{name}} を削除しますか？この正確なバインディングだけが削除されます。",
+      "capabilityDeleteIntent": "共有コンテキストから {{name}} の正確なインストール済みバインディングを削除する。",
+      "capabilityDeleteError": "インストール済みバインディングを削除できませんでした。",
+      "capabilityInventory": {
+        "chatInstallHint": "MCP サービスや Skill のインストール・変更は、AI のチャットで直接依頼してください。このページは一覧表示と正確なバインディング削除専用です。",
+        "noServer": "接続済みサーバーを選択してインストール済み機能を表示してください。",
+        "searchPlaceholder": "名前、ソース、バージョン、ツールを検索",
+        "searchLabel": "インストール済み機能を検索",
+        "bindingActive": "有効なバインディング",
+        "bindingInactive": "無効なバインディング",
+        "delete": "削除",
+        "mcp": { "title": "インストール済み MCP サービス", "description": "このサーバーの管理対象 capability registry で利用できる MCP サービスです。", "empty": "MCP サービスは未インストールです。追加するときはチャットで AI に依頼してください。" },
+        "skills": { "title": "インストール済み Skills", "description": "このサーバーの管理対象 capability registry で利用できる監査済み Agent Skills です。", "empty": "管理対象 Skill は未インストールです。追加するときはチャットで AI に依頼してください。" }
+      },
       "mcpTitle": "Model Context Protocol",
       "mcpSummaryLine1": "管理対象プロバイダーは、daemon 管理の MCP server 経由で 11 個の runtime-scoped tools を公開できます: memory search/recent summaries/source lookup、observation/preference writes、scoped Send、Cron scheduling。",
       "mcpSummaryLine2": "Memory tools は ref と projectionId 付きの compact hits を返します。list_memory_summaries は recent digests を取得し、正確な過去指示、bug details、source evidence が必要なとき get_memory_sources が relevant hits を展開できます。",

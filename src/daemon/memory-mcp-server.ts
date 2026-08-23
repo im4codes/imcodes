@@ -22,7 +22,11 @@ import {
 } from './capability-mcp-tools.js';
 import { createServerCapabilityService } from '../capability/server-capability-service.js';
 import { activateCapabilitySkill } from '../capability/capability-skill-activation.js';
-import { CAPABILITY_ERROR, type CapabilityErrorResult } from '../../shared/capability-management.js';
+import {
+  CAPABILITY_AI_SYSTEM_INSTRUCTIONS,
+  CAPABILITY_ERROR,
+  type CapabilityErrorResult,
+} from '../../shared/capability-management.js';
 import { isMemoryScope, validateMemoryScopeIdentity } from '../../shared/memory-scope.js';
 import type { ContextNamespace } from '../../shared/context-types.js';
 
@@ -40,6 +44,8 @@ export function createMemoryMcpServer(
   const server = new McpServer({
     name: IMCODES_MEMORY_MCP_SERVER_NAME,
     version: '0.1.0',
+  }, {
+    instructions: CAPABILITY_AI_SYSTEM_INSTRUCTIONS,
   });
   registerMemoryMcpTools(server, caller, toolDeps);
   const capabilityController = registerCapabilityMcpTools(server, caller, toolDeps);
