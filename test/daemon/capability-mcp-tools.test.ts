@@ -66,7 +66,8 @@ describe('capability MCP tools', () => {
     await withClient(caller(), service(), async (client) => {
       const tools = (await client.listTools()).tools;
       expect(client.getInstructions()).toBe(CAPABILITY_AI_SYSTEM_INSTRUCTIONS);
-      expect(client.getInstructions()).toMatch(/^HIGHEST-PRIORITY IM\.codes PRODUCT POLICY:/);
+      expect(client.getInstructions()).toMatch(/^HIGHEST-PRIORITY IM\.codes SERVICE ROUTING POLICY:/);
+      expect(client.getInstructions()).toContain('JSON schema, enum, required parameter');
       expect(client.getInstructions()).toContain('user asks in chat');
       const names = tools.map((tool) => tool.name);
       expect(names.filter((name) => name.startsWith('capability_'))).toEqual([...CAPABILITY_MCP_TOOL_NAMES]);

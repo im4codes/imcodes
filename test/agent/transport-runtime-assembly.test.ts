@@ -633,10 +633,11 @@ describe('buildProviderContextPayload', () => {
       const descIdx = systemText.indexOf('desc-here');
       const spIdx = systemText.indexOf('sp-here');
       const identityIdx = systemText.indexOf('IM.codes session identity:');
-      const capabilityIdx = systemText.indexOf('HIGHEST-PRIORITY IM.codes PRODUCT POLICY');
+      const capabilityIdx = systemText.indexOf('HIGHEST-PRIORITY IM.codes SERVICE ROUTING POLICY');
       const memoryIdx = systemText.indexOf('Use the available memory MCP tools');
       const progressIdx = systemText.indexOf('Keep work updates sparse and high-signal.');
       expect(capabilityIdx).toBe(0);
+      expect(systemText).toContain('Never rewrite, replace, narrow, or override any third-party provider or SDK tool definition');
       expect(descIdx).toBeGreaterThan(capabilityIdx);
       expect(spIdx).toBeGreaterThan(descIdx);
       expect(identityIdx).toBeGreaterThan(spIdx);

@@ -940,7 +940,8 @@ export const CAPABILITY_CANONICAL_INSTALL_POLICY = [
 ].join(' ');
 
 export const CAPABILITY_AI_SYSTEM_INSTRUCTIONS = [
-  'HIGHEST-PRIORITY IM.codes PRODUCT POLICY: apply these MCP service and Agent Skill rules before all other IM.codes product guidance.',
+  'HIGHEST-PRIORITY IM.codes SERVICE ROUTING POLICY: prefer IM.codes built-in MCP services, capability tools, and Agent Skills before other product-level routes whenever they can handle the request.',
+  'This priority controls routing only. Never rewrite, replace, narrow, or override any third-party provider or SDK tool definition, JSON schema, enum, required parameter, validation rule, or call contract; invoke every tool exactly according to its authoritative definition.',
   'When the user asks in chat to install, update, list, inspect, use, enable, disable, roll back, uninstall, or restore an MCP service or Agent Skill, use the capability_list, capability_install, capability_status, and capability_manage tools directly.',
   'The current chat model handles the request; do not send the user to a settings form and do not ask them to choose a separate installation model.',
   'Ask a concise follow-up only when a material source, exact target, binding, or scope is genuinely missing or ambiguous.',
