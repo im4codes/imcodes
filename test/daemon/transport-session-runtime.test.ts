@@ -4493,7 +4493,11 @@ ${PREFERENCE_CONTEXT_END}`;
     // identity block at the assembly layer, but now lives in Codex SDK's
     // `appendImcodesBaseInstructions` — Codex-only, once per thread.
     // It must NOT appear in the per-turn payload here.
-    const oversized = 'Y'.repeat(2000);
+    // Use a private-use marker that cannot occur in daemon-authored guidance.
+    // Counting a common ASCII letter made this regression depend on unrelated
+    // system-prompt wording (for example, "PRIORITY" contains "Y").
+    const authoredMarker = '\uE000';
+    const oversized = authoredMarker.repeat(2000);
     const freshProvider = makeMockProvider();
     const fresh = new TransportSessionRuntime(freshProvider.provider, 'deck_identity_brain');
     await fresh.initialize({
@@ -4509,14 +4513,15 @@ ${PREFERENCE_CONTEXT_END}`;
     const sent = freshProvider.provider.send.mock.calls.at(-1)?.[1] as Record<string, unknown>;
     const systemText = String(sent.systemText ?? '');
 
-    // User-authored cap still enforced: total Y count is 2 * 300 = 600.
-    const yCount = (systemText.match(/Y/g) ?? []).length;
-    expect(yCount).toBe(600);
-    expect(systemText).not.toMatch(/Y{301}/);
+    // User-authored cap still enforced: both fields contribute exactly 300
+    // private-use markers, independent of daemon-authored prompt wording.
+    const authoredMarkerCount = systemText.split(authoredMarker).length - 1;
+    expect(authoredMarkerCount).toBe(600);
+    expect(systemText).not.toContain(authoredMarker.repeat(301));
 
     // Identity block present in full, including the exact session name
     // and the display label. None of these strings exist in the user
-    // text (Y's only), so any match must come from the daemon-injected
+    // text (private-use markers only), so any match must come from the daemon-injected
     // block — proving it survived the user cap.
     expect(systemText).toMatch(/IM\.codes session identity:/);
     expect(systemText).toMatch(/Exact session name: deck_identity_brain/);
