@@ -23,7 +23,6 @@ import {
   type CapabilityStatusRequest,
   type CapabilityToolResult,
 } from '../../shared/capability-management.js';
-import { LEGACY_DAEMON_LOCAL_USER_ID } from '../../shared/memory-namespace.js';
 import { NODE_ROLE, type NodeRole } from '../../shared/remote-exec.js';
 import type { McpRuntimeCaller } from './memory-mcp-caller.js';
 import type { ContextNamespace } from '../../shared/context-types.js';
@@ -31,8 +30,7 @@ import type { ContextNamespace } from '../../shared/context-types.js';
 export interface CapabilityMcpToolDeps {
   capabilityService?: CapabilityService;
   nodeRole?: NodeRole;
-  isCapabilityOwner?: (caller: McpRuntimeCaller) => boolean;
-  /** Resolve the current owner over the daemon-local authenticated link. */
+  /** Resolve caller context for binding-scoped Skill activation only. */
   resolveCapabilityIdentity?: (caller: McpRuntimeCaller) => Promise<CapabilityRuntimeIdentity | null>;
 }
 
@@ -98,37 +96,11 @@ export const CAPABILITY_MCP_INPUT_SCHEMAS = {
   }),
 } as const;
 
-export function isAuthenticatedCapabilityOwner(caller: McpRuntimeCaller): boolean {
-  const userId = caller.userId.trim();
-  return Boolean(
-    caller.sessionName
-    && userId
-    && userId !== LEGACY_DAEMON_LOCAL_USER_ID
-    && caller.namespace.userId?.trim() === userId,
-  );
-}
-
-export function canRegisterCapabilityMcpTools(caller: McpRuntimeCaller, deps: CapabilityMcpToolDeps): boolean {
-  if (!deps.capabilityService || (deps.nodeRole ?? NODE_ROLE.FULL) !== NODE_ROLE.FULL) return false;
-  if (deps.resolveCapabilityIdentity) {
-    // The server-backed service authenticates every inventory/install/manage
-    // request with the daemon's registered node credential. Runtime identity
-    // is needed only for resolving session/provider-bound Skill instructions.
-    return Boolean(caller.serverId);
-  }
-  return (deps.isCapabilityOwner ?? isAuthenticatedCapabilityOwner)(caller);
-}
-
-function exactRuntimeIdentity(caller: McpRuntimeCaller, value: CapabilityRuntimeIdentity | null): value is CapabilityRuntimeIdentity {
-  return Boolean(value?.ownerId
-    && value.namespace.userId === value.ownerId
-    && (caller.userId === LEGACY_DAEMON_LOCAL_USER_ID || caller.userId === value.ownerId)
-    && (!caller.namespace.userId
-      || caller.namespace.userId === LEGACY_DAEMON_LOCAL_USER_ID
-      || caller.namespace.userId === value.ownerId)
-    && value.providerId === caller.providerId
-    && value.serverId === caller.serverId
-    && value.sessionId === caller.sessionName);
+export function canRegisterCapabilityMcpTools(_caller: McpRuntimeCaller, deps: CapabilityMcpToolDeps): boolean {
+  // A FULL registered node authenticates every server-backed operation with its
+  // bound node credential. Do not add a second session/user/nonce gate here:
+  // provider children legitimately start with daemon-local fallback identity.
+  return Boolean(deps.capabilityService && (deps.nodeRole ?? NODE_ROLE.FULL) === NODE_ROLE.FULL);
 }
 
 function error(reason: CapabilityErrorResult['reason'], message: string, retryable = false): CapabilityErrorResult {
@@ -156,16 +128,6 @@ export function registerCapabilityMcpTools(
       description: contract.description,
       inputSchema: CAPABILITY_MCP_INPUT_SCHEMAS[name],
     }, async (raw: unknown) => {
-      const requiresRuntimeIdentity = name === CAPABILITY_MCP_TOOL.STATUS
-        && Boolean((raw as CapabilityStatusRequest | undefined)?.activate);
-      const identity = requiresRuntimeIdentity && deps.resolveCapabilityIdentity
-        ? await deps.resolveCapabilityIdentity(caller).catch(() => null)
-        : null;
-      if (deps.resolveCapabilityIdentity
-        ? requiresRuntimeIdentity && !exactRuntimeIdentity(caller, identity)
-        : !(deps.isCapabilityOwner ?? isAuthenticatedCapabilityOwner)(caller)) {
-        return toolResult(error(CAPABILITY_ERROR.FORBIDDEN, 'capability management requires an authenticated owner session'));
-      }
       try {
         switch (name as CapabilityMcpToolName) {
           case CAPABILITY_MCP_TOOL.LIST:

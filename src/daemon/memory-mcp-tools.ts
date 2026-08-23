@@ -148,10 +148,9 @@ type MemoryMcpListSummaries = (query: {
 const repositoryIdentityService = new GitOriginRepositoryIdentityService();
 
 export interface MemoryMcpToolDeps {
-  /** Owner-only AI-managed MCP/Skill service. Capability tools are absent when unavailable. */
+  /** Registered-node AI-managed MCP/Skill service. Capability tools are absent when unavailable. */
   capabilityService?: CapabilityService;
-  /** Additional authoritative owner check for capability discovery and dispatch. */
-  isCapabilityOwner?: (caller: McpRuntimeCaller) => boolean;
+  /** Caller context resolver used only when activating binding-scoped Skill instructions. */
   resolveCapabilityIdentity?: (caller: McpRuntimeCaller) => Promise<CapabilityRuntimeIdentity | null>;
   featureFlags?: MCPFeatureFlagValues;
   isMemoryFeatureEnabled?: (flag: MemoryFeatureFlag) => boolean;

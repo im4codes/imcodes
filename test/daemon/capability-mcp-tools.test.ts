@@ -61,7 +61,7 @@ async function withClient(
 }
 
 describe('capability MCP tools', () => {
-  it('advertises exactly the four capability tools to an authenticated owner', async () => {
+  it('advertises exactly the four capability tools on a registered FULL node', async () => {
     await withClient(caller(), service(), async (client) => {
       const tools = (await client.listTools()).tools;
       expect(client.getInstructions()).toBe(CAPABILITY_AI_SYSTEM_INSTRUCTIONS);
@@ -84,7 +84,7 @@ describe('capability MCP tools', () => {
         enum: expect.not.arrayContaining(['delete_credentials']),
       });
       const install = tools.find((tool) => tool.name === 'capability_install');
-      expect(install?.description).toContain('directly compose source.kind=mcp_config');
+      expect(install?.description).toContain('compose source.kind=mcp_config');
       expect(install?.inputSchema.properties?.source).toMatchObject({
         properties: {
           kind: { description: expect.stringContaining('Use mcp_config') },
@@ -94,24 +94,28 @@ describe('capability MCP tools', () => {
     });
   });
 
-  it('keeps the tools structurally absent without owner identity or service', async () => {
+  it('does not require session owner identity and stays absent without the node service', async () => {
     await withClient(caller({ sessionName: null }), service(), async (client) => {
-      expect((await client.listTools()).tools.map((tool) => tool.name)).not.toEqual(expect.arrayContaining([...CAPABILITY_MCP_TOOL_NAMES]));
+      expect((await client.listTools()).tools.map((tool) => tool.name))
+        .toEqual(expect.arrayContaining([...CAPABILITY_MCP_TOOL_NAMES]));
+      await expect(client.callTool({ name: 'capability_list', arguments: {} })).resolves.toMatchObject({
+        structuredContent: { status: 'ok', items: [] },
+      });
     });
     await withClient(caller(), undefined, async (client) => {
       expect((await client.listTools()).tools.map((tool) => tool.name)).not.toEqual(expect.arrayContaining([...CAPABILITY_MCP_TOOL_NAMES]));
     });
   });
 
-  it('uses registered-node auth for management and runtime identity only for Skill activation', async () => {
-    let identity: Awaited<ReturnType<NonNullable<Parameters<typeof createMemoryMcpServer>[1]['resolveCapabilityIdentity']>>> = null;
+  it('does not add a session/runtime auth gate in front of registered-node operations', async () => {
+    const resolveCapabilityIdentity = vi.fn(async () => null);
     const runtimeCaller = caller({
       userId: 'daemon-local',
       namespace: { scope: 'personal', projectId: 'forged-project' },
     });
     const server = createMemoryMcpServer(runtimeCaller, {
       capabilityService: service(),
-      resolveCapabilityIdentity: async () => identity,
+      resolveCapabilityIdentity,
     });
     const client = new Client({ name: 'dynamic-capability-tools-test', version: '1' });
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
@@ -124,19 +128,8 @@ describe('capability MCP tools', () => {
       });
       await expect(client.callTool({
         name: 'capability_status', arguments: { capabilityId: 'skill-1', activate: true },
-      })).resolves.toMatchObject({
-        isError: true, structuredContent: { status: 'error', reason: CAPABILITY_ERROR.FORBIDDEN },
-      });
-      identity = {
-        ownerId: 'owner-1', providerId: 'codex-sdk', serverId: 'server-1',
-        sessionId: 'deck_project_brain',
-        namespace: { scope: 'personal', userId: 'owner-1', projectId: 'authority-project' },
-        projectDir: '/authority/project',
-      };
-      await expect(client.callTool({
-        name: 'capability_status', arguments: { capabilityId: 'skill-1', activate: true },
       })).resolves.toMatchObject({ structuredContent: { status: 'ok' } });
-      identity = null;
+      expect(resolveCapabilityIdentity).not.toHaveBeenCalled();
       expect((await client.listTools()).tools.map((tool) => tool.name))
         .toEqual(expect.arrayContaining([...CAPABILITY_MCP_TOOL_NAMES]));
       await expect(client.callTool({ name: 'capability_list', arguments: {} })).resolves.toMatchObject({
@@ -148,7 +141,7 @@ describe('capability MCP tools', () => {
     }
   });
 
-  it('carries provider identity through provider config and child parsing before dynamic authorization', async () => {
+  it('carries provider context for Skill resolution without making it a tool authorization gate', async () => {
     const config = getDefaultMcpServers({
       sessionKey: 'route-fallback',
       sessionName: 'deck_fallback_brain',
@@ -164,9 +157,9 @@ describe('capability MCP tools', () => {
       serverId: 'server-1', providerId: 'codex-sdk',
     });
 
-    let identity: Awaited<ReturnType<NonNullable<Parameters<typeof createMemoryMcpServer>[1]['resolveCapabilityIdentity']>>> = null;
+    const resolveCapabilityIdentity = vi.fn(async () => null);
     const server = createMemoryMcpServer(runtimeCaller, {
-      capabilityService: service(), resolveCapabilityIdentity: async () => identity,
+      capabilityService: service(), resolveCapabilityIdentity,
     });
     const client = new Client({ name: 'provider-env-capability-tools-test', version: '1' });
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
@@ -177,15 +170,10 @@ describe('capability MCP tools', () => {
       await expect(client.callTool({ name: 'capability_list', arguments: {} })).resolves.toMatchObject({
         structuredContent: { status: 'ok', items: [] },
       });
-      identity = {
-        ownerId: 'owner-1', providerId: 'codex-sdk', serverId: 'server-1',
-        sessionId: 'deck_fallback_brain',
-        namespace: { scope: 'personal', userId: 'owner-1', projectId: 'github.com/acme/project' },
-        projectDir: '/authority/project',
-      };
       await expect(client.callTool({
         name: 'capability_status', arguments: { capabilityId: 'skill-1', activate: true },
       })).resolves.toMatchObject({ structuredContent: { status: 'ok' } });
+      expect(resolveCapabilityIdentity).not.toHaveBeenCalled();
     } finally {
       await client.close();
       await server.close();
