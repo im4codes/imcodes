@@ -1755,9 +1755,9 @@ export class TransportSessionRuntime implements SessionRuntime {
     }
 
     let providerConfig = config;
-    if (config.sessionName && config.providerId && config.serverId && config.capabilityOwnerId) {
+    if (config.sessionName && config.providerId && config.serverId) {
       const token = mintCapabilityRuntimeToken({
-        ownerId: config.capabilityOwnerId,
+        ...(config.capabilityOwnerId ? { ownerId: config.capabilityOwnerId } : {}),
         sessionId: config.sessionName,
         providerId: config.providerId,
         serverId: config.serverId,

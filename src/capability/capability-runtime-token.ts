@@ -8,14 +8,21 @@ export interface CapabilityRuntimeTokenBinding {
   token: string;
 }
 
-const currentBySession = new Map<string, CapabilityRuntimeTokenBinding>();
+interface PendingCapabilityRuntimeTokenBinding extends Omit<CapabilityRuntimeTokenBinding, 'ownerId'> {
+  ownerId?: string;
+}
+
+const currentBySession = new Map<string, PendingCapabilityRuntimeTokenBinding>();
 
 function bounded(value: string): boolean {
   return value.length > 0 && Buffer.byteLength(value, 'utf8') <= 256;
 }
 
-export function mintCapabilityRuntimeToken(input: Omit<CapabilityRuntimeTokenBinding, 'token'>): string {
-  if (!bounded(input.ownerId) || !bounded(input.sessionId) || !bounded(input.providerId) || !bounded(input.serverId)) {
+export function mintCapabilityRuntimeToken(
+  input: Omit<CapabilityRuntimeTokenBinding, 'token' | 'ownerId'> & { ownerId?: string },
+): string {
+  if ((input.ownerId !== undefined && !bounded(input.ownerId))
+    || !bounded(input.sessionId) || !bounded(input.providerId) || !bounded(input.serverId)) {
     throw new Error('Capability runtime identity is invalid');
   }
   const token = randomBytes(32).toString('base64url');
@@ -32,16 +39,27 @@ export function revokeCapabilityRuntimeToken(sessionId: string, token?: string):
 
 export function verifyCapabilityRuntimeToken(input: CapabilityRuntimeTokenBinding): boolean {
   const current = currentBySession.get(input.sessionId);
-  if (!current || current.ownerId !== input.ownerId || current.providerId !== input.providerId || current.serverId !== input.serverId
+  if (!current || (current.ownerId !== undefined && current.ownerId !== input.ownerId)
+    || current.providerId !== input.providerId || current.serverId !== input.serverId
     || current.token.length !== input.token.length) return false;
-  return timingSafeEqual(Buffer.from(current.token), Buffer.from(input.token));
+  if (!timingSafeEqual(Buffer.from(current.token), Buffer.from(input.token))) return false;
+  // Restored provider sessions can start before ServerLink receives its first
+  // complete AUTHORITY frame. Their daemon-minted token is still bound to the
+  // exact session/provider/server generation, but has no account owner yet.
+  // Bind it once, to the first authenticated owner observed on that link.
+  if (current.ownerId === undefined) current.ownerId = input.ownerId;
+  return true;
 }
 
 /** Revokes provider-generation capabilities when one authenticated link is
  * replaced, disconnected, or changes account owner. */
 export function revokeCapabilityRuntimeTokensForServer(serverId: string, exceptOwnerId?: string): void {
   for (const [sessionId, current] of currentBySession) {
-    if (current.serverId === serverId && current.ownerId !== exceptOwnerId) currentBySession.delete(sessionId);
+    if (current.serverId !== serverId) continue;
+    if (exceptOwnerId === undefined
+      || (current.ownerId !== undefined && current.ownerId !== exceptOwnerId)) {
+      currentBySession.delete(sessionId);
+    }
   }
 }
 

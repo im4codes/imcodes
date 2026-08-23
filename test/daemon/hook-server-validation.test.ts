@@ -106,6 +106,26 @@ describe('Hook server — session validation', () => {
     })).resolves.toMatchObject({ status: 200 });
   });
 
+  it('binds a restored-session token after owner authority arrives', async () => {
+    getSessionMock.mockImplementation((name: string) => ({
+      name, providerId: 'codex-sdk', agentType: 'codex-sdk', projectDir: '',
+      contextNamespace: { scope: 'personal' },
+    }));
+    const restoredToken = mintCapabilityRuntimeToken({
+      sessionId: 'deck_restored_brain', providerId: 'codex-sdk', serverId: 'server-1',
+    });
+
+    expect(setCapabilityAuthority('owner-1', 'server-1', 1, [], [])).toBe(true);
+    await expect(postCapabilityIdentity(port, 'deck_restored_brain', {
+      providerId: 'codex-sdk', serverId: 'server-1', capabilityToken: restoredToken,
+    })).resolves.toMatchObject({ status: 200 });
+
+    expect(setCapabilityAuthority('owner-2', 'server-1', 2, [], [])).toBe(true);
+    await expect(postCapabilityIdentity(port, 'deck_restored_brain', {
+      providerId: 'codex-sdk', serverId: 'server-1', capabilityToken: restoredToken,
+    })).resolves.toMatchObject({ status: 403 });
+  });
+
   it('revokes the old provider token when the authenticated owner changes on one server link', async () => {
     expect(setCapabilityAuthority('owner-1', 'server-1', 1, [], [])).toBe(true);
     getSessionMock.mockImplementation((name: string) => ({

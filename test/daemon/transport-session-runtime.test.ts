@@ -286,6 +286,25 @@ describe('TransportSessionRuntime', () => {
     expect(mock.provider.createSession).toHaveBeenCalledWith(defaultConfig);
   });
 
+  it('mints a recoverable capability token before ServerLink owner authority is available', async () => {
+    const restored = makeMockProvider('codex-sdk');
+    const restoredRuntime = new TransportSessionRuntime(restored.provider, 'deck_restore_brain');
+    await restoredRuntime.initialize({
+      sessionKey: 'restore-route',
+      sessionName: 'deck_restore_brain',
+      providerId: 'codex-sdk',
+      serverId: 'server-1',
+    });
+
+    expect(restored.provider.createSession).toHaveBeenCalledWith(expect.objectContaining({
+      sessionName: 'deck_restore_brain',
+      providerId: 'codex-sdk',
+      serverId: 'server-1',
+      capabilityRuntimeToken: expect.stringMatching(/^[A-Za-z0-9_-]{40,}$/),
+    }));
+    await restoredRuntime.kill();
+  });
+
   it('send() throws if not initialized', () => {
     const fresh = new TransportSessionRuntime(mock.provider, 'x');
     expect(() => fresh.send('hi')).toThrow(/not initialized/i);
