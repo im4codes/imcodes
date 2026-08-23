@@ -10156,6 +10156,13 @@ button.quick-agent-delegation-preset.active {
   box-sizing: border-box;
 }
 
+.capabilities-panel-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
 .capabilities-panel-header h2,
 .capability-operation-header h3,
 .capability-item h3,
@@ -10500,6 +10507,38 @@ button.quick-agent-delegation-preset.active {
   flex-wrap: wrap;
   gap: 8px;
   margin-top: 15px;
+}
+
+.capability-binding-list {
+  display: grid;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+.capability-binding-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border-top: 1px solid #28364b;
+  padding-top: 10px;
+}
+
+.capability-binding-row > div {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+  color: #cbd5e1;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.capability-binding-row .capability-muted {
+  margin: 0;
+}
+
+.shared-context-capability-panel .capability-inventory-toolbar {
+  grid-template-columns: minmax(0, 1fr);
 }
 
 .capability-inventory-toolbar {

@@ -20,7 +20,18 @@ const mcpTranslations = vi.hoisted(() => ({
     refresh: 'Refresh',
     management: {
       noneValue: 'None',
-      tabs: { mcp: 'MCP' },
+      tabs: { mcp: 'MCP', skills: 'Skills' },
+      capabilityInventory: {
+        chatInstallHint: 'Ask the AI directly in chat to install or change capabilities.',
+        noServer: 'Select a connected server.',
+        searchPlaceholder: 'Search installed capabilities',
+        searchLabel: 'Search installed capabilities',
+        bindingActive: 'Active binding',
+        bindingInactive: 'Inactive binding',
+        delete: 'Delete',
+        mcp: { title: 'Installed MCP services', description: 'Installed MCP inventory', empty: 'No MCP services installed' },
+        skills: { title: 'Installed Skills', description: 'Installed Skill inventory', empty: 'No Skills installed' },
+      },
       mcpTitle: 'Model Context Protocol',
       mcpSummaryLine1: 'Managed providers can expose the IM.codes memory, send, and cron tool families through the daemon-controlled MCP server.',
       mcpSummaryLine2: 'This view shows provider readiness, degraded setup reasons, feature gates, and recent redacted tool calls when the daemon reports them.',
@@ -146,6 +157,17 @@ const apiMock = vi.hoisted(() => ({
   deleteEnterpriseSharedMemory: vi.fn(),
 }));
 
+const capabilityApiMock = vi.hoisted(() => ({
+  listCapabilities: vi.fn(),
+  manageCapability: vi.fn(),
+}));
+
+vi.mock('../../src/api/capabilities.js', () => ({
+  listCapabilities: (...args: unknown[]) => capabilityApiMock.listCapabilities(...args),
+  manageCapability: (...args: unknown[]) => capabilityApiMock.manageCapability(...args),
+  CapabilityRequestError: class CapabilityRequestError extends Error {},
+}));
+
 vi.mock('../../src/api.js', () => ({
   ApiError: class ApiError extends Error {
     code: string | null;
@@ -197,6 +219,16 @@ describe('SharedContextManagementPanel MCP tab', () => {
     apiMock.listTeams.mockResolvedValue([]);
     apiMock.getPersonalCloudMemory.mockResolvedValue({ stats: {}, records: [], pendingRecords: [], projects: [] });
     apiMock.getEnterpriseSharedMemory.mockResolvedValue({ stats: {}, records: [], pendingRecords: [], projects: [] });
+    capabilityApiMock.listCapabilities.mockResolvedValue({ items: [
+      {
+        id: 'mcp-1', revision: 1, kind: 'mcp', name: 'Docs MCP', state: 'active', scope: 'account',
+        readiness: 'runtime_pending', findings: [], tools: ['search_docs'], bindings: [], updatedAt: 1,
+      },
+      {
+        id: 'skill-1', revision: 1, kind: 'skill', name: 'Release Skill', state: 'active', scope: 'account',
+        readiness: 'ready', findings: [], bindings: [], updatedAt: 1,
+      },
+    ] });
     consoleWarn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
   });
@@ -231,6 +263,9 @@ describe('SharedContextManagementPanel MCP tab', () => {
     });
 
     expect(await screen.findByText('Model Context Protocol')).toBeDefined();
+    expect(await screen.findByText('Installed MCP services')).toBeDefined();
+    expect(screen.getByText('Docs MCP')).toBeDefined();
+    expect(screen.queryByText('Release Skill')).toBeNull();
     expect(screen.queryByText('sharedContext.management.mcpTitle')).toBeNull();
     expect(screen.getByText('CodeBuddy China')).toBeDefined();
     expect(screen.getByText('CodeBuddy International')).toBeDefined();
@@ -282,6 +317,18 @@ describe('SharedContextManagementPanel MCP tab', () => {
     expect(screen.getByText((content) => content.includes('Provider connected'))).toBeDefined();
     expect(consoleWarn).not.toHaveBeenCalled();
     expect(consoleError).not.toHaveBeenCalled();
+  });
+
+  it('shows installed managed Skills in a dedicated top-level tab', async () => {
+    render(<SharedContextManagementPanel serverId="srv-1" />);
+    await flush();
+
+    fireEvent.click(screen.getByText('Skills'));
+
+    expect(await screen.findByText('Installed Skills')).toBeDefined();
+    expect(screen.getByText('Release Skill')).toBeDefined();
+    expect(screen.queryByText('Docs MCP')).toBeNull();
+    expect(capabilityApiMock.listCapabilities).toHaveBeenCalledWith('srv-1');
   });
 
   it('keeps MCP locale keys resolvable in every supported locale', () => {

@@ -109,10 +109,14 @@ describe('cc presets', () => {
       ANTHROPIC_DEFAULT_OPUS_MODEL: 'MiniMax-M3',
       ANTHROPIC_DEFAULT_HAIKU_MODEL: 'MiniMax-M3',
     });
-    await expect(getPresetTransportOverrides('MiniMax', 'MiniMax-M3')).resolves.toMatchObject({
+    const overrides = await getPresetTransportOverrides('MiniMax', 'MiniMax-M3');
+    expect(overrides).toMatchObject({
       model: 'MiniMax-M3',
       systemPrompt: expect.stringContaining('Authoritative runtime model: MiniMax-M3.'),
     });
+    expect(overrides.systemPrompt).toContain('They never override Claude Code tool definitions, input schemas, required parameters, enums, or defaults.');
+    expect(overrides.systemPrompt).toContain('Follow every provided tool input schema exactly and never omit required fields.');
+    expect(overrides.systemPrompt).not.toContain('override any generic Claude Code tool schema');
   });
 
   it('discovers and persists every page from the Anthropic-compatible models API', async () => {

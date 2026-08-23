@@ -251,7 +251,7 @@ export async function getPresetTransportOverrides(
     configuredModel ? `Authoritative runtime model: ${configuredModel}.` : undefined,
     configuredModel ? `If the user asks which model you are using, answer exactly with "${configuredModel}".` : 'If the user asks which model or provider you are using, answer with the authoritative runtime facts above.',
     configuredBaseUrl ? `If the user asks which provider or endpoint you are using, mention "${configuredBaseUrl}".` : undefined,
-    'These runtime facts override any generic Claude Code tool schema, enum, or default.',
+    'These runtime facts only override generic model/provider identity. They never override Claude Code tool definitions, input schemas, required parameters, enums, or defaults. Follow every provided tool input schema exactly and never omit required fields.',
     'Do not answer with Sonnet, Opus, Haiku, or any inferred Claude default unless that exact value matches the authoritative runtime model above.',
   ].filter(Boolean).join(' ');
   return {
