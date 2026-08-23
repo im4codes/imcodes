@@ -17,6 +17,7 @@ import {
 import logger from '../util/logger.js';
 import {
   SUPERVISION_CONTRACT_IDS,
+  SUPERVISION_AUDIT_MARKER_CORRECTION_AUTOMATION_KIND,
   SUPERVISION_AUDIT_TARGET_RECOVERY_AUTOMATION_KIND,
   SUPERVISION_DEFAULT_MAX_AUTO_CONTINUE_STREAK,
   SUPERVISION_DEFAULT_MAX_AUTO_CONTINUE_TOTAL,
@@ -154,6 +155,10 @@ interface ActiveTaskRunState {
   auditDelegationId?: string;
   auditStartedAt?: number;
   auditReplyObserved: boolean;
+  /** One bounded self-heal turn when the orchestrator omits/duplicates the marker. */
+  auditVerdictCorrectionAttempts: number;
+  /** De-duplicates the terminal warning across repeated idle projections. */
+  auditMarkerWarningEmitted: boolean;
   auditDeadlineTimer?: NodeJS.Timeout;
   auditTargetSessionInstanceId?: string;
   auditTargetDispatchObservedAt?: number;
@@ -229,6 +234,10 @@ function parseExplicitAuditVerdict(text: string): 'PASS' | 'REWORK' | null {
   )].map((match) => match[1]!.toUpperCase() as 'PASS' | 'REWORK');
   const unique = [...new Set(matches)];
   return unique.length === 1 ? unique[0]! : null;
+}
+
+function parseDeliveredAuditVerdict(text: string): 'PASS' | 'REWORK' | null {
+  return parsePeerAuditOrchestratedResult(text) ?? parseExplicitAuditVerdict(text);
 }
 
 function sanitizeRecentEvidenceText(value: string): string {
@@ -966,6 +975,8 @@ class SupervisionAutomation {
       sawAssistantOutput: false,
       reworkDispatches: 0,
       auditReplyObserved: false,
+      auditVerdictCorrectionAttempts: 0,
+      auditMarkerWarningEmitted: false,
       auditTargetObservedActive: false,
       auditTargetRecoveryAttempts: 0,
       auditTargetRecoveryLimitNotified: false,
@@ -1085,6 +1096,8 @@ class SupervisionAutomation {
     run.evaluating = false;
     run.terminalState = 'complete';
     run.auditReplyObserved = false;
+    run.auditVerdictCorrectionAttempts = 0;
+    run.auditMarkerWarningEmitted = false;
     run.auditAttemptId = options.auditAttemptId;
     run.auditDelegationId = options.delegationId;
     run.auditStartedAt = Date.now();
@@ -1166,6 +1179,8 @@ class SupervisionAutomation {
       || !delegationIdentityMatches(record.target, boundDelegationIdentity(getSession(record.target.sessionName)))) return;
     this.clearAuditTargetRecovery(run);
     run.auditReplyObserved = true;
+    run.auditVerdictCorrectionAttempts = 0;
+    run.auditMarkerWarningEmitted = false;
     run.sawAssistantOutput = false;
     run.lastAssistantText = undefined;
     this.emitStatus(run.sessionName, 'supervision_audit_waiting', SUPERVISION_AUDIT_WAITING_LABEL);
@@ -1199,7 +1214,7 @@ class SupervisionAutomation {
     return exactReplyRoute && (exactActor || exactAttempt);
   }
 
-  private auditTargetRuntimeIsWorking(sessionName: string): boolean {
+  private transportRuntimeIsWorking(sessionName: string): boolean {
     const runtime = getTransportRuntime(sessionName);
     if (!runtime) return false;
     const activity = runtime.getDiagnosticSnapshot();
@@ -1208,6 +1223,10 @@ class SupervisionAutomation {
       || activity.pendingCount > 0
       || activity.activeDispatchCount > 0
       || activity.blockingWorkCount > 0;
+  }
+
+  private auditTargetRuntimeIsWorking(sessionName: string): boolean {
+    return this.transportRuntimeIsWorking(sessionName);
   }
 
   private handleAuditTargetTimelineEvent(event: {
@@ -1457,6 +1476,8 @@ class SupervisionAutomation {
       if (delegatedReply && activeRun) {
         this.clearAuditTargetRecovery(activeRun);
         activeRun.auditReplyObserved = true;
+        activeRun.auditVerdictCorrectionAttempts = 0;
+        activeRun.auditMarkerWarningEmitted = false;
         activeRun.sawAssistantOutput = false;
         activeRun.lastAssistantText = undefined;
         this.emitStatus(activeRun.sessionName, 'supervision_audit_waiting', SUPERVISION_AUDIT_WAITING_LABEL);
@@ -1519,6 +1540,19 @@ class SupervisionAutomation {
         queueMicrotask(() => {
           const latest = this.activeRuns.get(event.sessionId);
           if (!latest || latest.generation !== generation || latest.phase !== 'auditing' || !latest.auditReplyObserved) return;
+          // A provider may finalize several assistant text blocks inside one
+          // tool-using turn. Those blocks all have `streaming:false`, but only
+          // the trailing idle (or an already-idle retained runtime) proves the
+          // orchestrator has finished its audit judgment. Treating every block
+          // as final produced one identical marker warning per tool round.
+          // An exact marker/anchored verdict is itself a terminal boundary by
+          // contract, so it can still settle retained transports that omit the
+          // trailing idle event entirely.
+          const hasVerdict = latest.lastAssistantText
+            ? parseDeliveredAuditVerdict(latest.lastAssistantText) !== null
+            : false;
+          if (!hasVerdict
+            && (!this.isSessionIdle(event.sessionId) || this.transportRuntimeIsWorking(event.sessionId))) return;
           this.handleOrchestratedAuditCompletion(latest, { settledWithoutIdle: true });
         });
       }
@@ -1776,6 +1810,8 @@ class SupervisionAutomation {
     current.requiresAudit = false;
     current.evaluating = false;
     current.auditReplyObserved = false;
+    current.auditVerdictCorrectionAttempts = 0;
+    current.auditMarkerWarningEmitted = false;
     current.auditAttemptId = randomUUID();
     current.auditDelegationId = undefined;
     current.auditStartedAt = Date.now();
@@ -1918,10 +1954,13 @@ class SupervisionAutomation {
     options: { settledWithoutIdle?: boolean } = {},
   ): void {
     if (current.phase !== 'auditing' || !current.auditReplyObserved || !current.lastAssistantText) return;
-    const verdict = parsePeerAuditOrchestratedResult(current.lastAssistantText)
-      ?? parseExplicitAuditVerdict(current.lastAssistantText);
+    const verdict = parseDeliveredAuditVerdict(current.lastAssistantText);
     if (!verdict) {
-      this.emitWarning(current.sessionName, 'The delegated audit reply arrived, but the current session did not report exactly one PASS/REWORK audit marker. Waiting until the audit deadline.');
+      if (this.requestAuditVerdictCorrection(current)) return;
+      if (!current.auditMarkerWarningEmitted) {
+        current.auditMarkerWarningEmitted = true;
+        this.emitWarning(current.sessionName, 'The delegated audit reply arrived, but the current session still did not report exactly one PASS/REWORK audit marker after an automatic correction attempt. Waiting until the audit deadline.');
+      }
       return;
     }
     this.clearAuditDeadline(current);
@@ -1974,6 +2013,8 @@ class SupervisionAutomation {
     current.evaluating = false;
     current.sawAssistantOutput = false;
     current.auditReplyObserved = false;
+    current.auditVerdictCorrectionAttempts = 0;
+    current.auditMarkerWarningEmitted = false;
     current.terminalState = undefined;
     current.lastAssistantText = undefined;
     timelineEmitter.emit(
@@ -1991,6 +2032,61 @@ class SupervisionAutomation {
       // Do not retain a completion timer after the run reaches a terminal state.
       this.clearWaitingTimeout(current);
       this.activeRuns.delete(current.sessionName);
+    }
+  }
+
+  private requestAuditVerdictCorrection(current: ActiveTaskRunState): boolean {
+    if (current.auditVerdictCorrectionAttempts >= 1) return false;
+    const transportRuntime = getTransportRuntime(current.sessionName);
+    if (!transportRuntime) return false;
+
+    const correctionNumber = current.auditVerdictCorrectionAttempts + 1;
+    const correctionPrompt = [
+      `[Contract: ${SUPERVISION_CONTRACT_IDS.AUDIT_MARKER_CORRECTION}]`,
+      'The delegated audit reply is already present in this session.',
+      'Your preceding judgment omitted the required audit marker or emitted more than one marker.',
+      'Do not delegate again, re-run the audit, call tools, modify files, or repeat implementation.',
+      'Evaluate the delivered audit evidence already in context, state the concrete findings, and end the response with exactly one of these markers:',
+      PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS.PASS,
+      PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS.REWORK,
+      'Do not include both markers and do not write anything after the selected marker.',
+    ].join('\n');
+
+    current.auditVerdictCorrectionAttempts = correctionNumber;
+    current.auditMarkerWarningEmitted = false;
+    current.sawAssistantOutput = false;
+    current.lastAssistantText = undefined;
+    timelineEmitter.emit(
+      current.sessionName,
+      'user.message',
+      {
+        text: correctionPrompt,
+        allowDuplicate: true,
+        automation: true,
+        automationKind: SUPERVISION_AUDIT_MARKER_CORRECTION_AUTOMATION_KIND,
+      },
+      {
+        source: 'daemon',
+        confidence: 'high',
+        eventId: `supervision-audit-marker-correction:${current.generation}:${correctionNumber}:${randomUUID()}`,
+      },
+    );
+
+    try {
+      transportRuntime.send(
+        correctionPrompt,
+        `supervision-audit-marker-correction-${current.generation}-${correctionNumber}`,
+      );
+      this.emitAutomationNote(
+        current.sessionName,
+        'Auto: the audit reply arrived, but the final marker was missing or ambiguous; requested one bounded marker-only correction turn.',
+        'supervision-audit-marker-correction-status',
+      );
+      this.armAuditDeadline(current);
+      return true;
+    } catch (error) {
+      logger.warn({ session: current.sessionName, err: error }, 'Automatic audit marker correction dispatch failed');
+      return false;
     }
   }
 

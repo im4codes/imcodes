@@ -4,6 +4,7 @@ import path from 'node:path';
 import os from 'node:os';
 import {
   normalizeSessionSupervisionSnapshot,
+  SUPERVISION_AUDIT_MARKER_CORRECTION_AUTOMATION_KIND,
   SUPERVISION_AUDIT_TARGET_RECOVERY_AUTOMATION_KIND,
   SUPERVISION_CONTRACT_IDS,
   SUPERVISION_MODE,
@@ -30,11 +31,19 @@ const mockGetP2pRun = vi.fn();
 // helper never trips on `daemon_busy`.
 const mockListP2pRuns = vi.fn(() => [] as unknown[]);
 const mockSupervisionDecide = vi.fn(async () => ({ decision: 'complete', reason: 'done', confidence: 0.9 }));
+let mockTransportRuntimeWorking = false;
 const mockTransportRuntime = {
   send: vi.fn(),
   pendingCount: 0,
   pendingMessages: [],
   pendingEntries: [],
+  getDiagnosticSnapshot: vi.fn(() => ({
+    status: mockTransportRuntimeWorking ? 'running' : 'idle',
+    sending: mockTransportRuntimeWorking,
+    pendingCount: 0,
+    activeDispatchCount: mockTransportRuntimeWorking ? 1 : 0,
+    blockingWorkCount: mockTransportRuntimeWorking ? 1 : 0,
+  })),
 };
 let mockAuditTargetStatus = 'idle';
 let mockAuditTargetSending = false;
@@ -144,6 +153,7 @@ beforeEach(() => {
   mockAuditTargetStatus = 'idle';
   mockAuditTargetSending = false;
   mockAuditTargetLastProviderError = null;
+  mockTransportRuntimeWorking = false;
   mockAuditTargetRuntime.send.mockReturnValue('sent');
   removeSession('deck_supervision_brain');
   removeSession('deck_sub_reviewer');
@@ -1140,6 +1150,134 @@ describe('SupervisionAutomation', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it('does not treat finalized intermediate tool-round text as the final audit judgment', async () => {
+    const snapshot = await seedSession('supervised_audit');
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent(
+      'deck_supervision_brain',
+      'cmd-multi-message-audit-turn',
+      'implement the feature',
+      snapshot,
+    );
+    beginRun('cmd-multi-message-audit-turn', 'implement the feature');
+    completeTurn('implemented the feature');
+    await waitForRunPhase('auditing');
+
+    timelineEmitter.emit('deck_supervision_brain', 'user.message', {
+      text: 'Task: independent audit\nResult: PASS with evidence.',
+      allowDuplicate: true,
+    });
+    // Some providers finalize one assistant text block before each tool call.
+    // The origin session can still look idle from the previous turn, so the
+    // runtime activity snapshot is the load-bearing guard here.
+    mockTransportRuntimeWorking = true;
+    for (const text of [
+      'I am checking the changed files.',
+      'The focused tests are running.',
+      'I am reconciling the evidence.',
+    ]) {
+      timelineEmitter.emit('deck_supervision_brain', 'assistant.text', {
+        text,
+        streaming: false,
+      });
+      await Promise.resolve();
+    }
+
+    const warningsBeforeFinal = timelineEmitter.replay('deck_supervision_brain', 0).events.filter((event) =>
+      event.type === 'assistant.text'
+      && event.payload.automationKind === 'supervision-warning'
+      && String(event.payload.text ?? '').includes('PASS/REWORK audit marker'));
+    expect(warningsBeforeFinal).toHaveLength(0);
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({
+      phase: 'auditing',
+      auditReplyObserved: true,
+    });
+
+    mockTransportRuntimeWorking = false;
+    timelineEmitter.emit('deck_supervision_brain', 'assistant.text', {
+      text: `Concrete findings: no blocker.\n${PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS.PASS}`,
+      streaming: false,
+    });
+    await Promise.resolve();
+
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
+    const warningsAfterFinal = timelineEmitter.replay('deck_supervision_brain', 0).events.filter((event) =>
+      event.type === 'assistant.text'
+      && event.payload.automationKind === 'supervision-warning'
+      && String(event.payload.text ?? '').includes('PASS/REWORK audit marker'));
+    expect(warningsAfterFinal).toHaveLength(0);
+  });
+
+  it('self-corrects one missing audit marker and de-duplicates later warnings', async () => {
+    const snapshot = await seedSession('supervised_audit');
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent(
+      'deck_supervision_brain',
+      'cmd-audit-marker-correction',
+      'implement the feature',
+      snapshot,
+    );
+    beginRun('cmd-audit-marker-correction', 'implement the feature');
+    completeTurn('implemented the feature');
+    await waitForRunPhase('auditing');
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
+
+    timelineEmitter.emit('deck_supervision_brain', 'user.message', {
+      text: 'Task: independent audit\nResult: PASS with evidence.',
+      allowDuplicate: true,
+    });
+    timelineEmitter.emit('deck_supervision_brain', 'assistant.text', {
+      text: 'Concrete findings are clean, but this response omitted the control marker.',
+      streaming: false,
+    });
+    await Promise.resolve();
+
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(2);
+    const correctionPrompt = String(mockTransportRuntime.send.mock.calls[1]?.[0]);
+    expect(correctionPrompt).toContain(`[Contract: ${SUPERVISION_CONTRACT_IDS.AUDIT_MARKER_CORRECTION}]`);
+    expect(correctionPrompt).toContain(PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS.PASS);
+    expect(correctionPrompt).toContain(PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS.REWORK);
+    expect(correctionPrompt).toContain('Do not delegate again');
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({
+      phase: 'auditing',
+      auditVerdictCorrectionAttempts: 1,
+      sawAssistantOutput: false,
+    });
+
+    // If the bounded correction is malformed too, repeated final/idle
+    // projections surface only one warning rather than one per projection.
+    timelineEmitter.emit('deck_supervision_brain', 'assistant.text', {
+      text: 'Still missing the exact marker.',
+      streaming: false,
+    });
+    await Promise.resolve();
+    timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'idle' });
+    timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'idle' });
+
+    const warnings = timelineEmitter.replay('deck_supervision_brain', 0).events.filter((event) =>
+      event.type === 'assistant.text'
+      && event.payload.automationKind === 'supervision-warning'
+      && String(event.payload.text ?? '').includes('PASS/REWORK audit marker'));
+    expect(warnings).toHaveLength(1);
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(2);
+    expect(timelineEmitter.replay('deck_supervision_brain', 0).events).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: 'user.message',
+        payload: expect.objectContaining({
+          automationKind: SUPERVISION_AUDIT_MARKER_CORRECTION_AUTOMATION_KIND,
+        }),
+      }),
+    ]));
+
+    timelineEmitter.emit('deck_supervision_brain', 'assistant.text', {
+      text: `Concrete findings: no blocker.\n${PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS.PASS}`,
+      streaming: false,
+    });
+    await Promise.resolve();
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
   });
 
   it('ignores the audit turn idle when it arrives after fallback settlement starts finalization', async () => {
