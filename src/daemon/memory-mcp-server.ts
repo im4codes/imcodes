@@ -301,6 +301,12 @@ export async function runMemoryMcpServer(options: MemoryMcpServerOptions = {}): 
   try {
     await loadStore();
     const server = createMemoryMcpServerFromEnv(options);
+    // Resolve the exact runtime identity before the MCP handshake. Several
+    // provider clients cache their first tools/list response and do not honor
+    // tools/list_changed reliably. Connecting while capability tools are still
+    // disabled therefore makes them disappear for the whole provider session,
+    // even when the identity refresh succeeds a moment later.
+    await refreshCapabilityIdentity(server);
     await server.connect(new StdioServerTransport());
     startCapabilityIdentityRefresh(server);
   } catch (err) {

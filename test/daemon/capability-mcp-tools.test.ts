@@ -143,6 +143,35 @@ describe('capability MCP tools', () => {
     }
   });
 
+  it('enables capability tools before connect so the first tools/list is complete', async () => {
+    const runtimeCaller = caller({
+      userId: 'daemon-local',
+      namespace: { scope: 'personal', projectId: 'authority-project' },
+    });
+    const server = createMemoryMcpServer(runtimeCaller, {
+      capabilityService: service(),
+      resolveCapabilityIdentity: async () => ({
+        ownerId: 'owner-1', providerId: 'codex-sdk', serverId: 'server-1',
+        sessionId: 'deck_project_brain',
+        namespace: { scope: 'personal', userId: 'owner-1', projectId: 'authority-project' },
+        projectDir: '/authority/project',
+      }),
+    });
+
+    // Production performs this preflight before StdioServerTransport.connect.
+    expect(await refreshCapabilityIdentity(server)).toBe(true);
+    const client = new Client({ name: 'initial-capability-list-test', version: '1' });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+    try {
+      const firstList = (await client.listTools()).tools.map((tool) => tool.name);
+      expect(firstList).toEqual(expect.arrayContaining([...CAPABILITY_MCP_TOOL_NAMES]));
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+
   it('carries provider identity through provider config and child parsing before dynamic authorization', async () => {
     const config = getDefaultMcpServers({
       sessionKey: 'route-fallback',
