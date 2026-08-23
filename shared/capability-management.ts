@@ -1000,7 +1000,7 @@ const machineSchema = arraySchema(
 export const CAPABILITY_MCP_TOOL_CONTRACTS: Readonly<Record<CapabilityMcpToolName, CapabilityMcpToolContract>> = {
   [CAPABILITY_MCP_TOOL.LIST]: {
     name: CAPABILITY_MCP_TOOL.LIST,
-    description: `List visible IM.codes MCP services and Skills with state, scope, version, readiness, findings, and management hints. Read-only. ${CAPABILITY_CANONICAL_INSTALL_POLICY}`,
+    description: 'List visible IM.codes MCP services and Skills with state, scope, version, readiness, findings, and management hints. Read-only.',
     inputSchema: objectSchema('Bounded inventory filter.', {
       kind: kindSchema,
       state: { type: 'string', enum: CAPABILITY_LIFECYCLE_STATES, description: 'Optional lifecycle-state filter.' },
@@ -1011,7 +1011,7 @@ export const CAPABILITY_MCP_TOOL_CONTRACTS: Readonly<Record<CapabilityMcpToolNam
   },
   [CAPABILITY_MCP_TOOL.INSTALL]: {
     name: CAPABILITY_MCP_TOOL.INSTALL,
-    description: `Start one automatic IM.codes install. For MCP, directly compose source.kind=mcp_config with the requested non-secret stdio command/args or Streamable HTTP endpoint; no downloadable installer is required. Skill sources may be a URL, repository, local path, or inline package. Returns an operation; scanning and one isolated audit run automatically, then the user receives one confirmation card. ${CAPABILITY_CANONICAL_INSTALL_POLICY}`,
+    description: 'Start one automatic IM.codes install. For MCP, directly compose source.kind=mcp_config with the non-secret stdio definition or Streamable HTTP endpoint; no downloadable installer is required. Managed Skills stay under ~/.imcodes/skills/managed. Scanning and one isolated AI audit run before user confirmation; verify authoritative status before claiming success.',
     inputSchema: objectSchema('One bounded capability install request.', {
       capabilityId: stringSchema('Optional exact installed capability id when updating; names are never used to guess an update target.'),
       bindingId: stringSchema('Exact installed binding id required with capabilityId; update never guesses among bindings.'),
@@ -1043,7 +1043,7 @@ export const CAPABILITY_MCP_TOOL_CONTRACTS: Readonly<Record<CapabilityMcpToolNam
   },
   [CAPABILITY_MCP_TOOL.MANAGE]: {
     name: CAPABILITY_MCP_TOOL.MANAGE,
-    description: `Enable, disable, roll back, uninstall, restore, or cancel an operation. Explicit user language authorizes uninstall; if target or scope is ambiguous this returns choices so ask once. Uninstall is recoverable and retains credentials. ${CAPABILITY_CANONICAL_INSTALL_POLICY}`,
+    description: 'Enable, disable, roll back, uninstall, restore, or cancel an operation. Explicit user language authorizes uninstall; ambiguous targets return choices. Uninstall is recoverable and retains credentials.',
     inputSchema: objectSchema('One bounded management request.', {
       action: { type: 'string', enum: CAPABILITY_AVAILABLE_MANAGEMENT_ACTIONS, description: 'Requested management action currently available through AI management.' },
       capabilityId: stringSchema('Preferred exact opaque capability id.'),
