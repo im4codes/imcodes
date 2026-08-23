@@ -66,8 +66,11 @@ interface Props {
   sub: SubSession;
   ws: WsClient | null;
   connected: boolean;
-  /** When false, timeline and terminal subscriptions are paused to save CPU. */
+  /** Whether this is the focused/topmost visible sub-session window. */
   active: boolean;
+  /** False while its owning main-session tab is hidden; the mounted window and
+   * chat state are retained so returning to the tab never rebuilds a blank pane. */
+  visible?: boolean;
   /** Report the trailing pending ask.question (or null) for dialog re-surface. */
   onPendingQuestion?: (sessionName: string, q: TrailingAskQuestion | null) => void;
   idleFlashToken?: number;
@@ -259,7 +262,7 @@ function saveLocal(id: string, geom: WindowGeometry, viewMode: ViewMode) {
 }
 
 export function SubSessionWindow({
-  sub, ws, connected, active, onPendingQuestion, idleFlashToken, onDiff, onHistory, onMinimize, onClose, maximized = false, onToggleMaximized, onRestoreBeforeClose, getMaximizeBounds, desktopLayoutCapable = true, onRestart, onRename, onSettings, onShareSession, onViewRepo, onTransportConfigSaved, onPreviewFile, onOpenLocalWebPreview, zIndex, onFocus, desktopFileBrowserZIndex, onDesktopFileBrowserOpen, onDesktopFileBrowserFocus, onDesktopFileBrowserClose, onPin, sessions, subSessions, serverId, pendingPrefillText, onPendingPrefillApplied, onVersionSensitiveAction, detectedModelHint, inP2p, sharedState, accentColor = DEFAULT_SUBSESSION_ACCENT_COLOR,
+  sub, ws, connected, active, visible = true, onPendingQuestion, idleFlashToken, onDiff, onHistory, onMinimize, onClose, maximized = false, onToggleMaximized, onRestoreBeforeClose, getMaximizeBounds, desktopLayoutCapable = true, onRestart, onRename, onSettings, onShareSession, onViewRepo, onTransportConfigSaved, onPreviewFile, onOpenLocalWebPreview, zIndex, onFocus, desktopFileBrowserZIndex, onDesktopFileBrowserOpen, onDesktopFileBrowserFocus, onDesktopFileBrowserClose, onPin, sessions, subSessions, serverId, pendingPrefillText, onPendingPrefillApplied, onVersionSensitiveAction, detectedModelHint, inP2p, sharedState, accentColor = DEFAULT_SUBSESSION_ACCENT_COLOR,
 }: Props) {
   const { t } = useTranslation();
   const activeIdleFlashToken = useIdleFlashPlayback(idleFlashToken);
@@ -290,11 +293,11 @@ export function SubSessionWindow({
     loadOlderEvents,
     loadMessageContext,
   } = useTimeline(sub.sessionName, ws, serverId, {
-    // Any mounted sub-session window is user-visible work, even when it is not
-    // the focused/topmost one. Keep its active history/replay/retry path armed
-    // so timeline gaps do not wait for a focus/window switch to backfill.
-    isActiveSession: true,
-    isVisible: true,
+    // Any visible sub-session window is user-visible work, even when it is not
+    // the focused/topmost one. Hidden retained windows keep their hook state
+    // but pause history/replay/retry work until the owning tab is visible.
+    isActiveSession: visible,
+    isVisible: visible,
   });
 
   // Re-surface a still-pending question in the dedicated dialog from history
@@ -515,12 +518,13 @@ export function SubSessionWindow({
   }, [viewMode, ws, connected, active, sub.sessionName]);
 
   // Shell/script window: hold the raw PTY stream for the window's ENTIRE
-  // lifetime — NOT just while focused. An open sub-session window is always
-  // on-screen (position:fixed); users often keep one at the side to observe, so
-  // it must keep updating regardless of focus. (Previously this bailed with
+  // visible lifetime — NOT just while focused. Users often keep one at the
+  // side to observe, so it must keep updating regardless of focus. Hidden
+  // retained windows release the stream without discarding their UI state.
+  // (Previously this bailed with
   // `if (isShell && !active) return` and unsubscribed on focus loss, which froze
   // an open-but-unfocused shell window.) Ref-counted hold — see useTerminalRawHold.
-  useTerminalRawHold(ws, connected, isShell && !isTransport, sub.sessionName);
+  useTerminalRawHold(ws, connected, visible && isShell && !isTransport, sub.sessionName);
 
   // These arrive from app.tsx as inline arrows and would otherwise change
   // identity on every timeline event, defeating ChatView's memo boundary.
@@ -530,17 +534,16 @@ export function SubSessionWindow({
 
   // Non-shell window: subscribe raw only while focused (full-fidelity view); when
   // unfocused it falls back to the passive (non-raw) subscription app.tsx keeps.
-  // Re-subscribe on mount so the server sends a fresh snapshot (the window
-  // unmounts on minimize, so a remount would otherwise start empty).
+  // Re-subscribe on mount/restore so the server sends a fresh snapshot.
   useEffect(() => {
-    if (!ws || !connected || isTransport || isShell) return;
+    if (!visible || !ws || !connected || isTransport || isShell) return;
     const raw = active;
     try { ws.subscribeTerminal(sub.sessionName, raw); } catch { /* ignore */ }
     if (!raw) return;
     return () => {
       try { ws.subscribeTerminal(sub.sessionName, false); } catch { /* ignore */ }
     };
-  }, [ws, connected, sub.sessionName, active, isTransport, isShell]);
+  }, [ws, connected, sub.sessionName, active, visible, isTransport, isShell]);
 
   const scrollToBottom = useCallback(() => {
     setTimeout(() => {

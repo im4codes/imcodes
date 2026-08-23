@@ -83,23 +83,27 @@ const addOptimisticUserMessageSpy = vi.fn();
 const markOptimisticFailedSpy = vi.fn();
 const retryOptimisticMessageSpy = vi.fn();
 const loadOlderEventsSpy = vi.fn();
+const useTimelineSpy = vi.fn();
 
 vi.mock('../../src/hooks/useTimeline.js', () => ({
   requestActiveTimelineRefreshAfterUserAction: vi.fn(),
-  useTimeline: () => ({
-    events: timelineEventsMock,
-    refreshing: false,
-    // Provide the optimistic helpers so the onSend / retry handlers don't
-    // blow up when a test triggers user interaction. Real behavior is
-    // covered by the useTimeline unit tests.
-    addOptimisticUserMessage: addOptimisticUserMessageSpy,
-    markOptimisticFailed: markOptimisticFailedSpy,
-    retryOptimisticMessage: retryOptimisticMessageSpy,
-    // Older-history pagination — must be forwarded to ChatView so scroll-to-top loads history.
-    loadingOlder: false,
-    hasOlderHistory: true,
-    loadOlderEvents: loadOlderEventsSpy,
-  }),
+  useTimeline: (...args: any[]) => {
+    useTimelineSpy(...args);
+    return {
+      events: timelineEventsMock,
+      refreshing: false,
+      // Provide the optimistic helpers so the onSend / retry handlers don't
+      // blow up when a test triggers user interaction. Real behavior is
+      // covered by the useTimeline unit tests.
+      addOptimisticUserMessage: addOptimisticUserMessageSpy,
+      markOptimisticFailed: markOptimisticFailedSpy,
+      retryOptimisticMessage: retryOptimisticMessageSpy,
+      // Older-history pagination — must be forwarded to ChatView so scroll-to-top loads history.
+      loadingOlder: false,
+      hasOlderHistory: true,
+      loadOlderEvents: loadOlderEventsSpy,
+    };
+  },
 }));
 
 vi.mock('../../src/hooks/useSwipeBack.js', () => ({
@@ -1243,6 +1247,37 @@ describe('SubSessionWindow terminal subscription raw mode', () => {
     await waitFor(() => {
       expect(releaseHold).toHaveBeenCalledTimes(1);
     });
+  });
+
+  it('retains hidden chat state while pausing timeline and terminal subscriptions', async () => {
+    const sub = makeSubSession();
+
+    render(
+      <SubSessionWindow
+        sub={sub}
+        ws={ws}
+        connected={true}
+        active={false}
+        visible={false}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        onMinimize={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRename={vi.fn()}
+        zIndex={1}
+        onFocus={vi.fn()}
+      />,
+    );
+
+    expect(useTimelineSpy).toHaveBeenLastCalledWith(
+      sub.sessionName,
+      ws,
+      undefined,
+      { isActiveSession: false, isVisible: false },
+    );
+    expect(ws.holdTerminalRaw).not.toHaveBeenCalled();
+    expect(ws.subscribeTerminal).not.toHaveBeenCalled();
   });
 
   it('keeps non-shell windows passively subscribed when inactive', async () => {

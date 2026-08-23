@@ -356,6 +356,9 @@ vi.mock('../src/components/SessionTabs.js', () => ({
     <div>
       session-tabs
       <button onClick={() => onSelect?.(sessions?.[0]?.name)}>tabs-select</button>
+      {sessions?.map((session: any) => (
+        <button key={session.name} onClick={() => onSelect?.(session.name)}>tabs-select-{session.name}</button>
+      ))}
       <button onClick={() => onAlertDismiss?.(sessions?.[0]?.name)}>tabs-dismiss</button>
       <button onClick={onNewSession}>tabs-new-session</button>
       <button onClick={() => onStopProject?.()}>tabs-stop</button>
@@ -420,6 +423,8 @@ vi.mock('../src/components/SubSessionBar.js', () => ({
     onCollapsedChange,
     onNew,
     onOpen,
+    onCloseAllOpen,
+    onRestoreQuickClosed,
     onOpenMaximized,
     onViewAutoDeliver,
     onViewCron,
@@ -472,6 +477,8 @@ vi.mock('../src/components/SubSessionBar.js', () => ({
       {subSessions?.map((sub: any) => (
         <button key={sub.id} onClick={() => onOpen?.(sub.id)}>subbar-open-{sub.id}</button>
       ))}
+      <button onClick={onCloseAllOpen}>subbar-quick-close</button>
+      <button onClick={() => onRestoreQuickClosed?.(subSessions?.map((sub: any) => sub.id) ?? [])}>subbar-quick-restore</button>
       <button onClick={() => onOpenMaximized?.(subSessions?.[0]?.id)}>subbar-open-max</button>
       <button onClick={onViewAutoDeliver}>subbar-auto-deliver</button>
       <button onClick={onViewCron}>subbar-cron</button>
@@ -484,10 +491,11 @@ vi.mock('../src/components/SubSessionBar.js', () => ({
   ),
 }));
 vi.mock('../src/components/SubSessionWindow.js', () => ({
-  SubSessionWindow: ({ sub, active, zIndex, onFocus, onViewRepo }: any) => (
+  SubSessionWindow: ({ sub, active, visible, zIndex, onFocus, onViewRepo }: any) => (
     <div
       data-testid={`sub-session-window-${sub?.id}`}
       data-active={String(active)}
+      data-visible={String(visible)}
       style={{ zIndex }}
       onMouseDown={onFocus}
     >
@@ -1585,6 +1593,40 @@ describe('App shell', () => {
     });
   }, 20_000);
 
+  it('restores open sub-session windows from the tab-local hash session after refresh', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    // Simulate another browser tab having most recently written the shared
+    // fallback while this tab remains on Alpha through its own URL hash.
+    localStorage.setItem('rcc_session', 'deck_other_brain');
+    localStorage.setItem('rcc_open_subs_deck_alpha_brain', JSON.stringify(['sub-1']));
+    localStorage.setItem('rcc_open_subs_deck_other_brain', JSON.stringify(['sub-other']));
+    history.replaceState(null, '', '/#/srv-1/deck_alpha_brain');
+    useSubSessionsState.subSessions = [
+      {
+        id: 'sub-1',
+        sessionName: 'deck_sub_alpha_helper',
+        parentSession: 'deck_alpha_brain',
+        label: 'Helper',
+        description: 'Helper session',
+        cwd: '/work/alpha',
+        type: 'codex-sdk',
+        runtimeType: 'transport',
+        state: 'idle',
+        serverId: 'srv-1',
+      },
+    ];
+    useSubSessionsState.visibleSubSessions = useSubSessionsState.subSessions;
+
+    const { App } = await importApp();
+    render(<App />);
+
+    await waitFor(() => expect(wsInstances.length).toBe(1));
+    expect(await screen.findByTestId('sub-session-window-sub-1')).toBeTruthy();
+    expect(localStorage.getItem('rcc_open_subs_deck_alpha_brain')).toBe(JSON.stringify(['sub-1']));
+    expect(localStorage.getItem('rcc_open_subs_deck_other_brain')).toBe(JSON.stringify(['sub-other']));
+  }, 20_000);
+
   it('toggles a mobile bottom sub-session button open and closed', async () => {
     const originalUserAgent = navigator.userAgent;
     Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
@@ -2071,7 +2113,7 @@ describe('App shell', () => {
     expect(screen.queryByText('ask-question-dialog')).toBeNull();
   }, 20_000);
 
-  it('closes all open sub-session windows when clicking the active main session tab', async () => {
+  it('quick-collapses and restores all sub-session windows without unmounting their chat state', async () => {
     localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
     localStorage.setItem('rcc_server', 'srv-1');
     localStorage.setItem('rcc_session', 'deck_alpha_brain');
@@ -2115,12 +2157,25 @@ describe('App shell', () => {
       expect(second.getAttribute('data-active')).toBe('true');
     });
 
-    fireEvent.click(screen.getByText('tabs-select'));
+    fireEvent.click(screen.getByText('subbar-quick-close'));
 
     await waitFor(() => {
-      expect(screen.queryByTestId('sub-session-window-sub-1')).toBeNull();
-      expect(screen.queryByTestId('sub-session-window-sub-2')).toBeNull();
+      expect(screen.getByTestId('sub-session-window-sub-1')).toBe(first);
+      expect(screen.getByTestId('sub-session-window-sub-2')).toBe(second);
+      expect(first.getAttribute('data-visible')).toBe('false');
+      expect(second.getAttribute('data-visible')).toBe('false');
       expect(localStorage.getItem('rcc_open_subs_deck_alpha_brain')).toBeNull();
+    });
+
+    // The arrow's bulk restore uses the exact retained nodes instead of
+    // reconstructing two timelines concurrently (the production blank-pane
+    // race reported by users).
+    fireEvent.click(screen.getByText('subbar-quick-restore'));
+    await waitFor(() => {
+      expect(screen.getByTestId('sub-session-window-sub-1')).toBe(first);
+      expect(screen.getByTestId('sub-session-window-sub-2')).toBe(second);
+      expect(first.getAttribute('data-visible')).toBe('true');
+      expect(second.getAttribute('data-visible')).toBe('true');
     });
   }, 20_000);
 
@@ -2167,6 +2222,85 @@ describe('App shell', () => {
     fireEvent.click(screen.getByText('subbar-open-sub-2'));
     expect(await screen.findByTestId('sub-session-window-sub-2')).toBeTruthy();
     expect(screen.queryByTestId('sub-session-window-sub-1')).toBeNull();
+  }, 20_000);
+
+  it('keeps both open sub-session window instances mounted while switching main tabs', async () => {
+    // Regression: main SessionPane components stay mounted across tab switches,
+    // but floating sub-session windows used to be filtered out by
+    // visibleSubSessions. Returning to a main tab rebuilt both ChatViews at
+    // once; their cache/IDB bootstrap raced and one window intermittently
+    // rendered blank until a manual refresh. The exact DOM nodes must survive
+    // the round trip — hidden while inactive, visible again on return.
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    localStorage.setItem('rcc_open_subs_deck_alpha_brain', JSON.stringify(['sub-a1', 'sub-a2']));
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') return { id: 'user-1' };
+      if (path === '/api/server') return serverList();
+      if (path === '/api/server/srv-1/sessions') {
+        return {
+          sessions: [
+            ...sessionList().sessions,
+            { ...sessionList().sessions[0], name: 'deck_beta_brain', project_name: 'Beta', label: 'Beta Brain' },
+          ],
+        };
+      }
+      if (path.startsWith('/api/watch/sessions')) return { sessions: [] };
+      return {};
+    });
+
+    const alphaSubs = ['a1', 'a2'].map((suffix) => ({
+      id: `sub-${suffix}`,
+      sessionName: `deck_sub_alpha_${suffix}`,
+      parentSession: 'deck_alpha_brain',
+      label: suffix.toUpperCase(),
+      description: '',
+      cwd: '/work/alpha',
+      type: 'codex-sdk',
+      runtimeType: 'transport',
+      state: 'idle',
+      serverId: 'srv-1',
+    }));
+    const betaSub = {
+      id: 'sub-b1',
+      sessionName: 'deck_sub_beta_b1',
+      parentSession: 'deck_beta_brain',
+      label: 'B1',
+      description: '',
+      cwd: '/work/beta',
+      type: 'codex-sdk',
+      runtimeType: 'transport',
+      state: 'idle',
+      serverId: 'srv-1',
+    };
+    useSubSessionsState.subSessions = [...alphaSubs, betaSub];
+    useSubSessionsState.visibleSubSessions = alphaSubs;
+
+    const { App } = await importApp();
+    render(<App />);
+    await waitFor(() => expect(wsInstances.length).toBe(1));
+
+    const firstA = await screen.findByTestId('sub-session-window-sub-a1');
+    const secondA = await screen.findByTestId('sub-session-window-sub-a2');
+    expect(firstA.getAttribute('data-visible')).toBe('true');
+    expect(secondA.getAttribute('data-visible')).toBe('true');
+
+    useSubSessionsState.visibleSubSessions = [betaSub];
+    fireEvent.click(await screen.findByText('tabs-select-deck_beta_brain'));
+    await waitFor(() => {
+      expect(firstA.getAttribute('data-visible')).toBe('false');
+      expect(secondA.getAttribute('data-visible')).toBe('false');
+    });
+
+    useSubSessionsState.visibleSubSessions = alphaSubs;
+    fireEvent.click(screen.getByText('tabs-select-deck_alpha_brain'));
+    await waitFor(() => {
+      expect(screen.getByTestId('sub-session-window-sub-a1')).toBe(firstA);
+      expect(screen.getByTestId('sub-session-window-sub-a2')).toBe(secondA);
+      expect(firstA.getAttribute('data-visible')).toBe('true');
+      expect(secondA.getAttribute('data-visible')).toBe('true');
+    });
   }, 20_000);
 
   it('marks the most-recently opened sub-session window active, regardless of how many are open', async () => {

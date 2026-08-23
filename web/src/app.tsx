@@ -1445,9 +1445,15 @@ export function App() {
   // IDs of currently-open (non-minimized) sub-session windows.
   // Persisted per main session in localStorage so open state survives
   // session switches and page reloads.
+  // The URL hash is tab-local and therefore authoritative over the shared
+  // localStorage fallback. Keep the persistence scope in a ref so session
+  // switches can update it synchronously before replacing the open-window set.
+  // Reading `localStorage.rcc_session` here made a reload in tab B restore tab
+  // A's window state (or no windows at all).
+  const openSubPersistenceSessionRef = useRef(resolveInitialSessionName());
   const [openSubIds, setOpenSubIdsRaw] = useState<Set<string>>(() => {
     try {
-      const initial = localStorage.getItem('rcc_session');
+      const initial = openSubPersistenceSessionRef.current;
       if (initial) {
         const raw = localStorage.getItem(`rcc_open_subs_${initial}`);
         if (raw) return new Set(JSON.parse(raw) as string[]);
@@ -1455,34 +1461,52 @@ export function App() {
     } catch { /* ignore */ }
     return new Set();
   });
+  // Keep windows that were open in a previously visited main-session tab
+  // mounted (but hidden) while the user looks at another tab. Main
+  // SessionPane instances already follow this lifecycle; floating sub-session
+  // windows used to be the exception: switching tabs unmounted every ChatView
+  // and switching back mounted all of them again. Two heavy timelines could
+  // then race their cache/IDB bootstrap and one pane intermittently stayed
+  // blank until the user forced a refresh. Retaining the component instances
+  // preserves their timeline/scroll/composer state and makes the return trip a
+  // visibility flip rather than a destructive rebuild.
+  const [retainedOpenSubIds, setRetainedOpenSubIds] = useState<Set<string>>(
+    () => new Set(openSubIds),
+  );
   const openSubIdsRef = useRef(openSubIds);
   openSubIdsRef.current = openSubIds;
   const persistOpenSubIds = useCallback((next: Set<string>) => {
-    let mainSession: string | null = null;
-    try {
-      mainSession = localStorage.getItem('rcc_session');
-    } catch {
-      return;
-    }
+    const mainSession = openSubPersistenceSessionRef.current;
     if (!mainSession) return;
     const ids = Array.from(next);
     const storageKey = `rcc_open_subs_${mainSession}`;
     if (ids.length > 0) safeLocalStorageSetItem(storageKey, JSON.stringify(ids));
     else safeLocalStorageRemoveItem(storageKey);
   }, []);
-  const setOpenSubIds = useCallback((updater: Set<string> | ((prev: Set<string>) => Set<string>)) => {
-    if (typeof updater !== 'function') {
-      openSubIdsRef.current = updater;
-      persistOpenSubIds(updater);
-      setOpenSubIdsRaw(updater);
-      return;
-    }
-    setOpenSubIdsRaw((prev) => {
-      const next = updater(prev);
-      openSubIdsRef.current = next;
-      persistOpenSubIds(next);
-      return next;
+  const setOpenSubIds = useCallback((
+    updater: Set<string> | ((prev: Set<string>) => Set<string>),
+    options?: { retainPrevious?: boolean },
+  ) => {
+    // Resolve functional updates against the synchronous ref. Several window
+    // actions can run in one browser turn; waiting for Preact's state updater
+    // would make the retained-set reconciliation observe an older open set.
+    const previous = openSubIdsRef.current;
+    const next = typeof updater === 'function' ? updater(previous) : updater;
+    openSubIdsRef.current = next;
+    persistOpenSubIds(next);
+    setRetainedOpenSubIds((retained) => {
+      const updated = new Set(retained);
+      // Ordinary window actions replace the active tab's retained membership
+      // (so minimize/close really unmounts it). A main-tab switch instead keeps
+      // the previous tab mounted and only adds the target tab's restored set.
+      if (!options?.retainPrevious) {
+        for (const id of previous) updated.delete(id);
+      }
+      for (const id of next) updated.add(id);
+      if (updated.size === retained.size && [...updated].every((id) => retained.has(id))) return retained;
+      return updated;
     });
+    setOpenSubIdsRaw(next);
   }, [persistOpenSubIds]);
 
   // Panels pinned to the sidebar — synced to server, write-through cache
@@ -2038,7 +2062,10 @@ export function App() {
 
   const closeAllSubSessionWindows = useCallback(() => {
     setMaximizedSubIds(new Set());
-    setOpenSubIds(new Set());
+    // This is a presentation collapse (active-tab click / toolbar arrow), not
+    // termination. Keep the ChatView instances retained so expanding the same
+    // windows is instant and cannot race two fresh timeline bootstraps.
+    setOpenSubIds(new Set(), { retainPrevious: true });
     recomputeFocusedSubId();
     if (isMobileRef.current) return;
     const stack = stackRef.current!;
@@ -2215,6 +2242,9 @@ export function App() {
     name: string | null,
     opts?: { keepSubWindows?: boolean; scrollToBottom?: boolean },
   ) => {
+    // Update this before setOpenSubIds: state setters below run in the same
+    // turn, before the hash-sync effect can publish the new tab-local scope.
+    openSubPersistenceSessionRef.current = name;
     if (name) safeLocalStorageSetItem('rcc_session', name);
     else safeLocalStorageRemoveItem('rcc_session');
     setActiveSessionState(name);
@@ -2225,11 +2255,11 @@ export function App() {
       if (name) {
         try {
           const raw = localStorage.getItem(`rcc_open_subs_${name}`);
-          if (raw) { setOpenSubIds(new Set(JSON.parse(raw) as string[])); }
-          else { setOpenSubIds(new Set()); }
-        } catch { setOpenSubIds(new Set()); }
+          if (raw) { setOpenSubIds(new Set(JSON.parse(raw) as string[]), { retainPrevious: true }); }
+          else { setOpenSubIds(new Set(), { retainPrevious: true }); }
+        } catch { setOpenSubIds(new Set(), { retainPrevious: true }); }
       } else {
-        setOpenSubIds(new Set());
+        setOpenSubIds(new Set(), { retainPrevious: true });
       }
     }
     // scroll chat to bottom on session switch (rAF gives ChatView time to mount)
@@ -3046,7 +3076,15 @@ export function App() {
     return visibleSubSessions.filter((sub) => openSubIds.has(sub.id)
       && (isMobile || !pinnedPanels.some((p) => p.type === 'subsession' && p.props?.sessionName === sub.sessionName)));
   }, [visibleSubSessions, openSubIds, isMobile, pinnedPanels]);
-  const mountedWindowCount = useProgressiveMount(openWindowSubs.length);
+  const visibleOpenWindowIds = useMemo(
+    () => new Set(openWindowSubs.map((sub) => sub.id)),
+    [openWindowSubs],
+  );
+  const retainedWindowSubs = useMemo(() => (
+    subSessions.filter((sub) => retainedOpenSubIds.has(sub.id)
+      && !pinnedPanels.some((p) => p.type === 'subsession' && p.props?.sessionName === sub.sessionName))
+  ), [pinnedPanels, retainedOpenSubIds, subSessions]);
+  const mountedWindowCount = useProgressiveMount(retainedWindowSubs.length);
   const defaultViewMode: ViewMode = isMobile ? 'chat' : 'terminal';
   // Per-session view mode: Record<sessionName, ViewMode>
   const [viewModes, setViewModes] = useState<Record<string, ViewMode>>(() => {
@@ -6433,14 +6471,20 @@ export function App() {
       )}
 
       {/* Sub-session windows (floating) — only show if not pinned */}
-      {openWindowSubs.slice(0, mountedWindowCount).map((sub) => {
+      {retainedWindowSubs.slice(0, mountedWindowCount).map((sub) => {
+        const windowVisible = visibleOpenWindowIds.has(sub.id);
         return (
-          <div key={sub.id} style={{ display: 'contents' }}>
+          <div
+            key={sub.id}
+            data-subsession-retained={sub.id}
+            style={{ display: windowVisible ? 'contents' : 'none' }}
+          >
             <SubSessionWindow
               sub={sub}
               ws={wsRef.current}
               connected={connected}
-              active={isMobile || focusedSubId === sub.id}
+              active={windowVisible && (isMobile || focusedSubId === sub.id)}
+              visible={windowVisible}
               onPendingQuestion={surfaceAskQuestionFromHistory}
               idleFlashToken={idleFlashTokens.get(sub.sessionName) ?? 0}
               onDiff={registerDiffApplyer}
