@@ -10,7 +10,6 @@ import {
   type CapabilitySyncBinding,
   type CapabilityVersion,
 } from '../../shared/capability-management.js';
-import { revokeCapabilityRuntimeTokensForServer } from './capability-runtime-token.js';
 
 const trustByRuntime = new Map<string, ReadonlyMap<string, CapabilityAuthorizationKey>>();
 interface RuntimeAuthority {
@@ -108,7 +107,6 @@ export function setCapabilityAuthorizationKeys(
 export function clearCapabilityAuthorizationKeys(ownerId: string, serverId: string): void {
   trustByRuntime.delete(runtimeKey(ownerId, serverId));
   authorityByRuntime.delete(runtimeKey(ownerId, serverId));
-  revokeCapabilityRuntimeTokensForServer(serverId);
 }
 
 /**
@@ -172,7 +170,6 @@ export function setCapabilityAuthority(
   }
   authorityByRuntime.set(runtime, { revision, records: next });
   clearOtherOwnersForServer(ownerId, serverId);
-  revokeCapabilityRuntimeTokensForServer(serverId, ownerId);
   return true;
 }
 
@@ -202,7 +199,6 @@ export function upsertCapabilityAuthority(
   records.set(authorityRecordKey(record.capabilityId, record.versionId, record.bindingId), structuredClone(record));
   authorityByRuntime.set(runtime, { revision: Math.max(revision, current?.revision ?? 0), records });
   clearOtherOwnersForServer(ownerId, serverId);
-  revokeCapabilityRuntimeTokensForServer(serverId, ownerId);
   return true;
 }
 

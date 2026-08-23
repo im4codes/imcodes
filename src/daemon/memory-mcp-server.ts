@@ -17,7 +17,6 @@ import { EXECUTION_CLONE_CAPABILITY_V1 } from '../../shared/execution-clone.js';
 import { resolveExecutionCloneLimitsForParentRun } from './execution-clone-limits-resolver.js';
 import {
   registerCapabilityMcpTools,
-  type CapabilityMcpRegistrationController,
   type CapabilityRuntimeIdentity,
 } from './capability-mcp-tools.js';
 import { createServerCapabilityService } from '../capability/server-capability-service.js';
@@ -48,8 +47,7 @@ export function createMemoryMcpServer(
     instructions: CAPABILITY_AI_SYSTEM_INSTRUCTIONS,
   });
   registerMemoryMcpTools(server, caller, toolDeps);
-  const capabilityController = registerCapabilityMcpTools(server, caller, toolDeps);
-  if (capabilityController) capabilityControllers.set(server, capabilityController);
+  registerCapabilityMcpTools(server, caller, toolDeps);
   // Exact server-backed stores share this MCP server surface but stay outside
   // the fuzzy-memory contract list and schema firewall.
   registerAliasMcpTools(server, caller);
@@ -57,22 +55,18 @@ export function createMemoryMcpServer(
   return server;
 }
 
-const capabilityControllers = new WeakMap<McpServer, CapabilityMcpRegistrationController>();
-const CAPABILITY_IDENTITY_REFRESH_MS = 1_000;
-
 function capabilityError(message: string): CapabilityErrorResult {
   return { status: 'error', reason: CAPABILITY_ERROR.FORBIDDEN, error: message, retryable: false };
 }
 
 export async function resolveDaemonCapabilityIdentity(caller: McpRuntimeCaller): Promise<CapabilityRuntimeIdentity | null> {
-  if (!caller.sessionName || !caller.providerId || !caller.serverId || !caller.capabilityToken) return null;
+  if (!caller.sessionName || !caller.providerId || !caller.serverId) return null;
   const port = await resolveLiveHookPort();
   if (!port) return null;
   try {
     const response = await postHookSend(port, {
       providerId: caller.providerId,
       serverId: caller.serverId,
-      capabilityToken: caller.capabilityToken,
     }, '/capability-identity', caller.sessionName, 2_000);
     const namespace = response.namespace;
     const validNamespace = Boolean(namespace && typeof namespace === 'object' && !Array.isArray(namespace)
@@ -106,23 +100,6 @@ export async function resolveDaemonCapabilityIdentity(caller: McpRuntimeCaller):
   } catch {
     return null;
   }
-}
-
-/** Start dynamic tools/list gating after the MCP transport is connected. */
-export function startCapabilityIdentityRefresh(server: McpServer): () => void {
-  const controller = capabilityControllers.get(server);
-  if (!controller) return () => {};
-  void controller.refresh();
-  const timer = setInterval(() => { void controller.refresh(); }, CAPABILITY_IDENTITY_REFRESH_MS);
-  timer.unref?.();
-  return () => {
-    clearInterval(timer);
-    controller.stop();
-  };
-}
-
-export async function refreshCapabilityIdentity(server: McpServer): Promise<boolean> {
-  return capabilityControllers.get(server)?.refresh() ?? false;
 }
 
 const DELEGATION_REPLY_HOOK_TIMEOUT_MS = 10_000;
@@ -301,14 +278,7 @@ export async function runMemoryMcpServer(options: MemoryMcpServerOptions = {}): 
   try {
     await loadStore();
     const server = createMemoryMcpServerFromEnv(options);
-    // Resolve the exact runtime identity before the MCP handshake. Several
-    // provider clients cache their first tools/list response and do not honor
-    // tools/list_changed reliably. Connecting while capability tools are still
-    // disabled therefore makes them disappear for the whole provider session,
-    // even when the identity refresh succeeds a moment later.
-    await refreshCapabilityIdentity(server);
     await server.connect(new StdioServerTransport());
-    startCapabilityIdentityRefresh(server);
   } catch (err) {
     if (err instanceof MemoryMcpCallerEnvError) {
       process.stderr.write(`${err.message}\n`);

@@ -39,7 +39,6 @@ import {
 import { getAuthenticatedCapabilityOwner } from '../capability/capability-authorization.js';
 import { isMemoryScope, validateMemoryScopeIdentity } from '../../shared/memory-scope.js';
 import type { ContextNamespace } from '../../shared/context-types.js';
-import { verifyCapabilityRuntimeToken } from '../capability/capability-runtime-token.js';
 
 export { DEFAULT_HOOK_PORT };
 
@@ -579,13 +578,11 @@ export async function startHookServer(onHook: HookCallback): Promise<{ server: h
         const body = JSON.parse(await readBody(req, 4096)) as Record<string, unknown>;
         const providerId = typeof body.providerId === 'string' ? body.providerId.trim() : '';
         const serverId = typeof body.serverId === 'string' ? body.serverId.trim() : '';
-        const capabilityToken = typeof body.capabilityToken === 'string' ? body.capabilityToken.trim() : '';
         const session = senderSessionName ? getSession(senderSessionName) : null;
         const sessionProviderId = session?.providerId ?? session?.agentType;
         const ownerId = serverId ? getAuthenticatedCapabilityOwner(serverId) : undefined;
         const projectDir = session?.projectDir?.trim();
-        if (!session || !providerId || !serverId || !capabilityToken || sessionProviderId !== providerId || !ownerId
-          || !verifyCapabilityRuntimeToken({ ownerId, sessionId: session.name, providerId, serverId, token: capabilityToken })
+        if (!session || !providerId || !serverId || sessionProviderId !== providerId || !ownerId
           || (projectDir && Buffer.byteLength(projectDir, 'utf8') > 4096)) {
           res.writeHead(403, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ ok: false, error: 'capability_identity_unavailable' }));

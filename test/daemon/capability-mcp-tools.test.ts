@@ -8,7 +8,7 @@ import {
   CAPABILITY_MCP_TOOL_CONTRACTS,
   CAPABILITY_MCP_TOOL_NAMES,
 } from '../../shared/capability-management.js';
-import { createMemoryMcpServer, refreshCapabilityIdentity } from '../../src/daemon/memory-mcp-server.js';
+import { createMemoryMcpServer } from '../../src/daemon/memory-mcp-server.js';
 import { parseMcpRuntimeCallerFromEnv, type McpRuntimeCaller } from '../../src/daemon/memory-mcp-caller.js';
 import { getDefaultMcpServers } from '../../src/agent/providers/getDefaultMcpServers.js';
 import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../shared/memory-mcp-server-name.js';
@@ -22,7 +22,6 @@ function caller(overrides: Partial<McpRuntimeCaller> = {}): McpRuntimeCaller {
     projectRoot: '/tmp/project',
     serverId: 'server-1',
     providerId: 'codex-sdk',
-    capabilityToken: 'runtime-token-1',
     transport: 'in_process',
     ...overrides,
   };
@@ -104,7 +103,7 @@ describe('capability MCP tools', () => {
     });
   });
 
-  it('keeps tools discoverable while dynamically authorizing every call', async () => {
+  it('uses registered-node auth for management and runtime identity only for Skill activation', async () => {
     let identity: Awaited<ReturnType<NonNullable<Parameters<typeof createMemoryMcpServer>[1]['resolveCapabilityIdentity']>>> = null;
     const runtimeCaller = caller({
       userId: 'daemon-local',
@@ -121,8 +120,12 @@ describe('capability MCP tools', () => {
       expect((await client.listTools()).tools.map((tool) => tool.name))
         .toEqual(expect.arrayContaining([...CAPABILITY_MCP_TOOL_NAMES]));
       await expect(client.callTool({ name: 'capability_list', arguments: {} })).resolves.toMatchObject({
-        isError: true,
-        structuredContent: { status: 'error', reason: CAPABILITY_ERROR.FORBIDDEN },
+        structuredContent: { status: 'ok', items: [] },
+      });
+      await expect(client.callTool({
+        name: 'capability_status', arguments: { capabilityId: 'skill-1', activate: true },
+      })).resolves.toMatchObject({
+        isError: true, structuredContent: { status: 'error', reason: CAPABILITY_ERROR.FORBIDDEN },
       });
       identity = {
         ownerId: 'owner-1', providerId: 'codex-sdk', serverId: 'server-1',
@@ -130,46 +133,15 @@ describe('capability MCP tools', () => {
         namespace: { scope: 'personal', userId: 'owner-1', projectId: 'authority-project' },
         projectDir: '/authority/project',
       };
-      expect(await refreshCapabilityIdentity(server)).toBe(true);
-      expect((await client.listTools()).tools.map((tool) => tool.name))
-        .toEqual(expect.arrayContaining([...CAPABILITY_MCP_TOOL_NAMES]));
+      await expect(client.callTool({
+        name: 'capability_status', arguments: { capabilityId: 'skill-1', activate: true },
+      })).resolves.toMatchObject({ structuredContent: { status: 'ok' } });
       identity = null;
-      expect(await refreshCapabilityIdentity(server)).toBe(false);
       expect((await client.listTools()).tools.map((tool) => tool.name))
         .toEqual(expect.arrayContaining([...CAPABILITY_MCP_TOOL_NAMES]));
       await expect(client.callTool({ name: 'capability_list', arguments: {} })).resolves.toMatchObject({
-        isError: true,
-        structuredContent: { status: 'error', reason: CAPABILITY_ERROR.FORBIDDEN },
+        structuredContent: { status: 'ok', items: [] },
       });
-    } finally {
-      await client.close();
-      await server.close();
-    }
-  });
-
-  it('enables capability tools before connect so the first tools/list is complete', async () => {
-    const runtimeCaller = caller({
-      userId: 'daemon-local',
-      namespace: { scope: 'personal', projectId: 'authority-project' },
-    });
-    const server = createMemoryMcpServer(runtimeCaller, {
-      capabilityService: service(),
-      resolveCapabilityIdentity: async () => ({
-        ownerId: 'owner-1', providerId: 'codex-sdk', serverId: 'server-1',
-        sessionId: 'deck_project_brain',
-        namespace: { scope: 'personal', userId: 'owner-1', projectId: 'authority-project' },
-        projectDir: '/authority/project',
-      }),
-    });
-
-    // Production performs this preflight before StdioServerTransport.connect.
-    expect(await refreshCapabilityIdentity(server)).toBe(true);
-    const client = new Client({ name: 'initial-capability-list-test', version: '1' });
-    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
-    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
-    try {
-      const firstList = (await client.listTools()).tools.map((tool) => tool.name);
-      expect(firstList).toEqual(expect.arrayContaining([...CAPABILITY_MCP_TOOL_NAMES]));
     } finally {
       await client.close();
       await server.close();
@@ -183,7 +155,6 @@ describe('capability MCP tools', () => {
       projectName: 'fallback',
       serverId: 'server-1',
       providerId: 'codex-sdk',
-      capabilityRuntimeToken: 'runtime-token-fallback',
       cwd: '/authority/project',
       contextNamespace: { scope: 'personal', projectId: 'github.com/acme/project' },
     })[IMCODES_MEMORY_MCP_SERVER_NAME];
@@ -191,7 +162,6 @@ describe('capability MCP tools', () => {
     expect(runtimeCaller).toMatchObject({
       userId: 'daemon-local', sessionName: 'deck_fallback_brain',
       serverId: 'server-1', providerId: 'codex-sdk',
-      capabilityToken: 'runtime-token-fallback',
     });
 
     let identity: Awaited<ReturnType<NonNullable<Parameters<typeof createMemoryMcpServer>[1]['resolveCapabilityIdentity']>>> = null;
@@ -205,8 +175,7 @@ describe('capability MCP tools', () => {
       expect((await client.listTools()).tools.map((tool) => tool.name))
         .toEqual(expect.arrayContaining([...CAPABILITY_MCP_TOOL_NAMES]));
       await expect(client.callTool({ name: 'capability_list', arguments: {} })).resolves.toMatchObject({
-        isError: true,
-        structuredContent: { status: 'error', reason: CAPABILITY_ERROR.FORBIDDEN },
+        structuredContent: { status: 'ok', items: [] },
       });
       identity = {
         ownerId: 'owner-1', providerId: 'codex-sdk', serverId: 'server-1',
@@ -214,9 +183,9 @@ describe('capability MCP tools', () => {
         namespace: { scope: 'personal', userId: 'owner-1', projectId: 'github.com/acme/project' },
         projectDir: '/authority/project',
       };
-      expect(await refreshCapabilityIdentity(server)).toBe(true);
-      expect((await client.listTools()).tools.map((tool) => tool.name))
-        .toEqual(expect.arrayContaining([...CAPABILITY_MCP_TOOL_NAMES]));
+      await expect(client.callTool({
+        name: 'capability_status', arguments: { capabilityId: 'skill-1', activate: true },
+      })).resolves.toMatchObject({ structuredContent: { status: 'ok' } });
     } finally {
       await client.close();
       await server.close();

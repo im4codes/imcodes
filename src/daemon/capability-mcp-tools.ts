@@ -1,4 +1,4 @@
-import { McpServer, type RegisteredTool } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
 import {
@@ -43,11 +43,6 @@ export interface CapabilityRuntimeIdentity {
   sessionId: string;
   namespace: ContextNamespace;
   projectDir?: string;
-}
-
-export interface CapabilityMcpRegistrationController {
-  refresh(): Promise<boolean>;
-  stop(): void;
 }
 
 const kind = z.enum(CAPABILITY_KIND);
@@ -116,7 +111,10 @@ export function isAuthenticatedCapabilityOwner(caller: McpRuntimeCaller): boolea
 export function canRegisterCapabilityMcpTools(caller: McpRuntimeCaller, deps: CapabilityMcpToolDeps): boolean {
   if (!deps.capabilityService || (deps.nodeRole ?? NODE_ROLE.FULL) !== NODE_ROLE.FULL) return false;
   if (deps.resolveCapabilityIdentity) {
-    return Boolean(caller.sessionName && caller.providerId && caller.serverId && caller.capabilityToken);
+    // The server-backed service authenticates every inventory/install/manage
+    // request with the daemon's registered node credential. Runtime identity
+    // is needed only for resolving session/provider-bound Skill instructions.
+    return Boolean(caller.serverId);
   }
   return (deps.isCapabilityOwner ?? isAuthenticatedCapabilityOwner)(caller);
 }
@@ -149,28 +147,22 @@ export function registerCapabilityMcpTools(
   server: McpServer,
   caller: McpRuntimeCaller,
   deps: CapabilityMcpToolDeps,
-): CapabilityMcpRegistrationController | undefined {
-  if (!canRegisterCapabilityMcpTools(caller, deps)) return undefined;
+): void {
+  if (!canRegisterCapabilityMcpTools(caller, deps)) return;
   const service = deps.capabilityService!;
-  const registered: RegisteredTool[] = [];
-  // Tool discovery must not depend on whether the authenticated ServerLink
-  // authority happened to arrive before the provider's first tools/list.
-  // Several provider clients cache that first list and ignore list_changed.
-  // Keep definitions visible for an exact daemon-minted runtime; every call
-  // still re-resolves and validates owner/session/provider/server authority.
-  let authorized = !deps.resolveCapabilityIdentity;
-  let stopped = false;
   for (const name of CAPABILITY_MCP_TOOL_NAMES) {
     const contract = CAPABILITY_MCP_TOOL_CONTRACTS[name];
     const tool = server.registerTool(name, {
       description: contract.description,
       inputSchema: CAPABILITY_MCP_INPUT_SCHEMAS[name],
     }, async (raw: unknown) => {
-      const identity = deps.resolveCapabilityIdentity
+      const requiresRuntimeIdentity = name === CAPABILITY_MCP_TOOL.STATUS
+        && Boolean((raw as CapabilityStatusRequest | undefined)?.activate);
+      const identity = requiresRuntimeIdentity && deps.resolveCapabilityIdentity
         ? await deps.resolveCapabilityIdentity(caller).catch(() => null)
         : null;
       if (deps.resolveCapabilityIdentity
-        ? !exactRuntimeIdentity(caller, identity)
+        ? requiresRuntimeIdentity && !exactRuntimeIdentity(caller, identity)
         : !(deps.isCapabilityOwner ?? isAuthenticatedCapabilityOwner)(caller)) {
         return toolResult(error(CAPABILITY_ERROR.FORBIDDEN, 'capability management requires an authenticated owner session'));
       }
@@ -198,20 +190,5 @@ export function registerCapabilityMcpTools(
         return toolResult(error(CAPABILITY_ERROR.INTERNAL_ERROR, 'capability service failed safely', true));
       }
     });
-    registered.push(tool);
   }
-  return {
-    async refresh(): Promise<boolean> {
-      if (stopped || !deps.resolveCapabilityIdentity) return authorized;
-      const identity = await deps.resolveCapabilityIdentity(caller).catch(() => null);
-      const next = exactRuntimeIdentity(caller, identity);
-      authorized = next;
-      return authorized;
-    },
-    stop(): void {
-      stopped = true;
-      authorized = false;
-      for (const tool of registered) tool.disable();
-    },
-  };
 }

@@ -27,7 +27,6 @@ vi.mock('../../src/util/logger.js', () => ({
 }));
 
 import { startHookServer } from '../../src/daemon/hook-server.js';
-import { CAPABILITY_RUNTIME_TOKEN_TESTING, mintCapabilityRuntimeToken } from '../../src/capability/capability-runtime-token.js';
 import { clearCapabilityAuthorizationKeys, setCapabilityAuthority } from '../../src/capability/capability-authorization.js';
 
 function postNotify(port: number, body: Record<string, unknown>): Promise<{ status: number; body: string }> {
@@ -78,78 +77,40 @@ describe('Hook server — session validation', () => {
 
   afterEach(() => {
     server.close();
-    CAPABILITY_RUNTIME_TOKEN_TESTING.clear();
     clearCapabilityAuthorizationKeys('owner-1', 'server-1');
     clearCapabilityAuthorizationKeys('owner-2', 'server-1');
   });
 
-  it('binds capability identity to one daemon-minted provider generation token', async () => {
+  it('resolves capability context from the registered node and exact stored session', async () => {
     expect(setCapabilityAuthority('owner-1', 'server-1', 1, [], [])).toBe(true);
     getSessionMock.mockImplementation((name: string) => ({
       name, providerId: 'codex-sdk', agentType: 'codex-sdk', projectDir: '',
       contextNamespace: { scope: 'personal' },
     }));
-    const current = mintCapabilityRuntimeToken({ ownerId: 'owner-1', sessionId: 'deck_current_brain', providerId: 'codex-sdk', serverId: 'server-1' });
     await expect(postCapabilityIdentity(port, 'deck_current_brain', {
-      providerId: 'codex-sdk', serverId: 'server-1', capabilityToken: current,
+      providerId: 'codex-sdk', serverId: 'server-1',
     })).resolves.toMatchObject({ status: 200 });
-    await expect(postCapabilityIdentity(port, 'deck_other_brain', {
-      providerId: 'codex-sdk', serverId: 'server-1', capabilityToken: current,
-    })).resolves.toMatchObject({ status: 403 });
-
-    const replacement = mintCapabilityRuntimeToken({ ownerId: 'owner-1', sessionId: 'deck_current_brain', providerId: 'codex-sdk', serverId: 'server-1' });
     await expect(postCapabilityIdentity(port, 'deck_current_brain', {
-      providerId: 'codex-sdk', serverId: 'server-1', capabilityToken: current,
-    })).resolves.toMatchObject({ status: 403 });
-    await expect(postCapabilityIdentity(port, 'deck_current_brain', {
-      providerId: 'codex-sdk', serverId: 'server-1', capabilityToken: replacement,
-    })).resolves.toMatchObject({ status: 200 });
-  });
-
-  it('binds a restored-session token after owner authority arrives', async () => {
-    getSessionMock.mockImplementation((name: string) => ({
-      name, providerId: 'codex-sdk', agentType: 'codex-sdk', projectDir: '',
-      contextNamespace: { scope: 'personal' },
-    }));
-    const restoredToken = mintCapabilityRuntimeToken({
-      sessionId: 'deck_restored_brain', providerId: 'codex-sdk', serverId: 'server-1',
-    });
-
-    expect(setCapabilityAuthority('owner-1', 'server-1', 1, [], [])).toBe(true);
-    await expect(postCapabilityIdentity(port, 'deck_restored_brain', {
-      providerId: 'codex-sdk', serverId: 'server-1', capabilityToken: restoredToken,
-    })).resolves.toMatchObject({ status: 200 });
-
-    expect(setCapabilityAuthority('owner-2', 'server-1', 2, [], [])).toBe(true);
-    await expect(postCapabilityIdentity(port, 'deck_restored_brain', {
-      providerId: 'codex-sdk', serverId: 'server-1', capabilityToken: restoredToken,
+      providerId: 'pi', serverId: 'server-1',
     })).resolves.toMatchObject({ status: 403 });
   });
 
-  it('revokes the old provider token when the authenticated owner changes on one server link', async () => {
-    expect(setCapabilityAuthority('owner-1', 'server-1', 1, [], [])).toBe(true);
+  it('uses the current registered-node owner after authority changes', async () => {
     getSessionMock.mockImplementation((name: string) => ({
       name, providerId: 'codex-sdk', agentType: 'codex-sdk', projectDir: '',
       contextNamespace: { scope: 'personal' },
     }));
-    const ownerAToken = mintCapabilityRuntimeToken({
-      ownerId: 'owner-1', sessionId: 'deck_owner_swap_brain', providerId: 'codex-sdk', serverId: 'server-1',
-    });
-    await expect(postCapabilityIdentity(port, 'deck_owner_swap_brain', {
-      providerId: 'codex-sdk', serverId: 'server-1', capabilityToken: ownerAToken,
+    expect(setCapabilityAuthority('owner-1', 'server-1', 1, [], [])).toBe(true);
+    await expect(postCapabilityIdentity(port, 'deck_restored_brain', {
+      providerId: 'codex-sdk', serverId: 'server-1',
     })).resolves.toMatchObject({ status: 200 });
 
     expect(setCapabilityAuthority('owner-2', 'server-1', 2, [], [])).toBe(true);
-    await expect(postCapabilityIdentity(port, 'deck_owner_swap_brain', {
-      providerId: 'codex-sdk', serverId: 'server-1', capabilityToken: ownerAToken,
-    })).resolves.toMatchObject({ status: 403 });
-
-    const ownerBToken = mintCapabilityRuntimeToken({
-      ownerId: 'owner-2', sessionId: 'deck_owner_swap_brain', providerId: 'codex-sdk', serverId: 'server-1',
+    const response = await postCapabilityIdentity(port, 'deck_restored_brain', {
+      providerId: 'codex-sdk', serverId: 'server-1',
     });
-    await expect(postCapabilityIdentity(port, 'deck_owner_swap_brain', {
-      providerId: 'codex-sdk', serverId: 'server-1', capabilityToken: ownerBToken,
-    })).resolves.toMatchObject({ status: 200 });
+    expect(response.status).toBe(200);
+    expect(JSON.parse(response.body)).toMatchObject({ ownerId: 'owner-2' });
   });
 
   it('rejects hook when session does not exist in store', async () => {
