@@ -371,11 +371,11 @@ export function compileAgentContextArtifact(input: TransportRuntimeAssemblyInput
       )
     : undefined;
   const sessionSystemText = [
+    capabilityGuidance,
     input.description?.trim(),
     input.systemPrompt?.trim(),
     identityPart,
     filePathReportingGuidance,
-    capabilityGuidance,
     memorySearchGuidance,
     agentProgressGuidance,
   ].filter(Boolean).join('\n\n') || undefined;

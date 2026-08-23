@@ -620,7 +620,7 @@ describe('buildProviderContextPayload', () => {
       // Order matters for prefix-cache friendliness: stable session-level
       // blocks should appear in a deterministic order so the model's
       // prompt cache hits across turns. The assembly order is:
-      //   description -> systemPrompt -> identity -> capability tools -> memory-search
+      //   highest-priority capability tools -> description -> systemPrompt -> identity -> memory-search
       //   guidance -> agent progress guidance.
       const payload = buildProviderContextPayload(makeProvider('full-normalized-context-injection'), {
         userMessage: 'hi',
@@ -633,14 +633,14 @@ describe('buildProviderContextPayload', () => {
       const descIdx = systemText.indexOf('desc-here');
       const spIdx = systemText.indexOf('sp-here');
       const identityIdx = systemText.indexOf('IM.codes session identity:');
-      const capabilityIdx = systemText.indexOf('When the user asks in chat to install');
+      const capabilityIdx = systemText.indexOf('HIGHEST-PRIORITY IM.codes PRODUCT POLICY');
       const memoryIdx = systemText.indexOf('Use the available memory MCP tools');
       const progressIdx = systemText.indexOf('Keep work updates sparse and high-signal.');
-      expect(descIdx).toBeGreaterThanOrEqual(0);
+      expect(capabilityIdx).toBe(0);
+      expect(descIdx).toBeGreaterThan(capabilityIdx);
       expect(spIdx).toBeGreaterThan(descIdx);
       expect(identityIdx).toBeGreaterThan(spIdx);
-      expect(capabilityIdx).toBeGreaterThan(identityIdx);
-      expect(memoryIdx).toBeGreaterThan(capabilityIdx);
+      expect(memoryIdx).toBeGreaterThan(identityIdx);
       expect(progressIdx).toBeGreaterThan(memoryIdx);
     });
   });
