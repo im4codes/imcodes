@@ -28,9 +28,15 @@ import type {
   ProviderModelList,
   ProviderStatusUpdate,
   ProviderUsageUpdate,
+  ProviderDelegationNotification,
   SessionConfig,
   SessionInfoUpdate,
 } from '../transport-provider.js';
+import {
+  AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES,
+  AGENT_DELEGATION_NOTIFICATION_RESULTS,
+  type AgentDelegationNotificationResult,
+} from '../../../shared/agent-delegation.js';
 import {
   CONNECTION_MODES,
   SESSION_OWNERSHIP,
@@ -153,6 +159,7 @@ export class DeepseekHarnessProvider implements TransportProvider {
     // The harness composes its own persona and tool prompts, so IM.codes
     // context rides in the message body rather than a system slot.
     contextSupport: 'degraded-message-side-context-mapping',
+    activeDelegationNotification: AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE,
   };
 
   private config: ProviderConfig | null = null;
@@ -327,6 +334,22 @@ export class DeepseekHarnessProvider implements TransportProvider {
     // is a silent no-op on a closed stdin, and committing here would leave a
     // retried turn permanently stripped of its session instructions.
     state.pendingSessionSystemText = includeSessionSystemText ? sessionSystemText : undefined;
+  }
+
+  async notifyActiveDelegation(
+    sessionId: string,
+    notification: ProviderDelegationNotification,
+  ): Promise<AgentDelegationNotificationResult> {
+    const state = this.sessions.get(sessionId);
+    if (!state?.turnActive || state.cancelled || !state.child) {
+      return AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE;
+    }
+    // Both delegation replies and explicit queue appends are next-boundary
+    // steering messages in dsh. `followup()` would defer them until idle and
+    // defeat the product's Append/now contract; `steer()` keeps the current
+    // tool batch alive and inserts the text before the next model step.
+    this.write(state, { type: DSH_BRIDGE_COMMAND.STEER, text: notification.text });
+    return AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED;
   }
 
   async cancel(sessionId: string): Promise<void> {

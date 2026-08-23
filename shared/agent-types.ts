@@ -15,6 +15,7 @@ export const SESSION_AGENT_TYPES = [
   'openclaw',
   'kimi-sdk',
   'deepseek-harness',
+  'pi',
   'shell',
   'script',
 ] as const;
@@ -34,6 +35,7 @@ export const TRANSPORT_SESSION_AGENT_TYPES = [
   'grok-sdk',
   'kimi-sdk',
   'deepseek-harness',
+  'pi',
   'qwen',
   'openclaw',
 ] as const;

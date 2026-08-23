@@ -2,12 +2,14 @@ import { useEffect, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import {
   DOWNLOAD_TRANSFER_STATUS,
+  canSaveDownloadTransfer,
   canRetryDownloadTransfer,
   cancelDownloadTransfer,
   clearFinishedDownloadTransfers,
   dismissDownloadTransfer,
   getDownloadTransfers,
   retryDownloadTransfer,
+  saveDownloadTransfer,
   subscribeDownloadTransfers,
   type DownloadTransferItem,
 } from '../download-transfer-store.js';
@@ -34,6 +36,10 @@ function terminal(item: DownloadTransferItem): boolean {
     || item.status === DOWNLOAD_TRANSFER_STATUS.FAILED;
 }
 
+function inactive(item: DownloadTransferItem): boolean {
+  return item.status === DOWNLOAD_TRANSFER_STATUS.READY_TO_SAVE || terminal(item);
+}
+
 export function DownloadTransferCenter() {
   const { t } = useTranslation();
   const [items, setItems] = useState(getDownloadTransfers);
@@ -47,7 +53,7 @@ export function DownloadTransferCenter() {
   }, []);
   if (items.length === 0) return null;
 
-  const running = items.filter((item) => !terminal(item)).length;
+  const running = items.filter((item) => !inactive(item)).length;
   const hasFinished = items.some(terminal);
   return (
     <section class="download-transfer-center" aria-label={t('downloads.title')}>
@@ -73,7 +79,7 @@ export function DownloadTransferCenter() {
       {!collapsed && (
         <div class="download-transfer-list" aria-live="polite">
           {items.map((item) => {
-            const isTerminal = terminal(item);
+            const isInactive = inactive(item);
             const knownTotal = item.totalBytes !== null && item.totalBytes > 0;
             const percent = knownTotal ? Math.min(100, Math.round((item.loadedBytes / item.totalBytes!) * 100)) : null;
             const displayName = splitDownloadName(item.name);
@@ -92,7 +98,7 @@ export function DownloadTransferCenter() {
                   <span>{t(`downloads.status.${item.status}`)}</span>
                   {percent !== null && <span>{percent}%</span>}
                 </div>
-                {!isTerminal && (
+                {!isInactive && (
                   <div
                     class={`download-transfer-progress${knownTotal ? '' : ' indeterminate'}`}
                     role="progressbar"
@@ -114,15 +120,18 @@ export function DownloadTransferCenter() {
                         total: formatTransferBytes(item.totalBytes),
                       })}
                   </span>
-                  {!isTerminal && (
+                  {!isInactive && (
                     item.speedBps > 0
                       ? <span>{t('downloads.speed', { speed: formatTransferBytes(item.speedBps) })}</span>
                       : null
                   )}
                 </div>
                 <div class="download-transfer-actions">
-                  {isTerminal ? (
+                  {isInactive ? (
                     <>
+                      {canSaveDownloadTransfer(item.id) && (
+                        <button type="button" onClick={() => void saveDownloadTransfer(item.id)}>{t('downloads.save_share')}</button>
+                      )}
                       {canRetryDownloadTransfer(item.id) && (
                         <button type="button" onClick={() => void retryDownloadTransfer(item.id)}>{t('downloads.retry')}</button>
                       )}

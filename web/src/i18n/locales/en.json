@@ -664,7 +664,8 @@
       "gemini_sdk": "Gemini SDK",
       "grok_sdk": "Grok Build",
       "kimi_sdk": "Kimi Code",
-      "deepseek_harness": "DeepSeek Harness"
+      "deepseek_harness": "DeepSeek Harness",
+      "pi": "Pi"
     },
     "agentGroup": {
       "transport_sdk": "SDK",
@@ -1594,6 +1595,7 @@
     "clear_finished": "Clear finished",
     "cancel": "Cancel",
     "retry": "Retry",
+    "save_share": "Save / Share",
     "dismiss": "Dismiss",
     "progress_aria": "Download progress for {{name}}",
     "transferred": "{{transferred}} / {{total}}",
@@ -1605,6 +1607,7 @@
       "transferring": "Downloading",
       "falling_back": "Switching to HTTP",
       "handed_off": "Handed to browser",
+      "ready_to_save": "Ready to save",
       "completed": "Completed",
       "canceled": "Canceled",
       "failed": "Failed"
@@ -2498,6 +2501,7 @@
       "mcpProviderOpenCodeSdk": "OpenCode SDK",
       "mcpProviderQwen": "Qwen",
       "mcpProviderDeepseekHarness": "DeepSeek Harness",
+      "mcpProviderPi": "Pi",
       "mcpProviderUnknown": "{{provider}}",
       "mcpDisabledFlag": "Disabled flag: {{flag}}",
       "mcpDisabledFlagNone": "No disabled flag reported",

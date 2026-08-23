@@ -43,6 +43,7 @@ import {
   completeDownloadTransfer,
   failDownloadTransfer,
   reportDownloadTransferProgress,
+  setDownloadTransferSave,
   setDownloadTransferRetry,
   updateDownloadTransfer,
 } from '../download-transfer-store.js';
@@ -1744,6 +1745,8 @@ export function FileBrowser({
     const transfer = beginDownloadTransfer(selectedPath.split(/[/\\]/).pop() || selectedPath);
     let authorizedHandle = selectedHandle;
     const runTransfer = async (signal: AbortSignal, requireCurrentSelection: boolean): Promise<void> => {
+      let handedOffToBrowser = false;
+      let savePending = false;
       const download = async (handle: string) => downloadPreviewWithDirectFallback({
         ws,
         serverId,
@@ -1755,6 +1758,10 @@ export function FileBrowser({
         // retry classification and calls this at most once when it is eligible.
         httpFallback: () => downloadAttachment(serverId, handle, sessionName, signal),
         signal,
+        onSaveReady: (save) => {
+          savePending = true;
+          setDownloadTransferSave(transfer.id, save);
+        },
         onProgress: ({ loadedBytes, totalBytes }) => {
           reportDownloadTransferProgress(transfer.id, loadedBytes, totalBytes);
         },
@@ -1768,13 +1775,14 @@ export function FileBrowser({
           } else if (mode === FILE_DOWNLOAD_TRANSPORT_MODE.HTTP) {
             updateDownloadTransfer(transfer.id, DOWNLOAD_TRANSFER_ROUTE.HTTP, DOWNLOAD_TRANSFER_STATUS.TRANSFERRING);
           } else {
+            handedOffToBrowser = true;
             updateDownloadTransfer(transfer.id, DOWNLOAD_TRANSFER_ROUTE.BROWSER, DOWNLOAD_TRANSFER_STATUS.PREPARING);
           }
         },
       });
       try {
         await download(authorizedHandle);
-        completeDownloadTransfer(transfer.id, destination === null);
+        if (!savePending) completeDownloadTransfer(transfer.id, handedOffToBrowser);
         return;
       } catch (error) {
         let failure = error;
@@ -1816,7 +1824,7 @@ export function FileBrowser({
               });
             }
             await download(freshId);
-            completeDownloadTransfer(transfer.id, destination === null);
+            completeDownloadTransfer(transfer.id, handedOffToBrowser);
             return;
           } catch (refreshError) {
             if (refreshed) failure = refreshError;

@@ -17,6 +17,7 @@ import type { ProviderQuotaMeta } from '../../shared/provider-quota.js';
 import type { TransportAttachment } from '../../shared/transport-attachments.js';
 import type { MemoryMcpProviderStatusView } from '../../shared/memory-ws.js';
 import type { DshLlmConfig } from '../../shared/deepseek-harness.js';
+import type { PiLlmConfig } from '../../shared/pi-agent.js';
 import type {
   AgentDelegationActiveNotificationMode,
   AgentDelegationNotificationResult,
@@ -311,6 +312,8 @@ export interface SessionConfig {
    * overlay and credential data is supplied only to the child environment.
    */
   llm?: DshLlmConfig;
+  /** Pi coding-agent custom provider route, supplied only to the child process. */
+  piLlm?: PiLlmConfig;
   /** Parent session key for sub-sessions. */
   parentSessionKey?: string;
   /** If binding to an already-existing remote session, use this key directly. */

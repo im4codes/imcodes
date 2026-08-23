@@ -664,7 +664,8 @@
       "gemini_sdk": "Gemini SDK",
       "grok_sdk": "Grok Build",
       "kimi_sdk": "Kimi Code",
-      "deepseek_harness": "DeepSeek Harness"
+      "deepseek_harness": "DeepSeek Harness",
+      "pi": "Pi"
     },
     "agentGroup": {
       "transport_sdk": "SDK",
@@ -1593,6 +1594,7 @@
     "clear_finished": "完了項目を消去",
     "cancel": "キャンセル",
     "retry": "再試行",
+    "save_share": "保存・共有",
     "dismiss": "削除",
     "progress_aria": "{{name}} のダウンロード進捗",
     "transferred": "{{transferred}} / {{total}}",
@@ -1604,6 +1606,7 @@
       "transferring": "ダウンロード中",
       "falling_back": "HTTP に切り替え中",
       "handed_off": "ブラウザーに引き渡し済み",
+      "ready_to_save": "保存できます",
       "completed": "完了",
       "canceled": "キャンセル済み",
       "failed": "失敗"
@@ -2497,6 +2500,7 @@
       "mcpProviderOpenCodeSdk": "OpenCode SDK",
       "mcpProviderQwen": "Qwen",
       "mcpProviderDeepseekHarness": "DeepSeek Harness",
+      "mcpProviderPi": "Pi",
       "mcpProviderUnknown": "{{provider}}",
       "mcpDisabledFlag": "無効化フラグ: {{flag}}",
       "mcpDisabledFlagNone": "無効化フラグは未報告",

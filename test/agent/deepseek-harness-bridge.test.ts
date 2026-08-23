@@ -18,7 +18,7 @@ import {
   DSH_SESSION_EVENT,
   type DshBridgeEvent,
 } from '../../shared/deepseek-harness.js';
-import { apply, inject, name } from '../../src/agent/providers/deepseek-harness/bridge.js';
+import { apply, dispatchDshBridgeCommand, inject, name } from '../../src/agent/providers/deepseek-harness/bridge.js';
 
 type SessionEventListener = (session: { id: string }, event: { type: string; data?: Record<string, unknown> }) => void;
 
@@ -27,14 +27,17 @@ const OTHER_SESSION = { id: 'session-other' };
 
 function makeAgent() {
   const followups: unknown[] = [];
+  const steers: unknown[] = [];
   let cancelled = 0;
   return {
     followups,
+    steers,
     cancelCount: () => cancelled,
     agent: {
       session: OWN_SESSION,
       whenIdle: vi.fn().mockResolvedValue(undefined),
       followup: (message: unknown) => { followups.push(message); },
+      steer: (message: unknown) => { steers.push(message); },
       cancel: () => { cancelled += 1; },
     },
   };
@@ -324,6 +327,25 @@ describe('deepseek-harness bridge', () => {
 describe('deepseek-harness bridge command handling', () => {
   it('models the command vocabulary the daemon writes', () => {
     // The daemon writes these verbatim; a rename on either side breaks the child.
-    expect(Object.values(DSH_BRIDGE_COMMAND)).toEqual(['prompt', 'cancel', 'shutdown']);
+    expect(Object.values(DSH_BRIDGE_COMMAND)).toEqual(['prompt', 'steer', 'cancel', 'shutdown']);
+  });
+
+  it('dispatches active-turn append through steer without followup, cancel, or shutdown', () => {
+    const harness = makeAgent();
+    const requestExit = vi.fn();
+
+    dispatchDshBridgeCommand(harness.agent, {
+      type: DSH_BRIDGE_COMMAND.STEER,
+      text: 'append at the next model boundary',
+    }, requestExit);
+
+    expect(harness.steers).toHaveLength(1);
+    expect(harness.steers[0]).toMatchObject({
+      role: 'user',
+      content: [{ type: 'text', text: 'append at the next model boundary' }],
+    });
+    expect(harness.followups).toEqual([]);
+    expect(harness.cancelCount()).toBe(0);
+    expect(requestExit).not.toHaveBeenCalled();
   });
 });

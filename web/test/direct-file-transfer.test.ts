@@ -20,7 +20,13 @@ const apiMocks = vi.hoisted(() => ({
   streamAttachmentDownloadToWritable: vi.fn(),
 }));
 
+const browserDownloadMocks = vi.hoisted(() => ({
+  saveBlobViaDownloadAnchor: vi.fn(),
+  shareBlobOrDownload: vi.fn().mockResolvedValue('shared'),
+}));
+
 vi.mock('../src/api.js', () => apiMocks);
+vi.mock('../src/browser-download.js', () => browserDownloadMocks);
 
 class FakeDataChannel extends EventTarget {
   constructor(readonly label = '') { super(); }
@@ -433,6 +439,50 @@ describe('direct file transfer v2 browser broker', () => {
     expect(apiMocks.uploadFile).toHaveBeenCalledTimes(1);
   });
 
+  it('forces one HTTP fallback when direct upload has not connected within 20 seconds', async () => {
+    vi.useFakeTimers();
+    const { uploadFileWithDirectFallback } = await import('../src/direct-file-transfer.js');
+    const { ws, sent } = createWs(directCapabilities, 'hold');
+    const modes: string[] = [];
+    const upload = uploadFileWithDirectFallback({
+      ws,
+      serverId: 'server-1',
+      file: new File(['relay'], 'relay.txt', { type: 'text/plain' }),
+      onMode: (mode) => modes.push(mode),
+    });
+
+    await vi.advanceTimersByTimeAsync(DIRECT_FILE_TRANSFER_LIMITS.UPLOAD_DIRECT_CONNECT_FALLBACK_MS - 1);
+    expect(apiMocks.uploadFile).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+
+    await expect(upload).resolves.toMatchObject({ attachment: { id: 'relay-attachment' } });
+    const directAttempts = sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.OPERATION_INIT);
+    expect(directAttempts.length).toBeGreaterThan(0);
+    expect(directAttempts.length).toBeLessThanOrEqual(DIRECT_FILE_TRANSFER_LIMITS.MAX_ATTEMPTS);
+    expect(apiMocks.uploadFile).toHaveBeenCalledTimes(1);
+    expect(modes).toEqual(['connecting', 'falling_back', 'relay']);
+  });
+
+  it('cancels immediately while authority-free lease setup is still pending', async () => {
+    vi.useFakeTimers();
+    const { uploadFileWithDirectFallback } = await import('../src/direct-file-transfer.js');
+    const { ws } = createWs(directCapabilities, 'success', {
+      readyDelayMs: DIRECT_FILE_TRANSFER_LIMITS.NEGOTIATION_TIMEOUT_MS - 1,
+    });
+    const controller = new AbortController();
+    const upload = uploadFileWithDirectFallback({
+      ws,
+      serverId: 'server-1',
+      file: new File(['cancel'], 'cancel.txt', { type: 'text/plain' }),
+      signal: controller.signal,
+    });
+
+    await vi.advanceTimersByTimeAsync(0);
+    controller.abort();
+    await expect(upload).rejects.toMatchObject({ code: DIRECT_FILE_TRANSFER_ERROR.CANCELED });
+    expect(apiMocks.uploadFile).not.toHaveBeenCalled();
+  });
+
   it('creates an authority-free data channel before the cold lease offer', async () => {
     const { uploadFileDirect } = await import('../src/direct-file-transfer.js');
     const { ws } = createWs(directCapabilities);
@@ -826,6 +876,102 @@ describe('direct file transfer v2 browser broker', () => {
     expect(onMode).toHaveBeenCalledWith(FILE_DOWNLOAD_TRANSPORT_MODE.BROWSER);
     expect(onProgress).not.toHaveBeenCalled();
     expect(sent).toHaveLength(0);
+  });
+
+  it('downloads through P2P inside the native WebView before opening save or share', async () => {
+    vi.stubGlobal('Capacitor', { isNativePlatform: () => true });
+    const { downloadPreviewWithDirectFallback, FILE_DOWNLOAD_TRANSPORT_MODE } = await import('../src/direct-file-transfer.js');
+    const { ws, sent } = createWs(directCapabilities);
+    const onProgress = vi.fn();
+    const onMode = vi.fn();
+    const httpFallback = vi.fn();
+
+    await downloadPreviewWithDirectFallback({
+      ws,
+      serverId: 'server-1',
+      previewHandle: 'preview-handle-1',
+      suggestedName: 'mobile-report.pdf',
+      destination: null,
+      httpFallback,
+      onProgress,
+      onMode,
+    });
+
+    expect(onMode.mock.calls.map(([mode]) => mode)).toEqual([
+      FILE_DOWNLOAD_TRANSPORT_MODE.CONNECTING,
+      FILE_DOWNLOAD_TRANSPORT_MODE.DIRECT,
+    ]);
+    expect(onProgress).toHaveBeenCalledWith({ loadedBytes: 0, totalBytes: 3 });
+    expect(onProgress).toHaveBeenLastCalledWith({ loadedBytes: 3, totalBytes: 3 });
+    expect(browserDownloadMocks.shareBlobOrDownload).toHaveBeenCalledOnce();
+    const [blob, fileName] = browserDownloadMocks.shareBlobOrDownload.mock.calls[0]!;
+    expect(blob).toBeInstanceOf(Blob);
+    expect(blob.size).toBe(3);
+    expect(fileName).toBe('mobile-report.pdf');
+    expect(apiMocks.streamAttachmentDownloadToWritable).not.toHaveBeenCalled();
+    expect(apiMocks.downloadAttachment).not.toHaveBeenCalled();
+    expect(httpFallback).not.toHaveBeenCalled();
+    expect(sent).toContainEqual(expect.objectContaining({ type: DIRECT_FILE_TRANSFER_MSG.OPERATION_INIT }));
+    expect(FakePeerConnection.instances).toHaveLength(1);
+  });
+
+  it('falls back from mobile P2P to HTTP before opening save or share', async () => {
+    vi.stubGlobal('Capacitor', { isNativePlatform: () => true });
+    apiMocks.streamAttachmentDownloadToWritable.mockImplementationOnce(async (...args: unknown[]) => {
+      const writable = args[2] as { write(data: BufferSource): Promise<void> };
+      const progress = args[5] as ((value: { loadedBytes: number; totalBytes: number | null }) => void) | undefined;
+      progress?.({ loadedBytes: 0, totalBytes: 4 });
+      await writable.write(new Uint8Array([4, 5, 6, 7]));
+      progress?.({ loadedBytes: 4, totalBytes: 4 });
+    });
+    const { downloadPreviewWithDirectFallback, FILE_DOWNLOAD_TRANSPORT_MODE } = await import('../src/direct-file-transfer.js');
+    const { ws } = createWs(directCapabilities, 'operation_failure');
+    const onMode = vi.fn();
+
+    await downloadPreviewWithDirectFallback({
+      ws,
+      serverId: 'server-1',
+      previewHandle: 'preview-handle-1',
+      suggestedName: 'mobile-fallback.pdf',
+      destination: null,
+      onMode,
+    });
+
+    expect(onMode.mock.calls.map(([mode]) => mode)).toEqual([
+      FILE_DOWNLOAD_TRANSPORT_MODE.CONNECTING,
+      FILE_DOWNLOAD_TRANSPORT_MODE.FALLING_BACK,
+      FILE_DOWNLOAD_TRANSPORT_MODE.HTTP,
+    ]);
+    expect(apiMocks.streamAttachmentDownloadToWritable).toHaveBeenCalledOnce();
+    expect(browserDownloadMocks.shareBlobOrDownload).toHaveBeenCalledOnce();
+    const [blob, fileName] = browserDownloadMocks.shareBlobOrDownload.mock.calls[0]!;
+    expect(blob).toBeInstanceOf(Blob);
+    expect(blob.size).toBe(4);
+    expect(fileName).toBe('mobile-fallback.pdf');
+  });
+
+  it('keeps completed native P2P bytes for a fresh save tap when automatic sharing loses activation', async () => {
+    vi.stubGlobal('Capacitor', { isNativePlatform: () => true });
+    browserDownloadMocks.shareBlobOrDownload
+      .mockRejectedValueOnce(new DOMException('gesture expired', 'NotAllowedError'))
+      .mockResolvedValueOnce('shared');
+    const { downloadPreviewWithDirectFallback } = await import('../src/direct-file-transfer.js');
+    const { ws } = createWs(directCapabilities);
+    let save: (() => Promise<void>) | undefined;
+
+    await expect(downloadPreviewWithDirectFallback({
+      ws,
+      serverId: 'server-1',
+      previewHandle: 'preview-handle-1',
+      suggestedName: 'mobile-report.pdf',
+      destination: null,
+      onSaveReady: (action) => { save = action; },
+    })).resolves.toBeUndefined();
+
+    expect(save).toBeTypeOf('function');
+    await expect(save!()).resolves.toBeUndefined();
+    expect(browserDownloadMocks.shareBlobOrDownload).toHaveBeenCalledTimes(2);
+    expect(browserDownloadMocks.shareBlobOrDownload.mock.calls[1]?.[1]).toBe('mobile-report.pdf');
   });
 
   it('classifies daemon preview-handle expiry as the File Browser one-refresh condition', async () => {

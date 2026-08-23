@@ -115,6 +115,7 @@ function getClaudeMcpServers(config: SessionConfig): Record<string, unknown> {
     },
   };
 }
+
 const CLAUDE_RUNTIME_SUBAGENT_SYSTEM_SUBTYPES = new Set([
   'subagent_notification',
   'subagent_status',
@@ -197,6 +198,9 @@ interface ClaudeSdkSessionState {
   runtimeSubagentStartedAtByKey: Map<string, number>;
   emittedToolStates: Map<string, string>;
   subagentTasks: Map<string, ClaudeTaskState>;
+  /** Tool-use ids observed inside a subagent stream. Their lifecycle belongs
+   *  to that subagent, not to this session's foreground timeline. */
+  nestedClaudeToolUseIds: Set<string>;
   emittedSubagentStates: Map<string, string>;
   lastStatusSignature: string | null;
   /** Streaming-input channel for the live query (see SdkInputQueue). Lets a new
@@ -317,6 +321,8 @@ interface ClaudeTaskState {
   startedAtMs: number;
   lastUpdatedAt: number;
   parentWakeHandled?: boolean;
+  spawnDepth?: number;
+  nested: boolean;
 }
 
 const CLAUDE_LOCAL_BASH_TASK_TYPE = SDK_SUBAGENT_TASK_TYPES.LOCAL_BASH;
@@ -557,6 +563,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       runtimeSubagentStartedAtByKey: existing?.runtimeSubagentStartedAtByKey ?? new Map(),
       emittedToolStates: new Map(),
       subagentTasks: existing?.subagentTasks ?? new Map(),
+      nestedClaudeToolUseIds: existing?.nestedClaudeToolUseIds ?? new Set(),
       emittedSubagentStates: new Map(),
       lastStatusSignature: null,
     });
@@ -1370,6 +1377,21 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
         return;
       }
       if (event.type === 'content_block_start' && this.isToolBlock(event.content_block)) {
+        // Subagent stream frames share the parent iterator and reuse content
+        // block indexes. Projecting an internal tool here both exposed every
+        // child WebFetch/Bash in the parent's timeline and could overwrite a
+        // real foreground tool at the same index. Lifecycle snapshots are the
+        // only public representation of child work.
+        if (msg.parent_tool_use_id != null) {
+          const nestedToolUseId = this.pickString(event.content_block.id);
+          if (nestedToolUseId) {
+            state.nestedClaudeToolUseIds.add(nestedToolUseId);
+            const nestedTask = [...state.subagentTasks.values()]
+              .find((task) => task.toolUseId === nestedToolUseId);
+            if (nestedTask) nestedTask.nested = true;
+          }
+          return;
+        }
         const tool = this.normalizeToolCall(event.content_block);
         state.toolCalls.set(event.index, { ...tool, partialInputJson: undefined });
         this.emitToolCall(sessionId, state, tool);
@@ -1403,6 +1425,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
         return;
       }
       if (event.type === 'content_block_delta' && event.delta?.type === 'input_json_delta' && typeof event.delta.partial_json === 'string') {
+        if (msg.parent_tool_use_id != null) return;
         const tool = state.toolCalls.get(event.index);
         if (!tool) return;
         tool.partialInputJson = (tool.partialInputJson ?? '') + event.delta.partial_json;
@@ -1411,6 +1434,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
         return;
       }
       if (event.type === 'content_block_stop') {
+        if (msg.parent_tool_use_id != null) return;
         const tool = state.toolCalls.get(event.index);
         if (!tool) return;
         if (tool.partialInputJson && tool.input === undefined) {
@@ -1453,28 +1477,38 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
 
     if (msg.type === 'assistant') {
       const isTopLevelMessage = !('parent_tool_use_id' in msg) || msg.parent_tool_use_id == null;
+      // A Task subagent's trailing FULL assistant frame rides the same SDK
+      // iterator as the foreground conversation, just like its stream_event
+      // frames above. The streaming path already rejects those frames, but the
+      // full-message path used to continue below and overwrite currentText
+      // under the foreground message id. On the next foreground delta the UI
+      // therefore jumped from "<main prefix>" to "<subagent tail><new token>",
+      // which looked exactly like the beginning of the streamed reply vanished.
+      //
+      // Subagent lifecycle/progress is projected through the dedicated task
+      // snapshots; its private assistant text and internal tool blocks must
+      // never mutate or render as the foreground assistant message.
+      if (!isTopLevelMessage) return;
       const assistantMessageId = typeof msg.message?.id === 'string' && msg.message.id
         ? msg.message.id
         : undefined;
-      if (isTopLevelMessage && !state.completed && assistantMessageId && !state.currentMessageId) {
+      if (!state.completed && assistantMessageId && !state.currentMessageId) {
         state.currentMessageId = assistantMessageId;
       }
       const assistantUsage = msg.message?.usage as ClaudeUsageSnapshot | undefined;
-      if (isTopLevelMessage) {
-        this.recordClaudeUsage(
-          sessionId,
-          state,
-          assistantUsage,
-          assistantMessageId ?? state.currentMessageId ?? undefined,
-          state.completed,
-        );
-      }
+      this.recordClaudeUsage(
+        sessionId,
+        state,
+        assistantUsage,
+        assistantMessageId ?? state.currentMessageId ?? undefined,
+        state.completed,
+      );
       // includePartialMessages can emit message_delta(end_turn) and then flush
       // the matching full assistant frame. The stream boundary already emitted
       // and cleared the foreground, so the full frame is metadata-only; do not
       // re-emit its text as a duplicate bubble/completion. A genuine retained
       // task wake resets completed=false before its first assistant frame.
-      if (isTopLevelMessage && state.completed) return;
+      if (state.completed) return;
       const collectedAssistantText = collectAssistantText(msg);
       const transientCredentialRefresh403 = isClaudeCredentialRefresh403(collectedAssistantText);
       const rawAssistantText = transientCredentialRefresh403
@@ -1533,7 +1567,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       const isTerminalForegroundStop = typeof stopReason === 'string'
         && stopReason !== 'tool_use'
         && stopReason !== 'pause_turn';
-      if (isTopLevelMessage && !hasToolBlock && isTerminalForegroundStop) {
+      if (!hasToolBlock && isTerminalForegroundStop) {
         this.completeTerminalAssistantForeground(sessionId, state);
       }
       return;
@@ -1902,9 +1936,21 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     task.taskType = this.pickShortString(msg.task_type) ?? task.taskType;
 
     const toolUseId = this.pickString(msg.tool_use_id);
-    if (toolUseId) task.toolUseId = toolUseId;
+    if (toolUseId) {
+      task.toolUseId = toolUseId;
+      if (state.nestedClaudeToolUseIds.has(toolUseId)) task.nested = true;
+    }
 
     if (msg.subtype === 'task_started') {
+      const spawnDepth = typeof msg.spawn_depth === 'number'
+        && Number.isInteger(msg.spawn_depth)
+        && msg.spawn_depth >= 1
+        ? msg.spawn_depth
+        : undefined;
+      if (spawnDepth !== undefined) {
+        task.spawnDepth = spawnDepth;
+        if (spawnDepth > 1) task.nested = true;
+      }
       task.description = this.pickShortString(msg.description) ?? task.description;
       task.model = this.readRuntimeSubagentModel(msg) ?? task.model;
       task.workflowName = this.pickShortString(msg.workflow_name) ?? task.workflowName;
@@ -1949,7 +1995,10 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
 
     if (task.terminal && !task.parentWakeHandled) {
       task.parentWakeHandled = true;
-      if (state.currentQuery && state.completed && state.retainedSubagentMode) {
+      if (task.nested) return;
+      const isNestedBashCompletion = task.taskType === CLAUDE_LOCAL_BASH_TASK_TYPE
+        && this.hasActiveClaudeAgentTask(state);
+      if (!isNestedBashCompletion && state.currentQuery && state.completed && state.retainedSubagentMode) {
         // Keep completed=true until the SDK proves that its native automatic
         // task-notification turn actually re-entered the parent. Completed
         // tasks normally emit that user/assistant activity immediately, while
@@ -1965,6 +2014,15 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       }
     }
     this.emitClaudeSubagentSnapshot(sessionId, state, task);
+  }
+
+  private hasActiveClaudeAgentTask(state: ClaudeSdkSessionState): boolean {
+    return [...state.subagentTasks.values()].some((task) => (
+      !task.nested
+      && task.active
+      && !task.terminal
+      && task.taskType !== CLAUDE_LOCAL_BASH_TASK_TYPE
+    ));
   }
 
   private isRetainedTaskWakeActivity(msg: SDKMessage): boolean {
@@ -2006,6 +2064,16 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       ) {
         state.pendingTaskNotificationWakes.clear();
         return;
+      }
+      // Lifecycle messages are not guaranteed to be ordered: a detached Bash
+      // terminal may arrive just before its owning Agent is registered. Recheck
+      // at the actual wake boundary so that race cannot reintroduce a noisy
+      // synthetic turn for internal child work.
+      if (this.hasActiveClaudeAgentTask(state)) {
+        for (const [taskId, wake] of state.pendingTaskNotificationWakes) {
+          if (wake.kind === 'bash') state.pendingTaskNotificationWakes.delete(taskId);
+        }
+        if (state.pendingTaskNotificationWakes.size === 0) return;
       }
       const statuses = [...state.pendingTaskNotificationWakes.entries()].map(([taskId, wake]) => ({
         taskId,
@@ -2302,6 +2370,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       active: true,
       startedAtMs: Date.now(),
       lastUpdatedAt: Date.now(),
+      nested: false,
     };
   }
 
@@ -2357,12 +2426,17 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
    */
   private pruneTerminalSubagentTasks(state: ClaudeSdkSessionState): void {
     for (const [taskId, task] of state.subagentTasks) {
-      if (task.terminal || !task.active) state.subagentTasks.delete(taskId);
+      if (task.terminal || !task.active) {
+        state.subagentTasks.delete(taskId);
+        if (task.toolUseId) state.nestedClaudeToolUseIds.delete(task.toolUseId);
+      }
     }
   }
 
   private activeClaudeSubagentTasks(state: ClaudeSdkSessionState): ClaudeTaskState[] {
-    return Array.from(state.subagentTasks.values()).filter((task) => task.active && !task.terminal);
+    return Array.from(state.subagentTasks.values()).filter((task) => (
+      !task.nested && task.active && !task.terminal
+    ));
   }
 
   /**
@@ -2584,6 +2658,12 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     state: ClaudeSdkSessionState,
     task: ClaudeTaskState,
   ): void {
+    // Claude reports the whole recursive workflow on one SDK iterator. Only a
+    // depth-1 task is owned by this session; depth>1 tasks and tools observed
+    // inside a child stream belong to that child's private transcript. Claude
+    // already routes their final result to their direct parent, so projecting
+    // them here duplicates ownership and floods the main conversation.
+    if (task.nested) return;
     const isBashTask = task.taskType === CLAUDE_LOCAL_BASH_TASK_TYPE;
     const summary = sanitizeSdkSubagentText(task.summary) ?? (isBashTask ? 'Claude Bash task' : 'Claude task');
     const meta = this.buildClaudeSubagentMeta(state, task);

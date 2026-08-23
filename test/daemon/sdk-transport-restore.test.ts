@@ -1909,7 +1909,7 @@ describe('sdk transport session restore', () => {
         requestedModel: 'MiniMax-M3',
       });
 
-      expect(getDshPresetTransportConfigMock).toHaveBeenCalledWith('minimax');
+      expect(getDshPresetTransportConfigMock).toHaveBeenCalledWith('minimax', 'MiniMax-M3');
       expect(createSessionSpy).toHaveBeenCalledWith(expect.objectContaining({
         agentId: 'MiniMax-M3',
         env: expect.objectContaining({ ANTHROPIC_MODEL: 'MiniMax-M3' }),

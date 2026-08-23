@@ -210,6 +210,23 @@ describe('DeepseekHarnessProvider', () => {
     expect(prompts[0].text).toContain('hello');
   });
 
+  it('steers an active turn at the next model boundary without canceling or FIFO follow-up', async () => {
+    const sessionId = await startSession();
+    await provider.send(sessionId, 'first task');
+    await flush();
+
+    await expect(provider.notifyActiveDelegation(sessionId, {
+      text: 'append this now',
+      sourceSession: 'deck_sub_source',
+    })).resolves.toBe('delivered');
+
+    expect(child.commands().filter((command) => command.type === DSH_BRIDGE_COMMAND.STEER)).toEqual([
+      { type: DSH_BRIDGE_COMMAND.STEER, text: 'append this now' },
+    ]);
+    expect(child.commands().some((command) => command.type === DSH_BRIDGE_COMMAND.CANCEL)).toBe(false);
+    expect(child.commands().some((command) => command.type === 'follow_up')).toBe(false);
+  });
+
   it('reuses one child across turns instead of respawning', async () => {
     const sessionId = await startSession();
     await provider.send(sessionId, 'first');

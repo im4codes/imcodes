@@ -63,6 +63,16 @@ const makeWs = () => {
   };
 };
 
+function getAgentButton(agentType: string): HTMLButtonElement {
+  const button = document.querySelector(`[data-agent-type="${agentType}"]`) as HTMLButtonElement | null;
+  if (!button) throw new Error(`missing agent card: ${agentType}`);
+  return button;
+}
+
+function selectAgent(agentType: string): void {
+  fireEvent.click(getAgentButton(agentType));
+}
+
 describe('NewSessionDialog', () => {
   afterEach(() => {
     cleanup();
@@ -94,19 +104,19 @@ describe('NewSessionDialog', () => {
     expect(screen.queryByTestId('mock-file-browser')).toBeNull();
   });
 
-  it('renders agent type selector', () => {
+  it('renders the expanded agent card selector', () => {
     render(<NewSessionDialog ws={makeWs() as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
-    const select = screen.getAllByRole('combobox')[0] as HTMLSelectElement;
-    expect(select).toBeDefined();
+    expect(document.querySelector('.session-agent-groups')).toBeDefined();
+    expect(getAgentButton('claude-code-sdk')).toBeDefined();
+    expect(getAgentButton('pi')).toBeDefined();
   });
 
-  it('agent type selector separates transport/sdk and cli/process groups', () => {
+  it('agent cards separate transport/sdk and cli/process groups', () => {
     render(<NewSessionDialog ws={makeWs() as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
-    const select = screen.getAllByRole('combobox')[0] as HTMLSelectElement;
-    const optgroups = Array.from(select.querySelectorAll('optgroup'));
-    expect(optgroups.map((group) => group.label)).toEqual(['SDK', 'CLI']);
-    const options = Array.from(select.options).map((o) => o.value);
-    expect(options.slice(0, 12)).toEqual([
+    const groups = Array.from(document.querySelectorAll('.session-agent-group'));
+    expect(groups.map((group) => group.querySelector('.session-agent-group-title')?.textContent)).toEqual(['SDK', 'CLI']);
+    const options = groups.flatMap((group) => Array.from(group.querySelectorAll<HTMLButtonElement>('[data-agent-type]')).map((button) => button.dataset.agentType));
+    expect(options.slice(0, 13)).toEqual([
       'claude-code-sdk',
       'codex-sdk',
       'qoder-sdk',
@@ -117,10 +127,11 @@ describe('NewSessionDialog', () => {
       'grok-sdk',
       'kimi-sdk',
       'deepseek-harness',
+      'pi',
       'qwen',
       'openclaw',
     ]);
-    expect(options.slice(12)).toEqual([
+    expect(options.slice(13)).toEqual([
       'claude-code',
       'codex',
       'opencode',
@@ -130,8 +141,7 @@ describe('NewSessionDialog', () => {
 
   it('defaults agent type to claude-code-sdk', () => {
     render(<NewSessionDialog ws={makeWs() as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
-    const select = screen.getAllByRole('combobox')[0] as HTMLSelectElement;
-    expect(select.value).toBe('claude-code-sdk');
+    expect(getAgentButton('claude-code-sdk').getAttribute('aria-pressed')).toBe('true');
     expect(screen.getByText('agent_flavor_sdk')).toBeDefined();
     expect(screen.getByText('qwen_provider_hint')).toBeDefined();
   });
@@ -216,10 +226,8 @@ describe('NewSessionDialog', () => {
     const ws = makeWs();
     render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
 
-    const select = screen.getAllByRole('combobox')[0] as HTMLSelectElement;
-    select.value = 'codex';
-    fireEvent.input(select, { target: { value: select.value } });
-    await waitFor(() => expect(select.value).toBe('codex'));
+    selectAgent('codex');
+    await waitFor(() => expect(getAgentButton('codex').getAttribute('aria-pressed')).toBe('true'));
 
     fireEvent.input(screen.getByPlaceholderText('my-project'), {
       target: { value: 'test-proj' },
@@ -355,9 +363,7 @@ describe('NewSessionDialog', () => {
 
     expect(screen.getByText('agent_flavor_sdk')).toBeDefined();
 
-    const select = screen.getAllByRole('combobox')[0] as HTMLSelectElement;
-    select.value = 'claude-code';
-    fireEvent.input(select, { target: { value: select.value } });
+    selectAgent('claude-code');
 
     await waitFor(() => expect(screen.getByText('agent_flavor_cli')).toBeDefined());
   });
@@ -368,8 +374,7 @@ describe('NewSessionDialog', () => {
 
     fireEvent.input(screen.getByPlaceholderText('my-project'), { target: { value: 'qoder-app' } });
     fireEvent.input(screen.getByPlaceholderText('~/projects/my-project'), { target: { value: '~/projects/qoder-app' } });
-    const select = screen.getAllByRole('combobox')[0] as HTMLSelectElement;
-    fireEvent.input(select, { target: { value: 'qoder-sdk' } });
+    selectAgent('qoder-sdk');
 
     await waitFor(() => expect(screen.getByText('agent_flavor_sdk')).toBeDefined());
     expect(screen.queryByText('thinking')).toBeNull();
@@ -389,8 +394,7 @@ describe('NewSessionDialog', () => {
     const ws = makeWs();
     render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
 
-    const select = screen.getAllByRole('combobox')[0] as HTMLSelectElement;
-    fireEvent.input(select, { target: { value: 'qwen' } });
+    selectAgent('qwen');
 
     await waitFor(() => expect(screen.getByText('qwen_provider_selected_hint')).toBeDefined());
   });
@@ -401,15 +405,13 @@ describe('NewSessionDialog', () => {
 
     fireEvent.input(screen.getByPlaceholderText('my-project'), { target: { value: 'my-app' } });
     fireEvent.input(screen.getByPlaceholderText('~/projects/my-project'), { target: { value: '~/projects/my-app' } });
-    const agentTypeSelect = screen.getAllByRole('combobox')[0] as HTMLSelectElement;
-    agentTypeSelect.value = 'codex-sdk';
-    fireEvent.input(agentTypeSelect, { target: { value: agentTypeSelect.value } });
+    selectAgent('codex-sdk');
     await waitFor(() => {
-      const modelSelect = screen.getAllByRole('combobox')[2] as HTMLSelectElement;
+      const modelSelect = screen.getAllByRole('combobox')[1] as HTMLSelectElement;
       expect(modelSelect.value).toBe(DEFAULT_CODEX_SESSION_MODEL);
     });
     const selects = screen.getAllByRole('combobox') as HTMLSelectElement[];
-    fireEvent.input(selects[1], { target: { value: 'high' } });
+    fireEvent.input(selects[0], { target: { value: 'high' } });
     fireEvent.click(screen.getByRole('button', { name: /start/i }));
 
     expect(ws.sendSessionCommand).toHaveBeenCalledWith('start', expect.objectContaining({
@@ -488,9 +490,7 @@ describe('NewSessionDialog', () => {
 
     render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
 
-    const agentTypeSelect = screen.getAllByRole('combobox')[0] as HTMLSelectElement;
-    agentTypeSelect.value = 'qwen';
-    fireEvent.input(agentTypeSelect, { target: { value: agentTypeSelect.value } });
+    selectAgent('qwen');
     await waitFor(() => expect(screen.getByText('compatible_api_via_qwen')).toBeDefined());
     expect(screen.getByText('qwen_provider_selected_hint')).toBeDefined();
     fireEvent.input(screen.getByPlaceholderText('my-project'), { target: { value: 'my-app' } });
@@ -530,22 +530,19 @@ describe('NewSessionDialog', () => {
 
     render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
 
-    const agentTypeSelect = screen.getAllByRole('combobox')[0] as HTMLSelectElement;
     fireEvent.click(screen.getByLabelText(/custom_provider_sdk/i));
 
-    await waitFor(() => expect(agentTypeSelect.value).toBe('claude-code-sdk'));
-    expect(agentTypeSelect.disabled).toBe(false);
+    await waitFor(() => expect(getAgentButton('claude-code-sdk').getAttribute('aria-pressed')).toBe('true'));
+    expect(getAgentButton('claude-code-sdk').disabled).toBe(false);
     expect(screen.getByText('custom_provider_preset')).toBeDefined();
 
-    // dsh (deepseek-harness) is now a selectable option when custom provider SDK is on.
-    expect(screen.getByRole('option', { name: /deepseek_harness/i })).toBeDefined();
-    // Non-SDK types (e.g., codex-sdk) are filtered out and no longer shown.
-    expect(screen.queryByRole('option', { name: /codex_sdk/i })).toBeNull();
+    // DSH and Pi are selectable compatibility layers; unsupported transports
+    // are removed from the expanded card selector.
+    expect(getAgentButton('deepseek-harness')).toBeDefined();
+    expect(getAgentButton('pi')).toBeDefined();
+    expect(document.querySelector('[data-agent-type="codex-sdk"]')).toBeNull();
 
-    // Select dsh from the agent type dropdown (drives onInput →
-    // selectAgentType → setAgentType), then start the session.
-    agentTypeSelect.value = 'deepseek-harness';
-    fireEvent.input(agentTypeSelect, { target: { value: 'deepseek-harness' } });
+    selectAgent('deepseek-harness');
     // Confirm the agent-type state actually changed to dsh by checking the
     // resulting side effect (a transport.list_models request for dsh), not the
     // controlled <select>'s DOM value, which can revert to the React state.
@@ -563,6 +560,85 @@ describe('NewSessionDialog', () => {
       agentType: 'deepseek-harness',
       ccPreset: 'MiniMax',
     }));
+  });
+
+  it('keeps the third-party SDK switch available from every agent selection', async () => {
+    const ws = makeWs();
+    ws.onMessage.mockImplementation((handler: (msg: unknown) => void) => {
+      handler({
+        type: 'cc.presets.list_response',
+        presets: [{
+          name: 'MiniMax',
+          env: { ANTHROPIC_MODEL: 'MiniMax-M2.7' },
+          defaultModel: 'MiniMax-M2.7',
+        }],
+      });
+      return () => {};
+    });
+
+    render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
+    selectAgent('codex-sdk');
+
+    const toggle = screen.getByLabelText(/custom_provider_sdk/i) as HTMLInputElement;
+    expect(toggle.checked).toBe(false);
+    fireEvent.click(toggle);
+
+    await waitFor(() => {
+      expect(getAgentButton('claude-code-sdk').getAttribute('aria-pressed')).toBe('true');
+      expect(screen.getByText('custom_provider_preset')).toBeDefined();
+      expect((screen.getByLabelText(/custom_provider_sdk/i) as HTMLInputElement).checked).toBe(true);
+    });
+  });
+
+  it('resets the model when switching third-party provider presets even if catalogs overlap', async () => {
+    const ws = makeWs();
+    ws.onMessage.mockImplementation((handler: (msg: unknown) => void) => {
+      handler({
+        type: 'cc.presets.list_response',
+        presets: [
+          {
+            name: 'Provider A',
+            env: { ANTHROPIC_MODEL: 'a-default' },
+            defaultModel: 'a-default',
+            availableModels: [{ id: 'a-default' }, { id: 'shared-model' }],
+          },
+          {
+            name: 'Provider B',
+            env: { ANTHROPIC_MODEL: 'b-default' },
+            defaultModel: 'b-default',
+            availableModels: [{ id: 'b-default' }, { id: 'shared-model' }],
+          },
+        ],
+      });
+      return () => {};
+    });
+
+    render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
+    fireEvent.click(screen.getByLabelText(/custom_provider_sdk/i));
+    selectAgent('pi');
+
+    const presetSelect = await waitFor(() => {
+      const select = (screen.getAllByRole('combobox') as HTMLSelectElement[])
+        .find((candidate) => Array.from(candidate.options).some((option) => option.value === 'Provider B'));
+      expect(select).toBeDefined();
+      return select!;
+    });
+    const modelSelect = await waitFor(() => {
+      const select = (screen.getAllByRole('combobox') as HTMLSelectElement[])
+        .find((candidate) => Array.from(candidate.options).some((option) => option.value === 'shared-model'));
+      expect(select).toBeDefined();
+      return select!;
+    });
+
+    fireEvent.input(modelSelect, { target: { value: 'shared-model' } });
+    expect(modelSelect.value).toBe('shared-model');
+    fireEvent.input(presetSelect, { target: { value: 'Provider B' } });
+
+    await waitFor(() => {
+      const switchedModel = (screen.getAllByRole('combobox') as HTMLSelectElement[])
+        .find((candidate) => Array.from(candidate.options).some((option) => option.value === 'b-default'));
+      expect(switchedModel?.value).toBe('b-default');
+    });
   });
 
   it('shows a toast when qwen preset JSON is copied to the clipboard', async () => {
@@ -597,9 +673,7 @@ describe('NewSessionDialog', () => {
       />,
     );
 
-    const agentTypeSelect = screen.getAllByRole('combobox')[0] as HTMLSelectElement;
-    agentTypeSelect.value = 'qwen';
-    fireEvent.input(agentTypeSelect, { target: { value: agentTypeSelect.value } });
+    selectAgent('qwen');
     await waitFor(() => expect(screen.getByText('compatible_api_via_qwen')).toBeDefined());
 
     fireEvent.click(screen.getByText('api_provider_add_edit'));
@@ -616,9 +690,7 @@ describe('NewSessionDialog', () => {
     const ws = makeWs();
     render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
 
-    const agentTypeSelect = screen.getAllByRole('combobox')[0] as HTMLSelectElement;
-    agentTypeSelect.value = 'qwen';
-    fireEvent.input(agentTypeSelect, { target: { value: agentTypeSelect.value } });
+    selectAgent('qwen');
     await waitFor(() => expect(screen.getByText('compatible_api_via_qwen')).toBeDefined());
 
     fireEvent.click(screen.getByText('api_provider_add_edit'));
@@ -650,8 +722,7 @@ describe('NewSessionDialog', () => {
     const ws = makeWs();
     render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
 
-    const agentTypeSelect = screen.getAllByRole('combobox')[0] as HTMLSelectElement;
-    fireEvent.input(agentTypeSelect, { target: { value: 'qwen' } });
+    selectAgent('qwen');
     fireEvent.click(screen.getByText('api_provider_add_edit'));
     fireEvent.input(screen.getByPlaceholderText('e.g. MiniMax'), { target: { value: 'MiniMax' } });
     fireEvent.input(screen.getByPlaceholderText('your-api-key'), { target: { value: 'secret' } });
@@ -691,11 +762,9 @@ describe('NewSessionDialog', () => {
 
     fireEvent.input(screen.getByPlaceholderText('my-project'), { target: { value: 'my-app' } });
     fireEvent.input(screen.getByPlaceholderText('~/projects/my-project'), { target: { value: '~/projects/my-app' } });
-    const agentTypeSelect = screen.getAllByRole('combobox')[0] as HTMLSelectElement;
-    agentTypeSelect.value = 'qwen';
-    fireEvent.input(agentTypeSelect, { target: { value: agentTypeSelect.value } });
+    selectAgent('qwen');
     const selects = screen.getAllByRole('combobox') as HTMLSelectElement[];
-    fireEvent.input(selects[1], { target: { value: 'high' } });
+    fireEvent.input(selects[0], { target: { value: 'high' } });
     fireEvent.click(screen.getByRole('button', { name: /start/i }));
 
     expect(ws.sendSessionCommand).toHaveBeenCalledWith('start', expect.objectContaining({
@@ -710,11 +779,10 @@ describe('NewSessionDialog', () => {
 
     fireEvent.input(screen.getByPlaceholderText('my-project'), { target: { value: 'my-app' } });
     fireEvent.input(screen.getByPlaceholderText('~/projects/my-project'), { target: { value: '~/projects/my-app' } });
-    const agentTypeSelect = screen.getAllByRole('combobox')[0] as HTMLSelectElement;
-    fireEvent.input(agentTypeSelect, { target: { value: 'copilot-sdk' } });
-    await waitFor(() => expect(screen.getAllByRole('combobox').length).toBeGreaterThanOrEqual(3));
+    selectAgent('copilot-sdk');
+    await waitFor(() => expect(screen.getAllByRole('combobox').length).toBeGreaterThanOrEqual(2));
     const selects = screen.getAllByRole('combobox') as HTMLSelectElement[];
-    fireEvent.input(selects[2], { target: { value: 'gpt-5.4-mini' } });
+    fireEvent.input(selects[1], { target: { value: 'gpt-5.4-mini' } });
     fireEvent.click(screen.getByRole('button', { name: /start/i }));
 
     expect(ws.sendSessionCommand).toHaveBeenCalledWith('start', expect.objectContaining({
@@ -730,11 +798,10 @@ describe('NewSessionDialog', () => {
 
     fireEvent.input(screen.getByPlaceholderText('my-project'), { target: { value: 'my-app' } });
     fireEvent.input(screen.getByPlaceholderText('~/projects/my-project'), { target: { value: '~/projects/my-app' } });
-    const agentTypeSelect = screen.getAllByRole('combobox')[0] as HTMLSelectElement;
-    fireEvent.input(agentTypeSelect, { target: { value: 'cursor-headless' } });
-    await waitFor(() => expect(screen.getAllByRole('combobox').length).toBeGreaterThanOrEqual(2));
+    selectAgent('cursor-headless');
+    await waitFor(() => expect(screen.getAllByRole('combobox').length).toBeGreaterThanOrEqual(1));
     const selects = screen.getAllByRole('combobox') as HTMLSelectElement[];
-    fireEvent.input(selects[1], { target: { value: 'gpt-5.2' } });
+    fireEvent.input(selects[0], { target: { value: 'gpt-5.2' } });
     fireEvent.click(screen.getByRole('button', { name: /start/i }));
 
     expect(ws.sendSessionCommand).toHaveBeenCalledWith('start', expect.objectContaining({
@@ -749,9 +816,7 @@ describe('NewSessionDialog', () => {
 
     fireEvent.input(screen.getByPlaceholderText('my-project'), { target: { value: 'my-app' } });
     fireEvent.input(screen.getByPlaceholderText('~/projects/my-project'), { target: { value: '~/projects/my-app' } });
-    const agentTypeSelect = screen.getAllByRole('combobox')[0] as HTMLSelectElement;
-    agentTypeSelect.value = 'gemini-sdk';
-    fireEvent.input(agentTypeSelect, { target: { value: 'gemini-sdk' } });
+    selectAgent('gemini-sdk');
 
     await waitFor(() => {
       expect(ws.send.mock.calls.some((call) => (
@@ -774,7 +839,7 @@ describe('NewSessionDialog', () => {
 
     await waitFor(() => expect(screen.getByRole('option', { name: 'auto' })).toBeDefined());
     const selects = screen.getAllByRole('combobox') as HTMLSelectElement[];
-    fireEvent.input(selects[1], { target: { value: 'auto' } });
+    fireEvent.input(selects[0], { target: { value: 'auto' } });
     fireEvent.click(screen.getByRole('button', { name: /start/i }));
 
     expect(ws.sendSessionCommand).toHaveBeenCalledWith('start', expect.objectContaining({
@@ -789,9 +854,7 @@ describe('NewSessionDialog', () => {
 
     fireEvent.input(screen.getByPlaceholderText('my-project'), { target: { value: 'my-app' } });
     fireEvent.input(screen.getByPlaceholderText('~/projects/my-project'), { target: { value: '~/projects/my-app' } });
-    const agentTypeSelect = screen.getAllByRole('combobox')[0] as HTMLSelectElement;
-    agentTypeSelect.value = 'kimi-sdk';
-    fireEvent.input(agentTypeSelect, { target: { value: 'kimi-sdk' } });
+    selectAgent('kimi-sdk');
 
     await waitFor(() => {
       expect(ws.send.mock.calls.some((call) => (
@@ -813,7 +876,7 @@ describe('NewSessionDialog', () => {
 
     await waitFor(() => expect(screen.getByRole('option', { name: 'moonshot-v1-auto,thinking' })).toBeDefined());
     const selects = screen.getAllByRole('combobox') as HTMLSelectElement[];
-    fireEvent.input(selects[1], { target: { value: 'moonshot-v1-auto,thinking' } });
+    fireEvent.input(selects[0], { target: { value: 'moonshot-v1-auto,thinking' } });
     fireEvent.click(screen.getByRole('button', { name: /start/i }));
 
     expect(ws.sendSessionCommand).toHaveBeenCalledWith('start', expect.objectContaining({
@@ -828,9 +891,7 @@ describe('NewSessionDialog', () => {
 
     fireEvent.input(screen.getByPlaceholderText('my-project'), { target: { value: 'my-app' } });
     fireEvent.input(screen.getByPlaceholderText('~/projects/my-project'), { target: { value: '~/projects/my-app' } });
-    const agentTypeSelect = screen.getAllByRole('combobox')[0] as HTMLSelectElement;
-    agentTypeSelect.value = 'deepseek-harness';
-    fireEvent.input(agentTypeSelect, { target: { value: 'deepseek-harness' } });
+    selectAgent('deepseek-harness');
 
     await waitFor(() => {
       expect(ws.send.mock.calls.some((call) => (
@@ -853,8 +914,8 @@ describe('NewSessionDialog', () => {
     // Empty catalogue ⇒ free text, exactly like Kimi/Grok with no models.
     const modelInput = await screen.findByPlaceholderText('selectModel');
     expect(modelInput.tagName).toBe('INPUT');
-    // Only the agent-type dropdown remains: no populated model <select>.
-    expect(document.querySelectorAll('select')).toHaveLength(1);
+    // An empty catalogue remains a free-text input: no model dropdown appears.
+    expect(document.querySelectorAll('select')).toHaveLength(0);
     fireEvent.input(modelInput, { target: { value: 'deepseek-reasoner' } });
     fireEvent.click(screen.getByRole('button', { name: /start/i }));
 
@@ -870,8 +931,7 @@ describe('NewSessionDialog', () => {
 
     fireEvent.input(screen.getByPlaceholderText('my-project'), { target: { value: 'my-app' } });
     fireEvent.input(screen.getByPlaceholderText('~/projects/my-project'), { target: { value: '~/projects/my-app' } });
-    const agentTypeSelect = screen.getAllByRole('combobox')[0] as HTMLSelectElement;
-    fireEvent.input(agentTypeSelect, { target: { value: 'opencode-sdk' } });
+    selectAgent('opencode-sdk');
 
     await waitFor(() => expect(ws.send.mock.calls.some((call) => (
       call[0]?.type === 'transport.list_models' && call[0]?.agentType === 'opencode-sdk'
@@ -895,7 +955,7 @@ describe('NewSessionDialog', () => {
 
     await waitFor(() => expect(screen.getByRole('option', { name: 'anthropic/claude-sonnet-4-5' })).toBeDefined());
     const selects = screen.getAllByRole('combobox') as HTMLSelectElement[];
-    fireEvent.input(selects[1], { target: { value: 'anthropic/claude-sonnet-4-5' } });
+    fireEvent.input(selects[0], { target: { value: 'anthropic/claude-sonnet-4-5' } });
     fireEvent.click(screen.getByRole('button', { name: /start/i }));
 
     expect(ws.sendSessionCommand).toHaveBeenCalledWith('start', expect.objectContaining({
@@ -910,8 +970,7 @@ describe('NewSessionDialog', () => {
 
     fireEvent.input(screen.getByPlaceholderText('my-project'), { target: { value: 'my-app' } });
     fireEvent.input(screen.getByPlaceholderText('~/projects/my-project'), { target: { value: '~/projects/my-app' } });
-    const agentTypeSelect = screen.getAllByRole('combobox')[0] as HTMLSelectElement;
-    fireEvent.input(agentTypeSelect, { target: { value: 'grok-sdk' } });
+    selectAgent('grok-sdk');
 
     await waitFor(() => expect(ws.send.mock.calls.some((call) => (
       call[0]?.type === 'transport.list_models' && call[0]?.agentType === 'grok-sdk'
@@ -931,7 +990,7 @@ describe('NewSessionDialog', () => {
 
     await waitFor(() => expect(screen.getByRole('option', { name: 'grok-build' })).toBeDefined());
     const selects = screen.getAllByRole('combobox') as HTMLSelectElement[];
-    fireEvent.input(selects[1], { target: { value: 'grok-build' } });
+    fireEvent.input(selects[0], { target: { value: 'grok-build' } });
     fireEvent.click(screen.getByRole('button', { name: /start/i }));
 
     expect(ws.sendSessionCommand).toHaveBeenCalledWith('start', expect.objectContaining({
@@ -943,8 +1002,7 @@ describe('NewSessionDialog', () => {
   it('shows an actionable Grok prerequisite error returned by the daemon', async () => {
     const ws = makeWs();
     render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
-    const agentTypeSelect = screen.getAllByRole('combobox')[0] as HTMLSelectElement;
-    fireEvent.input(agentTypeSelect, { target: { value: 'grok-sdk' } });
+    selectAgent('grok-sdk');
     await waitFor(() => expect(ws.send.mock.calls.some((call) => call[0]?.agentType === 'grok-sdk')).toBe(true));
     const request = ws.send.mock.calls.find((call) => call[0]?.agentType === 'grok-sdk')?.[0];
     act(() => ws.emit({

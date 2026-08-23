@@ -856,6 +856,8 @@ describe('App shell', () => {
     expect(await screen.findByText('session-tabs')).toBeTruthy();
     expect(view.container.textContent).toContain('session-pane:deck_alpha_brain');
     expect(view.container.textContent).toContain('session-tree');
+    expect(screen.getByRole('button', { name: 'sharedContext.management.title' })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'sharedContext.diagnostics.title' })).toBeNull();
     expect(ws.connect).toHaveBeenCalled();
     expect(screen.getByText('featureAnnouncements.messagePins')).toBeTruthy();
     fireEvent.click(screen.getByText('featureAnnouncements.dismiss'));
@@ -1167,6 +1169,9 @@ describe('App shell', () => {
 
       await waitFor(() => expect(wsInstances.length).toBe(1));
       expect(view.container.querySelector('.layout')?.classList.contains('layout-mobile')).toBe(true);
+      expect(view.container.querySelector('[title="sharedContext.management.title"]')).toBeTruthy();
+      expect(view.container.querySelector('[title="sharedContext.diagnostics.title"]')).toBeNull();
+      expect(view.container.textContent).not.toContain('DBG');
       fireEvent.click(view.container.querySelector('.mobile-server-btn')!);
 
       const controlledNodesButton = await screen.findByRole('button', { name: 'controlled_nodes.title' });

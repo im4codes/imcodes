@@ -5150,13 +5150,6 @@ export function App() {
               >
                 {trans('sharedContext.management.title')}
               </button>
-              <button
-                class="btn"
-                style={{ background: '#334155', color: '#e2e8f0', fontSize: 12 }}
-                onClick={() => setShowSharedContextDiagnostics(true)}
-              >
-                {trans('sharedContext.diagnostics.title')}
-              </button>
               <div class="controlled-nodes-shortcut-group">
                 <button
                   class="btn controlled-nodes-shortcut-main"
@@ -5873,14 +5866,6 @@ export function App() {
                   }}
                   title={trans('sharedContext.management.title')}
                 >CTX</button>
-                <button
-                  class="mobile-sidebar-hdr-btn"
-                  onClick={() => {
-                    setShowSharedContextDiagnostics(true);
-                    closeSidebar();
-                  }}
-                  title={trans('sharedContext.diagnostics.title')}
-                >DBG</button>
                 <button
                   class={`mobile-sidebar-hdr-btn${mobileHideServerBar ? '' : ' active'}`}
                   onClick={() => setMobileHideServerBar((p) => { const v = !p; localStorage.setItem('mobile_hide_server_bar', v ? '1' : ''); return v; })}

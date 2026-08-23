@@ -148,8 +148,8 @@ html.native-ios-mac .chat-dl-btn {
 .sidebar-stats { padding: 8px 16px; border-top: 1px solid rgba(34,211,238,0.16); background: rgba(8,13,22,0.34); font-size: 11px; }
 .sidebar-stats-row { display: flex; justify-content: space-between; margin-bottom: 4px; }
 /* Compact per-session usage panel (opened from the session footer). */
-.session-usage-backdrop { position: fixed; inset: 0; background: rgba(2,6,12,0.6); z-index: 10050; display: flex; align-items: flex-start; justify-content: center; padding: 48px 12px; overflow-y: auto; }
-.session-usage-panel { width: 100%; max-width: 460px; background: linear-gradient(180deg, #111827, #0b1120); border: 1px solid rgba(125,211,252,0.18); border-radius: 12px; box-shadow: 0 18px 48px rgba(0,0,0,0.6); color: #e2e8f0; padding: 16px; max-height: calc(var(--vvh, 100dvh) - 64px); overflow-y: auto; }
+.session-usage-backdrop { position: fixed; inset: 0; box-sizing: border-box; background: rgba(2,6,12,0.6); z-index: 10050; display: flex; align-items: flex-start; justify-content: center; padding: max(48px, calc(env(safe-area-inset-top, 0px) + 12px)) 12px max(12px, env(safe-area-inset-bottom, 0px)); overflow-y: auto; }
+.session-usage-panel { width: 100%; max-width: 460px; background: linear-gradient(180deg, #111827, #0b1120); border: 1px solid rgba(125,211,252,0.18); border-radius: 12px; box-shadow: 0 18px 48px rgba(0,0,0,0.6); color: #e2e8f0; padding: 16px; max-height: calc(var(--vvh, 100dvh) - max(48px, calc(env(safe-area-inset-top, 0px) + 12px)) - max(12px, env(safe-area-inset-bottom, 0px))); overflow-y: auto; }
 .session-usage-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; margin-bottom: 12px; }
 
 /* "Daemon upgrading…" badge shown next to the version during an auto-upgrade. */
@@ -5684,6 +5684,103 @@ html.native-ios-mac .chat-dl-btn {
 }
 
 /* ── Sub-session start dialog extras ─────────────────────────────────────── */
+.session-launch-dialog {
+  position: relative;
+  isolation: isolate;
+  background:
+    radial-gradient(circle at 12% 0%, rgba(34, 211, 238, 0.12), transparent 32%),
+    radial-gradient(circle at 92% 8%, rgba(99, 102, 241, 0.12), transparent 36%),
+    linear-gradient(155deg, rgba(18, 30, 49, 0.98), rgba(10, 18, 32, 0.99));
+  border-color: rgba(94, 234, 212, 0.24);
+  border-radius: 14px;
+  box-shadow: 0 28px 80px rgba(2, 8, 23, 0.62), 0 0 0 1px rgba(56, 189, 248, 0.04) inset;
+}
+.session-launch-dialog::before {
+  content: "";
+  position: absolute;
+  z-index: -1;
+  inset: 0 18px auto;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, rgba(103, 232, 249, 0.7), rgba(129, 140, 248, 0.5), transparent);
+}
+.session-launch-dialog .dialog-header { padding-top: 18px; }
+.session-launch-dialog .dialog-header h2,
+.session-launch-dialog .dialog-header > span {
+  color: #f8fafc;
+  font-size: 15px;
+  font-weight: 650;
+  letter-spacing: 0.01em;
+}
+.session-agent-selector > label { margin-bottom: 8px; }
+.session-agent-groups { display: flex; flex-direction: column; gap: 14px; }
+.session-agent-group { display: flex; flex-direction: column; gap: 8px; }
+.session-agent-group-title {
+  color: #7890aa;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+.session-agent-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+.session-agent-card {
+  min-width: 0;
+  min-height: 46px;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 7px 10px;
+  color: #a9b8ca;
+  background: linear-gradient(145deg, rgba(25, 41, 63, 0.82), rgba(14, 26, 43, 0.9));
+  border: 1px solid rgba(100, 116, 139, 0.34);
+  border-radius: 9px;
+  cursor: pointer;
+  font: 500 12px/1.25 inherit;
+  text-align: left;
+  transition: color 140ms ease, border-color 140ms ease, background 140ms ease, box-shadow 140ms ease, transform 140ms ease;
+}
+.session-agent-card > span:last-child { min-width: 0; overflow-wrap: anywhere; }
+.session-agent-card-icon {
+  width: 25px;
+  height: 25px;
+  flex: 0 0 25px;
+  display: inline-grid;
+  place-items: center;
+  color: #a5f3fc;
+  background: rgba(14, 116, 144, 0.16);
+  border: 1px solid rgba(34, 211, 238, 0.18);
+  border-radius: 7px;
+  font-size: 13px;
+}
+.session-agent-card:hover:not(:disabled) {
+  color: #f1f5f9;
+  border-color: rgba(34, 211, 238, 0.48);
+  background: linear-gradient(145deg, rgba(24, 58, 79, 0.88), rgba(25, 37, 65, 0.92));
+  box-shadow: 0 8px 22px rgba(2, 132, 199, 0.1);
+  transform: translateY(-1px);
+}
+.session-agent-card.active {
+  color: #ecfeff;
+  border-color: #22d3ee;
+  background: linear-gradient(135deg, rgba(8, 145, 178, 0.25), rgba(79, 70, 229, 0.2));
+  box-shadow: 0 0 0 1px rgba(34, 211, 238, 0.12) inset, 0 0 22px rgba(34, 211, 238, 0.11);
+}
+.session-agent-card.active .session-agent-card-icon {
+  color: #fff;
+  border-color: rgba(103, 232, 249, 0.5);
+  background: rgba(8, 145, 178, 0.32);
+}
+.session-agent-card:focus-visible { outline: 2px solid #67e8f9; outline-offset: 2px; }
+.session-agent-card:disabled { opacity: 0.42; cursor: not-allowed; }
+@media (max-width: 560px) {
+  .session-agent-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .session-agent-card { min-height: 42px; padding: 6px 8px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .session-agent-card { transition: none; }
+  .session-agent-card:hover:not(:disabled) { transform: none; }
+}
+
+/* Legacy two-choice controls used by OpenClaw mode selection. */
 .subsession-type-groups { display: flex; flex-direction: column; gap: 12px; }
 .subsession-type-group { display: flex; flex-direction: column; gap: 8px; }
 .subsession-type-group-title { font-size: 11px; font-weight: 600; letter-spacing: 0.03em; text-transform: uppercase; color: #64748b; }

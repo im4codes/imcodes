@@ -42,6 +42,8 @@ import {
   uploadFile,
   type AttachmentRefResponse,
 } from './api.js';
+import { shareBlobOrDownload } from './browser-download.js';
+import { isNative } from './native.js';
 import type { ServerMessage, WsClient } from './ws-client.js';
 
 /**
@@ -961,7 +963,11 @@ async function pumpUpload(
 }
 
 async function runAttempt(lease: Lease, op: DirectAttempt, attempt: number): Promise<OperationSuccess> {
-  await ensureLease(lease);
+  // Lease creation used to ignore the upload AbortSignal. A user could press
+  // Stop during negotiation, but the composer row survived until the shared
+  // setup's full timeout elapsed.
+  if (op.signal?.aborted) throw directError(DIRECT_FILE_TRANSFER_ERROR.CANCELED, false);
+  await waitForCaller(ensureLease(lease), op.signal);
   const active: ActiveAttempt = {
     requestId: crypto.randomUUID(),
     attemptId: crypto.randomUUID(),
@@ -1021,7 +1027,8 @@ async function runAttempt(lease: Lease, op: DirectAttempt, attempt: number): Pro
     // The peer was established from lease-only SDP/ICE during File Browser
     // prewarm. Operation authorization merely allocates a data channel on that
     // reusable peer, so no file authority ever appears in an offer or ICE.
-    await ensureLeasePeer(lease);
+    if (op.signal?.aborted) throw directError(DIRECT_FILE_TRANSFER_ERROR.CANCELED, false);
+    await waitForCaller(ensureLeasePeer(lease), op.signal);
     const peer = lease.peer;
     if (!peer) throw directError(DIRECT_FILE_TRANSFER_ERROR.CONNECTION_FAILED);
     const channel = peer.createDataChannel(parsed.value.channelLabel, { ordered: true });
@@ -1265,6 +1272,28 @@ function wait(ms: number, signal?: AbortSignal): Promise<void> {
   });
 }
 
+/**
+ * Lease/peer setup can be shared with a prewarm or another transfer, so
+ * canceling one upload must not abort that authority-free shared work. Race
+ * only this caller against its signal; the setup may finish for later reuse.
+ */
+function waitForCaller<T>(pending: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return pending;
+  if (signal.aborted) return Promise.reject(directError(DIRECT_FILE_TRANSFER_ERROR.CANCELED, false));
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const finish = (error?: unknown, value?: T) => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener('abort', onAbort);
+      if (error) reject(error); else resolve(value as T);
+    };
+    const onAbort = () => finish(directError(DIRECT_FILE_TRANSFER_ERROR.CANCELED, false));
+    signal.addEventListener('abort', onAbort, { once: true });
+    pending.then((value) => finish(undefined, value), (error) => finish(error));
+  });
+}
+
 function failureDisposition(error: unknown, attemptsUsed: number) {
   if (!(error instanceof DirectFileTransferFailure)) {
     return attemptsUsed < DIRECT_FILE_TRANSFER_LIMITS.MAX_ATTEMPTS
@@ -1344,24 +1373,47 @@ export async function uploadFileWithDirectFallback(options: {
   const clientUploadId = crypto.randomUUID();
   if (options.ws && supportsUpload(options.ws) && !options.destinationDirectory) {
     options.onMode?.(FILE_UPLOAD_TRANSPORT_MODE.CONNECTING);
+    const directAbort = new AbortController();
+    let directConnectTimedOut = false;
+    let directConnected = false;
+    const abortDirect = () => directAbort.abort();
+    if (options.signal?.aborted) abortDirect();
+    else options.signal?.addEventListener('abort', abortDirect, { once: true });
+    const connectTimer = setTimeout(() => {
+      if (directConnected) return;
+      directConnectTimedOut = true;
+      directAbort.abort();
+    }, DIRECT_FILE_TRANSFER_LIMITS.UPLOAD_DIRECT_CONNECT_FALLBACK_MS);
     try {
       const direct = await uploadFileDirect(
         options.ws,
         options.file,
         clientUploadId,
         options.onProgress,
-        () => options.onMode?.(FILE_UPLOAD_TRANSPORT_MODE.DIRECT),
-        options.signal,
+        () => {
+          directConnected = true;
+          clearTimeout(connectTimer);
+          options.onMode?.(FILE_UPLOAD_TRANSPORT_MODE.DIRECT);
+        },
+        directAbort.signal,
         options.sessionName,
         options.serverId,
       );
       return direct;
     } catch (error) {
-      if (options.signal?.aborted || isFileUploadCanceled(error) || isTerminalDirectFailure(error)) throw error;
+      // User cancellation is terminal. The internal 20-second deadline uses
+      // the same abort machinery, but intentionally continues through HTTP.
+      const forcedFallbackCancellation = directConnectTimedOut && isFileUploadCanceled(error);
+      if (options.signal?.aborted
+        || (!forcedFallbackCancellation
+          && (isFileUploadCanceled(error) || isTerminalDirectFailure(error)))) throw error;
       if (options.file.size > FILE_TRANSFER_LIMITS.MAX_FILE_SIZE) {
         throw directError(DIRECT_FILE_TRANSFER_ERROR.INTERNAL_ERROR, false, 'relay_size_limit');
       }
       options.onMode?.(FILE_UPLOAD_TRANSPORT_MODE.FALLING_BACK);
+    } finally {
+      clearTimeout(connectTimer);
+      options.signal?.removeEventListener('abort', abortDirect);
     }
   } else if (options.file.size > FILE_TRANSFER_LIMITS.MAX_FILE_SIZE) {
     throw directError(DIRECT_FILE_TRANSFER_ERROR.INTERNAL_ERROR, false, 'relay_size_limit');
@@ -1390,6 +1442,71 @@ export async function selectPreviewDownloadDestination(suggestedName?: string): 
   }
 }
 
+type NativeBlobDownloadSink = {
+  destination: DirectPreviewDownloadDestination;
+  takeCompletedBlob(): Blob;
+};
+
+function createNativeBlobDownloadSink(): NativeBlobDownloadSink {
+  let completedBlob: Blob | null = null;
+  return {
+    destination: {
+      handle: {
+        async createWritable() {
+          const chunks: ArrayBuffer[] = [];
+          let settled = false;
+          completedBlob = null;
+          return {
+            async write(data) {
+              if (settled) throw new Error('download_writer_closed');
+              const bytes = data instanceof ArrayBuffer
+                ? new Uint8Array(data)
+                : new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+              const copy = new Uint8Array(bytes.byteLength);
+              copy.set(bytes);
+              chunks.push(copy.buffer);
+            },
+            async close() {
+              if (settled) throw new Error('download_writer_closed');
+              settled = true;
+              completedBlob = new Blob(chunks);
+              chunks.length = 0;
+            },
+            async abort() {
+              settled = true;
+              chunks.length = 0;
+            },
+          };
+        },
+      },
+    },
+    takeCompletedBlob() {
+      if (!completedBlob) throw directError(DIRECT_FILE_TRANSFER_ERROR.WRITE_FAILED, false, 'download_blob_missing');
+      const blob = completedBlob;
+      completedBlob = null;
+      return blob;
+    },
+  };
+}
+
+async function presentNativeDownloadedBlob(options: {
+  blob: Blob;
+  suggestedName?: string;
+  onSaveReady?: (save: () => Promise<void>) => void;
+}): Promise<void> {
+  const fileName = options.suggestedName?.trim() || 'download';
+  try {
+    await shareBlobOrDownload(options.blob, fileName);
+  } catch (error) {
+    // Web Share requires a live user gesture. A direct or HTTP transfer
+    // necessarily finishes after that gesture has expired in WKWebView. Keep
+    // the completed payload and let the transfer center invoke the same save
+    // operation from a fresh explicit tap instead of reporting transfer failure.
+    if (!options.onSaveReady) throw error;
+    options.onSaveReady(() => shareBlobOrDownload(options.blob, fileName).then(() => undefined));
+  }
+}
+
 async function createPreviewWriter(destination: DirectPreviewDownloadDestination): Promise<FileSystemWritableFileStreamLike> {
   try {
     return await destination.handle.createWritable();
@@ -1405,15 +1522,24 @@ export async function downloadPreviewWithDirectFallback(options: {
   suggestedName?: string;
   sessionName?: string;
   destination?: DirectPreviewDownloadDestination | null;
-  /** Kept for the non-FSA/native browser fallback only. */
+  /** Kept for desktop browsers without File System Access. */
   httpFallback?: () => Promise<void>;
   signal?: AbortSignal;
   onProgress?: (progress: FileDownloadProgress) => void;
   onMode?: (mode: FileDownloadTransportMode) => void;
+  onSaveReady?: (save: () => Promise<void>) => void;
 }): Promise<void> {
-  const destination = options.destination === undefined
+  // Mobile WebViews have no File System Access picker. Give the existing P2P
+  // protocol an in-memory writable target, then pass the completed bytes to the
+  // embedded Capacitor Filesystem/Share bridge (or a fresh Web Share tap). The
+  // same sink is recreated for the one HTTP fallback, so partial P2P bytes are
+  // never mixed with fallback bytes.
+  const nativeBlobSink = isNative() && options.destination == null
+    ? createNativeBlobDownloadSink()
+    : null;
+  const destination = nativeBlobSink?.destination ?? (options.destination === undefined
     ? await selectPreviewDownloadDestination(options.suggestedName)
-    : options.destination;
+    : options.destination);
   if (!destination) {
     // No File System Access API means no safe streaming sink.  Keep the
     // established HTTP browser download as the only fallback and do not start
@@ -1441,12 +1567,11 @@ export async function downloadPreviewWithDirectFallback(options: {
         direction: DIRECT_FILE_TRANSFER_DIRECTION.DOWNLOAD,
         route: await selectedPeerRoute(lease.peer),
       });
-      return;
     } catch (error) {
       if (isTerminalDirectFailure(error)) throw error;
       // Exactly one HTTP fallback after the full direct budget. It reuses the
-      // already user-approved destination and streams response chunks instead
-      // of constructing a Blob.
+      // same destination: desktop keeps streaming to its approved file handle,
+      // while mobile rebuilds only the completed fallback payload for sharing.
       const writer = await createPreviewWriter(destination);
       try {
         options.onMode?.(FILE_DOWNLOAD_TRANSPORT_MODE.FALLING_BACK);
@@ -1466,14 +1591,29 @@ export async function downloadPreviewWithDirectFallback(options: {
           },
         );
         await writer.close();
-        return;
       } catch (fallbackError) {
         await writer.abort(fallbackError).catch(() => undefined);
         throw fallbackError;
       }
+      if (nativeBlobSink) {
+        await presentNativeDownloadedBlob({
+          blob: nativeBlobSink.takeCompletedBlob(),
+          suggestedName: options.suggestedName,
+          onSaveReady: options.onSaveReady,
+        });
+      }
+      return;
     } finally {
       release();
     }
+    if (nativeBlobSink) {
+      await presentNativeDownloadedBlob({
+        blob: nativeBlobSink.takeCompletedBlob(),
+        suggestedName: options.suggestedName,
+        onSaveReady: options.onSaveReady,
+      });
+    }
+    return;
   }
   const writer = await createPreviewWriter(destination);
   try {
@@ -1483,6 +1623,13 @@ export async function downloadPreviewWithDirectFallback(options: {
   } catch (error) {
     await writer.abort(error).catch(() => undefined);
     throw error;
+  }
+  if (nativeBlobSink) {
+    await presentNativeDownloadedBlob({
+      blob: nativeBlobSink.takeCompletedBlob(),
+      suggestedName: options.suggestedName,
+      onSaveReady: options.onSaveReady,
+    });
   }
 }
 

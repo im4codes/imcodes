@@ -4,6 +4,7 @@ export const DOWNLOAD_TRANSFER_STATUS = {
   TRANSFERRING: 'transferring',
   FALLING_BACK: 'falling_back',
   HANDED_OFF: 'handed_off',
+  READY_TO_SAVE: 'ready_to_save',
   COMPLETED: 'completed',
   CANCELED: 'canceled',
   FAILED: 'failed',
@@ -34,9 +35,12 @@ export interface DownloadTransferItem {
 type Listener = () => void;
 type ProgressSample = { loadedBytes: number; totalBytes: number | null; now: number };
 type RetryHandler = (signal: AbortSignal) => Promise<void>;
+type SaveHandler = () => Promise<void>;
 type Runtime = {
   controller: AbortController;
   retry: RetryHandler | null;
+  save: SaveHandler | null;
+  saveInFlight: boolean;
   lastSampleAt: number;
   lastSampleBytes: number;
   speedBps: number;
@@ -70,6 +74,10 @@ function isTerminal(status: DownloadTransferStatus): boolean {
     || status === DOWNLOAD_TRANSFER_STATUS.COMPLETED
     || status === DOWNLOAD_TRANSFER_STATUS.CANCELED
     || status === DOWNLOAD_TRANSFER_STATUS.FAILED;
+}
+
+function isInactive(status: DownloadTransferStatus): boolean {
+  return status === DOWNLOAD_TRANSFER_STATUS.READY_TO_SAVE || isTerminal(status);
 }
 
 function clearRuntimeTimer(runtime: Runtime | undefined): void {
@@ -120,6 +128,8 @@ export function beginDownloadTransfer(name: string, now = Date.now()): { id: str
   runtimeById.set(id, {
     controller,
     retry: null,
+    save: null,
+    saveInFlight: false,
     lastSampleAt: now,
     lastSampleBytes: 0,
     speedBps: 0,
@@ -144,6 +154,44 @@ export function beginDownloadTransfer(name: string, now = Date.now()): { id: str
 export function setDownloadTransferRetry(id: string, retry: RetryHandler): void {
   const runtime = runtimeById.get(id);
   if (runtime) runtime.retry = retry;
+}
+
+export function setDownloadTransferSave(id: string, save: SaveHandler, now = Date.now()): void {
+  const runtime = runtimeById.get(id);
+  if (!runtime) return;
+  clearRuntimeTimer(runtime);
+  runtime.save = save;
+  runtime.saveInFlight = false;
+  updateItem(id, (item) => isTerminal(item.status) ? item : ({
+    ...item,
+    status: DOWNLOAD_TRANSFER_STATUS.READY_TO_SAVE,
+    speedBps: 0,
+    updatedAt: now,
+  }));
+}
+
+export function canSaveDownloadTransfer(id: string): boolean {
+  const runtime = runtimeById.get(id);
+  const item = snapshot.find((entry) => entry.id === id);
+  return !!runtime?.save && !runtime.saveInFlight && item?.status === DOWNLOAD_TRANSFER_STATUS.READY_TO_SAVE;
+}
+
+export async function saveDownloadTransfer(id: string, now = Date.now()): Promise<void> {
+  const runtime = runtimeById.get(id);
+  const item = snapshot.find((entry) => entry.id === id);
+  if (!runtime?.save || runtime.saveInFlight || item?.status !== DOWNLOAD_TRANSFER_STATUS.READY_TO_SAVE) return;
+  runtime.saveInFlight = true;
+  try {
+    await runtime.save();
+    runtime.save = null;
+    runtime.saveInFlight = false;
+    completeDownloadTransfer(id, false, now);
+  } catch {
+    // The file is already downloaded. A dismissed/blocked share sheet is not
+    // a transfer failure; retain the payload so another explicit tap can retry.
+    runtime.saveInFlight = false;
+    updateItem(id, (current) => ({ ...current, status: DOWNLOAD_TRANSFER_STATUS.READY_TO_SAVE, updatedAt: Date.now() }));
+  }
 }
 
 export function canRetryDownloadTransfer(id: string): boolean {
@@ -197,7 +245,7 @@ export function reportDownloadTransferProgress(
 ): void {
   const runtime = runtimeById.get(id);
   const item = snapshot.find((entry) => entry.id === id);
-  if (!runtime || !item || isTerminal(item.status)) return;
+  if (!runtime || !item || isInactive(item.status)) return;
   const sample = {
     loadedBytes: Math.max(0, loadedBytes),
     totalBytes: totalBytes === null ? null : Math.max(0, totalBytes),
@@ -221,6 +269,7 @@ function settleDownloadTransfer(id: string, status: DownloadTransferStatus, rout
   const runtime = runtimeById.get(id);
   if (runtime?.pending) applyProgress(id, { ...runtime.pending, now });
   clearRuntimeTimer(runtime);
+  if (runtime) runtime.save = null;
   updateItem(id, (item) => isTerminal(item.status) ? item : ({
     ...item,
     ...(route ? { route } : {}),
@@ -246,14 +295,14 @@ export function failDownloadTransfer(id: string, canceled = false, now = Date.no
 export function cancelDownloadTransfer(id: string): void {
   const runtime = runtimeById.get(id);
   const item = snapshot.find((entry) => entry.id === id);
-  if (!runtime || !item || isTerminal(item.status) || runtime.controller.signal.aborted) return;
+  if (!runtime || !item || isInactive(item.status) || runtime.controller.signal.aborted) return;
   runtime.controller.abort();
   failDownloadTransfer(id, true);
 }
 
 export function dismissDownloadTransfer(id: string): void {
   const item = snapshot.find((entry) => entry.id === id);
-  if (!item || !isTerminal(item.status)) return;
+  if (!item || !isInactive(item.status)) return;
   const runtime = runtimeById.get(id);
   if (runtime) clearRuntimeTimer(runtime);
   runtimeById.delete(id);

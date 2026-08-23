@@ -19,6 +19,7 @@ import {
   type CcPresetModelInfo,
 } from '../../shared/cc-presets.js';
 import type { DshLlmConfig } from '../../shared/deepseek-harness.js';
+import type { PiLlmConfig } from '../../shared/pi-agent.js';
 import logger from '../util/logger.js';
 
 const PRESETS_PATH = join(homedir(), '.imcodes', 'cc-presets.json');
@@ -144,6 +145,26 @@ export function getPresetEffectiveModel(preset: Pick<CcPreset, 'defaultModel' | 
 
 export function getPresetAvailableModelIds(preset: Pick<CcPreset, 'availableModels' | 'defaultModel' | 'env'>): string[] {
   return getCcPresetAvailableModelIds(preset);
+}
+
+/**
+ * Select a model inside one preset atomically.
+ *
+ * A model id from the previously selected third-party API must never leak into
+ * the newly selected preset. When discovery produced a catalogue, only ids in
+ * that catalogue are valid; without a catalogue, a deliberate free-text model
+ * remains supported and the UI owns resetting it when the preset changes.
+ */
+export function selectPresetModel(
+  preset: Pick<CcPreset, 'availableModels' | 'defaultModel' | 'env'>,
+  requestedModel?: string,
+): string | undefined {
+  const availableModels = getPresetAvailableModelIds(preset);
+  const fallback = getPresetEffectiveModel(preset) ?? availableModels[0];
+  const requested = requestedModel?.trim();
+  if (!requested) return fallback;
+  if (availableModels.length === 0 || availableModels.includes(requested)) return requested;
+  return fallback;
 }
 
 /** `${preset}:${model}` pairs already warned about, so launches stay quiet after the first. */
@@ -330,7 +351,7 @@ export async function getQwenPresetTransportConfig(presetName: string): Promise<
   };
 }
 
-export async function getDshPresetTransportConfig(presetName: string): Promise<{
+export async function getDshPresetTransportConfig(presetName: string, requestedModel?: string): Promise<{
   env: Record<string, string>;
   llm?: DshLlmConfig;
   model?: string;
@@ -341,9 +362,9 @@ export async function getDshPresetTransportConfig(presetName: string): Promise<{
   const preset = await getPreset(presetName);
   if (!preset) return { env: {} };
 
-  const resolvedEnv = await resolvePresetEnv(presetName);
   const availableModels = getPresetAvailableModelIds(preset);
-  const model = getPresetEffectiveModel(preset) ?? availableModels[0];
+  const model = selectPresetModel(preset, requestedModel);
+  const resolvedEnv = await resolvePresetEnv(presetName, undefined, model);
   const baseUrl = resolvedEnv['ANTHROPIC_BASE_URL']?.trim() || undefined;
   const apiKey = resolvedEnv['ANTHROPIC_API_KEY']?.trim()
     || resolvedEnv['ANTHROPIC_AUTH_TOKEN']?.trim()
@@ -377,6 +398,52 @@ export async function getDshPresetTransportConfig(presetName: string): Promise<{
   return {
     env,
     ...(llm ? { llm } : {}),
+    ...(model ? { model } : {}),
+    ...(availableModels.length ? { availableModels } : {}),
+    ...(runtimeFacts ? { systemPrompt: runtimeFacts } : {}),
+    ...(preset.contextWindow ? { contextWindow: preset.contextWindow } : {}),
+  };
+}
+
+export async function getPiPresetTransportConfig(presetName: string, requestedModel?: string): Promise<{
+  env: Record<string, string>;
+  piLlm?: PiLlmConfig;
+  model?: string;
+  availableModels?: string[];
+  systemPrompt?: string;
+  contextWindow?: number;
+}> {
+  const preset = await getPreset(presetName);
+  if (!preset) return { env: {} };
+
+  const availableModels = getPresetAvailableModelIds(preset);
+  const model = selectPresetModel(preset, requestedModel);
+  const resolvedEnv = await resolvePresetEnv(presetName, undefined, model);
+  const baseUrl = resolvedEnv['ANTHROPIC_BASE_URL']?.trim() || undefined;
+  const apiKey = resolvedEnv['ANTHROPIC_API_KEY']?.trim()
+    || resolvedEnv['ANTHROPIC_AUTH_TOKEN']?.trim()
+    || undefined;
+  const piLlm = model
+    ? {
+        provider: normalizeCcPresetName(preset.name),
+        model,
+        ...(baseUrl ? { baseUrl } : {}),
+        ...(apiKey ? { apiKey } : {}),
+        ...(preset.contextWindow ? { contextWindow: preset.contextWindow } : {}),
+      }
+    : undefined;
+  const runtimeFacts = model ? [
+    `Authoritative runtime fact: this Pi session is routed through the "${preset.name}" API provider preset.`,
+    baseUrl ? `Authoritative provider endpoint: ${baseUrl}.` : undefined,
+    model ? `Authoritative runtime model: ${model}.` : undefined,
+    model ? `If the user asks which model you are using, answer exactly with "${model}".` : undefined,
+    baseUrl ? `If the user asks which provider or endpoint you are using, mention "${baseUrl}".` : undefined,
+    'These runtime facts override any generic default model or provider.',
+  ].filter(Boolean).join(' ') : undefined;
+
+  return {
+    env: model ? { ANTHROPIC_MODEL: model } : {},
+    ...(piLlm ? { piLlm } : {}),
     ...(model ? { model } : {}),
     ...(availableModels.length ? { availableModels } : {}),
     ...(runtimeFacts ? { systemPrompt: runtimeFacts } : {}),

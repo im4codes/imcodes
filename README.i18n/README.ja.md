@@ -2,18 +2,29 @@
 
 [English](../README.md) | [简体中文](README.zh-CN.md) | [繁體中文](README.zh-TW.md) | [Español](README.es.md) | [Русский](README.ru.md) | [日本語](README.ja.md) | [한국어](README.ko.md)
 
-**エージェントのための IM。共有メモリ、OpenSpec Auto Deliver、管理対象 MCP ツール、監督付き実行、人間同士の協調、そして AI プロバイダー横断の監査。**
+**エージェントのための IM。AI リモートデスクトップ、共有メモリ、OpenSpec Auto Deliver、管理対象 MCP ツール、監督付き実行、クロスモデル監査。**
 
 <!-- TODO(native-review): JA hero couplet — 默认「天下」(可换「乾坤」);「三人の孔明」措辞待母语者确认 -->
 > 三人寄れば文殊の知恵。<br>
 > されど三人の孔明、談笑のうちに天下を定む。<br>
 > — IM.codes
 
-IM.codes は coding agent のための、プロバイダーをまたぐ共有メモリレイヤーと管理対象 MCP tool surface です。完了した作業を再利用可能なコンテキストとして蓄積し、適切な履歴を後続 session に注入または recall します。対応先は Claude Code、Codex、Gemini CLI、GitHub Copilot、Cursor、OpenCode、OpenClaw、Qwen などで、ターミナル、ファイル閲覧、Git 変更、localhost プレビュー、通知、マルチエージェント連携、transport 系 agent のネイティブストリーミングも備えています。OpenSpec Auto Deliver は変更を proposal/spec 監査から実装、検証ヒント、Team 監査/手戻り、自動モジュール採点、最終 quality gate まで進められます。セッション共有も live agent session を中心に pair / multi-person 協調プログラミングを支えます。内蔵の Auto supervision は完了済みターンを判定し、自律的な継続や監査/手戻りループまで行ったうえで制御を返せます。Team ディスカッションを内蔵——複数のモデルが互いの計画と実装をレビュー・監査し合い、単一モデルの見落とし・盲点・バイアスを効果的に減らします。
+IM.codes は AI agent を coding session だけでなく、実際に作業するコンピューターにも接続します。対応マシンを制限付きの **制御対象ノード（Controlled Nodes）** として登録すると、認可された agent が scoped command、ファイル転送、型付き Computer Use を使って 1 台でも複数台でも直接操作できます。人が画面を確認・引き継ぐ必要があるときは、対応する Windows ノードをブラウザやスマートフォンからリモートデスクトップで操作できます。
+
+マシン制御に加え、IM.codes は provider をまたぐ共有メモリレイヤーと管理対象 MCP tool surface を coding agent に提供します。完了した作業を再利用可能なコンテキストとして Claude Code、Codex、Gemini CLI、GitHub Copilot、Cursor、OpenCode、OpenClaw、Qwen などで活用できます。ターミナル、ファイルと Git、localhost プレビュー、通知、マルチエージェント連携、OpenSpec Auto Deliver、Auto supervision、Team 監査により、人と agent の作業を見える状態でつなぎます。
 
 > これは翻訳版です。**正式な内容は英語版 README（`../README.md`）です。** 差異がある場合は英語版を優先してください。
 
 複数のエージェントが CLI と SDK の両方で接続できます。
+
+## 制御対象ノード：AI リモートデスクトップ
+
+各マシンを完全な IM.codes source server にせず、対応コンピューターを AI が操作できる制御対象ノードとして登録できます。
+
+- **1 つの AI で複数の PC。** 複数マシンを登録し、1 つの agent または agent チームがそれらを直接操作して作業を実行できます。
+- **実際のコンピューター操作。** scoped command、個別ファイル転送、型付き Computer Use によるデスクトップアプリ操作に対応します。
+- **必要なときは人がリモート操作。** 対応する Windows ノードをブラウザやスマートフォンから開き、画面の確認や操作の引き継ぎができます。
+- **権限を限定し、いつでも取り消し可能。** ノードごとに独立した認証情報を使い、通常の server/session 一覧から分離し、所有者が実行権限を無効化・取り消しできます。
 
 ## スクリーンショット
 
@@ -129,13 +140,13 @@ IM.codes は、自分で書いた supervisor の指示で、対応する agent s
 
 ### 制御対象ノード
 
-別のマシンを完全な IM.codes source server にせず、制限付きの controlled node として登録できます。`^` でターゲットを補完するか、`^^(name)` を直接挿入すると、許可された agent が scoped remote command、単一ファイル転送、型付き Computer Use tool をそのノードで実行できます。実行権限は所有者が有効化・取り消しでき、controlled node は通常の server/session 一覧には表示されず、各マシンは独立した認証情報を持ちます。ダウンロードリンクには有効期限がありますが、新しく取得したインストーラーは保存して複数マシンの登録に再利用できます。
+1 台または複数のコンピューターを登録し、`^` で対象を選ぶ（または `^^(name)` を直接挿入する）と、認可された agent が選択したマシンで作業できます。scoped command、個別ファイル転送、型付き Computer Use を同じ会話から利用でき、コンピューター群の操作と連携に適しています。実行権限は所有者が管理・取り消しでき、ノードごとに独立した認証情報を使い、通常の server/session 一覧から分離されます。ダウンロードリンクは期限切れになりますが、インストーラーは保存して再利用できます。
 
 ### リモートデスクトップ操作
 
-条件を満たす controlled node は、認可された Owner と Participant に対して連続した H.264 リモートデスクトップを提供します。ブラウザとネイティブ worker はまず WebRTC の直接経路を交渉し、TURN はフォールバックとしてのみ使用します。映像とマウス/キーボードのデータがアプリケーションサーバーを通ることはありません。既定は操作モードで、複数の認可された操作者を許可し、各視聴者は個別に閲覧モードへ切り替えられます。ディスプレイタブは右クリック/長押しメニューから 720p・1080p・1440p・4K を切り替えられ、モバイルではピンチ/ドラッグ操作に加えて、エッジパン・左中右ボタン・ホイールを備えた仮想マウスモードが使えます。
+対応する Windows ノードは、認可された Owner と Participant にブラウザ内リモートデスクトップを提供します。操作/閲覧モード、ディスプレイと画質の切り替え、複数の認可ユーザーによる共同閲覧・操作に対応します。モバイルではタッチナビゲーションと仮想マウスで、スマートフォンやタブレットからデスクトップを操作できます。
 
-Windows では署名済みのビルド済み worker を使うため、controlled node にコンパイラやメディア依存関係をインストールする必要はありません。**現在は Windows に対応、macOS と Linux は近日対応。**
+リモートデスクトップは利用可能な接続を自動選択し、権限はいつでも取り消せます。**現在は Windows に対応しています。macOS と Linux のノードでは他の機能を利用でき、リモートデスクトップ対応は今後予定されています。**
 
 ### Computer Use とブラウザ自動化
 

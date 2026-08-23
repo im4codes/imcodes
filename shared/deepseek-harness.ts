@@ -22,6 +22,8 @@
 export const DSH_BRIDGE_COMMAND = {
   /** Submit user text as a new turn on the live agent. */
   PROMPT: 'prompt',
+  /** Insert user text at the next safe boundary of the active agent turn. */
+  STEER: 'steer',
   /** Cancel the in-flight turn without tearing the agent down. */
   CANCEL: 'cancel',
   /** Tear the agent down and exit the process. */
@@ -71,6 +73,11 @@ export interface DshBridgePromptCommand {
   text: string;
 }
 
+export interface DshBridgeSteerCommand {
+  type: typeof DSH_BRIDGE_COMMAND.STEER;
+  text: string;
+}
+
 export interface DshBridgeCancelCommand {
   type: typeof DSH_BRIDGE_COMMAND.CANCEL;
 }
@@ -81,6 +88,7 @@ export interface DshBridgeShutdownCommand {
 
 export type DshBridgeCommand =
   | DshBridgePromptCommand
+  | DshBridgeSteerCommand
   | DshBridgeCancelCommand
   | DshBridgeShutdownCommand;
 

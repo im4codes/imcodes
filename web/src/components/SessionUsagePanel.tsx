@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from 'preact/hooks';
+import { createPortal } from 'preact/compat';
 import { useTranslation } from 'react-i18next';
 import { fetchUsageSummary, type UsageSummaryResponse } from '../api/usage-summary.js';
 import { formatUsageNumber, formatUsageCost } from '../util/usage-format.js';
@@ -71,7 +72,7 @@ export function SessionUsagePanel({ targetSessionName, onClose }: Props) {
     return `${dates[0]} → ${dates[dates.length - 1]}`;
   }, [range.from, range.to, data, t]);
 
-  return (
+  const panel = (
     <div class="session-usage-backdrop" onClick={onClose}>
       <div class="session-usage-panel" onClick={(e) => e.stopPropagation()}>
         <div class="session-usage-header">
@@ -161,6 +162,10 @@ export function SessionUsagePanel({ targetSessionName, onClose }: Props) {
       </div>
     </div>
   );
+  // Floating sub-session windows create their own isolation/stacking context.
+  // A fixed modal left under that ancestor is still painted below the app
+  // chrome, which covered the Token title and close button on mobile.
+  return typeof document === 'undefined' ? panel : createPortal(panel, document.body);
 }
 
 function RowList({ rows, unknown, emptyLabel }: {

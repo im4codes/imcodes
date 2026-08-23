@@ -3,17 +3,28 @@
 [English](../README.md) | [简体中文](README.zh-CN.md) | [繁體中文](README.zh-TW.md) | [Español](README.es.md) | [Русский](README.ru.md) | [日本語](README.ja.md) | [한국어](README.ko.md)
 
 
-**El IM para agentes. Memoria compartida, OpenSpec Auto Deliver, herramientas MCP gestionadas, ejecución supervisada, colaboración humana y auditoría cruzada entre proveedores de IA.**
+**El IM para agentes. Escritorio remoto con IA, memoria compartida, OpenSpec Auto Deliver, herramientas MCP gestionadas, ejecución supervisada y auditoría cruzada.**
 
 > Two heads are better than one.<br>
 > But minds in concert don't answer fate, they author it.<br>
 > — IM.codes
 
-IM.codes ofrece a los coding agents una capa de memoria compartida entre proveedores y una superficie MCP gestionada. Convierte el trabajo completado en contexto reutilizable y vuelve a inyectar o recuperar el historial adecuado en sesiones futuras. Funciona con [Claude Code](https://github.com/anthropics/claude-code), [Codex](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), GitHub Copilot, Cursor, OpenCode, [OpenClaw](https://openclaw.com) y [Qwen](https://github.com/QwenLM/qwen-agent), además de terminal, archivos, vistas Git, localhost preview, notificaciones, flujos multiagente y streaming nativo para agentes transport. OpenSpec Auto Deliver puede llevar un cambio desde auditoría de propuesta/spec hasta implementación, sugerencias de validación, auditoría/retrabajo Team, scoring automático por módulo y quality gates finales. El uso compartido de sesión también permite programación colaborativa pair o multi-persona alrededor de sesiones agent en vivo. Auto supervision integrado puede juzgar los turnos completados, seguir trabajando de forma autónoma y, si quieres, ejecutar un bucle de auditoría y retrabajo antes de devolverte el control. La discusión Team integrada permite que varios modelos revisen y auditen los planes y las implementaciones de los demás, reduciendo de forma eficaz las omisiones, puntos ciegos y sesgos de un solo modelo.
+IM.codes conecta a los agentes de IA no solo con sesiones de código, sino también con los ordenadores donde se realiza el trabajo. Registra máquinas compatibles como **nodos controlados** restringidos y permite que un agente autorizado opere directamente uno o varios equipos mediante comandos con alcance, transferencia de archivos y Computer Use tipado. Cuando una persona necesita ver o tomar el control, los nodos Windows compatibles también ofrecen escritorio remoto desde el navegador o el móvil.
+
+Además del control de máquinas, IM.codes ofrece a los coding agents una memoria compartida entre proveedores y una superficie MCP gestionada. Convierte el trabajo completado en contexto reutilizable para [Claude Code](https://github.com/anthropics/claude-code), [Codex](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), GitHub Copilot, Cursor, OpenCode, [OpenClaw](https://openclaw.com), [Qwen](https://github.com/QwenLM/qwen-agent) y más. Terminal, archivos y Git, localhost preview, notificaciones, flujos multiagente, OpenSpec Auto Deliver, Auto supervision y auditoría Team mantienen visible y conectado el trabajo de personas y agentes.
 
 > **Nota:** Este archivo es una traducción. **El README en inglés (`../README.md`) es la versión canónica.** Si hay alguna diferencia, prevalece la versión en inglés.
 
 Varios agentes admiten dos modos de integración: CLI y SDK.
+
+## Nodos controlados: escritorio remoto con IA
+
+Convierte ordenadores compatibles en nodos operados por IA sin configurar cada máquina como un source server completo de IM.codes.
+
+- **Una IA, varios ordenadores.** Registra varias máquinas y deja que un agente —o un equipo de agentes— las opere directamente para realizar el trabajo.
+- **Acciones reales en el ordenador.** Ejecuta comandos con alcance, mueve archivos individuales y controla aplicaciones mediante herramientas Computer Use tipadas.
+- **Escritorio remoto para intervención humana.** Abre un nodo Windows compatible desde el navegador o el móvil para ver la pantalla o tomar el control.
+- **Acceso limitado y revocable.** Cada nodo usa credenciales independientes, queda fuera de las listas normales de server/session y su propietario puede desactivar o revocar la ejecución.
 
 ## Capturas
 
@@ -130,13 +141,13 @@ Guarda fragmentos de texto reutilizables vinculados al propietario y búscalos e
 
 ### Nodos controlados
 
-Registra otra máquina como nodo controlado restringido sin convertirla en un source server completo de IM.codes. Escribe `^` para autocompletar el destino o inserta `^^(name)`; los agentes autorizados podrán ejecutar comandos remotos con alcance, transferir archivos individuales o invocar herramientas Computer Use tipadas en ese nodo. El propietario habilita y puede revocar la ejecución, los nodos controlados no aparecen en las listas normales de server/session y cada máquina usa credenciales independientes. El enlace de descarga caduca, pero un instalador recién descargado puede conservarse y reutilizarse para registrar varias máquinas.
+Registra uno o varios ordenadores, escribe `^` para elegir un destino (o inserta `^^(name)`) y permite que los agentes autorizados trabajen en la máquina seleccionada. Pueden ejecutar comandos con alcance, transferir archivos individuales y usar herramientas Computer Use tipadas, lo que permite operar y coordinar una flota desde la misma conversación. La ejecución sigue bajo control del propietario y puede revocarse; cada nodo usa credenciales independientes y queda fuera de las listas normales de server/session. Los enlaces de descarga caducan, pero el instalador descargado puede conservarse y reutilizarse.
 
 ### Control de escritorio remoto
 
-Los nodos controlados compatibles ofrecen un escritorio remoto H.264 continuo a los Owners y Participants autorizados. El navegador y el worker nativo negocian primero una ruta WebRTC directa y solo usan TURN como respaldo; el vídeo y los datos de ratón/teclado nunca pasan por el servidor de la aplicación. El modo de control es el predeterminado, se permiten varios controladores autorizados y cada espectador puede cambiar por su cuenta al modo de solo vista. Las pestañas de pantalla ofrecen un menú contextual (clic derecho o pulsación larga) para 720p, 1080p, 1440p y 4K; en móvil hay navegación con pellizco/arrastre y un modo de ratón virtual con desplazamiento por bordes, botones izquierdo/central/derecho y rueda.
+Los nodos Windows compatibles ofrecen escritorio remoto en el navegador a Owners y Participants autorizados. Permite alternar entre control y solo vista, cambiar pantalla y resolución, y colaborar con varios espectadores o controladores autorizados. En móvil, la navegación táctil y el ratón virtual permiten manejar el escritorio desde un teléfono o una tableta.
 
-En Windows se usa un worker firmado y precompilado: los nodos controlados no instalan compiladores ni dependencias multimedia. **Hoy disponible en Windows; macOS y Linux muy pronto.**
+El escritorio remoto selecciona automáticamente la conexión disponible y el acceso puede revocarse en cualquier momento. **Actualmente está disponible en Windows; los nodos macOS y Linux conservan las demás capacidades, con soporte de escritorio remoto previsto.**
 
 ### Computer Use y automatización del navegador
 

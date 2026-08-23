@@ -9,6 +9,7 @@ import {
   failDownloadTransfer,
   getDownloadTransfers,
   reportDownloadTransferProgress,
+  setDownloadTransferSave,
   setDownloadTransferRetry,
   updateDownloadTransfer,
 } from '../../src/download-transfer-store.js';
@@ -83,5 +84,31 @@ describe('DownloadTransferCenter', () => {
     await vi.waitFor(() => expect(retry).toHaveBeenCalledOnce());
     expect(getDownloadTransfers()[0]?.status).toBe(DOWNLOAD_TRANSFER_STATUS.COMPLETED);
     expect(screen.getByText('downloads.status.completed')).toBeTruthy();
+  });
+
+  it('offers a fresh user gesture when downloaded mobile bytes are waiting to be saved', async () => {
+    const transfer = beginDownloadTransfer('mobile.docx');
+    const save = vi.fn().mockResolvedValue(undefined);
+    setDownloadTransferSave(transfer.id, save);
+    render(<DownloadTransferCenter />);
+
+    expect(screen.getByText('downloads.status.ready_to_save')).toBeTruthy();
+    fireEvent.click(screen.getByText('downloads.save_share'));
+
+    await vi.waitFor(() => expect(save).toHaveBeenCalledOnce());
+    expect(getDownloadTransfers()[0]?.status).toBe(DOWNLOAD_TRANSFER_STATUS.COMPLETED);
+  });
+
+  it('keeps the save/share action visible when the user dismisses the system sheet', async () => {
+    const transfer = beginDownloadTransfer('mobile.docx');
+    const save = vi.fn().mockRejectedValue(new DOMException('dismissed', 'AbortError'));
+    setDownloadTransferSave(transfer.id, save);
+    render(<DownloadTransferCenter />);
+
+    fireEvent.click(screen.getByText('downloads.save_share'));
+
+    await vi.waitFor(() => expect(save).toHaveBeenCalledOnce());
+    expect(getDownloadTransfers()[0]?.status).toBe(DOWNLOAD_TRANSFER_STATUS.READY_TO_SAVE);
+    expect(screen.getByText('downloads.save_share')).toBeTruthy();
   });
 });

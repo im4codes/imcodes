@@ -8409,6 +8409,45 @@ afterEach(() => {
     expect(screen.getByRole('button', { name: /^deepseek-reasoner$/i })).toBeDefined();
   });
 
+  it('loads and switches Pi models inside the active third-party provider preset', async () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({
+          name: 'pi-minimax-session',
+          agentType: 'pi',
+          runtimeType: 'transport',
+          ccPreset: 'minimax',
+          requestedModel: 'MiniMax-M2.7',
+          activeModel: 'MiniMax-M2.7',
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    const request = await waitFor(() => {
+      const found = ws.send.mock.calls
+        .map((call) => call[0])
+        .find((message) => message?.type === 'transport.list_models' && message?.agentType === 'pi');
+      expect(found).toMatchObject({ ccPreset: 'minimax' });
+      return found;
+    });
+    act(() => ws.emit({
+      type: 'transport.models_response',
+      agentType: 'pi',
+      ccPreset: 'minimax',
+      requestId: request.requestId,
+      models: [{ id: 'MiniMax-M2.7' }, { id: 'MiniMax-M3' }],
+      defaultModel: 'MiniMax-M2.7',
+    }));
+
+    fireEvent.click(screen.getByRole('button', { name: /^MiniMax-M2\.7$/i }));
+    const menu = document.querySelector('.menu-dropdown') as HTMLElement;
+    fireEvent.click(within(menu).getByRole('button', { name: /MiniMax-M3/i }));
+    expectSendPayload(ws, { sessionName: 'pi-minimax-session', text: '/model MiniMax-M3' });
+  });
+
   it('shows only dynamically discovered grok-sdk models and sends /model', async () => {
     const ws = makeWs();
     render(

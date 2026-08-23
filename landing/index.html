@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>IM.codes — The IM for agents. Shared memory, OpenSpec Auto Deliver, collaborative coding, managed MCP tools, and cross-agent audit.</title>
-<meta name="description" content="The IM for agents. Shared memory, OpenSpec Auto Deliver with automatic module scoring, collaborative coding, managed MCP tools, supervised execution, and cross-agent audit — recall solved work, message sibling agents, schedule cron sends, supervise task completion, and run audit/rework loops across Claude Code, Codex, Gemini, GitHub Copilot, Cursor, OpenCode, Qwen, and OpenClaw.">
+<title>IM.codes — AI remote desktop and the IM for agents.</title>
+<meta name="description" content="Connect AI agents to multiple computers with scoped commands, file transfer, Computer Use, and human remote desktop takeover. IM.codes also provides shared memory, OpenSpec Auto Deliver, managed MCP tools, supervised execution, and cross-agent audit across AI providers.">
 <style>
 :root {
   --bg: #0a0a0a;
@@ -230,7 +230,7 @@ footer {
 <header>
   <div class="header-left">
     <h1>IM<span>.</span>codes</h1>
-    <div class="tagline" data-i18n="tagline">The IM for agents. Shared memory, OpenSpec Auto Deliver, collaborative coding, managed MCP tools, and cross-agent audit.</div>
+    <div class="tagline" data-i18n="tagline">The IM for agents. AI remote desktop, shared memory, managed MCP tools, and cross-agent audit.</div>
   </div>
   <div class="lang-switch">
     <button onclick="setLang('en')" data-lang="en" class="active">EN</button>
@@ -249,13 +249,24 @@ footer {
     <span data-i18n="couplet_l2">But minds in concert don't answer fate, they author it.</span><br>
     <cite>— IM.codes</cite>
   </blockquote>
-  <p class="lead" data-i18n="hero_intro">IM.codes gives coding agents one shared memory layer and one managed MCP tool surface across providers. It turns completed work into reusable context, then injects or recalls the right history in future sessions across Claude Code, Codex, Gemini, GitHub Copilot, Cursor, OpenCode, Qwen, OpenClaw, and more. OpenSpec Auto Deliver can drive a change from proposal/spec audit through implementation, validation hints, Team audit/rework, automatic module scoring, and final quality gates. Session sharing also supports pair or multi-person collaborative coding around live agent sessions. Built-in Auto supervision can judge completed turns, continue work autonomously, and optionally run an audit/rework loop before handing control back. Team discussion lets multiple models review and audit each other's plans and implementations — an effective way to reduce single-model misses, blind spots, and biases.</p>
+  <p class="lead" data-i18n="hero_intro">IM.codes connects AI agents to coding sessions and to the computers where work happens. Enroll restricted Controlled Nodes so one agent—or a team—can directly operate multiple machines through scoped commands, file transfer, and Computer Use. When a person needs to see or take over, supported Windows nodes provide remote desktop from a browser or phone. Shared memory, OpenSpec Auto Deliver, managed MCP tools, supervision, and Team audit keep the whole workflow connected.</p>
   <div class="prompt">imcodes bind https://app.im.codes/bind/&lt;key&gt;<span class="cursor"></span></div>
   <div class="output" data-i18n="hero_output">bound to app.im.codes &middot; daemon started &middot; registered as system service</div>
 </section>
 
 <section class="warning" data-i18n="self_host_warning">
   <strong>Self-hosting is strongly recommended.</strong> <code>app.im.codes</code> is a shared test instance with no uptime guarantees — it may be rate-limited, targeted, or unavailable. This is a personal project with no commercial support. For anything beyond evaluation, deploy on your own infrastructure.
+</section>
+
+<section class="spotlight">
+  <h2 data-i18n="h_nodes">controlled nodes · AI remote desktop</h2>
+  <p style="color:var(--fg); margin-bottom:12px;" data-i18n="nodes_intro">Turn supported computers into AI-operated nodes without making every machine a full IM.codes source server.</p>
+  <ul class="reqs">
+    <li data-i18n="nodes_1">One AI—or a team of agents—can directly operate multiple enrolled computers to get work done.</li>
+    <li data-i18n="nodes_2">Run scoped commands, transfer individual files, and control desktop apps through typed Computer Use.</li>
+    <li data-i18n="nodes_3">Open supported Windows nodes from a browser or phone for human viewing and remote control.</li>
+    <li data-i18n="nodes_4">Independent credentials and owner-controlled execution keep every node scoped and revocable.</li>
+  </ul>
 </section>
 
 <section>
@@ -376,9 +387,9 @@ footer {
     <div class="feat"><div class="feat-name" data-i18n="f_memory_name">shared agent context</div><div class="feat-desc" data-i18n="f_memory_desc">problem→solution memory, multilingual recall, automatic per-message and startup injection with visible timeline cards</div></div>
     <div class="feat"><div class="feat-name" data-i18n="f_mcp_name">managed MCP tools</div><div class="feat-desc" data-i18n="f_mcp_desc">ten runtime-scoped tools for memory search/sources, preferences, scoped Send, and Cron scheduling</div></div>
     <div class="feat"><div class="feat-name" data-i18n="f_alias_name">private aliases</div><div class="feat-desc" data-i18n="f_alias_desc">reuse owner-scoped text through visible ;;(name) markers with out-of-band value delivery</div></div>
-    <div class="feat"><div class="feat-name" data-i18n="f_node_name">controlled nodes</div><div class="feat-desc" data-i18n="f_node_desc">enroll restricted machines for scoped remote commands, file transfer, and typed Computer Use via ^^(name)</div></div>
+    <div class="feat"><div class="feat-name" data-i18n="f_node_name">AI remote desktop</div><div class="feat-desc" data-i18n="f_node_desc">use ^^(name) to directly operate multiple controlled computers with scoped commands, files, and Computer Use</div></div>
     <div class="feat"><div class="feat-name" data-i18n="f_computer_name">Computer Use + browser automation</div><div class="feat-desc" data-i18n="f_computer_desc">integrated <a href="https://github.com/iFurySt/open-codex-computer-use">Open Computer Use</a> desktop control (Leo, MIT) plus IM.codes' own CDP browser tools with optional screenshots and local script access</div></div>
-    <div class="feat"><div class="feat-name" data-i18n="f_rdp_name">remote desktop control</div><div class="feat-desc" data-i18n="f_rdp_desc">watch and control an enrolled machine's screen from a browser or phone over H.264, negotiated peer-to-peer with TURN only as fallback — Windows today, macOS and Linux supported soon</div></div>
+    <div class="feat"><div class="feat-name" data-i18n="f_rdp_name">remote desktop control</div><div class="feat-desc" data-i18n="f_rdp_desc">view or control a supported Windows node from a browser or phone, with touch navigation and revocable access</div></div>
     <div class="feat"><div class="feat-name" data-i18n="f_autodeliver_name">OpenSpec Auto Deliver</div><div class="feat-desc" data-i18n="f_autodeliver_desc">proposal/spec audit → implementation → Team audit/rework, with automatic module scoring for spec/tasks/implementation/tests/risk</div></div>
     <div class="feat"><div class="feat-name" data-i18n="f_collab_name">collaborative coding</div><div class="feat-desc" data-i18n="f_collab_desc">scoped sharing for pair or small-group agent programming</div></div>
     <div class="feat"><div class="feat-name" data-i18n="f_auto_name">supervised execution</div><div class="feat-desc" data-i18n="f_auto_desc">turn-level completion checks, auto-continue, and optional audit→rework loops for transport-backed agents</div></div>
@@ -546,8 +557,14 @@ docker compose up -d</div>
 const I18N = {
   en: {
     watch_intro: 'Watch support covers quick session monitoring, unread counts, OTA update visibility, push notifications, and quick replies from the wrist.',
-    tagline: 'The IM for agents. Shared memory, OpenSpec Auto Deliver, collaborative coding, managed MCP tools, and cross-agent audit.',
-    hero_intro: "IM.codes gives coding agents one shared memory layer and one managed MCP tool surface across providers. It turns completed work into reusable context, then injects or recalls the right history in future sessions across Claude Code, Codex, Gemini, GitHub Copilot, Cursor, OpenCode, Qwen, OpenClaw, and more. OpenSpec Auto Deliver can drive a change from proposal/spec audit through implementation, validation hints, Team audit/rework, automatic module scoring, and final quality gates. Session sharing also supports pair or multi-person collaborative coding around live agent sessions. Built-in Auto supervision can judge completed turns, continue work autonomously, and optionally run an audit/rework loop before handing control back. Team discussion lets multiple models review and audit each other's plans and implementations — an effective way to reduce single-model misses, blind spots, and biases.",
+    tagline: 'The IM for agents. AI remote desktop, shared memory, managed MCP tools, and cross-agent audit.',
+    hero_intro: 'IM.codes connects AI agents to coding sessions and to the computers where work happens. Enroll restricted Controlled Nodes so one agent—or a team—can directly operate multiple machines through scoped commands, file transfer, and Computer Use. When a person needs to see or take over, supported Windows nodes provide remote desktop from a browser or phone. Shared memory, OpenSpec Auto Deliver, managed MCP tools, supervision, and Team audit keep the whole workflow connected.',
+    h_nodes: 'controlled nodes · AI remote desktop',
+    nodes_intro: 'Turn supported computers into AI-operated nodes without making every machine a full IM.codes source server.',
+    nodes_1: 'One AI—or a team of agents—can directly operate multiple enrolled computers to get work done.',
+    nodes_2: 'Run scoped commands, transfer individual files, and control desktop apps through typed Computer Use.',
+    nodes_3: 'Open supported Windows nodes from a browser or phone for human viewing and remote control.',
+    nodes_4: 'Independent credentials and owner-controlled execution keep every node scoped and revocable.',
     watch_badge: 'iPhone · iPad · Apple Watch',
     watch_download: 'Watch app includes session list, unread counts, and quick replies.',
     agents_intro: 'Multiple agents support both CLI and SDK integrations.',
@@ -589,11 +606,11 @@ const I18N = {
     f_mcp_desc: 'ten runtime-scoped tools for memory search/sources, preferences, scoped Send, and Cron scheduling',
     f_alias_name: 'private aliases',
     f_alias_desc: 'reuse owner-scoped text through visible ;;(name) markers with out-of-band value delivery',
-    f_node_name: 'controlled nodes',
-    f_node_desc: 'enroll restricted machines for scoped remote commands, file transfer, and typed Computer Use via ^^(name)',
+    f_node_name: 'AI remote desktop',
+    f_node_desc: 'use ^^(name) to directly operate multiple controlled computers with scoped commands, files, and Computer Use',
     f_computer_name: 'Computer Use + browser automation',
     f_computer_desc: 'integrated <a href="https://github.com/iFurySt/open-codex-computer-use">Open Computer Use</a> desktop control (Leo, MIT) plus IM.codes\' own CDP browser tools with optional screenshots and local script access',
-    f_rdp_name: 'remote desktop control', f_rdp_desc: "watch and control an enrolled machine's screen from a browser or phone over H.264, negotiated peer-to-peer with TURN only as fallback — Windows today, macOS and Linux supported soon",
+    f_rdp_name: 'remote desktop control', f_rdp_desc: 'view or control a supported Windows node from a browser or phone, with touch navigation and revocable access',
     f_collab_name: 'collaborative coding',
     f_collab_desc: 'scoped sharing for pair or small-group agent programming',
     f_autodeliver_name: 'OpenSpec Auto Deliver',
@@ -611,13 +628,19 @@ const I18N = {
     sh_manual_pgvector: 'Generated docker-compose.yml uses pgvector/pgvector:pg18 for PostgreSQL.',
   },
   'zh-CN': {
-    tagline: '给 AI agent 的 IM。共享记忆、OpenSpec 自动交付、协作编程、托管 MCP 工具，以及跨模型审计。',
-    hero_intro: 'IM.codes 为 coding agent 提供一套跨 provider 共享的记忆层，以及一套托管 MCP 工具面。它会把已完成的工作沉淀成可复用上下文，再在后续 session 中注入或召回合适的历史，贯通 Claude Code、Codex、Gemini、GitHub Copilot、Cursor、OpenCode、Qwen、OpenClaw 等。OpenSpec 自动交付可以把一个变更从提案/规格审计一路推进到实现、验证建议、团队审计/返工、自动模块打分和最终质量门控。会话共享也支持围绕实时 agent session 的双人或多人协作编程。内置 Auto supervision 可在每轮完成后判断任务是否完成、是否继续自动执行，并可选进入审计/返工闭环后再把控制权交还给你。团队讨论功能让多个模型相互审阅对方的方案和实现——能有效减少单模型的遗漏、盲点和偏差。',
+    tagline: '给 AI agent 的 IM。AI 远程桌面、共享记忆、托管 MCP 工具，以及跨模型审计。',
+    hero_intro: 'IM.codes 把 AI agent 同时连接到 coding session 和真正执行工作的电脑。注册受限的被控节点后，一个 AI 或一组 AI 就能通过有作用域的命令、文件传输和 Computer Use 直接操作多台电脑；需要人工查看或接管时，支持的 Windows 节点可直接从浏览器或手机打开远程桌面。共享记忆、OpenSpec 自动交付、托管 MCP 工具、监督执行和 Team 审计让整个工作流保持衔接。',
     couplet_l1: '三个臭皮匠，顶个诸葛亮。',
     couplet_l2: '三个诸葛亮，谈笑定阴阳。',
     hero_output: '已绑定 app.im.codes · 守护进程已启动 · 已注册为系统服务',
     self_host_warning: '<strong>强烈建议自行部署。</strong><code>app.im.codes</code> 是共享测试实例，无可用性保证，可能被限流、攻击或不可用。这是个人项目，不提供商用保障。正式使用请部署到自己的服务器。',
     h_screenshots: '截图', h_why: '为什么', h_memory: '共享代理上下文', h_mcp: '托管 MCP 工具', h_not: '它不是什么', h_features: '功能', h_arch: '架构', h_download: '下载', h_install: '安装', h_quick: '快速开始', h_selfhost: '自托管部署', h_agents: '支持的代理', h_reqs: '系统要求', h_about: '关于',
+    h_nodes: '被控节点 · AI 远程桌面',
+    nodes_intro: '无需把每台电脑都配置成完整的 IM.codes source server，就能把支持的机器接入为 AI 可操作的被控节点。',
+    nodes_1: '一个 AI 或一组 agent 可以直接操作多台已注册电脑完成工作。',
+    nodes_2: '运行有作用域的命令、传输单个文件，并通过类型化 Computer Use 操作桌面应用。',
+    nodes_3: '从浏览器或手机打开支持的 Windows 节点，让人工查看画面或直接远程控制。',
+    nodes_4: '独立凭证和所有者控制的执行权限，让每台节点都可限制、可撤销。',
     also_web: '也可作为 <a href="https://app.im.codes">网页版</a> 使用', watch_intro: 'Watch 支持可在手腕上快速查看会话、未读数、OTA 更新状态、推送通知和快捷回复。', watch_badge: 'iPhone · iPad · Apple Watch', watch_download: 'Watch App 提供会话列表、未读计数和快捷回复。',
     agents_intro: '支持多个 agent 通过 CLI 和 SDK 两种方式接入。',
     memory_intro: 'IM.codes 会把已完成的工作持续沉淀成可搜索的记忆——保存的是结构化的问题→解决方案摘要，而不是原始 prompt 日志。相关历史会在新消息和会话启动时自动召回，并且每次注入都会在时间线里可见。',
@@ -656,11 +679,11 @@ const I18N = {
     f_mcp_desc: '十个运行时作用域工具：记忆搜索/来源、偏好、Scoped Send 和 Cron 调度',
     f_alias_name: '私有别名',
     f_alias_desc: '通过可见的 ;;(name) 标记复用当前用户的文本，并在带外交付真实值',
-    f_node_name: '受控节点',
-    f_node_desc: '用 ^^(name) 注册受限机器，执行有作用域的远程命令、文件传输和类型化 Computer Use',
+    f_node_name: 'AI 远程桌面',
+    f_node_desc: '用 ^^(name) 直接操作多台被控电脑，执行有作用域的命令、文件传输和 Computer Use',
     f_computer_name: 'Computer Use 与浏览器自动化',
     f_computer_desc: '集成 <a href="https://github.com/iFurySt/open-codex-computer-use">Open Computer Use</a> 的桌面控制能力（Leo，MIT），并提供 IM.codes 自己实现的 CDP 浏览器工具、可选截图与本机脚本接入',
-    f_rdp_name: '远程桌面控制', f_rdp_desc: '在浏览器或手机上观看并操作已注册机器的屏幕，H.264 编码、优先点对点直连、TURN 仅作兜底——现支持 Windows，macOS 与 Linux 即将支持',
+    f_rdp_name: '远程桌面控制', f_rdp_desc: '从浏览器或手机查看、操作支持的 Windows 节点，支持触控导航，权限可随时撤销',
     f_collab_name: '协作编程',
     f_collab_desc: '有作用域地分享标签页/子会话/source server，支持双人或小团队 agent 编程',
     f_autodeliver_name: 'OpenSpec 自动交付',
@@ -719,13 +742,19 @@ const I18N = {
     disclaimer: 'IM.codes 是一个独立的开源项目，与 Anthropic、OpenAI、Google、阿里巴巴、OpenClaw 或任何其他被提及的公司无任何关联、认可或赞助关系。所有产品名称和商标均为其各自所有者的财产。',
   },
   'zh-TW': {
-    tagline: '給 AI agent 的 IM。共享記憶、OpenSpec 自動交付、協作編程、託管 MCP 工具，以及跨模型審計。',
-    hero_intro: 'IM.codes 為 coding agent 提供一套跨 provider 共享的記憶層，以及一套託管 MCP 工具面。它會把已完成的工作沉澱成可重用上下文，再在後續 session 中注入或召回合適的歷史，貫通 Claude Code、Codex、Gemini、GitHub Copilot、Cursor、OpenCode、Qwen、OpenClaw 等。OpenSpec 自動交付可以把一個變更從提案/規格審計一路推進到實作、驗證建議、團隊審計/返工、自動模組打分和最終品質門控。Session 分享也支援圍繞即時 agent session 的雙人或多人協作編程。內建 Auto supervision 可在每輪完成後判斷任務是否完成、是否繼續自動執行，並可選進入審計/返工閉環後再把控制權交還給你。團隊討論功能讓多個模型互相審閱對方的方案和實作——能有效減少單模型的遺漏、盲點和偏差。',
+    tagline: '給 AI agent 的 IM。AI 遠端桌面、共享記憶、託管 MCP 工具，以及跨模型審計。',
+    hero_intro: 'IM.codes 把 AI agent 同時連接到 coding session 與真正執行工作的電腦。註冊受限的受控節點後，一個 AI 或一組 AI 就能透過有作用域的命令、檔案傳輸與 Computer Use 直接操作多台電腦；需要人工查看或接管時，支援的 Windows 節點可直接從瀏覽器或手機開啟遠端桌面。共享記憶、OpenSpec 自動交付、託管 MCP 工具、監督執行與 Team 審計讓整個工作流保持銜接。',
     couplet_l1: '三個臭皮匠，頂個諸葛亮。',
     couplet_l2: '三個諸葛亮，談笑定陰陽。',
     hero_output: '已綁定 app.im.codes · 守護程序已啟動 · 已註冊為系統服務',
     self_host_warning: '<strong>強烈建議自行部署。</strong><code>app.im.codes</code> 是共享測試實例，無可用性保證，可能被限流、攻擊或不可用。這是個人專案，不提供商用保障。正式使用請部署到自己的伺服器。',
     h_screenshots: '截圖', h_why: '為什麼', h_memory: '共享代理上下文', h_mcp: '託管 MCP 工具', h_not: '它不是什麼', h_features: '功能', h_arch: '架構', h_download: '下載', h_install: '安裝', h_quick: '快速開始', h_selfhost: '自託管部署', h_agents: '支援的代理', h_reqs: '系統需求', h_about: '關於',
+    h_nodes: '受控節點 · AI 遠端桌面',
+    nodes_intro: '不必把每台電腦都設成完整的 IM.codes source server，就能把支援的機器接入為 AI 可操作的受控節點。',
+    nodes_1: '一個 AI 或一組 agent 可直接操作多台已註冊電腦完成工作。',
+    nodes_2: '執行有作用域的命令、傳輸單一檔案，並透過型別化 Computer Use 操作桌面應用程式。',
+    nodes_3: '從瀏覽器或手機開啟支援的 Windows 節點，讓人工查看畫面或直接遠端控制。',
+    nodes_4: '獨立憑證和擁有者控制的執行權限，讓每台節點都可限制、可撤銷。',
     also_web: '也可作為 <a href="https://app.im.codes">網頁版</a> 使用', watch_intro: 'Watch 支援可在手腕上快速查看會話、未讀數、OTA 更新狀態、推送通知和快捷回覆。', watch_badge: 'iPhone · iPad · Apple Watch', watch_download: 'Watch App 提供會話列表、未讀計數和快捷回覆。',
     agents_intro: '支援多個 agent 透過 CLI 和 SDK 兩種方式接入。',
     memory_intro: 'IM.codes 會把已完成的工作持續沉澱成可搜尋的記憶——保存的是結構化的問題→解決方案摘要，而不是原始 prompt 日誌。相關歷史會在新訊息和工作階段啟動時自動召回，而且每次注入都會在時間線中可見。',
@@ -764,11 +793,11 @@ const I18N = {
     f_mcp_desc: '十個執行時作用域工具：記憶搜尋/來源、偏好、Scoped Send 和 Cron 調度',
     f_alias_name: '私有別名',
     f_alias_desc: '透過可見的 ;;(name) 標記重用目前使用者的文字，並在帶外交付實際值',
-    f_node_name: '受控節點',
-    f_node_desc: '用 ^^(name) 註冊受限機器，執行有作用域的遠端命令、檔案傳輸與型別化 Computer Use',
+    f_node_name: 'AI 遠端桌面',
+    f_node_desc: '用 ^^(name) 直接操作多台受控電腦，執行有作用域的命令、檔案傳輸與 Computer Use',
     f_computer_name: 'Computer Use 與瀏覽器自動化',
     f_computer_desc: '整合 <a href="https://github.com/iFurySt/open-codex-computer-use">Open Computer Use</a> 的桌面控制能力（Leo，MIT），並提供 IM.codes 自行實作的 CDP 瀏覽器工具、選用螢幕截圖與本機指令碼接入',
-    f_rdp_name: '遠端桌面控制', f_rdp_desc: '在瀏覽器或手機上觀看並操作已註冊機器的畫面，H.264 編碼、優先點對點直連、TURN 僅作備援——現支援 Windows，macOS 與 Linux 即將支援',
+    f_rdp_name: '遠端桌面控制', f_rdp_desc: '從瀏覽器或手機查看、操作支援的 Windows 節點，支援觸控導覽，權限可隨時撤銷',
     f_collab_name: '協作編程',
     f_collab_desc: '有作用域地分享標籤頁/子 session/source server，支援雙人或小團隊 agent 編程',
     f_autodeliver_name: 'OpenSpec 自動交付',
@@ -827,14 +856,20 @@ const I18N = {
     disclaimer: 'IM.codes 是一個獨立的開源專案，與 Anthropic、OpenAI、Google、阿里巴巴、OpenClaw 或任何其他被提及的公司無任何關聯、認可或贊助關係。所有產品名稱和商標均為其各自擁有者的財產。',
   },
   ja: {
-    tagline: 'エージェントのための IM。共有メモリ、OpenSpec Auto Deliver、協調プログラミング、managed MCP tools、そしてクロスモデル監査。',
-    hero_intro: 'IM.codes は coding agent のための、プロバイダーをまたぐ共有メモリレイヤーと管理対象 MCP tool surface です。完了した作業を再利用可能なコンテキストとして蓄積し、適切な履歴を後続 session に注入または recall します。Claude Code、Codex、Gemini、GitHub Copilot、Cursor、OpenCode、Qwen、OpenClaw などに対応し、ターミナル、ファイル閲覧、Git 変更、localhost プレビュー、通知、マルチエージェント連携、transport 系 agent のネイティブストリーミングも備えています。OpenSpec Auto Deliver は変更を proposal/spec 監査から実装、検証ヒント、Team 監査/手戻り、自動モジュール採点、最終 quality gate まで進められます。セッション共有も live agent session を中心に pair / multi-person 協調プログラミングを支えます。内蔵の Auto supervision は完了済みターンを判定し、自律的な継続や監査/手戻りループまで行ったうえで制御を返せます。Team ディスカッションにより、複数のモデルが互いの計画と実装をレビュー・監査し合い、単一モデルの見落とし・盲点・バイアスを効果的に減らします。',
+    tagline: 'エージェントのための IM。AI リモートデスクトップ、共有メモリ、managed MCP tools、クロスモデル監査。',
+    hero_intro: 'IM.codes は AI agent を coding session と実際に作業するコンピューターの両方に接続します。制限付きの制御対象ノードを登録すると、1 つの AI または agent チームが scoped command、ファイル転送、Computer Use で複数マシンを直接操作できます。人が確認や引き継ぎを行うときは、対応する Windows ノードをブラウザやスマートフォンからリモート操作できます。共有メモリ、OpenSpec Auto Deliver、managed MCP tools、監督実行、Team 監査がワークフロー全体をつなぎます。',
     // TODO(native-review): JA hero couplet — 默认「天下」(可换「乾坤」);「三人の孔明」措辞待母语者确认
     couplet_l1: '三人寄れば文殊の知恵。',
     couplet_l2: 'されど三人の孔明、談笑のうちに天下を定む。',
     hero_output: 'app.im.codes にバインド完了 · デーモン起動 · システムサービスとして登録',
     self_host_warning: '<strong>セルフホスティングを強く推奨します。</strong><code>app.im.codes</code> は共有テストインスタンスであり、稼働保証はありません。レート制限、攻撃対象、利用不可の可能性があります。個人プロジェクトのため商用サポートはありません。評価以外の用途では自社インフラにデプロイしてください。',
     h_screenshots: 'スクリーンショット', h_why: '背景', h_memory: '共有エージェントコンテキスト', h_mcp: 'managed MCP tools', h_not: 'これは何ではないか', h_features: '機能', h_arch: 'アーキテクチャ', h_download: 'ダウンロード', h_install: 'インストール', h_quick: 'クイックスタート', h_selfhost: 'セルフホスト', h_agents: '対応エージェント', h_reqs: '要件', h_about: '概要',
+    h_nodes: '制御対象ノード · AI リモートデスクトップ',
+    nodes_intro: '各マシンを完全な IM.codes source server にせず、対応コンピューターを AI が操作できるノードとして登録します。',
+    nodes_1: '1 つの AI または agent チームが、登録した複数コンピューターを直接操作して作業を実行できます。',
+    nodes_2: 'scoped command、個別ファイル転送、型付き Computer Use によるデスクトップアプリ操作に対応します。',
+    nodes_3: '対応する Windows ノードをブラウザやスマートフォンから開き、人が画面を確認・操作できます。',
+    nodes_4: '独立した認証情報と所有者管理の実行権限により、各ノードは限定・取り消し可能です。',
     also_web: '<a href="https://app.im.codes">ウェブ版</a>もあります',
     agents_intro: '複数のエージェントが CLI と SDK の両方に対応しています。',
     memory_intro: 'IM.codes は完了済みの作業を検索可能な記憶として蓄積します。保存されるのは生のプロンプトログではなく、構造化された問題→解決の要約です。関連履歴は新しいメッセージ送信時やセッション起動時に自動で再利用され、その注入内容はタイムラインで確認できます。',
@@ -873,11 +908,11 @@ const I18N = {
     f_mcp_desc: '10 runtime-scoped tools for memory search/sources, preferences, scoped Send, and Cron scheduling',
     f_alias_name: 'プライベートエイリアス',
     f_alias_desc: '表示可能な ;;(name) マーカーでユーザー所有テキストを再利用し、実値は帯域外で配信',
-    f_node_name: '制御対象ノード',
-    f_node_desc: '^^(name) で制限付きマシンを登録し、scoped remote command、ファイル転送、型付き Computer Use を実行',
+    f_node_name: 'AI リモートデスクトップ',
+    f_node_desc: '^^(name) で複数の制御対象 PC を直接操作し、scoped command、ファイル、Computer Use を実行',
     f_computer_name: 'Computer Use とブラウザ自動化',
     f_computer_desc: '<a href="https://github.com/iFurySt/open-codex-computer-use">Open Computer Use</a> のデスクトップ操作（Leo、MIT）を統合し、IM.codes 独自の CDP ブラウザツール、任意のスクリーンショット、ローカルスクリプト接続も提供',
-    f_rdp_name: 'リモートデスクトップ操作', f_rdp_desc: '登録済みマシンの画面をブラウザやスマホから H.264 で表示・操作。P2P 接続を優先し TURN はフォールバックのみ — 現在は Windows、macOS と Linux は近日対応',
+    f_rdp_name: 'リモートデスクトップ操作', f_rdp_desc: '対応する Windows ノードをブラウザやスマートフォンから表示・操作。タッチ操作に対応し、権限はいつでも取り消し可能',
     f_collab_name: '協調プログラミング',
     f_collab_desc: 'tab/sub-session/source server を scoped に共有し、pair または small-team agent programming を支援',
     f_autodeliver_name: 'OpenSpec Auto Deliver',
@@ -936,14 +971,20 @@ const I18N = {
     disclaimer: 'IM.codes は独立したオープンソースプロジェクトであり、Anthropic、OpenAI、Google、Alibaba、OpenClaw、またはその他の言及された企業との提携、承認、スポンサーシップはありません。すべての製品名および商標は各所有者に帰属します。',
   },
   ko: {
-    tagline: '에이전트를 위한 IM. 공유 메모리, OpenSpec Auto Deliver, 협업 코딩, managed MCP tools, 그리고 교차 감사.',
-    hero_intro: 'IM.codes는 coding agent를 위한, provider를 가로지르는 공유 메모리 레이어이자 관리형 MCP tool surface입니다. 완료된 작업을 재사용 가능한 컨텍스트로 축적하고, 적절한 기록을 이후 session에 주입하거나 recall합니다. Claude Code, Codex, Gemini, GitHub Copilot, Cursor, OpenCode, Qwen, OpenClaw 등을 지원하며, 터미널, 파일 브라우징, Git 보기, localhost 미리보기, 알림, 멀티 에이전트 워크플로우, transport 기반 agent의 네이티브 스트리밍 출력도 함께 제공합니다. OpenSpec Auto Deliver는 변경을 proposal/spec 감사부터 구현, 검증 힌트, Team 감사/재작업, 자동 모듈 채점, 최종 quality gate까지 진행할 수 있습니다. 세션 공유도 live agent session 중심의 pair 또는 multi-person 협업 코딩을 지원합니다. 내장된 Auto supervision은 완료된 턴을 판정하고, 자동 계속과 감사/재작업 루프까지 수행한 뒤 제어를 돌려줄 수 있습니다. Team 토론 기능은 여러 모델이 서로의 계획과 구현을 리뷰하고 감사하여, 단일 모델의 누락·맹점·편향을 효과적으로 줄입니다.',
+    tagline: '에이전트를 위한 IM. AI 원격 데스크톱, 공유 메모리, managed MCP tools, 교차 모델 감사.',
+    hero_intro: 'IM.codes는 AI agent를 coding session과 실제 작업이 수행되는 컴퓨터 모두에 연결합니다. 제한된 제어 노드를 등록하면 하나의 AI 또는 agent 팀이 범위 지정 명령, 파일 전송, Computer Use로 여러 머신을 직접 조작할 수 있습니다. 사람이 확인하거나 인계받을 때는 지원되는 Windows 노드를 브라우저나 휴대폰에서 원격으로 제어할 수 있습니다. 공유 메모리, OpenSpec Auto Deliver, managed MCP tools, 감독 실행, Team 감사가 전체 워크플로우를 연결합니다.',
     // TODO(native-review): KO hero couplet — 第一句「백지장도 맞들면 낫다」承接弱,待母语者重写;默认「천하」
     couplet_l1: '백지장도 맞들면 낫다.',
     couplet_l2: '허나 세 명의 제갈량, 담소 속에 천하를 정한다.',
     hero_output: 'app.im.codes에 바인딩 완료 · 데몬 시작됨 · 시스템 서비스로 등록됨',
     self_host_warning: '<strong>셀프 호스팅을 강력히 권장합니다.</strong> <code>app.im.codes</code>는 공유 테스트 인스턴스로 가동 보장이 없으며, 속도 제한, 공격 대상이 되거나 사용 불가할 수 있습니다. 개인 프로젝트로 상업적 지원은 제공되지 않습니다. 평가 이외의 용도에는 자체 인프라에 배포하세요.',
     h_screenshots: '스크린샷', h_why: '배경', h_memory: '공유 에이전트 컨텍스트', h_mcp: 'managed MCP tools', h_not: '무엇이 아닌가', h_features: '기능', h_arch: '아키텍처', h_download: '다운로드', h_install: '설치', h_quick: '빠른 시작', h_selfhost: '셀프 호스팅', h_agents: '지원 에이전트', h_reqs: '요구사항', h_about: '소개',
+    h_nodes: '제어 노드 · AI 원격 데스크톱',
+    nodes_intro: '각 머신을 완전한 IM.codes source server로 만들지 않고 지원되는 컴퓨터를 AI가 조작할 수 있는 노드로 등록합니다.',
+    nodes_1: '하나의 AI 또는 agent 팀이 등록된 여러 컴퓨터를 직접 조작해 작업을 수행할 수 있습니다.',
+    nodes_2: '범위 지정 명령, 개별 파일 전송, 타입 지정 Computer Use를 통한 데스크톱 앱 조작을 지원합니다.',
+    nodes_3: '지원되는 Windows 노드를 브라우저나 휴대폰에서 열어 사람이 화면을 보거나 직접 제어할 수 있습니다.',
+    nodes_4: '독립 자격 증명과 소유자 관리 실행 권한으로 각 노드를 제한하고 언제든 철회할 수 있습니다.',
     also_web: '<a href="https://app.im.codes">웹 앱</a>으로도 이용 가능', watch_intro: 'Watch 지원으로 손목에서 세션 목록, 읽지 않음 수, OTA 업데이트 상태, 푸시 알림, 빠른 답장을 확인할 수 있습니다.', watch_badge: 'iPhone · iPad · Apple Watch', watch_download: 'Watch 앱은 세션 목록, 읽지 않음 수, 빠른 답장을 제공합니다.',
     agents_intro: '여러 에이전트가 CLI와 SDK 두 방식 모두를 지원합니다.',
     memory_intro: 'IM.codes는 완료된 작업을 검색 가능한 메모리로 계속 축적합니다. 저장되는 것은 원시 프롬프트 로그가 아니라 구조화된 문제→해결 요약입니다. 관련 기록은 새 메시지 전송과 세션 시작 시 자동으로 재사용되며, 어떤 내용이 주입됐는지도 타임라인에서 확인할 수 있습니다.',
@@ -982,11 +1023,11 @@ const I18N = {
     f_mcp_desc: '10 runtime-scoped tools for memory search/sources, preferences, scoped Send, and Cron scheduling',
     f_alias_name: '비공개 별칭',
     f_alias_desc: '보이는 ;;(name) 마커로 사용자 소유 텍스트를 재사용하고 실제 값은 대역 외로 전달',
-    f_node_name: '제어 노드',
-    f_node_desc: '^^(name)으로 제한된 머신을 등록해 범위 지정 원격 명령, 파일 전송, 타입 지정 Computer Use 실행',
+    f_node_name: 'AI 원격 데스크톱',
+    f_node_desc: '^^(name)으로 여러 제어 PC를 직접 조작하고 범위 지정 명령, 파일, Computer Use 실행',
     f_computer_name: 'Computer Use 및 브라우저 자동화',
     f_computer_desc: '<a href="https://github.com/iFurySt/open-codex-computer-use">Open Computer Use</a> 데스크톱 제어(Leo, MIT)를 통합하고 IM.codes 자체 CDP 브라우저 도구, 선택적 스크린샷 및 로컬 스크립트 연결을 제공',
-    f_rdp_name: '원격 데스크톱 제어', f_rdp_desc: '등록된 머신의 화면을 브라우저나 휴대폰에서 H.264로 보고 제어. P2P 연결을 우선하고 TURN은 폴백으로만 사용 — 현재 Windows 지원, macOS와 Linux는 곧 지원',
+    f_rdp_name: '원격 데스크톱 제어', f_rdp_desc: '지원되는 Windows 노드를 브라우저나 휴대폰에서 보고 제어하며 터치 탐색과 철회 가능한 권한 제공',
     f_collab_name: '협업 코딩',
     f_collab_desc: 'tab/sub-session/source server를 범위 있게 공유해 pair 또는 소규모 agent programming 지원',
     f_autodeliver_name: 'OpenSpec Auto Deliver',
@@ -1045,11 +1086,17 @@ const I18N = {
     disclaimer: 'IM.codes는 독립적인 오픈소스 프로젝트로, Anthropic, OpenAI, Google, Alibaba, OpenClaw 또는 언급된 다른 회사와 제휴, 보증 또는 후원 관계가 없습니다. 모든 제품 이름과 상표는 각 소유자의 자산입니다.',
   },
   es: {
-    tagline: 'El IM para agentes. Memoria compartida, OpenSpec Auto Deliver, programación colaborativa, herramientas MCP gestionadas y auditoría cruzada.',
-    hero_intro: 'IM.codes ofrece a los coding agents una capa de memoria compartida entre providers y una superficie MCP gestionada. Convierte el trabajo completado en contexto reutilizable y vuelve a inyectar o recuperar el historial adecuado en sesiones futuras para Claude Code, Codex, Gemini, GitHub Copilot, Cursor, OpenCode, Qwen, OpenClaw y más. OpenSpec Auto Deliver puede llevar un cambio desde auditoría de propuesta/spec hasta implementación, sugerencias de validación, auditoría/retrabajo Team, scoring automático por módulo y quality gates finales. El uso compartido de sesión también permite programación colaborativa pair o multi-persona alrededor de sesiones agent en vivo. Auto supervision integrado puede juzgar los turnos completados, seguir trabajando de forma autónoma y, si quieres, ejecutar un bucle de auditoría y retrabajo antes de devolverte el control. La discusión Team integrada permite que varios modelos revisen y auditen los planes y las implementaciones de los demás, reduciendo de forma eficaz las omisiones, puntos ciegos y sesgos de un solo modelo.',
+    tagline: 'El IM para agentes. Escritorio remoto con IA, memoria compartida, herramientas MCP gestionadas y auditoría cruzada.',
+    hero_intro: 'IM.codes conecta a los agentes de IA con las sesiones de código y con los ordenadores donde se realiza el trabajo. Registra nodos controlados restringidos para que una IA o un equipo de agentes opere directamente varias máquinas mediante comandos con alcance, archivos y Computer Use. Cuando una persona necesita revisar o tomar el control, los nodos Windows compatibles ofrecen escritorio remoto desde el navegador o el móvil. Memoria compartida, OpenSpec Auto Deliver, herramientas MCP, supervisión y auditoría Team mantienen unido todo el flujo.',
     hero_output: 'vinculado a app.im.codes · daemon iniciado · registrado como servicio del sistema',
     self_host_warning: '<strong>Se recomienda encarecidamente el autoalojamiento.</strong> <code>app.im.codes</code> es una instancia de prueba compartida sin garantías de disponibilidad — puede tener límites, ser objetivo de ataques o no estar disponible. Este es un proyecto personal sin soporte comercial. Para uso más allá de la evaluación, despliega en tu propia infraestructura.',
     h_screenshots: 'capturas', h_why: 'por qué', h_memory: 'contexto compartido para agentes', h_mcp: 'herramientas MCP gestionadas', h_not: 'qué no es', h_features: 'características', h_arch: 'arquitectura', h_download: 'descargar', h_install: 'instalar', h_quick: 'inicio rápido', h_selfhost: 'autoalojamiento', h_agents: 'agentes compatibles', h_reqs: 'requisitos', h_about: 'acerca de',
+    h_nodes: 'nodos controlados · escritorio remoto con IA',
+    nodes_intro: 'Convierte ordenadores compatibles en nodos operados por IA sin configurar cada máquina como un source server completo de IM.codes.',
+    nodes_1: 'Una IA o un equipo de agentes puede operar directamente varios ordenadores registrados para realizar el trabajo.',
+    nodes_2: 'Ejecuta comandos con alcance, transfiere archivos individuales y controla aplicaciones mediante Computer Use tipado.',
+    nodes_3: 'Abre nodos Windows compatibles desde el navegador o el móvil para que una persona vea o controle la pantalla.',
+    nodes_4: 'Las credenciales independientes y la ejecución controlada por el propietario mantienen cada nodo limitado y revocable.',
     also_web: 'También disponible como <a href="https://app.im.codes">app web</a>', watch_intro: 'La compatibilidad con Watch cubre monitoreo rápido de sesiones, contadores de no leídos, visibilidad de actualizaciones OTA, notificaciones push y respuestas rápidas desde la muñeca.', watch_badge: 'iPhone · iPad · Apple Watch', watch_download: 'La app de Watch incluye lista de sesiones, contadores de no leídos y respuestas rápidas.',
     agents_intro: 'Varios agentes admiten integración tanto por CLI como por SDK.',
     memory_intro: 'IM.codes convierte el trabajo ya resuelto en memoria reutilizable y buscable. Guarda resúmenes estructurados de problema→solución en lugar de logs crudos de prompts. El historial relevante se recupera automáticamente para nuevos mensajes y al iniciar sesiones, y cada inyección queda visible en la línea de tiempo.',
@@ -1088,11 +1135,11 @@ const I18N = {
     f_mcp_desc: 'diez herramientas con alcance de runtime para búsqueda/fuentes de memoria, preferencias, Send con alcance y programación Cron',
     f_alias_name: 'alias privados',
     f_alias_desc: 'reutiliza texto del propietario mediante marcadores visibles ;;(name) y entrega el valor fuera de banda',
-    f_node_name: 'nodos controlados',
-    f_node_desc: 'registra máquinas restringidas con ^^(name) para comandos remotos con alcance, archivos y Computer Use tipado',
+    f_node_name: 'escritorio remoto con IA',
+    f_node_desc: 'usa ^^(name) para operar directamente varios ordenadores con comandos con alcance, archivos y Computer Use',
     f_computer_name: 'Computer Use y automatización del navegador',
     f_computer_desc: 'control de escritorio integrado de <a href="https://github.com/iFurySt/open-codex-computer-use">Open Computer Use</a> (Leo, MIT), más herramientas de navegador CDP propias de IM.codes, capturas opcionales y acceso desde scripts locales',
-    f_rdp_name: 'control de escritorio remoto', f_rdp_desc: 'mira y controla la pantalla de una máquina registrada desde el navegador o el móvil por H.264, negociado punto a punto y con TURN solo como respaldo: hoy Windows, macOS y Linux muy pronto',
+    f_rdp_name: 'control de escritorio remoto', f_rdp_desc: 'mira o controla un nodo Windows compatible desde el navegador o el móvil, con navegación táctil y acceso revocable',
     f_collab_name: 'programación colaborativa',
     f_collab_desc: 'sharing con alcance de tabs/sub-sesiones/source servers para pair o small-group agent programming',
     f_autodeliver_name: 'OpenSpec Auto Deliver',
@@ -1151,11 +1198,17 @@ const I18N = {
     disclaimer: 'IM.codes es un proyecto de código abierto independiente y no está afiliado, respaldado ni patrocinado por Anthropic, OpenAI, Google, Alibaba, OpenClaw ni ninguna otra empresa mencionada. Todos los nombres de productos y marcas son propiedad de sus respectivos dueños.',
   },
   ru: {
-    tagline: 'IM для агентов. Общая память, OpenSpec Auto Deliver, совместное программирование, управляемые MCP tools и кросс-модельный аудит.',
-    hero_intro: 'IM.codes даёт coding agents единый слой памяти и управляемую поверхность MCP tools поверх разных провайдеров. Он превращает завершённую работу в переиспользуемый контекст и подмешивает или recall нужную историю в будущие session для Claude Code, Codex, Gemini, GitHub Copilot, Cursor, OpenCode, Qwen, OpenClaw и других. OpenSpec Auto Deliver может провести change от proposal/spec audit через implementation, validation hints, Team audit/rework, автоматическую оценку модулей и финальные quality gates. Session sharing также поддерживает pair или multi-person collaborative coding вокруг live agent sessions. Встроенный Auto supervision умеет оценивать завершённые ходы, продолжать работу автономно и при необходимости запускать цикл audit/rework перед возвратом контроля. Team-обсуждение — несколько моделей взаимно проверяют и аудируют планы и реализации друг друга, эффективно уменьшая пропуски, «слепые зоны» и смещения одной модели.',
+    tagline: 'IM для агентов. Удалённый рабочий стол с ИИ, общая память, управляемые MCP tools и кросс-модельный аудит.',
+    hero_intro: 'IM.codes связывает AI-агентов с coding sessions и с компьютерами, на которых выполняется работа. Зарегистрируйте ограниченные управляемые узлы, чтобы один AI или команда агентов могли напрямую работать на нескольких машинах через scoped commands, файлы и Computer Use. Когда человеку нужно проверить экран или вмешаться, совместимые Windows-узлы предоставляют удалённый рабочий стол из браузера или с телефона. Общая память, OpenSpec Auto Deliver, managed MCP tools, supervision и Team-аудит связывают весь процесс.',
     hero_output: 'привязан к app.im.codes · демон запущен · зарегистрирован как системная служба',
     self_host_warning: '<strong>Настоятельно рекомендуется самостоятельный хостинг.</strong> <code>app.im.codes</code> — общий тестовый экземпляр без гарантий доступности. Может быть ограничен, атакован или недоступен. Это личный проект без коммерческой поддержки. Для использования помимо тестирования разверните на собственной инфраструктуре.',
     h_screenshots: 'скриншоты', h_why: 'зачем', h_memory: 'общий контекст агентов', h_mcp: 'управляемые MCP tools', h_not: 'чем это не является', h_features: 'возможности', h_arch: 'архитектура', h_download: 'скачать', h_install: 'установка', h_quick: 'быстрый старт', h_selfhost: 'свой сервер', h_agents: 'поддерживаемые агенты', h_reqs: 'требования', h_about: 'о проекте',
+    h_nodes: 'управляемые узлы · удалённый рабочий стол с ИИ',
+    nodes_intro: 'Превратите поддерживаемые компьютеры в AI-узлы, не настраивая каждую машину как полноценный IM.codes source server.',
+    nodes_1: 'Один AI или команда агентов может напрямую управлять несколькими зарегистрированными компьютерами для выполнения работы.',
+    nodes_2: 'Выполняйте scoped commands, передавайте отдельные файлы и управляйте desktop-приложениями через типизированный Computer Use.',
+    nodes_3: 'Открывайте совместимые Windows-узлы в браузере или на телефоне для просмотра и управления человеком.',
+    nodes_4: 'Независимые учётные данные и управляемое владельцем выполнение делают каждый узел ограниченным и отзывным.',
     also_web: 'Также доступно как <a href="https://app.im.codes">веб-приложение</a>', watch_intro: 'Поддержка Watch даёт быстрый просмотр сессий, счётчики непрочитанного, статус OTA-обновлений, push-уведомления и быстрые ответы прямо с запястья.', watch_badge: 'iPhone · iPad · Apple Watch', watch_download: 'Приложение для Watch показывает список сессий, счётчики непрочитанного и быстрые ответы.',
     agents_intro: 'Несколько агентов поддерживают интеграции как через CLI, так и через SDK.',
     memory_intro: 'IM.codes превращает уже решённую работу в переиспользуемую и доступную для поиска память. Сохраняются не сырые логи промптов, а структурированные сводки проблема→решение. Релевантная история автоматически подмешивается в новые сообщения и при старте сессии, а каждая инъекция видна в таймлайне.',
@@ -1194,11 +1247,11 @@ const I18N = {
     f_mcp_desc: 'десять runtime-scoped tools для memory search/sources, preferences, scoped Send и Cron scheduling',
     f_alias_name: 'приватные алиасы',
     f_alias_desc: 'переиспользование пользовательского текста через видимые маркеры ;;(name) с внеполосной доставкой значения',
-    f_node_name: 'управляемые узлы',
-    f_node_desc: 'регистрация ограниченных машин через ^^(name) для scoped remote commands, файлов и типизированного Computer Use',
+    f_node_name: 'удалённый рабочий стол с ИИ',
+    f_node_desc: 'используйте ^^(name) для прямого управления несколькими компьютерами через scoped commands, файлы и Computer Use',
     f_computer_name: 'Computer Use и автоматизация браузера',
     f_computer_desc: 'интегрированное desktop-управление <a href="https://github.com/iFurySt/open-codex-computer-use">Open Computer Use</a> (Leo, MIT), а также собственные CDP-инструменты браузера IM.codes, снимки по запросу и доступ локальных скриптов',
-    f_rdp_name: 'удалённое управление рабочим столом', f_rdp_desc: 'смотрите и управляйте экраном зарегистрированной машины из браузера или с телефона по H.264, соединение напрямую, TURN — только как запасной путь: сейчас Windows, macOS и Linux скоро',
+    f_rdp_name: 'удалённое управление рабочим столом', f_rdp_desc: 'просмотр и управление совместимым Windows-узлом из браузера или с телефона, с сенсорной навигацией и отзывным доступом',
     f_collab_name: 'совместное программирование',
     f_collab_desc: 'scoped sharing tabs/sub-sessions/source servers для pair или small-group agent programming',
     f_autodeliver_name: 'OpenSpec Auto Deliver',
