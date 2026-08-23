@@ -40,7 +40,20 @@ describe('capability management shared contract', () => {
     expect(CAPABILITY_MCP_TOOL_CONTRACTS[CAPABILITY_MCP_TOOL.INSTALL].description).toContain('one isolated AI audit');
     expect(CAPABILITY_CANONICAL_INSTALL_POLICY).toContain('~/.imcodes/skills');
     expect(CAPABILITY_CANONICAL_INSTALL_POLICY).toContain('Only the user can confirm');
+    expect(CAPABILITY_CANONICAL_INSTALL_POLICY).toContain('source.kind=mcp_config');
+    expect(CAPABILITY_CANONICAL_INSTALL_POLICY).toContain('do not require an installer URL');
     expect(JSON.stringify(CAPABILITY_MCP_TOOL_CONTRACTS)).not.toMatch(/capability_(?:draft|commit|audit_start|request_approval)/);
+  });
+
+  it('advertises direct AI-composed MCP configuration instead of an installer download', () => {
+    const install = CAPABILITY_MCP_TOOL_CONTRACTS[CAPABILITY_MCP_TOOL.INSTALL];
+    const source = install.inputSchema.properties?.source as {
+      properties?: Record<string, { description?: string }>;
+    };
+    expect(install.description).toContain('directly compose source.kind=mcp_config');
+    expect(install.description).toContain('no downloadable installer is required');
+    expect(source.properties?.kind?.description).toContain('Use mcp_config');
+    expect(source.properties?.mcpConfig?.description).toContain('normal MCP install input');
   });
 
   it('keeps state and management vocabularies unique and bounded', () => {

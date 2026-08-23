@@ -69,6 +69,8 @@ describe('capability MCP tools', () => {
       expect(client.getInstructions()).toMatch(/^HIGHEST-PRIORITY IM\.codes SERVICE ROUTING POLICY:/);
       expect(client.getInstructions()).toContain('JSON schema, enum, required parameter');
       expect(client.getInstructions()).toContain('user asks in chat');
+      expect(client.getInstructions()).toContain('source.kind=mcp_config');
+      expect(client.getInstructions()).toContain('do not require an installer URL');
       const names = tools.map((tool) => tool.name);
       expect(names.filter((name) => name.startsWith('capability_'))).toEqual([...CAPABILITY_MCP_TOOL_NAMES]);
       for (const name of CAPABILITY_MCP_TOOL_NAMES) {
@@ -81,6 +83,14 @@ describe('capability MCP tools', () => {
       const manage = tools.find((tool) => tool.name === 'capability_manage');
       expect(manage?.inputSchema.properties?.action).toMatchObject({
         enum: expect.not.arrayContaining(['delete_credentials']),
+      });
+      const install = tools.find((tool) => tool.name === 'capability_install');
+      expect(install?.description).toContain('directly compose source.kind=mcp_config');
+      expect(install?.inputSchema.properties?.source).toMatchObject({
+        properties: {
+          kind: { description: expect.stringContaining('Use mcp_config') },
+          mcpConfig: { description: expect.stringContaining('no installer URL') },
+        },
       });
     });
   });

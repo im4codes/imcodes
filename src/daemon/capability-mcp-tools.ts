@@ -55,11 +55,11 @@ const scope = z.enum(CAPABILITY_SCOPE);
 const sourceKind = z.enum(CAPABILITY_SOURCE_KIND);
 
 const sourceSchema = z.strictObject({
-  kind: sourceKind.describe('Source form supplied by the user.'),
-  value: z.string().max(CAPABILITY_LIMITS.SOURCE_CHARS).optional().describe('URL, repository locator, or daemon-local path.'),
+  kind: sourceKind.describe('Use mcp_config for an AI-composed MCP definition; URL is a direct Streamable HTTP endpoint or Skill source.'),
+  value: z.string().max(CAPABILITY_LIMITS.SOURCE_CHARS).optional().describe('Direct MCP Streamable HTTP endpoint, Skill URL/repository locator, or daemon-local Skill path.'),
   repositorySubdir: z.string().max(CAPABILITY_LIMITS.PATH_BYTES).optional().describe('Repository-relative Skill directory.'),
   inlineFiles: z.record(z.string(), z.string()).optional().describe('Portable package file map including SKILL.md.'),
-  mcpConfig: z.record(z.string(), z.unknown()).optional().describe('Normalized non-secret MCP definition.'),
+  mcpConfig: z.record(z.string(), z.unknown()).optional().describe('AI-composed normalized non-secret MCP definition; no installer URL or package download is required.'),
 });
 
 export const CAPABILITY_MCP_INPUT_SCHEMAS = {

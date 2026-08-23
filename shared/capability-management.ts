@@ -932,6 +932,7 @@ export const CAPABILITY_MCP_TOOL_NAMES = Object.values(CAPABILITY_MCP_TOOL) as r
 
 export const CAPABILITY_CANONICAL_INSTALL_POLICY = [
   'Manage MCP services and Agent Skills only through IM.codes capability tools.',
+  'For MCP services, compose the requested non-secret stdio or Streamable HTTP definition directly as source.kind=mcp_config; do not require an installer URL, package download, Settings form, or separate model. A source.kind=url value is the MCP Streamable HTTP endpoint itself, not an installation package.',
   'Managed Skills install only under ~/.imcodes/skills/managed; never write or invoke provider-native Skill installers/directories.',
   'Installation runs automatic deterministic scanning and one isolated AI audit.',
   'Only the user can confirm installation; never claim success before authoritative installed/readiness state.',
@@ -1010,17 +1011,17 @@ export const CAPABILITY_MCP_TOOL_CONTRACTS: Readonly<Record<CapabilityMcpToolNam
   },
   [CAPABILITY_MCP_TOOL.INSTALL]: {
     name: CAPABILITY_MCP_TOOL.INSTALL,
-    description: `Start one automatic IM.codes install from a URL, repository, local path, inline Skill package, or non-secret MCP config. Returns an operation; scanning and one isolated audit run automatically, then the user receives one confirmation card. ${CAPABILITY_CANONICAL_INSTALL_POLICY}`,
+    description: `Start one automatic IM.codes install. For MCP, directly compose source.kind=mcp_config with the requested non-secret stdio command/args or Streamable HTTP endpoint; no downloadable installer is required. Skill sources may be a URL, repository, local path, or inline package. Returns an operation; scanning and one isolated audit run automatically, then the user receives one confirmation card. ${CAPABILITY_CANONICAL_INSTALL_POLICY}`,
     inputSchema: objectSchema('One bounded capability install request.', {
       capabilityId: stringSchema('Optional exact installed capability id when updating; names are never used to guess an update target.'),
       bindingId: stringSchema('Exact installed binding id required with capabilityId; update never guesses among bindings.'),
       kind: kindSchema,
-      source: objectSchema('Source descriptor. Never include raw credential values.', {
-        kind: { type: 'string', enum: Object.values(CAPABILITY_SOURCE_KIND), description: 'Source form supplied by the user.' },
-        value: stringSchema(`URL, repository locator, or daemon-local path, at most ${CAPABILITY_LIMITS.SOURCE_CHARS} characters.`, { maxLength: CAPABILITY_LIMITS.SOURCE_CHARS }),
+      source: objectSchema('Source descriptor. For MCP, the AI should compose mcp_config directly. Never include raw credential values.', {
+        kind: { type: 'string', enum: Object.values(CAPABILITY_SOURCE_KIND), description: 'Use mcp_config for an AI-composed MCP definition; URL is a direct Streamable HTTP endpoint or a Skill source.' },
+        value: stringSchema(`Direct MCP Streamable HTTP endpoint, Skill URL/repository locator, or daemon-local Skill path, at most ${CAPABILITY_LIMITS.SOURCE_CHARS} characters.`, { maxLength: CAPABILITY_LIMITS.SOURCE_CHARS }),
         repositorySubdir: stringSchema('Optional repository-relative Skill directory; traversal and absolute paths are forbidden.', { maxLength: CAPABILITY_LIMITS.PATH_BYTES }),
         inlineFiles: { type: 'object', description: `Optional bounded portable package file map including SKILL.md; total UTF-8 bytes at most ${CAPABILITY_LIMITS.INLINE_PACKAGE_BYTES}.`, additionalProperties: stringSchema('UTF-8 file content.') },
-        mcpConfig: { type: 'object', description: 'Optional normalized credential-free stdio or Streamable HTTP MCP definition. The Registry credential store is not ready in this release: authenticated definitions and all credentialRef fields are rejected with typed runtime_pending; never include token values.', additionalProperties: true },
+        mcpConfig: { type: 'object', description: 'AI-composed normalized credential-free stdio or Streamable HTTP MCP definition; this is the normal MCP install input and does not require a package URL. The Registry credential store is not ready in this release: authenticated definitions and all credentialRef fields are rejected with typed runtime_pending; never include token values.', additionalProperties: true },
       }, ['kind']),
       displayName: stringSchema('Optional user-facing name; source metadata is used when omitted.', { maxLength: CAPABILITY_LIMITS.DISPLAY_NAME_CHARS }),
       scope: scopeSchema,
