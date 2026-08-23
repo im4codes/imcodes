@@ -14,6 +14,8 @@ const mockGetDbSessionByName = vi.fn();
 const mockGetSubSessionById = vi.fn();
 const mockGetDbSessionsByServer = vi.fn<(...args: unknown[]) => Promise<unknown[]>>(async () => []);
 const mockGetSubSessionsByServer = vi.fn<(...args: unknown[]) => Promise<unknown[]>>(async () => []);
+const mockGetUserPref = vi.fn();
+const mockSetUserPref = vi.fn();
 const mockResolveHttpShareAccess = vi.fn();
 const mockResolveHttpShareAccessForCoveredSession = vi.fn();
 const mockResolveServerMemberAccessOrShareDeny = vi.fn();
@@ -35,11 +37,13 @@ vi.mock('../src/security/authorization.js', () => ({
 }));
 
 vi.mock('../src/db/queries.js', () => ({
-  getServerById: vi.fn(async () => ({ id: 'srv-1' })),
+  getServerById: vi.fn(async () => ({ id: 'srv-1', user_id: 'owner-user' })),
   getDbSessionsByServer: (...args: unknown[]) => mockGetDbSessionsByServer(...args),
   getDbSessionByName: (...args: unknown[]) => mockGetDbSessionByName(...args),
   getSubSessionById: (...args: unknown[]) => mockGetSubSessionById(...args),
   getSubSessionsByServer: (...args: unknown[]) => mockGetSubSessionsByServer(...args),
+  getUserPref: (...args: unknown[]) => mockGetUserPref(...args),
+  setUserPref: (...args: unknown[]) => mockSetUserPref(...args),
   upsertDbSession: (...args: unknown[]) => mockUpsertDbSession(...args),
   deleteDbSession: vi.fn(),
   updateSessionLabel: vi.fn(),
@@ -93,6 +97,8 @@ describe('session-mgmt persistence routes', () => {
     getActiveDispatchIdForSessionMock.mockReturnValue('dispatch-1');
     mockGetDbSessionsByServer.mockResolvedValue([]);
     mockGetSubSessionsByServer.mockResolvedValue([]);
+    mockGetUserPref.mockResolvedValue(null);
+    mockSetUserPref.mockResolvedValue(undefined);
   });
 
   async function buildApp() {
@@ -648,6 +654,82 @@ describe('session-mgmt persistence routes', () => {
     });
     expect(mockUpdateSession).not.toHaveBeenCalled();
     expect(sendToDaemonMock).not.toHaveBeenCalled();
+  });
+
+  it('reads and writes the machine owner supervision defaults for a covered participant', async () => {
+    mockResolveHttpShareAccessForCoveredSession.mockResolvedValue({
+      actor: {
+        kind: 'share',
+        effectiveActorRole: 'participant',
+        coverage: {
+          target: { kind: 'main', serverId: 'srv-1', sessionName: 'deck_proj_brain' },
+          effectiveRole: 'participant',
+        },
+      },
+    });
+    mockGetUserPref.mockResolvedValue(JSON.stringify({
+      backend: 'claude-code-sdk',
+      model: 'MiniMax-M2.7',
+      preset: 'MiniMax Owner',
+      timeoutMs: 50_000,
+      promptVersion: 'supervision_decision_v1',
+    }));
+    const app = await buildApp();
+
+    const read = await app.request('/api/server/srv-1/sessions/deck_proj_brain/supervision/defaults');
+    expect(read.status).toBe(200);
+    await expect(read.json()).resolves.toEqual({
+      defaults: expect.objectContaining({
+        backend: 'claude-code-sdk',
+        model: 'MiniMax-M2.7',
+        preset: 'MiniMax Owner',
+      }),
+    });
+    expect(mockGetUserPref).toHaveBeenCalledWith(mockDb, 'owner-user', 'supervision.user_default');
+
+    const write = await app.request('/api/server/srv-1/sessions/deck_proj_brain/supervision/defaults', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        defaults: {
+          backend: 'qwen',
+          model: 'MiniMax-M2.7',
+          preset: 'MiniMax Owner',
+          timeoutMs: 55_000,
+          promptVersion: 'supervision_decision_v1',
+        },
+      }),
+    });
+    expect(write.status).toBe(200);
+    expect(mockSetUserPref).toHaveBeenCalledWith(
+      mockDb,
+      'owner-user',
+      'supervision.user_default',
+      expect.any(String),
+    );
+    const stored = JSON.parse(String(mockSetUserPref.mock.calls[0]?.[3]));
+    expect(stored).toEqual(expect.objectContaining({
+      backend: 'qwen',
+      model: 'MiniMax-M2.7',
+      preset: 'MiniMax Owner',
+    }));
+  });
+
+  it('denies viewers access to the machine owner supervision defaults', async () => {
+    mockResolveHttpShareAccessForCoveredSession.mockResolvedValue({
+      actor: { kind: 'share', effectiveActorRole: 'viewer' },
+    });
+    const app = await buildApp();
+    const read = await app.request('/api/server/srv-1/sessions/deck_proj_brain/supervision/defaults');
+    const write = await app.request('/api/server/srv-1/sessions/deck_proj_brain/supervision/defaults', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ defaults: { backend: 'qwen', model: 'qwen3-coder-plus' } }),
+    });
+    expect(read.status).toBe(403);
+    expect(write.status).toBe(403);
+    expect(mockGetUserPref).not.toHaveBeenCalled();
+    expect(mockSetUserPref).not.toHaveBeenCalled();
   });
 
   it('POST /session/send allows share participants and stamps a server-authored sharedActor', async () => {

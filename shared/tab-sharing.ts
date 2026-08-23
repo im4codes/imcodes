@@ -306,6 +306,8 @@ export const SHARE_HTTP_ROUTE_POLICY_INVENTORY = [
   { id: 'session-stop', method: 'POST', pattern: '/api/server/:id/session/stop', command: SHARE_BROWSER_COMMANDS.SESSION_STOP, disposition: 'share-denied', reason: 'share-direct-surface-denied' },
   { id: 'session-settings', method: 'PATCH', pattern: '/api/server/:id/sessions/:name', command: SHARE_BROWSER_COMMANDS.SESSION_RESTART, disposition: 'share-aware' },
   { id: 'session-supervision', method: 'PATCH', pattern: '/api/server/:id/sessions/:name/supervision', command: SHARE_BROWSER_COMMANDS.SESSION_SUPERVISION, disposition: 'share-aware' },
+  { id: 'session-supervision-defaults-read', method: 'GET', pattern: '/api/server/:id/sessions/:name/supervision/defaults', command: SHARE_BROWSER_COMMANDS.SESSION_SUPERVISION, disposition: 'share-aware' },
+  { id: 'session-supervision-defaults-write', method: 'PUT', pattern: '/api/server/:id/sessions/:name/supervision/defaults', command: SHARE_BROWSER_COMMANDS.SESSION_SUPERVISION, disposition: 'share-aware' },
   { id: 'session-relabel', method: 'PATCH', pattern: '/api/server/:id/sessions/:name/label', command: SHARE_BROWSER_COMMANDS.SESSION_RESTART, disposition: 'share-aware' },
   { id: 'session-rename', method: 'PATCH', pattern: '/api/server/:id/sessions/:name/rename', command: SHARE_BROWSER_COMMANDS.SESSION_RESTART, disposition: 'share-aware' },
   { id: 'session-delete', method: 'DELETE', pattern: '/api/server/:id/sessions/:name', command: SHARE_BROWSER_COMMANDS.SESSION_STOP, disposition: 'share-denied', reason: 'share-direct-surface-denied' },

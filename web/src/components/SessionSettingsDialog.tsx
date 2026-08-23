@@ -6,8 +6,9 @@ import { createPortal } from 'preact/compat';
 import { useTranslation } from 'react-i18next';
 import { patchSession, patchSubSession } from '../api.js';
 import { useSupervisorDefaults } from '../hooks/useSupervisorDefaults.js';
-import { useTransportModels } from '../hooks/useTransportModels.js';
+import { supportsDynamicTransportModels, useTransportModels } from '../hooks/useTransportModels.js';
 import type { WsClient } from '../ws-client.js';
+import { DAEMON_MSG } from '@shared/daemon-events.js';
 import { SESSION_AGENT_TYPES, TRANSPORT_SESSION_AGENT_TYPES, getSessionRuntimeType, type SessionAgentType } from '@shared/agent-types.js';
 import { CODEBUDDY_PROVIDER_IDS } from '@shared/codebuddy.js';
 import { isDelegationReplyCapableAgentType } from '@shared/agent-delegation.js';
@@ -542,7 +543,10 @@ export function SessionSettingsDialog({
   const hasSupervision = supervision.mode !== 'off';
   const isSupportedTransport = TRANSPORT_SESSION_AGENT_TYPES.includes(agentType as typeof TRANSPORT_SESSION_AGENT_TYPES[number]);
   const isAuditMode = supervision.mode === 'supervised_audit';
-  const supervisorDefaultsPref = useSupervisorDefaults(isSupportedTransport);
+  const supervisorDefaultsPref = useSupervisorDefaults(isSupportedTransport, {
+    serverId,
+    sessionName,
+  });
 
   useEffect(() => {
     if (openIntent?.focus !== SESSION_SETTINGS_FOCUS.PEER_AUDIT_TARGET || !isAuditMode) return;
@@ -557,8 +561,33 @@ export function SessionSettingsDialog({
   // again whenever `ws` changes — the daemon response is idempotent.
   useEffect(() => {
     if (!ws) return;
+    // A dialog can move between covered sessions without remounting. Presets
+    // are owner-machine data, so never retain the previous owner's catalogue
+    // while the new scoped request is in flight (or if it is denied).
+    setCcPresets([]);
+    const requestPresets = (): void => {
+      const requestId = globalThis.crypto?.randomUUID?.()
+        ?? `cc-presets-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+      ccPresetListRequestIdRef.current = requestId;
+      // A reconnect can race this effect. Keep the settings dialog usable and
+      // let the next RECONNECTED notification retry instead of turning a
+      // transient transport failure into a render-time exception.
+      try {
+        ws.send({
+          type: CC_PRESET_MSG.LIST,
+          requestId,
+          sessionName,
+        });
+      } catch {
+        // Retry is driven by the reconnect notification above.
+      }
+    };
     const unsub = ws.onMessage((msg) => {
       const m = msg as { type?: string; requestId?: string; presets?: CcPresetSummary[] };
+      if (m.type === DAEMON_MSG.RECONNECTED) {
+        requestPresets();
+        return;
+      }
       if (
         m.type === CC_PRESET_MSG.LIST_RESPONSE
         && (!m.requestId || m.requestId === ccPresetListRequestIdRef.current)
@@ -566,16 +595,7 @@ export function SessionSettingsDialog({
         setCcPresets(m.presets ?? []);
       }
     });
-    const requestId = globalThis.crypto?.randomUUID?.()
-      ?? `cc-presets-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-    ccPresetListRequestIdRef.current = requestId;
-    try {
-      ws.send({
-        type: CC_PRESET_MSG.LIST,
-        requestId,
-        sessionName,
-      });
-    } catch { /* ws may not support send in tests */ }
+    requestPresets();
     return unsub;
   }, [sessionName, ws]);
 
@@ -697,7 +717,7 @@ export function SessionSettingsDialog({
   const supervisorDefaultsPresetModelOptions = getPresetModelOptions(ccPresets, supervisorDefaults.preset);
   const supervisorDefaultsDynamicModels = useTransportModels(
     ws ?? null,
-    supervisorDefaultsBackend && supervisorDefaultsPreset && doesSharedContextBackendSupportPresets(supervisorDefaultsBackend)
+    supportsDynamicTransportModels(supervisorDefaultsBackend)
       ? supervisorDefaultsBackend
       : null,
     supervisorDefaultsPreset || undefined,
@@ -709,7 +729,10 @@ export function SessionSettingsDialog({
             supervisorDefaultsPresetModelOptions,
             supervisorDefaultsDynamicModels.models.map((entry) => entry.id),
           )
-        : getSupervisionModelOptions(supervisorDefaultsBackend))
+        : mergeModelSuggestions(
+            supervisorDefaultsDynamicModels.models.map((entry) => entry.id),
+            getSupervisionModelOptions(supervisorDefaultsBackend),
+          ))
     : [];
   const supervisorDefaultsCustomInstructions = typeof supervisorDefaults.customInstructions === 'string' ? supervisorDefaults.customInstructions : '';
   const supervisorDefaultsAutoContinueStreak = supervisorDefaults.maxAutoContinueStreak ?? DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_STREAK;
@@ -721,7 +744,7 @@ export function SessionSettingsDialog({
   const supervisorDefaultsBackupPresetModelOptions = getPresetModelOptions(ccPresets, supervisorDefaultsBackupPreset);
   const supervisorDefaultsBackupDynamicModels = useTransportModels(
     ws ?? null,
-    supervisorDefaultsBackupBackend && supervisorDefaultsBackupPreset && doesSharedContextBackendSupportPresets(supervisorDefaultsBackupBackend)
+    supportsDynamicTransportModels(supervisorDefaultsBackupBackend)
       ? supervisorDefaultsBackupBackend
       : null,
     supervisorDefaultsBackupPreset || undefined,
@@ -733,7 +756,10 @@ export function SessionSettingsDialog({
             supervisorDefaultsBackupPresetModelOptions,
             supervisorDefaultsBackupDynamicModels.models.map((entry) => entry.id),
           )
-        : getSupervisionModelOptions(supervisorDefaultsBackupBackend))
+        : mergeModelSuggestions(
+            supervisorDefaultsBackupDynamicModels.models.map((entry) => entry.id),
+            getSupervisionModelOptions(supervisorDefaultsBackupBackend),
+          ))
     : [];
   // Preset persistence is valid only for runtime backends that can resolve the
   // same third-party endpoint bundles used by memory processing.

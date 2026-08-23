@@ -1,6 +1,6 @@
 import { Hono, type Context } from 'hono';
 import type { Env } from '../env.js';
-import { getServerById, getDbSessionByName, getDbSessionsByServer, getSubSessionById, getSubSessionsByServer, upsertDbSession, deleteDbSession, updateSessionLabel, updateProjectName, updateSession, updateSubSession } from '../db/queries.js';
+import { getServerById, getDbSessionByName, getDbSessionsByServer, getSubSessionById, getSubSessionsByServer, getUserPref, setUserPref, upsertDbSession, deleteDbSession, updateSessionLabel, updateProjectName, updateSession, updateSubSession } from '../db/queries.js';
 import { requireAuth } from '../security/authorization.js';
 import type { ServerRole } from '../security/authorization.js';
 import { randomHex } from '../security/crypto.js';
@@ -47,8 +47,11 @@ import {
   buildTransportConfigWithSupervision,
   extractSessionSupervisionSnapshot,
   isSupportedSupervisionTargetSessionType,
+  normalizeSupervisorDefaultConfig,
+  parseSupervisorDefaultConfig,
   parseSessionSupervisionSnapshot,
   SUPERVISION_MODE,
+  SUPERVISION_USER_DEFAULT_PREF_KEY,
   type SessionSupervisionSnapshot,
 } from '../../../shared/supervision-config.js';
 
@@ -389,6 +392,71 @@ sessionMgmtRoutes.patch('/:id/sessions/:name/supervision', async (c) => {
     ? buildTransportConfigWithSupervision(null, nextSnapshot)
     : nextTransportConfig;
   return c.json({ ok: true, transportConfig: responseTransportConfig });
+});
+
+async function resolveSupervisorDefaultsOwner(
+  c: Context<{ Bindings: Env; Variables: { userId: string; role: string } }>,
+): Promise<
+  | { ok: true; ownerUserId: string }
+  | { ok: false; response: Response }
+> {
+  const userId = c.get('userId' as never) as string;
+  const serverId = c.req.param('id')!;
+  const sessionName = c.req.param('name')!;
+  const target = shareTargetFromSessionName(serverId, sessionName);
+  if (!target || target.kind === 'server') {
+    return { ok: false, response: c.json({ error: 'invalid_session' }, 400) };
+  }
+  const access = await resolveHttpShareAccessForCoveredSession(c.env.DB, { serverId, userId, target });
+  if (access.actor.kind === 'none') {
+    return { ok: false, response: c.json({ error: 'forbidden', reason: 'not_authorized_for_server' }, 403) };
+  }
+  if (access.actor.kind === 'share' && access.actor.effectiveActorRole !== 'participant') {
+    return { ok: false, response: c.json({ error: 'forbidden', reason: 'share-role-denied' }, 403) };
+  }
+  const server = await getServerById(c.env.DB, serverId);
+  if (!server) return { ok: false, response: c.json({ error: 'not_found' }, 404) };
+  return { ok: true, ownerUserId: server.user_id };
+}
+
+/**
+ * Read/write the machine owner's account-level supervision runtime through a
+ * concrete covered session. A share participant must configure the runtime
+ * that the owner's daemon actually consumes, not a same-key preference under
+ * the participant's own account. The payload contains no provider credentials;
+ * preset secrets remain confined to the daemon-side preset catalogue.
+ */
+sessionMgmtRoutes.get('/:id/sessions/:name/supervision/defaults', async (c) => {
+  const resolved = await resolveSupervisorDefaultsOwner(c);
+  if (!resolved.ok) return resolved.response;
+  const raw = await getUserPref(c.env.DB, resolved.ownerUserId, SUPERVISION_USER_DEFAULT_PREF_KEY);
+  if (!raw) return c.json({ defaults: null });
+  try {
+    return c.json({ defaults: parseSupervisorDefaultConfig(JSON.parse(raw)) });
+  } catch {
+    return c.json({ defaults: null });
+  }
+});
+
+sessionMgmtRoutes.put('/:id/sessions/:name/supervision/defaults', async (c) => {
+  const resolved = await resolveSupervisorDefaultsOwner(c);
+  if (!resolved.ok) return resolved.response;
+  let body: { defaults?: unknown };
+  try {
+    body = await c.req.json() as typeof body;
+  } catch {
+    return c.json({ error: 'invalid_json' }, 400);
+  }
+  const parsed = parseSupervisorDefaultConfig(body.defaults);
+  if (!parsed) return c.json({ error: 'invalid_supervision_defaults' }, 400);
+  const defaults = normalizeSupervisorDefaultConfig(parsed);
+  await setUserPref(
+    c.env.DB,
+    resolved.ownerUserId,
+    SUPERVISION_USER_DEFAULT_PREF_KEY,
+    JSON.stringify(defaults),
+  );
+  return c.json({ ok: true, defaults });
 });
 
 /** PATCH /api/server/:id/sessions/:name — update session settings (label, description, cwd) */

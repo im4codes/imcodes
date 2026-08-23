@@ -285,6 +285,8 @@ vi.mock('../../src/api.js', () => ({
   },
   saveUserPref: (...args: unknown[]) => saveUserPrefMock(...args),
   fetchSupervisorDefaults: (...args: unknown[]) => fetchSupervisorDefaultsMock(...args),
+  fetchSessionSupervisorDefaults: (...args: unknown[]) => fetchSupervisorDefaultsMock(...args),
+  saveSessionSupervisorDefaults: async (_serverId: string, _sessionName: string, value: unknown) => value,
   patchSession: (...args: unknown[]) => patchSessionMock(...args),
   patchSessionSupervision: (...args: unknown[]) => patchSessionSupervisionMock(...args),
   patchSubSession: (...args: unknown[]) => patchSubSessionMock(...args),

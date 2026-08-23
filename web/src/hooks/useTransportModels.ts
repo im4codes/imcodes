@@ -41,13 +41,20 @@ export function useTransportModels(
 ): TransportModelState & { refresh: () => void } {
   const [state, setState] = useState<TransportModelState>({ models: [], loading: false });
   const pendingRequestId = useRef<string | null>(null);
-  const catalogIdentity = `${agentType ?? ''}\0${ccPreset?.trim().toLowerCase() ?? ''}`;
+  // Session scope is part of catalogue identity: the same preset name on two
+  // shared owner machines can resolve to completely different providers and
+  // model sets. Never retain one owner's entries while switching sessions.
+  const catalogIdentity = `${sessionName?.trim() ?? ''}\0${agentType ?? ''}\0${ccPreset?.trim().toLowerCase() ?? ''}`;
   const currentCatalogIdentity = useRef(catalogIdentity);
   const wsConnected = !!ws?.connected;
 
   const fetchModels = useCallback(
     (force: boolean) => {
-      if (!ws || !wsConnected || !supportsDynamicTransportModels(agentType)) {
+      // Read the live socket flag at dispatch time. A daemon.reconnected event
+      // can reach this handler before Preact has rendered the new `connected`
+      // prop value; a closure over the previous false value would otherwise
+      // discard the first authoritative participant catalogue after reconnect.
+      if (!ws || !ws.connected || !supportsDynamicTransportModels(agentType)) {
         setState({ models: [], loading: false });
         return;
       }

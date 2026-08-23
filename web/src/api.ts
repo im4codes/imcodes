@@ -1040,6 +1040,37 @@ export async function patchSessionSupervision(
   return response.transportConfig ?? null;
 }
 
+/**
+ * Load the supervision defaults owned by the machine behind a covered
+ * session. This differs from fetchSupervisorDefaults(): a share participant's
+ * own preference record is not the source consumed by the owner's daemon.
+ */
+export async function fetchSessionSupervisorDefaults(
+  serverId: string,
+  sessionName: string,
+): Promise<SupervisorDefaultConfig | null> {
+  const response = await apiFetch<{ defaults: unknown }>(
+    `/api/server/${encodeURIComponent(serverId)}/sessions/${encodeURIComponent(sessionName)}/supervision/defaults`,
+  );
+  return parseSupervisorDefaultConfig(response.defaults);
+}
+
+export async function saveSessionSupervisorDefaults(
+  serverId: string,
+  sessionName: string,
+  config: Partial<SupervisorDefaultConfig> | null | undefined,
+): Promise<SupervisorDefaultConfig> {
+  const defaults = normalizeSupervisorDefaultConfig(config);
+  const response = await apiFetch<{ ok: boolean; defaults: unknown }>(
+    `/api/server/${encodeURIComponent(serverId)}/sessions/${encodeURIComponent(sessionName)}/supervision/defaults`,
+    {
+      method: 'PUT',
+      body: JSON.stringify({ defaults }),
+    },
+  );
+  return parseSupervisorDefaultConfig(response.defaults) ?? defaults;
+}
+
 export async function reorderSubSessions(serverId: string, ids: string[]): Promise<void> {
   await apiFetch(`/api/server/${serverId}/sub-sessions/reorder`, {
     method: 'PATCH',

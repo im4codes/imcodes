@@ -34,6 +34,8 @@ vi.mock('../../src/api.js', () => ({
   patchSession: (...args: unknown[]) => patchSessionMock(...args),
   patchSubSession: (...args: unknown[]) => patchSubSessionMock(...args),
   fetchSupervisorDefaults: (...args: unknown[]) => fetchSupervisorDefaultsMock(...args),
+  fetchSessionSupervisorDefaults: (...args: unknown[]) => fetchSupervisorDefaultsMock(...args),
+  saveSessionSupervisorDefaults: (_serverId: string, _sessionName: string, value: unknown) => saveSupervisorDefaultsMock(value),
   saveSupervisorDefaults: (...args: unknown[]) => saveSupervisorDefaultsMock(...args),
   getUserPref: () => fetchSupervisorDefaultsMock(),
   saveUserPref: (_key: string, value: unknown) => saveSupervisorDefaultsMock(value),
@@ -710,7 +712,7 @@ describe('SessionSettingsDialog supervision', () => {
     );
 
     await waitFor(() => {
-      expect(fetchSupervisorDefaultsMock).toHaveBeenCalled();
+      expect(fetchSupervisorDefaultsMock).toHaveBeenCalledWith('srv-1', 'deck_proj_brain');
     });
 
     fireEvent.input(inputForLabel('maxAutoContinueStreak', 0), { target: { value: '5' } });
@@ -780,6 +782,11 @@ describe('SessionSettingsDialog supervision', () => {
         requestId: expect.any(String),
         sessionName: 'deck_proj_brain',
       }));
+      expect(sent).toContainEqual(expect.objectContaining({
+        type: 'transport.list_models',
+        agentType: 'qwen',
+        sessionName: 'deck_proj_brain',
+      }));
     });
 
     // Dispatch the preset list inside `act` so preact flushes the state update
@@ -829,6 +836,74 @@ describe('SessionSettingsDialog supervision', () => {
           }),
         }),
       }));
+    });
+  });
+
+  it('re-requests the owner preset catalogue when the initial shared socket send was dropped', async () => {
+    const sent: Array<Record<string, unknown>> = [];
+    const handlers = new Set<(message: unknown) => void>();
+    const wsStub = {
+      connected: false,
+      send(message: Record<string, unknown>) {
+        if (this.connected) sent.push(message);
+      },
+      onMessage(handler: (message: unknown) => void) {
+        handlers.add(handler);
+        return () => { handlers.delete(handler); };
+      },
+    };
+    fetchSupervisorDefaultsMock.mockResolvedValue({
+      backend: 'claude-code-sdk',
+      model: 'sonnet',
+      timeoutMs: 50_000,
+      promptVersion: 'supervision_decision_v1',
+    });
+
+    render(
+      <SessionSettingsDialog
+        serverId="srv-1"
+        sessionName="deck_proj_brain"
+        label="Brain"
+        description="desc"
+        cwd="/proj"
+        type="claude-code-sdk"
+        transportConfig={null}
+        ws={wsStub as unknown as import('../../src/ws-client.js').WsClient}
+        onClose={vi.fn()}
+        onSaved={vi.fn()}
+      />,
+    );
+    await waitFor(() => expect(fetchSupervisorDefaultsMock).toHaveBeenCalled());
+    expect(sent).toEqual([]);
+
+    wsStub.connected = true;
+    await act(async () => {
+      for (const handler of handlers) handler({ type: 'daemon.reconnected' });
+    });
+    const request = sent.find((message) => message.type === 'cc.presets.list');
+    expect(request).toEqual(expect.objectContaining({
+      sessionName: 'deck_proj_brain',
+      requestId: expect.any(String),
+    }));
+
+    await act(async () => {
+      for (const handler of handlers) {
+        handler({
+          type: 'cc.presets.list_response',
+          requestId: request?.requestId,
+          sessionName: 'deck_proj_brain',
+          presets: [{
+            name: 'Owner MiniMax',
+            env: {},
+            defaultModel: 'MiniMax-M2.7',
+            availableModels: [{ id: 'MiniMax-M2.7' }],
+          }],
+        });
+      }
+    });
+    await waitFor(() => {
+      const presetSelect = screen.getByLabelText('supervision-defaults:preset') as HTMLSelectElement;
+      expect([...presetSelect.options].map((option) => option.value)).toContain('Owner MiniMax');
     });
   });
 

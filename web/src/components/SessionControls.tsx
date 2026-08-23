@@ -1766,7 +1766,10 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     && isTransport
     && isSupportedSupervisionTargetSessionType(activeSession.agentType)
   );
-  const supervisorDefaultsPref = useSupervisorDefaults(canQuickControlSupervision);
+  const supervisorDefaultsPref = useSupervisorDefaults(
+    canQuickControlSupervision,
+    serverId && activeSession?.name ? { serverId, sessionName: activeSession.name } : null,
+  );
   const isCodex = activeSession?.agentType === 'codex' || activeSession?.agentType === 'codex-sdk';
   const isQwen = activeSession?.agentType === 'qwen';
   const isCopilot = activeSession?.agentType === 'copilot-sdk';

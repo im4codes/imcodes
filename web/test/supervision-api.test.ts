@@ -10,9 +10,11 @@ import {
 import { CODEX_MODEL_IDS } from '../../src/shared/models/options.js';
 import {
   fetchSupervisorDefaults,
+  fetchSessionSupervisorDefaults,
   patchSession,
   patchSessionSupervision,
   patchSubSession,
+  saveSessionSupervisorDefaults,
   saveSupervisorDefaults,
 } from '../src/api.js';
 
@@ -96,6 +98,57 @@ describe('supervision API helpers', () => {
         }),
       }),
     );
+  });
+
+  it('loads the machine owner supervision defaults through a covered session', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({
+      defaults: {
+        backend: 'claude-code-sdk',
+        model: 'MiniMax-M2.7',
+        preset: 'MiniMax Owner',
+        timeoutMs: 50_000,
+        promptVersion: 'supervision_decision_v1',
+      },
+    }));
+
+    await expect(fetchSessionSupervisorDefaults('srv owner', 'deck_proj_brain')).resolves.toEqual(expect.objectContaining({
+      backend: 'claude-code-sdk',
+      model: 'MiniMax-M2.7',
+      preset: 'MiniMax Owner',
+    }));
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/server/srv%20owner/sessions/deck_proj_brain/supervision/defaults',
+      expect.objectContaining({ credentials: 'include' }),
+    );
+  });
+
+  it('saves supervision defaults to the machine owner rather than the participant preference', async () => {
+    const defaults = {
+      backend: 'qwen' as const,
+      model: 'MiniMax-M2.7',
+      preset: 'MiniMax Owner',
+      timeoutMs: 50_000,
+      promptVersion: 'supervision_decision_v1',
+    };
+    fetchMock.mockResolvedValueOnce(jsonResponse({ ok: true, defaults }));
+
+    await expect(saveSessionSupervisorDefaults('srv-1', 'deck_proj_brain', defaults)).resolves.toEqual(expect.objectContaining({
+      backend: 'qwen',
+      model: 'MiniMax-M2.7',
+      preset: 'MiniMax Owner',
+    }));
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/server/srv-1/sessions/deck_proj_brain/supervision/defaults',
+      expect.objectContaining({ method: 'PUT' }),
+    );
+    const init = fetchMock.mock.calls[0]?.[1] as RequestInit;
+    expect(JSON.parse(String(init.body))).toEqual({
+      defaults: expect.objectContaining({
+        backend: 'qwen',
+        model: 'MiniMax-M2.7',
+        preset: 'MiniMax Owner',
+      }),
+    });
   });
 
   it('includes transportConfig and model fields when patching sessions', async () => {
