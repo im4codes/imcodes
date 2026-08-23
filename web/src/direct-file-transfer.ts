@@ -42,7 +42,7 @@ import {
   uploadFile,
   type AttachmentRefResponse,
 } from './api.js';
-import { saveBlobViaDownloadAnchor } from './browser-download.js';
+import { shareBlobOrDownload } from './browser-download.js';
 import { isNative } from './native.js';
 import type { ServerMessage, WsClient } from './ws-client.js';
 
@@ -1469,7 +1469,7 @@ async function downloadNativeHttpBlob(options: {
     options.onProgress,
   );
   if (options.signal?.aborted) throw new DOMException('download_canceled', 'AbortError');
-  saveBlobViaDownloadAnchor(new Blob(chunks), options.suggestedName?.trim() || 'download');
+  await shareBlobOrDownload(new Blob(chunks), options.suggestedName?.trim() || 'download');
 }
 
 async function createPreviewWriter(destination: DirectPreviewDownloadDestination): Promise<FileSystemWritableFileStreamLike> {

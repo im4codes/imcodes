@@ -22,6 +22,7 @@ const apiMocks = vi.hoisted(() => ({
 
 const browserDownloadMocks = vi.hoisted(() => ({
   saveBlobViaDownloadAnchor: vi.fn(),
+  shareBlobOrDownload: vi.fn().mockResolvedValue('shared'),
 }));
 
 vi.mock('../src/api.js', () => apiMocks);
@@ -909,8 +910,8 @@ describe('direct file transfer v2 browser broker', () => {
       [{ loadedBytes: 0, totalBytes: 3 }],
       [{ loadedBytes: 3, totalBytes: 3 }],
     ]);
-    expect(browserDownloadMocks.saveBlobViaDownloadAnchor).toHaveBeenCalledOnce();
-    const [blob, fileName] = browserDownloadMocks.saveBlobViaDownloadAnchor.mock.calls[0]!;
+    expect(browserDownloadMocks.shareBlobOrDownload).toHaveBeenCalledOnce();
+    const [blob, fileName] = browserDownloadMocks.shareBlobOrDownload.mock.calls[0]!;
     expect(blob).toBeInstanceOf(Blob);
     expect(blob.size).toBe(3);
     expect(fileName).toBe('mobile-report.pdf');
