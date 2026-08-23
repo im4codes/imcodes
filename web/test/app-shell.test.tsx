@@ -1675,6 +1675,82 @@ describe('App shell', () => {
     }
   }, 20_000);
 
+  it('activates exactly the mobile window targeted by a notification tap', async () => {
+    const originalUserAgent = navigator.userAgent;
+    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
+
+    try {
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      localStorage.setItem('rcc_server', 'srv-1');
+      localStorage.setItem('rcc_session', 'deck_alpha_brain');
+      useSubSessionsState.subSessions = [
+        {
+          id: 'sub-1',
+          sessionName: 'deck_sub_alpha_helper',
+          parentSession: 'deck_alpha_brain',
+          label: 'Helper',
+          description: 'Helper session',
+          cwd: '/work/alpha',
+          type: 'codex-sdk',
+          runtimeType: 'transport',
+          state: 'idle',
+          serverId: 'srv-1',
+        },
+        {
+          id: 'sub-2',
+          sessionName: 'deck_sub_alpha_reviewer',
+          parentSession: 'deck_alpha_brain',
+          label: 'Reviewer',
+          description: 'Reviewer session',
+          cwd: '/work/alpha',
+          type: 'codex-sdk',
+          runtimeType: 'transport',
+          state: 'idle',
+          serverId: 'srv-1',
+        },
+      ];
+      useSubSessionsState.visibleSubSessions = useSubSessionsState.subSessions;
+
+      const { App } = await importApp();
+      render(<App />);
+      await waitFor(() => expect(wsInstances.length).toBe(1));
+
+      // Start on the second full-screen sub-session overlay.
+      fireEvent.click(screen.getByText('subbar-open-sub-2'));
+      expect(await screen.findByTestId('sub-session-window-sub-2')).toBeTruthy();
+      expect(screen.queryByTestId('sub-session-window-sub-1')).toBeNull();
+
+      // A notification for the first sub-session must replace, not merely add
+      // to, the mobile open set. Both overlays have the same mobile z-index,
+      // so retaining sub-2 would let DOM order cover the requested target.
+      act(() => window.dispatchEvent(new CustomEvent('deck:navigate', {
+        detail: { serverId: 'srv-1', session: 'deck_sub_alpha_helper' },
+      })));
+
+      await waitFor(() => {
+        expect(screen.getByTestId('sub-session-window-sub-1')).toBeTruthy();
+        expect(screen.queryByTestId('sub-session-window-sub-2')).toBeNull();
+        expect(localStorage.getItem('rcc_open_subs_deck_alpha_brain')).toBe(JSON.stringify(['sub-1']));
+      });
+
+      // A notification for the parent main chat must also dismiss the mobile
+      // full-screen sub-session overlay so the requested chat is visible.
+      act(() => window.dispatchEvent(new CustomEvent('deck:navigate', {
+        detail: { serverId: 'srv-1', session: 'deck_alpha_brain' },
+      })));
+
+      await waitFor(() => {
+        // Quick collapse intentionally retains the live chat node to avoid a
+        // cold remount, but it must no longer cover the main-session target.
+        expect(screen.getByTestId('sub-session-window-sub-1').getAttribute('data-visible')).toBe('false');
+        expect(screen.getByTestId('session-pane-deck_alpha_brain')).toBeTruthy();
+        expect(localStorage.getItem('rcc_open_subs_deck_alpha_brain')).toBeNull();
+      });
+    } finally {
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
+    }
+  }, 20_000);
+
   it('keeps the mobile Team discussions page above an open sub-session window', async () => {
     const originalUserAgent = navigator.userAgent;
     Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });

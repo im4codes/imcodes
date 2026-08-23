@@ -4507,17 +4507,26 @@ export function App() {
           scrollToBottom: options?.scrollToBottom,
         });
       }
-      setOpenSubIds((prev) => new Set([...prev, sub.id]));
-      bringSubToFront(sub.id);
+      // Use the same authoritative open path as the mobile sub-session bar.
+      // On desktop it preserves the other floating windows and raises this
+      // one. On mobile exactly one full-screen sub-session can be visible, so
+      // it replaces the previously-open overlay. The old inline add-to-set
+      // logic left both mobile windows mounted at the same z-index; whichever
+      // happened to render last covered the notification target.
+      openSubSessionWindow(sub.id);
     } else {
       safeLocalStorageSetItem('rcc_session', session);
       setActiveSession(session, { scrollToBottom: options?.scrollToBottom });
+      // A mobile sub-session is a full-screen overlay. Merely selecting its
+      // already-active parent session restores the persisted overlay, leaving
+      // the notification's main-session target hidden underneath it.
+      if (isMobileRef.current) closeAllSubSessionWindows();
     }
     if (quote) {
       const quoteText = `${quote.trim().split('\n').map((l: string) => `> ${l}`).join('\n')}\n`;
       setPendingPrefills((prev) => ({ ...prev, [session]: (prev[session] || '') + quoteText }));
     }
-  }, [setActiveSession, bringSubToFront, resolveNavigationSubSession]);
+  }, [closeAllSubSessionWindows, openSubSessionWindow, resolveNavigationSubSession, setActiveSession]);
 
   const navigateToSessionRef = useRef(navigateToSession);
   navigateToSessionRef.current = navigateToSession;
