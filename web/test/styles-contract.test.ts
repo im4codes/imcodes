@@ -14,6 +14,16 @@ describe('styles.css regression contracts', () => {
   const css = readFileSync(resolve(__dirname, '../src/styles.css'), 'utf8');
   const cssWithoutComments = css.replace(/\/\*[\s\S]*?\*\//g, '');
 
+  it('shows the fast-audit label on desktop and keeps the mobile control icon-only', () => {
+    const desktopRule = css.match(/\.shortcut-btn-peer-audit-label\s*\{[^}]*\}/)?.[0];
+    expect(desktopRule).toBeTruthy();
+    expect(desktopRule).not.toMatch(/display:\s*none/);
+
+    const mobileRule = css.match(/@media\s*\(max-width:\s*640px\)\s*\{[\s\S]*?\.shortcut-btn-peer-audit-label\s*\{[^}]*\}/)?.[0];
+    expect(mobileRule).toBeTruthy();
+    expect(mobileRule).toMatch(/display:\s*none/);
+  });
+
   it('keeps remote desktop file window controls compact and horizontal', () => {
     const actionsRule = css.match(/\.remote-desktop-file-drawer \.remote-desktop-file-drawer-actions\s*\{[^}]*\}/)?.[0];
     expect(actionsRule).toMatch(/display:\s*flex/);

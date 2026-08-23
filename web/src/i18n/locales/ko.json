@@ -2898,6 +2898,7 @@
   },
   "peerAuditQuick": {
     "iconLabel": "피어 감사",
+    "shortLabel": "빠른 감사",
     "tooltip": "다른 에이전트에게 빠른 검토 위임",
     "chooserTitle": "최근 작업 위임",
     "delegationDescription": "모드를 선택한 뒤 에이전트를 클릭하면 즉시 위임합니다. 이 세션이 최근 작업을 요약하고 답장을 기다립니다.",

@@ -2898,6 +2898,7 @@
   },
   "peerAuditQuick": {
     "iconLabel": "ピア監査",
+    "shortLabel": "クイック監査",
     "tooltip": "別のエージェントにクイックレビューを委任",
     "chooserTitle": "最近の作業を委任",
     "delegationDescription": "モードを選び、エージェントをクリックするとすぐに委任します。このセッションが最近の作業を要約し、返信を待ちます。",

@@ -5606,7 +5606,8 @@ afterEach(() => {
     expect(peer.getAttribute('data-testid')).toBe('peer-audit-icon');
     expect(auto.previousElementSibling).toBe(peer);
     expect(peer.getAttribute('aria-label')).toBeTruthy();
-    expect(peer.textContent).toBe('');
+    expect(peer.textContent).toContain('shortLabel');
+    expect(peer.querySelector('.shortcut-btn-peer-audit-label')).not.toBeNull();
     expect(peer.querySelector('svg.shortcut-btn-peer-audit-icon')).not.toBeNull();
     expect(peer.parentElement?.classList.contains('shortcuts-model-supervision')).toBe(true);
   });

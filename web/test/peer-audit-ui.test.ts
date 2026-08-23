@@ -148,6 +148,7 @@ describe('Peer Audit UI slice', () => {
   describe('locale parity', () => {
     const REQUIRED_KEYS = [
       'peerAuditQuick.iconLabel',
+      'peerAuditQuick.shortLabel',
       'peerAuditQuick.tooltip',
       'peerAuditQuick.chooserTitle',
       'peerAuditQuick.delegationDescription',
@@ -214,7 +215,7 @@ describe('Peer Audit UI slice', () => {
     it('does not introduce new peerAuditQuick top-level keys outside the v1 set', () => {
       const top = Object.keys(en.peerAuditQuick as Record<string, unknown>);
       const EXPECTED = [
-        'iconLabel', 'tooltip', 'chooserTitle', 'delegationDescription', 'unknownModel', 'busy', 'unavailable', 'sendFailed',
+        'iconLabel', 'shortLabel', 'tooltip', 'chooserTitle', 'delegationDescription', 'unknownModel', 'busy', 'unavailable', 'sendFailed',
         'modeLabel', 'mode', 'customPlaceholder', 'dispatch', 'consentTitle', 'consentBody',
         'consentConfirm', 'selectionWillPersist', 'noCandidate', 'ineligibleCollapsed', 'providerBadge',
         'chooserReason', 'self_target', 'not_direct_child', 'cross_project', 'execution_clone',

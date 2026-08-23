@@ -2899,6 +2899,7 @@
   },
   "peerAuditQuick": {
     "iconLabel": "Auditoría de pares",
+    "shortLabel": "Auditoría exprés",
     "tooltip": "Delegar una revisión rápida a otro agente",
     "chooserTitle": "Delegar trabajo reciente",
     "delegationDescription": "Elige un modo y haz clic en un agente para delegar de inmediato. Esta sesión resumirá el trabajo reciente y esperará la respuesta.",

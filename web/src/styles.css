@@ -924,8 +924,9 @@ html.native-ios-mac .chat-dl-btn {
   from { background-position: 130% 0, 0 0, 0 0; }
   to { background-position: -125% 0, 0 0, 0 0; }
 }
-.shortcut-btn-peer-audit { height: 26px; box-sizing: border-box; color: #8ea3ba; }
+.shortcut-btn-peer-audit { width: auto; min-width: 28px; height: 26px; box-sizing: border-box; gap: 5px; padding-inline: 7px; color: #8ea3ba; }
 .shortcut-btn-peer-audit-icon { width: 15px; height: 15px; fill: none; stroke: currentColor; stroke-width: 1.9; stroke-linecap: round; stroke-linejoin: round; }
+.shortcut-btn-peer-audit-label { font-size: 10px; font-weight: 650; line-height: 1; white-space: nowrap; }
 .shortcut-btn-auto-dot { width: 6px; height: 6px; border-radius: 999px; flex-shrink: 0; background: var(--shortcut-auto-primary); box-shadow: 0 0 0 1px rgba(255,255,255,0.08); }
 .shortcut-btn-auto-active .shortcut-btn-auto-dot { box-shadow: 0 0 7px var(--shortcut-auto-primary), 0 0 13px var(--shortcut-auto-secondary); animation: shortcut-btn-auto-dot-pulse 1.05s ease-in-out infinite; }
 @keyframes shortcut-btn-auto-dot-pulse {
@@ -2386,6 +2387,8 @@ html.native-ios-mac .chat-dl-btn {
     padding-left: 0;
     padding-right: 0;
   }
+  .shortcut-btn-peer-audit { gap: 0; }
+  .shortcut-btn-peer-audit-label { display: none; }
   .p2p-settings-btn { gap: 0; padding-left: 6px; padding-right: 6px; min-width: auto; }
   .p2p-settings-label { display: none; }
   .session-ctx-wrap { gap: 3px; padding: 4px 5px 4px 0; }

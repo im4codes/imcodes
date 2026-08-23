@@ -2899,6 +2899,7 @@
   },
   "peerAuditQuick": {
     "iconLabel": "Peer audit",
+    "shortLabel": "Fast Audit",
     "tooltip": "Delegate a quick review to another agent",
     "chooserTitle": "Delegate recent work",
     "delegationDescription": "Choose a mode, then click an agent to delegate immediately. This session will summarize its recent work and wait for the reply.",

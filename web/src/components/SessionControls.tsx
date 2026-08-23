@@ -5118,6 +5118,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                 <path d="m15.3 15.3 4.2 4.2" />
                 <path d="m7.7 10.6 1.8 1.8 3.8-4" />
               </svg>
+              <span class="shortcut-btn-peer-audit-label">{t('peerAuditQuick.shortLabel')}</span>
             </button>
             <button
               class={`shortcut-btn shortcut-btn-auto ${quickAutoModeClass}`}

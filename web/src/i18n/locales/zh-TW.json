@@ -2899,6 +2899,7 @@
   },
   "peerAuditQuick": {
     "iconLabel": "對等稽核",
+    "shortLabel": "快審",
     "tooltip": "委派其他智慧體快速複核",
     "chooserTitle": "委派最近工作",
     "delegationDescription": "先選模式，再點智慧體立即委派。本會話會整理最近工作並等待對方回覆。",
