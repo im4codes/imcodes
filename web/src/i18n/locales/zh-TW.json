@@ -715,11 +715,15 @@
     "thinking_title": "等級：{{value}}",
     "supervision": {
       "title": "工作階段監督",
-      "help": "先設定新 Auto 會話預設使用的全域配置，再依需求覆蓋目前會話配置。",
+      "help": "設定一套供所有 Auto 會話共用的全域監督執行環境。",
       "globalDefaultsTitle": "全域預設配置",
-      "globalDefaultsHelp": "用來預填新的 Auto transport 會話。這裡保存的是你的預設監督後端、模型與逾時。",
+      "globalDefaultsHelp": "所有會話共用這裡的主要執行環境、逾時和可選備援執行環境。",
+      "globalPrimaryRuntime": "主要執行環境",
+      "globalBackupRuntime": "備援執行環境",
+      "globalBackupHelp": "可選。主要提供者不可用或回傳無效判定時自動切換。",
       "sessionConfigTitle": "目前會話配置",
-      "sessionConfigHelp": "只套用到目前會話。這裡的後端、模型、逾時可覆蓋全域預設，審計模式與自訂提示詞也只在目前會話生效。",
+      "sessionConfigHelp": "模式、對等審計者、循環上限和自訂提示詞只套用到目前會話。",
+      "usesGlobalRuntime": "後端、模型、預設、逾時和備援執行環境均使用上方全域設定。",
       "intro": {
         "title": "Auto 是做什麼的",
         "howToUseTitle": "怎麼用",

@@ -71,6 +71,29 @@ describe('supervision config helpers', () => {
     expect(config.promptVersion).toBe('custom_prompt_v1');
   });
 
+  it('normalizes an optional backup runtime with the same preset rules as memory processing', () => {
+    const config = normalizeSupervisorDefaultConfig({
+      backend: 'codex-sdk',
+      model: CODEX_MODEL_IDS[0],
+      backupBackend: 'qwen',
+      backupModel: 'MiniMax-M2.7',
+      backupPreset: 'minimax2.7',
+    });
+
+    expect(config).toMatchObject({
+      backupBackend: 'qwen',
+      backupModel: 'MiniMax-M2.7',
+      backupPreset: 'minimax2.7',
+    });
+    expect(normalizeSupervisorDefaultConfig({
+      backend: 'codex-sdk',
+      model: CODEX_MODEL_IDS[0],
+      backupBackend: 'codex-sdk',
+      backupModel: CODEX_MODEL_IDS[0],
+      backupPreset: 'ignored',
+    }).backupPreset).toBeUndefined();
+  });
+
   it('upgrades legacy positive timeouts to the 30-second minimum without invalidating the snapshot', () => {
     const transportConfig = {
       supervision: {

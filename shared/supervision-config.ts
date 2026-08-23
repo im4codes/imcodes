@@ -9,6 +9,7 @@ import {
   inferSharedContextRuntimeBackend,
   isKnownSharedContextModelForBackend,
   normalizeSharedContextPresetValue,
+  normalizeOptionalSharedContextRuntimeSelection,
   normalizeSharedContextRuntimeBackend,
 } from './shared-context-runtime-config.js';
 import { PROCESS_SESSION_AGENT_TYPES, TRANSPORT_SESSION_AGENT_TYPES } from './agent-types.js';
@@ -115,6 +116,9 @@ export type SessionSupervisionSnapshotIssue =
   | 'invalid_custom_instructions_override'
   | 'invalid_global_custom_instructions'
   | 'invalid_preset'
+  | 'invalid_backup_backend'
+  | 'invalid_backup_model'
+  | 'invalid_backup_preset'
   | 'invalid_max_parse_retries'
   | 'invalid_max_auto_continue_streak'
   | 'invalid_max_auto_continue_total'
@@ -156,6 +160,10 @@ export interface SupervisorDefaultConfig {
    * env bundle by delegating to `resolveProcessingProviderSessionConfig`.
    */
   preset?: string;
+  /** Optional fallback runtime, normalized with the same rules as memory processing. */
+  backupBackend?: SharedContextRuntimeBackend;
+  backupModel?: string;
+  backupPreset?: string;
 }
 
 export interface SessionSupervisionSnapshot extends SupervisorDefaultConfig {
@@ -278,6 +286,11 @@ export function normalizeSupervisorDefaultConfig(
     ? rawModel
     : getDefaultSharedContextModelForBackend(normalizedBackend);
   const customInstructions = trimString(merged.customInstructions);
+  const backup = normalizeOptionalSharedContextRuntimeSelection({
+    backend: merged.backupBackend,
+    model: merged.backupModel,
+    preset: merged.backupPreset,
+  });
   return {
     backend: normalizedBackend,
     model,
@@ -291,6 +304,11 @@ export function normalizeSupervisorDefaultConfig(
     maxAutoContinueTotal: normalizeNonNegativeInteger(merged.maxAutoContinueTotal, SUPERVISION_DEFAULT_MAX_AUTO_CONTINUE_TOTAL),
     ...(customInstructions ? { customInstructions } : {}),
     ...(preset ? { preset } : {}),
+    ...(backup.backend && backup.model ? {
+      backupBackend: backup.backend,
+      backupModel: backup.model,
+      ...(backup.preset ? { backupPreset: backup.preset } : {}),
+    } : {}),
   };
 }
 
@@ -342,6 +360,26 @@ export function getSessionSupervisionSnapshotIssues(
   const preset = trimString(record.preset);
   if (record.preset != null && typeof record.preset !== 'string') {
     issues.push('invalid_preset');
+  }
+  const backupBackend = trimString(record.backupBackend);
+  const backupModel = trimString(record.backupModel);
+  const backupPreset = trimString(record.backupPreset);
+  if (record.backupBackend != null && (!backupBackend || !isSupportedSupervisionBackend(backupBackend))) {
+    issues.push('invalid_backup_backend');
+  }
+  if (record.backupModel != null && !backupModel) issues.push('invalid_backup_model');
+  if (record.backupPreset != null && typeof record.backupPreset !== 'string') issues.push('invalid_backup_preset');
+  if (backupModel && !backupBackend && !issues.includes('invalid_backup_backend')) {
+    issues.push('invalid_backup_backend');
+  }
+  if (
+    backupBackend
+    && isSupportedSupervisionBackend(backupBackend)
+    && backupModel
+    && backupBackend !== 'openclaw'
+    && !isKnownSharedContextModelForBackend(backupBackend, backupModel, backupPreset)
+  ) {
+    issues.push('invalid_backup_model');
   }
   if (!model) {
     issues.push('missing_model');

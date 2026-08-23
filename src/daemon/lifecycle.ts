@@ -626,15 +626,19 @@ export async function startup(): Promise<DaemonContext> {
     } catch (err) {
       logger.warn({ err, serverId }, 'shared-context runtime config bootstrap failed');
     }
-    // Prime the supervisor global-defaults cache so the very first
-    // supervision dispatch after startup uses the current custom
-    // instructions even if no session's cached snapshot carries them.
+    // Prime the account-level supervisor runtime so the first decision uses
+    // the current primary/backup selection and global instructions even when
+    // a session carries an older compatibility snapshot.
     // Fire-and-forget: failure just means the daemon falls through to
     // the snapshot mirror. The WS-reconnect hook below keeps it fresh.
     void (async () => {
       try {
-        const { refreshSupervisorDefaultsCache } = await import('./supervisor-defaults-cache.js');
+        const {
+          refreshSupervisorDefaultsCache,
+          startSupervisorDefaultsCacheRefresh,
+        } = await import('./supervisor-defaults-cache.js');
         await refreshSupervisorDefaultsCache();
+        startSupervisorDefaultsCacheRefresh();
       } catch (err) {
         logger.debug({ err }, 'supervisor-defaults-cache: startup prime failed');
       }
@@ -1652,6 +1656,8 @@ export async function shutdown(exitCode = 0): Promise<void> {
     hookServer?.close();
     ctx?.serverLink?.disconnect();
     configureSharedContextRuntime(null);
+    const { stopSupervisorDefaultsCacheRefresh } = await import('./supervisor-defaults-cache.js');
+    stopSupervisorDefaultsCacheRefresh();
     await flushStore();
     logger.info('Store flushed');
   } catch (e) {

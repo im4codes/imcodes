@@ -715,11 +715,15 @@
     "thinking_title": "级别：{{value}}",
     "supervision": {
       "title": "会话监督",
-      "help": "先设置新 Auto 会话默认使用的全局配置，再按需覆盖当前会话配置。",
+      "help": "设置一套供所有 Auto 会话共用的全局监督运行时。",
       "globalDefaultsTitle": "全局默认配置",
-      "globalDefaultsHelp": "用于预填新的 Auto transport 会话。这里保存的是你的默认监督后端、模型和超时。",
+      "globalDefaultsHelp": "所有会话共用这里的主运行时、超时和可选备用运行时。",
+      "globalPrimaryRuntime": "主运行时",
+      "globalBackupRuntime": "备用运行时",
+      "globalBackupHelp": "可选。主提供方不可用或返回无效判定时自动切换。",
       "sessionConfigTitle": "当前会话配置",
-      "sessionConfigHelp": "只作用于当前会话。后端、模型、超时、对等审计者、循环上限和自定义提示词均按会话保存。",
+      "sessionConfigHelp": "模式、对等审计者、循环上限和自定义提示词只作用于当前会话。",
+      "usesGlobalRuntime": "后端、模型、预设、超时和备用运行时均使用上方全局配置。",
       "intro": {
         "title": "Auto 是做什么的",
         "howToUseTitle": "怎么用",

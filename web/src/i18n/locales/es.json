@@ -715,11 +715,15 @@
     "thinking_title": "Nivel: {{value}}",
     "supervision": {
       "title": "Supervisión de sesión",
-      "help": "Primero define los valores globales por defecto para nuevas sesiones con Auto y, cuando haga falta, sobreescríbelos para esta sesión.",
+      "help": "Configura un runtime global de supervisión compartido por todas las sesiones con Auto.",
       "globalDefaultsTitle": "Valores globales por defecto",
-      "globalDefaultsHelp": "Se usan para rellenar nuevas sesiones transport con Auto. Aquí guardas tu backend, modelo y timeout por defecto para supervisión.",
+      "globalDefaultsHelp": "Todas las sesiones usan este runtime principal, timeout y runtime de respaldo opcional.",
+      "globalPrimaryRuntime": "Runtime principal",
+      "globalBackupRuntime": "Runtime de respaldo",
+      "globalBackupHelp": "Opcional. Se usa si el proveedor principal no está disponible o devuelve una decisión no válida.",
       "sessionConfigTitle": "Esta sesión",
-      "sessionConfigHelp": "Solo se aplica a la sesión actual. Aquí backend/modelo/timeout pueden sobrescribir los valores globales, mientras que el modo de auditoría y las instrucciones personalizadas siguen siendo solo de esta sesión.",
+      "sessionConfigHelp": "El modo, auditor, límites de bucle e instrucciones personalizadas solo se aplican a esta sesión.",
+      "usesGlobalRuntime": "Backend, modelo, preset, timeout y respaldo usan la configuración global anterior.",
       "intro": {
         "title": "Qué hace Auto",
         "howToUseTitle": "Cómo usarlo",

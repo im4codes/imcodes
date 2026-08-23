@@ -429,7 +429,7 @@ describe('SharedContextManagementPanel', () => {
     fireEvent.click(primaryBackend);
     fireEvent.click(backupBackend);
     await flush();
-    expect(screen.getAllByLabelText('model:qwen:qwen3-coder-plus').some((el) => el.getAttribute('aria-pressed') === 'true')).toBe(true);
+    expect((screen.getByLabelText('backup:model') as HTMLSelectElement).value).toBe('qwen3-coder-plus');
 
     await act(async () => {
       fireEvent.click(screen.getByText('sharedContext.management.processingSave'));
@@ -451,7 +451,7 @@ describe('SharedContextManagementPanel', () => {
       },
       enablePersonalMemorySync: false,
     }));
-    expect(screen.getAllByLabelText('model:codex-sdk:gpt-5.4').some((el) => el.getAttribute('aria-pressed') === 'true')).toBe(true);
+    expect((screen.getByLabelText('primary:model') as HTMLSelectElement).value).toBe('gpt-5.4');
     expect(await screen.findByText('sharedContext.management.processingSavedPrimaryBackend')).toBeDefined();
   });
 
@@ -553,14 +553,14 @@ describe('SharedContextManagementPanel', () => {
     });
 
     await waitFor(() => {
-      expect(screen.getAllByLabelText('model:claude-code-sdk:sonnet').some((el) => el.getAttribute('aria-pressed') === 'true')).toBe(true);
+      expect((screen.getByLabelText('primary:model') as HTMLSelectElement).value).toBe('sonnet');
     });
 
     await act(async () => {
       fireEvent.click(screen.getByLabelText('sharedContext.management.processingPrimaryBackend: qwen'));
     });
 
-    expect(screen.getAllByLabelText('model:qwen:qwen3-coder-plus').some((el) => el.getAttribute('aria-pressed') === 'true')).toBe(true);
+    expect((screen.getByLabelText('primary:model') as HTMLSelectElement).value).toBe('qwen3-coder-plus');
   });
 
   it('defaults Codex-backed memory processing to Spark while keeping GPT-5.6 selectable', async () => {
@@ -571,17 +571,18 @@ describe('SharedContextManagementPanel', () => {
       fireEvent.click(screen.getByText('sharedContext.management.tabs.processing'));
     });
     await waitFor(() => {
-      expect(screen.getAllByLabelText('model:claude-code-sdk:sonnet').some((el) => el.getAttribute('aria-pressed') === 'true')).toBe(true);
+      expect((screen.getByLabelText('primary:model') as HTMLSelectElement).value).toBe('sonnet');
     });
     await act(async () => {
       fireEvent.click(screen.getByLabelText('sharedContext.management.processingPrimaryBackend: codex-sdk'));
     });
 
-    expect(await screen.findByLabelText('model:codex-sdk:gpt-5.6')).toBeDefined();
-    expect(screen.getByLabelText(`model:codex-sdk:${DEFAULT_CODEX_AUTOMATION_MODEL}`).getAttribute('aria-pressed')).toBe('true');
+    const primaryModel = await screen.findByLabelText('primary:model') as HTMLSelectElement;
+    expect(primaryModel.value).toBe(DEFAULT_CODEX_AUTOMATION_MODEL);
+    expect([...primaryModel.options].some((option) => option.value === 'gpt-5.6')).toBe(true);
   });
 
-  it('allows selecting a backup model directly from backend-specific chips', async () => {
+  it('allows selecting a backup model from the backend-specific dropdown', async () => {
     render(<SharedContextManagementPanel serverId="srv-1" />);
     await flush();
 
@@ -592,12 +593,9 @@ describe('SharedContextManagementPanel', () => {
     await act(async () => {
       fireEvent.click(screen.getByLabelText('sharedContext.management.processingBackupBackend: qwen'));
     });
-    const qwenChip = await screen.findByLabelText('model:qwen:qwen3-coder-plus');
-    await act(async () => {
-      fireEvent.click(qwenChip);
-    });
-
-    expect(qwenChip.getAttribute('aria-pressed')).toBe('true');
+    const qwenModel = await screen.findByLabelText('backup:model') as HTMLSelectElement;
+    fireEvent.change(qwenModel, { target: { value: 'qwen3-coder-plus' } });
+    expect(qwenModel.value).toBe('qwen3-coder-plus');
   });
 
   it('preloads a backend-appropriate backup model as soon as the backup backend changes', async () => {
@@ -609,14 +607,14 @@ describe('SharedContextManagementPanel', () => {
     });
 
     await waitFor(() => {
-      expect(screen.getAllByLabelText('model:claude-code-sdk:sonnet').some((el) => el.getAttribute('aria-pressed') === 'false')).toBe(true);
+      expect((screen.getByLabelText('backup:model') as HTMLSelectElement).value).toBe('');
     });
 
     await act(async () => {
       fireEvent.click(screen.getByLabelText('sharedContext.management.processingBackupBackend: qwen'));
     });
 
-    expect(screen.getAllByLabelText('model:qwen:qwen3-coder-plus').some((el) => el.getAttribute('aria-pressed') === 'true')).toBe(true);
+    expect((screen.getByLabelText('backup:model') as HTMLSelectElement).value).toBe('qwen3-coder-plus');
   });
 
   it('loads qwen presets from ws and persists the selected preset with its derived model', async () => {
@@ -660,18 +658,12 @@ describe('SharedContextManagementPanel', () => {
       fireEvent.click(screen.getByLabelText('sharedContext.management.processingPrimaryBackend: qwen'));
     });
 
-    // Preset chip — the old `<select>` was replaced with a chip button labeled
-    // `{idPrefix}:preset:{name}` so the selector is discoverable and testable
-    // without needing combo-box semantics.
-    const presetChip = await screen.findByLabelText('primary:preset:Qwen Team');
-    await act(async () => {
-      fireEvent.click(presetChip);
+    const presetSelect = await screen.findByLabelText('primary:preset') as HTMLSelectElement;
+    fireEvent.input(presetSelect, { target: { value: 'Qwen Team' } });
+    await waitFor(() => {
+      expect((screen.getByLabelText('primary:preset') as HTMLSelectElement).value).toBe('Qwen Team');
+      expect((screen.getByLabelText('primary:model') as HTMLSelectElement).value).toBe('qwen-team-model');
     });
-
-    // Clicking the preset chip should mark it active AND mirror the preset's
-    // ANTHROPIC_MODEL onto the built-in model highlight so the saved payload
-    // carries the correct model identifier.
-    expect(presetChip.getAttribute('aria-pressed')).toBe('true');
 
     await act(async () => {
       fireEvent.click(screen.getByText('sharedContext.management.processingSave'));

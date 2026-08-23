@@ -715,11 +715,15 @@
     "thinking_title": "Level: {{value}}",
     "supervision": {
       "title": "Session supervision",
-      "help": "Set global defaults for new Auto-enabled sessions, then override them for this session when needed.",
+      "help": "Set one global supervisor runtime shared by every Auto-enabled session.",
       "globalDefaultsTitle": "Global defaults",
-      "globalDefaultsHelp": "Used to prefill new Auto-enabled transport sessions. Saving here updates your default supervisor backend, model, and timeout.",
+      "globalDefaultsHelp": "All sessions use this primary runtime, timeout, and optional backup runtime.",
+      "globalPrimaryRuntime": "Primary runtime",
+      "globalBackupRuntime": "Backup runtime",
+      "globalBackupHelp": "Optional. Used when the primary provider is unavailable or returns an invalid decision.",
       "sessionConfigTitle": "This session",
-      "sessionConfigHelp": "Applies only to the current session. Backend/model/timeout, peer auditor, loop limit, and custom instructions stay session-specific.",
+      "sessionConfigHelp": "Mode, peer auditor, loop limits, and custom instructions apply only to this session.",
+      "usesGlobalRuntime": "Backend, model, preset, timeout, and backup runtime use the global configuration above.",
       "intro": {
         "title": "What Auto does",
         "howToUseTitle": "How to use it",

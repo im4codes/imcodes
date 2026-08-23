@@ -202,15 +202,16 @@ type SupervisionDraft = {
   taskRunPromptVersion?: string;
 };
 
-// Runtime draft used for both the global-defaults region and the session's
-// own backend/model/timeout overrides. `customInstructions` and `preset` are
-// included here so the global-defaults region can edit them; the session
-// region edits its own textarea value separately and uses the override flag
-// to decide merging.
+// Account-level automatic-supervision runtime. Sessions can still customize
+// mode, audit target, limits and instructions, but never own a separate model.
 type SupervisionRuntimeDraft = Pick<
   SupervisionDraft,
   'backend' | 'model' | 'preset' | 'timeoutMs' | 'promptVersion' | 'customInstructions' | 'maxAutoContinueStreak' | 'maxAutoContinueTotal'
->;
+> & {
+  backupBackend?: SharedContextRuntimeBackend;
+  backupModel?: string;
+  backupPreset?: string;
+};
 
 type CcPresetSummary = RuntimeModelPresetEntry;
 
@@ -412,20 +413,20 @@ function SupervisionRuntimeFields({
   model: string;
   preset: string;
   presets: readonly CcPresetSummary[];
-  timeoutSeconds: number;
+  timeoutSeconds?: number;
   modelOptions: readonly string[];
   idPrefix: string;
   onBackendChange: (backend: string) => void;
   onModelChange: (model: string) => void;
   onRuntimeChange: (next: { model: string; preset: string }) => void;
-  onTimeoutChange: (seconds: number) => void;
+  onTimeoutChange?: (seconds: number) => void;
 }) {
   const handleBackendSelect = (e: Event): void => {
     onBackendChange((e.target as HTMLSelectElement).value);
   };
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-      <div style={{ display: 'grid', gridTemplateColumns: backend === 'openclaw' ? 'repeat(3, minmax(0, 1fr))' : 'repeat(2, minmax(0, 1fr))', gap: 12 }}>
+      <div style={{ display: 'grid', gridTemplateColumns: backend === 'openclaw' ? `repeat(${onTimeoutChange ? 3 : 2}, minmax(0, 1fr))` : `repeat(${onTimeoutChange ? 2 : 1}, minmax(0, 1fr))`, gap: 12 }}>
         <div>
           <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 4 }}>{t('session.supervision.backend')}</div>
           <select
@@ -459,7 +460,7 @@ function SupervisionRuntimeFields({
           </div>
         )}
 
-        <div>
+        {onTimeoutChange && timeoutSeconds != null && <div>
           <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 4 }}>{t('session.supervision.timeout')}</div>
           <input
             class="input"
@@ -479,7 +480,7 @@ function SupervisionRuntimeFields({
             style={{ width: '100%' }}
             disabled={saving}
           />
-        </div>
+        </div>}
       </div>
 
       {backend && backend !== 'openclaw' && (
@@ -607,21 +608,21 @@ export function SessionSettingsDialog({
       if (!resolvedModel || prev.model === resolvedModel) return prev;
       return { ...prev, model: resolvedModel };
     });
-    setSupervision((prev) => {
-      const backend = normalizeBackendValue(String(prev.backend ?? ''));
-      if (!backend || !doesSharedContextBackendSupportPresets(backend) || !prev.preset) return prev;
-      const resolvedModel = resolvePresetModel(ccPresets, prev.preset, prev.model);
-      if (!resolvedModel || prev.model === resolvedModel) return prev;
-      return { ...prev, model: resolvedModel };
+    setSupervisorDefaults((prev) => {
+      const backend = normalizeBackendValue(String(prev.backupBackend ?? ''));
+      if (!backend || !doesSharedContextBackendSupportPresets(backend) || !prev.backupPreset) return prev;
+      const resolvedModel = resolvePresetModel(ccPresets, prev.backupPreset, prev.backupModel);
+      if (!resolvedModel || prev.backupModel === resolvedModel) return prev;
+      return { ...prev, backupModel: resolvedModel };
     });
   }, [
     ccPresets,
     supervisorDefaults.backend,
     supervisorDefaults.model,
     supervisorDefaults.preset,
-    supervision.backend,
-    supervision.model,
-    supervision.preset,
+    supervisorDefaults.backupBackend,
+    supervisorDefaults.backupModel,
+    supervisorDefaults.backupPreset,
   ]);
 
   useEffect(() => {
@@ -674,11 +675,6 @@ export function SessionSettingsDialog({
     setSupervisorDefaults(updater);
   };
 
-  const supervisionBackend = normalizeBackendValue(String(supervision.backend ?? ''));
-  const supervisionModel = typeof supervision.model === 'string' ? supervision.model : '';
-  const supervisionTimeout = supervision.timeoutMs ?? DEFAULT_SUPERVISION_TIMEOUT_MS;
-  const supervisionTimeoutSeconds = timeoutMsToUiSeconds(supervisionTimeout);
-  const supervisionPromptVersion = supervision.promptVersion ?? SUPERVISION_PROMPT_VERSION;
   const supervisionCustomInstructions = typeof supervision.customInstructions === 'string' ? supervision.customInstructions : '';
   const supervisionCustomInstructionsOverride = supervision.customInstructionsOverride === true;
   const supervisionParseRetries = supervision.maxParseRetries ?? DEFAULT_SUPERVISION_MAX_PARSE_RETRIES;
@@ -710,13 +706,6 @@ export function SessionSettingsDialog({
     && auditedPeerModel !== 'unknown'
     && selectedPeerAuditCandidate.normalizedModelId === auditedPeerModel);
   const taskRunPromptVersion = supervision.taskRunPromptVersion ?? TASK_RUN_PROMPT_VERSION;
-  const supervisionPresetEntry = ccPresets.find((p) => p.name === (typeof supervision.preset === 'string' ? supervision.preset.trim() : ''));
-  const supervisionPresetModelOptions = getPresetModelOptions(ccPresets, supervision.preset);
-  const modelOptions = supervisionBackend
-    ? (supervisionPresetEntry && supervisionPresetModelOptions.length > 0
-        ? supervisionPresetModelOptions
-        : getSupervisionModelOptions(supervisionBackend))
-    : [];
   const supervisorDefaultsBackend = normalizeBackendValue(String(supervisorDefaults.backend ?? ''));
   const supervisorDefaultsModel = typeof supervisorDefaults.model === 'string' ? supervisorDefaults.model : '';
   const supervisorDefaultsTimeout = supervisorDefaults.timeoutMs ?? DEFAULT_SUPERVISION_TIMEOUT_MS;
@@ -732,12 +721,22 @@ export function SessionSettingsDialog({
   const supervisorDefaultsCustomInstructions = typeof supervisorDefaults.customInstructions === 'string' ? supervisorDefaults.customInstructions : '';
   const supervisorDefaultsAutoContinueStreak = supervisorDefaults.maxAutoContinueStreak ?? DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_STREAK;
   const supervisorDefaultsAutoContinueTotal = supervisorDefaults.maxAutoContinueTotal ?? DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_TOTAL;
-  const supervisionPreset = typeof supervision.preset === 'string' ? supervision.preset : '';
   const supervisorDefaultsPreset = typeof supervisorDefaults.preset === 'string' ? supervisorDefaults.preset : '';
+  const supervisorDefaultsBackupBackend = normalizeBackendValue(String(supervisorDefaults.backupBackend ?? ''));
+  const supervisorDefaultsBackupModel = typeof supervisorDefaults.backupModel === 'string' ? supervisorDefaults.backupModel : '';
+  const supervisorDefaultsBackupPreset = typeof supervisorDefaults.backupPreset === 'string' ? supervisorDefaults.backupPreset : '';
+  const supervisorDefaultsBackupPresetEntry = ccPresets.find((p) => p.name === supervisorDefaultsBackupPreset.trim());
+  const supervisorDefaultsBackupPresetModelOptions = getPresetModelOptions(ccPresets, supervisorDefaultsBackupPreset);
+  const supervisorDefaultsBackupModelOptions = supervisorDefaultsBackupBackend
+    ? (supervisorDefaultsBackupPresetEntry && supervisorDefaultsBackupPresetModelOptions.length > 0
+        ? supervisorDefaultsBackupPresetModelOptions
+        : getSupervisionModelOptions(supervisorDefaultsBackupBackend))
+    : [];
   // Preset persistence is valid only for runtime backends that can resolve the
   // same third-party endpoint bundles used by memory processing.
-  const sessionSupportsPreset = !!supervisionBackend && doesSharedContextBackendSupportPresets(supervisionBackend);
   const defaultsSupportsPreset = !!supervisorDefaultsBackend && doesSharedContextBackendSupportPresets(supervisorDefaultsBackend);
+  const defaultsBackupSupportsPreset = !!supervisorDefaultsBackupBackend
+    && doesSharedContextBackendSupportPresets(supervisorDefaultsBackupBackend);
   // Merged preview shown only when override is unchecked AND both sides have
   // non-empty trimmed content. Any other case is redundant (the effective
   // value equals one or the other side, visible in the textarea already).
@@ -755,14 +754,21 @@ export function SessionSettingsDialog({
 
   const nextTransportConfig = useMemo(() => buildTransportConfigWithSupervision(transportConfig, {
     mode: supervision.mode,
-    backend: supervisionBackend || undefined,
-    model: supervisionModel.trim() || undefined,
-    // Preset only survives when the current backend supports it; the shared
-    // normalizer will also strip it server-side, but stripping here keeps the
-    // diff clean when the user flips between qwen and non-preset backends.
-    ...(sessionSupportsPreset && supervisionPreset.trim() ? { preset: supervisionPreset.trim() } : {}),
-    timeoutMs: supervisionTimeout,
-    promptVersion: supervisionPromptVersion,
+    // Session snapshots retain a runtime mirror for cold-start compatibility,
+    // but the UI has one global source of truth and the daemon refreshes it
+    // continuously and applies it to every decision.
+    backend: supervisorDefaultsBackend || undefined,
+    model: supervisorDefaultsModel.trim() || undefined,
+    ...(defaultsSupportsPreset && supervisorDefaultsPreset.trim() ? { preset: supervisorDefaultsPreset.trim() } : {}),
+    ...(supervisorDefaultsBackupBackend && supervisorDefaultsBackupModel.trim() ? {
+      backupBackend: supervisorDefaultsBackupBackend,
+      backupModel: supervisorDefaultsBackupModel.trim(),
+      ...(defaultsBackupSupportsPreset && supervisorDefaultsBackupPreset.trim()
+        ? { backupPreset: supervisorDefaultsBackupPreset.trim() }
+        : {}),
+    } : {}),
+    timeoutMs: supervisorDefaultsTimeout,
+    promptVersion: supervisorDefaultsPromptVersion,
     customInstructions: supervisionCustomInstructions.trim() || undefined,
     // Only write the flag when true to keep default payloads minimal.
     ...(supervisionCustomInstructionsOverride ? { customInstructionsOverride: true } : {}),
@@ -792,21 +798,25 @@ export function SessionSettingsDialog({
       : {}),
   }), [
     isAuditMode,
-    sessionSupportsPreset,
+    defaultsBackupSupportsPreset,
+    defaultsSupportsPreset,
     supervision.mode,
     supervisionAuditLoops,
     selectedPeerAuditCandidate,
     peerAuditTargetName,
     supervisionAutoContinueStreak,
     supervisionAutoContinueTotal,
-    supervisionBackend,
     supervisionCustomInstructions,
     supervisionCustomInstructionsOverride,
-    supervisionModel,
     supervisionParseRetries,
-    supervisionPreset,
-    supervisionPromptVersion,
-    supervisionTimeout,
+    supervisorDefaultsBackend,
+    supervisorDefaultsBackupBackend,
+    supervisorDefaultsBackupModel,
+    supervisorDefaultsBackupPreset,
+    supervisorDefaultsModel,
+    supervisorDefaultsPreset,
+    supervisorDefaultsPromptVersion,
+    supervisorDefaultsTimeout,
     supervisorDefaultsCustomInstructions,
     taskRunPromptVersion,
     transportConfig,
@@ -959,6 +969,13 @@ export function SessionSettingsDialog({
           ...(defaultsSupportsPreset && supervisorDefaultsPreset.trim()
             ? { preset: supervisorDefaultsPreset.trim() }
             : {}),
+          ...(supervisorDefaultsBackupBackend && supervisorDefaultsBackupModel.trim() ? {
+            backupBackend: supervisorDefaultsBackupBackend,
+            backupModel: supervisorDefaultsBackupModel.trim(),
+            ...(defaultsBackupSupportsPreset && supervisorDefaultsBackupPreset.trim()
+              ? { backupPreset: supervisorDefaultsBackupPreset.trim() }
+              : {}),
+          } : {}),
         });
       }
 
@@ -1013,9 +1030,29 @@ export function SessionSettingsDialog({
     if (!supervisorDefaultsBackend) return false;
     if (!supervisorDefaultsModel.trim()) return false;
     if (supervisorDefaultsBackend !== 'openclaw' && !isKnownSharedContextModelForBackend(supervisorDefaultsBackend, supervisorDefaultsModel.trim(), supervisorDefaultsPreset.trim() || undefined)) return false;
+    if (supervisorDefaultsBackupBackend) {
+      if (!supervisorDefaultsBackupModel.trim()) return false;
+      if (
+        supervisorDefaultsBackupBackend !== 'openclaw'
+        && !isKnownSharedContextModelForBackend(
+          supervisorDefaultsBackupBackend,
+          supervisorDefaultsBackupModel.trim(),
+          supervisorDefaultsBackupPreset.trim() || undefined,
+        )
+      ) return false;
+    }
     if (supervisorDefaultsTimeout < SUPERVISION_MIN_TIMEOUT_MS) return false;
     return true;
-  }, [isSupportedTransport, supervisorDefaultsBackend, supervisorDefaultsModel, supervisorDefaultsPreset, supervisorDefaultsTimeout]);
+  }, [
+    isSupportedTransport,
+    supervisorDefaultsBackend,
+    supervisorDefaultsBackupBackend,
+    supervisorDefaultsBackupModel,
+    supervisorDefaultsBackupPreset,
+    supervisorDefaultsModel,
+    supervisorDefaultsPreset,
+    supervisorDefaultsTimeout,
+  ]);
 
   const supervisionPanel = isSupportedTransport ? (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
@@ -1031,6 +1068,9 @@ export function SessionSettingsDialog({
         </div>
         <div style={{ fontSize: 12, color: '#94a3b8' }}>
           {t('session.supervision.globalDefaultsHelp')}
+        </div>
+        <div style={{ fontSize: 12, color: '#e2e8f0', fontWeight: 600 }}>
+          {t('session.supervision.globalPrimaryRuntime')}
         </div>
         <SupervisionRuntimeFields
           t={t}
@@ -1049,6 +1089,44 @@ export function SessionSettingsDialog({
           onRuntimeChange={({ model, preset }) => updateSupervisorDefaultsFromUser((prev) => ({ ...prev, model, preset: preset || undefined }))}
           onTimeoutChange={(seconds) => updateSupervisorDefaultsFromUser((prev) => ({ ...prev, timeoutMs: timeoutUiSecondsToMs(seconds) }))}
         />
+
+        <div style={{ marginTop: 2, paddingTop: 10, borderTop: '1px solid rgba(148, 163, 184, 0.14)' }}>
+          <div style={{ fontSize: 12, color: '#e2e8f0', fontWeight: 600, marginBottom: 4 }}>
+            {t('session.supervision.globalBackupRuntime')}
+          </div>
+          <div style={{ fontSize: 11, color: '#64748b', marginBottom: 8 }}>
+            {t('session.supervision.globalBackupHelp')}
+          </div>
+          <SupervisionRuntimeFields
+            t={t}
+            saving={saving}
+            backend={supervisorDefaultsBackupBackend}
+            model={supervisorDefaultsBackupModel}
+            preset={supervisorDefaultsBackupPreset}
+            presets={ccPresets}
+            modelOptions={supervisorDefaultsBackupModelOptions}
+            idPrefix="supervision-defaults-backup"
+            onBackendChange={(nextBackend) => {
+              updateSupervisorDefaultsFromUser((prev) => {
+                if (!isSupportedSupervisionBackend(nextBackend)) {
+                  return { ...prev, backupBackend: undefined, backupModel: undefined, backupPreset: undefined };
+                }
+                return {
+                  ...prev,
+                  backupBackend: nextBackend,
+                  backupModel: resolveSupervisionModelForBackend(nextBackend, prev.backupModel ?? '', prev.backupBackend),
+                  backupPreset: doesSharedContextBackendSupportPresets(nextBackend) ? prev.backupPreset : undefined,
+                };
+              });
+            }}
+            onModelChange={(backupModel) => updateSupervisorDefaultsFromUser((prev) => ({ ...prev, backupModel }))}
+            onRuntimeChange={({ model, preset }) => updateSupervisorDefaultsFromUser((prev) => ({
+              ...prev,
+              backupModel: model,
+              backupPreset: preset || undefined,
+            }))}
+          />
+        </div>
 
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 12 }}>
           <div>
@@ -1149,23 +1227,9 @@ export function SessionSettingsDialog({
 
         {hasSupervision && (
           <>
-            <SupervisionRuntimeFields
-              t={t}
-              saving={saving}
-              backend={supervisionBackend}
-              model={supervisionModel}
-              preset={supervisionPreset}
-              presets={ccPresets}
-              timeoutSeconds={supervisionTimeoutSeconds}
-              modelOptions={modelOptions}
-              idPrefix="supervision-session"
-              onBackendChange={(nextBackend) => {
-                setSupervision((prev) => ({ ...prev, ...updateRuntimeDraft(prev, nextBackend) }));
-              }}
-              onModelChange={(model) => setSupervision((prev) => ({ ...prev, model }))}
-              onRuntimeChange={({ model, preset }) => setSupervision((prev) => ({ ...prev, model, preset: preset || undefined }))}
-              onTimeoutChange={(seconds) => setSupervision((prev) => ({ ...prev, timeoutMs: timeoutUiSecondsToMs(seconds) }))}
-            />
+            <div style={{ padding: 10, borderRadius: 8, background: 'rgba(15, 23, 42, 0.6)', border: '1px solid rgba(148, 163, 184, 0.18)', fontSize: 12, color: '#94a3b8' }}>
+              {t('session.supervision.usesGlobalRuntime')}
+            </div>
 
             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 12 }}>
               <div>
@@ -1313,12 +1377,12 @@ export function SessionSettingsDialog({
               <div style={{ fontSize: 12, color: '#94a3b8' }}>{t('session.supervision.summaryMode', { value: supervisionModeLabel })}</div>
               <div style={{ fontSize: 12, color: '#94a3b8' }}>
                 {t('session.supervision.summaryBackendModel', {
-                  backend: supervisionBackend ? labelForBackend(t, supervisionBackend) : t('session.supervision.summaryUnset'),
-                  model: supervisionModel.trim() || t('session.supervision.summaryUnset'),
+                  backend: supervisorDefaultsBackend ? labelForBackend(t, supervisorDefaultsBackend) : t('session.supervision.summaryUnset'),
+                  model: supervisorDefaultsModel.trim() || t('session.supervision.summaryUnset'),
                 })}
               </div>
               <div style={{ fontSize: 12, color: '#94a3b8' }}>
-                {t('session.supervision.summaryTimeout', { value: `${supervisionTimeoutSeconds} s` })}
+                {t('session.supervision.summaryTimeout', { value: `${supervisorDefaultsTimeoutSeconds} s` })}
               </div>
               <div style={{ fontSize: 12, color: '#94a3b8' }}>
                 {t('session.supervision.summaryContinueLimits', {
@@ -1350,7 +1414,7 @@ export function SessionSettingsDialog({
               )}
               <div style={{ fontSize: 11, color: '#64748b' }}>
                 {t('session.supervision.summaryMeta', {
-                  promptVersion: supervisionPromptVersion,
+                  promptVersion: supervisorDefaultsPromptVersion,
                   repairVersion: SUPERVISION_REPAIR_PROMPT_VERSION,
                   parseRetries: supervisionParseRetries,
                   taskRunVersion: taskRunPromptVersion,
@@ -1373,24 +1437,6 @@ export function SessionSettingsDialog({
         </div>
       )}
 
-      {hasSupervision && !supervisionBackend && (
-        <div style={{ color: '#fbbf24', fontSize: 12 }}>
-          {t('session.supervision.validation.backendRequired')}
-        </div>
-      )}
-
-      {hasSupervision && supervisionBackend && !supervisionModel.trim() && (
-        <div style={{ color: '#fbbf24', fontSize: 12 }}>
-          {t('session.supervision.validation.modelRequired')}
-        </div>
-      )}
-
-      {hasSupervision && supervisionBackend && supervisionModel.trim() && supervisionBackend !== 'openclaw' && !isKnownSharedContextModelForBackend(supervisionBackend, supervisionModel.trim(), supervisionPreset.trim() || undefined) && (
-        <div style={{ color: '#f87171', fontSize: 12 }}>
-          {t('session.supervision.validation.modelInvalid', { backend: labelForBackend(t, supervisionBackend) })}
-        </div>
-      )}
-
       {isAuditMode && !peerAuditTargetName && (
         <div style={{ color: '#fbbf24', fontSize: 12 }}>
           {t('session.supervision.validation.auditTargetRequired')}
@@ -1406,16 +1452,13 @@ export function SessionSettingsDialog({
   const supervisionValid = useMemo(() => {
     if (!isSupportedTransport) return true;
     if (!hasSupervision) return true;
-    if (!supervisionBackend) return false;
-    if (!supervisionModel.trim()) return false;
-    if (supervisionBackend !== 'openclaw' && !isKnownSharedContextModelForBackend(supervisionBackend, supervisionModel.trim(), supervisionPreset.trim() || undefined)) return false;
-    if (supervisionTimeout <= 0) return false;
+    if (!globalDefaultsValid) return false;
     if (isAuditMode) {
       if (!peerAuditTargetName || !selectedPeerAuditCandidate?.eligible) return false;
       if (supervisionAuditLoops < 0) return false;
     }
     return true;
-  }, [hasSupervision, isAuditMode, isSupportedTransport, peerAuditTargetName, selectedPeerAuditCandidate, supervisionAuditLoops, supervisionBackend, supervisionModel, supervisionPreset, supervisionTimeout]);
+  }, [globalDefaultsValid, hasSupervision, isAuditMode, isSupportedTransport, peerAuditTargetName, selectedPeerAuditCandidate, supervisionAuditLoops]);
 
   const dialog = (
     <div class="dialog-overlay session-settings-overlay" onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}>

@@ -11,7 +11,9 @@ import {
   type SupervisionProviderFailure,
   type SupervisionRecentEvidence,
 } from './supervision-broker.js';
-import { getCachedGlobalCustomInstructions } from './supervisor-defaults-cache.js';
+import {
+  getCachedSupervisorDefaults,
+} from './supervisor-defaults-cache.js';
 import logger from '../util/logger.js';
 import {
   SUPERVISION_CONTRACT_IDS,
@@ -60,24 +62,36 @@ import {
 import { onDelegationReplyDelivered } from './delegation-reply-events.js';
 
 /**
- * Merge the daemon-cached global custom instructions into a session snapshot
- * when the snapshot's own `globalCustomInstructions` mirror is empty. The
- * web client only updates the mirror for the currently-edited session on
- * save, so snapshots for other sessions can be stale — this function is
- * the runtime fallback that makes the user's saved defaults actually reach
- * every session's supervisor. See `supervisor-defaults-cache.ts`.
- *
- * Returns a new snapshot (does not mutate) when augmentation happens; returns
- * the original reference otherwise so the fast path stays allocation-free.
+ * Apply the daemon-cached global supervisor runtime to every session. Session
+ * snapshots retain legacy runtime fields as a cold-start fallback, but once
+ * user defaults have been fetched they are authoritative for backend/model,
+ * optional backup, timeout and global custom instructions.
  */
-function enrichSnapshotWithGlobalDefaults(
+export function enrichSnapshotWithGlobalDefaults(
   snapshot: SessionSupervisionSnapshot,
 ): SessionSupervisionSnapshot {
-  const existing = snapshot.globalCustomInstructions?.trim();
-  if (existing) return snapshot;
-  const cached = getCachedGlobalCustomInstructions();
+  const cached = getCachedSupervisorDefaults();
   if (!cached) return snapshot;
-  return { ...snapshot, globalCustomInstructions: cached };
+  return {
+    ...snapshot,
+    backend: cached.backend,
+    model: cached.model,
+    timeoutMs: cached.timeoutMs,
+    promptVersion: cached.promptVersion,
+    ...(cached.preset ? { preset: cached.preset } : { preset: undefined }),
+    ...(cached.backupBackend && cached.backupModel ? {
+      backupBackend: cached.backupBackend,
+      backupModel: cached.backupModel,
+      ...(cached.backupPreset ? { backupPreset: cached.backupPreset } : { backupPreset: undefined }),
+    } : {
+      backupBackend: undefined,
+      backupModel: undefined,
+      backupPreset: undefined,
+    }),
+    ...(cached.customInstructions
+      ? { globalCustomInstructions: cached.customInstructions }
+      : { globalCustomInstructions: undefined }),
+  };
 }
 
 type TaskRunPhase = 'execution' | 'auditing' | 'finalizing';

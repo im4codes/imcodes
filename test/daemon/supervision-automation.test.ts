@@ -86,7 +86,14 @@ vi.mock('../../src/daemon/peer-audit-service.js', () => ({
   },
 }));
 
-const { supervisionAutomation } = await import('../../src/daemon/supervision-automation.js');
+const {
+  supervisionAutomation,
+  enrichSnapshotWithGlobalDefaults,
+} = await import('../../src/daemon/supervision-automation.js');
+const {
+  __resetSupervisorDefaultsCacheForTests,
+  __setCachedSupervisorDefaultsForTests,
+} = await import('../../src/daemon/supervisor-defaults-cache.js');
 const { timelineEmitter } = await import('../../src/daemon/timeline-emitter.js');
 const { getSession, upsertSession, removeSession } = await import('../../src/store/session-store.js');
 const { createDelegationReplyAuthority } = await import('../../src/daemon/delegation-reply-authority.js');
@@ -131,6 +138,7 @@ beforeEach(() => {
   vi.useRealTimers();
   mockSupervisionDecide.mockReset();
   mockSupervisionDecide.mockResolvedValue({ decision: 'complete', reason: 'done', confidence: 0.9 });
+  __resetSupervisorDefaultsCacheForTests();
   supervisionAutomation.cancelSession('deck_supervision_brain');
   supervisionAutomation.cancelSession('deck_sub_reviewer');
   mockAuditTargetStatus = 'idle';
@@ -313,6 +321,35 @@ function finishAuditRecoveryTestCleanup() {
 describe('SupervisionAutomation', () => {
   beforeEach(async () => {
     await cleanupProjectDir();
+  });
+
+  it('applies one cached global primary and backup runtime to every legacy session snapshot', async () => {
+    const snapshot = await seedSession('supervised', false, 2, {
+      backend: 'claude-code-sdk',
+      model: 'sonnet',
+      timeoutMs: 45_000,
+    });
+    __setCachedSupervisorDefaultsForTests({
+      backend: 'qwen',
+      model: 'qwen3-coder-plus',
+      preset: 'Qwen Team',
+      backupBackend: 'codex-sdk',
+      backupModel: 'gpt-5.3-codex-spark',
+      timeoutMs: 30_000,
+      promptVersion: 'supervision_decision_v1',
+      customInstructions: 'Use the account-level runtime.',
+    });
+
+    expect(enrichSnapshotWithGlobalDefaults(snapshot)).toMatchObject({
+      mode: 'supervised',
+      backend: 'qwen',
+      model: 'qwen3-coder-plus',
+      preset: 'Qwen Team',
+      backupBackend: 'codex-sdk',
+      backupModel: 'gpt-5.3-codex-spark',
+      timeoutMs: 30_000,
+      globalCustomInstructions: 'Use the account-level runtime.',
+    });
   });
 
   it('skips peer audit when the supervisor classifies a completed turn as ordinary read-only work', async () => {

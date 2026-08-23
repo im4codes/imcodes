@@ -715,11 +715,15 @@
     "thinking_title": "レベル: {{value}}",
     "supervision": {
       "title": "セッション監督",
-      "help": "まず新しい Auto セッション向けのグローバル既定値を設定し、必要に応じてこのセッション専用の設定で上書きします。",
+      "help": "すべての Auto セッションで共有するグローバル監督ランタイムを設定します。",
       "globalDefaultsTitle": "グローバル既定値",
-      "globalDefaultsHelp": "新しい Auto 対応 transport セッションの初期値として使われます。ここで監督バックエンド、モデル、タイムアウトの既定値を保存します。",
+      "globalDefaultsHelp": "すべてのセッションがこの主ランタイム、タイムアウト、任意の予備ランタイムを使用します。",
+      "globalPrimaryRuntime": "主ランタイム",
+      "globalBackupRuntime": "予備ランタイム",
+      "globalBackupHelp": "任意。主プロバイダーが利用不可、または無効な判定を返した場合に使用します。",
       "sessionConfigTitle": "このセッション",
-      "sessionConfigHelp": "現在のセッションにだけ適用されます。ここではバックエンド、モデル、タイムアウトで既定値を上書きでき、監査モードとカスタム指示もこのセッション専用です。",
+      "sessionConfigHelp": "モード、ピア監査者、ループ上限、カスタム指示はこのセッションだけに適用されます。",
+      "usesGlobalRuntime": "バックエンド、モデル、プリセット、タイムアウト、予備ランタイムは上のグローバル設定を使用します。",
       "intro": {
         "title": "Auto の役割",
         "howToUseTitle": "使い方",

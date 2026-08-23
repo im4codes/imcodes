@@ -1,30 +1,28 @@
 /**
  * Daemon-side cache of the user's global supervision defaults.
  *
- * Why this exists: the web client mirrors `globalCustomInstructions` into the
- * CURRENTLY-edited session's `transportConfig.supervision` when a user saves
- * the Session Settings dialog. Any OTHER session's cached snapshot retains
- * the old (or empty) mirror. When the supervisor fires against those other
- * sessions, `resolveEffectiveCustomInstructions(snapshot)` sees an empty
- * global layer and the user's "Always commit and push if asked!" never
- * reaches the prompt.
- *
- * This cache is the fallback layer: the daemon polls the user's current
- * defaults at startup + on each WS reconnect and stores the parsed result
- * in-process. When a snapshot has no `globalCustomInstructions`, callers
- * read `getCachedGlobalCustomInstructions()` and use that instead. No code
- * path silently loses the user's instruction.
+ * Automatic supervision has one account-level runtime selection shared by
+ * every session. Session snapshots retain a compatibility mirror, but cannot
+ * be authoritative because editing a different session would leave them
+ * stale. The daemon therefore refreshes the user's current defaults at
+ * startup, on WS reconnect, and every five seconds.
  *
  * The cache is best-effort: fetch failures do not throw; the daemon falls
- * through to the (possibly stale) snapshot mirror and continues operating.
- * A non-null cache is always more recent than a session snapshot that
- * predates a global-defaults edit.
+ * through to the session mirror until a successful fetch. Once populated,
+ * the cache is authoritative for primary/backup runtime, timeout, prompt
+ * version, and global instructions.
  */
 import logger from '../util/logger.js';
 import { loadCredentials } from '../bind/bind-flow.js';
+import {
+  normalizeSupervisorDefaultConfig,
+  type SupervisorDefaultConfig,
+} from '../../shared/supervision-config.js';
 
-let cachedGlobalCustomInstructions: string | null = null;
+let cachedSupervisorDefaults: SupervisorDefaultConfig | null = null;
 let lastFetchedAt = 0;
+let refreshTimer: ReturnType<typeof setInterval> | null = null;
+const SUPERVISOR_DEFAULTS_REFRESH_INTERVAL_MS = 5_000;
 
 /** Exported for tests and for the WS-reconnect hook. */
 export async function refreshSupervisorDefaultsCache(): Promise<void> {
@@ -45,31 +43,26 @@ export async function refreshSupervisorDefaultsCache(): Promise<void> {
       logger.debug({ status: response.status }, 'supervisor-defaults-cache: fetch non-ok — keeping previous value');
       return;
     }
-    const body = await response.json() as { defaults?: Record<string, unknown> | null };
-    const defaults = body?.defaults ?? null;
-    const next = typeof defaults?.customInstructions === 'string'
-      ? defaults.customInstructions.trim() || null
-      : null;
-    if (next !== cachedGlobalCustomInstructions) {
+    const body = await response.json() as { defaults?: Partial<SupervisorDefaultConfig> | null };
+    const next = normalizeSupervisorDefaultConfig(body?.defaults ?? null);
+    if (JSON.stringify(next) !== JSON.stringify(cachedSupervisorDefaults)) {
       logger.info({
-        previousLength: cachedGlobalCustomInstructions?.length ?? 0,
-        nextLength: next?.length ?? 0,
-      }, 'supervisor-defaults-cache: globalCustomInstructions changed');
+        backend: next.backend,
+        model: next.model,
+        backupConfigured: !!next.backupBackend,
+        customInstructionsLength: next.customInstructions?.length ?? 0,
+      }, 'supervisor-defaults-cache: defaults changed');
     }
-    cachedGlobalCustomInstructions = next;
+    cachedSupervisorDefaults = next;
     lastFetchedAt = Date.now();
   } catch (err) {
     logger.debug({ err }, 'supervisor-defaults-cache: fetch failed — keeping previous value');
   }
 }
 
-/**
- * Return the cached global custom instructions string. `null` means either
- * not-fetched-yet or the user has no global defaults. Callers use this as a
- * fallback; they should prefer `snapshot.globalCustomInstructions` when set.
- */
-export function getCachedGlobalCustomInstructions(): string | null {
-  return cachedGlobalCustomInstructions;
+/** Full global runtime used authoritatively by every supervised session. */
+export function getCachedSupervisorDefaults(): SupervisorDefaultConfig | null {
+  return cachedSupervisorDefaults;
 }
 
 /** When was the last SUCCESSFUL fetch? 0 means never. */
@@ -77,8 +70,32 @@ export function getSupervisorDefaultsCacheAgeMs(): number {
   return lastFetchedAt === 0 ? Infinity : Date.now() - lastFetchedAt;
 }
 
+/** Keep global runtime edits live without requiring a daemon reconnect. */
+export function startSupervisorDefaultsCacheRefresh(): void {
+  if (refreshTimer) return;
+  refreshTimer = setInterval(() => {
+    void refreshSupervisorDefaultsCache();
+  }, SUPERVISOR_DEFAULTS_REFRESH_INTERVAL_MS);
+  refreshTimer.unref?.();
+}
+
+export function stopSupervisorDefaultsCacheRefresh(): void {
+  if (!refreshTimer) return;
+  clearInterval(refreshTimer);
+  refreshTimer = null;
+}
+
 /** Test-only hook. Resets cache state between tests. */
 export function __resetSupervisorDefaultsCacheForTests(): void {
-  cachedGlobalCustomInstructions = null;
+  stopSupervisorDefaultsCacheRefresh();
+  cachedSupervisorDefaults = null;
   lastFetchedAt = 0;
+}
+
+/** Test-only hook for exercising consumers without making an HTTP request. */
+export function __setCachedSupervisorDefaultsForTests(
+  defaults: Partial<SupervisorDefaultConfig> | null,
+): void {
+  cachedSupervisorDefaults = defaults ? normalizeSupervisorDefaultConfig(defaults) : null;
+  lastFetchedAt = defaults ? Date.now() : 0;
 }

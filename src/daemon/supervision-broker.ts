@@ -462,7 +462,16 @@ export class SupervisionBroker {
       snapshot.timeoutMs > 0 ? snapshot.timeoutMs : SUPERVISION_DEFAULT_TIMEOUT_MS,
       SUPERVISION_MIN_TIMEOUT_MS,
     );
-    const key = `${snapshot.backend}:${snapshot.model}:${snapshot.preset ?? ''}`;
+    const runtimes = [{
+      backend: snapshot.backend,
+      model: snapshot.model,
+      preset: snapshot.preset,
+    }, ...(snapshot.backupBackend && snapshot.backupModel ? [{
+      backend: snapshot.backupBackend,
+      model: snapshot.backupModel,
+      preset: snapshot.backupPreset,
+    }] : [])];
+    const key = JSON.stringify(runtimes.map(({ backend, model, preset }) => ({ backend, model, preset: preset ?? '' })));
     const previous = this.queueChains.get(key) ?? Promise.resolve();
     let release!: () => void;
     const current = new Promise<void>((resolve) => { release = resolve; });
@@ -478,9 +487,51 @@ export class SupervisionBroker {
     }
 
     try {
-      const provider = await this.resolveProvider(snapshot.backend);
-      return await this.evaluateWithProvider(provider, request, remainingBudget, snapshot, request.cwd);
-    } catch (error) {
+      let lastError: unknown;
+      for (const [runtimeIndex, runtime] of runtimes.entries()) {
+        const runtimeSnapshot: SessionSupervisionSnapshot = {
+          ...snapshot,
+          backend: runtime.backend,
+          model: runtime.model,
+          ...(runtime.preset ? { preset: runtime.preset } : { preset: undefined }),
+        };
+        const runtimeBudget = timeoutMs - (this.now() - startedAt);
+        if (runtimeBudget <= MIN_SUPERVISION_EXECUTION_BUDGET_MS) break;
+        try {
+          const provider = await this.resolveProvider(runtime.backend);
+          const decision = await this.evaluateWithProvider(provider, request, runtimeBudget, runtimeSnapshot, request.cwd);
+          const canTryBackup = runtimeIndex + 1 < runtimes.length
+            && decision.unavailableReason === SUPERVISION_UNAVAILABLE_REASONS.INVALID_OUTPUT;
+          if (!canTryBackup) return decision;
+          lastError = Object.assign(new Error(decision.reason), {
+            supervisionUnavailableReason: decision.unavailableReason,
+          });
+          logger.warn({
+            backend: runtime.backend,
+            model: runtime.model,
+          }, 'Supervisor primary returned invalid output; trying backup runtime');
+        } catch (error) {
+          lastError = error;
+          if (runtimeIndex + 1 >= runtimes.length) break;
+          const unavailableReason = error && typeof error === 'object' && 'supervisionUnavailableReason' in error
+            ? (error as SupervisionExecutionError).supervisionUnavailableReason
+            : SUPERVISION_UNAVAILABLE_REASONS.PROVIDER_NOT_CONNECTED;
+          if (
+            unavailableReason !== SUPERVISION_UNAVAILABLE_REASONS.PROVIDER_ERROR
+            && unavailableReason !== SUPERVISION_UNAVAILABLE_REASONS.PROVIDER_NOT_CONNECTED
+            && unavailableReason !== SUPERVISION_UNAVAILABLE_REASONS.INVALID_OUTPUT
+          ) break;
+          logger.warn({
+            backend: runtime.backend,
+            model: runtime.model,
+            unavailableReason,
+          }, 'Supervisor primary runtime unavailable; trying backup runtime');
+        }
+      }
+
+      const error = lastError ?? Object.assign(new Error('supervision decision timeout'), {
+        supervisionUnavailableReason: SUPERVISION_UNAVAILABLE_REASONS.DECISION_TIMEOUT,
+      });
       const normalized = error as SupervisionExecutionError;
       // Same reason as normalizeProviderExecutionError: a non-Error thrown from
       // anywhere in this chain must not degrade into `[object Object]` — this

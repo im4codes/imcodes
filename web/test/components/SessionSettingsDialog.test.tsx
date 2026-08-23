@@ -63,17 +63,15 @@ function changeSupervisionMode(value: string): void {
   changeSelect(screen.getByLabelText('supervision-session:mode'), value);
 }
 
-function changeRuntimeBackend(idPrefix: 'supervision-defaults' | 'supervision-session', value: string): void {
+function changeRuntimeBackend(idPrefix: 'supervision-defaults' | 'supervision-defaults-backup', value: string): void {
   changeSelect(screen.getByLabelText(`${idPrefix}:backend`), value);
 }
 
-function clickRuntimeModel(
-  idPrefix: 'supervision-defaults' | 'supervision-session',
-  backend: string,
+function selectRuntimeModel(
+  idPrefix: 'supervision-defaults' | 'supervision-defaults-backup',
   model: string,
 ): void {
-  const selector = screen.getByTestId(`${idPrefix}-runtime-model-preset-selector`);
-  fireEvent.click(within(selector).getByLabelText(`model:${backend}:${model}`));
+  changeSelect(screen.getByLabelText(`${idPrefix}:model`), model);
 }
 
 function makePeerAuditSession(overrides: Record<string, unknown> = {}) {
@@ -166,7 +164,7 @@ describe('SessionSettingsDialog supervision', () => {
     expect(patchSubSessionMock.mock.calls[0]?.[2]).not.toHaveProperty('cwd');
   });
 
-  it('requires backend and model selection before enabling supervised mode', async () => {
+  it('uses global runtime selection and exposes no session-level model controls', async () => {
     const onSaved = vi.fn();
     render(
       <SessionSettingsDialog
@@ -183,15 +181,10 @@ describe('SessionSettingsDialog supervision', () => {
     );
 
     changeSupervisionMode('supervised');
-    expect(screen.getAllByText('backend').length).toBeGreaterThanOrEqual(2);
+    expect(screen.getAllByText('backend')).toHaveLength(2);
     expect(screen.queryByTestId('supervision-session-runtime-model-preset-selector')).toBeNull();
-    expect((screen.getByRole('button', { name: /save/i }) as HTMLButtonElement).disabled).toBe(true);
-
-    changeRuntimeBackend('supervision-session', 'codex-sdk');
-    expect(screen.getByTestId('supervision-session-runtime-model-preset-selector')).toBeDefined();
-    clickRuntimeModel('supervision-session', 'codex-sdk', CODEX_MODEL_IDS[0]);
-    expect(within(screen.getByTestId('supervision-session-runtime-model-preset-selector'))
-      .getByLabelText(`model:codex-sdk:${CODEX_MODEL_IDS[0]}`).getAttribute('aria-pressed')).toBe('true');
+    expect(screen.getByText('usesGlobalRuntime')).toBeDefined();
+    expect((screen.getByLabelText('supervision-defaults:model') as HTMLSelectElement).value).toBe(DEFAULT_CODEX_AUTOMATION_MODEL);
     fireEvent.click(screen.getByRole('button', { name: /save/i }));
 
     await waitFor(() => {
@@ -200,7 +193,7 @@ describe('SessionSettingsDialog supervision', () => {
           supervision: expect.objectContaining({
             mode: 'supervised',
             backend: 'codex-sdk',
-            model: CODEX_MODEL_IDS[0],
+            model: DEFAULT_CODEX_AUTOMATION_MODEL,
           }),
         }),
       }));
@@ -233,8 +226,9 @@ describe('SessionSettingsDialog supervision', () => {
     const backendSelect = screen.getByLabelText('supervision-defaults:backend') as HTMLSelectElement;
     await waitFor(() => {
       expect(backendSelect.value).toBe('codex-sdk');
-      expect(screen.getByLabelText(`model:codex-sdk:${DEFAULT_CODEX_AUTOMATION_MODEL}`).getAttribute('aria-pressed')).toBe('true');
-      expect(screen.getByLabelText('model:codex-sdk:gpt-5.6')).toBeDefined();
+      const modelSelect = screen.getByLabelText('supervision-defaults:model') as HTMLSelectElement;
+      expect(modelSelect.value).toBe(DEFAULT_CODEX_AUTOMATION_MODEL);
+      expect([...modelSelect.options].some((option) => option.value === 'gpt-5.6')).toBe(true);
     });
   });
 
@@ -432,8 +426,6 @@ describe('SessionSettingsDialog supervision', () => {
     });
     expect(screen.getByText('maxAuditLoops')).toBeDefined();
 
-    changeRuntimeBackend('supervision-session', 'claude-code-sdk');
-    clickRuntimeModel('supervision-session', 'claude-code-sdk', CLAUDE_CODE_MODEL_IDS[0]);
     fireEvent.click(screen.getByRole('button', { name: /save/i }));
 
     await waitFor(() => {
@@ -600,7 +592,7 @@ describe('SessionSettingsDialog supervision', () => {
     });
 
     changeSupervisionMode('supervised');
-    expect(screen.getAllByDisplayValue('30').length).toBeGreaterThanOrEqual(2);
+    expect(screen.getAllByDisplayValue('30')).toHaveLength(1);
     expect(screen.getAllByDisplayValue('4').length).toBeGreaterThanOrEqual(2);
     expect(screen.getAllByDisplayValue('9').length).toBeGreaterThanOrEqual(2);
     fireEvent.click(screen.getByRole('button', { name: /save/i }));
@@ -656,7 +648,7 @@ describe('SessionSettingsDialog supervision', () => {
     );
 
     expect(screen.getByText('summaryMode:supervised_audit')).toBeDefined();
-    expect(screen.getByText(`summaryBackendModel:codex_sdk:${CODEX_MODEL_IDS[0]}`)).toBeDefined();
+    expect(screen.getByText(`summaryBackendModel:codex_sdk:${DEFAULT_CODEX_AUTOMATION_MODEL}`)).toBeDefined();
     expect(screen.getByText('summaryTimeout:30 s')).toBeDefined();
     expect(screen.getByText('summaryContinueLimits:2:8')).toBeDefined();
     expect(screen.getByText('summaryCustomInstructions:summaryCustomInstructionsSet')).toBeDefined();
@@ -776,24 +768,24 @@ describe('SessionSettingsDialog supervision', () => {
     // unified runtime selector must expose the third-party preset alongside
     // the built-in models.
     await waitFor(() => expect(screen.getByTestId('supervision-defaults-runtime-model-preset-selector')).toBeDefined());
-    expect(screen.getByLabelText('supervision-defaults:preset:MiniMax')).toBeDefined();
+    expect(screen.getByLabelText('supervision-defaults:preset')).toBeDefined();
 
-    // Enable supervised mode on this qwen session and pick a preset-pinned model.
+    // Enable supervised mode and choose the global preset-pinned model.
     changeSupervisionMode('supervised');
-    changeRuntimeBackend('supervision-session', 'qwen');
-
-    // Both regions now render the same preset + model selector.
-    await waitFor(() => expect(screen.getByTestId('supervision-session-runtime-model-preset-selector')).toBeDefined());
-
-    const sessionMiniMax = screen.getByLabelText('supervision-session:preset:MiniMax');
-    fireEvent.click(sessionMiniMax);
-    expect(sessionMiniMax.getAttribute('aria-pressed')).toBe('true');
-    expect(within(screen.getByTestId('supervision-session-runtime-model-preset-selector'))
-      .getByLabelText('model:qwen:MiniMax-M2.5').getAttribute('aria-pressed')).toBe('true');
+    changeSelect(screen.getByLabelText('supervision-defaults:preset'), 'MiniMax');
+    await waitFor(() => {
+      expect((screen.getByLabelText('supervision-defaults:preset') as HTMLSelectElement).value).toBe('MiniMax');
+      expect((screen.getByLabelText('supervision-defaults:model') as HTMLSelectElement).value).toBe('MiniMax-M2.5');
+    });
 
     fireEvent.click(screen.getByRole('button', { name: /save/i }));
 
     await waitFor(() => {
+      expect(saveSupervisorDefaultsMock).toHaveBeenCalledWith(expect.objectContaining({
+        backend: 'qwen',
+        model: 'MiniMax-M2.5',
+        preset: 'MiniMax',
+      }));
       expect(patchSessionMock).toHaveBeenCalledWith('srv-1', 'deck_proj_brain', expect.objectContaining({
         transportConfig: expect.objectContaining({
           supervision: expect.objectContaining({
@@ -866,13 +858,13 @@ describe('SessionSettingsDialog supervision', () => {
     });
 
     await waitFor(() => {
-      expect(screen.getByLabelText('supervision-defaults:preset:MiniMax').getAttribute('aria-pressed')).toBe('true');
+      expect((screen.getByLabelText('supervision-defaults:preset') as HTMLSelectElement).value).toBe('MiniMax');
     });
     const globalSelector = within(screen.getByTestId('supervision-defaults-runtime-model-preset-selector'));
-    const pinnedModel = globalSelector.getByLabelText('model:qwen:MiniMax-M2.5') as HTMLButtonElement;
-    expect(pinnedModel.getAttribute('aria-pressed')).toBe('true');
+    const pinnedModel = globalSelector.getByLabelText('supervision-defaults:model') as HTMLSelectElement;
+    expect(pinnedModel.value).toBe('MiniMax-M2.5');
     expect(pinnedModel.disabled).toBe(true);
-    expect(globalSelector.queryByLabelText('model:qwen:qwen3-coder-plus')).toBeNull();
+    expect([...pinnedModel.options].some((option) => option.value === 'qwen3-coder-plus')).toBe(false);
 
     fireEvent.click(screen.getByRole('button', { name: /save/i }));
 
@@ -918,8 +910,6 @@ describe('SessionSettingsDialog supervision', () => {
 
     // Turn on supervised mode and the session body must become editable.
     changeSupervisionMode('supervised');
-    changeRuntimeBackend('supervision-session', 'codex-sdk');
-    clickRuntimeModel('supervision-session', 'codex-sdk', CODEX_MODEL_IDS[0]);
 
     // Session-level custom instructions — different text so we can confirm
     // the session layer vs global layer are kept distinct in the payload.
@@ -981,8 +971,6 @@ describe('SessionSettingsDialog supervision', () => {
     );
 
     changeSupervisionMode('supervised');
-    changeRuntimeBackend('supervision-session', 'codex-sdk');
-    clickRuntimeModel('supervision-session', 'codex-sdk', CODEX_MODEL_IDS[0]);
     fireEvent.input(screen.getByPlaceholderText('customInstructionsPlaceholder'), {
       target: { value: 'Always require tests and clean verification before complete.' },
     });
@@ -1138,8 +1126,6 @@ describe('SessionSettingsDialog supervision', () => {
     );
 
     changeSupervisionMode('supervised');
-    changeRuntimeBackend('supervision-session', 'codex-sdk');
-    clickRuntimeModel('supervision-session', 'codex-sdk', CODEX_MODEL_IDS[0]);
     fireEvent.click(screen.getByRole('button', { name: /save/i }));
 
     await waitFor(() => {
@@ -1176,7 +1162,13 @@ describe('SessionSettingsDialog supervision', () => {
     );
 
     changeRuntimeBackend('supervision-defaults', 'claude-code-sdk');
-    clickRuntimeModel('supervision-defaults', 'claude-code-sdk', CLAUDE_CODE_MODEL_IDS[0]);
+    await waitFor(() => {
+      expect((screen.getByLabelText('supervision-defaults:model') as HTMLSelectElement).value).toBe('sonnet');
+    });
+    selectRuntimeModel('supervision-defaults', CLAUDE_CODE_MODEL_IDS[0]);
+    await waitFor(() => {
+      expect((screen.getByLabelText('supervision-defaults:model') as HTMLSelectElement).value).toBe(CLAUDE_CODE_MODEL_IDS[0]);
+    });
     const timeoutInput = screen.getByLabelText('supervision-defaults:timeout');
     expect(timeoutInput.getAttribute('min')).toBe('30');
     fireEvent.input(timeoutInput, { target: { value: '5' } });
@@ -1192,5 +1184,36 @@ describe('SessionSettingsDialog supervision', () => {
     });
     expect(patchSessionMock).not.toHaveBeenCalled();
     expect(patchSubSessionMock).not.toHaveBeenCalled();
+  });
+
+  it('persists an optional global backup runtime from the shared dropdown selector', async () => {
+    render(
+      <SessionSettingsDialog
+        serverId="srv-1"
+        sessionName="deck_proj_brain"
+        label="Brain"
+        description="desc"
+        cwd="/proj"
+        type="codex-sdk"
+        transportConfig={null}
+        onClose={vi.fn()}
+        onSaved={vi.fn()}
+      />,
+    );
+
+    changeRuntimeBackend('supervision-defaults-backup', 'qwen');
+    await waitFor(() => {
+      expect((screen.getByLabelText('supervision-defaults-backup:model') as HTMLSelectElement).value)
+        .toBe('qwen3-coder-plus');
+    });
+    fireEvent.click(screen.getByRole('button', { name: /save/i }));
+
+    await waitFor(() => {
+      expect(saveSupervisorDefaultsMock).toHaveBeenCalledWith(expect.objectContaining({
+        backupBackend: 'qwen',
+        backupModel: 'qwen3-coder-plus',
+      }));
+    });
+    expect(patchSessionMock).not.toHaveBeenCalled();
   });
 });

@@ -120,6 +120,64 @@ describe('parseSupervisionDecision', () => {
 });
 
 describe('SupervisionBroker', () => {
+  it('falls back to the configured backup runtime when the primary provider fails', async () => {
+    const primary = new FakeProvider([]);
+    const backup = new FakeProvider([
+      '{"decision":"complete","reason":"backup ok","confidence":0.8}',
+    ]);
+    const resolveProvider = vi.fn(async (backend: string) => (
+      backend === 'codex-sdk' ? primary : backup
+    ));
+    const broker = new SupervisionBroker({ resolveProvider });
+    const snapshot = normalizeSessionSupervisionSnapshot({
+      mode: SUPERVISION_MODE.SUPERVISED,
+      backend: 'codex-sdk',
+      model: 'gpt-5.3-codex-spark',
+      backupBackend: 'qwen',
+      backupModel: 'MiniMax-M2.7',
+      backupPreset: 'minimax2.7',
+    });
+
+    const result = await broker.decide({
+      snapshot,
+      taskRequest: 'Implement the task',
+      assistantResponse: 'Done',
+    });
+
+    expect(result).toMatchObject({ decision: 'complete', reason: 'backup ok' });
+    expect(resolveProvider).toHaveBeenNthCalledWith(1, 'codex-sdk');
+    expect(resolveProvider).toHaveBeenNthCalledWith(2, 'qwen');
+    expect(resolverMock).toHaveBeenLastCalledWith({
+      backend: 'qwen',
+      model: 'MiniMax-M2.7',
+      preset: 'minimax2.7',
+    });
+  });
+
+  it('falls back when the primary runtime exhausts structured-output repair', async () => {
+    const primary = new FakeProvider(['not json', 'still not json']);
+    const backup = new FakeProvider([
+      '{"decision":"complete","reason":"backup parsed","confidence":0.8}',
+    ]);
+    const broker = new SupervisionBroker({
+      resolveProvider: async (backend) => backend === 'codex-sdk' ? primary : backup,
+    });
+    const snapshot = normalizeSessionSupervisionSnapshot({
+      mode: SUPERVISION_MODE.SUPERVISED,
+      backend: 'codex-sdk',
+      model: 'gpt-5.3-codex-spark',
+      backupBackend: 'qwen',
+      backupModel: 'qwen3-coder-plus',
+      maxParseRetries: 1,
+    });
+
+    const result = await broker.decide({ snapshot, taskRequest: 'Task', assistantResponse: 'Done' });
+
+    expect(result).toMatchObject({ decision: 'complete', reason: 'backup parsed' });
+    expect(primary.createSession).toHaveBeenCalledTimes(1);
+    expect(backup.createSession).toHaveBeenCalledTimes(1);
+  });
+
   it.each([
     ['claude-code-sdk', 'sonnet'],
     ['codex-sdk', 'gpt-5.3-codex-spark'],

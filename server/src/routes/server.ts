@@ -521,17 +521,11 @@ serverRoutes.get('/:id/shared-context/runtime-config/daemon', async (c) => {
  * GET /:id/supervision/user-defaults/daemon
  *
  * Daemon-scoped (Bearer server token) read of the user's global supervision
- * defaults pref. Exists because the web client only mirrors
- * `globalCustomInstructions` into the CURRENTLY-edited session's transportConfig
- * on save. Any OTHER session's cached snapshot retains an older (or empty)
- * global value — which is what made the user-visible complaint "typed
- * `Always commit and push if asked!` in Global custom instructions, but
- * supervisor ignores it" real: the session under supervision was not the
- * session where the defaults were saved, so its snapshot's
- * `globalCustomInstructions` was stale.
- *
- * The daemon polls this at startup + on each WS reconnect and uses the
- * result as a fallback layer for `resolveEffectiveCustomInstructions()`.
+ * defaults pref. Automatic supervision uses one account-level primary and
+ * optional backup runtime for every session, so a session's compatibility
+ * snapshot cannot be the source of truth after another tab edits the global
+ * settings. The daemon refreshes this endpoint at startup, on reconnect, and
+ * periodically while running.
  */
 serverRoutes.get('/:id/supervision/user-defaults/daemon', async (c) => {
   const auth = c.req.header('Authorization');
