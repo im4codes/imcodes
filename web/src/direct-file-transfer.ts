@@ -1442,45 +1442,68 @@ export async function selectPreviewDownloadDestination(suggestedName?: string): 
   }
 }
 
-async function downloadNativeHttpBlob(options: {
-  serverId: string;
-  previewHandle: string;
-  suggestedName?: string;
-  sessionName?: string;
-  signal?: AbortSignal;
-  onProgress?: (progress: FileDownloadProgress) => void;
-  onSaveReady?: (save: () => Promise<void>) => void;
-}): Promise<void> {
-  const chunks: ArrayBuffer[] = [];
-  await streamAttachmentDownloadToWritable(
-    options.serverId,
-    options.previewHandle,
-    {
-      async write(data) {
-        const bytes = data instanceof ArrayBuffer
-          ? new Uint8Array(data)
-          : new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
-        const copy = new Uint8Array(bytes.byteLength);
-        copy.set(bytes);
-        chunks.push(copy.buffer);
+type NativeBlobDownloadSink = {
+  destination: DirectPreviewDownloadDestination;
+  takeCompletedBlob(): Blob;
+};
+
+function createNativeBlobDownloadSink(): NativeBlobDownloadSink {
+  let completedBlob: Blob | null = null;
+  return {
+    destination: {
+      handle: {
+        async createWritable() {
+          const chunks: ArrayBuffer[] = [];
+          let settled = false;
+          completedBlob = null;
+          return {
+            async write(data) {
+              if (settled) throw new Error('download_writer_closed');
+              const bytes = data instanceof ArrayBuffer
+                ? new Uint8Array(data)
+                : new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+              const copy = new Uint8Array(bytes.byteLength);
+              copy.set(bytes);
+              chunks.push(copy.buffer);
+            },
+            async close() {
+              if (settled) throw new Error('download_writer_closed');
+              settled = true;
+              completedBlob = new Blob(chunks);
+              chunks.length = 0;
+            },
+            async abort() {
+              settled = true;
+              chunks.length = 0;
+            },
+          };
+        },
       },
     },
-    options.sessionName,
-    options.signal,
-    options.onProgress,
-  );
-  if (options.signal?.aborted) throw new DOMException('download_canceled', 'AbortError');
-  const blob = new Blob(chunks);
+    takeCompletedBlob() {
+      if (!completedBlob) throw directError(DIRECT_FILE_TRANSFER_ERROR.WRITE_FAILED, false, 'download_blob_missing');
+      const blob = completedBlob;
+      completedBlob = null;
+      return blob;
+    },
+  };
+}
+
+async function presentNativeDownloadedBlob(options: {
+  blob: Blob;
+  suggestedName?: string;
+  onSaveReady?: (save: () => Promise<void>) => void;
+}): Promise<void> {
   const fileName = options.suggestedName?.trim() || 'download';
   try {
-    await shareBlobOrDownload(blob, fileName);
+    await shareBlobOrDownload(options.blob, fileName);
   } catch (error) {
-    // Web Share requires a live user gesture. An HTTP transfer necessarily
-    // finishes after that gesture has expired in WKWebView. Keep the completed
-    // payload and let the transfer center invoke the same share operation from
-    // a fresh explicit tap instead of misreporting a network failure.
+    // Web Share requires a live user gesture. A direct or HTTP transfer
+    // necessarily finishes after that gesture has expired in WKWebView. Keep
+    // the completed payload and let the transfer center invoke the same save
+    // operation from a fresh explicit tap instead of reporting transfer failure.
     if (!options.onSaveReady) throw error;
-    options.onSaveReady(() => shareBlobOrDownload(blob, fileName).then(() => undefined));
+    options.onSaveReady(() => shareBlobOrDownload(options.blob, fileName).then(() => undefined));
   }
 }
 
@@ -1506,18 +1529,18 @@ export async function downloadPreviewWithDirectFallback(options: {
   onMode?: (mode: FileDownloadTransportMode) => void;
   onSaveReady?: (save: () => Promise<void>) => void;
 }): Promise<void> {
-  const destination = options.destination === undefined
+  // Mobile WebViews have no File System Access picker. Give the existing P2P
+  // protocol an in-memory writable target, then pass the completed bytes to the
+  // embedded Capacitor Filesystem/Share bridge (or a fresh Web Share tap). The
+  // same sink is recreated for the one HTTP fallback, so partial P2P bytes are
+  // never mixed with fallback bytes.
+  const nativeBlobSink = isNative() && options.destination == null
+    ? createNativeBlobDownloadSink()
+    : null;
+  const destination = nativeBlobSink?.destination ?? (options.destination === undefined
     ? await selectPreviewDownloadDestination(options.suggestedName)
-    : options.destination;
+    : options.destination);
   if (!destination) {
-    if (isNative()) {
-      // Capacitor WebViews do not expose File System Access. Keep mobile on
-      // authenticated HTTP for now, but retain observable progress and save
-      // completion inside the current WebView instead of handing off a URL.
-      options.onMode?.(FILE_DOWNLOAD_TRANSPORT_MODE.HTTP);
-      await downloadNativeHttpBlob(options);
-      return;
-    }
     // No File System Access API means no safe streaming sink.  Keep the
     // established HTTP browser download as the only fallback and do not start
     // an unbounded Blob/direct transfer.
@@ -1544,12 +1567,11 @@ export async function downloadPreviewWithDirectFallback(options: {
         direction: DIRECT_FILE_TRANSFER_DIRECTION.DOWNLOAD,
         route: await selectedPeerRoute(lease.peer),
       });
-      return;
     } catch (error) {
       if (isTerminalDirectFailure(error)) throw error;
       // Exactly one HTTP fallback after the full direct budget. It reuses the
-      // already user-approved destination and streams response chunks instead
-      // of constructing a Blob.
+      // same destination: desktop keeps streaming to its approved file handle,
+      // while mobile rebuilds only the completed fallback payload for sharing.
       const writer = await createPreviewWriter(destination);
       try {
         options.onMode?.(FILE_DOWNLOAD_TRANSPORT_MODE.FALLING_BACK);
@@ -1569,14 +1591,29 @@ export async function downloadPreviewWithDirectFallback(options: {
           },
         );
         await writer.close();
-        return;
       } catch (fallbackError) {
         await writer.abort(fallbackError).catch(() => undefined);
         throw fallbackError;
       }
+      if (nativeBlobSink) {
+        await presentNativeDownloadedBlob({
+          blob: nativeBlobSink.takeCompletedBlob(),
+          suggestedName: options.suggestedName,
+          onSaveReady: options.onSaveReady,
+        });
+      }
+      return;
     } finally {
       release();
     }
+    if (nativeBlobSink) {
+      await presentNativeDownloadedBlob({
+        blob: nativeBlobSink.takeCompletedBlob(),
+        suggestedName: options.suggestedName,
+        onSaveReady: options.onSaveReady,
+      });
+    }
+    return;
   }
   const writer = await createPreviewWriter(destination);
   try {
@@ -1586,6 +1623,13 @@ export async function downloadPreviewWithDirectFallback(options: {
   } catch (error) {
     await writer.abort(error).catch(() => undefined);
     throw error;
+  }
+  if (nativeBlobSink) {
+    await presentNativeDownloadedBlob({
+      blob: nativeBlobSink.takeCompletedBlob(),
+      suggestedName: options.suggestedName,
+      onSaveReady: options.onSaveReady,
+    });
   }
 }
 

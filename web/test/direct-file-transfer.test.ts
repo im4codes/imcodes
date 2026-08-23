@@ -878,15 +878,8 @@ describe('direct file transfer v2 browser broker', () => {
     expect(sent).toHaveLength(0);
   });
 
-  it('uses observable HTTP download inside the native WebView without starting P2P or browser handoff', async () => {
+  it('downloads through P2P inside the native WebView before opening save or share', async () => {
     vi.stubGlobal('Capacitor', { isNativePlatform: () => true });
-    apiMocks.streamAttachmentDownloadToWritable.mockImplementationOnce(async (...args: unknown[]) => {
-      const writable = args[2] as { write(data: BufferSource): Promise<void> };
-      const progress = args[5] as ((value: { loadedBytes: number; totalBytes: number | null }) => void) | undefined;
-      progress?.({ loadedBytes: 0, totalBytes: 3 });
-      await writable.write(new Uint8Array([1, 2, 3]));
-      progress?.({ loadedBytes: 3, totalBytes: 3 });
-    });
     const { downloadPreviewWithDirectFallback, FILE_DOWNLOAD_TRANSPORT_MODE } = await import('../src/direct-file-transfer.js');
     const { ws, sent } = createWs(directCapabilities);
     const onProgress = vi.fn();
@@ -904,29 +897,61 @@ describe('direct file transfer v2 browser broker', () => {
       onMode,
     });
 
-    expect(onMode).toHaveBeenCalledOnce();
-    expect(onMode).toHaveBeenCalledWith(FILE_DOWNLOAD_TRANSPORT_MODE.HTTP);
-    expect(onProgress.mock.calls).toEqual([
-      [{ loadedBytes: 0, totalBytes: 3 }],
-      [{ loadedBytes: 3, totalBytes: 3 }],
+    expect(onMode.mock.calls.map(([mode]) => mode)).toEqual([
+      FILE_DOWNLOAD_TRANSPORT_MODE.CONNECTING,
+      FILE_DOWNLOAD_TRANSPORT_MODE.DIRECT,
     ]);
+    expect(onProgress).toHaveBeenCalledWith({ loadedBytes: 0, totalBytes: 3 });
+    expect(onProgress).toHaveBeenLastCalledWith({ loadedBytes: 3, totalBytes: 3 });
     expect(browserDownloadMocks.shareBlobOrDownload).toHaveBeenCalledOnce();
     const [blob, fileName] = browserDownloadMocks.shareBlobOrDownload.mock.calls[0]!;
     expect(blob).toBeInstanceOf(Blob);
     expect(blob.size).toBe(3);
     expect(fileName).toBe('mobile-report.pdf');
+    expect(apiMocks.streamAttachmentDownloadToWritable).not.toHaveBeenCalled();
     expect(apiMocks.downloadAttachment).not.toHaveBeenCalled();
     expect(httpFallback).not.toHaveBeenCalled();
-    expect(sent).toHaveLength(0);
-    expect(FakePeerConnection.instances).toHaveLength(0);
+    expect(sent).toContainEqual(expect.objectContaining({ type: DIRECT_FILE_TRANSFER_MSG.OPERATION_INIT }));
+    expect(FakePeerConnection.instances).toHaveLength(1);
   });
 
-  it('keeps completed native HTTP bytes for a fresh save tap when automatic sharing loses activation', async () => {
+  it('falls back from mobile P2P to HTTP before opening save or share', async () => {
     vi.stubGlobal('Capacitor', { isNativePlatform: () => true });
     apiMocks.streamAttachmentDownloadToWritable.mockImplementationOnce(async (...args: unknown[]) => {
       const writable = args[2] as { write(data: BufferSource): Promise<void> };
-      await writable.write(new Uint8Array([1, 2, 3]));
+      const progress = args[5] as ((value: { loadedBytes: number; totalBytes: number | null }) => void) | undefined;
+      progress?.({ loadedBytes: 0, totalBytes: 4 });
+      await writable.write(new Uint8Array([4, 5, 6, 7]));
+      progress?.({ loadedBytes: 4, totalBytes: 4 });
     });
+    const { downloadPreviewWithDirectFallback, FILE_DOWNLOAD_TRANSPORT_MODE } = await import('../src/direct-file-transfer.js');
+    const { ws } = createWs(directCapabilities, 'operation_failure');
+    const onMode = vi.fn();
+
+    await downloadPreviewWithDirectFallback({
+      ws,
+      serverId: 'server-1',
+      previewHandle: 'preview-handle-1',
+      suggestedName: 'mobile-fallback.pdf',
+      destination: null,
+      onMode,
+    });
+
+    expect(onMode.mock.calls.map(([mode]) => mode)).toEqual([
+      FILE_DOWNLOAD_TRANSPORT_MODE.CONNECTING,
+      FILE_DOWNLOAD_TRANSPORT_MODE.FALLING_BACK,
+      FILE_DOWNLOAD_TRANSPORT_MODE.HTTP,
+    ]);
+    expect(apiMocks.streamAttachmentDownloadToWritable).toHaveBeenCalledOnce();
+    expect(browserDownloadMocks.shareBlobOrDownload).toHaveBeenCalledOnce();
+    const [blob, fileName] = browserDownloadMocks.shareBlobOrDownload.mock.calls[0]!;
+    expect(blob).toBeInstanceOf(Blob);
+    expect(blob.size).toBe(4);
+    expect(fileName).toBe('mobile-fallback.pdf');
+  });
+
+  it('keeps completed native P2P bytes for a fresh save tap when automatic sharing loses activation', async () => {
+    vi.stubGlobal('Capacitor', { isNativePlatform: () => true });
     browserDownloadMocks.shareBlobOrDownload
       .mockRejectedValueOnce(new DOMException('gesture expired', 'NotAllowedError'))
       .mockResolvedValueOnce('shared');
