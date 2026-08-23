@@ -18,7 +18,7 @@ import {
   type MemoryMcpToolFamilyGateView,
 } from '@shared/memory-ws.js';
 import { TRANSPORT_MSG } from '@shared/transport-events.js';
-import { CC_PRESET_MSG, getCcPresetEffectiveModel, type CcPresetModelInfo } from '@shared/cc-presets.js';
+import { CC_PRESET_MSG } from '@shared/cc-presets.js';
 import {
   MEMORY_MANAGEMENT_ERROR_CODES,
   type MemoryFeatureAdminRecord,
@@ -92,6 +92,10 @@ import {
   updateSharedContextRuntimeConfig,
   updateTeamMemberRole,
 } from '../api.js';
+import {
+  RuntimeModelPresetSelector,
+  type RuntimeModelPresetEntry,
+} from './RuntimeModelPresetSelector.js';
 import { ChatMarkdown } from './ChatMarkdown.js';
 import type { WsClient } from '../ws-client.js';
 import { CLAUDE_CODE_MODEL_IDS, CODEX_MODEL_IDS } from '../../../src/shared/models/options.js';
@@ -638,106 +642,6 @@ function processingChipStyle(active: boolean) {
       };
 }
 
-function modelChipStyle(active: boolean) {
-  return active
-    ? {
-        ...buttonStyle,
-        padding: '3px 8px',
-        fontSize: 11,
-        fontWeight: 700,
-        background: '#0f766e',
-        lineHeight: 1.35,
-      }
-    : {
-        ...subtleButtonStyle,
-        padding: '3px 8px',
-        fontSize: 11,
-        fontWeight: 600,
-        background: '#1e293b',
-        lineHeight: 1.35,
-      };
-}
-
-/** Preset chip: visually distinct from built-in model chips so users can see at
- *  a glance that a preset pulls in env/endpoint config, not just a model name. */
-function presetChipStyle(active: boolean) {
-  return active
-    ? {
-        ...buttonStyle,
-        padding: '3px 8px',
-        fontSize: 11,
-        fontWeight: 700,
-        background: '#7c3aed',
-        border: '1px solid #a78bfa',
-        display: 'inline-flex',
-        alignItems: 'center',
-        gap: 3,
-        lineHeight: 1.35,
-      }
-    : {
-        ...subtleButtonStyle,
-        padding: '3px 8px',
-        fontSize: 11,
-        fontWeight: 600,
-        background: '#1e1b3a',
-        border: '1px solid #4c1d95',
-        color: '#c4b5fd',
-        display: 'inline-flex',
-        alignItems: 'center',
-        gap: 3,
-        lineHeight: 1.35,
-      };
-}
-
-/** Shared row for preset + built-in chips. Wraps on narrow widths but never
- *  grows vertically beyond what the content needs — no decorative container. */
-const compactChipRowStyle = {
-  display: 'flex',
-  gap: 4,
-  flexWrap: 'wrap',
-  alignItems: 'center',
-} as const;
-
-/** Tiny inline "Preset:" / "Model:" label that sits on the same row as the
- *  chips. Smaller than the uppercase field label to keep the dimension
- *  separation visually obvious without adding another stacked heading. */
-const inlineDimensionLabelStyle = {
-  fontSize: 10,
-  fontWeight: 700,
-  letterSpacing: '0.1em',
-  textTransform: 'uppercase',
-  color: DT.text.muted,
-  marginRight: 6,
-  minWidth: 44,
-  flex: '0 0 auto',
-} as const;
-
-/** "(none)" / neutral chip used to clear the preset selection explicitly —
- *  visually distinct from both preset chips (purple) and model chips (teal)
- *  so users can see at a glance that it's the "no bundle" state. */
-function neutralChipStyle(active: boolean) {
-  return active
-    ? {
-        ...buttonStyle,
-        padding: '3px 8px',
-        fontSize: 11,
-        fontWeight: 700,
-        background: '#374151',
-        border: '1px solid #6b7280',
-        lineHeight: 1.35,
-      }
-    : {
-        ...subtleButtonStyle,
-        padding: '3px 8px',
-        fontSize: 11,
-        fontWeight: 600,
-        background: '#1f2937',
-        border: '1px solid #374151',
-        color: '#9ca3af',
-        lineHeight: 1.35,
-      };
-}
-
 const defaultPolicyState: SharedProjectPolicy = {
   enrollmentId: '',
   enterpriseId: '',
@@ -1162,175 +1066,6 @@ const adminFormRowStyle = {
   padding: SC_IS_MOBILE ? 0 : `${DT.space.xs}px 0`,
 } as const;
 
-interface ProcessingPresetEntry {
-  name: string;
-  env: Record<string, string>;
-  contextWindow?: number;
-  initMessage?: string;
-  availableModels?: CcPresetModelInfo[];
-  defaultModel?: string;
-  modelDiscoveryError?: string;
-}
-
-/**
- * Unified model + preset selector.
- *
- * Replaces the older two-control design (a `<select>` for presets PLUS a chip
- * row for models) with a single flat set of chips grouped by kind. This
- * removes the dual-control confusion where selecting a preset left the model
- * chip stale (or vice versa), and where the `<select>` silently failed to
- * reflect saved state when the saved preset wasn't in the loaded list yet.
- *
- * Interaction:
- *   - Clicking a PRESET chip: selects that preset and, if the preset's env
- *     carries ANTHROPIC_MODEL, mirrors that model so downstream consumers
- *     don't need to resolve the preset separately.
- *   - Clicking a MODEL chip: selects the model and clears any active preset
- *     (presets carry additional env like base URL / API key — clearing keeps
- *     the two concepts from drifting).
- *   - Clicking the active chip again: deselects (clears both for safety).
- *
- * Active-state highlighting is decoupled per-chip so users can see both the
- * active preset AND the active model when a preset-derived model matches a
- * built-in. That's the read path of the state the save will persist.
- */
-function ModelPresetChipSelector({
-  backend,
-  model,
-  preset,
-  presets,
-  onChange,
-  idPrefix,
-}: {
-  backend: SharedContextRuntimeBackend;
-  model: string;
-  preset: string;
-  presets: ReadonlyArray<ProcessingPresetEntry>;
-  onChange: (next: { model: string; preset: string }) => void;
-  idPrefix: string;
-}) {
-  const { t } = useTranslation();
-  const modelOptions = PROCESSING_MODEL_OPTIONS_BY_BACKEND[backend] ?? [];
-  const supportsPresets = doesSharedContextBackendSupportPresets(backend);
-  const trimmedModel = model.trim();
-  const trimmedPreset = preset.trim();
-  if (modelOptions.length === 0 && (!supportsPresets || presets.length === 0)) return null;
-
-  // Preset vs model are two DIFFERENT dimensions, not peers.
-  //
-  //   - A preset is an env bundle (ANTHROPIC_BASE_URL + ANTHROPIC_API_KEY +
-  //     ANTHROPIC_MODEL). Picking a preset routes traffic to the endpoint
-  //     that preset points at, and pins the model that endpoint serves.
-  //   - A model is the identifier the endpoint resolves. Built-in qwen
-  //     models run on the default qwen endpoint (OAuth / coding plan).
-  //
-  // Rendering them as one flat chip list invited users to read the preset
-  // as a "model" alongside the others. Split them into two labeled rows so
-  // the semantic distinction is visible in a glance, still compact:
-  //
-  //   Preset:  [ (none) ] [⚙ minimax] [⚙ team-b]
-  //   Model:   [coder-model] [qwen3-coder-plus] …   (when no preset)
-  //            [MiniMax-M2.5]                         (when preset pins one)
-  const activePreset = supportsPresets
-    ? presets.find((p) => p.name === trimmedPreset)
-    : undefined;
-  const presetPinnedModel = activePreset ? (getCcPresetEffectiveModel(activePreset) ?? '') : '';
-  // When a preset is active, model selection collapses to what the preset
-  // endpoint exposes — show ONLY the pinned model as a single read-ish chip.
-  // User can still switch away by clicking a built-in chip, which clears
-  // the preset (the `onChange({ model, preset: '' })` path handles that).
-  return (
-    <div style={chipGroupStyle}>
-      {supportsPresets && presets.length > 0 ? (
-        <div style={compactChipRowStyle}>
-          <span style={inlineDimensionLabelStyle}>{t('sharedContext.management.processingPresetLabel')}</span>
-          <button
-            key={`${idPrefix}:preset:__none__`}
-            type="button"
-            aria-label={`${idPrefix}:preset:none`}
-            aria-pressed={!trimmedPreset}
-            title={t('sharedContext.management.processingPresetNoneTitle')}
-            style={neutralChipStyle(!trimmedPreset)}
-            onClick={() => onChange({ model: trimmedModel, preset: '' })}
-          >
-            {t('sharedContext.management.processingPresetNone')}
-          </button>
-          {presets.map((p) => {
-            const active = trimmedPreset === p.name;
-            const pinned = getCcPresetEffectiveModel(p);
-            return (
-              <button
-                key={`${idPrefix}:preset:${p.name}`}
-                type="button"
-                aria-label={`${idPrefix}:preset:${p.name}`}
-                aria-pressed={active}
-                title={pinned
-                  ? t('sharedContext.management.processingPresetBundleModelTitle', { model: pinned })
-                  : t('sharedContext.management.processingPresetBundleTitle', { preset: p.name })}
-                style={presetChipStyle(active)}
-                onClick={() => {
-                  // Picking a preset pins its embedded model. User has to
-                  // explicitly pick a built-in model chip below (or "(none)"
-                  // + another chip) to override, which clears the preset
-                  // so the two dimensions can't drift.
-                  onChange({ model: pinned || trimmedModel, preset: p.name });
-                }}
-              >
-                <span aria-hidden="true">⚙</span>
-                <span>{p.name}</span>
-              </button>
-            );
-          })}
-        </div>
-      ) : null}
-      <div style={compactChipRowStyle}>
-        <span style={inlineDimensionLabelStyle}>{t('sharedContext.management.processingModelLabel')}</span>
-        {activePreset ? (
-          // Preset active — this row is read-only: the endpoint dictates
-          // the model. Rendered with the teal "active" style so the user
-          // sees WHICH model the preset pins without a misleading
-          // "click to pick" affordance.
-          <button
-            key={`${backend}:preset-pinned`}
-            type="button"
-            aria-label={`model:${backend}:${presetPinnedModel || '(preset)'}`}
-            aria-pressed={true}
-            disabled
-            title={t('sharedContext.management.processingModelPresetTitle')}
-            style={{ ...modelChipStyle(true), cursor: 'default', opacity: 0.95 }}
-          >
-            {presetPinnedModel || t('sharedContext.management.processingModelDefinedByPreset')}
-          </button>
-        ) : (
-          modelOptions.map((modelId) => {
-            const active = trimmedModel === modelId;
-            return (
-              <button
-                key={`${backend}:${modelId}`}
-                type="button"
-                aria-label={`model:${backend}:${modelId}`}
-                aria-pressed={active}
-                style={modelChipStyle(active)}
-                onClick={() => onChange({ model: modelId, preset: '' })}
-              >
-                {modelId}
-              </button>
-            );
-          })
-        )}
-      </div>
-    </div>
-  );
-}
-
-/** Vertical stack for the two-row (Preset / Model) selector. Tighter than
- *  `fieldLabelStyle`'s flex-column so the rows sit close together. */
-const chipGroupStyle = {
-  display: 'flex',
-  flexDirection: 'column',
-  gap: 4,
-} as const;
-
 function formatMemberIdentity(member: TeamDetail['members'][number]): string {
   const displayName = member.display_name?.trim();
   if (displayName) return displayName;
@@ -1624,7 +1359,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
   const [processingMemoryScoringWeights, setProcessingMemoryScoringWeights] = useState<MemoryScoringWeights>({ ...DEFAULT_MEMORY_SCORING_WEIGHTS });
   const [memoryAdvancedVisible, setMemoryAdvancedVisible] = useState(false);
   const [processingPersonalSyncEnabled, setProcessingPersonalSyncEnabled] = useState(false);
-  const [processingPresets, setProcessingPresets] = useState<Array<{ name: string; env: Record<string, string>; contextWindow?: number; initMessage?: string }>>([]);
+  const [processingPresets, setProcessingPresets] = useState<RuntimeModelPresetEntry[]>([]);
   const [memoryLoading, setMemoryLoading] = useState(false);
   const [memoryProjectId, setMemoryProjectId] = useState('');
   const [selectedMemoryProjectId, setSelectedMemoryProjectId] = useState('');
@@ -1807,7 +1542,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
     if (!ws) return;
     const unsub = ws.onMessage((msg) => {
       if (msg.type === CC_PRESET_MSG.LIST_RESPONSE) {
-        setProcessingPresets((msg as { presets?: ProcessingPresetEntry[] }).presets ?? []);
+        setProcessingPresets((msg as { presets?: RuntimeModelPresetEntry[] }).presets ?? []);
       }
     });
     try { ws.send({ type: CC_PRESET_MSG.LIST }); } catch {}
@@ -3886,11 +3621,12 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                     </label>
                     <label style={fieldLabelStyle}>
                       <span>{t('sharedContext.management.processingPrimaryModel')}</span>
-                      <ModelPresetChipSelector
+                      <RuntimeModelPresetSelector
                         backend={processingPrimaryBackend}
                         model={processingPrimaryModel}
                         preset={processingPrimaryPreset}
                         presets={processingPresets}
+                        modelOptions={PROCESSING_MODEL_OPTIONS_BY_BACKEND[processingPrimaryBackend] ?? []}
                         idPrefix="primary"
                         onChange={({ model, preset }) => {
                           setProcessingPrimaryModel(model);
@@ -3920,11 +3656,12 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                     </label>
                     <label style={fieldLabelStyle}>
                       <span>{t('sharedContext.management.processingBackupModel')}</span>
-                      <ModelPresetChipSelector
+                      <RuntimeModelPresetSelector
                         backend={processingBackupBackend}
                         model={processingBackupModel}
                         preset={processingBackupPreset}
                         presets={processingPresets}
+                        modelOptions={PROCESSING_MODEL_OPTIONS_BY_BACKEND[processingBackupBackend] ?? []}
                         idPrefix="backup"
                         onChange={({ model, preset }) => {
                           setProcessingBackupModel(model);

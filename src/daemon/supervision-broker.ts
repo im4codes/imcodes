@@ -100,9 +100,29 @@ export interface SupervisionBrokerRequest {
   snapshot: SessionSupervisionSnapshot | null | undefined;
   taskRequest: string;
   assistantResponse?: string;
+  /**
+   * Bounded chronological evidence from the current session. The decision
+   * prompt renders this as inert context so the arbiter can correlate recent
+   * refinements and structured audit results instead of judging from only the
+   * original request and final assistant paragraph.
+   */
+  recentEvidence?: readonly SupervisionRecentEvidence[];
   cwd?: string;
   description?: string;
 }
+
+export type SupervisionRecentEvidence =
+  | {
+      kind: 'user' | 'assistant';
+      text: string;
+    }
+  | {
+      kind: 'peer_audit_result';
+      outcome: string;
+      auditorSessionName?: string;
+      findings?: string;
+      reason?: string;
+    };
 
 export interface SupervisionBrokerDeps {
   resolveProvider?: (backend: SharedContextRuntimeBackend) => Promise<TransportProvider>;

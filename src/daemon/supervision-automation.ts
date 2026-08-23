@@ -9,6 +9,7 @@ import { timelineEmitter } from './timeline-emitter.js';
 import {
   supervisionBroker,
   type SupervisionProviderFailure,
+  type SupervisionRecentEvidence,
 } from './supervision-broker.js';
 import { getCachedGlobalCustomInstructions } from './supervisor-defaults-cache.js';
 import logger from '../util/logger.js';
@@ -42,6 +43,7 @@ import {
   PEER_AUDIT_DEADLINE_MS,
   PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS,
   parsePeerAuditOrchestratedResult,
+  sanitizePeerAuditUntrustedText,
   type PeerAuditTerminalOutcome,
 } from '../../shared/peer-audit.js';
 import { TIMELINE_EVENT_FILE_CHANGE, type FileChangePatch } from '../../shared/file-change.js';
@@ -101,6 +103,16 @@ const SUPERVISION_PARKED_LABEL = 'Supervised: parked until the pending reply arr
  */
 const SUPERVISION_WAITING_TIMEOUT_MS = 30 * 60_000;
 const AUDIT_TARGET_MAX_RECOVERY_CONTINUES = 2;
+/**
+ * Provider/runtime projections are not guaranteed to publish the final
+ * assistant row before the adjacent `idle` edge. Give that row a short,
+ * bounded window to arrive instead of permanently discarding the run at the
+ * first out-of-order idle event.
+ */
+const SUPERVISION_COMPLETION_GRACE_MS = 2_000;
+const SUPERVISION_RECENT_EVIDENCE_EVENT_COUNT = 80;
+const SUPERVISION_RECENT_EVIDENCE_COUNT = 12;
+const SUPERVISION_RECENT_EVIDENCE_TEXT_LENGTH = 4_096;
 
 interface ActiveTaskRunState {
   generation: number;
@@ -137,6 +149,8 @@ interface ActiveTaskRunState {
   auditTargetRecoveryTimer?: NodeJS.Timeout;
   /** Safety net for a parked run whose awaited reply never arrives. */
   waitingTimeoutTimer?: NodeJS.Timeout;
+  /** Bounded wait for a final assistant row that raced behind `idle`. */
+  completionGraceTimer?: NodeJS.Timeout;
   /** How much audit this run's change is worth; scopes the delegated brief. */
   auditDepth?: SupervisionAuditDepth;
   // When a reply-backed audit settles from the assistant-text fallback (that
@@ -188,10 +202,36 @@ function isDelegationCompletionNotificationText(text: string | undefined): boole
   return text?.trimStart().startsWith(AGENT_DELEGATION_COMPLETION_NOTIFICATION_MARKER) === true;
 }
 
+/**
+ * Models occasionally omit the hidden orchestration marker even though their
+ * user-visible conclusion is explicit. This fallback is consulted only after
+ * a correlated reply-enabled audit has actually been delivered, and accepts
+ * only a single anchored verdict line — incidental PASS/REWORK words in the
+ * findings cannot open the gate.
+ */
+function parseExplicitAuditVerdict(text: string): 'PASS' | 'REWORK' | null {
+  const matches = [...text.matchAll(
+    /^\s*(?:[-*]\s*)?(?:#{1,6}\s*)?(?:\*{1,2}\s*)?(?:final\s+(?:independent\s+)?(?:audit|review)\s+(?:verdict|recommendation)|(?:independent\s+)?(?:audit|review)(?:\s+(?:verdict|recommendation))?|verdict|recommendation|最终独立复审|最终审计结论|独立审计|审计结论|复审结论|审计|审核|复审|终审|结论)\s*\**\s*[:：-]?\s*\**(PASS|REWORK)\b/gimu,
+  )].map((match) => match[1]!.toUpperCase() as 'PASS' | 'REWORK');
+  const unique = [...new Set(matches)];
+  return unique.length === 1 ? unique[0]! : null;
+}
+
+function sanitizeRecentEvidenceText(value: string): string {
+  const sanitized = sanitizePeerAuditUntrustedText(value)
+    .replace(/<!--\s*IMCODES_AUTOMATIC_AUDIT:[\s\S]*?-->/giu, '[removed audit control marker]')
+    .replace(/[\u0000\u0008\u000b\u000c\u000e-\u001f\u007f]/g, '')
+    .trim();
+  if (sanitized.length <= SUPERVISION_RECENT_EVIDENCE_TEXT_LENGTH) return sanitized;
+  return `${sanitized.slice(0, SUPERVISION_RECENT_EVIDENCE_TEXT_LENGTH - 1)}…`;
+}
+
 function isReplyEnabledPeerAuditDelegationText(text: string | undefined, replyToSession: string): boolean {
   if (!text) return false;
-  const hasExactReplyRoute = text.includes(AGENT_DELEGATION_REPLY_INSTRUCTION_MARKER)
-    && text.includes(buildAgentDelegationReplyInstruction(replyToSession));
+  const hasStructuredReplyAuthority = !!extractAgentDelegationReplyAuthorityFromInstruction(text);
+  const hasExactReplyRoute = hasStructuredReplyAuthority
+    || (text.includes(AGENT_DELEGATION_REPLY_INSTRUCTION_MARKER)
+      && text.includes(buildAgentDelegationReplyInstruction(replyToSession)));
   const asksForAudit = /(?:\b(?:independent(?:ly)?\s+)?(?:peer\s+)?audit\b|独立(?:只读)?(?:审计|审核|复审|终审)|(?:审计|审核|复审|终审)(?:当前|本次|这次|最近))/iu.test(text);
   return hasExactReplyRoute && asksForAudit;
 }
@@ -276,6 +316,7 @@ const REPOSITORY_FINALIZATION_ACTION_RE = /(?:\b(?:git\s+(?:add|commit|push|merg
 const SUBSTANTIVE_PRE_AUDIT_ACTION_RE = /(?:\b(?:test|tests|testing|typecheck|lint|build|verify|verification|validate|validation|fix|repair|implement|edit|modify|update|write|refactor|restart)\b|测试|类型检查|构建|验证|修复|实现|修改|更新|编写|重构|重启)/iu;
 const COMPLETED_PRE_AUDIT_WORK_RE = /(?:\b(?:implementation|fix(?:es)?|coding|changes?|tests?|testing|typecheck|lint|build|verification|validation)\b[\s\S]{0,80}\b(?:complete|completed|done|finished|pass(?:ed)?)\b|(?:修复|实现|代码|改动|测试|验证|检查|类型检查|构建)[\s\S]{0,60}(?:已完成|已经完成|均已完成|全部完成|完成并通过|已通过|验证通过|测试通过))/iu;
 const PENDING_PRE_AUDIT_WORK_RE = /(?:\b(?:still|yet|remaining|pending|missing|failed?|incomplete|need(?:s)?\s+to|must)\b[\s\S]{0,50}\b(?:implementation|fix(?:es)?|tests?|testing|typecheck|lint|build|verification|validation)\b|\b(?:implementation|fix(?:es)?|tests?|testing|typecheck|lint|build|verification|validation)\b[\s\S]{0,50}\b(?:remain(?:s|ing)?|pending|missing|fail(?:ed|ing)?|incomplete|not\s+(?:done|complete)|need(?:s)?|required)\b|(?:仍|还|尚|待|未|缺少|失败)[\s\S]{0,30}(?:测试|验证|修复|实现|构建|类型检查)|(?:测试|验证|修复|实现|构建|类型检查)[\s\S]{0,30}(?:未完成|仍需|还需|待处理|失败|缺失|未通过))/iu;
+const NEW_AUDIT_DELEGATION_RE = /(?:\b(?:send|dispatch|delegate|construct|prepare)\b[\s\S]{0,100}\b(?:reply[- ]enabled|peer\s+audit|independent\s+(?:audit|review)|audit\s+brief)\b|\b(?:reply[- ]enabled|peer\s+audit|audit\s+brief)\b[\s\S]{0,100}\b(?:send|dispatch|delegate|construct|prepare)\b|(?:发送|补发|构造|准备|委派|发起)[\s\S]{0,80}(?:带回复|可回复|独立)?(?:审计|审核|复审)(?:简报|任务|请求)?)/iu;
 const POST_AUDIT_REPOSITORY_FINALIZATION_ACTION = 'Peer-audit has passed. Perform only the already-audited repository or delivery finalization requested for this task (stage/commit/push, merge, release, publish, or deploy as applicable). Do not perform additional implementation work. Do not request or start another audit.';
 
 type RepositoryFinalizationClassification = 'none' | 'finalization_only' | 'completion_evidenced_mixed';
@@ -299,6 +340,13 @@ function isRepositoryFinalizationOnly(decision: { nextAction?: string }): decisi
 
 function hasRepositoryFinalizationAction(decision: { nextAction?: string }): boolean {
   return Boolean(decision.nextAction?.trim() && REPOSITORY_FINALIZATION_ACTION_RE.test(decision.nextAction));
+}
+
+function requestsOnlyRedundantAudit(decision: { reason: string; nextAction?: string; gap?: string }): boolean {
+  const text = [decision.nextAction, decision.gap, decision.reason]
+    .filter((entry): entry is string => typeof entry === 'string' && entry.trim().length > 0)
+    .join(' ');
+  return NEW_AUDIT_DELEGATION_RE.test(text) && !PENDING_PRE_AUDIT_WORK_RE.test(text);
 }
 
 /**
@@ -495,6 +543,51 @@ function collectTimelineAuditArtifacts(sessionName: string): TimelineAuditArtifa
   };
 }
 
+function collectRecentSupervisionEvidence(sessionName: string): SupervisionRecentEvidence[] {
+  const events = timelineEmitter
+    .replay(sessionName, 0)
+    .events
+    .slice(-SUPERVISION_RECENT_EVIDENCE_EVENT_COUNT);
+  const evidence: SupervisionRecentEvidence[] = [];
+
+  for (const event of events) {
+    if (event.type === 'peer_audit.result') {
+      const outcome = typeof event.payload.outcome === 'string'
+        ? sanitizeRecentEvidenceText(event.payload.outcome)
+        : '';
+      if (!outcome) continue;
+      const auditorSessionName = typeof event.payload.auditorSessionName === 'string'
+        ? sanitizeRecentEvidenceText(event.payload.auditorSessionName)
+        : undefined;
+      const findings = typeof event.payload.findingsPreview === 'string'
+        ? sanitizeRecentEvidenceText(event.payload.findingsPreview)
+        : undefined;
+      const reason = typeof event.payload.reason === 'string'
+        ? sanitizeRecentEvidenceText(event.payload.reason)
+        : undefined;
+      evidence.push({
+        kind: 'peer_audit_result',
+        outcome,
+        ...(auditorSessionName ? { auditorSessionName } : {}),
+        ...(findings ? { findings } : {}),
+        ...(reason ? { reason } : {}),
+      });
+      continue;
+    }
+    if (event.type !== 'user.message' && event.type !== 'assistant.text') continue;
+    if (event.payload.streaming === true
+      || event.payload.automation === true
+      || event.payload.memoryExcluded === true) continue;
+    const text = typeof event.payload.text === 'string'
+      ? sanitizeRecentEvidenceText(event.payload.text)
+      : '';
+    if (!text || (event.type === 'user.message' && isDelegationCompletionNotificationText(text))) continue;
+    evidence.push({ kind: event.type === 'user.message' ? 'user' : 'assistant', text });
+  }
+
+  return evidence.slice(-SUPERVISION_RECENT_EVIDENCE_COUNT);
+}
+
 function resolveReferencedOpenSpecChangeName(
   run: ActiveTaskRunState,
   changeNames: string[],
@@ -595,6 +688,9 @@ class SupervisionAutomation {
   private recentTaskCandidates = new Map<string, RecentTaskCandidate>();
   private latestAssistantTexts = new Map<string, LatestAssistantText>();
   private lastObservedSessionStates = new Map<string, string>();
+  private implicitCompletionGraceTimers = new Map<string, NodeJS.Timeout>();
+  /** Monotonic even across cancellation, so an old async verdict cannot match a replacement run. */
+  private nextRunGeneration = 0;
   private initialized = false;
   private eventSequence = 0;
 
@@ -661,9 +757,13 @@ class SupervisionAutomation {
       this.clearAuditTargetRecovery(state);
       this.emitOrchestratedAuditResult(state, 'cancelled', 'session_supervision_cancelled');
     }
-    // A deleted run must not leave its park timer armed: generation is reused,
-    // so a survivor could later terminate an unrelated run.
-    if (state) this.clearWaitingTimeout(state);
+    // A deleted run must not leave any completion timer armed. Generations are
+    // monotonic, but clearing eagerly avoids retaining stale run state.
+    if (state) {
+      this.clearWaitingTimeout(state);
+      this.clearCompletionGrace(state);
+    }
+    this.clearImplicitCompletionGrace(sessionName);
     this.activeRuns.delete(sessionName);
     this.pendingTaskIntents.delete(sessionName);
     this.recentTaskCandidates.delete(sessionName);
@@ -694,6 +794,7 @@ class SupervisionAutomation {
         this.emitOrchestratedAuditResult(run, 'cancelled', 'audit_target_user_stopped');
       }
       this.clearWaitingTimeout(run);
+      this.clearCompletionGrace(run);
       this.activeRuns.delete(run.sessionName);
       this.clearStatus(run.sessionName);
       this.emitWarning(
@@ -734,7 +835,8 @@ class SupervisionAutomation {
     // against stale turns stay identical.
     if (!active && this.isSessionIdle(sessionName)) {
       if (!this.tryStartImplicitRun(sessionName, snapshot)) {
-        this.failClosedImplicitCandidate(sessionName, snapshot);
+        const candidate = this.recentTaskCandidates.get(sessionName);
+        if (candidate) this.armImplicitCompletionGrace(sessionName, snapshot, candidate);
       }
     }
   }
@@ -825,14 +927,17 @@ class SupervisionAutomation {
     snapshot: SessionSupervisionSnapshot,
   ): ActiveTaskRunState | null {
     if (snapshot.mode === SUPERVISION_MODE.OFF) return null;
+    this.clearImplicitCompletionGrace(sessionName);
     const existing = this.activeRuns.get(sessionName);
     if (existing?.phase === 'auditing' && existing.auditAttemptId) {
       this.clearAuditDeadline(existing);
       this.clearAuditTargetRecovery(existing);
       this.emitOrchestratedAuditResult(existing, 'cancelled', 'new_task_intent_replaced_existing_audit');
     }
+    if (existing) this.clearCompletionGrace(existing);
+    const generation = ++this.nextRunGeneration;
     const next: ActiveTaskRunState = {
-      generation: (existing?.generation ?? 0) + 1,
+      generation,
       sessionName,
       commandId,
       snapshot,
@@ -864,6 +969,71 @@ class SupervisionAutomation {
   private clearWaitingTimeout(run: ActiveTaskRunState): void {
     if (run.waitingTimeoutTimer) clearTimeout(run.waitingTimeoutTimer);
     run.waitingTimeoutTimer = undefined;
+  }
+
+  private clearCompletionGrace(run: ActiveTaskRunState): void {
+    if (run.completionGraceTimer) clearTimeout(run.completionGraceTimer);
+    run.completionGraceTimer = undefined;
+  }
+
+  private clearImplicitCompletionGrace(sessionName: string): void {
+    const timer = this.implicitCompletionGraceTimers.get(sessionName);
+    if (timer) clearTimeout(timer);
+    this.implicitCompletionGraceTimers.delete(sessionName);
+  }
+
+  private evaluateIdleRun(run: ActiveTaskRunState): void {
+    if (run.evaluating || !run.sawAssistantOutput) return;
+    if (run.phase !== 'execution' && run.phase !== 'finalizing') return;
+    this.clearCompletionGrace(run);
+    this.emitCheckingState(run.sessionName);
+    run.evaluating = true;
+    void this.evaluateExecutionTurn(run).catch((error) => {
+      logger.warn({ session: run.sessionName, err: error }, 'Supervision execution evaluation failed');
+      this.clearStatus(run.sessionName);
+      this.emitWarning(run.sessionName, 'Automation could not determine whether the task is complete. Manual continuation is required.');
+      this.finishRun(run.sessionName, 'needs_input');
+    });
+  }
+
+  private armCompletionGrace(run: ActiveTaskRunState): void {
+    this.clearCompletionGrace(run);
+    const generation = run.generation;
+    let timer: NodeJS.Timeout;
+    timer = setTimeout(() => {
+      const latest = this.activeRuns.get(run.sessionName);
+      if (!latest || latest.completionGraceTimer !== timer || latest.generation !== generation) return;
+      latest.completionGraceTimer = undefined;
+      if (latest.sawAssistantOutput) {
+        if (this.isSessionIdle(latest.sessionName)) this.evaluateIdleRun(latest);
+        return;
+      }
+      if (!this.isSessionIdle(latest.sessionName) || latest.evaluating) return;
+      this.failClosedMissingCompletion(latest.sessionName);
+      this.finishRun(latest.sessionName, 'needs_input', { preserveStatus: true });
+    }, SUPERVISION_COMPLETION_GRACE_MS);
+    timer.unref?.();
+    run.completionGraceTimer = timer;
+  }
+
+  private armImplicitCompletionGrace(
+    sessionName: string,
+    snapshot: SessionSupervisionSnapshot,
+    candidate: RecentTaskCandidate,
+  ): void {
+    this.clearImplicitCompletionGrace(sessionName);
+    let timer: NodeJS.Timeout;
+    timer = setTimeout(() => {
+      if (this.implicitCompletionGraceTimers.get(sessionName) !== timer) return;
+      this.implicitCompletionGraceTimers.delete(sessionName);
+      if (this.activeRuns.has(sessionName) || !this.isSessionIdle(sessionName)) return;
+      const latestCandidate = this.recentTaskCandidates.get(sessionName);
+      if (!latestCandidate || latestCandidate.sequence !== candidate.sequence) return;
+      if (this.tryStartImplicitRun(sessionName, snapshot)) return;
+      this.failClosedImplicitCandidate(sessionName, snapshot);
+    }, SUPERVISION_COMPLETION_GRACE_MS);
+    timer.unref?.();
+    this.implicitCompletionGraceTimers.set(sessionName, timer);
   }
 
   private clearAuditTargetRecoveryTimer(run: ActiveTaskRunState): void {
@@ -941,9 +1111,39 @@ class SupervisionAutomation {
     return record;
   }
 
+  /**
+   * `imcodes send --reply` predates the typed `audit` metadata accepted by the
+   * MCP tool. Automatic-audit prompts still name it as the fallback for agents
+   * without `send_message`, so bind that ordinary reply authority at the exact
+   * configured audit dispatch instead of losing the completion receipt later.
+   */
+  private legacyAuditRecord(
+    run: ActiveTaskRunState,
+    eventSessionId: string,
+    text: string | undefined,
+  ): DelegationReplyRecord | undefined {
+    if (!text || run.snapshot.auditTargetSessionName !== eventSessionId) return undefined;
+    const authority = extractAgentDelegationReplyAuthorityFromInstruction(text);
+    if (!authority) return undefined;
+    const record = getDelegationReplyStore().matchPendingAuthority(authority);
+    if (!record
+      || record.purpose !== undefined
+      || record.auditAttemptId !== undefined
+      || record.origin.sessionName !== run.sessionName
+      || record.target.sessionName !== eventSessionId
+      || !delegationIdentityMatches(record.origin, boundDelegationIdentity(getSession(run.sessionName)))
+      || !delegationIdentityMatches(record.target, boundDelegationIdentity(getSession(eventSessionId)))) return undefined;
+    return record;
+  }
+
   private handleStructuredDelegationReplyDelivered(record: DelegationReplyRecord): void {
-    if (record.purpose !== AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT) return;
     const run = this.activeRuns.get(record.origin.sessionName);
+    const typedAudit = record.purpose === AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT
+      && record.auditAttemptId === run?.auditAttemptId;
+    const boundLegacyAudit = record.purpose === undefined
+      && record.auditAttemptId === undefined
+      && record.delegationId === run?.auditDelegationId;
+    if (!typedAudit && !boundLegacyAudit) return;
     if (!run
       || run.phase !== 'auditing'
       || run.auditDelegationId !== record.delegationId
@@ -1024,9 +1224,11 @@ class SupervisionAutomation {
             : undefined;
           const exactOriginActor = trimString(sharedActor?.actorUserId) === run.sessionName;
           if (exactOriginActor && isReplyEnabledPeerAuditDelegationText(text, run.sessionName)) {
+            const legacy = this.legacyAuditRecord(run, event.sessionId, text);
             const legacyAttempt = text?.match(/Automatic audit attempt ID:\s*([A-Za-z0-9_-]+)/iu)?.[1];
             this.beginObservedAudit(run, target, {
               auditAttemptId: legacyAttempt ?? randomUUID(),
+              ...(legacy ? { delegationId: legacy.delegationId } : {}),
             });
           }
         }
@@ -1247,6 +1449,7 @@ class SupervisionAutomation {
         this.emitAutomationNote(activeRun.sessionName, 'Auto: the delegated audit reply arrived; waiting for this session to produce the final PASS/REWORK judgment.', 'supervision-audit-reply-received');
       }
       if (!automation && !queueAppended && !delegatedReply && !delegationCompletionNotification && text && !text.startsWith('/')) {
+        this.clearImplicitCompletionGrace(event.sessionId);
         this.recentTaskCandidates.set(event.sessionId, {
           commandId: clientMessageId ?? `implicit:${Date.now()}`,
           text,
@@ -1263,10 +1466,31 @@ class SupervisionAutomation {
       const text = typeof event.payload.text === 'string' ? event.payload.text : '';
       this.latestAssistantTexts.set(event.sessionId, { text, sequence });
       const run = this.activeRuns.get(event.sessionId);
-      if (!run) return;
+      if (!run) {
+        // Only an observed idle edge proves this is the late-final-row race.
+        // The persisted store often still says idle while a newly-started turn
+        // is already streaming, so consulting it here starts evaluation early.
+        if (this.lastObservedSessionStates.get(event.sessionId) === 'idle') {
+          const record = getSession(event.sessionId);
+          const snapshot = record?.agentType
+            ? extractSessionSupervisionSnapshot(record.transportConfig ?? null)
+            : null;
+          if (snapshot && snapshot.mode !== SUPERVISION_MODE.OFF) {
+            this.clearImplicitCompletionGrace(event.sessionId);
+            this.tryStartImplicitRun(event.sessionId, snapshot);
+          }
+        }
+        return;
+      }
+      this.clearCompletionGrace(run);
       run.ignoreIdleUntilPostAuditTurnActivity = false;
       run.lastAssistantText = text;
       run.sawAssistantOutput = true;
+      if ((run.phase === 'execution' || run.phase === 'finalizing')
+        && !run.evaluating
+        && this.lastObservedSessionStates.get(event.sessionId) === 'idle') {
+        this.evaluateIdleRun(run);
+      }
       // A retained/background transport can emit the final assistant result
       // without producing another session.state=idle edge afterwards. Waiting
       // exclusively for that edge leaves the audit deadline armed even after
@@ -1299,7 +1523,7 @@ class SupervisionAutomation {
           : null;
         if (candidate && snapshot && snapshot.mode !== SUPERVISION_MODE.OFF) {
           if (!this.tryStartImplicitRun(event.sessionId, snapshot)) {
-            this.failClosedImplicitCandidate(event.sessionId, snapshot);
+            this.armImplicitCompletionGrace(event.sessionId, snapshot, candidate);
           }
         }
         // Intentionally: do NOT delete the candidate when supervision is OFF
@@ -1312,6 +1536,7 @@ class SupervisionAutomation {
       }
       if (!run) return;
       if (state && state !== 'idle') {
+        this.clearCompletionGrace(run);
         run.ignoreIdleUntilPostAuditTurnActivity = false;
       }
       if (state === 'idle' && (run.phase === 'execution' || run.phase === 'finalizing') && !run.evaluating) {
@@ -1320,18 +1545,10 @@ class SupervisionAutomation {
             run.ignoreIdleUntilPostAuditTurnActivity = false;
             return;
           }
-          this.failClosedMissingCompletion(run.sessionName);
-          this.finishRun(run.sessionName, 'needs_input', { preserveStatus: true });
+          this.armCompletionGrace(run);
           return;
         }
-        this.emitCheckingState(run.sessionName);
-        run.evaluating = true;
-        void this.evaluateExecutionTurn(run).catch((error) => {
-          logger.warn({ session: run.sessionName, err: error }, 'Supervision execution evaluation failed');
-          this.clearStatus(run.sessionName);
-          this.emitWarning(run.sessionName, 'Automation could not determine whether the task is complete. Manual continuation is required.');
-          this.finishRun(run.sessionName, 'needs_input');
-        });
+        this.evaluateIdleRun(run);
       }
       if ((state === 'stopped' || state === 'error') && run.phase === 'execution') {
         this.emitTerminalStatus(run.sessionName, 'supervision_blocked', SUPERVISION_BLOCKED_LABEL);
@@ -1362,6 +1579,7 @@ class SupervisionAutomation {
         snapshot: enrichSnapshotWithGlobalDefaults(current.snapshot),
         taskRequest: current.userText,
         assistantResponse: current.lastAssistantText,
+        recentEvidence: collectRecentSupervisionEvidence(current.sessionName),
         cwd: record?.projectDir,
         description: record?.description,
       });
@@ -1375,7 +1593,10 @@ class SupervisionAutomation {
     // A new evaluation means the park (if any) is over; the branch below
     // re-arms it when the decision is still `waiting`.
     this.clearWaitingTimeout(latest);
-    latest.requiresAudit = latest.freshAuditRequiredAfterRework || decision.requiresAudit !== false;
+    const reportedAuditPass = !latest.freshAuditRequiredAfterRework
+      && parseExplicitAuditVerdict(latest.lastAssistantText ?? '') === 'PASS';
+    latest.requiresAudit = latest.freshAuditRequiredAfterRework
+      || (!reportedAuditPass && decision.requiresAudit !== false);
     // A rework round re-opens the full surface: the previous verdict already
     // said the narrow read was not enough.
     latest.auditDepth = latest.freshAuditRequiredAfterRework ? 'standard' : decision.auditDepth ?? 'standard';
@@ -1408,6 +1629,22 @@ class SupervisionAutomation {
         return;
       }
       case 'continue': {
+        // A completed turn can already contain a clearly stated independent
+        // audit PASS (for example an agent-native subagent review followed by
+        // commit/push). If the supervisor then asks only to dispatch that same
+        // audit again, deterministically close the duplicate loop. This does
+        // not bypass a REWORK gate and does not suppress concrete remaining
+        // implementation/validation work.
+        if (reportedAuditPass && requestsOnlyRedundantAudit(decision)) {
+          this.emitAutomationNote(
+            run.sessionName,
+            'Auto: the completed turn already reports an independent audit PASS; skipped the duplicate audit request.',
+            'supervision-audit-already-passed',
+          );
+          this.emitTerminalStatus(run.sessionName, 'supervision_complete', SUPERVISION_COMPLETE_LABEL);
+          this.finishRun(run.sessionName, 'complete', { preserveStatus: true });
+          return;
+        }
         const repositoryFinalization = classifyRepositoryFinalization(decision, latest.lastAssistantText);
         if (
           latest.phase === 'execution'
@@ -1507,6 +1744,8 @@ class SupervisionAutomation {
     this.clearAuditDeadline(run);
     this.clearAuditTargetRecovery(run);
     this.clearWaitingTimeout(run);
+    this.clearCompletionGrace(run);
+    this.clearImplicitCompletionGrace(sessionName);
     run.terminalState = state;
     this.activeRuns.delete(sessionName);
     if (!options.preserveStatus) this.clearStatus(sessionName);
@@ -1664,7 +1903,8 @@ class SupervisionAutomation {
     options: { settledWithoutIdle?: boolean } = {},
   ): void {
     if (current.phase !== 'auditing' || !current.auditReplyObserved || !current.lastAssistantText) return;
-    const verdict = parsePeerAuditOrchestratedResult(current.lastAssistantText);
+    const verdict = parsePeerAuditOrchestratedResult(current.lastAssistantText)
+      ?? parseExplicitAuditVerdict(current.lastAssistantText);
     if (!verdict) {
       this.emitWarning(current.sessionName, 'The delegated audit reply arrived, but the current session did not report exactly one PASS/REWORK audit marker. Waiting until the audit deadline.');
       return;
@@ -1686,8 +1926,7 @@ class SupervisionAutomation {
         void this.dispatchContinue(current, current.deferredFinalization);
       } else {
         this.emitTerminalStatus(current.sessionName, 'supervision_audit_pass', SUPERVISION_AUDIT_PASS_LABEL);
-        // A deleted run must not leave its park timer armed: generation is reused,
-        // so a survivor could later terminate an unrelated run.
+        // Do not retain a completion timer after the run reaches a terminal state.
         this.clearWaitingTimeout(current);
         this.activeRuns.delete(current.sessionName);
       }
@@ -1698,8 +1937,7 @@ class SupervisionAutomation {
     current.auditDelegationId = undefined;
     if (current.reworkDispatches >= current.snapshot.maxAuditLoops) {
       this.emitTerminalStatus(current.sessionName, 'supervision_needs_input', SUPERVISION_NEEDS_INPUT_LABEL);
-      // A deleted run must not leave its park timer armed: generation is reused,
-      // so a survivor could later terminate an unrelated run.
+      // Do not retain a completion timer after the run reaches a terminal state.
       this.clearWaitingTimeout(current);
       this.activeRuns.delete(current.sessionName);
       return;
@@ -1708,8 +1946,7 @@ class SupervisionAutomation {
     const transportRuntime = getTransportRuntime(current.sessionName);
     if (!transportRuntime) {
       this.emitTerminalStatus(current.sessionName, 'supervision_needs_input', SUPERVISION_NEEDS_INPUT_LABEL);
-      // A deleted run must not leave its park timer armed: generation is reused,
-      // so a survivor could later terminate an unrelated run.
+      // Do not retain a completion timer after the run reaches a terminal state.
       this.clearWaitingTimeout(current);
       this.activeRuns.delete(current.sessionName);
       return;
@@ -1736,8 +1973,7 @@ class SupervisionAutomation {
     } catch (error) {
       logger.warn({ session: current.sessionName, err: error }, 'Peer audit rework dispatch failed');
       this.emitTerminalStatus(current.sessionName, 'supervision_needs_input', SUPERVISION_NEEDS_INPUT_LABEL);
-      // A deleted run must not leave its park timer armed: generation is reused,
-      // so a survivor could later terminate an unrelated run.
+      // Do not retain a completion timer after the run reaches a terminal state.
       this.clearWaitingTimeout(current);
       this.activeRuns.delete(current.sessionName);
     }

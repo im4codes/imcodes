@@ -396,6 +396,135 @@ describe('SupervisionAutomation', () => {
     expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
   });
 
+  it('binds the ordinary imcodes send --reply fallback and accepts one anchored text PASS', async () => {
+    const snapshot = await seedSession('supervised_audit');
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent(
+      'deck_supervision_brain',
+      'cmd-legacy-cli-audit',
+      'implement and independently audit the feature',
+      snapshot,
+    );
+    beginRun('cmd-legacy-cli-audit', 'implement and independently audit the feature');
+
+    const origin = getSession('deck_supervision_brain');
+    const target = getSession('deck_sub_reviewer');
+    if (!target) throw new Error('reviewer was not seeded');
+    const authority = createDelegationReplyAuthority({
+      origin,
+      target,
+      dispatchId: createSendDispatchId(),
+      messageId: createSendMessageId(),
+    });
+    if (!authority) throw new Error('legacy delegation authority was not created');
+
+    timelineEmitter.emit('deck_sub_reviewer', 'user.message', {
+      text: [
+        'Task: independently audit the completed implementation and return PASS or REWORK.',
+        'Automatic audit attempt ID: cli_fallback_audit_1',
+        buildAgentDelegationReplyInstruction('deck_supervision_brain', authority.authority),
+      ].join('\n'),
+      allowDuplicate: true,
+      sharedActor: { actorUserId: 'deck_supervision_brain' },
+    });
+
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({
+      phase: 'auditing',
+      auditAttemptId: 'cli_fallback_audit_1',
+      auditDelegationId: authority.record.delegationId,
+      auditReplyObserved: false,
+    });
+
+    emitDelegationReplyDelivered({
+      ...authority.record,
+      status: 'delivered',
+      result: 'Independent checks passed.',
+      deliveredAt: Date.now(),
+    });
+    timelineEmitter.emit('deck_supervision_brain', 'assistant.text', {
+      text: '## 独立审计: PASS\n\nFocused tests and typecheck passed.',
+      streaming: false,
+    });
+    await sleep(10);
+
+    expect(mockTransportRuntime.send).not.toHaveBeenCalled();
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
+  });
+
+  it('skips a model-requested duplicate audit after the completed turn reports an independent PASS', async () => {
+    const snapshot = await seedSession('supervised_audit');
+    mockSupervisionDecide.mockResolvedValueOnce({
+      decision: 'continue',
+      reason: 'No reply-enabled audit was observed, so another audit brief should be sent.',
+      confidence: 0.9,
+      requiresAudit: true,
+      gap: 'A reply-enabled peer audit request has not been dispatched.',
+      nextAction: 'Construct and send a reply-enabled independent audit brief to the configured auditor.',
+    });
+
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent(
+      'deck_supervision_brain',
+      'cmd-redundant-audit',
+      'fix, audit, commit, and push the bug',
+      snapshot,
+    );
+    beginRun('cmd-redundant-audit', 'fix, audit, commit, and push the bug');
+    completeTurn([
+      '修复、测试、提交和推送均已完成。',
+      '审计 PASS，并已完成推送。',
+      '- HEAD == origin/dev',
+    ].join('\n'));
+    await sleep(25);
+
+    expect(mockTransportRuntime.send).not.toHaveBeenCalled();
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
+    expect(timelineEmitter.replay('deck_supervision_brain', 0).events).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: 'assistant.text',
+        payload: expect.objectContaining({ automationKind: 'supervision-audit-already-passed' }),
+      }),
+    ]));
+  });
+
+  it('passes recent task turns and structured peer-audit results to the supervisor model', async () => {
+    const snapshot = await seedSession('supervised');
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent(
+      'deck_supervision_brain',
+      'cmd-recent-evidence',
+      'finish the current bug fix',
+      snapshot,
+    );
+    beginRun('cmd-recent-evidence', 'finish the current bug fix');
+    timelineEmitter.emit('deck_supervision_brain', 'user.message', {
+      text: 'Also verify the audit result before finishing.',
+      clientMessageId: 'cmd-recent-refinement',
+    });
+    timelineEmitter.emit('deck_supervision_brain', 'peer_audit.result', {
+      memoryExcluded: true,
+      trigger: 'automatic',
+      outcome: 'pass',
+      auditorSessionName: 'deck_sub_reviewer',
+      elapsedMs: 123,
+      findingsPreview: 'Focused tests passed.',
+    });
+    completeTurn('The audited fix is complete.');
+    await sleep(25);
+
+    expect(mockSupervisionDecide).toHaveBeenCalledWith(expect.objectContaining({
+      recentEvidence: expect.arrayContaining([
+        expect.objectContaining({ kind: 'user', text: 'Also verify the audit result before finishing.' }),
+        expect.objectContaining({
+          kind: 'peer_audit_result',
+          outcome: 'pass',
+          auditorSessionName: 'deck_sub_reviewer',
+          findings: 'Focused tests passed.',
+        }),
+      ]),
+    }));
+  });
+
   it('adopts the production v1 终审 wording once and keeps deferred 211 validation behind PASS', async () => {
     const snapshot = await seedSession('supervised_audit');
     supervisionAutomation.init();
@@ -2087,38 +2216,45 @@ describe('SupervisionAutomation', () => {
   });
 
   it('fails closed when a supervised run reaches idle without a completed assistant response', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
     const snapshot = await seedSession('supervised');
+    try {
+      supervisionAutomation.init();
+      supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-no-output', 'implement the feature', snapshot);
+      beginRun('cmd-no-output', 'implement the feature');
 
-    supervisionAutomation.init();
-    supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-no-output', 'implement the feature', snapshot);
-    beginRun('cmd-no-output', 'implement the feature');
+      timelineEmitter.emit('deck_supervision_brain', 'session.state', {
+        state: 'idle',
+      });
+      await vi.advanceTimersByTimeAsync(1_999);
 
-    timelineEmitter.emit('deck_supervision_brain', 'session.state', {
-      state: 'idle',
-    });
-    await sleep(25);
+      expect(mockSupervisionDecide).not.toHaveBeenCalled();
+      expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeTruthy();
 
-    expect(mockSupervisionDecide).not.toHaveBeenCalled();
-    expect(mockTransportRuntime.send).not.toHaveBeenCalled();
-    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
-    const events = timelineEmitter.replay('deck_supervision_brain', 0).events;
-    expect(events).toEqual(expect.arrayContaining([
-      expect.objectContaining({
-        type: 'assistant.text',
-        payload: expect.objectContaining({
-          automation: true,
-          automationKind: 'supervision-warning',
-          text: '⚠️ Automation stopped because no completed assistant response was available for that turn. Manual continuation is required.',
+      await vi.advanceTimersByTimeAsync(1);
+      expect(mockTransportRuntime.send).not.toHaveBeenCalled();
+      expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
+      const events = timelineEmitter.replay('deck_supervision_brain', 0).events;
+      expect(events).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          type: 'assistant.text',
+          payload: expect.objectContaining({
+            automation: true,
+            automationKind: 'supervision-warning',
+            text: '⚠️ Automation stopped because no completed assistant response was available for that turn. Manual continuation is required.',
+          }),
         }),
-      }),
-      expect.objectContaining({
-        type: 'agent.status',
-        payload: expect.objectContaining({
-          status: 'supervision_needs_input',
-          label: 'Supervised: returned control to you.',
+        expect.objectContaining({
+          type: 'agent.status',
+          payload: expect.objectContaining({
+            status: 'supervision_needs_input',
+            label: 'Supervised: returned control to you.',
+          }),
         }),
-      }),
-    ]));
+      ]));
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('evaluates an empty final assistant response instead of skipping the Auto check', async () => {

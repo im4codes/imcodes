@@ -403,7 +403,7 @@ describe('supervision → idle → broker integration', () => {
     expect(note).toBeTruthy();
   });
 
-  it('fails closed when idle arrives before the final assistant text for an active supervised run', async () => {
+  it('evaluates when idle arrives just before the final assistant text for an active supervised run', async () => {
     const transportSend = vi.fn(() => 'sent');
     getTransportRuntimeMock.mockReturnValue({
       providerSessionId: SESSION,
@@ -429,30 +429,21 @@ describe('supervision → idle → broker integration', () => {
 
     timelineEmitter.emit(SESSION, 'session.state', { state: 'running' });
     timelineEmitter.emit(SESSION, 'session.state', { state: 'idle' });
-    await flushAsync();
+    timelineEmitter.emit(SESSION, 'assistant.text', {
+      text: 'Refactor completed and tested.',
+      streaming: false,
+    });
+    await waitFor(() => supervisionDecideMock.mock.calls.length > 0, 1_000);
     unsubscribe();
 
-    expect(supervisionDecideMock).not.toHaveBeenCalled();
-    expect(seen).toEqual(expect.arrayContaining([
-      expect.objectContaining({
-        type: 'assistant.text',
-        payload: expect.objectContaining({
-          automation: true,
-          automationKind: 'supervision-warning',
-          text: '⚠️ Automation stopped because no completed assistant response was available for that turn. Manual continuation is required.',
-        }),
-      }),
-      expect.objectContaining({
-        type: 'agent.status',
-        payload: expect.objectContaining({
-          status: 'supervision_needs_input',
-          label: 'Supervised: returned control to you.',
-        }),
-      }),
-    ]));
+    expect(supervisionDecideMock).toHaveBeenCalledWith(expect.objectContaining({
+      taskRequest: 'finish the refactor',
+      assistantResponse: 'Refactor completed and tested.',
+    }));
+    expect(seen.some((event) => event.payload.automationKind === 'supervision-warning')).toBe(false);
   });
 
-  it('fails closed when idle arrives before the final assistant text for an implicit supervised run', async () => {
+  it('evaluates when idle arrives just before the final assistant text for an implicit supervised run', async () => {
     seedSupervisedSession('supervised');
     const seen: Array<{ type: string; payload: Record<string, unknown> }> = [];
     const unsubscribe = timelineEmitter.on((event) => {
@@ -465,27 +456,18 @@ describe('supervision → idle → broker integration', () => {
     });
     timelineEmitter.emit(SESSION, 'session.state', { state: 'running' });
     timelineEmitter.emit(SESSION, 'session.state', { state: 'idle' });
-    await flushAsync();
+    timelineEmitter.emit(SESSION, 'assistant.text', {
+      text: 'Queue race fixed and covered.',
+      streaming: false,
+    });
+    await waitFor(() => supervisionDecideMock.mock.calls.length > 0, 1_000);
     unsubscribe();
 
-    expect(supervisionDecideMock).not.toHaveBeenCalled();
-    expect(seen).toEqual(expect.arrayContaining([
-      expect.objectContaining({
-        type: 'assistant.text',
-        payload: expect.objectContaining({
-          automation: true,
-          automationKind: 'supervision-warning',
-          text: '⚠️ Automation stopped because no completed assistant response was available for that turn. Manual continuation is required.',
-        }),
-      }),
-      expect.objectContaining({
-        type: 'agent.status',
-        payload: expect.objectContaining({
-          status: 'supervision_needs_input',
-          label: 'Supervised: returned control to you.',
-        }),
-      }),
-    ]));
+    expect(supervisionDecideMock).toHaveBeenCalledWith(expect.objectContaining({
+      taskRequest: 'fix the queue bug',
+      assistantResponse: 'Queue race fixed and covered.',
+    }));
+    expect(seen.some((event) => event.payload.automationKind === 'supervision-warning')).toBe(false);
   });
 
   it('does not evaluate on snapshot update before idle when a turn is still running', async () => {

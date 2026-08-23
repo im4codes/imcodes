@@ -3,7 +3,7 @@
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { h } from 'preact';
-import { render, screen, fireEvent, cleanup, waitFor, act } from '@testing-library/preact';
+import { render, screen, fireEvent, cleanup, waitFor, act, within } from '@testing-library/preact';
 import {
   CLAUDE_CODE_MODEL_IDS,
   CODEX_MODEL_IDS,
@@ -57,6 +57,23 @@ function changeSelect(select: HTMLElement, value: string): void {
   element.value = value;
   fireEvent.input(element);
   fireEvent.change(element);
+}
+
+function changeSupervisionMode(value: string): void {
+  changeSelect(screen.getByLabelText('supervision-session:mode'), value);
+}
+
+function changeRuntimeBackend(idPrefix: 'supervision-defaults' | 'supervision-session', value: string): void {
+  changeSelect(screen.getByLabelText(`${idPrefix}:backend`), value);
+}
+
+function clickRuntimeModel(
+  idPrefix: 'supervision-defaults' | 'supervision-session',
+  backend: string,
+  model: string,
+): void {
+  const selector = screen.getByTestId(`${idPrefix}-runtime-model-preset-selector`);
+  fireEvent.click(within(selector).getByLabelText(`model:${backend}:${model}`));
 }
 
 function makePeerAuditSession(overrides: Record<string, unknown> = {}) {
@@ -165,13 +182,16 @@ describe('SessionSettingsDialog supervision', () => {
       />,
     );
 
-    changeSelect(screen.getAllByRole('combobox')[3]!, 'supervised');
+    changeSupervisionMode('supervised');
     expect(screen.getAllByText('backend').length).toBeGreaterThanOrEqual(2);
-    expect(screen.getAllByText('model').length).toBeGreaterThanOrEqual(2);
+    expect(screen.queryByTestId('supervision-session-runtime-model-preset-selector')).toBeNull();
     expect((screen.getByRole('button', { name: /save/i }) as HTMLButtonElement).disabled).toBe(true);
 
-    changeSelect(screen.getAllByRole('combobox')[4]!, 'codex-sdk');
-    changeSelect(screen.getAllByRole('combobox')[5]!, CODEX_MODEL_IDS[0]);
+    changeRuntimeBackend('supervision-session', 'codex-sdk');
+    expect(screen.getByTestId('supervision-session-runtime-model-preset-selector')).toBeDefined();
+    clickRuntimeModel('supervision-session', 'codex-sdk', CODEX_MODEL_IDS[0]);
+    expect(within(screen.getByTestId('supervision-session-runtime-model-preset-selector'))
+      .getByLabelText(`model:codex-sdk:${CODEX_MODEL_IDS[0]}`).getAttribute('aria-pressed')).toBe('true');
     fireEvent.click(screen.getByRole('button', { name: /save/i }));
 
     await waitFor(() => {
@@ -210,12 +230,11 @@ describe('SessionSettingsDialog supervision', () => {
       />,
     );
 
-    const backendSelect = screen.getAllByRole('combobox')[1] as HTMLSelectElement;
-    const modelSelect = screen.getAllByRole('combobox')[2] as HTMLSelectElement;
+    const backendSelect = screen.getByLabelText('supervision-defaults:backend') as HTMLSelectElement;
     await waitFor(() => {
       expect(backendSelect.value).toBe('codex-sdk');
-      expect(modelSelect.value).toBe(DEFAULT_CODEX_AUTOMATION_MODEL);
-      expect(Array.from(modelSelect.options, (option) => option.value)).toContain('gpt-5.6');
+      expect(screen.getByLabelText(`model:codex-sdk:${DEFAULT_CODEX_AUTOMATION_MODEL}`).getAttribute('aria-pressed')).toBe('true');
+      expect(screen.getByLabelText('model:codex-sdk:gpt-5.6')).toBeDefined();
     });
   });
 
@@ -407,14 +426,14 @@ describe('SessionSettingsDialog supervision', () => {
       />,
     );
 
-    changeSelect(screen.getAllByRole('combobox')[3]!, 'supervised_audit');
+    changeSupervisionMode('supervised_audit');
     await waitFor(() => {
       expect(screen.getByTestId('peer-audit-settings-selected').textContent).toContain('Peer');
     });
     expect(screen.getByText('maxAuditLoops')).toBeDefined();
 
-    changeSelect(screen.getAllByRole('combobox')[4]!, 'claude-code-sdk');
-    changeSelect(screen.getAllByRole('combobox')[5]!, CLAUDE_CODE_MODEL_IDS[0]);
+    changeRuntimeBackend('supervision-session', 'claude-code-sdk');
+    clickRuntimeModel('supervision-session', 'claude-code-sdk', CLAUDE_CODE_MODEL_IDS[0]);
     fireEvent.click(screen.getByRole('button', { name: /save/i }));
 
     await waitFor(() => {
@@ -459,7 +478,7 @@ describe('SessionSettingsDialog supervision', () => {
       />,
     );
 
-    changeSelect(screen.getAllByRole('combobox')[3]!, 'supervised');
+    changeSupervisionMode('supervised');
     fireEvent.click(screen.getByRole('button', { name: /save/i }));
 
     await waitFor(() => {
@@ -502,7 +521,7 @@ describe('SessionSettingsDialog supervision', () => {
       />,
     );
 
-    const modeSelect = screen.getAllByRole('combobox')[3] as HTMLSelectElement;
+    const modeSelect = screen.getByLabelText('supervision-session:mode') as HTMLSelectElement;
     expect(modeSelect.value).toBe('supervised_audit');
     const targetSection = screen.getByTestId('session-supervision-peer-target-section');
     await waitFor(() => expect(document.activeElement).toBe(targetSection));
@@ -580,7 +599,7 @@ describe('SessionSettingsDialog supervision', () => {
       expect(fetchSupervisorDefaultsMock).toHaveBeenCalledTimes(1);
     });
 
-    changeSelect(screen.getAllByRole('combobox')[3]!, 'supervised');
+    changeSupervisionMode('supervised');
     expect(screen.getAllByDisplayValue('30').length).toBeGreaterThanOrEqual(2);
     expect(screen.getAllByDisplayValue('4').length).toBeGreaterThanOrEqual(2);
     expect(screen.getAllByDisplayValue('9').length).toBeGreaterThanOrEqual(2);
@@ -676,7 +695,7 @@ describe('SessionSettingsDialog supervision', () => {
 
     fireEvent.input(inputForLabel('maxAutoContinueStreak', 0), { target: { value: '5' } });
     fireEvent.input(inputForLabel('maxAutoContinueTotal', 0), { target: { value: '11' } });
-    changeSelect(screen.getAllByRole('combobox')[3]!, 'supervised');
+    changeSupervisionMode('supervised');
     fireEvent.input(inputForLabel('maxAutoContinueStreak', 1), { target: { value: '3' } });
     fireEvent.input(inputForLabel('maxAutoContinueTotal', 1), { target: { value: '6' } });
     fireEvent.click(screen.getByRole('button', { name: /save/i }));
@@ -697,7 +716,7 @@ describe('SessionSettingsDialog supervision', () => {
     });
   });
 
-  it('persists qwen preset selection via the preset picker when ws fetches presets', async () => {
+  it('shows and persists a third-party preset in the unified supervision runtime selector', async () => {
     // Stub ws that records sent messages and lets the test dispatch a preset list.
     // Pattern (Set of handlers + `act`-wrapped dispatch) mirrors the existing
     // SharedContextManagementPanel test, which the supervision picker reuses.
@@ -753,23 +772,24 @@ describe('SessionSettingsDialog supervision', () => {
       }
     });
 
-    // Defaults backend is already `qwen` via fetchSupervisorDefaults → the
-    // Global-defaults preset picker should render now that ccPresets is non-empty.
-    await waitFor(() => expect(screen.getAllByTestId('supervision-preset-picker').length).toBeGreaterThan(0));
+    // Defaults backend is already `qwen` via fetchSupervisorDefaults, so the
+    // unified runtime selector must expose the third-party preset alongside
+    // the built-in models.
+    await waitFor(() => expect(screen.getByTestId('supervision-defaults-runtime-model-preset-selector')).toBeDefined());
+    expect(screen.getByLabelText('supervision-defaults:preset:MiniMax')).toBeDefined();
 
     // Enable supervised mode on this qwen session and pick a preset-pinned model.
-    changeSelect(screen.getAllByRole('combobox')[3]!, 'supervised');
-    changeSelect(screen.getAllByRole('combobox')[4]!, 'qwen');
-    changeSelect(screen.getAllByRole('combobox')[5]!, 'MiniMax-M2.5');
+    changeSupervisionMode('supervised');
+    changeRuntimeBackend('supervision-session', 'qwen');
 
-    // Both regions now render a preset picker (Global defaults + This session).
-    await waitFor(() => expect(screen.getAllByTestId('supervision-preset-picker').length).toBe(2));
+    // Both regions now render the same preset + model selector.
+    await waitFor(() => expect(screen.getByTestId('supervision-session-runtime-model-preset-selector')).toBeDefined());
 
-    // Click the session-region MiniMax chip. Buttons render in the same order
-    // the pickers render (defaults first, session second) so [1] is session.
-    const minimaxButtons = screen.getAllByRole('button', { name: 'MiniMax' });
-    expect(minimaxButtons.length).toBe(2);
-    fireEvent.click(minimaxButtons[1]!);
+    const sessionMiniMax = screen.getByLabelText('supervision-session:preset:MiniMax');
+    fireEvent.click(sessionMiniMax);
+    expect(sessionMiniMax.getAttribute('aria-pressed')).toBe('true');
+    expect(within(screen.getByTestId('supervision-session-runtime-model-preset-selector'))
+      .getByLabelText('model:qwen:MiniMax-M2.5').getAttribute('aria-pressed')).toBe('true');
 
     fireEvent.click(screen.getByRole('button', { name: /save/i }));
 
@@ -845,14 +865,14 @@ describe('SessionSettingsDialog supervision', () => {
       }
     });
 
-    const globalModelSelect = screen.getAllByRole('combobox')[2] as HTMLSelectElement;
     await waitFor(() => {
-      expect(globalModelSelect.value).toBe('MiniMax-M2.5');
+      expect(screen.getByLabelText('supervision-defaults:preset:MiniMax').getAttribute('aria-pressed')).toBe('true');
     });
-    const optionValues = [...globalModelSelect.options].map((option) => option.value);
-    expect(optionValues).toContain('MiniMax-M2.5');
-    expect(optionValues).toContain('MiniMax-M2.7');
-    expect(optionValues).not.toContain('qwen3-coder-plus');
+    const globalSelector = within(screen.getByTestId('supervision-defaults-runtime-model-preset-selector'));
+    const pinnedModel = globalSelector.getByLabelText('model:qwen:MiniMax-M2.5') as HTMLButtonElement;
+    expect(pinnedModel.getAttribute('aria-pressed')).toBe('true');
+    expect(pinnedModel.disabled).toBe(true);
+    expect(globalSelector.queryByLabelText('model:qwen:qwen3-coder-plus')).toBeNull();
 
     fireEvent.click(screen.getByRole('button', { name: /save/i }));
 
@@ -897,9 +917,9 @@ describe('SessionSettingsDialog supervision', () => {
     });
 
     // Turn on supervised mode and the session body must become editable.
-    changeSelect(screen.getAllByRole('combobox')[3]!, 'supervised');
-    changeSelect(screen.getAllByRole('combobox')[4]!, 'codex-sdk');
-    changeSelect(screen.getAllByRole('combobox')[5]!, CODEX_MODEL_IDS[0]);
+    changeSupervisionMode('supervised');
+    changeRuntimeBackend('supervision-session', 'codex-sdk');
+    clickRuntimeModel('supervision-session', 'codex-sdk', CODEX_MODEL_IDS[0]);
 
     // Session-level custom instructions — different text so we can confirm
     // the session layer vs global layer are kept distinct in the payload.
@@ -960,9 +980,9 @@ describe('SessionSettingsDialog supervision', () => {
       />,
     );
 
-    changeSelect(screen.getAllByRole('combobox')[3]!, 'supervised');
-    changeSelect(screen.getAllByRole('combobox')[4]!, 'codex-sdk');
-    changeSelect(screen.getAllByRole('combobox')[5]!, CODEX_MODEL_IDS[0]);
+    changeSupervisionMode('supervised');
+    changeRuntimeBackend('supervision-session', 'codex-sdk');
+    clickRuntimeModel('supervision-session', 'codex-sdk', CODEX_MODEL_IDS[0]);
     fireEvent.input(screen.getByPlaceholderText('customInstructionsPlaceholder'), {
       target: { value: 'Always require tests and clean verification before complete.' },
     });
@@ -1117,9 +1137,9 @@ describe('SessionSettingsDialog supervision', () => {
       />,
     );
 
-    changeSelect(screen.getAllByRole('combobox')[3]!, 'supervised');
-    changeSelect(screen.getAllByRole('combobox')[4]!, 'codex-sdk');
-    changeSelect(screen.getAllByRole('combobox')[5]!, CODEX_MODEL_IDS[0]);
+    changeSupervisionMode('supervised');
+    changeRuntimeBackend('supervision-session', 'codex-sdk');
+    clickRuntimeModel('supervision-session', 'codex-sdk', CODEX_MODEL_IDS[0]);
     fireEvent.click(screen.getByRole('button', { name: /save/i }));
 
     await waitFor(() => {
@@ -1155,12 +1175,12 @@ describe('SessionSettingsDialog supervision', () => {
       />,
     );
 
-    changeSelect(screen.getAllByRole('combobox')[1]!, 'claude-code-sdk');
-    changeSelect(screen.getAllByRole('combobox')[2]!, CLAUDE_CODE_MODEL_IDS[0]);
-    const timeoutInput = screen.getByDisplayValue('30');
+    changeRuntimeBackend('supervision-defaults', 'claude-code-sdk');
+    clickRuntimeModel('supervision-defaults', 'claude-code-sdk', CLAUDE_CODE_MODEL_IDS[0]);
+    const timeoutInput = screen.getByLabelText('supervision-defaults:timeout');
     expect(timeoutInput.getAttribute('min')).toBe('30');
     fireEvent.input(timeoutInput, { target: { value: '5' } });
-    expect(screen.getByDisplayValue('30')).toBeDefined();
+    expect((screen.getByLabelText('supervision-defaults:timeout') as HTMLInputElement).value).toBe('30');
     fireEvent.click(screen.getByRole('button', { name: /save/i }));
 
     await waitFor(() => {

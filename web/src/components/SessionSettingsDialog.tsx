@@ -13,6 +13,10 @@ import { isDelegationReplyCapableAgentType } from '@shared/agent-delegation.js';
 import type { SharedContextRuntimeBackend } from '@shared/context-types.js';
 import { doesSharedContextBackendSupportPresets, isKnownSharedContextModelForBackend } from '@shared/shared-context-runtime-config.js';
 import {
+  CC_PRESET_MSG,
+  getCcPresetAvailableModelIds,
+} from '@shared/cc-presets.js';
+import {
   DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_STREAK,
   DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_TOTAL,
   buildTransportConfigWithSupervision,
@@ -48,6 +52,10 @@ import {
   SESSION_SETTINGS_FOCUS,
   type SessionSettingsOpenIntent,
 } from '../session-settings-open-intent.js';
+import {
+  RuntimeModelPresetSelector,
+  type RuntimeModelPresetEntry,
+} from './RuntimeModelPresetSelector.js';
 
 interface Props {
   serverId: string;
@@ -76,9 +84,9 @@ interface Props {
   openIntent?: SessionSettingsOpenIntent;
   /**
    * Optional WebSocket client. When supplied, the supervision dialog subscribes
-   * to `cc.presets.list_response` and renders a preset picker for qwen
-   * supervisor backends. When absent (tests, legacy callers), the dialog
-   * silently omits the picker — the rest of the UI keeps working unchanged.
+   * to `cc.presets.list_response` and adds compatible third-party presets to
+   * the shared runtime selector. When absent, built-in model selection remains
+   * available and only the preset row is omitted.
    */
   ws?: WsClient | null;
   onClose: () => void;
@@ -167,8 +175,7 @@ type SupervisionDraft = {
   model?: string;
   /**
    * Optional preset name — only meaningful when
-   * `doesSharedContextBackendSupportPresets(backend)` returns true
-   * (currently only `qwen`). The daemon broker routes the supervisor session
+   * `doesSharedContextBackendSupportPresets(backend)` returns true. The daemon broker routes the supervisor session
    * through the preset's env bundle when set.
    */
   preset?: string;
@@ -205,12 +212,7 @@ type SupervisionRuntimeDraft = Pick<
   'backend' | 'model' | 'preset' | 'timeoutMs' | 'promptVersion' | 'customInstructions' | 'maxAutoContinueStreak' | 'maxAutoContinueTotal'
 >;
 
-type CcPresetSummary = {
-  name: string;
-  env?: Record<string, string>;
-  availableModels?: Array<{ id: string; name?: string }>;
-  defaultModel?: string;
-};
+type CcPresetSummary = RuntimeModelPresetEntry;
 
 function timeoutMsToUiSeconds(timeoutMs: number | undefined): number {
   const safeMs = typeof timeoutMs === 'number' && Number.isFinite(timeoutMs)
@@ -366,33 +368,6 @@ function SupervisionIntroCard({ t }: { t: (key: string, params?: Record<string, 
   );
 }
 
-/**
- * Pull the preset's pinned model out of its env bundle. CcPreset stores
- * provider credentials + model under ANTHROPIC_MODEL (mirrored into
- * OPENAI_MODEL for OpenAI-compatible endpoints, e.g. qwen --auth-type anthropic
- * against a MiniMax/GLM/Kimi gateway). The daemon's getQwenPresetTransportConfig
- * reads the same field and treats it as authoritative at launch — we use it
- * here so the supervision UI reflects the effective model the moment the user
- * picks a preset, instead of showing a stale Qwen default alongside.
- */
-function getPresetPinnedModel(
-  presets: readonly CcPresetSummary[],
-  presetName: string | undefined,
-): string | undefined {
-  if (!presetName) return undefined;
-  const target = presetName.trim().toLowerCase();
-  if (!target) return undefined;
-  const match = presets.find((p) => p.name.trim().toLowerCase() === target);
-  if (!match) return undefined;
-  // Prefer the discovered defaultModel (set by cc.presets.discover_models);
-  // fall back to the env-pinned model used by the daemon at launch.
-  const discovered = typeof match.defaultModel === 'string' ? match.defaultModel.trim() : '';
-  if (discovered) return discovered;
-  const envModel = match.env?.ANTHROPIC_MODEL ?? match.env?.OPENAI_MODEL;
-  const trimmed = typeof envModel === 'string' ? envModel.trim() : '';
-  return trimmed || undefined;
-}
-
 function getPresetModelOptions(
   presets: readonly CcPresetSummary[],
   presetName: string | undefined,
@@ -402,16 +377,7 @@ function getPresetModelOptions(
   if (!target) return [];
   const match = presets.find((p) => p.name.trim().toLowerCase() === target);
   if (!match) return [];
-  const options: string[] = [];
-  const add = (value: string | undefined) => {
-    const trimmed = value?.trim();
-    if (trimmed && !options.includes(trimmed)) options.push(trimmed);
-  };
-  add(match.defaultModel);
-  add(match.env?.ANTHROPIC_MODEL);
-  add(match.env?.OPENAI_MODEL);
-  for (const model of match.availableModels ?? []) add(model.id);
-  return options;
+  return getCcPresetAvailableModelIds(match);
 }
 
 function resolvePresetModel(
@@ -425,181 +391,109 @@ function resolvePresetModel(
   return current && options.includes(current) ? current : options[0];
 }
 
-/**
- * Qwen preset picker — renders a chip row (including a "none" clear chip) for
- * backends that support presets. Kept lightweight and decoupled from the
- * broader shared-context panel's unified selector. The preset's pinned model
- * (from env.ANTHROPIC_MODEL) is auto-applied by the parent's onChange handler
- * so the model dropdown never shows a value that contradicts the preset.
- */
-function SupervisionPresetPicker({
-  t,
-  saving,
-  presets,
-  value,
-  onChange,
-  noneLabel,
-  labelKey,
-  helpKey,
-}: {
-  t: (key: string, params?: Record<string, unknown>) => string;
-  saving: boolean;
-  presets: readonly CcPresetSummary[];
-  value: string;
-  onChange: (next: string | undefined) => void;
-  noneLabel: string;
-  labelKey: string;
-  helpKey: string;
-}) {
-  const baseChipStyle = {
-    padding: '4px 10px',
-    fontSize: 11,
-    borderRadius: 999,
-    border: '1px solid rgba(148, 163, 184, 0.35)',
-    background: 'rgba(15, 23, 42, 0.6)',
-    color: '#cbd5e1',
-    cursor: saving ? 'not-allowed' : 'pointer',
-    opacity: saving ? 0.6 : 1,
-  } as const;
-  const activeChipStyle = {
-    ...baseChipStyle,
-    background: 'rgba(124, 58, 237, 0.35)',
-    border: '1px solid rgba(167, 139, 250, 0.55)',
-    color: '#f3e8ff',
-    fontWeight: 600,
-  } as const;
-  const noneActiveStyle = {
-    ...baseChipStyle,
-    background: '#374151',
-    border: '1px solid rgba(148, 163, 184, 0.55)',
-    color: '#f3f4f6',
-    fontWeight: 600,
-  } as const;
-  const trimmed = value.trim();
-  return (
-    <div>
-      <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 4 }}>{t(labelKey)}</div>
-      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }} data-testid="supervision-preset-picker">
-        <button
-          type="button"
-          disabled={saving}
-          style={trimmed === '' ? noneActiveStyle : baseChipStyle}
-          onClick={() => onChange(undefined)}
-        >
-          {noneLabel}
-        </button>
-        {presets.map((p) => (
-          <button
-            key={p.name}
-            type="button"
-            disabled={saving}
-            style={trimmed === p.name ? activeChipStyle : baseChipStyle}
-            onClick={() => onChange(p.name)}
-          >
-            {p.name}
-          </button>
-        ))}
-      </div>
-      <div style={{ fontSize: 11, color: '#64748b', marginTop: 4 }}>{t(helpKey)}</div>
-    </div>
-  );
-}
-
 function SupervisionRuntimeFields({
   t,
   saving,
   backend,
   model,
+  preset,
+  presets,
   timeoutSeconds,
   modelOptions,
+  idPrefix,
   onBackendChange,
   onModelChange,
+  onRuntimeChange,
   onTimeoutChange,
 }: {
   t: (key: string, params?: Record<string, unknown>) => string;
   saving: boolean;
   backend: SharedContextRuntimeBackend | '';
   model: string;
+  preset: string;
+  presets: readonly CcPresetSummary[];
   timeoutSeconds: number;
   modelOptions: readonly string[];
+  idPrefix: string;
   onBackendChange: (backend: string) => void;
   onModelChange: (model: string) => void;
+  onRuntimeChange: (next: { model: string; preset: string }) => void;
   onTimeoutChange: (seconds: number) => void;
 }) {
   const handleBackendSelect = (e: Event): void => {
     onBackendChange((e.target as HTMLSelectElement).value);
   };
-  const handleModelSelect = (e: Event): void => {
-    onModelChange((e.target as HTMLSelectElement).value);
-  };
-
   return (
-    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, minmax(0, 1fr))', gap: 12 }}>
-      <div>
-        <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 4 }}>{t('session.supervision.backend')}</div>
-        <select
-          class="input"
-          value={backend}
-          onInput={handleBackendSelect}
-          onChange={handleBackendSelect}
-          style={{ width: '100%' }}
-          disabled={saving}
-        >
-          <option value="">{t('session.supervision.selectBackend')}</option>
-          {getSupportedSupervisionBackendOptions().map((option) => (
-            <option key={option} value={option}>{labelForBackend(t, option)}</option>
-          ))}
-        </select>
-      </div>
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+      <div style={{ display: 'grid', gridTemplateColumns: backend === 'openclaw' ? 'repeat(3, minmax(0, 1fr))' : 'repeat(2, minmax(0, 1fr))', gap: 12 }}>
+        <div>
+          <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 4 }}>{t('session.supervision.backend')}</div>
+          <select
+            class="input"
+            aria-label={`${idPrefix}:backend`}
+            value={backend}
+            onInput={handleBackendSelect}
+            onChange={handleBackendSelect}
+            style={{ width: '100%' }}
+            disabled={saving}
+          >
+            <option value="">{t('session.supervision.selectBackend')}</option>
+            {getSupportedSupervisionBackendOptions().map((option) => (
+              <option key={option} value={option}>{labelForBackend(t, option)}</option>
+            ))}
+          </select>
+        </div>
 
-      <div>
-        <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 4 }}>{t('session.supervision.model')}</div>
-        {backend === 'openclaw' ? (
+        {backend === 'openclaw' && (
+          <div>
+            <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 4 }}>{t('session.supervision.model')}</div>
           <input
             class="input"
+            aria-label={`${idPrefix}:model`}
             value={model}
             onInput={(e) => onModelChange((e.target as HTMLInputElement).value)}
             style={{ width: '100%' }}
             disabled={saving}
             placeholder={t('session.supervision.selectModel')}
           />
-        ) : (
-          <select
-            class="input"
-            value={model}
-            onInput={handleModelSelect}
-            onChange={handleModelSelect}
-            style={{ width: '100%' }}
-            disabled={saving || !backend}
-          >
-            <option value="">{t('session.supervision.selectModel')}</option>
-            {(backend ? modelOptions : []).map((option) => (
-              <option key={option} value={option}>{option}</option>
-            ))}
-          </select>
+          </div>
         )}
+
+        <div>
+          <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 4 }}>{t('session.supervision.timeout')}</div>
+          <input
+            class="input"
+            aria-label={`${idPrefix}:timeout`}
+            type="number"
+            min={SUPERVISION_MIN_TIMEOUT_MS / 1000}
+            step={1}
+            value={String(timeoutSeconds)}
+            onInput={(e) => {
+              const value = Number.parseInt((e.target as HTMLInputElement).value, 10);
+              onTimeoutChange(
+                Number.isFinite(value)
+                  ? Math.max(value, SUPERVISION_MIN_TIMEOUT_MS / 1000)
+                  : timeoutSeconds,
+              );
+            }}
+            style={{ width: '100%' }}
+            disabled={saving}
+          />
+        </div>
       </div>
 
-      <div>
-        <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 4 }}>{t('session.supervision.timeout')}</div>
-        <input
-          class="input"
-          type="number"
-          min={SUPERVISION_MIN_TIMEOUT_MS / 1000}
-          step={1}
-          value={String(timeoutSeconds)}
-          onInput={(e) => {
-            const value = Number.parseInt((e.target as HTMLInputElement).value, 10);
-            onTimeoutChange(
-              Number.isFinite(value)
-                ? Math.max(value, SUPERVISION_MIN_TIMEOUT_MS / 1000)
-                : timeoutSeconds,
-            );
-          }}
-          style={{ width: '100%' }}
+      {backend && backend !== 'openclaw' && (
+        <RuntimeModelPresetSelector
+          backend={backend}
+          model={model}
+          preset={preset}
+          presets={presets}
+          modelOptions={modelOptions}
+          onChange={onRuntimeChange}
+          idPrefix={idPrefix}
           disabled={saving}
         />
-      </div>
+      )}
     </div>
   );
 }
@@ -695,11 +589,11 @@ export function SessionSettingsDialog({
     if (!ws) return;
     const unsub = ws.onMessage((msg) => {
       const m = msg as { type?: string; presets?: CcPresetSummary[] };
-      if (m.type === 'cc.presets.list_response') {
+      if (m.type === CC_PRESET_MSG.LIST_RESPONSE) {
         setCcPresets(m.presets ?? []);
       }
     });
-    try { ws.send({ type: 'cc.presets.list' }); } catch { /* ws may not support send in tests */ }
+    try { ws.send({ type: CC_PRESET_MSG.LIST }); } catch { /* ws may not support send in tests */ }
     return unsub;
   }, [ws]);
 
@@ -840,12 +734,10 @@ export function SessionSettingsDialog({
   const supervisorDefaultsAutoContinueTotal = supervisorDefaults.maxAutoContinueTotal ?? DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_TOTAL;
   const supervisionPreset = typeof supervision.preset === 'string' ? supervision.preset : '';
   const supervisorDefaultsPreset = typeof supervisorDefaults.preset === 'string' ? supervisorDefaults.preset : '';
-  // Gate preset picker visibility: needs a ws channel to fetch presets, a
-  // backend that actually uses them (qwen today), and at least one preset.
+  // Preset persistence is valid only for runtime backends that can resolve the
+  // same third-party endpoint bundles used by memory processing.
   const sessionSupportsPreset = !!supervisionBackend && doesSharedContextBackendSupportPresets(supervisionBackend);
   const defaultsSupportsPreset = !!supervisorDefaultsBackend && doesSharedContextBackendSupportPresets(supervisorDefaultsBackend);
-  const showSessionPresetPicker = !!ws && sessionSupportsPreset && ccPresets.length > 0;
-  const showDefaultsPresetPicker = !!ws && defaultsSupportsPreset && ccPresets.length > 0;
   // Merged preview shown only when override is unchecked AND both sides have
   // non-empty trimmed content. Any other case is redundant (the effective
   // value equals one or the other side, visible in the textarea already).
@@ -1145,12 +1037,16 @@ export function SessionSettingsDialog({
           saving={saving}
           backend={supervisorDefaultsBackend}
           model={supervisorDefaultsModel}
+          preset={supervisorDefaultsPreset}
+          presets={ccPresets}
           timeoutSeconds={supervisorDefaultsTimeoutSeconds}
           modelOptions={supervisorDefaultsModelOptions}
+          idPrefix="supervision-defaults"
           onBackendChange={(nextBackend) => {
             updateSupervisorDefaultsFromUser((prev) => ({ ...prev, ...updateRuntimeDraft(prev, nextBackend) }));
           }}
           onModelChange={(model) => updateSupervisorDefaultsFromUser((prev) => ({ ...prev, model }))}
+          onRuntimeChange={({ model, preset }) => updateSupervisorDefaultsFromUser((prev) => ({ ...prev, model, preset: preset || undefined }))}
           onTimeoutChange={(seconds) => updateSupervisorDefaultsFromUser((prev) => ({ ...prev, timeoutMs: timeoutUiSecondsToMs(seconds) }))}
         />
 
@@ -1188,27 +1084,6 @@ export function SessionSettingsDialog({
             <div style={{ fontSize: 11, color: '#64748b', marginTop: 4 }}>{t('session.supervision.maxAutoContinueTotalHelp')}</div>
           </div>
         </div>
-
-        {showDefaultsPresetPicker && (
-          <SupervisionPresetPicker
-            t={t}
-            saving={saving}
-            presets={ccPresets}
-            value={supervisorDefaultsPreset}
-            onChange={(next) => updateSupervisorDefaultsFromUser((prev) => {
-              // When a preset is chosen, pin the model to the preset's own
-              // ANTHROPIC_MODEL so the picker doesn't keep a stale Qwen default
-              // visible while the daemon is actually routing through MiniMax /
-              // GLM / Kimi. Clearing the preset leaves the model untouched —
-              // the user may have had a vanilla Qwen model they want to keep.
-              const pinned = getPresetPinnedModel(ccPresets, next);
-              return { ...prev, preset: next, ...(pinned ? { model: pinned } : {}) };
-            })}
-            noneLabel={t('session.supervision.presetNone')}
-            labelKey="session.supervision.presetLabel"
-            helpKey="session.supervision.presetHelp"
-          />
-        )}
 
         <div>
           <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 4 }}>
@@ -1259,6 +1134,7 @@ export function SessionSettingsDialog({
           <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 4 }}>{t('session.supervision.modeLabel')}</div>
           <select
             class="input"
+            aria-label="supervision-session:mode"
             value={supervision.mode}
             onInput={handleSessionModeSelect}
             onChange={handleSessionModeSelect}
@@ -1278,12 +1154,16 @@ export function SessionSettingsDialog({
               saving={saving}
               backend={supervisionBackend}
               model={supervisionModel}
+              preset={supervisionPreset}
+              presets={ccPresets}
               timeoutSeconds={supervisionTimeoutSeconds}
               modelOptions={modelOptions}
+              idPrefix="supervision-session"
               onBackendChange={(nextBackend) => {
                 setSupervision((prev) => ({ ...prev, ...updateRuntimeDraft(prev, nextBackend) }));
               }}
               onModelChange={(model) => setSupervision((prev) => ({ ...prev, model }))}
+              onRuntimeChange={({ model, preset }) => setSupervision((prev) => ({ ...prev, model, preset: preset || undefined }))}
               onTimeoutChange={(seconds) => setSupervision((prev) => ({ ...prev, timeoutMs: timeoutUiSecondsToMs(seconds) }))}
             />
 
@@ -1322,28 +1202,6 @@ export function SessionSettingsDialog({
                 <div style={{ fontSize: 11, color: '#64748b', marginTop: 4 }}>{t('session.supervision.maxAutoContinueTotalHelp')}</div>
               </div>
             </div>
-
-            {showSessionPresetPicker && (
-              <SupervisionPresetPicker
-                t={t}
-                saving={saving}
-                presets={ccPresets}
-                value={supervisionPreset}
-                onChange={(next) => setSupervision((prev) => {
-                  // Pin the preset's ANTHROPIC_MODEL into the draft so the
-                  // model dropdown immediately reflects the model the daemon
-                  // will actually spawn (preset wins at launch anyway — see
-                  // getQwenPresetTransportConfig). Clearing the preset keeps
-                  // the current model so we don't silently lose the user's
-                  // last selection.
-                  const pinned = getPresetPinnedModel(ccPresets, next);
-                  return { ...prev, preset: next, ...(pinned ? { model: pinned } : {}) };
-                })}
-                noneLabel={t('session.supervision.presetNone')}
-                labelKey="session.supervision.presetLabel"
-                helpKey="session.supervision.presetHelp"
-              />
-            )}
 
             <div>
               <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 4 }}>{t('session.supervision.customInstructionsLabel')}</div>
