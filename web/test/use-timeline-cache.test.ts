@@ -19,6 +19,7 @@ import {
   __clearPersistedTimelineSnapshotsForTests,
   __getTimelineCacheForTests,
   __getTimelineCacheKeysForTests,
+  __getTimelineSnapshotBookkeepingKeysForTests,
   __getSharedTimelineBaseForTests,
   __resetTimelineCacheForTests,
   __setTimelineCacheForTests,
@@ -83,6 +84,22 @@ describe('useTimeline global cache bounds', () => {
     expect(keys).toContain('server:b');
     expect(keys).toContain('server:c');
     expect(keys).toContain('server:d');
+  });
+
+  it('releases snapshot bookkeeping for an evicted session', () => {
+    // Eviction used to drop only the events map. The snapshot bookkeeping is
+    // keyed the same way and holds the last written tail, a pending tail and a
+    // live timer, so an evicted session stayed reachable — and its timer still
+    // fired, writing a snapshot for a session no longer cached. Evicting then
+    // freed almost nothing, which is the opposite of the point.
+    for (let i = 0; i < 13; i++) {
+      __setTimelineCacheForTests(`server:s${i}`, makeEvents(`s${i}`, 100));
+    }
+
+    expect(__getTimelineCacheKeysForTests()).not.toContain('server:s0');
+    expect(__getTimelineSnapshotBookkeepingKeysForTests()).not.toContain('server:s0');
+    // Non-vacuous: a session that survived eviction still has its bookkeeping.
+    expect(__getTimelineSnapshotBookkeepingKeysForTests()).toContain('server:s12');
   });
 
   it('does not collapse paged history back to the initial window on a realtime event', () => {

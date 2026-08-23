@@ -868,14 +868,31 @@ const VIEW_TAIL_MARGIN_ITEMS = 24;
 /** First guess at events-per-item. Tool groups collapse many events into one. */
 const VIEW_TAIL_EVENTS_PER_ITEM = 4;
 
+/**
+ * Passes before giving up and deriving everything.
+ *
+ * Each pass quadruples the window, so four billion events are covered in
+ * sixteen. Reaching this cap means the arithmetic below is wrong, and the
+ * correct response is a slow full derivation rather than another pass.
+ */
+const VIEW_TAIL_MAX_WIDENING_PASSES = 16;
+
 function buildViewItemsTail(
   events: TimelineEvent[],
   showToolCalls: boolean,
   wantItems: number,
 ): DerivedViewTail {
-  const target = wantItems + VIEW_TAIL_MARGIN_ITEMS;
+  // Every exit below is a numeric comparison, and every comparison against NaN
+  // is false — a non-finite want would therefore loop forever, on the main
+  // thread, wedging the tab past the point where even a reload can run. The
+  // callers pass finite numbers today; this does not depend on them continuing
+  // to.
+  const want = Number.isFinite(wantItems) && wantItems > 0
+    ? Math.floor(wantItems)
+    : CHAT_INITIAL_RENDER_ITEM_LIMIT;
+  const target = want + VIEW_TAIL_MARGIN_ITEMS;
   let windowSize = Math.min(events.length, Math.max(target * VIEW_TAIL_EVENTS_PER_ITEM, 200));
-  for (;;) {
+  for (let pass = 0; pass < VIEW_TAIL_MAX_WIDENING_PASSES; pass += 1) {
     const startIndex = Math.max(0, events.length - windowSize);
     const items = buildViewItems(startIndex === 0 ? events : events.slice(startIndex), showToolCalls);
     // Enough, or there is nothing older to widen into.
@@ -886,6 +903,7 @@ function buildViewItemsTail(
     // items, so widening by a constant factor rather than a constant count.
     windowSize = Math.min(events.length, windowSize * 4);
   }
+  return { items: buildViewItems(events, showToolCalls), windowStartIndex: 0 };
 }
 
 /** Test seam for the windowed derivation; production goes through the memo. */

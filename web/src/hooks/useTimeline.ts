@@ -583,6 +583,15 @@ function pruneTimelineCache(): void {
     if (eventsCache.size <= MAX_CACHED_SESSIONS && totalEvents <= MAX_TOTAL_CACHED_EVENTS) break;
     if (eventsCache.delete(entry.key)) {
       eventsCacheAccess.delete(entry.key);
+      // The snapshot bookkeeping is keyed by cacheKey but was never pruned with
+      // the cache, so every session the tab ever opened kept its last written
+      // tail — up to MAX_PERSISTED_SNAPSHOT_EVENTS events — reachable forever.
+      // Those are precisely the events this eviction exists to release, so
+      // dropping the entry without them frees almost nothing. Flush a queued
+      // write first: eviction should release memory, not silently lose a
+      // snapshot that was already scheduled.
+      flushTimelineSnapshotPersist(entry.key);
+      lastWrittenTimelineSnapshotTails.delete(entry.key);
       totalEvents -= entry.size;
     }
   }
@@ -1081,6 +1090,20 @@ function getTimelineHistoryAfterTs(events: TimelineEvent[]): number | undefined 
 
 export function __getTimelineHistoryAfterTsForTests(events: TimelineEvent[]): number | undefined {
   return getTimelineHistoryAfterTs(events);
+}
+
+/**
+ * Cache keys still held by the snapshot bookkeeping.
+ *
+ * These maps pin events and timers independently of the events cache, so
+ * eviction has to clear them too or it frees almost nothing.
+ */
+export function __getTimelineSnapshotBookkeepingKeysForTests(): string[] {
+  return [...new Set([
+    ...lastWrittenTimelineSnapshotTails.keys(),
+    ...pendingTimelineSnapshotTails.keys(),
+    ...pendingTimelineSnapshotTimers.keys(),
+  ])];
 }
 
 export function __getTimelineCacheKeysForTests(): string[] {
