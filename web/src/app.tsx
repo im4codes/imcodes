@@ -5824,6 +5824,7 @@ export function App() {
                 onDiff={registerDiffApplyer}
                 onHistory={registerHistoryApplyer}
                 serverId={selectedServerId}
+                quickClosePersistenceScope={activeRootSession ?? activeSession ?? undefined}
                 onViewRepo={() => openRepoPage()}
                 onViewCron={() => runVersionSensitiveAction(trans('cron.title'), () => setShowCronManager(true))}
                 subUsages={subUsages}

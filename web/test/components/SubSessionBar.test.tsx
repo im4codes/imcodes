@@ -729,6 +729,90 @@ describe('SubSessionBar', () => {
     expect(onRestoreQuickClosed).toHaveBeenCalledWith(['sub-a', 'sub-b']);
   });
 
+  it('persists quick-closed windows per main session so refresh can restore them', () => {
+    const onCloseAllOpen = vi.fn();
+    const subSessions = [
+      makeSubSession({ id: 'sub-a', sessionName: 'deck_sub_sub-a', label: 'a' }),
+      makeSubSession({ id: 'sub-b', sessionName: 'deck_sub_sub-b', label: 'b' }),
+    ];
+
+    const firstView = render(
+      <SubSessionBar
+        subSessions={subSessions}
+        openIds={new Set(['sub-a', 'sub-b'])}
+        collapsed={true}
+        desktopLayoutCapable={true}
+        serverId="srv-1"
+        quickClosePersistenceScope="deck_alpha_brain"
+        onOpen={vi.fn()}
+        onClose={vi.fn()}
+        onCloseAllOpen={onCloseAllOpen}
+        onRestoreQuickClosed={vi.fn()}
+        onRestart={vi.fn()}
+        onNew={vi.fn()}
+        ws={null}
+        connected={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(firstView.container.querySelector('.subsession-close-all-strip') as HTMLButtonElement);
+    expect(onCloseAllOpen).toHaveBeenCalledTimes(1);
+    firstView.unmount();
+
+    const otherSession = render(
+      <SubSessionBar
+        subSessions={subSessions}
+        openIds={new Set()}
+        collapsed={true}
+        desktopLayoutCapable={true}
+        serverId="srv-1"
+        quickClosePersistenceScope="deck_beta_brain"
+        onOpen={vi.fn()}
+        onClose={vi.fn()}
+        onCloseAllOpen={vi.fn()}
+        onRestoreQuickClosed={vi.fn()}
+        onRestart={vi.fn()}
+        onNew={vi.fn()}
+        ws={null}
+        connected={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+    expect((otherSession.container.querySelector('.subsession-close-all-strip') as HTMLButtonElement).disabled).toBe(true);
+    otherSession.unmount();
+
+    const onRestoreQuickClosed = vi.fn();
+    const refreshedView = render(
+      <SubSessionBar
+        subSessions={subSessions}
+        openIds={new Set()}
+        collapsed={true}
+        desktopLayoutCapable={true}
+        serverId="srv-1"
+        quickClosePersistenceScope="deck_alpha_brain"
+        onOpen={vi.fn()}
+        onClose={vi.fn()}
+        onCloseAllOpen={vi.fn()}
+        onRestoreQuickClosed={onRestoreQuickClosed}
+        onRestart={vi.fn()}
+        onNew={vi.fn()}
+        ws={null}
+        connected={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+
+    const restoreStrip = refreshedView.container.querySelector('.subsession-close-all-strip') as HTMLButtonElement;
+    expect(restoreStrip.disabled).toBe(false);
+    expect(restoreStrip.getAttribute('aria-label')).toBe('subsessionBar.restore_quick_closed');
+    fireEvent.click(restoreStrip);
+    expect(onRestoreQuickClosed).toHaveBeenCalledWith(['sub-a', 'sub-b']);
+  });
+
   it('keeps the desktop quick window strip disabled until a window can be closed or restored', () => {
     const subSessions = [
       makeSubSession({ id: 'sub-a', sessionName: 'deck_sub_sub-a', label: 'a' }),

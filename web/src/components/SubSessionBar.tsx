@@ -147,6 +147,8 @@ interface Props {
   onDiff: (sessionName: string, apply: (d: TerminalDiff) => void) => void;
   onHistory: (sessionName: string, apply: (c: string) => void) => void;
   serverId?: string;
+  /** Main-session identity used to isolate the temporary quick-collapse stash. */
+  quickClosePersistenceScope?: string;
   /** Per-sub-session usage data (ctx tokens, model) collected from timeline events. */
   subUsages?: Map<string, { inputTokens: number; cacheTokens: number; contextWindow: number; contextWindowSource?: UsageContextWindowSource; model?: string }>;
   /** Last model detected from timeline/terminal events, keyed by sessionName. */
@@ -173,6 +175,7 @@ interface CardSize { w: number; h: number }
 
 const DEFAULT_SIZE: CardSize = { w: 350, h: 250 };
 export const SUBSESSION_BAR_COLLAPSED_STORAGE_KEY = 'rcc_subcard_collapsed';
+export const SUBSESSION_QUICK_CLOSED_STORAGE_KEY_PREFIX = 'rcc_subcard_quick_closed_v1:';
 const P2P_MOBILE_COMPACT_STORAGE_KEY = 'rcc_subcard_p2p_hidden';
 const P2P_DESKTOP_COMPACT_STORAGE_KEY = 'rcc_subcard_p2p_desktop_compact';
 const EXPANDED_PREVIEW_INITIAL_COUNT = 2;
@@ -189,6 +192,19 @@ function load<T>(key: string, fallback: T): T {
 
 function save(key: string, value: unknown) {
   try { localStorage.setItem(key, JSON.stringify(value)); } catch { /* ignore */ }
+}
+
+export function subSessionQuickClosedStorageKey(
+  serverId: string | undefined,
+  scope: string | undefined,
+): string {
+  return `${SUBSESSION_QUICK_CLOSED_STORAGE_KEY_PREFIX}${encodeURIComponent(serverId?.trim() || 'local')}:${encodeURIComponent(scope?.trim() || 'global')}`;
+}
+
+function loadQuickClosedIds(key: string): string[] {
+  const stored = load<unknown>(key, []);
+  if (!Array.isArray(stored)) return [];
+  return [...new Set(stored.filter((value): value is string => typeof value === 'string' && value.trim().length > 0))];
 }
 
 function formatUptime(seconds: number): string {
@@ -678,7 +694,7 @@ function DaemonStatsModal({
   );
 }
 
-export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayoutCapable = true, idleFlashTokens, sharedSubSessionStates, onOpen, onFocus, onClose, onCloseAllOpen, onRestoreQuickClosed, onOpenMaximized, onMaximize, onRestore, onRestoreThenClose, onRestart, onNew, onViewAutoDeliver, onViewDiscussions, onViewDiscussion, onViewRepo, onViewCron, openSpecAutoProjection, openSpecAutoStopPending = false, openSpecAutoCompact = false, onOpenSpecAutoView, onOpenSpecAutoStop, onOpenSpecAutoToggleCompact, onOpenSpecAutoHide, discussions = [], totalRunningDiscussions = 0, onStopDiscussion, ws, connected, onDiff, onHistory, serverId, subUsages, detectedModels, focusedSubId, collapsed: controlledCollapsed, onCollapsedChange, onVisualOrderChange, quickData, sessions, allSubSessions, p2pSessionLabels, onSubTransportConfigSaved }: Props) {
+export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayoutCapable = true, idleFlashTokens, sharedSubSessionStates, onOpen, onFocus, onClose, onCloseAllOpen, onRestoreQuickClosed, onOpenMaximized, onMaximize, onRestore, onRestoreThenClose, onRestart, onNew, onViewAutoDeliver, onViewDiscussions, onViewDiscussion, onViewRepo, onViewCron, openSpecAutoProjection, openSpecAutoStopPending = false, openSpecAutoCompact = false, onOpenSpecAutoView, onOpenSpecAutoStop, onOpenSpecAutoToggleCompact, onOpenSpecAutoHide, discussions = [], totalRunningDiscussions = 0, onStopDiscussion, ws, connected, onDiff, onHistory, serverId, quickClosePersistenceScope, subUsages, detectedModels, focusedSubId, collapsed: controlledCollapsed, onCollapsedChange, onVisualOrderChange, quickData, sessions, allSubSessions, p2pSessionLabels, onSubTransportConfigSaved }: Props) {
   const { t } = useTranslation();
   const isMobile = !desktopLayoutCapable;
   const [layout, setLayout] = useState<Layout>(() => load('rcc_subcard_layout', 'single'));
@@ -694,7 +710,27 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
   const [showDaemonDetails, setShowDaemonDetails] = useState(false);
   const localClockNow = useNowTicker(!!stats && (desktopLayoutCapable || showDaemonDetails));
   const localClockText = useMemo(() => formatLocalDateTime(localClockNow), [localClockNow]);
-  const [quickClosedIds, setQuickClosedIds] = useState<string[]>([]);
+  const quickClosedStorageKey = useMemo(
+    () => subSessionQuickClosedStorageKey(serverId, quickClosePersistenceScope),
+    [quickClosePersistenceScope, serverId],
+  );
+  const [quickClosedState, setQuickClosedState] = useState(() => ({
+    storageKey: quickClosedStorageKey,
+    ids: loadQuickClosedIds(quickClosedStorageKey),
+  }));
+  const quickClosedIds = quickClosedState.storageKey === quickClosedStorageKey
+    ? quickClosedState.ids
+    : loadQuickClosedIds(quickClosedStorageKey);
+  const setQuickClosedIds = useCallback((ids: string[]) => {
+    const normalized = [...new Set(ids.filter((id) => id.trim().length > 0))];
+    save(quickClosedStorageKey, normalized);
+    setQuickClosedState({ storageKey: quickClosedStorageKey, ids: normalized });
+  }, [quickClosedStorageKey]);
+  useEffect(() => {
+    setQuickClosedState((current) => current.storageKey === quickClosedStorageKey
+      ? current
+      : { storageKey: quickClosedStorageKey, ids: loadQuickClosedIds(quickClosedStorageKey) });
+  }, [quickClosedStorageKey]);
   // DB sort_order is the authority — subSessions arrive pre-sorted from server.
   // Local dragOrder only tracks in-session drag reorder (synced back to DB via reorderSubSessions).
   const [dragOrder, setDragOrder] = useState<string[] | null>(null);
@@ -934,7 +970,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
       setQuickClosedIds([]);
       onRestoreQuickClosed(restoreIds);
     }
-  }, [onCloseAllOpen, onRestoreQuickClosed, restorableQuickClosedIds]);
+  }, [onCloseAllOpen, onRestoreQuickClosed, restorableQuickClosedIds, setQuickClosedIds]);
 
   const moveSubSessionInDragOrder = useCallback((draggedId: string, overId: string) => {
     if (draggedId === overId) return;
