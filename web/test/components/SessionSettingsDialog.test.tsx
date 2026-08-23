@@ -345,6 +345,34 @@ describe('SessionSettingsDialog supervision', () => {
     expect(onClose).toHaveBeenCalledTimes(2);
   });
 
+  it('uses the responsive themed settings shell instead of native dialog chrome', () => {
+    render(
+      <SessionSettingsDialog
+        serverId="srv-1"
+        sessionName="deck_proj_brain"
+        label="Brain"
+        description="desc"
+        cwd="/proj"
+        type="codex-sdk"
+        transportConfig={null}
+        onClose={vi.fn()}
+        onSaved={vi.fn()}
+      />,
+    );
+
+    const dialog = document.querySelector('.session-settings-dialog');
+    expect(dialog).toBeTruthy();
+    expect(dialog?.querySelector('.session-settings-header')).toBeTruthy();
+    expect(dialog?.querySelector('.session-settings-body')).toBeTruthy();
+    expect(dialog?.querySelector('.session-settings-footer')).toBeTruthy();
+    expect(dialog?.querySelectorAll('.session-settings-card')).toHaveLength(2);
+    expect(dialog?.querySelectorAll('.session-settings-field').length).toBeGreaterThanOrEqual(5);
+
+    const close = screen.getByRole('button', { name: /^close$/i });
+    expect(close.classList.contains('session-settings-close')).toBe(true);
+    expect(close.textContent).toContain('×');
+  });
+
   it('only offers reply-capable sessions from the audited session group', () => {
     render(
       <SessionSettingsDialog

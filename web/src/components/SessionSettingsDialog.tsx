@@ -303,66 +303,32 @@ function SupervisionIntroCard({ t }: { t: (key: string, params?: Record<string, 
   ];
 
   return (
-    <div
-      style={{
-        display: 'flex',
-        flexDirection: 'column',
-        gap: collapsed ? 0 : 10,
-        padding: 12,
-        borderRadius: 10,
-        background: 'rgba(15, 23, 42, 0.45)',
-        border: '1px solid rgba(96, 165, 250, 0.2)',
-      }}
-    >
+    <div class={`session-settings-intro${collapsed ? ' is-collapsed' : ''}`}>
       <button
         type="button"
         onClick={toggleCollapsed}
         aria-expanded={!collapsed}
         aria-controls="supervision-intro-body"
         data-testid="supervision-intro-toggle"
-        style={{
-          display: 'flex',
-          alignItems: 'center',
-          gap: 8,
-          background: 'transparent',
-          border: 'none',
-          padding: 0,
-          margin: 0,
-          cursor: 'pointer',
-          color: '#e2e8f0',
-          fontSize: 12,
-          fontWeight: 600,
-          textAlign: 'left',
-          width: '100%',
-        }}
+        class="session-settings-intro-toggle"
       >
         <span
           aria-hidden="true"
-          style={{
-            display: 'inline-block',
-            transition: 'transform 150ms ease',
-            transform: collapsed ? 'rotate(-90deg)' : 'rotate(0deg)',
-            width: 10,
-            textAlign: 'center',
-            color: '#94a3b8',
-          }}
+          class="session-settings-intro-arrow"
         >
           ▾
         </span>
-        <span style={{ flex: 1 }}>{t('session.supervision.intro.title')}</span>
-        <span style={{ fontSize: 11, color: '#64748b', fontWeight: 400 }}>
+        <span class="session-settings-intro-title">{t('session.supervision.intro.title')}</span>
+        <span class="session-settings-intro-hint">
           {t(collapsed ? 'session.supervision.intro.expandHint' : 'session.supervision.intro.collapseHint')}
         </span>
       </button>
       {!collapsed && (
-        <div
-          id="supervision-intro-body"
-          style={{ display: 'flex', flexDirection: 'column', gap: 10, marginTop: 2 }}
-        >
+        <div id="supervision-intro-body" class="session-settings-intro-body">
           {sections.map((section) => (
-            <div key={section.title} style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
-              <div style={{ fontSize: 12, color: '#cbd5e1', fontWeight: 600 }}>{section.title}</div>
-              <div style={{ fontSize: 12, lineHeight: 1.5, color: '#94a3b8' }}>{section.body}</div>
+            <div key={section.title} class="session-settings-intro-item">
+              <div class="session-settings-intro-item-title">{section.title}</div>
+              <div class="session-settings-intro-item-body">{section.body}</div>
             </div>
           ))}
         </div>
@@ -427,10 +393,10 @@ function SupervisionRuntimeFields({
     onBackendChange((e.target as HTMLSelectElement).value);
   };
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-      <div style={{ display: 'grid', gridTemplateColumns: backend === 'openclaw' ? `repeat(${onTimeoutChange ? 3 : 2}, minmax(0, 1fr))` : `repeat(${onTimeoutChange ? 2 : 1}, minmax(0, 1fr))`, gap: 12 }}>
-        <div>
-          <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 4 }}>{t('session.supervision.backend')}</div>
+    <div class="supervision-runtime-fields">
+      <div class="supervision-runtime-grid" style={{ gridTemplateColumns: backend === 'openclaw' ? `repeat(${onTimeoutChange ? 3 : 2}, minmax(0, 1fr))` : `repeat(${onTimeoutChange ? 2 : 1}, minmax(0, 1fr))` }}>
+        <div class="session-settings-field">
+          <div class="session-settings-label">{t('session.supervision.backend')}</div>
           <select
             class="input"
             aria-label={`${idPrefix}:backend`}
@@ -448,8 +414,8 @@ function SupervisionRuntimeFields({
         </div>
 
         {backend === 'openclaw' && (
-          <div>
-            <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 4 }}>{t('session.supervision.model')}</div>
+          <div class="session-settings-field">
+            <div class="session-settings-label">{t('session.supervision.model')}</div>
           <input
             class="input"
             aria-label={`${idPrefix}:model`}
@@ -462,8 +428,8 @@ function SupervisionRuntimeFields({
           </div>
         )}
 
-        {onTimeoutChange && timeoutSeconds != null && <div>
-          <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 4 }}>{t('session.supervision.timeout')}</div>
+        {onTimeoutChange && timeoutSeconds != null && <div class="session-settings-field">
+          <div class="session-settings-label">{t('session.supervision.timeout')}</div>
           <input
             class="input"
             aria-label={`${idPrefix}:timeout`}
@@ -1092,21 +1058,21 @@ export function SessionSettingsDialog({
   ]);
 
   const supervisionPanel = isSupportedTransport ? (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+    <div class="session-settings-supervision-panel">
       <SupervisionIntroCard t={t} />
 
-      <div style={{ fontSize: 12, color: '#94a3b8' }}>
+      <div class="session-settings-help">
         {t('session.supervision.help')}
       </div>
 
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 10, padding: 12, borderRadius: 10, background: 'rgba(15, 23, 42, 0.45)', border: '1px solid rgba(148, 163, 184, 0.16)' }}>
-        <div style={{ fontSize: 12, color: '#e2e8f0', fontWeight: 600 }}>
+      <div class="session-settings-card session-settings-card-primary">
+        <div class="session-settings-card-title">
           {t('session.supervision.globalDefaultsTitle')}
         </div>
-        <div style={{ fontSize: 12, color: '#94a3b8' }}>
+        <div class="session-settings-help">
           {t('session.supervision.globalDefaultsHelp')}
         </div>
-        <div style={{ fontSize: 12, color: '#e2e8f0', fontWeight: 600 }}>
+        <div class="session-settings-subtitle">
           {t('session.supervision.globalPrimaryRuntime')}
         </div>
         <SupervisionRuntimeFields
@@ -1127,11 +1093,11 @@ export function SessionSettingsDialog({
           onTimeoutChange={(seconds) => updateSupervisorDefaultsFromUser((prev) => ({ ...prev, timeoutMs: timeoutUiSecondsToMs(seconds) }))}
         />
 
-        <div style={{ marginTop: 2, paddingTop: 10, borderTop: '1px solid rgba(148, 163, 184, 0.14)' }}>
-          <div style={{ fontSize: 12, color: '#e2e8f0', fontWeight: 600, marginBottom: 4 }}>
+        <div class="session-settings-subsection">
+          <div class="session-settings-subtitle">
             {t('session.supervision.globalBackupRuntime')}
           </div>
-          <div style={{ fontSize: 11, color: '#64748b', marginBottom: 8 }}>
+          <div class="session-settings-muted">
             {t('session.supervision.globalBackupHelp')}
           </div>
           <SupervisionRuntimeFields
@@ -1165,9 +1131,9 @@ export function SessionSettingsDialog({
           />
         </div>
 
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 12 }}>
-          <div>
-            <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 4 }}>{t('session.supervision.maxAutoContinueStreak')}</div>
+        <div class="session-settings-grid">
+          <div class="session-settings-field">
+            <div class="session-settings-label">{t('session.supervision.maxAutoContinueStreak')}</div>
             <input
               class="input"
               type="number"
@@ -1180,10 +1146,10 @@ export function SessionSettingsDialog({
               style={{ width: '100%' }}
               disabled={saving}
             />
-            <div style={{ fontSize: 11, color: '#64748b', marginTop: 4 }}>{t('session.supervision.maxAutoContinueStreakHelp')}</div>
+            <div class="session-settings-field-help">{t('session.supervision.maxAutoContinueStreakHelp')}</div>
           </div>
-          <div>
-            <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 4 }}>{t('session.supervision.maxAutoContinueTotal')}</div>
+          <div class="session-settings-field">
+            <div class="session-settings-label">{t('session.supervision.maxAutoContinueTotal')}</div>
             <input
               class="input"
               type="number"
@@ -1196,12 +1162,12 @@ export function SessionSettingsDialog({
               style={{ width: '100%' }}
               disabled={saving}
             />
-            <div style={{ fontSize: 11, color: '#64748b', marginTop: 4 }}>{t('session.supervision.maxAutoContinueTotalHelp')}</div>
+            <div class="session-settings-field-help">{t('session.supervision.maxAutoContinueTotalHelp')}</div>
           </div>
         </div>
 
-        <div>
-          <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 4 }}>
+        <div class="session-settings-field">
+          <div class="session-settings-label">
             {t('session.supervision.globalCustomInstructionsLabel')}
           </div>
           <textarea
@@ -1213,7 +1179,7 @@ export function SessionSettingsDialog({
             disabled={saving}
             placeholder={t('session.supervision.globalCustomInstructionsPlaceholder')}
           />
-          <div style={{ fontSize: 11, color: '#64748b', marginTop: 4 }}>
+          <div class="session-settings-field-help">
             {t('session.supervision.globalCustomInstructionsHelp')}
           </div>
         </div>
@@ -1237,16 +1203,16 @@ export function SessionSettingsDialog({
         )}
       </div>
 
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 10, padding: 12, borderRadius: 10, background: 'rgba(15, 23, 42, 0.45)', border: '1px solid rgba(148, 163, 184, 0.16)' }}>
-        <div style={{ fontSize: 12, color: '#e2e8f0', fontWeight: 600 }}>
+      <div class="session-settings-card session-settings-card-session">
+        <div class="session-settings-card-title">
           {t('session.supervision.sessionConfigTitle')}
         </div>
-        <div style={{ fontSize: 12, color: '#94a3b8' }}>
+        <div class="session-settings-help">
           {t('session.supervision.sessionConfigHelp')}
         </div>
 
-        <div>
-          <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 4 }}>{t('session.supervision.modeLabel')}</div>
+        <div class="session-settings-field">
+          <div class="session-settings-label">{t('session.supervision.modeLabel')}</div>
           <select
             class="input"
             aria-label="supervision-session:mode"
@@ -1264,13 +1230,13 @@ export function SessionSettingsDialog({
 
         {hasSupervision && (
           <>
-            <div style={{ padding: 10, borderRadius: 8, background: 'rgba(15, 23, 42, 0.6)', border: '1px solid rgba(148, 163, 184, 0.18)', fontSize: 12, color: '#94a3b8' }}>
+            <div class="session-settings-notice">
               {t('session.supervision.usesGlobalRuntime')}
             </div>
 
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 12 }}>
-              <div>
-                <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 4 }}>{t('session.supervision.maxAutoContinueStreak')}</div>
+            <div class="session-settings-grid">
+              <div class="session-settings-field">
+                <div class="session-settings-label">{t('session.supervision.maxAutoContinueStreak')}</div>
                 <input
                   class="input"
                   type="number"
@@ -1283,11 +1249,11 @@ export function SessionSettingsDialog({
                   style={{ width: '100%' }}
                   disabled={saving}
                 />
-                <div style={{ fontSize: 11, color: '#64748b', marginTop: 4 }}>{t('session.supervision.maxAutoContinueStreakHelp')}</div>
+                <div class="session-settings-field-help">{t('session.supervision.maxAutoContinueStreakHelp')}</div>
               </div>
 
-              <div>
-                <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 4 }}>{t('session.supervision.maxAutoContinueTotal')}</div>
+              <div class="session-settings-field">
+                <div class="session-settings-label">{t('session.supervision.maxAutoContinueTotal')}</div>
                 <input
                   class="input"
                   type="number"
@@ -1300,12 +1266,12 @@ export function SessionSettingsDialog({
                   style={{ width: '100%' }}
                   disabled={saving}
                 />
-                <div style={{ fontSize: 11, color: '#64748b', marginTop: 4 }}>{t('session.supervision.maxAutoContinueTotalHelp')}</div>
+                <div class="session-settings-field-help">{t('session.supervision.maxAutoContinueTotalHelp')}</div>
               </div>
             </div>
 
-            <div>
-              <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 4 }}>{t('session.supervision.customInstructionsLabel')}</div>
+            <div class="session-settings-field">
+              <div class="session-settings-label">{t('session.supervision.customInstructionsLabel')}</div>
               <textarea
                 class="input"
                 value={supervisionCustomInstructions}
@@ -1315,7 +1281,7 @@ export function SessionSettingsDialog({
                 disabled={saving}
                 placeholder={t('session.supervision.customInstructionsPlaceholder')}
               />
-              <div style={{ fontSize: 11, color: '#64748b', marginTop: 4 }}>
+              <div class="session-settings-field-help">
                 {t('session.supervision.customInstructionsHelp')}
               </div>
 
@@ -1409,7 +1375,7 @@ export function SessionSettingsDialog({
               </div>
             )}
 
-            <div style={{ padding: 12, borderRadius: 8, background: 'rgba(15, 23, 42, 0.6)', border: '1px solid rgba(148, 163, 184, 0.18)', display: 'flex', flexDirection: 'column', gap: 4 }}>
+            <div class="session-settings-summary">
               <div style={{ fontSize: 12, color: '#cbd5e1', fontWeight: 600 }}>{t('session.supervision.summaryTitle')}</div>
               <div style={{ fontSize: 12, color: '#94a3b8' }}>{t('session.supervision.summaryMode', { value: supervisionModeLabel })}</div>
               <div style={{ fontSize: 12, color: '#94a3b8' }}>
@@ -1499,16 +1465,24 @@ export function SessionSettingsDialog({
 
   const dialog = (
     <div class="dialog-overlay session-settings-overlay" onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}>
-      <div class="dialog" style={{ width: 440 }}>
-        <div class="dialog-header">
-          <span>{t('session.settings')}</span>
-          <button type="button" class="dialog-close" onClick={onClose}>{t('common.close')}</button>
+      <div class="dialog session-settings-dialog">
+        <div class="dialog-header session-settings-header">
+          <span class="session-settings-title">{t('session.settings')}</span>
+          <button
+            type="button"
+            class="dialog-close session-settings-close"
+            aria-label={t('common.close')}
+            title={t('common.close')}
+            onClick={onClose}
+          >
+            <span aria-hidden="true">×</span>
+          </button>
         </div>
 
-        <div class="dialog-body" style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+        <div class="dialog-body session-settings-body">
           {/* Type */}
-          <div>
-            <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 4 }}>{t('session.type')}</div>
+          <div class="session-settings-field">
+            <div class="session-settings-label">{t('session.type')}</div>
             <select
               class="input"
               value={agentType}
@@ -1524,15 +1498,15 @@ export function SessionSettingsDialog({
 
           {/* Parent session (read-only, sub-session only) */}
           {parentSession && (
-            <div>
-              <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 4 }}>{t('session.parentSession')}</div>
-              <div style={{ fontSize: 13, color: '#64748b' }}>{parentSession}</div>
+            <div class="session-settings-field">
+              <div class="session-settings-label">{t('session.parentSession')}</div>
+              <div class="session-settings-readonly">{parentSession}</div>
             </div>
           )}
 
           {/* Label */}
-          <div>
-            <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 4 }}>{t('session.label')}</div>
+          <div class="session-settings-field">
+            <div class="session-settings-label">{t('session.label')}</div>
             <input
               class="input"
               value={label}
@@ -1543,8 +1517,8 @@ export function SessionSettingsDialog({
           </div>
 
           {/* Description */}
-          <div>
-            <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 4 }}>{t('session.description')}</div>
+          <div class="session-settings-field">
+            <div class="session-settings-label">{t('session.description')}</div>
             <textarea
               class="input"
               value={description}
@@ -1557,8 +1531,8 @@ export function SessionSettingsDialog({
           </div>
 
           {/* Working directory */}
-          <div>
-            <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 4 }}>{t('session.workingDir')}</div>
+          <div class="session-settings-field">
+            <div class="session-settings-label">{t('session.workingDir')}</div>
             <input
               class="input"
               value={initCwd}
@@ -1569,15 +1543,15 @@ export function SessionSettingsDialog({
             />
           </div>
 
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 10, paddingTop: 4, borderTop: '1px solid rgba(148, 163, 184, 0.18)' }}>
-            <div style={{ fontSize: 12, color: '#94a3b8', fontWeight: 600 }}>{t('session.supervision.title')}</div>
+          <div class="session-settings-section">
+            <div class="session-settings-section-title">{t('session.supervision.title')}</div>
             {supervisionPanel}
           </div>
 
-          {error && <div style={{ color: '#f87171', fontSize: 12 }}>{error}</div>}
+          {error && <div class="session-settings-error">{error}</div>}
         </div>
 
-        <div class="dialog-footer">
+        <div class="dialog-footer session-settings-footer">
           <button type="button" class="btn btn-secondary" onClick={onClose} disabled={saving}>{t('common.cancel')}</button>
           <button type="button" class="btn btn-primary" onClick={handleSave} disabled={saving || !hasChanges || !supervisionValid || !globalDefaultsValid}>
             {saving ? t('common.loading') : t('common.save')}

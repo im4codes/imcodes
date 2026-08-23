@@ -5686,6 +5686,426 @@ html.native-ios-mac .chat-dl-btn {
   min-height: 0;
 }
 
+/* ── Session settings ─────────────────────────────────────────────────────
+   Mobile is a bottom sheet with large touch targets; desktop expands into a
+   wider control surface. The restrained cyan/indigo lighting matches the app
+   chrome without reducing form contrast or making long settings noisy. */
+.session-settings-overlay {
+  background:
+    radial-gradient(circle at 14% 8%, rgba(34, 211, 238, 0.14), transparent 34%),
+    radial-gradient(circle at 88% 92%, rgba(99, 102, 241, 0.14), transparent 38%),
+    rgba(2, 6, 23, 0.82);
+  -webkit-backdrop-filter: blur(14px) saturate(120%);
+  backdrop-filter: blur(14px) saturate(120%);
+}
+.session-settings-dialog {
+  position: relative;
+  isolation: isolate;
+  width: min(720px, calc(100vw - 48px));
+  max-width: 720px;
+  max-height: min(92dvh, 900px);
+  color-scheme: dark;
+  color: #dceaf7;
+  background:
+    radial-gradient(circle at 12% 0%, rgba(34, 211, 238, 0.1), transparent 31%),
+    radial-gradient(circle at 94% 4%, rgba(99, 102, 241, 0.11), transparent 36%),
+    linear-gradient(155deg, rgba(15, 28, 47, 0.99), rgba(7, 15, 28, 0.995));
+  border: 1px solid rgba(103, 232, 249, 0.25);
+  border-radius: 18px;
+  box-shadow:
+    0 32px 100px rgba(2, 8, 23, 0.72),
+    0 0 0 1px rgba(56, 189, 248, 0.04) inset,
+    0 0 44px rgba(34, 211, 238, 0.07);
+}
+.session-settings-dialog::before {
+  content: "";
+  position: absolute;
+  z-index: 1;
+  inset: 0 24px auto;
+  height: 1px;
+  pointer-events: none;
+  background: linear-gradient(90deg, transparent, rgba(103, 232, 249, 0.82), rgba(129, 140, 248, 0.58), transparent);
+}
+.session-settings-header {
+  position: relative;
+  z-index: 2;
+  min-height: 60px;
+  padding: 14px 18px 13px;
+  border-bottom: 1px solid rgba(125, 211, 252, 0.11);
+  background: linear-gradient(180deg, rgba(17, 32, 52, 0.8), rgba(11, 23, 39, 0.38));
+}
+.session-settings-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  color: #f1f8ff;
+  font-size: 15px;
+  font-weight: 700;
+  letter-spacing: 0.015em;
+}
+.session-settings-title::before {
+  content: "";
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #67e8f9;
+  box-shadow: 0 0 0 4px rgba(34, 211, 238, 0.1), 0 0 16px rgba(34, 211, 238, 0.85);
+}
+.session-settings-close {
+  display: inline-grid;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  flex: 0 0 34px;
+  padding: 0;
+  color: #8fa6bd;
+  background: rgba(15, 29, 48, 0.72);
+  border: 1px solid rgba(125, 211, 252, 0.14);
+  border-radius: 10px;
+  font-size: 22px;
+  line-height: 1;
+  transition: color 140ms ease, border-color 140ms ease, background 140ms ease, box-shadow 140ms ease, transform 140ms ease;
+}
+.session-settings-close:hover {
+  color: #ecfeff;
+  background: rgba(14, 116, 144, 0.2);
+  border-color: rgba(103, 232, 249, 0.42);
+  box-shadow: 0 0 18px rgba(34, 211, 238, 0.12);
+}
+.session-settings-close:active { transform: scale(0.94); }
+.session-settings-close:focus-visible {
+  outline: 2px solid rgba(103, 232, 249, 0.88);
+  outline-offset: 2px;
+}
+.session-settings-body {
+  display: flex;
+  flex-direction: column;
+  gap: 15px;
+  padding: 18px 20px 22px;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(103, 232, 249, 0.32) transparent;
+}
+.session-settings-body::-webkit-scrollbar { width: 7px; }
+.session-settings-body::-webkit-scrollbar-track { background: transparent; }
+.session-settings-body::-webkit-scrollbar-thumb {
+  background: rgba(103, 232, 249, 0.25);
+  border: 2px solid transparent;
+  border-radius: 999px;
+  background-clip: padding-box;
+}
+.session-settings-field {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+.session-settings-label {
+  margin-bottom: 6px;
+  color: #8aa1b8;
+  font-size: 11px;
+  font-weight: 650;
+  letter-spacing: 0.045em;
+}
+.session-settings-dialog .input {
+  width: 100%;
+  min-width: 0;
+  min-height: 42px;
+  margin: 0;
+  padding: 9px 12px;
+  color: #e9f6ff;
+  caret-color: #67e8f9;
+  background-color: rgba(5, 14, 27, 0.86);
+  background-image: linear-gradient(180deg, rgba(20, 38, 60, 0.72), rgba(7, 17, 31, 0.88));
+  border: 1px solid rgba(125, 211, 252, 0.18);
+  border-radius: 10px;
+  box-shadow: 0 1px 0 rgba(255, 255, 255, 0.025) inset, 0 8px 20px rgba(2, 8, 23, 0.1) inset;
+  outline: none;
+  font: inherit;
+  font-size: 13px;
+  line-height: 1.35;
+  transition: border-color 140ms ease, box-shadow 140ms ease, background 140ms ease, opacity 140ms ease;
+}
+.session-settings-dialog select.input {
+  -webkit-appearance: none;
+  appearance: none;
+  padding-right: 42px;
+  background-image:
+    linear-gradient(45deg, transparent 50%, #67e8f9 50%),
+    linear-gradient(135deg, #67e8f9 50%, transparent 50%),
+    linear-gradient(90deg, transparent, rgba(125, 211, 252, 0.15), transparent),
+    linear-gradient(180deg, rgba(20, 38, 60, 0.76), rgba(7, 17, 31, 0.9));
+  background-position:
+    calc(100% - 18px) calc(50% - 2px),
+    calc(100% - 13px) calc(50% - 2px),
+    calc(100% - 34px) 50%,
+    0 0;
+  background-size: 5px 5px, 5px 5px, 1px 22px, 100% 100%;
+  background-repeat: no-repeat;
+}
+.session-settings-dialog textarea.input {
+  min-height: 84px;
+  line-height: 1.5;
+}
+.session-settings-dialog .input::placeholder { color: #536a82; }
+.session-settings-dialog .input:hover:not(:disabled) { border-color: rgba(103, 232, 249, 0.34); }
+.session-settings-dialog .input:focus,
+.session-settings-dialog .input:focus-visible {
+  border-color: rgba(103, 232, 249, 0.7);
+  box-shadow: 0 0 0 3px rgba(34, 211, 238, 0.1), 0 0 22px rgba(34, 211, 238, 0.06);
+}
+.session-settings-dialog .input:disabled {
+  color: #70859a;
+  background-color: rgba(7, 15, 27, 0.64);
+  border-color: rgba(100, 116, 139, 0.14);
+  opacity: 0.68;
+}
+.session-settings-readonly {
+  min-height: 38px;
+  display: flex;
+  align-items: center;
+  padding: 8px 11px;
+  color: #7f94aa;
+  background: rgba(8, 18, 32, 0.56);
+  border: 1px dashed rgba(125, 211, 252, 0.12);
+  border-radius: 9px;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.session-settings-section {
+  display: flex;
+  flex-direction: column;
+  gap: 11px;
+  padding-top: 17px;
+  border-top: 1px solid rgba(125, 211, 252, 0.12);
+}
+.session-settings-section-title,
+.session-settings-card-title {
+  color: #e5f5ff;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.055em;
+}
+.session-settings-section-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: #a5f3fc;
+  text-transform: uppercase;
+}
+.session-settings-section-title::before {
+  content: "";
+  width: 14px;
+  height: 1px;
+  background: linear-gradient(90deg, #22d3ee, transparent);
+  box-shadow: 0 0 8px rgba(34, 211, 238, 0.6);
+}
+.session-settings-supervision-panel,
+.supervision-runtime-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.supervision-runtime-grid,
+.session-settings-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+.session-settings-card,
+.session-settings-intro {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 11px;
+  padding: 14px;
+  overflow: hidden;
+  background: linear-gradient(145deg, rgba(17, 33, 53, 0.72), rgba(8, 18, 32, 0.82));
+  border: 1px solid rgba(125, 211, 252, 0.14);
+  border-radius: 13px;
+  box-shadow: 0 10px 30px rgba(2, 8, 23, 0.14);
+}
+.session-settings-card::before {
+  content: "";
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 2px;
+  background: linear-gradient(180deg, rgba(34, 211, 238, 0.78), rgba(99, 102, 241, 0.12));
+}
+.session-settings-card-session::before {
+  background: linear-gradient(180deg, rgba(167, 139, 250, 0.76), rgba(34, 211, 238, 0.12));
+}
+.session-settings-subtitle {
+  margin-top: 1px;
+  color: #c9deed;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.035em;
+}
+.session-settings-subsection {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 2px;
+  padding-top: 12px;
+  border-top: 1px solid rgba(125, 211, 252, 0.1);
+}
+.session-settings-muted,
+.session-settings-help,
+.session-settings-field-help {
+  color: #6f879f;
+  font-size: 11px;
+  line-height: 1.5;
+}
+.session-settings-help { font-size: 12px; }
+.session-settings-field-help { margin-top: 5px; }
+.session-settings-notice,
+.session-settings-summary {
+  padding: 11px 12px;
+  color: #8ca5bc;
+  background: rgba(5, 14, 27, 0.52);
+  border: 1px solid rgba(125, 211, 252, 0.11);
+  border-radius: 10px;
+  font-size: 12px;
+  line-height: 1.45;
+}
+.session-settings-summary {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.session-settings-intro { gap: 11px; }
+.session-settings-intro.is-collapsed { gap: 0; }
+.session-settings-intro-toggle {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  color: #dcecf8;
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.35;
+  text-align: left;
+}
+.session-settings-intro-toggle:focus-visible {
+  outline: 2px solid rgba(103, 232, 249, 0.78);
+  outline-offset: 5px;
+  border-radius: 4px;
+}
+.session-settings-intro-arrow {
+  width: 12px;
+  flex: 0 0 12px;
+  color: #67e8f9;
+  text-align: center;
+  transition: transform 150ms ease;
+}
+.session-settings-intro.is-collapsed .session-settings-intro-arrow { transform: rotate(-90deg); }
+.session-settings-intro-title { flex: 1; min-width: 0; }
+.session-settings-intro-hint { color: #60778e; font-size: 10px; font-weight: 500; }
+.session-settings-intro-body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.session-settings-intro-item { display: flex; flex-direction: column; gap: 3px; }
+.session-settings-intro-item-title { color: #c8dceb; font-size: 11px; font-weight: 700; }
+.session-settings-intro-item-body { color: #8098ae; font-size: 11px; line-height: 1.55; }
+.session-settings-error {
+  padding: 10px 12px;
+  color: #fecaca;
+  background: rgba(127, 29, 29, 0.16);
+  border: 1px solid rgba(248, 113, 113, 0.25);
+  border-radius: 10px;
+  font-size: 12px;
+}
+.session-settings-dialog input[type="checkbox"] {
+  accent-color: #22d3ee;
+}
+.session-settings-footer {
+  min-height: 64px;
+  display: flex;
+  flex: 0 0 auto;
+  justify-content: flex-end;
+  gap: 10px;
+  padding: 11px 20px calc(11px + env(safe-area-inset-bottom, 0px));
+  background: linear-gradient(180deg, rgba(7, 16, 29, 0.84), rgba(6, 13, 25, 0.98));
+  border-top: 1px solid rgba(125, 211, 252, 0.12);
+  -webkit-backdrop-filter: blur(12px);
+  backdrop-filter: blur(12px);
+}
+.session-settings-footer .btn {
+  min-width: 104px;
+  min-height: 40px;
+  border-radius: 10px;
+}
+
+@media (max-width: 640px) {
+  .session-settings-overlay {
+    align-items: flex-end;
+    padding: max(var(--sat, 0px), 8px) 8px 0;
+  }
+  .session-settings-dialog {
+    width: 100%;
+    max-width: none;
+    max-height: calc(100dvh - max(var(--sat, 0px), 8px));
+    border-right-color: rgba(103, 232, 249, 0.18);
+    border-bottom: 0;
+    border-left-color: rgba(103, 232, 249, 0.18);
+    border-radius: 20px 20px 0 0;
+    box-shadow: 0 -22px 70px rgba(2, 8, 23, 0.8), 0 0 34px rgba(34, 211, 238, 0.06);
+  }
+  .session-settings-dialog::before { inset-inline: 18%; }
+  .session-settings-header {
+    min-height: 56px;
+    padding: 11px 12px 10px 14px;
+  }
+  .session-settings-close {
+    width: 38px;
+    height: 38px;
+    flex-basis: 38px;
+  }
+  .session-settings-body {
+    gap: 14px;
+    padding: 14px 12px 18px;
+  }
+  .session-settings-card,
+  .session-settings-intro { padding: 13px; border-radius: 12px; }
+  .session-settings-dialog .input {
+    min-height: 46px;
+    padding-top: 10px;
+    padding-bottom: 10px;
+    font-size: 16px;
+  }
+  .session-settings-dialog textarea.input { min-height: 92px; }
+  .supervision-runtime-grid,
+  .session-settings-grid,
+  .supervision-runtime-fields [data-testid$="-runtime-model-preset-selector"] {
+    grid-template-columns: 1fr !important;
+    gap: 11px !important;
+  }
+  .session-settings-intro-hint { display: none; }
+  .session-settings-footer {
+    min-height: 66px;
+    gap: 9px;
+    padding: 10px 12px calc(10px + env(safe-area-inset-bottom, 0px));
+  }
+  .session-settings-footer .btn {
+    flex: 1 1 0;
+    min-width: 0;
+    min-height: 44px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .session-settings-dialog *,
+  .session-settings-dialog *::before,
+  .session-settings-dialog *::after { transition-duration: 0.01ms !important; }
+}
+
 /* ── Sub-session start dialog extras ─────────────────────────────────────── */
 .session-launch-dialog {
   position: relative;
