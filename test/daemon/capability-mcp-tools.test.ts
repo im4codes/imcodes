@@ -104,7 +104,7 @@ describe('capability MCP tools', () => {
     });
   });
 
-  it('dynamically hides, enables, and revokes tools with current daemon identity', async () => {
+  it('keeps tools discoverable while dynamically authorizing every call', async () => {
     let identity: Awaited<ReturnType<NonNullable<Parameters<typeof createMemoryMcpServer>[1]['resolveCapabilityIdentity']>>> = null;
     const runtimeCaller = caller({
       userId: 'daemon-local',
@@ -119,7 +119,11 @@ describe('capability MCP tools', () => {
     await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
     try {
       expect((await client.listTools()).tools.map((tool) => tool.name))
-        .not.toEqual(expect.arrayContaining([...CAPABILITY_MCP_TOOL_NAMES]));
+        .toEqual(expect.arrayContaining([...CAPABILITY_MCP_TOOL_NAMES]));
+      await expect(client.callTool({ name: 'capability_list', arguments: {} })).resolves.toMatchObject({
+        isError: true,
+        structuredContent: { status: 'error', reason: CAPABILITY_ERROR.FORBIDDEN },
+      });
       identity = {
         ownerId: 'owner-1', providerId: 'codex-sdk', serverId: 'server-1',
         sessionId: 'deck_project_brain',
@@ -132,10 +136,10 @@ describe('capability MCP tools', () => {
       identity = null;
       expect(await refreshCapabilityIdentity(server)).toBe(false);
       expect((await client.listTools()).tools.map((tool) => tool.name))
-        .not.toEqual(expect.arrayContaining([...CAPABILITY_MCP_TOOL_NAMES]));
+        .toEqual(expect.arrayContaining([...CAPABILITY_MCP_TOOL_NAMES]));
       await expect(client.callTool({ name: 'capability_list', arguments: {} })).resolves.toMatchObject({
         isError: true,
-        content: [expect.objectContaining({ text: expect.stringMatching(/disabled/i) })],
+        structuredContent: { status: 'error', reason: CAPABILITY_ERROR.FORBIDDEN },
       });
     } finally {
       await client.close();
@@ -199,7 +203,11 @@ describe('capability MCP tools', () => {
     await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
     try {
       expect((await client.listTools()).tools.map((tool) => tool.name))
-        .not.toEqual(expect.arrayContaining([...CAPABILITY_MCP_TOOL_NAMES]));
+        .toEqual(expect.arrayContaining([...CAPABILITY_MCP_TOOL_NAMES]));
+      await expect(client.callTool({ name: 'capability_list', arguments: {} })).resolves.toMatchObject({
+        isError: true,
+        structuredContent: { status: 'error', reason: CAPABILITY_ERROR.FORBIDDEN },
+      });
       identity = {
         ownerId: 'owner-1', providerId: 'codex-sdk', serverId: 'server-1',
         sessionId: 'deck_fallback_brain',

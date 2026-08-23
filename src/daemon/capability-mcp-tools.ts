@@ -153,7 +153,12 @@ export function registerCapabilityMcpTools(
   if (!canRegisterCapabilityMcpTools(caller, deps)) return undefined;
   const service = deps.capabilityService!;
   const registered: RegisteredTool[] = [];
-  let enabled = !deps.resolveCapabilityIdentity;
+  // Tool discovery must not depend on whether the authenticated ServerLink
+  // authority happened to arrive before the provider's first tools/list.
+  // Several provider clients cache that first list and ignore list_changed.
+  // Keep definitions visible for an exact daemon-minted runtime; every call
+  // still re-resolves and validates owner/session/provider/server authority.
+  let authorized = !deps.resolveCapabilityIdentity;
   let stopped = false;
   for (const name of CAPABILITY_MCP_TOOL_NAMES) {
     const contract = CAPABILITY_MCP_TOOL_CONTRACTS[name];
@@ -194,24 +199,18 @@ export function registerCapabilityMcpTools(
       }
     });
     registered.push(tool);
-    if (!enabled) tool.disable();
   }
   return {
     async refresh(): Promise<boolean> {
-      if (stopped || !deps.resolveCapabilityIdentity) return enabled;
+      if (stopped || !deps.resolveCapabilityIdentity) return authorized;
       const identity = await deps.resolveCapabilityIdentity(caller).catch(() => null);
       const next = exactRuntimeIdentity(caller, identity);
-      if (next === enabled) return enabled;
-      enabled = next;
-      for (const tool of registered) {
-        if (next) tool.enable();
-        else tool.disable();
-      }
-      return enabled;
+      authorized = next;
+      return authorized;
     },
     stop(): void {
       stopped = true;
-      enabled = false;
+      authorized = false;
       for (const tool of registered) tool.disable();
     },
   };
