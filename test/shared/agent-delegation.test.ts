@@ -143,6 +143,8 @@ describe('agent delegation shared contract', () => {
       'kimi-sdk',
       'deepseek-harness',
       'pi',
+      'codebuddy-cn',
+      'codebuddy-international',
     ]);
     expect(DELEGATION_REPLY_CAPABLE_PROCESS_AGENT_TYPES).toBe(DELEGATION_REPLY_CAPABLE_AGENT_TYPES);
     for (const agentType of DELEGATION_REPLY_CAPABLE_AGENT_TYPES) {

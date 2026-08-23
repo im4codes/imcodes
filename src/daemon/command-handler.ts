@@ -168,6 +168,13 @@ import { mergeCodexDisplayMetadata } from '../agent/codex-display.js';
 import { P2P_TERMINAL_RUN_STATUSES } from '../../shared/p2p-status.js';
 import { DAEMON_MSG } from '../../shared/daemon-events.js';
 import {
+  CODEBUDDY_CHINA_DEFAULT_MODEL,
+  CODEBUDDY_CHINA_MODEL_FALLBACK,
+  CODEBUDDY_INTERNATIONAL_MODEL_FALLBACK,
+  CODEBUDDY_PROVIDER_IDS,
+  isCodeBuddyProviderId,
+} from '../../shared/codebuddy.js';
+import {
   DAEMON_UPGRADE_BLOCK_REASON,
   DAEMON_UPGRADE_TARGET_LATEST,
   normalizeDaemonUpgradeTargetVersion,
@@ -933,7 +940,7 @@ function supportsEffort(agentType: string | undefined): agentType is 'claude-cod
     || agentType === 'qwen';
 }
 
-function supportsTransportClear(agentType: string | undefined): agentType is 'claude-code-sdk' | 'codex-sdk' | 'copilot-sdk' | 'cursor-headless' | 'opencode-sdk' | 'openclaw' | 'qwen' | 'kimi-sdk' | 'grok-sdk' | 'deepseek-harness' | 'pi' {
+function supportsTransportClear(agentType: string | undefined): boolean {
   return agentType === 'claude-code-sdk'
     || agentType === 'codex-sdk'
     || agentType === 'copilot-sdk'
@@ -944,7 +951,8 @@ function supportsTransportClear(agentType: string | undefined): agentType is 'cl
     || agentType === 'kimi-sdk'
     || agentType === 'grok-sdk'
     || agentType === 'deepseek-harness'
-    || agentType === 'pi';
+    || agentType === 'pi'
+    || isCodeBuddyProviderId(agentType);
 }
 
 // `/compact` is provider-dispatched, not daemon-synthesized. Provider adapters
@@ -964,7 +972,7 @@ async function relaunchFreshTransportConversation(record: SessionRecord): Promis
     name: record.name,
     projectName: record.projectName,
     role: record.role,
-    agentType: record.agentType as 'claude-code-sdk' | 'codex-sdk' | 'copilot-sdk' | 'cursor-headless' | 'opencode-sdk' | 'openclaw' | 'qwen' | 'kimi-sdk' | 'grok-sdk' | 'deepseek-harness' | 'pi',
+    agentType: record.agentType as AgentType,
     projectDir: record.projectDir,
     label: record.label,
     description: record.description,
@@ -2221,7 +2229,7 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
       brainType: agentType as ProjectConfig['brainType'],
       workerTypes: [],
       label,
-      fresh: agentType === 'claude-code-sdk' || agentType === 'codex-sdk' || agentType === 'opencode-sdk' || agentType === 'gemini-sdk' || agentType === 'kimi-sdk' || agentType === 'grok-sdk',
+      fresh: agentType === 'claude-code-sdk' || agentType === 'codex-sdk' || agentType === 'opencode-sdk' || agentType === 'gemini-sdk' || agentType === 'kimi-sdk' || agentType === 'grok-sdk' || isCodeBuddyProviderId(agentType),
       extraEnv,
       ccPreset: ccPresetName,
       effort,
@@ -2268,7 +2276,7 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
         label,
         effort,
       });
-    } else if (agentType === 'opencode-sdk' || agentType === 'gemini-sdk' || agentType === 'kimi-sdk' || agentType === 'grok-sdk' || agentType === 'deepseek-harness' || agentType === 'pi') {
+    } else if (agentType === 'opencode-sdk' || agentType === 'gemini-sdk' || agentType === 'kimi-sdk' || agentType === 'grok-sdk' || agentType === 'deepseek-harness' || agentType === 'pi' || isCodeBuddyProviderId(agentType)) {
       // Transport providers share the codex-sdk launch shape. DSH/Pi additionally
       // receive ccPreset so their adapters can bind the selected third-party
       // provider and model atomically before the first turn.
@@ -2277,7 +2285,7 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
         name: `deck_${project}_brain`,
         projectName: project,
         role: 'brain',
-        agentType: agentType as 'opencode-sdk' | 'gemini-sdk' | 'kimi-sdk' | 'grok-sdk' | 'deepseek-harness' | 'pi',
+        agentType: agentType as AgentType,
         projectDir: dir,
         fresh: true,
         ...((agentType === 'deepseek-harness' || agentType === 'pi') && ccPresetName ? { ccPreset: ccPresetName } : {}),
@@ -4379,7 +4387,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
           return;
         }
       }
-      if ((record?.agentType === 'copilot-sdk' || record?.agentType === 'cursor-headless' || record?.agentType === 'opencode-sdk' || record?.agentType === 'gemini-sdk' || record?.agentType === 'kimi-sdk' || record?.agentType === 'grok-sdk' || record?.agentType === 'deepseek-harness' || record?.agentType === 'pi') && modelMatch) {
+      if ((record?.agentType === 'copilot-sdk' || record?.agentType === 'cursor-headless' || record?.agentType === 'opencode-sdk' || record?.agentType === 'gemini-sdk' || record?.agentType === 'kimi-sdk' || record?.agentType === 'grok-sdk' || record?.agentType === 'deepseek-harness' || record?.agentType === 'pi' || isCodeBuddyProviderId(record?.agentType)) && modelMatch) {
         const nextModel = modelMatch[1];
         transportRuntime.setAgentId(nextModel);
         const nextRecord = {
@@ -6232,7 +6240,7 @@ async function handleSubSessionStart(cmd: Record<string, unknown>, serverLink: S
         bindExistingKey,
         ...(ccPreset ? { ccPreset } : {}),
         ...(type === 'claude-code-sdk' ? { ccSessionId: randomUUID(), fresh: true } : {}),
-        ...(type === 'codex-sdk' || type === 'opencode-sdk' || type === 'kimi-sdk' || type === 'grok-sdk' || type === 'deepseek-harness' || type === 'pi' ? { fresh: true } : {}),
+        ...(type === 'codex-sdk' || type === 'opencode-sdk' || type === 'kimi-sdk' || type === 'grok-sdk' || type === 'deepseek-harness' || type === 'pi' || isCodeBuddyProviderId(type) ? { fresh: true } : {}),
         ...(effort ? { effort } : {}),
         userCreated: true,
         parentSession: parentSession || undefined,
@@ -10756,7 +10764,7 @@ async function loadTransportListModels(agentType: string, force: boolean): Promi
   // caller explicitly forces a live probe.
   if (!provider && !force) return await loadPassiveTransportListModels(agentType);
 
-  if (!provider && force && (agentType === 'gemini-sdk' || agentType === 'kimi-sdk' || agentType === 'grok-sdk' || agentType === 'opencode-sdk' || agentType === 'claude-code-sdk' || agentType === 'codex-sdk' || agentType === 'copilot-sdk' || agentType === 'cursor-headless')) {
+  if (!provider && force && (agentType === 'gemini-sdk' || agentType === 'kimi-sdk' || agentType === 'grok-sdk' || agentType === 'opencode-sdk' || agentType === 'claude-code-sdk' || agentType === 'codex-sdk' || agentType === 'copilot-sdk' || agentType === 'cursor-headless' || isCodeBuddyProviderId(agentType))) {
     try {
       provider = await ensureProviderConnected(agentType, {});
     } catch (err) {
@@ -10807,6 +10815,18 @@ async function loadPassiveTransportListModels(agentType: string): Promise<Transp
     return {
       models: modelIdsToTransportModels(COPILOT_FALLBACK_MODEL_IDS),
       defaultModel: COPILOT_FALLBACK_MODEL_IDS[0],
+    };
+  }
+  if (agentType === CODEBUDDY_PROVIDER_IDS.CHINA) {
+    return {
+      models: modelIdsToTransportModels(CODEBUDDY_CHINA_MODEL_FALLBACK),
+      defaultModel: CODEBUDDY_CHINA_DEFAULT_MODEL,
+    };
+  }
+  if (agentType === CODEBUDDY_PROVIDER_IDS.INTERNATIONAL) {
+    return {
+      models: modelIdsToTransportModels(CODEBUDDY_INTERNATIONAL_MODEL_FALLBACK),
+      defaultModel: CODEBUDDY_INTERNATIONAL_MODEL_FALLBACK[0],
     };
   }
   if (agentType === 'cursor-headless' || agentType === 'kimi-sdk' || agentType === 'grok-sdk'

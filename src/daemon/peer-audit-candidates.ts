@@ -14,6 +14,7 @@ import { getSessionRuntimeType } from '../../shared/agent-types.js';
 import { readSupervisionSnapshotFromTransportConfig } from '../../shared/supervision-config.js';
 import { resolveExactDelegationTarget } from './session-dispatch.js';
 import type { SessionRecord } from '../store/session-store.js';
+import { CODEBUDDY_PROVIDER_IDS } from '../../shared/codebuddy.js';
 
 const UNKNOWN_DIMENSION = PEER_AUDIT_UNKNOWN_IDENTITY;
 
@@ -133,6 +134,9 @@ function peerAuditTypeLabel(agentType: string): string {
       return 'Ds';
     case 'pi':
       return 'Pi';
+    case CODEBUDDY_PROVIDER_IDS.CHINA:
+    case CODEBUDDY_PROVIDER_IDS.INTERNATIONAL:
+      return 'CB';
     default:
       return 'AI';
   }

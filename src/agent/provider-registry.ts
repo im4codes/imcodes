@@ -4,6 +4,7 @@
 import type { TransportProvider, ProviderConfig } from './transport-provider.js';
 import { wireProviderToRelay, broadcastProviderStatus } from '../daemon/transport-relay.js';
 import logger from '../util/logger.js';
+import { CODEBUDDY_PROVIDER_IDS } from '../../shared/codebuddy.js';
 
 const providers = new Map<string, TransportProvider>();
 
@@ -131,6 +132,14 @@ async function createProvider(id: string): Promise<TransportProvider> {
     case 'pi': {
       const { PiProvider } = await import('./providers/pi.js');
       return new PiProvider();
+    }
+    case CODEBUDDY_PROVIDER_IDS.CHINA: {
+      const { CodeBuddyChinaProvider } = await import('./providers/codebuddy.js');
+      return new CodeBuddyChinaProvider();
+    }
+    case CODEBUDDY_PROVIDER_IDS.INTERNATIONAL: {
+      const { CodeBuddyInternationalProvider } = await import('./providers/codebuddy.js');
+      return new CodeBuddyInternationalProvider();
     }
     default:
       throw new Error(`Unknown provider: ${id}`);

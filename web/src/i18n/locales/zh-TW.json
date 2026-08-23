@@ -664,6 +664,8 @@
       "gemini_sdk": "Gemini SDK",
       "grok_sdk": "Grok Build",
       "kimi_sdk": "Kimi Code",
+      "codebuddy_china": "CodeBuddy 中國版",
+      "codebuddy_international": "CodeBuddy 國際版",
       "deepseek_harness": "DeepSeek Harness",
       "pi": "Pi"
     },

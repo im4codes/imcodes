@@ -116,6 +116,12 @@ import { resizeHandleHoverEvents } from './window-resize.js';
 import type { SharedActorEnvelope } from '@shared/tab-sharing.js';
 import { EXECUTION_CLONE_KIND } from '@shared/execution-clone.js';
 import {
+  CODEBUDDY_CHINA_MODEL_FALLBACK,
+  CODEBUDDY_INTERNATIONAL_MODEL_FALLBACK,
+  CODEBUDDY_PROVIDER_IDS,
+  isCodeBuddyProviderId,
+} from '@shared/codebuddy.js';
+import {
   buildAgentDelegationOrchestrationPrompt,
   isDelegationUnsupportedControlText,
 } from '@shared/agent-delegation.js';
@@ -1771,7 +1777,8 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const isGrokSdk = activeSession?.agentType === 'grok-sdk';
   const isKimiSdk = activeSession?.agentType === 'kimi-sdk';
   const isOpenCodeSdk = activeSession?.agentType === 'opencode-sdk';
-  const supportsGenericTransportModelSelect = isCopilot || isCursorHeadless || isDeepseekHarness || isPi || isGeminiSdk || isGrokSdk || isKimiSdk || isOpenCodeSdk;
+  const isCodeBuddy = isCodeBuddyProviderId(activeSession?.agentType);
+  const supportsGenericTransportModelSelect = isCopilot || isCursorHeadless || isDeepseekHarness || isPi || isGeminiSdk || isGrokSdk || isKimiSdk || isOpenCodeSdk || isCodeBuddy;
   // Source-of-truth priority for the model picker:
   //   1. `useTransportModels` — live daemon probe via `transport.list_models`
   //      WS round-trip. Works uniformly for main sessions AND sub-sessions
@@ -1818,6 +1825,12 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     if (isGrokSdk) {
       return dynamicTransportModels.models.map((m) => m.id);
     }
+    if (activeSession?.agentType === CODEBUDDY_PROVIDER_IDS.CHINA) {
+      return CODEBUDDY_CHINA_MODEL_FALLBACK;
+    }
+    if (activeSession?.agentType === CODEBUDDY_PROVIDER_IDS.INTERNATIONAL) {
+      return CODEBUDDY_INTERNATIONAL_MODEL_FALLBACK;
+    }
     return [];
   }, [
     dynamicTransportModels.models,
@@ -1827,6 +1840,8 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     isGrokSdk,
     isKimiSdk,
     isOpenCodeSdk,
+    isCodeBuddy,
+    activeSession?.agentType,
     activeSession?.copilotAvailableModels,
     activeSession?.cursorAvailableModels,
   ]);

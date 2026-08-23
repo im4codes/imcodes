@@ -2,6 +2,7 @@ import { formatLabel } from './format-label.js';
 import { getApiKey } from './api.js';
 import { pushDurableEventToWatch, syncSnapshotToWatch } from './watch-bridge.js';
 import type { TimelineEvent } from '../../src/shared/timeline/types.js';
+import { CODEBUDDY_PROVIDER_IDS } from '@shared/codebuddy.js';
 import { isRunningTimelineEvent, isSdkSubagentTimelineEvent } from './timeline-running.js';
 import {
   createTransportQueueReducerState,
@@ -175,6 +176,8 @@ const BADGE_MAP: Record<string, string> = {
   'kimi-sdk': 'km',
   'deepseek-harness': 'ds',
   pi: 'pi',
+  [CODEBUDDY_PROVIDER_IDS.CHINA]: 'cb',
+  [CODEBUDDY_PROVIDER_IDS.INTERNATIONAL]: 'cb',
   'shell': 'sh',
   'script': 'sc',
 };

@@ -80,6 +80,7 @@ import type {
   ToolCallEvent,
   ApprovalRequest,
   ProviderCompactCapability,
+  ProviderDelegationNotification,
   RemoteSessionInfo,
   RemoteSessionListOptions,
 } from '../transport-provider.js';
@@ -90,6 +91,10 @@ import {
   SESSION_OWNERSHIP,
   PROVIDER_ERROR_CODES,
 } from '../transport-provider.js';
+import {
+  AGENT_DELEGATION_NOTIFICATION_RESULTS,
+  type AgentDelegationNotificationResult,
+} from '../../../shared/agent-delegation.js';
 import type { AgentMessage, MessageDelta } from '../../../shared/agent-message.js';
 import type { ProviderContextPayload } from '../../../shared/context-types.js';
 import type { TransportAttachment } from '../../../shared/transport-attachments.js';
@@ -577,6 +582,40 @@ export class KimiSdkProvider implements TransportProvider {
     await this.connection.cancel({ sessionId: state.acpSessionId }).catch((err: unknown) => {
       logger.debug({ provider: this.id, sessionId, err }, 'ACP cancel notification failed (non-fatal)');
     });
+  }
+
+  /**
+   * Queue text through an ACP agent that explicitly supports receiving another
+   * `session/prompt` while its current run is active. CodeBuddy routes that
+   * request through its busy-session message queue (`dispatchQueuedPrompt`),
+   * so this is a non-preemptive next-boundary admission: it never calls
+   * `session/cancel` and never starts a competing IM.codes runtime turn.
+   *
+   * Keep this protected and opt-in. Plain Kimi ACP has not advertised the same
+   * contract, so only a provider with verified busy-prompt semantics may expose
+   * it as `activeDelegationNotification: native`.
+   */
+  protected async queueActiveAcpPrompt(
+    sessionId: string,
+    notification: ProviderDelegationNotification,
+  ): Promise<AgentDelegationNotificationResult> {
+    const state = this.sessions.get(sessionId);
+    if (!state?.promptInFlight || state.cancelled || !state.loaded || !state.acpSessionId || !this.connection) {
+      return AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE;
+    }
+
+    try {
+      const result = await this.connection.prompt({
+        sessionId: state.acpSessionId,
+        prompt: [{ type: 'text', text: notification.text }],
+      });
+      return result.stopReason === 'cancelled'
+        ? AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE
+        : AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED;
+    } catch (error) {
+      logger.debug({ provider: this.id, sessionId, error }, 'ACP active-turn prompt admission failed');
+      return AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE;
+    }
   }
 
   // ── ACP client-side glue ────────────────────────────────────────────────

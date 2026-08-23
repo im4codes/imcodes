@@ -15,6 +15,7 @@ import { randomUUID } from 'node:crypto';
 import { resolveStructuredSessionBootstrap } from '../agent/structured-session-bootstrap.js';
 import type { TransportEffortLevel } from '../../shared/effort-levels.js';
 import { usesProviderResumeId } from '../agent/transport-resume-opts.js';
+import { isCodeBuddyProviderId } from '../../shared/codebuddy.js';
 
 import logger from '../util/logger.js';
 import { getAgentVersion } from '../agent/agent-version.js';
@@ -167,7 +168,7 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
       ...(sub.providerSessionId ? { ccSessionId: sub.ccSessionId ?? undefined, codexSessionId: sub.codexSessionId ?? undefined, fresh: sub.fresh } : {}),
       ...(!sub.providerSessionId && agentType === 'claude-code-sdk' ? { ccSessionId: randomUUID(), fresh: true } : {}),
       ...((agentType === 'codex-sdk' && !sub.providerSessionId)
-        || ((agentType === 'kimi-sdk' || agentType === 'grok-sdk' || agentType === 'deepseek-harness' || agentType === 'pi') && !providerResumeId)
+        || ((agentType === 'kimi-sdk' || agentType === 'grok-sdk' || agentType === 'deepseek-harness' || agentType === 'pi' || isCodeBuddyProviderId(agentType)) && !providerResumeId)
         ? { fresh: true }
         : {}),
       ...(sub.effort ? { effort: sub.effort } : {}),

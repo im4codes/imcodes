@@ -14,6 +14,8 @@ describe('agent display helpers', () => {
     expect(formatLabel('opencode-sdk5')).toBe('OC5');
     expect(formatLabel('deepseek-harness6')).toBe('Ds6');
     expect(formatLabel('pi7')).toBe('Pi7');
+    expect(formatLabel('codebuddy-cn8')).toBe('CB8');
+    expect(formatLabel('codebuddy-international9')).toBe('CB9');
   });
 
   it('uses short auto label prefixes for sdk session creation', () => {
@@ -25,5 +27,7 @@ describe('agent display helpers', () => {
     expect(getAutoSessionLabelPrefix('opencode-sdk')).toBe('OC');
     expect(getAutoSessionLabelPrefix('deepseek-harness')).toBe('Ds');
     expect(getAutoSessionLabelPrefix('pi')).toBe('Pi');
+    expect(getAutoSessionLabelPrefix('codebuddy-cn')).toBe('CB');
+    expect(getAutoSessionLabelPrefix('codebuddy-international')).toBe('CB');
   });
 });

@@ -116,7 +116,7 @@ describe('NewSessionDialog', () => {
     const groups = Array.from(document.querySelectorAll('.session-agent-group'));
     expect(groups.map((group) => group.querySelector('.session-agent-group-title')?.textContent)).toEqual(['SDK', 'CLI']);
     const options = groups.flatMap((group) => Array.from(group.querySelectorAll<HTMLButtonElement>('[data-agent-type]')).map((button) => button.dataset.agentType));
-    expect(options.slice(0, 13)).toEqual([
+    expect(options.slice(0, 15)).toEqual([
       'claude-code-sdk',
       'codex-sdk',
       'qoder-sdk',
@@ -128,10 +128,12 @@ describe('NewSessionDialog', () => {
       'kimi-sdk',
       'deepseek-harness',
       'pi',
+      'codebuddy-cn',
+      'codebuddy-international',
       'qwen',
       'openclaw',
     ]);
-    expect(options.slice(13)).toEqual([
+    expect(options.slice(15)).toEqual([
       'claude-code',
       'codex',
       'opencode',
@@ -883,6 +885,42 @@ describe('NewSessionDialog', () => {
       agentType: 'kimi-sdk',
       requestedModel: 'moonshot-v1-auto,thinking',
     }));
+  });
+
+  it('starts the China CodeBuddy provider with its Hy3 model independently from International', async () => {
+    const ws = makeWs();
+    render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
+
+    fireEvent.input(screen.getByPlaceholderText('my-project'), { target: { value: 'my-app' } });
+    fireEvent.input(screen.getByPlaceholderText('~/projects/my-project'), { target: { value: '~/projects/my-app' } });
+    selectAgent('codebuddy-cn');
+
+    await waitFor(() => {
+      expect(ws.send.mock.calls.some((call) => (
+        call[0]?.type === 'transport.list_models' && call[0]?.agentType === 'codebuddy-cn'
+      ))).toBe(true);
+    });
+    const request = ws.send.mock.calls.find((call) => (
+      call[0]?.type === 'transport.list_models' && call[0]?.agentType === 'codebuddy-cn'
+    ))?.[0];
+    act(() => ws.emit({
+      type: 'transport.models_response',
+      agentType: 'codebuddy-cn',
+      requestId: request?.requestId,
+      models: [{ id: 'hy3', name: 'Hy3' }],
+      defaultModel: 'hy3',
+    }));
+
+    await waitFor(() => expect(screen.getByRole('option', { name: 'hy3' })).toBeDefined());
+    const selects = screen.getAllByRole('combobox') as HTMLSelectElement[];
+    fireEvent.input(selects[0], { target: { value: 'hy3' } });
+    fireEvent.click(screen.getByRole('button', { name: /start/i }));
+
+    expect(ws.sendSessionCommand).toHaveBeenCalledWith('start', expect.objectContaining({
+      agentType: 'codebuddy-cn',
+      requestedModel: 'hy3',
+    }));
+    expect(getAgentButton('codebuddy-international')).toBeDefined();
   });
 
   it('offers a free-text model input for deepseek-harness and starts with the typed model', async () => {

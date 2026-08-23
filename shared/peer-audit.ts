@@ -1,4 +1,5 @@
 import { redactSensitiveText } from './redact-secrets.js';
+import { CODEBUDDY_PROVIDER_IDS } from './codebuddy.js';
 
 // Single shared source of truth for the lightweight peer-supervision-audit
 // contract (design "One shared peer-audit contract"). Owns contract/reply
@@ -303,6 +304,8 @@ const PEER_AUDIT_PROVIDER_FAMILY_BY_ID: Readonly<Record<string, string>> = {
   deepseek: 'deepseek',
   'deepseek-harness': 'deepseek',
   pi: 'pi',
+  [CODEBUDDY_PROVIDER_IDS.CHINA]: 'codebuddy',
+  [CODEBUDDY_PROVIDER_IDS.INTERNATIONAL]: 'codebuddy',
 };
 
 /** Provider family is independent of model normalization. Authoritative

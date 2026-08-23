@@ -154,6 +154,8 @@ describe('exact model and provider-family normalization', () => {
   it('resolves provider independently using explicit authoritative/fallback maps', () => {
     expect(resolvePeerAuditProviderFamily({ providerId: 'codex-sdk', agentType: 'claude-code-sdk' })).toBe('openai');
     expect(resolvePeerAuditProviderFamily({ agentType: 'claude-code-sdk' })).toBe('anthropic');
+    expect(resolvePeerAuditProviderFamily({ providerId: 'codebuddy-cn' })).toBe('codebuddy');
+    expect(resolvePeerAuditProviderFamily({ agentType: 'codebuddy-international' })).toBe('codebuddy');
     expect(resolvePeerAuditProviderFamily({ providerId: 'codex-ish' })).toBe('unknown');
     expect(resolvePeerAuditProviderFamily({})).toBe('unknown');
   });

@@ -1,4 +1,5 @@
 import type { SessionAgentType } from '@shared/agent-types.js';
+import { CODEBUDDY_PROVIDER_IDS } from '@shared/codebuddy.js';
 
 export type SessionAgentGroupId = 'transport' | 'process';
 export type SessionAgentSurface = 'new-session' | 'sub-session';
@@ -103,6 +104,22 @@ const SESSION_AGENT_CHOICES: SessionAgentChoice[] = [
     icon: 'π',
     fallbackLabel: 'Pi',
     labelKey: 'session.agentType.pi',
+    group: 'transport',
+    surfaces: ['new-session', 'sub-session'],
+  },
+  {
+    id: CODEBUDDY_PROVIDER_IDS.CHINA,
+    icon: '云',
+    fallbackLabel: 'CodeBuddy 中国版',
+    labelKey: 'session.agentType.codebuddy_china',
+    group: 'transport',
+    surfaces: ['new-session', 'sub-session'],
+  },
+  {
+    id: CODEBUDDY_PROVIDER_IDS.INTERNATIONAL,
+    icon: 'CB',
+    fallbackLabel: 'CodeBuddy International',
+    labelKey: 'session.agentType.codebuddy_international',
     group: 'transport',
     surfaces: ['new-session', 'sub-session'],
   },

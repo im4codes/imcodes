@@ -45,6 +45,14 @@ import {
 import { CODEX_MODEL_IDS, GEMINI_MODEL_IDS, mergeModelSuggestions } from "../../../src/shared/models/options.js";
 import { loadCodexModelPreference } from "../codex-model-preference.js";
 import { GIT_REMOTE_CLONE_CAPABILITY_V1 } from "@shared/git-remote-url.js";
+import type { SessionAgentType } from "@shared/agent-types.js";
+import {
+  CODEBUDDY_CHINA_DEFAULT_MODEL,
+  CODEBUDDY_CHINA_MODEL_FALLBACK,
+  CODEBUDDY_INTERNATIONAL_MODEL_FALLBACK,
+  CODEBUDDY_PROVIDER_IDS,
+  isCodeBuddyProviderId,
+} from "@shared/codebuddy.js";
 
 // Fallback suggestions used only when the daemon probe returns an empty list
 // (offline/unauthenticated). The live list comes from the dynamic models hook.
@@ -73,24 +81,7 @@ interface Props {
   onToast?: (message: string) => void;
 }
 
-type AgentType =
-  | "claude-code"
-  | "claude-code-sdk"
-  | "codex"
-  | "codex-sdk"
-  | "qoder-sdk"
-  | "copilot-sdk"
-  | "cursor-headless"
-  | "opencode-sdk"
-  | "opencode"
-  | "gemini"
-  | "gemini-sdk"
-  | "grok-sdk"
-  | "kimi-sdk"
-  | "deepseek-harness"
-  | "pi"
-  | "openclaw"
-  | "qwen";
+type AgentType = SessionAgentType;
 
 type OpenClawMode = "new" | "bind";
 
@@ -486,6 +477,7 @@ export function NewSessionDialog({
           || agentType === "kimi-sdk"
           || agentType === "deepseek-harness"
           || agentType === "pi"
+          || isCodeBuddyProviderId(agentType)
           || agentType === "qwen") &&
         requestedModel.trim()
       ) {
@@ -511,7 +503,7 @@ export function NewSessionDialog({
   const agentFlavor =
     agentType === "claude-code" || agentType === "codex"
       ? "cli"
-      : agentType === "claude-code-sdk" || agentType === "codex-sdk" || agentType === "qoder-sdk" || agentType === "opencode-sdk" || agentType === "grok-sdk" || agentType === "kimi-sdk" || agentType === "deepseek-harness" || agentType === "pi"
+      : agentType === "claude-code-sdk" || agentType === "codex-sdk" || agentType === "qoder-sdk" || agentType === "opencode-sdk" || agentType === "grok-sdk" || agentType === "kimi-sdk" || agentType === "deepseek-harness" || agentType === "pi" || isCodeBuddyProviderId(agentType)
         ? "sdk"
         : null;
   const qwenCompatibleApiPresetSelected = agentType === "qwen" && !!selectedCcPreset;
@@ -551,6 +543,7 @@ export function NewSessionDialog({
     || agentType === "kimi-sdk"
     || agentType === "deepseek-harness"
     || agentType === "pi"
+    || isCodeBuddyProviderId(agentType)
     || (agentType === "qwen" && !!selectedCcPreset);
   const dynamicModelsAgentType = supportsDynamicTransportModels(agentType)
     ? agentType
@@ -571,6 +564,8 @@ export function NewSessionDialog({
       const dynamicModelIds = transportModels.models.map((m) => m.id);
       if (agentType === "gemini-sdk") return mergeModelSuggestions(GEMINI_SDK_MODEL_FALLBACK, dynamicModelIds);
       if (agentType === "codex-sdk") return mergeModelSuggestions(CODEX_SDK_MODEL_FALLBACK, dynamicModelIds);
+      if (agentType === CODEBUDDY_PROVIDER_IDS.CHINA) return mergeModelSuggestions(CODEBUDDY_CHINA_MODEL_FALLBACK, dynamicModelIds);
+      if (agentType === CODEBUDDY_PROVIDER_IDS.INTERNATIONAL) return mergeModelSuggestions(CODEBUDDY_INTERNATIONAL_MODEL_FALLBACK, dynamicModelIds);
       return dynamicModelIds;
     }
     if (agentType === "qwen") return selectedPresetModels;
@@ -578,6 +573,8 @@ export function NewSessionDialog({
     if (agentType === "codex-sdk") return [...CODEX_SDK_MODEL_FALLBACK];
     if (agentType === "cursor-headless") return [...CURSOR_HEADLESS_MODEL_FALLBACK];
     if (agentType === "gemini-sdk") return [...GEMINI_SDK_MODEL_FALLBACK];
+    if (agentType === CODEBUDDY_PROVIDER_IDS.CHINA) return [...CODEBUDDY_CHINA_MODEL_FALLBACK];
+    if (agentType === CODEBUDDY_PROVIDER_IDS.INTERNATIONAL) return [...CODEBUDDY_INTERNATIONAL_MODEL_FALLBACK];
     return [] as string[];
   }, [transportModels.models, agentType, selectedPresetModels, selectedCcPreset]);
 
@@ -601,6 +598,19 @@ export function NewSessionDialog({
         return transportModels.defaultModel;
       }
       return modelSuggestions[0] ?? fallback;
+    });
+  }, [agentType, modelSuggestions, transportModels.defaultModel]);
+
+  useEffect(() => {
+    if (!isCodeBuddyProviderId(agentType)) return;
+    setRequestedModel((current) => {
+      const preferred = agentType === CODEBUDDY_PROVIDER_IDS.CHINA
+        ? CODEBUDDY_CHINA_DEFAULT_MODEL
+        : transportModels.defaultModel ?? CODEBUDDY_INTERNATIONAL_MODEL_FALLBACK[0];
+      const trimmed = current.trim();
+      if (trimmed && modelSuggestions.includes(trimmed)) return trimmed;
+      if (modelSuggestions.includes(preferred)) return preferred;
+      return modelSuggestions[0] ?? preferred;
     });
   }, [agentType, modelSuggestions, transportModels.defaultModel]);
 

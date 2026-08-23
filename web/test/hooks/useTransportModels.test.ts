@@ -3,6 +3,7 @@
  */
 import { describe, it, expect } from 'vitest';
 import { supportsDynamicTransportModels } from '../../src/hooks/useTransportModels.js';
+import { CODEBUDDY_PROVIDER_IDS } from '@shared/codebuddy.js';
 
 /**
  * `supportsDynamicTransportModels` is the root model-selection registry for the
@@ -23,6 +24,8 @@ describe('supportsDynamicTransportModels', () => {
       'kimi-sdk',
       'deepseek-harness',
       'pi',
+      CODEBUDDY_PROVIDER_IDS.CHINA,
+      CODEBUDDY_PROVIDER_IDS.INTERNATIONAL,
     ];
     for (const agentType of supported) {
       expect(supportsDynamicTransportModels(agentType), agentType).toBe(true);

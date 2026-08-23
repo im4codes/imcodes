@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback, useRef } from 'preact/hooks';
 import { DAEMON_MSG } from '@shared/daemon-events.js';
 import { TRANSPORT_MSG } from '@shared/transport-events.js';
 import type { WsClient } from '../ws-client.js';
+import { CODEBUDDY_PROVIDER_IDS, isCodeBuddyProviderId } from '@shared/codebuddy.js';
 
 export interface TransportModelInfo {
   id: string;
@@ -18,12 +19,12 @@ export interface TransportModelState {
 }
 
 /** Agent types that support dynamic model discovery via `transport.list_models`. */
-export type TransportAgentTypeWithModels = 'claude-code-sdk' | 'copilot-sdk' | 'cursor-headless' | 'codex-sdk' | 'opencode-sdk' | 'gemini-sdk' | 'grok-sdk' | 'kimi-sdk' | 'deepseek-harness' | 'pi';
+export type TransportAgentTypeWithModels = 'claude-code-sdk' | 'copilot-sdk' | 'cursor-headless' | 'codex-sdk' | 'opencode-sdk' | 'gemini-sdk' | 'grok-sdk' | 'kimi-sdk' | 'deepseek-harness' | 'pi' | typeof CODEBUDDY_PROVIDER_IDS.CHINA | typeof CODEBUDDY_PROVIDER_IDS.INTERNATIONAL;
 
 export function supportsDynamicTransportModels(
   agentType: string | undefined | null,
 ): agentType is TransportAgentTypeWithModels {
-  return agentType === 'claude-code-sdk' || agentType === 'copilot-sdk' || agentType === 'cursor-headless' || agentType === 'codex-sdk' || agentType === 'opencode-sdk' || agentType === 'gemini-sdk' || agentType === 'grok-sdk' || agentType === 'kimi-sdk' || agentType === 'deepseek-harness' || agentType === 'pi';
+  return agentType === 'claude-code-sdk' || agentType === 'copilot-sdk' || agentType === 'cursor-headless' || agentType === 'codex-sdk' || agentType === 'opencode-sdk' || agentType === 'gemini-sdk' || agentType === 'grok-sdk' || agentType === 'kimi-sdk' || agentType === 'deepseek-harness' || agentType === 'pi' || isCodeBuddyProviderId(agentType ?? undefined);
 }
 
 /** Fetch and cache the list of available models for a transport agent type.

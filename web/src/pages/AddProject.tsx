@@ -1,4 +1,5 @@
 import { useState } from 'preact/hooks';
+import { CODEBUDDY_PROVIDER_IDS } from '@shared/codebuddy.js';
 
 interface AddProjectProps {
   apiKey: string;
@@ -25,7 +26,7 @@ export function AddProject({ apiKey, serverId, onAdded, onCancel }: AddProjectPr
   const [validationError, setValidationError] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  const agentTypes = ['claude-code', 'claude-code-sdk', 'codex', 'codex-sdk', 'qoder-sdk', 'copilot-sdk', 'cursor-headless', 'opencode-sdk', 'opencode', 'gemini', 'gemini-sdk', 'grok-sdk', 'kimi-sdk', 'deepseek-harness', 'pi', 'qwen'];
+  const agentTypes = ['claude-code', 'claude-code-sdk', 'codex', 'codex-sdk', 'qoder-sdk', 'copilot-sdk', 'cursor-headless', 'opencode-sdk', 'opencode', 'gemini', 'gemini-sdk', 'grok-sdk', 'kimi-sdk', 'deepseek-harness', 'pi', CODEBUDDY_PROVIDER_IDS.CHINA, CODEBUDDY_PROVIDER_IDS.INTERNATIONAL, 'qwen'];
 
   async function validateTracker() {
     if (trackerType === 'none') return true;

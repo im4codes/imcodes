@@ -1,3 +1,5 @@
+import { CODEBUDDY_PROVIDER_IDS } from './codebuddy.js';
+
 export const SESSION_AGENT_TYPES = [
   'claude-code-sdk',
   'claude-code',
@@ -16,6 +18,8 @@ export const SESSION_AGENT_TYPES = [
   'kimi-sdk',
   'deepseek-harness',
   'pi',
+  CODEBUDDY_PROVIDER_IDS.CHINA,
+  CODEBUDDY_PROVIDER_IDS.INTERNATIONAL,
   'shell',
   'script',
 ] as const;
@@ -36,6 +40,8 @@ export const TRANSPORT_SESSION_AGENT_TYPES = [
   'kimi-sdk',
   'deepseek-harness',
   'pi',
+  CODEBUDDY_PROVIDER_IDS.CHINA,
+  CODEBUDDY_PROVIDER_IDS.INTERNATIONAL,
   'qwen',
   'openclaw',
 ] as const;

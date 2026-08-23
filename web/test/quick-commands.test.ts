@@ -31,6 +31,17 @@ describe('slash command suggestions', () => {
       '/fast status',
     ]));
   });
+
+  it('offers CodeBuddy model, compact, and fresh-conversation controls', () => {
+    for (const agentType of ['codebuddy-cn', 'codebuddy-international']) {
+      expect(getDefaultQuickCommands(agentType)).toEqual(expect.arrayContaining([
+        '/stop',
+        '/compact',
+        '/clear',
+        '/model',
+      ]));
+    }
+  });
 });
 
 describe('quick phrase suggestions', () => {

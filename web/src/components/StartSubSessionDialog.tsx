@@ -30,6 +30,13 @@ import {
 } from '@shared/cc-presets.js';
 import { CODEX_MODEL_IDS, GEMINI_MODEL_IDS, mergeModelSuggestions } from '../../../src/shared/models/options.js';
 import { loadCodexModelPreference } from '../codex-model-preference.js';
+import {
+  CODEBUDDY_CHINA_DEFAULT_MODEL,
+  CODEBUDDY_CHINA_MODEL_FALLBACK,
+  CODEBUDDY_INTERNATIONAL_MODEL_FALLBACK,
+  CODEBUDDY_PROVIDER_IDS,
+  isCodeBuddyProviderId,
+} from '@shared/codebuddy.js';
 
 const CURSOR_HEADLESS_MODEL_SUGGESTIONS = ['gpt-5.2'] as const;
 const COPILOT_SDK_MODEL_SUGGESTIONS = ['gpt-5.4', 'gpt-5.4-mini'] as const;
@@ -279,7 +286,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
     if (desc) extra.description = desc;
     if (ccPreset && (type === 'claude-code' || CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(type))) extra.ccPreset = ccPreset;
     if (ccInitPrompt.trim() && type === 'claude-code') extra.ccInitPrompt = ccInitPrompt.trim();
-    if ((type === 'claude-code-sdk' || type === 'codex-sdk' || type === 'copilot-sdk' || type === 'cursor-headless' || type === 'opencode-sdk' || type === 'gemini-sdk' || type === 'grok-sdk' || type === 'kimi-sdk' || type === 'deepseek-harness' || type === 'pi' || type === 'qwen') && requestedModel.trim()) extra.requestedModel = requestedModel.trim();
+    if ((type === 'claude-code-sdk' || type === 'codex-sdk' || type === 'copilot-sdk' || type === 'cursor-headless' || type === 'opencode-sdk' || type === 'gemini-sdk' || type === 'grok-sdk' || type === 'kimi-sdk' || type === 'deepseek-harness' || type === 'pi' || isCodeBuddyProviderId(type) || type === 'qwen') && requestedModel.trim()) extra.requestedModel = requestedModel.trim();
     if (type === 'claude-code-sdk' || type === 'codex-sdk' || type === 'copilot-sdk' || type === 'pi' || type === 'qwen') extra.thinking = thinking;
     onStart(type, selectedShell, cwd || undefined, label || undefined, Object.keys(extra).length > 0 ? extra : undefined);
   };
@@ -310,7 +317,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
     dynamicModelsAgentType,
     CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(type) ? ccPreset : undefined,
   );
-  const supportsModelSelection = type === 'claude-code-sdk' || type === 'codex-sdk' || type === 'copilot-sdk' || type === 'cursor-headless' || type === 'opencode-sdk' || type === 'gemini-sdk' || type === 'grok-sdk' || type === 'kimi-sdk' || type === 'deepseek-harness' || type === 'pi' || (type === 'qwen' && !!selectedCcPreset);
+  const supportsModelSelection = type === 'claude-code-sdk' || type === 'codex-sdk' || type === 'copilot-sdk' || type === 'cursor-headless' || type === 'opencode-sdk' || type === 'gemini-sdk' || type === 'grok-sdk' || type === 'kimi-sdk' || type === 'deepseek-harness' || type === 'pi' || isCodeBuddyProviderId(type) || (type === 'qwen' && !!selectedCcPreset);
   const modelSuggestions = useMemo(() => (
     CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(type) && selectedCcPreset
       ? mergeModelSuggestions(
@@ -322,6 +329,10 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
         ? mergeModelSuggestions(GEMINI_SDK_MODEL_SUGGESTIONS, transportModels.models.map((model) => model.id))
         : type === 'codex-sdk'
           ? mergeModelSuggestions(CODEX_SDK_MODEL_SUGGESTIONS, transportModels.models.map((model) => model.id))
+        : type === CODEBUDDY_PROVIDER_IDS.CHINA
+          ? mergeModelSuggestions(CODEBUDDY_CHINA_MODEL_FALLBACK, transportModels.models.map((model) => model.id))
+        : type === CODEBUDDY_PROVIDER_IDS.INTERNATIONAL
+          ? mergeModelSuggestions(CODEBUDDY_INTERNATIONAL_MODEL_FALLBACK, transportModels.models.map((model) => model.id))
         : transportModels.models.map((model) => model.id))
       : type === 'codex-sdk'
         ? [...CODEX_SDK_MODEL_SUGGESTIONS]
@@ -333,6 +344,10 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
             ? selectedPresetModels
             : type === 'gemini-sdk'
               ? [...GEMINI_SDK_MODEL_SUGGESTIONS]
+              : type === CODEBUDDY_PROVIDER_IDS.CHINA
+                ? [...CODEBUDDY_CHINA_MODEL_FALLBACK]
+                : type === CODEBUDDY_PROVIDER_IDS.INTERNATIONAL
+                  ? [...CODEBUDDY_INTERNATIONAL_MODEL_FALLBACK]
               : []
   ), [transportModels.models, type, selectedPresetModels, selectedCcPreset]);
 
@@ -356,6 +371,19 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
         return transportModels.defaultModel;
       }
       return modelSuggestions[0] ?? fallback;
+    });
+  }, [type, modelSuggestions, transportModels.defaultModel]);
+
+  useEffect(() => {
+    if (!isCodeBuddyProviderId(type)) return;
+    setRequestedModel((current) => {
+      const preferred = type === CODEBUDDY_PROVIDER_IDS.CHINA
+        ? CODEBUDDY_CHINA_DEFAULT_MODEL
+        : transportModels.defaultModel ?? CODEBUDDY_INTERNATIONAL_MODEL_FALLBACK[0];
+      const trimmed = current.trim();
+      if (trimmed && modelSuggestions.includes(trimmed)) return trimmed;
+      if (modelSuggestions.includes(preferred)) return preferred;
+      return modelSuggestions[0] ?? preferred;
     });
   }, [type, modelSuggestions, transportModels.defaultModel]);
 

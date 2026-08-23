@@ -35,6 +35,7 @@ import { buildAliasSendExtra } from '../util/alias-send.js';
 import { parseAliasMarkers } from '@shared/alias-types.js';
 import { useMachines } from '../hooks/useMachines.js';
 import { buildMachineSendExtra } from '../util/machine-send.js';
+import { CODEBUDDY_PROVIDER_IDS } from '@shared/codebuddy.js';
 
 const TYPE_ICON: Record<string, string> = {
   'claude-code': '⚡',
@@ -53,6 +54,8 @@ const TYPE_ICON: Record<string, string> = {
   'kimi-sdk': '月',
   'deepseek-harness': '🐳',
   pi: 'π',
+  [CODEBUDDY_PROVIDER_IDS.CHINA]: '云',
+  [CODEBUDDY_PROVIDER_IDS.INTERNATIONAL]: 'CB',
   'shell': '🐚',
   'script': '🔄',
 };

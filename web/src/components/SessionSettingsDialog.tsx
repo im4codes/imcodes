@@ -8,6 +8,7 @@ import { patchSession, patchSubSession } from '../api.js';
 import { useSupervisorDefaults } from '../hooks/useSupervisorDefaults.js';
 import type { WsClient } from '../ws-client.js';
 import { SESSION_AGENT_TYPES, TRANSPORT_SESSION_AGENT_TYPES, getSessionRuntimeType, type SessionAgentType } from '@shared/agent-types.js';
+import { CODEBUDDY_PROVIDER_IDS } from '@shared/codebuddy.js';
 import { isDelegationReplyCapableAgentType } from '@shared/agent-delegation.js';
 import type { SharedContextRuntimeBackend } from '@shared/context-types.js';
 import { doesSharedContextBackendSupportPresets, isKnownSharedContextModelForBackend } from '@shared/shared-context-runtime-config.js';
@@ -957,6 +958,8 @@ export function SessionSettingsDialog({
       case 'kimi-sdk': return t('session.agentType.kimi_sdk');
       case 'deepseek-harness': return t('session.agentType.deepseek_harness');
       case 'pi': return t('session.agentType.pi');
+      case CODEBUDDY_PROVIDER_IDS.CHINA: return t('session.agentType.codebuddy_china');
+      case CODEBUDDY_PROVIDER_IDS.INTERNATIONAL: return t('session.agentType.codebuddy_international');
       default: return value;
     }
   };

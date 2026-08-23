@@ -9,6 +9,7 @@ import {
   usesProviderResumeId,
 } from '../../src/agent/transport-resume-opts.js';
 import type { SessionRecord } from '../../src/store/session-store.js';
+import { CODEBUDDY_PROVIDER_IDS } from '../../shared/codebuddy.js';
 
 function rec(overrides: Partial<SessionRecord>): SessionRecord {
   return {
@@ -32,6 +33,8 @@ describe('buildTransportResumeLaunchOpts', () => {
     expect(usesProviderResumeId('opencode-sdk')).toBe(true);
     expect(usesProviderResumeId('deepseek-harness')).toBe(true);
     expect(usesProviderResumeId('pi')).toBe(true);
+    expect(usesProviderResumeId(CODEBUDDY_PROVIDER_IDS.CHINA)).toBe(true);
+    expect(usesProviderResumeId(CODEBUDDY_PROVIDER_IDS.INTERNATIONAL)).toBe(true);
     expect(usesProviderResumeId('gemini-sdk')).toBe(false);
   });
 
@@ -50,8 +53,8 @@ describe('buildTransportResumeLaunchOpts', () => {
     expect(buildTransportResumeLaunchOpts(rec({ agentType: 'claude-code-sdk', codexSessionId: 'cx-1' })).codexSessionId).toBeUndefined();
   });
 
-  it('threads providerResumeId for cursor-headless / copilot-sdk / OpenCode SDK / Kimi / Grok / DSH / Pi', () => {
-    for (const agentType of ['cursor-headless', 'copilot-sdk', 'opencode-sdk', 'kimi-sdk', 'grok-sdk', 'deepseek-harness', 'pi'] as const) {
+  it('threads providerResumeId for cursor-headless / copilot-sdk / OpenCode SDK / Kimi / Grok / DSH / Pi / CodeBuddy', () => {
+    for (const agentType of ['cursor-headless', 'copilot-sdk', 'opencode-sdk', 'kimi-sdk', 'grok-sdk', 'deepseek-harness', 'pi', CODEBUDDY_PROVIDER_IDS.CHINA, CODEBUDDY_PROVIDER_IDS.INTERNATIONAL] as const) {
       expect(buildTransportResumeLaunchOpts(rec({ agentType, providerResumeId: 'pr-1' }))).toMatchObject({ providerResumeId: 'pr-1' });
     }
   });

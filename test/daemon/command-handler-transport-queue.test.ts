@@ -1356,6 +1356,42 @@ describe('handleWebCommand transport queue behavior', () => {
     expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'command.ack', { commandId: 'cmd-clear-grok', status: 'accepted' });
   });
 
+  it('dispatches /clear as a fresh CodeBuddy relaunch without the old resume id', async () => {
+    getSessionMock.mockReturnValue({
+      name: 'deck_transport_brain',
+      projectName: 'transport',
+      role: 'brain',
+      agentType: 'codebuddy-cn',
+      runtimeType: 'transport',
+      state: 'running',
+      projectDir: '/proj',
+      providerSessionId: 'route-codebuddy-old',
+      providerResumeId: 'resume-codebuddy-old',
+      requestedModel: 'hy3',
+    });
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'route-codebuddy-old',
+      send: vi.fn(() => 'queued'),
+      pendingCount: 1,
+      pendingMessages: ['a'],
+    });
+
+    handleWebCommand({ type: 'session.send', session: 'deck_transport_brain', text: '/clear', commandId: 'cmd-clear-codebuddy' }, serverLink as any);
+    await flushAsync();
+
+    expect(stopTransportRuntimeSessionMock).toHaveBeenCalledWith('deck_transport_brain');
+    expect(launchTransportSessionMock).toHaveBeenCalledWith(expect.objectContaining({
+      name: 'deck_transport_brain',
+      agentType: 'codebuddy-cn',
+      projectDir: '/proj',
+      requestedModel: 'hy3',
+      fresh: true,
+    }));
+    expect(launchTransportSessionMock.mock.calls.at(-1)?.[0]).not.toHaveProperty('providerResumeId');
+    expect(launchTransportSessionMock.mock.calls.at(-1)?.[0]).not.toHaveProperty('bindExistingKey');
+    expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'command.ack', { commandId: 'cmd-clear-codebuddy', status: 'accepted' });
+  });
+
   it('dispatches /clear as a fresh openclaw relaunch that preserves the provider key', async () => {
     getSessionMock.mockReturnValue({
       name: 'deck_transport_brain',

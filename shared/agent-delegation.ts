@@ -1,5 +1,6 @@
 import { P2P_ROUTING_FIELDS } from './p2p-routing-fields.js';
 import { isSessionAgentType } from './agent-types.js';
+import { CODEBUDDY_PROVIDER_IDS } from './codebuddy.js';
 import { isValidImcodesSessionName } from './session-scope.js';
 
 export const AGENT_DELEGATION_TARGET_FIELD = 'delegateTarget' as const;
@@ -128,6 +129,8 @@ export const DELEGATION_REPLY_CAPABLE_AGENT_TYPES = [
   'kimi-sdk',
   'deepseek-harness',
   'pi',
+  CODEBUDDY_PROVIDER_IDS.CHINA,
+  CODEBUDDY_PROVIDER_IDS.INTERNATIONAL,
 ] as const;
 export type DelegationReplyCapableAgentType = typeof DELEGATION_REPLY_CAPABLE_AGENT_TYPES[number];
 

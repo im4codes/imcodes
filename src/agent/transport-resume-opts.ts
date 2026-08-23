@@ -3,6 +3,7 @@ import type { SessionRecord } from '../store/session-store.js';
 import type { AgentType } from './detect.js';
 import type { RemoteSessionInfo } from './transport-provider.js';
 import { canonicalizeTransportCwd } from './transport-paths.js';
+import { isCodeBuddyProviderId } from '../../shared/codebuddy.js';
 
 /** Providers whose durable conversation id is stored in SessionRecord.providerResumeId. */
 export function usesProviderResumeId(agentType: string | undefined): boolean {
@@ -12,7 +13,8 @@ export function usesProviderResumeId(agentType: string | undefined): boolean {
     || agentType === 'grok-sdk'
     || agentType === 'opencode-sdk'
     || agentType === 'deepseek-harness'
-    || agentType === 'pi';
+    || agentType === 'pi'
+    || isCodeBuddyProviderId(agentType);
 }
 
 /** Providers whose remote session namespace is partitioned by working directory. */
@@ -20,7 +22,8 @@ export function usesDirectoryScopedSessionListing(agentType: string | undefined)
   return agentType === 'opencode-sdk'
     || agentType === 'copilot-sdk'
     || agentType === 'kimi-sdk'
-    || agentType === 'grok-sdk';
+    || agentType === 'grok-sdk'
+    || isCodeBuddyProviderId(agentType);
 }
 
 /**
