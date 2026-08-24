@@ -1153,16 +1153,17 @@ describe('useTimeline global cache bounds', () => {
       streamingEvent,
     ]);
 
-    const setItemSpy = vi.spyOn(localStorage, 'setItem');
+    const stableSnapshotBeforeFreeze = localStorage.getItem(stableKey);
+    const streamingSnapshotBeforeFreeze = localStorage.getItem(streamingKey);
     // Exercise the exact callback registered for pagehide/visibility freeze.
     // Calling it directly keeps this scope assertion independent from jsdom's
     // process-global event-listener lifecycle when the full suite reuses forks;
     // the preceding test separately proves that pagehide invokes this callback.
-    __flushTimelineSnapshotsBeforeFreezeForTests();
+    expect(__flushTimelineSnapshotsBeforeFreezeForTests()).toBe(1);
 
-    expect(setItemSpy).toHaveBeenCalledTimes(1);
-    expect(setItemSpy).toHaveBeenCalledWith(streamingKey, expect.stringContaining('partial'));
-    expect(setItemSpy).not.toHaveBeenCalledWith(stableKey, expect.anything());
+    expect(localStorage.getItem(stableKey)).toBe(stableSnapshotBeforeFreeze);
+    expect(localStorage.getItem(streamingKey)).not.toBe(streamingSnapshotBeforeFreeze);
+    expect(localStorage.getItem(streamingKey)).toContain('partial');
   });
 
   it('does not persist streaming-only global ingests to IndexedDB', async () => {

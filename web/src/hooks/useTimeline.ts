@@ -704,7 +704,8 @@ function flushPendingTimelineSnapshotWrites(): void {
   }
 }
 
-function persistTimelineSnapshotsBeforeFreeze(): void {
+function persistTimelineSnapshotsBeforeFreeze(): number {
+  let persistedCount = 0;
   for (const [cacheKey, cachedEvents] of eventsCache.entries()) {
     // Ordinary (non-streaming) tails are already covered by the debounced
     // snapshot writer, which flushTimelineSnapshotsBeforeFreeze() drains immediately
@@ -718,7 +719,9 @@ function persistTimelineSnapshotsBeforeFreeze(): void {
     if (!cachedEvents.some((event) => event.payload?.streaming === true)) continue;
     const tail = getPersistableTimelineTail(cachedEvents, { includeStreaming: true });
     persistTimelineSnapshotTail(cacheKey, tail);
+    persistedCount += 1;
   }
+  return persistedCount;
 }
 
 function clearPendingTimelineSnapshotWrites(): void {
@@ -728,19 +731,19 @@ function clearPendingTimelineSnapshotWrites(): void {
   lastWrittenTimelineSnapshotTails.clear();
 }
 
-function flushTimelineSnapshotsBeforeFreeze(): void {
+function flushTimelineSnapshotsBeforeFreeze(): number {
   flushPendingTimelineCacheIngests();
   flushPendingTimelineSnapshotWrites();
   // A full page refresh during an active transport turn otherwise loses the
   // latest assistant.text streaming payload: streaming ticks are intentionally
   // kept out of IDB, and the daemon history store only has the final event.
   // localStorage is the lightweight browser-local crash mat for refresh/pagehide.
-  persistTimelineSnapshotsBeforeFreeze();
+  return persistTimelineSnapshotsBeforeFreeze();
 }
 
 /** Test seam for the exact callback registered on browser freeze events. */
-export function __flushTimelineSnapshotsBeforeFreezeForTests(): void {
-  flushTimelineSnapshotsBeforeFreeze();
+export function __flushTimelineSnapshotsBeforeFreezeForTests(): number {
+  return flushTimelineSnapshotsBeforeFreeze();
 }
 
 function scheduleTimelineSnapshotPersist(cacheKey: string, events: TimelineEvent[]): void {
