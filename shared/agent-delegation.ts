@@ -39,6 +39,7 @@ export const AGENT_DELEGATION_REPLY_VERSION = 'agent_delegation_reply_v1' as con
 export const AGENT_DELEGATION_REPLY_TOTAL_BYTES = 64 * 1024;
 export const AGENT_DELEGATION_REPLY_RESULT_BYTES = 48 * 1024;
 export const AGENT_DELEGATION_REPLY_TTL_MS = 24 * 60 * 60_000;
+export const AGENT_DELEGATION_REPLY_MAX_MESSAGES = 64;
 export const AGENT_DELEGATION_CAPABILITY_MIN_CHARS = 32;
 export const AGENT_DELEGATION_CAPABILITY_MAX_CHARS = 512;
 export const AGENT_DELEGATION_ID_MAX_BYTES = 256;
@@ -261,7 +262,7 @@ export function buildAgentDelegationReplyInstruction(
       || !isAgentDelegationReplyCapability(authority.replyCapability)) return '';
     return [
       `${AGENT_DELEGATION_STRUCTURED_REPLY_INSTRUCTION_MARKER} ${JSON.stringify(authority)}`,
-      `After completing the above task, reply exactly once with the delegation_reply tool using the delegationId and replyCapability above plus result: "<your complete response>". This structured reply is routed directly to ${JSON.stringify(replyToSession)}; do not use send_message or imcodes send for this reply.`,
+      `Use the delegation_reply tool with the delegationId and replyCapability above plus result: "<your response>" whenever you need to reply. The same capability may send multiple structured replies until it expires; each reply is routed directly to ${JSON.stringify(replyToSession)}. Do not use send_message or imcodes send for these replies.`,
     ].join('\n');
   }
   return `${AGENT_DELEGATION_REPLY_INSTRUCTION_MARKER}\nAfter completing the above task, send your response using: imcodes send ${JSON.stringify(replyToSession)} ${JSON.stringify('Task: <brief summary of the request>\nResult: <your response>')}`;
@@ -407,7 +408,7 @@ export function buildAgentDelegationOrchestrationPrompt(input: AgentDelegationOr
     '',
     'Then dispatch a self-contained delegation brief to the selected delegate using the exact target session above, and require a reply. Prefer the available send_message tool with reply enabled when present; otherwise use:',
     `imcodes send --reply ${JSON.stringify(targetSession)} ${JSON.stringify('Task: <self-contained brief>\nContext: <relevant current-session facts>\nAcceptance criteria: <how to verify>\nReply: send the result back to this session when done')}`,
-    'A reply-enabled send gives the delegate a one-time structured reply capability and routes that result back through this session provider’s notification path. After dispatch, do not poll the delegate, session status, logs, or transcripts; wait for the reply notification to arrive.',
+    'A reply-enabled send gives the delegate a bounded structured reply capability that may send multiple replies until expiry and routes each result back through this session provider’s notification path. After dispatch, do not poll the delegate, session status, logs, or transcripts; wait for reply notifications to arrive.',
     '',
     'If the user selected or mentioned multiple @ delegates, split the work into separate per-delegate briefs, dispatch each one independently with reply required, and track/report each delegate result separately.',
     '',

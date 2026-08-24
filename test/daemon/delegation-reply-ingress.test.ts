@@ -20,6 +20,7 @@ const mocks = vi.hoisted(() => ({
     markDelivered: vi.fn(),
     expire: vi.fn(),
     get: vi.fn(),
+    getMessage: vi.fn(),
     listReceived: vi.fn(() => []),
   },
   timelineEmit: vi.fn(),
@@ -104,6 +105,11 @@ describe('delegation reply ingress', () => {
     mocks.store.markDelivered.mockReset().mockReturnValue(true);
     mocks.store.expire.mockReset();
     mocks.store.get.mockReset();
+    mocks.store.getMessage.mockReset().mockImplementation(() => ({
+      ...record,
+      status: 'delivered',
+      deliveredAt: Date.now(),
+    }));
     mocks.store.listReceived.mockReset().mockReturnValue([]);
     mocks.timelineEmit.mockReset();
     vi.mocked(ensureTransportRuntimeAvailable).mockClear();
@@ -141,7 +147,10 @@ describe('delegation reply ingress', () => {
       expect.objectContaining({ text: expect.stringContaining(record.result) }),
     );
     await vi.waitFor(() => {
-      expect(mocks.store.markDelivered).toHaveBeenCalledWith(record.delegationId);
+      expect(mocks.store.markDelivered).toHaveBeenCalledWith(
+        record.delegationId,
+        record.notificationId,
+      );
     });
     expect(mocks.timelineEmit).toHaveBeenCalledWith(
       origin.sessionName,
@@ -164,6 +173,58 @@ describe('delegation reply ingress', () => {
       }));
     });
     unsubscribe();
+  });
+
+  it('delivers multiple distinct replies for one delegation without collapsing their in-flight work', async () => {
+    const secondRecord = {
+      ...record,
+      notificationId: 'notification-id-2',
+      result: 'A later progress update.',
+      updatedAt: 3,
+    };
+    mocks.store.receive
+      .mockReturnValueOnce({ ok: true, record, replay: false })
+      .mockReturnValueOnce({ ok: true, record: secondRecord, replay: false });
+    mocks.store.getMessage.mockImplementation((_delegationId: string, notificationId: string) => ({
+      ...(notificationId === secondRecord.notificationId ? secondRecord : record),
+      status: 'delivered',
+      deliveredAt: Date.now(),
+    }));
+
+    await Promise.all([
+      submitDelegationReply({
+        rawBody: envelope,
+        senderSessionName: target.sessionName,
+      }),
+      submitDelegationReply({
+        rawBody: { ...envelope, result: secondRecord.result },
+        senderSessionName: target.sessionName,
+      }),
+    ]);
+
+    await vi.waitFor(() => {
+      expect(mocks.runtime?.deliverDelegationNotification).toHaveBeenCalledTimes(2);
+      expect(mocks.store.markDelivered).toHaveBeenCalledWith(
+        record.delegationId,
+        record.notificationId,
+      );
+      expect(mocks.store.markDelivered).toHaveBeenCalledWith(
+        record.delegationId,
+        secondRecord.notificationId,
+      );
+    });
+    expect(mocks.timelineEmit).toHaveBeenCalledWith(
+      origin.sessionName,
+      AGENT_DELEGATION_REPLY_TIMELINE_EVENT,
+      expect.objectContaining({ result: record.result }),
+      expect.objectContaining({ eventId: `delegation-reply:${record.notificationId}` }),
+    );
+    expect(mocks.timelineEmit).toHaveBeenCalledWith(
+      origin.sessionName,
+      AGENT_DELEGATION_REPLY_TIMELINE_EVENT,
+      expect.objectContaining({ result: secondRecord.result }),
+      expect.objectContaining({ eventId: `delegation-reply:${secondRecord.notificationId}` }),
+    );
   });
 
   it('restores a missing origin runtime without changing the bound identities', async () => {

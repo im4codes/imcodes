@@ -96,6 +96,7 @@ describe('memory MCP shared contracts', () => {
   it('documents scoped send target discovery and self-target rejection', () => {
     const sendList = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS];
     const sendMessage = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE];
+    const delegationReply = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.DELEGATION_REPLY];
 
     expect(sendList.description).toContain('current caller session');
     expect(sendList.description).toContain('stopped sessions are excluded');
@@ -110,6 +111,7 @@ describe('memory MCP shared contracts', () => {
     expect(sendMessage.description).toContain('does not start a structured Team/P2P discussion run');
     expect(sendMessage.description).toContain('direct non-preemptive append');
     expect(sendMessage.description).toContain('retain delivery through the ordinary durable queue');
+    expect(delegationReply.description).toContain('multiple replies until it expires');
 
     const sendListQuery = sendList.inputSchema.properties?.query as { description?: string } | undefined;
     const sendMessageText = sendMessage.inputSchema.properties?.message as { description?: string } | undefined;
@@ -123,6 +125,7 @@ describe('memory MCP shared contracts', () => {
     expect(sendListQuery?.description).toContain('cc');
     expect(sendListQuery?.description).toContain('display labels');
     expect(sendMessageText?.description).toContain('complete task/request text');
+    expect(sendMessageReply?.description).toContain('multiple replies until expiry');
     expect(sendMessageReply?.description).toContain('Set true');
     expect(sendMessageReply?.description).toContain('discussion invites');
     expect(sendMessageAudit?.description).toContain('automatic-supervision');

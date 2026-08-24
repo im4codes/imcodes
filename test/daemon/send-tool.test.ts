@@ -476,6 +476,7 @@ describe('send-tool', () => {
 
     expect(result.queued).toEqual(['deck_alpha_brain']);
     expect(dispatchMessage.mock.calls[0][2]).toMatchObject({
+      deliveryMode: 'append',
       sharedActor: {
         actorDisplayName: 'CC1',
         effectiveActorRole: 'server-member',

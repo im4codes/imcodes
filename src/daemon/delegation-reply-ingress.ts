@@ -61,7 +61,7 @@ function withTimeoutOutcome<T>(promise: Promise<T>, timeoutMs: number): Promise<
 function startBackgroundDelivery(record: DelegationReplyRecord): void {
   void deliverRecord(record).catch((error) => {
     logger.warn({ error, delegationId: record.delegationId }, 'delegation reply background delivery failed');
-    scheduleRetry(record.delegationId, 1_000);
+    scheduleRetry(record.delegationId, record.notificationId, 1_000);
   });
 }
 
@@ -112,28 +112,28 @@ function emitDelegationReplyTimeline(record: DelegationReplyRecord): void {
   );
 }
 
-function scheduleRetry(delegationId: string, delayMs: number): void {
-  if (retryTimers.has(delegationId)) return;
+function scheduleRetry(delegationId: string, notificationId: string, delayMs: number): void {
+  if (retryTimers.has(notificationId)) return;
   const timer = setTimeout(() => {
-    retryTimers.delete(delegationId);
-    const record = getDelegationReplyStore().get(delegationId);
+    retryTimers.delete(notificationId);
+    const record = getDelegationReplyStore().getMessage(delegationId, notificationId);
     if (record?.result && record.status === AGENT_DELEGATION_REPLY_STATUSES.RECEIVED) {
       if (Date.now() >= record.expiresAt) {
         getDelegationReplyStore().expire(delegationId);
         return;
       }
       void deliverRecord(record).catch((error) => {
-        logger.warn({ error, delegationId }, 'delegation reply retry failed');
-        scheduleRetry(delegationId, 5_000);
+        logger.warn({ error, delegationId, notificationId }, 'delegation reply retry failed');
+        scheduleRetry(delegationId, notificationId, 5_000);
       });
     }
   }, delayMs);
   timer.unref?.();
-  retryTimers.set(delegationId, timer);
+  retryTimers.set(notificationId, timer);
 }
 
 async function deliverRecord(record: DelegationReplyRecord): Promise<DelegationReplyIngressResult> {
-  const existing = inFlight.get(record.delegationId);
+  const existing = inFlight.get(record.notificationId);
   if (existing) return existing;
   const promise = (async (): Promise<DelegationReplyIngressResult> => {
     if (Date.now() >= record.expiresAt) {
@@ -159,7 +159,7 @@ async function deliverRecord(record: DelegationReplyRecord): Promise<DelegationR
           sessionName: record.origin.sessionName,
           timeoutMs: DELEGATION_REPLY_RUNTIME_RECOVERY_TIMEOUT_MS,
         }, 'delegation reply runtime recovery timed out; scheduling durable retry');
-        scheduleRetry(record.delegationId, 1_000);
+        scheduleRetry(record.delegationId, record.notificationId, 1_000);
         return {
           ok: true,
           delivered: false,
@@ -170,7 +170,7 @@ async function deliverRecord(record: DelegationReplyRecord): Promise<DelegationR
       runtime = recovery.value;
     }
     if (!runtime) {
-      scheduleRetry(record.delegationId, 5_000);
+      scheduleRetry(record.delegationId, record.notificationId, 5_000);
       return {
         ok: true,
         delivered: false,
@@ -189,7 +189,7 @@ async function deliverRecord(record: DelegationReplyRecord): Promise<DelegationR
       });
     } catch (error) {
       logger.warn({ error, delegationId: record.delegationId }, 'delegation reply notification admission failed');
-      scheduleRetry(record.delegationId, 1_000);
+      scheduleRetry(record.delegationId, record.notificationId, 1_000);
       return {
         ok: true,
         delivered: false,
@@ -198,14 +198,21 @@ async function deliverRecord(record: DelegationReplyRecord): Promise<DelegationR
       };
     }
     if (result === AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED) {
-      if (getDelegationReplyStore().markDelivered(record.delegationId)) {
-        const delivered = getDelegationReplyStore().get(record.delegationId) ?? record;
+      if (getDelegationReplyStore().markDelivered(record.delegationId, record.notificationId)) {
+        const delivered = getDelegationReplyStore().getMessage(
+          record.delegationId,
+          record.notificationId,
+        ) ?? record;
         emitDelegationReplyDelivered(delivered);
       }
       return { ok: true, delivered: true };
     }
     const unsupported = result === AGENT_DELEGATION_NOTIFICATION_RESULTS.UNSUPPORTED;
-    scheduleRetry(record.delegationId, unsupported ? 5_000 : 1_000);
+    scheduleRetry(
+      record.delegationId,
+      record.notificationId,
+      unsupported ? 5_000 : 1_000,
+    );
     return {
       ok: true,
       delivered: false,
@@ -215,9 +222,9 @@ async function deliverRecord(record: DelegationReplyRecord): Promise<DelegationR
         : AGENT_DELEGATION_REPLY_ERRORS.DELIVERY_PENDING,
     };
   })().finally(() => {
-    inFlight.delete(record.delegationId);
+    inFlight.delete(record.notificationId);
   });
-  inFlight.set(record.delegationId, promise);
+  inFlight.set(record.notificationId, promise);
   return promise;
 }
 
@@ -257,6 +264,8 @@ export async function submitDelegationReply(input: {
       ? AGENT_DELEGATION_REPLY_ERRORS.EXPIRED
       : received.reason === 'already_replied'
         ? AGENT_DELEGATION_REPLY_ERRORS.ALREADY_REPLIED
+        : received.reason === 'limit'
+          ? AGENT_DELEGATION_REPLY_ERRORS.RATE_LIMITED
         : received.reason === 'identity'
           ? AGENT_DELEGATION_REPLY_ERRORS.IDENTITY_MISMATCH
           : received.reason === 'capability'
@@ -275,7 +284,10 @@ export async function submitDelegationReply(input: {
   // for provider admission: a wedged turn/steer used to keep delegation_reply
   // running until the user pressed Stop. Timeline visibility is immediate and
   // provider delivery continues through the durable retry outbox.
-  emitDelegationReplyTimeline(received.record);
+  if (!received.replay) emitDelegationReplyTimeline(received.record);
+  if (received.replay && received.record.status === AGENT_DELEGATION_REPLY_STATUSES.DELIVERED) {
+    return { ok: true, delivered: true };
+  }
   startBackgroundDelivery(received.record);
   return {
     ok: true,
@@ -288,7 +300,7 @@ export async function submitDelegationReply(input: {
 export function resumePendingDelegationReplies(): void {
   for (const record of getDelegationReplyStore().listReceived()) {
     emitDelegationReplyTimeline(record);
-    scheduleRetry(record.delegationId, 250);
+    scheduleRetry(record.delegationId, record.notificationId, 250);
   }
 }
 

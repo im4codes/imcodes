@@ -403,11 +403,11 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   },
   [MEMORY_MCP_TOOL_NAMES.DELEGATION_REPLY]: {
     name: MEMORY_MCP_TOOL_NAMES.DELEGATION_REPLY,
-    description: 'Submit the one structured reply for a reply-enabled delegation. Use only the delegation id and one-time capability supplied in that delegation brief. The daemon correlates and notifies the originating session directly; do not also call send_message.',
+    description: 'Submit a structured reply for a reply-enabled delegation. Use only the delegation id and bounded capability supplied in that delegation brief. The same capability may submit multiple replies until it expires; the daemon correlates each reply and notifies the originating session directly. Do not also call send_message for the same reply.',
     inputSchema: objectSchema({
       delegationId: stringSchema('Opaque delegation id supplied by the reply-enabled brief.'),
-      replyCapability: stringSchema('One-time reply capability supplied by the brief. Never repeat it inside result.'),
-      result: stringSchema(`Complete delegation result, at most ${AGENT_DELEGATION_REPLY_RESULT_BYTES} UTF-8 bytes.`),
+      replyCapability: stringSchema('Bounded reply capability supplied by the brief. It remains valid until expiry; never repeat it inside result.'),
+      result: stringSchema(`One complete delegation reply, at most ${AGENT_DELEGATION_REPLY_RESULT_BYTES} UTF-8 bytes.`),
     }, ['delegationId', 'replyCapability', 'result']),
     outputSchema: statusSchema,
   },
@@ -432,7 +432,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
         items: stringSchema(`Relative path or in-root absolute path reference, at most ${MEMORY_MCP_CAPS.SEND_FILE_PATH_MAX_CHARS} characters and without control characters.`),
         maxItems: MEMORY_MCP_CAPS.SEND_FILES_MAX_COUNT,
       },
-      reply: booleanSchema('Optional request for one correlated reply to the runtime-bound caller session. Set true for audit/review reports or discussion invites; the target receives an opaque delegation id and one-time capability, and its structured reply is delivered through the caller provider’s active-turn notification path when supported. Do not poll session state, logs, transcripts, or the target after a reply-enabled send.'),
+      reply: booleanSchema('Optional request for correlated replies to the runtime-bound caller session. Set true for audit/review reports or discussion invites; the target receives an opaque delegation id and bounded capability that may send multiple replies until expiry, and each structured reply is delivered through the caller provider’s active-turn notification path when supported. Do not poll session state, logs, transcripts, or the target after a reply-enabled send.'),
       audit: {
         ...objectSchema({
           kind: {

@@ -196,7 +196,7 @@ describe('agent delegation shared contract', () => {
     expect(isAgentDelegationControlInstructionText(instruction)).toBe(true);
   });
 
-  it('builds and validates one structured correlated delegation reply', () => {
+  it('builds and validates a reusable bounded structured delegation reply authority', () => {
     const delegationId = 'delegation_identity_1234567890';
     const replyCapability = 'reply_capability_1234567890_ABCDEFG';
     const instruction = buildAgentDelegationReplyInstruction('deck_repo_brain', {
@@ -207,6 +207,7 @@ describe('agent delegation shared contract', () => {
     expect(instruction).toContain('delegation_reply');
     expect(instruction).toContain(delegationId);
     expect(instruction).toContain(replyCapability);
+    expect(instruction).toContain('multiple structured replies until it expires');
     expect(instruction).not.toContain('send your response using: imcodes send');
     expect(stripAgentDelegationControlInstructions(`task\n${instruction}`)).toBe('task');
     expect(extractAgentDelegationReplyAuthorityFromInstruction(instruction)).toEqual({
@@ -254,7 +255,8 @@ describe('agent delegation shared contract', () => {
     expect(prompt).toContain('imcodes send --reply "deck_repo_w1"');
     expect(prompt).not.toContain('imcodes send --no-reply "deck_repo_w1"');
     expect(prompt).toContain('do not poll the delegate, session status, logs, or transcripts');
-    expect(prompt).toContain('one-time structured reply capability');
+    expect(prompt).toContain('bounded structured reply capability');
+    expect(prompt).toContain('multiple replies until expiry');
     expect(prompt).toContain('multiple @ delegates');
     expect(prompt).toContain('separate per-delegate briefs');
     expect(prompt).toContain('each delegate result separately');

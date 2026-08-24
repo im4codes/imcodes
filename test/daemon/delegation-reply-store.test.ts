@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   AGENT_DELEGATION_PURPOSES,
+  AGENT_DELEGATION_REPLY_MAX_MESSAGES,
   AGENT_DELEGATION_REPLY_STATUSES,
 } from '../../shared/agent-delegation.js';
 import { DelegationReplyStore } from '../../src/daemon/delegation-reply-store.js';
@@ -22,7 +23,7 @@ const target = {
 };
 
 describe('DelegationReplyStore', () => {
-  it('binds one capability to both session identities and consumes it only after delivery', () => {
+  it('keeps a supervision-audit capability single-result while binding both session identities', () => {
     const database = new DatabaseSync(':memory:');
     const store = new DelegationReplyStore({ database });
     const created = store.create({
@@ -96,7 +97,12 @@ describe('DelegationReplyStore', () => {
       now: 2_001,
     })).toEqual({ ok: false, reason: 'already_replied' });
 
-    expect(store.markDelivered(created.record.delegationId, 3_000)).toBe(true);
+    if (!accepted.ok) throw new Error('expected accepted audit reply');
+    expect(store.markDelivered(
+      created.record.delegationId,
+      accepted.record.notificationId,
+      3_000,
+    )).toBe(true);
     expect(store.get(created.record.delegationId)).toMatchObject({
       status: AGENT_DELEGATION_REPLY_STATUSES.DELIVERED,
       deliveredAt: 3_000,
@@ -107,7 +113,103 @@ describe('DelegationReplyStore', () => {
       result: 'result',
       sender: target,
       now: 3_001,
-    })).toEqual({ ok: false, reason: 'already_replied' });
+    })).toMatchObject({
+      ok: true,
+      replay: true,
+      record: { status: AGENT_DELEGATION_REPLY_STATUSES.DELIVERED },
+    });
+    store.close();
+    database.close();
+  });
+
+  it('accepts multiple ordinary replies under one bounded capability and deduplicates each result', () => {
+    const database = new DatabaseSync(':memory:');
+    const store = new DelegationReplyStore({ database });
+    const created = store.create({
+      origin,
+      target,
+      dispatchId: 'dispatch_multi',
+      messageId: 'message_multi',
+      now: 1_000,
+    });
+
+    const first = store.receive({
+      delegationId: created.record.delegationId,
+      replyCapability: created.replyCapability,
+      result: 'first progress update',
+      sender: target,
+      now: 2_000,
+    });
+    const second = store.receive({
+      delegationId: created.record.delegationId,
+      replyCapability: created.replyCapability,
+      result: 'second progress update',
+      sender: target,
+      now: 2_001,
+    });
+    expect(first).toMatchObject({ ok: true, replay: false });
+    expect(second).toMatchObject({ ok: true, replay: false });
+    if (!first.ok || !second.ok) throw new Error('expected two accepted replies');
+    expect(second.record.notificationId).not.toBe(first.record.notificationId);
+    expect(store.listReceived()).toEqual([
+      expect.objectContaining({ result: 'first progress update' }),
+      expect.objectContaining({ result: 'second progress update' }),
+    ]);
+
+    expect(store.markDelivered(
+      created.record.delegationId,
+      first.record.notificationId,
+      3_000,
+    )).toBe(true);
+    expect(store.receive({
+      delegationId: created.record.delegationId,
+      replyCapability: created.replyCapability,
+      result: 'first progress update',
+      sender: target,
+      now: 3_001,
+    })).toMatchObject({
+      ok: true,
+      replay: true,
+      record: { status: AGENT_DELEGATION_REPLY_STATUSES.DELIVERED },
+    });
+    expect(store.receive({
+      delegationId: created.record.delegationId,
+      replyCapability: created.replyCapability,
+      result: 'third progress update',
+      sender: target,
+      now: 3_002,
+    })).toMatchObject({ ok: true, replay: false });
+
+    store.close();
+    database.close();
+  });
+
+  it('bounds the number of distinct replies retained by one delegation', () => {
+    const database = new DatabaseSync(':memory:');
+    const store = new DelegationReplyStore({ database });
+    const created = store.create({
+      origin,
+      target,
+      dispatchId: 'dispatch_bounded',
+      messageId: 'message_bounded',
+      now: 1_000,
+    });
+    for (let index = 0; index < AGENT_DELEGATION_REPLY_MAX_MESSAGES; index += 1) {
+      expect(store.receive({
+        delegationId: created.record.delegationId,
+        replyCapability: created.replyCapability,
+        result: `reply ${index}`,
+        sender: target,
+        now: 2_000 + index,
+      })).toMatchObject({ ok: true, replay: false });
+    }
+    expect(store.receive({
+      delegationId: created.record.delegationId,
+      replyCapability: created.replyCapability,
+      result: 'one reply too many',
+      sender: target,
+      now: 3_000,
+    })).toEqual({ ok: false, reason: 'limit' });
     store.close();
     database.close();
   });

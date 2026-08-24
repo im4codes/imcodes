@@ -475,7 +475,7 @@ describe('Hook server /send endpoint', () => {
       expect(sendKeysMock).not.toHaveBeenCalled();
     });
 
-    it('delivers message to transport session via runtime.send()', async () => {
+    it('defaults CLI /send to direct append for a compatible busy transport', async () => {
       const brain = makeSession({ name: 'deck_proj_brain', role: 'brain', agentType: 'claude-code' });
       const transport = makeSession({ name: 'deck_proj_w1', role: 'w1', agentType: 'openclaw', runtimeType: 'transport', label: 'OpenClaw' });
 
@@ -489,6 +489,7 @@ describe('Hook server /send endpoint', () => {
       const mockRuntime = {
         providerSessionId: 'transport-provider-session',
         send: vi.fn().mockReturnValue('sent'),
+        appendExternalMessageToActiveTurn: vi.fn().mockResolvedValue('appended'),
         getStatus: vi.fn().mockReturnValue('idle'),
       };
       getTransportRuntimeMock.mockReturnValue(mockRuntime);
@@ -500,8 +501,8 @@ describe('Hook server /send endpoint', () => {
       expect(res.body.delivered).toBe(true);
       const messageId = res.body.messageId;
       expect(typeof messageId).toBe('string');
-      expect(mockRuntime.send).toHaveBeenCalledWith('hello transport', messageId);
-      expect(typeof mockRuntime.send.mock.calls[0][0]).toBe('string');
+      expect(mockRuntime.appendExternalMessageToActiveTurn).toHaveBeenCalledWith('hello transport', messageId);
+      expect(mockRuntime.send).not.toHaveBeenCalled();
       expect(timelineEmitMock).toHaveBeenCalledWith(
         'deck_proj_w1',
         'user.message',
@@ -528,6 +529,7 @@ describe('Hook server /send endpoint', () => {
 
       const mockRuntime = {
         providerSessionId: 'transport-provider-session',
+        appendExternalMessageToActiveTurn: vi.fn().mockResolvedValue('unsupported'),
         send: vi.fn((text: string, clientMessageId: string) => {
           getTransportQueueStore().enqueue({
             sessionName: 'deck_proj_w1',
@@ -547,6 +549,7 @@ describe('Hook server /send endpoint', () => {
       expect(res.status).toBe(200);
       expect(res.body.ok).toBe(true);
       expect(res.body.queued).toBe(true);
+      expect(mockRuntime.appendExternalMessageToActiveTurn).toHaveBeenCalledWith('queued transport', res.body.messageId);
       expect(mockRuntime.send).toHaveBeenCalledWith('queued transport', res.body.messageId);
       expect(timelineEmitMock).not.toHaveBeenCalledWith(
         'deck_proj_w1',
@@ -572,7 +575,7 @@ describe('Hook server /send endpoint', () => {
           queueAuthorityId: expect.any(String),
           queueSnapshot: expect.objectContaining({
             type: 'transport.queue.snapshot',
-            source: 'send_tool',
+            source: 'send_tool_append_fallback',
           }),
         }),
         { source: 'daemon', confidence: 'high' },

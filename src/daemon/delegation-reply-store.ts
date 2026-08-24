@@ -6,6 +6,7 @@ import { dirname, join } from 'node:path';
 
 import {
   AGENT_DELEGATION_REPLY_STATUSES,
+  AGENT_DELEGATION_REPLY_MAX_MESSAGES,
   AGENT_DELEGATION_REPLY_TTL_MS,
   type AgentDelegationPurpose,
   type AgentDelegationReplyStatus,
@@ -60,7 +61,7 @@ export interface CreatedDelegationReply {
 
 export type ReceiveDelegationReplyResult =
   | { ok: true; record: DelegationReplyRecord; replay: boolean }
-  | { ok: false; reason: 'not_found' | 'capability' | 'identity' | 'expired' | 'already_replied' };
+  | { ok: false; reason: 'not_found' | 'capability' | 'identity' | 'expired' | 'already_replied' | 'limit' };
 
 export interface DelegationReplyStoreOptions {
   dbPath?: string;
@@ -74,6 +75,10 @@ function opaqueId(bytes = 24): string {
 
 function capabilityHash(capability: string): string {
   return createHash('sha256').update(capability, 'utf8').digest('base64url');
+}
+
+function resultKey(result: string): string {
+  return createHash('sha256').update(result, 'utf8').digest('base64url');
 }
 
 function capabilityMatches(storedHash: string, capability: string): boolean {
@@ -172,6 +177,20 @@ export class DelegationReplyStore {
       );
       CREATE INDEX IF NOT EXISTS delegation_replies_status_idx
         ON delegation_replies(status, updated_at);
+      CREATE TABLE IF NOT EXISTS delegation_reply_messages (
+        delegation_id TEXT NOT NULL,
+        result_key TEXT NOT NULL,
+        notification_id TEXT NOT NULL UNIQUE,
+        result TEXT NOT NULL,
+        status TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        delivered_at INTEGER,
+        PRIMARY KEY (delegation_id, result_key),
+        FOREIGN KEY (delegation_id) REFERENCES delegation_replies(delegation_id) ON DELETE CASCADE
+      );
+      CREATE INDEX IF NOT EXISTS delegation_reply_messages_pending_idx
+        ON delegation_reply_messages(status, updated_at);
     `);
     const columns = this.#db.prepare('PRAGMA table_info(delegation_replies)').all() as Array<{ name?: unknown }>;
     const names = new Set(columns.map((column) => String(column.name ?? '')));
@@ -180,6 +199,37 @@ export class DelegationReplyStore {
     }
     if (!names.has('audit_attempt_id')) {
       this.#db.exec('ALTER TABLE delegation_replies ADD COLUMN audit_attempt_id TEXT');
+    }
+    // Preserve durable replies created by versions that stored the single
+    // message directly on the authority row.
+    const legacyRows = this.#db.prepare(`
+      SELECT delegation_id AS delegationId, notification_id AS notificationId,
+             result, status, updated_at AS updatedAt, delivered_at AS deliveredAt
+      FROM delegation_replies
+      WHERE result IS NOT NULL AND status IN (?, ?)
+    `).all(
+      AGENT_DELEGATION_REPLY_STATUSES.RECEIVED,
+      AGENT_DELEGATION_REPLY_STATUSES.DELIVERED,
+    ) as Array<Record<string, unknown>>;
+    const migrateLegacy = this.#db.prepare(`
+      INSERT OR IGNORE INTO delegation_reply_messages (
+        delegation_id, result_key, notification_id, result, status,
+        created_at, updated_at, delivered_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    for (const row of legacyRows) {
+      const result = String(row.result ?? '');
+      const updatedAt = Number(row.updatedAt ?? Date.now());
+      migrateLegacy.run(
+        String(row.delegationId ?? ''),
+        resultKey(result),
+        String(row.notificationId ?? opaqueId()),
+        result,
+        String(row.status ?? AGENT_DELEGATION_REPLY_STATUSES.RECEIVED),
+        updatedAt,
+        updatedAt,
+        typeof row.deliveredAt === 'number' ? row.deliveredAt : null,
+      );
     }
   }
 
@@ -252,6 +302,46 @@ export class DelegationReplyStore {
     return row ? parseRow(row) : undefined;
   }
 
+  getMessage(delegationId: string, notificationId: string): DelegationReplyRecord | undefined {
+    const row = this.#db.prepare(`
+      SELECT
+        authority.delegation_id AS delegationId,
+        authority.capability_hash AS capabilityHash,
+        authority.origin_session_name AS originSessionName,
+        authority.origin_session_instance_id AS originSessionInstanceId,
+        authority.origin_runtime_epoch AS originRuntimeEpoch,
+        authority.target_session_name AS targetSessionName,
+        authority.target_session_instance_id AS targetSessionInstanceId,
+        authority.target_runtime_epoch AS targetRuntimeEpoch,
+        authority.dispatch_id AS dispatchId,
+        authority.message_id AS messageId,
+        message.notification_id AS notificationId,
+        authority.purpose,
+        authority.audit_attempt_id AS auditAttemptId,
+        message.status,
+        message.result,
+        authority.created_at AS createdAt,
+        authority.expires_at AS expiresAt,
+        message.updated_at AS updatedAt,
+        message.delivered_at AS deliveredAt
+      FROM delegation_reply_messages message
+      JOIN delegation_replies authority ON authority.delegation_id = message.delegation_id
+      WHERE message.delegation_id = ? AND message.notification_id = ?
+    `).get(delegationId, notificationId) as Record<string, unknown> | undefined;
+    return row ? parseRow(row) : undefined;
+  }
+
+  #getMessageByResultKey(delegationId: string, key: string): DelegationReplyRecord | undefined {
+    const row = this.#db.prepare(`
+      SELECT notification_id AS notificationId
+      FROM delegation_reply_messages
+      WHERE delegation_id = ? AND result_key = ?
+    `).get(delegationId, key) as { notificationId?: unknown } | undefined;
+    return row?.notificationId
+      ? this.getMessage(delegationId, String(row.notificationId))
+      : undefined;
+  }
+
   matchPendingAuthority(input: {
     delegationId: string;
     replyCapability: string;
@@ -296,28 +386,50 @@ export class DelegationReplyStore {
         this.#db.exec('COMMIT');
         return { ok: false, reason: 'expired' };
       }
-      if (current.status === AGENT_DELEGATION_REPLY_STATUSES.DELIVERED) {
+      const key = resultKey(input.result);
+      const existing = this.#getMessageByResultKey(input.delegationId, key);
+      if (existing) {
+        this.#db.exec('ROLLBACK');
+        return { ok: true, record: existing, replay: true };
+      }
+      const messageCount = Number((this.#db.prepare(`
+        SELECT COUNT(*) AS count FROM delegation_reply_messages WHERE delegation_id = ?
+      `).get(input.delegationId) as { count?: unknown } | undefined)?.count ?? 0);
+      if (current.purpose && messageCount > 0) {
         this.#db.exec('ROLLBACK');
         return { ok: false, reason: 'already_replied' };
       }
-      if (current.status === AGENT_DELEGATION_REPLY_STATUSES.RECEIVED) {
+      if (messageCount >= AGENT_DELEGATION_REPLY_MAX_MESSAGES) {
         this.#db.exec('ROLLBACK');
-        return current.result === input.result
-          ? { ok: true, record: current, replay: true }
-          : { ok: false, reason: 'already_replied' };
+        return { ok: false, reason: 'limit' };
       }
+      const notificationId = opaqueId();
+      this.#db.prepare(`
+        INSERT INTO delegation_reply_messages (
+          delegation_id, result_key, notification_id, result, status,
+          created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        input.delegationId,
+        key,
+        notificationId,
+        input.result,
+        AGENT_DELEGATION_REPLY_STATUSES.RECEIVED,
+        now,
+        now,
+      );
       this.#db.prepare(`
         UPDATE delegation_replies
-        SET status = ?, result = ?, updated_at = ?
-        WHERE delegation_id = ? AND status = ?
+        SET status = ?, result = ?, notification_id = ?, updated_at = ?
+        WHERE delegation_id = ?
       `).run(
         AGENT_DELEGATION_REPLY_STATUSES.RECEIVED,
         input.result,
+        notificationId,
         now,
         input.delegationId,
-        AGENT_DELEGATION_REPLY_STATUSES.PENDING,
       );
-      const updated = this.get(input.delegationId);
+      const updated = this.getMessage(input.delegationId, notificationId);
       this.#db.exec('COMMIT');
       if (!updated) throw new Error('delegation reply authority disappeared');
       return { ok: true, record: updated, replay: false };
@@ -327,59 +439,82 @@ export class DelegationReplyStore {
     }
   }
 
-  markDelivered(delegationId: string, now = Date.now()): boolean {
+  markDelivered(delegationId: string, notificationId: string, now = Date.now()): boolean {
     const result = this.#db.prepare(`
-      UPDATE delegation_replies
+      UPDATE delegation_reply_messages
       SET status = ?, delivered_at = ?, updated_at = ?
-      WHERE delegation_id = ? AND status = ?
+      WHERE delegation_id = ? AND notification_id = ? AND status = ?
     `).run(
       AGENT_DELEGATION_REPLY_STATUSES.DELIVERED,
       now,
       now,
       delegationId,
+      notificationId,
       AGENT_DELEGATION_REPLY_STATUSES.RECEIVED,
     );
-    return Number(result.changes) === 1;
+    if (Number(result.changes) !== 1) return false;
+    const pending = Number((this.#db.prepare(`
+      SELECT COUNT(*) AS count FROM delegation_reply_messages
+      WHERE delegation_id = ? AND status = ?
+    `).get(delegationId, AGENT_DELEGATION_REPLY_STATUSES.RECEIVED) as { count?: unknown } | undefined)?.count ?? 0);
+    if (pending === 0) {
+      this.#db.prepare(`
+        UPDATE delegation_replies
+        SET status = ?, delivered_at = ?, updated_at = ?
+        WHERE delegation_id = ?
+      `).run(AGENT_DELEGATION_REPLY_STATUSES.DELIVERED, now, now, delegationId);
+    }
+    return true;
   }
 
   expire(delegationId: string, now = Date.now()): void {
     this.#db.prepare(`
       UPDATE delegation_replies
       SET status = ?, updated_at = ?
-      WHERE delegation_id = ? AND status != ?
+      WHERE delegation_id = ?
     `).run(
       AGENT_DELEGATION_REPLY_STATUSES.EXPIRED,
       now,
       delegationId,
-      AGENT_DELEGATION_REPLY_STATUSES.DELIVERED,
+    );
+    this.#db.prepare(`
+      UPDATE delegation_reply_messages
+      SET status = ?, updated_at = ?
+      WHERE delegation_id = ? AND status = ?
+    `).run(
+      AGENT_DELEGATION_REPLY_STATUSES.EXPIRED,
+      now,
+      delegationId,
+      AGENT_DELEGATION_REPLY_STATUSES.RECEIVED,
     );
   }
 
   listReceived(limit = 128): DelegationReplyRecord[] {
     const rows = this.#db.prepare(`
       SELECT
-        delegation_id AS delegationId,
-        capability_hash AS capabilityHash,
-        origin_session_name AS originSessionName,
-        origin_session_instance_id AS originSessionInstanceId,
-        origin_runtime_epoch AS originRuntimeEpoch,
-        target_session_name AS targetSessionName,
-        target_session_instance_id AS targetSessionInstanceId,
-        target_runtime_epoch AS targetRuntimeEpoch,
-        dispatch_id AS dispatchId,
-        message_id AS messageId,
-        notification_id AS notificationId,
-        purpose,
-        audit_attempt_id AS auditAttemptId,
-        status,
-        result,
-        created_at AS createdAt,
-        expires_at AS expiresAt,
-        updated_at AS updatedAt,
-        delivered_at AS deliveredAt
-      FROM delegation_replies
-      WHERE status = ?
-      ORDER BY updated_at ASC
+        authority.delegation_id AS delegationId,
+        authority.capability_hash AS capabilityHash,
+        authority.origin_session_name AS originSessionName,
+        authority.origin_session_instance_id AS originSessionInstanceId,
+        authority.origin_runtime_epoch AS originRuntimeEpoch,
+        authority.target_session_name AS targetSessionName,
+        authority.target_session_instance_id AS targetSessionInstanceId,
+        authority.target_runtime_epoch AS targetRuntimeEpoch,
+        authority.dispatch_id AS dispatchId,
+        authority.message_id AS messageId,
+        message.notification_id AS notificationId,
+        authority.purpose,
+        authority.audit_attempt_id AS auditAttemptId,
+        message.status,
+        message.result,
+        authority.created_at AS createdAt,
+        authority.expires_at AS expiresAt,
+        message.updated_at AS updatedAt,
+        message.delivered_at AS deliveredAt
+      FROM delegation_reply_messages message
+      JOIN delegation_replies authority ON authority.delegation_id = message.delegation_id
+      WHERE message.status = ?
+      ORDER BY message.updated_at ASC
       LIMIT ?
     `).all(AGENT_DELEGATION_REPLY_STATUSES.RECEIVED, Math.max(1, Math.min(1_024, limit))) as Record<string, unknown>[];
     return rows.map(parseRow);

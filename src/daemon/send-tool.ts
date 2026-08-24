@@ -866,6 +866,11 @@ export async function dispatchSendStop(
 
 export async function dispatchHookSend(input: HookSendDispatchInput, deps?: SendToolDeps): Promise<HookSendDispatchResult> {
   const d = depsWithDefaults(deps);
+  // `/send` is the transport used by both the managed MCP bridge and the
+  // `imcodes send` compatibility CLI. Node-to-node messages therefore prefer
+  // append by default; the runtime boundary retains the durable FIFO fallback
+  // when the provider cannot admit an active-turn append.
+  const deliveryMode = input.deliveryMode ?? MEMORY_MCP_SEND_DELIVERY_MODES.APPEND;
   const fileRefs = sanitizeFileReferences(input.files, input.projectRoot ?? null);
   if (!fileRefs.ok) throw new Error(fileRefs.error);
 
@@ -902,7 +907,7 @@ export async function dispatchHookSend(input: HookSendDispatchInput, deps?: Send
       const result = await d.dispatchMessage(target, message, {
         dispatchId,
         messageId,
-        ...(input.deliveryMode === MEMORY_MCP_SEND_DELIVERY_MODES.APPEND
+        ...(deliveryMode === MEMORY_MCP_SEND_DELIVERY_MODES.APPEND
           ? { deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND }
           : {}),
         ...buildSharedServerMemberSharedActorOption(
