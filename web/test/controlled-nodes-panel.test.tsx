@@ -84,6 +84,12 @@ vi.mock('../src/api.js', async (importOriginal) => {
   };
 });
 
+vi.mock('../src/components/RemoteDesktopOwnerAccess.js', () => ({
+  RemoteDesktopOwnerAccess: ({ hostId, endpointLabel }: { hostId: string | null; endpointLabel: string }) => (
+    <div data-testid="remote-desktop-owner-access">{hostId ?? 'missing-host'}:{endpointLabel}</div>
+  ),
+}));
+
 import {
   CONTROLLED_NODE_PRESENCE_REFRESH_MS,
   ControlledNodesPanel,
@@ -524,6 +530,44 @@ describe('ControlledNodesPanel (12.3)', () => {
       serverId: 'desktop-ready',
       displayName: 'Desktop Ready',
     }));
+    expect(container.querySelector('.remote-desktop-panel')).toBeNull();
+  });
+
+  it('opens Owner invitation management directly without opening a desktop connection', async () => {
+    const onOpenRemoteDesktop = vi.fn();
+    machines = [
+      machine({
+        serverId: 'desktop-owner',
+        remoteDesktopHostId: 'canonical-host-owner',
+        displayName: 'Owner Desktop',
+        os: 'win',
+        accessRole: 'owner',
+        execEnabled: true,
+        capabilities: [REMOTE_DESKTOP_CAPABILITY],
+      }),
+      machine({
+        serverId: 'desktop-participant',
+        remoteDesktopHostId: 'canonical-host-participant',
+        displayName: 'Participant Desktop',
+        os: 'win',
+        accessRole: 'participant',
+        execEnabled: true,
+        capabilities: [REMOTE_DESKTOP_CAPABILITY],
+      }),
+    ];
+    const { container, getByTestId } = render(
+      <ControlledNodesPanel onOpenRemoteDesktop={onOpenRemoteDesktop} />,
+    );
+    await waitFor(() => expect(container.querySelectorAll('.controlled-nodes-remote-desktop')).toHaveLength(2));
+
+    const accessButtons = container.querySelectorAll('.controlled-nodes-remote-desktop-access');
+    expect(accessButtons).toHaveLength(1);
+    expect(accessButtons[0]?.closest('li')?.textContent).toContain('Owner Desktop');
+    fireEvent.click(accessButtons[0]!);
+
+    expect(onOpenRemoteDesktop).not.toHaveBeenCalled();
+    expect(getByTestId('remote-desktop-owner-access').textContent)
+      .toBe('canonical-host-owner:Owner Desktop');
     expect(container.querySelector('.remote-desktop-panel')).toBeNull();
   });
 

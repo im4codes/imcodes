@@ -12,6 +12,7 @@ import { tabSharingRoutes } from '../src/routes/tab-sharing.js';
 import { signJwt } from '../src/security/crypto.js';
 import { COOKIE_SESSION } from '../../shared/cookie-names.js';
 import { NODE_ROLE } from '../../shared/remote-exec.js';
+import { REMOTE_DESKTOP_CAPABILITY } from '../../shared/remote-desktop.js';
 
 const JWT_KEY = 'controlled-machine-sharing-test-key';
 const hex = (bytes: number) => randomBytes(bytes).toString('hex');
@@ -184,6 +185,35 @@ describe('controlled-node sharing reuses grants without becoming a shared Tab', 
 });
 
 describe('controlled-node version reporting', () => {
+  it('exposes canonical remote-desktop host identity to browsers but not strict daemon clients', async () => {
+    const app = buildApp();
+    const ownerId = `owner-${hex(4)}`;
+    await createUser(db, ownerId);
+    const source = await fullCredential(ownerId);
+    const controlledId = await controlledNode(ownerId);
+    await db.execute(
+      'UPDATE servers SET controlled_capabilities = $2::jsonb WHERE id = $1',
+      [controlledId, JSON.stringify([REMOTE_DESKTOP_CAPABILITY])],
+    );
+
+    const browser = await (await app.request('/api/machines', { headers: webAuth(ownerId) })).json() as {
+      machines: { serverId: string; remoteDesktopHostId?: string }[];
+    };
+    const browserMachine = browser.machines.find((machine) => machine.serverId === controlledId);
+    expect(browserMachine?.remoteDesktopHostId).toMatch(/^[0-9a-f-]{36}$/);
+    expect(await db.queryOne<{ public_id: string }>(
+      `SELECT public_id FROM remote_desktop_public_ids
+        WHERE host_id = $1 AND status = 'active'`,
+      [browserMachine?.remoteDesktopHostId],
+    )).toMatchObject({ public_id: expect.stringMatching(/^[5-9][0-9]{9}$/) });
+
+    const daemon = await (await app.request('/api/machines', {
+      headers: { 'X-Server-Id': source.serverId, authorization: `Bearer ${source.token}` },
+    })).json() as { machines: Record<string, unknown>[] };
+    expect(daemon.machines.find((machine) => machine.serverId === controlledId))
+      .not.toHaveProperty('remoteDesktopHostId');
+  });
+
   it('shows a parseable node version to browsers, flags stale ones, and hides both from daemons', async () => {
     const app = buildApp();
     const ownerId = `owner-${hex(4)}`;

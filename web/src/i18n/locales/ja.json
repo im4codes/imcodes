@@ -3407,6 +3407,7 @@
     "login_screen_error_download_failed": "インストーラーを取得できませんでした。接続を確認して再試行してください",
     "login_screen_error_elevation_declined": "そのマシンで管理者の承認が得られませんでした",
     "access_owner_title": "Owner access",
+    "access_manage": "招待",
     "access_owner_hint": "Manage public remote-desktop access without exposing raw secrets on the remote screen.",
     "access_no_host": "Open or select a desktop before managing public access.",
     "access_refresh": "Refresh",

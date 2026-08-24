@@ -3407,6 +3407,7 @@
     "login_screen_error_download_failed": "설치 프로그램을 가져오지 못했습니다. 연결을 확인한 뒤 다시 시도하세요",
     "login_screen_error_elevation_declined": "해당 컴퓨터에서 관리자 승인을 받지 못했습니다",
     "access_owner_title": "Owner access",
+    "access_manage": "초대",
     "access_owner_hint": "Manage public remote-desktop access without exposing raw secrets on the remote screen.",
     "access_no_host": "Open or select a desktop before managing public access.",
     "access_refresh": "Refresh",

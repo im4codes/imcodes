@@ -24,15 +24,20 @@ export interface ControlledMachineAccessRow {
   node_role: string | null;
   /** The daemon this node was enrolled from, when it shares that machine. */
   host_server_id: string | null;
+  /** Canonical physical-host identity for remote-desktop presentation/management. */
+  remote_desktop_host_id: string | null;
 }
 
 const CONTROLLED_MACHINE_ACCESS_SELECT = `
   SELECT s.id, s.user_id, s.ref_name, s.display_name, s.status, s.node_role, s.host_server_id,
          s.last_heartbeat_at, s.exec_enabled, s.os, s.daemon_version, s.revoked_at,
          s.auto_unlock_configured, s.controlled_capabilities,
+         rdhe.host_id AS remote_desktop_host_id,
          CASE WHEN s.user_id = $1 THEN 'owner' ELSE sh.role END AS access_role,
          sh.expires_at AS access_expires_at
     FROM servers s
+    LEFT JOIN remote_desktop_host_endpoints rdhe
+      ON rdhe.server_id = s.id
     LEFT JOIN server_shares sh
       ON sh.server_id = s.id
      AND s.user_id <> $1

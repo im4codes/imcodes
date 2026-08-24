@@ -3408,6 +3408,7 @@
     "login_screen_error_download_failed": "安裝程式取得失敗，請檢查網路後重試",
     "login_screen_error_elevation_declined": "該機器上未確認管理員授權",
     "access_owner_title": "Owner access",
+    "access_manage": "邀請",
     "access_owner_hint": "Manage public remote-desktop access without exposing raw secrets on the remote screen.",
     "access_no_host": "Open or select a desktop before managing public access.",
     "access_refresh": "Refresh",

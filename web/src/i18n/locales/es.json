@@ -3408,6 +3408,7 @@
     "login_screen_error_download_failed": "No se pudo obtener el instalador: revisa la conexión y reinténtalo",
     "login_screen_error_elevation_declined": "No se concedió la aprobación de administrador en esa máquina",
     "access_owner_title": "Owner access",
+    "access_manage": "Invitaciones",
     "access_owner_hint": "Manage public remote-desktop access without exposing raw secrets on the remote screen.",
     "access_no_host": "Open or select a desktop before managing public access.",
     "access_refresh": "Refresh",

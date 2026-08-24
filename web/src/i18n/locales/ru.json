@@ -3407,6 +3407,7 @@
     "login_screen_error_download_failed": "Не удалось получить установщик — проверьте соединение и повторите",
     "login_screen_error_elevation_declined": "Подтверждение администратора на этой машине не получено",
     "access_owner_title": "Owner access",
+    "access_manage": "Приглашения",
     "access_owner_hint": "Manage public remote-desktop access without exposing raw secrets on the remote screen.",
     "access_no_host": "Open or select a desktop before managing public access.",
     "access_refresh": "Refresh",

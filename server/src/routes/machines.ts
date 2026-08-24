@@ -41,6 +41,7 @@ import {
   registerPendingAutoUnlock,
 } from '../ws/auto-unlock-registry.js';
 import { REMOTE_DESKTOP_INSTALLABLE_CAPABILITY } from '../../../shared/remote-desktop-install.js';
+import { backfillCanonicalHosts } from '../services/remote-desktop-host-identity.js';
 
 /** A node only has to reach its own disk, so this stays short. */
 const AUTO_UNLOCK_TIMEOUT_MS = 15_000;
@@ -61,6 +62,7 @@ interface ControlledRow {
   daemon_version: string | null;
   auto_unlock_configured: boolean;
   host_server_id: string | null;
+  remote_desktop_host_id: string | null;
   access_role: MachineAccessRole;
   controlled_capabilities: unknown;
 }
@@ -74,7 +76,13 @@ export async function listControlledMachines(
   db: Database,
   userId: string,
   nowMs: number,
-): Promise<{ machines: (MachineSummary & { refName: string; displayName: string; execEnabled: boolean; accessRole: MachineAccessRole })[]; overLimit: boolean }> {
+): Promise<{ machines: (MachineSummary & {
+  refName: string;
+  displayName: string;
+  execEnabled: boolean;
+  accessRole: MachineAccessRole;
+  remoteDesktopHostId?: string;
+})[]; overLimit: boolean }> {
   const rows: ControlledRow[] = await listAccessibleControlledMachines(
     db,
     userId,
@@ -104,6 +112,9 @@ export async function listControlledMachines(
       // keeps old MCP resolution logic from presenting a non-operable target.
       execEnabled: r.exec_enabled === true && r.access_role !== 'viewer',
       accessRole: r.access_role,
+      ...(typeof r.remote_desktop_host_id === 'string' && r.remote_desktop_host_id
+        ? { remoteDesktopHostId: r.remote_desktop_host_id }
+        : {}),
       ...(capabilities.ok && capabilities.value.length > 0 ? { capabilities: capabilities.value } : {}),
       ...(canonicalMachineOs(r.os) ? { os: canonicalMachineOs(r.os) } : {}),
       ...(typeof r.last_heartbeat_at === 'number' ? { lastSeenMs: r.last_heartbeat_at } : {}),
@@ -128,18 +139,32 @@ export async function listControlledMachines(
 // GET /api/machines — owned + actively shared controlled machines with DB-backed presence.
 machinesRoutes.get('/', requireAuth(), async (c) => {
   const userId = c.get('userId' as never) as string;
-  const { machines, overLimit } = await listControlledMachines(c.env.DB, userId, Date.now());
+  const now = Date.now();
+  // Browser discovery is also the bounded, resumable provisioning seam for an
+  // Owner whose remote-desktop node predates canonical host identity. This is
+  // idempotent and owner-scoped; strict daemon clients neither need nor receive
+  // the additive identity field.
+  const authenticatedDaemon = c.get('nodeRole') === NODE_ROLE.FULL
+    && typeof c.get('authServerId') === 'string';
+  if (!authenticatedDaemon) {
+    await backfillCanonicalHosts({
+      db: c.env.DB,
+      ownerUserId: userId,
+      limit: MACHINE_LIST_MAX_ITEMS,
+      now,
+    });
+  }
+  const { machines, overLimit } = await listControlledMachines(c.env.DB, userId, now);
   if (overLimit) {
     return c.json({ error: 'machine_list_over_limit', maxItems: MACHINE_LIST_MAX_ITEMS }, 413);
   }
   // Older daemons strictly reject unknown machine-list keys. Server-authenticated
   // callers do not need the display-only role because every action is admitted
   // again against the DB; preserve their legacy DTO during rolling upgrades.
-  const authenticatedDaemon = c.get('nodeRole') === NODE_ROLE.FULL
-    && typeof c.get('authServerId') === 'string';
   const responseMachines = authenticatedDaemon
     ? machines.map(({
       accessRole: _accessRole,
+      remoteDesktopHostId: _remoteDesktopHostId,
       capabilities: _capabilities,
       daemonVersion: _daemonVersion,
       updateAvailable: _updateAvailable,

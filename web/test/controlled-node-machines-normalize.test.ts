@@ -44,7 +44,7 @@ describe('controlled-node access-role normalization', () => {
   it('preserves valid shared roles, defaults an old-server omission to owner, and fails malformed roles closed', async () => {
     apiFetch.mockResolvedValueOnce({
       machines: [
-        { serverId: 'participant', refName: 'p', displayName: 'P', online: true, execEnabled: true, accessRole: 'participant' },
+        { serverId: 'participant', remoteDesktopHostId: 'host-p', refName: 'p', displayName: 'P', online: true, execEnabled: true, accessRole: 'participant' },
         { serverId: 'legacy-owner', refName: 'o', displayName: 'O', online: true, execEnabled: true },
         { serverId: 'malformed', refName: 'm', displayName: 'M', online: true, execEnabled: true, accessRole: 'administrator' },
       ],
@@ -56,6 +56,21 @@ describe('controlled-node access-role normalization', () => {
         ['legacy-owner', 'owner'],
         ['malformed', 'viewer'],
       ]);
+  });
+
+  it('preserves only a non-empty canonical remote-desktop host identity', async () => {
+    apiFetch.mockResolvedValueOnce({
+      machines: [
+        { serverId: 'canonical', remoteDesktopHostId: 'host-canonical', refName: 'c', online: true, execEnabled: true },
+        { serverId: 'empty', remoteDesktopHostId: '', refName: 'e', online: true, execEnabled: true },
+        { serverId: 'malformed', remoteDesktopHostId: 42, refName: 'm', online: true, execEnabled: true },
+      ],
+    });
+
+    const machines = await listControllableMachines();
+    expect(machines[0]?.remoteDesktopHostId).toBe('host-canonical');
+    expect(machines[1]).not.toHaveProperty('remoteDesktopHostId');
+    expect(machines[2]).not.toHaveProperty('remoteDesktopHostId');
   });
 
   it('surfaces a reported node version and the Server-computed upgrade flag', async () => {
