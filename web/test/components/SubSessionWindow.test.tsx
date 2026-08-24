@@ -1303,6 +1303,12 @@ describe('SubSessionWindow terminal subscription raw mode', () => {
     await waitFor(() => {
       expect(ws.subscribeTerminal).toHaveBeenCalledWith(sub.sessionName, false);
     });
+    expect(useTimelineSpy).toHaveBeenLastCalledWith(
+      sub.sessionName,
+      ws,
+      undefined,
+      { isActiveSession: false, isVisible: true },
+    );
   });
 
   it('does not replay an existing idle flash token when the window remounts', async () => {

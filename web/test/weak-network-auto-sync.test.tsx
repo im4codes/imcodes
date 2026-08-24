@@ -167,22 +167,22 @@ describe('weak-network auto-sync (cycle 1 validation)', () => {
     expect(fetchSpy).toHaveBeenCalledTimes(1);
   });
 
-  it('visible-but-not-focused session catches up on resume (isVisible gate)', async () => {
+  it('visible-but-not-focused session defers global resume recovery until it becomes active', async () => {
     const sessionName = `deck_weaknet_visible_${Date.now()}`;
     const serverId = `srv-weaknet-visible-${Date.now()}`;
     fetchSpy.mockResolvedValue({ events: [], epoch: 1, hasMore: false, nextCursor: null });
     seedEvent(sessionName, serverId, 1000, `${sessionName}-seed`);
 
     const ws = makeWs();
-    function Probe() {
+    function Probe({ active }: { active: boolean }) {
       // Not the active session, but mounted and visible (e.g. an open
       // sub-session card / window on desktop).
-      const { events } = useTimeline(sessionName, ws, serverId, { isActiveSession: false, isVisible: true });
+      const { events } = useTimeline(sessionName, ws, serverId, { isActiveSession: active, isVisible: true });
       return h('div', { 'data-testid': 'probe' }, String(events.length));
     }
 
     vi.useFakeTimers({ shouldAdvanceTime: true });
-    render(h(Probe));
+    const view = render(h(Probe, { active: false }));
     await waitFor(() => {
       expect(screen.getByTestId('probe').textContent).toBe('1');
     });
@@ -191,13 +191,17 @@ describe('weak-network auto-sync (cycle 1 validation)', () => {
     await act(async () => { await vi.advanceTimersByTimeAsync(300); });
     fetchSpy.mockClear();
 
-    // Resume broadcast (focus / visibility / app foreground). Before the gate
-    // fix this was silently dropped for non-active sessions; now it backfills.
+    // A process-wide resume broadcast must not fan out to every visible card.
     await act(async () => {
       window.dispatchEvent(new CustomEvent(ACTIVE_TIMELINE_REFRESH_EVENT));
       await vi.advanceTimersByTimeAsync(50);
     });
+    expect(fetchSpy).not.toHaveBeenCalled();
 
+    // The same passive timeline catches up immediately when the user focuses
+    // it, so suppressing the resume herd does not strand its history.
+    view.rerender(h(Probe, { active: true }));
+    await act(async () => { await vi.advanceTimersByTimeAsync(50); });
     expect(fetchSpy).toHaveBeenCalledTimes(1);
     const call = fetchSpy.mock.calls.at(-1) as [string, string, { timeoutMs?: number }];
     expect(call[0]).toBe(serverId);
@@ -206,10 +210,7 @@ describe('weak-network auto-sync (cycle 1 validation)', () => {
     expect(call[2].timeoutMs).toBeLessThan(15000);
   });
 
-  // Known gap (round-4 Cx1#1): the visible-but-not-active MOUNT path (HTTP
-  // backfill at useTimeline.ts and WS forward-history `requestDaemonHistory`)
-  // is still `isActiveSession`-gated. Only the activation-event path above is
-  // fixed. A visible card therefore waits for a resume broadcast instead of
-  // catching up on mount. Tracked for cycle-2 (shared job + refreshEligible).
-  it.todo('visible-non-active MOUNT catches up within a bounded delay without waiting for a resume broadcast');
+  // Visible passive mounts intentionally catch up on focus. Making them all
+  // participate in the process-wide resume broadcast caused an N-session
+  // recovery storm after long lock/sleep intervals.
 });

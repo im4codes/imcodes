@@ -293,10 +293,10 @@ export function SubSessionWindow({
     loadOlderEvents,
     loadMessageContext,
   } = useTimeline(sub.sessionName, ws, serverId, {
-    // Any visible sub-session window is user-visible work, even when it is not
-    // the focused/topmost one. Hidden retained windows keep their hook state
-    // but pause history/replay/retry work until the owning tab is visible.
-    isActiveSession: visible,
+    // Exactly one focused/topmost window owns opportunistic recovery. Other
+    // visible windows stay subscribed and cache-warm, but must not all launch
+    // HTTP/IDB work together when the browser resumes after sleep.
+    isActiveSession: active,
     isVisible: visible,
   });
 

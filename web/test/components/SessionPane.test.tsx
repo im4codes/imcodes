@@ -122,6 +122,37 @@ describe('SessionPane', () => {
     cleanup();
   });
 
+  it('keeps the main timeline passive while a sub-session owns keyboard focus', () => {
+    render(
+      <SessionPane
+        serverId="s1"
+        session={{
+          name: 'deck_test_brain',
+          project: 'test',
+          role: 'brain',
+          agentType: 'codex',
+          state: 'idle',
+          projectDir: '/tmp/test',
+        } as any}
+        sessions={[]}
+        subSessions={[]}
+        ws={null}
+        connected={false}
+        isActive={true}
+        keyboardActive={false}
+        viewMode="chat"
+        quickData={{} as any}
+      />,
+    );
+
+    expect(useTimelineMock).toHaveBeenCalledWith(
+      'deck_test_brain',
+      null,
+      's1',
+      expect.objectContaining({ isActiveSession: false }),
+    );
+  });
+
   it('renders UsageFooter for codex CLI when only quota metadata exists', () => {
     render(
       <SessionPane

@@ -706,6 +706,16 @@ function flushPendingTimelineSnapshotWrites(): void {
 
 function persistTimelineSnapshotsBeforeFreeze(): void {
   for (const [cacheKey, cachedEvents] of eventsCache.entries()) {
+    // Ordinary (non-streaming) tails are already covered by the debounced
+    // snapshot writer, which flushSnapshotsBeforeFreeze() drains immediately
+    // before this pass. Re-serializing every retained session here turns a
+    // screen lock/pagehide into an O(all sessions x tail payload) synchronous
+    // main-thread task. On workspaces with many open timelines Chromium can
+    // resume the compositor while that task is still monopolizing JS, leaving
+    // animations alive but clicks and reload unresponsive. The only data that
+    // needs this extra crash-mat write is the streaming text intentionally
+    // excluded from the normal snapshot/IDB path.
+    if (!cachedEvents.some((event) => event.payload?.streaming === true)) continue;
     const tail = getPersistableTimelineTail(cachedEvents, { includeStreaming: true });
     persistTimelineSnapshotTail(cacheKey, tail);
   }
@@ -1185,19 +1195,17 @@ export interface UseTimelineResult {
 
 export interface UseTimelineOptions {
   /**
-   * Only the active/visible timeline should trigger opportunistic HTTP
+   * Only the active timeline should trigger opportunistic HTTP
    * backfills. Inactive mounted timelines still stay warm via cache + WS
    * events, but they must not hammer `/timeline/history/full`.
    */
   isActiveSession?: boolean;
   /**
-   * Resume-broadcast eligibility: when `true`, the hook participates in the
-   * `ACTIVE_TIMELINE_REFRESH_EVENT` broadcast even if it isn't the active
-   * session. Used by visible-but-not-focused sub-session cards / windows so
-   * that a desktop with multiple open cards catches up on focus/visibility
-   * resume (gated by the same 15s success-only `ACTIVE_REFRESH_COOLDOWN_MS`,
-   * so multi-card resume is still rate-limited per session). Defaults to
-   * `isActiveSession` for back-compat.
+   * Presentation visibility. Visible inactive timelines stay subscribed and
+   * remain eligible for explicit per-session refresh, but a global browser
+   * resume only refreshes the focused/active timeline. This prevents a lock
+   * screen resume from creating one HTTP/IDB recovery job per open window.
+   * Defaults to `isActiveSession` for back-compat.
    */
   isVisible?: boolean;
   /**
@@ -2995,11 +3003,12 @@ export function useTimeline(
     // stream idled but is still streaming, the terminal was almost certainly
     // dropped: fire one immediate latest-window catch-up so it reconciles in
     // ~STREAMING_IDLE_PERSIST_MS instead of ~45s. Only from the idle timer (not a
-    // session-switch / unmount flush) and only for the still-current, active/visible
+    // session-switch / unmount flush) and only for the still-current, active
     // session; the HTTP backfill is a pure eventId-dedup merge, so a rare
-    // slightly-late terminal just no-ops.
+    // slightly-late terminal just no-ops. Only the focused presentation owns
+    // this opportunistic repair; open preview cards must not each start one.
     if (fromIdleTimer && hasStuckStream && key === cacheKeyRef.current
-      && (isActiveSessionRef.current || isVisibleRef.current)) {
+      && isActiveSessionRef.current) {
       fireHttpBackfillRef.current(0, { phase: 'refresh', visible: false, force: true, mode: 'manualLatestWindow' });
     }
   }, []);
@@ -3393,7 +3402,7 @@ export function useTimeline(
       return;
     }
     if (loading || refreshing || httpRefreshing) return; // another recovery path is still running
-    if (!isActiveSessionRef.current && !isVisibleRef.current) return;
+    if (!isActiveSessionRef.current) return;
     if (blankSelfHealRef.current === key) return;  // already self-healed this key
     fireBlankPaneRecovery(isActiveSessionRef.current);
   }, [
@@ -3422,7 +3431,7 @@ export function useTimeline(
       staleToolSelfHealRef.current = null;
       return;
     }
-    if (!isActiveSessionRef.current && !isVisibleRef.current) return;
+    if (!isActiveSessionRef.current) return;
     let newestToolCallEventId = 'anonymous';
     for (let index = events.length - 1; index >= 0; index -= 1) {
       if (events[index]?.type === 'tool.call') {
@@ -3463,12 +3472,13 @@ export function useTimeline(
   useEffect(() => {
     if (disableHistory) return;
     const handler = (): void => {
-      // Resume broadcast: refresh if either the hook is the active session
-      // OR it is a visible-but-not-focused mount (open sub-session card / window).
-      // The downstream 15s success-only cooldown still rate-limits each session
-      // so multiple visible cards on desktop don't herd the daemon.
-      if (!isActiveSessionRef.current && !isVisibleRef.current) {
-        backfillDebug('activation event: gated by !isActiveSession && !isVisible', { sessionId });
+      // A resume broadcast is process-wide. Only the focused timeline may do
+      // recovery work; visible-but-inactive cards/windows stay warm through
+      // cache + WS and catch up when they become active. Per-session cooldowns
+      // cannot prevent an N-session herd because every session has a distinct
+      // key and a long resume deliberately resets those cooldowns.
+      if (!isActiveSessionRef.current) {
+        backfillDebug('activation event: gated by !isActiveSession', { sessionId });
         return;
       }
       const now = Date.now();
@@ -3565,7 +3575,7 @@ export function useTimeline(
   // reconnected, and no focus/visibility tick fired — so none of the existing
   // catch-up triggers run and the chat just sits there stale. This is the core
   // "弱网前台停留不自动同步" complaint. Periodically, while foreground and
-  // active/visible, check whether the stream has gone quiet beyond
+  // active, check whether the stream has gone quiet beyond
   // WATCHDOG_STALE_MS (no content event AND no HTTP response) and, if so, fire
   // ONE silent catch-up. Any non-null HTTP response advances the staleness
   // baseline via `lastHttpBackfillResponseAt` (NOT a verified-contiguous signal),
@@ -3575,7 +3585,7 @@ export function useTimeline(
     if (disableHistory || typeof window === 'undefined') return;
     const tick = (): void => {
       if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return;
-      if (!isActiveSessionRef.current && !isVisibleRef.current) return;
+      if (!isActiveSessionRef.current) return;
       if (!serverId || !sessionId) return;
       // HTTP backfill is independent of the socket, but if the WS is down the
       // reconnect path already owns recovery; the watchdog targets the

@@ -166,10 +166,14 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
   const timeline = isShell
     ? { events: [], refreshing: false, addOptimisticUserMessage: undefined, retryOptimisticMessage: undefined }
     : useTimeline(sub.sessionName, ws, serverId, {
-      // Open cards are active timeline consumers even when not focused. Keeping
-      // only the focused card active let open sub-session previews miss history
-      // retry/replay until the user clicked or switched windows.
-      isActiveSession: !!(isOpen || isFocused),
+      // Only the focused card owns opportunistic recovery. Open-but-unfocused
+      // cards remain visible/subscribed below, and catch up when focused,
+      // without multiplying resume work by the number of open cards.
+      // When the corresponding floating window is open it is the sole active
+      // presentation. The bar card remains a passive preview; otherwise the
+      // same session owns two hook-local recovery timers and can issue the
+      // same resume fetch twice before either request records its cooldown.
+      isActiveSession: !!isFocused && !isOpen,
       // Keep the live timeline hook attached even while preview hydration is
       // delayed. Without this, sub-session cards miss the typewriter phase and
       // only jump to cached/final text when the timer flips `timelineHydrated`.

@@ -1110,6 +1110,51 @@ describe('useTimeline global cache bounds', () => {
     expect(putEventsSpy).not.toHaveBeenCalled();
   });
 
+  it('pagehide only reserializes caches with in-flight streaming text', async () => {
+    vi.useFakeTimers();
+    const serverId = `srv-freeze-${Date.now()}`;
+    const stableSession = `deck_freeze_stable_${Date.now()}`;
+    const streamingSession = `deck_freeze_streaming_${Date.now()}`;
+    const stableKey = `rcc_timeline_snapshot:${serverId}:${stableSession}`;
+    const streamingKey = `rcc_timeline_snapshot:${serverId}:${streamingSession}`;
+
+    for (const sessionName of [stableSession, streamingSession]) {
+      ingestTimelineEventForCache({
+        eventId: `${sessionName}-stable`,
+        sessionId: sessionName,
+        ts: 1,
+        epoch: 1,
+        seq: 1,
+        source: 'daemon',
+        confidence: 'high',
+        type: 'assistant.text',
+        payload: { text: 'stable' },
+      }, serverId);
+    }
+    await act(async () => { await vi.advanceTimersByTimeAsync(750); });
+    expect(localStorage.getItem(stableKey)).toBeTruthy();
+    expect(localStorage.getItem(streamingKey)).toBeTruthy();
+
+    ingestTimelineEventForCache({
+      eventId: `${streamingSession}-streaming`,
+      sessionId: streamingSession,
+      ts: 2,
+      epoch: 1,
+      seq: 2,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'assistant.text',
+      payload: { text: 'partial', streaming: true },
+    }, serverId);
+
+    const setItemSpy = vi.spyOn(localStorage, 'setItem');
+    window.dispatchEvent(new Event('pagehide'));
+
+    expect(setItemSpy).toHaveBeenCalledTimes(1);
+    expect(setItemSpy).toHaveBeenCalledWith(streamingKey, expect.stringContaining('partial'));
+    expect(setItemSpy).not.toHaveBeenCalledWith(stableKey, expect.anything());
+  });
+
   it('does not persist streaming-only global ingests to IndexedDB', async () => {
     const sessionName = `deck_streaming_idb_${Date.now()}`;
     const serverId = `srv-${Date.now()}`;
