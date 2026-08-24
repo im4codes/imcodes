@@ -492,6 +492,8 @@
     "delivery_mode_append": "Добавить",
     "delivery_mode_queue_description": "Отправить после завершения текущего ответа",
     "delivery_mode_append_description": "Добавить к текущему ответу на следующей безопасной границе провайдера",
+    "delivery_mode_queue_toast": "Текущий режим: очередь",
+    "delivery_mode_append_toast": "Текущий режим: добавление",
     "confirm_restart": "Подтвердить перезапуск?",
     "new": "+ Новая",
     "start_fresh": "Начать заново",

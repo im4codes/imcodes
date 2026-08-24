@@ -111,6 +111,8 @@ vi.mock('react-i18next', () => ({
       if (key === 'session.delivery_mode_append') return 'Append';
       if (key === 'session.delivery_mode_queue_description') return 'Wait until the current reply finishes';
       if (key === 'session.delivery_mode_append_description') return 'Add to the current reply at the next safe boundary';
+      if (key === 'session.delivery_mode_queue_toast') return 'Current mode: Queue';
+      if (key === 'session.delivery_mode_append_toast') return 'Current mode: Append';
       if (key === 'session.composer_target_label') return 'Sending to';
       if (key === 'session.composer_target_aria') {
         return `Message target: ${String(opts?.name ?? '')}`;
@@ -1025,6 +1027,30 @@ afterEach(() => {
       expect.stringContaining('btn-attachment-embedded'),
     ]);
     expect(screen.getAllByTitle('upload_file')).toHaveLength(1);
+  });
+
+  it('shows the current delivery mode in a toast after each mobile toggle', () => {
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 390 });
+    render(
+      <SessionControls
+        ws={makeWs() as any}
+        activeSession={makeTransportSession({ name: 'transport-mobile-toast' })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', {
+      name: 'Queue: Wait until the current reply finishes',
+    }));
+    const appendToast = screen.getByText('Current mode: Append').closest('[role="status"]');
+    expect(appendToast?.classList.contains('is-append')).toBe(true);
+
+    fireEvent.click(screen.getByRole('button', {
+      name: 'Append: Add to the current reply at the next safe boundary',
+    }));
+    const queueToast = screen.getByText('Current mode: Queue').closest('[role="status"]');
+    expect(queueToast?.classList.contains('is-queue')).toBe(true);
+    expect(screen.queryByText('Current mode: Append')).toBeNull();
   });
 
   it('hides the embedded voice button after typing on mobile', () => {

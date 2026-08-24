@@ -1541,11 +1541,13 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const uploadError = uploadSnapshot.error;
   const [sendWarning, setSendWarning] = useState<string | null>(null);
   const [appendSuccessNotice, setAppendSuccessNotice] = useState<string | null>(null);
+  const [deliveryModeNotice, setDeliveryModeNotice] = useState<{ append: boolean; message: string } | null>(null);
   const [attachments, setAttachments] = useState<ComposerAttachmentRecord[]>([]);
   const [deletingAttachmentKeys, setDeletingAttachmentKeys] = useState<Set<string>>(() => new Set());
   const [pendingDelegateTarget, setPendingDelegateTarget] = useState<PendingDelegateTarget | null>(null);
   const sendWarningTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const appendSuccessTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const deliveryModeNoticeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [localTransportConfig, setLocalTransportConfig] = useState<Record<string, unknown> | null>(activeSession?.transportConfig ?? null);
 
   // Keep external inputRef in sync so parent can call .focus()
@@ -1633,6 +1635,17 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       setAppendSuccessNotice(null);
     }, 3500);
   }, []);
+  const showDeliveryModeNotice = useCallback((append: boolean) => {
+    if (deliveryModeNoticeTimerRef.current) clearTimeout(deliveryModeNoticeTimerRef.current);
+    setDeliveryModeNotice({
+      append,
+      message: t(append ? 'session.delivery_mode_append_toast' : 'session.delivery_mode_queue_toast'),
+    });
+    deliveryModeNoticeTimerRef.current = setTimeout(() => {
+      deliveryModeNoticeTimerRef.current = null;
+      setDeliveryModeNotice(null);
+    }, 2200);
+  }, [t]);
   const transportQueueAppendFailedLabel = t('session.transport_queue_append_failed');
 
   // Persist input draft across unmount/remount (sub-session minimize/restore)
@@ -1682,6 +1695,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   useEffect(() => () => {
     if (sendWarningTimerRef.current) clearTimeout(sendWarningTimerRef.current);
     if (appendSuccessTimerRef.current) clearTimeout(appendSuccessTimerRef.current);
+    if (deliveryModeNoticeTimerRef.current) clearTimeout(deliveryModeNoticeTimerRef.current);
   }, []);
 
   useEffect(() => {
@@ -2396,7 +2410,14 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
 
   // Reset P2P mode on session change
   useEffect(() => { setP2pMode('solo'); setP2pOpen(false); }, [activeSession?.name]);
-  useEffect(() => { setDirectAppendMode(false); }, [activeSession?.name]);
+  useEffect(() => {
+    setDirectAppendMode(false);
+    setDeliveryModeNotice(null);
+    if (deliveryModeNoticeTimerRef.current) {
+      clearTimeout(deliveryModeNoticeTimerRef.current);
+      deliveryModeNoticeTimerRef.current = null;
+    }
+  }, [activeSession?.name]);
   useEffect(() => { setCloneDialogOpen(false); }, [activeSession?.name]);
   useEffect(() => {
     setPendingComboSendConfirm(null);
@@ -4885,6 +4906,11 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const deliveryModeDescription = directAppendMode
     ? t('session.delivery_mode_append_description')
     : t('session.delivery_mode_queue_description');
+  const handleDeliveryModeToggle = () => {
+    const append = !directAppendMode;
+    setDirectAppendMode(append);
+    if (isMobileLayout) showDeliveryModeNotice(append);
+  };
   const showCompactMetaControls = !!(openSpecChangesPath || isClaudeCode || isCodex || isQwen || supportsThinking || !isShellLike);
   const composerSubSession = subSessionId
     ? subSessions?.find((session) => session.sessionName === activeSession?.name)
@@ -4952,6 +4978,19 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       <div class="queue-append-success-toast" role="status" aria-live="polite">
         <span class="queue-append-success-toast-icon" aria-hidden="true">↗</span>
         <span>{appendSuccessNotice}</span>
+      </div>,
+      document.body,
+    )}
+    {deliveryModeNotice && typeof document !== 'undefined' && createPortal(
+      <div
+        class={`queue-append-success-toast composer-delivery-mode-toast${deliveryModeNotice.append ? ' is-append' : ' is-queue'}`}
+        role="status"
+        aria-live="polite"
+      >
+        <span class="queue-append-success-toast-icon composer-delivery-mode-toast-icon" aria-hidden="true">
+          <ComposerDeliveryModeIcon append={deliveryModeNotice.append} />
+        </span>
+        <span>{deliveryModeNotice.message}</span>
       </div>,
       document.body,
     )}
@@ -6136,7 +6175,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           <button
             type="button"
             class={`composer-delivery-mode composer-delivery-mode-desktop${directAppendMode ? ' is-append' : ' is-queue'}`}
-            onClick={() => setDirectAppendMode((enabled) => !enabled)}
+            onClick={handleDeliveryModeToggle}
             aria-pressed={directAppendMode}
             aria-label={`${deliveryModeLabel}: ${deliveryModeDescription}`}
             title={deliveryModeDescription}
@@ -6694,7 +6733,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           <button
             type="button"
             class={`composer-delivery-mode composer-delivery-mode-mobile${directAppendMode ? ' is-append' : ' is-queue'}`}
-            onClick={() => setDirectAppendMode((enabled) => !enabled)}
+            onClick={handleDeliveryModeToggle}
             aria-pressed={directAppendMode}
             aria-label={`${deliveryModeLabel}: ${deliveryModeDescription}`}
             title={deliveryModeDescription}

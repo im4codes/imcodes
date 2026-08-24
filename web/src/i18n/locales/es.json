@@ -492,6 +492,8 @@
     "delivery_mode_append": "Añadir",
     "delivery_mode_queue_description": "Enviar cuando termine la respuesta actual",
     "delivery_mode_append_description": "Añadir a la respuesta actual en el siguiente punto seguro del proveedor",
+    "delivery_mode_queue_toast": "Modo actual: En cola",
+    "delivery_mode_append_toast": "Modo actual: Añadir",
     "confirm_restart": "¿Confirmar reinicio?",
     "new": "+ Nuevo",
     "start_fresh": "Empezar de nuevo",

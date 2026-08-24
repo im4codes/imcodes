@@ -492,6 +492,8 @@
     "delivery_mode_append": "Append",
     "delivery_mode_queue_description": "Wait until the current reply finishes",
     "delivery_mode_append_description": "Add to the current reply at the provider's next safe boundary",
+    "delivery_mode_queue_toast": "Current mode: Queue",
+    "delivery_mode_append_toast": "Current mode: Append",
     "confirm_restart": "Confirm restart?",
     "new": "+ New",
     "start_fresh": "Start fresh",
