@@ -341,6 +341,25 @@ const COMPLETED_PRE_AUDIT_WORK_RE = /(?:\b(?:implementation|fix(?:es)?|coding|ch
 const PENDING_PRE_AUDIT_WORK_RE = /(?:\b(?:still|yet|remaining|pending|missing|failed?|incomplete|need(?:s)?\s+to|must)\b[\s\S]{0,50}\b(?:implementation|fix(?:es)?|tests?|testing|typecheck|lint|build|verification|validation)\b|\b(?:implementation|fix(?:es)?|tests?|testing|typecheck|lint|build|verification|validation)\b[\s\S]{0,50}\b(?:remain(?:s|ing)?|pending|missing|fail(?:ed|ing)?|incomplete|not\s+(?:done|complete)|need(?:s)?|required)\b|(?:仍|还|尚|待|未|缺少|失败)[\s\S]{0,30}(?:测试|验证|修复|实现|构建|类型检查)|(?:测试|验证|修复|实现|构建|类型检查)[\s\S]{0,30}(?:未完成|仍需|还需|待处理|失败|缺失|未通过))/iu;
 const NEW_AUDIT_DELEGATION_RE = /(?:\b(?:send|dispatch|delegate|construct|prepare)\b[\s\S]{0,100}\b(?:reply[- ]enabled|peer\s+audit|independent\s+(?:audit|review)|audit\s+brief)\b|\b(?:reply[- ]enabled|peer\s+audit|audit\s+brief)\b[\s\S]{0,100}\b(?:send|dispatch|delegate|construct|prepare)\b|(?:发送|补发|构造|准备|委派|发起)[\s\S]{0,80}(?:带回复|可回复|独立)?(?:审计|审核|复审)(?:简报|任务|请求)?)/iu;
 const POST_AUDIT_REPOSITORY_FINALIZATION_ACTION = 'Peer-audit has passed. Perform only the already-audited repository or delivery finalization requested for this task (stage/commit/push, merge, release, publish, or deploy as applicable). Do not perform additional implementation work. Do not request or start another audit.';
+const COMPLETED_REPOSITORY_FINALIZATION_RE = /(?:\bcommit\s*:\s*[0-9a-f]{7,40}\b|\bpush\s*:\s*(?:origin\/)?[^\s]+\s+(?:succeeded|successful|done|complete)|\b(?:committed|pushed|merged|released|published|deployed)\b|(?:已完成并)?(?:提交并推送|提交且推送)|(?:已|成功)(?:提交|推送|合并|发布|部署)|推送成功)/iu;
+const AUDIT_WORTHY_TASK_RE = /(?:\b(?:implement|fix|add|remove|delete|change|modify|update|refactor|optimi[sz]e|build|configure|migrate|install|uninstall)\b|(?:修复|实现|新增|添加|删除|修改|改成|调整|重构|优化|美化|配置|迁移|安装|卸载))/iu;
+const COMPLETED_ENGINEERING_WORK_RE = /(?:\b(?:implemented|fixed|added|removed|deleted|changed|modified|updated|refactored|optimized|built|configured|migrated|installed|uninstalled)\b|\b(?:implementation|fix(?:es)?|changes?|tests?|typecheck|lint|build|validation|verification)\b[\s\S]{0,60}\b(?:complete|completed|done|passed)\b|(?:已|已经)(?:完成|实现|修复|新增|添加|删除|修改|调整|重构|优化|美化|配置|迁移|安装|卸载)|(?:实现|修复|改动|测试|验证|类型检查|构建)[\s\S]{0,30}(?:完成|通过))/iu;
+
+/**
+ * Fail-safe for an arbiter that incorrectly labels a completion report as
+ * read-only. The model still decides proportional audit depth, but it cannot
+ * waive audit after observable engineering work or repository finalization.
+ */
+function turnHasDeterministicAuditEvidence(
+  taskRequest: string,
+  assistantResponse: string | undefined,
+): boolean {
+  const response = assistantResponse?.trim() ?? '';
+  if (!response) return false;
+  if (COMPLETED_REPOSITORY_FINALIZATION_RE.test(response)) return true;
+  return AUDIT_WORTHY_TASK_RE.test(taskRequest)
+    && COMPLETED_ENGINEERING_WORK_RE.test(response);
+}
 
 type RepositoryFinalizationClassification = 'none' | 'finalization_only' | 'completion_evidenced_mixed';
 
@@ -1644,8 +1663,10 @@ class SupervisionAutomation {
     this.clearWaitingTimeout(latest);
     const reportedAuditPass = !latest.freshAuditRequiredAfterRework
       && parseExplicitAuditVerdict(latest.lastAssistantText ?? '') === 'PASS';
+    const deterministicAuditRequired = latest.snapshot.mode === SUPERVISION_MODE.SUPERVISED_AUDIT
+      && turnHasDeterministicAuditEvidence(latest.userText, latest.lastAssistantText);
     latest.requiresAudit = latest.freshAuditRequiredAfterRework
-      || (!reportedAuditPass && decision.requiresAudit !== false);
+      || (!reportedAuditPass && (decision.requiresAudit !== false || deterministicAuditRequired));
     // A rework round re-opens the full surface: the previous verdict already
     // said the narrow read was not enough.
     latest.auditDepth = latest.freshAuditRequiredAfterRework ? 'standard' : decision.auditDepth ?? 'standard';

@@ -395,6 +395,42 @@ describe('SupervisionAutomation', () => {
     ]));
   });
 
+  it('forces peer audit when the supervisor misclassifies completed engineering and push as read-only', async () => {
+    const snapshot = await seedSession('supervised_audit');
+    mockSupervisionDecide.mockResolvedValueOnce({
+      decision: 'complete',
+      reason: 'The completion report needs no additional review.',
+      confidence: 0.97,
+      requiresAudit: false,
+    });
+
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent(
+      'deck_supervision_brain',
+      'cmd-model-skipped-audit',
+      '修复桌面墙独立打开和状态恢复，然后提交并推送',
+      snapshot,
+    );
+    beginRun('cmd-model-skipped-audit', '修复桌面墙独立打开和状态恢复，然后提交并推送');
+    completeTurn([
+      '全量 Web 测试与生产构建已经通过。',
+      '已完成并推送到 dev。',
+      '- Commit: 6cb4ac9ce fix(remote-desktop): expose wall state and standalone view',
+      '- Push: origin/dev 成功',
+    ].join('\n'));
+    await sleep(25);
+
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
+    expect(String(mockTransportRuntime.send.mock.calls[0]?.[0])).toContain('Automatic audit attempt ID:');
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({
+      phase: 'auditing',
+      requiresAudit: false,
+    });
+    completeDelegatedAudit('PASS', 'Forced audit cleanup passed.');
+    await sleep(25);
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
+  });
+
   it('adopts an existing reply-enabled audit delegation and sends no second request before its receipt', async () => {
     const snapshot = await seedSession('supervised_audit');
 

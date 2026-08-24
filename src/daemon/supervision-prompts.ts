@@ -77,6 +77,21 @@ function buildAuditBeforeFinalizationRule(request: SupervisionBrokerRequest): st
   ].join('\n');
 }
 
+/**
+ * Agent-only execution guard injected with the original user task.
+ *
+ * The completion arbiter runs after the agent turn, so a prompt that exists
+ * only in the arbiter cannot stop an eager agent from committing/pushing in
+ * that same turn. Supervised-audit sessions therefore carry this short rule at
+ * execution time as well: finish the reviewable work, then let the daemon
+ * arrange the independent audit before repository/delivery finalization.
+ */
+export const SUPERVISED_AUDIT_EXECUTION_PREAMBLE = [
+  'Automatic peer-audit mode is enabled for this task.',
+  'Complete the implementation and all pre-audit validation, but DO NOT run git add, commit, push, merge, release, publish, deploy, or any other repository/delivery finalization in this turn, even when the user requested final delivery.',
+  'When the substantive work is ready, stop and report the exact implementation and validation evidence. The daemon will arrange the independent peer audit; finalization is allowed only after that matching audit returns PASS and automation explicitly resumes the task.',
+].join(' ');
+
 export interface PeerAuditBriefV1Input {
   attemptId: string;
   replyCapability: string;
@@ -282,6 +297,7 @@ export function buildSupervisionDecisionPrompt(
     '- reason: short human-readable explanation of the decision.',
     '- confidence: number in [0,1].',
     '- requiresAudit: boolean meaning "must automation start a NEW peer audit now?" Decide this in the SAME judgment; do not request another model call. Set true for substantive engineering work such as implementation/development, source or configuration changes, bug fixes, complex debugging/root-cause investigation, deployment/runtime mutation, or repository finalization that has not yet been audited. Set false for ordinary read-only checks, status queries, lookups, explanations, simple verification, and read-only review/audit. Also set false when the current task already delegated a matching audit and is waiting for PASS/REWORK, or when that audit already passed; never recursively audit an audit-status turn. A task that starts as a check but proceeds to modify/fix something requires audit unless its matching audit is already pending or passed.',
+    '- If the assistant reports that it changed source/configuration, completed a bug fix or implementation, or performed git commit/push/merge/release/deploy, requiresAudit MUST be true unless the recent evidence contains a matching audit PASS for this exact work. Do not reinterpret completed engineering work as a read-only status check merely because the response is phrased as a completion report.',
     '- gap: REQUIRED when decision is continue — describe the specific missing artifact/state/verification that blocks calling the task complete. Keep it concrete (e.g. "tests for the new guardrail are not written", "staged diff not yet committed to git").',
     '- nextAction: REQUIRED when decision is continue — imperative instruction for the agent\'s next turn. Must be concrete and executable, e.g. "Run `npm test` and fix any failing spec", "Commit staged changes with message X and push to origin/dev". DO NOT write vague fillers like "keep going", "continue", "finish the task", "继续完成任务" — those are rejected and force-escalated to ask_human.',
     '- extra: optional object reserved for future metadata; return {} if you have nothing to add.',
@@ -319,6 +335,7 @@ export function buildSupervisionDecisionRepairPrompt(
     'Return exactly one valid JSON object and nothing else.',
     '{"decision":"complete|continue|waiting|ask_human","reason":"...","confidence":0.0,"requiresAudit":true,"auditDepth":"standard|narrow","gap":"...","nextAction":"...","extra":{}}',
     'requiresAudit is REQUIRED and means whether automation must start a NEW peer audit now: true for substantive implementation/modification/fixes/complex debugging/deployment or repository finalization not yet audited; false for ordinary read-only checks and when a matching audit is already delegated, awaiting PASS/REWORK, or has passed.',
+    'If the assistant reports source/configuration changes, a completed fix/implementation, or git commit/push/merge/release/deploy, requiresAudit MUST be true unless recent evidence contains a matching audit PASS for this exact work. A completion report is evidence of engineering work, not a read-only status check.',
     'When decision is continue, BOTH gap and nextAction are required; nextAction must be a concrete imperative instruction, not a filler like "keep going" / "继续完成任务". If you cannot name a concrete next action, return ask_human instead — a vague continue is always downgraded to ask_human anyway.',
     'If the assistant response mentions remaining implementation work like tests, fixes, verification, commit/push, or another concrete next engineering step, return continue with a nextAction that names the exact command or deliverable.',
     'USER-SET SUPERVISION RULES in the block below are AUTHORITATIVE and override the generic heuristics above. If a user rule uses blanket wording ("always", "每次", "必须", "绝不") or applies conditionally to the current topic (a rule like "Always commit and push if asked!" applies whenever the conversation is about committing / pushing / uncommitted changes, even if the user just asked a status question), return `continue` with a nextAction that enforces the rule. Do not treat a factual answer as `complete` when it violates a user-set rule.',

@@ -3915,7 +3915,12 @@ describe('handleWebCommand transport queue behavior', () => {
     }, serverLink as any);
     await flushAsync();
 
-    expect(transportSend).toHaveBeenCalledWith('implement the feature', 'cmd-heavy');
+    expect(transportSend).toHaveBeenCalledWith(
+      'implement the feature',
+      'cmd-heavy',
+      undefined,
+      expect.stringContaining('Automatic peer-audit mode is enabled for this task.'),
+    );
     expect(registerTaskIntentMock).toHaveBeenCalledWith(
       'deck_transport_brain',
       'cmd-heavy',

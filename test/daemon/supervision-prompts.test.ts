@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { normalizeSessionSupervisionSnapshot, SUPERVISION_MODE } from '../../shared/supervision-config.js';
 import {
+  SUPERVISED_AUDIT_EXECUTION_PREAMBLE,
   buildPeerAuditBriefV1,
   buildReworkBriefPrompt,
   buildSupervisionContinuePrompt,
@@ -10,6 +11,12 @@ import {
 import { PEER_AUDIT_BRIEF_TOTAL_BYTES, peerAuditByteLength } from '../../shared/peer-audit.js';
 
 describe('supervision prompts', () => {
+  it('gates repository finalization in the original supervised-audit execution turn', () => {
+    expect(SUPERVISED_AUDIT_EXECUTION_PREAMBLE).toContain('DO NOT run git add, commit, push');
+    expect(SUPERVISED_AUDIT_EXECUTION_PREAMBLE).toContain('matching audit returns PASS');
+    expect(SUPERVISED_AUDIT_EXECUTION_PREAMBLE).toContain('daemon will arrange the independent peer audit');
+  });
+
   it('builds a bounded lightweight brief with non-destructive executable validation and structured reply', () => {
     const prompt = buildPeerAuditBriefV1({
       attemptId: 'attempt_1',
@@ -176,6 +183,7 @@ describe('supervision prompts', () => {
     expect(prompt).toContain('already delegated a matching audit and is waiting for PASS/REWORK');
     expect(prompt).toContain('never recursively audit an audit-status turn');
     expect(prompt).toContain('A task that starts as a check but proceeds to modify/fix something requires audit unless its matching audit is already pending or passed.');
+    expect(prompt).toContain('Do not reinterpret completed engineering work as a read-only status check');
   });
 
   it('forbids repository finalization after REWORK until a fresh peer audit passes', () => {

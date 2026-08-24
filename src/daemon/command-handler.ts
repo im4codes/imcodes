@@ -101,6 +101,7 @@ import { CODEX_RESET_CREDITS_MSG } from '../../shared/codex-reset-credits.js';
 import { refreshCodexQuotaMetadataForSessions } from './codex-quota-refresh.js';
 import { fetchCodexResetCredits, consumeCodexResetCredit } from '../agent/codex-reset-credits.js';
 import { supervisionAutomation } from './supervision-automation.js';
+import { SUPERVISED_AUDIT_EXECUTION_PREAMBLE } from './supervision-prompts.js';
 import {
   getEnabledP2pMemberNames,
   isP2pMemberEligibleSession,
@@ -3926,9 +3927,18 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     currentRecords: preferenceIngest.records,
   });
   const attachmentRetentionPreamble = buildAttachmentRetentionPreamble(displayText);
+  const supervisionSnapshot = isSupportedSupervisionTargetSessionType(record?.agentType)
+    ? extractSessionSupervisionSnapshot(record?.transportConfig ?? null)
+    : null;
+  const shouldTrackSupervisionTaskRun = supervisionSnapshot != null
+    && supervisionSnapshot.mode !== SUPERVISION_MODE.OFF
+    && isEligibleSupervisionTaskText(displayText);
   const agentMessagePreamble = mergeAgentMessagePreambles(
     preferenceMessagePreamble,
     attachmentRetentionPreamble,
+    shouldTrackSupervisionTaskRun && supervisionSnapshot.mode === SUPERVISION_MODE.SUPERVISED_AUDIT
+      ? SUPERVISED_AUDIT_EXECUTION_PREAMBLE
+      : undefined,
   );
   schedulePreferencePersistence({
     userId: preferenceUserId,
@@ -3936,12 +3946,6 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     records: preferenceIngest.records,
     sendOrigin: normalizeSendOrigin(cmd.origin),
   });
-  const supervisionSnapshot = isSupportedSupervisionTargetSessionType(record?.agentType)
-    ? extractSessionSupervisionSnapshot(record?.transportConfig ?? null)
-    : null;
-  const shouldTrackSupervisionTaskRun = supervisionSnapshot != null
-    && supervisionSnapshot.mode !== SUPERVISION_MODE.OFF
-    && isEligibleSupervisionTaskText(displayText);
   const attachments: TransportAttachment[] = [];
   const transportUserEventId = (clientMessageId: string) => `transport-user:${clientMessageId}`;
   const isTransportSession = record?.runtimeType === 'transport'
