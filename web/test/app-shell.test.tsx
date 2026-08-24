@@ -2861,6 +2861,58 @@ describe('App shell', () => {
     });
   }, 20_000);
 
+  it('restores an explicit shared URL even when the shared inventory is temporarily empty', async () => {
+    history.replaceState(null, '', '/#/srv-shared/deck_beta_brain?shared=share-url-only');
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    discoverSharedEntriesMock.mockResolvedValue([]);
+    openSharedEntryMock.mockResolvedValue({
+      server: { id: 'srv-shared', name: 'Shared Server', status: 'online', lastHeartbeatAt: Date.now() },
+      target: { kind: 'main', serverId: 'srv-shared', sessionName: 'deck_beta_brain' },
+      coverage: {
+        effectiveRole: 'participant',
+        historyCutoffAt: 0,
+        nextCoverageRecheckAt: null,
+        coveringShareIds: ['share-url-only'],
+        primaryShareId: 'share-url-only',
+        authorizedAt: Date.now(),
+      },
+      sessions: [{
+        sessionName: 'deck_beta_brain',
+        title: 'Shared Beta',
+        state: 'running',
+        agentType: 'codex-sdk',
+        activeDispatchId: 'dispatch-url-only',
+      }],
+      subSessions: [],
+    });
+
+    const { App } = await importApp();
+    render(<App />);
+
+    await waitFor(() => expect(openSharedEntryMock).toHaveBeenCalledWith({
+      kind: 'main',
+      serverId: 'srv-shared',
+      sessionName: 'deck_beta_brain',
+    }));
+    expect(await screen.findByTestId('session-pane-deck_beta_brain')).toBeTruthy();
+    expect(window.location.hash).toBe('#/srv-shared/deck_beta_brain?shared=share-url-only');
+    expect(screen.queryByText('dashboard-page')).toBeNull();
+  }, 20_000);
+
+  it('keeps the explicit shared URL instead of jumping home when restore temporarily fails', async () => {
+    history.replaceState(null, '', '/#/srv-shared/deck_beta_brain?shared=share-retry');
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    discoverSharedEntriesMock.mockResolvedValue([]);
+    openSharedEntryMock.mockRejectedValue(new Error('temporary shared restore failure'));
+
+    const { App } = await importApp();
+    render(<App />);
+
+    expect(await screen.findByText('temporary shared restore failure')).toBeTruthy();
+    expect(window.location.hash).toBe('#/srv-shared/deck_beta_brain?shared=share-retry');
+    expect(screen.queryByText('dashboard-page')).toBeNull();
+  }, 20_000);
+
   it('does not wait for shared-entry discovery when the hash points to an owned server', async () => {
     history.replaceState(null, '', '/#/srv-1/deck_alpha_brain');
     localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));

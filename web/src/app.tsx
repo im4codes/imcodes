@@ -448,6 +448,26 @@ function formatSharedAccessError(error: unknown): string {
   return String(error || 'share_failed');
 }
 
+function sharedEntryFallbackFromHash(
+  entryId: string | null,
+  serverId: string | null,
+  sessionName: string | null,
+): SharedEntrySummary | null {
+  if (!entryId || !serverId) return null;
+  const target: ShareTarget = sessionName
+    ? { kind: 'main', serverId, sessionName }
+    : { kind: 'server', serverId };
+  return {
+    id: entryId,
+    serverId,
+    serverName: serverId,
+    role: 'viewer',
+    status: 'active',
+    target,
+    targetLabel: sessionName ?? serverId,
+  };
+}
+
 function buildSharedOutStateFromShares(shares: ShareGrantSummary[]): SharedStateSummary | null {
   const activeShares = shares.filter((share) => share.status === 'active');
   if (activeShares.length === 0) return null;
@@ -2636,7 +2656,7 @@ export function App() {
     entry: SharedEntrySummary,
     options?: { restoreFromHash?: boolean; preferredSessionName?: string | null },
   ) => {
-    if (openingSharedEntryId) return;
+    if (openingSharedEntryId) return false;
     const returnServer = options?.restoreFromHash
       ? null
       : selectedShareTarget
@@ -2730,8 +2750,10 @@ export function App() {
       }
       setShowMobileServerMenu(false);
       setMobileSidebarOpen(false);
+      return true;
     } catch (err) {
       setSharedEntriesError(formatSharedAccessError(err));
+      return false;
     } finally {
       setOpeningSharedEntryId(null);
     }
@@ -2761,7 +2783,7 @@ export function App() {
     if (!sharedEntriesLoaded) return;
 
     sharedHashRestoreStartedRef.current = true;
-    const entry = urlSharedEntryId
+    const discoveredEntry = urlSharedEntryId
       ? sharedEntries.find((candidate) => (
           candidate.status === 'active'
           && candidate.id === urlSharedEntryId
@@ -2770,9 +2792,17 @@ export function App() {
       : remembered
         ? findRememberedSharedEntry(sharedEntries, remembered)
         : findSharedEntryForHash(sharedEntries, initial.serverId, initial.sessionName);
+    // The shared inventory is navigation UI, not restore authority. It can be
+    // temporarily empty during auth refresh/reconnect. For an explicit shared
+    // URL, reconstruct the main/server target and let /api/shares/open perform
+    // the authoritative coverage check instead of silently dropping home.
+    const entry = discoveredEntry ?? sharedEntryFallbackFromHash(
+      urlSharedEntryId,
+      initial.serverId,
+      initial.sessionName,
+    );
     if (!entry) {
       if (remembered) clearSharedTabRestoreMarker();
-      if (urlSharedEntryId) setSelectedSharedEntryId(null);
       setSharedHashRestorePending(false);
       return;
     }
@@ -2780,8 +2810,10 @@ export function App() {
     void handleOpenSharedEntry(entry, {
       restoreFromHash: true,
       preferredSessionName: initial.sessionName,
-    }).finally(() => {
-      setSharedHashRestorePending(false);
+    }).then((restored) => {
+      if (restored || !urlSharedEntryId) {
+        setSharedHashRestorePending(false);
+      }
     });
   }, [
     auth,
@@ -5200,11 +5232,16 @@ export function App() {
   }, [showInitialConnectingGate]);
 
   if (showInitialConnectingGate) {
+    const sharedRestoreError = sharedHashRestorePending && initialHashStateRef.current.sharedEntryId
+      ? sharedEntriesError
+      : null;
     return (
       <div style={{ position: 'fixed', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#0a0e1a', flexDirection: 'column', gap: 16 }}>
         <div class="spinner" style={{ width: 32, height: 32 }} />
-        <div style={{ color: '#64748b', fontSize: 14 }}>{connecting ? trans('common.reconnecting') : trans('common.loading')}</div>
-        {connectTimeout && (
+        <div style={{ color: sharedRestoreError ? '#fca5a5' : '#64748b', fontSize: 14 }}>
+          {sharedRestoreError ?? (connecting ? trans('common.reconnecting') : trans('common.loading'))}
+        </div>
+        {(connectTimeout || sharedRestoreError) && (
           <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
             <button class="btn" style={{ background: '#334155', color: '#e2e8f0', fontSize: 12 }} onClick={handleBackToDashboard}>
               ← Back
