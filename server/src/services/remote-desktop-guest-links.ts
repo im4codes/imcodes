@@ -6,11 +6,10 @@
  * 1. The Server never sees a raw bearer. The client generates 32 CSPRNG bytes,
  *    hashes them under the frozen domain-separated preimage, and sends only the
  *    hash. A database read therefore yields no usable credential.
- * 2. Every authority mutation runs inside `consumeActionBoundStepUpGrant`, and
- *    re-verifies Owner, canonical host and a currently shielded privacy epoch
- *    *inside that same transaction*. A grant minted for one action cannot
- *    authorize a different retry, and a mutation cannot straddle the privacy
- *    barrier.
+ * 2. Every authority mutation re-verifies Owner, canonical host and a currently
+ *    shielded privacy epoch inside one transaction. The ordinary management Web
+ *    may create under its current Owner account session; signed-shell creation
+ *    and every narrowing mutation additionally consume an action-bound step-up.
  * 3. Mutations only ever narrow authority, and each narrowing advances exactly
  *    the counter that describes it: Control-to-View advances
  *    `authorityGeneration` (derived routes die), expiry shortening advances
@@ -46,7 +45,6 @@ import type {
 import {
   consumeActionBoundStepUpGrant,
   type AccountSession,
-  type StepUpGrantUse,
 } from './remote-desktop-account-auth.js';
 import {
   appendGuestEffectTx,
@@ -215,7 +213,8 @@ export interface PrivacyEpochRef { epochId: string; revision: number }
 export interface CreateLinkInput {
   ownerUserId: string;
   accountSession: AccountSession;
-  stepUpToken: string;
+  /** Required for the signed native shell; ordinary Web Owner creation uses the current account session. */
+  stepUpToken?: string;
   hostId: string;
   creationRequestId: string;
   tokenHashVersion: typeof REMOTE_DESKTOP_LINK_TOKEN.HASH_VERSION;
@@ -257,7 +256,53 @@ export async function createGuestLink(
   };
   const policyHash = hashLinkPolicy(policy);
 
-  const used = await consumeActionBoundStepUpGrant<{ link: OwnerLinkView }>(
+  if (input.ownerUserId !== input.accountSession.userId) {
+    throw new LinkAuthorityError(LINK_REFUSAL.UNAUTHORIZED);
+  }
+
+  const createTx = async (tx: Database): Promise<{ link: OwnerLinkView; replayed: boolean }> => {
+    await assertOwnedHostTx(tx, input.hostId, input.ownerUserId);
+    // The barrier must be authoritative at the moment of commit, not merely
+    // at the moment the client opened its dialog.
+    await requirePrivacyTx(tx, input.hostId, input.privacy);
+
+    const existing = await findExistingCreateTx(tx, input, policyHash);
+    if (existing) return { link: existing, replayed: true };
+
+    const id = randomUUID();
+    // A duration is committed to an absolute expiry once, here, so a retry
+    // recovers the original deadline rather than recomputing a later one.
+    const expiresAt = input.durationMs === undefined ? null : input.now + input.durationMs;
+    await createGuestLinkRowsTx(tx, {
+      id,
+      hostId: input.hostId,
+      ownerUserId: input.ownerUserId,
+      tokenHash: input.tokenHash,
+      creationRequestId: input.creationRequestId,
+      normalizedPolicyHash: policyHash,
+      label: input.label,
+      attendance: input.kind,
+      accessMode: input.mode,
+      expiresAt,
+      now: input.now,
+    });
+
+    const row = await tx.queryOne<LinkRow>(
+      `SELECT ${LINK_COLUMNS} FROM remote_desktop_guest_links WHERE id = $1`, [id],
+    );
+    if (!row) throw new LinkAuthorityError(LINK_REFUSAL.CONFLICT);
+    return { link: toView(row, false), replayed: false };
+  };
+
+  if (input.accountSession.kind === 'web' && !input.stepUpToken) {
+    return db.transaction(createTx);
+  }
+
+  if (!input.stepUpToken) {
+    throw new LinkAuthorityError(LINK_REFUSAL.STEP_UP_REQUIRED);
+  }
+
+  const used = await consumeActionBoundStepUpGrant<{ link: OwnerLinkView; replayed: boolean }>(
     db,
     {
       token: input.stepUpToken,
@@ -272,43 +317,15 @@ export async function createGuestLink(
       },
       requestId: input.creationRequestId,
     },
-    async (tx) => {
-      await assertOwnedHostTx(tx, input.hostId, input.ownerUserId);
-      // The barrier must be authoritative at the moment of commit, not merely
-      // at the moment the client opened its dialog.
-      await requirePrivacyTx(tx, input.hostId, input.privacy);
-
-      const existing = await findExistingCreateTx(tx, input, policyHash);
-      if (existing) return { link: existing };
-
-      const id = randomUUID();
-      // A duration is committed to an absolute expiry once, here, so a retry
-      // recovers the original deadline rather than recomputing a later one.
-      const expiresAt = input.durationMs === undefined ? null : input.now + input.durationMs;
-      await createGuestLinkRowsTx(tx, {
-        id,
-        hostId: input.hostId,
-        ownerUserId: input.ownerUserId,
-        tokenHash: input.tokenHash,
-        creationRequestId: input.creationRequestId,
-        normalizedPolicyHash: policyHash,
-        label: input.label,
-        attendance: input.kind,
-        accessMode: input.mode,
-        expiresAt,
-        now: input.now,
-      });
-
-      const row = await tx.queryOne<LinkRow>(
-        `SELECT ${LINK_COLUMNS} FROM remote_desktop_guest_links WHERE id = $1`, [id],
-      );
-      if (!row) throw new LinkAuthorityError(LINK_REFUSAL.CONFLICT);
-      return { link: toView(row, false) };
-    },
+    createTx,
     input.now,
   );
 
-  return unwrap(used, (value) => value.link);
+  if (!used.ok) throw new LinkAuthorityError(LINK_REFUSAL.STEP_UP_REQUIRED);
+  return {
+    link: used.result.link,
+    replayed: used.replayed || used.result.replayed,
+  };
 }
 
 async function findExistingCreateTx(
@@ -355,11 +372,6 @@ async function requirePrivacyTx(tx: Database, hostId: string, privacy: PrivacyEp
   } catch {
     throw new LinkAuthorityError(LINK_REFUSAL.PRIVACY_REQUIRED);
   }
-}
-
-function unwrap<T, R>(used: StepUpGrantUse<T>, pick: (value: T) => R): { link: R; replayed: boolean } {
-  if (!used.ok) throw new LinkAuthorityError(LINK_REFUSAL.STEP_UP_REQUIRED);
-  return { link: pick(used.result), replayed: used.replayed };
 }
 
 /** Owner-only inventory. Returns non-secret metadata for one canonical host. */

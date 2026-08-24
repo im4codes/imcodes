@@ -78,7 +78,7 @@ export interface RemoteDesktopStepUpGrant {
 
 export interface RemoteDesktopAccessApi {
   loadHost(hostId: string): Promise<RemoteDesktopOwnerHostSummary>;
-  rotateHost(input: { hostId: string; requestId: string; stepUpGrant: string }): Promise<RemoteDesktopOwnerHostSummary>;
+  rotateHost(input: { hostId: string; requestId: string }): Promise<RemoteDesktopOwnerHostSummary>;
   listLinks(hostId: string): Promise<RemoteDesktopOwnerLinkView[]>;
   createLink(input: CreateOwnerLinkInput): Promise<RemoteDesktopOwnerLinkView>;
   mutateLink(input: MutateOwnerLinkInput): Promise<RemoteDesktopOwnerLinkView>;
@@ -105,7 +105,6 @@ export interface CreateOwnerLinkInput {
   label?: string;
   durationMs?: number;
   privacyEpoch: RemoteDesktopPrivacyEpochRef;
-  stepUpGrant: string;
   prepared?: PreparedRemoteDesktopLink;
 }
 
@@ -516,7 +515,7 @@ export function createRemoteDesktopAccessApi(): RemoteDesktopAccessApi {
       });
       const response = await apiFetch('/api/remote-desktop/guest/links', {
         method: 'POST',
-        body: JSON.stringify({ request: prepared.request, privacyEpoch: input.privacyEpoch, stepUpGrant: input.stepUpGrant }),
+        body: JSON.stringify({ request: prepared.request, privacyEpoch: input.privacyEpoch }),
       });
       return isRecord(response) && isRecord(response.link) ? decodeLink(response.link) : decodeLink(response);
     },

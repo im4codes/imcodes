@@ -275,6 +275,22 @@ describe('Owner public identity management (real PostgreSQL)', () => {
     })).rejects.toMatchObject({ code: OWNER_HOST_MANAGEMENT_ERROR.UNAUTHORIZED });
   });
 
+  it('rotates for a current Web Owner without a configured Passkey', async () => {
+    const fx = await fixture();
+    await db.execute('DELETE FROM passkey_credentials WHERE user_id = $1', [fx.ownerUserId]);
+
+    const rotated = await rotateOwnerPublicNodeId(db, {
+      accountSession: fx.session,
+      hostId: fx.hostId,
+      requestId: requestId(),
+      now: NOW + 1,
+    });
+
+    expect(rotated.previousPublicNodeId).toBe(fx.publicNodeId);
+    expect(rotated.host.publicNodeId).not.toBe(fx.publicNodeId);
+    expect(rotated.replayed).toBe(false);
+  });
+
   it('atomically rotates with action-bound step-up, cancels only old-ID password bootstraps, and preserves admitted routes', async () => {
     const fx = await fixture();
     const seeded = await seedRotationState(fx);

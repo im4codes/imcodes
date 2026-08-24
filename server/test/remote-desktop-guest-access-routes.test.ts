@@ -506,16 +506,16 @@ describe('remote desktop guest access routes', () => {
       tokenHash: 'a'.repeat(64), kind: 'attended', mode: 'control', label: 'desk',
     };
     const privacyEpoch = { epochId: 'epoch-1', revision: 3 };
-    const response = await post({ request, privacyEpoch, stepUpGrant: 'rdsg_grant' }, 'links');
+    const response = await post({ request, privacyEpoch }, 'links');
     expect(response.status).toBe(201);
     const responseBody = await response.json();
     expect(responseBody).toEqual({ link: { id: LINK_ID, hostId: HOST_ID }, replayed: false });
     expect(JSON.stringify(responseBody)).not.toContain('service-secret');
     expect(mocks.create).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
       ownerUserId: 'owner-1', accountSession: { kind: 'web', id: 'web-session', userId: 'owner-1' },
-      ...request, privacy: privacyEpoch, stepUpToken: 'rdsg_grant', now: 1_700_000_000_000,
+      ...request, privacy: privacyEpoch, stepUpToken: undefined, now: 1_700_000_000_000,
     }));
-    expect(JSON.stringify(await post({ request: { ...request, token: 'raw-secret' }, privacyEpoch, stepUpGrant: 'x' }, 'links')
+    expect(JSON.stringify(await post({ request: { ...request, token: 'raw-secret' }, privacyEpoch }, 'links')
       .then((r) => r.json()))).not.toContain('raw-secret');
     expect(mocks.create).toHaveBeenCalledTimes(1);
   });
@@ -527,7 +527,7 @@ describe('remote desktop guest access routes', () => {
         hostId: HOST_ID, creationRequestId: 'r'.repeat(43), tokenHashVersion: 'v1',
         tokenHash: 'a'.repeat(64), kind: 'attended', mode: 'view', label: 'desk',
       },
-      privacyEpoch: { epochId: 'epoch-1', revision: 1 }, stepUpGrant: 'same-grant',
+      privacyEpoch: { epochId: 'epoch-1', revision: 1 },
     }, 'links');
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual({ link: { id: 'same-link', hostId: HOST_ID }, replayed: true });
@@ -606,6 +606,14 @@ describe('remote desktop guest access routes', () => {
     });
 
     const rotateGrant = 'rdsg_native_rotate';
+    const rotateWithoutGrant = await app().request('/api/remote-desktop/guest/host/rotate', {
+      method: 'POST',
+      headers: { ...authorization, 'content-type': 'application/json' },
+      body: JSON.stringify({ hostId: HOST_ID, requestId: 'z'.repeat(43) }),
+    }, ENV);
+    expect(rotateWithoutGrant.status).toBe(400);
+    expect(mocks.rotate).not.toHaveBeenCalled();
+
     const rotate = await app().request('/api/remote-desktop/guest/host/rotate', {
       method: 'POST',
       headers: { ...authorization, 'content-type': 'application/json' },
@@ -631,6 +639,20 @@ describe('remote desktop guest access routes', () => {
 
     const privacyEpoch = { epochId: 'epoch-controlled-host', revision: 9 };
     const createGrant = 'rdsg_native_create';
+    const createWithoutGrant = await app().request('/api/remote-desktop/guest/links', {
+      method: 'POST',
+      headers: { ...authorization, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        request: {
+          hostId: HOST_ID, creationRequestId: 'z'.repeat(43), tokenHashVersion: 'v1',
+          tokenHash: 'f'.repeat(64), kind: 'attended', mode: 'control', label: 'desk',
+        },
+        privacyEpoch,
+      }),
+    }, ENV);
+    expect(createWithoutGrant.status).toBe(400);
+    expect(mocks.create).not.toHaveBeenCalled();
+
     const created = await app().request('/api/remote-desktop/guest/links', {
       method: 'POST',
       headers: { ...authorization, 'content-type': 'application/json' },
@@ -749,7 +771,7 @@ describe('remote desktop guest access routes', () => {
     expect(mocks.browserSession).not.toHaveBeenCalled();
   });
 
-  it('serves Owner host summary and action-bound public-ID rotation only', async () => {
+  it('serves Owner host summary and rotates from the current Web Owner session without Passkey', async () => {
     mocks.hostSummary.mockResolvedValue({ hostId: HOST_ID, publicNodeId: '5837462190', mergeState: 'resolved' });
     const summary = await app().request(`/api/remote-desktop/guest/host?hostId=${HOST_ID}`, {}, ENV);
     expect(await summary.json()).toEqual({
@@ -761,12 +783,12 @@ describe('remote desktop guest access routes', () => {
       previousPublicNodeId: '5837462190', replayed: false,
     });
     const rotated = await post({
-      hostId: HOST_ID, requestId: 'q'.repeat(43), stepUpGrant: 'rdsg_rotate',
+      hostId: HOST_ID, requestId: 'q'.repeat(43),
     }, 'host/rotate');
     expect(rotated.status).toBe(200);
     expect(mocks.rotate).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
       accountSession: { kind: 'web', id: 'web-session', userId: 'owner-1' },
-      hostId: HOST_ID, requestId: 'q'.repeat(43), stepUpToken: 'rdsg_rotate',
+      hostId: HOST_ID, requestId: 'q'.repeat(43), stepUpToken: undefined,
     }));
   });
 

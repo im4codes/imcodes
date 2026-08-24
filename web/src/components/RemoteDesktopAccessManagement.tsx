@@ -146,12 +146,7 @@ export function RemoteDesktopAccessManagement({
         label: label.trim(),
         ...(kind === REMOTE_DESKTOP_LINK_KIND.UNATTENDED ? { durationMs } : {}),
       });
-      const grant = await runRemoteDesktopStepUp(api, {
-        canonicalHostId: hostId,
-        requestId: prepared.requestId,
-        action: prepared.action,
-      });
-      const link = await api.createLink({ prepared, privacyEpoch: epoch, stepUpGrant: grant });
+      const link = await api.createLink({ prepared, privacyEpoch: epoch });
       setLinks((current) => [link, ...current.filter((item) => item.id !== link.id)]);
       setLabel('');
       setInvite({ url: prepared.inviteUrl, epoch });
@@ -179,12 +174,7 @@ export function RemoteDesktopAccessManagement({
     setBusy(true);
     setError(null);
     try {
-      const grant = await runRemoteDesktopStepUp(api, {
-        canonicalHostId: hostId,
-        requestId,
-        action: { kind: 'remote_desktop.public_id.rotate', hostId },
-      });
-      setHost(await api.rotateHost({ hostId, requestId, stepUpGrant: grant }));
+      setHost(await api.rotateHost({ hostId, requestId }));
     } catch (reason) {
       setError(mapRemoteDesktopApiError(reason));
     } finally { setBusy(false); }

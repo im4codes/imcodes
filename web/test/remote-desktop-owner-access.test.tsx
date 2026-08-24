@@ -82,7 +82,7 @@ describe('RemoteDesktopOwnerAccess', () => {
     expect(document.body.textContent).not.toContain('sessionId');
   });
 
-  it('requires privacy and action-bound step-up before creating a link, then shows the raw invite once', async () => {
+  it('requires privacy but no Passkey before creating a link, then shows the raw invite once', async () => {
     const fake = api();
     const guard = privacy();
     render(<RemoteDesktopOwnerAccess hostId="host-1" api={fake} privacy={guard} />);
@@ -91,12 +91,33 @@ describe('RemoteDesktopOwnerAccess', () => {
     fireEvent.click(screen.getByRole('button', { name: 'remote_desktop.access_create_link' }));
     await screen.findByLabelText('remote_desktop.access_secret_value');
     expect(guard.begin).toHaveBeenCalledWith('host-1');
-    expect(fake.beginStepUp).toHaveBeenCalledWith(expect.objectContaining({ canonicalHostId: 'host-1', action: expect.objectContaining({ kind: 'remote_desktop.link.create' }) }));
-    expect(fake.createLink).toHaveBeenCalledWith(expect.objectContaining({ prepared: expect.objectContaining({ inviteUrl: expect.stringContaining('#invite=v1.') }), stepUpGrant: 'grant' }));
+    expect(fake.beginStepUp).not.toHaveBeenCalled();
+    expect(fake.completeStepUp).not.toHaveBeenCalled();
+    expect(navigator.credentials.get).not.toHaveBeenCalled();
+    expect(fake.createLink).toHaveBeenCalledWith(expect.objectContaining({
+      prepared: expect.objectContaining({ inviteUrl: expect.stringContaining('#invite=v1.') }),
+      privacyEpoch: { epochId: 'epoch-1', revision: 1 },
+    }));
+    expect(fake.createLink).not.toHaveBeenCalledWith(expect.objectContaining({ stepUpGrant: expect.anything() }));
     expect((screen.getByLabelText('remote_desktop.access_secret_value') as HTMLInputElement).value).toContain('#invite=v1.');
     fireEvent.keyDown(screen.getByRole('dialog'), { key: 'Escape' });
     await waitFor(() => expect(screen.queryByLabelText('remote_desktop.access_secret_value')).toBeNull());
     expect(guard.end).toHaveBeenCalledWith('host-1', { epochId: 'epoch-1', revision: 1 });
+  });
+
+  it('rotates the public ID from the current Owner session without requiring a Passkey', async () => {
+    const fake = api();
+    render(<RemoteDesktopOwnerAccess hostId="host-1" api={fake} privacy={privacy()} />);
+    await screen.findByText('5123456789');
+
+    fireEvent.click(screen.getByRole('button', { name: 'remote_desktop.access_rotate' }));
+
+    expect(await screen.findByText('5987654321')).toBeTruthy();
+    expect(fake.rotateHost).toHaveBeenCalledWith(expect.objectContaining({ hostId: 'host-1' }));
+    expect(fake.rotateHost).not.toHaveBeenCalledWith(expect.objectContaining({ stepUpGrant: expect.anything() }));
+    expect(fake.beginStepUp).not.toHaveBeenCalled();
+    expect(fake.completeStepUp).not.toHaveBeenCalled();
+    expect(navigator.credentials.get).not.toHaveBeenCalled();
   });
 
   it('fails closed when privacy cannot be established and clears passwords after mutation', async () => {

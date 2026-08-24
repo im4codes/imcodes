@@ -304,6 +304,48 @@ async function expectRefusal(promise: Promise<unknown>, refusal: string): Promis
 }
 
 describe('Owner link creation (4.5)', () => {
+  it('creates for a current Web Owner without a configured Passkey', async () => {
+    const fx = await seedFixture();
+    await db.execute('DELETE FROM passkey_credentials WHERE user_id = $1', [fx.ownerUserId]);
+    const { tokenHash } = newBearer();
+    const creationRequestId = newRequestId();
+
+    const created = await createGuestLink(db, {
+      ownerUserId: fx.ownerUserId,
+      accountSession: fx.session,
+      hostId: fx.hostId,
+      creationRequestId,
+      tokenHashVersion: REMOTE_DESKTOP_LINK_TOKEN.HASH_VERSION,
+      tokenHash,
+      kind: REMOTE_DESKTOP_LINK_KIND.ATTENDED,
+      mode: 'view',
+      label: 'no-passkey',
+      privacy: fx.privacy,
+      now: NOW,
+    });
+
+    expect(created.replayed).toBe(false);
+    expect(created.link.hostId).toBe(fx.hostId);
+    const replayed = await createGuestLink(db, {
+      ownerUserId: fx.ownerUserId,
+      accountSession: fx.session,
+      hostId: fx.hostId,
+      creationRequestId,
+      tokenHashVersion: REMOTE_DESKTOP_LINK_TOKEN.HASH_VERSION,
+      tokenHash,
+      kind: REMOTE_DESKTOP_LINK_KIND.ATTENDED,
+      mode: 'view',
+      label: 'no-passkey',
+      privacy: fx.privacy,
+      now: NOW,
+    });
+    expect(replayed).toEqual({ link: created.link, replayed: true });
+    expect(await db.query(
+      'SELECT id FROM remote_desktop_guest_links WHERE owner_user_id = $1 AND creation_request_id = $2',
+      [fx.ownerUserId, creationRequestId],
+    )).toHaveLength(1);
+  });
+
   it('stores hash only and returns non-secret metadata', async () => {
     const fx = await seedFixture();
     const created = await createLink(fx);

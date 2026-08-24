@@ -143,14 +143,15 @@ function managementPrivacySessionHash(session: AccountSession): string {
 function parseCreate(value: unknown): {
   request: RemoteDesktopLinkCreateRequest;
   privacy: { epochId: string; revision: number };
-  stepUpGrant: string;
+  stepUpGrant?: string;
 } | null {
-  const body = asExactRecord(value, ['request', 'privacyEpoch', 'stepUpGrant']);
-  if (!body || typeof body.stepUpGrant !== 'string' || body.stepUpGrant.length > 512) return null;
+  const body = asExactRecord(value, ['request', 'privacyEpoch'], ['stepUpGrant']);
+  if (!body || (body.stepUpGrant !== undefined
+    && (typeof body.stepUpGrant !== 'string' || body.stepUpGrant.length > 512))) return null;
   const request = validateRemoteDesktopLinkCreateRequest(body.request);
   const privacy = parsePrivacy(body.privacyEpoch);
   if (!request.ok || !privacy) return null;
-  return { request: request.value, privacy, stepUpGrant: body.stepUpGrant };
+  return { request: request.value, privacy, stepUpGrant: body.stepUpGrant as string | undefined };
 }
 
 function parseMutation(value: unknown): {
@@ -567,10 +568,12 @@ remoteDesktopGuestAccessRoutes.post('/remote-desktop/guest/host/rotate', async (
   c.header('Cache-Control', 'no-store');
   const accountSession = await resolveRemoteDesktopAccountSession(c);
   if (!accountSession) return c.json({ error: 'unauthorized' }, 401);
-  const body = asExactRecord(await readJson(c), ['hostId', 'requestId', 'stepUpGrant']);
+  const body = asExactRecord(await readJson(c), ['hostId', 'requestId'], ['stepUpGrant']);
   if (!body || !isRemoteDesktopId(body.hostId)
     || !isCanonicalRemoteDesktopCreationRequestId(body.requestId)
-    || typeof body.stepUpGrant !== 'string' || body.stepUpGrant.length > 512) {
+    || (body.stepUpGrant !== undefined
+      && (typeof body.stepUpGrant !== 'string' || body.stepUpGrant.length > 512))
+    || (accountSession.kind === 'native' && typeof body.stepUpGrant !== 'string')) {
     return c.json({ error: 'request_invalid' }, 400);
   }
   try {
@@ -579,7 +582,7 @@ remoteDesktopGuestAccessRoutes.post('/remote-desktop/guest/host/rotate', async (
       accountSession,
       hostId: body.hostId,
       requestId: body.requestId,
-      stepUpToken: body.stepUpGrant,
+      stepUpToken: body.stepUpGrant as string | undefined,
       now,
     });
     return c.json(result);
@@ -612,7 +615,9 @@ remoteDesktopGuestAccessRoutes.post('/remote-desktop/guest/links', async (c) => 
   const accountSession = await resolveRemoteDesktopAccountSession(c);
   if (!accountSession) return c.json({ error: 'unauthorized' }, 401);
   const parsed = parseCreate(await readJson(c));
-  if (!parsed) return c.json({ error: 'request_invalid' }, 400);
+  if (!parsed || (accountSession.kind === 'native' && parsed.stepUpGrant === undefined)) {
+    return c.json({ error: 'request_invalid' }, 400);
+  }
   try {
     const now = await c.env.DB.transaction(readDatabaseClock);
     const result = await createGuestLink(c.env.DB, {

@@ -84,12 +84,18 @@ export interface RotateOwnerPublicNodeIdInput {
   accountSession: AccountSession;
   hostId: string;
   requestId: string;
-  stepUpToken: string;
+  /** Required for the signed native shell; ordinary Web Owner sessions use current account authority. */
+  stepUpToken?: string;
   now: number;
 }
 
 /**
- * Rotate lookup identity under the same transaction that consumes step-up.
+ * Rotate lookup identity after rechecking current Owner authority.
+ *
+ * The ordinary management Web surface is already inside the Owner's account
+ * session and does not require a configured passkey merely to rotate a public
+ * lookup ID. The signed controlled-computer shell remains a separate local
+ * presentation and must consume its action-bound step-up grant atomically.
  *
  * Password proof currently has no separate durable challenge row. Its
  * post-proof, unredeemed bootstrap rows are identifiable by `node_password` and
@@ -112,6 +118,38 @@ export async function rotateOwnerPublicNodeId(
     throw new OwnerHostManagementError(OWNER_HOST_MANAGEMENT_ERROR.INVALID);
   }
 
+  const rotateTx = async (tx: Database): Promise<{
+    host: OwnerRemoteDesktopHostSummary;
+    previousPublicNodeId: string;
+  }> => {
+    await loadOwnedHost(tx, input.accountSession.userId, input.hostId, true);
+    const rotated = await rotatePublicNodeId({
+      db: tx,
+      hostId: input.hostId,
+      now: input.now,
+      onRotatedTx: async (rotationTx) => {
+        await rotationTx.execute(
+          `DELETE FROM remote_desktop_guest_bootstraps
+            WHERE host_id = $1
+              AND actor_source = 'node_password'
+              AND redeemed_at IS NULL`,
+          [input.hostId],
+        );
+      },
+    });
+    const host = await loadOwnedHost(tx, input.accountSession.userId, input.hostId);
+    return { host: toSummary(host), previousPublicNodeId: rotated.previousPublicId };
+  };
+
+  if (input.accountSession.kind === 'web' && !input.stepUpToken) {
+    const result = await db.transaction(rotateTx);
+    return { ...result, replayed: false };
+  }
+
+  if (!input.stepUpToken) {
+    throw new OwnerHostManagementError(OWNER_HOST_MANAGEMENT_ERROR.STEP_UP_REQUIRED);
+  }
+
   const used = await consumeActionBoundStepUpGrant<{
     host: OwnerRemoteDesktopHostSummary;
     previousPublicNodeId: string;
@@ -124,25 +162,7 @@ export async function rotateOwnerPublicNodeId(
       action: { kind: 'remote_desktop.public_id.rotate', hostId: input.hostId },
       requestId: input.requestId,
     },
-    async (tx) => {
-      await loadOwnedHost(tx, input.accountSession.userId, input.hostId, true);
-      const rotated = await rotatePublicNodeId({
-        db: tx,
-        hostId: input.hostId,
-        now: input.now,
-        onRotatedTx: async (rotationTx) => {
-          await rotationTx.execute(
-            `DELETE FROM remote_desktop_guest_bootstraps
-              WHERE host_id = $1
-                AND actor_source = 'node_password'
-                AND redeemed_at IS NULL`,
-            [input.hostId],
-          );
-        },
-      });
-      const host = await loadOwnedHost(tx, input.accountSession.userId, input.hostId);
-      return { host: toSummary(host), previousPublicNodeId: rotated.previousPublicId };
-    },
+    rotateTx,
     input.now,
   );
 

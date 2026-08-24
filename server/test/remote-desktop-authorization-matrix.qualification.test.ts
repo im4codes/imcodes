@@ -82,7 +82,10 @@ function decisionFor(actor: Actor, operation: Operation): MatrixRow {
       return { actor, operation, expected: 'allow', reason: 'Owner Web may open empty-snapshot privacy epoch.' };
     }
     if (OWNER_MUTATIONS.includes(operation)) {
-      return { actor, operation, expected: 'allow', reason: 'Owner Web with fresh step-up and empty privacy snapshot may mutate.' };
+      const reason = operation === 'public_id.rotate' || operation === 'link.create'
+        ? 'Current Owner Web session may rotate/create without Passkey; secret creation still requires an empty privacy snapshot.'
+        : 'Owner Web with fresh step-up and empty privacy snapshot may mutate.';
+      return { actor, operation, expected: 'allow', reason };
     }
     if (operation === 'wall.read') {
       return { actor, operation, expected: 'allow', reason: 'Owner may read workspace/wall state.' };
@@ -188,11 +191,12 @@ function blockingMatrixFindings(rows: readonly MatrixRow[]): string[] {
 }
 
 describe('remote desktop 14.2 authorization matrix qualification gate', () => {
-  it('enumerates every required actor and keeps management authority Owner+step-up+privacy scoped', () => {
+  it('enumerates every required actor and keeps management authority Owner scoped with per-operation step-up/privacy', () => {
     const rows = matrix();
     expect(blockingMatrixFindings(rows)).toEqual([]);
     expect(rows).toContainEqual(expect.objectContaining({
       actor: 'owner_management_web', operation: 'link.create', expected: 'allow',
+      reason: expect.stringContaining('without Passkey'),
     }));
     expect(rows).toContainEqual(expect.objectContaining({
       actor: 'owner_management_web_with_active_route', operation: 'link.create', expected: 'fail_closed',
