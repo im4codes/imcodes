@@ -3828,6 +3828,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       sessionName: activeSession.name,
       text,
       ...extra,
+      uiLocale: i18n?.resolvedLanguage ?? i18n?.language,
       commandId,
     };
     const markSendFailed = (err: unknown) => {
@@ -3859,7 +3860,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       requestActiveTimelineRefreshAfterUserAction();
     }
     return commandId;
-  }, [activeSession, cancelActiveTransportTurn, effectiveRuntimeType, makeCommandId, serverId, showStopFeedback, ws]);
+  }, [activeSession, cancelActiveTransportTurn, effectiveRuntimeType, i18n?.language, i18n?.resolvedLanguage, makeCommandId, serverId, showStopFeedback, ws]);
 
   const sendQueuedMessageMutation = useCallback((
     type: 'session.edit_queued_message' | 'session.undo_queued_message' | typeof TRANSPORT_QUEUE_COMMANDS.APPEND_MESSAGES,

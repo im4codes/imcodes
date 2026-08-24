@@ -3912,6 +3912,7 @@ describe('handleWebCommand transport queue behavior', () => {
       session: 'deck_transport_brain',
       text: 'implement the feature',
       commandId: 'cmd-heavy',
+      uiLocale: 'zh-CN',
     }, serverLink as any);
     await flushAsync();
 
@@ -3925,7 +3926,7 @@ describe('handleWebCommand transport queue behavior', () => {
       'deck_transport_brain',
       'cmd-heavy',
       'implement the feature',
-      expect.objectContaining({ mode: 'supervised_audit' }),
+      expect.objectContaining({ mode: 'supervised_audit', uiLocale: 'zh-CN' }),
     );
     expect(queueTaskIntentMock).not.toHaveBeenCalled();
   });

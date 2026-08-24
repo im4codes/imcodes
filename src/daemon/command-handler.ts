@@ -293,6 +293,7 @@ import {
   SUPERVISION_MODE,
   extractSessionSupervisionSnapshot,
   isSupportedSupervisionTargetSessionType,
+  normalizeSupervisionUiLocale,
 } from '../../shared/supervision-config.js';
 import {
   PREFERENCE_FEATURE_FLAG,
@@ -3219,6 +3220,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   const sessionName = (cmd.sessionName ?? cmd.session) as string | undefined;
   const text = cmd.text as string | undefined;
   const commandId = cmd.commandId as string | undefined;
+  const requestedUiLocale = normalizeSupervisionUiLocale(cmd.uiLocale);
   // Omission/unknown values are the safe default: ordinary durable FIFO.
   // Only the exact explicit append value may request a provider-native steer.
   const requestedDeliveryMode = cmd.deliveryMode === MEMORY_MCP_SEND_DELIVERY_MODES.APPEND
@@ -3350,6 +3352,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       allowDuplicate: true,
       commandId: effectiveId,
       ...(sharedActor ? { sharedActor } : {}),
+      ...(requestedUiLocale ? { uiLocale: requestedUiLocale } : {}),
     };
     timelineEmitter.emit(
       sessionName,
@@ -3927,9 +3930,12 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     currentRecords: preferenceIngest.records,
   });
   const attachmentRetentionPreamble = buildAttachmentRetentionPreamble(displayText);
-  const supervisionSnapshot = isSupportedSupervisionTargetSessionType(record?.agentType)
+  const persistedSupervisionSnapshot = isSupportedSupervisionTargetSessionType(record?.agentType)
     ? extractSessionSupervisionSnapshot(record?.transportConfig ?? null)
     : null;
+  const supervisionSnapshot = persistedSupervisionSnapshot && requestedUiLocale
+    ? { ...persistedSupervisionSnapshot, uiLocale: requestedUiLocale }
+    : persistedSupervisionSnapshot;
   const shouldTrackSupervisionTaskRun = supervisionSnapshot != null
     && supervisionSnapshot.mode !== SUPERVISION_MODE.OFF
     && isEligibleSupervisionTaskText(displayText);

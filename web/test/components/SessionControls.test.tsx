@@ -8,6 +8,9 @@ import { useRef, useState } from 'preact/hooks';
 import { FILE_TRANSFER_LIMITS } from '../../../shared/transport/file-transfer.js';
 
 const DEFAULT_INNER_WIDTH = 1280;
+const { mockI18n } = vi.hoisted(() => ({
+  mockI18n: { language: undefined as string | undefined, resolvedLanguage: undefined as string | undefined },
+}));
 
 if (!HTMLElement.prototype.scrollIntoView) {
   HTMLElement.prototype.scrollIntoView = vi.fn();
@@ -15,6 +18,7 @@ if (!HTMLElement.prototype.scrollIntoView) {
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
+    i18n: mockI18n,
     t: (key: string, opts?: Record<string, unknown>) => {
       if (key === 'openspec.title') return 'OpenSpec';
       if (key === 'openspec.changes') return 'changes';
@@ -498,6 +502,8 @@ afterEach(() => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    mockI18n.language = undefined;
+    mockI18n.resolvedLanguage = undefined;
     deleteAttachmentMock.mockResolvedValue(undefined);
     execCommandMock.mockImplementation((_command: string, _ui?: boolean, value?: string) => {
       const active = document.activeElement as HTMLDivElement | null;
@@ -1256,6 +1262,20 @@ afterEach(() => {
     expect(firstPayload.commandId).toEqual(expect.any(String));
     expect(secondPayload.commandId).toEqual(expect.any(String));
     expect(firstPayload.commandId).not.toBe(secondPayload.commandId);
+  });
+
+  it('sends the selected non-English UI locale with the supervised task message', () => {
+    mockI18n.language = 'zh-CN';
+    mockI18n.resolvedLanguage = 'zh-CN';
+    const ws = makeWs();
+    render(<SessionControls ws={ws as any} activeSession={makeSession({ name: 'localized-session' })} quickData={makeQuickData() as any} />);
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+
+    input.textContent = '修复并验证审计流程';
+    fireEvent.input(input);
+    fireEvent.click(screen.getByRole('button', { name: /send/i }));
+
+    expect(gatherSendCalls(ws)[0]).toMatchObject({ uiLocale: 'zh-CN' });
   });
 
   it('sends an advanced p2p workflow envelope when config mode is used', async () => {

@@ -25,6 +25,7 @@ import {
   SUPERVISION_UNAVAILABLE_REASONS,
   extractSessionSupervisionSnapshot,
   resolveSupervisionCustomInstructionsDetail,
+  normalizeSupervisionUiLocale,
   type SessionSupervisionSnapshot,
   type SupervisionUnavailableReason,
   type TaskRunTerminalState,
@@ -200,6 +201,7 @@ interface RecentTaskCandidate {
   commandId: string;
   text: string;
   sequence: number;
+  uiLocale?: SessionSupervisionSnapshot['uiLocale'];
 }
 
 interface LatestAssistantText {
@@ -340,6 +342,8 @@ const SUBSTANTIVE_PRE_AUDIT_ACTION_RE = /(?:\b(?:test|tests|testing|typecheck|li
 const COMPLETED_PRE_AUDIT_WORK_RE = /(?:\b(?:implementation|fix(?:es)?|coding|changes?|tests?|testing|typecheck|lint|build|verification|validation)\b[\s\S]{0,80}\b(?:complete|completed|done|finished|pass(?:ed)?)\b|(?:修复|实现|代码|改动|测试|验证|检查|类型检查|构建)[\s\S]{0,60}(?:已完成|已经完成|均已完成|全部完成|完成并通过|已通过|验证通过|测试通过))/iu;
 const PENDING_PRE_AUDIT_WORK_RE = /(?:\b(?:still|yet|remaining|pending|missing|failed?|incomplete|need(?:s)?\s+to|must)\b[\s\S]{0,50}\b(?:implementation|fix(?:es)?|tests?|testing|typecheck|lint|build|verification|validation)\b|\b(?:implementation|fix(?:es)?|tests?|testing|typecheck|lint|build|verification|validation)\b[\s\S]{0,50}\b(?:remain(?:s|ing)?|pending|missing|fail(?:ed|ing)?|incomplete|not\s+(?:done|complete)|need(?:s)?|required)\b|(?:仍|还|尚|待|未|缺少|失败)[\s\S]{0,30}(?:测试|验证|修复|实现|构建|类型检查)|(?:测试|验证|修复|实现|构建|类型检查)[\s\S]{0,30}(?:未完成|仍需|还需|待处理|失败|缺失|未通过))/iu;
 const NEW_AUDIT_DELEGATION_RE = /(?:\b(?:send|dispatch|delegate|construct|prepare)\b[\s\S]{0,100}\b(?:reply[- ]enabled|peer\s+audit|independent\s+(?:audit|review)|audit\s+brief)\b|\b(?:reply[- ]enabled|peer\s+audit|audit\s+brief)\b[\s\S]{0,100}\b(?:send|dispatch|delegate|construct|prepare)\b|(?:发送|补发|构造|准备|委派|发起)[\s\S]{0,80}(?:带回复|可回复|独立)?(?:审计|审核|复审)(?:简报|任务|请求)?)/iu;
+const FORBIDS_NEW_AUDIT_RE = /(?:\b(?:do\s+not|don't|never)\b[\s\S]{0,50}\b(?:send|dispatch|delegate|request|start)\b[\s\S]{0,30}\b(?:audit|review)\b|(?:不要|不得|禁止)[\s\S]{0,50}(?:发送|发起|委派|请求|开始)[\s\S]{0,30}(?:审计|审核|复审))/iu;
+const WAITING_FOR_PEER_AUDIT_RE = /(?:\b(?:peer[- ]audit|independent\s+(?:audit|review)|audit)\b[\s\S]{0,80}\b(?:pass|verdict|reply|result|receipt)\b|\b(?:pass|verdict|reply|result|receipt)\b[\s\S]{0,80}\b(?:peer[- ]audit|independent\s+(?:audit|review))\b|(?:等待|等候|尚未收到|未收到|阻塞)[\s\S]{0,60}(?:独立)?(?:审计|审核|复审)[\s\S]{0,30}(?:通过|结论|裁决|回复|回执|结果)?)/iu;
 const POST_AUDIT_REPOSITORY_FINALIZATION_ACTION = 'Peer-audit has passed. Perform only the already-audited repository or delivery finalization requested for this task (stage/commit/push, merge, release, publish, or deploy as applicable). Do not perform additional implementation work. Do not request or start another audit.';
 const COMPLETED_REPOSITORY_FINALIZATION_RE = /(?:\bcommit\s*:\s*[0-9a-f]{7,40}\b|\bpush\s*:\s*(?:origin\/)?[^\s]+\s+(?:succeeded|successful|done|complete)|\b(?:committed|pushed|merged|released|published|deployed)\b|(?:已完成并)?(?:提交并推送|提交且推送)|(?:已|成功)(?:提交|推送|合并|发布|部署)|推送成功)/iu;
 const AUDIT_WORTHY_TASK_RE = /(?:\b(?:implement|fix|add|remove|delete|change|modify|update|refactor|optimi[sz]e|build|configure|migrate|install|uninstall)\b|(?:修复|实现|新增|添加|删除|修改|改成|调整|重构|优化|美化|配置|迁移|安装|卸载))/iu;
@@ -858,12 +862,19 @@ class SupervisionAutomation {
     }
     const active = this.activeRuns.get(sessionName);
     if (active) {
-      active.snapshot = snapshot;
+      active.snapshot = active.snapshot.uiLocale
+        ? { ...snapshot, uiLocale: active.snapshot.uiLocale }
+        : snapshot;
       active.hasLiveSnapshotUpdate = true;
     }
     const pending = this.pendingTaskIntents.get(sessionName);
     if (pending) {
-      this.pendingTaskIntents.set(sessionName, { ...pending, snapshot });
+      this.pendingTaskIntents.set(sessionName, {
+        ...pending,
+        snapshot: pending.snapshot.uiLocale
+          ? { ...snapshot, uiLocale: pending.snapshot.uiLocale }
+          : snapshot,
+      });
     }
     // Regression fix: if supervision was freshly enabled on an already-idle
     // session (user flipped Auto ON after the assistant had already finished a
@@ -913,7 +924,12 @@ class SupervisionAutomation {
     const latestAssistant = this.latestAssistantTexts.get(sessionName);
     if (!candidate || !latestAssistant) return false;
     if (latestAssistant.sequence <= candidate.sequence) return false;
-    const implicitRun = this.registerTaskIntent(sessionName, candidate.commandId, candidate.text, snapshot);
+    const implicitRun = this.registerTaskIntent(
+      sessionName,
+      candidate.commandId,
+      candidate.text,
+      candidate.uiLocale ? { ...snapshot, uiLocale: candidate.uiLocale } : snapshot,
+    );
     if (!implicitRun) return false;
     implicitRun.lastAssistantText = latestAssistant.text;
     implicitRun.sawAssistantOutput = true;
@@ -1096,6 +1112,19 @@ class SupervisionAutomation {
     run.deferredFinalization = {
       reason: 'The original task explicitly defers validation or repository finalization until peer-audit PASS.',
       nextAction: POST_AUDIT_DEFERRED_NEXT_ACTION,
+    };
+  }
+
+  private deferRepositoryFinalizationIfPresent(
+    run: ActiveTaskRunState,
+    decision: { reason: string; gap?: string },
+    evidence: string,
+  ): void {
+    if (!REPOSITORY_FINALIZATION_ACTION_RE.test(evidence) || run.deferredFinalization) return;
+    run.deferredFinalization = {
+      reason: decision.reason,
+      nextAction: POST_AUDIT_REPOSITORY_FINALIZATION_ACTION,
+      ...(decision.gap ? { gap: decision.gap } : {}),
     };
   }
 
@@ -1477,6 +1506,7 @@ class SupervisionAutomation {
       const automation = event.payload.automation === true;
       const queueAppended = event.payload.queueAppended === true;
       const text = trimString(event.payload.text);
+      const uiLocale = normalizeSupervisionUiLocale(event.payload.uiLocale);
       const activeRun = this.activeRuns.get(event.sessionId);
       // Structured delegation replies are injected into the origin session as
       // trusted runtime notifications before the delivery event opens the
@@ -1508,6 +1538,7 @@ class SupervisionAutomation {
           commandId: clientMessageId ?? `implicit:${Date.now()}`,
           text,
           sequence,
+          ...(uiLocale ? { uiLocale } : {}),
         });
       }
       if (pending && !automation && !queueAppended && clientMessageId === pending.commandId) {
@@ -1699,6 +1730,26 @@ class SupervisionAutomation {
         return;
       }
       case 'continue': {
+        const continueText = [decision.nextAction, decision.gap, decision.reason, latest.lastAssistantText]
+          .filter((entry): entry is string => typeof entry === 'string' && entry.trim().length > 0)
+          .join(' ');
+        if (
+          latest.phase === 'execution'
+          && latest.snapshot.mode === SUPERVISION_MODE.SUPERVISED_AUDIT
+          && !reportedAuditPass
+          && NEW_AUDIT_DELEGATION_RE.test(continueText)
+          && !FORBIDS_NEW_AUDIT_RE.test(continueText)
+        ) {
+          // The supervisor model is not allowed to route an audit through a
+          // normal continue turn (including legacy P2P audit>plan wording).
+          // Audit selection and reply authority belong to startAudit(), whose
+          // dedicated prompt tells this current session exactly whom to
+          // contact. Normalize model drift into that state transition.
+          this.deferRepositoryFinalizationIfPresent(latest, decision, continueText);
+          latest.terminalState = 'complete';
+          await this.startAudit(latest);
+          return;
+        }
         // A completed turn can already contain a clearly stated independent
         // audit PASS (for example an agent-native subagent review followed by
         // commit/push). If the supervisor then asks only to dispatch that same
@@ -1776,6 +1827,25 @@ class SupervisionAutomation {
         return;
       }
       case 'waiting': {
+        const waitingText = [decision.reason, decision.gap, latest.lastAssistantText]
+          .filter((entry): entry is string => typeof entry === 'string' && entry.trim().length > 0)
+          .join(' ');
+        const waitingForUndispatchedAudit = latest.phase === 'execution'
+          && latest.snapshot.mode === SUPERVISION_MODE.SUPERVISED_AUDIT
+          && WAITING_FOR_PEER_AUDIT_RE.test(waitingText);
+        if (waitingForUndispatchedAudit) {
+          // `waiting` is valid only after a real reply-enabled delegation has
+          // moved this run into `auditing`. If the run is still in execution,
+          // the model merely inferred that an audit ought to exist. Parking
+          // here deadlocks the task: no auditor was contacted and the target
+          // session is simultaneously forbidden from finalizing. Start the
+          // daemon-owned audit handoff instead, which explicitly instructs
+          // this current session to prepare and send the addressed brief.
+          this.deferRepositoryFinalizationIfPresent(latest, decision, waitingText);
+          latest.terminalState = 'complete';
+          await this.startAudit(latest);
+          return;
+        }
         // Park: no continue contract, no finishRun. The run stays alive so the
         // next assistant turn — which happens when the awaited reply arrives —
         // re-enters evaluation naturally. Re-prompting here is exactly the loop
@@ -1823,9 +1893,20 @@ class SupervisionAutomation {
 
   private async startAudit(run: ActiveTaskRunState): Promise<void> {
     if (run.phase !== 'execution' || this.activeRuns.get(run.sessionName)?.generation !== run.generation) return;
+    // Keep the evaluation reservation across the asynchronous baseline scan.
+    // Clearing it before walking OpenSpec files lets a repeated idle boundary
+    // start a second evaluation and eventually dispatch a duplicate audit.
+    // The visible phase remains execution until the handoff is ready, so an
+    // `auditing` phase always means the addressed prompt has been emitted.
+    run.evaluating = true;
+
     const baseline = await resolveAuditBaseline(run.sessionName, run);
     const current = this.activeRuns.get(run.sessionName);
-    if (!current || current.generation !== run.generation) return;
+    if (
+      !current
+      || current.generation !== run.generation
+      || current.phase !== 'execution'
+    ) return;
 
     current.phase = 'auditing';
     current.requiresAudit = false;
@@ -1854,7 +1935,11 @@ class SupervisionAutomation {
     const authoritativeSnapshot = record
       ? extractSessionSupervisionSnapshot(record.transportConfig ?? null)
       : null;
-    const latestSnapshot = current.hasLiveSnapshotUpdate ? current.snapshot : authoritativeSnapshot;
+    const latestSnapshot = current.hasLiveSnapshotUpdate
+      ? current.snapshot
+      : authoritativeSnapshot && current.snapshot.uiLocale
+        ? { ...authoritativeSnapshot, uiLocale: current.snapshot.uiLocale }
+        : authoritativeSnapshot;
     let automaticSnapshot = latestSnapshot?.mode === SUPERVISION_MODE.SUPERVISED_AUDIT
       ? latestSnapshot
       : null;

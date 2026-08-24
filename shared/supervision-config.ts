@@ -49,6 +49,8 @@ export const SUPERVISION_USER_DEFAULT_PREF_KEY = 'supervision.user_default' as c
 export const SUPERVISION_SUPPORTED_BACKENDS = SHARED_CONTEXT_RUNTIME_BACKENDS;
 export const SUPERVISION_SUPPORTED_TARGET_SESSION_TYPES = TRANSPORT_SESSION_AGENT_TYPES;
 export const SUPERVISION_UNSUPPORTED_TARGET_SESSION_TYPES = PROCESS_SESSION_AGENT_TYPES;
+export const SUPERVISION_SUPPORTED_UI_LOCALES = ['en', 'zh-CN', 'zh-TW', 'es', 'ru', 'ja', 'ko'] as const;
+export type SupervisionUiLocale = typeof SUPERVISION_SUPPORTED_UI_LOCALES[number];
 export const DEFAULT_SUPERVISION_BACKEND: SharedContextRuntimeBackend = DEFAULT_PRIMARY_CONTEXT_BACKEND;
 
 const SUPERVISION_AUDIT_MODE_ALLOWLIST = [
@@ -117,6 +119,7 @@ export type SessionSupervisionSnapshotIssue =
   | 'invalid_custom_instructions'
   | 'invalid_custom_instructions_override'
   | 'invalid_global_custom_instructions'
+  | 'invalid_ui_locale'
   | 'invalid_preset'
   | 'invalid_backup_backend'
   | 'invalid_backup_model'
@@ -170,6 +173,8 @@ export interface SupervisorDefaultConfig {
 
 export interface SessionSupervisionSnapshot extends SupervisorDefaultConfig {
   mode: SupervisionMode;
+  /** UI language selected by the human who started this supervised task. */
+  uiLocale?: SupervisionUiLocale;
   /** Session-scoped supervision custom instructions. See merge rule in design §2. */
   customInstructions?: string;
   /**
@@ -211,6 +216,11 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 
 function trimString(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
+
+export function normalizeSupervisionUiLocale(value: unknown): SupervisionUiLocale | undefined {
+  const locale = trimString(value);
+  return SUPERVISION_SUPPORTED_UI_LOCALES.find((candidate) => candidate === locale);
 }
 
 function isCanonicalPeerAuditDimension(value: unknown): value is string {
@@ -409,6 +419,9 @@ export function getSessionSupervisionSnapshotIssues(
   if (record.globalCustomInstructions != null && typeof record.globalCustomInstructions !== 'string') {
     issues.push('invalid_global_custom_instructions');
   }
+  if (record.uiLocale != null && normalizeSupervisionUiLocale(record.uiLocale) === undefined) {
+    issues.push('invalid_ui_locale');
+  }
   if (
     record.maxParseRetries != null
     && (typeof record.maxParseRetries !== 'number' || !Number.isFinite(record.maxParseRetries) || Math.floor(record.maxParseRetries) < 1)
@@ -472,6 +485,7 @@ export function normalizeSessionSupervisionSnapshot(
     ? merged.customInstructionsOverride
     : false;
   const globalCustomInstructions = trimString(merged.globalCustomInstructions);
+  const uiLocale = normalizeSupervisionUiLocale(merged.uiLocale);
   const maxParseRetries = normalizePositiveInteger(merged.maxParseRetries, SUPERVISION_DEFAULT_MAX_PARSE_RETRIES, 1);
   const maxAutoContinueStreak = normalizeNonNegativeInteger(merged.maxAutoContinueStreak, SUPERVISION_DEFAULT_MAX_AUTO_CONTINUE_STREAK);
   const maxAutoContinueTotal = normalizeNonNegativeInteger(merged.maxAutoContinueTotal, SUPERVISION_DEFAULT_MAX_AUTO_CONTINUE_TOTAL);
@@ -490,6 +504,7 @@ export function normalizeSessionSupervisionSnapshot(
     // default (unchecked = concat) case. Normalizer defaults missing to false.
     ...(customInstructionsOverride ? { customInstructionsOverride: true } : {}),
     ...(globalCustomInstructions ? { globalCustomInstructions } : {}),
+    ...(uiLocale ? { uiLocale } : {}),
     maxParseRetries,
     maxAutoContinueStreak,
     maxAutoContinueTotal,

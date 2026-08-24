@@ -2790,7 +2790,111 @@ describe('SupervisionAutomation', () => {
     expect(String(mockTransportRuntime.send.mock.calls[0]?.[0])).toContain('imcodes send --reply');
     expect(mockStartP2pRun).not.toHaveBeenCalled();
   });
-  // The loop this fixes: a session that dispatched a peer audit and is barred
+
+  it('starts the addressed audit instead of parking when no peer audit was actually dispatched', async () => {
+    const snapshot = await seedSession('supervised_audit');
+    mockSupervisionDecide.mockResolvedValueOnce({
+      decision: 'waiting',
+      reason: 'The implementation and validation are complete, but the audit-order rule forbids git finalization until peer-audit PASS.',
+      confidence: 0.94,
+      requiresAudit: false,
+    });
+
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent(
+      'deck_supervision_brain',
+      'cmd-undispatched-audit-wait',
+      '修复共享会话刷新回归并完成提交推送',
+      snapshot,
+    );
+    beginRun('cmd-undispatched-audit-wait', '修复共享会话刷新回归并完成提交推送');
+    completeTurn('实现与验证已经完成并通过；当前阻塞于 peer-audit PASS，尚未执行 git commit/push。');
+
+    await vi.waitFor(() => {
+      expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
+    }, { timeout: 4_000 });
+
+    const auditPrompt = String(mockTransportRuntime.send.mock.calls[0]?.[0]);
+    expect(auditPrompt).toContain('Exact delegate target session: deck_sub_reviewer');
+    expect(auditPrompt).toContain('imcodes send --reply "deck_sub_reviewer"');
+    expect(auditPrompt).toContain('send exactly one reply-enabled audit request to deck_sub_reviewer');
+    expect(auditPrompt).not.toContain('[Contract: supervision_continue_v1]');
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({
+      phase: 'auditing',
+      deferredFinalization: {
+        nextAction: expect.stringContaining('Peer-audit has passed'),
+      },
+    });
+    const events = timelineEmitter.replay('deck_supervision_brain', 0).events;
+    expect(events.some((event) => event.type === 'agent.status'
+      && event.payload.status === 'supervision_parked')).toBe(false);
+  });
+
+  it('normalizes a model-authored P2P audit continue into the dedicated current-session audit handoff', async () => {
+    const snapshot = await seedSession('supervised_audit');
+    mockSupervisionDecide.mockResolvedValueOnce({
+      decision: 'continue',
+      reason: '实现和测试已完成，现在需要独立审计。',
+      gap: '尚未获得 peer-audit PASS。',
+      nextAction: '通过 P2P 发起 peer-audit，方向为 audit>plan。',
+      confidence: 0.92,
+      requiresAudit: true,
+    });
+
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent(
+      'deck_supervision_brain',
+      'cmd-model-audit-drift',
+      '修复共享会话刷新回归',
+      snapshot,
+    );
+    beginRun('cmd-model-audit-drift', '修复共享会话刷新回归');
+    completeTurn('实现和定向测试已全部完成。');
+
+    await vi.waitFor(() => {
+      expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
+    }, { timeout: 4_000 });
+
+    const prompt = String(mockTransportRuntime.send.mock.calls[0]?.[0]);
+    expect(prompt).toContain('Exact delegate target session: deck_sub_reviewer');
+    expect(prompt).toContain('imcodes send --reply "deck_sub_reviewer"');
+    expect(prompt).not.toContain('[Contract: supervision_continue_v1]');
+    expect(prompt).not.toContain('audit>plan');
+    expect(mockStartP2pRun).not.toHaveBeenCalled();
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({ phase: 'auditing' });
+  });
+
+  it('reserves the audit phase before baseline I/O so a repeated idle boundary cannot dispatch twice', async () => {
+    const snapshot = await seedSession('supervised_audit', true);
+    mockSupervisionDecide.mockImplementationOnce(async () => {
+      setImmediate(() => completeTurn('重复 idle 边界：仍然是同一个已完成回合。'));
+      return {
+        decision: 'complete',
+        reason: '实现与验证已完成。',
+        confidence: 0.95,
+        requiresAudit: true,
+      } as const;
+    });
+
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent(
+      'deck_supervision_brain',
+      'cmd-audit-baseline-race',
+      'implement supervised-task-automation',
+      snapshot,
+    );
+    beginRun('cmd-audit-baseline-race', 'implement supervised-task-automation');
+    completeTurn('Implementation and validation are complete.');
+
+    await waitForTransportSendCount(1);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    expect(mockSupervisionDecide).toHaveBeenCalledTimes(1);
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({ phase: 'auditing' });
+  });
+
+  // A session that dispatched an external validation request and is barred
   // from touching the repo until it returns can only be classified `continue`
   // out of the old three-value enum, so automation re-prompted it forever and
   // it answered "still blocked" every time.
@@ -2798,7 +2902,7 @@ describe('SupervisionAutomation', () => {
     const snapshot = await seedSession('supervised_audit');
     mockSupervisionDecide.mockResolvedValue({
       decision: 'waiting',
-      reason: 'blocked awaiting the delegated audit verdict',
+      reason: 'blocked awaiting the delegated validation reply',
       confidence: 0.9,
     });
 
@@ -2810,7 +2914,7 @@ describe('SupervisionAutomation', () => {
       snapshot,
     );
     beginRun('cmd-parked', 'implement the feature');
-    completeTurn('Still blocked on the audit reply; not touching the repository.');
+    completeTurn('Still blocked on the delegated validation reply; not touching the repository.');
 
     await vi.waitFor(() => {
       const events = timelineEmitter.replay('deck_supervision_brain', 0).events;
@@ -2830,12 +2934,12 @@ describe('SupervisionAutomation', () => {
     mockSupervisionDecide
       .mockResolvedValueOnce({
         decision: 'waiting',
-        reason: 'blocked awaiting the delegated audit verdict',
+        reason: 'blocked awaiting the delegated validation reply',
         confidence: 0.9,
       })
       .mockResolvedValueOnce({
         decision: 'complete',
-        reason: 'audit returned and the work is done',
+        reason: 'delegated validation returned and the work is done',
         confidence: 0.95,
         requiresAudit: false,
       });
@@ -2843,7 +2947,7 @@ describe('SupervisionAutomation', () => {
     supervisionAutomation.init();
     supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-park-resume', 'implement the feature', snapshot);
     beginRun('cmd-park-resume', 'implement the feature');
-    completeTurn('Still blocked on the audit reply.');
+    completeTurn('Still blocked on the delegated validation reply.');
     await vi.waitFor(() => {
       expect(mockSupervisionDecide).toHaveBeenCalledTimes(1);
     }, { timeout: 4_000 });
@@ -2855,7 +2959,7 @@ describe('SupervisionAutomation', () => {
     expect(parked).toMatchObject({ phase: 'execution', commandId: 'cmd-park-resume' });
     const parkedGeneration = parked!.generation;
 
-    completeTurn('Audit returned PASS; everything is finished.');
+    completeTurn('Delegated validation returned; everything is finished.');
     await vi.waitFor(() => {
       expect(mockSupervisionDecide).toHaveBeenCalledTimes(2);
     }, { timeout: 4_000 });
@@ -2877,13 +2981,13 @@ describe('SupervisionAutomation', () => {
     const snapshot = await seedSession('supervised_audit');
     mockSupervisionDecide.mockResolvedValue({
       decision: 'waiting',
-      reason: 'blocked awaiting the delegated audit verdict',
+      reason: 'blocked awaiting the delegated validation reply',
       confidence: 0.9,
     });
     supervisionAutomation.init();
     supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-stop-target', 'task', snapshot);
     beginRun('cmd-stop-target', 'task');
-    completeTurn('Blocked on the audit reply.');
+    completeTurn('Blocked on the delegated validation reply.');
     await vi.waitFor(async () => {
       expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeDefined();
     }, { timeout: 4_000 });
@@ -2900,13 +3004,13 @@ describe('SupervisionAutomation', () => {
     const snapshot = await seedSession('supervised_audit');
     mockSupervisionDecide.mockResolvedValue({
       decision: 'waiting',
-      reason: 'blocked awaiting the delegated audit verdict',
+      reason: 'blocked awaiting the delegated validation reply',
       confidence: 0.9,
     });
     supervisionAutomation.init();
     supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-stop-self', 'task', snapshot);
     beginRun('cmd-stop-self', 'task');
-    completeTurn('Blocked on the audit reply.');
+    completeTurn('Blocked on the delegated validation reply.');
     await vi.waitFor(async () => {
       expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeDefined();
     }, { timeout: 4_000 });
@@ -2924,7 +3028,7 @@ describe('SupervisionAutomation', () => {
     const snapshot = await seedSession('supervised_audit');
     mockSupervisionDecide.mockResolvedValue({
       decision: 'waiting',
-      reason: 'blocked awaiting the delegated audit verdict',
+      reason: 'blocked awaiting the delegated validation reply',
       confidence: 0.9,
     });
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
@@ -2932,7 +3036,7 @@ describe('SupervisionAutomation', () => {
       supervisionAutomation.init();
       supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-park-a', 'task A', snapshot);
       beginRun('cmd-park-a', 'task A');
-      completeTurn('Blocked on the audit reply.');
+      completeTurn('Blocked on the delegated validation reply.');
       await vi.waitFor(async () => {
         expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({ phase: 'execution' });
       }, { timeout: 4_000 });
@@ -2968,13 +3072,13 @@ describe('SupervisionAutomation', () => {
     mockSupervisionDecide
       .mockResolvedValueOnce({
         decision: 'waiting',
-        reason: 'blocked awaiting the delegated audit verdict',
+        reason: 'blocked awaiting the delegated validation reply',
         confidence: 0.9,
       })
       .mockImplementationOnce(() => new Promise((resolve) => {
         releaseSecondDecision = () => resolve({
           decision: 'complete',
-          reason: 'audit returned and the work is done',
+          reason: 'delegated validation returned and the work is done',
           confidence: 0.95,
           requiresAudit: false,
         });
@@ -2989,13 +3093,13 @@ describe('SupervisionAutomation', () => {
       supervisionAutomation.init();
       supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-park-race', 'implement the feature', snapshot);
       beginRun('cmd-park-race', 'implement the feature');
-      completeTurn('Blocked on the audit reply.');
+      completeTurn('Blocked on the delegated validation reply.');
       await vi.waitFor(async () => {
         expect(mockSupervisionDecide).toHaveBeenCalledTimes(1);
       }, { timeout: 4_000 });
 
       // The verdict lands; evaluation starts but the broker has not answered.
-      completeTurn('Audit returned PASS; everything is finished.');
+      completeTurn('Delegated validation returned; everything is finished.');
       await vi.waitFor(async () => {
         expect(mockSupervisionDecide).toHaveBeenCalledTimes(2);
       }, { timeout: 4_000 });
@@ -3032,7 +3136,7 @@ describe('SupervisionAutomation', () => {
     const snapshot = await seedSession('supervised_audit');
     mockSupervisionDecide.mockResolvedValue({
       decision: 'waiting',
-      reason: 'blocked awaiting the delegated audit verdict',
+      reason: 'blocked awaiting the delegated validation reply',
       confidence: 0.9,
     });
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
@@ -3040,7 +3144,7 @@ describe('SupervisionAutomation', () => {
       supervisionAutomation.init();
       supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-park-timeout', 'implement the feature', snapshot);
       beginRun('cmd-park-timeout', 'implement the feature');
-      completeTurn('Still blocked on the audit reply.');
+      completeTurn('Still blocked on the delegated validation reply.');
 
       await vi.waitFor(async () => {
         expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({ phase: 'execution' });

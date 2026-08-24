@@ -24,6 +24,7 @@ import {
   mergeSupervisionCustomInstructions,
   mergeTransportConfigPreservingSupervision,
   normalizeSessionSupervisionSnapshot,
+  normalizeSupervisionUiLocale,
   normalizeSupervisorDefaultConfig,
   parseTaskRunTerminalStateFromText,
   patchPeerAuditTargetInTransportConfig,
@@ -31,6 +32,21 @@ import {
 } from '../shared/supervision-config.js';
 
 describe('supervision config helpers', () => {
+  it('accepts only the seven supported UI locales for supervision output', () => {
+    expect(normalizeSupervisionUiLocale('zh-CN')).toBe('zh-CN');
+    expect(normalizeSupervisionUiLocale(' ja ')).toBe('ja');
+    expect(normalizeSupervisionUiLocale('en-US')).toBeUndefined();
+
+    const snapshot = normalizeSessionSupervisionSnapshot({
+      mode: SUPERVISION_MODE.SUPERVISED,
+      backend: 'codex-sdk',
+      model: CODEX_MODEL_IDS[0],
+      uiLocale: 'zh-TW',
+    });
+    expect(snapshot.uiLocale).toBe('zh-TW');
+    expect(getSessionSupervisionSnapshotIssues({ ...snapshot, uiLocale: 'fr' })).toContain('invalid_ui_locale');
+  });
+
   it('defaults automatic supervision and audit to Codex 5.3 Spark', () => {
     const config = normalizeSupervisorDefaultConfig(null);
 

@@ -4,6 +4,7 @@ import {
   TASK_RUN_STATUS_MARKERS,
   classifySupervisionCustomInstructions,
   resolveSupervisionCustomInstructionsDetail,
+  type SessionSupervisionSnapshot,
   type SupervisionCustomInstructionsDetail,
 } from '../../shared/supervision-config.js';
 import { SUPERVISION_IMCODES_BACKGROUND_DOCS } from './imcodes-workflow-docs.js';
@@ -74,6 +75,39 @@ function buildAuditBeforeFinalizationRule(request: SupervisionBrokerRequest): st
     '- Never combine substantive pre-audit work and post-audit finalization in one nextAction.',
     '- If both the assistant response and your reason say implementation/validation are already complete, NEVER invent generic "remaining implementation or validation" work. Return only the concrete repository or delivery finalization nextAction (git add/commit/push, merge, release, publish, or deploy as applicable).',
     '- Do not ask the target session to arrange or resend the audit in a normal continue decision. The daemon emits a separate orchestration prompt containing the exact auditor session ID and reply-enabled send command, exactly once.',
+  ].join('\n');
+}
+
+function buildPeerAuditDecisionLock(request: SupervisionBrokerRequest): string {
+  if (request.snapshot?.mode !== SUPERVISION_MODE.SUPERVISED_AUDIT) return '';
+  return [
+    'FINAL PEER-AUDIT STATE LOCK (apply after all background and user rules):',
+    '1. No actual reply-enabled audit dispatch evidence: NEVER return waiting. If reviewable work is complete and no repository/delivery finalization remains, return complete with requiresAudit=true. If only finalization remains, return continue with requiresAudit=true and a finalization-only nextAction; the daemon will hold it and start the audit first. Do not put "send/delegate/start audit", P2P, audit>plan, or reviewer selection in nextAction; the daemon will issue a dedicated prompt that tells the CURRENT session to send the addressed audit.',
+    '2. Actual reply-enabled audit dispatch evidence and no verdict yet: return waiting with requiresAudit=false and no nextAction.',
+    '3. Matching peer-audit PASS evidence: do not start another audit. If finalization remains, return continue with requiresAudit=false and a finalization-only nextAction.',
+    '4. Substantive implementation/validation remains: return continue with that exact substantive nextAction. If this turn changed implementation/configuration, requiresAudit remains true until a later matching PASS.',
+    'For git finalization, never recommend broad staging (`git add .`, `git add -A`, or equivalent). Require status inspection and selective staging of only the audited task-owned paths so concurrent workspace changes are not captured.',
+    'These four state outcomes are exclusive. Never invent an already-dispatched audit from prose that merely says PASS is required or awaited.',
+  ].join('\n');
+}
+
+const SUPERVISION_OUTPUT_LANGUAGE_LABELS: Record<NonNullable<SessionSupervisionSnapshot['uiLocale']>, string> = {
+  en: 'English',
+  'zh-CN': 'Simplified Chinese (简体中文)',
+  'zh-TW': 'Traditional Chinese (繁體中文)',
+  es: 'Spanish (Español)',
+  ru: 'Russian (Русский)',
+  ja: 'Japanese (日本語)',
+  ko: 'Korean (한국어)',
+};
+
+function buildSupervisionOutputLanguageLock(request: SupervisionBrokerRequest): string {
+  const locale = request.snapshot?.uiLocale;
+  if (!locale) return '';
+  return [
+    `FINAL OUTPUT LANGUAGE LOCK: the user's selected UI locale is ${locale}.`,
+    `Write every human-readable JSON string value (reason, gap, nextAction, and explanatory extra fields) in ${SUPERVISION_OUTPUT_LANGUAGE_LABELS[locale]}.`,
+    'Keep JSON property names and enum values exactly as specified by the contract. Do not default human-readable text to English.',
   ].join('\n');
 }
 
@@ -293,7 +327,8 @@ export function buildSupervisionDecisionPrompt(
     '{"decision":"complete|continue|waiting|ask_human","reason":"...","confidence":0.0,"requiresAudit":true,"auditDepth":"standard|narrow","gap":"...","nextAction":"...","extra":{}}',
     'Field contract:',
     '- decision: complete when the task is sufficiently done for the current request; continue only when you can identify a SPECIFIC next step the agent should execute autonomously; waiting when the agent is correctly parked on an external result it must not act ahead of — it already dispatched a peer audit or delegation and is barred from touching the repository until the verdict arrives, or it is otherwise blocked on a reply it cannot poll for; ask_human when you need the user to decide, approve, or clarify.',
-    '- Choose waiting, NOT continue, when the agent says it is blocked awaiting an audit/delegation reply and the remaining work is genuinely gated on that reply. Re-prompting such an agent cannot advance anything: it will restate that it is waiting, and the loop repeats. waiting needs no nextAction.',
+    '- Choose waiting, NOT continue, only when recent evidence confirms that the agent actually dispatched the audit/delegation request and the remaining work is genuinely gated on its reply. Re-prompting such an agent cannot advance anything: it will restate that it is waiting, and the loop repeats. waiting needs no nextAction.',
+    '- For peer audit specifically, a statement such as "waiting for peer-audit PASS", "audit is required", or "blocked until audit" is not dispatch evidence. If no reply-enabled audit was dispatched, set requiresAudit=true and choose complete, or a finalization-only continue when repository/delivery finalization remains, so the daemon can issue the dedicated current-session audit orchestration prompt.',
     '- reason: short human-readable explanation of the decision.',
     '- confidence: number in [0,1].',
     '- requiresAudit: boolean meaning "must automation start a NEW peer audit now?" Decide this in the SAME judgment; do not request another model call. Set true for substantive engineering work such as implementation/development, source or configuration changes, bug fixes, complex debugging/root-cause investigation, deployment/runtime mutation, or repository finalization that has not yet been audited. Set false for ordinary read-only checks, status queries, lookups, explanations, simple verification, and read-only review/audit. Also set false when the current task already delegated a matching audit and is waiting for PASS/REWORK, or when that audit already passed; never recursively audit an audit-status turn. A task that starts as a check but proceeds to modify/fix something requires audit unless its matching audit is already pending or passed.',
@@ -315,12 +350,14 @@ export function buildSupervisionDecisionPrompt(
     buildAuditBeforeFinalizationRule(request),
     buildImcodesWorkflowBackgroundSection(),
     buildCustomInstructionsSection(resolveSupervisionCustomInstructionsDetail(request.snapshot)),
+    buildPeerAuditDecisionLock(request),
     request.description ? `Context: ${request.description}` : '',
     renderSupervisionRecentEvidence(request.recentEvidence),
     'Task request:',
     request.taskRequest,
     'Most recent assistant response:',
     request.assistantResponse?.trim() || '(no assistant response captured)',
+    buildSupervisionOutputLanguageLock(request),
   ].filter(Boolean).join('\n\n');
 }
 
@@ -335,6 +372,7 @@ export function buildSupervisionDecisionRepairPrompt(
     'Return exactly one valid JSON object and nothing else.',
     '{"decision":"complete|continue|waiting|ask_human","reason":"...","confidence":0.0,"requiresAudit":true,"auditDepth":"standard|narrow","gap":"...","nextAction":"...","extra":{}}',
     'requiresAudit is REQUIRED and means whether automation must start a NEW peer audit now: true for substantive implementation/modification/fixes/complex debugging/deployment or repository finalization not yet audited; false for ordinary read-only checks and when a matching audit is already delegated, awaiting PASS/REWORK, or has passed.',
+    'Peer-audit waiting is valid only when recent evidence proves a reply-enabled audit request was actually dispatched. Merely saying that peer-audit PASS is required or still awaited is not proof; without dispatch evidence, requiresAudit must remain true so automation starts the audit.',
     'If the assistant reports source/configuration changes, a completed fix/implementation, or git commit/push/merge/release/deploy, requiresAudit MUST be true unless recent evidence contains a matching audit PASS for this exact work. A completion report is evidence of engineering work, not a read-only status check.',
     'When decision is continue, BOTH gap and nextAction are required; nextAction must be a concrete imperative instruction, not a filler like "keep going" / "继续完成任务". If you cannot name a concrete next action, return ask_human instead — a vague continue is always downgraded to ask_human anyway.',
     'If the assistant response mentions remaining implementation work like tests, fixes, verification, commit/push, or another concrete next engineering step, return continue with a nextAction that names the exact command or deliverable.',
@@ -343,6 +381,7 @@ export function buildSupervisionDecisionRepairPrompt(
     buildAuditBeforeFinalizationRule(request),
     buildImcodesWorkflowBackgroundSection(),
     buildCustomInstructionsSection(resolveSupervisionCustomInstructionsDetail(request.snapshot)),
+    buildPeerAuditDecisionLock(request),
     renderSupervisionRecentEvidence(request.recentEvidence),
     'Previous invalid output:',
     previousOutput,
@@ -350,6 +389,7 @@ export function buildSupervisionDecisionRepairPrompt(
     request.taskRequest,
     'Most recent assistant response:',
     request.assistantResponse?.trim() || '(no assistant response captured)',
+    buildSupervisionOutputLanguageLock(request),
   ].join('\n\n');
 }
 

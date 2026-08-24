@@ -180,10 +180,44 @@ describe('supervision prompts', () => {
     expect(prompt).toContain('"requiresAudit":true');
     expect(prompt).toContain('Set false for ordinary read-only checks, status queries, lookups, explanations, simple verification, and read-only review/audit.');
     expect(prompt).toContain('must automation start a NEW peer audit now?');
+    expect(prompt).toContain('only when recent evidence confirms that the agent actually dispatched the audit/delegation request');
+    expect(prompt).toContain('is not dispatch evidence');
+    expect(prompt).toContain('If only finalization remains, return continue with requiresAudit=true');
+    expect(prompt).toContain('never recommend broad staging (`git add .`, `git add -A`');
     expect(prompt).toContain('already delegated a matching audit and is waiting for PASS/REWORK');
     expect(prompt).toContain('never recursively audit an audit-status turn');
     expect(prompt).toContain('A task that starts as a check but proceeds to modify/fix something requires audit unless its matching audit is already pending or passed.');
     expect(prompt).toContain('Do not reinterpret completed engineering work as a read-only status check');
+  });
+
+  it('locks human-readable supervisor output to the task UI locale', () => {
+    const snapshot = normalizeSessionSupervisionSnapshot({
+      mode: SUPERVISION_MODE.SUPERVISED_AUDIT,
+      backend: 'codex-sdk',
+      model: 'gpt-5.3-codex-spark',
+      uiLocale: 'zh-CN',
+      timeoutMs: 2_000,
+      promptVersion: 'supervision_decision_v1',
+      maxParseRetries: 1,
+      maxAuditLoops: 2,
+      taskRunPromptVersion: 'task_run_status_v1',
+    });
+
+    const request = {
+      snapshot,
+      taskRequest: '修复并完成审计',
+      assistantResponse: '实现和测试已完成。',
+    };
+    const prompt = buildSupervisionDecisionPrompt(request);
+    const repair = buildSupervisionDecisionRepairPrompt(request, 'not json');
+
+    for (const rendered of [prompt, repair]) {
+      expect(rendered).toContain("the user's selected UI locale is zh-CN");
+      expect(rendered).toContain('Simplified Chinese (简体中文)');
+      expect(rendered).toContain('reason, gap, nextAction');
+      expect(rendered).toContain('Do not default human-readable text to English.');
+      expect(rendered.lastIndexOf('FINAL OUTPUT LANGUAGE LOCK')).toBeGreaterThan(rendered.lastIndexOf('Most recent assistant response:'));
+    }
   });
 
   it('forbids repository finalization after REWORK until a fresh peer audit passes', () => {
