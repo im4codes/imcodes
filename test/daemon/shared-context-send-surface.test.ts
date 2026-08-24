@@ -206,7 +206,13 @@ const flushAsync = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
 describe('shared-context send-surface parity integration', () => {
   let server: http.Server;
   let port: number;
-  let runtime: { providerSessionId: string; pendingCount: number; send: ReturnType<typeof vi.fn>; getStatus: ReturnType<typeof vi.fn> };
+  let runtime: {
+    providerSessionId: string;
+    pendingCount: number;
+    send: ReturnType<typeof vi.fn>;
+    appendExternalMessageToActiveTurn: ReturnType<typeof vi.fn>;
+    getStatus: ReturnType<typeof vi.fn>;
+  };
 
   beforeEach(async () => {
     vi.clearAllMocks();
@@ -215,6 +221,7 @@ describe('shared-context send-surface parity integration', () => {
       providerSessionId: 'provider-session',
       pendingCount: 0,
       send: vi.fn(() => 'sent'),
+      appendExternalMessageToActiveTurn: vi.fn(async () => 'appended'),
       getStatus: vi.fn(() => 'idle'),
     };
     getTransportRuntimeMock.mockReturnValue(runtime);
@@ -269,8 +276,14 @@ describe('shared-context send-surface parity integration', () => {
       daemonVersion: '0.1.0',
     } as never);
 
-    expect(runtime.send).toHaveBeenCalledTimes(3);
-    expect(runtime.send.mock.calls.map((call: unknown[]) => call[0])).toEqual([command, command, command]);
+    expect(runtime.send).toHaveBeenCalledTimes(2);
+    expect(runtime.appendExternalMessageToActiveTurn).toHaveBeenCalledTimes(1);
+    expect([
+      runtime.send.mock.calls[0]?.[0],
+      runtime.appendExternalMessageToActiveTurn.mock.calls[0]?.[0],
+      runtime.send.mock.calls[1]?.[0],
+    ]).toEqual([command, command, command]);
     expect(runtime.send.mock.calls.every((call: unknown[]) => typeof call[0] === 'string')).toBe(true);
+    expect(runtime.appendExternalMessageToActiveTurn.mock.calls.every((call: unknown[]) => typeof call[0] === 'string')).toBe(true);
   });
 });
