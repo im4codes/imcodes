@@ -350,6 +350,35 @@ describe('auth nonce exchange API', () => {
     expect(expired).toHaveBeenCalledWith('auth_identity_changed');
   });
 
+  it('does not clear a valid mobile login for an endpoint-specific bearer 401', async () => {
+    const fetchMock = vi.mocked(fetch);
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse({ error: 'unsupported_account_bearer' }, 401))
+      .mockResolvedValueOnce(jsonResponse({ id: 'mobile-user' }))
+      .mockResolvedValueOnce(jsonResponse({ error: 'unsupported_account_bearer' }, 401));
+    const expired = vi.fn();
+    const {
+      ApiError,
+      apiFetch,
+      configureApiKey,
+      getApiKey,
+      onAuthExpired,
+    } = await import('../src/api.js');
+
+    configureApiKey('deck_mobile_account_key');
+    onAuthExpired(expired);
+
+    await expect(apiFetch('/api/remote-desktop/guest/host?hostId=host-1'))
+      .rejects.toMatchObject({ status: 401 } satisfies Partial<InstanceType<typeof ApiError>>);
+    expect(expired).not.toHaveBeenCalled();
+    expect(getApiKey()).toBe('deck_mobile_account_key');
+    expect(fetchMock.mock.calls.map(([url]) => String(url))).toEqual([
+      '/api/remote-desktop/guest/host?hostId=host-1',
+      '/api/auth/user/me',
+      '/api/remote-desktop/guest/host?hostId=host-1',
+    ]);
+  });
+
   it('propagates JSON decode failures from successful API responses', async () => {
     const fetchMock = vi.mocked(fetch);
     fetchMock.mockResolvedValue(new Response('not json', {

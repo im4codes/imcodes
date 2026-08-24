@@ -36,11 +36,9 @@ import {
   type OwnerLinkView,
 } from '../services/remote-desktop-guest-links.js';
 import {
-  nativeShellIssuer,
-  resolveBrowserAccountSession,
-  resolveNativeShellSession,
   type AccountSession,
 } from '../services/remote-desktop-account-auth.js';
+import { resolveRemoteDesktopAccountSession } from './remote-desktop-account-session.js';
 import {
   OWNER_HOST_MANAGEMENT_ERROR,
   OwnerHostManagementError,
@@ -108,21 +106,6 @@ async function readJson(c: Context<RouteEnv>): Promise<unknown> {
   } catch {
     return null;
   }
-}
-
-async function requestAccountSession(c: Context<RouteEnv>): Promise<AccountSession | null> {
-  const authorization = c.req.header('authorization');
-  // Any Authorization header commits the request to native-shell auth. Never
-  // fall back to a browser cookie after an invalid Bearer: the global CSRF
-  // middleware intentionally exempts Bearer requests.
-  if (authorization !== undefined) {
-    return resolveNativeShellSession(
-      c.env.DB,
-      authorization,
-      nativeShellIssuer(c.env.SERVER_URL),
-    );
-  }
-  return resolveBrowserAccountSession(c.env.DB, c.env.JWT_SIGNING_KEY, c.req.header('cookie'));
 }
 
 function asExactRecord(
@@ -321,7 +304,7 @@ remoteDesktopGuestAccessRoutes.post('/remote-desktop/guest/resolve', async (c) =
 /** Owner canonical-host summary. Public ID is non-secret but still Owner-scoped. */
 remoteDesktopGuestAccessRoutes.get('/remote-desktop/guest/host', async (c) => {
   c.header('Cache-Control', 'no-store');
-  const accountSession = await requestAccountSession(c);
+  const accountSession = await resolveRemoteDesktopAccountSession(c);
   if (!accountSession) return c.json({ error: 'unauthorized' }, 401);
   const hostId = c.req.query('hostId');
   if (!isRemoteDesktopId(hostId)) return c.json({ error: 'request_invalid' }, 400);
@@ -343,7 +326,7 @@ remoteDesktopGuestAccessRoutes.get('/remote-desktop/guest/host', async (c) => {
  */
 remoteDesktopGuestAccessRoutes.post('/remote-desktop/guest/privacy/begin', async (c) => {
   c.header('Cache-Control', 'no-store');
-  const accountSession = await requestAccountSession(c);
+  const accountSession = await resolveRemoteDesktopAccountSession(c);
   if (!accountSession) return c.json({ error: 'unauthorized' }, 401);
   const body = asExactRecord(
     await readJson(c),
@@ -434,7 +417,7 @@ remoteDesktopGuestAccessRoutes.post('/remote-desktop/guest/privacy/begin', async
 /** Clear only the exact no-route management-Web epoch after local secret UI is gone. */
 remoteDesktopGuestAccessRoutes.post('/remote-desktop/guest/privacy/end', async (c) => {
   c.header('Cache-Control', 'no-store');
-  const accountSession = await requestAccountSession(c);
+  const accountSession = await resolveRemoteDesktopAccountSession(c);
   if (!accountSession) return c.json({ error: 'unauthorized' }, 401);
   const body = asExactRecord(await readJson(c), ['hostId', 'epochId', 'revision']);
   if (!body || !isRemoteDesktopId(body.hostId) || !isRemoteDesktopId(body.epochId)
@@ -475,7 +458,7 @@ remoteDesktopGuestAccessRoutes.post('/remote-desktop/guest/privacy/end', async (
 /** Native shell polls this bounded state before enabling or after clearing secret UI. */
 remoteDesktopGuestAccessRoutes.get('/remote-desktop/guest/privacy/status', async (c) => {
   c.header('Cache-Control', 'no-store');
-  const accountSession = await requestAccountSession(c);
+  const accountSession = await resolveRemoteDesktopAccountSession(c);
   if (!accountSession || accountSession.kind !== 'native') {
     return c.json({ error: 'unauthorized' }, 401);
   }
@@ -522,7 +505,7 @@ remoteDesktopGuestAccessRoutes.get('/remote-desktop/guest/privacy/status', async
  */
 remoteDesktopGuestAccessRoutes.post('/remote-desktop/guest/privacy/recovery', async (c) => {
   c.header('Cache-Control', 'no-store');
-  const accountSession = await requestAccountSession(c);
+  const accountSession = await resolveRemoteDesktopAccountSession(c);
   if (!accountSession || accountSession.kind !== 'native') {
     return c.json({ error: 'unauthorized' }, 401);
   }
@@ -582,7 +565,7 @@ remoteDesktopGuestAccessRoutes.post('/remote-desktop/guest/privacy/recovery', as
 
 remoteDesktopGuestAccessRoutes.post('/remote-desktop/guest/host/rotate', async (c) => {
   c.header('Cache-Control', 'no-store');
-  const accountSession = await requestAccountSession(c);
+  const accountSession = await resolveRemoteDesktopAccountSession(c);
   if (!accountSession) return c.json({ error: 'unauthorized' }, 401);
   const body = asExactRecord(await readJson(c), ['hostId', 'requestId', 'stepUpGrant']);
   if (!body || !isRemoteDesktopId(body.hostId)
@@ -610,7 +593,7 @@ remoteDesktopGuestAccessRoutes.post('/remote-desktop/guest/host/rotate', async (
 /** Owner inventory for one canonical host. Non-secret metadata only. */
 remoteDesktopGuestAccessRoutes.get('/remote-desktop/guest/links', async (c) => {
   c.header('Cache-Control', 'no-store');
-  const accountSession = await requestAccountSession(c);
+  const accountSession = await resolveRemoteDesktopAccountSession(c);
   if (!accountSession) return c.json({ error: 'unauthorized' }, 401);
   const hostId = c.req.query('hostId');
   if (!isRemoteDesktopId(hostId)) return c.json({ error: 'request_invalid' }, 400);
@@ -626,7 +609,7 @@ remoteDesktopGuestAccessRoutes.get('/remote-desktop/guest/links', async (c) => {
 
 remoteDesktopGuestAccessRoutes.post('/remote-desktop/guest/links', async (c) => {
   c.header('Cache-Control', 'no-store');
-  const accountSession = await requestAccountSession(c);
+  const accountSession = await resolveRemoteDesktopAccountSession(c);
   if (!accountSession) return c.json({ error: 'unauthorized' }, 401);
   const parsed = parseCreate(await readJson(c));
   if (!parsed) return c.json({ error: 'request_invalid' }, 400);
@@ -650,7 +633,7 @@ remoteDesktopGuestAccessRoutes.post('/remote-desktop/guest/links', async (c) => 
 
 remoteDesktopGuestAccessRoutes.patch('/remote-desktop/guest/links/:linkId', async (c) => {
   c.header('Cache-Control', 'no-store');
-  const accountSession = await requestAccountSession(c);
+  const accountSession = await resolveRemoteDesktopAccountSession(c);
   if (!accountSession) return c.json({ error: 'unauthorized' }, 401);
   const parsed = parseMutation(await readJson(c));
   const linkId = c.req.param('linkId');
@@ -681,7 +664,7 @@ remoteDesktopGuestAccessRoutes.patch('/remote-desktop/guest/links/:linkId', asyn
 
 remoteDesktopGuestAccessRoutes.delete('/remote-desktop/guest/links/:linkId', async (c) => {
   c.header('Cache-Control', 'no-store');
-  const accountSession = await requestAccountSession(c);
+  const accountSession = await resolveRemoteDesktopAccountSession(c);
   if (!accountSession) return c.json({ error: 'unauthorized' }, 401);
   const parsed = parseRevoke(await readJson(c));
   const linkId = c.req.param('linkId');

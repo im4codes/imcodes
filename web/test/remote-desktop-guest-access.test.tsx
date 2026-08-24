@@ -20,6 +20,14 @@ async function ready(): Promise<RemoteDesktopGuestReady> {
 afterEach(() => cleanup());
 
 describe('RemoteDesktopGuestAccess', () => {
+  it('always exposes an escape back to the normal IM.codes entry', () => {
+    const onExit = vi.fn();
+    render(<RemoteDesktopGuestAccess onExit={onExit} />);
+
+    fireEvent.click(screen.getByRole('button', { name: 'remote_desktop.guest.back_to_imcodes' }));
+    expect(onExit).toHaveBeenCalledOnce();
+  });
+
   it('moves a resolved scrubbed invite into attended waiting without rendering serverId or desktop controls', async () => {
     const starter: RemoteDesktopGuestSessionStarter = { start: vi.fn(async () => ({ stop: vi.fn() })) };
     render(<RemoteDesktopGuestAccess bootstrap={Promise.resolve({ status: 'invite', token: 'raw-token' })} api={{

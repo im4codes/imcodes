@@ -71,7 +71,12 @@ import {
   TRANSPORT_QUEUE_COMMANDS,
   TRANSPORT_QUEUE_DELIVERY_EVENT_TYPE,
 } from '@shared/transport-queue-types.js';
-import { SESSION_SEND_DELIVERY_MODES } from '@shared/session-send-delivery.js';
+import {
+  DEFAULT_SESSION_SEND_DELIVERY_MODE,
+  SESSION_SEND_DELIVERY_MODES,
+  SESSION_SEND_DELIVERY_USER_PREF_KEY,
+  type SessionSendDeliveryMode,
+} from '@shared/session-send-delivery.js';
 import { MSG_COMMAND_FAILED } from '@shared/ack-protocol.js';
 import { FS_READ_ERROR_CODES } from '@shared/fs-read-error-codes.js';
 import {
@@ -1141,6 +1146,13 @@ function extractManualP2pTargets(
 
 export function SessionControls({ ws, activeSession, connected: connectedProp, inputRef, onAfterAction, onStopProject, onRenameSession, onSettings, onShareSession, sessionPinned = false, stopBlockedByPinned = false, onToggleSessionPin, subSessionId, sessionDisplayName, quickData, detectedModel, hideShortcuts, onSend, onSubRestart, onSubNew, onSubStop, activeThinking = false, activeTransportTurn = false, transportTimelineEvents, mobileFileBrowserOpen, onMobileFileBrowserClose, sessions, subSessions, serverId, fileDropTargetRef, quotes, onRemoveQuote, pendingPrefillText, onPendingPrefillApplied, compact, keyboardActive, onQuickOpenChange, onOverlayOpenChange, onTransportConfigSaved, onVersionSensitiveAction, onComposerTextChange }: Props) {
   const { t, i18n } = useTranslation();
+  const deliveryModePref = usePref<SessionSendDeliveryMode>(SESSION_SEND_DELIVERY_USER_PREF_KEY, {
+    parse: (raw) => Object.values(SESSION_SEND_DELIVERY_MODES).includes(raw as SessionSendDeliveryMode)
+      ? raw as SessionSendDeliveryMode
+      : null,
+  });
+  const deliveryMode = deliveryModePref.value ?? DEFAULT_SESSION_SEND_DELIVERY_MODE;
+  const directAppendMode = deliveryMode === SESSION_SEND_DELIVERY_MODES.APPEND;
   const swipeBackRef = useSwipeBack(onMobileFileBrowserClose);
   const [hasText, setHasText] = useState(false);
   const [composerFocused, setComposerFocused] = useState(false);
@@ -1180,9 +1192,6 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const [thinkingOpen, setThinkingOpen] = useState(false);
   const [cloneDialogOpen, setCloneDialogOpen] = useState(false);
   const [quickOpen, setQuickOpen] = useState(false);
-  // Queue is deliberately the safe default for every newly selected session.
-  // Direct append is an explicit, local composer choice.
-  const [directAppendMode, setDirectAppendMode] = useState(false);
   const [p2pMode, setP2pMode] = useState<P2pMode>('solo');
   const [p2pExcludeSameType, setP2pExcludeSameType] = useState(true);
   const [p2pOpen, setP2pOpen] = useState(false);
@@ -2410,14 +2419,6 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
 
   // Reset P2P mode on session change
   useEffect(() => { setP2pMode('solo'); setP2pOpen(false); }, [activeSession?.name]);
-  useEffect(() => {
-    setDirectAppendMode(false);
-    setDeliveryModeNotice(null);
-    if (deliveryModeNoticeTimerRef.current) {
-      clearTimeout(deliveryModeNoticeTimerRef.current);
-      deliveryModeNoticeTimerRef.current = null;
-    }
-  }, [activeSession?.name]);
   useEffect(() => { setCloneDialogOpen(false); }, [activeSession?.name]);
   useEffect(() => {
     setPendingComboSendConfirm(null);
@@ -4908,7 +4909,12 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     : t('session.delivery_mode_queue_description');
   const handleDeliveryModeToggle = () => {
     const append = !directAppendMode;
-    setDirectAppendMode(append);
+    const nextMode = append
+      ? SESSION_SEND_DELIVERY_MODES.APPEND
+      : SESSION_SEND_DELIVERY_MODES.QUEUE;
+    void deliveryModePref.save(nextMode).catch(() => {
+      showSendWarning(t('session.delivery_mode_save_failed'));
+    });
     if (isMobileLayout) showDeliveryModeNotice(append);
   };
   const showCompactMetaControls = !!(openSpecChangesPath || isClaudeCode || isCodex || isQwen || supportsThinking || !isShellLike);

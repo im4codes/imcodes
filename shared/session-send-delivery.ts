@@ -14,6 +14,13 @@ export const SESSION_SEND_DELIVERY_MODES = {
 export type SessionSendDeliveryMode =
   typeof SESSION_SEND_DELIVERY_MODES[keyof typeof SESSION_SEND_DELIVERY_MODES];
 
+/** Account-scoped preference shared by every main/sub-session composer. */
+export const SESSION_SEND_DELIVERY_USER_PREF_KEY = 'composer.delivery_mode' as const;
+
+/** New accounts append directly unless the user explicitly chooses FIFO. */
+export const DEFAULT_SESSION_SEND_DELIVERY_MODE: SessionSendDeliveryMode =
+  SESSION_SEND_DELIVERY_MODES.APPEND;
+
 /** Backward-compatible MCP names; both names reference the same value/type. */
 export const MEMORY_MCP_SEND_DELIVERY_MODES = SESSION_SEND_DELIVERY_MODES;
 export type MemoryMcpSendDeliveryMode = SessionSendDeliveryMode;

@@ -24,6 +24,7 @@ const CODE_HASH_DOMAIN = 'imcodes.remote-desktop.native-code.v1';
 const STATE_HASH_DOMAIN = 'imcodes.remote-desktop.native-state.v1';
 const SESSION_HASH_DOMAIN = 'imcodes.remote-desktop.native-session.v1';
 const WEB_SESSION_HASH_DOMAIN = 'imcodes.remote-desktop.web-session.v1';
+const API_KEY_ACCOUNT_SESSION_PREFIX = 'remote-desktop-api-key:';
 const GRANT_HASH_DOMAIN = 'imcodes.remote-desktop.step-up-grant.v1';
 const ACTION_HASH_DOMAIN = 'imcodes.remote-desktop.step-up-action.v1';
 const NATIVE_SESSION_PREFIX = 'rdsn_';
@@ -37,6 +38,31 @@ export type AccountSession = {
   id: string;
   userId: string;
 };
+
+/**
+ * Bind the mobile app's account API key to the same step-up/session model used
+ * by browser account clients. The raw bearer is never persisted. API-key ids
+ * are server-issued opaque database identifiers and let the mutation
+ * transaction revalidate revocation/grace state before consuming a grant.
+ */
+export function createBearerAccountSession(input: {
+  userId: string;
+  bearerToken: string;
+  apiKeyId?: string;
+}): AccountSession {
+  if (input.apiKeyId) {
+    return {
+      kind: 'web',
+      id: `${API_KEY_ACCOUNT_SESSION_PREFIX}${input.apiKeyId}`,
+      userId: input.userId,
+    };
+  }
+  return {
+    kind: 'web',
+    id: hashDomain(WEB_SESSION_HASH_DOMAIN, input.bearerToken),
+    userId: input.userId,
+  };
+}
 
 export type NativeAuthorizationRequest = {
   accountSession: AccountSession;
@@ -182,6 +208,22 @@ async function accountSessionRemainsCurrent(
           AND account.status = 'active'
         FOR UPDATE OF session`,
       [session.id, session.userId, now],
+    );
+    return row != null;
+  }
+  if (session.id.startsWith(API_KEY_ACCOUNT_SESSION_PREFIX)) {
+    const apiKeyId = session.id.slice(API_KEY_ACCOUNT_SESSION_PREFIX.length);
+    if (!apiKeyId) return false;
+    const row = await db.queryOne<{ id: string }>(
+      `SELECT api_key.id
+         FROM api_keys AS api_key
+         JOIN users AS account ON account.id = api_key.user_id
+        WHERE api_key.id = $1 AND api_key.user_id = $2
+          AND api_key.revoked_at IS NULL
+          AND (api_key.grace_expires_at IS NULL OR api_key.grace_expires_at > $3)
+          AND account.status = 'active'
+        FOR UPDATE OF api_key`,
+      [apiKeyId, session.userId, now],
     );
     return row != null;
   }

@@ -494,6 +494,7 @@
     "delivery_mode_append_description": "Añadir a la respuesta actual en el siguiente punto seguro del proveedor",
     "delivery_mode_queue_toast": "Modo actual: En cola",
     "delivery_mode_append_toast": "Modo actual: Añadir",
+    "delivery_mode_save_failed": "No se pudo guardar el modo de envío. Inténtalo de nuevo.",
     "confirm_restart": "¿Confirmar reinicio?",
     "new": "+ Nuevo",
     "start_fresh": "Empezar de nuevo",
@@ -3473,6 +3474,7 @@
     "access_state_active": "Activa", "access_state_revoked": "Revocada", "access_state_expired": "Caducada", "access_expires_at": "Caduca {{value}}", "access_never_expires": "Válida hasta que se revoque",
     "access_password_invalidation": "Cambiar o desactivar la contraseña invalida las sesiones por contraseña.", "access_password_begin": "Iniciar cambio protegido", "access_password_strength": "Usa al menos 12 bytes y una contraseña exclusiva.",
     "guest": {
+      "back_to_imcodes": "Volver a IM.codes",
       "title": "Join remote desktop",
       "subtitle": "Enter an invite or public ID. Proof and consent are required before routing starts.",
       "public_id": "Public ID",

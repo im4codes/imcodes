@@ -73,7 +73,6 @@ import { SharedContextManagementPanel } from './components/SharedContextManageme
 import { ControlledNodesPanel } from './components/ControlledNodesPanel.js';
 import { ControlledNodeQuickMenu } from './components/ControlledNodeQuickMenu.js';
 import { RemoteDesktopWorkspace } from './components/RemoteDesktopWorkspace.js';
-import { RemoteDesktopGuestAccess } from './components/RemoteDesktopGuestAccess.js';
 import { RemoteDesktopConnectionManager } from './remote-desktop-connection-manager.js';
 import {
   REMOTE_DESKTOP_WORKSPACE_WINDOW_ID,
@@ -4695,19 +4694,16 @@ export function App() {
 
   if (!auth) {
     return (
-      <div class="remote-desktop-auth-shell">
-        <RemoteDesktopGuestAccess />
-        <LoginPage
-          serverUrl={nativeServerUrl}
-          onLoginSuccess={(userId, url) => {
-            const authState: AuthState = { userId, baseUrl: url };
-            configureExpectedUserId(userId);
-            localStorage.setItem('rcc_auth', JSON.stringify(authState));
-            setAuth(authState);
-          }}
-          onChangeServer={isNative() ? () => setNativeServerUrl(null) : undefined}
-        />
-      </div>
+      <LoginPage
+        serverUrl={nativeServerUrl}
+        onLoginSuccess={(userId, url) => {
+          const authState: AuthState = { userId, baseUrl: url };
+          configureExpectedUserId(userId);
+          localStorage.setItem('rcc_auth', JSON.stringify(authState));
+          setAuth(authState);
+        }}
+        onChangeServer={isNative() ? () => setNativeServerUrl(null) : undefined}
+      />
     );
   }
 

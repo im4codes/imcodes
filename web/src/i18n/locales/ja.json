@@ -494,6 +494,7 @@
     "delivery_mode_append_description": "プロバイダーの次の安全な境界で現在の応答に追加",
     "delivery_mode_queue_toast": "現在のモード：待機",
     "delivery_mode_append_toast": "現在のモード：追加",
+    "delivery_mode_save_failed": "送信モードを保存できませんでした。もう一度お試しください。",
     "confirm_restart": "再起動しますか？",
     "new": "+ 新規",
     "start_fresh": "やり直す",
@@ -3472,6 +3473,7 @@
     "access_state_active": "有効", "access_state_revoked": "取り消し済み", "access_state_expired": "期限切れ", "access_expires_at": "有効期限 {{value}}", "access_never_expires": "取り消すまで有効",
     "access_password_invalidation": "パスワードの変更・無効化で既存セッションは直ちに無効になります。", "access_password_begin": "保護された変更を開始", "access_password_strength": "12 バイト以上の専用パスワードを使用してください。",
     "guest": {
+      "back_to_imcodes": "IM.codes に戻る",
       "title": "Join remote desktop",
       "subtitle": "Enter an invite or public ID. Proof and consent are required before routing starts.",
       "public_id": "Public ID",

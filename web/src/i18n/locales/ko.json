@@ -494,6 +494,7 @@
     "delivery_mode_append_description": "제공자의 다음 안전한 경계에서 현재 응답에 추가",
     "delivery_mode_queue_toast": "현재 모드: 대기열",
     "delivery_mode_append_toast": "현재 모드: 추가",
+    "delivery_mode_save_failed": "전송 모드를 저장하지 못했습니다. 다시 시도하세요.",
     "confirm_restart": "재시작하시겠습니까?",
     "new": "+ 새로 만들기",
     "start_fresh": "다시 시작",
@@ -3472,6 +3473,7 @@
     "access_state_active": "활성", "access_state_revoked": "취소됨", "access_state_expired": "만료됨", "access_expires_at": "만료 {{value}}", "access_never_expires": "취소할 때까지 유효",
     "access_password_invalidation": "비밀번호를 변경하거나 끄면 기존 비밀번호 세션이 즉시 무효화됩니다.", "access_password_begin": "보호된 비밀번호 작업 시작", "access_password_strength": "12바이트 이상인 전용 비밀번호를 사용하세요.",
     "guest": {
+      "back_to_imcodes": "IM.codes로 돌아가기",
       "title": "Join remote desktop",
       "subtitle": "Enter an invite or public ID. Proof and consent are required before routing starts.",
       "public_id": "Public ID",

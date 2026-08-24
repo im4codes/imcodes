@@ -27,6 +27,7 @@ import {
   REMOTE_DESKTOP_NATIVE_CLIENT,
   computePkceS256,
   consumeActionBoundStepUpGrant,
+  createBearerAccountSession,
   digestStepUpAction,
   exchangeNativeAuthorizationCode,
   issueNativeAuthorizationCode,
@@ -34,6 +35,7 @@ import {
   resolveNativeShellSession,
   revokeBrowserAccountSession,
   revokeNativeShellSession,
+  storeStepUpChallenge,
   type AccountSession,
 } from '../src/services/remote-desktop-account-auth.js';
 import { signJwt } from '../src/security/crypto.js';
@@ -95,6 +97,7 @@ type Grant = {
 
 type State = {
   users: Map<string, 'active' | 'disabled'>;
+  apiKeys: Map<string, { userId: string; revokedAt: number | null; graceExpiresAt: number | null }>;
   webSessionRevocations: Map<string, { userId: string; expiresAt: number }>;
   credentials: Map<string, { id: string; user_id: string; public_key: string; counter: number; transports: string | null }>;
   authCodes: Map<string, AuthCode>;
@@ -110,6 +113,7 @@ function cloneState(state: State): State {
 function makeDb(): { db: Database; state: State } {
   let state: State = {
     users: new Map([['owner-1', 'active'], ['owner-2', 'active']]),
+    apiKeys: new Map([['mobile-key-1', { userId: 'owner-1', revokedAt: null, graceExpiresAt: null }]]),
     webSessionRevocations: new Map(),
     credentials: new Map([['cred-1', {
       id: 'cred-1', user_id: 'owner-1', public_key: Buffer.from('public-key').toString('base64'),
@@ -136,6 +140,16 @@ function makeDb(): { db: Database; state: State } {
       const normalized = normalize(sql);
       if (normalized.startsWith('select pg_advisory_xact_lock')) {
         return { locked: null } as T;
+      }
+      if (normalized.includes('from api_keys as api_key')) {
+        const row = state.apiKeys.get(String(params[0]));
+        return (row
+          && row.userId === params[1]
+          && row.revokedAt == null
+          && (row.graceExpiresAt == null || row.graceExpiresAt > Number(params[2]))
+          && state.users.get(row.userId) === 'active'
+          ? { id: params[0] }
+          : null) as T | null;
       }
       if (normalized.includes('from users as account')
         && normalized.includes('remote_desktop_web_session_revocations')) {
@@ -383,6 +397,44 @@ describe('remote desktop native account authentication', () => {
       .toBe(digestStepUpAction({ a: { x: 'v', y: true }, b: 2 }));
     expect(digestStepUpAction({ operation: 'disable_password' }))
       .not.toBe(digestStepUpAction({ operation: 'rotate_public_id' }));
+  });
+
+  it('binds mobile API-key step-up state to the current non-revoked key', async () => {
+    const { db, state } = makeDb();
+    const now = 1_700_000_000_000;
+    const accountSession = createBearerAccountSession({
+      userId: 'owner-1',
+      bearerToken: 'deck_raw_key_never_persisted',
+      apiKeyId: 'mobile-key-1',
+    });
+    expect(accountSession).toEqual({
+      kind: 'web',
+      id: 'remote-desktop-api-key:mobile-key-1',
+      userId: 'owner-1',
+    });
+
+    await expect(storeStepUpChallenge(db, {
+      accountSession,
+      canonicalHostId: 'host-mobile',
+      actionDigest: 'a'.repeat(64),
+      requestId: opaque32(),
+      challenge: opaque32(),
+      rpId: 'im.codes',
+      origin: 'https://app.im.codes',
+      deadline: now + 60_000,
+    }, now)).resolves.toMatchObject({ expiresAt: now + 60_000 });
+
+    state.apiKeys.get('mobile-key-1')!.revokedAt = now + 1;
+    await expect(storeStepUpChallenge(db, {
+      accountSession,
+      canonicalHostId: 'host-mobile',
+      actionDigest: 'b'.repeat(64),
+      requestId: opaque32(),
+      challenge: opaque32(),
+      rpId: 'im.codes',
+      origin: 'https://app.im.codes',
+      deadline: now + 60_000,
+    }, now + 2)).rejects.toThrow('account_session_revoked');
   });
 });
 

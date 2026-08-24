@@ -455,6 +455,39 @@ export async function apiFetch<T = unknown>(
   }
 
   if (res.status === 401 && path !== '/api/auth/refresh') {
+    // Native mobile auth is a long-lived Bearer API key, not a refresh-cookie
+    // session. An endpoint-specific 401 (for example, a newly added route that
+    // has not yet accepted API keys) must never erase a still-valid app login.
+    if (_apiKey) {
+      console.warn(`[auth] bearer 401 on ${path} — verifying account before changing login state`);
+      let verifyRes: Response;
+      try {
+        verifyRes = await rawFetch('/api/auth/user/me');
+      } catch {
+        throw new ApiError(503, 'server_unavailable');
+      }
+      if (verifyRes.ok) {
+        if (path === '/api/auth/user/me') return verifyRes.json() as Promise<T>;
+        const retryRes = await rawFetch(path, opts);
+        if (retryRes.status === 409) {
+          const body = await retryRes.text().catch(() => '');
+          if (body.includes(AUTH_IDENTITY_ERRORS.CHANGED)) {
+            _onAuthExpired?.(AUTH_IDENTITY_ERRORS.CHANGED);
+          }
+          throw new ApiError(retryRes.status, body);
+        }
+        if (!retryRes.ok) {
+          throw new ApiError(retryRes.status, await retryRes.text().catch(() => ''));
+        }
+        return retryRes.json() as Promise<T>;
+      }
+      if (verifyRes.status >= 500) {
+        throw new ApiError(verifyRes.status, await verifyRes.text().catch(() => 'server_unavailable'));
+      }
+      _onAuthExpired?.(`401 on ${path} — bearer account verification failed`);
+      throw new ApiError(401, 'session_expired');
+    }
+
     console.warn(`[auth] 401 on ${path} — attempting refresh`);
     // Try to refresh the token (with one retry on failure).
     // A single failure might be transient (e.g., CSRF mismatch after cookie rotation).
@@ -491,16 +524,25 @@ export async function apiFetch<T = unknown>(
     }
     // Both refresh attempts failed — but verify session is truly expired before logout.
     // Another tab may have refreshed successfully and our cookies are now valid.
+    let verifyRes: Response;
     try {
-      const verifyRes = await rawFetch('/api/auth/user/me');
-      if (verifyRes.ok) {
-        console.warn(`[auth] refresh failed but /me succeeded — session still valid, retrying original request`);
-        _lastRefreshAt = Date.now();
-        const retryRes = await rawFetch(path, opts);
-        if (!retryRes.ok) throw new ApiError(retryRes.status, await retryRes.text().catch(() => ''));
-        return retryRes.json() as Promise<T>;
+      verifyRes = await rawFetch('/api/auth/user/me');
+    } catch {
+      throw new ApiError(503, 'server_unavailable');
+    }
+    if (verifyRes.ok) {
+      console.warn(`[auth] refresh failed but /me succeeded — session still valid, retrying original request`);
+      _lastRefreshAt = Date.now();
+      if (path === '/api/auth/user/me') return verifyRes.json() as Promise<T>;
+      const retryRes = await rawFetch(path, opts);
+      if (!retryRes.ok) {
+        throw new ApiError(retryRes.status, await retryRes.text().catch(() => ''));
       }
-    } catch { /* /me also failed — truly expired */ }
+      return retryRes.json() as Promise<T>;
+    }
+    if (verifyRes.status >= 500) {
+      throw new ApiError(verifyRes.status, await verifyRes.text().catch(() => 'server_unavailable'));
+    }
     console.warn(`[auth] LOGOUT: refresh failed twice + /me failed for ${path}, triggering onAuthExpired`);
     _onAuthExpired?.(`401 on ${path} — refresh failed twice`);
     throw new ApiError(401, 'session_expired');

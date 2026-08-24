@@ -110,7 +110,12 @@ function app() {
   return app;
 }
 
-const DB = { transaction: async (fn: (db: unknown) => Promise<unknown>) => fn({}) };
+const DB = {
+  queryOne: vi.fn(async (sql: string) => (
+    sql.includes('FROM api_keys') ? { id: 'mobile-key-1', user_id: 'owner-1' } : null
+  )),
+  transaction: async (fn: (db: unknown) => Promise<unknown>) => fn({}),
+};
 const ENV = {
   DB,
   JWT_SIGNING_KEY: 'jwt-secret',
@@ -763,6 +768,25 @@ describe('remote desktop guest access routes', () => {
       accountSession: { kind: 'web', id: 'web-session', userId: 'owner-1' },
       hostId: HOST_ID, requestId: 'q'.repeat(43), stepUpToken: 'rdsg_rotate',
     }));
+  });
+
+  it('accepts the mobile deck_ API key as an account session without cookie fallback', async () => {
+    const response = await app().request(
+      `/api/remote-desktop/guest/host?hostId=${HOST_ID}`,
+      { headers: { authorization: 'Bearer deck_mobile_account_key' } },
+      ENV,
+    );
+
+    expect(response.status).toBe(200);
+    expect(mocks.browserSession).not.toHaveBeenCalled();
+    expect(mocks.hostSummary).toHaveBeenCalledWith(expect.anything(), {
+      accountSession: {
+        kind: 'web',
+        id: 'remote-desktop-api-key:mobile-key-1',
+        userId: 'owner-1',
+      },
+      hostId: HOST_ID,
+    });
   });
 
   it('fails stale or cross-action step-up grants closed without mutation', async () => {

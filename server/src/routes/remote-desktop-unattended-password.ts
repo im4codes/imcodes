@@ -1,5 +1,4 @@
 import { Hono } from 'hono';
-import type { Context } from 'hono';
 import type { Env } from '../env.js';
 import {
   REMOTE_DESKTOP_ACCESS_LIMITS,
@@ -10,12 +9,7 @@ import {
   validateRemoteDesktopPasswordMutation,
   type RemoteDesktopPasswordMutation,
 } from '../../../shared/remote-desktop-access.js';
-import {
-  nativeShellIssuer,
-  resolveBrowserAccountSession,
-  resolveNativeShellSession,
-  type AccountSession,
-} from '../services/remote-desktop-account-auth.js';
+import { resolveRemoteDesktopAccountSession } from './remote-desktop-account-session.js';
 import {
   RemoteDesktopUnattendedPasswordProofService,
   UNATTENDED_PASSWORD_MUTATION_ERROR,
@@ -43,7 +37,7 @@ remoteDesktopUnattendedPasswordRoutes.use('/*', async (c, next) => {
 });
 
 remoteDesktopUnattendedPasswordRoutes.post('/remote-desktop/unattended-password', async (c) => {
-  const session = await requestAccountSession(c);
+  const session = await resolveRemoteDesktopAccountSession(c);
   if (!session) return c.json({ error: 'unauthorized' }, 401);
   const body = await c.req.json().catch(() => null);
   const parsed = parseOwnerMutationRequest(body);
@@ -115,22 +109,6 @@ export function createRemoteDesktopUnattendedPasswordPublicRoutes(
     });
   });
   return routes;
-}
-
-async function requestAccountSession(c: Context<RouteEnv>): Promise<AccountSession | null> {
-  const authorization = c.req.header('authorization');
-  // Presence of Authorization commits the request to native-shell auth.  The
-  // global CSRF layer treats Bearer requests differently, so falling back to a
-  // browser cookie after an invalid node/foreign Bearer would turn that header
-  // into a CSRF and identity-confusion bypass.
-  if (authorization !== undefined) {
-    return resolveNativeShellSession(
-      c.env.DB,
-      authorization,
-      nativeShellIssuer(c.env.SERVER_URL),
-    );
-  }
-  return resolveBrowserAccountSession(c.env.DB, c.env.JWT_SIGNING_KEY, c.req.header('cookie'));
 }
 
 function parseOwnerMutationRequest(value: unknown): {

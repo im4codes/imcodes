@@ -19,6 +19,7 @@ export interface RemoteDesktopGuestAccessProps {
   bootstrap?: Promise<RemoteDesktopInviteBootstrapResult>;
   api?: RemoteDesktopAccessApi;
   sessionStarter?: RemoteDesktopGuestSessionStarter;
+  onExit?: () => void;
 }
 
 type GuestUiState =
@@ -32,6 +33,7 @@ export function RemoteDesktopGuestAccess({
   bootstrap = Promise.resolve({ status: 'unavailable' }),
   api = createRemoteDesktopAccessApi(),
   sessionStarter = remoteDesktopGuestSessionStarter,
+  onExit = () => window.location.replace('/'),
 }: RemoteDesktopGuestAccessProps) {
   const { t } = useTranslation();
   const [state, setState] = useState<GuestUiState>('idle');
@@ -128,6 +130,10 @@ export function RemoteDesktopGuestAccess({
   return (
     <main class="remote-desktop-guest" aria-labelledby="remote-desktop-guest-title">
       <section class="remote-desktop-guest-card">
+        <button type="button" class="remote-desktop-guest-exit" onClick={onExit}>
+          <span aria-hidden="true">←</span>
+          <span>{t('remote_desktop.guest.back_to_imcodes')}</span>
+        </button>
         <img src="/imcodes-robot-avatar.png" alt="" aria-hidden="true" />
         <h1 id="remote-desktop-guest-title">{t('remote_desktop.guest.title')}</h1>
         <p>{t('remote_desktop.guest.subtitle')}</p>

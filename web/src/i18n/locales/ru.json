@@ -494,6 +494,7 @@
     "delivery_mode_append_description": "Добавить к текущему ответу на следующей безопасной границе провайдера",
     "delivery_mode_queue_toast": "Текущий режим: очередь",
     "delivery_mode_append_toast": "Текущий режим: добавление",
+    "delivery_mode_save_failed": "Не удалось сохранить режим отправки. Повторите попытку.",
     "confirm_restart": "Подтвердить перезапуск?",
     "new": "+ Новая",
     "start_fresh": "Начать заново",
@@ -3472,6 +3473,7 @@
     "access_state_active": "Активна", "access_state_revoked": "Отозвана", "access_state_expired": "Истекла", "access_expires_at": "Истекает {{value}}", "access_never_expires": "Действует до отзыва",
     "access_password_invalidation": "Смена или отключение пароля немедленно завершает парольные сеансы.", "access_password_begin": "Начать защищённое изменение", "access_password_strength": "Используйте уникальный пароль длиной не менее 12 байт.",
     "guest": {
+      "back_to_imcodes": "Вернуться в IM.codes",
       "title": "Join remote desktop",
       "subtitle": "Enter an invite or public ID. Proof and consent are required before routing starts.",
       "public_id": "Public ID",

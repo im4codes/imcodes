@@ -37,6 +37,8 @@
 .remote-desktop-guest-card label { display:grid; gap:6px; color:#a5b4c7; font-size:13px; }
 .remote-desktop-guest-card input { padding:11px 12px; color:#effcff; background:#050c16; border:1px solid #34516f; border-radius:9px; font-size:16px; }
 .remote-desktop-guest-card button { min-height:42px; padding:9px 12px; border:1px solid #2b7385; border-radius:9px; color:#e6feff; background:#12435a; }
+.remote-desktop-guest-card .remote-desktop-guest-exit { min-height:36px; justify-self:start; display:inline-flex; align-items:center; gap:7px; padding:6px 10px; color:#a5d8e8; background:transparent; border-color:#27415d; }
+.remote-desktop-guest-card .remote-desktop-guest-exit:hover { color:#e6feff; border-color:#38bdf8; background:#0b2437; }
 .remote-desktop-guest-card :focus-visible { outline:2px solid #22d3ee; outline-offset:3px; }
 .remote-desktop-guest-state { display:grid; gap:10px; padding:14px; text-align:center; border:1px solid #28506d; border-radius:10px; background:#0a1a2b; }
 .remote-desktop-guest-video { width:100%; min-height:220px; max-height:70dvh; object-fit:contain; border:1px solid #28506d; border-radius:10px; background:#02050a; }

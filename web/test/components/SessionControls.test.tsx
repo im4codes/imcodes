@@ -512,6 +512,7 @@ afterEach(() => {
     });
     sessionStorage.clear();
     localStorage.clear();
+    getUserPrefMock.mockResolvedValue(null);
     fetchSupervisorDefaultsMock.mockResolvedValue(null);
     patchSessionMock.mockResolvedValue(undefined);
     patchSessionSupervisionMock.mockResolvedValue(null);
@@ -1015,7 +1016,7 @@ afterEach(() => {
       />,
     );
     const toggle = screen.getByRole('button', {
-      name: 'Queue: Wait until the current reply finishes',
+      name: 'Append: Add to the current reply at the next safe boundary',
     });
     expect(toggle.classList.contains('composer-delivery-mode-mobile')).toBe(true);
     expect(toggle.textContent).toBe('');
@@ -1040,17 +1041,17 @@ afterEach(() => {
     );
 
     fireEvent.click(screen.getByRole('button', {
-      name: 'Queue: Wait until the current reply finishes',
-    }));
-    const appendToast = screen.getByText('Current mode: Append').closest('[role="status"]');
-    expect(appendToast?.classList.contains('is-append')).toBe(true);
-
-    fireEvent.click(screen.getByRole('button', {
       name: 'Append: Add to the current reply at the next safe boundary',
     }));
     const queueToast = screen.getByText('Current mode: Queue').closest('[role="status"]');
     expect(queueToast?.classList.contains('is-queue')).toBe(true);
-    expect(screen.queryByText('Current mode: Append')).toBeNull();
+
+    fireEvent.click(screen.getByRole('button', {
+      name: 'Queue: Wait until the current reply finishes',
+    }));
+    const appendToast = screen.getByText('Current mode: Append').closest('[role="status"]');
+    expect(appendToast?.classList.contains('is-append')).toBe(true);
+    expect(screen.queryByText('Current mode: Queue')).toBeNull();
   });
 
   it('hides the embedded voice button after typing on mobile', () => {
@@ -1167,9 +1168,9 @@ afterEach(() => {
     });
   });
 
-  it('defaults transport composer delivery to queue and only appends after an explicit toggle', () => {
+  it('defaults every transport composer to append and persists an account-wide queue override', async () => {
     const ws = makeWs();
-    render(
+    const firstView = render(
       <SessionControls
         ws={ws as any}
         activeSession={makeTransportSession({ name: 'transport-compose', state: 'idle' })}
@@ -1177,31 +1178,44 @@ afterEach(() => {
       />,
     );
     const input = screen.getByRole('textbox') as HTMLDivElement;
-    const queueToggle = screen.getByRole('button', {
-      name: 'Queue: Wait until the current reply finishes',
-    });
-    expect(queueToggle.getAttribute('aria-pressed')).toBe('false');
-
-    input.textContent = 'ordinary FIFO';
-    fireEvent.input(input);
-    fireEvent.keyDown(input, { key: 'Enter' });
-    const first = gatherSendCalls(ws)[0];
-    expect(first).toMatchObject({ sessionName: 'transport-compose', text: 'ordinary FIFO' });
-    expect(first).not.toHaveProperty('deliveryMode');
-
-    fireEvent.click(queueToggle);
     const appendToggle = screen.getByRole('button', {
       name: 'Append: Add to the current reply at the next safe boundary',
     });
     expect(appendToggle.getAttribute('aria-pressed')).toBe('true');
-    input.textContent = 'append at next boundary';
+
+    input.textContent = 'append by default';
     fireEvent.input(input);
     fireEvent.keyDown(input, { key: 'Enter' });
-    expect(gatherSendCalls(ws)[1]).toMatchObject({
+    const first = gatherSendCalls(ws)[0];
+    expect(first).toMatchObject({
       sessionName: 'transport-compose',
-      text: 'append at next boundary',
+      text: 'append by default',
       deliveryMode: 'append',
     });
+
+    fireEvent.click(appendToggle);
+    await waitFor(() => expect(saveUserPrefMock).toHaveBeenCalledWith('composer.delivery_mode', 'queue'));
+    const queueToggle = screen.getByRole('button', {
+      name: 'Queue: Wait until the current reply finishes',
+    });
+    expect(queueToggle.getAttribute('aria-pressed')).toBe('false');
+    input.textContent = 'ordinary FIFO';
+    fireEvent.input(input);
+    fireEvent.keyDown(input, { key: 'Enter' });
+    expect(gatherSendCalls(ws)[1]).toMatchObject({ sessionName: 'transport-compose', text: 'ordinary FIFO' });
+    expect(gatherSendCalls(ws)[1]).not.toHaveProperty('deliveryMode');
+
+    firstView.unmount();
+    render(
+      <SessionControls
+        ws={makeWs() as any}
+        activeSession={makeTransportSession({ name: 'different-sub-session', state: 'idle' })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+    expect(screen.getByRole('button', {
+      name: 'Queue: Wait until the current reply finishes',
+    })).toBeTruthy();
   });
 
   it('does not apply composer append mode to SDK-native slash commands', () => {
@@ -1213,9 +1227,6 @@ afterEach(() => {
         quickData={makeQuickData() as any}
       />,
     );
-    fireEvent.click(screen.getByRole('button', {
-      name: 'Queue: Wait until the current reply finishes',
-    }));
     const input = screen.getByRole('textbox') as HTMLDivElement;
     input.textContent = '/compact';
     fireEvent.input(input);

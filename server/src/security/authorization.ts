@@ -17,7 +17,7 @@ import {
 
 export type Role = 'owner' | 'admin' | 'member' | 'unauthenticated';
 
-interface AuthContext {
+export interface AuthContext {
   userId: string;
   role: Role;
   keyId?: string;
@@ -42,6 +42,19 @@ export async function resolveAuth(c: Pick<Context<{ Bindings: Env }>, 'req' | 'e
     }
   }
 
+  return resolveBearerAuth(c);
+}
+
+/**
+ * Resolve only the Authorization bearer supplied by the request.
+ *
+ * Account-sensitive routes use this after observing an Authorization header so
+ * an invalid bearer can never fall back to a valid browser cookie. Keep the
+ * credential parsing in one place with the ordinary authorization middleware.
+ */
+export async function resolveBearerAuth(
+  c: Pick<Context<{ Bindings: Env }>, 'req' | 'env'>,
+): Promise<AuthContext | null> {
   const authHeader = c.req.header('Authorization');
   if (!authHeader?.startsWith('Bearer ')) return null;
 

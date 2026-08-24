@@ -27,6 +27,7 @@ import {
   type StepUpChallengeRow,
   issueNativeAuthorizationCode,
 } from '../services/remote-desktop-account-auth.js';
+import { resolveRemoteDesktopAccountSession } from './remote-desktop-account-session.js';
 
 type RouteEnv = { Bindings: Env };
 
@@ -99,14 +100,7 @@ async function browserSession(c: Context<RouteEnv>): Promise<AccountSession | nu
 }
 
 async function requestAccountSession(c: Context<RouteEnv>): Promise<AccountSession | null> {
-  const issuer = nativeShellIssuer(c.env.SERVER_URL);
-  const native = await resolveNativeShellSession(
-    c.env.DB,
-    c.req.header('authorization'),
-    issuer,
-  );
-  if (native) return native;
-  return browserSession(c);
+  return resolveRemoteDesktopAccountSession(c);
 }
 
 async function listCredentials(c: Context<RouteEnv>, userId: string): Promise<Array<{

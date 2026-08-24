@@ -842,6 +842,7 @@ describe('App shell', () => {
     render(<App />);
 
     expect(await screen.findByText('login-page')).toBeTruthy();
+    expect(screen.queryByText('remote_desktop.guest.title')).toBeNull();
     expect(apiFetchMock).toHaveBeenCalledWith('/api/auth/user/me');
   }, 20_000);
 
