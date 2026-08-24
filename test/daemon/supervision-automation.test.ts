@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
@@ -16,11 +16,13 @@ import {
 } from '../../shared/peer-audit.js';
 import {
   AGENT_DELEGATION_COMPLETION_NOTIFICATION_MARKER,
+  AGENT_DELEGATION_REPLY_TIMELINE_EVENT,
   AGENT_DELEGATION_PURPOSES,
   buildAgentDelegationReplyInstruction,
 } from '../../shared/agent-delegation.js';
 import { createSendDispatchId, createSendMessageId } from '../../shared/send-message-id.js';
 import { PROVIDER_ERROR_CODES } from '../../src/agent/transport-provider.js';
+import { getCounter, resetMetricsForTests } from '../../src/util/metrics.js';
 
 const mockStartP2pRun = vi.fn();
 const mockCancelP2pRun = vi.fn();
@@ -95,6 +97,20 @@ vi.mock('../../src/daemon/peer-audit-service.js', () => ({
   },
 }));
 
+// Timeline recovery deliberately reads the durable JSONL tail. Keep that tail
+// process-local: audit agents and CI shards can run this file concurrently,
+// and fixed session names under the real ~/.imcodes directory otherwise let
+// one process delete or recover another process's fixture events.
+const originalHome = process.env.HOME;
+const originalTimelineProjectionDbPath = process.env.IMCODES_TIMELINE_PROJECTION_DB_PATH;
+const supervisionTestHome = await mkdtemp(path.join(os.tmpdir(), 'imcodes-supervision-home-'));
+process.env.HOME = supervisionTestHome;
+process.env.IMCODES_TIMELINE_PROJECTION_DB_PATH = path.join(
+  supervisionTestHome,
+  '.imcodes',
+  'timeline.sqlite',
+);
+
 const {
   supervisionAutomation,
   enrichSnapshotWithGlobalDefaults,
@@ -104,7 +120,8 @@ const {
   __setCachedSupervisorDefaultsForTests,
 } = await import('../../src/daemon/supervisor-defaults-cache.js');
 const { timelineEmitter } = await import('../../src/daemon/timeline-emitter.js');
-const { getSession, upsertSession, removeSession } = await import('../../src/store/session-store.js');
+const { timelineStore } = await import('../../src/daemon/timeline-store.js');
+const { flushStore, getSession, upsertSession, removeSession } = await import('../../src/store/session-store.js');
 const { createDelegationReplyAuthority } = await import('../../src/daemon/delegation-reply-authority.js');
 const { emitDelegationReplyDelivered } = await import('../../src/daemon/delegation-reply-events.js');
 
@@ -142,14 +159,21 @@ async function waitForTransportSendCount(expectedCount: number, timeoutMs = 10_0
 
 let projectDir: string | null = null;
 
-beforeEach(() => {
+beforeEach(async () => {
+  supervisionAutomation.cancelSession('deck_supervision_brain');
+  supervisionAutomation.cancelSession('deck_sub_reviewer');
+  await timelineStore.flushSession('deck_supervision_brain');
+  await timelineStore.flushSession('deck_sub_reviewer');
+  await rm(timelineStore.filePath('deck_supervision_brain'), { force: true });
+  await rm(timelineStore.filePath('deck_sub_reviewer'), { force: true });
+  timelineEmitter.forgetSession('deck_supervision_brain');
+  timelineEmitter.forgetSession('deck_sub_reviewer');
   vi.clearAllMocks();
+  resetMetricsForTests();
   vi.useRealTimers();
   mockSupervisionDecide.mockReset();
   mockSupervisionDecide.mockResolvedValue({ decision: 'complete', reason: 'done', confidence: 0.9 });
   __resetSupervisorDefaultsCacheForTests();
-  supervisionAutomation.cancelSession('deck_supervision_brain');
-  supervisionAutomation.cancelSession('deck_sub_reviewer');
   mockAuditTargetStatus = 'idle';
   mockAuditTargetSending = false;
   mockAuditTargetLastProviderError = null;
@@ -157,6 +181,37 @@ beforeEach(() => {
   mockAuditTargetRuntime.send.mockReturnValue('sent');
   removeSession('deck_supervision_brain');
   removeSession('deck_sub_reviewer');
+});
+
+afterEach(async () => {
+  vi.useRealTimers();
+  supervisionAutomation.cancelSession('deck_supervision_brain');
+  supervisionAutomation.cancelSession('deck_sub_reviewer');
+  await timelineStore.flushSession('deck_supervision_brain');
+  await timelineStore.flushSession('deck_sub_reviewer');
+  timelineEmitter.forgetSession('deck_supervision_brain');
+  timelineEmitter.forgetSession('deck_sub_reviewer');
+  removeSession('deck_supervision_brain');
+  removeSession('deck_sub_reviewer');
+  await cleanupProjectDir();
+});
+
+afterAll(async () => {
+  supervisionAutomation.cancelSession('deck_supervision_brain');
+  supervisionAutomation.cancelSession('deck_sub_reviewer');
+  removeSession('deck_supervision_brain');
+  removeSession('deck_sub_reviewer');
+  await timelineStore.flushSession('deck_supervision_brain');
+  await timelineStore.flushSession('deck_sub_reviewer');
+  await flushStore();
+  await rm(supervisionTestHome, { recursive: true, force: true });
+  if (originalHome === undefined) delete process.env.HOME;
+  else process.env.HOME = originalHome;
+  if (originalTimelineProjectionDbPath === undefined) {
+    delete process.env.IMCODES_TIMELINE_PROJECTION_DB_PATH;
+  } else {
+    process.env.IMCODES_TIMELINE_PROJECTION_DB_PATH = originalTimelineProjectionDbPath;
+  }
 });
 
 async function seedProjectDir(withOpenSpecChange = false) {
@@ -331,6 +386,15 @@ function finishAuditRecoveryTestCleanup() {
 describe('SupervisionAutomation', () => {
   beforeEach(async () => {
     await cleanupProjectDir();
+  });
+
+  it('keeps durable recovery fixtures inside the process-local test home', () => {
+    const relativeTimelinePath = path.relative(
+      supervisionTestHome,
+      timelineStore.filePath('deck_supervision_brain'),
+    );
+    expect(relativeTimelinePath).not.toMatch(/^\.\.(?:\/|\\|$)/u);
+    expect(relativeTimelinePath).toBe(path.join('.imcodes', 'timeline', 'deck_supervision_brain.jsonl'));
   });
 
   it('applies one cached global primary and backup runtime to every legacy session snapshot', async () => {
@@ -835,6 +899,7 @@ describe('SupervisionAutomation', () => {
     timelineEmitter.emit('deck_supervision_brain', 'user.message', {
       text: [
         AGENT_DELEGATION_COMPLETION_NOTIFICATION_MARKER,
+  AGENT_DELEGATION_REPLY_TIMELINE_EVENT,
         'A delegated agent completed the requested work.',
         `Delegation ID: ${authority.record.delegationId}`,
         'From session: deck_sub_reviewer',
@@ -1393,7 +1458,14 @@ describe('SupervisionAutomation', () => {
     expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
     const cancelled = timelineEmitter.replay('deck_supervision_brain', 0).events.filter((event) =>
       event.type === 'peer_audit.result' && event.payload.outcome === 'cancelled');
-    expect(cancelled).toHaveLength(1);
+    expect(new Set(cancelled.map((event) => event.eventId)).size).toBe(1);
+    expect(getCounter('peer_audit.terminal', {
+      contractVersion: 'peer_audit_v1',
+      disposition: 'sent',
+      outcome: 'cancelled',
+      reason: 'session_supervision_cancelled',
+      trigger: 'automatic',
+    })).toBe(1);
   });
 
   it('times out an orchestrated audit at the deadline without releasing held finalization', async () => {
@@ -2363,14 +2435,6 @@ describe('SupervisionAutomation', () => {
     const events = timelineEmitter.replay('deck_supervision_brain', 0).events;
     expect(events).toEqual(expect.arrayContaining([
       expect.objectContaining({
-        type: 'assistant.text',
-        payload: expect.objectContaining({
-          automation: true,
-          automationKind: 'supervision-status',
-          text: 'Auto: checking whether the task is complete...',
-        }),
-      }),
-      expect.objectContaining({
         type: 'agent.status',
         payload: expect.objectContaining({
           status: 'supervision_waiting',
@@ -2380,6 +2444,15 @@ describe('SupervisionAutomation', () => {
       expect.objectContaining({
         type: 'agent.status',
         payload: { status: null, label: null },
+      }),
+      expect.objectContaining({
+        type: 'assistant.text',
+        eventId: 'supervision-note:deck_supervision_brain',
+        payload: expect.objectContaining({
+          automation: true,
+          automationKind: 'supervision-complete',
+          text: 'Auto: task looks complete.',
+        }),
       }),
     ]));
   });
@@ -2429,20 +2502,13 @@ describe('SupervisionAutomation', () => {
       .events
       .filter((event) => event.type === 'assistant.text' && event.payload.automation === true);
 
-    expect(noteEvents).toEqual(expect.arrayContaining([
-      expect.objectContaining({
-        eventId: 'supervision-note:deck_supervision_brain',
-        payload: expect.objectContaining({
-          text: 'Auto: checking whether the task is complete...',
-        }),
+    expect(noteEvents).toHaveLength(1);
+    expect(noteEvents[0]).toEqual(expect.objectContaining({
+      eventId: 'supervision-note:deck_supervision_brain',
+      payload: expect.objectContaining({
+        text: 'Auto: task looks complete.',
       }),
-      expect.objectContaining({
-        eventId: 'supervision-note:deck_supervision_brain',
-        payload: expect.objectContaining({
-          text: 'Auto: task looks complete.',
-        }),
-      }),
-    ]));
+    }));
   });
 
   it('updates an in-flight run to the latest supervision snapshot when Auto settings change live', async () => {
@@ -3036,6 +3102,367 @@ describe('SupervisionAutomation', () => {
     expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({ phase: 'auditing' });
   });
 
+  it('recovers a supervised audit from timeline when restart clears the in-memory task candidate', async () => {
+    const snapshot = await seedSession('supervised_audit');
+    mockSupervisionDecide.mockResolvedValueOnce({
+      decision: 'complete',
+      reason: '实现和验证已完成，需要独立审计。',
+      confidence: 0.96,
+      requiresAudit: true,
+    });
+
+    supervisionAutomation.init();
+    const baseTs = Date.now();
+    timelineEmitter.emit('deck_supervision_brain', 'user.message', {
+      text: '通过 acp 接入 Hermes Agent 并完成测试',
+      clientMessageId: 'cmd-restart-lost-candidate',
+      allowDuplicate: true,
+    }, { ts: baseTs });
+    await timelineStore.flushSession('deck_supervision_brain');
+
+    // Simulate the production failure mode: the daemon restarts during a long
+    // provider turn, so supervision's in-memory candidate/run maps and the
+    // timeline ring buffer are gone, while the JSONL conversation tail remains.
+    supervisionAutomation.cancelSession('deck_supervision_brain');
+    timelineEmitter.forgetSession('deck_supervision_brain');
+    timelineEmitter.emit('deck_supervision_brain', 'user.message', {
+      text: 'continue',
+      clientMessageId: 'cmd-midturn-continue-after-restart',
+      allowDuplicate: true,
+    }, { ts: baseTs + 1 });
+    timelineEmitter.emit('deck_supervision_brain', 'assistant.text', {
+      text: 'Hermes Agent ACP 接入已完成，验证通过；等待自动独立审计，尚未提交。',
+      streaming: false,
+    }, { ts: baseTs + 2 });
+    timelineEmitter.emit('deck_supervision_brain', 'session.state', {
+      state: 'idle',
+    }, { ts: baseTs + 3 });
+
+    await waitForTransportSendCount(1);
+
+    expect(mockSupervisionDecide).toHaveBeenCalledWith(expect.objectContaining({
+      taskRequest: '通过 acp 接入 Hermes Agent 并完成测试',
+      assistantResponse: expect.stringContaining('Hermes Agent ACP 接入已完成'),
+    }));
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
+    expect(String(mockTransportRuntime.send.mock.calls[0]?.[0])).toContain('Exact delegate target session: deck_sub_reviewer');
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({ phase: 'auditing' });
+
+    timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'running' });
+    timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'idle' });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps the original recovered task when a bare continue follows an assistant completion', async () => {
+    await seedSession('supervised_audit');
+    mockSupervisionDecide.mockResolvedValueOnce({
+      decision: 'complete',
+      reason: 'the resumed implementation is complete',
+      confidence: 0.96,
+      requiresAudit: true,
+    });
+
+    supervisionAutomation.init();
+    const baseTs = Date.now();
+    timelineEmitter.emit('deck_supervision_brain', 'user.message', {
+      text: 'finish the durable supervision recovery fix',
+      clientMessageId: 'cmd-recovery-before-post-completion-continue',
+      allowDuplicate: true,
+    }, { ts: baseTs });
+    timelineEmitter.emit('deck_supervision_brain', 'assistant.text', {
+      text: 'first completion before the user resumes the same task',
+      streaming: false,
+    }, { ts: baseTs + 1 });
+    await timelineStore.flushSession('deck_supervision_brain');
+
+    // Restart loses the in-memory candidate. A later control-only continue and
+    // assistant completion must remain attached to the original user task.
+    supervisionAutomation.cancelSession('deck_supervision_brain');
+    timelineEmitter.forgetSession('deck_supervision_brain');
+    timelineEmitter.emit('deck_supervision_brain', 'user.message', {
+      text: 'continue',
+      clientMessageId: 'cmd-post-completion-continue',
+      allowDuplicate: true,
+    }, { ts: baseTs + 2 });
+    timelineEmitter.emit('deck_supervision_brain', 'assistant.text', {
+      text: 'resumed completion after the control-only continue',
+      streaming: false,
+    }, { ts: baseTs + 3 });
+    timelineEmitter.emit('deck_supervision_brain', 'session.state', {
+      state: 'idle',
+    }, { ts: baseTs + 4 });
+
+    await waitForTransportSendCount(1);
+
+    expect(mockSupervisionDecide).toHaveBeenCalledWith(expect.objectContaining({
+      taskRequest: 'finish the durable supervision recovery fix',
+      assistantResponse: 'resumed completion after the control-only continue',
+    }));
+    expect(mockSupervisionDecide).not.toHaveBeenCalledWith(expect.objectContaining({
+      taskRequest: 'continue',
+    }));
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
+  });
+
+  it('resumes the original recovered task after STOP and bare continue without auditing continue itself', async () => {
+    await seedSession('supervised_audit');
+    mockSupervisionDecide.mockResolvedValueOnce({
+      decision: 'complete',
+      reason: 'the explicitly resumed implementation is complete',
+      confidence: 0.96,
+      requiresAudit: true,
+    });
+
+    supervisionAutomation.init();
+    const baseTs = Date.now();
+    timelineEmitter.emit('deck_supervision_brain', 'user.message', {
+      text: 'finish the stoppable supervision task',
+      clientMessageId: 'cmd-recovery-before-stop',
+      allowDuplicate: true,
+    }, { ts: baseTs });
+    timelineEmitter.emit('deck_supervision_brain', 'assistant.text', {
+      text: 'completion produced immediately before STOP',
+      streaming: false,
+    }, { ts: baseTs + 1 });
+    supervisionAutomation.cancelForUserStop('deck_supervision_brain');
+    timelineEmitter.emit('deck_supervision_brain', 'session.state', {
+      state: 'idle',
+      resetReason: 'command_handler_cancel_idle',
+    }, { ts: baseTs + 2 });
+    await timelineStore.flushSession('deck_supervision_brain');
+
+    // Simulate restart, then the user explicitly resumes the stopped task.
+    // The STOP barrier must remain until the new completion, while the bare
+    // continue itself must never replace the original task request.
+    supervisionAutomation.cancelSession('deck_supervision_brain');
+    timelineEmitter.forgetSession('deck_supervision_brain');
+    timelineEmitter.emit('deck_supervision_brain', 'user.message', {
+      text: '继续',
+      clientMessageId: 'cmd-continue-after-stop',
+      allowDuplicate: true,
+    }, { ts: baseTs + 3 });
+    timelineEmitter.emit('deck_supervision_brain', 'assistant.text', {
+      text: 'completion after explicitly resuming the stopped task',
+      streaming: false,
+    }, { ts: baseTs + 4 });
+    timelineEmitter.emit('deck_supervision_brain', 'session.state', {
+      state: 'idle',
+    }, { ts: baseTs + 5 });
+
+    await waitForTransportSendCount(1);
+
+    expect(mockSupervisionDecide).toHaveBeenCalledWith(expect.objectContaining({
+      taskRequest: 'finish the stoppable supervision task',
+      assistantResponse: 'completion after explicitly resuming the stopped task',
+    }));
+    expect(mockSupervisionDecide).not.toHaveBeenCalledWith(expect.objectContaining({
+      taskRequest: '继续',
+    }));
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
+  });
+
+
+  it('does not replay an implementation turn after a delegated audit reply and PASS final survive restart', async () => {
+    await seedSession('supervised_audit');
+
+    supervisionAutomation.init();
+    const baseTs = Date.now();
+    timelineEmitter.emit('deck_supervision_brain', 'user.message', {
+      text: 'implement the audited feature',
+      clientMessageId: 'cmd-before-delegated-reply',
+      allowDuplicate: true,
+    }, { ts: baseTs });
+    timelineEmitter.emit('deck_supervision_brain', 'assistant.text', {
+      text: 'implementation complete; waiting for peer audit',
+      streaming: false,
+    }, { ts: baseTs + 1 });
+    timelineEmitter.emit('deck_supervision_brain', 'assistant.text', {
+      text: 'Auto: peer audit was dispatched.',
+      streaming: false,
+      automation: true,
+      automationKind: 'supervision-audit-started',
+      memoryExcluded: true,
+    }, { ts: baseTs + 2, eventId: 'supervision-note:deck_supervision_brain' });
+    await timelineStore.flushSession('deck_supervision_brain');
+
+    // A daemon restart drops the active audit run. The delegated reply and this
+    // session's PASS/REWORK final are audit/control-plane traffic, not a new
+    // implementation completion for the original task.
+    supervisionAutomation.cancelSession('deck_supervision_brain');
+    timelineEmitter.forgetSession('deck_supervision_brain');
+    timelineEmitter.emit('deck_supervision_brain', 'user.message', {
+      text: [
+        AGENT_DELEGATION_COMPLETION_NOTIFICATION_MARKER,
+        'A delegated agent completed the requested work.',
+        'Delegation ID: audit-1',
+        'From session: deck_sub_reviewer',
+        '',
+        'Verdict: PASS',
+      ].join('\n'),
+      clientMessageId: 'cmd-delegation-notification',
+      allowDuplicate: true,
+    }, { ts: baseTs + 3 });
+    timelineEmitter.emit('deck_supervision_brain', AGENT_DELEGATION_REPLY_TIMELINE_EVENT, {
+      memoryExcluded: true,
+      sourceSessionName: 'deck_sub_reviewer',
+      result: 'Verdict: PASS',
+    }, { ts: baseTs + 4, eventId: 'delegation-reply:audit-1' });
+    timelineEmitter.emit('deck_supervision_brain', 'assistant.text', {
+      text: 'Verdict: PASS\nAudit found no blockers.',
+      streaming: false,
+    }, { ts: baseTs + 5 });
+    timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'idle' }, { ts: baseTs + 6 });
+    await sleep(25);
+
+    expect(mockSupervisionDecide).not.toHaveBeenCalled();
+    expect(mockTransportRuntime.send).not.toHaveBeenCalled();
+  });
+
+  it('recovers the original user task after more than one thousand non-conversation events', async () => {
+    await seedSession('supervised_audit');
+    mockSupervisionDecide.mockResolvedValueOnce({
+      decision: 'complete',
+      reason: 'long noisy task complete',
+      confidence: 0.96,
+      requiresAudit: true,
+    });
+
+    supervisionAutomation.init();
+    const baseTs = Date.now();
+    timelineEmitter.emit('deck_supervision_brain', 'user.message', {
+      text: 'complete the very noisy long-running task',
+      clientMessageId: 'cmd-noisy-long-task',
+      allowDuplicate: true,
+    }, { ts: baseTs });
+    for (let index = 0; index < 1_200; index += 1) {
+      timelineEmitter.emit('deck_supervision_brain', 'tool.call', {
+        id: `tool-noise-${index}`,
+        name: 'noop',
+        input: {},
+      }, { ts: baseTs + 1 + index });
+    }
+    timelineEmitter.emit('deck_supervision_brain', 'assistant.text', {
+      text: 'the noisy long-running task is complete',
+      streaming: false,
+    }, { ts: baseTs + 1_205 });
+    await timelineStore.flushSession('deck_supervision_brain');
+
+    supervisionAutomation.cancelSession('deck_supervision_brain');
+    timelineEmitter.forgetSession('deck_supervision_brain');
+    timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'idle' }, { ts: baseTs + 1_206 });
+
+    await waitForTransportSendCount(1);
+
+    expect(mockSupervisionDecide).toHaveBeenCalledWith(expect.objectContaining({
+      taskRequest: 'complete the very noisy long-running task',
+      assistantResponse: 'the noisy long-running task is complete',
+    }));
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not recover an already-evaluated turn after restart when durable supervision notes follow completion', async () => {
+    const snapshot = await seedSession('supervised');
+    mockSupervisionDecide.mockResolvedValue({
+      decision: 'complete',
+      reason: 'done',
+      confidence: 0.9,
+      requiresAudit: false,
+    });
+
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-first-evaluated', 'implement first task', snapshot);
+    beginRun('cmd-first-evaluated', 'implement first task');
+    completeTurn('first task complete');
+    await waitForRunEnd();
+
+    supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-second-evaluated', 'implement second task', snapshot);
+    beginRun('cmd-second-evaluated', 'implement second task');
+    completeTurn('second task complete');
+    await waitForRunEnd();
+    expect(mockSupervisionDecide).toHaveBeenCalledTimes(2);
+    await timelineStore.flushSession('deck_supervision_brain');
+
+    // Simulate daemon restart: in-memory completion keys disappear, so the
+    // durable post-completion supervision notes/append order must be the
+    // authority that prevents re-evaluating the old completed turn.
+    supervisionAutomation.cancelSession('deck_supervision_brain');
+    timelineEmitter.forgetSession('deck_supervision_brain');
+    timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'running' });
+    timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'idle' });
+    await sleep(25);
+
+    expect(mockSupervisionDecide).toHaveBeenCalledTimes(2);
+    expect(mockTransportRuntime.send).not.toHaveBeenCalled();
+  });
+
+  it('treats user STOP cancel-idle as a recovery barrier until the next real task', async () => {
+    const snapshot = await seedSession('supervised_audit');
+    mockSupervisionDecide.mockResolvedValue({
+      decision: 'complete',
+      reason: 'done',
+      confidence: 0.9,
+      requiresAudit: true,
+    });
+
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-stop-before-idle', 'implement stoppable task', snapshot);
+    beginRun('cmd-stop-before-idle', 'implement stoppable task');
+    timelineEmitter.emit('deck_supervision_brain', 'assistant.text', {
+      text: 'stoppable task reached a final response',
+      streaming: false,
+    });
+
+    supervisionAutomation.cancelForUserStop('deck_supervision_brain');
+    timelineEmitter.emit('deck_supervision_brain', 'session.state', {
+      state: 'idle',
+      resetReason: 'command_handler_cancel_idle',
+    });
+    await sleep(25);
+
+    expect(mockSupervisionDecide).not.toHaveBeenCalled();
+    expect(mockTransportRuntime.send).not.toHaveBeenCalled();
+
+    beginRun('cmd-after-stop', 'implement next task');
+    completeTurn('next task complete');
+    await waitForTransportSendCount(1);
+
+    expect(mockSupervisionDecide).toHaveBeenCalledWith(expect.objectContaining({
+      taskRequest: 'implement next task',
+      assistantResponse: 'next task complete',
+    }));
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not recover a previous incarnation of the same session name', async () => {
+    await seedSession('supervised_audit');
+    supervisionAutomation.init();
+    const oldTs = Date.now() - 10_000;
+    timelineEmitter.emit('deck_supervision_brain', 'user.message', {
+      text: 'old incarnation task',
+      clientMessageId: 'cmd-old-incarnation',
+      allowDuplicate: true,
+    }, { ts: oldTs });
+    timelineEmitter.emit('deck_supervision_brain', 'assistant.text', {
+      text: 'old incarnation completed',
+      streaming: false,
+    }, { ts: oldTs + 1 });
+    await timelineStore.flushSession('deck_supervision_brain');
+
+    removeSession('deck_supervision_brain');
+    removeSession('deck_sub_reviewer');
+    supervisionAutomation.cancelSession('deck_supervision_brain');
+    const newSnapshot = await seedSession('supervised_audit');
+    expect(newSnapshot.mode).toBe('supervised_audit');
+    timelineEmitter.forgetSession('deck_supervision_brain');
+    timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'running' });
+    timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'idle' });
+    await sleep(25);
+
+    expect(mockSupervisionDecide).not.toHaveBeenCalled();
+    expect(mockTransportRuntime.send).not.toHaveBeenCalled();
+  });
+
   // A session that dispatched an external validation request and is barred
   // from touching the repo until it returns can only be classified `continue`
   // out of the old three-value enum, so automation re-prompted it forever and
@@ -3272,6 +3699,48 @@ describe('SupervisionAutomation', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it('ignores a rejected evaluation after cancellation instead of terminating its replacement run', async () => {
+    const snapshot = await seedSession('supervised_audit');
+    let rejectOldDecision: ((error: Error) => void) | undefined;
+    mockSupervisionDecide.mockImplementationOnce(() => new Promise((_resolve, reject) => {
+      rejectOldDecision = reject;
+    }));
+
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-old-evaluation', 'old task', snapshot);
+    beginRun('cmd-old-evaluation', 'old task');
+    completeTurn('old task completion');
+    await vi.waitFor(() => {
+      expect(mockSupervisionDecide).toHaveBeenCalledTimes(1);
+    }, { timeout: 4_000 });
+
+    supervisionAutomation.cancelSession('deck_supervision_brain');
+    supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-replacement', 'replacement task', snapshot);
+    beginRun('cmd-replacement', 'replacement task');
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({
+      commandId: 'cmd-replacement',
+      phase: 'execution',
+    });
+
+    rejectOldDecision?.(new Error('old broker request failed after cancellation'));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({
+      commandId: 'cmd-replacement',
+      phase: 'execution',
+    });
+    expect(timelineEmitter.replay('deck_supervision_brain', 0).events).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: 'assistant.text',
+        payload: expect.objectContaining({
+          automationKind: 'supervision-warning',
+          text: expect.stringContaining('could not determine whether the task is complete'),
+        }),
+      }),
+    ]));
   });
 
   it('hands a parked run back to the human when the reply never arrives', async () => {

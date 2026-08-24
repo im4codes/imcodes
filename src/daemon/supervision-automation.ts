@@ -6,6 +6,8 @@ import { getTransportRuntime } from '../agent/session-manager.js';
 import { PROVIDER_ERROR_CODES } from '../agent/transport-provider.js';
 import type { ServerLink } from './server-link.js';
 import { timelineEmitter } from './timeline-emitter.js';
+import { readTailLines, timelineStore } from './timeline-store.js';
+import type { TimelineEvent } from './timeline-event.js';
 import {
   supervisionBroker,
   type SupervisionProviderFailure,
@@ -38,6 +40,7 @@ import {
   AGENT_DELEGATION_COMPLETION_NOTIFICATION_MARKER,
   AGENT_DELEGATION_PURPOSES,
   AGENT_DELEGATION_REPLY_INSTRUCTION_MARKER,
+  AGENT_DELEGATION_REPLY_TIMELINE_EVENT,
   buildAgentDelegationReplyInstruction,
   buildAgentDelegationOrchestrationPrompt,
   buildQuickAgentDelegationTask,
@@ -129,6 +132,10 @@ const SUPERVISION_COMPLETION_GRACE_MS = 2_000;
 const SUPERVISION_RECENT_EVIDENCE_EVENT_COUNT = 80;
 const SUPERVISION_RECENT_EVIDENCE_COUNT = 12;
 const SUPERVISION_RECENT_EVIDENCE_TEXT_LENGTH = 4_096;
+const SUPERVISION_RECOVERY_RELEVANT_EVENT_LIMIT = 1_000;
+const SUPERVISION_RECOVERY_RAW_EVENT_SCAN_LIMIT = 20_000;
+const SUPERVISION_RECOVERED_COMPLETION_KEYS_MAX = 256;
+const SUPERVISION_EMITTED_AUDIT_RESULTS_MAX = 512;
 
 interface ActiveTaskRunState {
   generation: number;
@@ -151,6 +158,7 @@ interface ActiveTaskRunState {
   evaluating: boolean;
   sawAssistantOutput: boolean;
   lastAssistantText?: string;
+  lastAssistantCompletionKey?: string;
   terminalState?: TaskRunTerminalState;
   auditAttemptId?: string;
   auditDelegationId?: string;
@@ -207,6 +215,13 @@ interface RecentTaskCandidate {
 interface LatestAssistantText {
   text: string;
   sequence: number;
+  completionKey?: string;
+}
+
+interface RecoveredImplicitCompletion {
+  candidate: RecentTaskCandidate;
+  latestAssistant: LatestAssistantText;
+  completionKey: string;
 }
 
 function isDelegatedAuditReplyText(text: string | undefined): boolean {
@@ -221,6 +236,28 @@ function isDelegatedAuditReplyText(text: string | undefined): boolean {
 
 function isDelegationCompletionNotificationText(text: string | undefined): boolean {
   return text?.trimStart().startsWith(AGENT_DELEGATION_COMPLETION_NOTIFICATION_MARKER) === true;
+}
+
+function isBareSupervisionContinueText(text: string | undefined): boolean {
+  return /^(?:continue|go on|继续|继续吧|继续处理|继续执行|继续做|继续推进)$/iu.test(text?.trim() ?? '');
+}
+
+
+type RecoveryBarrier = 'none' | 'handled' | 'stopped';
+
+const SUPERVISION_RECOVERY_RELEVANT_EVENT_TYPES = new Set<TimelineEvent['type']>([
+  'user.message',
+  'assistant.text',
+  'session.state',
+  'peer_audit.result',
+  AGENT_DELEGATION_REPLY_TIMELINE_EVENT,
+]);
+
+function isRecoveryRelevantTimelineEvent(event: TimelineEvent): boolean {
+  if (!SUPERVISION_RECOVERY_RELEVANT_EVENT_TYPES.has(event.type)) return false;
+  if (event.type !== 'assistant.text') return true;
+  const payload = event.payload as Record<string, unknown>;
+  return payload.streaming === false || payload.streaming === undefined;
 }
 
 /**
@@ -747,6 +784,11 @@ class SupervisionAutomation {
   private latestAssistantTexts = new Map<string, LatestAssistantText>();
   private lastObservedSessionStates = new Map<string, string>();
   private implicitCompletionGraceTimers = new Map<string, NodeJS.Timeout>();
+  private recoveredImplicitCompletionKeys: string[] = [];
+  private recoveredImplicitCompletionKeySet = new Set<string>();
+  private recoverySuppressedUntilNextUser = new Set<string>();
+  private emittedAuditResultAttemptIds: string[] = [];
+  private emittedAuditResultAttemptIdSet = new Set<string>();
   /** Monotonic even across cancellation, so an old async verdict cannot match a replacement run. */
   private nextRunGeneration = 0;
   private initialized = false;
@@ -827,6 +869,8 @@ class SupervisionAutomation {
     this.recentTaskCandidates.delete(sessionName);
     this.latestAssistantTexts.delete(sessionName);
     this.lastObservedSessionStates.delete(sessionName);
+    this.recoverySuppressedUntilNextUser.delete(sessionName);
+    this.forgetRecoveredImplicitCompletionKeys(sessionName);
     this.clearStatus(sessionName);
   }
 
@@ -843,6 +887,7 @@ class SupervisionAutomation {
    */
   cancelForUserStop(sessionName: string): void {
     this.cancelSession(sessionName);
+    this.recoverySuppressedUntilNextUser.add(sessionName);
     for (const run of [...this.activeRuns.values()]) {
       if (run.sessionName === sessionName) continue;
       if (run.snapshot.auditTargetSessionName !== sessionName) continue;
@@ -899,7 +944,8 @@ class SupervisionAutomation {
     // (recent task candidate + newer assistant response) so the guardrails
     // against stale turns stay identical.
     if (!active && this.isSessionIdle(sessionName)) {
-      if (!this.tryStartImplicitRun(sessionName, snapshot)) {
+      if (!this.tryStartImplicitRun(sessionName, snapshot)
+        && !this.tryRecoverImplicitRunFromTimeline(sessionName, snapshot)) {
         const candidate = this.recentTaskCandidates.get(sessionName);
         if (candidate) this.armImplicitCompletionGrace(sessionName, snapshot, candidate);
       }
@@ -916,6 +962,168 @@ class SupervisionAutomation {
     return isFinalAssistantPayload(payload)
       && payload.automation !== true
       && payload.memoryExcluded !== true;
+  }
+
+  private getRecoveryTimelineEvents(sessionName: string): TimelineEvent[] {
+    const events: TimelineEvent[] = [];
+    const seen = new Set<string>();
+    const add = (event: TimelineEvent) => {
+      if (!isRecoveryRelevantTimelineEvent(event)) return;
+      const key = `${event.epoch}:${event.seq}:${event.eventId}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      events.push(event);
+    };
+
+    const fileEvents: TimelineEvent[] = [];
+    for (const line of readTailLines(timelineStore.filePath(sessionName), SUPERVISION_RECOVERY_RAW_EVENT_SCAN_LIMIT)) {
+      try {
+        const event = JSON.parse(line) as TimelineEvent;
+        if (!isRecoveryRelevantTimelineEvent(event)) continue;
+        fileEvents.push(event);
+        if (fileEvents.length >= SUPERVISION_RECOVERY_RELEVANT_EVENT_LIMIT) break;
+      } catch { /* skip corrupt JSONL lines */ }
+    }
+    for (const event of fileEvents.reverse()) add(event);
+    for (const event of timelineEmitter.getBufferedEvents(sessionName)) add(event);
+    return events;
+  }
+
+  private rememberRecoveredImplicitCompletionKey(key: string): void {
+    if (this.recoveredImplicitCompletionKeySet.has(key)) return;
+    this.recoveredImplicitCompletionKeySet.add(key);
+    this.recoveredImplicitCompletionKeys.push(key);
+    while (this.recoveredImplicitCompletionKeys.length > SUPERVISION_RECOVERED_COMPLETION_KEYS_MAX) {
+      const evicted = this.recoveredImplicitCompletionKeys.shift();
+      if (evicted) this.recoveredImplicitCompletionKeySet.delete(evicted);
+    }
+  }
+
+  private forgetRecoveredImplicitCompletionKeys(sessionName: string): void {
+    const prefix = `${sessionName}:`;
+    if (!this.recoveredImplicitCompletionKeys.some((key) => key.startsWith(prefix))) return;
+    this.recoveredImplicitCompletionKeys = this.recoveredImplicitCompletionKeys.filter((key) => {
+      const keep = !key.startsWith(prefix);
+      if (!keep) this.recoveredImplicitCompletionKeySet.delete(key);
+      return keep;
+    });
+  }
+
+  private rememberEmittedAuditResultAttempt(attemptId: string): boolean {
+    if (this.emittedAuditResultAttemptIdSet.has(attemptId)) return false;
+    this.emittedAuditResultAttemptIdSet.add(attemptId);
+    this.emittedAuditResultAttemptIds.push(attemptId);
+    while (this.emittedAuditResultAttemptIds.length > SUPERVISION_EMITTED_AUDIT_RESULTS_MAX) {
+      const evicted = this.emittedAuditResultAttemptIds.shift();
+      if (evicted) this.emittedAuditResultAttemptIdSet.delete(evicted);
+    }
+    return true;
+  }
+
+  private timelineCompletionKey(sessionName: string, event: Pick<TimelineEvent, 'epoch' | 'seq' | 'eventId'>): string {
+    return `${sessionName}:${event.epoch}:${event.seq}:${event.eventId}`;
+  }
+
+  private findRecoverableImplicitCompletion(sessionName: string): RecoveredImplicitCompletion | null {
+    const record = getSession(sessionName);
+    const createdAt = typeof record?.createdAt === 'number' ? record.createdAt : 0;
+    const latestEventTs = Date.now() + 5_000;
+    let candidate: RecentTaskCandidate | null = null;
+    let latestAssistant: LatestAssistantText | null = null;
+    let latestAssistantKey: string | null = null;
+    let barrierAfterLatest: RecoveryBarrier = 'none';
+    let sequence = 0;
+
+    for (const event of this.getRecoveryTimelineEvents(sessionName)) {
+      if (createdAt > 0 && event.ts < createdAt) continue;
+      if (event.ts > latestEventTs) continue;
+      sequence += 1;
+      const payload = event.payload as Record<string, unknown>;
+      if (event.type === 'user.message') {
+        const clientMessageId = trimString(payload.clientMessageId);
+        const automation = payload.automation === true;
+        const queueAppended = payload.queueAppended === true;
+        const text = trimString(payload.text);
+        const uiLocale = normalizeSupervisionUiLocale(payload.uiLocale);
+        const delegationCompletionNotification = Boolean(
+          !automation && isDelegationCompletionNotificationText(text),
+        );
+        const delegatedReply = Boolean(
+          !automation && isDelegatedAuditReplyText(text),
+        );
+        if (!automation && !queueAppended && (delegatedReply || delegationCompletionNotification)) {
+          if (latestAssistant) barrierAfterLatest = 'handled';
+          continue;
+        }
+        if (!automation && !queueAppended && text && !text.startsWith('/')) {
+          this.recoverySuppressedUntilNextUser.delete(sessionName);
+          // A bare continue is a control-only resume signal in both the live
+          // path and durable recovery. It may lift STOP suppression, but it
+          // must never replace the original task candidate — including when a
+          // previous assistant completion already precedes it in the timeline.
+          if (isBareSupervisionContinueText(text)) continue;
+          candidate = {
+            commandId: clientMessageId ?? `implicit-recovered:${event.epoch}:${event.seq}:${event.eventId}`,
+            text,
+            sequence,
+            ...(uiLocale ? { uiLocale } : {}),
+          };
+          latestAssistant = null;
+          latestAssistantKey = null;
+          barrierAfterLatest = 'none';
+        }
+        continue;
+      }
+
+      if (event.type === 'assistant.text') {
+        if (payload.automation === true) {
+          const automationKind = trimString(payload.automationKind);
+          if (latestAssistant && automationKind?.startsWith('supervision')) {
+            barrierAfterLatest = 'handled';
+          }
+          continue;
+        }
+        if (candidate && barrierAfterLatest !== 'handled' && this.isEligibleAssistantCompletionPayload(payload)) {
+          const text = typeof payload.text === 'string' ? payload.text : '';
+          latestAssistantKey = this.timelineCompletionKey(sessionName, event);
+          latestAssistant = { text, sequence, completionKey: latestAssistantKey };
+          barrierAfterLatest = 'none';
+        }
+        continue;
+      }
+
+      if (latestAssistant && (event.type === 'peer_audit.result' || event.type === AGENT_DELEGATION_REPLY_TIMELINE_EVENT)) {
+        barrierAfterLatest = 'handled';
+      }
+      if (latestAssistant && event.type === 'session.state') {
+        const resetReason = trimString(payload.resetReason);
+        const reason = trimString(payload.reason);
+        if (resetReason === 'command_handler_cancel_idle' || reason === 'stopped') {
+          barrierAfterLatest = 'stopped';
+        }
+      }
+    }
+
+    if (!candidate || !latestAssistant || !latestAssistantKey || barrierAfterLatest !== 'none') return null;
+    if (this.recoverySuppressedUntilNextUser.has(sessionName)) return null;
+    if (this.recoveredImplicitCompletionKeySet.has(latestAssistantKey)) return null;
+    return { candidate, latestAssistant, completionKey: latestAssistantKey };
+  }
+
+  private tryRecoverImplicitRunFromTimeline(
+    sessionName: string,
+    snapshot: SessionSupervisionSnapshot,
+  ): boolean {
+    if (snapshot.mode === SUPERVISION_MODE.OFF) return false;
+    const recovered = this.findRecoverableImplicitCompletion(sessionName);
+    if (!recovered) return false;
+    this.recentTaskCandidates.set(sessionName, recovered.candidate);
+    this.latestAssistantTexts.set(sessionName, recovered.latestAssistant);
+    if (this.tryStartImplicitRun(sessionName, snapshot)) return true;
+    this.recentTaskCandidates.delete(sessionName);
+    this.latestAssistantTexts.delete(sessionName);
+    this.rememberRecoveredImplicitCompletionKey(recovered.completionKey);
+    return false;
   }
 
   private emitCheckingState(sessionName: string): void {
@@ -944,10 +1152,14 @@ class SupervisionAutomation {
     );
     if (!implicitRun) return false;
     implicitRun.lastAssistantText = latestAssistant.text;
+    implicitRun.lastAssistantCompletionKey = latestAssistant.completionKey;
     implicitRun.sawAssistantOutput = true;
     implicitRun.evaluating = true;
+    if (latestAssistant.completionKey) this.rememberRecoveredImplicitCompletionKey(latestAssistant.completionKey);
     this.emitCheckingState(sessionName);
     void this.evaluateExecutionTurn(implicitRun).catch((error) => {
+      const current = this.activeRuns.get(sessionName);
+      if (!current || current.generation !== implicitRun.generation) return;
       logger.warn({ session: sessionName, err: error }, 'Supervision implicit execution evaluation failed on snapshot update');
       this.clearStatus(sessionName);
       this.emitWarning(sessionName, 'Automation could not determine whether the task is complete. Manual continuation is required.');
@@ -998,6 +1210,7 @@ class SupervisionAutomation {
   ): ActiveTaskRunState | null {
     if (snapshot.mode === SUPERVISION_MODE.OFF) return null;
     this.clearImplicitCompletionGrace(sessionName);
+    this.recoverySuppressedUntilNextUser.delete(sessionName);
     const existing = this.activeRuns.get(sessionName);
     if (existing?.phase === 'auditing' && existing.auditAttemptId) {
       this.clearAuditDeadline(existing);
@@ -1058,9 +1271,12 @@ class SupervisionAutomation {
     if (run.evaluating || !run.sawAssistantOutput) return;
     if (run.phase !== 'execution' && run.phase !== 'finalizing') return;
     this.clearCompletionGrace(run);
+    if (run.lastAssistantCompletionKey) this.rememberRecoveredImplicitCompletionKey(run.lastAssistantCompletionKey);
     this.emitCheckingState(run.sessionName);
     run.evaluating = true;
     void this.evaluateExecutionTurn(run).catch((error) => {
+      const current = this.activeRuns.get(run.sessionName);
+      if (!current || current.generation !== run.generation) return;
       logger.warn({ session: run.sessionName, err: error }, 'Supervision execution evaluation failed');
       this.clearStatus(run.sessionName);
       this.emitWarning(run.sessionName, 'Automation could not determine whether the task is complete. Manual continuation is required.');
@@ -1535,7 +1751,7 @@ class SupervisionAutomation {
     }
   }
 
-  private handleTimelineEvent(event: { sessionId: string; type: string; payload: Record<string, unknown> }): void {
+  private handleTimelineEvent(event: TimelineEvent): void {
     this.handleAuditTargetTimelineEvent(event);
     const sequence = ++this.eventSequence;
 
@@ -1573,12 +1789,15 @@ class SupervisionAutomation {
       }
       if (!automation && !queueAppended && !delegatedReply && !delegationCompletionNotification && text && !text.startsWith('/')) {
         this.clearImplicitCompletionGrace(event.sessionId);
-        this.recentTaskCandidates.set(event.sessionId, {
-          commandId: clientMessageId ?? `implicit:${Date.now()}`,
-          text,
-          sequence,
-          ...(uiLocale ? { uiLocale } : {}),
-        });
+        this.recoverySuppressedUntilNextUser.delete(event.sessionId);
+        if (!isBareSupervisionContinueText(text)) {
+          this.recentTaskCandidates.set(event.sessionId, {
+            commandId: clientMessageId ?? `implicit:${Date.now()}`,
+            text,
+            sequence,
+            ...(uiLocale ? { uiLocale } : {}),
+          });
+        }
       }
       if (pending && !automation && !queueAppended && clientMessageId === pending.commandId) {
         this.pendingTaskIntents.delete(event.sessionId);
@@ -1588,7 +1807,8 @@ class SupervisionAutomation {
 
     if (event.type === 'assistant.text' && this.isEligibleAssistantCompletionPayload(event.payload)) {
       const text = typeof event.payload.text === 'string' ? event.payload.text : '';
-      this.latestAssistantTexts.set(event.sessionId, { text, sequence });
+      const completionKey = this.timelineCompletionKey(event.sessionId, event);
+      this.latestAssistantTexts.set(event.sessionId, { text, sequence, completionKey });
       const run = this.activeRuns.get(event.sessionId);
       if (!run) {
         // Only an observed idle edge proves this is the late-final-row race.
@@ -1601,7 +1821,9 @@ class SupervisionAutomation {
             : null;
           if (snapshot && snapshot.mode !== SUPERVISION_MODE.OFF) {
             this.clearImplicitCompletionGrace(event.sessionId);
-            this.tryStartImplicitRun(event.sessionId, snapshot);
+            if (!this.tryStartImplicitRun(event.sessionId, snapshot)) {
+              this.tryRecoverImplicitRunFromTimeline(event.sessionId, snapshot);
+            }
           }
         }
         return;
@@ -1609,6 +1831,7 @@ class SupervisionAutomation {
       this.clearCompletionGrace(run);
       run.ignoreIdleUntilPostAuditTurnActivity = false;
       run.lastAssistantText = text;
+      run.lastAssistantCompletionKey = completionKey;
       run.sawAssistantOutput = true;
       if ((run.phase === 'execution' || run.phase === 'finalizing')
         && !run.evaluating
@@ -1662,6 +1885,8 @@ class SupervisionAutomation {
           if (!this.tryStartImplicitRun(event.sessionId, snapshot)) {
             this.armImplicitCompletionGrace(event.sessionId, snapshot, candidate);
           }
+        } else if (snapshot && snapshot.mode !== SUPERVISION_MODE.OFF) {
+          this.tryRecoverImplicitRunFromTimeline(event.sessionId, snapshot);
         }
         // Intentionally: do NOT delete the candidate when supervision is OFF
         // at idle. The user may enable Auto afterwards, and
@@ -1722,7 +1947,8 @@ class SupervisionAutomation {
         description: record?.description,
       });
     } finally {
-      this.clearStatus(run.sessionName);
+      const statusOwner = this.activeRuns.get(run.sessionName);
+      if (statusOwner?.generation === run.generation) this.clearStatus(run.sessionName);
     }
 
     const latest = this.activeRuns.get(run.sessionName);
@@ -2084,6 +2310,7 @@ class SupervisionAutomation {
     findings?: string,
   ): void {
     if (!run.auditAttemptId) return;
+    if (!this.rememberEmittedAuditResultAttempt(run.auditAttemptId)) return;
     const targetName = run.snapshot.auditTargetSessionName ?? 'unavailable';
     const target = getSession(targetName);
     emitPeerAuditResult({
