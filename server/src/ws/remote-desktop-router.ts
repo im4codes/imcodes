@@ -31,7 +31,30 @@ import {
   type RemoteDesktopRoute as RemoteDesktopConnectionRoute,
 } from '../../../shared/remote-desktop.js';
 import { TURN_SERVICE_DEFAULTS } from '../../../shared/turn-service.js';
+import {
+  REMOTE_DESKTOP_ACTOR_SOURCE,
+  REMOTE_DESKTOP_OUTBOX_AUTHORITY_KIND,
+  REMOTE_DESKTOP_OUTBOX_EFFECT,
+  REMOTE_DESKTOP_PRIVACY_LIMITS,
+  isRemoteDesktopActorRenewable,
+  type RemoteDesktopActor,
+  type RemoteDesktopBootstrapProof,
+  type RemoteDesktopOutboxEvent,
+} from '../../../shared/remote-desktop-access.js';
+import type { RemoteDesktopGuestOutboxAuthorityMatch } from '../services/remote-desktop-guest-outbox-worker.js';
 import type { TurnIceServerAuthority } from './turn-credentials.js';
+import { resolveHostIdForServer } from '../services/remote-desktop-host-identity.js';
+import {
+  PrivacyBarrierError,
+  PRIVACY_REFUSAL,
+  activateShieldedRouteReplacements,
+  activateRouteTx,
+  allocateRemoteDesktopRouteGeneration,
+  closeRouteTx,
+  getPrivacyState,
+  joinShieldedRoute,
+  reserveRouteTx,
+} from '../services/remote-desktop-management-privacy.js';
 
 /** Why an access row does not permit remote desktop; see `accessFault`. */
 type RemoteDesktopAccessFault =
@@ -55,21 +78,136 @@ export interface RemoteDesktopRouterHooks {
   daemonSupportsRemoteDesktop(): boolean;
   featureEnabled?(): boolean;
   daemonGeneration(): number;
+  allocateRouteGeneration?(db: Database): Promise<number>;
   iceServers(userId: string): TurnIceServerAuthority;
   sendDaemon(message: Record<string, unknown>, generation: number): boolean;
   sendBrowser(socket: WebSocket, message: Record<string, unknown>): void;
   resolveAccess?: AccessResolver;
+  redeemGuestBootstrap?(input: {
+    proof: RemoteDesktopBootstrapProof;
+    routeGeneration: number;
+    now: number;
+  }): Promise<{
+    actor: RemoteDesktopActor;
+    sessionId: string;
+    routeGeneration: number;
+    registryAuthority: RemoteDesktopRouteRegistryIdentity['authority'];
+  } | null>;
+  resolveGuestActor?(actor: RemoteDesktopActor, now: number): Promise<RemoteDesktopActor | null>;
+  requestAttendedConsent?(input: {
+    actor: RemoteDesktopActor;
+    sessionId: string;
+    routeGeneration: number;
+    daemonGeneration: number;
+    mode: RemoteDesktopAccessMode;
+  }): Promise<boolean | 'approved' | 'denied' | 'timeout' | 'cancelled' | 'unavailable'>;
+  cancelPendingGuestConsent?(
+    actor: RemoteDesktopActor,
+    cause: 'browser_disconnect' | 'authority_revoked' | 'privacy_epoch',
+  ): Promise<void>;
+  cancelHostAttendedConsents?(hostId: string): Promise<void>;
+  /** True only when PREPARE+routeGeneration is guaranteed to create a
+   * default-shielded route that cannot emit ordinary capture before the exact
+   * management-privacy ACK. */
+  supportsDefaultShieldedRoute?(): boolean;
+  routeRegistry?: RemoteDesktopRouteRegistry;
   audit?(event: string, fields: Readonly<Record<string, string | number | boolean>>): void;
   now?(): number;
 }
+
+export interface RemoteDesktopRouteRegistryIdentity {
+  hostId: string;
+  routeGeneration: number;
+  guestSessionId?: string;
+  authority:
+    | { actorSource: typeof REMOTE_DESKTOP_ACTOR_SOURCE.ACCOUNT }
+    | {
+      actorSource:
+        | typeof REMOTE_DESKTOP_ACTOR_SOURCE.ATTENDED_LINK
+        | typeof REMOTE_DESKTOP_ACTOR_SOURCE.UNATTENDED_LINK;
+      actorAuditId: string;
+      authorityGeneration: number;
+      expiryRevision: number;
+      commitRevision: number;
+    }
+    | {
+      actorSource: typeof REMOTE_DESKTOP_ACTOR_SOURCE.NODE_PASSWORD;
+      actorAuditId: string;
+      sessionAuditId: string;
+      passwordGeneration: number;
+    };
+}
+
+export interface RemoteDesktopRouteRegistry {
+  reserve(db: Database, input: {
+    serverId: string;
+    routeId: string;
+    routeGeneration: number;
+    now: number;
+  }): Promise<RemoteDesktopRouteRegistryIdentity>;
+  activate(db: Database, input: RemoteDesktopRouteRegistryIdentity & {
+    routeId: string;
+    now: number;
+  }): Promise<void>;
+  close(db: Database, input: RemoteDesktopRouteRegistryIdentity & {
+    routeId: string;
+    now: number;
+  }): Promise<void>;
+}
+
+const postgresRouteRegistry: RemoteDesktopRouteRegistry = {
+  reserve: (db, input) => db.transaction(async (tx) => {
+    const hostId = await resolveHostIdForServer(tx, input.serverId);
+    if (!hostId) throw new Error('remote_desktop_host_unmapped');
+    await reserveRouteTx(tx, {
+      hostId,
+      routeId: input.routeId,
+      routeGeneration: input.routeGeneration,
+      actorSource: REMOTE_DESKTOP_ACTOR_SOURCE.ACCOUNT,
+      executionServerId: input.serverId,
+      now: input.now,
+    });
+    return {
+      hostId,
+      routeGeneration: input.routeGeneration,
+      authority: { actorSource: REMOTE_DESKTOP_ACTOR_SOURCE.ACCOUNT },
+    };
+  }),
+  activate: (db, input) => db.transaction(async (tx) => {
+    await activateRouteTx(tx, input);
+    if (input.guestSessionId) {
+      await tx.execute(
+        `UPDATE remote_desktop_guest_sessions
+            SET state = 'active', updated_at = $2
+          WHERE id = $1 AND state = 'admitting'`,
+        [input.guestSessionId, input.now],
+      );
+    }
+  }),
+  close: (db, input) => db.transaction(async (tx) => {
+    await closeRouteTx(tx, input);
+    if (input.guestSessionId) {
+      await tx.execute(
+        `UPDATE remote_desktop_guest_sessions
+            SET state = 'closed', route_id = NULL, route_generation = NULL,
+                closed_at = $2, updated_at = $2
+          WHERE id = $1 AND state <> 'closed'`,
+        [input.guestSessionId, input.now],
+      );
+    }
+  }),
+};
 
 interface RemoteDesktopRoute {
   requestId: string;
   sessionId: string;
   socket: WebSocket;
-  userId: string;
-  accessRole: MachineAccessRole;
+  actor: RemoteDesktopActor;
+  principalId: string;
+  userId?: string;
+  accessRole?: MachineAccessRole;
   daemonGeneration: number;
+  daemonSuspended: boolean;
   capabilityHash: Buffer;
   createdAt: number;
   expiresAt: number;
@@ -93,10 +231,18 @@ interface RemoteDesktopRoute {
   offerCount: number;
   answerCount: number;
   revalidationInFlight: boolean;
+  registryIdentity: RemoteDesktopRouteRegistryIdentity;
+  registryCloseStarted: boolean;
   negotiationTimer: ReturnType<typeof setTimeout>;
   absoluteTimer: ReturnType<typeof setTimeout>;
   leaseTimer: ReturnType<typeof setTimeout>;
   renewalTimer: ReturnType<typeof setInterval>;
+}
+
+interface PendingGuestAdmission {
+  actor: RemoteDesktopActor;
+  sessionId: string;
+  registryIdentity: RemoteDesktopRouteRegistryIdentity;
 }
 
 export interface RemoteDesktopRouterStats {
@@ -119,6 +265,11 @@ export interface RemoteDesktopSessionSummary {
   selectedDisplayId?: string;
   layoutRevision?: number;
 }
+
+export type RemoteDesktopOutboxApplyResult =
+  | { status: 'applied' }
+  | { status: 'duplicate' }
+  | { status: 'not_owner' };
 
 const REQUEST_ID_RE = /^[A-Za-z0-9_-]{16,128}$/;
 
@@ -156,12 +307,15 @@ export class RemoteDesktopRouter {
   private readonly capabilityKey = randomBytes(32);
   private readonly startsBySocket = new Map<WebSocket, number[]>();
   private readonly startsByUser = new Map<string, number[]>();
+  private readonly pendingGuestBySocket = new Map<WebSocket, PendingGuestAdmission>();
+  private readonly guestPrincipalBySocket = new Map<WebSocket, string>();
   private machineStarts: number[] = [];
   private machineSignalWindowStartedAt = 0;
   private machineSignalWindowCount = 0;
   private auditWindowStartedAt = 0;
   private auditWindowCount = 0;
   private admissionQueue: Promise<void> = Promise.resolve();
+  private readonly routeRegistry: RemoteDesktopRouteRegistry;
   private counters: Omit<RemoteDesktopRouterStats, 'active' | 'controlling'> = {
     admitted: 0,
     rejected: 0,
@@ -169,7 +323,9 @@ export class RemoteDesktopRouter {
     terminated: 0,
   };
 
-  constructor(private readonly hooks: RemoteDesktopRouterHooks) {}
+  constructor(private readonly hooks: RemoteDesktopRouterHooks) {
+    this.routeRegistry = hooks.routeRegistry ?? postgresRouteRegistry;
+  }
 
   handlesType(type: unknown): boolean {
     return typeof type === 'string' && type.startsWith('remote_desktop.');
@@ -205,7 +361,57 @@ export class RemoteDesktopRouter {
       return true;
     }
 
-    await this.forwardBrowserSignal(socket, userId, parsed.value);
+    await this.forwardBrowserSignal(socket, `account:${userId}`, parsed.value);
+    return true;
+  }
+
+  async redeemGuestBootstrap(socket: WebSocket, proof: RemoteDesktopBootstrapProof): Promise<boolean> {
+    if (this.pendingGuestBySocket.has(socket) || !this.hooks.redeemGuestBootstrap) return false;
+    const daemonGeneration = this.hooks.daemonGeneration();
+    if (!this.hooks.daemonAvailable() || !this.hooks.daemonSupportsRemoteDesktop()) return false;
+    const db = this.hooks.database();
+    if (!db) return false;
+    const routeGeneration = await this.allocateRouteGeneration(db).catch(() => null);
+    if (routeGeneration === null) return false;
+    const redeemed = await this.hooks.redeemGuestBootstrap({
+      proof,
+      routeGeneration,
+      now: this.now(),
+    }).catch(() => null);
+    if (!redeemed || redeemed.routeGeneration !== routeGeneration
+      || redeemed.actor.endpointGeneration !== daemonGeneration
+      || daemonGeneration !== this.hooks.daemonGeneration()) return false;
+    this.pendingGuestBySocket.set(socket, {
+      actor: redeemed.actor,
+      sessionId: redeemed.sessionId,
+      registryIdentity: {
+        hostId: redeemed.actor.hostId,
+        routeGeneration: redeemed.routeGeneration,
+        guestSessionId: redeemed.sessionId,
+        authority: redeemed.registryAuthority,
+      },
+    });
+    return true;
+  }
+
+  async handleGuestBrowser(socket: WebSocket, message: unknown): Promise<boolean> {
+    if (!this.handlesType((message as { type?: unknown } | null)?.type)) return false;
+    const parsed = validateRemoteDesktopBrowserMessage(message);
+    if (!parsed.ok) {
+      this.counters.rejected++;
+      return true;
+    }
+    const pending = this.pendingGuestBySocket.get(socket);
+    if (parsed.value.type === REMOTE_DESKTOP_MSG.START) {
+      if (!pending) return true;
+      const operation = this.admissionQueue.then(() => (
+        this.authorizeGuest(socket, pending, parsed.value as RemoteDesktopStart)
+      ));
+      this.admissionQueue = operation.catch(() => {});
+      await operation;
+      return true;
+    }
+    await this.forwardBrowserSignal(socket, this.guestPrincipalBySocket.get(socket) ?? '', parsed.value);
     return true;
   }
 
@@ -230,6 +436,7 @@ export class RemoteDesktopRouter {
     if (!route
       || route.requestId !== parsed.value.requestId
       || route.daemonGeneration !== daemonGeneration
+      || route.daemonSuspended
       || !capabilityMatches(route, parsed.value.capability)
       || route.expiresAt <= this.now()) {
       this.counters.dropped++;
@@ -317,6 +524,9 @@ export class RemoteDesktopRouter {
       this.publishCollaborationCounts(route.sessionId);
     }
     if (parsed.value.type === REMOTE_DESKTOP_MSG.TERMINAL) {
+      if (parsed.value.reason === REMOTE_DESKTOP_TERMINAL_REASON.STOPPED_BY_LOCAL_USER) {
+        void this.hooks.cancelHostAttendedConsents?.(route.actor.hostId).catch(() => {});
+      }
       this.audit(
         parsed.value.reason === REMOTE_DESKTOP_TERMINAL_REASON.AUTHORITY_REVOKED
           ? REMOTE_DESKTOP_AUDIT_EVENT.REVOKED
@@ -332,13 +542,207 @@ export class RemoteDesktopRouter {
   setDaemonGeneration(generation: number): void {
     for (const route of [...this.routesBySession.values()]) {
       if (route.daemonGeneration !== generation) {
-        this.failRoute(route, REMOTE_DESKTOP_TERMINAL_REASON.DAEMON_REPLACED, false);
+        // A replacement connection is not itself authority to revive a route.
+        // Freeze it until post-auth durable reconciliation either completes a
+        // real shield acknowledgement or terminates it fail closed.
+        route.daemonSuspended = true;
       }
     }
   }
 
+  /** Keep old routes inert across a bounded daemon reconnect. */
+  suspendDaemonGeneration(generation: number): void {
+    for (const route of this.routesBySession.values()) {
+      if (route.daemonGeneration === generation) route.daemonSuspended = true;
+    }
+  }
+
+  /** Exact post-commit cancellation for pre-PREPARE rows removed by begin. */
+  cancelPendingRoutes(hostId: string, routes: readonly { routeId: string; routeGeneration: number }[]): number {
+    const keys = new Set(routes.map((route) => `${route.routeId}#${route.routeGeneration}`));
+    let cancelled = 0;
+    for (const [socket, pending] of [...this.pendingGuestBySocket.entries()]) {
+      const key = `${pending.sessionId}#${pending.registryIdentity.routeGeneration}`;
+      if (pending.registryIdentity.hostId !== hostId || !keys.has(key)) continue;
+      this.pendingGuestBySocket.delete(socket);
+      this.closePendingGuest(pending, 'privacy_epoch');
+      this.sendError(socket, mintOpaque(16), REMOTE_DESKTOP_ERROR.CAPABILITY_UNAVAILABLE, true);
+      try { socket.close(1012, 'retry'); } catch { /* already closed/test double */ }
+      cancelled++;
+    }
+    for (const route of [...this.routesBySession.values()]) {
+      const key = `${route.sessionId}#${route.registryIdentity.routeGeneration}`;
+      if (route.registryIdentity.hostId !== hostId || !keys.has(key)) continue;
+      this.sendError(route.socket, route.requestId, REMOTE_DESKTOP_ERROR.CAPABILITY_UNAVAILABLE, true);
+      this.deleteRoute(route);
+      cancelled++;
+    }
+    return cancelled;
+  }
+
+  /**
+   * Rebind suspended in-memory routes to an authenticated replacement daemon.
+   * Only a live, already-shielded epoch permits transparent recovery.  The
+   * replacement PREPARE stays quarantined from the browser until the owning
+   * Worker returns the exact new snapshot ACK; every other case terminates.
+   */
+  async reconcileDaemonReplacement(daemonGeneration: number): Promise<number> {
+    const suspended = [...this.routesBySession.values()].filter((route) => (
+      route.daemonSuspended && route.daemonGeneration !== daemonGeneration
+    ));
+    if (suspended.length === 0) return 0;
+    const db = this.hooks.database();
+    if (!db || !this.hooks.supportsDefaultShieldedRoute?.()) {
+      for (const route of suspended) {
+        this.failRoute(route, REMOTE_DESKTOP_TERMINAL_REASON.DAEMON_REPLACED, false);
+      }
+      return 0;
+    }
+
+    const byHost = new Map<string, RemoteDesktopRoute[]>();
+    for (const route of suspended) {
+      const group = byHost.get(route.registryIdentity.hostId) ?? [];
+      group.push(route);
+      byHost.set(route.registryIdentity.hostId, group);
+    }
+
+    let recovered = 0;
+    for (const [hostId, routes] of byHost) {
+      try {
+        if (routes.some((route) => (
+          this.routesBySession.get(route.sessionId) !== route
+          || route.expiresAt <= this.now()
+          || route.leaseExpiresAt <= this.now()
+        ))) throw new Error('route_replacement_authority_expired');
+        const priorState = await getPrivacyState(db, hostId);
+        if (!priorState?.epochId
+          || (priorState.phase !== 'starting' && priorState.phase !== 'active')
+          || priorState.executionServerId !== this.hooks.serverId()) {
+          throw new Error('route_replacement_not_shielded');
+        }
+        const replacements = await Promise.all(routes.map(async (route) => ({
+          previous: {
+            routeId: route.sessionId,
+            routeGeneration: route.registryIdentity.routeGeneration,
+          },
+          replacement: {
+            routeId: route.sessionId,
+            routeGeneration: await this.allocateRouteGeneration(db),
+          },
+        })));
+        const state = await joinShieldedRoute(db, {
+          hostId,
+          epochId: priorState.epochId,
+          executionServerId: this.hooks.serverId(),
+          daemonGeneration,
+          replacements,
+          now: this.now(),
+        });
+
+        for (let index = 0; index < routes.length; index++) {
+          const route = routes[index]!;
+          const replacement = replacements[index]!.replacement;
+          route.daemonGeneration = daemonGeneration;
+          route.registryIdentity.routeGeneration = replacement.routeGeneration;
+          route.actor = { ...route.actor, endpointGeneration: daemonGeneration } as RemoteDesktopActor;
+          route.reconnectAttempt += 1;
+          route.state = REMOTE_DESKTOP_STATE.PREPARING;
+          route.workerInputEnabled = false;
+          route.auditedInputEnabled = false;
+          route.statusReceived = false;
+        }
+        // Only dispatch after every process-local identity mirrors the atomic
+        // database replacement.  A send failure can then close the exact new
+        // rows rather than leaking an unreferenced shielding incarnation.
+        for (const route of routes) {
+          const iceAuthority = this.hooks.iceServers(route.userId ?? route.actor.auditId);
+          const capability = this.deriveCapability(route.requestId, route.sessionId);
+          const authority = {
+            requestId: route.requestId,
+            sessionId: route.sessionId,
+            capability,
+            expiresAt: route.expiresAt,
+            leaseExpiresAt: route.leaseExpiresAt,
+            daemonGeneration,
+            mode: route.mode,
+            inputEpoch: route.inputEpoch,
+            iceServers: iceAuthority.iceServers,
+          };
+          if (!this.hooks.sendDaemon({
+            type: REMOTE_DESKTOP_MSG.PREPARE,
+            ...authority,
+            routeGeneration: route.registryIdentity.routeGeneration,
+            reconnectAttempt: route.reconnectAttempt,
+          }, daemonGeneration)) {
+            throw new Error('replacement_prepare_failed');
+          }
+        }
+
+        const waitDeadline = Date.now() + REMOTE_DESKTOP_PRIVACY_LIMITS.ROUTE_REPLACEMENT_ACK_MS;
+        let acknowledged = false;
+        while (Date.now() < waitDeadline) {
+          if (routes.some((route) => this.routesBySession.get(route.sessionId) !== route)) break;
+          const current = await getPrivacyState(db, hostId);
+          if (current?.epochId !== state.epochId || current.revision !== state.revision) break;
+          if (current.phase === 'active'
+            && current.routeSnapshot.length === current.acknowledgedRoutes.length
+            && current.routeSnapshot.every((expected) => current.acknowledgedRoutes.some((actual) => (
+              actual.routeId === expected.routeId
+              && actual.routeGeneration === expected.routeGeneration
+            )))) {
+            await activateShieldedRouteReplacements(db, {
+              hostId,
+              epochId: state.epochId!,
+              revision: state.revision,
+              routes: state.routeSnapshot,
+              now: this.now(),
+            });
+            acknowledged = true;
+            break;
+          }
+          await new Promise((resolve) => setTimeout(resolve, 25));
+        }
+        if (!acknowledged) throw new Error('replacement_shield_ack_timeout');
+
+        for (const route of routes) {
+          if (this.routesBySession.get(route.sessionId) !== route
+            || route.expiresAt <= this.now()
+            || route.leaseExpiresAt <= this.now()) {
+            throw new Error('route_replacement_authority_expired');
+          }
+          route.daemonSuspended = false;
+          const capability = this.deriveCapability(route.requestId, route.sessionId);
+          this.hooks.sendBrowser(route.socket, {
+            type: REMOTE_DESKTOP_MSG.AUTHORIZED,
+            requestId: route.requestId,
+            sessionId: route.sessionId,
+            capability,
+            expiresAt: route.expiresAt,
+            leaseExpiresAt: route.leaseExpiresAt,
+            daemonGeneration,
+            mode: route.mode,
+            inputEpoch: route.inputEpoch,
+            iceServers: this.hooks.iceServers(route.userId ?? route.actor.auditId).iceServers,
+          });
+          recovered++;
+        }
+      } catch {
+        for (const route of routes) {
+          this.failRoute(route, REMOTE_DESKTOP_TERMINAL_REASON.DAEMON_REPLACED, false);
+        }
+      }
+    }
+    return recovered;
+  }
+
   dropSocket(socket: WebSocket): void {
     this.startsBySocket.delete(socket);
+    this.guestPrincipalBySocket.delete(socket);
+    const pending = this.pendingGuestBySocket.get(socket);
+    if (pending) {
+      this.pendingGuestBySocket.delete(socket);
+      this.closePendingGuest(pending, 'browser_disconnect');
+    }
     for (const route of [...this.routesBySession.values()]) {
       if (route.socket === socket) {
         this.stopDaemon(route);
@@ -384,6 +788,111 @@ export class RemoteDesktopRouter {
     if (!route || route.userId !== userId) return false;
     this.failRoute(route, REMOTE_DESKTOP_TERMINAL_REASON.STOPPED_BY_CONTROLLER, true);
     return true;
+  }
+
+  /**
+   * Apply one already-authorized durable guest effect to the exact live
+   * process-local route. The production adapter verifies the PostgreSQL
+   * authority tuple before entering this method; this layer additionally
+   * binds the side effect to the in-memory host + route generation so an
+   * event can never land on a replacement route.
+   */
+  applyGuestOutboxEffect(
+    event: RemoteDesktopOutboxEvent,
+    routeId: string,
+    routeGeneration: number,
+    authority: RemoteDesktopGuestOutboxAuthorityMatch,
+  ): RemoteDesktopOutboxApplyResult {
+    const pendingEntry = [...this.pendingGuestBySocket.entries()].find(([, pending]) => (
+      pending.sessionId === routeId
+    ));
+    if (pendingEntry) {
+      const [socket, pending] = pendingEntry;
+      if (!remoteDesktopOutboxAuthorityMatches(event, authority)
+        || pending.registryIdentity.hostId !== event.hostId
+        || !remoteDesktopRouteAuthorityTransitionMatches(pending.registryIdentity, event)
+        || pending.registryIdentity.routeGeneration !== routeGeneration) {
+        return { status: 'not_owner' };
+      }
+      // A pending route has not reached PREPARE and therefore cannot apply a
+      // downgrade or deadline in place safely: its local-consent prompt may
+      // already describe the old mode/deadline. Cancel the exact admission and
+      // require a fresh bootstrap against current authority instead.
+      this.pendingGuestBySocket.delete(socket);
+      this.closePendingGuest(pending, 'authority_revoked');
+      try { socket.close(1008, 'unavailable'); } catch { /* already closed/test double */ }
+      return { status: 'applied' };
+    }
+
+    const route = this.routesBySession.get(routeId);
+    if (!remoteDesktopOutboxAuthorityMatches(event, authority)
+      || !route
+      || route.registryIdentity.hostId !== event.hostId
+      || !remoteDesktopRouteAuthorityTransitionMatches(route.registryIdentity, event)
+      || route.registryIdentity.routeGeneration !== routeGeneration
+      || route.daemonGeneration !== this.hooks.daemonGeneration()) {
+      return { status: 'not_owner' };
+    }
+
+    if (event.effect === REMOTE_DESKTOP_OUTBOX_EFFECT.TERMINAL) {
+      this.failRoute(route, REMOTE_DESKTOP_TERMINAL_REASON.AUTHORITY_REVOKED, true);
+      return { status: 'applied' };
+    }
+
+    if (event.effect === REMOTE_DESKTOP_OUTBOX_EFFECT.DOWNGRADE) {
+      if (route.mode === REMOTE_DESKTOP_ACCESS_MODE.VIEW) return { status: 'duplicate' };
+      route.mode = REMOTE_DESKTOP_ACCESS_MODE.VIEW;
+      route.inputEpoch += 1;
+      const state = {
+        ...this.modeState(route),
+        reason: REMOTE_DESKTOP_MODE_REASON.AUTHORITY_LOST,
+      };
+      if (!this.hooks.sendDaemon(state, route.daemonGeneration)) {
+        // Termination is stricter than a downgrade and prevents stale Control
+        // from surviving a lost daemon generation.
+        this.failRoute(route, REMOTE_DESKTOP_TERMINAL_REASON.DAEMON_REPLACED, false);
+      } else {
+        this.publishCollaborationCounts();
+      }
+      return { status: 'applied' };
+    }
+
+    if (event.deadlineAt === undefined) return { status: 'not_owner' };
+    const deadlineAt = Math.min(route.expiresAt, event.deadlineAt);
+    if (deadlineAt === route.expiresAt) return { status: 'duplicate' };
+    route.expiresAt = deadlineAt;
+    clearTimeout(route.absoluteTimer);
+    route.absoluteTimer = this.timer(() => {
+      if (this.routesBySession.get(route.sessionId) === route) {
+        this.failRoute(route, REMOTE_DESKTOP_TERMINAL_REASON.AUTHORITY_EXPIRED, true);
+      }
+    }, Math.max(0, deadlineAt - this.now()));
+
+    if (deadlineAt <= this.now()) {
+      this.failRoute(route, REMOTE_DESKTOP_TERMINAL_REASON.AUTHORITY_EXPIRED, true);
+      return { status: 'applied' };
+    }
+
+    const nextLease = Math.min(route.leaseExpiresAt, deadlineAt);
+    if (nextLease < route.leaseExpiresAt) {
+      route.leaseExpiresAt = nextLease;
+      clearTimeout(route.leaseTimer);
+      route.leaseTimer = this.scheduleLeaseExpiry(route);
+      if (!this.hooks.sendDaemon({
+        type: REMOTE_DESKTOP_MSG.LEASE,
+        requestId: route.requestId,
+        sessionId: route.sessionId,
+        capability: this.deriveCapability(route.requestId, route.sessionId),
+        leaseExpiresAt: nextLease,
+        daemonGeneration: route.daemonGeneration,
+        routeGeneration: route.registryIdentity.routeGeneration,
+        mode: route.mode,
+        inputEpoch: route.inputEpoch,
+      }, route.daemonGeneration)) {
+        this.failRoute(route, REMOTE_DESKTOP_TERMINAL_REASON.DAEMON_REPLACED, false);
+      }
+    }
+    return { status: 'applied' };
   }
 
   private async authorize(socket: WebSocket, userId: string, start: RemoteDesktopStart): Promise<void> {
@@ -487,6 +996,32 @@ export class RemoteDesktopRouter {
 
     const sessionId = mintOpaque();
     const capability = this.deriveCapability(start.requestId, sessionId);
+    const routeGeneration = await this.allocateRouteGeneration(db).catch(() => null);
+    if (routeGeneration === null) {
+      this.reject(socket, start.requestId, REMOTE_DESKTOP_ERROR.INTERNAL_ERROR, true);
+      return;
+    }
+    let registryIdentity: RemoteDesktopRouteRegistryIdentity;
+    try {
+      registryIdentity = await this.routeRegistry.reserve(db, {
+        serverId: this.hooks.serverId(),
+        routeId: sessionId,
+        routeGeneration,
+        now: authorizedAt,
+      });
+    } catch (error) {
+      this.reject(
+        socket,
+        start.requestId,
+        error instanceof PrivacyBarrierError && error.refusal === PRIVACY_REFUSAL.ROUTE_LIMIT
+          ? REMOTE_DESKTOP_ERROR.SESSION_LIMIT
+          : error instanceof PrivacyBarrierError
+            ? REMOTE_DESKTOP_ERROR.CAPABILITY_UNAVAILABLE
+            : REMOTE_DESKTOP_ERROR.INTERNAL_ERROR,
+        true,
+      );
+      return;
+    }
     const leaseExpiresAt = Math.min(
       authorizedAt + REMOTE_DESKTOP_LIMITS.LEASE_DURATION_MS,
       expiresAt,
@@ -497,6 +1032,18 @@ export class RemoteDesktopRouter {
       socket,
       userId,
       accessRole: access!.access_role,
+      principalId: `account:${userId}`,
+      actor: {
+        source: REMOTE_DESKTOP_ACTOR_SOURCE.ACCOUNT,
+        auditId: userId,
+        userId,
+        hostId: registryIdentity.hostId,
+        endpointGeneration: generation,
+        modeCeiling: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
+        authorityGeneration: 0,
+        expiryRevision: 0,
+        expiresAt: 0,
+      },
       daemonGeneration: generation,
       capability,
       createdAt: authorizedAt,
@@ -508,9 +1055,26 @@ export class RemoteDesktopRouter {
       mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
       inputEpoch: 1,
       reconnectAttempt: start.reconnectAttempt ?? 0,
+      registryIdentity,
     });
     this.routesBySession.set(sessionId, route);
     this.sessionByRequest.set(start.requestId, sessionId);
+
+    // Promote the durable route before PREPARE. Marking it active slightly
+    // early is conservative: a concurrent privacy epoch must shield or refuse
+    // it. Sending PREPARE while it was still cancellable could start capture
+    // after the shell had already concluded that no active route existed.
+    try {
+      await this.routeRegistry.activate(db, {
+        ...registryIdentity,
+        routeId: sessionId,
+        now: this.now(),
+      });
+    } catch {
+      this.deleteRoute(route);
+      this.reject(socket, start.requestId, REMOTE_DESKTOP_ERROR.CAPABILITY_UNAVAILABLE, true);
+      return;
+    }
 
     const authority = {
       requestId: start.requestId,
@@ -526,6 +1090,7 @@ export class RemoteDesktopRouter {
     if (!this.hooks.sendDaemon({
       type: REMOTE_DESKTOP_MSG.PREPARE,
       ...authority,
+      routeGeneration: registryIdentity.routeGeneration,
       ...(route.reconnectAttempt > 0 ? { reconnectAttempt: route.reconnectAttempt } : {}),
     }, generation)) {
       this.failRoute(route, REMOTE_DESKTOP_TERMINAL_REASON.DAEMON_REPLACED, false);
@@ -541,6 +1106,138 @@ export class RemoteDesktopRouter {
         reconnectAttempt: route.reconnectAttempt,
       });
     }
+    this.publishCollaborationCounts();
+  }
+
+  private async authorizeGuest(
+    socket: WebSocket,
+    pending: PendingGuestAdmission,
+    start: RemoteDesktopStart,
+  ): Promise<void> {
+    const principalId = `guest:${pending.actor.auditId}`;
+    if (this.routesBySession.has(pending.sessionId)) {
+      this.pendingGuestBySocket.delete(socket);
+      this.reject(socket, start.requestId, REMOTE_DESKTOP_ERROR.SESSION_LIMIT, false);
+      return;
+    }
+    if (this.pendingGuestBySocket.get(socket) !== pending
+      || !this.consumeStartBudget(socket, principalId)
+      || this.sessionByRequest.has(start.requestId)
+      || this.routesBySession.size >= REMOTE_DESKTOP_LIMITS.MAX_PER_MACHINE
+      || this.hooks.featureEnabled?.() === false
+      || !this.hooks.daemonAvailable()
+      || !this.hooks.daemonSupportsRemoteDesktop()) {
+      this.rejectPendingGuest(socket, pending, start.requestId);
+      return;
+    }
+    const db = this.hooks.database();
+    const generation = this.hooks.daemonGeneration();
+    if (!db || pending.actor.endpointGeneration !== generation) {
+      this.rejectPendingGuest(socket, pending, start.requestId);
+      return;
+    }
+
+    if (pending.actor.source === REMOTE_DESKTOP_ACTOR_SOURCE.ATTENDED_LINK) {
+      const consentOutcome = await this.hooks.requestAttendedConsent?.({
+        actor: pending.actor,
+        sessionId: pending.sessionId,
+        routeGeneration: pending.registryIdentity.routeGeneration,
+        daemonGeneration: generation,
+        mode: pending.actor.modeCeiling,
+      }).catch(() => 'unavailable' as const) ?? 'unavailable';
+      const approved = consentOutcome === true || consentOutcome === 'approved';
+      if (!approved || this.pendingGuestBySocket.get(socket) !== pending
+        || generation !== this.hooks.daemonGeneration()) {
+        this.rejectPendingGuest(
+          socket,
+          pending,
+          start.requestId,
+          consentOutcome === 'timeout'
+            ? REMOTE_DESKTOP_ERROR.NEGOTIATION_TIMEOUT
+            : consentOutcome === 'cancelled'
+              ? REMOTE_DESKTOP_ERROR.CONSENT_CANCELLED
+            : consentOutcome === 'unavailable'
+              ? REMOTE_DESKTOP_ERROR.CAPABILITY_UNAVAILABLE
+              : REMOTE_DESKTOP_ERROR.ACCESS_DENIED,
+        );
+        return;
+      }
+    }
+
+    let iceAuthority: TurnIceServerAuthority;
+    try {
+      iceAuthority = this.hooks.iceServers(pending.actor.auditId);
+    } catch {
+      this.rejectPendingGuest(socket, pending, start.requestId);
+      return;
+    }
+    const now = this.now();
+    const hardIceExpiry = iceAuthority.credentialExpiresAt === undefined
+      ? Number.MAX_SAFE_INTEGER
+      : iceAuthority.credentialExpiresAt - TURN_SERVICE_DEFAULTS.CREDENTIAL_EXPIRY_SAFETY_MS;
+    const actorExpiry = pending.actor.expiresAt === 0 ? Number.MAX_SAFE_INTEGER : pending.actor.expiresAt;
+    const expiresAt = Math.min(now + REMOTE_DESKTOP_LIMITS.ABSOLUTE_LIFETIME_MS, hardIceExpiry, actorExpiry);
+    if (expiresAt <= now) {
+      this.rejectPendingGuest(socket, pending, start.requestId);
+      return;
+    }
+    const capability = this.deriveCapability(start.requestId, pending.sessionId);
+    const route = this.createRoute({
+      requestId: start.requestId,
+      sessionId: pending.sessionId,
+      socket,
+      principalId,
+      actor: pending.actor,
+      daemonGeneration: generation,
+      capability,
+      createdAt: now,
+      expiresAt,
+      leaseExpiresAt: Math.min(now + REMOTE_DESKTOP_LIMITS.LEASE_DURATION_MS, expiresAt),
+      mode: pending.actor.modeCeiling,
+      inputEpoch: 1,
+      reconnectAttempt: start.reconnectAttempt ?? 0,
+      registryIdentity: pending.registryIdentity,
+    });
+    this.pendingGuestBySocket.delete(socket);
+    this.guestPrincipalBySocket.set(socket, principalId);
+    this.routesBySession.set(route.sessionId, route);
+    this.sessionByRequest.set(route.requestId, route.sessionId);
+    try {
+      await this.routeRegistry.activate(db, {
+        ...pending.registryIdentity,
+        routeId: route.sessionId,
+        now: this.now(),
+      });
+    } catch {
+      this.deleteRoute(route);
+      this.reject(socket, start.requestId, REMOTE_DESKTOP_ERROR.CAPABILITY_UNAVAILABLE, true);
+      return;
+    }
+    const authority = {
+      requestId: route.requestId,
+      sessionId: route.sessionId,
+      capability,
+      expiresAt,
+      leaseExpiresAt: route.leaseExpiresAt,
+      daemonGeneration: generation,
+      mode: route.mode,
+      inputEpoch: route.inputEpoch,
+      iceServers: iceAuthority.iceServers,
+    };
+    // For attended links this is intentionally after the one-use positive
+    // consent hook and durable activation. No pre-consent path dispatches.
+    if (!this.hooks.sendDaemon({
+      type: REMOTE_DESKTOP_MSG.PREPARE,
+      ...authority,
+      routeGeneration: pending.registryIdentity.routeGeneration,
+      ...(route.reconnectAttempt > 0 ? { reconnectAttempt: route.reconnectAttempt } : {}),
+    }, generation)) {
+      this.failRoute(route, REMOTE_DESKTOP_TERMINAL_REASON.DAEMON_REPLACED, false);
+      return;
+    }
+    this.hooks.sendBrowser(socket, { type: REMOTE_DESKTOP_MSG.AUTHORIZED, ...authority });
+    this.counters.admitted++;
+    this.audit(REMOTE_DESKTOP_AUDIT_EVENT.ADMITTED, route);
     this.publishCollaborationCounts();
   }
 
@@ -606,14 +1303,15 @@ export class RemoteDesktopRouter {
 
   private async forwardBrowserSignal(
     socket: WebSocket,
-    userId: string,
+    principalId: string,
     message: Exclude<RemoteDesktopBrowserMessage, RemoteDesktopStart>,
   ): Promise<void> {
     const route = this.routesBySession.get(message.sessionId);
     if (!route
       || route.requestId !== message.requestId
       || route.socket !== socket
-      || route.userId !== userId
+      || route.principalId !== principalId
+      || route.daemonSuspended
       || route.daemonGeneration !== this.hooks.daemonGeneration()
       || route.expiresAt <= this.now()
       || !capabilityMatches(route, message.capability)) {
@@ -650,6 +1348,12 @@ export class RemoteDesktopRouter {
       return;
     }
     if (message.type === REMOTE_DESKTOP_MSG.MODE_SET) {
+      if (route.actor.modeCeiling === REMOTE_DESKTOP_ACCESS_MODE.VIEW
+        && message.mode === REMOTE_DESKTOP_ACCESS_MODE.CONTROL) {
+        this.counters.dropped++;
+        this.sendError(socket, message.requestId, REMOTE_DESKTOP_ERROR.ACCESS_DENIED, false);
+        return;
+      }
       if (!this.consumeModeBudget(route)) {
         this.failRoute(route, REMOTE_DESKTOP_TERMINAL_REASON.PROTOCOL_ERROR, true);
         return;
@@ -710,8 +1414,10 @@ export class RemoteDesktopRouter {
     requestId: string;
     sessionId: string;
     socket: WebSocket;
-    userId: string;
-    accessRole: MachineAccessRole;
+    actor: RemoteDesktopActor;
+    principalId: string;
+    userId?: string;
+    accessRole?: MachineAccessRole;
     daemonGeneration: number;
     capability: string;
     createdAt: number;
@@ -720,11 +1426,13 @@ export class RemoteDesktopRouter {
     mode: RemoteDesktopAccessMode;
     inputEpoch: number;
     reconnectAttempt: number;
+    registryIdentity: RemoteDesktopRouteRegistryIdentity;
   }): RemoteDesktopRoute {
     const route = {} as RemoteDesktopRoute;
     Object.assign(route, {
       ...input,
       capabilityHash: hashCapability(input.capability),
+      daemonSuspended: false,
       state: REMOTE_DESKTOP_STATE.PREPARING,
       browserIceCandidates: 0,
       daemonIceCandidates: 0,
@@ -739,6 +1447,7 @@ export class RemoteDesktopRouter {
       workerInputEnabled: false,
       auditedInputEnabled: false,
       connectionRoute: undefined,
+      registryCloseStarted: false,
     });
     route.negotiationTimer = this.timer(() => {
       if (this.routesBySession.get(route.sessionId) === route) {
@@ -758,6 +1467,7 @@ export class RemoteDesktopRouter {
 
   private async renewLease(route: RemoteDesktopRoute): Promise<void> {
     if (this.routesBySession.get(route.sessionId) !== route || route.revalidationInFlight) return;
+    if (route.daemonSuspended) return;
     if (this.hooks.featureEnabled?.() === false) {
       this.failRoute(route, REMOTE_DESKTOP_TERMINAL_REASON.CAPABILITY_UNAVAILABLE, true);
       return;
@@ -774,25 +1484,60 @@ export class RemoteDesktopRouter {
       return;
     }
     route.revalidationInFlight = true;
-    let access: ControlledMachineAccessRow | null = null;
-    try {
-      access = await (this.hooks.resolveAccess ?? resolveRemoteDesktopHostAccess)(
-        db,
-        route.userId,
-        this.hooks.serverId(),
-        this.now(),
-      );
-    } catch {
-      // Fail closed immediately; the worker independently enforces the previous
-      // short lease if this terminal/stop message is lost.
-    } finally {
-      route.revalidationInFlight = false;
-    }
-    if (this.routesBySession.get(route.sessionId) !== route) return;
-    const terminalReason = this.revalidationFailure(access);
-    if (terminalReason) {
-      this.failRoute(route, terminalReason, true);
-      return;
+    if (route.actor.source === REMOTE_DESKTOP_ACTOR_SOURCE.ACCOUNT) {
+      let access: ControlledMachineAccessRow | null = null;
+      try {
+        access = await (this.hooks.resolveAccess ?? resolveRemoteDesktopHostAccess)(
+          db,
+          route.actor.userId,
+          this.hooks.serverId(),
+          this.now(),
+        );
+      } catch {
+        // Fail closed below.
+      } finally {
+        route.revalidationInFlight = false;
+      }
+      if (this.routesBySession.get(route.sessionId) !== route) return;
+      const terminalReason = this.revalidationFailure(access);
+      if (terminalReason) {
+        this.failRoute(route, terminalReason, true);
+        return;
+      }
+    } else {
+      let current: RemoteDesktopActor | null = null;
+      try {
+        current = await this.hooks.resolveGuestActor?.(route.actor, this.now()) ?? null;
+      } catch {
+        current = null;
+      } finally {
+        route.revalidationInFlight = false;
+      }
+      if (this.routesBySession.get(route.sessionId) !== route) return;
+      if (!current || current.endpointGeneration !== route.daemonGeneration
+        || !isRemoteDesktopActorRenewable(route.actor, current, this.now())) {
+        this.failRoute(route, REMOTE_DESKTOP_TERMINAL_REASON.AUTHORITY_REVOKED, true);
+        return;
+      }
+      route.actor = current;
+      if (current.modeCeiling === REMOTE_DESKTOP_ACCESS_MODE.VIEW
+        && route.mode === REMOTE_DESKTOP_ACCESS_MODE.CONTROL) {
+        route.mode = REMOTE_DESKTOP_ACCESS_MODE.VIEW;
+        route.inputEpoch += 1;
+        if (!this.hooks.sendDaemon(this.modeState(route), route.daemonGeneration)) {
+          this.failRoute(route, REMOTE_DESKTOP_TERMINAL_REASON.DAEMON_REPLACED, false);
+          return;
+        }
+      }
+      if (current.expiresAt !== 0 && current.expiresAt < route.expiresAt) {
+        route.expiresAt = current.expiresAt;
+        clearTimeout(route.absoluteTimer);
+        route.absoluteTimer = this.timer(() => {
+          if (this.routesBySession.get(route.sessionId) === route) {
+            this.failRoute(route, REMOTE_DESKTOP_TERMINAL_REASON.AUTHORITY_EXPIRED, true);
+          }
+        }, Math.max(0, route.expiresAt - this.now()));
+      }
     }
     const now = this.now();
     const nextLease = Math.min(now + REMOTE_DESKTOP_LIMITS.LEASE_DURATION_MS, route.expiresAt);
@@ -808,6 +1553,7 @@ export class RemoteDesktopRouter {
       capability,
       leaseExpiresAt: nextLease,
       daemonGeneration: route.daemonGeneration,
+      routeGeneration: route.registryIdentity.routeGeneration,
       mode: route.mode,
       inputEpoch: route.inputEpoch,
     }, route.daemonGeneration)) {
@@ -907,6 +1653,11 @@ export class RemoteDesktopRouter {
       .digest('base64url');
   }
 
+  private allocateRouteGeneration(db: Database): Promise<number> {
+    return this.hooks.allocateRouteGeneration?.(db)
+      ?? allocateRemoteDesktopRouteGeneration(db);
+  }
+
   private modeState(route: RemoteDesktopRoute): Record<string, unknown> {
     return {
       type: REMOTE_DESKTOP_MSG.MODE_STATE,
@@ -958,6 +1709,7 @@ export class RemoteDesktopRouter {
   }
 
   private deleteRoute(route: RemoteDesktopRoute): void {
+    this.closeRegisteredRoute(route);
     clearTimeout(route.negotiationTimer);
     clearTimeout(route.absoluteTimer);
     clearTimeout(route.leaseTimer);
@@ -969,6 +1721,27 @@ export class RemoteDesktopRouter {
     route.capabilityHash.fill(0);
     this.counters.terminated++;
     this.publishCollaborationCounts();
+  }
+
+  private closeRegisteredRoute(route: RemoteDesktopRoute): void {
+    if (route.registryCloseStarted) return;
+    route.registryCloseStarted = true;
+    const db = this.hooks.database();
+    if (!db) return;
+    void this.routeRegistry.close(db, {
+      ...route.registryIdentity,
+      routeId: route.sessionId,
+      now: this.now(),
+    }).catch(() => {
+      // A missed close stays fail-closed in durable state. Record only bounded
+      // identifiers; recovery/reconciliation must never reopen admission based
+      // on process-local belief.
+      this.hooks.audit?.(REMOTE_DESKTOP_AUDIT_EVENT.FAILED, {
+        serverId: this.hooks.serverId(),
+        sessionId: route.sessionId,
+        reason: 'route_registry_close_failed',
+      });
+    });
   }
 
   private publishCollaborationCounts(excludeSessionId?: string): void {
@@ -1003,6 +1776,38 @@ export class RemoteDesktopRouter {
     this.sendError(socket, requestId, error, retryable);
   }
 
+  private rejectPendingGuest(
+    socket: WebSocket,
+    pending: PendingGuestAdmission,
+    requestId: string,
+    error: string = REMOTE_DESKTOP_ERROR.ACCESS_DENIED,
+  ): void {
+    if (this.pendingGuestBySocket.get(socket) === pending) {
+      this.pendingGuestBySocket.delete(socket);
+    }
+    this.closePendingGuest(pending);
+    this.reject(socket, requestId, error, false);
+  }
+
+  private closePendingGuest(
+    pending: PendingGuestAdmission,
+    cancellationCause?: 'browser_disconnect' | 'authority_revoked' | 'privacy_epoch',
+  ): void {
+    if (cancellationCause) {
+      void this.hooks.cancelPendingGuestConsent?.(
+        pending.actor,
+        cancellationCause,
+      ).catch(() => {});
+    }
+    const db = this.hooks.database();
+    if (!db) return;
+    void this.routeRegistry.close(db, {
+      ...pending.registryIdentity,
+      routeId: pending.sessionId,
+      now: this.now(),
+    }).catch(() => {});
+  }
+
   private sendError(socket: WebSocket, requestId: string, error: string, retryable: boolean): void {
     this.hooks.sendBrowser(socket, {
       type: REMOTE_DESKTOP_MSG.ERROR,
@@ -1028,8 +1833,10 @@ export class RemoteDesktopRouter {
     if (!this.consumeAuditBudget()) return;
     this.hooks.audit?.(event, {
       serverId: this.hooks.serverId(),
-      userId: route.userId,
-      role: route.accessRole,
+      actorSource: route.actor.source,
+      actorAuditId: route.actor.auditId,
+      ...(route.userId === undefined ? {} : { userId: route.userId }),
+      ...(route.accessRole === undefined ? {} : { role: route.accessRole }),
       daemonGeneration: route.daemonGeneration,
       durationMs: Math.max(0, this.now() - route.createdAt),
       ...extra,
@@ -1050,4 +1857,49 @@ export class RemoteDesktopRouter {
   private now(): number {
     return this.hooks.now?.() ?? Date.now();
   }
+}
+
+function remoteDesktopRouteAuthorityTransitionMatches(
+  identity: RemoteDesktopRouteRegistryIdentity,
+  event: RemoteDesktopOutboxEvent,
+): boolean {
+  const authority = identity.authority;
+  if (event.authorityKind === REMOTE_DESKTOP_OUTBOX_AUTHORITY_KIND.PASSWORD) {
+    return authority.actorSource === REMOTE_DESKTOP_ACTOR_SOURCE.NODE_PASSWORD
+      && authority.actorAuditId === event.actorAuditId
+      && authority.sessionAuditId === event.sessionAuditId
+      && authority.passwordGeneration < event.passwordGeneration;
+  }
+  if (authority.actorSource !== REMOTE_DESKTOP_ACTOR_SOURCE.ATTENDED_LINK
+    && authority.actorSource !== REMOTE_DESKTOP_ACTOR_SOURCE.UNATTENDED_LINK) return false;
+  if (authority.actorAuditId !== event.actorAuditId
+    || authority.commitRevision > event.commitRevision) return false;
+  if (event.effect === REMOTE_DESKTOP_OUTBOX_EFFECT.DOWNGRADE) {
+    return authority.authorityGeneration < event.authorityGeneration
+      && authority.expiryRevision <= event.expiryRevision;
+  }
+  if (event.effect === REMOTE_DESKTOP_OUTBOX_EFFECT.DEADLINE_UPDATE) {
+    return authority.authorityGeneration === event.authorityGeneration
+      && authority.expiryRevision < event.expiryRevision;
+  }
+  return authority.authorityGeneration <= event.authorityGeneration
+    && authority.expiryRevision <= event.expiryRevision;
+}
+
+function remoteDesktopOutboxAuthorityMatches(
+  event: RemoteDesktopOutboxEvent,
+  authority: RemoteDesktopGuestOutboxAuthorityMatch,
+): boolean {
+  if (!authority
+    || event.authorityKind !== authority.authorityKind
+    || event.actorAuditId !== authority.actorAuditId) return false;
+  if (event.authorityKind === REMOTE_DESKTOP_OUTBOX_AUTHORITY_KIND.PASSWORD) {
+    return authority.authorityKind === REMOTE_DESKTOP_OUTBOX_AUTHORITY_KIND.PASSWORD
+      && event.sessionAuditId === authority.sessionAuditId
+      && event.passwordGeneration === authority.passwordGeneration;
+  }
+  return authority.authorityKind === REMOTE_DESKTOP_OUTBOX_AUTHORITY_KIND.LINK
+    && event.authorityGeneration === authority.authorityGeneration
+    && event.expiryRevision === authority.expiryRevision
+    && event.commitRevision === authority.commitRevision;
 }

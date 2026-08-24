@@ -102,6 +102,9 @@ struct Authority {
   int64_t expires_at_ms = 0;
   int64_t lease_expires_at_ms = 0;
   int daemon_generation = 0;
+  // Independent Server route epoch. Missing remains parseable for legacy v2
+  // authenticated access, but is never eligible for management-privacy ACK.
+  std::optional<int64_t> route_generation;
   std::string mode;
   int input_epoch = 0;
   int reconnect_attempt = 0;

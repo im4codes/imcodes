@@ -638,6 +638,16 @@ vi.mock('../src/components/RemoteDesktopPanel.js', () => ({
     </div>
   ),
 }));
+vi.mock('../src/components/RemoteDesktopWorkspace.js', () => ({
+  RemoteDesktopWorkspace: ({ minimized, onMinimize, onRestore, onCloseWorkspace }: any) => (
+    <div data-testid="remote-desktop-workspace">
+      remote-desktop-panel:{String(minimized)}
+      <button onClick={onMinimize}>remote-desktop-minimize</button>
+      <button onClick={onRestore}>remote-desktop-restore</button>
+      <button onClick={onCloseWorkspace}>remote-desktop-close</button>
+    </div>
+  ),
+}));
 vi.mock('../src/components/ContextDiagnosticsPanel.js', () => ({
   ContextDiagnosticsPanel: ({ onStateChange }: any) => (
     <button onClick={() => onStateChange?.({ enterpriseId: 'ent-1', language: 'ts' })}>context-diagnostics</button>

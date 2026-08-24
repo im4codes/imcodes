@@ -102,6 +102,15 @@ bool ParseAuthorityFields(const Json::Value& root,
     }
     authority->daemon_generation = root["daemonGeneration"].asInt();
   }
+  if (root.isMember("routeGeneration")) {
+    constexpr int64_t kMaximumSafeInteger = 9'007'199'254'740'991;
+    if (!root["routeGeneration"].isInt64()) return false;
+    const int64_t route_generation = root["routeGeneration"].asInt64();
+    if (route_generation < 0 || route_generation > kMaximumSafeInteger) {
+      return false;
+    }
+    authority->route_generation = route_generation;
+  }
   if (root.isMember("reconnectAttempt")) {
     if (!root["reconnectAttempt"].isInt() ||
         root["reconnectAttempt"].asInt() < 0 ||
@@ -168,7 +177,7 @@ std::optional<Signal> ParseServiceSignal(const Json::Value& root,
     if (!ExactKeys(root, {"type", "requestId", "sessionId", "capability",
                           "expiresAt", "leaseExpiresAt", "daemonGeneration",
                           "mode", "inputEpoch", "iceServers"},
-                   {"reconnectAttempt"}) ||
+                   {"routeGeneration", "reconnectAttempt"}) ||
         !ParseAuthorityFields(root, now_ms, true, &signal.authority)) {
       return std::nullopt;
     }
@@ -194,7 +203,7 @@ std::optional<Signal> ParseServiceSignal(const Json::Value& root,
   } else if (type == kLeaseType) {
     if (!ExactKeys(root, {"type", "requestId", "sessionId", "capability",
                           "leaseExpiresAt", "daemonGeneration", "mode",
-                          "inputEpoch"}) ||
+                          "inputEpoch"}, {"routeGeneration"}) ||
         !ParseAuthorityFields(root, now_ms, false, &signal.authority)) {
       return std::nullopt;
     }

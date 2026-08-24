@@ -153,6 +153,14 @@ type Lease = {
   iceRestartedGeneration: number | null;
   peerCreating: Promise<void> | null;
   leaseSignalRequestId: string | null;
+  /**
+   * Browser WebSocket lifecycle generation. Any lease/SDP wait started on an
+   * older control socket must be rejected when that socket is torn down;
+   * otherwise a resumed mobile app keeps awaiting a promise that can only be
+   * satisfied by frames from the dead socket.
+   */
+  controlEpoch: number;
+  controlAbort: AbortController;
   unsubscribeCapability: (() => void) | null;
   unsubscribeTerminalObserver: (() => void) | null;
   active: Map<string, ActiveAttempt>;
@@ -300,16 +308,24 @@ function getBroker(ws: WsClient, serverId: string): Lease {
     iceRestartedGeneration: null,
     peerCreating: null,
     leaseSignalRequestId: null,
+    controlEpoch: 0,
+    controlAbort: new AbortController(),
     unsubscribeCapability: null,
     unsubscribeTerminalObserver: null,
     active: new Map(),
     terminalGrace: new Map(),
   };
-  // A Server/WebSocket restart clears and then repopulates this snapshot.  A
-  // healthy peer is deliberately left alone; rebind only restores the control
-  // path and terminal status recovery.
+  // Capability state is scoped to one browser WebSocket. In particular, a
+  // null snapshot is not merely a UI hint: every request/SDP waiter registered
+  // on the old socket is now impossible to satisfy. Invalidate it immediately
+  // so a foregrounded mobile app can create a fresh lease without being held
+  // behind a suspended pre-background promise.
   lease.unsubscribeCapability = ws.onDaemonCapabilitySnapshot((snapshot) => {
-    if (!snapshot || !snapshot.capabilities.includes(DIRECT_FILE_TRANSFER_LEASE_CAPABILITY) || !lease.leaseId) return;
+    if (!snapshot || !snapshot.capabilities.includes(DIRECT_FILE_TRANSFER_LEASE_CAPABILITY)) {
+      invalidateLeaseControl(lease);
+      return;
+    }
+    if (!lease.leaseId) return;
     void rebindLease(lease).catch(() => undefined);
   });
   lease.unsubscribeTerminalObserver = ws.onMessage((raw) => {
@@ -326,6 +342,11 @@ function clearLeaseTimer(lease: Lease): void {
 
 function disposeLease(lease: Lease): void {
   clearLeaseTimer(lease);
+  lease.controlEpoch++;
+  lease.controlAbort.abort(directError(DIRECT_FILE_TRANSFER_ERROR.LEASE_EXPIRED));
+  lease.creating = null;
+  lease.rebinding = null;
+  lease.peerCreating = null;
   for (const active of lease.active.values()) {
     try { active.channel?.close(); } catch { /* best effort */ }
   }
@@ -352,7 +373,8 @@ function armLeaseIdleTimer(lease: Lease): void {
   // The bounded grace owns the binding after data ACK/local cancel until the
   // Server returns its re-armed deadline. Do not let an outer release arm the
   // stale pre-operation deadline in that interval.
-  if (lease.active.size !== 0 || lease.terminalGrace.size !== 0) return;
+  if (lease.active.size !== 0 || lease.terminalGrace.size !== 0
+    || lease.creating || lease.rebinding || lease.peerCreating) return;
   clearLeaseTimer(lease);
   // Unlike the browser's old relative five-minute timer, this deadline starts
   // when the server accepts LEASE_INIT. A delayed LEASE_READY/SDP exchange
@@ -496,14 +518,16 @@ function observeLateTerminalDeadline(lease: Lease, raw: ServerMessage): void {
   settleTerminalGrace(lease, grace);
 }
 
-function waitForControl<T extends DirectFileTransferServerMessage>(
+function startControlWait<T extends DirectFileTransferServerMessage>(
   lease: Lease,
   requestId: string,
   predicate: (message: DirectFileTransferServerMessage) => message is T,
   timeoutMs: number,
   signal?: AbortSignal,
-): Promise<T> {
-  return new Promise((resolve, reject) => {
+  abortFailure?: DirectFileTransferFailure,
+): { promise: Promise<T>; cancel: (error: unknown) => void } {
+  let cancel: (error: unknown) => void = () => undefined;
+  const promise = new Promise<T>((resolve, reject) => {
     let timeout: ReturnType<typeof setTimeout> | null = null;
     const finish = (error?: unknown, message?: T) => {
       if (timeout) clearTimeout(timeout);
@@ -513,7 +537,8 @@ function waitForControl<T extends DirectFileTransferServerMessage>(
       if (error) reject(error);
       else resolve(message!);
     };
-    const onAbort = () => finish(directError(DIRECT_FILE_TRANSFER_ERROR.CANCELED, false));
+    const onAbort = () => finish(abortFailure ?? directError(DIRECT_FILE_TRANSFER_ERROR.CANCELED, false));
+    cancel = (error) => finish(error);
     const off = lease.ws.onMessage((raw) => {
       const message = parseMatchingControl(raw, requestId);
       if (!message) return;
@@ -530,9 +555,13 @@ function waitForControl<T extends DirectFileTransferServerMessage>(
     signal?.addEventListener('abort', onAbort, { once: true });
     timeout = setTimeout(() => finish(directError(DIRECT_FILE_TRANSFER_ERROR.NEGOTIATION_TIMEOUT)), timeoutMs);
   });
+  return { promise, cancel };
 }
 
 async function ensureLease(lease: Lease): Promise<void> {
+  // A fresh daemon capability snapshot starts rebind asynchronously. Do not
+  // race a new offer/operation against the Server's PREPARE acknowledgement.
+  if (lease.rebinding) await lease.rebinding;
   if (lease.leaseId && lease.leaseGeneration && lease.daemonGeneration
     && lease.expiresAt > Date.now() && lease.idleExpiresAt > Date.now()) {
     recordDirectFileTransferMetric(DIRECT_FILE_TRANSFER_CLIENT_METRIC.LEASE_REUSED, { reused: true });
@@ -540,7 +569,10 @@ async function ensureLease(lease: Lease): Promise<void> {
     return;
   }
   if (lease.creating) return lease.creating;
-  lease.creating = (async () => {
+  const epoch = lease.controlEpoch;
+  const signal = lease.controlAbort.signal;
+  let creating!: Promise<void>;
+  creating = (async () => {
     if (!supportsLease(lease.ws)) throw directError(DIRECT_FILE_TRANSFER_ERROR.CAPABILITY_UNAVAILABLE, false);
     // retryDirect owns the three-attempt transport budget. Retrying here as
     // well multiplied one stalled lease negotiation into nine long waits
@@ -548,55 +580,79 @@ async function ensureLease(lease: Lease): Promise<void> {
     // One LEASE_INIT/offer per direct attempt keeps the total bounded and
     // guarantees the documented three attempts then exactly one relay path.
     const requestId = crypto.randomUUID();
-    const ready = waitForControl(
+    const ready = startControlWait(
       lease,
       requestId,
-      (message): message is DirectFileTransferLeaseReady => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_READY,
+      (candidate): candidate is DirectFileTransferLeaseReady => candidate.type === DIRECT_FILE_TRANSFER_MSG.LEASE_READY,
       DIRECT_FILE_TRANSFER_LIMITS.NEGOTIATION_TIMEOUT_MS,
+      signal,
+      directError(DIRECT_FILE_TRANSFER_ERROR.LEASE_EXPIRED),
     );
-    lease.ws.send({
-      type: DIRECT_FILE_TRANSFER_MSG.LEASE_INIT,
-      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
-      requestId,
-      serverId: lease.serverId,
-      browserTabId: lease.browserTabId,
-    });
-    leaseFromReady(lease, await ready);
+    try {
+      sendControl(lease, {
+        type: DIRECT_FILE_TRANSFER_MSG.LEASE_INIT,
+        protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+        requestId,
+        serverId: lease.serverId,
+        browserTabId: lease.browserTabId,
+      });
+    } catch (error) {
+      ready.cancel(error);
+      await ready.promise;
+      throw error; // unreachable; preserves narrowing if cancellation changes
+    }
+    const message = await ready.promise;
+    assertCurrentControl(lease, epoch);
+    leaseFromReady(lease, message);
     if (!lease.leaseId) throw directError(DIRECT_FILE_TRANSFER_ERROR.LEASE_EXPIRED);
     await ensureLeasePeer(lease);
   })().finally(() => {
-    lease.creating = null;
+    if (lease.creating === creating) lease.creating = null;
   });
-  return lease.creating;
+  lease.creating = creating;
+  return creating;
 }
 
 async function rebindLease(lease: Lease): Promise<void> {
   if (!lease.leaseId || !lease.leaseGeneration || !lease.resumeTicket) return ensureLease(lease);
   if (lease.rebinding) return lease.rebinding;
-  lease.rebinding = (async () => {
+  const epoch = lease.controlEpoch;
+  const signal = lease.controlAbort.signal;
+  let rebinding!: Promise<void>;
+  rebinding = (async () => {
     recordDirectFileTransferMetric(DIRECT_FILE_TRANSFER_CLIENT_METRIC.REBIND);
     const requestId = crypto.randomUUID();
-    const rebound = waitForControl(
+    const rebound = startControlWait(
       lease,
       requestId,
-      (message): message is DirectFileTransferLeaseReady => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_REBOUND,
+      (candidate): candidate is DirectFileTransferLeaseReady => candidate.type === DIRECT_FILE_TRANSFER_MSG.LEASE_REBOUND,
       DIRECT_FILE_TRANSFER_LIMITS.STATUS_RECOVERY_DEADLINE_MS,
+      signal,
+      directError(DIRECT_FILE_TRANSFER_ERROR.LEASE_EXPIRED),
     );
-    lease.ws.send({
-      type: DIRECT_FILE_TRANSFER_MSG.LEASE_REBIND,
-      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
-      requestId,
-      serverId: lease.serverId,
-      browserTabId: lease.browserTabId,
-      leaseId: lease.leaseId,
-      leaseGeneration: lease.leaseGeneration,
-      resumeTicket: lease.resumeTicket,
-    });
-    leaseFromReady(lease, await rebound);
+    try {
+      sendControl(lease, {
+        type: DIRECT_FILE_TRANSFER_MSG.LEASE_REBIND,
+        protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+        requestId,
+        serverId: lease.serverId,
+        browserTabId: lease.browserTabId,
+        leaseId: lease.leaseId,
+        leaseGeneration: lease.leaseGeneration,
+        resumeTicket: lease.resumeTicket,
+      });
+    } catch (error) {
+      rebound.cancel(error);
+      await rebound.promise;
+      throw error; // unreachable; preserves narrowing if cancellation changes
+    }
+    const message = await rebound.promise;
+    assertCurrentControl(lease, epoch);
+    leaseFromReady(lease, message);
     await ensureLeasePeer(lease);
     for (const active of lease.active.values()) {
       if (!active.authority || !lease.leaseId || !lease.leaseGeneration || !lease.daemonGeneration) continue;
-      lease.ws.send({
+      sendControl(lease, {
         type: DIRECT_FILE_TRANSFER_MSG.STATUS_QUERY,
         protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
         serverId: lease.serverId,
@@ -612,9 +668,10 @@ async function rebindLease(lease: Lease): Promise<void> {
       });
     }
   })().finally(() => {
-    lease.rebinding = null;
+    if (lease.rebinding === rebinding) lease.rebinding = null;
   });
-  return lease.rebinding;
+  lease.rebinding = rebinding;
+  return rebinding;
 }
 
 function currentBinding(lease: Lease, active: ActiveAttempt) {
@@ -658,6 +715,59 @@ function clearLeaseBinding(lease: Lease): void {
   lease.leaseSignalRequestId = null;
 }
 
+function invalidateLeaseControl(lease: Lease): void {
+  lease.controlEpoch++;
+  const stale = lease.controlAbort;
+  lease.controlAbort = new AbortController();
+  // Clear the ownership slots synchronously. The stale promises use
+  // identity-guarded finally handlers below, so they cannot erase a newer
+  // request that starts before their rejection microtask runs.
+  lease.creating = null;
+  lease.rebinding = null;
+  lease.peerCreating = null;
+  stale.abort(directError(DIRECT_FILE_TRANSFER_ERROR.LEASE_EXPIRED));
+
+  if (lease.active.size === 0) {
+    // No data plane has to survive this control reconnect. A clean lease and
+    // RTCPeerConnection is both cheaper and safer than trying to infer whether
+    // a mobile WebView's old association is still viable.
+    clearLeaseBinding(lease);
+    return;
+  }
+
+  // Active byte streams retain their immutable attempt binding and peer. Only
+  // old-socket signalling listeners are impossible to recover; the fresh
+  // daemon capability snapshot will rebind the control generation.
+  try { lease.leaseIceOff?.(); } catch { /* best effort */ }
+  lease.leaseIceOff = null;
+  lease.leaseSignalRequestId = null;
+}
+
+function assertCurrentControl(lease: Lease, epoch: number): void {
+  if (lease.controlEpoch !== epoch || lease.controlAbort.signal.aborted) {
+    throw directError(DIRECT_FILE_TRANSFER_ERROR.LEASE_EXPIRED);
+  }
+}
+
+/**
+ * File-transfer control messages are request/response traffic and must never
+ * use WsClient.send(), whose fire-and-forget contract intentionally drops
+ * frames while a foreground liveness probe has `_connected=false`. The OS
+ * socket can still be OPEN in that window; sendUrgent writes to it directly
+ * and throws on a genuinely absent socket so retry/HTTP fallback can run.
+ */
+function sendControl(lease: Lease, message: object): void {
+  try {
+    lease.ws.sendUrgent(message);
+  } catch (error) {
+    throw directError(
+      DIRECT_FILE_TRANSFER_ERROR.CONNECTION_FAILED,
+      true,
+      error instanceof Error ? error.message : undefined,
+    );
+  }
+}
+
 function hasLeaseBinding(lease: Lease): lease is Lease & {
   leaseId: string;
   leaseGeneration: number;
@@ -697,7 +807,11 @@ async function ensureLeasePeer(lease: Lease): Promise<void> {
     && lease.peer.connectionState !== 'disconnected'
     && lease.peer.connectionState !== 'closed') return;
   if (lease.peerCreating) return lease.peerCreating;
-  lease.peerCreating = (async () => {
+  const epoch = lease.controlEpoch;
+  const signal = lease.controlAbort.signal;
+  let peerCreating!: Promise<void>;
+  peerCreating = (async () => {
+    assertCurrentControl(lease, epoch);
     if (!hasLeaseBinding(lease)) throw directError(DIRECT_FILE_TRANSFER_ERROR.LEASE_EXPIRED);
     const restarting = lease.peer?.connectionState === 'failed'
       || lease.peer?.connectionState === 'disconnected';
@@ -722,19 +836,23 @@ async function ensureLeasePeer(lease: Lease): Promise<void> {
       );
       createdPeer.addEventListener('connectionstatechange', () => { lease.peerState = createdPeer.connectionState; });
       createdPeer.addEventListener('icecandidate', (event) => {
-        if (!event.candidate || !hasLeaseBinding(lease)) return;
-        lease.ws.send({
-          type: DIRECT_FILE_TRANSFER_MSG.LEASE_ICE,
-          protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
-          serverId: lease.serverId,
-          browserTabId: lease.browserTabId,
-          leaseId: lease.leaseId,
-          leaseGeneration: lease.leaseGeneration,
-          daemonGeneration: lease.daemonGeneration,
-          requestId: lease.leaseSignalRequestId ?? crypto.randomUUID(),
-          candidate: event.candidate.candidate,
-          mid: event.candidate.sdpMid ?? '',
-        });
+        if (!event.candidate || lease.peer !== createdPeer || !hasLeaseBinding(lease)) return;
+        try {
+          sendControl(lease, {
+            type: DIRECT_FILE_TRANSFER_MSG.LEASE_ICE,
+            protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+            serverId: lease.serverId,
+            browserTabId: lease.browserTabId,
+            leaseId: lease.leaseId,
+            leaseGeneration: lease.leaseGeneration,
+            daemonGeneration: lease.daemonGeneration,
+            requestId: lease.leaseSignalRequestId ?? crypto.randomUUID(),
+            candidate: event.candidate.candidate,
+            mid: event.candidate.sdpMid ?? '',
+          });
+        } catch {
+          // The outstanding answer waiter/reconnect lifecycle owns recovery.
+        }
       });
     }
     if (!peer) throw directError(DIRECT_FILE_TRANSFER_ERROR.CONNECTION_FAILED);
@@ -742,14 +860,6 @@ async function ensureLeasePeer(lease: Lease): Promise<void> {
     const requestId = crypto.randomUUID();
     lease.leaseSignalRequestId = requestId;
     const candidates = new PendingWebRtcCandidates<RTCIceCandidateInit>();
-    const answer = waitForControl(
-      lease,
-      requestId,
-      (message): message is DirectFileTransferLeaseAnswer => (
-        message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_ANSWER && leaseSignalMatches(message, lease, requestId)
-      ),
-      DIRECT_FILE_TRANSFER_LIMITS.NEGOTIATION_TIMEOUT_MS,
-    );
     // This subscription must outlive the answer. Host candidates come from
     // local interfaces and arrive at once, but a server-reflexive candidate
     // costs a STUN round trip and a relay candidate a TURN allocation, so both
@@ -773,32 +883,53 @@ async function ensureLeasePeer(lease: Lease): Promise<void> {
       }
       const offer = await leasePeer.createOffer(restarting ? { iceRestart: true } : undefined);
       await leasePeer.setLocalDescription(offer);
+      assertCurrentControl(lease, epoch);
       if (!hasLeaseBinding(lease)) throw directError(DIRECT_FILE_TRANSFER_ERROR.LEASE_EXPIRED);
-      lease.ws.send({
-        type: DIRECT_FILE_TRANSFER_MSG.LEASE_OFFER,
-        protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
-        serverId: lease.serverId,
-        browserTabId: lease.browserTabId,
-        leaseId: lease.leaseId,
-        leaseGeneration: lease.leaseGeneration,
-        daemonGeneration: lease.daemonGeneration,
+      const answer = startControlWait(
+        lease,
         requestId,
-        sdp: offer.sdp ?? '',
-      });
-      const remote = await answer;
+        (message): message is DirectFileTransferLeaseAnswer => (
+          message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_ANSWER && leaseSignalMatches(message, lease, requestId)
+        ),
+        DIRECT_FILE_TRANSFER_LIMITS.NEGOTIATION_TIMEOUT_MS,
+        signal,
+        directError(DIRECT_FILE_TRANSFER_ERROR.LEASE_EXPIRED),
+      );
+      try {
+        sendControl(lease, {
+          type: DIRECT_FILE_TRANSFER_MSG.LEASE_OFFER,
+          protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+          serverId: lease.serverId,
+          browserTabId: lease.browserTabId,
+          leaseId: lease.leaseId,
+          leaseGeneration: lease.leaseGeneration,
+          daemonGeneration: lease.daemonGeneration,
+          requestId,
+          sdp: offer.sdp ?? '',
+        });
+      } catch (error) {
+        answer.cancel(error);
+        await answer.promise;
+        throw error; // unreachable; preserves narrowing if cancellation changes
+      }
+      const remote = await answer.promise;
+      assertCurrentControl(lease, epoch);
       await leasePeer.setRemoteDescription({ type: 'answer', sdp: remote.sdp });
       await candidates.flush((candidate) => leasePeer.addIceCandidate(candidate));
     } catch (error) {
-      closePeer(lease);
-      if (restarting) clearLeaseBinding(lease);
+      if (lease.controlEpoch === epoch) {
+        closePeer(lease);
+        if (restarting) clearLeaseBinding(lease);
+      }
       throw error instanceof DirectFileTransferFailure
         ? error
         : directError(restarting ? DIRECT_FILE_TRANSFER_ERROR.ICE_RESTART_FAILED : DIRECT_FILE_TRANSFER_ERROR.CONNECTION_FAILED);
     }
   })().finally(() => {
-    lease.peerCreating = null;
+    if (lease.peerCreating === peerCreating) lease.peerCreating = null;
   });
-  return lease.peerCreating;
+  lease.peerCreating = peerCreating;
+  return peerCreating;
 }
 
 /**
@@ -1009,7 +1140,7 @@ async function runAttempt(lease: Lease, op: DirectAttempt, attempt: number): Pro
   const cancel = () => {
     if (!active.authority) return;
     try {
-      lease.ws.send({
+      sendControl(lease, {
         type: DIRECT_FILE_TRANSFER_MSG.CANCEL,
         protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
         ...makeDataBinding(lease, active),
@@ -1026,15 +1157,21 @@ async function runAttempt(lease: Lease, op: DirectAttempt, attempt: number): Pro
   };
   try {
     const init = makeOperationInit(lease, active, op);
-    const authorizedPromise = waitForControl(
+    const authorization = startControlWait(
       lease,
       active.requestId,
       (message): message is DirectFileTransferAuthorized => message.type === DIRECT_FILE_TRANSFER_MSG.AUTHORIZED && attemptMessageMatches(message, active),
       DIRECT_FILE_TRANSFER_LIMITS.NEGOTIATION_TIMEOUT_MS,
       op.signal,
     );
-    lease.ws.send(init);
-    const authorized = await authorizedPromise;
+    try {
+      sendControl(lease, init);
+    } catch (error) {
+      authorization.cancel(error);
+      await authorization.promise;
+      throw error; // unreachable; preserves narrowing if cancellation changes
+    }
+    const authorized = await authorization.promise;
     const parsed = validateDirectFileTransferAuthorized(authorized);
     if (!parsed.ok) throw directError(DIRECT_FILE_TRANSFER_ERROR.INVALID_AUTHORITY, false);
     active.daemonGeneration = parsed.value.daemonGeneration;
@@ -1064,7 +1201,7 @@ async function runAttempt(lease: Lease, op: DirectAttempt, attempt: number): Pro
         if (op.kind !== 'upload' || uploadStatusRecoveryRequested) return false;
         uploadStatusRecoveryRequested = true;
         try {
-          lease.ws.send({
+          sendControl(lease, {
             type: DIRECT_FILE_TRANSFER_MSG.STATUS_QUERY,
             protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
             ...currentBinding(lease, active),
@@ -1362,6 +1499,7 @@ async function retryDirect<T>(
   let last: unknown = directError(DIRECT_FILE_TRANSFER_ERROR.INTERNAL_ERROR);
   for (let attempt = 1; attempt <= DIRECT_FILE_TRANSFER_LIMITS.MAX_ATTEMPTS; attempt++) {
     if (attempt > 1) await wait(retryDelay(attempt - 1), signal);
+    const attemptControlEpoch = lease.controlEpoch;
     try {
       return await runAttempt(lease, await createOperation(attempt), attempt) as T;
     } catch (error) {
@@ -1370,7 +1508,8 @@ async function retryDirect<T>(
       // A retryable channel/ICE failure must not feed the next attempt back
       // into the same apparently-connected but dead mobile WebRTC peer. Do not
       // disturb sibling transfers that still own channels on the shared lease.
-      if (disposition !== DIRECT_FILE_TRANSFER_FAILURE_DISPOSITION.TERMINAL && lease.active.size === 0) {
+      if (disposition !== DIRECT_FILE_TRANSFER_FAILURE_DISPOSITION.TERMINAL
+        && lease.active.size === 0 && lease.controlEpoch === attemptControlEpoch) {
         closePeer(lease);
       }
       if (disposition !== DIRECT_FILE_TRANSFER_FAILURE_DISPOSITION.RETRY_DIRECT) {
@@ -1707,6 +1846,7 @@ export async function probeDirectConnectivity(
 ): Promise<DirectConnectivityProbeResult> {
   if (!serverId || !supportsLease(ws)) throw directError(DIRECT_FILE_TRANSFER_ERROR.CAPABILITY_UNAVAILABLE, false);
   const { lease, release } = acquireLease(ws, serverId);
+  const probeControlEpoch = lease.controlEpoch;
   try {
     await ensureLease(lease);
     const peer = lease.peer;
@@ -1763,7 +1903,8 @@ export async function probeDirectConnectivity(
     // offered to the next transfer. Drop only the peer (not the resumable
     // lease), so Refresh or the next upload renegotiates without requiring an
     // app restart. Active transfers, if any, retain ownership of their peer.
-    if (error instanceof DirectFileTransferFailure && error.retryable && lease.active.size === 0) {
+    if (error instanceof DirectFileTransferFailure && error.retryable
+      && lease.active.size === 0 && lease.controlEpoch === probeControlEpoch) {
       closePeer(lease);
     }
     throw error;

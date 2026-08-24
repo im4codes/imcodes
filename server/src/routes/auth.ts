@@ -14,6 +14,7 @@ import { z } from 'zod';
 import logger from '../util/logger.js';
 import { CLIENT_TIMEZONE_HEADER } from '../../../shared/http-header-names.js';
 import { rememberClientTimezone } from '../util/client-timezone.js';
+import { revokeBrowserAccountSession } from '../services/remote-desktop-account-auth.js';
 
 export const authRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
 
@@ -913,6 +914,15 @@ authRoutes.post('/password/change', async (c) => {
 // POST /api/auth/logout — clear session cookies + invalidate refresh tokens
 authRoutes.post('/logout', async (c) => {
   const userId = await resolveUserId(c);
+
+  // The access JWT remains cryptographically valid after its cookie is removed.
+  // Persist exact-session revocation before clearing it so pending native codes
+  // and action-bound remote-desktop grants cannot survive logout.
+  await revokeBrowserAccountSession(
+    c.env.DB,
+    c.env.JWT_SIGNING_KEY,
+    c.req.header('cookie'),
+  );
 
   // Clear all auth cookies regardless of auth state
   deleteCookie(c, COOKIE_SESSION, { path: '/' });

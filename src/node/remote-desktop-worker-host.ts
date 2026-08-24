@@ -14,6 +14,25 @@ import {
   type RemoteDesktopPrepare,
 } from '../../shared/remote-desktop.js';
 import {
+  REMOTE_DESKTOP_CANONICAL_BRANDING_CAPABILITY,
+  REMOTE_DESKTOP_CAPTURE_PRIVACY_CAPABILITY,
+  REMOTE_DESKTOP_INPUT_CAPABILITY,
+  REMOTE_DESKTOP_LOCAL_CONSENT_CAPABILITY,
+  REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY,
+  REMOTE_DESKTOP_LOCK_SCREEN_CAPABILITY,
+  type RemoteDesktopAdapterCapability,
+} from '../../shared/remote-desktop-access.js';
+import {
+  WORKER_CONSENT_FRAME,
+  parseWorkerConsentFrame,
+  type WorkerConsentInboundFrame,
+} from './remote-desktop-consent-ipc.js';
+import {
+  WORKER_PRIVACY_FRAME,
+  parseWorkerPrivacyFrame,
+  type WorkerPrivacyInboundFrame,
+} from './remote-desktop-privacy-ipc.js';
+import {
   REMOTE_DESKTOP_WORKER_FILENAME,
   REMOTE_DESKTOP_WORKER_MANIFEST_SUFFIX,
   REMOTE_DESKTOP_VIRTUAL_DISPLAY_ARCHIVE_FILENAME,
@@ -59,6 +78,14 @@ const OFFER_ANSWER_TIMEOUT_MS = 15_000;
 const VIRTUAL_DISPLAY_SHUTDOWN_GRACE_MS = 1_000;
 const MAX_LINE_BYTES = 512 * 1024;
 const SHA256_RE = /^[a-f0-9]{64}$/;
+
+const WORKER_LAUNCH_MODE = {
+  SESSION: 'session',
+  CONSENT_ONLY: 'consent_only',
+  PRIVACY_ONLY: 'privacy_only',
+} as const;
+
+type WorkerLaunchMode = typeof WORKER_LAUNCH_MODE[keyof typeof WORKER_LAUNCH_MODE];
 
 export const REMOTE_DESKTOP_COMPILED_SIGNER_SHA256 = WINDOWS_COMPILED_RELEASE_SIGNER_SHA256;
 
@@ -283,14 +310,26 @@ export class RemoteDesktopWorkerHost {
   private readonly pendingHelloSockets = new Set<net.Socket>();
   /** Which start produced a promoted socket, so its loss retires only its own. */
   private readonly socketStartToken = new WeakMap<net.Socket, object>();
+  /** Launch mode belongs to the authenticated start generation, not the path. */
+  private readonly launchModeByToken = new WeakMap<object, WorkerLaunchMode>();
   /** Authenticated worker pid for the socket; never inferred from its path. */
   private readonly workerPidBySocket = new WeakMap<net.Socket, number>();
   private virtualDisplayController: VirtualDisplayControllerProcess | null = null;
   private virtualDisplayStartPromise: Promise<void> | null = null;
   private virtualDisplayGeneration = 0;
   private buffer = '';
+  /**
+   * Consent frames share the pipe but not the session authentication: they
+   * exist before any session is authorized, so they are dispatched separately
+   * and never tracked as session traffic.
+   */
+  private readonly consentSubscribers = new Set<(frame: WorkerConsentInboundFrame) => void>();
+  private readonly privacySubscribers = new Set<(frame: WorkerPrivacyInboundFrame) => void>();
   private closing = false;
   private workerSecureConsole = false;
+  private workerLaunchMode: WorkerLaunchMode | null = null;
+  /** Host-side mirror only; native ACK remains the authority for activation. */
+  private privacyEpochArmed = false;
 
   constructor(
     private readonly onMessage: (message: RemoteDesktopDaemonMessage) => void,
@@ -316,6 +355,37 @@ export class RemoteDesktopWorkerHost {
   available(): boolean {
     return this.platform === 'win32' && this.artifact !== null
       && SHA256_RE.test(this.trustedSignerSha256);
+  }
+
+  /**
+   * Capabilities implemented by the verified worker artifact in this build.
+   * Keep this declaration independent from `available()`: callers still gate
+   * the returned matrix on artifact verification and the remote-desktop kill
+   * switch. Local consent is independent because this build can launch the
+   * signed worker in prompt-only mode before PREPARE without initializing
+   * capture, input or WebRTC. The signed account shell is a separately signed
+   * sidecar and is therefore advertised by runtime only after its independent
+   * artifact/launcher trust probe; it never belongs to the Worker matrix.
+   */
+  adapterCapabilities(): readonly RemoteDesktopAdapterCapability[] {
+    return [
+      REMOTE_DESKTOP_LOCAL_CONSENT_CAPABILITY,
+      REMOTE_DESKTOP_CAPTURE_PRIVACY_CAPABILITY,
+      REMOTE_DESKTOP_INPUT_CAPABILITY,
+      REMOTE_DESKTOP_LOCK_SCREEN_CAPABILITY,
+      REMOTE_DESKTOP_CANONICAL_BRANDING_CAPABILITY,
+      REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY,
+    ];
+  }
+
+  /**
+   * The verified Windows Worker can start in privacy-only mode before PREPARE,
+   * retain the host-wide epoch while it is promoted in place, default-shield
+   * every subsequently created source, and acknowledge only the exact durable
+   * route-id/route-generation snapshot received in BEGIN.
+   */
+  supportsDefaultShieldedRoute(): boolean {
+    return true;
   }
 
   private async verifiedArtifactForLaunch(): Promise<VerifiedRemoteDesktopWorkerArtifact> {
@@ -419,7 +489,7 @@ export class RemoteDesktopWorkerHost {
   private async handleValidated(command: RemoteDesktopDaemonCommand): Promise<boolean> {
     let recoverIdlePrepare = false;
     if (command.type === REMOTE_DESKTOP_MSG.PREPARE) {
-      recoverIdlePrepare = this.tracked.size === 0;
+      recoverIdlePrepare = this.tracked.size === 0 && !this.privacyEpochArmed;
       // Tracked before the start, not after: the offer that follows this
       // PREPARE arrives while the cold start is still running, and it can only
       // be told to wait for that start if the session it names is already
@@ -434,7 +504,7 @@ export class RemoteDesktopWorkerHost {
           // first so its immediately-following OFFER waits for this recycle.
           await this.recycleWorkerSocket(command.sessionId);
         }
-        await this.ensureStarted();
+        await this.ensureStarted(WORKER_LAUNCH_MODE.SESSION);
       } catch (error) {
         this.untrack(command.sessionId);
         throw error;
@@ -447,7 +517,7 @@ export class RemoteDesktopWorkerHost {
         // connect after any quiet period — the session is already tracked, so
         // cold-start one verified replacement instead.
         this.untrack(command.sessionId);
-        await this.ensureStarted();
+        await this.ensureStarted(WORKER_LAUNCH_MODE.SESSION);
         this.track(command);
         if (!this.socket || this.socket.destroyed) {
           // The replacement did not come up. Drop the authority before giving
@@ -467,7 +537,7 @@ export class RemoteDesktopWorkerHost {
       // that was about to work and is exactly what made a first connect after
       // any quiet period fail. Wait for the start this session already owns.
       if (!this.tracked.has(command.sessionId)) return false;
-      await this.ensureStarted();
+      await this.ensureStarted(WORKER_LAUNCH_MODE.SESSION);
       if (!this.socket || this.socket.destroyed) return false;
     }
     const socket = this.socket;
@@ -486,7 +556,7 @@ export class RemoteDesktopWorkerHost {
       // race as worker_failed: no other authority is alive, so cold-start one
       // verified replacement and retry this PREPARE exactly once.
       this.untrack(command.sessionId);
-      await this.ensureStarted();
+      await this.ensureStarted(WORKER_LAUNCH_MODE.SESSION);
       this.track(command);
       const replacement = this.socket;
       if (!replacement || replacement.destroyed) {
@@ -513,6 +583,60 @@ export class RemoteDesktopWorkerHost {
       this.untrack(command.sessionId);
     }
     return sent;
+  }
+
+  /**
+   * Hand a consent frame to the worker. When no session worker exists, launch
+   * the same verified binary in prompt-only mode. That process never creates
+   * capture/input/media authority and accepts only consent frames natively.
+   */
+  async sendConsentFrame(frame: Record<string, unknown>): Promise<boolean> {
+    if (frame.type === WORKER_CONSENT_FRAME.DISMISS
+      && (!this.socket || this.socket.destroyed)) return false;
+    try {
+      await this.ensureStarted(WORKER_LAUNCH_MODE.CONSENT_ONLY);
+    } catch {
+      return false;
+    }
+    const socket = this.socket;
+    if (!socket || socket.destroyed) return false;
+    return this.writeToWorker(socket, frame);
+  }
+
+  /**
+   * Privacy must never use the consent-only process. A BEGIN cold-starts a
+   * distinct persistent privacy-capable Worker before PREPARE; it has no
+   * session authority until a validated PREPARE arrives, then is promoted in
+   * place so its host-wide epoch survives until the first opaque source.
+   */
+  async sendPrivacyFrame(frame: Record<string, unknown>): Promise<boolean> {
+    if (frame.type !== WORKER_PRIVACY_FRAME.SHIELD
+      && frame.type !== WORKER_PRIVACY_FRAME.RELEASE) return false;
+    if (frame.type === WORKER_PRIVACY_FRAME.RELEASE
+      && (!this.socket || this.socket.destroyed)) return false;
+    try {
+      await this.ensureStarted(WORKER_LAUNCH_MODE.PRIVACY_ONLY);
+    } catch {
+      return false;
+    }
+    const socket = this.socket;
+    if (!socket || socket.destroyed
+      || this.workerLaunchMode === WORKER_LAUNCH_MODE.CONSENT_ONLY) {
+      return false;
+    }
+    const sent = await this.writeToWorker(socket, frame);
+    if (sent && frame.type === WORKER_PRIVACY_FRAME.SHIELD) this.privacyEpochArmed = true;
+    return sent;
+  }
+
+  onPrivacyFrame(handler: (frame: WorkerPrivacyInboundFrame) => void): () => void {
+    this.privacySubscribers.add(handler);
+    return () => { this.privacySubscribers.delete(handler); };
+  }
+
+  onConsentFrame(handler: (frame: WorkerConsentInboundFrame) => void): () => void {
+    this.consentSubscribers.add(handler);
+    return () => { this.consentSubscribers.delete(handler); };
   }
 
   private async writeToWorker(
@@ -588,6 +712,8 @@ export class RemoteDesktopWorkerHost {
     this.failTracked(REMOTE_DESKTOP_TERMINAL_REASON.DAEMON_REPLACED);
     this.socket?.destroy();
     this.socket = null;
+    this.workerLaunchMode = null;
+    this.privacyEpochArmed = false;
     this.server?.close();
     this.server = null;
     this.startPromise = null;
@@ -713,8 +839,14 @@ export class RemoteDesktopWorkerHost {
    * exact attempt, so retiring it can never clobber a fresh start someone else
    * has begun.
    */
-  private async ensureStarted(forceSecureConsole = false): Promise<void> {
-    if (this.socket && !this.socket.destroyed) return;
+  private async ensureStarted(
+    requestedMode: WorkerLaunchMode,
+    forceSecureConsole = false,
+  ): Promise<void> {
+    if (this.socket && !this.socket.destroyed) {
+      if (this.canReuseWorker(requestedMode)) return;
+      await this.recycleWorkerSocket();
+    }
     const inFlight = this.startPromise;
     if (inFlight) {
       try {
@@ -727,14 +859,36 @@ export class RemoteDesktopWorkerHost {
           this.startPromise = null;
         }
       }
-      if (this.socket && !this.socket.destroyed) return;
+      if (this.socket && !this.socket.destroyed) {
+        if (this.canReuseWorker(requestedMode)) return;
+        await this.recycleWorkerSocket();
+      }
     }
-    const attempt = this.startPromise ?? this.beginWorkerStart(forceSecureConsole);
+    const attempt = this.startPromise
+      ?? this.beginWorkerStart(requestedMode, forceSecureConsole);
     this.startPromise = attempt;
     await attempt;
   }
 
-  private beginWorkerStart(forceSecureConsole: boolean): Promise<void> {
+  private canReuseWorker(requestedMode: WorkerLaunchMode): boolean {
+    if (this.workerLaunchMode === WORKER_LAUNCH_MODE.SESSION) return true;
+    if (requestedMode === WORKER_LAUNCH_MODE.CONSENT_ONLY) return true;
+    if (this.workerLaunchMode === WORKER_LAUNCH_MODE.PRIVACY_ONLY) {
+      if (requestedMode === WORKER_LAUNCH_MODE.SESSION) {
+        // Promotion changes only the host's routing state. Native already has
+        // the session parser, but no capture/input authority exists until the
+        // validated PREPARE that follows this transition.
+        this.workerLaunchMode = WORKER_LAUNCH_MODE.SESSION;
+      }
+      return true;
+    }
+    return false;
+  }
+
+  private beginWorkerStart(
+    launchMode: WorkerLaunchMode,
+    forceSecureConsole: boolean,
+  ): Promise<void> {
     if (!this.artifact) {
       return Promise.reject(new Error('remote_desktop_worker_unavailable'));
     }
@@ -761,6 +915,7 @@ export class RemoteDesktopWorkerHost {
     // never a start that has since replaced it.
     const token = {};
     this.startToken = token;
+    this.launchModeByToken.set(token, launchMode);
     return new Promise<void>((resolveStarted, rejectStarted) => {
       let settled = false;
       const finish = (error?: Error) => {
@@ -797,8 +952,15 @@ export class RemoteDesktopWorkerHost {
                 ?? allowWindowsNamedPipeClients)(this.pipePath);
           }
             await this.launchVerified(
-              ['--pipe', this.pipePath, '--nonce', this.nonce],
-              true,
+              [
+                '--pipe', this.pipePath, '--nonce', this.nonce,
+                ...(launchMode === WORKER_LAUNCH_MODE.CONSENT_ONLY
+                  ? ['--consent-only']
+                  : launchMode === WORKER_LAUNCH_MODE.PRIVACY_ONLY
+                    ? ['--privacy-only']
+                    : []),
+              ],
+              launchMode !== WORKER_LAUNCH_MODE.CONSENT_ONLY,
               forceSecureConsole,
             );
           } catch (error) {
@@ -854,7 +1016,10 @@ export class RemoteDesktopWorkerHost {
       finishHandshake();
       if (this.socket && !this.socket.destroyed) this.socket.destroy();
       this.socket = socket;
-      if (this.startToken) this.socketStartToken.set(socket, this.startToken);
+      if (this.startToken) {
+        this.socketStartToken.set(socket, this.startToken);
+        this.workerLaunchMode = this.launchModeByToken.get(this.startToken) ?? null;
+      }
       this.buffer = '';
       socket.on('data', (data) => this.onData(String(data)));
       socket.on('close', () => this.onSocketLost(socket));
@@ -884,6 +1049,21 @@ export class RemoteDesktopWorkerHost {
         // loss turns into an anonymous `worker_failed`; the frame carries no
         // session, capability, media, or input data.
         this.options.onWorkerCrash?.(value);
+        continue;
+      }
+      const privacy = parseWorkerPrivacyFrame(value);
+      if (privacy) {
+        if (privacy.type === WORKER_PRIVACY_FRAME.RELEASED) this.privacyEpochArmed = false;
+        for (const subscriber of [...this.privacySubscribers]) {
+          try { subscriber(privacy); } catch { /* one bad subscriber must not stop the rest */ }
+        }
+        continue;
+      }
+      const consent = parseWorkerConsentFrame(value);
+      if (consent) {
+        for (const subscriber of [...this.consentSubscribers]) {
+          try { subscriber(consent); } catch { /* one bad subscriber must not stop the rest */ }
+        }
         continue;
       }
       const parsed = validateRemoteDesktopDaemonMessage(value);
@@ -942,6 +1122,8 @@ export class RemoteDesktopWorkerHost {
     this.workerPidBySocket.delete(socket);
     if (this.socket !== socket) return;
     this.socket = null;
+    this.workerLaunchMode = null;
+    this.privacyEpochArmed = false;
     this.buffer = '';
     if (token !== undefined && this.startToken !== token) {
       // A newer start already owns the listener and the memo. This loss belongs
@@ -1011,7 +1193,7 @@ export class RemoteDesktopWorkerHost {
       tracked.offerPending = false;
       this.tracked.delete(tracked.sessionId);
       await this.recycleWorkerSocket();
-      await this.ensureStarted(forceSecureConsole);
+      await this.ensureStarted(WORKER_LAUNCH_MODE.SESSION, forceSecureConsole);
       this.tracked.set(tracked.sessionId, tracked);
       const socket = this.socket;
       if (!socket || socket.destroyed) throw new Error('desktop_handover_unavailable');

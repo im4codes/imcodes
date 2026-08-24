@@ -953,7 +953,8 @@ const contracts: Contract[] = [
         // One cold start at a time: the memo is set with no await after the
         // check that decides to start.
         path: 'src/node/remote-desktop-worker-host.ts',
-        needle: 'const attempt = this.startPromise ?? this.beginWorkerStart(forceSecureConsole);\n    this.startPromise = attempt;',
+        needle:
+          'const attempt = this.startPromise\n      ?? this.beginWorkerStart(requestedMode, forceSecureConsole);\n    this.startPromise = attempt;',
       },
       {
         // Handing the listener back never waits on connections that may never
@@ -965,7 +966,8 @@ const contracts: Contract[] = [
         // The offer that follows a PREPARE waits for that PREPARE's cold start
         // instead of being declined as a dead worker.
         path: 'src/node/remote-desktop-worker-host.ts',
-        needle: 'if (!this.tracked.has(command.sessionId)) return false;\n      await this.ensureStarted();',
+        needle:
+          'if (!this.tracked.has(command.sessionId)) return false;\n      await this.ensureStarted(WORKER_LAUNCH_MODE.SESSION);',
       },
       {
         // Waiting for process start alone is insufficient: concurrent
@@ -1551,7 +1553,8 @@ const mutations: Mutation[] = [
     name: 'decline a tracked session message while its worker is still starting',
     contract: 'a dead idle pipe cold-starts a replacement instead of failing the session',
     path: 'src/node/remote-desktop-worker-host.ts',
-    needle: 'if (!this.tracked.has(command.sessionId)) return false;\n      await this.ensureStarted();',
+    needle:
+      'if (!this.tracked.has(command.sessionId)) return false;\n      await this.ensureStarted(WORKER_LAUNCH_MODE.SESSION);',
   },
   {
     name: 'allow an offer to overtake its prepare after a cold start',

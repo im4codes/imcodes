@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'preact/hooks';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import {
   REMOTE_DESKTOP_ACCESS_MODE,
@@ -6,7 +6,6 @@ import {
   REMOTE_DESKTOP_COMMON_DISPLAY_MODES,
   REMOTE_DESKTOP_DPI_SCALE_PERCENTS,
   REMOTE_DESKTOP_ERROR,
-  REMOTE_DESKTOP_LIMITS,
   REMOTE_DESKTOP_STATE,
   REMOTE_DESKTOP_TERMINAL_REASON,
   mapRemoteDesktopVideoPoint,
@@ -25,7 +24,12 @@ import {
   uploadFileWithDirectFallback,
   type FileUploadTransportMode,
 } from '../direct-file-transfer.js';
-import { RemoteDesktopClient, type RemoteDesktopSnapshot } from '../remote-desktop-client.js';
+import type { RemoteDesktopSnapshot } from '../remote-desktop-client.js';
+import {
+  RemoteDesktopConnectionManager,
+  remoteDesktopHostKey,
+  type RemoteDesktopManagedConnection,
+} from '../remote-desktop-connection-manager.js';
 import {
   REMOTE_DESKTOP_MOBILE_SHORTCUTS,
   isAppleControllerPlatform,
@@ -137,7 +141,6 @@ const INITIAL_SNAPSHOT: RemoteDesktopSnapshot = {
   capabilityVersion: REMOTE_DESKTOP_CAPABILITY,
 };
 
-const MAX_REMOTE_DESKTOP_RECONNECTS = REMOTE_DESKTOP_LIMITS.MAX_RECONNECT_ATTEMPTS;
 /**
  * The resolutions to offer for a display: the ones its driver reported, or the
  * common sizes when the node is too old to report any. A node that reports them
@@ -170,16 +173,6 @@ const DESKTOP_DOUBLE_CLICK_MS = 500;
 // scaling and turn an intended double-click into two singles.
 const DESKTOP_DOUBLE_CLICK_DISTANCE_PX = 8;
 const TOUCH_DOUBLE_TAP_DISTANCE_PX = 32;
-const RECONNECTABLE_REMOTE_DESKTOP_FAILURES = new Set<string>([
-  REMOTE_DESKTOP_ERROR.DAEMON_OFFLINE,
-  REMOTE_DESKTOP_ERROR.NEGOTIATION_TIMEOUT,
-  REMOTE_DESKTOP_TERMINAL_REASON.BROWSER_DISCONNECTED,
-  REMOTE_DESKTOP_TERMINAL_REASON.DAEMON_REPLACED,
-  REMOTE_DESKTOP_TERMINAL_REASON.NEGOTIATION_TIMEOUT,
-  REMOTE_DESKTOP_TERMINAL_REASON.PEER_FAILED,
-  REMOTE_DESKTOP_TERMINAL_REASON.WORKER_FAILED,
-]);
-
 const REMOTE_DESKTOP_CONNECTION_STEPS = [
   'authorize',
   'worker',
@@ -223,13 +216,22 @@ export function canOpenRemoteDesktop(machine: MachineListItem): boolean {
 
 export interface RemoteDesktopPanelProps {
   machine: MachineListItem;
+  connectionManager?: RemoteDesktopConnectionManager;
   ws?: WsClient | null;
   minimized?: boolean;
   standalone?: boolean;
   allowStandaloneWindow?: boolean;
+  /** Render inside the single remote-desktop workspace root, without another floating shell. */
+  embedded?: boolean;
+  /** Presentation visibility inside the workspace. The connection remains mounted while hidden. */
+  active?: boolean;
+  /** Only the active ordinary host tab may own keyboard/pointer input. */
+  inputActive?: boolean;
   onMinimize?(): void;
   onRestore?(): void;
   onClose(): void;
+  /** Clear protected workspace metadata when Server authority is terminally lost. */
+  onAuthorityLost?(): void;
   /**
    * Managed desktop-stack z-index. Without it the panel sat at a hardcoded
    * 10020, above every stack-managed window, so no other window could ever be
@@ -267,13 +269,18 @@ function activeTransferProgress(rows: readonly RemoteDesktopTransferRow[]): {
 
 export function RemoteDesktopPanel({
   machine,
+  connectionManager,
   ws = null,
   minimized = false,
   standalone = false,
   allowStandaloneWindow = false,
+  embedded = false,
+  active = true,
+  inputActive = true,
   onMinimize,
   onRestore,
   onClose,
+  onAuthorityLost,
   zIndex,
   onFocus,
 }: RemoteDesktopPanelProps) {
@@ -284,7 +291,6 @@ export function RemoteDesktopPanel({
   const [viewport, setViewport] = useState<RemoteDesktopViewport>(INITIAL_REMOTE_DESKTOP_VIEWPORT);
   const [virtualMouse, setVirtualMouse] = useState<TouchPoint>({ x: 0, y: 0 });
   const [viewportGeometryRevision, setViewportGeometryRevision] = useState(0);
-  const [clientGeneration, setClientGeneration] = useState(0);
   /**
    * How many hover/drag moves this panel actually received from the browser,
    * next to how many the client managed to send. Reported side by side because
@@ -326,7 +332,9 @@ export function RemoteDesktopPanel({
   const [mediaPresented, setMediaPresented] = useState(false);
   const [desktopMaximized, setDesktopMaximized] = useState(false);
   const [controlNotice, setControlNotice] = useState<{ id: number; text: string } | null>(null);
-  const clientRef = useRef<RemoteDesktopClient | null>(null);
+  const clientRef = useRef<RemoteDesktopManagedConnection | null>(null);
+  const ownedConnectionManagerRef = useRef<RemoteDesktopConnectionManager | null>(null);
+  const presentationRef = useRef<object>({});
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const stageRef = useRef<HTMLDivElement | null>(null);
   const panelRef = useRef<HTMLDivElement | null>(null);
@@ -334,7 +342,10 @@ export function RemoteDesktopPanel({
   const mobileTextInputRef = useRef<HTMLTextAreaElement | null>(null);
   const mobileTextComposingRef = useRef(false);
   const mobileTextLastCompositionCommitRef = useRef<string | null>(null);
-  const machineDirectoryAdapterRef = useRef<MachineDirectoryWsAdapter | null>(null);
+  const machineDirectoryAdapter = useMemo(
+    () => new MachineDirectoryWsAdapter(machine.serverId),
+    [machine.serverId],
+  );
   const displayModeMenuRef = useRef<HTMLDivElement | null>(null);
   const viewportRef = useRef<RemoteDesktopViewport>(INITIAL_REMOTE_DESKTOP_VIEWPORT);
   const virtualMouseRef = useRef<TouchPoint>({ x: 0, y: 0 });
@@ -357,12 +368,7 @@ export function RemoteDesktopPanel({
     normalized: TouchPoint;
   } | null>(null);
   const lastTouchRemotePointRef = useRef<TouchPoint>({ x: 0.5, y: 0.5 });
-  const reconnectCountRef = useRef(0);
-  const forceWorkerRecycleRef = useRef(false);
-  const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const reconnectStabilityTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const transferControllersRef = useRef(new Map<string, AbortController>());
-  const unmountedRef = useRef(false);
   const displayTabLongPressRef = useRef<DisplayTabLongPress | null>(null);
   const suppressDisplayTabClickRef = useRef(false);
   const suppressDisplayTabClickTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -374,95 +380,45 @@ export function RemoteDesktopPanel({
   const commandMiddleDragPointerRef = useRef<number | null>(null);
   const forwardedPasteShortcutAtRef = useRef(0);
   const supportsDirectoryTransfer = Boolean(machine.capabilities?.includes(FILE_TRANSFER_DIRECTORY_CAPABILITY));
-
-  if (!machineDirectoryAdapterRef.current) {
-    machineDirectoryAdapterRef.current = new MachineDirectoryWsAdapter(machine.serverId);
+  if (!connectionManager && !ownedConnectionManagerRef.current) {
+    ownedConnectionManagerRef.current = new RemoteDesktopConnectionManager();
   }
+  const manager = connectionManager ?? ownedConnectionManagerRef.current!;
+  const hostKey = remoteDesktopHostKey(machine);
 
-  useEffect(() => () => {
-    machineDirectoryAdapterRef.current?.destroy();
-    machineDirectoryAdapterRef.current = null;
-  }, []);
+  useEffect(() => () => machineDirectoryAdapter.destroy(), [machineDirectoryAdapter]);
 
   useEffect(() => {
-    let disposed = false;
-    const publishSnapshot = (next: RemoteDesktopSnapshot) => {
-      if (disposed || unmountedRef.current) return;
-      const connected = next.state === REMOTE_DESKTOP_STATE.DIRECT
-        || next.state === REMOTE_DESKTOP_STATE.RELAYED;
-      if (!connected && reconnectStabilityTimerRef.current) {
-        clearTimeout(reconnectStabilityTimerRef.current);
-        reconnectStabilityTimerRef.current = null;
-      }
-      if (connected && reconnectCountRef.current > 0
-        && !reconnectStabilityTimerRef.current) {
-        reconnectStabilityTimerRef.current = setTimeout(() => {
-          reconnectStabilityTimerRef.current = null;
-          if (disposed || unmountedRef.current) return;
-          reconnectCountRef.current = 0;
-          setSnapshot((current) => ({ ...current, reconnectCount: 0 }));
-        }, REMOTE_DESKTOP_LIMITS.RECONNECT_STABILITY_RESET_MS);
-      }
-      const reason = next.terminalReason ?? next.error;
-      const reconnectableFailure = next.state === REMOTE_DESKTOP_STATE.FAILED
-        && Boolean(reason && RECONNECTABLE_REMOTE_DESKTOP_FAILURES.has(reason));
-      // stop()/terminal cleanup can publish more than one FAILED snapshot for
-      // the same client. Once a retry is scheduled, keep the recovery UI in
-      // place instead of briefly exposing worker_failed (and a dead Retry
-      // button) while the old authority finishes closing.
-      if (reconnectableFailure && reconnectTimerRef.current) return;
-      if (reconnectableFailure
-        && reconnectCountRef.current < MAX_REMOTE_DESKTOP_RECONNECTS) {
-        reconnectCountRef.current++;
-        const reconnectCount = reconnectCountRef.current;
-        setSnapshot({
-          ...next,
-          state: REMOTE_DESKTOP_STATE.RECONNECTING,
-          inputEnabled: false,
-          reconnectCount,
-        });
-        reconnectTimerRef.current = setTimeout(() => {
-          reconnectTimerRef.current = null;
-          if (!unmountedRef.current) setClientGeneration((current) => current + 1);
-        }, REMOTE_DESKTOP_LIMITS.RECONNECT_BACKOFF_BASE_MS
-          * (2 ** (reconnectCount - 1)));
-        return;
-      }
-      setSnapshot({ ...next, reconnectCount: reconnectCountRef.current });
-    };
-    const client = new RemoteDesktopClient(machine.serverId, { onSnapshot: publishSnapshot });
-    clientRef.current = client;
-    const reconnectAttempt = forceWorkerRecycleRef.current
-      ? Math.max(1, reconnectCountRef.current)
-      : reconnectCountRef.current;
-    forceWorkerRecycleRef.current = false;
-    void client.start(reconnectAttempt).catch(() => publishSnapshot({
-      ...client.current(),
-      state: REMOTE_DESKTOP_STATE.FAILED,
-      inputEnabled: false,
-      error: REMOTE_DESKTOP_ERROR.DAEMON_OFFLINE,
-    }));
+    const connection = manager.presentation(machine, presentationRef.current);
+    clientRef.current = connection;
+    const unsubscribe = connection.subscribe(
+      presentationRef.current,
+      setSnapshot,
+      { controlsInput: inputActive },
+    );
+    void connection.start();
     return () => {
-      disposed = true;
-      if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
-      reconnectTimerRef.current = null;
-      if (reconnectStabilityTimerRef.current) {
-        clearTimeout(reconnectStabilityTimerRef.current);
-      }
-      reconnectStabilityTimerRef.current = null;
-      client.stop();
-      if (clientRef.current === client) clientRef.current = null;
+      unsubscribe();
+      if (clientRef.current === connection) clientRef.current = null;
     };
-  }, [machine.serverId, clientGeneration]);
+  }, [hostKey, inputActive, machine.serverId, manager]);
 
   useEffect(() => () => {
-    unmountedRef.current = true;
+    if (!connectionManager) manager.stopAll();
+  }, [connectionManager, manager]);
+
+  useEffect(() => {
+    const authorityLost = snapshot.terminalReason === REMOTE_DESKTOP_TERMINAL_REASON.AUTHORITY_REVOKED
+      || snapshot.terminalReason === REMOTE_DESKTOP_TERMINAL_REASON.AUTHORITY_EXPIRED
+      || snapshot.error === REMOTE_DESKTOP_ERROR.INVALID_AUTHORITY
+      || snapshot.error === REMOTE_DESKTOP_ERROR.AUTHORITY_EXPIRED
+      || snapshot.error === REMOTE_DESKTOP_ERROR.ACCESS_DENIED;
+    if (authorityLost) onAuthorityLost?.();
+  }, [onAuthorityLost, snapshot.error, snapshot.terminalReason]);
+
+  useEffect(() => () => {
     for (const controller of transferControllersRef.current.values()) controller.abort();
     transferControllersRef.current.clear();
-    if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
-    reconnectTimerRef.current = null;
-    if (reconnectStabilityTimerRef.current) clearTimeout(reconnectStabilityTimerRef.current);
-    reconnectStabilityTimerRef.current = null;
     if (virtualMouseEdgeFrameRef.current !== null) {
       if (typeof cancelAnimationFrame === 'function') {
         cancelAnimationFrame(virtualMouseEdgeFrameRef.current);
@@ -675,22 +631,7 @@ export function RemoteDesktopPanel({
   };
 
   const retryConnection = () => {
-    if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
-    reconnectTimerRef.current = null;
-    if (reconnectStabilityTimerRef.current) clearTimeout(reconnectStabilityTimerRef.current);
-    reconnectStabilityTimerRef.current = null;
-    reconnectCountRef.current = 0;
-    forceWorkerRecycleRef.current = true;
-    setSnapshot((current) => ({
-      ...current,
-      state: REMOTE_DESKTOP_STATE.RECONNECTING,
-      inputEnabled: false,
-      stream: null,
-      reconnectCount: 0,
-      error: undefined,
-      terminalReason: undefined,
-    }));
-    setClientGeneration((current) => current + 1);
+    clientRef.current?.retry();
   };
 
   /**
@@ -1701,32 +1642,14 @@ export function RemoteDesktopPanel({
     && videoRef.current?.srcObject === snapshot.stream);
   const activeConnectionStep = activeRemoteDesktopConnectionStep(snapshot, currentStreamPresented);
 
-  return (
-    <>
-      <div class="remote-desktop-window-host" hidden={minimized}>
-        <FloatingPanel
-      id={`remote-desktop-${machine.serverId}`}
-      title={t('remote_desktop.title', { machine: machine.displayName })}
-      onClose={stopAndClose}
-      zIndex={zIndex ?? 10020}
-      onFocus={onFocus}
-      defaultW={1200}
-      defaultH={760}
-      minW={640}
-      minH={420}
-      enableMaximize
-      isMaximized={desktopMaximized}
-      onToggleMaximized={() => setDesktopMaximized((current) => !current)}
-      className="remote-desktop-floating-shell"
-      hideTitleBar
-      dragHandleSelector=".remote-desktop-header"
-    >
+  const panelBody = (
       <div
         ref={panelRef}
         class={`remote-desktop-panel ${snapshot.route === 'direct' ? 'is-direct' : ''}`.trim()}
-        role="dialog"
+        role={embedded ? 'tabpanel' : 'dialog'}
         aria-modal="false"
         aria-label={t('remote_desktop.title', { machine: machine.displayName })}
+        hidden={embedded && !active}
       >
         <header class="remote-desktop-header">
           <div>
@@ -1738,7 +1661,7 @@ export function RemoteDesktopPanel({
             <span>{t('remote_desktop.controllers', { count: snapshot.controllerCount ?? (snapshot.mode === 'control' ? 1 : 0) })}</span>
           </div>
           <div class="remote-desktop-window-actions">
-            {!standalone && allowStandaloneWindow && (
+            {!embedded && !standalone && allowStandaloneWindow && (
               <button
                 type="button"
                 class="subsession-minimize-btn remote-desktop-open-window"
@@ -1749,12 +1672,12 @@ export function RemoteDesktopPanel({
                 }}
               >↗</button>
             )}
-            <DesktopWindowMaximizeButton
+            {!embedded && <DesktopWindowMaximizeButton
               maximized={desktopMaximized}
               class="subsession-minimize-btn remote-desktop-maximize"
               onClick={() => setDesktopMaximized((current) => !current)}
-            />
-            {onMinimize && (
+            />}
+            {!embedded && onMinimize && (
               <button
                 type="button"
                 class="subsession-minimize-btn remote-desktop-minimize"
@@ -2421,11 +2344,11 @@ export function RemoteDesktopPanel({
             </div>
             {transferError && <span role="alert">{transferError}</span>}
 
-            {directoryPickerOpen && machineDirectoryAdapterRef.current && (
+            {directoryPickerOpen && (
               <div class="remote-desktop-directory-picker">
                 <FileBrowser
                   key={`${machine.serverId}:${destinationDirectory}`}
-                  ws={machineDirectoryAdapterRef.current.asWsClient()}
+                  ws={machineDirectoryAdapter.asWsClient()}
                   mode="dir-only"
                   layout="panel"
                   initialPath={destinationDirectory || FILE_TRANSFER_DIRECTORY_PATH.WINDOWS_DRIVES}
@@ -2489,6 +2412,31 @@ export function RemoteDesktopPanel({
           </div>
         </footer>
       </div>
+  );
+
+  if (embedded) return panelBody;
+
+  return (
+    <>
+      <div class="remote-desktop-window-host" hidden={minimized}>
+        <FloatingPanel
+          id={`remote-desktop-${machine.serverId}`}
+          title={t('remote_desktop.title', { machine: machine.displayName })}
+          onClose={stopAndClose}
+          zIndex={zIndex ?? 10020}
+          onFocus={onFocus}
+          defaultW={1200}
+          defaultH={760}
+          minW={640}
+          minH={420}
+          enableMaximize
+          isMaximized={desktopMaximized}
+          onToggleMaximized={() => setDesktopMaximized((current) => !current)}
+          className="remote-desktop-floating-shell"
+          hideTitleBar
+          dragHandleSelector=".remote-desktop-header"
+        >
+          {panelBody}
         </FloatingPanel>
       </div>
       {minimized && (

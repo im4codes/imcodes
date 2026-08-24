@@ -17,4 +17,35 @@ describe('remote desktop worker bootstrap ordering', () => {
     expect(helloEmit).toBeGreaterThan(pipeConnect);
     expect(mediaInitialization.every((position) => position > helloEmit)).toBe(true);
   });
+
+  it('returns into a consent-only dispatcher before any media or session runtime exists', () => {
+    const source = readFileSync('native/windows-remote-desktop/worker_main.cc', 'utf8');
+    const consentBranch = source.indexOf('if (arguments->consent_only)');
+    const consentRunner = source.indexOf('int RunConsentOnlyWorker(');
+    const winsock = source.indexOf('webrtc::WinsockInitializer winsock');
+    const runtime = source.indexOf('WorkerRuntime runtime(');
+    const runnerBody = source.slice(
+      consentRunner,
+      source.indexOf('\nclass WorkerRuntime', consentRunner),
+    );
+
+    expect(consentRunner).toBeGreaterThan(-1);
+    expect(consentBranch).toBeGreaterThan(-1);
+    expect(consentBranch).toBeLessThan(winsock);
+    expect(consentBranch).toBeLessThan(runtime);
+    expect(runnerBody).toContain('ConsentDispatcher consent(writer);');
+    expect(runnerBody).toContain('!consent.Handle(root)');
+    expect(runnerBody).not.toMatch(/WorkerRuntime|PrivacyDispatcher|ParseServiceSignal|MFStartup|InitializeSSL/);
+  });
+
+  it('keeps privacy-only on the full persistent runtime rather than consent-only', () => {
+    const source = readFileSync('native/windows-remote-desktop/worker_main.cc', 'utf8');
+    expect(source).toContain('key == L"--privacy-only"');
+    expect(source).toContain('(consent_only && privacy_only)');
+    const consentBranch = source.indexOf('if (arguments->consent_only)');
+    const runtime = source.indexOf('WorkerRuntime runtime(');
+    expect(consentBranch).toBeGreaterThan(-1);
+    expect(runtime).toBeGreaterThan(consentBranch);
+    expect(source).not.toContain('if (arguments->privacy_only) {');
+  });
 });

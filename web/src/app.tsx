@@ -72,7 +72,18 @@ import { CronManager } from './pages/CronManager.js';
 import { SharedContextManagementPanel } from './components/SharedContextManagementPanel.js';
 import { ControlledNodesPanel } from './components/ControlledNodesPanel.js';
 import { ControlledNodeQuickMenu } from './components/ControlledNodeQuickMenu.js';
-import { RemoteDesktopPanel } from './components/RemoteDesktopPanel.js';
+import { RemoteDesktopWorkspace } from './components/RemoteDesktopWorkspace.js';
+import { RemoteDesktopGuestAccess } from './components/RemoteDesktopGuestAccess.js';
+import { RemoteDesktopConnectionManager } from './remote-desktop-connection-manager.js';
+import {
+  REMOTE_DESKTOP_WORKSPACE_WINDOW_ID,
+  activateRemoteDesktopWorkspaceTab,
+  closeRemoteDesktopWorkspace,
+  closeRemoteDesktopWorkspaceHost,
+  createRemoteDesktopWorkspaceState,
+  openRemoteDesktopWorkspaceHost,
+  reorderRemoteDesktopWorkspaceHost,
+} from './remote-desktop-workspace-state.js';
 import { DaemonRemoteDesktopControl } from './components/DaemonRemoteDesktopControl.js';
 import type { MachineListItem } from './api/machines.js';
 import { ContextDiagnosticsPanel } from './components/ContextDiagnosticsPanel.js';
@@ -500,6 +511,11 @@ function findSharedEntryForHash(
 
 export function App() {
   const { t: trans } = useTranslation();
+  const remoteDesktopConnectionManagerRef = useRef<RemoteDesktopConnectionManager | null>(null);
+  if (!remoteDesktopConnectionManagerRef.current) {
+    remoteDesktopConnectionManagerRef.current = new RemoteDesktopConnectionManager();
+  }
+  const remoteDesktopConnectionManager = remoteDesktopConnectionManagerRef.current;
   const initialHashStateRef = useRef(readHashState());
   const [globalFontPrefs] = useFontPrefs('chat', DEFAULT_CHAT_FONT);
   useEffect(() => {
@@ -1742,7 +1758,9 @@ export function App() {
   const [showAdminPage, setShowAdminPage] = useState(false);
   const [showSharedContextManagement, setShowSharedContextManagement] = useState(false);
   const [showControlledNodes, setShowControlledNodes] = useState(false);
-  const [remoteDesktopMachine, setRemoteDesktopMachine] = useState<MachineListItem | null>(null);
+  const [remoteDesktopWorkspace, setRemoteDesktopWorkspace] = useState(
+    createRemoteDesktopWorkspaceState,
+  );
   const [remoteDesktopMinimized, setRemoteDesktopMinimized] = useState(false);
   const [showSharedContextDiagnostics, setShowSharedContextDiagnostics] = useState(false);
   const [sharedContextManagementProps, setSharedContextManagementProps] = useState<Record<string, unknown>>({});
@@ -1761,15 +1779,21 @@ export function App() {
   }, [ensureDesktopWindow, selectedServerId]);
 
   const openRemoteDesktop = useCallback((machine: MachineListItem) => {
-    setRemoteDesktopMachine(machine);
+    setRemoteDesktopWorkspace((current) => openRemoteDesktopWorkspaceHost(current, machine));
     setRemoteDesktopMinimized(false);
-    // Join the managed desktop stack so this window can be raised and, just as
-    // importantly, can be covered by another window the user clicks.
-    ensureDesktopWindow(DESKTOP_WINDOW_IDS.remoteDesktop(machine.serverId), {
+    ensureDesktopWindow(REMOTE_DESKTOP_WORKSPACE_WINDOW_ID, {
       kind: DESKTOP_WINDOW_KINDS.remoteDesktop,
-      serverId: machine.serverId,
     }, { bringToFront: true });
   }, [ensureDesktopWindow]);
+
+  useEffect(() => {
+    if (auth) return;
+    remoteDesktopConnectionManager.stopAll();
+    setRemoteDesktopWorkspace(createRemoteDesktopWorkspaceState());
+    removeDesktopWindow(REMOTE_DESKTOP_WORKSPACE_WINDOW_ID);
+  }, [auth, remoteDesktopConnectionManager, removeDesktopWindow]);
+
+  useEffect(() => () => remoteDesktopConnectionManager.stopAll(), [remoteDesktopConnectionManager]);
 
   // Fetch current user info on auth
   useEffect(() => {
@@ -4671,16 +4695,19 @@ export function App() {
 
   if (!auth) {
     return (
-      <LoginPage
-        serverUrl={nativeServerUrl}
-        onLoginSuccess={(userId, url) => {
-          const authState: AuthState = { userId, baseUrl: url };
-          configureExpectedUserId(userId);
-          localStorage.setItem('rcc_auth', JSON.stringify(authState));
-          setAuth(authState);
-        }}
-        onChangeServer={isNative() ? () => setNativeServerUrl(null) : undefined}
-      />
+      <div class="remote-desktop-auth-shell">
+        <RemoteDesktopGuestAccess />
+        <LoginPage
+          serverUrl={nativeServerUrl}
+          onLoginSuccess={(userId, url) => {
+            const authState: AuthState = { userId, baseUrl: url };
+            configureExpectedUserId(userId);
+            localStorage.setItem('rcc_auth', JSON.stringify(authState));
+            setAuth(authState);
+          }}
+          onChangeServer={isNative() ? () => setNativeServerUrl(null) : undefined}
+        />
+      </div>
     );
   }
 
@@ -6332,25 +6359,34 @@ export function App() {
         </FloatingPanel>
       )}
 
-      {remoteDesktopMachine && (
-        <RemoteDesktopPanel
-          key={remoteDesktopMachine.serverId}
-          machine={remoteDesktopMachine}
+      {remoteDesktopWorkspace.open && (
+        <RemoteDesktopWorkspace
+          state={remoteDesktopWorkspace}
+          manager={remoteDesktopConnectionManager}
           ws={wsRef.current}
           minimized={remoteDesktopMinimized}
-          allowStandaloneWindow={!isMobile}
           zIndex={getDesktopWindowZIndex(
-            DESKTOP_WINDOW_IDS.remoteDesktop(remoteDesktopMachine.serverId),
+            REMOTE_DESKTOP_WORKSPACE_WINDOW_ID,
             5110,
           )}
           onFocus={() => bringDesktopWindowToFront(
-            DESKTOP_WINDOW_IDS.remoteDesktop(remoteDesktopMachine.serverId),
+            REMOTE_DESKTOP_WORKSPACE_WINDOW_ID,
           )}
+          onOpenHost={openRemoteDesktop}
+          onActivateTab={(tabId) => setRemoteDesktopWorkspace((current) => (
+            activateRemoteDesktopWorkspaceTab(current, tabId)
+          ))}
+          onCloseHost={(hostKey) => setRemoteDesktopWorkspace((current) => (
+            closeRemoteDesktopWorkspaceHost(current, hostKey)
+          ))}
+          onReorderHost={(hostKey, direction) => setRemoteDesktopWorkspace((current) => (
+            reorderRemoteDesktopWorkspaceHost(current, hostKey, direction)
+          ))}
           onMinimize={() => setRemoteDesktopMinimized(true)}
           onRestore={() => setRemoteDesktopMinimized(false)}
-          onClose={() => {
-            removeDesktopWindow(DESKTOP_WINDOW_IDS.remoteDesktop(remoteDesktopMachine.serverId));
-            setRemoteDesktopMachine(null);
+          onCloseWorkspace={() => {
+            removeDesktopWindow(REMOTE_DESKTOP_WORKSPACE_WINDOW_ID);
+            setRemoteDesktopWorkspace((current) => closeRemoteDesktopWorkspace(current));
             setRemoteDesktopMinimized(false);
           }}
         />

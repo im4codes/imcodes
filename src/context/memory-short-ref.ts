@@ -3,15 +3,15 @@ import { isMemoryScope, validateMemoryScopeIdentity } from '../../shared/memory-
 import { normalizeDaemonLocalMemoryNamespace } from '../../shared/memory-namespace.js';
 import { CONTEXT_STORE_RPC_TIMEOUT_MS } from '../../shared/context-store-rpc.js';
 import { MEMORY_SHORT_REF_HEALTH_ERROR_MAX_CHARS, type MemoryShortRefHealth } from '../../shared/memory-short-ref-health.js';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { encodeBase32 } from '../util/base32.js';
 import { getContextStoreClient } from '../store/context-store-worker-client.js';
 import { warnOncePerHour } from '../util/rate-limited-warn.js';
 import { incrementCounter } from '../util/metrics.js';
 import logger from '../util/logger.js';
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 
 export type MemoryShortRefKind = 'projection' | 'observation';
 
@@ -42,7 +42,7 @@ const persistedRefHydrations = new Map<string, Promise<number>>();
 let persistedLoaded = false;
 let shortRefHealth: MemoryShortRefHealth | undefined;
 
-interface MemoryShortRefStoreRow {
+interface MemoryShortRefStoreRow extends Record<string, unknown> {
   ref: string;
   kind: MemoryShortRefKind;
   id: string;
@@ -59,6 +59,11 @@ let storeFlushPromise: Promise<void> | null = null;
 let storeRetryTimer: NodeJS.Timeout | null = null;
 let storeRetryAttempt = 0;
 let shortRefStateGeneration = 0;
+let recoveryJournalActive = false;
+const processRecoveryJournalName = `memory-short-refs.pending.${process.pid}.${randomUUID()}.json`;
+/** Exact bytes last written/read per journal plus ownership proof. Journals of
+ *  live peer processes are replayable but never removed by this process. */
+const recoveryJournalSnapshots = new Map<string, { snapshot: string; cleanupAllowed: boolean }>();
 
 function refPrefix(kind: MemoryShortRefKind): 'proj' | 'obs' {
   return kind === 'projection' ? 'proj' : 'obs';
@@ -147,6 +152,55 @@ function shortRefStorePath(): string | undefined {
 function legacyShortRefFilePath(): string {
   const configured = process.env.IMCODES_MEMORY_SHORT_REF_LEGACY_PATH?.trim();
   return configured ? configured : join(homedir(), '.imcodes', 'memory-short-refs.json');
+}
+
+/**
+ * Emergency durability journal used only while the context-store worker is
+ * unavailable. The normal/healthy write path remains the SQLite store.
+ *
+ * Tests do not implicitly touch the developer's real home directory. They can
+ * opt into the journal with an explicit path when exercising recovery.
+ */
+function recoveryJournalPath(): string | undefined {
+  const configured = process.env.IMCODES_MEMORY_SHORT_REF_RECOVERY_PATH?.trim();
+  if (configured) return configured;
+  if (process.env.VITEST || process.env.NODE_ENV === 'test') return undefined;
+  // MCP providers and the daemon are separate processes. Give each writer its
+  // own atomic checkpoint so one process can never overwrite another process's
+  // unflushed refs with a smaller snapshot.
+  return join(homedir(), '.imcodes', processRecoveryJournalName);
+}
+
+function recoveryJournalCandidates(): string[] {
+  const configured = process.env.IMCODES_MEMORY_SHORT_REF_RECOVERY_PATH?.trim();
+  if (configured) return [configured];
+  if (process.env.VITEST || process.env.NODE_ENV === 'test') return [];
+  const directory = join(homedir(), '.imcodes');
+  try {
+    return readdirSync(directory)
+      // Keep accepting the first-generation PID-only journal name so an
+      // upgrade cannot strand a checkpoint written by the previous daemon.
+      .filter((name) => /^memory-short-refs\.pending\.\d+(?:\.[0-9a-f-]{36})?\.json$/i.test(name))
+      .map((name) => join(directory, name));
+  } catch {
+    return [];
+  }
+}
+
+function recoveryJournalCleanupAllowed(path: string): boolean {
+  const configured = process.env.IMCODES_MEMORY_SHORT_REF_RECOVERY_PATH?.trim();
+  if (configured) return path === configured;
+  if (basename(path) === processRecoveryJournalName) return true;
+  const ownerPid = Number(/^memory-short-refs\.pending\.(\d+)(?:\.[0-9a-f-]{36})?\.json$/i.exec(basename(path))?.[1]);
+  if (!Number.isSafeInteger(ownerPid) || ownerPid <= 0) return false;
+  try {
+    process.kill(ownerPid, 0);
+    return false;
+  } catch (error) {
+    // EPERM means the process exists but is owned by somebody else. Only ESRCH
+    // proves the writer is gone and makes unlinking its journal race-free.
+    return (error as NodeJS.ErrnoException | null)?.code === 'ESRCH';
+  }
 }
 
 /**
@@ -365,7 +419,7 @@ function persistShortRefsToFile(): void {
 /** Rows dropped while loading are a silent form of handle loss, so count them
  *  under a fixed-cardinality source and warn once per hour. */
 function reportDiscardedShortRefRows(
-  source: 'warm_load' | 'hydrate_ref' | 'legacy_file' | 'json_file',
+  source: 'warm_load' | 'hydrate_ref' | 'legacy_file' | 'json_file' | 'recovery_file',
   discarded: number,
 ): void {
   if (discarded <= 0) return;
@@ -378,7 +432,7 @@ function reportDiscardedShortRefRows(
 }
 
 function reportShortRefFailure(
-  stage: 'persist_store' | 'persist_file' | 'warm_load' | 'hydrate_ref' | 'load_file',
+  stage: 'persist_store' | 'persist_recovery' | 'persist_file' | 'warm_load' | 'hydrate_ref' | 'load_file',
   error: unknown,
   extra: Record<string, unknown> = {},
 ): void {
@@ -405,8 +459,120 @@ function storeRowKey(row: MemoryShortRefStoreRow): string {
   return JSON.stringify([row.ref, row.kind, row.id, row.namespaceKey]);
 }
 
+function toStoreRow(ref: string, entry: MemoryShortRefEntry): MemoryShortRefStoreRow {
+  return {
+    ref,
+    kind: entry.kind,
+    id: entry.id,
+    namespaceKey: namespaceStorageKey(entry.namespace),
+    namespaceJson: entry.namespace ? JSON.stringify(entry.namespace) : null,
+    lastSeenAt: entry.lastSeenAt ?? Date.now(),
+  };
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * Atomically checkpoint every row that still has not reached SQLite. This is
+ * deliberately activated only after a store failure, so the healthy path does
+ * not bring back the old whole-cache rewrite cost. Once active, each newly
+ * registered row refreshes the checkpoint before returning to the caller.
+ */
+function persistRecoveryJournal(): { durable: boolean; error?: unknown } {
+  const path = recoveryJournalPath();
+  if (!path) return { durable: false };
+  const tempPath = `${path}.${process.pid}.tmp`;
+  try {
+    mkdirSync(dirname(path), { recursive: true });
+    const rows = [...pendingStoreRows.values()]
+      .sort((a, b) => b.lastSeenAt - a.lastSeenAt);
+    const serialized = JSON.stringify({
+      schemaVersion: SHORT_REF_SCHEMA_VERSION,
+      rows,
+    });
+    writeFileSync(tempPath, serialized, { encoding: 'utf8', mode: 0o600 });
+    renameSync(tempPath, path);
+    recoveryJournalSnapshots.set(path, { snapshot: serialized, cleanupAllowed: true });
+    recoveryJournalActive = true;
+    return { durable: true };
+  } catch (error) {
+    try { unlinkSync(tempPath); } catch { /* best-effort cleanup */ }
+    return { durable: false, error };
+  }
+}
+
+function removeRecoveryJournal(): void {
+  const snapshots = [...recoveryJournalSnapshots];
+  if (snapshots.length === 0) {
+    recoveryJournalActive = false;
+    return;
+  }
+  for (const [path, state] of snapshots) {
+    // A different live daemon/MCP process still owns this file. We may replay
+    // the atomic snapshot we read, but only that process may unlink or replace
+    // it; compare-then-unlink alone has a TOCTOU window.
+    if (!state.cleanupAllowed) {
+      recoveryJournalSnapshots.delete(path);
+      continue;
+    }
+    try {
+      if (state.snapshot && readFileSync(path, 'utf8') !== state.snapshot) continue;
+      unlinkSync(path);
+      recoveryJournalSnapshots.delete(path);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException | null)?.code === 'ENOENT') {
+        recoveryJournalSnapshots.delete(path);
+      }
+      // A stale journal is safe: replay is idempotent and strictly validated.
+      // Keep its snapshot for any other error so later cleanup retries it.
+    }
+  }
+  const ownPath = recoveryJournalPath();
+  recoveryJournalActive = ownPath !== undefined && recoveryJournalSnapshots.has(ownPath);
+}
+
+function loadRecoveryJournal(): Array<{ ref: string; entry: MemoryShortRefEntry }> {
+  const recovered: Array<{ ref: string; entry: MemoryShortRefEntry }> = [];
+  let discarded = 0;
+  for (const path of recoveryJournalCandidates()) {
+    try {
+      const serialized = readFileSync(path, 'utf8');
+      const parsed = JSON.parse(serialized) as { schemaVersion?: unknown; rows?: unknown[] };
+      if (parsed.schemaVersion !== SHORT_REF_SCHEMA_VERSION || !Array.isArray(parsed.rows)) {
+        reportShortRefFailure('load_file', new Error('memory short-ref recovery journal has an invalid schema'), { path, recovery: true });
+        continue;
+      }
+      for (const raw of parsed.rows) {
+        const normalized = normalizePersistedShortRefRow(raw as Record<string, unknown>);
+        if (!normalized) {
+          discarded += 1;
+          continue;
+        }
+        recovered.push(normalized);
+        const row = toStoreRow(normalized.ref, normalized.entry);
+        pendingStoreRows.set(storeRowKey(row), row);
+      }
+      recoveryJournalSnapshots.set(path, {
+        snapshot: serialized,
+        cleanupAllowed: recoveryJournalCleanupAllowed(path),
+      });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException | null)?.code !== 'ENOENT') {
+        reportShortRefFailure('load_file', error, { path, recovery: true });
+      }
+    }
+  }
+  reportDiscardedShortRefRows('recovery_file', discarded);
+  const ownPath = recoveryJournalPath();
+  recoveryJournalActive = ownPath !== undefined && recoveryJournalSnapshots.has(ownPath);
+  return recovered;
+}
+
 function clearRecoveredStoreHealth(): void {
-  if (pendingStoreRows.size === 0 && shortRefHealth?.stage === 'persist_store') {
+  if (pendingStoreRows.size === 0
+    && (shortRefHealth?.stage === 'persist_store' || shortRefHealth?.stage === 'persist_recovery')) {
     shortRefHealth = undefined;
   }
 }
@@ -422,6 +588,21 @@ function scheduleStoreRetry(generation: number): void {
   if (typeof storeRetryTimer.unref === 'function') storeRetryTimer.unref();
 }
 
+async function waitForProductionWorkerReady(client: ReturnType<typeof getContextStoreClient>): Promise<void> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    await Promise.race([
+      client.whenReady(),
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, CONTEXT_STORE_RPC_TIMEOUT_MS.r4Background);
+        if (typeof timer.unref === 'function') timer.unref();
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 function flushPendingStoreRows(): void {
   if (storeFlushPromise || storeRetryTimer || pendingStoreRows.size === 0) {
     clearRecoveredStoreHealth();
@@ -431,12 +612,26 @@ function flushPendingStoreRows(): void {
   const batch = [...pendingStoreRows.entries()].slice(0, SHORT_REF_STORE_BATCH_SIZE);
   let succeeded = false;
   let operation!: Promise<void>;
-  operation = getContextStoreClient()
-    .run(
+  const client = getContextStoreClient();
+  operation = (async () => {
+    // A timeout self-heal creates a replacement worker that may still be doing
+    // its SQLite warm-up. `run()` intentionally rejects during that window;
+    // this background durability path can wait without blocking message acks.
+    if (client.isProductionOwner && !client.isReady) {
+      // Protect the rows before waiting: a stuck/slow warm-up must not recreate
+      // the exact restart-loss window this recovery path exists to close.
+      const recovery = persistRecoveryJournal();
+      if (!recovery.durable && recovery.error) {
+        reportShortRefFailure('persist_recovery', recovery.error, { rows: batch.length });
+      }
+      await waitForProductionWorkerReady(client);
+    }
+    await client.run(
       'upsertMemoryShortRefs',
       [batch.map(([, row]) => row)],
       { timeoutMs: CONTEXT_STORE_RPC_TIMEOUT_MS.r4Background },
-    )
+    );
+  })()
     .then(() => {
       if (generation !== shortRefStateGeneration) return;
       succeeded = true;
@@ -446,14 +641,30 @@ function flushPendingStoreRows(): void {
         // lastSeenAt while this batch was in flight. Keep that newer row queued.
         if (pendingStoreRows.get(key) === row) pendingStoreRows.delete(key);
       }
+      if (recoveryJournalSnapshots.size > 0 || recoveryJournalActive) {
+        if (pendingStoreRows.size === 0) removeRecoveryJournal();
+        else persistRecoveryJournal();
+      }
       clearRecoveredStoreHealth();
     })
     .catch((error: unknown) => {
       if (generation !== shortRefStateGeneration) return;
       storeRetryAttempt += 1;
-      // Keep the exact failed rows queued. A later successful retry is what
-      // makes these already-issued handles durable and clears the heartbeat.
-      reportShortRefFailure('persist_store', error, { rows: batch.length });
+      // Keep the exact failed rows queued. Before returning to the event loop,
+      // checkpoint them outside the worker-owned SQLite connection so a daemon
+      // restart during its self-heal window cannot strand already-issued refs.
+      const recovery = persistRecoveryJournal();
+      if (recovery.durable) {
+        incrementCounter('mem.short_ref.store_deferred', { recovery: 'journal' });
+        if (shortRefHealth?.stage === 'persist_store' || shortRefHealth?.stage === 'persist_recovery') {
+          shortRefHealth = undefined;
+        }
+      } else {
+        const combined = recovery.error
+          ? new Error(`${errorMessage(error)}; recovery journal failed: ${errorMessage(recovery.error)}`)
+          : error;
+        reportShortRefFailure('persist_store', combined, { rows: batch.length });
+      }
     })
     .finally(() => {
       if (generation !== shortRefStateGeneration || storeFlushPromise !== operation) return;
@@ -500,14 +711,17 @@ function persistShortRefs(touched: ReadonlyArray<{ ref: string; entry: MemorySho
   }
   if (touched.length === 0) return;
   const rows: MemoryShortRefStoreRow[] = touched.map(({ ref, entry }) => ({
-    ref,
-    kind: entry.kind,
-    id: entry.id,
-    namespaceKey: namespaceStorageKey(entry.namespace),
-    namespaceJson: entry.namespace ? JSON.stringify(entry.namespace) : null,
-    lastSeenAt: entry.lastSeenAt ?? Date.now(),
+    ...toStoreRow(ref, entry),
   }));
   for (const row of rows) pendingStoreRows.set(storeRowKey(row), row);
+  if (recoveryJournalActive) {
+    const recovery = persistRecoveryJournal();
+    if (!recovery.durable) {
+      reportShortRefFailure('persist_recovery', recovery.error ?? new Error('recovery journal unavailable'), { rows: rows.length });
+    } else if (shortRefHealth?.stage === 'persist_recovery') {
+      shortRefHealth = undefined;
+    }
+  }
   // Registration stays synchronous/non-fatal. The async flusher retains failed
   // rows and retries with bounded backoff until every issued handle is durable.
   flushPendingStoreRows();
@@ -593,6 +807,12 @@ function mergePersistedShortRefRows(
  */
 export async function loadMemoryShortRefsFromStore(): Promise<number> {
   if (shortRefStorePath()) return 0;
+  // Load the emergency journal before touching the worker. Even if the worker
+  // is still unavailable after a daemon restart, refs protected during the
+  // prior self-heal window are immediately resolvable from this local index.
+  const recovered = loadRecoveryJournal();
+  const recoveredMerged = mergePersistedShortRefRows(recovered.map(({ ref, entry }) => toStoreRow(ref, entry)));
+  reportDiscardedShortRefRows('recovery_file', recoveredMerged.discarded);
   try {
     const rows = await getContextStoreClient()
       .run<Array<Record<string, unknown>>>(
@@ -605,10 +825,12 @@ export async function loadMemoryShortRefsFromStore(): Promise<number> {
       // the same as a failed load — report instead of returning a 0 that reads
       // as "nothing stored".
       reportShortRefFailure('warm_load', new Error('listMemoryShortRefs returned a non-array response'));
-      return 0;
+      if (recovered.length > 0) flushPendingStoreRows();
+      pruneShortRefs();
+      return recoveredMerged.loaded;
     }
     const merged = mergePersistedShortRefRows(rows);
-    let loaded = merged.loaded;
+    let loaded = merged.loaded + recoveredMerged.loaded;
     // A well-formed array of malformed rows loads nothing and leaves every
     // earlier handle unresolvable — indistinguishable from an empty store
     // unless the discards are reported.
@@ -618,6 +840,7 @@ export async function loadMemoryShortRefsFromStore(): Promise<number> {
     const legacy = importLegacyShortRefFile();
     if (legacy.length > 0) persistShortRefs(legacy);
     loaded += legacy.length;
+    if (recovered.length > 0) flushPendingStoreRows();
     pruneShortRefs();
     persistedLoaded = true;
     return loaded;
@@ -626,7 +849,8 @@ export async function loadMemoryShortRefsFromStore(): Promise<number> {
     // unresolvable for the life of the process — report rather than return a
     // zero that is indistinguishable from "nothing stored".
     reportShortRefFailure('warm_load', error);
-    return 0;
+    if (recovered.length > 0) flushPendingStoreRows();
+    return recoveredMerged.loaded;
   }
 }
 
@@ -837,6 +1061,8 @@ export function resetMemoryShortRefsForTests(): void {
   storeRetryTimer = null;
   storeFlushPromise = null;
   storeRetryAttempt = 0;
+  recoveryJournalActive = false;
+  recoveryJournalSnapshots.clear();
   pendingStoreRows.clear();
   entriesByRef.clear();
   persistedRefHydrations.clear();

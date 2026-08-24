@@ -31,6 +31,10 @@ const stop = vi.fn();
 const { uploadFileWithDirectFallback } = vi.hoisted(() => ({
   uploadFileWithDirectFallback: vi.fn(),
 }));
+const directoryAdapters = vi.hoisted(() => [] as Array<{
+  serverId: string;
+  destroy: ReturnType<typeof vi.fn>;
+}>);
 const clientHooks: Array<{ onSnapshot(value: unknown): void }> = [];
 const clientStarts: number[] = [];
 let atomicButtonClickAdvertised = true;
@@ -61,6 +65,17 @@ vi.mock('../src/remote-desktop-client.js', () => ({
         stream: null,
       }));
     }
+    current = () => ({
+      state: REMOTE_DESKTOP_STATE.AUTHORIZING,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
+      inputEpoch: 0,
+      inputEnabled: false,
+      displays: [],
+      layoutRevision: 1,
+      stream: null,
+      durationMs: 0,
+      reconnectCount: 0,
+    });
     start = vi.fn(async (reconnectAttempt = 0) => { clientStarts.push(reconnectAttempt); });
     stop = stop;
     releaseAll = releaseAll;
@@ -76,6 +91,7 @@ vi.mock('../src/remote-desktop-client.js', () => ({
     selectDisplay = selectDisplay;
     setDisplayMode = setDisplayMode;
     setDisplayScale = setDisplayScale;
+    requestUnlock = vi.fn(() => true);
     requestRemoteClipboard = requestRemoteClipboard;
   },
 }));
@@ -105,7 +121,18 @@ vi.mock('../src/api/machines.js', () => ({
   listMachineDirectories: vi.fn(),
 }));
 
+vi.mock('../src/machine-directory-ws-adapter.js', () => ({
+  MachineDirectoryWsAdapter: class {
+    readonly destroy = vi.fn();
+    constructor(readonly serverId: string) {
+      directoryAdapters.push(this);
+    }
+    asWsClient() { return {}; }
+  },
+}));
+
 import { RemoteDesktopPanel } from '../src/components/RemoteDesktopPanel.js';
+import { RemoteDesktopConnectionManager } from '../src/remote-desktop-connection-manager.js';
 
 afterEach(() => {
   cleanup();
@@ -113,6 +140,7 @@ afterEach(() => {
   vi.useRealTimers();
   clientHooks.length = 0;
   clientStarts.length = 0;
+  directoryAdapters.length = 0;
   atomicButtonClickAdvertised = true;
   localStorage.removeItem('rcc_float_remote-desktop-server-1');
 });
@@ -216,6 +244,7 @@ async function renderPanel(
     onMinimize?: () => void;
     onRestore?: () => void;
     onClose?: () => void;
+    connectionManager?: RemoteDesktopConnectionManager;
   } = {},
 ) {
   const result = render(<RemoteDesktopPanel
@@ -235,6 +264,7 @@ async function renderPanel(
     allowStandaloneWindow={panelProps.allowStandaloneWindow}
     onMinimize={panelProps.onMinimize}
     onRestore={panelProps.onRestore}
+    connectionManager={panelProps.connectionManager}
   />);
   await act(async () => { await Promise.resolve(); });
   const stage = result.container.querySelector('.remote-desktop-stage') as HTMLDivElement;
@@ -261,6 +291,97 @@ async function renderPanel(
 }
 
 describe('RemoteDesktopPanel mobile gestures', () => {
+  it('clears only the affected workspace host when Server authority is terminally lost', async () => {
+    const onAuthorityLost = vi.fn();
+    render(<RemoteDesktopPanel
+      machine={{
+        serverId: 'server-1',
+        refName: 'controlled-1',
+        displayName: 'Windows',
+        os: 'win',
+        online: true,
+        execEnabled: true,
+        accessRole: 'owner',
+        capabilities: [REMOTE_DESKTOP_CAPABILITY],
+      }}
+      connectionManager={new RemoteDesktopConnectionManager()}
+      onClose={vi.fn()}
+      onAuthorityLost={onAuthorityLost}
+    />);
+    await act(async () => { await Promise.resolve(); });
+
+    act(() => clientHooks[0].onSnapshot({
+      state: REMOTE_DESKTOP_STATE.FAILED,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
+      inputEpoch: 1,
+      inputEnabled: false,
+      displays: [],
+      layoutRevision: 1,
+      stream: null,
+      durationMs: 0,
+      reconnectCount: 0,
+      terminalReason: REMOTE_DESKTOP_TERMINAL_REASON.AUTHORITY_REVOKED,
+    }));
+    expect(onAuthorityLost).toHaveBeenCalledTimes(1);
+  });
+
+  it('rebinds the directory picker adapter when a canonical host changes execution endpoint', async () => {
+    const connectionManager = new RemoteDesktopConnectionManager();
+    const machine = (serverId: string) => ({
+      serverId,
+      remoteDesktopHostId: 'canonical-host',
+      refName: serverId,
+      displayName: 'Windows',
+      os: 'win',
+      online: true,
+      execEnabled: true,
+      accessRole: 'owner' as const,
+      capabilities: [REMOTE_DESKTOP_CAPABILITY],
+    });
+    const result = render(<RemoteDesktopPanel
+      machine={machine('endpoint-a')}
+      connectionManager={connectionManager}
+      onClose={vi.fn()}
+    />);
+    await act(async () => { await Promise.resolve(); });
+
+    expect(directoryAdapters.map((adapter) => adapter.serverId)).toEqual(['endpoint-a']);
+    result.rerender(<RemoteDesktopPanel
+      machine={machine('endpoint-b')}
+      connectionManager={connectionManager}
+      onClose={vi.fn()}
+    />);
+    await act(async () => { await Promise.resolve(); });
+
+    expect(directoryAdapters.map((adapter) => adapter.serverId)).toEqual(['endpoint-a', 'endpoint-b']);
+    expect(directoryAdapters[0].destroy).toHaveBeenCalledTimes(1);
+    expect(clientHooks).toHaveLength(2);
+    connectionManager.stopAll();
+  });
+
+  it('remounts its presentation without replacing the workspace connection', async () => {
+    const connectionManager = new RemoteDesktopConnectionManager();
+    const first = await renderPanel(undefined, [REMOTE_DESKTOP_CAPABILITY], {
+      connectionManager,
+    });
+    expect(clientHooks).toHaveLength(1);
+    expect(clientStarts).toEqual([0]);
+
+    first.unmount();
+    expect(stop).not.toHaveBeenCalled();
+    expect(releaseAll).toHaveBeenCalledTimes(1);
+
+    const remounted = await renderPanel(undefined, [REMOTE_DESKTOP_CAPABILITY], {
+      connectionManager,
+    });
+    expect(clientHooks).toHaveLength(1);
+    expect(clientStarts).toEqual([0]);
+
+    remounted.unmount();
+    connectionManager.stopAll();
+    expect(stop).toHaveBeenCalledTimes(1);
+  });
+
   it('opens the same controlled machine in an independent browser window', async () => {
     const opened = { opener: window } as unknown as Window;
     const open = vi.spyOn(window, 'open').mockReturnValue(opened);

@@ -34,6 +34,8 @@
 #include "rtc_base/thread.h"
 #include "rtc_base/win32_socket_init.h"
 #include "third_party/imcodes_remote_desktop/display_capture.h"
+#include "third_party/imcodes_remote_desktop/consent_ipc.h"
+#include "third_party/imcodes_remote_desktop/privacy_ipc.h"
 #include "third_party/imcodes_remote_desktop/input_injector.h"
 #include "third_party/imcodes_remote_desktop/json_protocol.h"
 #include "third_party/imcodes_remote_desktop/local_indicator.h"
@@ -88,6 +90,19 @@ std::string WideToUtf8(const std::wstring& value) {
   return output;
 }
 
+std::wstring Utf8ToWide(const std::string& value) {
+  if (value.empty()) return {};
+  const int size = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+                                       value.data(), value.size(), nullptr, 0);
+  if (size <= 0) return {};
+  std::wstring output(static_cast<size_t>(size), L'\0');
+  if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value.data(),
+                          value.size(), output.data(), size) != size) {
+    return {};
+  }
+  return output;
+}
+
 bool IsSafePipePath(const std::wstring& path) {
   return path.size() > std::size(kPipePrefix) - 1 && path.size() <= 240 &&
          path.starts_with(kPipePrefix) &&
@@ -119,16 +134,16 @@ bool ConstantTimeEqual(const std::string& left, const std::string& right) {
  * user's own desktop and is indistinguishable from a signed-in screen by name
  * alone.
  */
-bool CurrentSessionIsLocked() {
+std::optional<bool> CurrentSessionLockedState() {
   WTSINFOEXW* info = nullptr;
   DWORD bytes = 0;
   if (!WTSQuerySessionInformationW(WTS_CURRENT_SERVER_HANDLE,
                                    WTS_CURRENT_SESSION, WTSSessionInfoEx,
                                    reinterpret_cast<LPWSTR*>(&info), &bytes) ||
       !info) {
-    return false;
+    return std::nullopt;
   }
-  bool locked = false;
+  std::optional<bool> locked;
   if (info->Level == 1) {
     // WTS_SESSIONSTATE_LOCK is 0, so this is a comparison and never a mask
     // test: `flags & WTS_SESSIONSTATE_LOCK` is always zero and reports every
@@ -138,6 +153,12 @@ bool CurrentSessionIsLocked() {
   }
   WTSFreeMemory(info);
   return locked;
+}
+
+bool CurrentSessionIsLocked() {
+  // Unknown is protected. Treating a failed WTS query as unlocked could show
+  // a consent prompt on a surface the local operator cannot actually see.
+  return CurrentSessionLockedState().value_or(true);
 }
 
 std::wstring CurrentInputDesktopName() {
@@ -314,6 +335,7 @@ class PipeWriter {
   explicit PipeWriter(PipeChannel* pipe) : pipe_(pipe) {}
 
   bool Emit(const Json::Value& value) {
+    std::lock_guard<std::mutex> lock(mutex_);
     std::string line = WriteJson(value);
     line.push_back('\n');
     if (line.size() > kMaxIpcLineBytes) return false;
@@ -322,7 +344,123 @@ class PipeWriter {
 
  private:
   PipeChannel* const pipe_;
+  std::mutex mutex_;
 };
+
+class ConsentDispatcher {
+ public:
+  explicit ConsentDispatcher(PipeWriter* writer) : writer_(writer) {}
+  ~ConsentDispatcher() { Shutdown(); }
+
+  bool Handle(const Json::Value& root) {
+    const std::optional<ConsentFrame> frame = ParseConsentFrame(root);
+    if (!frame) return false;
+    if (frame->kind == ConsentFrameKind::kSurfaceQuery) {
+      const std::wstring desktop = CurrentInputDesktopName();
+      const bool interactive = !desktop.empty();
+      const bool protected_desktop = CurrentSessionIsLocked() ||
+          (interactive && _wcsicmp(desktop.c_str(), L"Default") != 0);
+      writer_->Emit(ConsentSurfaceStateEnvelope(
+          interactive && !protected_desktop, interactive, protected_desktop));
+      return true;
+    }
+    if (frame->kind == ConsentFrameKind::kDismiss) {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (active_ && active_approval_id_ == frame->approval_id) prompt_.Cancel();
+      return true;
+    }
+
+    std::thread completed;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (active_) {
+        writer_->Emit(ConsentAnswerEnvelope(
+            frame->approval_id, consent_ipc::kOutcomeUnavailable));
+        return true;
+      }
+      if (prompt_thread_.joinable()) completed = std::move(prompt_thread_);
+      active_ = true;
+      active_approval_id_ = frame->approval_id;
+      const ConsentAsk ask = frame->ask;
+      const uint64_t cancellation_generation =
+          prompt_.cancellation_generation();
+      prompt_thread_ = std::thread([this, ask, cancellation_generation] {
+        ConsentPrompt::Outcome outcome = ConsentPrompt::Outcome::kUnavailable;
+        const std::wstring desktop = CurrentInputDesktopName();
+        const std::wstring requester = Utf8ToWide(ask.requester_label);
+        if (!requester.empty() && !desktop.empty() && !CurrentSessionIsLocked() &&
+            _wcsicmp(desktop.c_str(), L"Default") == 0) {
+          outcome = prompt_.Ask(requester, ask.control_mode, ask.deadline_ms,
+                                cancellation_generation);
+        }
+        writer_->Emit(ConsentAnswerEnvelope(
+            ask.approval_id, ConsentOutcomeLiteral(outcome)));
+        std::lock_guard<std::mutex> done_lock(mutex_);
+        active_ = false;
+        active_approval_id_.clear();
+      });
+    }
+    if (completed.joinable()) completed.join();
+    return true;
+  }
+
+  void Shutdown() {
+    std::thread prompt_thread;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (active_) prompt_.Cancel();
+      if (prompt_thread_.joinable()) prompt_thread = std::move(prompt_thread_);
+    }
+    if (prompt_thread.joinable()) prompt_thread.join();
+  }
+
+ private:
+  PipeWriter* const writer_;
+  ConsentPrompt prompt_;
+  std::mutex mutex_;
+  std::thread prompt_thread_;
+  bool active_ = false;
+  std::string active_approval_id_;
+};
+
+/**
+ * Prompt-only lifecycle used before PREPARE.
+ *
+ * This path deliberately returns before Winsock, COM, Media Foundation,
+ * libwebrtc, capture, the input injector, and session Signal parsing are
+ * initialized. The authenticated pipe can therefore ask/dismiss consent and
+ * nothing on it can create capture, input, offer, ICE, or session authority.
+ */
+int RunConsentOnlyWorker(PipeChannel* pipe_channel, PipeWriter* writer) {
+  SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+  ConsentDispatcher consent(writer);
+  bool protocol_ok = true;
+  std::string pending;
+  std::vector<char> buffer(8192);
+  while (protocol_ok) {
+    const size_t read = pipe_channel->Read(buffer.data(), buffer.size());
+    if (read == 0) break;
+    pending.append(buffer.data(), read);
+    if (pending.size() > kMaxIpcLineBytes) {
+      protocol_ok = false;
+      break;
+    }
+    for (;;) {
+      const size_t newline = pending.find('\n');
+      if (newline == std::string::npos) break;
+      std::string line = pending.substr(0, newline);
+      pending.erase(0, newline + 1);
+      if (!line.empty() && line.back() == '\r') line.pop_back();
+      if (line.empty()) continue;
+      Json::Value root;
+      // Malformed or session/privacy frames are ignored. They never fall
+      // through to another dispatcher in this lifecycle.
+      if (!ParseJson(line, &root) || !consent.Handle(root)) continue;
+    }
+  }
+  consent.Shutdown();
+  return protocol_ok ? 0 : 11;
+}
 
 class WorkerRuntime {
  public:
@@ -336,17 +474,19 @@ class WorkerRuntime {
         writer_(writer),
         indicator_(indicator),
         input_(
-            [indicator](UINT count, LPINPUT inputs, int size) {
-              if (!g_input_desktop_ready.load()) return static_cast<UINT>(0);
+            [this, indicator](UINT count, LPINPUT inputs, int size) {
+              if (privacy_active_.load() || !g_input_desktop_ready.load()) {
+                return static_cast<UINT>(0);
+              }
               return indicator ? indicator->DispatchInput(count, inputs, size)
                                : 0;
             },
-            [indicator] {
-              return g_input_desktop_ready.load() && indicator &&
+            [this, indicator] {
+              return !privacy_active_.load() && g_input_desktop_ready.load() && indicator &&
                      indicator->InputAvailable();
             },
-            [indicator](int x, int y) {
-              return g_input_desktop_ready.load() && indicator &&
+            [this, indicator](int x, int y) {
+              return !privacy_active_.load() && g_input_desktop_ready.load() && indicator &&
                      indicator->MovePointer(x, y);
             }),
         dwm_process_id_(CurrentDwmProcessIdForCurrentSession()) {}
@@ -457,7 +597,8 @@ class WorkerRuntime {
             !input_desktop.empty()) {
           session_transition_pending_ = false;
         }
-        g_input_desktop_ready.store(!session_transition_pending_ &&
+        g_input_desktop_ready.store(!privacy_active_.load() &&
+                                    !session_transition_pending_ &&
                                     !input_desktop.empty() &&
                                     input_desktop == indicator_->BoundDesktop());
         const bool expected_desktop =
@@ -514,6 +655,114 @@ class WorkerRuntime {
   }
 
   void RequestLocalStopAll() { local_stop_requested_ = true; }
+
+  /**
+   * Engage the management-privacy shield on every capture source.
+   *
+   * Ordering is the whole point and is enforced here rather than left to the
+   * caller: held input is released FIRST (a viewer whose key is still down
+   * would keep typing into a secret surface it can no longer see), then the
+   * shield goes up, and only then do we report. `routes` is captured AFTER the
+   * switch, so a session that appeared mid-switch is either shielded and
+   * listed, or not present at all -- never streaming and unlisted.
+   */
+  struct PrivacyShieldResult {
+    bool epoch_accepted = false;
+    bool input_released = false;
+    bool route_generations_complete = true;
+    int64_t worker_generation = 0;
+    std::vector<PrivacyRouteGeneration> routes;
+  };
+
+  PrivacyShieldResult EngagePrivacyShield(const std::string& epoch_id,
+                                           int64_t revision) {
+    PrivacyShieldResult result{};
+    signaling_thread_->BlockingCall([this, &result, &epoch_id, revision] {
+      if (privacy_active_.load() &&
+          (privacy_epoch_ != epoch_id || revision < privacy_revision_)) {
+        return;
+      }
+      privacy_active_.store(true);
+      privacy_epoch_ = epoch_id;
+      privacy_revision_ = revision;
+      g_input_desktop_ready.store(false);
+      result.epoch_accepted = true;
+      // Real release, not an assertion: this is the call that actually lifts
+      // whatever keys and buttons remote viewers are holding.
+      result.input_released = ReleaseAllSupportedInput();
+      for (int attempt = 0; attempt < 4 && !input_.RetryPendingReleases();
+           ++attempt) {
+        Sleep(10);
+      }
+      for (auto& [id, source] : sources_) source.source->EngagePrivacyShield();
+      int64_t generation = 0;
+      for (auto& [id, source] : sources_) {
+        generation = std::max<int64_t>(
+            generation, static_cast<int64_t>(source.source->shield_generation()));
+      }
+      result.worker_generation = generation;
+      for (auto& [id, session] : sessions_) {
+        if (!session->authority().route_generation) {
+          // Legacy v2 remains usable for authenticated access, but an absent
+          // route epoch can never be acknowledged as part of a privacy
+          // snapshot. daemon_generation is not a substitute.
+          result.route_generations_complete = false;
+          continue;
+        }
+        PrivacyRouteGeneration route{};
+        route.route_id = session->authority().session_id;
+        route.route_generation = *session->authority().route_generation;
+        result.routes.push_back(route);
+      }
+    });
+    return result;
+  }
+
+  /** Current highest broadcast generation across all sources. */
+  int64_t PrivacyShieldGeneration() {
+    int64_t generation = 0;
+    signaling_thread_->BlockingCall([this, &generation] {
+      for (auto& [id, source] : sources_) {
+        generation = std::max<int64_t>(
+            generation, static_cast<int64_t>(source.source->shield_generation()));
+      }
+    });
+    return generation;
+  }
+
+  bool ReleasePrivacyShield(const std::string& epoch_id, int64_t revision) {
+    bool released = false;
+    signaling_thread_->BlockingCall([this, &released, &epoch_id, revision] {
+      if (!privacy_active_.load() || privacy_epoch_ != epoch_id ||
+          revision != privacy_revision_) {
+        return;
+      }
+      for (auto& [id, source] : sources_) source.source->ReleasePrivacyShield();
+      // Input remains disabled until CompletePrivacyRelease runs after a
+      // strictly newer real frame is proven.
+      released = true;
+    });
+    return released;
+  }
+
+  bool CompletePrivacyRelease(const std::string& epoch_id, int64_t revision) {
+    bool completed = false;
+    signaling_thread_->BlockingCall([this, &completed, &epoch_id, revision] {
+      if (!privacy_active_.load() || privacy_epoch_ != epoch_id ||
+          revision != privacy_revision_) {
+        return;
+      }
+      privacy_epoch_.clear();
+      privacy_revision_ = 0;
+      privacy_active_.store(false);
+      g_input_desktop_ready.store(!session_transition_pending_ &&
+                                  !indicator_->BoundDesktop().empty() &&
+                                  indicator_->BoundDesktop() ==
+                                      CurrentInputDesktopName());
+      completed = true;
+    });
+    return completed;
+  }
   void RequestEnvironmentChange(uint32_t event_mask) {
     environment_events_.fetch_or(event_mask);
   }
@@ -599,12 +848,14 @@ class WorkerRuntime {
           [this](const DisplayInfo& display) { ReleaseSource(display); },
           &input_,
           [this] {
-            return ClipboardAllowedOnDesktop(indicator_->BoundDesktop())
+            return !privacy_active_.load() &&
+                           ClipboardAllowedOnDesktop(indicator_->BoundDesktop())
                        ? indicator_->ClipboardSequence()
                        : static_cast<DWORD>(0);
           },
           [this](DWORD previous_sequence) {
-            return ClipboardAllowedOnDesktop(indicator_->BoundDesktop())
+            return !privacy_active_.load() &&
+                           ClipboardAllowedOnDesktop(indicator_->BoundDesktop())
                        ? indicator_->ReadClipboardText(previous_sequence)
                        : std::optional<std::u16string>();
           },
@@ -684,6 +935,10 @@ class WorkerRuntime {
     // The tick reconciler corrects this the moment Windows disagrees; an
     // empty name simply means "whatever receives input right now".
     source->RequestDesktopRebind(CurrentInputDesktopName());
+    // A source created after BEGIN is opaque before its capture thread can
+    // publish even one frame. This also covers display hotplug while an epoch
+    // remains active.
+    if (privacy_active_.load()) source->EngagePrivacyShield();
     source->Start();
     sources_.emplace(key, SourceEntry{source, 1});
     return source;
@@ -907,6 +1162,11 @@ class WorkerRuntime {
   PipeWriter* const writer_;
   LocalIndicator* const indicator_;
   InputArbiter input_;
+  std::atomic<bool> privacy_active_{false};
+  // Signaling-thread only. The atomic above gates input callbacks running on
+  // other threads; epoch/revision are compared only while serialized there.
+  std::string privacy_epoch_;
+  int64_t privacy_revision_ = 0;
   std::map<std::string, std::shared_ptr<PeerSession>> sessions_;
   std::map<std::string, SourceEntry> sources_;
   std::atomic<bool> local_stop_requested_{false};
@@ -925,10 +1185,191 @@ class WorkerRuntime {
   int empty_topology_ticks_ = 0;
 };
 
+/**
+ * Management-privacy dispatcher.
+ *
+ * Holds at most one epoch. Every failure path leaves the shield UP and emits
+ * nothing: the node treats silence as "cannot prove", so an unanswered frame
+ * fails closed at the Server's deadline. Emitting an optimistic ack would let
+ * secret UI light up over pixels that were never shielded.
+ *
+ * This dispatcher is intentionally declared after WorkerRuntime: it invokes
+ * the runtime's privacy methods and consumes its nested result type, so a mere
+ * forward declaration cannot provide a complete C++ type here.
+ */
+class PrivacyDispatcher {
+ public:
+  PrivacyDispatcher(PipeWriter* writer, WorkerRuntime* runtime)
+      : writer_(writer), runtime_(runtime) {}
+
+  bool Handle(const Json::Value& root) {
+    const std::optional<PrivacyFrame> frame = ParsePrivacyFrame(root);
+    if (!frame) return false;
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (frame->kind == PrivacyFrameKind::kShield) return Shield(*frame);
+    return Release(*frame);
+  }
+
+  /**
+   * Re-publish the complete actual route set after PREPARE/STOP/maintenance,
+   * but only when it exactly equals the durable expected snapshot received in
+   * SHIELD. Re-emitting on every real change prevents an early subset from
+   * becoming a permanent deadlock without ever acknowledging that subset.
+   */
+  void Reconcile() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (active_) ReconcileLocked(false);
+  }
+
+  /** Pipe loss. The shield stays up: the owner may still be typing. */
+  void Shutdown() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    active_ = false;
+    active_epoch_.clear();
+    expected_routes_.clear();
+  }
+
+ private:
+  bool Shield(const PrivacyFrame& frame) {
+    // A second concurrent epoch would make "which shield is up" ambiguous
+    // exactly when it must not be. A repeat of the SAME epoch is idempotent.
+    if (active_ && (active_epoch_ != frame.epoch_id ||
+                    frame.revision < active_revision_)) {
+      return true;
+    }
+
+    if (!active_ || frame.revision > active_revision_) {
+      active_ = true;
+      active_epoch_ = frame.epoch_id;
+      active_revision_ = frame.revision;
+      last_emitted_revision_ = -1;
+      last_emitted_generation_ = -1;
+      last_emitted_routes_.clear();
+      expected_routes_ = frame.expected_routes;
+      std::sort(expected_routes_.begin(), expected_routes_.end(),
+                [](const PrivacyRouteGeneration& left,
+                   const PrivacyRouteGeneration& right) {
+                  return left.route_id < right.route_id;
+                });
+    } else {
+      std::vector<PrivacyRouteGeneration> repeated = frame.expected_routes;
+      std::sort(repeated.begin(), repeated.end(),
+                [](const PrivacyRouteGeneration& left,
+                   const PrivacyRouteGeneration& right) {
+                  return left.route_id < right.route_id;
+                });
+      if (!SameRoutes(repeated, expected_routes_)) return true;
+    }
+    // Force re-emission for an idempotent BEGIN retry: the earlier ACK may
+    // have been lost between the node and the owning Server pod.
+    ReconcileLocked(true);
+    return true;
+  }
+
+  void ReconcileLocked(bool force) {
+    const WorkerRuntime::PrivacyShieldResult result =
+        runtime_->EngagePrivacyShield(active_epoch_, active_revision_);
+    // No ack unless input really came down and every current session carries
+    // the independent route generation. The shield itself remains engaged.
+    if (!result.epoch_accepted || !result.input_released ||
+        !result.route_generations_complete) {
+      return;
+    }
+    std::vector<PrivacyRouteGeneration> routes = result.routes;
+    std::sort(routes.begin(), routes.end(),
+              [](const PrivacyRouteGeneration& left,
+                 const PrivacyRouteGeneration& right) {
+                if (left.route_id != right.route_id) {
+                  return left.route_id < right.route_id;
+                }
+                return left.route_generation < right.route_generation;
+              });
+    if (!SameRoutes(routes, expected_routes_)) return;
+    const bool same_routes = SameRoutes(routes, last_emitted_routes_);
+    if (!force && last_emitted_revision_ == active_revision_ &&
+        last_emitted_generation_ == result.worker_generation && same_routes) {
+      return;
+    }
+    shield_generation_ = result.worker_generation;
+    if (!writer_->Emit(PrivacyShieldedEnvelope(
+            active_epoch_, active_revision_, result.worker_generation, true,
+            routes))) {
+      return;
+    }
+    last_emitted_revision_ = active_revision_;
+    last_emitted_generation_ = result.worker_generation;
+    last_emitted_routes_ = std::move(routes);
+  }
+
+  static bool SameRoutes(const std::vector<PrivacyRouteGeneration>& left,
+                         const std::vector<PrivacyRouteGeneration>& right) {
+    return left.size() == right.size() &&
+        std::equal(left.begin(), left.end(), right.begin(),
+                   [](const PrivacyRouteGeneration& a,
+                      const PrivacyRouteGeneration& b) {
+                     return a.route_id == b.route_id &&
+                         a.route_generation == b.route_generation;
+                   });
+  }
+
+  bool Release(const PrivacyFrame& frame) {
+    // Unknown, stale or wrong-epoch release is ignored, shield untouched.
+    if (!active_ || active_epoch_ != frame.epoch_id) return true;
+    if (frame.revision != active_revision_) return true;
+
+    if (!runtime_->ReleasePrivacyShield(frame.epoch_id, active_revision_)) {
+      return true;
+    }
+
+    // Prove a real frame captured strictly AFTER the shield came down. A
+    // cached pre-release frame cannot satisfy this: the counter advances only
+    // when BroadcastFrame actually runs again.
+    const int64_t deadline_generation = shield_generation_;
+    int64_t fresh = 0;
+    const DWORD started = GetTickCount();
+    for (;;) {
+      fresh = runtime_->PrivacyShieldGeneration();
+      if (fresh > deadline_generation) break;
+      if (GetTickCount() - started >= privacy_ipc::kFreshFrameTimeoutMs) {
+        // Could not prove freshness. Re-engage rather than leave a
+        // half-released state, and stay silent so the node fails closed.
+        runtime_->EngagePrivacyShield(frame.epoch_id, active_revision_);
+        return true;
+      }
+      Sleep(25);
+    }
+
+    if (!runtime_->CompletePrivacyRelease(frame.epoch_id, active_revision_)) {
+      runtime_->EngagePrivacyShield(frame.epoch_id, active_revision_);
+      return true;
+    }
+    active_ = false;
+    active_epoch_.clear();
+    expected_routes_.clear();
+    last_emitted_routes_.clear();
+    writer_->Emit(PrivacyReleasedEnvelope(frame.epoch_id, true, fresh));
+    return true;
+  }
+
+  PipeWriter* const writer_;
+  WorkerRuntime* const runtime_;
+  std::mutex mutex_;
+  bool active_ = false;
+  std::string active_epoch_;
+  int64_t active_revision_ = 0;
+  int64_t shield_generation_ = 0;
+  int64_t last_emitted_revision_ = -1;
+  int64_t last_emitted_generation_ = -1;
+  std::vector<PrivacyRouteGeneration> last_emitted_routes_;
+  std::vector<PrivacyRouteGeneration> expected_routes_;
+};
+
 struct WorkerArguments {
   std::wstring pipe;
   std::string nonce;
   bool secure_console = false;
+  bool consent_only = false;
+  bool privacy_only = false;
 };
 
 std::optional<WorkerArguments> ParseArguments() {
@@ -938,10 +1379,22 @@ std::optional<WorkerArguments> ParseArguments() {
   std::optional<std::wstring> pipe;
   std::optional<std::string> nonce;
   bool secure_console = false;
+  bool consent_only = false;
+  bool privacy_only = false;
   for (int index = 1; index < count;) {
     const std::wstring key = arguments[index];
     if (key == L"--secure-console" && !secure_console) {
       secure_console = true;
+      ++index;
+      continue;
+    }
+    if (key == L"--consent-only" && !consent_only) {
+      consent_only = true;
+      ++index;
+      continue;
+    }
+    if (key == L"--privacy-only" && !privacy_only) {
+      privacy_only = true;
       ++index;
       continue;
     }
@@ -959,12 +1412,14 @@ std::optional<WorkerArguments> ParseArguments() {
     index += 2;
   }
   LocalFree(arguments);
-  if (!pipe || !nonce || !IsSafePipePath(*pipe) ||
+  if (!pipe || !nonce || (consent_only && privacy_only) ||
+      (secure_console && consent_only) || !IsSafePipePath(*pipe) ||
       !IsSafeCapability(*nonce)) {
     return std::nullopt;
   }
   return WorkerArguments{
-      std::move(*pipe), std::move(*nonce), secure_console};
+      std::move(*pipe), std::move(*nonce), secure_console, consent_only,
+      privacy_only};
 }
 
 }  // namespace
@@ -1054,6 +1509,13 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     return 7;
   }
 
+  if (arguments->consent_only) {
+    const int result = RunConsentOnlyWorker(&pipe_channel, &writer);
+    g_crash_pipe.store(nullptr);
+    pipe_channel.Close();
+    return result;
+  }
+
   // Native libwebrtc embedders own Winsock lifetime. Without this, ICE can
   // expose TCP-active placeholders but cannot bind a real UDP host/STUN/TURN
   // socket, leaving every browser peer permanently in `new`.
@@ -1134,6 +1596,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
   // but it no longer selects behaviour: this worker follows whichever desktop
   // Windows is showing.
   WorkerRuntime runtime(signaling_thread.get(), factory, &writer, &indicator);
+  ConsentDispatcher consent(&writer);
+  PrivacyDispatcher privacy(&writer, &runtime);
   if (!indicator.Start(
           [&runtime] { runtime.RequestLocalStopAll(); },
           [&runtime](uint32_t event_mask) {
@@ -1156,7 +1620,10 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
   std::thread maintenance([&] {
     while (running.load()) {
       std::this_thread::sleep_for(std::chrono::milliseconds(250));
-      if (running.load()) runtime.Maintenance();
+      if (running.load()) {
+        runtime.Maintenance();
+        privacy.Reconcile();
+      }
     }
   });
 
@@ -1179,13 +1646,27 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
       if (!line.empty() && line.back() == '\r') line.pop_back();
       if (line.empty()) continue;
       Json::Value root;
-      if (!ParseJson(line, &root) || !runtime.Handle(root)) {
+      if (!ParseJson(line, &root)) {
+        continue;
+      }
+      bool handled = consent.Handle(root) || privacy.Handle(root);
+      if (!handled && runtime.Handle(root)) {
+        handled = true;
+        // PREPARE/STOP/CANCEL can replace the exact route set while an epoch
+        // remains active. The source was shielded before Start(); now publish
+        // the complete post-mutation set for Server-side exact comparison.
+        privacy.Reconcile();
+      }
+      if (!handled) {
         // Reject this bounded message but keep the authenticated IPC alive;
         // a stale ICE candidate must not terminate unrelated sessions.
         continue;
       }
     }
   }
+
+  consent.Shutdown();
+  privacy.Shutdown();
 
   // A display-driver or DWM reset can leave a DXGI call permanently blocked.
   // Once the authenticated pipe is gone there is no authority left to serve,

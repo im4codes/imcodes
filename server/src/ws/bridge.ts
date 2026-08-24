@@ -12,7 +12,7 @@
  * terminal.stream_reset and unsubscribes the browser from that session.
  */
 
-import WebSocket from 'ws';
+import WebSocket, { type RawData } from 'ws';
 import { performance } from 'node:perf_hooks';
 import { randomUUID } from 'node:crypto';
 import type { Database } from '../db/client.js';
@@ -83,6 +83,11 @@ import { PEER_AUDIT_COMMAND_ERRORS, PEER_AUDIT_MESSAGES } from '../../../shared/
 import { PeerAuditUnicastRouter } from './peer-audit-unicast-router.js';
 import { DirectFileTransferRouter } from './direct-file-transfer-router.js';
 import { RemoteDesktopRouter } from './remote-desktop-router.js';
+import type {
+  RemoteDesktopGuestDeliveryResult,
+  RemoteDesktopGuestOutboxAuthorityMatch,
+  RemoteDesktopGuestOutboxExecutionTarget,
+} from '../services/remote-desktop-guest-outbox-worker.js';
 import { createTurnIceServerAuthority } from './turn-credentials.js';
 import {
   DIRECT_FILE_TRANSFER_REQUIRED_CAPABILITIES,
@@ -106,9 +111,65 @@ import {
 } from '../../../shared/controlled-node-capabilities.js';
 import {
   REMOTE_DESKTOP_CAPABILITY,
+  REMOTE_DESKTOP_MSG,
   REMOTE_DESKTOP_TERMINAL_REASON,
+  type RemoteDesktopAccessMode,
   type RemoteDesktopTerminalReason,
 } from '../../../shared/remote-desktop.js';
+import {
+  REMOTE_DESKTOP_ACTOR_SOURCE,
+  REMOTE_DESKTOP_CAPTURE_PRIVACY_CAPABILITY,
+  REMOTE_DESKTOP_CONSENT_CANCEL_REASON,
+  REMOTE_DESKTOP_CONSENT_MSG,
+  REMOTE_DESKTOP_DEFAULT_SHIELDED_ROUTE_CAPABILITY,
+  REMOTE_DESKTOP_LINK_LIMITS,
+  REMOTE_DESKTOP_LOCAL_CONSENT_CAPABILITY,
+  REMOTE_DESKTOP_NODE_CONTEXT_MSG,
+  REMOTE_DESKTOP_PRIVACY_MSG,
+  REMOTE_DESKTOP_PRIVACY_PHASE,
+  REMOTE_DESKTOP_SHELL_MSG,
+  REMOTE_DESKTOP_SIGNED_SHELL_CAPABILITY,
+  validateRemoteDesktopBootstrapProof,
+  validateRemoteDesktopConsentMessage,
+  validateRemoteDesktopNodeAuthorityContext,
+  validateRemoteDesktopPrivacyMessage,
+  validateRemoteDesktopShellMessage,
+  type RemoteDesktopShellLaunchContext,
+  type RemoteDesktopOutboxEvent,
+  type RemoteDesktopActor,
+  type RemoteDesktopPrivacyBegin,
+  type RemoteDesktopPrivacyEnd,
+} from '../../../shared/remote-desktop-access.js';
+import {
+  redeemBootstrapForRoute,
+  resolveRedeemedGuestActor,
+} from '../services/remote-desktop-guest-bootstrap.js';
+import { hashBrowserKey } from '../services/remote-desktop-guest-links.js';
+import {
+  REMOTE_DESKTOP_CONSENT_STATE,
+  REMOTE_DESKTOP_CONSENT_CANCEL_TRIGGER,
+  cancelAttendedConsents,
+  consumeApprovedAttendedConsent,
+  createRemoteDesktopConsentResultConsumer,
+  getAttendedConsent,
+  remoteDesktopConsentCancellation,
+  requestAttendedConsent,
+  type RemoteDesktopConsentDispatchCommand,
+} from '../services/remote-desktop-consent-coordinator.js';
+import {
+  acknowledgeFreshFrame,
+  acknowledgeShield,
+  getPrivacyState,
+  markRecoveryRequired,
+  setRemoteDesktopPendingRouteCancellationDispatcher,
+  type RemoteDesktopManagementPrivacyCommand,
+  type RemoteDesktopPendingRouteCancellationCommand,
+} from '../services/remote-desktop-management-privacy.js';
+import type {
+  RemoteDesktopShellEndpointAuthority,
+  RemoteDesktopShellLaunchContextDispatcher,
+} from '../services/remote-desktop-shell-launch-context.js';
+import { readDatabaseClock } from '../services/remote-desktop-guest-due-worker.js';
 import { isRemoteDesktopFeatureEnabled } from '../../../shared/remote-desktop-feature.js';
 import {
   REMOTE_DESKTOP_INSTALLABLE_CAPABILITY,
@@ -1326,6 +1387,7 @@ function toCapabilityManageJournalFrame(
 
 export class WsBridge {
   private static instances = new Map<string, WsBridge>();
+  private static remoteDesktopReconnectRevalidator: ((serverId: string) => Promise<void>) | null = null;
 
   private daemonWs: WebSocket | null = null;
   /** Bumped on every new daemon connection; binds pending MACHINE_EXEC results to a generation. */
@@ -1349,14 +1411,71 @@ export class WsBridge {
   static invalidMachineExecChunksDropped = 0;
   /** Count of malformed/oversized COMPUTER_USE_RESULT frames rejected before pending-RPC resolution. */
   static invalidComputerUseResultsDropped = 0;
+  /** Count of malformed, reverse-direction, stale or non-owning privacy frames. */
+  static invalidRemoteDesktopPrivacyFramesDropped = 0;
+  /** Count of malformed, stale or non-owning signed-shell lifecycle frames. */
+  static invalidRemoteDesktopShellFramesDropped = 0;
   /** DB-authoritative role of the connected daemon (controlled nodes are a restricted surface). */
   private daemonNodeRole: NodeRole = NODE_ROLE.FULL;
   private authenticated = false;
+  /** Current daemon generation has completed durable route reconciliation. */
+  private remoteDesktopAuthorityReadyGeneration: number | null = null;
   private daemonVersion: string | null = null;
   private daemonControlledOs: ControlledNodeOs | null = null;
   private daemonOwnerUserId: string | null = null;
   private lastCapabilityRevisionSent = 0;
   private capabilitySyncInitialized = false;
+
+  /**
+   * Publish the two authority coordinates a controlled node cannot derive:
+   * its canonical physical-host principal and this Server connection's
+   * generation. Absence is fail closed -- the node may stay online, but it
+   * cannot answer attended-consent requests against a guessed identity.
+   */
+  private async sendRemoteDesktopNodeContext(
+    db: Database,
+    ws: WebSocket,
+    connectionGeneration: number,
+  ): Promise<void> {
+    if (this.daemonNodeRole !== NODE_ROLE.CONTROLLED
+      || this.daemonWs !== ws
+      || this.daemonGeneration !== connectionGeneration
+      || !this.authenticated) return;
+    const sendUnavailable = () => {
+      if (this.daemonWs !== ws
+        || this.daemonGeneration !== connectionGeneration
+        || !this.authenticated) return;
+      ws.send(JSON.stringify({
+        type: REMOTE_DESKTOP_NODE_CONTEXT_MSG.UNAVAILABLE,
+        daemonGeneration: connectionGeneration,
+      }));
+    };
+    try {
+      const row = await db.queryOne<{ host_id: string }>(
+        'SELECT host_id FROM remote_desktop_host_endpoints WHERE server_id = $1',
+        [this.serverId],
+      );
+      const context = row ? validateRemoteDesktopNodeAuthorityContext({
+        type: REMOTE_DESKTOP_NODE_CONTEXT_MSG.CURRENT,
+        hostId: row.host_id,
+        daemonGeneration: connectionGeneration,
+      }) : null;
+      if (!context?.ok) {
+        sendUnavailable();
+        return;
+      }
+      if (this.daemonWs !== ws
+        || this.daemonGeneration !== connectionGeneration
+        || !this.authenticated) return;
+      ws.send(JSON.stringify(context.value));
+    } catch (error) {
+      // Host backfill/migration failure removes consent authority; it must not
+      // take unrelated controlled-node exec/file-transfer liveness down.
+      logger.warn({ error, serverId: this.serverId },
+        'could not publish remote desktop canonical-host context');
+      sendUnavailable();
+    }
+  }
   private legacyUpgradeRescuePreparedGeneration: number | null = null;
   /** A safe-self-upgrade node can still retain its process-local latch when a
    *  detached task fails before replacing the process. Arm the same verified
@@ -1511,6 +1630,7 @@ export class WsBridge {
     // capability, not the node role, is what gates the feature.
     daemonAvailable: () => Boolean(
       this.authenticated
+      && this.remoteDesktopAuthorityReadyGeneration === this.daemonGeneration
       && this.daemonWs?.readyState === WebSocket.OPEN
       && (this.daemonNodeRole === NODE_ROLE.CONTROLLED
         || this.hasDaemonCapability(REMOTE_DESKTOP_CAPABILITY)),
@@ -1524,6 +1644,72 @@ export class WsBridge {
     iceServers: (userId) => createTurnIceServerAuthority(userId),
     sendDaemon: (message, generation) => this.trySendRemoteDesktop(message, generation),
     sendBrowser: (socket, message) => { safeSend(socket, JSON.stringify(message)); },
+    redeemGuestBootstrap: async ({ proof, routeGeneration, now }) => {
+      const db = this.db;
+      if (!db) return null;
+      const redeemed = await redeemBootstrapForRoute({
+        db,
+        proof,
+        redeemingServerId: this.serverId,
+        routeGeneration,
+        now,
+      });
+      if (!redeemed) return null;
+      // Bootstrap storage binds the independent route incarnation.  Runtime
+      // actor authority remains bound to the authenticated daemon channel.
+      return {
+        ...redeemed,
+        actor: { ...redeemed.actor, endpointGeneration: this.daemonGeneration },
+      };
+    },
+    resolveGuestActor: async (actor, now) => {
+      const db = this.db;
+      if (!db) return null;
+      return resolveRedeemedGuestActor({
+        db,
+        previous: actor,
+        serverId: this.serverId,
+        endpointGeneration: this.daemonGeneration,
+        now,
+      });
+    },
+    requestAttendedConsent: (input) => this.requestRemoteDesktopAttendedConsent(input),
+    cancelPendingGuestConsent: async (actor, cause) => {
+      const db = this.db;
+      if (!db || actor.source !== REMOTE_DESKTOP_ACTOR_SOURCE.ATTENDED_LINK) return;
+      const dispatch = (command: RemoteDesktopConsentDispatchCommand) => (
+        this.trySendRemoteDesktopConsent(command)
+      );
+      if (cause === 'privacy_epoch') {
+        await cancelAttendedConsents(db, {
+          selector: { actorAuditId: actor.auditId },
+          reason: REMOTE_DESKTOP_CONSENT_CANCEL_REASON.LOCAL_UI_FAILED,
+          trigger: REMOTE_DESKTOP_CONSENT_CANCEL_TRIGGER.CALLER_CANCEL,
+          dispatch,
+        });
+      } else if (cause === 'authority_revoked') {
+        await remoteDesktopConsentCancellation.linkRevoked(db, actor.auditId, dispatch);
+      } else {
+        await remoteDesktopConsentCancellation.browserDisconnected(
+          db,
+          hashBrowserKey(actor.browserKeyThumbprint),
+          dispatch,
+        );
+      }
+    },
+    cancelHostAttendedConsents: async (hostId) => {
+      const db = this.db;
+      if (!db) return;
+      await remoteDesktopConsentCancellation.localStop(
+        db,
+        hostId,
+        (command) => this.trySendRemoteDesktopConsent(command),
+      );
+    },
+    supportsDefaultShieldedRoute: () => (
+      this.hasDaemonCapability(REMOTE_DESKTOP_CAPTURE_PRIVACY_CAPABILITY)
+      && this.hasDaemonCapability(REMOTE_DESKTOP_DEFAULT_SHIELDED_ROUTE_CAPABILITY)
+    ),
     audit: (event, fields) => {
       incrementCounter('remote_desktop.session_event', { event });
       const db = this.db;
@@ -1644,6 +1830,9 @@ export class WsBridge {
   private ackHousekeepingTimer: ReturnType<typeof setInterval> | null = null;
 
   private constructor(private serverId: string) {
+    setRemoteDesktopPendingRouteCancellationDispatcher(
+      (command) => WsBridge.dispatchRemoteDesktopPendingRouteCancellation(command),
+    );
     // Start periodic cleanup sweep (shared across all bridge instances)
     if (!cleanupSweepHandle) {
       cleanupSweepHandle = setInterval(() => {
@@ -1683,6 +1872,80 @@ export class WsBridge {
 
   static getAll(): Map<string, WsBridge> {
     return WsBridge.instances;
+  }
+
+  static setRemoteDesktopReconnectRevalidator(
+    revalidator: ((serverId: string) => Promise<void>) | null,
+  ): void {
+    WsBridge.remoteDesktopReconnectRevalidator = revalidator;
+  }
+
+  /** Deliver one durable privacy command only through the currently
+   * authenticated, generation-bound daemon channel. It is never queued or
+   * replayed onto a replacement generation. */
+  static dispatchRemoteDesktopManagementPrivacy(
+    command: RemoteDesktopManagementPrivacyCommand,
+  ): boolean {
+    const bridge = WsBridge.instances.get(command.executionServerId);
+    return bridge?.trySendRemoteDesktopManagementPrivacy(
+      command.message,
+      command.daemonGeneration,
+    ) ?? false;
+  }
+
+  /**
+   * Production adapter for one-use signed-shell launch contexts. Resolution
+   * and delivery both re-check the same live, authenticated controlled-node
+   * generation and never queue onto a replacement connection.
+   */
+  static remoteDesktopShellLaunchContextDispatcher(): RemoteDesktopShellLaunchContextDispatcher {
+    return {
+      currentControlledEndpoint: async (input) => {
+        let selected: RemoteDesktopShellEndpointAuthority | null = null;
+        for (const bridge of WsBridge.instances.values()) {
+          const candidate = await bridge.currentRemoteDesktopShellEndpoint(input);
+          if (!candidate) continue;
+          // More than one live controlled endpoint for one canonical host is
+          // ambiguous presentation identity, not a reason to pick the first.
+          if (selected) return null;
+          selected = candidate;
+        }
+        return selected;
+      },
+      dispatch: async (input) => {
+        const bridge = WsBridge.instances.get(input.executionServerId);
+        return bridge?.trySendRemoteDesktopShellLaunchContext(
+          input.ownerUserId,
+          input.hostId,
+          input.context,
+          input.endpointGeneration,
+        ) ?? false;
+      },
+    };
+  }
+
+  static dispatchRemoteDesktopPendingRouteCancellation(
+    command: RemoteDesktopPendingRouteCancellationCommand,
+  ): boolean {
+    const bridge = WsBridge.instances.get(command.executionServerId);
+    if (!bridge) return false;
+    bridge.remoteDesktopRouter.cancelPendingRoutes(command.hostId, command.routes);
+    return true;
+  }
+
+  /** Resolve only an already-created bridge on this pod. Merely observing an
+   * outbox row must never instantiate a fake owner. */
+  static remoteDesktopGuestOutboxTarget(
+    serverId: string,
+  ): RemoteDesktopGuestOutboxExecutionTarget | null {
+    const bridge = WsBridge.instances.get(serverId);
+    if (!bridge) return null;
+    return {
+      isAvailable: () => bridge.isRemoteDesktopGuestOutboxTargetAvailable(),
+      apply: (event, routeId, routeGeneration, authority) => (
+        bridge.applyRemoteDesktopGuestOutboxEffect(event, routeId, routeGeneration, authority)
+      ),
+    };
   }
 
   /** Immediate same-process fan-out; heartbeat revision checks cover other pods. */
@@ -3824,6 +4087,12 @@ export class WsBridge {
       : null;
     // Replace existing daemon connection
     if (this.daemonWs) {
+      const replacedGeneration = this.daemonGeneration;
+      void remoteDesktopConsentCancellation.endpointReplaced(
+        db,
+        this.serverId,
+        replacedGeneration,
+      ).catch(() => {});
       if (this.daemonOwnerUserId) {
         this.failDisconnectedCapabilityOperations(db, this.daemonOwnerUserId);
       }
@@ -3834,11 +4103,18 @@ export class WsBridge {
       try { this.daemonWs.close(1001, 'replaced'); } catch { /* ignore */ }
     }
     this.daemonWs = ws;
+    // A test double or abrupt transport can emit `close` synchronously while
+    // the old socket is being replaced, causing maybeCleanup() to remove this
+    // otherwise live bridge before the assignment above. Re-register the same
+    // object; this never manufactures ownership because the new socket still
+    // has to authenticate and complete durable reconciliation.
+    WsBridge.instances.set(this.serverId, this);
     // New connection generation: abandon any pending exec bound to a prior
     // generation (they resolve as indeterminate) so a reconnect never delivers a
     // stale result to a new waiter (10.6).
     this.daemonGeneration++;
     const connectionGeneration = this.daemonGeneration;
+    this.remoteDesktopAuthorityReadyGeneration = null;
     this.directFileTransferRouter.setDaemonGeneration(connectionGeneration);
     this.remoteDesktopRouter.setDaemonGeneration(connectionGeneration);
     abandonPriorGenerations(this.serverId, this.daemonGeneration);
@@ -4020,6 +4296,31 @@ export class WsBridge {
         this.clearPendingIdlePushes();
         this.activeMainSessions.clear();
         this.hasActiveMainSessionSnapshot = false;
+        try {
+          const recovered = await this.remoteDesktopRouter.reconcileDaemonReplacement(connectionGeneration);
+          // The legacy reconciler closes every process-lost route.  Running it
+          // after a privacy-fenced transparent replacement would immediately
+          // destroy that replacement, so it is used only when no in-memory
+          // route was recovered.  Failed replacements are already terminated
+          // and durably closed by the Router.
+          if (recovered === 0) {
+            await WsBridge.remoteDesktopReconnectRevalidator?.(this.serverId);
+          }
+          if (isCurrentAuthConnection()) {
+            this.remoteDesktopAuthorityReadyGeneration = connectionGeneration;
+          }
+        } catch (error) {
+          // Keep the daemon available for unrelated services, but fail closed
+          // for remote desktop until a later reconnect can reconcile durable
+          // authority. Do not replay process-local remote authority.
+          logger.warn({ error, serverId: this.serverId },
+            'Remote desktop reconnect authority reconciliation failed');
+        }
+        await this.sendRemoteDesktopNodeContext(db, ws, connectionGeneration);
+        if (!isCurrentAuthConnection()) {
+          finishLocalAuth();
+          return;
+        }
         logger.info({ serverId: this.serverId, daemonVersion: this.daemonVersion }, 'Daemon authenticated');
         onAuthenticated?.();
 
@@ -4196,6 +4497,52 @@ export class WsBridge {
         return;
       }
 
+      // Local-consent results/cancels are endpoint/generation bound and are
+      // never relayed to browsers. Request is Server→node only.
+      if (typeof msg.type === 'string' && msg.type.startsWith('remote_desktop.consent.')) {
+        const parsed = validateRemoteDesktopConsentMessage(msg);
+        if (parsed.ok
+          && (parsed.value.type === REMOTE_DESKTOP_CONSENT_MSG.RESULT
+            || parsed.value.type === REMOTE_DESKTOP_CONSENT_MSG.CANCEL)
+          && this.db && this.authenticated
+          && this.daemonGeneration === connectionGeneration
+          && this.remoteDesktopAuthorityReadyGeneration === connectionGeneration
+          && this.hasDaemonCapability(REMOTE_DESKTOP_LOCAL_CONSENT_CAPABILITY)) {
+          await createRemoteDesktopConsentResultConsumer(this.db)({
+            executionServerId: this.serverId,
+            daemonGeneration: connectionGeneration,
+            message: parsed.value,
+          }).catch(() => false);
+        }
+        return;
+      }
+
+      // A shell may only report fail-closed recovery state in this direction.
+      // Launch is Server→node only; malformed/reversed frames are consumed and
+      // never reach browsers or the generic CONTROLLED-node allowlist.
+      if (msg.type === REMOTE_DESKTOP_SHELL_MSG.LAUNCH
+        || msg.type === REMOTE_DESKTOP_SHELL_MSG.RECOVERY_REQUIRED) {
+        if (msg.type === REMOTE_DESKTOP_SHELL_MSG.RECOVERY_REQUIRED) {
+          await this.handleRemoteDesktopShellRecoveryRequired(msg, connectionGeneration);
+        } else {
+          WsBridge.invalidRemoteDesktopShellFramesDropped += 1;
+        }
+        return;
+      }
+
+      // Privacy ACK is a Server-only control response. Consume the entire
+      // exact type before the ordinary remote-desktop namespace/CONTROLLED
+      // allowlist so malformed or stale acknowledgements cannot fall through
+      // to browser relay.
+      if (typeof msg.type === 'string' && msg.type.startsWith('management_privacy.')) {
+        if (msg.type === REMOTE_DESKTOP_PRIVACY_MSG.ACK) {
+          await this.handleRemoteDesktopManagementPrivacyAck(msg, connectionGeneration);
+        } else {
+          WsBridge.invalidRemoteDesktopPrivacyFramesDropped += 1;
+        }
+        return;
+      }
+
       // Remote desktop is the only continuous CONTROLLED-node extension and is
       // admitted through its exact validator/session/generation registry before
       // the legacy allowlist. The router consumes the entire namespace, including
@@ -4289,6 +4636,7 @@ export class WsBridge {
             logger.error({ err }, 'Failed to update heartbeat'),
           );
           try { ws.send(JSON.stringify({ type: 'heartbeat_ack' })); } catch { /* ignore */ }
+          void this.sendRemoteDesktopNodeContext(db, ws, connectionGeneration);
           return;
         }
         WsBridge.controlledInboundDropped++;
@@ -4455,7 +4803,12 @@ export class WsBridge {
           this.failDisconnectedCapabilityOperations(db, disconnectedOwnerUserId);
         }
         this.resetLegacyUpgradeRescueForGeneration(this.daemonGeneration);
-        this.remoteDesktopRouter.stopAll(REMOTE_DESKTOP_TERMINAL_REASON.DAEMON_REPLACED);
+        void remoteDesktopConsentCancellation.daemonDisconnected(
+          db,
+          this.serverId,
+          connectionGeneration,
+        ).catch(() => {});
+        this.remoteDesktopRouter.suspendDaemonGeneration(connectionGeneration);
         this.openspecAutoDeliverProjectionCache.clearActive();
         this.broadcastToBrowsers(JSON.stringify({ type: DAEMON_MSG.DISCONNECTED }));
         void clearProviderStatus(db, this.serverId).catch(() => {});
@@ -4574,6 +4927,89 @@ export class WsBridge {
     reason: RemoteDesktopTerminalReason = REMOTE_DESKTOP_TERMINAL_REASON.INTERNAL_ERROR,
   ): void {
     this.remoteDesktopRouter.stopAll(reason);
+  }
+
+  /**
+   * Anonymous remote-desktop signaling socket. It has no browser/session
+   * subscriptions and cannot reach any ordinary bridge command. The sole
+   * bounded first frame is the shared bootstrap proof; only after atomic
+   * redemption can standard remote-desktop signaling enter the Router.
+   */
+  handleGuestRemoteDesktopConnection(ws: WebSocket, db: Database): void {
+    this.db = db;
+    let state: 'quarantined' | 'verifying' | 'admitted' | 'closed' = 'quarantined';
+    let receivedFirstFrame = false;
+    let inbound = Promise.resolve();
+    let quarantineTimer: ReturnType<typeof setTimeout> | null = null;
+    const closeUniformly = () => {
+      if (state === 'closed') return;
+      state = 'closed';
+      if (quarantineTimer) clearTimeout(quarantineTimer);
+      quarantineTimer = null;
+      this.remoteDesktopRouter.dropSocket(ws);
+      try { ws.close(1008, 'unavailable'); } catch { /* socket already gone */ }
+    };
+    quarantineTimer = setTimeout(
+      closeUniformly,
+      REMOTE_DESKTOP_LINK_LIMITS.BOOTSTRAP_TTL_MS,
+    );
+    quarantineTimer.unref?.();
+    const handleMessage = async (data: RawData) => {
+      const raw = (data as Buffer).toString();
+      if (state === 'closed') return;
+      if (state === 'quarantined') {
+        if (Buffer.byteLength(raw, 'utf8') > 1024) {
+          closeUniformly();
+          return;
+        }
+        let value: unknown;
+        try { value = JSON.parse(raw); } catch { closeUniformly(); return; }
+        const proof = validateRemoteDesktopBootstrapProof(value);
+        if (!proof.ok) { closeUniformly(); return; }
+        state = 'verifying';
+        const admitted = await this.remoteDesktopRouter.redeemGuestBootstrap(ws, proof.value);
+        if (!admitted || (state as string) === 'closed') {
+          this.remoteDesktopRouter.dropSocket(ws);
+          closeUniformly();
+          return;
+        }
+        state = 'admitted';
+        if (quarantineTimer) clearTimeout(quarantineTimer);
+        quarantineTimer = null;
+        if (!safeSend(ws, JSON.stringify({ type: REMOTE_DESKTOP_MSG.BOOTSTRAP_REDEEMED }))) {
+          closeUniformly();
+        }
+        return;
+      }
+      if (state !== 'admitted' || Buffer.byteLength(raw, 'utf8') > SERVER_WS_MAX_PAYLOAD_BYTES) {
+        closeUniformly();
+        return;
+      }
+      let message: unknown;
+      try { message = JSON.parse(raw); } catch { closeUniformly(); return; }
+      const handled = await this.remoteDesktopRouter.handleGuestBrowser(ws, message);
+      if (!handled) closeUniformly();
+    };
+    ws.on('message', (data) => {
+      // The bootstrap proof is the sole frame permitted before atomic
+      // redemption. Record first-frame receipt synchronously: a same-tick
+      // second frame must close even before the async verifier advances state.
+      if (!receivedFirstFrame) {
+        receivedFirstFrame = true;
+      } else if (state !== 'admitted') {
+        closeUniformly();
+        return;
+      }
+      // Once admitted, preserve signaling order across async Router handlers.
+      inbound = inbound.then(() => handleMessage(data)).catch(closeUniformly);
+    });
+    ws.once('close', () => {
+      state = 'closed';
+      if (quarantineTimer) clearTimeout(quarantineTimer);
+      quarantineTimer = null;
+      this.remoteDesktopRouter.dropSocket(ws);
+    });
+    ws.once('error', closeUniformly);
   }
 
   async revalidateShareSocketsForTarget(target: ShareTarget): Promise<void> {
@@ -8403,6 +8839,13 @@ export class WsBridge {
   /** Force-close the daemon WebSocket. Use after token rotation to evict the stale connection. */
   kickDaemon(): void {
     if (this.daemonWs) {
+      if (this.db) {
+        void remoteDesktopConsentCancellation.daemonDisconnected(
+          this.db,
+          this.serverId,
+          this.daemonGeneration,
+        ).catch(() => {});
+      }
       if (this.db && this.daemonOwnerUserId) {
         this.failDisconnectedCapabilityOperations(this.db, this.daemonOwnerUserId);
       }
@@ -8518,6 +8961,256 @@ export class WsBridge {
     }
   }
 
+  private trySendRemoteDesktopConsent(command: RemoteDesktopConsentDispatchCommand): boolean {
+    const parsed = validateRemoteDesktopConsentMessage(command.message);
+    if (!parsed.ok || parsed.value.type === REMOTE_DESKTOP_CONSENT_MSG.RESULT) return false;
+    if (command.executionServerId !== this.serverId
+      || command.daemonGeneration !== this.daemonGeneration
+      || !this.daemonWs || !this.authenticated || this.daemonWs.readyState !== WebSocket.OPEN
+      || this.remoteDesktopAuthorityReadyGeneration !== this.daemonGeneration
+      || !this.hasDaemonCapability(REMOTE_DESKTOP_LOCAL_CONSENT_CAPABILITY)) return false;
+    try {
+      this.daemonWs.send(JSON.stringify(parsed.value));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private async requestRemoteDesktopAttendedConsent(input: {
+    actor: RemoteDesktopActor;
+    sessionId: string;
+    routeGeneration: number;
+    daemonGeneration: number;
+    mode: RemoteDesktopAccessMode;
+  }): Promise<'approved' | 'denied' | 'timeout' | 'cancelled' | 'unavailable'> {
+    const db = this.db;
+    if (!db || input.actor.source !== REMOTE_DESKTOP_ACTOR_SOURCE.ATTENDED_LINK
+      || input.daemonGeneration !== this.daemonGeneration
+      || input.actor.endpointGeneration !== input.daemonGeneration) return 'unavailable';
+    const now = await readDatabaseClock(db);
+    const deadlineAt = now + REMOTE_DESKTOP_LINK_LIMITS.CONSENT_DEADLINE_MS;
+    const localWaitUntil = Date.now() + REMOTE_DESKTOP_LINK_LIMITS.CONSENT_DEADLINE_MS;
+    const consent = await requestAttendedConsent(db, {
+      hostId: input.actor.hostId,
+      actorAuditId: input.actor.auditId,
+      browserKeyHash: hashBrowserKey(input.actor.browserKeyThumbprint),
+      executionServerId: this.serverId,
+      endpointGeneration: input.actor.endpointGeneration,
+      daemonGeneration: input.daemonGeneration,
+      mode: input.mode,
+      requesterLabel: 'Remote guest',
+      deadlineAt,
+    }, { dispatch: (command) => this.trySendRemoteDesktopConsent(command) }).catch(() => null);
+    if (!consent) return 'unavailable';
+
+    while (Date.now() < localWaitUntil) {
+      const current = await getAttendedConsent(db, consent.approvalId).catch(() => null);
+      if (!current) return 'unavailable';
+      if (current.state === REMOTE_DESKTOP_CONSENT_STATE.DENIED) return 'denied';
+      if (current.state === REMOTE_DESKTOP_CONSENT_STATE.CANCELLED) return 'cancelled';
+      if (current.state === REMOTE_DESKTOP_CONSENT_STATE.TIMED_OUT) return 'timeout';
+      if (current.state === REMOTE_DESKTOP_CONSENT_STATE.APPROVED) {
+        return consumeApprovedAttendedConsent(db, {
+          approvalId: current.approvalId,
+          hostId: input.actor.hostId,
+          actorAuditId: input.actor.auditId,
+          browserKeyHash: hashBrowserKey(input.actor.browserKeyThumbprint),
+          executionServerId: this.serverId,
+          endpointGeneration: input.actor.endpointGeneration,
+          daemonGeneration: input.daemonGeneration,
+          mode: input.mode,
+          sessionId: input.sessionId,
+        }).then(() => 'approved' as const, () => 'unavailable' as const);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      if (this.daemonGeneration !== input.daemonGeneration || !this.authenticated) return 'cancelled';
+    }
+    return 'timeout';
+  }
+
+  private async currentRemoteDesktopShellEndpoint(input: {
+    ownerUserId: string;
+    hostId: string;
+  }): Promise<RemoteDesktopShellEndpointAuthority | null> {
+    const db = this.db;
+    const socket = this.daemonWs;
+    const generation = this.daemonGeneration;
+    if (!db || !socket || socket.readyState !== WebSocket.OPEN
+      || !this.authenticated
+      || this.daemonNodeRole !== NODE_ROLE.CONTROLLED
+      || this.daemonOwnerUserId !== input.ownerUserId
+      || this.remoteDesktopAuthorityReadyGeneration !== generation
+      || !this.hasDaemonCapability(REMOTE_DESKTOP_SIGNED_SHELL_CAPABILITY)) return null;
+    const mapping = await db.queryOne<{ server_id: string }>(
+      `SELECT server_id
+         FROM remote_desktop_host_endpoints
+        WHERE server_id = $1 AND host_id = $2 AND owner_user_id = $3
+          AND endpoint_role = 'controlled'`,
+      [this.serverId, input.hostId, input.ownerUserId],
+    );
+    if (!mapping
+      || this.daemonWs !== socket
+      || this.daemonGeneration !== generation
+      || !this.authenticated
+      || this.remoteDesktopAuthorityReadyGeneration !== generation
+      || !this.hasDaemonCapability(REMOTE_DESKTOP_SIGNED_SHELL_CAPABILITY)) return null;
+    return { serverId: this.serverId, endpointGeneration: generation };
+  }
+
+  private async trySendRemoteDesktopShellLaunchContext(
+    ownerUserId: string,
+    hostId: string,
+    context: RemoteDesktopShellLaunchContext,
+    expectedGeneration: number,
+  ): Promise<boolean> {
+    const parsed = validateRemoteDesktopShellMessage({
+      type: REMOTE_DESKTOP_SHELL_MSG.LAUNCH,
+      context,
+    });
+    if (!parsed.ok || parsed.value.type !== REMOTE_DESKTOP_SHELL_MSG.LAUNCH
+      || parsed.value.context.hostId !== hostId
+      || parsed.value.context.endpointGeneration !== expectedGeneration) return false;
+    const endpoint = await this.currentRemoteDesktopShellEndpoint({ ownerUserId, hostId });
+    if (!endpoint || endpoint.endpointGeneration !== expectedGeneration) return false;
+    const socket = this.daemonWs;
+    if (!socket || socket.readyState !== WebSocket.OPEN) return false;
+    try {
+      socket.send(JSON.stringify(parsed.value));
+      return this.daemonWs === socket
+        && this.daemonGeneration === expectedGeneration
+        && this.authenticated;
+    } catch {
+      incrementCounter('remote_desktop.shell_launch_send_failed');
+      return false;
+    }
+  }
+
+  /** Management privacy uses the authenticated node socket and no secondary
+   * nonce. Exact shared validation plus capability/generation checks prevent
+   * an account/session secret or a stale command entering the node channel. */
+  private trySendRemoteDesktopManagementPrivacy(
+    message: RemoteDesktopPrivacyBegin | RemoteDesktopPrivacyEnd,
+    expectedGeneration: number,
+  ): boolean {
+    const parsed = validateRemoteDesktopPrivacyMessage(message);
+    if (!parsed.ok || parsed.value.type === REMOTE_DESKTOP_PRIVACY_MSG.ACK) return false;
+    if (!this.daemonWs || !this.authenticated || this.daemonWs.readyState !== WebSocket.OPEN) return false;
+    if (this.daemonGeneration !== expectedGeneration
+      || !this.hasDaemonCapability(REMOTE_DESKTOP_CAPTURE_PRIVACY_CAPABILITY)) return false;
+    try {
+      this.daemonWs.send(JSON.stringify(parsed.value));
+      return true;
+    } catch {
+      incrementCounter('remote_desktop.privacy_send_failed', { type: parsed.value.type });
+      return false;
+    }
+  }
+
+  private async handleRemoteDesktopManagementPrivacyAck(
+    message: Record<string, unknown>,
+    connectionGeneration: number,
+  ): Promise<void> {
+    const reject = () => { WsBridge.invalidRemoteDesktopPrivacyFramesDropped += 1; };
+    const parsed = validateRemoteDesktopPrivacyMessage(message);
+    const db = this.db;
+    if (!parsed.ok
+      || parsed.value.type !== REMOTE_DESKTOP_PRIVACY_MSG.ACK
+      || !db
+      || !this.authenticated
+      || this.daemonGeneration !== connectionGeneration
+      || !this.hasDaemonCapability(REMOTE_DESKTOP_CAPTURE_PRIVACY_CAPABILITY)) {
+      reject();
+      return;
+    }
+
+    try {
+      const ack = parsed.value;
+      const state = await getPrivacyState(db, ack.hostId);
+      if (!state
+        || state.epochId !== ack.epochId
+        || state.revision !== ack.revision
+        || state.executionServerId !== this.serverId
+        || state.daemonGeneration !== connectionGeneration) {
+        reject();
+        return;
+      }
+      const now = await readDatabaseClock(db);
+      if (state.phase === REMOTE_DESKTOP_PRIVACY_PHASE.STARTING) {
+        await acknowledgeShield(db, {
+          hostId: ack.hostId,
+          epochId: ack.epochId,
+          revision: ack.revision,
+          executionServerId: this.serverId,
+          daemonGeneration: connectionGeneration,
+          workerGeneration: ack.workerGeneration,
+          acknowledgedRoutes: ack.routes,
+          now,
+        });
+        return;
+      }
+      if (state.phase === REMOTE_DESKTOP_PRIVACY_PHASE.ENDING) {
+        await acknowledgeFreshFrame(db, {
+          hostId: ack.hostId,
+          epochId: ack.epochId,
+          revision: ack.revision,
+          executionServerId: this.serverId,
+          daemonGeneration: connectionGeneration,
+          freshFrameGeneration: ack.workerGeneration,
+          acknowledgedRoutes: ack.routes,
+          now,
+        });
+        return;
+      }
+      reject();
+    } catch {
+      // All mismatches remain fail closed in durable state. ACK payloads are
+      // intentionally not logged because route IDs are unnecessary here.
+      reject();
+    }
+  }
+
+  private async handleRemoteDesktopShellRecoveryRequired(
+    message: Record<string, unknown>,
+    connectionGeneration: number,
+  ): Promise<void> {
+    const reject = () => { WsBridge.invalidRemoteDesktopShellFramesDropped += 1; };
+    const parsed = validateRemoteDesktopShellMessage(message);
+    const db = this.db;
+    if (!parsed.ok
+      || parsed.value.type !== REMOTE_DESKTOP_SHELL_MSG.RECOVERY_REQUIRED
+      || !db
+      || !this.authenticated
+      || this.daemonNodeRole !== NODE_ROLE.CONTROLLED
+      || this.daemonGeneration !== connectionGeneration
+      || this.remoteDesktopAuthorityReadyGeneration !== connectionGeneration
+      || parsed.value.endpointGeneration !== connectionGeneration
+      || !this.hasDaemonCapability(REMOTE_DESKTOP_SIGNED_SHELL_CAPABILITY)) {
+      reject();
+      return;
+    }
+    try {
+      const state = await getPrivacyState(db, parsed.value.hostId);
+      if (!state
+        || state.epochId !== parsed.value.epochId
+        || state.executionServerId !== this.serverId
+        || state.daemonGeneration !== connectionGeneration) {
+        reject();
+        return;
+      }
+      await markRecoveryRequired(db, {
+        hostId: parsed.value.hostId,
+        epochId: parsed.value.epochId,
+        reason: parsed.value.reason,
+        now: await readDatabaseClock(db),
+      });
+    } catch {
+      // Durable state remains closed on every failure. The payload is never
+      // logged because it is unnecessary for recovery and may contain IDs.
+      reject();
+    }
+  }
+
   sendToDaemon(message: string): void {
     const parsed = this.parseJsonObject(message);
     const parsedType = parsed?.type;
@@ -8548,6 +9241,7 @@ export class WsBridge {
       || parsedType === MACHINE_DIRECT_FILE_TRANSFER_MSG.REQUEST
       || parsedType === MACHINE_DIRECT_FILE_TRANSFER_MSG.FETCH_REQUEST
       || (typeof parsedType === 'string' && parsedType.startsWith('remote_desktop.'))
+      || (typeof parsedType === 'string' && parsedType.startsWith('management_privacy.'))
     ) {
       logger.warn({ serverId: this.serverId, type: parsedType }, 'Dropped control command sent via generic sendToDaemon');
       return;
@@ -8873,6 +9567,23 @@ export class WsBridge {
   /** Returns true if the daemon WebSocket is connected and authenticated. */
   isDaemonConnected(): boolean {
     return !!(this.daemonWs && this.authenticated);
+  }
+
+  private isRemoteDesktopGuestOutboxTargetAvailable(): boolean {
+    return this.authenticated
+      && this.remoteDesktopAuthorityReadyGeneration === this.daemonGeneration
+      && this.daemonWs?.readyState === WebSocket.OPEN
+      && this.hasDaemonCapability(REMOTE_DESKTOP_CAPABILITY);
+  }
+
+  private applyRemoteDesktopGuestOutboxEffect(
+    event: RemoteDesktopOutboxEvent,
+    routeId: string,
+    routeGeneration: number,
+    authority: RemoteDesktopGuestOutboxAuthorityMatch,
+  ): RemoteDesktopGuestDeliveryResult {
+    if (!this.isRemoteDesktopGuestOutboxTargetAvailable()) return { status: 'not_owner' };
+    return this.remoteDesktopRouter.applyGuestOutboxEffect(event, routeId, routeGeneration, authority);
   }
 
   /**

@@ -141,7 +141,33 @@ class DxgiDesktopSource : public webrtc::VideoTrackSource {
     return protected_content_masked_.load();
   }
 
+  /**
+   * Management-privacy shield. While engaged, BroadcastFrame() substitutes a
+   * locally generated opaque frame for every captured one, so no real desktop
+   * pixel can reach any route while the owner types a secret.
+   *
+   * The gate lives at the single broadcast chokepoint rather than at each
+   * capture path: DXGI, the GDI fallback and any future source all funnel
+   * through BroadcastFrame(), so a new capture path cannot forget to honour it.
+   *
+   * `shield_generation()` advances on every broadcast, shielded or not. END is
+   * only allowed to restore once a generation captured strictly AFTER secret
+   * cleanup has been broadcast, which a cached pre-end frame cannot satisfy.
+   */
+  void EngagePrivacyShield();
+  void ReleasePrivacyShield();
+  bool privacy_shielded() const { return privacy_shielded_.load(); }
+  uint64_t shield_generation() const { return shield_generation_.load(); }
+
   bool is_screencast() const override { return true; }
+
+ private:
+  std::atomic<bool> privacy_shielded_{false};
+  std::atomic<uint64_t> shield_generation_{0};
+  /** Reused opaque buffer; allocated once so shielding cannot fail on memory. */
+  webrtc::scoped_refptr<webrtc::I420Buffer> privacy_buffer_;
+
+ public:
 
  protected:
   DxgiDesktopSource(DisplayInfo display, CaptureFallback fallback);
@@ -158,6 +184,7 @@ class DxgiDesktopSource : public webrtc::VideoTrackSource {
       CaptureWaitPolicy wait_policy = CaptureWaitPolicy::kReuseLastFrame);
   bool CaptureDesktopGdi();
   bool BroadcastStagingFrame();
+  webrtc::scoped_refptr<webrtc::I420Buffer> PrivacyFrame(int width, int height);
   bool BindCaptureThreadToRequestedDesktop();
   bool BroadcastBgraFrame(int width, int height);
   void BroadcastFrame(

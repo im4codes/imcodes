@@ -1,0 +1,35 @@
+.remote-desktop-access { display:grid; gap:12px; padding:14px; color:#dbeafe; overflow:auto; max-height:100%; background:#08111f; }
+.remote-desktop-access > header { display:flex; align-items:flex-start; justify-content:space-between; gap:12px; }
+.remote-desktop-access h2,.remote-desktop-access h3,.remote-desktop-access h4,.remote-desktop-access p { margin:0; }
+.remote-desktop-access header p,.remote-desktop-access-card p { color:#94a3b8; font-size:12px; margin-top:4px; }
+.remote-desktop-access-card { display:grid; gap:10px; padding:13px; border:1px solid #23354d; border-radius:12px; background:#0d1726; }
+.remote-desktop-access-card output { font-size:24px; letter-spacing:.12em; font-variant-numeric:tabular-nums; }
+.remote-desktop-access label { display:grid; gap:5px; font-size:12px; color:#a5b4c7; }
+.remote-desktop-access input,.remote-desktop-access select { min-width:0; padding:9px 10px; color:#e5f6ff; background:#07101d; border:1px solid #334a68; border-radius:8px; }
+.remote-desktop-access button { min-height:36px; padding:7px 11px; color:#dffcff; background:#15314a; border:1px solid #2a6175; border-radius:8px; cursor:pointer; }
+.remote-desktop-access button:focus-visible,.remote-desktop-access input:focus-visible,.remote-desktop-access select:focus-visible { outline:2px solid #22d3ee; outline-offset:2px; }
+.remote-desktop-access button:disabled { opacity:.48; cursor:not-allowed; }
+.remote-desktop-access button.danger { border-color:#7f1d1d; color:#fecaca; background:#35151b; }
+.remote-desktop-access-grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:9px; }
+.remote-desktop-access-actions { display:flex; flex-wrap:wrap; gap:8px; }
+.remote-desktop-access-inline-edit { display:grid; gap:8px; padding:10px; border-radius:9px; background:#081320; }
+.remote-desktop-access-alert { padding:10px; border:1px solid #b45309; border-radius:8px; background:#3a240b; color:#fde68a; }
+.remote-desktop-secret-once { display:grid; gap:10px; padding:12px; border:2px solid #22d3ee; border-radius:10px; background:#071827; }
+.remote-desktop-link-list { display:grid; gap:8px; margin:0; padding:0; list-style:none; }
+.remote-desktop-link-list li { display:grid; gap:8px; padding:10px; border:1px solid #23354d; border-radius:9px; }
+.remote-desktop-link-list li > div { display:flex; flex-wrap:wrap; justify-content:space-between; gap:8px; }
+.remote-desktop-link-list span { color:#94a3b8; font-size:12px; }
+@media(max-width:720px){.remote-desktop-access{padding:10px}.remote-desktop-access-grid{grid-template-columns:1fr}.remote-desktop-access-card output{font-size:20px}.remote-desktop-access-actions button{flex:1 1 auto}}
+.remote-desktop-guest { min-height:100dvh; display:grid; place-items:center; padding:max(18px,var(--sat,0px)) 18px max(18px,var(--sab,0px)); color:#dbeafe; background:radial-gradient(circle at 50% 0,#13304a 0,#07101d 52%,#050b14 100%); }
+.remote-desktop-guest-card { width:min(100%,960px); display:grid; gap:14px; padding:22px; border:1px solid #27415d; border-radius:16px; background:rgba(9,20,35,.96); box-shadow:0 24px 70px #0008; }
+.remote-desktop-guest-card>img { width:64px; height:64px; justify-self:center; }
+.remote-desktop-guest-card h1,.remote-desktop-guest-card p { margin:0; text-align:center; }
+.remote-desktop-guest-card>p { color:#94a3b8; }
+.remote-desktop-guest-card form { display:grid; gap:12px; }
+.remote-desktop-guest-card label { display:grid; gap:6px; color:#a5b4c7; font-size:13px; }
+.remote-desktop-guest-card input { padding:11px 12px; color:#effcff; background:#050c16; border:1px solid #34516f; border-radius:9px; font-size:16px; }
+.remote-desktop-guest-card button { min-height:42px; padding:9px 12px; border:1px solid #2b7385; border-radius:9px; color:#e6feff; background:#12435a; }
+.remote-desktop-guest-card :focus-visible { outline:2px solid #22d3ee; outline-offset:3px; }
+.remote-desktop-guest-state { display:grid; gap:10px; padding:14px; text-align:center; border:1px solid #28506d; border-radius:10px; background:#0a1a2b; }
+.remote-desktop-guest-video { width:100%; min-height:220px; max-height:70dvh; object-fit:contain; border:1px solid #28506d; border-radius:10px; background:#02050a; }
+.remote-desktop-guest-boundary { font-size:12px; }

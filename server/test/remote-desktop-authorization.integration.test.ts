@@ -6,6 +6,7 @@ import { NODE_ROLE } from '../../shared/remote-exec.js';
 import { createDatabase, type Database } from '../src/db/client.js';
 import { runMigrations } from '../src/db/migrate.js';
 import { createUser } from '../src/db/queries.js';
+import { ensureCanonicalHostForServer } from '../src/services/remote-desktop-host-identity.js';
 import { createOrUpdateShare } from '../src/db/tab-sharing.js';
 import { RemoteDesktopRouter } from '../src/ws/remote-desktop-router.js';
 
@@ -39,6 +40,7 @@ async function createControlledNode(ownerId: string): Promise<string> {
       JSON.stringify([REMOTE_DESKTOP_CAPABILITY]),
     ],
   );
+  await ensureCanonicalHostForServer({ db, serverId, now: Date.now() });
   return serverId;
 }
 

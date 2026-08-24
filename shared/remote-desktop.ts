@@ -3,6 +3,13 @@ import {
   isDirectFileTransferIceServerConfig,
   type DirectFileTransferIceServerConfig,
 } from './direct-file-transfer.js';
+import {
+  hasExactRemoteDesktopKeys,
+  isBoundedRemoteDesktopString,
+  isRemoteDesktopId,
+  isRemoteDesktopRecord,
+  isSafeNonNegativeRemoteDesktopInteger,
+} from './remote-desktop-contract-primitives.js';
 
 export const REMOTE_DESKTOP_CAPABILITY = 'remote.desktop.windows.h264.v2' as const;
 export const REMOTE_DESKTOP_PROTOCOL_VERSION = 2 as const;
@@ -28,6 +35,7 @@ export const REMOTE_DESKTOP_STATE = {
 export type RemoteDesktopState = typeof REMOTE_DESKTOP_STATE[keyof typeof REMOTE_DESKTOP_STATE];
 
 export const REMOTE_DESKTOP_MSG = {
+  BOOTSTRAP_REDEEMED: 'remote_desktop.bootstrap_redeemed',
   START: 'remote_desktop.start',
   AUTHORIZED: 'remote_desktop.authorized',
   PREPARE: 'remote_desktop.prepare',
@@ -101,6 +109,7 @@ export const REMOTE_DESKTOP_ERROR = {
   AUTHORITY_EXPIRED: 'authority_expired',
   CAPABILITY_UNAVAILABLE: 'capability_unavailable',
   ACCESS_DENIED: 'access_denied',
+  CONSENT_CANCELLED: 'consent_cancelled',
   EXECUTION_DISABLED: 'execution_disabled',
   DAEMON_OFFLINE: 'daemon_offline',
   UNSUPPORTED_PLATFORM: 'unsupported_platform',
@@ -387,6 +396,13 @@ export interface RemoteDesktopStart {
   reconnectAttempt?: number;
 }
 
+/** Server acknowledgement that the anonymous socket's sole bootstrap frame
+ * was atomically redeemed. The browser MUST wait for this content-free frame
+ * before sending START or any other signaling message. */
+export interface RemoteDesktopBootstrapRedeemed {
+  type: typeof REMOTE_DESKTOP_MSG.BOOTSTRAP_REDEEMED;
+}
+
 export interface RemoteDesktopAuthority {
   requestId: string;
   sessionId: string;
@@ -405,6 +421,20 @@ export interface RemoteDesktopAuthorized extends RemoteDesktopAuthority {
 
 export interface RemoteDesktopPrepare extends RemoteDesktopAuthority {
   type: typeof REMOTE_DESKTOP_MSG.PREPARE;
+  /**
+   * Independent route incarnation fence. This is deliberately not the daemon
+   * generation: one authenticated daemon connection may replace a WebRTC
+   * route while a management-privacy epoch is active, and the replacement
+   * must join that epoch as a distinct route generation before it can expose
+   * captured pixels.
+   */
+  /**
+   * Required when the selected adapter advertises capture-privacy support.
+   * It remains optional on the v2 base wire solely so a new Server can keep
+   * legacy authenticated access working for old nodes that cannot expose the
+   * controlled-computer management surface.
+   */
+  routeGeneration?: number;
   reconnectAttempt?: number;
 }
 
@@ -436,8 +466,21 @@ export interface RemoteDesktopLease {
   capability: string;
   leaseExpiresAt: number;
   daemonGeneration: number;
+  /** Must remain equal to PREPARE when capture-privacy is advertised. */
+  routeGeneration?: number;
   mode: RemoteDesktopAccessMode;
   inputEpoch: number;
+}
+
+/**
+ * Qualification fence for the capture-privacy adapter. Legacy authenticated
+ * v2 routes may omit the field, but such a route is never eligible to join or
+ * acknowledge a management-privacy epoch.
+ */
+export function hasRemoteDesktopIndependentRouteGeneration(
+  value: { routeGeneration?: unknown },
+): value is { routeGeneration: number } {
+  return isSafeNonNegativeRemoteDesktopInteger(value.routeGeneration);
 }
 
 export interface RemoteDesktopModeSet {
@@ -642,7 +685,7 @@ export interface RemoteDesktopReleaseAll extends RemoteDesktopInputBase {
 export type RemoteDesktopBrowserMessage = RemoteDesktopStart | RemoteDesktopOffer | RemoteDesktopIce | RemoteDesktopModeSet | RemoteDesktopCancel | RemoteDesktopStop;
 export type RemoteDesktopDaemonCommand = RemoteDesktopPrepare | RemoteDesktopOffer | RemoteDesktopIce | RemoteDesktopLease | RemoteDesktopModeState | RemoteDesktopCancel | RemoteDesktopStop;
 export type RemoteDesktopDaemonMessage = RemoteDesktopAnswer | RemoteDesktopIce | RemoteDesktopModeState | RemoteDesktopStatus | RemoteDesktopRenegotiate | RemoteDesktopTerminal;
-export type RemoteDesktopServerMessage = RemoteDesktopAuthorized | RemoteDesktopAnswer | RemoteDesktopIce | RemoteDesktopModeState | RemoteDesktopStatus | RemoteDesktopRenegotiate | RemoteDesktopTerminal | RemoteDesktopError;
+export type RemoteDesktopServerMessage = RemoteDesktopBootstrapRedeemed | RemoteDesktopAuthorized | RemoteDesktopAnswer | RemoteDesktopIce | RemoteDesktopModeState | RemoteDesktopStatus | RemoteDesktopRenegotiate | RemoteDesktopTerminal | RemoteDesktopError;
 export type RemoteDesktopDataMessage = RemoteDesktopDisplayTopology | RemoteDesktopQuality | RemoteDesktopClipboard | RemoteDesktopPointer | RemoteDesktopKeyboard | RemoteDesktopControl | RemoteDesktopReleaseAll | RemoteDesktopControlRejected;
 
 export type RemoteDesktopValidationResult<T> = { ok: true; value: T } | { ok: false; error: typeof REMOTE_DESKTOP_ERROR.INVALID_REQUEST };
@@ -694,7 +737,6 @@ export interface RemoteDesktopVideoPointMapping {
   videoHeight: number;
 }
 
-const ID_RE = /^[A-Za-z0-9_-]{16,128}$/;
 const CAPABILITY_RE = /^[A-Za-z0-9_-]{43}$/;
 const STATES = new Set<string>(Object.values(REMOTE_DESKTOP_STATE));
 const ROUTES = new Set<string>(Object.values(REMOTE_DESKTOP_ROUTE));
@@ -715,35 +757,18 @@ function invalid<T>(): RemoteDesktopValidationResult<T> {
   return { ok: false, error: REMOTE_DESKTOP_ERROR.INVALID_REQUEST };
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === 'object' && !Array.isArray(value);
-}
-
-function hasExactKeys(value: Record<string, unknown>, required: readonly string[], optional: readonly string[] = []): boolean {
-  const allowed = new Set([...required, ...optional]);
-  return required.every((key) => Object.prototype.hasOwnProperty.call(value, key))
-    && Object.keys(value).every((key) => allowed.has(key));
-}
-
-function utf8Bytes(value: string): number {
-  return new TextEncoder().encode(value).byteLength;
-}
-
-function isBoundedString(value: unknown, maxBytes: number): value is string {
-  return typeof value === 'string' && value.length > 0 && utf8Bytes(value) <= maxBytes;
-}
-
-function isId(value: unknown): value is string {
-  return typeof value === 'string' && ID_RE.test(value);
-}
+// One definition of each primitive, shared with every other remote-desktop
+// contract module. See ./remote-desktop-contract-primitives.ts.
+const isRecord = isRemoteDesktopRecord;
+const hasExactKeys = hasExactRemoteDesktopKeys;
+const isBoundedString = isBoundedRemoteDesktopString;
+const isId = isRemoteDesktopId;
 
 function isCapability(value: unknown): value is string {
   return typeof value === 'string' && CAPABILITY_RE.test(value);
 }
 
-function isSafeNonNegative(value: unknown): value is number {
-  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
-}
+const isSafeNonNegative = isSafeNonNegativeRemoteDesktopInteger;
 
 function isSafePositive(value: unknown): value is number {
   return typeof value === 'number' && Number.isSafeInteger(value) && value > 0;
@@ -831,18 +856,20 @@ export function validateRemoteDesktopBrowserMessage(value: unknown): RemoteDeskt
 export function validateRemoteDesktopDaemonCommand(value: unknown): RemoteDesktopValidationResult<RemoteDesktopDaemonCommand> {
   if (!isRecord(value) || typeof value.type !== 'string') return invalid();
   if (value.type === REMOTE_DESKTOP_MSG.PREPARE) {
-    if (!hasExactKeys(value, ['type', 'requestId', 'sessionId', 'capability', 'expiresAt', 'leaseExpiresAt', 'daemonGeneration', 'mode', 'inputEpoch', 'iceServers'], ['reconnectAttempt'])
+    if (!hasExactKeys(value, ['type', 'requestId', 'sessionId', 'capability', 'expiresAt', 'leaseExpiresAt', 'daemonGeneration', 'mode', 'inputEpoch', 'iceServers'], ['routeGeneration', 'reconnectAttempt'])
       || !validateAuthority(value)
+      || (value.routeGeneration !== undefined && !isSafeNonNegative(value.routeGeneration))
       || (value.reconnectAttempt !== undefined
         && (!isSafeNonNegative(value.reconnectAttempt)
           || value.reconnectAttempt > REMOTE_DESKTOP_LIMITS.MAX_RECONNECT_ATTEMPTS))) return invalid();
     return { ok: true, value: value as unknown as RemoteDesktopPrepare };
   }
   if (value.type === REMOTE_DESKTOP_MSG.LEASE) {
-    if (!hasExactKeys(value, ['type', 'requestId', 'sessionId', 'capability', 'leaseExpiresAt', 'daemonGeneration', 'mode', 'inputEpoch'])
+    if (!hasExactKeys(value, ['type', 'requestId', 'sessionId', 'capability', 'leaseExpiresAt', 'daemonGeneration', 'mode', 'inputEpoch'], ['routeGeneration'])
       || !hasSessionCorrelation(value)
       || !isSafePositive(value.leaseExpiresAt)
       || !isSafePositive(value.daemonGeneration)
+      || (value.routeGeneration !== undefined && !isSafeNonNegative(value.routeGeneration))
       || typeof value.mode !== 'string' || !ACCESS_MODES.has(value.mode)
       || !isSafeNonNegative(value.inputEpoch)
       || (value.mode === REMOTE_DESKTOP_ACCESS_MODE.CONTROL && (value.inputEpoch as number) === 0)) return invalid();
@@ -937,6 +964,11 @@ export function validateRemoteDesktopAuthorized(value: unknown): RemoteDesktopVa
 }
 
 export function validateRemoteDesktopServerMessage(value: unknown): RemoteDesktopValidationResult<RemoteDesktopServerMessage> {
+  if (isRecord(value)
+    && value.type === REMOTE_DESKTOP_MSG.BOOTSTRAP_REDEEMED
+    && hasExactKeys(value, ['type'])) {
+    return { ok: true, value: value as unknown as RemoteDesktopBootstrapRedeemed };
+  }
   const authorized = validateRemoteDesktopAuthorized(value);
   if (authorized.ok) return authorized;
   const daemon = validateRemoteDesktopDaemonMessage(value);

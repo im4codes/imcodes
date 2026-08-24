@@ -42,6 +42,7 @@ import {
   REMOTE_DESKTOP_CAPABILITY,
   REMOTE_DESKTOP_MSG,
   REMOTE_DESKTOP_TERMINAL_REASON,
+  hasRemoteDesktopIndependentRouteGeneration,
   isRemoteDesktopMessageType,
   validateRemoteDesktopDaemonCommand,
   type RemoteDesktopDaemonCommand,
@@ -64,6 +65,35 @@ import {
 } from '../../shared/controlled-node-auto-unlock.js';
 import { incrementCounter } from '../util/metrics.js';
 import logger from '../util/logger.js';
+import {
+  REMOTE_DESKTOP_ADAPTER_CAPABILITIES,
+  REMOTE_DESKTOP_CAPTURE_PRIVACY_CAPABILITY,
+  REMOTE_DESKTOP_DEFAULT_SHIELDED_ROUTE_CAPABILITY,
+  REMOTE_DESKTOP_CONSENT_MSG,
+  REMOTE_DESKTOP_LOCAL_CONSENT_CAPABILITY,
+  REMOTE_DESKTOP_NODE_CONTEXT_MSG,
+  REMOTE_DESKTOP_PRIVACY_MSG,
+  REMOTE_DESKTOP_SHELL_MSG,
+  REMOTE_DESKTOP_SIGNED_SHELL_CAPABILITY,
+  validateRemoteDesktopNodeAuthorityContext,
+  validateRemoteDesktopShellMessage,
+  type RemoteDesktopAdapterCapability,
+} from '../../shared/remote-desktop-access.js';
+import {
+  LocalRemoteDesktopConsentProvider,
+} from '../daemon/remote-desktop-consent-provider.js';
+import {
+  RemoteDesktopPrivacyBarrier,
+} from './remote-desktop-privacy-ipc.js';
+import {
+  WorkerConsentUi,
+  type WorkerConsentInboundFrame,
+} from './remote-desktop-consent-ipc.js';
+import type { WorkerPrivacyInboundFrame } from './remote-desktop-privacy-ipc.js';
+import {
+  RemoteDesktopSignedShellController,
+  type RemoteDesktopSignedShellLauncher,
+} from './remote-desktop-shell-launch.js';
 
 /** Server → controlled node: auth succeeded; connection is live (bridge.ts heartbeat path). */
 const CONTROLLED_NODE_AUTH_ACK_TYPE = 'heartbeat_ack' as const;
@@ -85,10 +115,32 @@ export interface ControlledNodeRuntimeOptions {
   onHeartbeatAck?: () => void | Promise<void>;
   remoteDesktopWorker?: {
     available(): boolean;
+    /** Explicit adapter support; absence means no decision-11 capability. */
+    adapterCapabilities?(): readonly RemoteDesktopAdapterCapability[];
+    /**
+     * Consent frames share the worker pipe but not the session authentication.
+     * Optional so an injected double may omit them; a worker that cannot carry
+     * them simply cannot ask, which fails closed at the provider.
+     */
+    sendConsentFrame?(frame: Record<string, unknown>): Promise<boolean> | boolean;
+    sendPrivacyFrame?(frame: Record<string, unknown>): Promise<boolean> | boolean;
+    onConsentFrame?(handler: (frame: WorkerConsentInboundFrame) => void): () => void;
+    onPrivacyFrame?(handler: (frame: WorkerPrivacyInboundFrame) => void): () => void;
+    /** Stronger than capture privacy; never infer it from that base marker. */
+    supportsDefaultShieldedRoute?(): boolean;
     handle(message: RemoteDesktopDaemonCommand): Promise<boolean>;
     applyAutoUnlockSecret(secret: string | null): Promise<boolean>;
     autoUnlockConfigured(): Promise<boolean>;
     close(): void;
+  };
+  /**
+   * Separately verified account-shell sidecar. Absence keeps the signed-shell
+   * capability unadvertised even when the capture Worker is available.
+   */
+  remoteDesktopSignedShell?: {
+    available(): boolean;
+    executablePath: string;
+    launcher: RemoteDesktopSignedShellLauncher;
   };
   cleanupLegacyUpgradeRescue?: () => Promise<void>;
   /**
@@ -154,11 +206,132 @@ export function createControlledNodeRuntime(
   );
   const remoteDesktopWorkerAvailable = remoteDesktopWorker.available();
   const remoteDesktopEnabled = remoteDesktopWorkerAvailable && remoteDesktopFeatureEnabled;
+  let declaredAdapterCapabilities: readonly RemoteDesktopAdapterCapability[] = [];
+  try {
+    declaredAdapterCapabilities = remoteDesktopWorker.adapterCapabilities?.() ?? [];
+  } catch {
+    // A broken feature probe cannot widen the node's advertisement.
+  }
+  const workerAdapterCapabilities = remoteDesktopEnabled
+    ? [...new Set(declaredAdapterCapabilities)].filter((capability) => {
+      if (!(REMOTE_DESKTOP_ADAPTER_CAPABILITIES as readonly string[]).includes(capability)) return false;
+      if (capability === REMOTE_DESKTOP_LOCAL_CONSENT_CAPABILITY) {
+        return typeof remoteDesktopWorker.sendConsentFrame === 'function'
+          && typeof remoteDesktopWorker.onConsentFrame === 'function';
+      }
+      if (capability === REMOTE_DESKTOP_CAPTURE_PRIVACY_CAPABILITY) {
+        return typeof remoteDesktopWorker.sendPrivacyFrame === 'function'
+          && typeof remoteDesktopWorker.onPrivacyFrame === 'function';
+      }
+      return true;
+    })
+    : [];
+  let defaultShieldedRouteAvailable = false;
+  try {
+    defaultShieldedRouteAvailable = remoteDesktopEnabled
+      && workerAdapterCapabilities.includes(REMOTE_DESKTOP_CAPTURE_PRIVACY_CAPABILITY)
+      && typeof remoteDesktopWorker.sendPrivacyFrame === 'function'
+      && typeof remoteDesktopWorker.onPrivacyFrame === 'function'
+      && (remoteDesktopWorker.supportsDefaultShieldedRoute?.() ?? false);
+  } catch {
+    // A broken stronger-capability probe may only disable transparent recovery.
+  }
+  let signedShellAvailable = false;
+  try {
+    signedShellAvailable = remoteDesktopEnabled
+      && workerAdapterCapabilities.includes(REMOTE_DESKTOP_CAPTURE_PRIVACY_CAPABILITY)
+      && defaultShieldedRouteAvailable
+      && (options.remoteDesktopSignedShell?.available() ?? false);
+  } catch {
+    // Artifact/signature probes may only remove the local management surface.
+  }
+  const advertisedAdapterCapabilities = [
+    ...workerAdapterCapabilities.filter((capability) => (
+      capability !== REMOTE_DESKTOP_SIGNED_SHELL_CAPABILITY
+    )),
+    ...(signedShellAvailable ? [REMOTE_DESKTOP_SIGNED_SHELL_CAPABILITY] : []),
+  ];
   const missingRemoteDesktopWorkerCanRepair = (options.platform ?? process.platform) === 'win32'
     && (options.arch ?? process.arch) === 'x64'
     && remoteDesktopFeatureEnabled
     && !remoteDesktopWorkerAvailable;
   let upgradeInFlight = false;
+  // Attended consent. The UI lives in the signed worker, so the provider can
+  // only ask while that worker is usable; `surfaceState()` re-probes per
+  // request rather than trusting a value cached at startup.
+  const consentUi = new WorkerConsentUi({
+    // A worker double without a consent channel yields "cannot ask", which the
+    // provider turns into a cancel -- never into an approval.
+    send: (frame) => remoteDesktopWorker.sendConsentFrame?.(frame) ?? false,
+    subscribe: (handler) => remoteDesktopWorker.onConsentFrame?.(handler) ?? (() => {}),
+  }, { now: () => options.now?.() ?? Date.now() });
+  // Authority is connection-generation bound: every reconnect invalidates the
+  // approvals minted under the previous one.
+  let authoritativeHostId = '';
+  let daemonGeneration = -1;
+  const consentProvider = new LocalRemoteDesktopConsentProvider({
+    ui: consentUi,
+    daemonGeneration: () => daemonGeneration,
+    hostId: () => authoritativeHostId,
+    now: () => options.now?.() ?? Date.now(),
+    onTeardownFailure: (approvalId) => {
+      // A prompt stuck on the local user's screen is its own hazard, even
+      // though the decision it carried was already reported.
+      incrementCounter('remote_desktop.consent_teardown_failed');
+      logger.warn({ approvalId }, 'remote desktop consent prompt teardown failed');
+    },
+  });
+
+  // Management privacy rides the SAME authenticated node channel as everything
+  // else. No second credential or nonce: a barrier that needed its own secret
+  // would just be one more thing to steal, and this channel is already the
+  // authority boundary for every other privileged operation here.
+  const privacyBarrier = new RemoteDesktopPrivacyBarrier({
+    transport: {
+      send: (frame) => remoteDesktopWorker.sendPrivacyFrame?.(frame) ?? false,
+      subscribe: (handler) => remoteDesktopWorker.onPrivacyFrame?.(handler) ?? (() => {}),
+    },
+    // The endpoint credential identifies the authenticated transport, not the
+    // canonical physical host. Privacy/consent both stay closed until the
+    // Server supplies the current canonical context explicitly.
+    hostId: () => authoritativeHostId,
+    daemonGeneration: () => daemonGeneration,
+    now: () => options.now?.() ?? Date.now(),
+    // A replacement PREPARE follows BEGIN. Native re-emits its complete
+    // actual route set after every route change; forward those later proofs so
+    // the Server can compare against its durable authoritative snapshot.
+    onShieldedUpdate: (ack) => client.send(ack as unknown as Record<string, unknown>),
+    onRecoveryRequired: (reason) => {
+      incrementCounter('remote_desktop.privacy_recovery_required', { reason });
+      logger.warn({ reason }, 'remote desktop privacy recovery required');
+    },
+  });
+  const signedShellController = signedShellAvailable && options.remoteDesktopSignedShell
+    ? new RemoteDesktopSignedShellController({
+      executablePath: options.remoteDesktopSignedShell.executablePath,
+      serverOrigin: credential.serverUrl,
+      launcher: options.remoteDesktopSignedShell.launcher,
+      expectedContext: () => (
+        authoritativeHostId && daemonGeneration >= 0
+          ? { hostId: authoritativeHostId, endpointGeneration: daemonGeneration }
+          : null
+      ),
+      now: () => options.now?.() ?? Date.now(),
+      onRecoveryRequired: (reason) => {
+        const epochId = privacyBarrier.activeEpochId();
+        if (!epochId || !authoritativeHostId || daemonGeneration < 0) return;
+        const recovery = validateRemoteDesktopShellMessage({
+          type: REMOTE_DESKTOP_SHELL_MSG.RECOVERY_REQUIRED,
+          hostId: authoritativeHostId,
+          epochId,
+          endpointGeneration: daemonGeneration,
+          reason,
+        });
+        if (recovery.ok) client.send(recovery.value as unknown as Record<string, unknown>);
+      },
+    })
+    : null;
+
   let remoteDesktopWorkerRepairEligibleAt: number | null = null;
   let remoteDesktopWorkerRepairNextAttemptAt = 0;
   let authenticationPersisted = false;
@@ -263,6 +436,13 @@ export function createControlledNodeRuntime(
         ...(missingRemoteDesktopWorkerCanRepair
           ? [REMOTE_DESKTOP_INSTALLABLE_CAPABILITY]
           : []),
+        // Every decision-11 adapter feature is explicitly declared by the
+        // verified implementation. The base capture capability never implies
+        // consent, shell, privacy, input, lock-screen, brand or disclosure.
+        ...advertisedAdapterCapabilities,
+        ...(defaultShieldedRouteAvailable
+          ? [REMOTE_DESKTOP_DEFAULT_SHIELDED_ROUTE_CAPABILITY]
+          : []),
       ],
     },
     heartbeatMessage: { type: 'heartbeat', daemonVersion: DAEMON_VERSION },
@@ -277,6 +457,14 @@ export function createControlledNodeRuntime(
       // Remote desktop authority is connection-generation-bound. Unlike the
       // warm Computer Use helper, every peer must die on Server-link loss.
       remoteDesktopWorker.close();
+      // Every open prompt dies with the authority it would have been granted
+      // under; a reconnect mints a new generation.
+      privacyBarrier.onDaemonDisconnected();
+      signedShellController?.markLogoutUncertain();
+      void signedShellController?.terminate().catch(() => {});
+      authoritativeHostId = '';
+      daemonGeneration = -1;
+      void consentProvider.cancelAll('daemon_generation_changed');
       // Keep Computer Use warm across daemon websocket reconnects. The helper owns
       // long-lived OCU/MCP and fast-click subprocesses after first use; closing it
       // here would make every transient network reconnect pay the cold-start cost.
@@ -310,6 +498,31 @@ export function createControlledNodeRuntime(
         } catch (error) {
           reportAuthenticationError(error);
         }
+      }
+      const nodeContext = validateRemoteDesktopNodeAuthorityContext(message);
+      if (nodeContext.ok) {
+        if (nodeContext.value.type === REMOTE_DESKTOP_NODE_CONTEXT_MSG.UNAVAILABLE) {
+          const replaced = authoritativeHostId !== ''
+            || daemonGeneration !== nodeContext.value.daemonGeneration;
+          authoritativeHostId = '';
+          daemonGeneration = nodeContext.value.daemonGeneration;
+          if (replaced) void consentProvider.cancelAll('daemon_generation_changed');
+          return;
+        }
+        const replaced = authoritativeHostId !== nodeContext.value.hostId
+          || daemonGeneration !== nodeContext.value.daemonGeneration;
+        authoritativeHostId = nodeContext.value.hostId;
+        daemonGeneration = nodeContext.value.daemonGeneration;
+        if (replaced) {
+          // A context replacement invalidates every prompt opened under the
+          // previous canonical host or Server connection generation.
+          void consentProvider.cancelAll('daemon_generation_changed');
+          // Bootstrap carries only the canonical host and public HTTPS origin.
+          // It grants no management authority; after native Owner sign-in the
+          // Server dispatches the real one-use context over this node channel.
+          void signedShellController?.startBootstrap().catch(() => {});
+        }
+        return;
       }
       if (message.type === DAEMON_COMMAND_TYPES.DAEMON_UPGRADE) {
         if (upgradeInFlight) {
@@ -348,7 +561,70 @@ export function createControlledNodeRuntime(
         if (Object.keys(message).length === 1) repairMissingRemoteDesktopWorker(true);
         return;
       }
+      if (message.type === REMOTE_DESKTOP_PRIVACY_MSG.BEGIN
+        || message.type === REMOTE_DESKTOP_PRIVACY_MSG.END) {
+        // Only the management privacy frame is forwarded, and only after the
+        // shared validator has proven it carries no account session, token or
+        // password -- exact-key validation rejects an implementation that
+        // tries to attach one rather than trusting and logging it.
+        const ack = message.type === REMOTE_DESKTOP_PRIVACY_MSG.BEGIN
+          ? await privacyBarrier.begin(message)
+          : await privacyBarrier.end(message);
+        // No ack means the barrier could not be proven. Staying silent lets
+        // the Server's own deadline fail the epoch closed; inventing an ack
+        // would enable secret UI over unshielded pixels.
+        if (ack) client.send(ack as unknown as Record<string, unknown>);
+        return;
+      }
+      if (message.type === REMOTE_DESKTOP_SHELL_MSG.LAUNCH
+        || message.type === REMOTE_DESKTOP_SHELL_MSG.RECOVERY_REQUIRED) {
+        const shellMessage = validateRemoteDesktopShellMessage(message);
+        if (shellMessage.ok
+          && shellMessage.value.type === REMOTE_DESKTOP_SHELL_MSG.LAUNCH
+          && signedShellController
+          && advertisedAdapterCapabilities.includes(REMOTE_DESKTOP_SIGNED_SHELL_CAPABILITY)) {
+          await signedShellController.start(shellMessage.value.context);
+        }
+        return;
+      }
+      if (message.type === REMOTE_DESKTOP_CONSENT_MSG.REQUEST) {
+        // The provider validates the payload again itself; this branch only
+        // decides who answers. Its reply is always a result or an enumerated
+        // cancel, so the Server never waits on silence.
+        const outcome = await consentProvider.request(message);
+        client.send(outcome as unknown as Record<string, unknown>);
+        return;
+      }
+      if (message.type === REMOTE_DESKTOP_CONSENT_MSG.CANCEL) {
+        const approvalId = typeof message.approvalId === 'string' ? message.approvalId : '';
+        const reason = typeof message.reason === 'string' ? message.reason : '';
+        if (approvalId && reason) {
+          await consentProvider.cancelPending(approvalId, reason as never);
+        }
+        return;
+      }
       if (isRemoteDesktopMessageType(message.type)) {
+        const requiresIndependentRouteGeneration = remoteDesktopEnabled
+          && advertisedAdapterCapabilities.includes(REMOTE_DESKTOP_CAPTURE_PRIVACY_CAPABILITY)
+          && (message.type === REMOTE_DESKTOP_MSG.PREPARE || message.type === REMOTE_DESKTOP_MSG.LEASE);
+        if (requiresIndependentRouteGeneration
+          && !hasRemoteDesktopIndependentRouteGeneration(message)) {
+          const messageWithoutRouteGeneration = { ...message };
+          delete messageWithoutRouteGeneration.routeGeneration;
+          const legacyParsed = validateRemoteDesktopDaemonCommand(messageWithoutRouteGeneration);
+          if (legacyParsed.ok
+            && (legacyParsed.value.type === REMOTE_DESKTOP_MSG.PREPARE
+              || legacyParsed.value.type === REMOTE_DESKTOP_MSG.LEASE)) {
+            client.send({
+              type: REMOTE_DESKTOP_MSG.TERMINAL,
+              requestId: legacyParsed.value.requestId,
+              sessionId: legacyParsed.value.sessionId,
+              capability: legacyParsed.value.capability,
+              reason: REMOTE_DESKTOP_TERMINAL_REASON.CAPABILITY_UNAVAILABLE,
+            });
+          }
+          return;
+        }
         await dispatchRemoteDesktopCommand({
           message,
           enabled: remoteDesktopEnabled,

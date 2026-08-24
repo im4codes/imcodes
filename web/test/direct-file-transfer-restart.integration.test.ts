@@ -238,6 +238,10 @@ async function createHarness(): Promise<Harness> {
   });
   router = makeRouter();
 
+  const routeBrowserControl = (message: Record<string, unknown>) => {
+    controls.push(message);
+    router.handleBrowser(browserSocket, USER_ID, message);
+  };
   const ws = {
     getDaemonCapabilitySnapshot: () => ({
       daemonId: 'integrated-daemon-1', capabilities: CAPABILITIES,
@@ -251,10 +255,8 @@ async function createHarness(): Promise<Harness> {
       handlers.add(handler);
       return () => handlers.delete(handler);
     },
-    send: (message: Record<string, unknown>) => {
-      controls.push(message);
-      router.handleBrowser(browserSocket, USER_ID, message);
-    },
+    send: routeBrowserControl,
+    sendUrgent: routeBrowserControl,
   } as unknown as WsClient;
 
   return {

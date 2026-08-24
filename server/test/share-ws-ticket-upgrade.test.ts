@@ -8,6 +8,7 @@ import type { Database } from '../src/db/client.js';
 import type { Env } from '../src/env.js';
 import type { ShareAuthorizationSnapshot, ShareTarget } from '../../shared/tab-sharing.js';
 import {
+  REMOTE_DESKTOP_MSG,
   REMOTE_DESKTOP_SERVER_ID_QUERY,
   REMOTE_DESKTOP_SIGNALING_PATH,
 } from '../../shared/remote-desktop.js';
@@ -126,9 +127,9 @@ function makeEnv(db: Database): Env {
   } as Env;
 }
 
-function connect(url: string): Promise<ConnectResult> {
+function connect(url: string, origin?: string): Promise<ConnectResult> {
   return new Promise((resolve) => {
-    const ws = new WebSocket(url);
+    const ws = new WebSocket(url, origin ? { origin } : undefined);
     let settled = false;
     const done = (result: ConnectResult) => {
       if (settled) return;
@@ -283,7 +284,7 @@ describe('share websocket ticket upgrade semantics', () => {
     if (!memberSecond.opened) expect(memberSecond.statusCode).toBe(401);
   });
 
-  it('routes remote desktop signaling by the explicit serverId query and requires a browser ticket', async () => {
+  it('routes account signaling by ticket and quarantines ticket-less guest sockets until proof', async () => {
     const memberTicket = signJwt({
       type: 'ws-ticket',
       sub: 'member-user',
@@ -295,9 +296,24 @@ describe('share websocket ticket upgrade semantics', () => {
     expect(connected.opened).toBe(true);
     if (connected.opened) await closeWs(connected.ws);
 
-    const withoutTicket = await connect(remoteDesktopWsUrl(port, serverId));
-    expect(withoutTicket.opened).toBe(false);
-    if (!withoutTicket.opened) expect(withoutTicket.statusCode).toBe(401);
+    const noOrigin = await connect(remoteDesktopWsUrl(port, serverId));
+    expect(noOrigin.opened).toBe(false);
+    if (!noOrigin.opened) expect(noOrigin.statusCode).toBe(403);
+
+    const withoutTicket = await connect(remoteDesktopWsUrl(port, serverId), 'http://localhost');
+    expect(withoutTicket.opened).toBe(true);
+    if (withoutTicket.opened) {
+      const closed = new Promise<number>((resolve) => withoutTicket.ws.once('close', resolve));
+      withoutTicket.ws.send(JSON.stringify({ type: REMOTE_DESKTOP_MSG.START }));
+      expect(await closed).toBe(1008);
+    }
+
+    const secretInUrl = await connect(
+      `${remoteDesktopWsUrl(port, serverId)}&bootstrapTicket=raw-secret`,
+      'http://localhost',
+    );
+    expect(secretInUrl.opened).toBe(false);
+    if (!secretInUrl.opened) expect(secretInUrl.statusCode).toBe(403);
   });
 
   it('admits share-only concrete main-tab and sub-session tickets without server membership', async () => {

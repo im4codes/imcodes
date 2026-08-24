@@ -1,11 +1,25 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-const { runMock, incrementCounterMock, warnOncePerHourMock, writeFileSyncMock, mkdirSyncMock } = vi.hoisted(() => ({
+const {
+  runMock,
+  incrementCounterMock,
+  warnOncePerHourMock,
+  writeFileSyncMock,
+  mkdirSyncMock,
+  renameSyncMock,
+  unlinkSyncMock,
+  readFileSyncMock,
+  readdirSyncMock,
+} = vi.hoisted(() => ({
   runMock: vi.fn(),
   incrementCounterMock: vi.fn(),
   warnOncePerHourMock: vi.fn(),
   writeFileSyncMock: vi.fn(),
   mkdirSyncMock: vi.fn(),
+  renameSyncMock: vi.fn(),
+  unlinkSyncMock: vi.fn(),
+  readFileSyncMock: vi.fn(() => { throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' }); }),
+  readdirSyncMock: vi.fn(() => []),
 }));
 
 // The production-route test below strips VITEST/NODE_ENV so it exercises the
@@ -17,7 +31,10 @@ const { runMock, incrementCounterMock, warnOncePerHourMock, writeFileSyncMock, m
 vi.mock('node:fs', () => ({
   writeFileSync: writeFileSyncMock,
   mkdirSync: mkdirSyncMock,
-  readFileSync: () => { throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' }); },
+  renameSync: renameSyncMock,
+  unlinkSync: unlinkSyncMock,
+  readFileSync: readFileSyncMock,
+  readdirSync: readdirSyncMock,
 }));
 
 vi.mock('../../src/store/context-store-worker-client.js', () => ({
@@ -28,6 +45,7 @@ vi.mock('../../src/util/rate-limited-warn.js', () => ({ warnOncePerHour: warnOnc
 
 import {
   getMemoryShortRefHealth,
+  makeMemoryShortRef,
   registerMemoryShortRefs,
   resetMemoryShortRefsForTests,
   resolveMemoryShortRef,
@@ -42,10 +60,13 @@ import {
  */
 describe('memory short refs — persistence failures stay observable', () => {
   let priorPath: string | undefined;
+  let priorRecoveryPath: string | undefined;
 
   beforeEach(() => {
     priorPath = process.env.IMCODES_MEMORY_SHORT_REF_PATH;
+    priorRecoveryPath = process.env.IMCODES_MEMORY_SHORT_REF_RECOVERY_PATH;
     delete process.env.IMCODES_MEMORY_SHORT_REF_PATH; // select the store path
+    delete process.env.IMCODES_MEMORY_SHORT_REF_RECOVERY_PATH;
     vi.clearAllMocks();
     resetMemoryShortRefsForTests();
   });
@@ -54,6 +75,8 @@ describe('memory short refs — persistence failures stay observable', () => {
     resetMemoryShortRefsForTests();
     if (priorPath === undefined) delete process.env.IMCODES_MEMORY_SHORT_REF_PATH;
     else process.env.IMCODES_MEMORY_SHORT_REF_PATH = priorPath;
+    if (priorRecoveryPath === undefined) delete process.env.IMCODES_MEMORY_SHORT_REF_RECOVERY_PATH;
+    else process.env.IMCODES_MEMORY_SHORT_REF_RECOVERY_PATH = priorRecoveryPath;
   });
 
   const entry = {
@@ -117,6 +140,112 @@ describe('memory short refs — persistence failures stay observable', () => {
     await vi.waitFor(() => expect(warnOncePerHourMock).toHaveBeenCalled());
     // The unpersisted handle still resolves for the life of this process.
     expect(resolveMemoryShortRef(refs[0]!, entry.namespace)).toMatchObject({ id: entry.id });
+  });
+
+  it('checkpoints unavailable-store rows and restores them before the worker warm-load after restart', async () => {
+    const recoveryPath = '/tmp/imcodes-short-ref-recovery-test.json';
+    const tempPath = `${recoveryPath}.${process.pid}.tmp`;
+    let journal = '';
+    process.env.IMCODES_MEMORY_SHORT_REF_RECOVERY_PATH = recoveryPath;
+    writeFileSyncMock.mockImplementation((path: unknown, data: unknown) => {
+      if (path === tempPath) journal = String(data);
+    });
+    renameSyncMock.mockImplementation((from: unknown, to: unknown) => {
+      if (from !== tempPath || to !== recoveryPath || !journal) throw new Error('bad journal rename');
+    });
+    readFileSyncMock.mockImplementation((path: unknown) => {
+      if (path === recoveryPath && journal) return journal;
+      throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
+    });
+    runMock.mockRejectedValueOnce(new Error('context-store worker unavailable for op: upsertMemoryShortRefs'));
+
+    const [ref] = registerMemoryShortRefs([entry]);
+    await vi.waitFor(() => expect(renameSyncMock).toHaveBeenCalledWith(tempPath, recoveryPath));
+    expect(getMemoryShortRefHealth()).toBeUndefined();
+    const secondEntry = { ...entry, id: 'queued-during-context-store-self-heal' };
+    const [secondRef] = registerMemoryShortRefs([secondEntry]);
+    expect(JSON.parse(journal)).toMatchObject({
+      schemaVersion: 2,
+      rows: expect.arrayContaining([
+        expect.objectContaining({ id: entry.id, kind: entry.kind }),
+        expect.objectContaining({ id: secondEntry.id, kind: secondEntry.kind }),
+      ]),
+    });
+
+    // Simulate the in-memory portion of a daemon restart while preserving the
+    // journal on disk. Recovery happens before the SQLite list result matters.
+    resetMemoryShortRefsForTests();
+    runMock.mockRejectedValueOnce(new Error('context-store worker unavailable for op: listMemoryShortRefs'));
+    const { loadMemoryShortRefsFromStore } = await import('../../src/context/memory-short-ref.js');
+    await expect(loadMemoryShortRefsFromStore()).resolves.toBe(2);
+    expect(resolveMemoryShortRef(ref!, entry.namespace)).toMatchObject({ id: entry.id });
+    expect(resolveMemoryShortRef(secondRef!, secondEntry.namespace)).toMatchObject({ id: secondEntry.id });
+
+    // A malformed worker response is a different failure branch from a rejected
+    // RPC. It still must not hide or strand the already recovered checkpoint.
+    resetMemoryShortRefsForTests();
+    runMock.mockResolvedValueOnce({ invalid: 'not-an-array' });
+    await expect(loadMemoryShortRefsFromStore()).resolves.toBe(2);
+    expect(resolveMemoryShortRef(ref!, entry.namespace)).toMatchObject({ id: entry.id });
+    expect(resolveMemoryShortRef(secondRef!, secondEntry.namespace)).toMatchObject({ id: secondEntry.id });
+  });
+
+  it('replays but never unlinks a recovery journal owned by another live process', async () => {
+    const priorVitest = process.env.VITEST;
+    const priorNodeEnv = process.env.NODE_ENV;
+    delete process.env.VITEST;
+    process.env.NODE_ENV = 'production';
+    const foreignName = 'memory-short-refs.pending.424242.123e4567-e89b-12d3-a456-426614174000.json';
+    const foreignPath = expect.stringContaining(foreignName);
+    const ref = makeMemoryShortRef(entry.kind, entry.id);
+    const journal = JSON.stringify({
+      schemaVersion: 2,
+      rows: [{
+        ref,
+        kind: entry.kind,
+        id: entry.id,
+        namespaceKey: JSON.stringify(['personal', 'user-1', 'repo-1', '', '']),
+        namespaceJson: JSON.stringify(entry.namespace),
+        lastSeenAt: Date.now(),
+      }],
+    });
+    readdirSyncMock.mockReturnValue([foreignName]);
+    readFileSyncMock.mockImplementation((path: unknown) => {
+      if (String(path).endsWith(foreignName)) return journal;
+      throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
+    });
+    const killSpy = vi.spyOn(process, 'kill').mockReturnValue(true);
+    runMock.mockResolvedValueOnce([]).mockResolvedValueOnce(1);
+
+    try {
+      const { loadMemoryShortRefsFromStore } = await import('../../src/context/memory-short-ref.js');
+      await expect(loadMemoryShortRefsFromStore()).resolves.toBe(1);
+      await vi.waitFor(() => expect(runMock).toHaveBeenCalledTimes(2));
+      expect(killSpy).toHaveBeenCalledWith(424242, 0);
+      expect(unlinkSyncMock).not.toHaveBeenCalledWith(foreignPath);
+      expect(resolveMemoryShortRef(ref, entry.namespace)).toMatchObject({ id: entry.id });
+    } finally {
+      killSpy.mockRestore();
+      if (priorVitest === undefined) delete process.env.VITEST;
+      else process.env.VITEST = priorVitest;
+      if (priorNodeEnv === undefined) delete process.env.NODE_ENV;
+      else process.env.NODE_ENV = priorNodeEnv;
+    }
+  });
+
+  it('keeps the loss alert when both SQLite and the recovery journal are unavailable', async () => {
+    process.env.IMCODES_MEMORY_SHORT_REF_RECOVERY_PATH = '/tmp/imcodes-short-ref-recovery-unwritable.json';
+    runMock.mockRejectedValue(new Error('context_store_unavailable'));
+    writeFileSyncMock.mockImplementation(() => {
+      throw Object.assign(new Error('ENOSPC: no space left on device'), { code: 'ENOSPC' });
+    });
+
+    registerMemoryShortRefs([entry]);
+    await vi.waitFor(() => expect(getMemoryShortRefHealth()).toBeDefined());
+    expect(getMemoryShortRefHealth()).toMatchObject({
+      stage: 'persist_store',
+      lastError: expect.stringContaining('recovery journal failed'),
+    });
   });
 
   it('clears a file-write alert after the complete cache is written successfully', () => {

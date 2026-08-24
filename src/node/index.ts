@@ -3,6 +3,10 @@ import { execFileSync } from 'node:child_process';
 import { bootstrapControlledNodeWithDisposition, defaultBootstrapDeps, journalPathFor, markServiceHealthy } from './bootstrap.js';
 import { runComputerUseIpcHelper } from './computer-use-ipc.js';
 import { createControlledNodeRuntime } from './runtime.js';
+import {
+  createRemoteDesktopSignedShellLauncher,
+  resolveRemoteDesktopAccountShellArtifact,
+} from './remote-desktop-signed-shell-host.js';
 import { DAEMON_VERSION } from '../util/version.js';
 import {
   controlledNodeHealthLeasePath,
@@ -59,7 +63,13 @@ async function main(): Promise<void> {
         onError: reportHealthError,
       })
       : undefined;
+  const signedShellArtifact = resolveRemoteDesktopAccountShellArtifact();
   const runtime = createControlledNodeRuntime(bootstrap.credential, undefined, {
+    remoteDesktopSignedShell: signedShellArtifact ? {
+      available: () => true,
+      executablePath: signedShellArtifact.executablePath,
+      launcher: createRemoteDesktopSignedShellLauncher(signedShellArtifact),
+    } : undefined,
     onAuthenticated: () => markServiceHealthy(deps.journalPath, Date.now(), {
       isStableRuntime: deps.isStableRuntime,
       inspectServiceState: deps.inspectServiceState,

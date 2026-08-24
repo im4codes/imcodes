@@ -137,7 +137,7 @@ function controlBinding(message: Record<string, unknown>) {
 
 function createWs(
   capabilities: string[],
-  mode: 'success' | 'operation_failure' | 'lease_signal_failure' | 'hold' | 'authorized_hold' | 'status_committed' | 'commit_ack_lost_status_committed' | 'terminal_committed' | 'ack_then_late_terminal' | 'download_hold_rebind' | 'download_size_mismatch' | 'error_after_expiry' | 'drop_first_lease_ready' = 'success',
+  mode: 'success' | 'operation_failure' | 'lease_signal_failure' | 'hold' | 'authorized_hold' | 'status_committed' | 'commit_ack_lost_status_committed' | 'terminal_committed' | 'ack_then_late_terminal' | 'download_hold_rebind' | 'download_size_mismatch' | 'error_after_expiry' | 'drop_first_lease_ready' | 'drop_first_lease_answer' | 'control_socket_closed' = 'success',
   leaseTiming: { readyDelayMs?: number; idleWindowMs?: number; terminalDelayMs?: number; rebindDaemonGeneration?: number } = {},
 ) {
   const handlers = new Set<(message: ServerMessage) => void>();
@@ -148,6 +148,7 @@ function createWs(
   };
   const completedDownloads = new WeakSet<FakeDataChannel>();
   let leaseInitCount = 0;
+  let leaseOfferCount = 0;
   const handleData = (channel: FakeDataChannel, value: unknown) => {
     if (typeof value !== 'string') return;
     const payload = JSON.parse(value) as Record<string, unknown>;
@@ -261,21 +262,11 @@ function createWs(
     }
   };
   FakePeerConnection.onDataChannel = handleData;
-  const ws = {
-    getDaemonCapabilitySnapshot: () => ({
-      daemonId: 'daemon-1', capabilities, helloEpoch: 1, sentAt: Date.now(), observedAt: Date.now(),
-    }),
-    onDaemonCapabilitySnapshot: (handler: (snapshot: { capabilities: string[] } | null) => void) => {
-      capabilityHandlers.add(handler);
-      return () => capabilityHandlers.delete(handler);
-    },
-    onMessage: (handler: (message: ServerMessage) => void) => {
-      handlers.add(handler);
-      return () => handlers.delete(handler);
-    },
-    send: (message: Record<string, unknown>) => {
-      sent.push(message);
-      if (message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_INIT) {
+  let capabilitySnapshot: string[] | null = capabilities;
+  const sendControlMessage = (message: Record<string, unknown>) => {
+    if (mode === 'control_socket_closed') throw new Error('WebSocket not connected');
+    sent.push(message);
+    if (message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_INIT) {
         if (++leaseInitCount === 1 && mode === 'drop_first_lease_ready') return;
         // The idle deadline is issued at LEASE_INIT, not when the browser
         // receives the delayed READY. This makes the test catch a browser
@@ -298,7 +289,8 @@ function createWs(
         });
         if (leaseInitCount === 1 && leaseTiming.readyDelayMs) setTimeout(respond, leaseTiming.readyDelayMs);
         else queueMicrotask(respond);
-      } else if (message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_OFFER) {
+    } else if (message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_OFFER) {
+        if (++leaseOfferCount === 1 && mode === 'drop_first_lease_answer') return;
         if (mode === 'lease_signal_failure') {
           queueMicrotask(() => emit({
             type: DIRECT_FILE_TRANSFER_MSG.ERROR,
@@ -311,7 +303,7 @@ function createWs(
         } else {
           queueMicrotask(() => emit({ ...message, type: DIRECT_FILE_TRANSFER_MSG.LEASE_ANSWER, sdp: 'daemon-lease-answer' }));
         }
-      } else if (message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_REBIND) {
+    } else if (message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_REBIND) {
         queueMicrotask(() => emit({
           type: DIRECT_FILE_TRANSFER_MSG.LEASE_REBOUND,
           protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
@@ -326,8 +318,8 @@ function createWs(
           expiresAt: Date.now() + 10 * 60_000,
           iceServers: [],
         }));
-      } else if (message.type === DIRECT_FILE_TRANSFER_MSG.STATUS_QUERY
-        && (mode === 'status_committed' || mode === 'commit_ack_lost_status_committed')) {
+    } else if (message.type === DIRECT_FILE_TRANSFER_MSG.STATUS_QUERY
+      && (mode === 'status_committed' || mode === 'commit_ack_lost_status_committed')) {
         queueMicrotask(() => emit({
           type: DIRECT_FILE_TRANSFER_MSG.STATUS,
           protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
@@ -339,7 +331,7 @@ function createWs(
             createdAt: '2026-01-01T00:00:00.000Z', downloadable: true,
           },
         }));
-      } else if (message.type === DIRECT_FILE_TRANSFER_MSG.OPERATION_INIT) {
+    } else if (message.type === DIRECT_FILE_TRANSFER_MSG.OPERATION_INIT) {
         if (mode === 'operation_failure') {
           queueMicrotask(() => emit({
             type: DIRECT_FILE_TRANSFER_MSG.ERROR,
@@ -359,15 +351,31 @@ function createWs(
             iceServers: [],
           }));
         }
-      }
+    }
+  };
+  const ws = {
+    getDaemonCapabilitySnapshot: () => capabilitySnapshot ? ({
+      daemonId: 'daemon-1', capabilities: capabilitySnapshot, helloEpoch: 1, sentAt: Date.now(), observedAt: Date.now(),
+    }) : null,
+    onDaemonCapabilitySnapshot: (handler: (snapshot: { capabilities: string[] } | null) => void) => {
+      capabilityHandlers.add(handler);
+      handler(capabilitySnapshot ? { capabilities: capabilitySnapshot } : null);
+      return () => capabilityHandlers.delete(handler);
     },
+    onMessage: (handler: (message: ServerMessage) => void) => {
+      handlers.add(handler);
+      return () => handlers.delete(handler);
+    },
+    send: vi.fn(),
+    sendUrgent: sendControlMessage,
   } as unknown as WsClient;
   return {
     ws,
     sent,
     emit,
-    emitCapabilitySnapshot: () => {
-      for (const handler of capabilityHandlers) handler({ capabilities });
+    emitCapabilitySnapshot: (snapshot: string[] | null = capabilities) => {
+      capabilitySnapshot = snapshot;
+      for (const handler of capabilityHandlers) handler(snapshot ? { capabilities: snapshot } : null);
     },
   };
 }
@@ -1139,12 +1147,87 @@ describe('direct file transfer v2 browser broker', () => {
     await expect(probeDirectConnectivity(ws, undefined, 'server-1')).resolves.toMatchObject({ route: 'lan_direct' });
     await expect(probeDirectConnectivity(ws, undefined, 'server-1')).resolves.toMatchObject({ route: 'lan_direct' });
 
+    // Normal WsClient.send is deliberately a silent no-op while foreground
+    // liveness is being probed. Direct request/response control must use the
+    // open-socket throwing path instead, or LEASE_INIT disappears at stage 1.
+    expect(ws.send).not.toHaveBeenCalled();
     expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_INIT)).toHaveLength(1);
     for (const message of sent.filter((entry) => entry.type === DIRECT_FILE_TRANSFER_MSG.LEASE_OFFER || entry.type === DIRECT_FILE_TRANSFER_MSG.LEASE_ICE)) {
       expect(message).not.toHaveProperty('authority');
       expect(message).not.toHaveProperty('previewHandle');
       expect(message).not.toHaveProperty('sessionName');
     }
+  });
+
+  it('invalidates an unanswered LEASE_INIT on socket loss and immediately starts fresh after reconnect', async () => {
+    const { probeDirectConnectivity, DirectFileTransferFailure } = await import('../src/direct-file-transfer.js');
+    const { ws, sent, emitCapabilitySnapshot } = createWs(directCapabilities, 'drop_first_lease_ready');
+
+    const stale = probeDirectConnectivity(ws, undefined, 'server-1');
+    await vi.waitFor(() => {
+      expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_INIT)).toHaveLength(1);
+    });
+
+    emitCapabilitySnapshot(null);
+    // Reconnect and retry before the stale promise's rejection/finally
+    // microtasks run. This pins the ownership-slot race that previously let an
+    // old finally erase the new creating promise.
+    emitCapabilitySnapshot(directCapabilities);
+    const fresh = probeDirectConnectivity(ws, undefined, 'server-1');
+    await expect(stale).rejects.toEqual(expect.objectContaining({
+      name: DirectFileTransferFailure.name,
+      code: DIRECT_FILE_TRANSFER_ERROR.LEASE_EXPIRED,
+      retryable: true,
+    }));
+
+    await expect(fresh).resolves.toMatchObject({ route: 'lan_direct' });
+    expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_INIT)).toHaveLength(2);
+  });
+
+  it('invalidates an unanswered lease SDP exchange instead of retaining peerCreating across reconnect', async () => {
+    const { probeDirectConnectivity } = await import('../src/direct-file-transfer.js');
+    const { ws, sent, emitCapabilitySnapshot } = createWs(directCapabilities, 'drop_first_lease_answer');
+
+    const stale = probeDirectConnectivity(ws, undefined, 'server-1');
+    await vi.waitFor(() => {
+      expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_OFFER)).toHaveLength(1);
+    });
+
+    emitCapabilitySnapshot(null);
+    emitCapabilitySnapshot(directCapabilities);
+    const fresh = probeDirectConnectivity(ws, undefined, 'server-1');
+    await expect(stale).rejects.toMatchObject({
+      code: DIRECT_FILE_TRANSFER_ERROR.LEASE_EXPIRED,
+      retryable: true,
+    });
+
+    await expect(fresh).resolves.toMatchObject({ route: 'lan_direct' });
+    expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_INIT)).toHaveLength(2);
+    expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_OFFER)).toHaveLength(2);
+    expect(FakePeerConnection.instances.at(0)?.connectionState).toBe('closed');
+  });
+
+  it('falls back to HTTP when the control socket is absent instead of silently waiting for direct timeouts', async () => {
+    vi.useFakeTimers();
+    const { uploadFileWithDirectFallback, FILE_UPLOAD_TRANSPORT_MODE } = await import('../src/direct-file-transfer.js');
+    const { ws } = createWs(directCapabilities, 'control_socket_closed');
+    const modes: string[] = [];
+
+    const pending = uploadFileWithDirectFallback({
+      ws,
+      serverId: 'server-1',
+      file: createUploadFile('socket-closed.txt', 'relay me'),
+      onMode: (mode) => modes.push(mode),
+    });
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    await expect(pending).resolves.toMatchObject({ attachment: { id: 'relay-attachment' } });
+    expect(modes).toEqual(expect.arrayContaining([
+      FILE_UPLOAD_TRANSPORT_MODE.CONNECTING,
+      FILE_UPLOAD_TRANSPORT_MODE.FALLING_BACK,
+      FILE_UPLOAD_TRANSPORT_MODE.RELAY,
+    ]));
+    expect(apiMocks.uploadFile).toHaveBeenCalledOnce();
   });
 
   it('ICE-restarts a disconnected long-lived mobile peer instead of reusing its dead channel path', async () => {

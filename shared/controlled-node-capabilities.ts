@@ -10,6 +10,10 @@ import {
 } from './machine-direct-file-transfer-capabilities.js';
 import { REMOTE_DESKTOP_CAPABILITY } from './remote-desktop.js';
 import { REMOTE_DESKTOP_INSTALLABLE_CAPABILITY } from './remote-desktop-install.js';
+import {
+  REMOTE_DESKTOP_ADAPTER_CAPABILITIES,
+  REMOTE_DESKTOP_DEFAULT_SHIELDED_ROUTE_CAPABILITY,
+} from './remote-desktop-access.js';
 import { CONTROLLED_NODE_SAFE_SELF_UPGRADE_CAPABILITY } from './controlled-node-service.js';
 import { CONTROLLED_NODE_AUTO_UNLOCK_CAPABILITY } from './controlled-node-auto-unlock.js';
 
@@ -22,12 +26,22 @@ export const CONTROLLED_NODE_CAPABILITIES = [
   MACHINE_DIRECT_FILE_FETCH_CAPABILITY,
   REMOTE_DESKTOP_CAPABILITY,
   REMOTE_DESKTOP_INSTALLABLE_CAPABILITY,
+  // Advertised per OS adapter, never inferred from the platform: a host
+  // without local consent cannot serve attended links, and one without the
+  // signed shell / capture privacy pair stays manageable from another device
+  // but must not expose controlled-computer management.
+  ...REMOTE_DESKTOP_ADAPTER_CAPABILITIES,
+  REMOTE_DESKTOP_DEFAULT_SHIELDED_ROUTE_CAPABILITY,
   CONTROLLED_NODE_SAFE_SELF_UPGRADE_CAPABILITY,
   CONTROLLED_NODE_AUTO_UNLOCK_CAPABILITY,
 ] as const;
 
 export type ControlledNodeCapability = typeof CONTROLLED_NODE_CAPABILITIES[number];
-export const CONTROLLED_NODE_CAPABILITY_MAX_ITEMS = 16;
+// Remote-desktop adapters advertise consent, signed shell, capture privacy,
+// input, lock-screen, branding and local disclosure independently. Keep the
+// envelope bounded while leaving room for that explicit feature matrix and
+// future non-Windows adapters; 16 would reject the already-specified set.
+export const CONTROLLED_NODE_CAPABILITY_MAX_ITEMS = 32;
 export const CONTROLLED_NODE_CAPABILITY_MAX_LENGTH = 128;
 const CONTROLLED_NODE_CAPABILITY_ADVERTISEMENT_PATTERN = /^[a-z0-9][a-z0-9._-]*$/;
 

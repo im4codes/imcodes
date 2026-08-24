@@ -71,6 +71,13 @@ import {
   REMOTE_DESKTOP_INSTALL_MSG,
 } from '../../shared/remote-desktop-install.js';
 import {
+  REMOTE_DESKTOP_CONSENT_MSG,
+  REMOTE_DESKTOP_LOCAL_CONSENT_CAPABILITY,
+  REMOTE_DESKTOP_NODE_CONTEXT_MSG,
+  type RemoteDesktopConsentRequest,
+} from '../../shared/remote-desktop-access.js';
+import { REMOTE_DESKTOP_ACCESS_MODE, REMOTE_DESKTOP_CAPABILITY } from '../../shared/remote-desktop.js';
+import {
   LEGACY_WINDOWS_UPGRADE_RESCUE_READY_PREFIX,
   LEGACY_WINDOWS_UPGRADE_RESTART_READY_PREFIX,
 } from '../src/ws/windows-controlled-node-upgrade-rescue.js';
@@ -386,10 +393,137 @@ describe('WsBridge', () => {
 
   afterEach(() => {
     restoreUpgradePublisherSignerResolver();
+    WsBridge.setRemoteDesktopReconnectRevalidator(null);
     WsBridge.getAll().clear();
     resetDaemonUpgradePublicationGateForTest();
     resetMetricsForTests();
     vi.clearAllMocks();
+  });
+
+  it('closes when any second frame arrives before bootstrap redemption', async () => {
+    const bridge = WsBridge.get(serverId);
+    const ws = new MockWs();
+    const redeemGuestBootstrap = vi.fn(async () => true);
+    const handleGuestBrowser = vi.fn(async () => true);
+    Object.defineProperty(bridge, 'remoteDesktopRouter', {
+      value: {
+        redeemGuestBootstrap,
+        handleGuestBrowser,
+        dropSocket: vi.fn(),
+      },
+    });
+    bridge.handleGuestRemoteDesktopConnection(ws as never, makeDb('valid-hash'));
+
+    ws.emit('message', Buffer.from(JSON.stringify({
+      ticket: 'A'.repeat(43),
+      browserKeyThumbprint: 'B'.repeat(43),
+      signature: 'C'.repeat(86),
+    })));
+    ws.emit('message', Buffer.from(JSON.stringify({
+      type: 'remote_desktop.start',
+      protocolVersion: 'remote-desktop.v1',
+      requestId: 'guest_request_123456',
+    })));
+    await flushAsync();
+    expect(redeemGuestBootstrap).not.toHaveBeenCalled();
+    expect(handleGuestBrowser).not.toHaveBeenCalled();
+    expect(ws.closed).toBe(true);
+    expect(ws.closeCode).toBe(1008);
+  });
+
+  it('acknowledges bootstrap redemption before accepting START', async () => {
+    const bridge = WsBridge.get(serverId);
+    const ws = new MockWs();
+    const handleGuestBrowser = vi.fn(async () => true);
+    Object.defineProperty(bridge, 'remoteDesktopRouter', {
+      value: {
+        redeemGuestBootstrap: vi.fn(async () => true),
+        handleGuestBrowser,
+        dropSocket: vi.fn(),
+      },
+    });
+    bridge.handleGuestRemoteDesktopConnection(ws as never, makeDb('valid-hash'));
+
+    ws.emit('message', Buffer.from(JSON.stringify({
+      ticket: 'A'.repeat(43),
+      browserKeyThumbprint: 'B'.repeat(43),
+      signature: 'C'.repeat(86),
+    })));
+    await flushAsync();
+    expect(ws.sentStrings.map((raw) => JSON.parse(raw))).toContainEqual({
+      type: 'remote_desktop.bootstrap_redeemed',
+    });
+
+    ws.emit('message', Buffer.from(JSON.stringify({
+      type: 'remote_desktop.start',
+      protocolVersion: 'remote-desktop.v1',
+      requestId: 'guest_request_123456',
+    })));
+    await flushAsync();
+    expect(handleGuestBrowser).toHaveBeenCalledOnce();
+    expect(ws.closed).toBe(false);
+  });
+
+  it('closes an anonymous socket that never supplies its bounded first proof', async () => {
+    vi.useFakeTimers();
+    try {
+      const bridge = WsBridge.get(serverId);
+      const ws = new MockWs();
+      bridge.handleGuestRemoteDesktopConnection(ws as never, makeDb('valid-hash'));
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(ws.closed).toBe(true);
+      expect(ws.closeCode).toBe(1008);
+      expect(ws.closeReason).toBe('unavailable');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('dispatches consent only on the authenticated authority-ready owning generation', () => {
+    const bridge = WsBridge.get(serverId);
+    const daemon = new MockWs();
+    const internals = bridge as unknown as {
+      daemonWs: MockWs;
+      authenticated: boolean;
+      daemonGeneration: number;
+      remoteDesktopAuthorityReadyGeneration: number | null;
+      daemonNodeRole: 'controlled';
+      controlledNodeCapabilities: Set<string>;
+      trySendRemoteDesktopConsent(command: {
+        executionServerId: string;
+        daemonGeneration: number;
+        message: RemoteDesktopConsentRequest;
+      }): boolean;
+    };
+    internals.daemonWs = daemon;
+    internals.authenticated = true;
+    internals.daemonGeneration = 4;
+    internals.daemonNodeRole = 'controlled';
+    internals.controlledNodeCapabilities = new Set([
+      REMOTE_DESKTOP_CAPABILITY,
+      REMOTE_DESKTOP_LOCAL_CONSENT_CAPABILITY,
+    ]);
+    const message: RemoteDesktopConsentRequest = {
+      type: REMOTE_DESKTOP_CONSENT_MSG.REQUEST,
+      approvalId: 'approval-00000000-0000-4000-8000-000000000001',
+      hostId: 'host-00000000-0000-4000-8000-000000000001',
+      mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
+      requesterLabel: 'Remote guest',
+      createdAt: 1_800_000_000_000,
+      deadlineAt: 1_800_000_030_000,
+      daemonGeneration: 4,
+    };
+    const command = { executionServerId: serverId, daemonGeneration: 4, message };
+
+    internals.remoteDesktopAuthorityReadyGeneration = null;
+    expect(internals.trySendRemoteDesktopConsent(command)).toBe(false);
+    expect(daemon.sent).toEqual([]);
+
+    internals.remoteDesktopAuthorityReadyGeneration = 4;
+    expect(internals.trySendRemoteDesktopConsent(command)).toBe(true);
+    expect(daemon.sentStrings.map((value) => JSON.parse(value))).toEqual([message]);
+    expect(internals.trySendRemoteDesktopConsent({ ...command, daemonGeneration: 3 })).toBe(false);
+    expect(daemon.sent).toHaveLength(1);
   });
 
   describe('daemon auth', () => {
@@ -409,6 +543,45 @@ describe('WsBridge', () => {
       ws.emit('message', JSON.stringify({ type: 'auth', serverId, token: 'my-token' }));
       await flushAsync();
       expect(bridge.isAuthenticated).toBe(true);
+    });
+
+    it('keeps remote desktop unavailable until each reconnect revalidates durable authority', async () => {
+      const releases: Array<() => void> = [];
+      const revalidate = vi.fn(() => new Promise<void>((resolve) => { releases.push(resolve); }));
+      WsBridge.setRemoteDesktopReconnectRevalidator(revalidate);
+      const bridge = WsBridge.get(serverId);
+
+      const first = new MockWs();
+      bridge.handleDaemonConnection(
+        first as never,
+        makeDb('valid-hash', 'controlled', CONTROLLED_NODE_OS_WIN),
+        {} as never,
+      );
+      first.emit('message', JSON.stringify({
+        type: 'auth', serverId, token: 'my-token', capabilities: [REMOTE_DESKTOP_CAPABILITY],
+      }));
+      await flushAsync();
+      expect(revalidate).toHaveBeenCalledWith(serverId);
+      expect(WsBridge.remoteDesktopGuestOutboxTarget(serverId)?.isAvailable()).toBe(false);
+      releases.shift()?.();
+      await flushAsync();
+      expect(WsBridge.remoteDesktopGuestOutboxTarget(serverId)?.isAvailable()).toBe(true);
+
+      const replacement = new MockWs();
+      bridge.handleDaemonConnection(
+        replacement as never,
+        makeDb('valid-hash', 'controlled', CONTROLLED_NODE_OS_WIN),
+        {} as never,
+      );
+      replacement.emit('message', JSON.stringify({
+        type: 'auth', serverId, token: 'my-token', capabilities: [REMOTE_DESKTOP_CAPABILITY],
+      }));
+      await flushAsync();
+      expect(revalidate).toHaveBeenCalledTimes(2);
+      expect(WsBridge.remoteDesktopGuestOutboxTarget(serverId)?.isAvailable()).toBe(false);
+      releases.shift()?.();
+      await flushAsync();
+      expect(WsBridge.remoteDesktopGuestOutboxTarget(serverId)?.isAvailable()).toBe(true);
     });
 
     it('sends an exact generation-bound worker repair request to an installable controlled node', async () => {
@@ -437,6 +610,56 @@ describe('WsBridge', () => {
       expect(bridge.tryInstallControlledNodeRemoteDesktopWorker(
         bridge.daemonConnectionGeneration() - 1,
       )).toBe('generation_changed');
+      expect(ws.sentStrings.map((value) => JSON.parse(value))).toContainEqual({
+        type: REMOTE_DESKTOP_NODE_CONTEXT_MSG.UNAVAILABLE,
+        daemonGeneration: bridge.daemonConnectionGeneration(),
+      });
+    });
+
+    it('publishes the canonical host context and actively clears it when the mapping disappears', async () => {
+      let hostId: string | null = 'host-00000000000000000001';
+      const db = {
+        queryOne: async (sql: string) => {
+          if (sql.includes('remote_desktop_host_endpoints')) return hostId ? { host_id: hostId } : null;
+          return {
+            token_hash: 'valid-hash',
+            node_role: 'controlled',
+            revoked_at: null,
+            os: CONTROLLED_NODE_OS_WIN,
+          };
+        },
+        query: async () => [],
+        execute: async () => ({ changes: 1 }),
+        exec: async () => {},
+        transaction: async <T>(fn: (tx: import('../src/db/client.js').Database) => Promise<T>) => (
+          fn(db as unknown as import('../src/db/client.js').Database)
+        ),
+        close: () => {},
+      } as unknown as import('../src/db/client.js').Database;
+      const bridge = WsBridge.get(serverId);
+      const ws = new MockWs();
+      bridge.handleDaemonConnection(ws as never, db, {} as never);
+      ws.emit('message', JSON.stringify({
+        type: 'auth',
+        serverId,
+        token: 'my-token',
+        capabilities: [],
+      }));
+      await flushAsync();
+      const generation = bridge.daemonConnectionGeneration();
+      expect(ws.sentStrings.map((value) => JSON.parse(value))).toContainEqual({
+        type: REMOTE_DESKTOP_NODE_CONTEXT_MSG.CURRENT,
+        hostId: 'host-00000000000000000001',
+        daemonGeneration: generation,
+      });
+
+      hostId = null;
+      ws.emit('message', JSON.stringify({ type: 'heartbeat' }));
+      await flushAsync();
+      expect(ws.sentStrings.map((value) => JSON.parse(value))).toContainEqual({
+        type: REMOTE_DESKTOP_NODE_CONTEXT_MSG.UNAVAILABLE,
+        daemonGeneration: generation,
+      });
     });
 
     it('closes on auth timeout', async () => {

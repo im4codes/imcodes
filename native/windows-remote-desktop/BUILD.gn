@@ -18,10 +18,17 @@ rtc_executable("imcodes_remote_desktop_worker") {
     "ice_candidate_queue.h",
     "json_protocol.cc",
     "json_protocol.h",
+    "brand_logo_generated.h",
+    "consent_ipc.cc",
+    "consent_ipc.h",
+    "consent_prompt.cc",
+    "consent_prompt.h",
     "local_indicator.cc",
     "local_indicator.h",
     "mf_h264_encoder.cc",
     "mf_h264_encoder.h",
+    "privacy_ipc.cc",
+    "privacy_ipc.h",
     "peer_session.cc",
     "peer_session.h",
     "pipe_ipc.cc",
@@ -58,6 +65,7 @@ rtc_executable("imcodes_remote_desktop_worker") {
     "swdevice.lib",
     "wtsapi32.lib",
     "wmcodecdspuuid.lib",
+      "msimg32.lib",  # AlphaBlend for the indicator brand mark
   ]
 }
 
@@ -125,6 +133,20 @@ if (rtc_include_tests) {
       "json_protocol.cc",
       "json_protocol.h",
       "json_protocol_unittest.cc",
+    ]
+    deps = [
+      "//test:test_support",
+      "//third_party/jsoncpp",
+    ]
+  }
+
+  rtc_test("privacy_ipc_unittests") {
+    sources = [
+      "json_protocol.cc",
+      "json_protocol.h",
+      "privacy_ipc.cc",
+      "privacy_ipc.h",
+      "privacy_ipc_unittest.cc",
     ]
     deps = [
       "//test:test_support",

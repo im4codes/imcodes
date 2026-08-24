@@ -177,6 +177,43 @@ beforeEach(() => {
 });
 
 describe('RemoteDesktopClient', () => {
+  it('keeps guest bootstrap proof out of the URL and waits for redemption before START', async () => {
+    let socket!: FakeSocket;
+    let socketUrl = '';
+    const fetchTicket = vi.fn();
+    const guestBootstrapProof = {
+      ticket: 'guest-ticket-secret',
+      browserKeyThumbprint: 'browser-thumbprint',
+      signature: 'browser-signature',
+    };
+    const dependencies = {
+      fetchTicket,
+      guestBootstrapProof,
+      createSocket: (url: string) => {
+        socketUrl = url;
+        socket = new FakeSocket();
+        queueMicrotask(() => socket.open());
+        return socket as unknown as WebSocket;
+      },
+    };
+    const client = new RemoteDesktopClient('sticky-server', { onSnapshot: vi.fn() }, dependencies);
+
+    const starting = client.start();
+
+    expect(fetchTicket).not.toHaveBeenCalled();
+    expect(socketUrl).toContain('serverId=sticky-server');
+    expect(socketUrl).not.toContain('ticket');
+    expect(socketUrl).not.toContain('proof');
+    await vi.waitFor(() => expect(socket.sent).toHaveLength(1));
+    expect(JSON.parse(socket.sent[0]!)).toEqual(guestBootstrapProof);
+    expect(socket.sent).toHaveLength(1);
+    socket.receive({ type: REMOTE_DESKTOP_MSG.BOOTSTRAP_REDEEMED });
+    await starting;
+    expect(JSON.parse(socket.sent[1]!).type).toBe(REMOTE_DESKTOP_MSG.START);
+    expect(dependencies.guestBootstrapProof).toBeUndefined();
+    client.stop();
+  });
+
   it('defaults to independent Control but enables input only after every channel and worker acknowledgement', async () => {
     const intervalSpy = vi.spyOn(globalThis, 'setInterval');
     const timeoutSpy = vi.spyOn(globalThis, 'setTimeout');

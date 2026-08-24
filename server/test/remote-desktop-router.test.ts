@@ -2,7 +2,11 @@ import { describe, expect, it, vi } from 'vitest';
 import type WebSocket from 'ws';
 import type { Database } from '../src/db/client.js';
 import type { ControlledMachineAccessRow } from '../src/share/machine-access.js';
-import { RemoteDesktopRouter } from '../src/ws/remote-desktop-router.js';
+import {
+  RemoteDesktopRouter,
+  type RemoteDesktopRouteRegistry,
+  type RemoteDesktopRouteRegistryIdentity,
+} from '../src/ws/remote-desktop-router.js';
 import {
   REMOTE_DESKTOP_ACCESS_MODE,
   REMOTE_DESKTOP_AUDIT_EVENT,
@@ -17,6 +21,10 @@ import {
   REMOTE_DESKTOP_TERMINAL_REASON,
 } from '../../shared/remote-desktop.js';
 import { NODE_ROLE } from '../../shared/remote-exec.js';
+import {
+  REMOTE_DESKTOP_ACTOR_SOURCE,
+  type RemoteDesktopOutboxEvent,
+} from '../../shared/remote-desktop-access.js';
 
 const requestId = 'request_12345678';
 const start = {
@@ -65,18 +73,38 @@ function fixture(options: {
   access?: ControlledMachineAccessRow | null;
   resolveAccess?: (userId: string) => Promise<ControlledMachineAccessRow | null>;
   credentialExpiresAt?: number;
+  routeRegistry?: RemoteDesktopRouteRegistry;
+  routeAuthority?: RemoteDesktopRouteRegistryIdentity['authority'];
+  allocateRouteGeneration?: () => Promise<number>;
 } = {}) {
   const browserA = {} as WebSocket;
   const browserB = {} as WebSocket;
   const browserMessages = new Map<WebSocket, Array<Record<string, unknown>>>();
   const daemonMessages: Array<Record<string, unknown>> = [];
   const audits: Array<{ event: string; fields: Readonly<Record<string, string | number | boolean>> }> = [];
+  const registryEvents: string[] = [];
   let generation = 7;
   let available = true;
   let supported = true;
   let featureEnabled = true;
   let access = options.access === undefined ? validAccess() : options.access;
   let resolver = options.resolveAccess ?? (async () => access);
+  const routeRegistry: RemoteDesktopRouteRegistry = options.routeRegistry ?? {
+    reserve: async (_db, input) => {
+      registryEvents.push(`reserve:${input.routeId}:${input.routeGeneration}`);
+      return {
+        hostId: 'host-00000000000000000001',
+        routeGeneration: input.routeGeneration,
+        authority: options.routeAuthority ?? { actorSource: REMOTE_DESKTOP_ACTOR_SOURCE.ACCOUNT },
+      };
+    },
+    activate: async (_db, input) => {
+      registryEvents.push(`activate:${input.routeId}:${input.routeGeneration}`);
+    },
+    close: async (_db, input) => {
+      registryEvents.push(`close:${input.routeId}:${input.routeGeneration}`);
+    },
+  };
   const router = new RemoteDesktopRouter({
     serverId: () => 'controlled-win',
     database: () => ({}) as Database,
@@ -84,6 +112,7 @@ function fixture(options: {
     daemonSupportsRemoteDesktop: () => supported,
     featureEnabled: () => featureEnabled,
     daemonGeneration: () => generation,
+    allocateRouteGeneration: options.allocateRouteGeneration ?? (async () => generation),
     iceServers: () => ({
       iceServers: [
         'stun:stun.example.test:3478',
@@ -94,6 +123,7 @@ function fixture(options: {
     sendDaemon: vi.fn((message, expectedGeneration) => {
       if (!available || expectedGeneration !== generation) return false;
       daemonMessages.push(message);
+      registryEvents.push(`daemon:${String(message.type)}`);
       return true;
     }),
     sendBrowser: (socket, message) => {
@@ -102,6 +132,7 @@ function fixture(options: {
       browserMessages.set(socket, messages);
     },
     resolveAccess: async (_db, userId) => resolver(userId),
+    routeRegistry,
     audit: (event, fields) => { audits.push({ event, fields }); },
   });
   return {
@@ -110,6 +141,7 @@ function fixture(options: {
     browserB,
     daemonMessages,
     audits,
+    registryEvents,
     messages: (socket: WebSocket) => browserMessages.get(socket) ?? [],
     setAccess: (value: ControlledMachineAccessRow | null) => { access = value; },
     setResolver: (value: (userId: string) => Promise<ControlledMachineAccessRow | null>) => { resolver = value; },
@@ -143,6 +175,217 @@ async function authorize(
 }
 
 describe('RemoteDesktopRouter', () => {
+  it('applies exact durable downgrade/terminal effects and rejects a replacement generation', async () => {
+    const downgraded = fixture({
+      routeAuthority: {
+        actorSource: REMOTE_DESKTOP_ACTOR_SOURCE.ATTENDED_LINK,
+        actorAuditId: 'audit-link-1',
+        authorityGeneration: 1,
+        expiryRevision: 1,
+        commitRevision: 1,
+      },
+    });
+    const authority = await authorize(downgraded);
+    const event: RemoteDesktopOutboxEvent = {
+      idempotencyKey: 'down:1', sequence: 1, authorityKind: 'link', effect: 'downgrade', scope: 'route',
+      hostId: 'host-00000000000000000001', targetServerId: 'controlled-win',
+      actorAuditId: 'audit-link-1', authorityGeneration: 2, expiryRevision: 1,
+      commitRevision: 2, routeGeneration: 7,
+    };
+    const authorityMatch = {
+      authorityKind: 'link' as const,
+      actorAuditId: event.actorAuditId,
+      authorityGeneration: event.authorityGeneration,
+      expiryRevision: event.expiryRevision,
+      commitRevision: event.commitRevision,
+    };
+    expect(downgraded.router.applyGuestOutboxEffect(event, authority.sessionId, 8, authorityMatch))
+      .toEqual({ status: 'not_owner' });
+    expect(downgraded.router.applyGuestOutboxEffect(event, authority.sessionId, 7, authorityMatch))
+      .toEqual({ status: 'applied' });
+    expect(downgraded.daemonMessages.at(-1)).toMatchObject({
+      type: REMOTE_DESKTOP_MSG.MODE_STATE,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW,
+      inputEpoch: 2,
+      reason: REMOTE_DESKTOP_MODE_REASON.AUTHORITY_LOST,
+    });
+    expect(downgraded.router.applyGuestOutboxEffect(event, authority.sessionId, 7, authorityMatch))
+      .toEqual({ status: 'duplicate' });
+
+    const terminal = { ...event, idempotencyKey: 'term:2', sequence: 2, effect: 'terminal' } as const;
+    expect(downgraded.router.applyGuestOutboxEffect(terminal, authority.sessionId, 7, authorityMatch))
+      .toEqual({ status: 'applied' });
+    expect(downgraded.daemonMessages.at(-1)).toMatchObject({
+      type: REMOTE_DESKTOP_MSG.STOP,
+      sessionId: authority.sessionId,
+    });
+    expect(downgraded.messages(downgraded.browserA).at(-1)).toMatchObject({
+      type: REMOTE_DESKTOP_MSG.TERMINAL,
+      reason: REMOTE_DESKTOP_TERMINAL_REASON.AUTHORITY_REVOKED,
+    });
+  });
+
+  it('applies deadline updates as a minimum and expires the route at that absolute time', async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(1_800_000_000_000);
+      const f = fixture({
+        routeAuthority: {
+          actorSource: REMOTE_DESKTOP_ACTOR_SOURCE.ATTENDED_LINK,
+          actorAuditId: 'audit-link-1',
+          authorityGeneration: 1,
+          expiryRevision: 1,
+          commitRevision: 1,
+        },
+      });
+      const authority = await authorize(f);
+      const deadlineAt = Date.now() + 2_000;
+      const event: RemoteDesktopOutboxEvent = {
+        idempotencyKey: 'deadline:1', sequence: 1, authorityKind: 'link', effect: 'deadline_update', scope: 'route',
+        hostId: 'host-00000000000000000001', targetServerId: 'controlled-win',
+        actorAuditId: 'audit-link-1', authorityGeneration: 1, expiryRevision: 2,
+        commitRevision: 2, routeGeneration: 7, deadlineAt,
+      };
+      const authorityMatch = {
+        authorityKind: 'link' as const,
+        actorAuditId: event.actorAuditId,
+        authorityGeneration: event.authorityGeneration,
+        expiryRevision: event.expiryRevision,
+        commitRevision: event.commitRevision,
+      };
+      expect(f.router.applyGuestOutboxEffect(event, authority.sessionId, 7, authorityMatch))
+        .toEqual({ status: 'applied' });
+      expect(f.daemonMessages.at(-1)).toMatchObject({
+        type: REMOTE_DESKTOP_MSG.LEASE,
+        leaseExpiresAt: deadlineAt,
+      });
+      expect(f.router.applyGuestOutboxEffect(
+        { ...event, deadlineAt: deadlineAt + 10_000 },
+        authority.sessionId,
+        7,
+        authorityMatch,
+      )).toEqual({ status: 'duplicate' });
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(f.messages(f.browserA).at(-1)).toMatchObject({
+        type: REMOTE_DESKTOP_MSG.TERMINAL,
+        reason: REMOTE_DESKTOP_TERMINAL_REASON.AUTHORITY_EXPIRED,
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('accepts a password terminal only for the exact older in-memory actor generation', async () => {
+    const f = fixture({
+      routeAuthority: {
+        actorSource: REMOTE_DESKTOP_ACTOR_SOURCE.NODE_PASSWORD,
+        actorAuditId: 'password-audit-1',
+        sessionAuditId: 'password-session-1',
+        passwordGeneration: 4,
+      },
+    });
+    const authority = await authorize(f);
+    const event: RemoteDesktopOutboxEvent = {
+      idempotencyKey: 'password:5',
+      sequence: 1,
+      authorityKind: 'password',
+      effect: 'terminal',
+      scope: 'route',
+      hostId: 'host-00000000000000000001',
+      targetServerId: 'controlled-win',
+      actorAuditId: 'password-audit-1',
+      sessionAuditId: 'password-session-1',
+      passwordGeneration: 5,
+      routeGeneration: 7,
+    };
+    const match = {
+      authorityKind: 'password' as const,
+      actorAuditId: 'password-audit-1',
+      sessionAuditId: 'password-session-1',
+      passwordGeneration: 5,
+    };
+    expect(f.router.applyGuestOutboxEffect(
+      event,
+      authority.sessionId,
+      7,
+      { ...match, passwordGeneration: 6 },
+    )).toEqual({ status: 'not_owner' });
+    expect(f.router.applyGuestOutboxEffect(event, authority.sessionId, 7, match))
+      .toEqual({ status: 'applied' });
+    expect(f.messages(f.browserA).at(-1)).toMatchObject({
+      type: REMOTE_DESKTOP_MSG.TERMINAL,
+      reason: REMOTE_DESKTOP_TERMINAL_REASON.AUTHORITY_REVOKED,
+    });
+  });
+
+  it('durably reserves and activates the canonical-host route before PREPARE, then closes it on Stop', async () => {
+    const f = fixture();
+    const authority = await authorize(f);
+    expect(f.registryEvents.slice(0, 3)).toEqual([
+      `reserve:${authority.sessionId}:7`,
+      `activate:${authority.sessionId}:7`,
+      `daemon:${REMOTE_DESKTOP_MSG.PREPARE}`,
+    ]);
+
+    await f.router.handleBrowser(f.browserA, 'owner-user', {
+      type: REMOTE_DESKTOP_MSG.STOP,
+      ...authority,
+    });
+    await vi.waitFor(() => expect(f.registryEvents).toContain(`close:${authority.sessionId}:7`));
+    expect(f.registryEvents.filter((event) => event === `close:${authority.sessionId}:7`)).toHaveLength(1);
+  });
+
+  it('uses a route incarnation that is independent from the daemon generation on PREPARE and LEASE', async () => {
+    const f = fixture({ allocateRouteGeneration: async () => 101 });
+    const authority = await authorize(f);
+    expect(f.registryEvents[0]).toMatch(/reserve:.*:101$/);
+    expect(f.daemonMessages[0]).toMatchObject({
+      type: REMOTE_DESKTOP_MSG.PREPARE,
+      daemonGeneration: 7,
+      routeGeneration: 101,
+    });
+    await f.router.revalidateUser('owner-user');
+    expect(f.daemonMessages.at(-1)).toMatchObject({
+      type: REMOTE_DESKTOP_MSG.LEASE,
+      daemonGeneration: 7,
+      routeGeneration: 101,
+    });
+    await f.router.handleBrowser(f.browserA, 'owner-user', {
+      type: REMOTE_DESKTOP_MSG.STOP,
+      ...authority,
+    });
+  });
+
+  it('never dispatches PREPARE when the durable route cannot become active', async () => {
+    const events: string[] = [];
+    const routeRegistry: RemoteDesktopRouteRegistry = {
+      reserve: async (_db, input) => {
+        events.push(`reserve:${input.routeId}`);
+        return {
+          hostId: 'host-00000000000000000001',
+          routeGeneration: input.routeGeneration,
+          authority: { actorSource: REMOTE_DESKTOP_ACTOR_SOURCE.ACCOUNT },
+        };
+      },
+      activate: async (_db, input) => {
+        events.push(`activate:${input.routeId}`);
+        throw new Error('synthetic_gate_closed');
+      },
+      close: async (_db, input) => { events.push(`close:${input.routeId}`); },
+    };
+    const f = fixture({ routeRegistry });
+
+    await f.router.handleBrowser(f.browserA, 'owner-user', start);
+    await vi.waitFor(() => expect(events.some((event) => event.startsWith('close:'))).toBe(true));
+    expect(f.daemonMessages).toHaveLength(0);
+    expect(f.messages(f.browserA).at(-1)).toMatchObject({
+      type: REMOTE_DESKTOP_MSG.ERROR,
+      error: REMOTE_DESKTOP_ERROR.CAPABILITY_UNAVAILABLE,
+      retryable: true,
+    });
+    expect(f.router.stats().active).toBe(0);
+  });
+
   it('never forwards media or input data envelopes over the application WebSocket', async () => {
     const f = fixture();
     const authority = await authorize(f);
@@ -862,13 +1105,24 @@ describe('RemoteDesktopRouter', () => {
     }
   });
 
-  it('tears down on daemon replacement, browser close, and malformed current-generation frames', async () => {
+  it('suspends on daemon replacement and still tears down browser close/malformed frames', async () => {
     const replaced = fixture();
     const firstAuthority = await authorize(replaced);
     replaced.setGeneration(8);
+    expect(replaced.router.stats().active).toBe(1);
+    await replaced.router.handleBrowser(replaced.browserA, 'owner-user', {
+      type: REMOTE_DESKTOP_MSG.OFFER,
+      ...firstAuthority,
+      sdp: 'must-not-cross-suspended-generation',
+    });
+    expect(replaced.messages(replaced.browserA).at(-1)).toMatchObject({
+      type: REMOTE_DESKTOP_MSG.ERROR,
+      error: REMOTE_DESKTOP_ERROR.INVALID_AUTHORITY,
+    });
+    expect(replaced.daemonMessages).toHaveLength(1);
+    await expect(replaced.router.reconcileDaemonReplacement(8)).resolves.toBe(0);
     expect(replaced.messages(replaced.browserA).at(-1)).toMatchObject({
       type: REMOTE_DESKTOP_MSG.TERMINAL,
-      ...firstAuthority,
       reason: REMOTE_DESKTOP_TERMINAL_REASON.DAEMON_REPLACED,
     });
 

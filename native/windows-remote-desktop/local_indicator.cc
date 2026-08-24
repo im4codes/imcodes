@@ -1,11 +1,14 @@
 #include "third_party/imcodes_remote_desktop/local_indicator.h"
 
 #include <algorithm>
+#include <cstring>
 #include <string>
 
 #include <windowsx.h>
 #include <dwmapi.h>
 #include <wtsapi32.h>
+
+#include "third_party/imcodes_remote_desktop/brand_logo_generated.h"
 
 namespace imcodes::rd {
 namespace {
@@ -20,10 +23,126 @@ constexpr UINT kDispatchInputMessage = WM_APP + 3;
 constexpr UINT kProbeInputMessage = WM_APP + 4;
 constexpr UINT kReadClipboardMessage = WM_APP + 5;
 constexpr UINT kMovePointerMessage = WM_APP + 6;
+// Logical (96-dpi) geometry. Every consumer scales it through Scaled(); the
+// window used to be laid out in raw pixels while only the fonts scaled, so at
+// 200% the text overflowed a window that had stayed 368x148.
 constexpr int kExpandedWidth = 368;
 constexpr int kExpandedHeight = 148;
 constexpr int kCollapsedSize = 38;
 constexpr int kCornerMargin = 14;
+constexpr int kLogoLogicalSize = 20;
+// The product name is a compile-time constant on purpose. Nothing a remote
+// requester sends may ever reach this window -- see the note on Update().
+constexpr wchar_t kProductName[] = L"IM.codes";
+constexpr wchar_t kSurfaceName[] = L"Remote Desktop";
+
+int Scaled(UINT dpi, int logical) {
+  return MulDiv(logical, dpi > 0 ? static_cast<int>(dpi) : 96, 96);
+}
+
+UINT WindowDpi(HWND window) {
+  const UINT dpi = window ? GetDpiForWindow(window) : 0;
+  return dpi > 0 ? dpi : 96;
+}
+
+/**
+ * High contrast replaces the brand palette with the user's chosen system
+ * colours. Ignoring it would leave an always-on-top window that a
+ * low-vision user cannot read, and it is the one surface they cannot dismiss.
+ */
+bool HighContrastActive() {
+  HIGHCONTRASTW info{};
+  info.cbSize = sizeof(info);
+  if (!SystemParametersInfoW(SPI_GETHIGHCONTRAST, sizeof(info), &info, 0)) {
+    return false;
+  }
+  return (info.dwFlags & HCF_HIGHCONTRASTON) != 0;
+}
+
+struct Palette {
+  COLORREF surface;
+  COLORREF border;
+  COLORREF title;
+  COLORREF detail;
+  COLORREF stop_fill;
+  COLORREF stop_border;
+  COLORREF stop_text;
+};
+
+Palette CurrentPalette(bool stopping) {
+  if (HighContrastActive()) {
+    const COLORREF window = GetSysColor(COLOR_WINDOW);
+    const COLORREF text = GetSysColor(COLOR_WINDOWTEXT);
+    const COLORREF accent = GetSysColor(stopping ? COLOR_GRAYTEXT : COLOR_HOTLIGHT);
+    return Palette{window, text, text, text, window, accent, text};
+  }
+  return Palette{
+      RGB(5, 16, 29), RGB(50, 196, 255), RGB(227, 247, 255), RGB(137, 177, 205),
+      stopping ? RGB(52, 63, 74) : RGB(116, 29, 49),
+      stopping ? RGB(88, 103, 117) : RGB(244, 80, 112),
+      stopping ? RGB(165, 179, 190) : RGB(255, 236, 241)};
+}
+
+/** Nearest compiled bitmap at or above `wanted`, so we never upscale. */
+const brand::LogoBitmap* SelectLogoBitmap(int wanted) {
+  const brand::LogoBitmap* best = nullptr;
+  for (int i = 0; i < brand::kLogoBitmapCount; ++i) {
+    const brand::LogoBitmap& candidate = brand::kLogoBitmaps[i];
+    if (candidate.size >= wanted && (!best || candidate.size < best->size)) {
+      best = &candidate;
+    }
+  }
+  if (best) return best;
+  // Every compiled size is smaller than the monitor wants: use the largest.
+  for (int i = 0; i < brand::kLogoBitmapCount; ++i) {
+    if (!best || brand::kLogoBitmaps[i].size > best->size) {
+      best = &brand::kLogoBitmaps[i];
+    }
+  }
+  return best;
+}
+
+/**
+ * Returns false when the logo could not be composited for any reason -- no
+ * compiled bitmap, DIB allocation refused, AlphaBlend unavailable. The caller
+ * then draws the text-only layout instead of leaving a hole, so a failed
+ * image can never cost the user the disclosure itself.
+ */
+bool DrawBrandLogo(HDC dc, int x, int y, int edge) {
+  const brand::LogoBitmap* bitmap = SelectLogoBitmap(edge);
+  if (!bitmap || !bitmap->premultiplied_bgra || bitmap->size <= 0) return false;
+  BITMAPINFO info{};
+  info.bmiHeader.biSize = sizeof(info.bmiHeader);
+  info.bmiHeader.biWidth = bitmap->size;
+  // Negative height: the generated rows are top-down.
+  info.bmiHeader.biHeight = -bitmap->size;
+  info.bmiHeader.biPlanes = 1;
+  info.bmiHeader.biBitCount = 32;
+  info.bmiHeader.biCompression = BI_RGB;
+  void* pixels = nullptr;
+  const HDC memory = CreateCompatibleDC(dc);
+  if (!memory) return false;
+  const HBITMAP dib =
+      CreateDIBSection(memory, &info, DIB_RGB_COLORS, &pixels, nullptr, 0);
+  if (!dib || !pixels) {
+    if (dib) DeleteObject(dib);
+    DeleteDC(memory);
+    return false;
+  }
+  memcpy(pixels, bitmap->premultiplied_bgra,
+         static_cast<size_t>(bitmap->size) * bitmap->size * 4);
+  const HGDIOBJ old = SelectObject(memory, dib);
+  BLENDFUNCTION blend{};
+  blend.BlendOp = AC_SRC_OVER;
+  blend.SourceConstantAlpha = 255;
+  blend.AlphaFormat = AC_SRC_ALPHA;
+  const BOOL drawn = AlphaBlend(dc, x, y, edge, edge, memory, 0, 0,
+                                bitmap->size, bitmap->size, blend);
+  SelectObject(memory, old);
+  DeleteObject(dib);
+  DeleteDC(memory);
+  return drawn != FALSE;
+}
 
 struct InputDispatchRequest {
   UINT count = 0;
@@ -80,13 +199,14 @@ void WriteCollapsedPreference(bool collapsed) {
   RegCloseKey(key);
 }
 
-RECT CollapseRect(const RECT& client) {
-  return RECT{client.right - 42, 8, client.right - 8, 40};
+RECT CollapseRect(const RECT& client, UINT dpi) {
+  return RECT{client.right - Scaled(dpi, 42), Scaled(dpi, 8),
+              client.right - Scaled(dpi, 8), Scaled(dpi, 40)};
 }
 
-RECT StopRect(const RECT& client) {
-  return RECT{16, client.bottom - 50, client.right - 16,
-              client.bottom - 14};
+RECT StopRect(const RECT& client, UINT dpi) {
+  return RECT{Scaled(dpi, 16), client.bottom - Scaled(dpi, 50),
+              client.right - Scaled(dpi, 16), client.bottom - Scaled(dpi, 14)};
 }
 
 bool Contains(const RECT& rect, int x, int y) {
@@ -245,9 +365,9 @@ LRESULT LocalIndicator::HandleMessage(HWND window, UINT message,
       GetClientRect(window, &client);
       const int x = GET_X_LPARAM(lparam);
       const int y = GET_Y_LPARAM(lparam);
-      if (Contains(CollapseRect(client), x, y)) {
+      if (Contains(CollapseRect(client, WindowDpi(window)), x, y)) {
         SetCollapsed(true, true);
-      } else if (Contains(StopRect(client), x, y)) {
+      } else if (Contains(StopRect(client, WindowDpi(window)), x, y)) {
         RequestStopAll();
       }
       return 0;
@@ -258,8 +378,10 @@ LRESULT LocalIndicator::HandleMessage(HWND window, UINT message,
       ScreenToClient(window, &cursor);
       RECT client{};
       GetClientRect(window, &client);
-      if (collapsed_ || Contains(CollapseRect(client), cursor.x, cursor.y) ||
-          Contains(StopRect(client), cursor.x, cursor.y)) {
+      const UINT hover_dpi = WindowDpi(window);
+      if (collapsed_ ||
+          Contains(CollapseRect(client, hover_dpi), cursor.x, cursor.y) ||
+          Contains(StopRect(client, hover_dpi), cursor.x, cursor.y)) {
         SetCursor(LoadCursorW(nullptr, IDC_HAND));
         return TRUE;
       }
@@ -446,6 +568,8 @@ void LocalIndicator::ThreadMain() {
   RegisterClassW(&window_class);
 
   collapsed_ = ReadCollapsedPreference();
+  // Creation size is logical only; the window does not exist yet so its DPI is
+  // unknown. AnchorToCorner() re-sizes with the real monitor DPI right after.
   const int width = collapsed_ ? kCollapsedSize : kExpandedWidth;
   const int height = collapsed_ ? kCollapsedSize : kExpandedHeight;
   const HWND window = CreateWindowExW(
@@ -497,15 +621,15 @@ void LocalIndicator::AnchorToCorner(HWND window) {
   MONITORINFO info{};
   info.cbSize = sizeof(info);
   if (!GetMonitorInfoW(ActiveMonitor(), &info)) return;
-  const int width = collapsed_ ? kCollapsedSize : kExpandedWidth;
-  const int height = collapsed_ ? kCollapsedSize : kExpandedHeight;
-  const int x = std::max(info.rcWork.left,
-                         info.rcWork.right - width - kCornerMargin);
-  const int y = std::max(info.rcWork.top,
-                         info.rcWork.bottom - height - kCornerMargin);
+  const UINT dpi = WindowDpi(window);
+  const int width = Scaled(dpi, collapsed_ ? kCollapsedSize : kExpandedWidth);
+  const int height = Scaled(dpi, collapsed_ ? kCollapsedSize : kExpandedHeight);
+  const int margin = Scaled(dpi, kCornerMargin);
+  const int x = std::max(info.rcWork.left, info.rcWork.right - width - margin);
+  const int y = std::max(info.rcWork.top, info.rcWork.bottom - height - margin);
   SetWindowPos(window, HWND_TOPMOST, x, y, width, height,
                SWP_NOACTIVATE | SWP_SHOWWINDOW);
-  const int radius = collapsed_ ? 12 : 18;
+  const int radius = Scaled(dpi, collapsed_ ? 12 : 18);
   SetWindowRgn(window, CreateRoundRectRgn(0, 0, width + 1, height + 1,
                                           radius, radius), TRUE);
 }
@@ -525,66 +649,99 @@ void LocalIndicator::PaintWindow(HWND window) {
   const HDC dc = BeginPaint(window, &paint);
   RECT client{};
   GetClientRect(window, &client);
+  const UINT dpi = WindowDpi(window);
+  const bool stopping = stop_requested_.load();
+  const Palette palette = CurrentPalette(stopping);
   SetBkMode(dc, TRANSPARENT);
-  DrawRoundedFill(dc, client, collapsed_ ? 12 : 18, RGB(5, 16, 29),
-                  RGB(50, 196, 255));
+  DrawRoundedFill(dc, client, Scaled(dpi, collapsed_ ? 12 : 18),
+                  palette.surface, palette.border);
 
   if (collapsed_) {
-    const HBRUSH glow = CreateSolidBrush(RGB(84, 219, 255));
-    const HGDIOBJ old = SelectObject(dc, glow);
-    POINT triangle[] = {{13, 10}, {29, 19}, {13, 28}};
-    Polygon(dc, triangle, 3);
-    SelectObject(dc, old);
-    DeleteObject(glow);
+    // Collapsed is the smallest persistent affordance, so it carries the mark
+    // itself. If the bitmap cannot be composited it falls back to the original
+    // glyph rather than collapsing to an empty chip.
+    const int edge = Scaled(dpi, 18);
+    const int inset = (Scaled(dpi, kCollapsedSize) - edge) / 2;
+    if (!DrawBrandLogo(dc, inset, inset, edge)) {
+      const HBRUSH glow = CreateSolidBrush(palette.border);
+      const HGDIOBJ old = SelectObject(dc, glow);
+      POINT triangle[] = {{Scaled(dpi, 13), Scaled(dpi, 10)},
+                          {Scaled(dpi, 29), Scaled(dpi, 19)},
+                          {Scaled(dpi, 13), Scaled(dpi, 28)}};
+      Polygon(dc, triangle, 3);
+      SelectObject(dc, old);
+      DeleteObject(glow);
+    }
     EndPaint(window, &paint);
     return;
   }
 
-  const HBRUSH live = CreateSolidBrush(RGB(56, 230, 151));
-  const HGDIOBJ old_live = SelectObject(dc, live);
-  Ellipse(dc, 18, 18, 28, 28);
-  SelectObject(dc, old_live);
-  DeleteObject(live);
+  const int logo_edge = Scaled(dpi, kLogoLogicalSize);
+  const int logo_x = Scaled(dpi, 16);
+  const int logo_y = Scaled(dpi, 12);
+  const bool logo_drawn = DrawBrandLogo(dc, logo_x, logo_y, logo_edge);
+  if (!logo_drawn) {
+    // Image failure must not shift the text: the live dot occupies the same
+    // box the logo would have.
+    const HBRUSH live = CreateSolidBrush(palette.border);
+    const HGDIOBJ old_live = SelectObject(dc, live);
+    Ellipse(dc, logo_x + logo_edge / 4, logo_y + logo_edge / 4,
+            logo_x + logo_edge * 3 / 4, logo_y + logo_edge * 3 / 4);
+    SelectObject(dc, old_live);
+    DeleteObject(live);
+  }
 
   const HFONT title_font = CreateUiFont(window, 11, FW_SEMIBOLD);
   const HFONT detail_font = CreateUiFont(window, 9, FW_NORMAL);
   const HFONT button_font = CreateUiFont(window, 9, FW_SEMIBOLD);
   const HGDIOBJ old_font = SelectObject(dc, title_font);
-  SetTextColor(dc, RGB(227, 247, 255));
-  RECT title{36, 9, client.right - 50, 39};
-  DrawTextW(dc, L"IM.CODES  //  REMOTE LINK", -1, &title,
-            DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+  SetTextColor(dc, palette.title);
+  // The product name is spelled out next to the mark so the disclosure is
+  // attributable even when the logo cannot render or the user cannot see it.
+  const std::wstring heading =
+      std::wstring(kProductName) + L"  ·  " + kSurfaceName;
+  RECT title{logo_x + logo_edge + Scaled(dpi, 10), Scaled(dpi, 9),
+             client.right - Scaled(dpi, 50), Scaled(dpi, 39)};
+  DrawTextW(dc, heading.c_str(), -1, &title,
+            DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
 
   SelectObject(dc, detail_font);
-  SetTextColor(dc, RGB(137, 177, 205));
+  SetTextColor(dc, palette.detail);
+  // Counts only. See the isolation note on LocalIndicator::Update().
   const std::wstring detail = std::to_wstring(viewers_.load()) +
       L" VIEWING  ·  " + std::to_wstring(controllers_.load()) +
       L" CONTROLLING";
-  RECT detail_rect{18, 42, client.right - 18, 75};
+  RECT detail_rect{Scaled(dpi, 18), Scaled(dpi, 42),
+                   client.right - Scaled(dpi, 18), Scaled(dpi, 75)};
   DrawTextW(dc, detail.c_str(), -1, &detail_rect,
-            DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+            DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
 
-  const RECT collapse = CollapseRect(client);
-  DrawRoundedFill(dc, collapse, 10, RGB(10, 35, 55), RGB(43, 111, 149));
-  const HBRUSH arrow = CreateSolidBrush(RGB(119, 213, 255));
+  const RECT collapse = CollapseRect(client, dpi);
+  DrawRoundedFill(dc, collapse, Scaled(dpi, 10),
+                  HighContrastActive() ? palette.surface : RGB(10, 35, 55),
+                  HighContrastActive() ? palette.title : RGB(43, 111, 149));
+  const HBRUSH arrow = CreateSolidBrush(
+      HighContrastActive() ? palette.title : RGB(119, 213, 255));
   const HGDIOBJ old_arrow = SelectObject(dc, arrow);
   const int cx = (collapse.left + collapse.right) / 2;
   const int cy = (collapse.top + collapse.bottom) / 2;
-  POINT fold[] = {{cx - 7, cy - 4}, {cx + 7, cy - 4}, {cx, cy + 5}};
+  POINT fold[] = {{cx - Scaled(dpi, 7), cy - Scaled(dpi, 4)},
+                  {cx + Scaled(dpi, 7), cy - Scaled(dpi, 4)},
+                  {cx, cy + Scaled(dpi, 5)}};
   Polygon(dc, fold, 3);
   SelectObject(dc, old_arrow);
   DeleteObject(arrow);
 
-  const RECT stop = StopRect(client);
-  const bool stopping = stop_requested_.load();
-  DrawRoundedFill(dc, stop, 12,
-                  stopping ? RGB(52, 63, 74) : RGB(116, 29, 49),
-                  stopping ? RGB(88, 103, 117) : RGB(244, 80, 112));
+  const RECT stop = StopRect(client, dpi);
+  DrawRoundedFill(dc, stop, Scaled(dpi, 12), palette.stop_fill,
+                  palette.stop_border);
   SelectObject(dc, button_font);
-  SetTextColor(dc, stopping ? RGB(165, 179, 190) : RGB(255, 236, 241));
+  SetTextColor(dc, palette.stop_text);
   RECT stop_text = stop;
   DrawTextW(dc, stopping ? L"STOPPING…" : L"STOP ALL REMOTE SESSIONS", -1,
-            &stop_text, DT_SINGLELINE | DT_CENTER | DT_VCENTER);
+            &stop_text,
+            DT_SINGLELINE | DT_CENTER | DT_VCENTER | DT_END_ELLIPSIS |
+                DT_NOPREFIX);
 
   SelectObject(dc, old_font);
   DeleteObject(title_font);

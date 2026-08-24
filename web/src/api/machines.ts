@@ -69,6 +69,8 @@ export function daemonRemoteDesktopMachine(
 
 export interface MachineListItem {
   serverId: string;
+  /** Canonical physical-host identity. Required for Owner guest-access management. */
+  remoteDesktopHostId?: string;
   refName: string;
   displayName: string;
   os?: string;
@@ -245,6 +247,9 @@ function normalizeMachine(raw: unknown): MachineListItem | null {
   const capabilities = validateControlledNodeCapabilities(raw.capabilities);
   return {
     serverId,
+    ...(typeof raw.remoteDesktopHostId === 'string' && raw.remoteDesktopHostId
+      ? { remoteDesktopHostId: raw.remoteDesktopHostId }
+      : {}),
     refName,
     displayName: typeof raw.displayName === 'string' && raw.displayName ? raw.displayName : refName,
     ...(typeof raw.os === 'string' && raw.os ? { os: raw.os } : {}),

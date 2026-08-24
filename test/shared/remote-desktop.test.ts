@@ -22,6 +22,7 @@ import {
   REMOTE_DESKTOP_STATE,
   REMOTE_DESKTOP_TERMINAL_REASON,
   isRemoteDesktopSequenceAccepted,
+  hasRemoteDesktopIndependentRouteGeneration,
   isRemoteDesktopDaemonMessageType,
   isRemoteDesktopPresentedFrameCompatible,
   mapRemoteDesktopPointToPhysicalPixels,
@@ -188,20 +189,41 @@ describe('remote desktop production contract', () => {
       serverId: 'must-be-query-scoped',
     })).toEqual({ ok: false, error: REMOTE_DESKTOP_ERROR.INVALID_REQUEST });
     expect(validateRemoteDesktopAuthorized({ type: REMOTE_DESKTOP_MSG.AUTHORIZED, ...authority })).toMatchObject({ ok: true });
-    expect(validateRemoteDesktopDaemonCommand({ type: REMOTE_DESKTOP_MSG.PREPARE, ...authority })).toMatchObject({ ok: true });
+    expect(validateRemoteDesktopAuthorized({
+      type: REMOTE_DESKTOP_MSG.AUTHORIZED,
+      ...authority,
+      routeGeneration: 1,
+    })).toEqual({ ok: false, error: REMOTE_DESKTOP_ERROR.INVALID_REQUEST });
+    // The v2 base protocol keeps legacy authenticated nodes usable. Such a
+    // route can never qualify for controlled-host privacy management because
+    // it has no independent route-incarnation fence.
     expect(validateRemoteDesktopDaemonCommand({
       type: REMOTE_DESKTOP_MSG.PREPARE,
       ...authority,
+    })).toMatchObject({ ok: true });
+    expect(hasRemoteDesktopIndependentRouteGeneration({})).toBe(false);
+    expect(hasRemoteDesktopIndependentRouteGeneration({ routeGeneration: 0 })).toBe(true);
+    expect(validateRemoteDesktopDaemonCommand({
+      type: REMOTE_DESKTOP_MSG.PREPARE,
+      ...authority,
+      routeGeneration: 0,
+    })).toMatchObject({ ok: true });
+    expect(validateRemoteDesktopDaemonCommand({
+      type: REMOTE_DESKTOP_MSG.PREPARE,
+      ...authority,
+      routeGeneration: 1,
       reconnectAttempt: REMOTE_DESKTOP_LIMITS.MAX_RECONNECT_ATTEMPTS,
     })).toMatchObject({ ok: true });
     expect(validateRemoteDesktopDaemonCommand({
       type: REMOTE_DESKTOP_MSG.PREPARE,
       ...authority,
+      routeGeneration: 1,
       reconnectAttempt: REMOTE_DESKTOP_LIMITS.MAX_RECONNECT_ATTEMPTS + 1,
     })).toEqual({ ok: false, error: REMOTE_DESKTOP_ERROR.INVALID_REQUEST });
     expect(validateRemoteDesktopDaemonCommand({
       type: REMOTE_DESKTOP_MSG.PREPARE,
       ...authority,
+      routeGeneration: 1,
       leaseExpiresAt: authority.expiresAt + 1,
     })).toEqual({ ok: false, error: REMOTE_DESKTOP_ERROR.INVALID_REQUEST });
     expect(validateRemoteDesktopAuthorized({
@@ -259,6 +281,18 @@ describe('remote desktop production contract', () => {
       capability,
       leaseExpiresAt: 90_000,
       daemonGeneration: 0,
+      routeGeneration: 0,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW,
+      inputEpoch: 0,
+    })).toEqual({ ok: false, error: REMOTE_DESKTOP_ERROR.INVALID_REQUEST });
+    expect(validateRemoteDesktopDaemonCommand({
+      type: REMOTE_DESKTOP_MSG.LEASE,
+      requestId,
+      sessionId,
+      capability,
+      leaseExpiresAt: 90_000,
+      daemonGeneration: 7,
+      routeGeneration: -1,
       mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW,
       inputEpoch: 0,
     })).toEqual({ ok: false, error: REMOTE_DESKTOP_ERROR.INVALID_REQUEST });

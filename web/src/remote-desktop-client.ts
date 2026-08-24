@@ -33,6 +33,7 @@ import {
   type RemoteDesktopState,
 } from '@shared/remote-desktop.js';
 import { PendingWebRtcCandidates, toWebRtcIceServers } from '@shared/webrtc-connectivity.js';
+import type { RemoteDesktopBootstrapProof } from '@shared/remote-desktop-access.js';
 import { apiFetch, getApiBaseUrl } from './api.js';
 
 const DATA_BUFFER_HIGH_WATER_BYTES = 256 * 1024;
@@ -140,6 +141,9 @@ export interface RemoteDesktopClientDependencies {
   isDocumentVisible?: () => boolean;
   requestAnimationFrame?: (callback: FrameRequestCallback) => number;
   cancelAnimationFrame?: (handle: number) => void;
+  /** Anonymous guest bootstrap proof. It is sent as the bounded first WebSocket
+   * frame and cleared from this dependency object immediately afterwards. */
+  guestBootstrapProof?: RemoteDesktopBootstrapProof;
 }
 
 function isOpen(channel: RTCDataChannel | null): channel is RTCDataChannel {
@@ -156,6 +160,12 @@ function defaultSocketUrl(serverId: string, ticket: string): string {
     [REMOTE_DESKTOP_SERVER_ID_QUERY]: serverId,
     ticket,
   });
+  return `${base}${REMOTE_DESKTOP_SIGNALING_PATH}?${query.toString()}`;
+}
+
+function defaultGuestSocketUrl(serverId: string): string {
+  const base = getApiBaseUrl().replace(/^http/, 'ws').replace(/\/$/, '');
+  const query = new URLSearchParams({ [REMOTE_DESKTOP_SERVER_ID_QUERY]: serverId });
   return `${base}${REMOTE_DESKTOP_SIGNALING_PATH}?${query.toString()}`;
 }
 
@@ -253,28 +263,84 @@ class RemoteDesktopSignalingSocket {
   ): Promise<void> {
     const abort = new AbortController();
     this.ticketAbort = abort;
-    const ticket = await (this.deps.fetchTicket ?? defaultFetchTicket)(serverId, abort.signal);
+    const guestBootstrapProof = this.deps.guestBootstrapProof;
+    const socketUrl = guestBootstrapProof
+      ? defaultGuestSocketUrl(serverId)
+      : defaultSocketUrl(
+        serverId,
+        await (this.deps.fetchTicket ?? defaultFetchTicket)(serverId, abort.signal),
+      );
     if (abort.signal.aborted) throw new Error('remote_desktop_canceled');
-    const socket = (this.deps.createSocket ?? ((url) => new WebSocket(url)))(defaultSocketUrl(serverId, ticket));
+    const socket = (this.deps.createSocket ?? ((url) => new WebSocket(url)))(socketUrl);
     this.socket = socket;
     socket.binaryType = 'arraybuffer';
     await new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        socket.close(4000, 'remote_desktop_open_timeout');
-        reject(new Error('remote_desktop_open_timeout'));
-      }, START_TIMEOUT_MS);
-      const opened = () => {
-        clearTimeout(timer);
-        socket.removeEventListener('error', failed);
-        resolve();
-      };
-      const failed = () => {
+      let settled = false;
+      const cleanup = () => {
         clearTimeout(timer);
         socket.removeEventListener('open', opened);
-        reject(new Error('remote_desktop_socket_failed'));
+        socket.removeEventListener('error', failed);
+        socket.removeEventListener('close', closed);
+        socket.removeEventListener('message', redeemed);
       };
+      const succeed = () => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve();
+      };
+      const fail = (error: Error) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(error);
+      };
+      const timer = setTimeout(() => {
+        socket.close(4000, 'remote_desktop_open_timeout');
+        fail(new Error('remote_desktop_open_timeout'));
+      }, START_TIMEOUT_MS);
+      const redeemed = (event: MessageEvent) => {
+        if (typeof event.data !== 'string') {
+          socket.close(4000, 'remote_desktop_bootstrap_failed');
+          fail(new Error('remote_desktop_bootstrap_failed'));
+          return;
+        }
+        let value: unknown;
+        try { value = JSON.parse(event.data); } catch {
+          socket.close(4000, 'remote_desktop_bootstrap_failed');
+          fail(new Error('remote_desktop_bootstrap_failed'));
+          return;
+        }
+        const parsed = validateRemoteDesktopServerMessage(value);
+        if (!parsed.ok || parsed.value.type !== REMOTE_DESKTOP_MSG.BOOTSTRAP_REDEEMED) {
+          socket.close(4000, 'remote_desktop_bootstrap_failed');
+          fail(new Error('remote_desktop_bootstrap_failed'));
+          return;
+        }
+        succeed();
+      };
+      const opened = () => {
+        if (guestBootstrapProof) {
+          try {
+            socket.send(JSON.stringify(guestBootstrapProof));
+            this.deps.guestBootstrapProof = undefined;
+            socket.addEventListener('message', redeemed);
+          } catch {
+            socket.close(4000, 'remote_desktop_bootstrap_failed');
+            fail(new Error('remote_desktop_bootstrap_failed'));
+            return;
+          }
+          return;
+        }
+        succeed();
+      };
+      const failed = () => {
+        fail(new Error('remote_desktop_socket_failed'));
+      };
+      const closed = () => fail(new Error('remote_desktop_socket_failed'));
       socket.addEventListener('open', opened, { once: true });
       socket.addEventListener('error', failed, { once: true });
+      socket.addEventListener('close', closed, { once: true });
     });
     socket.addEventListener('message', (event) => {
       if (this.socket !== socket || typeof event.data !== 'string') return;
@@ -827,7 +893,11 @@ export class RemoteDesktopClient {
 
   private async handleServer(value: unknown): Promise<void> {
     const parsed = validateRemoteDesktopServerMessage(value);
-    if (!parsed.ok || !this.requestId || parsed.value.requestId !== this.requestId || this.stopped) return;
+    if (!parsed.ok || this.stopped) return;
+    // Consumed by the signaling handshake before START; ignore a duplicate
+    // rather than letting a content-free acknowledgement affect a session.
+    if (parsed.value.type === REMOTE_DESKTOP_MSG.BOOTSTRAP_REDEEMED) return;
+    if (!this.requestId || parsed.value.requestId !== this.requestId) return;
     const message = parsed.value;
     if (message.type === REMOTE_DESKTOP_MSG.AUTHORIZED) {
       if (this.sessionId || !validateRemoteDesktopAuthorized(message).ok) return;
@@ -1423,7 +1493,9 @@ export class RemoteDesktopClient {
   }
 
   private matchesAuthority(message: RemoteDesktopServerMessage): boolean {
-    if (message.type === REMOTE_DESKTOP_MSG.ERROR || message.type === REMOTE_DESKTOP_MSG.AUTHORIZED) return false;
+    if (message.type === REMOTE_DESKTOP_MSG.BOOTSTRAP_REDEEMED
+      || message.type === REMOTE_DESKTOP_MSG.ERROR
+      || message.type === REMOTE_DESKTOP_MSG.AUTHORIZED) return false;
     return message.sessionId === this.sessionId && message.capability === this.capability;
   }
 

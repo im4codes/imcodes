@@ -480,7 +480,9 @@ bool PeerSession::FlushPendingRemoteIce() {
 }
 
 bool PeerSession::Renew(const Authority& renewal) {
-  if (!Matches(renewal) || renewal.daemon_generation != authority_.daemon_generation ||
+  if (!Matches(renewal) ||
+      renewal.daemon_generation != authority_.daemon_generation ||
+      renewal.route_generation != authority_.route_generation ||
       renewal.lease_expires_at_ms <= authority_.lease_expires_at_ms ||
       renewal.input_epoch != authority_.input_epoch ||
       renewal.mode != authority_.mode) {

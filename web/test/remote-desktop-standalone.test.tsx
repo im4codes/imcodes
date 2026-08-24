@@ -16,16 +16,21 @@ vi.mock('../src/api/machines.js', () => ({
 
 vi.mock('../src/components/RemoteDesktopPanel.js', () => ({
   canOpenRemoteDesktop: (machine: { online: boolean }) => machine.online,
-  RemoteDesktopPanel: ({ machine, standalone, onClose }: {
-    machine: { displayName: string };
-    standalone?: boolean;
-    onClose(): void;
-  }) => (
-    <div data-testid="standalone-desktop">
-      {machine.displayName}:{String(standalone)}
-      <button onClick={onClose}>stop-standalone</button>
-    </div>
-  ),
+}));
+
+vi.mock('../src/components/RemoteDesktopWorkspace.js', () => ({
+  RemoteDesktopWorkspace: ({ state, onCloseWorkspace }: {
+    state: { orderedHostKeys: string[]; hosts: Record<string, { machine: { displayName: string } }> };
+    onCloseWorkspace(): void;
+  }) => {
+    const host = state.hosts[state.orderedHostKeys[0]];
+    return (
+      <div data-testid="standalone-desktop">
+        {host?.machine.displayName}:workspace
+        <button onClick={onCloseWorkspace}>stop-standalone</button>
+      </div>
+    );
+  },
 }));
 
 import { RemoteDesktopStandalone } from '../src/components/RemoteDesktopStandalone.js';
@@ -53,7 +58,7 @@ describe('remote desktop standalone window', () => {
     const result = render(<RemoteDesktopStandalone serverId="desktop-1" />);
 
     expect(result.getByRole('status').textContent).toBe('controlled_nodes.loading');
-    await waitFor(() => expect(result.getByTestId('standalone-desktop').textContent).toContain('Desktop One:true'));
+    await waitFor(() => expect(result.getByTestId('standalone-desktop').textContent).toContain('Desktop One:workspace'));
 
     act(() => result.getByText('stop-standalone').click());
     expect(close).toHaveBeenCalledTimes(1);

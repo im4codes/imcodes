@@ -39,6 +39,11 @@ $ExpectedSources = @(
   'ice_candidate_queue_unittest.cc',
   'input_injector.cc', 'input_injector.h', 'input_injector_unittest.cc',
   'json_protocol.cc', 'json_protocol.h', 'json_protocol_unittest.cc',
+  'brand_logo_generated.h',
+  'consent_ipc.cc', 'consent_ipc.h',
+  'privacy_ipc.cc', 'privacy_ipc.h',
+  'privacy_ipc_unittest.cc',
+  'consent_prompt.cc', 'consent_prompt.h',
   'local_indicator.cc', 'local_indicator.h',
   'mf_h264_encoder.cc', 'mf_h264_encoder.h', 'mf_h264_encoder_unittest.cc',
   'peer_session.cc', 'peer_session.h',
@@ -280,6 +285,7 @@ try {
       'third_party/imcodes_remote_desktop:input_injector_unittests',
       'third_party/imcodes_remote_desktop:ice_candidate_queue_unittests',
       'third_party/imcodes_remote_desktop:json_protocol_unittests',
+      'third_party/imcodes_remote_desktop:privacy_ipc_unittests',
       'third_party/imcodes_remote_desktop:worker_policy_unittests',
       'third_party/imcodes_remote_desktop:mf_h264_encoder_unittests'
     )
@@ -293,6 +299,7 @@ try {
         'input_injector_unittests',
         'ice_candidate_queue_unittests',
         'json_protocol_unittests',
+        'privacy_ipc_unittests',
         'worker_policy_unittests',
         'mf_h264_encoder_unittests')) {
       & (Join-Path $BuildDirectory "$TestName.exe")

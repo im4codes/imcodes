@@ -15,6 +15,17 @@ import {
 } from '../../shared/remote-desktop.js';
 import { WINDOWS_REMOTE_DESKTOP_QUALIFICATION_PLAN } from '../../shared/remote-desktop-qualification.js';
 import {
+  REMOTE_DESKTOP_CANONICAL_BRANDING_CAPABILITY,
+  REMOTE_DESKTOP_CAPTURE_PRIVACY_CAPABILITY,
+  REMOTE_DESKTOP_INPUT_CAPABILITY,
+  REMOTE_DESKTOP_LOCAL_CONSENT_CAPABILITY,
+  REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY,
+  REMOTE_DESKTOP_LOCK_SCREEN_CAPABILITY,
+  REMOTE_DESKTOP_SIGNED_SHELL_CAPABILITY,
+} from '../../shared/remote-desktop-access.js';
+import { WORKER_CONSENT_FRAME } from '../../src/node/remote-desktop-consent-ipc.js';
+import { WORKER_PRIVACY_FRAME } from '../../src/node/remote-desktop-privacy-ipc.js';
+import {
   REMOTE_DESKTOP_WORKER_CRASH_TYPE,
   REMOTE_DESKTOP_WORKER_FILENAME,
   REMOTE_DESKTOP_WORKER_HELLO_TYPE,
@@ -95,6 +106,149 @@ function decodePowerShellStdinCommand(value: string): string {
 }
 
 describe('remote desktop worker artifact and IPC host', () => {
+  it('declares only adapter capabilities implemented by the current worker', () => {
+    const host = new RemoteDesktopWorkerHost(() => {}, {
+      ...trustedHostOptions,
+      platform: 'win32',
+      artifact,
+    });
+    expect(host.adapterCapabilities()).toEqual([
+      REMOTE_DESKTOP_LOCAL_CONSENT_CAPABILITY,
+      REMOTE_DESKTOP_CAPTURE_PRIVACY_CAPABILITY,
+      REMOTE_DESKTOP_INPUT_CAPABILITY,
+      REMOTE_DESKTOP_LOCK_SCREEN_CAPABILITY,
+      REMOTE_DESKTOP_CANONICAL_BRANDING_CAPABILITY,
+      REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY,
+    ]);
+    expect(host.adapterCapabilities()).not.toContain(REMOTE_DESKTOP_SIGNED_SHELL_CAPABILITY);
+    expect(host.supportsDefaultShieldedRoute()).toBe(true);
+  });
+
+  it('launches a prompt-only worker before PREPARE and replaces it before session authority', async () => {
+    const temp = await mkdtemp(join(tmpdir(), 'imcodes-rd-consent-only-'));
+    cleanup.push(() => rm(temp, { recursive: true, force: true }));
+    const pipePath = join(temp, 'worker.sock');
+    const helpers: net.Socket[] = [];
+    const receivedByLaunch: string[] = [];
+    const launches: string[][] = [];
+    const launch = vi.fn((_executable: string, _argsLine: string, _secure?: boolean, args?: readonly string[]) => {
+      const actual = [...(args ?? [])];
+      launches.push(actual);
+      const launchIndex = helpers.length;
+      const helper = net.createConnection(pipePath, () => {
+        helper.write(`${JSON.stringify({
+          type: REMOTE_DESKTOP_WORKER_HELLO_TYPE,
+          ipcVersion: REMOTE_DESKTOP_WORKER_IPC_VERSION,
+          nonce: actual[actual.indexOf('--nonce') + 1],
+          pid: 600 + launchIndex,
+        })}\n`);
+      });
+      helper.setEncoding('utf8');
+      helper.on('data', (chunk) => { receivedByLaunch[launchIndex] = (receivedByLaunch[launchIndex] ?? '') + chunk; });
+      helpers.push(helper);
+    });
+    const host = new RemoteDesktopWorkerHost(() => {}, {
+      ...trustedHostOptions,
+      platform: 'win32',
+      artifact,
+      pipePath,
+      allowPipeClients: () => {},
+      launch,
+    });
+    cleanup.push(() => {
+      host.close();
+      for (const helper of helpers) helper.destroy();
+    });
+
+    await expect(host.sendConsentFrame({
+      type: WORKER_CONSENT_FRAME.SURFACE_QUERY,
+    })).resolves.toBe(true);
+    await vi.waitFor(() => expect(receivedByLaunch[0]).toContain(WORKER_CONSENT_FRAME.SURFACE_QUERY));
+    expect(launches[0]).toEqual([
+      '--pipe', pipePath, '--nonce', expect.any(String), '--consent-only',
+    ]);
+
+    const prepare = {
+      type: REMOTE_DESKTOP_MSG.PREPARE,
+      requestId,
+      sessionId,
+      capability,
+      expiresAt: Date.now() + 60_000,
+      leaseExpiresAt: Date.now() + 15_000,
+      daemonGeneration: 7,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW,
+      inputEpoch: 0,
+      iceServers: ['stun:stun.example.test:3478'],
+    } as const;
+    await expect(host.handle(prepare)).resolves.toBe(true);
+    await vi.waitFor(() => expect(receivedByLaunch[1]).toContain(REMOTE_DESKTOP_MSG.PREPARE));
+    expect(launches[1]).toEqual([
+      '--pipe', pipePath, '--nonce', expect.any(String),
+    ]);
+    expect(receivedByLaunch[0]).not.toContain(REMOTE_DESKTOP_MSG.PREPARE);
+    expect(helpers[0]!.destroyed).toBe(true);
+  });
+
+  it('cold-starts a privacy-only Worker and promotes that exact process for PREPARE', async () => {
+    const temp = await mkdtemp(join(tmpdir(), 'imcodes-rd-privacy-before-prepare-'));
+    cleanup.push(() => rm(temp, { recursive: true, force: true }));
+    const pipePath = join(temp, 'worker.sock');
+    const received: string[] = [];
+    const launches: string[][] = [];
+    const helperSockets: net.Socket[] = [];
+    const launch = vi.fn((_executable: string, _argsLine: string, _secure?: boolean, args?: readonly string[]) => {
+      const actual = [...(args ?? [])];
+      launches.push(actual);
+      const helper = net.createConnection(pipePath, () => {
+        helper.write(`${JSON.stringify({
+          type: REMOTE_DESKTOP_WORKER_HELLO_TYPE,
+          ipcVersion: REMOTE_DESKTOP_WORKER_IPC_VERSION,
+          nonce: actual[actual.indexOf('--nonce') + 1],
+          pid: 700,
+        })}\n`);
+      });
+      helper.setEncoding('utf8');
+      helper.on('data', (chunk) => received.push(String(chunk)));
+      helperSockets.push(helper);
+    });
+    const host = new RemoteDesktopWorkerHost(() => {}, {
+      ...trustedHostOptions,
+      platform: 'win32', artifact, pipePath, allowPipeClients: () => {}, launch,
+    });
+    cleanup.push(() => {
+      host.close();
+      for (const helper of helperSockets) helper.destroy();
+    });
+
+    await expect(host.sendPrivacyFrame({
+      type: WORKER_PRIVACY_FRAME.SHIELD,
+      epochId: 'epoch-0000000000000000001',
+      revision: 2,
+      presentationSource: 'signed_shell',
+      routes: [{ routeId: sessionId, routeGeneration: 17 }],
+    })).resolves.toBe(true);
+    await vi.waitFor(() => expect(received.join('')).toContain(WORKER_PRIVACY_FRAME.SHIELD));
+    expect(launches).toEqual([[
+      '--pipe', pipePath, '--nonce', expect.any(String), '--privacy-only',
+    ]]);
+
+    await expect(host.handle({
+      type: REMOTE_DESKTOP_MSG.PREPARE,
+      requestId,
+      sessionId,
+      capability,
+      expiresAt: Date.now() + 60_000,
+      leaseExpiresAt: Date.now() + 15_000,
+      daemonGeneration: 8,
+      routeGeneration: 17,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW,
+      inputEpoch: 0,
+      iceServers: [],
+    })).resolves.toBe(true);
+    await vi.waitFor(() => expect(received.join('')).toContain(REMOTE_DESKTOP_MSG.PREPARE));
+    expect(launches).toHaveLength(1);
+  });
+
   it('accepts only the exact pinned immutable manifest contract', () => {
     expect(validateRemoteDesktopWorkerManifest(manifest)).toEqual(manifest);
     expect(validateRemoteDesktopWorkerManifest({ ...manifest, protocolVersion: 1 })).toBeNull();

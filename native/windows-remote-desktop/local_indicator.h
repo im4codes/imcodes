@@ -37,6 +37,13 @@ class LocalIndicator {
    * that currently receives input to decide when to move.
    */
   std::wstring BoundDesktop() const;
+  /**
+   * Counts only, and deliberately so. Nothing a remote requester supplies --
+   * display name, session label, message, hostname -- may reach this window:
+   * it is an always-on-top, unclosable disclosure, so any attacker-controlled
+   * string rendered here becomes a spoofing surface for the disclosure itself.
+   * The signature is the enforcement point; keep it free of string parameters.
+   */
   void Update(int viewers, int controllers);
   UINT DispatchInput(UINT count, LPINPUT inputs, int size);
   bool MovePointer(int x, int y);
