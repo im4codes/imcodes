@@ -3263,6 +3263,94 @@ describe('SupervisionAutomation', () => {
   });
 
 
+  it('does not recover a stopped turn when a late assistant final arrives without user resume', async () => {
+    await seedSession('supervised_audit');
+    mockSupervisionDecide.mockResolvedValue({
+      decision: 'complete',
+      reason: 'late final should remain stopped',
+      confidence: 0.96,
+      requiresAudit: true,
+    });
+
+    supervisionAutomation.init();
+    const baseTs = Date.now();
+    timelineEmitter.emit('deck_supervision_brain', 'user.message', {
+      text: 'finish the task that will be stopped',
+      clientMessageId: 'cmd-stop-before-late-final',
+      allowDuplicate: true,
+    }, { ts: baseTs });
+    timelineEmitter.emit('deck_supervision_brain', 'assistant.text', {
+      text: 'completion before STOP',
+      streaming: false,
+    }, { ts: baseTs + 1 });
+    supervisionAutomation.cancelForUserStop('deck_supervision_brain');
+    timelineEmitter.emit('deck_supervision_brain', 'session.state', {
+      state: 'idle',
+      resetReason: 'command_handler_cancel_idle',
+    }, { ts: baseTs + 2 });
+    await timelineStore.flushSession('deck_supervision_brain');
+
+    // After restart, in-memory STOP suppression is gone. The durable STOP
+    // barrier must still reject provider/transport late-final rows unless the
+    // user first sends an explicit resume control such as `continue` / `继续`.
+    supervisionAutomation.cancelSession('deck_supervision_brain');
+    timelineEmitter.forgetSession('deck_supervision_brain');
+    timelineEmitter.emit('deck_supervision_brain', 'assistant.text', {
+      text: 'late final after STOP with no user resume',
+      streaming: false,
+    }, { ts: baseTs + 3 });
+    timelineEmitter.emit('deck_supervision_brain', 'session.state', {
+      state: 'idle',
+    }, { ts: baseTs + 4 });
+    await sleep(25);
+
+    expect(mockSupervisionDecide).not.toHaveBeenCalled();
+    expect(mockTransportRuntime.send).not.toHaveBeenCalled();
+  });
+
+
+  it('does not recover a stopped in-flight turn when the first assistant final arrives without user resume', async () => {
+    await seedSession('supervised_audit');
+    mockSupervisionDecide.mockResolvedValue({
+      decision: 'complete',
+      reason: 'in-flight late final should remain stopped',
+      confidence: 0.96,
+      requiresAudit: true,
+    });
+
+    supervisionAutomation.init();
+    const baseTs = Date.now();
+    timelineEmitter.emit('deck_supervision_brain', 'user.message', {
+      text: 'finish the in-flight task that will be stopped',
+      clientMessageId: 'cmd-inflight-stop-before-final',
+      allowDuplicate: true,
+    }, { ts: baseTs });
+    supervisionAutomation.cancelForUserStop('deck_supervision_brain');
+    timelineEmitter.emit('deck_supervision_brain', 'session.state', {
+      state: 'idle',
+      resetReason: 'command_handler_cancel_idle',
+    }, { ts: baseTs + 1 });
+    await timelineStore.flushSession('deck_supervision_brain');
+
+    // Production STOP can be persisted before the provider emits any terminal
+    // assistant row. After restart, that first late final must still be blocked
+    // until the user explicitly resumes the stopped task.
+    supervisionAutomation.cancelSession('deck_supervision_brain');
+    timelineEmitter.forgetSession('deck_supervision_brain');
+    timelineEmitter.emit('deck_supervision_brain', 'assistant.text', {
+      text: 'first assistant final after STOP with no user resume',
+      streaming: false,
+    }, { ts: baseTs + 2 });
+    timelineEmitter.emit('deck_supervision_brain', 'session.state', {
+      state: 'idle',
+    }, { ts: baseTs + 3 });
+    await sleep(25);
+
+    expect(mockSupervisionDecide).not.toHaveBeenCalled();
+    expect(mockTransportRuntime.send).not.toHaveBeenCalled();
+  });
+
+
   it('does not replay an implementation turn after a delegated audit reply and PASS final survive restart', async () => {
     await seedSession('supervised_audit');
 

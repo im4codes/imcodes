@@ -1032,6 +1032,7 @@ class SupervisionAutomation {
     let latestAssistant: LatestAssistantText | null = null;
     let latestAssistantKey: string | null = null;
     let barrierAfterLatest: RecoveryBarrier = 'none';
+    let stoppedBarrierResumed = false;
     let sequence = 0;
 
     for (const event of this.getRecoveryTimelineEvents(sessionName)) {
@@ -1061,7 +1062,10 @@ class SupervisionAutomation {
           // path and durable recovery. It may lift STOP suppression, but it
           // must never replace the original task candidate — including when a
           // previous assistant completion already precedes it in the timeline.
-          if (isBareSupervisionContinueText(text)) continue;
+          if (isBareSupervisionContinueText(text)) {
+            if (barrierAfterLatest === 'stopped') stoppedBarrierResumed = true;
+            continue;
+          }
           candidate = {
             commandId: clientMessageId ?? `implicit-recovered:${event.epoch}:${event.seq}:${event.eventId}`,
             text,
@@ -1071,6 +1075,7 @@ class SupervisionAutomation {
           latestAssistant = null;
           latestAssistantKey = null;
           barrierAfterLatest = 'none';
+          stoppedBarrierResumed = false;
         }
         continue;
       }
@@ -1083,11 +1088,14 @@ class SupervisionAutomation {
           }
           continue;
         }
-        if (candidate && barrierAfterLatest !== 'handled' && this.isEligibleAssistantCompletionPayload(payload)) {
+        if (candidate
+          && (barrierAfterLatest === 'none' || (barrierAfterLatest === 'stopped' && stoppedBarrierResumed))
+          && this.isEligibleAssistantCompletionPayload(payload)) {
           const text = typeof payload.text === 'string' ? payload.text : '';
           latestAssistantKey = this.timelineCompletionKey(sessionName, event);
           latestAssistant = { text, sequence, completionKey: latestAssistantKey };
           barrierAfterLatest = 'none';
+          stoppedBarrierResumed = false;
         }
         continue;
       }
@@ -1095,11 +1103,14 @@ class SupervisionAutomation {
       if (latestAssistant && (event.type === 'peer_audit.result' || event.type === AGENT_DELEGATION_REPLY_TIMELINE_EVENT)) {
         barrierAfterLatest = 'handled';
       }
-      if (latestAssistant && event.type === 'session.state') {
+      if (candidate && event.type === 'session.state') {
         const resetReason = trimString(payload.resetReason);
         const reason = trimString(payload.reason);
         if (resetReason === 'command_handler_cancel_idle' || reason === 'stopped') {
+          latestAssistant = null;
+          latestAssistantKey = null;
           barrierAfterLatest = 'stopped';
+          stoppedBarrierResumed = false;
         }
       }
     }
