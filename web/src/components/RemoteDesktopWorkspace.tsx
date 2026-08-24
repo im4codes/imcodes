@@ -3,10 +3,8 @@ import { useTranslation } from 'react-i18next';
 import { listControllableMachines } from '../api/machines.js';
 import {
   getRemoteDesktopWall,
-  mutateRemoteDesktopWall,
   type RemoteDesktopWallSnapshot,
 } from '../api/remote-desktop-wall.js';
-import { REMOTE_DESKTOP_WALL_OPERATION } from '@shared/remote-desktop-access.js';
 import type { WsClient } from '../ws-client.js';
 import {
   RemoteDesktopConnectionManager,
@@ -24,8 +22,6 @@ import {
 import { FloatingPanel } from './FloatingPanel.js';
 import { canOpenRemoteDesktop, RemoteDesktopPanel } from './RemoteDesktopPanel.js';
 import { RemoteDesktopWallTile } from './RemoteDesktopWallTile.js';
-import { RemoteDesktopOwnerAccess } from './RemoteDesktopOwnerAccess.js';
-import { mutateRemoteDesktopWallWithOneReplay } from '../remote-desktop-wall-store.js';
 import './remote-desktop-workspace.css';
 
 export interface RemoteDesktopWorkspaceProps {
@@ -61,25 +57,15 @@ export function RemoteDesktopWorkspace({
 }: RemoteDesktopWorkspaceProps) {
   const { t } = useTranslation();
   const [pickerOpen, setPickerOpen] = useState(false);
-  const [wallPickerOpen, setWallPickerOpen] = useState(false);
   const [pickerMachines, setPickerMachines] = useState<RemoteDesktopWorkspaceMachine[]>([]);
   const [pickerError, setPickerError] = useState(false);
   const [wallSnapshot, setWallSnapshot] = useState<RemoteDesktopWallSnapshot | null>(null);
   const [wallError, setWallError] = useState<string | null>(null);
   const tabButtonsRef = useRef(new Map<RemoteDesktopWorkspaceTabId, HTMLButtonElement>());
-  const wallTilesRef = useRef(new Map<string, HTMLElement>());
   const hosts = remoteDesktopWorkspaceHosts(state);
-  const wallPickerMachines = [...new Map(
-    [...pickerMachines, ...hosts.map((host) => host.machine)]
-      .map((machine) => [machine.serverId, machine] as const),
-  ).values()];
-  const ownerAccessTarget = state.activeTabId === REMOTE_DESKTOP_WALL_TAB_ID
-    ? (wallSnapshot?.hosts[0] ?? hosts[0]?.machine ?? null)
-    : (state.hosts[state.activeTabId]?.machine ?? null);
-  const ownerAccessHostId = ownerAccessTarget?.remoteDesktopHostId ?? null;
 
   useEffect(() => {
-    if (!pickerOpen && !wallPickerOpen) return;
+    if (!pickerOpen) return;
     let active = true;
     setPickerError(false);
     void listControllableMachines().then((machines) => {
@@ -88,7 +74,7 @@ export function RemoteDesktopWorkspace({
       if (active) setPickerError(true);
     });
     return () => { active = false; };
-  }, [pickerOpen, wallPickerOpen]);
+  }, [pickerOpen]);
 
   useEffect(() => {
     let active = true;
@@ -123,59 +109,6 @@ export function RemoteDesktopWorkspace({
     setPickerOpen(false);
   }, [onOpenHost]);
 
-  const mutateWall = useCallback(async (
-    intent: Parameters<typeof mutateRemoteDesktopWallWithOneReplay>[0]['intent'],
-  ) => {
-    if (!wallSnapshot) return;
-    const previous = wallSnapshot;
-    const result = await mutateRemoteDesktopWallWithOneReplay({
-      snapshot: previous,
-      intent,
-      send: mutateRemoteDesktopWall,
-    });
-    setWallSnapshot((current) => (!current || result.snapshot.revision >= current.revision
-      ? result.snapshot
-      : current));
-    setWallError(result.outcome === 'applied' ? null : result.outcome);
-    const remaining = new Set(result.snapshot.hostIds);
-    for (const host of previous.hosts) {
-      const runtimeHostKey = remoteDesktopHostKey(host);
-      if (!remaining.has(host.hostId) && !state.hosts[runtimeHostKey]) manager.stop(runtimeHostKey);
-    }
-    return result;
-  }, [manager, state.hosts, wallSnapshot]);
-
-  const addWallHost = useCallback(async (machine: RemoteDesktopWorkspaceMachine) => {
-    const identity = remoteDesktopHostKey(machine);
-    const result = await mutateWall({ operation: REMOTE_DESKTOP_WALL_OPERATION.ADD, hostId: identity });
-    if (result?.outcome === 'applied') {
-      setWallPickerOpen(false);
-      const added = result.snapshot.hosts.find((host) => host.serverId === machine.serverId);
-      if (added) requestAnimationFrame(() => wallTilesRef.current.get(added.hostId)?.focus());
-    }
-  }, [mutateWall]);
-
-  const removeWallHost = useCallback(async (hostId: string) => {
-    const currentIndex = wallSnapshot?.hostIds.indexOf(hostId) ?? -1;
-    const result = await mutateWall({ operation: REMOTE_DESKTOP_WALL_OPERATION.REMOVE, hostId });
-    if (result?.outcome === 'applied') {
-      const next = result.snapshot.hostIds[Math.min(currentIndex, result.snapshot.hostIds.length - 1)];
-      requestAnimationFrame(() => (next ? wallTilesRef.current.get(next) : null)?.focus());
-    }
-  }, [mutateWall, wallSnapshot?.hostIds]);
-
-  const moveWallHost = useCallback(async (hostId: string, direction: -1 | 1) => {
-    const index = wallSnapshot?.hostIds.indexOf(hostId) ?? -1;
-    const result = await mutateWall({
-      operation: REMOTE_DESKTOP_WALL_OPERATION.REORDER,
-      hostId,
-      toIndex: index + direction,
-    });
-    if (result?.outcome === 'applied') {
-      requestAnimationFrame(() => wallTilesRef.current.get(hostId)?.focus());
-    }
-  }, [mutateWall, wallSnapshot?.hostIds]);
-
   const tabIds = [REMOTE_DESKTOP_WALL_TAB_ID, ...state.orderedHostKeys];
   const handleTabKeyDown = (event: KeyboardEvent, tabId: RemoteDesktopWorkspaceTabId) => {
     const index = tabIds.indexOf(tabId);
@@ -202,15 +135,20 @@ export function RemoteDesktopWorkspace({
         <strong>{t('remote_desktop.workspace_title')}</strong>
         <div class="remote-desktop-workspace-actions">
           {onMinimize && (
-            <button type="button" onClick={onMinimize} aria-label={t('window.minimize')}>▾</button>
+            <button class="remote-desktop-workspace-chrome-button" type="button" onClick={onMinimize} aria-label={t('window.minimize')}>
+              <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m5 8 5 5 5-5" /></svg>
+            </button>
           )}
-          <button type="button" onClick={closeWorkspace} aria-label={t('remote_desktop.workspace_stop_all')}>×</button>
+          <button class="remote-desktop-workspace-chrome-button is-danger" type="button" onClick={closeWorkspace} aria-label={t('remote_desktop.workspace_stop_all')}>
+            <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m6 6 8 8M14 6l-8 8" /></svg>
+          </button>
         </div>
       </header>
 
-      <div class="remote-desktop-workspace-tabbar">
+      {state.activeTabId !== REMOTE_DESKTOP_WALL_TAB_ID && <div class="remote-desktop-workspace-tabbar">
         <div role="tablist" aria-label={t('remote_desktop.workspace_tabs')}>
           <button
+            class="remote-desktop-workspace-tab"
             type="button"
             role="tab"
             ref={(element) => {
@@ -225,6 +163,7 @@ export function RemoteDesktopWorkspace({
           {hosts.map(({ hostKey, machine }, index) => (
             <span class="remote-desktop-workspace-host-tab" key={hostKey}>
               <button
+                class="remote-desktop-workspace-tab"
                 type="button"
                 role="tab"
                 ref={(element) => {
@@ -237,35 +176,38 @@ export function RemoteDesktopWorkspace({
                 onKeyDown={(event) => handleTabKeyDown(event, hostKey)}
               >{machine.displayName}</button>
               <button
+                class="remote-desktop-workspace-icon-button"
                 type="button"
                 onClick={() => onReorderHost(hostKey, -1)}
                 disabled={index === 0}
                 aria-label={t('remote_desktop.workspace_move_left', { machine: machine.displayName })}
-              >←</button>
+              ><svg viewBox="0 0 20 20" aria-hidden="true"><path d="m12 5-5 5 5 5" /></svg></button>
               <button
+                class="remote-desktop-workspace-icon-button"
                 type="button"
                 onClick={() => onReorderHost(hostKey, 1)}
                 disabled={index === hosts.length - 1}
                 aria-label={t('remote_desktop.workspace_move_right', { machine: machine.displayName })}
-              >→</button>
+              ><svg viewBox="0 0 20 20" aria-hidden="true"><path d="m8 5 5 5-5 5" /></svg></button>
               <button
+                class="remote-desktop-workspace-icon-button is-danger"
                 type="button"
                 onClick={() => closeHost(hostKey)}
                 aria-label={t('remote_desktop.workspace_close_tab', { machine: machine.displayName })}
-              >×</button>
+              ><svg viewBox="0 0 20 20" aria-hidden="true"><path d="m6 6 8 8M14 6l-8 8" /></svg></button>
             </span>
           ))}
         </div>
         <button
           type="button"
-          class="remote-desktop-workspace-add"
+          class="remote-desktop-workspace-add remote-desktop-workspace-icon-button"
           aria-expanded={pickerOpen}
           aria-label={t('remote_desktop.workspace_add')}
           onClick={() => setPickerOpen((current) => !current)}
-        >+</button>
-      </div>
+        ><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 4v12M4 10h12" /></svg></button>
+      </div>}
 
-      <label class="remote-desktop-workspace-mobile-selector">
+      {state.activeTabId !== REMOTE_DESKTOP_WALL_TAB_ID && <label class="remote-desktop-workspace-mobile-selector">
         <span>{t('remote_desktop.workspace_select')}</span>
         <select value={state.activeTabId} onInput={(event) => activate(event.currentTarget.value)}>
           <option value={REMOTE_DESKTOP_WALL_TAB_ID}>{t('remote_desktop.workspace_wall')}</option>
@@ -273,7 +215,7 @@ export function RemoteDesktopWorkspace({
             <option value={hostKey} key={hostKey}>{machine.displayName}</option>
           ))}
         </select>
-      </label>
+      </label>}
 
       {pickerOpen && (
         <div class="remote-desktop-workspace-picker" role="dialog" aria-label={t('remote_desktop.workspace_picker')}>
@@ -297,50 +239,16 @@ export function RemoteDesktopWorkspace({
         </div>
       )}
 
-      {ownerAccessTarget && ownerAccessTarget.accessRole === 'owner' && (
-        <details class="remote-desktop-owner-access-drawer">
-          <summary>{t('remote_desktop.access_owner_title')}</summary>
-          <RemoteDesktopOwnerAccess
-            hostId={ownerAccessHostId}
-            endpointLabel={ownerAccessTarget.displayName}
-          />
-        </details>
-      )}
-
       <section
         class="remote-desktop-workspace-wall"
         role="tabpanel"
         hidden={state.activeTabId !== REMOTE_DESKTOP_WALL_TAB_ID}
       >
-        <div class="remote-desktop-wall-toolbar">
-          <strong>{t('remote_desktop.workspace_wall')}</strong>
-          <button
-            type="button"
-            aria-expanded={wallPickerOpen}
-            onClick={() => setWallPickerOpen((current) => !current)}
-            disabled={(wallSnapshot?.hostIds.length ?? 0) >= REMOTE_DESKTOP_WORKSPACE_MAX_HOSTS}
-          >{t('remote_desktop.wall_add')}</button>
-        </div>
         {wallError && <p role="alert">{t(`remote_desktop.wall_error_${wallError}`)}</p>}
-        {wallPickerOpen && (
-          <div class="remote-desktop-wall-picker" role="dialog" aria-label={t('remote_desktop.wall_picker')}>
-            {pickerError && <p role="alert">{t('remote_desktop.workspace_picker_failed')}</p>}
-            {wallPickerMachines.filter((machine) => !wallSnapshot?.hosts.some(
-              (host) => remoteDesktopHostKey(host) === remoteDesktopHostKey(machine),
-            )).map((machine) => (
-              <button type="button" key={machine.serverId} onClick={() => void addWallHost(machine)}>
-                <strong>{machine.displayName}</strong><span>{machine.refName}</span>
-              </button>
-            ))}
-          </div>
-        )}
         {wallSnapshot && wallSnapshot.hosts.length > 0 ? (
           <div class="remote-desktop-wall-grid" aria-label={t('remote_desktop.wall_grid')}>
             {wallSnapshot.hosts.map((host, index) => (
-              <div key={host.hostId} tabIndex={-1} ref={(element) => {
-                if (element) wallTilesRef.current.set(host.hostId, element);
-                else wallTilesRef.current.delete(host.hostId);
-              }}>
+              <div key={host.hostId}>
                 <RemoteDesktopWallTile
                   host={host}
                   manager={manager}
@@ -348,11 +256,6 @@ export function RemoteDesktopWorkspace({
                   pressurePaused={(navigator as Navigator & { deviceMemory?: number }).deviceMemory !== undefined
                     && (navigator as Navigator & { deviceMemory?: number }).deviceMemory! <= 2
                     && index >= 4}
-                  onActivate={onOpenHost}
-                  onRemove={(hostId) => void removeWallHost(hostId)}
-                  onMove={(hostId, direction) => void moveWallHost(hostId, direction)}
-                  first={index === 0}
-                  last={index === wallSnapshot.hosts.length - 1}
                 />
               </div>
             ))}

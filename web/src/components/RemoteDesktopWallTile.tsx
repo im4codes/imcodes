@@ -4,6 +4,7 @@ import { useTranslation } from 'react-i18next';
 import type { RemoteDesktopWallHost } from '../api/remote-desktop-wall.js';
 import type { RemoteDesktopSnapshot } from '../remote-desktop-client.js';
 import type { RemoteDesktopConnectionManager } from '../remote-desktop-connection-manager.js';
+import { openRemoteDesktopWindow } from '../remote-desktop-window.js';
 
 const INITIAL: RemoteDesktopSnapshot = {
   state: REMOTE_DESKTOP_STATE.AUTHORIZING,
@@ -21,11 +22,6 @@ export interface RemoteDesktopWallTileProps {
   manager: RemoteDesktopConnectionManager;
   wallVisible: boolean;
   pressurePaused?: boolean;
-  onActivate(host: RemoteDesktopWallHost): void;
-  onRemove(hostId: string): void;
-  onMove(hostId: string, direction: -1 | 1): void;
-  first: boolean;
-  last: boolean;
 }
 
 export function RemoteDesktopWallTile({
@@ -33,11 +29,6 @@ export function RemoteDesktopWallTile({
   manager,
   wallVisible,
   pressurePaused = false,
-  onActivate,
-  onRemove,
-  onMove,
-  first,
-  last,
 }: RemoteDesktopWallTileProps) {
   const { t } = useTranslation();
   const presentationRef = useRef<object>({});
@@ -138,32 +129,20 @@ export function RemoteDesktopWallTile({
       data-presentation-priority={paused ? 'paused' : 'visible-wall'}
       data-route={snapshot.route ?? 'pending'}
       data-size-tier={sizeTier}
-      onClick={() => onActivate(host)}
     >
-      <header>
-        <button
-          type="button"
-          class="remote-desktop-wall-tile-open"
-          aria-label={t('remote_desktop.wall_open_host', { machine: host.displayName })}
-          onClick={(event) => { event.stopPropagation(); onActivate(host); }}
-        ><strong>{host.displayName}</strong></button>
-        <span class="remote-desktop-wall-health">{t(`remote_desktop.wall_health_${health}`)}</span>
-      </header>
       <video ref={videoRef} muted playsInline aria-label={t('remote_desktop.video_label', { machine: host.displayName })} />
-      <dl class="remote-desktop-wall-diagnostics">
-        <div><dt>{t('remote_desktop.wall_route')}</dt><dd>{snapshot.route ?? '—'}</dd></div>
-        <div><dt>FPS</dt><dd>{snapshot.quality?.fps.toFixed(0) ?? '—'}</dd></div>
-        <div><dt>{t('remote_desktop.wall_resolution')}</dt><dd>{snapshot.quality ? `${snapshot.quality.width}×${snapshot.quality.height}` : '—'}</dd></div>
-        <div><dt>{t('remote_desktop.wall_latency')}</dt><dd>{snapshot.quality ? `${snapshot.quality.rttMs.toFixed(0)} ms` : '—'}</dd></div>
-        <div><dt>{t('remote_desktop.wall_bitrate')}</dt><dd>{snapshot.quality ? `${(snapshot.quality.bitrateBps / 1_000_000).toFixed(1)} Mbps` : '—'}</dd></div>
-        <div><dt>{t('remote_desktop.wall_frame_age')}</dt><dd>{lastFrameAt ? `${Math.max(0, clock - lastFrameAt)} ms` : '—'}</dd></div>
-      </dl>
-      <footer onClick={(event) => event.stopPropagation()}>
-        <button type="button" disabled={first} onClick={() => onMove(host.hostId, -1)} aria-label={t('remote_desktop.wall_move_before', { machine: host.displayName })}>←</button>
-        <button type="button" disabled={last} onClick={() => onMove(host.hostId, 1)} aria-label={t('remote_desktop.wall_move_after', { machine: host.displayName })}>→</button>
-        <button type="button" onClick={() => manager.presentation(host, presentationRef.current).retry()}>{t('remote_desktop.retry')}</button>
-        <button type="button" onClick={() => onRemove(host.hostId)} aria-label={t('remote_desktop.wall_remove', { machine: host.displayName })}>×</button>
-      </footer>
+      <button
+        type="button"
+        class="remote-desktop-wall-tile-open"
+        aria-label={`${t('remote_desktop.open')}: ${host.displayName}`}
+        title={`${t('remote_desktop.open')}: ${host.displayName}`}
+        onClick={() => openRemoteDesktopWindow(host.serverId)}
+      >
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M14 5h5v5M19 5l-8 8M18 13v5a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5" />
+        </svg>
+        <span>{t('remote_desktop.open')}</span>
+      </button>
     </article>
   );
 }

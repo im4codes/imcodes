@@ -27,14 +27,9 @@ vi.mock('../src/api/remote-desktop-wall.js', () => ({
 }));
 
 vi.mock('../src/components/RemoteDesktopWallTile.js', () => ({
-  RemoteDesktopWallTile: ({ host, onActivate, onRemove }: {
+  RemoteDesktopWallTile: ({ host }: {
     host: { hostId: string; displayName: string };
-    onActivate(host: unknown): void;
-    onRemove(hostId: string): void;
-  }) => <div>
-    <button type="button" onClick={() => onActivate(host)}>{`wall:${host.displayName}`}</button>
-    <button type="button" onClick={() => onRemove(host.hostId)}>{`remove:${host.displayName}`}</button>
-  </div>,
+  }) => <div>{`wall:${host.displayName}`}</div>,
 }));
 
 vi.mock('../src/components/FloatingPanel.js', () => ({
@@ -187,8 +182,9 @@ describe('RemoteDesktopWorkspace', () => {
     api.listControllableMachines.mockResolvedValue([machine('c')]);
     const { manager } = setupManager();
     const openHost = vi.fn();
+    const state = openRemoteDesktopWorkspaceHost(createRemoteDesktopWorkspaceState(), machine('a'));
     render(<RemoteDesktopWorkspace
-      state={createRemoteDesktopWorkspaceState()}
+      state={state}
       manager={manager}
       onOpenHost={openHost}
       onActivateTab={vi.fn()}
@@ -201,6 +197,31 @@ describe('RemoteDesktopWorkspace', () => {
     await waitFor(() => expect(screen.getByRole('button', { name: /C/ })).toBeDefined());
     fireEvent.click(screen.getByRole('button', { name: /C/ }));
     expect(openHost).toHaveBeenCalledWith(expect.objectContaining({ serverId: 'c' }));
+  });
+
+  it('keeps the wall presentation-only and removes sharing and wall management controls', async () => {
+    api.getRemoteDesktopWall.mockResolvedValueOnce({
+      revision: 3,
+      layout: 'grid',
+      hostIds: ['a'],
+      hosts: [{ ...machine('a'), hostId: 'a', remoteDesktopHostId: 'a' }],
+    });
+    const { manager } = setupManager();
+    render(<RemoteDesktopWorkspace
+      state={createRemoteDesktopWorkspaceState()}
+      manager={manager}
+      onOpenHost={vi.fn()}
+      onActivateTab={vi.fn()}
+      onCloseHost={vi.fn()}
+      onReorderHost={vi.fn()}
+      onCloseWorkspace={vi.fn()}
+    />);
+
+    await screen.findByText('wall:A');
+    expect(screen.queryByRole('tablist')).toBeNull();
+    expect(screen.queryByRole('button', { name: 'remote_desktop.workspace_add' })).toBeNull();
+    expect(document.querySelector('.remote-desktop-owner-access-drawer')).toBeNull();
+    expect(document.querySelector('.remote-desktop-wall-toolbar')).toBeNull();
   });
 
   it('keeps every host presentation mounted while the workspace is minimized and restored', () => {
