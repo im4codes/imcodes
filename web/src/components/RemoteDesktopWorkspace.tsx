@@ -22,11 +22,8 @@ export interface RemoteDesktopWorkspaceProps {
   state: RemoteDesktopWorkspaceState;
   manager: RemoteDesktopConnectionManager;
   ws?: WsClient | null;
-  minimized?: boolean;
   zIndex?: number;
   onFocus?(): void;
-  onMinimize?(): void;
-  onRestore?(): void;
   onOpenHost(machine: RemoteDesktopWorkspaceMachine): void;
   onActivateTab(tabId: RemoteDesktopWorkspaceTabId): void;
   onCloseHost(hostKey: string): void;
@@ -39,11 +36,8 @@ export function RemoteDesktopWorkspace({
   state,
   manager,
   ws = null,
-  minimized = false,
   zIndex,
   onFocus,
-  onMinimize,
-  onRestore,
   onOpenHost,
   onActivateTab,
   onCloseHost,
@@ -97,6 +91,16 @@ export function RemoteDesktopWorkspace({
   const handleTabKeyDown = (event: KeyboardEvent, tabId: RemoteDesktopWorkspaceTabId) => {
     const index = tabIds.indexOf(tabId);
     let nextIndex: number | null = null;
+    if (event.altKey && event.key === 'ArrowLeft') {
+      event.preventDefault();
+      onReorderHost(tabId, -1);
+      return;
+    }
+    if (event.altKey && event.key === 'ArrowRight') {
+      event.preventDefault();
+      onReorderHost(tabId, 1);
+      return;
+    }
     if (event.key === 'ArrowLeft') nextIndex = (index - 1 + tabIds.length) % tabIds.length;
     if (event.key === 'ArrowRight') nextIndex = (index + 1) % tabIds.length;
     if (event.key === 'Home') nextIndex = 0;
@@ -115,23 +119,9 @@ export function RemoteDesktopWorkspace({
 
   const content = (
     <div class="remote-desktop-workspace" data-active-tab={state.activeTabId}>
-      <header class="remote-desktop-workspace-header">
-        <strong>{t('remote_desktop.workspace_title')}</strong>
-        <div class="remote-desktop-workspace-actions">
-          {onMinimize && (
-            <button class="remote-desktop-workspace-chrome-button" type="button" onClick={onMinimize} aria-label={t('window.minimize')}>
-              <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m5 8 5 5 5-5" /></svg>
-            </button>
-          )}
-          <button class="remote-desktop-workspace-chrome-button is-danger" type="button" onClick={closeWorkspace} aria-label={t('remote_desktop.workspace_stop_all')}>
-            <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m6 6 8 8M14 6l-8 8" /></svg>
-          </button>
-        </div>
-      </header>
-
       <div class="remote-desktop-workspace-tabbar">
         <div role="tablist" aria-label={t('remote_desktop.workspace_tabs')}>
-          {hosts.map(({ hostKey, machine }, index) => (
+          {hosts.map(({ hostKey, machine }) => (
             <span class="remote-desktop-workspace-host-tab" key={hostKey}>
               <button
                 class="remote-desktop-workspace-tab"
@@ -147,21 +137,7 @@ export function RemoteDesktopWorkspace({
                 onKeyDown={(event) => handleTabKeyDown(event, hostKey)}
               >{machine.displayName}</button>
               <button
-                class="remote-desktop-workspace-icon-button"
-                type="button"
-                onClick={() => onReorderHost(hostKey, -1)}
-                disabled={index === 0}
-                aria-label={t('remote_desktop.workspace_move_left', { machine: machine.displayName })}
-              ><svg viewBox="0 0 20 20" aria-hidden="true"><path d="m12 5-5 5 5 5" /></svg></button>
-              <button
-                class="remote-desktop-workspace-icon-button"
-                type="button"
-                onClick={() => onReorderHost(hostKey, 1)}
-                disabled={index === hosts.length - 1}
-                aria-label={t('remote_desktop.workspace_move_right', { machine: machine.displayName })}
-              ><svg viewBox="0 0 20 20" aria-hidden="true"><path d="m8 5 5 5-5 5" /></svg></button>
-              <button
-                class="remote-desktop-workspace-icon-button is-danger"
+                class="remote-desktop-workspace-tab-close"
                 type="button"
                 onClick={() => closeHost(hostKey)}
                 aria-label={t('remote_desktop.workspace_close_tab', { machine: machine.displayName })}
@@ -226,31 +202,19 @@ export function RemoteDesktopWorkspace({
   );
 
   return (
-    <>
-      <div class="remote-desktop-workspace-window" hidden={minimized}>
-        <FloatingPanel
-          id={REMOTE_DESKTOP_WORKSPACE_WINDOW_ID}
-          title={t('remote_desktop.workspace_title')}
-          onClose={closeWorkspace}
-          zIndex={zIndex ?? 10020}
-          onFocus={onFocus}
-          defaultW={1240}
-          defaultH={800}
-          minW={680}
-          minH={460}
-          className="remote-desktop-workspace-shell"
-          hideTitleBar
-          dragHandleSelector=".remote-desktop-workspace-header"
-        >{content}</FloatingPanel>
-      </div>
-      {minimized && (
-        <button
-          type="button"
-          class="remote-desktop-minimized-dock"
-          onClick={onRestore}
-          aria-label={t('remote_desktop.workspace_title')}
-        >{t('remote_desktop.workspace_title')} · {hosts.length}</button>
-      )}
-    </>
+    <FloatingPanel
+      id={REMOTE_DESKTOP_WORKSPACE_WINDOW_ID}
+      title={t('remote_desktop.workspace_title')}
+      onClose={closeWorkspace}
+      zIndex={zIndex ?? 10020}
+      onFocus={onFocus}
+      defaultW={1240}
+      defaultH={800}
+      minW={680}
+      minH={460}
+      className="remote-desktop-workspace-shell"
+      hideTitleBar
+      dragHandleSelector=".remote-desktop-workspace-tabbar"
+    >{content}</FloatingPanel>
   );
 }

@@ -629,21 +629,17 @@ vi.mock('../src/components/ControlledNodeQuickMenu.js', () => ({
   ),
 }));
 vi.mock('../src/components/RemoteDesktopPanel.js', () => ({
-  RemoteDesktopPanel: ({ minimized, onMinimize, onRestore, onClose }: any) => (
+  RemoteDesktopPanel: ({ onClose }: any) => (
     <div data-testid="remote-desktop-panel">
-      remote-desktop-panel:{String(minimized)}
-      <button onClick={onMinimize}>remote-desktop-minimize</button>
-      <button onClick={onRestore}>remote-desktop-restore</button>
+      remote-desktop-panel
       <button onClick={onClose}>remote-desktop-close</button>
     </div>
   ),
 }));
 vi.mock('../src/components/RemoteDesktopWorkspace.js', () => ({
-  RemoteDesktopWorkspace: ({ minimized, onMinimize, onRestore, onCloseWorkspace }: any) => (
+  RemoteDesktopWorkspace: ({ onCloseWorkspace }: any) => (
     <div data-testid="remote-desktop-workspace">
-      remote-desktop-panel:{String(minimized)}
-      <button onClick={onMinimize}>remote-desktop-minimize</button>
-      <button onClick={onRestore}>remote-desktop-restore</button>
+      remote-desktop-workspace
       <button onClick={onCloseWorkspace}>remote-desktop-close</button>
     </div>
   ),
@@ -1111,19 +1107,15 @@ describe('App shell', () => {
     await waitFor(() => expect(panelZ()).toBeGreaterThan(subZ()));
 
     fireEvent.click(screen.getByText('controlled-nodes-panel'));
-    expect(await screen.findByText('remote-desktop-panel:false')).toBeTruthy();
+    expect(await screen.findByText('remote-desktop-workspace')).toBeTruthy();
 
     const closeControlledNodes = Array.from(panel.querySelectorAll('button'))
       .find((button) => button.textContent === 'floating-close');
     expect(closeControlledNodes).toBeTruthy();
     fireEvent.click(closeControlledNodes!);
     await waitFor(() => expect(screen.queryByTestId('floating-panel-controlled-nodes')).toBeNull());
-    expect(screen.getByText('remote-desktop-panel:false')).toBeTruthy();
-
-    fireEvent.click(screen.getByText('remote-desktop-minimize'));
-    expect(await screen.findByText('remote-desktop-panel:true')).toBeTruthy();
-    fireEvent.click(screen.getByText('remote-desktop-restore'));
-    expect(await screen.findByText('remote-desktop-panel:false')).toBeTruthy();
+    expect(screen.getByText('remote-desktop-workspace')).toBeTruthy();
+    expect(screen.queryByText('remote-desktop-minimize')).toBeNull();
   }, 20_000);
 
   it('opens remote control from the sidebar chevron without opening node management', async () => {
@@ -1136,7 +1128,7 @@ describe('App shell', () => {
     await waitFor(() => expect(wsInstances.length).toBe(1));
 
     fireEvent.click(await screen.findByTestId('controlled-node-quick-trigger'));
-    expect(await screen.findByText('remote-desktop-panel:false')).toBeTruthy();
+    expect(await screen.findByText('remote-desktop-workspace')).toBeTruthy();
     expect(screen.queryByTestId('floating-panel-controlled-nodes')).toBeNull();
   }, 20_000);
 

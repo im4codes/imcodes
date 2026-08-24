@@ -3234,6 +3234,8 @@
     "wall_health_failed": "失敗",
     "wall_health_paused": "背景已暫停",
     "wall_health_pressure_paused": "裝置壓力下已暫停",
+    "wall_retry_all": "重試中斷的桌面（{{count}}）",
+    "wall_open_new_window": "在獨立視窗開啟桌面牆",
     "wall_error_load_failed": "無法載入桌面牆。",
     "wall_error_authorization_lost": "存取權限已變更，桌面牆已重新整理。",
     "wall_error_conflict_requires_retry": "桌面牆再次變更，請重試操作。",

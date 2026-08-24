@@ -239,10 +239,7 @@ async function renderPanel(
   ws?: { targetsServer(serverId: string): boolean },
   capabilities: string[] = [REMOTE_DESKTOP_CAPABILITY],
   panelProps: {
-    minimized?: boolean;
     allowStandaloneWindow?: boolean;
-    onMinimize?: () => void;
-    onRestore?: () => void;
     onClose?: () => void;
     connectionManager?: RemoteDesktopConnectionManager;
   } = {},
@@ -260,10 +257,7 @@ async function renderPanel(
     }}
     ws={ws as never}
     onClose={panelProps.onClose ?? vi.fn()}
-    minimized={panelProps.minimized}
     allowStandaloneWindow={panelProps.allowStandaloneWindow}
-    onMinimize={panelProps.onMinimize}
-    onRestore={panelProps.onRestore}
     connectionManager={panelProps.connectionManager}
   />);
   await act(async () => { await Promise.resolve(); });
@@ -429,67 +423,58 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     })).toBeNull();
   });
 
-  it('uses shared window controls and minimizes without stopping the live desktop', async () => {
-    const onMinimize = vi.fn();
-    const onRestore = vi.fn();
+  it('keeps window controls in the toolbar without a second title or minimized dock', async () => {
     const onClose = vi.fn();
     const result = await renderPanel(undefined, [REMOTE_DESKTOP_CAPABILITY], {
-      onMinimize,
-      onRestore,
       onClose,
     });
 
+    expect(result.container.querySelector('.remote-desktop-header')).toBeNull();
+    expect(result.container.querySelector('.remote-desktop-minimized-dock')).toBeNull();
     const maximize = result.getByRole('button', { name: 'window.maximize' });
     expect(maximize.classList.contains('subsession-minimize-btn')).toBe(true);
     act(() => (maximize as HTMLButtonElement).click());
     expect(result.getByRole('button', { name: 'window.restore' })).toBeTruthy();
 
-    const minimize = result.getByRole('button', { name: 'window.minimize' });
-    expect(minimize.classList.contains('subsession-minimize-btn')).toBe(true);
-    act(() => (minimize as HTMLButtonElement).click());
-    expect(releaseAll).toHaveBeenCalled();
-    expect(stop).not.toHaveBeenCalled();
-    expect(onMinimize).toHaveBeenCalledTimes(1);
-    expect(onClose).not.toHaveBeenCalled();
-
-    result.rerender(<RemoteDesktopPanel
-      machine={{
-        serverId: 'server-1',
-        refName: 'controlled-1',
-        displayName: 'Windows',
-        os: 'win',
-        online: true,
-        execEnabled: true,
-        accessRole: 'owner',
-        capabilities: [REMOTE_DESKTOP_CAPABILITY],
-      }}
-      minimized
-      onMinimize={onMinimize}
-      onRestore={onRestore}
-      onClose={onClose}
-    />);
-    expect(result.container.querySelector('.remote-desktop-window-host')?.hasAttribute('hidden')).toBe(true);
-    act(() => (result.getByRole('button', { name: 'remote_desktop.title' }) as HTMLButtonElement).click());
-    expect(onRestore).toHaveBeenCalledTimes(1);
-
     const stopButton = result.container.querySelector('.remote-desktop-stop');
     expect(stopButton?.classList.contains('subsession-close-btn')).toBe(true);
   });
 
-  it('uses the shared desktop window chrome for header drag and eight-way resize', async () => {
+  it('moves audience facts into bottom diagnostics without counting controllers as viewers', async () => {
+    const { container } = await renderPanel();
+    act(() => clientHooks.at(-1)?.onSnapshot({
+      state: REMOTE_DESKTOP_STATE.DIRECT,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
+      inputEpoch: 1,
+      inputEnabled: true,
+      route: 'direct',
+      displays: [],
+      layoutRevision: 1,
+      stream: null,
+      viewerCount: 2,
+      controllerCount: 1,
+    }));
+
+    expect(container.querySelector('.remote-desktop-header')).toBeNull();
+    expect(container.querySelector('.remote-desktop-presence')).toBeNull();
+    expect(container.querySelector('[data-viewer-count="1"]')?.closest('footer')).not.toBeNull();
+    expect(container.querySelector('[data-controller-count="1"]')?.closest('footer')).not.toBeNull();
+  });
+
+  it('uses the compact toolbar as the drag handle and keeps eight-way resize', async () => {
     Object.defineProperties(window, {
       innerWidth: { value: 1600, configurable: true },
       innerHeight: { value: 1000, configurable: true },
     });
     const { container, getByTestId } = await renderPanel();
     const shell = getByTestId('floating-panel-remote-desktop-server-1') as HTMLDivElement;
-    const header = container.querySelector('.remote-desktop-header') as HTMLElement;
+    const toolbar = container.querySelector('.remote-desktop-toolbar') as HTMLElement;
     const initialLeft = Number.parseFloat(String(shell.style.left));
     const initialTop = Number.parseFloat(String(shell.style.top));
     const initialWidth = Number.parseFloat(String(shell.style.width));
 
     act(() => {
-      header.dispatchEvent(new MouseEvent('mousedown', {
+      toolbar.dispatchEvent(new MouseEvent('mousedown', {
         bubbles: true, cancelable: true, clientX: 200, clientY: 100,
       }));
       document.dispatchEvent(new MouseEvent('mousemove', {
@@ -1178,12 +1163,12 @@ describe('RemoteDesktopPanel mobile gestures', () => {
 
   it('keeps sending hover when focus retargets mouse movement outside the stage', async () => {
     const { container } = await renderPanel();
-    const header = container.querySelector('.remote-desktop-header');
-    expect(header).not.toBeNull();
+    const toolbar = container.querySelector('.remote-desktop-toolbar');
+    expect(toolbar).not.toBeNull();
     pointerMove.mockClear();
 
     act(() => {
-      header!.dispatchEvent(new MouseEvent('mousedown', {
+      toolbar!.dispatchEvent(new MouseEvent('mousedown', {
         bubbles: true,
         cancelable: true,
         clientX: 20,

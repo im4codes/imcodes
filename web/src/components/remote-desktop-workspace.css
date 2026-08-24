@@ -20,7 +20,13 @@
   background: #050b13;
 }
 
-.remote-desktop-workspace-header,
+.remote-desktop-wall-standalone {
+  position: fixed;
+  inset: 0;
+  overflow: hidden;
+}
+
+.remote-desktop-wall-header,
 .remote-desktop-workspace-tabbar {
   display: flex;
   align-items: center;
@@ -29,7 +35,7 @@
   border-bottom: 1px solid var(--chrome-line-soft);
 }
 
-.remote-desktop-workspace-header {
+.remote-desktop-wall-header {
   justify-content: space-between;
   cursor: move;
   background:
@@ -49,7 +55,12 @@
 .remote-desktop-workspace-tabbar > [role="tablist"] {
   min-width: 0;
   overflow-x: auto;
-  flex: 1;
+  flex: 0 1 auto;
+}
+
+.remote-desktop-workspace-tabbar {
+  justify-content: flex-start;
+  cursor: move;
 }
 
 .remote-desktop-workspace-tab,
@@ -111,6 +122,25 @@
   opacity: .28;
 }
 
+.remote-desktop-workspace-chrome-button:disabled {
+  opacity: .34;
+  cursor: default;
+  transform: none;
+}
+
+.remote-desktop-wall-retry-all {
+  display: inline-flex;
+  min-width: 34px;
+  gap: 5px;
+  padding-inline: 7px;
+}
+
+.remote-desktop-wall-retry-all > span {
+  min-width: 14px;
+  color: #d8f7ff;
+  font: 700 10px/1 ui-monospace, monospace;
+}
+
 .remote-desktop-workspace-icon-button.is-danger:hover:not(:disabled),
 .remote-desktop-workspace-chrome-button.is-danger:hover:not(:disabled) {
   border-color: rgb(251 113 133 / 65%);
@@ -119,13 +149,43 @@
 }
 
 .remote-desktop-workspace-host-tab {
+  gap: 0;
   white-space: nowrap;
+}
+
+.remote-desktop-workspace-host-tab .remote-desktop-workspace-tab {
+  border-radius: 7px 0 0 7px;
+}
+
+.remote-desktop-workspace-tab-close {
+  display: inline-grid;
+  min-width: 28px;
+  min-height: 30px;
+  place-items: center;
+  border: 1px solid rgb(76 168 218 / 24%);
+  border-left: 0;
+  border-radius: 0 7px 7px 0;
+  color: #7899ad;
+  background: linear-gradient(180deg, rgb(20 43 66 / 78%), rgb(8 21 36 / 88%));
+  cursor: pointer;
+}
+
+.remote-desktop-workspace-tab-close:hover,
+.remote-desktop-workspace-tab-close:focus-visible {
+  color: #fecdd3;
+  background: rgb(95 26 43 / 42%);
+  outline: 1px solid rgb(251 113 133 / 48%);
+}
+
+.remote-desktop-workspace-add {
+  flex: 0 0 auto;
+  margin-left: 0;
 }
 
 .remote-desktop-workspace-picker {
   position: absolute;
   z-index: 3;
-  top: 88px;
+  top: 48px;
   right: 12px;
   display: grid;
   width: min(360px, calc(100% - 24px));
@@ -179,9 +239,9 @@
   user-select: none;
 }
 
-.remote-desktop-wall-tile:focus-visible {
+.remote-desktop-wall-picture:focus-visible {
   outline: 2px solid var(--chrome-accent);
-  outline-offset: 2px;
+  outline-offset: -3px;
 }
 
 .remote-desktop-wall-tile[data-health="failed"],
@@ -189,13 +249,97 @@
   border-color: var(--danger, #ef4444);
 }
 
-.remote-desktop-wall-tile video {
+.remote-desktop-wall-picture {
+  display: block;
+  width: 100%;
+  height: 100%;
+  padding: 0;
+  border: 0;
+  border-radius: inherit;
+  background: transparent;
+  cursor: pointer;
+}
+
+.remote-desktop-wall-picture video {
   display: block;
   width: 100%;
   height: 100%;
   object-fit: contain;
   border-radius: inherit;
   background: #05070a;
+}
+
+.remote-desktop-wall-state {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px;
+  color: #b8d4e3;
+  background:
+    radial-gradient(circle at 50% 45%, rgb(15 61 86 / 22%), transparent 52%),
+    linear-gradient(180deg, rgb(2 6 11 / 40%), rgb(2 6 11 / 86%));
+  pointer-events: none;
+}
+
+.remote-desktop-wall-state-copy {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border: 1px solid rgb(88 180 224 / 18%);
+  border-radius: 999px;
+  background: rgb(4 16 27 / 78%);
+  box-shadow: 0 0 18px rgb(14 165 233 / 7%);
+  font-size: 12px;
+  letter-spacing: .02em;
+}
+
+.remote-desktop-wall-status-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #38bdf8;
+  box-shadow: 0 0 10px rgb(56 189 248 / 70%);
+}
+
+.remote-desktop-wall-state.is-connecting .remote-desktop-wall-status-dot,
+.remote-desktop-wall-state.is-reconnecting .remote-desktop-wall-status-dot {
+  animation: remote-desktop-wall-status-pulse 1.2s ease-in-out infinite;
+}
+
+.remote-desktop-wall-state.is-failed .remote-desktop-wall-status-dot,
+.remote-desktop-wall-state.is-stale .remote-desktop-wall-status-dot {
+  background: #fb7185;
+  box-shadow: 0 0 10px rgb(251 113 133 / 72%);
+}
+
+.remote-desktop-wall-tile-retry {
+  min-height: 30px;
+  padding: 6px 13px;
+  border: 1px solid rgb(56 189 248 / 46%);
+  border-radius: 7px;
+  color: #ddf8ff;
+  background: linear-gradient(180deg, rgb(13 78 106 / 92%), rgb(6 42 62 / 96%));
+  box-shadow: 0 0 18px rgb(14 165 233 / 12%);
+  pointer-events: auto;
+  cursor: pointer;
+}
+
+.remote-desktop-wall-tile-retry:hover,
+.remote-desktop-wall-tile-retry:focus-visible {
+  border-color: rgb(103 232 249 / 82%);
+  box-shadow: 0 0 20px rgb(34 211 238 / 20%);
+  outline: none;
+}
+
+@keyframes remote-desktop-wall-status-pulse {
+  0%, 100% { opacity: .45; transform: scale(.8); }
+  50% { opacity: 1; transform: scale(1.15); }
 }
 
 .remote-desktop-wall-add-slot {

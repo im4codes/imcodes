@@ -93,13 +93,14 @@ describe('RemoteDesktopWorkspace', () => {
     state = openRemoteDesktopWorkspaceHost(state, machine('b'));
     const { manager, events } = setupManager();
     const activate = vi.fn((tabId: string) => events.push(`activate:${tabId}`));
+    const reorder = vi.fn();
     render(<RemoteDesktopWorkspace
       state={state}
       manager={manager}
       onOpenHost={vi.fn()}
       onActivateTab={activate}
       onCloseHost={vi.fn()}
-      onReorderHost={vi.fn()}
+      onReorderHost={reorder}
       onCloseWorkspace={vi.fn()}
     />);
 
@@ -107,15 +108,16 @@ describe('RemoteDesktopWorkspace', () => {
     expect(screen.getByTestId('panel-b').textContent).toBe('true:true');
     fireEvent.keyDown(screen.getByRole('tab', { name: 'B' }), { key: 'ArrowLeft' });
     expect(events).toEqual(['release:a', 'activate:a']);
+    fireEvent.keyDown(screen.getByRole('tab', { name: 'B' }), { key: 'ArrowLeft', altKey: true });
+    expect(reorder).toHaveBeenCalledWith('b', -1);
   });
 
-  it('stops only the exact host on tab close and Stop All only on workspace close', () => {
+  it('stops only the exact host selected by its integrated tab close control', () => {
     let state = createRemoteDesktopWorkspaceState();
     state = openRemoteDesktopWorkspaceHost(state, machine('a'));
     state = openRemoteDesktopWorkspaceHost(state, machine('b'));
     const { manager, events } = setupManager();
     const closeHost = vi.fn();
-    const closeWorkspace = vi.fn();
     render(<RemoteDesktopWorkspace
       state={state}
       manager={manager}
@@ -123,15 +125,12 @@ describe('RemoteDesktopWorkspace', () => {
       onActivateTab={vi.fn()}
       onCloseHost={closeHost}
       onReorderHost={vi.fn()}
-      onCloseWorkspace={closeWorkspace}
+      onCloseWorkspace={vi.fn()}
     />);
 
     fireEvent.click(screen.getByRole('button', { name: 'remote_desktop.workspace_close_tab:B' }));
     expect(events).toEqual(['stop:b']);
     expect(closeHost).toHaveBeenCalledWith('b');
-    fireEvent.click(screen.getByRole('button', { name: 'remote_desktop.workspace_stop_all' }));
-    expect(events).toEqual(['stop:b', 'stop:a', 'stop:b']);
-    expect(closeWorkspace).toHaveBeenCalledTimes(1);
   });
 
   it('keeps the sole manager owner alive when closing a tab still represented on the wall', async () => {
@@ -194,7 +193,7 @@ describe('RemoteDesktopWorkspace', () => {
     expect(openHost).toHaveBeenCalledWith(expect.objectContaining({ serverId: 'c' }));
   });
 
-  it('keeps every host presentation mounted while the workspace is minimized and restored', () => {
+  it('renders only the compact tab strip and keeps the add control adjacent to it', () => {
     let state = createRemoteDesktopWorkspaceState();
     state = openRemoteDesktopWorkspaceHost(state, machine('a'));
     state = openRemoteDesktopWorkspaceHost(state, machine('b'));
@@ -208,13 +207,15 @@ describe('RemoteDesktopWorkspace', () => {
       onReorderHost: vi.fn(),
       onCloseWorkspace: vi.fn(),
     };
-    const result = render(<RemoteDesktopWorkspace {...props} minimized={false} />);
+    const result = render(<RemoteDesktopWorkspace {...props} />);
     expect(screen.getByTestId('panel-a')).toBeDefined();
     expect(screen.getByTestId('panel-b')).toBeDefined();
-
-    result.rerender(<RemoteDesktopWorkspace {...props} minimized />);
-    expect(screen.getByTestId('panel-a')).toBeDefined();
-    expect(screen.getByTestId('panel-b')).toBeDefined();
+    expect(result.container.querySelector('.remote-desktop-workspace-header')).toBeNull();
+    expect(result.container.querySelector('.remote-desktop-minimized-dock')).toBeNull();
+    const tabbar = result.container.querySelector('.remote-desktop-workspace-tabbar');
+    const tablist = tabbar?.querySelector('[role="tablist"]');
+    const add = screen.getByRole('button', { name: 'remote_desktop.workspace_add' });
+    expect(tablist?.nextElementSibling).toBe(add);
     expect(manager.stop).not.toHaveBeenCalled();
     expect(manager.stopAll).not.toHaveBeenCalled();
   });

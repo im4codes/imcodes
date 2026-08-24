@@ -3233,6 +3233,8 @@
     "wall_health_failed": "失敗",
     "wall_health_paused": "バックグラウンドで一時停止",
     "wall_health_pressure_paused": "端末負荷により一時停止",
+    "wall_retry_all": "切断されたデスクトップを再試行（{{count}}）",
+    "wall_open_new_window": "デスクトップウォールを別ウィンドウで開く",
     "wall_error_load_failed": "ウォールを読み込めませんでした。",
     "wall_error_authorization_lost": "アクセス権が変更され、ウォールを更新しました。",
     "wall_error_conflict_requires_retry": "ウォールが再度変更されました。再試行してください。",

@@ -75,6 +75,7 @@ import { ControlledNodeQuickMenu } from './components/ControlledNodeQuickMenu.js
 import { RemoteDesktopWorkspace } from './components/RemoteDesktopWorkspace.js';
 import { RemoteDesktopWall, REMOTE_DESKTOP_WALL_WINDOW_ID } from './components/RemoteDesktopWall.js';
 import { RemoteDesktopConnectionManager } from './remote-desktop-connection-manager.js';
+import { openRemoteDesktopWallWindow } from './remote-desktop-window.js';
 import {
   REMOTE_DESKTOP_WORKSPACE_WINDOW_ID,
   activateRemoteDesktopWorkspaceTab,
@@ -1770,7 +1771,6 @@ export function App() {
   const [remoteDesktopWorkspace, setRemoteDesktopWorkspace] = useState(
     createRemoteDesktopWorkspaceState,
   );
-  const [remoteDesktopMinimized, setRemoteDesktopMinimized] = useState(false);
   const [remoteDesktopWallOpen, setRemoteDesktopWallOpen] = useState(false);
   const [remoteDesktopWallMinimized, setRemoteDesktopWallMinimized] = useState(false);
   const [remoteDesktopWallHostKeys, setRemoteDesktopWallHostKeys] = useState<readonly string[]>([]);
@@ -1792,7 +1792,6 @@ export function App() {
 
   const openRemoteDesktop = useCallback((machine: MachineListItem) => {
     setRemoteDesktopWorkspace((current) => openRemoteDesktopWorkspaceHost(current, machine));
-    setRemoteDesktopMinimized(false);
     ensureDesktopWindow(REMOTE_DESKTOP_WORKSPACE_WINDOW_ID, {
       kind: DESKTOP_WINDOW_KINDS.remoteDesktop,
     }, { bringToFront: true });
@@ -1805,6 +1804,21 @@ export function App() {
       kind: DESKTOP_WINDOW_KINDS.remoteDesktopWall,
     }, { bringToFront: true });
   }, [ensureDesktopWindow]);
+
+  const closeRemoteDesktopWall = useCallback((hostKeys: readonly string[]) => {
+    const retained = new Set(remoteDesktopWorkspace.orderedHostKeys);
+    for (const hostKey of hostKeys) {
+      if (!retained.has(hostKey)) remoteDesktopConnectionManager.stop(hostKey);
+    }
+    setRemoteDesktopWallOpen(false);
+    setRemoteDesktopWallMinimized(false);
+    removeDesktopWindow(DESKTOP_WINDOW_IDS.remoteDesktopWall);
+  }, [remoteDesktopConnectionManager, remoteDesktopWorkspace.orderedHostKeys, removeDesktopWindow]);
+
+  const openRemoteDesktopWallStandalone = useCallback(() => {
+    if (!openRemoteDesktopWallWindow()) return;
+    closeRemoteDesktopWall(remoteDesktopWallHostKeys);
+  }, [closeRemoteDesktopWall, remoteDesktopWallHostKeys]);
 
   useEffect(() => {
     if (auth) return;
@@ -6398,7 +6412,6 @@ export function App() {
           state={remoteDesktopWorkspace}
           manager={remoteDesktopConnectionManager}
           ws={wsRef.current}
-          minimized={remoteDesktopMinimized}
           zIndex={getDesktopWindowZIndex(
             REMOTE_DESKTOP_WORKSPACE_WINDOW_ID,
             5110,
@@ -6418,12 +6431,9 @@ export function App() {
           onReorderHost={(hostKey, direction) => setRemoteDesktopWorkspace((current) => (
             reorderRemoteDesktopWorkspaceHost(current, hostKey, direction)
           ))}
-          onMinimize={() => setRemoteDesktopMinimized(true)}
-          onRestore={() => setRemoteDesktopMinimized(false)}
           onCloseWorkspace={() => {
             removeDesktopWindow(REMOTE_DESKTOP_WORKSPACE_WINDOW_ID);
             setRemoteDesktopWorkspace((current) => closeRemoteDesktopWorkspace(current));
-            setRemoteDesktopMinimized(false);
           }}
           wallHostKeys={new Set(remoteDesktopWallHostKeys)}
         />
@@ -6438,17 +6448,10 @@ export function App() {
           onFocus={() => bringDesktopWindowToFront(DESKTOP_WINDOW_IDS.remoteDesktopWall)}
           onMinimize={() => setRemoteDesktopWallMinimized(true)}
           onRestore={() => setRemoteDesktopWallMinimized(false)}
+          onOpenStandalone={openRemoteDesktopWallStandalone}
           onOpenHost={openRemoteDesktop}
           onHostKeysChange={setRemoteDesktopWallHostKeys}
-          onClose={(hostKeys) => {
-            const retained = new Set(remoteDesktopWorkspace.orderedHostKeys);
-            for (const hostKey of hostKeys) {
-              if (!retained.has(hostKey)) remoteDesktopConnectionManager.stop(hostKey);
-            }
-            setRemoteDesktopWallOpen(false);
-            setRemoteDesktopWallMinimized(false);
-            removeDesktopWindow(DESKTOP_WINDOW_IDS.remoteDesktopWall);
-          }}
+          onClose={closeRemoteDesktopWall}
         />
       )}
 

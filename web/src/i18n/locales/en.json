@@ -3234,6 +3234,8 @@
     "wall_health_failed": "Failed",
     "wall_health_paused": "Paused in background",
     "wall_health_pressure_paused": "Paused for device pressure",
+    "wall_retry_all": "Retry disconnected desktops ({{count}})",
+    "wall_open_new_window": "Open wall in a separate window",
     "wall_error_load_failed": "The wall could not be loaded.",
     "wall_error_authorization_lost": "Access changed. The wall was refreshed.",
     "wall_error_conflict_requires_retry": "The wall changed again. Retry your action.",

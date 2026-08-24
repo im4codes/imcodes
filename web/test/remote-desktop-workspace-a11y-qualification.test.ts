@@ -114,6 +114,7 @@ describe('remote desktop 16.3 workspace accessibility and locale qualification',
       'access_secret_once_title', 'access_secret_once', 'access_password_title', 'access_privacy_recovery',
       'workspace_title', 'workspace_tabs', 'workspace_wall', 'workspace_select', 'workspace_add', 'workspace_close_tab',
       'wall_grid', 'wall_open_host', 'wall_manage', 'wall_health_live', 'wall_health_stale', 'wall_health_pressure_paused',
+      'wall_retry_all', 'wall_open_new_window',
     ] as const;
     const guestKeys = ['title', 'subtitle', 'public_id', 'password', 'connect', 'boundary', 'state_waiting_for_consent', 'generic_error', 'remote_screen'] as const;
     for (const [name, locale] of Object.entries({ en, es, ja, ko, ru, zhCN, zhTW })) {
@@ -136,7 +137,7 @@ describe('remote desktop 16.3 workspace accessibility and locale qualification',
     expect(accessCss).toContain('@media(max-width:720px)');
     expect(accessCss).toContain(':focus-visible');
 
-    expect(sourceQualificationIssues(`${workspace.replace("event.key === 'ArrowRight'", 'event.key === \'PageDown\'')}\n${wall}\n${wallTile}`))
+    expect(sourceQualificationIssues(`${workspace.replaceAll("event.key === 'ArrowRight'", 'event.key === \'PageDown\'')}\n${wall}\n${wallTile}`))
       .toContain('right-key');
     expect(guestSecretDisclosureIssues(`${guest}\nreturn <span>{ready.serverId}</span>;`))
       .toContain('renders-internal-secret-or-routing-field');

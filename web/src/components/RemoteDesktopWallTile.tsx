@@ -1,5 +1,5 @@
 import { REMOTE_DESKTOP_STATE } from '@shared/remote-desktop.js';
-import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { createPortal } from 'preact/compat';
 import { useTranslation } from 'react-i18next';
 import type { RemoteDesktopWallHost } from '../api/remote-desktop-wall.js';
@@ -22,6 +22,8 @@ export interface RemoteDesktopWallTileProps {
   manager: RemoteDesktopConnectionManager;
   wallVisible: boolean;
   pressurePaused?: boolean;
+  retryGeneration?: number;
+  onRetryableChange?(hostId: string, retryable: boolean): void;
   onOpen(host: RemoteDesktopWallHost): void;
   onRemove(hostId: string): void;
 }
@@ -31,6 +33,8 @@ export function RemoteDesktopWallTile({
   manager,
   wallVisible,
   pressurePaused = false,
+  retryGeneration = 0,
+  onRetryableChange,
   onOpen,
   onRemove,
 }: RemoteDesktopWallTileProps) {
@@ -45,7 +49,14 @@ export function RemoteDesktopWallTile({
   const [inViewport, setInViewport] = useState(true);
   const [sizeTier, setSizeTier] = useState<'compact' | 'normal'>('normal');
   const [menuPosition, setMenuPosition] = useState<{ left: number; top: number } | null>(null);
+  const lastRetryGenerationRef = useRef(retryGeneration);
   const paused = pressurePaused || !wallVisible || !pageVisible || !inViewport;
+  const retryable = snapshot.state === REMOTE_DESKTOP_STATE.FAILED
+    || snapshot.state === REMOTE_DESKTOP_STATE.STOPPED;
+
+  const retryConnection = useCallback(() => {
+    manager.presentation(host, presentationRef.current).retry();
+  }, [host, manager]);
 
   useEffect(() => {
     const update = () => setPageVisible(document.visibilityState === 'visible');
@@ -90,6 +101,17 @@ export function RemoteDesktopWallTile({
     void connection.start();
     return unsubscribe;
   }, [host.remoteDesktopHostId, host.serverId, manager]);
+
+  useEffect(() => {
+    onRetryableChange?.(host.hostId, retryable);
+    return () => onRetryableChange?.(host.hostId, false);
+  }, [host.hostId, onRetryableChange, retryable]);
+
+  useEffect(() => {
+    if (retryGeneration === lastRetryGenerationRef.current) return;
+    lastRetryGenerationRef.current = retryGeneration;
+    if (retryable) retryConnection();
+  }, [retryConnection, retryGeneration, retryable]);
 
   useEffect(() => {
     const video = videoRef.current;
@@ -186,7 +208,7 @@ export function RemoteDesktopWallTile({
         type="button"
         role="menuitem"
         onClick={() => {
-          manager.presentation(host, presentationRef.current).retry();
+          retryConnection();
           setMenuPosition(null);
         }}
       >{t('remote_desktop.retry')}</button>
@@ -209,28 +231,46 @@ export function RemoteDesktopWallTile({
         data-presentation-priority={paused ? 'paused' : 'visible-wall'}
         data-route={snapshot.route ?? 'pending'}
         data-size-tier={sizeTier}
-        tabIndex={0}
-        role="button"
-        aria-label={t('remote_desktop.wall_open_host', { machine: host.displayName })}
-        aria-haspopup="menu"
-        onClick={() => onOpen(host)}
         onContextMenu={(event) => {
           event.preventDefault();
           openContextMenu(event.clientX, event.clientY);
         }}
-        onKeyDown={(event) => {
-          if (event.key === 'Enter' || event.key === ' ') {
-            event.preventDefault();
-            onOpen(host);
-          }
-          if (event.key === 'ContextMenu' || (event.shiftKey && event.key === 'F10')) {
-            event.preventDefault();
-            const rect = tileRef.current?.getBoundingClientRect();
-            openContextMenu(rect?.left ?? 8, rect?.top ?? 8);
-          }
-        }}
       >
-        <video ref={videoRef} muted playsInline aria-label={t('remote_desktop.video_label', { machine: host.displayName })} />
+        <button
+          type="button"
+          class="remote-desktop-wall-picture"
+          aria-label={t('remote_desktop.wall_open_host', { machine: host.displayName })}
+          aria-haspopup="menu"
+          onClick={() => onOpen(host)}
+          onKeyDown={(event) => {
+            if (event.key === 'ContextMenu' || (event.shiftKey && event.key === 'F10')) {
+              event.preventDefault();
+              const rect = tileRef.current?.getBoundingClientRect();
+              openContextMenu(rect?.left ?? 8, rect?.top ?? 8);
+            }
+          }}
+        >
+          <video ref={videoRef} muted playsInline aria-label={t('remote_desktop.video_label', { machine: host.displayName })} />
+        </button>
+        {health !== 'live' && (
+          <div class={`remote-desktop-wall-state is-${health}`}>
+            <span class="remote-desktop-wall-state-copy" role="status" aria-live="polite">
+              <span class="remote-desktop-wall-status-dot" aria-hidden="true" />
+              <strong>{t(`remote_desktop.wall_health_${health}`)}</strong>
+            </span>
+            {retryable && (
+              <button
+                type="button"
+                class="remote-desktop-wall-tile-retry"
+                onPointerDown={(event) => event.stopPropagation()}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  retryConnection();
+                }}
+              >{t('remote_desktop.retry')}</button>
+            )}
+          </div>
+        )}
       </article>
       {contextMenu}
     </>

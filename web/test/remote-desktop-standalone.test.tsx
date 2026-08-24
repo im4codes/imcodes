@@ -29,6 +29,7 @@ vi.mock('../src/components/RemoteDesktopPanel.js', () => ({
 import { RemoteDesktopStandalone } from '../src/components/RemoteDesktopStandalone.js';
 import {
   buildRemoteDesktopWindowUrl,
+  isRemoteDesktopWallWindow,
   readRemoteDesktopWindowServerId,
 } from '../src/remote-desktop-window.js';
 
@@ -73,7 +74,9 @@ describe('remote desktop standalone window', () => {
     const url = buildRemoteDesktopWindowUrl('desktop_1-abc', 'https://example.test/app?keep=1#chat');
     const parsed = new URL(url);
     expect(parsed.searchParams.get('keep')).toBe('1');
+    expect(parsed.searchParams.get('remoteDesktopWall')).toBeNull();
     expect(readRemoteDesktopWindowServerId(parsed.search)).toBe('desktop_1-abc');
+    expect(isRemoteDesktopWallWindow(parsed.search)).toBe(false);
     expect(parsed.hash).toBe('');
     expect(readRemoteDesktopWindowServerId('?remoteDesktopServer=../bad')).toBeNull();
   });

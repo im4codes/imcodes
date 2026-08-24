@@ -218,7 +218,6 @@ export interface RemoteDesktopPanelProps {
   machine: MachineListItem;
   connectionManager?: RemoteDesktopConnectionManager;
   ws?: WsClient | null;
-  minimized?: boolean;
   standalone?: boolean;
   allowStandaloneWindow?: boolean;
   /** Render inside the single remote-desktop workspace root, without another floating shell. */
@@ -227,8 +226,6 @@ export interface RemoteDesktopPanelProps {
   active?: boolean;
   /** Only the active ordinary host tab may own keyboard/pointer input. */
   inputActive?: boolean;
-  onMinimize?(): void;
-  onRestore?(): void;
   onClose(): void;
   /** Clear protected workspace metadata when Server authority is terminally lost. */
   onAuthorityLost?(): void;
@@ -271,14 +268,11 @@ export function RemoteDesktopPanel({
   machine,
   connectionManager,
   ws = null,
-  minimized = false,
   standalone = false,
   allowStandaloneWindow = false,
   embedded = false,
   active = true,
   inputActive = true,
-  onMinimize,
-  onRestore,
   onClose,
   onAuthorityLost,
   zIndex,
@@ -1481,12 +1475,6 @@ export function RemoteDesktopPanel({
     onClose();
   };
 
-  const minimizePanel = () => {
-    releaseCapturedInput();
-    setDesktopMaximized(false);
-    onMinimize?.();
-  };
-
   const toggleFullscreen = async () => {
     if (document.fullscreenElement) await document.exitFullscreen();
     else await panelRef.current?.requestFullscreen();
@@ -1641,6 +1629,10 @@ export function RemoteDesktopPanel({
     && mediaPresented
     && videoRef.current?.srcObject === snapshot.stream);
   const activeConnectionStep = activeRemoteDesktopConnectionStep(snapshot, currentStreamPresented);
+  const controllerCount = snapshot.controllerCount ?? (
+    snapshot.mode === REMOTE_DESKTOP_ACCESS_MODE.CONTROL ? 1 : 0
+  );
+  const viewerCount = Math.max(0, (snapshot.viewerCount ?? 1) - controllerCount);
 
   const panelBody = (
       <div
@@ -1651,51 +1643,6 @@ export function RemoteDesktopPanel({
         aria-label={t('remote_desktop.title', { machine: machine.displayName })}
         hidden={embedded && !active}
       >
-        <header class="remote-desktop-header">
-          <div>
-            <strong>{machine.displayName}</strong>
-            <span>{t(`remote_desktop.state.${snapshot.state}`)}</span>
-          </div>
-          <div class="remote-desktop-presence" aria-live="polite">
-            <span>{t('remote_desktop.viewers', { count: snapshot.viewerCount ?? 1 })}</span>
-            <span>{t('remote_desktop.controllers', { count: snapshot.controllerCount ?? (snapshot.mode === 'control' ? 1 : 0) })}</span>
-          </div>
-          <div class="remote-desktop-window-actions">
-            {!embedded && !standalone && allowStandaloneWindow && (
-              <button
-                type="button"
-                class="subsession-minimize-btn remote-desktop-open-window"
-                aria-label={t('remote_desktop.open_new_window')}
-                title={t('remote_desktop.open_new_window')}
-                onClick={() => {
-                  if (openRemoteDesktopWindow(machine.serverId)) stopAndClose();
-                }}
-              >↗</button>
-            )}
-            {!embedded && <DesktopWindowMaximizeButton
-              maximized={desktopMaximized}
-              class="subsession-minimize-btn remote-desktop-maximize"
-              onClick={() => setDesktopMaximized((current) => !current)}
-            />}
-            {!embedded && onMinimize && (
-              <button
-                type="button"
-                class="subsession-minimize-btn remote-desktop-minimize"
-                aria-label={t('window.minimize')}
-                title={t('window.minimize')}
-                onClick={minimizePanel}
-              >▾</button>
-            )}
-            <button
-              type="button"
-              class="subsession-close-btn remote-desktop-stop"
-              aria-label={t('remote_desktop.stop')}
-              title={t('remote_desktop.stop')}
-              onClick={stopAndClose}
-            >×</button>
-          </div>
-        </header>
-
         <div class="remote-desktop-toolbar">
           <div class="remote-desktop-display-tabs" role="tablist" aria-label={t('remote_desktop.displays')}>
             {snapshot.displays.map((display) => (
@@ -1818,6 +1765,33 @@ export function RemoteDesktopPanel({
             aria-pressed={filePanelOpen}
             onClick={() => setFilePanelOpen((open) => !open)}
           >{t('remote_desktop.files')}</button>
+          {!embedded && (
+            <div class="remote-desktop-window-actions">
+              {!standalone && allowStandaloneWindow && (
+                <button
+                  type="button"
+                  class="subsession-minimize-btn remote-desktop-open-window"
+                  aria-label={t('remote_desktop.open_new_window')}
+                  title={t('remote_desktop.open_new_window')}
+                  onClick={() => {
+                    if (openRemoteDesktopWindow(machine.serverId)) stopAndClose();
+                  }}
+                >↗</button>
+              )}
+              <DesktopWindowMaximizeButton
+                maximized={desktopMaximized}
+                class="subsession-minimize-btn remote-desktop-maximize"
+                onClick={() => setDesktopMaximized((current) => !current)}
+              />
+              <button
+                type="button"
+                class="subsession-close-btn remote-desktop-stop"
+                aria-label={t('remote_desktop.stop')}
+                title={t('remote_desktop.stop')}
+                onClick={stopAndClose}
+              >×</button>
+            </div>
+          )}
         </div>
 
         {controlNotice && (
@@ -2371,6 +2345,10 @@ export function RemoteDesktopPanel({
 
         <footer class="remote-desktop-footer">
           <div class="remote-desktop-diagnostics" aria-label={t('remote_desktop.diagnostics')}>
+            <span class="remote-desktop-diagnostic-machine">{machine.displayName}</span>
+            <span>{t(`remote_desktop.state.${snapshot.state}`)}</span>
+            <span aria-live="polite" data-viewer-count={viewerCount}>{t('remote_desktop.viewers', { count: viewerCount })}</span>
+            <span aria-live="polite" data-controller-count={controllerCount}>{t('remote_desktop.controllers', { count: controllerCount })}</span>
             <span>{t('remote_desktop.route', { route: snapshot.route ?? '—' })}</span>
             {selectedDisplay && <span>{selectedDisplay.width}×{selectedDisplay.height} · {Math.round(selectedDisplay.dpiScale * 100)}% DPI</span>}
             {snapshot.quality && (
@@ -2417,43 +2395,24 @@ export function RemoteDesktopPanel({
   if (embedded) return panelBody;
 
   return (
-    <>
-      <div class="remote-desktop-window-host" hidden={minimized}>
-        <FloatingPanel
-          id={`remote-desktop-${machine.serverId}`}
-          title={t('remote_desktop.title', { machine: machine.displayName })}
-          onClose={stopAndClose}
-          zIndex={zIndex ?? 10020}
-          onFocus={onFocus}
-          defaultW={1200}
-          defaultH={760}
-          minW={640}
-          minH={420}
-          enableMaximize
-          isMaximized={desktopMaximized}
-          onToggleMaximized={() => setDesktopMaximized((current) => !current)}
-          className="remote-desktop-floating-shell"
-          hideTitleBar
-          dragHandleSelector=".remote-desktop-header"
-        >
-          {panelBody}
-        </FloatingPanel>
-      </div>
-      {minimized && (
-        <button
-          type="button"
-          class="remote-desktop-minimized-dock"
-          aria-label={t('remote_desktop.title', { machine: machine.displayName })}
-          onClick={onRestore}
-        >
-          <span class={`remote-desktop-minimized-status${connected ? ' is-online' : ''}`} aria-hidden="true" />
-          <span class="remote-desktop-minimized-copy">
-            <strong>{machine.displayName}</strong>
-            <small>{t(`remote_desktop.state.${snapshot.state}`)}</small>
-          </span>
-          <span class="remote-desktop-minimized-restore" aria-hidden="true">↗</span>
-        </button>
-      )}
-    </>
+    <FloatingPanel
+      id={`remote-desktop-${machine.serverId}`}
+      title={t('remote_desktop.title', { machine: machine.displayName })}
+      onClose={stopAndClose}
+      zIndex={zIndex ?? 10020}
+      onFocus={onFocus}
+      defaultW={1200}
+      defaultH={760}
+      minW={640}
+      minH={420}
+      enableMaximize
+      isMaximized={desktopMaximized}
+      onToggleMaximized={() => setDesktopMaximized((current) => !current)}
+      className="remote-desktop-floating-shell"
+      hideTitleBar
+      dragHandleSelector=".remote-desktop-toolbar"
+    >
+      {panelBody}
+    </FloatingPanel>
   );
 }

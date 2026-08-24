@@ -3234,6 +3234,8 @@
     "wall_health_failed": "失败",
     "wall_health_paused": "后台已暂停",
     "wall_health_pressure_paused": "设备压力下已暂停",
+    "wall_retry_all": "重试断开的桌面（{{count}}）",
+    "wall_open_new_window": "在独立窗口打开桌面墙",
     "wall_error_load_failed": "无法加载桌面墙。",
     "wall_error_authorization_lost": "访问权限已变化，桌面墙已刷新。",
     "wall_error_conflict_requires_retry": "桌面墙再次变化，请重试操作。",

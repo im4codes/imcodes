@@ -29,13 +29,17 @@ vi.mock('../src/components/RemoteDesktopPanel.js', () => ({
   canOpenRemoteDesktop: (machine: { online: boolean }) => machine.online,
 }));
 vi.mock('../src/components/RemoteDesktopWallTile.js', () => ({
-  RemoteDesktopWallTile: ({ host, onOpen, onRemove }: {
+  RemoteDesktopWallTile: ({ host, retryGeneration, onRetryableChange, onOpen, onRemove }: {
     host: { hostId: string; displayName: string };
+    retryGeneration: number;
+    onRetryableChange(hostId: string, retryable: boolean): void;
     onOpen(host: unknown): void;
     onRemove(hostId: string): void;
   }) => <div data-testid={`tile-${host.hostId}`}>
     <button type="button" onClick={() => onOpen(host)}>{`open:${host.displayName}`}</button>
     <button type="button" onClick={() => onRemove(host.hostId)}>{`remove:${host.displayName}`}</button>
+    <button type="button" onClick={() => onRetryableChange(host.hostId, true)}>{`fail:${host.displayName}`}</button>
+    <span data-testid={`retry-generation-${host.hostId}`}>{retryGeneration}</span>
   </div>,
 }));
 
@@ -111,5 +115,44 @@ describe('RemoteDesktopWall', () => {
 
     fireEvent.click(screen.getByText('remove:A'));
     await waitFor(() => expect(manager.stop).toHaveBeenCalledWith('a'));
+  });
+
+  it('enables global retry only for tiles that reported a retryable disconnect', async () => {
+    api.getRemoteDesktopWall.mockResolvedValue({
+      revision: 2, layout: 'grid', hostIds: ['a'], hosts: [machine('a')],
+    });
+    render(<RemoteDesktopWall
+      manager={{ stop: vi.fn() } as unknown as RemoteDesktopConnectionManager}
+      retainedHostKeys={new Set()}
+      onOpenHost={vi.fn()}
+      onHostKeysChange={vi.fn()}
+      onClose={vi.fn()}
+    />);
+    const retryAll = await screen.findByRole('button', {
+      name: 'remote_desktop.wall_retry_all:0',
+    });
+    expect((retryAll as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(screen.getByRole('button', { name: 'fail:A' }));
+    await waitFor(() => expect((screen.getByRole('button', {
+      name: 'remote_desktop.wall_retry_all:1',
+    }) as HTMLButtonElement).disabled).toBe(false));
+    fireEvent.click(screen.getByRole('button', { name: 'remote_desktop.wall_retry_all:1' }));
+    expect(screen.getByTestId('retry-generation-a').textContent).toBe('1');
+  });
+
+  it('offers a dedicated browser-window handoff from the wall titlebar', async () => {
+    const openStandalone = vi.fn();
+    render(<RemoteDesktopWall
+      manager={{ stop: vi.fn() } as unknown as RemoteDesktopConnectionManager}
+      retainedHostKeys={new Set()}
+      onOpenStandalone={openStandalone}
+      onOpenHost={vi.fn()}
+      onHostKeysChange={vi.fn()}
+      onClose={vi.fn()}
+    />);
+    fireEvent.click(await screen.findByRole('button', {
+      name: 'remote_desktop.wall_open_new_window',
+    }));
+    expect(openStandalone).toHaveBeenCalledTimes(1);
   });
 });

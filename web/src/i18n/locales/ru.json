@@ -3233,6 +3233,8 @@
     "wall_health_failed": "Ошибка",
     "wall_health_paused": "Приостановлено в фоне",
     "wall_health_pressure_paused": "Приостановлено из-за нагрузки",
+    "wall_retry_all": "Повторить подключение отключённых рабочих столов ({{count}})",
+    "wall_open_new_window": "Открыть стену в отдельном окне",
     "wall_error_load_failed": "Не удалось загрузить стену.",
     "wall_error_authorization_lost": "Доступ изменился. Стена обновлена.",
     "wall_error_conflict_requires_retry": "Стена снова изменилась. Повторите действие.",

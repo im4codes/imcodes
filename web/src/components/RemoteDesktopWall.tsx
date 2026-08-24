@@ -23,11 +23,13 @@ export const REMOTE_DESKTOP_WALL_WINDOW_ID = 'remote-desktop-wall';
 export interface RemoteDesktopWallProps {
   manager: RemoteDesktopConnectionManager;
   retainedHostKeys: ReadonlySet<string>;
+  standalone?: boolean;
   minimized?: boolean;
   zIndex?: number;
   onFocus?(): void;
   onMinimize?(): void;
   onRestore?(): void;
+  onOpenStandalone?(): void;
   onOpenHost(machine: RemoteDesktopWorkspaceMachine): void;
   onHostKeysChange(hostKeys: readonly string[]): void;
   onClose(hostKeys: readonly string[]): void;
@@ -41,11 +43,13 @@ function addSlotCount(hostCount: number): number {
 export function RemoteDesktopWall({
   manager,
   retainedHostKeys,
+  standalone = false,
   minimized = false,
   zIndex,
   onFocus,
   onMinimize,
   onRestore,
+  onOpenStandalone,
   onOpenHost,
   onHostKeysChange,
   onClose,
@@ -56,7 +60,19 @@ export function RemoteDesktopWall({
   const [pickerOpen, setPickerOpen] = useState(false);
   const [pickerMachines, setPickerMachines] = useState<RemoteDesktopWorkspaceMachine[]>([]);
   const [pickerError, setPickerError] = useState(false);
+  const [retryableHostIds, setRetryableHostIds] = useState<ReadonlySet<string>>(() => new Set());
+  const [retryGeneration, setRetryGeneration] = useState(0);
   const addButtonRef = useRef<HTMLButtonElement>(null);
+
+  const updateRetryableHost = useCallback((hostId: string, retryable: boolean) => {
+    setRetryableHostIds((current) => {
+      const next = new Set(current);
+      if (retryable) next.add(hostId);
+      else next.delete(hostId);
+      if (next.size === current.size && [...next].every((id) => current.has(id))) return current;
+      return next;
+    });
+  }, []);
 
   useEffect(() => {
     let active = true;
@@ -136,6 +152,28 @@ export function RemoteDesktopWall({
       <header class="remote-desktop-workspace-header remote-desktop-wall-header">
         <strong>{t('remote_desktop.workspace_wall')}</strong>
         <div class="remote-desktop-workspace-actions">
+          <button
+            class="remote-desktop-workspace-chrome-button remote-desktop-wall-retry-all"
+            type="button"
+            disabled={retryableHostIds.size === 0}
+            onClick={() => setRetryGeneration((current) => current + 1)}
+            aria-label={t('remote_desktop.wall_retry_all', { count: retryableHostIds.size })}
+            title={t('remote_desktop.wall_retry_all', { count: retryableHostIds.size })}
+          >
+            <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M15.5 7A6 6 0 1 0 16 12M15.5 7V3m0 4h-4" /></svg>
+            {retryableHostIds.size > 0 && <span>{retryableHostIds.size}</span>}
+          </button>
+          {!standalone && onOpenStandalone && (
+            <button
+              class="remote-desktop-workspace-chrome-button"
+              type="button"
+              onClick={onOpenStandalone}
+              aria-label={t('remote_desktop.wall_open_new_window')}
+              title={t('remote_desktop.wall_open_new_window')}
+            >
+              <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M11 4h5v5M16 4l-7 7M14 11v5H4V6h5" /></svg>
+            </button>
+          )}
           {onMinimize && (
             <button class="remote-desktop-workspace-chrome-button" type="button" onClick={onMinimize} aria-label={t('window.minimize')}>
               <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m5 8 5 5 5-5" /></svg>
@@ -163,6 +201,8 @@ export function RemoteDesktopWall({
                 pressurePaused={(navigator as Navigator & { deviceMemory?: number }).deviceMemory !== undefined
                   && (navigator as Navigator & { deviceMemory?: number }).deviceMemory! <= 2
                   && index >= 4}
+                retryGeneration={retryGeneration}
+                onRetryableChange={updateRetryableHost}
                 onOpen={onOpenHost}
                 onRemove={(hostId) => { void removeHost(hostId); }}
               />
@@ -199,6 +239,10 @@ export function RemoteDesktopWall({
       </main>
     </div>
   );
+
+  if (standalone) {
+    return <div class="remote-desktop-wall-standalone">{content}</div>;
+  }
 
   return (
     <>

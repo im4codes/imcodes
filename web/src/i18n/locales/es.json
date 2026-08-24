@@ -3234,6 +3234,8 @@
     "wall_health_failed": "Error",
     "wall_health_paused": "Pausado en segundo plano",
     "wall_health_pressure_paused": "Pausado por presión del dispositivo",
+    "wall_retry_all": "Reintentar escritorios desconectados ({{count}})",
+    "wall_open_new_window": "Abrir el muro en una ventana independiente",
     "wall_error_load_failed": "No se pudo cargar el muro.",
     "wall_error_authorization_lost": "El acceso cambió. El muro se actualizó.",
     "wall_error_conflict_requires_retry": "El muro volvió a cambiar. Reintenta.",

@@ -3233,6 +3233,8 @@
     "wall_health_failed": "실패",
     "wall_health_paused": "백그라운드에서 일시 중지",
     "wall_health_pressure_paused": "기기 부하로 일시 중지",
+    "wall_retry_all": "연결이 끊긴 데스크톱 다시 시도 ({{count}})",
+    "wall_open_new_window": "데스크톱 월을 별도 창에서 열기",
     "wall_error_load_failed": "월을 불러올 수 없습니다.",
     "wall_error_authorization_lost": "접근 권한이 변경되어 월을 새로 고쳤습니다.",
     "wall_error_conflict_requires_retry": "월이 다시 변경되었습니다. 다시 시도하세요.",

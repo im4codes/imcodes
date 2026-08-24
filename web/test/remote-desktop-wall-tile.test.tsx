@@ -79,7 +79,8 @@ describe('RemoteDesktopWallTile', () => {
     // The existing input owner remains the only presentation able to control.
     manager.presentation(host, {}).pointerMove(0.5, 0.5);
     expect(pointerMoves).toBe(0);
-    expect(result.container.querySelectorAll('button')).toHaveLength(0);
+    expect(result.container.querySelectorAll('button')).toHaveLength(1);
+    expect(screen.getByRole('status').textContent).toContain('remote_desktop.wall_health_connecting');
     expect(result.container.querySelector('header')).toBeNull();
     expect(result.container.querySelector('footer')).toBeNull();
     expect(result.container.querySelector('dl')).toBeNull();
@@ -144,5 +145,68 @@ describe('RemoteDesktopWallTile', () => {
     fireEvent.contextMenu(screen.getByRole('button', { name: 'remote_desktop.wall_open_host:A' }), { clientX: 40, clientY: 50 });
     fireEvent.click(screen.getByRole('menuitem', { name: 'remote_desktop.wall_remove:A' }));
     expect(onRemove).toHaveBeenCalledWith('host-a');
+  });
+
+  it('shows failed state and retries only after a tile or global retry request', async () => {
+    const hooks: RemoteDesktopClientHooks[] = [];
+    let allocations = 0;
+    let starts = 0;
+    const manager = new RemoteDesktopConnectionManager({
+      createClient: (_serverId, nextHooks) => {
+        allocations += 1;
+        hooks.push(nextHooks);
+        return {
+          current: initial,
+          start: async () => { starts += 1; },
+          setMode: vi.fn(), selectDisplay: () => true,
+          setDisplayMode: () => true, setDisplayScale: () => true,
+          requestUnlock: () => true, requestRemoteClipboard: async () => null,
+          acknowledgePresentedFrame: () => true,
+          pointerMove: vi.fn(), pointerButton: () => true, pointerClick: () => true,
+          wheel: () => true, key: () => true, text: () => true,
+          releaseAll: vi.fn(), releasePointerButtons: vi.fn(), stop: vi.fn(),
+        };
+      },
+    });
+    const host = {
+      hostId: 'host-a', remoteDesktopHostId: 'host-a', serverId: 'server-a',
+      refName: 'a', displayName: 'A', online: true, execEnabled: true, accessRole: 'owner' as const,
+    };
+    const retryable = vi.fn();
+    const result = render(<RemoteDesktopWallTile
+      host={host}
+      manager={manager}
+      wallVisible
+      retryGeneration={0}
+      onRetryableChange={retryable}
+      onOpen={vi.fn()}
+      onRemove={vi.fn()}
+    />);
+    await waitFor(() => expect(starts).toBe(1));
+
+    hooks.at(-1)?.onSnapshot({
+      ...initial(),
+      state: REMOTE_DESKTOP_STATE.FAILED,
+    });
+    const retryButton = await screen.findByRole('button', { name: 'remote_desktop.retry' });
+    expect(screen.getByRole('status').textContent).toContain('remote_desktop.wall_health_failed');
+    await waitFor(() => expect(retryable).toHaveBeenLastCalledWith('host-a', true));
+    fireEvent.click(retryButton);
+    await waitFor(() => expect(allocations).toBe(2));
+
+    hooks.at(-1)?.onSnapshot({
+      ...initial(),
+      state: REMOTE_DESKTOP_STATE.FAILED,
+    });
+    result.rerender(<RemoteDesktopWallTile
+      host={host}
+      manager={manager}
+      wallVisible
+      retryGeneration={1}
+      onRetryableChange={retryable}
+      onOpen={vi.fn()}
+      onRemove={vi.fn()}
+    />);
+    await waitFor(() => expect(allocations).toBe(3));
   });
 });
