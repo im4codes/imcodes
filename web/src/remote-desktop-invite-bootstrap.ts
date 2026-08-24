@@ -1,11 +1,16 @@
-import { parseRemoteDesktopLinkFragment } from '@shared/remote-desktop-access.js';
+import {
+  isRemoteDesktopLinkTokenHash,
+  parseRemoteDesktopLinkFragment,
+} from '@shared/remote-desktop-access.js';
 
 export type RemoteDesktopInviteBootstrapResult =
   | { status: 'unavailable' }
-  | { status: 'invite'; token: string };
+  | { status: 'invite'; token: string }
+  | { status: 'resume'; tokenHash: string };
 
 type BootstrapEnvironment = {
   fragment: string;
+  resumeTokenHash?: unknown;
   scrub: () => void;
 };
 
@@ -20,5 +25,8 @@ export function bootstrapRemoteDesktopInvite(
 ): Promise<RemoteDesktopInviteBootstrapResult> {
   const token = parseRemoteDesktopLinkFragment(environment.fragment);
   environment.scrub();
-  return Promise.resolve(token ? { status: 'invite', token } : { status: 'unavailable' });
+  if (token) return Promise.resolve({ status: 'invite', token });
+  return Promise.resolve(isRemoteDesktopLinkTokenHash(environment.resumeTokenHash)
+    ? { status: 'resume', tokenHash: environment.resumeTokenHash }
+    : { status: 'unavailable' });
 }

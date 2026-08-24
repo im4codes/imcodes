@@ -1,6 +1,8 @@
 /** @vitest-environment jsdom */
+import 'fake-indexeddb/auto';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/preact';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { IDBFactory } from 'fake-indexeddb';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { REMOTE_DESKTOP_ACCESS_MODE } from '../../shared/remote-desktop.js';
 import { REMOTE_DESKTOP_ACTOR_SOURCE } from '../../shared/remote-desktop-access.js';
 import { RemoteDesktopGuestAccess } from '../src/components/RemoteDesktopGuestAccess.js';
@@ -18,6 +20,7 @@ async function ready(): Promise<RemoteDesktopGuestReady> {
 }
 
 afterEach(() => cleanup());
+beforeEach(() => { globalThis.indexedDB = new IDBFactory(); });
 
 describe('RemoteDesktopGuestAccess', () => {
   it('always exposes an escape back to the normal IM.codes entry', () => {
@@ -30,7 +33,7 @@ describe('RemoteDesktopGuestAccess', () => {
 
   it('moves a resolved scrubbed invite into attended waiting without rendering serverId or desktop controls', async () => {
     const starter: RemoteDesktopGuestSessionStarter = { start: vi.fn(async () => ({ stop: vi.fn() })) };
-    render(<RemoteDesktopGuestAccess bootstrap={Promise.resolve({ status: 'invite', token: 'raw-token' })} api={{
+    render(<RemoteDesktopGuestAccess bootstrap={Promise.resolve({ status: 'invite', token: 'A'.repeat(43) })} api={{
       resolveInvite: vi.fn(async () => ready()),
     } as unknown as RemoteDesktopAccessApi} sessionStarter={starter} />);
     expect(await screen.findByText(/waiting_for_consent/)).toBeTruthy();
@@ -53,5 +56,34 @@ describe('RemoteDesktopGuestAccess', () => {
     await waitFor(() => expect(provePassword).toHaveBeenCalledWith(expect.objectContaining({ publicNodeId: 5123456789, password: 'secret-password' })));
     expect(await screen.findByText(/cooldown/)).toBeTruthy();
     expect(document.body.textContent).not.toContain('secret-password');
+  });
+
+  it('retries a scrubbed invitation with the same decrypted bearer and browser key', async () => {
+    const calls: Array<Parameters<RemoteDesktopAccessApi['resolveInvite']>[0]> = [];
+    const resolveInvite = vi.fn(async (input: Parameters<RemoteDesktopAccessApi['resolveInvite']>[0]) => {
+      calls.push(input);
+      if (calls.length === 1) return { status: 'unavailable' as const };
+      return {
+        ...await ready(),
+        browserKey: input.browserKey,
+      };
+    });
+    const starter: RemoteDesktopGuestSessionStarter = {
+      start: vi.fn(async () => ({ stop: vi.fn() })),
+    };
+    render(<RemoteDesktopGuestAccess
+      bootstrap={Promise.resolve({ status: 'invite', token: 'B'.repeat(43) })}
+      api={{ resolveInvite } as unknown as RemoteDesktopAccessApi}
+      sessionStarter={starter}
+    />);
+
+    expect(await screen.findByText(/state_unavailable/)).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: /try_again/ }));
+    expect(await screen.findByText(/waiting_for_consent/)).toBeTruthy();
+    expect(resolveInvite).toHaveBeenCalledTimes(2);
+    expect(calls[0].token).toBe('B'.repeat(43));
+    expect(calls[1].token).toBe(calls[0].token);
+    expect(calls[1].browserKey).toBe(calls[0].browserKey);
+    expect(calls[0].browserKey.privateKey.extractable).toBe(false);
   });
 });

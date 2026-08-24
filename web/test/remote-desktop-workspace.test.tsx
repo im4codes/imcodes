@@ -130,17 +130,11 @@ describe('RemoteDesktopWorkspace', () => {
     expect(events).toEqual(['stop:b']);
     expect(closeHost).toHaveBeenCalledWith('b');
     fireEvent.click(screen.getByRole('button', { name: 'remote_desktop.workspace_stop_all' }));
-    expect(events).toEqual(['stop:b', 'stop:all']);
+    expect(events).toEqual(['stop:b', 'stop:a', 'stop:b']);
     expect(closeWorkspace).toHaveBeenCalledTimes(1);
   });
 
   it('keeps the sole manager owner alive when closing a tab still represented on the wall', async () => {
-    api.getRemoteDesktopWall.mockResolvedValueOnce({
-      revision: 2,
-      layout: 'grid',
-      hostIds: ['a'],
-      hosts: [{ ...machine('a'), hostId: 'a', remoteDesktopHostId: 'a' }],
-    });
     let state = createRemoteDesktopWorkspaceState();
     state = openRemoteDesktopWorkspaceHost(state, machine('a'));
     const { manager } = setupManager();
@@ -152,8 +146,8 @@ describe('RemoteDesktopWorkspace', () => {
       onCloseHost={vi.fn()}
       onReorderHost={vi.fn()}
       onCloseWorkspace={vi.fn()}
+      wallHostKeys={new Set(['a'])}
     />);
-    await screen.findByText('wall:A');
     fireEvent.click(screen.getByRole('button', { name: 'remote_desktop.workspace_close_tab:A' }));
     expect(manager.stop).not.toHaveBeenCalled();
   });
@@ -161,6 +155,7 @@ describe('RemoteDesktopWorkspace', () => {
   it('routes the mobile selector through the same release-before-activate action', () => {
     let state = createRemoteDesktopWorkspaceState();
     state = openRemoteDesktopWorkspaceHost(state, machine('a'));
+    state = openRemoteDesktopWorkspaceHost(state, machine('b'));
     const { manager, events } = setupManager();
     render(<RemoteDesktopWorkspace
       state={state}
@@ -173,9 +168,9 @@ describe('RemoteDesktopWorkspace', () => {
     />);
 
     const selector = screen.getByLabelText('remote_desktop.workspace_select') as HTMLSelectElement;
-    selector.value = 'wall';
+    selector.value = 'a';
     fireEvent.input(selector);
-    expect(events).toEqual(['release:a', 'activate:wall']);
+    expect(events).toEqual(['release:a', 'activate:a']);
   });
 
   it('opens a picker selection through the shared upsert callback', async () => {
@@ -197,31 +192,6 @@ describe('RemoteDesktopWorkspace', () => {
     await waitFor(() => expect(screen.getByRole('button', { name: /C/ })).toBeDefined());
     fireEvent.click(screen.getByRole('button', { name: /C/ }));
     expect(openHost).toHaveBeenCalledWith(expect.objectContaining({ serverId: 'c' }));
-  });
-
-  it('keeps the wall presentation-only and removes sharing and wall management controls', async () => {
-    api.getRemoteDesktopWall.mockResolvedValueOnce({
-      revision: 3,
-      layout: 'grid',
-      hostIds: ['a'],
-      hosts: [{ ...machine('a'), hostId: 'a', remoteDesktopHostId: 'a' }],
-    });
-    const { manager } = setupManager();
-    render(<RemoteDesktopWorkspace
-      state={createRemoteDesktopWorkspaceState()}
-      manager={manager}
-      onOpenHost={vi.fn()}
-      onActivateTab={vi.fn()}
-      onCloseHost={vi.fn()}
-      onReorderHost={vi.fn()}
-      onCloseWorkspace={vi.fn()}
-    />);
-
-    await screen.findByText('wall:A');
-    expect(screen.queryByRole('tablist')).toBeNull();
-    expect(screen.queryByRole('button', { name: 'remote_desktop.workspace_add' })).toBeNull();
-    expect(document.querySelector('.remote-desktop-owner-access-drawer')).toBeNull();
-    expect(document.querySelector('.remote-desktop-wall-toolbar')).toBeNull();
   });
 
   it('keeps every host presentation mounted while the workspace is minimized and restored', () => {

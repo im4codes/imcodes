@@ -108,10 +108,12 @@ const PLATFORM_PRESENTATION: Record<ControlledNodeOs, { glyph: string; name: str
 
 export interface ControlledNodesPanelProps {
   onOpenRemoteDesktop?(machine: MachineListItem): void;
+  onOpenRemoteDesktopWall?(): void;
 }
 
 export function ControlledNodesPanel({
   onOpenRemoteDesktop,
+  onOpenRemoteDesktopWall,
 }: ControlledNodesPanelProps) {
   const { t, i18n } = useTranslation();
   const { machines, loaded, loading, error, refetch } = useMachines();
@@ -374,15 +376,22 @@ export function ControlledNodesPanel({
             <span class="controlled-nodes-section-index">01</span>
             <h3>{t('controlled_nodes.machines_title')}</h3>
           </div>
-          <button
-            type="button"
-            class="controlled-nodes-refresh"
-            onClick={() => { void refreshPresenceManually(); }}
-            disabled={manualPresenceRefresh || (!loaded && loading)}
-          >
-            <span class={manualPresenceRefresh || (!loaded && loading) ? 'controlled-nodes-refresh-icon is-spinning' : 'controlled-nodes-refresh-icon'} aria-hidden="true">↻</span>
-            {t('controlled_nodes.refresh')}
-          </button>
+          <div class="controlled-nodes-machines-actions">
+            {onOpenRemoteDesktopWall && (
+              <button type="button" class="controlled-nodes-wall" onClick={onOpenRemoteDesktopWall}>
+                <span aria-hidden="true">▦</span>{t('remote_desktop.workspace_wall')}
+              </button>
+            )}
+            <button
+              type="button"
+              class="controlled-nodes-refresh"
+              onClick={() => { void refreshPresenceManually(); }}
+              disabled={manualPresenceRefresh || (!loaded && loading)}
+            >
+              <span class={manualPresenceRefresh || (!loaded && loading) ? 'controlled-nodes-refresh-icon is-spinning' : 'controlled-nodes-refresh-icon'} aria-hidden="true">↻</span>
+              {t('controlled_nodes.refresh')}
+            </button>
+          </div>
         </div>
         {actionError && <p class="controlled-nodes-error" role="alert">{actionError}</p>}
         {(presenceRefreshFailed || error) && (

@@ -214,6 +214,7 @@ function presentOwnerLink(link: OwnerLinkView): Record<string, unknown> {
     label: link.label,
     kind: link.kind,
     mode: link.mode,
+    usePolicy: link.usePolicy,
     expiresAt: link.expiresAt,
     authorityGeneration: link.authorityGeneration,
     expiryRevision: link.expiryRevision,
@@ -265,8 +266,7 @@ function mapOwnerError(c: Context<RouteEnv>, error: unknown): Response | null {
  */
 async function issueGuestClaimChallenge(c: Context<RouteEnv>): Promise<Response> {
   c.header('Cache-Control', 'no-store');
-  const body = await readJson(c);
-  const record = body && typeof body === 'object' ? body as Record<string, unknown> : null;
+  const record = asExactRecord(await readJson(c), ['token']);
   const token = typeof record?.token === 'string' ? record.token : '';
   if (!isCanonicalRemoteDesktopLinkToken(token)) return c.json(PUBLIC_UNAVAILABLE);
   return c.json(await issueClaimChallenge(c.env.DB, { token, now: Date.now() }));

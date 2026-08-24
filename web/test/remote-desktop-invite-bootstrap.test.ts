@@ -23,6 +23,13 @@ describe('remote desktop invitation startup bootstrap', () => {
     expect(scrub).toHaveBeenCalledOnce();
   });
 
+  it('restores a scrubbed invite from a hash-only history binding on refresh', async () => {
+    const tokenHash = 'a'.repeat(64);
+    await expect(bootstrapRemoteDesktopInvite({
+      fragment: '', resumeTokenHash: tokenHash, scrub: vi.fn(),
+    })).resolves.toEqual({ status: 'resume', tokenHash });
+  });
+
   it('loads the scrubber module before the ordinary application bundle', () => {
     const htmlPath = existsSync(resolve(process.cwd(), 'web/index.html'))
       ? resolve(process.cwd(), 'web/index.html')

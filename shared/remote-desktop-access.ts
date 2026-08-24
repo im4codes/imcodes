@@ -198,6 +198,22 @@ export const REMOTE_DESKTOP_LINK_KIND = {
 export type RemoteDesktopLinkKind =
   typeof REMOTE_DESKTOP_LINK_KIND[keyof typeof REMOTE_DESKTOP_LINK_KIND];
 
+/**
+ * Browser reuse policy for one bearer link.
+ *
+ * `single_use` means one browser key owns the link for its lifetime.  That
+ * browser may refresh/reconnect with the same non-exportable key, but another
+ * browser cannot claim it. `reusable` lets multiple browser keys use the same
+ * bearer until expiry/revocation; each key still owns at most one live session.
+ */
+export const REMOTE_DESKTOP_LINK_USE_POLICY = {
+  SINGLE_USE: 'single_use',
+  REUSABLE: 'reusable',
+} as const;
+
+export type RemoteDesktopLinkUsePolicy =
+  typeof REMOTE_DESKTOP_LINK_USE_POLICY[keyof typeof REMOTE_DESKTOP_LINK_USE_POLICY];
+
 const HOUR_MS = 60 * 60 * 1000;
 const DAY_MS = 24 * HOUR_MS;
 
@@ -222,9 +238,10 @@ export function isRemoteDesktopLinkDurationMs(value: unknown): value is number {
 }
 
 export const REMOTE_DESKTOP_LINK_LIMITS = {
-  /** One link admits at most one live session, and binds to one browser key. */
-  MAX_LIVE_SESSIONS_PER_LINK: 1,
-  MAX_CLAIMED_BROWSERS_PER_LINK: 1,
+  /** Every browser key owns at most one live route for one link. */
+  MAX_LIVE_SESSIONS_PER_BROWSER: 1,
+  /** A single-use link binds to one browser key; reusable links use host caps. */
+  SINGLE_USE_MAX_CLAIMED_BROWSERS: 1,
   LABEL_BYTES: 256,
   /** Attended approval is bounded so a silent node cannot hold a request open. */
   CONSENT_DEADLINE_MS: 60_000,
@@ -258,6 +275,7 @@ export interface RemoteDesktopLinkPolicy {
   hostId: string;
   kind: RemoteDesktopLinkKind;
   mode: RemoteDesktopAccessMode;
+  usePolicy?: RemoteDesktopLinkUsePolicy;
   /** Required for `unattended`, forbidden for `attended`. */
   durationMs?: number;
   label: string;
@@ -274,6 +292,7 @@ export function isMonotonicRemoteDesktopLinkMutation(
 ): boolean {
   if (next.hostId !== undefined && next.hostId !== current.hostId) return false;
   if (next.kind !== undefined && next.kind !== current.kind) return false;
+  if (next.usePolicy !== undefined && next.usePolicy !== current.usePolicy) return false;
   if (next.mode !== undefined
     && next.mode !== current.mode
     && !(current.mode === REMOTE_DESKTOP_ACCESS_MODE.CONTROL
@@ -1616,11 +1635,13 @@ export interface RemoteDesktopLinkCreateRequest {
   tokenHash: string;
   kind: RemoteDesktopLinkKind;
   mode: RemoteDesktopAccessMode;
+  usePolicy?: RemoteDesktopLinkUsePolicy;
   label: string;
   durationMs?: number;
 }
 
 const LINK_KINDS = new Set<string>(Object.values(REMOTE_DESKTOP_LINK_KIND));
+const LINK_USE_POLICIES = new Set<string>(Object.values(REMOTE_DESKTOP_LINK_USE_POLICY));
 
 export function validateRemoteDesktopLinkCreateRequest(
   value: unknown,
@@ -1629,7 +1650,7 @@ export function validateRemoteDesktopLinkCreateRequest(
     || !hasExactRemoteDesktopKeys(
       value,
       ['hostId', 'creationRequestId', 'tokenHashVersion', 'tokenHash', 'kind', 'mode', 'label'],
-      ['durationMs'],
+      ['usePolicy', 'durationMs'],
     )
     || !isRemoteDesktopId(value.hostId)
     || !isCanonicalRemoteDesktopCreationRequestId(value.creationRequestId)
@@ -1637,6 +1658,8 @@ export function validateRemoteDesktopLinkCreateRequest(
     || !isRemoteDesktopLinkTokenHash(value.tokenHash)
     || typeof value.kind !== 'string' || !LINK_KINDS.has(value.kind)
     || typeof value.mode !== 'string' || !ACCESS_MODES.has(value.mode)
+    || (value.usePolicy !== undefined
+      && (typeof value.usePolicy !== 'string' || !LINK_USE_POLICIES.has(value.usePolicy)))
     || !isBoundedRemoteDesktopString(value.label, REMOTE_DESKTOP_LINK_LIMITS.LABEL_BYTES)
     || containsRemoteDesktopSecretField(value)) return invalid();
   // Attended links never expire; unattended links require one exact duration.

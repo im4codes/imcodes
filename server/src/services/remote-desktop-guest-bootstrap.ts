@@ -26,6 +26,7 @@ import type { Database } from '../db/client.js';
 import {
   REMOTE_DESKTOP_ACTOR_SOURCE,
   REMOTE_DESKTOP_LINK_KIND,
+  REMOTE_DESKTOP_LINK_USE_POLICY,
   REMOTE_DESKTOP_LINK_TOKEN,
   REMOTE_DESKTOP_BROWSER_CLAIM,
   REMOTE_DESKTOP_PUBLIC_LOOKUP_UNAVAILABLE,
@@ -191,8 +192,14 @@ export async function issueClaimChallenge(
  *      proof is dead here, before any link is touched;
  *   2. verify the signature against the *stored* challenge material, so the
  *      caller cannot choose the bytes it signs;
- *   3. bind or re-check the browser claim atomically in the same transaction;
- *   4. only then look at endpoints and issue a ticket.
+ *   3. prove that admission currently has a qualified endpoint;
+ *   4. only then bind or re-check the browser claim and issue a ticket.
+ *
+ * The readiness check MUST precede the first claim write.  A management
+ * privacy epoch can still be ending when the Owner copies a newly-created
+ * invitation.  Persisting the claim before discovering that admission is
+ * temporarily closed would bind the link without issuing a bootstrap, leaving
+ * a retry from a freshly loaded page unable to prove the abandoned key.
  *
  * Every rejection returns the identical bounded body. The function does not
  * branch its return shape on *why* it failed, which is what keeps an
@@ -236,10 +243,11 @@ export async function resolveLinkProof(
 
     const link = await tx.queryOne<{
       id: string; host_id: string; access_mode: string; attendance: string;
+      use_policy: string;
       state: string; expires_at: number | null;
       authority_generation: number; expiry_revision: number;
     }>(
-      `SELECT id, host_id, access_mode, attendance, state, expires_at,
+      `SELECT id, host_id, access_mode, attendance, use_policy, state, expires_at,
               authority_generation, expiry_revision
          FROM remote_desktop_guest_links
         WHERE id = $1
@@ -250,37 +258,48 @@ export async function resolveLinkProof(
     if (link.state !== 'active') return FAIL;
     if (link.expires_at !== null && link.expires_at <= input.now) return FAIL;
 
-    // 3. First verified proof binds the link to this key, atomically. A later
-    //    competing browser passes its own signature check and still loses here.
+    // 3. Only a currently qualified endpoint may be disclosed.  Keep this
+    // before the first browser-claim write: a transiently closed privacy gate
+    // must consume this one-use challenge without poisoning the durable link.
+    const endpoint = await resolveQualifiedEndpointTx(tx, link.host_id, input.fullEndpointEligible);
+    if (!endpoint) return FAIL;
+
+    // 4. Bind this browser key under the link's policy. The locked link row
+    // serializes the single-use first-claim decision; reusable links keep one
+    // claim row per independently proving browser key.
     const browserHash = hashBrowserKey(proof.browserKeyThumbprint);
     const inserted = await tx.queryOne<{ link_id: string }>(
       `INSERT INTO remote_desktop_guest_browser_claims
          (link_id, browser_key_hash, browser_key_hash_version,
           browser_public_key_spki, claimed_at, last_proved_at)
        VALUES ($1, $2, 'v1', $3, $4, $4)
-       ON CONFLICT (link_id) DO NOTHING
+       ON CONFLICT (link_id, browser_key_hash) DO NOTHING
        RETURNING link_id`,
       [link.id, browserHash, proof.browserPublicKeySpki, input.now],
     );
-    if (!inserted) {
-      const claim = await tx.queryOne<{ browser_key_hash: string }>(
-        'SELECT browser_key_hash FROM remote_desktop_guest_browser_claims WHERE link_id = $1',
+    if (inserted && link.use_policy === REMOTE_DESKTOP_LINK_USE_POLICY.SINGLE_USE) {
+      const claimCount = await tx.queryOne<{ count: number | string }>(
+        'SELECT COUNT(*) AS count FROM remote_desktop_guest_browser_claims WHERE link_id = $1',
         [link.id],
       );
-      // A losing claimant must not refresh the incumbent's liveness either.
-      if (!claim || !constantTimeEqualHex(claim.browser_key_hash, browserHash)) return FAIL;
+      if (Number(claimCount?.count ?? 0) !== 1) {
+        await tx.execute(
+          `DELETE FROM remote_desktop_guest_browser_claims
+            WHERE link_id = $1 AND browser_key_hash = $2`,
+          [link.id, browserHash],
+        );
+        return FAIL;
+      }
+    }
+    if (!inserted) {
       await tx.execute(
         `UPDATE remote_desktop_guest_browser_claims
             SET last_proved_at = $2,
                 browser_public_key_spki = COALESCE(browser_public_key_spki, $3)
-          WHERE link_id = $1`,
-        [link.id, input.now, proof.browserPublicKeySpki],
+          WHERE link_id = $1 AND browser_key_hash = $4`,
+        [link.id, input.now, proof.browserPublicKeySpki, browserHash],
       );
     }
-
-    // 4. Only a currently qualified endpoint may be disclosed.
-    const endpoint = await resolveQualifiedEndpointTx(tx, link.host_id, input.fullEndpointEligible);
-    if (!endpoint) return FAIL;
 
     const source = link.attendance === REMOTE_DESKTOP_LINK_KIND.UNATTENDED
       ? REMOTE_DESKTOP_ACTOR_SOURCE.UNATTENDED_LINK
@@ -634,9 +653,10 @@ export async function redeemBootstrapForRoute(input: {
       }>(
         `SELECT id, browser_key_hash, route_id
            FROM remote_desktop_guest_sessions
-          WHERE link_id = $1 AND state IN ('admitting', 'active')
+          WHERE link_id = $1 AND browser_key_hash = $2
+            AND state IN ('admitting', 'active')
           FOR UPDATE`,
-        [redeemed.linkId],
+        [redeemed.linkId, keyHash],
       );
       // Exact reconnect is possible only after the old route closes and clears
       // its durable route binding. A concurrent live socket never gets adopted.
@@ -770,9 +790,11 @@ export async function resolveRedeemedGuestActor(input: {
       `SELECT l.state, l.attendance, l.access_mode, l.authority_generation,
               l.expiry_revision, l.expires_at, c.browser_key_hash
          FROM remote_desktop_guest_links l
-         LEFT JOIN remote_desktop_guest_browser_claims c ON c.link_id = l.id
+         LEFT JOIN remote_desktop_guest_browser_claims c
+           ON c.link_id = l.id AND c.browser_key_hash = $3
         WHERE l.id = $1 AND l.host_id = $2`,
-      [input.previous.linkId, input.previous.hostId],
+      [input.previous.linkId, input.previous.hostId,
+        hashBrowserKey(input.previous.browserKeyThumbprint)],
     );
     const expectedSource = row?.attendance === REMOTE_DESKTOP_LINK_KIND.ATTENDED
       ? REMOTE_DESKTOP_ACTOR_SOURCE.ATTENDED_LINK

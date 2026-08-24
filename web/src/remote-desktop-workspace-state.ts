@@ -84,7 +84,7 @@ export function closeRemoteDesktopWorkspaceHost(
   const activeTabId = state.activeTabId === hostKey
     ? orderedHostKeys[Math.min(index, orderedHostKeys.length - 1)] ?? REMOTE_DESKTOP_WALL_TAB_ID
     : state.activeTabId;
-  return { ...state, orderedHostKeys, hosts, activeTabId };
+  return { ...state, open: orderedHostKeys.length > 0, orderedHostKeys, hosts, activeTabId };
 }
 
 export function reorderRemoteDesktopWorkspaceHost(

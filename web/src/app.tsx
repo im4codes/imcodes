@@ -73,6 +73,7 @@ import { SharedContextManagementPanel } from './components/SharedContextManageme
 import { ControlledNodesPanel } from './components/ControlledNodesPanel.js';
 import { ControlledNodeQuickMenu } from './components/ControlledNodeQuickMenu.js';
 import { RemoteDesktopWorkspace } from './components/RemoteDesktopWorkspace.js';
+import { RemoteDesktopWall, REMOTE_DESKTOP_WALL_WINDOW_ID } from './components/RemoteDesktopWall.js';
 import { RemoteDesktopConnectionManager } from './remote-desktop-connection-manager.js';
 import {
   REMOTE_DESKTOP_WORKSPACE_WINDOW_ID,
@@ -1761,6 +1762,9 @@ export function App() {
     createRemoteDesktopWorkspaceState,
   );
   const [remoteDesktopMinimized, setRemoteDesktopMinimized] = useState(false);
+  const [remoteDesktopWallOpen, setRemoteDesktopWallOpen] = useState(false);
+  const [remoteDesktopWallMinimized, setRemoteDesktopWallMinimized] = useState(false);
+  const [remoteDesktopWallHostKeys, setRemoteDesktopWallHostKeys] = useState<readonly string[]>([]);
   const [showSharedContextDiagnostics, setShowSharedContextDiagnostics] = useState(false);
   const [sharedContextManagementProps, setSharedContextManagementProps] = useState<Record<string, unknown>>({});
   const [sharedContextDiagnosticsProps, setSharedContextDiagnosticsProps] = useState<SharedContextDiagnosticsWindowState>({});
@@ -1785,11 +1789,22 @@ export function App() {
     }, { bringToFront: true });
   }, [ensureDesktopWindow]);
 
+  const openRemoteDesktopWall = useCallback(() => {
+    setRemoteDesktopWallOpen(true);
+    setRemoteDesktopWallMinimized(false);
+    ensureDesktopWindow(DESKTOP_WINDOW_IDS.remoteDesktopWall, {
+      kind: DESKTOP_WINDOW_KINDS.remoteDesktopWall,
+    }, { bringToFront: true });
+  }, [ensureDesktopWindow]);
+
   useEffect(() => {
     if (auth) return;
     remoteDesktopConnectionManager.stopAll();
     setRemoteDesktopWorkspace(createRemoteDesktopWorkspaceState());
+    setRemoteDesktopWallOpen(false);
+    setRemoteDesktopWallHostKeys([]);
     removeDesktopWindow(REMOTE_DESKTOP_WORKSPACE_WINDOW_ID);
+    removeDesktopWindow(REMOTE_DESKTOP_WALL_WINDOW_ID);
   }, [auth, remoteDesktopConnectionManager, removeDesktopWindow]);
 
   useEffect(() => () => remoteDesktopConnectionManager.stopAll(), [remoteDesktopConnectionManager]);
@@ -5228,7 +5243,10 @@ export function App() {
                 >
                   {trans('controlled_nodes.title')}
                 </button>
-                <ControlledNodeQuickMenu onOpenRemoteDesktop={openRemoteDesktop} />
+                <ControlledNodeQuickMenu
+                  onOpenRemoteDesktop={openRemoteDesktop}
+                  onOpenRemoteDesktopWall={openRemoteDesktopWall}
+                />
               </div>
               {/* Session-list show/hide toggle — same as the mobile sidebar ⊞ button */}
               <button
@@ -6351,6 +6369,7 @@ export function App() {
         >
           <ControlledNodesPanel
             onOpenRemoteDesktop={openRemoteDesktop}
+            onOpenRemoteDesktopWall={openRemoteDesktopWall}
           />
         </FloatingPanel>
       )}
@@ -6372,9 +6391,11 @@ export function App() {
           onActivateTab={(tabId) => setRemoteDesktopWorkspace((current) => (
             activateRemoteDesktopWorkspaceTab(current, tabId)
           ))}
-          onCloseHost={(hostKey) => setRemoteDesktopWorkspace((current) => (
-            closeRemoteDesktopWorkspaceHost(current, hostKey)
-          ))}
+          onCloseHost={(hostKey) => setRemoteDesktopWorkspace((current) => {
+            const next = closeRemoteDesktopWorkspaceHost(current, hostKey);
+            if (!next.open) removeDesktopWindow(REMOTE_DESKTOP_WORKSPACE_WINDOW_ID);
+            return next;
+          })}
           onReorderHost={(hostKey, direction) => setRemoteDesktopWorkspace((current) => (
             reorderRemoteDesktopWorkspaceHost(current, hostKey, direction)
           ))}
@@ -6384,6 +6405,30 @@ export function App() {
             removeDesktopWindow(REMOTE_DESKTOP_WORKSPACE_WINDOW_ID);
             setRemoteDesktopWorkspace((current) => closeRemoteDesktopWorkspace(current));
             setRemoteDesktopMinimized(false);
+          }}
+          wallHostKeys={new Set(remoteDesktopWallHostKeys)}
+        />
+      )}
+
+      {remoteDesktopWallOpen && (
+        <RemoteDesktopWall
+          manager={remoteDesktopConnectionManager}
+          retainedHostKeys={new Set(remoteDesktopWorkspace.orderedHostKeys)}
+          minimized={remoteDesktopWallMinimized}
+          zIndex={getDesktopWindowZIndex(DESKTOP_WINDOW_IDS.remoteDesktopWall, 5105)}
+          onFocus={() => bringDesktopWindowToFront(DESKTOP_WINDOW_IDS.remoteDesktopWall)}
+          onMinimize={() => setRemoteDesktopWallMinimized(true)}
+          onRestore={() => setRemoteDesktopWallMinimized(false)}
+          onOpenHost={openRemoteDesktop}
+          onHostKeysChange={setRemoteDesktopWallHostKeys}
+          onClose={(hostKeys) => {
+            const retained = new Set(remoteDesktopWorkspace.orderedHostKeys);
+            for (const hostKey of hostKeys) {
+              if (!retained.has(hostKey)) remoteDesktopConnectionManager.stop(hostKey);
+            }
+            setRemoteDesktopWallOpen(false);
+            setRemoteDesktopWallMinimized(false);
+            removeDesktopWindow(DESKTOP_WINDOW_IDS.remoteDesktopWall);
           }}
         />
       )}

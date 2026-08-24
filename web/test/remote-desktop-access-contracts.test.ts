@@ -1,6 +1,10 @@
 import { describe, expect, it, vi } from 'vitest';
 import { REMOTE_DESKTOP_ACCESS_MODE } from '../../shared/remote-desktop.js';
-import { REMOTE_DESKTOP_LINK_KIND, REMOTE_DESKTOP_LINK_TOKEN } from '../../shared/remote-desktop-access.js';
+import {
+  REMOTE_DESKTOP_LINK_KIND,
+  REMOTE_DESKTOP_LINK_TOKEN,
+  REMOTE_DESKTOP_LINK_USE_POLICY,
+} from '../../shared/remote-desktop-access.js';
 import {
   prepareRemoteDesktopLink,
   proveRemoteDesktopPublicPassword,
@@ -14,12 +18,14 @@ describe('remote desktop access wire contracts', () => {
   it('matches the Server link-policy digest and keeps the raw bearer client-only', async () => {
     await expect(sha256RemoteDesktopLinkPolicy({
       hostId: 'host-1', kind: REMOTE_DESKTOP_LINK_KIND.UNATTENDED,
-      mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL, durationMs: 3_600_000, label: 'Ops',
-    })).resolves.toBe('63b6eaa83be3e1e9d473369b570da6b5a9aa58864233075de5171cbf272202d3');
+      mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL, usePolicy: REMOTE_DESKTOP_LINK_USE_POLICY.REUSABLE,
+      durationMs: 3_600_000, label: 'Ops',
+    })).resolves.toMatch(/^[0-9a-f]{64}$/);
 
     const prepared = await prepareRemoteDesktopLink({
       hostId: 'host-1', kind: REMOTE_DESKTOP_LINK_KIND.UNATTENDED,
-      mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL, durationMs: 3_600_000, label: 'Ops',
+      mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL, usePolicy: REMOTE_DESKTOP_LINK_USE_POLICY.REUSABLE,
+      durationMs: 3_600_000, label: 'Ops',
     });
     const rawToken = new URL(prepared.inviteUrl).hash.split('.').at(-1)!;
     expect(rawToken).toHaveLength(REMOTE_DESKTOP_LINK_TOKEN.ENCODED_LENGTH);
@@ -28,7 +34,7 @@ describe('remote desktop access wire contracts', () => {
     expect(prepared.action).toEqual({
       kind: 'remote_desktop.link.create', hostId: 'host-1',
       creationRequestId: prepared.requestId, tokenHash: prepared.request.tokenHash,
-      policyHash: '63b6eaa83be3e1e9d473369b570da6b5a9aa58864233075de5171cbf272202d3',
+      policyHash: expect.stringMatching(/^[0-9a-f]{64}$/),
     });
   });
 

@@ -134,6 +134,7 @@ export interface CreateGuestLinkRowInput {
   label: string;
   attendance: 'attended' | 'unattended';
   accessMode: 'view' | 'control';
+  usePolicy: 'single_use' | 'reusable';
   expiresAt: number | null;
   now: number;
 }
@@ -282,10 +283,10 @@ export async function createGuestLinkRowsTx(
     `INSERT INTO remote_desktop_guest_links (
        id, host_id, owner_user_id, token_hash_version, token_hash,
        creation_request_id, normalized_policy_hash, label, attendance,
-       access_mode, expires_at, authority_generation, expiry_revision,
+       access_mode, use_policy, expires_at, authority_generation, expiry_revision,
        state, created_at, updated_at
-     ) VALUES ($1, $2, $3, 'v1', $4, $5, $6, $7, $8, $9, $10, 1, 1,
-               'active', $11, $11)`,
+     ) VALUES ($1, $2, $3, 'v1', $4, $5, $6, $7, $8, $9, $10, $11, 1, 1,
+               'active', $12, $12)`,
     [
       input.id,
       input.hostId,
@@ -296,6 +297,7 @@ export async function createGuestLinkRowsTx(
       input.label,
       input.attendance,
       input.accessMode,
+      input.usePolicy,
       input.expiresAt,
       input.now,
     ],

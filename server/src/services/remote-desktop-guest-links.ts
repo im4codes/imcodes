@@ -26,6 +26,7 @@ import type { Database } from '../db/client.js';
 import {
   REMOTE_DESKTOP_ACTOR_SOURCE,
   REMOTE_DESKTOP_LINK_KIND,
+  REMOTE_DESKTOP_LINK_USE_POLICY,
   REMOTE_DESKTOP_LINK_MUTATION,
   REMOTE_DESKTOP_LINK_TOKEN,
   REMOTE_DESKTOP_OUTBOX_EFFECT,
@@ -41,6 +42,7 @@ import type {
   RemoteDesktopLinkKind,
   RemoteDesktopLinkMutation,
   RemoteDesktopLinkPolicy,
+  RemoteDesktopLinkUsePolicy,
 } from '../../../shared/remote-desktop-access.js';
 import {
   consumeActionBoundStepUpGrant,
@@ -96,6 +98,7 @@ export interface OwnerLinkView {
   label: string;
   kind: RemoteDesktopLinkKind;
   mode: RemoteDesktopAccessMode;
+  usePolicy: RemoteDesktopLinkUsePolicy;
   expiresAt: number | null;
   authorityGeneration: number;
   expiryRevision: number;
@@ -116,6 +119,7 @@ interface LinkRow {
   label: string;
   attendance: string;
   access_mode: string;
+  use_policy: string;
   expires_at: number | null;
   authority_generation: number;
   expiry_revision: number;
@@ -125,7 +129,7 @@ interface LinkRow {
 }
 
 const LINK_COLUMNS = `id, host_id, owner_user_id, token_hash, creation_request_id,
-  normalized_policy_hash, label, attendance, access_mode, expires_at,
+  normalized_policy_hash, label, attendance, access_mode, use_policy, expires_at,
   authority_generation, expiry_revision, commit_revision, state, created_at`;
 
 function emptyConnectionAudit(): OwnerLinkConnectionAudit {
@@ -148,6 +152,7 @@ function toView(
     label: row.label,
     kind: row.attendance as RemoteDesktopLinkKind,
     mode: row.access_mode as RemoteDesktopAccessMode,
+    usePolicy: row.use_policy as RemoteDesktopLinkUsePolicy,
     expiresAt: row.expires_at,
     authorityGeneration: row.authority_generation,
     expiryRevision: row.expiry_revision,
@@ -169,6 +174,7 @@ function toView(
 export function hashLinkPolicy(policy: RemoteDesktopLinkPolicy): string {
   const canonical = JSON.stringify([
     policy.hostId, policy.kind, policy.mode,
+    ...(policy.usePolicy === undefined ? [] : [policy.usePolicy]),
     policy.durationMs ?? null, policy.label,
   ]);
   return createHash('sha256')
@@ -221,6 +227,7 @@ export interface CreateLinkInput {
   tokenHash: string;
   kind: RemoteDesktopLinkKind;
   mode: RemoteDesktopAccessMode;
+  usePolicy?: RemoteDesktopLinkUsePolicy;
   label: string;
   durationMs?: number;
   privacy: PrivacyEpochRef;
@@ -252,7 +259,7 @@ export async function createGuestLink(
 
   const policy: RemoteDesktopLinkPolicy = {
     hostId: input.hostId, kind: input.kind, mode: input.mode,
-    durationMs: input.durationMs, label: input.label,
+    usePolicy: input.usePolicy, durationMs: input.durationMs, label: input.label,
   };
   const policyHash = hashLinkPolicy(policy);
 
@@ -283,6 +290,7 @@ export async function createGuestLink(
       label: input.label,
       attendance: input.kind,
       accessMode: input.mode,
+      usePolicy: input.usePolicy ?? REMOTE_DESKTOP_LINK_USE_POLICY.REUSABLE,
       expiresAt,
       now: input.now,
     });
@@ -388,10 +396,11 @@ export async function listOwnerLinks(
     last_connected_at: number | null;
   }>(
     `SELECT ${LINK_COLUMNS.split(', ').map((c) => `l.${c.trim()}`).join(', ')},
-            (c.link_id IS NOT NULL) AS claimed,
+            EXISTS (
+              SELECT 1 FROM remote_desktop_guest_browser_claims c WHERE c.link_id = l.id
+            ) AS claimed,
             audit.connection_count, audit.total_duration_ms, audit.last_connected_at
        FROM remote_desktop_guest_links l
-       LEFT JOIN remote_desktop_guest_browser_claims c ON c.link_id = l.id
        LEFT JOIN LATERAL (
          SELECT COUNT(*) AS connection_count,
                 COALESCE(SUM(GREATEST(0, COALESCE(s.closed_at, $4) - s.connected_at)), 0)
@@ -520,6 +529,7 @@ export async function mutateGuestLink(
         hostId: row.host_id,
         kind: row.attendance as RemoteDesktopLinkKind,
         mode: row.access_mode as RemoteDesktopAccessMode,
+        usePolicy: row.use_policy as RemoteDesktopLinkUsePolicy,
         durationMs: row.expires_at === null ? undefined : Math.max(1, row.expires_at - row.created_at),
         label: row.label,
       };
@@ -752,20 +762,15 @@ async function applyMutationTx(tx: Database, ctx: {
   return { effectsEmitted: 1 };
 }
 
-/**
- * First browser to present a thumbprint for a link owns it, atomically.
- *
- * A competing browser receives the same generic refusal as an unknown link, so
- * losing the race discloses nothing about whether a claim exists.
- */
+/** Bind one browser key under the link's single-use/reusable policy. */
 export async function claimLinkBrowser(
   db: Database,
   input: { linkId: string; browserKeyThumbprint: string; now: number },
 ): Promise<{ claimed: boolean }> {
   const keyHash = hashBrowserKey(input.browserKeyThumbprint);
   return db.transaction(async (tx) => {
-    const link = await tx.queryOne<{ id: string; state: string }>(
-      `SELECT id, state FROM remote_desktop_guest_links WHERE id = $1 FOR UPDATE`,
+    const link = await tx.queryOne<{ id: string; state: string; use_policy: string }>(
+      `SELECT id, state, use_policy FROM remote_desktop_guest_links WHERE id = $1 FOR UPDATE`,
       [input.linkId],
     );
     if (!link || link.state !== 'active') throw new LinkAuthorityError(LINK_REFUSAL.NOT_FOUND);
@@ -774,31 +779,33 @@ export async function claimLinkBrowser(
       `INSERT INTO remote_desktop_guest_browser_claims
          (link_id, browser_key_hash, browser_key_hash_version, claimed_at, last_proved_at)
        VALUES ($1, $2, 'v1', $3, $3)
-       ON CONFLICT (link_id) DO NOTHING
+       ON CONFLICT (link_id, browser_key_hash) DO NOTHING
        RETURNING link_id`,
       [input.linkId, keyHash, input.now],
     );
-    if (inserted) return { claimed: true };
-
-    // Already claimed. Only the original browser may proceed, and a different
-    // one is refused exactly like a missing link.
-    const existing = await tx.queryOne<{ browser_key_hash: string }>(
-      'SELECT browser_key_hash FROM remote_desktop_guest_browser_claims WHERE link_id = $1',
-      [input.linkId],
-    );
-    if (!existing || !constantTimeEqualHex(existing.browser_key_hash, keyHash)) {
-      throw new LinkAuthorityError(LINK_REFUSAL.NOT_FOUND);
+    if (inserted) {
+      if (link.use_policy === REMOTE_DESKTOP_LINK_USE_POLICY.SINGLE_USE) {
+        const claimCount = await tx.queryOne<{ count: number | string }>(
+          'SELECT COUNT(*) AS count FROM remote_desktop_guest_browser_claims WHERE link_id = $1',
+          [input.linkId],
+        );
+        if (Number(claimCount?.count ?? 0) !== 1) {
+          throw new LinkAuthorityError(LINK_REFUSAL.NOT_FOUND);
+        }
+      }
+      return { claimed: true };
     }
     await tx.execute(
-      'UPDATE remote_desktop_guest_browser_claims SET last_proved_at = $2 WHERE link_id = $1',
-      [input.linkId, input.now],
+      `UPDATE remote_desktop_guest_browser_claims SET last_proved_at = $3
+        WHERE link_id = $1 AND browser_key_hash = $2`,
+      [input.linkId, keyHash, input.now],
     );
     return { claimed: false };
   });
 }
 
 /**
- * One live session per link, with exact-session resume.
+ * One live session per link/browser key, with exact-session resume.
  *
  * The same browser reconnecting recovers its own session id rather than opening
  * a second one, so a link can never hold two PeerConnection authorities.
@@ -817,8 +824,9 @@ export async function openOrResumeLinkSession(
     if (!link || link.state !== 'active') throw new LinkAuthorityError(LINK_REFUSAL.NOT_FOUND);
 
     const claim = await tx.queryOne<{ browser_key_hash: string }>(
-      'SELECT browser_key_hash FROM remote_desktop_guest_browser_claims WHERE link_id = $1',
-      [input.linkId],
+      `SELECT browser_key_hash FROM remote_desktop_guest_browser_claims
+        WHERE link_id = $1 AND browser_key_hash = $2`,
+      [input.linkId, keyHash],
     );
     if (!claim || !constantTimeEqualHex(claim.browser_key_hash, keyHash)) {
       throw new LinkAuthorityError(LINK_REFUSAL.NOT_FOUND);
@@ -826,8 +834,8 @@ export async function openOrResumeLinkSession(
 
     const live = await tx.queryOne<{ id: string; browser_key_hash: string | null }>(
       `SELECT id, browser_key_hash FROM remote_desktop_guest_sessions
-        WHERE link_id = $1 AND state IN ('admitting', 'active')`,
-      [input.linkId],
+        WHERE link_id = $1 AND browser_key_hash = $2 AND state IN ('admitting', 'active')`,
+      [input.linkId, keyHash],
     );
     if (live) {
       // A different browser must not adopt an existing session.

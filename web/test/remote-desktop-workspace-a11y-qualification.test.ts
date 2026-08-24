@@ -29,7 +29,6 @@ function sourceQualificationIssues(source: string): string[] {
   const required = [
     ['tablist', 'role="tablist"'],
     ['tab', 'role="tab"'],
-    ['tabpanel', 'role="tabpanel"'],
     ['selected', 'aria-selected'],
     ['roving-tab-index', 'tabIndex={state.activeTabId'],
     ['left-key', "event.key === 'ArrowLeft'"],
@@ -39,6 +38,8 @@ function sourceQualificationIssues(source: string): string[] {
     ['delete-key', "event.key === 'Delete'"],
     ['mobile-selector', 'remote-desktop-workspace-mobile-selector'],
     ['wall-grid-label', 'remote_desktop.wall_grid'],
+    ['wall-context-menu', 'role="menu"'],
+    ['wall-add-slots', 'remote-desktop-wall-add-slot'],
   ] as const;
   return required.flatMap(([id, needle]) => source.includes(needle) ? [] : [id]);
 }
@@ -112,7 +113,7 @@ describe('remote desktop 16.3 workspace accessibility and locale qualification',
       'access_owner_title', 'access_public_id', 'access_public_id_non_secret', 'access_create_link',
       'access_secret_once_title', 'access_secret_once', 'access_password_title', 'access_privacy_recovery',
       'workspace_title', 'workspace_tabs', 'workspace_wall', 'workspace_select', 'workspace_add', 'workspace_close_tab',
-      'wall_grid', 'wall_open_host', 'wall_health_live', 'wall_health_stale', 'wall_health_pressure_paused',
+      'wall_grid', 'wall_open_host', 'wall_manage', 'wall_health_live', 'wall_health_stale', 'wall_health_pressure_paused',
     ] as const;
     const guestKeys = ['title', 'subtitle', 'public_id', 'password', 'connect', 'boundary', 'state_waiting_for_consent', 'generic_error', 'remote_screen'] as const;
     for (const [name, locale] of Object.entries({ en, es, ja, ko, ru, zhCN, zhTW })) {
@@ -123,17 +124,19 @@ describe('remote desktop 16.3 workspace accessibility and locale qualification',
 
   it('pins responsive, keyboard and ARIA source contracts, with mutation-quality positive control', () => {
     const workspace = read('src/components/RemoteDesktopWorkspace.tsx');
+    const wall = read('src/components/RemoteDesktopWall.tsx');
+    const wallTile = read('src/components/RemoteDesktopWallTile.tsx');
     const guest = read('src/components/RemoteDesktopGuestAccess.tsx');
     const workspaceCss = read('src/components/remote-desktop-workspace.css');
     const accessCss = read('src/components/remote-desktop-access.css');
-    expect(sourceQualificationIssues(workspace)).toEqual([]);
+    expect(sourceQualificationIssues(`${workspace}\n${wall}\n${wallTile}`)).toEqual([]);
     expect(guestSecretDisclosureIssues(guest)).toEqual([]);
     expect(workspaceCss).toContain('@media (max-width: 700px)');
     expect(workspaceCss).toContain('.remote-desktop-workspace-mobile-selector');
     expect(accessCss).toContain('@media(max-width:720px)');
     expect(accessCss).toContain(':focus-visible');
 
-    expect(sourceQualificationIssues(workspace.replace("event.key === 'ArrowRight'", 'event.key === \'PageDown\'')))
+    expect(sourceQualificationIssues(`${workspace.replace("event.key === 'ArrowRight'", 'event.key === \'PageDown\'')}\n${wall}\n${wallTile}`))
       .toContain('right-key');
     expect(guestSecretDisclosureIssues(`${guest}\nreturn <span>{ready.serverId}</span>;`))
       .toContain('renders-internal-secret-or-routing-field');

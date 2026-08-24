@@ -7,6 +7,7 @@ import { canOpenRemoteDesktop } from './RemoteDesktopPanel.js';
 
 interface ControlledNodeQuickMenuProps {
   onOpenRemoteDesktop(machine: MachineListItem): void;
+  onOpenRemoteDesktopWall?(): void;
 }
 
 interface MenuPosition {
@@ -23,7 +24,7 @@ interface MenuPosition {
  * split-button menu is deliberately read-only: it lists every accessible node
  * and jumps straight into remote control without opening the management panel.
  */
-export function ControlledNodeQuickMenu({ onOpenRemoteDesktop }: ControlledNodeQuickMenuProps) {
+export function ControlledNodeQuickMenu({ onOpenRemoteDesktop, onOpenRemoteDesktopWall }: ControlledNodeQuickMenuProps) {
   const { t } = useTranslation();
   const { machines, loaded, loading, error, refetch } = useMachines();
   const [open, setOpen] = useState(false);
@@ -103,6 +104,12 @@ export function ControlledNodeQuickMenu({ onOpenRemoteDesktop }: ControlledNodeQ
         <span>{t('controlled_nodes.machines_title')}</span>
         <span class="controlled-node-quick-count">{machines.length}</span>
       </div>
+      {onOpenRemoteDesktopWall && <button
+        type="button"
+        class="controlled-node-quick-wall"
+        role="menuitem"
+        onClick={() => { close(); onOpenRemoteDesktopWall(); }}
+      ><span aria-hidden="true">▦</span>{t('remote_desktop.workspace_wall')}</button>}
       {!loaded && loading && <div class="controlled-node-quick-state">{t('common.loading')}</div>}
       {loaded && error && machines.length === 0 && (
         <div class="controlled-node-quick-state is-error">{t('controlled_nodes.refresh_error')}</div>

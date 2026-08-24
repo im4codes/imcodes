@@ -1,8 +1,12 @@
-import { describe, expect, it } from 'vitest';
+import 'fake-indexeddb/auto';
+import { IDBFactory } from 'fake-indexeddb';
+import { beforeEach, describe, expect, it } from 'vitest';
 import {
   generateRemoteDesktopBrowserKeyPair,
   generateRemoteDesktopRawInvite,
+  getOrCreateRemoteDesktopInviteBinding,
   isRemoteDesktopBrowserKeyNonExportable,
+  loadRemoteDesktopInviteBinding,
   signRemoteDesktopClaim,
 } from '../src/remote-desktop-access-crypto.js';
 import {
@@ -13,6 +17,7 @@ import {
 const B64_32 = 'A'.repeat(REMOTE_DESKTOP_BROWSER_CLAIM.CHALLENGE_ID_ENCODED_LENGTH);
 
 describe('remote desktop browser access crypto', () => {
+  beforeEach(() => { globalThis.indexedDB = new IDBFactory(); });
   it('generates a one-time raw invite and only exposes a bounded hash for storage', async () => {
     const invite = await generateRemoteDesktopRawInvite();
     expect(invite.token).toHaveLength(REMOTE_DESKTOP_LINK_TOKEN.ENCODED_LENGTH);
@@ -33,5 +38,38 @@ describe('remote desktop browser access crypto', () => {
       privateKey: key.privateKey,
     });
     expect(signature).toHaveLength(REMOTE_DESKTOP_BROWSER_CLAIM.SIGNATURE_ENCODED_LENGTH);
+  });
+
+  it('reuses one non-exportable key and decrypts the original bearer across page reloads', async () => {
+    const invite = await generateRemoteDesktopRawInvite();
+    const first = await getOrCreateRemoteDesktopInviteBinding(invite.token);
+    const reopened = await getOrCreateRemoteDesktopInviteBinding(invite.token);
+    const refreshed = await loadRemoteDesktopInviteBinding(invite.tokenHash);
+
+    expect(first.tokenHash).toBe(invite.tokenHash);
+    expect(reopened.browserKey.thumbprint).toBe(first.browserKey.thumbprint);
+    expect(refreshed?.browserKey.thumbprint).toBe(first.browserKey.thumbprint);
+    expect(refreshed?.browserKey.privateKey.extractable).toBe(false);
+    expect(refreshed?.token).toBe(invite.token);
+
+    const db = await new Promise<IDBDatabase>((resolve, reject) => {
+      const request = indexedDB.open('imcodes-remote-desktop-invite-keys-v1');
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+    const stored = await new Promise<Record<string, unknown>>((resolve, reject) => {
+      const request = db.transaction('invite-keys').objectStore('invite-keys').get(invite.tokenHash);
+      request.onsuccess = () => resolve(request.result as Record<string, unknown>);
+      request.onerror = () => reject(request.error);
+    });
+    expect(JSON.stringify(stored)).not.toContain(invite.token);
+    expect(stored).not.toHaveProperty('token');
+    expect(stored.privateKey).toBeInstanceOf(CryptoKey);
+    expect(stored.tokenEncryptionKey).toBeInstanceOf(CryptoKey);
+    expect((stored.tokenEncryptionKey as CryptoKey).extractable).toBe(false);
+    expect((stored.tokenEncryptionKey as CryptoKey).algorithm.name).toBe('AES-GCM');
+    expect(Object.prototype.toString.call(stored.tokenCiphertext)).toBe('[object ArrayBuffer]');
+    expect(new TextDecoder().decode(stored.tokenCiphertext as ArrayBuffer)).not.toBe(invite.token);
+    db.close();
   });
 });

@@ -1,10 +1,10 @@
 import { REMOTE_DESKTOP_STATE } from '@shared/remote-desktop.js';
 import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
+import { createPortal } from 'preact/compat';
 import { useTranslation } from 'react-i18next';
 import type { RemoteDesktopWallHost } from '../api/remote-desktop-wall.js';
 import type { RemoteDesktopSnapshot } from '../remote-desktop-client.js';
 import type { RemoteDesktopConnectionManager } from '../remote-desktop-connection-manager.js';
-import { openRemoteDesktopWindow } from '../remote-desktop-window.js';
 
 const INITIAL: RemoteDesktopSnapshot = {
   state: REMOTE_DESKTOP_STATE.AUTHORIZING,
@@ -22,6 +22,8 @@ export interface RemoteDesktopWallTileProps {
   manager: RemoteDesktopConnectionManager;
   wallVisible: boolean;
   pressurePaused?: boolean;
+  onOpen(host: RemoteDesktopWallHost): void;
+  onRemove(hostId: string): void;
 }
 
 export function RemoteDesktopWallTile({
@@ -29,6 +31,8 @@ export function RemoteDesktopWallTile({
   manager,
   wallVisible,
   pressurePaused = false,
+  onOpen,
+  onRemove,
 }: RemoteDesktopWallTileProps) {
   const { t } = useTranslation();
   const presentationRef = useRef<object>({});
@@ -40,6 +44,7 @@ export function RemoteDesktopWallTile({
   const [pageVisible, setPageVisible] = useState(() => document.visibilityState === 'visible');
   const [inViewport, setInViewport] = useState(true);
   const [sizeTier, setSizeTier] = useState<'compact' | 'normal'>('normal');
+  const [menuPosition, setMenuPosition] = useState<{ left: number; top: number } | null>(null);
   const paused = pressurePaused || !wallVisible || !pageVisible || !inViewport;
 
   useEffect(() => {
@@ -47,6 +52,22 @@ export function RemoteDesktopWallTile({
     document.addEventListener('visibilitychange', update);
     return () => document.removeEventListener('visibilitychange', update);
   }, []);
+
+  useEffect(() => {
+    if (!menuPosition) return;
+    const close = () => setMenuPosition(null);
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') close();
+    };
+    document.addEventListener('pointerdown', close);
+    document.addEventListener('keydown', closeOnEscape);
+    window.addEventListener('blur', close);
+    return () => {
+      document.removeEventListener('pointerdown', close);
+      document.removeEventListener('keydown', closeOnEscape);
+      window.removeEventListener('blur', close);
+    };
+  }, [menuPosition]);
 
   useEffect(() => {
     const tile = tileRef.current;
@@ -121,28 +142,97 @@ export function RemoteDesktopWallTile({
     return clock - lastFrameAt <= FRESH_FRAME_MS ? 'live' : 'stale';
   }, [clock, lastFrameAt, paused, pressurePaused, snapshot.state, snapshot.stream]);
 
-  return (
-    <article
-      ref={tileRef}
-      class="remote-desktop-wall-tile"
-      data-health={health}
-      data-presentation-priority={paused ? 'paused' : 'visible-wall'}
-      data-route={snapshot.route ?? 'pending'}
-      data-size-tier={sizeTier}
+  const openContextMenu = (left: number, top: number) => {
+    const width = 238;
+    const height = Math.min(360, 132 + snapshot.displays.length * 38);
+    setMenuPosition({
+      left: Math.max(8, Math.min(left, window.innerWidth - width - 8)),
+      top: Math.max(8, Math.min(top, window.innerHeight - height - 8)),
+    });
+  };
+
+  const contextMenu = menuPosition && typeof document !== 'undefined' ? createPortal(
+    <div
+      class="remote-desktop-wall-context-menu"
+      role="menu"
+      aria-label={t('remote_desktop.wall_manage', { machine: host.displayName })}
+      style={{ left: menuPosition.left, top: menuPosition.top }}
+      onPointerDown={(event) => event.stopPropagation()}
     >
-      <video ref={videoRef} muted playsInline aria-label={t('remote_desktop.video_label', { machine: host.displayName })} />
+      <button type="button" role="menuitem" onClick={() => { setMenuPosition(null); onOpen(host); }}>
+        {t('remote_desktop.wall_open_host', { machine: host.displayName })}
+      </button>
+      {snapshot.displays.filter((display) => display.available).length > 1 && (
+        <div class="remote-desktop-wall-context-group" role="group" aria-label={t('remote_desktop.displays')}>
+          <span>{t('remote_desktop.displays')}</span>
+          {snapshot.displays.filter((display) => display.available).map((display) => (
+            <button
+              type="button"
+              role="menuitemradio"
+              aria-checked={snapshot.selectedDisplayId === display.id}
+              key={display.id}
+              onClick={() => {
+                manager.connection(host).selectDisplay(display.id);
+                setMenuPosition(null);
+              }}
+            >
+              <span aria-hidden="true">{snapshot.selectedDisplayId === display.id ? '●' : '○'}</span>
+              {display.label}
+            </button>
+          ))}
+        </div>
+      )}
       <button
         type="button"
-        class="remote-desktop-wall-tile-open"
-        aria-label={`${t('remote_desktop.open')}: ${host.displayName}`}
-        title={`${t('remote_desktop.open')}: ${host.displayName}`}
-        onClick={() => openRemoteDesktopWindow(host.serverId)}
+        role="menuitem"
+        onClick={() => {
+          manager.presentation(host, presentationRef.current).retry();
+          setMenuPosition(null);
+        }}
+      >{t('remote_desktop.retry')}</button>
+      <button
+        type="button"
+        role="menuitem"
+        class="is-danger"
+        onClick={() => { setMenuPosition(null); onRemove(host.hostId); }}
+      >{t('remote_desktop.wall_remove', { machine: host.displayName })}</button>
+    </div>,
+    document.body,
+  ) : null;
+
+  return (
+    <>
+      <article
+        ref={tileRef}
+        class="remote-desktop-wall-tile"
+        data-health={health}
+        data-presentation-priority={paused ? 'paused' : 'visible-wall'}
+        data-route={snapshot.route ?? 'pending'}
+        data-size-tier={sizeTier}
+        tabIndex={0}
+        role="button"
+        aria-label={t('remote_desktop.wall_open_host', { machine: host.displayName })}
+        aria-haspopup="menu"
+        onClick={() => onOpen(host)}
+        onContextMenu={(event) => {
+          event.preventDefault();
+          openContextMenu(event.clientX, event.clientY);
+        }}
+        onKeyDown={(event) => {
+          if (event.key === 'Enter' || event.key === ' ') {
+            event.preventDefault();
+            onOpen(host);
+          }
+          if (event.key === 'ContextMenu' || (event.shiftKey && event.key === 'F10')) {
+            event.preventDefault();
+            const rect = tileRef.current?.getBoundingClientRect();
+            openContextMenu(rect?.left ?? 8, rect?.top ?? 8);
+          }
+        }}
       >
-        <svg viewBox="0 0 24 24" aria-hidden="true">
-          <path d="M14 5h5v5M19 5l-8 8M18 13v5a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5" />
-        </svg>
-        <span>{t('remote_desktop.open')}</span>
-      </button>
-    </article>
+        <video ref={videoRef} muted playsInline aria-label={t('remote_desktop.video_label', { machine: host.displayName })} />
+      </article>
+      {contextMenu}
+    </>
   );
 }

@@ -6,12 +6,6 @@ import { RemoteDesktopWallTile } from '../src/components/RemoteDesktopWallTile.j
 import { RemoteDesktopConnectionManager } from '../src/remote-desktop-connection-manager.js';
 import type { RemoteDesktopClientHooks, RemoteDesktopSnapshot } from '../src/remote-desktop-client.js';
 
-const { openRemoteDesktopWindow } = vi.hoisted(() => ({
-  openRemoteDesktopWindow: vi.fn(),
-}));
-
-vi.mock('../src/remote-desktop-window.js', () => ({ openRemoteDesktopWindow }));
-
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({ t: (key: string, values?: Record<string, unknown>) => (
     values ? `${key}:${Object.values(values).join(':')}` : key
@@ -70,10 +64,14 @@ describe('RemoteDesktopWallTile', () => {
     ordinary.subscribe(tabPresentation, () => {}, { controlsInput: true });
     await ordinary.start();
 
+    const onOpen = vi.fn();
+    const onRemove = vi.fn();
     const result = render(<RemoteDesktopWallTile
       host={host}
       manager={manager}
       wallVisible
+      onOpen={onOpen}
+      onRemove={onRemove}
     />);
     await waitFor(() => expect(starts).toBe(1));
     expect(allocations).toBe(1);
@@ -81,12 +79,12 @@ describe('RemoteDesktopWallTile', () => {
     // The existing input owner remains the only presentation able to control.
     manager.presentation(host, {}).pointerMove(0.5, 0.5);
     expect(pointerMoves).toBe(0);
-    expect(result.container.querySelectorAll('button')).toHaveLength(1);
+    expect(result.container.querySelectorAll('button')).toHaveLength(0);
     expect(result.container.querySelector('header')).toBeNull();
     expect(result.container.querySelector('footer')).toBeNull();
     expect(result.container.querySelector('dl')).toBeNull();
-    fireEvent.click(screen.getByRole('button', { name: 'remote_desktop.open: A' }));
-    expect(openRemoteDesktopWindow).toHaveBeenCalledWith('server-a');
+    fireEvent.click(screen.getByRole('button', { name: 'remote_desktop.wall_open_host:A' }));
+    expect(onOpen).toHaveBeenCalledWith(host);
 
     (hook as RemoteDesktopClientHooks | null)?.onSnapshot({
       ...initial(),
@@ -104,5 +102,47 @@ describe('RemoteDesktopWallTile', () => {
     Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'hidden' });
     document.dispatchEvent(new Event('visibilitychange'));
     await waitFor(() => expect(video.closest('article')?.dataset.health).toBe('paused'));
+  });
+
+  it('opens a right-click management menu for display switching and removal', async () => {
+    let hook: RemoteDesktopClientHooks | null = null;
+    const selectDisplay = vi.fn(() => true);
+    const manager = new RemoteDesktopConnectionManager({
+      createClient: (_serverId, hooks) => {
+        hook = hooks;
+        return {
+          current: initial, start: async () => {}, setMode: vi.fn(), selectDisplay,
+          setDisplayMode: () => true, setDisplayScale: () => true, requestUnlock: () => true,
+          requestRemoteClipboard: async () => null, acknowledgePresentedFrame: () => true,
+          pointerMove: vi.fn(), pointerButton: () => true, pointerClick: () => true,
+          wheel: () => true, key: () => true, text: () => true,
+          releaseAll: vi.fn(), releasePointerButtons: vi.fn(), stop: vi.fn(),
+        };
+      },
+    });
+    const host = {
+      hostId: 'host-a', remoteDesktopHostId: 'host-a', serverId: 'server-a',
+      refName: 'a', displayName: 'A', online: true, execEnabled: true, accessRole: 'owner' as const,
+    };
+    const onRemove = vi.fn();
+    render(<RemoteDesktopWallTile host={host} manager={manager} wallVisible onOpen={vi.fn()} onRemove={onRemove} />);
+    (hook as RemoteDesktopClientHooks | null)?.onSnapshot({
+      ...initial(),
+      displays: [
+        { id: 'one', label: 'Display 1', primary: true, available: true, width: 1920, height: 1080, dpiScale: 1, rotation: 0 },
+        { id: 'two', label: 'Display 2', primary: false, available: true, width: 1280, height: 720, dpiScale: 1, rotation: 0 },
+      ],
+      selectedDisplayId: 'one',
+    });
+    fireEvent.contextMenu(screen.getByRole('button', { name: 'remote_desktop.wall_open_host:A' }), { clientX: 40, clientY: 50 });
+    await screen.findByRole('menu', { name: 'remote_desktop.wall_manage:A' });
+    expect(onRemove).not.toHaveBeenCalled();
+    expect(screen.getByRole('menuitem', { name: 'remote_desktop.retry' })).toBeTruthy();
+    fireEvent.click(screen.getByRole('menuitemradio', { name: /Display 2/ }));
+    expect(selectDisplay).toHaveBeenCalledWith('two');
+
+    fireEvent.contextMenu(screen.getByRole('button', { name: 'remote_desktop.wall_open_host:A' }), { clientX: 40, clientY: 50 });
+    fireEvent.click(screen.getByRole('menuitem', { name: 'remote_desktop.wall_remove:A' }));
+    expect(onRemove).toHaveBeenCalledWith('host-a');
   });
 });

@@ -202,6 +202,14 @@ describe('remote desktop guest access routes', () => {
     );
   });
 
+  it('rejects a token hash as a bearer-equivalent refresh selector', async () => {
+    const tokenHash = 'a'.repeat(64);
+    const response = await post({ tokenHash }, 'challenge');
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ status: 'unavailable' });
+    expect(mocks.challenge).not.toHaveBeenCalled();
+  });
+
   it('returns one identical body for every pre-proof failure', async () => {
     // Bad shape, absent link, revoked link and expired link must be
     // indistinguishable — including by status code, which is why each is

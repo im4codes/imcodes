@@ -3,8 +3,10 @@ import { useTranslation } from 'react-i18next';
 import {
   REMOTE_DESKTOP_LINK_DURATION_MS,
   REMOTE_DESKTOP_LINK_KIND,
+  REMOTE_DESKTOP_LINK_USE_POLICY,
   REMOTE_DESKTOP_LINK_MUTATION,
   type RemoteDesktopLinkKind,
+  type RemoteDesktopLinkUsePolicy,
 } from '@shared/remote-desktop-access.js';
 import { REMOTE_DESKTOP_ACCESS_MODE, type RemoteDesktopAccessMode } from '@shared/remote-desktop.js';
 import {
@@ -68,6 +70,7 @@ export function RemoteDesktopAccessManagement({
   const [recoveryRequired, setRecoveryRequired] = useState(false);
   const [kind, setKind] = useState<RemoteDesktopLinkKind>(REMOTE_DESKTOP_LINK_KIND.ATTENDED);
   const [mode, setMode] = useState<RemoteDesktopAccessMode>(REMOTE_DESKTOP_ACCESS_MODE.CONTROL);
+  const [usePolicy, setUsePolicy] = useState<RemoteDesktopLinkUsePolicy>(REMOTE_DESKTOP_LINK_USE_POLICY.REUSABLE);
   const [durationMs, setDurationMs] = useState<number>(REMOTE_DESKTOP_LINK_DURATION_MS.H24);
   const [label, setLabel] = useState('');
   const [invite, setInvite] = useState<OneTimeInvite | null>(null);
@@ -143,6 +146,7 @@ export function RemoteDesktopAccessManagement({
         hostId,
         kind,
         mode,
+        usePolicy,
         label: label.trim(),
         ...(kind === REMOTE_DESKTOP_LINK_KIND.UNATTENDED ? { durationMs } : {}),
       });
@@ -310,6 +314,12 @@ export function RemoteDesktopAccessManagement({
               <option value={REMOTE_DESKTOP_ACCESS_MODE.CONTROL}>{t('remote_desktop.control_mode')}</option>
             </select>
           </label>
+          <label>{t('remote_desktop.access_use_policy')}
+            <select value={usePolicy} onChange={(e) => setUsePolicy(e.currentTarget.value as RemoteDesktopLinkUsePolicy)}>
+              <option value={REMOTE_DESKTOP_LINK_USE_POLICY.SINGLE_USE}>{t('remote_desktop.access_single_use')}</option>
+              <option value={REMOTE_DESKTOP_LINK_USE_POLICY.REUSABLE}>{t('remote_desktop.access_reusable')}</option>
+            </select>
+          </label>
           {kind === REMOTE_DESKTOP_LINK_KIND.UNATTENDED && <label>{t('remote_desktop.access_expires')}
             <select value={durationMs} onChange={(e) => setDurationMs(Number(e.currentTarget.value))}>
               {DURATION_OPTIONS.map((duration) => <option value={duration}>{durationLabels.get(duration)}</option>)}
@@ -335,7 +345,7 @@ export function RemoteDesktopAccessManagement({
 
         <ul class="remote-desktop-link-list">
           {links.map((link) => <li key={link.id}>
-            <div><strong>{link.label || t('remote_desktop.access_unnamed')}</strong><span>{t(`remote_desktop.access_${link.kind}`)} · {t(`remote_desktop.${link.mode}_mode`)}</span></div>
+            <div><strong>{link.label || t('remote_desktop.access_unnamed')}</strong><span>{t(`remote_desktop.access_${link.kind}`)} · {t(`remote_desktop.${link.mode}_mode`)} · {t(`remote_desktop.access_${link.usePolicy}`)}</span></div>
             <div>
               <span>{link.claimed ? t('remote_desktop.access_claimed') : t('remote_desktop.access_unclaimed')}</span>
               <span>{t(`remote_desktop.access_state_${link.state}`)}</span>

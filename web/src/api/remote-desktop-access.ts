@@ -8,10 +8,12 @@ import {
   REMOTE_DESKTOP_BROWSER_CLAIM,
   REMOTE_DESKTOP_ACTOR_SOURCE,
   REMOTE_DESKTOP_LINK_KIND,
+  REMOTE_DESKTOP_LINK_USE_POLICY,
   REMOTE_DESKTOP_LINK_MUTATION,
   REMOTE_DESKTOP_LINK_TOKEN,
   type RemoteDesktopActorSource,
   type RemoteDesktopLinkKind,
+  type RemoteDesktopLinkUsePolicy,
 } from '@shared/remote-desktop-access.js';
 import {
   isRemoteDesktopId,
@@ -49,6 +51,7 @@ export interface RemoteDesktopOwnerLinkView {
   label: string;
   kind: RemoteDesktopLinkKind;
   mode: RemoteDesktopAccessMode;
+  usePolicy: RemoteDesktopLinkUsePolicy;
   expiresAt: number | null;
   authorityGeneration: number;
   expiryRevision: number;
@@ -102,6 +105,7 @@ export interface CreateOwnerLinkInput {
   hostId?: string;
   kind?: RemoteDesktopLinkKind;
   mode?: RemoteDesktopAccessMode;
+  usePolicy?: RemoteDesktopLinkUsePolicy;
   label?: string;
   durationMs?: number;
   privacyEpoch: RemoteDesktopPrivacyEpochRef;
@@ -119,6 +123,7 @@ export interface PreparedRemoteDesktopLink {
     tokenHash: string;
     kind: RemoteDesktopLinkKind;
     mode: RemoteDesktopAccessMode;
+    usePolicy: RemoteDesktopLinkUsePolicy;
     label: string;
     durationMs?: number;
   };
@@ -277,6 +282,7 @@ export async function prepareRemoteDesktopLink(input: {
   hostId: string;
   kind: RemoteDesktopLinkKind;
   mode: RemoteDesktopAccessMode;
+  usePolicy: RemoteDesktopLinkUsePolicy;
   label: string;
   durationMs?: number;
 }): Promise<PreparedRemoteDesktopLink> {
@@ -290,6 +296,7 @@ export async function prepareRemoteDesktopLink(input: {
     tokenHash: raw.tokenHash,
     kind: input.kind,
     mode: input.mode,
+    usePolicy: input.usePolicy,
     label,
     ...(input.durationMs !== undefined ? { durationMs: input.durationMs } : {}),
   };
@@ -297,6 +304,7 @@ export async function prepareRemoteDesktopLink(input: {
     hostId: input.hostId,
     kind: input.kind,
     mode: input.mode,
+    usePolicy: input.usePolicy,
     label,
     ...(input.durationMs === undefined ? {} : { durationMs: input.durationMs }),
   });
@@ -369,6 +377,8 @@ function decodeLink(value: unknown): RemoteDesktopOwnerLinkView {
     || typeof value.label !== 'string'
     || (value.kind !== REMOTE_DESKTOP_LINK_KIND.ATTENDED && value.kind !== REMOTE_DESKTOP_LINK_KIND.UNATTENDED)
     || (value.mode !== REMOTE_DESKTOP_ACCESS_MODE.VIEW && value.mode !== REMOTE_DESKTOP_ACCESS_MODE.CONTROL)
+    || (value.usePolicy !== REMOTE_DESKTOP_LINK_USE_POLICY.SINGLE_USE
+      && value.usePolicy !== REMOTE_DESKTOP_LINK_USE_POLICY.REUSABLE)
     || (value.expiresAt !== null && typeof value.expiresAt !== 'number')
     || typeof value.authorityGeneration !== 'number'
     || typeof value.expiryRevision !== 'number'
@@ -510,6 +520,7 @@ export function createRemoteDesktopAccessApi(): RemoteDesktopAccessApi {
         hostId: input.hostId ?? '',
         kind: input.kind ?? REMOTE_DESKTOP_LINK_KIND.ATTENDED,
         mode: input.mode ?? REMOTE_DESKTOP_ACCESS_MODE.VIEW,
+        usePolicy: input.usePolicy ?? REMOTE_DESKTOP_LINK_USE_POLICY.REUSABLE,
         label: input.label ?? '',
         ...(input.durationMs !== undefined ? { durationMs: input.durationMs } : {}),
       });

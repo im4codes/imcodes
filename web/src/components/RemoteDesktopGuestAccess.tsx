@@ -13,6 +13,12 @@ import {
   type RemoteDesktopGuestSessionState,
 } from '../api/remote-desktop-access.js';
 import type { RemoteDesktopInviteBootstrapResult } from '../remote-desktop-invite-bootstrap.js';
+import {
+  REMOTE_DESKTOP_INVITE_HISTORY_STATE_KEY,
+  getOrCreateRemoteDesktopInviteBinding,
+  loadRemoteDesktopInviteBinding,
+  type PersistedRemoteDesktopInviteBinding,
+} from '../remote-desktop-access-crypto.js';
 import './remote-desktop-access.css';
 
 export interface RemoteDesktopGuestAccessProps {
@@ -43,6 +49,7 @@ export function RemoteDesktopGuestAccess({
   const [error, setError] = useState<string | null>(null);
   const [stream, setStream] = useState<MediaStream | null>(null);
   const session = useRef<{ stop(): void } | null>(null);
+  const invite = useRef<PersistedRemoteDesktopInviteBinding | null>(null);
   const video = useRef<HTMLVideoElement | null>(null);
   const alive = useRef(true);
 
@@ -72,12 +79,16 @@ export function RemoteDesktopGuestAccess({
     }, (next) => { if (alive.current) setState(next); });
   };
 
-  const resolveInvite = async (token: string) => {
+  const resolveInvite = async () => {
+    const currentInvite = invite.current;
+    if (!currentInvite) return;
     setState('resolving');
     setError(null);
     try {
-      const browserKey = await newRemoteDesktopGuestBrowserKey();
-      const result = await api.resolveInvite({ token, browserKey });
+      const result = await api.resolveInvite({
+        token: currentInvite.token,
+        browserKey: currentInvite.browserKey,
+      });
       if (result.status !== 'ready') {
         setState(result.status === 'rate_limited' ? 'cooldown' : 'unavailable');
         return;
@@ -92,13 +103,32 @@ export function RemoteDesktopGuestAccess({
   useEffect(() => {
     alive.current = true;
     document.getElementById('splash')?.classList.add('splash-exit');
-    void bootstrap.then((result) => {
-      if (alive.current && result.status === 'invite') void resolveInvite(result.token);
+    void bootstrap.then(async (result) => {
+      const binding = result.status === 'invite'
+        ? await getOrCreateRemoteDesktopInviteBinding(result.token)
+        : result.status === 'resume'
+          ? await loadRemoteDesktopInviteBinding(result.tokenHash)
+          : null;
+      if (!alive.current || !binding) return;
+      invite.current = binding;
+      const state = window.history.state && typeof window.history.state === 'object'
+        ? window.history.state as Record<string, unknown>
+        : {};
+      window.history.replaceState({
+        ...state,
+        [REMOTE_DESKTOP_INVITE_HISTORY_STATE_KEY]: binding.tokenHash,
+      }, '', '/remote-desktop/access');
+      void resolveInvite();
+    }).catch((reason) => {
+      if (!alive.current) return;
+      setError(mapRemoteDesktopApiError(reason));
+      setState('unavailable');
     });
     return () => {
       alive.current = false;
       session.current?.stop();
       session.current = null;
+      invite.current = null;
       setStream(null);
       setPassword('');
     };
@@ -127,6 +157,19 @@ export function RemoteDesktopGuestAccess({
     }
   };
 
+  const retryOrReset = () => {
+    session.current?.stop();
+    session.current = null;
+    setStream(null);
+    setTarget(null);
+    setError(null);
+    if (invite.current) {
+      void resolveInvite();
+      return;
+    }
+    setState('idle');
+  };
+
   return (
     <main class="remote-desktop-guest" aria-labelledby="remote-desktop-guest-title">
       <section class="remote-desktop-guest-card">
@@ -152,7 +195,7 @@ export function RemoteDesktopGuestAccess({
           <strong>{t(`remote_desktop.guest.state_${state}`)}</strong>
           {target && <p>{t('remote_desktop.guest.target', { target })}</p>}
           {state === 'waiting_for_consent' && <p>{t('remote_desktop.guest.waiting_help')}</p>}
-          {(state === 'unavailable' || state === 'cooldown' || state === 'denied' || state === 'timeout' || state === 'cancelled') && <button type="button" onClick={() => { setState('idle'); setTarget(null); setError(null); }}>{t('remote_desktop.guest.try_again')}</button>}
+          {(state === 'unavailable' || state === 'cooldown' || state === 'denied' || state === 'timeout' || state === 'cancelled') && <button type="button" onClick={retryOrReset}>{t('remote_desktop.guest.try_again')}</button>}
         </div>}
         {stream && <video
           ref={video}

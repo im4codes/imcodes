@@ -25,6 +25,7 @@ import {
   REMOTE_DESKTOP_ACTOR_SOURCE,
   REMOTE_DESKTOP_BROWSER_CLAIM,
   REMOTE_DESKTOP_LINK_KIND,
+  REMOTE_DESKTOP_LINK_USE_POLICY,
   REMOTE_DESKTOP_LINK_MUTATION,
   REMOTE_DESKTOP_LINK_TOKEN,
   remoteDesktopBootstrapSignaturePreimage,
@@ -184,23 +185,25 @@ function createAction(fx: Fixture, requestId: string, tokenHash: string, policyH
 
 async function createLink(fx: Fixture, overrides: Partial<{
   kind: 'attended' | 'unattended'; mode: 'view' | 'control'; label: string; durationMs: number;
+  usePolicy: 'single_use' | 'reusable';
 }> = {}) {
   const { token, tokenHash } = newBearer();
   const requestId = newRequestId();
   const kind = overrides.kind ?? REMOTE_DESKTOP_LINK_KIND.ATTENDED;
   const mode = overrides.mode ?? 'control';
   const label = overrides.label ?? 'desk';
+  const usePolicy = overrides.usePolicy ?? REMOTE_DESKTOP_LINK_USE_POLICY.REUSABLE;
   const durationMs = kind === REMOTE_DESKTOP_LINK_KIND.UNATTENDED
     ? (overrides.durationMs ?? DAY) : undefined;
-  const policyHash = hashLinkPolicy({ hostId: fx.hostId, kind, mode, durationMs, label });
+  const policyHash = hashLinkPolicy({ hostId: fx.hostId, kind, mode, usePolicy, durationMs, label });
   const grant = await mintGrant(fx, createAction(fx, requestId, tokenHash, policyHash), requestId);
   const result = await createGuestLink(db, {
     ownerUserId: fx.ownerUserId, accountSession: fx.session, stepUpToken: grant,
     hostId: fx.hostId, creationRequestId: requestId,
     tokenHashVersion: REMOTE_DESKTOP_LINK_TOKEN.HASH_VERSION, tokenHash,
-    kind, mode, label, durationMs, privacy: fx.privacy, now: NOW,
+    kind, mode, usePolicy, label, durationMs, privacy: fx.privacy, now: NOW,
   });
-  return { ...result, token, tokenHash, requestId, grant, policyHash, kind, mode, label, durationMs };
+  return { ...result, token, tokenHash, requestId, grant, policyHash, kind, mode, usePolicy, label, durationMs };
 }
 
 async function mutate(fx: Fixture, linkId: string, mutation: string, extra: Record<string, unknown> = {}) {
@@ -259,7 +262,7 @@ async function proveLink(
   options: { now?: number; ttlMs?: number } = {},
 ) {
   const now = options.now ?? NOW;
-  const challenge = await issueClaimChallenge(db, { token, now });
+  const challenge = await issueClaimChallenge(db, { token, now, ttlMs: options.ttlMs });
   const signature = sign(
     'sha256',
     remoteDesktopBrowserClaimSignaturePreimage(
@@ -385,7 +388,8 @@ describe('Owner link creation (4.5)', () => {
       ownerUserId: fx.ownerUserId, accountSession: fx.session, stepUpToken: first.grant,
       hostId: fx.hostId, creationRequestId: first.requestId,
       tokenHashVersion: 'v1', tokenHash: first.tokenHash,
-      kind: first.kind, mode: first.mode, label: first.label, privacy: fx.privacy, now: NOW,
+      kind: first.kind, mode: first.mode, usePolicy: first.usePolicy,
+      label: first.label, privacy: fx.privacy, now: NOW,
     });
 
     expect(second.link.id).toBe(first.link.id);
@@ -403,7 +407,8 @@ describe('Owner link creation (4.5)', () => {
       ownerUserId: fx.ownerUserId, accountSession: fx.session, stepUpToken: first.grant,
       hostId: fx.hostId, creationRequestId: first.requestId,
       tokenHashVersion: 'v1', tokenHash: first.tokenHash,
-      kind: first.kind, mode: 'view', label: first.label, privacy: fx.privacy, now: NOW,
+      kind: first.kind, mode: 'view', usePolicy: first.usePolicy,
+      label: first.label, privacy: fx.privacy, now: NOW,
       // The grant's action digest covers the policy hash, so a changed policy
       // fails the outer step-up fence before the idempotency check is reached.
       // The inner conflict path is covered by the hash-collision case below.
@@ -771,10 +776,10 @@ describe('Owner list and mutation matrix (4.7 / 4.8)', () => {
 });
 
 describe('browser claim and session binding (4.9 / 4.10)', () => {
-  it('gives the link to the first browser and refuses a competitor generically', async () => {
+  it('keeps a single-use link on one browser while allowing that browser to refresh', async () => {
     const tp = newThumbprint();
     const fx = await seedFixture();
-    const created = await createLink(fx);
+    const created = await createLink(fx, { usePolicy: REMOTE_DESKTOP_LINK_USE_POLICY.SINGLE_USE });
 
     expect(await claimLinkBrowser(db, { linkId: created.link.id, browserKeyThumbprint: `${tp}-a`, now: NOW }))
       .toEqual({ claimed: true });
@@ -788,10 +793,10 @@ describe('browser claim and session binding (4.9 / 4.10)', () => {
       .toEqual({ claimed: false });
   });
 
-  it('resolves a concurrent first claim to exactly one owner', async () => {
+  it('resolves a concurrent single-use first claim to exactly one owner', async () => {
     const tp = newThumbprint();
     const fx = await seedFixture();
-    const created = await createLink(fx);
+    const created = await createLink(fx, { usePolicy: REMOTE_DESKTOP_LINK_USE_POLICY.SINGLE_USE });
     const results = await Promise.allSettled([
       claimLinkBrowser(db, { linkId: created.link.id, browserKeyThumbprint: `${tp}-a`, now: NOW }),
       claimLinkBrowser(db, { linkId: created.link.id, browserKeyThumbprint: `${tp}-b`, now: NOW }),
@@ -803,7 +808,7 @@ describe('browser claim and session binding (4.9 / 4.10)', () => {
   it('refuses a lost-key browser without disclosing the claim', async () => {
     const tp = newThumbprint();
     const fx = await seedFixture();
-    const created = await createLink(fx);
+    const created = await createLink(fx, { usePolicy: REMOTE_DESKTOP_LINK_USE_POLICY.SINGLE_USE });
     await claimLinkBrowser(db, { linkId: created.link.id, browserKeyThumbprint: `${tp}-orig`, now: NOW });
 
     // The user cleared storage and generated a new key.
@@ -832,6 +837,32 @@ describe('browser claim and session binding (4.9 / 4.10)', () => {
       [created.link.id],
     );
     expect(live).toHaveLength(1);
+  });
+
+  it('lets a reusable link admit different browsers while keeping one live session per browser', async () => {
+    const first = newThumbprint();
+    const second = newThumbprint();
+    const fx = await seedFixture();
+    const created = await createLink(fx, { usePolicy: REMOTE_DESKTOP_LINK_USE_POLICY.REUSABLE });
+
+    expect(await claimLinkBrowser(db, {
+      linkId: created.link.id, browserKeyThumbprint: first, now: NOW,
+    })).toEqual({ claimed: true });
+    expect(await claimLinkBrowser(db, {
+      linkId: created.link.id, browserKeyThumbprint: second, now: NOW + 1,
+    })).toEqual({ claimed: true });
+
+    const firstSession = await openOrResumeLinkSession(db, {
+      linkId: created.link.id, hostId: fx.hostId, browserKeyThumbprint: first, now: NOW + 2,
+    });
+    const secondSession = await openOrResumeLinkSession(db, {
+      linkId: created.link.id, hostId: fx.hostId, browserKeyThumbprint: second, now: NOW + 3,
+    });
+    expect(secondSession.sessionId).not.toBe(firstSession.sessionId);
+    expect(await db.query(
+      "SELECT id FROM remote_desktop_guest_sessions WHERE link_id = $1 AND state IN ('admitting','active')",
+      [created.link.id],
+    )).toHaveLength(2);
   });
 });
 
@@ -874,6 +905,22 @@ describe('public proof and sticky bootstrap (5.1–5.4)', () => {
       'SELECT ticket_hash FROM remote_desktop_guest_bootstraps WHERE host_id = $1', [fx.hostId],
     );
     expect(stored?.ticket_hash).not.toBe(proof.bootstrapTicket);
+  });
+
+  it('lets reusable links prove from different browsers and lets single-use links refresh only with their original key', async () => {
+    const fx = await seedFixture();
+    const reusable = await createLink(fx, { usePolicy: REMOTE_DESKTOP_LINK_USE_POLICY.REUSABLE });
+    await endPrivacy(fx);
+    expect((await proveLink(reusable.token, newBrowserProofKey())).ok).toBe(true);
+    expect((await proveLink(reusable.token, newBrowserProofKey(), { now: NOW + 1 })).ok).toBe(true);
+
+    const fxSingle = await seedFixture();
+    const single = await createLink(fxSingle, { usePolicy: REMOTE_DESKTOP_LINK_USE_POLICY.SINGLE_USE });
+    await endPrivacy(fxSingle);
+    const original = newBrowserProofKey();
+    expect((await proveLink(single.token, original)).ok).toBe(true);
+    expect((await proveLink(single.token, original, { now: NOW + 1 })).ok).toBe(true);
+    expect((await proveLink(single.token, newBrowserProofKey(), { now: NOW + 2 })).ok).toBe(false);
   });
 
   it('redeems once on the owning pod and refuses replay', async () => {
@@ -1028,13 +1075,30 @@ describe('public proof and sticky bootstrap (5.1–5.4)', () => {
     })).toBeNull();
   });
 
-  it('refuses proof while the host privacy gate is closed', async () => {
-    const key = newBrowserProofKey();
+  it('refuses proof while the host privacy gate is closed without poisoning the browser claim', async () => {
+    const firstKey = newBrowserProofKey();
     const fx = await seedFixture();
     const created = await createLink(fx);
     // The epoch opened during seeding is still live, so admission is closed.
-    const proof = await proveLink(created.token, key);
+    const proof = await proveLink(created.token, firstKey);
     expect(proof.ok).toBe(false);
+
+    // A transient refusal consumes its challenge but must not bind the link to
+    // a key that never received a bootstrap ticket.
+    expect(await db.queryOne(
+      'SELECT link_id FROM remote_desktop_guest_browser_claims WHERE link_id = $1',
+      [created.link.id],
+    )).toBeNull();
+
+    // Once privacy reopens, a freshly loaded page may prove with its newly
+    // generated key and becomes the one durable browser owner.
+    await endPrivacy(fx);
+    const retried = await proveLink(created.token, newBrowserProofKey(), { now: NOW + 3 });
+    expect(retried.ok).toBe(true);
+    expect(await db.queryOne(
+      'SELECT link_id FROM remote_desktop_guest_browser_claims WHERE link_id = $1',
+      [created.link.id],
+    )).not.toBeNull();
   });
 
   it('sweeps expired unredeemed tickets and keeps redeemed ones', async () => {
