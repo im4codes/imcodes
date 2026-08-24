@@ -104,6 +104,12 @@ import {
 } from './subsession-accent-colors.js';
 import type { PanelRenderContext } from './components/PinnedPanelRegistry.js';
 import { shareTargetKey, type ShareDialogTarget, type ShareGrantSummary, type SharedStateSummary, type ShareTarget } from './tab-sharing-ui.js';
+import {
+  clearSharedTabRestoreMarker,
+  findRememberedSharedEntry,
+  readSharedTabRestoreMarker,
+  rememberSharedTab,
+} from './shared-tab-restore.js';
 import './components/pinnedPanelTypes.js'; // register all panel types
 import {
   LOCAL_WEB_PREVIEW_PANEL_TYPE,
@@ -517,6 +523,7 @@ export function App() {
   }
   const remoteDesktopConnectionManager = remoteDesktopConnectionManagerRef.current;
   const initialHashStateRef = useRef(readHashState());
+  const initialSharedTabRestoreRef = useRef(readSharedTabRestoreMarker());
   const [globalFontPrefs] = useFontPrefs('chat', DEFAULT_CHAT_FONT);
   useEffect(() => {
     applyGlobalFontPrefs(globalFontPrefs);
@@ -548,6 +555,7 @@ export function App() {
     localStorage.removeItem('rcc_server');
     localStorage.removeItem('rcc_server_name');
     localStorage.removeItem('rcc_session');
+    clearSharedTabRestoreMarker();
     clearMessagePinsCache();
     clearMessagePinNavigation();
     setAuth(null);
@@ -725,6 +733,7 @@ export function App() {
     localStorage.removeItem('rcc_server');
     localStorage.removeItem('rcc_server_name');
     localStorage.removeItem('rcc_session');
+    clearSharedTabRestoreMarker();
   }, [selectedServerId, servers, serversLoaded, serversSynced, selectedShareTarget, sharedHashRestorePending]);
 
   useEffect(() => {
@@ -2661,6 +2670,7 @@ export function App() {
       setSharedActiveDispatchIds(openedDispatchIds);
 
       setSelectedShareTarget(opened.target);
+      rememberSharedTab(entry);
       setManualDashboard(false);
       setSelectedServerId(opened.server.id);
       setSelectedServerName(opened.server.name);
@@ -2713,6 +2723,9 @@ export function App() {
     if (sharedHashRestoreStartedRef.current) return;
 
     const initial = initialHashStateRef.current;
+    const remembered = initialSharedTabRestoreRef.current?.serverId === initial.serverId
+      ? initialSharedTabRestoreRef.current
+      : null;
     if (!initial.serverId
       || selectedServerId !== initial.serverId
       || selectedShareTarget) {
@@ -2720,7 +2733,7 @@ export function App() {
       setSharedHashRestorePending(false);
       return;
     }
-    if (servers.some((server) => server.id === initial.serverId)) {
+    if (!remembered && servers.some((server) => server.id === initial.serverId)) {
       sharedHashRestoreStartedRef.current = true;
       setSharedHashRestorePending(false);
       return;
@@ -2728,8 +2741,11 @@ export function App() {
     if (!sharedEntriesLoaded) return;
 
     sharedHashRestoreStartedRef.current = true;
-    const entry = findSharedEntryForHash(sharedEntries, initial.serverId, initial.sessionName);
+    const entry = remembered
+      ? findRememberedSharedEntry(sharedEntries, remembered)
+      : findSharedEntryForHash(sharedEntries, initial.serverId, initial.sessionName);
     if (!entry) {
+      if (remembered) clearSharedTabRestoreMarker();
       setSharedHashRestorePending(false);
       return;
     }
@@ -4438,6 +4454,7 @@ export function App() {
     localStorage.removeItem('rcc_server');
     localStorage.removeItem('rcc_server_name');
     localStorage.removeItem('rcc_session');
+    clearSharedTabRestoreMarker();
     clearMessagePinsCache();
     clearMessagePinNavigation();
     configureExpectedUserId(null);
@@ -4468,6 +4485,7 @@ export function App() {
     autoEntryRunRef.current++;
     setManualDashboard(false);
     setSelectedShareTarget(null);
+    clearSharedTabRestoreMarker();
     setShowSharedReturnGuide(false);
     // Save current active session for the server we're leaving
     const prevServer = localStorage.getItem('rcc_server');
@@ -4651,6 +4669,7 @@ export function App() {
     localStorage.removeItem('rcc_server');
     localStorage.removeItem('rcc_server_name');
     localStorage.removeItem('rcc_session');
+    clearSharedTabRestoreMarker();
     setSelectedServerId(null);
     setSelectedServerName(null);
     setSelectedShareTarget(null);

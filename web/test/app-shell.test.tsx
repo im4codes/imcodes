@@ -2683,6 +2683,13 @@ describe('App shell', () => {
     fireEvent.click(entryLabel.closest('button')!);
 
     await waitFor(() => expect(openSharedEntryMock).toHaveBeenCalledWith(sharedEntry.target));
+    const { readSharedTabRestoreMarker } = await import('../src/shared-tab-restore.js');
+    expect(readSharedTabRestoreMarker()).toEqual({
+      version: 1,
+      entryId: 'share-1',
+      serverId: 'srv-shared',
+      targetKey: 'main:srv-shared:deck_beta_brain',
+    });
     const sharedPane = await screen.findByTestId('session-pane-deck_beta_brain');
     expect(sharedPane.getAttribute('data-active-dispatch-id')).toBe('dispatch-open-1');
     await waitFor(() => expect(wsInstances.length).toBeGreaterThan(ownServerWsCount));
@@ -2777,6 +2784,88 @@ describe('App shell', () => {
       expect(wsInstances.some((instance) => instance.options?.shareTarget === sharedEntry.target)).toBe(true);
     });
     expect(apiFetchMock).not.toHaveBeenCalledWith('/api/server/srv-shared/sessions', expect.anything());
+  }, 20_000);
+
+  it('restores the exact shared tab after refresh even when its server is also in the server list', async () => {
+    history.replaceState(null, '', '/#/srv-shared/deck_beta_brain');
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-shared');
+    localStorage.setItem('rcc_server_name', 'Shared Server');
+    localStorage.setItem('rcc_session', 'deck_beta_brain');
+    const sharedEntry = {
+      id: 'share-refresh-exact',
+      serverId: 'srv-shared',
+      serverName: 'Shared Server',
+      role: 'participant',
+      status: 'active',
+      targetLabel: 'Shared Beta',
+      target: { kind: 'main', serverId: 'srv-shared', sessionName: 'deck_beta_brain' },
+    } as const;
+    const otherEntry = {
+      id: 'share-refresh-server',
+      serverId: 'srv-shared',
+      serverName: 'Shared Server',
+      role: 'viewer',
+      status: 'active',
+      targetLabel: 'Whole Shared Server',
+      target: { kind: 'server', serverId: 'srv-shared' },
+    } as const;
+    const { rememberSharedTab } = await import('../src/shared-tab-restore.js');
+    rememberSharedTab(sharedEntry);
+    discoverSharedEntriesMock.mockResolvedValue([otherEntry, sharedEntry]);
+    openSharedEntryMock.mockResolvedValue({
+      server: { id: 'srv-shared', name: 'Shared Server', status: 'online', lastHeartbeatAt: Date.now() },
+      target: sharedEntry.target,
+      coverage: {
+        effectiveRole: 'participant',
+        historyCutoffAt: 0,
+        nextCoverageRecheckAt: null,
+        coveringShareIds: ['share-refresh-exact'],
+        primaryShareId: 'share-refresh-exact',
+        authorizedAt: Date.now(),
+      },
+      sessions: [{
+        sessionName: 'deck_beta_brain',
+        title: 'Shared Beta',
+        state: 'running',
+        agentType: 'codex-sdk',
+        activeDispatchId: 'dispatch-refresh-exact',
+      }],
+      subSessions: [],
+    });
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') return { id: 'user-1' };
+      if (path === '/api/server') {
+        return {
+          servers: [
+            ...serverList().servers,
+            {
+              id: 'srv-shared',
+              name: 'Shared Server',
+              status: 'online',
+              lastHeartbeatAt: Date.now(),
+              createdAt: Date.now(),
+              daemonVersion: '2026.8.24',
+            },
+          ],
+        };
+      }
+      if (path.startsWith('/api/watch/sessions')) return { sessions: [] };
+      if (path === '/api/server/srv-shared/sessions') return sessionList();
+      return {};
+    });
+
+    const { App } = await importApp();
+    render(<App />);
+
+    await waitFor(() => expect(openSharedEntryMock).toHaveBeenCalledTimes(1));
+    expect(openSharedEntryMock).toHaveBeenCalledWith(sharedEntry.target);
+    expect(await screen.findByTestId('session-pane-deck_beta_brain')).toBeTruthy();
+    expect(screen.queryByTestId('session-pane-deck_alpha_brain')).toBeNull();
+    expect(apiFetchMock).not.toHaveBeenCalledWith('/api/server/srv-shared/sessions', expect.anything());
+    await waitFor(() => {
+      expect(wsInstances.some((instance) => instance.options?.shareTarget === sharedEntry.target)).toBe(true);
+    });
   }, 20_000);
 
   it('does not wait for shared-entry discovery when the hash points to an owned server', async () => {
