@@ -3,7 +3,11 @@ import { createHash } from 'node:crypto';
 import { createSendDispatchId, createSendMessageId, type SendDispatchId, type SendMessageId } from '../../shared/send-message-id.js';
 import { IMCODES_SEND_MCP_DISPATCH_FEATURE_FLAG } from '../../shared/imcodes-send.js';
 import { MCP_ERROR_REASONS, type MCPErrorReason } from '../../shared/memory-mcp-errors.js';
-import { MEMORY_MCP_CAPS } from '../../shared/memory-mcp-contracts.js';
+import {
+  MEMORY_MCP_CAPS,
+  MEMORY_MCP_SEND_DELIVERY_MODES,
+  type MemoryMcpSendDeliveryMode,
+} from '../../shared/memory-mcp-contracts.js';
 import { sanitizeMcpErrorMessage } from '../../shared/mcp-error-sanitize.js';
 import { isDiscoverableInterAgentSession, resolveEffectiveProjectName, resolveRuntimeScope } from '../../shared/session-scope.js';
 import {
@@ -38,7 +42,6 @@ import {
   createDelegationReplyAuthority,
   expireDelegationReplyAuthority,
 } from './delegation-reply-authority.js';
-import { timelineEmitter } from './timeline-emitter.js';
 import { buildServerMemberSharedActorOption as buildSharedServerMemberSharedActorOption, buildSessionDispatchMessage, dispatchSessionMessage, type SessionDispatchMessageResult, type SessionDispatchOptions } from './session-dispatch.js';
 
 export const SEND_MCP_DISPATCH_FEATURE_FLAG = IMCODES_SEND_MCP_DISPATCH_FEATURE_FLAG;
@@ -159,6 +162,8 @@ export interface HookSendDispatchInput {
   files?: string[];
   projectRoot?: string | null;
   reply?: boolean;
+  /** Internal MCP path only: prefer native append, retain FIFO fallback. */
+  deliveryMode?: MemoryMcpSendDeliveryMode;
 }
 
 export interface HookSendDispatchResult {
@@ -480,6 +485,7 @@ export async function dispatchSendMessage(
       await d.dispatchMessage(target, message, {
         dispatchId,
         messageId,
+        deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND,
         ...buildSharedServerMemberSharedActorOption(caller, callerRecord, target, messageId, now),
       });
       deliveries.push({
@@ -896,6 +902,9 @@ export async function dispatchHookSend(input: HookSendDispatchInput, deps?: Send
       const result = await d.dispatchMessage(target, message, {
         dispatchId,
         messageId,
+        ...(input.deliveryMode === MEMORY_MCP_SEND_DELIVERY_MODES.APPEND
+          ? { deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND }
+          : {}),
         ...buildSharedServerMemberSharedActorOption(
           {
             userId: input.from,

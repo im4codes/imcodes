@@ -19,6 +19,10 @@ import {
   type DelegationContextStatus,
 } from '../../shared/agent-delegation.js';
 import { sanitizeMcpErrorMessage } from '../../shared/mcp-error-sanitize.js';
+import {
+  MEMORY_MCP_SEND_DELIVERY_MODES,
+  type MemoryMcpSendDeliveryMode,
+} from '../../shared/memory-mcp-contracts.js';
 import { redactSensitiveText } from '../../shared/redact-secrets.js';
 import { EXECUTION_CLONE_KIND } from '../../shared/execution-clone.js';
 import { isValidImcodesSessionName, resolveEffectiveProjectName, resolveRuntimeScope } from '../../shared/session-scope.js';
@@ -47,6 +51,8 @@ export interface SessionDispatchMessageOptions {
   dispatchId: SendDispatchId;
   messageId: SendMessageId;
   sharedActor?: SharedActorEnvelope;
+  /** Node MCP send_message: prefer provider-native append before FIFO. */
+  deliveryMode?: MemoryMcpSendDeliveryMode;
 }
 
 export type SessionDispatchOptions = SessionDispatchMessageOptions;
@@ -181,6 +187,42 @@ export async function dispatchSessionMessage(
       // the eventual single user.message projection.
       void ensureTransportRuntimeForPendingResend(target.name);
       return 'queued';
+    }
+    if (options.deliveryMode === MEMORY_MCP_SEND_DELIVERY_MODES.APPEND) {
+      const result = await runtime.appendExternalMessageToActiveTurn(
+        message,
+        options.messageId,
+      );
+      if (result !== 'sent' && result !== 'appended') {
+        // Unsupported providers and active-turn races retain the old durable
+        // delivery guarantee. Prefer append, but never drop a peer message.
+        const fallback = options.sharedActor
+          ? runtime.send(message, options.messageId, undefined, undefined, {
+              sharedActor: options.sharedActor,
+            })
+          : runtime.send(message, options.messageId);
+        if (fallback === 'sent') {
+          emitStructuredTransportUserMessage(
+            target.name,
+            message,
+            options.messageId,
+            options.sharedActor,
+          );
+        } else {
+          timelineEmitter.emit(target.name, 'session.state', {
+            state: 'queued',
+            ...buildTransportQueueSnapshotPayload(target.name, 'send_tool_append_fallback'),
+          }, { source: 'daemon', confidence: 'high' });
+        }
+        return fallback;
+      }
+      emitStructuredTransportUserMessage(
+        target.name,
+        message,
+        options.messageId,
+        options.sharedActor,
+      );
+      return 'sent';
     }
     const result = options.sharedActor
       ? runtime.send(message, options.messageId, undefined, undefined, { sharedActor: options.sharedActor })

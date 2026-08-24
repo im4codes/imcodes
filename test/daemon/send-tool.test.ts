@@ -122,6 +122,7 @@ describe('send-tool', () => {
     expect(result.deliveries).toHaveLength(1);
     expect(dispatchMessage).toHaveBeenCalledTimes(1);
     expect(dispatchMessage.mock.calls[0][1]).toBe('hello');
+    expect(dispatchMessage.mock.calls[0][2]).toMatchObject({ deliveryMode: 'append' });
   });
 
   it('send_stop force-stops a resolved sibling via cancelSession', async () => {

@@ -329,6 +329,7 @@ describe('memory MCP stdio server', () => {
         to: 'deck_sub_peer',
         message: 'hello from stdio mcp',
         depth: 0,
+        deliveryMode: 'append',
       }]);
 
       await writeSessionStore(home, { includeLatePeer: true });
@@ -572,6 +573,7 @@ describe('memory MCP stdio server', () => {
         to: 'deck_sub_peer',
         message: 'hello after transient empty store',
         depth: 0,
+        deliveryMode: 'append',
       }]);
     } finally {
       await client.close();

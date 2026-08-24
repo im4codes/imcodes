@@ -483,6 +483,37 @@ describe('TransportSessionRuntime', () => {
     }
   });
 
+  it('directly appends an external MCP message without creating a pending queue row', async () => {
+    mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
+    mock.provider.notifyActiveDelegation = vi.fn().mockResolvedValue(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    runtime.send('foreground work', 'foreground-mcp-append');
+    await flushDispatch();
+
+    const result = await runtime.appendExternalMessageToActiveTurn('peer update', 'send_message_peer_1');
+
+    expect(result).toBe('appended');
+    expect(mock.provider.notifyActiveDelegation).toHaveBeenCalledWith('sess-1', {
+      notificationId: 'send_message_peer_1',
+      delegationId: 'mcp-append:send_message_peer_1',
+      sourceSessionName: 'deck_test_brain',
+      text: 'peer update',
+      deliveryKind: PROVIDER_ACTIVE_TURN_DELIVERY_KINDS.MCP_MESSAGE,
+    });
+    expect(runtime.pendingEntries).toEqual([]);
+    expect(getTransportQueueStore().readSnapshot('deck_test_brain').pendingMessageEntries).toEqual([]);
+  });
+
+  it('fails an unsupported external MCP append without falling back to the FIFO', async () => {
+    mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.UNSUPPORTED;
+    runtime.send('foreground work', 'foreground-mcp-unsupported');
+    await flushDispatch();
+
+    await expect(runtime.appendExternalMessageToActiveTurn('peer update', 'send_message_peer_2'))
+      .resolves.toBe('unsupported');
+    expect(runtime.pendingEntries).toEqual([]);
+    expect(getTransportQueueStore().readSnapshot('deck_test_brain').pendingMessageEntries).toEqual([]);
+  });
+
   it('keeps queued messages intact when active-turn append is unsupported', async () => {
     mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.UNSUPPORTED;
     runtime.send('foreground work', 'foreground-unsupported');

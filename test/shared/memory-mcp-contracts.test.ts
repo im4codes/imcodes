@@ -108,6 +108,8 @@ describe('memory MCP shared contracts', () => {
     expect(sendMessage.description).toContain('empty send_list_targets result');
     expect(sendMessage.description).toContain('asking a CC session to audit');
     expect(sendMessage.description).toContain('does not start a structured Team/P2P discussion run');
+    expect(sendMessage.description).toContain('direct non-preemptive append');
+    expect(sendMessage.description).toContain('retain delivery through the ordinary durable queue');
 
     const sendListQuery = sendList.inputSchema.properties?.query as { description?: string } | undefined;
     const sendMessageText = sendMessage.inputSchema.properties?.message as { description?: string } | undefined;

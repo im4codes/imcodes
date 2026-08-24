@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { SessionRecord } from '../../src/store/session-store.js';
 
 const sendMock = vi.fn();
+const appendExternalMock = vi.fn();
 const removeMock = vi.fn();
 const processSendMock = vi.fn();
 const injectPrivateMock = vi.fn();
@@ -64,6 +65,7 @@ function target(patch: Partial<SessionRecord> = {}): SessionRecord {
 describe('peer-audit dedicated dispatch', () => {
   beforeEach(() => {
     sendMock.mockReset();
+    appendExternalMock.mockReset();
     removeMock.mockReset();
     processSendMock.mockReset();
     injectPrivateMock.mockReset();
@@ -72,6 +74,7 @@ describe('peer-audit dedicated dispatch', () => {
     getTransportRuntimeMock.mockReturnValue({
       providerSessionId: 'provider_session_1',
       send: sendMock,
+      appendExternalMessageToActiveTurn: appendExternalMock,
       removePendingMessage: removeMock,
     });
     ensureTransportRuntimeForPendingResendMock.mockReset();
@@ -182,6 +185,50 @@ describe('peer-audit dedicated dispatch', () => {
       .resolves.toBeUndefined();
     expect(processSendMock).toHaveBeenCalledWith('deck_sub_audit123', 'process external message');
     expect(sendMock).not.toHaveBeenCalled();
+  });
+
+  it('appends MCP-mode transport messages directly and never touches the resend FIFO', async () => {
+    appendExternalMock.mockResolvedValue('appended');
+
+    await expect(dispatchSessionMessage(target(), 'peer update', {
+      dispatchId: 'send_dispatch_12345678' as never,
+      messageId: 'send_message_12345678' as never,
+      deliveryMode: 'append',
+    })).resolves.toBe('sent');
+
+    expect(appendExternalMock).toHaveBeenCalledWith('peer update', 'send_message_12345678');
+    expect(sendMock).not.toHaveBeenCalled();
+    expect(enqueueResendMock).not.toHaveBeenCalled();
+  });
+
+  it('durably queues MCP delivery when the transport runtime is unavailable', async () => {
+    getTransportRuntimeMock.mockReturnValueOnce(undefined);
+
+    await expect(dispatchSessionMessage(target(), 'peer update', {
+      dispatchId: 'send_dispatch_12345678' as never,
+      messageId: 'send_message_12345678' as never,
+      deliveryMode: 'append',
+    })).resolves.toBe('queued');
+
+    expect(enqueueResendMock).toHaveBeenCalledWith('deck_sub_audit123', expect.objectContaining({
+      text: 'peer update',
+      clientMessageId: 'send_message_12345678',
+    }));
+    expect(ensureTransportRuntimeForPendingResendMock).toHaveBeenCalledWith('deck_sub_audit123');
+  });
+
+  it('falls back to the durable runtime FIFO when native append is unsupported', async () => {
+    appendExternalMock.mockResolvedValue('unsupported');
+    sendMock.mockReturnValue('queued');
+
+    await expect(dispatchSessionMessage(target(), 'peer update', {
+      dispatchId: 'send_dispatch_12345678' as never,
+      messageId: 'send_message_12345678' as never,
+      deliveryMode: 'append',
+    })).resolves.toBe('queued');
+
+    expect(appendExternalMock).toHaveBeenCalledOnce();
+    expect(sendMock).toHaveBeenCalledWith('peer update', 'send_message_12345678');
   });
 
   it('durably queues a named transport send while its runtime is still restoring', async () => {

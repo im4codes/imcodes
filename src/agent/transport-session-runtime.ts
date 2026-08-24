@@ -137,6 +137,8 @@ export interface PendingTransportMessage {
   };
 }
 
+export type ExternalAppendResult = 'sent' | 'appended' | 'stale' | 'unsupported';
+
 export type AppendQueuedMessagesResult =
   | {
       status: 'delivered';
@@ -1915,6 +1917,55 @@ export class TransportSessionRuntime implements SessionRuntime {
       throw err;
     }
     return 'sent';
+  }
+
+  /**
+   * Deliver one node-to-node MCP message without entering IM.codes' ordinary
+   * pending FIFO. An idle target starts a normal turn; a busy target uses the
+   * provider's native next-boundary/steer primitive. Providers that cannot
+   * append return `unsupported`; the dispatch boundary then preserves the
+   * message through the ordinary durable FIFO.
+   */
+  async appendExternalMessageToActiveTurn(
+    message: string,
+    clientMessageId: string,
+  ): Promise<ExternalAppendResult> {
+    if (!this._providerSessionId) return 'stale';
+    if (!this.hasActiveTurnWork()) {
+      return this.send(message, clientMessageId) === 'sent' ? 'sent' : 'stale';
+    }
+    if (this.provider.capabilities.activeDelegationNotification
+        !== AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE
+      || !this.provider.notifyActiveDelegation) {
+      return 'unsupported';
+    }
+    const outcome = await withTimeoutOutcome(
+      this.provider.notifyActiveDelegation(this._providerSessionId, {
+        notificationId: clientMessageId,
+        delegationId: `mcp-append:${clientMessageId}`,
+        sourceSessionName: this.sessionKey,
+        text: message,
+        deliveryKind: PROVIDER_ACTIVE_TURN_DELIVERY_KINDS.MCP_MESSAGE,
+      }),
+      DEFAULT_ACTIVE_DELEGATION_NOTIFICATION_TIMEOUT_MS,
+    );
+    if (outcome.timedOut) return 'stale';
+    if (outcome.value === AGENT_DELEGATION_NOTIFICATION_RESULTS.UNSUPPORTED) {
+      return 'unsupported';
+    }
+    if (outcome.value !== AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED) {
+      return 'stale';
+    }
+    this._history.push({
+      id: randomUUID(),
+      sessionId: this._providerSessionId,
+      kind: 'text',
+      role: 'user',
+      content: message,
+      timestamp: Date.now(),
+      status: 'complete',
+    });
+    return 'appended';
   }
 
   /**

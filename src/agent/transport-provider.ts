@@ -83,6 +83,8 @@ export const PROVIDER_CANCEL_ORIGINS = {
 export const PROVIDER_ACTIVE_TURN_DELIVERY_KINDS = {
   DELEGATION_REPLY: 'delegation_reply',
   QUEUED_MESSAGE: 'queued_message',
+  /** Direct node-to-node MCP append; never entered the ordinary pending FIFO. */
+  MCP_MESSAGE: 'mcp_message',
 } as const;
 
 // ── Derived types ───────────────────────────────────────────────────────────

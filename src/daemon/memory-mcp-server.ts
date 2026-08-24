@@ -28,6 +28,7 @@ import {
 } from '../../shared/capability-management.js';
 import { isMemoryScope, validateMemoryScopeIdentity } from '../../shared/memory-scope.js';
 import type { ContextNamespace } from '../../shared/context-types.js';
+import { MEMORY_MCP_SEND_DELIVERY_MODES } from '../../shared/memory-mcp-contracts.js';
 
 export interface MemoryMcpServerOptions {
   env?: Record<string, string | undefined>;
@@ -235,7 +236,7 @@ export function mergeDefaultToolDeps(caller: McpRuntimeCaller, toolDeps: MemoryM
       // POST the daemon hook /send default.
       dispatchMessage:
         toolDeps.sendDeps?.dispatchMessage
-        ?? (async (target: SessionRecord, message: string) => {
+        ?? (async (target: SessionRecord, message: string, options) => {
           const port = await resolveLiveHookPort();
           if (!port) throw new Error('daemon hook server is unavailable');
           if (!caller.sessionName) throw new Error('send_message requires a scoped caller');
@@ -244,6 +245,9 @@ export function mergeDefaultToolDeps(caller: McpRuntimeCaller, toolDeps: MemoryM
             to: target.name,
             message,
             depth: 0,
+            ...(options.deliveryMode === MEMORY_MCP_SEND_DELIVERY_MODES.APPEND
+              ? { deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND }
+              : {}),
           });
         }),
       // Per-field default: an injected `cancelSession` (tests) wins; otherwise

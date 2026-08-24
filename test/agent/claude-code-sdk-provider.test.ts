@@ -179,7 +179,10 @@ describe('ClaudeCodeSdkProvider', () => {
     await sendPromise;
   });
 
-  it('inserts an appended message at Claude\'s next safe boundary instead of preempting it', async () => {
+  it.each([
+    PROVIDER_ACTIVE_TURN_DELIVERY_KINDS.QUEUED_MESSAGE,
+    PROVIDER_ACTIVE_TURN_DELIVERY_KINDS.MCP_MESSAGE,
+  ])('inserts %s at Claude\'s next safe boundary instead of preempting it', async (deliveryKind) => {
     sdkMock.setWaitForClose(true);
     const provider = new ClaudeCodeSdkProvider();
     await provider.connect({ binaryPath: 'claude' });
@@ -196,7 +199,7 @@ describe('ClaudeCodeSdkProvider', () => {
       delegationId: 'queue-append:queued_notification_identity',
       sourceSessionName: 'deck_project_brain',
       text: 'append at the next safe boundary',
-      deliveryKind: PROVIDER_ACTIVE_TURN_DELIVERY_KINDS.QUEUED_MESSAGE,
+      deliveryKind,
     });
 
     expect(result).toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);

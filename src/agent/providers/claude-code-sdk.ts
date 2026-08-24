@@ -791,8 +791,9 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     // human-authored when it drained and "not from the user" when it was
     // appended. Only genuine runtime notifications (delegation replies, peer
     // audits) are synthetic peer input.
-    const isQueuedUserMessage = notification.deliveryKind
-      === PROVIDER_ACTIVE_TURN_DELIVERY_KINDS.QUEUED_MESSAGE;
+    const isHumanAppendedMessage = notification.deliveryKind
+      === PROVIDER_ACTIVE_TURN_DELIVERY_KINDS.QUEUED_MESSAGE
+      || notification.deliveryKind === PROVIDER_ACTIVE_TURN_DELIVERY_KINDS.MCP_MESSAGE;
     state.inputQueue.push({
       type: 'user',
       message: { role: 'user', content: notification.text },
@@ -804,7 +805,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       // `next` is still injected into the active query after its current tool
       // result — it does not wait for the normal idle FIFO to drain.
       priority: CLAUDE_SDK_INPUT_PRIORITIES.NEXT_SAFE_BOUNDARY,
-      origin: isQueuedUserMessage
+      origin: isHumanAppendedMessage
         ? { kind: 'human' }
         : {
           kind: 'peer',
@@ -812,7 +813,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
           name: notification.delegationId,
         },
       shouldQuery: true,
-      ...(isQueuedUserMessage ? {} : { isSynthetic: true }),
+      ...(isHumanAppendedMessage ? {} : { isSynthetic: true }),
     } as SDKUserMessage);
     return AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED;
   }

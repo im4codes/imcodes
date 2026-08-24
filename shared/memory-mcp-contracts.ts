@@ -81,6 +81,14 @@ export const MEMORY_MCP_TOOL_NAMES = {
   COMPUTER_USE_CALL: 'computer_use_call',
 } as const;
 
+/** Internal daemon delivery policy selected by the trusted send_message MCP bridge. */
+export const MEMORY_MCP_SEND_DELIVERY_MODES = {
+  APPEND: 'append',
+} as const;
+
+export type MemoryMcpSendDeliveryMode =
+  typeof MEMORY_MCP_SEND_DELIVERY_MODES[keyof typeof MEMORY_MCP_SEND_DELIVERY_MODES];
+
 export type MemoryMcpToolName = (typeof MEMORY_MCP_TOOL_NAMES)[keyof typeof MEMORY_MCP_TOOL_NAMES];
 
 export const MEMORY_MCP_TOOL_NAME_LIST = [
@@ -414,7 +422,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   },
   [MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE]: {
     name: MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE,
-    description: 'Send a plain-text request to an exact send_list_targets target, for example asking a CC session to audit. The caller session is not a valid target; an empty send_list_targets result means none exists. It does not start a structured Team/P2P discussion run. Files are project-root path references, not bytes. Returns dispatch/message ids and delivery status.',
+    description: 'Send a plain-text request to an exact send_list_targets target, for example asking a CC session to audit. The caller session is not a valid target; an empty send_list_targets result means none exists. A busy compatible provider receives the message by direct non-preemptive append at its next safe boundary; unsupported, racing, or temporarily unready targets retain delivery through the ordinary durable queue. It does not start a structured Team/P2P discussion run. Files are project-root path references, not bytes. Returns dispatch/message ids and delivery status.',
     inputSchema: objectSchema({
       target: stringSchema('Required exact target session value. For an ordinary peer, use the exact send_list_targets.target value. For a follow-up to an execution clone you created, use the exact result.clone.target from the originating clone send — execution clones are NOT returned by send_list_targets and only their creator may address them. Always use the exact target name; never a label or agentType value.'),
       message: stringSchema(`Required complete task/request text to deliver, up to ${MEMORY_MCP_CAPS.SEND_MESSAGE_MAX_BYTES} UTF-8 bytes. Include the desired role and output, such as audit findings, discussion input, plan, implementation request, or verification result.`),
@@ -452,7 +460,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   },
   [MEMORY_MCP_TOOL_NAMES.SEND_STOP]: {
     name: MEMORY_MCP_TOOL_NAMES.SEND_STOP,
-    description: 'Immediately stop a sibling\'s active turn using its exact target; unlike send_message, this bypasses its queue. Use for stuck or wrong work. The caller is invalid. Queued user messages remain; only the active turn is interrupted.',
+    description: 'Immediately stop a sibling\'s active turn using its exact target. Use for stuck or wrong work. The caller is invalid. Existing queued user messages remain; only the active turn is interrupted.',
     inputSchema: objectSchema({
       target: stringSchema('Exact target session value. Required unless broadcast is true. For an ordinary peer, use the exact send_list_targets.target value. To stop an execution clone you created, use the exact result.clone.target from the originating clone send — execution clones are NOT returned by send_list_targets and only their creator may stop them. Always use the exact target name; never a label or agentType value.'),
       broadcast: booleanSchema('Optional project-scoped request to stop every sendable sibling session; unavailable for unscoped callers.'),
