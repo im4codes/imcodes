@@ -52,6 +52,11 @@
   gap: 4px;
 }
 
+.remote-desktop-workspace-actions {
+  flex: 0 0 auto;
+  margin-left: auto;
+}
+
 .remote-desktop-workspace-tabbar > [role="tablist"] {
   min-width: 0;
   overflow-x: auto;
@@ -168,6 +173,16 @@
   color: #7899ad;
   background: linear-gradient(180deg, rgb(20 43 66 / 78%), rgb(8 21 36 / 88%));
   cursor: pointer;
+}
+
+.remote-desktop-workspace-tab-close svg {
+  display: block;
+  width: 16px;
+  height: 16px;
+  fill: none;
+  stroke: currentcolor;
+  stroke-width: 2;
+  stroke-linecap: round;
 }
 
 .remote-desktop-workspace-tab-close:hover,
@@ -463,6 +478,14 @@
   min-height: 0;
 }
 
+/* The panel's author-level `display:flex` otherwise overrides the browser's
+   built-in `[hidden]` rule and turns tabs into an accidental split view. Keep
+   every connection presentation mounted, but paint exactly the active tab. */
+.remote-desktop-workspace > .remote-desktop-panel[hidden],
+.remote-desktop-workspace-window[hidden] {
+  display: none !important;
+}
+
 .remote-desktop-workspace-mobile-selector {
   display: none;
 }
@@ -479,20 +502,30 @@
   }
 
   .remote-desktop-workspace-tabbar > [role="tablist"] {
-    display: none;
-  }
-
-  .remote-desktop-workspace-mobile-selector {
     display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 8px 12px;
-    border-bottom: 1px solid var(--chrome-line-soft);
+    min-width: 0;
+    flex: 1 1 auto;
+    overflow-x: auto;
   }
 
-  .remote-desktop-workspace-mobile-selector select {
-    min-width: 0;
-    flex: 1;
+  .remote-desktop-workspace-tabbar {
+    gap: 4px;
+    padding: 6px;
+  }
+
+  .remote-desktop-workspace-host-tab {
+    flex: 0 0 auto;
+  }
+
+  .remote-desktop-workspace-host-tab .remote-desktop-workspace-tab {
+    max-width: 132px;
+    overflow: hidden;
+    padding-inline: 9px;
+    text-overflow: ellipsis;
+  }
+
+  .remote-desktop-workspace-actions {
+    margin-left: 0;
   }
 
 }

@@ -1,4 +1,6 @@
 /** @vitest-environment jsdom */
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/preact';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { ComponentChildren } from 'preact';
@@ -44,7 +46,11 @@ vi.mock('../src/components/RemoteDesktopPanel.js', () => ({
     machine: { serverId: string };
     active: boolean;
     inputActive: boolean;
-  }) => <div data-testid={`panel-${machine.serverId}`}>{String(active)}:{String(inputActive)}</div>,
+  }) => (
+    <div data-testid={`panel-${machine.serverId}`} hidden={!active}>
+      {String(active)}:{String(inputActive)}
+    </div>
+  ),
 }));
 
 import type { RemoteDesktopConnectionManager } from '../src/remote-desktop-connection-manager.js';
@@ -53,6 +59,12 @@ import {
   createRemoteDesktopWorkspaceState,
   openRemoteDesktopWorkspaceHost,
 } from '../src/remote-desktop-workspace-state.js';
+
+const workspaceCss = readFileSync(
+  resolve(__dirname, '../src/components/remote-desktop-workspace.css'),
+  'utf8',
+);
+const originalConfirm = window.confirm;
 
 function machine(serverId: string) {
   return {
@@ -82,6 +94,7 @@ function setupManager() {
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
+  window.confirm = originalConfirm;
 });
 
 api.getRemoteDesktopWall.mockResolvedValue({ revision: 0, layout: 'grid', hostIds: [], hosts: [] });
@@ -106,6 +119,9 @@ describe('RemoteDesktopWorkspace', () => {
 
     expect(screen.getByTestId('panel-a').textContent).toBe('false:false');
     expect(screen.getByTestId('panel-b').textContent).toBe('true:true');
+    expect((screen.getByTestId('panel-a') as HTMLElement).hidden).toBe(true);
+    expect((screen.getByTestId('panel-b') as HTMLElement).hidden).toBe(false);
+    expect(workspaceCss).toMatch(/\.remote-desktop-workspace\s*>\s*\.remote-desktop-panel\[hidden\][\s\S]*display:\s*none\s*!important/);
     fireEvent.keyDown(screen.getByRole('tab', { name: 'B' }), { key: 'ArrowLeft' });
     expect(events).toEqual(['release:a', 'activate:a']);
     fireEvent.keyDown(screen.getByRole('tab', { name: 'B' }), { key: 'ArrowLeft', altKey: true });
@@ -131,6 +147,75 @@ describe('RemoteDesktopWorkspace', () => {
     fireEvent.click(screen.getByRole('button', { name: 'remote_desktop.workspace_close_tab:B' }));
     expect(events).toEqual(['stop:b']);
     expect(closeHost).toHaveBeenCalledWith('b');
+    const closeIcon = screen.getByRole('button', { name: 'remote_desktop.workspace_close_tab:A' })
+      .querySelector('svg');
+    expect(closeIcon?.getAttribute('width')).toBe('16');
+    expect(closeIcon?.getAttribute('height')).toBe('16');
+  });
+
+  it('keeps minimize separate from close and confirms closing multiple tabs', () => {
+    let state = createRemoteDesktopWorkspaceState();
+    state = openRemoteDesktopWorkspaceHost(state, machine('a'));
+    state = openRemoteDesktopWorkspaceHost(state, machine('b'));
+    const { manager } = setupManager();
+    const minimize = vi.fn();
+    const restore = vi.fn();
+    const closeWorkspace = vi.fn();
+    const confirm = vi.fn(() => false);
+    window.confirm = confirm;
+    const props = {
+      state,
+      manager,
+      onOpenHost: vi.fn(),
+      onActivateTab: vi.fn(),
+      onCloseHost: vi.fn(),
+      onReorderHost: vi.fn(),
+      onCloseWorkspace: closeWorkspace,
+      onMinimize: minimize,
+      onRestore: restore,
+    };
+    const result = render(<RemoteDesktopWorkspace {...props} />);
+
+    fireEvent.click(screen.getByRole('button', { name: 'window.minimize' }));
+    expect(minimize).toHaveBeenCalledTimes(1);
+    expect(manager.stop).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole('button', { name: 'remote_desktop.workspace_close' }));
+    expect(confirm).toHaveBeenCalledWith('remote_desktop.workspace_close_confirm:2');
+    expect(manager.stop).not.toHaveBeenCalled();
+    expect(closeWorkspace).not.toHaveBeenCalled();
+
+    confirm.mockReturnValue(true);
+    fireEvent.click(screen.getByRole('button', { name: 'remote_desktop.workspace_close' }));
+    expect(manager.stop).toHaveBeenCalledTimes(2);
+    expect(closeWorkspace).toHaveBeenCalledTimes(1);
+
+    result.rerender(<RemoteDesktopWorkspace {...props} minimized />);
+    const dock = screen.getByRole('button', { name: 'remote_desktop.workspace_restore:2' });
+    fireEvent.click(dock);
+    expect(restore).toHaveBeenCalledTimes(1);
+  });
+
+  it('closes a single-tab workspace without an unnecessary confirmation', () => {
+    const state = openRemoteDesktopWorkspaceHost(createRemoteDesktopWorkspaceState(), machine('a'));
+    const { manager } = setupManager();
+    const confirm = vi.fn(() => false);
+    window.confirm = confirm;
+    const closeWorkspace = vi.fn();
+    render(<RemoteDesktopWorkspace
+      state={state}
+      manager={manager}
+      onOpenHost={vi.fn()}
+      onActivateTab={vi.fn()}
+      onCloseHost={vi.fn()}
+      onReorderHost={vi.fn()}
+      onCloseWorkspace={closeWorkspace}
+    />);
+
+    fireEvent.click(screen.getByRole('button', { name: 'remote_desktop.workspace_close' }));
+    expect(confirm).not.toHaveBeenCalled();
+    expect(manager.stop).toHaveBeenCalledTimes(1);
+    expect(closeWorkspace).toHaveBeenCalledTimes(1);
   });
 
   it('keeps the sole manager owner alive when closing a tab still represented on the wall', async () => {

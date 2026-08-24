@@ -1795,6 +1795,7 @@ export function App() {
   const [remoteDesktopWorkspace, setRemoteDesktopWorkspace] = useState(
     createRemoteDesktopWorkspaceState,
   );
+  const [remoteDesktopWorkspaceMinimized, setRemoteDesktopWorkspaceMinimized] = useState(false);
   const [remoteDesktopWallOpen, setRemoteDesktopWallOpen] = useState(false);
   const [remoteDesktopWallMinimized, setRemoteDesktopWallMinimized] = useState(false);
   const [remoteDesktopWallHostKeys, setRemoteDesktopWallHostKeys] = useState<readonly string[]>([]);
@@ -1816,6 +1817,7 @@ export function App() {
 
   const openRemoteDesktop = useCallback((machine: MachineListItem) => {
     setRemoteDesktopWorkspace((current) => openRemoteDesktopWorkspaceHost(current, machine));
+    setRemoteDesktopWorkspaceMinimized(false);
     ensureDesktopWindow(REMOTE_DESKTOP_WORKSPACE_WINDOW_ID, {
       kind: DESKTOP_WINDOW_KINDS.remoteDesktop,
     }, { bringToFront: true });
@@ -1848,6 +1850,7 @@ export function App() {
     if (auth) return;
     remoteDesktopConnectionManager.stopAll();
     setRemoteDesktopWorkspace(createRemoteDesktopWorkspaceState());
+    setRemoteDesktopWorkspaceMinimized(false);
     setRemoteDesktopWallOpen(false);
     setRemoteDesktopWallHostKeys([]);
     removeDesktopWindow(REMOTE_DESKTOP_WORKSPACE_WINDOW_ID);
@@ -6465,6 +6468,7 @@ export function App() {
           state={remoteDesktopWorkspace}
           manager={remoteDesktopConnectionManager}
           ws={wsRef.current}
+          minimized={remoteDesktopWorkspaceMinimized}
           zIndex={getDesktopWindowZIndex(
             REMOTE_DESKTOP_WORKSPACE_WINDOW_ID,
             5110,
@@ -6478,15 +6482,21 @@ export function App() {
           ))}
           onCloseHost={(hostKey) => setRemoteDesktopWorkspace((current) => {
             const next = closeRemoteDesktopWorkspaceHost(current, hostKey);
-            if (!next.open) removeDesktopWindow(REMOTE_DESKTOP_WORKSPACE_WINDOW_ID);
+            if (!next.open) {
+              setRemoteDesktopWorkspaceMinimized(false);
+              removeDesktopWindow(REMOTE_DESKTOP_WORKSPACE_WINDOW_ID);
+            }
             return next;
           })}
           onReorderHost={(hostKey, direction) => setRemoteDesktopWorkspace((current) => (
             reorderRemoteDesktopWorkspaceHost(current, hostKey, direction)
           ))}
+          onMinimize={() => setRemoteDesktopWorkspaceMinimized(true)}
+          onRestore={() => setRemoteDesktopWorkspaceMinimized(false)}
           onCloseWorkspace={() => {
             removeDesktopWindow(REMOTE_DESKTOP_WORKSPACE_WINDOW_ID);
             setRemoteDesktopWorkspace((current) => closeRemoteDesktopWorkspace(current));
+            setRemoteDesktopWorkspaceMinimized(false);
           }}
           wallHostKeys={new Set(remoteDesktopWallHostKeys)}
         />

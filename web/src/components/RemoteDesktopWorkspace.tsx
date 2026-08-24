@@ -22,8 +22,11 @@ export interface RemoteDesktopWorkspaceProps {
   state: RemoteDesktopWorkspaceState;
   manager: RemoteDesktopConnectionManager;
   ws?: WsClient | null;
+  minimized?: boolean;
   zIndex?: number;
   onFocus?(): void;
+  onMinimize?(): void;
+  onRestore?(): void;
   onOpenHost(machine: RemoteDesktopWorkspaceMachine): void;
   onActivateTab(tabId: RemoteDesktopWorkspaceTabId): void;
   onCloseHost(hostKey: string): void;
@@ -36,8 +39,11 @@ export function RemoteDesktopWorkspace({
   state,
   manager,
   ws = null,
+  minimized = false,
   zIndex,
   onFocus,
+  onMinimize,
+  onRestore,
   onOpenHost,
   onActivateTab,
   onCloseHost,
@@ -76,11 +82,15 @@ export function RemoteDesktopWorkspace({
   }, [manager, onCloseHost, wallHostKeys]);
 
   const closeWorkspace = useCallback(() => {
+    if (state.orderedHostKeys.length > 1 && !window.confirm(t(
+      'remote_desktop.workspace_close_confirm',
+      { count: state.orderedHostKeys.length },
+    ))) return;
     for (const hostKey of state.orderedHostKeys) {
       if (!wallHostKeys.has(hostKey)) manager.stop(hostKey);
     }
     onCloseWorkspace();
-  }, [manager, onCloseWorkspace, state.orderedHostKeys, wallHostKeys]);
+  }, [manager, onCloseWorkspace, state.orderedHostKeys, t, wallHostKeys]);
 
   const selectHost = useCallback((machine: RemoteDesktopWorkspaceMachine) => {
     onOpenHost(machine);
@@ -141,7 +151,7 @@ export function RemoteDesktopWorkspace({
                 type="button"
                 onClick={() => closeHost(hostKey)}
                 aria-label={t('remote_desktop.workspace_close_tab', { machine: machine.displayName })}
-              ><svg viewBox="0 0 20 20" aria-hidden="true"><path d="m6 6 8 8M14 6l-8 8" /></svg></button>
+              ><svg width="16" height="16" viewBox="0 0 20 20" aria-hidden="true"><path d="m6 6 8 8M14 6l-8 8" /></svg></button>
             </span>
           ))}
         </div>
@@ -152,6 +162,24 @@ export function RemoteDesktopWorkspace({
           aria-label={t('remote_desktop.workspace_add')}
           onClick={() => setPickerOpen((current) => !current)}
         ><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 4v12M4 10h12" /></svg></button>
+        <div class="remote-desktop-workspace-actions">
+          {onMinimize && (
+            <button
+              class="remote-desktop-workspace-chrome-button"
+              type="button"
+              onClick={onMinimize}
+              aria-label={t('window.minimize')}
+              title={t('window.minimize')}
+            ><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M5 13h10" /></svg></button>
+          )}
+          <button
+            class="remote-desktop-workspace-chrome-button is-danger"
+            type="button"
+            onClick={closeWorkspace}
+            aria-label={t('remote_desktop.workspace_close')}
+            title={t('remote_desktop.workspace_close')}
+          ><svg viewBox="0 0 20 20" aria-hidden="true"><path d="m6 6 8 8M14 6l-8 8" /></svg></button>
+        </div>
       </div>
 
       <label class="remote-desktop-workspace-mobile-selector">
@@ -202,19 +230,34 @@ export function RemoteDesktopWorkspace({
   );
 
   return (
-    <FloatingPanel
-      id={REMOTE_DESKTOP_WORKSPACE_WINDOW_ID}
-      title={t('remote_desktop.workspace_title')}
-      onClose={closeWorkspace}
-      zIndex={zIndex ?? 10020}
-      onFocus={onFocus}
-      defaultW={1240}
-      defaultH={800}
-      minW={680}
-      minH={460}
-      className="remote-desktop-workspace-shell"
-      hideTitleBar
-      dragHandleSelector=".remote-desktop-workspace-tabbar"
-    >{content}</FloatingPanel>
+    <>
+      <div class="remote-desktop-workspace-window" hidden={minimized}>
+        <FloatingPanel
+          id={REMOTE_DESKTOP_WORKSPACE_WINDOW_ID}
+          title={t('remote_desktop.workspace_title')}
+          onClose={closeWorkspace}
+          zIndex={zIndex ?? 10020}
+          onFocus={onFocus}
+          defaultW={1240}
+          defaultH={800}
+          minW={680}
+          minH={460}
+          className="remote-desktop-workspace-shell"
+          hideTitleBar
+          dragHandleSelector=".remote-desktop-workspace-tabbar"
+        >{content}</FloatingPanel>
+      </div>
+      {minimized && (
+        <button
+          type="button"
+          class="remote-desktop-minimized-dock"
+          onClick={() => {
+            onRestore?.();
+            onFocus?.();
+          }}
+          aria-label={t('remote_desktop.workspace_restore', { count: hosts.length })}
+        >{t('remote_desktop.workspace_title')} · {hosts.length}</button>
+      )}
+    </>
   );
 }

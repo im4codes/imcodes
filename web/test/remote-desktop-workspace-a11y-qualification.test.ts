@@ -2,7 +2,9 @@ import { createRequire } from 'node:module';
 import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { describe, expect, it } from 'vitest';
+import { render } from '@testing-library/preact';
+import { h } from 'preact';
+import { describe, expect, it, vi } from 'vitest';
 import en from '../src/i18n/locales/en.json';
 import es from '../src/i18n/locales/es.json';
 import ja from '../src/i18n/locales/ja.json';
@@ -10,6 +12,43 @@ import ko from '../src/i18n/locales/ko.json';
 import ru from '../src/i18n/locales/ru.json';
 import zhCN from '../src/i18n/locales/zh-CN.json';
 import zhTW from '../src/i18n/locales/zh-TW.json';
+
+vi.mock('react-i18next', () => ({
+  useTranslation: () => ({
+    t: (key: string, values?: Record<string, unknown>) => values
+      ? `${key}:${Object.values(values).join(':')}`
+      : key,
+  }),
+}));
+
+vi.mock('../src/components/FloatingPanel.js', async () => {
+  const { h: createElement } = await import('preact');
+  return {
+    FloatingPanel: ({ children }: { children: unknown }) => createElement('div', {}, children),
+  };
+});
+
+vi.mock('../src/components/RemoteDesktopPanel.js', async () => {
+  const { h: createElement } = await import('preact');
+  return {
+    canOpenRemoteDesktop: () => true,
+    RemoteDesktopPanel: ({ active, machine }: {
+      active: boolean;
+      machine: { serverId: string };
+    }) => createElement('section', {
+      class: 'remote-desktop-panel',
+      'data-host': machine.serverId,
+      hidden: !active,
+    }),
+  };
+});
+
+import type { RemoteDesktopConnectionManager } from '../src/remote-desktop-connection-manager.js';
+import { RemoteDesktopWorkspace } from '../src/components/RemoteDesktopWorkspace.js';
+import {
+  createRemoteDesktopWorkspaceState,
+  openRemoteDesktopWorkspaceHost,
+} from '../src/remote-desktop-workspace-state.js';
 
 const require = createRequire(import.meta.url);
 const WEB_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -23,6 +62,42 @@ type BrowserSmokeResult = {
 
 function read(rel: string): string {
   return readFileSync(resolve(WEB_ROOT, rel), 'utf8');
+}
+
+function productionWorkspaceMarkup(): string {
+  const machine = (serverId: string) => ({
+    serverId,
+    refName: serverId,
+    displayName: serverId.toUpperCase(),
+    os: 'win',
+    online: true,
+    execEnabled: true,
+    accessRole: 'owner' as const,
+    capabilities: ['remote-desktop-v1' as const],
+  });
+  let state = createRemoteDesktopWorkspaceState();
+  state = openRemoteDesktopWorkspaceHost(state, machine('host-a'));
+  state = openRemoteDesktopWorkspaceHost(state, machine('host-b'));
+  const manager = {
+    releaseInput: vi.fn(),
+    stop: vi.fn(),
+  } as unknown as RemoteDesktopConnectionManager;
+  const view = render(h(RemoteDesktopWorkspace, {
+    state,
+    manager,
+    onOpenHost: vi.fn(),
+    onActivateTab: vi.fn(),
+    onCloseHost: vi.fn(),
+    onReorderHost: vi.fn(),
+    onCloseWorkspace: vi.fn(),
+    onMinimize: vi.fn(),
+    onRestore: vi.fn(),
+  }));
+  const workspace = view.container.querySelector('.remote-desktop-workspace');
+  if (!workspace) throw new Error('production workspace markup unavailable');
+  const markup = workspace.outerHTML;
+  view.unmount();
+  return markup;
 }
 
 function sourceQualificationIssues(source: string): string[] {
@@ -57,25 +132,17 @@ function guestSecretDisclosureIssues(source: string): string[] {
   return issues;
 }
 
-async function browserSmoke(browserType: BrowserType, name: string): Promise<BrowserSmokeResult> {
+async function browserSmoke(
+  browserType: BrowserType,
+  name: string,
+  workspaceMarkup: string,
+  productionCss: string,
+): Promise<BrowserSmokeResult> {
   try {
     const browser = await browserType.launch({ headless: true, timeout: 15_000 });
     const page = await browser.newPage({ viewport: { width: 390, height: 844 } });
-    await page.setContent(`<!doctype html><html><head><style>
-      .remote-desktop-workspace-mobile-selector { display:block; }
-      @media (min-width: 701px) { .remote-desktop-workspace-mobile-selector { display:none; } }
-      .remote-desktop-workspace-tabbar button:focus-visible { outline: 2px solid rgb(34, 211, 238); }
-    </style></head><body>
-      <main class="remote-desktop-workspace">
-        <div class="remote-desktop-workspace-tabbar">
-          <div role="tablist" aria-label="Remote desktop tabs">
-            <button role="tab" aria-selected="true" tabindex="0" id="wall">Wall</button>
-            <button role="tab" aria-selected="false" tabindex="-1" id="host">Host</button>
-          </div>
-        </div>
-        <label class="remote-desktop-workspace-mobile-selector"><span>Select</span><select><option>Wall</option></select></label>
-        <section role="tabpanel"><div class="remote-desktop-wall-grid" aria-label="Wall grid"><button aria-label="Open Host">Host</button></div></section>
-      </main>
+    await page.setContent(`<!doctype html><html><head><style>${productionCss}</style></head><body>
+      ${workspaceMarkup}
       <script>
         const tabs = [...document.querySelectorAll('[role=tab]')];
         document.querySelector('[role=tablist]').addEventListener('keydown', (event) => {
@@ -90,15 +157,41 @@ async function browserSmoke(browserType: BrowserType, name: string): Promise<Bro
         });
       </script>
     </body></html>`);
-    await page.locator('#wall').focus();
+    const probe = async (width: number) => {
+      await page.setViewportSize({ width, height: 844 });
+      return page.evaluate(() => {
+        const tablist = document.querySelector('[role=tablist]');
+        const closeButtons = [...document.querySelectorAll('.remote-desktop-workspace-tab-close')];
+        const inactive = document.querySelector('[data-host="host-a"]');
+        const active = document.querySelector('[data-host="host-b"]');
+        return {
+          tablistDisplay: tablist ? getComputedStyle(tablist).display : 'missing',
+          closeRects: closeButtons.map((button) => {
+            const rect = button.getBoundingClientRect();
+            return { width: rect.width, height: rect.height };
+          }),
+          inactiveDisplay: inactive ? getComputedStyle(inactive).display : 'missing',
+          activeDisplay: active ? getComputedStyle(active).display : 'missing',
+        };
+      });
+    };
+    const mobile = await probe(390);
+    const desktop = await probe(1280);
+    await page.locator('[role=tab]').first().focus();
     await page.keyboard.press('End');
     const selected = await page.locator('[role=tab][aria-selected=true]').textContent();
-    const mobileDisplay = await page.locator('.remote-desktop-workspace-mobile-selector').evaluate((el) => getComputedStyle(el).display);
     await browser.close();
+    const layoutPass = [mobile, desktop].every((layout) => (
+      layout.tablistDisplay === 'flex'
+      && layout.closeRects.length === 2
+      && layout.closeRects.every((rect) => rect.width > 0 && rect.height > 0)
+      && layout.inactiveDisplay === 'none'
+      && layout.activeDisplay !== 'none'
+    ));
     return {
       name,
-      status: selected === 'Host' && mobileDisplay !== 'none' ? 'passed' : 'failed',
-      details: `selected=${selected}, mobileDisplay=${mobileDisplay}`,
+      status: selected === 'HOST-B' && layoutPass ? 'passed' : 'failed',
+      details: `selected=${selected}, mobile=${JSON.stringify(mobile)}, desktop=${JSON.stringify(desktop)}`,
     };
   } catch (error) {
     const details = error instanceof Error ? error.message.split('\n')[0] ?? String(error) : String(error);
@@ -113,6 +206,7 @@ describe('remote desktop 16.3 workspace accessibility and locale qualification',
       'access_owner_title', 'access_public_id', 'access_public_id_non_secret', 'access_create_link',
       'access_secret_once_title', 'access_secret_once', 'access_password_title', 'access_privacy_recovery',
       'workspace_title', 'workspace_tabs', 'workspace_wall', 'workspace_select', 'workspace_add', 'workspace_close_tab',
+      'workspace_close', 'workspace_close_confirm', 'workspace_restore',
       'wall_grid', 'wall_open_host', 'wall_manage', 'wall_health_live', 'wall_health_stale', 'wall_health_pressure_paused',
       'wall_retry_all', 'wall_open_new_window',
     ] as const;
@@ -134,6 +228,7 @@ describe('remote desktop 16.3 workspace accessibility and locale qualification',
     expect(guestSecretDisclosureIssues(guest)).toEqual([]);
     expect(workspaceCss).toContain('@media (max-width: 700px)');
     expect(workspaceCss).toContain('.remote-desktop-workspace-mobile-selector');
+    expect(workspaceCss).toMatch(/\.remote-desktop-workspace\s*>\s*\.remote-desktop-panel\[hidden\][\s\S]*display:\s*none\s*!important/);
     expect(accessCss).toContain('@media(max-width:720px)');
     expect(accessCss).toContain(':focus-visible');
 
@@ -145,9 +240,11 @@ describe('remote desktop 16.3 workspace accessibility and locale qualification',
 
   it('runs the locally available Chromium and WebKit browser mechanics without claiming real network qualification', async () => {
     const { chromium, webkit } = require('playwright') as { chromium: BrowserType; webkit: BrowserType };
+    const workspaceMarkup = productionWorkspaceMarkup();
+    const productionCss = `${read('src/styles.css')}\n${read('src/components/remote-desktop-workspace.css')}`;
     const results = await Promise.all([
-      browserSmoke(chromium, 'chromium'),
-      browserSmoke(webkit, 'webkit'),
+      browserSmoke(chromium, 'chromium', workspaceMarkup, productionCss),
+      browserSmoke(webkit, 'webkit', workspaceMarkup, productionCss),
     ]);
     expect(results.map(({ name }) => name)).toEqual(['chromium', 'webkit']);
     for (const result of results) {
