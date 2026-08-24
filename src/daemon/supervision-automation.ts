@@ -263,6 +263,18 @@ function isReplyEnabledPeerAuditDelegationText(text: string | undefined, replyTo
 
 const POST_AUDIT_DEFERRED_WORK_RE = /(?:\b(?:after|once|when)\b[\s\S]{0,40}\b(?:audit|review)\b[\s\S]{0,120}\b(?:test|verify|validate|commit|push|merge|release|deploy)\b|(?:审计|审核|复审|终审)(?:[\s\S]{0,20}PASS)?\s*(?:通过)?\s*后[\s\S]{0,120}(?:测试|验证|检查|提交|推送|合并|发布|部署)|PASS\s*(?:通过)?\s*后[\s\S]{0,120}(?:测试|验证|检查|提交|推送|合并|发布|部署))/iu;
 const POST_AUDIT_DEFERRED_NEXT_ACTION = 'Peer audit passed. Resume only the validation and repository or delivery finalization explicitly deferred until PASS in the original task. Run the requested post-audit tests before any commit or push. Do not repeat implementation and do not request or start another audit.';
+const FINALIZATION_PROHIBITION_RE = /(?:\b(?:do\s+not|don't|never|must\s+not)\b[\s\S]{0,50}\b(?:git\s+(?:add|commit|push|merge)|commit|push|stage|merge|release|deploy|publish)\b|(?:不要|不得|禁止)[\s\S]{0,40}(?:提交|推送|暂存|合并|发布|部署|上线))/iu;
+const FINALIZATION_UNTIL_AUDIT_PASS_RE = /(?:\b(?:do\s+not|don't|must\s+not)\b[\s\S]{0,60}\b(?:git\s+(?:add|commit|push|merge)|commit|push|stage|merge|release|deploy|publish)\b[\s\S]{0,80}\buntil\b[\s\S]{0,30}\b(?:audit|review)\b[\s\S]{0,20}\bpass|(?:审计|审核|复审|终审)[\s\S]{0,20}(?:PASS|通过)[\s\S]{0,50}(?:之前|前)[\s\S]{0,30}(?:不要|不得|禁止)[\s\S]{0,30}(?:提交|推送|暂存|合并|发布|部署|上线)|(?:不要|不得|禁止)[\s\S]{0,40}(?:提交|推送|暂存|合并|发布|部署|上线)[\s\S]{0,60}(?:直到|除非)[\s\S]{0,30}(?:审计|审核|复审|终审)[\s\S]{0,20}(?:PASS|通过))/iu;
+const POSITIVE_FINALIZATION_REQUIREMENT_RE = /(?:\b(?:always|must|should|need(?:s)?\s+to|required\s+to|please|then|finally)\b[\s\S]{0,50}\b(?:git\s+(?:add|commit|push|merge)|commit|push|stage|merge|release|deploy|publish)\b|\bcommit\s*(?:and|&)\s*push\b|(?:始终|总是|必须|需要|务必|请|完成后|测试后)[\s\S]{0,40}(?:提交|推送|暂存|合并|发布|部署|上线)|(?:提交并推送|提交且推送))/iu;
+
+function hasExplicitRepositoryFinalizationRequirement(text: string | undefined): boolean {
+  if (!text?.trim()) return false;
+  if (POST_AUDIT_DEFERRED_WORK_RE.test(text) || FINALIZATION_UNTIL_AUDIT_PASS_RE.test(text)) return true;
+  return text
+    .split(/[\n。；;]+/u)
+    .some((clause) => POSITIVE_FINALIZATION_REQUIREMENT_RE.test(clause)
+      && !FINALIZATION_PROHIBITION_RE.test(clause));
+}
 
 function boundDelegationIdentity(record: ReturnType<typeof getSession>): DelegationReplyBoundIdentity | null {
   const sessionInstanceId = record?.sessionInstanceId?.trim();
@@ -1108,10 +1120,37 @@ class SupervisionAutomation {
   }
 
   private deferExplicitPostAuditWork(run: ActiveTaskRunState): void {
-    if (run.deferredFinalization || !POST_AUDIT_DEFERRED_WORK_RE.test(run.userText)) return;
+    if (run.deferredFinalization) return;
+
+    // Do not replay work the completed turn already proves was finalized,
+    // and let an explicit task-scoped prohibition override a broader account
+    // default. A qualified "do not commit until audit PASS" is handled below
+    // as a deferred requirement rather than a permanent prohibition.
+    if (COMPLETED_REPOSITORY_FINALIZATION_RE.test(run.lastAssistantText ?? '')) return;
+    if (
+      FINALIZATION_PROHIBITION_RE.test(run.userText)
+      && !FINALIZATION_UNTIL_AUDIT_PASS_RE.test(run.userText)
+    ) return;
+
+    const customInstructions = resolveSupervisionCustomInstructionsDetail(
+      enrichSnapshotWithGlobalDefaults(run.snapshot),
+    )?.text;
+    const explicitRequirements = [run.userText, customInstructions].filter(
+      (value): value is string => typeof value === 'string' && value.trim().length > 0,
+    );
+
+    if (explicitRequirements.some((value) => POST_AUDIT_DEFERRED_WORK_RE.test(value))) {
+      run.deferredFinalization = {
+        reason: 'The original task or supervision rules explicitly defer validation or repository finalization until peer-audit PASS.',
+        nextAction: POST_AUDIT_DEFERRED_NEXT_ACTION,
+      };
+      return;
+    }
+
+    if (!explicitRequirements.some(hasExplicitRepositoryFinalizationRequirement)) return;
     run.deferredFinalization = {
-      reason: 'The original task explicitly defers validation or repository finalization until peer-audit PASS.',
-      nextAction: POST_AUDIT_DEFERRED_NEXT_ACTION,
+      reason: 'The original task or supervision rules explicitly require repository or delivery finalization after the reviewed work.',
+      nextAction: POST_AUDIT_REPOSITORY_FINALIZATION_ACTION,
     };
   }
 
@@ -1893,6 +1932,12 @@ class SupervisionAutomation {
 
   private async startAudit(run: ActiveTaskRunState): Promise<void> {
     if (run.phase !== 'execution' || this.activeRuns.get(run.sessionName)?.generation !== run.generation) return;
+    // Daemon-owned audits can start directly from a `complete` broker decision,
+    // bypassing the `continue` branch that normally captures held repository
+    // finalization. Record only explicit task/rule requirements here so PASS
+    // always resumes required commit/push work while ordinary audited tasks
+    // still terminate without an invented finalization turn.
+    this.deferExplicitPostAuditWork(run);
     // Keep the evaluation reservation across the asynchronous baseline scan.
     // Clearing it before walking OpenSpec files lets a repeated idle boundary
     // start a second evaluation and eventually dispatch a duplicate audit.

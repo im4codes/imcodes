@@ -1701,6 +1701,148 @@ describe('SupervisionAutomation', () => {
     expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
   });
 
+  it('resumes explicit global commit and push after PASS when a complete decision starts the audit', async () => {
+    const snapshot = await seedSession('supervised_audit', false, 2, {
+      globalCustomInstructions: 'Check for uncommitted code and always commit and push after coding and testing.',
+    });
+    mockSupervisionDecide
+      .mockResolvedValueOnce({
+        decision: 'complete',
+        reason: 'implementation and tests are complete, subject to peer audit',
+        confidence: 0.95,
+        requiresAudit: true,
+      })
+      .mockResolvedValueOnce({
+        decision: 'complete',
+        reason: 'the required repository finalization is complete',
+        confidence: 0.95,
+        requiresAudit: false,
+      });
+
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent(
+      'deck_supervision_brain',
+      'cmd-complete-before-required-finalization',
+      'implement the feature',
+      snapshot,
+    );
+    beginRun('cmd-complete-before-required-finalization', 'implement the feature');
+    completeTurn('Implementation and tests are complete. Git commit and push have not been run.');
+    await waitForRunPhase('auditing');
+
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({
+      phase: 'auditing',
+      deferredFinalization: {
+        nextAction: expect.stringContaining('stage/commit/push'),
+      },
+    });
+
+    completeDelegatedAudit('PASS', 'The implementation and tests are correct.');
+    await waitForRunPhase('finalizing');
+    await waitForTransportSendCount(2);
+
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(2);
+    const finalizationPrompt = String(mockTransportRuntime.send.mock.calls[1]?.[0]);
+    expect(finalizationPrompt).toContain('[Contract: supervision_continue_v1]');
+    expect(finalizationPrompt).toContain('stage/commit/push');
+    expect(finalizationPrompt).not.toContain('Exact delegate target session:');
+    expect(timelineEmitter.replay('deck_supervision_brain', 0).events).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: 'user.message',
+        payload: expect.objectContaining({ automationKind: 'supervision-post-audit-finalization' }),
+      }),
+    ]));
+
+    // Repeated idle boundaries after PASS must not inject another finalization
+    // turn while the first one is still pending.
+    timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'idle' });
+    timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'idle' });
+    await sleep(25);
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(2);
+
+    completeTurn('Committed and pushed the audited changes.');
+    await waitForRunEnd();
+
+    expect(mockSupervisionDecide).toHaveBeenCalledTimes(2);
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(2);
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
+  });
+
+  it('does not invent finalization after PASS when explicit instructions prohibit git changes', async () => {
+    const snapshot = await seedSession('supervised_audit', false, 2, {
+      globalCustomInstructions: 'This is a read-only verification. Do not stage, commit, or push any files.',
+    });
+    mockSupervisionDecide.mockResolvedValueOnce({
+      decision: 'complete',
+      reason: 'the read-only verification is complete, subject to peer audit',
+      confidence: 0.95,
+      requiresAudit: true,
+    });
+
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent(
+      'deck_supervision_brain',
+      'cmd-complete-without-finalization',
+      'review the implementation without modifying the repository',
+      snapshot,
+    );
+    beginRun('cmd-complete-without-finalization', 'review the implementation without modifying the repository');
+    completeTurn('The read-only review is complete.');
+    await waitForRunPhase('auditing');
+
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({ phase: 'auditing' });
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')?.deferredFinalization).toBeUndefined();
+
+    completeDelegatedAudit('PASS', 'The read-only review is correct.');
+    await waitForRunEnd();
+
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
+  });
+
+  it('does not release complete-path finalization when peer audit requests REWORK', async () => {
+    const snapshot = await seedSession('supervised_audit', false, 1, {
+      globalCustomInstructions: 'Always commit and push after coding and testing.',
+    });
+    mockSupervisionDecide.mockResolvedValueOnce({
+      decision: 'complete',
+      reason: 'implementation and tests are complete, subject to peer audit',
+      confidence: 0.95,
+      requiresAudit: true,
+    });
+
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent(
+      'deck_supervision_brain',
+      'cmd-complete-rework-before-required-finalization',
+      'implement the feature',
+      snapshot,
+    );
+    beginRun('cmd-complete-rework-before-required-finalization', 'implement the feature');
+    completeTurn('Implementation and tests are complete. Git has not been changed.');
+    await waitForRunPhase('auditing');
+
+    const priorFinalizationEventCount = timelineEmitter.replay('deck_supervision_brain', 0).events.filter((event) =>
+      event.type === 'user.message'
+      && event.payload.automationKind === 'supervision-post-audit-finalization').length;
+    completeDelegatedAudit('REWORK', 'A regression test is still missing.');
+    await waitForRunPhase('execution');
+
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(2);
+    expect(String(mockTransportRuntime.send.mock.calls[1]?.[0])).toContain('Audit verdict: REWORK');
+    expect(String(mockTransportRuntime.send.mock.calls[1]?.[0])).not.toContain('stage/commit/push');
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({
+      phase: 'execution',
+      deferredFinalization: {
+        nextAction: expect.stringContaining('stage/commit/push'),
+      },
+    });
+    expect(timelineEmitter.replay('deck_supervision_brain', 0).events.filter((event) =>
+      event.type === 'user.message'
+      && event.payload.automationKind === 'supervision-post-audit-finalization')).toHaveLength(priorFinalizationEventCount);
+  });
+
   it('starts peer audit when commit-only finalization is qualified by audit-pass wording', async () => {
     const snapshot = await seedSession('supervised_audit');
     mockSupervisionDecide.mockResolvedValueOnce({
