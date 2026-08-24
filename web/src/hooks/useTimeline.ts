@@ -707,7 +707,7 @@ function flushPendingTimelineSnapshotWrites(): void {
 function persistTimelineSnapshotsBeforeFreeze(): void {
   for (const [cacheKey, cachedEvents] of eventsCache.entries()) {
     // Ordinary (non-streaming) tails are already covered by the debounced
-    // snapshot writer, which flushSnapshotsBeforeFreeze() drains immediately
+    // snapshot writer, which flushTimelineSnapshotsBeforeFreeze() drains immediately
     // before this pass. Re-serializing every retained session here turns a
     // screen lock/pagehide into an O(all sessions x tail payload) synchronous
     // main-thread task. On workspaces with many open timelines Chromium can
@@ -728,6 +728,21 @@ function clearPendingTimelineSnapshotWrites(): void {
   lastWrittenTimelineSnapshotTails.clear();
 }
 
+function flushTimelineSnapshotsBeforeFreeze(): void {
+  flushPendingTimelineCacheIngests();
+  flushPendingTimelineSnapshotWrites();
+  // A full page refresh during an active transport turn otherwise loses the
+  // latest assistant.text streaming payload: streaming ticks are intentionally
+  // kept out of IDB, and the daemon history store only has the final event.
+  // localStorage is the lightweight browser-local crash mat for refresh/pagehide.
+  persistTimelineSnapshotsBeforeFreeze();
+}
+
+/** Test seam for the exact callback registered on browser freeze events. */
+export function __flushTimelineSnapshotsBeforeFreezeForTests(): void {
+  flushTimelineSnapshotsBeforeFreeze();
+}
+
 function scheduleTimelineSnapshotPersist(cacheKey: string, events: TimelineEvent[]): void {
   const tail = getPersistableTimelineTail(events);
   const pendingTail = pendingTimelineSnapshotTails.get(cacheKey);
@@ -741,20 +756,11 @@ function scheduleTimelineSnapshotPersist(cacheKey: string, events: TimelineEvent
 }
 
 if (typeof document !== 'undefined' && typeof window !== 'undefined') {
-  const flushSnapshotsBeforeFreeze = (): void => {
-    flushPendingTimelineCacheIngests();
-    flushPendingTimelineSnapshotWrites();
-    // A full page refresh during an active transport turn otherwise loses the
-    // latest assistant.text streaming payload: streaming ticks are intentionally
-    // kept out of IDB, and the daemon history store only has the final event.
-    // localStorage is the lightweight browser-local crash mat for refresh/pagehide.
-    persistTimelineSnapshotsBeforeFreeze();
-  };
   document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'hidden') flushSnapshotsBeforeFreeze();
+    if (document.visibilityState === 'hidden') flushTimelineSnapshotsBeforeFreeze();
   });
-  window.addEventListener('pagehide', flushSnapshotsBeforeFreeze);
-  window.addEventListener('beforeunload', flushSnapshotsBeforeFreeze);
+  window.addEventListener('pagehide', flushTimelineSnapshotsBeforeFreeze);
+  window.addEventListener('beforeunload', flushTimelineSnapshotsBeforeFreeze);
 }
 
 function isProvisionalTransportHistoryEvent(event: TimelineEvent): boolean {

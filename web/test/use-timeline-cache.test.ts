@@ -17,6 +17,7 @@ vi.mock('../src/api.js', () => ({
 }));
 import {
   __clearPersistedTimelineSnapshotsForTests,
+  __flushTimelineSnapshotsBeforeFreezeForTests,
   __getTimelineCacheForTests,
   __getTimelineCacheKeysForTests,
   __getTimelineSnapshotBookkeepingKeysForTests,
@@ -1148,7 +1149,11 @@ describe('useTimeline global cache bounds', () => {
     }, serverId);
 
     const setItemSpy = vi.spyOn(localStorage, 'setItem');
-    window.dispatchEvent(new Event('pagehide'));
+    // Exercise the exact callback registered for pagehide/visibility freeze.
+    // Calling it directly keeps this scope assertion independent from jsdom's
+    // process-global event-listener lifecycle when the full suite reuses forks;
+    // the preceding test separately proves that pagehide invokes this callback.
+    __flushTimelineSnapshotsBeforeFreezeForTests();
 
     expect(setItemSpy).toHaveBeenCalledTimes(1);
     expect(setItemSpy).toHaveBeenCalledWith(streamingKey, expect.stringContaining('partial'));
