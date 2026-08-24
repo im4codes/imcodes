@@ -488,6 +488,10 @@
   "session": {
     "restart": "↺ Перезапустить",
     "restart_plain": "Перезапустить",
+    "delivery_mode_queue": "В очередь",
+    "delivery_mode_append": "Добавить",
+    "delivery_mode_queue_description": "Отправить после завершения текущего ответа",
+    "delivery_mode_append_description": "Добавить к текущему ответу на следующей безопасной границе провайдера",
     "confirm_restart": "Подтвердить перезапуск?",
     "new": "+ Новая",
     "start_fresh": "Начать заново",

@@ -28,6 +28,7 @@ import {
 import type { AgentMessage, MessageDelta, ToolCallEvent } from '../../../shared/agent-message.js';
 import type { ProviderContextPayload } from '../../../shared/context-types.js';
 import type { TransportAttachment } from '../../../shared/transport-attachments.js';
+import { AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES } from '../../../shared/agent-delegation.js';
 import logger from '../../util/logger.js';
 import { normalizeOpenClawDisplayName } from '../openclaw-display.js';
 import { composeMessageSideProviderPrompt, getProviderSystemTextParts } from '../provider-context-routing.js';
@@ -102,6 +103,13 @@ export class OpenClawProvider implements TransportProvider {
     reasoningEffort: true,
     supportedEffortLevels: OPENCLAW_THINKING_LEVELS,
     contextSupport: 'full-normalized-context-injection',
+    // OpenClaw's active-run queue is not an active-only admission contract.
+    // The current gateway `sessions.send` schema has no per-request queue mode,
+    // while `chat.send` with `queueMode: "steer"` starts a normal new turn when
+    // the target is already idle (and can do so when a captured target goes
+    // stale). TransportProvider requires that race to return STALE without
+    // starting work, so do not advertise or fake native append support.
+    activeDelegationNotification: AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.UNSUPPORTED,
     compact: {
       execution: 'unsupported',
       verified: true,

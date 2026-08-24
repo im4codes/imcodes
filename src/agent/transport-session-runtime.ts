@@ -4,7 +4,7 @@ import type { SessionRuntime } from './session-runtime.js';
 import { RUNTIME_TYPES } from './session-runtime.js';
 import type { AgentStatus } from './detect.js';
 import type { AgentMessage, MessageDelta } from '../../shared/agent-message.js';
-import type { TransportProvider, ProviderDelegationNotification, ProviderError, ProviderRolloutCompletionReconcileOptions, SessionConfig, SessionInfoUpdate, ProviderStatusUpdate, ProviderUsageUpdate, ToolCallEvent, SdkTurnLostRecoveryPhase, SdkTurnLostReplayDecision } from './transport-provider.js';
+import type { TransportProvider, ProviderActiveTurnDeliveryKind, ProviderDelegationNotification, ProviderError, ProviderRolloutCompletionReconcileOptions, SessionConfig, SessionInfoUpdate, ProviderStatusUpdate, ProviderUsageUpdate, ToolCallEvent, SdkTurnLostRecoveryPhase, SdkTurnLostReplayDecision } from './transport-provider.js';
 import { BACKGROUND_SUBAGENT_WAKE_MODES, PROVIDER_ACTIVE_TURN_DELIVERY_KINDS, PROVIDER_CANCEL_ORIGINS, PROVIDER_ERROR_CODES, SDK_TURN_LOST_RECOVERY_PHASES, SDK_TURN_LOST_RECOVERY_STATUS } from './transport-provider.js';
 import type { ApprovalRequest } from './transport-provider.js';
 import type { TransportEffortLevel } from '../../shared/effort-levels.js';
@@ -98,6 +98,10 @@ import {
   AGENT_DELEGATION_NOTIFICATION_RESULTS,
   type AgentDelegationNotificationResult,
 } from '../../shared/agent-delegation.js';
+import {
+  MEMORY_MCP_SEND_DELIVERY_MODES,
+  type MemoryMcpSendDeliveryMode,
+} from '../../shared/memory-mcp-contracts.js';
 
 export interface PendingTransportMessage {
   clientMessageId: string;
@@ -126,6 +130,10 @@ export interface PendingTransportMessage {
   timelineCommitted?: boolean;
   /** @internal: this logical user event has already been written to runtime history. */
   historyCommitted?: boolean;
+  /** @internal: retain provider-native append intent across the pre-send startup window. */
+  deliveryMode?: MemoryMcpSendDeliveryMode;
+  /** @internal: distinguishes a human queue steer from an MCP append. */
+  activeTurnDeliveryKind?: ProviderActiveTurnDeliveryKind;
   /** @internal: private peer-audit queue ownership; excluded from public snapshots. */
   peerAudit?: {
     contractVersion: string;
@@ -170,6 +178,8 @@ function publicPendingEntry(entry: PendingTransportMessage): PendingTransportMes
   const publicEntry: PendingTransportMessage = { ...entry };
   delete publicEntry.timelineCommitted;
   delete publicEntry.historyCommitted;
+  delete publicEntry.deliveryMode;
+  delete publicEntry.activeTurnDeliveryKind;
   // RV-B: the expanded alias value (`providerText`) and the per-turn
   // `messagePreamble` are secret agent-bound material. The public projection
   // feeds diagnostics / status snapshots / UI / the onDrain callback — none of
@@ -206,6 +216,10 @@ export interface TransportSendMetadata {
   timelineCommitted?: boolean;
   /** @internal: set when replaying entries that already exist in runtime history. */
   historyCommitted?: boolean;
+  /** @internal: provider-native delivery requested before the live query exists. */
+  deliveryMode?: MemoryMcpSendDeliveryMode;
+  /** @internal: exact provider notification kind for a native active-turn append. */
+  activeTurnDeliveryKind?: ProviderActiveTurnDeliveryKind;
   /** @internal: marks a persisted queued row as an ephemeral peer-audit brief. */
   peerAudit?: {
     contractVersion: string;
@@ -506,6 +520,16 @@ export class TransportSessionRuntime implements SessionRuntime {
   private _activeDispatchCancelled = false;
   /** True once the active dispatch has crossed into provider.send(). */
   private _activeDispatchProviderStarted = false;
+  /**
+   * True only after provider.send() fulfils its send-start/admission contract.
+   * This is deliberately separate from `ProviderStarted`: several adapters do
+   * asynchronous session/bootstrap work before the original user message is
+   * accepted.  Appending during that gap can either return a false STALE or,
+   * worse, put B ahead of A at the provider.
+   */
+  private _activeDispatchProviderAccepted = false;
+  /** One serialized native-append flush; new rows are picked up by its loop. */
+  private _activeAppendFlush: Promise<void> | null = null;
   private _activeDispatchId: number | null = null;
   /** Summary delivery ownership for the active provider turn. A provider
    * accepting send() is not proof that the model consumed the context: the
@@ -551,6 +575,8 @@ export class TransportSessionRuntime implements SessionRuntime {
 
   /** Callback fired when pending messages are drained into a new turn. */
   private _onDrain?: (messages: PendingTransportMessage[], mergedMessage: string, count: number, metadata: ActivityDrainMetadata) => void;
+  /** Callback fired when composer rows are admitted into the current provider turn. */
+  private _onActiveAppend?: (messages: PendingTransportMessage[], snapshot: QueueSnapshot) => void;
   private _onSessionInfoChange?: (info: SessionInfoUpdate) => void;
   /** Fired when the provider session binds (a non-null providerSessionId is
    *  established) and the runtime is fully configured. The daemon uses this to
@@ -853,6 +879,7 @@ export class TransportSessionRuntime implements SessionRuntime {
 
   /** Register a callback for when pending messages are drained into a new turn. */
   set onDrain(cb: (messages: PendingTransportMessage[], mergedMessage: string, count: number, metadata: ActivityDrainMetadata) => void) { this._onDrain = cb; }
+  set onActiveAppend(cb: (messages: PendingTransportMessage[], snapshot: QueueSnapshot) => void) { this._onActiveAppend = cb; }
   /** Register a callback fired exactly once when startup memory reaches the provider. */
   set onStartupMemoryInjected(cb: () => void) { this._onStartupMemoryInjected = cb; }
   /** Register a callback for provider session metadata updates. */
@@ -1156,6 +1183,7 @@ export class TransportSessionRuntime implements SessionRuntime {
             sharedActorEnvelope?: unknown;
             timelineCommitted?: unknown;
             historyCommitted?: unknown;
+            deliveryMode?: unknown;
           };
           if (typeof material.text === 'string') {
             entry = {
@@ -1170,6 +1198,9 @@ export class TransportSessionRuntime implements SessionRuntime {
               ...(material.sharedActorEnvelope ? { sharedActor: material.sharedActorEnvelope as SharedActorEnvelope } : {}),
               ...(material.timelineCommitted === true ? { timelineCommitted: true } : {}),
               ...(material.historyCommitted === true ? { historyCommitted: true } : {}),
+              ...(material.deliveryMode === MEMORY_MCP_SEND_DELIVERY_MODES.APPEND
+                ? { deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND }
+                : {}),
             };
           }
         }
@@ -1830,6 +1861,11 @@ export class TransportSessionRuntime implements SessionRuntime {
       throw new Error(reason || `${this.provider.id} does not support /compact`);
     }
 
+    const nativeAppendRequested = metadata?.deliveryMode === MEMORY_MCP_SEND_DELIVERY_MODES.APPEND
+      && this.provider.capabilities.activeDelegationNotification === AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE
+      && !!this.provider.notifyActiveDelegation
+      && (attachments?.length ?? 0) === 0
+      && !message.trim().startsWith('/');
     const entry: PendingTransportMessage = {
       clientMessageId: clientMessageId ?? randomUUID(),
       text: message,
@@ -1844,6 +1880,10 @@ export class TransportSessionRuntime implements SessionRuntime {
       ...(metadata?.sharedActor ? { sharedActor: metadata.sharedActor } : {}),
       ...(metadata?.timelineCommitted ? { timelineCommitted: true } : {}),
       ...(metadata?.historyCommitted ? { historyCommitted: true } : {}),
+      ...(nativeAppendRequested ? { deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND } : {}),
+      ...(nativeAppendRequested && metadata?.activeTurnDeliveryKind
+        ? { activeTurnDeliveryKind: metadata.activeTurnDeliveryKind }
+        : {}),
       ...(metadata?.peerAudit ? { peerAudit: { ...metadata.peerAudit } } : {}),
       ...(metadata?.delegationReply ? { delegationReply: { ...metadata.delegationReply } } : {}),
     };
@@ -1872,6 +1912,7 @@ export class TransportSessionRuntime implements SessionRuntime {
             ...(entry.sharedActor ? { sharedActorEnvelope: entry.sharedActor } : {}),
             ...(entry.timelineCommitted ? { timelineCommitted: true } : {}),
             ...(entry.historyCommitted ? { historyCommitted: true } : {}),
+            ...(entry.deliveryMode ? { deliveryMode: entry.deliveryMode } : {}),
             ...(entry.peerAudit ? { peerAudit: entry.peerAudit } : {}),
             ...(entry.delegationReply ? { delegationReply: entry.delegationReply } : {}),
           }),
@@ -1880,6 +1921,11 @@ export class TransportSessionRuntime implements SessionRuntime {
         logger.warn({ err, sessionKey: this.sessionKey, clientMessageId: entry.clientMessageId }, 'transport queue sqlite enqueue failed; preserving runtime-local queue');
       }
       this._pendingVersion++;
+      if (entry.deliveryMode === MEMORY_MCP_SEND_DELIVERY_MODES.APPEND
+        && this._activeDispatchProviderAccepted
+        && this._activeDispatchId !== null) {
+        this.scheduleActiveAppendFlush(this._activeDispatchId);
+      }
       return 'queued';
     }
 
@@ -1939,33 +1985,17 @@ export class TransportSessionRuntime implements SessionRuntime {
       || !this.provider.notifyActiveDelegation) {
       return 'unsupported';
     }
-    const outcome = await withTimeoutOutcome(
-      this.provider.notifyActiveDelegation(this._providerSessionId, {
-        notificationId: clientMessageId,
-        delegationId: `mcp-append:${clientMessageId}`,
-        sourceSessionName: this.sessionKey,
-        text: message,
-        deliveryKind: PROVIDER_ACTIVE_TURN_DELIVERY_KINDS.MCP_MESSAGE,
-      }),
-      DEFAULT_ACTIVE_DELEGATION_NOTIFICATION_TIMEOUT_MS,
-    );
-    if (outcome.timedOut) return 'stale';
-    if (outcome.value === AGENT_DELEGATION_NOTIFICATION_RESULTS.UNSUPPORTED) {
-      return 'unsupported';
-    }
-    if (outcome.value !== AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED) {
-      return 'stale';
-    }
-    this._history.push({
-      id: randomUUID(),
-      sessionId: this._providerSessionId,
-      kind: 'text',
-      role: 'user',
-      content: message,
-      timestamp: Date.now(),
-      status: 'complete',
+    // Always stage through the same durable queue used by the human Append
+    // mode.  This preserves A -> B -> C order across both context assembly and
+    // provider-specific bootstrap.  The provider is touched only after its
+    // send-start Promise proves A was accepted; an unsupported provider was
+    // rejected above and therefore never gets a misleading append receipt.
+    const staged = this.send(message, clientMessageId, undefined, undefined, {
+      timelineCommitted: true,
+      deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND,
+      activeTurnDeliveryKind: PROVIDER_ACTIVE_TURN_DELIVERY_KINDS.MCP_MESSAGE,
     });
-    return 'appended';
+    return staged === 'queued' ? 'appended' : 'stale';
   }
 
   /**
@@ -1984,6 +2014,13 @@ export class TransportSessionRuntime implements SessionRuntime {
           !== AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE
         || !this.provider.notifyActiveDelegation) {
         return AGENT_DELEGATION_NOTIFICATION_RESULTS.UNSUPPORTED;
+      }
+      // Runtime ownership starts before the provider has admitted the original
+      // prompt. Never launch a non-cancellable notify Promise in that window:
+      // timing it out locally while it later succeeds is a duplicate-delivery
+      // bug. The durable delegation outbox will retry once send-start resolves.
+      if (this._activeDispatchId !== null && !this._activeDispatchProviderAccepted) {
+        return AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE;
       }
       const outcome = await withTimeoutOutcome(
         this.provider.notifyActiveDelegation(this._providerSessionId, {
@@ -2040,6 +2077,7 @@ export class TransportSessionRuntime implements SessionRuntime {
   async appendPendingMessagesToActiveTurn(
     clientMessageIds: string[],
     notificationId: string,
+    deliveryKind: ProviderActiveTurnDeliveryKind = PROVIDER_ACTIVE_TURN_DELIVERY_KINDS.QUEUED_MESSAGE,
   ): Promise<AppendQueuedMessagesResult> {
     const ids = [...new Set(clientMessageIds.map((id) => id.trim()).filter(Boolean))];
     if (ids.length === 0 || !this._providerSessionId) return { status: 'not_found' };
@@ -2103,10 +2141,12 @@ export class TransportSessionRuntime implements SessionRuntime {
     try {
       admission = await this.provider.notifyActiveDelegation(this._providerSessionId, {
         notificationId,
-        delegationId: `queue-append:${notificationId}`,
+        delegationId: deliveryKind === PROVIDER_ACTIVE_TURN_DELIVERY_KINDS.MCP_MESSAGE
+          ? `mcp-append:${notificationId}`
+          : `queue-append:${notificationId}`,
         sourceSessionName: this.sessionKey,
         text: selected.map((entry) => entry.providerText ?? entry.text).join('\n\n'),
-        deliveryKind: PROVIDER_ACTIVE_TURN_DELIVERY_KINDS.QUEUED_MESSAGE,
+        deliveryKind,
       });
     } catch (error) {
       restoreReservation();
@@ -2403,6 +2443,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     this.clearStalePendingCancelFallbackTimer();
     this._activeDispatchCancelled = false;
     this._activeDispatchProviderStarted = false;
+    this._activeDispatchProviderAccepted = false;
     this._activeDispatchId = null;
     this._activeDispatchStaleRecoveryStarted = false;
     this._locallyCancelledDispatchIds.clear();
@@ -2911,6 +2952,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     this._lastProviderErrorAt = 0;
     this._activeDispatchCancelled = false;
     this._activeDispatchProviderStarted = false;
+    this._activeDispatchProviderAccepted = false;
     this._activeDispatchHasSideEffectEvidence = false;
     this._activeDispatchId = dispatchId;
     this._activeDispatchStaleRecoveryStarted = false;
@@ -3087,6 +3129,10 @@ export class TransportSessionRuntime implements SessionRuntime {
       }
       // Provider accepted the send — the turn was delivered. Resolve any
       // recoverable-retry streak so a later failure starts with a full budget.
+      if (this._activeDispatchId === dispatchId) {
+        this._activeDispatchProviderAccepted = true;
+        this.scheduleActiveAppendFlush(dispatchId);
+      }
       this._recoverableDispatchRetries = 0;
       this.markSdkTurnLostReplacementProviderAccepted(dispatchId);
       if (dispatchResult.payload?.memoryRecall) {
@@ -3231,6 +3277,63 @@ export class TransportSessionRuntime implements SessionRuntime {
         this._activeDispatchEntries = [];
         // Don't drain on async send failure — the provider is likely broken.
       });
+  }
+
+  private scheduleActiveAppendFlush(dispatchId: number): void {
+    if (this._activeDispatchId !== dispatchId || !this._activeDispatchProviderAccepted) return;
+    if (this._activeAppendFlush) return;
+    const flush = this.flushAcceptedProviderActiveAppends(dispatchId);
+    this._activeAppendFlush = flush;
+    void flush.catch((err) => {
+      logger.warn(
+        { err, sessionKey: this.sessionKey, dispatchId },
+        'transport accepted-provider active append flush failed; retaining durable FIFO fallback',
+      );
+    }).finally(() => {
+      if (this._activeAppendFlush === flush) this._activeAppendFlush = null;
+    });
+  }
+
+  private async flushAcceptedProviderActiveAppends(dispatchId: number): Promise<void> {
+    for (;;) {
+      if (this._activeDispatchId !== dispatchId || !this._activeDispatchProviderAccepted) return;
+      const entry = this._pendingMessages.find(
+        (candidate) => candidate.deliveryMode === MEMORY_MCP_SEND_DELIVERY_MODES.APPEND,
+      );
+      if (!entry) return;
+
+      const result = await this.appendPendingMessagesToActiveTurn(
+        [entry.clientMessageId],
+        entry.clientMessageId,
+        entry.activeTurnDeliveryKind ?? PROVIDER_ACTIVE_TURN_DELIVERY_KINDS.QUEUED_MESSAGE,
+      );
+      if (result.status !== 'delivered') {
+        logger.info(
+          {
+            sessionKey: this.sessionKey,
+            clientMessageId: entry.clientMessageId,
+            status: result.status,
+          },
+          'transport active append was not admitted; retaining durable idle fallback',
+        );
+        return;
+      }
+      const timelineEntries = result.entries.filter((candidate) => !candidate.timelineCommitted);
+      for (const candidate of timelineEntries) candidate.timelineCommitted = true;
+      if (timelineEntries.length > 0) {
+        try {
+          this._onActiveAppend?.(timelineEntries, result.queueSnapshot);
+        } catch (error) {
+          logger.warn({ error, sessionKey: this.sessionKey }, 'transport active append projection callback failed');
+        }
+      }
+      for (const fact of result.deliveryFacts) {
+        timelineEmitter.emit(this.sessionKey, 'transport.queue.delivery', { ...fact }, {
+          source: 'daemon',
+          confidence: 'high',
+        });
+      }
+    }
   }
 
   private resolveAuthoredContextRepository(): string | undefined {

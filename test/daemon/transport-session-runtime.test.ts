@@ -405,6 +405,36 @@ describe('TransportSessionRuntime', () => {
     expect(runtime.pendingEntries).toEqual([]);
   });
 
+  it('does not start a delegation notify until provider.send has admitted the original prompt', async () => {
+    const mock = makeMockProvider();
+    mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
+    mock.provider.notifyActiveDelegation = vi.fn().mockResolvedValue(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    let confirmProviderAdmission!: () => void;
+    (mock.provider.send as ReturnType<typeof vi.fn>).mockImplementationOnce(() => new Promise<void>((resolve) => {
+      confirmProviderAdmission = resolve;
+    }));
+    const runtime = new TransportSessionRuntime(mock.provider, 'deck_test_brain');
+    await runtime.initialize(defaultConfig);
+    runtime.send('A', 'foreground-delegation-starting');
+    await waitForProviderSendCount(mock.provider, 1);
+
+    const notification = {
+      notificationId: 'notify-before-admission',
+      delegationId: 'delegation-before-admission',
+      sourceSessionName: 'deck_sub_auditor',
+      text: 'B',
+    };
+    await expect(runtime.deliverDelegationNotification(notification))
+      .resolves.toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE);
+    expect(mock.provider.notifyActiveDelegation).not.toHaveBeenCalled();
+
+    confirmProviderAdmission();
+    await flushDispatch();
+    await expect(runtime.deliverDelegationNotification(notification))
+      .resolves.toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    expect(mock.provider.notifyActiveDelegation).toHaveBeenCalledOnce();
+  });
+
   it('fails closed instead of queueing when a busy provider has no native delegation notification', async () => {
     const mock = makeMockProvider();
     mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.UNSUPPORTED;
@@ -501,6 +531,72 @@ describe('TransportSessionRuntime', () => {
     });
     expect(runtime.pendingEntries).toEqual([]);
     expect(getTransportQueueStore().readSnapshot('deck_test_brain').pendingMessageEntries).toEqual([]);
+  });
+
+  it('buffers immediate B/C appends until provider.send confirms A admission, then injects next in order', async () => {
+    mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
+    mock.provider.notifyActiveDelegation = vi.fn().mockResolvedValue(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    let releaseDispatchBootstrap!: () => void;
+    let confirmProviderAdmission!: () => void;
+    (mock.provider.send as ReturnType<typeof vi.fn>).mockImplementationOnce(() => new Promise<void>((resolve) => {
+      confirmProviderAdmission = resolve;
+    }));
+    runtime.setContextBootstrapResolver(() => new Promise((resolve) => {
+      releaseDispatchBootstrap = () => resolve({
+        namespace: { scope: 'personal', projectId: 'test' },
+        diagnostics: [],
+      });
+    }));
+
+    expect(runtime.send('A', 'msg-A')).toBe('sent');
+    await expect(runtime.appendExternalMessageToActiveTurn('B', 'msg-B')).resolves.toBe('appended');
+    await expect(runtime.appendExternalMessageToActiveTurn('C', 'msg-C')).resolves.toBe('appended');
+
+    // Context assembly is deliberately blocked: provider.send/query has not
+    // started, yet receipt is immediate and neither append was demoted into a
+    // second provider turn.
+    expect(mock.provider.send).not.toHaveBeenCalled();
+    expect(mock.provider.notifyActiveDelegation).not.toHaveBeenCalled();
+    expect(getTransportQueueStore().readSnapshot('deck_test_brain').pendingMessageEntries.map(
+      (entry) => entry.clientMessageId,
+    )).toEqual(['msg-B', 'msg-C']);
+
+    releaseDispatchBootstrap();
+    await waitForProviderSendCount(mock.provider, 1);
+    // Crossing into provider.send is not admission.  SDKs such as Codex,
+    // DSH/Pi, OpenCode and CodeBuddy still perform asynchronous bootstrap or
+    // request setup here.  B/C must remain staged and must never race ahead of
+    // A while that send-start Promise is unresolved.
+    await flushDispatch();
+    expect(mock.provider.notifyActiveDelegation).not.toHaveBeenCalled();
+    expect(getTransportQueueStore().readSnapshot('deck_test_brain').pendingMessageEntries.map(
+      (entry) => entry.clientMessageId,
+    )).toEqual(['msg-B', 'msg-C']);
+
+    confirmProviderAdmission();
+    const deadline = Date.now() + 5_000;
+    while (Date.now() < deadline && (mock.provider.notifyActiveDelegation as ReturnType<typeof vi.fn>).mock.calls.length < 2) {
+      await flushDispatch();
+    }
+
+    expect(mock.provider.send).toHaveBeenCalledTimes(1);
+    expect((mock.provider.notifyActiveDelegation as ReturnType<typeof vi.fn>).mock.calls.map((call) => call[1]))
+      .toEqual([
+        expect.objectContaining({
+          notificationId: 'msg-B',
+          text: 'B',
+          deliveryKind: PROVIDER_ACTIVE_TURN_DELIVERY_KINDS.MCP_MESSAGE,
+        }),
+        expect.objectContaining({
+          notificationId: 'msg-C',
+          text: 'C',
+          deliveryKind: PROVIDER_ACTIVE_TURN_DELIVERY_KINDS.MCP_MESSAGE,
+        }),
+      ]);
+    expect(runtime.pendingEntries).toEqual([]);
+    expect(getTransportQueueStore().readSnapshot('deck_test_brain').pendingMessageEntries).toEqual([]);
+    expect(runtime.getHistory().filter((entry) => entry.role === 'user').map((entry) => entry.content))
+      .toEqual(['A', 'B', 'C']);
   });
 
   it('fails an unsupported external MCP append without falling back to the FIFO', async () => {

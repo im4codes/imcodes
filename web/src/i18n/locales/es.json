@@ -488,6 +488,10 @@
   "session": {
     "restart": "↺ Reiniciar",
     "restart_plain": "Reiniciar",
+    "delivery_mode_queue": "En cola",
+    "delivery_mode_append": "Añadir",
+    "delivery_mode_queue_description": "Enviar cuando termine la respuesta actual",
+    "delivery_mode_append_description": "Añadir a la respuesta actual en el siguiente punto seguro del proveedor",
     "confirm_restart": "¿Confirmar reinicio?",
     "new": "+ Nuevo",
     "start_fresh": "Empezar de nuevo",

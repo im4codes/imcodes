@@ -164,6 +164,39 @@ describe('OpenCodeSdkProvider', () => {
     await provider.disconnect();
   });
 
+  it('does not replay a steer whose provider ACK races with session idle', async () => {
+    const harness = createHarness();
+    const steerAck = deferred<{ data: { accepted: boolean }; response: { status: number } }>();
+    harness.client.notificationSession.prompt.mockImplementationOnce(() => steerAck.promise);
+    openCodeSdkRuntimeHooks.start = vi.fn(async (options) => {
+      options.signal.addEventListener('abort', harness.queue.close, { once: true });
+      return { client: harness.client as any, server: harness.server };
+    });
+    const provider = new OpenCodeSdkProvider();
+    await provider.connect({});
+    const routeId = await provider.createSession({
+      sessionKey: 'route-steer-idle-race',
+      sessionName: 'deck_project_brain',
+      cwd: '/tmp/project',
+    });
+    await provider.send(routeId, 'foreground work');
+
+    const admission = provider.notifyActiveDelegation?.(routeId, {
+      notificationId: 'notification_idle_race',
+      delegationId: 'delegation_idle_race',
+      sourceSessionName: 'deck_sub_auditor',
+      text: 'accepted before idle is observed',
+    });
+    await vi.waitFor(() => expect(harness.client.notificationSession.prompt).toHaveBeenCalledOnce());
+    harness.queue.push({ type: 'session.idle', properties: { sessionID: 'oc-session-1' } });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    steerAck.resolve({ data: { accepted: true }, response: { status: 200 } });
+
+    await expect(admission).resolves.toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    expect(harness.client.notificationSession.prompt).toHaveBeenCalledOnce();
+    await provider.disconnect();
+  });
+
   it('starts the official server on loopback and exposes connected status', async () => {
     const harness = createHarness();
     openCodeSdkRuntimeHooks.start = vi.fn(async (options) => {

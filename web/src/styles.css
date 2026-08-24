@@ -992,7 +992,8 @@ html.native-ios-mac .chat-dl-btn {
   background: rgba(2, 6, 23, 0.72);
   z-index: 4090;
 }
-.controls-input-with-trailing { padding-right: 64px; }
+.controls-input-with-trailing-1 { padding-right: 54px; }
+.controls-input-with-trailing-2 { padding-right: 96px; }
 .btn-input-expand {
   width: 28px;
   height: 28px;
@@ -1019,13 +1020,62 @@ html.native-ios-mac .chat-dl-btn {
   bottom: calc(100% + 6px);
   z-index: 2;
 }
-.btn-voice-embedded {
+.controls-composer-trailing-actions {
   position: absolute;
   right: 8px;
   top: 50%;
   transform: translateY(-50%);
   z-index: 1;
+  display: inline-flex;
+  align-items: stretch;
+  gap: 4px;
 }
+.btn-voice-embedded,
+.btn-attachment-embedded {
+  position: static;
+  transform: none;
+}
+
+.composer-delivery-mode {
+  min-height: 30px;
+  padding: 4px 9px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  flex: 0 0 auto;
+  border: 1px solid rgba(148,163,184,0.2);
+  border-radius: 8px;
+  background: linear-gradient(180deg, rgba(30,41,59,0.88), rgba(15,23,42,0.88));
+  color: #cbd5e1;
+  font: 700 11px/1 inherit;
+  cursor: pointer;
+  transition: color .16s, border-color .16s, background .16s, box-shadow .16s, transform .16s;
+}
+.composer-delivery-mode:hover:not(:disabled) { transform: translateY(-1px); }
+.composer-delivery-mode:disabled { opacity: .45; cursor: default; }
+.composer-delivery-mode.is-queue {
+  color: #fbbf24;
+  border-color: rgba(251,191,36,.34);
+  background: linear-gradient(180deg, rgba(120,53,15,.22), rgba(30,41,59,.78));
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.04);
+}
+.composer-delivery-mode.is-append {
+  color: #67e8f9;
+  border-color: rgba(34,211,238,.58);
+  background: linear-gradient(180deg, rgba(8,145,178,.28), rgba(30,64,175,.22));
+  box-shadow: 0 0 14px rgba(34,211,238,.16), inset 0 1px 0 rgba(255,255,255,.08);
+}
+.composer-delivery-mode-icon {
+  width: 18px;
+  height: 18px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.65;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.composer-delivery-mode-mobile { width: 38px; height: 38px; padding: 0; border-radius: 10px; }
 .controls-queued-hint {
   margin: 0 8px 8px;
   padding: 8px 10px;
@@ -2417,19 +2467,23 @@ html.native-ios-mac .chat-dl-btn {
     max-height: none;
     border-radius: 12px;
   }
-  .btn-voice-embedded {
+  .controls-composer-trailing-actions {
     right: 5px;
     /* Fill the input's height (absolute-positioned, so it never pushes the
        input taller) and make it comfortably wide for an easy tap target. */
     top: 4px;
     bottom: 4px;
     transform: none;
-    width: 54px;
     height: auto;
-    padding: 0;
     /* Remove the 300ms tap delay / double-tap zoom on touch so the press
        registers immediately and is not mistaken for a gesture. */
     touch-action: manipulation;
+  }
+  .btn-voice-embedded,
+  .btn-attachment-embedded {
+    width: 40px;
+    height: auto;
+    padding: 0;
     display: inline-flex;
     align-items: center;
     justify-content: center;
@@ -2438,14 +2492,14 @@ html.native-ios-mac .chat-dl-btn {
     border: 1px solid rgba(125,211,252,0.18);
     color: #cbd5e1;
   }
-  .controls-composer-mobile-expanded .btn-voice-embedded {
+  .controls-composer-mobile-expanded .controls-composer-trailing-actions {
     top: 10px;
     right: 10px;
     bottom: auto;
-    height: 34px;
-    width: 54px;
     transform: none;
   }
+  .controls-composer-mobile-expanded .btn-voice-embedded,
+  .controls-composer-mobile-expanded .btn-attachment-embedded { height: 34px; }
   .controls-wrapper-mobile-expanded .btn-input-expand-floating {
     position: fixed;
     left: 18px;
@@ -2454,7 +2508,9 @@ html.native-ios-mac .chat-dl-btn {
     z-index: 4101;
   }
   .btn-voice-embedded:hover,
-  .btn-voice-embedded:active {
+  .btn-voice-embedded:active,
+  .btn-attachment-embedded:hover,
+  .btn-attachment-embedded:active {
     background: rgba(8,145,178,0.18);
     border-color: rgba(34,211,238,0.5);
     color: #f8fafc;

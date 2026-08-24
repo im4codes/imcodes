@@ -488,6 +488,10 @@
   "session": {
     "restart": "↺ Restart",
     "restart_plain": "Restart",
+    "delivery_mode_queue": "Queue",
+    "delivery_mode_append": "Append",
+    "delivery_mode_queue_description": "Wait until the current reply finishes",
+    "delivery_mode_append_description": "Add to the current reply at the provider's next safe boundary",
     "confirm_restart": "Confirm restart?",
     "new": "+ New",
     "start_fresh": "Start fresh",

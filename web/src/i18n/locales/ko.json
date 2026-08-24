@@ -488,6 +488,10 @@
   "session": {
     "restart": "↺ 재시작",
     "restart_plain": "재시작",
+    "delivery_mode_queue": "대기열",
+    "delivery_mode_append": "추가",
+    "delivery_mode_queue_description": "현재 응답이 끝난 뒤 전송",
+    "delivery_mode_append_description": "제공자의 다음 안전한 경계에서 현재 응답에 추가",
     "confirm_restart": "재시작하시겠습니까?",
     "new": "+ 새로 만들기",
     "start_fresh": "다시 시작",

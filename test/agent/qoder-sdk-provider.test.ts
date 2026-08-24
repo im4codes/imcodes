@@ -7,12 +7,16 @@ const sdkMock = vi.hoisted(() => {
     runtimePresent: true,
     workerPresent: false,
     scripts: [] as any[][],
-    calls: [] as Array<{ prompt: string; options: QoderOptions }>,
+    calls: [] as Array<{ prompt: string | AsyncIterable<any>; options: QoderOptions }>,
     interrupted: 0,
     closed: 0,
     permissionResults: [] as any[],
     mcpStatus: [] as any[],
     models: [] as any[],
+    queries: [] as any[],
+    streamInputs: [] as any[],
+    pauseInputAfterCount: null as number | null,
+    resumeInput: null as Promise<void> | null,
   };
 
   const reset = (): void => {
@@ -25,6 +29,10 @@ const sdkMock = vi.hoisted(() => {
     state.permissionResults = [];
     state.mcpStatus = [];
     state.models = [];
+    state.queries = [];
+    state.streamInputs = [];
+    state.pauseInputAfterCount = null;
+    state.resumeInput = null;
     query.mockClear();
     accessTokenFromEnv.mockClear();
     qodercliAuth.mockClear();
@@ -34,7 +42,7 @@ const sdkMock = vi.hoisted(() => {
     WorkerTransport.mockClear();
   };
 
-  const query = vi.fn((call: { prompt: string; options: QoderOptions }) => {
+  const query = vi.fn((call: { prompt: string | AsyncIterable<any>; options: QoderOptions }) => {
     state.calls.push(call);
     const script = state.scripts.shift() ?? [];
     const queryObject: any = {};
@@ -75,6 +83,32 @@ const sdkMock = vi.hoisted(() => {
     queryObject.setModel = vi.fn();
     queryObject.mcpServerStatus = vi.fn(async () => state.mcpStatus);
     queryObject.getAvailableModels = vi.fn(async () => state.models);
+    queryObject.initializationResult = vi.fn(async () => ({ commands: [], agents: [] }));
+    queryObject.streamInput = vi.fn(async (input: AsyncIterable<any>) => {
+      for await (const message of input) state.streamInputs.push(message);
+    });
+    state.queries.push(queryObject);
+    if (typeof call.prompt !== 'string') {
+      void (async () => {
+        const iterator = call.prompt[Symbol.asyncIterator]();
+        let paused = false;
+        while (true) {
+          const next = await iterator.next();
+          if (next.done) return;
+          // Pull first, then optionally pause before recording the write. This
+          // models QueryRunner having received/yielded the entry while its
+          // transport.write admission is still pending. Calling next again is
+          // what resolves QoderInputQueue's admission promise.
+          if (!paused
+            && state.pauseInputAfterCount !== null
+            && state.streamInputs.length === state.pauseInputAfterCount) {
+            paused = true;
+            await state.resumeInput;
+          }
+          state.streamInputs.push(next.value);
+        }
+      })();
+    }
     return queryObject;
   });
 
@@ -148,6 +182,11 @@ import {
 import { PROVIDER_ERROR_CODES } from '../../src/agent/transport-provider.js';
 import { MEMORY_MCP_STATUS } from '../../shared/memory-ws.js';
 import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../shared/memory-mcp-server-name.js';
+import {
+  AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES,
+  AGENT_DELEGATION_NOTIFICATION_RESULTS,
+} from '../../shared/agent-delegation.js';
+import { PROVIDER_ACTIVE_TURN_DELIVERY_KINDS } from '../../src/agent/transport-provider.js';
 
 let provider: QoderSdkProvider | null = null;
 
@@ -229,6 +268,7 @@ describe('Qoder SDK import surface and config gates', () => {
       sessionRestore: false,
       attachments: false,
       reasoningEffort: false,
+      activeDelegationNotification: AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE,
     });
     await expect(p.listModels()).resolves.toMatchObject({
       models: [],
@@ -260,6 +300,162 @@ describe('Qoder SDK import surface and config gates', () => {
 });
 
 describe('Qoder SDK readiness and streaming fixtures', () => {
+  it('does not resolve provider send-start until the SDK has admitted the original prompt', async () => {
+    const p = await makeProvider();
+    const route = await createReadySession(p);
+    let admitInitial!: () => void;
+    sdkMock.state.pauseInputAfterCount = 0;
+    sdkMock.state.resumeInput = new Promise<void>((resolve) => { admitInitial = resolve; });
+    let releaseTurn!: () => void;
+    const holdTurn = new Promise<void>((resolve) => { releaseTurn = resolve; });
+    sdkMock.state.scripts.push([async () => {
+      await holdTurn;
+      return { type: 'result', subtype: 'success', result: 'done', uuid: 'qoder-initial-admitted' };
+    }]);
+
+    let sendSettled = false;
+    const send = p.send(route, 'A').then(() => { sendSettled = true; });
+    await vi.waitFor(() => expect(sdkMock.state.queries).toHaveLength(1));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(sendSettled).toBe(false);
+    expect(sdkMock.state.streamInputs).toHaveLength(0);
+
+    admitInitial();
+    await send;
+    expect(sdkMock.state.streamInputs[0]).toMatchObject({
+      type: 'user',
+      message: { role: 'user', content: [{ type: 'text', text: 'A' }] },
+    });
+    releaseTurn();
+  });
+
+  it('streams active-turn input with next priority, stable UUID dedupe, and correct human provenance', async () => {
+    const p = await makeProvider();
+    const route = await createReadySession(p);
+    let releaseTurn!: () => void;
+    const holdTurn = new Promise<void>((resolve) => { releaseTurn = resolve; });
+    sdkMock.state.scripts.push([
+      async () => {
+        await holdTurn;
+        return { type: 'result', subtype: 'success', result: 'done', uuid: 'qoder-done' };
+      },
+    ]);
+    await p.send(route, 'foreground');
+    await vi.waitFor(() => expect(sdkMock.state.queries).toHaveLength(1));
+    const notification = {
+      notificationId: 'qoder-append-stable-id',
+      delegationId: 'composer-append',
+      sourceSessionName: route,
+      text: 'follow up now',
+      deliveryKind: PROVIDER_ACTIVE_TURN_DELIVERY_KINDS.MCP_MESSAGE,
+    } as const;
+
+    await expect(p.notifyActiveDelegation(route, notification))
+      .resolves.toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    await expect(p.notifyActiveDelegation(route, notification))
+      .resolves.toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+
+    await vi.waitFor(() => expect(sdkMock.state.streamInputs).toHaveLength(2));
+    expect(sdkMock.state.queries[0].streamInput).not.toHaveBeenCalled();
+    expect(sdkMock.state.calls[0].prompt).toEqual(expect.objectContaining({
+      [Symbol.asyncIterator]: expect.any(Function),
+    }));
+    expect(sdkMock.state.streamInputs[1]).toEqual({
+      type: 'user',
+      message: { role: 'user', content: [{ type: 'text', text: 'follow up now' }] },
+      parent_tool_use_id: null,
+      uuid: 'qoder-append-stable-id',
+      priority: 'next',
+    });
+    releaseTurn();
+  });
+
+  it('marks peer notifications synthetic while preserving Qoder next scheduling', async () => {
+    const p = await makeProvider();
+    const route = await createReadySession(p);
+    let releaseTurn!: () => void;
+    const holdTurn = new Promise<void>((resolve) => { releaseTurn = resolve; });
+    sdkMock.state.scripts.push([async () => {
+      await holdTurn;
+      return { type: 'result', subtype: 'success', result: 'done', uuid: 'qoder-done' };
+    }]);
+    await p.send(route, 'foreground');
+
+    await expect(p.notifyActiveDelegation(route, {
+      notificationId: 'qoder-peer-id',
+      delegationId: 'delegation-1',
+      sourceSessionName: 'deck_source_worker',
+      text: 'audit result',
+    })).resolves.toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    await vi.waitFor(() => expect(sdkMock.state.streamInputs).toHaveLength(2));
+    expect(sdkMock.state.streamInputs[1]).toMatchObject({
+      uuid: 'qoder-peer-id',
+      priority: 'next',
+      isSynthetic: true,
+    });
+    releaseTurn();
+  });
+
+  it('does not replay an append already pulled by Qoder when the turn settles', async () => {
+    const p = await makeProvider();
+    const route = await createReadySession(p);
+    let consumeInput!: () => void;
+    sdkMock.state.pauseInputAfterCount = 1;
+    sdkMock.state.resumeInput = new Promise<void>((resolve) => { consumeInput = resolve; });
+    let releaseTurn!: () => void;
+    const holdTurn = new Promise<void>((resolve) => { releaseTurn = resolve; });
+    sdkMock.state.scripts.push([async () => {
+      await holdTurn;
+      return { type: 'result', subtype: 'success', result: 'done', uuid: 'qoder-done' };
+    }]);
+    await p.send(route, 'foreground');
+    await vi.waitFor(() => expect(sdkMock.state.streamInputs).toHaveLength(1));
+    const admission = p.notifyActiveDelegation(route, {
+      notificationId: 'qoder-raced-idle',
+      delegationId: 'composer-append',
+      sourceSessionName: route,
+      text: 'must not start another turn',
+    });
+    releaseTurn();
+    let settled = false;
+    void admission.finally(() => { settled = true; });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(settled).toBe(false);
+    consumeInput();
+    await expect(admission).resolves.toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    expect(sdkMock.state.streamInputs).toHaveLength(2);
+  });
+
+  it('does not replay an append already pulled by Qoder when the output stream fails', async () => {
+    const p = await makeProvider();
+    const route = await createReadySession(p);
+    let consumeInput!: () => void;
+    sdkMock.state.pauseInputAfterCount = 1;
+    sdkMock.state.resumeInput = new Promise<void>((resolve) => { consumeInput = resolve; });
+    let failTurn!: () => void;
+    const failureGate = new Promise<void>((resolve) => { failTurn = resolve; });
+    sdkMock.state.scripts.push([async () => {
+      await failureGate;
+      throw new Error('Qoder transport write failed');
+    }]);
+    await p.send(route, 'foreground');
+    await vi.waitFor(() => expect(sdkMock.state.streamInputs).toHaveLength(1));
+    const admission = p.notifyActiveDelegation(route, {
+      notificationId: 'qoder-retry-id',
+      delegationId: 'composer-append',
+      sourceSessionName: route,
+      text: 'retry me',
+    });
+    failTurn();
+    let settled = false;
+    void admission.finally(() => { settled = true; });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(settled).toBe(false);
+    consumeInput();
+    await expect(admission).resolves.toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    expect(sdkMock.state.streamInputs).toHaveLength(2);
+  });
+
   it('keeps provider connected but send-degraded when the local runtime is unavailable', async () => {
     sdkMock.state.runtimePresent = false;
     const p = await makeProvider();
@@ -404,14 +600,18 @@ describe('Qoder SDK readiness and streaming fixtures', () => {
     await vi.waitFor(() => expect(events.completions).toHaveLength(1));
 
     const call = sdkMock.state.calls[0];
-    expect(call.prompt).toBe('hello');
+    await vi.waitFor(() => expect(sdkMock.state.streamInputs).toHaveLength(1));
+    expect(sdkMock.state.streamInputs[0]).toMatchObject({
+      type: 'user',
+      message: { role: 'user', content: [{ type: 'text', text: 'hello' }] },
+    });
     expect(call.options).toMatchObject({
       includePartialMessages: true,
       strictMcpConfig: true,
       allowedMcpServerNames: [IMCODES_MEMORY_MCP_SERVER_NAME],
-      maxTurns: 1,
       permissionMode: 'default',
     });
+    expect(call.options.maxTurns).toBeUndefined();
     expect(call.options.auth).toEqual({
       type: 'accessToken',
       accessToken: { envVar: 'QODER_PERSONAL_ACCESS_TOKEN' },

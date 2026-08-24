@@ -36,6 +36,7 @@ function lastWs(): any {
 import { OpenClawProvider } from '../../src/agent/providers/openclaw.js';
 import type { ProviderError } from '../../src/agent/transport-provider.js';
 import type { AgentMessage, MessageDelta, ToolCallEvent } from '../../shared/agent-message.js';
+import { AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES } from '../../shared/agent-delegation.js';
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -122,6 +123,7 @@ describe('OpenClawProvider', () => {
       reasoningEffort: true,
       supportedEffortLevels: ['off', 'minimal', 'low', 'medium', 'high', 'adaptive'],
       contextSupport: 'full-normalized-context-injection',
+      activeDelegationNotification: AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.UNSUPPORTED,
       compact: {
         execution: 'unsupported',
         verified: true,
@@ -130,6 +132,12 @@ describe('OpenClawProvider', () => {
         reason: 'Verified in this adapter/environment: OpenClaw exposes no compact RPC/command path here, and no local openclaw CLI is installed to test a provider slash command.',
       },
     });
+  });
+
+  it('does not expose a native active-turn notifier without active-only gateway admission', () => {
+    expect(provider.capabilities.activeDelegationNotification)
+      .toBe(AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.UNSUPPORTED);
+    expect(provider.notifyActiveDelegation).toBeUndefined();
   });
 
   // 2. Handshake flow
@@ -263,6 +271,7 @@ describe('OpenClawProvider', () => {
       expect(rpcFrame.params.message).toBe('Hello agent');
       expect(rpcFrame.params.thinking).toBe('off');
       expect(rpcFrame.params.idempotencyKey).toBeDefined();
+      expect(rpcFrame.params).not.toHaveProperty('queueMode');
 
       replyToLastRpc();
       await sendPromise;

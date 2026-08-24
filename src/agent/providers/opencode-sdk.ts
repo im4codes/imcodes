@@ -737,7 +737,6 @@ export class OpenCodeSdkProvider implements TransportProvider {
     const state = this.sessions.get(sessionId);
     if (!state?.busy || state.cancelled) return AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE;
     if (!state.client.notificationSession) return AGENT_DELEGATION_NOTIFICATION_RESULTS.UNSUPPORTED;
-    const generation = state.generation;
     await state.client.notificationSession.prompt({
       sessionID: state.providerSessionId,
       id: notification.notificationId,
@@ -745,9 +744,9 @@ export class OpenCodeSdkProvider implements TransportProvider {
       delivery: 'steer',
       resume: true,
     }, { throwOnError: true });
-    if (!this.isCurrent(state, generation) || state.cancelled) {
-      return AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE;
-    }
+    // A successful prompt RPC is the irreversible provider admission ACK.
+    // Do not post-check generation/idle after success: doing so would retain
+    // and replay a message that OpenCode has already accepted.
     return AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED;
   }
 

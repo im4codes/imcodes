@@ -107,6 +107,10 @@ vi.mock('react-i18next', () => ({
       if (key === 'session.send_placeholder_desktop_shortcuts') {
         return `${String(opts?.placeholder ?? '')}\n/ commands · # phrases · @ files/agents · ; aliases · ^ nodes · paste or drag files`;
       }
+      if (key === 'session.delivery_mode_queue') return 'Queue';
+      if (key === 'session.delivery_mode_append') return 'Append';
+      if (key === 'session.delivery_mode_queue_description') return 'Wait until the current reply finishes';
+      if (key === 'session.delivery_mode_append_description') return 'Add to the current reply at the next safe boundary';
       if (key === 'session.composer_target_label') return 'Sending to';
       if (key === 'session.composer_target_aria') {
         return `Message target: ${String(opts?.name ?? '')}`;
@@ -998,6 +1002,31 @@ afterEach(() => {
     expect(screen.getByTitle('voice_input')).toBeDefined();
   });
 
+  it('uses an icon-only mobile delivery toggle and places attachment after voice inside the composer', () => {
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 390 });
+    const { container } = render(
+      <SessionControls
+        ws={makeWs() as any}
+        serverId="srv-mobile-compose"
+        activeSession={makeTransportSession({ name: 'transport-mobile' })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+    const toggle = screen.getByRole('button', {
+      name: 'Queue: Wait until the current reply finishes',
+    });
+    expect(toggle.classList.contains('composer-delivery-mode-mobile')).toBe(true);
+    expect(toggle.textContent).toBe('');
+
+    const trailing = container.querySelector('.controls-composer-trailing-actions');
+    expect(trailing).toBeTruthy();
+    expect(Array.from(trailing!.children).map((node) => (node as HTMLElement).className)).toEqual([
+      expect.stringContaining('btn-voice-embedded'),
+      expect.stringContaining('btn-attachment-embedded'),
+    ]);
+    expect(screen.getAllByTitle('upload_file')).toHaveLength(1);
+  });
+
   it('hides the embedded voice button after typing on mobile', () => {
     Object.defineProperty(window, 'innerWidth', { configurable: true, value: 390 });
     render(<SessionControls ws={makeWs() as any} activeSession={makeSession()} quickData={makeQuickData() as any} />);
@@ -1110,6 +1139,65 @@ afterEach(() => {
       sessionName: 'my-session',
       text: 'run tests',
     });
+  });
+
+  it('defaults transport composer delivery to queue and only appends after an explicit toggle', () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeTransportSession({ name: 'transport-compose', state: 'idle' })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    const queueToggle = screen.getByRole('button', {
+      name: 'Queue: Wait until the current reply finishes',
+    });
+    expect(queueToggle.getAttribute('aria-pressed')).toBe('false');
+
+    input.textContent = 'ordinary FIFO';
+    fireEvent.input(input);
+    fireEvent.keyDown(input, { key: 'Enter' });
+    const first = gatherSendCalls(ws)[0];
+    expect(first).toMatchObject({ sessionName: 'transport-compose', text: 'ordinary FIFO' });
+    expect(first).not.toHaveProperty('deliveryMode');
+
+    fireEvent.click(queueToggle);
+    const appendToggle = screen.getByRole('button', {
+      name: 'Append: Add to the current reply at the next safe boundary',
+    });
+    expect(appendToggle.getAttribute('aria-pressed')).toBe('true');
+    input.textContent = 'append at next boundary';
+    fireEvent.input(input);
+    fireEvent.keyDown(input, { key: 'Enter' });
+    expect(gatherSendCalls(ws)[1]).toMatchObject({
+      sessionName: 'transport-compose',
+      text: 'append at next boundary',
+      deliveryMode: 'append',
+    });
+  });
+
+  it('does not apply composer append mode to SDK-native slash commands', () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeTransportSession({ name: 'transport-command', state: 'idle' })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+    fireEvent.click(screen.getByRole('button', {
+      name: 'Queue: Wait until the current reply finishes',
+    }));
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.textContent = '/compact';
+    fireEvent.input(input);
+    fireEvent.keyDown(input, { key: 'Enter' });
+
+    const payload = gatherSendCalls(ws)[0];
+    expect(payload).toMatchObject({ sessionName: 'transport-command', text: '/compact' });
+    expect(payload).not.toHaveProperty('deliveryMode');
   });
 
   it('generates a distinct commandId for each send', () => {

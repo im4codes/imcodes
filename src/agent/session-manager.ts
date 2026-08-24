@@ -81,8 +81,9 @@ import { closeSingleSession, collectProjectCloseTargets, type CloseFailure, type
 import { cleanupKnownTestTerminalSessions } from './startup-test-session-cleanup.js';
 import { clearResend, drainResend, getResendCount, getResendEntries, listFreshResendQueues } from '../daemon/transport-resend-queue.js';
 import { preserveTransportRuntimeQueuesToResend } from '../daemon/transport-resend-preservation.js';
+import { deliverTransportResendEntry } from './transport-resend-delivery.js';
 import { getTransportQueueRevision, observeTransportQueueRevision } from '../daemon/transport-queue-revision.js';
-import { buildTransportQueueSnapshotPayload } from '../daemon/transport-queue-projection.js';
+import { buildTransportQueueSnapshotPayload, transportQueueSnapshotToPayload } from '../daemon/transport-queue-projection.js';
 import { appendTransportEvent, replayTransportHistory } from '../daemon/transport-history.js';
 import { materializeMasterSummary } from '../context/materialization-coordinator.js';
 import { serializeContextNamespace } from '../context/context-keys.js';
@@ -1376,37 +1377,10 @@ async function drainTransportResendQueueIntoRuntime(
   try {
     await drainResend(
       sessionName,
-      (entry) => {
+      async (entry) => {
         const attachments = entry.attachments ?? [];
-        // Single metadata object for every send shape below. `providerText`
-        // (alias-expanded agent-bound copy, A′) rides here so the provider gets
-        // the expanded text while `entry.text` stays the timeline copy; the
-        // committed flags and sharedActor are threaded exactly as before.
-        const resendMetadata = {
-          ...(entry.sharedActor ? { sharedActor: entry.sharedActor } : {}),
-          ...(entry.providerText != null ? { providerText: entry.providerText } : {}),
-          // Preserve the anchor across a reconnect resend for the same reason as
-          // providerText: the user.message is emitted after this hop.
-          ...(entry.aliasAudit ? { aliasAudit: entry.aliasAudit } : {}),
-          ...(entry.timelineCommitted ? { timelineCommitted: true } : {}),
-          ...(entry.historyCommitted ? { historyCommitted: true } : {}),
-        };
-        const result = entry.messagePreamble
-          ? runtime.send(
-              entry.text,
-              entry.commandId,
-              attachments.length > 0 ? attachments : undefined,
-              entry.messagePreamble,
-              resendMetadata,
-            )
-          : runtime.send(
-              entry.text,
-              entry.commandId,
-              attachments.length > 0 ? attachments : undefined,
-              undefined,
-              resendMetadata,
-            );
-        if (result === 'sent' && !entry.timelineCommitted) {
+        const result = await deliverTransportResendEntry(runtime, entry);
+        if ((result === 'sent' || result === 'appended') && !entry.timelineCommitted) {
           const clientMessageId = entry.clientMessageId;
           if (!clientMessageId) {
             logger.warn({ sessionName, commandId: entry.commandId }, 'transport resend drain sent without clientMessageId; user.message projection skipped');
@@ -1435,7 +1409,7 @@ async function drainTransportResendQueueIntoRuntime(
             buildTransportQueueSessionStatePayload(sessionName, 'running', 'transport_resend_drain_sent'),
             { source: 'daemon', confidence: 'high' },
           );
-        } else if (result === 'sent') {
+        } else if (result === 'sent' || result === 'appended') {
           timelineEmitter.emit(
             sessionName,
             'session.state',
@@ -1734,6 +1708,37 @@ function wireTransportCallbacks(
       }),
       { source: 'daemon', confidence: 'high' },
     );
+  };
+  runtime.onActiveAppend = (messages, snapshot) => {
+    const pendingMessageVersion = observeTransportQueueRevision(sessionName, snapshot.pendingMessageVersion);
+    for (const entry of messages) {
+      // Avoid a static cycle: supervision-automation owns runtimes through this
+      // module. The import resolves in the same process turn and only clears an
+      // already-queued intent after provider admission is authoritative.
+      void import('../daemon/supervision-automation.js').then(({ supervisionAutomation }) => {
+        supervisionAutomation.removeQueuedTaskIntent(sessionName, entry.clientMessageId);
+      }).catch(() => {});
+      timelineEmitter.emit(
+        sessionName,
+        'user.message',
+        {
+          text: entry.text,
+          commandId: entry.clientMessageId,
+          clientMessageId: entry.clientMessageId,
+          allowDuplicate: true,
+          queueAppended: true,
+          pendingMessageVersion,
+          ...(entry.sharedActor ? { sharedActor: entry.sharedActor } : {}),
+          ...(entry.aliasAudit ? { aliasAudit: entry.aliasAudit } : {}),
+        },
+        { source: 'daemon', confidence: 'high', eventId: transportUserEventId(entry.clientMessageId) },
+      );
+    }
+    persistTransportState('running');
+    timelineEmitter.emit(sessionName, 'session.state', {
+      state: runtime.pendingCount > 0 ? 'queued' : 'running',
+      ...transportQueueSnapshotToPayload(snapshot),
+    }, { source: 'daemon', confidence: 'high' });
   };
   if (!options.deferProviderReadyDrain) wireTransportProviderReadyDrain(runtime, sessionName);
   runtime.onStartupMemoryInjected = () => {

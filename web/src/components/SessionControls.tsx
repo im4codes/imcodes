@@ -71,6 +71,7 @@ import {
   TRANSPORT_QUEUE_COMMANDS,
   TRANSPORT_QUEUE_DELIVERY_EVENT_TYPE,
 } from '@shared/transport-queue-types.js';
+import { SESSION_SEND_DELIVERY_MODES } from '@shared/session-send-delivery.js';
 import { MSG_COMMAND_FAILED } from '@shared/ack-protocol.js';
 import { FS_READ_ERROR_CODES } from '@shared/fs-read-error-codes.js';
 import {
@@ -360,6 +361,22 @@ type OpenSpecTaskStatsSummary = {
   checked: number;
   unchecked: number;
 };
+
+function ComposerDeliveryModeIcon({ append }: { append: boolean }) {
+  return append ? (
+    <svg class="composer-delivery-mode-icon" viewBox="0 0 20 20" aria-hidden="true">
+      <path d="M3.5 5.25h7.25M3.5 9.75h5.25" />
+      <path d="M8.5 9.75h3.25a3.75 3.75 0 0 1 3.75 3.75v.75" />
+      <path d="m12.75 14.1 1.65 1.65 2.85-3.25" />
+    </svg>
+  ) : (
+    <svg class="composer-delivery-mode-icon" viewBox="0 0 20 20" aria-hidden="true">
+      <path d="M3.25 5.25h7.5M3.25 9.5h6" />
+      <circle cx="13.5" cy="13" r="3.5" />
+      <path d="M13.5 11v2.25l1.5.9" />
+    </svg>
+  );
+}
 
 type OpenSpecChangeListItem = {
   name: string;
@@ -1163,6 +1180,9 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const [thinkingOpen, setThinkingOpen] = useState(false);
   const [cloneDialogOpen, setCloneDialogOpen] = useState(false);
   const [quickOpen, setQuickOpen] = useState(false);
+  // Queue is deliberately the safe default for every newly selected session.
+  // Direct append is an explicit, local composer choice.
+  const [directAppendMode, setDirectAppendMode] = useState(false);
   const [p2pMode, setP2pMode] = useState<P2pMode>('solo');
   const [p2pExcludeSameType, setP2pExcludeSameType] = useState(true);
   const [p2pOpen, setP2pOpen] = useState(false);
@@ -2376,6 +2396,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
 
   // Reset P2P mode on session change
   useEffect(() => { setP2pMode('solo'); setP2pOpen(false); }, [activeSession?.name]);
+  useEffect(() => { setDirectAppendMode(false); }, [activeSession?.name]);
   useEffect(() => { setCloneDialogOpen(false); }, [activeSession?.name]);
   useEffect(() => {
     setPendingComboSendConfirm(null);
@@ -3848,6 +3869,14 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       || (payload.extra.p2pSessionConfig != null && typeof payload.extra.p2pSessionConfig === 'object')
     );
     const isDelegationSend = Boolean(payload.delegation);
+    const directAppendRequested = effectiveRuntimeType === 'transport'
+      && directAppendMode
+      && !isP2pSend
+      && !isDelegationSend
+      && !payload.text.trim().startsWith('/');
+    const effectiveSendExtra = directAppendRequested
+      ? { ...payload.extra, deliveryMode: SESSION_SEND_DELIVERY_MODES.APPEND }
+      : payload.extra;
     const clearComposerState = () => {
       pendingAtTargetsRef.current = [];
       pendingConfigOverrideRef.current = null;
@@ -3914,7 +3943,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     const commandId = makeCommandId();
     let localFailure: string | undefined;
     try {
-      if (!sendSessionMessage(payload.text, payload.extra, commandId)) return 'rejected';
+      if (!sendSessionMessage(payload.text, effectiveSendExtra, commandId)) return 'rejected';
     } catch (err) {
       localFailure = err instanceof Error ? err.message : String(err || 'Send failed');
     }
@@ -3952,7 +3981,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       onSend?.(activeSession.name, payload.text, {
         commandId,
         ...(attachmentSnapshot ? { attachments: attachmentSnapshot } : {}),
-        ...(payload.extra && Object.keys(payload.extra).length > 0 ? { extra: payload.extra } : {}),
+        ...(effectiveSendExtra && Object.keys(effectiveSendExtra).length > 0 ? { extra: effectiveSendExtra } : {}),
         ...(localFailure ? { localFailure } : {}),
       });
     }
@@ -3960,7 +3989,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       clearComposerState();
     }
     return localFailure ? 'rejected' : 'accepted';
-  }, [activeSession, attachmentDraftKey, cancelActiveTransportTurn, draftKey, editingQueuedMessageId, effectiveRuntimeType, incomingQueuedTransportEntries, incomingQueuedTransportVersion, makeCommandId, onRemoveQuote, onSend, publishComposerText, quickData, queuedTransportEntries, quotes, sendQueuedMessageMutation, sendSessionMessage, showSendWarning, showStopFeedback, t, transportSendShouldQueue, uploading]);
+  }, [activeSession, attachmentDraftKey, cancelActiveTransportTurn, directAppendMode, draftKey, editingQueuedMessageId, effectiveRuntimeType, incomingQueuedTransportEntries, incomingQueuedTransportVersion, makeCommandId, onRemoveQuote, onSend, publishComposerText, quickData, queuedTransportEntries, quotes, sendQueuedMessageMutation, sendSessionMessage, showSendWarning, showStopFeedback, t, transportSendShouldQueue, uploading]);
 
   const handleQueuedMessageEdit = useCallback((entry: { clientMessageId: string; text: string }) => {
     if (!isEditableQueuedEntry(entry)) return;
@@ -4848,6 +4877,14 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
 
   const isMobileLayout = typeof window !== 'undefined' && window.innerWidth <= 640;
   const showEmbeddedVoiceButton = isMobileLayout && VoiceInput.isAvailable() && !hasText;
+  const showEmbeddedAttachmentButton = isMobileLayout && !!serverId;
+  const embeddedComposerActionCount = Number(showEmbeddedVoiceButton) + Number(showEmbeddedAttachmentButton);
+  const deliveryModeLabel = directAppendMode
+    ? t('session.delivery_mode_append')
+    : t('session.delivery_mode_queue');
+  const deliveryModeDescription = directAppendMode
+    ? t('session.delivery_mode_append_description')
+    : t('session.delivery_mode_queue_description');
   const showCompactMetaControls = !!(openSpecChangesPath || isClaudeCode || isCodex || isQwen || supportsThinking || !isShellLike);
   const composerSubSession = subSessionId
     ? subSessions?.find((session) => session.sessionName === activeSession?.name)
@@ -6095,6 +6132,21 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           />
         </div>
 
+        {!isMobileLayout && isTransport && (
+          <button
+            type="button"
+            class={`composer-delivery-mode composer-delivery-mode-desktop${directAppendMode ? ' is-append' : ' is-queue'}`}
+            onClick={() => setDirectAppendMode((enabled) => !enabled)}
+            aria-pressed={directAppendMode}
+            aria-label={`${deliveryModeLabel}: ${deliveryModeDescription}`}
+            title={deliveryModeDescription}
+            disabled={inputDisabled}
+          >
+            <ComposerDeliveryModeIcon append={directAppendMode} />
+            <span>{deliveryModeLabel}</span>
+          </button>
+        )}
+
         {/* @ mention picker */}
         {atPickerOpen && ws && activeSession && (
           <AtPicker
@@ -6435,7 +6487,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           for contenteditable elements, unlike <input> or <textarea>.
         */}
         {mobileComposerExpanded && <div class="controls-composer-backdrop" onClick={() => setMobileComposerExpanded(false)} />}
-        <div class={`controls-composer${showEmbeddedVoiceButton ? ' controls-composer-with-voice' : ''}${mobileComposerExpanded ? ' controls-composer-mobile-expanded' : ''}`}>
+        <div class={`controls-composer${embeddedComposerActionCount > 0 ? ' controls-composer-with-trailing' : ''}${mobileComposerExpanded ? ' controls-composer-mobile-expanded' : ''}`}>
           {!isMobileLayout && !compact && (
             <>
               <div
@@ -6455,7 +6507,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           )}
           <div
             ref={divRef}
-            class={`controls-input${inputDisabled ? ' controls-input-disabled' : ''}${p2pMode !== 'solo' ? ' controls-input-p2p' : ''}${showEmbeddedVoiceButton ? ' controls-input-with-trailing' : ''}${fileDragActive ? ' controls-input-file-drag-over' : ''}`}
+            class={`controls-input${inputDisabled ? ' controls-input-disabled' : ''}${p2pMode !== 'solo' ? ' controls-input-p2p' : ''}${embeddedComposerActionCount > 0 ? ` controls-input-with-trailing controls-input-with-trailing-${embeddedComposerActionCount}` : ''}${fileDragActive ? ' controls-input-file-drag-over' : ''}`}
             data-onboarding="chat-input"
             contenteditable={inputDisabled ? 'false' : 'true'}
             role="textbox"
@@ -6606,25 +6658,51 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
             onDragLeave={handleFileDragLeave}
             onDrop={handleFileDrop}
           />
-          {showEmbeddedVoiceButton && (
-            <button
-              class="btn btn-voice btn-voice-embedded"
-              // Open on pointerdown (fires synchronously at touch-start) so the
-              // tap is never lost to the ~300ms click delay or to a re-render
-              // unmounting this conditionally-rendered button mid-gesture (the
-              // timeline re-renders constantly while an agent streams).
-              // preventDefault stops the tap from falling through to focus the
-              // input. onClick is kept as an idempotent fallback.
-              onPointerDown={(e) => { e.preventDefault(); setVoiceOpen(true); }}
-              onClick={() => setVoiceOpen(true)}
-              disabled={inputDisabled}
-              title={t('voice.voice_input')}
-              aria-label={t('voice.voice_input')}
-            >
-              🎙
-            </button>
+          {embeddedComposerActionCount > 0 && (
+            <div class="controls-composer-trailing-actions">
+              {showEmbeddedVoiceButton && (
+                <button
+                  class="btn btn-voice btn-voice-embedded"
+                  // Open on pointerdown (fires synchronously at touch-start) so the
+                  // tap is never lost to the ~300ms click delay or to a re-render
+                  // unmounting this conditionally-rendered button mid-gesture.
+                  onPointerDown={(e) => { e.preventDefault(); setVoiceOpen(true); }}
+                  onClick={() => setVoiceOpen(true)}
+                  disabled={inputDisabled}
+                  title={t('voice.voice_input')}
+                  aria-label={t('voice.voice_input')}
+                >
+                  🎙
+                </button>
+              )}
+              {showEmbeddedAttachmentButton && (
+                <button
+                  class="btn btn-voice btn-attachment-embedded"
+                  onPointerDown={(e) => e.preventDefault()}
+                  onClick={() => fileInputRef.current?.click()}
+                  disabled={inputDisabled || uploading}
+                  title={uploading ? t('upload.uploading') : t('upload.upload_file')}
+                  aria-label={uploading ? t('upload.uploading') : t('upload.upload_file')}
+                >
+                  {uploading ? '…' : '\u{1F4CE}'}
+                </button>
+              )}
+            </div>
           )}
         </div>
+        {isMobileLayout && isTransport && (
+          <button
+            type="button"
+            class={`composer-delivery-mode composer-delivery-mode-mobile${directAppendMode ? ' is-append' : ' is-queue'}`}
+            onClick={() => setDirectAppendMode((enabled) => !enabled)}
+            aria-pressed={directAppendMode}
+            aria-label={`${deliveryModeLabel}: ${deliveryModeDescription}`}
+            title={deliveryModeDescription}
+            disabled={inputDisabled}
+          >
+            <ComposerDeliveryModeIcon append={directAppendMode} />
+          </button>
+        )}
         {serverId && (
           <>
             <input
@@ -6638,14 +6716,16 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                 input.value = '';
               }}
             />
-            <button
-              class="btn btn-voice"
-              onClick={() => fileInputRef.current?.click()}
-              disabled={inputDisabled || uploading}
-              title={uploading ? t('upload.uploading') : t('upload.upload_file')}
-            >
-              {uploading ? '...' : '\u{1F4CE}'}
-            </button>
+            {!isMobileLayout && (
+              <button
+                class="btn btn-voice"
+                onClick={() => fileInputRef.current?.click()}
+                disabled={inputDisabled || uploading}
+                title={uploading ? t('upload.uploading') : t('upload.upload_file')}
+              >
+                {uploading ? '...' : '\u{1F4CE}'}
+              </button>
+            )}
           </>
         )}
         {!isMobileLayout && VoiceInput.isAvailable() && (

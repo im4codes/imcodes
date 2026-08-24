@@ -329,7 +329,10 @@ export class DeepseekHarnessProvider implements TransportProvider {
     state.toolNames.clear();
     // Stale counters would otherwise be stamped onto a turn that reports none.
     state.lastUsage = undefined;
-    this.write(state, { type: DSH_BRIDGE_COMMAND.PROMPT, text });
+    if (!this.write(state, { type: DSH_BRIDGE_COMMAND.PROMPT, text })) {
+      state.turnActive = false;
+      throw this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, 'dsh bridge stdin is unavailable', true);
+    }
     // Only claim the session text landed once the turn actually settles: `write`
     // is a silent no-op on a closed stdin, and committing here would leave a
     // retried turn permanently stripped of its session instructions.
@@ -348,8 +351,9 @@ export class DeepseekHarnessProvider implements TransportProvider {
     // steering messages in dsh. `followup()` would defer them until idle and
     // defeat the product's Append/now contract; `steer()` keeps the current
     // tool batch alive and inserts the text before the next model step.
-    this.write(state, { type: DSH_BRIDGE_COMMAND.STEER, text: notification.text });
-    return AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED;
+    return this.write(state, { type: DSH_BRIDGE_COMMAND.STEER, text: notification.text })
+      ? AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED
+      : AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE;
   }
 
   async cancel(sessionId: string): Promise<void> {
@@ -585,10 +589,18 @@ export class DeepseekHarnessProvider implements TransportProvider {
     await killProcessTree(child, { gracefulMs: SHUTDOWN_GRACE_MS }).catch(() => {});
   }
 
-  private write(state: DeepseekHarnessSessionState, command: DshBridgeCommand): void {
+  private write(state: DeepseekHarnessSessionState, command: DshBridgeCommand): boolean {
     const stdin = state.child?.stdin;
-    if (!stdin || stdin.destroyed) return;
-    stdin.write(`${JSON.stringify(command)}\n`);
+    if (!stdin || stdin.destroyed) return false;
+    try {
+      // A false Writable.write() result is backpressure, not rejection: the
+      // bytes are already accepted into Node's buffer. Only absence,
+      // destruction, or a synchronous write error means no admission.
+      stdin.write(`${JSON.stringify(command)}\n`);
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   // ── Bridge event handling ──────────────────────────────────────────────────

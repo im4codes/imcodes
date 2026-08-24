@@ -42,7 +42,7 @@
 
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { Readable, Writable } from 'node:stream';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import {
   ClientSideConnection,
   ndJsonStream,
@@ -122,6 +122,21 @@ const KIMI_BIN = 'kimi';
 /** Kimi ACP currently advertises one mode named `default`. */
 const KIMI_DEFAULT_MODE = 'default';
 
+function stableAcpMessageId(notificationId: string): string {
+  const hex = createHash('sha256')
+    .update('imcodes-acp-active-prompt\0')
+    .update(notificationId)
+    .digest('hex')
+    .slice(0, 32)
+    .split('');
+  // Canonical deterministic UUIDv5 shape. The input remains private to the
+  // local daemon; only this non-secret correlation id crosses ACP.
+  hex[12] = '5';
+  hex[16] = ((Number.parseInt(hex[16] ?? '0', 16) & 0x3) | 0x8).toString(16);
+  const compact = hex.join('');
+  return `${compact.slice(0, 8)}-${compact.slice(8, 12)}-${compact.slice(12, 16)}-${compact.slice(16, 20)}-${compact.slice(20)}`;
+}
+
 export interface AcpCliProviderProfile {
   id: string;
   displayName: string;
@@ -176,6 +191,10 @@ interface KimiSdkSessionState {
   modeApplied: boolean;
   /** Set while a `prompt` RPC is in flight. */
   promptInFlight: boolean;
+  /** Generation whose original prompt RPC has actually been submitted. */
+  promptSubmittedGeneration: number | null;
+  /** Generation-scoped, stable-id admission results for verified busy prompts. */
+  activePromptAdmissions: Map<string, Promise<AgentDelegationNotificationResult>>;
   /** Monotonic local turn generation used to suppress duplicate terminals. */
   turnGeneration: number;
   /** Most recent generation that emitted a terminal completion/error. */
@@ -365,6 +384,8 @@ export class KimiSdkProvider implements TransportProvider {
       loaded: false,
       modeApplied: false,
       promptInFlight: false,
+      promptSubmittedGeneration: null,
+      activePromptAdmissions: new Map(),
       turnGeneration: existing?.turnGeneration ?? 0,
       settledGeneration: existing?.settledGeneration ?? 0,
       replaying: false,
@@ -562,13 +583,12 @@ export class KimiSdkProvider implements TransportProvider {
     state.lastStatusSignature = null;
 
     const payload = normalizeProviderPayload(payloadOrMessage, attachments, extraSystemPrompt);
-    // TransportProvider.send is a send-start contract: the runtime owns the
-    // in-flight turn state and waits for onDelta/onComplete/onError callbacks.
-    // ACP `prompt()` is long-lived and resolves only when the turn finishes, so
-    // awaiting it here would make generic send-start watchdogs look like total
-    // turn timeouts for normal long-running Kimi work.
+    // TransportProvider.send is a send-start/admission contract: resolve only
+    // after the original ACP prompt RPC has actually been invoked, but never
+    // wait for that long-lived RPC to finish the whole model turn.  The runtime
+    // uses this boundary to guarantee B/C cannot overtake A.
     const generation = ++state.turnGeneration;
-    void this.startTurn(sessionId, state, payload, generation);
+    await this.startTurn(sessionId, state, payload, generation);
   }
 
   async cancel(sessionId: string): Promise<void> {
@@ -600,22 +620,86 @@ export class KimiSdkProvider implements TransportProvider {
     notification: ProviderDelegationNotification,
   ): Promise<AgentDelegationNotificationResult> {
     const state = this.sessions.get(sessionId);
-    if (!state?.promptInFlight || state.cancelled || !state.loaded || !state.acpSessionId || !this.connection) {
+    if (!state?.promptInFlight
+      || state.promptSubmittedGeneration !== state.turnGeneration
+      || state.cancelled
+      || !state.loaded
+      || !state.acpSessionId
+      || !this.connection) {
       return AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE;
     }
 
+    const existing = state.activePromptAdmissions.get(notification.notificationId);
+    if (existing) return existing;
+    const admission = this.deliverActiveAcpPrompt(sessionId, state, notification);
+    state.activePromptAdmissions.set(notification.notificationId, admission);
     try {
-      const result = await this.connection.prompt({
-        sessionId: state.acpSessionId,
-        prompt: [{ type: 'text', text: notification.text }],
-      });
-      return result.stopReason === 'cancelled'
-        ? AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE
-        : AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED;
+      const result = await admission;
+      if (result !== AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED) {
+        state.activePromptAdmissions.delete(notification.notificationId);
+      }
+      return result;
     } catch (error) {
+      state.activePromptAdmissions.delete(notification.notificationId);
       logger.debug({ provider: this.id, sessionId, error }, 'ACP active-turn prompt admission failed');
       return AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE;
     }
+  }
+
+  private async deliverActiveAcpPrompt(
+    sessionId: string,
+    state: KimiSdkSessionState,
+    notification: ProviderDelegationNotification,
+  ): Promise<AgentDelegationNotificationResult> {
+    const connection = this.connection;
+    if (!connection) return AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE;
+    try {
+      // ACP's response is the queued prompt's *turn completion*, not a short
+      // admission ACK.  Calling prompt() submits the request to the live ACP
+      // connection; observe its eventual settlement in the background so the
+      // runtime can enqueue B then C immediately instead of timing out and
+      // replaying already-admitted text through the idle FIFO.
+      const queuedPrompt = connection.prompt({
+        sessionId: state.acpSessionId,
+        prompt: [{ type: 'text', text: notification.text }],
+        // ACP's canonical unstable messageId is the only provider-visible
+        // correlation key available for a queued prompt. Derive a valid stable
+        // UUID from IM.codes' durable notification id; the generation-scoped
+        // admission map handles local retries, while capable ACP agents may use
+        // this id to correlate a replay across their own history.
+        messageId: stableAcpMessageId(notification.notificationId),
+      });
+      void queuedPrompt.then((result) => {
+        if (result.stopReason === 'cancelled') {
+          logger.debug({ provider: this.id, sessionId }, 'ACP active-turn queued prompt later settled as cancelled');
+        }
+      }).catch((error: unknown) => {
+        logger.warn({ provider: this.id, sessionId, error }, 'ACP active-turn queued prompt failed after submission');
+      });
+      // ClientSideConnection.prompt() resolves at the end of the queued turn,
+      // while sendRequest() writes through an internal serialized writeQueue.
+      // Wait for that exact write to flush, not for the model turn, before
+      // committing the durable IM.codes row. If the writable failed, ACP closes
+      // the connection and the abort signal is authoritative.
+      return await this.waitForAcpWrite(connection, true)
+        ? AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED
+        : AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE;
+    } catch (error) {
+      logger.debug({ provider: this.id, sessionId, error }, 'ACP active-turn prompt write failed');
+      return AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE;
+    }
+  }
+
+  private async waitForAcpWrite(connection: ClientSideConnection, requireTracker: boolean): Promise<boolean> {
+    const tracker = (connection as unknown as {
+      connection?: {
+        writeQueue?: Promise<void>;
+        abortController?: { signal?: AbortSignal };
+      };
+    }).connection;
+    if (!tracker?.writeQueue) return !requireTracker;
+    await tracker.writeQueue;
+    return tracker.abortController?.signal?.aborted !== true;
   }
 
   // ── ACP client-side glue ────────────────────────────────────────────────
@@ -815,6 +899,8 @@ export class KimiSdkProvider implements TransportProvider {
     generation: number,
   ): Promise<void> {
     state.promptInFlight = true;
+    state.promptSubmittedGeneration = null;
+    state.activePromptAdmissions.clear();
     try {
       await this.ensureSessionReady(sessionId, state);
       // Start the turn's delta buffer clean. (During loadSession the replay
@@ -827,24 +913,61 @@ export class KimiSdkProvider implements TransportProvider {
       const includeSessionSystemText = !!sessionSystemText && state.sessionSystemTextInjected !== sessionSystemText;
       const promptBlocks = this.buildPromptContent(payload, includeSessionSystemText);
 
-      // Long-lived call — agent streams sessionUpdate notifications until this
-      // resolves with { stopReason }.
-      const result: PromptResponse = await this.connection!.prompt({
+      // Long-lived call — invoking it submits A; its Promise resolves only
+      // when the turn ends.  Publish the generation-scoped admission boundary
+      // before returning from send(), then settle asynchronously.
+      const connection = this.connection!;
+      const turn = connection.prompt({
         sessionId: state.acpSessionId!,
         prompt: promptBlocks,
+        messageId: randomUUID(),
       });
-      this.settleTurn(sessionId, state, generation, result.stopReason, includeSessionSystemText ? sessionSystemText : undefined);
+      void turn.then((result: PromptResponse) => {
+        this.settleTurn(
+          sessionId,
+          state,
+          generation,
+          result.stopReason,
+          includeSessionSystemText ? sessionSystemText : undefined,
+        );
+      }).catch((err: unknown) => {
+        this.failTurn(sessionId, state, generation, err);
+      });
+      if (!await this.waitForAcpWrite(connection, true)) {
+        throw this.makeError(
+          PROVIDER_ERROR_CODES.CONNECTION_LOST,
+          `${this.profile.displayName} ACP prompt write failed`,
+          true,
+        );
+      }
+      if (state.turnGeneration === generation
+        && state.settledGeneration !== generation
+        && state.promptInFlight) {
+        state.promptSubmittedGeneration = generation;
+      }
     } catch (err) {
-      if (state.settledGeneration === generation) return;
-      state.settledGeneration = generation;
-      state.promptInFlight = false;
-      state.cancelled = false;
-      state.toolCalls.clear();
-      state.emittedToolSignatures.clear();
-      this.cancelPendingApprovals(sessionId);
-      this.clearStatus(sessionId, state);
-      this.emitError(sessionId, this.normalizeError(err));
+      this.failTurn(sessionId, state, generation, err);
+      throw this.normalizeError(err);
     }
+  }
+
+  private failTurn(
+    sessionId: string,
+    state: KimiSdkSessionState,
+    generation: number,
+    error: unknown,
+  ): void {
+    if (state.settledGeneration === generation) return;
+    state.settledGeneration = generation;
+    state.promptInFlight = false;
+    state.promptSubmittedGeneration = null;
+    state.activePromptAdmissions.clear();
+    state.cancelled = false;
+    state.toolCalls.clear();
+    state.emittedToolSignatures.clear();
+    this.cancelPendingApprovals(sessionId);
+    this.clearStatus(sessionId, state);
+    this.emitError(sessionId, this.normalizeError(error));
   }
 
   /** Create the session on the agent if it doesn't exist yet, otherwise
@@ -1057,6 +1180,8 @@ export class KimiSdkProvider implements TransportProvider {
     if (state.settledGeneration === generation) return;
     state.settledGeneration = generation;
     state.promptInFlight = false;
+    state.promptSubmittedGeneration = null;
+    state.activePromptAdmissions.clear();
     this.clearStatus(sessionId, state);
     const text = state.currentText;
     const messageId = state.currentMessageId ?? `${sessionId}:${randomUUID()}`;
@@ -1525,6 +1650,8 @@ export class KimiSdkProvider implements TransportProvider {
     const hadActiveWork = state.promptInFlight || state.replaying || state.toolCalls.size > 0;
     if (hadActiveWork) state.settledGeneration = state.turnGeneration;
     state.promptInFlight = false;
+    state.promptSubmittedGeneration = null;
+    state.activePromptAdmissions.clear();
     state.replaying = false;
     state.cancelled = false;
     state.currentMessageId = null;

@@ -20,6 +20,26 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
+function makeTrackedConnection(
+  implementation: (request: any) => Promise<{ stopReason: 'end_turn' | 'cancelled' }>,
+) {
+  const tracker = {
+    writeQueue: Promise.resolve(),
+    nextWrite: null as Promise<void> | null,
+    abortController: new AbortController(),
+  };
+  const prompt = vi.fn((request: any) => {
+    tracker.writeQueue = tracker.nextWrite ?? Promise.resolve();
+    tracker.nextWrite = null;
+    return implementation(request);
+  });
+  return {
+    prompt,
+    tracker,
+    connection: { prompt, connection: tracker },
+  };
+}
+
 describe('CodeBuddy ACP providers', () => {
   it('exposes China and International as independent streaming providers', () => {
     const china = new CodeBuddyChinaProvider();
@@ -41,17 +61,21 @@ describe('CodeBuddy ACP providers', () => {
 
   it('admits appended messages through CodeBuddy busy-prompt queue without cancellation', async () => {
     const provider = new CodeBuddyChinaProvider();
-    const prompt = vi.fn().mockResolvedValue({ stopReason: 'end_turn' });
+    const tracked = makeTrackedConnection(async () => ({ stopReason: 'end_turn' }));
+    const { prompt } = tracked;
     const internal = provider as unknown as {
-      connection: { prompt: typeof prompt };
+      connection: typeof tracked.connection;
       sessions: Map<string, Record<string, unknown>>;
     };
-    internal.connection = { prompt };
+    internal.connection = tracked.connection;
     internal.sessions.set('route-next', {
       routeId: 'route-next',
       cwd: '/tmp',
       loaded: true,
       promptInFlight: true,
+      turnGeneration: 1,
+      promptSubmittedGeneration: 1,
+      activePromptAdmissions: new Map(),
       cancelled: false,
       acpSessionId: 'acp-next',
     });
@@ -64,10 +88,181 @@ describe('CodeBuddy ACP providers', () => {
       deliveryKind: 'queued_message',
     })).resolves.toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
 
-    expect(prompt).toHaveBeenCalledWith({
+    expect(prompt).toHaveBeenCalledWith(expect.objectContaining({
       sessionId: 'acp-next',
       prompt: [{ type: 'text', text: 'insert at the next safe boundary' }],
+      messageId: expect.stringMatching(/^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/),
+    }));
+    await expect(provider.notifyActiveDelegation('route-next', {
+      notificationId: 'append-next',
+      delegationId: 'queue-append:append-next',
+      sourceSessionName: 'deck_codebuddy_brain',
+      text: 'insert at the next safe boundary',
+      deliveryKind: 'queued_message',
+    })).resolves.toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    expect(prompt).toHaveBeenCalledOnce();
+  });
+
+  it('does not acknowledge an ACP prompt whose serialized writable fails', async () => {
+    const provider = new CodeBuddyChinaProvider();
+    const tracked = makeTrackedConnection(() => new Promise(() => {}));
+    let releaseWrite!: () => void;
+    tracked.tracker.nextWrite = new Promise<void>((resolve) => { releaseWrite = resolve; });
+    const internal = provider as unknown as {
+      connection: typeof tracked.connection;
+      sessions: Map<string, Record<string, unknown>>;
+    };
+    internal.connection = tracked.connection;
+    internal.sessions.set('route-write-failure', {
+      routeId: 'route-write-failure',
+      cwd: '/tmp',
+      loaded: true,
+      promptInFlight: true,
+      turnGeneration: 2,
+      promptSubmittedGeneration: 2,
+      activePromptAdmissions: new Map(),
+      cancelled: false,
+      acpSessionId: 'acp-write-failure',
     });
+
+    const admission = provider.notifyActiveDelegation('route-write-failure', {
+      notificationId: 'append-write-failure',
+      delegationId: 'queue-append:append-write-failure',
+      sourceSessionName: 'deck_codebuddy_brain',
+      text: 'must remain durable',
+      deliveryKind: 'queued_message',
+    });
+    await vi.waitFor(() => expect(tracked.prompt).toHaveBeenCalledOnce());
+    tracked.tracker.abortController.abort(new Error('ACP writable failed'));
+    releaseWrite();
+
+    await expect(admission).resolves.toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE);
+  });
+
+  it.each([
+    ['China', () => new CodeBuddyChinaProvider()],
+    ['International', () => new CodeBuddyInternationalProvider()],
+  ])('submits consecutive %s appends in order without awaiting their long-lived turn responses', async (_region, makeProvider) => {
+    const provider = makeProvider();
+    const pending: Array<() => void> = [];
+    const tracked = makeTrackedConnection(() => new Promise<{ stopReason: 'end_turn' }>((resolve) => {
+      pending.push(() => resolve({ stopReason: 'end_turn' }));
+    }));
+    const { prompt } = tracked;
+    const internal = provider as unknown as {
+      connection: typeof tracked.connection;
+      sessions: Map<string, Record<string, unknown>>;
+    };
+    internal.connection = tracked.connection;
+    internal.sessions.set('route-next', {
+      routeId: 'route-next',
+      cwd: '/tmp',
+      loaded: true,
+      promptInFlight: true,
+      turnGeneration: 7,
+      promptSubmittedGeneration: 7,
+      activePromptAdmissions: new Map(),
+      cancelled: false,
+      acpSessionId: 'acp-next',
+    });
+
+    const first = provider.notifyActiveDelegation('route-next', {
+      notificationId: 'append-B',
+      delegationId: 'queue-append:append-B',
+      sourceSessionName: 'deck_codebuddy_brain',
+      text: 'B',
+      deliveryKind: 'queued_message',
+    });
+    const second = provider.notifyActiveDelegation('route-next', {
+      notificationId: 'append-C',
+      delegationId: 'queue-append:append-C',
+      sourceSessionName: 'deck_codebuddy_brain',
+      text: 'C',
+      deliveryKind: 'queued_message',
+    });
+
+    await expect(Promise.all([first, second])).resolves.toEqual([
+      AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED,
+      AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED,
+    ]);
+    expect(prompt.mock.calls.map((call) => call[0].prompt[0]?.text)).toEqual(['B', 'C']);
+    expect(pending).toHaveLength(2);
+    pending.forEach((resolve) => resolve());
+  });
+
+  it('does not append before the original CodeBuddy prompt generation is submitted', async () => {
+    const provider = new CodeBuddyChinaProvider();
+    const tracked = makeTrackedConnection(async () => ({ stopReason: 'end_turn' }));
+    const { prompt } = tracked;
+    const internal = provider as unknown as {
+      connection: typeof tracked.connection;
+      sessions: Map<string, Record<string, unknown>>;
+    };
+    internal.connection = tracked.connection;
+    internal.sessions.set('route-starting', {
+      routeId: 'route-starting',
+      cwd: '/tmp',
+      loaded: true,
+      promptInFlight: true,
+      turnGeneration: 8,
+      promptSubmittedGeneration: null,
+      activePromptAdmissions: new Map(),
+      cancelled: false,
+      acpSessionId: 'acp-starting',
+    });
+
+    await expect(provider.notifyActiveDelegation('route-starting', {
+      notificationId: 'append-too-early',
+      delegationId: 'queue-append:append-too-early',
+      sourceSessionName: 'deck_codebuddy_brain',
+      text: 'must wait for A',
+      deliveryKind: 'queued_message',
+    })).resolves.toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE);
+    expect(prompt).not.toHaveBeenCalled();
+  });
+
+  it('resolves send-start only after submitting A, while A/B/C turn responses remain long-lived', async () => {
+    const provider = new CodeBuddyChinaProvider();
+    const pending: Array<() => void> = [];
+    const tracked = makeTrackedConnection(() => new Promise<{ stopReason: 'end_turn' }>((resolve) => {
+      pending.push(() => resolve({ stopReason: 'end_turn' }));
+    }));
+    const { prompt } = tracked;
+    const internal = provider as unknown as {
+      config: Record<string, unknown> | null;
+      initPromise: Promise<void> | null;
+      connection: typeof tracked.connection;
+      sessions: Map<string, Record<string, unknown>>;
+    };
+    internal.config = {};
+    internal.initPromise = Promise.resolve();
+    internal.connection = tracked.connection;
+    await provider.createSession({ sessionKey: 'route-admission', cwd: '/tmp', resumeId: 'acp-admission' });
+    const state = internal.sessions.get('route-admission')!;
+    state.loaded = true;
+    state.modeApplied = true;
+
+    await expect(provider.send('route-admission', 'A')).resolves.toBeUndefined();
+    expect(prompt.mock.calls.map((call) => call[0].prompt[0]?.text)).toEqual(['A']);
+    expect(state.promptSubmittedGeneration).toBe(state.turnGeneration);
+
+    await expect(provider.notifyActiveDelegation('route-admission', {
+      notificationId: 'append-B',
+      delegationId: 'queue-append:append-B',
+      sourceSessionName: 'deck_codebuddy_brain',
+      text: 'B',
+      deliveryKind: 'queued_message',
+    })).resolves.toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    await expect(provider.notifyActiveDelegation('route-admission', {
+      notificationId: 'append-C',
+      delegationId: 'queue-append:append-C',
+      sourceSessionName: 'deck_codebuddy_brain',
+      text: 'C',
+      deliveryKind: 'queued_message',
+    })).resolves.toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    expect(prompt.mock.calls.map((call) => call[0].prompt[0]?.text)).toEqual(['A', 'B', 'C']);
+    expect(pending).toHaveLength(3);
+    pending.forEach((resolve) => resolve());
   });
 
   it('fails closed when there is no active CodeBuddy turn to receive an append', async () => {

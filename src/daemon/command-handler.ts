@@ -362,6 +362,7 @@ import {
 } from '../store/memory-feature-config-store.js';
 import {
   MEMORY_MCP_DISABLED_FLAGS,
+  MEMORY_MCP_SEND_DELIVERY_MODES,
   MEMORY_MCP_TOOL_NAMES,
 } from '../../shared/memory-mcp-contracts.js';
 import {
@@ -3217,6 +3218,11 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   const sessionName = (cmd.sessionName ?? cmd.session) as string | undefined;
   const text = cmd.text as string | undefined;
   const commandId = cmd.commandId as string | undefined;
+  // Omission/unknown values are the safe default: ordinary durable FIFO.
+  // Only the exact explicit append value may request a provider-native steer.
+  const requestedDeliveryMode = cmd.deliveryMode === MEMORY_MCP_SEND_DELIVERY_MODES.APPEND
+    ? MEMORY_MCP_SEND_DELIVERY_MODES.APPEND
+    : undefined;
   const inboundClientMessageId = typeof cmd.clientMessageId === 'string' && cmd.clientMessageId.trim()
     ? cmd.clientMessageId.trim()
     : undefined;
@@ -3969,6 +3975,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       ...(sharedActor ? { sharedActor } : {}),
       commandId: effectiveId,
       ...(inboundClientMessageId ? { clientMessageId: inboundClientMessageId } : {}),
+      ...(requestedDeliveryMode ? { deliveryMode: requestedDeliveryMode } : {}),
       queuedAt: Date.now(),
     });
     if (!enqueueResult.accepted) {
@@ -4059,6 +4066,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       ...(sharedActor ? { sharedActor } : {}),
       commandId: effectiveId,
       ...(inboundClientMessageId ? { clientMessageId: inboundClientMessageId } : {}),
+      ...(requestedDeliveryMode ? { deliveryMode: requestedDeliveryMode } : {}),
       queuedAt: Date.now(),
     });
     if (!enqueueResultMissingSid.accepted) {
@@ -4476,11 +4484,12 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       // `aliasAudit` must ride the metadata, not just the immediate emit: a
       // queued/resent message emits its user.message later from session-manager,
       // which can only anchor what the entry carries.
-      const sendMetadata = (sharedActor || aliasProviderText || aliasAudit)
+      const sendMetadata = (sharedActor || aliasProviderText || aliasAudit || requestedDeliveryMode)
         ? {
             ...(sharedActor ? { sharedActor } : {}),
             ...(aliasProviderText ? { providerText: aliasProviderText } : {}),
             ...(aliasAudit ? { aliasAudit } : {}),
+            ...(requestedDeliveryMode ? { deliveryMode: requestedDeliveryMode } : {}),
           }
         : undefined;
       const result = agentMessagePreamble

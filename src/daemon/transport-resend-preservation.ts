@@ -28,6 +28,7 @@ function preserveEntries(
       ...(entry.sharedActor ? { sharedActor: entry.sharedActor } : {}),
       ...(entry.timelineCommitted ? { timelineCommitted: true } : {}),
       ...(entry.historyCommitted ? { historyCommitted: true } : {}),
+      ...(entry.deliveryMode ? { deliveryMode: entry.deliveryMode } : {}),
       queuedAt: Date.now(),
     });
     seenCommandIds.add(entry.clientMessageId);

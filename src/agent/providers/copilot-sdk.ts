@@ -10,6 +10,7 @@ import type {
   SessionConfig,
   SessionInfoUpdate,
   ProviderStatusUpdate,
+  ProviderDelegationNotification,
   ToolCallEvent,
   ApprovalRequest,
   RemoteSessionInfo,
@@ -34,6 +35,11 @@ import { composeMessageSideProviderPrompt, getProviderSystemTextParts } from '..
 import { resolveBinaryWithWindowsFallbacks } from '../transport-paths.js';
 import { type TransportEffortLevel } from '../../../shared/effort-levels.js';
 import { getDefaultMcpServers } from './getDefaultMcpServers.js';
+import {
+  AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES,
+  AGENT_DELEGATION_NOTIFICATION_RESULTS,
+  type AgentDelegationNotificationResult,
+} from '../../../shared/agent-delegation.js';
 
 const COPILOT_BIN = 'copilot';
 const MIN_PROTOCOL_VERSION = 3;
@@ -137,6 +143,10 @@ interface CopilotSessionState {
   compactCompletionEmitted: boolean;
   rotationInProgress: boolean;
   generation: number;
+  activeTurnGeneration: number;
+  activeTurnReady: Promise<boolean> | null;
+  resolveActiveTurnReady: ((ready: boolean) => void) | null;
+  activeNotificationAdmissions: Map<string, Promise<AgentDelegationNotificationResult>>;
   lastStatusSignature: string | null;
   /** Stable IM.codes context already injected into this Copilot chat history. */
   sessionSystemTextInjected?: string;
@@ -283,6 +293,7 @@ export class CopilotSdkProvider implements TransportProvider {
     reasoningEffort: true,
     supportedEffortLevels: ['low', 'medium', 'high', 'max'],
     contextSupport: 'degraded-message-side-context-mapping',
+    activeDelegationNotification: AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE,
     compact: {
       execution: 'sdk-rpc',
       verified: true,
@@ -402,6 +413,7 @@ export class CopilotSdkProvider implements TransportProvider {
 
   async disconnect(): Promise<void> {
     for (const state of this.sessions.values()) {
+      this.settleActiveTurnReady(state, false);
       state.unsubscribes.forEach((fn) => fn());
       try { await state.session.disconnect?.(); } catch {}
       for (const pending of state.pendingApprovals.values()) {
@@ -472,6 +484,10 @@ export class CopilotSdkProvider implements TransportProvider {
       compactCompletionEmitted: false,
       rotationInProgress: false,
       generation: 0,
+      activeTurnGeneration: 0,
+      activeTurnReady: null,
+      resolveActiveTurnReady: null,
+      activeNotificationAdmissions: new Map(),
       lastStatusSignature: null,
       sessionSystemTextInjected: undefined,
       sessionSystemTextPending: undefined,
@@ -502,6 +518,8 @@ export class CopilotSdkProvider implements TransportProvider {
   }
 
   private detachSessionState(state: CopilotSessionState): void {
+    this.settleActiveTurnReady(state, false);
+    state.activeNotificationAdmissions.clear();
     state.unsubscribes.forEach((fn) => fn());
     state.unsubscribes = [];
     for (const pending of state.pendingApprovals.values()) {
@@ -623,6 +641,11 @@ export class CopilotSdkProvider implements TransportProvider {
     const prompt = composeMessageSideProviderPrompt(payload, { includeSessionSystemText, labelContextInstructions: false });
     const sdkAttachments = toAttachmentPayload(payload.attachments);
     this.resetTurnState(state);
+    const turnGeneration = ++state.activeTurnGeneration;
+    state.activeNotificationAdmissions.clear();
+    state.activeTurnReady = new Promise<boolean>((resolve) => {
+      state.resolveActiveTurnReady = resolve;
+    });
     state.operation = 'turn';
     state.busy = true;
     state.sessionSystemTextPending = includeSessionSystemText ? sessionSystemText : undefined;
@@ -637,7 +660,13 @@ export class CopilotSdkProvider implements TransportProvider {
         ...(sdkAttachments ? { attachments: sdkAttachments } : {}),
         mode: 'immediate',
       });
+      if (this.isActiveTurn(state, turnGeneration)) {
+        this.settleActiveTurnReady(state, true);
+      } else {
+        this.settleActiveTurnReady(state, false);
+      }
     } catch (error) {
+      this.settleActiveTurnReady(state, false);
       state.sessionSystemTextPending = undefined;
       state.busy = false;
       state.operation = 'idle';
@@ -645,7 +674,78 @@ export class CopilotSdkProvider implements TransportProvider {
     }
   }
 
+  async notifyActiveDelegation(
+    sessionId: string,
+    notification: ProviderDelegationNotification,
+  ): Promise<AgentDelegationNotificationResult> {
+    const state = this.getSessionState(sessionId);
+    if (!state || !state.busy || state.operation !== 'turn' || state.cancelRequested) {
+      return AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE;
+    }
+    const existing = state.activeNotificationAdmissions.get(notification.notificationId);
+    if (existing) return existing;
+    const turnGeneration = state.activeTurnGeneration;
+    const admission = this.deliverActiveNotification(state, turnGeneration, notification);
+    state.activeNotificationAdmissions.set(notification.notificationId, admission);
+    try {
+      const result = await admission;
+      if (result !== AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED) {
+        state.activeNotificationAdmissions.delete(notification.notificationId);
+      }
+      return result;
+    } catch (error) {
+      state.activeNotificationAdmissions.delete(notification.notificationId);
+      throw error;
+    }
+  }
+
+  private async deliverActiveNotification(
+    state: CopilotSessionState,
+    turnGeneration: number,
+    notification: ProviderDelegationNotification,
+  ): Promise<AgentDelegationNotificationResult> {
+    const ready = await state.activeTurnReady;
+    if (!ready || !this.isActiveTurn(state, turnGeneration)) {
+      return AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE;
+    }
+    try {
+      await state.session.send({
+        prompt: notification.text,
+        // Copilot SDK 0.2.2 exposes immediate delivery as its native live-turn
+        // admission path. Unlike the default enqueue mode, this enters the
+        // active interaction instead of waiting for the session to go idle.
+        mode: 'immediate',
+      });
+    } catch (error) {
+      if (!this.isActiveTurn(state, turnGeneration)) {
+        return AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE;
+      }
+      // Propagate a live-session admission error. TransportSessionRuntime keeps
+      // the durable pending row when admission throws, so the message is never
+      // acknowledged and lost.
+      throw error;
+    }
+    // The SDK RPC resolving is the irreversible admission ACK. A concurrent
+    // session.idle event after that point must not downgrade the result to
+    // STALE, otherwise the durable caller will replay an already accepted B.
+    return AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED;
+  }
+
+  private isActiveTurn(state: CopilotSessionState, turnGeneration: number): boolean {
+    return state.activeTurnGeneration === turnGeneration
+      && state.busy
+      && state.operation === 'turn'
+      && !state.cancelRequested;
+  }
+
+  private settleActiveTurnReady(state: CopilotSessionState, ready: boolean): void {
+    const resolve = state.resolveActiveTurnReady;
+    state.resolveActiveTurnReady = null;
+    resolve?.(ready);
+  }
+
   private resetTurnState(state: CopilotSessionState): void {
+    this.settleActiveTurnReady(state, false);
     state.currentMessageId = null;
     state.currentText = '';
     state.completionEmittedForCurrentTurn = false;
@@ -761,6 +861,8 @@ export class CopilotSdkProvider implements TransportProvider {
     if (state.cancelSettlement) return state.cancelSettlement;
     const wasCompact = state.operation === 'compact';
     const settlement = (async () => {
+      this.settleActiveTurnReady(state, false);
+      state.activeNotificationAdmissions.clear();
       state.cancelRequested = true;
       state.operation = 'cancelling';
       try {
@@ -986,6 +1088,8 @@ export class CopilotSdkProvider implements TransportProvider {
           return;
         }
         const wasTurn = state.operation === 'turn';
+        this.settleActiveTurnReady(state, false);
+        state.activeNotificationAdmissions.clear();
         state.busy = false;
         state.operation = 'idle';
         if (state.cancelRequested && !state.cancelErrorEmitted) {
@@ -1047,6 +1151,8 @@ export class CopilotSdkProvider implements TransportProvider {
         return;
       }
       case 'session.error': {
+        this.settleActiveTurnReady(state, false);
+        state.activeNotificationAdmissions.clear();
         state.busy = false;
         state.operation = 'idle';
         state.sessionSystemTextPending = undefined;
@@ -1103,6 +1209,7 @@ export class CopilotSdkProvider implements TransportProvider {
   private async rotatePoisonedSession(state: CopilotSessionState): Promise<void> {
     if (state.rotationInProgress || this.poisonedSessionIds.has(state.sessionId)) return;
     state.rotationInProgress = true;
+    this.settleActiveTurnReady(state, false);
     const oldSessionId = state.sessionId;
     const oldSession = state.session;
     this.poisonedSessionIds.add(oldSessionId);
@@ -1162,6 +1269,7 @@ export class CopilotSdkProvider implements TransportProvider {
   }
 
   private async replaceSession(state: CopilotSessionState, resumeId: string): Promise<void> {
+    this.settleActiveTurnReady(state, false);
     const oldSessionId = state.sessionId;
     const oldSession = state.session;
     const resumed = await this.resumeSdkSession(resumeId, {

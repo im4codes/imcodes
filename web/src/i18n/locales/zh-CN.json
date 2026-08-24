@@ -488,6 +488,10 @@
   "session": {
     "restart": "↺ 重启",
     "restart_plain": "重启",
+    "delivery_mode_queue": "排队",
+    "delivery_mode_append": "追加",
+    "delivery_mode_queue_description": "等待当前回复结束后再发送",
+    "delivery_mode_append_description": "在模型的下一个安全边界追加到当前回复",
     "confirm_restart": "确认重启?",
     "new": "+ 新建",
     "start_fresh": "重新开始",

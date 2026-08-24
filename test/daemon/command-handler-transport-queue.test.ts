@@ -26,6 +26,7 @@ import { MEMORY_MANAGEMENT_ERROR_CODES } from '../../shared/memory-management.js
 import { MEMORY_FEATURE_CONFIG_MSG, MEMORY_FEATURE_FLAGS_BY_NAME, memoryFeatureFlagEnvKey } from '../../shared/feature-flags.js';
 import {
   MEMORY_MCP_DISABLED_FLAGS,
+  MEMORY_MCP_SEND_DELIVERY_MODES,
   MEMORY_MCP_TOOL_NAMES,
 } from '../../shared/memory-mcp-contracts.js';
 import { TIMELINE_DETAIL_ERROR_REASONS, TIMELINE_REQUEST_ERROR_REASONS } from '../../shared/timeline-history-errors.js';
@@ -1801,6 +1802,42 @@ describe('handleWebCommand transport queue behavior', () => {
       expect.objectContaining({ state: 'queued' }),
       expect.anything(),
     );
+  });
+
+  it('forwards only the exact composer append delivery mode into runtime metadata', async () => {
+    const send = vi.fn(() => 'sent');
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'route-transport',
+      send,
+      pendingCount: 0,
+    });
+
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_transport_brain',
+      text: 'append now',
+      commandId: 'cmd-composer-append',
+      deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND,
+    }, serverLink as any);
+    await flushAsync();
+    expect(send).toHaveBeenCalledWith(
+      'append now',
+      'cmd-composer-append',
+      undefined,
+      undefined,
+      { deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND },
+    );
+
+    send.mockClear();
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_transport_brain',
+      text: 'safe default',
+      commandId: 'cmd-composer-unknown',
+      deliveryMode: 'unexpected-mode',
+    }, serverLink as any);
+    await flushAsync();
+    expect(send).toHaveBeenCalledWith('safe default', 'cmd-composer-unknown');
   });
 
   it('injects a numbered temporary-upload reminder for the agent without changing the transport timeline', async () => {

@@ -6,6 +6,7 @@ import type {
   Options as QoderOptions,
   Query as QoderQuery,
   SDKMessage as QoderSdkMessage,
+  SDKUserMessage as QoderSdkUserMessage,
 } from '@qoder-ai/qoder-agent-sdk';
 
 import type {
@@ -15,6 +16,7 @@ import type {
   ProviderError,
   ProviderModelList,
   ProviderStatusUpdate,
+  ProviderDelegationNotification,
   SessionConfig,
   SessionInfoUpdate,
   ToolCallEvent,
@@ -23,6 +25,7 @@ import type {
 import {
   CONNECTION_MODES,
   normalizeProviderPayload,
+  PROVIDER_ACTIVE_TURN_DELIVERY_KINDS,
   PROVIDER_ERROR_CODES,
   SESSION_OWNERSHIP,
 } from '../transport-provider.js';
@@ -48,6 +51,11 @@ import { getDefaultMcpServers } from './getDefaultMcpServers.js';
 import { composeProviderSystemText } from '../provider-context-routing.js';
 import { IMCODES_SESSION_ENV, IMCODES_SESSION_LABEL_ENV } from '../../../shared/imcodes-send.js';
 import logger from '../../util/logger.js';
+import {
+  AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES,
+  AGENT_DELEGATION_NOTIFICATION_RESULTS,
+  type AgentDelegationNotificationResult,
+} from '../../../shared/agent-delegation.js';
 
 type QoderSdkModule = typeof import('@qoder-ai/qoder-agent-sdk');
 type QoderSdkPackageMetadata = Awaited<ReturnType<typeof inspectQoderSdkPackage>>;
@@ -89,6 +97,7 @@ interface QoderSessionState {
   effectiveModel?: string;
   qoderSessionId?: string;
   activeQuery?: QoderQuery;
+  activeInput?: QoderInputQueue;
   activeGeneration: number;
   inFlight: boolean;
   cancelled: boolean;
@@ -102,11 +111,84 @@ interface QoderSessionState {
   readiness: QoderLayeredReadiness;
   config: QoderTransportConfig;
   lastUnknownMessages: string[];
+  activeTurnSettled: Promise<void> | null;
+  resolveActiveTurnSettled: (() => void) | null;
+  activeNotificationAdmissions: Map<string, Promise<AgentDelegationNotificationResult>>;
 }
 
 interface QoderSendOptions {
   prompt: string;
   options: QoderOptions;
+}
+
+interface QoderInputEntry {
+  message: QoderSdkUserMessage;
+  resolve?: () => void;
+  reject?: (error: unknown) => void;
+}
+
+/**
+ * Qoder's ProcessTransport closes stdin when a streamInput iterable ends.
+ * Keep one SDK-owned input stream open for the whole active turn so native
+ * `priority: 'next'` messages can enter the live query without opening a new
+ * query or writing after stdin has already ended.
+ */
+class QoderInputQueue implements AsyncIterable<QoderSdkUserMessage> {
+  private readonly entries: QoderInputEntry[] = [];
+  private inFlightEntry: QoderInputEntry | null = null;
+  private wake: (() => void) | null = null;
+  private closed = false;
+
+  pushInitial(message: QoderSdkUserMessage): Promise<void> {
+    return this.push(message);
+  }
+
+  push(message: QoderSdkUserMessage): Promise<void> {
+    if (this.closed) return Promise.reject(new Error('Qoder input stream is closed'));
+    const accepted = new Promise<void>((resolve, reject) => {
+      this.entries.push({ message, resolve, reject });
+    });
+    this.wake?.();
+    this.wake = null;
+    return accepted;
+  }
+
+  close(): void {
+    if (this.closed) return;
+    this.closed = true;
+    const error = new Error('Qoder active turn ended before input admission');
+    for (const entry of this.entries.splice(0)) entry.reject?.(error);
+    // Do not reject an entry already yielded to QueryRunner. Its transport
+    // write is synchronous: the consumer will either request next after the
+    // write (resolve), or close/return the iterator (finally rejects). Rejecting
+    // here would race an irreversible write and cause a duplicate FIFO replay.
+    this.wake?.();
+    this.wake = null;
+  }
+
+  async *[Symbol.asyncIterator](): AsyncIterator<QoderSdkUserMessage> {
+    try {
+      while (!this.closed || this.entries.length > 0) {
+        const entry = this.entries.shift();
+        if (!entry) {
+          await new Promise<void>((resolve) => { this.wake = resolve; });
+          continue;
+        }
+        this.inFlightEntry = entry;
+        yield entry.message;
+        // QueryRunner requests the next entry only after transport.write() has
+        // accepted this one, giving callers an actual admission boundary.
+        if (this.inFlightEntry === entry) {
+          this.inFlightEntry = null;
+          entry.resolve?.();
+        }
+      }
+    } finally {
+      const entry = this.inFlightEntry;
+      this.inFlightEntry = null;
+      entry?.reject?.(new Error('Qoder input consumer ended before input admission'));
+    }
+  }
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -202,6 +284,7 @@ export class QoderSdkProvider implements TransportProvider {
     attachments: false,
     reasoningEffort: false,
     contextSupport: 'degraded-message-side-context-mapping',
+    activeDelegationNotification: AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE,
     compact: {
       execution: 'slash-command',
       providerCommand: '/compact',
@@ -338,6 +421,9 @@ export class QoderSdkProvider implements TransportProvider {
       readiness,
       config: normalized.config,
       lastUnknownMessages: [],
+      activeTurnSettled: null,
+      resolveActiveTurnSettled: null,
+      activeNotificationAdmissions: new Map(),
     };
     this.sessions.set(routeId, state);
     if (state.effectiveModel) this.emitSessionInfo(routeId, { model: state.effectiveModel });
@@ -371,7 +457,12 @@ export class QoderSdkProvider implements TransportProvider {
     await this.assertSendReady(state);
     const payload = normalizeProviderPayload(payloadOrMessage, attachments, extraSystemPrompt);
     const generation = state.activeGeneration + 1;
+    this.settleActiveTurn(state);
     state.activeGeneration = generation;
+    state.activeTurnSettled = new Promise<void>((resolve) => {
+      state.resolveActiveTurnSettled = resolve;
+    });
+    state.activeNotificationAdmissions.clear();
     state.inFlight = true;
     state.cancelled = false;
     state.completedGeneration = null;
@@ -381,12 +472,115 @@ export class QoderSdkProvider implements TransportProvider {
     state.toolBlocksByIndex.clear();
     const queryOptions = this.buildSendOptions(state, payload);
     this.emitStatus(sessionId, { status: 'qoder_running', label: 'Qoder running...' });
-    const query = this.sdk.query(queryOptions);
+    const input = new QoderInputQueue();
+    const initialAdmission = input.pushInitial({
+      type: 'user',
+      message: {
+        role: 'user',
+        content: [{ type: 'text', text: queryOptions.prompt }],
+      },
+      parent_tool_use_id: null,
+      uuid: randomUUID(),
+    });
+    state.activeInput = input;
+    // Passing the long-lived AsyncIterable makes the pinned SDK invoke its
+    // native streamInput path without closing ProcessTransport stdin after the
+    // first prompt. Later priority:'next' messages use this same live stream.
+    const query = this.sdk.query({ prompt: input, options: queryOptions.options });
     state.activeQuery = query;
     void this.consumeQuery(sessionId, state, generation, query).catch((err) => {
       if (state.activeGeneration !== generation || state.cancelled) return;
       this.finishWithError(sessionId, state, generation, this.normalizeQoderError(err));
     });
+    // Provider.send resolves only once the SDK has pulled A and advanced the
+    // iterator after transport.write(). The runtime may then safely flush B/C
+    // without racing them ahead of the original prompt.
+    await initialAdmission;
+  }
+
+  async notifyActiveDelegation(
+    sessionId: string,
+    notification: ProviderDelegationNotification,
+  ): Promise<AgentDelegationNotificationResult> {
+    const state = this.sessions.get(sessionId);
+    if (!state?.inFlight || state.cancelled || !state.activeQuery) {
+      return AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE;
+    }
+    const existing = state.activeNotificationAdmissions.get(notification.notificationId);
+    if (existing) return existing;
+    const generation = state.activeGeneration;
+    const query = state.activeQuery;
+    const admission = this.deliverActiveNotification(state, generation, query, notification);
+    state.activeNotificationAdmissions.set(notification.notificationId, admission);
+    try {
+      const result = await admission;
+      if (result !== AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED) {
+        state.activeNotificationAdmissions.delete(notification.notificationId);
+      }
+      return result;
+    } catch (error) {
+      state.activeNotificationAdmissions.delete(notification.notificationId);
+      throw error;
+    }
+  }
+
+  private async deliverActiveNotification(
+    state: QoderSessionState,
+    generation: number,
+    query: QoderQuery,
+    notification: ProviderDelegationNotification,
+  ): Promise<AgentDelegationNotificationResult> {
+    if (!this.isActiveQuery(state, generation, query)) {
+      return AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE;
+    }
+    const input = state.activeInput;
+    if (!input) return AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE;
+
+    const isHumanAppendedMessage = notification.deliveryKind
+      === PROVIDER_ACTIVE_TURN_DELIVERY_KINDS.QUEUED_MESSAGE
+      || notification.deliveryKind === PROVIDER_ACTIVE_TURN_DELIVERY_KINDS.MCP_MESSAGE;
+    const message: QoderSdkUserMessage = {
+      type: 'user',
+      message: {
+        role: 'user',
+        content: [{ type: 'text', text: notification.text }],
+      },
+      parent_tool_use_id: null,
+      uuid: notification.notificationId,
+      priority: 'next',
+      ...(isHumanAppendedMessage ? {} : { isSynthetic: true }),
+    };
+
+    const admitted = input.push(message).then(
+      () => AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED,
+    );
+    try {
+      // Once QueryRunner pulls an entry, let its iterator lifecycle decide the
+      // outcome. Racing a local terminal signal can report STALE after the
+      // synchronous transport write, causing the durable row to replay.
+      return await admitted;
+    } catch (error) {
+      if (!this.isActiveQuery(state, generation, query)) {
+        return AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE;
+      }
+      // A live admission error must propagate so the runtime retains its
+      // durable pending row and can retry/fall back without message loss.
+      throw error;
+    }
+  }
+
+  private isActiveQuery(state: QoderSessionState, generation: number, query: QoderQuery): boolean {
+    return state.activeGeneration === generation
+      && state.activeQuery === query
+      && state.inFlight
+      && !state.cancelled
+      && state.completedGeneration !== generation;
+  }
+
+  private settleActiveTurn(state: QoderSessionState): void {
+    const resolve = state.resolveActiveTurnSettled;
+    state.resolveActiveTurnSettled = null;
+    resolve?.();
   }
 
   async cancel(sessionId: string): Promise<void> {
@@ -621,7 +815,10 @@ export class QoderSdkProvider implements TransportProvider {
       cwd: state.cwd,
       includePartialMessages: true,
       includeHookEvents: false,
-      maxTurns: 1,
+      // Do not set maxTurns for the SDK's interactive AsyncIterable mode.
+      // The pinned SDK documents maxTurns:1 only for one-shot string prompts;
+      // applying it here can terminate the CLI after A before priority-next
+      // B/C are consumed from the same long-lived stream.
       permissionMode: state.config.permissionMode,
       allowDangerouslySkipPermissions: state.config.allowDangerousPermissionBypass,
       canUseTool: (toolName, input, opts) => this.handleCanUseTool(state, toolName, input, opts),
@@ -1031,6 +1228,10 @@ export class QoderSdkProvider implements TransportProvider {
   private finishWithComplete(sessionId: string, state: QoderSessionState, generation: number, message: AgentMessage): void {
     if (this.isStale(state, generation) || state.completedGeneration === generation) return;
     state.completedGeneration = generation;
+    this.settleActiveTurn(state);
+    state.activeInput?.close();
+    state.activeInput = undefined;
+    state.activeNotificationAdmissions.clear();
     state.inFlight = false;
     state.cancelled = false;
     state.activeQuery = undefined;
@@ -1042,6 +1243,10 @@ export class QoderSdkProvider implements TransportProvider {
   private finishWithError(sessionId: string, state: QoderSessionState, generation: number, error: ProviderError): void {
     if (state.activeGeneration !== generation || state.completedGeneration === generation) return;
     state.completedGeneration = generation;
+    this.settleActiveTurn(state);
+    state.activeInput?.close();
+    state.activeInput = undefined;
+    state.activeNotificationAdmissions.clear();
     state.inFlight = false;
     state.activeQuery = undefined;
     this.denyPendingApprovals(state, error.message);
@@ -1050,6 +1255,10 @@ export class QoderSdkProvider implements TransportProvider {
   }
 
   private async cleanupState(state: QoderSessionState, reason: string): Promise<void> {
+    this.settleActiveTurn(state);
+    state.activeInput?.close();
+    state.activeInput = undefined;
+    state.activeNotificationAdmissions.clear();
     state.cancelled = true;
     state.activeGeneration += 1;
     this.denyPendingApprovals(state, `Qoder session cleanup: ${reason}`);

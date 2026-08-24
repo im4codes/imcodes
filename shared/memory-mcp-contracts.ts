@@ -47,6 +47,10 @@ import {
   AGENT_DELEGATION_PURPOSES,
   AGENT_DELEGATION_REPLY_RESULT_BYTES,
 } from './agent-delegation.js';
+export {
+  MEMORY_MCP_SEND_DELIVERY_MODES,
+  type MemoryMcpSendDeliveryMode,
+} from './session-send-delivery.js';
 
 export const MEMORY_MCP_TOOL_NAMES = {
   SEARCH_MEMORY: 'search_memory',
@@ -80,14 +84,6 @@ export const MEMORY_MCP_TOOL_NAMES = {
   COMPUTER_USE_DOCS: 'computer_use_docs',
   COMPUTER_USE_CALL: 'computer_use_call',
 } as const;
-
-/** Internal daemon delivery policy selected by the trusted send_message MCP bridge. */
-export const MEMORY_MCP_SEND_DELIVERY_MODES = {
-  APPEND: 'append',
-} as const;
-
-export type MemoryMcpSendDeliveryMode =
-  typeof MEMORY_MCP_SEND_DELIVERY_MODES[keyof typeof MEMORY_MCP_SEND_DELIVERY_MODES];
 
 export type MemoryMcpToolName = (typeof MEMORY_MCP_TOOL_NAMES)[keyof typeof MEMORY_MCP_TOOL_NAMES];
 

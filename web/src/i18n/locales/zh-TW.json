@@ -488,6 +488,10 @@
   "session": {
     "restart": "↺ 重新啟動",
     "restart_plain": "重新啟動",
+    "delivery_mode_queue": "排隊",
+    "delivery_mode_append": "追加",
+    "delivery_mode_queue_description": "等待目前回覆結束後再傳送",
+    "delivery_mode_append_description": "在模型的下一個安全邊界追加到目前回覆",
     "confirm_restart": "確認重新啟動？",
     "new": "+ 新建",
     "start_fresh": "重新開始",

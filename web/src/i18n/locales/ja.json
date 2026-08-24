@@ -488,6 +488,10 @@
   "session": {
     "restart": "↺ 再起動",
     "restart_plain": "再起動",
+    "delivery_mode_queue": "待機",
+    "delivery_mode_append": "追加",
+    "delivery_mode_queue_description": "現在の応答が完了してから送信",
+    "delivery_mode_append_description": "プロバイダーの次の安全な境界で現在の応答に追加",
     "confirm_restart": "再起動しますか？",
     "new": "+ 新規",
     "start_fresh": "やり直す",

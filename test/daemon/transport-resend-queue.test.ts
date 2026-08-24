@@ -26,6 +26,26 @@ describe('transport-resend-queue', () => {
     expect(getResendCount('s1')).toBe(2);
   });
 
+  it('preserves append delivery intent in memory and durable private material', () => {
+    enqueueResend('s-append', {
+      text: 'append after restore',
+      commandId: 'cmd-append',
+      clientMessageId: 'msg-append',
+      deliveryMode: 'append',
+      queuedAt: Date.now(),
+    });
+
+    expect(getResendEntries('s-append')).toEqual([
+      expect.objectContaining({
+        clientMessageId: 'msg-append',
+        deliveryMode: 'append',
+      }),
+    ]);
+    expect(JSON.parse(
+      getTransportQueueStore().readPrivateDispatchMaterial('s-append', 'msg-append') ?? '{}',
+    )).toMatchObject({ deliveryMode: 'append' });
+  });
+
   it('fails closed when SQLite enqueue fails', () => {
     getTransportQueueStore().close();
 

@@ -213,6 +213,7 @@ describe('peer-audit dedicated dispatch', () => {
     expect(enqueueResendMock).toHaveBeenCalledWith('deck_sub_audit123', expect.objectContaining({
       text: 'peer update',
       clientMessageId: 'send_message_12345678',
+      deliveryMode: 'append',
     }));
     expect(ensureTransportRuntimeForPendingResendMock).toHaveBeenCalledWith('deck_sub_audit123');
   });

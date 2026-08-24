@@ -21,6 +21,7 @@
 
 import { randomUUID } from 'node:crypto';
 import type { AliasSendAudit } from '../../shared/alias-types.js';
+import type { MemoryMcpSendDeliveryMode } from '../../shared/memory-mcp-contracts.js';
 import logger from '../util/logger.js';
 import type { TransportAttachment } from '../../shared/transport-attachments.js';
 import type { SharedActorEnvelope } from '../../shared/tab-sharing.js';
@@ -56,6 +57,8 @@ export interface ResendEntry {
   attachments?: TransportAttachment[];
   /** Server-authored share actor for attribution only; never injected into provider prompts. */
   sharedActor?: SharedActorEnvelope;
+  /** Preserve the trusted MCP delivery policy across runtime restore windows. */
+  deliveryMode?: MemoryMcpSendDeliveryMode;
   /** @internal: this logical user event has already been written to the timeline. */
   timelineCommitted?: boolean;
   /** @internal: this logical user event has already been written to runtime history. */
@@ -107,6 +110,7 @@ export function enqueueResend(sessionName: string, entry: ResendEntry): {
         ...(normalizedEntry.messagePreamble ? { messagePreamble: normalizedEntry.messagePreamble } : {}),
         ...(normalizedEntry.attachments?.length ? { attachmentRefs: normalizedEntry.attachments } : {}),
         ...(normalizedEntry.sharedActor ? { sharedActorEnvelope: normalizedEntry.sharedActor } : {}),
+        ...(normalizedEntry.deliveryMode ? { deliveryMode: normalizedEntry.deliveryMode } : {}),
         ...(normalizedEntry.timelineCommitted ? { timelineCommitted: true } : {}),
         ...(normalizedEntry.historyCommitted ? { historyCommitted: true } : {}),
       }),
