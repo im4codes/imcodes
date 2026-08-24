@@ -253,6 +253,7 @@ vi.mock('../../src/daemon/timeline-emitter.js', () => ({
     }),
     on: vi.fn(() => () => {}),
     epoch: 0,
+    getBufferedEvents: vi.fn(() => []),
     replay: vi.fn(() => ({ events: [], truncated: false })),
   },
 }));
