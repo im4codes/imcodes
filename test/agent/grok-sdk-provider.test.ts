@@ -19,6 +19,8 @@ function attachRoute(provider: GrokSdkProvider, routeId = 'grok-route') {
     loaded: true,
     modeApplied: true,
     promptInFlight: true,
+    promptSubmittedGeneration: 1,
+    activePromptAdmissions: new Map(),
     turnGeneration: 1,
     settledGeneration: 0,
     replaying: false,

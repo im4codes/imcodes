@@ -8,7 +8,9 @@ const ROOT = resolve(__dirname, '..', '..');
 const NATIVE = resolve(ROOT, 'native', 'windows-remote-desktop');
 
 function native(name: string): string {
-  return readFileSync(resolve(NATIVE, name), 'utf8');
+  // PowerShell files are checked out as CRLF on CI. Normalize source text so
+  // ordering/trust guards verify semantics rather than checkout line endings.
+  return readFileSync(resolve(NATIVE, name), 'utf8').replaceAll('\r\n', '\n');
 }
 
 const sources = {

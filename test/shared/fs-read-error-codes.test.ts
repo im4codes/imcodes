@@ -30,6 +30,9 @@ const ALLOWED_NON_FS_READ_LITERAL_FILES = new Map<string, ReadonlySet<string>>([
   // Attended-consent owns a separate coordinator protocol; its request
   // validation failure is not part of the filesystem read wire contract.
   ['server/src/services/remote-desktop-consent-coordinator.ts', new Set(['invalid_request'])],
+  // Signed-shell launch contexts own a separate exact-shape HTTP protocol;
+  // this validation failure is unrelated to the filesystem read contract.
+  ['server/src/routes/remote-desktop-shell-launch-context.ts', new Set(['invalid_request'])],
   ['server/src/ws/bridge.ts', new Set(['invalid_request'])],
   ['src/daemon/file-preview-read-observability.ts', new Set(['stale_read'])],
   ['src/daemon/session-group-clone.ts', new Set(['invalid_request', 'internal_error'])],

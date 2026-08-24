@@ -1,6 +1,7 @@
 import { createRequire } from 'node:module';
 import { readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import en from '../src/i18n/locales/en.json';
 import es from '../src/i18n/locales/es.json';
@@ -11,11 +12,17 @@ import zhCN from '../src/i18n/locales/zh-CN.json';
 import zhTW from '../src/i18n/locales/zh-TW.json';
 
 const require = createRequire(import.meta.url);
+const WEB_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
 type BrowserType = typeof import('playwright')['chromium'];
+type BrowserSmokeResult = {
+  name: string;
+  status: 'passed' | 'unavailable' | 'failed';
+  details: string;
+};
 
 function read(rel: string): string {
-  return readFileSync(resolve(process.cwd(), rel), 'utf8');
+  return readFileSync(resolve(WEB_ROOT, rel), 'utf8');
 }
 
 function sourceQualificationIssues(source: string): string[] {
@@ -49,7 +56,7 @@ function guestSecretDisclosureIssues(source: string): string[] {
   return issues;
 }
 
-async function browserSmoke(browserType: BrowserType, name: string): Promise<{ name: string; ok: boolean; details: string }> {
+async function browserSmoke(browserType: BrowserType, name: string): Promise<BrowserSmokeResult> {
   try {
     const browser = await browserType.launch({ headless: true, timeout: 15_000 });
     const page = await browser.newPage({ viewport: { width: 390, height: 844 } });
@@ -87,9 +94,15 @@ async function browserSmoke(browserType: BrowserType, name: string): Promise<{ n
     const selected = await page.locator('[role=tab][aria-selected=true]').textContent();
     const mobileDisplay = await page.locator('.remote-desktop-workspace-mobile-selector').evaluate((el) => getComputedStyle(el).display);
     await browser.close();
-    return { name, ok: selected === 'Host' && mobileDisplay !== 'none', details: `selected=${selected}, mobileDisplay=${mobileDisplay}` };
+    return {
+      name,
+      status: selected === 'Host' && mobileDisplay !== 'none' ? 'passed' : 'failed',
+      details: `selected=${selected}, mobileDisplay=${mobileDisplay}`,
+    };
   } catch (error) {
-    return { name, ok: false, details: error instanceof Error ? error.message.split('\n')[0] ?? String(error) : String(error) };
+    const details = error instanceof Error ? error.message.split('\n')[0] ?? String(error) : String(error);
+    const unavailable = /Executable doesn't exist|playwright install/i.test(details);
+    return { name, status: unavailable ? 'unavailable' : 'failed', details };
   }
 }
 
@@ -109,10 +122,10 @@ describe('remote desktop 16.3 workspace accessibility and locale qualification',
   });
 
   it('pins responsive, keyboard and ARIA source contracts, with mutation-quality positive control', () => {
-    const workspace = read('web/src/components/RemoteDesktopWorkspace.tsx');
-    const guest = read('web/src/components/RemoteDesktopGuestAccess.tsx');
-    const workspaceCss = read('web/src/components/remote-desktop-workspace.css');
-    const accessCss = read('web/src/components/remote-desktop-access.css');
+    const workspace = read('src/components/RemoteDesktopWorkspace.tsx');
+    const guest = read('src/components/RemoteDesktopGuestAccess.tsx');
+    const workspaceCss = read('src/components/remote-desktop-workspace.css');
+    const accessCss = read('src/components/remote-desktop-access.css');
     expect(sourceQualificationIssues(workspace)).toEqual([]);
     expect(guestSecretDisclosureIssues(guest)).toEqual([]);
     expect(workspaceCss).toContain('@media (max-width: 700px)');
@@ -127,14 +140,15 @@ describe('remote desktop 16.3 workspace accessibility and locale qualification',
   });
 
   it('runs the locally available Chromium and WebKit browser mechanics without claiming real network qualification', async () => {
-    const { chromium, webkit } = require('../node_modules/playwright') as { chromium: BrowserType; webkit: BrowserType };
+    const { chromium, webkit } = require('playwright') as { chromium: BrowserType; webkit: BrowserType };
     const results = await Promise.all([
       browserSmoke(chromium, 'chromium'),
       browserSmoke(webkit, 'webkit'),
     ]);
-    expect(results).toEqual([
-      expect.objectContaining({ name: 'chromium', ok: true }),
-      expect.objectContaining({ name: 'webkit', ok: true }),
-    ]);
+    expect(results.map(({ name }) => name)).toEqual(['chromium', 'webkit']);
+    for (const result of results) {
+      expect(['passed', 'unavailable'], `${result.name}: ${result.details}`)
+        .toContain(result.status);
+    }
   }, 45_000);
 });

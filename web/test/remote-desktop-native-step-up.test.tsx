@@ -1,6 +1,7 @@
 /** @vitest-environment jsdom */
 import { cleanup, render, screen, waitFor } from '@testing-library/preact';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const { apiFetchMock, fetchMeMock } = vi.hoisted(() => ({
@@ -152,7 +153,10 @@ describe('RemoteDesktopNativeStepUp', () => {
   });
 
   it('is mounted as a dedicated app route before the ordinary app shell', () => {
-    const source = readFileSync('web/src/main.tsx', 'utf8');
+    const webRoot = existsSync(resolve(process.cwd(), 'src/main.tsx'))
+      ? process.cwd()
+      : resolve(process.cwd(), 'web');
+    const source = readFileSync(resolve(webRoot, 'src/main.tsx'), 'utf8');
     expect(source).toContain("window.location.pathname === REMOTE_DESKTOP_NATIVE_STEP_UP_PATH");
     expect(source).toContain('if (remoteDesktopNativeStepUpEntry)');
     expect(source).toContain('render(<RemoteDesktopNativeStepUp />');
