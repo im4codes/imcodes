@@ -18,8 +18,10 @@ import {
   buildMcpDisabledResult,
   buildMcpErrorResult,
   MEMORY_MCP_CAPS,
+  MEMORY_MCP_SEND_DELIVERY_MODES,
   pickAllowedMcpArgs,
   advertisedMcpToolNames,
+  type MemoryMcpSendDeliveryMode,
   type MemoryMcpToolName,
 } from '../../shared/memory-mcp-contracts.js';
 import { MCP_ERROR_REASONS, type MCPErrorReason } from '../../shared/memory-mcp-errors.js';
@@ -446,6 +448,13 @@ function numberArg(args: Record<string, unknown>, key: string): number | undefin
 
 function boolArg(args: Record<string, unknown>, key: string): boolean | undefined {
   return typeof args[key] === 'boolean' ? args[key] : undefined;
+}
+
+function sendDeliveryModeArg(value: unknown): MemoryMcpSendDeliveryMode | undefined | 'invalid' {
+  if (value === undefined) return undefined;
+  return Object.values(MEMORY_MCP_SEND_DELIVERY_MODES).includes(value as MemoryMcpSendDeliveryMode)
+    ? value as MemoryMcpSendDeliveryMode
+    : 'invalid';
 }
 
 function listProjectionClassArg(args: Record<string, unknown>): MemoryMcpListProjectionClass | undefined {
@@ -1230,11 +1239,13 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
     },
     [MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE]: async (input) => {
       const sessions = await sendSessions();
-      const args = pickAllowedMcpArgs(input, ['target', 'message', 'files', 'reply', 'audit', 'broadcast', 'idempotencyKey', 'clone']);
+      const args = pickAllowedMcpArgs(input, ['target', 'message', 'files', 'reply', 'audit', 'broadcast', 'idempotencyKey', 'deliveryMode', 'clone']);
       const clone = parseCloneArg(args.clone);
       if (clone === 'invalid') return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'clone request is invalid');
       const audit = parseAuditArg(args.audit);
       if (audit === 'invalid') return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'audit request is invalid');
+      const deliveryMode = sendDeliveryModeArg(args.deliveryMode);
+      if (deliveryMode === 'invalid') return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'deliveryMode is invalid');
       return dispatchSendMessage(caller, {
         target: stringArg(args, 'target'),
         message: stringArg(args, 'message'),
@@ -1243,6 +1254,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         ...(audit ? { audit } : {}),
         broadcast: boolArg(args, 'broadcast'),
         idempotencyKey: stringArg(args, 'idempotencyKey'),
+        ...(deliveryMode ? { deliveryMode } : {}),
         ...(clone ? { clone } : {}),
       }, sendDepsWithSessions(sessions, {
         isDispatchEnabled: () => deps.sendDeps?.isDispatchEnabled?.() ?? true,
@@ -1755,6 +1767,9 @@ const schemas = {
   [MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE]: z.object({
     target: z.string().describe('Exact send_list_targets target; never the caller.'),
     message: z.string().describe('Complete task/request and expected output.'),
+    deliveryMode: z.enum(Object.values(MEMORY_MCP_SEND_DELIVERY_MODES) as [MemoryMcpSendDeliveryMode, ...MemoryMcpSendDeliveryMode[]])
+      .optional()
+      .describe('append (default) or ordinary durable queue.'),
     files: z.array(z.string()).optional().describe('Project-root path refs; no file bytes.'),
     reply: z.boolean().optional().describe('Request a reply/report.'),
     audit: z.object({

@@ -245,9 +245,7 @@ export function mergeDefaultToolDeps(caller: McpRuntimeCaller, toolDeps: MemoryM
             to: target.name,
             message,
             depth: 0,
-            ...(options.deliveryMode === MEMORY_MCP_SEND_DELIVERY_MODES.APPEND
-              ? { deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND }
-              : {}),
+            ...(options.deliveryMode ? { deliveryMode: options.deliveryMode } : {}),
           });
         }),
       // Per-field default: an injected `cancelSession` (tests) wins; otherwise

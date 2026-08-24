@@ -201,6 +201,19 @@ describe('peer-audit dedicated dispatch', () => {
     expect(enqueueResendMock).not.toHaveBeenCalled();
   });
 
+  it('keeps explicit queue delivery in ordinary FIFO without active-turn append', async () => {
+    sendMock.mockReturnValue('queued');
+
+    await expect(dispatchSessionMessage(target(), 'wait your turn', {
+      dispatchId: 'send_dispatch_12345678' as never,
+      messageId: 'send_message_12345678' as never,
+      deliveryMode: 'queue',
+    })).resolves.toBe('queued');
+
+    expect(appendExternalMock).not.toHaveBeenCalled();
+    expect(sendMock).toHaveBeenCalledWith('wait your turn', 'send_message_12345678');
+  });
+
   it('durably queues MCP delivery when the transport runtime is unavailable', async () => {
     getTransportRuntimeMock.mockReturnValueOnce(undefined);
 

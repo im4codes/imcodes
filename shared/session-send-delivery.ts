@@ -8,6 +8,7 @@
  */
 export const SESSION_SEND_DELIVERY_MODES = {
   APPEND: 'append',
+  QUEUE: 'queue',
 } as const;
 
 export type SessionSendDeliveryMode =

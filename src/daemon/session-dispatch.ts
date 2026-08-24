@@ -175,7 +175,9 @@ export async function dispatchSessionMessage(
         commandId: options.messageId,
         clientMessageId: options.messageId,
         ...(options.sharedActor ? { sharedActor: options.sharedActor } : {}),
-        ...(options.deliveryMode ? { deliveryMode: options.deliveryMode } : {}),
+        ...(options.deliveryMode === MEMORY_MCP_SEND_DELIVERY_MODES.APPEND
+          ? { deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND }
+          : {}),
         queuedAt: Date.now(),
       });
       if (!queued.accepted) throw new Error(`transport queue unavailable for session ${target.name}`);

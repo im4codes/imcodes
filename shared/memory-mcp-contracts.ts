@@ -47,10 +47,14 @@ import {
   AGENT_DELEGATION_PURPOSES,
   AGENT_DELEGATION_REPLY_RESULT_BYTES,
 } from './agent-delegation.js';
-export {
+import {
   MEMORY_MCP_SEND_DELIVERY_MODES,
   type MemoryMcpSendDeliveryMode,
 } from './session-send-delivery.js';
+export {
+  MEMORY_MCP_SEND_DELIVERY_MODES,
+  type MemoryMcpSendDeliveryMode,
+};
 
 export const MEMORY_MCP_TOOL_NAMES = {
   SEARCH_MEMORY: 'search_memory',
@@ -418,10 +422,15 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   },
   [MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE]: {
     name: MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE,
-    description: 'Send a plain-text request to an exact send_list_targets target, for example asking a CC session to audit. The caller session is not a valid target; an empty send_list_targets result means none exists. A busy compatible provider receives the message by direct non-preemptive append at its next safe boundary; unsupported, racing, or temporarily unready targets retain delivery through the ordinary durable queue. It does not start a structured Team/P2P discussion run. Files are project-root path references, not bytes. Returns dispatch/message ids and delivery status.',
+    description: 'Send a plain-text request to an exact send_list_targets target, for example asking a CC session to audit. The caller session is not a valid target; an empty send_list_targets result means none exists. deliveryMode defaults to append: a busy compatible provider receives the message by direct non-preemptive append at its next safe boundary, while unsupported, racing, or temporarily unready targets retain delivery through the ordinary durable queue. Set deliveryMode=queue to always retain the message in ordinary durable FIFO instead of inserting it into the active turn. It does not start a structured Team/P2P discussion run. Files are project-root path references, not bytes. Returns dispatch/message ids and delivery status.',
     inputSchema: objectSchema({
       target: stringSchema('Required exact target session value. For an ordinary peer, use the exact send_list_targets.target value. For a follow-up to an execution clone you created, use the exact result.clone.target from the originating clone send — execution clones are NOT returned by send_list_targets and only their creator may address them. Always use the exact target name; never a label or agentType value.'),
       message: stringSchema(`Required complete task/request text to deliver, up to ${MEMORY_MCP_CAPS.SEND_MESSAGE_MAX_BYTES} UTF-8 bytes. Include the desired role and output, such as audit findings, discussion input, plan, implementation request, or verification result.`),
+      deliveryMode: {
+        type: 'string',
+        enum: [...Object.values(MEMORY_MCP_SEND_DELIVERY_MODES)],
+        description: 'Optional delivery policy. append (default) attempts a non-preemptive active-turn append with durable queue fallback; queue always uses ordinary durable FIFO and never inserts into the active turn.',
+      },
       files: {
         type: 'array',
         description: `Optional file path references under the caller project root; at most ${MEMORY_MCP_CAPS.SEND_FILES_MAX_COUNT}; contents are not read or transferred by MCP.`,

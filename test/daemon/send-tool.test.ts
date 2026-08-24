@@ -125,6 +125,28 @@ describe('send-tool', () => {
     expect(dispatchMessage.mock.calls[0][2]).toMatchObject({ deliveryMode: 'append' });
   });
 
+  it('honors explicit queue delivery without attempting active-turn append', async () => {
+    const dispatchMessage = vi.fn().mockResolvedValue('queued');
+    const result = await dispatchSendMessage(caller, {
+      target: 'Coder',
+      message: 'wait your turn',
+      deliveryMode: 'queue',
+    }, {
+      listSessions: () => [
+        session({ name: 'deck_alpha_brain', projectName: 'alpha', role: 'brain' }),
+        session({ name: 'deck_alpha_w1', projectName: 'alpha', role: 'w1', label: 'Coder' }),
+      ],
+      dispatchMessage,
+    });
+
+    expect(result).toMatchObject({ status: 'accepted' });
+    expect(dispatchMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ name: 'deck_alpha_w1' }),
+      'wait your turn',
+      expect.objectContaining({ deliveryMode: 'queue' }),
+    );
+  });
+
   it('send_stop force-stops a resolved sibling via cancelSession', async () => {
     const cancelSession = vi.fn().mockResolvedValue(true);
     const result = await dispatchSendStop(caller, { target: 'Coder' }, {

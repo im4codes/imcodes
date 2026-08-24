@@ -127,6 +127,8 @@ export interface SendMessageInput {
   reply?: boolean;
   broadcast?: boolean;
   idempotencyKey?: string;
+  /** Defaults to append; queue explicitly preserves ordinary durable FIFO. */
+  deliveryMode?: MemoryMcpSendDeliveryMode;
   /** Strict supervision-only metadata. Never infer this purpose from message text. */
   audit?: AgentDelegationAuditRequest;
   /** Optional execution-clone request — see {@link SendMessageCloneRequest}. */
@@ -402,6 +404,10 @@ export async function dispatchSendMessage(
   if (!input.message || input.message.trim().length === 0) {
     return { status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED, error: 'message is required' };
   }
+  if (input.deliveryMode !== undefined
+    && !Object.values(MEMORY_MCP_SEND_DELIVERY_MODES).includes(input.deliveryMode)) {
+    return { status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED, error: 'deliveryMode is invalid' };
+  }
   if (Buffer.byteLength(input.message, 'utf8') > MEMORY_MCP_CAPS.SEND_MESSAGE_MAX_BYTES) {
     return { status: 'error', reason: MCP_ERROR_REASONS.WRITE_QUOTA_EXCEEDED, error: `message exceeds ${MEMORY_MCP_CAPS.SEND_MESSAGE_MAX_BYTES} bytes` };
   }
@@ -485,7 +491,7 @@ export async function dispatchSendMessage(
       await d.dispatchMessage(target, message, {
         dispatchId,
         messageId,
-        deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND,
+        deliveryMode: input.deliveryMode ?? MEMORY_MCP_SEND_DELIVERY_MODES.APPEND,
         ...buildSharedServerMemberSharedActorOption(caller, callerRecord, target, messageId, now),
       });
       deliveries.push({
@@ -907,9 +913,7 @@ export async function dispatchHookSend(input: HookSendDispatchInput, deps?: Send
       const result = await d.dispatchMessage(target, message, {
         dispatchId,
         messageId,
-        ...(deliveryMode === MEMORY_MCP_SEND_DELIVERY_MODES.APPEND
-          ? { deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND }
-          : {}),
+        deliveryMode,
         ...buildSharedServerMemberSharedActorOption(
           {
             userId: input.from,

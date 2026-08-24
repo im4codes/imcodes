@@ -332,6 +332,26 @@ describe('memory MCP stdio server', () => {
         deliveryMode: 'append',
       }]);
 
+      const queuedResult = await client.callTool({
+        name: 'send_message',
+        arguments: {
+          target: 'deck_sub_peer',
+          message: 'queue this from stdio mcp',
+          deliveryMode: 'queue',
+        },
+      });
+      expect(queuedResult.structuredContent).toMatchObject({
+        status: 'accepted',
+        deliveries: [expect.objectContaining({ target: 'deck_sub_peer', status: 'delivered' })],
+      });
+      expect(hookBodies.at(-1)).toEqual({
+        from: 'deck_sub_worker',
+        to: 'deck_sub_peer',
+        message: 'queue this from stdio mcp',
+        depth: 0,
+        deliveryMode: 'queue',
+      });
+
       await writeSessionStore(home, { includeLatePeer: true });
       const refreshedSend = await client.callTool({
         name: 'send_message',

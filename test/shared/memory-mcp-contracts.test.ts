@@ -79,8 +79,11 @@ describe('memory MCP shared contracts', () => {
 
     const send = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE];
     const files = send.inputSchema.properties?.files as { description?: string } | undefined;
+    const deliveryMode = send.inputSchema.properties?.deliveryMode as { enum?: string[]; description?: string } | undefined;
     expect(files?.description).toMatch(/path references/i);
     expect(files?.description).toMatch(/not read or transferred/i);
+    expect(deliveryMode?.enum).toEqual(['append', 'queue']);
+    expect(deliveryMode?.description).toContain('never inserts into the active turn');
   });
 
   it('advertises the active-user shell 900 second timeout without widening GUI methods', () => {
@@ -111,6 +114,7 @@ describe('memory MCP shared contracts', () => {
     expect(sendMessage.description).toContain('does not start a structured Team/P2P discussion run');
     expect(sendMessage.description).toContain('direct non-preemptive append');
     expect(sendMessage.description).toContain('retain delivery through the ordinary durable queue');
+    expect(sendMessage.description).toContain('deliveryMode=queue');
     expect(delegationReply.description).toContain('multiple replies until it expires');
 
     const sendListQuery = sendList.inputSchema.properties?.query as { description?: string } | undefined;

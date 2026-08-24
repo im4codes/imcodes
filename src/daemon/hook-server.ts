@@ -364,7 +364,7 @@ async function handleSend(body: SendRequest): Promise<{ status: number; body: Re
     return { status: 501, body: { ok: false, error: 'context is not yet supported — send plain message only' } };
   }
   if (body.deliveryMode !== undefined
-      && body.deliveryMode !== MEMORY_MCP_SEND_DELIVERY_MODES.APPEND) {
+      && !Object.values(MEMORY_MCP_SEND_DELIVERY_MODES).includes(body.deliveryMode)) {
     return { status: 400, body: { ok: false, error: 'invalid delivery mode' } };
   }
 
@@ -433,9 +433,7 @@ async function handleSend(body: SendRequest): Promise<{ status: number; body: Re
       files: body.files,
       projectRoot,
       reply: body.reply === true,
-      ...(body.deliveryMode === MEMORY_MCP_SEND_DELIVERY_MODES.APPEND
-        ? { deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND }
-        : {}),
+      ...(body.deliveryMode ? { deliveryMode: body.deliveryMode } : {}),
     });
   } catch (err) {
     return { status: 400, body: { ok: false, error: (err as Error).message } };
