@@ -26,7 +26,6 @@ import { formatByteSize } from '../util/byte-size.js';
 import { useMachines } from '../hooks/useMachines.js';
 import { isNative } from '../native.js';
 import { ShareSessionDialog } from './ShareSessionDialog.js';
-import { RemoteDesktopOwnerAccess } from './RemoteDesktopOwnerAccess.js';
 import type { MachineListItem } from '../api/machines.js';
 import { canOpenRemoteDesktop } from './RemoteDesktopPanel.js';
 
@@ -136,8 +135,6 @@ export function ControlledNodesPanel({
   const [editingServerId, setEditingServerId] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState('');
   const [sharingMachine, setSharingMachine] = useState<MachineListItem | null>(null);
-  const [accessServerId, setAccessServerId] = useState<string | null>(null);
-  const accessTriggerRef = useRef<HTMLButtonElement | null>(null);
   const presenceMountedRef = useRef(true);
 
   const sortedTargets = useMemo(() => downloadTargets, [downloadTargets]);
@@ -344,11 +341,6 @@ export function ControlledNodesPanel({
   const onlineMachineCount = machines.filter((machine) => machine.online).length;
   const execEnabledMachineCount = machines.filter((machine) => machine.execEnabled).length;
 
-  const closeRemoteDesktopAccess = () => {
-    setAccessServerId(null);
-    requestAnimationFrame(() => accessTriggerRef.current?.focus());
-  };
-
   return (
     <div class="controlled-nodes-panel">
       <div class="controlled-nodes-grid" aria-hidden="true" />
@@ -492,20 +484,6 @@ export function ControlledNodesPanel({
                     {t('remote_desktop.open')}
                   </button>
                 )}
-                {canOpenRemoteDesktop(m) && machineAccessRole(m) === 'owner' && (
-                  <button
-                    type="button"
-                    class="controlled-nodes-remote-desktop-access"
-                    aria-expanded={accessServerId === m.serverId}
-                    aria-controls={`remote-desktop-access-${m.serverId}`}
-                    onClick={(event) => {
-                      accessTriggerRef.current = event.currentTarget;
-                      setAccessServerId((current) => current === m.serverId ? null : m.serverId);
-                    }}
-                  >
-                    {t('remote_desktop.access_manage')}
-                  </button>
-                )}
                 {machineAccessRole(m) === 'owner' ? (
                   <>
                     <button
@@ -586,30 +564,6 @@ export function ControlledNodesPanel({
                   </span>
                 )}
               </div>
-              {accessServerId === m.serverId && machineAccessRole(m) === 'owner' && (
-                <section
-                  id={`remote-desktop-access-${m.serverId}`}
-                  class="controlled-nodes-remote-desktop-access-panel"
-                  aria-label={t('remote_desktop.access_owner_title')}
-                >
-                  <header>
-                    <div>
-                      <strong>{t('remote_desktop.access_owner_title')}</strong>
-                      <span>{m.displayName}</span>
-                    </div>
-                    <button
-                      type="button"
-                      class="controlled-nodes-remote-desktop-access-close"
-                      aria-label={t('common.close')}
-                      onClick={closeRemoteDesktopAccess}
-                    >×</button>
-                  </header>
-                  <RemoteDesktopOwnerAccess
-                    hostId={m.remoteDesktopHostId ?? null}
-                    endpointLabel={m.displayName}
-                  />
-                </section>
-              )}
             </li>
           ))}
         </ul>
@@ -706,6 +660,10 @@ export function ControlledNodesPanel({
             serverLabel: sharingMachine.displayName,
             sessionName: '',
             tabLabel: sharingMachine.displayName,
+          }}
+          remoteDesktopAccess={{
+            hostId: sharingMachine.remoteDesktopHostId ?? null,
+            endpointLabel: sharingMachine.displayName,
           }}
           onClose={() => setSharingMachine(null)}
           onSharesChanged={() => { void refreshPresence(); }}

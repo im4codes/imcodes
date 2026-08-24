@@ -3098,6 +3098,9 @@
     "share": {
       "title": "共享被控节点",
       "subtitle": "授予对 {{target}} 的访问权限",
+      "sections_label": "共享方式",
+      "account_tab": "账号共享",
+      "remote_desktop_tab": "远程桌面邀请",
       "role_help": {
         "viewer": "可查看节点在线状态和基本信息，但不能操作节点。",
         "participant": "节点允许执行时，可运行命令、传输文件和使用电脑控制。"
@@ -3411,6 +3414,14 @@
     "login_screen_error_elevation_declined": "那台机器上没有确认管理员授权",
     "access_owner_title": "远程桌面邀请与访问",
     "access_manage": "邀请",
+    "access_audit_connections": "连接次数：{{count}}",
+    "access_audit_total_duration": "累计时长：{{duration}}",
+    "access_audit_last_connected": "最近连接：{{value}}",
+    "access_audit_history": "连接审计记录",
+    "access_audit_connected_now": "当前连接中 · {{duration}}",
+    "access_audit_under_minute": "不足 1 分钟",
+    "access_audit_minutes": "{{minutes}} 分钟",
+    "access_audit_hours_minutes": "{{hours}} 小时 {{minutes}} 分钟",
     "access_owner_hint": "直接管理公开远程桌面访问，无需先连接这台电脑。",
     "access_no_host": "这台节点仍在准备公开访问，请刷新后重试。",
     "access_refresh": "刷新",

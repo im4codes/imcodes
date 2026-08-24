@@ -19,7 +19,15 @@
 .remote-desktop-link-list li { display:grid; gap:8px; padding:10px; border:1px solid #23354d; border-radius:9px; }
 .remote-desktop-link-list li > div { display:flex; flex-wrap:wrap; justify-content:space-between; gap:8px; }
 .remote-desktop-link-list span { color:#94a3b8; font-size:12px; }
-@media(max-width:720px){.remote-desktop-access{padding:10px}.remote-desktop-access-grid{grid-template-columns:1fr}.remote-desktop-access-card output{font-size:20px}.remote-desktop-access-actions button{flex:1 1 auto}}
+.remote-desktop-link-list li > .remote-desktop-link-audit-summary { justify-content:flex-start; gap:6px 12px; padding-top:8px; border-top:1px solid #21344b; }
+.remote-desktop-link-audit-summary span { color:#a5b4c7; }
+.remote-desktop-link-audit-history { font-size:12px; color:#bfdbfe; }
+.remote-desktop-link-audit-history summary { cursor:pointer; font-weight:700; }
+.remote-desktop-link-audit-history ul { display:grid; gap:6px; margin:8px 0 0; padding:0; list-style:none; }
+.remote-desktop-link-audit-history li { display:grid; grid-template-columns:minmax(110px,auto) 1fr auto; gap:8px; align-items:center; padding:7px 8px; border:0; border-radius:7px; background:#07101d; }
+.remote-desktop-link-audit-history code { color:#c4b5fd; }
+.remote-desktop-link-audit-history li span { color:#94a3b8; }
+@media(max-width:720px){.remote-desktop-access{padding:10px}.remote-desktop-access-grid{grid-template-columns:1fr}.remote-desktop-access-card output{font-size:20px}.remote-desktop-access-actions button{flex:1 1 auto}.remote-desktop-link-audit-history li{grid-template-columns:1fr}.remote-desktop-link-audit-history li span{white-space:normal}}
 .remote-desktop-guest { min-height:100dvh; display:grid; place-items:center; padding:max(18px,var(--sat,0px)) 18px max(18px,var(--sab,0px)); color:#dbeafe; background:radial-gradient(circle at 50% 0,#13304a 0,#07101d 52%,#050b14 100%); }
 .remote-desktop-guest-card { width:min(100%,960px); display:grid; gap:14px; padding:22px; border:1px solid #27415d; border-radius:16px; background:rgba(9,20,35,.96); box-shadow:0 24px 70px #0008; }
 .remote-desktop-guest-card>img { width:64px; height:64px; justify-self:center; }

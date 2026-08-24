@@ -41,6 +41,19 @@ const DURATION_OPTIONS = [
   REMOTE_DESKTOP_LINK_DURATION_MS.D30,
 ] as const;
 
+function formatConnectionDuration(
+  durationMs: number,
+  t: (key: string, options?: Record<string, number>) => string,
+): string {
+  const totalMinutes = Math.floor(durationMs / 60_000);
+  if (totalMinutes < 1) return t('remote_desktop.access_audit_under_minute');
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+  return hours > 0
+    ? t('remote_desktop.access_audit_hours_minutes', { hours, minutes })
+    : t('remote_desktop.access_audit_minutes', { minutes });
+}
+
 export function RemoteDesktopAccessManagement({
   hostId,
   endpointLabel,
@@ -193,7 +206,9 @@ export function RemoteDesktopAccessManagement({
           ? api.revokeLink({ linkId: link.id, hostId, requestId, privacyEpoch, stepUpGrant })
           : api.mutateLink({ linkId: link.id, hostId, requestId, mutation, privacyEpoch, stepUpGrant, ...options }),
       });
-      setLinks((current) => current.map((item) => item.id === updated.id ? updated : item));
+      setLinks((current) => current.map((item) => item.id === updated.id
+        ? { ...updated, connectionAudit: item.connectionAudit }
+        : item));
     } catch (reason) {
       setError(mapRemoteDesktopApiError(reason));
     } finally { setBusy(false); }
@@ -338,6 +353,37 @@ export function RemoteDesktopAccessManagement({
                 ? t('remote_desktop.access_expires_at', { value: new Date(link.expiresAt).toLocaleString() })
                 : t('remote_desktop.access_never_expires')}</span>
             </div>
+            <div class="remote-desktop-link-audit-summary">
+              <span>{t('remote_desktop.access_audit_connections', {
+                count: link.connectionAudit.connectionCount,
+              })}</span>
+              <span>{t('remote_desktop.access_audit_total_duration', {
+                duration: formatConnectionDuration(link.connectionAudit.totalDurationMs, t),
+              })}</span>
+              {link.connectionAudit.lastConnectedAt !== null && (
+                <span>{t('remote_desktop.access_audit_last_connected', {
+                  value: new Date(link.connectionAudit.lastConnectedAt).toLocaleString(),
+                })}</span>
+              )}
+            </div>
+            {link.connectionAudit.recentConnections.length > 0 && (
+              <details class="remote-desktop-link-audit-history">
+                <summary>{t('remote_desktop.access_audit_history')}</summary>
+                <ul>
+                  {link.connectionAudit.recentConnections.map((entry, index) => (
+                    <li key={`${entry.connectedAt}:${entry.ipAddress}:${index}`}>
+                      <code>{entry.ipAddress}</code>
+                      <span>{new Date(entry.connectedAt).toLocaleString()}</span>
+                      <span>{entry.disconnectedAt === null
+                        ? t('remote_desktop.access_audit_connected_now', {
+                          duration: formatConnectionDuration(entry.durationMs, t),
+                        })
+                        : formatConnectionDuration(entry.durationMs, t)}</span>
+                    </li>
+                  ))}
+                </ul>
+              </details>
+            )}
             {editingLinkId === link.id && <form class="remote-desktop-access-inline-edit" onSubmit={(event) => {
               event.preventDefault();
               void mutateLink(link, REMOTE_DESKTOP_LINK_MUTATION.SET_LABEL, { label: editingLabel })

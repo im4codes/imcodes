@@ -3098,6 +3098,9 @@
     "share": {
       "title": "Share controlled node",
       "subtitle": "Grant access to {{target}}",
+      "sections_label": "Sharing method",
+      "account_tab": "Account sharing",
+      "remote_desktop_tab": "Remote desktop invites",
       "role_help": {
         "viewer": "Can view this node's presence and basic details, but cannot operate it.",
         "participant": "Can run commands, transfer files, and use computer control while execution is enabled."
@@ -3411,6 +3414,14 @@
     "login_screen_error_elevation_declined": "Administrator approval was not given on that machine",
     "access_owner_title": "Owner access",
     "access_manage": "Invites",
+    "access_audit_connections": "Connections: {{count}}",
+    "access_audit_total_duration": "Total duration: {{duration}}",
+    "access_audit_last_connected": "Last connected: {{value}}",
+    "access_audit_history": "Connection audit",
+    "access_audit_connected_now": "Connected now · {{duration}}",
+    "access_audit_under_minute": "under 1 min",
+    "access_audit_minutes": "{{minutes}} min",
+    "access_audit_hours_minutes": "{{hours}} h {{minutes}} min",
     "access_owner_hint": "Manage public remote-desktop access without exposing raw secrets on the remote screen.",
     "access_no_host": "Public access is still being prepared for this node. Refresh and try again.",
     "access_refresh": "Refresh",

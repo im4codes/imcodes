@@ -78,6 +78,20 @@ export class LinkAuthorityError extends Error {
 }
 
 /** Non-secret identity metadata. Never carries the hash or any bearer. */
+export interface OwnerLinkConnectionAuditEntry {
+  ipAddress: string;
+  connectedAt: number;
+  disconnectedAt: number | null;
+  durationMs: number;
+}
+
+export interface OwnerLinkConnectionAudit {
+  connectionCount: number;
+  totalDurationMs: number;
+  lastConnectedAt: number | null;
+  recentConnections: OwnerLinkConnectionAuditEntry[];
+}
+
 export interface OwnerLinkView {
   id: string;
   hostId: string;
@@ -91,6 +105,7 @@ export interface OwnerLinkView {
   state: 'active' | 'revoked' | 'expired';
   claimed: boolean;
   createdAt: number;
+  connectionAudit: OwnerLinkConnectionAudit;
 }
 
 interface LinkRow {
@@ -115,7 +130,20 @@ const LINK_COLUMNS = `id, host_id, owner_user_id, token_hash, creation_request_i
   normalized_policy_hash, label, attendance, access_mode, expires_at,
   authority_generation, expiry_revision, commit_revision, state, created_at`;
 
-function toView(row: LinkRow, claimed: boolean): OwnerLinkView {
+function emptyConnectionAudit(): OwnerLinkConnectionAudit {
+  return {
+    connectionCount: 0,
+    totalDurationMs: 0,
+    lastConnectedAt: null,
+    recentConnections: [],
+  };
+}
+
+function toView(
+  row: LinkRow,
+  claimed: boolean,
+  connectionAudit: OwnerLinkConnectionAudit = emptyConnectionAudit(),
+): OwnerLinkView {
   return {
     id: row.id,
     hostId: row.host_id,
@@ -129,6 +157,7 @@ function toView(row: LinkRow, claimed: boolean): OwnerLinkView {
     state: row.state as OwnerLinkView['state'],
     claimed,
     createdAt: row.created_at,
+    connectionAudit,
   };
 }
 
@@ -336,20 +365,72 @@ function unwrap<T, R>(used: StepUpGrantUse<T>, pick: (value: T) => R): { link: R
 /** Owner-only inventory. Returns non-secret metadata for one canonical host. */
 export async function listOwnerLinks(
   db: Database,
-  input: { ownerUserId: string; hostId: string; limit?: number },
+  input: { ownerUserId: string; hostId: string; limit?: number; now?: number },
 ): Promise<OwnerLinkView[]> {
   await db.transaction((tx) => assertOwnedHostTx(tx, input.hostId, input.ownerUserId));
-  const rows = await db.query<LinkRow & { claimed: boolean }>(
+  const now = input.now ?? Date.now();
+  const rows = await db.query<LinkRow & {
+    claimed: boolean;
+    connection_count: number | string;
+    total_duration_ms: number | string;
+    last_connected_at: number | null;
+  }>(
     `SELECT ${LINK_COLUMNS.split(', ').map((c) => `l.${c.trim()}`).join(', ')},
-            (c.link_id IS NOT NULL) AS claimed
+            (c.link_id IS NOT NULL) AS claimed,
+            audit.connection_count, audit.total_duration_ms, audit.last_connected_at
        FROM remote_desktop_guest_links l
        LEFT JOIN remote_desktop_guest_browser_claims c ON c.link_id = l.id
+       LEFT JOIN LATERAL (
+         SELECT COUNT(*) AS connection_count,
+                COALESCE(SUM(GREATEST(0, COALESCE(s.closed_at, $4) - s.connected_at)), 0)
+                  AS total_duration_ms,
+                MAX(s.connected_at) AS last_connected_at
+           FROM remote_desktop_guest_sessions s
+          WHERE s.link_id = l.id AND s.connected_at IS NOT NULL
+       ) audit ON TRUE
       WHERE l.owner_user_id = $1 AND l.host_id = $2
       ORDER BY l.created_at DESC
       LIMIT $3`,
-    [input.ownerUserId, input.hostId, Math.min(input.limit ?? 100, 200)],
+    [input.ownerUserId, input.hostId, Math.min(input.limit ?? 100, 200), now],
   );
-  return rows.map((row) => toView(row, row.claimed));
+  if (rows.length === 0) return [];
+
+  const recentRows = await db.query<{
+    link_id: string;
+    source_ip: string;
+    connected_at: number;
+    closed_at: number | null;
+    duration_ms: number | string;
+  }>(
+    `SELECT link_id, host(source_ip) AS source_ip, connected_at, closed_at,
+            GREATEST(0, COALESCE(closed_at, $1) - connected_at) AS duration_ms
+       FROM (
+         SELECT link_id, source_ip, connected_at, closed_at,
+                ROW_NUMBER() OVER (PARTITION BY link_id ORDER BY connected_at DESC) AS audit_rank
+           FROM remote_desktop_guest_sessions
+          WHERE link_id = ANY($2::text[]) AND connected_at IS NOT NULL AND source_ip IS NOT NULL
+       ) recent
+      WHERE audit_rank <= 20
+      ORDER BY connected_at DESC`,
+    [now, rows.map((row) => row.id)],
+  );
+  const recentByLink = new Map<string, OwnerLinkConnectionAuditEntry[]>();
+  for (const row of recentRows) {
+    const recent = recentByLink.get(row.link_id) ?? [];
+    recent.push({
+      ipAddress: row.source_ip,
+      connectedAt: row.connected_at,
+      disconnectedAt: row.closed_at,
+      durationMs: Number(row.duration_ms),
+    });
+    recentByLink.set(row.link_id, recent);
+  }
+  return rows.map((row) => toView(row, row.claimed, {
+    connectionCount: Number(row.connection_count),
+    totalDurationMs: Number(row.total_duration_ms),
+    lastConnectedAt: row.last_connected_at,
+    recentConnections: recentByLink.get(row.id) ?? [],
+  }));
 }
 
 export interface MutateLinkInput {

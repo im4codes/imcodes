@@ -86,6 +86,7 @@ export interface RemoteDesktopRouterHooks {
   redeemGuestBootstrap?(input: {
     proof: RemoteDesktopBootstrapProof;
     routeGeneration: number;
+    clientIp: string;
     now: number;
   }): Promise<{
     actor: RemoteDesktopActor;
@@ -178,7 +179,7 @@ const postgresRouteRegistry: RemoteDesktopRouteRegistry = {
     if (input.guestSessionId) {
       await tx.execute(
         `UPDATE remote_desktop_guest_sessions
-            SET state = 'active', updated_at = $2
+            SET state = 'active', connected_at = COALESCE(connected_at, $2), updated_at = $2
           WHERE id = $1 AND state = 'admitting'`,
         [input.guestSessionId, input.now],
       );
@@ -365,7 +366,11 @@ export class RemoteDesktopRouter {
     return true;
   }
 
-  async redeemGuestBootstrap(socket: WebSocket, proof: RemoteDesktopBootstrapProof): Promise<boolean> {
+  async redeemGuestBootstrap(
+    socket: WebSocket,
+    proof: RemoteDesktopBootstrapProof,
+    clientIp = '0.0.0.0',
+  ): Promise<boolean> {
     if (this.pendingGuestBySocket.has(socket) || !this.hooks.redeemGuestBootstrap) return false;
     const daemonGeneration = this.hooks.daemonGeneration();
     if (!this.hooks.daemonAvailable() || !this.hooks.daemonSupportsRemoteDesktop()) return false;
@@ -376,6 +381,7 @@ export class RemoteDesktopRouter {
     const redeemed = await this.hooks.redeemGuestBootstrap({
       proof,
       routeGeneration,
+      clientIp,
       now: this.now(),
     }).catch(() => null);
     if (!redeemed || redeemed.routeGeneration !== routeGeneration

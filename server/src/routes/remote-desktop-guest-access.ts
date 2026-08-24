@@ -223,7 +223,7 @@ function parseRevoke(value: unknown): Omit<NonNullable<ReturnType<typeof parseMu
 }
 
 /** Explicit response allowlist: hashes, bearers and browser material cannot leak if the service grows. */
-function presentOwnerLink(link: OwnerLinkView): OwnerLinkView {
+function presentOwnerLink(link: OwnerLinkView): Record<string, unknown> {
   return {
     id: link.id,
     hostId: link.hostId,
@@ -237,6 +237,17 @@ function presentOwnerLink(link: OwnerLinkView): OwnerLinkView {
     state: link.state,
     claimed: link.claimed,
     createdAt: link.createdAt,
+    ...(link.connectionAudit ? { connectionAudit: {
+      connectionCount: link.connectionAudit.connectionCount,
+      totalDurationMs: link.connectionAudit.totalDurationMs,
+      lastConnectedAt: link.connectionAudit.lastConnectedAt,
+      recentConnections: link.connectionAudit.recentConnections.map((entry) => ({
+        ipAddress: entry.ipAddress,
+        connectedAt: entry.connectedAt,
+        disconnectedAt: entry.disconnectedAt,
+        durationMs: entry.durationMs,
+      })),
+    } } : {}),
   };
 }
 

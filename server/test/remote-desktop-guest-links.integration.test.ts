@@ -514,6 +514,47 @@ describe('Owner list and mutation matrix (4.7 / 4.8)', () => {
     );
   });
 
+  it('returns successful connection count, duration and bounded source-IP history for Owner audit', async () => {
+    const fx = await seedFixture();
+    const created = await createLink(fx);
+    await db.execute(
+      `INSERT INTO remote_desktop_guest_sessions
+         (id, link_id, host_id, browser_key_hash, actor_kind, authority_generation,
+          expiry_revision, state, source_ip, connected_at, created_at, updated_at, closed_at)
+       VALUES
+         ($1,$2,$3,'key-1','attended_link',1,1,'closed',$4::inet,$5,$5,$6,$6),
+         ($7,$2,$3,'key-2','attended_link',1,1,'active',$8::inet,$9,$9,$9,NULL)`,
+      [randomUUID(), created.link.id, fx.hostId, '203.0.113.42', NOW - 120_000, NOW - 60_000,
+        randomUUID(), '2001:db8::42', NOW - 30_000],
+    );
+
+    const [audited] = await listOwnerLinks(db, {
+      ownerUserId: fx.ownerUserId,
+      hostId: fx.hostId,
+      now: NOW,
+    });
+    expect(audited?.connectionAudit).toEqual({
+      connectionCount: 2,
+      totalDurationMs: 90_000,
+      lastConnectedAt: NOW - 30_000,
+      recentConnections: [
+        {
+          ipAddress: '2001:db8::42',
+          connectedAt: NOW - 30_000,
+          disconnectedAt: null,
+          durationMs: 30_000,
+        },
+        {
+          ipAddress: '203.0.113.42',
+          connectedAt: NOW - 120_000,
+          disconnectedAt: NOW - 60_000,
+          durationMs: 60_000,
+        },
+      ],
+    });
+    expect(JSON.stringify(audited)).not.toContain('key-1');
+  });
+
   it('advances neither counter on a label edit', async () => {
     const fx = await seedFixture();
     const created = await createLink(fx);
@@ -828,6 +869,7 @@ describe('public proof and sticky bootstrap (5.1–5.4)', () => {
       proof: makeBootstrapProof(proof.bootstrapTicket, key),
       redeemingServerId: fx.serverId,
       routeGeneration: 17,
+      clientIp: '203.0.113.77',
       now: NOW + 10,
     });
     expect(admitted).toMatchObject({
@@ -841,8 +883,10 @@ describe('public proof and sticky bootstrap (5.1–5.4)', () => {
     const durable = await db.queryOne<{
       state: string; route_id: string; route_generation: number; actor_source: string;
       guest_session_id: string;
+      source_ip: string;
     }>(
-      `SELECT s.state, s.route_id, s.route_generation, r.actor_source, r.guest_session_id
+      `SELECT s.state, s.route_id, s.route_generation, host(s.source_ip) AS source_ip,
+              r.actor_source, r.guest_session_id
          FROM remote_desktop_guest_sessions s
          JOIN remote_desktop_host_routes r
            ON r.guest_session_id = s.id AND r.route_id = s.route_id
@@ -855,6 +899,7 @@ describe('public proof and sticky bootstrap (5.1–5.4)', () => {
       route_generation: 17,
       actor_source: REMOTE_DESKTOP_ACTOR_SOURCE.ATTENDED_LINK,
       guest_session_id: admitted!.sessionId,
+      source_ip: '203.0.113.77',
     });
     const duplicate = await proveLink(created.token, key);
     if (!duplicate.ok) throw new Error('duplicate proof failed');
@@ -863,6 +908,7 @@ describe('public proof and sticky bootstrap (5.1–5.4)', () => {
       proof: makeBootstrapProof(duplicate.bootstrapTicket, key),
       redeemingServerId: fx.serverId,
       routeGeneration: 17,
+      clientIp: '203.0.113.77',
       now: NOW + 11,
     })).toBeNull();
     expect(await db.queryOne<{ redeemed_at: number | null }>(
@@ -874,6 +920,7 @@ describe('public proof and sticky bootstrap (5.1–5.4)', () => {
       proof: makeBootstrapProof(proof.bootstrapTicket, key),
       redeemingServerId: fx.serverId,
       routeGeneration: 17,
+      clientIp: '203.0.113.77',
       now: NOW + 11,
     })).toBeNull();
   });

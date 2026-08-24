@@ -258,10 +258,36 @@ describe('remote desktop guest access routes', () => {
   it('scopes the Owner inventory to the authenticated user', async () => {
     mocks.list.mockResolvedValue([{
       id: LINK_ID, label: 'laptop', tokenHash: 'forbidden-hash', browserPrivateKey: 'forbidden-key',
+      connectionAudit: {
+        connectionCount: 1,
+        totalDurationMs: 60_000,
+        lastConnectedAt: 1_700_000_000_000,
+        recentConnections: [{
+          ipAddress: '203.0.113.42',
+          connectedAt: 1_700_000_000_000,
+          disconnectedAt: 1_700_000_060_000,
+          durationMs: 60_000,
+          sessionId: 'forbidden-session-id',
+        }],
+      },
     }]);
     const response = await app().request(`/api/remote-desktop/guest/links?hostId=${HOST_ID}`, {}, ENV);
     expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({ links: [{ id: LINK_ID, label: 'laptop' }] });
+    expect(await response.json()).toEqual({ links: [{
+      id: LINK_ID,
+      label: 'laptop',
+      connectionAudit: {
+        connectionCount: 1,
+        totalDurationMs: 60_000,
+        lastConnectedAt: 1_700_000_000_000,
+        recentConnections: [{
+          ipAddress: '203.0.113.42',
+          connectedAt: 1_700_000_000_000,
+          disconnectedAt: 1_700_000_060_000,
+          durationMs: 60_000,
+        }],
+      },
+    }] });
     expect(mocks.list).toHaveBeenCalledWith(expect.anything(), { ownerUserId: 'owner-1', hostId: HOST_ID });
   });
 

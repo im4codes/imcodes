@@ -3097,6 +3097,9 @@
     "share": {
       "title": "Поделиться управляемым узлом",
       "subtitle": "Предоставить доступ к {{target}}",
+      "sections_label": "Способ предоставления доступа",
+      "account_tab": "Доступ для аккаунтов",
+      "remote_desktop_tab": "Приглашения удалённого рабочего стола",
       "role_help": {
         "viewer": "Можно видеть состояние и основные сведения об узле, но нельзя управлять им.",
         "participant": "Можно выполнять команды, передавать файлы и управлять компьютером, пока выполнение разрешено."
@@ -3410,6 +3413,14 @@
     "login_screen_error_elevation_declined": "Подтверждение администратора на этой машине не получено",
     "access_owner_title": "Owner access",
     "access_manage": "Приглашения",
+    "access_audit_connections": "Подключений: {{count}}",
+    "access_audit_total_duration": "Общая длительность: {{duration}}",
+    "access_audit_last_connected": "Последнее подключение: {{value}}",
+    "access_audit_history": "Аудит подключений",
+    "access_audit_connected_now": "Сейчас подключён · {{duration}}",
+    "access_audit_under_minute": "менее 1 мин",
+    "access_audit_minutes": "{{minutes}} мин",
+    "access_audit_hours_minutes": "{{hours}} ч {{minutes}} мин",
     "access_owner_hint": "Manage public remote-desktop access without exposing raw secrets on the remote screen.",
     "access_no_host": "Open or select a desktop before managing public access.",
     "access_refresh": "Refresh",

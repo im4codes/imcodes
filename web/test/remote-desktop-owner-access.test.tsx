@@ -12,6 +12,17 @@ const link: RemoteDesktopOwnerLinkView = {
   id: 'link-1', hostId: 'host-1', label: 'Ops', kind: REMOTE_DESKTOP_LINK_KIND.ATTENDED,
   mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL, expiresAt: Date.now() + 3600_000,
   authorityGeneration: 1, expiryRevision: 1, commitRevision: 1, state: 'active', claimed: false, createdAt: Date.now(),
+  connectionAudit: {
+    connectionCount: 2,
+    totalDurationMs: 5_400_000,
+    lastConnectedAt: Date.now() - 3_600_000,
+    recentConnections: [{
+      ipAddress: '203.0.113.42',
+      connectedAt: Date.now() - 3_600_000,
+      disconnectedAt: Date.now() - 1_800_000,
+      durationMs: 1_800_000,
+    }],
+  },
 };
 
 function api(overrides: Partial<RemoteDesktopAccessApi> = {}): RemoteDesktopAccessApi {
@@ -61,6 +72,14 @@ describe('RemoteDesktopOwnerAccess', () => {
     expect(document.body.textContent).not.toContain('srv-secret');
     fireEvent.click(screen.getByRole('button', { name: 'common.copy' }));
     expect(navigator.clipboard.writeText).toHaveBeenCalledWith('5123456789');
+  });
+
+  it('shows bounded per-link connection count, duration and source IP audit', async () => {
+    render(<RemoteDesktopOwnerAccess hostId="host-1" api={api()} privacy={privacy()} />);
+    expect(await screen.findByText('203.0.113.42')).toBeTruthy();
+    expect(document.body.textContent).toContain('remote_desktop.access_audit_connections:2');
+    expect(document.body.textContent).toContain('remote_desktop.access_audit_total_duration');
+    expect(document.body.textContent).not.toContain('sessionId');
   });
 
   it('requires privacy and action-bound step-up before creating a link, then shows the raw invite once', async () => {

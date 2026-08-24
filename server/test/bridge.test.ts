@@ -435,14 +435,15 @@ describe('WsBridge', () => {
     const bridge = WsBridge.get(serverId);
     const ws = new MockWs();
     const handleGuestBrowser = vi.fn(async () => true);
+    const redeemGuestBootstrap = vi.fn(async () => true);
     Object.defineProperty(bridge, 'remoteDesktopRouter', {
       value: {
-        redeemGuestBootstrap: vi.fn(async () => true),
+        redeemGuestBootstrap,
         handleGuestBrowser,
         dropSocket: vi.fn(),
       },
     });
-    bridge.handleGuestRemoteDesktopConnection(ws as never, makeDb('valid-hash'));
+    bridge.handleGuestRemoteDesktopConnection(ws as never, makeDb('valid-hash'), '203.0.113.55');
 
     ws.emit('message', Buffer.from(JSON.stringify({
       ticket: 'A'.repeat(43),
@@ -450,6 +451,11 @@ describe('WsBridge', () => {
       signature: 'C'.repeat(86),
     })));
     await flushAsync();
+    expect(redeemGuestBootstrap).toHaveBeenCalledWith(
+      ws,
+      expect.objectContaining({ ticket: 'A'.repeat(43) }),
+      '203.0.113.55',
+    );
     expect(ws.sentStrings.map((raw) => JSON.parse(raw))).toContainEqual({
       type: 'remote_desktop.bootstrap_redeemed',
     });

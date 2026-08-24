@@ -533,7 +533,7 @@ describe('ControlledNodesPanel (12.3)', () => {
     expect(container.querySelector('.remote-desktop-panel')).toBeNull();
   });
 
-  it('opens Owner invitation management directly without opening a desktop connection', async () => {
+  it('keeps one Share entry and opens Owner invitations inside that dialog without connecting', async () => {
     const onOpenRemoteDesktop = vi.fn();
     machines = [
       machine({
@@ -560,10 +560,16 @@ describe('ControlledNodesPanel (12.3)', () => {
     );
     await waitFor(() => expect(container.querySelectorAll('.controlled-nodes-remote-desktop')).toHaveLength(2));
 
-    const accessButtons = container.querySelectorAll('.controlled-nodes-remote-desktop-access');
-    expect(accessButtons).toHaveLength(1);
-    expect(accessButtons[0]?.closest('li')?.textContent).toContain('Owner Desktop');
-    fireEvent.click(accessButtons[0]!);
+    expect(container.querySelector('.controlled-nodes-remote-desktop-access')).toBeNull();
+    const ownerCard = [...container.querySelectorAll('.controlled-nodes-machine-row')]
+      .find((card) => card.textContent?.includes('Owner Desktop'))!;
+    const shareButton = ownerCard.querySelector('.controlled-nodes-machine-actions > .share-revoke-btn');
+    expect(shareButton).not.toBeNull();
+    fireEvent.click(shareButton!);
+
+    const shareTabs = container.querySelectorAll('.share-dialog-tab');
+    expect(shareTabs).toHaveLength(2);
+    fireEvent.click(shareTabs[1]!);
 
     expect(onOpenRemoteDesktop).not.toHaveBeenCalled();
     expect(getByTestId('remote-desktop-owner-access').textContent)

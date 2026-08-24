@@ -492,7 +492,7 @@ export function setupWebSocketUpgrade(server: import('node:http').Server, env: E
           counted = false;
           unauthenticatedDaemonCount = Math.max(0, unauthenticatedDaemonCount - 1);
         };
-        WsBridge.get(serverId).handleGuestRemoteDesktopConnection(ws, env.DB);
+        WsBridge.get(serverId).handleGuestRemoteDesktopConnection(ws, env.DB, ip);
         ws.once('close', decrement);
         ws.once('error', decrement);
       });

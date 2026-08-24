@@ -21,6 +21,7 @@
  */
 
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
+import { isIP } from 'node:net';
 import type { Database } from '../db/client.js';
 import {
   REMOTE_DESKTOP_ACTOR_SOURCE,
@@ -600,8 +601,10 @@ export async function redeemBootstrapForRoute(input: {
   proof: RemoteDesktopBootstrapProof;
   redeemingServerId: string;
   routeGeneration: number;
+  clientIp: string;
   now: number;
 }): Promise<RedeemedGuestAdmission | null> {
+  if (isIP(input.clientIp) === 0) return null;
   return input.db.transaction(async (tx) => {
     const redeemed = await redeemBootstrapTx(tx, input);
     if (!redeemed) return null;
@@ -676,9 +679,9 @@ export async function redeemBootstrapForRoute(input: {
       ?? `password:${redeemed.hostId}:${redeemed.credentialGeneration}`;
     const bound = await tx.execute(
       `UPDATE remote_desktop_guest_sessions
-          SET route_id = $2, route_generation = $3, updated_at = $4
+          SET route_id = $2, route_generation = $3, source_ip = $4::inet, updated_at = $5
         WHERE id = $1 AND state = 'admitting'`,
-      [sessionId, sessionId, input.routeGeneration, input.now],
+      [sessionId, sessionId, input.routeGeneration, input.clientIp, input.now],
     );
     if (bound.changes !== 1) throw new GuestAdmissionRefused();
     await reserveRouteTx(tx, {

@@ -34,6 +34,12 @@ vi.mock('../src/api.js', async (importOriginal) => {
   };
 });
 
+vi.mock('../src/components/RemoteDesktopOwnerAccess.js', () => ({
+  RemoteDesktopOwnerAccess: ({ hostId, endpointLabel }: { hostId: string | null; endpointLabel: string }) => (
+    <div data-testid="remote-desktop-share-access">{hostId ?? 'missing'}:{endpointLabel}</div>
+  ),
+}));
+
 const messages: Record<string, string> = {
   'share.menu.shareTab': 'Share',
   'share.dialogTitle': 'Share access',
@@ -54,6 +60,9 @@ const messages: Record<string, string> = {
   'share.trust.body': 'Agents are not sandboxed.',
   'controlled_nodes.share.title': 'Share controlled node',
   'controlled_nodes.share.subtitle': 'Grant access to {{target}}',
+  'controlled_nodes.share.sections_label': 'Sharing method',
+  'controlled_nodes.share.account_tab': 'Account sharing',
+  'controlled_nodes.share.remote_desktop_tab': 'Remote desktop invites',
   'controlled_nodes.share.role_help.viewer': 'Can view this node.',
   'controlled_nodes.share.role_help.participant': 'Can control this node.',
   'controlled_nodes.share.trust_title': 'Machine control disclosure',
@@ -451,6 +460,52 @@ describe('collaborative tab sharing UI', () => {
       targetUserId: 'recipient-1',
       role: 'participant',
     }));
+  });
+
+  it('keeps account sharing and remote desktop invitations in one machine dialog', async () => {
+    apiMocks.listSharesForTarget.mockResolvedValue([]);
+    render(
+      <ShareSessionDialog
+        variant="machine"
+        fixedTarget={{ kind: 'server', serverId: 'machine-1' }}
+        target={{
+          serverId: 'machine-1',
+          serverLabel: 'Office Node',
+          sessionName: '',
+          tabLabel: 'Office Node',
+        }}
+        remoteDesktopAccess={{ hostId: 'host-1', endpointLabel: 'Office Node' }}
+        onClose={() => {}}
+      />,
+    );
+
+    const accountTab = screen.getByRole('tab', { name: 'Account sharing' });
+    const inviteTab = screen.getByRole('tab', { name: 'Remote desktop invites' });
+    expect(accountTab.getAttribute('aria-selected')).toBe('true');
+    expect(screen.getByLabelText('Recipient')).not.toBeNull();
+
+    fireEvent.keyDown(accountTab, { key: 'ArrowRight' });
+    expect(inviteTab.getAttribute('aria-selected')).toBe('true');
+    expect(screen.queryByLabelText('Recipient')).toBeNull();
+    expect(screen.getByTestId('remote-desktop-share-access').textContent).toBe('host-1:Office Node');
+    expect(apiMocks.createShare).not.toHaveBeenCalled();
+  });
+
+  it('does not add machine sharing tabs to the ordinary session share dialog', () => {
+    apiMocks.listSharesForTarget.mockResolvedValue([]);
+    render(
+      <ShareSessionDialog
+        target={{
+          serverId: 'srv-1',
+          serverLabel: 'Workstation',
+          sessionName: 'deck_alpha_brain',
+          tabLabel: 'Alpha',
+        }}
+        onClose={() => {}}
+      />,
+    );
+    expect(screen.queryByRole('tablist')).toBeNull();
+    expect(screen.getByLabelText('Recipient')).not.toBeNull();
   });
 
   it('lets managers update and revoke existing shares from the share dialog', async () => {

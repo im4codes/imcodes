@@ -331,6 +331,13 @@ html.native-ios-mac .chat-dl-btn {
 .share-dialog { max-width: 520px; }
 .share-dialog-title { font-size: 18px; font-weight: 800; color: #f8fafc; }
 .share-dialog-subtitle { margin-top: 4px; font-size: 12px; line-height: 1.4; color: #94a3b8; }
+.share-dialog-tabs { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; padding: 4px; border: 1px solid rgba(125,211,252,0.16); border-radius: 9px; background: rgba(8,15,28,0.62); }
+.share-dialog-tab { min-height: 36px; padding: 7px 10px; border: 1px solid transparent; border-radius: 7px; background: transparent; color: #94a3b8; font: inherit; font-size: 12px; font-weight: 750; cursor: pointer; }
+.share-dialog-tab:hover { color: #e0f2fe; background: rgba(14,116,144,0.12); }
+.share-dialog-tab.is-active { border-color: rgba(34,211,238,0.34); background: rgba(8,145,178,0.2); color: #cffafe; box-shadow: inset 0 0 14px rgba(34,211,238,0.06); }
+.share-dialog-tab:focus-visible { outline: 2px solid var(--chrome-accent); outline-offset: 2px; }
+.share-dialog-panel { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+.share-dialog-remote-desktop .remote-desktop-access { max-height: none; padding: 0; background: transparent; overflow: visible; }
 .share-field { display: flex; flex-direction: column; gap: 8px; }
 .share-field-label { font-size: 12px; font-weight: 700; color: #cbd5e1; }
 .share-choice-row { display: flex; flex-wrap: wrap; gap: 8px; }
@@ -3416,51 +3423,6 @@ html.native-ios-mac .chat-dl-btn {
   transition: border-color 0.16s, background 0.16s, color 0.16s, box-shadow 0.16s;
 }
 .controlled-nodes-machine-actions button:disabled { cursor: wait; opacity: 0.48; }
-.controlled-nodes-remote-desktop-access {
-  padding: 5px 11px;
-  border: 1px solid rgba(167, 139, 250, 0.42);
-  background: rgba(124, 58, 237, 0.14);
-  color: #ddd6fe;
-  font-size: 10px;
-}
-.controlled-nodes-remote-desktop-access:hover,
-.controlled-nodes-remote-desktop-access[aria-expanded="true"] {
-  border-color: rgba(196, 181, 253, 0.7);
-  background: rgba(124, 58, 237, 0.26);
-  color: #f5f3ff;
-  box-shadow: 0 0 14px rgba(139, 92, 246, 0.16);
-}
-.controlled-nodes-remote-desktop-access-panel {
-  grid-column: 1 / -1;
-  min-width: 0;
-  padding-top: 12px;
-  border-top: 1px solid rgba(167, 139, 250, 0.22);
-}
-.controlled-nodes-remote-desktop-access-panel > header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  margin-bottom: 8px;
-}
-.controlled-nodes-remote-desktop-access-panel > header > div {
-  display: grid;
-  gap: 2px;
-}
-.controlled-nodes-remote-desktop-access-panel > header strong { color: #ede9fe; }
-.controlled-nodes-remote-desktop-access-panel > header span { color: #94a3b8; font-size: 11px; }
-.controlled-nodes-remote-desktop-access-close {
-  min-width: 36px;
-  padding: 5px 9px;
-  border: 1px solid rgba(148, 163, 184, 0.26);
-  background: rgba(15, 23, 42, 0.68);
-  color: #cbd5e1;
-}
-.controlled-nodes-remote-desktop-access-panel .remote-desktop-access {
-  max-height: none;
-  padding: 0;
-  background: transparent;
-}
 .controlled-nodes-exec-toggle {
   display: inline-flex;
   align-items: center;

@@ -3098,6 +3098,9 @@
     "share": {
       "title": "Compartir nodo controlado",
       "subtitle": "Conceder acceso a {{target}}",
+      "sections_label": "Método para compartir",
+      "account_tab": "Compartir con cuentas",
+      "remote_desktop_tab": "Invitaciones de escritorio remoto",
       "role_help": {
         "viewer": "Puede ver la presencia y los datos básicos del nodo, pero no controlarlo.",
         "participant": "Puede ejecutar comandos, transferir archivos y usar el control del equipo mientras la ejecución esté habilitada."
@@ -3411,6 +3414,14 @@
     "login_screen_error_elevation_declined": "No se concedió la aprobación de administrador en esa máquina",
     "access_owner_title": "Owner access",
     "access_manage": "Invitaciones",
+    "access_audit_connections": "Conexiones: {{count}}",
+    "access_audit_total_duration": "Duración total: {{duration}}",
+    "access_audit_last_connected": "Última conexión: {{value}}",
+    "access_audit_history": "Auditoría de conexiones",
+    "access_audit_connected_now": "Conectado ahora · {{duration}}",
+    "access_audit_under_minute": "menos de 1 min",
+    "access_audit_minutes": "{{minutes}} min",
+    "access_audit_hours_minutes": "{{hours}} h {{minutes}} min",
     "access_owner_hint": "Manage public remote-desktop access without exposing raw secrets on the remote screen.",
     "access_no_host": "Open or select a desktop before managing public access.",
     "access_refresh": "Refresh",

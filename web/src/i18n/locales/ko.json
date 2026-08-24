@@ -3097,6 +3097,9 @@
     "share": {
       "title": "제어 노드 공유",
       "subtitle": "{{target}} 접근 권한 부여",
+      "sections_label": "공유 방법",
+      "account_tab": "계정 공유",
+      "remote_desktop_tab": "원격 데스크톱 초대",
       "role_help": {
         "viewer": "노드의 연결 상태와 기본 정보만 볼 수 있으며 조작할 수 없습니다.",
         "participant": "실행이 허용된 동안 명령 실행, 파일 전송 및 컴퓨터 제어를 사용할 수 있습니다."
@@ -3410,6 +3413,14 @@
     "login_screen_error_elevation_declined": "해당 컴퓨터에서 관리자 승인을 받지 못했습니다",
     "access_owner_title": "Owner access",
     "access_manage": "초대",
+    "access_audit_connections": "연결 횟수: {{count}}",
+    "access_audit_total_duration": "총 연결 시간: {{duration}}",
+    "access_audit_last_connected": "최근 연결: {{value}}",
+    "access_audit_history": "연결 감사",
+    "access_audit_connected_now": "현재 연결됨 · {{duration}}",
+    "access_audit_under_minute": "1분 미만",
+    "access_audit_minutes": "{{minutes}}분",
+    "access_audit_hours_minutes": "{{hours}}시간 {{minutes}}분",
     "access_owner_hint": "Manage public remote-desktop access without exposing raw secrets on the remote screen.",
     "access_no_host": "Open or select a desktop before managing public access.",
     "access_refresh": "Refresh",

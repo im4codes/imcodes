@@ -1644,7 +1644,7 @@ export class WsBridge {
     iceServers: (userId) => createTurnIceServerAuthority(userId),
     sendDaemon: (message, generation) => this.trySendRemoteDesktop(message, generation),
     sendBrowser: (socket, message) => { safeSend(socket, JSON.stringify(message)); },
-    redeemGuestBootstrap: async ({ proof, routeGeneration, now }) => {
+    redeemGuestBootstrap: async ({ proof, routeGeneration, clientIp, now }) => {
       const db = this.db;
       if (!db) return null;
       const redeemed = await redeemBootstrapForRoute({
@@ -1652,6 +1652,7 @@ export class WsBridge {
         proof,
         redeemingServerId: this.serverId,
         routeGeneration,
+        clientIp,
         now,
       });
       if (!redeemed) return null;
@@ -4935,7 +4936,7 @@ export class WsBridge {
    * bounded first frame is the shared bootstrap proof; only after atomic
    * redemption can standard remote-desktop signaling enter the Router.
    */
-  handleGuestRemoteDesktopConnection(ws: WebSocket, db: Database): void {
+  handleGuestRemoteDesktopConnection(ws: WebSocket, db: Database, clientIp = '0.0.0.0'): void {
     this.db = db;
     let state: 'quarantined' | 'verifying' | 'admitted' | 'closed' = 'quarantined';
     let receivedFirstFrame = false;
@@ -4967,7 +4968,7 @@ export class WsBridge {
         const proof = validateRemoteDesktopBootstrapProof(value);
         if (!proof.ok) { closeUniformly(); return; }
         state = 'verifying';
-        const admitted = await this.remoteDesktopRouter.redeemGuestBootstrap(ws, proof.value);
+        const admitted = await this.remoteDesktopRouter.redeemGuestBootstrap(ws, proof.value, clientIp);
         if (!admitted || (state as string) === 'closed') {
           this.remoteDesktopRouter.dropSocket(ws);
           closeUniformly();

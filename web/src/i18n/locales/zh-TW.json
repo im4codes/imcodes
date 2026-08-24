@@ -3098,6 +3098,9 @@
     "share": {
       "title": "共享受控節點",
       "subtitle": "授予對 {{target}} 的存取權限",
+      "sections_label": "共享方式",
+      "account_tab": "帳號共享",
+      "remote_desktop_tab": "遠端桌面邀請",
       "role_help": {
         "viewer": "可查看節點上線狀態和基本資訊，但不能操作節點。",
         "participant": "節點允許執行時，可執行命令、傳輸檔案及使用電腦控制。"
@@ -3411,6 +3414,14 @@
     "login_screen_error_elevation_declined": "該機器上未確認管理員授權",
     "access_owner_title": "Owner access",
     "access_manage": "邀請",
+    "access_audit_connections": "連線次數：{{count}}",
+    "access_audit_total_duration": "累計時長：{{duration}}",
+    "access_audit_last_connected": "最近連線：{{value}}",
+    "access_audit_history": "連線稽核記錄",
+    "access_audit_connected_now": "目前連線中 · {{duration}}",
+    "access_audit_under_minute": "不足 1 分鐘",
+    "access_audit_minutes": "{{minutes}} 分鐘",
+    "access_audit_hours_minutes": "{{hours}} 小時 {{minutes}} 分鐘",
     "access_owner_hint": "Manage public remote-desktop access without exposing raw secrets on the remote screen.",
     "access_no_host": "Open or select a desktop before managing public access.",
     "access_refresh": "Refresh",

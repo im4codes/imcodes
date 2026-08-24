@@ -56,6 +56,17 @@ export interface RemoteDesktopOwnerLinkView {
   state: 'active' | 'revoked' | 'expired';
   claimed: boolean;
   createdAt: number;
+  connectionAudit: {
+    connectionCount: number;
+    totalDurationMs: number;
+    lastConnectedAt: number | null;
+    recentConnections: Array<{
+      ipAddress: string;
+      connectedAt: number;
+      disconnectedAt: number | null;
+      durationMs: number;
+    }>;
+  };
 }
 
 export interface RemoteDesktopStepUpGrant {
@@ -351,6 +362,8 @@ function decodeHost(value: unknown): RemoteDesktopOwnerHostSummary {
 }
 
 function decodeLink(value: unknown): RemoteDesktopOwnerLinkView {
+  const audit = isRecord(value) && isRecord(value.connectionAudit) ? value.connectionAudit : null;
+  const recent = audit && Array.isArray(audit.recentConnections) ? audit.recentConnections : null;
   if (!isRecord(value)
     || typeof value.id !== 'string'
     || typeof value.hostId !== 'string'
@@ -363,7 +376,19 @@ function decodeLink(value: unknown): RemoteDesktopOwnerLinkView {
     || typeof value.commitRevision !== 'number'
     || (value.state !== 'active' && value.state !== 'revoked' && value.state !== 'expired')
     || typeof value.claimed !== 'boolean'
-    || typeof value.createdAt !== 'number') throw new Error('invalid_remote_desktop_link');
+    || typeof value.createdAt !== 'number'
+    || !audit
+    || !Number.isSafeInteger(audit.connectionCount) || (audit.connectionCount as number) < 0
+    || typeof audit.totalDurationMs !== 'number' || audit.totalDurationMs < 0
+    || (audit.lastConnectedAt !== null && typeof audit.lastConnectedAt !== 'number')
+    || !recent || recent.length > 20
+    || recent.some((entry) => !isRecord(entry)
+      || typeof entry.ipAddress !== 'string' || entry.ipAddress.length === 0 || entry.ipAddress.length > 64
+      || typeof entry.connectedAt !== 'number'
+      || (entry.disconnectedAt !== null && typeof entry.disconnectedAt !== 'number')
+      || typeof entry.durationMs !== 'number' || entry.durationMs < 0)) {
+    throw new Error('invalid_remote_desktop_link');
+  }
   return value as unknown as RemoteDesktopOwnerLinkView;
 }
 

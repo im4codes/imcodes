@@ -3097,6 +3097,9 @@
     "share": {
       "title": "被制御ノードを共有",
       "subtitle": "{{target}} へのアクセスを許可",
+      "sections_label": "共有方法",
+      "account_tab": "アカウント共有",
+      "remote_desktop_tab": "リモートデスクトップ招待",
       "role_help": {
         "viewer": "ノードの接続状態と基本情報を表示できますが、操作はできません。",
         "participant": "実行が許可されている間、コマンド実行、ファイル転送、コンピューター操作ができます。"
@@ -3410,6 +3413,14 @@
     "login_screen_error_elevation_declined": "そのマシンで管理者の承認が得られませんでした",
     "access_owner_title": "Owner access",
     "access_manage": "招待",
+    "access_audit_connections": "接続回数: {{count}}",
+    "access_audit_total_duration": "合計接続時間: {{duration}}",
+    "access_audit_last_connected": "最終接続: {{value}}",
+    "access_audit_history": "接続監査",
+    "access_audit_connected_now": "接続中 · {{duration}}",
+    "access_audit_under_minute": "1 分未満",
+    "access_audit_minutes": "{{minutes}} 分",
+    "access_audit_hours_minutes": "{{hours}} 時間 {{minutes}} 分",
     "access_owner_hint": "Manage public remote-desktop access without exposing raw secrets on the remote screen.",
     "access_no_host": "Open or select a desktop before managing public access.",
     "access_refresh": "Refresh",
