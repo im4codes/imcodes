@@ -566,6 +566,7 @@ export function App() {
     setSelectedServerId(null);
     setSelectedServerName(null);
     setSelectedShareTarget(null);
+    setSelectedSharedEntryId(null);
     setSharedEntries([]);
     setSharedEntriesError(null);
     setManagedShares([]);
@@ -595,6 +596,9 @@ export function App() {
   const [showMobileFileBrowser, setShowMobileFileBrowser] = useState(false);
   const [shareDialogTarget, setShareDialogTarget] = useState<ShareDialogTarget | null>(null);
   const [selectedShareTarget, setSelectedShareTarget] = useState<ShareTarget | null>(null);
+  const [selectedSharedEntryId, setSelectedSharedEntryId] = useState<string | null>(
+    () => initialHashStateRef.current.sharedEntryId,
+  );
   const [sharedHashRestorePending, setSharedHashRestorePending] = useState(
     () => Boolean(initialHashStateRef.current.serverId),
   );
@@ -1312,8 +1316,8 @@ export function App() {
 
   // Sync URL hash with current server + session so each tab has its own URL
   useEffect(() => {
-    writeHashState(selectedServerId, activeSession);
-  }, [selectedServerId, activeSession]);
+    writeHashState(selectedServerId, activeSession, selectedSharedEntryId);
+  }, [selectedServerId, activeSession, selectedSharedEntryId]);
 
   const [showNewSession, setShowNewSession] = useState(false);
   const [renameRequest, setRenameRequest] = useState<string | null>(null);
@@ -2684,6 +2688,7 @@ export function App() {
       setSharedActiveDispatchIds(openedDispatchIds);
 
       setSelectedShareTarget(opened.target);
+      setSelectedSharedEntryId(entry.id);
       rememberSharedTab(entry);
       setManualDashboard(false);
       setSelectedServerId(opened.server.id);
@@ -2737,6 +2742,7 @@ export function App() {
     if (sharedHashRestoreStartedRef.current) return;
 
     const initial = initialHashStateRef.current;
+    const urlSharedEntryId = initial.sharedEntryId;
     const remembered = initialSharedTabRestoreRef.current?.serverId === initial.serverId
       ? initialSharedTabRestoreRef.current
       : null;
@@ -2747,7 +2753,7 @@ export function App() {
       setSharedHashRestorePending(false);
       return;
     }
-    if (!remembered && servers.some((server) => server.id === initial.serverId)) {
+    if (!urlSharedEntryId && !remembered && servers.some((server) => server.id === initial.serverId)) {
       sharedHashRestoreStartedRef.current = true;
       setSharedHashRestorePending(false);
       return;
@@ -2755,11 +2761,18 @@ export function App() {
     if (!sharedEntriesLoaded) return;
 
     sharedHashRestoreStartedRef.current = true;
-    const entry = remembered
-      ? findRememberedSharedEntry(sharedEntries, remembered)
-      : findSharedEntryForHash(sharedEntries, initial.serverId, initial.sessionName);
+    const entry = urlSharedEntryId
+      ? sharedEntries.find((candidate) => (
+          candidate.status === 'active'
+          && candidate.id === urlSharedEntryId
+          && candidate.serverId === initial.serverId
+        )) ?? null
+      : remembered
+        ? findRememberedSharedEntry(sharedEntries, remembered)
+        : findSharedEntryForHash(sharedEntries, initial.serverId, initial.sessionName);
     if (!entry) {
       if (remembered) clearSharedTabRestoreMarker();
+      if (urlSharedEntryId) setSelectedSharedEntryId(null);
       setSharedHashRestorePending(false);
       return;
     }
@@ -4477,6 +4490,7 @@ export function App() {
     setActiveSession(null);
     setSelectedServerId(null);
     setSelectedShareTarget(null);
+    setSelectedSharedEntryId(null);
     setSharedReturnServer(null);
     setShowSharedReturnGuide(false);
     setSharedEntries([]);
@@ -4499,6 +4513,7 @@ export function App() {
     autoEntryRunRef.current++;
     setManualDashboard(false);
     setSelectedShareTarget(null);
+    setSelectedSharedEntryId(null);
     clearSharedTabRestoreMarker();
     setShowSharedReturnGuide(false);
     // Save current active session for the server we're leaving
@@ -4687,6 +4702,7 @@ export function App() {
     setSelectedServerId(null);
     setSelectedServerName(null);
     setSelectedShareTarget(null);
+    setSelectedSharedEntryId(null);
     setActiveSession(null);
     setShowMobileServerMenu(false);
   }, [setActiveSession]);

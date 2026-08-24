@@ -2682,6 +2682,9 @@ describe('App shell', () => {
       serverId: 'srv-shared',
       targetKey: 'main:srv-shared:deck_beta_brain',
     });
+    await waitFor(() => {
+      expect(window.location.hash).toBe('#/srv-shared/deck_beta_brain?shared=share-1');
+    });
     const sharedPane = await screen.findByTestId('session-pane-deck_beta_brain');
     expect(sharedPane.getAttribute('data-active-dispatch-id')).toBe('dispatch-open-1');
     await waitFor(() => expect(wsInstances.length).toBeGreaterThan(ownServerWsCount));
@@ -2769,7 +2772,7 @@ describe('App shell', () => {
     expect(openSharedEntryMock).toHaveBeenCalledWith(sharedEntry.target);
     const sharedPane = await screen.findByTestId('session-pane-deck_beta_brain');
     expect(sharedPane.getAttribute('data-active-dispatch-id')).toBe('dispatch-refresh-1');
-    expect(window.location.hash).toBe('#/srv-shared/deck_beta_brain');
+    expect(window.location.hash).toBe('#/srv-shared/deck_beta_brain?shared=share-refresh-1');
     expect(screen.queryByTestId('session-pane-deck_alpha_brain')).toBeNull();
     expect(screen.queryByTestId('shared-return-guide')).toBeNull();
     await waitFor(() => {
@@ -2779,7 +2782,7 @@ describe('App shell', () => {
   }, 20_000);
 
   it('restores the exact shared tab after refresh even when its server is also in the server list', async () => {
-    history.replaceState(null, '', '/#/srv-shared/deck_beta_brain');
+    history.replaceState(null, '', '/#/srv-shared/deck_beta_brain?shared=share-refresh-exact');
     localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
     localStorage.setItem('rcc_server', 'srv-shared');
     localStorage.setItem('rcc_server_name', 'Shared Server');
@@ -2802,8 +2805,6 @@ describe('App shell', () => {
       targetLabel: 'Whole Shared Server',
       target: { kind: 'server', serverId: 'srv-shared' },
     } as const;
-    const { rememberSharedTab } = await import('../src/shared-tab-restore.js');
-    rememberSharedTab(sharedEntry);
     discoverSharedEntriesMock.mockResolvedValue([otherEntry, sharedEntry]);
     openSharedEntryMock.mockResolvedValue({
       server: { id: 'srv-shared', name: 'Shared Server', status: 'online', lastHeartbeatAt: Date.now() },
