@@ -80,6 +80,10 @@ describe('RemoteDesktopWallTile', () => {
     manager.presentation(host, {}).pointerMove(0.5, 0.5);
     expect(pointerMoves).toBe(0);
     expect(result.container.querySelectorAll('button')).toHaveLength(1);
+    const nameBar = result.container.querySelector('.remote-desktop-wall-tile-title');
+    expect(nameBar?.textContent).toBe('A');
+    expect(nameBar?.getAttribute('title')).toBe('A');
+    expect(nameBar?.getAttribute('aria-hidden')).toBe('true');
     expect(screen.getByRole('status').textContent).toContain('remote_desktop.wall_health_connecting');
     expect(result.container.querySelector('header')).toBeNull();
     expect(result.container.querySelector('footer')).toBeNull();

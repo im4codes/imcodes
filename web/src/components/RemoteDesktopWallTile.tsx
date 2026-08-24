@@ -236,6 +236,13 @@ export function RemoteDesktopWallTile({
           openContextMenu(event.clientX, event.clientY);
         }}
       >
+        <div
+          class="remote-desktop-wall-tile-title"
+          title={host.displayName}
+          aria-hidden="true"
+        >
+          <span>{host.displayName}</span>
+        </div>
         <button
           type="button"
           class="remote-desktop-wall-picture"

@@ -35,11 +35,24 @@ import {
 
 afterEach(() => {
   cleanup();
+  document.getElementById('splash')?.remove();
   vi.restoreAllMocks();
   vi.clearAllMocks();
 });
 
 describe('remote desktop standalone window', () => {
+  it('removes the static HTML splash that otherwise masks the direct-entry desktop', () => {
+    listControllableMachines.mockReturnValue(new Promise(() => {}));
+    const splash = document.createElement('div');
+    splash.id = 'splash';
+    document.body.append(splash);
+
+    const result = render(<RemoteDesktopStandalone serverId="desktop-1" />);
+
+    expect(document.getElementById('splash')).toBeNull();
+    expect(result.getByRole('status').textContent).toBe('controlled_nodes.loading');
+  });
+
   it('loads the selected machine and closes only its own browser window', async () => {
     listControllableMachines.mockResolvedValue([{
       serverId: 'desktop-1',

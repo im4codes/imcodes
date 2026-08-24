@@ -1,5 +1,6 @@
-import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
+import { dismissHtmlSplashForDirectEntry } from '../html-splash.js';
 import { RemoteDesktopConnectionManager } from '../remote-desktop-connection-manager.js';
 import {
   activateRemoteDesktopWorkspaceTab,
@@ -24,6 +25,10 @@ export function RemoteDesktopWallStandalone() {
     () => new Set(workspace.orderedHostKeys),
     [workspace.orderedHostKeys],
   );
+
+  useLayoutEffect(() => {
+    dismissHtmlSplashForDirectEntry();
+  }, []);
 
   useEffect(() => {
     document.title = t('remote_desktop.workspace_wall');

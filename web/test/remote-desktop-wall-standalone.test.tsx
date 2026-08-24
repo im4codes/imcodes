@@ -40,10 +40,22 @@ import {
 
 afterEach(() => {
   cleanup();
+  document.getElementById('splash')?.remove();
   vi.restoreAllMocks();
 });
 
 describe('remote desktop wall standalone window', () => {
+  it('removes the static HTML splash that otherwise masks the direct-entry wall', () => {
+    const splash = document.createElement('div');
+    splash.id = 'splash';
+    document.body.append(splash);
+
+    render(<RemoteDesktopWallStandalone />);
+
+    expect(document.getElementById('splash')).toBeNull();
+    expect(screen.getByTestId('standalone-wall')).toBeTruthy();
+  });
+
   it('keeps the wall independent and opens a reusable manager only after selecting a tile', () => {
     const close = vi.spyOn(window, 'close').mockImplementation(() => undefined);
     render(<RemoteDesktopWallStandalone />);

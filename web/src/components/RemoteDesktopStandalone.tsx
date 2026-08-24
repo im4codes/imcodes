@@ -1,6 +1,7 @@
-import { useEffect, useRef, useState } from 'preact/hooks';
+import { useEffect, useLayoutEffect, useRef, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import { listControllableMachines, type MachineListItem } from '../api/machines.js';
+import { dismissHtmlSplashForDirectEntry } from '../html-splash.js';
 import { RemoteDesktopConnectionManager } from '../remote-desktop-connection-manager.js';
 import { canOpenRemoteDesktop, RemoteDesktopPanel } from './RemoteDesktopPanel.js';
 
@@ -10,6 +11,10 @@ export function RemoteDesktopStandalone({ serverId }: { serverId: string }) {
   const [failed, setFailed] = useState(false);
   const managerRef = useRef<RemoteDesktopConnectionManager | null>(null);
   if (!managerRef.current) managerRef.current = new RemoteDesktopConnectionManager();
+
+  useLayoutEffect(() => {
+    dismissHtmlSplashForDirectEntry();
+  }, []);
 
   useEffect(() => {
     let active = true;
