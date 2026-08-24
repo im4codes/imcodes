@@ -1136,7 +1136,8 @@ describe('useTimeline global cache bounds', () => {
     expect(localStorage.getItem(stableKey)).toBeTruthy();
     expect(localStorage.getItem(streamingKey)).toBeTruthy();
 
-    ingestTimelineEventForCache({
+    const streamingCacheKey = `${serverId}:${streamingSession}`;
+    const streamingEvent: TimelineEvent = {
       eventId: `${streamingSession}-streaming`,
       sessionId: streamingSession,
       ts: 2,
@@ -1146,7 +1147,11 @@ describe('useTimeline global cache bounds', () => {
       confidence: 'high',
       type: 'assistant.text',
       payload: { text: 'partial', streaming: true },
-    }, serverId);
+    };
+    __setTimelineCacheForTests(streamingCacheKey, [
+      ...(__getTimelineCacheForTests(streamingCacheKey) ?? []),
+      streamingEvent,
+    ]);
 
     const setItemSpy = vi.spyOn(localStorage, 'setItem');
     // Exercise the exact callback registered for pagehide/visibility freeze.
