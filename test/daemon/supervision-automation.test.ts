@@ -957,6 +957,10 @@ describe('SupervisionAutomation', () => {
     expect(orchestrationPrompt).toContain('Do not choose another session or send a second audit');
     expect(orchestrationPrompt).toContain('You—not the daemon—must prepare the brief');
     expect(orchestrationPrompt).toContain('do not modify, commit, push, or deploy');
+    expect(orchestrationPrompt).toContain('fix and validate autonomously without waiting for another user prompt');
+    expect(orchestrationPrompt).toContain('then the daemon starts a fresh audit attempt');
+    expect(orchestrationPrompt).toContain('Repeat until PASS or an exact blocker/safety limit');
+    expect(orchestrationPrompt).toContain('only need to kick again if progress truly stalls');
     expect(orchestrationPrompt).not.toContain('A reply-enabled send gives the delegate');
     expect(orchestrationPrompt).not.toContain('If the user selected or mentioned multiple @ delegates');
     expect(Buffer.byteLength(orchestrationPrompt, 'utf8')).toBeLessThan(5 * 1024);
@@ -2790,7 +2794,7 @@ describe('SupervisionAutomation', () => {
       && String(event.payload.text ?? '').includes('repeated auto-continue limit'))).toBe(false);
   });
 
-  it('activates queued task intents only when the matching user message is dispatched', async () => {
+  it('activates queued task intents when restore preserves a distinct command id', async () => {
     const snapshot = await seedSession('supervised');
     supervisionAutomation.init();
     supervisionAutomation.queueTaskIntent(
@@ -2804,7 +2808,8 @@ describe('SupervisionAutomation', () => {
 
     timelineEmitter.emit('deck_supervision_brain', 'user.message', {
       text: 'implement queued task',
-      clientMessageId: 'cmd-queued',
+      commandId: 'cmd-queued',
+      clientMessageId: 'client-queued',
       allowDuplicate: true,
     });
 
@@ -2819,7 +2824,12 @@ describe('SupervisionAutomation', () => {
     const snapshot = await seedSession('supervised');
     supervisionAutomation.init();
     supervisionAutomation.queueTaskIntent('deck_supervision_brain', 'cmd-original', 'implement original task', snapshot);
-    beginRun('cmd-original', 'implement original task');
+    timelineEmitter.emit('deck_supervision_brain', 'user.message', {
+      text: 'implement original task',
+      commandId: 'cmd-original',
+      clientMessageId: 'client-original',
+      allowDuplicate: true,
+    });
 
     timelineEmitter.emit('deck_supervision_brain', 'user.message', {
       text: 'also handle this queued follow-up',
@@ -2964,6 +2974,8 @@ describe('SupervisionAutomation', () => {
     expect(prompt).toContain('"kind":"supervision_audit"');
     expect(prompt).toContain('"attemptId":');
     expect(prompt).toContain('While waiting: do not modify, commit, push, or deploy.');
+    expect(prompt).toContain('fix and validate autonomously without waiting for another user prompt');
+    expect(prompt).toContain('then the daemon starts a fresh audit attempt');
     expect(prompt).toContain(PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS.PASS);
     expect(prompt).toContain(PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS.REWORK);
   });

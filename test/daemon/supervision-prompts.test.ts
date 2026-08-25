@@ -230,7 +230,9 @@ describe('supervision prompts', () => {
 
     expect(prompt).toContain('Fix these findings, then run the relevant validation:');
     expect(prompt).toContain('the daemon will start one fresh peer audit automatically');
-    expect(prompt).toContain('do not delegate or poll an auditor yourself');
+    expect(prompt).toContain('complete the repair plus relevant validation autonomously');
+    expect(prompt).toContain('do not pause merely to say you are ready or wait for another user prompt');
+    expect(prompt).toContain('Do not delegate or poll an auditor yourself');
     expect(prompt).toContain('Do not stage, commit, push, merge, release, publish, or deploy until the fresh matching audit returns PASS.');
     expect(prompt).not.toContain('Current assistant result:');
   });

@@ -1842,6 +1842,54 @@ describe('handleWebCommand transport queue behavior', () => {
     expect(send).toHaveBeenCalledWith('safe default', 'cmd-composer-unknown');
   });
 
+  it('does not replace the active supervision task when an append is staged during the turn', async () => {
+    const send = vi.fn(() => 'queued');
+    getSessionMock.mockReturnValue({
+      name: 'deck_transport_brain',
+      projectName: 'transport',
+      role: 'brain',
+      agentType: 'codex-sdk',
+      runtimeType: 'transport',
+      state: 'running',
+      transportConfig: {
+        supervision: {
+          mode: 'supervised_audit',
+          backend: 'codex-sdk',
+          model: 'gpt-5.3-codex-spark',
+          timeoutMs: 12_000,
+          promptVersion: 'supervision_decision_v1',
+          maxParseRetries: 1,
+          maxAuditLoops: 2,
+          taskRunPromptVersion: 'task_run_status_v1',
+        },
+      },
+    });
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'route-transport',
+      send,
+      pendingCount: 1,
+    });
+
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_transport_brain',
+      text: 'also cover automatic audit',
+      commandId: 'cmd-composer-append-supervised',
+      deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND,
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(send).toHaveBeenCalledWith(
+      'also cover automatic audit',
+      'cmd-composer-append-supervised',
+      undefined,
+      expect.stringContaining('Automatic peer-audit mode is enabled for this task.'),
+      { deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND },
+    );
+    expect(queueTaskIntentMock).not.toHaveBeenCalled();
+    expect(registerTaskIntentMock).not.toHaveBeenCalled();
+  });
+
   it('injects a numbered temporary-upload reminder for the agent without changing the transport timeline', async () => {
     const send = vi.fn(() => 'sent');
     getTransportRuntimeMock.mockReturnValue({

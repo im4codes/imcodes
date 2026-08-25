@@ -67,6 +67,7 @@ describe('QuickAgentDelegationDialog', () => {
       sessionName: 'deck_sub_reviewer',
       label: 'Reviewer',
       task: 'Review the retry race only.',
+      preset: 'custom',
     });
     const stored = [...Array(localStorage.length)].map((_, index) => {
       const key = localStorage.key(index) ?? '';
@@ -91,6 +92,7 @@ describe('QuickAgentDelegationDialog', () => {
 
     expect(onDispatch).toHaveBeenCalledTimes(1);
     expect(onDispatch.mock.calls[0]?.[0].task).toContain('independently audit this session\'s most recent work');
+    expect(onDispatch.mock.calls[0]?.[0].preset).toBe('audit');
   });
 
   it.each([
@@ -109,6 +111,7 @@ describe('QuickAgentDelegationDialog', () => {
     fireEvent.click(screen.getByText(`peerAuditQuick.mode.${preset}`));
     fireEvent.click(screen.getAllByTestId('quick-agent-delegation-candidate')[0]!);
     expect(onDispatch.mock.calls[0]?.[0].task).toContain(expectedText);
+    expect(onDispatch.mock.calls[0]?.[0].preset).toBe(preset);
   });
 
   it('sanitizes embedded internal ids without applying lifecycle-state policy', () => {

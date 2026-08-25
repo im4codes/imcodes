@@ -262,6 +262,8 @@ describe('agent delegation shared contract', () => {
     expect(prompt).toContain('do not poll session state, logs, or transcripts');
     expect(prompt).not.toContain('multiple replies until expiry');
     expect(prompt).not.toContain('multiple @ delegates');
+    expect(prompt).not.toContain('Quick Audit cycle after each delegated reply:');
+    expect(prompt).not.toContain('<!-- IMCODES_AUTOMATIC_AUDIT:');
   });
 
   it('bounds an oversized delegation task instead of flooding the target turn', () => {
@@ -273,6 +275,26 @@ describe('agent delegation shared contract', () => {
     expect(Buffer.byteLength(prompt, 'utf8')).toBeLessThan(6 * 1024);
     expect(prompt).toContain('Target ID (pass directly to send_message; do not look it up): deck_repo_w1');
     expect(prompt.match(/imcodes send --reply/g)).toHaveLength(1);
+  });
+
+  it('keeps the Quick Audit marker and repair/re-audit cycle outside task truncation', () => {
+    const prompt = buildAgentDelegationOrchestrationPrompt({
+      targetSession: 'deck_repo_w1',
+      targetLabel: 'Reviewer',
+      task: '超'.repeat(10_000),
+      auditCycle: true,
+    });
+    expect(prompt).toContain('[truncated]');
+    expect(prompt).toContain('Quick Audit cycle after each delegated reply:');
+    expect(prompt).toContain('<!-- IMCODES_AUTOMATIC_AUDIT: PASS -->');
+    expect(prompt).toContain('<!-- IMCODES_AUTOMATIC_AUDIT: REWORK -->');
+    expect(prompt).toContain('REWORK is not a stopping response');
+    expect(prompt).toContain('do not merely output REWORK and wait');
+    expect(prompt).toContain('Apply the findings, run the relevant validation');
+    expect(prompt).toContain('send one fresh reply-enabled audit to the same Target ID');
+    expect(prompt).toContain('Repeat repair -> re-audit autonomously until PASS');
+    expect(prompt).toContain('Only when an exact blocker or safety limit prevents another cycle');
+    expect(prompt).toContain('Never finalize the repository or delivery from a REWORK verdict.');
   });
 
   it('builds quick presets as ordinary delegation tasks and keeps custom text exact', () => {

@@ -5849,6 +5849,12 @@ afterEach(() => {
     expect(sent.text).toContain('Target ID (pass directly to send_message; do not look it up): deck_sub_reviewer');
     expect(sent.text).toContain('independently audit this session\'s most recent work');
     expect(sent.text).toContain('imcodes send --reply "deck_sub_reviewer"');
+    expect(sent.text).toContain('<!-- IMCODES_AUTOMATIC_AUDIT: PASS -->');
+    expect(sent.text).toContain('<!-- IMCODES_AUTOMATIC_AUDIT: REWORK -->');
+    expect(sent.text).toContain('REWORK is not a stopping response');
+    expect(sent.text).toContain('do not merely output REWORK and wait');
+    expect(sent.text).toContain('send one fresh reply-enabled audit to the same Target ID');
+    expect(sent.text).toContain('Repeat repair -> re-audit autonomously until PASS');
     expect(ws.send.mock.calls.some(([message]) => message?.type === 'peer_audit.quick_start')).toBe(false);
     expect(ws.sendSessionCommand.mock.calls.some(([, payload]) => payload?.delegateTarget)).toBe(false);
   });
@@ -6794,6 +6800,8 @@ afterEach(() => {
     expect(sent.text).toContain('Target label: w1');
     expect(sent.text).toContain('Target ID (pass directly to send_message; do not look it up): deck_sub_w1');
     expect(sent.text).toContain('Task: please review');
+    expect(sent.text).not.toContain('Quick Audit cycle after each delegated reply:');
+    expect(sent.text).not.toContain('<!-- IMCODES_AUTOMATIC_AUDIT:');
     expect(sent).toHaveProperty('text');
     expect(sent).not.toHaveProperty('delegateTarget');
     expect(sent).not.toHaveProperty('p2pAtTargets');

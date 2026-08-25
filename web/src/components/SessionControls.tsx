@@ -131,6 +131,7 @@ import { HERMES_AGENT_PROVIDER_ID } from '@shared/hermes-agent.js';
 import {
   buildAgentDelegationOrchestrationPrompt,
   isDelegationUnsupportedControlText,
+  type QuickAgentDelegationPreset,
 } from '@shared/agent-delegation.js';
 import {
   SESSION_SETTINGS_FOCUS,
@@ -4233,6 +4234,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     sessionName: string;
     label: string;
     task: string;
+    preset: QuickAgentDelegationPreset;
   }) => {
     const task = input.task.trim();
     if (!task) {
@@ -4249,6 +4251,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         targetSession: input.sessionName,
         targetLabel: input.label,
         task,
+        auditCycle: input.preset === 'audit',
       }),
       extra: {},
       delegation: {

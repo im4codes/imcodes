@@ -22,7 +22,12 @@ interface QuickAgentDelegationDialogProps {
   candidates: QuickAgentDelegationCandidate[];
   error?: string | null;
   onClose: () => void;
-  onDispatch: (input: { sessionName: string; label: string; task: string }) => void;
+  onDispatch: (input: {
+    sessionName: string;
+    label: string;
+    task: string;
+    preset: QuickAgentDelegationPreset;
+  }) => void;
 }
 
 const QUICK_TARGET_STORAGE_KEY = 'quickAgentDelegationTargets:v1';
@@ -129,6 +134,7 @@ export function QuickAgentDelegationDialog({
       sessionName: candidate.sessionName,
       label: candidateLabels.get(candidate.sessionName) ?? visibleCandidateLabel(candidate),
       task,
+      preset,
     });
   };
 

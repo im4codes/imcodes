@@ -1768,6 +1768,7 @@ class SupervisionAutomation {
     if (event.type === 'user.message') {
       const pending = this.pendingTaskIntents.get(event.sessionId);
       const clientMessageId = trimString(event.payload.clientMessageId);
+      const commandId = trimString(event.payload.commandId);
       const automation = event.payload.automation === true;
       const queueAppended = event.payload.queueAppended === true;
       const text = trimString(event.payload.text);
@@ -1809,7 +1810,10 @@ class SupervisionAutomation {
           });
         }
       }
-      if (pending && !automation && !queueAppended && clientMessageId === pending.commandId) {
+      if (pending
+        && !automation
+        && !queueAppended
+        && (clientMessageId === pending.commandId || commandId === pending.commandId)) {
         this.pendingTaskIntents.delete(event.sessionId);
         this.registerTaskIntent(event.sessionId, pending.commandId, pending.text, pending.snapshot);
       }
@@ -2262,6 +2266,7 @@ class SupervisionAutomation {
       // delegation renderer bounds task text, and a large OpenSpec/path list
       // must never truncate away the PASS/REWORK markers that close the audit.
       `After the reply, report the findings and end with exactly one matching marker: ${PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS.PASS} or ${PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS.REWORK}. Emit neither marker before the reply.`,
+      'Automatic audit cycle: PASS releases any remaining delivery/finalization. REWORK makes the daemon feed the findings back into this same session as one repair turn; fix and validate autonomously without waiting for another user prompt, then the daemon starts a fresh audit attempt. Repeat until PASS or an exact blocker/safety limit. Do not self-start a duplicate audit; supervision should only need to kick again if progress truly stalls.',
       baseline.changeDir ? `Relevant OpenSpec change: ${baseline.changeDir}` : '',
       baseline.fileContents.length > 0
         ? `Observed changed paths: ${baseline.fileContents.map((entry) => entry.path).join(', ')}`

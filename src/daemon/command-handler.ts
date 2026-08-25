@@ -4528,7 +4528,14 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
                 ? transportRuntime.send(displayText, effectiveId, undefined, undefined, sendMetadata)
                 : transportRuntime.send(displayText, effectiveId)));
       if (shouldTrackSupervisionTaskRun) {
-        if (result === 'queued') {
+        // A busy-turn Append is an extension of the task already being
+        // supervised, not a queued replacement task. queueTaskIntent() clears
+        // the current run before recording the future one; doing that here
+        // leaves the trailing queueAppended timeline row intentionally unable
+        // to seed either run, so the eventual idle edge never gets audited.
+        // If native append later falls back to an ordinary turn, its normal
+        // user.message projection will seed implicit supervision at dispatch.
+        if (result === 'queued' && requestedDeliveryMode !== MEMORY_MCP_SEND_DELIVERY_MODES.APPEND) {
           supervisionAutomation.queueTaskIntent(sessionName, effectiveId, displayText, supervisionSnapshot);
         } else if (result === 'sent') {
           supervisionAutomation.registerTaskIntent(sessionName, effectiveId, displayText, supervisionSnapshot);

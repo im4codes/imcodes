@@ -516,7 +516,7 @@ export function buildReworkBriefPrompt(
     `[Contract: ${SUPERVISION_CONTRACT_IDS.REWORK_BRIEF}]`,
     'Audit verdict: REWORK',
     `Fix these findings, then run the relevant validation:\n${findings}`,
-    'Continue the same task. After reporting the repair and validation, the daemon will start one fresh peer audit automatically; do not delegate or poll an auditor yourself.',
+    'Continue the same task and complete the repair plus relevant validation autonomously; do not pause merely to say you are ready or wait for another user prompt. Report the concrete result once, then the daemon will start one fresh peer audit automatically. Do not delegate or poll an auditor yourself.',
     'Do not stage, commit, push, merge, release, publish, or deploy until the fresh matching audit returns PASS.',
     `Task context: ${taskContext}`,
   ].join('\n');
