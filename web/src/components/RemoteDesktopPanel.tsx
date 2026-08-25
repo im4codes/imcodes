@@ -1709,7 +1709,7 @@ export function RemoteDesktopPanel({
               disabled={!snapshot.inputEnabled || clipboardStatus === 'copying'}
               title={inputBlockedHint()}
               onClick={() => { void copyRemoteSelection(); }}
-            >{t('remote_desktop.copy_remote_selection')}</button>
+            >{t('common.copy')}</button>
             <button
               type="button"
               disabled={!snapshot.inputEnabled || clipboardStatus === 'pasting'}

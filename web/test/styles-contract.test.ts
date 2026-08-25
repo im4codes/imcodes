@@ -33,6 +33,14 @@ describe('styles.css regression contracts', () => {
     expect(controlRule).toMatch(/border-radius:\s*999px/);
   });
 
+  it('keeps the remote desktop clipboard actions compact', () => {
+    const rule = css.match(/\.remote-desktop-toolbar \.remote-desktop-clipboard-switch button\s*\{[^}]*\}/)?.[0];
+    expect(rule).toBeTruthy();
+    expect(rule).toMatch(/min-height:\s*30px/);
+    expect(rule).toMatch(/padding:\s*4px 9px/);
+    expect(rule).toMatch(/font-size:\s*11\.5px/);
+  });
+
   it('keeps feature announcements visible and dismissible on desktop and mobile', () => {
     const announcementRule = css.match(/\.feature-announcement\s*\{[^}]*\}/)?.[0];
     expect(announcementRule).toBeTruthy();

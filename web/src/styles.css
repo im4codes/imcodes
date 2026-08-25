@@ -9466,6 +9466,12 @@ button.quick-agent-delegation-preset.active {
   position: relative;
 }
 
+.remote-desktop-toolbar .remote-desktop-clipboard-switch button {
+  min-height: 30px;
+  padding: 4px 9px;
+  font-size: 11.5px;
+}
+
 .remote-desktop-clipboard-status {
   min-width: 54px;
   color: #9bdfff;

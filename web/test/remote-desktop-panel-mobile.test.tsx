@@ -823,7 +823,7 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     expect(text).toHaveBeenCalledWith('local clipboard');
 
     await act(async () => {
-      (getByRole('button', { name: 'remote_desktop.copy_remote_selection' }) as HTMLButtonElement).click();
+      (getByRole('button', { name: 'common.copy' }) as HTMLButtonElement).click();
       await Promise.resolve();
       await Promise.resolve();
     });
