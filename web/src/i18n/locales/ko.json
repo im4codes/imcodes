@@ -3218,6 +3218,8 @@
     "wall_add": "월에 추가",
     "wall_picker": "컴퓨터를 월에 추가",
     "wall_grid": "원격 데스크톱 월",
+    "wall_use_one_column": "1열로 보기",
+    "wall_use_two_columns": "2열로 보기",
     "wall_empty_hint": "최대 16대를 보기 전용으로 모니터링할 수 있습니다.",
     "wall_open_host": "{{machine}}을(를) 원격 데스크톱 관리자에서 열기",
     "wall_manage": "{{machine}} 관리",

@@ -1,4 +1,6 @@
 /** @vitest-environment jsdom */
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/preact';
 import type { ComponentChildren } from 'preact';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -46,6 +48,11 @@ vi.mock('../src/components/RemoteDesktopWallTile.js', () => ({
 import { RemoteDesktopWall } from '../src/components/RemoteDesktopWall.js';
 import type { RemoteDesktopConnectionManager } from '../src/remote-desktop-connection-manager.js';
 
+const wallCss = readFileSync(
+  resolve(__dirname, '../src/components/remote-desktop-workspace.css'),
+  'utf8',
+);
+
 function machine(id: string) {
   return {
     hostId: id, remoteDesktopHostId: id, serverId: id, refName: id,
@@ -56,6 +63,7 @@ function machine(id: string) {
 
 describe('RemoteDesktopWall', () => {
   beforeEach(() => {
+    window.localStorage.removeItem('imcodes.remoteDesktopWall.mobileColumns');
     api.getRemoteDesktopWall.mockResolvedValue({ revision: 0, layout: 'grid', hostIds: [], hosts: [] });
     api.listControllableMachines.mockResolvedValue([machine('a'), machine('b')]);
   });
@@ -154,5 +162,48 @@ describe('RemoteDesktopWall', () => {
       name: 'remote_desktop.wall_open_new_window',
     }));
     expect(openStandalone).toHaveBeenCalledTimes(1);
+  });
+
+  it('defaults mobile layout to one column and remembers an explicit two-column choice', async () => {
+    api.getRemoteDesktopWall.mockResolvedValue({
+      revision: 3,
+      layout: 'grid',
+      hostIds: ['a', 'b', 'c'],
+      hosts: [machine('a'), machine('b'), machine('c')],
+    });
+    const props = {
+      manager: { stop: vi.fn() } as unknown as RemoteDesktopConnectionManager,
+      retainedHostKeys: new Set<string>(),
+      onOpenHost: vi.fn(),
+      onHostKeysChange: vi.fn(),
+      onClose: vi.fn(),
+    };
+    const first = render(<RemoteDesktopWall {...props} />);
+    const grid = await waitFor(() => {
+      const element = first.container.querySelector('.remote-desktop-wall-grid');
+      expect(element).toBeTruthy();
+      return element!;
+    });
+
+    expect(grid.getAttribute('data-mobile-columns')).toBe('1');
+    expect((grid as HTMLElement).style.getPropertyValue('--remote-desktop-wall-columns')).toBe('2');
+    fireEvent.click(screen.getByRole('button', { name: 'remote_desktop.wall_use_two_columns' }));
+    expect(grid.getAttribute('data-mobile-columns')).toBe('2');
+    expect(window.localStorage.getItem('imcodes.remoteDesktopWall.mobileColumns')).toBe('2');
+    expect(screen.getByRole('button', { name: 'remote_desktop.wall_use_one_column' })).toBeDefined();
+
+    first.unmount();
+    const restored = render(<RemoteDesktopWall {...props} />);
+    await waitFor(() => expect(
+      restored.container.querySelector('.remote-desktop-wall-grid')?.getAttribute('data-mobile-columns'),
+    ).toBe('2'));
+  });
+
+  it('packs mobile rows at the top and uses compact spacing in two-column mode', () => {
+    const mobileCss = wallCss.slice(wallCss.indexOf('@media (max-width: 700px)'));
+    expect(mobileCss).toMatch(/\.remote-desktop-wall-grid\s*\{[^}]*min-height:\s*0;[^}]*grid-auto-rows:\s*auto;[^}]*align-content:\s*start;/s);
+    expect(mobileCss).toMatch(/\.remote-desktop-wall-grid\[data-mobile-columns="1"\]\s*\{[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\);/s);
+    expect(mobileCss).toMatch(/\.remote-desktop-wall-grid\[data-mobile-columns="2"\]\s*\{[^}]*repeat\(2,\s*minmax\(0,\s*1fr\)\)[^}]*gap:\s*4px;/s);
+    expect(mobileCss).toMatch(/data-mobile-columns="2"\]\s+\.remote-desktop-wall-tile-title\s*\{[^}]*min-height:\s*18px;[^}]*font-size:\s*9px;/s);
   });
 });

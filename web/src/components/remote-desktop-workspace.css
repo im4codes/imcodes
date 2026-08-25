@@ -140,6 +140,10 @@
   padding-inline: 7px;
 }
 
+.remote-desktop-wall-column-toggle {
+  display: none;
+}
+
 .remote-desktop-wall-retry-all > span {
   min-width: 14px;
   color: #d8f7ff;
@@ -236,6 +240,7 @@
   display: grid;
   width: 100%;
   min-height: 100%;
+  grid-template-columns: repeat(var(--remote-desktop-wall-columns, 1), minmax(0, 1fr));
   grid-auto-rows: minmax(0, 1fr);
   gap: 8px;
 }
@@ -554,6 +559,69 @@
 
   .remote-desktop-workspace-actions {
     margin-left: 0;
+  }
+
+  .remote-desktop-wall-header {
+    gap: 6px;
+    padding: 6px 8px;
+  }
+
+  .remote-desktop-wall-column-toggle {
+    display: inline-grid;
+  }
+
+  .remote-desktop-workspace-wall {
+    padding: 6px;
+  }
+
+  .remote-desktop-wall-grid {
+    min-height: 0;
+    grid-auto-rows: auto;
+    align-content: start;
+    gap: 6px;
+  }
+
+  .remote-desktop-wall-grid[data-mobile-columns="1"] {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .remote-desktop-wall-grid[data-mobile-columns="2"] {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 4px;
+  }
+
+  .remote-desktop-wall-grid[data-mobile-columns="2"] .remote-desktop-wall-tile,
+  .remote-desktop-wall-grid[data-mobile-columns="2"] .remote-desktop-wall-add-slot {
+    border-radius: 5px;
+    box-shadow: inset 0 0 0 1px rgb(255 255 255 / 2%);
+  }
+
+  .remote-desktop-wall-grid[data-mobile-columns="2"] .remote-desktop-wall-tile-title {
+    min-height: 18px;
+    padding: 2px 5px;
+    font-size: 9px;
+    letter-spacing: 0;
+  }
+
+  .remote-desktop-wall-grid[data-mobile-columns="2"] .remote-desktop-wall-state {
+    gap: 5px;
+    padding: 6px;
+  }
+
+  .remote-desktop-wall-grid[data-mobile-columns="2"] .remote-desktop-wall-state-copy {
+    gap: 4px;
+    padding: 3px 6px;
+    font-size: 9px;
+  }
+
+  .remote-desktop-wall-grid[data-mobile-columns="2"] .remote-desktop-wall-tile-retry {
+    min-height: 24px;
+    padding: 3px 7px;
+    font-size: 10px;
+  }
+
+  .remote-desktop-wall-grid[data-mobile-columns="2"] .remote-desktop-wall-add-slot > span {
+    font-size: 28px;
   }
 
 }

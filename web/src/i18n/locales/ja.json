@@ -3218,6 +3218,8 @@
     "wall_add": "ウォールに追加",
     "wall_picker": "コンピューターをウォールに追加",
     "wall_grid": "リモートデスクトップウォール",
+    "wall_use_one_column": "1列表示に切り替え",
+    "wall_use_two_columns": "2列表示に切り替え",
     "wall_empty_hint": "最大16台を表示専用で監視できます。",
     "wall_open_host": "{{machine}} をリモートデスクトップ管理で開く",
     "wall_manage": "{{machine}} を管理",

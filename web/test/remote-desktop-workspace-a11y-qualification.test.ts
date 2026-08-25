@@ -208,7 +208,7 @@ describe('remote desktop 16.3 workspace accessibility and locale qualification',
       'workspace_title', 'workspace_tabs', 'workspace_wall', 'workspace_select', 'workspace_add', 'workspace_close_tab',
       'workspace_close', 'workspace_close_confirm', 'workspace_restore',
       'wall_grid', 'wall_open_host', 'wall_manage', 'wall_health_live', 'wall_health_stale', 'wall_health_pressure_paused',
-      'wall_retry_all', 'wall_open_new_window',
+      'wall_retry_all', 'wall_open_new_window', 'wall_use_one_column', 'wall_use_two_columns',
     ] as const;
     const guestKeys = ['title', 'subtitle', 'public_id', 'password', 'connect', 'boundary', 'state_waiting_for_consent', 'generic_error', 'remote_screen'] as const;
     for (const [name, locale] of Object.entries({ en, es, ja, ko, ru, zhCN, zhTW })) {

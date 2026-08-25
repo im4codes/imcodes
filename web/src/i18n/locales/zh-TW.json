@@ -3219,6 +3219,8 @@
     "wall_add": "加入桌面牆",
     "wall_picker": "加入電腦到桌面牆",
     "wall_grid": "遠端桌面牆",
+    "wall_use_one_column": "切換為單欄",
+    "wall_use_two_columns": "切換為雙欄",
     "wall_empty_hint": "最多加入 16 台電腦進行唯讀監看。",
     "wall_open_host": "在遠端桌面管理中開啟 {{machine}}",
     "wall_manage": "管理 {{machine}}",

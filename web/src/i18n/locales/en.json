@@ -3219,6 +3219,8 @@
     "wall_add": "Add to wall",
     "wall_picker": "Add a computer to the wall",
     "wall_grid": "Remote desktop wall",
+    "wall_use_one_column": "Use one column",
+    "wall_use_two_columns": "Use two columns",
     "wall_empty_hint": "Add up to 16 computers for view-only monitoring.",
     "wall_open_host": "Open {{machine}} in remote desktop manager",
     "wall_manage": "Manage {{machine}}",

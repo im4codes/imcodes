@@ -19,6 +19,18 @@ import { RemoteDesktopWallTile } from './RemoteDesktopWallTile.js';
 import './remote-desktop-workspace.css';
 
 export const REMOTE_DESKTOP_WALL_WINDOW_ID = 'remote-desktop-wall';
+const REMOTE_DESKTOP_WALL_MOBILE_COLUMNS_KEY = 'imcodes.remoteDesktopWall.mobileColumns';
+
+type MobileWallColumns = 1 | 2;
+
+function readMobileWallColumns(): MobileWallColumns {
+  if (typeof window === 'undefined') return 1;
+  try {
+    return window.localStorage.getItem(REMOTE_DESKTOP_WALL_MOBILE_COLUMNS_KEY) === '2' ? 2 : 1;
+  } catch {
+    return 1;
+  }
+}
 
 export interface RemoteDesktopWallProps {
   manager: RemoteDesktopConnectionManager;
@@ -62,7 +74,21 @@ export function RemoteDesktopWall({
   const [pickerError, setPickerError] = useState(false);
   const [retryableHostIds, setRetryableHostIds] = useState<ReadonlySet<string>>(() => new Set());
   const [retryGeneration, setRetryGeneration] = useState(0);
+  const [mobileColumns, setMobileColumns] = useState<MobileWallColumns>(readMobileWallColumns);
   const addButtonRef = useRef<HTMLButtonElement>(null);
+
+  const toggleMobileColumns = useCallback(() => {
+    setMobileColumns((current) => {
+      const next: MobileWallColumns = current === 1 ? 2 : 1;
+      try {
+        window.localStorage.setItem(REMOTE_DESKTOP_WALL_MOBILE_COLUMNS_KEY, String(next));
+      } catch {
+        // Storage is only a convenience. The in-memory selection still applies
+        // in private WebViews or browsers where localStorage is unavailable.
+      }
+      return next;
+    });
+  }, []);
 
   const updateRetryableHost = useCallback((hostId: string, retryable: boolean) => {
     setRetryableHostIds((current) => {
@@ -153,6 +179,28 @@ export function RemoteDesktopWall({
         <strong>{t('remote_desktop.workspace_wall')}</strong>
         <div class="remote-desktop-workspace-actions">
           <button
+            class="remote-desktop-workspace-chrome-button remote-desktop-wall-column-toggle"
+            type="button"
+            onClick={toggleMobileColumns}
+            aria-label={t(mobileColumns === 1
+              ? 'remote_desktop.wall_use_two_columns'
+              : 'remote_desktop.wall_use_one_column')}
+            title={t(mobileColumns === 1
+              ? 'remote_desktop.wall_use_two_columns'
+              : 'remote_desktop.wall_use_one_column')}
+          >
+            {mobileColumns === 1 ? (
+              <svg viewBox="0 0 20 20" aria-hidden="true">
+                <rect x="3" y="4" width="6" height="12" rx="1" />
+                <rect x="11" y="4" width="6" height="12" rx="1" />
+              </svg>
+            ) : (
+              <svg viewBox="0 0 20 20" aria-hidden="true">
+                <rect x="4" y="4" width="12" height="12" rx="1" />
+              </svg>
+            )}
+          </button>
+          <button
             class="remote-desktop-workspace-chrome-button remote-desktop-wall-retry-all"
             type="button"
             disabled={retryableHostIds.size === 0}
@@ -190,7 +238,8 @@ export function RemoteDesktopWall({
           <div
             class="remote-desktop-wall-grid"
             aria-label={t('remote_desktop.wall_grid')}
-            style={{ gridTemplateColumns: `repeat(${columns}, minmax(0, 1fr))` }}
+            data-mobile-columns={mobileColumns}
+            style={`--remote-desktop-wall-columns:${columns}`}
           >
             {snapshot.hosts.map((host, index) => (
               <RemoteDesktopWallTile

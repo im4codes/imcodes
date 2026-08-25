@@ -3219,6 +3219,8 @@
     "wall_add": "Añadir al muro",
     "wall_picker": "Añadir un equipo al muro",
     "wall_grid": "Muro de escritorios remotos",
+    "wall_use_one_column": "Usar una columna",
+    "wall_use_two_columns": "Usar dos columnas",
     "wall_empty_hint": "Añade hasta 16 equipos para supervisión de solo lectura.",
     "wall_open_host": "Abrir {{machine}} en el gestor de escritorio remoto",
     "wall_manage": "Administrar {{machine}}",
