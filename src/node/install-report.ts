@@ -38,6 +38,14 @@ export interface InstallSuccessFacts {
   displayName?: string;
   refName?: string;
   serverUrl: string;
+  /**
+   * Set when the machine registered but the publisher certificate could not be
+   * installed. Registration succeeded, so this is a warning inside a success
+   * block rather than a failure — but it must be visible, because the native
+   * features will refuse to start and the operator would otherwise chase that
+   * as a second, unexplained fault.
+   */
+  publisherTrustError?: string;
 }
 
 function isChinese(locale: string): boolean {
@@ -171,6 +179,12 @@ export function formatInstallSuccess(locale: string, facts: InstallSuccessFacts)
       '',
       '   这台机器已经注册，后台服务已安装并会开机自启。',
       '   现在可以在 IM.codes 网页端看到它了。',
+      ...(facts.publisherTrustError ? [
+        '',
+        '⚠️  发布者证书未能安装，远程桌面等原生功能暂不可用：',
+        `   ${facts.publisherTrustError}`,
+        '   基础功能（终端、命令、文件传输）不受影响，可以先远程连上来再修。',
+      ] : []),
       RULE,
     ]
     : [
@@ -183,6 +197,14 @@ export function formatInstallSuccess(locale: string, facts: InstallSuccessFacts)
       '   This machine is registered. The background service is installed',
       '   and will start automatically on boot.',
       '   You can now see it in the IM.codes web app.',
+      ...(facts.publisherTrustError ? [
+        '',
+        '⚠️  The publisher certificate could not be installed, so native',
+        '   features such as remote desktop stay unavailable:',
+        `   ${facts.publisherTrustError}`,
+        '   Terminal, commands and file transfer still work, so you can',
+        '   connect remotely and fix this from there.',
+      ] : []),
       RULE,
     ];
   return lines.join('\n');

@@ -174,7 +174,11 @@ describe('bootstrapControlledNode — journaled first run (10.10 + D-A v2)', () 
     expect(deps.startService).not.toHaveBeenCalled();
   });
 
-  it('still fails closed on publisher-trust failure before a non-stable handoff', async () => {
+  it('keeps the machine reachable when publisher trust cannot be installed', async () => {
+    // The trust anchor gates native sidecars, not enrolment. Failing closed
+    // here would leave a machine that nobody can open a session to — including
+    // to inspect the policy or antivirus that blocked the import, which on a
+    // remote machine is the only way to fix it at all.
     const deps = makeDeps({
       loadCredential: vi.fn(async () => CRED),
       ensureReleasePublisherTrust: vi.fn(async () => { throw new Error('publisher trust invalid'); }),
@@ -187,8 +191,28 @@ describe('bootstrapControlledNode — journaled first run (10.10 + D-A v2)', () 
       })),
     });
 
-    await expect(bootstrapControlledNodeWithDisposition(deps)).rejects.toThrow(/publisher trust invalid/);
-    expect(deps.startService).not.toHaveBeenCalled();
+    const result = await bootstrapControlledNodeWithDisposition(deps);
+    expect(result.credential).toEqual(CRED);
+    // The reason is carried, not swallowed: the installer prints it and the
+    // operator learns why remote desktop will not start.
+    expect(result.publisherTrustError).toMatch(/publisher trust invalid/);
+    expect(deps.warn).toHaveBeenCalledWith(expect.stringMatching(/publisher trust invalid/));
+  });
+
+  it('reports no publisher-trust error when the certificate installs', async () => {
+    const deps = makeDeps({
+      loadCredential: vi.fn(async () => CRED),
+      loadInstallJournal: vi.fn(async () => ({
+        phase: 'service_registered' as InstallPhase,
+        stagedExePath: '/tmp/staged/imcodes-node',
+        stagedReceipt: STAGED_RECEIPT,
+        serviceName: 'imcodes-node',
+        serviceReceipt: SERVICE_RECEIPT,
+      })),
+    });
+
+    const result = await bootstrapControlledNodeWithDisposition(deps);
+    expect(result.publisherTrustError).toBeUndefined();
   });
 
   it('stable macOS owner repairs durable drift, re-inspects, and never restarts itself', async () => {

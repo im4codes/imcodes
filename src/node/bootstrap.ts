@@ -105,6 +105,12 @@ export interface BootstrapResult {
   credential: ControlledNodeCredential;
   disposition: BootstrapDisposition;
   journal: InstallJournal;
+  /**
+   * Set when the release publisher certificate could not be installed. The node
+   * is enrolled and reachable; the native sidecars that require the trust
+   * anchor will refuse to launch until it is.
+   */
+  publisherTrustError?: string;
 }
 
 /** Production deps wired to the real enrollment/installer/journal + fs. */
@@ -231,6 +237,35 @@ function assertReceiptMatchesInspection(receipt: StagedExecutableReceipt, inspec
 export async function verifyStagedExecutableReceipt(receipt: StagedExecutableReceipt): Promise<void> {
   const inspected = await inspectVerifiedExecutable(receipt.path);
   assertReceiptMatchesInspection(receipt, inspected);
+}
+
+/**
+ * Install publisher trust, but never let its failure cost the machine.
+ *
+ * The trust anchor gates native sidecars — the remote-desktop worker and the
+ * Computer Use helper both re-verify the signer before launching. It does not
+ * gate enrolment, terminal access, exec or file transfer.
+ *
+ * Refusing to enrol on a trust failure therefore trades a degraded node for an
+ * unreachable one: the operator cannot open a session to inspect the group
+ * policy or antivirus that blocked the import, and on a machine in another
+ * building there is no second channel to fix it from. That is the deadlock this
+ * product exists to remove, so the failure is reported and carried instead of
+ * thrown. The stable-runtime path already reasoned this way; the install paths
+ * now agree with it.
+ */
+async function tryReleasePublisherTrust(
+  deps: ControlledNodeBootstrapDeps,
+  context: string,
+): Promise<string | undefined> {
+  try {
+    await deps.ensureReleasePublisherTrust(deps.sourceExecutablePath);
+    return undefined;
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    deps.warn(`${context}: ${detail}`);
+    return detail;
+  }
 }
 
 async function ensureElevated(
@@ -513,28 +548,37 @@ export async function bootstrapControlledNodeWithDisposition(deps: ControlledNod
   const stableRuntime = await deps.isStableRuntime(journal);
 
   if (existing && stableRuntime && phaseIndex(journal.phase) >= phaseIndex('service_registered')) {
-    try {
-      await deps.ensureReleasePublisherTrust(deps.sourceExecutablePath);
-    } catch (error) {
-      // Publisher trust is installed and enforced during the elevated install
-      // and upgrade paths. A transient maintenance failure on an already
-      // healthy stable runtime must not turn the node into a watchdog crash
-      // loop; keep serving and retry on the next process start.
-      deps.warn(`Windows release publisher trust maintenance failed; continuing stable runtime and retrying later: ${String(error)}`);
-    }
+    // A transient maintenance failure on an already healthy stable runtime must
+    // not turn the node into a watchdog crash loop; keep serving and retry on
+    // the next process start.
+    const publisherTrustError = await tryReleasePublisherTrust(
+      deps,
+      'Windows release publisher trust maintenance failed; continuing stable runtime and retrying later',
+    );
     journal = await ensureServiceStartRequested(deps, journal, { startService: false });
     journal = await reconcileStableServicePersistence(deps, journal);
-    return { credential: existing, disposition: 'run_runtime', journal };
+    return { credential: existing, disposition: 'run_runtime', journal, publisherTrustError };
   }
 
   if (existing && phaseIndex(journal.phase) >= phaseIndex('service_registered')) {
-    await deps.ensureReleasePublisherTrust(deps.sourceExecutablePath);
+    const publisherTrustError = await tryReleasePublisherTrust(
+      deps,
+      'Windows release publisher trust installation failed; native features stay unavailable until it succeeds',
+    );
     journal = await ensureServiceStartRequested(deps, journal, { startService: !stableRuntime });
-    return { credential: existing, disposition: stableRuntime ? 'run_runtime' : 'handoff_complete', journal };
+    return {
+      credential: existing,
+      disposition: stableRuntime ? 'run_runtime' : 'handoff_complete',
+      journal,
+      publisherTrustError,
+    };
   }
 
   journal = await ensureElevated(deps, journal);
-  await deps.ensureReleasePublisherTrust(deps.sourceExecutablePath);
+  const publisherTrustError = await tryReleasePublisherTrust(
+    deps,
+    'Windows release publisher trust installation failed; enrolling anyway so the machine stays reachable',
+  );
 
   if (existing) {
     if (phaseIndex(journal.phase) < phaseIndex('files_staged')) {
@@ -550,7 +594,12 @@ export async function bootstrapControlledNodeWithDisposition(deps: ControlledNod
       });
     }
     journal = await ensureServiceStartRequested(deps, journal);
-    return { credential: existing, disposition: stableRuntime ? 'run_runtime' : 'handoff_complete', journal };
+    return {
+      credential: existing,
+      disposition: stableRuntime ? 'run_runtime' : 'handoff_complete',
+      journal,
+      publisherTrustError,
+    };
   }
 
   let source: VerifiedEnrollmentSource | null = null;
@@ -576,7 +625,7 @@ export async function bootstrapControlledNodeWithDisposition(deps: ControlledNod
 
     journal = await ensureServiceStartRequested(deps, journal);
 
-    return { credential, disposition: 'handoff_complete', journal };
+    return { credential, disposition: 'handoff_complete', journal, publisherTrustError };
   } finally {
     if (source) await source.close().catch(() => {});
   }

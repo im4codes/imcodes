@@ -141,6 +141,7 @@ async function main(): Promise<void> {
       displayName: bootstrap.credential.displayName,
       refName: bootstrap.credential.refName,
       serverUrl: bootstrap.credential.serverUrl,
+      publisherTrustError: bootstrap.publisherTrustError,
     })}\n`);
   }
   if (bootstrap.disposition === 'handoff_complete') {
