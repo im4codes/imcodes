@@ -125,20 +125,29 @@ describe('legacy Windows controlled-node upgrade rescue', () => {
     expect(setup).toContain('$candidateVersion = [string]$workerManifest.workerVersion');
     expect(setup).toContain('$mainManifest.build.version -cne $candidateVersion');
     expect(setup).not.toContain('$expectedVersion');
-    expect(setup).toContain("Cert:\\LocalMachine\\TrustedPeople");
-    expect(setup).toContain("Cert:\\LocalMachine\\TrustedPublisher");
+    // Both anchor stores are written, and the Cert: path is derived from the
+    // store name so the probe and the write can never target different stores.
+    expect(setup).toContain("$anchorStoreNames = @('TrustedPeople', 'TrustedPublisher')");
+    expect(setup).toContain("Get-ChildItem -LiteralPath ('Cert:\\LocalMachine\\' + $storeName)");
+    // The signer is trusted for our artifacts, never promoted to a machine-wide CA.
     expect(setup).not.toContain('LocalMachine\\Root');
+    // Import-Certificate cannot create a store that does not exist yet, which
+    // broke every first install; the write must go through X509Store.
+    expect(setup).not.toContain('Import-Certificate');
+    expect(setup).toContain('X509Certificates.OpenFlags]::ReadWrite');
     expect(setup).toContain('if ($actual -cne $expected)');
     expect(setup).toContain('if (-not $hasCodeSigningEku)');
     expect(setup).toContain('$path = [string]$workerPath');
+    // The anchor and EKU checks must both gate the store write.
+    const storeWrite = setup.indexOf('foreach ($storeName in $anchorStoreNames)');
+    expect(storeWrite).toBeGreaterThan(-1);
     expect(setup.indexOf("throw 'release signer does not match the compiled trust anchor'"))
-      .toBeLessThan(setup.indexOf('Import-Certificate'));
+      .toBeLessThan(storeWrite);
     expect(setup.indexOf("throw 'release signer is not valid for code signing'"))
-      .toBeLessThan(setup.indexOf('Import-Certificate'));
-    expect(setup.indexOf('Import-Certificate'))
-      .toBeLessThan(setup.indexOf('$stagedWorker = $workerPath'));
+      .toBeLessThan(storeWrite);
+    expect(storeWrite).toBeLessThan(setup.indexOf('$stagedWorker = $workerPath'));
     expect(setup.indexOf("throw 'legacy upgrade task still registered'"))
-      .toBeLessThan(setup.indexOf("Cert:\\LocalMachine\\TrustedPeople"));
+      .toBeLessThan(storeWrite);
     expect(setup).toContain("-User 'SYSTEM' -RunLevel Highest -Force");
     expect(setup).toContain('legacy upgrade restart task verification failed');
     expect(setup.indexOf('legacy upgrade restart task verification failed'))

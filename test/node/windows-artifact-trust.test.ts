@@ -136,23 +136,40 @@ describe('Windows release artifact trust', () => {
     )).resolves.toEqual({ ok: true, detail: '' });
     const script = decodedScript(calls);
     expect(script).toContain("$codeSigningOid = '1.3.6.1.5.5.7.3.3'");
-    expect(script).toContain("Cert:\\LocalMachine\\TrustedPeople");
-    expect(script).toContain("Cert:\\LocalMachine\\TrustedPublisher");
+    // Both anchor stores are covered, and the Cert: path is derived from the
+    // store name so the presence probe and the write cannot target different stores.
+    expect(script).toContain("$anchorStoreNames = @('TrustedPeople', 'TrustedPublisher')");
+    expect(script).toContain("Get-ChildItem -LiteralPath ('Cert:\\LocalMachine\\' + $storeName)");
+    // Trusted for our own artifacts only, never promoted to a machine-wide CA.
     expect(script).not.toContain('LocalMachine\\Root');
+    // Only the public leaf ever leaves the signature; no private key material.
     expect(script).not.toContain('Export-PfxCertificate');
     expect(script).toContain('$certificate.RawData');
     expect(script).toContain('Microsoft.PowerShell.Security\\Microsoft.PowerShell.Security.psd1');
-    expect(script).toContain('Modules\\PKI\\PKI.psd1');
+    // Import-Certificate cannot create a LocalMachine store that does not exist
+    // yet, so it failed with E_ACCESSDENIED on every fresh Windows install.
+    // X509Store.Open(ReadWrite) creates it. That also removed the only PKI
+    // cmdlet, so the PKI module is no longer required (slimmed Windows images
+    // ship without it), and the certificate is no longer written to disk.
+    expect(script).not.toContain('Import-Certificate');
+    expect(script).not.toContain('Modules\\PKI\\PKI.psd1');
+    expect(script).not.toContain('[IO.File]::WriteAllBytes');
+    expect(script).not.toContain('$temporaryCertificate');
+    expect(script).toContain('X509Certificates.OpenFlags]::ReadWrite');
     expect(script).toContain('if ($actual -cne $expected)');
     expect(script).toContain('if (-not $hasCodeSigningEku)');
+    // The anchor and EKU checks must both gate the store write.
+    const storeWrite = script.indexOf('foreach ($storeName in $anchorStoreNames)');
+    expect(storeWrite).toBeGreaterThan(-1);
     expect(script.indexOf("throw 'release signer does not match the compiled trust anchor'"))
-      .toBeLessThan(script.indexOf('Import-Certificate'));
+      .toBeLessThan(storeWrite);
     expect(script.indexOf("throw 'release signer is not valid for code signing'"))
-      .toBeLessThan(script.indexOf('Import-Certificate'));
+      .toBeLessThan(storeWrite);
     expect(script).toContain('Test-AnchoredCertificateInStore');
-    expect(script.indexOf('Test-AnchoredCertificateInStore')).toBeLessThan(script.indexOf('[IO.File]::WriteAllBytes'));
-    expect(script).toContain('$trustedPeoplePresent -and $trustedPublisherPresent');
-    expect(script).toContain('Remove-Item -LiteralPath $temporaryCertificate');
+    expect(script.indexOf('Test-AnchoredCertificateInStore')).toBeLessThan(storeWrite);
+    // A store that cannot be written is reported, not silently swallowed, and
+    // the final revalidation still decides the outcome.
+    expect(script).toContain("$storeFailures -join '; '");
     expect(script).toContain(signer);
     expect(calls.at(-1)).toContain('"timeout":60000');
     expect(calls.at(-1)).toContain('"maxBuffer":65536');

@@ -7,10 +7,29 @@ const POWERSHELL_VARIABLE_RE = /^[A-Za-z][A-Za-z0-9_]*$/;
  * LocalMachine stores the release signer must end up in.
  *
  * Named once and reused for both the presence probe and the write, so the two
- * can never drift apart.
+ * can never drift apart. `Root` is deliberately absent: the signer is trusted
+ * for our own artifacts, never promoted to a machine-wide certificate authority.
  */
 const ANCHOR_STORE_NAMES = ['TrustedPeople', 'TrustedPublisher'] as const;
 
+/**
+ * Why the stores are written through X509Store rather than Import-Certificate.
+ *
+ * Import-Certificate cannot create a LocalMachine physical certificate store
+ * that does not exist yet. On a machine that has never trusted a publisher --
+ * which is every fresh Windows install -- Cert:\LocalMachine\TrustedPublisher
+ * has no registry key, and the cmdlet fails with E_ACCESSDENIED even from an
+ * elevated process. That aborted the trust step on first install, and with it
+ * enrolment, so the node never registered. X509Store.Open(ReadWrite) creates
+ * the store when missing, so it works on the first install and every later one.
+ *
+ * It also drops the only PKI cmdlet, so the script no longer requires the PKI
+ * module (slimmed Windows images ship without it) and no longer writes a
+ * temporary certificate file to disk.
+ *
+ * The rationale lives here rather than inside the emitted PowerShell because
+ * the script travels as a command string through a size-bounded exec envelope.
+ */
 function publisherTrustBody(expectedSignerSha256: string): string {
   if (!SHA256_RE.test(expectedSignerSha256)) throw new Error('invalid_windows_release_signer_sha256');
   const storeList = ANCHOR_STORE_NAMES.map((name) => `'${name}'`).join(', ');
@@ -42,20 +61,10 @@ function Test-AnchoredCertificateInStore([string]$storeName) {
   return $false
 }
 function Add-AnchoredCertificateToStore([string]$storeName, [System.Security.Cryptography.X509Certificates.X509Certificate2]$certificate) {
-  # Import-Certificate cannot create a LocalMachine physical store that does not
-  # exist yet. On a machine that has never trusted a publisher - which is every
-  # fresh Windows install - Cert:\LocalMachine\TrustedPublisher has no registry
-  # key, and the cmdlet fails with E_ACCESSDENIED even from an elevated process.
-  # X509Store.Open(ReadWrite) creates the store, so this works on the first
-  # install as well as on every later one, and needs neither the PKI module nor
-  # a temporary certificate file on disk.
   $store = New-Object System.Security.Cryptography.X509Certificates.X509Store($storeName, [System.Security.Cryptography.X509Certificates.StoreLocation]::LocalMachine)
   $store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
   try { $store.Add($certificate) } finally { $store.Close() }
 }
-# Each store is attempted independently: one locked store must not stop the
-# other from being written, because what decides success is whether the
-# executable validates afterwards, not which stores were reachable.
 $storeFailures = @()
 foreach ($storeName in $anchorStoreNames) {
   if (Test-AnchoredCertificateInStore $storeName) { continue }
