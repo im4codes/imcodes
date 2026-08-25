@@ -3185,6 +3185,9 @@ export function App() {
   const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
   isMobileRef.current = isMobile;
   const desktopLayoutCapable = !isMobile;
+  const mobileRemoteSurfaceActive = isMobile
+    && ((remoteDesktopWorkspace.open && !remoteDesktopWorkspaceMinimized)
+      || (remoteDesktopWallOpen && !remoteDesktopWallMinimized));
 
   // Open sub-session windows are restored from localStorage, so a reload
   // re-mounts all of them in one render pass — which is why reloading to escape
@@ -5269,7 +5272,10 @@ export function App() {
   }
 
   return (
-    <div class={`layout${isMobile ? ' layout-mobile' : ''}`} key={selectedServerId ?? ''}>
+    <div
+      class={`layout${isMobile ? ' layout-mobile' : ''}${mobileRemoteSurfaceActive ? ' layout-mobile-remote-surface-active' : ''}`}
+      key={selectedServerId ?? ''}
+    >
       {showSharedReturnGuide && sharedReturnServer && selectedShareTarget && (
         <aside
           class="shared-return-guide"
@@ -6481,7 +6487,7 @@ export function App() {
           minimized={remoteDesktopWorkspaceMinimized}
           zIndex={getDesktopWindowZIndex(
             REMOTE_DESKTOP_WORKSPACE_WINDOW_ID,
-            5110,
+            isMobile ? 7000 : 5110,
           )}
           onFocus={() => bringDesktopWindowToFront(
             REMOTE_DESKTOP_WORKSPACE_WINDOW_ID,
@@ -6517,7 +6523,7 @@ export function App() {
           manager={remoteDesktopConnectionManager}
           retainedHostKeys={new Set(remoteDesktopWorkspace.orderedHostKeys)}
           minimized={remoteDesktopWallMinimized}
-          zIndex={getDesktopWindowZIndex(DESKTOP_WINDOW_IDS.remoteDesktopWall, 5105)}
+          zIndex={getDesktopWindowZIndex(DESKTOP_WINDOW_IDS.remoteDesktopWall, isMobile ? 7000 : 5105)}
           onFocus={() => bringDesktopWindowToFront(DESKTOP_WINDOW_IDS.remoteDesktopWall)}
           onMinimize={() => setRemoteDesktopWallMinimized(true)}
           onRestore={() => setRemoteDesktopWallMinimized(false)}

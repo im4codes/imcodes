@@ -132,6 +132,16 @@ html.native-ios-mac .chat-dl-btn {
 .sidebar { width: 220px; min-width: 180px; background: repeating-linear-gradient(90deg, transparent 0 22px, rgba(125,211,252,0.025) 22px 23px), linear-gradient(180deg, #0d1422 0%, #080d16 100%); border-right: 1px solid rgba(34,211,238,0.18); box-shadow: inset -1px 0 0 rgba(255,255,255,0.035), 8px 0 24px rgba(0,0,0,0.24); display: flex; flex-direction: column; overflow-y: auto; }
 .main { flex: 1; min-width: 0; display: flex; flex-direction: column; overflow: hidden; background: #070b13; }
 
+/* Mobile remote desktop / wall are full-screen work surfaces. When one is
+   active, ordinary chat chrome (server bar, tabs, composer, sub-session dock
+   and any mobile sub-session drawer inside .main) must not sit above or steal
+   viewport space from the remote video. Remote-specific chrome remains inside
+   the fixed RemoteDesktopWorkspace/Wall window. */
+.layout-mobile.layout-mobile-remote-surface-active > .main {
+  display: none;
+}
+
+
 /* Sidebar */
 .sidebar-header { padding: 16px; font-size: 12px; font-weight: 700; color: #dbeafe; letter-spacing: 0; text-transform: uppercase; border-bottom: 1px solid rgba(34,211,238,0.18); background: linear-gradient(180deg, rgba(34,211,238,0.12), rgba(15,23,42,0.08)); box-shadow: inset 0 1px 0 rgba(255,255,255,0.04), inset 0 -1px 0 rgba(34,211,238,0.12); text-shadow: 0 0 10px rgba(34,211,238,0.18); }
 .server-list { padding: 8px 0; flex: 1; overflow-y: auto; }

@@ -1,6 +1,7 @@
 /**
  * @vitest-environment jsdom
  */
+import { readFileSync } from 'node:fs';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/preact';
 import { P2P_WORKFLOW_MSG } from '@shared/p2p-workflow-messages.js';
@@ -1200,6 +1201,74 @@ describe('App shell', () => {
         expect(wallZ).toBeGreaterThan(Number((discussionsPanel as HTMLElement).style.zIndex));
         expect(wallZ).toBeGreaterThan(Number((controlledNodesPanel as HTMLElement).style.zIndex));
       });
+    } finally {
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
+    }
+  }, 20_000);
+
+  it('hides mobile chat chrome while remote desktop or wall is the active full-screen surface', async () => {
+    const originalUserAgent = navigator.userAgent;
+    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
+
+    try {
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      localStorage.setItem('rcc_server', 'srv-1');
+      localStorage.setItem('rcc_session', 'deck_alpha_brain');
+      useSubSessionsState.subSessions = [
+        {
+          id: 'sub-1',
+          sessionName: 'deck_sub_alpha_helper',
+          parentSession: 'deck_alpha_brain',
+          label: 'Helper',
+          description: 'Helper session',
+          cwd: '/work/alpha',
+          type: 'codex-sdk',
+          runtimeType: 'transport',
+          state: 'idle',
+          serverId: 'srv-1',
+        },
+      ];
+      useSubSessionsState.visibleSubSessions = useSubSessionsState.subSessions;
+
+      const { App } = await importApp();
+      const view = render(<App />);
+      const layout = () => view.container.querySelector('.layout') as HTMLElement;
+
+      await waitFor(() => expect(wsInstances.length).toBe(1));
+      expect(layout().classList.contains('layout-mobile-remote-surface-active')).toBe(false);
+      fireEvent.click(screen.getByText('subbar-open-sub-1'));
+      const subWindow = await screen.findByTestId('sub-session-window-sub-1');
+
+      fireEvent.click(document.querySelector('.mobile-server-btn')!);
+      fireEvent.click(await screen.findByText('controlled_nodes.title'));
+      fireEvent.click(screen.getByText('controlled-nodes-panel'));
+      const remoteDesktop = await screen.findByTestId('remote-desktop-workspace');
+
+      await waitFor(() => {
+        expect(layout().classList.contains('layout-mobile-remote-surface-active')).toBe(true);
+        expect(Number((remoteDesktop as HTMLElement).style.zIndex)).toBeGreaterThan(Number((subWindow as HTMLElement).style.zIndex));
+      });
+
+      fireEvent.click(screen.getByText('remote-desktop-minimize'));
+      await waitFor(() => expect(layout().classList.contains('layout-mobile-remote-surface-active')).toBe(false));
+      fireEvent.click(screen.getByText('remote-desktop-restore'));
+      await waitFor(() => expect(layout().classList.contains('layout-mobile-remote-surface-active')).toBe(true));
+      fireEvent.click(screen.getByText('remote-desktop-close'));
+      await waitFor(() => expect(layout().classList.contains('layout-mobile-remote-surface-active')).toBe(false));
+
+      fireEvent.click(document.querySelector('.mobile-server-btn')!);
+      fireEvent.click(await screen.findByText('controlled_nodes.title'));
+      fireEvent.click(screen.getByText('controlled-nodes-wall'));
+      const wall = await screen.findByTestId('remote-desktop-wall');
+      await waitFor(() => {
+        expect(layout().classList.contains('layout-mobile-remote-surface-active')).toBe(true);
+        expect(Number((wall as HTMLElement).style.zIndex)).toBeGreaterThan(Number((subWindow as HTMLElement).style.zIndex));
+      });
+      fireEvent.click(screen.getByText('remote-desktop-wall-close'));
+      await waitFor(() => expect(layout().classList.contains('layout-mobile-remote-surface-active')).toBe(false));
+
+      const css = readFileSync('web/src/styles.css', 'utf8');
+      expect(css).toMatch(/\.layout-mobile\.layout-mobile-remote-surface-active\s*>\s*\.main\s*{[^}]*display:\s*none/s);
     } finally {
       Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
     }
