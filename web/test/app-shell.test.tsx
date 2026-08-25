@@ -9,21 +9,32 @@ import { P2P_WORKFLOW_MSG } from '@shared/p2p-workflow-messages.js';
 const {
   apiFetchMock,
   chatScrollMock,
+  clearAuthKeyMock,
+  clearServerUrlMock,
   discoverSharedEntriesMock,
   fetchMeMock,
+  getServerUrlMock,
   listP2pRunsMock,
+  nativeState,
   openSharedEntryMock,
+  preferencesRemoveMock,
   wsInstances,
   useSubSessionsState,
   authExpiredState,
+  loginAttemptState,
   loginState,
 } = vi.hoisted(() => ({
   apiFetchMock: vi.fn(),
   chatScrollMock: vi.fn(),
+  clearAuthKeyMock: vi.fn(async () => undefined),
+  clearServerUrlMock: vi.fn(async () => undefined),
   discoverSharedEntriesMock: vi.fn(),
   fetchMeMock: vi.fn(),
+  getServerUrlMock: vi.fn(async () => null as string | null),
   listP2pRunsMock: vi.fn(),
+  nativeState: { value: false },
   openSharedEntryMock: vi.fn(),
+  preferencesRemoveMock: vi.fn(async () => undefined),
   wsInstances: [] as Array<{
     connected: boolean;
     options?: { shareTarget?: unknown };
@@ -61,6 +72,11 @@ const {
   },
   authExpiredState: {
     handler: null as ((reason?: string) => void) | null,
+  },
+  loginAttemptState: {
+    pending: null as Promise<void> | null,
+    mode: 'native' as 'native' | 'web',
+    webReloads: 0,
   },
   loginState: {
     userId: 'user-1',
@@ -115,13 +131,33 @@ vi.mock('../src/api.js', () => {
 });
 
 vi.mock('../src/native.js', () => ({
-  clearServerUrl: vi.fn(),
-  getServerUrl: vi.fn(async () => null),
-  isNative: vi.fn(() => false),
+  clearServerUrl: (...args: unknown[]) => clearServerUrlMock(...args),
+  getServerUrl: (...args: unknown[]) => getServerUrlMock(...args),
+  isNative: vi.fn(() => nativeState.value),
+}));
+
+vi.mock('@capacitor/status-bar', () => ({
+  StatusBar: {
+    setStyle: vi.fn(async () => undefined),
+    setBackgroundColor: vi.fn(async () => undefined),
+  },
+  Style: { Dark: 'DARK' },
+}));
+
+vi.mock('@capacitor/splash-screen', () => ({
+  SplashScreen: { hide: vi.fn(async () => undefined) },
+}));
+
+vi.mock('@capacitor/preferences', () => ({
+  Preferences: {
+    get: vi.fn(async () => ({ value: null })),
+    set: vi.fn(async () => undefined),
+    remove: (...args: unknown[]) => preferencesRemoveMock(...args),
+  },
 }));
 
 vi.mock('../src/biometric-auth.js', () => ({
-  clearAuthKey: vi.fn(async () => undefined),
+  clearAuthKey: (...args: unknown[]) => clearAuthKeyMock(...args),
   getAuthKey: vi.fn(async () => null),
 }));
 
@@ -283,11 +319,42 @@ vi.mock('../src/components/ErrorBoundary.js', () => ({
 
 vi.mock('../src/components/LanguageSwitcher.js', () => ({ LanguageSwitcher: textComponent('language-switcher') }));
 vi.mock('../src/pages/LoginPage.js', () => ({
-  LoginPage: ({ onLoginSuccess }: { onLoginSuccess: (userId: string, url: string) => void }) => (
-    <button
-      type="button"
-      onClick={() => onLoginSuccess(loginState.userId, loginState.baseUrl)}
-    >login-page</button>
+  LoginPage: ({
+    onLoginSuccess,
+    beginAuthAttempt,
+    onChangeServer,
+  }: {
+    onLoginSuccess: (userId: string, url: string) => void;
+    beginAuthAttempt?: () => { isCurrent: () => boolean; finish: () => void };
+    onChangeServer?: () => void | Promise<void>;
+  }) => (
+    <div>
+      <button
+        type="button"
+        onClick={async () => {
+          const attempt = beginAuthAttempt?.();
+          try {
+            if (loginAttemptState.pending) await loginAttemptState.pending;
+            if (attempt?.isCurrent() ?? true) {
+              if (loginAttemptState.mode === 'web') {
+                // Model the real Web LoginPage path: it owns the cookie login
+                // and reloads directly; it does not call native onLoginSuccess.
+                loginAttemptState.webReloads += 1;
+              } else {
+                onLoginSuccess(loginState.userId, loginState.baseUrl);
+              }
+            }
+          } finally {
+            attempt?.finish();
+          }
+        }}
+      >login-page</button>
+      {onChangeServer && (
+        <button type="button" onClick={() => void onChangeServer()}>
+          change-server
+        </button>
+      )}
+    </div>
   ),
 }));
 vi.mock('../src/pages/ServerSetupPage.js', () => ({ ServerSetupPage: textComponent('server-setup-page') }));
@@ -809,9 +876,21 @@ beforeEach(() => {
   useSubSessionsState.visibleSubSessions = [];
   useSubSessionsState.loadedServerId = 'srv-1';
   authExpiredState.handler = null;
+  loginAttemptState.pending = null;
+  loginAttemptState.mode = 'native';
+  loginAttemptState.webReloads = 0;
   loginState.userId = 'user-1';
   loginState.baseUrl = 'http://localhost';
+  nativeState.value = false;
   chatScrollMock.mockReset();
+  clearAuthKeyMock.mockReset();
+  clearAuthKeyMock.mockResolvedValue(undefined);
+  clearServerUrlMock.mockReset();
+  clearServerUrlMock.mockResolvedValue(undefined);
+  getServerUrlMock.mockReset();
+  getServerUrlMock.mockResolvedValue(null);
+  preferencesRemoveMock.mockReset();
+  preferencesRemoveMock.mockResolvedValue(undefined);
   fetchMeMock.mockResolvedValue({
     id: 'user-1',
     is_admin: true,
@@ -1008,6 +1087,279 @@ describe('App shell', () => {
     );
   }, 20_000);
 
+  it('lets an explicit Web login claim authority before a stale mount verification succeeds', async () => {
+    let resolveInitialVerification!: (value: { id: string }) => void;
+    const initialVerification = new Promise<{ id: string }>((resolve) => {
+      resolveInitialVerification = resolve;
+    });
+    let resolveWebLogin!: () => void;
+    loginAttemptState.mode = 'web';
+    loginAttemptState.pending = new Promise<void>((resolve) => {
+      resolveWebLogin = resolve;
+    });
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') return initialVerification;
+      return {};
+    });
+
+    const { App } = await importApp();
+    render(<App />);
+
+    const login = await screen.findByRole('button', { name: 'login-page' });
+    fireEvent.click(login);
+
+    // The user-auth attempt claims a new generation synchronously. The older
+    // mount verifier must not install its previous-cookie identity even if it
+    // resolves before the explicit Web login finishes and reloads.
+    await act(async () => {
+      resolveInitialVerification({ id: 'stale-cookie-user' });
+      await Promise.resolve();
+    });
+    expect(localStorage.getItem('rcc_auth')).toBeNull();
+    expect(loginAttemptState.webReloads).toBe(0);
+
+    await act(async () => {
+      resolveWebLogin();
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(loginAttemptState.webReloads).toBe(1));
+    expect(localStorage.getItem('rcc_auth')).toBeNull();
+    expect(screen.getByRole('button', { name: 'login-page' })).toBeTruthy();
+  }, 20_000);
+
+  it('drops a mount verification success that arrives after auth cleanup starts', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({
+      userId: 'user-1',
+      baseUrl: 'http://localhost',
+    }));
+    let resolveVerification!: (value: { id: string }) => void;
+    const verification = new Promise<{ id: string }>((resolve) => {
+      resolveVerification = resolve;
+    });
+    let resolveCredentialCleanup!: () => void;
+    let resolvePreferenceCleanup!: () => void;
+    clearAuthKeyMock.mockImplementationOnce(() => new Promise<void>((resolve) => {
+      resolveCredentialCleanup = resolve;
+    }));
+    preferencesRemoveMock.mockImplementationOnce(() => new Promise<void>((resolve) => {
+      resolvePreferenceCleanup = resolve;
+    }));
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') return verification;
+      if (path === '/api/server') return serverList();
+      if (path === '/api/server/srv-1/sessions') return sessionList();
+      return {};
+    });
+
+    const { App } = await importApp();
+    render(<App />);
+    await waitFor(() => expect(authExpiredState.handler).not.toBeNull());
+
+    act(() => authExpiredState.handler?.('expire while mount verification is pending'));
+    expect(await screen.findByTestId('auth-credential-cleanup-gate')).toBeTruthy();
+
+    await act(async () => {
+      resolveVerification({ id: 'stale-success-user' });
+      await Promise.resolve();
+    });
+    expect(screen.getByTestId('auth-credential-cleanup-gate')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'login-page' })).toBeNull();
+    expect(localStorage.getItem('rcc_auth')).toBeNull();
+
+    await act(async () => {
+      resolveCredentialCleanup();
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(preferencesRemoveMock).toHaveBeenCalledTimes(1));
+    expect(screen.getByTestId('auth-credential-cleanup-gate')).toBeTruthy();
+
+    await act(async () => {
+      resolvePreferenceCleanup();
+      await Promise.resolve();
+    });
+    expect(await screen.findByRole('button', { name: 'login-page' })).toBeTruthy();
+    expect(localStorage.getItem('rcc_auth')).toBeNull();
+  }, 20_000);
+
+  it('waits for an invalidated in-flight LoginPage attempt before deleting old credentials', async () => {
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') return new Promise(() => {});
+      return {};
+    });
+    let resolveLoginAttempt!: () => void;
+    loginAttemptState.pending = new Promise<void>((resolve) => {
+      resolveLoginAttempt = resolve;
+    });
+
+    const { App } = await importApp();
+    render(<App />);
+    const login = await screen.findByRole('button', { name: 'login-page' });
+    fireEvent.click(login);
+    await waitFor(() => expect(authExpiredState.handler).not.toBeNull());
+
+    act(() => authExpiredState.handler?.('cleanup during active login attempt'));
+    expect(await screen.findByTestId('auth-credential-cleanup-gate')).toBeTruthy();
+    expect(clearAuthKeyMock).not.toHaveBeenCalled();
+
+    await act(async () => {
+      resolveLoginAttempt();
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(clearAuthKeyMock).toHaveBeenCalledTimes(1));
+    expect(await screen.findByRole('button', { name: 'login-page' })).toBeTruthy();
+    expect(localStorage.getItem('rcc_auth')).toBeNull();
+  }, 20_000);
+
+  it('keeps login gated until overlapping auth cleanups finish out of order', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({
+      userId: 'user-1',
+      baseUrl: 'http://localhost',
+    }));
+    let resolveFirstCleanup!: () => void;
+    let resolveSecondCleanup!: () => void;
+    clearAuthKeyMock
+      .mockImplementationOnce(() => new Promise<void>((resolve) => {
+        resolveFirstCleanup = resolve;
+      }))
+      .mockImplementationOnce(() => new Promise<void>((resolve) => {
+        resolveSecondCleanup = resolve;
+      }));
+
+    const { App } = await importApp();
+    render(<App />);
+    await waitFor(() => expect(authExpiredState.handler).not.toBeNull());
+    act(() => {
+      authExpiredState.handler?.('first overlapping cleanup');
+      authExpiredState.handler?.('second overlapping cleanup');
+    });
+    await waitFor(() => expect(clearAuthKeyMock).toHaveBeenCalledTimes(2));
+    expect(await screen.findByTestId('auth-credential-cleanup-gate')).toBeTruthy();
+
+    await act(async () => {
+      resolveSecondCleanup();
+      await Promise.resolve();
+    });
+    expect(screen.getByTestId('auth-credential-cleanup-gate')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'login-page' })).toBeNull();
+
+    await act(async () => {
+      resolveFirstCleanup();
+      await Promise.resolve();
+    });
+    expect(await screen.findByRole('button', { name: 'login-page' })).toBeTruthy();
+    expect(preferencesRemoveMock).toHaveBeenCalledTimes(2);
+  }, 20_000);
+
+  it('waits for an active native login and deletes its credentials before changing server', async () => {
+    nativeState.value = true;
+    getServerUrlMock.mockResolvedValue('https://old-server.example');
+    let resolveLoginAttempt!: () => void;
+    loginAttemptState.pending = new Promise<void>((resolve) => {
+      resolveLoginAttempt = resolve;
+    });
+    let resolveCredentialCleanup!: () => void;
+    clearAuthKeyMock.mockImplementationOnce(() => new Promise<void>((resolve) => {
+      resolveCredentialCleanup = resolve;
+    }));
+    let resolvePreferenceCleanup!: () => void;
+    preferencesRemoveMock.mockImplementationOnce(() => new Promise<void>((resolve) => {
+      resolvePreferenceCleanup = resolve;
+    }));
+    let resolveServerCleanup!: () => void;
+    clearServerUrlMock.mockImplementationOnce(() => new Promise<void>((resolve) => {
+      resolveServerCleanup = resolve;
+    }));
+
+    const { App } = await importApp();
+    render(<App />);
+
+    const login = await screen.findByRole('button', { name: 'login-page' });
+    fireEvent.click(login);
+    fireEvent.click(screen.getByRole('button', { name: 'change-server' }));
+
+    expect(await screen.findByTestId('auth-credential-cleanup-gate')).toBeTruthy();
+    expect(clearAuthKeyMock).not.toHaveBeenCalled();
+    expect(preferencesRemoveMock).not.toHaveBeenCalled();
+    expect(clearServerUrlMock).not.toHaveBeenCalled();
+
+    await act(async () => {
+      resolveLoginAttempt();
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(clearAuthKeyMock).toHaveBeenCalledTimes(1));
+    expect(localStorage.getItem('rcc_auth')).toBeNull();
+
+    await act(async () => {
+      resolveCredentialCleanup();
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(preferencesRemoveMock).toHaveBeenCalledWith({
+      key: 'deck_api_key_id',
+    }));
+    expect(screen.getByTestId('auth-credential-cleanup-gate')).toBeTruthy();
+
+    await act(async () => {
+      resolvePreferenceCleanup();
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(clearServerUrlMock).toHaveBeenCalledTimes(1));
+    expect(screen.getByTestId('auth-credential-cleanup-gate')).toBeTruthy();
+
+    await act(async () => {
+      resolveServerCleanup();
+      await Promise.resolve();
+    });
+    expect(await screen.findByText('server-setup-page')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'login-page' })).toBeNull();
+    expect(localStorage.getItem('rcc_auth')).toBeNull();
+    expect(sessionStorage.getItem('rcc_tab_route_v1')).toBeNull();
+  }, 20_000);
+
+  it('keeps authenticated native server switching gated through server cleanup', async () => {
+    const originalUserAgent = navigator.userAgent;
+    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
+    nativeState.value = true;
+    getServerUrlMock.mockResolvedValue('https://old-server.example');
+    localStorage.setItem('rcc_auth', JSON.stringify({
+      userId: 'user-1',
+      baseUrl: 'https://old-server.example',
+    }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    clearAuthKeyMock.mockRejectedValueOnce(new Error('secure storage unavailable'));
+    let resolveServerCleanup!: () => void;
+    clearServerUrlMock.mockImplementationOnce(() => new Promise<void>((resolve) => {
+      resolveServerCleanup = resolve;
+    }));
+
+    try {
+      const { App } = await importApp();
+      render(<App />);
+
+      await waitFor(() => expect(document.querySelector('.mobile-server-btn')).toBeTruthy());
+      fireEvent.click(document.querySelector('.mobile-server-btn')!);
+      fireEvent.click(await screen.findByText('⇄ Switch Cloud Server'));
+
+      await waitFor(() => expect(clearServerUrlMock).toHaveBeenCalledTimes(1));
+      expect(screen.getByTestId('auth-credential-cleanup-gate')).toBeTruthy();
+      expect(screen.queryByRole('button', { name: 'login-page' })).toBeNull();
+      expect(localStorage.getItem('rcc_auth')).toBeNull();
+      expect(sessionStorage.getItem('rcc_tab_route_v1')).toBeNull();
+
+      await act(async () => {
+        resolveServerCleanup();
+        await Promise.resolve();
+      });
+      expect(await screen.findByText('server-setup-page')).toBeTruthy();
+      expect(screen.queryByRole('button', { name: 'login-page' })).toBeNull();
+    } finally {
+      Object.defineProperty(navigator, 'userAgent', {
+        configurable: true,
+        value: originalUserAgent,
+      });
+    }
+  }, 20_000);
+
   it('clears stale shared session authority until re-open succeeds after auth expiry', async () => {
     history.replaceState(
       null,
@@ -1085,8 +1437,16 @@ describe('App shell', () => {
     });
     discoverSharedEntriesMock.mockResolvedValue([]);
     let resolveOldOpen!: (value: ReturnType<typeof sharedMainOpenResult>) => void;
+    let resolveCredentialCleanup!: () => void;
+    let resolvePreferenceCleanup!: () => void;
     openSharedEntryMock.mockImplementationOnce(() => new Promise((resolve) => {
       resolveOldOpen = resolve;
+    }));
+    clearAuthKeyMock.mockImplementationOnce(() => new Promise<void>((resolve) => {
+      resolveCredentialCleanup = resolve;
+    }));
+    preferencesRemoveMock.mockImplementationOnce(() => new Promise<void>((resolve) => {
+      resolvePreferenceCleanup = resolve;
     }));
 
     const { App } = await importApp();
@@ -1095,7 +1455,12 @@ describe('App shell', () => {
     await waitFor(() => expect(openSharedEntryMock).toHaveBeenCalledTimes(1));
     expect(authExpiredState.handler).not.toBeNull();
     act(() => authExpiredState.handler?.('expired with open in flight'));
-    expect(await screen.findByRole('button', { name: 'login-page' })).toBeTruthy();
+    // clearAuthState is still blocked on credential I/O. The generation fence
+    // and old-authority UI revocation must already be effective synchronously,
+    // while fresh login stays unavailable until the unconditional deletion ends.
+    await waitFor(() => expect(clearAuthKeyMock).toHaveBeenCalledTimes(1));
+    expect(await screen.findByTestId('auth-credential-cleanup-gate')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'login-page' })).toBeNull();
 
     await act(async () => {
       resolveOldOpen(sharedMainOpenResult('share-stale-open', 'dispatch-must-not-render'));
@@ -1103,10 +1468,39 @@ describe('App shell', () => {
     });
 
     expect(screen.queryByTestId('session-pane-deck_beta_brain')).toBeNull();
-    expect(screen.getByRole('button', { name: 'login-page' })).toBeTruthy();
+    expect(screen.getByTestId('auth-credential-cleanup-gate')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'login-page' })).toBeNull();
     expect(window.location.hash).toBe(
       '#/srv-shared/deck_beta_brain?shared=share-stale-open',
     );
+    const { readSharedTabRestoreMarker } = await import('../src/shared-tab-restore.js');
+    expect(readSharedTabRestoreMarker()).toBeNull();
+    expect(wsInstances.filter((instance) => instance.options?.shareTarget && instance.connected)).toHaveLength(0);
+
+    await act(async () => {
+      resolveCredentialCleanup();
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(preferencesRemoveMock).toHaveBeenCalledWith({
+      key: 'deck_api_key_id',
+    }));
+    expect(screen.getByTestId('auth-credential-cleanup-gate')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'login-page' })).toBeNull();
+
+    await act(async () => {
+      resolvePreferenceCleanup();
+      await Promise.resolve();
+    });
+    const login = await screen.findByRole('button', { name: 'login-page' });
+    expect(screen.queryByTestId('auth-credential-cleanup-gate')).toBeNull();
+    fireEvent.click(login);
+    await waitFor(() => {
+      expect(JSON.parse(localStorage.getItem('rcc_auth') ?? '{}')).toMatchObject({
+        userId: 'user-1',
+      });
+    });
+    expect(clearAuthKeyMock).toHaveBeenCalledTimes(1);
+    expect(preferencesRemoveMock).toHaveBeenCalledTimes(1);
   }, 20_000);
 
   it('loads servers and renders the dashboard when no server is selected', async () => {
@@ -3190,6 +3584,109 @@ describe('App shell', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'share.sharedWithMe.guideDismiss' }));
     expect(screen.queryByTestId('shared-return-guide')).toBeNull();
+  }, 20_000);
+
+  it('does not let a pending shared open undo Back to dashboard', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    const sharedEntry = {
+      id: 'share-pending-back',
+      serverId: 'srv-shared',
+      serverName: 'Shared Server',
+      role: 'participant',
+      status: 'active',
+      targetLabel: 'Shared Beta',
+      target: { kind: 'main', serverId: 'srv-shared', sessionName: 'deck_beta_brain' },
+    };
+    discoverSharedEntriesMock.mockResolvedValue([sharedEntry]);
+    let resolveOpen!: (value: ReturnType<typeof sharedMainOpenResult>) => void;
+    openSharedEntryMock.mockImplementationOnce(() => new Promise((resolve) => {
+      resolveOpen = resolve;
+    }));
+
+    const { App } = await importApp();
+    render(<App />);
+
+    const entryLabel = await screen.findByText('Shared Beta');
+    fireEvent.click(entryLabel.closest('button')!);
+    await waitFor(() => expect(openSharedEntryMock).toHaveBeenCalledTimes(1));
+
+    fireEvent.click(screen.getByRole('button', { name: 'server-home' }));
+    expect(await screen.findByText('dashboard-page')).toBeTruthy();
+
+    await act(async () => {
+      resolveOpen(sharedMainOpenResult('share-pending-back', 'dispatch-must-not-return'));
+      await Promise.resolve();
+    });
+
+    expect(screen.queryByTestId('session-pane-deck_beta_brain')).toBeNull();
+    expect(screen.getByText('dashboard-page')).toBeTruthy();
+    expect(window.location.hash).toBe('');
+    const { readSharedTabRestoreMarker } = await import('../src/shared-tab-restore.js');
+    const { readTabRouteState } = await import('../src/hooks/useHashState.js');
+    expect(readSharedTabRestoreMarker()).toBeNull();
+    expect(readTabRouteState()).toEqual({ serverId: null, sessionName: null, sharedEntryId: null });
+    expect(wsInstances.some((instance) => instance.options?.shareTarget)).toBe(false);
+  }, 20_000);
+
+  it('does not let a pending shared open undo Logout while the logout request is pending', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    const sharedEntry = {
+      id: 'share-pending-logout',
+      serverId: 'srv-shared',
+      serverName: 'Shared Server',
+      role: 'participant',
+      status: 'active',
+      targetLabel: 'Shared Beta',
+      target: { kind: 'main', serverId: 'srv-shared', sessionName: 'deck_beta_brain' },
+    };
+    discoverSharedEntriesMock.mockResolvedValue([sharedEntry]);
+    let resolveOpen!: (value: ReturnType<typeof sharedMainOpenResult>) => void;
+    let resolveLogout!: () => void;
+    openSharedEntryMock.mockImplementationOnce(() => new Promise((resolve) => {
+      resolveOpen = resolve;
+    }));
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') return { id: 'user-1' };
+      if (path === '/api/server') return serverList();
+      if (path === '/api/server/srv-1/sessions') return sessionList();
+      if (path === '/api/auth/logout') {
+        return new Promise<void>((resolve) => { resolveLogout = resolve; });
+      }
+      if (path.startsWith('/api/watch/sessions')) return { sessions: [] };
+      return {};
+    });
+
+    const { App } = await importApp();
+    render(<App />);
+
+    const entryLabel = await screen.findByText('Shared Beta');
+    fireEvent.click(entryLabel.closest('button')!);
+    await waitFor(() => expect(openSharedEntryMock).toHaveBeenCalledTimes(1));
+
+    fireEvent.click(screen.getByRole('button', { name: 'Log Out' }));
+    await waitFor(() => expect(apiFetchMock).toHaveBeenCalledWith('/api/auth/logout', { method: 'POST' }));
+
+    await act(async () => {
+      resolveOpen(sharedMainOpenResult('share-pending-logout', 'dispatch-must-not-return'));
+      await Promise.resolve();
+    });
+    expect(screen.queryByTestId('session-pane-deck_beta_brain')).toBeNull();
+    expect(wsInstances.some((instance) => instance.options?.shareTarget)).toBe(false);
+
+    await act(async () => {
+      resolveLogout();
+      await Promise.resolve();
+    });
+    expect(await screen.findByRole('button', { name: 'login-page' })).toBeTruthy();
+    expect(window.location.hash).toBe('');
+    const { readSharedTabRestoreMarker } = await import('../src/shared-tab-restore.js');
+    const { readTabRouteState } = await import('../src/hooks/useHashState.js');
+    expect(readSharedTabRestoreMarker()).toBeNull();
+    expect(readTabRouteState()).toEqual({ serverId: null, sessionName: null, sharedEntryId: null });
   }, 20_000);
 
   it('restores a shared tab from the URL hash instead of falling back to an owned tab', async () => {

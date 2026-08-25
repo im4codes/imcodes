@@ -110,6 +110,38 @@ describe('LoginPage native auth nonce exchange', () => {
     });
   });
 
+  it('drops an in-flight native login before any credential write when its parent generation expires', async () => {
+    authSessionStartMock.mockResolvedValue({ url: 'imcodes://auth?nonce=nonce-stale' });
+    let resolveExchange!: (value: { apiKey: string; userId: string; keyId: string }) => void;
+    exchangeNonceWithRetryMock.mockImplementationOnce(() => new Promise((resolve) => {
+      resolveExchange = resolve;
+    }));
+    let current = true;
+    const finish = vi.fn();
+    const onLoginSuccess = vi.fn();
+
+    render(
+      <LoginPage
+        serverUrl="https://app.im.codes"
+        beginAuthAttempt={() => ({ isCurrent: () => current, finish })}
+        onLoginSuccess={onLoginSuccess}
+      />,
+    );
+    fireEvent.click(await screen.findByRole('button', { name: 'login.passkey_signin' }));
+    await waitFor(() => {
+      expect(exchangeNonceWithRetryMock).toHaveBeenCalledWith('https://app.im.codes', 'nonce-stale');
+    });
+
+    current = false;
+    resolveExchange({ apiKey: 'must-not-store', userId: 'stale-user', keyId: 'stale-key' });
+
+    await waitFor(() => expect(finish).toHaveBeenCalledTimes(1));
+    expect(storeAuthKeyMock).not.toHaveBeenCalled();
+    expect(configureApiKeyMock).not.toHaveBeenCalled();
+    expect(preferencesSetMock).not.toHaveBeenCalled();
+    expect(onLoginSuccess).not.toHaveBeenCalled();
+  });
+
   it('shows a connection failure message when nonce exchange fails', async () => {
     authSessionStartMock.mockResolvedValue({ url: 'imcodes://auth?nonce=nonce-123' });
     exchangeNonceWithRetryMock.mockRejectedValue(new Error('network down'));
@@ -118,6 +150,111 @@ describe('LoginPage native auth nonce exchange', () => {
     fireEvent.click(await screen.findByRole('button', { name: 'login.passkey_signin' }));
 
     expect(await screen.findByText('login.nonce_exchange_failed')).toBeDefined();
+  });
+
+  it('rejects a second native password attempt while Secure Storage is pending', async () => {
+    passwordLoginMock.mockResolvedValue({
+      apiKey: 'api-key-a',
+      userId: 'user-a',
+      keyId: 'key-a',
+    });
+    let resolveStore!: () => void;
+    storeAuthKeyMock.mockImplementationOnce(() => new Promise<void>((resolve) => {
+      resolveStore = resolve;
+    }));
+    preferencesSetMock.mockResolvedValue(undefined);
+    const beginAuthAttempt = vi.fn(() => ({
+      isCurrent: () => true,
+      finish: vi.fn(),
+    }));
+    const onLoginSuccess = vi.fn();
+    const onChangeServer = vi.fn();
+
+    render(
+      <LoginPage
+        serverUrl="https://app.im.codes"
+        beginAuthAttempt={beginAuthAttempt}
+        onLoginSuccess={onLoginSuccess}
+        onChangeServer={onChangeServer}
+      />,
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'login.password_signin' }));
+    const username = screen.getByPlaceholderText('login.username_placeholder');
+    const password = screen.getByPlaceholderText('login.password_placeholder');
+    fireEvent.input(username, { target: { value: 'user-a' } });
+    fireEvent.input(password, { target: { value: 'password-a' } });
+    fireEvent.click(screen.getByRole('button', { name: 'login.signin' }));
+
+    await waitFor(() => expect(storeAuthKeyMock).toHaveBeenCalledWith('api-key-a'));
+    fireEvent.keyDown(password, { key: 'Enter' });
+    fireEvent.click(screen.getByRole('button', { name: 'common.loading' }));
+    const changeServer = screen.getByRole('button', { name: 'serverSetup.changeServer' });
+    expect((changeServer as HTMLButtonElement).disabled).toBe(true);
+    (changeServer as HTMLButtonElement).click();
+    expect(passwordLoginMock).toHaveBeenCalledTimes(1);
+    expect(beginAuthAttempt).toHaveBeenCalledTimes(1);
+    expect(onChangeServer).not.toHaveBeenCalled();
+
+    resolveStore();
+    await waitFor(() => expect(onLoginSuccess).toHaveBeenCalledWith(
+      'user-a',
+      'https://app.im.codes',
+    ));
+    expect(preferencesSetMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects a second native password attempt while key-id Preferences are pending', async () => {
+    passwordLoginMock.mockResolvedValue({
+      apiKey: 'api-key-b',
+      userId: 'user-b',
+      keyId: 'key-b',
+    });
+    storeAuthKeyMock.mockResolvedValue(undefined);
+    let resolvePreference!: () => void;
+    preferencesSetMock.mockImplementationOnce(() => new Promise<void>((resolve) => {
+      resolvePreference = resolve;
+    }));
+    const beginAuthAttempt = vi.fn(() => ({
+      isCurrent: () => true,
+      finish: vi.fn(),
+    }));
+    const onLoginSuccess = vi.fn();
+    const onChangeServer = vi.fn();
+
+    render(
+      <LoginPage
+        serverUrl="https://app.im.codes"
+        beginAuthAttempt={beginAuthAttempt}
+        onLoginSuccess={onLoginSuccess}
+        onChangeServer={onChangeServer}
+      />,
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'login.password_signin' }));
+    const username = screen.getByPlaceholderText('login.username_placeholder');
+    const password = screen.getByPlaceholderText('login.password_placeholder');
+    fireEvent.input(username, { target: { value: 'user-b' } });
+    fireEvent.input(password, { target: { value: 'password-b' } });
+    fireEvent.click(screen.getByRole('button', { name: 'login.signin' }));
+
+    await waitFor(() => expect(preferencesSetMock).toHaveBeenCalledWith({
+      key: 'deck_api_key_id',
+      value: 'key-b',
+    }));
+    fireEvent.keyDown(password, { key: 'Enter' });
+    fireEvent.click(screen.getByRole('button', { name: 'common.loading' }));
+    const changeServer = screen.getByRole('button', { name: 'serverSetup.changeServer' });
+    expect((changeServer as HTMLButtonElement).disabled).toBe(true);
+    (changeServer as HTMLButtonElement).click();
+    expect(passwordLoginMock).toHaveBeenCalledTimes(1);
+    expect(beginAuthAttempt).toHaveBeenCalledTimes(1);
+    expect(onChangeServer).not.toHaveBeenCalled();
+
+    resolvePreference();
+    await waitFor(() => expect(onLoginSuccess).toHaveBeenCalledWith(
+      'user-b',
+      'https://app.im.codes',
+    ));
+    expect(storeAuthKeyMock).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -200,6 +337,51 @@ describe('LoginPage password login: remember-password', () => {
       expect(localStorage.getItem('rcc_login_username')).toBe('bob');
       expect(localStorage.getItem('rcc_login_password')).toBe('secret');
     });
+  });
+
+  it('claims the parent auth generation before starting a Web password login', async () => {
+    let resolveLogin!: (value: Record<string, never>) => void;
+    passwordLoginMock.mockImplementationOnce(() => new Promise((resolve) => {
+      resolveLogin = resolve;
+    }));
+    let generation = 0;
+    const staleMountGeneration = generation;
+    const finish = vi.fn();
+    const beginAuthAttempt = vi.fn(() => {
+      generation += 1;
+      const claimedGeneration = generation;
+      return {
+        isCurrent: () => generation === claimedGeneration,
+        finish,
+      };
+    });
+    const onLogin = vi.fn();
+
+    render(
+      <LoginPage
+        serverUrl="https://app.im.codes"
+        beginAuthAttempt={beginAuthAttempt}
+        onLogin={onLogin}
+      />,
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'login.password_signin' }));
+    fireEvent.input(screen.getByPlaceholderText('login.username_placeholder'), {
+      target: { value: 'new-user' },
+    });
+    fireEvent.input(screen.getByPlaceholderText('login.password_placeholder'), {
+      target: { value: 'new-password' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'login.signin' }));
+
+    await waitFor(() => expect(passwordLoginMock).toHaveBeenCalledTimes(1));
+    expect(beginAuthAttempt).toHaveBeenCalledTimes(1);
+    expect(generation).not.toBe(staleMountGeneration);
+    expect(onLogin).not.toHaveBeenCalled();
+
+    resolveLogin({});
+    await waitFor(() => expect(onLogin).toHaveBeenCalledTimes(1));
+    expect(window.location.reload).toHaveBeenCalledTimes(1);
+    expect(finish).toHaveBeenCalledTimes(1);
   });
 
   it('immediately wipes saved credentials when the user unchecks the box', () => {

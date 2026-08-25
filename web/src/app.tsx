@@ -566,8 +566,54 @@ export function App() {
   const [initialAuthVerificationPending, setInitialAuthVerificationPending] = useState(
     () => !isNative(),
   );
+  const authMutationGenerationRef = useRef(0);
+  const activeAuthAttemptSettlementsRef = useRef(new Set<Promise<void>>());
+  const authCredentialCleanupCountRef = useRef(0);
+  const [authCredentialCleanupPending, setAuthCredentialCleanupPending] = useState(false);
+  const holdAuthCredentialCleanupGate = useCallback(() => {
+    authCredentialCleanupCountRef.current += 1;
+    setAuthCredentialCleanupPending(true);
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      authCredentialCleanupCountRef.current = Math.max(
+        0,
+        authCredentialCleanupCountRef.current - 1,
+      );
+      if (authCredentialCleanupCountRef.current === 0) {
+        setAuthCredentialCleanupPending(false);
+      }
+    };
+  }, []);
+  const beginAuthAttempt = useCallback(() => {
+    // Explicit user authentication outranks startup verification and every
+    // older login attempt. Claim a generation at admission time rather than
+    // at success: an already pending /me response must not be able to commit
+    // the previous cookie identity while this attempt is in flight.
+    authMutationGenerationRef.current += 1;
+    const generation = authMutationGenerationRef.current;
+    let finished = false;
+    let resolveSettled!: () => void;
+    const settled = new Promise<void>((resolve) => {
+      resolveSettled = resolve;
+    });
+    activeAuthAttemptSettlementsRef.current.add(settled);
+    return {
+      isCurrent: () => generation === authMutationGenerationRef.current,
+      finish: () => {
+        if (finished) return;
+        finished = true;
+        activeAuthAttemptSettlementsRef.current.delete(settled);
+        resolveSettled();
+      },
+    };
+  }, []);
   const [managedShares, setManagedShares] = useState<ShareGrantSummary[]>([]);
-  const clearAuthState = useCallback(async (reason?: string) => {
+  const clearAuthState = useCallback(async (
+    reason?: string,
+    options?: { preserveSharedNavigation?: boolean },
+  ) => {
     // Authentication is authority, but it is not navigation state. In
     // particular, a refresh can discover an expired cookie before LoginPage
     // completes a fresh sign-in. Clearing the explicit shared hash here used
@@ -576,23 +622,26 @@ export function App() {
     // that is still explicitly present in this tab; /api/shares/open remains
     // the sole authority after authentication succeeds.
     console.warn('[auth] clearing auth state', reason ?? '');
-    clearApiKey();
-    configureExpectedUserId(null);
-    try { await clearAuthKey(); } catch { /* ignore */ }
-    try {
-      const { Preferences } = await import('@capacitor/preferences');
-      await Preferences.remove({ key: 'deck_api_key_id' });
-    } catch { /* ignore */ }
-    // Re-read after asynchronous credential cleanup so a deliberate navigation
-    // during that interval wins over the route that triggered the 401.
+    // Capture the navigation intent and revoke the old authority synchronously.
+    // Credential deletion can involve native IPC; an in-flight shared open must
+    // already be fenced out while those asynchronous operations are pending.
     const hashRoute = readHashState();
     const sharedRoute = hashRoute.serverId ? hashRoute : readTabRouteState();
-    const preserveSharedRoute = Boolean(
+    const preserveSharedRoute = options?.preserveSharedNavigation !== false && Boolean(
       sharedRoute.serverId && sharedRoute.sharedEntryId,
     );
     const sharedRestoreMarker = preserveSharedRoute
       ? readSharedTabRestoreMarker()
       : null;
+    // Do not expose LoginPage until every cleanup started for the old authority
+    // has completed. Native credential deletion is unconditional, so allowing a
+    // fresh login while it is in flight could delete the newly stored key.
+    const releaseCleanupGate = holdAuthCredentialCleanupGate();
+    authMutationGenerationRef.current += 1;
+    const staleAuthAttempts = [...activeAuthAttemptSettlementsRef.current];
+    sharedOpenGenerationRef.current += 1;
+    clearApiKey();
+    configureExpectedUserId(null);
     localStorage.removeItem('rcc_auth');
     localStorage.removeItem('rcc_server');
     localStorage.removeItem('rcc_server_name');
@@ -601,10 +650,7 @@ export function App() {
     clearMessagePinsCache();
     clearMessagePinNavigation();
     // A shared hash is only a navigation intent. Everything learned under the
-    // expired identity must be discarded before a later login can render it.
-    // Invalidate any in-flight /api/shares/open as well: its response belongs
-    // to the old credential even if it settles after this reset.
-    sharedOpenGenerationRef.current += 1;
+    // expired identity is discarded before asynchronous credential cleanup.
     setAuth(null);
     setServers([]);
     setServersLoaded(false);
@@ -625,6 +671,12 @@ export function App() {
       initialHashStateRef.current = sharedRoute;
       initialSharedTabRestoreRef.current = sharedRestoreMarker;
       sharedHashRestoreStartedRef.current = false;
+    } else {
+      const emptyRoute = { serverId: null, sessionName: null, sharedEntryId: null };
+      initialHashStateRef.current = emptyRoute;
+      initialSharedTabRestoreRef.current = null;
+      sharedHashRestoreStartedRef.current = false;
+      writeHashState(null, null, null);
     }
     setSelectedServerId(preserveSharedRoute ? sharedRoute.serverId : null);
     setSelectedServerName(null);
@@ -637,7 +689,19 @@ export function App() {
     setManagedShares([]);
     setManualDashboard(false);
     setAutoEnteringRecent(false);
-  }, []);
+    try {
+      // If an invalidated login was already inside a native credential write,
+      // let it settle first so this cleanup is guaranteed to be the last writer.
+      await Promise.allSettled(staleAuthAttempts);
+      try { await clearAuthKey(); } catch { /* ignore */ }
+      try {
+        const { Preferences } = await import('@capacitor/preferences');
+        await Preferences.remove({ key: 'deck_api_key_id' });
+      } catch { /* ignore */ }
+    } finally {
+      releaseCleanupGate();
+    }
+  }, [holdAuthCredentialCleanupGate]);
 
   // Native: server URL state and readiness flag
   const [nativeServerUrl, setNativeServerUrl] = useState<string | null>(null);
@@ -968,6 +1032,10 @@ export function App() {
   // Native: initialize server URL and API key from Preferences storage
   useEffect(() => {
     if (!isNative()) return;
+    const authGeneration = authMutationGenerationRef.current;
+    const isCurrentAuthGeneration = () => (
+      authGeneration === authMutationGenerationRef.current
+    );
     // Set status bar to match app background
     import('@capacitor/status-bar').then(({ StatusBar, Style }) => {
       StatusBar.setStyle({ style: Style.Dark });
@@ -984,16 +1052,19 @@ export function App() {
         if (url) configureApi(url);
 
         const storedKey = url ? await getAuthKey() : null;
-        if (storedKey) {
+        if (storedKey && isCurrentAuthGeneration()) {
           configureApiKey(storedKey);
           try {
             const user = await apiFetch<{ id: string }>('/api/auth/user/me');
+            if (!isCurrentAuthGeneration()) return;
             const authState: AuthState = { userId: user.id, baseUrl: url! };
+            authMutationGenerationRef.current += 1;
             configureExpectedUserId(user.id);
             localStorage.setItem('rcc_auth', JSON.stringify(authState));
             setAuth(authState);
           } catch (err) {
             console.warn('[native] /me failed:', err);
+            if (!isCurrentAuthGeneration()) return;
             clearApiKey();
             await clearAuthKey();
           }
@@ -1067,16 +1138,19 @@ export function App() {
   // Also handles post-OAuth redirect: cookie was set by server, we just need to confirm.
   useEffect(() => {
     if (isNative()) return; // native uses biometric auth flow above
+    const authGeneration = authMutationGenerationRef.current;
     const baseUrl = window.location.origin;
     configureApi(baseUrl);
     console.warn('[auth] mount: verifying session via /api/auth/user/me');
     void apiFetch<{ id: string }>('/api/auth/user/me').then((user) => {
       console.warn(`[auth] /me OK: userId=${user.id}`);
+      if (authGeneration !== authMutationGenerationRef.current) return;
       if (auth && auth.userId !== user.id) {
         void clearAuthState(AUTH_IDENTITY_ERRORS.CHANGED);
         return;
       }
       const authState: AuthState = { userId: user.id, baseUrl };
+      authMutationGenerationRef.current += 1;
       configureExpectedUserId(user.id);
       localStorage.setItem('rcc_auth', JSON.stringify(authState));
       setAuth((prev) => {
@@ -4564,6 +4638,11 @@ export function App() {
   const closeSidebar = useCallback(() => setMobileSidebarOpen(false), []);
 
   const handleLogout = useCallback(async () => {
+    // User intent to leave is authoritative immediately; a shared-open response
+    // that settles while logout I/O is pending must not restore the old route.
+    authMutationGenerationRef.current += 1;
+    sharedOpenGenerationRef.current += 1;
+    setOpeningSharedEntryId(null);
     if (isNative()) {
       // Native: revoke API key server-side, clear biometric storage
       try {
@@ -4574,7 +4653,10 @@ export function App() {
           await Preferences.remove({ key: 'deck_api_key_id' });
         }
       } catch { /* ignore */ }
-      await clearAuthKey();
+      // Local authority revocation must continue even if Secure Storage is
+      // unavailable. In particular, server switching must never carry the old
+      // in-memory/localStorage identity into ServerSetupPage.
+      try { await clearAuthKey(); } catch { /* ignore */ }
       clearApiKey();
     } else {
       try {
@@ -4608,12 +4690,30 @@ export function App() {
   // Native only: log out + clear server URL → back to ServerSetupPage
   const handleChangeServer = useCallback(async () => {
     setShowMobileServerMenu(false);
-    try { await handleLogout(); } catch { /* ignore */ }
-    try { await clearServerUrl(); } catch { /* ignore */ }
-    setNativeServerUrl(null);
-  }, [handleLogout]);
+    // Both authenticated and LoginPage-initiated switching must keep the gate
+    // held through clearServerUrl. Otherwise handleLogout can render the old
+    // server's LoginPage after setAuth(null), allowing a fresh credential write
+    // to race the remainder of this server-switch operation.
+    const releaseCleanupGate = holdAuthCredentialCleanupGate();
+    try {
+      if (auth) {
+        await handleLogout();
+      } else {
+        // LoginPage can be unmounted while a native auth Promise is still
+        // writing Secure Storage. Wait for that attempt before deleting the
+        // old credentials so cleanup remains the final writer.
+        await clearAuthState('login_change_server', { preserveSharedNavigation: false });
+      }
+      try { await clearServerUrl(); } catch { /* ignore */ }
+      setNativeServerUrl(null);
+    } finally {
+      releaseCleanupGate();
+    }
+  }, [auth, clearAuthState, handleLogout, holdAuthCredentialCleanupGate]);
 
   const handleSelectServer = useCallback(async (serverId: string, serverName?: string) => {
+    sharedOpenGenerationRef.current += 1;
+    setOpeningSharedEntryId(null);
     autoEntryRunRef.current++;
     setManualDashboard(false);
     setSelectedShareTarget(null);
@@ -4797,6 +4897,8 @@ export function App() {
   }, [handleSelectServer, navigateToSession, runVersionSensitiveAction, trans]);
 
   const handleBackToDashboard = useCallback(() => {
+    sharedOpenGenerationRef.current += 1;
+    setOpeningSharedEntryId(null);
     autoEntryRunRef.current++;
     setManualDashboard(true);
     localStorage.removeItem('rcc_server');
@@ -4860,17 +4962,41 @@ export function App() {
     );
   }
 
+  if (authCredentialCleanupPending) {
+    return (
+      <div
+        data-testid="auth-credential-cleanup-gate"
+        role="status"
+        aria-live="polite"
+        style={{
+          minHeight: '100vh',
+          display: 'flex',
+          flexDirection: 'column',
+          alignItems: 'center',
+          justifyContent: 'center',
+          gap: 12,
+          color: '#94a3b8',
+        }}
+      >
+        <div class="spinner" aria-hidden="true" />
+        <div>{trans('common.loading')}</div>
+      </div>
+    );
+  }
+
   if (!auth) {
     return (
       <LoginPage
         serverUrl={nativeServerUrl}
+        beginAuthAttempt={beginAuthAttempt}
         onLoginSuccess={(userId, url) => {
           const authState: AuthState = { userId, baseUrl: url };
+          authMutationGenerationRef.current += 1;
           configureExpectedUserId(userId);
           localStorage.setItem('rcc_auth', JSON.stringify(authState));
           setAuth(authState);
         }}
-        onChangeServer={isNative() ? () => setNativeServerUrl(null) : undefined}
+        onChangeServer={isNative() ? handleChangeServer : undefined}
       />
     );
   }

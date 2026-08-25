@@ -77,4 +77,35 @@ describe('tab-local hash state', () => {
       sharedEntryId: null,
     });
   });
+
+  it('fails closed for malformed or over-bounded tab snapshots', () => {
+    sessionStorage.setItem('rcc_tab_route_v1', '{not-json');
+    expect(readTabRouteState()).toEqual({ serverId: null, sessionName: null, sharedEntryId: null });
+
+    sessionStorage.setItem('rcc_tab_route_v1', JSON.stringify({
+      version: 2,
+      serverId: 'srv-current',
+      sessionName: 'deck_current_brain',
+      sharedEntryId: null,
+    }));
+    expect(readTabRouteState()).toEqual({ serverId: null, sessionName: null, sharedEntryId: null });
+
+    sessionStorage.setItem('rcc_tab_route_v1', JSON.stringify({
+      version: 1,
+      serverId: 's'.repeat(513),
+      sessionName: 'deck_current_brain',
+      sharedEntryId: null,
+    }));
+    expect(readTabRouteState()).toEqual({ serverId: null, sessionName: null, sharedEntryId: null });
+  });
+
+  it('clears the tab snapshot when navigation returns home', () => {
+    writeHashState('srv-current', 'deck_current_brain', null);
+    expect(readTabRouteState().serverId).toBe('srv-current');
+
+    writeHashState(null, null, null);
+
+    expect(readTabRouteState()).toEqual({ serverId: null, sessionName: null, sharedEntryId: null });
+    expect(sessionStorage.getItem('rcc_tab_route_v1')).toBeNull();
+  });
 });
