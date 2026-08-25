@@ -97,6 +97,23 @@ const execFileAsync = promisify(execFile);
 // fails explicitly at the deadline.
 const SEND_WAIT_MS = 30_000;
 const COVERAGE_CONTENDED_SEND_WAIT_MS = 60_000;
+/**
+ * Floor on how many times a wait actually looks, independent of the clock.
+ *
+ * The budget above is wall-clock, but what decides these waits is how many
+ * times the loop gets to observe. On a saturated worker a `setTimeout(10)` can
+ * return hundreds of milliseconds late, so the loop spends its whole 30s on a
+ * handful of observations and reports a timeout for work that was merely
+ * descheduled — the same case finishes in ~1.5s when run alone. Requiring a
+ * minimum number of looks makes the wait mean "I checked enough times", which
+ * is the actual intent. Costs ~2s extra on a genuinely absent send.
+ */
+const SEND_WAIT_MIN_POLLS = 200;
+
+/** True while either the clock or the observation floor still has budget left. */
+function waitBudgetRemains(start: number, maxMs: number, polls: number): boolean {
+  return Date.now() - start < maxMs || polls < SEND_WAIT_MIN_POLLS;
+}
 vi.setConfig({ testTimeout: 120_000, hookTimeout: 60_000 });
 
 async function makeChange(name: string, tasks = '- [ ] first\n- [x] second\n'): Promise<void> {
@@ -133,26 +150,30 @@ function describeOrchestratorActivity(): string {
 
 async function waitForSend(predicate: (msg: Record<string, unknown>) => boolean, maxMs = SEND_WAIT_MS): Promise<Record<string, unknown>> {
   const start = Date.now();
-  while (Date.now() - start < maxMs) {
-    const found = serverLinkMock.send.mock.calls.map((call) => call[0] as Record<string, unknown>).find(predicate);
+  const find = (): Record<string, unknown> | undefined =>
+    serverLinkMock.send.mock.calls.map((call) => call[0] as Record<string, unknown>).find(predicate);
+  for (let polls = 0; waitBudgetRemains(start, maxMs, polls); polls += 1) {
+    const found = find();
     if (found) return found;
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
+  const found = find();
+  if (found) return found;
   throw new Error(`Expected websocket send was not observed${describeOrchestratorActivity()}`);
 }
 
 async function waitForTransportSend(predicate: (text: string) => boolean, maxMs = SEND_WAIT_MS): Promise<string> {
   const start = Date.now();
-  while (Date.now() - start < maxMs) {
-    const found = transportSendMock.mock.calls.map((call) => String(call[0] ?? '')).find(predicate);
+  const find = (): string | undefined =>
+    transportSendMock.mock.calls.map((call) => String(call[0] ?? '')).find(predicate);
+  for (let polls = 0; waitBudgetRemains(start, maxMs, polls); polls += 1) {
+    const found = find();
     if (found) return found;
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
-  // Under a saturated CI worker, the final polling timer can resume after the
-  // deadline even though the send was recorded while that timer was delayed.
-  // Check once more before reporting a timeout instead of discarding it solely
-  // because the event loop crossed the wall-clock boundary.
-  const found = transportSendMock.mock.calls.map((call) => String(call[0] ?? '')).find(predicate);
+  // The last timer can also resume after the deadline with the send already
+  // recorded, so look once more rather than discard it for crossing the line.
+  const found = find();
   if (found) return found;
   throw new Error(`Expected transport send was not observed${describeOrchestratorActivity()}`);
 }
@@ -163,19 +184,21 @@ function transportSendCount(predicate: (text: string) => boolean): number {
 
 async function waitForTransportSendCount(predicate: (text: string) => boolean, count: number, maxMs = SEND_WAIT_MS): Promise<void> {
   const start = Date.now();
-  while (Date.now() - start < maxMs) {
+  for (let polls = 0; waitBudgetRemains(start, maxMs, polls); polls += 1) {
     if (transportSendCount(predicate) >= count) return;
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
+  if (transportSendCount(predicate) >= count) return;
   throw new Error(`Expected transport send count was not observed${describeOrchestratorActivity()}`);
 }
 
 async function waitForP2pStartCount(count: number, maxMs = SEND_WAIT_MS): Promise<void> {
   const start = Date.now();
-  while (Date.now() - start < maxMs) {
+  for (let polls = 0; waitBudgetRemains(start, maxMs, polls); polls += 1) {
     if (startP2pRunMock.mock.calls.length >= count) return;
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
+  if (startP2pRunMock.mock.calls.length >= count) return;
   throw new Error(`expected >= ${count} P2P starts, saw ${startP2pRunMock.mock.calls.length}`);
 }
 
