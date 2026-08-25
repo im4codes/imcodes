@@ -187,7 +187,7 @@ export interface FileDirectoryListRequest {
 export interface FileDirectoryEntry {
   name: string;
   path: string;
-  isDir: true;
+  isDir: boolean;
   hidden: boolean;
 }
 
@@ -531,7 +531,7 @@ export function validateControlledFileTransferResponse(
         || !hasOnlyKeys(entry, new Set(['name', 'path', 'isDir', 'hidden']))
         || !isBoundedString(entry.name, 1024)
         || !isBoundedString(entry.path, FILE_TRANSFER_PATH_MAX_BYTES)
-        || entry.isDir !== true
+        || typeof entry.isDir !== 'boolean'
         || typeof entry.hidden !== 'boolean') {
         return { ok: false, error: 'invalid_directory_entry' };
       }

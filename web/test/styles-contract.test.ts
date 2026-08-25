@@ -33,6 +33,23 @@ describe('styles.css regression contracts', () => {
     expect(controlRule).toMatch(/border-radius:\s*999px/);
   });
 
+  it('keeps the mobile remote desktop file manager viewport-bound and in document flow', () => {
+    const mobileStart = css.indexOf('@media (max-width: 720px)');
+    const mobileEnd = css.indexOf('@media (max-height: 520px)', mobileStart);
+    const mobileBlock = mobileStart >= 0 && mobileEnd > mobileStart
+      ? css.slice(mobileStart, mobileEnd)
+      : '';
+    expect(mobileBlock).toBeTruthy();
+    const drawerRule = mobileBlock.match(/\.remote-desktop-file-drawer\s*\{[^}]*\}/)?.[0];
+    expect(drawerRule).toMatch(/position:\s*fixed/);
+    expect(drawerRule).toMatch(/width:\s*calc\(100dvw - 16px\)/);
+    expect(drawerRule).toMatch(/display:\s*block/);
+    const explorerRule = mobileBlock.match(/\.remote-desktop-file-explorer\s*\{[^}]*\}/)?.[0];
+    expect(explorerRule).toMatch(/grid-template-columns:\s*minmax\(0, 1fr\)/);
+    const queueRule = mobileBlock.match(/\.remote-desktop-transfer-queue\s*\{[^}]*\}/)?.[0];
+    expect(queueRule).toMatch(/margin-top:\s*11px/);
+  });
+
   it('keeps the remote desktop clipboard actions compact', () => {
     const rule = css.match(/\.remote-desktop-toolbar \.remote-desktop-clipboard-switch button\s*\{[^}]*\}/)?.[0];
     expect(rule).toBeTruthy();

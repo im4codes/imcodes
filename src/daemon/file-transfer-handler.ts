@@ -976,7 +976,7 @@ function sendDirectoryListError(sender: FileTransferSender, requestId: string, e
   } satisfies FileDirectoryListError);
 }
 
-/** Controlled-node directory-only browser used by the integrated remote desktop picker. */
+/** Bounded controlled-node browser used by the integrated remote desktop file manager. */
 export async function handleFileDirectoryList(cmd: Record<string, unknown>, sender: FileTransferSender): Promise<void> {
   const parsed = validateFileDirectoryListRequest(cmd);
   const requestId = typeof cmd.requestId === 'string' ? cmd.requestId : '';
@@ -1015,14 +1015,17 @@ export async function handleFileDirectoryList(cmd: Record<string, unknown>, send
       throw new Error('not_directory');
     }
     const entries = (await readdir(canonical.realPath, { withFileTypes: true }))
-      .filter((entry) => entry.isDirectory())
+      .filter((entry) => entry.isDirectory() || entry.isFile())
       .map((entry): FileDirectoryEntry => ({
         name: entry.name,
         path: path.join(canonical.realPath, entry.name),
-        isDir: true,
+        isDir: entry.isDirectory(),
         hidden: entry.name.startsWith('.'),
       }))
-      .sort((a, b) => a.name === b.name ? 0 : a.name < b.name ? -1 : 1)
+      .sort((a, b) => {
+        if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
+        return a.name === b.name ? 0 : a.name < b.name ? -1 : 1;
+      })
       .slice(0, FILE_TRANSFER_DIRECTORY_MAX_ENTRIES);
     sender.send({
       type: FILE_TRANSFER_MSG.DIRECTORY_LIST_DONE,

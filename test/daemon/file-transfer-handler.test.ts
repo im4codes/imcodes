@@ -403,11 +403,11 @@ describe('file-transfer local handle hardening', () => {
     }));
   });
 
-  it('lists only child directories through the bounded directory picker', async () => {
+  it('lists child directories and regular files through the bounded remote file browser', async () => {
     const parent = path.join(rootDir, 'directory-picker');
     await mkdir(path.join(parent, 'visible'), { recursive: true });
     await mkdir(path.join(parent, '.hidden'), { recursive: true });
-    await writeFile(path.join(parent, 'ignored.txt'), 'not a directory');
+    await writeFile(path.join(parent, 'report.txt'), 'downloadable file');
     const transfer = await loadFileTransferHandler(fakeHome);
     const result = createServerLinkMock();
 
@@ -425,6 +425,7 @@ describe('file-transfer local handle hardening', () => {
       entries: [
         { name: '.hidden', path: path.join(await realpath(parent), '.hidden'), isDir: true, hidden: true },
         { name: 'visible', path: path.join(await realpath(parent), 'visible'), isDir: true, hidden: false },
+        { name: 'report.txt', path: path.join(await realpath(parent), 'report.txt'), isDir: false, hidden: false },
       ],
     }]);
   });

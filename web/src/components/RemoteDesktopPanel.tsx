@@ -242,6 +242,9 @@ export interface RemoteDesktopPanelProps {
 interface RemoteDesktopTransferRow {
   id: string;
   name: string;
+  direction: 'send' | 'fetch';
+  sourcePath: string;
+  destinationPath: string;
   progress: number;
   transport: FileUploadTransportMode;
   status: 'transferring' | 'done' | 'canceled' | 'error';
@@ -314,11 +317,11 @@ export function RemoteDesktopPanel({
   );
   const [transfers, setTransfers] = useState<RemoteDesktopTransferRow[]>([]);
   const [transferError, setTransferError] = useState<string | null>(null);
-  const [fetchPath, setFetchPath] = useState('');
   const [filePanelOpen, setFilePanelOpen] = useState(false);
   const [fileDrawerMinimized, setFileDrawerMinimized] = useState(false);
-  const [directoryPickerOpen, setDirectoryPickerOpen] = useState(false);
   const [destinationDirectory, setDestinationDirectory] = useState('');
+  const [selectedLocalFiles, setSelectedLocalFiles] = useState<File[]>([]);
+  const [selectedRemoteFile, setSelectedRemoteFile] = useState('');
   const [fileDropActive, setFileDropActive] = useState(false);
   const [mobileTextOpen, setMobileTextOpen] = useState(false);
   const [displayModeMenu, setDisplayModeMenu] = useState<DisplayModeMenuState | null>(null);
@@ -374,6 +377,25 @@ export function RemoteDesktopPanel({
   const commandMiddleDragPointerRef = useRef<number | null>(null);
   const forwardedPasteShortcutAtRef = useRef(0);
   const supportsDirectoryTransfer = Boolean(machine.capabilities?.includes(FILE_TRANSFER_DIRECTORY_CAPABILITY));
+  const handleRemotePathChange = useCallback((path: string) => {
+    const isRoot = path === FILE_TRANSFER_DIRECTORY_PATH.WINDOWS_DRIVES
+      || path === FILE_TRANSFER_DIRECTORY_PATH.WINDOWS_DRIVES_ROOT
+      || path === t('file_browser.this_pc');
+    setDestinationDirectory(isRoot ? '' : path);
+    setSelectedRemoteFile('');
+  }, [t]);
+  const handleRemoteSelectionChange = useCallback((path: string | null, isDirectory: boolean) => {
+    if (!path) {
+      setSelectedRemoteFile('');
+      return;
+    }
+    if (isDirectory) {
+      setDestinationDirectory(path);
+      setSelectedRemoteFile('');
+      return;
+    }
+    setSelectedRemoteFile(path);
+  }, []);
   if (!connectionManager && !ownedConnectionManagerRef.current) {
     ownedConnectionManagerRef.current = new RemoteDesktopConnectionManager();
   }
@@ -1522,6 +1544,9 @@ export function RemoteDesktopPanel({
     setTransfers((current) => [...current, {
       id,
       name: file.name || 'file',
+      direction: 'send',
+      sourcePath: file.name || 'file',
+      destinationPath: destinationDirectory || t('remote_desktop.compatible_upload_location'),
       progress: 0,
       transport: FILE_UPLOAD_TRANSPORT_MODE.CONNECTING,
       status: 'transferring',
@@ -1559,6 +1584,27 @@ export function RemoteDesktopPanel({
     }
   };
 
+  const stageLocalFiles = (files: readonly File[]) => {
+    setSelectedLocalFiles((current) => {
+      const next = [...current];
+      const known = new Set(current.map((file) => `${file.name}:${file.size}:${file.lastModified}`));
+      for (const file of files) {
+        const key = `${file.name}:${file.size}:${file.lastModified}`;
+        if (known.has(key)) continue;
+        known.add(key);
+        next.push(file);
+      }
+      return next;
+    });
+  };
+
+  const sendSelectedFiles = () => {
+    if (selectedLocalFiles.length === 0) return;
+    const files = selectedLocalFiles;
+    setSelectedLocalFiles([]);
+    void sendFiles(files);
+  };
+
   const openMobileKeyboard = () => {
     if (!snapshot.inputEnabled) return;
     setMobileTextOpen(true);
@@ -1587,15 +1633,18 @@ export function RemoteDesktopPanel({
     mobileTextInputRef.current?.focus({ preventScroll: true });
   };
 
-  const fetchFile = async () => {
-    const path = fetchPath.trim();
+  const fetchFile = async (requestedPath = selectedRemoteFile) => {
+    const path = requestedPath.trim();
     if (!path) return;
     const id = crypto.randomUUID();
     const controller = new AbortController();
     transferControllersRef.current.set(id, controller);
     setTransfers((current) => [...current, {
       id,
-      name: path,
+      name: path.split(/[/\\]/).pop() || path,
+      direction: 'fetch',
+      sourcePath: path,
+      destinationPath: t('remote_desktop.browser_downloads'),
       progress: 0,
       transport: FILE_UPLOAD_TRANSPORT_MODE.RELAY,
       status: 'transferring',
@@ -2189,10 +2238,7 @@ export function RemoteDesktopPanel({
                   class="remote-desktop-file-control"
                   aria-label={t('remote_desktop.minimize_files')}
                   title={t('remote_desktop.minimize_files')}
-                  onClick={() => {
-                    setDirectoryPickerOpen(false);
-                    setFileDrawerMinimized(true);
-                  }}
+                  onClick={() => setFileDrawerMinimized(true)}
                 >
                   <svg viewBox="0 0 16 16" aria-hidden="true">
                     <path d="M3.5 8h9" />
@@ -2203,10 +2249,7 @@ export function RemoteDesktopPanel({
                   class="remote-desktop-file-control is-close"
                   aria-label={t('remote_desktop.close_files')}
                   title={t('remote_desktop.close_files')}
-                  onClick={() => {
-                    setDirectoryPickerOpen(false);
-                    setFilePanelOpen(false);
-                  }}
+                  onClick={() => setFilePanelOpen(false)}
                 >
                   <svg viewBox="0 0 16 16" aria-hidden="true">
                     <path d="m4.5 4.5 7 7m0-7-7 7" />
@@ -2215,22 +2258,6 @@ export function RemoteDesktopPanel({
               </div>
             </div>
 
-            {supportsDirectoryTransfer ? (
-              <div class="remote-desktop-file-destination">
-                <span>{t('remote_desktop.destination_folder')}</span>
-                <code title={destinationDirectory || undefined}>
-                  {destinationDirectory || t('remote_desktop.choose_destination_folder')}
-                </code>
-                <button type="button" onClick={() => setDirectoryPickerOpen(true)}>
-                  {t('remote_desktop.choose_folder')}
-                </button>
-              </div>
-            ) : (
-              <div class="remote-desktop-file-compatibility">
-                {t('remote_desktop.file_destination_upgrade_hint')}
-              </div>
-            )}
-
             <input
               ref={fileInputRef}
               type="file"
@@ -2238,108 +2265,175 @@ export function RemoteDesktopPanel({
               multiple
               onChange={(event) => {
                 const files = Array.from((event.currentTarget as HTMLInputElement).files ?? []);
-                if (files.length > 0) void sendFiles(files);
+                if (files.length > 0) stageLocalFiles(files);
                 (event.currentTarget as HTMLInputElement).value = '';
               }}
             />
-            <button
-              type="button"
-              class={`remote-desktop-file-drop${fileDropActive ? ' is-active' : ''}`}
-              disabled={supportsDirectoryTransfer && !destinationDirectory}
-              onClick={() => fileInputRef.current?.click()}
-              onDragEnter={(event) => {
-                event.preventDefault();
-                if (!supportsDirectoryTransfer || destinationDirectory) setFileDropActive(true);
-              }}
-              onDragOver={(event) => {
-                event.preventDefault();
-                if (!supportsDirectoryTransfer || destinationDirectory) {
-                  if (event.dataTransfer) event.dataTransfer.dropEffect = 'copy';
-                  setFileDropActive(true);
-                }
-              }}
-              onDragLeave={(event) => {
-                if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setFileDropActive(false);
-              }}
-              onDrop={(event) => {
-                event.preventDefault();
-                setFileDropActive(false);
-                if (supportsDirectoryTransfer && !destinationDirectory) return;
-                const files = Array.from(event.dataTransfer?.files ?? []);
-                if (files.length > 0) void sendFiles(files);
-              }}
-            >
-              <span aria-hidden="true">⇧</span>
-              <strong>{supportsDirectoryTransfer && !destinationDirectory
-                ? t('remote_desktop.choose_destination_first')
-                : t('remote_desktop.drop_files_here')}</strong>
-              <small>{t('remote_desktop.drop_files_hint')}</small>
-            </button>
-
-            <div class="remote-desktop-fetch-row">
-              <input
-                value={fetchPath}
-                onInput={(event) => setFetchPath((event.currentTarget as HTMLInputElement).value)}
-                placeholder={t('remote_desktop.fetch_path')}
-                aria-label={t('remote_desktop.fetch_path')}
-              />
-              <button type="button" disabled={!fetchPath.trim()} onClick={() => { void fetchFile(); }}>
-                {t('remote_desktop.fetch_file')}
-              </button>
-            </div>
-
-            <div class="remote-desktop-transfer-list" aria-live="polite">
-              {transfers.map((transfer) => (
-                <div class="remote-desktop-transfer-row" key={transfer.id}>
-                  <span class="remote-desktop-transfer-name">{transfer.name}</span>
-                  <span>{t(`upload.transport.${transfer.transport}`)}</span>
-                  <progress
-                    value={transfer.progress}
-                    max={100}
-                    aria-label={t('remote_desktop.transfer_progress', { progress: transfer.progress })}
-                  />
-                  <span class="remote-desktop-transfer-meta">
-                    {transfer.progress}%
-                    {transfer.status === 'transferring' && transfer.bytesPerSecond
-                      ? ` · ${formatByteRate(transfer.bytesPerSecond)}`
-                      : ''}
-                    {transfer.sizeBytes ? ` · ${formatByteSize(transfer.sizeBytes)}` : ''}
-                  </span>
-                  <span>{t(`remote_desktop.transfer_status_${transfer.status}`)}</span>
-                  {transfer.status === 'transferring' && (
+            <div class="remote-desktop-file-explorer">
+              <section class="remote-desktop-file-pane remote-desktop-file-pane-local" aria-label={t('remote_desktop.local_files')}>
+                <div class="remote-desktop-file-pane-head">
+                  <div>
+                    <span>{t('remote_desktop.local_badge')}</span>
+                    <strong>{t('remote_desktop.local_files')}</strong>
+                  </div>
+                  <div class="remote-desktop-file-pane-actions">
+                    <button type="button" onClick={() => fileInputRef.current?.click()}>
+                      {t('remote_desktop.choose_local_files')}
+                    </button>
                     <button
                       type="button"
-                      aria-label={t('remote_desktop.cancel_transfer', { name: transfer.name })}
-                      onClick={() => cancelTransfer(transfer.id)}
-                    >{t('upload.cancel')}</button>
-                  )}
+                      disabled={selectedLocalFiles.length === 0}
+                      onClick={() => setSelectedLocalFiles([])}
+                    >{t('remote_desktop.clear_selection')}</button>
+                  </div>
                 </div>
-              ))}
-            </div>
-            {transferError && <span role="alert">{transferError}</span>}
-
-            {directoryPickerOpen && (
-              <div class="remote-desktop-directory-picker">
-                <FileBrowser
-                  key={`${machine.serverId}:${destinationDirectory}`}
-                  ws={machineDirectoryAdapter.asWsClient()}
-                  mode="dir-only"
-                  layout="panel"
-                  initialPath={destinationDirectory || FILE_TRANSFER_DIRECTORY_PATH.WINDOWS_DRIVES}
-                  serverId={`${machine.serverId}:remote-directory`}
-                  readOnly
-                  onConfirm={(paths) => {
-                    const selected = paths[0];
-                    if (!selected
-                      || selected === FILE_TRANSFER_DIRECTORY_PATH.WINDOWS_DRIVES
-                      || selected === FILE_TRANSFER_DIRECTORY_PATH.WINDOWS_DRIVES_ROOT) return;
-                    setDestinationDirectory(selected);
-                    setDirectoryPickerOpen(false);
+                <div class="remote-desktop-file-path">{t('remote_desktop.browser_selected_files')}</div>
+                <div
+                  class={`remote-desktop-local-file-list${fileDropActive ? ' is-active' : ''}`}
+                  onDragEnter={(event) => {
+                    event.preventDefault();
+                    setFileDropActive(true);
                   }}
-                  onClose={() => setDirectoryPickerOpen(false)}
-                />
+                  onDragOver={(event) => {
+                    event.preventDefault();
+                    if (event.dataTransfer) event.dataTransfer.dropEffect = 'copy';
+                    setFileDropActive(true);
+                  }}
+                  onDragLeave={(event) => {
+                    if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setFileDropActive(false);
+                  }}
+                  onDrop={(event) => {
+                    event.preventDefault();
+                    setFileDropActive(false);
+                    stageLocalFiles(Array.from(event.dataTransfer?.files ?? []));
+                  }}
+                >
+                  {selectedLocalFiles.length === 0 ? (
+                    <button type="button" class="remote-desktop-file-empty" onClick={() => fileInputRef.current?.click()}>
+                      <strong>{t('remote_desktop.drop_files_here')}</strong>
+                      <small>{t('remote_desktop.local_selection_hint')}</small>
+                    </button>
+                  ) : selectedLocalFiles.map((file) => (
+                    <div class="remote-desktop-local-file-row" key={`${file.name}:${file.size}:${file.lastModified}`}>
+                      <span title={file.name}>{file.name}</span>
+                      <small>{formatByteSize(file.size)}</small>
+                      <button
+                        type="button"
+                        aria-label={t('remote_desktop.remove_selected_file', { name: file.name })}
+                        onClick={() => setSelectedLocalFiles((current) => current.filter((candidate) => candidate !== file))}
+                      >{t('remote_desktop.remove_file')}</button>
+                    </div>
+                  ))}
+                </div>
+              </section>
+
+              <div class="remote-desktop-file-direction-actions" aria-label={t('remote_desktop.transfer_actions')}>
+                <button
+                  type="button"
+                  aria-label={t('remote_desktop.send_to_remote')}
+                  disabled={selectedLocalFiles.length === 0 || (supportsDirectoryTransfer && !destinationDirectory)}
+                  onClick={sendSelectedFiles}
+                >
+                  <strong>{t('remote_desktop.send_to_remote')}</strong>
+                  <small>{selectedLocalFiles.length > 0
+                    ? t('remote_desktop.selected_files_count', { count: selectedLocalFiles.length })
+                    : t('remote_desktop.select_local_files')}</small>
+                </button>
+                <button
+                  type="button"
+                  aria-label={t('remote_desktop.fetch_to_local')}
+                  disabled={!selectedRemoteFile}
+                  onClick={() => { void fetchFile(); }}
+                >
+                  <strong>{t('remote_desktop.fetch_to_local')}</strong>
+                  <small>{selectedRemoteFile
+                    ? selectedRemoteFile.split(/[/\\]/).pop()
+                    : t('remote_desktop.select_remote_file')}</small>
+                </button>
               </div>
-            )}
+
+              <section class="remote-desktop-file-pane remote-desktop-file-pane-remote" aria-label={t('remote_desktop.remote_files')}>
+                <div class="remote-desktop-file-pane-head">
+                  <div>
+                    <span class="is-remote">{t('remote_desktop.remote_badge')}</span>
+                    <strong>{machine.displayName}</strong>
+                  </div>
+                  <small>{supportsDirectoryTransfer
+                    ? t('remote_desktop.remote_folder_ready')
+                    : t('remote_desktop.file_destination_upgrade_hint')}</small>
+                </div>
+                <div class="remote-desktop-file-path" title={destinationDirectory || undefined}>
+                  {destinationDirectory || t('remote_desktop.choose_destination_folder')}
+                </div>
+                <div class="remote-desktop-remote-browser">
+                  <FileBrowser
+                    ws={machineDirectoryAdapter.asWsClient()}
+                    mode="file-single"
+                    layout="panel"
+                    initialPath={FILE_TRANSFER_DIRECTORY_PATH.WINDOWS_DRIVES}
+                    serverId={machine.serverId}
+                    readOnly
+                    hideFooter
+                    hideBreadcrumbConfirm
+                    onCurrentPathChange={handleRemotePathChange}
+                    onSelectedPathChange={handleRemoteSelectionChange}
+                    onPreviewFile={() => {}}
+                    onConfirm={(paths) => setSelectedRemoteFile(paths[0] ?? '')}
+                  />
+                </div>
+              </section>
+            </div>
+
+            <section class="remote-desktop-transfer-queue" aria-label={t('remote_desktop.transfer_queue')}>
+              <div class="remote-desktop-transfer-queue-head">
+                <div>
+                  <strong>{t('remote_desktop.transfer_queue')}</strong>
+                  <span>{t('remote_desktop.transfer_queue_count', { count: transfers.length })}</span>
+                </div>
+                <button
+                  type="button"
+                  disabled={!transfers.some((transfer) => transfer.status !== 'transferring')}
+                  onClick={() => setTransfers((current) => current.filter((transfer) => transfer.status === 'transferring'))}
+                >{t('remote_desktop.clear_completed_transfers')}</button>
+              </div>
+              <div class="remote-desktop-transfer-list" aria-live="polite">
+                {transfers.length === 0 ? (
+                  <div class="remote-desktop-transfer-empty">{t('remote_desktop.no_transfer_tasks')}</div>
+                ) : transfers.map((transfer) => (
+                  <div class="remote-desktop-transfer-row" key={transfer.id}>
+                    <span class="remote-desktop-transfer-name">{transfer.name}</span>
+                    <span class={`remote-desktop-transfer-direction is-${transfer.direction}`}>
+                      {t(`remote_desktop.transfer_direction_${transfer.direction}`)}
+                    </span>
+                    <span>{t(`upload.transport.${transfer.transport}`)}</span>
+                    <progress
+                      value={transfer.progress}
+                      max={100}
+                      aria-label={t('remote_desktop.transfer_progress', { progress: transfer.progress })}
+                    />
+                    <span class="remote-desktop-transfer-meta">
+                      {transfer.progress}%
+                      {transfer.status === 'transferring' && transfer.bytesPerSecond
+                        ? ` · ${formatByteRate(transfer.bytesPerSecond)}`
+                        : ''}
+                      {transfer.sizeBytes ? ` · ${formatByteSize(transfer.sizeBytes)}` : ''}
+                    </span>
+                    <span class="remote-desktop-transfer-paths" title={`${transfer.sourcePath} → ${transfer.destinationPath}`}>
+                      {transfer.sourcePath} → {transfer.destinationPath}
+                    </span>
+                    <span>{t(`remote_desktop.transfer_status_${transfer.status}`)}</span>
+                    {transfer.status === 'transferring' && (
+                      <button
+                        type="button"
+                        aria-label={t('remote_desktop.cancel_transfer', { name: transfer.name })}
+                        onClick={() => cancelTransfer(transfer.id)}
+                      >{t('upload.cancel')}</button>
+                    )}
+                  </div>
+                ))}
+              </div>
+              {transferError && <span role="alert">{transferError}</span>}
+            </section>
           </aside>
         )}
 

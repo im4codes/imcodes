@@ -9940,9 +9940,9 @@ button.quick-agent-delegation-preset.active {
   z-index: 12;
   right: 12px;
   bottom: 58px;
-  width: min(560px, calc(100% - 24px));
-  max-height: min(680px, calc(100% - 108px));
-  overflow: auto;
+  width: min(1120px, calc(100% - 24px));
+  max-height: min(760px, calc(100% - 108px));
+  overflow: hidden;
   padding: 12px;
   display: grid;
   gap: 11px;
@@ -10125,6 +10125,295 @@ button.quick-agent-delegation-preset.active {
   min-height: 340px;
 }
 
+.remote-desktop-file-explorer {
+  min-height: 360px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 126px minmax(0, 1fr);
+  gap: 10px;
+}
+
+.remote-desktop-file-pane {
+  min-width: 0;
+  min-height: 360px;
+  overflow: hidden;
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr);
+  background: rgb(3 15 25 / 76%);
+  border: 1px solid rgb(89 186 226 / 24%);
+  border-radius: 10px;
+}
+
+.remote-desktop-file-pane-head {
+  min-width: 0;
+  min-height: 48px;
+  padding: 8px 10px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  border-bottom: 1px solid rgb(90 190 230 / 16%);
+}
+
+.remote-desktop-file-pane-head > div:first-child {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.remote-desktop-file-pane-head strong {
+  overflow: hidden;
+  color: #eaf9ff;
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.remote-desktop-file-pane-head span {
+  flex: 0 0 auto;
+  padding: 2px 7px;
+  color: #b7cad5;
+  background: rgb(124 150 168 / 18%);
+  border: 1px solid rgb(154 181 199 / 18%);
+  border-radius: 5px;
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.remote-desktop-file-pane-head span.is-remote {
+  color: #8ff3c1;
+  background: rgb(41 191 120 / 14%);
+  border-color: rgb(72 220 148 / 26%);
+}
+
+.remote-desktop-file-pane-head > small {
+  max-width: 48%;
+  overflow: hidden;
+  color: #789db3;
+  font-size: 10px;
+  text-align: right;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.remote-desktop-file-pane-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.remote-desktop-file-pane-actions button {
+  min-height: 28px;
+  padding: 4px 8px;
+  font-size: 10.5px;
+}
+
+.remote-desktop-file-path {
+  min-width: 0;
+  padding: 6px 10px;
+  overflow: hidden;
+  color: #8fdcf8;
+  background: rgb(2 12 20 / 78%);
+  border-bottom: 1px solid rgb(90 190 230 / 12%);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 10.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.remote-desktop-local-file-list {
+  min-height: 0;
+  overflow: auto;
+  padding: 5px;
+  transition: background .15s ease, box-shadow .15s ease;
+}
+
+.remote-desktop-local-file-list.is-active {
+  background: rgb(18 73 98 / 52%);
+  box-shadow: inset 0 0 0 1px rgb(100 221 255 / 42%);
+}
+
+.remote-desktop-file-empty {
+  width: 100%;
+  height: 100%;
+  min-height: 260px !important;
+  display: grid;
+  place-content: center;
+  gap: 5px;
+  color: #bcecff !important;
+  background: transparent !important;
+  border: 1px dashed rgb(91 208 255 / 36%) !important;
+}
+
+.remote-desktop-file-empty small {
+  color: #7699ac;
+  font-size: 10.5px;
+}
+
+.remote-desktop-local-file-row {
+  min-width: 0;
+  min-height: 34px;
+  padding: 5px 6px 5px 9px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 8px;
+  border-bottom: 1px solid rgb(109 178 211 / 10%);
+}
+
+.remote-desktop-local-file-row > span {
+  overflow: hidden;
+  color: #d8edf7;
+  font-size: 11.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.remote-desktop-local-file-row > small {
+  color: #7897aa;
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+}
+
+.remote-desktop-local-file-row > button {
+  min-height: 26px;
+  padding: 3px 7px;
+  font-size: 10px;
+}
+
+.remote-desktop-file-direction-actions {
+  display: grid;
+  align-content: center;
+  gap: 10px;
+}
+
+.remote-desktop-file-direction-actions button {
+  min-width: 0;
+  min-height: 64px;
+  padding: 9px 8px;
+  display: grid;
+  place-content: center;
+  gap: 4px;
+  border-color: rgb(83 198 241 / 42%);
+}
+
+.remote-desktop-file-direction-actions button:not(:disabled):hover {
+  background: #174866;
+  border-color: rgb(105 220 255 / 74%);
+}
+
+.remote-desktop-file-direction-actions strong {
+  color: #dff8ff;
+  font-size: 11.5px;
+}
+
+.remote-desktop-file-direction-actions small {
+  max-width: 105px;
+  overflow: hidden;
+  color: #7fa4b8;
+  font-size: 9.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.remote-desktop-remote-browser {
+  min-height: 0;
+  overflow: hidden;
+}
+
+.remote-desktop-remote-browser > .fb-panel {
+  height: 100%;
+  color: #dcecf4;
+  background: rgb(3 15 25 / 42%);
+}
+
+.remote-desktop-remote-browser .fb-nav-stack {
+  border-top: 0;
+}
+
+.remote-desktop-transfer-queue {
+  min-height: 118px;
+  max-height: 230px;
+  overflow: hidden;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  background: rgb(3 15 25 / 76%);
+  border: 1px solid rgb(89 186 226 / 20%);
+  border-radius: 10px;
+}
+
+.remote-desktop-transfer-queue-head {
+  min-height: 42px;
+  padding: 7px 9px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  border-bottom: 1px solid rgb(90 190 230 / 15%);
+}
+
+.remote-desktop-transfer-queue-head > div {
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.remote-desktop-transfer-queue-head strong {
+  color: #eaf9ff;
+  font-size: 12px;
+}
+
+.remote-desktop-transfer-queue-head span {
+  color: #7898aa;
+  font-size: 10.5px;
+}
+
+.remote-desktop-transfer-queue-head button {
+  min-height: 28px;
+  padding: 4px 8px;
+  font-size: 10.5px;
+}
+
+.remote-desktop-file-drawer .remote-desktop-transfer-list {
+  max-height: none;
+  min-height: 0;
+  overflow: auto;
+  padding: 0 6px 6px;
+}
+
+.remote-desktop-transfer-empty {
+  min-height: 70px;
+  display: grid;
+  place-items: center;
+  color: #65889b;
+  font-size: 11px;
+}
+
+.remote-desktop-transfer-direction {
+  padding: 2px 6px;
+  color: #8ee3ff;
+  background: rgb(37 143 185 / 16%);
+  border: 1px solid rgb(79 193 235 / 22%);
+  border-radius: 5px;
+  font-size: 9.5px;
+  white-space: nowrap;
+}
+
+.remote-desktop-transfer-direction.is-fetch {
+  color: #8ff0bf;
+  background: rgb(40 169 106 / 14%);
+  border-color: rgb(71 211 139 / 22%);
+}
+
+.remote-desktop-transfer-paths {
+  min-width: 0;
+  overflow: hidden;
+  color: #7898aa;
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .remote-desktop-diagnostics,
 .remote-desktop-files {
   display: flex;
@@ -10175,9 +10464,12 @@ button.quick-agent-delegation-preset.active {
 
 .remote-desktop-transfer-row {
   display: grid;
-  grid-template-columns: minmax(90px, 1fr) auto minmax(90px, 180px) auto auto;
+  grid-template-columns: minmax(110px, 1fr) auto auto minmax(90px, 150px) auto minmax(130px, 1.2fr) auto auto;
   align-items: center;
   gap: 8px;
+  min-height: 38px;
+  padding: 5px 4px;
+  border-bottom: 1px solid rgb(109 178 211 / 9%);
 }
 
 .remote-desktop-transfer-name {
@@ -10247,9 +10539,51 @@ button.quick-agent-delegation-preset.active {
   }
 
   .remote-desktop-file-drawer {
-    inset: 92px 8px 8px;
-    width: auto;
+    position: fixed;
+    inset: 92px auto 8px 8px;
+    width: calc(100dvw - 16px);
+    max-width: calc(100dvw - 16px);
     max-height: none;
+    overflow: auto;
+    display: block;
+  }
+
+  .remote-desktop-file-explorer {
+    min-height: 0;
+    grid-template-columns: minmax(0, 1fr);
+    margin-top: 11px;
+  }
+
+  .remote-desktop-file-pane {
+    min-height: 300px;
+  }
+
+  .remote-desktop-file-direction-actions {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
+  }
+
+  .remote-desktop-file-direction-actions button {
+    min-height: 54px;
+  }
+
+  .remote-desktop-file-direction-actions small {
+    max-width: 36vw;
+  }
+
+  .remote-desktop-transfer-queue {
+    max-height: 300px;
+    margin-top: 11px;
+  }
+
+  .remote-desktop-transfer-row {
+    grid-template-columns: minmax(100px, 1fr) auto auto;
+  }
+
+  .remote-desktop-transfer-row progress,
+  .remote-desktop-transfer-meta,
+  .remote-desktop-transfer-paths {
+    grid-column: 1 / -1;
   }
 
   .remote-desktop-file-destination {

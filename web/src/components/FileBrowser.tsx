@@ -155,6 +155,12 @@ export interface FileBrowserProps {
   scopeToSessionRoot?: boolean;
   /** Hide mutation controls while preserving browse, preview, and download. */
   readOnly?: boolean;
+  /** Report the current single-selection to an embedded host control. */
+  onSelectedPathChange?: (path: string | null, isDirectory: boolean) => void;
+  /** Report directory navigation so an embedded uploader can target it. */
+  onCurrentPathChange?: (path: string) => void;
+  /** Embedded hosts may provide their own primary action outside the browser. */
+  hideBreadcrumbConfirm?: boolean;
   onConfirm: (paths: string[]) => void;
   onClose?: () => void;
   /** Called after a new directory is successfully created. */
@@ -495,6 +501,9 @@ export function FileBrowser({
   sessionName,
   scopeToSessionRoot = false,
   readOnly = false,
+  onSelectedPathChange,
+  onCurrentPathChange,
+  hideBreadcrumbConfirm = false,
 }: FileBrowserProps) {
   const { t } = useTranslation();
   const includeFiles = mode !== 'dir-only';
@@ -526,6 +535,7 @@ export function FileBrowser({
   const navigateToRef = useRef<(path: string) => void>(() => {});
   const currentLabelRef = useRef(currentLabel);
   useEffect(() => { currentLabelRef.current = currentLabel; }, [currentLabel]);
+  useEffect(() => { onCurrentPathChange?.(currentLabel); }, [currentLabel, onCurrentPathChange]);
   const dataRef = useRef(data);
   useEffect(() => { dataRef.current = data; }, [data]);
   const [error, setError] = useState<string | null>(null);
@@ -1578,12 +1588,13 @@ export function FileBrowser({
     } else {
       setSelectedPaths(new Set([nodeId]));
     }
+    onSelectedPathChange?.(nodeId, isDir);
     if (isDir) {
       const path = nodeId.split(/[/\\]/).pop() || nodeId;
       void path;
       setCurrentLabel(nodeId);
     }
-  }, [mode, isMulti]);
+  }, [mode, isMulti, onSelectedPathChange]);
 
   const handlePreview = useCallback((filePath: string) => {
     if (preview.status !== 'loading' || (preview as { path: string }).path !== filePath) {
@@ -2318,14 +2329,16 @@ export function FileBrowser({
             aria-label={copiedPath === currentLabel ? t('fileBrowser.copied') : t('fileBrowser.copyPath')}
             onClick={copyCurrentPath}
           >{copiedPath === currentLabel ? '✓' : '⧉'}</button>
-          <button
-            type="button"
-            class="fb-breadcrumb-action is-primary"
-            aria-label={confirmLabel}
-            disabled={(mode === 'dir-only' && isAtDrives)
-              || (mode !== 'dir-only' && selectedPaths.size === 0)}
-            onClick={handleConfirm}
-          >✓</button>
+          {!hideBreadcrumbConfirm && (
+            <button
+              type="button"
+              class="fb-breadcrumb-action is-primary"
+              aria-label={confirmLabel}
+              disabled={(mode === 'dir-only' && isAtDrives)
+                || (mode !== 'dir-only' && selectedPaths.size === 0)}
+              onClick={handleConfirm}
+            >✓</button>
+          )}
         </div>
       </div>
     </div>

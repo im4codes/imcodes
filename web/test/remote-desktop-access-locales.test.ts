@@ -20,6 +20,15 @@ const requiredGuest = [
   'waiting_help', 'try_again', 'generic_error',
 ] as const;
 
+const requiredFileTransfer = [
+  'local_files', 'remote_files', 'local_badge', 'remote_badge', 'choose_local_files',
+  'clear_selection', 'local_selection_hint', 'browser_selected_files', 'remove_selected_file',
+  'remove_file', 'transfer_actions', 'send_to_remote', 'fetch_to_local', 'selected_files_count',
+  'select_local_files', 'select_remote_file', 'remote_folder_ready', 'compatible_upload_location',
+  'browser_downloads', 'transfer_queue', 'transfer_queue_count', 'clear_completed_transfers',
+  'no_transfer_tasks', 'transfer_direction_send', 'transfer_direction_fetch',
+] as const;
+
 describe('remote desktop access locale coverage', () => {
   it('ships owner and guest access labels in all supported locales', () => {
     for (const locale of [en, es, ja, ko, ru, zhCN, zhTW]) {
@@ -30,6 +39,10 @@ describe('remote desktop access locale coverage', () => {
       for (const key of requiredGuest) {
         expect(locale.remote_desktop.guest[key]).toEqual(expect.any(String));
         expect(locale.remote_desktop.guest[key].length).toBeGreaterThan(0);
+      }
+      for (const key of requiredFileTransfer) {
+        expect(locale.remote_desktop[key]).toEqual(expect.any(String));
+        expect(locale.remote_desktop[key].length).toBeGreaterThan(0);
       }
     }
   });

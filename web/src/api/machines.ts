@@ -163,7 +163,7 @@ export async function listMachineDirectories(
     const candidate = entry as Partial<FileDirectoryEntry>;
     return typeof candidate.name === 'string'
       && typeof candidate.path === 'string'
-      && candidate.isDir === true
+      && typeof candidate.isDir === 'boolean'
       && typeof candidate.hidden === 'boolean';
   });
   if (entries.length !== result.entries.length) throw new Error('machine_file_list_failed');

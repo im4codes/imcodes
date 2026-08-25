@@ -225,6 +225,32 @@ describe('FileBrowser', () => {
     expect(directFileTransferMocks.prewarmDirectFileLease).not.toHaveBeenCalled();
   });
 
+  it('reports embedded navigation and selection while the host owns the primary action', async () => {
+    const { ws, respond } = makeWsFactory();
+    const onCurrentPathChange = vi.fn();
+    const onSelectedPathChange = vi.fn();
+    const view = render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        hideFooter
+        hideBreadcrumbConfirm
+        onCurrentPathChange={onCurrentPathChange}
+        onSelectedPathChange={onSelectedPathChange}
+        onPreviewFile={() => {}}
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    expect(onCurrentPathChange).toHaveBeenCalledWith('/home/user');
+    act(() => respond([{ name: 'report.txt', isDir: false }], '/home/user'));
+    fireEvent.click(await view.findByText('report.txt'));
+    expect(onSelectedPathChange).toHaveBeenCalledWith('/home/user/report.txt', false);
+    expect(view.queryByRole('button', { name: 'Select' })).toBeNull();
+  });
+
   it('starts preview download only from the clicked preview handle', async () => {
     const { ws } = makeWsFactory();
     const view = render(

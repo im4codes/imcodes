@@ -31,6 +31,10 @@ const stop = vi.fn();
 const { uploadFileWithDirectFallback } = vi.hoisted(() => ({
   uploadFileWithDirectFallback: vi.fn(),
 }));
+const fileApiMocks = vi.hoisted(() => ({
+  downloadAttachment: vi.fn(),
+  createMachineFileHandle: vi.fn(),
+}));
 const directoryAdapters = vi.hoisted(() => [] as Array<{
   serverId: string;
   destroy: ReturnType<typeof vi.fn>;
@@ -97,7 +101,7 @@ vi.mock('../src/remote-desktop-client.js', () => ({
 }));
 
 vi.mock('../src/api.js', () => ({
-  downloadAttachment: vi.fn(),
+  downloadAttachment: fileApiMocks.downloadAttachment,
 }));
 
 vi.mock('../src/direct-file-transfer.js', () => ({
@@ -117,7 +121,7 @@ vi.mock('../src/direct-file-transfer.js', () => ({
 }));
 
 vi.mock('../src/api/machines.js', () => ({
-  createMachineFileHandle: vi.fn(),
+  createMachineFileHandle: fileApiMocks.createMachineFileHandle,
   listMachineDirectories: vi.fn(),
 }));
 
@@ -129,6 +133,23 @@ vi.mock('../src/machine-directory-ws-adapter.js', () => ({
     }
     asWsClient() { return {}; }
   },
+}));
+
+vi.mock('../src/components/FileBrowser.js', () => ({
+  FileBrowser: (props: {
+    onCurrentPathChange?(path: string): void;
+    onSelectedPathChange?(path: string | null, isDirectory: boolean): void;
+  }) => (
+    <div data-testid="remote-file-browser">
+      <button
+        type="button"
+        onClick={() => {
+          props.onCurrentPathChange?.('C:\\Users\\admin\\Desktop');
+          props.onSelectedPathChange?.('C:\\Users\\admin\\Desktop\\report.txt', false);
+        }}
+      >select-remote-file</button>
+    </div>
+  ),
 }));
 
 import { RemoteDesktopPanel } from '../src/components/RemoteDesktopPanel.js';
@@ -520,6 +541,8 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     const file = new File(['payload'], 'report.txt', { type: 'text/plain' });
     Object.defineProperty(input, 'files', { value: [file], configurable: true });
     act(() => input.dispatchEvent(new Event('change', { bubbles: true })));
+    expect(uploadFileWithDirectFallback).not.toHaveBeenCalled();
+    act(() => (getByRole('button', { name: 'remote_desktop.send_to_remote' }) as HTMLButtonElement).click());
 
     await vi.waitFor(() => expect(container.textContent).toContain('upload.transport.direct'));
     expect((container.querySelector('progress') as HTMLProgressElement).value).toBe(33);
@@ -548,8 +571,29 @@ describe('RemoteDesktopPanel mobile gestures', () => {
       configurable: true,
     });
     act(() => input.dispatchEvent(new Event('change', { bubbles: true })));
+    act(() => (getByRole('button', { name: 'remote_desktop.send_to_remote' }) as HTMLButtonElement).click());
     await vi.waitFor(() => expect(container.textContent).toContain('upload.transport.relay'));
     await vi.waitFor(() => expect(container.textContent).toContain('remote_desktop.transfer_status_done'));
+  });
+
+  it('uses the embedded remote file selection for an explicit fetch action', async () => {
+    fileApiMocks.createMachineFileHandle.mockResolvedValue({ id: 'handle-1' });
+    fileApiMocks.downloadAttachment.mockResolvedValue(undefined);
+    const { getByRole } = await renderPanel();
+    act(() => { (getByRole('button', { name: 'remote_desktop.files' }) as HTMLButtonElement).click(); });
+    act(() => { (getByRole('button', { name: 'select-remote-file' }) as HTMLButtonElement).click(); });
+    act(() => { (getByRole('button', { name: 'remote_desktop.fetch_to_local' }) as HTMLButtonElement).click(); });
+    await vi.waitFor(() => expect(fileApiMocks.createMachineFileHandle).toHaveBeenCalledWith(
+      'server-1',
+      'C:\\Users\\admin\\Desktop\\report.txt',
+      expect.any(AbortSignal),
+    ));
+    expect(fileApiMocks.downloadAttachment).toHaveBeenCalledWith(
+      'server-1',
+      'handle-1',
+      undefined,
+      expect.any(AbortSignal),
+    );
   });
 
   it('shows bounded connection diagnostics without rendering signaling or authority secrets', async () => {
