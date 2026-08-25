@@ -6,6 +6,7 @@ import { h } from 'preact';
 import { render, screen, fireEvent, cleanup, within, waitFor, act } from '@testing-library/preact';
 import { useRef, useState } from 'preact/hooks';
 import { FILE_TRANSFER_LIMITS } from '../../../shared/transport/file-transfer.js';
+import { HERMES_AGENT_PROVIDER_ID } from '../../../shared/hermes-agent.js';
 
 const DEFAULT_INNER_WIDTH = 1280;
 const { mockI18n } = vi.hoisted(() => ({
@@ -8549,6 +8550,54 @@ afterEach(() => {
     expectSendPayload(ws, {
       sessionName: 'kimi-sdk-session',
       text: '/model moonshot-v1-auto,thinking',
+    });
+  });
+
+  it('force-loads Hermes models and sends /model from the active session picker', async () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({
+          name: 'hermes-session',
+          agentType: HERMES_AGENT_PROVIDER_ID,
+          runtimeType: 'transport',
+          activeModel: 'nous-free',
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    const request = ws.send.mock.calls.find((call) => (
+      call[0]?.type === 'transport.list_models'
+      && call[0]?.agentType === HERMES_AGENT_PROVIDER_ID
+      && call[0]?.force === true
+    ))?.[0];
+    expect(request).toMatchObject({
+      type: 'transport.list_models',
+      agentType: HERMES_AGENT_PROVIDER_ID,
+      force: true,
+    });
+
+    act(() => ws.emit({
+      type: 'transport.models_response',
+      agentType: HERMES_AGENT_PROVIDER_ID,
+      requestId: request?.requestId,
+      models: [
+        { id: 'nous-free', name: 'Nous Free' },
+        { id: 'minimax-oauth', name: 'MiniMax OAuth' },
+      ],
+      defaultModel: 'nous-free',
+      isAuthenticated: true,
+    }));
+
+    fireEvent.click(screen.getByRole('button', { name: /^nous-free$/i }));
+    const menu = document.querySelector('.menu-dropdown') as HTMLElement;
+    fireEvent.click(within(menu).getByRole('button', { name: /minimax-oauth/i }));
+
+    expectSendPayload(ws, {
+      sessionName: 'hermes-session',
+      text: '/model minimax-oauth',
     });
   });
 

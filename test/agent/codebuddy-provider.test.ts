@@ -137,6 +137,53 @@ describe('CodeBuddy ACP providers', () => {
     releaseWrite();
 
     await expect(admission).resolves.toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE);
+    expect((internal.sessions.get('route-write-failure')!.activePromptAdmissions as Map<string, unknown>).size).toBe(0);
+  });
+
+  it('retains one admission authority after the original turn settles until its write is terminal', async () => {
+    const provider = new CodeBuddyChinaProvider();
+    const tracked = makeTrackedConnection(() => new Promise(() => {}));
+    let releaseWrite!: () => void;
+    tracked.tracker.nextWrite = new Promise<void>((resolve) => { releaseWrite = resolve; });
+    const internal = provider as unknown as {
+      connection: typeof tracked.connection;
+      sessions: Map<string, Record<string, any>>;
+    };
+    internal.connection = tracked.connection;
+    internal.sessions.set('route-late-write', {
+      routeId: 'route-late-write',
+      cwd: '/tmp',
+      loaded: true,
+      promptInFlight: true,
+      turnGeneration: 3,
+      promptSubmittedGeneration: 3,
+      activePromptAdmissions: new Map(),
+      cancelled: false,
+      acpSessionId: 'acp-late-write',
+    });
+    const notification = {
+      notificationId: 'append-late-write',
+      delegationId: 'queue-append:append-late-write',
+      sourceSessionName: 'deck_codebuddy_brain',
+      text: 'deliver exactly once',
+      deliveryKind: 'queued_message' as const,
+    };
+
+    const first = provider.notifyActiveDelegation('route-late-write', notification);
+    await vi.waitFor(() => expect(tracked.prompt).toHaveBeenCalledOnce());
+    const state = internal.sessions.get('route-late-write')!;
+    state.promptInFlight = false;
+    state.promptSubmittedGeneration = null;
+    state.cancelled = true;
+    const retry = provider.notifyActiveDelegation('route-late-write', notification);
+
+    expect(tracked.prompt).toHaveBeenCalledOnce();
+    releaseWrite();
+    await expect(Promise.all([first, retry])).resolves.toEqual([
+      AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED,
+      AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED,
+    ]);
+    expect(tracked.prompt).toHaveBeenCalledOnce();
   });
 
   it.each([

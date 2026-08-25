@@ -482,6 +482,152 @@ describe('TransportSessionRuntime', () => {
     expect(runtime.pendingEntries).toEqual([]);
   });
 
+  it('does not start an idle retry while a timed-out provider admission can still succeed', async () => {
+    const mock = makeMockProvider();
+    mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
+    let finishAdmission!: (result: typeof AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED) => void;
+    mock.provider.notifyActiveDelegation = vi.fn(() => new Promise((resolve) => {
+      finishAdmission = resolve;
+    }));
+    const runtime = new TransportSessionRuntime(mock.provider, 'deck_test_brain');
+    await runtime.initialize(defaultConfig);
+    runtime.send('foreground work', 'foreground-late-admission');
+    await flushDispatch();
+    vi.useFakeTimers();
+    const notification = {
+      notificationId: 'notify-late-admission',
+      delegationId: 'delegation-late-admission',
+      sourceSessionName: 'deck_sub_auditor',
+      text: 'audit complete',
+    };
+
+    const first = runtime.deliverDelegationNotification(notification);
+    await vi.advanceTimersByTimeAsync(10_000);
+    await expect(first).resolves.toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE);
+    expect(mock.provider.notifyActiveDelegation).toHaveBeenCalledOnce();
+
+    // A settles while the provider's B write remains unresolved. The durable
+    // retry must rejoin the same admission instead of starting an idle turn.
+    mock.fireComplete('sess-1');
+    await Promise.resolve();
+    const retryWhilePending = runtime.deliverDelegationNotification(notification);
+    await vi.advanceTimersByTimeAsync(10_000);
+    await expect(retryWhilePending).resolves.toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE);
+    expect(mock.provider.send).toHaveBeenCalledOnce();
+    expect(mock.provider.notifyActiveDelegation).toHaveBeenCalledOnce();
+
+    finishAdmission(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    await Promise.resolve();
+    await expect(runtime.deliverDelegationNotification(notification))
+      .resolves.toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    expect(mock.provider.send).toHaveBeenCalledOnce();
+    expect(mock.provider.notifyActiveDelegation).toHaveBeenCalledOnce();
+  });
+
+  it('retains all pending delegation authorities at capacity and rejects conflicting or distinct admissions', async () => {
+    mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
+    mock.provider.notifyActiveDelegation = vi.fn().mockResolvedValue(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    runtime.send('foreground work', 'foreground-admission-capacity');
+    await flushDispatch();
+
+    const admissions = (runtime as any)._activeDelegationNotificationAdmissions as Map<string, {
+      notification: {
+        notificationId: string;
+        delegationId: string;
+        sourceSessionName: string;
+        text: string;
+      };
+      promise: Promise<string>;
+      status: 'pending' | 'delivered';
+    }>;
+    const unresolved = new Promise<string>(() => {});
+    for (let index = 0; index < 512; index += 1) {
+      const notificationId = `pending-capacity-${index}`;
+      admissions.set(notificationId, {
+        notification: {
+          notificationId,
+          delegationId: `delegation-capacity-${index}`,
+          sourceSessionName: 'deck_sub_capacity',
+          text: `pending ${index}`,
+        },
+        promise: unresolved,
+        status: 'pending',
+      });
+    }
+    vi.useFakeTimers();
+
+    const samePending = runtime.deliverDelegationNotification({
+      notificationId: 'pending-capacity-0',
+      delegationId: 'delegation-capacity-0',
+      sourceSessionName: 'deck_sub_capacity',
+      text: 'pending 0',
+    });
+    await vi.advanceTimersByTimeAsync(10_000);
+    await expect(samePending).resolves.toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE);
+
+    await expect(runtime.deliverDelegationNotification({
+      notificationId: 'pending-capacity-0',
+      delegationId: 'delegation-capacity-0',
+      sourceSessionName: 'deck_sub_capacity',
+      text: 'changed immutable content',
+    })).resolves.toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE);
+    await expect(runtime.deliverDelegationNotification({
+      notificationId: 'pending-capacity-512',
+      delegationId: 'delegation-capacity-512',
+      sourceSessionName: 'deck_sub_capacity',
+      text: 'distinct admission beyond capacity',
+    })).resolves.toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE);
+
+    expect(admissions.size).toBe(512);
+    expect(admissions.get('pending-capacity-0')?.notification.text).toBe('pending 0');
+    expect(admissions.has('pending-capacity-512')).toBe(false);
+    expect(mock.provider.notifyActiveDelegation).not.toHaveBeenCalled();
+  });
+
+  it('prunes only delivered delegation tombstones before admitting new work at capacity', async () => {
+    mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
+    mock.provider.notifyActiveDelegation = vi.fn().mockResolvedValue(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    runtime.send('foreground work', 'foreground-tombstone-capacity');
+    await flushDispatch();
+
+    const admissions = (runtime as any)._activeDelegationNotificationAdmissions as Map<string, {
+      notification: {
+        notificationId: string;
+        delegationId: string;
+        sourceSessionName: string;
+        text: string;
+      };
+      promise: Promise<string>;
+      status: 'pending' | 'delivered';
+    }>;
+    for (let index = 0; index < 512; index += 1) {
+      const notificationId = `delivered-capacity-${index}`;
+      admissions.set(notificationId, {
+        notification: {
+          notificationId,
+          delegationId: `delegation-delivered-${index}`,
+          sourceSessionName: 'deck_sub_capacity',
+          text: `delivered ${index}`,
+        },
+        promise: Promise.resolve(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED),
+        status: 'delivered',
+      });
+    }
+
+    await expect(runtime.deliverDelegationNotification({
+      notificationId: 'new-after-delivered-capacity',
+      delegationId: 'delegation-new-after-capacity',
+      sourceSessionName: 'deck_sub_capacity',
+      text: 'new work after delivered tombstones',
+    })).resolves.toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    await Promise.resolve();
+
+    expect(admissions.size).toBe(512);
+    expect(admissions.has('delivered-capacity-0')).toBe(false);
+    expect(admissions.get('new-after-delivered-capacity')?.status).toBe('delivered');
+    expect(mock.provider.notifyActiveDelegation).toHaveBeenCalledOnce();
+  });
+
   it('appends selected queued messages into the active turn without cancelling or draining the rest', async () => {
     mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
     mock.provider.notifyActiveDelegation = vi.fn().mockResolvedValue(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);

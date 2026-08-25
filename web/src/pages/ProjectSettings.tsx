@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'preact/hooks';
 import { CODEBUDDY_PROVIDER_IDS } from '@shared/codebuddy.js';
+import { HERMES_AGENT_PROVIDER_ID } from '@shared/hermes-agent.js';
 
 interface ProjectSettings {
   name: string;
@@ -30,7 +31,7 @@ export function ProjectSettings({ apiKey, serverId, projectName, onSaved, onCanc
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  const agentTypes = ['claude-code', 'claude-code-sdk', 'codex', 'codex-sdk', 'qoder-sdk', 'copilot-sdk', 'cursor-headless', 'opencode-sdk', 'opencode', 'gemini', 'gemini-sdk', 'grok-sdk', 'kimi-sdk', 'deepseek-harness', 'pi', CODEBUDDY_PROVIDER_IDS.CHINA, CODEBUDDY_PROVIDER_IDS.INTERNATIONAL, 'qwen'];
+  const agentTypes = ['claude-code', 'claude-code-sdk', 'codex', 'codex-sdk', 'qoder-sdk', 'copilot-sdk', 'cursor-headless', 'opencode-sdk', 'opencode', 'gemini', 'gemini-sdk', 'grok-sdk', 'kimi-sdk', HERMES_AGENT_PROVIDER_ID, 'deepseek-harness', 'pi', CODEBUDDY_PROVIDER_IDS.CHINA, CODEBUDDY_PROVIDER_IDS.INTERNATIONAL, 'qwen'];
 
   useEffect(() => {
     fetch(`/api/server/${serverId}/projects/${projectName}`, {

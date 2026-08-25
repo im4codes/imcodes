@@ -36,6 +36,7 @@ import {
   stripAgentDelegationControlInstructions,
   type AgentDelegationErrorCode,
 } from '../../shared/agent-delegation.js';
+import { HERMES_AGENT_PROVIDER_ID } from '../../shared/hermes-agent.js';
 
 const expectInvalid = (value: unknown) => {
   expect(parseAgentDelegationTargetPayload(value)).toEqual(expect.objectContaining({
@@ -141,6 +142,7 @@ describe('agent delegation shared contract', () => {
       'qwen',
       'openclaw',
       'kimi-sdk',
+      HERMES_AGENT_PROVIDER_ID,
       'deepseek-harness',
       'pi',
       'codebuddy-cn',

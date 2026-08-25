@@ -53,6 +53,7 @@ import {
   CODEBUDDY_PROVIDER_IDS,
   isCodeBuddyProviderId,
 } from "@shared/codebuddy.js";
+import { HERMES_AGENT_PROVIDER_ID } from "@shared/hermes-agent.js";
 
 // Fallback suggestions used only when the daemon probe returns an empty list
 // (offline/unauthenticated). The live list comes from the dynamic models hook.
@@ -475,6 +476,7 @@ export function NewSessionDialog({
           || agentType === "gemini-sdk"
           || agentType === "grok-sdk"
           || agentType === "kimi-sdk"
+          || agentType === HERMES_AGENT_PROVIDER_ID
           || agentType === "deepseek-harness"
           || agentType === "pi"
           || isCodeBuddyProviderId(agentType)
@@ -503,7 +505,7 @@ export function NewSessionDialog({
   const agentFlavor =
     agentType === "claude-code" || agentType === "codex"
       ? "cli"
-      : agentType === "claude-code-sdk" || agentType === "codex-sdk" || agentType === "qoder-sdk" || agentType === "opencode-sdk" || agentType === "grok-sdk" || agentType === "kimi-sdk" || agentType === "deepseek-harness" || agentType === "pi" || isCodeBuddyProviderId(agentType)
+      : agentType === "claude-code-sdk" || agentType === "codex-sdk" || agentType === "qoder-sdk" || agentType === "opencode-sdk" || agentType === "grok-sdk" || agentType === "kimi-sdk" || agentType === HERMES_AGENT_PROVIDER_ID || agentType === "deepseek-harness" || agentType === "pi" || isCodeBuddyProviderId(agentType)
         ? "sdk"
         : null;
   const qwenCompatibleApiPresetSelected = agentType === "qwen" && !!selectedCcPreset;
@@ -541,6 +543,7 @@ export function NewSessionDialog({
     || agentType === "gemini-sdk"
     || agentType === "grok-sdk"
     || agentType === "kimi-sdk"
+    || agentType === HERMES_AGENT_PROVIDER_ID
     || agentType === "deepseek-harness"
     || agentType === "pi"
     || isCodeBuddyProviderId(agentType)
@@ -930,6 +933,11 @@ export function NewSessionDialog({
             {agentType === "grok-sdk" && transportModels.error && (
               <div role="alert" style={{ marginTop: 6, color: "#fca5a5", fontSize: 12 }}>
                 {t("new_session.grok_prerequisite_error", { error: transportModels.error })}
+              </div>
+            )}
+            {agentType === HERMES_AGENT_PROVIDER_ID && transportModels.error && (
+              <div role="alert" style={{ marginTop: 6, color: "#fca5a5", fontSize: 12 }}>
+                {t("new_session.hermes_prerequisite_error", { error: transportModels.error })}
               </div>
             )}
           </div>

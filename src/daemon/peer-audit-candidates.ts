@@ -15,6 +15,7 @@ import { readSupervisionSnapshotFromTransportConfig } from '../../shared/supervi
 import { resolveExactDelegationTarget } from './session-dispatch.js';
 import type { SessionRecord } from '../store/session-store.js';
 import { CODEBUDDY_PROVIDER_IDS } from '../../shared/codebuddy.js';
+import { HERMES_AGENT_PROVIDER_ID } from '../../shared/hermes-agent.js';
 
 const UNKNOWN_DIMENSION = PEER_AUDIT_UNKNOWN_IDENTITY;
 
@@ -126,6 +127,8 @@ function peerAuditTypeLabel(agentType: string): string {
       return 'Qw';
     case 'kimi-sdk':
       return 'Km';
+    case HERMES_AGENT_PROVIDER_ID:
+      return 'He';
     case 'copilot-sdk':
       return 'Cp';
     case 'openclaw':

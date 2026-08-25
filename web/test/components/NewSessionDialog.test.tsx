@@ -6,6 +6,7 @@ import { h } from 'preact';
 import { render, screen, fireEvent, cleanup, waitFor, act } from '@testing-library/preact';
 import { GIT_REMOTE_CLONE_CAPABILITY_V1 } from '../../../shared/git-remote-url.js';
 import { DEFAULT_CODEX_SESSION_MODEL } from '../../../src/shared/models/options.js';
+import { HERMES_AGENT_PROVIDER_ID } from '../../../shared/hermes-agent.js';
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
@@ -116,7 +117,7 @@ describe('NewSessionDialog', () => {
     const groups = Array.from(document.querySelectorAll('.session-agent-group'));
     expect(groups.map((group) => group.querySelector('.session-agent-group-title')?.textContent)).toEqual(['SDK', 'CLI']);
     const options = groups.flatMap((group) => Array.from(group.querySelectorAll<HTMLButtonElement>('[data-agent-type]')).map((button) => button.dataset.agentType));
-    expect(options.slice(0, 15)).toEqual([
+    expect(options.slice(0, 16)).toEqual([
       'claude-code-sdk',
       'codex-sdk',
       'qoder-sdk',
@@ -126,6 +127,7 @@ describe('NewSessionDialog', () => {
       'gemini-sdk',
       'grok-sdk',
       'kimi-sdk',
+      HERMES_AGENT_PROVIDER_ID,
       'deepseek-harness',
       'pi',
       'codebuddy-cn',
@@ -133,7 +135,7 @@ describe('NewSessionDialog', () => {
       'qwen',
       'openclaw',
     ]);
-    expect(options.slice(15)).toEqual([
+    expect(options.slice(16)).toEqual([
       'claude-code',
       'codex',
       'opencode',
@@ -884,6 +886,47 @@ describe('NewSessionDialog', () => {
     expect(ws.sendSessionCommand).toHaveBeenCalledWith('start', expect.objectContaining({
       agentType: 'kimi-sdk',
       requestedModel: 'moonshot-v1-auto,thinking',
+    }));
+  });
+
+  it('actively discovers Hermes models and starts with the selected model', async () => {
+    const ws = makeWs();
+    render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
+
+    fireEvent.input(screen.getByPlaceholderText('my-project'), { target: { value: 'my-app' } });
+    fireEvent.input(screen.getByPlaceholderText('~/projects/my-project'), { target: { value: '~/projects/my-app' } });
+    selectAgent(HERMES_AGENT_PROVIDER_ID);
+
+    await waitFor(() => {
+      expect(ws.send.mock.calls.some((call) => (
+        call[0]?.type === 'transport.list_models'
+        && call[0]?.agentType === HERMES_AGENT_PROVIDER_ID
+        && call[0]?.force === true
+      ))).toBe(true);
+    });
+    const request = ws.send.mock.calls.find((call) => (
+      call[0]?.type === 'transport.list_models' && call[0]?.agentType === HERMES_AGENT_PROVIDER_ID
+    ))?.[0];
+    act(() => ws.emit({
+      type: 'transport.models_response',
+      agentType: HERMES_AGENT_PROVIDER_ID,
+      requestId: request?.requestId,
+      models: [
+        { id: 'nous-free', name: 'Nous Free' },
+        { id: 'minimax-oauth', name: 'MiniMax OAuth' },
+      ],
+      defaultModel: 'nous-free',
+      isAuthenticated: true,
+    }));
+
+    await waitFor(() => expect(screen.getByRole('option', { name: 'minimax-oauth' })).toBeDefined());
+    const selects = screen.getAllByRole('combobox') as HTMLSelectElement[];
+    fireEvent.input(selects[0], { target: { value: 'minimax-oauth' } });
+    fireEvent.click(screen.getByRole('button', { name: /start/i }));
+
+    expect(ws.sendSessionCommand).toHaveBeenCalledWith('start', expect.objectContaining({
+      agentType: HERMES_AGENT_PROVIDER_ID,
+      requestedModel: 'minimax-oauth',
     }));
   });
 

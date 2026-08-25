@@ -4,6 +4,7 @@
 import { describe, expect, it } from 'vitest';
 import { formatLabel } from '../src/format-label.js';
 import { getAutoSessionLabelPrefix } from '../src/agent-display.js';
+import { HERMES_AGENT_PROVIDER_ID } from '../../shared/hermes-agent.js';
 
 describe('agent display helpers', () => {
   it('normalizes legacy sdk auto labels into short readable labels', () => {
@@ -24,6 +25,7 @@ describe('agent display helpers', () => {
     expect(getAutoSessionLabelPrefix('copilot-sdk')).toBe('Co');
     expect(getAutoSessionLabelPrefix('cursor-headless')).toBe('Cu');
     expect(getAutoSessionLabelPrefix('grok-sdk')).toBe('Gr');
+    expect(getAutoSessionLabelPrefix(HERMES_AGENT_PROVIDER_ID)).toBe('He');
     expect(getAutoSessionLabelPrefix('opencode-sdk')).toBe('OC');
     expect(getAutoSessionLabelPrefix('deepseek-harness')).toBe('Ds');
     expect(getAutoSessionLabelPrefix('pi')).toBe('Pi');

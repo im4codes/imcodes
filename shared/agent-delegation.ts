@@ -1,6 +1,7 @@
 import { P2P_ROUTING_FIELDS } from './p2p-routing-fields.js';
 import { isSessionAgentType } from './agent-types.js';
 import { CODEBUDDY_PROVIDER_IDS } from './codebuddy.js';
+import { HERMES_AGENT_PROVIDER_ID } from './hermes-agent.js';
 import { isValidImcodesSessionName } from './session-scope.js';
 
 export const AGENT_DELEGATION_TARGET_FIELD = 'delegateTarget' as const;
@@ -128,6 +129,7 @@ export const DELEGATION_REPLY_CAPABLE_AGENT_TYPES = [
   'qwen',
   'openclaw',
   'kimi-sdk',
+  HERMES_AGENT_PROVIDER_ID,
   'deepseek-harness',
   'pi',
   CODEBUDDY_PROVIDER_IDS.CHINA,

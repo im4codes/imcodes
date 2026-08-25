@@ -1,5 +1,6 @@
 import type { SessionAgentType } from '@shared/agent-types.js';
 import { CODEBUDDY_PROVIDER_IDS } from '@shared/codebuddy.js';
+import { HERMES_AGENT_PROVIDER_ID } from '@shared/hermes-agent.js';
 
 export type SessionAgentGroupId = 'transport' | 'process';
 export type SessionAgentSurface = 'new-session' | 'sub-session';
@@ -88,6 +89,14 @@ const SESSION_AGENT_CHOICES: SessionAgentChoice[] = [
     icon: '月',
     fallbackLabel: 'Kimi Code',
     labelKey: 'session.agentType.kimi_sdk',
+    group: 'transport',
+    surfaces: ['new-session', 'sub-session'],
+  },
+  {
+    id: HERMES_AGENT_PROVIDER_ID,
+    icon: 'H',
+    fallbackLabel: 'Hermes Agent',
+    labelKey: 'session.agentType.hermes_agent',
     group: 'transport',
     surfaces: ['new-session', 'sub-session'],
   },

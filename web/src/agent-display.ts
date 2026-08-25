@@ -1,4 +1,5 @@
 import { CODEBUDDY_PROVIDER_IDS } from '@shared/codebuddy.js';
+import { HERMES_AGENT_PROVIDER_ID } from '@shared/hermes-agent.js';
 
 export interface AgentBadgeConfig {
   label: string;
@@ -21,6 +22,7 @@ export const AGENT_BADGE_CONFIG: Record<string, AgentBadgeConfig> = {
   'gemini-sdk': { label: 'gm', color: '#1d4ed8', autoLabelPrefix: 'Gm' },
   'grok-sdk': { label: 'gr', color: '#64748b', autoLabelPrefix: 'Gr' },
   'kimi-sdk': { label: 'km', color: '#8b5cf6', autoLabelPrefix: 'Km' },
+  [HERMES_AGENT_PROVIDER_ID]: { label: 'he', color: '#14b8a6', autoLabelPrefix: 'He' },
   'deepseek-harness': { label: 'ds', color: '#4d6bfe', autoLabelPrefix: 'Ds' },
   pi: { label: 'pi', color: '#06b6d4', autoLabelPrefix: 'Pi' },
   [CODEBUDDY_PROVIDER_IDS.CHINA]: { label: 'cb', color: '#22c55e', autoLabelPrefix: 'CB' },

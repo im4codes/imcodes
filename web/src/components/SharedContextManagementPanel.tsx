@@ -4,6 +4,7 @@ import { useTranslation } from 'react-i18next';
 import type { ContextMemoryProjectView, ContextMemoryView, SharedContextRuntimeBackend } from '@shared/context-types.js';
 import { QWEN_MODEL_IDS } from '@shared/qwen-models.js';
 import { CODEBUDDY_PROVIDER_IDS } from '@shared/codebuddy.js';
+import { HERMES_AGENT_PROVIDER_ID } from '@shared/hermes-agent.js';
 import {
   MEMORY_MCP_DEGRADED_REASON,
   MEMORY_MCP_PROVIDER_IDS,
@@ -1129,6 +1130,7 @@ const MCP_PROVIDER_LABEL_KEY: Record<MemoryMcpProviderId, string> = {
   'gemini-sdk': 'sharedContext.management.mcpProviderGeminiAcp',
   'grok-sdk': 'sharedContext.management.mcpProviderGrokAcp',
   'kimi-sdk': 'sharedContext.management.mcpProviderKimiAcp',
+  [HERMES_AGENT_PROVIDER_ID]: 'sharedContext.management.mcpProviderHermesAcp',
   'copilot-sdk': 'sharedContext.management.mcpProviderCopilotSdk',
   'codex-sdk': 'sharedContext.management.mcpProviderCodexSdk',
   'qoder-sdk': 'sharedContext.management.mcpProviderQoderSdk',

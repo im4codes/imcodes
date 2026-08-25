@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { getSessionRuntimeType, isTransportSessionAgentType } from '../shared/agent-types.js';
 import { CODEBUDDY_PROVIDER_IDS } from '../shared/codebuddy.js';
+import { HERMES_AGENT_PROVIDER_ID } from '../shared/hermes-agent.js';
 
 describe('shared agent type helpers', () => {
   it('recognizes transport-backed session agent types', () => {
@@ -8,6 +9,7 @@ describe('shared agent type helpers', () => {
     expect(isTransportSessionAgentType('codex-sdk')).toBe(true);
     expect(isTransportSessionAgentType('qoder-sdk')).toBe(true);
     expect(isTransportSessionAgentType('kimi-sdk')).toBe(true);
+    expect(isTransportSessionAgentType(HERMES_AGENT_PROVIDER_ID)).toBe(true);
     expect(isTransportSessionAgentType('grok-sdk')).toBe(true);
     expect(isTransportSessionAgentType('deepseek-harness')).toBe(true);
     expect(isTransportSessionAgentType('pi')).toBe(true);
@@ -24,6 +26,7 @@ describe('shared agent type helpers', () => {
     expect(getSessionRuntimeType('codex-sdk')).toBe('transport');
     expect(getSessionRuntimeType('qoder-sdk')).toBe('transport');
     expect(getSessionRuntimeType('kimi-sdk')).toBe('transport');
+    expect(getSessionRuntimeType(HERMES_AGENT_PROVIDER_ID)).toBe('transport');
     expect(getSessionRuntimeType('grok-sdk')).toBe('transport');
     expect(getSessionRuntimeType('opencode-sdk')).toBe('transport');
     expect(getSessionRuntimeType('pi')).toBe('transport');

@@ -42,12 +42,14 @@ import {
 } from '../../shared/preference-ingest.js';
 import { TIMELINE_CURSOR_DIRECTIONS, TIMELINE_MESSAGES, TIMELINE_RESPONSE_STATUS, TIMELINE_RESPONSE_SOURCES } from '../../shared/timeline-protocol.js';
 import { TRANSPORT_MSG } from '../../shared/transport-events.js';
+import { HERMES_AGENT_PROVIDER_ID } from '../../shared/hermes-agent.js';
 import { ALIAS_LEGEND_DIRECTIVE, buildAliasLegendLine } from '../../shared/alias-types.js';
 import { buildAliasSendAudit } from '../../src/daemon/alias-audit.js';
 import { TransportSessionRuntime } from '../../src/agent/transport-session-runtime.js';
 import type { TransportProvider } from '../../src/agent/transport-provider.js';
 import type { AgentMessage, MessageDelta } from '../../shared/agent-message.js';
 import { resetMemoryFeatureConfigStoreForTests } from '../../src/store/memory-feature-config-store.js';
+import logger from '../../src/util/logger.js';
 
 const {
   getSessionMock,
@@ -2915,6 +2917,52 @@ describe('handleWebCommand transport queue behavior', () => {
       models: [{ id: 'grok-build' }],
       defaultModel: 'grok-build',
     }));
+  });
+
+  it.each([
+    [Object.assign(new Error('ENOENT /secret/install/path'), { code: 'ENOENT' }), 'unavailable or incompatible', 'cli_unavailable_or_incompatible'],
+    [{ code: 'AUTH_FAILED', message: 'token=super-secret', recoverable: false }, 'authentication is required', 'authentication'],
+    [{ code: 'CONFIG_ERROR', message: 'api_key=super-secret', recoverable: false }, 'unavailable or incompatible', 'cli_unavailable_or_incompatible'],
+    [{ code: 'RATE_LIMITED', message: 'bearer=super-secret', recoverable: true }, 'temporarily rate limited', 'rate_limited'],
+    [new Error('generic failure /secret/install/path token=super-secret'), 'model discovery failed', 'provider_failure'],
+  ])('surfaces and logs a bounded Hermes model-discovery failure without echoing provider secrets', async (failure, expected, failureClass) => {
+    getProviderMock.mockReturnValue(undefined);
+    ensureProviderConnectedMock.mockRejectedValue(failure);
+
+    handleWebCommand({
+      type: 'transport.list_models',
+      agentType: HERMES_AGENT_PROVIDER_ID,
+      requestId: 'hermes-model-failure',
+      force: true,
+    }, serverLink as any);
+    await waitForAsync(() => serverLink.send.mock.calls.some((call) => (
+      (call[0] as Record<string, unknown>).requestId === 'hermes-model-failure'
+    )));
+
+    expect(ensureProviderConnectedMock).toHaveBeenCalledWith(HERMES_AGENT_PROVIDER_ID, {});
+    const response = serverLink.send.mock.calls.find((call) => (
+      (call[0] as Record<string, unknown>).requestId === 'hermes-model-failure'
+    ))?.[0] as Record<string, unknown>;
+    expect(response).toMatchObject({
+      type: 'transport.models_response',
+      agentType: HERMES_AGENT_PROVIDER_ID,
+      requestId: 'hermes-model-failure',
+      models: [],
+      isAuthenticated: false,
+      error: expect.stringContaining(expected),
+    });
+    expect(JSON.stringify(response)).not.toContain('super-secret');
+    expect(JSON.stringify(response)).not.toContain('/secret/install/path');
+    expect(JSON.stringify(response)).not.toContain('Unsupported agentType');
+    expect(logger.debug).toHaveBeenCalledWith({
+      provider: HERMES_AGENT_PROVIDER_ID,
+      failureClass,
+    }, 'Hermes Agent auto-connect for model listing failed');
+    const serializedHermesLogs = JSON.stringify((logger.debug as ReturnType<typeof vi.fn>).mock.calls.filter((call) => (
+      call[1] === 'Hermes Agent auto-connect for model listing failed'
+    )));
+    expect(serializedHermesLogs).not.toContain('super-secret');
+    expect(serializedHermesLogs).not.toContain('/secret/install/path');
   });
 
   it('does not auto-connect qoder-sdk for forced transport.list_models', async () => {

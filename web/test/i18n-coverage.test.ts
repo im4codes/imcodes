@@ -555,6 +555,19 @@ describe('generic i18n coverage guard', () => {
     }
   });
 
+  it('keeps the Hermes Agent and managed MCP labels present in every locale', () => {
+    for (const locale of SUPPORTED_LOCALES) {
+      const messages = JSON.parse(readFileSync(join(WEB_ROOT, 'src/i18n/locales', `${locale}.json`), 'utf8')) as unknown;
+      const label = readPath(messages, 'session.agentType.hermes_agent');
+      const mcpLabel = readPath(messages, 'sharedContext.management.mcpProviderHermesAcp');
+      const prerequisiteError = readPath(messages, 'new_session.hermes_prerequisite_error');
+      expect(label, `${locale}:session.agentType.hermes_agent`).toBe('Hermes Agent');
+      expect(mcpLabel, `${locale}:sharedContext.management.mcpProviderHermesAcp`).toBe('Hermes ACP');
+      expect(prerequisiteError, `${locale}:new_session.hermes_prerequisite_error`).toEqual(expect.any(String));
+      expect((prerequisiteError as string).trim().length).toBeGreaterThan(0);
+    }
+  });
+
   it('keeps the DeepSeek Harness agent label present in every locale', () => {
     for (const locale of SUPPORTED_LOCALES) {
       const messages = JSON.parse(readFileSync(join(WEB_ROOT, 'src/i18n/locales', `${locale}.json`), 'utf8')) as unknown;

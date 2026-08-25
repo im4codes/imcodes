@@ -1,5 +1,6 @@
 import { redactSensitiveText } from './redact-secrets.js';
 import { CODEBUDDY_PROVIDER_IDS } from './codebuddy.js';
+import { HERMES_AGENT_PROVIDER_ID } from './hermes-agent.js';
 
 // Single shared source of truth for the lightweight peer-supervision-audit
 // contract (design "One shared peer-audit contract"). Owns contract/reply
@@ -292,6 +293,7 @@ const PEER_AUDIT_PROVIDER_FAMILY_BY_ID: Readonly<Record<string, string>> = {
   qwen: 'alibaba',
   moonshot: 'moonshot',
   'kimi-sdk': 'moonshot',
+  [HERMES_AGENT_PROVIDER_ID]: 'hermes',
   github: 'github',
   'copilot-sdk': 'github',
   cursor: 'cursor',

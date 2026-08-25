@@ -1,4 +1,5 @@
 import { CODEBUDDY_PROVIDER_IDS } from './codebuddy.js';
+import { HERMES_AGENT_PROVIDER_ID } from './hermes-agent.js';
 
 export const SESSION_AGENT_TYPES = [
   'claude-code-sdk',
@@ -16,6 +17,7 @@ export const SESSION_AGENT_TYPES = [
   'qwen',
   'openclaw',
   'kimi-sdk',
+  HERMES_AGENT_PROVIDER_ID,
   'deepseek-harness',
   'pi',
   CODEBUDDY_PROVIDER_IDS.CHINA,
@@ -38,6 +40,7 @@ export const TRANSPORT_SESSION_AGENT_TYPES = [
   'gemini-sdk',
   'grok-sdk',
   'kimi-sdk',
+  HERMES_AGENT_PROVIDER_ID,
   'deepseek-harness',
   'pi',
   CODEBUDDY_PROVIDER_IDS.CHINA,

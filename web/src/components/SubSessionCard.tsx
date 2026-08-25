@@ -36,6 +36,7 @@ import { parseAliasMarkers } from '@shared/alias-types.js';
 import { useMachines } from '../hooks/useMachines.js';
 import { buildMachineSendExtra } from '../util/machine-send.js';
 import { CODEBUDDY_PROVIDER_IDS } from '@shared/codebuddy.js';
+import { HERMES_AGENT_PROVIDER_ID } from '@shared/hermes-agent.js';
 
 const TYPE_ICON: Record<string, string> = {
   'claude-code': '⚡',
@@ -52,6 +53,7 @@ const TYPE_ICON: Record<string, string> = {
   'gemini-sdk': '♊',
   'grok-sdk': '𝕏',
   'kimi-sdk': '月',
+  [HERMES_AGENT_PROVIDER_ID]: 'H',
   'deepseek-harness': '🐳',
   pi: 'π',
   [CODEBUDDY_PROVIDER_IDS.CHINA]: '云',

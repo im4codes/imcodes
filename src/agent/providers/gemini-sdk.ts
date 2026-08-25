@@ -101,6 +101,7 @@ import { composeMessageSideProviderPrompt, getProviderSystemTextParts } from '..
 import { normalizeTransportCwd, resolveExecutableForSpawn } from '../transport-paths.js';
 import { getDefaultAcpMcpServers } from './getDefaultMcpServers.js';
 import { filterAcpJsonLines } from './acp-json-filter.js';
+import { acpPlanEntriesToInput } from './acp-plan.js';
 import {
   SDK_SUBAGENT_DETAIL_KIND,
   SDK_SUBAGENT_DIAGNOSTIC,
@@ -1329,7 +1330,7 @@ export class GeminiSdkProvider implements TransportProvider {
     state: GeminiSdkSessionState,
     update: SessionUpdate,
   ): void {
-    const input = geminiPlanEntriesToInput((update as unknown as { entries?: unknown }).entries);
+    const input = acpPlanEntriesToInput((update as unknown as { entries?: unknown }).entries);
     if (!input) return;
     this.clearStatus(sessionId, state);
     // Stable id so each plan revision overwrites the same timeline event in
@@ -1459,20 +1460,7 @@ export class GeminiSdkProvider implements TransportProvider {
  * priority, status }; some builds use `title`. Exported for unit testing.
  */
 export function geminiPlanEntriesToInput(entries: unknown): { plan: Array<{ content: string; status: string }> } | null {
-  if (!Array.isArray(entries)) return null;
-  const plan: Array<{ content: string; status: string }> = [];
-  for (const entry of entries) {
-    if (!entry || typeof entry !== 'object') continue;
-    const record = entry as Record<string, unknown>;
-    const rawText = typeof record.content === 'string'
-      ? record.content
-      : typeof record.title === 'string' ? record.title : '';
-    const content = rawText.trim();
-    if (!content) continue;
-    const status = typeof record.status === 'string' ? record.status : 'pending';
-    plan.push({ content, status });
-  }
-  return plan.length > 0 ? { plan } : null;
+  return acpPlanEntriesToInput(entries);
 }
 
 function extractTextFromContent(block: ContentBlock): string {

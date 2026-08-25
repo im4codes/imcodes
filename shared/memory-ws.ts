@@ -1,6 +1,7 @@
 import { PROVIDER_STATUS_REASON } from './provider-status-reasons.js';
 import { MCP_ERROR_REASONS } from './memory-mcp-errors.js';
 import { CODEBUDDY_PROVIDER_IDS } from './codebuddy.js';
+import { HERMES_AGENT_PROVIDER_ID } from './hermes-agent.js';
 
 export const MEMORY_WS = {
   SEARCH: 'memory.search',
@@ -71,6 +72,7 @@ export const MEMORY_MCP_PROVIDER_ID = {
   GEMINI_SDK: 'gemini-sdk',
   GROK_SDK: 'grok-sdk',
   KIMI_SDK: 'kimi-sdk',
+  HERMES_AGENT: HERMES_AGENT_PROVIDER_ID,
   COPILOT_SDK: 'copilot-sdk',
   CODEX_SDK: 'codex-sdk',
   QODER_SDK: 'qoder-sdk',
@@ -88,6 +90,7 @@ export const MEMORY_MCP_PROVIDER_IDS = [
   MEMORY_MCP_PROVIDER_ID.GEMINI_SDK,
   MEMORY_MCP_PROVIDER_ID.GROK_SDK,
   MEMORY_MCP_PROVIDER_ID.KIMI_SDK,
+  MEMORY_MCP_PROVIDER_ID.HERMES_AGENT,
   MEMORY_MCP_PROVIDER_ID.COPILOT_SDK,
   MEMORY_MCP_PROVIDER_ID.CODEX_SDK,
   MEMORY_MCP_PROVIDER_ID.QODER_SDK,

@@ -4,6 +4,7 @@
 import { describe, it, expect } from 'vitest';
 import { supportsDynamicTransportModels } from '../../src/hooks/useTransportModels.js';
 import { CODEBUDDY_PROVIDER_IDS } from '@shared/codebuddy.js';
+import { HERMES_AGENT_PROVIDER_ID } from '@shared/hermes-agent.js';
 
 /**
  * `supportsDynamicTransportModels` is the root model-selection registry for the
@@ -22,6 +23,7 @@ describe('supportsDynamicTransportModels', () => {
       'gemini-sdk',
       'grok-sdk',
       'kimi-sdk',
+      HERMES_AGENT_PROVIDER_ID,
       'deepseek-harness',
       'pi',
       'qwen',
@@ -36,7 +38,7 @@ describe('supportsDynamicTransportModels', () => {
   it('treats DSH and Pi like the other empty-catalogue providers', () => {
     // DSH/Pi resolve third-party provider routes from the selected preset,
     // so its catalogue is always empty — the same free-text case as Kimi/Grok.
-    for (const agentType of ['deepseek-harness', 'pi', 'kimi-sdk', 'grok-sdk', 'cursor-headless']) {
+    for (const agentType of ['deepseek-harness', 'pi', 'kimi-sdk', HERMES_AGENT_PROVIDER_ID, 'grok-sdk', 'cursor-headless']) {
       expect(supportsDynamicTransportModels(agentType), agentType).toBe(true);
     }
   });

@@ -10,6 +10,7 @@ import {
   CODEX_FAST_STATUS_COMMAND,
 } from '@shared/codex-service-tier.js';
 import { CODEBUDDY_PROVIDER_IDS } from '@shared/codebuddy.js';
+import { HERMES_AGENT_PROVIDER_ID } from '@shared/hermes-agent.js';
 
 const DEFAULT_QUICK_COMMANDS: Readonly<Record<string, readonly string[]>> = {
   'claude-code': [SESSION_COMPACT_COMMAND, SESSION_CLEAR_COMMAND, '/usage', '/cost', '/status', '/help'],
@@ -31,6 +32,7 @@ const DEFAULT_QUICK_COMMANDS: Readonly<Record<string, readonly string[]>> = {
   qwen: [SESSION_COMPACT_COMMAND, SESSION_CLEAR_COMMAND, SESSION_MODEL_COMMAND, '/thinking'],
   'grok-sdk': [SESSION_COMPACT_COMMAND, SESSION_CLEAR_COMMAND, SESSION_MODEL_COMMAND],
   'kimi-sdk': [SESSION_COMPACT_COMMAND, SESSION_CLEAR_COMMAND, SESSION_MODEL_COMMAND],
+  [HERMES_AGENT_PROVIDER_ID]: [SESSION_COMPACT_COMMAND, SESSION_CLEAR_COMMAND, SESSION_MODEL_COMMAND, '/steer', '/queue', '/tools', '/context'],
   'deepseek-harness': [SESSION_CLEAR_COMMAND, SESSION_MODEL_COMMAND],
   pi: [SESSION_CLEAR_COMMAND, SESSION_MODEL_COMMAND, '/thinking'],
   [CODEBUDDY_PROVIDER_IDS.CHINA]: [SESSION_COMPACT_COMMAND, SESSION_CLEAR_COMMAND, SESSION_MODEL_COMMAND],

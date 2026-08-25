@@ -3,6 +3,7 @@ import { DAEMON_MSG } from '@shared/daemon-events.js';
 import { TRANSPORT_MSG } from '@shared/transport-events.js';
 import type { WsClient } from '../ws-client.js';
 import { CODEBUDDY_PROVIDER_IDS, isCodeBuddyProviderId } from '@shared/codebuddy.js';
+import { HERMES_AGENT_PROVIDER_ID } from '@shared/hermes-agent.js';
 
 export interface TransportModelInfo {
   id: string;
@@ -19,12 +20,12 @@ export interface TransportModelState {
 }
 
 /** Agent types that support dynamic model discovery via `transport.list_models`. */
-export type TransportAgentTypeWithModels = 'claude-code-sdk' | 'copilot-sdk' | 'cursor-headless' | 'codex-sdk' | 'opencode-sdk' | 'gemini-sdk' | 'grok-sdk' | 'kimi-sdk' | 'deepseek-harness' | 'pi' | 'qwen' | typeof CODEBUDDY_PROVIDER_IDS.CHINA | typeof CODEBUDDY_PROVIDER_IDS.INTERNATIONAL;
+export type TransportAgentTypeWithModels = 'claude-code-sdk' | 'copilot-sdk' | 'cursor-headless' | 'codex-sdk' | 'opencode-sdk' | 'gemini-sdk' | 'grok-sdk' | 'kimi-sdk' | typeof HERMES_AGENT_PROVIDER_ID | 'deepseek-harness' | 'pi' | 'qwen' | typeof CODEBUDDY_PROVIDER_IDS.CHINA | typeof CODEBUDDY_PROVIDER_IDS.INTERNATIONAL;
 
 export function supportsDynamicTransportModels(
   agentType: string | undefined | null,
 ): agentType is TransportAgentTypeWithModels {
-  return agentType === 'claude-code-sdk' || agentType === 'copilot-sdk' || agentType === 'cursor-headless' || agentType === 'codex-sdk' || agentType === 'opencode-sdk' || agentType === 'gemini-sdk' || agentType === 'grok-sdk' || agentType === 'kimi-sdk' || agentType === 'deepseek-harness' || agentType === 'pi' || agentType === 'qwen' || isCodeBuddyProviderId(agentType ?? undefined);
+  return agentType === 'claude-code-sdk' || agentType === 'copilot-sdk' || agentType === 'cursor-headless' || agentType === 'codex-sdk' || agentType === 'opencode-sdk' || agentType === 'gemini-sdk' || agentType === 'grok-sdk' || agentType === 'kimi-sdk' || agentType === HERMES_AGENT_PROVIDER_ID || agentType === 'deepseek-harness' || agentType === 'pi' || agentType === 'qwen' || isCodeBuddyProviderId(agentType ?? undefined);
 }
 
 /** Fetch and cache the list of available models for a transport agent type.
@@ -128,7 +129,7 @@ export function useTransportModels(
       });
     });
 
-    // Grok and OpenCode have no safe hardcoded model roster. Their live
+    // Grok, Hermes, and OpenCode have no safe hardcoded model roster. Their live
     // provider catalogs are the authoritative binary/authentication check, so
     // the first picker load must actively connect instead of asking for the
     // passive fallback (which is intentionally empty for these providers).
@@ -136,7 +137,11 @@ export function useTransportModels(
     // provider routes and model ids from its own `~/.dsh` config, so the
     // daemon's catalog is a constant empty list and a forced probe would only
     // spend a round trip to re-learn that. Its picker is free text, like Kimi.
-    if (wsConnected) fetchModels(agentType === 'grok-sdk' || agentType === 'opencode-sdk');
+    if (wsConnected) fetchModels(
+      agentType === 'grok-sdk'
+      || agentType === HERMES_AGENT_PROVIDER_ID
+      || agentType === 'opencode-sdk',
+    );
     return unsub;
   }, [ws, wsConnected, agentType, ccPreset, catalogIdentity, fetchModels]);
 

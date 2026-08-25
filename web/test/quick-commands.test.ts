@@ -8,6 +8,7 @@ import {
   matchQuickPhraseTrigger,
   matchSlashCommandTrigger,
 } from '../src/quick-commands.js';
+import { HERMES_AGENT_PROVIDER_ID } from '../../shared/hermes-agent.js';
 
 describe('slash command suggestions', () => {
   it('opens only for an argument-free slash command at the start of the composer', () => {
@@ -41,6 +42,19 @@ describe('slash command suggestions', () => {
         '/model',
       ]));
     }
+  });
+
+  it('offers Hermes native steering and queue controls', () => {
+    expect(getDefaultQuickCommands(HERMES_AGENT_PROVIDER_ID)).toEqual(expect.arrayContaining([
+      '/stop',
+      '/compact',
+      '/clear',
+      '/model',
+      '/steer',
+      '/queue',
+      '/tools',
+      '/context',
+    ]));
   });
 });
 

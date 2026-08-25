@@ -127,6 +127,7 @@ import {
   CODEBUDDY_PROVIDER_IDS,
   isCodeBuddyProviderId,
 } from '@shared/codebuddy.js';
+import { HERMES_AGENT_PROVIDER_ID } from '@shared/hermes-agent.js';
 import {
   buildAgentDelegationOrchestrationPrompt,
   isDelegationUnsupportedControlText,
@@ -1822,9 +1823,10 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const isGeminiSdk = activeSession?.agentType === 'gemini-sdk';
   const isGrokSdk = activeSession?.agentType === 'grok-sdk';
   const isKimiSdk = activeSession?.agentType === 'kimi-sdk';
+  const isHermesAgent = activeSession?.agentType === HERMES_AGENT_PROVIDER_ID;
   const isOpenCodeSdk = activeSession?.agentType === 'opencode-sdk';
   const isCodeBuddy = isCodeBuddyProviderId(activeSession?.agentType);
-  const supportsGenericTransportModelSelect = isCopilot || isCursorHeadless || isDeepseekHarness || isPi || isGeminiSdk || isGrokSdk || isKimiSdk || isOpenCodeSdk || isCodeBuddy;
+  const supportsGenericTransportModelSelect = isCopilot || isCursorHeadless || isDeepseekHarness || isPi || isGeminiSdk || isGrokSdk || isKimiSdk || isHermesAgent || isOpenCodeSdk || isCodeBuddy;
   // Source-of-truth priority for the model picker:
   //   1. `useTransportModels` — live daemon probe via `transport.list_models`
   //      WS round-trip. Works uniformly for main sessions AND sub-sessions
@@ -1865,7 +1867,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     if (isGeminiSdk) {
       return GEMINI_SDK_MODEL_SUGGESTIONS;
     }
-    if (isKimiSdk) {
+    if (isKimiSdk || isHermesAgent) {
       return dynamicTransportModels.models.map((m) => m.id);
     }
     if (isGrokSdk) {
@@ -1885,6 +1887,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     isGeminiSdk,
     isGrokSdk,
     isKimiSdk,
+    isHermesAgent,
     isOpenCodeSdk,
     isCodeBuddy,
     activeSession?.agentType,

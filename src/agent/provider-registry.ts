@@ -5,6 +5,7 @@ import type { TransportProvider, ProviderConfig } from './transport-provider.js'
 import { wireProviderToRelay, broadcastProviderStatus } from '../daemon/transport-relay.js';
 import logger from '../util/logger.js';
 import { CODEBUDDY_PROVIDER_IDS } from '../../shared/codebuddy.js';
+import { HERMES_AGENT_PROVIDER_ID } from '../../shared/hermes-agent.js';
 
 const providers = new Map<string, TransportProvider>();
 
@@ -96,6 +97,10 @@ async function createProvider(id: string): Promise<TransportProvider> {
     case 'kimi-sdk': {
       const { KimiSdkProvider } = await import('./providers/kimi-sdk.js');
       return new KimiSdkProvider();
+    }
+    case HERMES_AGENT_PROVIDER_ID: {
+      const { HermesAcpProvider } = await import('./providers/hermes-acp.js');
+      return new HermesAcpProvider();
     }
     case 'grok-sdk': {
       const { GrokSdkProvider } = await import('./providers/grok-sdk.js');

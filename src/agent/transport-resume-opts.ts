@@ -4,12 +4,14 @@ import type { AgentType } from './detect.js';
 import type { RemoteSessionInfo } from './transport-provider.js';
 import { canonicalizeTransportCwd } from './transport-paths.js';
 import { isCodeBuddyProviderId } from '../../shared/codebuddy.js';
+import { HERMES_AGENT_PROVIDER_ID } from '../../shared/hermes-agent.js';
 
 /** Providers whose durable conversation id is stored in SessionRecord.providerResumeId. */
 export function usesProviderResumeId(agentType: string | undefined): boolean {
   return agentType === 'cursor-headless'
     || agentType === 'copilot-sdk'
     || agentType === 'kimi-sdk'
+    || agentType === HERMES_AGENT_PROVIDER_ID
     || agentType === 'grok-sdk'
     || agentType === 'opencode-sdk'
     || agentType === 'deepseek-harness'
@@ -22,6 +24,7 @@ export function usesDirectoryScopedSessionListing(agentType: string | undefined)
   return agentType === 'opencode-sdk'
     || agentType === 'copilot-sdk'
     || agentType === 'kimi-sdk'
+    || agentType === HERMES_AGENT_PROVIDER_ID
     || agentType === 'grok-sdk'
     || isCodeBuddyProviderId(agentType);
 }

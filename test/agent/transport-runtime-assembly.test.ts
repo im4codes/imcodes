@@ -7,6 +7,7 @@ import {
 import type { TransportProvider } from '../../src/agent/transport-provider.js';
 import type { TransportMemoryRecallArtifact } from '../../shared/context-types.js';
 import { CAPABILITY_AI_SYSTEM_INSTRUCTIONS } from '../../shared/capability-management.js';
+import { HERMES_AGENT_PROVIDER_ID } from '../../shared/hermes-agent.js';
 
 function makeProvider(
   contextSupport: NonNullable<TransportProvider['capabilities']['contextSupport']>,
@@ -89,6 +90,7 @@ describe('buildProviderContextPayload', () => {
       'claude-code-sdk',
       'gemini-sdk',
       'kimi-sdk',
+      HERMES_AGENT_PROVIDER_ID,
       'copilot-sdk',
       'codex-sdk',
       'cursor-headless',

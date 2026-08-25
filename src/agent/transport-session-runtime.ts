@@ -401,6 +401,24 @@ function withTimeoutOutcome<T>(
   });
 }
 
+interface ActiveDelegationNotificationAdmission {
+  notification: ProviderDelegationNotification;
+  promise: Promise<AgentDelegationNotificationResult>;
+  status: 'pending' | 'delivered';
+}
+
+const MAX_ACTIVE_DELEGATION_NOTIFICATION_ADMISSIONS = 512;
+
+function sameDelegationNotification(
+  left: ProviderDelegationNotification,
+  right: ProviderDelegationNotification,
+): boolean {
+  return left.notificationId === right.notificationId
+    && left.delegationId === right.delegationId
+    && left.sourceSessionName === right.sourceSessionName
+    && left.text === right.text;
+}
+
 function isTransportSlashControl(message: string | undefined): boolean {
   return message?.trim().startsWith('/') === true;
 }
@@ -530,6 +548,14 @@ export class TransportSessionRuntime implements SessionRuntime {
   private _activeDispatchProviderAccepted = false;
   /** One serialized native-append flush; new rows are picked up by its loop. */
   private _activeAppendFlush: Promise<void> | null = null;
+  /** Runtime-level authority for active delegation admissions. Provider state
+   *  can settle before its serialized write does; keeping the same Promise and
+   *  delivered tombstone here prevents a timeout retry from falling through
+   *  to a second idle turn while the first write can still succeed. */
+  private readonly _activeDelegationNotificationAdmissions = new Map<
+    string,
+    ActiveDelegationNotificationAdmission
+  >();
   private _activeDispatchId: number | null = null;
   /** Summary delivery ownership for the active provider turn. A provider
    * accepting send() is not proof that the model consumed the context: the
@@ -2009,6 +2035,31 @@ export class TransportSessionRuntime implements SessionRuntime {
   ): Promise<AgentDelegationNotificationResult> {
     if (!this._providerSessionId) return AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE;
 
+    const existingAdmission = this._activeDelegationNotificationAdmissions.get(notification.notificationId);
+    if (existingAdmission) {
+      if (!sameDelegationNotification(existingAdmission.notification, notification)) {
+        logger.warn({
+          sessionKey: this.sessionKey,
+          notificationId: notification.notificationId,
+        }, 'active delegation notification id was reused with different immutable content');
+        return AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE;
+      }
+      const existingOutcome = await withTimeoutOutcome(
+        existingAdmission.promise,
+        DEFAULT_ACTIVE_DELEGATION_NOTIFICATION_TIMEOUT_MS,
+      );
+      if (existingOutcome.timedOut) return AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE;
+      if (existingOutcome.value === AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED) {
+        return AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED;
+      }
+      if (this._activeDelegationNotificationAdmissions.get(notification.notificationId) === existingAdmission) {
+        this._activeDelegationNotificationAdmissions.delete(notification.notificationId);
+      }
+      // The previous admission reached a terminal non-delivery result. It is
+      // now safe for this same invocation to retry against current runtime
+      // state, including the ordinary idle continuation path below.
+    }
+
     if (this.hasActiveTurnWork()) {
       if (this.provider.capabilities.activeDelegationNotification
           !== AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE
@@ -2022,11 +2073,47 @@ export class TransportSessionRuntime implements SessionRuntime {
       if (this._activeDispatchId !== null && !this._activeDispatchProviderAccepted) {
         return AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE;
       }
-      const outcome = await withTimeoutOutcome(
-        this.provider.notifyActiveDelegation(this._providerSessionId, {
+      this.pruneActiveDelegationNotificationAdmissions(
+        MAX_ACTIVE_DELEGATION_NOTIFICATION_ADMISSIONS - 1,
+      );
+      if (this._activeDelegationNotificationAdmissions.size
+          >= MAX_ACTIVE_DELEGATION_NOTIFICATION_ADMISSIONS) {
+        logger.warn({
+          sessionKey: this.sessionKey,
+          notificationId: notification.notificationId,
+          pendingAdmissions: this._activeDelegationNotificationAdmissions.size,
+        }, 'active delegation notification admission limit reached; retaining durable retry');
+        return AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE;
+      }
+      const providerNotification: ProviderDelegationNotification = {
           ...notification,
           deliveryKind: PROVIDER_ACTIVE_TURN_DELIVERY_KINDS.DELEGATION_REPLY,
-        }),
+      };
+      const admission = Promise.resolve().then(() => this.provider.notifyActiveDelegation!(
+        this._providerSessionId!,
+        providerNotification,
+      ));
+      const trackedAdmission: ActiveDelegationNotificationAdmission = {
+        notification: { ...notification },
+        promise: admission,
+        status: 'pending',
+      };
+      this._activeDelegationNotificationAdmissions.set(notification.notificationId, trackedAdmission);
+      void admission.then((result) => {
+        if (this._activeDelegationNotificationAdmissions.get(notification.notificationId) !== trackedAdmission) return;
+        if (result === AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED) {
+          trackedAdmission.status = 'delivered';
+          this.pruneActiveDelegationNotificationAdmissions();
+        } else {
+          this._activeDelegationNotificationAdmissions.delete(notification.notificationId);
+        }
+      }, () => {
+        if (this._activeDelegationNotificationAdmissions.get(notification.notificationId) === trackedAdmission) {
+          this._activeDelegationNotificationAdmissions.delete(notification.notificationId);
+        }
+      });
+      const outcome = await withTimeoutOutcome(
+        admission,
         DEFAULT_ACTIVE_DELEGATION_NOTIFICATION_TIMEOUT_MS,
       );
       // Admission must be a short control-plane operation. A provider adapter
@@ -2065,6 +2152,20 @@ export class TransportSessionRuntime implements SessionRuntime {
     // the ordinary user FIFO.
     this.removePendingMessage(notification.notificationId);
     return AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE;
+  }
+
+  private pruneActiveDelegationNotificationAdmissions(
+    limit = MAX_ACTIVE_DELEGATION_NOTIFICATION_ADMISSIONS,
+  ): void {
+    if (this._activeDelegationNotificationAdmissions.size <= limit) return;
+    for (const [notificationId, admission] of this._activeDelegationNotificationAdmissions) {
+      if (this._activeDelegationNotificationAdmissions.size <= limit) break;
+      // Pending admissions are irreversible-capable writes. Never evict one
+      // merely to satisfy a bound; reject new work until it reaches terminal.
+      if (admission.status === 'delivered') {
+        this._activeDelegationNotificationAdmissions.delete(notificationId);
+      }
+    }
   }
 
   /**
@@ -2421,6 +2522,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     this._backgroundSubagentWakeTimer = null;
     this._activeBackgroundSubagents.clear();
     this._pendingBackgroundSubagentWake.clear();
+    this._activeDelegationNotificationAdmissions.clear();
     for (const unsub of this._unsubscribes) unsub();
     this._unsubscribes = [];
 
