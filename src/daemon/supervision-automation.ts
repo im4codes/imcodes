@@ -43,7 +43,6 @@ import {
   AGENT_DELEGATION_REPLY_TIMELINE_EVENT,
   buildAgentDelegationReplyInstruction,
   buildAgentDelegationOrchestrationPrompt,
-  buildQuickAgentDelegationTask,
   extractAgentDelegationReplyAuthorityFromInstruction,
 } from '../../shared/agent-delegation.js';
 import {
@@ -2248,24 +2247,26 @@ class SupervisionAutomation {
     current.auditTargetSessionInstanceId = target.sessionInstanceId;
 
     const auditTask = [
-      buildQuickAgentDelegationTask('audit'),
+      'Ask the selected delegate to independently audit this session\'s most recent work and return PASS or REWORK with concrete evidence, prioritized defects, and unavailable checks.',
       ...(current.auditDepth === 'narrow'
-        ? ['Scope: this change is NARROW — small, self-contained, blast radius visible in the diff. Instruct the delegate to audit the change and what it directly touches rather than re-reviewing unrelated subsystems or running the full matrix. A proportionate check is the correct outcome, not a thin version of a full one; still require executable evidence where a relevant check exists.']
+        ? ['Scope: this change is NARROW; inspect the diff and its direct blast radius, using proportionate executable evidence.']
         : []),
-      'This is the configured automatic supervision audit. You—not the daemon—must prepare the audit background from your real current-session context and send it to the selected delegate with reply enabled.',
-      `Automatic audit attempt ID: ${current.auditAttemptId}. Include this exact attempt ID in the delegated audit brief. The route is fixed: send exactly one reply-enabled audit request to ${targetName}. Do not choose another session or send a second audit while this attempt is pending.`,
-      `When send_message is available, set reply=true and audit=${JSON.stringify({
+      'You—not the daemon—must prepare the brief from the real current context.',
+      `Automatic audit attempt ID: ${current.auditAttemptId}. Include this exact attempt ID in the delegated audit brief; send exactly one reply-enabled audit request to ${targetName}. Do not choose another session or send a second audit while this attempt is pending.`,
+      `For send_message use reply=true and audit=${JSON.stringify({
         kind: AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT,
         attemptId: current.auditAttemptId,
-      })}. This structured metadata is required so supervision can register the pending audit without parsing natural-language task text.`,
-      'Do not commit, push, deploy, or modify the implementation while waiting for the audit.',
+      })}; this metadata is required.`,
+      'While waiting: do not modify, commit, push, or deploy.',
+      // Keep the result contract ahead of variable baseline context. The
+      // delegation renderer bounds task text, and a large OpenSpec/path list
+      // must never truncate away the PASS/REWORK markers that close the audit.
+      `After the reply, report the findings and end with exactly one matching marker: ${PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS.PASS} or ${PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS.REWORK}. Emit neither marker before the reply.`,
       baseline.changeDir ? `Relevant OpenSpec change: ${baseline.changeDir}` : '',
       baseline.fileContents.length > 0
-        ? `Relevant changed paths observed by supervision: ${baseline.fileContents.map((entry) => entry.path).join(', ')}`
+        ? `Observed changed paths: ${baseline.fileContents.map((entry) => entry.path).join(', ')}`
         : '',
-      'After the delegated reply returns to this session, evaluate its evidence and state the concrete findings.',
-      `End that post-reply final response with exactly one marker: ${PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS.PASS} or ${PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS.REWORK}. Do not emit either marker before the delegated reply arrives.`,
-    ].filter(Boolean).join(' ');
+    ].filter(Boolean).join('\n');
     const orchestrationPrompt = buildAgentDelegationOrchestrationPrompt({
       targetSession: targetName,
       targetLabel: target.label,
@@ -2406,6 +2407,13 @@ class SupervisionAutomation {
     current.auditMarkerWarningEmitted = false;
     current.terminalState = undefined;
     current.lastAssistantText = undefined;
+    // A REWORK verdict starts a new substantive revision. Do not carry the
+    // preceding revision's same-bucket continue streak into this repair turn;
+    // otherwise a legitimate fix/test cycle can immediately hit the repeated
+    // auto-continue limit and stall before the fresh audit. The task-wide hard
+    // limit remains intact, and maxAuditLoops still bounds audit/rework cycles.
+    current.continueStreakCount = 0;
+    current.lastContinueBucket = undefined;
     timelineEmitter.emit(
       current.sessionName,
       'user.message',

@@ -8,6 +8,7 @@ import {
 import { getAgentBadgeConfig, getAutoSessionLabelPrefix } from '../agent-display.js';
 
 export interface QuickAgentDelegationCandidate {
+  /** Exact send_message target ID; pass directly without a target-list lookup. */
   sessionName: string;
   agentType: string;
   label?: string | null;

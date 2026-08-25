@@ -250,18 +250,29 @@ describe('agent delegation shared contract', () => {
       task: 'review the queue sync bug',
     });
     expect(prompt).toContain('current session orchestrator');
-    expect(prompt).toContain('Worker One (deck_repo_w1)');
+    expect(prompt).toContain('Target label: Worker One');
+    expect(prompt).toContain('Target ID (pass directly to send_message; do not look it up): deck_repo_w1');
     expect(prompt).toContain('review the queue sync bug');
-    expect(prompt).toContain('organize the relevant current-session context yourself');
-    expect(prompt).toContain('Do not send the raw user task by itself.');
+    expect(prompt).toContain('Prepare one concise, self-contained brief from the current context');
+    expect(prompt).toContain('Do not forward the raw task alone.');
+    expect(prompt).toContain('send_message(target="deck_repo_w1", reply=true)');
+    expect(prompt).toContain('Do not call send_list_targets.');
     expect(prompt).toContain('imcodes send --reply "deck_repo_w1"');
     expect(prompt).not.toContain('imcodes send --no-reply "deck_repo_w1"');
-    expect(prompt).toContain('do not poll the delegate, session status, logs, or transcripts');
-    expect(prompt).toContain('bounded structured reply capability');
-    expect(prompt).toContain('multiple replies until expiry');
-    expect(prompt).toContain('multiple @ delegates');
-    expect(prompt).toContain('separate per-delegate briefs');
-    expect(prompt).toContain('each delegate result separately');
+    expect(prompt).toContain('do not poll session state, logs, or transcripts');
+    expect(prompt).not.toContain('multiple replies until expiry');
+    expect(prompt).not.toContain('multiple @ delegates');
+  });
+
+  it('bounds an oversized delegation task instead of flooding the target turn', () => {
+    const prompt = buildAgentDelegationOrchestrationPrompt({
+      targetSession: 'deck_repo_w1',
+      task: '超'.repeat(10_000),
+    });
+    expect(prompt).toContain('[truncated]');
+    expect(Buffer.byteLength(prompt, 'utf8')).toBeLessThan(6 * 1024);
+    expect(prompt).toContain('Target ID (pass directly to send_message; do not look it up): deck_repo_w1');
+    expect(prompt.match(/imcodes send --reply/g)).toHaveLength(1);
   });
 
   it('builds quick presets as ordinary delegation tasks and keeps custom text exact', () => {

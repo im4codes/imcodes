@@ -407,6 +407,24 @@ export interface SupervisionContinueInstructions {
   gap?: string;
 }
 
+const SUPERVISION_CONTINUE_ACTION_BYTES = 2 * 1024;
+const SUPERVISION_CONTINUE_CONTEXT_TASK_BYTES = 2 * 1024;
+const SUPERVISION_CONTINUE_CONTEXT_RESULT_BYTES = 1024;
+const SUPERVISION_REWORK_FINDINGS_BYTES = 4 * 1024;
+const SUPERVISION_REWORK_TASK_BYTES = 2 * 1024;
+
+function buildCompactContinueRulesSection(
+  detail: SupervisionCustomInstructionsDetail | undefined,
+): string {
+  if (!detail?.text.trim()) return '';
+  const scope = detail.source === 'global'
+    ? 'global'
+    : detail.source === 'merged'
+      ? 'global + session'
+      : 'session';
+  return `User supervision rules (${scope}):\n${detail.text.trim()}`;
+}
+
 export function buildSupervisionContinuePrompt(
   taskRequest: string,
   assistantResponse: string | undefined,
@@ -426,33 +444,21 @@ export function buildSupervisionContinuePrompt(
   customInstructions?: string | SupervisionCustomInstructionsDetail,
   contractId: string = SUPERVISION_CONTRACT_IDS.CONTINUE,
 ): string {
-  // Continue prompt goes to the TARGET session's chat (user-visible), not to
-  // the supervisor judge. It must stay a lightweight nudge — the IM.codes
-  // capability background is NOT injected here, because:
-  //   1. The target session already has `customInstructions` in its own
-  //      system prompt / session config, and its chat history retains the
-  //      original user request and last assistant turn.
-  //   2. The capability docs are authored to help the SUPERVISOR classify
-  //      workflows (OpenSpec / P2P / imcodes send) as autonomous work, not
-  //      to re-teach the target agent what tools it already has.
-  // Previously this function appended buildImcodesWorkflowBackgroundSection()
-  // here; that dumped ~80 lines of operator-facing docs into every continue
-  // turn, leaking into user-visible chat and polluting downstream P2P runs
-  // that harvested the latest message as `userText`.
-  //
-  // The taskRequest + assistantResponse restatements are kept because some
-  // transport providers rehydrate conversation state per-turn from the
-  // payload rather than from server-side history; dropping them risks the
-  // agent losing task framing mid-run. They're cheap (a few KB) compared to
-  // the background block we removed.
-  // Normalize the structured/legacy instructions into a single shape so the
-  // render can pull reason / nextAction / gap uniformly.
+  // This prompt is user-visible and can be injected repeatedly. Keep only the
+  // concrete remaining action, a bounded fallback context for providers that
+  // rehydrate per turn, and the user's actual supervision rules. Detailed
+  // workflow documentation and repeated prose belong to the supervisor judge,
+  // not to every continuation turn.
   const parsed: SupervisionContinueInstructions = typeof instructions === 'string'
     ? { reason: instructions }
     : instructions;
-  const reason = parsed.reason;
-  const nextAction = parsed.nextAction?.trim();
-  const gap = parsed.gap?.trim();
+  const reason = sanitizePeerAuditText(parsed.reason, SUPERVISION_CONTINUE_ACTION_BYTES);
+  const nextAction = parsed.nextAction
+    ? sanitizePeerAuditText(parsed.nextAction, SUPERVISION_CONTINUE_ACTION_BYTES)
+    : '';
+  const gap = parsed.gap
+    ? sanitizePeerAuditText(parsed.gap, SUPERVISION_CONTINUE_ACTION_BYTES)
+    : '';
   // Normalize: a bare string keeps the old "session-specific" label; a
   // detail object drives the correct heading per its `source` tag. Both
   // empty → section is omitted entirely.
@@ -460,28 +466,24 @@ export function buildSupervisionContinuePrompt(
     typeof customInstructions === 'string'
       ? classifySupervisionCustomInstructions(undefined, customInstructions, undefined)
       : customInstructions;
+  const action = nextAction || reason || 'Continue the remaining task work.';
+  const distinctGap = gap && gap !== action ? gap : '';
+  const distinctReason = nextAction && reason !== action && reason !== distinctGap ? reason : '';
+  const taskContext = sanitizePeerAuditText(taskRequest, SUPERVISION_CONTINUE_CONTEXT_TASK_BYTES)
+    || '(use the existing conversation context)';
+  const resultContext = assistantResponse?.trim()
+    ? sanitizePeerAuditText(assistantResponse, SUPERVISION_CONTINUE_CONTEXT_RESULT_BYTES)
+    : '';
   return [
     `[Contract: ${contractId}]`,
     'Continue working on the same task.',
-    // Lead with the imperative nextAction when available. This is the fix
-    // for the "supervision keeps tugging back and forth" loop: when the
-    // supervisor named a concrete next step, the target reads it here
-    // first and has something actionable to execute. Without this, the
-    // agent only saw "Supervisor reason: ..." and had to infer what to do
-    // — which often meant rewriting the same answer.
-    nextAction ? `Next action required: ${nextAction}` : null,
-    gap ? `What's missing: ${gap}` : null,
-    `Supervisor reason: ${reason}`,
-    'Do not restart from scratch or restate completed work.',
-    'Focus only on the remaining steps needed to finish the task.',
-    'If you are truly blocked or need clarification, say that explicitly.',
-    buildCustomInstructionsSection(detail) || null,
-    '',
-    'Original task request:',
-    taskRequest,
-    '',
-    'Most recent assistant response:',
-    assistantResponse?.trim() || '(no assistant response captured)',
+    `Action: ${action}`,
+    distinctGap ? `Missing: ${distinctGap}` : null,
+    distinctReason ? `Why: ${distinctReason}` : null,
+    'Do only this remaining work; do not repeat completed work. If it cannot proceed, state the exact blocker.',
+    buildCompactContinueRulesSection(detail) || null,
+    `Task context: ${taskContext}`,
+    resultContext ? `Last result: ${resultContext}` : null,
   ].filter((line): line is string => line !== null).join('\n');
 }
 
@@ -502,24 +504,20 @@ export function appendTaskRunContract(
 }
 
 export function buildReworkBriefPrompt(
-  sessionName: string,
+  _sessionName: string,
   userText: string,
-  lastAssistantText: string | undefined,
+  _lastAssistantText: string | undefined,
   verdictText: string,
 ): string {
+  const findings = sanitizePeerAuditText(verdictText, SUPERVISION_REWORK_FINDINGS_BYTES);
+  const taskContext = sanitizePeerAuditText(userText, SUPERVISION_REWORK_TASK_BYTES)
+    || '(use the existing conversation context)';
   return [
     `[Contract: ${SUPERVISION_CONTRACT_IDS.REWORK_BRIEF}]`,
     'Audit verdict: REWORK',
-    `Session: ${sessionName}`,
-    `Request: ${userText}`,
-    `Current assistant result: ${lastAssistantText ?? '(none)'}`,
-    '',
-    'Audit feedback:',
-    verdictText,
-    '',
-    'Apply the required fixes and continue the same task.',
-    'This REWORK verdict means the previous audit did not pass. It is not authorization to finalize the repository.',
-    'After fixing and validating the change, stop before repository finalization and report that the implementation is ready for a fresh peer audit.',
-    'Do not stage, commit, push, merge, release, publish, or deploy until a new matching peer audit returns PASS.',
+    `Fix these findings, then run the relevant validation:\n${findings}`,
+    'Continue the same task. After reporting the repair and validation, the daemon will start one fresh peer audit automatically; do not delegate or poll an auditor yourself.',
+    'Do not stage, commit, push, merge, release, publish, or deploy until the fresh matching audit returns PASS.',
+    `Task context: ${taskContext}`,
   ].join('\n');
 }

@@ -228,10 +228,23 @@ describe('supervision prompts', () => {
       'The auditor found a missing regression test.',
     );
 
-    expect(prompt).toContain('This REWORK verdict means the previous audit did not pass.');
-    expect(prompt).toContain('stop before repository finalization');
-    expect(prompt).toContain('ready for a fresh peer audit');
-    expect(prompt).toContain('Do not stage, commit, push, merge, release, publish, or deploy until a new matching peer audit returns PASS.');
+    expect(prompt).toContain('Fix these findings, then run the relevant validation:');
+    expect(prompt).toContain('the daemon will start one fresh peer audit automatically');
+    expect(prompt).toContain('do not delegate or poll an auditor yourself');
+    expect(prompt).toContain('Do not stage, commit, push, merge, release, publish, or deploy until the fresh matching audit returns PASS.');
+    expect(prompt).not.toContain('Current assistant result:');
+  });
+
+  it('keeps REWORK feedback and task context bounded', () => {
+    const prompt = buildReworkBriefPrompt(
+      'deck_supervision_brain',
+      '任务'.repeat(4_000),
+      'old result'.repeat(2_000),
+      `Verdict: REWORK\n${'缺陷'.repeat(5_000)}`,
+    );
+    expect(prompt).toContain('[truncated]');
+    expect(Buffer.byteLength(prompt, 'utf8')).toBeLessThan(7 * 1024);
+    expect(prompt).not.toContain('old result');
   });
 
   it('does NOT include IM.codes workflow background in the continue prompt', () => {
@@ -262,10 +275,12 @@ describe('supervision prompts', () => {
     // The lightweight nudge contract and user-supplied custom instructions
     // (which ARE session-scoped guidance, not operator docs) stay.
     expect(prompt).toContain('Continue working on the same task.');
-    expect(prompt).toContain('Supervisor reason: OpenSpec and follow-up work remain');
+    expect(prompt).toContain('Action: OpenSpec and follow-up work remain');
     expect(prompt).toContain('Prefer OpenSpec when a change is already referenced.');
-    expect(prompt).toContain('Original task request:');
+    expect(prompt).toContain('Task context:');
     expect(prompt).toContain('Finish the task with the right IM.codes tools');
+    expect(prompt).not.toContain('Original task request:');
+    expect(prompt).not.toContain('Most recent assistant response:');
   });
 
   it('keeps IM.codes workflow background on the decision-repair prompt (supervisor-facing)', () => {

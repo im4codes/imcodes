@@ -5846,7 +5846,7 @@ afterEach(() => {
     const sent = gatherSendCalls(ws).at(-1)!;
     expect(sent.sessionName).toBe('deck_proj_brain');
     expect(sent.text).toContain('You are the current session orchestrator for an agent delegation.');
-    expect(sent.text).toContain('Exact delegate target session: deck_sub_reviewer');
+    expect(sent.text).toContain('Target ID (pass directly to send_message; do not look it up): deck_sub_reviewer');
     expect(sent.text).toContain('independently audit this session\'s most recent work');
     expect(sent.text).toContain('imcodes send --reply "deck_sub_reviewer"');
     expect(ws.send.mock.calls.some(([message]) => message?.type === 'peer_audit.quick_start')).toBe(false);
@@ -5882,7 +5882,7 @@ afterEach(() => {
 
     expect(ws.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'session.edit_queued_message' }));
     const sent = gatherSendCalls(ws).at(-1)!;
-    expect(sent.text).toContain('Exact delegate target session: deck_sub_reviewer');
+    expect(sent.text).toContain('Target ID (pass directly to send_message; do not look it up): deck_sub_reviewer');
     expect((screen.getByRole('textbox') as HTMLDivElement).textContent).toBe('queued original');
     expect(screen.getByText(/queued · edit/i)).toBeDefined();
   });
@@ -6668,10 +6668,11 @@ afterEach(() => {
       text: expect.stringContaining('You are the current session orchestrator for an agent delegation.'),
     }));
     const sent = gatherSendCalls(ws).at(-1)!;
-    expect(sent.text).toContain('Exact delegate target session: deck_sub_w1');
-    expect(sent.text).toContain('User task to delegate:\nplease review');
-    expect(sent.text).toContain('organize the relevant current-session context yourself');
-    expect(sent.text).toContain('Do not send the raw user task by itself.');
+    expect(sent.text).toContain('Target ID (pass directly to send_message; do not look it up): deck_sub_w1');
+    expect(sent.text).toContain('Task: please review');
+    expect(sent.text).toContain('Prepare one concise, self-contained brief from the current context');
+    expect(sent.text).toContain('Do not forward the raw task alone.');
+    expect(sent.text).toContain('send_message(target="deck_sub_w1", reply=true)');
     expect(sent.text).toContain('imcodes send --reply "deck_sub_w1"');
     expect(sent).not.toHaveProperty('delegateTarget');
 
@@ -6790,8 +6791,9 @@ afterEach(() => {
       sessionName: 'deck_my-project_brain',
     });
     expect(sent.text).toContain('You are the current session orchestrator for an agent delegation.');
-    expect(sent.text).toContain('Selected delegate: w1 (deck_sub_w1)');
-    expect(sent.text).toContain('User task to delegate:\nplease review');
+    expect(sent.text).toContain('Target label: w1');
+    expect(sent.text).toContain('Target ID (pass directly to send_message; do not look it up): deck_sub_w1');
+    expect(sent.text).toContain('Task: please review');
     expect(sent).toHaveProperty('text');
     expect(sent).not.toHaveProperty('delegateTarget');
     expect(sent).not.toHaveProperty('p2pAtTargets');
@@ -7906,7 +7908,7 @@ afterEach(() => {
 
       const sent = gatherSendCalls(ws).at(-1)!;
       expect(sent).toMatchObject({ sessionName: 'deck_my-project_brain' });
-      expect(sent.text).toContain('Exact delegate target session: deck_sub_w1');
+      expect(sent.text).toContain('Target ID (pass directly to send_message; do not look it up): deck_sub_w1');
       expect(sent.text).toContain('User task to delegate:\nplease review');
       expect(sent).not.toHaveProperty('delegateTarget');
       expect(screen.queryByText('title')).toBeNull();

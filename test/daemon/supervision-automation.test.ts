@@ -854,7 +854,7 @@ describe('SupervisionAutomation', () => {
     expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
     expect(String(mockTransportRuntime.send.mock.calls[0]?.[0])).toContain('在 211 完整测试');
     expect(String(mockTransportRuntime.send.mock.calls[0]?.[0])).toContain('post-audit tests');
-    expect(String(mockTransportRuntime.send.mock.calls[0]?.[0])).not.toContain('Exact delegate target session:');
+    expect(String(mockTransportRuntime.send.mock.calls[0]?.[0])).not.toContain('Target ID (pass directly to send_message; do not look it up):');
     expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({
       phase: 'finalizing',
     });
@@ -948,15 +948,18 @@ describe('SupervisionAutomation', () => {
     expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
     const orchestrationPrompt = String(mockTransportRuntime.send.mock.calls[0]?.[0]);
     expect(orchestrationPrompt).toContain('You are the current session orchestrator for an agent delegation.');
-    expect(orchestrationPrompt).toContain('Exact delegate target session: deck_sub_reviewer');
+    expect(orchestrationPrompt).toContain('Target ID (pass directly to send_message; do not look it up): deck_sub_reviewer');
     expect(orchestrationPrompt).toContain('imcodes send --reply "deck_sub_reviewer"');
     expect(orchestrationPrompt).toContain('send exactly one reply-enabled audit request to deck_sub_reviewer');
     expect(orchestrationPrompt).toContain('Include this exact attempt ID in the delegated audit brief');
     expect(orchestrationPrompt).toContain('"kind":"supervision_audit"');
     expect(orchestrationPrompt).toContain('"attemptId":');
     expect(orchestrationPrompt).toContain('Do not choose another session or send a second audit');
-    expect(orchestrationPrompt).toContain('You—not the daemon—must prepare the audit background');
-    expect(orchestrationPrompt).toContain('Do not commit, push, deploy');
+    expect(orchestrationPrompt).toContain('You—not the daemon—must prepare the brief');
+    expect(orchestrationPrompt).toContain('do not modify, commit, push, or deploy');
+    expect(orchestrationPrompt).not.toContain('A reply-enabled send gives the delegate');
+    expect(orchestrationPrompt).not.toContain('If the user selected or mentioned multiple @ delegates');
+    expect(Buffer.byteLength(orchestrationPrompt, 'utf8')).toBeLessThan(5 * 1024);
     expect(mockStartP2pRun).not.toHaveBeenCalled();
     expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({
       phase: 'auditing',
@@ -1563,7 +1566,7 @@ describe('SupervisionAutomation', () => {
     await sleep(50);
 
     expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
-    expect(String(mockTransportRuntime.send.mock.calls[0]?.[0])).toContain('Exact delegate target session: deck_sub_reviewer');
+    expect(String(mockTransportRuntime.send.mock.calls[0]?.[0])).toContain('Target ID (pass directly to send_message; do not look it up): deck_sub_reviewer');
     expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({
       phase: 'auditing',
       snapshot: { auditTargetSessionName: 'deck_sub_reviewer' },
@@ -1818,7 +1821,7 @@ describe('SupervisionAutomation', () => {
     const finalizationPrompt = String(mockTransportRuntime.send.mock.calls[1]?.[0]);
     expect(finalizationPrompt).toContain('[Contract: supervision_continue_v1]');
     expect(finalizationPrompt).toContain('stage/commit/push');
-    expect(finalizationPrompt).not.toContain('Exact delegate target session:');
+    expect(finalizationPrompt).not.toContain('Target ID (pass directly to send_message; do not look it up):');
     expect(timelineEmitter.replay('deck_supervision_brain', 0).events).toEqual(expect.arrayContaining([
       expect.objectContaining({
         type: 'user.message',
@@ -1970,7 +1973,7 @@ describe('SupervisionAutomation', () => {
       expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
     }, { timeout: 4_000 });
     const auditPrompt = String(mockTransportRuntime.send.mock.calls[0]?.[0]);
-    expect(auditPrompt).toContain('Exact delegate target session: deck_sub_reviewer');
+    expect(auditPrompt).toContain('Target ID (pass directly to send_message; do not look it up): deck_sub_reviewer');
     expect(auditPrompt).toContain('imcodes send --reply "deck_sub_reviewer"');
     expect(auditPrompt).toContain('send exactly one reply-enabled audit request to deck_sub_reviewer');
     expect(auditPrompt).not.toContain('[Contract: supervision_continue_v1]');
@@ -1994,14 +1997,14 @@ describe('SupervisionAutomation', () => {
     expect(mockTransportRuntime.send).toHaveBeenCalledTimes(2);
     const finalizationPrompt = String(mockTransportRuntime.send.mock.calls[1]?.[0]);
     expect(finalizationPrompt).toContain('Do not request or start another audit');
-    expect(finalizationPrompt).not.toContain('Exact delegate target session:');
+    expect(finalizationPrompt).not.toContain('Target ID (pass directly to send_message; do not look it up):');
     expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({ phase: 'finalizing' });
 
     completeTurn('已提交并推送审计通过的改动。');
     await sleep(25);
     expect(mockTransportRuntime.send).toHaveBeenCalledTimes(2);
     expect(mockTransportRuntime.send.mock.calls.filter((call) =>
-      String(call[0]).includes('Exact delegate target session:'))).toHaveLength(1);
+      String(call[0]).includes('Target ID (pass directly to send_message; do not look it up):'))).toHaveLength(1);
     expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
   });
 
@@ -2026,7 +2029,7 @@ describe('SupervisionAutomation', () => {
     expect(mockTransportRuntime.send).toHaveBeenCalledTimes(2);
     const reworkPrompt = String(mockTransportRuntime.send.mock.calls[1]?.[0]);
     expect(reworkPrompt).toContain('Audit verdict: REWORK');
-    expect(reworkPrompt).toContain('Do not stage, commit, push, merge, release, publish, or deploy until a new matching peer audit returns PASS.');
+    expect(reworkPrompt).toContain('Do not stage, commit, push, merge, release, publish, or deploy until the fresh matching audit returns PASS.');
     expect(reworkPrompt).not.toContain('Commit the completed changes and push to origin/dev.');
     expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({
       phase: 'execution',
@@ -2299,7 +2302,7 @@ describe('SupervisionAutomation', () => {
 
     expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
     expect(String(mockTransportRuntime.send.mock.calls[0]?.[0])).toContain('Continue working on the same task.');
-    expect(String(mockTransportRuntime.send.mock.calls[0]?.[0])).toContain('Supervisor reason: tests are still missing');
+    expect(String(mockTransportRuntime.send.mock.calls[0]?.[0])).toContain('Action: tests are still missing');
     expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({
       commandId: 'cmd-continue',
       phase: 'execution',
@@ -2719,6 +2722,74 @@ describe('SupervisionAutomation', () => {
     expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeDefined();
   });
 
+  it('starts a fresh continue streak for REWORK so repair can reach the next audit', async () => {
+    const snapshot = await seedSession('supervised_audit', false, 2, {
+      maxAutoContinueStreak: 1,
+      maxAutoContinueTotal: 0,
+    });
+    mockSupervisionDecide
+      .mockResolvedValueOnce({
+        decision: 'continue',
+        reason: 'write the missing regression tests',
+        confidence: 0.8,
+      })
+      .mockResolvedValueOnce({
+        decision: 'complete',
+        reason: 'the first implementation and tests are ready for audit',
+        confidence: 0.9,
+        requiresAudit: true,
+      })
+      .mockResolvedValueOnce({
+        decision: 'continue',
+        reason: 'write the repaired regression tests',
+        confidence: 0.8,
+      });
+
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent(
+      'deck_supervision_brain',
+      'cmd-rework-resets-continue-streak',
+      'implement and audit the feature',
+      snapshot,
+    );
+    beginRun('cmd-rework-resets-continue-streak', 'implement and audit the feature');
+
+    completeTurn('implemented the first version');
+    await waitForTransportSendCount(1);
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({
+      continueStreakCount: 1,
+      lastContinueBucket: 'test_verify',
+    });
+
+    completeTurn('added the first regression tests');
+    await waitForRunPhase('auditing');
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(2);
+
+    completeDelegatedAudit('REWORK', 'Repair the edge case and add its regression test.');
+    await waitForRunPhase('execution');
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(3);
+    expect(String(mockTransportRuntime.send.mock.calls[2]?.[0])).toContain(
+      'the daemon will start one fresh peer audit automatically',
+    );
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({
+      continueStreakCount: 0,
+      phase: 'execution',
+    });
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')?.lastContinueBucket).toBeUndefined();
+
+    completeTurn('repaired the edge case');
+    await waitForTransportSendCount(4);
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({
+      continueStreakCount: 1,
+      lastContinueBucket: 'test_verify',
+      phase: 'execution',
+    });
+    expect(timelineEmitter.replay('deck_supervision_brain', 0).events.some((event) =>
+      event.type === 'assistant.text'
+      && event.payload.automationKind === 'supervision-warning'
+      && String(event.payload.text ?? '').includes('repeated auto-continue limit'))).toBe(false);
+  });
+
   it('activates queued task intents only when the matching user message is dispatched', async () => {
     const snapshot = await seedSession('supervised');
     supervisionAutomation.init();
@@ -2853,6 +2924,48 @@ describe('SupervisionAutomation', () => {
     expect(orchestrationPrompt).toContain('changed-files.txt');
     expect(orchestrationPrompt).toContain('validation-output.txt');
     expect(mockStartP2pRun).not.toHaveBeenCalled();
+  });
+
+  it('keeps automatic-audit routing and result markers ahead of oversized path truncation', async () => {
+    const snapshot = await seedSession('supervised_audit', true);
+    const specsDir = path.join(
+      projectDir!,
+      'openspec',
+      'changes',
+      'supervised-task-automation',
+      'specs',
+    );
+    await Promise.all(Array.from({ length: 47 }, (_, index) => writeFile(
+      path.join(specsDir, `audit-context-${String(index).padStart(2, '0')}-${'x'.repeat(120)}.md`),
+      '# Audit context\n',
+    )));
+
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent(
+      'deck_supervision_brain',
+      'cmd-large-audit-context',
+      'finish openspec/changes/supervised-task-automation implementation',
+      snapshot,
+    );
+    beginRun(
+      'cmd-large-audit-context',
+      'finish openspec/changes/supervised-task-automation implementation',
+    );
+
+    completeTurn('implemented the large change');
+    await waitForTransportSendCount(1);
+
+    const prompt = String(mockTransportRuntime.send.mock.calls[0]?.[0]);
+    expect(prompt).toContain('[truncated]');
+    expect(prompt).toContain('Target ID (pass directly to send_message; do not look it up): deck_sub_reviewer');
+    expect(prompt).toContain('send_message(target="deck_sub_reviewer", reply=true)');
+    expect(prompt).toContain('Do not call send_list_targets.');
+    expect(prompt).toContain('imcodes send --reply "deck_sub_reviewer"');
+    expect(prompt).toContain('"kind":"supervision_audit"');
+    expect(prompt).toContain('"attemptId":');
+    expect(prompt).toContain('While waiting: do not modify, commit, push, or deploy.');
+    expect(prompt).toContain(PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS.PASS);
+    expect(prompt).toContain(PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS.REWORK);
   });
 
   it('falls back to contextual audit when the task does not resolve to a specific OpenSpec change', async () => {
@@ -3023,7 +3136,7 @@ describe('SupervisionAutomation', () => {
     }, { timeout: 4_000 });
 
     const auditPrompt = String(mockTransportRuntime.send.mock.calls[0]?.[0]);
-    expect(auditPrompt).toContain('Exact delegate target session: deck_sub_reviewer');
+    expect(auditPrompt).toContain('Target ID (pass directly to send_message; do not look it up): deck_sub_reviewer');
     expect(auditPrompt).toContain('imcodes send --reply "deck_sub_reviewer"');
     expect(auditPrompt).toContain('send exactly one reply-enabled audit request to deck_sub_reviewer');
     expect(auditPrompt).not.toContain('[Contract: supervision_continue_v1]');
@@ -3064,7 +3177,7 @@ describe('SupervisionAutomation', () => {
     }, { timeout: 4_000 });
 
     const prompt = String(mockTransportRuntime.send.mock.calls[0]?.[0]);
-    expect(prompt).toContain('Exact delegate target session: deck_sub_reviewer');
+    expect(prompt).toContain('Target ID (pass directly to send_message; do not look it up): deck_sub_reviewer');
     expect(prompt).toContain('imcodes send --reply "deck_sub_reviewer"');
     expect(prompt).not.toContain('[Contract: supervision_continue_v1]');
     expect(prompt).not.toContain('audit>plan');
@@ -3145,7 +3258,7 @@ describe('SupervisionAutomation', () => {
       assistantResponse: expect.stringContaining('Hermes Agent ACP 接入已完成'),
     }));
     expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
-    expect(String(mockTransportRuntime.send.mock.calls[0]?.[0])).toContain('Exact delegate target session: deck_sub_reviewer');
+    expect(String(mockTransportRuntime.send.mock.calls[0]?.[0])).toContain('Target ID (pass directly to send_message; do not look it up): deck_sub_reviewer');
     expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({ phase: 'auditing' });
 
     timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'running' });

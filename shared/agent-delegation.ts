@@ -361,6 +361,23 @@ export interface AgentDelegationOrchestrationPromptInput {
   task: string;
 }
 
+const AGENT_DELEGATION_ORCHESTRATION_TASK_BYTES = 4 * 1024;
+
+function truncateAgentDelegationUtf8(value: string, maxBytes: number): string {
+  if (agentDelegationByteLength(value) <= maxBytes) return value;
+  const suffix = '\n[truncated]';
+  const suffixBytes = agentDelegationByteLength(suffix);
+  let used = 0;
+  let output = '';
+  for (const codePoint of value) {
+    const bytes = agentDelegationByteLength(codePoint);
+    if (used + bytes + suffixBytes > maxBytes) break;
+    output += codePoint;
+    used += bytes;
+  }
+  return output + suffix;
+}
+
 export const QUICK_AGENT_DELEGATION_PRESETS = ['audit', 'discussion', 'brainstorm', 'custom'] as const;
 export type QuickAgentDelegationPreset = typeof QUICK_AGENT_DELEGATION_PRESETS[number];
 
@@ -393,29 +410,20 @@ export function buildQuickAgentDelegationTask(
 export function buildAgentDelegationOrchestrationPrompt(input: AgentDelegationOrchestrationPromptInput): string {
   const targetSession = input.targetSession.trim();
   const targetLabel = input.targetLabel?.trim();
-  const task = input.task.trim();
-  const displayTarget = targetLabel && targetLabel !== targetSession
-    ? `${targetLabel} (${targetSession})`
-    : targetSession;
+  const task = truncateAgentDelegationUtf8(
+    input.task.trim(),
+    AGENT_DELEGATION_ORCHESTRATION_TASK_BYTES,
+  );
   return [
     'You are the current session orchestrator for an agent delegation.',
-    '',
-    `Selected delegate: ${displayTarget}`,
-    `Exact delegate target session: ${targetSession}`,
-    '',
-    'User task to delegate:',
-    task,
-    '',
-    'Before contacting the delegate, organize the relevant current-session context yourself: summarize the goal, constraints, repo paths, recent decisions, current state, and acceptance criteria the delegate needs. Do not send the raw user task by itself.',
-    '',
-    'Then dispatch a self-contained delegation brief to the selected delegate using the exact target session above, and require a reply. Prefer the available send_message tool with reply enabled when present; otherwise use:',
+    targetLabel && targetLabel !== targetSession ? `Target label: ${targetLabel}` : null,
+    `Target ID (pass directly to send_message; do not look it up): ${targetSession}`,
+    `Task: ${task}`,
+    'Prepare one concise, self-contained brief from the current context (goal, scope, relevant paths/state, decisions, validation, acceptance criteria, and risks). Do not forward the raw task alone.',
+    `Send it exactly once with send_message(target=${JSON.stringify(targetSession)}, reply=true). Do not call send_list_targets. If send_message is unavailable, use:`,
     `imcodes send --reply ${JSON.stringify(targetSession)} ${JSON.stringify('Task: <self-contained brief>\nContext: <relevant current-session facts>\nAcceptance criteria: <how to verify>\nReply: send the result back to this session when done')}`,
-    'A reply-enabled send gives the delegate a bounded structured reply capability that may send multiple replies until expiry and routes each result back through this session provider’s notification path. After dispatch, do not poll the delegate, session status, logs, or transcripts; wait for reply notifications to arrive.',
-    '',
-    'If the user selected or mentioned multiple @ delegates, split the work into separate per-delegate briefs, dispatch each one independently with reply required, and track/report each delegate result separately.',
-    '',
-    'Keep this session responsible for orchestration and final judgment. Do not implement the delegated task yourself unless implementation is needed only to prepare or verify the delegation brief.',
-  ].join('\n');
+    'After sending, do not poll session state, logs, or transcripts; wait for reply notifications. Do not perform the delegated work unless needed only to prepare or verify the brief.',
+  ].filter((line): line is string => line !== null).join('\n');
 }
 
 export function isAgentDelegationForwardedPayloadText(text: string): boolean {
