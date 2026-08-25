@@ -6461,7 +6461,7 @@ export function App() {
           />
         </FloatingPanel>
       )}
-      {showControlledNodes && (
+      {showControlledNodes && !mobileRemoteSurfaceActive && (
         <FloatingPanel
           id="controlled-nodes"
           title={trans('controlled_nodes.title')}
@@ -6659,7 +6659,7 @@ export function App() {
 
       {/* Sub-session windows (floating) — only show if not pinned */}
       {retainedWindowSubs.slice(0, mountedWindowCount).map((sub) => {
-        const windowVisible = visibleOpenWindowIds.has(sub.id);
+        const windowVisible = visibleOpenWindowIds.has(sub.id) && !mobileRemoteSurfaceActive;
         return (
           <div
             key={sub.id}

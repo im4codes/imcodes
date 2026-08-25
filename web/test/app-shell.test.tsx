@@ -1161,14 +1161,14 @@ describe('App shell', () => {
       const discussionsPanel = await screen.findByTestId('floating-panel-discussions');
       fireEvent.click(document.querySelector('.mobile-server-btn')!);
       fireEvent.click(await screen.findByText('controlled_nodes.title'));
-      const controlledNodesPanel = await screen.findByTestId('floating-panel-controlled-nodes');
+      expect(await screen.findByTestId('floating-panel-controlled-nodes')).toBeTruthy();
       fireEvent.click(screen.getByText('controlled-nodes-panel'));
       const remoteDesktop = await screen.findByTestId('remote-desktop-workspace');
 
       await waitFor(() => {
+        expect(screen.queryByTestId('floating-panel-controlled-nodes')).toBeNull();
         const remoteZ = Number((remoteDesktop as HTMLElement).style.zIndex);
         expect(remoteZ).toBeGreaterThan(Number((discussionsPanel as HTMLElement).style.zIndex));
-        expect(remoteZ).toBeGreaterThan(Number((controlledNodesPanel as HTMLElement).style.zIndex));
       });
     } finally {
       Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
@@ -1192,14 +1192,14 @@ describe('App shell', () => {
       const discussionsPanel = await screen.findByTestId('floating-panel-discussions');
       fireEvent.click(document.querySelector('.mobile-server-btn')!);
       fireEvent.click(await screen.findByText('controlled_nodes.title'));
-      const controlledNodesPanel = await screen.findByTestId('floating-panel-controlled-nodes');
+      expect(await screen.findByTestId('floating-panel-controlled-nodes')).toBeTruthy();
       fireEvent.click(screen.getByText('controlled-nodes-wall'));
       const wall = await screen.findByTestId('remote-desktop-wall');
 
       await waitFor(() => {
+        expect(screen.queryByTestId('floating-panel-controlled-nodes')).toBeNull();
         const wallZ = Number((wall as HTMLElement).style.zIndex);
         expect(wallZ).toBeGreaterThan(Number((discussionsPanel as HTMLElement).style.zIndex));
-        expect(wallZ).toBeGreaterThan(Number((controlledNodesPanel as HTMLElement).style.zIndex));
       });
     } finally {
       Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
@@ -1246,15 +1246,26 @@ describe('App shell', () => {
 
       await waitFor(() => {
         expect(layout().classList.contains('layout-mobile-remote-surface-active')).toBe(true);
+        expect(screen.queryByTestId('floating-panel-controlled-nodes')).toBeNull();
+        expect((subWindow.closest('[data-subsession-retained]') as HTMLElement)?.style.display).toBe('none');
         expect(Number((remoteDesktop as HTMLElement).style.zIndex)).toBeGreaterThan(Number((subWindow as HTMLElement).style.zIndex));
       });
 
       fireEvent.click(screen.getByText('remote-desktop-minimize'));
-      await waitFor(() => expect(layout().classList.contains('layout-mobile-remote-surface-active')).toBe(false));
+      await waitFor(() => {
+        expect(layout().classList.contains('layout-mobile-remote-surface-active')).toBe(false);
+        expect((subWindow.closest('[data-subsession-retained]') as HTMLElement)?.style.display).toBe('contents');
+      });
       fireEvent.click(screen.getByText('remote-desktop-restore'));
-      await waitFor(() => expect(layout().classList.contains('layout-mobile-remote-surface-active')).toBe(true));
+      await waitFor(() => {
+        expect(layout().classList.contains('layout-mobile-remote-surface-active')).toBe(true);
+        expect((subWindow.closest('[data-subsession-retained]') as HTMLElement)?.style.display).toBe('none');
+      });
       fireEvent.click(screen.getByText('remote-desktop-close'));
-      await waitFor(() => expect(layout().classList.contains('layout-mobile-remote-surface-active')).toBe(false));
+      await waitFor(() => {
+        expect(layout().classList.contains('layout-mobile-remote-surface-active')).toBe(false);
+        expect((subWindow.closest('[data-subsession-retained]') as HTMLElement)?.style.display).toBe('contents');
+      });
 
       fireEvent.click(document.querySelector('.mobile-server-btn')!);
       fireEvent.click(await screen.findByText('controlled_nodes.title'));
@@ -1262,6 +1273,8 @@ describe('App shell', () => {
       const wall = await screen.findByTestId('remote-desktop-wall');
       await waitFor(() => {
         expect(layout().classList.contains('layout-mobile-remote-surface-active')).toBe(true);
+        expect(screen.queryByTestId('floating-panel-controlled-nodes')).toBeNull();
+        expect((subWindow.closest('[data-subsession-retained]') as HTMLElement)?.style.display).toBe('none');
         expect(Number((wall as HTMLElement).style.zIndex)).toBeGreaterThan(Number((subWindow as HTMLElement).style.zIndex));
       });
       fireEvent.click(screen.getByText('remote-desktop-wall-close'));
