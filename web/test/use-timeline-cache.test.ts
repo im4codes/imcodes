@@ -3,7 +3,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { render, screen, cleanup, act, waitFor } from '@testing-library/preact';
-import { h } from 'preact';
+import { h, render as preactRender, options as preactOptions } from 'preact';
 import type { ServerMessage, TimelineEvent, WsClient } from '../src/ws-client.js';
 import { TIMELINE_CURSOR_DIRECTIONS, TIMELINE_MESSAGES, TIMELINE_RESPONSE_STATUS } from '../../shared/timeline-protocol.js';
 import { TIMELINE_DETAIL_ERROR_REASONS, TIMELINE_HISTORY_ERROR_REASONS } from '../../shared/timeline-history-errors.js';
@@ -44,6 +44,45 @@ function makeEvents(sessionId: string, count: number): TimelineEvent[] {
 
 async function flushMicrotasks(count = 6): Promise<void> {
   for (let i = 0; i < count; i += 1) await Promise.resolve();
+}
+
+async function flushPrePaintUpdates(): Promise<void> {
+  await Promise.resolve();
+  await Promise.resolve();
+}
+
+async function drainQueuedPassiveFrames(queuedPassiveFrames: Array<(timestamp: number) => void>): Promise<void> {
+  while (queuedPassiveFrames.length > 0) {
+    const pending = queuedPassiveFrames.splice(0);
+    for (const callback of pending) callback(performance.now());
+    await flushPrePaintUpdates();
+  }
+}
+
+type RawPreactHarness = {
+  container: HTMLDivElement;
+  queuedPassiveFrames: Array<(timestamp: number) => void>;
+  cleanup: () => void;
+};
+
+function createRawPreactHarness(): RawPreactHarness {
+  const container = document.createElement('div');
+  document.body.appendChild(container);
+  const queuedPassiveFrames: Array<(timestamp: number) => void> = [];
+  const previousRequestAnimationFrame = preactOptions.requestAnimationFrame;
+  preactOptions.requestAnimationFrame = ((callback: (timestamp: number) => void) => {
+    queuedPassiveFrames.push(callback);
+    return queuedPassiveFrames.length;
+  }) as typeof preactOptions.requestAnimationFrame;
+  return {
+    container,
+    queuedPassiveFrames,
+    cleanup: () => {
+      preactRender(null, container);
+      container.remove();
+      preactOptions.requestAnimationFrame = previousRequestAnimationFrame;
+    },
+  };
 }
 
 describe('useTimeline global cache bounds', () => {
@@ -3344,6 +3383,234 @@ describe('useTimeline global cache bounds', () => {
 
     expect(screen.getByTestId('probe-switch').getAttribute('data-state')).toBe('done');
     expect(screen.getByTestId('probe-switch').textContent).toBe('5');
+  });
+  it('raw-render paints a switched module-cache session before passive effects run', async () => {
+    const target = makeEvents('deck_raw_switch_mem_target', 5);
+    __setTimelineCacheForTests('srv:deck_raw_switch_mem_target', target);
+    vi.spyOn(TimelineDB.prototype, 'open').mockResolvedValue();
+    vi.spyOn(TimelineDB.prototype, 'getLastSeqAndEpoch').mockResolvedValue(null);
+    vi.spyOn(TimelineDB.prototype, 'getRecentEvents').mockResolvedValue([]);
+
+    function Probe({ session }: { session: string }) {
+      const { events: seen, loading } = useTimeline(session, null, 'srv');
+      return h('div', {
+        id: 'probe-raw-switch-mem',
+        'data-loading': String(loading),
+      }, `${seen.length}:${String(seen[0]?.payload.text ?? '')}`);
+    }
+
+    const harness = createRawPreactHarness();
+    try {
+      preactRender(h(Probe, { session: 'deck_raw_switch_mem_origin' }), harness.container);
+      await flushPrePaintUpdates();
+      expect(harness.container.querySelector('#probe-raw-switch-mem')?.textContent).toBe('0:');
+
+      preactRender(h(Probe, { session: 'deck_raw_switch_mem_target' }), harness.container);
+      await flushPrePaintUpdates();
+
+      // This intentionally avoids Testing Library's act(). Passive effects are
+      // parked in queuedPassiveFrames, so old useEffect-only bootstrapping stays
+      // invisible here. The selected session must be available before those
+      // passive effects (and before any async IDB/daemon history) run.
+      expect(harness.queuedPassiveFrames.length).toBeGreaterThan(0);
+      expect(harness.container.querySelector('#probe-raw-switch-mem')?.textContent).toBe('5:deck_raw_switch_mem_target-0');
+      expect(harness.container.querySelector('#probe-raw-switch-mem')?.getAttribute('data-loading')).toBe('false');
+    } finally {
+      harness.cleanup();
+    }
+  });
+
+  it('raw-render paints a switched localStorage session before passive effects run', async () => {
+    const target = makeEvents('deck_raw_switch_snapshot_target', 6);
+    localStorage.setItem('rcc_timeline_snapshot:srv:deck_raw_switch_snapshot_target', JSON.stringify(target));
+    vi.spyOn(TimelineDB.prototype, 'open').mockResolvedValue();
+    vi.spyOn(TimelineDB.prototype, 'getLastSeqAndEpoch').mockResolvedValue(null);
+    vi.spyOn(TimelineDB.prototype, 'getRecentEvents').mockResolvedValue([]);
+
+    function Probe({ session }: { session: string }) {
+      const { events: seen, loading } = useTimeline(session, null, 'srv');
+      return h('div', {
+        id: 'probe-raw-switch-localstorage',
+        'data-loading': String(loading),
+      }, `${seen.length}:${String(seen[0]?.payload.text ?? '')}`);
+    }
+
+    const harness = createRawPreactHarness();
+    try {
+      preactRender(h(Probe, { session: 'deck_raw_switch_snapshot_origin' }), harness.container);
+      await flushPrePaintUpdates();
+      expect(harness.container.querySelector('#probe-raw-switch-localstorage')?.textContent).toBe('0:');
+
+      preactRender(h(Probe, { session: 'deck_raw_switch_snapshot_target' }), harness.container);
+      await flushPrePaintUpdates();
+
+      expect(harness.queuedPassiveFrames.length).toBeGreaterThan(0);
+      expect(harness.container.querySelector('#probe-raw-switch-localstorage')?.textContent).toBe('6:deck_raw_switch_snapshot_target-0');
+      expect(harness.container.querySelector('#probe-raw-switch-localstorage')?.getAttribute('data-loading')).toBe('false');
+    } finally {
+      harness.cleanup();
+    }
+  });
+
+  it('raw-render clears stale events immediately when switching to a session without any synchronous seed', async () => {
+    const origin = makeEvents('deck_raw_switch_cold_origin', 3);
+    __setTimelineCacheForTests('srv:deck_raw_switch_cold_origin', origin);
+    vi.spyOn(TimelineDB.prototype, 'open').mockResolvedValue();
+    vi.spyOn(TimelineDB.prototype, 'getLastSeqAndEpoch').mockResolvedValue(null);
+    vi.spyOn(TimelineDB.prototype, 'getRecentEvents').mockResolvedValue([]);
+
+    function Probe({ session }: { session: string }) {
+      const { events: seen, loading } = useTimeline(session, null, 'srv');
+      return h('div', {
+        id: 'probe-raw-switch-cold',
+        'data-loading': String(loading),
+      }, `${seen.length}:${String(seen[0]?.payload.text ?? '')}`);
+    }
+
+    const harness = createRawPreactHarness();
+    try {
+      preactRender(h(Probe, { session: 'deck_raw_switch_cold_origin' }), harness.container);
+      await flushPrePaintUpdates();
+      expect(harness.container.querySelector('#probe-raw-switch-cold')?.textContent).toBe('3:deck_raw_switch_cold_origin-0');
+
+      preactRender(h(Probe, { session: 'deck_raw_switch_cold_target' }), harness.container);
+      await flushPrePaintUpdates();
+
+      // The old session's bubbles must not survive until passive bootstrap gets
+      // around to clearing them. Showing a fast loading state is preferable to
+      // painting the wrong conversation.
+      expect(harness.queuedPassiveFrames.length).toBeGreaterThan(0);
+      expect(harness.container.querySelector('#probe-raw-switch-cold')?.textContent).toBe('0:');
+      expect(harness.container.querySelector('#probe-raw-switch-cold')?.getAttribute('data-loading')).toBe('true');
+    } finally {
+      harness.cleanup();
+    }
+  });
+
+  it('raw-render paints a retained inactive session before passive effects run when it becomes active', async () => {
+    const sessionName = 'deck_raw_retained_activate_snapshot';
+    const target = makeEvents(sessionName, 4);
+    vi.spyOn(TimelineDB.prototype, 'open').mockResolvedValue();
+    vi.spyOn(TimelineDB.prototype, 'getLastSeqAndEpoch').mockResolvedValue(null);
+    vi.spyOn(TimelineDB.prototype, 'getRecentEvents').mockResolvedValue([]);
+
+    function Probe({ active }: { active: boolean }) {
+      const { events: seen, loading } = useTimeline(sessionName, null, 'srv', {
+        isActiveSession: active,
+        isVisible: active,
+      });
+      return h('div', {
+        id: 'probe-raw-retained-activate',
+        'data-loading': String(loading),
+      }, `${seen.length}:${String(seen[0]?.payload.text ?? '')}`);
+    }
+
+    const harness = createRawPreactHarness();
+    try {
+      preactRender(h(Probe, { active: false }), harness.container);
+      await flushPrePaintUpdates();
+      expect(harness.container.querySelector('#probe-raw-retained-activate')?.textContent).toBe('0:');
+
+      // Finish the inactive mount's passive bootstrap before writing the seed.
+      // Otherwise Preact may flush that old passive effect at the beginning of
+      // the next render and a useEffect-only implementation could read the
+      // newly written snapshot before the active render, falsely passing.
+      await drainQueuedPassiveFrames(harness.queuedPassiveFrames);
+      expect(harness.queuedPassiveFrames).toHaveLength(0);
+
+      localStorage.setItem(`rcc_timeline_snapshot:srv:${sessionName}`, JSON.stringify(target));
+      preactRender(h(Probe, { active: true }), harness.container);
+      await flushPrePaintUpdates();
+
+      expect(harness.queuedPassiveFrames.length).toBeGreaterThan(0);
+      expect(harness.container.querySelector('#probe-raw-retained-activate')?.textContent).toBe('4:deck_raw_retained_activate_snapshot-0');
+      expect(harness.container.querySelector('#probe-raw-retained-activate')?.getAttribute('data-loading')).toBe('false');
+    } finally {
+      harness.cleanup();
+    }
+  });
+
+  it('paints a switched session from module cache immediately before async history loads', () => {
+    const target = makeEvents('deck_switch_mem_target', 7);
+    __setTimelineCacheForTests('srv:deck_switch_mem_target', target);
+    vi.spyOn(TimelineDB.prototype, 'open').mockResolvedValue();
+    vi.spyOn(TimelineDB.prototype, 'getLastSeqAndEpoch').mockResolvedValue(null);
+    vi.spyOn(TimelineDB.prototype, 'getRecentEvents').mockResolvedValue([]);
+
+    function Probe({ session }: { session: string }) {
+      const { events: seen, loading } = useTimeline(session, null, 'srv');
+      return h('div', {
+        'data-testid': 'probe-switch-sync',
+        'data-loading': String(loading),
+      }, `${seen.length}:${String(seen[0]?.payload.text ?? '')}`);
+    }
+
+    const view = render(h(Probe, { session: 'deck_switch_mem_origin' }));
+    expect(screen.getByTestId('probe-switch-sync').textContent).toBe('0:');
+
+    view.rerender(h(Probe, { session: 'deck_switch_mem_target' }));
+
+    // No waitFor/async flush: the selected session's local cache must be
+    // visible in the same browser turn, before IDB/daemon history can answer.
+    expect(screen.getByTestId('probe-switch-sync').textContent).toBe('7:deck_switch_mem_target-0');
+    expect(screen.getByTestId('probe-switch-sync').getAttribute('data-loading')).toBe('false');
+  });
+  it('paints a switched session from localStorage immediately before IndexedDB loads', () => {
+    const target = makeEvents('deck_switch_snapshot_target', 6);
+    localStorage.setItem('rcc_timeline_snapshot:srv:deck_switch_snapshot_target', JSON.stringify(target));
+    vi.spyOn(TimelineDB.prototype, 'open').mockResolvedValue();
+    vi.spyOn(TimelineDB.prototype, 'getLastSeqAndEpoch').mockResolvedValue(null);
+    vi.spyOn(TimelineDB.prototype, 'getRecentEvents').mockResolvedValue([]);
+
+    function Probe({ session }: { session: string }) {
+      const { events: seen, loading } = useTimeline(session, null, 'srv');
+      return h('div', {
+        'data-testid': 'probe-switch-localstorage',
+        'data-loading': String(loading),
+      }, `${seen.length}:${String(seen[0]?.payload.text ?? '')}`);
+    }
+
+    const view = render(h(Probe, { session: 'deck_switch_snapshot_origin' }));
+    expect(screen.getByTestId('probe-switch-localstorage').textContent).toBe('0:');
+
+    view.rerender(h(Probe, { session: 'deck_switch_snapshot_target' }));
+
+    // Regression for mobile tab switches that showed an empty pane with only
+    // "load earlier messages": useState's mount initializer does not re-run
+    // on a session prop change, so the switch path must synchronously re-seed.
+    expect(screen.getByTestId('probe-switch-localstorage').textContent).toBe('6:deck_switch_snapshot_target-0');
+    expect(screen.getByTestId('probe-switch-localstorage').getAttribute('data-loading')).toBe('false');
+  });
+  it('paints a retained inactive session from localStorage immediately when it becomes active', () => {
+    const sessionName = 'deck_retained_activate_snapshot';
+    const target = makeEvents(sessionName, 4);
+    vi.spyOn(TimelineDB.prototype, 'open').mockResolvedValue();
+    vi.spyOn(TimelineDB.prototype, 'getLastSeqAndEpoch').mockResolvedValue(null);
+    vi.spyOn(TimelineDB.prototype, 'getRecentEvents').mockResolvedValue([]);
+
+    function Probe({ active }: { active: boolean }) {
+      const { events: seen, loading } = useTimeline(sessionName, null, 'srv', {
+        isActiveSession: active,
+        isVisible: active,
+      });
+      return h('div', {
+        'data-testid': 'probe-retained-activate',
+        'data-loading': String(loading),
+      }, `${seen.length}:${String(seen[0]?.payload.text ?? '')}`);
+    }
+
+    const view = render(h(Probe, { active: false }));
+    expect(screen.getByTestId('probe-retained-activate').textContent).toBe('0:');
+
+    // Simulate the production retained-window case: the inactive hook instance
+    // survives, and another already-mounted presentation / pagehide writes the
+    // local tail before this retained window is focused. The session/cacheKey
+    // does NOT change, so only the active flip can synchronously re-seed it.
+    localStorage.setItem(`rcc_timeline_snapshot:srv:${sessionName}`, JSON.stringify(target));
+    view.rerender(h(Probe, { active: true }));
+
+    expect(screen.getByTestId('probe-retained-activate').textContent).toBe('4:deck_retained_activate_snapshot-0');
+    expect(screen.getByTestId('probe-retained-activate').getAttribute('data-loading')).toBe('false');
   });
   it('does not carry one session\'s local count into the next', async () => {
     // Switching from a session WITH a local copy to one without must not

@@ -69,7 +69,7 @@ function localizedDelegationAckError(error: unknown): string | undefined {
  * listens for real-time WS events, handles reconnection replay.
  */
 
-import { useEffect, useRef, useState, useCallback } from 'preact/hooks';
+import { useEffect, useLayoutEffect, useRef, useState, useCallback } from 'preact/hooks';
 import type { WsClient, TimelineEvent, ServerMessage } from '../ws-client.js';
 import { TimelineDB } from '../timeline-db.js';
 import {
@@ -650,6 +650,15 @@ function loadPersistedTimelineSnapshotWithFallback(
     /* ignore — fallback read still surfaced the events */
   }
   return raw;
+}
+
+function loadSynchronousTimelineSeed(
+  cacheKey: string,
+  rawSessionIdForFallback?: string,
+): TimelineEvent[] {
+  const memCached = getCachedEvents(cacheKey);
+  if (memCached && memCached.length > 0) return memCached;
+  return loadPersistedTimelineSnapshotWithFallback(cacheKey, rawSessionIdForFallback);
 }
 
 function getPersistableTimelineTail(
@@ -1803,6 +1812,49 @@ export function useTimeline(
       httpBackfillTimerDueAtRef.current[currentMode] = 0;
     }
   }, []);
+
+  const synchronousSeedTriggerRef = useRef<{ cacheKey: string | null; active: boolean }>({
+    cacheKey: cacheKey ?? null,
+    active: isActiveSession,
+  });
+  useLayoutEffect(() => {
+    const nextKey = cacheKey ?? null;
+    const previous = synchronousSeedTriggerRef.current;
+    const cacheKeyChanged = previous.cacheKey !== nextKey;
+    const activated = !previous.active && isActiveSession;
+    synchronousSeedTriggerRef.current = { cacheKey: nextKey, active: isActiveSession };
+    if (!cacheKeyChanged && !activated) return;
+    if (!cacheKeyChanged && activated && eventsRef.current.length > 0) return;
+
+    if (!sessionId) return;
+    if (disableHistory || !cacheKey) {
+      localRestoredKeyRef.current = nextKey;
+      localRestoredIdsRef.current = new Set();
+      setEvents([]);
+      setLoading(false);
+      setHistoryStatus(createIdleHistoryStatus());
+      return;
+    }
+
+    const rawSessionIdForFallback = sessionId !== cacheKey ? sessionId : undefined;
+    const seed = loadSynchronousTimelineSeed(cacheKey, rawSessionIdForFallback);
+    localRestoredKeyRef.current = cacheKey;
+    localRestoredIdsRef.current = new Set(seed.map((event) => event.eventId));
+    if (seed.length > 0) {
+      setEvents(seed);
+      setLoading(false);
+      setHistoryStatus(createBootstrapHistoryStatus({
+        canHttp: false,
+        cacheSeeded: true,
+        cacheCount: localRestoredIdsRef.current.size,
+      }));
+      return;
+    }
+
+    setEvents([]);
+    setLoading(true);
+    setHistoryStatus(createBootstrapHistoryStatus({ canHttp: false }));
+  }, [cacheKey, disableHistory, isActiveSession, sessionId]);
 
   useEffect(() => {
     if (!cacheKey) return;
