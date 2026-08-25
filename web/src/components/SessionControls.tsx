@@ -2657,7 +2657,10 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     const lineHeight = Number.parseFloat(computed.lineHeight || '') || 20;
     const verticalPadding = (Number.parseFloat(computed.paddingTop || '') || 0)
       + (Number.parseFloat(computed.paddingBottom || '') || 0);
-    const multilineThreshold = (lineHeight * 2) + verticalPadding + 4;
+    // Treat the composer as multiline as soon as it wraps onto a second line.
+    // This keeps the mobile side controls out of the text area once horizontal
+    // space becomes scarce, instead of waiting until a third line appears.
+    const multilineThreshold = lineHeight + verticalPadding + 4;
     setMobileComposerMultiline(root.scrollHeight > multilineThreshold);
   }, []);
 
@@ -4903,7 +4906,14 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
 
   const isMobileLayout = typeof window !== 'undefined' && window.innerWidth <= 640;
   const showEmbeddedVoiceButton = isMobileLayout && VoiceInput.isAvailable() && !hasText;
-  const showEmbeddedAttachmentButton = isMobileLayout && !!serverId;
+  const showMobileStackedAttachmentButton = isMobileLayout
+    && isTransport
+    && !!serverId
+    && mobileComposerMultiline
+    && !mobileComposerExpanded;
+  const showEmbeddedAttachmentButton = isMobileLayout
+    && !!serverId
+    && !showMobileStackedAttachmentButton;
   const embeddedComposerActionCount = Number(showEmbeddedVoiceButton) + Number(showEmbeddedAttachmentButton);
   const deliveryModeLabel = directAppendMode
     ? t('session.delivery_mode_append')
@@ -6740,17 +6750,32 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           )}
         </div>
         {isMobileLayout && isTransport && (
-          <button
-            type="button"
-            class={`composer-delivery-mode composer-delivery-mode-mobile${directAppendMode ? ' is-append' : ' is-queue'}`}
-            onClick={handleDeliveryModeToggle}
-            aria-pressed={directAppendMode}
-            aria-label={`${deliveryModeLabel}: ${deliveryModeDescription}`}
-            title={deliveryModeDescription}
-            disabled={inputDisabled}
-          >
-            <ComposerDeliveryModeIcon append={directAppendMode} />
-          </button>
+          <div class="composer-mobile-side-actions">
+            {showMobileStackedAttachmentButton && (
+              <button
+                type="button"
+                class="btn btn-voice btn-attachment-mobile-stacked"
+                onPointerDown={(e) => e.preventDefault()}
+                onClick={() => fileInputRef.current?.click()}
+                disabled={inputDisabled || uploading}
+                title={uploading ? t('upload.uploading') : t('upload.upload_file')}
+                aria-label={uploading ? t('upload.uploading') : t('upload.upload_file')}
+              >
+                {uploading ? '…' : '\u{1F4CE}'}
+              </button>
+            )}
+            <button
+              type="button"
+              class={`composer-delivery-mode composer-delivery-mode-mobile${directAppendMode ? ' is-append' : ' is-queue'}`}
+              onClick={handleDeliveryModeToggle}
+              aria-pressed={directAppendMode}
+              aria-label={`${deliveryModeLabel}: ${deliveryModeDescription}`}
+              title={deliveryModeDescription}
+              disabled={inputDisabled}
+            >
+              <ComposerDeliveryModeIcon append={directAppendMode} />
+            </button>
+          </div>
         )}
         {serverId && (
           <>
