@@ -15,6 +15,8 @@ const {
   openSharedEntryMock,
   wsInstances,
   useSubSessionsState,
+  authExpiredState,
+  loginState,
 } = vi.hoisted(() => ({
   apiFetchMock: vi.fn(),
   chatScrollMock: vi.fn(),
@@ -57,6 +59,13 @@ const {
     visibleSubSessions: [] as any[],
     loadedServerId: null as string | null,
   },
+  authExpiredState: {
+    handler: null as ((reason?: string) => void) | null,
+  },
+  loginState: {
+    userId: 'user-1',
+    baseUrl: 'http://localhost',
+  },
 }));
 
 function textComponent(name: string) {
@@ -96,7 +105,9 @@ vi.mock('../src/api.js', () => {
     listP2pRuns: (...args: unknown[]) => listP2pRunsMock(...args),
     normalizeLocalWebPreviewPath: (path: string) => path.startsWith('/') ? path : `/${path}`,
     openSharedEntry: (...args: unknown[]) => openSharedEntryMock(...args),
-    onAuthExpired: vi.fn(),
+    onAuthExpired: (handler: (reason?: string) => void) => {
+      authExpiredState.handler = handler;
+    },
     refreshSessionIfStale: vi.fn(),
     startProactiveRefresh: vi.fn(),
     stopProactiveRefresh: vi.fn(),
@@ -271,7 +282,14 @@ vi.mock('../src/components/ErrorBoundary.js', () => ({
 }));
 
 vi.mock('../src/components/LanguageSwitcher.js', () => ({ LanguageSwitcher: textComponent('language-switcher') }));
-vi.mock('../src/pages/LoginPage.js', () => ({ LoginPage: textComponent('login-page') }));
+vi.mock('../src/pages/LoginPage.js', () => ({
+  LoginPage: ({ onLoginSuccess }: { onLoginSuccess: (userId: string, url: string) => void }) => (
+    <button
+      type="button"
+      onClick={() => onLoginSuccess(loginState.userId, loginState.baseUrl)}
+    >login-page</button>
+  ),
+}));
 vi.mock('../src/pages/ServerSetupPage.js', () => ({ ServerSetupPage: textComponent('server-setup-page') }));
 vi.mock('../src/pages/NativeAuthBridge.js', () => ({ NativeAuthBridge: textComponent('native-auth-bridge') }));
 vi.mock('../src/pages/DashboardPage.js', () => ({ DashboardPage: textComponent('dashboard-page') }));
@@ -751,6 +769,29 @@ function sessionList() {
   };
 }
 
+function sharedMainOpenResult(shareId: string, activeDispatchId: string) {
+  return {
+    server: { id: 'srv-shared', name: 'Shared Server', status: 'online', lastHeartbeatAt: Date.now() },
+    target: { kind: 'main', serverId: 'srv-shared', sessionName: 'deck_beta_brain' },
+    coverage: {
+      effectiveRole: 'participant',
+      historyCutoffAt: 0,
+      nextCoverageRecheckAt: null,
+      coveringShareIds: [shareId],
+      primaryShareId: shareId,
+      authorizedAt: Date.now(),
+    },
+    sessions: [{
+      sessionName: 'deck_beta_brain',
+      title: 'Shared Beta',
+      state: 'running',
+      agentType: 'codex-sdk',
+      activeDispatchId,
+    }],
+    subSessions: [],
+  };
+}
+
 async function getActiveWsClient() {
   await waitFor(() => {
     expect(wsInstances.some((instance) => instance.messageHandlers.length > 0)).toBe(true);
@@ -767,6 +808,9 @@ beforeEach(() => {
   useSubSessionsState.subSessions = [];
   useSubSessionsState.visibleSubSessions = [];
   useSubSessionsState.loadedServerId = 'srv-1';
+  authExpiredState.handler = null;
+  loginState.userId = 'user-1';
+  loginState.baseUrl = 'http://localhost';
   chatScrollMock.mockReset();
   fetchMeMock.mockResolvedValue({
     id: 'user-1',
@@ -848,6 +892,11 @@ describe('App shell', () => {
   }, 20_000);
 
   it('renders the login page when session verification fails', async () => {
+    history.replaceState(
+      null,
+      '',
+      '/#/srv-shared/deck_beta_brain?shared=share-login-route',
+    );
     apiFetchMock.mockImplementation(async (path: string) => {
       if (path === '/api/auth/user/me') {
         const { ApiError } = await import('../src/api.js');
@@ -862,6 +911,202 @@ describe('App shell', () => {
     expect(await screen.findByText('login-page')).toBeTruthy();
     expect(screen.queryByText('remote_desktop.guest.title')).toBeNull();
     expect(apiFetchMock).toHaveBeenCalledWith('/api/auth/user/me');
+    expect(window.location.hash).toBe(
+      '#/srv-shared/deck_beta_brain?shared=share-login-route',
+    );
+  }, 20_000);
+
+  it('keeps and restores an explicit shared tab across an expired-auth login boundary', async () => {
+    history.replaceState(
+      null,
+      '',
+      '/#/srv-shared/deck_beta_brain?shared=share-after-login',
+    );
+    localStorage.setItem('rcc_auth', JSON.stringify({
+      userId: 'user-1',
+      baseUrl: 'http://localhost',
+    }));
+    let sessionVerificationExpired = true;
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') {
+        if (sessionVerificationExpired) {
+          sessionVerificationExpired = false;
+          const { ApiError } = await import('../src/api.js');
+          throw new ApiError(401, 'expired');
+        }
+        return { id: 'user-1' };
+      }
+      if (path === '/api/server') return { servers: [] };
+      return {};
+    });
+    discoverSharedEntriesMock.mockResolvedValue([]);
+    openSharedEntryMock.mockResolvedValue(
+      sharedMainOpenResult('share-after-login', 'dispatch-after-login'),
+    );
+
+    const { App } = await importApp();
+    render(<App />);
+
+    const login = await screen.findByRole('button', { name: 'login-page' });
+    expect(window.location.hash).toBe(
+      '#/srv-shared/deck_beta_brain?shared=share-after-login',
+    );
+    expect(openSharedEntryMock).not.toHaveBeenCalled();
+
+    fireEvent.click(login);
+
+    await waitFor(() => expect(openSharedEntryMock).toHaveBeenCalledTimes(1));
+    expect(openSharedEntryMock).toHaveBeenCalledWith({
+      kind: 'main', serverId: 'srv-shared', sessionName: 'deck_beta_brain',
+    });
+    expect(await screen.findByTestId('session-pane-deck_beta_brain')).toBeTruthy();
+    expect(window.location.hash).toBe(
+      '#/srv-shared/deck_beta_brain?shared=share-after-login',
+    );
+    expect(screen.queryByText('dashboard-page')).toBeNull();
+  }, 20_000);
+
+  it('ignores a stale logged-out mount verification failure after a fresh login', async () => {
+    history.replaceState(
+      null,
+      '',
+      '/#/srv-shared/deck_beta_brain?shared=share-login-race',
+    );
+    let rejectInitialVerification!: (reason: unknown) => void;
+    const initialVerification = new Promise<never>((_resolve, reject) => {
+      rejectInitialVerification = reject;
+    });
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') return initialVerification;
+      if (path === '/api/server') return { servers: [] };
+      return {};
+    });
+    discoverSharedEntriesMock.mockResolvedValue([]);
+    openSharedEntryMock.mockResolvedValue(
+      sharedMainOpenResult('share-login-race', 'dispatch-login-race'),
+    );
+
+    const { App } = await importApp();
+    render(<App />);
+
+    const login = await screen.findByRole('button', { name: 'login-page' });
+    expect(openSharedEntryMock).not.toHaveBeenCalled();
+    fireEvent.click(login);
+
+    const { ApiError } = await import('../src/api.js');
+    await act(async () => {
+      rejectInitialVerification(new ApiError(401, 'stale logged-out verification'));
+      await Promise.resolve();
+    });
+
+    await waitFor(() => expect(openSharedEntryMock).toHaveBeenCalledTimes(1));
+    expect(await screen.findByTestId('session-pane-deck_beta_brain')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'login-page' })).toBeNull();
+    expect(JSON.parse(localStorage.getItem('rcc_auth') ?? '{}')).toMatchObject({ userId: 'user-1' });
+    expect(window.location.hash).toBe(
+      '#/srv-shared/deck_beta_brain?shared=share-login-race',
+    );
+  }, 20_000);
+
+  it('clears stale shared session authority until re-open succeeds after auth expiry', async () => {
+    history.replaceState(
+      null,
+      '',
+      '/#/srv-shared/deck_beta_brain?shared=share-auth-expiry',
+    );
+    localStorage.setItem('rcc_auth', JSON.stringify({
+      userId: 'user-1',
+      baseUrl: 'http://localhost',
+    }));
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') return { id: 'user-1' };
+      if (path === '/api/server') return { servers: [] };
+      return {};
+    });
+    discoverSharedEntriesMock.mockResolvedValue([]);
+
+    let resolveReauthorizedOpen!: (value: ReturnType<typeof sharedMainOpenResult>) => void;
+    openSharedEntryMock
+      .mockResolvedValueOnce(sharedMainOpenResult('share-auth-expiry', 'dispatch-old-identity'))
+      .mockImplementationOnce(() => new Promise((resolve) => {
+        resolveReauthorizedOpen = resolve;
+      }));
+
+    const { App } = await importApp();
+    render(<App />);
+
+    const oldPane = await screen.findByTestId('session-pane-deck_beta_brain');
+    expect(oldPane.getAttribute('data-active-dispatch-id')).toBe('dispatch-old-identity');
+    expect(openSharedEntryMock).toHaveBeenCalledTimes(1);
+    expect(authExpiredState.handler).not.toBeNull();
+
+    act(() => authExpiredState.handler?.('expired during shared session'));
+
+    const login = await screen.findByRole('button', { name: 'login-page' });
+    expect(screen.queryByTestId('session-pane-deck_beta_brain')).toBeNull();
+    expect(window.location.hash).toBe(
+      '#/srv-shared/deck_beta_brain?shared=share-auth-expiry',
+    );
+    expect(openSharedEntryMock).toHaveBeenCalledTimes(1);
+    expect(wsInstances.filter((instance) => instance.options?.shareTarget && instance.connected)).toHaveLength(0);
+
+    loginState.userId = 'user-2';
+    fireEvent.click(login);
+
+    await waitFor(() => expect(openSharedEntryMock).toHaveBeenCalledTimes(2));
+    expect(screen.queryByTestId('session-pane-deck_beta_brain')).toBeNull();
+    expect(wsInstances.filter((instance) => instance.options?.shareTarget && instance.connected)).toHaveLength(0);
+
+    await act(async () => {
+      resolveReauthorizedOpen(sharedMainOpenResult('share-auth-expiry', 'dispatch-new-identity'));
+      await Promise.resolve();
+    });
+
+    const newPane = await screen.findByTestId('session-pane-deck_beta_brain');
+    expect(newPane.getAttribute('data-active-dispatch-id')).toBe('dispatch-new-identity');
+    expect(openSharedEntryMock).toHaveBeenCalledTimes(2);
+    expect(JSON.parse(localStorage.getItem('rcc_auth') ?? '{}')).toMatchObject({ userId: 'user-2' });
+  }, 20_000);
+
+  it('discards a shared open response that settles after its auth generation expires', async () => {
+    history.replaceState(
+      null,
+      '',
+      '/#/srv-shared/deck_beta_brain?shared=share-stale-open',
+    );
+    localStorage.setItem('rcc_auth', JSON.stringify({
+      userId: 'user-1',
+      baseUrl: 'http://localhost',
+    }));
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') return { id: 'user-1' };
+      if (path === '/api/server') return { servers: [] };
+      return {};
+    });
+    discoverSharedEntriesMock.mockResolvedValue([]);
+    let resolveOldOpen!: (value: ReturnType<typeof sharedMainOpenResult>) => void;
+    openSharedEntryMock.mockImplementationOnce(() => new Promise((resolve) => {
+      resolveOldOpen = resolve;
+    }));
+
+    const { App } = await importApp();
+    render(<App />);
+
+    await waitFor(() => expect(openSharedEntryMock).toHaveBeenCalledTimes(1));
+    expect(authExpiredState.handler).not.toBeNull();
+    act(() => authExpiredState.handler?.('expired with open in flight'));
+    expect(await screen.findByRole('button', { name: 'login-page' })).toBeTruthy();
+
+    await act(async () => {
+      resolveOldOpen(sharedMainOpenResult('share-stale-open', 'dispatch-must-not-render'));
+      await Promise.resolve();
+    });
+
+    expect(screen.queryByTestId('session-pane-deck_beta_brain')).toBeNull();
+    expect(screen.getByRole('button', { name: 'login-page' })).toBeTruthy();
+    expect(window.location.hash).toBe(
+      '#/srv-shared/deck_beta_brain?shared=share-stale-open',
+    );
   }, 20_000);
 
   it('loads servers and renders the dashboard when no server is selected', async () => {
@@ -1425,6 +1670,13 @@ describe('App shell', () => {
     const ws = wsInstances[0];
     expect(await screen.findByText('session-tabs')).toBeTruthy();
 
+    // The production client announces connection asynchronously. The mock's
+    // connect() only flips its own field, so drive the app-level connected
+    // state explicitly before asserting subscription side effects.
+    await act(async () => {
+      ws.emit({ type: 'session.event', event: 'connected', session: '', state: 'connected' });
+    });
+
     await waitFor(() => {
       expect(ws.subscribeTransportSession).toHaveBeenCalledWith('deck_sub_alpha_sdk', { replayHistory: false });
     });
@@ -1797,6 +2049,65 @@ describe('App shell', () => {
     expect(await screen.findByTestId('sub-session-window-sub-1')).toBeTruthy();
     expect(localStorage.getItem('rcc_open_subs_deck_alpha_brain')).toBe(JSON.stringify(['sub-1']));
     expect(localStorage.getItem('rcc_open_subs_deck_other_brain')).toBe(JSON.stringify(['sub-other']));
+  }, 20_000);
+
+  it('keeps this browser tab on its tab-local server and session when another tab changed the shared fallback', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    // localStorage represents the most recently used route in another browser
+    // tab. This tab's URL is its independent, authoritative navigation state.
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_server_name', 'Alpha Server');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    const { writeHashState } = await import('../src/hooks/useHashState.js');
+    writeHashState('srv-2', 'deck_beta_brain');
+    // A reload/navigation boundary may reach the SPA without the hash. The
+    // tab-local snapshot must still beat another page's shared fallback.
+    history.replaceState(null, '', '/');
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') return { id: 'user-1' };
+      if (path === '/api/server') {
+        return {
+          servers: [
+            ...serverList().servers,
+            {
+              id: 'srv-2',
+              name: 'Beta Server',
+              status: 'online',
+              lastHeartbeatAt: Date.now(),
+              createdAt: Date.now(),
+              daemonVersion: '2026.8.25',
+            },
+          ],
+        };
+      }
+      if (path === '/api/server/srv-2/sessions') {
+        return {
+          sessions: [{
+            name: 'deck_beta_brain',
+            project_name: 'Beta',
+            role: 'brain',
+            agent_type: 'codex-sdk',
+            state: 'running',
+            project_dir: '/work/beta',
+            runtime_type: 'transport',
+            label: 'Beta Brain',
+          }],
+        };
+      }
+      if (path.startsWith('/api/watch/sessions')) return { sessions: [] };
+      return {};
+    });
+
+    const { App } = await importApp();
+    render(<App />);
+
+    expect(await screen.findByTestId('session-pane-deck_beta_brain')).toBeTruthy();
+    expect(screen.queryByTestId('session-pane-deck_alpha_brain')).toBeNull();
+    expect(apiFetchMock).toHaveBeenCalledWith(
+      '/api/server/srv-2/sessions',
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    );
+    expect(window.location.hash).toBe('#/srv-2/deck_beta_brain');
   }, 20_000);
 
   it('toggles a mobile bottom sub-session button open and closed', async () => {

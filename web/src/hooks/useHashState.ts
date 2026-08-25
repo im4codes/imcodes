@@ -8,13 +8,58 @@
  * Each browser tab can independently track its own server+session via the URL hash,
  * so multiple tabs no longer collide through shared localStorage.
  *
- * localStorage remains the fallback when no hash is present (e.g. first visit, bookmarks).
+ * sessionStorage preserves the route across reloads in this tab. localStorage
+ * remains a last-resort fallback for a new tab with no explicit route.
  */
 
 export interface HashState {
   serverId: string | null;
   sessionName: string | null;
   sharedEntryId: string | null;
+}
+
+const TAB_ROUTE_STORAGE_KEY = 'rcc_tab_route_v1';
+
+interface StoredTabRoute extends HashState {
+  version: 1;
+}
+
+function isStoredRouteString(value: unknown, maxLength: number): value is string {
+  return typeof value === 'string'
+    && value.length > 0
+    && value.length <= maxLength
+    && !/[\u0000-\u001f\u007f]/.test(value);
+}
+
+export function readTabRouteState(): HashState {
+  try {
+    const raw = sessionStorage.getItem(TAB_ROUTE_STORAGE_KEY);
+    if (!raw) return { serverId: null, sessionName: null, sharedEntryId: null };
+    const parsed = JSON.parse(raw) as Partial<StoredTabRoute>;
+    if (parsed.version !== 1 || !isStoredRouteString(parsed.serverId, 512)) {
+      return { serverId: null, sessionName: null, sharedEntryId: null };
+    }
+    return {
+      serverId: parsed.serverId,
+      sessionName: isStoredRouteString(parsed.sessionName, 1_024) ? parsed.sessionName : null,
+      sharedEntryId: isStoredRouteString(parsed.sharedEntryId, 512) ? parsed.sharedEntryId : null,
+    };
+  } catch {
+    return { serverId: null, sessionName: null, sharedEntryId: null };
+  }
+}
+
+function writeTabRouteState(state: HashState): void {
+  try {
+    if (!state.serverId) {
+      sessionStorage.removeItem(TAB_ROUTE_STORAGE_KEY);
+      return;
+    }
+    const stored: StoredTabRoute = { version: 1, ...state };
+    sessionStorage.setItem(TAB_ROUTE_STORAGE_KEY, JSON.stringify(stored));
+  } catch {
+    // Browsing can continue from the URL when tab storage is unavailable.
+  }
 }
 
 export function readHashState(): HashState {
@@ -44,6 +89,7 @@ export function writeHashState(
   sessionName: string | null,
   sharedEntryId: string | null = null,
 ): void {
+  writeTabRouteState({ serverId, sessionName, sharedEntryId });
   let hash = '';
   if (serverId) {
     hash = `#/${encodeURIComponent(serverId)}`;
@@ -61,19 +107,33 @@ export function writeHashState(
 }
 
 /**
- * Resolve initial server ID: hash takes priority, then localStorage fallback.
+ * Resolve one coherent route for this browser tab. Never combine a server from
+ * the URL with a session last written by another tab through localStorage.
  */
-export function resolveInitialServerId(): string | null {
-  const fromHash = readHashState().serverId;
-  if (fromHash) return fromHash;
-  return localStorage.getItem('rcc_server');
+export function resolveInitialRouteState(): HashState {
+  const fromHash = readHashState();
+  if (fromHash.serverId) return fromHash;
+
+  const fromTab = readTabRouteState();
+  if (fromTab.serverId) return fromTab;
+
+  return {
+    serverId: localStorage.getItem('rcc_server'),
+    sessionName: localStorage.getItem('rcc_session'),
+    sharedEntryId: null,
+  };
 }
 
 /**
- * Resolve initial session name: hash takes priority, then localStorage fallback.
+ * Resolve initial server ID from the coherent tab route.
+ */
+export function resolveInitialServerId(): string | null {
+  return resolveInitialRouteState().serverId;
+}
+
+/**
+ * Resolve initial session name from the coherent tab route.
  */
 export function resolveInitialSessionName(): string | null {
-  const fromHash = readHashState().sessionName;
-  if (fromHash) return fromHash;
-  return localStorage.getItem('rcc_session');
+  return resolveInitialRouteState().sessionName;
 }

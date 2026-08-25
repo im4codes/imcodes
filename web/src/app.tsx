@@ -155,7 +155,7 @@ import {
   resolveP2pRootSession,
   serializeP2pSavedConfig,
 } from './preferences/p2p-config-pref.js';
-import { readHashState, resolveInitialServerId, resolveInitialSessionName, writeHashState } from './hooks/useHashState.js';
+import { readHashState, readTabRouteState, resolveInitialRouteState, writeHashState } from './hooks/useHashState.js';
 import { useSubSessions, type SubSession } from './hooks/useSubSessions.js';
 import { useProviderStatus } from './hooks/useProviderStatus.js';
 import { useProgressiveMount } from './hooks/useProgressiveMount.js';
@@ -543,8 +543,9 @@ export function App() {
     remoteDesktopConnectionManagerRef.current = new RemoteDesktopConnectionManager();
   }
   const remoteDesktopConnectionManager = remoteDesktopConnectionManagerRef.current;
-  const initialHashStateRef = useRef(readHashState());
+  const initialHashStateRef = useRef(resolveInitialRouteState());
   const initialSharedTabRestoreRef = useRef(readSharedTabRestoreMarker());
+  const sharedOpenGenerationRef = useRef(0);
   const [globalFontPrefs] = useFontPrefs('chat', DEFAULT_CHAT_FONT);
   useEffect(() => {
     applyGlobalFontPrefs(globalFontPrefs);
@@ -562,8 +563,18 @@ export function App() {
       return null;
     }
   });
+  const [initialAuthVerificationPending, setInitialAuthVerificationPending] = useState(
+    () => !isNative(),
+  );
   const [managedShares, setManagedShares] = useState<ShareGrantSummary[]>([]);
   const clearAuthState = useCallback(async (reason?: string) => {
+    // Authentication is authority, but it is not navigation state. In
+    // particular, a refresh can discover an expired cookie before LoginPage
+    // completes a fresh sign-in. Clearing the explicit shared hash here used
+    // to turn `#/server/session?shared=entry` into the dashboard URL, so the
+    // post-login render had no route left to restore. Preserve only the route
+    // that is still explicitly present in this tab; /api/shares/open remains
+    // the sole authority after authentication succeeds.
     console.warn('[auth] clearing auth state', reason ?? '');
     clearApiKey();
     configureExpectedUserId(null);
@@ -572,6 +583,16 @@ export function App() {
       const { Preferences } = await import('@capacitor/preferences');
       await Preferences.remove({ key: 'deck_api_key_id' });
     } catch { /* ignore */ }
+    // Re-read after asynchronous credential cleanup so a deliberate navigation
+    // during that interval wins over the route that triggered the 401.
+    const hashRoute = readHashState();
+    const sharedRoute = hashRoute.serverId ? hashRoute : readTabRouteState();
+    const preserveSharedRoute = Boolean(
+      sharedRoute.serverId && sharedRoute.sharedEntryId,
+    );
+    const sharedRestoreMarker = preserveSharedRoute
+      ? readSharedTabRestoreMarker()
+      : null;
     localStorage.removeItem('rcc_auth');
     localStorage.removeItem('rcc_server');
     localStorage.removeItem('rcc_server_name');
@@ -579,14 +600,38 @@ export function App() {
     clearSharedTabRestoreMarker();
     clearMessagePinsCache();
     clearMessagePinNavigation();
+    // A shared hash is only a navigation intent. Everything learned under the
+    // expired identity must be discarded before a later login can render it.
+    // Invalidate any in-flight /api/shares/open as well: its response belongs
+    // to the old credential even if it settles after this reset.
+    sharedOpenGenerationRef.current += 1;
     setAuth(null);
     setServers([]);
     setServersLoaded(false);
     setServersSynced(false);
-    setSelectedServerId(null);
+    setSessions([]);
+    setSessionsLoaded(false);
+    setSharedActiveDispatchIds(new Map());
+    setOpeningSharedEntryId(null);
+    setSharedEntriesLoading(false);
+    setSharedEntriesLoaded(false);
+    setSharedReturnServer(null);
+    setShowSharedReturnGuide(false);
+    setOpenSubIds(new Set());
+    setMaximizedSubIds(new Set());
+    setDiscussions([]);
+    setRepoContexts(new Map());
+    if (preserveSharedRoute) {
+      initialHashStateRef.current = sharedRoute;
+      initialSharedTabRestoreRef.current = sharedRestoreMarker;
+      sharedHashRestoreStartedRef.current = false;
+    }
+    setSelectedServerId(preserveSharedRoute ? sharedRoute.serverId : null);
     setSelectedServerName(null);
     setSelectedShareTarget(null);
-    setSelectedSharedEntryId(null);
+    setSelectedSharedEntryId(preserveSharedRoute ? sharedRoute.sharedEntryId : null);
+    if (preserveSharedRoute) setActiveSessionState(sharedRoute.sessionName);
+    setSharedHashRestorePending(preserveSharedRoute);
     setSharedEntries([]);
     setSharedEntriesError(null);
     setManagedShares([]);
@@ -603,7 +648,7 @@ export function App() {
   const [serversLoaded, setServersLoaded] = useState(false);
   const [serversSynced, setServersSynced] = useState(false);
   const [selectedServerId, setSelectedServerId] = useState<string | null>(
-    () => resolveInitialServerId(),
+    () => initialHashStateRef.current.serverId,
   );
   const selectedServerIdRef = useRef<string | null>(selectedServerId);
   const [selectedServerName, setSelectedServerName] = useState<string | null>(
@@ -1025,7 +1070,7 @@ export function App() {
     const baseUrl = window.location.origin;
     configureApi(baseUrl);
     console.warn('[auth] mount: verifying session via /api/auth/user/me');
-    apiFetch<{ id: string }>('/api/auth/user/me').then((user) => {
+    void apiFetch<{ id: string }>('/api/auth/user/me').then((user) => {
       console.warn(`[auth] /me OK: userId=${user.id}`);
       if (auth && auth.userId !== user.id) {
         void clearAuthState(AUTH_IDENTITY_ERRORS.CHANGED);
@@ -1038,11 +1083,16 @@ export function App() {
         if (prev && prev.userId === authState.userId && prev.baseUrl === authState.baseUrl) return prev;
         return authState;
       });
-    }).catch((err) => {
+    }).catch(async (err) => {
       console.warn(`[auth] /me FAILED:`, err instanceof ApiError ? `${err.status}: ${err.body}` : err);
-      if (err instanceof ApiError && err.status === 401) {
-        void clearAuthState('mount_verify_401');
+      // A logged-out cold start has no auth state to clear. Running the full
+      // clear path anyway used to erase an explicit shared hash before the
+      // user could sign in and continue to that tab.
+      if (err instanceof ApiError && err.status === 401 && auth) {
+        await clearAuthState('mount_verify_401');
       }
+    }).finally(() => {
+      setInitialAuthVerificationPending(false);
     });
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -1331,7 +1381,7 @@ export function App() {
   );
   const [sessionsLoaded, setSessionsLoaded] = useState(false);
   const [activeSession, setActiveSessionState] = useState<string | null>(
-    () => resolveInitialSessionName(),
+    () => initialHashStateRef.current.sessionName,
   );
 
   // Sync URL hash with current server + session so each tab has its own URL
@@ -1500,7 +1550,7 @@ export function App() {
   // switches can update it synchronously before replacing the open-window set.
   // Reading `localStorage.rcc_session` here made a reload in tab B restore tab
   // A's window state (or no windows at all).
-  const openSubPersistenceSessionRef = useRef(resolveInitialSessionName());
+  const openSubPersistenceSessionRef = useRef(initialHashStateRef.current.sessionName);
   const [openSubIds, setOpenSubIdsRaw] = useState<Set<string>>(() => {
     try {
       const initial = openSubPersistenceSessionRef.current;
@@ -2684,8 +2734,10 @@ export function App() {
         : null;
     setOpeningSharedEntryId(entry.id);
     setSharedEntriesError(null);
+    const openGeneration = sharedOpenGenerationRef.current;
     try {
       const opened = await openSharedEntry(entry.target);
+      if (openGeneration !== sharedOpenGenerationRef.current) return false;
       const nextServer: ServerInfo = {
         id: opened.server.id,
         name: opened.server.name,
@@ -2765,15 +2817,18 @@ export function App() {
       setMobileSidebarOpen(false);
       return true;
     } catch (err) {
+      if (openGeneration !== sharedOpenGenerationRef.current) return false;
       setSharedEntriesError(formatSharedAccessError(err));
       return false;
     } finally {
-      setOpeningSharedEntryId(null);
+      if (openGeneration === sharedOpenGenerationRef.current) {
+        setOpeningSharedEntryId(null);
+      }
     }
   }, [hydrateSharedSubSessions, openingSharedEntryId, resolvedSelectedServerName, selectedServerId, selectedShareTarget, servers, setActiveSession, sharedReturnServer]);
 
   useEffect(() => {
-    if (!sharedHashRestorePending || !auth || !serversLoaded) return;
+    if (initialAuthVerificationPending || !sharedHashRestorePending || !auth || !serversLoaded) return;
     if (sharedHashRestoreStartedRef.current) return;
 
     const initial = initialHashStateRef.current;
@@ -2831,6 +2886,7 @@ export function App() {
   }, [
     auth,
     handleOpenSharedEntry,
+    initialAuthVerificationPending,
     selectedServerId,
     selectedShareTarget,
     servers,
@@ -5197,7 +5253,7 @@ export function App() {
   // Show full-screen connecting indicator while waiting for initial WS + session data.
   // After 8s, show escape buttons so the user is never stuck.
   const [connectTimeout, setConnectTimeout] = useState(false);
-  const showInitialConnectingGate = shouldShowInitialConnectingGate(
+  const showInitialConnectingGate = initialAuthVerificationPending || shouldShowInitialConnectingGate(
     Boolean(auth),
     selectedServerId,
     connected,
