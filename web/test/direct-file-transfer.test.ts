@@ -1207,6 +1207,26 @@ describe('direct file transfer v2 browser broker', () => {
     expect(FakePeerConnection.instances.at(0)?.connectionState).toBe('closed');
   });
 
+  it('replaces an established idle lease peer after daemon generation replacement', async () => {
+    const { probeDirectConnectivity } = await import('../src/direct-file-transfer.js');
+    const { ws, sent, emitCapabilitySnapshot } = createWs(directCapabilities);
+
+    await expect(probeDirectConnectivity(ws, undefined, 'server-1')).resolves.toMatchObject({ route: 'lan_direct' });
+    const stalePeer = FakePeerConnection.instances.at(-1)!;
+
+    // WsClient emits this null snapshot on daemon.disconnected/reconnected even
+    // though the browser↔Server socket itself remains open during an upgrade.
+    emitCapabilitySnapshot(null);
+    expect(stalePeer.connectionState).toBe('closed');
+
+    emitCapabilitySnapshot(directCapabilities);
+    await expect(probeDirectConnectivity(ws, undefined, 'server-1')).resolves.toMatchObject({ route: 'lan_direct' });
+
+    expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_INIT)).toHaveLength(2);
+    expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_OFFER)).toHaveLength(2);
+    expect(FakePeerConnection.instances.at(-1)).not.toBe(stalePeer);
+  });
+
   it('falls back to HTTP when the control socket is absent instead of silently waiting for direct timeouts', async () => {
     vi.useFakeTimers();
     const { uploadFileWithDirectFallback, FILE_UPLOAD_TRANSPORT_MODE } = await import('../src/direct-file-transfer.js');

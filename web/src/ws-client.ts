@@ -2144,6 +2144,15 @@ export class WsClient {
 
   private dispatch(msg: ServerMessage): void {
     this.settleP2pWorkflowRequest(msg);
+    // Daemon lifecycle generations are independent from the browser↔Server
+    // WebSocket.  During an in-place daemon upgrade that browser socket stays
+    // open, so clear the generation-bound capability snapshot explicitly.  A
+    // fresh daemon.hello follows RECONNECTED after authentication; clearing
+    // first also permits its process-local helloEpoch to restart from one and
+    // invalidates file-transfer lease waiters/peers tied to the old process.
+    if (msg.type === DAEMON_MSG.DISCONNECTED || msg.type === DAEMON_MSG.RECONNECTED) {
+      this.setDaemonCapabilitySnapshot(null);
+    }
     if (msg.type === P2P_WORKFLOW_MSG.DAEMON_HELLO) {
       this.handleDaemonHelloMessage(msg);
     }

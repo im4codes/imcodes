@@ -4730,6 +4730,49 @@ describe('WsBridge', () => {
       });
     });
 
+    it('accepts a replacement daemon process whose hello epoch restarts while the old socket closes asynchronously', async () => {
+      const bridge = WsBridge.get(serverId);
+      const firstDaemon = new MockWs();
+      bridge.handleDaemonConnection(firstDaemon as never, makeDb('valid-hash'), {} as never);
+      firstDaemon.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+      firstDaemon.emit('message', JSON.stringify({
+        type: P2P_WORKFLOW_MSG.DAEMON_HELLO,
+        daemonId: serverId,
+        capabilities: ['old-capability'],
+        helloEpoch: 9,
+        sentAt: 900,
+      }));
+      await flushAsync();
+      expect(bridge.getDaemonP2pWorkflowCapabilities()?.helloEpoch).toBe(9);
+
+      // Production ws.close() is asynchronous.  Pin the replacement window in
+      // which the old identity-guarded close handler cannot clear bridge state.
+      vi.spyOn(firstDaemon, 'close').mockImplementation(() => {
+        firstDaemon.closed = true;
+        firstDaemon.readyState = 3;
+      });
+      const replacement = new MockWs();
+      bridge.handleDaemonConnection(replacement as never, makeDb('valid-hash'), {} as never);
+      replacement.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      replacement.emit('message', JSON.stringify({
+        type: P2P_WORKFLOW_MSG.DAEMON_HELLO,
+        daemonId: serverId,
+        capabilities: ['new-capability'],
+        helloEpoch: 1,
+        sentAt: 1_000,
+      }));
+      await flushAsync();
+      await flushAsync();
+
+      expect(bridge.getDaemonP2pWorkflowCapabilities()).toMatchObject({
+        daemonId: serverId,
+        capabilities: ['new-capability'],
+        helloEpoch: 1,
+        sentAt: 1_000,
+      });
+    });
+
     it('R3 v2 PR-σ — does NOT replay daemon.hello when no daemon is connected yet', async () => {
       const bridge = WsBridge.get(serverId);
       const browserWs = new MockWs();

@@ -4115,6 +4115,14 @@ export class WsBridge {
     // stale result to a new waiter (10.6).
     this.daemonGeneration++;
     const connectionGeneration = this.daemonGeneration;
+    // `daemon.hello.helloEpoch` is process-local and restarts from one after a
+    // daemon upgrade.  Scope the cached capability advertisement to this exact
+    // transport generation: when a replacement socket closes asynchronously,
+    // its identity-guarded close handler cannot clear the old cache after
+    // `daemonWs` has already moved to `ws`.  Retaining it would make the new
+    // process's lower hello epoch look stale forever, leaving browsers on the
+    // pre-upgrade capability snapshot even though the new daemon is healthy.
+    this.daemonP2pWorkflowCapabilities = null;
     this.remoteDesktopAuthorityReadyGeneration = null;
     this.directFileTransferRouter.setDaemonGeneration(connectionGeneration);
     this.remoteDesktopRouter.setDaemonGeneration(connectionGeneration);

@@ -14,6 +14,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { WsClient } from '../src/ws-client.js';
 import { P2P_WORKFLOW_MSG } from '@shared/p2p-workflow-messages.js';
+import { DAEMON_MSG } from '@shared/daemon-events.js';
 import { P2P_CAPABILITY_FRESHNESS_TTL_MS } from '@shared/p2p-workflow-constants.js';
 import { REPO_MSG } from '@shared/repo-types.js';
 import { TIMELINE_PROTOCOL_CAPABILITY, TIMELINE_PROTOCOL_REVISION } from '@shared/timeline-protocol.js';
@@ -185,4 +186,23 @@ describe('WsClient daemonLastSeenAt freshness whitelist (N4)', () => {
     // After close + snapshot null, isDaemonCapabilityStale must be true again.
     expect(client.isDaemonCapabilityStale()).toBe(true);
   });
+
+  it.each([DAEMON_MSG.DISCONNECTED, DAEMON_MSG.RECONNECTED])(
+    '%s clears the generation-bound capability snapshot while the browser socket stays open',
+    async (type) => {
+      const { client, ws } = await connect();
+      const snapshots: unknown[] = [];
+      const unsubscribe = client.onDaemonCapabilitySnapshot((snapshot) => snapshots.push(snapshot));
+      seedHello(ws);
+      expect(client.getDaemonCapabilitySnapshot()).not.toBeNull();
+
+      ws.emit('message', { data: JSON.stringify({ type }) });
+
+      expect(client.connected).toBe(true);
+      expect(client.getDaemonCapabilitySnapshot()).toBeNull();
+      expect(client.isDaemonCapabilityStale()).toBe(true);
+      expect(snapshots.at(-1)).toBeNull();
+      unsubscribe();
+    },
+  );
 });
