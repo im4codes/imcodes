@@ -598,34 +598,43 @@ vi.mock('../src/components/SharedContextManagementPanel.js', () => ({
   ),
 }));
 vi.mock('../src/components/ControlledNodesPanel.js', () => ({
-  ControlledNodesPanel: ({ onOpenRemoteDesktop }: any) => (
-    <button onClick={() => onOpenRemoteDesktop?.({
-      serverId: 'desktop-1',
-      refName: 'desktop-ref',
-      displayName: 'Desktop One',
-      os: 'win',
-      online: true,
-      execEnabled: true,
-      accessRole: 'owner',
-      capabilities: [],
-    })}>controlled-nodes-panel</button>
-  ),
-}));
-vi.mock('../src/components/ControlledNodeQuickMenu.js', () => ({
-  ControlledNodeQuickMenu: ({ onOpenRemoteDesktop }: any) => (
-    <button
-      data-testid="controlled-node-quick-trigger"
-      onClick={() => onOpenRemoteDesktop?.({
-        serverId: 'desktop-quick',
-        refName: 'desktop-quick-ref',
-        displayName: 'Desktop Quick',
+  ControlledNodesPanel: ({ onOpenRemoteDesktop, onOpenRemoteDesktopWall }: any) => (
+    <div>
+      <button onClick={() => onOpenRemoteDesktop?.({
+        serverId: 'desktop-1',
+        refName: 'desktop-ref',
+        displayName: 'Desktop One',
         os: 'win',
         online: true,
         execEnabled: true,
         accessRole: 'owner',
         capabilities: [],
-      })}
-    >controlled-node-quick-trigger</button>
+      })}>controlled-nodes-panel</button>
+      <button onClick={onOpenRemoteDesktopWall}>controlled-nodes-wall</button>
+    </div>
+  ),
+}));
+vi.mock('../src/components/ControlledNodeQuickMenu.js', () => ({
+  ControlledNodeQuickMenu: ({ onOpenRemoteDesktop, onOpenRemoteDesktopWall }: any) => (
+    <>
+      <button
+        data-testid="controlled-node-quick-trigger"
+        onClick={() => onOpenRemoteDesktop?.({
+          serverId: 'desktop-quick',
+          refName: 'desktop-quick-ref',
+          displayName: 'Desktop Quick',
+          os: 'win',
+          online: true,
+          execEnabled: true,
+          accessRole: 'owner',
+          capabilities: [],
+        })}
+      >controlled-node-quick-trigger</button>
+      <button
+        data-testid="controlled-node-quick-wall"
+        onClick={() => onOpenRemoteDesktopWall?.()}
+      >controlled-node-quick-wall</button>
+    </>
   ),
 }));
 vi.mock('../src/components/RemoteDesktopPanel.js', () => ({
@@ -637,13 +646,22 @@ vi.mock('../src/components/RemoteDesktopPanel.js', () => ({
   ),
 }));
 vi.mock('../src/components/RemoteDesktopWorkspace.js', () => ({
-  RemoteDesktopWorkspace: ({ minimized, onCloseWorkspace, onMinimize, onRestore }: any) => (
-    <div data-testid="remote-desktop-workspace">
+  RemoteDesktopWorkspace: ({ minimized, onCloseWorkspace, onMinimize, onRestore, zIndex, onFocus }: any) => (
+    <div data-testid="remote-desktop-workspace" style={{ zIndex }} onMouseDown={onFocus}>
       remote-desktop-workspace
       <span>remote-desktop-minimized:{String(Boolean(minimized))}</span>
       <button onClick={onMinimize}>remote-desktop-minimize</button>
       {minimized && <button onClick={onRestore}>remote-desktop-restore</button>}
       <button onClick={onCloseWorkspace}>remote-desktop-close</button>
+    </div>
+  ),
+}));
+vi.mock('../src/components/RemoteDesktopWall.js', () => ({
+  REMOTE_DESKTOP_WALL_WINDOW_ID: 'remote-desktop-wall',
+  RemoteDesktopWall: ({ zIndex, onFocus, onClose }: any) => (
+    <div data-testid="remote-desktop-wall" style={{ zIndex }} onMouseDown={onFocus}>
+      remote-desktop-wall
+      <button onClick={() => onClose?.([])}>remote-desktop-wall-close</button>
     </div>
   ),
 }));
@@ -1123,6 +1141,68 @@ describe('App shell', () => {
     expect(await screen.findByText('remote-desktop-minimized:true')).toBeTruthy();
     fireEvent.click(screen.getByText('remote-desktop-restore'));
     expect(await screen.findByText('remote-desktop-minimized:false')).toBeTruthy();
+  }, 20_000);
+
+  it('keeps mobile remote desktop workspace above earlier floating surfaces', async () => {
+    const originalUserAgent = navigator.userAgent;
+    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
+
+    try {
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      localStorage.setItem('rcc_server', 'srv-1');
+      localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+      const { App } = await importApp();
+      render(<App />);
+
+      await waitFor(() => expect(wsInstances.length).toBe(1));
+      fireEvent.click(screen.getByText('subbar-discussions'));
+      const discussionsPanel = await screen.findByTestId('floating-panel-discussions');
+      fireEvent.click(document.querySelector('.mobile-server-btn')!);
+      fireEvent.click(await screen.findByText('controlled_nodes.title'));
+      const controlledNodesPanel = await screen.findByTestId('floating-panel-controlled-nodes');
+      fireEvent.click(screen.getByText('controlled-nodes-panel'));
+      const remoteDesktop = await screen.findByTestId('remote-desktop-workspace');
+
+      await waitFor(() => {
+        const remoteZ = Number((remoteDesktop as HTMLElement).style.zIndex);
+        expect(remoteZ).toBeGreaterThan(Number((discussionsPanel as HTMLElement).style.zIndex));
+        expect(remoteZ).toBeGreaterThan(Number((controlledNodesPanel as HTMLElement).style.zIndex));
+      });
+    } finally {
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
+    }
+  }, 20_000);
+
+  it('keeps mobile remote desktop wall above earlier floating surfaces', async () => {
+    const originalUserAgent = navigator.userAgent;
+    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
+
+    try {
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      localStorage.setItem('rcc_server', 'srv-1');
+      localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+      const { App } = await importApp();
+      render(<App />);
+
+      await waitFor(() => expect(wsInstances.length).toBe(1));
+      fireEvent.click(screen.getByText('subbar-discussions'));
+      const discussionsPanel = await screen.findByTestId('floating-panel-discussions');
+      fireEvent.click(document.querySelector('.mobile-server-btn')!);
+      fireEvent.click(await screen.findByText('controlled_nodes.title'));
+      const controlledNodesPanel = await screen.findByTestId('floating-panel-controlled-nodes');
+      fireEvent.click(screen.getByText('controlled-nodes-wall'));
+      const wall = await screen.findByTestId('remote-desktop-wall');
+
+      await waitFor(() => {
+        const wallZ = Number((wall as HTMLElement).style.zIndex);
+        expect(wallZ).toBeGreaterThan(Number((discussionsPanel as HTMLElement).style.zIndex));
+        expect(wallZ).toBeGreaterThan(Number((controlledNodesPanel as HTMLElement).style.zIndex));
+      });
+    } finally {
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
+    }
   }, 20_000);
 
   it('opens remote control from the sidebar chevron without opening node management', async () => {

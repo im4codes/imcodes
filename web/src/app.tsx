@@ -1655,16 +1655,26 @@ export function App() {
   // `stackVersion` counter live so z-index consumers re-render on stack changes.
   useEffect(() => { recomputeFocusedSubId(); }, [stackVersion, recomputeFocusedSubId]);
 
+  const canUseWindowStackForSurface = useCallback((meta: DesktopWindowMeta): boolean => {
+    if (!isMobileRef.current) return true;
+    // Mobile sub-sessions keep their existing single-open drawer semantics and
+    // geometry, but full-screen work surfaces (remote desktop, wall, file
+    // preview, discussions, etc.) still need the shared stack ordering so the
+    // latest opened surface is not covered by an older fallback-z overlay.
+    return meta.kind !== DESKTOP_WINDOW_KINDS.subSession
+      && meta.kind !== DESKTOP_WINDOW_KINDS.subsessionFileBrowser;
+  }, []);
+
   /** Idempotent register; raises if `bringToFront` is requested. Bumps version only on real change. */
   const ensureDesktopWindow = useCallback((id: string, meta: DesktopWindowMeta, opts?: { bringToFront?: boolean }) => {
-    if (isMobileRef.current) return;
+    if (!canUseWindowStackForSurface(meta)) return;
     const stack = stackRef.current!;
     let changed = stack.ensureWindow(id, meta);
     if (opts?.bringToFront) {
       if (stack.bringToFront(id)) changed = true;
     }
     if (changed) bumpStack();
-  }, []);
+  }, [canUseWindowStackForSurface]);
 
   const openLocalWebPreviewFromChat = useCallback<ChatLocalWebPreviewOpenHandler>(({ port, path }) => {
     setLocalWebPreviewPort(String(port));
@@ -1682,7 +1692,6 @@ export function App() {
 
   /** Raise an existing window. No-op (no version bump) if it is already frontmost. */
   const bringDesktopWindowToFront = useCallback((id: string) => {
-    if (isMobileRef.current) return;
     if (stackRef.current!.bringToFront(id)) bumpStack();
   }, []);
 
@@ -2213,7 +2222,8 @@ export function App() {
   // stack's own short-circuit logic ensures no version bump when nothing
   // changed (e.g. re-running the effect when an unrelated dep changes).
   //
-  // Mobile is a no-op (the helpers themselves bail out on isMobileRef).
+  // On mobile, sub-session entries remain no-op, while full-screen work
+  // surfaces still register so z-index follows the same frontmost ordering.
   useEffect(() => {
     if (showRepoPage) {
       if (repoPanelParentSubId) {
