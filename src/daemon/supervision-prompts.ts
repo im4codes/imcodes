@@ -42,6 +42,21 @@ import {
  * "supervision-enforced rule" framing, making it read like a per-session
  * chat hint. Now we pick the heading from the source classification.
  */
+const SUPERVISION_RULES_TRUNCATED_NOTICE = '(Note: these rules exceeded the size limit and were truncated; shorten them so every rule takes effect.)';
+
+/**
+ * One bounded renderer for user-authored supervision rules, shared by the
+ * supervisor decision prompt and the worker continuation prompt. Truncation is
+ * reported by the BYTE budget, never by comparing UTF-16 lengths: the
+ * truncator cuts on UTF-8 bytes and appends a suffix, so a `.length` check
+ * silently misses CJK/emoji cuts -- the exact silent drop the notice exists to
+ * prevent.
+ */
+function boundSupervisionRules(text: string): { text: string; truncated: boolean } {
+  const truncated = peerAuditByteLength(text) > SUPERVISION_CUSTOM_INSTRUCTIONS_BYTES;
+  return { text: truncatePeerAuditUtf8(text, SUPERVISION_CUSTOM_INSTRUCTIONS_BYTES), truncated };
+}
+
 function buildCustomInstructionsSection(detail: SupervisionCustomInstructionsDetail | undefined): string {
   if (!detail || !detail.text.trim()) return '';
   const heading = ((): string => {
@@ -57,7 +72,13 @@ function buildCustomInstructionsSection(detail: SupervisionCustomInstructionsDet
         return 'Session-specific supervision rules set by the user (supervision enforces these on this session):';
     }
   })();
-  return [heading, detail.text].join('\n');
+  // The only user-controlled segment that reached the model unbounded. Evidence
+  // is hard-capped and the templates are fixed, so an oversized rule block was
+  // the one thing that could dominate a small supervisor's context. Truncation
+  // is surfaced, never silent: quietly dropping instructions the user wrote is
+  // its own kind of "it ignored me" bug.
+  const { text, truncated } = boundSupervisionRules(detail.text);
+  return [heading, text, truncated ? SUPERVISION_RULES_TRUNCATED_NOTICE : ''].filter(Boolean).join('\n');
 }
 
 function buildImcodesWorkflowBackgroundSection(): string {
@@ -120,10 +141,24 @@ function buildSupervisionOutputLanguageLock(request: SupervisionBrokerRequest): 
  * execution time as well: finish the reviewable work, then let the daemon
  * arrange the independent audit before repository/delivery finalization.
  */
+/**
+ * Rules handed to the WORKER model once, up front.
+ *
+ * The worker owns the audit-fix loop: it knows what it changed and why, so it
+ * writes its own audit brief instead of having a cheaper supervisor rebuild
+ * that context and push it one step at a time. Supervision is a reminder of
+ * last resort, not a driver — the previous wording ("stop and report, the
+ * daemon will arrange the audit") is exactly what turned every cycle into a
+ * supervisor-led tug of war.
+ *
+ * Deliberately short: this text is also carried by a small supervisor model,
+ * which degrades fast on long multi-rule prompts.
+ */
 export const SUPERVISED_AUDIT_EXECUTION_PREAMBLE = [
-  'Automatic peer-audit mode is enabled for this task.',
-  'Complete the implementation and all pre-audit validation, but DO NOT run git add, commit, push, merge, release, publish, deploy, or any other repository/delivery finalization in this turn, even when the user requested final delivery.',
-  'When the substantive work is ready, stop and report the exact implementation and validation evidence. The daemon will arrange the independent peer audit; finalization is allowed only after that matching audit returns PASS and automation explicitly resumes the task.',
+  'Peer-audit mode is on. You own the repair loop; the daemon owns audit routing.',
+  'Complete the implementation and validation, but DO NOT run git add, commit, push, merge, release, publish, deploy, or any other repository/delivery finalization in this turn, even when the user requested final delivery.',
+  'When the work is reviewable, report the concrete changes and validation evidence once. Do not choose or contact an auditor yourself: the daemon sends one addressed reply-enabled audit handoff.',
+  'On REWORK, own the repair: fix every actionable finding, validate, and report the new result. Repeat until PASS or an exact blocker.',
 ].join(' ');
 
 export interface PeerAuditBriefV1Input {
@@ -410,6 +445,8 @@ export interface SupervisionContinueInstructions {
 const SUPERVISION_CONTINUE_ACTION_BYTES = 2 * 1024;
 const SUPERVISION_CONTINUE_CONTEXT_TASK_BYTES = 2 * 1024;
 const SUPERVISION_CONTINUE_CONTEXT_RESULT_BYTES = 1024;
+/** User-authored supervision rules, bounded like every other prompt segment. */
+const SUPERVISION_CUSTOM_INSTRUCTIONS_BYTES = 4 * 1024;
 const SUPERVISION_REWORK_FINDINGS_BYTES = 4 * 1024;
 const SUPERVISION_REWORK_TASK_BYTES = 2 * 1024;
 
@@ -422,7 +459,14 @@ function buildCompactContinueRulesSection(
     : detail.source === 'merged'
       ? 'global + session'
       : 'session';
-  return `User supervision rules (${scope}):\n${detail.text.trim()}`;
+  // Same byte cap as the supervisor-facing section. This one matters more for
+  // prompt size: it is injected into EVERY continuation turn sent to the
+  // worker, not just the supervisor decision call. Leaving it unbounded while
+  // capping only the decision prompt bounded the cheaper of the two paths.
+  const { text, truncated } = boundSupervisionRules(detail.text.trim());
+  return [`User supervision rules (${scope}):\n${text}`, truncated ? SUPERVISION_RULES_TRUNCATED_NOTICE : '']
+    .filter(Boolean)
+    .join('\n');
 }
 
 export function buildSupervisionContinuePrompt(
@@ -508,6 +552,13 @@ export function buildReworkBriefPrompt(
   userText: string,
   _lastAssistantText: string | undefined,
   verdictText: string,
+  /**
+   * Attempts already spent and the ceiling. Previously absent from the entire
+   * data path, so the model was told "repeat until PASS" while the daemon cut
+   * it off at a limit the model could not see. Optional to keep older callers
+   * compiling; when omitted the line is skipped rather than guessed.
+   */
+  budget?: { attempt: number; limit: number },
 ): string {
   const findings = sanitizePeerAuditText(verdictText, SUPERVISION_REWORK_FINDINGS_BYTES);
   const taskContext = sanitizePeerAuditText(userText, SUPERVISION_REWORK_TASK_BYTES)
@@ -516,8 +567,11 @@ export function buildReworkBriefPrompt(
     `[Contract: ${SUPERVISION_CONTRACT_IDS.REWORK_BRIEF}]`,
     'Audit verdict: REWORK',
     `Fix these findings, then run the relevant validation:\n${findings}`,
-    'Continue the same task and complete the repair plus relevant validation autonomously; do not pause merely to say you are ready or wait for another user prompt. Report the concrete result once, then the daemon will start one fresh peer audit automatically. Do not delegate or poll an auditor yourself.',
-    'Do not stage, commit, push, merge, release, publish, or deploy until the fresh matching audit returns PASS.',
+    'Fix and validate autonomously, then report the concrete result once. Do not pause just to say you are ready, and do not delegate or poll an auditor yourself: the daemon starts one fresh audit for the repaired revision.',
+    ...(budget
+      ? [`Repair attempt ${budget.attempt} of ${budget.limit}. On the last attempt, fix what matters most or report an exact blocker; do not assume another round follows.`]
+      : []),
+    'Do not stage, commit, push, merge, release, publish, or deploy until a fresh matching audit returns PASS.',
     `Task context: ${taskContext}`,
   ].join('\n');
 }

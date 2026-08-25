@@ -127,7 +127,10 @@ const AUDIT_TARGET_MAX_RECOVERY_CONTINUES = 2;
  * bounded window to arrive instead of permanently discarding the run at the
  * first out-of-order idle event.
  */
+const SUPERVISION_CONSUMED_AUDIT_ATTEMPTS_MAX = 10_000;
 const SUPERVISION_COMPLETION_GRACE_MS = 2_000;
+/** Max time spent waiting while provider activity is UNKNOWN before failing closed. */
+const SUPERVISION_COMPLETION_WAIT_MAX_MS = 60_000;
 const SUPERVISION_RECENT_EVIDENCE_EVENT_COUNT = 80;
 const SUPERVISION_RECENT_EVIDENCE_COUNT = 12;
 const SUPERVISION_RECENT_EVIDENCE_TEXT_LENGTH = 4_096;
@@ -178,6 +181,8 @@ interface ActiveTaskRunState {
   waitingTimeoutTimer?: NodeJS.Timeout;
   /** Bounded wait for a final assistant row that raced behind `idle`. */
   completionGraceTimer?: NodeJS.Timeout;
+  /** Wall-clock start of the current no-activity-evidence wait. */
+  completionWaitStartedAt?: number;
   /** How much audit this run's change is worth; scopes the delegated brief. */
   auditDepth?: SupervisionAuditDepth;
   // When a reply-backed audit settles from the assistant-text fallback (that
@@ -769,7 +774,10 @@ async function resolveAuditBaseline(sessionName: string, run: ActiveTaskRunState
 }
 
 function buildReworkBrief(run: ActiveTaskRunState, verdictText: string): string {
-  return buildReworkBriefPrompt(run.sessionName, run.userText, run.lastAssistantText, verdictText);
+  return buildReworkBriefPrompt(run.sessionName, run.userText, run.lastAssistantText, verdictText, {
+    attempt: run.reworkDispatches,
+    limit: run.snapshot.maxAuditLoops,
+  });
 }
 
 function isFinalAssistantPayload(payload: Record<string, unknown>): boolean {
@@ -781,6 +789,8 @@ class SupervisionAutomation {
   private pendingTaskIntents = new Map<string, PendingTaskIntent>();
   private recentTaskCandidates = new Map<string, RecentTaskCandidate>();
   private latestAssistantTexts = new Map<string, LatestAssistantText>();
+  /** Settled audit attempts, kept beyond the emission ring's eviction window. */
+  private consumedAuditAttemptIds = new Set<string>();
   private lastObservedSessionStates = new Map<string, string>();
   private implicitCompletionGraceTimers = new Map<string, NodeJS.Timeout>();
   private recoveredImplicitCompletionKeys: string[] = [];
@@ -951,10 +961,72 @@ class SupervisionAutomation {
     }
   }
 
-  private isSessionIdle(sessionName: string): boolean {
+  /**
+   * Single source of truth for "is this session still working".
+   *
+   * For transport sessions the runtime diagnostics are complete and live, so
+   * neither the cached timeline state nor the persisted store participates --
+   * consulting them was what allowed a stale projection to authorize a
+   * termination. `transportRuntimeIsWorking()` cannot be reused here because it
+   * folds "no runtime" and "not working" into the same `false`, which is
+   * exactly the distinction this tri-state exists to keep.
+   */
+  private resolveSessionActivity(sessionName: string): 'active' | 'idle' | 'unknown' {
     const observed = this.lastObservedSessionStates.get(sessionName);
-    if (observed) return observed === 'idle';
-    return getSession(sessionName)?.state === 'idle';
+    const persisted = getSession(sessionName)?.state;
+    const runtime = getTransportRuntime(sessionName);
+    // This predicate runs on every idle check, which is a far wider surface
+    // than the original narrow call sites. Not every runtime implementation
+    // exposes diagnostics, so probe before use and fall back to the event
+    // stream rather than throwing inside a timer callback.
+    if (runtime && typeof runtime.getDiagnosticSnapshot === 'function') {
+      const activity = runtime.getDiagnosticSnapshot();
+      if (isWorkingSessionState(activity.status)
+        || activity.sending
+        || activity.pendingCount > 0
+        || activity.activeDispatchCount > 0
+        || activity.blockingWorkCount > 0) return 'active';
+      // A quiet runtime is necessary but NOT sufficient. When another signal
+      // still asserts work is in flight we genuinely do not know which one is
+      // stale, and "unknown" must never be silently upgraded to "finished" --
+      // that is what let a stale projection authorize a termination. Unknown
+      // keeps the watchdog armed and ends at a visible needs_input instead.
+      // The observed event stream wins over the persisted projection: when we
+      // have seen an edge, that is the freshest thing we know.
+      if (observed) return observed === 'idle' ? 'idle' : 'unknown';
+      if (persisted === 'running') return 'unknown';
+      return 'idle';
+    }
+    if (observed) return observed === 'idle' ? 'idle' : 'active';
+    if (persisted === 'idle') return 'idle';
+    if (persisted === 'running') return 'active';
+    return 'unknown';
+  }
+
+  private isSessionIdle(sessionName: string): boolean {
+    return this.resolveSessionActivity(sessionName) === 'idle';
+  }
+
+  /**
+   * Positive, diagnostics-backed proof that work is in flight right now.
+   *
+   * Deliberately stricter than `resolveSessionActivity() === 'active'`: that
+   * one infers `active` from an observed projection when no runtime exists,
+   * which is fine for deciding "not idle yet" but must never be enough to
+   * REVOKE the only watchdog a run has. A delayed/reordered `running` row on a
+   * session with no diagnostics would otherwise clear the timer and leave the
+   * run in `activeRuns` with no timer and no terminal action -- the original
+   * permanent-hang bug, reachable again through a different door.
+   */
+  private hasActiveRuntimeEvidence(sessionName: string): boolean {
+    const runtime = getTransportRuntime(sessionName);
+    if (!runtime || typeof runtime.getDiagnosticSnapshot !== 'function') return false;
+    const activity = runtime.getDiagnosticSnapshot();
+    return isWorkingSessionState(activity.status)
+      || activity.sending
+      || activity.pendingCount > 0
+      || activity.activeDispatchCount > 0
+      || activity.blockingWorkCount > 0;
   }
 
   private isEligibleAssistantCompletionPayload(payload: Record<string, unknown>): boolean {
@@ -1009,6 +1081,23 @@ class SupervisionAutomation {
   }
 
   private rememberEmittedAuditResultAttempt(attemptId: string): boolean {
+    // Consumed-attempt tombstones are tracked separately from the 512-entry
+    // emission ring: the ring exists to de-duplicate result emission and
+    // evicts by age, which would silently re-open a settled attempt for
+    // adoption.
+    //
+    // What this provides, precisely: recent same-process duplicate-attempt
+    // suppression. NOT global, NOT cross-restart, NOT permanent. That is
+    // sufficient because the attempt label is not the deciding authority --
+    // adoption still requires a live pending delegation authority (purpose,
+    // origin, target, session identity) and the verdict still has to come back
+    // from the configured auditor over that authority.
+    this.consumedAuditAttemptIds.add(attemptId);
+    while (this.consumedAuditAttemptIds.size > SUPERVISION_CONSUMED_AUDIT_ATTEMPTS_MAX) {
+      const oldest = this.consumedAuditAttemptIds.values().next().value;
+      if (oldest === undefined) break;
+      this.consumedAuditAttemptIds.delete(oldest);
+    }
     if (this.emittedAuditResultAttemptIdSet.has(attemptId)) return false;
     this.emittedAuditResultAttemptIdSet.add(attemptId);
     this.emittedAuditResultAttemptIds.push(attemptId);
@@ -1144,6 +1233,18 @@ class SupervisionAutomation {
   private failClosedMissingCompletion(sessionName: string): void {
     this.emitTerminalStatus(sessionName, 'supervision_needs_input', SUPERVISION_NEEDS_INPUT_LABEL);
     this.emitWarning(sessionName, 'Automation stopped because no completed assistant response was available for that turn. Manual continuation is required.');
+  }
+
+  /**
+   * Terminal notice for "the reply arrived, the session state did not".
+   * Distinct from `failClosedMissingCompletion`: there the assistant response
+   * is missing, here it exists and only activity convergence failed. Reusing
+   * the other wording sent users to re-run the model instead of looking at
+   * provider/runtime state.
+   */
+  private failClosedUnconfirmedActivity(sessionName: string): void {
+    this.emitTerminalStatus(sessionName, 'supervision_needs_input', SUPERVISION_NEEDS_INPUT_LABEL);
+    this.emitWarning(sessionName, 'Automation stopped because the assistant result arrived but this session\'s activity could not be confirmed before the deadline. Check the provider/runtime state; manual continuation is required.');
   }
 
   private tryStartImplicitRun(
@@ -1303,7 +1404,32 @@ class SupervisionAutomation {
       if (!latest || latest.completionGraceTimer !== timer || latest.generation !== generation) return;
       latest.completionGraceTimer = undefined;
       if (latest.sawAssistantOutput) {
-        if (this.isSessionIdle(latest.sessionName)) this.evaluateIdleRun(latest);
+        const activity = this.resolveSessionActivity(latest.sessionName);
+        if (activity === 'idle') {
+          latest.completionWaitStartedAt = undefined;
+          this.evaluateIdleRun(latest);
+          return;
+        }
+        // The budget measures how long we have waited without TRUSTWORTHY
+        // evidence, not total turn length, so a genuinely long tool-using turn
+        // is never failed. Only diagnostics-backed activity resets the window:
+        // an `active` merely inferred from a projection (no runtime, or a
+        // stale `running` row) must keep consuming the budget, otherwise such a
+        // run re-arms forever and never reaches a terminal state.
+        if (this.hasActiveRuntimeEvidence(latest.sessionName)) {
+          latest.completionWaitStartedAt = Date.now();
+        } else if (latest.completionWaitStartedAt === undefined) {
+          latest.completionWaitStartedAt = Date.now();
+        }
+        if (!this.hasActiveRuntimeEvidence(latest.sessionName)
+          && Date.now() - (latest.completionWaitStartedAt ?? Date.now()) >= SUPERVISION_COMPLETION_WAIT_MAX_MS) {
+          // Never end without a terminal action: the previous code returned
+          // here with no timer and the run left in activeRuns forever.
+          this.failClosedUnconfirmedActivity(latest.sessionName);
+          this.finishRun(latest.sessionName, 'needs_input', { preserveStatus: true });
+          return;
+        }
+        this.armCompletionGrace(latest);
         return;
       }
       if (!this.isSessionIdle(latest.sessionName) || latest.evaluating) return;
@@ -1431,6 +1557,27 @@ class SupervisionAutomation {
     this.armAuditDeadline(run);
   }
 
+  /**
+   * True when a typed supervision-audit delegation exists for this text but was
+   * refused (replay, wrong origin/target, attempt mismatch). Rejecting the
+   * structured record must NOT fall through to the heuristic adoption branch:
+   * that branch mints `randomUUID()` when no attempt is embedded, so a refused
+   * replay would simply be re-adopted under a fresh identity and the guard
+   * would be decorative.
+   */
+  private typedAuditRecordRefused(
+    run: ActiveTaskRunState,
+    eventSessionId: string,
+    text: string | undefined,
+  ): boolean {
+    if (!text) return false;
+    const authority = extractAgentDelegationReplyAuthorityFromInstruction(text);
+    if (!authority) return false;
+    const record = getDelegationReplyStore().matchPendingAuthority(authority);
+    if (!record || record.purpose !== AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT) return false;
+    return this.structuredAuditRecord(run, eventSessionId, text) === undefined;
+  }
+
   private structuredAuditRecord(
     run: ActiveTaskRunState,
     eventSessionId: string,
@@ -1445,7 +1592,15 @@ class SupervisionAutomation {
       || !record.auditAttemptId
       || record.origin.sessionName !== run.sessionName
       || record.target.sessionName !== eventSessionId
-      || (run.phase === 'auditing' && run.auditAttemptId && run.auditAttemptId !== record.auditAttemptId)
+      // Adopting a worker-prepared typed delegation during `execution` is an
+      // intended feature (it is how a self-addressed audit avoids a duplicate
+      // daemon dispatch), so the attempt ID is necessarily supplied by the
+      // audited session. What must NOT be possible is replaying an attempt that
+      // has already settled: that would let the constrained party re-bind an
+      // old verdict to new work. Equality is still enforced once the daemon has
+      // issued its own attempt.
+      || this.consumedAuditAttemptIds.has(record.auditAttemptId)
+      || (run.auditAttemptId && run.auditAttemptId !== record.auditAttemptId)
       || !delegationIdentityMatches(record.origin, boundDelegationIdentity(getSession(run.sessionName)))
       || !delegationIdentityMatches(record.target, boundDelegationIdentity(getSession(eventSessionId)))) return undefined;
     return record;
@@ -1564,7 +1719,7 @@ class SupervisionAutomation {
             auditAttemptId: structured.auditAttemptId!,
             delegationId: structured.delegationId,
           });
-        } else if (run.phase === 'execution') {
+        } else if (run.phase === 'execution' && !this.typedAuditRecordRefused(run, event.sessionId, text)) {
           const sharedActor = event.payload.sharedActor && typeof event.payload.sharedActor === 'object'
             ? event.payload.sharedActor as Record<string, unknown>
             : undefined;
@@ -1847,10 +2002,18 @@ class SupervisionAutomation {
       run.lastAssistantText = text;
       run.lastAssistantCompletionKey = completionKey;
       run.sawAssistantOutput = true;
-      if ((run.phase === 'execution' || run.phase === 'finalizing')
-        && !run.evaluating
-        && this.lastObservedSessionStates.get(event.sessionId) === 'idle') {
-        this.evaluateIdleRun(run);
+      if ((run.phase === 'execution' || run.phase === 'finalizing') && !run.evaluating) {
+        if (this.lastObservedSessionStates.get(event.sessionId) === 'idle') {
+          this.evaluateIdleRun(run);
+        } else {
+          // The final row landed while the cached state is still non-idle. The
+          // completion grace is otherwise only armed on an observed idle edge,
+          // so a runtime that stops without emitting that edge would leave this
+          // run with no watchdog at all and supervision would never look at it
+          // again. Arm one here; it re-arms and reconciles the stale
+          // observation against the store.
+          this.armCompletionGrace(run);
+        }
       }
       // A retained/background transport can emit the final assistant result
       // without producing another session.state=idle edge afterwards. Waiting
@@ -1911,8 +2074,21 @@ class SupervisionAutomation {
         return;
       }
       if (!run) return;
-      if (state && state !== 'idle') {
+      // A delayed/reordered non-idle projection must not kill the only
+      // watchdog this run has. Clear it only when the runtime confirms work is
+      // actually in flight; otherwise a stale `running` row silently wedges the
+      // run -- the exact reordering this code exists to tolerate.
+      // Once the final assistant row has landed, NOTHING may revoke this run's
+      // watchdog -- not even diagnostics-backed activity. Clearing it here left
+      // no mechanism to observe the runtime going quiet again, so a provider
+      // that stopped without a trailing idle wedged the run forever. Genuine
+      // activity is already handled inside the timer callback, which resets the
+      // wait window and re-arms. Clearing is only safe before a final row,
+      // where it exists to rebase the grace onto a newly started turn.
+      if (state && state !== 'idle' && !run.sawAssistantOutput) {
         this.clearCompletionGrace(run);
+        run.ignoreIdleUntilPostAuditTurnActivity = false;
+      } else if (state && state !== 'idle') {
         run.ignoreIdleUntilPostAuditTurnActivity = false;
       }
       if (state === 'idle' && (run.phase === 'execution' || run.phase === 'finalizing') && !run.evaluating) {

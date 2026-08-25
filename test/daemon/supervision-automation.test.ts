@@ -34,6 +34,8 @@ const mockGetP2pRun = vi.fn();
 const mockListP2pRuns = vi.fn(() => [] as unknown[]);
 const mockSupervisionDecide = vi.fn(async () => ({ decision: 'complete', reason: 'done', confidence: 0.9 }));
 let mockTransportRuntimeWorking = false;
+/** Simulates a process-agent session that has no transport runtime at all. */
+let mockBrainRuntimeMissing = false;
 const mockTransportRuntime = {
   send: vi.fn(),
   pendingCount: 0,
@@ -78,9 +80,10 @@ vi.mock('../../src/daemon/p2p-orchestrator.js', () => ({
 }));
 
 vi.mock('../../src/agent/session-manager.js', () => ({
-  getTransportRuntime: vi.fn((sessionName: string) => sessionName === 'deck_sub_reviewer'
-    ? mockAuditTargetRuntime
-    : mockTransportRuntime),
+  getTransportRuntime: vi.fn((sessionName: string) => {
+    if (sessionName === 'deck_sub_reviewer') return mockAuditTargetRuntime;
+    return mockBrainRuntimeMissing ? undefined : mockTransportRuntime;
+  }),
   persistSessionRecord: mockPersistSessionRecord,
 }));
 
@@ -166,6 +169,7 @@ beforeEach(async () => {
   await timelineStore.flushSession('deck_sub_reviewer');
   await rm(timelineStore.filePath('deck_supervision_brain'), { force: true });
   await rm(timelineStore.filePath('deck_sub_reviewer'), { force: true });
+  mockBrainRuntimeMissing = false;
   timelineEmitter.forgetSession('deck_supervision_brain');
   timelineEmitter.forgetSession('deck_sub_reviewer');
   vi.clearAllMocks();
@@ -457,6 +461,115 @@ describe('SupervisionAutomation', () => {
         }),
       }),
     ]));
+  });
+
+  it('does not hang forever when the runtime never emits the trailing idle edge', async () => {
+    const snapshot = await seedSession('supervised_audit');
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    try {
+      supervisionAutomation.init();
+      supervisionAutomation.registerTaskIntent(
+        'deck_supervision_brain',
+        'cmd-missing-idle-edge',
+        '检查部署状态',
+        snapshot,
+      );
+      beginRun('cmd-missing-idle-edge', '检查部署状态');
+
+      // The runtime reports that it is working and then delivers its final
+      // assistant row, but never emits the trailing session.state=idle edge.
+      timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'running' });
+      timelineEmitter.emit('deck_supervision_brain', 'assistant.text', {
+        text: '当前环境尚未部署最新提交。',
+        streaming: false,
+      });
+
+      // A quiet runtime contradicted by a non-idle observation is UNKNOWN, not
+      // finished: supervision must not evaluate on that evidence.
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(mockSupervisionDecide).not.toHaveBeenCalled();
+      expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeDefined();
+
+      // But it must not stay silent forever either. Once the unknown-wait
+      // budget is spent the run fails closed and returns control to the user,
+      // which is the behaviour the original "idle 不反应" report was missing.
+      await vi.advanceTimersByTimeAsync(35_000);
+      expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('still terminates when a diagnostics-active runtime later goes quiet without a trailing idle row', async () => {
+    const snapshot = await seedSession('supervised_audit');
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    try {
+      supervisionAutomation.init();
+      supervisionAutomation.registerTaskIntent(
+        'deck_supervision_brain',
+        'cmd-active-then-quiet',
+        '检查部署状态',
+        snapshot,
+      );
+      beginRun('cmd-active-then-quiet', '检查部署状态');
+      timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'running' });
+      timelineEmitter.emit('deck_supervision_brain', 'assistant.text', {
+        text: '当前环境尚未部署最新提交。',
+        streaming: false,
+      });
+
+      // A non-idle row backed by REAL diagnostics activity. Revoking the
+      // watchdog here used to be considered safe, but nothing then observes the
+      // runtime going quiet again.
+      mockTransportRuntimeWorking = true;
+      timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'running' });
+
+      // The provider stops working and never emits a trailing idle row.
+      mockTransportRuntimeWorking = false;
+
+      await vi.advanceTimersByTimeAsync(70_000);
+      expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
+    } finally {
+      mockTransportRuntimeWorking = false;
+      vi.useRealTimers();
+    }
+  });
+
+  it('never leaves a run without a watchdog when a session with no transport runtime gets a late non-idle row', async () => {
+    const snapshot = await seedSession('supervised_audit');
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    try {
+      supervisionAutomation.init();
+      supervisionAutomation.registerTaskIntent(
+        'deck_supervision_brain',
+        'cmd-no-runtime-late-running',
+        '检查部署状态',
+        snapshot,
+      );
+      beginRun('cmd-no-runtime-late-running', '检查部署状态');
+      timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'running' });
+      timelineEmitter.emit('deck_supervision_brain', 'assistant.text', {
+        text: '当前环境尚未部署最新提交。',
+        streaming: false,
+      });
+
+      // Process agent: no transport runtime, so activity can only ever be
+      // INFERRED from projections. A delayed `running` row must not be able to
+      // revoke the only watchdog this run has.
+      mockBrainRuntimeMissing = true;
+      timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'running' });
+
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeDefined();
+
+      // Inferred activity keeps consuming the budget, so the run still reaches
+      // a visible terminal state instead of sitting in activeRuns forever.
+      await vi.advanceTimersByTimeAsync(35_000);
+      expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
+    } finally {
+      mockBrainRuntimeMissing = false;
+      vi.useRealTimers();
+    }
   });
 
   it('forces peer audit when the supervisor misclassifies completed engineering and push as read-only', async () => {
@@ -782,6 +895,61 @@ describe('SupervisionAutomation', () => {
     expect(activeRun).toMatchObject({ phase: 'execution' });
     expect(activeRun).not.toHaveProperty('auditDelegationId');
     expect(mockTransportRuntime.send).not.toHaveBeenCalled();
+  });
+
+  it('refuses to adopt a typed audit attempt that has already settled', async () => {
+    // Adopting a worker-prepared typed delegation is an intended feature, so
+    // the attempt ID is necessarily supplied by the audited session.
+    //
+    // Scope of what this guarantees, stated precisely: RECENT SAME-PROCESS
+    // duplicate-attempt suppression -- the last 10k settled attempt labels in
+    // this daemon process. It is NOT global, not cross-restart, and not
+    // permanent. It cannot re-bind an old verdict either way: every adoption
+    // still has to match a live pending delegation authority (purpose, origin,
+    // target, session identity), and the verdict itself still has to arrive
+    // from the configured auditor over that new authority.
+    const snapshot = await seedSession('supervised_audit');
+    supervisionAutomation.init();
+    const origin = getSession('deck_supervision_brain');
+    const target = getSession('deck_sub_reviewer');
+    if (!target) throw new Error('reviewer was not seeded');
+    const attemptId = 'automatic_audit_attempt_replayed_1';
+
+    const adopt = (commandId: string) => {
+      supervisionAutomation.registerTaskIntent('deck_supervision_brain', commandId, '实现并审计该功能', snapshot);
+      beginRun(commandId, '实现并审计该功能');
+      const authority = createDelegationReplyAuthority({
+        origin,
+        target,
+        dispatchId: createSendDispatchId(),
+        messageId: createSendMessageId(),
+        audit: { kind: AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT, attemptId },
+      });
+      if (!authority) throw new Error('authority was not created');
+      timelineEmitter.emit('deck_sub_reviewer', 'user.message', {
+        text: [
+          'Task: audit request.',
+          buildAgentDelegationReplyInstruction('deck_supervision_brain', authority.authority),
+        ].join('\n'),
+        allowDuplicate: true,
+        sharedActor: { actorUserId: 'deck_supervision_brain' },
+      });
+    };
+
+    adopt('cmd-replay-first');
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({
+      phase: 'auditing',
+      auditAttemptId: attemptId,
+    });
+
+    // Settle it, which records the attempt as consumed.
+    completeDelegatedAudit('PASS', 'First audit evidence.');
+    await sleep(25);
+
+    // A second run replaying the very same attempt must NOT enter auditing.
+    supervisionAutomation.cancelSession('deck_supervision_brain');
+    adopt('cmd-replay-second');
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')?.phase).not.toBe('auditing');
   });
 
   it('registers a v2 audit by delegation authority and releases deferred validation only after its delivery', async () => {
@@ -2033,7 +2201,7 @@ describe('SupervisionAutomation', () => {
     expect(mockTransportRuntime.send).toHaveBeenCalledTimes(2);
     const reworkPrompt = String(mockTransportRuntime.send.mock.calls[1]?.[0]);
     expect(reworkPrompt).toContain('Audit verdict: REWORK');
-    expect(reworkPrompt).toContain('Do not stage, commit, push, merge, release, publish, or deploy until the fresh matching audit returns PASS.');
+    expect(reworkPrompt).toContain('Do not stage, commit, push, merge, release, publish, or deploy until a fresh matching audit returns PASS.');
     expect(reworkPrompt).not.toContain('Commit the completed changes and push to origin/dev.');
     expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({
       phase: 'execution',
@@ -2773,8 +2941,19 @@ describe('SupervisionAutomation', () => {
     await waitForRunPhase('execution');
     expect(mockTransportRuntime.send).toHaveBeenCalledTimes(3);
     expect(String(mockTransportRuntime.send.mock.calls[2]?.[0])).toContain(
-      'the daemon will start one fresh peer audit automatically',
+      'the daemon starts one fresh audit for the repaired revision',
     );
+    // The rendered repair budget must match the real one. Assert the NUMBERS
+    // the worker actually receives, not the builder's inputs: the off-by-one
+    // lived in how the caller computed `attempt`, so a builder-level test
+    // could never see it. Numeric comparison kills offsets in either
+    // direction, including a future regression that shifts the other way.
+    const reworkBudget = /Repair attempt (\d+) of (\d+)/.exec(
+      String(mockTransportRuntime.send.mock.calls[2]?.[0]),
+    );
+    expect(reworkBudget).not.toBeNull();
+    expect(Number(reworkBudget![1])).toBe(1);
+    expect(Number(reworkBudget![1])).toBeLessThanOrEqual(Number(reworkBudget![2]));
     expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({
       continueStreakCount: 0,
       phase: 'execution',

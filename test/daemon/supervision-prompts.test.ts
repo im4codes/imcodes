@@ -11,10 +11,38 @@ import {
 import { PEER_AUDIT_BRIEF_TOTAL_BYTES, peerAuditByteLength } from '../../shared/peer-audit.js';
 
 describe('supervision prompts', () => {
-  it('gates repository finalization in the original supervised-audit execution turn', () => {
-    expect(SUPERVISED_AUDIT_EXECUTION_PREAMBLE).toContain('DO NOT run git add, commit, push');
-    expect(SUPERVISED_AUDIT_EXECUTION_PREAMBLE).toContain('matching audit returns PASS');
-    expect(SUPERVISED_AUDIT_EXECUTION_PREAMBLE).toContain('daemon will arrange the independent peer audit');
+  // Wording snapshot, NOT a behavioural gate. There is no execution-time
+  // interception of git/release/deploy anywhere in the daemon, so this asserts
+  // only that the explicit prohibition text stays present and that we never
+  // again claim a code-enforced gate that does not exist.
+  it('surfaces truncation for CJK supervision rules that only just exceed the byte cap', () => {
+    // 4 KiB cap; CJK is 3 UTF-8 bytes but 1 UTF-16 unit. 1366 chars = 4098
+    // bytes -- barely over. The old `bounded.length < text.length` check
+    // compared UTF-16 units against a byte-based truncation that also appends
+    // a suffix, so this exact shape was truncated SILENTLY.
+    const rules = '规'.repeat(1366);
+    expect(peerAuditByteLength(rules)).toBeGreaterThan(4 * 1024);
+    expect(rules.length).toBeLessThan(4 * 1024);
+
+    const prompt = buildSupervisionContinuePrompt(
+      'Finish the task',
+      'Partial implementation complete',
+      'Remaining work',
+      rules,
+    );
+
+    expect(prompt).toContain('exceeded the size limit and were truncated');
+    // And the untruncated case must NOT claim truncation.
+    const short = buildSupervisionContinuePrompt('t', 'r', 'i', '只有一条规则。');
+    expect(short).not.toContain('exceeded the size limit');
+  });
+
+  it('keeps the supervised-audit execution preamble wording stable', () => {
+    expect(SUPERVISED_AUDIT_EXECUTION_PREAMBLE).toContain('DO NOT run git add, commit, push, merge, release, publish, deploy');
+    expect(SUPERVISED_AUDIT_EXECUTION_PREAMBLE).toContain('even when the user requested final delivery');
+    expect(SUPERVISED_AUDIT_EXECUTION_PREAMBLE).toContain('in this turn');
+    expect(SUPERVISED_AUDIT_EXECUTION_PREAMBLE).toContain('Do not choose or contact an auditor yourself');
+    expect(SUPERVISED_AUDIT_EXECUTION_PREAMBLE).not.toContain('enforced in code');
   });
 
   it('builds a bounded lightweight brief with non-destructive executable validation and structured reply', () => {
@@ -229,11 +257,11 @@ describe('supervision prompts', () => {
     );
 
     expect(prompt).toContain('Fix these findings, then run the relevant validation:');
-    expect(prompt).toContain('the daemon will start one fresh peer audit automatically');
-    expect(prompt).toContain('complete the repair plus relevant validation autonomously');
-    expect(prompt).toContain('do not pause merely to say you are ready or wait for another user prompt');
-    expect(prompt).toContain('Do not delegate or poll an auditor yourself');
-    expect(prompt).toContain('Do not stage, commit, push, merge, release, publish, or deploy until the fresh matching audit returns PASS.');
+    expect(prompt).toContain('the daemon starts one fresh audit for the repaired revision');
+    expect(prompt).toContain('Fix and validate autonomously');
+    // The worker now owns re-audit; the old prohibition would contradict that.
+    expect(prompt).not.toContain('Do not delegate or poll an auditor yourself');
+    expect(prompt).toContain('Do not stage, commit, push, merge, release, publish, or deploy until a fresh matching audit returns PASS.');
     expect(prompt).not.toContain('Current assistant result:');
   });
 

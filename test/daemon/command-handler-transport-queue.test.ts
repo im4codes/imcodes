@@ -1883,7 +1883,7 @@ describe('handleWebCommand transport queue behavior', () => {
       'also cover automatic audit',
       'cmd-composer-append-supervised',
       undefined,
-      expect.stringContaining('Automatic peer-audit mode is enabled for this task.'),
+      expect.stringContaining('You own the repair loop'),
       { deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND },
     );
     expect(queueTaskIntentMock).not.toHaveBeenCalled();
@@ -4016,7 +4016,7 @@ describe('handleWebCommand transport queue behavior', () => {
       'implement the feature',
       'cmd-heavy',
       undefined,
-      expect.stringContaining('Automatic peer-audit mode is enabled for this task.'),
+      expect.stringContaining('You own the repair loop'),
     );
     expect(registerTaskIntentMock).toHaveBeenCalledWith(
       'deck_transport_brain',
