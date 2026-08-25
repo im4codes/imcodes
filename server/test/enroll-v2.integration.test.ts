@@ -38,6 +38,8 @@ import { AUTH_IDENTITY_ERRORS } from '../../shared/auth-identity.js';
 import {
   CONTROLLED_NODE_ARTIFACT_COMPRESSION_ENCODING,
   CONTROLLED_NODE_ARTIFACT_HEADERS,
+  CONTROLLED_NODE_TICKET_DELIVERY,
+  CONTROLLED_NODE_TICKET_TTL_MS,
 } from '../../shared/controlled-node-artifacts.js';
 import {
   REMOTE_DESKTOP_LEGACY_UPGRADE_PROTOCOL_VERSION,
@@ -255,6 +257,75 @@ describe('POST /api/enroll/v2/ticket (artifact manifest → enrollments_v2 row)'
 
     const count = await db.queryOne<{ n: string }>('SELECT COUNT(*)::text AS n FROM controlled_node_enrollments_v2');
     expect(count?.n).toBe('0');
+  });
+
+  it('gives a remote install link a lifetime that can survive being carried to another machine', async () => {
+    const app = buildApp();
+    const userId = `u_${hex(4)}`;
+    await createUser(db, userId);
+    const o = await owner(userId);
+
+    const before = Date.now();
+    const res = await app.request('/api/enroll/v2/ticket', {
+      method: 'POST',
+      headers: ticketHeaders(userId, o),
+      body: JSON.stringify({
+        version: 2, os: 'linux', arch: 'x64',
+        delivery: CONTROLLED_NODE_TICKET_DELIVERY.REMOTE_LINK,
+      }),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json() as { ticketId: string; expiresAt: number; delivery: string };
+    expect(body.delivery).toBe(CONTROLLED_NODE_TICKET_DELIVERY.REMOTE_LINK);
+
+    // `before` is sampled ahead of the request, so the observed window is the
+    // TTL plus request latency. Band it rather than pin it; the exact value is
+    // asserted against the durable row below.
+    const ttl = body.expiresAt - before;
+    const expected = CONTROLLED_NODE_TICKET_TTL_MS[CONTROLLED_NODE_TICKET_DELIVERY.REMOTE_LINK];
+    expect(ttl).toBeGreaterThan(expected - 60_000);
+    expect(ttl).toBeLessThan(expected + 60_000);
+
+    // The durable row, not just the response, must carry the long window —
+    // download consumption is gated on ticket_expires_at.
+    const row = await db.queryOne<{ ticket_expires_at: string; created_at: string }>(
+      'SELECT ticket_expires_at, created_at FROM controlled_node_enrollments_v2 WHERE id = $1',
+      [body.ticketId],
+    );
+    expect(Number(row?.ticket_expires_at) - Number(row?.created_at)).toBe(expected);
+  });
+
+  it('keeps the default and every unknown delivery on the short browser window', async () => {
+    const app = buildApp();
+    const userId = `u_${hex(4)}`;
+    await createUser(db, userId);
+    const o = await owner(userId);
+    const browserTtl = CONTROLLED_NODE_TICKET_TTL_MS[CONTROLLED_NODE_TICKET_DELIVERY.BROWSER];
+
+    // Omitted: historical callers must be unaffected.
+    const omitted = await app.request('/api/enroll/v2/ticket', {
+      method: 'POST',
+      headers: ticketHeaders(userId, o),
+      body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
+    });
+    expect(omitted.status).toBe(200);
+    const omittedBody = await omitted.json() as { ticketId: string; delivery: string };
+    expect(omittedBody.delivery).toBe(CONTROLLED_NODE_TICKET_DELIVERY.BROWSER);
+    const omittedRow = await db.queryOne<{ ticket_expires_at: string; created_at: string }>(
+      'SELECT ticket_expires_at, created_at FROM controlled_node_enrollments_v2 WHERE id = $1',
+      [omittedBody.ticketId],
+    );
+    expect(Number(omittedRow?.ticket_expires_at) - Number(omittedRow?.created_at)).toBe(browserTtl);
+
+    // A bogus value must be refused outright, never silently widened: the body
+    // schema is strict precisely so an attacker cannot invent a longer window.
+    const bogus = await app.request('/api/enroll/v2/ticket', {
+      method: 'POST',
+      headers: ticketHeaders(userId, o),
+      body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64', delivery: 'forever' }),
+    });
+    expect(bogus.status).toBe(400);
+    expect(await bogus.json()).toEqual({ error: 'invalid_body' });
   });
 
   it('records the daemon a login-screen enrolment was started from, and refuses another user\'s', async () => {

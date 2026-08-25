@@ -4,6 +4,9 @@
  * ControlledNodesPanel (tasks 12.2/12.3): download buttons gated by server
  * availability + machine list with exec toggle and revoke.
  */
+import { readFileSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { act, render, cleanup, fireEvent, waitFor } from '@testing-library/preact';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { ControlledNodeAvailability, MachineListItem } from '../src/api/machines.js';
@@ -69,6 +72,11 @@ const beginControlledNodeDesktopDownload = vi.fn(() => ({
   closed: false,
   close: vi.fn(),
 }));
+const createControlledNodeRemoteInstallLink = vi.fn(async () => ({
+  url: 'https://im.example.test/api/enroll/v2/bootstrap#ticket=remote-raw-ticket',
+  expiresAt: Date.now() + 24 * 60 * 60 * 1000,
+  ticketId: 'tid-remote-1',
+}));
 const listSharesForTarget = vi.fn(async () => []);
 const createShare = vi.fn(async () => ({
   id: 'share-1', targetUserId: 'user-2', role: 'viewer' as const, status: 'active' as const,
@@ -78,6 +86,7 @@ vi.mock('../src/api.js', async (importOriginal) => {
   return {
     ...actual,
     downloadControlledNodeExecutable: (...a: unknown[]) => downloadControlledNodeExecutable(...a),
+    createControlledNodeRemoteInstallLink: (...a: unknown[]) => createControlledNodeRemoteInstallLink(...a),
     beginControlledNodeDesktopDownload: () => beginControlledNodeDesktopDownload(),
     listSharesForTarget: (...a: unknown[]) => listSharesForTarget(...a),
     createShare: (...a: unknown[]) => createShare(...a),
@@ -259,7 +268,11 @@ describe('ControlledNodesPanel (12.3)', () => {
 
   it('offers one download button per canonical (os, arch) artifact', async () => {
     const { container } = render(<ControlledNodesPanel />);
-    await waitFor(() => expect(container.textContent).toContain('controlled_nodes.download_target'));
+    await waitFor(() => expect(container.textContent).toContain('controlled_nodes.download_action'));
+    // The os/arch detail moved into the button's title when the row gained a
+    // second action; assert it is still reachable rather than silently dropped.
+    expect(container.querySelector('.controlled-nodes-download-btn')?.getAttribute('title'))
+      .toContain('controlled_nodes.download_target');
     const downloadBtns = Array.from(container.querySelectorAll('.controlled-nodes-download-btn'));
     expect(downloadBtns).toHaveLength(3); // win x64, mac Universal 2, linux x64
     expect(container.textContent).toContain('universal');
@@ -295,6 +308,134 @@ describe('ControlledNodesPanel (12.3)', () => {
     const preOpenOrder = beginControlledNodeDesktopDownload.mock.invocationCallOrder[0] ?? 0;
     const downloadOrder = downloadControlledNodeExecutable.mock.invocationCallOrder[0] ?? 0;
     expect(preOpenOrder).toBeLessThan(downloadOrder);
+  });
+
+  it('copies a remote install link without navigating anywhere', async () => {
+    // The operator is not at the target machine, so the useful outcome is a
+    // string on the clipboard — explicitly NOT a download in this browser.
+    const writeText = vi.fn(async () => {});
+    vi.stubGlobal('navigator', { ...globalThis.navigator, clipboard: { writeText } });
+    const { container } = render(<ControlledNodesPanel />);
+    const btn = await waitFor(() => {
+      const b = container.querySelector('.controlled-nodes-download-item.is-win .controlled-nodes-copy-link-btn');
+      if (!b) throw new Error('win x64 copy-link button not found');
+      return b;
+    });
+    fireEvent.click(btn);
+
+    await waitFor(() => {
+      expect(createControlledNodeRemoteInstallLink).toHaveBeenCalledWith({ os: 'win', arch: 'x64' });
+      expect(writeText).toHaveBeenCalledWith(
+        'https://im.example.test/api/enroll/v2/bootstrap#ticket=remote-raw-ticket',
+      );
+    });
+    // Minting a link must never start a local download or open a window.
+    expect(downloadControlledNodeExecutable).not.toHaveBeenCalled();
+    expect(beginControlledNodeDesktopDownload).not.toHaveBeenCalled();
+  });
+
+  it('gives the two row actions a real side-by-side rule, not just a comment', () => {
+    // jsdom does not compute layout, so this is a static contract check: the
+    // container the component renders must actually have a multi-column rule,
+    // and neither child may keep the full-width/push-to-bottom sizing that
+    // made them stack. It cannot prove pixels — a browser check would — but it
+    // does prove the markup and the stylesheet agree about the intent.
+    // Resolved against this module: these tests run both from the repo root
+    // and from `web/` via the package's own `npm test`, and a cwd-relative
+    // literal is ENOENT under one of them. Not `new URL(..., import.meta.url)`
+    // — Vite rewrites that pattern for asset resolution and yields `undefined`
+    // for an argument it cannot statically resolve.
+    const webRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+    const read = (relative: string): string => readFileSync(resolve(webRoot, relative), 'utf8');
+    const markup = read('src/components/ControlledNodesPanel.tsx');
+    const css = read('src/styles.css');
+    expect(markup).toContain('class="controlled-nodes-download-actions"');
+
+    const rule = (selector: string): string => {
+      const at = css.indexOf(`${selector} {`);
+      expect({ selector, defined: at >= 0 }).toEqual({ selector, defined: true });
+      return css.slice(at, css.indexOf('}', at));
+    };
+
+    const container = rule('.controlled-nodes-download-actions');
+    expect(container).toMatch(/display:\s*(grid|flex)/);
+    expect(container).toMatch(/grid-template-columns|flex-direction:\s*row/);
+    // The container now owns bottom alignment for the pair.
+    expect(container).toContain('margin-top: auto');
+
+    for (const selector of ['.controlled-nodes-download-btn', '.controlled-nodes-copy-link-btn']) {
+      const child = rule(selector);
+      expect({ selector, fullWidth: /width:\s*100%/.test(child) })
+        .toEqual({ selector, fullWidth: false });
+      expect({ selector, pushesItself: /margin-top:\s*auto/.test(child) })
+        .toEqual({ selector, pushesItself: false });
+    }
+  });
+
+  it('reports a denied clipboard instead of claiming the link was copied', async () => {
+    // The mint succeeded but the operator never received the URL. Showing
+    // "copied" here would send them to the target machine with an empty
+    // clipboard and no way to tell what went wrong.
+    const writeText = vi.fn(async () => { throw new Error('denied'); });
+    vi.stubGlobal('navigator', { ...globalThis.navigator, clipboard: { writeText } });
+    vi.spyOn(document, 'execCommand').mockReturnValue(false);
+
+    const { container } = render(<ControlledNodesPanel />);
+    const btn = await waitFor(() => {
+      const b = container.querySelector('.controlled-nodes-download-item.is-win .controlled-nodes-copy-link-btn');
+      if (!b) throw new Error('copy-link button not found');
+      return b;
+    });
+    fireEvent.click(btn);
+
+    await waitFor(() => {
+      const alert = container.querySelector('.controlled-nodes-error');
+      expect(alert?.textContent).toContain('controlled_nodes.copy_install_link_clipboard_error');
+    });
+    expect(createControlledNodeRemoteInstallLink).toHaveBeenCalled();
+    // Neither the success flash nor the expiry may appear for a copy that
+    // never reached the clipboard.
+    expect(btn.textContent).not.toContain('controlled_nodes.copy_install_link_copied');
+    expect(container.textContent).not.toContain('controlled_nodes.copy_install_link_expires_at');
+  });
+
+  it('offers the copy-link action on every platform row, beside the download button', async () => {
+    const { container } = render(<ControlledNodesPanel />);
+    await waitFor(() => {
+      if (!container.querySelector('.controlled-nodes-download-item.is-win')) {
+        throw new Error('rows not rendered');
+      }
+    });
+    for (const os of ['win', 'mac', 'linux']) {
+      const row = container.querySelector(`.controlled-nodes-download-item.is-${os}`);
+      expect(row?.querySelector('.controlled-nodes-download-btn')).toBeTruthy();
+      expect(row?.querySelector('.controlled-nodes-copy-link-btn')).toBeTruthy();
+    }
+  });
+
+  it('shows the link expiry and a copied confirmation, and surfaces mint failures', async () => {
+    const writeText = vi.fn(async () => {});
+    vi.stubGlobal('navigator', { ...globalThis.navigator, clipboard: { writeText } });
+    const { container } = render(<ControlledNodesPanel />);
+    const btn = await waitFor(() => {
+      const b = container.querySelector('.controlled-nodes-download-item.is-win .controlled-nodes-copy-link-btn');
+      if (!b) throw new Error('copy-link button not found');
+      return b;
+    });
+
+    fireEvent.click(btn);
+    await waitFor(() => {
+      expect(btn.textContent).toContain('controlled_nodes.copy_install_link_copied');
+    });
+    // The long window is only useful if the operator can see when it ends.
+    expect(container.textContent).toContain('controlled_nodes.copy_install_link_expires_at');
+
+    // A mint failure must be visible, not swallowed into a silent no-op.
+    createControlledNodeRemoteInstallLink.mockRejectedValueOnce(new Error('boom'));
+    fireEvent.click(btn);
+    await waitFor(() => {
+      expect(container.querySelector('.controlled-nodes-error')).toBeTruthy();
+    });
   });
 
   it('fail-closes when artifacts lack arch metadata', async () => {

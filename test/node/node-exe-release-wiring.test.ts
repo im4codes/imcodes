@@ -254,16 +254,54 @@ describe('controlled-node executable release wiring', () => {
     expect(entry).toContain('process.stdout.write(`${DAEMON_VERSION}\\n`)');
   });
 
-  it('keeps first-run Windows installation output quiet and user-facing', () => {
+  it('keeps first-run installation output user-facing on every platform', () => {
     const entry = readFileSync('src/node/index.ts', 'utf8');
-    const installUi = readFileSync('src/node/windows-install-ui.ts', 'utf8');
+    const installUi = readFileSync('src/node/install-report.ts', 'utf8');
     const buildScript = readFileSync('scripts/build-node-exe.mjs', 'utf8');
 
     expect(installUi).toContain("'IM.codes 安装中，请稍候...'");
-    expect(entry).toContain('isWindowsInstallerLaunch(process.platform, deps.sourceExecutablePath, deps.stagedExecutablePath)');
+    expect(entry).toContain('isInstallerLaunch(');
+    // Neither terminal outcome may be silent.
+    expect(entry).toContain('formatInstallSuccess(');
+    expect(entry).toContain('formatInstallFailure(');
     expect(buildScript).toContain("'process.env.WS_NO_BUFFER_UTIL': JSON.stringify('1')");
     expect(buildScript).toContain("'process.env.WS_NO_UTF_8_VALIDATE': JSON.stringify('1')");
     expect(buildScript).not.toContain("execArgv: ['--no-warnings']");
+  });
+
+  it('raises the UAC level after postject and strictly before signing', () => {
+    const buildScript = readFileSync('scripts/build-node-exe.mjs', 'utf8');
+    const manifestAt = buildScript.indexOf("runWindowsReleaseSigning('Manifest'");
+    const signAt = buildScript.indexOf("runWindowsReleaseSigning('Sign', outPath");
+    const injectAt = buildScript.indexOf('await inject(officialNode.nodeBin, outPath)');
+    expect(manifestAt).toBeGreaterThan(-1);
+    expect(signAt).toBeGreaterThan(-1);
+    expect(injectAt).toBeGreaterThan(-1);
+    // mt.exe rewrites the resource section and drops the Authenticode
+    // certificate table while doing so (measured: 81,471,184 -> 81,463,296
+    // bytes, exactly the 7,888-byte table, Valid -> NotSigned). Raising the
+    // manifest after signing would therefore ship an unsigned release without
+    // failing the build, which is why this ordering is asserted rather than
+    // merely commented.
+    expect(injectAt).toBeLessThan(manifestAt);
+    expect(manifestAt).toBeLessThan(signAt);
+  });
+
+  it('accepts the Manifest mode and defaults it to requireAdministrator', () => {
+    const signScript = readFileSync('scripts/windows-sign-release-artifact.ps1', 'utf8');
+    expect(signScript).toContain("[ValidateSet('Remove', 'Sign', 'Verify', 'Manifest')]");
+    expect(signScript).toContain("[string]$RequestedExecutionLevel = 'requireAdministrator'");
+    // Signing credentials gate 'Sign' only, so unsigned developer builds still
+    // get the same elevation behaviour as CI.
+    const build = readFileSync('scripts/build-node-exe.mjs', 'utf8');
+    expect(build).toContain("runWindowsReleaseSigning('Manifest', outPath)");
+    // Both SDK tools must resolve through one shared discovery path.
+    expect(signScript).toContain('function Resolve-WindowsSdkTool');
+    expect(signScript).toContain("Resolve-WindowsSdkTool -ToolName 'mt.exe'");
+    expect(signScript).toContain("Resolve-WindowsSdkTool -ToolName 'signtool.exe'");
+    // The written level is read back out of the artifact, not trusted from the
+    // tool's exit code.
+    expect(signScript).toContain('Reading back the updated PE application manifest failed.');
   });
 
   it('copies the artifacts into the image and configures the serving directory', () => {

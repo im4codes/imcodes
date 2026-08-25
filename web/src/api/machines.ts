@@ -16,14 +16,17 @@ import {
 import {
   compareControlledNodeArtifactPairs,
   CONTROLLED_NODE_MINT_ERRORS,
+  CONTROLLED_NODE_TICKET_DELIVERY,
   controlledNodeArtifactKey,
   isCanonicalControlledNodePair,
   isControlledNodeArtifactArch,
   isControlledNodeArtifactSha256,
   isControlledNodeOs,
+  isControlledNodeTicketDelivery,
   type ControlledNodeArtifactArch,
   type ControlledNodeArtifactPair,
   type ControlledNodeOs,
+  type ControlledNodeTicketDelivery,
 } from '@shared/controlled-node-artifacts.js';
 import { MACHINE_API_PATH } from '@shared/machine-reference.js';
 import { REMOTE_DESKTOP_CAPABILITY } from '@shared/remote-desktop.js';
@@ -121,6 +124,8 @@ export interface ControlledNodeExecutableTicket {
   sizeBytes: number;
   sha256: string;
   expiresAt: number;
+  /** How this ticket is meant to reach the machine; decides its lifetime. */
+  delivery: ControlledNodeTicketDelivery;
   ownerUserId: string;
 }
 
@@ -221,6 +226,11 @@ function normalizeTicket(res: unknown, expectedOwnerUserId: string): ControlledN
   const sha256 = typeof res.sha256 === 'string' && isControlledNodeArtifactSha256(res.sha256) ? res.sha256 : null;
   const expiresAt = typeof res.expiresAt === 'number' && Number.isFinite(res.expiresAt) ? res.expiresAt : null;
   const ownerUserId = typeof res.ownerUserId === 'string' ? res.ownerUserId : '';
+  // A server that predates delivery modes minted a browser-window ticket, which
+  // is the safe assumption: it under-promises the lifetime rather than over.
+  const delivery = isControlledNodeTicketDelivery(res.delivery)
+    ? res.delivery
+    : CONTROLLED_NODE_TICKET_DELIVERY.BROWSER;
   if (ownerUserId && ownerUserId !== expectedOwnerUserId) {
     throw new Error(CONTROLLED_NODE_MINT_ERRORS.AUTH_IDENTITY_CHANGED);
   }
@@ -228,7 +238,10 @@ function normalizeTicket(res: unknown, expectedOwnerUserId: string): ControlledN
     throw new Error('invalid_ticket_response');
   }
   if (!isCanonicalControlledNodePair(os, arch)) throw new Error('invalid_ticket_response');
-  return { version: 2, ticket, ticketId, os, arch, filename, sizeBytes, sha256, expiresAt, ownerUserId };
+  return {
+    version: 2, ticket, ticketId, os, arch, filename, sizeBytes, sha256,
+    expiresAt, delivery, ownerUserId,
+  };
 }
 
 /** Build download targets: one per canonical (os, arch) artifact with explicit arch. */
@@ -361,6 +374,11 @@ export async function mintControlledNodeExecutableTicket(
    * known to share a machine and the browser keeps offering one entry.
    */
   hostServerId?: string,
+  /**
+   * Defaults to a browser sitting at the machine. Pass `remote_link` when the
+   * operator will carry the link to a different machine and open it there.
+   */
+  delivery: ControlledNodeTicketDelivery = CONTROLLED_NODE_TICKET_DELIVERY.BROWSER,
 ): Promise<ControlledNodeExecutableTicket> {
   if (!isCanonicalControlledNodePair(selection.os, selection.arch)) {
     throw new Error('controlled_node_non_canonical_pair');
@@ -377,6 +395,9 @@ export async function mintControlledNodeExecutableTicket(
       os: selection.os,
       arch: selection.arch,
       ...(hostServerId ? { hostServerId } : {}),
+      // Omitted for the default so an older server, which rejects unknown keys
+      // with its strict body schema, keeps working unchanged.
+      ...(delivery === CONTROLLED_NODE_TICKET_DELIVERY.BROWSER ? {} : { delivery }),
     }),
   });
   return normalizeTicket(res, expectedOwnerUserId);
@@ -388,4 +409,27 @@ export async function mintControlledNodeExecutableTicket(
  */
 export function buildControlledNodeBootstrapUrl(ticket: string): string {
   return `${getApiBaseUrl()}${ENROLL_V2_BOOTSTRAP_PATH}#ticket=${encodeURIComponent(ticket)}`;
+}
+
+/**
+ * Mint a long-lived link the operator can open ON the machine being enrolled.
+ *
+ * This exists to break a genuine deadlock: installing on a remote machine
+ * otherwise means downloading the binary here and transferring it there with
+ * some other remote tool — which is the tool you are trying to install. The
+ * ticket rides in the URL fragment, so it is never sent to the server as part
+ * of the request line and never lands in access logs or Referer headers.
+ */
+export async function mintControlledNodeRemoteInstallLink(
+  selection: ControlledNodeArtifactSelection,
+  hostServerId?: string,
+): Promise<{ url: string; expiresAt: number; ticketId: string }> {
+  const minted = await mintControlledNodeExecutableTicket(
+    selection, hostServerId, CONTROLLED_NODE_TICKET_DELIVERY.REMOTE_LINK,
+  );
+  return {
+    url: buildControlledNodeBootstrapUrl(minted.ticket),
+    expiresAt: minted.expiresAt,
+    ticketId: minted.ticketId,
+  };
 }

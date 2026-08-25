@@ -3112,7 +3112,15 @@
       "trust_title": "Participant access can control this machine",
       "trust_body": "Only share with someone you trust. Their actions run with the controlled node's privileges.",
       "view_only": "View only"
-    }
+    },
+    "copy_install_link": "Copy install link",
+    "copy_install_link_hint": "Open this link on the machine you want to add, then run the downloaded file.",
+    "copy_install_link_copied": "Link copied",
+    "copy_install_link_pending": "Creating link…",
+    "copy_install_link_error": "Could not create an install link. Please try again.",
+    "copy_install_link_expires_at": "Install link valid until {{time}}",
+    "download_action": "Download",
+    "copy_install_link_clipboard_error": "Could not write to the clipboard. Copy the link manually, or try a different browser."
   },
   "peerAuditQuick": {
     "iconLabel": "Peer audit",

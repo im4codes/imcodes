@@ -22,12 +22,16 @@ import {
   CONTROLLED_NODE_ARTIFACT_ASSETS,
   CONTROLLED_NODE_ARTIFACT_HEADERS,
   CONTROLLED_NODE_OS_WIN,
+  CONTROLLED_NODE_TICKET_DELIVERY,
+  CONTROLLED_NODE_TICKET_DELIVERY_VALUES,
   controlledNodeComputerUseHelperFilename,
+  controlledNodeTicketTtlMs,
   isControlledNodeArtifactArch,
   isControlledNodeArtifactCompatibleWithRuntime,
   isControlledNodeArch,
   isControlledNodeRuntimePair,
   isControlledNodeOs,
+  isControlledNodeTicketDelivery,
   isRemoteDesktopArtifactAsset,
   normalizeControlledNodeArtifactPair,
   type ControlledNodeArtifactArch,
@@ -54,7 +58,8 @@ function resolveTicketEncryptionKey(c: { env: Env }): string {
 
 type EnrollRouter = Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>;
 
-const DOWNLOAD_TICKET_TTL_MS = 5 * 60 * 1000;
+// Ticket lifetime now depends on how the ticket reaches the target machine;
+// the table lives in shared/ so Web and Server cannot disagree about it.
 const TICKET_MAX_CONSUMES = 3;
 const ATTEMPT_LEASE_MS = 30 * 1000;
 
@@ -102,6 +107,11 @@ const TICKET_BODY = z
      * single entry.
      */
     hostServerId: z.string().min(1).max(128).optional(),
+    /**
+     * Omitted means the historical behaviour: a browser standing at the machine,
+     * with the short exposure window that allows.
+     */
+    delivery: z.enum(CONTROLLED_NODE_TICKET_DELIVERY_VALUES as readonly [string, ...string[]]).optional(),
   })
   .strict();
 
@@ -142,6 +152,9 @@ enrollRoutes.post('/v2/ticket', requireAuth(), async (c) => {
   const parsed = TICKET_BODY.safeParse(body);
   if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
   const { os, arch, hostServerId } = parsed.data;
+  const delivery = parsed.data.delivery && isControlledNodeTicketDelivery(parsed.data.delivery)
+    ? parsed.data.delivery
+    : CONTROLLED_NODE_TICKET_DELIVERY.BROWSER;
   if (!isControlledNodeOs(os) || !isControlledNodeArtifactArch(arch) || !isCanonicalControlledNodePair(os, arch)) {
     return c.json({ error: 'invalid_body' }, 400);
   }
@@ -182,7 +195,7 @@ enrollRoutes.post('/v2/ticket', requireAuth(), async (c) => {
   );
 
   const now = Date.now();
-  const ticketExpiresAt = now + DOWNLOAD_TICKET_TTL_MS;
+  const ticketExpiresAt = now + controlledNodeTicketTtlMs(delivery);
 
   const inserted = await (c.env.DB as Database).queryOne<{ id: string }>(
     `INSERT INTO controlled_node_enrollments_v2
@@ -203,7 +216,10 @@ enrollRoutes.post('/v2/ticket', requireAuth(), async (c) => {
     userId,
     action: 'enroll.v2.ticket.mint',
     ip: (c.get('clientIp' as never) as string) ?? 'unknown',
-    details: { ticketId: inserted.id, os, arch, artifactSha256: v.descriptor.sha256, ticketExpiresAt },
+    details: {
+      ticketId: inserted.id, os, arch, artifactSha256: v.descriptor.sha256,
+      ticketExpiresAt, delivery,
+    },
   }, c.env.DB).catch(() => {});
 
   return c.json({
@@ -217,6 +233,7 @@ enrollRoutes.post('/v2/ticket', requireAuth(), async (c) => {
     sha256: v.descriptor.sha256,
     maxConsumes: TICKET_MAX_CONSUMES,
     expiresAt: ticketExpiresAt,
+    delivery,
     ownerUserId: userId,
   });
 });

@@ -13,18 +13,25 @@
  * resolves so they can flip their UI into a "Copied!" state without having
  * to know which path succeeded.
  */
-export function copyToClipboard(text: string, onSuccess: () => void): void {
-  if (!text) return;
+export function copyToClipboard(
+  text: string,
+  onSuccess: () => void,
+  onFailure: () => void = () => {},
+): void {
+  if (!text) {
+    onFailure();
+    return;
+  }
   if (navigator.clipboard?.writeText) {
     navigator.clipboard.writeText(text).then(onSuccess).catch(() => {
-      execCommandCopy(text, onSuccess);
+      execCommandCopy(text, onSuccess, onFailure);
     });
     return;
   }
-  execCommandCopy(text, onSuccess);
+  execCommandCopy(text, onSuccess, onFailure);
 }
 
-function execCommandCopy(text: string, onSuccess: () => void): void {
+function execCommandCopy(text: string, onSuccess: () => void, onFailure: () => void): void {
   const selection = window.getSelection();
   const activeElement = document.activeElement instanceof HTMLElement ? document.activeElement : null;
   let ta: HTMLTextAreaElement | null = null;
@@ -58,10 +65,9 @@ function execCommandCopy(text: string, onSuccess: () => void): void {
     document.addEventListener('copy', onCopy);
     const commandCopied = document.execCommand('copy');
     if (copyEventHandled || commandCopied) onSuccess();
+    else onFailure();
   } catch {
-    // No clipboard available. Callers that surface a "Copied!" state will
-    // simply not flip; the user can long-press inside the source element
-    // and use the native callout instead.
+    onFailure();
   } finally {
     document.removeEventListener('copy', onCopy);
     ta?.remove();

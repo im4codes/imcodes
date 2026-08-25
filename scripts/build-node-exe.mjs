@@ -241,6 +241,17 @@ async function main() {
     );
   }
 
+  // Raise the UAC level before signing, never after.
+  //
+  // The artifact otherwise inherits official node.exe's `asInvoker`, so a
+  // double-clicked installer starts unelevated, trips its own Administrator
+  // precondition and dies with its console. mt.exe rewrites the resource
+  // section and drops the certificate table as a side effect, so doing this
+  // after Sign would silently ship an unsigned release; the ordering here is
+  // the mitigation. Unlike 'Sign', this runs even without signing credentials,
+  // so local developer builds get the same elevation behaviour as CI.
+  runWindowsReleaseSigning('Manifest', outPath);
+
   // postject changes the official node.exe bytes and therefore invalidates its
   // Microsoft signature. Sign the final SEA executable before hashing it into
   // the release manifest. Formal Windows CI always supplies both signer values;

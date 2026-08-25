@@ -3111,7 +3111,15 @@
       "trust_title": "참여자는 이 머신을 제어할 수 있습니다",
       "trust_body": "신뢰하는 사람에게만 공유하세요. 해당 작업은 제어 노드의 권한으로 실행됩니다.",
       "view_only": "보기 전용"
-    }
+    },
+    "copy_install_link": "설치 링크 복사",
+    "copy_install_link_hint": "추가하려는 컴퓨터에서 이 링크를 열고 다운로드한 파일을 실행하세요.",
+    "copy_install_link_copied": "링크가 복사됨",
+    "copy_install_link_pending": "링크 생성 중…",
+    "copy_install_link_error": "설치 링크를 만들 수 없습니다. 다시 시도해 주세요.",
+    "copy_install_link_expires_at": "설치 링크 유효 기간: {{time}}까지",
+    "download_action": "다운로드",
+    "copy_install_link_clipboard_error": "클립보드에 쓸 수 없습니다. 링크를 직접 복사하거나 다른 브라우저에서 시도해 주세요."
   },
   "peerAuditQuick": {
     "iconLabel": "피어 감사",

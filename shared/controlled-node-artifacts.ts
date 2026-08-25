@@ -197,3 +197,68 @@ export function compareControlledNodeArtifactPairs(
   if (osCmp !== 0) return osCmp;
   return CONTROLLED_NODE_ARCH_ORDER.indexOf(a.arch) - CONTROLLED_NODE_ARCH_ORDER.indexOf(b.arch);
 }
+
+/* ────────────────────────────────────────────────────────────────────────── */
+/* Download-ticket delivery                                                   */
+/* ────────────────────────────────────────────────────────────────────────── */
+
+/**
+ * How a minted enrolment ticket reaches the machine being enrolled.
+ *
+ * These are two genuinely different threat/usability trade-offs, not one
+ * setting with two numbers:
+ *
+ * - `browser` — the operator is sitting at the machine and the browser redeems
+ *   the ticket within seconds. The exposure window should be as small as the
+ *   round trip allows.
+ * - `remote_link` — the operator is NOT at the machine. The link has to survive
+ *   being copied into a chat, an email or a ticketing system and opened later
+ *   on the target box. Without this, installing on a remote machine requires
+ *   downloading locally and transferring the binary by some other tool — which
+ *   is exactly the tool you cannot install yet.
+ *
+ * The ticket itself is identical in kind; only its lifetime differs. Both stay
+ * reusable up to `max_consumes` so a failed first attempt is recoverable.
+ */
+export const CONTROLLED_NODE_TICKET_DELIVERY = {
+  BROWSER: 'browser',
+  REMOTE_LINK: 'remote_link',
+} as const;
+
+export type ControlledNodeTicketDelivery =
+  (typeof CONTROLLED_NODE_TICKET_DELIVERY)[keyof typeof CONTROLLED_NODE_TICKET_DELIVERY];
+
+export const CONTROLLED_NODE_TICKET_DELIVERY_VALUES: readonly ControlledNodeTicketDelivery[] = [
+  CONTROLLED_NODE_TICKET_DELIVERY.BROWSER,
+  CONTROLLED_NODE_TICKET_DELIVERY.REMOTE_LINK,
+];
+
+/** Ticket lifetime per delivery mode. */
+export const CONTROLLED_NODE_TICKET_TTL_MS: Readonly<
+  Record<ControlledNodeTicketDelivery, number>
+> = {
+  [CONTROLLED_NODE_TICKET_DELIVERY.BROWSER]: 5 * 60 * 1000,
+  [CONTROLLED_NODE_TICKET_DELIVERY.REMOTE_LINK]: 24 * 60 * 60 * 1000,
+};
+
+export function isControlledNodeTicketDelivery(
+  value: unknown,
+): value is ControlledNodeTicketDelivery {
+  return typeof value === 'string'
+    && (CONTROLLED_NODE_TICKET_DELIVERY_VALUES as readonly string[]).includes(value);
+}
+
+/**
+ * Ticket lifetime for a delivery mode, defaulting to the short browser window.
+ *
+ * Validates rather than indexing blindly. The argument is typed, but this value
+ * originates in a request body, so a caller that skipped validation would
+ * otherwise index the map with an unknown key and get `undefined` — which would
+ * flow into `now + undefined` and produce a NaN expiry. Failing to the short
+ * window keeps every unrecognized input on the conservative side.
+ */
+export function controlledNodeTicketTtlMs(delivery?: ControlledNodeTicketDelivery): number {
+  return isControlledNodeTicketDelivery(delivery)
+    ? CONTROLLED_NODE_TICKET_TTL_MS[delivery]
+    : CONTROLLED_NODE_TICKET_TTL_MS[CONTROLLED_NODE_TICKET_DELIVERY.BROWSER];
+}

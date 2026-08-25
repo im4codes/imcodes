@@ -3112,7 +3112,15 @@
       "trust_title": "參與者可以控制這台機器",
       "trust_body": "僅共享給你信任的人；其操作會以受控節點的系統權限執行。",
       "view_only": "僅檢視"
-    }
+    },
+    "copy_install_link": "複製安裝連結",
+    "copy_install_link_hint": "在要新增的那台機器上開啟此連結，然後執行下載的檔案。",
+    "copy_install_link_copied": "連結已複製",
+    "copy_install_link_pending": "正在產生連結…",
+    "copy_install_link_error": "無法產生安裝連結，請重試。",
+    "copy_install_link_expires_at": "安裝連結有效期至 {{time}}",
+    "download_action": "下載",
+    "copy_install_link_clipboard_error": "無法寫入剪貼簿。請手動複製連結，或換一個瀏覽器重試。"
   },
   "peerAuditQuick": {
     "iconLabel": "對等稽核",

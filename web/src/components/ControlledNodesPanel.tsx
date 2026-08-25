@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks'
 import { useTranslation } from 'react-i18next';
 import {
   controlledNodeDownloadErrorKey,
+  createControlledNodeRemoteInstallLink,
   downloadControlledNodeExecutable,
   beginControlledNodeDesktopDownload,
 } from '../api.js';
@@ -23,6 +24,7 @@ import { REMOTE_DESKTOP_INSTALLABLE_CAPABILITY } from '@shared/remote-desktop-in
 import { REMOTE_DESKTOP_CAPABILITY } from '@shared/remote-desktop.js';
 import { normalizeMachineDisplayName } from '@shared/machine-reference.js';
 import { formatByteSize } from '../util/byte-size.js';
+import { copyToClipboard } from '../util/clipboard.js';
 import { useMachines } from '../hooks/useMachines.js';
 import { isNative } from '../native.js';
 import { ShareSessionDialog } from './ShareSessionDialog.js';
@@ -126,6 +128,10 @@ export function ControlledNodesPanel({
   const [downloadingKey, setDownloadingKey] = useState<string | null>(null);
   const [downloadError, setDownloadError] = useState<string | null>(null);
   const [ticketExpiryByKey, setTicketExpiryByKey] = useState<Partial<Record<string, number>>>({});
+  const [linkingKey, setLinkingKey] = useState<string | null>(null);
+  const [copiedKey, setCopiedKey] = useState<string | null>(null);
+  const [linkExpiryByKey, setLinkExpiryByKey] = useState<Partial<Record<string, number>>>({});
+  const copiedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const [actionError, setActionError] = useState<string | null>(null);
   const [presenceRefreshFailed, setPresenceRefreshFailed] = useState(error != null);
@@ -227,6 +233,53 @@ export function ControlledNodesPanel({
       setDownloadError(t(controlledNodeDownloadErrorKey(err)));
     } finally {
       setDownloadingKey(null);
+    }
+  };
+
+  // Clearing the "Copied" flash on unmount keeps the timer from calling
+  // setState against a torn-down component when the panel closes quickly.
+  useEffect(() => () => {
+    if (copiedTimerRef.current) clearTimeout(copiedTimerRef.current);
+  }, []);
+
+  /**
+   * Mint a long-lived link and copy it, without navigating anywhere.
+   *
+   * This is the whole point of the remote-install mode: the operator is not at
+   * the target machine, so the useful artifact is a string they can paste into
+   * a chat and open over there. Downloading here and transferring the binary
+   * would need the very remote tool they are trying to install.
+   */
+  const onCopyInstallLink = async (target: ControlledNodeArtifactSelection) => {
+    const key = artifactSelectionKey(target);
+    if (linkingKey) return;
+    setLinkingKey(key);
+    setDownloadError(null);
+    try {
+      const link = await createControlledNodeRemoteInstallLink(target);
+      const copied = await new Promise<boolean>((resolve) => {
+        copyToClipboard(link.url, () => resolve(true), () => resolve(false));
+      });
+      if (!copied) {
+        setDownloadError(t('controlled_nodes.copy_install_link_clipboard_error'));
+        return;
+      }
+      // Do not retain or render the bearer URL. Only the non-secret expiry is
+      // kept after the clipboard confirms that the operator received it.
+      setLinkExpiryByKey((prev) => ({ ...prev, [key]: link.expiresAt }));
+      setCopiedKey(key);
+      if (copiedTimerRef.current) clearTimeout(copiedTimerRef.current);
+      copiedTimerRef.current = setTimeout(() => {
+        setCopiedKey(null);
+        copiedTimerRef.current = null;
+      }, 4000);
+    } catch (err) {
+      const errorKey = controlledNodeDownloadErrorKey(err);
+      setDownloadError(t(errorKey === 'controlled_nodes.download_error'
+        ? 'controlled_nodes.copy_install_link_error'
+        : errorKey));
+    } finally {
+      setLinkingKey(null);
     }
   };
 
@@ -594,6 +647,10 @@ export function ControlledNodesPanel({
             const meta = artifactMetaLine(findArtifactForTarget(artifacts, target), t);
             const expiry = ticketExpiryByKey[key];
             const isDownloading = downloadingKey === key;
+            const isLinking = linkingKey === key;
+            const isCopied = copiedKey === key;
+            const linkExpiry = linkExpiryByKey[key];
+            const rowBusy = isDownloading || isLinking;
             const platform = PLATFORM_PRESENTATION[target.os];
             return (
               <div key={key} class={`controlled-nodes-download-item is-${target.os}`}>
@@ -604,19 +661,45 @@ export function ControlledNodesPanel({
                     {meta && <span class="controlled-nodes-artifact-meta">{meta}</span>}
                   </div>
                 </div>
-                <button
-                  type="button"
-                  class="controlled-nodes-download-btn"
-                  disabled={isDownloading}
-                  onClick={() => onDownload(target)}
-                >
-                  <span>{isDownloading ? t('controlled_nodes.loading_download') : downloadLabel(target, t)}</span>
-                  <span class="controlled-nodes-download-arrow" aria-hidden="true">↓</span>
-                </button>
+                <div class="controlled-nodes-download-actions">
+                  <button
+                    type="button"
+                    class="controlled-nodes-download-btn"
+                    disabled={rowBusy}
+                    title={downloadLabel(target, t)}
+                    onClick={() => onDownload(target)}
+                  >
+                    <span>{isDownloading
+                      ? t('controlled_nodes.loading_download')
+                      : t('controlled_nodes.download_action')}</span>
+                    <span class="controlled-nodes-download-arrow" aria-hidden="true">↓</span>
+                  </button>
+                  <button
+                    type="button"
+                    class="controlled-nodes-copy-link-btn"
+                    disabled={rowBusy}
+                    title={t('controlled_nodes.copy_install_link_hint')}
+                    aria-live="polite"
+                    onClick={() => void onCopyInstallLink(target)}
+                  >
+                    {isLinking
+                      ? t('controlled_nodes.copy_install_link_pending')
+                      : isCopied
+                        ? t('controlled_nodes.copy_install_link_copied')
+                        : t('controlled_nodes.copy_install_link')}
+                  </button>
+                </div>
                 {expiry != null && (
                   <span class="controlled-nodes-ticket-expiry">
                     {t('controlled_nodes.ticket_expires_at', {
                       time: formatExpiryTime(expiry, i18n.language),
+                    })}
+                  </span>
+                )}
+                {linkExpiry != null && (
+                  <span class="controlled-nodes-ticket-expiry">
+                    {t('controlled_nodes.copy_install_link_expires_at', {
+                      time: formatExpiryTime(linkExpiry, i18n.language),
                     })}
                   </span>
                 )}

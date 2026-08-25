@@ -3112,7 +3112,15 @@
       "trust_title": "El acceso de participante permite controlar esta máquina",
       "trust_body": "Compártela solo con personas de confianza. Sus acciones se ejecutan con los privilegios del nodo controlado.",
       "view_only": "Solo lectura"
-    }
+    },
+    "copy_install_link": "Copiar enlace de instalación",
+    "copy_install_link_hint": "Abre este enlace en el equipo que quieres añadir y ejecuta el archivo descargado.",
+    "copy_install_link_copied": "Enlace copiado",
+    "copy_install_link_pending": "Creando enlace…",
+    "copy_install_link_error": "No se pudo crear el enlace de instalación. Inténtalo de nuevo.",
+    "copy_install_link_expires_at": "Enlace de instalación válido hasta las {{time}}",
+    "download_action": "Descargar",
+    "copy_install_link_clipboard_error": "No se pudo escribir en el portapapeles. Copia el enlace manualmente o prueba con otro navegador."
   },
   "peerAuditQuick": {
     "iconLabel": "Auditoría de pares",

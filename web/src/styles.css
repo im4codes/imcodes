@@ -3645,14 +3645,26 @@ html.native-ios-mac .chat-dl-btn {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/*
+ * Two actions share one row. The container owns the width and the push-to-
+ * bottom that the download button used to own alone; leaving `width:100%` and
+ * `margin-top:auto` on the button itself would force the pair to stack.
+ */
+.controlled-nodes-download-actions {
+  display: grid;
+  grid-template-columns: minmax(0, 3fr) minmax(0, 2fr);
+  align-items: stretch;
+  gap: 6px;
+  width: 100%;
+  margin-top: auto;
+}
 .controlled-nodes-download-btn {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 9px;
-  width: 100%;
+  min-width: 0;
   min-height: 36px;
-  margin-top: auto;
   padding: 7px 9px 7px 11px;
   border: 1px solid rgba(34, 211, 238, 0.3);
   border-radius: 8px;
@@ -3683,6 +3695,31 @@ html.native-ios-mac .chat-dl-btn {
   background: rgba(34, 211, 238, 0.1);
   color: #67e8f9;
   font-size: 14px;
+}
+/* Secondary to the download button: same row, visibly not the primary action. */
+.controlled-nodes-copy-link-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 0;
+  min-height: 36px;
+  padding: 6px 9px;
+  border: 1px dashed rgba(103, 232, 249, 0.3);
+  border-radius: 8px;
+  background: rgba(30, 41, 59, 0.4);
+  color: #a5f3fc;
+  font: 600 10px/1.3 var(--imcodes-app-font-family);
+  text-align: center;
+  cursor: pointer;
+}
+.controlled-nodes-copy-link-btn:hover:not(:disabled) {
+  border-color: rgba(103, 232, 249, 0.6);
+  background: rgba(30, 41, 59, 0.62);
+  color: #fff;
+}
+.controlled-nodes-copy-link-btn:disabled { cursor: wait; opacity: 0.58; }
+@media (max-width: 420px) {
+  .controlled-nodes-download-actions { grid-template-columns: minmax(0, 1fr); }
 }
 .controlled-nodes-ticket-expiry {
   display: block;

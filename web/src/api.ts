@@ -1835,6 +1835,22 @@ export async function downloadControlledNodeExecutable(
   }
 }
 
+/**
+ * Mint a link the operator opens ON the machine being enrolled.
+ *
+ * Deliberately does not navigate anywhere: the whole point is to hand back a
+ * string that survives being pasted into a chat or an email and opened later,
+ * on a different machine. It reuses the same error mapping as the direct
+ * download so a failure reads identically wherever it surfaces.
+ */
+export async function createControlledNodeRemoteInstallLink(
+  selection: import('./api/machines.js').ControlledNodeArtifactSelection,
+  hostServerId?: string,
+): Promise<{ url: string; expiresAt: number; ticketId: string }> {
+  const { mintControlledNodeRemoteInstallLink } = await import('./api/machines.js');
+  return mintControlledNodeRemoteInstallLink(selection, hostServerId);
+}
+
 export async function previewAttachment(serverId: string, attachmentId: string, sessionName?: string): Promise<void> {
   const res = await rawFetch(withSessionName(`/api/server/${encodeURIComponent(serverId)}/uploads/${encodeURIComponent(attachmentId)}/download`, sessionName));
   if (!res.ok) {

@@ -47,7 +47,43 @@ describe('controlled-node installer artifacts (4.1-4.4)', () => {
   it('detects Windows Administrator membership through a testable probe', () => {
     expect(isProcessElevated({ platform: 'win32', runCommand: () => 'True\r\n' })).toBe(true);
     expect(isProcessElevated({ platform: 'win32', runCommand: () => 'False\r\n' })).toBe(false);
-    expect(isProcessElevated({ platform: 'win32', runCommand: () => { throw new Error('denied'); } })).toBe(false);
+  });
+
+  it('probes the absolute System32 PowerShell before the PATH-resolved name', () => {
+    // A downloaded installer can be started with a PATH that lacks System32,
+    // so the absolute path must be tried first rather than depended upon as a
+    // fallback that only runs after a confusing failure.
+    const seen: string[] = [];
+    expect(isProcessElevated({
+      platform: 'win32',
+      runCommand: (file) => { seen.push(file); return 'True\r\n'; },
+    })).toBe(true);
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toMatch(/System32[\\/]WindowsPowerShell[\\/]v1\.0[\\/]powershell\.exe$/i);
+  });
+
+  it('falls back to the PATH name when the absolute probe cannot run', () => {
+    const seen: string[] = [];
+    expect(isProcessElevated({
+      platform: 'win32',
+      runCommand: (file) => {
+        seen.push(file);
+        if (seen.length === 1) throw new Error('ENOENT');
+        return 'True\r\n';
+      },
+    })).toBe(true);
+    expect(seen).toHaveLength(2);
+    expect(seen[1]).toBe('powershell.exe');
+  });
+
+  it('refuses to report an administrator as unprivileged when PowerShell cannot run', () => {
+    // Returning false here would be a lie with a specific, damaging
+    // consequence: a user who DID run as administrator is told to run as
+    // administrator, and has no way to discover the real fault.
+    expect(() => isProcessElevated({
+      platform: 'win32',
+      runCommand: () => { throw new Error('denied'); },
+    })).toThrow(/PowerShell could not be executed/);
   });
 
   it('fails with the existing Administrator/root precondition when not elevated', () => {

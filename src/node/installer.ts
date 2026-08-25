@@ -62,11 +62,27 @@ export function isProcessElevated(options: PrivilegeCheckOptions = {}): boolean 
     const runCommand = options.runCommand ?? ((file: string, args: readonly string[]) => (
       execFileSync(file, [...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })
     ));
-    try {
-      return String(runCommand('powershell.exe', WINDOWS_ADMIN_CHECK)).trim().toLowerCase() === 'true';
-    } catch {
-      return false;
+    // Absolute path, not a bare name: a downloaded installer can be started
+    // from Explorer with a PATH that does not contain System32, and resolving
+    // `powershell.exe` through PATH would then throw ENOENT. The catch below
+    // reports "not elevated", so a PATH problem would masquerade as the user
+    // having failed to run as administrator — the single most misleading
+    // outcome this check can produce.
+    const candidates = [windowsPowerShellExecutablePath(), 'powershell.exe'];
+    let lastError: unknown = null;
+    for (const candidate of candidates) {
+      try {
+        return String(runCommand(candidate, WINDOWS_ADMIN_CHECK)).trim().toLowerCase() === 'true';
+      } catch (error) {
+        lastError = error;
+      }
     }
+    // Every probe failed to *run*, which is not evidence about privilege. Say
+    // so, rather than silently denying an administrator.
+    throw new Error(
+      'unable to determine Windows privilege level: PowerShell could not be executed '
+      + `(${lastError instanceof Error ? lastError.message : String(lastError)})`,
+    );
   }
   return false;
 }

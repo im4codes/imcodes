@@ -3111,7 +3111,15 @@
       "trust_title": "参加者はこのマシンを操作できます",
       "trust_body": "信頼できる相手にのみ共有してください。操作は被制御ノードの権限で実行されます。",
       "view_only": "表示のみ"
-    }
+    },
+    "copy_install_link": "インストールリンクをコピー",
+    "copy_install_link_hint": "追加したいマシンでこのリンクを開き、ダウンロードしたファイルを実行してください。",
+    "copy_install_link_copied": "リンクをコピーしました",
+    "copy_install_link_pending": "リンクを作成中…",
+    "copy_install_link_error": "インストールリンクを作成できませんでした。もう一度お試しください。",
+    "copy_install_link_expires_at": "インストールリンクの有効期限は {{time}} まで",
+    "download_action": "ダウンロード",
+    "copy_install_link_clipboard_error": "クリップボードに書き込めませんでした。リンクを手動でコピーするか、別のブラウザーでお試しください。"
   },
   "peerAuditQuick": {
     "iconLabel": "ピア監査",

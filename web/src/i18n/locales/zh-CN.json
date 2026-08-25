@@ -3112,7 +3112,15 @@
       "trust_title": "参与者可以控制这台机器",
       "trust_body": "仅共享给你信任的人；其操作将以被控节点的系统权限执行。",
       "view_only": "仅查看"
-    }
+    },
+    "copy_install_link": "复制安装链接",
+    "copy_install_link_hint": "在要添加的那台机器上打开此链接，然后运行下载到的文件。",
+    "copy_install_link_copied": "链接已复制",
+    "copy_install_link_pending": "正在生成链接…",
+    "copy_install_link_error": "无法生成安装链接，请重试。",
+    "copy_install_link_expires_at": "安装链接有效期至 {{time}}",
+    "download_action": "下载",
+    "copy_install_link_clipboard_error": "无法写入剪贴板。请手动复制链接，或换一个浏览器重试。"
   },
   "peerAuditQuick": {
     "iconLabel": "对等审计",
