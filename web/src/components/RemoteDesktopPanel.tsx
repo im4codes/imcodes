@@ -14,14 +14,19 @@ import {
 import {
   FILE_TRANSFER_DIRECTORY_CAPABILITY,
   FILE_TRANSFER_DIRECTORY_PATH,
+  FILE_TRANSFER_PATH_HANDLE_CAPABILITY,
 } from '@shared/transport/file-transfer.js';
 import { downloadAttachment } from '../api.js';
 import { createMachineFileHandle, type MachineListItem } from '../api/machines.js';
 import { MachineDirectoryWsAdapter } from '../machine-directory-ws-adapter.js';
 import {
+  FILE_DOWNLOAD_TRANSPORT_MODE,
   FILE_UPLOAD_TRANSPORT_MODE,
+  downloadPreviewWithDirectFallback,
   isFileUploadCanceled,
+  selectPreviewDownloadDestination,
   uploadFileWithDirectFallback,
+  type FileDownloadTransportMode,
   type FileUploadTransportMode,
 } from '../direct-file-transfer.js';
 import type { RemoteDesktopSnapshot } from '../remote-desktop-client.js';
@@ -246,7 +251,7 @@ interface RemoteDesktopTransferRow {
   sourcePath: string;
   destinationPath: string;
   progress: number;
-  transport: FileUploadTransportMode;
+  transport: FileUploadTransportMode | FileDownloadTransportMode;
   status: 'transferring' | 'done' | 'canceled' | 'error';
   /** Known for a file being sent; a fetch learns it only on completion. */
   sizeBytes?: number;
@@ -322,6 +327,7 @@ export function RemoteDesktopPanel({
   const [destinationDirectory, setDestinationDirectory] = useState('');
   const [selectedLocalFiles, setSelectedLocalFiles] = useState<File[]>([]);
   const [selectedRemoteFile, setSelectedRemoteFile] = useState('');
+  const [legacyFetchPath, setLegacyFetchPath] = useState('');
   const [fileDropActive, setFileDropActive] = useState(false);
   const [mobileTextOpen, setMobileTextOpen] = useState(false);
   const [displayModeMenu, setDisplayModeMenu] = useState<DisplayModeMenuState | null>(null);
@@ -377,6 +383,10 @@ export function RemoteDesktopPanel({
   const commandMiddleDragPointerRef = useRef<number | null>(null);
   const forwardedPasteShortcutAtRef = useRef(0);
   const supportsDirectoryTransfer = Boolean(machine.capabilities?.includes(FILE_TRANSFER_DIRECTORY_CAPABILITY));
+  const supportsPathHandleTransfer = Boolean(machine.capabilities?.includes(FILE_TRANSFER_PATH_HANDLE_CAPABILITY));
+  const fetchSourcePath = supportsPathHandleTransfer
+    ? (supportsDirectoryTransfer ? selectedRemoteFile : legacyFetchPath.trim())
+    : '';
   const handleRemotePathChange = useCallback((path: string) => {
     const isRoot = path === FILE_TRANSFER_DIRECTORY_PATH.WINDOWS_DRIVES
       || path === FILE_TRANSFER_DIRECTORY_PATH.WINDOWS_DRIVES_ROOT
@@ -1537,6 +1547,29 @@ export function RemoteDesktopPanel({
     }));
   };
 
+  const updateDownloadTransferProgress = (id: string, loadedBytes: number, totalBytes: number | null) => {
+    setTransfers((current) => current.map((row) => {
+      if (row.id !== id) return row;
+      const now = Date.now();
+      const progress = totalBytes && totalBytes > 0
+        ? Math.min(99, Math.round((loadedBytes / totalBytes) * 100))
+        : row.progress;
+      const elapsed = now - (row.sampledAt ?? now);
+      const delta = loadedBytes - (row.sampledBytes ?? 0);
+      const instant = elapsed >= 250 && delta > 0 ? (delta * 1000) / elapsed : 0;
+      return {
+        ...row,
+        progress,
+        ...(totalBytes && totalBytes > 0 ? { sizeBytes: totalBytes } : {}),
+        ...(instant > 0 ? {
+          bytesPerSecond: row.bytesPerSecond ? row.bytesPerSecond * 0.6 + instant * 0.4 : instant,
+          sampledAt: now,
+          sampledBytes: loadedBytes,
+        } : {}),
+      };
+    }));
+  };
+
   const sendFile = async (file: File) => {
     const id = crypto.randomUUID();
     const controller = new AbortController();
@@ -1633,9 +1666,17 @@ export function RemoteDesktopPanel({
     mobileTextInputRef.current?.focus({ preventScroll: true });
   };
 
-  const fetchFile = async (requestedPath = selectedRemoteFile) => {
+  const fetchFile = async (requestedPath: string) => {
     const path = requestedPath.trim();
     if (!path) return;
+    let destination;
+    try {
+      destination = await selectPreviewDownloadDestination(path.split(/[/\\]/).pop() || undefined);
+    } catch (error) {
+      if (isFileUploadCanceled(error)) return;
+      setTransferError(t('remote_desktop.file_transfer_failed'));
+      return;
+    }
     const id = crypto.randomUUID();
     const controller = new AbortController();
     transferControllersRef.current.set(id, controller);
@@ -1646,17 +1687,34 @@ export function RemoteDesktopPanel({
       sourcePath: path,
       destinationPath: t('remote_desktop.browser_downloads'),
       progress: 0,
-      transport: FILE_UPLOAD_TRANSPORT_MODE.RELAY,
+      transport: FILE_DOWNLOAD_TRANSPORT_MODE.CONNECTING,
       status: 'transferring',
+      sampledAt: Date.now(),
+      sampledBytes: 0,
     }]);
     setTransferError(null);
     try {
       const attachment = await createMachineFileHandle(machine.serverId, path, controller.signal);
-      updateTransfer(id, { progress: 70 });
-      await downloadAttachment(machine.serverId, attachment.id, undefined, controller.signal);
+      const transferWs = ws?.targetsServer(machine.serverId) ? ws : null;
+      if (transferWs) {
+        await downloadPreviewWithDirectFallback({
+          ws: transferWs,
+          serverId: machine.serverId,
+          previewHandle: attachment.id,
+          suggestedName: path.split(/[/\\]/).pop() || undefined,
+          destination,
+          httpFallback: () => downloadAttachment(machine.serverId, attachment.id, undefined, controller.signal),
+          signal: controller.signal,
+          onMode: (transport) => updateTransfer(id, { transport }),
+          onProgress: ({ loadedBytes, totalBytes }) => updateDownloadTransferProgress(id, loadedBytes, totalBytes),
+        });
+      } else {
+        updateTransfer(id, { transport: FILE_DOWNLOAD_TRANSPORT_MODE.BROWSER });
+        await downloadAttachment(machine.serverId, attachment.id, undefined, controller.signal);
+      }
       updateTransfer(id, { progress: 100, status: 'done' });
     } catch (error) {
-      if (error instanceof Error && error.name === 'AbortError') {
+      if (isFileUploadCanceled(error)) {
         updateTransfer(id, { status: 'canceled' });
         return;
       }
@@ -2342,12 +2400,12 @@ export function RemoteDesktopPanel({
                 <button
                   type="button"
                   aria-label={t('remote_desktop.fetch_to_local')}
-                  disabled={!selectedRemoteFile}
-                  onClick={() => { void fetchFile(); }}
+                  disabled={!fetchSourcePath}
+                  onClick={() => { void fetchFile(fetchSourcePath); }}
                 >
                   <strong>{t('remote_desktop.fetch_to_local')}</strong>
-                  <small>{selectedRemoteFile
-                    ? selectedRemoteFile.split(/[/\\]/).pop()
+                  <small>{fetchSourcePath
+                    ? fetchSourcePath.split(/[/\\]/).pop()
                     : t('remote_desktop.select_remote_file')}</small>
                 </button>
               </div>
@@ -2360,26 +2418,52 @@ export function RemoteDesktopPanel({
                   </div>
                   <small>{supportsDirectoryTransfer
                     ? t('remote_desktop.remote_folder_ready')
-                    : t('remote_desktop.file_destination_upgrade_hint')}</small>
+                    : supportsPathHandleTransfer
+                      ? t('remote_desktop.fetch_path')
+                      : t('remote_desktop.file_destination_upgrade_hint')}</small>
                 </div>
-                <div class="remote-desktop-file-path" title={destinationDirectory || undefined}>
-                  {destinationDirectory || t('remote_desktop.choose_destination_folder')}
+                <div
+                  class="remote-desktop-file-path"
+                  title={(supportsDirectoryTransfer ? destinationDirectory : fetchSourcePath) || undefined}
+                >
+                  {supportsDirectoryTransfer
+                    ? destinationDirectory || t('remote_desktop.choose_destination_folder')
+                    : fetchSourcePath || t('remote_desktop.fetch_path')}
                 </div>
                 <div class="remote-desktop-remote-browser">
-                  <FileBrowser
-                    ws={machineDirectoryAdapter.asWsClient()}
-                    mode="file-single"
-                    layout="panel"
-                    initialPath={FILE_TRANSFER_DIRECTORY_PATH.WINDOWS_DRIVES}
-                    serverId={machine.serverId}
-                    readOnly
-                    hideFooter
-                    hideBreadcrumbConfirm
-                    onCurrentPathChange={handleRemotePathChange}
-                    onSelectedPathChange={handleRemoteSelectionChange}
-                    onPreviewFile={() => {}}
-                    onConfirm={(paths) => setSelectedRemoteFile(paths[0] ?? '')}
-                  />
+                  {supportsDirectoryTransfer ? (
+                    <FileBrowser
+                      ws={machineDirectoryAdapter.asWsClient()}
+                      mode="file-single"
+                      layout="panel"
+                      initialPath={FILE_TRANSFER_DIRECTORY_PATH.WINDOWS_DRIVES}
+                      serverId={machine.serverId}
+                      readOnly
+                      hideFooter
+                      hideBreadcrumbConfirm
+                      onCurrentPathChange={handleRemotePathChange}
+                      onSelectedPathChange={handleRemoteSelectionChange}
+                      onPreviewFile={() => {}}
+                      onConfirm={(paths) => setSelectedRemoteFile(paths[0] ?? '')}
+                    />
+                  ) : supportsPathHandleTransfer ? (
+                    <label class="remote-desktop-legacy-fetch">
+                      <span>{t('remote_desktop.fetch_path')}</span>
+                      <input
+                        value={legacyFetchPath}
+                        onInput={(event) => setLegacyFetchPath((event.currentTarget as HTMLInputElement).value)}
+                        placeholder={t('remote_desktop.fetch_path')}
+                        aria-label={t('remote_desktop.fetch_path')}
+                        autoComplete="off"
+                        spellcheck={false}
+                      />
+                      <small>{t('remote_desktop.file_destination_upgrade_hint')}</small>
+                    </label>
+                  ) : (
+                    <div class="remote-desktop-file-empty is-compatibility">
+                      <strong>{t('remote_desktop.file_destination_upgrade_hint')}</strong>
+                    </div>
+                  )}
                 </div>
               </section>
             </div>

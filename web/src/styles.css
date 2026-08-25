@@ -10326,6 +10326,48 @@ button.quick-agent-delegation-preset.active {
   background: rgb(3 15 25 / 42%);
 }
 
+.remote-desktop-legacy-fetch {
+  height: 100%;
+  min-height: 260px;
+  padding: 20px;
+  display: grid;
+  align-content: center;
+  gap: 9px;
+  color: #a7cede;
+  background: rgb(3 15 25 / 42%);
+  font-size: 11px;
+}
+
+.remote-desktop-legacy-fetch input {
+  width: 100%;
+  min-width: 0;
+  min-height: 38px;
+  padding: 8px 10px;
+  color: #eaf9ff;
+  background: #05131f;
+  border: 1px solid #2b5872;
+  border-radius: 8px;
+  font: inherit;
+}
+
+.remote-desktop-legacy-fetch input:focus {
+  border-color: #67d8ff;
+  box-shadow: 0 0 0 2px rgb(99 216 255 / 15%);
+  outline: none;
+}
+
+.remote-desktop-legacy-fetch small {
+  color: #7699ac;
+  line-height: 1.45;
+}
+
+.remote-desktop-file-empty.is-compatibility {
+  margin: 5px;
+  padding: 18px;
+  color: #89aabd !important;
+  text-align: center;
+}
+
 .remote-desktop-remote-browser .fb-nav-stack {
   border-top: 0;
 }

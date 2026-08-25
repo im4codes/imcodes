@@ -3,6 +3,7 @@ import {
   DIRECT_CONNECTIVITY_ROUTE,
   DIRECT_FILE_TRANSFER_DATA_MSG,
   DIRECT_FILE_TRANSFER_DIRECTION,
+  DIRECT_FILE_TRANSFER_DIRECTORY_UPLOAD_CAPABILITY,
   DIRECT_FILE_TRANSFER_FAILURE_DISPOSITION,
   DIRECT_FILE_TRANSFER_ERROR,
   DIRECT_FILE_TRANSFER_HEALTH_CHANNEL_PREFIX,
@@ -199,6 +200,7 @@ type DirectUploadAttempt = {
   file: File;
   operationId: string;
   sessionName?: string;
+  destinationDirectory?: string;
   onProgress?: (pct: number) => void;
   onConnected?: () => void;
   signal?: AbortSignal;
@@ -254,6 +256,14 @@ function supportsUpload(ws: WsClient): boolean {
   return supportsCapabilities(ws, [
     DIRECT_FILE_TRANSFER_LEASE_CAPABILITY,
     DIRECT_FILE_TRANSFER_UPLOAD_RECOVERY_CAPABILITY,
+  ]);
+}
+
+function supportsDirectoryUpload(ws: WsClient): boolean {
+  return supportsCapabilities(ws, [
+    DIRECT_FILE_TRANSFER_LEASE_CAPABILITY,
+    DIRECT_FILE_TRANSFER_UPLOAD_RECOVERY_CAPABILITY,
+    DIRECT_FILE_TRANSFER_DIRECTORY_UPLOAD_CAPABILITY,
   ]);
 }
 
@@ -990,6 +1000,7 @@ function makeOperationInit(lease: Lease, active: ActiveAttempt, op: DirectAttemp
       filename: op.file.name || 'file',
       ...(op.file.type ? { mime: op.file.type } : {}),
       ...(op.sessionName ? { sessionName: op.sessionName } : {}),
+      ...(op.destinationDirectory ? { destinationDirectory: op.destinationDirectory } : {}),
       size: op.file.size,
     };
   }
@@ -1532,12 +1543,13 @@ export async function uploadFileDirect(
   signal?: AbortSignal,
   sessionName?: string,
   serverId?: string,
+  destinationDirectory?: string,
 ): Promise<{ ok: true; attachment: AttachmentRefResponse }> {
   if (!serverId || !supportsUpload(ws)) throw directError(DIRECT_FILE_TRANSFER_ERROR.CAPABILITY_UNAVAILABLE, false);
   const { lease, release } = acquireLease(ws, serverId);
   try {
     const result = await retryDirect<OperationSuccess>(lease, () => ({
-      kind: 'upload', file, operationId: clientUploadId, sessionName, onProgress, onConnected, signal,
+      kind: 'upload', file, operationId: clientUploadId, sessionName, destinationDirectory, onProgress, onConnected, signal,
     }), signal);
     if (result.kind !== 'upload') throw directError(DIRECT_FILE_TRANSFER_ERROR.INTERNAL_ERROR, false);
     recordDirectFileTransferMetric(DIRECT_FILE_TRANSFER_CLIENT_METRIC.DIRECT_SUCCESS, {
@@ -1561,7 +1573,8 @@ export async function uploadFileWithDirectFallback(options: {
   destinationDirectory?: string;
 }): Promise<{ ok: boolean; attachment: AttachmentRefResponse }> {
   const clientUploadId = crypto.randomUUID();
-  if (options.ws && supportsUpload(options.ws) && !options.destinationDirectory) {
+  if (options.ws && supportsUpload(options.ws)
+    && (!options.destinationDirectory || supportsDirectoryUpload(options.ws))) {
     options.onMode?.(FILE_UPLOAD_TRANSPORT_MODE.CONNECTING);
     const directAbort = new AbortController();
     let directConnectTimedOut = false;
@@ -1588,6 +1601,7 @@ export async function uploadFileWithDirectFallback(options: {
         directAbort.signal,
         options.sessionName,
         options.serverId,
+        options.destinationDirectory,
       );
       return direct;
     } catch (error) {

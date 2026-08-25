@@ -451,7 +451,24 @@ export async function finalizeDirectUploadedFile(params: {
   mime?: string;
   resolved: string;
   size: number;
+  destinationDirectory?: string;
 }): Promise<AttachmentRef> {
+  if (params.destinationDirectory) {
+    const destination = await commitUploadedFileToDirectory(
+      params.resolved,
+      params.destinationDirectory,
+      params.originalName,
+    );
+    const destinationStat = await lstat(destination);
+    return createProjectFileHandleFromValidatedPath(
+      toValidatedRealPath(await fsRealpath(destination)),
+      params.originalName,
+      params.mime,
+      destinationStat.size,
+      { device: destinationStat.dev, inode: destinationStat.ino },
+      params.clientUploadId,
+    );
+  }
   const now = Date.now();
   await writeFile(`${params.resolved}.meta.json`, JSON.stringify({
     originalName: params.originalName,

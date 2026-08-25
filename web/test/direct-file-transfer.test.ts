@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   DIRECT_FILE_TRANSFER_DATA_MSG,
   DIRECT_FILE_TRANSFER_DIRECTION,
+  DIRECT_FILE_TRANSFER_DIRECTORY_UPLOAD_CAPABILITY,
   DIRECT_FILE_TRANSFER_ERROR,
   DIRECT_FILE_TRANSFER_ERROR_SCOPE,
   DIRECT_FILE_TRANSFER_LEASE_CAPABILITY,
@@ -384,6 +385,7 @@ const directCapabilities = [
   DIRECT_FILE_TRANSFER_LEASE_CAPABILITY,
   DIRECT_FILE_TRANSFER_UPLOAD_RECOVERY_CAPABILITY,
   DIRECT_FILE_TRANSFER_PREVIEW_DOWNLOAD_CAPABILITY,
+  DIRECT_FILE_TRANSFER_DIRECTORY_UPLOAD_CAPABILITY,
 ];
 
 function createUploadFile(name: string, content: string): File {
@@ -447,6 +449,52 @@ describe('direct file transfer v2 browser broker', () => {
 
     expect(sent).toHaveLength(0);
     expect(apiMocks.uploadFile).toHaveBeenCalledTimes(1);
+  });
+
+  it('sends a selected destination directory over direct transport only when the daemon advertises it', async () => {
+    const { uploadFileWithDirectFallback } = await import('../src/direct-file-transfer.js');
+    const { ws, sent } = createWs(directCapabilities);
+
+    await uploadFileWithDirectFallback({
+      ws,
+      serverId: 'server-1',
+      file: createUploadFile('report.txt', 'direct-directory'),
+      destinationDirectory: 'C:\\Users\\admin\\Desktop',
+    });
+
+    expect(sent).toContainEqual(expect.objectContaining({
+      type: DIRECT_FILE_TRANSFER_MSG.OPERATION_INIT,
+      direction: DIRECT_FILE_TRANSFER_DIRECTION.UPLOAD,
+      destinationDirectory: 'C:\\Users\\admin\\Desktop',
+    }));
+    expect(apiMocks.uploadFile).not.toHaveBeenCalled();
+  });
+
+  it('keeps selected-directory upload on HTTP for a rolling daemon without the optional direct capability', async () => {
+    const { uploadFileWithDirectFallback } = await import('../src/direct-file-transfer.js');
+    const legacyCapabilities = directCapabilities.filter(
+      (capability) => capability !== DIRECT_FILE_TRANSFER_DIRECTORY_UPLOAD_CAPABILITY,
+    );
+    const { ws, sent } = createWs(legacyCapabilities);
+    const file = createUploadFile('report.txt', 'relay-directory');
+
+    await uploadFileWithDirectFallback({
+      ws,
+      serverId: 'server-1',
+      file,
+      destinationDirectory: 'C:\\Users\\admin\\Desktop',
+    });
+
+    expect(sent).toHaveLength(0);
+    expect(apiMocks.uploadFile).toHaveBeenCalledWith(
+      'server-1',
+      file,
+      undefined,
+      expect.any(String),
+      undefined,
+      undefined,
+      'C:\\Users\\admin\\Desktop',
+    );
   });
 
   it('forces one HTTP fallback when direct upload has not connected within 20 seconds', async () => {

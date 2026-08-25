@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   DIRECT_FILE_TRANSFER_DATA_MSG,
   DIRECT_FILE_TRANSFER_DIRECTION,
+  DIRECT_FILE_TRANSFER_DIRECTORY_UPLOAD_CAPABILITY,
   DIRECT_FILE_TRANSFER_ERROR,
   DIRECT_FILE_TRANSFER_ERROR_SCOPE,
   DIRECT_FILE_TRANSFER_FAILURE_DISPOSITION,
@@ -75,6 +76,7 @@ describe('direct file transfer v2 shared protocol', () => {
     expect(DIRECT_FILE_TRANSFER_LEASE_CAPABILITY).toBe('file.transfer.direct.lease.v2');
     expect(DIRECT_FILE_TRANSFER_UPLOAD_RECOVERY_CAPABILITY).toBe('file.transfer.direct.upload_recovery.v2');
     expect(DIRECT_FILE_TRANSFER_PREVIEW_DOWNLOAD_CAPABILITY).toBe('file.transfer.direct.preview_download.v2');
+    expect(DIRECT_FILE_TRANSFER_DIRECTORY_UPLOAD_CAPABILITY).toBe('file.transfer.direct.directory_upload.v1');
     expect(DIRECT_FILE_TRANSFER_LIMITS.MAX_ATTEMPTS).toBe(3);
     expect(DIRECT_FILE_TRANSFER_LIMITS.RETRY_BACKOFF_MS).toEqual([250, 1_000]);
     expect(DIRECT_FILE_TRANSFER_LIMITS.LEASE_IDLE_TTL_MS).toBe(5 * 60 * 1_000);
@@ -135,6 +137,14 @@ describe('direct file transfer v2 shared protocol', () => {
 
   it('separates upload metadata from handle-only download authorization', () => {
     expect(validateDirectFileTransferBrowserMessage(uploadInit())).toMatchObject({ ok: true });
+    expect(validateDirectFileTransferBrowserMessage({
+      ...uploadInit(),
+      destinationDirectory: 'C:\\Users\\admin\\Desktop',
+    })).toMatchObject({ ok: true });
+    expect(validateDirectFileTransferBrowserMessage({
+      ...uploadInit(),
+      destinationDirectory: `C:\\${'x'.repeat(5_000)}`,
+    })).toMatchObject({ ok: false });
     expect(validateDirectFileTransferBrowserMessage(downloadInit())).toMatchObject({ ok: true });
 
     for (const forbidden of [

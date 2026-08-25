@@ -171,6 +171,7 @@ function operationDescriptor(init: DirectFileTransferOperationInit): string {
       size: init.size,
       mime: init.mime,
       sha256: init.sha256,
+      destinationDirectory: init.destinationDirectory,
     });
   }
   return JSON.stringify({

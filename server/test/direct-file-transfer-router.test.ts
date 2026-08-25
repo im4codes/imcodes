@@ -247,7 +247,9 @@ describe('DirectFileTransferRouter v2', () => {
   it('maps a stable upload operation to a fresh exact authority without carrying bytes', () => {
     const f = fixture();
     const lease = readyLease(f);
-    f.router.handleBrowser(f.browserA, 'user-a', uploadInit(lease));
+    f.router.handleBrowser(f.browserA, 'user-a', uploadInit(lease, {
+      destinationDirectory: 'C:\\Users\\admin\\Desktop',
+    }));
     const prepare = f.daemonMessages.at(-1)!;
     const authorized = f.messages(f.browserA).at(-1)!;
     expect(prepare).toMatchObject({
@@ -255,8 +257,13 @@ describe('DirectFileTransferRouter v2', () => {
       direction: DIRECT_FILE_TRANSFER_DIRECTION.UPLOAD,
       operationId: OPERATION_ID,
       clientUploadId: OPERATION_ID,
+      destinationDirectory: 'C:\\Users\\admin\\Desktop',
     });
-    expect(authorized).toMatchObject({ type: DIRECT_FILE_TRANSFER_MSG.AUTHORIZED, authority: expect.any(String) });
+    expect(authorized).toMatchObject({
+      type: DIRECT_FILE_TRANSFER_MSG.AUTHORIZED,
+      authority: expect.any(String),
+      destinationDirectory: 'C:\\Users\\admin\\Desktop',
+    });
     for (const frame of [prepare, authorized]) {
       expect(frame).not.toHaveProperty('chunk');
       expect(frame).not.toHaveProperty('content');

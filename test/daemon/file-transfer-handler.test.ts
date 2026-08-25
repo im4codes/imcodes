@@ -478,6 +478,38 @@ describe('file-transfer local handle hardening', () => {
     await expect(stat(path.join(destinationDirectory, 'report.txt'))).resolves.toMatchObject({ size: 5 });
   });
 
+  it('commits a direct upload into the same validated destination seam', async () => {
+    const destinationDirectory = path.join(rootDir, 'direct-destination');
+    const stagedPath = path.join(rootDir, 'direct-upload.part');
+    await mkdir(destinationDirectory, { recursive: true });
+    await writeFile(stagedPath, 'hello');
+    const transfer = await loadFileTransferHandler(fakeHome);
+
+    const attachment = await transfer.finalizeDirectUploadedFile({
+      clientUploadId: 'client-direct-directory',
+      filename: 'direct-staged.txt',
+      originalName: 'report.txt',
+      mime: 'text/plain',
+      resolved: stagedPath,
+      size: 5,
+      destinationDirectory,
+    });
+
+    const destination = path.join(destinationDirectory, 'report.txt');
+    await expect(stat(destination)).resolves.toMatchObject({ size: 5 });
+    await expect(stat(stagedPath)).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(attachment).toMatchObject({
+      source: 'local',
+      daemonPath: await realpath(destination),
+      originalName: 'report.txt',
+      size: 5,
+    });
+    expect(transfer.lookupAttachmentByClientUploadId('client-direct-directory')).toMatchObject({
+      id: attachment.id,
+      daemonPath: await realpath(destination),
+    });
+  });
+
   it('deletes a completed upload and its metadata while refusing local project handles', async () => {
     const transfer = await loadFileTransferHandler(fakeHome);
     const uploaded = createServerLinkMock();

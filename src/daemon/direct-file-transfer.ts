@@ -344,7 +344,16 @@ async function closeTransferResources(transfer: ActiveDirectTransfer, removePart
   transfer.uploadFileHandle = null;
   transfer.downloadFileHandle = null;
   try { transfer.channel?.close(); } catch { /* already closed */ }
-  if (removePart && transfer.partPath) await unlink(transfer.partPath).catch(() => {});
+  if (removePart) {
+    if (transfer.partPath) await unlink(transfer.partPath).catch(() => {});
+    // After the atomic staging rename, directory validation/commit can still
+    // fail (missing directory, symlink, existing target). Do not strand the
+    // promoted upload or metadata when that attempt terminalizes as failed.
+    if (transfer.finalPath && transfer.finalPath !== transfer.partPath) {
+      await unlink(transfer.finalPath).catch(() => {});
+      await unlink(`${transfer.finalPath}.meta.json`).catch(() => {});
+    }
+  }
   activeAttempts.delete(transfer.authority.attemptId);
   transfer.lease.activeAttempts.delete(transfer.authority.attemptId);
   if (transfer.uploadClaim) releaseClientUploadClaim(transfer.authority.operationId, transfer.uploadClaim);
@@ -604,6 +613,7 @@ async function finishUpload(transfer: ActiveDirectTransfer, totalBytes: number, 
     mime: authority.mime,
     resolved: transfer.finalPath,
     size: transfer.received,
+    ...(authority.destinationDirectory ? { destinationDirectory: authority.destinationDirectory } : {}),
   });
   transfer.settled = true;
   directFileMetric('direct_success', {

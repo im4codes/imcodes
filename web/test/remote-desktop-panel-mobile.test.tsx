@@ -8,6 +8,10 @@ import {
   REMOTE_DESKTOP_STATE,
   REMOTE_DESKTOP_TERMINAL_REASON,
 } from '@shared/remote-desktop.js';
+import {
+  FILE_TRANSFER_DIRECTORY_CAPABILITY,
+  FILE_TRANSFER_PATH_HANDLE_CAPABILITY,
+} from '@shared/transport/file-transfer.js';
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({ t: (key: string) => key }),
@@ -28,9 +32,12 @@ const text = vi.fn(() => true);
 const requestRemoteClipboard = vi.fn(async () => 'selected remotely');
 const selectDisplay = vi.fn(() => true);
 const stop = vi.fn();
-const { uploadFileWithDirectFallback } = vi.hoisted(() => ({
+const directTransferMocks = vi.hoisted(() => ({
   uploadFileWithDirectFallback: vi.fn(),
+  downloadPreviewWithDirectFallback: vi.fn(),
+  selectPreviewDownloadDestination: vi.fn().mockResolvedValue(null),
 }));
+const { uploadFileWithDirectFallback } = directTransferMocks;
 const fileApiMocks = vi.hoisted(() => ({
   downloadAttachment: vi.fn(),
   createMachineFileHandle: vi.fn(),
@@ -104,21 +111,42 @@ vi.mock('../src/api.js', () => ({
   downloadAttachment: fileApiMocks.downloadAttachment,
 }));
 
-vi.mock('../src/direct-file-transfer.js', () => ({
-  // Keep this mock aligned with the panel's presentation-state import. The
-  // production helper owns these strings; the test only substitutes transport
-  // execution, not the panel's transfer-row state machine.
-  FILE_UPLOAD_TRANSPORT_MODE: {
-    CONNECTING: 'connecting',
-    DIRECT: 'direct',
-    FALLING_BACK: 'falling_back',
-    RELAY: 'relay',
-  },
-  uploadFileWithDirectFallback,
-  isFileUploadCanceled: (error: unknown) => (
-    typeof error === 'object' && error !== null && 'name' in error && error.name === 'AbortError'
-  ),
-}));
+vi.mock('../src/direct-file-transfer.js', () => {
+  const DIRECT_FILE_TRANSFER_ERROR = { CANCELED: 'canceled' } as const;
+  class DirectFileTransferFailure extends Error {
+    constructor(readonly code: string, readonly retryable = true, message = code) {
+      super(message);
+      this.name = 'DirectFileTransferFailure';
+    }
+  }
+  return {
+    // Keep this mock aligned with the panel's presentation-state import. The
+    // production helper owns these strings; the test only substitutes transport
+    // execution, not the panel's transfer-row state machine.
+    FILE_UPLOAD_TRANSPORT_MODE: {
+      CONNECTING: 'connecting',
+      DIRECT: 'direct',
+      FALLING_BACK: 'falling_back',
+      RELAY: 'relay',
+    },
+    FILE_DOWNLOAD_TRANSPORT_MODE: {
+      CONNECTING: 'connecting',
+      DIRECT: 'direct',
+      FALLING_BACK: 'falling_back',
+      HTTP: 'http',
+      BROWSER: 'browser',
+    },
+    DIRECT_FILE_TRANSFER_ERROR,
+    DirectFileTransferFailure,
+    uploadFileWithDirectFallback: directTransferMocks.uploadFileWithDirectFallback,
+    downloadPreviewWithDirectFallback: directTransferMocks.downloadPreviewWithDirectFallback,
+    selectPreviewDownloadDestination: directTransferMocks.selectPreviewDownloadDestination,
+    isFileUploadCanceled: (error: unknown) => (
+      (error instanceof DirectFileTransferFailure && error.code === DIRECT_FILE_TRANSFER_ERROR.CANCELED)
+      || (typeof error === 'object' && error !== null && 'name' in error && error.name === 'AbortError')
+    ),
+  };
+});
 
 vi.mock('../src/api/machines.js', () => ({
   createMachineFileHandle: fileApiMocks.createMachineFileHandle,
@@ -154,10 +182,16 @@ vi.mock('../src/components/FileBrowser.js', () => ({
 
 import { RemoteDesktopPanel } from '../src/components/RemoteDesktopPanel.js';
 import { RemoteDesktopConnectionManager } from '../src/remote-desktop-connection-manager.js';
+import {
+  DIRECT_FILE_TRANSFER_ERROR,
+  DirectFileTransferFailure,
+} from '../src/direct-file-transfer.js';
 
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
+  directTransferMocks.selectPreviewDownloadDestination.mockReset().mockResolvedValue(null);
+  directTransferMocks.downloadPreviewWithDirectFallback.mockReset();
   vi.useRealTimers();
   clientHooks.length = 0;
   clientStarts.length = 0;
@@ -579,7 +613,11 @@ describe('RemoteDesktopPanel mobile gestures', () => {
   it('uses the embedded remote file selection for an explicit fetch action', async () => {
     fileApiMocks.createMachineFileHandle.mockResolvedValue({ id: 'handle-1' });
     fileApiMocks.downloadAttachment.mockResolvedValue(undefined);
-    const { getByRole } = await renderPanel();
+    const { getByRole } = await renderPanel(undefined, [
+      REMOTE_DESKTOP_CAPABILITY,
+      FILE_TRANSFER_PATH_HANDLE_CAPABILITY,
+      FILE_TRANSFER_DIRECTORY_CAPABILITY,
+    ]);
     act(() => { (getByRole('button', { name: 'remote_desktop.files' }) as HTMLButtonElement).click(); });
     act(() => { (getByRole('button', { name: 'select-remote-file' }) as HTMLButtonElement).click(); });
     act(() => { (getByRole('button', { name: 'remote_desktop.fetch_to_local' }) as HTMLButtonElement).click(); });
@@ -591,6 +629,121 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     expect(fileApiMocks.downloadAttachment).toHaveBeenCalledWith(
       'server-1',
       'handle-1',
+      undefined,
+      expect.any(AbortSignal),
+    );
+  });
+
+  it('routes a panel fetch through the direct-first download helper before browser fallback', async () => {
+    fileApiMocks.createMachineFileHandle.mockResolvedValue({ id: 'direct-handle-1' });
+    directTransferMocks.selectPreviewDownloadDestination.mockResolvedValue({
+      handle: { createWritable: vi.fn() },
+    });
+    directTransferMocks.downloadPreviewWithDirectFallback.mockImplementation(async (options: {
+      onMode?(mode: string): void;
+      onProgress?(progress: { loadedBytes: number; totalBytes: number | null }): void;
+    }) => {
+      options.onMode?.('direct');
+      options.onProgress?.({ loadedBytes: 4, totalBytes: 8 });
+    });
+    const ws = { targetsServer: vi.fn(() => true) };
+    const { container, getByRole } = await renderPanel(ws, [
+      REMOTE_DESKTOP_CAPABILITY,
+      FILE_TRANSFER_PATH_HANDLE_CAPABILITY,
+      FILE_TRANSFER_DIRECTORY_CAPABILITY,
+    ]);
+    act(() => { (getByRole('button', { name: 'remote_desktop.files' }) as HTMLButtonElement).click(); });
+    act(() => { (getByRole('button', { name: 'select-remote-file' }) as HTMLButtonElement).click(); });
+    act(() => { (getByRole('button', { name: 'remote_desktop.fetch_to_local' }) as HTMLButtonElement).click(); });
+
+    await vi.waitFor(() => expect(directTransferMocks.downloadPreviewWithDirectFallback).toHaveBeenCalledWith(
+      expect.objectContaining({
+        ws,
+        serverId: 'server-1',
+        previewHandle: 'direct-handle-1',
+        suggestedName: 'report.txt',
+        signal: expect.any(AbortSignal),
+      }),
+    ));
+    expect(directTransferMocks.selectPreviewDownloadDestination).toHaveBeenCalledWith('report.txt');
+    expect(directTransferMocks.selectPreviewDownloadDestination.mock.invocationCallOrder[0]).toBeLessThan(
+      fileApiMocks.createMachineFileHandle.mock.invocationCallOrder[0]!,
+    );
+    expect(container.textContent).toContain('upload.transport.direct');
+    expect(fileApiMocks.downloadAttachment).not.toHaveBeenCalled();
+  });
+
+  it('classifies a canceled direct fetch as canceled instead of failed', async () => {
+    fileApiMocks.createMachineFileHandle.mockResolvedValue({ id: 'cancel-handle-1' });
+    directTransferMocks.selectPreviewDownloadDestination.mockResolvedValue({
+      handle: { createWritable: vi.fn() },
+    });
+    directTransferMocks.downloadPreviewWithDirectFallback.mockImplementation(async (options: {
+      signal: AbortSignal;
+    }) => await new Promise((_resolve, reject) => {
+      options.signal.addEventListener('abort', () => {
+        reject(new DirectFileTransferFailure(DIRECT_FILE_TRANSFER_ERROR.CANCELED, false));
+      }, { once: true });
+    }));
+    const ws = { targetsServer: vi.fn(() => true) };
+    const { container, getByRole } = await renderPanel(ws, [
+      REMOTE_DESKTOP_CAPABILITY,
+      FILE_TRANSFER_PATH_HANDLE_CAPABILITY,
+      FILE_TRANSFER_DIRECTORY_CAPABILITY,
+    ]);
+    act(() => { (getByRole('button', { name: 'remote_desktop.files' }) as HTMLButtonElement).click(); });
+    act(() => { (getByRole('button', { name: 'select-remote-file' }) as HTMLButtonElement).click(); });
+    act(() => { (getByRole('button', { name: 'remote_desktop.fetch_to_local' }) as HTMLButtonElement).click(); });
+
+    await vi.waitFor(() => expect(directTransferMocks.downloadPreviewWithDirectFallback).toHaveBeenCalled());
+    act(() => { (getByRole('button', { name: 'remote_desktop.cancel_transfer' }) as HTMLButtonElement).click(); });
+
+    await vi.waitFor(() => expect(container.textContent).toContain('remote_desktop.transfer_status_canceled'));
+    expect(container.textContent).not.toContain('remote_desktop.file_transfer_failed');
+  });
+
+  it('does not enable fetch from directory metadata without path-handle authority', async () => {
+    const { getByRole } = await renderPanel(undefined, [
+      REMOTE_DESKTOP_CAPABILITY,
+      FILE_TRANSFER_DIRECTORY_CAPABILITY,
+    ]);
+    act(() => { (getByRole('button', { name: 'remote_desktop.files' }) as HTMLButtonElement).click(); });
+    act(() => { (getByRole('button', { name: 'select-remote-file' }) as HTMLButtonElement).click(); });
+
+    const fetch = getByRole('button', { name: 'remote_desktop.fetch_to_local' }) as HTMLButtonElement;
+    expect(fetch.disabled).toBe(true);
+    act(() => fetch.click());
+    expect(fileApiMocks.createMachineFileHandle).not.toHaveBeenCalled();
+  });
+
+  it('keeps exact-path fetch available for path-handle nodes without directory browsing', async () => {
+    fileApiMocks.createMachineFileHandle.mockResolvedValue({ id: 'legacy-handle-1' });
+    fileApiMocks.downloadAttachment.mockResolvedValue(undefined);
+    const { container, getByRole } = await renderPanel(undefined, [
+      REMOTE_DESKTOP_CAPABILITY,
+      FILE_TRANSFER_PATH_HANDLE_CAPABILITY,
+    ]);
+    act(() => { (getByRole('button', { name: 'remote_desktop.files' }) as HTMLButtonElement).click(); });
+
+    expect(container.querySelector('[data-testid="remote-file-browser"]')).toBeNull();
+    const fetch = getByRole('button', { name: 'remote_desktop.fetch_to_local' }) as HTMLButtonElement;
+    expect(fetch.disabled).toBe(true);
+    const exactPath = getByRole('textbox', { name: 'remote_desktop.fetch_path' }) as HTMLInputElement;
+    act(() => {
+      exactPath.value = 'C:\\Users\\admin\\Desktop\\legacy-report.txt';
+      exactPath.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+    expect(fetch.disabled).toBe(false);
+    act(() => fetch.click());
+
+    await vi.waitFor(() => expect(fileApiMocks.createMachineFileHandle).toHaveBeenCalledWith(
+      'server-1',
+      'C:\\Users\\admin\\Desktop\\legacy-report.txt',
+      expect.any(AbortSignal),
+    ));
+    expect(fileApiMocks.downloadAttachment).toHaveBeenCalledWith(
+      'server-1',
+      'legacy-handle-1',
       undefined,
       expect.any(AbortSignal),
     );

@@ -35,6 +35,7 @@ import {
   FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY,
 } from '../../shared/transport/file-transfer.js';
 import {
+  DIRECT_FILE_TRANSFER_DIRECTORY_UPLOAD_CAPABILITY,
   DIRECT_FILE_TRANSFER_REQUIRED_CAPABILITIES,
   type DirectConnectivityRuntimeStatus,
 } from '../../shared/direct-file-transfer.js';
@@ -232,7 +233,7 @@ const DAEMON_STATIC_CAPABILITIES = [
 
 export function directFileTransferDaemonCapabilities(available: boolean): readonly string[] {
   return available
-    ? [...DIRECT_FILE_TRANSFER_REQUIRED_CAPABILITIES]
+    ? [...DIRECT_FILE_TRANSFER_REQUIRED_CAPABILITIES, DIRECT_FILE_TRANSFER_DIRECTORY_UPLOAD_CAPABILITY]
     : [];
 }
 

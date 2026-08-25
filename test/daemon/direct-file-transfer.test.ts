@@ -280,9 +280,9 @@ describe('daemon direct file transfer v2 lease broker', () => {
     await direct.shutdownDirectFileTransfers();
   });
 
-  it('commits an upload once on a ready lease and exposes it through exact status recovery', async () => {
+  it('commits a selected-directory upload once and exposes it through exact status recovery', async () => {
     const { direct, sent, sender } = await readyLease();
-    const authority = uploadPrepare();
+    const authority = uploadPrepare({ destinationDirectory: 'C:\\Users\\admin\\Desktop' });
     await direct.handleDirectFileTransferCommand(authority, sender);
     const channel = new FakeDataChannel(authority.channelLabel as string);
     FakePeerConnection.latest!.emitDataChannel(channel);
@@ -299,6 +299,9 @@ describe('daemon direct file transfer v2 lease broker', () => {
       ...binding(), totalBytes: 5,
     }));
     await vi.waitFor(() => expect(finalizeDirectUploadedFile).toHaveBeenCalledTimes(1));
+    expect(finalizeDirectUploadedFile).toHaveBeenCalledWith(expect.objectContaining({
+      destinationDirectory: 'C:\\Users\\admin\\Desktop',
+    }));
     await expect(readFile(storedPath, 'utf8')).resolves.toBe('hello');
     expect(directLogger.info).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -323,6 +326,37 @@ describe('daemon direct file transfer v2 lease broker', () => {
       ...binding(),
     }, sender);
     expect(sent).toContainEqual(expect.objectContaining({ type: DIRECT_FILE_TRANSFER_MSG.STATUS, state: DIRECT_FILE_TRANSFER_OPERATION_STATE.COMMITTED }));
+    await direct.shutdownDirectFileTransfers();
+  });
+
+  it('removes promoted staging when selected-directory commit fails', async () => {
+    const { direct, sent, sender } = await readyLease();
+    finalizeDirectUploadedFile.mockRejectedValueOnce(new Error('destination_exists'));
+    const authority = uploadPrepare({ destinationDirectory: 'C:\\Users\\admin\\Desktop' });
+    await direct.handleDirectFileTransferCommand(authority, sender);
+    const channel = new FakeDataChannel(authority.channelLabel as string);
+    FakePeerConnection.latest!.emitDataChannel(channel);
+    channel.emit(JSON.stringify({
+      type: DIRECT_FILE_TRANSFER_DATA_MSG.START,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      ...binding(),
+      authority: authority.authority,
+    }));
+    await vi.waitFor(() => expect(channel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED)));
+    channel.emit(Buffer.from('hello'));
+    channel.emit(JSON.stringify({
+      type: DIRECT_FILE_TRANSFER_DATA_MSG.FINISH,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      ...binding(),
+      totalBytes: 5,
+    }));
+
+    await vi.waitFor(() => expect(sent).toContainEqual(expect.objectContaining({
+      type: DIRECT_FILE_TRANSFER_MSG.TERMINAL,
+      state: DIRECT_FILE_TRANSFER_TERMINAL_STATE.FAILED,
+      error: DIRECT_FILE_TRANSFER_ERROR.WRITE_FAILED,
+    })));
+    await expect(readFile(storedPath)).rejects.toMatchObject({ code: 'ENOENT' });
     await direct.shutdownDirectFileTransfers();
   });
 

@@ -1,5 +1,5 @@
 import type { AttachmentRef } from './transport/file-transfer.js';
-import { validateAttachmentRef } from './transport/file-transfer.js';
+import { FILE_TRANSFER_PATH_MAX_BYTES, validateAttachmentRef } from './transport/file-transfer.js';
 
 /**
  * Full daemons auto-upgrade, so this is a clean v2 protocol.  Do not add v1
@@ -13,6 +13,8 @@ export const DIRECT_FILE_TRANSFER_RESUME_TICKET_TYPE = 'direct_file.v2.resume_ti
 export const DIRECT_FILE_TRANSFER_LEASE_CAPABILITY = 'file.transfer.direct.lease.v2' as const;
 export const DIRECT_FILE_TRANSFER_UPLOAD_RECOVERY_CAPABILITY = 'file.transfer.direct.upload_recovery.v2' as const;
 export const DIRECT_FILE_TRANSFER_PREVIEW_DOWNLOAD_CAPABILITY = 'file.transfer.direct.preview_download.v2' as const;
+/** Optional rolling capability for direct uploads committed into a selected controlled-node directory. */
+export const DIRECT_FILE_TRANSFER_DIRECTORY_UPLOAD_CAPABILITY = 'file.transfer.direct.directory_upload.v1' as const;
 export const DIRECT_FILE_TRANSFER_HEALTH_CHANNEL_PREFIX = 'imcodes-health-' as const;
 
 export const DIRECT_FILE_TRANSFER_REQUIRED_CAPABILITIES = [
@@ -21,7 +23,8 @@ export const DIRECT_FILE_TRANSFER_REQUIRED_CAPABILITIES = [
   DIRECT_FILE_TRANSFER_PREVIEW_DOWNLOAD_CAPABILITY,
 ] as const;
 
-export type DirectFileTransferCapability = typeof DIRECT_FILE_TRANSFER_REQUIRED_CAPABILITIES[number];
+export type DirectFileTransferCapability = typeof DIRECT_FILE_TRANSFER_REQUIRED_CAPABILITIES[number]
+  | typeof DIRECT_FILE_TRANSFER_DIRECTORY_UPLOAD_CAPABILITY;
 
 export const DIRECT_FILE_TRANSFER_DIRECTION = {
   UPLOAD: 'upload',
@@ -434,6 +437,7 @@ export interface DirectFileTransferUploadInit extends DirectFileTransferOperatio
   size: number;
   mime?: string;
   sha256?: string;
+  destinationDirectory?: string;
 }
 
 export interface DirectFileTransferDownloadInit extends DirectFileTransferOperationInitBase {
@@ -872,7 +876,7 @@ function isResumeTicket(value: unknown): value is string {
 function isUploadInit(value: Record<string, unknown>, type: string): boolean {
   return hasExactKeys(value,
     ['type', 'protocolVersion', 'serverId', 'browserTabId', 'leaseId', 'leaseGeneration', 'daemonGeneration', 'requestId', 'attemptId', 'attempt', 'direction', 'operationId', 'clientUploadId', 'filename', 'size'],
-    ['sessionName', 'mime', 'sha256'],
+    ['sessionName', 'mime', 'sha256', 'destinationDirectory'],
   )
     && value.type === type
     && value.protocolVersion === DIRECT_FILE_TRANSFER_PROTOCOL_VERSION
@@ -884,7 +888,9 @@ function isUploadInit(value: Record<string, unknown>, type: string): boolean {
     && isDirectFileTransferSize(value.size)
     && (value.sessionName === undefined || isBoundedString(value.sessionName, DIRECT_FILE_TRANSFER_LIMITS.SESSION_NAME_BYTES))
     && (value.mime === undefined || isBoundedString(value.mime, DIRECT_FILE_TRANSFER_LIMITS.MIME_BYTES))
-    && (value.sha256 === undefined || (typeof value.sha256 === 'string' && SHA256_RE.test(value.sha256)));
+    && (value.sha256 === undefined || (typeof value.sha256 === 'string' && SHA256_RE.test(value.sha256)))
+    && (value.destinationDirectory === undefined
+      || isBoundedString(value.destinationDirectory, FILE_TRANSFER_PATH_MAX_BYTES));
 }
 
 function isDownloadInit(value: Record<string, unknown>, type: string): boolean {
@@ -910,7 +916,7 @@ function authorityKeysFor(value: Record<string, unknown>, type: string): boolean
   const common = ['type', 'protocolVersion', 'serverId', 'browserTabId', 'leaseId', 'leaseGeneration', 'daemonGeneration', 'requestId', 'attemptId', 'attempt', 'direction', 'operationId', 'authority', 'authorityExpiresAt', 'channelLabel', 'iceServers'];
   if (value.direction === DIRECT_FILE_TRANSFER_DIRECTION.UPLOAD) {
     const { authority: _authority, authorityExpiresAt: _authorityExpiresAt, channelLabel: _channelLabel, iceServers: _iceServers, ...operation } = value;
-    return hasExactKeys(value, [...common, 'clientUploadId', 'filename', 'size'], ['sessionName', 'mime', 'sha256'])
+    return hasExactKeys(value, [...common, 'clientUploadId', 'filename', 'size'], ['sessionName', 'mime', 'sha256', 'destinationDirectory'])
       && isUploadInit(operation, type);
   }
   if (value.direction === DIRECT_FILE_TRANSFER_DIRECTION.DOWNLOAD) {
