@@ -18,6 +18,60 @@ function decodedScript(capture: string[]): string {
   return Buffer.from(capture[encodedIndex]!, 'base64').toString('utf16le');
 }
 
+/** execFile stub that fails the way PowerShell actually fails. */
+function failingRunner(stderr: string, extra: Record<string, unknown> = {}): typeof execFile {
+  return vi.fn((
+    _file: string,
+    _args: readonly string[],
+    _options: unknown,
+    callback: (error: Error | null, stdout: string, stderrOut: string) => void,
+  ) => {
+    callback(Object.assign(new Error('Command failed'), extra), '', stderr);
+    return {} as never;
+  }) as unknown as typeof execFile;
+}
+
+describe('Windows release publisher trust failure reporting', () => {
+  it('carries the script\'s own reason instead of a bare boolean', async () => {
+    // Each of these is a distinct throw in the trust script. Collapsing them
+    // into one message is what left a real failed install undiagnosable.
+    const reasons = [
+      'release signer certificate is missing',
+      'release signer does not match the compiled trust anchor',
+      'release signer is not valid for code signing',
+      'release publisher trust installation did not validate the executable',
+      'trusted release signer changed during installation',
+    ];
+    for (const reason of reasons) {
+      const outcome = await installWindowsReleasePublisherTrust(
+        'C:\\Users\\test\\Downloads\\imcodes-node.exe',
+        'a'.repeat(64),
+        failingRunner(`${reason}\r\nAt line:22 char:35\r\n+     throw 'x'\r\n+     ~~~~~~~~~`),
+      );
+      expect(outcome).toEqual({ ok: false, detail: reason });
+    }
+  });
+
+  it('strips PowerShell position noise and the script-name prefix', async () => {
+    const outcome = await installWindowsReleasePublisherTrust(
+      'C:\\Users\\test\\Downloads\\imcodes-node.exe',
+      'a'.repeat(64),
+      failingRunner('C:\\Windows\\Temp\\t.ps1 : Access is denied.\r\nAt line:1 char:1\r\n+ ~~~~\r\n    + CategoryInfo : SecurityError'),
+    );
+    expect(outcome).toEqual({ ok: false, detail: 'Access is denied.' });
+  });
+
+  it('names a timeout as a timeout rather than an empty reason', async () => {
+    const outcome = await installWindowsReleasePublisherTrust(
+      'C:\\Users\\test\\Downloads\\imcodes-node.exe',
+      'a'.repeat(64),
+      failingRunner('', { killed: true }),
+    );
+    expect(outcome.ok).toBe(false);
+    expect(outcome.detail).toMatch(/did not finish within \d+s/);
+  });
+});
+
 describe('Windows release artifact trust', () => {
   it('verifies every launch against a valid chain and the exact raw-DER signer hash', async () => {
     const calls: string[] = [];
@@ -44,7 +98,7 @@ describe('Windows release artifact trust', () => {
       'C:\\Users\\test\\Downloads\\imcodes-node.exe',
       signer,
       successfulRunner(calls),
-    )).resolves.toBe(true);
+    )).resolves.toEqual({ ok: true, detail: '' });
     const script = decodedScript(calls);
     expect(script).toContain("$codeSigningOid = '1.3.6.1.5.5.7.3.3'");
     expect(script).toContain("Cert:\\LocalMachine\\TrustedPeople");
@@ -71,7 +125,8 @@ describe('Windows release artifact trust', () => {
 
   it('fails closed without a compiled-style signer anchor', async () => {
     const run = vi.fn();
-    await expect(installWindowsReleasePublisherTrust('C:\\x.exe', '', run as never)).resolves.toBe(false);
+    await expect(installWindowsReleasePublisherTrust('C:\\x.exe', '', run as never))
+      .resolves.toEqual({ ok: false, detail: 'no compiled release trust anchor' });
     await expect(verifyWindowsAuthenticodeSigners(['C:\\x.exe'], 'bad', run as never)).resolves.toBe(false);
     expect(run).not.toHaveBeenCalled();
   });

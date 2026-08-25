@@ -128,8 +128,15 @@ export function defaultBootstrapDeps(now: number): ControlledNodeBootstrapDeps {
     assertElevated: assertProcessElevated,
     ensureReleasePublisherTrust: async (executablePath) => {
       if (process.platform !== 'win32' || !/^[a-f0-9]{64}$/.test(WINDOWS_COMPILED_RELEASE_SIGNER_SHA256)) return;
-      if (!await installWindowsReleasePublisherTrust(executablePath)) {
-        throw new Error('Windows release publisher trust installation failed');
+      // Carry PowerShell's own reason. The script distinguishes six causes —
+      // wrong signer, missing Code Signing EKU, store import refused, and so on
+      // — and collapsing them into one sentence leaves the operator, and
+      // whoever they forward it to, with nothing to act on.
+      const trust = await installWindowsReleasePublisherTrust(executablePath);
+      if (!trust.ok) {
+        throw new Error(
+          `Windows release publisher trust installation failed${trust.detail ? `: ${trust.detail}` : ''}`,
+        );
       }
     },
     prepareCredentialDir: () => prepareCredentialDir(credentialPath),

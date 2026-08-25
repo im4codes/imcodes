@@ -27,6 +27,7 @@ export const INSTALL_FAILURE_CAUSE = {
   ENROLLMENT_REJECTED: 'enrollment_rejected',
   SERVER_UNREACHABLE: 'server_unreachable',
   JOURNAL_RECOVERY: 'journal_recovery',
+  PUBLISHER_TRUST: 'publisher_trust',
   UNKNOWN: 'unknown',
 } as const;
 
@@ -100,6 +101,7 @@ export function classifyInstallFailure(error: unknown): InstallFailureCause {
   if (message.includes('manual recovery required') || message.includes('journal is corrupt')) {
     return INSTALL_FAILURE_CAUSE.JOURNAL_RECOVERY;
   }
+  if (message.includes('publisher trust')) return INSTALL_FAILURE_CAUSE.PUBLISHER_TRUST;
   return INSTALL_FAILURE_CAUSE.UNKNOWN;
 }
 
@@ -131,6 +133,14 @@ function hintFor(cause: InstallFailureCause, platform: NodeJS.Platform, zh: bool
     return zh
       ? '无法连接到 IM.codes 服务器。请检查这台机器的网络、代理和防火墙设置。'
       : 'Could not reach the IM.codes server. Check this machine\'s network, proxy and firewall settings.';
+  }
+  if (cause === INSTALL_FAILURE_CAUSE.PUBLISHER_TRUST) {
+    // The reason above is PowerShell's, and it is the actionable part. This
+    // only says where to look, because the causes range from a group policy
+    // that locks the certificate stores to antivirus blocking PowerShell.
+    return zh
+      ? '这台机器拒绝安装 IM.codes 的发布者证书。常见原因是组策略锁定了证书存储、杀毒软件拦截了 PowerShell，或这份安装包不是官方签名版本。请把上面这行「原因」连同这台机器的杀毒/组策略情况发给管理员。'
+      : 'This machine refused to install the IM.codes publisher certificate. Common causes are group policy locking the certificate stores, antivirus blocking PowerShell, or an installer that is not an officially signed release. Send the Reason line above, plus this machine\'s antivirus/group-policy situation, to your administrator.';
   }
   if (cause === INSTALL_FAILURE_CAUSE.JOURNAL_RECOVERY) {
     return zh
