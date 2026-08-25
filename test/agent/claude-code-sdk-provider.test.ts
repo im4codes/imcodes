@@ -98,7 +98,7 @@ vi.mock('../../src/util/logger.js', () => ({
   default: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
 }));
 
-import { ClaudeCodeSdkProvider } from '../../src/agent/providers/claude-code-sdk.js';
+import { ClaudeCodeSdkProvider, isClaudeAuthFailureMessage } from '../../src/agent/providers/claude-code-sdk.js';
 import { PROVIDER_ACTIVE_TURN_DELIVERY_KINDS } from '../../src/agent/transport-provider.js';
 import type { AgentMessage, ToolCallEvent } from '../../shared/agent-message.js';
 import type { ProviderContextPayload } from '../../shared/context-types.js';
@@ -1069,6 +1069,41 @@ describe('ClaudeCodeSdkProvider', () => {
     expect(sdkMock.runs.slice(1).every((run) => run.options.resume === 'session-connection-retry')).toBe(true);
     expect(completed).toEqual(['Recovered answer']);
     expect(errors).toEqual([]);
+  });
+
+  it('does not append recovery guidance to prose that merely mentions a 401', () => {
+    // Every string here came from, or models, a real successful answer. Telling
+    // the user their session is broken because their reply contained the digits
+    // 401 is worse than saying nothing: it sends them to /logout for no reason.
+    const innocuous = [
+      '平均每 G 毛利 401.61 元/G/月（12.96 元/G/天）',
+      'Total: $401.00',
+      'See server/src/routes/enroll.ts:401 for the guard.',
+      'The endpoint returns 401 when the bearer token is missing.',
+      'Detector matches the `[API Error: 401 Invalid API Key]` shape exactly.',
+      'Service listens on port 4011 and answered in 4010ms.',
+      'HEAD is now at 401abc9.',
+      'All 402 tests passed.',
+    ];
+    for (const text of innocuous) {
+      expect({ text, isAuthFailure: isClaudeAuthFailureMessage(text) })
+        .toEqual({ text, isAuthFailure: false });
+    }
+  });
+
+  it('still recognizes a real auth failure, including inside a joined SDK error list', () => {
+    const genuine = [
+      'Failed to authenticate. API Error: 401 Invalid authentication credentials',
+      'API Error: 401 Unauthorized',
+      'Invalid authentication credentials',
+      // SDK errors arrive joined with '; ', so the notice is not always first.
+      'stream closed; Failed to authenticate. API Error: 401 Invalid authentication credentials',
+      'first line\nAPI Error: 401 Unauthorized',
+    ];
+    for (const text of genuine) {
+      expect({ text, isAuthFailure: isClaudeAuthFailureMessage(text) })
+        .toEqual({ text, isAuthFailure: true });
+    }
   });
 
   it('tells users to logout, fully exit, and login again after a 401', async () => {

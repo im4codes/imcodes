@@ -371,9 +371,33 @@ function normalizeStatusName(status: string | undefined): string {
   return (status ?? '').replace(/[_\s-]+/g, '').toLowerCase();
 }
 
+/**
+ * A genuine Claude auth-failure notice, as opposed to prose that mentions one.
+ *
+ * Anchored to a message or segment boundary on purpose. The previous predicate
+ * made the `api error:` prefix optional, so it reduced to "a bare 401 anywhere
+ * in the text" — and it is applied to assistant prose, not only to transport
+ * errors. Any answer that merely contained the digits matched: a currency
+ * amount (`401.61 元/G/月`), a source line (`enroll.ts:401`), an explanation of
+ * what HTTP 401 means, or a truthful quotation of an error while discussing
+ * this very detector. Each of those got "run /logout and restart" appended to a
+ * correct answer, which is worse than saying nothing: it tells the user their
+ * session is broken when it is not.
+ *
+ * A real notice occupies a whole message or a whole `; `-joined SDK error
+ * segment. Prose embeds the phrase mid-sentence, and that is the distinction
+ * this matches on.
+ */
+const CLAUDE_AUTH_FAILURE_SEGMENT =
+  /(?:^|[\n;]\s*)(?:failed to authenticate\b|invalid authentication credentials\b|api error:\s*401\b)/i;
+
+export function isClaudeAuthFailureMessage(message: string): boolean {
+  return CLAUDE_AUTH_FAILURE_SEGMENT.test(message.trim());
+}
+
 function appendClaudeAuthRecoveryGuidance(message: string): string {
   if (isClaudeCredentialRefresh403(message)) return message;
-  if (!/failed to authenticate|invalid authentication credentials|(?:api error:\s*)?401\b/i.test(message)) return message;
+  if (!isClaudeAuthFailureMessage(message)) return message;
   return appendClaudeAuthRecoveryGuidanceUnconditionally(message);
 }
 
