@@ -104,7 +104,12 @@ import {
   ControlledNodesPanel,
 } from '../src/components/ControlledNodesPanel.js';
 
+/** Set by the clipboard-denied test; `vi.unstubAllGlobals` does not cover
+ *  properties defined directly on `document`. */
+let restoreExecCommand: (() => void) | null = null;
+
 afterEach(() => {
+  restoreExecCommand?.();
   cleanup();
   vi.clearAllMocks();
   vi.unstubAllGlobals();
@@ -378,7 +383,21 @@ describe('ControlledNodesPanel (12.3)', () => {
     // clipboard and no way to tell what went wrong.
     const writeText = vi.fn(async () => { throw new Error('denied'); });
     vi.stubGlobal('navigator', { ...globalThis.navigator, clipboard: { writeText } });
-    vi.spyOn(document, 'execCommand').mockReturnValue(false);
+    // Define rather than spy. `document.execCommand` is not implemented by
+    // jsdom; it exists only when a setup file polyfills it, and the CI unit
+    // project loads a different setup than the workspace project does. Spying
+    // therefore throws "execCommand does not exist" in exactly one of the two
+    // runners. Defining it makes the fallback deterministically fail here no
+    // matter which setup is loaded, which is the behaviour under test.
+    const previousExecCommand = Object.getOwnPropertyDescriptor(document, 'execCommand');
+    Object.defineProperty(document, 'execCommand', {
+      configurable: true, writable: true, value: vi.fn(() => false),
+    });
+    restoreExecCommand = () => {
+      if (previousExecCommand) Object.defineProperty(document, 'execCommand', previousExecCommand);
+      else delete (document as { execCommand?: unknown }).execCommand;
+      restoreExecCommand = null;
+    };
 
     const { container } = render(<ControlledNodesPanel />);
     const btn = await waitFor(() => {
