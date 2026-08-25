@@ -1267,7 +1267,7 @@ describe('App shell', () => {
       fireEvent.click(screen.getByText('remote-desktop-wall-close'));
       await waitFor(() => expect(layout().classList.contains('layout-mobile-remote-surface-active')).toBe(false));
 
-      const css = readFileSync('web/src/styles.css', 'utf8');
+      const css = readFileSync(process.cwd().split(/[\\/]/).pop() === 'web' ? 'src/styles.css' : 'web/src/styles.css', 'utf8');
       expect(css).toMatch(/\.layout-mobile\.layout-mobile-remote-surface-active\s*>\s*\.main\s*{[^}]*display:\s*none/s);
     } finally {
       Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });

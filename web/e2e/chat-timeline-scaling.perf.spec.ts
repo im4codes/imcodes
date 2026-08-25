@@ -1,5 +1,10 @@
 import { expect, test, type Page } from '@playwright/test';
 
+// Keep the perf samples isolated. Running the two long-session probes in
+// parallel on a shared CI runner makes the 8,000-row sample measure worker
+// contention instead of renderer growth, which turns the flatness guard flaky.
+test.describe.configure({ mode: 'serial' });
+
 /**
  * Does the chat get slower as the conversation gets longer?
  *
