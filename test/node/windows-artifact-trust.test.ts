@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { execFile } from 'node:child_process';
 import {
+  decodePowerShellClixml,
   installWindowsReleasePublisherTrust,
   verifyWindowsAuthenticodeSigners,
 } from '../../src/node/windows-artifact-trust.js';
@@ -50,6 +51,40 @@ describe('Windows release publisher trust failure reporting', () => {
       );
       expect(outcome).toEqual({ ok: false, detail: reason });
     }
+  });
+
+  it('unwraps the CLIXML envelope PowerShell emits when stderr is redirected', async () => {
+    // Captured verbatim from Windows 10 19045. stderr is always redirected here
+    // because the caller captures it, so powershell.exe serializes error records
+    // instead of writing text — and reading the first line of that stream gave a
+    // real operator the literal string "#< CLIXML" as their failure reason.
+    // Note the position header is localized; an English-only filter would keep it.
+    const realClixml = '#< CLIXML\r\n'
+      + '<Objs Version="1.1.0.1" xmlns="http://schemas.microsoft.com/powershell/2004/04">'
+      + '<S S="Error">release signer does not match the compiled trust anchor_x000D__x000A_</S>'
+      + '<S S="Error">所在位置 行:1 字符: 1_x000D__x000A_</S>'
+      + "<S S=\"Error\">+ throw 'release signer does not match the compiled trust anchor'_x000D__x000A_</S>"
+      + '<S S="Error">+ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~_x000D__x000A_</S>'
+      + '<S S="Error">    + CategoryInfo          : OperationStopped: (release signer ...ed trust anchor:String) [], RuntimeException_x000D__x000A_</S>'
+      + '<S S="Error">    + FullyQualifiedErrorId : release signer does not match the compiled trust anchor_x000D__x000A_</S>'
+      + '<S S="Error"> _x000D__x000A_</S></Objs>';
+
+    const outcome = await installWindowsReleasePublisherTrust(
+      'C:\\Users\\test\\Downloads\\imcodes-node.exe',
+      'a'.repeat(64),
+      failingRunner(realClixml),
+    );
+    expect(outcome).toEqual({
+      ok: false,
+      detail: 'release signer does not match the compiled trust anchor',
+    });
+  });
+
+  it('decodes escapes and entities without double-decoding an ampersand', () => {
+    expect(decodePowerShellClixml('plain text, not CLIXML')).toBe('plain text, not CLIXML');
+    const encoded = '#< CLIXML\r\n<Objs><S S="Error">a &amp;lt; b_x000D__x000A_</S></Objs>';
+    // `&amp;lt;` is a literal "&lt;", not an encoded "<".
+    expect(decodePowerShellClixml(encoded)).toBe('a &lt; b\r\n');
   });
 
   it('strips PowerShell position noise and the script-name prefix', async () => {
