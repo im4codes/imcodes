@@ -1851,6 +1851,14 @@ export async function createControlledNodeRemoteInstallLink(
   return mintControlledNodeRemoteInstallLink(selection, hostServerId);
 }
 
+export async function createControlledNodeInstallCommand(
+  selection: import('./api/machines.js').ControlledNodeArtifactSelection,
+  hostServerId?: string,
+): Promise<{ command: string; expiresAt: number; ticketId: string }> {
+  const { mintControlledNodeInstallCommand } = await import('./api/machines.js');
+  return mintControlledNodeInstallCommand(selection, hostServerId);
+}
+
 export async function previewAttachment(serverId: string, attachmentId: string, sessionName?: string): Promise<void> {
   const res = await rawFetch(withSessionName(`/api/server/${encodeURIComponent(serverId)}/uploads/${encodeURIComponent(attachmentId)}/download`, sessionName));
   if (!res.ok) {

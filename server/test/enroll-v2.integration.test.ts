@@ -39,8 +39,11 @@ import {
   CONTROLLED_NODE_ARTIFACT_COMPRESSION_ENCODING,
   CONTROLLED_NODE_ARTIFACT_HEADERS,
   CONTROLLED_NODE_TICKET_DELIVERY,
+  CONTROLLED_NODE_TICKET_MAX_CONSUMES,
   CONTROLLED_NODE_TICKET_TTL_MS,
+  isControlledNodeInstallCode,
 } from '../../shared/controlled-node-artifacts.js';
+import { controlledNodeInstallCommandRoutes } from '../src/routes/controlled-node-install.js';
 import {
   REMOTE_DESKTOP_LEGACY_UPGRADE_PROTOCOL_VERSION,
   REMOTE_DESKTOP_WORKER_FILENAME,
@@ -293,6 +296,98 @@ describe('POST /api/enroll/v2/ticket (artifact manifest → enrollments_v2 row)'
       [body.ticketId],
     );
     expect(Number(row?.ticket_expires_at) - Number(row?.created_at)).toBe(expected);
+  });
+
+  /**
+   * The pasted one-liner, end to end.
+   *
+   * The pieces are covered separately elsewhere; what is only provable here is
+   * that they compose: minting must actually persist a code, `/i/:code` must
+   * find that row and render a script naming it, and the code must then work as
+   * a download credential against the real artifact. A direct row INSERT would
+   * skip the mint wiring entirely, which is where a silent break would live.
+   */
+  it('mints an install command whose code fetches a script and then downloads the artifact', async () => {
+    const app = buildApp();
+    // The short path is mounted at the root in production, not under /api/enroll.
+    app.route('/i', controlledNodeInstallCommandRoutes);
+    const userId = `u_${hex(4)}`;
+    await createUser(db, userId);
+    const o = await owner(userId);
+
+    const minted = await app.request('/api/enroll/v2/ticket', {
+      method: 'POST',
+      headers: ticketHeaders(userId, o),
+      body: JSON.stringify({
+        version: 2, os: 'linux', arch: 'x64',
+        delivery: CONTROLLED_NODE_TICKET_DELIVERY.INSTALL_COMMAND,
+      }),
+    });
+    expect(minted.status).toBe(200);
+    const body = await minted.json() as {
+      ticketId: string; delivery: string; maxConsumes: number;
+      installCode?: string; installCommand?: string;
+    };
+
+    expect(body.delivery).toBe(CONTROLLED_NODE_TICKET_DELIVERY.INSTALL_COMMAND);
+    expect(isControlledNodeInstallCode(body.installCode)).toBe(true);
+    // A fleet-sized budget, not the three attempts a single enrolment gets.
+    expect(body.maxConsumes).toBe(
+      CONTROLLED_NODE_TICKET_MAX_CONSUMES[CONTROLLED_NODE_TICKET_DELIVERY.INSTALL_COMMAND],
+    );
+    const row = await db.queryOne<{ max_consumes: number; install_code_hash: string | null }>(
+      'SELECT max_consumes, install_code_hash FROM controlled_node_enrollments_v2 WHERE id = $1',
+      [body.ticketId],
+    );
+    // Persisted as a hash; the plaintext code exists only in the response.
+    expect(row?.install_code_hash).toBe(sha256(body.installCode!));
+    expect(Number(row?.max_consumes)).toBe(
+      CONTROLLED_NODE_TICKET_MAX_CONSUMES[CONTROLLED_NODE_TICKET_DELIVERY.INSTALL_COMMAND],
+    );
+
+    // The command is the literal line the operator pastes.
+    expect(body.installCommand).toContain(`/i/${body.installCode}`);
+    expect(body.installCommand).toMatch(/^curl -fsSL /);
+    expect(body.installCommand).toContain('sudo sh');
+    // The minted command is what the operator pastes into a root shell. A test
+    // that only required `^curl -fsSL ` codified the unpinned form and would
+    // have accepted a transport that follows a cross-scheme redirect.
+    //
+    // The pin must match the origin's own scheme; this harness mints against
+    // http://localhost, so asserting a literal `=https` would only prove the
+    // test knew the harness, not that the command is pinned at all.
+    const mintedScheme = body.installCommand!.includes('https://') ? 'https' : 'http';
+    expect(body.installCommand).toContain(`--proto '=${mintedScheme}'`);
+    expect(body.installCommand).toContain(`--proto-redir '=${mintedScheme}'`);
+
+    // 1. The pasted command fetches its script.
+    const script = await app.request(`/i/${body.installCode}`);
+    expect(script.status).toBe(200);
+    const scriptBody = await script.text();
+    expect(scriptBody).toContain(body.installCode!);
+    expect(scriptBody).toContain("imcodes_expect_os='linux'");
+    // Rendering must not spend a download slot, or probing would exhaust it.
+    const afterRender = await db.queryOne<{ consumed_count: number }>(
+      'SELECT consumed_count FROM controlled_node_enrollments_v2 WHERE id = $1', [body.ticketId],
+    );
+    expect(Number(afterRender?.consumed_count)).toBe(0);
+
+    // 2. That same code is what the script posts to download the binary.
+    const download = await app.request('/api/enroll/v2/download', {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ ticket: body.installCode! }).toString(),
+    });
+    expect(download.status).toBe(200);
+    const bytes = Buffer.from(await download.arrayBuffer());
+    // A real personalized artifact, carrying the enrolment trailer.
+    expect(bytes.length).toBeGreaterThan(FAKE_BINARY.length);
+    expect(decodeEnrollmentTrailer(bytes)).not.toBeNull();
+
+    const afterDownload = await db.queryOne<{ consumed_count: number }>(
+      'SELECT consumed_count FROM controlled_node_enrollments_v2 WHERE id = $1', [body.ticketId],
+    );
+    expect(Number(afterDownload?.consumed_count)).toBe(1);
   });
 
   it('keeps the default and every unknown delivery on the short browser window', async () => {
@@ -1714,6 +1809,56 @@ describe('GET /api/enroll/v2/availability + retention', () => {
 // ─────────────────────────── GET /v2/node-artifact ───────────────────────────
 
 describe('GET /api/enroll/v2/node-artifact (controlled-node self-upgrade)', () => {
+  /**
+   * A revoked credential must be indistinguishable from an unknown one.
+   *
+   * This route authenticates independently of the central daemon-token
+   * resolver, because it is one of the two HTTP calls a controlled node
+   * legitimately makes (`src/node/self-upgrade.ts`). It used to answer a
+   * revoked credential with 403 `revoked`, which confirmed to whoever held it
+   * that the credential had once been real, and contradicted the policy the
+   * central resolver enforces everywhere else.
+   */
+  it('answers a revoked credential exactly as it answers an unknown one', async () => {
+    const app = buildApp();
+    await writeFile(join(exeDir, 'imcodes-node-linux'), FAKE_BINARY);
+    await writeManifest('imcodes-node-linux', 'linux', 'x64', FAKE_BINARY);
+    const userId = `u_${hex(4)}`;
+    await createUser(db, userId);
+
+    const token = hex(16);
+    const serverId = hex(8);
+    await db.execute(
+      `INSERT INTO servers (id, user_id, name, token_hash, status, created_at, node_role, exec_enabled, os, arch)
+       VALUES ($1, $2, 'controlled-linux', $3, 'online', $4, $5, TRUE, 'linux', 'x64')`,
+      [serverId, userId, sha256(token), Date.now(), NODE_ROLE.CONTROLLED],
+    );
+    const path = `/api/enroll/v2/node-artifact?serverId=${serverId}&os=linux&arch=x64`;
+    const headers = { authorization: `Bearer ${token}`, 'X-Server-Id': serverId };
+
+    // Live: the upgrade path a controlled node depends on must keep working.
+    // The body MUST be consumed. This route streams from an open FileHandle that
+    // production closes only at EOF, on error, or on cancel
+    // (`server/src/routes/enroll.ts` bare-stream close path). Asserting only the
+    // status leaves the descriptor pinned until GC finalizes it, which Node now
+    // raises as ERR_INVALID_STATE — an unhandled error that fails the run while
+    // every assertion still reports as passing.
+    const live = await app.request(path, { headers });
+    expect(live.status).toBe(200);
+    expect(Buffer.from(await live.arrayBuffer()).equals(FAKE_BINARY)).toBe(true);
+
+    await db.execute('UPDATE servers SET revoked_at = $1 WHERE id = $2', [Date.now(), serverId]);
+
+    const revoked = await app.request(path, { headers });
+    const unknown = await app.request(
+      `/api/enroll/v2/node-artifact?serverId=${hex(8)}&os=linux&arch=x64`,
+      { headers: { authorization: `Bearer ${hex(16)}`, 'X-Server-Id': hex(8) } },
+    );
+    expect(revoked.status).toBe(401);
+    expect(unknown.status).toBe(401);
+    expect(await revoked.text()).toBe(await unknown.text());
+  });
+
   it('gzip-encodes self-upgrade bytes on demand while retaining decoded size and digest metadata', async () => {
     const app = buildApp();
     await writeFile(join(exeDir, 'imcodes-node-linux'), COMPRESSIBLE_FAKE_BINARY);

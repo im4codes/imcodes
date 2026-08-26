@@ -3121,7 +3121,13 @@
     "copy_install_link_error": "インストールリンクを作成できませんでした。もう一度お試しください。",
     "copy_install_link_expires_at": "インストールリンクの有効期限は {{time}} まで",
     "download_action": "ダウンロード",
-    "copy_install_link_clipboard_error": "クリップボードに書き込めませんでした。リンクを手動でコピーするか、別のブラウザーでお試しください。"
+    "copy_install_link_clipboard_error": "クリップボードに書き込めませんでした。リンクを手動でコピーするか、別のブラウザーでお試しください。",
+    "copy_install_command": "インストールコマンドをコピー",
+    "copy_install_command_hint": "登録する端末のターミナルに貼り付けるだけの1行コマンドをコピーします。その端末にシェルはあるがブラウザが使いにくい場合に便利です。",
+    "copy_install_command_pending": "準備中…",
+    "copy_install_command_copied": "コマンドをコピーしました",
+    "copy_install_command_error": "インストールコマンドを作成できませんでした。もう一度お試しください。",
+    "copy_install_command_clipboard_error": "コマンドをコピーできませんでした。クリップボードの権限を確認してください。"
   },
   "peerAuditQuick": {
     "iconLabel": "ピア監査",

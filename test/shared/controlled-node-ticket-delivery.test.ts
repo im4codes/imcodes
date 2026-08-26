@@ -3,6 +3,7 @@ import {
   CONTROLLED_NODE_TICKET_DELIVERY,
   CONTROLLED_NODE_TICKET_DELIVERY_VALUES,
   CONTROLLED_NODE_TICKET_TTL_MS,
+  CONTROLLED_NODE_TICKET_MAX_CONSUMES,
   controlledNodeTicketTtlMs,
   isControlledNodeTicketDelivery,
 } from '../../shared/controlled-node-artifacts.js';
@@ -37,19 +38,25 @@ describe('controlled-node download ticket delivery', () => {
     }
   });
 
-  it('recognizes exactly the two delivery modes', () => {
+  it('recognizes exactly the declared delivery modes', () => {
     expect(isControlledNodeTicketDelivery('browser')).toBe(true);
     expect(isControlledNodeTicketDelivery('remote_link')).toBe(true);
+    expect(isControlledNodeTicketDelivery('install_command')).toBe(true);
     for (const bad of ['', 'BROWSER', 'remote-link', 'forever', null, undefined, 42, {}]) {
       expect(isControlledNodeTicketDelivery(bad)).toBe(false);
     }
-    expect([...CONTROLLED_NODE_TICKET_DELIVERY_VALUES].sort()).toEqual(['browser', 'remote_link']);
+    expect([...CONTROLLED_NODE_TICKET_DELIVERY_VALUES].sort())
+      .toEqual(['browser', 'install_command', 'remote_link']);
   });
 
-  it('has a TTL for every declared mode', () => {
+  it('has a TTL and a download budget for every declared mode', () => {
     for (const mode of CONTROLLED_NODE_TICKET_DELIVERY_VALUES) {
       expect(Number.isSafeInteger(CONTROLLED_NODE_TICKET_TTL_MS[mode])).toBe(true);
       expect(CONTROLLED_NODE_TICKET_TTL_MS[mode]).toBeGreaterThan(0);
+      // A mode without a budget would index the map with undefined and admit
+      // NaN comparisons into the consume check.
+      expect(Number.isSafeInteger(CONTROLLED_NODE_TICKET_MAX_CONSUMES[mode])).toBe(true);
+      expect(CONTROLLED_NODE_TICKET_MAX_CONSUMES[mode]).toBeGreaterThan(0);
     }
   });
 });

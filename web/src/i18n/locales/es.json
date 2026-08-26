@@ -3122,7 +3122,13 @@
     "copy_install_link_error": "No se pudo crear el enlace de instalación. Inténtalo de nuevo.",
     "copy_install_link_expires_at": "Enlace de instalación válido hasta las {{time}}",
     "download_action": "Descargar",
-    "copy_install_link_clipboard_error": "No se pudo escribir en el portapapeles. Copia el enlace manualmente o prueba con otro navegador."
+    "copy_install_link_clipboard_error": "No se pudo escribir en el portapapeles. Copia el enlace manualmente o prueba con otro navegador.",
+    "copy_install_command": "Copiar comando de instalación",
+    "copy_install_command_hint": "Copia un comando de una línea para pegarlo en una terminal de la máquina que vas a registrar. Útil cuando esa máquina tiene shell pero no un navegador a mano.",
+    "copy_install_command_pending": "Preparando…",
+    "copy_install_command_copied": "Comando copiado",
+    "copy_install_command_error": "No se pudo crear el comando de instalación. Inténtalo de nuevo.",
+    "copy_install_command_clipboard_error": "No se pudo copiar el comando. Revisa los permisos del portapapeles."
   },
   "peerAuditQuick": {
     "iconLabel": "Auditoría de pares",

@@ -23,6 +23,8 @@ import { githubAuthRoutes } from './routes/github-auth.js';
 import { adminRoutes } from './routes/admin.js';
 import { bindRoutes } from './routes/bind.js';
 import { enrollRoutes, runEnrollmentRetention } from './routes/enroll.js';
+import { controlledNodeInstallCommandRoutes } from './routes/controlled-node-install.js';
+import { CONTROLLED_NODE_INSTALL_COMMAND_PATH } from './services/controlled-node-install-command.js';
 import { machinesRoutes } from './routes/machines.js';
 import { machineExecRoutes } from './routes/machine-exec.js';
 import { machineComputerUseRoutes } from './routes/machine-computer-use.js';
@@ -224,6 +226,9 @@ export function buildApp(env: Env, options: BuildAppOptions = {}) {
   app.route('/api/auth/github', githubAuthRoutes);
   app.route('/api/bind', bindRoutes);
   app.route('/api/enroll', enrollRoutes);
+  // Top-level and deliberately short: this URL is typed by hand, read off a
+  // phone screen and dictated over the phone. It serves a script, never data.
+  app.route(CONTROLLED_NODE_INSTALL_COMMAND_PATH, controlledNodeInstallCommandRoutes);
   app.route('/api/machines', machinesRoutes);
   app.route('/api/machine/exec', machineExecRoutes);
   app.route('/api/machine/computer-use', machineComputerUseRoutes);

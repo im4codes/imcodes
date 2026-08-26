@@ -77,6 +77,15 @@ const createControlledNodeRemoteInstallLink = vi.fn(async () => ({
   expiresAt: Date.now() + 24 * 60 * 60 * 1000,
   ticketId: 'tid-remote-1',
 }));
+// Platform-faithful: these tests click the Windows row, so the fixture must be
+// the command the server actually mints for Windows. A curl fixture behind a
+// Windows click would assert clipboard behaviour against a string that platform
+// never produces.
+const createControlledNodeInstallCommand = vi.fn(async () => ({
+  command: 'irm -MaximumRedirection 0 https://im.example.test/i/0123456789AB | iex',
+  expiresAt: Date.now() + 10 * 365 * 24 * 60 * 60 * 1000,
+  ticketId: 'tid-cmd-1',
+}));
 const listSharesForTarget = vi.fn(async () => []);
 const createShare = vi.fn(async () => ({
   id: 'share-1', targetUserId: 'user-2', role: 'viewer' as const, status: 'active' as const,
@@ -87,6 +96,7 @@ vi.mock('../src/api.js', async (importOriginal) => {
     ...actual,
     downloadControlledNodeExecutable: (...a: unknown[]) => downloadControlledNodeExecutable(...a),
     createControlledNodeRemoteInstallLink: (...a: unknown[]) => createControlledNodeRemoteInstallLink(...a),
+    createControlledNodeInstallCommand: (...a: unknown[]) => createControlledNodeInstallCommand(...a),
     beginControlledNodeDesktopDownload: () => beginControlledNodeDesktopDownload(),
     listSharesForTarget: (...a: unknown[]) => listSharesForTarget(...a),
     createShare: (...a: unknown[]) => createShare(...a),
@@ -339,7 +349,7 @@ describe('ControlledNodesPanel (12.3)', () => {
     expect(beginControlledNodeDesktopDownload).not.toHaveBeenCalled();
   });
 
-  it('gives the two row actions a real side-by-side rule, not just a comment', () => {
+  it('gives the row actions a real side-by-side rule, not just a comment', () => {
     // jsdom does not compute layout, so this is a static contract check: the
     // container the component renders must actually have a multi-column rule,
     // and neither child may keep the full-width/push-to-bottom sizing that
@@ -356,8 +366,14 @@ describe('ControlledNodesPanel (12.3)', () => {
     const css = read('src/styles.css');
     expect(markup).toContain('class="controlled-nodes-download-actions"');
 
+    // A selector may be declared alone or grouped with a peer that shares its
+    // rules, so match either `sel {` or `sel,`. Matching only the first form
+    // would report a grouped-but-present selector as missing.
     const rule = (selector: string): string => {
-      const at = css.indexOf(`${selector} {`);
+      const at = [`${selector} {`, `${selector},`]
+        .map((needle) => css.indexOf(needle))
+        .filter((index) => index >= 0)
+        .sort((a, b) => a - b)[0] ?? -1;
       expect({ selector, defined: at >= 0 }).toEqual({ selector, defined: true });
       return css.slice(at, css.indexOf('}', at));
     };
@@ -368,13 +384,23 @@ describe('ControlledNodesPanel (12.3)', () => {
     // The container now owns bottom alignment for the pair.
     expect(container).toContain('margin-top: auto');
 
-    for (const selector of ['.controlled-nodes-download-btn', '.controlled-nodes-copy-link-btn']) {
+    for (const selector of [
+      '.controlled-nodes-download-btn',
+      '.controlled-nodes-copy-link-btn',
+      '.controlled-nodes-copy-command-btn',
+    ]) {
       const child = rule(selector);
       expect({ selector, fullWidth: /width:\s*100%/.test(child) })
         .toEqual({ selector, fullWidth: false });
       expect({ selector, pushesItself: /margin-top:\s*auto/.test(child) })
         .toEqual({ selector, pushesItself: false });
     }
+
+    // Download is the primary action and spans the row; the two copy actions
+    // share the row beneath it. Spanning is the container's job, so the button
+    // itself still must not carry its own full-width sizing (asserted above).
+    expect(css).toContain('.controlled-nodes-download-actions > .controlled-nodes-download-btn');
+    expect(markup).toContain('class="controlled-nodes-copy-command-btn"');
   });
 
   it('reports a denied clipboard instead of claiming the link was copied', async () => {
@@ -604,7 +630,7 @@ describe('ControlledNodesPanel (12.3)', () => {
     expect(container.textContent).toContain('controlled_nodes.exec_on');
   });
 
-  it('shows Remote Desktop only for an operable Windows Owner or Participant with the exact capability', async () => {
+  it('shows Remote Desktop only for an operable Owner or Participant with a resolvable profile', async () => {
     machines = [
       machine({ serverId: 'owner-ready', displayName: 'Owner Ready', os: 'win', accessRole: 'owner', execEnabled: true, capabilities: [REMOTE_DESKTOP_CAPABILITY] }),
       machine({ serverId: 'participant-ready', displayName: 'Participant Ready', os: 'win', accessRole: 'participant', execEnabled: true, capabilities: [REMOTE_DESKTOP_CAPABILITY] }),
@@ -618,9 +644,12 @@ describe('ControlledNodesPanel (12.3)', () => {
     await waitFor(() => expect(container.textContent).toContain('Owner Ready'));
 
     const buttons = container.querySelectorAll('.controlled-nodes-remote-desktop');
-    expect(buttons).toHaveLength(2);
+    // Descriptive OS metadata is not Web authority. Server independently
+    // rejects an enrolled OS/profile contradiction before signaling.
+    expect(buttons).toHaveLength(3);
     expect(buttons[0]?.closest('li')?.textContent).toContain('Owner Ready');
     expect(buttons[1]?.closest('li')?.textContent).toContain('Participant Ready');
+    expect(buttons[2]?.closest('li')?.textContent).toContain('Linux');
   });
 
   it('offers quick worker installation only for an online supported Owner node', async () => {
@@ -809,5 +838,89 @@ describe('ControlledNodesPanel (12.3)', () => {
     await waitFor(() => expect(container.textContent).toContain('controlled_nodes.refresh_error'));
     expect(container.textContent).not.toContain('controlled_nodes.error_generic');
     confirmSpy.mockRestore();
+  });
+});
+
+/**
+ * The copy-command button had only a static layout assertion, so nothing
+ * verified what actually reaches the clipboard. That matters more here than for
+ * an ordinary copy control: this string is pasted into a root shell, and an
+ * unpinned transport would follow an HTTPS→HTTP redirect into `sudo sh`.
+ */
+describe('ControlledNodesPanel — copy install command', () => {
+  it('copies the minted command verbatim, transport pin included', async () => {
+    const writeText = vi.fn(async () => {});
+    vi.stubGlobal('navigator', { ...globalThis.navigator, clipboard: { writeText } });
+    const { container } = render(<ControlledNodesPanel />);
+
+    const btn = await waitFor(() => {
+      const b = container.querySelector(
+        '.controlled-nodes-download-item.is-win .controlled-nodes-copy-command-btn',
+      );
+      if (!b) throw new Error('copy-command button not found');
+      return b;
+    });
+    fireEvent.click(btn);
+
+    await waitFor(() => expect(writeText).toHaveBeenCalled());
+    expect(createControlledNodeInstallCommand).toHaveBeenCalledWith({ os: 'win', arch: 'x64' });
+    const copied = String(writeText.mock.calls[0]?.[0] ?? '');
+    // Verbatim: the UI must not reformat, wrap or truncate a command that will
+    // be executed as root.
+    expect(copied).toBe((await createControlledNodeInstallCommand.mock.results[0]!.value).command);
+    // The redirect pin must survive the copy: this string is executed elevated.
+    expect(copied).toContain('-MaximumRedirection 0');
+    await waitFor(() =>
+      expect(btn.textContent).toContain('controlled_nodes.copy_install_command_copied'));
+  });
+
+  it('reports a denied clipboard instead of claiming the command was copied', async () => {
+    const writeText = vi.fn(async () => { throw new Error('denied'); });
+    vi.stubGlobal('navigator', { ...globalThis.navigator, clipboard: { writeText } });
+    const previousExecCommand = Object.getOwnPropertyDescriptor(document, 'execCommand');
+    Object.defineProperty(document, 'execCommand', {
+      configurable: true, writable: true, value: vi.fn(() => false),
+    });
+    try {
+      const { container } = render(<ControlledNodesPanel />);
+      const btn = await waitFor(() => {
+        const b = container.querySelector(
+          '.controlled-nodes-download-item.is-win .controlled-nodes-copy-command-btn',
+        );
+        if (!b) throw new Error('copy-command button not found');
+        return b;
+      });
+      fireEvent.click(btn);
+      await waitFor(() => {
+        const alert = container.querySelector('.controlled-nodes-error');
+        expect(alert?.textContent).toContain('controlled_nodes.copy_install_command_clipboard_error');
+      });
+      // No success flash for a copy that never reached the clipboard: the
+      // operator would otherwise walk to the target machine with nothing.
+      expect(btn.textContent).not.toContain('controlled_nodes.copy_install_command_copied');
+    } finally {
+      if (previousExecCommand) Object.defineProperty(document, 'execCommand', previousExecCommand);
+      else delete (document as { execCommand?: unknown }).execCommand;
+    }
+  });
+
+  it('surfaces a mint failure without pretending anything was copied', async () => {
+    createControlledNodeInstallCommand.mockRejectedValueOnce(new Error('boom'));
+    const writeText = vi.fn(async () => {});
+    vi.stubGlobal('navigator', { ...globalThis.navigator, clipboard: { writeText } });
+    const { container } = render(<ControlledNodesPanel />);
+    const btn = await waitFor(() => {
+      const b = container.querySelector(
+        '.controlled-nodes-download-item.is-win .controlled-nodes-copy-command-btn',
+      );
+      if (!b) throw new Error('copy-command button not found');
+      return b;
+    });
+    fireEvent.click(btn);
+    await waitFor(() => {
+      const alert = container.querySelector('.controlled-nodes-error');
+      expect(alert?.textContent).toContain('controlled_nodes.copy_install_command_error');
+    });
+    expect(writeText).not.toHaveBeenCalled();
   });
 });

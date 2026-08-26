@@ -1,4 +1,6 @@
 import { Hono, type Context } from 'hono';
+import { isAllowedServerUrl } from '../security/server-url.js';
+import { controlledNodeInstallCommand } from '../services/controlled-node-install-command.js';
 import { compress } from 'hono/compress';
 import { z } from 'zod';
 import { lstat, open, type FileHandle } from 'node:fs/promises';
@@ -26,6 +28,9 @@ import {
   CONTROLLED_NODE_TICKET_DELIVERY_VALUES,
   controlledNodeComputerUseHelperFilename,
   controlledNodeTicketTtlMs,
+  controlledNodeTicketMaxConsumes,
+  CONTROLLED_NODE_INSTALL_CODE_ALPHABET,
+  CONTROLLED_NODE_INSTALL_CODE_LENGTH,
   isControlledNodeArtifactArch,
   isControlledNodeArtifactCompatibleWithRuntime,
   isControlledNodeArch,
@@ -58,12 +63,34 @@ function resolveTicketEncryptionKey(c: { env: Env }): string {
 
 type EnrollRouter = Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>;
 
-// Ticket lifetime now depends on how the ticket reaches the target machine;
-// the table lives in shared/ so Web and Server cannot disagree about it.
-const TICKET_MAX_CONSUMES = 3;
+// Ticket lifetime and download budget now depend on how the ticket reaches the
+// target machine; both tables live in shared/ so Web and Server cannot disagree.
 const ATTEMPT_LEASE_MS = 30 * 1000;
 
-function resolveCanonicalServerUrl(c: { req: { url: string }; env: Env }): string | null {
+/**
+ * Generate an install code with rejection sampling.
+ *
+ * `byte % 32` would be uniform only because 256 divides evenly by 32; that is
+ * true today but silently stops being true if the alphabet is ever resized.
+ * Masking and rejecting keeps the distribution correct for any alphabet size.
+ */
+function randomInstallCode(): string {
+  const alphabet = CONTROLLED_NODE_INSTALL_CODE_ALPHABET;
+  const mask = (1 << Math.ceil(Math.log2(alphabet.length))) - 1;
+  let out = '';
+  while (out.length < CONTROLLED_NODE_INSTALL_CODE_LENGTH) {
+    for (const byte of randomBytes(32)) {
+      const index = byte & mask;
+      if (index < alphabet.length) {
+        out += alphabet[index];
+        if (out.length === CONTROLLED_NODE_INSTALL_CODE_LENGTH) break;
+      }
+    }
+  }
+  return out;
+}
+
+export function resolveCanonicalServerUrl(c: { req: { url: string }; env: Env }): string | null {
   const envName = c.env.NODE_ENV ?? 'development';
   const configured = c.env.SERVER_URL?.trim();
   if (envName === 'production' && !configured) return null;
@@ -87,11 +114,6 @@ function checkOrigin(c: { req: { url: string }; env: Env }): { ok: true } | { ok
     : { ok: false, reason: 'canonical_server_url_required' };
 }
 
-function isAllowedServerUrl(value: string): boolean {
-  if (/^https:\/\//.test(value)) return true;
-  if (/^http:\/\/(127\.0\.0\.1|localhost|\[::1\])(:\d+)?\/?$/.test(value)) return true;
-  return false;
-}
 
 // ── POST /api/enroll/v2/ticket ──────────────────────────────────────────────
 
@@ -188,6 +210,14 @@ enrollRoutes.post('/v2/ticket', requireAuth(), async (c) => {
   const codeHash = sha256Hex(enrollCode);
   const rawTicket = randomHex(32);
   const ticketHash = sha256Hex(rawTicket);
+  // The pasted install command carries a short code instead of the 64-hex
+  // ticket: a ticket cannot be read off a phone screen or dictated, which is
+  // how a remote install is usually handed over. It is a second lookup key onto
+  // this same row, so it inherits the lease, budget and audit path unchanged.
+  const installCode = delivery === CONTROLLED_NODE_TICKET_DELIVERY.INSTALL_COMMAND
+    ? randomInstallCode()
+    : null;
+  const installCodeHash = installCode ? sha256Hex(installCode) : null;
   const encryptionKey = resolveTicketEncryptionKey(c);
   const encryptedCode = encryptBotConfig(
     { enrollCode, codeHash, os, arch, serverUrl },
@@ -196,16 +226,18 @@ enrollRoutes.post('/v2/ticket', requireAuth(), async (c) => {
 
   const now = Date.now();
   const ticketExpiresAt = now + controlledNodeTicketTtlMs(delivery);
+  const maxConsumes = controlledNodeTicketMaxConsumes(delivery);
 
   const inserted = await (c.env.DB as Database).queryOne<{ id: string }>(
     `INSERT INTO controlled_node_enrollments_v2
        (ticket_hash, code_hash, owner_user_id, os, arch, artifact_sha256,
         encrypted_code, consumed_count, max_consumes, ticket_expires_at,
-        expires_at, reusable, created_at, host_server_id)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, 0, $8, $9, NULL, TRUE, $10, $11)
+        expires_at, reusable, created_at, host_server_id, install_code_hash)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, 0, $8, $9, NULL, TRUE, $10, $11, $12)
      RETURNING id`,
     [ticketHash, codeHash, userId, os, arch, v.descriptor.sha256,
-     encryptedCode, TICKET_MAX_CONSUMES, ticketExpiresAt, now, hostServerId ?? null],
+     encryptedCode, maxConsumes, ticketExpiresAt, now, hostServerId ?? null,
+     installCodeHash],
   );
   if (!inserted) {
     return c.json({ error: 'ticket_mint_failed' }, 500);
@@ -231,10 +263,16 @@ enrollRoutes.post('/v2/ticket', requireAuth(), async (c) => {
     filename: v.descriptor.filename,
     sizeBytes: v.descriptor.sizeBytes,
     sha256: v.descriptor.sha256,
-    maxConsumes: TICKET_MAX_CONSUMES,
+    maxConsumes,
     expiresAt: ticketExpiresAt,
     delivery,
     ownerUserId: userId,
+    ...(installCode
+      ? {
+        installCode,
+        installCommand: controlledNodeInstallCommand(serverUrl, installCode, os),
+      }
+      : {}),
   });
 });
 
@@ -300,9 +338,12 @@ async function reserveAttempt(
       id: string; owner_user_id: string; os: string; arch: string;
       artifact_sha256: string; encrypted_code: string;
     }>(
+      // Either credential resolves the same row: the download ticket, or the
+      // short install code from a pasted command. Both are sha256 of a
+      // high-entropy secret and each column is unique, so they cannot collide.
       `SELECT id, owner_user_id, os, arch, artifact_sha256, encrypted_code
          FROM controlled_node_enrollments_v2
-        WHERE ticket_hash = $1
+        WHERE (ticket_hash = $1 OR install_code_hash = $1)
           AND revoked_at IS NULL
           AND ticket_expires_at > $2
         FOR UPDATE`,
@@ -998,8 +1039,12 @@ enrollRoutes.get('/v2/node-artifact', async (c) => {
     'SELECT id, token_hash, node_role, revoked_at, os, arch FROM servers WHERE id = $1',
     [serverId],
   );
-  if (!server || server.token_hash !== tokenHash) return c.json({ error: 'unauthorized' }, 401);
-  if (server.revoked_at != null) return c.json({ error: 'revoked' }, 403);
+  // Unknown, wrong-token and revoked answer identically. A distinct `revoked`
+  // reply confirmed to whoever holds the credential that it was once real, and
+  // contradicted the policy the central daemon-token resolver enforces.
+  if (!server || server.token_hash !== tokenHash || server.revoked_at != null) {
+    return c.json({ error: 'unauthorized' }, 401);
+  }
   // A normal (FULL) daemon may fetch the remote-desktop bundle, and the runtime
   // executable that carries its elevated helper.
   //

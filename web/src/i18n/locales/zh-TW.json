@@ -3122,7 +3122,13 @@
     "copy_install_link_error": "無法產生安裝連結，請重試。",
     "copy_install_link_expires_at": "安裝連結有效期至 {{time}}",
     "download_action": "下載",
-    "copy_install_link_clipboard_error": "無法寫入剪貼簿。請手動複製連結，或換一個瀏覽器重試。"
+    "copy_install_link_clipboard_error": "無法寫入剪貼簿。請手動複製連結，或換一個瀏覽器重試。",
+    "copy_install_command": "複製安裝命令",
+    "copy_install_command_hint": "複製一條命令,貼到目標機器的終端機即可安裝。適合那台機器有終端機但不方便開瀏覽器的情況。",
+    "copy_install_command_pending": "準備中…",
+    "copy_install_command_copied": "命令已複製",
+    "copy_install_command_error": "無法產生安裝命令,請重試。",
+    "copy_install_command_clipboard_error": "無法複製命令,請檢查剪貼簿權限。"
   },
   "peerAuditQuick": {
     "iconLabel": "對等稽核",

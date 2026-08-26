@@ -3122,7 +3122,13 @@
     "copy_install_link_error": "Could not create an install link. Please try again.",
     "copy_install_link_expires_at": "Install link valid until {{time}}",
     "download_action": "Download",
-    "copy_install_link_clipboard_error": "Could not write to the clipboard. Copy the link manually, or try a different browser."
+    "copy_install_link_clipboard_error": "Could not write to the clipboard. Copy the link manually, or try a different browser.",
+    "copy_install_command": "Copy install command",
+    "copy_install_command_hint": "Copy a one-line command to paste into a terminal on the machine being enrolled. Useful when that machine has a shell but no convenient browser.",
+    "copy_install_command_pending": "Preparing…",
+    "copy_install_command_copied": "Command copied",
+    "copy_install_command_error": "Could not create the install command. Please try again.",
+    "copy_install_command_clipboard_error": "Could not copy the command. Please check clipboard permissions."
   },
   "peerAuditQuick": {
     "iconLabel": "Peer audit",

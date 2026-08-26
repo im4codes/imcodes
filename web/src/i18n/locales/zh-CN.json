@@ -3122,7 +3122,13 @@
     "copy_install_link_error": "无法生成安装链接，请重试。",
     "copy_install_link_expires_at": "安装链接有效期至 {{time}}",
     "download_action": "下载",
-    "copy_install_link_clipboard_error": "无法写入剪贴板。请手动复制链接，或换一个浏览器重试。"
+    "copy_install_link_clipboard_error": "无法写入剪贴板。请手动复制链接，或换一个浏览器重试。",
+    "copy_install_command": "复制安装命令",
+    "copy_install_command_hint": "复制一条命令,粘贴到目标机器的终端里即可安装。适合那台机器有终端但不方便开浏览器的情况。",
+    "copy_install_command_pending": "准备中…",
+    "copy_install_command_copied": "命令已复制",
+    "copy_install_command_error": "无法生成安装命令,请重试。",
+    "copy_install_command_clipboard_error": "无法复制命令,请检查剪贴板权限。"
   },
   "peerAuditQuick": {
     "iconLabel": "对等审计",

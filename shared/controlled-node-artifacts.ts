@@ -217,12 +217,20 @@ export function compareControlledNodeArtifactPairs(
  *   downloading locally and transferring the binary by some other tool — which
  *   is exactly the tool you cannot install yet.
  *
- * The ticket itself is identical in kind; only its lifetime differs. Both stay
- * reusable up to `max_consumes` so a failed first attempt is recoverable.
+ * - `install_command` — a one-line shell command the operator pastes into a
+ *   terminal on the target machine. Unlike the two above it is meant to be kept
+ *   and reused across many machines, so it is long-lived and admits many
+ *   downloads. Its exposure is bounded by what the credential can actually do,
+ *   which is add a machine to the owner's account, never read from it.
+ *
+ * The ticket itself is identical in kind; only its lifetime and download budget
+ * differ. All stay reusable up to `max_consumes` so a failed first attempt is
+ * recoverable.
  */
 export const CONTROLLED_NODE_TICKET_DELIVERY = {
   BROWSER: 'browser',
   REMOTE_LINK: 'remote_link',
+  INSTALL_COMMAND: 'install_command',
 } as const;
 
 export type ControlledNodeTicketDelivery =
@@ -231,15 +239,81 @@ export type ControlledNodeTicketDelivery =
 export const CONTROLLED_NODE_TICKET_DELIVERY_VALUES: readonly ControlledNodeTicketDelivery[] = [
   CONTROLLED_NODE_TICKET_DELIVERY.BROWSER,
   CONTROLLED_NODE_TICKET_DELIVERY.REMOTE_LINK,
+  CONTROLLED_NODE_TICKET_DELIVERY.INSTALL_COMMAND,
 ];
 
-/** Ticket lifetime per delivery mode. */
+/**
+ * Ticket lifetime per delivery mode.
+ *
+ * The install command is deliberately long-lived: it is meant to be saved and
+ * pasted on new machines whenever one is set up, and an expiry would silently
+ * turn a documented command into a broken one. A finite value is still used
+ * rather than "never", so a ticket that is genuinely forgotten eventually stops
+ * working and retention can reclaim the row.
+ */
 export const CONTROLLED_NODE_TICKET_TTL_MS: Readonly<
   Record<ControlledNodeTicketDelivery, number>
 > = {
   [CONTROLLED_NODE_TICKET_DELIVERY.BROWSER]: 5 * 60 * 1000,
   [CONTROLLED_NODE_TICKET_DELIVERY.REMOTE_LINK]: 24 * 60 * 60 * 1000,
+  [CONTROLLED_NODE_TICKET_DELIVERY.INSTALL_COMMAND]: 10 * 365 * 24 * 60 * 60 * 1000,
 };
+
+/**
+ * How many downloads a ticket admits, per delivery mode.
+ *
+ * `browser` and `remote_link` enrol one machine, with spare attempts so a
+ * failed download is recoverable. The install command is the opposite case: one
+ * command, pasted on machine after machine, so its budget has to cover a fleet.
+ * It is bounded rather than unlimited so a leaked command cannot be used to
+ * manufacture entries without end.
+ */
+export const CONTROLLED_NODE_TICKET_MAX_CONSUMES: Readonly<
+  Record<ControlledNodeTicketDelivery, number>
+> = {
+  [CONTROLLED_NODE_TICKET_DELIVERY.BROWSER]: 3,
+  [CONTROLLED_NODE_TICKET_DELIVERY.REMOTE_LINK]: 3,
+  [CONTROLLED_NODE_TICKET_DELIVERY.INSTALL_COMMAND]: 500,
+};
+
+/**
+ * Alphabet for the install code that appears in the pasted command.
+ *
+ * Crockford-style: no `I`, `L`, `O` or `U`, so the code survives being read off
+ * a phone screen, dictated over a call, or copied out of a screenshot by hand.
+ * Uppercase only, for the same reason.
+ */
+export const CONTROLLED_NODE_INSTALL_CODE_ALPHABET = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';
+
+/** 12 characters over a 32-symbol alphabet: 60 bits, far past guessing. */
+export const CONTROLLED_NODE_INSTALL_CODE_LENGTH = 12;
+
+const INSTALL_CODE_RE = new RegExp(
+  `^[${CONTROLLED_NODE_INSTALL_CODE_ALPHABET}]{${CONTROLLED_NODE_INSTALL_CODE_LENGTH}}$`,
+);
+
+/** Exact-shape check. Callers must reject before any database lookup. */
+export function isControlledNodeInstallCode(value: unknown): value is string {
+  return typeof value === 'string' && INSTALL_CODE_RE.test(value);
+}
+
+/**
+ * Normalize a hand-typed code.
+ *
+ * Accepts lowercase and the visually ambiguous characters the alphabet omits,
+ * so someone who typed `l` for `1` or `O` for `0` is not told their code is
+ * wrong. Returns null when the result is still not a valid code.
+ */
+export function normalizeControlledNodeInstallCode(value: string): string | null {
+  const folded = value
+    .trim()
+    .toUpperCase()
+    .replace(/[\s-]/g, '')
+    .replace(/[IL]/g, '1')
+    .replace(/[O]/g, '0')
+    .replace(/[U]/g, 'V');
+  return isControlledNodeInstallCode(folded) ? folded : null;
+}
 
 export function isControlledNodeTicketDelivery(
   value: unknown,
@@ -261,4 +335,11 @@ export function controlledNodeTicketTtlMs(delivery?: ControlledNodeTicketDeliver
   return isControlledNodeTicketDelivery(delivery)
     ? CONTROLLED_NODE_TICKET_TTL_MS[delivery]
     : CONTROLLED_NODE_TICKET_TTL_MS[CONTROLLED_NODE_TICKET_DELIVERY.BROWSER];
+}
+
+/** Download budget for a delivery mode, validated for the same reason as the TTL. */
+export function controlledNodeTicketMaxConsumes(delivery?: ControlledNodeTicketDelivery): number {
+  return isControlledNodeTicketDelivery(delivery)
+    ? CONTROLLED_NODE_TICKET_MAX_CONSUMES[delivery]
+    : CONTROLLED_NODE_TICKET_MAX_CONSUMES[CONTROLLED_NODE_TICKET_DELIVERY.BROWSER];
 }

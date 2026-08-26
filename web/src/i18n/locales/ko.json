@@ -3121,7 +3121,13 @@
     "copy_install_link_error": "설치 링크를 만들 수 없습니다. 다시 시도해 주세요.",
     "copy_install_link_expires_at": "설치 링크 유효 기간: {{time}}까지",
     "download_action": "다운로드",
-    "copy_install_link_clipboard_error": "클립보드에 쓸 수 없습니다. 링크를 직접 복사하거나 다른 브라우저에서 시도해 주세요."
+    "copy_install_link_clipboard_error": "클립보드에 쓸 수 없습니다. 링크를 직접 복사하거나 다른 브라우저에서 시도해 주세요.",
+    "copy_install_command": "설치 명령 복사",
+    "copy_install_command_hint": "등록할 컴퓨터의 터미널에 붙여넣기만 하면 되는 한 줄 명령을 복사합니다. 해당 컴퓨터에 셸은 있지만 브라우저를 쓰기 어려울 때 유용합니다.",
+    "copy_install_command_pending": "준비 중…",
+    "copy_install_command_copied": "명령이 복사됨",
+    "copy_install_command_error": "설치 명령을 만들지 못했습니다. 다시 시도해 주세요.",
+    "copy_install_command_clipboard_error": "명령을 복사하지 못했습니다. 클립보드 권한을 확인해 주세요."
   },
   "peerAuditQuick": {
     "iconLabel": "피어 감사",

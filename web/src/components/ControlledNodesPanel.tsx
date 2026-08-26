@@ -3,6 +3,7 @@ import { useTranslation } from 'react-i18next';
 import {
   controlledNodeDownloadErrorKey,
   createControlledNodeRemoteInstallLink,
+  createControlledNodeInstallCommand,
   downloadControlledNodeExecutable,
   beginControlledNodeDesktopDownload,
 } from '../api.js';
@@ -130,6 +131,8 @@ export function ControlledNodesPanel({
   const [ticketExpiryByKey, setTicketExpiryByKey] = useState<Partial<Record<string, number>>>({});
   const [linkingKey, setLinkingKey] = useState<string | null>(null);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
+  const [commandKey, setCommandKey] = useState<string | null>(null);
+  const [copiedCommandKey, setCopiedCommandKey] = useState<string | null>(null);
   const [linkExpiryByKey, setLinkExpiryByKey] = useState<Partial<Record<string, number>>>({});
   const copiedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -250,6 +253,44 @@ export function ControlledNodesPanel({
    * a chat and open over there. Downloading here and transferring the binary
    * would need the very remote tool they are trying to install.
    */
+  /**
+   * Copy the one-line install command.
+   *
+   * For a machine that has a terminal but no convenient browser: a headless
+   * Linux box, or a Windows host reached over RDP where pasting a line into a
+   * shell beats driving a browser. The command carries a short code rather than
+   * the download ticket, so it can be read off a screen or dictated.
+   */
+  const onCopyInstallCommand = async (target: ControlledNodeArtifactSelection) => {
+    const key = artifactSelectionKey(target);
+    if (commandKey) return;
+    setCommandKey(key);
+    setDownloadError(null);
+    try {
+      const minted = await createControlledNodeInstallCommand(target);
+      const copied = await new Promise<boolean>((resolve) => {
+        copyToClipboard(minted.command, () => resolve(true), () => resolve(false));
+      });
+      if (!copied) {
+        setDownloadError(t('controlled_nodes.copy_install_command_clipboard_error'));
+        return;
+      }
+      setCopiedCommandKey(key);
+      if (copiedTimerRef.current) clearTimeout(copiedTimerRef.current);
+      copiedTimerRef.current = setTimeout(() => {
+        setCopiedCommandKey(null);
+        copiedTimerRef.current = null;
+      }, 4000);
+    } catch (err) {
+      const errorKey = controlledNodeDownloadErrorKey(err);
+      setDownloadError(t(errorKey === 'controlled_nodes.download_error'
+        ? 'controlled_nodes.copy_install_command_error'
+        : errorKey));
+    } finally {
+      setCommandKey(null);
+    }
+  };
+
   const onCopyInstallLink = async (target: ControlledNodeArtifactSelection) => {
     const key = artifactSelectionKey(target);
     if (linkingKey) return;
@@ -649,8 +690,10 @@ export function ControlledNodesPanel({
             const isDownloading = downloadingKey === key;
             const isLinking = linkingKey === key;
             const isCopied = copiedKey === key;
+            const isCommanding = commandKey === key;
+            const isCommandCopied = copiedCommandKey === key;
             const linkExpiry = linkExpiryByKey[key];
-            const rowBusy = isDownloading || isLinking;
+            const rowBusy = isDownloading || isLinking || isCommanding;
             const platform = PLATFORM_PRESENTATION[target.os];
             return (
               <div key={key} class={`controlled-nodes-download-item is-${target.os}`}>
@@ -687,6 +730,20 @@ export function ControlledNodesPanel({
                       : isCopied
                         ? t('controlled_nodes.copy_install_link_copied')
                         : t('controlled_nodes.copy_install_link')}
+                  </button>
+                  <button
+                    type="button"
+                    class="controlled-nodes-copy-command-btn"
+                    disabled={rowBusy}
+                    title={t('controlled_nodes.copy_install_command_hint')}
+                    aria-live="polite"
+                    onClick={() => void onCopyInstallCommand(target)}
+                  >
+                    {isCommanding
+                      ? t('controlled_nodes.copy_install_command_pending')
+                      : isCommandCopied
+                        ? t('controlled_nodes.copy_install_command_copied')
+                        : t('controlled_nodes.copy_install_command')}
                   </button>
                 </div>
                 {expiry != null && (

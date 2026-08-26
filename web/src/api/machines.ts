@@ -127,6 +127,11 @@ export interface ControlledNodeExecutableTicket {
   /** How this ticket is meant to reach the machine; decides its lifetime. */
   delivery: ControlledNodeTicketDelivery;
   ownerUserId: string;
+  /**
+   * The line the operator pastes into a terminal, present only for the
+   * `install_command` delivery. Older servers do not send it.
+   */
+  installCommand?: string;
 }
 
 export async function createMachineFileHandle(
@@ -231,6 +236,9 @@ function normalizeTicket(res: unknown, expectedOwnerUserId: string): ControlledN
   const delivery = isControlledNodeTicketDelivery(res.delivery)
     ? res.delivery
     : CONTROLLED_NODE_TICKET_DELIVERY.BROWSER;
+  const installCommand = typeof res.installCommand === 'string' && res.installCommand.length > 0
+    ? res.installCommand
+    : undefined;
   if (ownerUserId && ownerUserId !== expectedOwnerUserId) {
     throw new Error(CONTROLLED_NODE_MINT_ERRORS.AUTH_IDENTITY_CHANGED);
   }
@@ -241,6 +249,7 @@ function normalizeTicket(res: unknown, expectedOwnerUserId: string): ControlledN
   return {
     version: 2, ticket, ticketId, os, arch, filename, sizeBytes, sha256,
     expiresAt, delivery, ownerUserId,
+    ...(installCommand ? { installCommand } : {}),
   };
 }
 
@@ -409,6 +418,30 @@ export async function mintControlledNodeExecutableTicket(
  */
 export function buildControlledNodeBootstrapUrl(ticket: string): string {
   return `${getApiBaseUrl()}${ENROLL_V2_BOOTSTRAP_PATH}#ticket=${encodeURIComponent(ticket)}`;
+}
+
+/**
+ * Mint the one-line install command for a platform.
+ *
+ * Solves the same deadlock as the remote link, for the case where the target
+ * has a terminal but no browser — a headless Linux box, or a Windows machine
+ * reached over RDP where pasting a URL into a browser is more work than pasting
+ * a line into a shell. The command is long-lived and admits many downloads,
+ * because it is meant to be kept and reused as machines are set up.
+ */
+export async function mintControlledNodeInstallCommand(
+  selection: ControlledNodeArtifactSelection,
+  hostServerId?: string,
+): Promise<{ command: string; expiresAt: number; ticketId: string }> {
+  const minted = await mintControlledNodeExecutableTicket(
+    selection, hostServerId, CONTROLLED_NODE_TICKET_DELIVERY.INSTALL_COMMAND,
+  );
+  if (!minted.installCommand) throw new Error('install_command_unsupported');
+  return {
+    command: minted.installCommand,
+    expiresAt: minted.expiresAt,
+    ticketId: minted.ticketId,
+  };
 }
 
 /**

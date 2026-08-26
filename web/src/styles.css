@@ -3652,11 +3652,16 @@ html.native-ios-mac .chat-dl-btn {
  */
 .controlled-nodes-download-actions {
   display: grid;
-  grid-template-columns: minmax(0, 3fr) minmax(0, 2fr);
+  /* Download spans the row as the primary action; the two copy actions share
+     the row beneath it, so neither competes with it or with each other. */
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
   align-items: stretch;
   gap: 6px;
   width: 100%;
   margin-top: auto;
+}
+.controlled-nodes-download-actions > .controlled-nodes-download-btn {
+  grid-column: 1 / -1;
 }
 .controlled-nodes-download-btn {
   display: flex;
@@ -3696,8 +3701,9 @@ html.native-ios-mac .chat-dl-btn {
   color: #67e8f9;
   font-size: 14px;
 }
-/* Secondary to the download button: same row, visibly not the primary action. */
-.controlled-nodes-copy-link-btn {
+/* Secondary to the download button: visibly not the primary action. */
+.controlled-nodes-copy-link-btn,
+.controlled-nodes-copy-command-btn {
   display: flex;
   align-items: center;
   justify-content: center;
@@ -3712,12 +3718,14 @@ html.native-ios-mac .chat-dl-btn {
   text-align: center;
   cursor: pointer;
 }
-.controlled-nodes-copy-link-btn:hover:not(:disabled) {
+.controlled-nodes-copy-link-btn:hover:not(:disabled),
+.controlled-nodes-copy-command-btn:hover:not(:disabled) {
   border-color: rgba(103, 232, 249, 0.6);
   background: rgba(30, 41, 59, 0.62);
   color: #fff;
 }
-.controlled-nodes-copy-link-btn:disabled { cursor: wait; opacity: 0.58; }
+.controlled-nodes-copy-link-btn:disabled,
+.controlled-nodes-copy-command-btn:disabled { cursor: wait; opacity: 0.58; }
 @media (max-width: 420px) {
   .controlled-nodes-download-actions { grid-template-columns: minmax(0, 1fr); }
 }
