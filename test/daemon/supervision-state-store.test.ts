@@ -1,5 +1,5 @@
 import { createRequire } from 'node:module';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -8,6 +8,8 @@ import { SUPERVISION_MODE, normalizeSessionSupervisionSnapshot } from '../../sha
 import {
   SUPERVISION_STATE_VERSION,
   SupervisionStateStore,
+  getSupervisionStateStore,
+  resetSupervisionStateStoreForTests,
   type PersistedSupervisionWaitState,
 } from '../../src/daemon/supervision-state-store.js';
 import { suppressSqliteExperimentalWarning } from '../../src/util/suppress-sqlite-warning.js';
@@ -66,6 +68,26 @@ function state(overrides: Partial<PersistedSupervisionWaitState> = {}): Persiste
 }
 
 describe('SupervisionStateStore', () => {
+  it('degrades to a no-op store instead of crashing startup on a corrupt database', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'imcodes-supervision-corrupt-'));
+    const dbPath = join(dir, 'state.sqlite');
+    const previousPath = process.env.IMCODES_SUPERVISION_STATE_DB_PATH;
+    writeFileSync(dbPath, 'not a sqlite database');
+    resetSupervisionStateStoreForTests();
+    process.env.IMCODES_SUPERVISION_STATE_DB_PATH = dbPath;
+    try {
+      const store = getSupervisionStateStore();
+      expect(store.list()).toEqual([]);
+      expect(() => store.upsert(state())).not.toThrow();
+      expect(store.get('deck_supervision_brain')).toBeUndefined();
+    } finally {
+      resetSupervisionStateStoreForTests();
+      if (previousPath === undefined) delete process.env.IMCODES_SUPERVISION_STATE_DB_PATH;
+      else process.env.IMCODES_SUPERVISION_STATE_DB_PATH = previousPath;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('reopens a file-backed SQLite database with the same exact session authority', () => {
     const dir = mkdtempSync(join(tmpdir(), 'imcodes-supervision-state-'));
     const dbPath = join(dir, 'state.sqlite');

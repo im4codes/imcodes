@@ -6,6 +6,7 @@ import { homedir } from 'node:os';
 import type { SessionSupervisionSnapshot } from '../../shared/supervision-config.js';
 import type { SupervisionAuditDepth } from './supervision-broker.js';
 import { suppressSqliteExperimentalWarning } from '../util/suppress-sqlite-warning.js';
+import logger from '../util/logger.js';
 
 const require = createRequire(import.meta.url);
 suppressSqliteExperimentalWarning();
@@ -74,6 +75,15 @@ export interface SupervisionStateStoreOptions {
   busyTimeoutMs?: number;
 }
 
+export interface SupervisionWaitStateStore {
+  close(): void;
+  upsert(state: PersistedSupervisionWaitState): void;
+  get(sessionName: string): PersistedSupervisionWaitState | undefined;
+  list(): PersistedSupervisionWaitState[];
+  delete(sessionName: string): void;
+  clear(): void;
+}
+
 function isFiniteTimestamp(value: unknown): value is number {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0;
 }
@@ -97,39 +107,54 @@ function parseRecord(payload: string): PersistedSupervisionWaitState | undefined
   }
 }
 
-export class SupervisionStateStore {
+export class SupervisionStateStore implements SupervisionWaitStateStore {
   readonly #db: DatabaseSyncInstance;
   readonly #ownsDb: boolean;
   #closed = false;
 
   constructor(options: SupervisionStateStoreOptions = {}) {
+    let db: DatabaseSyncInstance | undefined;
+    let ownsDb = false;
     if (options.database) {
-      this.#db = options.database;
-      this.#ownsDb = false;
+      db = options.database;
     } else {
       const dbPath = options.dbPath?.trim()
         || process.env.IMCODES_SUPERVISION_STATE_DB_PATH?.trim()
         || (process.env.VITEST ? ':memory:' : DEFAULT_DB_PATH);
       if (dbPath !== ':memory:') mkdirSync(dirname(dbPath), { recursive: true });
-      this.#db = new DatabaseSync(dbPath);
-      this.#ownsDb = true;
+      db = new DatabaseSync(dbPath);
+      ownsDb = true;
     }
-    const timeout = Math.max(0, Math.min(60_000, Math.floor(options.busyTimeoutMs ?? 5_000)));
-    this.#db.exec(`
-      PRAGMA journal_mode = WAL;
-      PRAGMA busy_timeout = ${timeout};
-      CREATE TABLE IF NOT EXISTS supervision_wait_states (
-        session_name TEXT PRIMARY KEY,
-        session_instance_id TEXT NOT NULL,
-        command_id TEXT NOT NULL,
-        phase TEXT NOT NULL CHECK (phase IN ('waiting', 'auditing')),
-        deadline_at INTEGER NOT NULL,
-        payload_json TEXT NOT NULL,
-        updated_at INTEGER NOT NULL
-      );
-      CREATE INDEX IF NOT EXISTS supervision_wait_states_deadline_idx
-        ON supervision_wait_states(deadline_at);
-    `);
+    if (!db) throw new Error('supervision state database was not initialized');
+    try {
+      const timeout = Math.max(0, Math.min(60_000, Math.floor(options.busyTimeoutMs ?? 5_000)));
+      db.exec(`
+        PRAGMA journal_mode = WAL;
+        PRAGMA busy_timeout = ${timeout};
+        CREATE TABLE IF NOT EXISTS supervision_wait_states (
+          session_name TEXT PRIMARY KEY,
+          session_instance_id TEXT NOT NULL,
+          command_id TEXT NOT NULL,
+          phase TEXT NOT NULL CHECK (phase IN ('waiting', 'auditing')),
+          deadline_at INTEGER NOT NULL,
+          payload_json TEXT NOT NULL,
+          updated_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS supervision_wait_states_deadline_idx
+          ON supervision_wait_states(deadline_at);
+      `);
+    } catch (error) {
+      if (ownsDb) {
+        try {
+          db.close();
+        } catch {
+          // Preserve the authoritative initialization error.
+        }
+      }
+      throw error;
+    }
+    this.#db = db;
+    this.#ownsDb = ownsDb;
   }
 
   close(): void {
@@ -197,10 +222,29 @@ export class SupervisionStateStore {
   }
 }
 
-let supervisionStateStore: SupervisionStateStore | undefined;
+class DisabledSupervisionStateStore implements SupervisionWaitStateStore {
+  close(): void {}
+  upsert(_state: PersistedSupervisionWaitState): void {}
+  get(_sessionName: string): PersistedSupervisionWaitState | undefined { return undefined; }
+  list(): PersistedSupervisionWaitState[] { return []; }
+  delete(_sessionName: string): void {}
+  clear(): void {}
+}
 
-export function getSupervisionStateStore(): SupervisionStateStore {
-  supervisionStateStore ??= new SupervisionStateStore();
+let supervisionStateStore: SupervisionWaitStateStore | undefined;
+
+export function getSupervisionStateStore(): SupervisionWaitStateStore {
+  if (supervisionStateStore) return supervisionStateStore;
+  try {
+    supervisionStateStore = new SupervisionStateStore();
+  } catch (error) {
+    // Durable supervision recovery is an optional resilience layer. A corrupt,
+    // locked or unwritable local database must never prevent the daemon from
+    // starting; this process continues without restart recovery and retries on
+    // the next daemon start.
+    logger.warn({ err: error }, 'Supervision durable state unavailable; continuing without persisted wait recovery');
+    supervisionStateStore = new DisabledSupervisionStateStore();
+  }
   return supervisionStateStore;
 }
 
