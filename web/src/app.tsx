@@ -172,7 +172,13 @@ import {
 import { WsClient, type P2pWorkflowRequestScope } from './ws-client.js';
 import { configure as configureApi, configureExpectedUserId, apiFetch, onAuthExpired, startProactiveRefresh, stopProactiveRefresh, refreshSessionIfStale, ApiError, configureApiKey, clearApiKey, fetchMe, getApiKey, normalizeLocalWebPreviewPath, listP2pRuns, discoverSharedEntries, openSharedEntry, listManagedSharesForServer, type SharedEntrySummary } from './api.js';
 import { isNative, getServerUrl, clearServerUrl } from './native.js';
-import { getAuthKey, clearAuthKey, getAuthKeyId, clearAuthKeyId } from './biometric-auth.js';
+import {
+  getAuthKey,
+  clearAuthKey,
+  getAuthKeyId,
+  clearAuthKeyId,
+  initializeServerScopedAuth,
+} from './biometric-auth.js';
 import { initPushNotifications, resetPushBadge } from './push-notifications.js';
 import { ServerSetupPage } from './pages/ServerSetupPage.js';
 import { NativeAuthBridge } from './pages/NativeAuthBridge.js';
@@ -1095,6 +1101,7 @@ export function App() {
         setNativeServerUrl(url);
         if (url) configureApi(url);
 
+        await initializeServerScopedAuth(url);
         const storedKey = url ? await getAuthKey(url) : null;
         if (storedKey && isCurrentAuthGeneration()) {
           configureApiKey(storedKey);

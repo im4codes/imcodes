@@ -19,6 +19,7 @@ const {
   getAuthKeyMock,
   getAuthKeyIdMock,
   getServerUrlMock,
+  initializeServerScopedAuthMock,
   listP2pRunsMock,
   nativeState,
   openSharedEntryMock,
@@ -40,6 +41,7 @@ const {
   getAuthKeyMock: vi.fn(async () => null as string | null),
   getAuthKeyIdMock: vi.fn(async () => null as string | null),
   getServerUrlMock: vi.fn(async () => null as string | null),
+  initializeServerScopedAuthMock: vi.fn(async () => undefined),
   listP2pRunsMock: vi.fn(),
   nativeState: { value: false },
   openSharedEntryMock: vi.fn(),
@@ -161,6 +163,7 @@ vi.mock('../src/biometric-auth.js', () => ({
   clearAuthKeyId: (...args: unknown[]) => clearAuthKeyIdMock(...args),
   getAuthKey: (...args: unknown[]) => getAuthKeyMock(...args),
   getAuthKeyId: (...args: unknown[]) => getAuthKeyIdMock(...args),
+  initializeServerScopedAuth: (...args: unknown[]) => initializeServerScopedAuthMock(...args),
 }));
 
 vi.mock('../src/push-notifications.js', () => ({
@@ -905,6 +908,8 @@ beforeEach(() => {
   getAuthKeyIdMock.mockResolvedValue(null);
   getServerUrlMock.mockReset();
   getServerUrlMock.mockResolvedValue(null);
+  initializeServerScopedAuthMock.mockReset();
+  initializeServerScopedAuthMock.mockResolvedValue(undefined);
   fetchMeMock.mockResolvedValue({
     id: 'user-1',
     is_admin: true,
@@ -1328,6 +1333,9 @@ describe('App shell', () => {
       const { App } = await importApp();
       render(<App />);
 
+      await waitFor(() => expect(initializeServerScopedAuthMock).toHaveBeenCalledWith(
+        'https://old-server.example',
+      ));
       await waitFor(() => expect(document.querySelector('.mobile-server-btn')).toBeTruthy());
       fireEvent.click(document.querySelector('.mobile-server-btn')!);
       fireEvent.click(await screen.findByText('⇄ Switch Cloud Server'));
@@ -1446,6 +1454,39 @@ describe('App shell', () => {
     expect(clearAuthKeyMock).not.toHaveBeenCalledWith('https://other-server.example');
     expect(clearAuthKeyIdMock).not.toHaveBeenCalledWith('https://other-server.example');
     expect(localStorage.getItem('rcc_auth')).toBeNull();
+  }, 20_000);
+
+  it('revokes and deletes only the active Cloud Server credential on explicit logout', async () => {
+    nativeState.value = true;
+    getServerUrlMock.mockResolvedValue('https://active-server.example');
+    getAuthKeyIdMock.mockResolvedValue('active-key-id');
+    localStorage.setItem('rcc_auth', JSON.stringify({
+      userId: 'active-user',
+      baseUrl: 'https://active-server.example',
+    }));
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') return { id: 'active-user' };
+      if (path === '/api/server') return { servers: [] };
+      return {};
+    });
+
+    const { App } = await importApp();
+    render(<App />);
+
+    fireEvent.click(await screen.findByText('Log Out'));
+
+    await waitFor(() => expect(getAuthKeyIdMock).toHaveBeenCalledWith(
+      'https://active-server.example',
+    ));
+    await waitFor(() => expect(apiFetchMock).toHaveBeenCalledWith(
+      '/api/auth/user/me/keys/active-key-id',
+      { method: 'DELETE' },
+    ));
+    expect(clearAuthKeyMock).toHaveBeenCalledWith('https://active-server.example');
+    expect(clearAuthKeyIdMock).toHaveBeenCalledWith('https://active-server.example');
+    expect(clearAuthKeyMock).not.toHaveBeenCalledWith('https://other-server.example');
+    expect(clearAuthKeyIdMock).not.toHaveBeenCalledWith('https://other-server.example');
+    expect(await screen.findByRole('button', { name: 'login-page' })).toBeTruthy();
   }, 20_000);
 
   it('clears stale shared session authority until re-open succeeds after auth expiry', async () => {

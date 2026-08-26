@@ -60,19 +60,44 @@ describe('server-scoped native credentials', () => {
     await expect(getAuthKeyId('https://cloud-b.example')).resolves.toBe('key-id-b');
   });
 
-  it('migrates each legacy single-server credential into the selected server slot once', async () => {
+  it('atomically migrates both legacy credentials before another server can modify them', async () => {
     preferenceState.store.set('deck_auth_key', 'legacy-api-key');
     preferenceState.store.set('deck_api_key_id', 'legacy-key-id');
-    const { getAuthKey, getAuthKeyId } = await import('../src/biometric-auth.js');
+    const {
+      clearAuthKey,
+      clearAuthKeyId,
+      getAuthKey,
+      getAuthKeyId,
+      initializeServerScopedAuth,
+      storeAuthKey,
+      storeAuthKeyId,
+    } = await import('../src/biometric-auth.js');
 
+    await initializeServerScopedAuth('https://legacy-cloud.example/');
     await expect(getAuthKey('https://legacy-cloud.example/')).resolves.toBe('legacy-api-key');
     await expect(getAuthKeyId('https://legacy-cloud.example/')).resolves.toBe('legacy-key-id');
     expect(preferenceState.store.has('deck_auth_key')).toBe(false);
     expect(preferenceState.store.has('deck_api_key_id')).toBe(false);
 
-    await expect(getAuthKey('https://different-cloud.example')).resolves.toBeNull();
-    await expect(getAuthKeyId('https://different-cloud.example')).resolves.toBeNull();
+    await storeAuthKey('different-key', 'https://different-cloud.example');
+    await storeAuthKeyId('different-key-id', 'https://different-cloud.example');
+    await clearAuthKey('https://different-cloud.example');
+    await clearAuthKeyId('https://different-cloud.example');
     await expect(getAuthKey('https://legacy-cloud.example')).resolves.toBe('legacy-api-key');
     await expect(getAuthKeyId('https://legacy-cloud.example')).resolves.toBe('legacy-key-id');
+  });
+
+  it('discards ambiguous legacy credentials when no previously selected server exists', async () => {
+    preferenceState.store.set('deck_auth_key', 'must-not-send-to-arbitrary-server');
+    preferenceState.store.set('deck_api_key_id', 'ambiguous-key-id');
+    const { getAuthKey, getAuthKeyId, initializeServerScopedAuth } = await import('../src/biometric-auth.js');
+
+    await initializeServerScopedAuth(null);
+
+    await expect(getAuthKey('https://newly-selected.example')).resolves.toBeNull();
+    await expect(getAuthKeyId('https://newly-selected.example')).resolves.toBeNull();
+    expect(preferenceState.store.has('deck_auth_key')).toBe(false);
+    expect(preferenceState.store.has('deck_api_key_id')).toBe(false);
+    expect(preferenceState.store.get('deck_auth_scope_migration_complete_v1')).toBe('1');
   });
 });

@@ -10,6 +10,8 @@ const AUTH_KEY = 'deck_auth_key';
 const AUTH_KEY_ID = 'deck_api_key_id';
 const AUTH_KEY_V2_PREFIX = 'deck_auth_key_v2:';
 const AUTH_KEY_ID_V2_PREFIX = 'deck_api_key_id_v2:';
+const AUTH_SCOPE_MIGRATION_OWNER = 'deck_auth_scope_migration_owner_v1';
+const AUTH_SCOPE_MIGRATION_COMPLETE = 'deck_auth_scope_migration_complete_v1';
 
 function normalizeCredentialServerUrl(serverUrl: string | null | undefined): string | null {
   const trimmed = String(serverUrl ?? '').trim().replace(/\/+$/, '');
@@ -66,53 +68,77 @@ async function removeStoredValue(key: string): Promise<void> {
   }
 }
 
-async function migrateLegacyValue(legacyKey: string, scopedKey: string): Promise<string | null> {
-  const existing = await readStoredValue(scopedKey);
-  if (existing) return existing;
-  const legacy = await readStoredValue(legacyKey);
-  if (!legacy) return null;
-  // The legacy slot always belonged to the one selected server from the old
-  // schema. Write the isolated slot first, then remove the ambiguous alias.
-  await writeStoredValue(scopedKey, legacy);
-  await removeStoredValue(legacyKey);
-  return legacy;
+/**
+ * Upgrade the legacy single-server slots exactly once.
+ *
+ * Only the server URL already persisted by the old app is trusted to own those
+ * ambiguous credentials. If there is no selected server, discarding them is
+ * safer than ever sending one Cloud Server's bearer token to another. The
+ * owner marker makes a crash between the two scoped writes resumable.
+ */
+export async function initializeServerScopedAuth(serverUrl?: string | null): Promise<void> {
+  if (await readStoredValue(AUTH_SCOPE_MIGRATION_COMPLETE)) return;
+
+  const recordedOwner = normalizeCredentialServerUrl(
+    await readStoredValue(AUTH_SCOPE_MIGRATION_OWNER),
+  );
+  const selectedOwner = recordedOwner ?? normalizeCredentialServerUrl(serverUrl);
+  if (!selectedOwner) {
+    await removeStoredValue(AUTH_KEY);
+    await removeStoredValue(AUTH_KEY_ID);
+    await writeStoredValue(AUTH_SCOPE_MIGRATION_COMPLETE, '1');
+    await removeStoredValue(AUTH_SCOPE_MIGRATION_OWNER);
+    return;
+  }
+
+  if (!recordedOwner) {
+    await writeStoredValue(AUTH_SCOPE_MIGRATION_OWNER, selectedOwner);
+  }
+  const scopedAuthKey = scopedCredentialKey(AUTH_KEY_V2_PREFIX, selectedOwner)!;
+  const scopedKeyId = scopedCredentialKey(AUTH_KEY_ID_V2_PREFIX, selectedOwner)!;
+  // Keep native Preferences reads serialized. Some bridge implementations
+  // multiplex calls through one callback channel during cold startup.
+  const legacyAuthKey = await readStoredValue(AUTH_KEY);
+  const legacyKeyId = await readStoredValue(AUTH_KEY_ID);
+  const existingAuthKey = await readStoredValue(scopedAuthKey);
+  const existingKeyId = await readStoredValue(scopedKeyId);
+  if (!existingAuthKey && legacyAuthKey) await writeStoredValue(scopedAuthKey, legacyAuthKey);
+  if (!existingKeyId && legacyKeyId) await writeStoredValue(scopedKeyId, legacyKeyId);
+  await removeStoredValue(AUTH_KEY);
+  await removeStoredValue(AUTH_KEY_ID);
+  await writeStoredValue(AUTH_SCOPE_MIGRATION_COMPLETE, '1');
+  await removeStoredValue(AUTH_SCOPE_MIGRATION_OWNER);
 }
 
 /** Store API key — Preferences on native (encrypted by iOS), localStorage on web */
 export async function storeAuthKey(apiKey: string, serverUrl?: string | null): Promise<void> {
   const scopedKey = scopedCredentialKey(AUTH_KEY_V2_PREFIX, serverUrl);
   await writeStoredValue(scopedKey ?? AUTH_KEY, apiKey);
-  if (scopedKey) await removeStoredValue(AUTH_KEY);
 }
 
 /** Retrieve API key */
 export async function getAuthKey(serverUrl?: string | null): Promise<string | null> {
   const scopedKey = scopedCredentialKey(AUTH_KEY_V2_PREFIX, serverUrl);
-  return scopedKey ? migrateLegacyValue(AUTH_KEY, scopedKey) : readStoredValue(AUTH_KEY);
+  return readStoredValue(scopedKey ?? AUTH_KEY);
 }
 
 /** Clear stored auth key */
 export async function clearAuthKey(serverUrl?: string | null): Promise<void> {
   const scopedKey = scopedCredentialKey(AUTH_KEY_V2_PREFIX, serverUrl);
-  if (scopedKey) await removeStoredValue(scopedKey);
-  // Clear the legacy alias too: before migration it can only represent the
-  // currently selected server, never another saved Cloud Server.
-  await removeStoredValue(AUTH_KEY);
+  await removeStoredValue(scopedKey ?? AUTH_KEY);
 }
 
 export async function storeAuthKeyId(keyId: string, serverUrl?: string | null): Promise<void> {
   const scopedKey = scopedCredentialKey(AUTH_KEY_ID_V2_PREFIX, serverUrl);
   await writeStoredValue(scopedKey ?? AUTH_KEY_ID, keyId);
-  if (scopedKey) await removeStoredValue(AUTH_KEY_ID);
 }
 
 export async function getAuthKeyId(serverUrl?: string | null): Promise<string | null> {
   const scopedKey = scopedCredentialKey(AUTH_KEY_ID_V2_PREFIX, serverUrl);
-  return scopedKey ? migrateLegacyValue(AUTH_KEY_ID, scopedKey) : readStoredValue(AUTH_KEY_ID);
+  return readStoredValue(scopedKey ?? AUTH_KEY_ID);
 }
 
 export async function clearAuthKeyId(serverUrl?: string | null): Promise<void> {
   const scopedKey = scopedCredentialKey(AUTH_KEY_ID_V2_PREFIX, serverUrl);
-  if (scopedKey) await removeStoredValue(scopedKey);
-  await removeStoredValue(AUTH_KEY_ID);
+  await removeStoredValue(scopedKey ?? AUTH_KEY_ID);
 }
