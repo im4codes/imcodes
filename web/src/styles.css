@@ -4766,7 +4766,6 @@ html.native-ios-mac .chat-dl-btn {
 .delegation-reply-card-body {
   max-height: calc(1.5em * 40);
   overflow-y: auto;
-  overscroll-behavior: contain;
   scrollbar-width: thin;
   scrollbar-color: rgba(71, 85, 105, 0.82) transparent;
 }

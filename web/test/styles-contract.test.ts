@@ -115,6 +115,7 @@ describe('styles.css regression contracts', () => {
     expect(bodyRule).toBeTruthy();
     expect(bodyRule).toMatch(/max-height:\s*calc\(1\.5em \* 40\)/);
     expect(bodyRule).toMatch(/overflow-y:\s*auto/);
+    expect(bodyRule).not.toMatch(/overscroll-behavior/);
   });
 
   it('.chat-view-preview must NOT be a scroll container', () => {
