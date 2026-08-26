@@ -22,6 +22,7 @@ const apiMocks = vi.hoisted(() => ({
 }));
 
 const browserDownloadMocks = vi.hoisted(() => ({
+  canUseNativeFileShare: vi.fn(() => true),
   saveBlobViaDownloadAnchor: vi.fn(),
   shareBlobOrDownload: vi.fn().mockResolvedValue('shared'),
 }));
@@ -418,6 +419,8 @@ describe('direct file transfer v2 browser broker', () => {
       ok: true,
       attachment: { id: 'relay-attachment', serverId: 'server-1', daemonPath: '/tmp/relay.txt' },
     });
+    browserDownloadMocks.canUseNativeFileShare.mockReturnValue(true);
+    browserDownloadMocks.shareBlobOrDownload.mockResolvedValue('shared');
   });
 
   it('acquires the File System Access destination during the user action and classifies picker cancellation', async () => {
@@ -933,6 +936,31 @@ describe('direct file transfer v2 browser broker', () => {
     expect(onMode).toHaveBeenCalledOnce();
     expect(onMode).toHaveBeenCalledWith(FILE_DOWNLOAD_TRANSPORT_MODE.BROWSER);
     expect(onProgress).not.toHaveBeenCalled();
+    expect(sent).toHaveLength(0);
+  });
+
+  it('uses the visible browser download path on native WebViews without embedded file-share plugins', async () => {
+    vi.stubGlobal('Capacitor', { isNativePlatform: () => true });
+    browserDownloadMocks.canUseNativeFileShare.mockReturnValue(false);
+    const { downloadPreviewWithDirectFallback, FILE_DOWNLOAD_TRANSPORT_MODE } = await import('../src/direct-file-transfer.js');
+    const { ws, sent } = createWs(directCapabilities);
+    const httpFallback = vi.fn().mockResolvedValue(undefined);
+    const onMode = vi.fn();
+
+    await downloadPreviewWithDirectFallback({
+      ws,
+      serverId: 'server-1',
+      previewHandle: 'preview-handle-1',
+      suggestedName: 'mobile-report.pdf',
+      destination: null,
+      httpFallback,
+      onMode,
+    });
+
+    expect(onMode).toHaveBeenCalledOnce();
+    expect(onMode).toHaveBeenCalledWith(FILE_DOWNLOAD_TRANSPORT_MODE.BROWSER);
+    expect(httpFallback).toHaveBeenCalledOnce();
+    expect(browserDownloadMocks.shareBlobOrDownload).not.toHaveBeenCalled();
     expect(sent).toHaveLength(0);
   });
 

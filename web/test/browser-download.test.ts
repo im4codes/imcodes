@@ -4,6 +4,7 @@ import { saveBlobViaDownloadAnchor, shareBlobOrDownload } from '../src/browser-d
 
 const nativePluginMocks = vi.hoisted(() => ({
   native: false,
+  platform: 'android',
   available: new Set<string>(),
   writeFile: vi.fn(),
   deleteFile: vi.fn(),
@@ -13,6 +14,7 @@ const nativePluginMocks = vi.hoisted(() => ({
 vi.mock('@capacitor/core', () => ({
   Capacitor: {
     isNativePlatform: () => nativePluginMocks.native,
+    getPlatform: () => nativePluginMocks.platform,
     isPluginAvailable: (name: string) => nativePluginMocks.available.has(name),
   },
   registerPlugin: (name: string) => name === 'Filesystem'
@@ -23,6 +25,7 @@ vi.mock('@capacitor/core', () => ({
 describe('browser download', () => {
   beforeEach(() => {
     nativePluginMocks.native = false;
+    nativePluginMocks.platform = 'android';
     nativePluginMocks.available.clear();
     nativePluginMocks.writeFile.mockReset();
     nativePluginMocks.deleteFile.mockReset();
@@ -92,6 +95,24 @@ describe('browser download', () => {
 
     await expect(shareBlobOrDownload(new Blob(['payload']), 'report.pdf')).resolves.toBe('shared');
     expect(share).toHaveBeenCalledOnce();
+  });
+
+  it('does not use embedded Capacitor file sharing on iOS', async () => {
+    nativePluginMocks.native = true;
+    nativePluginMocks.platform = 'ios';
+    nativePluginMocks.available.add('Filesystem');
+    nativePluginMocks.available.add('Share');
+    const webShare = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperties(navigator, {
+      share: { configurable: true, value: webShare },
+      canShare: { configurable: true, value: vi.fn(() => true) },
+    });
+
+    await expect(shareBlobOrDownload(new Blob(['payload']), 'report.pdf')).resolves.toBe('shared');
+
+    expect(nativePluginMocks.writeFile).not.toHaveBeenCalled();
+    expect(nativePluginMocks.share).not.toHaveBeenCalled();
+    expect(webShare).toHaveBeenCalledOnce();
   });
 
   it('reuses embedded Capacitor Filesystem and Share plugins before browser Web Share', async () => {

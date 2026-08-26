@@ -43,7 +43,7 @@ import {
   uploadFile,
   type AttachmentRefResponse,
 } from './api.js';
-import { shareBlobOrDownload } from './browser-download.js';
+import { canUseNativeFileShare, shareBlobOrDownload } from './browser-download.js';
 import { isNative } from './native.js';
 import type { ServerMessage, WsClient } from './ws-client.js';
 
@@ -1632,6 +1632,11 @@ export async function uploadFileWithDirectFallback(options: {
 }
 
 export async function selectPreviewDownloadDestination(suggestedName?: string): Promise<DirectPreviewDownloadDestination | null> {
+  // Native WebViews must not use a coincidental/partial File System Access
+  // surface. If embedded Filesystem+Share plugins are unavailable, the caller
+  // falls back to the authenticated Browser.open download path instead of an
+  // invisible hidden-anchor handoff.
+  if (isNative()) return null;
   const picker = (globalThis as typeof globalThis & { showSaveFilePicker?: SavePicker }).showSaveFilePicker;
   if (!picker) return null;
   try {
@@ -1738,7 +1743,7 @@ export async function downloadPreviewWithDirectFallback(options: {
   // embedded Capacitor Filesystem/Share bridge (or a fresh Web Share tap). The
   // same sink is recreated for the one HTTP fallback, so partial P2P bytes are
   // never mixed with fallback bytes.
-  const nativeBlobSink = isNative() && options.destination == null
+  const nativeBlobSink = isNative() && options.destination == null && canUseNativeFileShare()
     ? createNativeBlobDownloadSink()
     : null;
   const destination = nativeBlobSink?.destination ?? (options.destination === undefined
@@ -1749,7 +1754,7 @@ export async function downloadPreviewWithDirectFallback(options: {
     // established HTTP browser download as the only fallback and do not start
     // an unbounded Blob/direct transfer.
     options.onMode?.(FILE_DOWNLOAD_TRANSPORT_MODE.BROWSER);
-    await (options.httpFallback ?? (() => downloadAttachment(options.serverId, options.previewHandle, options.sessionName, options.signal))());
+    await (options.httpFallback ?? (() => downloadAttachment(options.serverId, options.previewHandle, options.sessionName, options.signal)))();
     return;
   }
   if (supportsPreviewDownload(options.ws)) {
