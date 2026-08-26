@@ -88,8 +88,8 @@ const EXECUTION_PROMPT_COPY: Record<SupervisionUiLocale, ExecutionPromptCopy> = 
     ownContext: 'Use your own context: advance safe unfinished work now; do not stop at a summary or repeat completed work.',
     noSafeWork: (m) => `If none is safe, report the exact human blocker unless an already-sent external/delegated reply is required next; then use ${m.WAITING}. Do not guess. Uncommitted files alone are not completion.`,
     userRules: 'User supervision rules', taskContext: 'Task context', lastResult: 'Last result',
-    statusContract: (m) => `Include exactly one status marker: ${m.ADVANCE} only if this session can do a concrete safe step now; ${m.AUDIT_READY} implementation+validation done; ${m.NEEDS_INPUT} human input required; ${m.WAITING} a sent external/delegated reply is required next and no independent safe work remains. Pending delegated work alone is ${m.WAITING}, not ${m.ADVANCE}.`,
-    waitingHeartbeat: (minutes, m) => `Waiting check after ${minutes} minutes: check the external/delegated request. If its reply arrived, continue. If still pending but independent safe work exists, do it and use ${m.ADVANCE}; otherwise report what is pending and use ${m.WAITING}. Use ${m.AUDIT_READY} if done and ${m.NEEDS_INPUT} only for an exact human blocker. Include exactly one status marker.`,
+    statusContract: (m) => `Do all safe work possible in this turn; never use a marker instead of acting. Include exactly one status marker: ${m.ADVANCE} meaningful progress made but safe work remains at the turn boundary; ${m.AUDIT_READY} implementation+validation done; ${m.NEEDS_INPUT} human input required; ${m.WAITING} a sent external/delegated reply is required next and no independent safe work remains. Pending delegated work alone is ${m.WAITING}.`,
+    waitingHeartbeat: (minutes, m) => `Waiting check after ${minutes} minutes: check the external/delegated request. If its reply arrived, continue. If still pending but independent safe work exists, do it now; use ${m.ADVANCE} only if safe work remains at the turn boundary. Otherwise report what is pending and use ${m.WAITING}. Use ${m.AUDIT_READY} if done and ${m.NEEDS_INPUT} only for an exact human blocker. Include exactly one status marker.`,
   },
   'zh-CN': {
     auditPreamble: '同伴审计模式：先完成实现与验证；PASS 前不得暂存、提交、推送、合并、发布或部署。',
@@ -98,8 +98,8 @@ const EXECUTION_PROMPT_COPY: Record<SupervisionUiLocale, ExecutionPromptCopy> = 
     ownContext: '以你自己的上下文为准：本轮立即推进可安全处理的未完成项；不要只做总结或重复已完成工作。',
     noSafeWork: (m) => `若无可安全推进项，报告确切人工阻断；但若已发外部/委派请求且下一步需其回执，则改用 ${m.WAITING}。不要猜测。仅有未提交文件不代表已完成。`,
     userRules: '用户监督规则', taskContext: '任务上下文', lastResult: '最近结果',
-    statusContract: (m) => `回复中只用一个状态标记：${m.ADVANCE} 仅限当前会话现在能亲自执行具体安全步骤；${m.AUDIT_READY} 实现验证完成；${m.NEEDS_INPUT} 必须人工输入；${m.WAITING} 已真实发出外部/委派请求、下一步依赖回执且当前无其他安全工作。仅剩委派事项未完成时用 ${m.WAITING}，不用 ${m.ADVANCE}。`,
-    waitingHeartbeat: (minutes, m) => `等待状态检查（已等待 ${minutes} 分钟）：现在核对外部/委派请求。回执已到就继续；仍未到但有独立安全工作就立即执行并用 ${m.ADVANCE}，否则汇报等待对象并用 ${m.WAITING}。完成则用 ${m.AUDIT_READY}；只有确需人工时才用 ${m.NEEDS_INPUT}。只用一个状态标记。`,
+    statusContract: (m) => `本轮先尽量完成所有安全工作，不得用状态标记代替执行。回复中只用一个状态标记：${m.ADVANCE} 本轮已有实质进展，但到回合边界仍有安全工作；${m.AUDIT_READY} 实现验证完成；${m.NEEDS_INPUT} 必须人工输入；${m.WAITING} 已真实发出外部/委派请求、下一步依赖回执且当前无其他安全工作。仅剩委派事项未完成时用 ${m.WAITING}。`,
+    waitingHeartbeat: (minutes, m) => `等待状态检查（已等待 ${minutes} 分钟）：核对外部/委派请求。回执已到就继续；仍未到但有独立安全工作就现在执行，仅在回合结束仍有安全工作时用 ${m.ADVANCE}；否则汇报等待对象并用 ${m.WAITING}。完成则用 ${m.AUDIT_READY}；只有确需人工时才用 ${m.NEEDS_INPUT}。只用一个状态标记。`,
   },
   'zh-TW': {
     auditPreamble: '同伴審計模式：先完成實作與驗證；PASS 前不得暫存、提交、推送、合併、發佈或部署。',
@@ -108,8 +108,8 @@ const EXECUTION_PROMPT_COPY: Record<SupervisionUiLocale, ExecutionPromptCopy> = 
     ownContext: '以你自己的上下文為準：本輪立即推進可安全處理的未完成項；不要只做摘要或重複已完成工作。',
     noSafeWork: (m) => `若無可安全推進項，回報確切人工阻斷；但若已發外部/委派請求且下一步需其回執，則改用 ${m.WAITING}。不要猜測。僅有未提交檔案不代表已完成。`,
     userRules: '使用者監督規則', taskContext: '任務上下文', lastResult: '最近結果',
-    statusContract: (m) => `回覆中只用一個狀態標記：${m.ADVANCE} 僅限目前會話現在能親自執行具體安全步驟；${m.AUDIT_READY} 實作驗證完成；${m.NEEDS_INPUT} 必須人工輸入；${m.WAITING} 已真實發出外部/委派請求、下一步依賴回執且目前無其他安全工作。僅剩委派事項未完成時用 ${m.WAITING}，不用 ${m.ADVANCE}。`,
-    waitingHeartbeat: (minutes, m) => `等待狀態檢查（已等待 ${minutes} 分鐘）：現在核對外部/委派請求。回執已到就繼續；仍未到但有獨立安全工作就立即執行並用 ${m.ADVANCE}，否則回報等待對象並用 ${m.WAITING}。完成則用 ${m.AUDIT_READY}；只有確需人工時才用 ${m.NEEDS_INPUT}。只用一個狀態標記。`,
+    statusContract: (m) => `本輪先盡量完成所有安全工作，不得用狀態標記代替執行。回覆中只用一個狀態標記：${m.ADVANCE} 本輪已有實質進展，但到回合邊界仍有安全工作；${m.AUDIT_READY} 實作驗證完成；${m.NEEDS_INPUT} 必須人工輸入；${m.WAITING} 已真實發出外部/委派請求、下一步依賴回執且目前無其他安全工作。僅剩委派事項未完成時用 ${m.WAITING}。`,
+    waitingHeartbeat: (minutes, m) => `等待狀態檢查（已等待 ${minutes} 分鐘）：核對外部/委派請求。回執已到就繼續；仍未到但有獨立安全工作就現在執行，僅在回合結束仍有安全工作時用 ${m.ADVANCE}；否則回報等待對象並用 ${m.WAITING}。完成則用 ${m.AUDIT_READY}；只有確需人工時才用 ${m.NEEDS_INPUT}。只用一個狀態標記。`,
   },
   es: {
     auditPreamble: 'Modo de auditoría: termina implementación y validación; antes de PASS no prepares, confirmes, envíes, fusiones, publiques ni despliegues.',
@@ -118,8 +118,8 @@ const EXECUTION_PROMPT_COPY: Record<SupervisionUiLocale, ExecutionPromptCopy> = 
     ownContext: 'Usa tu propio contexto: avanza ahora el trabajo pendiente seguro; no te detengas en un resumen ni repitas lo completado.',
     noSafeWork: (m) => `Si nada es seguro, informa el bloqueo humano exacto, salvo que la siguiente acción requiera una respuesta externa/delegada ya solicitada; entonces usa ${m.WAITING}. No adivines. Archivos sin confirmar no implican finalización.`,
     userRules: 'Reglas de supervisión del usuario', taskContext: 'Contexto de la tarea', lastResult: 'Último resultado',
-    statusContract: (m) => `Incluye un solo marcador de estado: ${m.ADVANCE} solo si esta sesión puede ejecutar ahora un paso concreto y seguro; ${m.AUDIT_READY} implementación+validación listas; ${m.NEEDS_INPUT} intervención humana obligatoria; ${m.WAITING} ya se envió una solicitud externa/delegada, su respuesta es necesaria y no queda trabajo seguro independiente. Si solo queda trabajo delegado pendiente, usa ${m.WAITING}, no ${m.ADVANCE}.`,
-    waitingHeartbeat: (minutes, m) => `Comprobación tras ${minutes} minutos: revisa la solicitud externa/delegada. Si llegó la respuesta, continúa. Si sigue pendiente pero hay trabajo seguro independiente, hazlo y usa ${m.ADVANCE}; si no, informa qué esperas y usa ${m.WAITING}. Usa ${m.AUDIT_READY} si terminaste y ${m.NEEDS_INPUT} solo ante un bloqueo humano concreto. Incluye un solo marcador.`,
+    statusContract: (m) => `Primero completa todo el trabajo seguro posible en este turno; no uses un marcador en vez de actuar. Incluye un solo marcador de estado: ${m.ADVANCE} hubo progreso real, pero queda trabajo seguro al terminar el turno; ${m.AUDIT_READY} implementación+validación listas; ${m.NEEDS_INPUT} intervención humana obligatoria; ${m.WAITING} una solicitud externa/delegada ya enviada es necesaria y no queda trabajo seguro independiente. Si solo queda trabajo delegado pendiente, usa ${m.WAITING}.`,
+    waitingHeartbeat: (minutes, m) => `Comprobación tras ${minutes} minutos: revisa la solicitud externa/delegada. Si llegó la respuesta, continúa. Si sigue pendiente pero hay trabajo seguro independiente, hazlo ahora; usa ${m.ADVANCE} solo si queda trabajo seguro al terminar el turno. Si no, informa qué esperas y usa ${m.WAITING}. Usa ${m.AUDIT_READY} si terminaste y ${m.NEEDS_INPUT} solo ante un bloqueo humano concreto. Incluye un solo marcador.`,
   },
   ru: {
     auditPreamble: 'Режим аудита: завершите реализацию и проверку; до PASS нельзя индексировать, коммитить, отправлять, сливать, публиковать или развёртывать.',
@@ -128,8 +128,8 @@ const EXECUTION_PROMPT_COPY: Record<SupervisionUiLocale, ExecutionPromptCopy> = 
     ownContext: 'Опирайтесь на свой контекст: сейчас продвигайте безопасную незавершённую работу; не останавливайтесь на отчёте и не повторяйте готовое.',
     noSafeWork: (m) => `Если безопасных действий нет, укажите точную человеческую блокировку, кроме случая, когда следующий шаг требует ответа на уже отправленный внешний/делегированный запрос; тогда используйте ${m.WAITING}. Не угадывайте. Незакоммиченные файлы не означают завершение.`,
     userRules: 'Правила надзора пользователя', taskContext: 'Контекст задачи', lastResult: 'Последний результат',
-    statusContract: (m) => `Используйте ровно один маркер статуса: ${m.ADVANCE} только если этот сеанс сейчас сам может выполнить конкретный безопасный шаг; ${m.AUDIT_READY} реализация+проверка готовы; ${m.NEEDS_INPUT} обязателен ввод человека; ${m.WAITING} внешний/делегированный запрос уже отправлен, его ответ нужен дальше и независимой безопасной работы здесь нет. Если осталось только делегированное ожидание, используйте ${m.WAITING}, не ${m.ADVANCE}.`,
-    waitingHeartbeat: (minutes, m) => `Проверка ожидания через ${minutes} мин.: проверьте внешний/делегированный запрос. Если ответ получен, продолжайте. Если ответа нет, но есть независимая безопасная работа, выполните её и используйте ${m.ADVANCE}; иначе укажите, чего ждёте, и используйте ${m.WAITING}. ${m.AUDIT_READY} — если всё готово; ${m.NEEDS_INPUT} — только для точной человеческой блокировки. Используйте один маркер.`,
+    statusContract: (m) => `Сначала выполните всю безопасную работу, возможную в этом ходе; не заменяйте действие маркером. Используйте ровно один маркер статуса: ${m.ADVANCE} есть реальный прогресс, но на границе хода остаётся безопасная работа; ${m.AUDIT_READY} реализация+проверка готовы; ${m.NEEDS_INPUT} обязателен ввод человека; ${m.WAITING} уже отправленный внешний/делегированный запрос нужен для следующего шага и независимой безопасной работы нет. Если осталось только делегированное ожидание, используйте ${m.WAITING}.`,
+    waitingHeartbeat: (minutes, m) => `Проверка ожидания через ${minutes} мин.: проверьте внешний/делегированный запрос. Если ответ получен, продолжайте. Если ответа нет, но есть независимая безопасная работа, выполните её сейчас; используйте ${m.ADVANCE} только если на границе хода работа ещё остаётся. Иначе укажите, чего ждёте, и используйте ${m.WAITING}. ${m.AUDIT_READY} — если всё готово; ${m.NEEDS_INPUT} — только для точной человеческой блокировки. Используйте один маркер.`,
   },
   ja: {
     auditPreamble: 'ピア監査モード：実装と検証を完了し、PASS 前はステージ、コミット、プッシュ、マージ、公開、デプロイをしないでください。',
@@ -138,8 +138,8 @@ const EXECUTION_PROMPT_COPY: Record<SupervisionUiLocale, ExecutionPromptCopy> = 
     ownContext: '自分の文脈を優先し、安全に進められる未完了作業を今すぐ進めてください。要約だけで止まらず、完了済み作業を繰り返さないでください。',
     noSafeWork: (m) => `安全に進められない場合は必要な人手の障害を明示してください。ただし次の手順が送信済みの外部/委任リクエストの返信を必要とするなら ${m.WAITING} を使います。推測しないでください。未コミットファイルだけでは完了を意味しません。`,
     userRules: 'ユーザーの監督ルール', taskContext: 'タスク文脈', lastResult: '直近の結果',
-    statusContract: (m) => `状態マーカーは1つだけ：${m.ADVANCE} このセッション自身が今すぐ具体的で安全な手順を実行できる；${m.AUDIT_READY} 実装検証完了；${m.NEEDS_INPUT} 人手の入力が必須；${m.WAITING} 外部/委任リクエストを送信済みで次の手順に返信が必要かつ独立して進められる安全な作業がない。委任済み作業の完了待ちだけなら ${m.ADVANCE} ではなく ${m.WAITING}。`,
-    waitingHeartbeat: (minutes, m) => `待機開始から ${minutes} 分の確認です。外部/委任リクエストを確認してください。返信済みなら続行します。未返信でも独立した安全な作業があれば実行して ${m.ADVANCE}、なければ待機対象を報告して ${m.WAITING} を使います。完了なら ${m.AUDIT_READY}、人手が必須の場合だけ ${m.NEEDS_INPUT}。マーカーは1つだけです。`,
+    statusContract: (m) => `このターンで可能な安全な作業を先にすべて進め、マーカーを実行の代わりにしないでください。状態マーカーは1つだけ：${m.ADVANCE} 実質的に進捗したがターン境界で安全な作業が残る；${m.AUDIT_READY} 実装検証完了；${m.NEEDS_INPUT} 人手の入力が必須；${m.WAITING} 送信済みの外部/委任リクエストの返信が次に必要で、独立して進められる安全な作業がない。委任済み作業の完了待ちだけなら ${m.WAITING}。`,
+    waitingHeartbeat: (minutes, m) => `待機開始から ${minutes} 分の確認です。外部/委任リクエストを確認してください。返信済みなら続行します。未返信でも独立した安全な作業があれば今実行し、ターン終了時にも残る場合だけ ${m.ADVANCE} を使います。なければ待機対象を報告して ${m.WAITING}。完了なら ${m.AUDIT_READY}、人手が必須の場合だけ ${m.NEEDS_INPUT}。マーカーは1つだけです。`,
   },
   ko: {
     auditPreamble: '동료 감사 모드: 구현과 검증을 완료하고 PASS 전에는 스테이징, 커밋, 푸시, 병합, 게시, 배포하지 마세요.',
@@ -148,8 +148,8 @@ const EXECUTION_PROMPT_COPY: Record<SupervisionUiLocale, ExecutionPromptCopy> = 
     ownContext: '자신의 문맥을 기준으로 지금 안전한 미완료 작업을 진행하세요. 요약만 하고 멈추거나 완료한 작업을 반복하지 마세요.',
     noSafeWork: (m) => `안전하게 진행할 수 없으면 정확한 사람 개입 사유를 보고하세요. 단, 다음 단계에 이미 보낸 외부/위임 요청의 회신이 필요하면 ${m.WAITING}을 사용하세요. 추측하지 마세요. 미커밋 파일만으로 완료된 것은 아닙니다.`,
     userRules: '사용자 감독 규칙', taskContext: '작업 문맥', lastResult: '최근 결과',
-    statusContract: (m) => `상태 마커는 하나만 사용: ${m.ADVANCE} 이 세션이 지금 구체적이고 안전한 단계를 직접 실행할 수 있음; ${m.AUDIT_READY} 구현·검증 완료; ${m.NEEDS_INPUT} 사람 입력 필수; ${m.WAITING} 외부/위임 요청을 이미 보냈고 다음 단계에 회신이 필요하며 독립적으로 진행할 안전한 작업이 없음. 위임 작업의 완료만 기다린다면 ${m.ADVANCE}가 아니라 ${m.WAITING}.`,
-    waitingHeartbeat: (minutes, m) => `대기 ${minutes}분 상태 확인: 외부/위임 요청을 확인하세요. 회신이 왔으면 계속하세요. 아직 대기 중이어도 독립적인 안전 작업이 있으면 실행하고 ${m.ADVANCE}, 없으면 대기 대상을 보고하고 ${m.WAITING}을 사용하세요. 완료했으면 ${m.AUDIT_READY}, 사람 입력이 꼭 필요한 경우만 ${m.NEEDS_INPUT}. 상태 마커는 하나만 사용하세요.`,
+    statusContract: (m) => `이번 턴에 가능한 안전한 작업을 먼저 모두 수행하고, 상태 마커를 실행 대신 사용하지 마세요. 상태 마커는 하나만 사용: ${m.ADVANCE} 실질적인 진전이 있었지만 턴 경계에 안전한 작업이 남음; ${m.AUDIT_READY} 구현·검증 완료; ${m.NEEDS_INPUT} 사람 입력 필수; ${m.WAITING} 이미 보낸 외부/위임 요청의 회신이 다음 단계에 필요하고 독립적으로 진행할 안전한 작업이 없음. 위임 작업의 완료만 기다린다면 ${m.WAITING}.`,
+    waitingHeartbeat: (minutes, m) => `대기 ${minutes}분 상태 확인: 외부/위임 요청을 확인하세요. 회신이 왔으면 계속하세요. 아직 대기 중이어도 독립적인 안전 작업이 있으면 지금 수행하고, 턴 종료 시에도 남을 때만 ${m.ADVANCE}를 사용하세요. 없으면 대기 대상을 보고하고 ${m.WAITING}. 완료했으면 ${m.AUDIT_READY}, 사람 입력이 꼭 필요한 경우만 ${m.NEEDS_INPUT}. 상태 마커는 하나만 사용하세요.`,
   },
 };
 

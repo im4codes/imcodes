@@ -61,7 +61,8 @@ describe('supervision prompts', () => {
   it('gives ordinary supervised turns the same short localized status protocol', () => {
     const prompt = buildSupervisionExecutionPreamble('zh-CN');
     expect(prompt).toContain('以你自己的上下文为准');
-    expect(prompt).toContain('仅限当前会话现在能亲自执行具体安全步骤');
+    expect(prompt).toContain('不得用状态标记代替执行');
+    expect(prompt).toContain('本轮已有实质进展');
     expect(prompt).toContain('仅剩委派事项未完成时用');
     expect(prompt).toContain('<!-- IMCODES_EXEC: ADVANCE -->');
     expect(prompt).toContain('<!-- IMCODES_EXEC: AUDIT_READY -->');
@@ -69,6 +70,15 @@ describe('supervision prompts', () => {
   });
 
   it('distinguishes locally actionable work from delegated waiting in every locale', () => {
+    const actionNeedles = {
+      en: 'never use a marker instead of acting',
+      'zh-CN': '不得用状态标记代替执行',
+      'zh-TW': '不得用狀態標記代替執行',
+      es: 'no uses un marcador en vez de actuar',
+      ru: 'не заменяйте действие маркером',
+      ja: 'マーカーを実行の代わりにしない',
+      ko: '상태 마커를 실행 대신 사용하지 마세요',
+    } satisfies Record<(typeof SUPERVISION_SUPPORTED_UI_LOCALES)[number], string>;
     const statusNeedles = {
       en: 'Pending delegated work alone is',
       'zh-CN': '仅剩委派事项未完成时用',
@@ -91,6 +101,7 @@ describe('supervision prompts', () => {
     for (const locale of SUPERVISION_SUPPORTED_UI_LOCALES) {
       const prompt = buildSupervisionExecutionPreamble(locale);
       const heartbeat = buildSupervisionWaitingHeartbeatPrompt(10, locale);
+      expect(prompt).toContain(actionNeedles[locale]);
       expect(prompt).toContain(statusNeedles[locale]);
       expect(prompt).toContain(SUPERVISION_EXECUTION_STATUS_MARKERS.ADVANCE);
       expect(prompt).toContain(SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING);
@@ -104,7 +115,7 @@ describe('supervision prompts', () => {
     const heartbeat = buildSupervisionWaitingHeartbeatPrompt(10, 'zh-CN');
     expect(heartbeat).toContain('[Contract: supervision_waiting_heartbeat_v1]');
     expect(heartbeat).toContain('已等待 10 分钟');
-    expect(heartbeat).toContain('仍未到但有独立安全工作就立即执行');
+    expect(heartbeat).toContain('仍未到但有独立安全工作就现在执行');
     expect(heartbeat).toContain('<!-- IMCODES_EXEC: WAITING -->');
     expect(heartbeat).not.toContain('Waiting check');
 
