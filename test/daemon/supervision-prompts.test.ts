@@ -4,6 +4,8 @@ import {
   SUPERVISED_AUDIT_EXECUTION_PREAMBLE,
   buildSupervisedAuditExecutionPreamble,
   buildSupervisionExecutionPreamble,
+  buildSupervisionWaitingHeartbeatPrompt,
+  buildAutomaticAuditTaskPrompt,
   buildPeerAuditBriefV1,
   buildReworkBriefPrompt,
   buildSupervisionContinuePrompt,
@@ -57,6 +59,26 @@ describe('supervision prompts', () => {
     expect(prompt).toContain('<!-- IMCODES_EXEC: ADVANCE -->');
     expect(prompt).toContain('<!-- IMCODES_EXEC: AUDIT_READY -->');
     expect(prompt).not.toContain('PASS 前不得');
+  });
+
+  it('localizes waiting heartbeats and automatic audit instructions', () => {
+    const heartbeat = buildSupervisionWaitingHeartbeatPrompt(10, 'zh-CN');
+    expect(heartbeat).toContain('[Contract: supervision_waiting_heartbeat_v1]');
+    expect(heartbeat).toContain('已等待 10 分钟');
+    expect(heartbeat).toContain('<!-- IMCODES_EXEC: WAITING -->');
+    expect(heartbeat).not.toContain('Waiting check');
+
+    const audit = buildAutomaticAuditTaskPrompt({
+      attemptId: 'attempt-zh',
+      targetSession: 'deck_sub_reviewer',
+      auditMetadata: '{"kind":"supervision_audit","attemptId":"attempt-zh"}',
+      narrow: true,
+      changedPaths: ['src/example.ts'],
+      uiLocale: 'zh-CN',
+    });
+    expect(audit).toContain('只向 deck_sub_reviewer 发送一次可回执审计');
+    expect(audit).toContain('等待期间不得修改、提交、推送或部署');
+    expect(audit).not.toContain('While waiting');
   });
 
   it('builds a bounded lightweight brief with non-destructive executable validation and structured reply', () => {

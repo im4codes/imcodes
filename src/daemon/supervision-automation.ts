@@ -1,7 +1,7 @@
 import { readFile, readdir, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { getSession } from '../store/session-store.js';
+import { getSession, type SessionRecord } from '../store/session-store.js';
 import { getTransportRuntime } from '../agent/session-manager.js';
 import { PROVIDER_ERROR_CODES } from '../agent/transport-provider.js';
 import type { ServerLink } from './server-link.js';
@@ -22,11 +22,13 @@ import {
   SUPERVISION_CONTRACT_IDS,
   SUPERVISION_AUDIT_MARKER_CORRECTION_AUTOMATION_KIND,
   SUPERVISION_AUDIT_TARGET_RECOVERY_AUTOMATION_KIND,
+  SUPERVISION_WAITING_HEARTBEAT_AUTOMATION_KIND,
   SUPERVISION_DEFAULT_MAX_AUTO_CONTINUE_STREAK,
   SUPERVISION_DEFAULT_MAX_AUTO_CONTINUE_TOTAL,
   SUPERVISION_MODE,
   SUPERVISION_UNAVAILABLE_REASONS,
   extractSessionSupervisionSnapshot,
+  normalizeSessionSupervisionSnapshot,
   parseSupervisionExecutionStateDetailsFromText,
   resolveSupervisionCustomInstructionsDetail,
   normalizeSupervisionUiLocale,
@@ -38,7 +40,17 @@ import {
 import {
   buildSupervisionContinuePrompt,
   buildReworkBriefPrompt,
+  buildAutomaticAuditTaskPrompt,
+  buildAuditMarkerCorrectionPrompt,
+  buildAuditTargetRecoveryPrompt,
+  buildSupervisionWaitingHeartbeatPrompt,
 } from './supervision-prompts.js';
+import {
+  getSupervisionStateStore,
+  SUPERVISION_STATE_VERSION,
+  type PersistedSupervisionSessionIdentity,
+  type PersistedSupervisionWaitState,
+} from './supervision-state-store.js';
 import {
   AGENT_DELEGATION_COMPLETION_NOTIFICATION_MARKER,
   AGENT_DELEGATION_PURPOSES,
@@ -50,7 +62,6 @@ import {
 } from '../../shared/agent-delegation.js';
 import {
   PEER_AUDIT_DEADLINE_MS,
-  PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS,
   parsePeerAuditOrchestratedResult,
   sanitizePeerAuditUntrustedText,
   type PeerAuditTerminalOutcome,
@@ -67,6 +78,7 @@ import {
   type DelegationReplyRecord,
 } from './delegation-reply-store.js';
 import { onDelegationReplyDelivered } from './delegation-reply-events.js';
+import { getSessionRuntimeType } from '../../shared/agent-types.js';
 
 /**
  * Apply the daemon-cached global supervisor runtime to every session. Session
@@ -123,6 +135,7 @@ const SUPERVISION_PARKED_LABEL = 'Supervised: parked until the pending reply arr
  * would strand the run silently instead of surfacing to the human.
  */
 const SUPERVISION_WAITING_TIMEOUT_MS = 30 * 60_000;
+const SUPERVISION_WAITING_HEARTBEAT_MS = 10 * 60_000;
 const AUDIT_TARGET_MAX_RECOVERY_CONTINUES = 2;
 /**
  * Provider/runtime projections are not guaranteed to publish the final
@@ -168,6 +181,7 @@ interface ActiveTaskRunState {
   auditAttemptId?: string;
   auditDelegationId?: string;
   auditStartedAt?: number;
+  auditDeadlineAt?: number;
   auditReplyObserved: boolean;
   /** One bounded self-heal turn when the orchestrator omits/duplicates the marker. */
   auditVerdictCorrectionAttempts: number;
@@ -182,6 +196,13 @@ interface ActiveTaskRunState {
   auditTargetRecoveryTimer?: NodeJS.Timeout;
   /** Safety net for a parked run whose awaited reply never arrives. */
   waitingTimeoutTimer?: NodeJS.Timeout;
+  /** Periodic status request while a reported external reply remains pending. */
+  waitingHeartbeatTimer?: NodeJS.Timeout;
+  /** Original wait boundary; repeated WAITING replies must not reset it. */
+  waitingStartedAt?: number;
+  waitingDeadlineAt?: number;
+  waitingNextHeartbeatAt?: number;
+  waitingEvaluationPending?: boolean;
   /** Bounded wait for a final assistant row that raced behind `idle`. */
   completionGraceTimer?: NodeJS.Timeout;
   /** Wall-clock start of the current no-activity-evidence wait. */
@@ -229,6 +250,38 @@ interface RecoveredImplicitCompletion {
   candidate: RecentTaskCandidate;
   latestAssistant: LatestAssistantText;
   completionKey: string;
+}
+
+function persistedSessionIdentity(record: SessionRecord): PersistedSupervisionSessionIdentity | undefined {
+  if (!record.sessionInstanceId) return undefined;
+  return {
+    sessionName: record.name,
+    sessionInstanceId: record.sessionInstanceId,
+    agentType: record.agentType,
+    runtimeType: record.runtimeType ?? getSessionRuntimeType(record.agentType),
+    ...(record.runtimeEpoch ? { runtimeEpoch: record.runtimeEpoch } : {}),
+    ...(record.providerId ? { providerId: record.providerId } : {}),
+    ...(record.providerSessionId ? { providerSessionId: record.providerSessionId } : {}),
+    ...(record.providerResumeId ? { providerResumeId: record.providerResumeId } : {}),
+  };
+}
+
+function persistedIdentityMatches(
+  persisted: PersistedSupervisionSessionIdentity,
+  current: SessionRecord | undefined,
+): boolean {
+  if (!current?.sessionInstanceId) return false;
+  if (persisted.sessionName !== current.name || persisted.sessionInstanceId !== current.sessionInstanceId) return false;
+  if (persisted.agentType !== current.agentType) return false;
+  if (persisted.runtimeType !== (current.runtimeType ?? getSessionRuntimeType(current.agentType))) return false;
+  // runtimeEpoch is expected to rotate when the daemon/provider authority is
+  // recreated. Stable logical/provider session identifiers must still match;
+  // model selection is deliberately not identity because it may change within
+  // the same conversation.
+  if (persisted.providerId !== current.providerId) return false;
+  if (persisted.providerSessionId !== current.providerSessionId) return false;
+  if (persisted.providerResumeId !== current.providerResumeId) return false;
+  return true;
 }
 
 function isDelegatedAuditReplyText(text: string | undefined): boolean {
@@ -795,6 +848,7 @@ function isFinalAssistantPayload(payload: Record<string, unknown>): boolean {
 }
 
 class SupervisionAutomation {
+  private readonly stateStore = getSupervisionStateStore();
   private activeRuns = new Map<string, ActiveTaskRunState>();
   private pendingTaskIntents = new Map<string, PendingTaskIntent>();
   private recentTaskCandidates = new Map<string, RecentTaskCandidate>();
@@ -862,6 +916,7 @@ class SupervisionAutomation {
     onDelegationReplyDelivered((record) => {
       this.handleStructuredDelegationReplyDelivered(record);
     });
+    this.restorePersistedWaitStates();
   }
 
   setServerLink(_serverLink: ServerLink | null): void {
@@ -879,9 +934,10 @@ class SupervisionAutomation {
     // A deleted run must not leave any completion timer armed. Generations are
     // monotonic, but clearing eagerly avoids retaining stale run state.
     if (state) {
-      this.clearWaitingTimeout(state);
+      this.clearWaitingTimers(state);
       this.clearCompletionGrace(state);
     }
+    this.deletePersistedWaitState(sessionName);
     this.clearImplicitCompletionGrace(sessionName);
     this.activeRuns.delete(sessionName);
     this.pendingTaskIntents.delete(sessionName);
@@ -915,9 +971,10 @@ class SupervisionAutomation {
         this.clearAuditTargetRecovery(run);
         this.emitOrchestratedAuditResult(run, 'cancelled', 'audit_target_user_stopped');
       }
-      this.clearWaitingTimeout(run);
+      this.clearWaitingTimers(run);
       this.clearCompletionGrace(run);
       this.activeRuns.delete(run.sessionName);
+      this.deletePersistedWaitState(run.sessionName);
       this.clearStatus(run.sessionName);
       this.emitWarning(
         run.sessionName,
@@ -1338,7 +1395,11 @@ class SupervisionAutomation {
       this.clearAuditTargetRecovery(existing);
       this.emitOrchestratedAuditResult(existing, 'cancelled', 'new_task_intent_replaced_existing_audit');
     }
-    if (existing) this.clearCompletionGrace(existing);
+    if (existing) {
+      this.clearWaitingTimers(existing);
+      this.clearCompletionGrace(existing);
+      this.deletePersistedWaitState(sessionName);
+    }
     const generation = ++this.nextRunGeneration;
     const next: ActiveTaskRunState = {
       generation,
@@ -1372,9 +1433,207 @@ class SupervisionAutomation {
     return this.activeRuns.get(sessionName);
   }
 
-  private clearWaitingTimeout(run: ActiveTaskRunState): void {
+  private clearWaitingTimers(
+    run: ActiveTaskRunState,
+    options: { preserveWindow?: boolean } = {},
+  ): void {
     if (run.waitingTimeoutTimer) clearTimeout(run.waitingTimeoutTimer);
+    if (run.waitingHeartbeatTimer) clearTimeout(run.waitingHeartbeatTimer);
     run.waitingTimeoutTimer = undefined;
+    run.waitingHeartbeatTimer = undefined;
+    if (!options.preserveWindow) {
+      run.waitingStartedAt = undefined;
+      run.waitingDeadlineAt = undefined;
+      run.waitingNextHeartbeatAt = undefined;
+    }
+  }
+
+  private deletePersistedWaitState(sessionName: string): void {
+    try {
+      this.stateStore.delete(sessionName);
+    } catch (error) {
+      logger.warn({ session: sessionName, err: error }, 'Supervision durable wait-state delete failed');
+    }
+  }
+
+  private persistWaitState(run: ActiveTaskRunState, phase: PersistedSupervisionWaitState['phase']): void {
+    const ownerRecord = getSession(run.sessionName);
+    const owner = ownerRecord ? persistedSessionIdentity(ownerRecord) : undefined;
+    if (!owner) {
+      logger.warn({ session: run.sessionName }, 'Supervision wait state lacks a stable session identity; durable recovery disabled');
+      return;
+    }
+    const targetRecord = run.snapshot.auditTargetSessionName
+      ? getSession(run.snapshot.auditTargetSessionName)
+      : undefined;
+    const auditTarget = targetRecord ? persistedSessionIdentity(targetRecord) : undefined;
+    const now = Date.now();
+    const state: PersistedSupervisionWaitState = {
+      version: SUPERVISION_STATE_VERSION,
+      owner,
+      commandId: run.commandId,
+      snapshot: run.snapshot,
+      userText: run.userText,
+      phase,
+      requiresAudit: run.requiresAudit,
+      freshAuditRequiredAfterRework: run.freshAuditRequiredAfterRework,
+      continueLoops: run.continueLoops,
+      continueStreakCount: run.continueStreakCount,
+      ...(run.lastContinueBucket ? { lastContinueBucket: run.lastContinueBucket } : {}),
+      reworkDispatches: run.reworkDispatches,
+      startedAt: run.startedAt,
+      ...(run.auditDepth ? { auditDepth: run.auditDepth } : {}),
+      ...(run.deferredFinalization ? { deferredFinalization: run.deferredFinalization } : {}),
+      ...(run.waitingStartedAt !== undefined ? { waitingStartedAt: run.waitingStartedAt } : {}),
+      ...(run.waitingDeadlineAt !== undefined ? { waitingDeadlineAt: run.waitingDeadlineAt } : {}),
+      ...(run.waitingNextHeartbeatAt !== undefined ? { waitingNextHeartbeatAt: run.waitingNextHeartbeatAt } : {}),
+      ...(run.auditAttemptId ? { auditAttemptId: run.auditAttemptId } : {}),
+      ...(run.auditDelegationId ? { auditDelegationId: run.auditDelegationId } : {}),
+      ...(run.auditStartedAt !== undefined ? { auditStartedAt: run.auditStartedAt } : {}),
+      ...(run.auditDeadlineAt !== undefined ? { auditDeadlineAt: run.auditDeadlineAt } : {}),
+      auditReplyObserved: run.auditReplyObserved,
+      ...(auditTarget ? { auditTarget } : {}),
+      ...(run.auditTargetDispatchObservedAt !== undefined
+        ? { auditTargetDispatchObservedAt: run.auditTargetDispatchObservedAt }
+        : {}),
+      auditTargetObservedActive: run.auditTargetObservedActive,
+      auditTargetRecoveryAttempts: run.auditTargetRecoveryAttempts,
+      auditTargetRecoveryLimitNotified: run.auditTargetRecoveryLimitNotified,
+      auditVerdictCorrectionAttempts: run.auditVerdictCorrectionAttempts,
+      auditMarkerWarningEmitted: run.auditMarkerWarningEmitted,
+      ...(run.sawAssistantOutput && run.lastAssistantText !== undefined
+        ? { pendingAssistantText: run.lastAssistantText }
+        : {}),
+      ...(run.sawAssistantOutput && run.lastAssistantCompletionKey
+        ? { pendingAssistantCompletionKey: run.lastAssistantCompletionKey }
+        : {}),
+      updatedAt: now,
+    };
+    try {
+      this.stateStore.upsert(state);
+    } catch (error) {
+      logger.warn({ session: run.sessionName, phase, err: error }, 'Supervision durable wait-state persist failed');
+    }
+  }
+
+  private restorePersistedWaitStates(): void {
+    let persistedStates: PersistedSupervisionWaitState[];
+    try {
+      persistedStates = this.stateStore.list();
+    } catch (error) {
+      logger.warn({ err: error }, 'Supervision durable wait-state restore failed');
+      return;
+    }
+    for (const persisted of persistedStates) {
+      if (this.activeRuns.has(persisted.owner.sessionName)) continue;
+      const ownerRecord = getSession(persisted.owner.sessionName);
+      const snapshot = normalizeSessionSupervisionSnapshot(persisted.snapshot);
+      if (!persistedIdentityMatches(persisted.owner, ownerRecord)
+        || !snapshot
+        || snapshot.mode === SUPERVISION_MODE.OFF) {
+        this.deletePersistedWaitState(persisted.owner.sessionName);
+        continue;
+      }
+      if (persisted.phase === 'auditing') {
+        const targetRecord = persisted.auditTarget ? getSession(persisted.auditTarget.sessionName) : undefined;
+        if (!persisted.auditAttemptId
+          || !persisted.auditTarget
+          || !persistedIdentityMatches(persisted.auditTarget, targetRecord)) {
+          this.deletePersistedWaitState(persisted.owner.sessionName);
+          this.emitTerminalStatus(persisted.owner.sessionName, 'supervision_needs_input', SUPERVISION_NEEDS_INPUT_LABEL);
+          this.emitWarning(persisted.owner.sessionName, 'Supervision could not restore the exact peer-audit session identity after restart. Manual review is required.');
+          continue;
+        }
+      }
+
+      const run: ActiveTaskRunState = {
+        generation: ++this.nextRunGeneration,
+        sessionName: persisted.owner.sessionName,
+        commandId: persisted.commandId,
+        snapshot,
+        hasLiveSnapshotUpdate: false,
+        userText: persisted.userText,
+        phase: persisted.phase === 'waiting' ? 'execution' : 'auditing',
+        requiresAudit: persisted.requiresAudit,
+        freshAuditRequiredAfterRework: persisted.freshAuditRequiredAfterRework,
+        continueLoops: persisted.continueLoops,
+        continueStreakCount: persisted.continueStreakCount,
+        ...(persisted.lastContinueBucket ? { lastContinueBucket: persisted.lastContinueBucket } : {}),
+        evaluating: false,
+        sawAssistantOutput: persisted.pendingAssistantText !== undefined,
+        ...(persisted.pendingAssistantText !== undefined
+          ? { lastAssistantText: persisted.pendingAssistantText }
+          : {}),
+        ...(persisted.pendingAssistantCompletionKey
+          ? { lastAssistantCompletionKey: persisted.pendingAssistantCompletionKey }
+          : {}),
+        reworkDispatches: persisted.reworkDispatches,
+        auditReplyObserved: persisted.auditReplyObserved,
+        auditVerdictCorrectionAttempts: persisted.auditVerdictCorrectionAttempts,
+        auditMarkerWarningEmitted: persisted.auditMarkerWarningEmitted,
+        auditTargetObservedActive: persisted.auditTargetObservedActive,
+        auditTargetRecoveryAttempts: persisted.auditTargetRecoveryAttempts,
+        auditTargetRecoveryLimitNotified: persisted.auditTargetRecoveryLimitNotified,
+        startedAt: persisted.startedAt,
+        ...(persisted.auditDepth ? { auditDepth: persisted.auditDepth } : {}),
+        ...(persisted.deferredFinalization ? { deferredFinalization: persisted.deferredFinalization } : {}),
+        ...(persisted.waitingStartedAt !== undefined ? { waitingStartedAt: persisted.waitingStartedAt } : {}),
+        ...(persisted.waitingDeadlineAt !== undefined ? { waitingDeadlineAt: persisted.waitingDeadlineAt } : {}),
+        ...(persisted.waitingNextHeartbeatAt !== undefined
+          ? { waitingNextHeartbeatAt: persisted.waitingNextHeartbeatAt }
+          : {}),
+        ...(persisted.phase === 'waiting' && persisted.pendingAssistantText !== undefined
+          ? { waitingEvaluationPending: true }
+          : {}),
+        ...(persisted.auditAttemptId ? { auditAttemptId: persisted.auditAttemptId } : {}),
+        ...(persisted.auditDelegationId ? { auditDelegationId: persisted.auditDelegationId } : {}),
+        ...(persisted.auditStartedAt !== undefined ? { auditStartedAt: persisted.auditStartedAt } : {}),
+        ...(persisted.auditDeadlineAt !== undefined ? { auditDeadlineAt: persisted.auditDeadlineAt } : {}),
+        ...(persisted.auditTarget?.sessionInstanceId
+          ? { auditTargetSessionInstanceId: persisted.auditTarget.sessionInstanceId }
+          : {}),
+        ...(persisted.auditTargetDispatchObservedAt !== undefined
+          ? { auditTargetDispatchObservedAt: persisted.auditTargetDispatchObservedAt }
+          : {}),
+      };
+      this.activeRuns.set(run.sessionName, run);
+      if (persisted.phase === 'waiting') {
+        if (run.waitingEvaluationPending) {
+          run.evaluating = true;
+          this.emitCheckingState(run.sessionName);
+          queueMicrotask(() => {
+            void this.evaluateExecutionTurn(run).catch((error) => {
+              logger.warn({ session: run.sessionName, err: error }, 'Restored supervision waiting evaluation failed');
+              this.finishRun(run.sessionName, 'needs_input');
+            });
+          });
+        } else {
+          this.emitStatus(run.sessionName, 'supervision_parked', SUPERVISION_PARKED_LABEL);
+          this.armWaitingTimers(run, { preserveSchedule: true });
+        }
+      } else {
+        this.emitStatus(run.sessionName, 'supervision_audit_waiting', SUPERVISION_AUDIT_WAITING_LABEL);
+        this.armAuditDeadline(run, { preserveDeadline: true });
+        if (run.auditReplyObserved && run.sawAssistantOutput) {
+          queueMicrotask(() => this.handleOrchestratedAuditCompletion(run, { settledWithoutIdle: true }));
+        }
+      }
+    }
+  }
+
+  /** Simulates process-memory loss while retaining SQLite authority. */
+  __simulateProcessRestartForTests(): void {
+    for (const run of this.activeRuns.values()) {
+      this.clearWaitingTimers(run, { preserveWindow: true });
+      this.clearAuditDeadline(run);
+      this.clearAuditTargetRecoveryTimer(run);
+      this.clearCompletionGrace(run);
+    }
+    this.activeRuns.clear();
+    this.pendingTaskIntents.clear();
+    this.recentTaskCandidates.clear();
+    this.latestAssistantTexts.clear();
+    this.restorePersistedWaitStates();
   }
 
   private clearCompletionGrace(run: ActiveTaskRunState): void {
@@ -1550,6 +1809,7 @@ class SupervisionAutomation {
     run.auditAttemptId = options.auditAttemptId;
     run.auditDelegationId = options.delegationId;
     run.auditStartedAt = Date.now();
+    run.auditDeadlineAt = undefined;
     run.auditTargetSessionInstanceId = target.sessionInstanceId;
     run.auditTargetDispatchObservedAt = Date.now();
     run.auditTargetObservedActive = true;
@@ -1661,6 +1921,7 @@ class SupervisionAutomation {
     run.auditMarkerWarningEmitted = false;
     run.sawAssistantOutput = false;
     run.lastAssistantText = undefined;
+    this.persistWaitState(run, 'auditing');
     this.emitStatus(run.sessionName, 'supervision_audit_waiting', SUPERVISION_AUDIT_WAITING_LABEL);
     this.emitAutomationNote(
       run.sessionName,
@@ -1837,15 +2098,26 @@ class SupervisionAutomation {
   }
 
   /**
-   * Bound how long a parked run may sit with no reply.
-   *
-   * Re-armed on every park, and cancelled implicitly by the generation/phase
-   * guard once the run moves on. This is a safety net, NOT the wake path — the
-   * awaited reply produces a new assistant turn, which re-enters evaluation on
-   * its own.
+   * Keep a parked run observable without turning the heartbeat into normal
+   * task advancement. The ten-minute prompt does not consume continue-loop
+   * budgets. Its 30-minute hard deadline is anchored to the FIRST WAITING
+   * result and is persisted in SQLite, so repeated WAITING replies or daemon
+   * restarts cannot silently grant a fresh window.
    */
-  private armWaitingTimeout(run: ActiveTaskRunState): void {
-    if (run.waitingTimeoutTimer) clearTimeout(run.waitingTimeoutTimer);
+  private armWaitingTimers(
+    run: ActiveTaskRunState,
+    options: { preserveSchedule?: boolean } = {},
+  ): void {
+    this.clearWaitingTimers(run, { preserveWindow: true });
+    const now = Date.now();
+    run.waitingStartedAt ??= now;
+    run.waitingDeadlineAt ??= run.waitingStartedAt + SUPERVISION_WAITING_TIMEOUT_MS;
+    if (!options.preserveSchedule || run.waitingNextHeartbeatAt === undefined) {
+      run.waitingNextHeartbeatAt = Math.min(
+        run.waitingStartedAt + SUPERVISION_WAITING_HEARTBEAT_MS,
+        run.waitingDeadlineAt,
+      );
+    }
     const generation = run.generation;
     const phase = run.phase;
     let timer: NodeJS.Timeout;
@@ -1865,16 +2137,94 @@ class SupervisionAutomation {
         'The awaited reply did not arrive within the parked-wait limit; handing control back to the human.',
       );
       this.finishRun(latest.sessionName, 'needs_input');
-    }, SUPERVISION_WAITING_TIMEOUT_MS);
+    }, Math.max(0, run.waitingDeadlineAt - now));
     timer.unref?.();
     run.waitingTimeoutTimer = timer;
+
+    this.armNextWaitingHeartbeat(run, generation, phase);
+    this.persistWaitState(run, 'waiting');
+  }
+
+  private armNextWaitingHeartbeat(
+    run: ActiveTaskRunState,
+    generation = run.generation,
+    phase = run.phase,
+  ): void {
+    if (run.waitingHeartbeatTimer) clearTimeout(run.waitingHeartbeatTimer);
+    run.waitingHeartbeatTimer = undefined;
+    if (run.waitingNextHeartbeatAt === undefined
+      || run.waitingDeadlineAt === undefined
+      || run.waitingNextHeartbeatAt >= run.waitingDeadlineAt) return;
+    let heartbeatTimer: NodeJS.Timeout;
+    heartbeatTimer = setTimeout(() => {
+      const latest = this.activeRuns.get(run.sessionName);
+      if (!latest || latest.waitingHeartbeatTimer !== heartbeatTimer) return;
+      if (latest.generation !== generation || latest.phase !== phase || latest.evaluating) return;
+      latest.waitingHeartbeatTimer = undefined;
+      this.dispatchWaitingHeartbeat(latest);
+    }, Math.max(0, run.waitingNextHeartbeatAt - Date.now()));
+    heartbeatTimer.unref?.();
+    run.waitingHeartbeatTimer = heartbeatTimer;
+  }
+
+  private dispatchWaitingHeartbeat(run: ActiveTaskRunState): void {
+    const current = this.activeRuns.get(run.sessionName);
+    if (!current || current.generation !== run.generation || current.phase !== 'execution') return;
+    const now = Date.now();
+    if (!current.waitingStartedAt || !current.waitingDeadlineAt || now >= current.waitingDeadlineAt) return;
+    const waitedMinutes = Math.max(1, Math.floor((now - current.waitingStartedAt) / 60_000));
+    const heartbeatPrompt = buildSupervisionWaitingHeartbeatPrompt(waitedMinutes, current.snapshot.uiLocale);
+    const heartbeatId = `${SUPERVISION_WAITING_HEARTBEAT_AUTOMATION_KIND}:${current.generation}:${now}`;
+    current.waitingNextHeartbeatAt = Math.min(
+      now + SUPERVISION_WAITING_HEARTBEAT_MS,
+      current.waitingDeadlineAt,
+    );
+    current.sawAssistantOutput = false;
+    current.lastAssistantText = undefined;
+    current.terminalState = undefined;
+    // Persist the next due time before dispatch. A crash after delivery must
+    // not replay this heartbeat immediately on process restart.
+    this.armNextWaitingHeartbeat(current);
+    this.persistWaitState(current, 'waiting');
+
+    timelineEmitter.emit(
+      current.sessionName,
+      'user.message',
+      {
+        text: heartbeatPrompt,
+        clientMessageId: heartbeatId,
+        allowDuplicate: true,
+        automation: true,
+        automationKind: SUPERVISION_WAITING_HEARTBEAT_AUTOMATION_KIND,
+        memoryExcluded: true,
+      },
+      { source: 'daemon', confidence: 'high', eventId: heartbeatId },
+    );
+    const runtime = getTransportRuntime(current.sessionName);
+    if (!runtime) {
+      this.emitWarning(current.sessionName, 'The waiting-status heartbeat could not reach the execution session; the original wait deadline remains active.');
+      return;
+    }
+    try {
+      runtime.send(heartbeatPrompt, heartbeatId);
+      this.emitAutomationNote(
+        current.sessionName,
+        `Auto: requested a waiting-status update after ${waitedMinutes} minutes; the original deadline was preserved.`,
+        SUPERVISION_WAITING_HEARTBEAT_AUTOMATION_KIND,
+      );
+    } catch (error) {
+      logger.warn({ session: current.sessionName, err: error }, 'Supervision waiting heartbeat dispatch failed');
+      this.emitWarning(current.sessionName, 'The waiting-status heartbeat failed; the original wait deadline remains active.');
+    }
   }
 
   private continueFailedAuditTarget(run: ActiveTaskRunState, failedState: string): void {
     const targetName = run.snapshot.auditTargetSessionName;
+    const attemptId = run.auditAttemptId;
     const target = targetName ? getSession(targetName) : undefined;
     if (
       !targetName
+      || !attemptId
       || !target
       || target.sessionInstanceId !== run.auditTargetSessionInstanceId
     ) {
@@ -1893,17 +2243,15 @@ class SupervisionAutomation {
     if (run.auditTargetRecoveryAttempts >= AUDIT_TARGET_MAX_RECOVERY_CONTINUES) return;
 
     const recoveryNumber = run.auditTargetRecoveryAttempts + 1;
-    const recoveryPrompt = [
-      `[Contract: ${SUPERVISION_CONTRACT_IDS.AUDIT_TARGET_RECOVERY}]`,
-      'Continue the in-progress automatic peer audit. The previous audit turn stopped before returning its result because of a runtime or provider failure.',
-      `Audited session ID: ${run.sessionName}`,
-      `Audit target session ID: ${targetName}`,
-      `Automatic audit attempt ID: ${run.auditAttemptId}`,
-      `Observed failed state: ${failedState}`,
-      'Resume the same audit from the evidence already available in this session. Do not start or delegate a new audit, do not change the implementation, and do not commit or push.',
-      buildAgentDelegationReplyInstruction(run.sessionName),
-    ].join('\n');
-    const clientMessageId = `${SUPERVISION_AUDIT_TARGET_RECOVERY_AUTOMATION_KIND}:${run.auditAttemptId}:${recoveryNumber}`;
+    const recoveryPrompt = buildAuditTargetRecoveryPrompt({
+      auditedSession: run.sessionName,
+      auditTargetSession: targetName,
+      attemptId,
+      failedState,
+      replyInstruction: buildAgentDelegationReplyInstruction(run.sessionName),
+      uiLocale: run.snapshot.uiLocale,
+    });
+    const clientMessageId = `${SUPERVISION_AUDIT_TARGET_RECOVERY_AUTOMATION_KIND}:${attemptId}:${recoveryNumber}`;
     run.auditTargetRecoveryAttempts = recoveryNumber;
     try {
       runtime.send(recoveryPrompt, clientMessageId);
@@ -1966,6 +2314,7 @@ class SupervisionAutomation {
         activeRun.auditMarkerWarningEmitted = false;
         activeRun.sawAssistantOutput = false;
         activeRun.lastAssistantText = undefined;
+        this.persistWaitState(activeRun, 'auditing');
         this.emitStatus(activeRun.sessionName, 'supervision_audit_waiting', SUPERVISION_AUDIT_WAITING_LABEL);
         this.emitAutomationNote(activeRun.sessionName, 'Auto: the delegated audit reply arrived; waiting for this session to produce the final PASS/REWORK judgment.', 'supervision-audit-reply-received');
       }
@@ -2018,6 +2367,12 @@ class SupervisionAutomation {
       run.lastAssistantText = text;
       run.lastAssistantCompletionKey = completionKey;
       run.sawAssistantOutput = true;
+      if (run.phase === 'execution' && run.waitingStartedAt !== undefined) {
+        run.waitingEvaluationPending = true;
+        this.persistWaitState(run, 'waiting');
+      } else if (run.phase === 'auditing' && run.auditReplyObserved) {
+        this.persistWaitState(run, 'auditing');
+      }
       if ((run.phase === 'execution' || run.phase === 'finalizing') && !run.evaluating) {
         if (this.lastObservedSessionStates.get(event.sessionId) === 'idle') {
           this.evaluateIdleRun(run);
@@ -2138,7 +2493,7 @@ class SupervisionAutomation {
     // produced this turn, so the run is no longer parked; leaving the timer
     // armed across the await lets it fire mid-decision, finish the run, and
     // silently discard the very verdict it was waiting for.
-    this.clearWaitingTimeout(current);
+    this.clearWaitingTimers(current, { preserveWindow: true });
 
     // Normal execution turns carry one exact, prefixed status marker. Trusting
     // that small protocol avoids a supervisor-model call on every step; absent
@@ -2173,7 +2528,7 @@ class SupervisionAutomation {
     latest.evaluating = false;
     // A new evaluation means the park (if any) is over; the branch below
     // re-arms it when the decision is still `waiting`.
-    this.clearWaitingTimeout(latest);
+    this.clearWaitingTimers(latest, { preserveWindow: true });
     const reportedAuditPass = !latest.freshAuditRequiredAfterRework
       && parseExplicitAuditVerdict(latest.lastAssistantText ?? '') === 'PASS';
     const deterministicAuditRequired = latest.snapshot.mode === SUPERVISION_MODE.SUPERVISED_AUDIT
@@ -2345,7 +2700,11 @@ class SupervisionAutomation {
           `Auto: parked while waiting — ${decision.reason}`,
           'supervision-parked',
         );
-        this.armWaitingTimeout(latest);
+        latest.waitingEvaluationPending = false;
+        latest.sawAssistantOutput = false;
+        latest.lastAssistantText = undefined;
+        latest.lastAssistantCompletionKey = undefined;
+        this.armWaitingTimers(latest, { preserveSchedule: true });
         return;
       }
       case 'ask_human':
@@ -2414,7 +2773,11 @@ class SupervisionAutomation {
       case 'waiting':
         this.emitStatus(current.sessionName, 'supervision_parked', SUPERVISION_PARKED_LABEL);
         this.emitAutomationNote(current.sessionName, 'Auto: parked on the executing session\'s reported external reply.', 'supervision-parked');
-        this.armWaitingTimeout(current);
+        current.waitingEvaluationPending = false;
+        current.sawAssistantOutput = false;
+        current.lastAssistantText = undefined;
+        current.lastAssistantCompletionKey = undefined;
+        this.armWaitingTimers(current, { preserveSchedule: true });
         return;
     }
   }
@@ -2456,9 +2819,10 @@ class SupervisionAutomation {
     if (!run) return;
     this.clearAuditDeadline(run);
     this.clearAuditTargetRecovery(run);
-    this.clearWaitingTimeout(run);
+    this.clearWaitingTimers(run);
     this.clearCompletionGrace(run);
     this.clearImplicitCompletionGrace(sessionName);
+    this.deletePersistedWaitState(sessionName);
     run.terminalState = state;
     this.activeRuns.delete(sessionName);
     if (!options.preserveStatus) this.clearStatus(sessionName);
@@ -2466,6 +2830,8 @@ class SupervisionAutomation {
 
   private async startAudit(run: ActiveTaskRunState): Promise<void> {
     if (run.phase !== 'execution' || this.activeRuns.get(run.sessionName)?.generation !== run.generation) return;
+    this.clearWaitingTimers(run);
+    this.deletePersistedWaitState(run.sessionName);
     // Daemon-owned audits can start directly from a `complete` broker decision,
     // bypassing the `continue` branch that normally captures held repository
     // finalization. Record only explicit task/rule requirements here so PASS
@@ -2496,6 +2862,7 @@ class SupervisionAutomation {
     current.auditAttemptId = randomUUID();
     current.auditDelegationId = undefined;
     current.auditStartedAt = Date.now();
+    current.auditDeadlineAt = undefined;
     current.auditTargetSessionInstanceId = undefined;
     current.auditTargetDispatchObservedAt = undefined;
     current.auditTargetObservedActive = false;
@@ -2544,33 +2911,28 @@ class SupervisionAutomation {
 
     current.auditTargetSessionInstanceId = target.sessionInstanceId;
 
-    const auditTask = [
-      'Ask the selected delegate to independently audit this session\'s most recent work and return PASS or REWORK with concrete evidence, prioritized defects, and unavailable checks.',
-      ...(current.auditDepth === 'narrow'
-        ? ['Scope: this change is NARROW; inspect the diff and its direct blast radius, using proportionate executable evidence.']
-        : []),
-      'You—not the daemon—must prepare the brief from the real current context.',
-      `Automatic audit attempt ID: ${current.auditAttemptId}. Include this exact attempt ID in the delegated audit brief; send exactly one reply-enabled audit request to ${targetName}. Do not choose another session or send a second audit while this attempt is pending.`,
-      `For send_message use reply=true and audit=${JSON.stringify({
+    const auditTask = buildAutomaticAuditTaskPrompt({
+      attemptId: current.auditAttemptId,
+      targetSession: targetName,
+      auditMetadata: JSON.stringify({
         kind: AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT,
         attemptId: current.auditAttemptId,
-      })}; this metadata is required.`,
-      'While waiting: do not modify, commit, push, or deploy.',
-      // Keep the result contract ahead of variable baseline context. The
-      // delegation renderer bounds task text, and a large OpenSpec/path list
-      // must never truncate away the PASS/REWORK markers that close the audit.
-      `After the reply, report the findings and end with exactly one matching marker: ${PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS.PASS} or ${PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS.REWORK}. Emit neither marker before the reply.`,
-      'Automatic audit cycle: PASS releases any remaining delivery/finalization. REWORK makes the daemon feed the findings back into this same session as one repair turn with the exact re-audit target. After fixing and validating, this same session must prepare and send the fresh reply-enabled re-audit itself; do not wait for another user/supervisor prompt. Repeat until PASS or an exact blocker/safety limit. Do not self-start a duplicate audit before the REWORK repair is complete; supervision should only need to kick again if progress truly stalls.',
-      baseline.changeDir ? `Relevant OpenSpec change: ${baseline.changeDir}` : '',
-      baseline.fileContents.length > 0
-        ? `Observed changed paths: ${baseline.fileContents.map((entry) => entry.path).join(', ')}`
-        : '',
-    ].filter(Boolean).join('\n');
+      }),
+      narrow: current.auditDepth === 'narrow',
+      ...(baseline.changeDir ? { changeDir: baseline.changeDir } : {}),
+      changedPaths: baseline.fileContents.map((entry) => entry.path),
+      uiLocale: current.snapshot.uiLocale,
+    });
     const orchestrationPrompt = buildAgentDelegationOrchestrationPrompt({
       targetSession: targetName,
       targetLabel: target.label,
       task: auditTask,
+      uiLocale: current.snapshot.uiLocale,
     });
+    // Persist the exact owner/auditor identities, attempt and original
+    // deadline before dispatch. A daemon crash immediately after provider
+    // admission must restore this same audit instead of issuing a duplicate.
+    this.armAuditDeadline(current);
     timelineEmitter.emit(
       current.sessionName,
       'user.message',
@@ -2586,11 +2948,18 @@ class SupervisionAutomation {
       this.finishRun(current.sessionName, 'needs_input');
       return;
     }
-    this.armAuditDeadline(current);
   }
 
-  private armAuditDeadline(run: ActiveTaskRunState): void {
+  private armAuditDeadline(
+    run: ActiveTaskRunState,
+    options: { preserveDeadline?: boolean } = {},
+  ): void {
     this.clearAuditDeadline(run);
+    const now = Date.now();
+    run.auditStartedAt ??= now;
+    if (!options.preserveDeadline || run.auditDeadlineAt === undefined) {
+      run.auditDeadlineAt = now + PEER_AUDIT_DEADLINE_MS;
+    }
     const generation = run.generation;
     const attemptId = run.auditAttemptId;
     const timer = setTimeout(() => {
@@ -2604,9 +2973,10 @@ class SupervisionAutomation {
       this.emitOrchestratedAuditResult(latest, 'timeout', 'deadline_expired');
       this.emitTerminalStatus(latest.sessionName, 'supervision_needs_input', SUPERVISION_NEEDS_INPUT_LABEL);
       this.finishRun(latest.sessionName, 'needs_input', { preserveStatus: true });
-    }, PEER_AUDIT_DEADLINE_MS);
+    }, Math.max(0, run.auditDeadlineAt - now));
     timer.unref?.();
     run.auditDeadlineTimer = timer;
+    this.persistWaitState(run, 'auditing');
   }
 
   private clearAuditDeadline(run: ActiveTaskRunState): void {
@@ -2670,7 +3040,8 @@ class SupervisionAutomation {
       } else {
         this.emitTerminalStatus(current.sessionName, 'supervision_audit_pass', SUPERVISION_AUDIT_PASS_LABEL);
         // Do not retain a completion timer after the run reaches a terminal state.
-        this.clearWaitingTimeout(current);
+        this.clearWaitingTimers(current);
+        this.deletePersistedWaitState(current.sessionName);
         this.activeRuns.delete(current.sessionName);
       }
       return;
@@ -2681,7 +3052,8 @@ class SupervisionAutomation {
     if (current.reworkDispatches >= current.snapshot.maxAuditLoops) {
       this.emitTerminalStatus(current.sessionName, 'supervision_needs_input', SUPERVISION_NEEDS_INPUT_LABEL);
       // Do not retain a completion timer after the run reaches a terminal state.
-      this.clearWaitingTimeout(current);
+      this.clearWaitingTimers(current);
+      this.deletePersistedWaitState(current.sessionName);
       this.activeRuns.delete(current.sessionName);
       return;
     }
@@ -2690,12 +3062,14 @@ class SupervisionAutomation {
     if (!transportRuntime) {
       this.emitTerminalStatus(current.sessionName, 'supervision_needs_input', SUPERVISION_NEEDS_INPUT_LABEL);
       // Do not retain a completion timer after the run reaches a terminal state.
-      this.clearWaitingTimeout(current);
+      this.clearWaitingTimers(current);
+      this.deletePersistedWaitState(current.sessionName);
       this.activeRuns.delete(current.sessionName);
       return;
     }
     const reworkBrief = buildReworkBrief(current, findings);
     current.phase = 'execution';
+    this.deletePersistedWaitState(current.sessionName);
     current.requiresAudit = true;
     current.freshAuditRequiredAfterRework = true;
     current.ignoreIdleUntilPostAuditTurnActivity = options.settledWithoutIdle === true;
@@ -2726,7 +3100,8 @@ class SupervisionAutomation {
       logger.warn({ session: current.sessionName, err: error }, 'Peer audit rework dispatch failed');
       this.emitTerminalStatus(current.sessionName, 'supervision_needs_input', SUPERVISION_NEEDS_INPUT_LABEL);
       // Do not retain a completion timer after the run reaches a terminal state.
-      this.clearWaitingTimeout(current);
+      this.clearWaitingTimers(current);
+      this.deletePersistedWaitState(current.sessionName);
       this.activeRuns.delete(current.sessionName);
     }
   }
@@ -2737,16 +3112,7 @@ class SupervisionAutomation {
     if (!transportRuntime) return false;
 
     const correctionNumber = current.auditVerdictCorrectionAttempts + 1;
-    const correctionPrompt = [
-      `[Contract: ${SUPERVISION_CONTRACT_IDS.AUDIT_MARKER_CORRECTION}]`,
-      'The delegated audit reply is already present in this session.',
-      'Your preceding judgment omitted the required audit marker or emitted more than one marker.',
-      'Do not delegate again, re-run the audit, call tools, modify files, or repeat implementation.',
-      'Evaluate the delivered audit evidence already in context, state the concrete findings, and end the response with exactly one of these markers:',
-      PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS.PASS,
-      PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS.REWORK,
-      'Do not include both markers and do not write anything after the selected marker.',
-    ].join('\n');
+    const correctionPrompt = buildAuditMarkerCorrectionPrompt(current.snapshot.uiLocale);
 
     current.auditVerdictCorrectionAttempts = correctionNumber;
     current.auditMarkerWarningEmitted = false;
@@ -2795,6 +3161,8 @@ class SupervisionAutomation {
   ): Promise<void> {
     const current = this.activeRuns.get(run.sessionName);
     if (!current || current.generation !== run.generation || (current.phase !== 'execution' && current.phase !== 'finalizing')) return;
+    this.clearWaitingTimers(current);
+    this.deletePersistedWaitState(current.sessionName);
     const postAuditFinalization = current.phase === 'finalizing';
     const transportRuntime = getTransportRuntime(run.sessionName);
     if (!transportRuntime) {

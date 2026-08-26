@@ -3568,6 +3568,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         targetSession: pendingDelegateTarget.session,
         targetLabel: pendingDelegateTarget.label,
         task,
+        uiLocale: i18n.resolvedLanguage ?? i18n.language,
       });
     } else if (pendingTargets.length > 0) {
       // @ picker was used — derive routing from the visible textbox order, then strip matched labels.
@@ -4252,6 +4253,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         targetLabel: input.label,
         task,
         auditCycle: input.preset === 'audit',
+        uiLocale: i18n.resolvedLanguage ?? i18n.language,
       }),
       extra: {},
       delegation: {
@@ -4265,7 +4267,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       return;
     }
     setQuickDelegationError(t('peerAuditQuick.sendFailed'));
-  }, [finalizeSend, t]);
+  }, [finalizeSend, i18n.language, i18n.resolvedLanguage, t]);
 
   const handleDirectComboSelect = useCallback((mode: string, roundsOverride?: number) => {
     setP2pOpen(false);

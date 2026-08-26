@@ -5860,6 +5860,33 @@ afterEach(() => {
     expect(ws.sendSessionCommand.mock.calls.some(([, payload]) => payload?.delegateTarget)).toBe(false);
   });
 
+  it('uses the current UI locale for the full Quick Audit orchestration prompt', () => {
+    mockI18n.language = 'zh-CN';
+    mockI18n.resolvedLanguage = 'zh-CN';
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        serverId="srv1"
+        activeSession={makeTransportSession({ name: 'deck_proj_brain', project: 'proj', role: 'brain' })}
+        subSessions={[{
+          sessionName: 'deck_sub_reviewer', type: 'codex-sdk', label: 'Reviewer', state: 'idle', parentSession: 'deck_proj_brain',
+        }]}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    fireEvent.click(screen.getByTestId('peer-audit-icon'));
+    fireEvent.click(screen.getByTestId('quick-agent-delegation-candidate'));
+
+    const sent = gatherSendCalls(ws).at(-1)!;
+    expect(sent.text).toContain('你是当前会话的代理委派编排者');
+    expect(sent.text).toContain('目标 ID（直接传给 send_message，不要再查询）：deck_sub_reviewer');
+    expect(sent.text).toContain('独立审计本会话最近的工作');
+    expect(sent.text).toContain('修复→复审');
+    expect(sent.text).not.toContain('You are the current session orchestrator');
+  });
+
   it('quick delegation bypasses queued-message editing instead of rewriting the queued row', () => {
     const ws = makeWs();
     render(

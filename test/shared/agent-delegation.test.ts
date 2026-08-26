@@ -298,6 +298,25 @@ describe('agent delegation shared contract', () => {
     expect(prompt).toContain('Never finalize the repository or delivery from a REWORK verdict.');
   });
 
+  it('localizes quick-audit orchestration while preserving exact protocol tokens', () => {
+    const task = buildQuickAgentDelegationTask('audit', '', 'zh-CN');
+    expect(task).toContain('独立审计本会话最近的工作');
+    expect(task).not.toContain('Ask the selected delegate');
+
+    const prompt = buildAgentDelegationOrchestrationPrompt({
+      targetSession: 'deck_sub_reviewer',
+      targetLabel: '审计员',
+      task,
+      auditCycle: true,
+      uiLocale: 'zh-CN',
+    });
+    expect(prompt).toContain('目标 ID（直接传给 send_message，不要再查询）：deck_sub_reviewer');
+    expect(prompt).toContain('修复→复审');
+    expect(prompt).toContain('send_message(target="deck_sub_reviewer", reply=true)');
+    expect(prompt).toContain('<!-- IMCODES_AUTOMATIC_AUDIT: PASS -->');
+    expect(prompt).not.toContain('You are the current session orchestrator');
+  });
+
   it('builds quick presets as ordinary delegation tasks and keeps custom text exact', () => {
     const audit = buildQuickAgentDelegationTask('audit');
     expect(audit).toContain('current session context');

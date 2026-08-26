@@ -289,6 +289,8 @@ async function seedSession(
     runtimeType: 'transport',
     providerId: 'codex-sdk',
     providerSessionId: 'provider-session-1',
+    activeModel: 'gpt-5.3-codex-spark',
+    requestedModel: 'gpt-5.3-codex-spark',
     projectDir: seededProjectDir,
     state: 'running',
     transportConfig: { supervision: snapshot },
@@ -4081,6 +4083,228 @@ describe('SupervisionAutomation', () => {
     expect(prompts.some((prompt) => prompt.includes('[Contract: supervision_continue_v1]'))).toBe(false);
     // … and the run is still alive, so the reply's turn can resume it.
     expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({ phase: 'execution' });
+  });
+
+  it('sends a localized waiting heartbeat after ten minutes without consuming continue budget', async () => {
+    const snapshot = await seedSession('supervised', false, 2, { uiLocale: 'zh-CN' });
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    try {
+      supervisionAutomation.init();
+      supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-heartbeat-zh', '等待外部回执', snapshot);
+      beginRun('cmd-heartbeat-zh', '等待外部回执');
+      completeTurn(`已发出外部请求。\n${SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING}`);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      await new Promise<void>((resolve) => setImmediate(resolve));
+
+      await vi.advanceTimersByTimeAsync(10 * 60_000 - 1);
+      expect(mockTransportRuntime.send).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+
+      expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
+      const prompt = String(mockTransportRuntime.send.mock.calls[0]?.[0]);
+      expect(prompt).toContain('[Contract: supervision_waiting_heartbeat_v1]');
+      expect(prompt).toContain('已等待 10 分钟');
+      expect(prompt).toContain(SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING);
+      expect(prompt).not.toContain('Waiting check');
+      expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({
+        commandId: 'cmd-heartbeat-zh',
+        continueLoops: 0,
+        phase: 'execution',
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps the original hard deadline when the heartbeat reply is still WAITING', async () => {
+    const snapshot = await seedSession('supervised');
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    try {
+      supervisionAutomation.init();
+      supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-heartbeat-deadline', 'wait for reply', snapshot);
+      beginRun('cmd-heartbeat-deadline', 'wait for reply');
+      completeTurn(`External request sent.\n${SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING}`);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      await vi.advanceTimersByTimeAsync(10 * 60_000);
+      expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
+
+      completeTurn(`Still waiting on the same request.\n${SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING}`);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      await vi.advanceTimersByTimeAsync(20 * 60_000 + 1);
+
+      expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('restores a parked run from SQLite with the exact main session identity and original timer', async () => {
+    const snapshot = await seedSession('supervised', false, 2, { uiLocale: 'zh-CN' });
+    const mainIdentity = getSession('deck_supervision_brain')?.sessionInstanceId;
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    try {
+      supervisionAutomation.init();
+      supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-heartbeat-restart', 'wait across restart', snapshot);
+      beginRun('cmd-heartbeat-restart', 'wait across restart');
+      completeTurn(`等待外部回执。\n${SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING}`);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      await vi.advanceTimersByTimeAsync(6 * 60_000);
+
+      // Model selection is mutable metadata, not the conversation identity.
+      upsertSession({
+        ...getSession('deck_supervision_brain')!,
+        activeModel: 'gpt-5.4-switched-in-same-session',
+        updatedAt: Date.now(),
+      });
+
+      supervisionAutomation.__simulateProcessRestartForTests();
+      const restored = supervisionAutomation.getActiveRun('deck_supervision_brain');
+      expect(restored).toMatchObject({
+        commandId: 'cmd-heartbeat-restart',
+        phase: 'execution',
+        waitingStartedAt: expect.any(Number),
+      });
+      expect(getSession('deck_supervision_brain')?.sessionInstanceId).toBe(mainIdentity);
+
+      await vi.advanceTimersByTimeAsync(4 * 60_000);
+      expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
+      expect(String(mockTransportRuntime.send.mock.calls[0]?.[0])).toContain('已等待 10 分钟');
+
+      await vi.advanceTimersByTimeAsync(20 * 60_000 + 1);
+      expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('refuses SQLite recovery after the main execution session is recreated under the same name', async () => {
+    const snapshot = await seedSession('supervised');
+    const oldIdentity = getSession('deck_supervision_brain')?.sessionInstanceId;
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    try {
+      supervisionAutomation.init();
+      supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-main-recreated', 'wait across restart', snapshot);
+      beginRun('cmd-main-recreated', 'wait across restart');
+      completeTurn(`External request sent.\n${SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING}`);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+
+      removeSession('deck_supervision_brain');
+      upsertSession({
+        name: 'deck_supervision_brain',
+        projectName: 'supervision',
+        role: 'brain',
+        agentType: 'codex-sdk',
+        runtimeType: 'transport',
+        providerId: 'codex-sdk',
+        providerSessionId: 'provider-session-1',
+        activeModel: 'gpt-5.3-codex-spark',
+        requestedModel: 'gpt-5.3-codex-spark',
+        projectDir: projectDir!,
+        state: 'running',
+        transportConfig: { supervision: snapshot },
+        restarts: 0,
+        restartTimestamps: [],
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      });
+      expect(getSession('deck_supervision_brain')?.sessionInstanceId).not.toBe(oldIdentity);
+
+      supervisionAutomation.__simulateProcessRestartForTests();
+      expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
+      await vi.advanceTimersByTimeAsync(30 * 60_000);
+      expect(mockTransportRuntime.send).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('refuses SQLite recovery when the provider-side execution session id changes', async () => {
+    const snapshot = await seedSession('supervised');
+    const before = getSession('deck_supervision_brain');
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    try {
+      supervisionAutomation.init();
+      supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-main-model-changed', 'wait across restart', snapshot);
+      beginRun('cmd-main-model-changed', 'wait across restart');
+      completeTurn(`External request sent.\n${SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING}`);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+
+      upsertSession({
+        ...getSession('deck_supervision_brain')!,
+        providerSessionId: 'provider-session-replacement',
+        updatedAt: Date.now(),
+      });
+      expect(getSession('deck_supervision_brain')?.sessionInstanceId).toBe(before?.sessionInstanceId);
+
+      supervisionAutomation.__simulateProcessRestartForTests();
+      expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
+      await vi.advanceTimersByTimeAsync(30 * 60_000);
+      expect(mockTransportRuntime.send).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('restores an in-flight audit with the same attempt and exact auditor identity', async () => {
+    const snapshot = await seedSession('supervised_audit');
+    const auditorIdentity = getSession('deck_sub_reviewer')?.sessionInstanceId;
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    try {
+      supervisionAutomation.init();
+      supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-audit-restart-state', 'implement and audit', snapshot);
+      beginRun('cmd-audit-restart-state', 'implement and audit');
+      completeTurn(`Implementation and validation complete.\n${SUPERVISION_EXECUTION_STATUS_MARKERS.AUDIT_READY}`);
+      await waitForRunPhase('auditing');
+      const before = supervisionAutomation.getActiveRun('deck_supervision_brain');
+      expect(before?.auditAttemptId).toBeTruthy();
+      const attemptId = before!.auditAttemptId;
+      expect(before?.auditTargetSessionInstanceId).toBe(auditorIdentity);
+      expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
+
+      await vi.advanceTimersByTimeAsync(5 * 60_000);
+      supervisionAutomation.__simulateProcessRestartForTests();
+
+      expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({
+        commandId: 'cmd-audit-restart-state',
+        phase: 'auditing',
+        auditAttemptId: attemptId,
+        auditTargetSessionInstanceId: auditorIdentity,
+      });
+      expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
+
+      await vi.advanceTimersByTimeAsync(PEER_AUDIT_DEADLINE_MS - 5 * 60_000 + 1);
+      expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('refuses audit recovery when the configured auditor was recreated under the same name', async () => {
+    const snapshot = await seedSession('supervised_audit');
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    try {
+      supervisionAutomation.init();
+      supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-auditor-recreated', 'implement and audit', snapshot);
+      beginRun('cmd-auditor-recreated', 'implement and audit');
+      completeTurn(`Implementation and validation complete.\n${SUPERVISION_EXECUTION_STATUS_MARKERS.AUDIT_READY}`);
+      await waitForRunPhase('auditing');
+      expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
+      const priorAuditorIdentity = getSession('deck_sub_reviewer')?.sessionInstanceId;
+      const replacement = recreateReviewer();
+      expect(replacement.sessionInstanceId).not.toBe(priorAuditorIdentity);
+
+      supervisionAutomation.__simulateProcessRestartForTests();
+
+      expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
+      expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
+      const events = timelineEmitter.replay('deck_supervision_brain', 0).events;
+      expect(events.some((event) => event.type === 'assistant.text'
+        && event.payload.automationKind === 'supervision-warning'
+        && String(event.payload.text).includes('exact peer-audit session identity'))).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('resumes the SAME parked run when the awaited reply produces the next turn', async () => {

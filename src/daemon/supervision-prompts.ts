@@ -74,6 +74,10 @@ type ExecutionPromptCopy = {
   taskContext: string;
   lastResult: string;
   statusContract: (markers: typeof SUPERVISION_EXECUTION_STATUS_MARKERS) => string;
+  waitingHeartbeat: (
+    waitedMinutes: number,
+    markers: typeof SUPERVISION_EXECUTION_STATUS_MARKERS,
+  ) => string;
 };
 
 const EXECUTION_PROMPT_COPY: Record<SupervisionUiLocale, ExecutionPromptCopy> = {
@@ -85,6 +89,7 @@ const EXECUTION_PROMPT_COPY: Record<SupervisionUiLocale, ExecutionPromptCopy> = 
     noSafeWork: 'If none is safe, report the exact human blocker; do not guess. Uncommitted files alone are not completion.',
     userRules: 'User supervision rules', taskContext: 'Task context', lastResult: 'Last result',
     statusContract: (m) => `Include exactly one status marker: ${m.ADVANCE} more safe work; ${m.AUDIT_READY} implementation+validation done; ${m.NEEDS_INPUT} human input; ${m.WAITING} external reply pending.`,
+    waitingHeartbeat: (minutes, m) => `Waiting check after ${minutes} minutes: check the external request now. If its reply arrived, continue immediately and report ${m.ADVANCE} or ${m.AUDIT_READY}. If it is still pending, briefly report what is pending and use ${m.WAITING}. Use ${m.NEEDS_INPUT} only for an exact human blocker. Include exactly one status marker.`,
   },
   'zh-CN': {
     auditPreamble: '同伴审计模式：先完成实现与验证；PASS 前不得暂存、提交、推送、合并、发布或部署。',
@@ -94,6 +99,7 @@ const EXECUTION_PROMPT_COPY: Record<SupervisionUiLocale, ExecutionPromptCopy> = 
     noSafeWork: '若无可安全推进项，报告确切人工阻断；不要猜测。仅有未提交文件不代表已完成。',
     userRules: '用户监督规则', taskContext: '任务上下文', lastResult: '最近结果',
     statusContract: (m) => `回复中只用一个状态标记：${m.ADVANCE} 可继续；${m.AUDIT_READY} 实现验证完成；${m.NEEDS_INPUT} 需人工；${m.WAITING} 已发外部请求待回执。`,
+    waitingHeartbeat: (minutes, m) => `等待状态检查（已等待 ${minutes} 分钟）：现在核对外部请求。回执已到就立即继续，并回复 ${m.ADVANCE} 或 ${m.AUDIT_READY}；仍未到则简短汇报等待对象，并回复 ${m.WAITING}；只有确需人工时才回复 ${m.NEEDS_INPUT}。只用一个状态标记。`,
   },
   'zh-TW': {
     auditPreamble: '同伴審計模式：先完成實作與驗證；PASS 前不得暫存、提交、推送、合併、發佈或部署。',
@@ -103,6 +109,7 @@ const EXECUTION_PROMPT_COPY: Record<SupervisionUiLocale, ExecutionPromptCopy> = 
     noSafeWork: '若無可安全推進項，回報確切人工阻斷；不要猜測。僅有未提交檔案不代表已完成。',
     userRules: '使用者監督規則', taskContext: '任務上下文', lastResult: '最近結果',
     statusContract: (m) => `回覆中只用一個狀態標記：${m.ADVANCE} 可繼續；${m.AUDIT_READY} 實作驗證完成；${m.NEEDS_INPUT} 需人工；${m.WAITING} 已發外部請求待回執。`,
+    waitingHeartbeat: (minutes, m) => `等待狀態檢查（已等待 ${minutes} 分鐘）：現在核對外部請求。回覆已到就立即繼續，並回覆 ${m.ADVANCE} 或 ${m.AUDIT_READY}；仍未到則簡短回報等待對象，並回覆 ${m.WAITING}；只有確需人工時才回覆 ${m.NEEDS_INPUT}。只用一個狀態標記。`,
   },
   es: {
     auditPreamble: 'Modo de auditoría: termina implementación y validación; antes de PASS no prepares, confirmes, envíes, fusiones, publiques ni despliegues.',
@@ -112,6 +119,7 @@ const EXECUTION_PROMPT_COPY: Record<SupervisionUiLocale, ExecutionPromptCopy> = 
     noSafeWork: 'Si nada es seguro, informa el bloqueo humano exacto; no adivines. Archivos sin confirmar no implican finalización.',
     userRules: 'Reglas de supervisión del usuario', taskContext: 'Contexto de la tarea', lastResult: 'Último resultado',
     statusContract: (m) => `Incluye un solo marcador de estado: ${m.ADVANCE} trabajo seguro; ${m.AUDIT_READY} implementación+validación listas; ${m.NEEDS_INPUT} intervención humana; ${m.WAITING} respuesta externa pendiente.`,
+    waitingHeartbeat: (minutes, m) => `Comprobación tras ${minutes} minutos: revisa ahora la solicitud externa. Si llegó la respuesta, continúa y usa ${m.ADVANCE} o ${m.AUDIT_READY}. Si sigue pendiente, informa brevemente qué esperas y usa ${m.WAITING}. Usa ${m.NEEDS_INPUT} solo ante un bloqueo humano concreto. Incluye un solo marcador.`,
   },
   ru: {
     auditPreamble: 'Режим аудита: завершите реализацию и проверку; до PASS нельзя индексировать, коммитить, отправлять, сливать, публиковать или развёртывать.',
@@ -121,6 +129,7 @@ const EXECUTION_PROMPT_COPY: Record<SupervisionUiLocale, ExecutionPromptCopy> = 
     noSafeWork: 'Если безопасных действий нет, укажите точную человеческую блокировку; не угадывайте. Незакоммиченные файлы не означают завершение.',
     userRules: 'Правила надзора пользователя', taskContext: 'Контекст задачи', lastResult: 'Последний результат',
     statusContract: (m) => `Используйте ровно один маркер статуса: ${m.ADVANCE} есть безопасная работа; ${m.AUDIT_READY} реализация+проверка готовы; ${m.NEEDS_INPUT} нужен человек; ${m.WAITING} ждём внешний ответ.`,
+    waitingHeartbeat: (minutes, m) => `Проверка ожидания через ${minutes} мин.: проверьте внешний запрос. Если ответ получен, сразу продолжайте и используйте ${m.ADVANCE} или ${m.AUDIT_READY}. Если ответа ещё нет, кратко укажите, чего ждёте, и используйте ${m.WAITING}. ${m.NEEDS_INPUT} — только для точной блокировки, требующей человека. Используйте один маркер.`,
   },
   ja: {
     auditPreamble: 'ピア監査モード：実装と検証を完了し、PASS 前はステージ、コミット、プッシュ、マージ、公開、デプロイをしないでください。',
@@ -130,6 +139,7 @@ const EXECUTION_PROMPT_COPY: Record<SupervisionUiLocale, ExecutionPromptCopy> = 
     noSafeWork: '安全に進められない場合だけ、必要な人手の障害を明示してください。推測しないでください。未コミットファイルだけでは完了を意味しません。',
     userRules: 'ユーザーの監督ルール', taskContext: 'タスク文脈', lastResult: '直近の結果',
     statusContract: (m) => `状態マーカーは1つだけ：${m.ADVANCE} 続行可能；${m.AUDIT_READY} 実装検証完了；${m.NEEDS_INPUT} 人手が必要；${m.WAITING} 外部返信待ち。`,
+    waitingHeartbeat: (minutes, m) => `待機開始から ${minutes} 分の確認です。外部リクエストを今確認してください。返信済みなら直ちに続行し ${m.ADVANCE} または ${m.AUDIT_READY}、未返信なら待機対象を短く報告して ${m.WAITING} を使ってください。人手が本当に必要な場合だけ ${m.NEEDS_INPUT} を使います。マーカーは1つだけです。`,
   },
   ko: {
     auditPreamble: '동료 감사 모드: 구현과 검증을 완료하고 PASS 전에는 스테이징, 커밋, 푸시, 병합, 게시, 배포하지 마세요.',
@@ -139,6 +149,7 @@ const EXECUTION_PROMPT_COPY: Record<SupervisionUiLocale, ExecutionPromptCopy> = 
     noSafeWork: '안전하게 진행할 수 없을 때만 정확한 사람 개입 사유를 보고하세요. 추측하지 마세요. 미커밋 파일만으로 완료된 것은 아닙니다.',
     userRules: '사용자 감독 규칙', taskContext: '작업 문맥', lastResult: '최근 결과',
     statusContract: (m) => `상태 마커는 하나만 사용: ${m.ADVANCE} 계속 가능; ${m.AUDIT_READY} 구현·검증 완료; ${m.NEEDS_INPUT} 사람 필요; ${m.WAITING} 외부 회신 대기.`,
+    waitingHeartbeat: (minutes, m) => `대기 ${minutes}분 상태 확인: 외부 요청을 지금 확인하세요. 회신이 왔으면 즉시 계속하고 ${m.ADVANCE} 또는 ${m.AUDIT_READY}를 사용하세요. 아직 대기 중이면 무엇을 기다리는지 짧게 보고하고 ${m.WAITING}을 사용하세요. 사람의 개입이 꼭 필요한 경우에만 ${m.NEEDS_INPUT}을 사용하세요. 상태 마커는 하나만 사용하세요.`,
   },
 };
 
@@ -265,6 +276,171 @@ export function buildSupervisedAuditExecutionPreamble(locale?: SupervisionUiLoca
 export function buildSupervisionExecutionPreamble(locale?: SupervisionUiLocale): string {
   const copy = resolveExecutionPromptCopy(locale);
   return [copy.ownContext, copy.noSafeWork, buildExecutionStatusContract(locale)].join(' ');
+}
+
+export function buildSupervisionWaitingHeartbeatPrompt(
+  waitedMinutes: number,
+  locale?: SupervisionUiLocale,
+): string {
+  const normalizedMinutes = Math.max(1, Math.floor(waitedMinutes));
+  return [
+    `[Contract: ${SUPERVISION_CONTRACT_IDS.WAITING_HEARTBEAT}]`,
+    resolveExecutionPromptCopy(locale).waitingHeartbeat(
+      normalizedMinutes,
+      SUPERVISION_EXECUTION_STATUS_MARKERS,
+    ),
+  ].join('\n');
+}
+
+export function buildAutomaticAuditTaskPrompt(options: {
+  attemptId: string;
+  targetSession: string;
+  auditMetadata: string;
+  narrow: boolean;
+  changeDir?: string;
+  changedPaths?: string[];
+  uiLocale?: SupervisionUiLocale;
+}): string {
+  const markerLine = `${PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS.PASS} / ${PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS.REWORK}`;
+  const common = {
+    attempt: options.attemptId,
+    target: options.targetSession,
+    metadata: options.auditMetadata,
+    markers: markerLine,
+  };
+  const copies: Record<SupervisionUiLocale, string[]> = {
+    en: [
+      'Ask the selected delegate to independently audit this session\'s most recent work and return PASS or REWORK with concrete evidence, prioritized defects, and unavailable checks.',
+      ...(options.narrow ? ['Scope: this change is NARROW; inspect the diff and its direct blast radius, using proportionate executable evidence.'] : []),
+      'You—not the daemon—must prepare the brief from the real current context.',
+      `Automatic audit attempt ID: ${common.attempt}. Include this exact attempt ID in the delegated audit brief; send exactly one reply-enabled audit request to ${common.target}. Do not choose another session or send a second audit while this attempt is pending.`,
+      `For send_message use reply=true and audit=${common.metadata}; this metadata is required.`,
+      'While waiting: do not modify, commit, push, or deploy.',
+      `After the reply, report the findings and end with exactly one matching marker: ${PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS.PASS} or ${PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS.REWORK}. Emit neither marker before the reply.`,
+      'Automatic audit cycle: PASS releases any remaining delivery/finalization. REWORK makes the daemon feed the findings back into this same session as one repair turn with the exact re-audit target. After fixing and validating, this same session must prepare and send the fresh reply-enabled re-audit itself; do not wait for another user/supervisor prompt. Repeat until PASS or an exact blocker/safety limit. Do not self-start a duplicate audit before the REWORK repair is complete; supervision should only need to kick again if progress truly stalls.',
+    ],
+    'zh-CN': [
+      '请所选代理独立审计本会话最近的工作，并以具体证据、按优先级排列的缺陷和不可用检查返回 PASS 或 REWORK。',
+      ...(options.narrow ? ['范围：本次变更较窄；聚焦 diff 及直接影响面，执行与范围相称的可执行验证。'] : []),
+      '请根据本会话真实上下文自行准备审计说明。',
+      `审计 attempt ID：${common.attempt}。说明中必须包含它，并只向 ${common.target} 发送一次可回执审计；不要改选目标或重复发送。`,
+      `调用时使用 reply=true 和 audit=${common.metadata}。`,
+      '等待期间不得修改、提交、推送或部署。',
+      `回执到达后汇报发现，并只使用一个匹配标记：${common.markers}。回执前不要输出任一标记。`,
+      '自主循环：PASS 后才释放任务明确要求的剩余交付；REWORK 后立即修复、验证，再自行向同一目标发送一次新的可回执复审。循环至 PASS 或明确阻断/安全上限。',
+    ],
+    'zh-TW': [
+      '請所選代理獨立審計本工作階段最近的工作，並以具體證據、依優先級排列的缺陷與不可用檢查回覆 PASS 或 REWORK。',
+      ...(options.narrow ? ['範圍：本次變更較窄；聚焦 diff 與直接影響面，執行相稱的可執行驗證。'] : []),
+      '請依本工作階段真實脈絡自行準備審計說明。',
+      `審計 attempt ID：${common.attempt}。說明中必須包含它，並只向 ${common.target} 傳送一次可回覆審計；不要改選目標或重複傳送。`,
+      `呼叫時使用 reply=true 與 audit=${common.metadata}。`,
+      '等待期間不得修改、提交、推送或部署。',
+      `回覆到達後回報發現，並只使用一個匹配標記：${common.markers}。回覆前不要輸出任一標記。`,
+      '自主循環：PASS 後才釋放任務明確要求的剩餘交付；REWORK 後立即修復、驗證，再自行向同一目標傳送一次新的可回覆複審。循環至 PASS 或明確阻斷/安全上限。',
+    ],
+    es: [
+      'Pide al agente seleccionado una auditoría independiente con evidencia, defectos priorizados, comprobaciones no disponibles y veredicto PASS o REWORK.',
+      ...(options.narrow ? ['Alcance estrecho: revisa el diff y su impacto directo con evidencia ejecutable proporcional.'] : []),
+      'Prepara tú mismo el resumen desde el contexto real.',
+      `ID del intento: ${common.attempt}. Inclúyelo y envía una sola auditoría con respuesta a ${common.target}; no cambies ni dupliques el destino.`,
+      `Usa reply=true y audit=${common.metadata}.`, 'Mientras esperas, no modifiques, confirmes, envíes ni despliegues.',
+      `Tras la respuesta, informa hallazgos y usa un solo marcador: ${common.markers}. No emitas ninguno antes.`,
+      'Ciclo autónomo: PASS libera la entrega explícita; REWORK exige corregir, validar y reenviar una nueva auditoría con respuesta al mismo destino hasta PASS o un bloqueo/límite exacto.',
+    ],
+    ru: [
+      'Попросите выбранного агента провести независимую проверку с доказательствами, приоритетными дефектами, недоступными проверками и вердиктом PASS или REWORK.',
+      ...(options.narrow ? ['Узкая область: проверьте diff и прямое влияние соразмерными исполняемыми проверками.'] : []),
+      'Самостоятельно подготовьте описание из фактического контекста.',
+      `ID попытки: ${common.attempt}. Включите его и отправьте ровно одну проверку с ответом в ${common.target}; не меняйте цель и не дублируйте запрос.`,
+      `Используйте reply=true и audit=${common.metadata}.`, 'Во время ожидания не изменяйте, не коммитьте, не отправляйте и не развёртывайте.',
+      `После ответа сообщите выводы и используйте один маркер: ${common.markers}. До ответа маркеры не выводить.`,
+      'Автономный цикл: PASS разрешает явную доставку; REWORK требует исправить, проверить и отправить новую проверку с ответом той же цели до PASS или точной блокировки/лимита.',
+    ],
+    ja: [
+      '選択したエージェントに、証拠、優先度付き欠陥、実施不能な確認、PASS/REWORK 判定を含む独立監査を依頼してください。',
+      ...(options.narrow ? ['範囲は狭いです。diff と直接影響だけを、相応の実行可能な証拠で確認します。'] : []),
+      '実際の文脈から自分で監査説明を作成してください。',
+      `試行 ID：${common.attempt}。説明に含め、${common.target} へ返信可能な監査を1回だけ送信します。対象変更や重複送信は禁止です。`,
+      `reply=true と audit=${common.metadata} を使います。`, '待機中は変更、コミット、プッシュ、デプロイをしないでください。',
+      `返信後に所見を報告し、マーカーは1つだけ使います：${common.markers}。返信前は出力しません。`,
+      '自律サイクル：PASS 後のみ明示された引き渡しを解放します。REWORK 後は修正・検証し、同じ対象へ新しい返信可能な再監査を送り、PASS または明確な障害/上限まで繰り返します。',
+    ],
+    ko: [
+      '선택한 에이전트에게 증거, 우선순위 결함, 수행 불가 검사, PASS/REWORK 판정을 포함한 독립 감사를 요청하세요.',
+      ...(options.narrow ? ['범위가 좁습니다. diff와 직접 영향만 비례하는 실행 증거로 확인하세요.'] : []),
+      '실제 현재 문맥에서 감사 설명을 직접 준비하세요.',
+      `시도 ID: ${common.attempt}. 설명에 포함하고 ${common.target}로 회신 가능 감사를 한 번만 보내세요. 대상을 바꾸거나 중복 전송하지 마세요.`,
+      `reply=true와 audit=${common.metadata}를 사용하세요.`, '대기 중에는 수정, 커밋, 푸시, 배포하지 마세요.',
+      `회신 후 발견 사항을 보고하고 마커 하나만 사용하세요: ${common.markers}. 회신 전에는 출력하지 마세요.`,
+      '자율 순환: PASS 후에만 명시된 전달을 해제합니다. REWORK 후 즉시 수정·검증하고 같은 대상으로 새 회신 가능 재감사를 보내 PASS 또는 명확한 차단/안전 한도까지 반복하세요.',
+    ],
+  };
+  return [
+    ...copies[options.uiLocale ?? 'en'],
+    options.changeDir
+      ? `${options.uiLocale && options.uiLocale !== 'en' ? 'OpenSpec' : 'Relevant OpenSpec change'}: ${options.changeDir}`
+      : '',
+    options.changedPaths?.length
+      ? `${options.uiLocale && options.uiLocale !== 'en' ? 'Paths' : 'Observed changed paths'}: ${options.changedPaths.join(', ')}`
+      : '',
+  ].filter(Boolean).join('\n');
+}
+
+export function buildAuditTargetRecoveryPrompt(options: {
+  auditedSession: string;
+  auditTargetSession: string;
+  attemptId: string;
+  failedState: string;
+  replyInstruction: string;
+  uiLocale?: SupervisionUiLocale;
+}): string {
+  const values = `${options.auditedSession}\n${options.auditTargetSession}\n${options.attemptId}\n${options.failedState}`;
+  const copies: Record<SupervisionUiLocale, string[]> = {
+    en: ['Continue the in-progress automatic peer audit. The previous audit turn stopped before returning its result because of a runtime or provider failure.', 'Resume the same audit from the evidence already available in this session. Do not start or delegate a new audit, do not change the implementation, and do not commit or push.'],
+    'zh-CN': ['继续当前自动同伴审计。上一轮因运行时或提供商故障而停止，尚未返回结果。', '从本会话已有证据继续；不要新建或再次委派审计，不要修改实现、提交或推送。'],
+    'zh-TW': ['繼續目前自動同伴審計。上一輪因執行階段或提供商故障停止，尚未回覆結果。', '從本工作階段既有證據繼續；不要新建或再次委派審計，不要修改實作、提交或推送。'],
+    es: ['Continúa la auditoría automática en curso; el turno anterior terminó por un fallo de runtime/proveedor sin resultado.', 'Retoma la evidencia existente. No inicies ni delegues otra auditoría, no cambies la implementación ni confirmes o envíes.'],
+    ru: ['Продолжите текущую автоматическую проверку: предыдущий ход остановился из-за сбоя runtime/провайдера без результата.', 'Возобновите работу по имеющимся доказательствам. Не начинайте и не делегируйте новую проверку, не меняйте реализацию, не коммитьте и не отправляйте.'],
+    ja: ['進行中の自動ピア監査を続行してください。前回はランタイム/プロバイダー障害で結果を返す前に停止しました。', '既存の証拠から再開し、新しい監査の開始・委任、実装変更、コミット、プッシュはしないでください。'],
+    ko: ['진행 중인 자동 동료 감사를 계속하세요. 이전 감사 턴은 런타임/제공자 오류로 결과를 반환하기 전에 중단됐습니다.', '현재 증거에서 재개하고 새 감사를 시작·위임하거나 구현 수정, 커밋, 푸시를 하지 마세요.'],
+  };
+  const [intro, action] = copies[options.uiLocale ?? 'en'];
+  const identityLines = options.uiLocale && options.uiLocale !== 'en'
+    ? [`Session / Target / Attempt / State:\n${values}`]
+    : [
+      `Audited session ID: ${options.auditedSession}`,
+      `Audit target session ID: ${options.auditTargetSession}`,
+      `Automatic audit attempt ID: ${options.attemptId}`,
+      `Observed failed state: ${options.failedState}`,
+    ];
+  return [
+    `[Contract: ${SUPERVISION_CONTRACT_IDS.AUDIT_TARGET_RECOVERY}]`,
+    intro,
+    ...identityLines,
+    action,
+    options.replyInstruction,
+  ].join('\n');
+}
+
+export function buildAuditMarkerCorrectionPrompt(
+  locale?: SupervisionUiLocale,
+): string {
+  const copies: Record<SupervisionUiLocale, string[]> = {
+    en: ['The delegated audit reply is already present in this session.', 'Your preceding judgment omitted the required audit marker or emitted more than one.', 'Do not delegate again, run the audit, call tools, modify files, or repeat implementation. Evaluate existing evidence, state concrete findings, and use exactly one marker:'],
+    'zh-CN': ['委派审计回执已在本会话中。', '你上一轮判断遗漏了必需标记，或输出了多个标记。', '不要再次委派、重跑审计、调用工具、修改文件或重复实现。只评估已有证据，说明具体发现，并只使用一个标记：'],
+    'zh-TW': ['委派審計回覆已在本工作階段中。', '你上一輪判斷遺漏必要標記，或輸出了多個標記。', '不要再次委派、重跑審計、呼叫工具、修改檔案或重複實作。只評估既有證據，說明具體發現，並只使用一個標記：'],
+    es: ['La respuesta de auditoría ya está en esta sesión.', 'El juicio anterior omitió el marcador o emitió varios.', 'No delegues ni ejecutes otra auditoría, no uses herramientas ni cambies archivos. Evalúa la evidencia existente y usa un solo marcador:'],
+    ru: ['Ответ делегированной проверки уже находится в сессии.', 'Предыдущее решение пропустило маркер или вывело несколько.', 'Не делегируйте и не запускайте проверку снова, не вызывайте инструменты и не меняйте файлы. Оцените имеющиеся доказательства и используйте один маркер:'],
+    ja: ['委任監査の返信はすでにこのセッションにあります。', '前回の判断は必須マーカーを省略したか複数出力しました。', '再委任・再監査・ツール利用・ファイル変更をせず、既存の証拠を評価してマーカーを1つだけ使ってください：'],
+    ko: ['위임 감사 회신이 이미 이 세션에 있습니다.', '이전 판정에서 필수 마커를 누락했거나 여러 개 출력했습니다.', '다시 위임·감사하거나 도구를 호출하거나 파일을 수정하지 말고 기존 증거를 평가하여 마커 하나만 사용하세요:'],
+  };
+  return [
+    `[Contract: ${SUPERVISION_CONTRACT_IDS.AUDIT_MARKER_CORRECTION}]`,
+    ...copies[locale ?? 'en'],
+    PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS.PASS,
+    PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS.REWORK,
+  ].join('\n');
 }
 
 /** English compatibility export for callers/tests that do not have a locale. */
@@ -701,25 +877,94 @@ export function buildReworkBriefPrompt(
   uiLocale?: SupervisionUiLocale,
 ): string {
   const copy = resolveExecutionPromptCopy(uiLocale);
+  const locale = uiLocale ?? 'en';
   const findings = sanitizePeerAuditText(verdictText, SUPERVISION_REWORK_FINDINGS_BYTES);
   const taskContext = sanitizePeerAuditText(userText, SUPERVISION_REWORK_TASK_BYTES)
     || copy.continueTask;
+  const localized: Record<SupervisionUiLocale, {
+    verdict: string;
+    fix: string;
+    target: string;
+    reaudit: (target: string) => string;
+    after: string;
+    fallback: string;
+    budget: (attempt: number, limit: number) => string;
+    freeze: string;
+  }> = {
+    en: {
+      verdict: 'Audit verdict: REWORK', fix: 'Fix these findings, then run the relevant validation', target: 'Fresh re-audit target ID',
+      reaudit: (target) => `After the repair is reviewable, generate a fresh unique attempt ID, prepare one concise, self-contained re-audit brief yourself from the current context, and send it immediately with send_message(target=${JSON.stringify(target)}, reply=true, audit={"kind":"supervision_audit","attemptId":"<that-fresh-attempt-id>"}, message="<your re-audit brief>"). Include the same attempt ID inside the brief. Do not call send_list_targets, do not poll, and do not wait for the daemon or user to start this next audit.`,
+      after: `After that delegated audit replies, report the evidence and end with exactly one matching marker: ${PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS.PASS} or ${PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS.REWORK}. On REWORK, repeat this repair -> validate -> self-prepared re-audit cycle until PASS or an exact blocker/safety limit.`,
+      fallback: 'After the repair is reviewable, prepare one concise, self-contained re-audit brief yourself and send one fresh reply-enabled audit to the same configured audit target if it is available in the current context. If the target ID is unavailable, report that exact blocker instead of waiting silently.',
+      budget: (attempt, limit) => `Repair attempt ${attempt} of ${limit}. On the last attempt, fix what matters most or report an exact blocker; do not assume another round follows.`,
+      freeze: 'Do not stage, commit, push, merge, release, publish, or deploy until a fresh matching audit returns PASS.',
+    },
+    'zh-CN': {
+      verdict: '审计结论：REWORK', fix: '修复以下发现，然后执行相关验证', target: '新一轮复审目标 ID',
+      reaudit: (target) => `修复达到可审状态后，生成新的唯一 attempt ID，根据当前上下文自行准备简短、自包含的复审说明，并立即调用 send_message(target=${JSON.stringify(target)}, reply=true, audit={"kind":"supervision_audit","attemptId":"<新 attempt ID>"}, message="<复审说明>")。说明内必须使用同一个 attempt ID。不要调用 send_list_targets，不要轮询，也不要等待 daemon 或用户替你启动复审。`,
+      after: `复审回执到达后汇报证据，并只以一个匹配标记结束：${PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS.PASS} 或 ${PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS.REWORK}。若为 REWORK，继续“修复→验证→自行复审”，直至 PASS 或明确阻断/安全上限。`,
+      fallback: '修复达到可审状态后，自行准备简短、自包含的复审说明，并向当前上下文中的同一审计目标发送一次新的可回执复审。若没有目标 ID，报告这个明确阻断，不要静默等待。',
+      budget: (attempt, limit) => `修复次数 ${attempt}/${limit}。最后一次应优先修复关键问题或报告明确阻断，不要假设还有下一轮。`,
+      freeze: '新的匹配审计返回 PASS 前，不得暂存、提交、推送、合并、发布或部署。',
+    },
+    'zh-TW': {
+      verdict: '審計結論：REWORK', fix: '修復以下發現，然後執行相關驗證', target: '新一輪複審目標 ID',
+      reaudit: (target) => `修復達到可審狀態後，產生新的唯一 attempt ID，依目前脈絡自行準備簡短、自包含的複審說明，並立即呼叫 send_message(target=${JSON.stringify(target)}, reply=true, audit={"kind":"supervision_audit","attemptId":"<新 attempt ID>"}, message="<複審說明>")。說明內必須使用同一個 attempt ID。不要呼叫 send_list_targets，不要輪詢，也不要等待 daemon 或使用者替你啟動複審。`,
+      after: `複審回覆到達後回報證據，並只以一個匹配標記結束：${PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS.PASS} 或 ${PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS.REWORK}。若為 REWORK，繼續「修復→驗證→自行複審」，直到 PASS 或明確阻斷/安全上限。`,
+      fallback: '修復達到可審狀態後，自行準備簡短、自包含的複審說明，並向目前脈絡中的同一審計目標傳送一次新的可回覆複審。若沒有目標 ID，回報此明確阻斷，不要靜默等待。',
+      budget: (attempt, limit) => `修復次數 ${attempt}/${limit}。最後一次應優先修復關鍵問題或回報明確阻斷，不要假設還有下一輪。`,
+      freeze: '新的匹配審計回覆 PASS 前，不得暫存、提交、推送、合併、發佈或部署。',
+    },
+    es: {
+      verdict: 'Veredicto: REWORK', fix: 'Corrige estos hallazgos y ejecuta la validación pertinente', target: 'ID del nuevo destino',
+      reaudit: (target) => `Cuando la corrección sea revisable, genera un attempt ID único, prepara el resumen y envíalo de inmediato con send_message(target=${JSON.stringify(target)}, reply=true, audit={"kind":"supervision_audit","attemptId":"<nuevo-id>"}, message="<resumen>"). Usa el mismo ID; no consultes destinos ni esperes al daemon o al usuario.`,
+      after: `Tras la respuesta, informa evidencia y termina con un solo marcador: ${PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS.PASS} o ${PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS.REWORK}. En REWORK repite corrección, validación y auditoría hasta PASS o un bloqueo/límite exacto.`,
+      fallback: 'Cuando sea revisable, prepara y envía una nueva auditoría con respuesta al mismo destino configurado. Si falta el ID, informa ese bloqueo y no esperes en silencio.',
+      budget: (a, l) => `Intento de corrección ${a} de ${l}. En el último, corrige lo esencial o informa un bloqueo exacto.`,
+      freeze: 'No prepares, confirmes, envíes, fusiones, publiques ni despliegues hasta un PASS nuevo y coincidente.',
+    },
+    ru: {
+      verdict: 'Вердикт: REWORK', fix: 'Исправьте выводы и выполните нужные проверки', target: 'ID цели повторной проверки',
+      reaudit: (target) => `Когда исправление готово к проверке, создайте новый уникальный attempt ID, подготовьте описание и немедленно отправьте через send_message(target=${JSON.stringify(target)}, reply=true, audit={"kind":"supervision_audit","attemptId":"<новый-id>"}, message="<описание>"). Используйте тот же ID; не ищите цели и не ждите daemon или пользователя.`,
+      after: `После ответа сообщите доказательства и завершите одним маркером: ${PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS.PASS} или ${PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS.REWORK}. При REWORK повторяйте исправление, проверку и аудит до PASS или точной блокировки/лимита.`,
+      fallback: 'После готовности самостоятельно отправьте новую проверку с ответом той же настроенной цели. Если ID отсутствует, сообщите точную блокировку, не ждите молча.',
+      budget: (a, l) => `Попытка исправления ${a} из ${l}. В последней исправьте главное или сообщите точную блокировку.`,
+      freeze: 'До нового совпадающего PASS нельзя индексировать, коммитить, отправлять, сливать, публиковать или развёртывать.',
+    },
+    ja: {
+      verdict: '監査判定：REWORK', fix: '次の所見を修正し、関連する検証を実行', target: '新しい再監査対象 ID',
+      reaudit: (target) => `修正が監査可能になったら新しい一意の attempt ID を作り、説明を準備して send_message(target=${JSON.stringify(target)}, reply=true, audit={"kind":"supervision_audit","attemptId":"<新ID>"}, message="<説明>") で直ちに送信します。同じ ID を使い、対象検索・ポーリング・daemon/利用者待ちはしません。`,
+      after: `返信後に証拠を報告し、${PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS.PASS} または ${PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS.REWORK} の一方だけで終了します。REWORK なら PASS または明確な障害/上限まで修正・検証・再監査を繰り返します。`,
+      fallback: '監査可能になったら、同じ設定済み対象へ新しい返信可能な再監査を自分で送ってください。対象 ID がなければ黙って待たず、その障害を報告します。',
+      budget: (a, l) => `修正試行 ${a}/${l}。最終試行では重要点を直すか明確な障害を報告します。`,
+      freeze: '新しい一致する監査が PASS になるまで、ステージ、コミット、プッシュ、マージ、公開、デプロイは禁止です。',
+    },
+    ko: {
+      verdict: '감사 판정: REWORK', fix: '다음 발견을 수정하고 관련 검증 실행', target: '새 재감사 대상 ID',
+      reaudit: (target) => `수정이 감사 가능해지면 새 고유 attempt ID를 만들고 설명을 준비하여 send_message(target=${JSON.stringify(target)}, reply=true, audit={"kind":"supervision_audit","attemptId":"<새ID>"}, message="<설명>")로 즉시 보내세요. 같은 ID를 사용하고 대상 조회, 폴링, daemon/사용자 대기를 하지 마세요.`,
+      after: `회신 후 증거를 보고하고 ${PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS.PASS} 또는 ${PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS.REWORK} 중 하나로만 끝내세요. REWORK면 PASS 또는 명확한 차단/한도까지 수정·검증·재감사를 반복하세요.`,
+      fallback: '감사 가능해지면 같은 설정 대상에 새 회신 가능 재감사를 직접 보내세요. 대상 ID가 없으면 조용히 기다리지 말고 정확한 차단을 보고하세요.',
+      budget: (a, l) => `수정 시도 ${a}/${l}. 마지막에는 핵심을 수정하거나 명확한 차단을 보고하세요.`,
+      freeze: '새 일치 감사가 PASS가 되기 전에는 스테이징, 커밋, 푸시, 병합, 게시, 배포하지 마세요.',
+    },
+  };
+  const text = localized[locale];
   return [
     `[Contract: ${SUPERVISION_CONTRACT_IDS.REWORK_BRIEF}]`,
-    'Audit verdict: REWORK',
-    `Fix these findings, then run the relevant validation:\n${findings}`,
+    text.verdict,
+    `${text.fix}:\n${findings}`,
     copy.reworkLoop,
     ...(auditTargetSessionName ? [
-      `Fresh re-audit target ID: ${auditTargetSessionName}`,
-      `After the repair is reviewable, generate a fresh unique attempt ID, prepare one concise, self-contained re-audit brief yourself from the current context, and send it immediately with send_message(target=${JSON.stringify(auditTargetSessionName)}, reply=true, audit={"kind":"supervision_audit","attemptId":"<that-fresh-attempt-id>"}, message="<your re-audit brief>"). Include the same attempt ID inside the brief. Do not call send_list_targets, do not poll, and do not wait for the daemon or user to start this next audit.`,
-      `After that delegated audit replies, report the evidence and end with exactly one matching marker: ${PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS.PASS} or ${PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS.REWORK}. On REWORK, repeat this repair -> validate -> self-prepared re-audit cycle until PASS or an exact blocker/safety limit.`,
+      `${text.target}: ${auditTargetSessionName}`,
+      text.reaudit(auditTargetSessionName),
+      text.after,
     ] : [
-      'After the repair is reviewable, prepare one concise, self-contained re-audit brief yourself and send one fresh reply-enabled audit to the same configured audit target if it is available in the current context. If the target ID is unavailable, report that exact blocker instead of waiting silently.',
+      text.fallback,
     ]),
     ...(budget
-      ? [`Repair attempt ${budget.attempt} of ${budget.limit}. On the last attempt, fix what matters most or report an exact blocker; do not assume another round follows.`]
+      ? [text.budget(budget.attempt, budget.limit)]
       : []),
-    'Do not stage, commit, push, merge, release, publish, or deploy until a fresh matching audit returns PASS.',
+    text.freeze,
     `${copy.taskContext}: ${taskContext}`,
   ].join('\n');
 }

@@ -93,7 +93,7 @@ export function QuickAgentDelegationDialog({
   onClose,
   onDispatch,
 }: QuickAgentDelegationDialogProps) {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const remembered = readRememberedTarget(currentSessionName);
   const [preset, setPreset] = useState<QuickAgentDelegationPreset>('audit');
   const [customTask, setCustomTask] = useState('');
@@ -125,7 +125,11 @@ export function QuickAgentDelegationDialog({
     }
     return labels;
   }, [orderedCandidates]);
-  const task = buildQuickAgentDelegationTask(preset, customTask);
+  const task = buildQuickAgentDelegationTask(
+    preset,
+    customTask,
+    i18n.resolvedLanguage ?? i18n.language,
+  );
 
   const dispatch = (candidate: QuickAgentDelegationCandidate) => {
     if (!task) return;
