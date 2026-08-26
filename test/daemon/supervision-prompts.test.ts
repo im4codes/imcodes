@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { normalizeSessionSupervisionSnapshot, SUPERVISION_MODE } from '../../shared/supervision-config.js';
+import {
+  normalizeSessionSupervisionSnapshot,
+  SUPERVISION_EXECUTION_STATUS_MARKERS,
+  SUPERVISION_MODE,
+  SUPERVISION_SUPPORTED_UI_LOCALES,
+} from '../../shared/supervision-config.js';
 import {
   SUPERVISED_AUDIT_EXECUTION_PREAMBLE,
   buildSupervisedAuditExecutionPreamble,
@@ -56,15 +61,50 @@ describe('supervision prompts', () => {
   it('gives ordinary supervised turns the same short localized status protocol', () => {
     const prompt = buildSupervisionExecutionPreamble('zh-CN');
     expect(prompt).toContain('以你自己的上下文为准');
+    expect(prompt).toContain('仅限当前会话现在能亲自执行具体安全步骤');
+    expect(prompt).toContain('仅剩委派事项未完成时用');
     expect(prompt).toContain('<!-- IMCODES_EXEC: ADVANCE -->');
     expect(prompt).toContain('<!-- IMCODES_EXEC: AUDIT_READY -->');
     expect(prompt).not.toContain('PASS 前不得');
+  });
+
+  it('distinguishes locally actionable work from delegated waiting in every locale', () => {
+    const statusNeedles = {
+      en: 'Pending delegated work alone is',
+      'zh-CN': '仅剩委派事项未完成时用',
+      'zh-TW': '僅剩委派事項未完成時用',
+      es: 'Si solo queda trabajo delegado pendiente',
+      ru: 'Если осталось только делегированное ожидание',
+      ja: '委任済み作業の完了待ちだけなら',
+      ko: '위임 작업의 완료만 기다린다면',
+    } satisfies Record<(typeof SUPERVISION_SUPPORTED_UI_LOCALES)[number], string>;
+    const heartbeatNeedles = {
+      en: 'still pending but independent safe work exists',
+      'zh-CN': '仍未到但有独立安全工作',
+      'zh-TW': '仍未到但有獨立安全工作',
+      es: 'sigue pendiente pero hay trabajo seguro independiente',
+      ru: 'ответа нет, но есть независимая безопасная работа',
+      ja: '未返信でも独立した安全な作業があれば',
+      ko: '아직 대기 중이어도 독립적인 안전 작업이 있으면',
+    } satisfies Record<(typeof SUPERVISION_SUPPORTED_UI_LOCALES)[number], string>;
+
+    for (const locale of SUPERVISION_SUPPORTED_UI_LOCALES) {
+      const prompt = buildSupervisionExecutionPreamble(locale);
+      const heartbeat = buildSupervisionWaitingHeartbeatPrompt(10, locale);
+      expect(prompt).toContain(statusNeedles[locale]);
+      expect(prompt).toContain(SUPERVISION_EXECUTION_STATUS_MARKERS.ADVANCE);
+      expect(prompt).toContain(SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING);
+      expect(heartbeat).toContain(heartbeatNeedles[locale]);
+      expect(heartbeat).toContain(SUPERVISION_EXECUTION_STATUS_MARKERS.ADVANCE);
+      expect(heartbeat).toContain(SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING);
+    }
   });
 
   it('localizes waiting heartbeats and automatic audit instructions', () => {
     const heartbeat = buildSupervisionWaitingHeartbeatPrompt(10, 'zh-CN');
     expect(heartbeat).toContain('[Contract: supervision_waiting_heartbeat_v1]');
     expect(heartbeat).toContain('已等待 10 分钟');
+    expect(heartbeat).toContain('仍未到但有独立安全工作就立即执行');
     expect(heartbeat).toContain('<!-- IMCODES_EXEC: WAITING -->');
     expect(heartbeat).not.toContain('Waiting check');
 
