@@ -7,6 +7,7 @@ import {
   SUPERVISION_AUDIT_MARKER_CORRECTION_AUTOMATION_KIND,
   SUPERVISION_AUDIT_TARGET_RECOVERY_AUTOMATION_KIND,
   SUPERVISION_CONTRACT_IDS,
+  SUPERVISION_EXECUTION_STATUS_MARKERS,
   SUPERVISION_MODE,
   SUPERVISION_UNAVAILABLE_REASONS,
 } from '../../shared/supervision-config.js';
@@ -388,6 +389,106 @@ function finishAuditRecoveryTestCleanup() {
 }
 
 describe('SupervisionAutomation', () => {
+  it('fast-paths ADVANCE without calling the supervisor model', async () => {
+    const snapshot = await seedSession('supervised_audit', false, 2, { uiLocale: 'zh-CN' });
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-marker-advance', 'implement the feature', snapshot);
+    beginRun('cmd-marker-advance', 'implement the feature');
+
+    completeTurn(`More safe work remains.\n${SUPERVISION_EXECUTION_STATUS_MARKERS.ADVANCE}`);
+    await waitForTransportSendCount(1);
+
+    expect(mockSupervisionDecide).not.toHaveBeenCalled();
+    const prompt = String(mockTransportRuntime.send.mock.calls[0]?.[0]);
+    expect(prompt).toContain('执行模式：advance_safe_work');
+    expect(prompt).toContain('本轮立即推进可安全处理的未完成项');
+    expect(prompt).not.toContain('Continue the same task.');
+    expect(prompt).toContain(SUPERVISION_EXECUTION_STATUS_MARKERS.ADVANCE);
+    expect(prompt).toContain(SUPERVISION_EXECUTION_STATUS_MARKERS.AUDIT_READY);
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({ phase: 'execution' });
+  });
+
+  it('fast-paths AUDIT_READY into peer audit without calling the supervisor model', async () => {
+    const snapshot = await seedSession('supervised_audit');
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-marker-audit', 'implement the feature', snapshot);
+    beginRun('cmd-marker-audit', 'implement the feature');
+
+    completeTurn(`Implementation and validation are complete.\n${SUPERVISION_EXECUTION_STATUS_MARKERS.AUDIT_READY}`);
+    await waitForTransportSendCount(1);
+
+    expect(mockSupervisionDecide).not.toHaveBeenCalled();
+    expect(String(mockTransportRuntime.send.mock.calls[0]?.[0])).toContain('send exactly one reply-enabled audit request');
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({ phase: 'auditing' });
+  });
+
+  it('fast-paths AUDIT_READY into explicit finalization for ordinary supervision', async () => {
+    const snapshot = await seedSession('supervised', false, 2, {
+      globalCustomInstructions: 'Always commit and push after implementation and tests are complete.',
+    });
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-marker-finalize', 'implement the feature', snapshot);
+    beginRun('cmd-marker-finalize', 'implement the feature');
+
+    completeTurn(`Implementation and validation are complete.\n${SUPERVISION_EXECUTION_STATUS_MARKERS.AUDIT_READY}`);
+    await waitForTransportSendCount(1);
+
+    expect(mockSupervisionDecide).not.toHaveBeenCalled();
+    const prompt = String(mockTransportRuntime.send.mock.calls[0]?.[0]);
+    expect(prompt).toContain('Perform only the repository or delivery finalization explicitly requested');
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({ phase: 'execution' });
+  });
+
+  it('fast-paths NEEDS_INPUT and WAITING without calling the supervisor model', async () => {
+    const needsInputSnapshot = await seedSession('supervised');
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-marker-input', 'configure the device', needsInputSnapshot);
+    beginRun('cmd-marker-input', 'configure the device');
+    completeTurn(`A device approval is required.\n${SUPERVISION_EXECUTION_STATUS_MARKERS.NEEDS_INPUT}`);
+    await vi.waitFor(() => expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined());
+    expect(mockSupervisionDecide).not.toHaveBeenCalled();
+    expect(mockTransportRuntime.send).not.toHaveBeenCalled();
+
+    const waitingSnapshot = await seedSession('supervised');
+    supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-marker-waiting', 'wait for the reply', waitingSnapshot);
+    beginRun('cmd-marker-waiting', 'wait for the reply');
+    completeTurn(`The reply-enabled request was sent.\n${SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING}`);
+    await vi.waitFor(() => expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({ phase: 'execution' }));
+    expect(mockSupervisionDecide).not.toHaveBeenCalled();
+    expect(mockTransportRuntime.send).not.toHaveBeenCalled();
+  });
+
+  it('falls back to the supervisor when execution markers conflict', async () => {
+    const snapshot = await seedSession('supervised');
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-marker-conflict', 'finish the task', snapshot);
+    beginRun('cmd-marker-conflict', 'finish the task');
+    completeTurn([
+      SUPERVISION_EXECUTION_STATUS_MARKERS.ADVANCE,
+      SUPERVISION_EXECUTION_STATUS_MARKERS.AUDIT_READY,
+    ].join('\n'));
+
+    await vi.waitFor(() => expect(mockSupervisionDecide).toHaveBeenCalledTimes(1));
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
+  });
+
+  it('fast-paths the unique reserved status prefix without requiring terminal layout', async () => {
+    const snapshot = await seedSession('supervised_audit');
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-marker-inline', 'finish and audit the status protocol', snapshot);
+    beginRun('cmd-marker-inline', 'finish and audit the status protocol');
+    completeTurn([
+      `Implementation is ready ${SUPERVISION_EXECUTION_STATUS_MARKERS.AUDIT_READY}`,
+      'Layout after the reserved marker does not change its protocol meaning.',
+    ].join('\n'));
+
+    await waitForTransportSendCount(1);
+    expect(mockSupervisionDecide).not.toHaveBeenCalled();
+    const prompt = String(mockTransportRuntime.send.mock.calls[0]?.[0]);
+    expect(prompt).toContain('send exactly one reply-enabled audit request');
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({ phase: 'auditing' });
+  });
+
   beforeEach(async () => {
     await cleanupProjectDir();
   });
@@ -2193,6 +2294,7 @@ describe('SupervisionAutomation', () => {
     await sleep(25);
     expect(mockTransportRuntime.send).toHaveBeenCalledTimes(2);
     const finalizationPrompt = String(mockTransportRuntime.send.mock.calls[1]?.[0]);
+    expect(finalizationPrompt).toContain('Execution mode: finalize_audited_work');
     expect(finalizationPrompt).toContain('Do not request or start another audit');
     expect(finalizationPrompt).not.toContain('Target ID (pass directly to send_message; do not look it up):');
     expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({ phase: 'finalizing' });
@@ -2203,6 +2305,63 @@ describe('SupervisionAutomation', () => {
     expect(mockTransportRuntime.send.mock.calls.filter((call) =>
       String(call[0]).includes('Target ID (pass directly to send_message; do not look it up):'))).toHaveLength(1);
     expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
+  });
+
+  it('keeps advancing assistant-reported code blockers instead of auditing or committing a passing sub-slice', async () => {
+    const snapshot = await seedSession('supervised_audit');
+    mockSupervisionDecide.mockResolvedValueOnce({
+      decision: 'continue',
+      reason: 'CC3 GN targets 修复已完成，测试 7/7 PASS；未 stage/commit/push，执行用户规则的时机已成熟。',
+      confidence: 0.9,
+      gap: 'CC3 GN targets 修复的变更尚未提交。',
+      nextAction: 'Selectively stage the changes, commit them, and push to origin/dev.',
+    });
+
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent(
+      'deck_supervision_brain',
+      'cmd-partial-gn-fix',
+      '继续完成 macOS remote desktop 主实现',
+      snapshot,
+    );
+    beginRun('cmd-partial-gn-fix', '继续完成 macOS remote desktop 主实现');
+    completeTurn([
+      'CC3 GN targets 反向守卫已修复，聚焦测试 7/7 PASS。',
+      '当前主要代码阻断：HandleHostCommand() 尚未真正驱动 SDP、ICE、lease/mode authority、stop/cancel 和 DataChannel payload。',
+      '完成前不能勾选 3.6、5.3、5.5、7.5、7.6。',
+    ].join('\n'));
+
+    await waitForTransportSendCount(1);
+    const continuePrompt = String(mockTransportRuntime.send.mock.calls[0]?.[0]);
+    expect(continuePrompt).toContain('[Contract: supervision_continue_v1]');
+    expect(continuePrompt).toContain('Execution mode: advance_safe_work');
+    expect(continuePrompt).toContain('advance safe unfinished work now; do not stop at a summary');
+    expect(continuePrompt).toContain('If none is safe, report the exact human blocker');
+    expect(continuePrompt).not.toContain('CC3 GN targets 修复的变更尚未提交。');
+    expect(continuePrompt).not.toContain('Target ID (pass directly to send_message; do not look it up):');
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({ phase: 'execution' });
+  });
+
+  it('overrides a stale complete judgment when the executing session reports unfinished code blockers', async () => {
+    const snapshot = await seedSession('supervised_audit');
+    mockSupervisionDecide.mockResolvedValueOnce({
+      decision: 'complete',
+      reason: 'the focused checks pass',
+      confidence: 0.9,
+      requiresAudit: true,
+    });
+
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-stale-complete', 'finish the implementation', snapshot);
+    beginRun('cmd-stale-complete', 'finish the implementation');
+    completeTurn('The focused target test passes, but the current major code blocker remains: SDP and ICE are not yet actually wired, so the task cannot be marked complete.');
+
+    await waitForTransportSendCount(1);
+    const continuePrompt = String(mockTransportRuntime.send.mock.calls[0]?.[0]);
+    expect(continuePrompt).toContain('[Contract: supervision_continue_v1]');
+    expect(continuePrompt).toContain('advance safe unfinished work now');
+    expect(continuePrompt).not.toContain('imcodes send --reply');
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({ phase: 'execution' });
   });
 
   it('never releases held commit and push when peer audit requests REWORK', async () => {
@@ -2401,8 +2560,8 @@ describe('SupervisionAutomation', () => {
 
     expect(mockTransportRuntime.send).toHaveBeenCalledTimes(3);
     const preAuditContinue = String(mockTransportRuntime.send.mock.calls[2]?.[0]);
-    expect(preAuditContinue).toContain('Complete only the remaining substantive implementation or validation work');
-    expect(preAuditContinue).toContain('Do not stage, commit, or push; do not merge, release, publish, or deploy.');
+    expect(preAuditContinue).toContain('advance safe unfinished work now; do not stop at a summary');
+    expect(preAuditContinue).toContain('Do not stage, commit, push, merge, release, publish, or deploy before peer-audit PASS.');
     expect(preAuditContinue).not.toContain(mixedAction);
     expect(preAuditContinue).not.toContain(finalizationAction);
 
@@ -2455,8 +2614,8 @@ describe('SupervisionAutomation', () => {
 
     expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
     const continuePrompt = String(mockTransportRuntime.send.mock.calls[0]?.[0]);
-    expect(continuePrompt).toContain('Complete only the remaining substantive implementation or validation work');
-    expect(continuePrompt).toContain('Do not stage, commit, or push');
+    expect(continuePrompt).toContain('advance safe unfinished work now; do not stop at a summary');
+    expect(continuePrompt).toContain('Do not stage, commit, push');
     expect(continuePrompt).not.toContain('Run the focused tests, fix failures, then commit and push.');
   });
 
@@ -2477,7 +2636,7 @@ describe('SupervisionAutomation', () => {
 
     expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
     const continuePrompt = String(mockTransportRuntime.send.mock.calls[0]?.[0]);
-    expect(continuePrompt).toContain('Complete only the remaining substantive implementation or validation work');
+    expect(continuePrompt).toContain('advance safe unfinished work now; do not stop at a summary');
     expect(continuePrompt).not.toContain('imcodes send --reply');
     expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({ phase: 'execution' });
   });
@@ -2498,8 +2657,8 @@ describe('SupervisionAutomation', () => {
     await sleep(25);
 
     expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
-    expect(String(mockTransportRuntime.send.mock.calls[0]?.[0])).toContain('Continue working on the same task.');
-    expect(String(mockTransportRuntime.send.mock.calls[0]?.[0])).toContain('Action: tests are still missing');
+    expect(String(mockTransportRuntime.send.mock.calls[0]?.[0])).toContain('Continue the same task.');
+    expect(String(mockTransportRuntime.send.mock.calls[0]?.[0])).toContain('Supervisor hint (verify first): tests are still missing');
     expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({
       commandId: 'cmd-continue',
       phase: 'execution',

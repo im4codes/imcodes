@@ -103,10 +103,22 @@ export const TASK_RUN_STATUS_MARKERS = {
   BLOCKED: '<!-- IMCODES_TASK_RUN: BLOCKED -->',
 } as const;
 
+export const SUPERVISION_EXECUTION_STATUS_MARKERS = {
+  ADVANCE: '<!-- IMCODES_EXEC: ADVANCE -->',
+  AUDIT_READY: '<!-- IMCODES_EXEC: AUDIT_READY -->',
+  NEEDS_INPUT: '<!-- IMCODES_EXEC: NEEDS_INPUT -->',
+  WAITING: '<!-- IMCODES_EXEC: WAITING -->',
+} as const;
+
 export type SupervisionMode = typeof SUPERVISION_MODE[keyof typeof SUPERVISION_MODE];
 export type SupervisionAuditMode = 'audit' | 'review' | 'audit>plan' | 'review>plan' | 'audit>review>plan';
 export type TaskRunStatusMarker = keyof typeof TASK_RUN_STATUS_MARKERS;
 export type TaskRunTerminalState = 'complete' | 'needs_input' | 'blocked';
+export type SupervisionExecutionState =
+  | 'advance'
+  | 'audit_ready'
+  | 'needs_input'
+  | 'waiting';
 export type SessionSupervisionSnapshotIssue =
   | 'invalid_shape'
   | 'invalid_mode'
@@ -713,6 +725,33 @@ export const DEFAULT_SUPERVISION_MAX_AUDIT_LOOPS = SUPERVISION_DEFAULT_MAX_AUDIT
 export const DEFAULT_SUPERVISION_MAX_PARSE_RETRIES = SUPERVISION_DEFAULT_MAX_PARSE_RETRIES;
 export const DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_STREAK = SUPERVISION_DEFAULT_MAX_AUTO_CONTINUE_STREAK;
 export const DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_TOTAL = SUPERVISION_DEFAULT_MAX_AUTO_CONTINUE_TOTAL;
+
+export interface ParsedSupervisionExecutionState {
+  state: SupervisionExecutionState | null;
+  markerCount: number;
+}
+
+export function parseSupervisionExecutionStateDetailsFromText(text: string): ParsedSupervisionExecutionState {
+  const matches = [...text.matchAll(/<!--\s*IMCODES_EXEC:\s*(ADVANCE|AUDIT_READY|NEEDS_INPUT|WAITING)\s*-->/g)];
+  if (matches.length !== 1) return { state: null, markerCount: matches.length };
+  const state = matches[0]?.[1];
+  switch (state) {
+    case 'ADVANCE':
+      return { state: 'advance', markerCount: 1 };
+    case 'AUDIT_READY':
+      return { state: 'audit_ready', markerCount: 1 };
+    case 'NEEDS_INPUT':
+      return { state: 'needs_input', markerCount: 1 };
+    case 'WAITING':
+      return { state: 'waiting', markerCount: 1 };
+    default:
+      return { state: null, markerCount: matches.length };
+  }
+}
+
+export function parseSupervisionExecutionStateFromText(text: string): SupervisionExecutionState | null {
+  return parseSupervisionExecutionStateDetailsFromText(text).state;
+}
 
 export function parseTaskRunTerminalStateDetailsFromText(text: string): ParsedTaskRunTerminalState {
   const matches = [...text.matchAll(/<!--\s*IMCODES_TASK_RUN:\s*(COMPLETE|NEEDS_INPUT|BLOCKED)\s*-->/g)];

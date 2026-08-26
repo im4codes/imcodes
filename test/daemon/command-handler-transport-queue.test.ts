@@ -1883,7 +1883,7 @@ describe('handleWebCommand transport queue behavior', () => {
       'also cover automatic audit',
       'cmd-composer-append-supervised',
       undefined,
-      expect.stringContaining('You own the repair loop'),
+      expect.stringContaining('<!-- IMCODES_EXEC: AUDIT_READY -->'),
       { deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND },
     );
     expect(queueTaskIntentMock).not.toHaveBeenCalled();
@@ -4016,7 +4016,7 @@ describe('handleWebCommand transport queue behavior', () => {
       'implement the feature',
       'cmd-heavy',
       undefined,
-      expect.stringContaining('You own the repair loop'),
+      expect.stringContaining('回复中只用一个状态标记：<!-- IMCODES_EXEC: ADVANCE -->'),
     );
     expect(registerTaskIntentMock).toHaveBeenCalledWith(
       'deck_transport_brain',
@@ -4025,6 +4025,48 @@ describe('handleWebCommand transport queue behavior', () => {
       expect.objectContaining({ mode: 'supervised_audit', uiLocale: 'zh-CN' }),
     );
     expect(queueTaskIntentMock).not.toHaveBeenCalled();
+  });
+
+  it('injects the localized execution-status protocol for ordinary supervised turns', async () => {
+    const transportSend = vi.fn(() => 'sent');
+    getSessionMock.mockReturnValue({
+      name: 'deck_transport_brain',
+      projectName: 'transport',
+      role: 'brain',
+      agentType: 'claude-code-sdk',
+      runtimeType: 'transport',
+      state: 'running',
+      transportConfig: {
+        supervision: {
+          mode: 'supervised',
+          backend: 'codex-sdk',
+          model: 'gpt-5.3-codex-spark',
+          timeoutMs: 12_000,
+          promptVersion: 'supervision_decision_v1',
+          maxParseRetries: 1,
+          taskRunPromptVersion: 'task_run_status_v1',
+        },
+      },
+    });
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'route-transport',
+      send: transportSend,
+      pendingCount: 0,
+    });
+
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_transport_brain',
+      text: '继续实现功能',
+      commandId: 'cmd-supervised-status',
+      uiLocale: 'zh-CN',
+    }, serverLink as any);
+    await flushAsync();
+
+    const preamble = String(transportSend.mock.calls[0]?.[3]);
+    expect(preamble).toContain('以你自己的上下文为准');
+    expect(preamble).toContain('<!-- IMCODES_EXEC: AUDIT_READY -->');
+    expect(preamble).not.toContain('PASS 前不得');
   });
 
   it('marks transport control-plane success messages as automation so supervision does not capture them as task completions', async () => {

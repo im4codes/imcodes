@@ -13,6 +13,7 @@ import {
   DEFAULT_SUPERVISION_TIMEOUT_MS,
   SUPERVISION_MIN_TIMEOUT_MS,
   SUPERVISION_MODE,
+  SUPERVISION_EXECUTION_STATUS_MARKERS,
   SUPERVISION_TRANSPORT_CONFIG_KEY,
   TASK_RUN_STATUS_MARKERS,
   embedSessionSupervisionSnapshot,
@@ -26,6 +27,8 @@ import {
   normalizeSessionSupervisionSnapshot,
   normalizeSupervisionUiLocale,
   normalizeSupervisorDefaultConfig,
+  parseSupervisionExecutionStateDetailsFromText,
+  parseSupervisionExecutionStateFromText,
   parseTaskRunTerminalStateFromText,
   patchPeerAuditTargetInTransportConfig,
   resolveEffectiveCustomInstructions,
@@ -341,6 +344,36 @@ describe('supervision config helpers', () => {
   it('accepts exactly one task-run marker and rejects duplicates', () => {
     expect(parseTaskRunTerminalStateFromText(`hello\n${TASK_RUN_STATUS_MARKERS.COMPLETE}`)).toBe('complete');
     expect(parseTaskRunTerminalStateFromText(`${TASK_RUN_STATUS_MARKERS.NEEDS_INPUT}\n${TASK_RUN_STATUS_MARKERS.BLOCKED}`)).toBeNull();
+  });
+
+  it('accepts exactly one fully-prefixed execution marker and ignores bare status words', () => {
+    expect(parseSupervisionExecutionStateFromText(
+      `still working\n${SUPERVISION_EXECUTION_STATUS_MARKERS.ADVANCE}`,
+    )).toBe('advance');
+    expect(parseSupervisionExecutionStateFromText(SUPERVISION_EXECUTION_STATUS_MARKERS.AUDIT_READY)).toBe('audit_ready');
+    expect(parseSupervisionExecutionStateFromText(SUPERVISION_EXECUTION_STATUS_MARKERS.NEEDS_INPUT)).toBe('needs_input');
+    expect(parseSupervisionExecutionStateFromText(SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING)).toBe('waiting');
+
+    for (const text of ['ADVANCE', 'AUDIT_READY', 'NEEDS_INPUT', 'WAITING', '<!-- IMCODES_TASK_RUN: ADVANCE -->']) {
+      expect(parseSupervisionExecutionStateFromText(text)).toBeNull();
+    }
+  });
+
+  it('rejects conflicting execution markers instead of guessing', () => {
+    expect(parseSupervisionExecutionStateDetailsFromText(
+      `${SUPERVISION_EXECUTION_STATUS_MARKERS.ADVANCE}\n${SUPERVISION_EXECUTION_STATUS_MARKERS.AUDIT_READY}`,
+    )).toEqual({ state: null, markerCount: 2 });
+  });
+
+  it('treats the unique reserved prefix as status without imposing layout rules', () => {
+    const marker = SUPERVISION_EXECUTION_STATUS_MARKERS.AUDIT_READY;
+    expect(parseSupervisionExecutionStateDetailsFromText(`${marker}\nmore text`))
+      .toEqual({ state: 'audit_ready', markerCount: 1 });
+    expect(parseSupervisionExecutionStateDetailsFromText(`End your turn with ${marker}`))
+      .toEqual({ state: 'audit_ready', markerCount: 1 });
+    expect(parseSupervisionExecutionStateDetailsFromText(`\`\`\`ts\nconst marker = ${JSON.stringify(marker)};\n\`\`\``))
+      .toEqual({ state: 'audit_ready', markerCount: 1 });
+    expect(parseSupervisionExecutionStateFromText(`done\n  ${marker}\n`)).toBe('audit_ready');
   });
 
   describe('mergeTransportConfigPreservingSupervision', () => {

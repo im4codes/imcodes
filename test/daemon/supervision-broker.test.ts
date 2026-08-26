@@ -292,10 +292,13 @@ describe('SupervisionBroker', () => {
     });
 
     const prompt = String(provider.send.mock.calls[0]?.[1] ?? '');
-    // New action-oriented contract: nextAction is required for continue,
-    // and vague fillers are explicitly rejected. Prefer ask_human over a
-    // fuzzy continue — the whole point of this redesign.
-    expect(prompt).toContain('REQUIRED when decision is continue — imperative instruction for the agent\'s next turn.');
+    // The broker selects a standardized execution mode and supplies only an
+    // advisory direction. The executing session owns detailed progress and
+    // implementation choices; unsupported commands must not be invented.
+    expect(prompt).toContain('decision is the standardized execution-mode enum');
+    expect(prompt).toContain('REQUIRED when decision is continue — a short advisory hint about the safest concrete direction.');
+    expect(prompt).toContain('It is not execution authority');
+    expect(prompt).toContain('Do not invent commands or implementation details you cannot support from evidence.');
     expect(prompt).toContain('DO NOT write vague fillers like "keep going", "continue", "finish the task"');
     expect(prompt).toContain('Prefer ask_human over a vague continue');
     expect(prompt).toContain('When the assistant itself says remaining implementation work (tests, fixes, commit/push) is still pending, choose continue AND spell out what to do in nextAction.');

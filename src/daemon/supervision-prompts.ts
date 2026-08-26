@@ -1,11 +1,13 @@
 import {
   SUPERVISION_CONTRACT_IDS,
+  SUPERVISION_EXECUTION_STATUS_MARKERS,
   SUPERVISION_MODE,
   TASK_RUN_STATUS_MARKERS,
   classifySupervisionCustomInstructions,
   resolveSupervisionCustomInstructionsDetail,
   type SessionSupervisionSnapshot,
   type SupervisionCustomInstructionsDetail,
+  type SupervisionUiLocale,
 } from '../../shared/supervision-config.js';
 import { SUPERVISION_IMCODES_BACKGROUND_DOCS } from './imcodes-workflow-docs.js';
 import type { SupervisionBrokerRequest, SupervisionRecentEvidence } from './supervision-broker.js';
@@ -58,6 +60,97 @@ function boundSupervisionRules(text: string): { text: string; truncated: boolean
   return { text: truncatePeerAuditUtf8(text, SUPERVISION_CUSTOM_INSTRUCTIONS_BYTES), truncated };
 }
 
+type ExecutionPromptCopy = {
+  auditPreamble: string;
+  reworkLoop: string;
+  continueTask: string;
+  executionMode: string;
+  actionHint: string;
+  gapHint: string;
+  reasonHint: string;
+  ownContext: string;
+  noSafeWork: string;
+  userRules: string;
+  taskContext: string;
+  lastResult: string;
+  statusContract: (markers: typeof SUPERVISION_EXECUTION_STATUS_MARKERS) => string;
+};
+
+const EXECUTION_PROMPT_COPY: Record<SupervisionUiLocale, ExecutionPromptCopy> = {
+  en: {
+    auditPreamble: 'Peer-audit mode: finish implementation and validation, but DO NOT stage, commit, push, merge, release, publish, or deploy before PASS.',
+    reworkLoop: 'On REWORK, fix and validate immediately, then send the instructed reply-enabled re-audit; repeat until PASS or an exact blocker.',
+    continueTask: 'Continue the same task.', executionMode: 'Execution mode', actionHint: 'Supervisor hint (verify first)', gapHint: 'Reported gap (advisory)', reasonHint: 'Rationale (advisory)',
+    ownContext: 'Use your own context: advance safe unfinished work now; do not stop at a summary or repeat completed work.',
+    noSafeWork: 'If none is safe, report the exact human blocker; do not guess. Uncommitted files alone are not completion.',
+    userRules: 'User supervision rules', taskContext: 'Task context', lastResult: 'Last result',
+    statusContract: (m) => `Include exactly one status marker: ${m.ADVANCE} more safe work; ${m.AUDIT_READY} implementation+validation done; ${m.NEEDS_INPUT} human input; ${m.WAITING} external reply pending.`,
+  },
+  'zh-CN': {
+    auditPreamble: '同伴审计模式：先完成实现与验证；PASS 前不得暂存、提交、推送、合并、发布或部署。',
+    reworkLoop: '收到 REWORK 后立即修复并验证，再按指示发送可回执复审；循环至 PASS 或明确阻断。',
+    continueTask: '继续同一任务。', executionMode: '执行模式', actionHint: '监督提示（先核对）', gapHint: '监督报告缺口（仅供参考）', reasonHint: '监督理由（仅供参考）',
+    ownContext: '以你自己的上下文为准：本轮立即推进可安全处理的未完成项；不要只做总结或重复已完成工作。',
+    noSafeWork: '若无可安全推进项，报告确切人工阻断；不要猜测。仅有未提交文件不代表已完成。',
+    userRules: '用户监督规则', taskContext: '任务上下文', lastResult: '最近结果',
+    statusContract: (m) => `回复中只用一个状态标记：${m.ADVANCE} 可继续；${m.AUDIT_READY} 实现验证完成；${m.NEEDS_INPUT} 需人工；${m.WAITING} 已发外部请求待回执。`,
+  },
+  'zh-TW': {
+    auditPreamble: '同伴審計模式：先完成實作與驗證；PASS 前不得暫存、提交、推送、合併、發佈或部署。',
+    reworkLoop: '收到 REWORK 後立即修復並驗證，再依指示發送可回執複審；循環至 PASS 或明確阻斷。',
+    continueTask: '繼續同一任務。', executionMode: '執行模式', actionHint: '監督提示（先核對）', gapHint: '監督回報缺口（僅供參考）', reasonHint: '監督理由（僅供參考）',
+    ownContext: '以你自己的上下文為準：本輪立即推進可安全處理的未完成項；不要只做摘要或重複已完成工作。',
+    noSafeWork: '若無可安全推進項，回報確切人工阻斷；不要猜測。僅有未提交檔案不代表已完成。',
+    userRules: '使用者監督規則', taskContext: '任務上下文', lastResult: '最近結果',
+    statusContract: (m) => `回覆中只用一個狀態標記：${m.ADVANCE} 可繼續；${m.AUDIT_READY} 實作驗證完成；${m.NEEDS_INPUT} 需人工；${m.WAITING} 已發外部請求待回執。`,
+  },
+  es: {
+    auditPreamble: 'Modo de auditoría: termina implementación y validación; antes de PASS no prepares, confirmes, envíes, fusiones, publiques ni despliegues.',
+    reworkLoop: 'Tras REWORK, corrige y valida de inmediato; luego envía la nueva auditoría con respuesta hasta PASS o un bloqueo exacto.',
+    continueTask: 'Continúa la misma tarea.', executionMode: 'Modo de ejecución', actionHint: 'Sugerencia del supervisor (verifica primero)', gapHint: 'Falta informada (orientativa)', reasonHint: 'Motivo (orientativo)',
+    ownContext: 'Usa tu propio contexto: avanza ahora el trabajo pendiente seguro; no te detengas en un resumen ni repitas lo completado.',
+    noSafeWork: 'Si nada es seguro, informa el bloqueo humano exacto; no adivines. Archivos sin confirmar no implican finalización.',
+    userRules: 'Reglas de supervisión del usuario', taskContext: 'Contexto de la tarea', lastResult: 'Último resultado',
+    statusContract: (m) => `Incluye un solo marcador de estado: ${m.ADVANCE} trabajo seguro; ${m.AUDIT_READY} implementación+validación listas; ${m.NEEDS_INPUT} intervención humana; ${m.WAITING} respuesta externa pendiente.`,
+  },
+  ru: {
+    auditPreamble: 'Режим аудита: завершите реализацию и проверку; до PASS нельзя индексировать, коммитить, отправлять, сливать, публиковать или развёртывать.',
+    reworkLoop: 'После REWORK сразу исправьте и проверьте, затем отправьте указанную повторную проверку с ответом; повторяйте до PASS или точной блокировки.',
+    continueTask: 'Продолжайте ту же задачу.', executionMode: 'Режим выполнения', actionHint: 'Подсказка надзора (сначала проверьте)', gapHint: 'Указанный пробел (справочно)', reasonHint: 'Причина (справочно)',
+    ownContext: 'Опирайтесь на свой контекст: сейчас продвигайте безопасную незавершённую работу; не останавливайтесь на отчёте и не повторяйте готовое.',
+    noSafeWork: 'Если безопасных действий нет, укажите точную человеческую блокировку; не угадывайте. Незакоммиченные файлы не означают завершение.',
+    userRules: 'Правила надзора пользователя', taskContext: 'Контекст задачи', lastResult: 'Последний результат',
+    statusContract: (m) => `Используйте ровно один маркер статуса: ${m.ADVANCE} есть безопасная работа; ${m.AUDIT_READY} реализация+проверка готовы; ${m.NEEDS_INPUT} нужен человек; ${m.WAITING} ждём внешний ответ.`,
+  },
+  ja: {
+    auditPreamble: 'ピア監査モード：実装と検証を完了し、PASS 前はステージ、コミット、プッシュ、マージ、公開、デプロイをしないでください。',
+    reworkLoop: 'REWORK 後は直ちに修正・検証し、指示された返信可能な再監査を送信してください。PASS または明確な障害まで繰り返します。',
+    continueTask: '同じタスクを続行してください。', executionMode: '実行モード', actionHint: '監督ヒント（先に確認）', gapHint: '報告された不足（参考）', reasonHint: '理由（参考）',
+    ownContext: '自分の文脈を優先し、安全に進められる未完了作業を今すぐ進めてください。要約だけで止まらず、完了済み作業を繰り返さないでください。',
+    noSafeWork: '安全に進められない場合だけ、必要な人手の障害を明示してください。推測しないでください。未コミットファイルだけでは完了を意味しません。',
+    userRules: 'ユーザーの監督ルール', taskContext: 'タスク文脈', lastResult: '直近の結果',
+    statusContract: (m) => `状態マーカーは1つだけ：${m.ADVANCE} 続行可能；${m.AUDIT_READY} 実装検証完了；${m.NEEDS_INPUT} 人手が必要；${m.WAITING} 外部返信待ち。`,
+  },
+  ko: {
+    auditPreamble: '동료 감사 모드: 구현과 검증을 완료하고 PASS 전에는 스테이징, 커밋, 푸시, 병합, 게시, 배포하지 마세요.',
+    reworkLoop: 'REWORK 후 즉시 수정·검증하고 안내된 회신 가능 재감사를 보내세요. PASS 또는 명확한 차단 사유까지 반복합니다.',
+    continueTask: '같은 작업을 계속하세요.', executionMode: '실행 모드', actionHint: '감독 힌트(먼저 확인)', gapHint: '보고된 누락(참고)', reasonHint: '이유(참고)',
+    ownContext: '자신의 문맥을 기준으로 지금 안전한 미완료 작업을 진행하세요. 요약만 하고 멈추거나 완료한 작업을 반복하지 마세요.',
+    noSafeWork: '안전하게 진행할 수 없을 때만 정확한 사람 개입 사유를 보고하세요. 추측하지 마세요. 미커밋 파일만으로 완료된 것은 아닙니다.',
+    userRules: '사용자 감독 규칙', taskContext: '작업 문맥', lastResult: '최근 결과',
+    statusContract: (m) => `상태 마커는 하나만 사용: ${m.ADVANCE} 계속 가능; ${m.AUDIT_READY} 구현·검증 완료; ${m.NEEDS_INPUT} 사람 필요; ${m.WAITING} 외부 회신 대기.`,
+  },
+};
+
+function resolveExecutionPromptCopy(locale: SupervisionUiLocale | undefined): ExecutionPromptCopy {
+  return EXECUTION_PROMPT_COPY[locale ?? 'en'];
+}
+
+function buildExecutionStatusContract(locale?: SupervisionUiLocale): string {
+  const marker = SUPERVISION_EXECUTION_STATUS_MARKERS;
+  return resolveExecutionPromptCopy(locale).statusContract(marker);
+}
+
 function buildCustomInstructionsSection(detail: SupervisionCustomInstructionsDetail | undefined): string {
   if (!detail || !detail.text.trim()) return '';
   const heading = ((): string => {
@@ -97,6 +190,15 @@ function buildAuditBeforeFinalizationRule(request: SupervisionBrokerRequest): st
     '- Never combine substantive pre-audit work and post-audit finalization in one nextAction.',
     '- If both the assistant response and your reason say implementation/validation are already complete, NEVER invent generic "remaining implementation or validation" work. Return only the concrete repository or delivery finalization nextAction (git add/commit/push, merge, release, publish, or deploy as applicable).',
     '- Do not ask the target session to arrange or resend the audit in a normal continue decision. The daemon emits a separate orchestration prompt containing the exact auditor session ID and reply-enabled send command, exactly once.',
+  ].join('\n');
+}
+
+function buildExecutionProgressGroundingRule(): string {
+  return [
+    'EXECUTION PROGRESS GROUNDING:',
+    '- The executing session\'s latest checklist and blockers are progress authority; your bounded snapshot is advisory.',
+    '- One passing slice or uncommitted files do not prove completion. Return continue for safe unfinished work so the executor advances it now, not merely summarizes it.',
+    '- Return ask_human only for an exact decision, credential, device, destructive action, or unavailable external condition; never guess.',
   ].join('\n');
 }
 
@@ -155,12 +257,18 @@ function buildSupervisionOutputLanguageLock(request: SupervisionBrokerRequest): 
  * Deliberately short: this text is also carried by a small supervisor model,
  * which degrades fast on long multi-rule prompts.
  */
-export const SUPERVISED_AUDIT_EXECUTION_PREAMBLE = [
-  'Peer-audit mode is on. You own the repair loop; supervision only routes the first audit or verifies the one you send.',
-  'Complete the implementation and validation, but DO NOT run git add, commit, push, merge, release, publish, deploy, or any other repository/delivery finalization in this turn, even when the user requested final delivery.',
-  'When the work is reviewable the first time, report concrete changes and validation evidence once; the daemon will hand you the addressed audit request if one is required.',
-  'On REWORK, do not wait for another user/supervisor prompt: fix every actionable finding, validate, prepare the re-audit brief yourself, and send the fresh reply-enabled audit exactly as instructed in the REWORK brief. Repeat until PASS or an exact blocker.',
-].join(' ');
+export function buildSupervisedAuditExecutionPreamble(locale?: SupervisionUiLocale): string {
+  const copy = resolveExecutionPromptCopy(locale);
+  return [copy.auditPreamble, copy.reworkLoop, buildExecutionStatusContract(locale)].join(' ');
+}
+
+export function buildSupervisionExecutionPreamble(locale?: SupervisionUiLocale): string {
+  const copy = resolveExecutionPromptCopy(locale);
+  return [copy.ownContext, copy.noSafeWork, buildExecutionStatusContract(locale)].join(' ');
+}
+
+/** English compatibility export for callers/tests that do not have a locale. */
+export const SUPERVISED_AUDIT_EXECUTION_PREAMBLE = buildSupervisedAuditExecutionPreamble();
 
 export interface PeerAuditBriefV1Input {
   attemptId: string;
@@ -362,7 +470,8 @@ export function buildSupervisionDecisionPrompt(
     'Return exactly one JSON object and nothing else.',
     '{"decision":"complete|continue|waiting|ask_human","reason":"...","confidence":0.0,"requiresAudit":true,"auditDepth":"standard|narrow","gap":"...","nextAction":"...","extra":{}}',
     'Field contract:',
-    '- decision: complete when the task is sufficiently done for the current request; continue only when you can identify a SPECIFIC next step the agent should execute autonomously; waiting when the agent is correctly parked on an external result it must not act ahead of — it already dispatched a peer audit or delegation and is barred from touching the repository until the verdict arrives, or it is otherwise blocked on a reply it cannot poll for; ask_human when you need the user to decide, approve, or clarify.',
+    '- decision is the standardized execution-mode enum: continue = advance_safe_work; waiting = wait_external; ask_human = report_blocker; complete = complete_task or (in supervised_audit when required) start_audit. Post-PASS repository work is finalize_audited_work and is released by the daemon, not invented here.',
+    '- Choose continue when the executing session can use its fuller context to safely advance unfinished work; waiting only when it is correctly parked on an external result it must not act ahead of — it already dispatched a peer audit or delegation and is barred from touching the repository until the verdict arrives, or it is otherwise blocked on a reply it cannot poll for; ask_human when the user must decide, approve, supply access, or clarify; complete only when no substantive task work remains.',
     '- Choose waiting, NOT continue, only when recent evidence confirms that the agent actually dispatched the audit/delegation request and the remaining work is genuinely gated on its reply. Re-prompting such an agent cannot advance anything: it will restate that it is waiting, and the loop repeats. waiting needs no nextAction.',
     '- For peer audit specifically, a statement such as "waiting for peer-audit PASS", "audit is required", or "blocked until audit" is not dispatch evidence. If no reply-enabled audit was dispatched, set requiresAudit=true and choose complete, or a finalization-only continue when repository/delivery finalization remains, so the daemon can issue the dedicated current-session audit orchestration prompt.',
     '- reason: short human-readable explanation of the decision.',
@@ -370,19 +479,20 @@ export function buildSupervisionDecisionPrompt(
     '- requiresAudit: boolean meaning "must automation start a NEW peer audit now?" Decide this in the SAME judgment; do not request another model call. Set true for substantive engineering work such as implementation/development, source or configuration changes, bug fixes, complex debugging/root-cause investigation, deployment/runtime mutation, or repository finalization that has not yet been audited. Set false for ordinary read-only checks, status queries, lookups, explanations, simple verification, and read-only review/audit. Also set false when the current task already delegated a matching audit and is waiting for PASS/REWORK, or when that audit already passed; never recursively audit an audit-status turn. A task that starts as a check but proceeds to modify/fix something requires audit unless its matching audit is already pending or passed.',
     '- If the assistant reports that it changed source/configuration, completed a bug fix or implementation, or performed git commit/push/merge/release/deploy, requiresAudit MUST be true unless the recent evidence contains a matching audit PASS for this exact work. Do not reinterpret completed engineering work as a read-only status check merely because the response is phrased as a completion report.',
     '- gap: REQUIRED when decision is continue — describe the specific missing artifact/state/verification that blocks calling the task complete. Keep it concrete (e.g. "tests for the new guardrail are not written", "staged diff not yet committed to git").',
-    '- nextAction: REQUIRED when decision is continue — imperative instruction for the agent\'s next turn. Must be concrete and executable, e.g. "Run `npm test` and fix any failing spec", "Commit staged changes with message X and push to origin/dev". DO NOT write vague fillers like "keep going", "continue", "finish the task", "继续完成任务" — those are rejected and force-escalated to ask_human.',
+    '- nextAction: REQUIRED when decision is continue — a short advisory hint about the safest concrete direction. It is not execution authority; the target reconciles it against its fuller context. Do not invent commands or implementation details you cannot support from evidence. DO NOT write vague fillers like "keep going", "continue", "finish the task", "继续完成任务" — those are rejected and force-escalated to ask_human.',
     '- extra: optional object reserved for future metadata; return {} if you have nothing to add.',
     'Decision rules:',
     '- USER-SET SUPERVISION RULES ARE AUTHORITATIVE. When the user-rules block below contains a directive, it OVERRIDES the generic heuristics in this list. The user set these rules so supervision would enforce them; do not let a generic heuristic provide an escape hatch. Examples of things that must trigger `continue` (not `complete`) despite other heuristics:',
-    '    * Rule says "Always commit and push if asked!" and the conversation topic is commits / pushing / "uncommitted files" / "did you push" / "还没提交" etc. → if there are uncommitted changes, return `continue` with nextAction = "Stage + commit + push the outstanding changes to origin/<branch>".',
+    '    * Rule says "always commit and push after finishing coding and testing" → enforce it only after the executing session no longer reports unfinished task work. A passing sub-slice or the mere presence of uncommitted files does not satisfy "finished". Continue safe unfinished implementation first; in supervised_audit, audit that completed revision before finalization.',
     '    * Rule uses blanket wording — "always", "every time", "each time", "must", "never skip", "总是", "每次", "必须", "一定", "不要省略", "绝不" — treat as UNCONDITIONAL policy. The mere presence of the relevant topic in the conversation is the trigger; do NOT require the user to have explicitly commanded the action in this exact turn.',
-    '    * Rule uses conditional wording — "if asked", "when X", "once Y", "如果", "当" — interpret the condition GENEROUSLY in favor of the user\'s intent. A user rule "Always commit and push if asked!" asked about an uncommitted diff counts as the condition firing; an assistant reply reporting "还没提交" counts as the condition firing.',
+    '    * Rule uses conditional wording — "if asked", "when X", "once Y", "如果", "当" — enforce the condition from concrete task evidence, without fabricating completion. An explicit delivery request can trigger finalization only when no substantive task work remains and any required peer audit has passed.',
     '- Prefer ask_human over a vague continue. If you cannot articulate a concrete nextAction, returning ask_human is the correct move — do not stall by emitting filler continues (they are downgraded to ask_human automatically and just waste a round-trip).',
     '- A factual answer to a user question (e.g. "yes, there are 3 uncommitted files") is typically complete for that turn IF no user-set rule applies. If a user rule applies (see authoritative clause above), return continue and enforce the rule. Do not otherwise treat state reports as proposed work.',
     '- When the assistant itself says remaining implementation work (tests, fixes, commit/push) is still pending, choose continue AND spell out what to do in nextAction.',
 '- auditDepth: how much audit the change is worth, used only when requiresAudit is true. Use "narrow" for a small, self-contained change whose blast radius is visible in the diff — a presentational tweak, copy/i18n wording, a comment, a test-only edit, a single-file fix with no cross-layer or runtime/security surface. Use "standard" for anything touching protocol/schema/persistence, auth or secrets, concurrency or state machines, multiple layers (daemon/server/web), or behaviour that other code depends on. Default to "standard" when genuinely unsure — but do not bill a two-line stylesheet change as if it were a state-machine rewrite; that is why supervised sessions feel audited constantly.',
     '- requiresAudit false is CORRECT for a change with no behavioural surface at all: pure formatting, a comment, a doc file, or a rename with no call-site semantics. Auditing those spends a full independent round to confirm nothing.',
     '- EXCEPTION that outranks BOTH the authoritative-user-rule clause and the pending-work rule above: if the agent already dispatched a peer audit or delegation and is waiting for its PASS/REWORK, or is otherwise blocked on a reply it cannot poll for, return `waiting` — NOT continue. Pending tests/fixes/commit/push do not make it continue while the work is gated on that reply, and a rule such as "always commit and push" is satisfied once the verdict arrives, not by re-prompting a blocked agent. Re-prompting cannot advance anything: the agent restates that it is waiting and the loop repeats.',
+    buildExecutionProgressGroundingRule(),
     buildAuditBeforeFinalizationRule(request),
     buildImcodesWorkflowBackgroundSection(),
     buildCustomInstructionsSection(resolveSupervisionCustomInstructionsDetail(request.snapshot)),
@@ -407,13 +517,15 @@ export function buildSupervisionDecisionRepairPrompt(
     'Your previous response was invalid.',
     'Return exactly one valid JSON object and nothing else.',
     '{"decision":"complete|continue|waiting|ask_human","reason":"...","confidence":0.0,"requiresAudit":true,"auditDepth":"standard|narrow","gap":"...","nextAction":"...","extra":{}}',
+    'decision is the standardized execution-mode enum: continue=advance_safe_work, waiting=wait_external, ask_human=report_blocker, complete=complete_task or start_audit when supervised audit is required. The daemon alone releases finalize_audited_work after matching PASS.',
     'requiresAudit is REQUIRED and means whether automation must start a NEW peer audit now: true for substantive implementation/modification/fixes/complex debugging/deployment or repository finalization not yet audited; false for ordinary read-only checks and when a matching audit is already delegated, awaiting PASS/REWORK, or has passed.',
     'Peer-audit waiting is valid only when recent evidence proves a reply-enabled audit request was actually dispatched. Merely saying that peer-audit PASS is required or still awaited is not proof; without dispatch evidence, requiresAudit must remain true so automation starts the audit.',
     'If the assistant reports source/configuration changes, a completed fix/implementation, or git commit/push/merge/release/deploy, requiresAudit MUST be true unless recent evidence contains a matching audit PASS for this exact work. A completion report is evidence of engineering work, not a read-only status check.',
-    'When decision is continue, BOTH gap and nextAction are required; nextAction must be a concrete imperative instruction, not a filler like "keep going" / "继续完成任务". If you cannot name a concrete next action, return ask_human instead — a vague continue is always downgraded to ask_human anyway.',
+    'When decision is continue, BOTH gap and nextAction are required; nextAction is a short advisory direction, not execution authority. Do not invent commands or implementation details not supported by evidence, and do not use a filler like "keep going" / "继续完成任务". If no safe direction exists, return ask_human instead.',
     'If the assistant response mentions remaining implementation work like tests, fixes, verification, commit/push, or another concrete next engineering step, return continue with a nextAction that names the exact command or deliverable.',
-    'USER-SET SUPERVISION RULES in the block below are AUTHORITATIVE and override the generic heuristics above. If a user rule uses blanket wording ("always", "每次", "必须", "绝不") or applies conditionally to the current topic (a rule like "Always commit and push if asked!" applies whenever the conversation is about committing / pushing / uncommitted changes, even if the user just asked a status question), return `continue` with a nextAction that enforces the rule. Do not treat a factual answer as `complete` when it violates a user-set rule.',
+    'USER-SET SUPERVISION RULES in the block below are AUTHORITATIVE and override generic heuristics, but do not fabricate that their preconditions are satisfied. In particular, "commit and push after finishing coding and testing" does not fire merely because one sub-slice passed or files are uncommitted while the executing session still reports unfinished work. Continue the safe unfinished work first; require ask_human only for a concrete input/authority blocker.',
     '- EXCEPTION that outranks the two rules above: if the agent already dispatched a peer audit or delegation and is waiting for its PASS/REWORK, or is otherwise blocked on a reply it cannot poll for, return `waiting` — NOT continue. Pending tests/fixes/commit/push do not make it continue while the work is gated on that reply, and a user rule such as "always commit and push" is satisfied after the verdict arrives, not by re-prompting a blocked agent. Re-prompting cannot advance anything: the agent will restate that it is waiting, and the loop repeats.',
+    buildExecutionProgressGroundingRule(),
     buildAuditBeforeFinalizationRule(request),
     buildImcodesWorkflowBackgroundSection(),
     buildCustomInstructionsSection(resolveSupervisionCustomInstructionsDetail(request.snapshot)),
@@ -433,14 +545,16 @@ export function buildSupervisionDecisionRepairPrompt(
  * Narrow input shape for the continue-prompt builder. Legacy call sites may
  * still pass a bare reason string; new callers — supervision-automation's
  * dispatcher — pass the full object so the target agent receives the
- * supervisor's concrete imperative `nextAction` as the lead of the prompt,
- * which is how the "agent has nothing to do → rewrites the same reply →
- * supervision loop" pattern gets broken.
+ * supervisor's proposed `nextAction` near the top of the prompt. The target
+ * reconciles it with its fuller execution context and advances safe work in
+ * the same turn; the bounded supervisor is not progress authority.
  */
 export interface SupervisionContinueInstructions {
   reason: string;
   nextAction?: string;
   gap?: string;
+  executionMode?: 'advance_safe_work' | 'finalize_audited_work';
+  uiLocale?: SupervisionUiLocale;
 }
 
 const SUPERVISION_CONTINUE_ACTION_BYTES = 2 * 1024;
@@ -453,8 +567,10 @@ const SUPERVISION_REWORK_TASK_BYTES = 2 * 1024;
 
 function buildCompactContinueRulesSection(
   detail: SupervisionCustomInstructionsDetail | undefined,
+  locale?: SupervisionUiLocale,
 ): string {
   if (!detail?.text.trim()) return '';
+  const copy = resolveExecutionPromptCopy(locale);
   const scope = detail.source === 'global'
     ? 'global'
     : detail.source === 'merged'
@@ -465,7 +581,20 @@ function buildCompactContinueRulesSection(
   // worker, not just the supervisor decision call. Leaving it unbounded while
   // capping only the decision prompt bounded the cheaper of the two paths.
   const { text, truncated } = boundSupervisionRules(detail.text.trim());
-  return [`User supervision rules (${scope}):\n${text}`, truncated ? SUPERVISION_RULES_TRUNCATED_NOTICE : '']
+  const truncatedNotice = locale === 'zh-CN'
+    ? '（这些规则超过大小限制，已截断。）'
+    : locale === 'zh-TW'
+      ? '（這些規則超過大小限制，已截斷。）'
+      : locale === 'es'
+        ? '(Estas reglas excedieron el límite y se truncaron.)'
+        : locale === 'ru'
+          ? '(Правила превысили лимит и были сокращены.)'
+          : locale === 'ja'
+            ? '（ルールが上限を超えたため切り詰めました。）'
+            : locale === 'ko'
+              ? '(규칙이 크기 제한을 넘어 잘렸습니다.)'
+              : SUPERVISION_RULES_TRUNCATED_NOTICE;
+  return [`${copy.userRules} (${scope}):\n${text}`, truncated ? truncatedNotice : '']
     .filter(Boolean)
     .join('\n');
 }
@@ -490,13 +619,18 @@ export function buildSupervisionContinuePrompt(
   contractId: string = SUPERVISION_CONTRACT_IDS.CONTINUE,
 ): string {
   // This prompt is user-visible and can be injected repeatedly. Keep only the
-  // concrete remaining action, a bounded fallback context for providers that
+  // advisory proposed action, a bounded fallback context for providers that
   // rehydrate per turn, and the user's actual supervision rules. Detailed
   // workflow documentation and repeated prose belong to the supervisor judge,
   // not to every continuation turn.
   const parsed: SupervisionContinueInstructions = typeof instructions === 'string'
     ? { reason: instructions }
     : instructions;
+  const copy = resolveExecutionPromptCopy(parsed.uiLocale);
+  const separator = parsed.uiLocale === 'zh-CN' || parsed.uiLocale === 'zh-TW'
+    ? '：'
+    : ': ';
+  const executionMode = parsed.executionMode ?? 'advance_safe_work';
   const reason = sanitizePeerAuditText(parsed.reason, SUPERVISION_CONTINUE_ACTION_BYTES);
   const nextAction = parsed.nextAction
     ? sanitizePeerAuditText(parsed.nextAction, SUPERVISION_CONTINUE_ACTION_BYTES)
@@ -511,24 +645,27 @@ export function buildSupervisionContinuePrompt(
     typeof customInstructions === 'string'
       ? classifySupervisionCustomInstructions(undefined, customInstructions, undefined)
       : customInstructions;
-  const action = nextAction || reason || 'Continue the remaining task work.';
+  const action = nextAction || reason || copy.continueTask;
   const distinctGap = gap && gap !== action ? gap : '';
   const distinctReason = nextAction && reason !== action && reason !== distinctGap ? reason : '';
   const taskContext = sanitizePeerAuditText(taskRequest, SUPERVISION_CONTINUE_CONTEXT_TASK_BYTES)
-    || '(use the existing conversation context)';
+    || copy.continueTask;
   const resultContext = assistantResponse?.trim()
     ? sanitizePeerAuditText(assistantResponse, SUPERVISION_CONTINUE_CONTEXT_RESULT_BYTES)
     : '';
   return [
     `[Contract: ${contractId}]`,
-    'Continue working on the same task.',
-    `Action: ${action}`,
-    distinctGap ? `Missing: ${distinctGap}` : null,
-    distinctReason ? `Why: ${distinctReason}` : null,
-    'Do only this remaining work; do not repeat completed work. If it cannot proceed, state the exact blocker.',
-    buildCompactContinueRulesSection(detail) || null,
-    `Task context: ${taskContext}`,
-    resultContext ? `Last result: ${resultContext}` : null,
+    copy.continueTask,
+    `${copy.executionMode}${separator}${executionMode}`,
+    `${copy.actionHint}${separator}${action}`,
+    distinctGap ? `${copy.gapHint}${separator}${distinctGap}` : null,
+    distinctReason ? `${copy.reasonHint}${separator}${distinctReason}` : null,
+    copy.ownContext,
+    copy.noSafeWork,
+    buildExecutionStatusContract(parsed.uiLocale),
+    buildCompactContinueRulesSection(detail, parsed.uiLocale) || null,
+    `${copy.taskContext}${separator}${taskContext}`,
+    resultContext ? `${copy.lastResult}${separator}${resultContext}` : null,
   ].filter((line): line is string => line !== null).join('\n');
 }
 
@@ -561,15 +698,17 @@ export function buildReworkBriefPrompt(
    */
   budget?: { attempt: number; limit: number },
   auditTargetSessionName?: string,
+  uiLocale?: SupervisionUiLocale,
 ): string {
+  const copy = resolveExecutionPromptCopy(uiLocale);
   const findings = sanitizePeerAuditText(verdictText, SUPERVISION_REWORK_FINDINGS_BYTES);
   const taskContext = sanitizePeerAuditText(userText, SUPERVISION_REWORK_TASK_BYTES)
-    || '(use the existing conversation context)';
+    || copy.continueTask;
   return [
     `[Contract: ${SUPERVISION_CONTRACT_IDS.REWORK_BRIEF}]`,
     'Audit verdict: REWORK',
     `Fix these findings, then run the relevant validation:\n${findings}`,
-    'Fix and validate autonomously. Do not pause just to say you are ready.',
+    copy.reworkLoop,
     ...(auditTargetSessionName ? [
       `Fresh re-audit target ID: ${auditTargetSessionName}`,
       `After the repair is reviewable, generate a fresh unique attempt ID, prepare one concise, self-contained re-audit brief yourself from the current context, and send it immediately with send_message(target=${JSON.stringify(auditTargetSessionName)}, reply=true, audit={"kind":"supervision_audit","attemptId":"<that-fresh-attempt-id>"}, message="<your re-audit brief>"). Include the same attempt ID inside the brief. Do not call send_list_targets, do not poll, and do not wait for the daemon or user to start this next audit.`,
@@ -581,6 +720,6 @@ export function buildReworkBriefPrompt(
       ? [`Repair attempt ${budget.attempt} of ${budget.limit}. On the last attempt, fix what matters most or report an exact blocker; do not assume another round follows.`]
       : []),
     'Do not stage, commit, push, merge, release, publish, or deploy until a fresh matching audit returns PASS.',
-    `Task context: ${taskContext}`,
+    `${copy.taskContext}: ${taskContext}`,
   ].join('\n');
 }

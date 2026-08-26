@@ -10,6 +10,7 @@ import { readTailLines, timelineStore } from './timeline-store.js';
 import type { TimelineEvent } from './timeline-event.js';
 import {
   supervisionBroker,
+  type SupervisionDecision,
   type SupervisionProviderFailure,
   type SupervisionRecentEvidence,
 } from './supervision-broker.js';
@@ -26,9 +27,11 @@ import {
   SUPERVISION_MODE,
   SUPERVISION_UNAVAILABLE_REASONS,
   extractSessionSupervisionSnapshot,
+  parseSupervisionExecutionStateDetailsFromText,
   resolveSupervisionCustomInstructionsDetail,
   normalizeSupervisionUiLocale,
   type SessionSupervisionSnapshot,
+  type SupervisionExecutionState,
   type SupervisionUnavailableReason,
   type TaskRunTerminalState,
 } from '../../shared/supervision-config.js';
@@ -393,11 +396,13 @@ function classifyContinueBucket(decision: { nextAction?: string; gap?: string; r
 const REPOSITORY_FINALIZATION_ACTION_RE = /(?:\b(?:git\s+(?:add|commit|push|merge)|commit|push|stage|staging|merge|release|deploy|publish)\b|提交|推送|暂存|合并|发布|部署|上线)/iu;
 const SUBSTANTIVE_PRE_AUDIT_ACTION_RE = /(?:\b(?:test|tests|testing|typecheck|lint|build|verify|verification|validate|validation|fix|repair|implement|edit|modify|update|write|refactor|restart)\b|测试|类型检查|构建|验证|修复|实现|修改|更新|编写|重构|重启)/iu;
 const COMPLETED_PRE_AUDIT_WORK_RE = /(?:\b(?:implementation|fix(?:es)?|coding|changes?|tests?|testing|typecheck|lint|build|verification|validation)\b[\s\S]{0,80}\b(?:complete|completed|done|finished|pass(?:ed)?)\b|(?:修复|实现|代码|改动|测试|验证|检查|类型检查|构建)[\s\S]{0,60}(?:已完成|已经完成|均已完成|全部完成|完成并通过|已通过|验证通过|测试通过))/iu;
-const PENDING_PRE_AUDIT_WORK_RE = /(?:\b(?:still|yet|remaining|pending|missing|failed?|incomplete|need(?:s)?\s+to|must)\b[\s\S]{0,50}\b(?:implementation|fix(?:es)?|tests?|testing|typecheck|lint|build|verification|validation)\b|\b(?:implementation|fix(?:es)?|tests?|testing|typecheck|lint|build|verification|validation)\b[\s\S]{0,50}\b(?:remain(?:s|ing)?|pending|missing|fail(?:ed|ing)?|incomplete|not\s+(?:done|complete)|need(?:s)?|required)\b|(?:仍|还|尚|待|未|缺少|失败)[\s\S]{0,30}(?:测试|验证|修复|实现|构建|类型检查)|(?:测试|验证|修复|实现|构建|类型检查)[\s\S]{0,30}(?:未完成|仍需|还需|待处理|失败|缺失|未通过))/iu;
+const PENDING_PRE_AUDIT_WORK_RE = /(?:\b(?:still|yet|remaining|pending|missing|failed?|incomplete|need(?:s)?\s+to|must)\b[^\n.;]{0,50}\b(?:implementation|fix(?:es)?|tests?|testing|typecheck|lint|build|verification|validation)\b|\b(?:implementation|fix(?:es)?|tests?|testing|typecheck|lint|build|verification|validation)\b[^\n.;]{0,50}\b(?:remain(?:s|ing)?|pending|missing|fail(?:ed|ing)?|incomplete|not\s+(?:done|complete)|need(?:s)?|required)\b|\b(?:current|remaining|open|unresolved|major)\b[^\n.;]{0,30}\b(?:code\s+)?blocker(?:s)?\b|\bnot\s+(?:yet\s+)?(?:actually\s+)?(?:implemented|wired|connected|driven|complete)\b|\bcannot\s+(?:mark|check)[^\n.;]{0,30}\bcomplete\b|(?:仍|还|尚|待|未|缺少|失败)[^\n。；;]{0,30}(?:测试|验证|修复|实现|构建|类型检查)|(?:测试|验证|修复|实现|构建|类型检查)[^\n。；;]{0,30}(?:未完成|仍需|还需|待处理|失败|缺失|未通过)|(?:当前|主要|未解决)[^\n。；;]{0,20}(?:代码|实现|功能)?阻断|(?:尚未|仍未|还未)(?:真正|实际)?(?:驱动|接入|实现|完成|连通|验证)|完成前不能(?:勾选|标记|视为))/iu;
 const NEW_AUDIT_DELEGATION_RE = /(?:\b(?:send|dispatch|delegate|construct|prepare)\b[\s\S]{0,100}\b(?:reply[- ]enabled|peer\s+audit|independent\s+(?:audit|review)|audit\s+brief)\b|\b(?:reply[- ]enabled|peer\s+audit|audit\s+brief)\b[\s\S]{0,100}\b(?:send|dispatch|delegate|construct|prepare)\b|(?:发送|补发|构造|准备|委派|发起)[\s\S]{0,80}(?:带回复|可回复|独立)?(?:审计|审核|复审)(?:简报|任务|请求)?)/iu;
 const FORBIDS_NEW_AUDIT_RE = /(?:\b(?:do\s+not|don't|never)\b[\s\S]{0,50}\b(?:send|dispatch|delegate|request|start)\b[\s\S]{0,30}\b(?:audit|review)\b|(?:不要|不得|禁止)[\s\S]{0,50}(?:发送|发起|委派|请求|开始)[\s\S]{0,30}(?:审计|审核|复审))/iu;
 const WAITING_FOR_PEER_AUDIT_RE = /(?:\b(?:peer[- ]audit|independent\s+(?:audit|review)|audit)\b[\s\S]{0,80}\b(?:pass|verdict|reply|result|receipt)\b|\b(?:pass|verdict|reply|result|receipt)\b[\s\S]{0,80}\b(?:peer[- ]audit|independent\s+(?:audit|review))\b|(?:等待|等候|尚未收到|未收到|阻塞)[\s\S]{0,60}(?:独立)?(?:审计|审核|复审)[\s\S]{0,30}(?:通过|结论|裁决|回复|回执|结果)?)/iu;
 const POST_AUDIT_REPOSITORY_FINALIZATION_ACTION = 'Peer-audit has passed. Perform only the already-audited repository or delivery finalization requested for this task (stage/commit/push, merge, release, publish, or deploy as applicable). Do not perform additional implementation work. Do not request or start another audit.';
+const SUPERVISED_REPOSITORY_FINALIZATION_ACTION = 'Implementation and validation are complete. Perform only the repository or delivery finalization explicitly requested by the task or user supervision rules; do not invent delivery work.';
+const PRE_AUDIT_SELF_RECONCILIATION_ACTION = 'Advance safe unfinished task-owned work from your own context in this same turn; do not stop at a status summary. If none can be safely advanced, report the exact human blocker. Do not stage, commit, push, merge, release, publish, or deploy before peer-audit PASS.';
 const COMPLETED_REPOSITORY_FINALIZATION_RE = /(?:\bcommit\s*:\s*[0-9a-f]{7,40}\b|\bpush\s*:\s*(?:origin\/)?[^\s]+\s+(?:succeeded|successful|done|complete)|\b(?:committed|pushed|merged|released|published|deployed)\b|(?:已完成并)?(?:提交并推送|提交且推送)|(?:已|成功)(?:提交|推送|合并|发布|部署)|推送成功)/iu;
 const AUDIT_WORTHY_TASK_RE = /(?:\b(?:implement|fix|add|remove|delete|change|modify|update|refactor|optimi[sz]e|build|configure|migrate|install|uninstall)\b|(?:修复|实现|新增|添加|删除|修改|改成|调整|重构|优化|美化|配置|迁移|安装|卸载))/iu;
 const COMPLETED_ENGINEERING_WORK_RE = /(?:\b(?:implemented|fixed|added|removed|deleted|changed|modified|updated|refactored|optimized|built|configured|migrated|installed|uninstalled)\b|\b(?:implementation|fix(?:es)?|changes?|tests?|typecheck|lint|build|validation|verification)\b[\s\S]{0,60}\b(?:complete|completed|done|passed)\b|(?:已|已经)(?:完成|实现|修复|新增|添加|删除|修改|调整|重构|优化|美化|配置|迁移|安装|卸载)|(?:实现|修复|改动|测试|验证|类型检查|构建)[\s\S]{0,30}(?:完成|通过))/iu;
@@ -469,12 +474,17 @@ function classifyRepositoryFinalization(
   assistantResponse: string | undefined,
 ): RepositoryFinalizationClassification {
   if (!hasRepositoryFinalizationAction(decision)) return 'none';
+  const assistantEvidence = assistantResponse?.trim() ?? '';
+  // A finalization-only broker decision is not progress authority. If the
+  // executing session explicitly reports unfinished implementation or a real
+  // blocker, keep working (or ask for the needed human input) instead of
+  // auditing/finalizing a partial revision.
+  if (PENDING_PRE_AUDIT_WORK_RE.test(assistantEvidence)) return 'none';
   if (isRepositoryFinalizationOnly(decision)) return 'finalization_only';
 
   const decisionEvidence = [decision.reason, decision.gap]
     .filter((entry): entry is string => typeof entry === 'string' && entry.trim().length > 0)
     .join(' ');
-  const assistantEvidence = assistantResponse?.trim() ?? '';
   if (!COMPLETED_PRE_AUDIT_WORK_RE.test(decisionEvidence)
     || !COMPLETED_PRE_AUDIT_WORK_RE.test(assistantEvidence)
     || PENDING_PRE_AUDIT_WORK_RE.test(decisionEvidence)
@@ -777,7 +787,7 @@ function buildReworkBrief(run: ActiveTaskRunState, verdictText: string): string 
   return buildReworkBriefPrompt(run.sessionName, run.userText, run.lastAssistantText, verdictText, {
     attempt: run.reworkDispatches,
     limit: run.snapshot.maxAuditLoops,
-  }, run.snapshot.auditTargetSessionName);
+  }, run.snapshot.auditTargetSessionName, run.snapshot.uiLocale);
 }
 
 function isFinalAssistantPayload(payload: Record<string, unknown>): boolean {
@@ -2130,10 +2140,21 @@ class SupervisionAutomation {
     // silently discard the very verdict it was waiting for.
     this.clearWaitingTimeout(current);
 
+    // Normal execution turns carry one exact, prefixed status marker. Trusting
+    // that small protocol avoids a supervisor-model call on every step; absent
+    // or conflicting markers deliberately fall through to the broker.
+    const executionStatus = parseSupervisionExecutionStateDetailsFromText(current.lastAssistantText ?? '');
+    if (executionStatus.state) {
+      current.evaluating = false;
+      this.clearStatus(run.sessionName);
+      await this.handleExecutionStatus(current, executionStatus.state);
+      return;
+    }
+
     const record = getSession(run.sessionName);
-    let decision;
+    let brokerDecision;
     try {
-      decision = await supervisionBroker.decide({
+      brokerDecision = await supervisionBroker.decide({
         snapshot: enrichSnapshotWithGlobalDefaults(current.snapshot),
         targetSessionId: record?.sessionInstanceId ?? run.sessionName,
         taskRequest: current.userText,
@@ -2158,10 +2179,33 @@ class SupervisionAutomation {
     const deterministicAuditRequired = latest.snapshot.mode === SUPERVISION_MODE.SUPERVISED_AUDIT
       && turnHasDeterministicAuditEvidence(latest.userText, latest.lastAssistantText);
     latest.requiresAudit = latest.freshAuditRequiredAfterRework
-      || (!reportedAuditPass && (decision.requiresAudit !== false || deterministicAuditRequired));
+      || (!reportedAuditPass && (brokerDecision.requiresAudit !== false || deterministicAuditRequired));
     // A rework round re-opens the full surface: the previous verdict already
     // said the narrow read was not enough.
-    latest.auditDepth = latest.freshAuditRequiredAfterRework ? 'standard' : decision.auditDepth ?? 'standard';
+    latest.auditDepth = latest.freshAuditRequiredAfterRework ? 'standard' : brokerDecision.auditDepth ?? 'standard';
+    const assistantReportsPendingPreAuditWork = latest.phase === 'execution'
+      && latest.snapshot.mode === SUPERVISION_MODE.SUPERVISED_AUDIT
+      && PENDING_PRE_AUDIT_WORK_RE.test(latest.lastAssistantText ?? '');
+
+    const decision: SupervisionDecision = brokerDecision.decision === 'complete' && assistantReportsPendingPreAuditWork
+      ? {
+        ...brokerDecision,
+        decision: 'continue',
+        reason: 'The latest result explicitly identifies unfinished task work; the supervisor completion judgment may be stale.',
+        gap: 'Reconcile the unfinished work from the current session context before peer audit.',
+        nextAction: PRE_AUDIT_SELF_RECONCILIATION_ACTION,
+        requiresAudit: true,
+      }
+      : brokerDecision;
+
+    if (brokerDecision.decision === 'complete' && assistantReportsPendingPreAuditWork) {
+      // The broker sees a bounded snapshot and can mistake a passing sub-check
+      // for completion of the larger task. The executing session's explicit
+      // unfinished-work report is the stronger progress signal. Keep the run in
+      // execution and ask it to reconcile/advance what it actually knows rather
+      // than starting an audit of an incomplete revision.
+      latest.requiresAudit = true;
+    }
 
     switch (decision.decision) {
       case 'complete': {
@@ -2248,42 +2292,26 @@ class SupervisionAutomation {
           await this.startAudit(latest);
           return;
         }
-        const continueBucket = classifyContinueBucket({
-          reason: decision.reason,
-          nextAction: decision.nextAction,
-          gap: decision.gap,
-        });
-        const nextStreakCount = latest.lastContinueBucket === continueBucket
-          ? latest.continueStreakCount + 1
-          : 1;
-        const maxAutoContinueStreak = latest.snapshot.maxAutoContinueStreak ?? SUPERVISION_DEFAULT_MAX_AUTO_CONTINUE_STREAK;
-        const maxAutoContinueTotal = latest.snapshot.maxAutoContinueTotal ?? SUPERVISION_DEFAULT_MAX_AUTO_CONTINUE_TOTAL;
-
-        if (maxAutoContinueStreak > 0 && nextStreakCount > maxAutoContinueStreak) {
-          this.emitWarning(run.sessionName, `Automation reached the repeated auto-continue limit (${maxAutoContinueStreak}) for ${continueBucket}; handing control back to the human.`);
-          this.finishRun(run.sessionName, 'needs_input');
-          return;
-        }
-        if (maxAutoContinueTotal > 0 && latest.continueLoops >= maxAutoContinueTotal) {
-          this.emitWarning(run.sessionName, `Automation reached the auto-continue hard limit (${maxAutoContinueTotal}); handing control back to the human.`);
-          this.finishRun(run.sessionName, 'needs_input');
-          return;
-        }
-        latest.lastContinueBucket = continueBucket;
-        latest.continueStreakCount = nextStreakCount;
         // Forward the full decision so the continue prompt can lead with
         // the supervisor's concrete nextAction. Without this, the target
         // agent only sees the reason and has to infer what to do next —
         // which historically caused the "rewrite same answer" loop.
-        const guardedNextAction = latest.phase === 'execution'
+        const guardsPreAuditFinalization = latest.phase === 'execution'
           && latest.snapshot.mode === SUPERVISION_MODE.SUPERVISED_AUDIT
-          && hasRepositoryFinalizationAction(decision)
-          ? 'Complete only the remaining substantive implementation or validation work described by the supervisor. Do not stage, commit, or push; do not merge, release, publish, or deploy. Repository and delivery finalization are deferred until peer-audit PASS.'
+          && hasRepositoryFinalizationAction(decision);
+        const guardedNextAction = guardsPreAuditFinalization
+          ? PRE_AUDIT_SELF_RECONCILIATION_ACTION
           : decision.nextAction;
-        await this.dispatchContinue(latest, {
-          reason: decision.reason,
+        const guardedReason = guardsPreAuditFinalization && assistantReportsPendingPreAuditWork
+          ? 'The latest result explicitly identifies unfinished task work. Treat the supervisor finalization hint as advisory, reconcile the real progress from current context, and continue only safe actionable work.'
+          : decision.reason;
+        const guardedGap = guardsPreAuditFinalization && assistantReportsPendingPreAuditWork
+          ? undefined
+          : decision.gap;
+        await this.dispatchContinueWithinLimits(latest, {
+          reason: guardedReason,
           nextAction: guardedNextAction,
-          gap: decision.gap,
+          gap: guardedGap,
         });
         return;
       }
@@ -2333,6 +2361,90 @@ class SupervisionAutomation {
         this.finishRun(run.sessionName, 'needs_input', { preserveStatus: true });
       }
     }
+  }
+
+  private async handleExecutionStatus(
+    run: ActiveTaskRunState,
+    state: SupervisionExecutionState,
+  ): Promise<void> {
+    const current = this.activeRuns.get(run.sessionName);
+    if (!current || current.generation !== run.generation) return;
+
+    switch (state) {
+      case 'advance':
+        await this.dispatchContinueWithinLimits(current, {
+          reason: 'The execution status reports safe unfinished work.',
+          nextAction: current.phase === 'finalizing'
+            ? POST_AUDIT_REPOSITORY_FINALIZATION_ACTION
+            : 'Advance the safest unfinished task-owned work from current context now.',
+        });
+        return;
+      case 'audit_ready':
+        current.terminalState = 'complete';
+        if (current.phase === 'finalizing') {
+          this.emitAutomationNote(current.sessionName, 'Auto: audited finalization completed.', 'supervision-post-audit-complete');
+          this.emitTerminalStatus(current.sessionName, 'supervision_complete', SUPERVISION_COMPLETE_LABEL);
+          this.finishRun(current.sessionName, 'complete', { preserveStatus: true });
+        } else if (current.snapshot.mode === SUPERVISION_MODE.SUPERVISED_AUDIT) {
+          current.requiresAudit = true;
+          current.auditDepth = current.freshAuditRequiredAfterRework ? 'standard' : current.auditDepth ?? 'standard';
+          await this.startAudit(current);
+        } else if (hasExplicitRepositoryFinalizationRequirement([
+          current.userText,
+          resolveSupervisionCustomInstructionsDetail(
+            enrichSnapshotWithGlobalDefaults(current.snapshot),
+          ).text,
+        ].filter(Boolean).join('\n'))) {
+          current.terminalState = undefined;
+          await this.dispatchContinueWithinLimits(current, {
+            reason: 'Implementation and validation are complete; explicit delivery work remains.',
+            nextAction: SUPERVISED_REPOSITORY_FINALIZATION_ACTION,
+          });
+        } else {
+          this.emitAutomationNote(current.sessionName, 'Auto: task reported implementation and validation complete.', 'supervision-complete');
+          this.emitTerminalStatus(current.sessionName, 'supervision_complete', SUPERVISION_COMPLETE_LABEL);
+          this.finishRun(current.sessionName, 'complete', { preserveStatus: true });
+        }
+        return;
+      case 'needs_input':
+        this.emitTerminalStatus(current.sessionName, 'supervision_needs_input', SUPERVISION_NEEDS_INPUT_LABEL);
+        this.emitWarning(current.sessionName, 'Automation returned control because the executing session reported a human-input blocker.');
+        this.finishRun(current.sessionName, 'needs_input', { preserveStatus: true });
+        return;
+      case 'waiting':
+        this.emitStatus(current.sessionName, 'supervision_parked', SUPERVISION_PARKED_LABEL);
+        this.emitAutomationNote(current.sessionName, 'Auto: parked on the executing session\'s reported external reply.', 'supervision-parked');
+        this.armWaitingTimeout(current);
+        return;
+    }
+  }
+
+  private async dispatchContinueWithinLimits(
+    run: ActiveTaskRunState,
+    decision: { reason: string; nextAction?: string; gap?: string },
+  ): Promise<void> {
+    const current = this.activeRuns.get(run.sessionName);
+    if (!current || current.generation !== run.generation) return;
+    const continueBucket = classifyContinueBucket(decision);
+    const nextStreakCount = current.lastContinueBucket === continueBucket
+      ? current.continueStreakCount + 1
+      : 1;
+    const maxAutoContinueStreak = current.snapshot.maxAutoContinueStreak ?? SUPERVISION_DEFAULT_MAX_AUTO_CONTINUE_STREAK;
+    const maxAutoContinueTotal = current.snapshot.maxAutoContinueTotal ?? SUPERVISION_DEFAULT_MAX_AUTO_CONTINUE_TOTAL;
+
+    if (maxAutoContinueStreak > 0 && nextStreakCount > maxAutoContinueStreak) {
+      this.emitWarning(current.sessionName, `Automation reached the repeated auto-continue limit (${maxAutoContinueStreak}) for ${continueBucket}; handing control back to the human.`);
+      this.finishRun(current.sessionName, 'needs_input');
+      return;
+    }
+    if (maxAutoContinueTotal > 0 && current.continueLoops >= maxAutoContinueTotal) {
+      this.emitWarning(current.sessionName, `Automation reached the auto-continue hard limit (${maxAutoContinueTotal}); handing control back to the human.`);
+      this.finishRun(current.sessionName, 'needs_input');
+      return;
+    }
+    current.lastContinueBucket = continueBucket;
+    current.continueStreakCount = nextStreakCount;
+    await this.dispatchContinue(current, decision);
   }
 
   private finishRun(
@@ -2676,9 +2788,9 @@ class SupervisionAutomation {
 
   private async dispatchContinue(
     run: ActiveTaskRunState,
-    /** Pass the full decision so the target agent receives a concrete
-     *  imperative nextAction instead of just a vague reason string — this
-     *  is what breaks the supervision loop. */
+    /** Pass the broker fields as bounded advisory hints. The standardized
+     * execution mode and the target session's fuller context decide how work
+     * advances; the supervisor does not remotely author implementation steps. */
     decision: { reason: string; nextAction?: string; gap?: string },
   ): Promise<void> {
     const current = this.activeRuns.get(run.sessionName);
@@ -2701,9 +2813,13 @@ class SupervisionAutomation {
     const continuePrompt = buildSupervisionContinuePrompt(
       current.userText,
       current.lastAssistantText,
-      // Pass the full structured instructions; the builder leads with
-      // nextAction so the agent has something concrete to execute.
-      { reason: decision.reason, nextAction: decision.nextAction, gap: decision.gap },
+      {
+        reason: decision.reason,
+        nextAction: decision.nextAction,
+        gap: decision.gap,
+        executionMode: postAuditFinalization ? 'finalize_audited_work' : 'advance_safe_work',
+        uiLocale: current.snapshot.uiLocale,
+      },
       resolveSupervisionCustomInstructionsDetail(enrichSnapshotWithGlobalDefaults(current.snapshot)),
     );
     current.continueLoops += 1;

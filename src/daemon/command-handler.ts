@@ -103,7 +103,10 @@ import { PROVIDER_ERROR_CODES } from '../agent/transport-provider.js';
 import { refreshCodexQuotaMetadataForSessions } from './codex-quota-refresh.js';
 import { fetchCodexResetCredits, consumeCodexResetCredit } from '../agent/codex-reset-credits.js';
 import { supervisionAutomation } from './supervision-automation.js';
-import { SUPERVISED_AUDIT_EXECUTION_PREAMBLE } from './supervision-prompts.js';
+import {
+  buildSupervisedAuditExecutionPreamble,
+  buildSupervisionExecutionPreamble,
+} from './supervision-prompts.js';
 import {
   getEnabledP2pMemberNames,
   isP2pMemberEligibleSession,
@@ -3945,8 +3948,10 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   const agentMessagePreamble = mergeAgentMessagePreambles(
     preferenceMessagePreamble,
     attachmentRetentionPreamble,
-    shouldTrackSupervisionTaskRun && supervisionSnapshot.mode === SUPERVISION_MODE.SUPERVISED_AUDIT
-      ? SUPERVISED_AUDIT_EXECUTION_PREAMBLE
+    shouldTrackSupervisionTaskRun
+      ? supervisionSnapshot.mode === SUPERVISION_MODE.SUPERVISED_AUDIT
+        ? buildSupervisedAuditExecutionPreamble(supervisionSnapshot.uiLocale)
+        : buildSupervisionExecutionPreamble(supervisionSnapshot.uiLocale)
       : undefined,
   );
   schedulePreferencePersistence({

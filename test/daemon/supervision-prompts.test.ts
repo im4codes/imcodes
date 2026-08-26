@@ -2,6 +2,8 @@ import { describe, expect, it } from 'vitest';
 import { normalizeSessionSupervisionSnapshot, SUPERVISION_MODE } from '../../shared/supervision-config.js';
 import {
   SUPERVISED_AUDIT_EXECUTION_PREAMBLE,
+  buildSupervisedAuditExecutionPreamble,
+  buildSupervisionExecutionPreamble,
   buildPeerAuditBriefV1,
   buildReworkBriefPrompt,
   buildSupervisionContinuePrompt,
@@ -38,12 +40,23 @@ describe('supervision prompts', () => {
   });
 
   it('keeps the supervised-audit execution preamble wording stable', () => {
-    expect(SUPERVISED_AUDIT_EXECUTION_PREAMBLE).toContain('DO NOT run git add, commit, push, merge, release, publish, deploy');
-    expect(SUPERVISED_AUDIT_EXECUTION_PREAMBLE).toContain('even when the user requested final delivery');
-    expect(SUPERVISED_AUDIT_EXECUTION_PREAMBLE).toContain('in this turn');
-    expect(SUPERVISED_AUDIT_EXECUTION_PREAMBLE).toContain('prepare the re-audit brief yourself');
-    expect(SUPERVISED_AUDIT_EXECUTION_PREAMBLE).toContain('send the fresh reply-enabled audit exactly as instructed in the REWORK brief');
+    expect(SUPERVISED_AUDIT_EXECUTION_PREAMBLE).toContain('DO NOT stage, commit, push, merge, release, publish, or deploy before PASS');
+    expect(SUPERVISED_AUDIT_EXECUTION_PREAMBLE).toContain('On REWORK, fix and validate immediately');
+    expect(SUPERVISED_AUDIT_EXECUTION_PREAMBLE).toContain('<!-- IMCODES_EXEC: AUDIT_READY -->');
     expect(SUPERVISED_AUDIT_EXECUTION_PREAMBLE).not.toContain('enforced in code');
+
+    const zhPrompt = buildSupervisedAuditExecutionPreamble('zh-CN');
+    expect(zhPrompt).toContain('同伴审计模式');
+    expect(zhPrompt).toContain('收到 REWORK 后立即修复并验证');
+    expect(zhPrompt).toContain('回复中只用一个状态标记');
+  });
+
+  it('gives ordinary supervised turns the same short localized status protocol', () => {
+    const prompt = buildSupervisionExecutionPreamble('zh-CN');
+    expect(prompt).toContain('以你自己的上下文为准');
+    expect(prompt).toContain('<!-- IMCODES_EXEC: ADVANCE -->');
+    expect(prompt).toContain('<!-- IMCODES_EXEC: AUDIT_READY -->');
+    expect(prompt).not.toContain('PASS 前不得');
   });
 
   it('builds a bounded lightweight brief with non-destructive executable validation and structured reply', () => {
@@ -198,6 +211,10 @@ describe('supervision prompts', () => {
     });
 
     expect(prompt).toContain('Peer audit MUST finish before repository or delivery finalization');
+    expect(prompt).toContain('decision is the standardized execution-mode enum');
+    expect(prompt).toContain('continue = advance_safe_work');
+    expect(prompt).toContain('waiting = wait_external');
+    expect(prompt).toContain('ask_human = report_blocker');
     expect(prompt).toContain('A REWORK verdict means the previous audit did NOT pass');
     expect(prompt).toContain('require a fresh matching peer audit and a new PASS before any git add/commit/push');
     expect(prompt).toContain('merge, release, publish, or deploy');
@@ -217,6 +234,10 @@ describe('supervision prompts', () => {
     expect(prompt).toContain('never recursively audit an audit-status turn');
     expect(prompt).toContain('A task that starts as a check but proceeds to modify/fix something requires audit unless its matching audit is already pending or passed.');
     expect(prompt).toContain('Do not reinterpret completed engineering work as a read-only status check');
+    expect(prompt).toContain('latest checklist and blockers are progress authority');
+    expect(prompt).toContain('One passing slice or uncommitted files do not prove completion');
+    expect(prompt).toContain('the executor advances it now, not merely summarizes it');
+    expect(prompt).toContain('Return ask_human only for an exact decision');
   });
 
   it('locks human-readable supervisor output to the task UI locale', () => {
@@ -267,7 +288,7 @@ describe('supervision prompts', () => {
     expect(prompt).toContain('Do not call send_list_targets');
     expect(prompt).toContain('do not wait for the daemon or user to start this next audit');
     expect(prompt).toContain('self-prepared re-audit cycle until PASS');
-    expect(prompt).toContain('Fix and validate autonomously');
+    expect(prompt).toContain('On REWORK, fix and validate immediately');
     expect(prompt).not.toContain('the daemon starts one fresh audit for the repaired revision');
     expect(prompt).not.toContain('Do not delegate or poll an auditor yourself');
     expect(prompt).toContain('Do not stage, commit, push, merge, release, publish, or deploy until a fresh matching audit returns PASS.');
@@ -313,8 +334,10 @@ describe('supervision prompts', () => {
 
     // The lightweight nudge contract and user-supplied custom instructions
     // (which ARE session-scoped guidance, not operator docs) stay.
-    expect(prompt).toContain('Continue working on the same task.');
-    expect(prompt).toContain('Action: OpenSpec and follow-up work remain');
+    expect(prompt).toContain('Continue the same task.');
+    expect(prompt).toContain('Execution mode: advance_safe_work');
+    expect(prompt).toContain('Supervisor hint (verify first): OpenSpec and follow-up work remain');
+    expect(prompt).toContain('advance safe unfinished work now; do not stop at a summary');
     expect(prompt).toContain('Prefer OpenSpec when a change is already referenced.');
     expect(prompt).toContain('Task context:');
     expect(prompt).toContain('Finish the task with the right IM.codes tools');

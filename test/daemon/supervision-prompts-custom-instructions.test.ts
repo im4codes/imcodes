@@ -127,7 +127,7 @@ describe('supervision prompt custom-instructions merge', () => {
     expect(prompt).not.toContain('Session-specific supervision rules set by the user');
   });
 
-  it('buildSupervisionContinuePrompt leads with nextAction when structured instructions are supplied', () => {
+  it('buildSupervisionContinuePrompt presents supervisor fields as advisory and requires same-turn grounded progress', () => {
     // This is the loop-breaker: when the supervisor supplied a concrete
     // nextAction, the target must see it as the first imperative line.
     // Without this the agent only saw the reason field and kept rewriting
@@ -141,12 +141,16 @@ describe('supervision prompt custom-instructions merge', () => {
         gap: 'no test covers the new fallback branch',
       },
     );
-    expect(prompt).toContain('Action: Add a regression test for the new guardrail and run `npx vitest run`.');
-    expect(prompt).toContain('Missing: no test covers the new fallback branch');
-    expect(prompt).toContain('Why: tests missing');
+    expect(prompt).toContain('Execution mode: advance_safe_work');
+    expect(prompt).toContain('Supervisor hint (verify first): Add a regression test for the new guardrail and run `npx vitest run`.');
+    expect(prompt).toContain('Reported gap (advisory): no test covers the new fallback branch');
+    expect(prompt).toContain('Rationale (advisory): tests missing');
+    expect(prompt).toContain('advance safe unfinished work now; do not stop at a summary');
+    expect(prompt).toContain('If none is safe, report the exact human blocker');
+    expect(prompt).toContain('Uncommitted files alone are not completion');
     // Action appears before the supporting reason.
-    const idxNext = prompt.indexOf('Action:');
-    const idxReason = prompt.indexOf('Why:');
+    const idxNext = prompt.indexOf('Supervisor hint');
+    const idxReason = prompt.indexOf('Rationale (advisory)');
     expect(idxNext).toBeGreaterThanOrEqual(0);
     expect(idxReason).toBeGreaterThanOrEqual(0);
     expect(idxNext).toBeLessThan(idxReason);
@@ -160,8 +164,21 @@ describe('supervision prompt custom-instructions merge', () => {
     );
     expect(prompt).not.toContain('Next action required:');
     expect(prompt).not.toContain("What's missing:");
-    expect(prompt).toContain('Action: just continue');
-    expect(prompt).not.toContain('Why: just continue');
+    expect(prompt).toContain('Supervisor hint (verify first): just continue');
+    expect(prompt).not.toContain('Rationale (advisory): just continue');
+  });
+
+  it('localizes supervisor continuation prompts while keeping protocol markers stable', () => {
+    const prompt = buildSupervisionContinuePrompt(
+      '完成任务',
+      '还有安全工作',
+      { reason: '继续实现', uiLocale: 'zh-CN' },
+    );
+    expect(prompt).toContain('继续同一任务。');
+    expect(prompt).toContain('监督提示（先核对）：继续实现');
+    expect(prompt).toContain('本轮立即推进可安全处理的未完成项');
+    expect(prompt).toContain('<!-- IMCODES_EXEC: ADVANCE -->');
+    expect(prompt).not.toContain('Continue the same task.');
   });
 
   it('bounds repeated task/result context and removes nested control lines', () => {
