@@ -5903,9 +5903,9 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
               )}
             </>
           )}
+        </div>}
         </div>
         )}
-        </div>}
       </div>}
 
       {pendingTransportApproval && effectiveRuntimeType === 'transport' && (
