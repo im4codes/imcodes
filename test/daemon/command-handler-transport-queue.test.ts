@@ -4018,6 +4018,7 @@ describe('handleWebCommand transport queue behavior', () => {
       undefined,
       expect.stringContaining('回复中只用一个状态标记：<!-- IMCODES_EXEC: ADVANCE -->'),
     );
+    expect(String(transportSend.mock.calls[0]?.[3])).toContain('对方仍有工作都不算');
     expect(registerTaskIntentMock).toHaveBeenCalledWith(
       'deck_transport_brain',
       'cmd-heavy',
@@ -4065,6 +4066,7 @@ describe('handleWebCommand transport queue behavior', () => {
 
     const preamble = String(transportSend.mock.calls[0]?.[3]);
     expect(preamble).toContain('以你自己的上下文为准');
+    expect(preamble).toContain('对方仍有工作都不算');
     expect(preamble).toContain('<!-- IMCODES_EXEC: AUDIT_READY -->');
     expect(preamble).not.toContain('PASS 前不得');
   });

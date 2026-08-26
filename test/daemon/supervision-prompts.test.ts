@@ -62,8 +62,8 @@ describe('supervision prompts', () => {
     const prompt = buildSupervisionExecutionPreamble('zh-CN');
     expect(prompt).toContain('以你自己的上下文为准');
     expect(prompt).toContain('不得用状态标记代替执行');
-    expect(prompt).toContain('本轮已有实质进展');
-    expect(prompt).toContain('仅剩委派事项未完成时用');
+    expect(prompt).toContain('当前会话自己下一轮仍会执行具体工作');
+    expect(prompt).toContain('对方仍有工作都不算');
     expect(prompt).toContain('<!-- IMCODES_EXEC: ADVANCE -->');
     expect(prompt).toContain('<!-- IMCODES_EXEC: AUDIT_READY -->');
     expect(prompt).not.toContain('PASS 前不得');
@@ -80,22 +80,31 @@ describe('supervision prompts', () => {
       ko: '상태 마커를 실행 대신 사용하지 마세요',
     } satisfies Record<(typeof SUPERVISION_SUPPORTED_UI_LOCALES)[number], string>;
     const statusNeedles = {
-      en: 'Pending delegated work alone is',
-      'zh-CN': '仅剩委派事项未完成时用',
-      'zh-TW': '僅剩委派事項未完成時用',
-      es: 'Si solo queda trabajo delegado pendiente',
-      ru: 'Если осталось только делегированное ожидание',
-      ja: '委任済み作業の完了待ちだけなら',
-      ko: '위임 작업의 완료만 기다린다면',
+      en: "a delegate's remaining work never counts as",
+      'zh-CN': '对方仍有工作都不算',
+      'zh-TW': '對方仍有工作都不算',
+      es: 'el trabajo pendiente del delegado nunca cuenta como',
+      ru: 'оставшаяся работа исполнителя не считаются',
+      ja: '委任先に残る作業は',
+      ko: '위임 대상에 남은 작업은',
+    } satisfies Record<(typeof SUPERVISION_SUPPORTED_UI_LOCALES)[number], string>;
+    const waitingPriorityNeedles = {
+      en: 'when all known next work is assigned to other sessions, use',
+      'zh-CN': '全部已知后续工作已派给其他会话时必须用',
+      'zh-TW': '全部已知後續工作已派給其他會話時必須用',
+      es: 'si todo el trabajo siguiente conocido se asignó a otras sesiones, usa',
+      ru: 'если вся известная следующая работа назначена другим сеансам, используйте',
+      ja: '既知の次作業をすべて他セッションに委任した場合は',
+      ko: '알려진 후속 작업을 모두 다른 세션에 맡겼다면',
     } satisfies Record<(typeof SUPERVISION_SUPPORTED_UI_LOCALES)[number], string>;
     const heartbeatNeedles = {
-      en: 'still pending but independent safe work exists',
-      'zh-CN': '仍未到但有独立安全工作',
-      'zh-TW': '仍未到但有獨立安全工作',
-      es: 'sigue pendiente pero hay trabajo seguro independiente',
-      ru: 'ответа нет, но есть независимая безопасная работа',
-      ja: '未返信でも独立した安全な作業があれば',
-      ko: '아직 대기 중이어도 독립적인 안전 작업이 있으면',
+      en: 'A delegate still working is not',
+      'zh-CN': '对方仍在工作不算',
+      'zh-TW': '對方仍在工作不算',
+      es: 'Que el delegado siga trabajando no es',
+      ru: 'Работающий исполнитель — не',
+      ja: '委任先が作業中でも',
+      ko: '위임 대상이 작업 중인 것은',
     } satisfies Record<(typeof SUPERVISION_SUPPORTED_UI_LOCALES)[number], string>;
 
     for (const locale of SUPERVISION_SUPPORTED_UI_LOCALES) {
@@ -103,6 +112,7 @@ describe('supervision prompts', () => {
       const heartbeat = buildSupervisionWaitingHeartbeatPrompt(10, locale);
       expect(prompt).toContain(actionNeedles[locale]);
       expect(prompt).toContain(statusNeedles[locale]);
+      expect(prompt).toContain(waitingPriorityNeedles[locale]);
       expect(prompt).toContain(SUPERVISION_EXECUTION_STATUS_MARKERS.ADVANCE);
       expect(prompt).toContain(SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING);
       expect(heartbeat).toContain(heartbeatNeedles[locale]);
@@ -115,7 +125,8 @@ describe('supervision prompts', () => {
     const heartbeat = buildSupervisionWaitingHeartbeatPrompt(10, 'zh-CN');
     expect(heartbeat).toContain('[Contract: supervision_waiting_heartbeat_v1]');
     expect(heartbeat).toContain('已等待 10 分钟');
-    expect(heartbeat).toContain('仍未到但有独立安全工作就现在执行');
+    expect(heartbeat).toContain('仍未到但当前会话有独立安全工作就现在执行');
+    expect(heartbeat).toContain('对方仍在工作不算');
     expect(heartbeat).toContain('<!-- IMCODES_EXEC: WAITING -->');
     expect(heartbeat).not.toContain('Waiting check');
 
