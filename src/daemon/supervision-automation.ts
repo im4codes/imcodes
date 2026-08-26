@@ -79,6 +79,10 @@ import {
 } from './delegation-reply-store.js';
 import { onDelegationReplyDelivered } from './delegation-reply-events.js';
 import { getSessionRuntimeType } from '../../shared/agent-types.js';
+import {
+  localizeSupervisionAutomationNote,
+  localizeSupervisionStatusLabel,
+} from './supervision-i18n.js';
 
 /**
  * Apply the daemon-cached global supervisor runtime to every session. Session
@@ -876,20 +880,39 @@ class SupervisionAutomation {
     );
   }
 
+  private uiLocaleForSession(sessionName: string): string | undefined {
+    const activeLocale = this.activeRuns.get(sessionName)?.snapshot.uiLocale;
+    if (activeLocale) return activeLocale;
+    const record = getSession(sessionName);
+    return record
+      ? extractSessionSupervisionSnapshot(record.transportConfig ?? null)?.uiLocale
+      : undefined;
+  }
+
   private emitAutomationNote(sessionName: string, text: string, kind: string): void {
+    const localizedText = localizeSupervisionAutomationNote(
+      kind,
+      text,
+      this.uiLocaleForSession(sessionName),
+    );
     timelineEmitter.emit(
       sessionName,
       'assistant.text',
-      { text, streaming: false, automation: true, automationKind: kind, memoryExcluded: true },
+      { text: localizedText, streaming: false, automation: true, automationKind: kind, memoryExcluded: true },
       { source: 'daemon', confidence: 'high', eventId: `supervision-note:${sessionName}` },
     );
   }
 
   private emitStatus(sessionName: string, status: string, label: string): void {
+    const localizedLabel = localizeSupervisionStatusLabel(
+      status,
+      label,
+      this.uiLocaleForSession(sessionName),
+    );
     timelineEmitter.emit(
       sessionName,
       'agent.status',
-      { status, label },
+      { status, label: localizedLabel },
       { source: 'daemon', confidence: 'high', eventId: `supervision-status:${sessionName}:${status}` },
     );
   }

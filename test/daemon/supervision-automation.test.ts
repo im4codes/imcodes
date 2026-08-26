@@ -4096,6 +4096,14 @@ describe('SupervisionAutomation', () => {
       await new Promise<void>((resolve) => setImmediate(resolve));
       await new Promise<void>((resolve) => setImmediate(resolve));
 
+      const parkedEvents = timelineEmitter.replay('deck_supervision_brain', 0).events;
+      expect(parkedEvents.some((event) => event.type === 'assistant.text'
+        && event.payload.automationKind === 'supervision-parked'
+        && event.payload.text === '自动：已根据执行会话上报的外部回执进入等待。')).toBe(true);
+      expect(parkedEvents.some((event) => event.type === 'agent.status'
+        && event.payload.status === 'supervision_parked'
+        && event.payload.label === '监督：等待外部回执。')).toBe(true);
+
       await vi.advanceTimersByTimeAsync(10 * 60_000 - 1);
       expect(mockTransportRuntime.send).not.toHaveBeenCalled();
       await vi.advanceTimersByTimeAsync(1);
