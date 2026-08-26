@@ -4351,7 +4351,9 @@ html.native-ios-mac .chat-dl-btn {
    fixed rather than absolute and is not clipped by the chat scroller. */
 .chat-tool-peek {
   position: fixed;
-  z-index: 60;
+  /* Portalled from chips inside sub-session windows; keep it above the
+     window stack (6000 desktop / 7000 mobile) but below modal overlays. */
+  z-index: 10020;
   display: flex;
   flex-direction: column;
   overflow: hidden;

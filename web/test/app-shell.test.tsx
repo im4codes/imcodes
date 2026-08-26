@@ -2270,6 +2270,99 @@ describe('App shell', () => {
     });
   }, 20_000);
 
+  it('restores scoped team discussion cards immediately when returning to a main tab before visible sub-sessions refresh', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') return { id: 'user-1' };
+      if (path === '/api/server') return serverList();
+      if (path === '/api/server/srv-1/sessions') {
+        return {
+          sessions: [
+            ...sessionList().sessions,
+            { ...sessionList().sessions[0], name: 'deck_beta_brain', project_name: 'Beta', label: 'Beta Brain' },
+          ],
+        };
+      }
+      if (path.startsWith('/api/watch/sessions')) return { sessions: [] };
+      return {};
+    });
+
+    const alphaSub = {
+      id: 'sub-alpha-a1',
+      sessionName: 'deck_sub_alpha_a1',
+      parentSession: 'deck_alpha_brain',
+      label: 'A1',
+      description: '',
+      cwd: '/work/alpha',
+      type: 'codex-sdk',
+      runtimeType: 'transport',
+      state: 'idle',
+      serverId: 'srv-1',
+    };
+    const betaSub = {
+      id: 'sub-beta-b1',
+      sessionName: 'deck_sub_beta_b1',
+      parentSession: 'deck_beta_brain',
+      label: 'B1',
+      description: '',
+      cwd: '/work/beta',
+      type: 'codex-sdk',
+      runtimeType: 'transport',
+      state: 'idle',
+      serverId: 'srv-1',
+    };
+    useSubSessionsState.subSessions = [alphaSub, betaSub];
+    useSubSessionsState.visibleSubSessions = [alphaSub];
+
+    const { App } = await importApp();
+    render(<App />);
+
+    expect(await screen.findByText('session-tabs')).toBeTruthy();
+    const ws = await getActiveWsClient();
+    await act(async () => {
+      ws.emit({ type: 'session.event', event: 'connected', session: '', state: 'connected' });
+      ws.emit({
+        type: P2P_WORKFLOW_MSG.RUN_UPDATE,
+        run: {
+          id: 'run-alpha-sub-only',
+          status: 'running',
+          mode_key: 'discuss',
+          current_round: 1,
+          total_rounds: 1,
+          total_hops: 1,
+          active_phase: 'hop',
+          current_target_session: 'deck_sub_alpha_a1',
+          all_nodes: [
+            { label: 'A1', agentType: 'codex-sdk', status: 'running', phase: 'hop' },
+          ],
+        },
+      });
+    });
+    expect(await screen.findByTestId('app-shell-p2p-discussion-p2p_run-alpha-sub-only')).toBeTruthy();
+
+    ws.p2pListDiscussions.mockClear();
+    ws.p2pStatus.mockClear();
+    useSubSessionsState.visibleSubSessions = [betaSub];
+    fireEvent.click(screen.getByText('tabs-select-deck_beta_brain'));
+    await waitFor(() => {
+      expect(screen.queryByTestId('app-shell-p2p-discussion-p2p_run-alpha-sub-only')).toBeNull();
+    });
+    expect(ws.p2pListDiscussions).toHaveBeenCalledWith({ sessionName: 'deck_beta_brain' });
+    expect(ws.p2pStatus).toHaveBeenCalledWith({ sessionName: 'deck_beta_brain' });
+
+    ws.p2pListDiscussions.mockClear();
+    ws.p2pStatus.mockClear();
+    fireEvent.click(screen.getByText('tabs-select-deck_alpha_brain'));
+
+    await waitFor(() => {
+      expect(screen.getByTestId('app-shell-p2p-discussion-p2p_run-alpha-sub-only')).toBeTruthy();
+    });
+    expect(ws.p2pListDiscussions).toHaveBeenCalledWith({ sessionName: 'deck_alpha_brain' });
+    expect(ws.p2pStatus).toHaveBeenCalledWith({ sessionName: 'deck_alpha_brain' });
+  }, 20_000);
+
   it('nudges browser WebSocket recovery when daemon heartbeat is fresh but the tab is disconnected', async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     vi.setSystemTime(new Date('2026-05-31T12:00:00Z'));

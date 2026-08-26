@@ -139,6 +139,14 @@ describe('styles.css regression contracts', () => {
     expect(subcardRule![0]).toMatch(/overflow-y:\s*auto/);
   });
 
+  it('keeps collapsed tool hover peeks above sub-session windows without covering modal overlays', () => {
+    const rule = cssWithoutComments.match(/\.chat-tool-peek\s*\{[^}]*\}/)?.[0];
+    expect(rule).toBeTruthy();
+    const zIndex = Number(rule?.match(/z-index:\s*(\d+)/)?.[1]);
+    expect(zIndex).toBeGreaterThan(7000);
+    expect(zIndex).toBeLessThan(10050);
+  });
+
   it('keeps the expanded tool fold header visible while its details scroll', () => {
     const foldRule = css.match(/\.chat-tool-block-fold\s*\{[^}]*\}/);
     expect(foldRule).not.toBeNull();

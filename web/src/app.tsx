@@ -3056,6 +3056,41 @@ export function App() {
     () => visibleSubSessions.map((sub) => sub.sessionName),
     [visibleSubSessions],
   );
+  const p2pDiscussionScopeSubSessionNames = useMemo(() => {
+    if (!activeRootSession) return visibleSubSessionNames;
+    const names = new Set(visibleSubSessionNames);
+    for (const sub of subSessions) {
+      if (sub.parentSession === activeRootSession || sub.sessionName === activeSession) {
+        names.add(sub.sessionName);
+      }
+    }
+    return [...names];
+  }, [activeRootSession, activeSession, subSessions, visibleSubSessionNames]);
+  const p2pRouteResyncKeyRef = useRef<string | null>(null);
+  useEffect(() => {
+    const scopeSession = activeSession ?? activeRootSession ?? null;
+    const key = `${selectedServerId ?? ''}:${scopeSession ?? ''}`;
+    const ws = wsRef.current;
+    if (!auth || !selectedServerId || sharedHashRestorePending) {
+      p2pRouteResyncKeyRef.current = key;
+      return;
+    }
+    if (!connected || !ws?.connected) return;
+    const previousKey = p2pRouteResyncKeyRef.current;
+    p2pRouteResyncKeyRef.current = key;
+    if (!previousKey || previousKey === key) return;
+    const scope = scopeSession ? { sessionName: scopeSession } : undefined;
+    ws.p2pListDiscussions(scope);
+    requestP2pStatusWithCachedRunConfirmation(ws, scope);
+  }, [
+    activeRootSession,
+    activeSession,
+    auth,
+    connected,
+    requestP2pStatusWithCachedRunConfirmation,
+    selectedServerId,
+    sharedHashRestorePending,
+  ]);
   const p2pConfigPref = usePref(
     activeRootSession ? p2pSessionConfigPrefKey(activeRootSession, selectedServerId) : null,
     {
@@ -6219,7 +6254,7 @@ export function App() {
                 discussions={discussions.filter((d) => isP2pDiscussionVisibleInSubSessionBar(d, {
                   activeSession,
                   activeRootSession,
-                  visibleSubSessionNames,
+                  visibleSubSessionNames: p2pDiscussionScopeSubSessionNames,
                 }))}
                 // Daemon-wide running count (NOT scoped to this
                 // session) so the View Discussions (📋) button shows
