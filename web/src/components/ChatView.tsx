@@ -4600,15 +4600,17 @@ const ChatEvent = memo(function ChatEvent({
             <span>{t('delegation.reply_from', { source })}</span>
           </div>
           {result && (
-            <ChatMarkdown
-              text={result}
-              onPathClick={onPathClick}
-              onUrlClick={onUrlClick}
-              onDownload={onDownload}
-              onHtmlPreview={onHtmlPreview}
-              onImagePreview={onImagePreview}
-              onOpenLocalWebPreview={onOpenLocalWebPreview}
-            />
+            <div class="delegation-reply-card-body">
+              <ChatMarkdown
+                text={result}
+                onPathClick={onPathClick}
+                onUrlClick={onUrlClick}
+                onDownload={onDownload}
+                onHtmlPreview={onHtmlPreview}
+                onImagePreview={onImagePreview}
+                onOpenLocalWebPreview={onOpenLocalWebPreview}
+              />
+            </div>
           )}
           <ChatTime ts={event.ts} />
         </section>

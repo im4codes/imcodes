@@ -106,10 +106,15 @@ describe('styles.css regression contracts', () => {
     expect(mobileButtonRule).toMatch(/width:\s*auto/);
   });
 
-  it('keeps long delegation replies at content height inside the chat flex scroller', () => {
-    const rule = cssWithoutComments.match(/\.delegation-reply-card\s*\{[^}]*\}/)?.[0];
-    expect(rule).toBeTruthy();
-    expect(rule).toMatch(/flex:\s*0\s+0\s+auto/);
+  it('keeps long delegation replies readable by scrolling after forty lines instead of clipping text', () => {
+    const cardRule = cssWithoutComments.match(/\.delegation-reply-card\s*\{[^}]*\}/)?.[0];
+    expect(cardRule).toBeTruthy();
+    expect(cardRule).toMatch(/flex:\s*0\s+0\s+auto/);
+
+    const bodyRule = cssWithoutComments.match(/\.delegation-reply-card-body\s*\{[^}]*\}/)?.[0];
+    expect(bodyRule).toBeTruthy();
+    expect(bodyRule).toMatch(/max-height:\s*calc\(1\.5em \* 40\)/);
+    expect(bodyRule).toMatch(/overflow-y:\s*auto/);
   });
 
   it('.chat-view-preview must NOT be a scroll container', () => {

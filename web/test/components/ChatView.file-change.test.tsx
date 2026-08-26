@@ -493,7 +493,7 @@ describe('ChatView delegation reply cards', () => {
     expect(card?.textContent).not.toContain('<imcodes-delegation-completed-v1>');
   });
 
-  it('renders a long audit reply completely in one non-collapsing card', () => {
+  it('renders a long audit reply completely inside a scrollable body', () => {
     const result = Array.from({ length: 80 }, (_, index) => `Audit evidence line ${index + 1}`).join('\n');
     const event = makeEvent('delegation.reply', {
       memoryExcluded: true,
@@ -507,7 +507,9 @@ describe('ChatView delegation reply cards', () => {
 
     const cards = container.querySelectorAll('.delegation-reply-card');
     expect(cards).toHaveLength(1);
-    expect(cards[0]?.textContent).toContain('Audit evidence line 1');
-    expect(cards[0]?.textContent).toContain('Audit evidence line 80');
+    const body = cards[0]?.querySelector('.delegation-reply-card-body');
+    expect(body).toBeTruthy();
+    expect(body?.textContent).toContain('Audit evidence line 1');
+    expect(body?.textContent).toContain('Audit evidence line 80');
   });
 });

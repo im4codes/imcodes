@@ -4763,6 +4763,13 @@ html.native-ios-mac .chat-dl-btn {
 .delegation-reply-card-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; margin-bottom: 7px; }
 .delegation-reply-card-head strong { color: #67e8f9; font-size: 12px; letter-spacing: 0.02em; }
 .delegation-reply-card-head span { min-width: 0; overflow: hidden; color: #94a3b8; text-overflow: ellipsis; white-space: nowrap; }
+.delegation-reply-card-body {
+  max-height: calc(1.5em * 40);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(71, 85, 105, 0.82) transparent;
+}
 .delegation-reply-card .chat-rich-text { color: #e2e8f0; font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
 .delegation-reply-card .chat-bubble-time { text-align: right; }
 .chat-loading { text-align: center; color: #475569; padding: 24px; }
