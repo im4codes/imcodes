@@ -302,6 +302,67 @@ export function formatChatDateTime(ts: number, now = Date.now(), locale?: string
   return chatDateTimeFormatter(locale, !isToday).format(date);
 }
 
+const PINNED_MEMORY_SUMMARY_PREVIEW_MAX = 240;
+const MEMORY_PROBLEM_HEADING_RE = /^#{1,6}\s*(?:user\s+problem|problem|issue|问题|問題)\s*[:：]?\s*$/i;
+const MEMORY_PROBLEM_INLINE_RE = /^(?:user\s+problem|problem|issue|问题|問題)\s*[:：]\s*(.+)$/i;
+const MARKDOWN_HEADING_RE = /^#{1,6}\s+/;
+
+function compactMemorySummaryPreview(text: string): string | null {
+  const cleaned = text
+    .replace(/```[\s\S]*?```/g, ' ')
+    .replace(/`([^`]+)`/g, '$1')
+    .replace(/\*\*([^*]+)\*\*/g, '$1')
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
+    .split('\n')
+    .map((line) => line.trim().replace(/^[-*]\s+/, '').replace(/^\d+\.\s+/, ''))
+    .filter(Boolean)
+    .join(' · ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!cleaned) return null;
+  return cleaned.length > PINNED_MEMORY_SUMMARY_PREVIEW_MAX
+    ? `${cleaned.slice(0, PINNED_MEMORY_SUMMARY_PREVIEW_MAX - 1).trimEnd()}…`
+    : cleaned;
+}
+
+function extractMemoryProblemPreview(summary: string): string | null {
+  const normalized = summary.replace(/\r\n?/g, '\n').trim();
+  if (!normalized) return null;
+  const lines = normalized.split('\n');
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
+    const inline = MEMORY_PROBLEM_INLINE_RE.exec(line);
+    if (inline?.[1]?.trim()) return compactMemorySummaryPreview(inline[1]);
+    if (!MEMORY_PROBLEM_HEADING_RE.test(line)) continue;
+    const body: string[] = [];
+    for (let j = i + 1; j < lines.length; j++) {
+      const nextLine = lines[j].trim();
+      if (MARKDOWN_HEADING_RE.test(nextLine)) break;
+      body.push(lines[j]);
+    }
+    const preview = compactMemorySummaryPreview(body.join('\n'));
+    if (preview) return preview;
+  }
+  return compactMemorySummaryPreview(
+    lines.filter((line) => !MARKDOWN_HEADING_RE.test(line.trim())).join('\n'),
+  );
+}
+
+function getLatestRecentMemoryProblemPreview(events: TimelineEvent[]): string | null {
+  for (let i = events.length - 1; i >= 0; i--) {
+    const event = events[i];
+    if (event.type !== 'memory.context') continue;
+    const payload = event.payload as unknown as Partial<MemoryContextTimelinePayload>;
+    if (!Array.isArray(payload.items)) continue;
+    for (const item of payload.items) {
+      if (item?.projectionClass !== 'recent_summary') continue;
+      const preview = extractMemoryProblemPreview(String(item.summary ?? ''));
+      if (preview) return preview;
+    }
+  }
+  return null;
+}
+
 type MemoryContextSection =
   | {
     key: string;
@@ -1823,9 +1884,12 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
     }
     return null;
   }, [events, t]);
-  // Reset the expand state whenever the pinned target changes so a new
+  const recentMemoryProblemPreview = useMemo(() => getLatestRecentMemoryProblemPreview(events), [events]);
+  const pinnedPreviewText = recentMemoryProblemPreview ?? lastSentUserMessage?.text ?? '';
+  const pinnedPreviewUsesMemory = !!recentMemoryProblemPreview;
+  // Reset the expand state whenever the pinned target/summary changes so a new
   // message never inherits the expanded state of an older one.
-  useEffect(() => { setPinnedExpanded(false); }, [lastSentUserMessage?.eventId]);
+  useEffect(() => { setPinnedExpanded(false); }, [lastSentUserMessage?.eventId, recentMemoryProblemPreview]);
 
   const suppressLoadOlder = useCallback((durationMs = 1200) => {
     suppressLoadOlderUntilRef.current = Date.now() + durationMs;
@@ -3331,7 +3395,9 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
             class={`chat-pinned-last-sent${pinnedExpanded ? ' chat-pinned-expanded' : ''}`}
             role="button"
             tabIndex={0}
-            aria-label={t('chat.pinned_last_sent_aria', 'Jump to your last sent message')}
+            aria-label={pinnedPreviewUsesMemory
+              ? t('chat.pinned_recent_summary_aria', 'Show recent summary and jump to your last sent message')
+              : t('chat.pinned_last_sent_aria', 'Jump to your last sent message')}
             onClick={() => {
               // Tap once → toggle 2-line clamp; tap again (while expanded)
               // behaves like a jump-to-message. Holds the expand state so a
@@ -3354,13 +3420,17 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
             }}
           >
             <span class="chat-pinned-last-sent-meta">
-              <span class="chat-pinned-last-sent-label">{t('chat.pinned_last_sent_label', 'Last sent')}</span>
+              <span class="chat-pinned-last-sent-label">
+                {pinnedPreviewUsesMemory
+                  ? t('chat.pinned_recent_summary_label', 'Recent summary')
+                  : t('chat.pinned_last_sent_label', 'Last sent')}
+              </span>
               {lastSentUserMessage.actorLabel && (
                 <span class="chat-pinned-last-sent-actor">{lastSentUserMessage.actorLabel}</span>
               )}
               <span class="chat-pinned-last-sent-time">{formatChatDateTime(lastSentUserMessage.ts, Date.now(), locale)}</span>
             </span>
-            <span class="chat-pinned-last-sent-text">{lastSentUserMessage.text}</span>
+            <span class="chat-pinned-last-sent-text">{pinnedPreviewText}</span>
           </div>
         )}
         <div class={`chat-view${preview ? ' chat-view-preview' : ''}`} ref={scrollRef} style={chatFontStyle} onScroll={preview ? undefined : handleScroll}

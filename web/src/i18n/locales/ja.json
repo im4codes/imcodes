@@ -398,6 +398,8 @@
     "tool_result_done_with_command": "完了 · {{command}}",
     "pinned_last_sent_label": "直近の送信",
     "pinned_last_sent_aria": "直近に送信したメッセージへ移動",
+    "pinned_recent_summary_label": "最近の要約",
+    "pinned_recent_summary_aria": "最近の要約を表示し、直近に送信したメッセージへ移動",
     "memory_context_title": "関連履歴",
     "memory_context_supplemental_title": "関連履歴・補足要約",
     "memory_context_startup_title": "履歴コンテキスト・注入済み",

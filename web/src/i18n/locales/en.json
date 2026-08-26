@@ -398,6 +398,8 @@
     "tool_result_done_with_command": "done · {{command}}",
     "pinned_last_sent_label": "Last sent",
     "pinned_last_sent_aria": "Jump to your last sent message",
+    "pinned_recent_summary_label": "Recent summary",
+    "pinned_recent_summary_aria": "Show recent summary and jump to your last sent message",
     "memory_context_title": "Related history",
     "memory_context_supplemental_title": "Related history · Supplemental summaries",
     "memory_context_startup_title": "Historical context · injected",

@@ -398,6 +398,8 @@
     "tool_result_done_with_command": "готово · {{command}}",
     "pinned_last_sent_label": "Последнее отправленное",
     "pinned_last_sent_aria": "Перейти к последнему отправленному сообщению",
+    "pinned_recent_summary_label": "Недавняя сводка",
+    "pinned_recent_summary_aria": "Показать недавнюю сводку и перейти к последнему отправленному сообщению",
     "memory_context_title": "Связанная история",
     "memory_context_supplemental_title": "Связанная история · Дополнительные сводки",
     "memory_context_startup_title": "Исторический контекст · внедрён",

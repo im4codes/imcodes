@@ -398,6 +398,8 @@
     "tool_result_done_with_command": "완료 · {{command}}",
     "pinned_last_sent_label": "마지막 전송",
     "pinned_last_sent_aria": "마지막으로 보낸 메시지로 이동",
+    "pinned_recent_summary_label": "최근 요약",
+    "pinned_recent_summary_aria": "최근 요약을 보고 마지막으로 보낸 메시지로 이동",
     "memory_context_title": "관련 기록",
     "memory_context_supplemental_title": "관련 기록 · 추가 요약",
     "memory_context_startup_title": "히스토리 컨텍스트 · 주입됨",

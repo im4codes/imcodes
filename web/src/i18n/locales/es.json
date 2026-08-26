@@ -398,6 +398,8 @@
     "tool_result_done_with_command": "hecho · {{command}}",
     "pinned_last_sent_label": "Último enviado",
     "pinned_last_sent_aria": "Ir a tu último mensaje enviado",
+    "pinned_recent_summary_label": "Resumen reciente",
+    "pinned_recent_summary_aria": "Mostrar el resumen reciente e ir a tu último mensaje enviado",
     "memory_context_title": "Historial relacionado",
     "memory_context_supplemental_title": "Historial relacionado · Resúmenes adicionales",
     "memory_context_startup_title": "Contexto histórico · inyectado",

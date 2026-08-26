@@ -398,6 +398,8 @@
     "tool_result_done_with_command": "完成 · {{command}}",
     "pinned_last_sent_label": "最近發送",
     "pinned_last_sent_aria": "跳轉到你最近發送的訊息",
+    "pinned_recent_summary_label": "最近摘要",
+    "pinned_recent_summary_aria": "查看最近摘要並跳轉到你最近發送的訊息",
     "memory_context_title": "相關歷史",
     "memory_context_supplemental_title": "相關歷史 · 補充摘要",
     "memory_context_startup_title": "歷史上下文 · 已注入",
