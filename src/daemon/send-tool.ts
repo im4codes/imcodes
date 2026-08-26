@@ -9,6 +9,7 @@ import {
   type MemoryMcpSendDeliveryMode,
 } from '../../shared/memory-mcp-contracts.js';
 import { sanitizeMcpErrorMessage } from '../../shared/mcp-error-sanitize.js';
+import { resolveEffectiveSessionModel } from '../../shared/session-model.js';
 import { isDiscoverableInterAgentSession, resolveEffectiveProjectName, resolveRuntimeScope } from '../../shared/session-scope.js';
 import {
   AGENT_DELEGATION_PURPOSES,
@@ -94,6 +95,12 @@ export interface SendTargetInfo {
   sessionName: string;
   role: SessionRecord['role'];
   agentType: string;
+  /** Effective concrete model when the session has reported or configured one. */
+  model?: string;
+  activeModel?: string;
+  requestedModel?: string;
+  modelDisplay?: string;
+  qwenModel?: string;
   status: SessionRecord['state'];
   lastActiveAt: number;
 }
@@ -371,7 +378,17 @@ export function listSendTargets(
   const limit = Math.max(0, Math.min(MAX_TARGET_LIST_LIMIT, rawLimit));
   const candidates = getSiblingSessions({ ...caller, projectName: callerProjectName }, allSessions);
   const filtered = query
-    ? candidates.filter((s) => [s.name, s.label, s.role, s.agentType].some((value) => String(value ?? '').toLowerCase().includes(query)))
+    ? candidates.filter((s) => [
+        s.name,
+        s.label,
+        s.role,
+        s.agentType,
+        resolveEffectiveSessionModel(s),
+        s.activeModel,
+        s.requestedModel,
+        s.modelDisplay,
+        s.qwenModel,
+      ].some((value) => String(value ?? '').toLowerCase().includes(query)))
     : candidates;
 
   return {
@@ -975,13 +992,28 @@ export async function dispatchCronSend(input: CronSendDispatchInput, deps?: Send
   };
 }
 
+function optionalModelField(value: string | null | undefined): string | undefined {
+  const trimmed = value?.trim();
+  return trimmed ? trimmed : undefined;
+}
+
 function toTargetInfo(s: SessionRecord): SendTargetInfo {
+  const model = resolveEffectiveSessionModel(s);
+  const activeModel = optionalModelField(s.activeModel);
+  const requestedModel = optionalModelField(s.requestedModel);
+  const modelDisplay = optionalModelField(s.modelDisplay);
+  const qwenModel = optionalModelField(s.qwenModel);
   return {
     target: s.name,
     label: s.label ?? null,
     sessionName: s.name,
     role: s.role,
     agentType: s.agentType,
+    ...(model ? { model } : {}),
+    ...(activeModel ? { activeModel } : {}),
+    ...(requestedModel ? { requestedModel } : {}),
+    ...(modelDisplay ? { modelDisplay } : {}),
+    ...(qwenModel ? { qwenModel } : {}),
     status: s.state,
     lastActiveAt: s.updatedAt,
   };

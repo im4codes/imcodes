@@ -45,7 +45,17 @@ describe('send-tool', () => {
     const result = listSendTargets(caller, {}, {
       listSessions: () => [
         session({ name: 'deck_alpha_brain', projectName: 'alpha', role: 'brain', label: 'Brain' }),
-        session({ name: 'deck_alpha_w1', projectName: 'alpha', role: 'w1', label: 'Coder', agentType: 'codex', updatedAt: 20 }),
+        session({
+          name: 'deck_alpha_w1',
+          projectName: 'alpha',
+          role: 'w1',
+          label: 'Coder',
+          agentType: 'codex',
+          updatedAt: 20,
+          requestedModel: 'gpt-5.4',
+          modelDisplay: 'gpt-5.4-display',
+          activeModel: 'gpt-5.6',
+        }),
         session({ name: 'deck_beta_w1', projectName: 'beta', role: 'w1', label: 'Other', projectDir: '/work/beta' }),
       ],
     });
@@ -59,11 +69,34 @@ describe('send-tool', () => {
         sessionName: 'deck_alpha_w1',
         role: 'w1',
         agentType: 'codex',
+        model: 'gpt-5.6',
+        activeModel: 'gpt-5.6',
+        requestedModel: 'gpt-5.4',
+        modelDisplay: 'gpt-5.4-display',
         status: 'idle',
         lastActiveAt: 20,
       },
     ]);
     expect(result.items[0]).not.toHaveProperty('projectDir');
+  });
+
+  it('lists and filters by concrete model metadata', () => {
+    const result = listSendTargets(caller, { query: 'qwen3-coder' }, {
+      listSessions: () => [
+        session({ name: 'deck_alpha_brain', projectName: 'alpha', role: 'brain', label: 'Brain' }),
+        session({ name: 'deck_alpha_w1', projectName: 'alpha', role: 'w1', label: 'Coder', agentType: 'codex-sdk', activeModel: 'gpt-5.6' }),
+        session({ name: 'deck_alpha_w2', projectName: 'alpha', role: 'w2', label: 'Qwen', agentType: 'qwen', qwenModel: 'qwen3-coder-plus' }),
+      ],
+    });
+
+    expect(result.status).toBe('ok');
+    if (result.status !== 'ok') throw new Error('expected ok');
+    expect(result.items).toEqual([expect.objectContaining({
+      target: 'deck_alpha_w2',
+      agentType: 'qwen',
+      model: 'qwen3-coder-plus',
+      qwenModel: 'qwen3-coder-plus',
+    })]);
   });
 
   it('hides unlabelled legacy project workers from discovery and ordinary sends', async () => {

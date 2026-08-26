@@ -74,6 +74,9 @@ async function writeSessionStore(home: string, options: { includeLatePeer?: bool
         agentType: 'claude-code-sdk',
         projectDir: join(home, 'proj'),
         state: 'idle',
+        activeModel: 'claude-opus-4-8',
+        requestedModel: 'opus',
+        modelDisplay: 'claude-opus-4-8',
         restarts: 0,
         restartTimestamps: [],
         createdAt: now,
@@ -259,7 +262,13 @@ describe('memory MCP stdio server', () => {
         status: 'ok',
         items: [
           expect.objectContaining({ target: 'deck_proj_brain' }),
-          expect.objectContaining({ target: 'deck_sub_peer', label: 'Peer' }),
+          expect.objectContaining({
+            target: 'deck_sub_peer',
+            label: 'Peer',
+            model: 'claude-opus-4-8',
+            activeModel: 'claude-opus-4-8',
+            requestedModel: 'opus',
+          }),
         ],
       });
       expect(JSON.stringify(result.structuredContent)).not.toContain('deck_sub_worker');
@@ -567,11 +576,15 @@ describe('memory MCP stdio server', () => {
       await client.connect(transport);
       const listed = await client.callTool({
         name: 'send_list_targets',
-        arguments: { query: 'Peer' },
+        arguments: { query: 'claude-opus' },
       });
       expect(listed.structuredContent).toMatchObject({
         status: 'ok',
-        items: [expect.objectContaining({ target: 'deck_sub_peer', label: 'Peer' })],
+        items: [expect.objectContaining({
+          target: 'deck_sub_peer',
+          label: 'Peer',
+          model: 'claude-opus-4-8',
+        })],
       });
 
       await writeFile(join(home, '.imcodes', 'sessions.json'), JSON.stringify({ sessions: {} }), 'utf8');

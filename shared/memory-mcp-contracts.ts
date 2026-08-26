@@ -413,9 +413,9 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   },
   [MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS]: {
     name: MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS,
-    description: 'List sendable caller-project siblings for delegation, for example "ask CC to audit" or "invite a reviewer to discuss". The current caller session and stopped sessions are excluded; if this returns no items, send_message cannot run. Filter by display label or name, then use the exact target; labels are not targets. If no match exists, report that no such running peer session is available.',
+    description: 'List sendable caller-project siblings for delegation, for example "ask CC to audit" or "invite a reviewer to discuss". The current caller session and stopped sessions are excluded; if this returns no items, send_message cannot run. Results include agentType plus concrete model metadata when known. Filter by display label, name, type, or model, then use the exact target; labels are not targets. If no match exists, report that no such running peer session is available.',
     inputSchema: objectSchema({
-      query: stringSchema('Optional case-insensitive text filter over target display labels and names, such as "cc", "codex", "reviewer", or a session label mentioned by the user.'),
+      query: stringSchema('Optional case-insensitive text filter over target display labels, names, agent types, and model metadata, such as "cc", "codex", "gpt-5", "reviewer", or a session label mentioned by the user.'),
       limit: numberSchema('Optional maximum number of targets to return; implementations may clamp it.'),
     }),
     outputSchema: statusSchema,
