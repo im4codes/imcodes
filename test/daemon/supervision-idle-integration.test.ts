@@ -19,6 +19,7 @@
  */
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
+  SUPERVISION_EXECUTION_STATUS_MARKERS,
   SUPERVISION_MODE,
   normalizeSessionSupervisionSnapshot,
 } from '../../shared/supervision-config.js';
@@ -201,7 +202,12 @@ describe('supervision → idle → broker integration', () => {
     await flushAsync();
 
     // handleSend must have dispatched the message and registered the task intent.
-    expect(transportSend).toHaveBeenCalledWith('implement the feature', 'cmd-int-1');
+    expect(transportSend).toHaveBeenCalledWith(
+      'implement the feature',
+      'cmd-int-1',
+      undefined,
+      expect.stringContaining(SUPERVISION_EXECUTION_STATUS_MARKERS.ADVANCE),
+    );
     expect(supervisionAutomation.getActiveRun(SESSION)).toBeTruthy();
 
     // Now simulate the transport runtime's status flow: streaming → idle.

@@ -77,6 +77,8 @@ export interface RemoteDesktopRouterHooks {
   database(): Database | null;
   daemonAvailable(): boolean;
   daemonSupportsRemoteDesktop(): boolean;
+  /** Capabilities advertised by the authenticated daemon generation, when consumed by this router version. */
+  daemonRemoteDesktopCapabilities?(): readonly string[];
   featureEnabled?(): boolean;
   daemonGeneration(): number;
   allocateRouteGeneration?(db: Database): Promise<number>;
