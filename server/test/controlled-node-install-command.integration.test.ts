@@ -414,7 +414,11 @@ describe('the copied one-liner pins its own transport', () => {
         (_e, out) => resolve(String(out)));
     });
     // Not merely "it failed": the failure must be the protocol refusal itself.
-    expect(pinnedOutput).toContain('Protocol "https" disabled');
+    // The wording is build-specific -- macOS curl says `Protocol "https"
+    // disabled (in redirect)`, GNU/Linux curl says `Protocol "https" not
+    // supported or disabled in libcurl` -- so match the stable part: exit code
+    // 1 (CURLE_UNSUPPORTED_PROTOCOL) naming the refused scheme.
+    expect(pinnedOutput).toMatch(/curl: \(1\) Protocol "https"/);
 
     // Counterfactual: the same fetch WITHOUT the pin follows the redirect, so
     // the assertion above is testing the pin and not some unrelated failure.
@@ -428,7 +432,9 @@ describe('the copied one-liner pins its own transport', () => {
     // caused by the pin. Without it curl accepts the cross-scheme redirect and
     // proceeds to the target, failing later and differently (TLS, because the
     // target is https on a plain listener) — never with a protocol refusal.
-    expect(unpinnedOutput).not.toContain('Protocol "https" disabled');
+    // Same portability caveat: asserting the absence of one build's exact
+    // wording would pass vacuously on the other build.
+    expect(unpinnedOutput).not.toMatch(/curl: \(1\) Protocol "https"/);
     expect(unpinnedOutput).toMatch(/SSL|TLS|handshake|error:/i);
   }, 40_000);
 });

@@ -630,7 +630,7 @@ describe('ControlledNodesPanel (12.3)', () => {
     expect(container.textContent).toContain('controlled_nodes.exec_on');
   });
 
-  it('shows Remote Desktop only for an operable Owner or Participant with a resolvable profile', async () => {
+  it('shows Remote Desktop only for an operable Windows Owner or Participant with the exact capability', async () => {
     machines = [
       machine({ serverId: 'owner-ready', displayName: 'Owner Ready', os: 'win', accessRole: 'owner', execEnabled: true, capabilities: [REMOTE_DESKTOP_CAPABILITY] }),
       machine({ serverId: 'participant-ready', displayName: 'Participant Ready', os: 'win', accessRole: 'participant', execEnabled: true, capabilities: [REMOTE_DESKTOP_CAPABILITY] }),
@@ -644,12 +644,9 @@ describe('ControlledNodesPanel (12.3)', () => {
     await waitFor(() => expect(container.textContent).toContain('Owner Ready'));
 
     const buttons = container.querySelectorAll('.controlled-nodes-remote-desktop');
-    // Descriptive OS metadata is not Web authority. Server independently
-    // rejects an enrolled OS/profile contradiction before signaling.
-    expect(buttons).toHaveLength(3);
+    expect(buttons).toHaveLength(2);
     expect(buttons[0]?.closest('li')?.textContent).toContain('Owner Ready');
     expect(buttons[1]?.closest('li')?.textContent).toContain('Participant Ready');
-    expect(buttons[2]?.closest('li')?.textContent).toContain('Linux');
   });
 
   it('offers quick worker installation only for an online supported Owner node', async () => {
