@@ -9,15 +9,19 @@ import { P2P_WORKFLOW_MSG } from '@shared/p2p-workflow-messages.js';
 const {
   apiFetchMock,
   chatScrollMock,
+  clearApiKeyMock,
   clearAuthKeyMock,
+  clearAuthKeyIdMock,
   clearServerUrlMock,
+  configureApiKeyMock,
   discoverSharedEntriesMock,
   fetchMeMock,
+  getAuthKeyMock,
+  getAuthKeyIdMock,
   getServerUrlMock,
   listP2pRunsMock,
   nativeState,
   openSharedEntryMock,
-  preferencesRemoveMock,
   wsInstances,
   useSubSessionsState,
   authExpiredState,
@@ -26,15 +30,19 @@ const {
 } = vi.hoisted(() => ({
   apiFetchMock: vi.fn(),
   chatScrollMock: vi.fn(),
+  clearApiKeyMock: vi.fn(),
   clearAuthKeyMock: vi.fn(async () => undefined),
+  clearAuthKeyIdMock: vi.fn(async () => undefined),
   clearServerUrlMock: vi.fn(async () => undefined),
+  configureApiKeyMock: vi.fn(),
   discoverSharedEntriesMock: vi.fn(),
   fetchMeMock: vi.fn(),
+  getAuthKeyMock: vi.fn(async () => null as string | null),
+  getAuthKeyIdMock: vi.fn(async () => null as string | null),
   getServerUrlMock: vi.fn(async () => null as string | null),
   listP2pRunsMock: vi.fn(),
   nativeState: { value: false },
   openSharedEntryMock: vi.fn(),
-  preferencesRemoveMock: vi.fn(async () => undefined),
   wsInstances: [] as Array<{
     connected: boolean;
     options?: { shareTarget?: unknown };
@@ -111,10 +119,10 @@ vi.mock('../src/api.js', () => {
   return {
     ApiError,
     apiFetch: (...args: unknown[]) => apiFetchMock(...args),
-    clearApiKey: vi.fn(),
+    clearApiKey: (...args: unknown[]) => clearApiKeyMock(...args),
     configure: vi.fn(),
     configureExpectedUserId: vi.fn(),
-    configureApiKey: vi.fn(),
+    configureApiKey: (...args: unknown[]) => configureApiKeyMock(...args),
     discoverSharedEntries: (...args: unknown[]) => discoverSharedEntriesMock(...args),
     fetchMe: (...args: unknown[]) => fetchMeMock(...args),
     getApiKey: vi.fn(() => 'api-key-1'),
@@ -148,17 +156,11 @@ vi.mock('@capacitor/splash-screen', () => ({
   SplashScreen: { hide: vi.fn(async () => undefined) },
 }));
 
-vi.mock('@capacitor/preferences', () => ({
-  Preferences: {
-    get: vi.fn(async () => ({ value: null })),
-    set: vi.fn(async () => undefined),
-    remove: (...args: unknown[]) => preferencesRemoveMock(...args),
-  },
-}));
-
 vi.mock('../src/biometric-auth.js', () => ({
   clearAuthKey: (...args: unknown[]) => clearAuthKeyMock(...args),
-  getAuthKey: vi.fn(async () => null),
+  clearAuthKeyId: (...args: unknown[]) => clearAuthKeyIdMock(...args),
+  getAuthKey: (...args: unknown[]) => getAuthKeyMock(...args),
+  getAuthKeyId: (...args: unknown[]) => getAuthKeyIdMock(...args),
 }));
 
 vi.mock('../src/push-notifications.js', () => ({
@@ -357,7 +359,13 @@ vi.mock('../src/pages/LoginPage.js', () => ({
     </div>
   ),
 }));
-vi.mock('../src/pages/ServerSetupPage.js', () => ({ ServerSetupPage: textComponent('server-setup-page') }));
+vi.mock('../src/pages/ServerSetupPage.js', () => ({
+  ServerSetupPage: ({ onConnect }: { onConnect: (url: string) => void | Promise<void> }) => (
+    <button type="button" onClick={() => void onConnect('https://new-server.example')}>
+      server-setup-page
+    </button>
+  ),
+}));
 vi.mock('../src/pages/NativeAuthBridge.js', () => ({ NativeAuthBridge: textComponent('native-auth-bridge') }));
 vi.mock('../src/pages/DashboardPage.js', () => ({ DashboardPage: textComponent('dashboard-page') }));
 vi.mock('../src/pages/DiscussionsPage.js', () => ({
@@ -883,14 +891,20 @@ beforeEach(() => {
   loginState.baseUrl = 'http://localhost';
   nativeState.value = false;
   chatScrollMock.mockReset();
+  clearApiKeyMock.mockReset();
   clearAuthKeyMock.mockReset();
   clearAuthKeyMock.mockResolvedValue(undefined);
+  clearAuthKeyIdMock.mockReset();
+  clearAuthKeyIdMock.mockResolvedValue(undefined);
   clearServerUrlMock.mockReset();
   clearServerUrlMock.mockResolvedValue(undefined);
+  configureApiKeyMock.mockReset();
+  getAuthKeyMock.mockReset();
+  getAuthKeyMock.mockResolvedValue(null);
+  getAuthKeyIdMock.mockReset();
+  getAuthKeyIdMock.mockResolvedValue(null);
   getServerUrlMock.mockReset();
   getServerUrlMock.mockResolvedValue(null);
-  preferencesRemoveMock.mockReset();
-  preferencesRemoveMock.mockResolvedValue(undefined);
   fetchMeMock.mockResolvedValue({
     id: 'user-1',
     is_admin: true,
@@ -1137,12 +1151,12 @@ describe('App shell', () => {
       resolveVerification = resolve;
     });
     let resolveCredentialCleanup!: () => void;
-    let resolvePreferenceCleanup!: () => void;
+    let resolveKeyIdCleanup!: () => void;
     clearAuthKeyMock.mockImplementationOnce(() => new Promise<void>((resolve) => {
       resolveCredentialCleanup = resolve;
     }));
-    preferencesRemoveMock.mockImplementationOnce(() => new Promise<void>((resolve) => {
-      resolvePreferenceCleanup = resolve;
+    clearAuthKeyIdMock.mockImplementationOnce(() => new Promise<void>((resolve) => {
+      resolveKeyIdCleanup = resolve;
     }));
     apiFetchMock.mockImplementation(async (path: string) => {
       if (path === '/api/auth/user/me') return verification;
@@ -1170,11 +1184,11 @@ describe('App shell', () => {
       resolveCredentialCleanup();
       await Promise.resolve();
     });
-    await waitFor(() => expect(preferencesRemoveMock).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(clearAuthKeyIdMock).toHaveBeenCalledWith('http://localhost'));
     expect(screen.getByTestId('auth-credential-cleanup-gate')).toBeTruthy();
 
     await act(async () => {
-      resolvePreferenceCleanup();
+      resolveKeyIdCleanup();
       await Promise.resolve();
     });
     expect(await screen.findByRole('button', { name: 'login-page' })).toBeTruthy();
@@ -1247,24 +1261,16 @@ describe('App shell', () => {
       await Promise.resolve();
     });
     expect(await screen.findByRole('button', { name: 'login-page' })).toBeTruthy();
-    expect(preferencesRemoveMock).toHaveBeenCalledTimes(2);
+    expect(clearAuthKeyIdMock).toHaveBeenCalledTimes(2);
   }, 20_000);
 
-  it('waits for an active native login and deletes its credentials before changing server', async () => {
+  it('waits for an active native login and preserves its credentials before changing server', async () => {
     nativeState.value = true;
     getServerUrlMock.mockResolvedValue('https://old-server.example');
     let resolveLoginAttempt!: () => void;
     loginAttemptState.pending = new Promise<void>((resolve) => {
       resolveLoginAttempt = resolve;
     });
-    let resolveCredentialCleanup!: () => void;
-    clearAuthKeyMock.mockImplementationOnce(() => new Promise<void>((resolve) => {
-      resolveCredentialCleanup = resolve;
-    }));
-    let resolvePreferenceCleanup!: () => void;
-    preferencesRemoveMock.mockImplementationOnce(() => new Promise<void>((resolve) => {
-      resolvePreferenceCleanup = resolve;
-    }));
     let resolveServerCleanup!: () => void;
     clearServerUrlMock.mockImplementationOnce(() => new Promise<void>((resolve) => {
       resolveServerCleanup = resolve;
@@ -1279,30 +1285,17 @@ describe('App shell', () => {
 
     expect(await screen.findByTestId('auth-credential-cleanup-gate')).toBeTruthy();
     expect(clearAuthKeyMock).not.toHaveBeenCalled();
-    expect(preferencesRemoveMock).not.toHaveBeenCalled();
+    expect(clearAuthKeyIdMock).not.toHaveBeenCalled();
     expect(clearServerUrlMock).not.toHaveBeenCalled();
 
     await act(async () => {
       resolveLoginAttempt();
       await Promise.resolve();
     });
-    await waitFor(() => expect(clearAuthKeyMock).toHaveBeenCalledTimes(1));
-    expect(localStorage.getItem('rcc_auth')).toBeNull();
-
-    await act(async () => {
-      resolveCredentialCleanup();
-      await Promise.resolve();
-    });
-    await waitFor(() => expect(preferencesRemoveMock).toHaveBeenCalledWith({
-      key: 'deck_api_key_id',
-    }));
-    expect(screen.getByTestId('auth-credential-cleanup-gate')).toBeTruthy();
-
-    await act(async () => {
-      resolvePreferenceCleanup();
-      await Promise.resolve();
-    });
     await waitFor(() => expect(clearServerUrlMock).toHaveBeenCalledTimes(1));
+    expect(clearAuthKeyMock).not.toHaveBeenCalled();
+    expect(clearAuthKeyIdMock).not.toHaveBeenCalled();
+    expect(localStorage.getItem('rcc_auth')).toBeNull();
     expect(screen.getByTestId('auth-credential-cleanup-gate')).toBeTruthy();
 
     await act(async () => {
@@ -1326,7 +1319,6 @@ describe('App shell', () => {
     }));
     localStorage.setItem('rcc_server', 'srv-1');
     localStorage.setItem('rcc_session', 'deck_alpha_brain');
-    clearAuthKeyMock.mockRejectedValueOnce(new Error('secure storage unavailable'));
     let resolveServerCleanup!: () => void;
     clearServerUrlMock.mockImplementationOnce(() => new Promise<void>((resolve) => {
       resolveServerCleanup = resolve;
@@ -1345,6 +1337,8 @@ describe('App shell', () => {
       expect(screen.queryByRole('button', { name: 'login-page' })).toBeNull();
       expect(localStorage.getItem('rcc_auth')).toBeNull();
       expect(sessionStorage.getItem('rcc_tab_route_v1')).toBeNull();
+      expect(clearAuthKeyMock).not.toHaveBeenCalled();
+      expect(clearAuthKeyIdMock).not.toHaveBeenCalled();
 
       await act(async () => {
         resolveServerCleanup();
@@ -1358,6 +1352,100 @@ describe('App shell', () => {
         value: originalUserAgent,
       });
     }
+  }, 20_000);
+
+  it('restores the selected native Cloud Server with its isolated saved session', async () => {
+    const originalUserAgent = navigator.userAgent;
+    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
+    nativeState.value = true;
+    getServerUrlMock.mockResolvedValue('https://old-server.example');
+    getAuthKeyMock.mockImplementation(async (serverUrl?: string) => (
+      serverUrl === 'https://new-server.example' ? 'new-server-key' : null
+    ));
+    localStorage.setItem('rcc_auth', JSON.stringify({
+      userId: 'old-user',
+      baseUrl: 'https://old-server.example',
+    }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') {
+        const activeKey = configureApiKeyMock.mock.calls.at(-1)?.[0];
+        return { id: activeKey === 'new-server-key' ? 'new-user' : 'old-user' };
+      }
+      if (path === '/api/server') return serverList();
+      if (path === '/api/server/srv-1/sessions') return sessionList();
+      return {};
+    });
+
+    try {
+      const { App } = await importApp();
+      render(<App />);
+
+      await waitFor(() => expect(document.querySelector('.mobile-server-btn')).toBeTruthy());
+      fireEvent.click(document.querySelector('.mobile-server-btn')!);
+      fireEvent.click(await screen.findByText('⇄ Switch Cloud Server'));
+      const setup = await screen.findByRole('button', { name: 'server-setup-page' });
+
+      expect(clearAuthKeyMock).not.toHaveBeenCalled();
+      expect(clearAuthKeyIdMock).not.toHaveBeenCalled();
+      fireEvent.click(setup);
+
+      await waitFor(() => expect(getAuthKeyMock).toHaveBeenCalledWith('https://new-server.example'));
+      await waitFor(() => expect(configureApiKeyMock).toHaveBeenCalledWith('new-server-key'));
+      await waitFor(() => {
+        expect(JSON.parse(localStorage.getItem('rcc_auth') ?? '{}')).toEqual({
+          userId: 'new-user',
+          baseUrl: 'https://new-server.example',
+        });
+      });
+      expect(await screen.findByTestId('session-pane-deck_alpha_brain')).toBeTruthy();
+      expect(screen.queryByRole('button', { name: 'login-page' })).toBeNull();
+      expect(clearAuthKeyMock).not.toHaveBeenCalled();
+      expect(clearAuthKeyIdMock).not.toHaveBeenCalled();
+      expect(apiFetchMock).not.toHaveBeenCalledWith(
+        expect.stringContaining('/api/auth/user/me/keys/'),
+        expect.anything(),
+      );
+    } finally {
+      Object.defineProperty(navigator, 'userAgent', {
+        configurable: true,
+        value: originalUserAgent,
+      });
+    }
+  }, 20_000);
+
+  it('deletes only the selected Cloud Server credential after an authoritative restore 401', async () => {
+    nativeState.value = true;
+    getServerUrlMock.mockResolvedValue(null);
+    getAuthKeyMock.mockImplementation(async (serverUrl?: string) => (
+      serverUrl === 'https://new-server.example' ? 'expired-server-key' : null
+    ));
+    const { ApiError } = await import('../src/api.js');
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me' && configureApiKeyMock.mock.calls.at(-1)?.[0] === 'expired-server-key') {
+        // Match the production Bearer flow: apiFetch announces expiry before
+        // its rejected Promise reaches connectNativeServer's catch block.
+        authExpiredState.handler?.('selected server credential expired');
+        throw new ApiError(401, 'session_expired');
+      }
+      if (path === '/api/auth/user/me') return new Promise(() => {});
+      return {};
+    });
+
+    const { App } = await importApp();
+    render(<App />);
+
+    const setup = await screen.findByRole('button', { name: 'server-setup-page' });
+    await waitFor(() => expect(authExpiredState.handler).not.toBeNull());
+    fireEvent.click(setup);
+
+    await waitFor(() => expect(clearAuthKeyMock).toHaveBeenCalledWith('https://new-server.example'));
+    await waitFor(() => expect(clearAuthKeyIdMock).toHaveBeenCalledWith('https://new-server.example'));
+    expect(await screen.findByRole('button', { name: 'login-page' })).toBeTruthy();
+    expect(clearAuthKeyMock).not.toHaveBeenCalledWith('https://other-server.example');
+    expect(clearAuthKeyIdMock).not.toHaveBeenCalledWith('https://other-server.example');
+    expect(localStorage.getItem('rcc_auth')).toBeNull();
   }, 20_000);
 
   it('clears stale shared session authority until re-open succeeds after auth expiry', async () => {
@@ -1438,15 +1526,15 @@ describe('App shell', () => {
     discoverSharedEntriesMock.mockResolvedValue([]);
     let resolveOldOpen!: (value: ReturnType<typeof sharedMainOpenResult>) => void;
     let resolveCredentialCleanup!: () => void;
-    let resolvePreferenceCleanup!: () => void;
+    let resolveKeyIdCleanup!: () => void;
     openSharedEntryMock.mockImplementationOnce(() => new Promise((resolve) => {
       resolveOldOpen = resolve;
     }));
     clearAuthKeyMock.mockImplementationOnce(() => new Promise<void>((resolve) => {
       resolveCredentialCleanup = resolve;
     }));
-    preferencesRemoveMock.mockImplementationOnce(() => new Promise<void>((resolve) => {
-      resolvePreferenceCleanup = resolve;
+    clearAuthKeyIdMock.mockImplementationOnce(() => new Promise<void>((resolve) => {
+      resolveKeyIdCleanup = resolve;
     }));
 
     const { App } = await importApp();
@@ -1481,14 +1569,14 @@ describe('App shell', () => {
       resolveCredentialCleanup();
       await Promise.resolve();
     });
-    await waitFor(() => expect(preferencesRemoveMock).toHaveBeenCalledWith({
-      key: 'deck_api_key_id',
-    }));
+    await waitFor(() => expect(clearAuthKeyIdMock).toHaveBeenCalledWith(
+      expect.stringContaining('http://localhost'),
+    ));
     expect(screen.getByTestId('auth-credential-cleanup-gate')).toBeTruthy();
     expect(screen.queryByRole('button', { name: 'login-page' })).toBeNull();
 
     await act(async () => {
-      resolvePreferenceCleanup();
+      resolveKeyIdCleanup();
       await Promise.resolve();
     });
     const login = await screen.findByRole('button', { name: 'login-page' });
@@ -1500,7 +1588,7 @@ describe('App shell', () => {
       });
     });
     expect(clearAuthKeyMock).toHaveBeenCalledTimes(1);
-    expect(preferencesRemoveMock).toHaveBeenCalledTimes(1);
+    expect(clearAuthKeyIdMock).toHaveBeenCalledTimes(1);
   }, 20_000);
 
   it('loads servers and renders the dashboard when no server is selected', async () => {

@@ -22,13 +22,13 @@ const {
   configureApiKeyMock,
   exchangeNonceWithRetryMock,
   storeAuthKeyMock,
-  preferencesSetMock,
+  storeAuthKeyIdMock,
 } = vi.hoisted(() => ({
   authSessionStartMock: vi.fn(),
   configureApiKeyMock: vi.fn(),
   exchangeNonceWithRetryMock: vi.fn(),
   storeAuthKeyMock: vi.fn(),
-  preferencesSetMock: vi.fn(),
+  storeAuthKeyIdMock: vi.fn(),
 }));
 
 const passwordLoginMock = vi.hoisted(() => vi.fn());
@@ -55,12 +55,7 @@ vi.mock('../../src/plugins/auth-session.js', () => ({
 
 vi.mock('../../src/biometric-auth.js', () => ({
   storeAuthKey: (...args: unknown[]) => storeAuthKeyMock(...args),
-}));
-
-vi.mock('@capacitor/preferences', () => ({
-  Preferences: {
-    set: (...args: unknown[]) => preferencesSetMock(...args),
-  },
+  storeAuthKeyId: (...args: unknown[]) => storeAuthKeyIdMock(...args),
 }));
 
 import { LoginPage } from '../../src/pages/LoginPage.js';
@@ -87,9 +82,9 @@ describe('LoginPage native auth nonce exchange', () => {
 
     await waitFor(() => {
       expect(exchangeNonceWithRetryMock).toHaveBeenCalledWith('https://app.im.codes', 'nonce-123');
-      expect(storeAuthKeyMock).toHaveBeenCalledWith('api-key-1');
+      expect(storeAuthKeyMock).toHaveBeenCalledWith('api-key-1', 'https://app.im.codes');
       expect(configureApiKeyMock).toHaveBeenCalledWith('api-key-1');
-      expect(preferencesSetMock).toHaveBeenCalledWith({ key: 'deck_api_key_id', value: 'key-1' });
+      expect(storeAuthKeyIdMock).toHaveBeenCalledWith('key-1', 'https://app.im.codes');
       expect(onLoginSuccess).toHaveBeenCalledWith('user-1', 'https://app.im.codes');
     });
   });
@@ -103,9 +98,9 @@ describe('LoginPage native auth nonce exchange', () => {
 
     await waitFor(() => {
       expect(exchangeNonceWithRetryMock).not.toHaveBeenCalled();
-      expect(storeAuthKeyMock).toHaveBeenCalledWith('legacy-key');
+      expect(storeAuthKeyMock).toHaveBeenCalledWith('legacy-key', 'https://app.im.codes');
       expect(configureApiKeyMock).toHaveBeenCalledWith('legacy-key');
-      expect(preferencesSetMock).toHaveBeenCalledWith({ key: 'deck_api_key_id', value: 'key-2' });
+      expect(storeAuthKeyIdMock).toHaveBeenCalledWith('key-2', 'https://app.im.codes');
       expect(onLoginSuccess).toHaveBeenCalledWith('user-2', 'https://app.im.codes');
     });
   });
@@ -138,7 +133,7 @@ describe('LoginPage native auth nonce exchange', () => {
     await waitFor(() => expect(finish).toHaveBeenCalledTimes(1));
     expect(storeAuthKeyMock).not.toHaveBeenCalled();
     expect(configureApiKeyMock).not.toHaveBeenCalled();
-    expect(preferencesSetMock).not.toHaveBeenCalled();
+    expect(storeAuthKeyIdMock).not.toHaveBeenCalled();
     expect(onLoginSuccess).not.toHaveBeenCalled();
   });
 
@@ -162,7 +157,7 @@ describe('LoginPage native auth nonce exchange', () => {
     storeAuthKeyMock.mockImplementationOnce(() => new Promise<void>((resolve) => {
       resolveStore = resolve;
     }));
-    preferencesSetMock.mockResolvedValue(undefined);
+    storeAuthKeyIdMock.mockResolvedValue(undefined);
     const beginAuthAttempt = vi.fn(() => ({
       isCurrent: () => true,
       finish: vi.fn(),
@@ -185,7 +180,10 @@ describe('LoginPage native auth nonce exchange', () => {
     fireEvent.input(password, { target: { value: 'password-a' } });
     fireEvent.click(screen.getByRole('button', { name: 'login.signin' }));
 
-    await waitFor(() => expect(storeAuthKeyMock).toHaveBeenCalledWith('api-key-a'));
+    await waitFor(() => expect(storeAuthKeyMock).toHaveBeenCalledWith(
+      'api-key-a',
+      'https://app.im.codes',
+    ));
     fireEvent.keyDown(password, { key: 'Enter' });
     fireEvent.click(screen.getByRole('button', { name: 'common.loading' }));
     const changeServer = screen.getByRole('button', { name: 'serverSetup.changeServer' });
@@ -200,10 +198,10 @@ describe('LoginPage native auth nonce exchange', () => {
       'user-a',
       'https://app.im.codes',
     ));
-    expect(preferencesSetMock).toHaveBeenCalledTimes(1);
+    expect(storeAuthKeyIdMock).toHaveBeenCalledWith('key-a', 'https://app.im.codes');
   });
 
-  it('rejects a second native password attempt while key-id Preferences are pending', async () => {
+  it('rejects a second native password attempt while server key-id storage is pending', async () => {
     passwordLoginMock.mockResolvedValue({
       apiKey: 'api-key-b',
       userId: 'user-b',
@@ -211,7 +209,7 @@ describe('LoginPage native auth nonce exchange', () => {
     });
     storeAuthKeyMock.mockResolvedValue(undefined);
     let resolvePreference!: () => void;
-    preferencesSetMock.mockImplementationOnce(() => new Promise<void>((resolve) => {
+    storeAuthKeyIdMock.mockImplementationOnce(() => new Promise<void>((resolve) => {
       resolvePreference = resolve;
     }));
     const beginAuthAttempt = vi.fn(() => ({
@@ -236,10 +234,10 @@ describe('LoginPage native auth nonce exchange', () => {
     fireEvent.input(password, { target: { value: 'password-b' } });
     fireEvent.click(screen.getByRole('button', { name: 'login.signin' }));
 
-    await waitFor(() => expect(preferencesSetMock).toHaveBeenCalledWith({
-      key: 'deck_api_key_id',
-      value: 'key-b',
-    }));
+    await waitFor(() => expect(storeAuthKeyIdMock).toHaveBeenCalledWith(
+      'key-b',
+      'https://app.im.codes',
+    ));
     fireEvent.keyDown(password, { key: 'Enter' });
     fireEvent.click(screen.getByRole('button', { name: 'common.loading' }));
     const changeServer = screen.getByRole('button', { name: 'serverSetup.changeServer' });

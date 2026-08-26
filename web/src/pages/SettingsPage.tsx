@@ -66,7 +66,7 @@ export function SettingsPage({ displayName, username, hasPassword, serverUrl, on
       import('../biometric-auth.js'),
       import('../plugins/auth-session.js'),
     ]);
-    const key = await getAuthKey();
+    const key = await getAuthKey(serverUrl);
     if (!key) {
       setSetupMsg({ type: 'err', text: t('settings.password_setup_error') });
       return;

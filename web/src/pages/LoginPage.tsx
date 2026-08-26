@@ -181,12 +181,11 @@ export function LoginPage({ onLogin, serverUrl, onLoginSuccess, onChangeServer, 
           const exchanged = await exchangeNonceWithRetry(serverUrl, nonce);
           if (!attempt.isCurrent()) return;
           const { configureApiKey } = await import('../api.js');
-          const { storeAuthKey } = await import('../biometric-auth.js');
-          const { Preferences } = await import('@capacitor/preferences');
-          await storeAuthKey(exchanged.apiKey);
+          const { storeAuthKey, storeAuthKeyId } = await import('../biometric-auth.js');
+          await storeAuthKey(exchanged.apiKey, serverUrl);
           if (!attempt.isCurrent()) return;
           configureApiKey(exchanged.apiKey);
-          await Preferences.set({ key: 'deck_api_key_id', value: exchanged.keyId });
+          await storeAuthKeyId(exchanged.keyId, serverUrl);
           if (!attempt.isCurrent()) return;
           onLoginSuccess?.(exchanged.userId, serverUrl);
           resolved = true;
@@ -197,12 +196,11 @@ export function LoginPage({ onLogin, serverUrl, onLoginSuccess, onChangeServer, 
       if (!resolved && key && userId && keyId) {
         if (!attempt.isCurrent()) return;
         const { configureApiKey } = await import('../api.js');
-        const { storeAuthKey } = await import('../biometric-auth.js');
-        const { Preferences } = await import('@capacitor/preferences');
-        await storeAuthKey(key);
+        const { storeAuthKey, storeAuthKeyId } = await import('../biometric-auth.js');
+        await storeAuthKey(key, serverUrl);
         if (!attempt.isCurrent()) return;
         configureApiKey(key);
-        await Preferences.set({ key: 'deck_api_key_id', value: keyId });
+        await storeAuthKeyId(keyId, serverUrl);
         if (!attempt.isCurrent()) return;
         onLoginSuccess?.(userId, serverUrl);
         resolved = true;
@@ -291,14 +289,13 @@ export function LoginPage({ onLogin, serverUrl, onLoginSuccess, onChangeServer, 
       // just succeeded — `password` is still the original (pre-change) value
       // when `passwordMustChange` is true; the change flow re-saves below.
       persistRememberedCredentials(rememberPassword, username.trim(), password);
-      if (native && res.apiKey && res.userId && res.keyId) {
+      if (native && serverUrl && res.apiKey && res.userId && res.keyId) {
         const { configureApiKey } = await import('../api.js');
-        const { storeAuthKey } = await import('../biometric-auth.js');
-        const { Preferences } = await import('@capacitor/preferences');
-        await storeAuthKey(res.apiKey);
+        const { storeAuthKey, storeAuthKeyId } = await import('../biometric-auth.js');
+        await storeAuthKey(res.apiKey, serverUrl);
         if (!attempt.isCurrent()) return;
         configureApiKey(res.apiKey);
-        await Preferences.set({ key: 'deck_api_key_id', value: res.keyId });
+        await storeAuthKeyId(res.keyId, serverUrl);
         if (!attempt.isCurrent()) return;
         if (res.passwordMustChange) {
           setMode('change_password');
@@ -353,14 +350,13 @@ export function LoginPage({ onLogin, serverUrl, onLoginSuccess, onChangeServer, 
         setError(t('login.account_pending'));
         return;
       }
-      if (native && res.apiKey && res.userId && res.keyId) {
+      if (native && serverUrl && res.apiKey && res.userId && res.keyId) {
         const { configureApiKey } = await import('../api.js');
-        const { storeAuthKey } = await import('../biometric-auth.js');
-        const { Preferences } = await import('@capacitor/preferences');
-        await storeAuthKey(res.apiKey);
+        const { storeAuthKey, storeAuthKeyId } = await import('../biometric-auth.js');
+        await storeAuthKey(res.apiKey, serverUrl);
         if (!attempt.isCurrent()) return;
         configureApiKey(res.apiKey);
-        await Preferences.set({ key: 'deck_api_key_id', value: res.keyId });
+        await storeAuthKeyId(res.keyId, serverUrl);
         if (!attempt.isCurrent()) return;
         onLoginSuccess?.(res.userId, serverUrl!);
       } else {
@@ -411,11 +407,8 @@ export function LoginPage({ onLogin, serverUrl, onLoginSuccess, onChangeServer, 
       if (isNative() && serverUrl) {
         // API key was already stored during login — just proceed
         const { getAuthKey } = await import('../biometric-auth.js');
-        const key = await getAuthKey();
+        const key = await getAuthKey(serverUrl);
         if (key) {
-          // userId already known from login, but we can read from Preferences
-          const { Preferences } = await import('@capacitor/preferences');
-          await Preferences.get({ key: 'deck_api_key_id' });
           // Re-resolve userId from /me endpoint
           const { apiFetch } = await import('../api.js');
           const me = await apiFetch<{ id: string }>('/api/auth/user/me');

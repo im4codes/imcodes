@@ -172,7 +172,7 @@ import {
 import { WsClient, type P2pWorkflowRequestScope } from './ws-client.js';
 import { configure as configureApi, configureExpectedUserId, apiFetch, onAuthExpired, startProactiveRefresh, stopProactiveRefresh, refreshSessionIfStale, ApiError, configureApiKey, clearApiKey, fetchMe, getApiKey, normalizeLocalWebPreviewPath, listP2pRuns, discoverSharedEntries, openSharedEntry, listManagedSharesForServer, type SharedEntrySummary } from './api.js';
 import { isNative, getServerUrl, clearServerUrl } from './native.js';
-import { getAuthKey, clearAuthKey } from './biometric-auth.js';
+import { getAuthKey, clearAuthKey, getAuthKeyId, clearAuthKeyId } from './biometric-auth.js';
 import { initPushNotifications, resetPushBadge } from './push-notifications.js';
 import { ServerSetupPage } from './pages/ServerSetupPage.js';
 import { NativeAuthBridge } from './pages/NativeAuthBridge.js';
@@ -234,6 +234,11 @@ import {
   type AppUpdateReason,
   type AppUpdateRequiredDetail,
 } from './app-update.js';
+
+async function clearStoredAuthForServer(serverUrl?: string | null): Promise<void> {
+  try { await clearAuthKey(serverUrl); } catch { /* local revocation is best-effort */ }
+  try { await clearAuthKeyId(serverUrl); } catch { /* local revocation is best-effort */ }
+}
 
 const DashboardPage = lazy(() => lazyImportWithAppUpdateNotice(() => import('./pages/DashboardPage.js')).then((m) => ({ default: m.DashboardPage })));
 const DiscussionsPage = lazy(() => lazyImportWithAppUpdateNotice(() => import('./pages/DiscussionsPage.js')).then((m) => ({ default: m.DiscussionsPage })));
@@ -612,7 +617,11 @@ export function App() {
   const [managedShares, setManagedShares] = useState<ShareGrantSummary[]>([]);
   const clearAuthState = useCallback(async (
     reason?: string,
-    options?: { preserveSharedNavigation?: boolean },
+    options?: {
+      preserveSharedNavigation?: boolean;
+      preserveCredentials?: boolean;
+      credentialServerUrl?: string | null;
+    },
   ) => {
     // Authentication is authority, but it is not navigation state. In
     // particular, a refresh can discover an expired cookie before LoginPage
@@ -693,11 +702,9 @@ export function App() {
       // If an invalidated login was already inside a native credential write,
       // let it settle first so this cleanup is guaranteed to be the last writer.
       await Promise.allSettled(staleAuthAttempts);
-      try { await clearAuthKey(); } catch { /* ignore */ }
-      try {
-        const { Preferences } = await import('@capacitor/preferences');
-        await Preferences.remove({ key: 'deck_api_key_id' });
-      } catch { /* ignore */ }
+      if (!options?.preserveCredentials) {
+        await clearStoredAuthForServer(options?.credentialServerUrl);
+      }
     } finally {
       releaseCleanupGate();
     }
@@ -707,6 +714,43 @@ export function App() {
   const [nativeServerUrl, setNativeServerUrl] = useState<string | null>(null);
   const [nativeReady, setNativeReady] = useState(!isNative()); // web is immediately ready
   const [splashDone, setSplashDone] = useState(false);
+
+  const connectNativeServer = useCallback(async (url: string) => {
+    const releaseCleanupGate = holdAuthCredentialCleanupGate();
+    const attempt = beginAuthAttempt();
+    setNativeServerUrl(url);
+    configureApi(url);
+    configureExpectedUserId(null);
+    clearApiKey();
+    try {
+      const storedKey = await getAuthKey(url);
+      if (!storedKey || !attempt.isCurrent()) return;
+      configureApiKey(storedKey);
+      try {
+        const user = await apiFetch<{ id: string }>('/api/auth/user/me');
+        if (!attempt.isCurrent()) return;
+        const authState: AuthState = { userId: user.id, baseUrl: url };
+        authMutationGenerationRef.current += 1;
+        configureExpectedUserId(user.id);
+        localStorage.setItem('rcc_auth', JSON.stringify(authState));
+        setAuth(authState);
+      } catch (err) {
+        // A network outage must not destroy a still-valid saved session. Only
+        // the selected server's authoritative 401 invalidates its credentials.
+        // apiFetch notifies the global expiry handler before throwing, so the
+        // attempt may already be stale here; the URL-scoped deletion is still
+        // required and cannot affect a different server selected afterward.
+        if (err instanceof ApiError && err.status === 401) {
+          await clearStoredAuthForServer(url);
+        }
+        if (!attempt.isCurrent()) return;
+        clearApiKey();
+      }
+    } finally {
+      attempt.finish();
+      releaseCleanupGate();
+    }
+  }, [beginAuthAttempt, holdAuthCredentialCleanupGate]);
 
   const [servers, setServers] = useState<ServerInfo[]>([]);
   const [serversLoaded, setServersLoaded] = useState(false);
@@ -1051,7 +1095,7 @@ export function App() {
         setNativeServerUrl(url);
         if (url) configureApi(url);
 
-        const storedKey = url ? await getAuthKey() : null;
+        const storedKey = url ? await getAuthKey(url) : null;
         if (storedKey && isCurrentAuthGeneration()) {
           configureApiKey(storedKey);
           try {
@@ -1064,9 +1108,11 @@ export function App() {
             setAuth(authState);
           } catch (err) {
             console.warn('[native] /me failed:', err);
+            if (err instanceof ApiError && err.status === 401) {
+              await clearStoredAuthForServer(url);
+            }
             if (!isCurrentAuthGeneration()) return;
             clearApiKey();
-            await clearAuthKey();
           }
         }
       } catch (e) {
@@ -1105,7 +1151,7 @@ export function App() {
   // Native: init push notifications after login
   useEffect(() => {
     if (!auth || !isNative()) return;
-    getAuthKey().then((key) => {
+    getAuthKey(auth.baseUrl).then((key) => {
       if (key) initPushNotifications(key, auth.baseUrl).catch(console.warn);
     });
   }, [auth]);
@@ -1129,9 +1175,9 @@ export function App() {
   // Registered once so any apiFetch 401 after refresh failure lands here.
   useEffect(() => {
     onAuthExpired((reason?: string) => {
-      void clearAuthState(reason ?? 'expired');
+      void clearAuthState(reason ?? 'expired', { credentialServerUrl: auth?.baseUrl });
     });
-  }, [clearAuthState]);
+  }, [auth?.baseUrl, clearAuthState]);
 
 
   // Verify session via /api/auth/user/me on mount (cookie-based auth)
@@ -1146,7 +1192,7 @@ export function App() {
       console.warn(`[auth] /me OK: userId=${user.id}`);
       if (authGeneration !== authMutationGenerationRef.current) return;
       if (auth && auth.userId !== user.id) {
-        void clearAuthState(AUTH_IDENTITY_ERRORS.CHANGED);
+        void clearAuthState(AUTH_IDENTITY_ERRORS.CHANGED, { credentialServerUrl: auth.baseUrl });
         return;
       }
       const authState: AuthState = { userId: user.id, baseUrl };
@@ -1163,7 +1209,7 @@ export function App() {
       // clear path anyway used to erase an explicit shared hash before the
       // user could sign in and continue to that tab.
       if (err instanceof ApiError && err.status === 401 && auth) {
-        await clearAuthState('mount_verify_401');
+        await clearAuthState('mount_verify_401', { credentialServerUrl: auth.baseUrl });
       }
     }).finally(() => {
       setInitialAuthVerificationPending(false);
@@ -1221,7 +1267,7 @@ export function App() {
         await fetchMe();
       } catch (err) {
         if (err instanceof ApiError && err.status === 401) {
-          await clearAuthState(reason);
+          await clearAuthState(reason, { credentialServerUrl: auth.baseUrl });
         }
       }
     };
@@ -1310,7 +1356,7 @@ export function App() {
     if (!selectedServer || isServerOnline(selectedServer)) return;
     void fetchMe().catch(async (err) => {
       if (err instanceof ApiError && err.status === 401) {
-        await clearAuthState('server_offline_verify_401');
+        await clearAuthState('server_offline_verify_401', { credentialServerUrl: auth.baseUrl });
       }
     });
   }, [auth, clearAuthState, selectedServerId, servers, serversLoaded]);
@@ -4645,18 +4691,17 @@ export function App() {
     setOpeningSharedEntryId(null);
     if (isNative()) {
       // Native: revoke API key server-side, clear biometric storage
+      const credentialServerUrl = auth?.baseUrl ?? nativeServerUrl;
       try {
-        const { Preferences } = await import('@capacitor/preferences');
-        const { value: keyId } = await Preferences.get({ key: 'deck_api_key_id' });
+        const keyId = await getAuthKeyId(credentialServerUrl);
         if (keyId) {
           await apiFetch(`/api/auth/user/me/keys/${keyId}`, { method: 'DELETE' }).catch(() => {});
-          await Preferences.remove({ key: 'deck_api_key_id' });
         }
       } catch { /* ignore */ }
       // Local authority revocation must continue even if Secure Storage is
       // unavailable. In particular, server switching must never carry the old
       // in-memory/localStorage identity into ServerSetupPage.
-      try { await clearAuthKey(); } catch { /* ignore */ }
+      await clearStoredAuthForServer(credentialServerUrl);
       clearApiKey();
     } else {
       try {
@@ -4685,9 +4730,11 @@ export function App() {
     setRepoContexts(new Map());
     setManualDashboard(false);
     setAutoEnteringRecent(false);
-  }, [setActiveSession]);
+  }, [auth?.baseUrl, nativeServerUrl, setActiveSession]);
 
-  // Native only: log out + clear server URL → back to ServerSetupPage
+  // Native only: suspend the current server locally and return to the picker.
+  // Stored credentials remain isolated under that server URL, so selecting it
+  // again can restore the session after a fresh /me authority check.
   const handleChangeServer = useCallback(async () => {
     setShowMobileServerMenu(false);
     // Both authenticated and LoginPage-initiated switching must keep the gate
@@ -4696,20 +4743,20 @@ export function App() {
     // to race the remainder of this server-switch operation.
     const releaseCleanupGate = holdAuthCredentialCleanupGate();
     try {
-      if (auth) {
-        await handleLogout();
-      } else {
-        // LoginPage can be unmounted while a native auth Promise is still
-        // writing Secure Storage. Wait for that attempt before deleting the
-        // old credentials so cleanup remains the final writer.
-        await clearAuthState('login_change_server', { preserveSharedNavigation: false });
-      }
+      // LoginPage can be unmounted while a native auth Promise is still writing
+      // its server-scoped credential. Wait for it, revoke all in-memory route
+      // authority, but do not revoke/delete the saved server session.
+      await clearAuthState('change_server', {
+        preserveSharedNavigation: false,
+        preserveCredentials: true,
+        credentialServerUrl: auth?.baseUrl ?? nativeServerUrl,
+      });
       try { await clearServerUrl(); } catch { /* ignore */ }
       setNativeServerUrl(null);
     } finally {
       releaseCleanupGate();
     }
-  }, [auth, clearAuthState, handleLogout, holdAuthCredentialCleanupGate]);
+  }, [auth?.baseUrl, clearAuthState, holdAuthCredentialCleanupGate, nativeServerUrl]);
 
   const handleSelectServer = useCallback(async (serverId: string, serverName?: string) => {
     sharedOpenGenerationRef.current += 1;
@@ -4954,10 +5001,7 @@ export function App() {
   if (isNative() && !nativeServerUrl) {
     return (
       <ServerSetupPage
-        onConnect={(url) => {
-          setNativeServerUrl(url);
-          configureApi(url);
-        }}
+        onConnect={connectNativeServer}
       />
     );
   }
