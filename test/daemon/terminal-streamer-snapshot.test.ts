@@ -627,3 +627,109 @@ describe('TerminalStreamer — snapshot behavior', () => {
     expect(stalled).not.toHaveBeenCalled();
   });
 });
+
+describe('TerminalStreamer — snapshot coalescing (subscription storm)', () => {
+  let streamer: TerminalStreamer;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    mockSize.mockResolvedValue({ cols: 80, rows: 4 });
+    mockCapture.mockResolvedValue('line0\nline1\nline2\nline3');
+    mockHistory.mockResolvedValue('');
+    mockGetPaneId.mockResolvedValue('%1');
+    mockSessionExists.mockResolvedValue(true);
+    mockGetSession.mockReturnValue({ paneId: '%1' });
+    jsonlWatcherMock.isWatching.mockReturnValue(false);
+    const noopStream = { on: vi.fn(), destroy: vi.fn() };
+    mockStartPipe.mockResolvedValue({ stream: noopStream, cleanup: vi.fn().mockResolvedValue(undefined) });
+    streamer = new TerminalStreamer();
+  });
+
+  afterEach(() => {
+    streamer.destroy();
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+    vi.clearAllMocks();
+  });
+
+  /** Attach a subscriber and let the bootstrap capture settle, then reset the
+   *  capture spy so assertions only count on-demand snapshots. */
+  async function attachAndSettle(sessionName: string) {
+    const frames: import('../../src/daemon/terminal-streamer.js').TerminalDiff[] = [];
+    streamer.subscribe({ sessionName, send: (d) => { frames.push(d); } });
+    await vi.advanceTimersByTimeAsync(200);
+    mockCapture.mockClear();
+    frames.length = 0;
+    return frames;
+  }
+
+  it('collapses a burst of concurrent snapshot requests into ONE capture and ONE broadcast', async () => {
+    const frames = await attachAndSettle('sess-burst');
+
+    // Every open browser tab asks on reconnect, and SessionPane /
+    // SubSessionWindow each render a TerminalView that asks again.
+    for (let i = 0; i < 8; i++) streamer.requestSnapshot('sess-burst');
+    await vi.advanceTimersByTimeAsync(200);
+
+    expect(mockCapture).toHaveBeenCalledTimes(1);
+    expect(frames.filter((f) => f.snapshotRequested)).toHaveLength(1);
+  });
+
+  it('reuses a just-taken snapshot even when requests are spaced out (in-flight alone is not enough)', async () => {
+    await attachAndSettle('sess-spaced');
+
+    // The client staggers its requests, and a local capture-pane finishes far
+    // faster than the stagger — so an implementation that only checks
+    // "is a capture in flight" would re-capture every single time.
+    streamer.requestSnapshot('sess-spaced');
+    await vi.advanceTimersByTimeAsync(20);
+    streamer.requestSnapshot('sess-spaced');
+    await vi.advanceTimersByTimeAsync(20);
+    streamer.requestSnapshot('sess-spaced');
+    await vi.advanceTimersByTimeAsync(20);
+
+    expect(mockCapture).toHaveBeenCalledTimes(1);
+  });
+
+  it('lets a new snapshot through once the freshness window expires', async () => {
+    await attachAndSettle('sess-expiry');
+
+    streamer.requestSnapshot('sess-expiry');
+    await vi.advanceTimersByTimeAsync(50);
+    expect(mockCapture).toHaveBeenCalledTimes(1);
+
+    await vi.advanceTimersByTimeAsync(400);
+    streamer.requestSnapshot('sess-expiry');
+    await vi.advanceTimersByTimeAsync(50);
+    expect(mockCapture).toHaveBeenCalledTimes(2);
+  });
+
+  it('a resize invalidates freshness so the next request is not swallowed', async () => {
+    await attachAndSettle('sess-resize');
+
+    streamer.requestSnapshot('sess-resize');
+    await vi.advanceTimersByTimeAsync(50);
+    expect(mockCapture).toHaveBeenCalledTimes(1);
+
+    // Geometry changed — serving the cached frame would show the old size.
+    streamer.invalidateSize('sess-resize');
+    streamer.requestSnapshot('sess-resize');
+    await vi.advanceTimersByTimeAsync(50);
+    expect(mockCapture).toHaveBeenCalledTimes(2);
+  });
+
+  it('a failed capture does not wedge the session into permanent in-flight', async () => {
+    await attachAndSettle('sess-fail');
+
+    mockCapture.mockRejectedValueOnce(new Error('capture-pane exploded'));
+    streamer.requestSnapshot('sess-fail');
+    await vi.advanceTimersByTimeAsync(50);
+    expect(mockCapture).toHaveBeenCalledTimes(1);
+
+    // A rejected capture must NOT earn a freshness window and must release the
+    // in-flight flag, or one failure would freeze the terminal forever.
+    streamer.requestSnapshot('sess-fail');
+    await vi.advanceTimersByTimeAsync(50);
+    expect(mockCapture).toHaveBeenCalledTimes(2);
+  });
+});

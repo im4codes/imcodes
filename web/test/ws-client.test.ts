@@ -1083,7 +1083,153 @@ describe('WsClient', () => {
       const secondWs = lastWs!;
       secondWs.emit('open');
 
+      // The LIVE subscription is restored synchronously so no realtime event is
+      // dropped while reconnecting...
+      expect(secondWs.send).toHaveBeenCalledWith(expect.stringContaining('"forceHistory":false'));
+      // ...and the expensive history replay follows on a staggered timer, so a
+      // reconnect with many open sessions cannot fire them all at once.
+      await vi.advanceTimersByTimeAsync(500);
       expect(secondWs.send).toHaveBeenCalledWith(expect.stringContaining('"forceHistory":true'));
+      client.disconnect();
+      vi.useRealTimers();
+    });
+
+    it('governs snapshot requests across sessions instead of emitting one per terminal', async () => {
+      vi.useFakeTimers();
+      const client = new WsClient('http://localhost:8787', 'srv-1');
+      client.connect();
+      await vi.advanceTimersByTimeAsync(0);
+      lastWs!.emit('open');
+      const ws = lastWs!;
+      ws.send.mockClear();
+
+      const snapshots = () => ws.send.mock.calls
+        .map((c) => String(c[0]))
+        .filter((raw) => raw.includes('"terminal.snapshot_request"'));
+
+      // A reconnect re-runs the snapshot effect in TerminalView, SessionPane and
+      // SubSessionWindow. SessionPane/SubSessionWindow each render a
+      // TerminalView, so the same session asks twice — times every session.
+      const sessions = ['s1', 's2', 's3', 's4', 's5'];
+      for (const name of sessions) {
+        client.sendSnapshotRequest(name);
+        client.sendSnapshotRequest(name);  // the nested TerminalView
+      }
+
+      // Ungoverned this was 10 requests in one tick. The global cursor lets one
+      // through and defers the rest.
+      expect(snapshots().length).toBeLessThanOrEqual(1);
+
+      await vi.advanceTimersByTimeAsync(2_000);
+      const targets = snapshots().map((raw) => JSON.parse(raw).sessionName as string);
+      // Every session still recovers exactly once — governance must never starve
+      // or permanently freeze a terminal.
+      expect(new Set(targets)).toEqual(new Set(sessions));
+      // 10 ungoverned calls collapse to at most one per session plus a single
+      // deferred follow-up for the session that was already in flight — and
+      // every one of them is spread out by the global cursor rather than
+      // emitted in the same tick.
+      expect(targets.length).toBeLessThanOrEqual(sessions.length + 1);
+
+      client.disconnect();
+      vi.useRealTimers();
+    });
+
+    it('does not re-send an unchanged terminal size', async () => {
+      vi.useFakeTimers();
+      const client = new WsClient('http://localhost:8787', 'srv-1');
+      client.connect();
+      await vi.advanceTimersByTimeAsync(0);
+      lastWs!.emit('open');
+      const ws = lastWs!;
+      ws.send.mockClear();
+
+      const resizes = () => ws.send.mock.calls
+        .map((c) => String(c[0]))
+        .filter((raw) => raw.includes('"session.resize"'));
+
+      client.sendResize('s1', 120, 40);
+      client.sendResize('s1', 120, 40);
+      client.sendResize('s1', 120, 40);
+      // tmux has one size per session; a redundant resize reflows the whole pane
+      // and streams that reflow to every subscriber.
+      expect(resizes()).toHaveLength(1);
+
+      client.sendResize('s1', 121, 40);
+      expect(resizes()).toHaveLength(2);
+
+      client.disconnect();
+      vi.useRealTimers();
+    });
+
+    it('staggers transport history replay instead of asking for every session at once', async () => {
+      vi.useFakeTimers();
+      const client = new WsClient('http://localhost:8787', 'srv-1');
+      client.connect();
+      await vi.advanceTimersByTimeAsync(0);
+      lastWs!.emit('open');
+      const firstWs = lastWs!;
+
+      const sessions = ['s1', 's2', 's3', 's4', 's5'];
+      for (const id of sessions) client.subscribeTransportSession(id);
+
+      // Socket dies the way it does after a long lock, and everything reconnects.
+      firstWs.send.mockClear();
+      firstWs.emit('close');
+      await vi.advanceTimersByTimeAsync(5000);
+      const secondWs = lastWs!;
+      expect(secondWs).not.toBe(firstWs);
+      secondWs.emit('open');
+
+      const subscribesWithHistory = () => secondWs.send.mock.calls
+        .map((c) => String(c[0]))
+        .filter((raw) => raw.includes(`"type":"${TRANSPORT_MSG.CHAT_SUBSCRIBE}"`) && raw.includes('"forceHistory":true'));
+      const subscribesLiveOnly = () => secondWs.send.mock.calls
+        .map((c) => String(c[0]))
+        .filter((raw) => raw.includes(`"type":"${TRANSPORT_MSG.CHAT_SUBSCRIBE}"`) && raw.includes('"forceHistory":false'));
+
+      // Every session gets its LIVE subscription back immediately — nothing may
+      // sit unsubscribed while the histories trickle in, or the server silently
+      // drops its realtime events.
+      expect(subscribesLiveOnly()).toHaveLength(sessions.length);
+      // ...but at most one history replay has been asked for so far. Before this
+      // fix all five went out in the same synchronous loop.
+      expect(subscribesWithHistory().length).toBeLessThanOrEqual(1);
+
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(subscribesWithHistory()).toHaveLength(sessions.length);
+
+      client.disconnect();
+      vi.useRealTimers();
+    });
+
+    it('drops a queued history replay when the session is unsubscribed during the stagger window', async () => {
+      vi.useFakeTimers();
+      const client = new WsClient('http://localhost:8787', 'srv-1');
+      client.onMessage(vi.fn());
+      client.connect();
+      await vi.advanceTimersByTimeAsync(0);
+      lastWs!.emit('open');
+
+      for (const id of ['keep-1', 'keep-2', 'closed-3']) client.subscribeTransportSession(id);
+
+      lastWs!.emit('close');
+      await vi.advanceTimersByTimeAsync(1000);
+      await vi.advanceTimersByTimeAsync(0);
+      const secondWs = lastWs!;
+      secondWs.send.mockClear();
+      secondWs.emit('open');
+
+      // User closes that window while its history request is still queued.
+      client.unsubscribeTransportSession('closed-3');
+      await vi.advanceTimersByTimeAsync(2_000);
+
+      const historyTargets = secondWs.send.mock.calls
+        .map((c) => String(c[0]))
+        .filter((raw) => raw.includes('"forceHistory":true'))
+        .map((raw) => JSON.parse(raw).sessionId as string);
+      expect(historyTargets).not.toContain('closed-3');
+
       client.disconnect();
       vi.useRealTimers();
     });

@@ -5,6 +5,7 @@
  */
 import { h } from 'preact';
 import { useEffect, useLayoutEffect, useRef, useState, useMemo, useCallback } from 'preact/hooks';
+import { useCoalescedFrame } from '../hooks/useCoalescedFrame.js';
 import { memo, createPortal } from 'preact/compat';
 import { useTranslation } from 'react-i18next';
 import type {
@@ -2482,6 +2483,12 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
   // follow/suppress policy stays synchronous so ordering against callers that
   // set state right after is unchanged.
   const pendingScrollFrameRef = useRef<number | null>(null);
+  // Single-flight frame for every "follow the bottom" request in this view.
+  // These fire from timeline updates, scroll handling and ResizeObserver — all
+  // of which keep running while the display is asleep and frames are not
+  // produced. A raw rAF per request therefore builds an unbounded backlog that
+  // the browser executes in one post-unlock frame. See useCoalescedFrame.
+  const scheduleFollowFrame = useCoalescedFrame();
 
   const scrollToBottom = (engageFollow: boolean = true) => {
     const el = scrollRef.current;
@@ -2521,8 +2528,8 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
     setShowScrollBtn(false);
     // Force scroll to bottom on tab switch — the auto-scroll effect may not fire
     // if no new events arrived while this tab was inactive.
-    requestAnimationFrame(() => scrollToBottom(true));
-  }, [sessionId]);
+    scheduleFollowFrame(() => scrollToBottom(true));
+  }, [sessionId, scheduleFollowFrame]);
 
   // On mobile: when keyboard opens, viewport shrinks and scrollTop can reset to 0.
   // Save the relative bottom offset on focusin, then restore against the new layout
@@ -2547,7 +2554,7 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
       if (vv.height !== prevHeight) {
         suppressLoadOlder();
         if (savedWasNearBottom || autoScrollRef.current) {
-          requestAnimationFrame(() => scrollToBottom());
+          scheduleFollowFrame(() => scrollToBottom());
         } else if (vv.height < prevHeight) {
           const targetTop = Math.max(0, el.scrollHeight - el.clientHeight - savedBottomOffset);
           el.scrollTop = targetTop;
@@ -2761,13 +2768,13 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
     prevVisibleTsRef.current = lastVisibleTs;
     if (!changed && !preview) return;
     if (layoutHandledVisibleTsRef.current === lastVisibleTs) return;
-    requestAnimationFrame(() => {
+    scheduleFollowFrame(() => {
       // Re-check inside the rAF callback so a state flip during the frame
       // window (e.g. a user scroll-up that lands between schedule and fire)
       // is honoured. Preview always follows by design.
       if (preview || autoScrollRef.current) scrollToBottom(false);
     });
-  }, [lastVisibleTs, preview]);
+  }, [lastVisibleTs, preview, scheduleFollowFrame]);
 
   const lastScrollActivityRef = useRef(Date.now());
   // (Previously SCROLL_IDLE_RESUME_MS = 60_000 drove a setInterval that
@@ -2866,7 +2873,7 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
       && Date.now() < suppressLoadOlderUntilRef.current;
     if (transientTopJump) {
       setShowScrollBtn(false);
-      requestAnimationFrame(() => scrollToBottom(true));
+      scheduleFollowFrame(() => scrollToBottom(true));
       return;
     }
     // Adaptive + hysteresis thresholds (avoid boundary flicker during streaming
@@ -2928,14 +2935,14 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
       // Re-check follow state INSIDE the rAF: a user scroll-up that disengages
       // during the frame gap must still win, or we'd snap them back against
       // their intent.
-      requestAnimationFrame(() => {
+      scheduleFollowFrame(() => {
         if (autoScrollRef.current) scrollToBottom();
       });
     });
 
     ro.observe(el);
     return () => ro.disconnect();
-  }, [preview]);
+  }, [preview, scheduleFollowFrame]);
 
   // Hold the bottom through the post-mount layout settle.
   //

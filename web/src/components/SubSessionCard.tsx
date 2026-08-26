@@ -4,6 +4,7 @@
  * Right-edge drag handle lets user resize width independently per card.
  */
 import { useRef, useState, useCallback, useMemo, useEffect } from 'preact/hooks';
+import { useCoalescedFrame } from '../hooks/useCoalescedFrame.js';
 import type { JSX } from 'preact';
 import { useTranslation } from 'react-i18next';
 import { resizeHandleHoverEvents } from './window-resize.js';
@@ -251,6 +252,7 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
     sharedState,
   }), [sharedState, sub]);
 
+  const scheduleFollowFrame = useCoalescedFrame();
   const forceFollowLatest = useCallback(() => {
     if (isShell) termScrollRef.current?.();
     else chatScrollRef.current?.();
@@ -293,8 +295,8 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
       addOptimisticUserMessage?.(text, commandId);
     }
     cardInputRef.current!.value = '';
-    requestAnimationFrame(() => { forceFollowLatest(); });
-  }, [addOptimisticUserMessage, aliasAll, aliasError, aliasLoaded, machineAll, ws, connected, sub.sessionName, forceFollowLatest]);
+    scheduleFollowFrame(() => { forceFollowLatest(); });
+  }, [addOptimisticUserMessage, aliasAll, aliasError, aliasLoaded, machineAll, ws, connected, sub.sessionName, forceFollowLatest, scheduleFollowFrame]);
 
   const handleTransportStop = useCallback(() => {
     // Stop is highest-priority — must fire even when the WS is briefly in
@@ -346,9 +348,13 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
     handleScroll();
     return () => el.removeEventListener('scroll', handleScroll);
   }, []);
+  // Coalesced: a raw rAF here queued one uncancelled callback per timeline
+  // update. With the display asleep nothing drains that queue, so a long
+  // lock plus several open cards built a backlog the browser then ran in a
+  // single post-unlock frame. See useCoalescedFrame for the full rationale.
   useEffect(() => {
-    requestAnimationFrame(() => { forceFollowLatest(); });
-  }, [events, sub.state, forceFollowLatest]);
+    scheduleFollowFrame(() => { forceFollowLatest(); });
+  }, [events, sub.state, forceFollowLatest, scheduleFollowFrame]);
   const scrollToBottom = useCallback(() => {
     forceFollowLatest();
   }, [forceFollowLatest]);

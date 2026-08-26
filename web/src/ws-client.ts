@@ -309,6 +309,29 @@ const HEARTBEAT_MS = 10000; // lowered from 25s for faster dead-connection detec
 const TERMINAL_SUBSCRIPTION_DEBOUNCE_MS = 50;
 const TERMINAL_SUBSCRIPTION_STAGGER_MS = 30;
 const TERMINAL_RECONNECT_REPLAY_STAGGER_MS = 90;
+/** Spacing between per-session transport `chat.history` replay requests after a
+ *  reconnect. Each one makes the daemon read and ship that session's whole
+ *  history, and the browser then parses + merges + re-renders it. Firing them
+ *  all in one loop — which is what happened before — put N of those bursts on
+ *  the main thread back to back. `subscribeTransportSession` already documents
+ *  this hazard for the page-open path; the reconnect path bypassed that
+ *  protection entirely. Kept in the same order of magnitude as the terminal
+ *  stagger so a reconnect with both kinds of subscription interleaves. */
+const TRANSPORT_RECONNECT_HISTORY_STAGGER_MS = 120;
+
+/** Minimum spacing between snapshot requests for the SAME session.
+ *  Previously this lived only inside `handleStreamReset`; `sendSnapshotRequest`
+ *  had no governance at all, so component-driven requests bypassed it. */
+const SNAPSHOT_SESSION_MIN_INTERVAL_MS = 500;
+/** Spacing between snapshot requests for DIFFERENT sessions.
+ *
+ *  A per-session limiter has no ceiling once K sessions are open: K terminals
+ *  reconnecting (or K stream_resets arriving) each get their own 500ms budget,
+ *  so the client can emit K requests in one tick. Every one of them makes the
+ *  daemon fork a `capture-pane` AND makes the server broadcast a full frame to
+ *  EVERY browser subscribed to that session, so the cost grows with tabs x
+ *  sessions. This global cursor is the missing brake. */
+const SNAPSHOT_GLOBAL_STAGGER_MS = 60;
 const POST_CONNECT_NON_CRITICAL_WINDOW_MS = 1_000;
 const POST_CONNECT_NON_CRITICAL_BASE_DELAY_MS = 250;
 const POST_CONNECT_NON_CRITICAL_STAGGER_MS = 90;
@@ -476,6 +499,8 @@ export class WsClient {
   private terminalRawHolds = new Map<string, number>();
   private sentTerminalSubscriptions = new Map<string, boolean>();
   private terminalSubscriptionTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  /** Staggered `forceHistory` upgrades issued after a reconnect (see replayAllSubscriptionsForNewSocket). */
+  private transportHistoryReplayTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private terminalSubscriptionNextFlushAt = 0;
 
   /** Desired transport-chat subscriptions per session. Replayed on browser reconnect. */
@@ -503,6 +528,12 @@ export class WsClient {
     lastSnapshotAt: number;
     pendingSnapshot: ReturnType<typeof setTimeout> | null;
   }>();
+  /** Global (cross-session) cursor for outbound snapshot requests. */
+  private snapshotNextGlobalSlotAt = 0;
+  /** Last dimensions actually sent per session. tmux keeps ONE size per
+   *  session, so a redundant resize still reflows the whole pane and streams
+   *  that reflow to every subscriber as raw PTY bytes. */
+  private lastSentResize = new Map<string, string>();
 
   constructor(baseUrl: string, serverId: string, options: { shareTarget?: ShareTarget | null } = {}) {
     this.baseUrl = baseUrl;
@@ -880,10 +911,47 @@ export class WsClient {
       terminalReplayIndex++;
     }
 
+    // Two-phase, deliberately. Phase 1 re-establishes every LIVE subscription
+    // immediately and with `forceHistory:false`, so no session misses realtime
+    // events while the reconnect settles (the server drops events for sessions
+    // with no subscriber). Phase 2 asks for the expensive `chat.history` replay
+    // one session at a time.
+    //
+    // Doing both in a single synchronous loop meant that after a lock/sleep —
+    // where the socket almost always died and every open session reconnects at
+    // once — the daemon replayed N full histories in parallel and the browser
+    // had to parse, merge and re-render all of them back to back on the main
+    // thread. That is a subscription storm, and it scales with the number of
+    // open sessions, which matches "the more tabs are open, the worse it is".
+    let historyReplayIndex = 0;
     for (const sessionId of this.transportSubscriptions) {
-      const replayHistory = this.transportSubscriptionReplayHistory.get(sessionId) !== false;
-      if (!this.sendTransportSubscribe(sessionId, replayHistory)) break;
+      if (!this.sendTransportSubscribe(sessionId, false)) break;
+      if (this.transportSubscriptionReplayHistory.get(sessionId) === false) continue;
+      this.queueTransportHistoryReplay(sessionId, historyReplayIndex * TRANSPORT_RECONNECT_HISTORY_STAGGER_MS);
+      historyReplayIndex++;
     }
+  }
+
+  /** Ask for one session's transport history replay after `delayMs`. Replaces any
+   *  pending request for the same session and is cancelled on socket teardown, so
+   *  a flapping link cannot accumulate replay requests. */
+  private queueTransportHistoryReplay(sessionId: string, delayMs: number): void {
+    const existing = this.transportHistoryReplayTimers.get(sessionId);
+    if (existing) clearTimeout(existing);
+    const timer = setTimeout(() => {
+      this.transportHistoryReplayTimers.delete(sessionId);
+      // Still wanted? A session unsubscribed during the stagger window must not
+      // pull a history it no longer displays.
+      if (!this.transportSubscriptions.has(sessionId)) return;
+      if (this.transportSubscriptionReplayHistory.get(sessionId) === false) return;
+      this.sendTransportSubscribe(sessionId, true);
+    }, Math.max(0, delayMs));
+    this.transportHistoryReplayTimers.set(sessionId, timer);
+  }
+
+  private clearTransportHistoryReplayTimers(): void {
+    for (const timer of this.transportHistoryReplayTimers.values()) clearTimeout(timer);
+    this.transportHistoryReplayTimers.clear();
   }
 
   private flushSubscriptionDiffAfterProbeRecovery(): void {
@@ -1045,6 +1113,14 @@ export class WsClient {
   /** Notify the daemon that the terminal viewport has been resized. */
   sendResize(sessionName: string, cols: number, rows: number): void {
     if (!this._connected) return;
+    // An unchanged resize is NOT a no-op on the daemon: `handleResize` still
+    // calls `resizeSession`, tmux reflows the entire pane, and that reflow is
+    // streamed to every subscriber as raw PTY bytes. Every terminal re-runs
+    // its resize effect on reconnect, so without this guard one reconnect
+    // replays a full-screen reflow per open terminal.
+    const key = `${cols}x${rows}`;
+    if (this.lastSentResize.get(sessionName) === key) return;
+    this.lastSentResize.set(sessionName, key);
     this.send({ type: 'session.resize', sessionName, cols, rows });
   }
 
@@ -1423,8 +1499,63 @@ export class WsClient {
   }
 
   /** Request a terminal snapshot (fullFrame) for a session. */
+  /** Request a fresh full-frame snapshot for a session.
+   *
+   *  Governed, NOT a bare send. Three call sites (`TerminalView`,
+   *  `SessionPane`, `SubSessionWindow`) all fire on the same `connected`
+   *  transition, and `SessionPane`/`SubSessionWindow` each render a
+   *  `TerminalView` for the SAME session — so one reconnect emitted at least
+   *  two requests per session, times every open session, times every browser
+   *  tab. Each request costs a `capture-pane` fork on the daemon and a
+   *  full-frame broadcast to every subscriber of that session. */
   sendSnapshotRequest(sessionName: string): void {
-    this.send({ type: 'terminal.snapshot_request', sessionName });
+    this.requestSnapshotGoverned(sessionName);
+  }
+
+  /** Shared implementation behind `sendSnapshotRequest` and stream-reset
+   *  recovery: at most one request per session per
+   *  SNAPSHOT_SESSION_MIN_INTERVAL_MS, spread across sessions by a global
+   *  cursor. Requests inside the window collapse into a single deferred one,
+   *  so a session can never be starved and can never be frozen. */
+  private requestSnapshotGoverned(session: string): void {
+    if (!this._connected || this._destroyed) return;
+    const now = Date.now();
+    let state = this.resetState.get(session);
+    if (!state) {
+      state = { lastSnapshotAt: 0, pendingSnapshot: null };
+      this.resetState.set(session, state);
+    }
+
+    const sessionReadyAt = state.lastSnapshotAt === 0
+      ? now
+      : state.lastSnapshotAt + SNAPSHOT_SESSION_MIN_INTERVAL_MS;
+    const slotAt = Math.max(sessionReadyAt, this.snapshotNextGlobalSlotAt, now);
+
+    if (slotAt <= now) {
+      state.lastSnapshotAt = now;
+      this.snapshotNextGlobalSlotAt = now + SNAPSHOT_GLOBAL_STAGGER_MS;
+      this.emitSnapshotRequest(session);
+      return;
+    }
+
+    if (state.pendingSnapshot) return;
+    this.snapshotNextGlobalSlotAt = slotAt + SNAPSHOT_GLOBAL_STAGGER_MS;
+    state.pendingSnapshot = setTimeout(() => {
+      const s = this.resetState.get(session);
+      if (!s) return;
+      s.pendingSnapshot = null;
+      if (this._destroyed || !this._connected) return;
+      s.lastSnapshotAt = Date.now();
+      this.emitSnapshotRequest(session);
+    }, Math.max(0, slotAt - now));
+  }
+
+  private emitSnapshotRequest(session: string): void {
+    try {
+      this.send({ type: 'terminal.snapshot_request', sessionName: session });
+    } catch {
+      // ws not open right now; the next reset / reconnect replay recovers.
+    }
   }
 
   /** Request a directory listing from the daemon. Returns the requestId for matching the response. */
@@ -1746,6 +1877,10 @@ export class WsClient {
         if (state.pendingSnapshot) clearTimeout(state.pendingSnapshot);
       }
       this.resetState.clear();
+      this.snapshotNextGlobalSlotAt = 0;
+      // A new socket means the daemon may have restarted or the pane may have
+      // been rebuilt — the remembered size is no longer known-applied.
+      this.lastSentResize.clear();
       this.replayAllSubscriptionsForNewSocket();
       this.dispatch({
         type: 'session.event',
@@ -1859,43 +1994,11 @@ export class WsClient {
    *     this design cannot.
    */
   private handleStreamReset(session: string): void {
-    if (!this._connected) return;
-    const SNAPSHOT_REQUEST_MIN_INTERVAL_MS = 500;
-    const now = Date.now();
-    let state = this.resetState.get(session);
-    if (!state) {
-      state = { lastSnapshotAt: 0, pendingSnapshot: null };
-      this.resetState.set(session, state);
-    }
-
-    const sinceLast = now - state.lastSnapshotAt;
-    if (sinceLast >= SNAPSHOT_REQUEST_MIN_INTERVAL_MS) {
-      // Window open — fire snapshot now.
-      state.lastSnapshotAt = now;
-      try {
-        this.send({ type: 'terminal.snapshot_request', sessionName: session });
-      } catch {
-        // ws not open right now; the next reset (or the reconnect resubscribe
-        // replay) will recover.
-      }
-      return;
-    }
-
-    // Inside the rate-limit window — defer one snapshot to the end of the
-    // window. If a deferred snapshot is already scheduled, leave it alone:
-    // multiple resets in the same window collapse into a single snapshot.
-    if (state.pendingSnapshot) return;
-    const remaining = SNAPSHOT_REQUEST_MIN_INTERVAL_MS - sinceLast;
-    state.pendingSnapshot = setTimeout(() => {
-      const s = this.resetState.get(session);
-      if (!s) return;
-      s.pendingSnapshot = null;
-      if (this._destroyed || !this._connected) return;
-      s.lastSnapshotAt = Date.now();
-      try {
-        this.send({ type: 'terminal.snapshot_request', sessionName: session });
-      } catch { /* covered by next reset / reconnect */ }
-    }, remaining);
+    // Shares ONE window with component-driven requests. Previously this kept a
+    // second, independent per-session limiter, so overflow recovery and a
+    // reconnect-driven request could fire back to back for the same session,
+    // neither knowing about the other.
+    this.requestSnapshotGoverned(session);
   }
 
   private isCurrentSocket(socket: WebSocket, generation: number): boolean {
@@ -1943,6 +2046,7 @@ export class WsClient {
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
     this.clearPongWatchdog();
     this.clearTerminalSubscriptionTimers();
+    this.clearTransportHistoryReplayTimers();
     this.clearNonCriticalSendTimers();
     this.clearP2pWorkflowPendingRequests();
     // Capability state belongs to a single daemon WS; on socket teardown

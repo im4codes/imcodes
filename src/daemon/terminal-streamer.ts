@@ -79,6 +79,11 @@ function isBlankTerminalSnapshot(value: string): boolean {
 
 export type { TerminalDiff, TerminalHistory } from '../shared/transport/terminal.js';
 
+/** How long a just-broadcast snapshot is treated as current, so a burst of
+ *  requests from several browser tabs collapses to one `capture-pane`. Kept
+ *  well below human perception so a reused frame is never visibly stale. */
+const SNAPSHOT_FRESHNESS_MS = 250;
+
 export interface StreamSubscriber {
   sessionName: string;
   /** Send a fullFrame snapshot or diff (snapshot uses fullFrame: true). */
@@ -130,6 +135,14 @@ export class TerminalStreamer {
    *  `cat` is then orphaned. Observed a ~5% orphan rate (10 of 215 pipe
    *  starts) on a leaking production daemon before this guard. */
   private pipeStartLocks = new Set<string>();
+
+  /** Sessions with a `capture-pane` currently running. See `requestSnapshot`. */
+  private snapshotInFlight = new Set<string>();
+  /** Timestamp until which the last broadcast snapshot is considered current. */
+  private snapshotFreshUntil = new Map<string, number>();
+  /** Sessions invalidated (resized) while a capture was in flight — each earns
+   *  exactly one trailing capture so the new geometry is not lost. */
+  private snapshotStaleWhileCapturing = new Set<string>();
 
   /** Grace period before tearing down a pipe whose subscriber count
    *  dropped to zero. Without it, any browser-side subscriber churn
@@ -440,6 +453,9 @@ export class TerminalStreamer {
       const currentSubs = this.subscribers.get(sessionName);
       if (!currentSubs || currentSubs.size > 0) return;
       this.subscribers.delete(sessionName);
+      // No subscribers left — drop snapshot coalescing state so a session that
+      // comes back later is not gated by a stale freshness window.
+      this.clearSnapshotCoalescing(sessionName);
       void this.stopPipe(sessionName);
       this.clearIdleTimer(sessionName);
       this.lastRawAt.delete(sessionName);
@@ -453,13 +469,42 @@ export class TerminalStreamer {
     logger.debug({ sessionName, graceMs: TerminalStreamer.PIPE_STOP_GRACE_MS }, 'pipe-stop scheduled with grace');
   }
 
-  /** Request an on-demand snapshot for all subscribers of a session. */
+  /**
+   * Request an on-demand snapshot for all subscribers of a session.
+   *
+   * COALESCED, and deliberately so. Every browser tab that has this session
+   * open asks for a snapshot on reconnect — and each tab asks more than once,
+   * because `SessionPane` / `SubSessionWindow` each render a `TerminalView`
+   * that also asks. Ungoverned, each of those requests forked its own
+   * `capture-pane`, and the resulting full frame is broadcast to EVERY
+   * subscriber of the session, so the delivered bytes grew with
+   * (requests x subscribers). After a lock/sleep, when every tab reconnects at
+   * once, that is a subscription storm.
+   *
+   * Two gates, and BOTH are needed:
+   *  - in-flight: a capture already running absorbs later requests;
+   *  - freshness: a capture that finished microseconds ago is reused. Without
+   *    this, a client that spaces its requests out (the client staggers them)
+   *    would see "nothing in flight" every single time — a local capture-pane
+   *    finishes far faster than the stagger — and re-capture on every request.
+   *
+   * The snapshot is authoritative for the whole session (tmux keeps ONE size
+   * per session; `SubscriberState` carries no per-subscriber dimensions), so a
+   * single capture broadcast once is correct for every subscriber.
+   */
   requestSnapshot(sessionName: string): void {
     // Transport sessions have no tmux pane — snapshot requests are no-ops.
     if (isTransportSessionName(sessionName)) return;
     const subs = this.subscribers.get(sessionName);
     if (!subs || subs.size === 0) return;
 
+    // Already capturing — that capture's broadcast covers this request too.
+    if (this.snapshotInFlight.has(sessionName)) return;
+    // Captured moments ago and nothing invalidated it — reuse, do not re-fork.
+    const freshUntil = this.snapshotFreshUntil.get(sessionName) ?? 0;
+    if (Date.now() < freshUntil) return;
+
+    this.snapshotInFlight.add(sessionName);
     void (async () => {
       try {
         const size = await this.getSize(sessionName);
@@ -500,15 +545,47 @@ export class TerminalStreamer {
         }
 
         timelineEmitter.emit(sessionName, 'terminal.snapshot', { lines, cols: size.cols, rows: size.rows });
+        // Only a SUCCESSFUL capture earns a freshness window. A failure must
+        // not suppress the next attempt.
+        this.snapshotFreshUntil.set(sessionName, Date.now() + SNAPSHOT_FRESHNESS_MS);
       } catch (err) {
         logger.warn({ sessionName, err }, 'requestSnapshot failed');
+      } finally {
+        // Released in `finally` so a rejected capture cannot wedge the session
+        // into "permanently in flight" — that would turn one failure into a
+        // terminal that never refreshes again.
+        this.snapshotInFlight.delete(sessionName);
+        // A resize (or anything else) that landed WHILE the capture was running
+        // invalidated it: the frame just broadcast may describe the old
+        // geometry. Drop the freshness window and run exactly one more capture
+        // — bounded, because this flag is cleared before re-entering.
+        if (this.snapshotStaleWhileCapturing.delete(sessionName)) {
+          this.snapshotFreshUntil.delete(sessionName);
+          if ((this.subscribers.get(sessionName)?.size ?? 0) > 0) {
+            this.requestSnapshot(sessionName);
+          }
+        }
       }
     })();
+  }
+
+  /** Drop any coalescing state for a session (unsubscribe / teardown). */
+  private clearSnapshotCoalescing(sessionName: string): void {
+    this.snapshotInFlight.delete(sessionName);
+    this.snapshotFreshUntil.delete(sessionName);
+    this.snapshotStaleWhileCapturing.delete(sessionName);
   }
 
   /** Invalidate size cache (call after resize events). */
   invalidateSize(sessionName: string): void {
     this.sizeCache.delete(sessionName);
+    // The cached snapshot describes the OLD geometry — never serve it as fresh.
+    this.snapshotFreshUntil.delete(sessionName);
+    // If a capture is mid-flight it is already reading stale geometry; mark it
+    // so exactly one trailing capture runs once it settles.
+    if (this.snapshotInFlight.has(sessionName)) {
+      this.snapshotStaleWhileCapturing.add(sessionName);
+    }
   }
 
   /** No-op in new design (no polling loop to nudge). Kept for API compat. */
@@ -560,6 +637,12 @@ export class TerminalStreamer {
     this.idleState.clear();
     this.sizeCache.clear();
     this.frameSeqs.clear();
+    // Snapshot coalescing state is per-session bookkeeping, not a resource —
+    // but leaving it behind means a rebuilt streamer (or a reused instance)
+    // could be gated by a freshness window that outlived its session.
+    this.snapshotInFlight.clear();
+    this.snapshotFreshUntil.clear();
+    this.snapshotStaleWhileCapturing.clear();
   }
 
   destroy(): void {

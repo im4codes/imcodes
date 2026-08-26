@@ -120,6 +120,13 @@ class MockWs extends EventEmitter {
   closeCode: number | undefined;
   closeReason: string | undefined;
 
+  /** When true, `send` accepts the frame but NEVER invokes the completion
+   *  callback — the shape of a peer whose receive side has stopped draining, so
+   *  the bridge's in-flight accounting keeps climbing. Off by default. */
+  stallSend = false;
+  /** Pending completion callbacks captured while `stallSend` is on. */
+  stalledCallbacks: Array<(err?: Error) => void> = [];
+
   send(data: string | Buffer, _opts?: unknown, callback?: (err?: Error) => void) {
     if (this.closed) {
       const err = new Error('socket closed');
@@ -127,7 +134,17 @@ class MockWs extends EventEmitter {
       throw err;
     }
     this.sent.push(data);
+    if (this.stallSend) {
+      if (callback) this.stalledCallbacks.push(callback);
+      return;
+    }
     callback?.();
+  }
+
+  /** Release every stalled completion callback (peer started reading again). */
+  drainStalledSends() {
+    const pending = this.stalledCallbacks.splice(0, this.stalledCallbacks.length);
+    for (const cb of pending) cb();
   }
 
   close(code?: number, reason?: string) {
@@ -3057,6 +3074,97 @@ describe('WsBridge', () => {
       // The huge frame was DROPPED at overflow detection (never sent), but
       // the normal-sized one MUST flow because subscription is still alive.
       expect(binarySent.length).toBeGreaterThanOrEqual(1);
+    });
+
+    it('an oversize single frame does not swallow the stream_reset of a LATER real overflow', async () => {
+      const { bridge, daemonWs } = await setupAuth();
+
+      // A browser that never acknowledges: its ws.send callbacks stay pending,
+      // so in-flight bytes accumulate and a real congestion episode can form.
+      const browserWs = new MockWs();
+      browserWs.stallSend = true;
+      bridge.handleBrowserConnection(browserWs as never, 'test-user', makeDb('valid-hash'));
+      browserWs.emit('message', JSON.stringify({ type: 'terminal.subscribe', session: 'sessNoticeLatch' }));
+      await flushAsync();
+      browserWs.sent.length = 0;
+
+      const resetCount = () => browserWs.sentStrings.filter((x) => x.includes('"terminal.stream_reset"')).length;
+
+      // 1. A single frame bigger than the whole budget, with nothing in flight.
+      //    This is not congestion — there is no backlog — so it must not open
+      //    (or consume) an overflow episode.
+      daemonWs.emit('message', packFrame('sessNoticeLatch', Buffer.alloc(4 * 1024 * 1024 + 100, 0x51)), true);
+      await flushAsync();
+      const afterOversize = resetCount();
+      expect(afterOversize).toBeGreaterThanOrEqual(1);
+
+      // 2. Now build REAL congestion: normal frames the stalled browser never
+      //    acknowledges, until the high-water mark is crossed.
+      for (let i = 0; i < 6; i++) {
+        daemonWs.emit('message', packFrame('sessNoticeLatch', Buffer.alloc(1024 * 1024, 0x52)), true);
+        await flushAsync();
+      }
+
+      // If the oversize drop had consumed the one-shot notice, nothing would
+      // ever clear it again (that path never pauses), and the browser would be
+      // left with a silent gap it is never told about.
+      expect(resetCount()).toBeGreaterThan(afterOversize);
+    });
+
+    it('a late callback from a forgiven generation cannot hand the socket extra budget', async () => {
+      vi.useFakeTimers();
+      try {
+        const { bridge, daemonWs } = await setupAuth();
+        const browserWs = new MockWs();
+        browserWs.stallSend = true;
+        bridge.handleBrowserConnection(browserWs as never, 'test-user', makeDb('valid-hash'));
+        browserWs.emit('message', JSON.stringify({ type: 'terminal.subscribe', session: 'sessEpoch' }));
+        await vi.advanceTimersByTimeAsync(50);
+        browserWs.sent.length = 0;
+
+        const binaryCount = () => browserWs.sent.filter((x) => Buffer.isBuffer(x)).length;
+
+        // Fill the budget with frames the peer never acknowledges.
+        for (let i = 0; i < 5; i++) {
+          daemonWs.emit('message', packFrame('sessEpoch', Buffer.alloc(1024 * 1024, 0x61)), true);
+          await vi.advanceTimersByTimeAsync(1);
+        }
+        const acceptedBeforeGrace = binaryCount();
+
+        // Paused now: further frames are dropped, not sent.
+        daemonWs.emit('message', packFrame('sessEpoch', Buffer.alloc(512 * 1024, 0x62)), true);
+        await vi.advanceTimersByTimeAsync(1);
+        expect(binaryCount()).toBe(acceptedBeforeGrace);
+
+        // Wait past the grace window so the budget is forgiven once, then let
+        // the OLD, still-unacknowledged callbacks land.
+        await vi.advanceTimersByTimeAsync(2_500);
+        daemonWs.emit('message', packFrame('sessEpoch', Buffer.alloc(1024, 0x63)), true);
+        await vi.advanceTimersByTimeAsync(1);
+        const afterForgiveness = binaryCount();
+        expect(afterForgiveness).toBeGreaterThan(acceptedBeforeGrace);
+
+        // The forgiven generation's callbacks arrive late. They refer to bytes
+        // already written off; if they decremented the fresh counter it would go
+        // negative and the socket would silently regain multi-MB of credit.
+        browserWs.drainStalledSends();
+        await vi.advanceTimersByTimeAsync(1);
+
+        // Re-fill: the post-forgiveness budget must be the SAME 4MB, not 4MB
+        // plus whatever the stale callbacks refunded.
+        browserWs.stallSend = true;
+        let accepted = 0;
+        for (let i = 0; i < 12; i++) {
+          const before = binaryCount();
+          daemonWs.emit('message', packFrame('sessEpoch', Buffer.alloc(1024 * 1024, 0x64)), true);
+          await vi.advanceTimersByTimeAsync(1);
+          if (binaryCount() > before) accepted += 1;
+        }
+        // 4MB budget / 1MB frames => at most 4 accepted before pausing again.
+        expect(accepted).toBeLessThanOrEqual(4);
+      } finally {
+        vi.useRealTimers();
+      }
     });
   });
 

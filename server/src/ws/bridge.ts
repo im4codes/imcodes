@@ -171,6 +171,7 @@ import type {
 } from '../services/remote-desktop-shell-launch-context.js';
 import { readDatabaseClock } from '../services/remote-desktop-guest-due-worker.js';
 import { isRemoteDesktopFeatureEnabled } from '../../../shared/remote-desktop-feature.js';
+import { resolveRemoteDesktopSessionProfile } from '../../../shared/remote-desktop-platform.js';
 import {
   REMOTE_DESKTOP_INSTALLABLE_CAPABILITY,
   REMOTE_DESKTOP_INSTALL_MSG,
@@ -532,6 +533,14 @@ const BROWSER_RATE_LIMIT_ENABLED = false;
 // at typical egress rates without holding meaningful memory (a single ws
 // per session, queue is reset on overflow anyway).
 const QUEUE_MAX_BYTES = 4 * 1024 * 1024;
+/** Resume sending only after in-flight bytes drain to a quarter of the budget.
+ *  Resuming at the high-water mark would flap: one callback frees a few KB and
+ *  the next full frame immediately re-triggers the overflow. */
+const QUEUE_LOW_WATER_BYTES = QUEUE_MAX_BYTES / 4;
+/** How long a socket may stay paused before its budget is forgiven once. Bounds
+ *  the damage of a wedged peer without letting every dropped frame buy a fresh
+ *  budget the way the old queue-replacement did. */
+const QUEUE_PAUSE_GRACE_MS = 2_000;
 const SUBSESSION_OWNERSHIP_RETRY_DELAYS_MS = [50, 150, 350] as const;
 
 /**
@@ -570,24 +579,114 @@ function safeSend(ws: WebSocket, data: string | Buffer, onComplete?: (err?: Erro
  */
 class TerminalForwardQueue {
   private bufferedBytes = 0;
+  /** True once the high-water mark was hit; stays true until in-flight bytes
+   *  drain back below the low-water mark. While set, terminal frames are
+   *  dropped WITHOUT re-notifying the client (see `overflowNotified`). */
+  private paused = false;
+  private pausedSince = 0;
+  /** Bumped when the grace valve forgives the outstanding budget. Frames sent
+   *  before the bump belong to a dead generation: their `ws.send` callbacks
+   *  must NOT decrement the new accounting, or a late callback would push
+   *  `bufferedBytes` negative and hand the socket credit it never earned —
+   *  re-opening the unbounded-in-flight hole this class exists to close. */
+  private epoch = 0;
+  /** One stream_reset per overflow episode, not one per dropped frame. */
+  private overflowNotified = false;
 
-  send(ws: WebSocket, data: string | Buffer, onOverflow: () => void): void {
+  /** In-flight bytes this queue has handed to `ws.send` and not yet seen
+   *  acknowledged. Exposed so overflow handling can decide when the socket is
+   *  writable again instead of resetting the counter. */
+  get inFlightBytes(): number {
+    return this.bufferedBytes;
+  }
+
+  /** True while the socket is above the high-water mark. */
+  get isPaused(): boolean {
+    return this.paused;
+  }
+
+  /**
+   * @returns `'sent'` | `'dropped'` — `'dropped'` means the frame did not go
+   *          out. The caller decides whether that is the FIRST drop of this
+   *          episode (worth a stream_reset) by checking `takeOverflowNotice()`.
+   */
+  send(ws: WebSocket, data: string | Buffer, onOverflow: () => void): 'sent' | 'dropped' {
     const size = typeof data === 'string' ? Buffer.byteLength(data, 'utf8') : data.byteLength;
-    this.bufferedBytes += size;
 
-    if (this.bufferedBytes > QUEUE_MAX_BYTES) {
-      this.bufferedBytes -= size;
-      onOverflow();
-      return;
+    const now = Date.now();
+    if (this.paused || this.bufferedBytes + size > QUEUE_MAX_BYTES) {
+      // A single frame larger than the whole budget with NOTHING in flight is
+      // not congestion — there is no backlog to drain. Drop just that frame and
+      // let the next one through; pausing here would stall a healthy socket.
+      //
+      // Such a drop must NOT consume the overflow episode's one-shot notice.
+      // It is not an episode: nothing is paused, so nothing will ever clear
+      // `overflowNotified` again, and the next REAL congestion episode would be
+      // silently swallowed — the browser would keep a gap it is never told
+      // about and would sit there until the user reloads.
+      if (!this.paused && this.bufferedBytes === 0) {
+        const hadNotice = this.overflowNotified;
+        onOverflow();
+        this.overflowNotified = hadNotice;
+        return 'dropped';
+      }
+      if (!this.paused) {
+        this.paused = true;
+        this.pausedSince = now;
+      }
+      // Escape valve. If the socket never acknowledges (a wedged connection, or
+      // a peer whose main thread has stopped reading), staying paused forever
+      // would freeze the terminal — the exact "终端卡住不更新, 刷新才恢复"
+      // regression the stream_reset design was written to avoid. So the budget
+      // IS eventually forgiven, but at most once per grace window instead of on
+      // every dropped frame: the old code replaced the whole queue on each
+      // overflow, which handed out a brand-new 4MB while the previous 4MB was
+      // still unacknowledged, so one socket's real backlog had no bound at all.
+      if (now - this.pausedSince >= QUEUE_PAUSE_GRACE_MS) {
+        // Forgive the outstanding budget, and retire the generation with it so
+        // the still-unacknowledged frames cannot decrement the fresh counter.
+        this.epoch += 1;
+        this.bufferedBytes = 0;
+        this.paused = false;
+        this.overflowNotified = false;
+        this.pausedSince = 0;
+      } else {
+        onOverflow();
+        return 'dropped';
+      }
     }
 
+    this.bufferedBytes += size;
+    const sentEpoch = this.epoch;
     safeSend(ws, data, (err) => {
-      this.bufferedBytes -= size;
+      // A callback from a forgiven generation refers to bytes that were already
+      // written off. Decrementing here would drive the counter negative and let
+      // the next burst exceed the high-water mark by exactly that much.
+      const sameEpoch = sentEpoch === this.epoch;
+      if (sameEpoch) this.bufferedBytes -= size;
       if (err) {
         // Socket closed or errored — treat as overflow to trigger cleanup
+        this.paused = true;
         onOverflow();
+        return;
+      }
+      // Drained far enough to resume. The low-water mark (a quarter of the
+      // budget) gives the socket real headroom instead of flapping at the
+      // threshold.
+      if (sameEpoch && this.paused && this.bufferedBytes <= QUEUE_LOW_WATER_BYTES) {
+        this.paused = false;
+        this.overflowNotified = false;
       }
     });
+    return 'sent';
+  }
+
+  /** True exactly once per overflow episode — use it to send a single
+   *  `terminal.stream_reset` instead of one per dropped frame. */
+  takeOverflowNotice(): boolean {
+    if (this.overflowNotified) return false;
+    this.overflowNotified = true;
+    return true;
   }
 }
 
@@ -1635,7 +1734,16 @@ export class WsBridge {
       && (this.daemonNodeRole === NODE_ROLE.CONTROLLED
         || this.hasDaemonCapability(REMOTE_DESKTOP_CAPABILITY)),
     ),
-    daemonSupportsRemoteDesktop: () => this.hasDaemonCapability(REMOTE_DESKTOP_CAPABILITY),
+    daemonSupportsRemoteDesktop: () => resolveRemoteDesktopSessionProfile(
+      this.daemonNodeRole === NODE_ROLE.CONTROLLED
+        ? [...this.controlledNodeCapabilities]
+        : this.daemonP2pWorkflowCapabilities?.capabilities,
+    ) !== null,
+    daemonRemoteDesktopCapabilities: () => (
+      this.daemonNodeRole === NODE_ROLE.CONTROLLED
+        ? [...this.controlledNodeCapabilities]
+        : [...(this.daemonP2pWorkflowCapabilities?.capabilities ?? [])]
+    ),
     featureEnabled: () => isRemoteDesktopFeatureEnabled(
       process.env.IMCODES_REMOTE_DESKTOP_ENABLED,
       process.env.NODE_ENV,
@@ -7547,6 +7655,13 @@ export class WsBridge {
   }
 
   private handleQueueOverflow(sessionName: string, ws: WebSocket): void {
+    // One reset per overflow EPISODE, not per dropped frame. Every reset makes
+    // the client ask for a fresh full-frame snapshot, which is exactly the work
+    // that overflowed the socket in the first place — notifying per frame turns
+    // congestion into a feedback loop.
+    const queue = this.terminalQueues.get(sessionName)?.get(ws);
+    if (queue && !queue.takeOverflowNotice()) return;
+
     const resetMsg = JSON.stringify({
       type: 'terminal.stream_reset',
       session: sessionName,
@@ -7583,10 +7698,15 @@ export class WsBridge {
     // full re-subscribe roundtrip. The fresh queue gives us a clean budget
     // for subsequent sends; orphaned in-flight callbacks from the old
     // queue still decrement only their own (now-unreachable) counter.
-    const sessionQueues = this.terminalQueues.get(sessionName);
-    if (sessionQueues?.has(ws)) {
-      sessionQueues.set(ws, new TerminalForwardQueue());
-    }
+    // Deliberately NOT `sessionQueues.set(ws, new TerminalForwardQueue())`.
+    //
+    // Replacing the queue handed out a fresh 4MB budget while the previous
+    // ~4MB was still sitting unacknowledged in the socket/kernel: the orphaned
+    // callbacks only decremented a counter nobody could read any more. Repeated
+    // overflows could therefore keep buying new budget, so the real in-flight
+    // backlog for one socket was unbounded — the opposite of backpressure. The
+    // queue now stays put, keeps its counter, and resumes on its own once
+    // in-flight bytes drain below the low-water mark.
   }
 
   private getOrCreateQueue(sessionName: string, ws: WebSocket): TerminalForwardQueue {
