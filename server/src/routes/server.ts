@@ -1,4 +1,5 @@
 import { Hono } from 'hono';
+import { authenticateDaemonServer, daemonAuthFailure } from '../security/daemon-auth.js';
 import type { Env } from '../env.js';
 import {
   getFullServersByUserId,
@@ -423,17 +424,11 @@ serverRoutes.post('/:id/upgrade', requireAuth(), async (c) => {
 
 // POST /api/server/:id/heartbeat — authenticated via Bearer server token
 serverRoutes.post('/:id/heartbeat', async (c) => {
-  const auth = c.req.header('Authorization');
-  if (!auth?.startsWith('Bearer ')) return c.json({ error: 'unauthorized' }, 401);
-  const token = auth.slice(7);
-  const tokenHash = sha256Hex(token);
-
   const serverId = c.req.param('id');
-  const server = await c.env.DB.queryOne<{ id: string; user_id: string }>(
-    'SELECT id FROM servers WHERE id = $1 AND token_hash = $2',
-    [serverId, tokenHash],
-  );
-  if (!server) return c.json({ error: 'unauthorized' }, 401);
+  // The one daemon-token route a controlled node may reach. Everything it
+  // touches belongs to the calling machine; nothing here is account-scoped.
+  const authed = await authenticateDaemonServer(c, serverId, { allowControlledNode: true });
+  if (!authed.ok) return daemonAuthFailure(c, authed);
 
   const body = await c.req.json().catch(() => null) as Record<string, unknown> | null;
   const daemonVersion = typeof body?.daemonVersion === 'string' ? body.daemonVersion : undefined;
@@ -498,17 +493,12 @@ serverRoutes.put('/:id/shared-context/runtime-config', requireAuth(), async (c) 
 });
 
 serverRoutes.get('/:id/shared-context/runtime-config/daemon', async (c) => {
-  const auth = c.req.header('Authorization');
-  if (!auth?.startsWith('Bearer ')) return c.json({ error: 'unauthorized' }, 401);
-  const tokenHash = sha256Hex(auth.slice(7));
   const serverId = c.req.param('id');
-  const server = await c.env.DB.queryOne<{ id: string; user_id: string }>(
-    'SELECT id, user_id FROM servers WHERE id = $1 AND token_hash = $2',
-    [serverId, tokenHash],
-  );
-  if (!server) return c.json({ error: 'unauthorized' }, 401);
+  const authed = await authenticateDaemonServer(c, serverId);
+  if (!authed.ok) return daemonAuthFailure(c, authed);
+  const serverRow = authed.auth;
   const persisted = await getServerSharedContextRuntimeConfig(c.env.DB, serverId);
-  const personalSyncEnabled = await getPersonalMemorySyncEnabled(c.env.DB, server.user_id);
+  const personalSyncEnabled = await getPersonalMemorySyncEnabled(c.env.DB, serverRow.userId);
   return c.json({
     config: {
       ...(persisted ?? defaultSharedContextRuntimeConfig()),
@@ -528,16 +518,11 @@ serverRoutes.get('/:id/shared-context/runtime-config/daemon', async (c) => {
  * periodically while running.
  */
 serverRoutes.get('/:id/supervision/user-defaults/daemon', async (c) => {
-  const auth = c.req.header('Authorization');
-  if (!auth?.startsWith('Bearer ')) return c.json({ error: 'unauthorized' }, 401);
-  const tokenHash = sha256Hex(auth.slice(7));
   const serverId = c.req.param('id');
-  const server = await c.env.DB.queryOne<{ id: string; user_id: string }>(
-    'SELECT id, user_id FROM servers WHERE id = $1 AND token_hash = $2',
-    [serverId, tokenHash],
-  );
-  if (!server) return c.json({ error: 'unauthorized' }, 401);
-  const raw = await getUserPref(c.env.DB, server.user_id, SUPERVISION_USER_DEFAULT_PREF_KEY);
+  const authed = await authenticateDaemonServer(c, serverId);
+  if (!authed.ok) return daemonAuthFailure(c, authed);
+  const serverRow = authed.auth;
+  const raw = await getUserPref(c.env.DB, serverRow.userId, SUPERVISION_USER_DEFAULT_PREF_KEY);
   let parsed: Record<string, unknown> | null = null;
   if (raw) {
     try {
@@ -557,17 +542,9 @@ serverRoutes.get('/:id/supervision/user-defaults/daemon', async (c) => {
  * The daemon calls this after processing a /bind command from a user in chat.
  */
 serverRoutes.post('/:id/bindings', async (c) => {
-  const auth = c.req.header('Authorization');
-  if (!auth?.startsWith('Bearer ')) return c.json({ error: 'unauthorized' }, 401);
-  const token = auth.slice(7);
-
-  const tokenHash = sha256Hex(token);
-  const serverRow = await c.env.DB.queryOne<{ id: string; user_id: string }>(
-    'SELECT id, user_id FROM servers WHERE token_hash = $1 AND id = $2',
-    [tokenHash, c.req.param('id')],
-  );
-
-  if (!serverRow) return c.json({ error: 'unauthorized' }, 401);
+  const authed = await authenticateDaemonServer(c, c.req.param('id'));
+  if (!authed.ok) return daemonAuthFailure(c, authed);
+  const serverRow = authed.auth;
 
   const body = await c.req.json().catch(() => null);
   const parsed = z.object({
@@ -582,7 +559,7 @@ serverRoutes.post('/:id/bindings', async (c) => {
 
   const { platform, channelId, botId, bindingType, target } = parsed.data;
   const id = randomHex(16);
-  await upsertChannelBinding(c.env.DB, id, serverRow.id, platform, channelId, bindingType, target, botId);
+  await upsertChannelBinding(c.env.DB, id, serverRow.serverId, platform, channelId, bindingType, target, botId);
 
   return c.json({ ok: true });
 });
@@ -592,17 +569,9 @@ serverRoutes.post('/:id/bindings', async (c) => {
  * Body: { platform, channelId, botId }
  */
 serverRoutes.delete('/:id/bindings', async (c) => {
-  const auth = c.req.header('Authorization');
-  if (!auth?.startsWith('Bearer ')) return c.json({ error: 'unauthorized' }, 401);
-  const token = auth.slice(7);
-
-  const tokenHash = sha256Hex(token);
-  const serverRow = await c.env.DB.queryOne<{ id: string }>(
-    'SELECT id FROM servers WHERE token_hash = $1 AND id = $2',
-    [tokenHash, c.req.param('id')],
-  );
-
-  if (!serverRow) return c.json({ error: 'unauthorized' }, 401);
+  const authed = await authenticateDaemonServer(c, c.req.param('id'));
+  if (!authed.ok) return daemonAuthFailure(c, authed);
+  const serverRow = authed.auth;
 
   const body = await c.req.json().catch(() => null);
   const parsed = z.object({ platform: z.string(), channelId: z.string(), botId: z.string() }).safeParse(body);
@@ -612,23 +581,16 @@ serverRoutes.delete('/:id/bindings', async (c) => {
   // Scope to server_id to prevent cross-server deletion races
   await c.env.DB.execute(
     'DELETE FROM channel_bindings WHERE platform = $1 AND channel_id = $2 AND bot_id = $3 AND server_id = $4',
-    [platform, channelId, botId, serverRow.id],
+    [platform, channelId, botId, serverRow.serverId],
   );
 
   return c.json({ ok: true });
 });
 
 serverRoutes.post('/:id/shared-context/processed', async (c) => {
-  const auth = c.req.header('Authorization');
-  if (!auth?.startsWith('Bearer ')) return c.json({ error: 'unauthorized' }, 401);
-  const token = auth.slice(7);
-  const tokenHash = sha256Hex(token);
-
-  const serverRow = await c.env.DB.queryOne<{ id: string; team_id: string | null; user_id: string }>(
-    'SELECT id, team_id, user_id FROM servers WHERE token_hash = $1 AND id = $2',
-    [tokenHash, c.req.param('id')],
-  );
-  if (!serverRow) return c.json({ error: 'unauthorized' }, 401);
+  const authed = await authenticateDaemonServer(c, c.req.param('id'));
+  if (!authed.ok) return daemonAuthFailure(c, authed);
+  const serverRow = authed.auth;
 
   const body = await c.req.json().catch(() => null) as ProcessedContextReplicationBody | null;
   const parsed = processedReplicationSchema.safeParse(body);
@@ -640,15 +602,15 @@ serverRoutes.post('/:id/shared-context/processed', async (c) => {
   for (const projection of parsed.data.projections) {
     if (isMemoryNoiseSummary(projection.summary)) continue;
     const isPersonal = projection.namespace.scope === 'personal';
-    if (isPersonal && projection.namespace.userId && projection.namespace.userId !== serverRow.user_id) {
+    if (isPersonal && projection.namespace.userId && projection.namespace.userId !== serverRow.userId) {
       return c.json({ error: 'namespace_user_mismatch', projectionId: projection.id }, 403);
     }
-    if (!isPersonal && projection.namespace.enterpriseId && projection.namespace.enterpriseId !== serverRow.team_id) {
+    if (!isPersonal && projection.namespace.enterpriseId && projection.namespace.enterpriseId !== serverRow.teamId) {
       return c.json({ error: 'namespace_enterprise_mismatch', projectionId: projection.id }, 403);
     }
-    const safeEnterpriseId = isPersonal ? null : (serverRow.team_id ?? projection.namespace.enterpriseId ?? null);
+    const safeEnterpriseId = isPersonal ? null : (serverRow.teamId ?? projection.namespace.enterpriseId ?? null);
     const safeWorkspaceId = isPersonal ? null : (projection.namespace.workspaceId ?? null);
-    const safeUserId = isPersonal ? serverRow.user_id : (projection.namespace.userId ?? null);
+    const safeUserId = isPersonal ? serverRow.userId : (projection.namespace.userId ?? null);
     const contentHash = computeProjectionContentHash({
       summary: projection.summary,
       content: projection.content,
@@ -676,7 +638,7 @@ serverRoutes.post('/:id/shared-context/processed', async (c) => {
         replicated_at = excluded.replicated_at`,
       [
         projection.id,
-        serverRow.id,
+        serverRow.serverId,
         projection.namespace.scope,
         safeEnterpriseId,
         safeWorkspaceId,
@@ -716,7 +678,7 @@ serverRoutes.post('/:id/shared-context/processed', async (c) => {
         [
           `record:${projection.id}`,
           projection.id,
-          serverRow.id,
+          serverRow.serverId,
           projection.namespace.scope,
           safeEnterpriseId,
           safeWorkspaceId,
@@ -750,17 +712,11 @@ serverRoutes.post('/:id/shared-context/processed', async (c) => {
 });
 
 serverRoutes.post('/:id/shared-context/owner-private', async (c) => {
-  const auth = c.req.header('Authorization');
-  if (!auth?.startsWith('Bearer ')) return c.json({ error: 'unauthorized' }, 401);
-  const tokenHash = sha256Hex(auth.slice(7));
-
-  const serverRow = await c.env.DB.queryOne<{ id: string; user_id: string }>(
-    'SELECT id, user_id FROM servers WHERE token_hash = $1 AND id = $2',
-    [tokenHash, c.req.param('id')],
-  );
-  if (!serverRow) return c.json({ error: 'unauthorized' }, 401);
+  const authed = await authenticateDaemonServer(c, c.req.param('id'));
+  if (!authed.ok) return daemonAuthFailure(c, authed);
+  const serverRow = authed.auth;
   const featureFlags = parseMemoryFeatureFlagValuesJson(
-    await getUserPref(c.env.DB, serverRow.user_id, MEMORY_FEATURE_CONFIG_PREF_KEY),
+    await getUserPref(c.env.DB, serverRow.userId, MEMORY_FEATURE_CONFIG_PREF_KEY),
   );
   if (!isMemoryFeatureEnabled(c.env, MEMORY_FEATURES.userPrivateSync, featureFlags)) {
     return c.json(sameShapeMemoryLookupEnvelope(), 404);
@@ -769,7 +725,7 @@ serverRoutes.post('/:id/shared-context/owner-private', async (c) => {
   const body = await c.req.json().catch(() => null);
   const parsed = ownerPrivateReplicationSchema.safeParse(body);
   if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
-  if (parsed.data.namespace.userId && parsed.data.namespace.userId !== serverRow.user_id) {
+  if (parsed.data.namespace.userId && parsed.data.namespace.userId !== serverRow.userId) {
     return c.json(sameShapeMemoryLookupEnvelope(), 404);
   }
 
@@ -777,8 +733,8 @@ serverRoutes.post('/:id/shared-context/owner-private', async (c) => {
   let acceptedCount = 0;
   for (const record of parsed.data.records) {
     const idempotencyKey = record.idempotencyKey
-      ?? sha256Hex(`owner-private:v1:${serverRow.user_id}:${record.kind}:${record.fingerprint}:${record.text}`);
-    const recordId = record.id ?? sha256Hex(`owner-private-id:v1:${serverRow.user_id}:${idempotencyKey}`);
+      ?? sha256Hex(`owner-private:v1:${serverRow.userId}:${record.kind}:${record.fingerprint}:${record.text}`);
+    const recordId = record.id ?? sha256Hex(`owner-private-id:v1:${serverRow.userId}:${idempotencyKey}`);
     const createdAt = record.createdAt ?? now;
     const updatedAt = record.updatedAt ?? createdAt;
     await c.env.DB.execute(
@@ -797,14 +753,14 @@ serverRoutes.post('/:id/shared-context/owner-private', async (c) => {
         replicated_at = excluded.replicated_at`,
       [
         recordId,
-        serverRow.user_id,
+        serverRow.userId,
         record.kind,
         record.origin,
         record.fingerprint,
         record.text,
         JSON.stringify(record.content),
         idempotencyKey,
-        serverRow.id,
+        serverRow.serverId,
         createdAt,
         updatedAt,
         now,
@@ -817,17 +773,11 @@ serverRoutes.post('/:id/shared-context/owner-private', async (c) => {
 });
 
 serverRoutes.post('/:id/shared-context/owner-private/search', async (c) => {
-  const auth = c.req.header('Authorization');
-  if (!auth?.startsWith('Bearer ')) return c.json({ error: 'unauthorized' }, 401);
-  const tokenHash = sha256Hex(auth.slice(7));
-
-  const serverRow = await c.env.DB.queryOne<{ id: string; user_id: string }>(
-    'SELECT id, user_id FROM servers WHERE token_hash = $1 AND id = $2',
-    [tokenHash, c.req.param('id')],
-  );
-  if (!serverRow) return c.json({ error: 'unauthorized' }, 401);
+  const authed = await authenticateDaemonServer(c, c.req.param('id'));
+  if (!authed.ok) return daemonAuthFailure(c, authed);
+  const serverRow = authed.auth;
   const featureFlags = parseMemoryFeatureFlagValuesJson(
-    await getUserPref(c.env.DB, serverRow.user_id, MEMORY_FEATURE_CONFIG_PREF_KEY),
+    await getUserPref(c.env.DB, serverRow.userId, MEMORY_FEATURE_CONFIG_PREF_KEY),
   );
   if (!isMemoryFeatureEnabled(c.env, MEMORY_FEATURES.userPrivateSync, featureFlags)) {
     return c.json(sameShapeSearchEnvelope());
@@ -853,7 +803,7 @@ serverRoutes.post('/:id/shared-context/owner-private/search', async (c) => {
        ${query ? 'AND text ILIKE $2' : ''}
      ORDER BY updated_at DESC
      LIMIT $${query ? 3 : 2}`,
-    [serverRow.user_id, ...(query ? [`%${query}%`] : []), parsed.data.limit],
+    [serverRow.userId, ...(query ? [`%${query}%`] : []), parsed.data.limit],
   );
   return c.json({
     results: rows.map((row) => ({
@@ -980,19 +930,12 @@ serverRoutes.get('/:id/shared-context/personal-memory', requireAuth(), async (c)
 });
 
 serverRoutes.post('/:id/shared-context/authored-bindings', async (c) => {
-  const auth = c.req.header('Authorization');
-  if (!auth?.startsWith('Bearer ')) return c.json({ error: 'unauthorized' }, 401);
-  const token = auth.slice(7);
-  const tokenHash = sha256Hex(token);
+  const authed = await authenticateDaemonServer(c, c.req.param('id'));
+  if (!authed.ok) return daemonAuthFailure(c, authed);
+  const serverRow = authed.auth;
 
-  const serverRow = await c.env.DB.queryOne<{ id: string; team_id: string | null; user_id: string }>(
-    'SELECT id, team_id, user_id FROM servers WHERE token_hash = $1 AND id = $2',
-    [tokenHash, c.req.param('id')],
-  );
-  if (!serverRow) return c.json({ error: 'unauthorized' }, 401);
-
-  // Cross-tenant security: use serverRow.team_id as authoritative enterprise binding
-  const enterpriseId = serverRow.team_id;
+  // Cross-tenant security: use serverRow.teamId as authoritative enterprise binding
+  const enterpriseId = serverRow.teamId;
   if (!enterpriseId) return c.json({ bindings: [] });
 
   const body = await c.req.json().catch(() => null);
@@ -1044,7 +987,7 @@ serverRoutes.post('/:id/shared-context/authored-bindings', async (c) => {
   );
 
   const featureFlags = parseMemoryFeatureFlagValuesJson(
-    await getUserPref(c.env.DB, serverRow.user_id, MEMORY_FEATURE_CONFIG_PREF_KEY),
+    await getUserPref(c.env.DB, serverRow.userId, MEMORY_FEATURE_CONFIG_PREF_KEY),
   );
   const orgAuthoredEnabled = isMemoryFeatureEnabled(c.env, MEMORY_FEATURES.orgSharedAuthoredStandards, featureFlags);
   const bindings: RuntimeAuthoredContextBinding[] = rows
@@ -1072,26 +1015,19 @@ serverRoutes.post('/:id/shared-context/authored-bindings', async (c) => {
 });
 
 serverRoutes.post('/:id/shared-context/resolve-namespace', async (c) => {
-  const auth = c.req.header('Authorization');
-  if (!auth?.startsWith('Bearer ')) return c.json({ error: 'unauthorized' }, 401);
-  const token = auth.slice(7);
-  const tokenHash = sha256Hex(token);
-
-  const serverRow = await c.env.DB.queryOne<{ id: string; team_id: string | null; user_id: string }>(
-    'SELECT id, team_id, user_id FROM servers WHERE token_hash = $1 AND id = $2',
-    [tokenHash, c.req.param('id')],
-  );
-  if (!serverRow) return c.json({ error: 'unauthorized' }, 401);
+  const authed = await authenticateDaemonServer(c, c.req.param('id'));
+  if (!authed.ok) return daemonAuthFailure(c, authed);
+  const serverRow = authed.auth;
 
   const body = await c.req.json().catch(() => null);
   const parsed = namespaceResolutionSchema.safeParse(body);
   if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
 
   const canonicalRepoId = parsed.data.canonicalRepoId.trim();
-  const enterpriseId = serverRow.team_id;
+  const enterpriseId = serverRow.teamId;
   const personalRemoteProjection = await c.env.DB.queryOne<{ id: string; updated_at: number }>(
     "SELECT id, updated_at FROM shared_context_projections WHERE scope = 'personal' AND user_id = $1 AND project_id = $2 ORDER BY updated_at DESC LIMIT 1",
-    [serverRow.user_id, canonicalRepoId],
+    [serverRow.userId, canonicalRepoId],
   );
   const personalRemoteFreshness = classifyTimestampFreshness(
     personalRemoteProjection?.updated_at,

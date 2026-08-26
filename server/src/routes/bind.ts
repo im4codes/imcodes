@@ -5,6 +5,7 @@ import { createServer, getServerById, updateServerToken } from '../db/queries.js
 import { logAudit } from '../security/audit.js';
 import { requireAuth } from '../security/authorization.js';
 import { WsBridge } from '../ws/bridge.js';
+import { NODE_ROLE, NODE_ROLE_REFUSAL } from '../../../shared/remote-exec.js';
 import { z } from 'zod';
 
 export const bindRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
@@ -116,10 +117,24 @@ bindRoutes.post('/verify', async (c) => {
 
   const { serverId, token } = parsed.data;
   const server = await getServerById(c.env.DB, serverId);
-  if (!server) return c.json({ error: 'not_found' }, 404);
 
-  const tokenHash = sha256Hex(token);
-  if (tokenHash !== server.token_hash) return c.json({ error: 'invalid_token' }, 401);
+  // An unknown server, a wrong token and a revoked credential are one answer.
+  // Distinguishing them told an unauthenticated caller whether a serverId
+  // exists and whether its token was ever real; `not_found` did exactly that.
+  if (!server
+    || sha256Hex(token) !== server.token_hash
+    || server.revoked_at != null) {
+    return c.json({ error: 'unauthorized' }, 401);
+  }
 
-  return c.json({ ok: true, serverId, userId: server.user_id });
+  // Role is checked only after the token verifies, so this cannot be used to
+  // probe which serverIds are controlled nodes.
+  if (server.node_role === NODE_ROLE.CONTROLLED) {
+    return c.json({ error: 'forbidden', reason: NODE_ROLE_REFUSAL.CONTROLLED_NODE }, 403);
+  }
+
+  // The sole caller (src/bind/bind-flow.ts) checks `response.ok` and never
+  // reads the body. Returning the owner's user id handed account identity to
+  // anyone holding a machine token.
+  return c.json({ ok: true });
 });

@@ -44,6 +44,13 @@ export interface DbServer {
   created_at: number;
   /** Missing/null is a legacy full daemon; only the explicit controlled role is passive. */
   node_role?: NodeRole | null;
+  /**
+   * Set by the owner kill-switch. `SELECT *` has always returned this column,
+   * but it was absent from the type, so a caller could not check what it could
+   * not see — which is how daemon-token routes silently kept honouring revoked
+   * credentials.
+   */
+  revoked_at?: number | null;
 }
 
 export interface DbChannelBinding {

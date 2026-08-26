@@ -31,6 +31,19 @@ export function isNodeRole(value: unknown): value is NodeRole {
   return value === NODE_ROLE.FULL || value === NODE_ROLE.CONTROLLED;
 }
 
+/**
+ * Refusal reason when a controlled-node credential reaches a surface reserved
+ * for full daemons.
+ *
+ * Named once because the daemon, the browser and every server guard compare it:
+ * a controlled node that starts seeing this is misconfigured, not broken, and
+ * the client needs to tell those two apart.
+ */
+export const NODE_ROLE_REFUSAL = {
+  CONTROLLED_NODE: 'controlled_node',
+} as const;
+export type NodeRoleRefusal = (typeof NODE_ROLE_REFUSAL)[keyof typeof NODE_ROLE_REFUSAL];
+
 /** Shell used to run a one-shot remote command. Default per-OS resolved by node. */
 export const REMOTE_EXEC_SHELLS = ['powershell', 'cmd', 'bash', 'sh'] as const;
 export type RemoteExecShell = (typeof REMOTE_EXEC_SHELLS)[number];

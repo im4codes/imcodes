@@ -67,21 +67,12 @@ function makeMockDb() {
   const db: Database = {
     queryOne: async <T = unknown>(sql: string, params: unknown[] = []) => {
       const normalized = sql.toLowerCase().replace(/\s+/g, ' ').trim();
-      if (normalized.includes('select id, team_id, user_id from servers where token_hash = $1 and id = $2')) {
-        if (params[0] === validTokenHash && params[1] === 'srv-1') {
-          return { id: 'srv-1', team_id: 'ent-1', user_id: 'user-1' } as T;
-        }
-        return null;
-      }
-      if (normalized.includes('select id, team_id from servers where token_hash = $1 and id = $2')) {
-        if (params[0] === validTokenHash && params[1] === 'srv-1') {
-          return { id: 'srv-1', team_id: 'ent-1' } as T;
-        }
-        return null;
-      }
-      if (normalized.includes('select id from servers where token_hash = $1 and id = $2')) {
-        if (params[0] === validTokenHash && params[1] === 'srv-1') {
-          return { id: 'srv-1' } as T;
+      // The daemon-token guard reads role and revocation together with the row,
+      // and matches on id first. A stub that omits node_role/revoked_at would
+      // make a controlled or revoked credential look like a full daemon.
+      if (normalized.includes('from servers where id = $1 and token_hash = $2')) {
+        if (params[0] === 'srv-1' && params[1] === validTokenHash) {
+          return { id: 'srv-1', team_id: 'ent-1', user_id: 'user-1', node_role: 'full', revoked_at: null } as T;
         }
         return null;
       }
@@ -724,9 +715,9 @@ describe('shared-context processed remote route', () => {
       ...db,
       queryOne: async <T = unknown>(sql: string, params: unknown[] = []) => {
         const normalized = sql.toLowerCase().replace(/\s+/g, ' ').trim();
-        if (normalized.includes('select id, team_id, user_id from servers where token_hash = $1 and id = $2')) {
-          if (params[0] === sha256Hex('daemon-token') && params[1] === 'srv-1') {
-            return { id: 'srv-1', team_id: null, user_id: 'user-1' } as T;
+        if (normalized.includes('from servers where id = $1 and token_hash = $2')) {
+          if (params[0] === 'srv-1' && params[1] === sha256Hex('daemon-token')) {
+            return { id: 'srv-1', team_id: null, user_id: 'user-1', node_role: 'full', revoked_at: null } as T;
           }
         }
         return db.queryOne<T>(sql, params);

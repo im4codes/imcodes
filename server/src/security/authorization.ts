@@ -9,7 +9,7 @@ import { sha256Hex, verifyJwt } from './crypto.js';
 import { COOKIE_SESSION } from '../../../shared/cookie-names.js';
 import { AUTH_IDENTITY_ERRORS } from '../../../shared/auth-identity.js';
 import { EXPECTED_USER_ID_HEADER } from '../../../shared/http-header-names.js';
-import { NODE_ROLE, type NodeRole } from '../../../shared/remote-exec.js';
+import { NODE_ROLE, type NodeRole, NODE_ROLE_REFUSAL } from '../../../shared/remote-exec.js';
 import {
   canOperateControlledMachine,
   resolveControlledMachineAccess,
@@ -165,7 +165,7 @@ export function requireAuth() {
     // Global default-deny: a controlled-node credential may ONLY reach the WS
     // presence/heartbeat + MACHINE_EXEC_RESULT surface, never a normal REST API (10.2).
     if (auth.nodeRole === NODE_ROLE.CONTROLLED) {
-      return c.json({ error: 'forbidden', reason: 'controlled_node' }, 403);
+      return c.json({ error: 'forbidden', reason: NODE_ROLE_REFUSAL.CONTROLLED_NODE }, 403);
     }
 
     c.set('userId' as never, auth.userId);
@@ -191,7 +191,7 @@ export function requireRole(minRole: Role) {
     const identityMismatch = rejectChangedClientIdentity(c, auth.userId);
     if (identityMismatch) return identityMismatch;
     if (auth.nodeRole === NODE_ROLE.CONTROLLED) {
-      return c.json({ error: 'forbidden', reason: 'controlled_node' }, 403);
+      return c.json({ error: 'forbidden', reason: NODE_ROLE_REFUSAL.CONTROLLED_NODE }, 403);
     }
 
     if (!canPerform(auth.role, minPerm)) {
