@@ -838,6 +838,30 @@ afterEach(() => {
     expect(document.querySelector('.shortcuts')).toBeNull();
   });
 
+  it('hides OpenSpec for mobile Shell and gives the whole toolbar row to shortcuts', () => {
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 390 });
+    const { container } = render(
+      <SessionControls
+        ws={makeWs() as any}
+        activeSession={makeSession({
+          name: 'deck_proj_shell',
+          agentType: 'shell',
+          projectDir: '/tmp/project',
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    expect(screen.queryByText('OpenSpec')).toBeNull();
+    const row = container.querySelector('.shortcuts-row');
+    const shortcuts = row?.querySelector('.shortcuts');
+    expect(shortcuts).toBeTruthy();
+    expect(shortcuts?.querySelector('.shell-quick-trigger')).toBeTruthy();
+    expect(row?.querySelector('.shortcuts-meta-scroll')).toBeNull();
+    expect(row?.children).toHaveLength(1);
+    expect(row?.firstElementChild).toBe(shortcuts);
+  });
+
   it('reports card overlay state when compact dropdowns open', () => {
     const onOverlayOpenChange = vi.fn();
     render(

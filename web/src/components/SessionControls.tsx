@@ -4936,7 +4936,8 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     });
     if (isMobileLayout) showDeliveryModeNotice(append);
   };
-  const showCompactMetaControls = !!(openSpecChangesPath || isClaudeCode || isCodex || isQwen || supportsThinking || !isShellLike);
+  const showOpenSpecControl = !!openSpecChangesPath && !isShellLike;
+  const showCompactMetaControls = !!(showOpenSpecControl || isClaudeCode || isCodex || isQwen || supportsThinking || !isShellLike);
   const composerSubSession = subSessionId
     ? subSessions?.find((session) => session.sessionName === activeSession?.name)
     : undefined;
@@ -5195,6 +5196,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           )}
         </div>}
 
+        {!isShellLike && (
         <div class={`shortcuts-meta-scroll${autoOpen || modelOpen || thinkingOpen ? ' has-open-menu' : ''}`}>
         {/* Quick peer delegation reuses the ordinary @agent orchestration path.
             It stays separate from automatic supervision state and remains
@@ -5314,7 +5316,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         )}
 
         {/* Model selector — outside overflow-x scroll area so dropdown isn't clipped */}
-        {openSpecChangesPath && (
+        {showOpenSpecControl && (
           <div class="shortcuts-model" ref={openSpecRef}>
             <button
               class="shortcut-btn"
@@ -5901,8 +5903,9 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
               )}
             </>
           )}
-        </div>}
         </div>
+        )}
+        </div>}
       </div>}
 
       {pendingTransportApproval && effectiveRuntimeType === 'transport' && (

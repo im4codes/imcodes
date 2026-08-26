@@ -377,6 +377,15 @@ describe('styles.css regression contracts', () => {
     expect(mobileP2pRule![0]).toMatch(/overflow-y:\s*auto/);
   });
 
+  it('lets the terminal shortcut strip own remaining width and scroll horizontally', () => {
+    const shortcutStripRule = css.match(/\.shortcuts\s*\{[^}]*\}/);
+    expect(shortcutStripRule).not.toBeNull();
+    expect(shortcutStripRule![0]).toMatch(/flex:\s*1/);
+    expect(shortcutStripRule![0]).toMatch(/min-width:\s*0/);
+    expect(shortcutStripRule![0]).toMatch(/overflow-x:\s*auto/);
+    expect(css).toMatch(/\.shortcuts::-webkit-scrollbar\s*\{\s*display:\s*none/);
+  });
+
   it('context meters keep the segmented static tech styling', () => {
     const meterRule = css.match(/\.session-ctx-bar,\s*[\s\S]*?\.subsession-card-ctx\s*\{[^}]*\}/);
     expect(meterRule).not.toBeNull();
