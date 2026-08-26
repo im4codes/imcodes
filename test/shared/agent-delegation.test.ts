@@ -291,6 +291,7 @@ describe('agent delegation shared contract', () => {
     expect(prompt).toContain('REWORK is not a stopping response');
     expect(prompt).toContain('do not merely output REWORK and wait');
     expect(prompt).toContain('Apply the findings, run the relevant validation');
+    expect(prompt).toContain('prepare the next audit brief yourself');
     expect(prompt).toContain('send one fresh reply-enabled audit to the same Target ID');
     expect(prompt).toContain('Repeat repair -> re-audit autonomously until PASS');
     expect(prompt).toContain('Only when an exact blocker or safety limit prevents another cycle');

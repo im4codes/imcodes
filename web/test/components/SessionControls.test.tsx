@@ -5853,6 +5853,7 @@ afterEach(() => {
     expect(sent.text).toContain('<!-- IMCODES_AUTOMATIC_AUDIT: REWORK -->');
     expect(sent.text).toContain('REWORK is not a stopping response');
     expect(sent.text).toContain('do not merely output REWORK and wait');
+    expect(sent.text).toContain('prepare the next audit brief yourself');
     expect(sent.text).toContain('send one fresh reply-enabled audit to the same Target ID');
     expect(sent.text).toContain('Repeat repair -> re-audit autonomously until PASS');
     expect(ws.send.mock.calls.some(([message]) => message?.type === 'peer_audit.quick_start')).toBe(false);

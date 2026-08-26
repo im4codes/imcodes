@@ -41,7 +41,8 @@ describe('supervision prompts', () => {
     expect(SUPERVISED_AUDIT_EXECUTION_PREAMBLE).toContain('DO NOT run git add, commit, push, merge, release, publish, deploy');
     expect(SUPERVISED_AUDIT_EXECUTION_PREAMBLE).toContain('even when the user requested final delivery');
     expect(SUPERVISED_AUDIT_EXECUTION_PREAMBLE).toContain('in this turn');
-    expect(SUPERVISED_AUDIT_EXECUTION_PREAMBLE).toContain('Do not choose or contact an auditor yourself');
+    expect(SUPERVISED_AUDIT_EXECUTION_PREAMBLE).toContain('prepare the re-audit brief yourself');
+    expect(SUPERVISED_AUDIT_EXECUTION_PREAMBLE).toContain('send the fresh reply-enabled audit exactly as instructed in the REWORK brief');
     expect(SUPERVISED_AUDIT_EXECUTION_PREAMBLE).not.toContain('enforced in code');
   });
 
@@ -254,12 +255,20 @@ describe('supervision prompts', () => {
       'Implement and deliver the fix',
       'The first implementation is ready.',
       'The auditor found a missing regression test.',
+      { attempt: 1, limit: 3 },
+      'deck_sub_reviewer',
     );
 
     expect(prompt).toContain('Fix these findings, then run the relevant validation:');
-    expect(prompt).toContain('the daemon starts one fresh audit for the repaired revision');
+    expect(prompt).toContain('Fresh re-audit target ID: deck_sub_reviewer');
+    expect(prompt).toContain('prepare one concise, self-contained re-audit brief yourself');
+    expect(prompt).toContain('send it immediately with send_message(target="deck_sub_reviewer", reply=true');
+    expect(prompt).toContain('audit={"kind":"supervision_audit","attemptId":"<that-fresh-attempt-id>"}');
+    expect(prompt).toContain('Do not call send_list_targets');
+    expect(prompt).toContain('do not wait for the daemon or user to start this next audit');
+    expect(prompt).toContain('self-prepared re-audit cycle until PASS');
     expect(prompt).toContain('Fix and validate autonomously');
-    // The worker now owns re-audit; the old prohibition would contradict that.
+    expect(prompt).not.toContain('the daemon starts one fresh audit for the repaired revision');
     expect(prompt).not.toContain('Do not delegate or poll an auditor yourself');
     expect(prompt).toContain('Do not stage, commit, push, merge, release, publish, or deploy until a fresh matching audit returns PASS.');
     expect(prompt).not.toContain('Current assistant result:');

@@ -430,7 +430,7 @@ export function buildAgentDelegationOrchestrationPrompt(input: AgentDelegationOr
       'Quick Audit cycle after each delegated reply:',
       `- Outcome markers (emit neither before the reply): ${PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS.PASS} or ${PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS.REWORK}.`,
       `- PASS: report the evidence, end with ${PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS.PASS}, then continue any remaining delivery/finalization requested by the task.`,
-      '- REWORK is not a stopping response: do not merely output REWORK and wait. Apply the findings, run the relevant validation, then send one fresh reply-enabled audit to the same Target ID.',
+      '- REWORK is not a stopping response: do not merely output REWORK and wait. Apply the findings, run the relevant validation, prepare the next audit brief yourself, then send one fresh reply-enabled audit to the same Target ID.',
       '- Repeat repair -> re-audit autonomously until PASS. Only when an exact blocker or safety limit prevents another cycle, report it and end with the REWORK marker.',
       '- Never finalize the repository or delivery from a REWORK verdict.',
     ] : []),

@@ -777,7 +777,7 @@ function buildReworkBrief(run: ActiveTaskRunState, verdictText: string): string 
   return buildReworkBriefPrompt(run.sessionName, run.userText, run.lastAssistantText, verdictText, {
     attempt: run.reworkDispatches,
     limit: run.snapshot.maxAuditLoops,
-  });
+  }, run.snapshot.auditTargetSessionName);
 }
 
 function isFinalAssistantPayload(payload: Record<string, unknown>): boolean {
@@ -2448,7 +2448,7 @@ class SupervisionAutomation {
       // delegation renderer bounds task text, and a large OpenSpec/path list
       // must never truncate away the PASS/REWORK markers that close the audit.
       `After the reply, report the findings and end with exactly one matching marker: ${PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS.PASS} or ${PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS.REWORK}. Emit neither marker before the reply.`,
-      'Automatic audit cycle: PASS releases any remaining delivery/finalization. REWORK makes the daemon feed the findings back into this same session as one repair turn; fix and validate autonomously without waiting for another user prompt, then the daemon starts a fresh audit attempt. Repeat until PASS or an exact blocker/safety limit. Do not self-start a duplicate audit; supervision should only need to kick again if progress truly stalls.',
+      'Automatic audit cycle: PASS releases any remaining delivery/finalization. REWORK makes the daemon feed the findings back into this same session as one repair turn with the exact re-audit target. After fixing and validating, this same session must prepare and send the fresh reply-enabled re-audit itself; do not wait for another user/supervisor prompt. Repeat until PASS or an exact blocker/safety limit. Do not self-start a duplicate audit before the REWORK repair is complete; supervision should only need to kick again if progress truly stalls.',
       baseline.changeDir ? `Relevant OpenSpec change: ${baseline.changeDir}` : '',
       baseline.fileContents.length > 0
         ? `Observed changed paths: ${baseline.fileContents.map((entry) => entry.path).join(', ')}`

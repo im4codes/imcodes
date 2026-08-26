@@ -1125,8 +1125,8 @@ describe('SupervisionAutomation', () => {
     expect(orchestrationPrompt).toContain('Do not choose another session or send a second audit');
     expect(orchestrationPrompt).toContain('You—not the daemon—must prepare the brief');
     expect(orchestrationPrompt).toContain('do not modify, commit, push, or deploy');
-    expect(orchestrationPrompt).toContain('fix and validate autonomously without waiting for another user prompt');
-    expect(orchestrationPrompt).toContain('then the daemon starts a fresh audit attempt');
+    expect(orchestrationPrompt).toContain('this same session must prepare and send the fresh reply-enabled re-audit itself');
+    expect(orchestrationPrompt).not.toContain('then the daemon starts a fresh audit attempt');
     expect(orchestrationPrompt).toContain('Repeat until PASS or an exact blocker/safety limit');
     expect(orchestrationPrompt).toContain('only need to kick again if progress truly stalls');
     expect(orchestrationPrompt).not.toContain('A reply-enabled send gives the delegate');
@@ -2966,7 +2966,16 @@ describe('SupervisionAutomation', () => {
     await waitForRunPhase('execution');
     expect(mockTransportRuntime.send).toHaveBeenCalledTimes(3);
     expect(String(mockTransportRuntime.send.mock.calls[2]?.[0])).toContain(
-      'the daemon starts one fresh audit for the repaired revision',
+      'Fresh re-audit target ID: deck_sub_reviewer',
+    );
+    expect(String(mockTransportRuntime.send.mock.calls[2]?.[0])).toContain(
+      'prepare one concise, self-contained re-audit brief yourself',
+    );
+    expect(String(mockTransportRuntime.send.mock.calls[2]?.[0])).toContain(
+      'audit={"kind":"supervision_audit","attemptId":"<that-fresh-attempt-id>"}',
+    );
+    expect(String(mockTransportRuntime.send.mock.calls[2]?.[0])).toContain(
+      'do not wait for the daemon or user to start this next audit',
     );
     // The rendered repair budget must match the real one. Assert the NUMBERS
     // the worker actually receives, not the builder's inputs: the off-by-one
@@ -3178,8 +3187,8 @@ describe('SupervisionAutomation', () => {
     expect(prompt).toContain('"kind":"supervision_audit"');
     expect(prompt).toContain('"attemptId":');
     expect(prompt).toContain('While waiting: do not modify, commit, push, or deploy.');
-    expect(prompt).toContain('fix and validate autonomously without waiting for another user prompt');
-    expect(prompt).toContain('then the daemon starts a fresh audit attempt');
+    expect(prompt).toContain('this same session must prepare and send the fresh reply-enabled re-audit itself');
+    expect(prompt).not.toContain('then the daemon starts a fresh audit attempt');
     expect(prompt).toContain(PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS.PASS);
     expect(prompt).toContain(PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS.REWORK);
   });

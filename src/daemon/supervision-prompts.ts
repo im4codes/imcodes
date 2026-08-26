@@ -13,6 +13,7 @@ import {
   PEER_AUDIT_BRIEF_REQUEST_BYTES,
   PEER_AUDIT_BRIEF_RESULT_BYTES,
   PEER_AUDIT_BRIEF_TOTAL_BYTES,
+  PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS,
   PEER_AUDIT_PATH_COUNT,
   PEER_AUDIT_PATH_ITEM_BYTES,
   PEER_AUDIT_PROMPT_VERSION,
@@ -155,10 +156,10 @@ function buildSupervisionOutputLanguageLock(request: SupervisionBrokerRequest): 
  * which degrades fast on long multi-rule prompts.
  */
 export const SUPERVISED_AUDIT_EXECUTION_PREAMBLE = [
-  'Peer-audit mode is on. You own the repair loop; the daemon owns audit routing.',
+  'Peer-audit mode is on. You own the repair loop; supervision only routes the first audit or verifies the one you send.',
   'Complete the implementation and validation, but DO NOT run git add, commit, push, merge, release, publish, deploy, or any other repository/delivery finalization in this turn, even when the user requested final delivery.',
-  'When the work is reviewable, report the concrete changes and validation evidence once. Do not choose or contact an auditor yourself: the daemon sends one addressed reply-enabled audit handoff.',
-  'On REWORK, own the repair: fix every actionable finding, validate, and report the new result. Repeat until PASS or an exact blocker.',
+  'When the work is reviewable the first time, report concrete changes and validation evidence once; the daemon will hand you the addressed audit request if one is required.',
+  'On REWORK, do not wait for another user/supervisor prompt: fix every actionable finding, validate, prepare the re-audit brief yourself, and send the fresh reply-enabled audit exactly as instructed in the REWORK brief. Repeat until PASS or an exact blocker.',
 ].join(' ');
 
 export interface PeerAuditBriefV1Input {
@@ -559,6 +560,7 @@ export function buildReworkBriefPrompt(
    * compiling; when omitted the line is skipped rather than guessed.
    */
   budget?: { attempt: number; limit: number },
+  auditTargetSessionName?: string,
 ): string {
   const findings = sanitizePeerAuditText(verdictText, SUPERVISION_REWORK_FINDINGS_BYTES);
   const taskContext = sanitizePeerAuditText(userText, SUPERVISION_REWORK_TASK_BYTES)
@@ -567,7 +569,14 @@ export function buildReworkBriefPrompt(
     `[Contract: ${SUPERVISION_CONTRACT_IDS.REWORK_BRIEF}]`,
     'Audit verdict: REWORK',
     `Fix these findings, then run the relevant validation:\n${findings}`,
-    'Fix and validate autonomously, then report the concrete result once. Do not pause just to say you are ready, and do not delegate or poll an auditor yourself: the daemon starts one fresh audit for the repaired revision.',
+    'Fix and validate autonomously. Do not pause just to say you are ready.',
+    ...(auditTargetSessionName ? [
+      `Fresh re-audit target ID: ${auditTargetSessionName}`,
+      `After the repair is reviewable, generate a fresh unique attempt ID, prepare one concise, self-contained re-audit brief yourself from the current context, and send it immediately with send_message(target=${JSON.stringify(auditTargetSessionName)}, reply=true, audit={"kind":"supervision_audit","attemptId":"<that-fresh-attempt-id>"}, message="<your re-audit brief>"). Include the same attempt ID inside the brief. Do not call send_list_targets, do not poll, and do not wait for the daemon or user to start this next audit.`,
+      `After that delegated audit replies, report the evidence and end with exactly one matching marker: ${PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS.PASS} or ${PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS.REWORK}. On REWORK, repeat this repair -> validate -> self-prepared re-audit cycle until PASS or an exact blocker/safety limit.`,
+    ] : [
+      'After the repair is reviewable, prepare one concise, self-contained re-audit brief yourself and send one fresh reply-enabled audit to the same configured audit target if it is available in the current context. If the target ID is unavailable, report that exact blocker instead of waiting silently.',
+    ]),
     ...(budget
       ? [`Repair attempt ${budget.attempt} of ${budget.limit}. On the last attempt, fix what matters most or report an exact blocker; do not assume another round follows.`]
       : []),
