@@ -595,7 +595,7 @@ describe('SupervisionAutomation', () => {
       '- Commit: 6cb4ac9ce fix(remote-desktop): expose wall state and standalone view',
       '- Push: origin/dev 成功',
     ].join('\n'));
-    await sleep(25);
+    await waitForRunPhase('auditing');
 
     expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
     expect(String(mockTransportRuntime.send.mock.calls[0]?.[0])).toContain('Automatic audit attempt ID:');
@@ -604,7 +604,7 @@ describe('SupervisionAutomation', () => {
       requiresAudit: false,
     });
     completeDelegatedAudit('PASS', 'Forced audit cleanup passed.');
-    await sleep(25);
+    await waitForRunEnd();
     expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
   });
 
