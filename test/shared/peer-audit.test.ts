@@ -78,7 +78,7 @@ describe('peer-audit contract — versions, enums, limits', () => {
     expect([...PEER_AUDIT_PHASES]).toEqual(['preparing', 'sent', 'queued', 'sent_unrevocable', 'waiting_reply']);
   });
   it('pins the exact v1 limits', () => {
-    expect(PEER_AUDIT_DEADLINE_MS).toBe(360_000);
+    expect(PEER_AUDIT_DEADLINE_MS).toBe(15 * 60_000);
     expect(PEER_AUDIT_REPLY_TOTAL_BYTES).toBe(24 * 1024);
     expect(PEER_AUDIT_FINDINGS_BYTES).toBe(16 * 1024);
     expect(PEER_AUDIT_VALIDATION_COUNT).toBe(32);

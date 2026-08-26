@@ -25,7 +25,7 @@ const authority: PeerAuditReplyAuthority = {
   targetRevision: 'target_revision_1',
   configRevision: 'config_revision_1',
   controllerRevision: 2,
-  deadlineAt: 361_000,
+  deadlineAt: 901_000,
 };
 
 const current: PeerAuditReplyCurrentBindings = {

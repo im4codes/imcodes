@@ -1775,19 +1775,25 @@ class SupervisionAutomation {
       const providerErrorBelongsToAttempt = Boolean(
         providerError && providerError.at >= run.auditTargetDispatchObservedAt,
       );
-      const failed = state === 'error'
+      const needsRecovery = state === 'error'
         || state === 'stopped'
-        || (state === 'idle' && providerErrorBelongsToAttempt);
-      if (!failed) {
-        if (state === 'idle') run.auditTargetObservedActive = false;
-        continue;
-      }
+        // If the audit target returns to idle without delivering the reply, the
+        // audit model has either completed without reporting through the
+        // required channel or stopped before the report reached this session.
+        // Do not wait for the global audit deadline; tick the same audit turn
+        // through the bounded recovery path. A real reply arriving during the
+        // short backoff clears the timer before the continue is sent.
+        || state === 'idle';
+      if (!needsRecovery) continue;
 
       // Consume the active edge before arming the timer. Duplicate error/idle
       // projections for the same failed turn then cannot schedule duplicates;
       // a genuinely resumed turn must first emit running/queued again.
       run.auditTargetObservedActive = false;
-      this.scheduleAuditTargetRecovery(run, state);
+      const recoveryState = state === 'idle' && !providerErrorBelongsToAttempt
+        ? 'idle_without_audit_reply'
+        : state;
+      this.scheduleAuditTargetRecovery(run, recoveryState);
     }
   }
 

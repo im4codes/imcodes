@@ -45,7 +45,7 @@ describe('peer-audit controller reducer', () => {
     vi.useRealTimers();
   });
 
-  it('starts the six-minute deadline in preparing and times out an unresolved dispatch', () => {
+  it('starts the 15-minute deadline in preparing and times out an unresolved dispatch', () => {
     const emitted: PeerAuditControllerEffect[][] = [];
     const controller = new PeerAuditController('deck_proj_brain', {
       onEffects: (effects) => emitted.push([...effects]),
@@ -53,18 +53,18 @@ describe('peer-audit controller reducer', () => {
     const started = controller.request(request('attempt-1'));
     expect(started).toMatchObject({
       status: 'started',
-      pending: { phase: 'preparing', startedAt: 1_000, deadlineAt: 361_000, revision: 1 },
+      pending: { phase: 'preparing', startedAt: 1_000, deadlineAt: 901_000, revision: 1 },
     });
 
-    vi.advanceTimersByTime(359_999);
+    vi.advanceTimersByTime(899_999);
     expect(controller.pending?.attemptId).toBe('attempt-1');
     vi.advanceTimersByTime(1);
 
     expect(controller.pending).toBeUndefined();
     expect(controller.getTombstone('attempt-1')?.terminal).toMatchObject({
       outcome: 'timeout',
-      completedAt: 361_000,
-      elapsedMs: 360_000,
+      completedAt: 901_000,
+      elapsedMs: 900_000,
     });
     expect(emitted.flat().filter((effect) => effect.type === 'emit_terminal')).toHaveLength(1);
   });

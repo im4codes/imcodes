@@ -304,7 +304,7 @@ export function buildPeerAuditBriefV1(input: PeerAuditBriefV1Input): string {
     `[Contract: ${PEER_AUDIT_PROMPT_VERSION}]`,
     'You are the independently selected peer auditor. Audit the completed result against the request and acceptance criteria below.',
     'This is a lightweight, single-pass audit. Do not start Team/P2P rounds, create a discussion, poll another session, or bulk-read OpenSpec artifact bodies.',
-    'Prioritize the highest-value checks within six minutes. Separate observed evidence from inference.',
+    'Prioritize the highest-value checks within 15 minutes. Separate observed evidence from inference.',
     'Use every applicable existing means for NON-DESTRUCTIVE verification; static code review alone is insufficient when relevant executable validation is available.',
     'You MAY run focused/unit/integration tests, typecheck, lint, build, read-only tools, and explicitly isolated test fixtures. You MAY use already-authorized devices/environments only for read-only checks or isolated fixture operations.',
     'You MUST NOT modify tracked source, commit, push, deploy, mutate production, or alter persistent external/product state. Do not run reset/clean. Inspect worktree state before and after, preserve pre-existing changes, and stop/report if validation creates an unexpected tracked diff.',

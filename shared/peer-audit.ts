@@ -113,7 +113,7 @@ export function isPeerAuditPhase(v: unknown): v is PeerAuditPhase {
 
 // ── Exact v1 limits (all UTF-8 bytes unless a *_COUNT) ────────────────────────
 
-export const PEER_AUDIT_DEADLINE_MS = 360_000;
+export const PEER_AUDIT_DEADLINE_MS = 15 * 60_000;
 export const PEER_AUDIT_BRIEF_TOTAL_BYTES = 32 * 1024;
 export const PEER_AUDIT_BRIEF_REQUEST_BYTES = 8 * 1024;
 export const PEER_AUDIT_BRIEF_RESULT_BYTES = 8 * 1024;

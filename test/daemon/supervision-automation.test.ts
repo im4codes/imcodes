@@ -136,7 +136,7 @@ async function waitForRunPhase(phase: 'execution' | 'auditing' | 'finalizing', t
     if (performance.now() >= deadline) return;
     // `setTimeout` is deliberately faked by the deadline test below. Yield on
     // the real check queue so async filesystem baseline discovery can finish
-    // without advancing the six-minute audit deadline.
+    // without advancing the 15-minute audit deadline.
     await new Promise<void>((resolve) => setImmediate(resolve));
   }
 }
@@ -1256,18 +1256,43 @@ describe('SupervisionAutomation', () => {
     }
   });
 
-  it('does not continue a correlated audit target after a healthy idle completion', async () => {
+  it('continues a correlated audit target after it falls idle without delivering the audit report', async () => {
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
     try {
-      const attemptId = await startAuditForRecoveryTest('cmd-audit-target-healthy-idle');
+      const attemptId = await startAuditForRecoveryTest('cmd-audit-target-idle-no-report');
       beginAuditTargetTurn(attemptId);
       mockAuditTargetStatus = 'idle';
       mockAuditTargetSending = false;
       mockAuditTargetLastProviderError = null;
       timelineEmitter.emit('deck_sub_reviewer', 'session.state', { state: 'idle' });
 
+      await vi.advanceTimersByTimeAsync(1_499);
+      expect(mockAuditTargetRuntime.send).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(mockAuditTargetRuntime.send).toHaveBeenCalledTimes(1);
+      expect(String(mockAuditTargetRuntime.send.mock.calls[0]?.[0])).toContain('Observed failed state: idle_without_audit_reply');
+      expect(String(mockAuditTargetRuntime.send.mock.calls[0]?.[0])).toContain(`Automatic audit attempt ID: ${attemptId}`);
+    } finally {
+      finishAuditRecoveryTestCleanup();
+      vi.useRealTimers();
+    }
+  });
+
+  it('cancels an idle-without-report recovery tick when the audit reply arrives during backoff', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      const attemptId = await startAuditForRecoveryTest('cmd-audit-target-idle-reply-race');
+      beginAuditTargetTurn(attemptId);
+      mockAuditTargetStatus = 'idle';
+      mockAuditTargetSending = false;
+      mockAuditTargetLastProviderError = null;
+      timelineEmitter.emit('deck_sub_reviewer', 'session.state', { state: 'idle' });
+
+      await vi.advanceTimersByTimeAsync(500);
+      completeDelegatedAudit('PASS', 'The audit report arrived before the recovery tick.');
       await vi.advanceTimersByTimeAsync(2_000);
       expect(mockAuditTargetRuntime.send).not.toHaveBeenCalled();
+      expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
     } finally {
       finishAuditRecoveryTestCleanup();
       vi.useRealTimers();
@@ -1415,7 +1440,7 @@ describe('SupervisionAutomation', () => {
       await Promise.resolve();
 
       // Intentionally do not emit session.state=idle. The final assistant
-      // boundary must settle the audit and disarm the six-minute deadline.
+      // boundary must settle the audit and disarm the 15-minute deadline.
       expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
       await vi.advanceTimersByTimeAsync(PEER_AUDIT_DEADLINE_MS);
 
