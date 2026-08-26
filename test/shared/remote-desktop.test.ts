@@ -354,6 +354,39 @@ describe('remote desktop production contract', () => {
       .toEqual({ ok: false, error: REMOTE_DESKTOP_ERROR.INVALID_REQUEST });
   });
 
+  it('separates encoded pixels from logical input geometry for common profiles', () => {
+    const topology = {
+      type: REMOTE_DESKTOP_DATA_MSG.DISPLAY_TOPOLOGY,
+      protocolVersion: REMOTE_DESKTOP_PROTOCOL_VERSION,
+      sessionId,
+      sequence: 1,
+      layoutRevision: 2,
+      displays: [{
+        id: 'mac-display-generation-2-main',
+        label: 'Built-in Retina Display',
+        primary: true,
+        available: true,
+        // ScreenCaptureKit pixels differ from Quartz input points.
+        width: 3024,
+        height: 1964,
+        dpiScale: 2,
+        rotation: REMOTE_DESKTOP_DISPLAY_ROTATION.ROTATE_0,
+        inputBounds: { x: 0, y: 0, width: 1512, height: 982 },
+        operations: { setMode: false, setScale: false },
+      }],
+      selectedDisplayId: 'mac-display-generation-2-main',
+    };
+    expect(validateRemoteDesktopDataMessage(topology)).toMatchObject({ ok: true });
+    expect(validateRemoteDesktopDataMessage({
+      ...topology,
+      displays: [{ ...topology.displays[0], inputBounds: { x: 0, y: 0, width: 0, height: 982 } }],
+    })).toEqual({ ok: false, error: REMOTE_DESKTOP_ERROR.INVALID_REQUEST });
+    expect(validateRemoteDesktopDataMessage({
+      ...topology,
+      displays: [{ ...topology.displays[0], operations: { setMode: false, setScale: false, capture: true } }],
+    })).toEqual({ ok: false, error: REMOTE_DESKTOP_ERROR.INVALID_REQUEST });
+  });
+
   it('carries the driver-reported resolutions on a display, bounded and unique', () => {
     const base = {
       type: REMOTE_DESKTOP_DATA_MSG.DISPLAY_TOPOLOGY,

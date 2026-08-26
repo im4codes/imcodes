@@ -574,15 +574,37 @@ export interface RemoteDesktopDisplayMode {
   height: number;
 }
 
+/**
+ * Platform logical coordinates used for input. These deliberately do not
+ * reuse encoded frame pixels: Retina/Wayland capture can produce a different
+ * pixel size from the coordinates accepted by the native input backend.
+ */
+export interface RemoteDesktopLogicalBounds {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+export interface RemoteDesktopDisplayOperations {
+  setMode: boolean;
+  setScale: boolean;
+}
+
 export interface RemoteDesktopDisplay {
   id: string;
   label: string;
   primary: boolean;
   available: boolean;
+  /** Encoded/captured pixel dimensions; retained names preserve protocol v2. */
   width: number;
   height: number;
   dpiScale: number;
   rotation: typeof REMOTE_DESKTOP_DISPLAY_ROTATION[keyof typeof REMOTE_DESKTOP_DISPLAY_ROTATION];
+  /** Required by the common v3 profile, absent from legacy Windows v2. */
+  inputBounds?: RemoteDesktopLogicalBounds;
+  /** Required by the common v3 profile, absent from legacy Windows v2. */
+  operations?: RemoteDesktopDisplayOperations;
   /**
    * The resolutions this display's driver reports, largest first. Absent from
    * older nodes, which is the only reason the common-mode list still exists:
@@ -989,7 +1011,11 @@ export function validateRemoteDesktopServerMessage(value: unknown): RemoteDeskto
 
 function isDisplay(value: unknown): value is RemoteDesktopDisplay {
   if (!isRecord(value)
-    || !hasExactKeys(value, ['id', 'label', 'primary', 'available', 'width', 'height', 'dpiScale', 'rotation'], ['modes'])) return false;
+    || !hasExactKeys(
+      value,
+      ['id', 'label', 'primary', 'available', 'width', 'height', 'dpiScale', 'rotation'],
+      ['modes', 'inputBounds', 'operations'],
+    )) return false;
   return isBoundedString(value.id, REMOTE_DESKTOP_LIMITS.DISPLAY_ID_BYTES)
     && isBoundedString(value.label, REMOTE_DESKTOP_LIMITS.DISPLAY_LABEL_BYTES)
     && typeof value.primary === 'boolean'
@@ -998,7 +1024,35 @@ function isDisplay(value: unknown): value is RemoteDesktopDisplay {
     && isSafePositive(value.height) && value.height <= 16_384
     && isFiniteRange(value.dpiScale, 0.5, 8)
     && typeof value.rotation === 'number' && ROTATIONS.has(value.rotation)
+    && (value.inputBounds === undefined || isLogicalBounds(value.inputBounds))
+    && (value.operations === undefined || isDisplayOperations(value.operations))
     && (value.modes === undefined || isDisplayModeList(value.modes));
+}
+
+function isLogicalBounds(value: unknown): value is RemoteDesktopLogicalBounds {
+  return isRecord(value)
+    && hasExactKeys(value, ['x', 'y', 'width', 'height'])
+    && isFiniteRange(value.x, -1_000_000, 1_000_000)
+    && isFiniteRange(value.y, -1_000_000, 1_000_000)
+    && isFiniteRange(value.width, 1, 1_000_000)
+    && isFiniteRange(value.height, 1, 1_000_000);
+}
+
+function isDisplayOperations(value: unknown): value is RemoteDesktopDisplayOperations {
+  return isRecord(value)
+    && hasExactKeys(value, ['setMode', 'setScale'])
+    && typeof value.setMode === 'boolean'
+    && typeof value.setScale === 'boolean';
+}
+
+/** Common-profile workers must provide the geometry/operation refinement. */
+export function hasRemoteDesktopCrossPlatformDisplayGeometry(
+  display: RemoteDesktopDisplay,
+): display is RemoteDesktopDisplay & {
+  inputBounds: RemoteDesktopLogicalBounds;
+  operations: RemoteDesktopDisplayOperations;
+} {
+  return display.inputBounds !== undefined && display.operations !== undefined;
 }
 
 function isDisplayModeList(value: unknown): value is RemoteDesktopDisplayMode[] {

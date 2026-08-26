@@ -12,6 +12,7 @@ import {
   type MachineAccessRole,
 } from '../../../shared/remote-exec.js';
 import { validateControlledNodeCapabilities } from '../../../shared/controlled-node-capabilities.js';
+import { resolveRemoteDesktopSessionProfile } from '../../../shared/remote-desktop-platform.js';
 import {
   REMOTE_DESKTOP_AUDIT_EVENT,
   REMOTE_DESKTOP_ACCESS_MODE,
@@ -1286,7 +1287,9 @@ export class RemoteDesktopRouter {
     }
     if (controlledNode) {
       const capabilities = validateControlledNodeCapabilities(access.controlled_capabilities);
-      if (!capabilities.ok || !capabilities.value.includes(REMOTE_DESKTOP_CAPABILITY)) {
+      if (!capabilities.ok
+        || !capabilities.value.includes(REMOTE_DESKTOP_CAPABILITY)
+        || resolveRemoteDesktopSessionProfile(capabilities.value) === null) {
         return 'capability';
       }
     }

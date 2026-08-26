@@ -10,6 +10,10 @@ import {
   validateControlledNodeCapabilities,
 } from '../../shared/controlled-node-capabilities.js';
 import {
+  REMOTE_DESKTOP_SESSION_CAPABILITY,
+  REMOTE_DESKTOP_UNSUPPORTED_PROFILE_CAPABILITY,
+} from '../../shared/remote-desktop-platform.js';
+import {
   PendingWebRtcCandidates,
   readWebRtcCandidateType,
   toWebRtcIceServers,
@@ -61,10 +65,27 @@ describe('controlled-node capability version boundary', () => {
     expect(validateControlledNodeCapabilities(['unknown.feature.v1'])).toEqual({ ok: false });
   });
 
-  it('ignores bounded future advertisements without granting them', () => {
+  it('keeps legacy rollback tokens inert but preserves a fail-closed v3 sentinel', () => {
     expect(parseAdvertisedControlledNodeCapabilities([
       REMOTE_DESKTOP_CAPABILITY,
       'remote.desktop.windows.h264.v3',
+      'unknown.feature.v1',
+    ])).toEqual({ ok: true, value: [REMOTE_DESKTOP_CAPABILITY] });
+    expect(parseAdvertisedControlledNodeCapabilities([
+      REMOTE_DESKTOP_CAPABILITY,
+      REMOTE_DESKTOP_SESSION_CAPABILITY,
+      'remote.desktop.platform.plan9.v1',
+      'unknown.feature.v1',
+    ])).toEqual({
+      ok: true,
+      value: [
+        REMOTE_DESKTOP_CAPABILITY,
+        REMOTE_DESKTOP_SESSION_CAPABILITY,
+        REMOTE_DESKTOP_UNSUPPORTED_PROFILE_CAPABILITY,
+      ],
+    });
+    expect(parseAdvertisedControlledNodeCapabilities([
+      REMOTE_DESKTOP_CAPABILITY,
       'unknown.feature.v1',
     ])).toEqual({ ok: true, value: [REMOTE_DESKTOP_CAPABILITY] });
   });

@@ -20,9 +20,18 @@ import {
   REMOTE_DESKTOP_STATE,
   REMOTE_DESKTOP_TERMINAL_REASON,
 } from '../../shared/remote-desktop.js';
+import {
+  REMOTE_DESKTOP_CAPTURE_CAPABILITY,
+  REMOTE_DESKTOP_ENCODER_CAPABILITY,
+  REMOTE_DESKTOP_PLATFORM_CAPABILITY,
+  REMOTE_DESKTOP_SESSION_CAPABILITY,
+  REMOTE_DESKTOP_UNSUPPORTED_PROFILE_CAPABILITY,
+} from '../../shared/remote-desktop-platform.js';
+import { parseAdvertisedControlledNodeCapabilities } from '../../shared/controlled-node-capabilities.js';
 import { NODE_ROLE } from '../../shared/remote-exec.js';
 import {
   REMOTE_DESKTOP_ACTOR_SOURCE,
+  REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY,
   type RemoteDesktopOutboxEvent,
 } from '../../shared/remote-desktop-access.js';
 
@@ -687,11 +696,76 @@ describe('RemoteDesktopRouter', () => {
     ['non-Windows', { os: 'linux' }, REMOTE_DESKTOP_ERROR.UNSUPPORTED_PLATFORM],
     ['stale presence', { last_heartbeat_at: 1 }, REMOTE_DESKTOP_ERROR.DAEMON_OFFLINE],
     ['unknown capability', { controlled_capabilities: ['remote.desktop.windows.h264.v3'] }, REMOTE_DESKTOP_ERROR.CAPABILITY_UNAVAILABLE],
+    ['unsupported persisted profile', {
+      controlled_capabilities: [
+        REMOTE_DESKTOP_CAPABILITY,
+        REMOTE_DESKTOP_UNSUPPORTED_PROFILE_CAPABILITY,
+      ],
+    }, REMOTE_DESKTOP_ERROR.CAPABILITY_UNAVAILABLE],
   ] as const)('rejects %s before signaling', async (_label, patch, error) => {
     const f = fixture({ access: { ...validAccess(), ...patch } as ControlledMachineAccessRow });
     await f.router.handleBrowser(f.browserA, 'owner-user', start);
     expect(f.daemonMessages).toHaveLength(0);
     expect(f.messages(f.browserA)[0]).toMatchObject({ type: REMOTE_DESKTOP_MSG.ERROR, error });
+  });
+
+  it('keeps an unknown remote-desktop advertisement fail-closed from ingress through admission', async () => {
+    const parsed = parseAdvertisedControlledNodeCapabilities([
+      REMOTE_DESKTOP_CAPABILITY,
+      REMOTE_DESKTOP_SESSION_CAPABILITY,
+      REMOTE_DESKTOP_PLATFORM_CAPABILITY.WINDOWS,
+      REMOTE_DESKTOP_CAPTURE_CAPABILITY.WINDOWS_DXGI,
+      REMOTE_DESKTOP_ENCODER_CAPABILITY.H264,
+      REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY,
+      'remote.desktop.platform.plan9.v1',
+      'future.unrelated.feature.v1',
+    ]);
+    expect(parsed).toEqual({
+      ok: true,
+      value: [
+        REMOTE_DESKTOP_CAPABILITY,
+        REMOTE_DESKTOP_SESSION_CAPABILITY,
+        REMOTE_DESKTOP_PLATFORM_CAPABILITY.WINDOWS,
+        REMOTE_DESKTOP_CAPTURE_CAPABILITY.WINDOWS_DXGI,
+        REMOTE_DESKTOP_ENCODER_CAPABILITY.H264,
+        REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY,
+        REMOTE_DESKTOP_UNSUPPORTED_PROFILE_CAPABILITY,
+      ],
+    });
+    if (!parsed.ok) throw new Error('capability fixture did not parse');
+    const f = fixture({
+      access: {
+        ...validAccess(),
+        controlled_capabilities: parsed.value,
+      },
+    });
+    await f.router.handleBrowser(f.browserA, 'owner-user', start);
+    expect(f.daemonMessages).toHaveLength(0);
+    expect(f.messages(f.browserA)[0]).toMatchObject({
+      type: REMOTE_DESKTOP_MSG.ERROR,
+      error: REMOTE_DESKTOP_ERROR.CAPABILITY_UNAVAILABLE,
+    });
+  });
+
+  it('keeps rollback-era unknown extensions inert for a pure legacy Windows profile', async () => {
+    const parsed = parseAdvertisedControlledNodeCapabilities([
+      REMOTE_DESKTOP_CAPABILITY,
+      'remote.desktop.future_adapter.v9',
+    ]);
+    expect(parsed).toEqual({ ok: true, value: [REMOTE_DESKTOP_CAPABILITY] });
+    if (!parsed.ok) throw new Error('legacy capability fixture did not parse');
+    const f = fixture({
+      access: {
+        ...validAccess(),
+        controlled_capabilities: parsed.value,
+      },
+    });
+    await f.router.handleBrowser(f.browserA, 'owner-user', start);
+    expect(f.messages(f.browserA)[0]).toMatchObject({
+      type: REMOTE_DESKTOP_MSG.AUTHORIZED,
+      requestId,
+    });
+    expect(f.daemonMessages).toHaveLength(1);
   });
 
   it('admits a normal Windows daemon whose controlled-node columns are unset', async () => {
