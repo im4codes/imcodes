@@ -1,0 +1,40 @@
+source_set("remote_desktop_common") {
+  sources = [
+    "data_channel_payload.cc",
+    "data_channel_payload.h",
+    "input_ledger.cc",
+    "input_ledger.h",
+    "json_protocol.cc",
+    "json_protocol.h",
+    "data_channel_constants.h",
+    "platform_interfaces.h",
+    "protocol_contracts.h",
+    "quality_ladder.cc",
+    "quality_ladder.h",
+    "session_core.cc",
+    "session_core.h",
+    "signaling_types.h",
+    "transport_session_core.cc",
+    "transport_session_core.h",
+    "value_types.cc",
+    "value_types.h",
+  ]
+
+  public = [
+    "data_channel_constants.h",
+    "data_channel_payload.h",
+    "input_ledger.h",
+    "json_protocol.h",
+    "platform_interfaces.h",
+    "protocol_contracts.h",
+    "quality_ladder.h",
+    "session_core.h",
+    "signaling_types.h",
+    "transport_session_core.h",
+    "value_types.h",
+  ]
+
+  # json_protocol.h exposes Json::Value in the preserved Windows v2 API, so
+  # downstream compatibility headers need jsoncpp's include config as well.
+  public_deps = [ "//third_party/jsoncpp" ]
+}

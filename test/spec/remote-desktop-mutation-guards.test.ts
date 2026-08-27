@@ -26,6 +26,7 @@ const SOURCE_PATHS = [
   'native/windows-virtual-display/virtual_display_driver.cc',
   'native/windows-virtual-display/imcodes-virtual-display.inf',
   'src/node/remote-desktop-worker-host.ts',
+  'src/node/remote-desktop-worker-host-core.ts',
   'src/node/self-upgrade.ts',
   'src/node/windows-user-session.ts',
   'scripts/build-node-exe.mjs',
@@ -508,7 +509,7 @@ const contracts: Contract[] = [
       },
       {
         path: 'src/node/remote-desktop-worker-host.ts',
-        needle: 'this.retryOnOtherDesktop(parsed.value, tracked)',
+        needle: 'this.retryOnOtherDesktop(event.value, tracked)',
       },
       {
         path: 'native/windows-remote-desktop/worker_main.cc',
@@ -636,8 +637,8 @@ const contracts: Contract[] = [
         needle: 'TerminateProcess(GetCurrentProcess(), 20)',
       },
       {
-        path: 'src/node/remote-desktop-worker-host.ts',
-        needle: 'validateRemoteDesktopWorkerCrash(value, this.nonce)',
+        path: 'src/node/remote-desktop-worker-host-core.ts',
+        needle: 'validateRemoteDesktopWorkerCrash(value, this.options.nonce)',
       },
     ],
   },
@@ -967,13 +968,13 @@ const contracts: Contract[] = [
         // instead of being declined as a dead worker.
         path: 'src/node/remote-desktop-worker-host.ts',
         needle:
-          'if (!this.tracked.has(command.sessionId)) return false;\n      await this.ensureStarted(WORKER_LAUNCH_MODE.SESSION);',
+          'if (!this.core.has(command.sessionId)) return false;\n      await this.ensureStarted(WORKER_LAUNCH_MODE.SESSION);',
       },
       {
         // Waiting for process start alone is insufficient: concurrent
         // continuations may otherwise write OFFER before PREPARE.
         path: 'src/node/remote-desktop-worker-host.ts',
-        needle: 'await this.preparing.get(command.sessionId);',
+        needle: 'await this.core.waitForPreparing(command.sessionId);',
       },
     ],
   },
@@ -1259,7 +1260,7 @@ const mutations: Mutation[] = [
     name: 'let a stale desktop choice stand',
     contract: 'one console-session worker that follows the desktop',
     path: 'src/node/remote-desktop-worker-host.ts',
-    needle: 'this.retryOnOtherDesktop(parsed.value, tracked)',
+    needle: 'this.retryOnOtherDesktop(event.value, tracked)',
   },
   {
     name: 'stop reporting a wrong-desktop prepare',
@@ -1288,8 +1289,8 @@ const mutations: Mutation[] = [
   {
     name: 'drop the daemon side of the crash report',
     contract: 'native worker faults are reported, never silent',
-    path: 'src/node/remote-desktop-worker-host.ts',
-    needle: 'validateRemoteDesktopWorkerCrash(value, this.nonce)',
+    path: 'src/node/remote-desktop-worker-host-core.ts',
+    needle: 'validateRemoteDesktopWorkerCrash(value, this.options.nonce)',
   },
   {
     name: 'let the media engine build the platform audio device',
@@ -1554,13 +1555,13 @@ const mutations: Mutation[] = [
     contract: 'a dead idle pipe cold-starts a replacement instead of failing the session',
     path: 'src/node/remote-desktop-worker-host.ts',
     needle:
-      'if (!this.tracked.has(command.sessionId)) return false;\n      await this.ensureStarted(WORKER_LAUNCH_MODE.SESSION);',
+      'if (!this.core.has(command.sessionId)) return false;\n      await this.ensureStarted(WORKER_LAUNCH_MODE.SESSION);',
   },
   {
     name: 'allow an offer to overtake its prepare after a cold start',
     contract: 'a dead idle pipe cold-starts a replacement instead of failing the session',
     path: 'src/node/remote-desktop-worker-host.ts',
-    needle: 'await this.preparing.get(command.sessionId);',
+    needle: 'await this.core.waitForPreparing(command.sessionId);',
   },
   {
     name: 'let a settled start promise stand in for a live worker',

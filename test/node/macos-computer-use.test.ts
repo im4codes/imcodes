@@ -3,13 +3,13 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
-  macosComputerUseDoctorArgs,
-  macosUserSessionHelperArgs,
+  MACOS_AIDESK_APP_NAME,
   prepareMacosComputerUseRuntime,
   validateMacosComputerUseArchiveEntries,
   type MacosComputerUseRuntime,
   type MacosConsoleUser,
 } from '../../src/node/macos-computer-use.js';
+import { macosUserSessionLaunchctlArgs } from '../../src/node/user-session-launcher.js';
 
 const dirs: string[] = [];
 
@@ -28,11 +28,41 @@ async function writeExtractedApp(destinationRoot: string, executableBytes: strin
   await writeFile(join(app, 'Contents', 'MacOS', 'OpenComputerUse'), executableBytes, { mode: 0o755 });
 }
 
+async function writeExtractedAiDesk(destinationRoot: string, executableBytes: string): Promise<void> {
+  const app = join(destinationRoot, MACOS_AIDESK_APP_NAME);
+  await mkdir(join(app, 'Contents', 'MacOS'), { recursive: true });
+  await mkdir(join(app, 'Contents', '_CodeSignature'), { recursive: true });
+  await writeFile(join(app, 'Contents', 'Info.plist'), '<plist>aidesk-signed</plist>');
+  await writeFile(join(app, 'Contents', '_CodeSignature', 'CodeResources'), 'imcodes-developer-id-seal');
+  await writeFile(join(app, 'Contents', 'MacOS', 'aidesk-agent'), executableBytes, { mode: 0o755 });
+}
+
 afterEach(async () => {
   await Promise.all(dirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
 });
 
 describe('macOS Computer Use runtime boundary', () => {
+  it('migrates the legacy OCU runtime to the unified aiDesk.to application', async () => {
+    const dir = await tempDir();
+    const sourceNode = join(dir, 'source-node');
+    const sourceArchive = join(dir, 'open-computer-use.app.zip');
+    const runtimeRoot = join(dir, 'runtime');
+    await writeFile(sourceNode, 'node-v1', { mode: 0o755 });
+    await writeFile(sourceArchive, 'aidesk-archive', { mode: 0o644 });
+    await writeExtractedApp(runtimeRoot, 'legacy-ocu');
+    const runtime = await prepareMacosComputerUseRuntime(sourceNode, sourceArchive, {
+      runtimeRoot,
+      extractAppArchive: async (_archive, destination) => writeExtractedAiDesk(destination, 'aidesk-v1'),
+      verifyCodeSignature: async () => {},
+      verifyAppBundle: async () => {},
+    });
+    expect(runtime.openComputerUseExecutable).toBe(
+      join(runtimeRoot, MACOS_AIDESK_APP_NAME, 'Contents', 'MacOS', 'aidesk-agent'),
+    );
+    expect(await readFile(runtime.openComputerUseExecutable, 'utf8')).toBe('aidesk-v1');
+    await expect(lstat(join(runtimeRoot, 'Open Computer Use.app'))).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
   it('publishes the complete upstream-signed app without rebuilding or re-signing it', async () => {
     const dir = await tempDir();
     const sourceNode = join(dir, 'source-node');
@@ -172,7 +202,11 @@ describe('macOS Computer Use runtime boundary', () => {
       openComputerUseExecutable: '/Library/Application Support/imcodes-node-computer-use/Open Computer Use.app/Contents/MacOS/OpenComputerUse',
     };
 
-    const args = macosUserSessionHelperArgs(user, runtime, '/tmp/private.sock');
+    const args = macosUserSessionLaunchctlArgs(user, {
+      executable: runtime.helperExecutable,
+      args: ['--computer-use-helper', '--pipe', '/tmp/private.sock'],
+      environment: [['IMCODES_COMPUTER_USE_EXE', runtime.openComputerUseExecutable]],
+    });
 
     expect(args.slice(0, 7)).toEqual([
       'asuser',
@@ -188,7 +222,10 @@ describe('macOS Computer Use runtime boundary', () => {
     expect(args).toContain(`IMCODES_COMPUTER_USE_EXE=${runtime.openComputerUseExecutable}`);
     expect(args).toContain(runtime.helperExecutable);
     expect(args).not.toContain('/Library/Application Support/imcodes-node/credential.json');
-    expect(macosComputerUseDoctorArgs(user, runtime)).toEqual([
+    expect(macosUserSessionLaunchctlArgs(user, {
+      executable: runtime.openComputerUseExecutable,
+      args: ['doctor'],
+    })).toEqual([
       'asuser',
       '501',
       '/usr/bin/sudo',

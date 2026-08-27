@@ -114,6 +114,52 @@ export function validateLibwebrtcSdkNotices(text) {
   return text;
 }
 
+export const MACOS_LIBWEBRTC_NOTICE_TARGETS = Object.freeze([
+  '//third_party/imcodes_macos_remote_desktop:imcodes_remote_desktop_disclosure',
+  '//third_party/imcodes_macos_remote_desktop:imcodes_remote_desktop_launch_agent',
+  '//third_party/imcodes_macos_remote_desktop:imcodes_remote_desktop_worker',
+  // Sorted last on purpose: this list is compared byte-for-byte against the
+  // generator's own `",".join(sorted(EXPECTED_TARGETS))`, so the order is part
+  // of the contract, not a style choice.
+  '//third_party/imcodes_macos_remote_desktop:imcodes_virtual_display_helper',
+]);
+
+/** Validate the fail-closed inventory emitted from the pinned macOS GN graph. */
+export function validateMacosLibwebrtcNotices(text, expectedRevision) {
+  if (typeof text !== 'string' || text.length === 0 || text.length > 16 * 1024 * 1024) {
+    throw new Error('invalid macOS libwebrtc notices');
+  }
+  const inventory = text.match(/^<!-- imcodes-macos-libwebrtc-notices-v1\nlibwebrtcRevision=([0-9a-f]{40})\ntargets=([^\n]+)\nlibraries=([^\n]+)\n-->\n\n/u);
+  if (!inventory) throw new Error('macOS libwebrtc notices inventory is missing');
+  if (expectedRevision !== undefined && inventory[1] !== expectedRevision) {
+    throw new Error('macOS libwebrtc notices revision mismatch');
+  }
+  if (inventory[2] !== MACOS_LIBWEBRTC_NOTICE_TARGETS.join(',')) {
+    throw new Error('macOS libwebrtc notices target inventory mismatch');
+  }
+  const libraries = inventory[3].split(',');
+  if (libraries[0] !== 'webrtc' || new Set(libraries).size !== libraries.length) {
+    throw new Error('macOS libwebrtc notices library inventory is invalid');
+  }
+  if (libraries.slice(1).join(',') !== [...libraries.slice(1)].sort().join(',')) {
+    throw new Error('macOS libwebrtc notices library inventory is not deterministic');
+  }
+  const headings = [...text.matchAll(/^# ([^\r\n]+)\r?$/gmu)];
+  if (headings.map((heading) => heading[1]).join(',') !== libraries.join(',')) {
+    throw new Error('macOS libwebrtc notices sections do not match their inventory');
+  }
+  for (let index = 0; index < headings.length; index += 1) {
+    const start = headings[index].index + headings[index][0].length;
+    const end = index + 1 < headings.length ? headings[index + 1].index : text.length;
+    const section = text.slice(start, end);
+    const fenced = section.match(/^\r?\n```\r?\n([\s\S]*?)\r?\n```\s*$/u);
+    if (!fenced || fenced[1].trim().length === 0) {
+      throw new Error(`macOS libwebrtc notices contain an empty ${headings[index][1]} section`);
+    }
+  }
+  return text;
+}
+
 export async function computeLibwebrtcSdkSourceSha256() {
   const hash = createHash('sha256');
   for (const input of SOURCE_INPUTS) {

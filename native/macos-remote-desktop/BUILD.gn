@@ -1,0 +1,1074 @@
+import("//webrtc.gni")
+
+assert(is_mac, "the macOS remote-desktop build spike only supports macOS")
+assert(current_cpu == "arm64" || current_cpu == "x64",
+       "the macOS remote-desktop build spike requires arm64 or x64")
+
+# This target intentionally depends on the pinned checkout's root WebRTC
+# target. Apple frameworks provide capture and H.264 only; libwebrtc remains
+# the sole implementation of ICE, DTLS-SRTP, RTP/RTCP, pacing and congestion
+# control.
+rtc_executable("imcodes_macos_remote_desktop_build_spike") {
+  testonly = true
+  sources = [ "build_spike.mm" ]
+
+  # Make the macOS 12.3 deployment target an API-availability gate rather than
+  # accepting a warning for a newer unguarded SDK symbol.
+  cflags_objcc = [ "-Werror=unguarded-availability-new" ]
+
+  deps = [ "//:webrtc" ]
+
+  frameworks = [
+    "CoreMedia.framework",
+    "CoreVideo.framework",
+    "Foundation.framework",
+    "ScreenCaptureKit.framework",
+    "VideoToolbox.framework",
+  ]
+}
+
+source_set("screen_capture_kit_adapter") {
+  sources = [
+    "screen_capture_kit_limits.cc",
+    "screen_capture_kit_adapter.h",
+    "screen_capture_kit_adapter.mm",
+  ]
+
+  public = [ "screen_capture_kit_adapter.h" ]
+  public_deps = [ "../remote-desktop-common:remote_desktop_common" ]
+
+  cflags_objcc = [
+    "-fobjc-arc",
+    "-Werror=unguarded-availability-new",
+  ]
+
+  frameworks = [
+    "CoreGraphics.framework",
+    "CoreMedia.framework",
+    "CoreVideo.framework",
+    "Foundation.framework",
+    "ScreenCaptureKit.framework",
+  ]
+}
+
+# Generation-owned headless display support. The private CoreGraphics runtime
+# types are resolved only inside the Objective-C++ backend; the public adapter
+# and common display contract remain Apple-SDK-free and sanitizer-testable.
+source_set("macos_virtual_display_adapter") {
+  sources = [
+    "apple_virtual_display_backend.mm",
+    "macos_virtual_display_adapter.cc",
+    "macos_virtual_display_adapter.h",
+  ]
+
+  public = [ "macos_virtual_display_adapter.h" ]
+  public_deps = [ "../remote-desktop-common:remote_desktop_common" ]
+
+  cflags_objcc = [
+    "-fobjc-arc",
+    "-Werror=unguarded-availability-new",
+  ]
+
+  frameworks = [
+    "CoreGraphics.framework",
+    "Foundation.framework",
+  ]
+}
+
+# Version admission for the private virtual-display surface. Pure C++ so the
+# policy is provable without macOS, and deliberately fail-closed: an unqualified
+# build is refused rather than probed. macOS 26 already moved this surface once
+# (-dealloc stopped removing displays), which is exactly the class of change an
+# optimistic probe would miss.
+source_set("macos_virtual_display_version_gate") {
+  sources = [
+    "macos_virtual_display_version_gate.cc",
+    "macos_virtual_display_version_gate.h",
+  ]
+
+  public = [ "macos_virtual_display_version_gate.h" ]
+}
+
+# Dynamic SkyLight seam. NOTHING private is linked: SkyLight is opened with
+# dlopen and every symbol is resolved by dlsym, so a missing or renamed symbol
+# yields an INCOMPLETE seam that the authority layer treats as "display control
+# unavailable" rather than a reason to guess.
+# Split by responsibility, and the split is load-bearing for the build itself:
+# GN derives object-file names from the source BASENAME, so a .cc and a .mm that
+# differ only by extension collide as the same .o ("generates two object files
+# with the same name"). The pure-C++ half must stay pure so the presence/state
+# logic is testable with no SkyLight and no ObjC runtime linked at all; the
+# runtime half must stay ObjC++ because it resolves the private symbols. Merging
+# them to dodge the collision would forfeit exactly that separation, so the
+# ObjC++ half carries the explicit _runtime suffix instead.
+# Pure C++, no OS calls and no ObjC runtime: the admission, retirement and
+# self-heal rules plus identity derivation are provable against a fake
+# WindowServer, which is the only way to test them without stranding a real
+# display on the host.
+source_set("macos_virtual_display_policy") {
+  sources = [
+    "macos_virtual_display_identity.cc",
+    "macos_virtual_display_identity.h",
+    "macos_virtual_display_policy.cc",
+    "macos_virtual_display_policy.h",
+  ]
+
+  public = [
+    "macos_virtual_display_identity.h",
+    "macos_virtual_display_policy.h",
+  ]
+}
+
+source_set("macos_virtual_display_skylight") {
+  sources = [
+    "macos_virtual_display_skylight.cc",
+    "macos_virtual_display_skylight.h",
+    "macos_virtual_display_skylight_runtime.mm",
+  ]
+
+  public = [ "macos_virtual_display_skylight.h" ]
+
+  cflags_objcc = [
+    "-fobjc-arc",
+    "-Werror=unguarded-availability-new",
+  ]
+
+  frameworks = [
+    "CoreGraphics.framework",
+    "Foundation.framework",
+  ]
+}
+
+# Authority over the one warm display, kept separate from the display's
+# lifetime. Releasing a CGVirtualDisplay does not remove it on macOS 26.x, so
+# route end revokes authority and DISABLES the display; it never claims a
+# removal enumeration did not confirm.
+source_set("macos_virtual_display_authority") {
+  sources = [
+    "macos_virtual_display_authority.cc",
+    "macos_virtual_display_authority.h",
+    "macos_virtual_display_helper_backend.cc",
+    "macos_virtual_display_helper_backend.h",
+    "macos_virtual_display_agent.cc",
+    "macos_virtual_display_agent.h",
+    "macos_virtual_display_challenge_ledger.cc",
+    "macos_virtual_display_challenge_ledger.h",
+    "macos_virtual_display_control_protocol.cc",
+    "macos_virtual_display_control_protocol.h",
+    "macos_virtual_display_control_server.cc",
+    "macos_virtual_display_control_server.h",
+    "macos_virtual_display_authority_link.cc",
+    "macos_virtual_display_authority_link.h",
+    "macos_virtual_display_authority_link_posix.cc",
+    "macos_virtual_display_authority_link_posix.h",
+    "macos_virtual_display_resident_loop.cc",
+    "macos_virtual_display_resident_loop.h",
+    "macos_virtual_display_resident.cc",
+    "macos_virtual_display_resident.h",
+    "macos_virtual_display_route_backend.cc",
+    "macos_virtual_display_route_backend.h",
+    "macos_virtual_display_grant.cc",
+    "macos_virtual_display_grant.h",
+    "macos_virtual_display_helper_binding.cc",
+    "macos_virtual_display_helper_binding.h",
+    "macos_virtual_display_helper_protocol.cc",
+    "macos_virtual_display_helper_protocol.h",
+    "macos_virtual_display_supervisor.cc",
+    "macos_virtual_display_supervisor.h",
+    "macos_virtual_display_supervisor_posix.cc",
+    "macos_virtual_display_supervisor_posix.h",
+  ]
+
+  public = [
+    "macos_virtual_display_authority.h",
+    "macos_virtual_display_helper_backend.h",
+    "macos_virtual_display_agent.h",
+    "macos_virtual_display_challenge_ledger.h",
+    "macos_virtual_display_control_protocol.h",
+    "macos_virtual_display_control_server.h",
+    "macos_virtual_display_authority_link.h",
+    "macos_virtual_display_grant.h",
+    "macos_virtual_display_resident.h",
+    "macos_virtual_display_resident_loop.h",
+    "macos_virtual_display_route_backend.h",
+    "macos_virtual_display_helper_binding.h",
+    "macos_virtual_display_helper_protocol.h",
+    "macos_virtual_display_supervisor.h",
+    "macos_virtual_display_supervisor_posix.h",
+  ]
+
+  # ONE list. GN treats a second assignment to a non-empty list as an error
+  # ("Replacing nonempty list"), so adding a dependency by appending a fresh
+  # `public_deps = [...]` block breaks `gn gen` outright rather than merging.
+  # macos_virtual_display_backend depends on the policy types (three-state view,
+  # last-surface guard, identity derivation), so policy belongs here too.
+  public_deps = [
+    ":macos_virtual_display_policy",
+    ":macos_virtual_display_skylight",
+    ":macos_virtual_display_version_gate",
+    "../remote-desktop-common:remote_desktop_common",
+  ]
+
+  # SecStaticCodeCheckValidity: the signer check that makes a matching digest
+  # insufficient on its own. Single assignment -- GN treats a second one as
+  # "Replacing nonempty list" and fails `gn gen` outright.
+  frameworks = [
+    "CoreFoundation.framework",
+    "Security.framework",
+  ]
+}
+
+source_set("ns_pasteboard_clipboard_adapter") {
+  sources = [
+    "ns_pasteboard_clipboard_adapter.h",
+    "ns_pasteboard_clipboard_adapter.mm",
+  ]
+
+  public = [ "ns_pasteboard_clipboard_adapter.h" ]
+  public_deps = [ "../remote-desktop-common:remote_desktop_common" ]
+
+  cflags_objcc = [
+    "-fobjc-arc",
+    "-Werror=unguarded-availability-new",
+  ]
+
+  frameworks = [
+    "Security.framework",
+    "AppKit.framework",
+    "Foundation.framework",
+  ]
+}
+
+source_set("cg_event_input_adapter") {
+  sources = [
+    "cg_event_input_adapter.h",
+    "cg_event_input_adapter.mm",
+  ]
+
+  public = [ "cg_event_input_adapter.h" ]
+  public_deps = [ "../remote-desktop-common:remote_desktop_common" ]
+
+  cflags_objcc = [
+    "-fobjc-arc",
+    "-Werror=unguarded-availability-new",
+  ]
+
+  frameworks = [
+    "ApplicationServices.framework",
+    "Foundation.framework",
+  ]
+}
+
+source_set("macos_permission_readiness") {
+  sources = [
+    "macos_permission_readiness.h",
+    "macos_permission_readiness.mm",
+  ]
+
+  public = [ "macos_permission_readiness.h" ]
+  public_deps = [ "../remote-desktop-common:remote_desktop_common" ]
+
+  cflags_objcc = [
+    "-fobjc-arc",
+    "-Werror=unguarded-availability-new",
+  ]
+
+  frameworks = [
+    "AppKit.framework",
+    "ApplicationServices.framework",
+    "CoreGraphics.framework",
+    "Foundation.framework",
+  ]
+}
+
+source_set("macos_permission_onboarding") {
+  sources = [
+    "macos_permission_onboarding.h",
+    "macos_permission_onboarding.mm",
+  ]
+
+  public = [ "macos_permission_onboarding.h" ]
+  public_deps = [ ":macos_native_command_v1" ]
+
+  cflags_objcc = [
+    "-fobjc-arc",
+    "-Werror=unguarded-availability-new",
+  ]
+
+  frameworks = [
+    "AppKit.framework",
+    "ApplicationServices.framework",
+    "CoreGraphics.framework",
+    "Foundation.framework",
+  ]
+}
+
+source_set("macos_local_disclosure") {
+  sources = [
+    "macos_local_disclosure.h",
+    "macos_local_disclosure.mm",
+  ]
+
+  public = [ "macos_local_disclosure.h" ]
+  public_deps = [ "../remote-desktop-common:remote_desktop_common" ]
+
+  cflags_objcc = [
+    "-fobjc-arc",
+    "-Werror=unguarded-availability-new",
+  ]
+
+  frameworks = [
+    "AppKit.framework",
+    "Foundation.framework",
+  ]
+}
+
+source_set("macos_session_monitor") {
+  sources = [
+    "macos_session_monitor.h",
+    "macos_session_monitor.mm",
+  ]
+
+  public = [ "macos_session_monitor.h" ]
+  public_deps = [ "../remote-desktop-common:remote_desktop_common" ]
+
+  cflags_objcc = [
+    "-fobjc-arc",
+    "-Werror=unguarded-availability-new",
+  ]
+
+  frameworks = [
+    "AppKit.framework",
+    "Foundation.framework",
+  ]
+}
+
+source_set("macos_peer_identity") {
+  sources = [
+    "macos_peer_identity.h",
+    "macos_peer_identity.mm",
+  ]
+
+  public = [ "macos_peer_identity.h" ]
+
+  cflags_objcc = [
+    "-fobjc-arc",
+    "-Werror=unguarded-availability-new",
+  ]
+
+  frameworks = [
+    "CoreFoundation.framework",
+    "Security.framework",
+  ]
+  libs = [ "bsm" ]
+}
+
+# Signed active-user entry point. The root host reuses this exact code identity
+# for bounded inherited-fd peer verification instead of shipping a second
+# helper with a different designated requirement. Normal invocations tail-exec
+# the verified sibling worker only after the verifier declines the command.
+rtc_executable("imcodes_remote_desktop_launch_agent") {
+  output_name = "imcodes-remote-desktop-launch-agent"
+  sources = [
+    "macos_launch_agent_main.mm",
+    "macos_peer_identity.h",
+    "macos_peer_identity.mm",
+    "macos_peer_verifier_command.h",
+    "macos_peer_verifier_command.mm",
+  ]
+
+  # rtc_executable's pinned template reads invoker.deps unconditionally.
+  # The verifier sources are compiled directly; the session identity and the
+  # worker environment key names are shared with the worker and must not be
+  # restated here.
+  deps = [
+    ":macos_session_identity",
+    # The agent is now the RESIDENT virtual-display owner in session mode: it
+    # dials the root daemon's authority rendezvous, spawns the worker as a
+    # CHILD rather than exec-replacing itself, and owns the supervised helper
+    # across route lifetimes. Readiness and permission invocations still
+    # tail-exec, because those must answer and exit rather than own anything.
+    ":macos_virtual_display_authority",
+    # The resident owner validates the display configuration and modes it is
+    # asked to hold, so it needs their definitions, not just the declarations.
+    ":macos_virtual_display_adapter",
+    ":macos_worker_ipc_client",
+  ]
+
+  cflags_objcc = [
+    "-fobjc-arc",
+    "-Werror=unguarded-availability-new",
+  ]
+
+  frameworks = [
+    "CoreFoundation.framework",
+    "Security.framework",
+  ]
+  libs = [ "bsm" ]
+}
+
+source_set("video_toolbox_h264_encoder") {
+  sources = [
+    "video_toolbox_h264_encoder.h",
+    "video_toolbox_h264_encoder.mm",
+  ]
+
+  public = [ "video_toolbox_h264_encoder.h" ]
+  public_deps = [ "../remote-desktop-common:remote_desktop_common" ]
+
+  cflags_objcc = [
+    "-fobjc-arc",
+    "-Werror=unguarded-availability-new",
+  ]
+
+  frameworks = [
+    "CoreMedia.framework",
+    "CoreVideo.framework",
+    "Foundation.framework",
+    "VideoToolbox.framework",
+  ]
+}
+
+# The queue/generation bridge is kept in the same target as its only
+# production backend so every shipped consumer reaches the repository-pinned
+# libwebrtc encoded-image sender. Upstream WebRTC owns packetization and all
+# transport behavior.
+source_set("pinned_libwebrtc_h264_sender_bridge") {
+  sources = [
+    "h264_sender_bridge.cc",
+    "h264_sender_bridge.h",
+    "pinned_libwebrtc_h264_sender.cc",
+    "pinned_libwebrtc_h264_sender.h",
+  ]
+
+  public = [
+    "h264_sender_bridge.h",
+    "pinned_libwebrtc_h264_sender.h",
+  ]
+  public_deps = [ "../remote-desktop-common:remote_desktop_common" ]
+  deps = [
+    "//api/video:encoded_image",
+    "//api/video_codecs:video_codecs_api",
+    "//modules/video_coding:video_codec_interface",
+  ]
+
+  if (is_clang) {
+    # These translation units consume public upstream WebRTC headers whose
+    # inline definitions are not valid input to Chromium's source-style
+    # plugin. Keep the exception target-local; warnings and -Werror remain.
+    configs -= [ "//build/config/clang:find_bad_constructs" ]
+  }
+}
+
+# Active-user production composition. This target owns the platform adapters
+# and consumes both common SessionCore and TransportSessionCore boundaries.
+# The pinned sender remains the sole existing libwebrtc media seam; a caller
+# must inject a real TransportSessionAdapter before PeerConnection/DataChannel
+# behavior can be claimed.
+source_set("macos_remote_desktop_session") {
+  sources = [
+    "macos_remote_desktop_session.h",
+    "macos_remote_desktop_session.mm",
+  ]
+
+  public = [ "macos_remote_desktop_session.h" ]
+  deps = [
+    ":cg_event_input_adapter",
+    ":macos_local_disclosure",
+    ":macos_permission_readiness",
+    ":macos_session_monitor",
+    ":macos_virtual_display_adapter",
+    ":ns_pasteboard_clipboard_adapter",
+    ":pinned_libwebrtc_h264_sender_bridge",
+    ":screen_capture_kit_adapter",
+    ":video_toolbox_h264_encoder",
+  ]
+  public_deps = [
+    ":macos_login_window_capture",
+    "../remote-desktop-common:remote_desktop_common",
+  ]
+
+  cflags_objcc = [
+    "-fobjc-arc",
+    "-Werror=unguarded-availability-new",
+  ]
+}
+
+# Real signaling transport for the active-user composition.
+#
+# The adapter half is platform-neutral logic and is deliberately kept free of
+# libwebrtc headers so its fail-closed rules can be compiled and tested without
+# a pinned checkout. The backend half is the only translation unit that touches
+# upstream WebRTC.
+source_set("macos_transport_session_adapter") {
+  sources = [
+    "macos_transport_session_adapter.cc",
+    "macos_transport_session_adapter.h",
+  ]
+
+  public = [ "macos_transport_session_adapter.h" ]
+  public_deps = [ "../remote-desktop-common:remote_desktop_common" ]
+}
+
+# Sole libwebrtc-facing transport translation unit. ICE, DTLS-SRTP, SCTP,
+# RTP/RTCP, pacing and congestion control are upstream's; nothing here
+# reimplements them and no second media stack may be added beside it.
+source_set("pinned_libwebrtc_transport_backend") {
+  sources = [
+    "pinned_libwebrtc_transport_backend.cc",
+    "pinned_libwebrtc_transport_backend.h",
+  ]
+
+  public = [ "pinned_libwebrtc_transport_backend.h" ]
+  public_deps = [
+    ":macos_media_sender_binder",
+    ":macos_transport_session_adapter",
+  ]
+  deps = [
+    "//api:create_modular_peer_connection_factory",
+    "//api:data_channel_interface",
+    "//api:jsep",
+    "//api:peer_connection_interface",
+    "//api:scoped_refptr",
+    "//rtc_base:threading",
+  ]
+
+  if (is_clang) {
+    configs -= [ "//build/config/clang:find_bad_constructs" ]
+  }
+}
+
+# Exact daemon-consumed v1 commands and their strict readiness contract. Kept
+# free of OS headers so the contract can be compiled and tested without a
+# pinned checkout or a live desktop session.
+source_set("macos_native_command_v1") {
+  sources = [
+    "macos_native_command_v1.cc",
+    "macos_native_command_v1.h",
+  ]
+
+  public = [ "macos_native_command_v1.h" ]
+}
+
+# Bounded newline framing and envelope parsing for the host IPC socket. No OS
+# or framework types: the same reason as above, and so the frame bounds are
+# provable in isolation from any socket.
+source_set("macos_worker_ipc_client") {
+  sources = [
+    "macos_worker_ipc_client.cc",
+    "macos_worker_ipc_client.h",
+  ]
+
+  public = [ "macos_worker_ipc_client.h" ]
+}
+
+# HOST_COMMAND dispatch. Deliberately free of ScreenCaptureKit, libwebrtc and
+# any OS framework: the standalone native test binary links this target to prove
+# what each command emits and refuses, which is impossible from inside the
+# worker entry point.
+# Automatic-unlock decision half. Deliberately free of Security.framework and
+# of any Apple header so every branch can be linked and sanitized on a machine
+# with no keychain, no signing identity and no login window.
+# LoginWindow capture supervision: backend selection, shared bounds and the
+# session-type capability profile. Deliberately free of Apple headers so both
+# backends are driven through one interface and the whole thing can be
+# sanitized without a login window.
+# Real CGDisplayStream capture for pre-14.4 login windows. Implements the same
+# ScreenCaptureKitBackend interface so the supervisor drives it with identical
+# bounds; a second interface would let this path acquire its own.
+source_set("cg_display_stream_backend") {
+  sources = [
+    "cg_display_stream_backend.h",
+    "cg_display_stream_backend.mm",
+  ]
+
+  public = [ "cg_display_stream_backend.h" ]
+
+  public_deps = [ ":screen_capture_kit_adapter" ]
+
+  frameworks = [
+    "CoreGraphics.framework",
+    "CoreVideo.framework",
+    "IOSurface.framework",
+  ]
+
+  # ARC, because cg_display_stream_backend.mm depends on it for correctness,
+  # not merely for style: it creates a dispatch queue and a dispatch semaphore
+  # and deliberately calls no dispatch_release, documenting "this file is
+  # compiled with ARC, which owns dispatch objects". That was true of the
+  # source and false of this target -- ARC was never enabled here -- so both
+  # objects leaked on every handle/Stop. The repair belongs in the build, not
+  # in the source: adding manual dispatch_release would be a use-after-free the
+  # moment this target is ever compiled with ARC on.
+  cflags_objcc = [
+    "-fobjc-arc",
+    "-Werror=unguarded-availability-new",
+  ]
+
+}
+
+source_set("macos_virtual_display_daemon_backend") {
+  sources = [
+    "macos_virtual_display_daemon_backend.cc",
+    "macos_virtual_display_daemon_backend.h",
+  ]
+
+  public = [ "macos_virtual_display_daemon_backend.h" ]
+
+  public_deps = [
+    ":macos_virtual_display_adapter",
+    ":macos_worker_ipc_client",
+  ]
+
+  # The cookie derivation lives in the authority target alongside the binding
+  # it is derived from; there is no separate binding target to depend on.
+  deps = [ ":macos_virtual_display_authority" ]
+}
+
+source_set("macos_session_identity") {
+  sources = [
+    "macos_session_identity.h",
+    "macos_session_identity.mm",
+  ]
+
+  public = [ "macos_session_identity.h" ]
+
+  public_deps = [ ":macos_login_window_capture" ]
+
+  frameworks = [
+    "CoreGraphics.framework",
+    "Foundation.framework",
+  ]
+
+  # getaudit_addr: the kernel audit session id, which is the only value that
+  # distinguishes two successive login windows.
+  libs = [ "bsm" ]
+
+  cflags_objcc = [
+    "-fobjc-arc",
+    "-Werror=unguarded-availability-new",
+  ]
+}
+
+source_set("macos_login_window_capture") {
+  sources = [
+    "macos_login_window_capture.cc",
+    "macos_login_window_capture.h",
+  ]
+
+  public = [ "macos_login_window_capture.h" ]
+
+  public_deps = [ ":screen_capture_kit_adapter" ]
+
+  deps = [ ":cg_display_stream_backend" ]
+}
+
+source_set("macos_auto_unlock_controller") {
+  sources = [
+    "macos_auto_unlock_controller.cc",
+    "macos_auto_unlock_controller.h",
+  ]
+
+  public = [ "macos_auto_unlock_controller.h" ]
+}
+
+source_set("macos_auto_unlock_authorization_context") {
+  sources = [
+    "macos_auto_unlock_authorization_context.cc",
+    "macos_auto_unlock_authorization_context.h",
+  ]
+
+  public = [ "macos_auto_unlock_authorization_context.h" ]
+  public_deps = [ ":macos_auto_unlock_controller" ]
+}
+
+# Classic file-keychain store. Separated from the controller because it is the
+# only part that needs Security.framework, and therefore the only part that
+# cannot be exercised without a real signed agent.
+source_set("macos_auto_unlock_keychain") {
+  sources = [
+    "macos_auto_unlock_keychain.h",
+    "macos_auto_unlock_keychain.mm",
+  ]
+
+  public = [ "macos_auto_unlock_keychain.h" ]
+
+  public_deps = [ ":macos_auto_unlock_controller" ]
+
+  frameworks = [
+    "Security.framework",
+    "CoreFoundation.framework",
+  ]
+
+  cflags_objcc = [ "-Werror=unguarded-availability-new" ]
+
+}
+
+# Authorization Plug-in: mechanism sequencing, bundle identity, transactional
+# right registration. Split so only the two Apple-dependent units link Security
+# and the rest stays reachable from pure C++ counterfactuals.
+# The one-shot local authority. Pure logic, no Security.framework: it carries
+# only the facts needed to refuse, never a credential.
+source_set("macos_auto_unlock_authority") {
+  sources = [
+    "macos_auto_unlock_authority.cc",
+    "macos_auto_unlock_authority.h",
+  ]
+
+  public = [ "macos_auto_unlock_authority.h" ]
+}
+
+# Drop-box layout and the validated read/atomic write. Shared by the
+# unprivileged issuer and the root plug-in so the two cannot drift on owner,
+# mode or replace semantics.
+source_set("macos_auto_unlock_record_io") {
+  sources = [
+    "macos_auto_unlock_paths.h",
+    "macos_auto_unlock_record_io.cc",
+    "macos_auto_unlock_record_io.h",
+  ]
+
+  public = [
+    "macos_auto_unlock_paths.h",
+    "macos_auto_unlock_record_io.h",
+  ]
+}
+
+# Privileged drop-box provisioning. Part of install/enrolment, so it rides with
+# the package target.
+source_set("macos_auto_unlock_provision") {
+  sources = [
+    "macos_auto_unlock_provision.cc",
+    "macos_auto_unlock_provision.h",
+  ]
+
+  public = [ "macos_auto_unlock_provision.h" ]
+  public_deps = [ ":macos_auto_unlock_record_io" ]
+}
+
+# Runs UNPRIVILEGED inside the signed agent. Writes binding facts, never a
+# credential.
+source_set("macos_auto_unlock_issuer") {
+  sources = [
+    "macos_auto_unlock_issuer.cc",
+    "macos_auto_unlock_issuer.h",
+  ]
+
+  public = [ "macos_auto_unlock_issuer.h" ]
+  public_deps = [
+    ":macos_auto_unlock_authority",
+    ":macos_auto_unlock_provision",
+    ":macos_auto_unlock_record_io",
+  ]
+}
+
+# The production decision the worker actually calls: enrolment, policy, surface
+# and binding -> mint or skip.
+source_set("macos_auto_unlock_gateway") {
+  sources = [
+    "macos_auto_unlock_gateway.cc",
+    "macos_auto_unlock_gateway.h",
+  ]
+
+  public = [ "macos_auto_unlock_gateway.h" ]
+  public_deps = [
+    ":macos_auto_unlock_controller",
+    ":macos_auto_unlock_issuer",
+  ]
+}
+
+source_set("macos_auto_unlock_plugin") {
+  sources = [
+    "macos_auto_unlock_plugin.cc",
+    "macos_auto_unlock_plugin.h",
+  ]
+
+  public = [ "macos_auto_unlock_plugin.h" ]
+  public_deps = [
+    ":macos_auto_unlock_authority",
+    ":macos_auto_unlock_authorization_context",
+  ]
+}
+
+source_set("macos_auto_unlock_rights") {
+  sources = [
+    "macos_auto_unlock_rights.cc",
+    "macos_auto_unlock_rights.h",
+  ]
+
+  public = [ "macos_auto_unlock_rights.h" ]
+}
+
+source_set("macos_auto_unlock_package") {
+  sources = [
+    "macos_auto_unlock_install.cc",
+    "macos_auto_unlock_install.h",
+    "macos_auto_unlock_package.cc",
+    "macos_auto_unlock_package.h",
+  ]
+
+  public = [
+    "macos_auto_unlock_install.h",
+    "macos_auto_unlock_package.h",
+  ]
+
+  public_deps = [
+    ":macos_auto_unlock_plugin",
+    ":macos_auto_unlock_provision",
+    ":macos_auto_unlock_rights",
+  ]
+}
+
+# The two units that must link Security.framework. Kept apart from the logic so
+# an unsigned build still compiles and still fails closed at identity.
+source_set("macos_auto_unlock_plugin_host") {
+  sources = [
+    "macos_auto_unlock_plugin_host.mm",
+    "macos_auto_unlock_rights_backend.mm",
+  ]
+
+  public_deps = [
+    ":macos_auto_unlock_authority",
+    ":macos_auto_unlock_keychain",
+    ":macos_auto_unlock_record_io",
+    ":macos_auto_unlock_package",
+    ":macos_auto_unlock_plugin",
+    ":macos_auto_unlock_rights",
+  ]
+
+  frameworks = [
+    "Security.framework",
+    "CoreFoundation.framework",
+  ]
+
+  cflags_objcc = [ "-Werror=unguarded-availability-new" ]
+
+}
+
+# Loadable bundle authorizationhost dlopens. Signing and installation are
+# manual gates; this target only produces the layout.
+# Verification-only aggregate. Auto unlock is NOT qualified (5.10-5.12 and 11.9
+# are unchecked, nothing is signed/installed, and there is no production enroller
+# or installer), so it is deliberately unreachable from the shipped roots --
+# `imcodes_remote_desktop_worker`, `imcodes_remote_desktop_launch_agent`,
+# `imcodes_remote_desktop_disclosure` and `imcodes_virtual_display_helper` all
+# reach ZERO auto-unlock targets.
+#
+# This group exists so the pinned toolchain can still compile every auto-unlock
+# TU and link the bundle on demand. Without it the code would lose the only
+# compile coverage that catches pinned-toolchain-specific defects -- that is
+# exactly how the `-fno-exceptions` failure was found, which standalone clang
+# did not reproduce. Build it explicitly; nothing depends on it.
+group("macos_auto_unlock_all") {
+  testonly = false
+  deps = [
+    ":aiDeskAutoUnlock",
+    ":macos_auto_unlock_authority",
+    ":macos_auto_unlock_authorization_context",
+    ":macos_auto_unlock_controller",
+    ":macos_auto_unlock_gateway",
+    ":macos_auto_unlock_issuer",
+    ":macos_auto_unlock_keychain",
+    ":macos_auto_unlock_package",
+    ":macos_auto_unlock_plugin",
+    ":macos_auto_unlock_plugin_host",
+    ":macos_auto_unlock_provision",
+    ":macos_auto_unlock_record_io",
+    ":macos_auto_unlock_rights",
+  ]
+}
+
+loadable_module("aiDeskAutoUnlock") {
+  output_name = "aiDeskAutoUnlock"
+  output_extension = "bundle"
+
+  deps = [ ":macos_auto_unlock_plugin_host" ]
+
+  ldflags = [
+    "-Wl,-exported_symbol,_AuthorizationPluginCreate",
+  ]
+}
+
+source_set("macos_host_command_dispatch") {
+  sources = [
+    "macos_host_command_dispatch.cc",
+    "macos_host_command_dispatch.h",
+  ]
+
+  public = [ "macos_host_command_dispatch.h" ]
+
+  public_deps = [ ":macos_worker_ipc_client" ]
+}
+
+# Bounded local control seam between the separate signed disclosure process
+# and the worker that owns route admission.
+source_set("macos_disclosure_control") {
+  sources = [
+    "macos_disclosure_control.cc",
+    "macos_disclosure_control.h",
+  ]
+
+  public = [ "macos_disclosure_control.h" ]
+}
+
+# Per-user control socket contract. A cleanup command runs as a fresh sibling
+# process with an empty environment, so it must reach the live generation over
+# this seam rather than answering from its own (empty) state.
+source_set("macos_worker_control") {
+  sources = [
+    "macos_worker_control.cc",
+    "macos_worker_control.h",
+  ]
+
+  public = [ "macos_worker_control.h" ]
+}
+
+# Production media sender for the session.
+#
+# Free of libwebrtc headers on purpose: the fail-closed behaviour it provides
+# before upstream produces an encoder callback must be compilable and testable
+# without a pinned checkout.
+source_set("macos_media_sender_binder") {
+  sources = [
+    "macos_media_sender_binder.cc",
+    "macos_media_sender_binder.h",
+  ]
+
+  public = [ "macos_media_sender_binder.h" ]
+  public_deps = [ ":pinned_libwebrtc_h264_sender_bridge" ]
+}
+
+# Signed active-user worker. This is the component that composes the capture,
+# encode, input, clipboard, disclosure and transport adapters into one session.
+rtc_executable("imcodes_remote_desktop_worker") {
+  output_name = "imcodes-remote-desktop-worker"
+  sources = [ "macos_remote_desktop_worker_main.mm" ]
+
+  deps = [
+    # Real caller: SessionSeamAdapter::Prepare mints the one-shot authority.
+    ":macos_disclosure_control",
+    ":macos_media_sender_binder",
+    ":macos_native_command_v1",
+    ":macos_permission_onboarding",
+    ":macos_permission_readiness",
+    ":macos_remote_desktop_session",
+    ":macos_session_monitor",
+    ":macos_transport_session_adapter",
+    ":macos_virtual_display_authority",
+    ":macos_worker_control",
+    ":cg_display_stream_backend",
+    ":macos_host_command_dispatch",
+    ":macos_login_window_capture",
+    ":macos_session_identity",
+    ":macos_virtual_display_daemon_backend",
+    ":macos_worker_ipc_client",
+    ":pinned_libwebrtc_transport_backend",
+  ]
+
+  cflags_objcc = [
+    "-fobjc-arc",
+    "-Werror=unguarded-availability-new",
+  ]
+
+  frameworks = [
+    "ApplicationServices.framework",
+    "CoreGraphics.framework",
+    "Foundation.framework",
+  ]
+}
+
+# Signed local disclosure. A separate code identity on purpose: the on-screen
+# indication of remote access must not be suppressible by tampering with the
+# worker alone.
+# Signed long-lived holder for the single warm virtual display. Separate from
+# the worker on purpose: this process IS the display's lifetime, which is the
+# only teardown primitive macOS 26.x still honours, so a worker crash must not
+# be able to strand a display and a stranded display must not be able to take
+# the worker down with it. Lumen's vd_helper and DeskPad's app lifecycle are the
+# same shape.
+# The SLVirtualDisplay-backed destroy-capable backend (Cx5, audited standalone
+# under macos-slvirtualdisplay-destroy-backend-audit-20260827-cc3-r3-6a641eac).
+# Kept a separate target so the helper depends on the exact endorsed factory
+# rather than on a general availability probe.
+source_set("macos_slvirtual_display_backend") {
+  sources = [
+    "macos_slvirtual_display_backend.cc",
+    "macos_slvirtual_display_backend.h",
+    "macos_slvirtual_display_runtime.mm",
+    # The production hold composition lives here rather than in the helper
+    # executable so a counterexample can link and drive the exact objects
+    # helper_main installs. It carries no main() and no AppKit.
+    "macos_virtual_display_hold_composition.cc",
+    "macos_virtual_display_hold_composition.h",
+  ]
+
+  public = [
+    "macos_slvirtual_display_backend.h",
+    "macos_virtual_display_hold_composition.h",
+  ]
+
+  public_deps = [
+    ":macos_virtual_display_adapter",
+    ":macos_virtual_display_policy",
+  ]
+
+  # ARC is a correctness requirement here, not style: the runtime holds
+  # Objective-C objects and the file enforces __has_feature(objc_arc) at compile
+  # time. The availability flag matches every other macOS target.
+  cflags_objcc = [
+    "-fobjc-arc",
+    "-Werror=unguarded-availability-new",
+  ]
+
+  frameworks = [
+    "CoreGraphics.framework",
+    "Foundation.framework",
+  ]
+}
+
+rtc_executable("imcodes_virtual_display_helper") {
+  output_name = "imcodes-virtual-display-helper"
+  sources = [ "macos_virtual_display_helper_main.mm" ]
+
+  deps = [
+    ":macos_virtual_display_adapter",
+    ":macos_virtual_display_authority",
+    # The helper's pre-create hold gate lives in the policy target so the same
+    # seam is linkable by the counterexample executable.
+    ":macos_virtual_display_policy",
+    # The exact destroy-capable factory the 26.x hold path is authorised against.
+    ":macos_slvirtual_display_backend",
+    ":macos_virtual_display_skylight",
+    ":macos_virtual_display_version_gate",
+  ]
+
+  cflags_objcc = [
+    "-fobjc-arc",
+    "-Werror=unguarded-availability-new",
+  ]
+
+  frameworks = [
+    "CoreGraphics.framework",
+    "Foundation.framework",
+  ]
+}
+
+rtc_executable("imcodes_remote_desktop_disclosure") {
+  output_name = "imcodes-remote-desktop-disclosure"
+  sources = [ "macos_remote_desktop_disclosure_main.mm" ]
+
+  deps = [
+    ":macos_disclosure_control",
+    ":macos_local_disclosure",
+  ]
+
+  cflags_objcc = [
+    "-fobjc-arc",
+    "-Werror=unguarded-availability-new",
+  ]
+
+  frameworks = [
+    "AppKit.framework",
+    "Foundation.framework",
+  ]
+}

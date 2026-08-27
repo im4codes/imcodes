@@ -13,14 +13,16 @@ import {
 import { applyWindowsAclCommands, windowsComputerUseHelperAclCommands } from './installer.js';
 import {
   authorizeMacosComputerUseSocket,
-  launchMacosUserSessionHelper,
   prepareMacosComputerUseRuntime,
-  resolveMacosConsoleUser,
-  runMacosComputerUseDoctor,
   MACOS_COMPUTER_USE_RUNTIME_ROOT,
   type MacosComputerUseRuntime,
   type MacosConsoleUser,
 } from './macos-computer-use.js';
+import {
+  launchMacosUserSessionCommand,
+  resolveMacosUserSession,
+  runMacosUserSessionCommand,
+} from './user-session-launcher.js';
 import {
   controlledNodeArtifactTarget,
   downloadControlledNodeComputerUseHelper,
@@ -253,11 +255,22 @@ export class ComputerUseIpcHost {
 
   private async launchMacosHelper(tool: ComputerUseToolName): Promise<void> {
     const execPath = this.options.execPath ?? process.execPath;
-    const resolveConsoleUser = this.options.resolveMacosConsoleUser ?? resolveMacosConsoleUser;
+    const resolveConsoleUser = this.options.resolveMacosConsoleUser ?? resolveMacosUserSession;
     const authorizeSocket = this.options.authorizeMacosComputerUseSocket ?? authorizeMacosComputerUseSocket;
     const prepareRuntime = this.options.prepareMacosComputerUseRuntime ?? prepareMacosComputerUseRuntime;
-    const runDoctor = this.options.runMacosComputerUseDoctor ?? runMacosComputerUseDoctor;
-    const launchHelper = this.options.launchMacosUserSessionHelper ?? launchMacosUserSessionHelper;
+    const runDoctor = this.options.runMacosComputerUseDoctor ?? ((user, runtime) => (
+      runMacosUserSessionCommand(user, {
+        executable: runtime.openComputerUseExecutable,
+        args: ['doctor'],
+      }, 10_000)
+    ));
+    const launchHelper = this.options.launchMacosUserSessionHelper ?? ((user, runtime, pipe) => {
+      launchMacosUserSessionCommand(user, {
+        executable: runtime.helperExecutable,
+        args: ['--computer-use-helper', '--pipe', pipe],
+        environment: [['IMCODES_COMPUTER_USE_EXE', runtime.openComputerUseExecutable]],
+      });
+    });
     const user = await resolveConsoleUser();
     await authorizeSocket(this.path, user);
     const archiveName = controlledNodeComputerUseHelperFilename(CONTROLLED_NODE_OS_MAC);

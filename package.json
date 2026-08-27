@@ -51,6 +51,7 @@
     "prepare": "husky",
     "bench:memory": "tsx bench/memory-pipeline.bench.ts",
     "build:node-exe": "node scripts/build-node-exe.mjs",
+    "package:macos-remote-desktop": "node --import tsx scripts/macos-remote-desktop-release-guard.ts package",
     "check:node-exe-deps": "node scripts/check-node-exe-deps.mjs"
   },
   "dependencies": {

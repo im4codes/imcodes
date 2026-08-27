@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- Loaded by authorizationhost, not by the product. The identifier here is
+       the SAME string the System-keychain ACL designated requirement must name;
+       drift between the two is a fail-closed condition, not a warning. -->
+  <key>CFBundleIdentifier</key>
+  <string>to.aidesk.remote-desktop.autounlock</string>
+  <key>CFBundleName</key>
+  <string>aiDeskAutoUnlock</string>
+  <key>CFBundleExecutable</key>
+  <string>aiDeskAutoUnlock</string>
+  <key>CFBundlePackageType</key>
+  <string>BNDL</string>
+  <key>CFBundleInfoDictionaryVersion</key>
+  <string>6.0</string>
+  <key>CFBundleVersion</key>
+  <string>1</string>
+  <key>CFBundleShortVersionString</key>
+  <string>1.0</string>
+  <key>LSMinimumSystemVersion</key>
+  <string>12.3</string>
+  <!-- Mechanisms this bundle vends. Apple's verifier is NOT listed here; it is
+       inserted between these two in the authorization right definition. -->
+  <key>AiDeskAutoUnlockMechanisms</key>
+  <array>
+    <string>submit</string>
+    <string>settle</string>
+  </array>
+</dict>
+</plist>

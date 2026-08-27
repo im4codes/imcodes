@@ -3,7 +3,11 @@ import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
 import { DAEMON_MSG } from '../../shared/daemon-events.js';
 import { DAEMON_UPGRADE_BLOCK_REASON } from '../../shared/daemon-upgrade.js';
 import { DAEMON_VERSION } from '../util/version.js';
-import { AuthenticatedWebSocketClient, type AuthenticatedWebSocketFactory } from '../transport/authenticated-websocket.js';
+import {
+  AuthenticatedWebSocketClient,
+  type AuthenticatedWebSocketFactory,
+  type AuthenticatedWebSocketOptions,
+} from '../transport/authenticated-websocket.js';
 import { MachineExecWorker } from './machine-exec-worker.js';
 import { ComputerUseWorker } from './computer-use-worker.js';
 import { startControlledNodeSelfUpgrade } from './self-upgrade.js';
@@ -46,8 +50,20 @@ import {
   isRemoteDesktopMessageType,
   validateRemoteDesktopDaemonCommand,
   type RemoteDesktopDaemonCommand,
+  type RemoteDesktopDaemonMessage,
 } from '../../shared/remote-desktop.js';
-import { RemoteDesktopWorkerHost } from './remote-desktop-worker-host.js';
+import {
+  RemoteDesktopWorkerHost,
+  type RemoteDesktopWorkerHostOptions,
+} from './remote-desktop-worker-host.js';
+import {
+  MacosRemoteDesktopWorkerHost,
+  type MacosRemoteDesktopWorkerHostOptions,
+} from './macos-remote-desktop-worker-host.js';
+import {
+  REMOTE_DESKTOP_SESSION_PROFILE_CAPABILITIES,
+  resolveRemoteDesktopSessionProfile,
+} from '../../shared/remote-desktop-platform.js';
 import { dispatchRemoteDesktopCommand } from './remote-desktop-dispatch.js';
 import { isRemoteDesktopFeatureEnabled } from '../../shared/remote-desktop-feature.js';
 import {
@@ -108,31 +124,124 @@ export function isControlledNodeAuthAck(message: Record<string, unknown>): boole
   return message.type === CONTROLLED_NODE_AUTH_ACK_TYPE;
 }
 
+export interface ControlledNodeRemoteDesktopWorker {
+  available(): boolean;
+  sessionCapabilities?(): readonly string[];
+  adapterCapabilities?(): readonly RemoteDesktopAdapterCapability[];
+  sendConsentFrame?(frame: Record<string, unknown>): Promise<boolean> | boolean;
+  sendPrivacyFrame?(frame: Record<string, unknown>): Promise<boolean> | boolean;
+  onConsentFrame?(handler: (frame: WorkerConsentInboundFrame) => void): () => void;
+  onPrivacyFrame?(handler: (frame: WorkerPrivacyInboundFrame) => void): () => void;
+  supportsDefaultShieldedRoute?(): boolean;
+  handle(message: RemoteDesktopDaemonCommand): Promise<boolean>;
+  applyAutoUnlockSecret?(secret: string | null): Promise<boolean>;
+  autoUnlockConfigured?(): Promise<boolean>;
+  /** Retire connection-scoped routes while keeping a verified sidecar warm. */
+  onDaemonDisconnected?(): void;
+  close(): void;
+}
+
+export interface PlatformRemoteDesktopWorkerSelection {
+  worker: ControlledNodeRemoteDesktopWorker;
+  /** Only macOS needs an authenticated GUI-sidecar before capability sampling. */
+  startup?: () => Promise<void>;
+}
+
+class UnavailableRemoteDesktopWorkerHost implements ControlledNodeRemoteDesktopWorker {
+  available(): boolean { return false; }
+  sessionCapabilities(): readonly string[] { return []; }
+  adapterCapabilities(): readonly RemoteDesktopAdapterCapability[] { return []; }
+  async handle(): Promise<boolean> { return false; }
+  close(): void {}
+}
+
+/**
+ * Platform-discriminated production boundary. macOS is selectable only when
+ * the caller supplies native peer-identity/readiness dependencies; without
+ * those non-inferable proofs the daemon remains unavailable rather than
+ * falling back to the Windows host.
+ */
+export function createPlatformRemoteDesktopWorkerHost(input: {
+  platform: NodeJS.Platform;
+  arch: string;
+  onMessage(message: RemoteDesktopDaemonMessage): void;
+  windows?: RemoteDesktopWorkerHostOptions;
+  macos?: MacosRemoteDesktopWorkerHostOptions;
+}): PlatformRemoteDesktopWorkerSelection {
+  if (input.platform === 'win32') {
+    return { worker: new RemoteDesktopWorkerHost(input.onMessage, input.windows) };
+  }
+  if (input.platform === 'darwin'
+    && (input.arch === 'arm64' || input.arch === 'x64')
+    && input.macos) {
+    const worker = new MacosRemoteDesktopWorkerHost(input.onMessage, {
+      ...input.macos,
+      runtime: { platform: input.platform, arch: input.arch },
+    });
+    return { worker, startup: () => worker.start() };
+  }
+  return { worker: new UnavailableRemoteDesktopWorkerHost() };
+}
+
+class StartupGatedAuthenticatedWebSocketClient extends AuthenticatedWebSocketClient {
+  private startRequested = false;
+  private cancelled = false;
+
+  constructor(
+    options: AuthenticatedWebSocketOptions,
+    private readonly prepare: () => Promise<void>,
+    private readonly onCancelled: () => void,
+  ) {
+    super(options);
+  }
+
+  override start(): void {
+    if (this.startRequested || this.cancelled) return;
+    this.startRequested = true;
+    const connect = (): void => {
+      if (!this.cancelled) super.start();
+    };
+    void this.prepare().then(connect, connect);
+  }
+
+  override stop(): void {
+    if (this.cancelled) return;
+    this.cancelled = true;
+    this.onCancelled();
+    super.stop();
+  }
+}
+
+class FinalizingAuthenticatedWebSocketClient extends AuthenticatedWebSocketClient {
+  private finalized = false;
+
+  constructor(
+    options: AuthenticatedWebSocketOptions,
+    private readonly finalize: () => void,
+  ) {
+    super(options);
+  }
+
+  override stop(): void {
+    if (!this.finalized) {
+      this.finalized = true;
+      this.finalize();
+    }
+    super.stop();
+  }
+}
+
 export interface ControlledNodeRuntimeOptions {
   onAuthenticated?: () => void | Promise<void>;
   onAuthenticationError?: (error: unknown) => void;
   /** Called for every authenticated server heartbeat acknowledgement. */
   onHeartbeatAck?: () => void | Promise<void>;
-  remoteDesktopWorker?: {
-    available(): boolean;
-    /** Explicit adapter support; absence means no decision-11 capability. */
-    adapterCapabilities?(): readonly RemoteDesktopAdapterCapability[];
-    /**
-     * Consent frames share the worker pipe but not the session authentication.
-     * Optional so an injected double may omit them; a worker that cannot carry
-     * them simply cannot ask, which fails closed at the provider.
-     */
-    sendConsentFrame?(frame: Record<string, unknown>): Promise<boolean> | boolean;
-    sendPrivacyFrame?(frame: Record<string, unknown>): Promise<boolean> | boolean;
-    onConsentFrame?(handler: (frame: WorkerConsentInboundFrame) => void): () => void;
-    onPrivacyFrame?(handler: (frame: WorkerPrivacyInboundFrame) => void): () => void;
-    /** Stronger than capture privacy; never infer it from that base marker. */
-    supportsDefaultShieldedRoute?(): boolean;
-    handle(message: RemoteDesktopDaemonCommand): Promise<boolean>;
-    applyAutoUnlockSecret(secret: string | null): Promise<boolean>;
-    autoUnlockConfigured(): Promise<boolean>;
-    close(): void;
-  };
+  remoteDesktopWorker?: ControlledNodeRemoteDesktopWorker;
+  /**
+   * Native macOS production dependencies. Omission is deliberately unavailable:
+   * uid/code-signing/TCC/disclosure evidence cannot be inferred in TypeScript.
+  */
+  macosRemoteDesktopWorker?: MacosRemoteDesktopWorkerHostOptions;
   /**
    * Separately verified account-shell sidecar. Absence keeps the signed-shell
    * capability unadvertised even when the capture Worker is available.
@@ -168,91 +277,142 @@ export function createControlledNodeRuntime(
   const worker = new MachineExecWorker();
   const computerUseWorker = new ComputerUseWorker(credential);
   let client!: AuthenticatedWebSocketClient;
-  const remoteDesktopWorker = options.remoteDesktopWorker ?? new RemoteDesktopWorkerHost((message) => {
-    client.send(message);
-  }, {
-    onWorkerCrash: (crash) => {
+  let onMacosRemoteDesktopProfileChanged = (): void => undefined;
+  const platform = options.platform ?? process.platform;
+  const arch = options.arch ?? process.arch;
+  const platformWorker = options.remoteDesktopWorker
+    ? { worker: options.remoteDesktopWorker }
+    : createPlatformRemoteDesktopWorkerHost({
+      platform,
+      arch,
+      onMessage: (message) => { client.send(message); },
+      macos: options.macosRemoteDesktopWorker ? {
+        ...options.macosRemoteDesktopWorker,
+        onProfileChanged: () => {
+          options.macosRemoteDesktopWorker?.onProfileChanged?.();
+          onMacosRemoteDesktopProfileChanged();
+        },
+      } : undefined,
+      windows: {
+        platform,
+        onWorkerCrash: (crash) => {
       // A native fault would otherwise reach the browser as a bare
       // `worker_failed`, indistinguishable from an ordinary disconnect.
-      incrementCounter('remote_desktop.worker_crash', {
-        exception: `0x${crash.exceptionCode.toString(16)}`,
-        module: crash.module,
-      });
-      logger.warn(
-        {
-          pid: crash.pid,
-          exceptionCode: `0x${crash.exceptionCode.toString(16)}`,
-          module: crash.module,
-          moduleOffset: crash.moduleOffset,
+          incrementCounter('remote_desktop.worker_crash', {
+            exception: `0x${crash.exceptionCode.toString(16)}`,
+            module: crash.module,
+          });
+          logger.warn({
+            pid: crash.pid,
+            exceptionCode: `0x${crash.exceptionCode.toString(16)}`,
+            module: crash.module,
+            moduleOffset: crash.moduleOffset,
+          }, 'remote desktop worker crashed');
         },
-        'remote desktop worker crashed',
-      );
-    },
-    onPrepareTimeout: () => {
-      // No session/capability/desktop detail is logged. This exists to
-      // distinguish a native pre-offer wedge from ordinary ICE negotiation
-      // failures while the host recycles the authenticated worker.
-      incrementCounter('remote_desktop.prepare_timeout');
-      logger.warn('remote desktop worker did not complete prepare; recycling');
-    },
-    onOfferTimeout: () => {
-      incrementCounter('remote_desktop.offer_timeout');
-      logger.warn('remote desktop worker did not answer offer; recycling');
-    },
-  });
+        onPrepareTimeout: () => {
+          // No session/capability/desktop detail is logged. This exists to
+          // distinguish a native pre-offer wedge from ordinary ICE negotiation
+          // failures while the host recycles the authenticated worker.
+          incrementCounter('remote_desktop.prepare_timeout');
+          logger.warn('remote desktop worker did not complete prepare; recycling');
+        },
+        onOfferTimeout: () => {
+          incrementCounter('remote_desktop.offer_timeout');
+          logger.warn('remote desktop worker did not answer offer; recycling');
+        },
+      },
+    });
+  const remoteDesktopWorker = platformWorker.worker;
+  const remoteDesktopWorkerStartup = platformWorker.startup;
   const remoteDesktopFeatureEnabled = isRemoteDesktopFeatureEnabled(
     process.env.IMCODES_REMOTE_DESKTOP_ENABLED,
     process.env.NODE_ENV,
   );
-  const remoteDesktopWorkerAvailable = remoteDesktopWorker.available();
-  const remoteDesktopEnabled = remoteDesktopWorkerAvailable && remoteDesktopFeatureEnabled;
-  let declaredAdapterCapabilities: readonly RemoteDesktopAdapterCapability[] = [];
-  try {
-    declaredAdapterCapabilities = remoteDesktopWorker.adapterCapabilities?.() ?? [];
-  } catch {
-    // A broken feature probe cannot widen the node's advertisement.
-  }
-  const workerAdapterCapabilities = remoteDesktopEnabled
-    ? [...new Set(declaredAdapterCapabilities)].filter((capability) => {
-      if (!(REMOTE_DESKTOP_ADAPTER_CAPABILITIES as readonly string[]).includes(capability)) return false;
-      if (capability === REMOTE_DESKTOP_LOCAL_CONSENT_CAPABILITY) {
-        return typeof remoteDesktopWorker.sendConsentFrame === 'function'
-          && typeof remoteDesktopWorker.onConsentFrame === 'function';
-      }
-      if (capability === REMOTE_DESKTOP_CAPTURE_PRIVACY_CAPABILITY) {
-        return typeof remoteDesktopWorker.sendPrivacyFrame === 'function'
-          && typeof remoteDesktopWorker.onPrivacyFrame === 'function';
-      }
-      return true;
-    })
-    : [];
+  let remoteDesktopWorkerAvailable = false;
+  let workerAdapterCapabilities: readonly RemoteDesktopAdapterCapability[] = [];
+  let workerSessionCapabilities: readonly string[] = [];
+  let remoteDesktopEnabled = false;
+  let remoteDesktopAutoUnlockAvailable = false;
   let defaultShieldedRouteAvailable = false;
-  try {
-    defaultShieldedRouteAvailable = remoteDesktopEnabled
-      && workerAdapterCapabilities.includes(REMOTE_DESKTOP_CAPTURE_PRIVACY_CAPABILITY)
-      && typeof remoteDesktopWorker.sendPrivacyFrame === 'function'
-      && typeof remoteDesktopWorker.onPrivacyFrame === 'function'
-      && (remoteDesktopWorker.supportsDefaultShieldedRoute?.() ?? false);
-  } catch {
-    // A broken stronger-capability probe may only disable transparent recovery.
-  }
   let signedShellAvailable = false;
-  try {
-    signedShellAvailable = remoteDesktopEnabled
-      && workerAdapterCapabilities.includes(REMOTE_DESKTOP_CAPTURE_PRIVACY_CAPABILITY)
-      && defaultShieldedRouteAvailable
-      && (options.remoteDesktopSignedShell?.available() ?? false);
-  } catch {
-    // Artifact/signature probes may only remove the local management surface.
-  }
-  const advertisedAdapterCapabilities = [
-    ...workerAdapterCapabilities.filter((capability) => (
-      capability !== REMOTE_DESKTOP_SIGNED_SHELL_CAPABILITY
-    )),
-    ...(signedShellAvailable ? [REMOTE_DESKTOP_SIGNED_SHELL_CAPABILITY] : []),
-  ];
-  const missingRemoteDesktopWorkerCanRepair = (options.platform ?? process.platform) === 'win32'
-    && (options.arch ?? process.arch) === 'x64'
+  let advertisedAdapterCapabilities: readonly RemoteDesktopAdapterCapability[] = [];
+
+  const refreshRemoteDesktopCapabilityState = (): void => {
+    try {
+      remoteDesktopWorkerAvailable = remoteDesktopWorker.available();
+    } catch {
+      remoteDesktopWorkerAvailable = false;
+    }
+    let declaredAdapterCapabilities: readonly RemoteDesktopAdapterCapability[] = [];
+    try {
+      declaredAdapterCapabilities = remoteDesktopWorker.adapterCapabilities?.() ?? [];
+    } catch {
+      // A broken feature probe cannot widen the node's advertisement.
+    }
+    workerAdapterCapabilities = remoteDesktopWorkerAvailable && remoteDesktopFeatureEnabled
+      ? [...new Set(declaredAdapterCapabilities)].filter((capability) => {
+        if (!(REMOTE_DESKTOP_ADAPTER_CAPABILITIES as readonly string[]).includes(capability)) return false;
+        if (capability === REMOTE_DESKTOP_LOCAL_CONSENT_CAPABILITY) {
+          return typeof remoteDesktopWorker.sendConsentFrame === 'function'
+            && typeof remoteDesktopWorker.onConsentFrame === 'function';
+        }
+        if (capability === REMOTE_DESKTOP_CAPTURE_PRIVACY_CAPABILITY) {
+          return typeof remoteDesktopWorker.sendPrivacyFrame === 'function'
+            && typeof remoteDesktopWorker.onPrivacyFrame === 'function';
+        }
+        return true;
+      })
+      : [];
+    let declaredSessionCapabilities: readonly string[] = [REMOTE_DESKTOP_CAPABILITY];
+    try {
+      declaredSessionCapabilities = remoteDesktopWorker.sessionCapabilities?.()
+        ?? [REMOTE_DESKTOP_CAPABILITY];
+    } catch {
+      declaredSessionCapabilities = [];
+    }
+    workerSessionCapabilities = remoteDesktopWorkerAvailable && remoteDesktopFeatureEnabled
+      ? [...new Set(declaredSessionCapabilities)].filter((capability) => (
+        capability === REMOTE_DESKTOP_CAPABILITY
+        || (REMOTE_DESKTOP_SESSION_PROFILE_CAPABILITIES as readonly string[]).includes(capability)
+      ))
+      : [];
+    const profile = resolveRemoteDesktopSessionProfile([
+      ...workerSessionCapabilities,
+      ...workerAdapterCapabilities,
+    ]);
+    remoteDesktopEnabled = remoteDesktopWorkerAvailable
+      && remoteDesktopFeatureEnabled
+      && profile !== null;
+    const enabledAdapters = remoteDesktopEnabled ? workerAdapterCapabilities : [];
+    remoteDesktopAutoUnlockAvailable = remoteDesktopEnabled
+      && profile?.platform === 'windows';
+    try {
+      defaultShieldedRouteAvailable = remoteDesktopEnabled
+        && enabledAdapters.includes(REMOTE_DESKTOP_CAPTURE_PRIVACY_CAPABILITY)
+        && typeof remoteDesktopWorker.sendPrivacyFrame === 'function'
+        && typeof remoteDesktopWorker.onPrivacyFrame === 'function'
+        && (remoteDesktopWorker.supportsDefaultShieldedRoute?.() ?? false);
+    } catch {
+      defaultShieldedRouteAvailable = false;
+    }
+    try {
+      signedShellAvailable = remoteDesktopEnabled
+        && enabledAdapters.includes(REMOTE_DESKTOP_CAPTURE_PRIVACY_CAPABILITY)
+        && defaultShieldedRouteAvailable
+        && (options.remoteDesktopSignedShell?.available() ?? false);
+    } catch {
+      signedShellAvailable = false;
+    }
+    advertisedAdapterCapabilities = [
+      ...enabledAdapters.filter((capability) => (
+        capability !== REMOTE_DESKTOP_SIGNED_SHELL_CAPABILITY
+      )),
+      ...(signedShellAvailable ? [REMOTE_DESKTOP_SIGNED_SHELL_CAPABILITY] : []),
+    ];
+  };
+  refreshRemoteDesktopCapabilityState();
+  const missingRemoteDesktopWorkerCanRepair = platform === 'win32'
+    && arch === 'x64'
     && remoteDesktopFeatureEnabled
     && !remoteDesktopWorkerAvailable;
   let upgradeInFlight = false;
@@ -306,8 +466,10 @@ export function createControlledNodeRuntime(
       logger.warn({ reason }, 'remote desktop privacy recovery required');
     },
   });
-  const signedShellController = signedShellAvailable && options.remoteDesktopSignedShell
-    ? new RemoteDesktopSignedShellController({
+  let signedShellController: RemoteDesktopSignedShellController | null = null;
+  const ensureSignedShellController = (): void => {
+    if (signedShellController || !signedShellAvailable || !options.remoteDesktopSignedShell) return;
+    signedShellController = new RemoteDesktopSignedShellController({
       executablePath: options.remoteDesktopSignedShell.executablePath,
       serverOrigin: credential.serverUrl,
       launcher: options.remoteDesktopSignedShell.launcher,
@@ -329,8 +491,9 @@ export function createControlledNodeRuntime(
         });
         if (recovery.ok) client.send(recovery.value as unknown as Record<string, unknown>);
       },
-    })
-    : null;
+    });
+  };
+  ensureSignedShellController();
 
   let remoteDesktopWorkerRepairEligibleAt: number | null = null;
   let remoteDesktopWorkerRepairNextAttemptAt = 0;
@@ -412,43 +575,54 @@ export function createControlledNodeRuntime(
       return normalized.ok ? client.send(normalized.value) : false;
     },
   };
-  client = new AuthenticatedWebSocketClient({
+  const authFrame: Record<string, unknown> & { capabilities: string[] } = {
+    type: 'auth',
+    serverId: credential.serverId,
+    token: credential.token,
+    daemonVersion: DAEMON_VERSION,
+    capabilities: [],
+  };
+  const refreshAuthCapabilities = (): void => {
+    authFrame.capabilities = [
+      FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY,
+      FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY,
+      FILE_TRANSFER_PATH_HANDLE_CAPABILITY,
+      FILE_TRANSFER_DIRECTORY_CAPABILITY,
+      MACHINE_DIRECT_FILE_TRANSFER_CAPABILITY,
+      MACHINE_DIRECT_FILE_FETCH_CAPABILITY,
+      CONTROLLED_NODE_SAFE_SELF_UPGRADE_CAPABILITY,
+      ...(remoteDesktopEnabled
+        ? [
+          ...workerSessionCapabilities,
+          ...(remoteDesktopAutoUnlockAvailable ? [CONTROLLED_NODE_AUTO_UNLOCK_CAPABILITY] : []),
+        ]
+        : []),
+      ...(missingRemoteDesktopWorkerCanRepair ? [REMOTE_DESKTOP_INSTALLABLE_CAPABILITY] : []),
+      ...advertisedAdapterCapabilities,
+      ...(defaultShieldedRouteAvailable
+        ? [REMOTE_DESKTOP_DEFAULT_SHIELDED_ROUTE_CAPABILITY]
+        : []),
+    ];
+  };
+  onMacosRemoteDesktopProfileChanged = () => {
+    refreshRemoteDesktopCapabilityState();
+    refreshAuthCapabilities();
+  };
+  refreshAuthCapabilities();
+  const clientOptions: AuthenticatedWebSocketOptions = {
     url: controlledNodeWebSocketUrl(credential.serverUrl, credential.serverId),
-    auth: {
-      type: 'auth',
-      serverId: credential.serverId,
-      token: credential.token,
-      daemonVersion: DAEMON_VERSION,
-      capabilities: [
-        FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY,
-        FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY,
-        FILE_TRANSFER_PATH_HANDLE_CAPABILITY,
-        FILE_TRANSFER_DIRECTORY_CAPABILITY,
-        MACHINE_DIRECT_FILE_TRANSFER_CAPABILITY,
-        MACHINE_DIRECT_FILE_FETCH_CAPABILITY,
-        CONTROLLED_NODE_SAFE_SELF_UPGRADE_CAPABILITY,
-        // Auto unlock rides on the same worker: without it there is nothing
-        // that can hold a secret or type at the sign-in desktop, so a node
-        // that cannot run the worker must not offer the option at all.
-        ...(remoteDesktopEnabled
-          ? [REMOTE_DESKTOP_CAPABILITY, CONTROLLED_NODE_AUTO_UNLOCK_CAPABILITY]
-          : []),
-        ...(missingRemoteDesktopWorkerCanRepair
-          ? [REMOTE_DESKTOP_INSTALLABLE_CAPABILITY]
-          : []),
-        // Every decision-11 adapter feature is explicitly declared by the
-        // verified implementation. The base capture capability never implies
-        // consent, shell, privacy, input, lock-screen, brand or disclosure.
-        ...advertisedAdapterCapabilities,
-        ...(defaultShieldedRouteAvailable
-          ? [REMOTE_DESKTOP_DEFAULT_SHIELDED_ROUTE_CAPABILITY]
-          : []),
-      ],
-    },
+    auth: authFrame,
     heartbeatMessage: { type: 'heartbeat', daemonVersion: DAEMON_VERSION },
     heartbeatMs: 5_000,
     silenceTimeoutMs: 30_000,
-    createSocket,
+    createSocket: (url) => {
+      // Auth is connection-generation scoped. Re-sample immediately before
+      // each socket so a readiness downgrade cannot reconnect as stale Control.
+      refreshRemoteDesktopCapabilityState();
+      ensureSignedShellController();
+      refreshAuthCapabilities();
+      return createSocket(url);
+    },
     onOpen: () => {
       client.send({ type: 'heartbeat', daemonVersion: DAEMON_VERSION });
     },
@@ -456,7 +630,11 @@ export function createControlledNodeRuntime(
       worker.abortAll();
       // Remote desktop authority is connection-generation-bound. Unlike the
       // warm Computer Use helper, every peer must die on Server-link loss.
-      remoteDesktopWorker.close();
+      if (remoteDesktopWorker.onDaemonDisconnected) {
+        remoteDesktopWorker.onDaemonDisconnected();
+      } else {
+        remoteDesktopWorker.close();
+      }
       // Every open prompt dies with the authority it would have been granted
       // under; a reconnect mints a new generation.
       privacyBarrier.onDaemonDisconnected();
@@ -722,10 +900,12 @@ export function createControlledNodeRuntime(
         let ok = false;
         let error: ControlledNodeAutoUnlockError | undefined;
         try {
-          if (!remoteDesktopWorker.available()) {
+          if (!remoteDesktopAutoUnlockAvailable
+            || !remoteDesktopWorker.available()
+            || typeof remoteDesktopWorker.applyAutoUnlockSecret !== 'function') {
             error = CONTROLLED_NODE_AUTO_UNLOCK_ERROR.UNSUPPORTED_PLATFORM;
           } else {
-            ok = await remoteDesktopWorker.applyAutoUnlockSecret(
+            ok = await remoteDesktopWorker.applyAutoUnlockSecret!(
               command.action === CONTROLLED_NODE_AUTO_UNLOCK_ACTION.SET
                 ? command.secret ?? ''
                 : null,
@@ -737,7 +917,7 @@ export function createControlledNodeRuntime(
         }
         const configured = ok
           ? command.action === CONTROLLED_NODE_AUTO_UNLOCK_ACTION.SET
-          : await remoteDesktopWorker.autoUnlockConfigured().catch(() => false);
+          : await remoteDesktopWorker.autoUnlockConfigured?.().catch(() => false) ?? false;
         client.send({
           type: DAEMON_MSG.CONTROLLED_NODE_AUTO_UNLOCK_RESULT,
           requestId: command.requestId,
@@ -755,6 +935,25 @@ export function createControlledNodeRuntime(
       });
       if (reply) client.send({ type: DAEMON_MSG.MACHINE_EXEC_RESULT, ...reply });
     },
-  });
+  };
+  if (remoteDesktopWorkerStartup) {
+    client = new StartupGatedAuthenticatedWebSocketClient(clientOptions, async () => {
+      try {
+        await remoteDesktopWorkerStartup();
+      } catch (error) {
+        reportAuthenticationError(error);
+      }
+      refreshRemoteDesktopCapabilityState();
+      ensureSignedShellController();
+      refreshAuthCapabilities();
+    }, () => remoteDesktopWorker.close());
+  } else if (remoteDesktopWorker.onDaemonDisconnected) {
+    client = new FinalizingAuthenticatedWebSocketClient(
+      clientOptions,
+      () => remoteDesktopWorker.close(),
+    );
+  } else {
+    client = new AuthenticatedWebSocketClient(clientOptions);
+  }
   return client;
 }

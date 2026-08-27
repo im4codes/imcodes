@@ -156,6 +156,14 @@ export function resolveRemoteDesktopSessionProfile(
 
   if (!hasCommon) {
     if (!hasLegacy) return null;
+    // A rollback-era legacy worker may carry unknown extensions (ingress drops
+    // them), but it must not smuggle registered v3 platform/capture metadata
+    // into a hard-coded Windows profile without the v3 session marker.
+    if (PLATFORM_CAPABILITIES.some((capability) => known.has(capability))
+      || CAPTURE_CAPABILITIES.some((capability) => known.has(capability))
+      || known.has(REMOTE_DESKTOP_ENCODER_CAPABILITY.H264)
+      || known.has(REMOTE_DESKTOP_EXPLICIT_CLIPBOARD_CAPABILITY)
+      || known.has(REMOTE_DESKTOP_DISPLAY_CONTROL_CAPABILITY)) return null;
     return {
       kind: 'legacy_windows_v2',
       capability: REMOTE_DESKTOP_CAPABILITY,
@@ -190,9 +198,10 @@ export function resolveRemoteDesktopSessionProfile(
   const capturePrivacy = known.has(REMOTE_DESKTOP_CAPTURE_PRIVACY_CAPABILITY);
   const lockScreen = known.has(REMOTE_DESKTOP_LOCK_SCREEN_CAPABILITY);
   const displayControl = known.has(REMOTE_DESKTOP_DISPLAY_CONTROL_CAPABILITY);
-  // The first macOS adapter deliberately supports only an unlocked active
-  // user session. Refuse capability combinations that would widen it by typo.
-  if (platform === 'macos' && (capturePrivacy || lockScreen || displayControl
+  // macOS lock-screen and display-control support are explicit adapter
+  // advertisements and therefore safe only when their local probes succeed.
+  // Capture privacy and signed shell remain unsupported and fail closed.
+  if (platform === 'macos' && (capturePrivacy
     || known.has(REMOTE_DESKTOP_SIGNED_SHELL_CAPABILITY))) return null;
 
   return {

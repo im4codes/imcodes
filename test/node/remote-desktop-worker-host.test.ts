@@ -124,6 +124,35 @@ describe('remote desktop worker artifact and IPC host', () => {
     expect(host.supportsDefaultShieldedRoute()).toBe(true);
   });
 
+  it('close unconditionally retires connection and privacy state without a live socket', () => {
+    const host = new RemoteDesktopWorkerHost(() => {}, {
+      ...trustedHostOptions,
+      platform: 'win32',
+      artifact,
+    });
+    const core = Reflect.get(host, 'core') as {
+      beginConnection(): number;
+      isCurrentConnection(generation: number): boolean;
+      readonly isPrivacyEpochArmed: boolean;
+      markPrivacyShielded(): void;
+      pushInbound(chunk: string, generation: number): { events: unknown[] };
+    };
+    const generation = core.beginConnection();
+    core.pushInbound('{\"partial\":', generation);
+    core.markPrivacyShielded();
+    expect(core.isCurrentConnection(generation)).toBe(true);
+    expect(core.isPrivacyEpochArmed).toBe(true);
+
+    // No socket was ever installed, reproducing shutdown after a failed or
+    // generation-stale connection. The next idle PREPARE must not inherit the
+    // old privacy epoch and suppress worker recovery.
+    host.close();
+
+    expect(core.isCurrentConnection(generation)).toBe(false);
+    expect(core.isPrivacyEpochArmed).toBe(false);
+    expect(core.pushInbound('true}\n', generation).events).toEqual([]);
+  });
+
   it('launches a prompt-only worker before PREPARE and replaces it before session authority', async () => {
     const temp = await mkdtemp(join(tmpdir(), 'imcodes-rd-consent-only-'));
     cleanup.push(() => rm(temp, { recursive: true, force: true }));
@@ -2070,5 +2099,94 @@ describe('remote desktop worker artifact and IPC host', () => {
       }),
     ]));
     expect(launchVirtualDisplay).toHaveBeenCalledOnce();
+  });
+
+  it('keeps the Windows launch and authenticated envelope contract after core extraction', async () => {
+    const temp = await mkdtemp(join(tmpdir(), 'imcodes-rd-host-core-equivalence-'));
+    cleanup.push(() => rm(temp, { recursive: true, force: true }));
+    const pipePath = join(temp, 'worker.sock');
+    const workerCommands: Record<string, unknown>[] = [];
+    const serverMessages: RemoteDesktopDaemonMessage[] = [];
+    let helper: net.Socket | null = null;
+    let workerBuffer = '';
+    const launch = vi.fn((_executable: string, argsLine: string) => {
+      const args = quotedArgs(argsLine);
+      helper = net.createConnection(pipePath, () => {
+        helper!.write(`${JSON.stringify({
+          type: REMOTE_DESKTOP_WORKER_HELLO_TYPE,
+          ipcVersion: REMOTE_DESKTOP_WORKER_IPC_VERSION,
+          nonce: args[3],
+          pid: 147,
+        })}\n`);
+      });
+      helper.setEncoding('utf8');
+      helper.on('data', (chunk) => {
+        workerBuffer += String(chunk);
+        const lines = workerBuffer.split('\n');
+        workerBuffer = lines.pop() ?? '';
+        for (const line of lines) {
+          if (line) workerCommands.push(JSON.parse(line) as Record<string, unknown>);
+        }
+      });
+    });
+    const host = new RemoteDesktopWorkerHost((message) => serverMessages.push(message), {
+      ...trustedHostOptions,
+      platform: 'win32',
+      artifact,
+      pipePath,
+      allowPipeClients: () => {},
+      launch,
+    });
+    cleanup.push(() => { host.close(); helper?.destroy(); });
+    const prepare = {
+      type: REMOTE_DESKTOP_MSG.PREPARE,
+      requestId,
+      sessionId,
+      capability,
+      expiresAt: Date.now() + 60_000,
+      leaseExpiresAt: Date.now() + 15_000,
+      daemonGeneration: 7,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW,
+      inputEpoch: 0,
+      iceServers: [],
+    } as const;
+
+    await expect(host.handle(prepare)).resolves.toBe(true);
+    await vi.waitFor(() => expect(workerCommands).toEqual([prepare]));
+    expect(launch).toHaveBeenCalledOnce();
+    expect(launch.mock.calls[0]?.[0]).toBe(artifact.executablePath);
+    expect(quotedArgs(String(launch.mock.calls[0]?.[1]))).toEqual([
+      '--pipe', pipePath, '--nonce', expect.any(String),
+    ]);
+    expect(launch.mock.calls[0]?.[2]).toBe(false);
+    expect(launch.mock.calls[0]?.[3]).toEqual([
+      '--pipe', pipePath, '--nonce', expect.any(String),
+    ]);
+
+    helper!.write(`${JSON.stringify({
+      type: REMOTE_DESKTOP_MSG.MODE_STATE,
+      requestId,
+      sessionId,
+      capability,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW,
+      inputEpoch: 0,
+      reason: REMOTE_DESKTOP_MODE_REASON.INITIAL,
+    })}\n`);
+    await vi.waitFor(() => expect(serverMessages).toEqual([
+      expect.objectContaining({ type: REMOTE_DESKTOP_MSG.MODE_STATE, sessionId }),
+    ]));
+    await expect(host.handle({
+      type: REMOTE_DESKTOP_MSG.STOP,
+      requestId,
+      sessionId,
+      capability,
+    })).resolves.toBe(true);
+    await vi.waitFor(() => expect(workerCommands.at(-1)).toEqual({
+      type: REMOTE_DESKTOP_MSG.STOP,
+      requestId,
+      sessionId,
+      capability,
+    }));
+    expect((host as unknown as { tracked: ReadonlyMap<string, unknown> }).tracked.size).toBe(0);
   });
 });

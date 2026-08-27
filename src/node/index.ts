@@ -2,6 +2,7 @@
 import { execFileSync } from 'node:child_process';
 import { bootstrapControlledNodeWithDisposition, defaultBootstrapDeps, journalPathFor, markServiceHealthy } from './bootstrap.js';
 import { runComputerUseIpcHelper } from './computer-use-ipc.js';
+import { createMacosRemoteDesktopProductionDependencies } from './macos-remote-desktop-production.js';
 import { createControlledNodeRuntime } from './runtime.js';
 import {
   createRemoteDesktopSignedShellLauncher,
@@ -160,7 +161,12 @@ async function main(): Promise<void> {
       })
       : undefined;
   const signedShellArtifact = resolveRemoteDesktopAccountShellArtifact();
+  const macosRemoteDesktopWorker = process.platform === 'darwin'
+    && (process.arch === 'arm64' || process.arch === 'x64')
+    ? createMacosRemoteDesktopProductionDependencies()
+    : undefined;
   const runtime = createControlledNodeRuntime(bootstrap.credential, undefined, {
+    macosRemoteDesktopWorker,
     remoteDesktopSignedShell: signedShellArtifact ? {
       available: () => true,
       executablePath: signedShellArtifact.executablePath,
