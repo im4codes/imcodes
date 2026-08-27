@@ -744,7 +744,7 @@ describe('handleWebCommand transport queue behavior', () => {
       expect.any(Object),
     );
     const stateCall = emitMock.mock.calls.find((call) => call[0] === 'deck_transport_brain' && call[1] === 'session.state');
-    expect(stateCall?.[2]).not.toHaveProperty('pendingCount');
+    expect(stateCall?.[2]).toHaveProperty('pendingCount', 2);
     expect(stateCall?.[2]).not.toHaveProperty('pendingMessages');
     expect(emitMock).not.toHaveBeenCalledWith(
       'deck_transport_brain',
@@ -1016,7 +1016,7 @@ describe('handleWebCommand transport queue behavior', () => {
       expect.any(Object),
     );
     const answerStateCall = emitMock.mock.calls.find((call) => call[0] === 'deck_transport_brain' && call[1] === 'session.state');
-    expect(answerStateCall?.[2]).not.toHaveProperty('pendingCount');
+    expect(answerStateCall?.[2]).toHaveProperty('pendingCount', 3);
     expect(answerStateCall?.[2]).not.toHaveProperty('pendingMessages');
     // Front placement alone only beats other QUEUED messages — it still waits
     // for the active turn, which is the very turn paused on this question. The
@@ -1585,7 +1585,7 @@ describe('handleWebCommand transport queue behavior', () => {
       && call[1] === 'session.state'
       && (call[2] as Record<string, unknown>)?.state === 'idle'
     ));
-    expect(idleStateCall?.[2]).not.toHaveProperty('pendingCount');
+    expect(idleStateCall?.[2]).toHaveProperty('pendingCount', 1);
     expect(idleStateCall?.[2]).not.toHaveProperty('pendingMessages');
     const stopFeedbackOrder = firstInvocationOrder((call) =>
       call[0] === 'deck_transport_brain'
@@ -3573,7 +3573,7 @@ describe('handleWebCommand transport queue behavior', () => {
       .find((entry) => entry.commandId === 'cmd-offline-1');
     expect(offlineEntry?.clientMessageId).toEqual(expect.any(String));
     expect(offlineEntry?.clientMessageId).not.toBe('cmd-offline-1');
-    expect(offlineStateCall?.[2]).not.toHaveProperty('pendingCount');
+    expect(offlineStateCall?.[2]).toHaveProperty('pendingCount', 1);
     expect(offlineStateCall?.[2]).not.toHaveProperty('pendingMessages');
 
     // 5. The entry is actually sitting in the resend queue for later drain.
@@ -3816,7 +3816,7 @@ describe('handleWebCommand transport queue behavior', () => {
       .find((entry) => entry.commandId === 'cmd-stale-runtime');
     expect(staleRuntimeEntry?.clientMessageId).toEqual(expect.any(String));
     expect(staleRuntimeEntry?.clientMessageId).not.toBe('cmd-stale-runtime');
-    expect(staleRuntimeStateCall?.[2]).not.toHaveProperty('pendingCount');
+    expect(staleRuntimeStateCall?.[2]).toHaveProperty('pendingCount', 1);
     expect(staleRuntimeStateCall?.[2]).not.toHaveProperty('pendingMessages');
     expect(serverLink.send).toHaveBeenCalledWith({
       type: 'command.ack',
@@ -4358,7 +4358,7 @@ describe('handleWebCommand transport queue behavior', () => {
       }),
       expect.any(Object),
     );
-    expect(stateCall?.[2]).not.toHaveProperty('pendingCount');
+    expect(stateCall?.[2]).toHaveProperty('pendingCount', 1);
     expect(stateCall?.[2]).not.toHaveProperty('pendingMessages');
   });
 
@@ -4414,7 +4414,7 @@ describe('handleWebCommand transport queue behavior', () => {
       }),
       expect.any(Object),
     );
-    expect(stateCall?.[2]).not.toHaveProperty('pendingCount');
+    expect(stateCall?.[2]).toHaveProperty('pendingCount', 0);
     expect(stateCall?.[2]).not.toHaveProperty('pendingMessages');
   });
 

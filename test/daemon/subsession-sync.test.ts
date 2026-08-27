@@ -60,6 +60,6 @@ describe('subsession-sync transport queue projection', () => {
     }));
     expect(payload?.transportPendingMessages).toBeUndefined();
     expect(payload?.transportPendingMessageEntries).toBeUndefined();
-    expect(payload?.pendingCount).toBeUndefined();
+    expect(payload?.pendingCount).toBe(1);
   });
 });
