@@ -1008,7 +1008,7 @@ exec "${realGit}" "$@"
         getTransportQueueStore().readSnapshot('deck_demo_brain').pendingMessageVersion,
       );
       expect(queuedPayload.pendingMessages).toBeUndefined();
-      expect(queuedPayload.pendingCount).toBeUndefined();
+      expect(queuedPayload.pendingCount).toBe(1);
 
       timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
       await new Promise((resolve) => setTimeout(resolve, 60));

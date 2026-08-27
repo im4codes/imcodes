@@ -326,6 +326,7 @@ const implementationMarkerPollTimers = new Map<string, ReturnType<typeof setTime
 const implementationAwaitingDispatchIdleTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const promptIdleAdvanceTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const acceptanceResultFilePollTimers = new Map<string, ReturnType<typeof setTimeout>>();
+const acceptanceAuditIdleRecheckTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const acceptanceAuditAdvancesInFlight = new Map<string, Promise<void>>();
 let timelineUnsubscribe: (() => void) | null = null;
 const execFileAsync = promisify(execFile);
@@ -595,6 +596,45 @@ function clearAcceptanceResultFilePollTimer(runId: string): void {
   const timer = acceptanceResultFilePollTimers.get(runId);
   if (timer) clearTimeout(timer);
   acceptanceResultFilePollTimers.delete(runId);
+}
+
+function clearAcceptanceAuditIdleRecheckTimer(runId: string): void {
+  const timer = acceptanceAuditIdleRecheckTimers.get(runId);
+  if (timer) clearTimeout(timer);
+  acceptanceAuditIdleRecheckTimers.delete(runId);
+}
+
+/**
+ * Preserve a real idle edge that arrived before the transport runtime finished
+ * its active turn. Timeline state dedupe may suppress the later idle snapshot,
+ * so merely returning from the listener can otherwise strand the acceptance
+ * audit forever. This timer is intentionally distinct from result-file polling:
+ * polling may consume an already-written result while busy, but it must not
+ * independently dispatch a repair prompt.
+ */
+function schedulePostRepairAcceptanceAuditIdleRecheck(run: AutoDeliverRun): void {
+  clearAcceptanceAuditIdleRecheckTimer(run.runId);
+  if (!run.activeAcceptanceAudit || !run.activeCommandId || run.status !== run.activeAcceptanceAudit.stage) return;
+  const attemptId = run.activeAcceptanceAudit.attemptId;
+  const commandId = run.activeCommandId;
+  const stage = run.status;
+  acceptanceAuditIdleRecheckTimers.set(run.runId, setTimeout(() => {
+    acceptanceAuditIdleRecheckTimers.delete(run.runId);
+    const current = runsById.get(run.runId);
+    if (!current || isOpenSpecAutoDeliverTerminalStage(current.status)) return;
+    if (
+      current.activeAcceptanceAudit?.attemptId !== attemptId
+      || current.activeCommandId !== commandId
+      || current.status !== stage
+    ) return;
+    if (isTransportRuntimeBusyForIdleAdvance(current)) {
+      schedulePostRepairAcceptanceAuditIdleRecheck(current);
+      return;
+    }
+    void advanceAfterPostRepairAcceptanceAuditIdle(current).catch((error) => {
+      terminalizeAndSend(current, 'failed', error instanceof Error ? error.message : 'post_repair_acceptance_audit_idle_recheck_failed');
+    });
+  }, OPENSPEC_AUTO_DELIVER_ACCEPTANCE_RESULT_FILE_POLL_MS));
 }
 
 function schedulePostRepairAcceptanceResultFilePoll(run: AutoDeliverRun): void {
@@ -2012,6 +2052,7 @@ function buildPostRepairAcceptanceAuditResultRepairPrompt(
 }
 
 async function dispatchPostRepairAcceptanceAuditPrompt(run: AutoDeliverRun): Promise<OpenSpecAutoDeliverProjection> {
+  clearAcceptanceAuditIdleRecheckTimer(run.runId);
   const elapsedProjection = enforceElapsedLimit(run);
   if (elapsedProjection) return elapsedProjection;
   const stage: AuditRepairStage = run.postRepairAcceptanceStage ?? 'implementation_audit_repair';
@@ -2077,6 +2118,7 @@ async function dispatchPostRepairAcceptanceAuditResultRepairPrompt(
   active: NonNullable<AutoDeliverRun['activeAcceptanceAudit']>,
   reason: string,
 ): Promise<OpenSpecAutoDeliverProjection> {
+  clearAcceptanceAuditIdleRecheckTimer(run.runId);
   const repairAttemptNumber = markResultFileRepairPromptDispatched(active);
   run.activeAcceptanceAudit = active;
   run.activeCommandId = `${active.attemptId}:result-file-repair:${repairAttemptNumber}`;
@@ -2904,6 +2946,7 @@ function terminalize(run: AutoDeliverRun, status: Extract<AutoDeliverRunStatus, 
   }
   run.activeAcceptanceAudit = undefined;
   clearAcceptanceResultFilePollTimer(run.runId);
+  clearAcceptanceAuditIdleRecheckTimer(run.runId);
   clearAuditFixRetryTimer(run.runId);
   clearImplementationReminderTimer(run.runId);
   clearImplementationMarkerPollTimer(run.runId);
@@ -3718,7 +3761,10 @@ function ensureTimelineListener(): void {
       && !!candidate.activeAcceptanceAudit
     );
     if (acceptanceAuditRun) {
-      if (isTransportRuntimeBusyForIdleAdvance(acceptanceAuditRun)) return;
+      if (isTransportRuntimeBusyForIdleAdvance(acceptanceAuditRun)) {
+        schedulePostRepairAcceptanceAuditIdleRecheck(acceptanceAuditRun);
+        return;
+      }
       void advanceAfterPostRepairAcceptanceAuditIdle(acceptanceAuditRun).catch((error) => {
         terminalizeAndSend(acceptanceAuditRun, 'failed', error instanceof Error ? error.message : 'post_repair_acceptance_audit_idle_advance_failed');
       });
@@ -4117,6 +4163,8 @@ export function clearOpenSpecAutoDeliverRunsForTests(): void {
   promptIdleAdvanceTimers.clear();
   for (const timer of acceptanceResultFilePollTimers.values()) clearTimeout(timer);
   acceptanceResultFilePollTimers.clear();
+  for (const timer of acceptanceAuditIdleRecheckTimers.values()) clearTimeout(timer);
+  acceptanceAuditIdleRecheckTimers.clear();
   acceptanceAuditAdvancesInFlight.clear();
   for (const run of runsById.values()) {
     releaseAutoDeliverP2pLock(run.owningMainSessionName, run.runId);
