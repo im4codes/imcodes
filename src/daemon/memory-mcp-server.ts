@@ -11,6 +11,7 @@ import {
 import { registerAliasMcpTools, registerMemoryMcpTools, type MemoryMcpToolDeps } from './memory-mcp-tools.js';
 import { registerMessagePinMcpTools, type MessagePinMcpToolDeps } from './message-pin-mcp-tools.js';
 import { registerSupervisionMcpTools, type SupervisionMcpToolDeps } from './supervision-mcp-tools.js';
+import { createSupervisionMcpToolDeps } from './supervision-registry-port.js';
 import { createDaemonMachineToolDeps } from './machine-mcp-deps.js';
 import { loadStore, type SessionRecord } from '../store/session-store.js';
 import { isDaemonCapabilityAdvertised } from './server-link.js';
@@ -35,6 +36,8 @@ export interface MemoryMcpServerOptions {
   env?: Record<string, string | undefined>;
   toolDeps?: MemoryMcpToolDeps;
   messagePinToolDeps?: MessagePinMcpToolDeps;
+  /** Injected by tests; production binds the real registry. */
+  supervisionToolDeps?: SupervisionMcpToolDeps;
 }
 
 export function createMemoryMcpServer(
@@ -245,13 +248,14 @@ export function mergeDefaultToolDeps(caller: McpRuntimeCaller, toolDeps: MemoryM
           const port = await resolveLiveHookPort();
           if (!port) throw new Error('daemon hook server is unavailable');
           if (!caller.sessionName) throw new Error('send_message requires a scoped caller');
-          await postHookSend(port, {
+          const response = await postHookSend(port, {
             from: caller.sessionName,
             to: target.name,
             message,
             depth: 0,
             ...(options.deliveryMode ? { deliveryMode: options.deliveryMode } : {}),
           });
+          return response.queued === true ? 'queued' : 'sent';
         }),
       // Per-field default: an injected `cancelSession` (tests) wins; otherwise
       // POST the daemon hook /stop default. Required so `send_stop` from this
@@ -278,6 +282,9 @@ export function createMemoryMcpServerFromEnv(options: MemoryMcpServerOptions = {
     caller,
     mergeDefaultToolDeps(caller, options.toolDeps ?? {}),
     options.messagePinToolDeps,
+    // Fourth argument was MISSING, so supervisionToolDeps defaulted to {} and
+    // every supervision tool reported `supervision registry not bound`.
+    options.supervisionToolDeps ?? createSupervisionMcpToolDeps(),
   );
 }
 

@@ -50,8 +50,8 @@ function producer(over: Partial<{ onBoundary: (b: SupervisionCrashBoundary) => v
 
 function seedTask(status = 'auditing'): void {
   db.prepare(`INSERT INTO supervision_tasks
-    (task_id, top_level_task_id, classification, status, current_revision, payload_json, created_at, updated_at)
-    VALUES ('tsk_console','top','slice',?,?,'{}',1,1)`).run(status, REVISION);
+    (task_id, project_name, top_level_task_id, classification, status, current_revision, payload_json, created_at, updated_at)
+    VALUES ('tsk_console','codedeck','top','slice',?,?,'{}',1,1)`).run(status, REVISION);
   db.prepare(`INSERT INTO supervision_task_assignments
     (assignment_id, task_id, role, status, session_name, session_instance_id, runtime_epoch,
      agent_type, provider_family, lease_id, generation, audit_attempt_id, payload_json, created_at, updated_at)
@@ -212,7 +212,7 @@ describe('assignment, pool and validation projections', () => {
     db.prepare(`UPDATE supervision_task_assignments SET pool_kind='primary',
       validation_state='passed', observed_model='gpt-5.6-sol', observed_provider='openai',
       heartbeat_at=555 WHERE assignment_id='asg_console'`).run();
-    const rows = producer().readAssignmentRows();
+    const rows = producer().readAssignmentRows(SCOPE.projectName);
     expect(rows).toHaveLength(1);
     expect(rows[0]).toMatchObject({
       assignmentId: 'asg_console', taskId: 'tsk_console', status: 'implementing', phase: 'active',
@@ -224,14 +224,14 @@ describe('assignment, pool and validation projections', () => {
 
   it('falls back to provider_family when no observed provider is recorded', () => {
     seedTask('implementing');
-    expect(producer().readAssignmentRows()[0]!.observedProvider).toBe('openai');
+    expect(producer().readAssignmentRows(SCOPE.projectName)[0]!.observedProvider).toBe('openai');
   });
 
   it('coerces an unknown validation state / pool kind to fail-closed values', () => {
     seedTask('implementing');
     db.exec('DROP TRIGGER IF EXISTS supervision_assignments_pool_kind_guard');
     db.prepare("UPDATE supervision_task_assignments SET pool_kind='turbo', validation_state='maybe'").run();
-    const row = producer().readAssignmentRows()[0]!;
+    const row = producer().readAssignmentRows(SCOPE.projectName)[0]!;
     expect(row.poolKind).toBeUndefined();
     expect(row.validationState).toBe('unknown');
   });
@@ -240,17 +240,17 @@ describe('assignment, pool and validation projections', () => {
     seedTask('implementing');
     db.exec('DROP TRIGGER IF EXISTS supervision_task_assignments_status_guard_update');
     db.prepare("UPDATE supervision_task_assignments SET status='scope_violation'").run();
-    expect(producer().readAssignmentRows()).toHaveLength(0);
+    expect(producer().readAssignmentRows(SCOPE.projectName)).toHaveLength(0);
   });
 
   it('always projects BOTH pools, including at zero occupancy', () => {
     seedTask('implementing');
-    const empty = producer().readPools();
+    const empty = producer().readPools(SCOPE.projectName);
     expect(empty.map((p) => p.poolId)).toEqual(['primary', 'economy']);
     expect(empty.every((p) => p.activeCount === 0)).toBe(true);
     expect(empty[0]!.capacity).toBeGreaterThan(0);
     db.prepare("UPDATE supervision_task_assignments SET pool_kind='economy'").run();
-    const occupied = producer().readPools();
+    const occupied = producer().readPools(SCOPE.projectName);
     expect(occupied.find((p) => p.poolId === 'economy')!.activeCount).toBe(1);
     expect(occupied.find((p) => p.poolId === 'primary')!.activeCount).toBe(0);
   });
@@ -258,7 +258,7 @@ describe('assignment, pool and validation projections', () => {
   it('does not count terminal assignments as occupying a pool', () => {
     seedTask('implementing');
     db.prepare("UPDATE supervision_task_assignments SET pool_kind='primary', status='finalized'").run();
-    expect(producer().readPools().find((p) => p.poolId === 'primary')!.activeCount).toBe(0);
+    expect(producer().readPools(SCOPE.projectName).find((p) => p.poolId === 'primary')!.activeCount).toBe(0);
   });
 
   it('ships assignments and pools inside the snapshot', () => {
@@ -270,10 +270,35 @@ describe('assignment, pool and validation projections', () => {
     expect(snapshot.tasks).toHaveLength(1);
   });
 
+  it('never projects tasks or assignments from another project', () => {
+    seedTask('implementing');
+    db.prepare(`INSERT INTO supervision_tasks
+      (task_id, project_name, top_level_task_id, classification, status, payload_json, created_at, updated_at)
+      VALUES ('tsk_other','other','other-top','slice','implementing','{}',1,1)`).run();
+    db.prepare(`INSERT INTO supervision_task_assignments
+      (assignment_id, task_id, role, status, session_name, session_instance_id, runtime_epoch,
+       agent_type, provider_family, lease_id, generation, payload_json, created_at, updated_at)
+      VALUES ('asg_other','tsk_other','implementer','implementing','deck_other_w1','i2','e2',
+       'codex','openai','l2',1,'{}',1,1)`).run();
+    const snapshot = producer().buildSnapshot(SCOPE, 'sub-project');
+    expect(snapshot.tasks.map((task) => task.taskId)).toEqual(['tsk_console']);
+    expect(snapshot.assignments.map((assignment) => assignment.assignmentId)).toEqual(['asg_console']);
+    expect(() => producer().appendTaskEvent({
+      scope: SCOPE,
+      taskId: 'tsk_other',
+      eventType: 'implementing',
+      status: 'implementing',
+    })).toThrow('outside the requested project scope');
+    expect(() => producer().applyAuditReceipt(
+      { projectName: 'other', coordinatorSessionName: 'deck_other_brain' },
+      receipt(),
+    )).toThrow('audit receipt is outside the requested project scope');
+  });
+
   it('projects the task validation state from the durable column', () => {
     seedTask('implementing');
     db.prepare("UPDATE supervision_tasks SET validation_state='failed', heartbeat_at=42").run();
-    const row = producer().readTaskRow('tsk_console')!;
+    const row = producer().readTaskRow('tsk_console', SCOPE.projectName)!;
     expect(row.validationState).toBe('failed');
     expect(row.heartbeatAt).toBe(42);
   });
@@ -330,7 +355,7 @@ describe('audit receipt persistence', () => {
     // Bypass the trigger the way a corrupted/legacy row would look.
     db.exec('DROP TRIGGER IF EXISTS supervision_tasks_status_guard_update');
     db.prepare("UPDATE supervision_tasks SET status = 'file_event'").run();
-    expect(producer().readTaskRow('tsk_console')).toBeUndefined();
+    expect(producer().readTaskRow('tsk_console', SCOPE.projectName)).toBeUndefined();
     expect(producer().buildSnapshot(SCOPE, 'sub-1').tasks).toHaveLength(0);
   });
 });

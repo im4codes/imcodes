@@ -50,8 +50,8 @@ const LEGACY_SCHEMA = `
 
 function insertTask(db: DatabaseSync, taskId: string, status: string): void {
   db.prepare(`INSERT INTO supervision_tasks
-    (task_id, top_level_task_id, classification, status, payload_json, created_at, updated_at)
-    VALUES (?, ?, 'slice', ?, '{}', 1, 1)`).run(taskId, 'top', status);
+    (task_id, project_name, top_level_task_id, classification, status, payload_json, created_at, updated_at)
+    VALUES (?, 'codedeck', ?, 'slice', ?, '{}', 1, 1)`).run(taskId, 'top', status);
 }
 
 let db: DatabaseSync;
@@ -69,7 +69,7 @@ describe('supervision store migrations', () => {
   it('migrates a legacy version-0 database deterministically', () => {
     expect(readSupervisionSchemaVersion(db as never)).toBe(0);
     const result = migrate();
-    expect(result).toEqual({ from: 0, to: SUPERVISION_SCHEMA_VERSION, applied: [1, 2] });
+    expect(result).toEqual({ from: 0, to: SUPERVISION_SCHEMA_VERSION, applied: [1, 2, 3] });
     for (const column of ['project_name', 'integration_owner', 'next_action', 'blocked_reason',
       'recovery_state', 'recovery_reason', 'last_durable_event_id', 'semantic_key']) {
       expect(columns('supervision_tasks'), column).toContain(column);
@@ -102,10 +102,20 @@ describe('supervision store migrations', () => {
   });
 
   it('preserves existing rows across migration', () => {
-    insertTask(db, 'tsk_legacy', 'implementing');
+    db.prepare(`INSERT INTO supervision_tasks
+      (task_id, top_level_task_id, classification, status, payload_json, created_at, updated_at)
+      VALUES ('tsk_legacy','top','slice','implementing','{}',1,1)`).run();
     migrate();
     const row = db.prepare('SELECT task_id, status FROM supervision_tasks').get() as { task_id: string; status: string };
     expect(row).toEqual({ task_id: 'tsk_legacy', status: 'implementing' });
+  });
+
+  it('requires project scope on every newly written task row', () => {
+    migrate();
+    expect(() => db.prepare(`INSERT INTO supervision_tasks
+      (task_id, top_level_task_id, classification, status, payload_json, created_at, updated_at)
+      VALUES ('tsk_unscoped','top','slice','implementing','{}',1,1)`).run())
+      .toThrow(/project scope is required/);
   });
 });
 

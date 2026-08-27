@@ -4,6 +4,12 @@ import { homedir } from 'os';
 import { randomUUID } from 'node:crypto';
 import type { QwenAuthType } from '../../shared/qwen-auth.js';
 import type { TransportEffortLevel } from '../../shared/effort-levels.js';
+import {
+  isDelegationLimitActive,
+  observeProviderLimitSignal,
+  type DelegationLimitState,
+  type ProviderLimitSignal,
+} from '../../shared/delegation-availability.js';
 import type { ProviderQuotaMeta } from '../../shared/provider-quota.js';
 import type { SessionContextBootstrapState } from '../../shared/session-context-bootstrap.js';
 import { isKnownTestSessionLike } from '../../shared/test-session-guard.js';
@@ -100,6 +106,20 @@ export interface SessionRecord extends SessionContextBootstrapState {
   quotaUsageLabel?: string;
   /** Structured quota metadata for client-side countdown rendering. */
   quotaMeta?: ProviderQuotaMeta;
+  /**
+   * Machine-readable provider limit, from a canonical {@link ProviderLimitSignal}.
+   *
+   * Persisted deliberately. A limit that lived only in memory would be
+   * forgotten on every daemon restart, and an orchestrator would go straight
+   * back to handing work to an account that is still being refused. Distinct
+   * from `quotaMeta`, which is display telemetry and carries no verdict:
+   * `usedPercent` is undefined while Claude is healthy, so it cannot answer
+   * "are we being refused" and must never be thresholded into one.
+   *
+   * Cleared by a healthy structured signal, and treated as expired -- not
+   * cleared -- once `retryAt` or the bounded fallback passes.
+   */
+  providerLimit?: DelegationLimitState;
   /** Generic reasoning/thinking effort for supported providers. */
   effort?: TransportEffortLevel;
   /**
@@ -463,6 +483,79 @@ export function listSessions(projectName?: string): SessionRecord[] {
 export function findSessionByProviderSessionId(providerSessionId: string): SessionRecord | undefined {
   return Object.values(store.sessions).find((s) => s.providerSessionId === providerSessionId);
 }
+
+/**
+ * Apply a canonical provider limit signal to one session.
+ *
+ * The ONLY writer of `providerLimit`. Routing every adapter through one
+ * mutator is what makes "a limit can only come from provider-native evidence"
+ * checkable: there is a single place to audit rather than one per provider.
+ *
+ * Returns true when the stored state changed, so a caller can emit a
+ * notification exactly once instead of on every repeated signal -- providers
+ * re-send the same rate-limit event freely, and one notification per event
+ * would be a storm.
+ */
+/**
+ * What a signal does to a record's stored limit. PURE -- no store access.
+ *
+ * Extracted so the store mutator and any caller that must fold the limit into a
+ * WHOLE-RECORD write share one decision. Two implementations would be two
+ * answers, and the one that ran last would win silently.
+ */
+export function resolveProviderLimitUpdate(
+  previous: DelegationLimitState | undefined,
+  signal: ProviderLimitSignal | null | undefined,
+  nowMs: number,
+): { changed: false } | { changed: true; value: DelegationLimitState | undefined } {
+  const observation = observeProviderLimitSignal(signal, nowMs);
+
+  if (observation.kind === 'noEvidence') {
+    // Neither sets nor clears. An unrecognised, low-confidence, or merely
+    // WARNING signal must not un-limit an account that is still being refused.
+    return { changed: false };
+  }
+  if (observation.kind === 'healthy') {
+    return previous === undefined ? { changed: false } : { changed: true, value: undefined };
+  }
+
+  const next = observation.state;
+  // Re-observing an ALREADY ACTIVE limit is not a change. Without this the
+  // limit's own clock would restart on every repeated event and the window
+  // would never expire.
+  if (previous
+    && isDelegationLimitActive(previous, nowMs)
+    && previous.reason === next.reason
+    && previous.retryAt === next.retryAt) {
+    return { changed: false };
+  }
+  return { changed: true, value: next };
+}
+
+/**
+ * Apply a canonical provider limit signal onto a record IN PLACE.
+ *
+ * Used by whole-record writers, which must fold the limit into the SAME object
+ * they are about to persist. Applying it to the store separately and then
+ * upserting a record snapshotted beforehand silently reverted the limit --
+ * `quotaMeta` and `limitSignal` arrive on one `SessionInfoUpdate`, so the very
+ * event that reported a refusal also carried the display field whose write
+ * erased it. The failure was invisible: the store briefly held the right value.
+ *
+ * Returns true when the record changed.
+ */
+export function mergeProviderLimitSignal(
+  record: { providerLimit?: DelegationLimitState },
+  signal: ProviderLimitSignal | null | undefined,
+  nowMs = Date.now(),
+): boolean {
+  const update = resolveProviderLimitUpdate(record.providerLimit, signal, nowMs);
+  if (!update.changed) return false;
+  if (update.value === undefined) delete record.providerLimit;
+  else record.providerLimit = update.value;
+  return true;
+}
+
 
 export function updateSessionState(name: string, state: SessionState, error?: string): void {
   const s = store.sessions[name];

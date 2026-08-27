@@ -42,6 +42,7 @@ import { composeMessageSideProviderPrompt, getProviderSystemTextParts } from '..
 import { getDefaultMcpServers } from './getDefaultMcpServers.js';
 import { claudeRateLimitsToQuotaMeta, type ClaudeRateLimitInfo } from '../claude-rate-limit.js';
 import { formatProviderQuotaLabel } from '../../../shared/provider-quota.js';
+import { claudeRateLimitSignal } from '../claude-rate-limit.js';
 import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../../shared/memory-mcp-server-name.js';
 import {
   AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES,
@@ -1359,9 +1360,20 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       if (info?.rateLimitType) {
         state.rateLimits = { ...(state.rateLimits ?? {}), [info.rateLimitType]: info };
         const quotaMeta = claudeRateLimitsToQuotaMeta(state.rateLimits);
-        if (quotaMeta) {
-          const quotaLabel = formatProviderQuotaLabel(quotaMeta);
-          this.emitSessionInfo(sessionId, { ...(quotaLabel ? { quotaLabel } : {}), quotaMeta });
+        // The VERDICT, mapped here in Claude's own adapter. `quotaMeta` above is
+        // display telemetry and cannot answer "are we being refused" --
+        // `usedPercent` is undefined while healthy, so a threshold on it would
+        // be a policy we invented rather than something Claude stated.
+        // `status` is what Claude actually said, and it used to be parsed and
+        // then dropped, leaving nothing downstream to read.
+        const limitSignal = claudeRateLimitSignal(info, this.id, Date.now());
+        const quotaLabel = quotaMeta ? formatProviderQuotaLabel(quotaMeta) : undefined;
+        if (quotaMeta || limitSignal) {
+          this.emitSessionInfo(sessionId, {
+            ...(quotaLabel ? { quotaLabel } : {}),
+            ...(quotaMeta ? { quotaMeta } : {}),
+            ...(limitSignal ? { limitSignal } : {}),
+          });
         }
       }
       return;

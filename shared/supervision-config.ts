@@ -436,43 +436,6 @@ export const SUPERVISION_DELEGATION_ELIGIBILITY_POLICY = {
   taskListFields: SUPERVISION_DELEGATION_ELIGIBILITY_TASK_LIST_FIELDS,
 } as const;
 
-export interface SupervisionDelegationEligibilityCandidate {
-  targetSession?: string | null;
-  agentType?: string | null;
-  providerFamily?: string | null;
-  availability?: 'ready' | 'busy' | 'limited' | 'offline' | 'unknown' | 'missing' | string | null;
-  limitGroup?: string | null;
-  replyCapable?: boolean | null;
-}
-
-export interface SupervisionDelegationEligibilityInput {
-  candidate: SupervisionDelegationEligibilityCandidate;
-  implementerProviderFamily?: string | null;
-  crossVendorReadyAvailable?: boolean;
-  daemonFixedAttemptTarget?: boolean;
-}
-
-export function evaluateSupervisionDelegationEligibility(
-  input: SupervisionDelegationEligibilityInput,
-): SupervisionDelegationEligibilityDecision {
-  if (input.daemonFixedAttemptTarget) return 'daemon_fixed_target';
-  const candidate = input.candidate;
-  if (!candidate.targetSession || !candidate.agentType || !candidate.providerFamily
-    || !candidate.availability || !candidate.limitGroup || typeof candidate.replyCapable !== 'boolean') {
-    return 'missing_fields';
-  }
-  if ((SUPERVISION_DELEGATION_ELIGIBILITY_FORBIDDEN_AGENT_TYPES as readonly string[]).includes(candidate.agentType)) return 'forbidden_agent_type';
-  if (!candidate.replyCapable) return 'not_reply_capable';
-  if (candidate.availability === 'limited') return 'limited';
-  if (candidate.availability === 'offline') return 'offline';
-  if (candidate.availability !== 'ready' && candidate.availability !== 'busy') return 'missing_fields';
-  if (candidate.availability === 'busy') return 'queue_only';
-  if (input.implementerProviderFamily && candidate.providerFamily === input.implementerProviderFamily) {
-    return input.crossVendorReadyAvailable ? 'same_family_degraded' : 'no_cross_vendor_blocker';
-  }
-  return 'eligible';
-}
-
 export const SUPERVISION_TASK_REGISTRY_VERSION = 1 as const;
 
 export const SUPERVISION_TASK_CLASSIFICATIONS = [

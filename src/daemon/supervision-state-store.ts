@@ -20,6 +20,13 @@ import { mayFinalizeEconomyAssignment } from '../../shared/supervision-execution
 import { suppressSqliteExperimentalWarning } from '../util/suppress-sqlite-warning.js';
 import logger from '../util/logger.js';
 import { mintSupervisionId } from './supervision-id-minter.js';
+import type {
+  SupervisionTaskLifecycleStatus,
+  SupervisionTaskRegistryEventType,
+} from '../../shared/supervision-config.js';
+// Type-only: supervision-mcp-tools does not import this module, and the import
+// is erased at runtime, so this cannot create a cycle.
+import type { SupervisionRecoveryTargetStatus } from './supervision-mcp-tools.js';
 
 const require = createRequire(import.meta.url);
 suppressSqliteExperimentalWarning();
@@ -285,6 +292,8 @@ export interface PersistedSupervisionTaskAssignmentIdentity {
 export interface PersistedSupervisionTaskRecord {
   version: typeof SUPERVISION_TASK_REGISTRY_DB_VERSION;
   taskId: string;
+  /** Authoritative project audience. Legacy rows are deliberately unscoped. */
+  projectName: string;
   topLevelTaskId: string;
   classification: import('../../shared/supervision-config.js').SupervisionTaskClassification;
   objective: string;
@@ -359,6 +368,8 @@ export interface PersistedSupervisionTaskFileEvent {
 }
 
 export interface SupervisionTaskCreateInput {
+  /** Runtime-resolved caller project; never accepted from model metadata. */
+  projectName?: string | null;
   /**
    * Model/user PROPOSED semantic key, strict kebab-case. When present the
    * daemon mints the canonical id and `taskId` is ignored -- uniqueness is
@@ -539,6 +550,7 @@ export class SupervisionTaskRegistry {
       PRAGMA busy_timeout = ${timeout};
       CREATE TABLE IF NOT EXISTS supervision_tasks (
         task_id TEXT PRIMARY KEY,
+        project_name TEXT,
         top_level_task_id TEXT NOT NULL,
         classification TEXT NOT NULL,
         status TEXT NOT NULL,
@@ -625,6 +637,12 @@ export class SupervisionTaskRegistry {
         created_at INTEGER NOT NULL
       );
     `);
+    const taskColumns = new Set((this.#db.prepare('PRAGMA table_info(supervision_tasks)').all() as Array<{ name?: unknown }>)
+      .map((row) => String(row.name ?? '')));
+    if (!taskColumns.has('project_name')) {
+      this.#db.exec('ALTER TABLE supervision_tasks ADD COLUMN project_name TEXT;');
+    }
+    this.#db.exec('CREATE INDEX IF NOT EXISTS supervision_tasks_project_idx ON supervision_tasks(project_name, updated_at);');
   }
 
   close(): void { if (this.#ownsDb && !this.#closed) this.#db.close(); this.#closed = true; }
@@ -636,13 +654,13 @@ export class SupervisionTaskRegistry {
 
   #writeTask(record: PersistedSupervisionTaskRecord, eventType: import('../../shared/supervision-config.js').SupervisionTaskRegistryEventType, payload?: Record<string, unknown>): void {
     this.#db.prepare(`
-      INSERT INTO supervision_tasks (task_id, top_level_task_id, classification, status, current_revision, commit_sha, push_remote_ref, blocker, payload_json, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO supervision_tasks (task_id, project_name, top_level_task_id, classification, status, current_revision, commit_sha, push_remote_ref, blocker, payload_json, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(task_id) DO UPDATE SET
-        top_level_task_id=excluded.top_level_task_id, classification=excluded.classification, status=excluded.status,
+        project_name=excluded.project_name, top_level_task_id=excluded.top_level_task_id, classification=excluded.classification, status=excluded.status,
         current_revision=excluded.current_revision, commit_sha=excluded.commit_sha, push_remote_ref=excluded.push_remote_ref,
         blocker=excluded.blocker, payload_json=excluded.payload_json, updated_at=excluded.updated_at
-    `).run(record.taskId, record.topLevelTaskId, record.classification, record.status, record.currentRevision ?? null, record.commitSha ?? null, record.pushRemoteRef ?? null, record.blocker ?? null, JSON.stringify(record), record.createdAt, record.updatedAt);
+    `).run(record.taskId, record.projectName, record.topLevelTaskId, record.classification, record.status, record.currentRevision ?? null, record.commitSha ?? null, record.pushRemoteRef ?? null, record.blocker ?? null, JSON.stringify(record), record.createdAt, record.updatedAt);
     this.#appendEvent(record.taskId, undefined, eventType, record.status, payload, record.updatedAt);
   }
 
@@ -682,10 +700,11 @@ export class SupervisionTaskRegistry {
     return row ? parseAssignmentRow(row) : undefined;
   }
 
-  list(filter: { status?: import('../../shared/supervision-config.js').SupervisionTaskLifecycleStatus; topLevelTaskId?: string; ownerSessionName?: string } = {}): SupervisionTaskSnapshot[] {
+  list(filter: { status?: import('../../shared/supervision-config.js').SupervisionTaskLifecycleStatus; topLevelTaskId?: string; ownerSessionName?: string; projectName?: string } = {}): SupervisionTaskSnapshot[] {
     if (this.#closed) return [];
     let sql = 'SELECT DISTINCT t.payload_json AS payloadJson FROM supervision_tasks t LEFT JOIN supervision_task_assignments a ON a.task_id = t.task_id WHERE 1=1';
     const params: string[] = [];
+    if (filter.projectName) { sql += ' AND t.project_name = ?'; params.push(filter.projectName); }
     if (filter.status) { sql += ' AND t.status = ?'; params.push(filter.status); }
     if (filter.topLevelTaskId) { sql += ' AND t.top_level_task_id = ?'; params.push(filter.topLevelTaskId); }
     if (filter.ownerSessionName) { sql += ' AND a.session_name = ?'; params.push(filter.ownerSessionName); }
@@ -739,9 +758,11 @@ export class SupervisionTaskRegistry {
   createOrGet(input: SupervisionTaskCreateInput): SupervisionTaskRegistryResult<PersistedSupervisionTaskRecord> {
     if (this.#closed) return { ok: false, reason: 'invalid' };
     const now = input.now ?? Date.now();
+    const projectName = normalizeTaskString(input.projectName) ?? '__legacy_unscoped__';
     const key = normalizeTaskString(input.idempotencyKey);
+    const taskIdempotencyKey = key ? `task\0${projectName}\0${key}` : '';
     if (key) {
-      const row = this.#db.prepare('SELECT task_id AS taskId FROM supervision_task_idempotency WHERE idempotency_key = ?').get(`task\0${key}`) as { taskId?: unknown } | undefined;
+      const row = this.#db.prepare('SELECT task_id AS taskId FROM supervision_task_idempotency WHERE idempotency_key = ?').get(taskIdempotencyKey) as { taskId?: unknown } | undefined;
       const replay = typeof row?.taskId === 'string' ? this.getTaskRecord(row.taskId) : undefined;
       if (replay) return { ok: true, value: replay, replay: true };
     }
@@ -764,6 +785,9 @@ export class SupervisionTaskRegistry {
     const record: PersistedSupervisionTaskRecord = {
       version: SUPERVISION_TASK_REGISTRY_DB_VERSION,
       taskId,
+      // Direct registry callers from before project scoping stay invisible to
+      // every real project rather than being guessed into the caller's scope.
+      projectName,
       topLevelTaskId: normalizeTaskString(input.topLevelTaskId) ?? taskId,
       classification,
       objective: normalizeTaskString(input.objective) ?? 'Delegated supervised task',
@@ -777,7 +801,7 @@ export class SupervisionTaskRegistry {
     this.#db.exec('BEGIN IMMEDIATE');
     try {
       this.#writeTask(record, 'created', { source: 'task_start' });
-      if (key) this.#db.prepare('INSERT INTO supervision_task_idempotency (idempotency_key, task_id, created_at) VALUES (?, ?, ?)').run(`task\0${key}`, taskId, now);
+      if (key) this.#db.prepare('INSERT INTO supervision_task_idempotency (idempotency_key, task_id, created_at) VALUES (?, ?, ?)').run(taskIdempotencyKey, taskId, now);
       this.#db.exec('COMMIT');
       return { ok: true, value: record };
     } catch (error) { this.#db.exec('ROLLBACK'); throw error; }
@@ -949,6 +973,85 @@ export class SupervisionTaskRegistry {
                   : 'validated';
       this.#writeTask({ ...task, status: next, updatedAt: now }, aggregateEvent, { source: 'aggregate_status' });
     }
+  }
+
+  /**
+   * Event id used when a TASK-level status is written directly.
+   *
+   * Three statuses have no distinct member in the event vocabulary, so they
+   * share the closest one. That is not lossy: #writeTask records the exact
+   * status on the record itself, and the payload carries it too. Adding event
+   * members is an explicit contract-version migration, not something to do
+   * inline here.
+   */
+  #taskEventFor(status: SupervisionTaskLifecycleStatus): SupervisionTaskRegistryEventType {
+    switch (status) {
+      case 'planned': return 'created';
+      case 'auditing': return 'audit_requested';
+      case 'final_audit': return 'audit_requested';
+      case 'integrating': return 'ready_for_integration';
+      default: return status as SupervisionTaskRegistryEventType;
+    }
+  }
+
+  /**
+   * Persist a task-level status DECIDED by the audited intent state machine.
+   *
+   * Validation deliberately lives in the caller: resolveSupervisionIntent() owns
+   * the transition table and the status-rejection rules, and the MCP handler
+   * owns authorization. Re-deriving either here would be a second copy of the
+   * same policy that could drift, and the two would mask each other's bugs.
+   * This records what was decided, with an event, in one write.
+   */
+  applyTaskIntent(input: {
+    taskId: string;
+    intent: string;
+    toStatus: SupervisionTaskLifecycleStatus | null;
+    validationState?: string;
+    note?: string;
+  }): SupervisionTaskRegistryResult<PersistedSupervisionTaskRecord> {
+    const task = this.getTaskRecord(input.taskId);
+    if (!task) return { ok: false, reason: 'not_found' };
+    // Intents such as heartbeat/claim carry no destination; they are a no-op on
+    // status by design rather than an error.
+    if (!input.toStatus || input.toStatus === task.status) return { ok: true, value: task };
+    const record: PersistedSupervisionTaskRecord = {
+      ...task, status: input.toStatus, updatedAt: Date.now(),
+    };
+    this.#writeTask(record, this.#taskEventFor(input.toStatus), {
+      source: 'task_intent',
+      intent: input.intent,
+      status: input.toStatus,
+      ...(input.validationState ? { validationState: input.validationState } : {}),
+      ...(input.note ? { note: input.note } : {}),
+    });
+    return { ok: true, value: record };
+  }
+
+  /**
+   * Administrative recovery to a restricted status.
+   *
+   * The handler already enforced the restricted enum, the forbidden source
+   * states, and the admin gate. A blocked recovery records its reason as the
+   * blocker so the operator sees WHY on the task itself, not only in an event.
+   */
+  recoverTask(input: {
+    taskId: string;
+    toStatus: SupervisionRecoveryTargetStatus;
+    reason: string;
+  }): SupervisionTaskRegistryResult<PersistedSupervisionTaskRecord> {
+    const task = this.getTaskRecord(input.taskId);
+    if (!task) return { ok: false, reason: 'not_found' };
+    const record: PersistedSupervisionTaskRecord = {
+      ...task,
+      status: input.toStatus,
+      updatedAt: Date.now(),
+      ...(input.toStatus === 'blocked' ? { blocker: input.reason } : {}),
+    };
+    this.#writeTask(record, this.#taskEventFor(input.toStatus), {
+      source: 'admin_recovery', reason: input.reason, status: input.toStatus,
+    });
+    return { ok: true, value: record };
   }
 
   recordFileEvent(input: SupervisionTaskFileEventInput): SupervisionTaskRegistryResult<PersistedSupervisionTaskAssignment> {

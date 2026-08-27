@@ -157,6 +157,10 @@ export class SupervisionConsoleProducer {
    * Returns the durable ids. If this throws, nothing was written.
    */
   appendTaskEvent(input: SupervisionTaskEventInput): { eventId: number; projectionVersion: number } {
+    const owned = this.#db.prepare(
+      'SELECT 1 AS ok FROM supervision_tasks WHERE task_id = ? AND project_name = ?',
+    ).get(input.taskId, input.scope.projectName) as { ok?: number } | undefined;
+    if (!owned?.ok) throw new Error('supervision task is outside the requested project scope');
     const committed = this.#transaction(() => {
       this.#db.prepare(
         `INSERT INTO supervision_task_events (task_id, assignment_id, event_type, status, payload_json, created_at)
@@ -207,20 +211,20 @@ export class SupervisionConsoleProducer {
       op,
     } as SupervisionTaskConsoleDelta;
     if (op === 'task_upsert') {
-      const row = this.readTaskRow(input.taskId, eventId);
+      const row = this.readTaskRow(input.taskId, input.scope.projectName, eventId);
       if (row) base.task = row;
     }
     return base;
   }
 
   /** Project one durable task row into its browser-safe shape. */
-  readTaskRow(taskId: string, lastEventId?: number): SupervisionTaskConsoleTaskRow | undefined {
+  readTaskRow(taskId: string, projectName: string, lastEventId?: number): SupervisionTaskConsoleTaskRow | undefined {
     const row = this.#db.prepare(
       `SELECT task_id, top_level_task_id, status, semantic_key, integration_owner, next_action,
               blocked_reason, recovery_state, recovery_reason, last_durable_event_id, updated_at,
               validation_state, heartbeat_at
-       FROM supervision_tasks WHERE task_id = ?`,
-    ).get(taskId) as Record<string, unknown> | undefined;
+       FROM supervision_tasks WHERE task_id = ? AND project_name = ?`,
+    ).get(taskId, projectName) as Record<string, unknown> | undefined;
     if (!row) return undefined;
     const status = String(row.status ?? '');
     // Fail closed: never project a status the contract does not know.
@@ -245,14 +249,16 @@ export class SupervisionConsoleProducer {
   }
 
   /** Project every assignment into its browser-safe row. */
-  readAssignmentRows(): SupervisionTaskConsoleAssignmentRow[] {
+  readAssignmentRows(projectName: string): SupervisionTaskConsoleAssignmentRow[] {
     const rows = this.#db.prepare(
-      `SELECT assignment_id, task_id, role, status, session_name, agent_type, provider_family,
-              pool_kind, validation_state, observed_model, observed_provider, heartbeat_at,
-              audit_attempt_id, verdict, blocker, next_action,
-              recovery_state, recovery_reason, last_durable_event_id, updated_at
-       FROM supervision_task_assignments ORDER BY assignment_id ASC`,
-    ).all() as Array<Record<string, unknown>>;
+      `SELECT a.assignment_id, a.task_id, a.role, a.status, a.session_name, a.agent_type, a.provider_family,
+              a.pool_kind, a.validation_state, a.observed_model, a.observed_provider, a.heartbeat_at,
+              a.audit_attempt_id, a.verdict, a.blocker, a.next_action,
+              a.recovery_state, a.recovery_reason, a.last_durable_event_id, a.updated_at
+       FROM supervision_task_assignments a
+       INNER JOIN supervision_tasks t ON t.task_id = a.task_id
+       WHERE t.project_name = ? ORDER BY a.assignment_id ASC`,
+    ).all(projectName) as Array<Record<string, unknown>>;
     const out: SupervisionTaskConsoleAssignmentRow[] = [];
     for (const row of rows) {
       const status = String(row.status ?? '');
@@ -292,12 +298,14 @@ export class SupervisionConsoleProducer {
    * information ("nothing is running there"), whereas a missing column reads as
    * a broken console.
    */
-  readPools(): SupervisionTaskConsolePoolRow[] {
+  readPools(projectName: string): SupervisionTaskConsolePoolRow[] {
     const counts = this.#db.prepare(
-      `SELECT pool_kind AS kind, COUNT(*) AS n FROM supervision_task_assignments
-       WHERE pool_kind IS NOT NULL AND status NOT IN ('finalized','pushed','blocked','cancelled')
-       GROUP BY pool_kind`,
-    ).all() as Array<{ kind?: string; n?: number }>;
+      `SELECT a.pool_kind AS kind, COUNT(*) AS n FROM supervision_task_assignments a
+       INNER JOIN supervision_tasks t ON t.task_id = a.task_id
+       WHERE t.project_name = ? AND a.pool_kind IS NOT NULL
+         AND a.status NOT IN ('finalized','pushed','blocked','cancelled')
+       GROUP BY a.pool_kind`,
+    ).all(projectName) as Array<{ kind?: string; n?: number }>;
     const byKind = new Map(counts.map((row) => [String(row.kind), Number(row.n ?? 0)]));
     return SUPERVISION_EXECUTION_POOL_KINDS.map((kind) => ({
       poolId: kind,
@@ -369,10 +377,10 @@ export class SupervisionConsoleProducer {
   buildSnapshot(scope: SupervisionTaskConsoleScope, subscriptionId: string): SupervisionTaskConsoleSnapshot {
     const cursor = this.restoreCursor(scope);
     const ids = this.#db.prepare(
-      'SELECT task_id FROM supervision_tasks ORDER BY task_id ASC',
-    ).all() as Array<{ task_id: string }>;
+      'SELECT task_id FROM supervision_tasks WHERE project_name = ? ORDER BY task_id ASC',
+    ).all(scope.projectName) as Array<{ task_id: string }>;
     const tasks = ids
-      .map((row) => this.readTaskRow(String(row.task_id)))
+      .map((row) => this.readTaskRow(String(row.task_id), scope.projectName))
       .filter((row): row is SupervisionTaskConsoleTaskRow => !!row);
     return {
       type: SUPERVISION_TASK_CONSOLE_MSG.SNAPSHOT,
@@ -385,8 +393,8 @@ export class SupervisionConsoleProducer {
       projectionEpoch: cursor.projectionEpoch,
       generatedAt: this.#now(),
       tasks,
-      assignments: this.readAssignmentRows(),
-      pools: this.readPools(),
+      assignments: this.readAssignmentRows(scope.projectName),
+      pools: this.readPools(scope.projectName),
     };
   }
 
@@ -398,6 +406,12 @@ export class SupervisionConsoleProducer {
    * its durable blocked reason so no PASS can sit silently unowned.
    */
   applyAuditReceipt(scope: SupervisionTaskConsoleScope, receipt: SupervisionAuditReceipt): SupervisionHandoffDecision {
+    const scoped = this.#db.prepare(
+      `SELECT 1 AS ok FROM supervision_tasks t
+       INNER JOIN supervision_task_assignments a ON a.task_id = t.task_id
+       WHERE t.task_id = ? AND t.project_name = ? AND a.assignment_id = ?`,
+    ).get(receipt.taskId, scope.projectName, receipt.assignmentId) as { ok?: number } | undefined;
+    if (!scoped?.ok) throw new Error('supervision audit receipt is outside the requested project scope');
     const task = this.#db.prepare(
       `SELECT status, current_revision, integration_owner FROM supervision_tasks WHERE task_id = ?`,
     ).get(receipt.taskId) as Record<string, unknown> | undefined;

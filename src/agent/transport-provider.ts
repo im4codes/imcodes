@@ -13,6 +13,7 @@
 import type { AgentMessage, MessageDelta, ToolCallEvent } from '../../shared/agent-message.js';
 import type { TransportEffortLevel } from '../../shared/effort-levels.js';
 import type { SessionContextBootstrapState } from '../../shared/session-context-bootstrap.js';
+import type { ProviderLimitSignal } from '../../shared/delegation-availability.js';
 import type { ProviderQuotaMeta } from '../../shared/provider-quota.js';
 import type { TransportAttachment } from '../../shared/transport-attachments.js';
 import type { MemoryMcpProviderStatusView } from '../../shared/memory-ws.js';
@@ -434,6 +435,16 @@ export interface SessionInfoUpdate extends SessionContextBootstrapState {
   quotaUsageLabel?: string;
   /** Structured quota metadata for recomputing display labels. */
   quotaMeta?: ProviderQuotaMeta;
+  /**
+   * Canonical provider limit verdict, mapped by the provider's own adapter.
+   *
+   * Separate from `quotaMeta` because they answer different questions.
+   * `quotaMeta` is display telemetry -- percentages and reset clocks -- and
+   * cannot say whether the provider is REFUSING us: Claude leaves
+   * `usedPercent` undefined while healthy, so thresholding it would be a
+   * policy we invented rather than a verdict the vendor stated.
+   */
+  limitSignal?: ProviderLimitSignal;
   /** Current reasoning/thinking effort, if known. */
   effort?: TransportEffortLevel;
   /**

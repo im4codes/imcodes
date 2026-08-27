@@ -16,8 +16,8 @@ function config(agentType: string, providerFamily: string, model: string): Super
   const runtimeType = 'transport' as const;
   return { agentType, providerFamily, model, runtimeType, capabilityId: buildSupervisionExecutionCapabilityId({ agentType, providerFamily, model, runtimeType }) };
 }
-const opus = config('claude-code-sdk', 'claude', 'opus[1M]');
-const gpt56 = config('codex-sdk', 'codex', 'gpt-5.6');
+const opus = config('claude-code-sdk', 'anthropic', 'opus[1M]');
+const gpt56 = config('codex-sdk', 'openai', 'gpt-5.6');
 const pools = normalizeSupervisionExecutionPools({
   state: 'configured',
   primaryDevelopmentPool: { configs: [opus, gpt56] },
@@ -80,7 +80,7 @@ describe('supervision execution pools', () => {
 
   it('never folds a third-party model hosted on claude-code-sdk into a Claude bucket', () => {
     // claude-code-sdk also hosts MiniMax-M3 / qwen3.8-27b. Those must stay verbatim.
-    const mini = config('claude-code-sdk', 'claude', 'MiniMax-M3');
+    const mini = config('claude-code-sdk', 'anthropic', 'MiniMax-M3');
     expect(mini.model).toBe('MiniMax-M3');
     const withMini = normalizeSupervisionExecutionPools({
       state: 'configured', primaryDevelopmentPool: { configs: [mini] }, economyTaskPool: { configs: [] },
@@ -105,9 +105,36 @@ describe('supervision execution pools', () => {
   it('migrates any observed backend+model without a hardcoded id allowlist', () => {
     // The live Claude id migrates even though it is not the canonical literal.
     expect(migrateLegacySupervisionExecutionPools({ backend: 'claude-code-sdk', model: 'claude-opus-5' }))
-      .toMatchObject({ state: 'configured', primaryDevelopmentPool: { configs: [{ model: 'opus[1M]', providerFamily: 'claude' }] } });
+      .toMatchObject({ state: 'configured', primaryDevelopmentPool: { configs: [{ model: 'opus[1M]', providerFamily: 'anthropic' }] } });
     expect(migrateLegacySupervisionExecutionPools({ backend: 'codex-sdk', model: 'gpt-5.6-sol' }))
-      .toMatchObject({ state: 'configured', primaryDevelopmentPool: { configs: [{ model: 'gpt-5.6-sol', providerFamily: 'codex' }] } });
+      .toMatchObject({ state: 'configured', primaryDevelopmentPool: { configs: [{ model: 'gpt-5.6-sol', providerFamily: 'openai' }] } });
+  });
+
+  it('binds a legacy-migrated pool to the canonical live provider identity', () => {
+    const migrated = migrateLegacySupervisionExecutionPools({
+      backend: 'claude-code-sdk',
+      model: 'claude-opus-5',
+    });
+    const selected = migrated.primaryDevelopmentPool.configs[0];
+    expect(selected).toMatchObject({
+      agentType: 'claude-code-sdk',
+      providerFamily: 'anthropic',
+      model: 'opus[1M]',
+    });
+    expect(evaluateSupervisionExecutionBinding({
+      pools: migrated,
+      pool: 'primary',
+      actual: {
+        sessionName: 'deck_alpha_w1',
+        sessionInstanceId: 'instance-1',
+        runtimeEpoch: 'epoch-1',
+        agentType: 'claude-code-sdk',
+        providerFamily: 'anthropic',
+        runtimeType: 'transport',
+        model: 'claude-opus-5',
+      },
+      requestedCapabilityId: selected?.capabilityId,
+    })).toMatchObject({ ok: true, requested: { providerFamily: 'anthropic' } });
   });
 
   it('keeps economy fail-closed and prevents direct finalization', () => {
@@ -130,7 +157,7 @@ describe('supervision execution pools', () => {
   });
 
   const definition = pools.primaryDevelopmentPool;
-  const base = { pool: 'primary' as const, definition, candidates: [] as never[], activeAssignments: 0, activeSpawned: 0, providerCapacity: { claude: { total: 3, inUse: 1 }, codex: { total: 2, inUse: 1 } }, parentSessionName: 'deck_alpha_brain', parentRunId: 'run-1', parentStage: 'implementation', idempotencyKey: 'spawn-1', now: 100 };
+  const base = { pool: 'primary' as const, definition, candidates: [] as never[], activeAssignments: 0, activeSpawned: 0, providerCapacity: { anthropic: { total: 3, inUse: 1 }, openai: { total: 2, inUse: 1 } }, parentSessionName: 'deck_alpha_brain', parentRunId: 'run-1', parentStage: 'implementation', idempotencyKey: 'spawn-1', now: 100 };
 
   it('reuses first, spawns same selected config idempotently, and enforces limits/headroom', () => {
     const spawned = planSupervisionExecutionCapacity(base);
@@ -140,7 +167,7 @@ describe('supervision execution pools', () => {
     expect(planSupervisionExecutionCapacity({ ...base, candidates: [{ config: gpt56, actual: actual(gpt56), available: true, limited: false, staleRuntime: false }] })).toMatchObject({ action: 'reuse' });
     expect(planSupervisionExecutionCapacity({ ...base, activeAssignments: definition.controls.maxConcurrency })).toEqual({ action: 'blocked', reason: 'max_concurrency' });
     expect(planSupervisionExecutionCapacity({ ...base, activeSpawned: definition.controls.maxSpawned })).toEqual({ action: 'blocked', reason: 'max_spawned' });
-    expect(planSupervisionExecutionCapacity({ ...base, providerCapacity: { claude: { total: 2, inUse: 1 }, codex: { total: 2, inUse: 1 } } })).toEqual({ action: 'blocked', reason: 'audit_headroom' });
+    expect(planSupervisionExecutionCapacity({ ...base, providerCapacity: { anthropic: { total: 2, inUse: 1 }, openai: { total: 2, inUse: 1 } } })).toEqual({ action: 'blocked', reason: 'audit_headroom' });
   });
 
   it('REFUSES reuse when the selected config and the OBSERVED identity disagree', () => {

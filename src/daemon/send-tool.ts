@@ -10,20 +10,43 @@ import {
 } from '../../shared/memory-mcp-contracts.js';
 import { sanitizeMcpErrorMessage } from '../../shared/mcp-error-sanitize.js';
 import { resolveEffectiveSessionModel } from '../../shared/session-model.js';
-import { getSessionRuntimeType } from '../../shared/agent-types.js';
-import type { SupervisionTaskMetadata } from '../../shared/supervision-config.js';
-import { delegationLimitGroup } from '../../shared/delegation-availability.js';
 import {
-  evaluateSupervisionExecutionBinding,
-  normalizeSupervisionExecutionModel,
-  normalizeSupervisionExecutionPools,
-} from '../../shared/supervision-execution-pool.js';
+  DELEGATION_AVAILABILITY,
+  delegationLimitGroup,
+  type DelegationAvailability,
+  type DelegationAlternative,
+  type DelegationLimitGroup,
+  type DelegationTargetAvailability,
+} from '../../shared/delegation-availability.js';
+import {
+  DELEGATION_ADMISSION_REASONS,
+  buildDelegationRefusal,
+  authorizedDelegationCandidates,
+  delegationTargetInputs,
+  evaluateDelegationAdmission,
+  type DelegationAdmissionReason,
+  type DelegationRefusal,
+} from './delegation-admission.js';
+import { resolveDelegationTargets } from '../../shared/delegation-availability.js';
 import { isDiscoverableInterAgentSession, resolveEffectiveProjectName, resolveRuntimeScope } from '../../shared/session-scope.js';
 import {
   AGENT_DELEGATION_PURPOSES,
   isAgentDelegationOpaqueId,
+  isDelegationReplyCapableAgentType,
   type AgentDelegationAuditRequest,
 } from '../../shared/agent-delegation.js';
+import { readSupervisionSnapshotFromTransportConfig, type SupervisionTaskMetadata } from '../../shared/supervision-config.js';
+import { getSessionRuntimeType } from '../../shared/agent-types.js';
+import {
+  evaluateSupervisionExecutionBinding,
+  type SupervisionExecutionBinding,
+  type SupervisionObservedExecutionIdentity,
+} from '../../shared/supervision-execution-pool.js';
+import {
+  resolvePeerAuditProviderFamily,
+  validateBrainAuditRoute as validateBrainAuditRouteAuthority,
+} from './peer-audit-candidates.js';
+import { supervisionCallerParticipates } from './supervision-mcp-tools.js';
 import {
   EXECUTION_CLONE_KIND,
   EXECUTION_CLONE_ERROR_CODES,
@@ -45,9 +68,9 @@ const EXECUTION_CLONE_TERMINAL_REASON_DESTROYED: ExecutionCloneTerminalReason =
   EXECUTION_CLONE_TERMINAL_REASONS.find((reason) => reason === 'destroyed')
   ?? EXECUTION_CLONE_TERMINAL_REASONS[0];
 import type { SessionRecord } from '../store/session-store.js';
+import { getSupervisionTaskRegistry, type PersistedSupervisionTaskAssignmentIdentity } from './supervision-state-store.js';
 import { getSession, listSessions } from '../store/session-store.js';
 import { isExecutionClone } from './execution-clone.js';
-import { validateBrainAuditRoute } from './peer-audit-candidates.js';
 import {
   createDelegationReplyAuthority,
   expireDelegationReplyAuthority,
@@ -61,6 +84,12 @@ export const SEND_TOOL_ERROR_REASONS = {
   IDENTITY_REJECTED: MCP_ERROR_REASONS.IDENTITY_REJECTED,
   VALIDATION_FAILED: MCP_ERROR_REASONS.VALIDATION_FAILED,
   WRITE_QUOTA_EXCEEDED: MCP_ERROR_REASONS.WRITE_QUOTA_EXCEEDED,
+  // The RECIPIENT's provider account is out of quota. Deliberately not folded
+  // into WRITE_QUOTA_EXCEEDED, which is about the CALLER writing too much: the
+  // two demand opposite responses (slow down vs. route elsewhere).
+  TARGET_LIMITED: MCP_ERROR_REASONS.TARGET_LIMITED,
+  // Missing / errored / offline. Separate retry semantics: no reset clock.
+  TARGET_UNAVAILABLE: MCP_ERROR_REASONS.TARGET_UNAVAILABLE,
   INTERNAL_ERROR: MCP_ERROR_REASONS.INTERNAL_ERROR,
 } as const satisfies Record<string, MCPErrorReason>;
 
@@ -112,6 +141,23 @@ export interface SendTargetInfo {
   qwenModel?: string;
   status: SessionRecord['state'];
   lastActiveAt: number;
+  /**
+   * Whether this target can actually take work right now.
+   *
+   * Distinct from `status`, which is the session's own runtime state and says
+   * nothing about its upstream quota: a target can be perfectly `idle` and
+   * still be refused by its provider, which is exactly the case an orchestrator
+   * used to have no way to see. It would hand over the task, get silence, and
+   * then try the next session on the same account and get silence again.
+   */
+  providerFamily: string;
+  availability: DelegationAvailability;
+  /** Sessions sharing one upstream account share a group, and share its limit. */
+  limitGroup: DelegationLimitGroup;
+  replyCapable: boolean;
+  limitedAt?: number;
+  retryAt?: number;
+  limitReason?: DelegationTargetAvailability['reason'];
 }
 
 export type SendToolErrorReason = (typeof SEND_TOOL_ERROR_REASONS)[keyof typeof SEND_TOOL_ERROR_REASONS];
@@ -147,17 +193,30 @@ export interface SendMessageInput {
   deliveryMode?: MemoryMcpSendDeliveryMode;
   /** Strict supervision-only metadata. Never infer this purpose from message text. */
   audit?: AgentDelegationAuditRequest;
-  /** Opens a tracked supervision task for this send. Declared, never inferred. */
-  task?: SupervisionTaskMetadata;
   /** Optional execution-clone request — see {@link SendMessageCloneRequest}. */
   clone?: SendMessageCloneRequest;
+  /** Optional supervised task metadata; when present daemon creates/binds a durable task assignment. */
+  task?: SupervisionTaskMetadata;
+  /**
+   * This send SPAWNS work rather than continuing a conversation (cron ticks,
+   * clone bootstraps).
+   *
+   * Widens the provider-limit gate to refuse unhealthy and unresolvable targets
+   * too. A human-initiated send to a struggling session is allowed to queue --
+   * that is often how it gets woken -- but a scheduler firing into one just
+   * grows a backlog nobody is draining. NOT settable from the MCP tool surface;
+   * only internal callers that know they are creating work set it.
+   */
+  newWorkload?: boolean;
 }
 
 export interface SendMessageDelivery {
   target: string;
   messageId?: SendMessageId;
   delegationId?: string;
-  status: 'delivered' | 'failed';
+  taskId?: string;
+  assignmentId?: string;
+  status: 'delivered' | 'queued' | 'failed';
   error?: string;
 }
 
@@ -171,12 +230,50 @@ export type SendMessageResult =
       idempotentReplay?: boolean;
       /** Present only when the send created an execution clone (input.clone). */
       clone?: { target: string; sessionName: string; hardTimeoutAt: number };
-      /** Present only when the send declared supervision task metadata. */
       taskId?: string;
       assignmentId?: string;
     }
   | { status: 'disabled'; reason: typeof MCP_ERROR_REASONS.FEATURE_DISABLED; disabledFlag: typeof SEND_MCP_DISPATCH_FEATURE_FLAG }
-  | { status: 'error'; reason: SendToolErrorReason; error: string };
+  | {
+      status: 'error';
+      reason: SendToolErrorReason;
+      error: string;
+      /**
+       * Present only on a `target_limited` refusal.
+       *
+       * Machine-readable so the caller re-routes instead of re-reading prose.
+       * `alternatives` is the point of the whole refusal: an orchestrator told
+       * only "no" retries the same family, which is the exact behaviour this
+       * feature exists to stop.
+       */
+      limited?: SendTargetLimitedInfo;
+    };
+
+/**
+ * A cron tick refused because its target's provider is out of quota.
+ *
+ * A distinct class so the executor can branch on the type instead of matching
+ * the message: a limited target is a WAIT, and every other dispatch failure is
+ * not, so collapsing them loses the only distinction the scheduler needs.
+ */
+export class CronSendTargetLimitedError extends Error {
+  constructor(
+    readonly reason: DelegationAdmissionReason,
+    message: string,
+    readonly limited: SendTargetLimitedInfo | undefined,
+  ) {
+    super(message);
+    this.name = 'CronSendTargetLimitedError';
+  }
+}
+
+/**
+ * Why a send was refused, and where the work can go instead.
+ *
+ * Re-exported from the admission service rather than restated: a second shape
+ * here would let the tool surface and the service drift apart.
+ */
+export type SendTargetLimitedInfo = DelegationRefusal;
 
 export interface HookSendDispatchInput {
   from: string;
@@ -187,6 +284,8 @@ export interface HookSendDispatchInput {
   reply?: boolean;
   /** Internal MCP path only: prefer native append, retain FIFO fallback. */
   deliveryMode?: MemoryMcpSendDeliveryMode;
+  /** This `/send` spawns work; see {@link SendMessageInput.newWorkload}. */
+  newWorkload?: boolean;
 }
 
 export interface HookSendDispatchResult {
@@ -405,87 +504,35 @@ export function listSendTargets(
       ].some((value) => String(value ?? '').toLowerCase().includes(query)))
     : candidates;
 
+  // Resolved over ALL sessions, before the query filter and the slice. Group
+  // evidence lives on whichever session met the provider, and that session may
+  // be filtered out or fall past the limit -- resolving after either would
+  // report a limited family as healthy precisely when the caller narrowed its
+  // search. Same resolver as `dispatchSendMessage`, so a target this list
+  // offers is never one the next send refuses.
+  const availability = resolveDelegationTargets(delegationTargetInputs(allSessions), d.now());
   return {
     status: 'ok',
-    items: filtered.slice(0, limit).map(toTargetInfo),
+    items: filtered.slice(0, limit).map((s) => toTargetInfo(
+      s,
+      availability.get(s.name) ?? {
+        availability: DELEGATION_AVAILABILITY.UNKNOWN,
+        limitGroup: delegationLimitGroup(s.agentType),
+      },
+    )),
   };
 }
 
-/**
- * Register the supervision task a `send_message` declared.
- *
- * The send tool never invents supervision state. It records the task the caller
- * DECLARED and binds it to the session that actually received the message. The
- * binding is evaluated against the CALLER's configured pools, so a recipient
- * running a config the pool never selected is recorded without a binding rather
- * than silently blessed as pool-eligible.
- *
- * Delivery has already happened by the time this runs, so a registry refusal
- * must not unsend anything; it degrades to returning no ids.
- */
-async function registerSendMessageTask(input: {
-  task: SupervisionTaskMetadata;
-  callerRecord: SessionRecord | undefined;
-  target: SessionRecord;
-  idempotencyKey?: string;
-}): Promise<{ taskId: string; assignmentId: string } | undefined> {
-  const objective = input.task.objective?.trim();
-  if (!objective) return undefined;
-  const { getSupervisionTaskRegistry } = await import('./supervision-state-store.js');
-  const registry = getSupervisionTaskRegistry();
-  const task = registry.createOrGet({
-    topLevelTaskId: input.task.topLevelTaskId ?? undefined,
-    ...(input.task.classification ? { classification: input.task.classification } : {}),
-    objective,
-    acceptance: input.task.acceptance ?? undefined,
-    idempotencyKey: input.idempotencyKey,
-  });
-  if (!task.ok) return undefined;
 
-  const agentType = input.target.agentType ?? '';
-  const rawModel = resolveEffectiveSessionModel(input.target) ?? '';
-  const actual = {
-    sessionName: input.target.name,
-    sessionInstanceId: input.target.sessionInstanceId ?? '',
-    runtimeEpoch: input.target.runtimeEpoch ?? '',
-    agentType,
-    providerFamily: delegationLimitGroup(agentType),
-    runtimeType: getSessionRuntimeType(agentType),
-    model: rawModel ? normalizeSupervisionExecutionModel(agentType, rawModel) : '',
+function supervisionTaskIdentityForTarget(target: SessionRecord): PersistedSupervisionTaskAssignmentIdentity | undefined {
+  if (!target.sessionInstanceId || !target.runtimeEpoch) return undefined;
+  return {
+    sessionName: target.name,
+    sessionInstanceId: target.sessionInstanceId,
+    runtimeEpoch: target.runtimeEpoch,
+    agentType: target.agentType,
+    providerFamily: resolvePeerAuditProviderFamily(target),
   };
-  const supervision = (input.callerRecord?.transportConfig as
-    { supervision?: { executionPools?: unknown } } | undefined)?.supervision;
-  // The caller DECLARES which pool the work belongs to; the daemon validates
-  // that declaration against the configured pools rather than choosing one.
-  const pool = input.task.executionPool ?? 'primary';
-  const binding = evaluateSupervisionExecutionBinding({
-    pools: normalizeSupervisionExecutionPools(supervision?.executionPools),
-    pool,
-    actual,
-    ...(input.task.requestedExecutionType
-      ? { requestedCapabilityId: input.task.requestedExecutionType.capabilityId } : {}),
-    ...(input.task.economyPolicy ? { economyPolicy: input.task.economyPolicy } : {}),
-  });
-  const assignment = registry.createAssignment({
-    taskId: task.value.taskId,
-    role: 'implementer',
-    identity: {
-      sessionName: actual.sessionName,
-      sessionInstanceId: actual.sessionInstanceId,
-      runtimeEpoch: actual.runtimeEpoch,
-      agentType: actual.agentType,
-      providerFamily: actual.providerFamily,
-    },
-    scopeFiles: input.task.ownedFiles ?? undefined,
-    idempotencyKey: input.idempotencyKey,
-    // `reused`: the recipient was an already-running session this send found,
-    // not one spawned to serve the task.
-    ...(binding.ok
-      ? { executionBinding: { pool, requested: binding.requested, actual, origin: 'reused' as const } }
-      : {}),
-  });
-  if (!assignment.ok) return undefined;
-  return { taskId: task.value.taskId, assignmentId: assignment.value.assignmentId };
 }
 
 export async function dispatchSendMessage(
@@ -533,6 +580,14 @@ export async function dispatchSendMessage(
     };
   }
 
+  if (input.task && (input.broadcast === true || Boolean(input.clone))) {
+    return {
+      status: 'error',
+      reason: MCP_ERROR_REASONS.VALIDATION_FAILED,
+      error: 'task metadata requires one exact non-clone target',
+    };
+  }
+
   // ── Execution-clone branch ──────────────────────────────────────────────
   // STRUCTURAL LIVENESS: only this branch references the execution-clone create
   // path. The ordinary (non-clone) send path below NEVER imports or calls
@@ -562,37 +617,181 @@ export async function dispatchSendMessage(
   const targets = resolveScopedTargets({ ...caller, projectName: callerProjectName }, input, allSessions, d.exactTargetOnly, 'exactCreatorOnly');
   if (!targets.ok) return { status: 'error', reason: targets.reason, error: targets.error };
 
-  // The Brain's route is VALIDATED here, never chosen here. This runs for every
-  // audit envelope, including sends carrying no task metadata: an audit whose
-  // route was never checked is exactly the case that used to slip through.
-  //
-  // One call site is sufficient and deliberate: the shape check above rejects
-  // audit+clone and audit+broadcast, so no other dispatch path can carry an
-  // audit envelope. A duplicate guard in the clone branch would be dead code
-  // that no test could kill.
-  if (input.audit) {
-    const route = validateBrainAuditRoute({
-      auditedSessionName: input.audit.auditedSessionName,
-      targetName: targets.targets[0]?.name ?? '',
-      allSessions,
-    });
-    if (!route.ok) {
-      // Map the ONE authoritative decision onto this boundary's surface.
-      const reason = route.refusal === 'self_audit'
-        ? MCP_ERROR_REASONS.IDENTITY_REJECTED
-        : MCP_ERROR_REASONS.VALIDATION_FAILED;
-      return { status: 'error', reason, error: route.detail };
-    }
+  // ── Provider-limit gate ────────────────────────────────────────────────
+  // Same resolver, same inputs as `send_list_targets`, so the list and the send
+  // can never disagree about one target. Refusing here rather than queueing is
+  // the whole point: a message dropped into a limited session's FIFO looks
+  // accepted and then sits there, so the orchestrator learns nothing and waits.
+  const gate = evaluateDelegationAdmission(allSessions, targets.targets, now, {
+    newWorkload: input.newWorkload === true,
+  });
+  const blockedTargets = gate.blocked;
+  const dispatchable = gate.dispatchable;
+  if (dispatchable.length === 0 && blockedTargets.length > 0) {
+    // Alternatives come from the caller's OWN discoverable sibling set, never
+    // from the account-wide evidence pool: suggesting a target the caller may
+    // not address would leak other projects' sessions and hidden clones.
+    const refusal = buildDelegationRefusal(
+      blockedTargets,
+      getSiblingSessions({ ...caller, projectName: callerProjectName }, allSessions),
+      gate.availability,
+    );
+    return {
+      status: 'error',
+      reason: refusal.reason,
+      error: blockedTargets.length === 1
+        ? `target ${blockedTargets[0]!.target} is ${blockedTargets[0]!.reason}`
+        : `every resolved target is unavailable (${refusal.reason})`,
+      limited: refusal,
+    };
+  }
+
+  if (input.task && dispatchable.length !== 1) {
+    return { status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED, error: 'task metadata requires exactly one dispatchable target' };
   }
 
   const fileRefs = sanitizeFileReferences(input.files, caller.projectRoot);
   if (!fileRefs.ok) return { status: 'error', reason: fileRefs.reason, error: fileRefs.error };
 
+  // THE single audit-route validator. Both the audit-only path and the task
+  // path call exactly this, so they can never diverge in strictness.
+  //
+  // The audited session comes from the Brain-supplied `auditedSessionName` and
+  // from nowhere else: not the caller (on a Brain-dispatched audit the caller is
+  // the Brain), not the target, not task metadata, not provider/model, not
+  // ancestry, not candidate ordering.
+  const validateBrainAuditRoute = (auditTarget: SessionRecord):
+    | { ok: true }
+    | { ok: false; reason: typeof MCP_ERROR_REASONS.IDENTITY_REJECTED | typeof MCP_ERROR_REASONS.VALIDATION_FAILED; error: string } => {
+    const route = validateBrainAuditRouteAuthority({
+      auditedSessionName: input.audit?.auditedSessionName,
+      targetName: auditTarget.name,
+      allSessions,
+    });
+    if (route.ok) return { ok: true };
+    return {
+      ok: false,
+      reason: route.refusal === 'self_audit'
+        ? MCP_ERROR_REASONS.IDENTITY_REJECTED
+        : MCP_ERROR_REASONS.VALIDATION_FAILED,
+      error: route.detail,
+    };
+  };
+
+  if (input.audit) {
+    const auditTarget = dispatchable[0];
+    if (!auditTarget) return { status: 'error', reason: MCP_ERROR_REASONS.IDENTITY_REJECTED, error: 'audit target is unavailable' };
+    const routeCheck = validateBrainAuditRoute(auditTarget);
+    if (!routeCheck.ok) return { status: 'error', reason: routeCheck.reason, error: routeCheck.error };
+  }
+
+  let supervisedTaskId: string | undefined;
+  let supervisedAssignmentId: string | undefined;
+  let supervisedExecutionBinding: SupervisionExecutionBinding | undefined;
+
+  if (input.task) {
+    const targetRecord = dispatchable[0]!;
+    const targetIdentity = supervisionTaskIdentityForTarget(targetRecord);
+    if (!targetIdentity) return { status: 'error', reason: MCP_ERROR_REASONS.IDENTITY_REJECTED, error: 'task target identity is unavailable' };
+    let executionBinding: SupervisionExecutionBinding | undefined;
+    let auditRoutingReason: import('../../shared/supervision-execution-pool.js').SupervisionAuditRoutingReason | undefined;
+    if (!input.audit) {
+      const callerRecord = allSessions.find((session) => session.name === caller.sessionName);
+      const model = resolveEffectiveSessionModel(targetRecord);
+      const runtimeType = targetRecord.runtimeType ?? getSessionRuntimeType(targetRecord.agentType);
+      const actual: Partial<SupervisionObservedExecutionIdentity> = {
+        sessionName: targetRecord.name,
+        sessionInstanceId: targetRecord.sessionInstanceId,
+        runtimeEpoch: targetRecord.runtimeEpoch,
+        agentType: targetRecord.agentType,
+        providerFamily: resolvePeerAuditProviderFamily(targetRecord),
+        runtimeType,
+        model,
+      };
+      const pool = input.task.executionPool ?? 'primary';
+      const checked = evaluateSupervisionExecutionBinding({
+        pools: readSupervisionSnapshotFromTransportConfig(callerRecord?.transportConfig).executionPools,
+        pool,
+        actual,
+        requestedCapabilityId: input.task.requestedExecutionType?.capabilityId,
+        economyPolicy: input.task.economyPolicy ?? undefined,
+      });
+      if (!checked.ok) return { status: 'error', reason: MCP_ERROR_REASONS.IDENTITY_REJECTED, error: `development execution pool rejected target: ${checked.reason}` };
+      executionBinding = { pool, requested: checked.requested, actual: actual as SupervisionObservedExecutionIdentity, origin: 'reused' };
+      supervisedExecutionBinding = executionBinding;
+    } else {
+      // Same single validator as the audit-only path above; already run.
+      const taskRouteCheck = validateBrainAuditRoute(targetRecord);
+      if (!taskRouteCheck.ok) return { status: 'error', reason: taskRouteCheck.reason, error: taskRouteCheck.error };
+    }
+    const registry = getSupervisionTaskRegistry();
+    const requestedTaskId = input.task.taskId?.trim();
+    let taskId: string;
+    if (requestedTaskId) {
+      const existing = registry.get(requestedTaskId);
+      // Explicit task ids are references, never create requests. Keep missing
+      // and unauthorized indistinguishable so send_message is not a task-id
+      // existence oracle.
+      if (!existing
+        || existing.projectName !== callerProjectName
+        || !supervisionCallerParticipates(existing, caller.sessionName)) {
+        return {
+          status: 'error',
+          reason: MCP_ERROR_REASONS.IDENTITY_REJECTED,
+          error: 'task is not visible to this caller',
+        };
+      }
+      taskId = existing.taskId;
+    } else {
+      const task = registry.createOrGet({
+        projectName: callerProjectName,
+        topLevelTaskId: input.task.topLevelTaskId,
+        classification: input.task.classification ?? 'integration_slice',
+        objective: input.task.objective,
+        acceptance: input.task.acceptance,
+        baseRevision: input.task.baseRevision,
+        currentRevision: input.task.currentRevision,
+        idempotencyKey: idempotencyKey ? `send:${idempotencyKey}` : undefined,
+        now,
+      });
+      if (!task.ok) return { status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED, error: `task registry rejected task: ${task.reason}` };
+      taskId = task.value.taskId;
+    }
+    const assignment = registry.createAssignment({
+      taskId,
+      role: input.audit ? 'auditor' : 'implementer',
+      identity: targetIdentity,
+      scopeFiles: [...(input.task.ownedFiles ?? []), ...(input.task.sharedFiles ?? [])],
+      claimMode: input.audit ? 'read_only' : 'exclusive',
+      auditAttemptId: input.task.auditAttemptId ?? input.audit?.attemptId,
+      auditRevision: input.task.auditRevision,
+      ...(executionBinding ? { executionBinding } : {}),
+      ...(input.task.economyPolicy ? { economyPolicy: input.task.economyPolicy } : {}),
+      ...(auditRoutingReason ? { auditRoutingReason } : {}),
+      idempotencyKey: idempotencyKey ? `send:${idempotencyKey}` : undefined,
+      now,
+    });
+    if (!assignment.ok) return { status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED, error: `task registry rejected assignment: ${assignment.reason}` };
+    supervisedTaskId = taskId;
+    supervisedAssignmentId = assignment.value.assignmentId;
+  }
+
   const dispatchId = createSendDispatchId();
   const callerRecord = allSessions.find((session) => session.name === caller.sessionName);
   const deliveries: SendMessageDelivery[] = [];
 
-  for (const target of targets.targets) {
+  // A partial broadcast still reports the limited recipients. Dropping them
+  // silently would let the caller read "accepted" and believe every sibling got
+  // the message.
+  for (const blockedTarget of blockedTargets) {
+    deliveries.push({
+      target: blockedTarget.target,
+      status: 'failed',
+      error: `${blockedTarget.reason}: target cannot accept work`,
+    });
+  }
+
+  for (const target of dispatchable) {
     const messageId = createSendMessageId();
     const replyAuthority = input.reply
       ? createDelegationReplyAuthority({
@@ -612,14 +811,25 @@ export async function dispatchSendMessage(
       });
       continue;
     }
+    const assignmentMessage = supervisedExecutionBinding
+      ? [
+          '[Daemon-resolved development assignment]',
+          `Pool: ${supervisedExecutionBinding.pool}`,
+          `Requested config: ${JSON.stringify(supervisedExecutionBinding.requested)}`,
+          `Observed runtime identity: ${JSON.stringify(supervisedExecutionBinding.actual)}`,
+          'Eligibility was decided by the coordinator from daemon evidence. Start the task directly; do not self-report or guess your model.',
+          '',
+          input.message,
+        ].join('\n')
+      : input.message;
     const message = buildSessionDispatchMessage({
-      message: input.message,
+      message: assignmentMessage,
       files: fileRefs.files,
       replyTo: input.reply ? caller.sessionName : null,
       ...(replyAuthority ? { replyAuthority: replyAuthority.authority } : {}),
     });
     try {
-      await d.dispatchMessage(target, message, {
+      const dispatchResult = await d.dispatchMessage(target, message, {
         dispatchId,
         messageId,
         deliveryMode: input.deliveryMode ?? MEMORY_MCP_SEND_DELIVERY_MODES.APPEND,
@@ -629,7 +839,9 @@ export async function dispatchSendMessage(
         target: target.name,
         messageId,
         ...(replyAuthority ? { delegationId: replyAuthority.record.delegationId } : {}),
-        status: 'delivered',
+        ...(supervisedTaskId ? { taskId: supervisedTaskId } : {}),
+        ...(supervisedAssignmentId ? { assignmentId: supervisedAssignmentId } : {}),
+        status: dispatchResult === 'queued' ? 'queued' : 'delivered',
       });
     } catch (err) {
       if (replyAuthority) expireDelegationReplyAuthority(replyAuthority.record.delegationId);
@@ -637,9 +849,9 @@ export async function dispatchSendMessage(
     }
   }
 
-  const delivered = deliveries.filter((delivery) => delivery.status === 'delivered');
-  const failed = deliveries.length - delivered.length;
-  if (delivered.length === 0) {
+  const successful = deliveries.filter((delivery) => delivery.status !== 'failed');
+  const failed = deliveries.length - successful.length;
+  if (successful.length === 0) {
     return {
       status: 'error',
       reason: MCP_ERROR_REASONS.INTERNAL_ERROR,
@@ -647,24 +859,14 @@ export async function dispatchSendMessage(
     };
   }
 
-  // A declared task binds to exactly ONE recipient. A broadcast has no single
-  // session to assign, so the ids are omitted rather than guessed at.
-  const taskTarget = delivered.length === 1
-    ? targets.targets.find((record) => record.name === delivered[0]?.target)
-    : undefined;
-  const registered = input.task && taskTarget
-    ? await registerSendMessageTask({
-      task: input.task, callerRecord, target: taskTarget, idempotencyKey: input.idempotencyKey,
-    })
-    : undefined;
-
   const accepted: Extract<SendMessageResult, { status: 'accepted' }> = {
     status: 'accepted',
     dispatchId,
-    ...(deliveries.length === 1 && delivered[0]?.messageId ? { messageId: delivered[0].messageId } : {}),
+    ...(deliveries.length === 1 && successful[0]?.messageId ? { messageId: successful[0].messageId } : {}),
     deliveries,
+    ...(supervisedTaskId ? { taskId: supervisedTaskId } : {}),
+    ...(supervisedAssignmentId ? { assignmentId: supervisedAssignmentId } : {}),
     ...(failed > 0 ? { partial: true } : {}),
-    ...(registered ? { taskId: registered.taskId, assignmentId: registered.assignmentId } : {}),
   };
   if (cacheKey && failed === 0) idempotencyCache.set(cacheKey, { expiresAt: now + SEND_IDEMPOTENCY_WINDOW_MS, result: accepted });
   return accepted;
@@ -730,6 +932,30 @@ async function dispatchExecutionCloneSend(
     return { status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED, error: 'clone requires exactly one target template' };
   }
   const templateSessionName = targets.targets[0].name;
+
+  // ── Provider-limit gate, on the TEMPLATE ────────────────────────────────
+  // A clone inherits its template's agentType, so it inherits the template's
+  // provider account and therefore its limit. Creating one anyway spawns a
+  // worker that cannot do anything, and because the clone is ephemeral with a
+  // hard timeout it would be torn down having burned its whole lifetime
+  // waiting on a quota that was already exhausted before it started.
+  //
+  // Checked BEFORE the idempotency cache and the create call: refusing after
+  // creation would leave an orphan to reap.
+  const cloneGate = evaluateDelegationAdmission(allSessions, targets.targets, d.now(), { newWorkload: true });
+  if (cloneGate.blocked.length > 0) {
+    const refusal = buildDelegationRefusal(
+      cloneGate.blocked,
+      getSiblingSessions(caller, allSessions),
+      cloneGate.availability,
+    );
+    return {
+      status: 'error',
+      reason: refusal.reason,
+      error: `clone template ${templateSessionName} is ${cloneGate.blocked[0]!.reason}`,
+      limited: refusal,
+    };
+  }
 
   const fileRefs = sanitizeFileReferences(input.files, caller.projectRoot);
   if (!fileRefs.ok) return { status: 'error', reason: fileRefs.reason, error: fileRefs.error };
@@ -832,8 +1058,9 @@ async function dispatchExecutionCloneSend(
     replyAuthority: replyAuthority.authority,
   });
 
+  let dispatchResult: SendDispatchMessageResult;
   try {
-    await d.dispatchMessage(cloneRecord, message, {
+    dispatchResult = await d.dispatchMessage(cloneRecord, message, {
       dispatchId,
       messageId,
       ...buildSharedServerMemberSharedActorOption(caller, callerRecord, cloneRecord, messageId, now),
@@ -853,7 +1080,7 @@ async function dispatchExecutionCloneSend(
       target: created.target,
       messageId,
       delegationId: replyAuthority.record.delegationId,
-      status: 'delivered',
+      status: dispatchResult === 'queued' ? 'queued' : 'delivered',
     }],
     clone: {
       target: created.target,
@@ -1031,7 +1258,32 @@ export async function dispatchHookSend(input: HookSendDispatchInput, deps?: Send
   const callerRecord = d.getSession(input.from) ?? undefined;
   const now = d.now();
 
-  for (const target of input.targetRecords) {
+  // ── Provider-limit gate ────────────────────────────────────────────────
+  // Same admission service as `send_message`, so `/send` cannot become
+  // the way around it. This path takes `targetRecords` directly rather than
+  // resolving them, which is exactly why it needed its own call: nothing
+  // upstream of here consults availability.
+  const hookSessions = d.listSessions();
+  const hookGate = evaluateDelegationAdmission(hookSessions, input.targetRecords, now, {
+    newWorkload: input.newWorkload === true,
+  });
+  for (const blocked of hookGate.blocked) {
+    const refusal = buildDelegationRefusal(
+      [blocked],
+      getSiblingSessions(
+        { userId: input.from, sessionName: input.from, projectName: callerRecord?.projectName ?? null, projectRoot: null },
+        hookSessions,
+      ),
+      hookGate.availability,
+    );
+    errors.push(
+      `${blocked.target}: ${blocked.reason}`
+      + `${blocked.retryAt === undefined ? '' : ` (retry after ${new Date(blocked.retryAt).toISOString()})`}`
+      + `${refusal.alternatives.length === 0 ? '' : `; alternatives: ${refusal.alternatives.map((a) => a.target).join(', ')}`}`,
+    );
+  }
+
+  for (const target of hookGate.dispatchable) {
     const messageId = createSendMessageId();
     const replyAuthority = input.reply
       ? createDelegationReplyAuthority({
@@ -1076,7 +1328,7 @@ export async function dispatchHookSend(input: HookSendDispatchInput, deps?: Send
         target: target.name,
         messageId,
         ...(replyAuthority ? { delegationId: replyAuthority.record.delegationId } : {}),
-        status: 'delivered',
+        status: result === 'queued' ? 'queued' : 'delivered',
       });
     } catch (err) {
       if (replyAuthority) expireDelegationReplyAuthority(replyAuthority.record.delegationId);
@@ -1102,8 +1354,23 @@ export async function dispatchCronSend(input: CronSendDispatchInput, deps?: Send
     ...(input.reply !== undefined ? { reply: input.reply } : {}),
     ...(input.broadcast !== undefined ? { broadcast: input.broadcast } : {}),
     ...(input.idempotencyKey ? { idempotencyKey: input.idempotencyKey } : {}),
+    // A cron tick creates work on a schedule nobody is watching, so it gets the
+    // wider refusal: firing every N minutes into a target that cannot run the
+    // task builds a backlog and burns the retry budget for nothing.
+    newWorkload: true,
   }, deps);
   if (result.status !== 'accepted') {
+    if (result.status === 'error'
+      && (result.reason === SEND_TOOL_ERROR_REASONS.TARGET_LIMITED
+        || result.reason === SEND_TOOL_ERROR_REASONS.TARGET_UNAVAILABLE)) {
+      // Thrown as a TYPED refusal, not a bare message. A scheduler needs to
+      // tell "wait for the reset at T" apart from "this target is gone" --
+      // flattening both into an Error string makes the first look permanent and
+      // the second look retryable, which is exactly backwards. The reason is
+      // carried through rather than fixed, so the two stay distinguishable all
+      // the way to the control plane.
+      throw new CronSendTargetLimitedError(result.reason, result.error, result.limited);
+    }
     throw new Error(result.status === 'disabled' ? `send disabled: ${result.disabledFlag}` : result.error);
   }
   return {
@@ -1123,7 +1390,7 @@ function optionalModelField(value: string | null | undefined): string | undefine
   return trimmed ? trimmed : undefined;
 }
 
-function toTargetInfo(s: SessionRecord): SendTargetInfo {
+function toTargetInfo(s: SessionRecord, availability: DelegationTargetAvailability): SendTargetInfo {
   const model = resolveEffectiveSessionModel(s);
   const activeModel = optionalModelField(s.activeModel);
   const requestedModel = optionalModelField(s.requestedModel);
@@ -1142,6 +1409,13 @@ function toTargetInfo(s: SessionRecord): SendTargetInfo {
     ...(qwenModel ? { qwenModel } : {}),
     status: s.state,
     lastActiveAt: s.updatedAt,
+    providerFamily: resolvePeerAuditProviderFamily(s),
+    availability: availability.availability,
+    limitGroup: availability.limitGroup,
+    replyCapable: isDelegationReplyCapableAgentType(s.agentType),
+    ...(availability.limitedAt === undefined ? {} : { limitedAt: availability.limitedAt }),
+    ...(availability.retryAt === undefined ? {} : { retryAt: availability.retryAt }),
+    ...(availability.reason === undefined ? {} : { limitReason: availability.reason }),
   };
 }
 
@@ -1151,15 +1425,16 @@ function toTargetInfo(s: SessionRecord): SendTargetInfo {
  * (their only legitimate follow-up target is the `result.clone.target` returned
  * by the originating clone send). This is the `discoverable` resolution mode.
  */
+/**
+ * Delegates to the ONE authorized-candidate resolver.
+ *
+ * Kept as a local name because the send tool calls it in several places, but
+ * the rule itself lives in the admission service so the P2P orchestrator gets
+ * the identical answer. It previously approximated one for itself and leaked
+ * the caller's own session and a hidden execution clone as "alternatives".
+ */
 function getSiblingSessions(caller: SendRuntimeCaller, allSessions: SessionRecord[]): SessionRecord[] {
-  const callerProjectName = effectiveCallerProjectName(caller, allSessions);
-  return allSessions.filter((s) => (
-    s.state !== 'stopped'
-    && s.name !== caller.sessionName
-    && !isExecutionClone(s)
-    && isDiscoverableInterAgentSession(s)
-    && effectiveProjectName(s, allSessions) === callerProjectName
-  ));
+  return authorizedDelegationCandidates(caller, allSessions);
 }
 
 /**

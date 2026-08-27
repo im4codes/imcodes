@@ -444,7 +444,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   },
   [MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE]: {
     name: MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE,
-    description: 'Send a plain-text request to an exact send_list_targets target, for example asking a CC session to audit. The caller session is not a valid target; an empty send_list_targets result means none exists. deliveryMode defaults to append: a busy compatible provider receives the message by direct non-preemptive append at its next safe boundary, while unsupported, racing, or temporarily unready targets retain delivery through the ordinary durable queue. Set deliveryMode=queue to always retain the message in ordinary durable FIFO instead of inserting it into the active turn. It does not start a structured Team/P2P discussion run. Files are project-root path references, not bytes. Returns dispatch/message ids and delivery status.',
+    description: 'Send a plain-text request to an exact send_list_targets target, for example asking a CC session to audit. Callers and labels are invalid targets; an empty send_list_targets result means none exists. deliveryMode append (default) sends by direct non-preemptive append when supported, while unsupported, racing, or temporarily unready targets retain delivery through the ordinary durable FIFO fallback. deliveryMode=queue always uses FIFO, retaining the message in ordinary durable storage instead of inserting it into the active turn. It does not start a structured Team/P2P discussion run. Files are project-root path references, not bytes. Returns dispatch/message ids and delivered/queued/failed status.',
     inputSchema: objectSchema({
       target: stringSchema('Required exact target session value. For an ordinary peer, use the exact send_list_targets.target value. For a follow-up to an execution clone you created, use the exact result.clone.target from the originating clone send — execution clones are NOT returned by send_list_targets and only their creator may address them. Always use the exact target name; never a label or agentType value.'),
       message: stringSchema(`Required complete task/request text to deliver, up to ${MEMORY_MCP_CAPS.SEND_MESSAGE_MAX_BYTES} UTF-8 bytes. Include the desired role and output, such as audit findings, discussion input, plan, implementation request, or verification result.`),
@@ -462,7 +462,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
       reply: booleanSchema('Optional request for correlated replies to the runtime-bound caller session. Set true for audit/review reports or discussion invites; the target receives an opaque delegation id and bounded capability that may send multiple replies until expiry, and each structured reply is delivered through the caller provider’s active-turn notification path when supported. Do not poll session state, logs, transcripts, or the target after a reply-enabled send.'),
       task: {
         ...objectSchema({
-          taskId: stringSchema('Optional stable task id; omitted means daemon generates one.'),
+          taskId: stringSchema('Optional existing visible task id to bind; omitted creates a task. Missing or inaccessible ids fail and are never silently reminted.'),
           topLevelTaskId: stringSchema('Optional top-level task id.'),
           sliceId: stringSchema('Optional slice id.'),
           classification: { type: 'string', enum: [...SUPERVISION_TASK_CLASSIFICATIONS], description: 'Task classification.' },
@@ -487,7 +487,8 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
             description: 'Exact supervision-audit purpose. Ordinary reply-enabled delegations must omit this object.',
           },
           attemptId: stringSchema('Exact automatic supervision audit attempt id supplied by the orchestration request.'),
-        }, ['kind', 'attemptId']),
+          auditedSessionName: stringSchema('Exact session being audited, chosen by the Supervisor Brain. The daemon never infers it.'),
+        }, ['kind', 'attemptId', 'auditedSessionName']),
         description: 'Strict automatic-supervision metadata. Requires reply=true, one exact target, no broadcast, and no clone.',
       },
       broadcast: booleanSchema('Optional project-scoped broadcast request; unavailable for unscoped callers. Use targeted sends for singular requests like "ask a reviewer"; use broadcast only when the user asks every/all available sessions.'),

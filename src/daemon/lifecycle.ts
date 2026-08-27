@@ -84,9 +84,9 @@ import { homedir } from 'node:os';
 import { mkdirSync } from 'node:fs';
 import {
   createSupervisionConsoleBinding,
+  isAuthorizedSupervisionConsoleScope,
   type SupervisionConsoleBinding,
 } from './supervision-console-binding.js';
-import { isValidImcodesSessionName } from '../../shared/session-scope.js';
 
 let supervisionConsole: SupervisionConsoleBinding | undefined;
 
@@ -1342,7 +1342,7 @@ export async function startup(): Promise<DaemonContext> {
       serverLink,
       database: new DatabaseSync(supervisionConsoleDbPath()) as never,
       // Only the coordinator that owns a project scope may subscribe to it.
-      authorize: (scope) => isValidImcodesSessionName(scope.coordinatorSessionName),
+      authorize: (scope) => isAuthorizedSupervisionConsoleScope(scope, listSessions()),
     });
     logger.info({ epoch: supervisionConsole.projectionEpoch }, 'supervision console bound');
   } catch (err) {

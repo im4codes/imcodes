@@ -1,5 +1,5 @@
 import { getSessionRuntimeType, isClaudeCodeFamily } from './agent-types.js';
-import { delegationLimitGroup } from './delegation-availability.js';
+import { resolvePeerAuditProviderFamily } from './peer-audit.js';
 import { normalizeClaudeCodeModelId } from '../src/shared/models/options.js';
 
 export const SUPERVISION_EXECUTION_POOL_KINDS = ['primary', 'economy'] as const;
@@ -232,7 +232,7 @@ export function migrateLegacySupervisionExecutionPools(input: {
   const migration = backend && model && !isExcludedDevelopmentModel(model)
     ? {
       agentType: backend,
-      providerFamily: delegationLimitGroup(backend),
+      providerFamily: resolvePeerAuditProviderFamily({ agentType: backend }),
       runtimeType: getSessionRuntimeType(backend),
       model,
     }

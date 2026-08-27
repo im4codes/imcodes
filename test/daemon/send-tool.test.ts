@@ -75,6 +75,11 @@ describe('send-tool', () => {
         modelDisplay: 'gpt-5.4-display',
         status: 'idle',
         lastActiveAt: 20,
+        // Delegation-eligibility projection required by the published contract.
+        providerFamily: 'openai',
+        availability: 'ready',
+        limitGroup: 'codex',
+        replyCapable: true,
       },
     ]);
     expect(result.items[0]).not.toHaveProperty('projectDir');
@@ -172,7 +177,10 @@ describe('send-tool', () => {
       dispatchMessage,
     });
 
-    expect(result).toMatchObject({ status: 'accepted' });
+    expect(result).toMatchObject({
+      status: 'accepted',
+      deliveries: [expect.objectContaining({ target: 'deck_alpha_w1', status: 'queued' })],
+    });
     expect(dispatchMessage).toHaveBeenCalledWith(
       expect.objectContaining({ name: 'deck_alpha_w1' }),
       'wait your turn',
@@ -530,6 +538,9 @@ describe('send-tool', () => {
     });
 
     expect(result.queued).toEqual(['deck_alpha_brain']);
+    expect(result.messages).toEqual([
+      expect.objectContaining({ target: 'deck_alpha_brain', status: 'queued' }),
+    ]);
     expect(dispatchMessage.mock.calls[0][2]).toMatchObject({
       deliveryMode: 'append',
       sharedActor: {
@@ -592,6 +603,9 @@ describe('send-tool', () => {
       purpose: AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT,
       auditAttemptId: 'automatic_audit_attempt_1',
     });
+    expect(dispatchMessage.mock.calls[0][1]).toContain('peer_audit_reply');
+    expect(dispatchMessage.mock.calls[0][1]).toContain('"attemptId": "automatic_audit_attempt_1"');
+    expect(dispatchMessage.mock.calls[0][1]).not.toContain('Use the delegation_reply tool');
 
     await expect(dispatchSendMessage(caller, {
       target: target.name,

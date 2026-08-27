@@ -73,6 +73,8 @@ export interface AgentDelegationReplyEnvelope {
 export interface AgentDelegationReplyAuthority {
   delegationId: string;
   replyCapability: string;
+  /** Present only for a supervision audit; selects the dedicated reply ingress. */
+  audit?: AgentDelegationAuditRequest;
 }
 
 export const AGENT_DELEGATION_PURPOSES = {
@@ -300,6 +302,17 @@ export function buildAgentDelegationReplyInstruction(
   if (authority) {
     if (!isAgentDelegationOpaqueId(authority.delegationId)
       || !isAgentDelegationReplyCapability(authority.replyCapability)) return '';
+    if (authority.audit?.kind === AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT) {
+      return [
+        `${AGENT_DELEGATION_STRUCTURED_REPLY_INSTRUCTION_MARKER} ${JSON.stringify({
+          delegationId: authority.delegationId,
+          replyCapability: authority.replyCapability,
+        })}`,
+        'This is a supervision audit reply capability. Do not use delegation_reply for this audit.',
+        'Use the peer_audit_reply tool with these exact fields:',
+        `{ "attemptId": ${JSON.stringify(authority.audit.attemptId)}, "replyCapability": ${JSON.stringify(authority.replyCapability)}, "verdict": "PASS|REWORK", "findings": "<bounded findings>", "validations": [{ "kind": "test", "label": "<check>", "outcome": "passed|failed|unavailable", "summary": "<exact result or reason>" }] }`,
+      ].join('\n');
+    }
     return [
       `${AGENT_DELEGATION_STRUCTURED_REPLY_INSTRUCTION_MARKER} ${JSON.stringify(authority)}`,
       `Use the delegation_reply tool with the delegationId and replyCapability above plus result: "<your response>" whenever you need to reply. The same capability may send multiple structured replies until it expires; each reply is routed directly to ${JSON.stringify(replyToSession)}. Do not use send_message or imcodes send for these replies.`,

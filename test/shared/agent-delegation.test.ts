@@ -243,6 +243,29 @@ describe('agent delegation shared contract', () => {
     })).toEqual({ ok: false, error: 'unknown_field' });
   });
 
+  it('renders supervision-audit reply authorities as peer_audit_reply instructions, not free-text delegation replies', () => {
+    const delegationId = 'delegation_identity_1234567890';
+    const replyCapability = 'reply_capability_1234567890_ABCDEFG';
+    const instruction = buildAgentDelegationReplyInstruction('deck_repo_brain', {
+      delegationId,
+      replyCapability,
+      audit: {
+        kind: 'supervision_audit',
+        attemptId: 'attempt-r5',
+        auditedSessionName: 'deck_sub_implementation',
+      },
+    });
+    expect(instruction).toContain(AGENT_DELEGATION_STRUCTURED_REPLY_INSTRUCTION_MARKER);
+    expect(instruction).toContain('peer_audit_reply');
+    expect(instruction).toContain('"attemptId": "attempt-r5"');
+    expect(instruction).toContain('"replyCapability":');
+    expect(instruction).not.toContain('Use the delegation_reply tool');
+    expect(extractAgentDelegationReplyAuthorityFromInstruction(instruction)).toEqual({
+      delegationId,
+      replyCapability,
+    });
+  });
+
   it('builds a current-session orchestration prompt for UI-picked single-agent delegation', () => {
     const prompt = buildAgentDelegationOrchestrationPrompt({
       targetSession: 'deck_repo_w1',

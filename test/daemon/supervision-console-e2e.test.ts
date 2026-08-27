@@ -1,7 +1,7 @@
 import { DatabaseSync } from 'node:sqlite';
 import { beforeEach, describe, expect, it } from 'vitest';
 import {
-  createSupervisionConsoleBinding, resolveSupervisionProjectionEpoch,
+  createSupervisionConsoleBinding, isAuthorizedSupervisionConsoleScope, resolveSupervisionProjectionEpoch,
   type SupervisionConsoleLink,
 } from '../../src/daemon/supervision-console-binding.js';
 import type { SupervisionMigrationDb } from '../../src/daemon/supervision-store-migrations.js';
@@ -109,6 +109,20 @@ beforeEach(() => {
     payload_json, created_at, updated_at) VALUES ('tsk_a','top','slice','implementing','{}',1,1)`).run();
   browser = new BrowserClient();
   connect('epoch-1');
+  db.prepare("UPDATE supervision_tasks SET project_name = 'codedeck' WHERE task_id = 'tsk_a'").run();
+});
+
+describe('scope authorization', () => {
+  const coordinator = {
+    name: 'deck_cd_brain', projectName: 'codedeck', role: 'brain', agentType: 'codex',
+    projectDir: '/work/codedeck', state: 'idle', restarts: 0, restartTimestamps: [], createdAt: 1, updatedAt: 1,
+  } as never;
+  it('requires the exact live brain and its effective project', () => {
+    expect(isAuthorizedSupervisionConsoleScope(SCOPE, [coordinator])).toBe(true);
+    expect(isAuthorizedSupervisionConsoleScope({ ...SCOPE, projectName: 'other' }, [coordinator])).toBe(false);
+    expect(isAuthorizedSupervisionConsoleScope(SCOPE, [{ ...coordinator, role: 'w1' }])).toBe(false);
+    expect(isAuthorizedSupervisionConsoleScope(SCOPE, [])).toBe(false);
+  });
 });
 
 describe('producer -> link -> browser E2E', () => {

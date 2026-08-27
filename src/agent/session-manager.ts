@@ -35,6 +35,7 @@ import {
   upsertSession,
   removeSession,
   listSessions as storeSessions,
+  mergeProviderLimitSignal,
   updateSessionState,
   type SessionRecord,
   type SessionState,
@@ -1882,6 +1883,26 @@ function wireTransportSessionInfo(
 
     if (effQuotaMeta !== undefined && !providerQuotaMetaEquals(next.quotaMeta, effQuotaMeta)) {
       next.quotaMeta = effQuotaMeta;
+      changed = true;
+    }
+
+    // THE CANONICAL LIMIT VERDICT, MERGED INTO THE SAME RECORD WE PERSIST.
+    //
+    // This MUST fold into `next`. `next` was snapshotted from the stored record
+    // at the top of this function, and the `upsertSession(next)` below writes
+    // it back whole -- so mutating the store separately here and letting the
+    // upsert follow would revert the limit we just recorded. That is not a
+    // theoretical ordering nit: Claude emits `quotaMeta` and `limitSignal` on
+    // the SAME `SessionInfoUpdate`, so the quota field guarantees `changed` is
+    // true and the very event reporting a refusal is the one whose write erases
+    // it. The store held the correct value for a moment, which is why nothing
+    // downstream noticed.
+    //
+    // `mergeProviderLimitSignal` shares its decision with the store's own
+    // mutator, so there is still exactly one rule for when a limit may be set
+    // or cleared. It reports whether the record actually changed, so a caller
+    // can notify once rather than on every repeated rate-limit event.
+    if (info.limitSignal && mergeProviderLimitSignal(next, info.limitSignal)) {
       changed = true;
     }
 

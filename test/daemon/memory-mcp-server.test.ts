@@ -338,7 +338,9 @@ describe('memory MCP stdio server', () => {
         const body = JSON.parse(raw) as Record<string, unknown>;
         hookBodies.push(body);
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: true, delivered: true, target: body.to }));
+        res.end(JSON.stringify(body.deliveryMode === 'queue'
+          ? { ok: true, queued: true, target: body.to }
+          : { ok: true, delivered: true, target: body.to }));
       });
     });
 
@@ -388,7 +390,7 @@ describe('memory MCP stdio server', () => {
       });
       expect(queuedResult.structuredContent).toMatchObject({
         status: 'accepted',
-        deliveries: [expect.objectContaining({ target: 'deck_sub_peer', status: 'delivered' })],
+        deliveries: [expect.objectContaining({ target: 'deck_sub_peer', status: 'queued' })],
       });
       expect(hookBodies.at(-1)).toEqual({
         from: 'deck_sub_worker',
@@ -591,7 +593,9 @@ describe('memory MCP stdio server', () => {
         const body = JSON.parse(raw) as Record<string, unknown>;
         hookBodies.push(body);
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: true, delivered: true, target: body.to }));
+        res.end(JSON.stringify(body.deliveryMode === 'queue'
+          ? { ok: true, queued: true, target: body.to }
+          : { ok: true, delivered: true, target: body.to }));
       });
     });
 

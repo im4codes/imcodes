@@ -48,6 +48,7 @@ export function createDelegationReplyAuthority(input: {
     authority: {
       delegationId: created.record.delegationId,
       replyCapability: created.replyCapability,
+      ...(input.audit ? { audit: input.audit } : {}),
     },
   };
 }

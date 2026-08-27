@@ -142,6 +142,7 @@ import { GitOriginRepositoryIdentityService } from '../agent/repository-identity
 import { ALIAS_DESCRIPTION_MAX, ALIAS_MCP_TOOLS, toAliasMetadata, type AliasMcpToolName } from '../../shared/alias-types.js';
 import { mapLegacySupervisionUpdate, mapLegacySupervisionFinish } from './supervision-compat-shims.js';
 import { resolveSupervisionIntent } from './supervision-intent-ops.js';
+import { supervisionCallerParticipates } from './supervision-mcp-tools.js';
 import {
   aliasMcpList,
   aliasMcpResolve,
@@ -1012,7 +1013,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       sessionInstanceId: record.sessionInstanceId,
       runtimeEpoch: record.runtimeEpoch,
       agentType: record.agentType,
-      providerFamily: record.providerId ?? record.agentType,
+      providerFamily: resolvePeerAuditProviderFamily(record),
     };
   };
 
@@ -1410,14 +1411,30 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       const identity = await supervisionTaskIdentity();
       if (!identity) return error(MCP_ERROR_REASONS.IDENTITY_REJECTED, 'supervision task caller identity is unavailable');
       const registry = getSupervisionTaskRegistry();
-      const task = registry.createOrGet({
-        taskId: stringArg(args, 'taskId'),
-        topLevelTaskId: stringArg(args, 'topLevelTaskId'),
-        classification: typeof args.classification === 'string' ? args.classification as never : undefined,
-        objective: stringArg(args, 'objective'),
-        acceptance: stringArrayArg(args, 'acceptance'),
-        idempotencyKey: stringArg(args, 'idempotencyKey'),
-      });
+      const projectName = caller.projectName?.trim();
+      if (!projectName) return error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'supervision task caller project is unavailable');
+      const requestedTaskId = stringArg(args, 'taskId')?.trim();
+      const existing = requestedTaskId ? registry.get(requestedTaskId) : undefined;
+      // taskId is a reference, never a create hint. Missing, cross-project and
+      // non-participant tasks share one refusal so this tool cannot probe the
+      // registry or silently mint a replacement task.
+      if (requestedTaskId && (
+        !existing
+        || existing.projectName !== projectName
+        || !supervisionCallerParticipates(existing, identity.sessionName)
+      )) {
+        return error(MCP_ERROR_REASONS.IDENTITY_REJECTED, 'task is not visible to this caller');
+      }
+      const task = existing
+        ? { ok: true as const, value: existing, replay: true as const }
+        : registry.createOrGet({
+            projectName,
+            topLevelTaskId: stringArg(args, 'topLevelTaskId'),
+            classification: typeof args.classification === 'string' ? args.classification as never : undefined,
+            objective: stringArg(args, 'objective'),
+            acceptance: stringArrayArg(args, 'acceptance'),
+            idempotencyKey: stringArg(args, 'idempotencyKey'),
+          });
       if (!task.ok) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `task_start rejected: ${task.reason}`);
       const assignment = registry.createAssignment({
         taskId: task.value.taskId,

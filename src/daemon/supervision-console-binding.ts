@@ -14,6 +14,8 @@ import { SupervisionConsoleProducer } from './supervision-console-producer.js';
 import { SupervisionConsoleSessionRegistry } from './supervision-console-session.js';
 import { migrateSupervisionStore, type SupervisionMigrationDb } from './supervision-store-migrations.js';
 import type { SupervisionTaskConsoleScope } from '../../shared/supervision-task-console.js';
+import { resolveEffectiveProjectName } from '../../shared/session-scope.js';
+import type { SessionRecord } from '../store/session-store.js';
 
 export interface SupervisionConsoleLink {
   send(message: unknown): void;
@@ -33,6 +35,20 @@ export interface SupervisionConsoleBinding {
   producer: SupervisionConsoleProducer;
   sessions: SupervisionConsoleSessionRegistry;
   projectionEpoch: string;
+}
+
+/** Exact live-session authorization for a browser-requested console scope. */
+export function isAuthorizedSupervisionConsoleScope(
+  scope: SupervisionTaskConsoleScope,
+  sessions: readonly SessionRecord[],
+): boolean {
+  const coordinator = sessions.find((session) => session.name === scope.coordinatorSessionName);
+  return Boolean(
+    coordinator
+      && coordinator.role === 'brain'
+      && !coordinator.parentSession
+      && resolveEffectiveProjectName(coordinator, sessions) === scope.projectName,
+  );
 }
 
 /**

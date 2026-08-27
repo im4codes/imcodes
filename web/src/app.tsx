@@ -35,6 +35,10 @@ import { LoginPage } from './pages/LoginPage.js';
 import { SessionTabs } from './components/SessionTabs.js';
 // TransportChatView removed — transport sessions use unified ChatView via timelineEmitter
 import { SessionPane } from './components/SessionPane.js';
+import {
+  SupervisionTaskConsole,
+  SupervisionTaskConsoleToggle,
+} from './components/SupervisionTaskConsole.js';
 import { ShareSessionDialog } from './components/ShareSessionDialog.js';
 import { SharedEntriesPanel } from './components/SharedEntriesPanel.js';
 import { SharedStateIndicator } from './components/SharedStateIndicator.js';
@@ -773,6 +777,8 @@ export function App() {
   const autoEntryRunRef = useRef(0);
   const [showMobileServerMenu, setShowMobileServerMenu] = useState(false);
   const [showMobileFileBrowser, setShowMobileFileBrowser] = useState(false);
+  const [showSupervisionTaskConsole, setShowSupervisionTaskConsole] = useState(false);
+  const supervisionTaskConsoleToggleRef = useRef<HTMLButtonElement>(null);
   const [shareDialogTarget, setShareDialogTarget] = useState<ShareDialogTarget | null>(null);
   const [selectedShareTarget, setSelectedShareTarget] = useState<ShareTarget | null>(null);
   const [selectedSharedEntryId, setSelectedSharedEntryId] = useState<string | null>(
@@ -5913,6 +5919,12 @@ export function App() {
                 <button class="view-toggle" title={trans('localWebPreview.title')} onClick={() => setShowDesktopLocalWebPreview((o) => !o)} style={{ position: 'relative' }}>
                   🌐
                 </button>
+                <SupervisionTaskConsoleToggle
+                  session={selectedShareTarget ? null : activeSessionInfo}
+                  open={showSupervisionTaskConsole}
+                  triggerRef={supervisionTaskConsoleToggleRef}
+                  onToggle={() => setShowSupervisionTaskConsole((open) => !open)}
+                />
                 {!isTransportSession && (
                   <button class="view-toggle" data-onboarding="view-toggle" onClick={toggleViewMode}>
                     {viewMode === 'chat' ? '⌨' : '💬'}
@@ -6029,6 +6041,12 @@ export function App() {
                 >
                   🌐
                 </button>
+                <SupervisionTaskConsoleToggle
+                  session={selectedShareTarget ? null : activeSessionInfo}
+                  open={showSupervisionTaskConsole}
+                  triggerRef={supervisionTaskConsoleToggleRef}
+                  onToggle={() => setShowSupervisionTaskConsole((open) => !open)}
+                />
                 <DesktopWindowMaximizeButton
                   class="view-toggle desktop-main-maximize-toggle"
                   data-testid="main-session-maximize-toggle"
@@ -6051,8 +6069,10 @@ export function App() {
               </div>
             )}
 
-            {/* Session panes: visible brain sessions stay mounted; worker sessions remain addressable but hidden from main windows. */}
-            {visibleMainSessions.map((s) => (
+            <div class="supervision-task-console-workspace">
+              <div class="supervision-task-console-primary">
+              {/* Session panes: visible brain sessions stay mounted; worker sessions remain addressable but hidden from main windows. */}
+              {visibleMainSessions.map((s) => (
               <ErrorBoundary key={`eb-${s.name}`}>
               <SessionPane
                 key={s.name}
@@ -6106,15 +6126,15 @@ export function App() {
                 onVersionSensitiveAction={runVersionSensitiveAction}
               />
               </ErrorBoundary>
-            ))}
+              ))}
 
-            {!resolvedActiveSessionExists && !sessionsLoaded && (
+              {!resolvedActiveSessionExists && !sessionsLoaded && (
               <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#475569', flexDirection: 'column', gap: 12 }}>
                 <div class="spinner" />
                 <div>{connected ? 'Waiting for daemon...' : 'Connecting...'}</div>
               </div>
-            )}
-            {!resolvedActiveSessionExists && sessionsLoaded && (
+              )}
+              {!resolvedActiveSessionExists && sessionsLoaded && (
               <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#475569', flexDirection: 'column', gap: 12 }}>
                 <div style={{ fontSize: 32 }}>⌨</div>
                 <div>Select a session or start a new one</div>
@@ -6122,7 +6142,25 @@ export function App() {
                   + New Session
                 </button>
               </div>
-            )}
+              )}
+              </div>
+              {showSupervisionTaskConsole && activeSessionInfo?.role === 'brain' && !selectedShareTarget && (
+                <SupervisionTaskConsole
+                  key={`${activeSessionInfo.project}:${activeSessionInfo.name}`}
+                  ws={wsRef.current}
+                  connected={connected}
+                  projectName={activeSessionInfo.project}
+                  coordinatorSessionName={activeSessionInfo.name}
+                  mobile={isMobile}
+                  onClose={() => setShowSupervisionTaskConsole(false)}
+                  returnFocusRef={supervisionTaskConsoleToggleRef}
+                  onNavigateSession={(sessionName) => {
+                    navigateToSession(sessionName);
+                    if (isMobile) setShowSupervisionTaskConsole(false);
+                  }}
+                />
+              )}
+            </div>
 
             {/* Desktop floating file browser */}
             {!isMobile && showDesktopFileBrowser && wsRef.current && activeSessionInfo && (

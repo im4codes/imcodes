@@ -127,8 +127,12 @@ export class SupervisionConsoleSessionRegistry {
       .filter((row) => row.eventId > afterEventId)
       .sort((left, right) => left.projectionVersion - right.projectionVersion);
 
-    // Nothing owed: the client is current. Do not send a redundant snapshot.
-    if (owed.length === 0) return true;
+    // Nothing owed: explicitly confirm the current projection. The browser has
+    // already moved to SUBSCRIBING for this new subscription id; silence here
+    // leaves it there forever even though its cursor is current. A snapshot is
+    // the existing authenticated/current acknowledgement and also makes a
+    // restart robust when the browser retained rows but the socket did not.
+    if (owed.length === 0) return this.#sendSnapshot(scope, subscriptionId);
     // The oldest thing we still hold must be exactly the client's next version.
     // If the outbox has already been pruned past it we cannot patch the hole.
     if (owed[0]!.projectionVersion !== clientVersion + 1) {

@@ -23,6 +23,7 @@ import { timelineEmitter } from './timeline-emitter.js';
 import type { TimelineEvent } from './timeline-event.js';
 import type { ServerLink } from './server-link.js';
 import logger from '../util/logger.js';
+import { MCP_ERROR_REASONS } from '../../shared/memory-mcp-errors.js';
 
 /** Default retry budget when daemon admission returns `daemon_busy`. */
 const CRON_DAEMON_BUSY_DEFAULT_ATTEMPTS = 3;
@@ -275,6 +276,36 @@ export async function executeCronJob(msg: CronDispatchMessage, serverLink: Serve
         }),
       });
     } catch (err) {
+      // A provider-limit refusal is NOT an opaque failure and must not be
+      // flattened by `formatErr`. The scheduler's only useful question is
+      // "when may this run again", and the answer is `retryAt` -- a sentence
+      // saying the same thing forces the control plane to guess, and a guess
+      // here means either hammering a refused account or parking the job
+      // indefinitely. `alternatives` likewise only survives as structure.
+      const limited = asCronTargetLimited(err);
+      if (limited) {
+        logger.warn({
+          jobId,
+          executionId,
+          reason: limited.reason,
+          retryAt: limited.limited?.targets[0]?.retryAt,
+        }, 'Cron: structured send refused by delegation admission');
+        sendCommandResult(serverLink, {
+          type: CRON_MSG.COMMAND_RESULT,
+          jobId,
+          executionId,
+          status: 'error',
+          detail: JSON.stringify({
+            reason: limited.reason,
+            targets: limited.limited?.targets ?? [],
+            alternatives: limited.limited?.alternatives ?? [],
+            // Absolute epoch-ms, so the scheduler can reschedule on it directly
+            // rather than parsing a rendered timestamp back out of prose.
+            retryAt: limited.limited?.targets[0]?.retryAt,
+          }),
+        });
+        return;
+      }
       logger.error({ jobId, executionId, err }, 'Cron: structured send dispatch failed');
       sendCommandResult(serverLink, {
         type: CRON_MSG.COMMAND_RESULT,
@@ -624,6 +655,35 @@ function sendCommandResult(serverLink: ServerLink, msg: CronCommandResultMessage
     const delayMs = Math.min(30_000, 1000 * attempt);
     setTimeout(() => sendCommandResult(serverLink, msg, attempt + 1), delayMs);
   }
+}
+
+/**
+ * Recognise a typed delegation refusal without importing the send tool.
+ *
+ * Structural rather than `instanceof`: the send tool is loaded through a
+ * dynamic import here, so a class identity check would silently fail across
+ * module instances and quietly downgrade every refusal to an opaque error --
+ * the exact flattening this exists to prevent.
+ */
+function asCronTargetLimited(err: unknown): {
+  reason: string;
+  limited?: {
+    targets: Array<{ target: string; retryAt?: number; reason?: string }>;
+    alternatives: Array<{ target: string }>;
+  };
+} | null {
+  if (!err || typeof err !== 'object') return null;
+  const candidate = err as { name?: unknown; reason?: unknown; limited?: unknown };
+  if (typeof candidate.reason !== 'string') return null;
+  if (candidate.reason !== MCP_ERROR_REASONS.TARGET_LIMITED
+    && candidate.reason !== MCP_ERROR_REASONS.TARGET_UNAVAILABLE) return null;
+  return {
+    reason: candidate.reason,
+    ...(candidate.limited ? { limited: candidate.limited as {
+      targets: Array<{ target: string; retryAt?: number; reason?: string }>;
+      alternatives: Array<{ target: string }>;
+    } } : {}),
+  };
 }
 
 function formatErr(err: unknown): string {

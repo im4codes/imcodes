@@ -113,13 +113,12 @@ describe('memory MCP shared contracts', () => {
     expect(sendList.description).toContain('invite a reviewer to discuss');
     expect(sendList.description).toContain('display label');
     expect(sendList.description).toContain('no such running peer session is available');
-    expect(sendMessage.description).toContain('caller session is not a valid target');
-    expect(sendMessage.description).toContain('empty send_list_targets result');
-    expect(sendMessage.description).toContain('asking a CC session to audit');
-    expect(sendMessage.description).toContain('does not start a structured Team/P2P discussion run');
-    expect(sendMessage.description).toContain('direct non-preemptive append');
-    expect(sendMessage.description).toContain('retain delivery through the ordinary durable queue');
-    expect(sendMessage.description).toContain('deliveryMode=queue');
+    expect(sendMessage.description).toContain('exact send_list_targets target');
+    expect(sendMessage.description).toContain('Callers and labels are invalid targets');
+    expect(sendMessage.description).toContain('append (default)');
+    expect(sendMessage.description).toContain('durable FIFO fallback');
+    expect(sendMessage.description).toContain('queue always uses FIFO');
+    expect(sendMessage.description).toContain('delivered/queued/failed status');
     expect(delegationReply.description).toContain('multiple replies until it expires');
 
     const sendListQuery = sendList.inputSchema.properties?.query as { description?: string } | undefined;
@@ -139,7 +138,7 @@ describe('memory MCP shared contracts', () => {
     expect(sendMessageReply?.description).toContain('discussion invites');
     expect(sendMessageAudit?.description).toContain('automatic-supervision');
     expect(sendMessageAudit?.properties?.kind?.enum).toEqual(['supervision_audit']);
-    expect(sendMessageAudit?.required).toEqual(['kind', 'attemptId']);
+    expect(sendMessageAudit?.required).toEqual(['kind', 'attemptId', 'auditedSessionName']);
     expect(sendMessageBroadcast?.description).toContain('every/all available sessions');
   });
 

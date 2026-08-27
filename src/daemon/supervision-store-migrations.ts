@@ -17,7 +17,7 @@
 import { SUPERVISION_TASK_LIFECYCLE_STATUSES } from '../../shared/supervision-config.js';
 
 /** Bump with every migration appended below. */
-export const SUPERVISION_SCHEMA_VERSION = 2;
+export const SUPERVISION_SCHEMA_VERSION = 3;
 
 /** Minimal surface we need; avoids importing node:sqlite types at the boundary. */
 export interface SupervisionMigrationDb {
@@ -226,7 +226,29 @@ const MIGRATION_2: SupervisionMigration = {
   },
 };
 
-export const SUPERVISION_MIGRATIONS: readonly SupervisionMigration[] = Object.freeze([MIGRATION_1, MIGRATION_2]);
+const MIGRATION_3: SupervisionMigration = {
+  version: 3,
+  description: 'authoritative project scope for supervision task projections',
+  up(db) {
+    addColumnIfMissing(db, 'supervision_tasks', 'project_name', 'TEXT');
+    db.exec(`
+      CREATE INDEX IF NOT EXISTS supervision_tasks_project_idx
+        ON supervision_tasks(project_name, updated_at);
+      DROP TRIGGER IF EXISTS supervision_tasks_project_guard_insert;
+      CREATE TRIGGER supervision_tasks_project_guard_insert
+      BEFORE INSERT ON supervision_tasks
+      FOR EACH ROW WHEN NEW.project_name IS NULL OR trim(NEW.project_name) = ''
+      BEGIN SELECT RAISE(ABORT, 'supervision task project scope is required'); END;
+      DROP TRIGGER IF EXISTS supervision_tasks_project_guard_update;
+      CREATE TRIGGER supervision_tasks_project_guard_update
+      BEFORE UPDATE ON supervision_tasks
+      FOR EACH ROW WHEN NEW.project_name IS NULL OR trim(NEW.project_name) = ''
+      BEGIN SELECT RAISE(ABORT, 'supervision task project scope is required'); END;
+    `);
+  },
+};
+
+export const SUPERVISION_MIGRATIONS: readonly SupervisionMigration[] = Object.freeze([MIGRATION_1, MIGRATION_2, MIGRATION_3]);
 
 export function readSupervisionSchemaVersion(db: SupervisionMigrationDb): number {
   const row = db.prepare('PRAGMA user_version').get() as { user_version?: number } | undefined;

@@ -46,8 +46,8 @@ beforeEach(() => {
   db = new DatabaseSync(':memory:');
   db.exec(LEGACY);
   migrateSupervisionStore(db as unknown as SupervisionMigrationDb);
-  db.prepare(`INSERT INTO supervision_tasks (task_id, top_level_task_id, classification, status,
-    payload_json, created_at, updated_at) VALUES ('tsk_a','top','slice','implementing','{}',1,1)`).run();
+  db.prepare(`INSERT INTO supervision_tasks (task_id, project_name, top_level_task_id, classification, status,
+    payload_json, created_at, updated_at) VALUES ('tsk_a','codedeck','top','slice','implementing','{}',1,1)`).run();
   sent = []; clock = 0;
   producer = new SupervisionConsoleProducer(db as unknown as SupervisionMigrationDb, {
     projectionEpoch: EPOCH, now: () => ++clock,
@@ -82,11 +82,17 @@ describe('subscribe', () => {
     expect(sent.every((f) => f.subscriptionId === 'sub-1')).toBe(true);
   });
 
-  it('sends nothing when the client is already current', () => {
+  it('explicitly confirms the snapshot when the reconnect cursor is already current', () => {
     const r = emit();
     sent.length = 0;
     registry.handleFrame(subscribe({ afterEventId: r.eventId, projectionVersion: 1 }));
-    expect(sent).toHaveLength(0);
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toMatchObject({
+      type: SUPERVISION_TASK_CONSOLE_MSG.SNAPSHOT,
+      subscriptionId: 'sub-1',
+      projectionVersion: 1,
+      lastDurableEventId: r.eventId,
+    });
   });
 
   it('demands resync rather than patching across a pruned outbox', () => {

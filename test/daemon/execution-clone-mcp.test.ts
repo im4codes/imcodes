@@ -242,6 +242,25 @@ describe('execution-clone send dispatch', () => {
     expect(dispatchMessage.mock.calls[0][0].name).not.toBe(TEMPLATE);
   });
 
+  it('preserves a queued clone dispatch in the accepted delivery status', async () => {
+    const dispatchMessage = vi.fn(async () => 'queued' as const);
+    cloneMocks.createExecutionClone.mockResolvedValue(createdResult());
+    const result = await dispatchSendMessage(brainCaller, {
+      target: TEMPLATE,
+      message: 'queue the work',
+      clone: { ...canonicalClone },
+    }, {
+      listSessions: () => baseSessions(),
+      getSession: sessionAfterCloneCreation,
+      dispatchMessage,
+    });
+
+    expect(result).toMatchObject({
+      status: 'accepted',
+      deliveries: [{ target: CLONE, status: 'queued' }],
+    });
+  });
+
   it('forces reply:true so the worker message carries a reply instruction', async () => {
     const dispatchMessage = vi.fn(async () => {});
     cloneMocks.createExecutionClone.mockResolvedValue(createdResult());

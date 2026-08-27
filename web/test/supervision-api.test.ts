@@ -56,7 +56,7 @@ const EXPECTED_QWEN_DEFAULTS = {
   promptVersion: 'supervision_decision_v1',
   maxAutoContinueStreak: DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_STREAK,
   maxAutoContinueTotal: DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_TOTAL,
-  executionPools: migratedPools('qwen', 'qwen', 'qwen3-coder-plus'),
+  executionPools: migratedPools('qwen', 'alibaba', 'qwen3-coder-plus'),
 };
 
 const fetchMock = vi.fn();
@@ -98,7 +98,7 @@ describe('supervision API helpers', () => {
       promptVersion: 'custom_prompt_v1',
       maxAutoContinueStreak: DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_STREAK,
       maxAutoContinueTotal: DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_TOTAL,
-      executionPools: migratedPools('codex-sdk', 'codex', CODEX_MODEL_IDS[0]),
+      executionPools: migratedPools('codex-sdk', 'openai', CODEX_MODEL_IDS[0]),
     });
 
     expect(fetchMock).toHaveBeenCalledWith(

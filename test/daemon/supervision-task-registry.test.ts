@@ -2,7 +2,7 @@ import { createRequire } from 'node:module';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { describe, expect, it, beforeEach } from 'vitest';
+import { describe, expect, it, beforeEach, vi } from 'vitest';
 
 import {
   SupervisionTaskRegistry,
@@ -19,7 +19,7 @@ import { SUPERVISION_TASK_REGISTRY_CONTRACT } from '../../shared/supervision-con
 import { buildSupervisionExecutionCapabilityId } from '../../shared/supervision-execution-pool.js';
 import { createSupervisionMcpToolHandlers } from '../../src/daemon/supervision-mcp-tools.js';
 import { SUPERVISION_MCP_TOOLS } from '../../shared/supervision-mcp-tools.js';
-import { getSupervisionTaskRegistry } from '../../src/daemon/supervision-state-store.js';
+import { resolvePeerAuditProviderFamily } from '../../shared/peer-audit.js';
 
 /** Adapts the real registry to the audited handler port. */
 function supervisionRegistryPort() {
@@ -34,7 +34,7 @@ function supervisionRegistryPort() {
 }
 
 function persistedExecutionBinding(name: string) {
-  const requested = { agentType: 'codex-sdk', providerFamily: 'codex', runtimeType: 'transport' as const, model: 'gpt-5.6' };
+  const requested = { agentType: 'codex-sdk', providerFamily: 'openai', runtimeType: 'transport' as const, model: 'gpt-5.6' };
   return {
     pool: 'primary' as const,
     requested: { ...requested, capabilityId: buildSupervisionExecutionCapabilityId(requested) },
@@ -53,12 +53,12 @@ function identity(name: string, agentType = 'codex-sdk'): PersistedSupervisionTa
     sessionInstanceId: `instance-${name}`,
     runtimeEpoch: `epoch-${name}`,
     agentType,
-    providerFamily: agentType.replace(/-sdk$/, ''),
+    providerFamily: resolvePeerAuditProviderFamily({ agentType }),
   };
 }
 
 function session(name: string, projectName = 'alpha', agentType = 'codex-sdk'): SessionRecord {
-  const selected = { agentType: 'codex-sdk', providerFamily: 'codex', runtimeType: 'transport' as const, model: 'gpt-5.6' };
+  const selected = { agentType: 'codex-sdk', providerFamily: 'openai', runtimeType: 'transport' as const, model: 'gpt-5.6' };
   return {
     name,
     sessionInstanceId: `instance-${name}`,
@@ -99,6 +99,18 @@ beforeEach(() => {
 });
 
 describe('SupervisionTaskRegistry', () => {
+  it('scopes task rows and idempotency keys by project', () => {
+    const registry = makeRegistry();
+    const alpha = registry.createOrGet({ projectName: 'alpha', objective: 'same request', idempotencyKey: 'same-key' });
+    const beta = registry.createOrGet({ projectName: 'beta', objective: 'same request', idempotencyKey: 'same-key' });
+    expect(alpha.ok && beta.ok).toBe(true);
+    if (!alpha.ok || !beta.ok) throw new Error('expected scoped tasks');
+    expect(alpha.value.taskId).not.toBe(beta.value.taskId);
+    expect(registry.list({ projectName: 'alpha' }).map((task) => task.taskId)).toEqual([alpha.value.taskId]);
+    expect(registry.list({ projectName: 'beta' }).map((task) => task.taskId)).toEqual([beta.value.taskId]);
+    registry.close();
+  });
+
   it('publishes the caller-reported-only file tracking limitation in the machine contract', () => {
     expect(SUPERVISION_TASK_REGISTRY_CONTRACT.fileTracking).toStrictEqual({
       mode: 'caller_reported_only',
@@ -400,10 +412,172 @@ describe('SupervisionTaskRegistry', () => {
     expect(replay.assignmentId).toBe(result.assignmentId);
     expect(getSupervisionTaskRegistry().get(result.taskId!)?.assignments[0]?.executionBinding).toMatchObject({
       pool: 'primary',
-      requested: { providerFamily: 'codex', model: 'gpt-5.6' },
+      requested: { providerFamily: 'openai', model: 'gpt-5.6' },
       actual: { sessionName: 'deck_alpha_w1', sessionInstanceId: 'instance-deck_alpha_w1', runtimeEpoch: 'epoch-deck_alpha_w1', model: 'gpt-5.6' },
       origin: 'reused',
     });
+  });
+
+  it('keeps one canonical provider identity across send_message and delegate task-report tools', async () => {
+    const selected = {
+      agentType: 'claude-code-sdk',
+      providerFamily: 'anthropic',
+      runtimeType: 'transport' as const,
+      model: 'opus[1M]',
+    };
+    const brain = session('deck_alpha_brain');
+    brain.transportConfig = {
+      supervision: {
+        mode: 'off',
+        executionPools: {
+          state: 'configured',
+          primaryDevelopmentPool: {
+            configs: [{
+              ...selected,
+              capabilityId: buildSupervisionExecutionCapabilityId(selected),
+            }],
+          },
+          economyTaskPool: { configs: [] },
+        },
+      },
+    } as SessionRecord['transportConfig'];
+    const worker = session('deck_alpha_w1', 'alpha', 'claude-code-sdk');
+    worker.requestedModel = 'claude-opus-5';
+    worker.activeModel = 'claude-opus-5';
+    const sessions = [brain, worker];
+
+    const sent = await dispatchSendMessage(
+      { userId: 'u', sessionName: brain.name, projectName: 'alpha', projectRoot: '/work/alpha' },
+      {
+        target: worker.name,
+        message: 'implement the cross-entrypoint task',
+        idempotencyKey: 'cross-entrypoint-provider-family',
+        task: { objective: 'canonical provider family', ownedFiles: ['src/cross-entrypoint.ts'] },
+      },
+      { listSessions: () => sessions, dispatchMessage: async () => undefined, exactTargetOnly: true },
+    );
+    expect(sent).toMatchObject({ status: 'accepted', taskId: expect.any(String), assignmentId: expect.any(String) });
+    if (sent.status !== 'accepted' || !sent.assignmentId || !sent.taskId) throw new Error('expected task assignment');
+
+    const registry = getSupervisionTaskRegistry();
+    const assignment = registry.getAssignment(sent.assignmentId);
+    expect(assignment?.identity).toMatchObject({
+      sessionName: worker.name,
+      agentType: 'claude-code-sdk',
+      providerFamily: 'anthropic',
+    });
+    if (!assignment) throw new Error('assignment missing');
+
+    const handlers = createMemoryMcpToolHandlers(
+      { userId: 'u', sessionName: worker.name, projectName: 'alpha', projectRoot: '/work/alpha' },
+      { sendDeps: { listSessions: () => sessions } },
+    );
+    expect(await handlers[MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_UPDATE]({
+      assignmentId: assignment.assignmentId,
+      revision: 'revision-1',
+    })).toMatchObject({ status: 'ok' });
+    expect(await handlers[MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_FILE_EVENT]({
+      assignmentId: assignment.assignmentId,
+      filePath: 'src/cross-entrypoint.ts',
+      operation: 'modify',
+      beforeHash: 'before',
+      afterHash: 'after',
+    })).toMatchObject({ status: 'ok' });
+
+    for (const status of [
+      'implementing', 'validated', 'ready_for_audit', 'auditing', 'passed',
+      'ready_for_integration', 'integrating', 'final_audit', 'passed',
+      'finalizing', 'committed', 'pushed',
+    ] as const) {
+      expect(registry.updateAssignment({
+        assignmentId: assignment.assignmentId,
+        identity: assignment.identity,
+        status,
+      }).ok, status).toBe(true);
+    }
+    expect(await handlers[MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_FINISH]({
+      assignmentId: assignment.assignmentId,
+      revision: 'revision-2',
+      evidence: 'delegate completed',
+    })).toMatchObject({ status: 'ok', item: { status: 'finalized' } });
+  });
+
+  it('send_message binds a visible existing task and idempotency replay keeps the same assignment', async () => {
+    const registry = getSupervisionTaskRegistry();
+    const task = registry.createOrGet({ projectName: 'alpha', taskId: 'existing-visible-task', objective: 'existing task' });
+    expect(task).toMatchObject({ ok: true, value: { taskId: 'existing-visible-task' } });
+    expect(registry.createAssignment({
+      taskId: 'existing-visible-task',
+      role: 'coordinator',
+      identity: identity('deck_alpha_brain'),
+      scopeFiles: [],
+    }).ok).toBe(true);
+
+    const sessions = [session('deck_alpha_brain'), session('deck_alpha_w1')];
+    const dispatchMessage = vi.fn(async () => undefined);
+    const request = {
+      target: 'deck_alpha_w1',
+      message: 'continue the existing task',
+      idempotencyKey: 'bind-existing-once',
+      task: { taskId: 'existing-visible-task', objective: 'must not mint a replacement' },
+    } as const;
+    const deps = { listSessions: () => sessions, dispatchMessage, exactTargetOnly: true };
+
+    const first = await dispatchSendMessage(
+      { userId: 'u', sessionName: 'deck_alpha_brain', projectName: 'alpha', projectRoot: '/work/alpha' },
+      request,
+      deps,
+    );
+    const replay = await dispatchSendMessage(
+      { userId: 'u', sessionName: 'deck_alpha_brain', projectName: 'alpha', projectRoot: '/work/alpha' },
+      request,
+      deps,
+    );
+
+    expect(first).toMatchObject({ status: 'accepted', taskId: 'existing-visible-task' });
+    if (first.status !== 'accepted' || replay.status !== 'accepted') throw new Error('expected accepted');
+    expect(first.taskId).toBe('existing-visible-task');
+    expect(replay).toMatchObject({
+      idempotentReplay: true,
+      taskId: 'existing-visible-task',
+      assignmentId: first.assignmentId,
+    });
+    expect(dispatchMessage).toHaveBeenCalledTimes(1);
+    expect(registry.list()).toHaveLength(1);
+    expect(registry.get('existing-visible-task')?.assignments.map((item) => item.identity.sessionName).sort())
+      .toEqual(['deck_alpha_brain', 'deck_alpha_w1']);
+  });
+
+  it('send_message rejects missing and inaccessible explicit task ids without minting or dispatching', async () => {
+    const registry = getSupervisionTaskRegistry();
+    expect(registry.createOrGet({ projectName: 'alpha', taskId: 'other-owner-task', objective: 'private task' }).ok).toBe(true);
+    expect(registry.createAssignment({
+      taskId: 'other-owner-task',
+      role: 'coordinator',
+      identity: identity('deck_alpha_other'),
+      scopeFiles: [],
+    }).ok).toBe(true);
+    const sessions = [session('deck_alpha_brain'), session('deck_alpha_w1')];
+    const dispatchMessage = vi.fn(async () => undefined);
+    const deps = { listSessions: () => sessions, dispatchMessage, exactTargetOnly: true };
+    const runtimeCaller = { userId: 'u', sessionName: 'deck_alpha_brain', projectName: 'alpha', projectRoot: '/work/alpha' };
+
+    const inaccessible = await dispatchSendMessage(runtimeCaller, {
+      target: 'deck_alpha_w1', message: 'must not dispatch',
+      task: { taskId: 'other-owner-task', objective: 'must not replace' },
+    }, deps);
+    const missing = await dispatchSendMessage(runtimeCaller, {
+      target: 'deck_alpha_w1', message: 'must not dispatch',
+      task: { taskId: 'missing-task', objective: 'must not create' },
+    }, deps);
+
+    expect(inaccessible).toEqual({
+      status: 'error', reason: 'identity_rejected', error: 'task is not visible to this caller',
+    });
+    expect(missing).toEqual(inaccessible);
+    expect(dispatchMessage).not.toHaveBeenCalled();
+    expect(registry.list()).toHaveLength(1);
+    expect(registry.get('missing-task')).toBeUndefined();
   });
 
   it('MCP task_list/task_get use registry projection and reject unrelated session enumeration', async () => {
@@ -428,5 +602,59 @@ describe('SupervisionTaskRegistry', () => {
     );
     const invisible = await other[SUPERVISION_MCP_TOOLS.GET]({ taskId: (start as { taskId: string }).taskId });
     expect(invisible).toMatchObject({ status: 'error', reason: 'identity_rejected' });
+  });
+
+  it('supervision_task_start treats taskId as a visible reference and replays one assignment', async () => {
+    const registry = getSupervisionTaskRegistry();
+    expect(registry.createOrGet({ projectName: 'alpha', taskId: 'existing-start-task', objective: 'existing' }).ok).toBe(true);
+    expect(registry.createAssignment({
+      taskId: 'existing-start-task', role: 'coordinator', identity: identity('deck_alpha_w1'), scopeFiles: [],
+    }).ok).toBe(true);
+    const sessions = [session('deck_alpha_brain'), session('deck_alpha_w1')];
+    const handlers = createMemoryMcpToolHandlers(
+      { userId: 'u', sessionName: 'deck_alpha_w1', projectName: 'alpha', projectRoot: '/work/alpha' },
+      { sendDeps: { listSessions: () => sessions } },
+    );
+    const request = {
+      taskId: 'existing-start-task', role: 'implementer', objective: 'join existing',
+      scopeFiles: ['src/join.ts'], idempotencyKey: 'join-existing-once',
+    } as const;
+    const first = await handlers[MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_START](request);
+    const replay = await handlers[MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_START](request);
+    expect(first).toMatchObject({ status: 'ok', taskId: 'existing-start-task' });
+    expect(replay).toMatchObject({
+      status: 'ok', taskId: 'existing-start-task',
+      assignmentId: first.assignmentId, idempotentReplay: true,
+    });
+    expect(registry.list({ projectName: 'alpha' })).toHaveLength(1);
+    expect(registry.get('existing-start-task')?.assignments).toHaveLength(2);
+  });
+
+  it('supervision_task_start makes missing, foreign-project and inaccessible task ids indistinguishable', async () => {
+    const registry = getSupervisionTaskRegistry();
+    expect(registry.createOrGet({ projectName: 'alpha', taskId: 'private-start-task', objective: 'private' }).ok).toBe(true);
+    expect(registry.createAssignment({
+      taskId: 'private-start-task', role: 'coordinator', identity: identity('deck_alpha_other'), scopeFiles: [],
+    }).ok).toBe(true);
+    expect(registry.createOrGet({ projectName: 'beta', taskId: 'foreign-start-task', objective: 'foreign' }).ok).toBe(true);
+    expect(registry.createAssignment({
+      taskId: 'foreign-start-task', role: 'coordinator', identity: identity('deck_alpha_w1'), scopeFiles: [],
+    }).ok).toBe(true);
+    const handlers = createMemoryMcpToolHandlers(
+      { userId: 'u', sessionName: 'deck_alpha_w1', projectName: 'alpha', projectRoot: '/work/alpha' },
+      { sendDeps: { listSessions: () => [session('deck_alpha_brain'), session('deck_alpha_w1')] } },
+    );
+    const results = await Promise.all(['missing-start-task', 'private-start-task', 'foreign-start-task'].map((taskId) => (
+      handlers[MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_START]({
+        taskId, role: 'implementer', objective: 'must not reveal', idempotencyKey: `probe-${taskId}`,
+      })
+    )));
+    expect(results[1]).toEqual(results[0]);
+    expect(results[2]).toEqual(results[0]);
+    expect(results[0]).toEqual({
+      status: 'error', reason: 'identity_rejected', message: 'task is not visible to this caller', recoverable: false,
+    });
+    expect(registry.get('missing-start-task')).toBeUndefined();
+    expect(registry.list()).toHaveLength(2);
   });
 });
