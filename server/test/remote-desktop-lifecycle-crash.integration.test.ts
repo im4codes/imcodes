@@ -8,7 +8,7 @@
  * track is not yet wired into the Router, the corresponding cell is recorded
  * as BLOCKED-on-prerequisite rather than stubbed.
  */
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import {
   createHash,
   generateKeyPairSync,
@@ -45,17 +45,124 @@ import { hashBrowserKey } from '../src/services/remote-desktop-guest-links.js';
 let db: Database;
 const NOW = 1_700_000_000_000;
 const DAEMON_GEN = 7;
+// Deterministic cleanup scope: every row this file inserts is keyed by one of
+// these unique prefixes, generated per `seedHost()` call. The afterEach hook
+// deletes the host-scoped subtree without touching rows from other test files
+// that share the same container.
+const HOST_PREFIX = 'lch-'; // remote_desktop_hosts.id prefix this file uses
+const OWNER_PREFIX = 'u_lch-'; // users.id prefix this file uses (randomUUID suffix)
+const SERVER_PREFIX = 's_lch-'; // servers.id prefix this file uses
+const ROUTE_PREFIX = 'r-lch-'; // remote_desktop_host_routes.route_id prefix
+const LINK_PREFIX = 'l-lch-'; // remote_desktop_guest_links.id prefix
+const BOOTSTRAP_HOSTS: string[] = [];
+const OWNER_USERS: string[] = [];
+const SERVER_IDS: string[] = [];
+const ROUTE_IDS: string[] = [];
+const LINK_IDS: string[] = [];
+const BOOTSTRAP_TICKETS: string[] = [];
+
+function trackHost(hostId: string, ownerUserId: string, serverId: string): void {
+  if (!hostId.startsWith(HOST_PREFIX)) return;
+  BOOTSTRAP_HOSTS.push(hostId);
+  OWNER_USERS.push(ownerUserId);
+  SERVER_IDS.push(serverId);
+}
+function trackRoute(routeId: string): void {
+  if (routeId.startsWith(ROUTE_PREFIX)) ROUTE_IDS.push(routeId);
+}
+function trackLink(linkId: string): void {
+  if (linkId.startsWith(LINK_PREFIX)) LINK_IDS.push(linkId);
+}
+function trackBootstrap(ticketHash: string): void {
+  BOOTSTRAP_TICKETS.push(ticketHash);
+}
+
+async function cleanupTrackedRows(): Promise<void> {
+  if (!db) return;
+  // Order: child rows first (bootstraps → links → routes → privacy → endpoints
+  // → hosts → servers → users), each scoped to this file's tracked IDs.
+  if (BOOTSTRAP_TICKETS.length > 0) {
+    await db.execute(
+      `DELETE FROM remote_desktop_guest_bootstraps WHERE ticket_hash = ANY($1::text[])`,
+      [BOOTSTRAP_TICKETS],
+    );
+    BOOTSTRAP_TICKETS.length = 0;
+  }
+  if (LINK_IDS.length > 0) {
+    await db.execute(
+      `DELETE FROM remote_desktop_guest_browser_claims WHERE link_id = ANY($1::text[])`,
+      [LINK_IDS],
+    );
+    await db.execute(
+      `DELETE FROM remote_desktop_guest_links WHERE id = ANY($1::text[])`,
+      [LINK_IDS],
+    );
+    LINK_IDS.length = 0;
+  }
+  if (ROUTE_IDS.length > 0) {
+    await db.execute(
+      `DELETE FROM remote_desktop_host_routes WHERE route_id = ANY($1::text[])`,
+      [ROUTE_IDS],
+    );
+    ROUTE_IDS.length = 0;
+  }
+  if (BOOTSTRAP_HOSTS.length > 0) {
+    await db.execute(
+      `DELETE FROM remote_desktop_guest_sessions WHERE host_id = ANY($1::text[])`,
+      [BOOTSTRAP_HOSTS],
+    );
+    await db.execute(
+      `DELETE FROM remote_desktop_management_privacy WHERE host_id = ANY($1::text[])`,
+      [BOOTSTRAP_HOSTS],
+    );
+    await db.execute(
+      `DELETE FROM remote_desktop_unattended_passwords WHERE host_id = ANY($1::text[])`,
+      [BOOTSTRAP_HOSTS],
+    );
+    await db.execute(
+      `DELETE FROM remote_desktop_host_endpoints WHERE host_id = ANY($1::text[])`,
+      [BOOTSTRAP_HOSTS],
+    );
+    await db.execute(
+      `DELETE FROM remote_desktop_public_ids WHERE host_id = ANY($1::text[])`,
+      [BOOTSTRAP_HOSTS],
+    );
+    await db.execute(
+      `DELETE FROM remote_desktop_hosts WHERE id = ANY($1::text[])`,
+      [BOOTSTRAP_HOSTS],
+    );
+    BOOTSTRAP_HOSTS.length = 0;
+  }
+  if (SERVER_IDS.length > 0) {
+    await db.execute(
+      `DELETE FROM servers WHERE id = ANY($1::text[])`,
+      [SERVER_IDS],
+    );
+    SERVER_IDS.length = 0;
+  }
+  if (OWNER_USERS.length > 0) {
+    await db.execute(
+      `DELETE FROM users WHERE id = ANY($1::text[])`,
+      [OWNER_USERS],
+    );
+    OWNER_USERS.length = 0;
+  }
+}
 
 beforeAll(async () => {
   db = createDatabase(process.env.TEST_DATABASE_URL!);
   await runMigrations(db);
 });
-afterAll(async () => { await db.close(); });
+afterEach(async () => { await cleanupTrackedRows(); });
+afterAll(async () => {
+  await cleanupTrackedRows();
+  await db.close();
+});
 
 async function seedHost(): Promise<{ hostId: string; ownerUserId: string; serverId: string }> {
-  const ownerUserId = `u_${randomUUID()}`;
+  const ownerUserId = `${OWNER_PREFIX}${randomUUID()}`;
   await createUser(db, ownerUserId);
-  const hostId = randomUUID();
+  const hostId = `${HOST_PREFIX}${randomUUID()}`;
   await db.execute(
     `INSERT INTO remote_desktop_hosts (id, owner_user_id, merge_state, created_at, updated_at)
      VALUES ($1, $2, 'resolved', $3, $3)`,
@@ -71,7 +178,7 @@ async function seedHost(): Promise<{ hostId: string; ownerUserId: string; server
      VALUES ($1, $2, 'active', $3)`,
     [publicId, hostId, NOW],
   );
-  const serverId = `s_${randomUUID()}`;
+  const serverId = `${SERVER_PREFIX}${randomUUID()}`;
   await createServer(db, serverId, ownerUserId, 'host', `hash-${serverId}`, undefined, NODE_ROLE.CONTROLLED);
   await db.execute(
     'UPDATE servers SET controlled_capabilities = $2::jsonb WHERE id = $1',
@@ -92,13 +199,14 @@ async function seedHost(): Promise<{ hostId: string; ownerUserId: string; server
      ON CONFLICT (host_id) DO NOTHING`,
     [hostId, NOW],
   );
+  trackHost(hostId, ownerUserId, serverId);
   return { hostId, ownerUserId, serverId };
 }
 
 async function seedActiveRoute(hostId: string, serverId: string): Promise<{
   routeId: string; routeGeneration: number;
 }> {
-  const routeId = `r-${randomUUID()}`;
+  const routeId = `${ROUTE_PREFIX}${randomUUID()}`;
   const routeGeneration = 1;
   await db.execute(
     `INSERT INTO remote_desktop_host_routes (
@@ -107,6 +215,7 @@ async function seedActiveRoute(hostId: string, serverId: string): Promise<{
      ) VALUES ($1, $2, $3, 'account', 'audit', $4, 'active', $5, $5, $5)`,
     [routeId, routeGeneration, hostId, serverId, NOW],
   );
+  trackRoute(routeId);
   return { routeId, routeGeneration };
 }
 
@@ -128,7 +237,7 @@ async function seedLink(hostId: string, ownerUserId: string, opts: {
   mode?: 'view' | 'control'; attendance?: 'attended' | 'unattended';
   authorityGeneration?: number; expiresAt?: number | null;
 } = {}): Promise<{ linkId: string; authorityGeneration: number; tokenHash: string }> {
-  const linkId = `l-${randomUUID()}`;
+  const linkId = `${LINK_PREFIX}${randomUUID()}`;
   const authorityGeneration = opts.authorityGeneration ?? 1;
   const mode = opts.mode ?? 'control';
   const attendance = opts.attendance ?? 'attended';
@@ -151,6 +260,7 @@ async function seedLink(hostId: string, ownerUserId: string, opts: {
       authorityGeneration, NOW, opts.expiresAt ?? null,
     ],
   );
+  trackLink(linkId);
   return { linkId, authorityGeneration, tokenHash };
 }
 
@@ -178,6 +288,7 @@ async function seedBootstrap(opts: {
       NOW, opts.expiresAt ?? NOW + 60_000,
     ],
   );
+  trackBootstrap(ticketHash);
   return { ticket, ticketHash };
 }
 
@@ -339,7 +450,12 @@ describe('14.3 link lifecycle boundaries — claim, bootstrap, revoke', () => {
     expect(wrong).toBeNull();
   });
 
-  it('rejects bootstrap after the link is revoked (authority generation no longer matches)', async () => {
+  it('rejects bootstrap after the link is revoked (state guard)', async () => {
+    // This test exercises ONLY the `link.state !== 'active'` guard. The
+    // authority_generation guard is exercised by the next test, where the
+    // link stays active but its generation has advanced past the bootstrap's.
+    // Splitting them prevents a single assertion from being satisfied by the
+    // wrong guard.
     const { hostId, serverId, ownerUserId } = await seedHost();
     const browserKey = newBrowserKey();
     const { linkId, authorityGeneration } = await seedLink(hostId, ownerUserId);
@@ -367,6 +483,60 @@ describe('14.3 link lifecycle boundaries — claim, bootstrap, revoke', () => {
       redeemingServerId: serverId, now: NOW + 2,
     });
     expect(result).toBeNull();
+  });
+
+  it('rejects bootstrap when the link stays active but authority_generation has advanced', async () => {
+    // This is the load-bearing guard for the audit: it MUST RED when the
+    // production `if (link.authority_generation !== row.authority_generation)
+    // return null;` line is deleted. The state guard alone is not enough —
+    // a single mutation that just sets state='revoked' would still pass the
+    // state path and bypass the generation check entirely. So the link here
+    // stays `active` throughout, and only the durable generation advances.
+    const { hostId, serverId, ownerUserId } = await seedHost();
+    const browserKey = newBrowserKey();
+    const { linkId } = await seedLink(hostId, ownerUserId, { authorityGeneration: 1 });
+    const { ticket } = await seedBootstrap({
+      hostId, serverId, linkId, actorSource: 'attended_link', browserKey,
+      authorityGeneration: 1,
+    });
+    const signature = sign(
+      'sha256',
+      remoteDesktopBootstrapSignaturePreimage(
+        Buffer.from(ticket, 'base64url'),
+        Buffer.from(browserKey.thumbprint, 'base64url'),
+      ),
+      { key: browserKey.privateKey, dsaEncoding: 'ieee-p1363' },
+    ).toString('base64url');
+
+    // Owner rotates authority: generation advances 1 → 2 while the link stays
+    // active. The ticket was bound to generation 1 and is now stale.
+    await db.execute(
+      'UPDATE remote_desktop_guest_links SET authority_generation = 2, updated_at = $2 WHERE id = $1',
+      [linkId, NOW + 1],
+    );
+    const state = await db.queryOne<{ authority_generation: number; state: string }>(
+      'SELECT authority_generation, state FROM remote_desktop_guest_links WHERE id = $1',
+      [linkId],
+    );
+    expect(state?.state).toBe('active');
+    expect(state?.authority_generation).toBe(2);
+
+    const result = await redeemBootstrap(db, {
+      proof: { ticket, browserKeyThumbprint: browserKey.thumbprint, signature },
+      redeemingServerId: serverId, now: NOW + 2,
+    });
+    expect(result).toBeNull();
+
+    // The bootstrap row must not be consumed by a refused redemption: if the
+    // generation guard were deleted, redeem would have returned a non-null
+    // admission and stamped `redeemed_at`. We assert the row remains in its
+    // un-consumed durable state to make the mutation RED with a tighter
+    // observable.
+    const row = await db.queryOne<{ redeemed_at: number | null }>(
+      'SELECT redeemed_at FROM remote_desktop_guest_bootstraps WHERE link_id = $1',
+      [linkId],
+    );
+    expect(row?.redeemed_at).toBeNull();
   });
 
   it('rejects bootstrap after link expiry (natural expires_at has passed)', async () => {
@@ -475,45 +645,101 @@ describe('14.4 password lifecycle — generation revoke on change/disable', () =
 });
 
 describe('14.5 sweep / idempotency — recover without double-apply', () => {
-  it('sweeps expired unredeemed bootstraps exactly once and retains redeemed rows', async () => {
+  it('sweeps only expired unredeemed bootstraps; redeemed rows are retained with their stamped redeemed_at', async () => {
+    // Two distinct rows, each scoped to its own observable:
+    //
+    //   * `keptRowHash` (Row A): a future-expiry bootstrap whose redemption
+    //     SUCCEEDS at NOW + 1. The row must remain after sweep with a numeric
+    //     `redeemed_at` (audit retention). This is the load-bearing assertion:
+    //     if the production sweep removed the `redeemed_at IS NULL` predicate,
+    //     the sweep would delete this redeemed row and the explicit
+    //     `expect(row.redeemed_at).toBe(NOW + 1)` would fail with
+    //     `Cannot read properties of null (reading 'redeemed_at')`.
+    //
+    //   * `sweepRowHash` (Row B): an already-expired bootstrap that was NEVER
+    //     redeemed. This is the actual sweep target — the production sweep
+    //     must delete it. We assert the row is *absent* via `toBeNull()` so
+    //     that deletion is the observable, not a vacuous `not.toBeNull()`
+    //     chained through `?.`.
+    //
+    // The two rows must be tracked separately so `cleanupTrackedRows` does not
+    // delete Row A while Row B's absence assertion is still pending.
     const { hostId, serverId, ownerUserId } = await seedHost();
     const browserKey = newBrowserKey();
     const { linkId, authorityGeneration } = await seedLink(hostId, ownerUserId);
-    const { ticket, ticketHash } = await seedBootstrap({
+
+    const kept = await seedBootstrap({
       hostId, serverId, linkId, actorSource: 'attended_link', browserKey,
       authorityGeneration,
-      expiresAt: NOW - 100,
+      expiresAt: NOW + 60_000,
     });
-    const signature = sign(
+    const keptTicket = kept.ticket;
+    const keptRowHash = kept.ticketHash;
+    const keptSignature = sign(
       'sha256',
       remoteDesktopBootstrapSignaturePreimage(
-        Buffer.from(ticket, 'base64url'),
+        Buffer.from(keptTicket, 'base64url'),
         Buffer.from(browserKey.thumbprint, 'base64url'),
       ),
       { key: browserKey.privateKey, dsaEncoding: 'ieee-p1363' },
     ).toString('base64url');
-    await redeemBootstrap(db, {
-      proof: { ticket, browserKeyThumbprint: browserKey.thumbprint, signature },
+
+    const redeemed = await redeemBootstrap(db, {
+      proof: { ticket: keptTicket, browserKeyThumbprint: browserKey.thumbprint, signature: keptSignature },
       redeemingServerId: serverId, now: NOW + 1,
     });
+    // Row A: redemption actually succeeds and the durable `redeemed_at`
+    // timestamp is exactly `NOW + 1`. This pins the positive observable the
+    // audit requires; without it the subsequent `toBe(NOW + 1)` assertion is
+    // meaningless (a deleted row would also have nothing to compare).
+    expect(redeemed).not.toBeNull();
+
+    const sweepTarget = await seedBootstrap({
+      hostId, serverId, linkId, actorSource: 'attended_link', browserKey,
+      authorityGeneration,
+      expiresAt: NOW - 100,
+    });
+    const sweepRowHash = sweepTarget.ticketHash;
+    // Confirm Row B is unredeemed and expired before sweeping.
+    const preSweepTarget = await db.queryOne<{ redeemed_at: number | null; expires_at: number }>(
+      'SELECT redeemed_at, expires_at FROM remote_desktop_guest_bootstraps WHERE ticket_hash = $1',
+      [sweepRowHash],
+    );
+    expect(preSweepTarget).not.toBeNull();
+    expect(preSweepTarget?.redeemed_at).toBeNull();
+    expect(preSweepTarget?.expires_at).toBeLessThanOrEqual(NOW);
 
     const swept = await sweepExpiredBootstraps(db, { now: NOW + 1_000_000 });
     expect(swept.removed).toBeGreaterThanOrEqual(1);
 
-    // The redeemed row remains (audit retention); sweep deletes only unredeemed.
-    const row = await db.queryOne<{ redeemed_at: number | null }>(
+    // Row A (kept, redeemed): present, redeemed_at is exactly NOW + 1. We use
+    // a direct property read here (no optional chaining) so a deleted row
+    // throws and the test goes RED on a mutation that drops the
+    // `redeemed_at IS NULL` sweep predicate.
+    const keptRow = await db.queryOne<{ redeemed_at: number }>(
       'SELECT redeemed_at FROM remote_desktop_guest_bootstraps WHERE ticket_hash = $1',
-      [ticketHash],
+      [keptRowHash],
     );
-    expect(row?.redeemed_at).not.toBeNull();
+    expect(keptRow).not.toBeNull();
+    expect(keptRow!.redeemed_at).toBe(NOW + 1);
 
-    // Second sweep at a later `now` must not delete the redeemed row.
-    await sweepExpiredBootstraps(db, { now: NOW + 2_000_000 });
-    const stillThere = await db.queryOne<{ redeemed_at: number | null }>(
+    // Row B (sweep target): absent. `toBeNull()` is the observable for
+    // deletion — it fails if the sweep did not remove the unredeemed row,
+    // and it cannot be satisfied by a missing redeemed_at field.
+    const sweptRow = await db.queryOne<{ redeemed_at: number }>(
       'SELECT redeemed_at FROM remote_desktop_guest_bootstraps WHERE ticket_hash = $1',
-      [ticketHash],
+      [sweepRowHash],
     );
-    expect(stillThere?.redeemed_at).not.toBeNull();
+    expect(sweptRow).toBeNull();
+
+    // Second sweep at a later `now` must not delete the redeemed Row A.
+    await sweepExpiredBootstraps(db, { now: NOW + 2_000_000 });
+    const stillKept = await db.queryOne<{ redeemed_at: number }>(
+      'SELECT redeemed_at FROM remote_desktop_guest_bootstraps WHERE ticket_hash = $1',
+      [keptRowHash],
+    );
+    expect(stillKept).not.toBeNull();
+    expect(stillKept!.redeemed_at).toBe(NOW + 1);
   });
 });
 
