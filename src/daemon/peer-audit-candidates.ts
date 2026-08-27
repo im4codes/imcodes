@@ -263,16 +263,18 @@ function revisionFor(
   return createHash('sha256').update(JSON.stringify(authority)).digest('base64url');
 }
 
-function candidateRank(candidate: PeerAuditCandidate, auditedModel: string, auditedProvider: string): number {
-  if (!candidate.eligible) return 100;
-  const differentProvider = candidate.providerFamily !== UNKNOWN_DIMENSION
-    && auditedProvider !== UNKNOWN_DIMENSION
-    && candidate.providerFamily !== auditedProvider;
-  if (differentProvider) return 0;
-  const differentModel = candidate.normalizedModelId !== UNKNOWN_DIMENSION
-    && auditedModel !== UNKNOWN_DIMENSION
-    && candidate.normalizedModelId !== auditedModel;
-  return differentModel ? 1 : 2;
+/**
+ * Ordering is NEUTRAL on purpose.
+ *
+ * This used to rank cross-provider candidates first, then cross-model. That is
+ * the daemon choosing a vendor, and vendor choice belongs to the Supervisor
+ * Brain alone. Enumeration may only state who is ELIGIBLE; a ranked list is a
+ * recommendation, and a recommendation is a choice. Eligible-before-ineligible
+ * plus the label/name tiebreak keeps the order deterministic without expressing
+ * a preference the Brain never stated.
+ */
+function candidateRank(candidate: PeerAuditCandidate): number {
+  return candidate.eligible ? 0 : 1;
 }
 
 export function resolvePeerAuditCandidateList(
@@ -297,9 +299,7 @@ export function resolvePeerAuditCandidateList(
     }, metadata))
     .filter((result): result is Extract<PeerAuditCandidateResolution, { ok: true }> => result.ok)
     .map((result) => result.candidate);
-  const auditedModel = metadata.normalizedModelId(audited);
-  const auditedProvider = metadata.providerFamily(audited);
-  candidates.sort((a, b) => candidateRank(a, auditedModel, auditedProvider) - candidateRank(b, auditedModel, auditedProvider)
+  candidates.sort((a, b) => candidateRank(a) - candidateRank(b)
     || a.label.localeCompare(b.label)
     || a.name.localeCompare(b.name));
 
@@ -341,4 +341,80 @@ export function revalidatePeerAuditCandidateSelection(input: {
     };
   }
   return { ok: true, list: resolvedList.list, candidate };
+}
+
+/**
+ * Why a Brain-supplied audit route was refused.
+ *
+ * Neutral vocabulary on purpose: this is the ONE authoritative eligibility
+ * decision, and each boundary maps it to its own surface (MCP error reason at
+ * the send tool, invalid_configuration + terminal needs-input in the
+ * automation). Duplicating "approximate rules" at a second boundary is how a
+ * target that one path refuses gets silently accepted by the other.
+ */
+export type BrainAuditRouteRefusal =
+  | 'missing_audited_session'
+  | 'self_audit'
+  | 'audited_session_unresolvable'
+  | 'target_not_candidate'
+  | 'target_ineligible';
+
+export type BrainAuditRouteResult =
+  | { ok: true }
+  | { ok: false; refusal: BrainAuditRouteRefusal; detail: string };
+
+/**
+ * Validate the EXACT audit route the Supervisor Brain supplied.
+ *
+ * The daemon does not choose auditors, vendors or models. Its entire role here
+ * is to confirm that the route the Brain STATED is one the audited session may
+ * actually use, and to refuse when it is not.
+ *
+ * There is deliberately no fallback, no ranking, and no first-eligible pick: a
+ * missing or ineligible route is an error to REPORT, never a gap for the daemon
+ * to fill. The target is matched BY NAME against the candidate set -- never by
+ * position, provider family, or model -- so no substitution can hide here.
+ */
+export function validateBrainAuditRoute(input: {
+  auditedSessionName: string | undefined | null;
+  targetName: string;
+  allSessions: readonly SessionRecord[];
+}): BrainAuditRouteResult {
+  // Defensive read: `audit` crosses a process boundary from MCP callers, and
+  // test sources are not typechecked, so an absent field must reach the
+  // fail-closed refusal rather than throw.
+  const auditedSessionName = typeof input.auditedSessionName === 'string'
+    ? input.auditedSessionName.trim()
+    : '';
+  if (!auditedSessionName) {
+    return {
+      ok: false, refusal: 'missing_audited_session',
+      detail: 'audit.auditedSessionName is required and is never inferred',
+    };
+  }
+  // A session reviewing its own work is not an audit, whoever dispatched it.
+  if (auditedSessionName === input.targetName) {
+    return { ok: false, refusal: 'self_audit', detail: 'a session cannot audit itself' };
+  }
+  const resolved = resolvePeerAuditCandidateList({ auditedSessionName, allSessions: input.allSessions });
+  if (!resolved.ok) {
+    return {
+      ok: false, refusal: 'audited_session_unresolvable',
+      detail: `audit route rejected: ${resolved.error}`,
+    };
+  }
+  const stated = resolved.list.candidates.find((candidate) => candidate.name === input.targetName);
+  if (!stated) {
+    return {
+      ok: false, refusal: 'target_not_candidate',
+      detail: 'audit target is not a peer-audit candidate for the audited session',
+    };
+  }
+  if (!stated.eligible) {
+    return {
+      ok: false, refusal: 'target_ineligible',
+      detail: `audit target is ineligible: ${stated.reason}`,
+    };
+  }
+  return { ok: true };
 }

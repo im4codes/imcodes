@@ -84,6 +84,43 @@ export type AgentDelegationPurpose =
 export interface AgentDelegationAuditRequest {
   kind: typeof AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT;
   attemptId: string;
+  /**
+   * The session being audited. REQUIRED for a supervision audit.
+   *
+   * Audited identity is STATED, never inferred. It is not the caller (the
+   * Supervisor Brain dispatches audits it is not the subject of), not the
+   * target (the auditor), not the task owner, and not a candidate ordering.
+   * Every one of those inferences has been wrong in practice, so the field is
+   * required and the daemon fails closed when it is absent.
+   */
+  auditedSessionName: string;
+}
+
+/**
+ * Build the supervision-audit envelope.
+ *
+ * The ONE place the envelope is constructed, so a required field cannot be
+ * forgotten at one call site and present at another. Callers pass the audited
+ * session explicitly; nothing here defaults or infers it.
+ */
+export function buildAgentDelegationAuditEnvelope(input: {
+  attemptId: string;
+  auditedSessionName: string;
+}): AgentDelegationAuditRequest {
+  // Runtime guard, not belt-and-braces. The type alone does NOT make omission
+  // impossible: the root tsconfig excludes `test/`, and vitest strips types
+  // without checking them, so an untypechecked caller can pass undefined here.
+  // JSON.stringify would then silently drop the key and emit an envelope the
+  // parser is guaranteed to reject -- a re-audit loop that dies quietly. Fail
+  // loudly at construction instead of shipping a poisoned prompt.
+  if (typeof input.auditedSessionName !== 'string' || !input.auditedSessionName.trim()) {
+    throw new Error('supervision audit envelope requires a non-empty auditedSessionName');
+  }
+  return {
+    kind: AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT,
+    attemptId: input.attemptId,
+    auditedSessionName: input.auditedSessionName,
+  };
 }
 
 export const AGENT_DELEGATION_REPLY_STATUSES = {

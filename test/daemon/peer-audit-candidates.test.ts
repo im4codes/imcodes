@@ -138,7 +138,10 @@ describe('peer-audit candidate authority', () => {
     });
   });
 
-  it('lists only ordinary direct siblings/children and recommends cross-provider peers first', () => {
+  it('lists only ordinary direct siblings/children and orders them NEUTRALLY', () => {
+    // Enumeration states who is ELIGIBLE. It must not express a vendor
+    // preference: choosing the auditor (and whether to cross vendor) is the
+    // Supervisor Brain's decision, and a ranked list is a recommendation.
     const main = session('deck_proj_brain', { providerId: 'openai' });
     const audited = session('deck_sub_audited', { parentSession: main.name, providerId: 'openai' });
     const sameProvider = session('deck_sub_same', { parentSession: main.name, providerId: 'openai', label: 'A' });
@@ -154,18 +157,30 @@ describe('peer-audit candidate authority', () => {
       parentSession: main.name,
       executionCloneMetadata: { kind: EXECUTION_CLONE_KIND } as SessionRecord['executionCloneMetadata'],
     });
+    const all = [main, audited, sameProvider, crossProvider, legacyProjectName, nested, clone];
 
-    const result = resolvePeerAuditCandidateList({
-      auditedSessionName: audited.name,
-      allSessions: [main, audited, sameProvider, crossProvider, legacyProjectName, nested, clone],
-    });
+    const result = resolvePeerAuditCandidateList({ auditedSessionName: audited.name, allSessions: all });
     expect(result.ok).toBe(true);
     if (!result.ok) return;
+    // Scope: direct ordinary siblings only -- no nested child, no clone, no brain.
+    // Order: purely the deterministic label tiebreak (A, Legacy, Z), NOT provider.
     expect(result.list.candidates.map((item) => item.name)).toEqual([
+      sameProvider.name,
       legacyProjectName.name,
       crossProvider.name,
-      sameProvider.name,
     ]);
+    // The load-bearing part: the audited session's own provider is flipped to
+    // anthropic, which inverts every cross-provider relationship in the set. A
+    // provider-relative ranking MUST reorder here; a neutral one cannot.
+    const flipped = session('deck_sub_audited', { parentSession: main.name, providerId: 'anthropic' });
+    const flippedResult = resolvePeerAuditCandidateList({
+      auditedSessionName: flipped.name,
+      allSessions: [main, flipped, sameProvider, crossProvider, legacyProjectName, nested, clone],
+    });
+    expect(flippedResult.ok).toBe(true);
+    if (!flippedResult.ok) return;
+    expect(flippedResult.list.candidates.map((item) => item.name))
+      .toEqual(result.list.candidates.map((item) => item.name));
   });
 
   it('never exposes an internal deck id as the candidate display label', () => {

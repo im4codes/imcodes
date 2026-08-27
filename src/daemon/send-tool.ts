@@ -10,6 +10,14 @@ import {
 } from '../../shared/memory-mcp-contracts.js';
 import { sanitizeMcpErrorMessage } from '../../shared/mcp-error-sanitize.js';
 import { resolveEffectiveSessionModel } from '../../shared/session-model.js';
+import { getSessionRuntimeType } from '../../shared/agent-types.js';
+import type { SupervisionTaskMetadata } from '../../shared/supervision-config.js';
+import { delegationLimitGroup } from '../../shared/delegation-availability.js';
+import {
+  evaluateSupervisionExecutionBinding,
+  normalizeSupervisionExecutionModel,
+  normalizeSupervisionExecutionPools,
+} from '../../shared/supervision-execution-pool.js';
 import { isDiscoverableInterAgentSession, resolveEffectiveProjectName, resolveRuntimeScope } from '../../shared/session-scope.js';
 import {
   AGENT_DELEGATION_PURPOSES,
@@ -39,6 +47,7 @@ const EXECUTION_CLONE_TERMINAL_REASON_DESTROYED: ExecutionCloneTerminalReason =
 import type { SessionRecord } from '../store/session-store.js';
 import { getSession, listSessions } from '../store/session-store.js';
 import { isExecutionClone } from './execution-clone.js';
+import { validateBrainAuditRoute } from './peer-audit-candidates.js';
 import {
   createDelegationReplyAuthority,
   expireDelegationReplyAuthority,
@@ -138,6 +147,8 @@ export interface SendMessageInput {
   deliveryMode?: MemoryMcpSendDeliveryMode;
   /** Strict supervision-only metadata. Never infer this purpose from message text. */
   audit?: AgentDelegationAuditRequest;
+  /** Opens a tracked supervision task for this send. Declared, never inferred. */
+  task?: SupervisionTaskMetadata;
   /** Optional execution-clone request — see {@link SendMessageCloneRequest}. */
   clone?: SendMessageCloneRequest;
 }
@@ -160,6 +171,9 @@ export type SendMessageResult =
       idempotentReplay?: boolean;
       /** Present only when the send created an execution clone (input.clone). */
       clone?: { target: string; sessionName: string; hardTimeoutAt: number };
+      /** Present only when the send declared supervision task metadata. */
+      taskId?: string;
+      assignmentId?: string;
     }
   | { status: 'disabled'; reason: typeof MCP_ERROR_REASONS.FEATURE_DISABLED; disabledFlag: typeof SEND_MCP_DISPATCH_FEATURE_FLAG }
   | { status: 'error'; reason: SendToolErrorReason; error: string };
@@ -397,6 +411,83 @@ export function listSendTargets(
   };
 }
 
+/**
+ * Register the supervision task a `send_message` declared.
+ *
+ * The send tool never invents supervision state. It records the task the caller
+ * DECLARED and binds it to the session that actually received the message. The
+ * binding is evaluated against the CALLER's configured pools, so a recipient
+ * running a config the pool never selected is recorded without a binding rather
+ * than silently blessed as pool-eligible.
+ *
+ * Delivery has already happened by the time this runs, so a registry refusal
+ * must not unsend anything; it degrades to returning no ids.
+ */
+async function registerSendMessageTask(input: {
+  task: SupervisionTaskMetadata;
+  callerRecord: SessionRecord | undefined;
+  target: SessionRecord;
+  idempotencyKey?: string;
+}): Promise<{ taskId: string; assignmentId: string } | undefined> {
+  const objective = input.task.objective?.trim();
+  if (!objective) return undefined;
+  const { getSupervisionTaskRegistry } = await import('./supervision-state-store.js');
+  const registry = getSupervisionTaskRegistry();
+  const task = registry.createOrGet({
+    topLevelTaskId: input.task.topLevelTaskId ?? undefined,
+    ...(input.task.classification ? { classification: input.task.classification } : {}),
+    objective,
+    acceptance: input.task.acceptance ?? undefined,
+    idempotencyKey: input.idempotencyKey,
+  });
+  if (!task.ok) return undefined;
+
+  const agentType = input.target.agentType ?? '';
+  const rawModel = resolveEffectiveSessionModel(input.target) ?? '';
+  const actual = {
+    sessionName: input.target.name,
+    sessionInstanceId: input.target.sessionInstanceId ?? '',
+    runtimeEpoch: input.target.runtimeEpoch ?? '',
+    agentType,
+    providerFamily: delegationLimitGroup(agentType),
+    runtimeType: getSessionRuntimeType(agentType),
+    model: rawModel ? normalizeSupervisionExecutionModel(agentType, rawModel) : '',
+  };
+  const supervision = (input.callerRecord?.transportConfig as
+    { supervision?: { executionPools?: unknown } } | undefined)?.supervision;
+  // The caller DECLARES which pool the work belongs to; the daemon validates
+  // that declaration against the configured pools rather than choosing one.
+  const pool = input.task.executionPool ?? 'primary';
+  const binding = evaluateSupervisionExecutionBinding({
+    pools: normalizeSupervisionExecutionPools(supervision?.executionPools),
+    pool,
+    actual,
+    ...(input.task.requestedExecutionType
+      ? { requestedCapabilityId: input.task.requestedExecutionType.capabilityId } : {}),
+    ...(input.task.economyPolicy ? { economyPolicy: input.task.economyPolicy } : {}),
+  });
+  const assignment = registry.createAssignment({
+    taskId: task.value.taskId,
+    role: 'implementer',
+    identity: {
+      sessionName: actual.sessionName,
+      sessionInstanceId: actual.sessionInstanceId,
+      runtimeEpoch: actual.runtimeEpoch,
+      agentType: actual.agentType,
+      providerFamily: actual.providerFamily,
+    },
+    scopeFiles: input.task.ownedFiles ?? undefined,
+    idempotencyKey: input.idempotencyKey,
+    // `reused`: the recipient was an already-running session this send found,
+    // not one spawned to serve the task.
+    ...(binding.ok
+      ? { executionBinding: { pool, requested: binding.requested, actual, origin: 'reused' as const } }
+      : {}),
+  });
+  if (!assignment.ok) return undefined;
+  return { taskId: task.value.taskId, assignmentId: assignment.value.assignmentId };
+}
+
 export async function dispatchSendMessage(
   caller: SendRuntimeCaller,
   input: SendMessageInput,
@@ -471,6 +562,29 @@ export async function dispatchSendMessage(
   const targets = resolveScopedTargets({ ...caller, projectName: callerProjectName }, input, allSessions, d.exactTargetOnly, 'exactCreatorOnly');
   if (!targets.ok) return { status: 'error', reason: targets.reason, error: targets.error };
 
+  // The Brain's route is VALIDATED here, never chosen here. This runs for every
+  // audit envelope, including sends carrying no task metadata: an audit whose
+  // route was never checked is exactly the case that used to slip through.
+  //
+  // One call site is sufficient and deliberate: the shape check above rejects
+  // audit+clone and audit+broadcast, so no other dispatch path can carry an
+  // audit envelope. A duplicate guard in the clone branch would be dead code
+  // that no test could kill.
+  if (input.audit) {
+    const route = validateBrainAuditRoute({
+      auditedSessionName: input.audit.auditedSessionName,
+      targetName: targets.targets[0]?.name ?? '',
+      allSessions,
+    });
+    if (!route.ok) {
+      // Map the ONE authoritative decision onto this boundary's surface.
+      const reason = route.refusal === 'self_audit'
+        ? MCP_ERROR_REASONS.IDENTITY_REJECTED
+        : MCP_ERROR_REASONS.VALIDATION_FAILED;
+      return { status: 'error', reason, error: route.detail };
+    }
+  }
+
   const fileRefs = sanitizeFileReferences(input.files, caller.projectRoot);
   if (!fileRefs.ok) return { status: 'error', reason: fileRefs.reason, error: fileRefs.error };
 
@@ -533,12 +647,24 @@ export async function dispatchSendMessage(
     };
   }
 
+  // A declared task binds to exactly ONE recipient. A broadcast has no single
+  // session to assign, so the ids are omitted rather than guessed at.
+  const taskTarget = delivered.length === 1
+    ? targets.targets.find((record) => record.name === delivered[0]?.target)
+    : undefined;
+  const registered = input.task && taskTarget
+    ? await registerSendMessageTask({
+      task: input.task, callerRecord, target: taskTarget, idempotencyKey: input.idempotencyKey,
+    })
+    : undefined;
+
   const accepted: Extract<SendMessageResult, { status: 'accepted' }> = {
     status: 'accepted',
     dispatchId,
     ...(deliveries.length === 1 && delivered[0]?.messageId ? { messageId: delivered[0].messageId } : {}),
     deliveries,
     ...(failed > 0 ? { partial: true } : {}),
+    ...(registered ? { taskId: registered.taskId, assignmentId: registered.assignmentId } : {}),
   };
   if (cacheKey && failed === 0) idempotencyCache.set(cacheKey, { expiresAt: now + SEND_IDEMPOTENCY_WINDOW_MS, result: accepted });
   return accepted;

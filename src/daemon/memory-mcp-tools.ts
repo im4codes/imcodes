@@ -558,18 +558,31 @@ function parseTaskArg(value: unknown): SupervisionTaskMetadata | undefined | 'in
   };
 }
 
-const AUDIT_ARG_ALLOWED_KEYS: ReadonlySet<string> = new Set(['kind', 'attemptId']);
+const AUDIT_ARG_ALLOWED_KEYS: ReadonlySet<string> = new Set(['kind', 'attemptId', 'auditedSessionName']);
 
-function parseAuditArg(value: unknown): AgentDelegationAuditRequest | undefined | 'invalid' {
+/**
+ * Parse the strict supervision-audit envelope.
+ *
+ * `auditedSessionName` is REQUIRED and must be a real session name. It is not
+ * defaulted from the caller or the target: a Supervisor Brain dispatching an
+ * audit is neither the auditor nor the audited, so any such default silently
+ * mislabels the subject. Absent or malformed fails closed as 'invalid'.
+ */
+export function parseAuditArg(value: unknown): AgentDelegationAuditRequest | undefined | 'invalid' {
   if (value === undefined || value === null) return undefined;
   if (typeof value !== 'object' || Array.isArray(value)) return 'invalid';
   const record = value as Record<string, unknown>;
+  const auditedSessionName = typeof record.auditedSessionName === 'string'
+    ? record.auditedSessionName.trim() : '';
   if (Object.keys(record).some((key) => !AUDIT_ARG_ALLOWED_KEYS.has(key))
     || record.kind !== AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT
-    || !isAgentDelegationOpaqueId(record.attemptId)) return 'invalid';
+    || !isAgentDelegationOpaqueId(record.attemptId)
+    || !auditedSessionName
+    || auditedSessionName !== record.auditedSessionName) return 'invalid';
   return {
     kind: AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT,
     attemptId: record.attemptId,
+    auditedSessionName,
   };
 }
 
@@ -1920,31 +1933,31 @@ const schemas = {
     kind: z.enum(['projection', 'observation']).optional().describe('Kind from sourceLookup.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.ARCHIVE_MEMORY]: z.object({
-    projectionId: z.string().optional().describe('Projection id to archive.'),
+    projectionId: z.string().optional(),
     ref: z.string().optional().describe('Compact proj: ref.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.RESTORE_MEMORY]: z.object({
-    projectionId: z.string().optional().describe('Projection id to restore.'),
+    projectionId: z.string().optional(),
     ref: z.string().optional().describe('Compact proj: ref.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.DELETE_MEMORY]: z.object({
-    projectionId: z.string().optional().describe('Projection id to delete.'),
+    projectionId: z.string().optional(),
     ref: z.string().optional().describe('Compact proj: ref.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.UPDATE_MEMORY]: z.object({
-    projectionId: z.string().optional().describe('Projection id to update.'),
+    projectionId: z.string().optional(),
     ref: z.string().optional().describe('Compact proj: ref.'),
     text: z.string().describe('Replacement summary.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.MEMORY_FEEDBACK]: z.object({
-    projectionId: z.string().optional().describe('Projection id.'),
+    projectionId: z.string().optional(),
     ref: z.string().optional().describe('Compact proj: ref.'),
     feedback: z.enum(['not_relevant', 'relevant']).describe('Archive or strengthen ranking.'),
-    reason: z.string().optional().describe('Short audit reason.'),
+    reason: z.string().optional(),
   }),
   [MEMORY_MCP_TOOL_NAMES.SAVE_OBSERVATION]: z.object({
     content: z.string().describe('Durable fact or decision.'),
-    tags: z.array(z.string()).optional().describe('Short tags.'),
+    tags: z.array(z.string()).optional(),
     turnId: z.string().optional().describe('Source turn/event id.'),
     idempotencyKey: z.string().optional().describe('Retry key.'),
   }),
@@ -1981,7 +1994,7 @@ const schemas = {
       .optional()
       .describe('append (default) or ordinary durable queue.'),
     files: z.array(z.string()).optional().describe('Project-root path refs; no file bytes.'),
-    reply: z.boolean().optional().describe('Request a reply/report.'),
+    reply: z.boolean().optional(),
     task: z.object({
       taskId: z.string().optional(), topLevelTaskId: z.string().optional(), sliceId: z.string().optional(), classification: z.enum(SUPERVISION_TASK_CLASSIFICATIONS).optional(),
       objective: z.string().optional(), acceptance: z.array(z.string()).optional(), ownedFiles: z.array(z.string()).optional(), sharedFiles: z.array(z.string()).optional(), dependencies: z.array(z.string()).optional(),
@@ -1990,14 +2003,15 @@ const schemas = {
     audit: z.object({
       kind: z.literal(AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT),
       attemptId: z.string().min(1),
+      auditedSessionName: z.string().min(1).describe('Session under audit; never the caller or target.'),
     }).strict().optional().describe('Automatic supervision audit metadata; requires reply=true and one exact target.'),
     broadcast: z.boolean().optional().describe('Only when the user asks every/all sessions.'),
     idempotencyKey: z.string().optional().describe('Accepted-send replay key.'),
     clone: z.object({
-      kind: z.literal(EXECUTION_CLONE_KIND).describe('Clone kind.'),
+      kind: z.literal(EXECUTION_CLONE_KIND),
       ephemeral: z.literal(true).describe('Always true.'),
-      parentRunId: z.string().min(1).describe('Owning parent run id.'),
-      parentStage: z.enum(EXECUTION_CLONE_PARENT_STAGES).describe('Creating parent stage.'),
+      parentRunId: z.string().min(1),
+      parentStage: z.enum(EXECUTION_CLONE_PARENT_STAGES),
     }).strict().optional().describe('Route to a new ephemeral target clone; returns clone.target; forbids broadcast.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.DESTROY_EXECUTION_CLONE]: z.object({
@@ -2020,9 +2034,9 @@ const schemas = {
   }),
   [MEMORY_MCP_TOOL_NAMES.CRON_CREATE_SELF]: z.object({
     cronExpr: z.string().describe(`${MEMORY_MCP_CAPS.CRON_MIN_INTERVAL_MINUTES}-minute minimum interval.`),
-    message: z.string().describe('Message to this session.'),
+    message: z.string(),
     name: z.string().optional().describe('Job name; derived from message by default.'),
-    timezone: z.string().optional().describe('Schedule timezone.'),
+    timezone: z.string().optional(),
     expiresAt: z.union([z.number(), z.string(), z.null()]).optional().describe('Epoch-ms or explicit-offset ISO expiration.'),
     completionPolicy: z.enum([
       CRON_COMPLETION_POLICY.RECURRING,
@@ -2033,8 +2047,8 @@ const schemas = {
     id: z.string().describe('Current-session job id.'),
     cronExpr: z.string().optional().describe(`Replacement schedule; ${MEMORY_MCP_CAPS.CRON_MIN_INTERVAL_MINUTES}-minute minimum.`),
     message: z.string().optional().describe('Replacement wake-up message.'),
-    name: z.string().optional().describe('Replacement name.'),
-    timezone: z.string().optional().describe('Replacement timezone.'),
+    name: z.string().optional(),
+    timezone: z.string().optional(),
     expiresAt: z.union([z.number(), z.string(), z.null()]).optional().describe('Replacement epoch-ms/offset-ISO expiration.'),
     completionPolicy: z.enum([
       CRON_COMPLETION_POLICY.RECURRING,
@@ -2049,13 +2063,13 @@ const schemas = {
     force: z.boolean().optional().describe('Required for recurring jobs; use only after an explicit user request.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.CRON_CREATE]: z.object({
-    name: z.string().describe('Job name.'),
+    name: z.string(),
     cronExpr: z.string().describe(`${MEMORY_MCP_CAPS.CRON_MIN_INTERVAL_MINUTES}-minute minimum; every-minute schedules are invalid.`),
     projectName: z.string().optional().describe('Project; defaults to caller project.'),
     targetRole: z.string().optional().describe('Source role; defaults to project brain.'),
     targetSessionName: z.string().nullable().optional().describe('Source session; target resolves among its siblings and cannot be itself.'),
     action: z.record(z.string(), z.unknown()).describe('Send action: {type:"send", target, message, reply?, broadcast?, idempotencyKey?}.'),
-    timezone: z.string().optional().describe('Schedule timezone only.'),
+    timezone: z.string().optional(),
     expiresAt: z.union([z.number(), z.string(), z.null()]).optional().describe('Epoch-ms/offset-ISO, ≤90 days; affects future sends only.'),
     completionPolicy: z.enum([
       CRON_COMPLETION_POLICY.RECURRING,
@@ -2067,8 +2081,8 @@ const schemas = {
     limit: z.number().int().min(1).max(100).optional().describe('Page size.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.CRON_UPDATE]: z.object({
-    id: z.string().describe('Job id.'),
-    name: z.string().optional().describe('Replacement name.'),
+    id: z.string(),
+    name: z.string().optional(),
     cronExpr: z.string().optional().describe(`Replacement schedule; ${MEMORY_MCP_CAPS.CRON_MIN_INTERVAL_MINUTES}-minute minimum.`),
     projectName: z.string().optional().describe('Replacement project.'),
     targetRole: z.string().optional().describe('Replacement source role.'),
@@ -2083,7 +2097,7 @@ const schemas = {
     force: z.boolean().optional().describe('Required to change recurring to until_complete.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.CRON_DELETE]: z.object({
-    id: z.string().describe('Job id.'),
+    id: z.string(),
     force: z.boolean().optional().describe('Required for agent deletion of recurring jobs.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.LIST_MACHINES]: z.strictObject({
@@ -2091,9 +2105,9 @@ const schemas = {
   }),
   [MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE]: z.strictObject({
     machine: machineTargetRuntimeSchema.describe('Canonical 10-digit nodeId or ^^(nodeId); deprecated noncanonical legacy alias is compatibility-only. No list_machines preflight when known.'),
-    command: z.string().describe('One shell command.'),
-    shell: z.enum(REMOTE_EXEC_SHELLS).optional().describe('Shell.'),
-    timeoutMs: z.number().int().min(REMOTE_EXEC_MIN_TIMEOUT_MS).max(REMOTE_EXEC_MAX_TIMEOUT_MS).optional().describe('Timeout ms.'),
+    command: z.string(),
+    shell: z.enum(REMOTE_EXEC_SHELLS).optional(),
+    timeoutMs: z.number().int().min(REMOTE_EXEC_MIN_TIMEOUT_MS).max(REMOTE_EXEC_MAX_TIMEOUT_MS).optional(),
   }),
   [MEMORY_MCP_TOOL_NAMES.SEND_FILE_TO_MACHINE]: z.strictObject({
     machine: machineTargetRuntimeSchema.describe('Canonical 10-digit nodeId or ^^(nodeId); deprecated noncanonical legacy alias is compatibility-only.'),
@@ -2106,7 +2120,7 @@ const schemas = {
     overwrite: z.boolean().optional(),
   }),
   [MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_DOCS]: z.strictObject({
-    topic: z.enum(COMPUTER_USE_DOC_TOPICS).describe('Documentation topic.'),
+    topic: z.enum(COMPUTER_USE_DOC_TOPICS),
   }),
   [MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL]: z.strictObject({
     machine: machineTargetRuntimeSchema.describe('Canonical 10-digit nodeId, ^^(nodeId), deprecated noncanonical legacy alias, or local/localhost/self/this; do not preflight list_machines when known.'),

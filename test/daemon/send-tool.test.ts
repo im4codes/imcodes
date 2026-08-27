@@ -560,7 +560,16 @@ describe('send-tool', () => {
   it('persists strict supervision audit purpose only for one reply-enabled target', async () => {
     const dispatchMessage = vi.fn().mockResolvedValue(undefined);
     const origin = session({ name: 'deck_alpha_brain', projectName: 'alpha', role: 'brain' });
-    const target = session({ name: 'deck_alpha_w1', projectName: 'alpha', role: 'w1', label: 'Auditor' });
+    // A real third session is the audit SUBJECT. The dispatching Brain is
+    // neither auditor nor audited, so it must not stand in as either.
+    const audited = session({
+      name: 'deck_alpha_impl', projectName: 'alpha', role: 'w2',
+      parentSession: 'deck_alpha_brain', label: 'Impl',
+    });
+    const target = session({
+      name: 'deck_alpha_w1', projectName: 'alpha', role: 'w1',
+      parentSession: 'deck_alpha_brain', label: 'Auditor',
+    });
     const result = await dispatchSendMessage(caller, {
       target: target.name,
       message: 'perform the configured audit',
@@ -568,9 +577,10 @@ describe('send-tool', () => {
       audit: {
         kind: AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT,
         attemptId: 'automatic_audit_attempt_1',
+        auditedSessionName: 'deck_alpha_impl',
       },
     }, {
-      listSessions: () => [origin, target],
+      listSessions: () => [origin, audited, target],
       dispatchMessage,
     });
 
@@ -589,9 +599,10 @@ describe('send-tool', () => {
       audit: {
         kind: AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT,
         attemptId: 'automatic_audit_attempt_2',
+        auditedSessionName: 'deck_alpha_impl',
       },
     }, {
-      listSessions: () => [origin, target],
+      listSessions: () => [origin, audited, target],
       dispatchMessage,
     })).resolves.toMatchObject({
       status: 'error',

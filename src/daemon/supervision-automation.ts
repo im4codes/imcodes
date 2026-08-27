@@ -1,7 +1,8 @@
 import { readFile, readdir, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { getSession, type SessionRecord } from '../store/session-store.js';
+import { getSession, listSessions, type SessionRecord } from '../store/session-store.js';
+import { validateBrainAuditRoute } from './peer-audit-candidates.js';
 import { getTransportRuntime } from '../agent/session-manager.js';
 import { PROVIDER_ERROR_CODES } from '../agent/transport-provider.js';
 import type { ServerLink } from './server-link.js';
@@ -1821,6 +1822,37 @@ class SupervisionAutomation {
   ): void {
     if (run.phase !== 'execution' && run.phase !== 'auditing') return;
     if (run.phase === 'auditing' && run.auditDelegationId && run.auditDelegationId !== options.delegationId) return;
+
+    // SINGLE CONVERGENCE POINT for both observation callers (structured record
+    // and legacy text-pattern), and it runs before ANY mutation below --
+    // before deferExplicitPostAuditWork, before phase becomes 'auditing',
+    // before the attempt/instance ids are adopted, before the deadline is armed.
+    //
+    // This is NOT redundant with the startAudit gate. The legacy caller fires on
+    // a TEXT PATTERN, so no audit envelope exists and the send-tool gate never
+    // ran for it: a session whose message merely looks like an audit delegation
+    // could adopt an ineligible auditor and arm a 15-minute deadline against a
+    // stopped session, an execution clone, or a non-direct child. Both entry
+    // points call the SAME shared validator, so they cannot drift; neither can
+    // mask the other, because each guards mutations the other never reaches.
+    const route = validateBrainAuditRoute({
+      auditedSessionName: run.sessionName,
+      targetName: target.name,
+      allSessions: listSessions(),
+    });
+    if (!route.ok) {
+      logger.warn({
+        session: run.sessionName,
+        targetName: target.name,
+        refusal: route.refusal,
+      }, 'Observed peer audit refused the adopted route');
+      this.failUnroutableAudit(
+        run,
+        `Automation observed a peer audit delegated to an unusable auditor: ${route.detail}. Manual review is required.`,
+      );
+      return;
+    }
+
     if (run.phase === 'execution') this.deferExplicitPostAuditWork(run);
     run.phase = 'auditing';
     run.requiresAudit = false;
@@ -2833,6 +2865,23 @@ class SupervisionAutomation {
     await this.dispatchContinue(current, decision);
   }
 
+  /**
+   * End a run that has no usable audit route.
+   *
+   * One method for BOTH the missing-route and ineligible-route paths, because
+   * they must end identically: invalid_configuration, a visible warning, and a
+   * TERMINAL needs-input status. finishRun() clears the status unless told
+   * otherwise, so without preserveStatus the run would end at status:null and
+   * look indistinguishable from a clean finish. The diagnostic differs; the
+   * terminal semantics must not.
+   */
+  private failUnroutableAudit(current: ActiveTaskRunState, warning: string): void {
+    this.emitOrchestratedAuditResult(current, 'invalid_configuration', 'invalid_configuration');
+    this.emitWarning(current.sessionName, warning);
+    this.emitTerminalStatus(current.sessionName, 'supervision_needs_input', SUPERVISION_NEEDS_INPUT_LABEL);
+    this.finishRun(current.sessionName, 'needs_input', { preserveStatus: true });
+  }
+
   private finishRun(
     sessionName: string,
     state: TaskRunTerminalState,
@@ -2926,9 +2975,33 @@ class SupervisionAutomation {
         hasTarget: Boolean(target),
         hasTransportRuntime: Boolean(transportRuntime),
       }, 'Automatic audit preflight could not resolve the selected session');
-      this.emitOrchestratedAuditResult(current, 'invalid_configuration', 'invalid_configuration');
-      this.emitWarning(current.sessionName, 'Automation peer audit could not resolve the current session or configured auditor. Manual review is required.');
-      this.finishRun(current.sessionName, 'needs_input');
+      this.failUnroutableAudit(current, 'Automation peer audit could not resolve the current session or configured auditor. Manual review is required.');
+      return;
+    }
+
+    // ELIGIBILITY, not just existence. The check above only proves the target
+    // record and runtime exist; a stopped session, an execution clone, a
+    // non-direct child, or one lacking identity/reply capability would sail
+    // past it and then get a 15-minute audit deadline armed against it.
+    //
+    // This calls the SAME authoritative validator the send tool uses. A second
+    // approximate rule set here is precisely how a route one boundary refuses
+    // becomes one the other accepts.
+    const route = validateBrainAuditRoute({
+      auditedSessionName: current.sessionName,
+      targetName,
+      allSessions: listSessions(),
+    });
+    if (!route.ok) {
+      logger.warn({
+        session: current.sessionName,
+        targetName,
+        refusal: route.refusal,
+      }, 'Automatic audit preflight refused the configured route');
+      this.failUnroutableAudit(
+        current,
+        `Automation peer audit cannot use the configured auditor: ${route.detail}. Manual review is required.`,
+      );
       return;
     }
 
@@ -2937,10 +3010,9 @@ class SupervisionAutomation {
     const auditTask = buildAutomaticAuditTaskPrompt({
       attemptId: current.auditAttemptId,
       targetSession: targetName,
-      auditMetadata: JSON.stringify({
-        kind: AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT,
-        attemptId: current.auditAttemptId,
-      }),
+      // The audited session is the one whose work this attempt reviews --
+      // never the auditor (targetName) and never the dispatching Brain.
+      auditedSessionName: current.sessionName,
       narrow: current.auditDepth === 'narrow',
       ...(baseline.changeDir ? { changeDir: baseline.changeDir } : {}),
       changedPaths: baseline.fileContents.map((entry) => entry.path),

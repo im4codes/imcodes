@@ -126,6 +126,7 @@ const {
 const { timelineEmitter } = await import('../../src/daemon/timeline-emitter.js');
 const { timelineStore } = await import('../../src/daemon/timeline-store.js');
 const { flushStore, getSession, upsertSession, removeSession } = await import('../../src/store/session-store.js');
+const { EXECUTION_CLONE_KIND } = await import('../../shared/execution-clone.js');
 const { createDelegationReplyAuthority } = await import('../../src/daemon/delegation-reply-authority.js');
 const { emitDelegationReplyDelivered } = await import('../../src/daemon/delegation-reply-events.js');
 
@@ -248,6 +249,10 @@ async function seedSession(
     name: 'deck_sub_reviewer',
     label: 'Reviewer',
     projectName: 'supervision',
+    // The reviewer is a SUB-SESSION of the supervised session, which is what
+    // makes it a peer-audit candidate. The fixture previously omitted this, so
+    // it described a topology the peer-audit authority would never accept.
+    parentSession: 'deck_supervision_brain',
     role: 'w1',
     agentType: 'claude-code-sdk',
     runtimeType: 'transport',
@@ -308,6 +313,9 @@ function recreateReviewer(label = 'Replacement reviewer') {
     name: 'deck_sub_reviewer',
     label,
     projectName: 'supervision',
+    // Same sub-session topology as seedSession(); a recreated reviewer must
+    // still be a peer-audit candidate.
+    parentSession: 'deck_supervision_brain',
     role: 'w1',
     agentType: 'claude-code-sdk',
     runtimeType: 'transport',
@@ -3040,6 +3048,194 @@ describe('SupervisionAutomation', () => {
     }
   });
 
+  /** Re-seat the reviewer with a topology/state override, to make it INELIGIBLE. */
+  function reseatReviewer(overrides: Record<string, unknown>) {
+    removeSession('deck_sub_reviewer');
+    upsertSession({
+      name: 'deck_sub_reviewer',
+      label: 'Reviewer',
+      projectName: 'supervision',
+      parentSession: 'deck_supervision_brain',
+      role: 'w1',
+      agentType: 'claude-code-sdk',
+      runtimeType: 'transport',
+      providerId: 'claude-code-sdk',
+      providerSessionId: 'provider-session-reviewer',
+      activeModel: 'claude-sonnet-4-6',
+      projectDir: projectDir!,
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      ...overrides,
+    } as never);
+  }
+
+  /** Drive a supervised_audit run to the audit preflight and let it settle. */
+  async function runToAuditPreflight(commandId: string) {
+    mockSupervisionDecide.mockResolvedValue({
+      decision: 'complete',
+      reason: 'implementation complete, subject to peer audit',
+      confidence: 0.95,
+      requiresAudit: true,
+    });
+    supervisionAutomation.init();
+    const snapshot = await seedSession('supervised_audit');
+    return { snapshot, commandId };
+  }
+
+  function lastStatusPayload(): Record<string, unknown> | undefined {
+    const statuses = timelineEmitter.replay('deck_supervision_brain', 0).events
+      .filter((event) => event.type === 'agent.status');
+    return statuses.at(-1)?.payload as Record<string, unknown> | undefined;
+  }
+
+  /**
+   * Drive the REAL observed legacy delegation sequence against an ineligible
+   * auditor and assert the daemon refuses to adopt it.
+   *
+   * This path is reached by TEXT PATTERN, not by an audit envelope, so the
+   * send-tool gate never ran for it. Before the fix it adopted whatever session
+   * emitted the text, flipped phase to 'auditing', and armed a 900000ms deadline.
+   */
+  async function observedAuditAgainstIneligibleTarget(
+    commandId: string,
+    reviewerOverrides: Record<string, unknown>,
+  ) {
+    const snapshot = await seedSession('supervised_audit');
+    reseatReviewer(reviewerOverrides);
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent(
+      'deck_supervision_brain', commandId, 'implement the feature', snapshot,
+    );
+    beginRun(commandId, 'implement the feature');
+    // Run is in EXECUTION phase; the observation below is what would adopt the
+    // auditor, so startAudit's gate is not what is under test here.
+    beginAuditTargetTurn('attempt-observed-ineligible');
+    await waitForRunEnd();
+  }
+
+  it('refuses an observed legacy delegation to a STOPPED auditor', async () => {
+    await observedAuditAgainstIneligibleTarget('cmd-observed-stopped', { state: 'stopped' });
+    const run = supervisionAutomation.getActiveRun('deck_supervision_brain');
+    expect(run).toBeUndefined();
+    expect(run?.phase).not.toBe('auditing');
+    expect(run?.auditDeadlineAt).toBeUndefined();
+    expect(mockTransportRuntime.send).not.toHaveBeenCalled();
+    expect(lastStatusPayload()).toMatchObject({ status: 'supervision_needs_input' });
+  });
+
+  it('refuses an observed legacy delegation to an EXECUTION-CLONE auditor', async () => {
+    await observedAuditAgainstIneligibleTarget('cmd-observed-clone', {
+      executionCloneMetadata: { kind: EXECUTION_CLONE_KIND },
+    });
+    const run = supervisionAutomation.getActiveRun('deck_supervision_brain');
+    expect(run).toBeUndefined();
+    expect(run?.phase).not.toBe('auditing');
+    expect(run?.auditDeadlineAt).toBeUndefined();
+    expect(mockTransportRuntime.send).not.toHaveBeenCalled();
+    expect(lastStatusPayload()).toMatchObject({ status: 'supervision_needs_input' });
+  });
+
+  it('refuses an observed legacy delegation to a NON-DIRECT-CHILD auditor', async () => {
+    await observedAuditAgainstIneligibleTarget('cmd-observed-orphan', { parentSession: undefined });
+    const run = supervisionAutomation.getActiveRun('deck_supervision_brain');
+    expect(run).toBeUndefined();
+    expect(run?.phase).not.toBe('auditing');
+    expect(run?.auditDeadlineAt).toBeUndefined();
+    expect(mockTransportRuntime.send).not.toHaveBeenCalled();
+    expect(lastStatusPayload()).toMatchObject({ status: 'supervision_needs_input' });
+  });
+
+  it('refuses a STOPPED audit target instead of arming a deadline against it', async () => {
+    // The old preflight checked only that the record and runtime EXIST. A
+    // stopped session satisfies that and would get a 15-minute audit deadline
+    // armed against a session that can never answer.
+    const { snapshot } = await runToAuditPreflight('cmd-stopped-auditor');
+    reseatReviewer({ state: 'stopped' });
+
+    supervisionAutomation.registerTaskIntent(
+      'deck_supervision_brain', 'cmd-stopped-auditor', 'implement the feature', snapshot,
+    );
+    beginRun('cmd-stopped-auditor', 'implement the feature');
+    completeTurn('Implementation and tests are complete.');
+    await waitForRunEnd();
+
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
+    expect(mockTransportRuntime.send).not.toHaveBeenCalled();
+    expect(lastStatusPayload()).toMatchObject({ status: 'supervision_needs_input' });
+    expect(lastStatusPayload()?.status).not.toBeNull();
+  });
+
+  it('refuses an execution-clone audit target instead of arming a deadline against it', async () => {
+    // An execution clone is ephemeral and is never a peer-audit candidate, but
+    // it resolves as an ordinary session record, so existence-only preflight
+    // accepted it.
+    const { snapshot } = await runToAuditPreflight('cmd-clone-auditor');
+    reseatReviewer({ executionCloneMetadata: { kind: EXECUTION_CLONE_KIND } });
+
+    supervisionAutomation.registerTaskIntent(
+      'deck_supervision_brain', 'cmd-clone-auditor', 'implement the feature', snapshot,
+    );
+    beginRun('cmd-clone-auditor', 'implement the feature');
+    completeTurn('Implementation and tests are complete.');
+    await waitForRunEnd();
+
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
+    expect(mockTransportRuntime.send).not.toHaveBeenCalled();
+    expect(lastStatusPayload()).toMatchObject({ status: 'supervision_needs_input' });
+  });
+
+  it('refuses a non-direct-child audit target instead of arming a deadline against it', async () => {
+    const { snapshot } = await runToAuditPreflight('cmd-orphan-auditor');
+    reseatReviewer({ parentSession: undefined });
+
+    supervisionAutomation.registerTaskIntent(
+      'deck_supervision_brain', 'cmd-orphan-auditor', 'implement the feature', snapshot,
+    );
+    beginRun('cmd-orphan-auditor', 'implement the feature');
+    completeTurn('Implementation and tests are complete.');
+    await waitForRunEnd();
+
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
+    expect(mockTransportRuntime.send).not.toHaveBeenCalled();
+    expect(lastStatusPayload()).toMatchObject({ status: 'supervision_needs_input' });
+  });
+
+  it('leaves a TERMINAL needs-input status when the Brain audit route cannot be resolved', async () => {
+    // The Brain named an auditor that does not exist. The daemon must NOT
+    // substitute another session, and must not end the run silently: finishRun()
+    // clears the status unless preserved, which would make an unroutable audit
+    // externally indistinguishable from a clean finish.
+    const snapshot = await seedSession('supervised_audit', false, 2, {
+      auditTargetSessionName: 'deck_sub_absent',
+    });
+    mockSupervisionDecide.mockResolvedValue({
+      decision: 'complete',
+      reason: 'implementation complete, subject to peer audit',
+      confidence: 0.95,
+      requiresAudit: true,
+    });
+
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent(
+      'deck_supervision_brain', 'cmd-unroutable-audit', 'implement the feature', snapshot,
+    );
+    beginRun('cmd-unroutable-audit', 'implement the feature');
+    completeTurn('Implementation and tests are complete.');
+    await waitForRunEnd();
+
+    const statuses = timelineEmitter.replay('deck_supervision_brain', 0).events
+      .filter((event) => event.type === 'agent.status');
+    const last = statuses.at(-1);
+    // The LAST status is the observable one. Asserting merely that a
+    // needs-input status appeared somewhere would pass even if it were
+    // immediately cleared to null, which is the exact regression guarded here.
+    expect(last?.payload).toMatchObject({ status: 'supervision_needs_input' });
+    expect(last?.payload?.status).not.toBeNull();
+  });
+
   it('evaluates an empty final assistant response instead of skipping the Auto check', async () => {
     const snapshot = await seedSession('supervised');
 
@@ -3133,7 +3329,9 @@ describe('SupervisionAutomation', () => {
       'prepare one concise, self-contained re-audit brief yourself',
     );
     expect(String(mockTransportRuntime.send.mock.calls[2]?.[0])).toContain(
-      'audit={"kind":"supervision_audit","attemptId":"<that-fresh-attempt-id>"}',
+      // The envelope the prompt tells the model to send must be one the parser
+      // accepts, so it carries the audited session explicitly.
+      'audit={"kind":"supervision_audit","attemptId":"<that-fresh-attempt-id>","auditedSessionName":"deck_supervision_brain"}',
     );
     expect(String(mockTransportRuntime.send.mock.calls[2]?.[0])).toContain(
       'do not wait for the daemon or user to start this next audit',

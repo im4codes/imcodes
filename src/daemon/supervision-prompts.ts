@@ -1,5 +1,7 @@
+import { buildAgentDelegationAuditEnvelope } from '../../shared/agent-delegation.js';
 import {
   SUPERVISION_CONTRACT_IDS,
+  SUPERVISION_TRUSTED_EXECUTION_CONTRACT_IDS,
   SUPERVISION_DELEGATION_ELIGIBILITY_DECISIONS,
   SUPERVISION_DELEGATION_ELIGIBILITY_FORBIDDEN_AGENT_TYPES,
   SUPERVISION_DELEGATION_ELIGIBILITY_POLICY,
@@ -478,7 +480,8 @@ export function buildSupervisionAuditHeartbeatPrompt(options: {
 export function buildAutomaticAuditTaskPrompt(options: {
   attemptId: string;
   targetSession: string;
-  auditMetadata: string;
+  /** Session under audit. Typed, so the envelope cannot omit it. */
+  auditedSessionName: string;
   narrow: boolean;
   changeDir?: string;
   changedPaths?: string[];
@@ -488,7 +491,10 @@ export function buildAutomaticAuditTaskPrompt(options: {
   const common = {
     attempt: options.attemptId,
     target: options.targetSession,
-    metadata: options.auditMetadata,
+    metadata: JSON.stringify(buildAgentDelegationAuditEnvelope({
+      attemptId: options.attemptId,
+      auditedSessionName: options.auditedSessionName,
+    })),
     markers: markerLine,
   };
   const copies: Record<SupervisionUiLocale, string[]> = {
@@ -970,6 +976,20 @@ function buildCompactContinueRulesSection(
     .join('\n');
 }
 
+/**
+ * Re-declare the standing contracts BY REFERENCE.
+ *
+ * SUPERVISION_TRUSTED_CONTRACT_DELIVERY.reinjectEveryEntrypoint requires every
+ * entrypoint to re-assert the contracts in force. The per-turn prompts satisfy
+ * that by naming them (~200 bytes) rather than restating them (~6500 bytes):
+ * the full text is delivered once as the system/developer supervision preamble,
+ * and repeating it on every continuation turn crowds out the actual task
+ * context it is supposed to protect.
+ */
+export function buildSupervisionContractsInForceLine(): string {
+  return `[Contracts in force (delivered as the supervision preamble; still binding): ${SUPERVISION_TRUSTED_EXECUTION_CONTRACT_IDS.join(', ')}]`;
+}
+
 export function buildSupervisionContinuePrompt(
   taskRequest: string,
   assistantResponse: string | undefined,
@@ -1026,10 +1046,16 @@ export function buildSupervisionContinuePrompt(
     : '';
   return [
     `[Contract: ${contractId}]`,
-    buildSupervisionOrchestratorContext(parsed.uiLocale),
-    buildSupervisionTaskFinalizationContract(parsed.uiLocale),
-    buildSupervisionTaskRegistryContract(parsed.uiLocale),
-    buildSupervisionDelegationEligibilityPolicy(parsed.uiLocale),
+    // The four standing contract blocks (orchestrator context, task
+    // finalization, task registry, delegation eligibility) are deliberately
+    // NOT here. They are ~6.5KB of fixed prose, and this prompt is injected
+    // on EVERY continuation turn -- re-sending them each turn is what the
+    // function comment above forbids ("Detailed workflow documentation and
+    // repeated prose belong to the supervisor judge, not to every
+    // continuation turn"). They are still sent in full by the decision and
+    // preamble prompts, which run once per task rather than once per turn, and
+    // are re-asserted here by reference on the line below.
+    buildSupervisionContractsInForceLine(),
     copy.continueTask,
     `${copy.executionMode}${separator}${executionMode}`,
     `${copy.actionHint}${separator}${action}`,
@@ -1061,7 +1087,8 @@ export function appendTaskRunContract(
 }
 
 export function buildReworkBriefPrompt(
-  _sessionName: string,
+  /** The session being audited: the one doing this rework. Never the auditor. */
+  auditedSessionName: string,
   userText: string,
   _lastAssistantText: string | undefined,
   verdictText: string,
@@ -1084,7 +1111,7 @@ export function buildReworkBriefPrompt(
     verdict: string;
     fix: string;
     target: string;
-    reaudit: (target: string) => string;
+    reaudit: (target: string, audited: string) => string;
     after: string;
     fallback: string;
     budget: (attempt: number, limit: number) => string;
@@ -1092,7 +1119,7 @@ export function buildReworkBriefPrompt(
   }> = {
     en: {
       verdict: 'Audit verdict: REWORK', fix: 'Fix these findings, then run the relevant validation', target: 'Fresh re-audit target ID',
-      reaudit: (target) => `After the repair is reviewable, generate a fresh unique attempt ID, prepare one concise, self-contained re-audit brief yourself from the current context, and send it immediately with send_message(target=${JSON.stringify(target)}, reply=true, audit={"kind":"supervision_audit","attemptId":"<that-fresh-attempt-id>"}, message="<your re-audit brief>"). Include the same attempt ID inside the brief. Do not call send_list_targets, do not poll, and do not wait for the daemon or user to start this next audit.`,
+      reaudit: (target, audited) => `After the repair is reviewable, generate a fresh unique attempt ID, prepare one concise, self-contained re-audit brief yourself from the current context, and send it immediately with send_message(target=${JSON.stringify(target)}, reply=true, audit={"kind":"supervision_audit","attemptId":"<that-fresh-attempt-id>","auditedSessionName":${JSON.stringify(audited)}}, message="<your re-audit brief>"). Include the same attempt ID inside the brief. Do not call send_list_targets, do not poll, and do not wait for the daemon or user to start this next audit.`,
       after: `After that delegated audit replies, report the evidence and end with exactly one matching marker: ${PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS.PASS} or ${PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS.REWORK}. On REWORK, repeat this repair -> validate -> self-prepared re-audit cycle until PASS or an exact blocker/safety limit.`,
       fallback: 'After the repair is reviewable, prepare one concise, self-contained re-audit brief yourself and send one fresh reply-enabled audit to the same configured audit target if it is available in the current context. If the target ID is unavailable, report that exact blocker instead of waiting silently.',
       budget: (attempt, limit) => `Repair attempt ${attempt} of ${limit}. On the last attempt, fix what matters most or report an exact blocker; do not assume another round follows.`,
@@ -1100,7 +1127,7 @@ export function buildReworkBriefPrompt(
     },
     'zh-CN': {
       verdict: '审计结论：REWORK', fix: '修复以下发现，然后执行相关验证', target: '新一轮复审目标 ID',
-      reaudit: (target) => `修复达到可审状态后，生成新的唯一 attempt ID，根据当前上下文自行准备简短、自包含的复审说明，并立即调用 send_message(target=${JSON.stringify(target)}, reply=true, audit={"kind":"supervision_audit","attemptId":"<新 attempt ID>"}, message="<复审说明>")。说明内必须使用同一个 attempt ID。不要调用 send_list_targets，不要轮询，也不要等待 daemon 或用户替你启动复审。`,
+      reaudit: (target, audited) => `修复达到可审状态后，生成新的唯一 attempt ID，根据当前上下文自行准备简短、自包含的复审说明，并立即调用 send_message(target=${JSON.stringify(target)}, reply=true, audit={"kind":"supervision_audit","attemptId":"<新 attempt ID>","auditedSessionName":${JSON.stringify(audited)}}, message="<复审说明>")。说明内必须使用同一个 attempt ID。不要调用 send_list_targets，不要轮询，也不要等待 daemon 或用户替你启动复审。`,
       after: `复审回执到达后汇报证据，并只以一个匹配标记结束：${PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS.PASS} 或 ${PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS.REWORK}。若为 REWORK，继续“修复→验证→自行复审”，直至 PASS 或明确阻断/安全上限。`,
       fallback: '修复达到可审状态后，自行准备简短、自包含的复审说明，并向当前上下文中的同一审计目标发送一次新的可回执复审。若没有目标 ID，报告这个明确阻断，不要静默等待。',
       budget: (attempt, limit) => `修复次数 ${attempt}/${limit}。最后一次应优先修复关键问题或报告明确阻断，不要假设还有下一轮。`,
@@ -1108,7 +1135,7 @@ export function buildReworkBriefPrompt(
     },
     'zh-TW': {
       verdict: '審計結論：REWORK', fix: '修復以下發現，然後執行相關驗證', target: '新一輪複審目標 ID',
-      reaudit: (target) => `修復達到可審狀態後，產生新的唯一 attempt ID，依目前脈絡自行準備簡短、自包含的複審說明，並立即呼叫 send_message(target=${JSON.stringify(target)}, reply=true, audit={"kind":"supervision_audit","attemptId":"<新 attempt ID>"}, message="<複審說明>")。說明內必須使用同一個 attempt ID。不要呼叫 send_list_targets，不要輪詢，也不要等待 daemon 或使用者替你啟動複審。`,
+      reaudit: (target, audited) => `修復達到可審狀態後，產生新的唯一 attempt ID，依目前脈絡自行準備簡短、自包含的複審說明，並立即呼叫 send_message(target=${JSON.stringify(target)}, reply=true, audit={"kind":"supervision_audit","attemptId":"<新 attempt ID>","auditedSessionName":${JSON.stringify(audited)}}, message="<複審說明>")。說明內必須使用同一個 attempt ID。不要呼叫 send_list_targets，不要輪詢，也不要等待 daemon 或使用者替你啟動複審。`,
       after: `複審回覆到達後回報證據，並只以一個匹配標記結束：${PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS.PASS} 或 ${PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS.REWORK}。若為 REWORK，繼續「修復→驗證→自行複審」，直到 PASS 或明確阻斷/安全上限。`,
       fallback: '修復達到可審狀態後，自行準備簡短、自包含的複審說明，並向目前脈絡中的同一審計目標傳送一次新的可回覆複審。若沒有目標 ID，回報此明確阻斷，不要靜默等待。',
       budget: (attempt, limit) => `修復次數 ${attempt}/${limit}。最後一次應優先修復關鍵問題或回報明確阻斷，不要假設還有下一輪。`,
@@ -1116,7 +1143,7 @@ export function buildReworkBriefPrompt(
     },
     es: {
       verdict: 'Veredicto: REWORK', fix: 'Corrige estos hallazgos y ejecuta la validación pertinente', target: 'ID del nuevo destino',
-      reaudit: (target) => `Cuando la corrección sea revisable, genera un attempt ID único, prepara el resumen y envíalo de inmediato con send_message(target=${JSON.stringify(target)}, reply=true, audit={"kind":"supervision_audit","attemptId":"<nuevo-id>"}, message="<resumen>"). Usa el mismo ID; no consultes destinos ni esperes al daemon o al usuario.`,
+      reaudit: (target, audited) => `Cuando la corrección sea revisable, genera un attempt ID único, prepara el resumen y envíalo de inmediato con send_message(target=${JSON.stringify(target)}, reply=true, audit={"kind":"supervision_audit","attemptId":"<nuevo-id>","auditedSessionName":${JSON.stringify(audited)}}, message="<resumen>"). Usa el mismo ID; no consultes destinos ni esperes al daemon o al usuario.`,
       after: `Tras la respuesta, informa evidencia y termina con un solo marcador: ${PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS.PASS} o ${PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS.REWORK}. En REWORK repite corrección, validación y auditoría hasta PASS o un bloqueo/límite exacto.`,
       fallback: 'Cuando sea revisable, prepara y envía una nueva auditoría con respuesta al mismo destino configurado. Si falta el ID, informa ese bloqueo y no esperes en silencio.',
       budget: (a, l) => `Intento de corrección ${a} de ${l}. En el último, corrige lo esencial o informa un bloqueo exacto.`,
@@ -1124,7 +1151,7 @@ export function buildReworkBriefPrompt(
     },
     ru: {
       verdict: 'Вердикт: REWORK', fix: 'Исправьте выводы и выполните нужные проверки', target: 'ID цели повторной проверки',
-      reaudit: (target) => `Когда исправление готово к проверке, создайте новый уникальный attempt ID, подготовьте описание и немедленно отправьте через send_message(target=${JSON.stringify(target)}, reply=true, audit={"kind":"supervision_audit","attemptId":"<новый-id>"}, message="<описание>"). Используйте тот же ID; не ищите цели и не ждите daemon или пользователя.`,
+      reaudit: (target, audited) => `Когда исправление готово к проверке, создайте новый уникальный attempt ID, подготовьте описание и немедленно отправьте через send_message(target=${JSON.stringify(target)}, reply=true, audit={"kind":"supervision_audit","attemptId":"<новый-id>","auditedSessionName":${JSON.stringify(audited)}}, message="<описание>"). Используйте тот же ID; не ищите цели и не ждите daemon или пользователя.`,
       after: `После ответа сообщите доказательства и завершите одним маркером: ${PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS.PASS} или ${PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS.REWORK}. При REWORK повторяйте исправление, проверку и аудит до PASS или точной блокировки/лимита.`,
       fallback: 'После готовности самостоятельно отправьте новую проверку с ответом той же настроенной цели. Если ID отсутствует, сообщите точную блокировку, не ждите молча.',
       budget: (a, l) => `Попытка исправления ${a} из ${l}. В последней исправьте главное или сообщите точную блокировку.`,
@@ -1132,7 +1159,7 @@ export function buildReworkBriefPrompt(
     },
     ja: {
       verdict: '監査判定：REWORK', fix: '次の所見を修正し、関連する検証を実行', target: '新しい再監査対象 ID',
-      reaudit: (target) => `修正が監査可能になったら新しい一意の attempt ID を作り、説明を準備して send_message(target=${JSON.stringify(target)}, reply=true, audit={"kind":"supervision_audit","attemptId":"<新ID>"}, message="<説明>") で直ちに送信します。同じ ID を使い、対象検索・ポーリング・daemon/利用者待ちはしません。`,
+      reaudit: (target, audited) => `修正が監査可能になったら新しい一意の attempt ID を作り、説明を準備して send_message(target=${JSON.stringify(target)}, reply=true, audit={"kind":"supervision_audit","attemptId":"<新ID>","auditedSessionName":${JSON.stringify(audited)}}, message="<説明>") で直ちに送信します。同じ ID を使い、対象検索・ポーリング・daemon/利用者待ちはしません。`,
       after: `返信後に証拠を報告し、${PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS.PASS} または ${PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS.REWORK} の一方だけで終了します。REWORK なら PASS または明確な障害/上限まで修正・検証・再監査を繰り返します。`,
       fallback: '監査可能になったら、同じ設定済み対象へ新しい返信可能な再監査を自分で送ってください。対象 ID がなければ黙って待たず、その障害を報告します。',
       budget: (a, l) => `修正試行 ${a}/${l}。最終試行では重要点を直すか明確な障害を報告します。`,
@@ -1140,7 +1167,7 @@ export function buildReworkBriefPrompt(
     },
     ko: {
       verdict: '감사 판정: REWORK', fix: '다음 발견을 수정하고 관련 검증 실행', target: '새 재감사 대상 ID',
-      reaudit: (target) => `수정이 감사 가능해지면 새 고유 attempt ID를 만들고 설명을 준비하여 send_message(target=${JSON.stringify(target)}, reply=true, audit={"kind":"supervision_audit","attemptId":"<새ID>"}, message="<설명>")로 즉시 보내세요. 같은 ID를 사용하고 대상 조회, 폴링, daemon/사용자 대기를 하지 마세요.`,
+      reaudit: (target, audited) => `수정이 감사 가능해지면 새 고유 attempt ID를 만들고 설명을 준비하여 send_message(target=${JSON.stringify(target)}, reply=true, audit={"kind":"supervision_audit","attemptId":"<새ID>","auditedSessionName":${JSON.stringify(audited)}}, message="<설명>")로 즉시 보내세요. 같은 ID를 사용하고 대상 조회, 폴링, daemon/사용자 대기를 하지 마세요.`,
       after: `회신 후 증거를 보고하고 ${PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS.PASS} 또는 ${PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS.REWORK} 중 하나로만 끝내세요. REWORK면 PASS 또는 명확한 차단/한도까지 수정·검증·재감사를 반복하세요.`,
       fallback: '감사 가능해지면 같은 설정 대상에 새 회신 가능 재감사를 직접 보내세요. 대상 ID가 없으면 조용히 기다리지 말고 정확한 차단을 보고하세요.',
       budget: (a, l) => `수정 시도 ${a}/${l}. 마지막에는 핵심을 수정하거나 명확한 차단을 보고하세요.`,
@@ -1151,7 +1178,14 @@ export function buildReworkBriefPrompt(
   return [
     `[Contract: ${SUPERVISION_CONTRACT_IDS.REWORK_BRIEF}]`,
     buildSupervisionOrchestratorContext(uiLocale),
-    buildSupervisionTaskFinalizationContract(uiLocale),
+    // NO task-finalization contract here, deliberately.
+    //
+    // A REWORK brief is sent precisely when finalization has been DEFERRED
+    // (the run carries deferredFinalization.nextAction until a fresh matching
+    // PASS). Restating the whole stage/commit/push contract to a session that
+    // must not finalize contradicts the run state and invites the premature
+    // commit the supervisor exists to prevent. `text.freeze` below states the
+    // prohibition in one line, which is all this prompt needs.
     buildSupervisionTaskRegistryContract(uiLocale),
     buildSupervisionDelegationEligibilityPolicy(uiLocale),
     text.verdict,
@@ -1159,7 +1193,7 @@ export function buildReworkBriefPrompt(
     copy.reworkLoop,
     ...(auditTargetSessionName ? [
       `${text.target}: ${auditTargetSessionName}`,
-      text.reaudit(auditTargetSessionName),
+      text.reaudit(auditTargetSessionName, auditedSessionName),
       text.after,
     ] : [
       text.fallback,
@@ -1309,7 +1343,7 @@ export const SUPERVISION_PROMPT_ENTRYPOINTS = [
     render: () => buildAutomaticAuditTaskPrompt({
       attemptId: 'attempt-registry',
       targetSession: 'deck_sub_reviewer',
-      auditMetadata: '{"kind":"supervision_audit","attemptId":"attempt-registry"}',
+      auditedSessionName: 'deck_alpha_impl',
       narrow: true,
     }),
   },
@@ -1357,17 +1391,19 @@ export const SUPERVISION_PROMPT_ENTRYPOINTS = [
   {
     id: 'supervisionContinue',
     builderName: 'buildSupervisionContinuePrompt',
-    includesOrchestratorContext: true,
-    includesTaskFinalizationContract: true,
-    includesTaskRegistryContract: true,
-    includesDelegationEligibilityPolicy: true,
+    // Per-turn prompt: carries no standing contract blocks.
+    includesOrchestratorContext: false,
+    includesTaskFinalizationContract: false,
+    includesTaskRegistryContract: false,
+    includesDelegationEligibilityPolicy: false,
     render: () => buildSupervisionContinuePrompt('Task', 'Result', { reason: 'More work remains' }),
   },
   {
     id: 'reworkBrief',
     builderName: 'buildReworkBriefPrompt',
     includesOrchestratorContext: true,
-    includesTaskFinalizationContract: true,
+    // Finalization is DEFERRED on a REWORK; see buildReworkBriefPrompt.
+    includesTaskFinalizationContract: false,
     includesTaskRegistryContract: true,
     includesDelegationEligibilityPolicy: true,
     render: () => buildReworkBriefPrompt(

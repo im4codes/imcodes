@@ -7,6 +7,7 @@ import {
   DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_TOTAL,
   SUPERVISION_USER_DEFAULT_PREF_KEY,
 } from '@shared/supervision-config.js';
+import { DEFAULT_SUPERVISION_EXECUTION_POOL_CONTROLS } from '@shared/supervision-execution-pool.js';
 import { CODEX_MODEL_IDS } from '../../src/shared/models/options.js';
 import {
   fetchSupervisorDefaults,
@@ -17,6 +18,46 @@ import {
   saveSessionSupervisorDefaults,
   saveSupervisorDefaults,
 } from '../src/api.js';
+
+/**
+ * The pools a legacy backend+model preference migrates into.
+ *
+ * A preference written before execution pools existed carries only backend and
+ * model, so the normalizer migrates it into a single-config primary pool and
+ * marks it configured. Spelling that out here keeps the round-trip exact: the
+ * browser must persist exactly what it normalized -- no field invented on the
+ * way in, none dropped on the way out to the PUT body.
+ */
+function migratedPools(agentType: string, providerFamily: string, model: string) {
+  return {
+    state: 'configured',
+    primaryDevelopmentPool: {
+      configs: [{
+        agentType,
+        providerFamily,
+        runtimeType: 'transport',
+        model,
+        capabilityId: `supervision-exec-v1:transport:${agentType}:${providerFamily}:${model}`,
+      }],
+      controls: { ...DEFAULT_SUPERVISION_EXECUTION_POOL_CONTROLS.primary },
+    },
+    economyTaskPool: {
+      configs: [],
+      controls: { ...DEFAULT_SUPERVISION_EXECUTION_POOL_CONTROLS.economy },
+    },
+  };
+}
+
+/** Asserted twice: as the resolved value AND as the persisted PUT payload. */
+const EXPECTED_QWEN_DEFAULTS = {
+  backend: 'qwen',
+  model: 'qwen3-coder-plus',
+  timeoutMs: 30_000,
+  promptVersion: 'supervision_decision_v1',
+  maxAutoContinueStreak: DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_STREAK,
+  maxAutoContinueTotal: DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_TOTAL,
+  executionPools: migratedPools('qwen', 'qwen', 'qwen3-coder-plus'),
+};
 
 const fetchMock = vi.fn();
 
@@ -57,6 +98,7 @@ describe('supervision API helpers', () => {
       promptVersion: 'custom_prompt_v1',
       maxAutoContinueStreak: DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_STREAK,
       maxAutoContinueTotal: DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_TOTAL,
+      executionPools: migratedPools('codex-sdk', 'codex', CODEX_MODEL_IDS[0]),
     });
 
     expect(fetchMock).toHaveBeenCalledWith(
@@ -73,31 +115,14 @@ describe('supervision API helpers', () => {
       model: 'qwen3-coder-plus',
       timeoutMs: 15_000,
       promptVersion: 'supervision_decision_v1',
-    })).resolves.toEqual({
-      backend: 'qwen',
-      model: 'qwen3-coder-plus',
-      timeoutMs: 30_000,
-      promptVersion: 'supervision_decision_v1',
-      maxAutoContinueStreak: DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_STREAK,
-      maxAutoContinueTotal: DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_TOTAL,
-    });
+    })).resolves.toEqual(EXPECTED_QWEN_DEFAULTS);
 
-    expect(fetchMock).toHaveBeenCalledWith(
-      `/api/preferences/${SUPERVISION_USER_DEFAULT_PREF_KEY}`,
-      expect.objectContaining({
-        method: 'PUT',
-        body: JSON.stringify({
-          value: {
-            backend: 'qwen',
-            model: 'qwen3-coder-plus',
-            timeoutMs: 30_000,
-            promptVersion: 'supervision_decision_v1',
-            maxAutoContinueStreak: DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_STREAK,
-            maxAutoContinueTotal: DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_TOTAL,
-          },
-        }),
-      }),
-    );
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe(`/api/preferences/${SUPERVISION_USER_DEFAULT_PREF_KEY}`);
+    expect(init.method).toBe('PUT');
+    // Parse rather than string-compare: the round-trip contract is the VALUE
+    // persisted, not the key order the normalizer happens to emit.
+    expect(JSON.parse(String(init.body))).toEqual({ value: EXPECTED_QWEN_DEFAULTS });
   });
 
   it('loads the machine owner supervision defaults through a covered session', async () => {

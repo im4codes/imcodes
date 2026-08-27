@@ -6,6 +6,10 @@ import {
   SUPERVISION_SUPPORTED_UI_LOCALES,
 } from '../../shared/supervision-config.js';
 import {
+  SUPERVISION_CONTRACT_IDS,
+} from '../../shared/supervision-config.js';
+import {
+  SUPERVISION_PROMPT_ENTRYPOINTS,
   SUPERVISED_AUDIT_EXECUTION_PREAMBLE,
   buildSupervisedAuditExecutionPreamble,
   buildSupervisionExecutionPreamble,
@@ -133,7 +137,7 @@ describe('supervision prompts', () => {
     const audit = buildAutomaticAuditTaskPrompt({
       attemptId: 'attempt-zh',
       targetSession: 'deck_sub_reviewer',
-      auditMetadata: '{"kind":"supervision_audit","attemptId":"attempt-zh"}',
+      auditedSessionName: 'deck_supervision_brain',
       narrow: true,
       changedPaths: ['src/example.ts'],
       uiLocale: 'zh-CN',
@@ -368,7 +372,9 @@ describe('supervision prompts', () => {
     expect(prompt).toContain('Fresh re-audit target ID: deck_sub_reviewer');
     expect(prompt).toContain('prepare one concise, self-contained re-audit brief yourself');
     expect(prompt).toContain('send it immediately with send_message(target="deck_sub_reviewer", reply=true');
-    expect(prompt).toContain('audit={"kind":"supervision_audit","attemptId":"<that-fresh-attempt-id>"}');
+    // The envelope names the AUDITED session (the one doing this rework, i.e.
+    // the first argument), not the auditor it is being sent to.
+    expect(prompt).toContain('audit={"kind":"supervision_audit","attemptId":"<that-fresh-attempt-id>","auditedSessionName":"deck_supervision_brain"}');
     expect(prompt).toContain('Do not call send_list_targets');
     expect(prompt).toContain('do not wait for the daemon or user to start this next audit');
     expect(prompt).toContain('self-prepared re-audit cycle until PASS');
@@ -485,4 +491,34 @@ describe('supervision prompts', () => {
     expect(prompt).not.toContain('THIS IS A RE-AUDIT');
     expect(prompt).not.toContain('Previous REWORK findings');
   });
+});
+
+describe('supervision prompt entrypoint registry', () => {
+  /**
+   * SUPERVISION_PROMPT_ENTRYPOINTS documents, per prompt, which standing
+   * contracts that prompt carries. Nothing enforced that: a builder could drop a
+   * contract block and the flag would go on claiming it was there. This test
+   * makes the declaration load-bearing, so drift is a failure rather than a lie
+   * a future reader trusts.
+   */
+  const CONTRACT_FLAGS: ReadonlyArray<readonly [string, string]> = [
+    ['includesOrchestratorContext', SUPERVISION_CONTRACT_IDS.ORCHESTRATOR_CONTEXT],
+    ['includesTaskFinalizationContract', SUPERVISION_CONTRACT_IDS.TASK_FINALIZATION],
+    ['includesTaskRegistryContract', SUPERVISION_CONTRACT_IDS.TASK_REGISTRY],
+    ['includesDelegationEligibilityPolicy', SUPERVISION_CONTRACT_IDS.DELEGATION_ELIGIBILITY],
+  ];
+
+  it.each(SUPERVISION_PROMPT_ENTRYPOINTS.map((entry) => [entry.id, entry] as const))(
+    '%s declares exactly the contract blocks it renders',
+    (_id, entry) => {
+      const rendered = entry.render();
+      const declared: Record<string, boolean> = {};
+      const actual: Record<string, boolean> = {};
+      for (const [flag, contractId] of CONTRACT_FLAGS) {
+        declared[flag] = (entry as unknown as Record<string, boolean>)[flag] === true;
+        actual[flag] = rendered.includes(`[Contract: ${contractId}]`);
+      }
+      expect(actual).toEqual(declared);
+    },
+  );
 });

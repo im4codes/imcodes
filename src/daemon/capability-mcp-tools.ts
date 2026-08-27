@@ -61,14 +61,14 @@ export const CAPABILITY_MCP_INPUT_SCHEMAS = {
     state: z.enum(CAPABILITY_LIFECYCLE_STATES).optional().describe('Optional lifecycle-state filter.'),
     scope: scope.optional().describe('Optional install-scope filter.'),
     query: z.string().max(CAPABILITY_LIMITS.DISPLAY_NAME_CHARS).optional().describe('Optional name/source search text.'),
-    limit: z.number().int().min(1).max(CAPABILITY_LIMITS.LIST_MAX).optional().describe('Bounded result limit.'),
+    limit: z.number().int().min(1).max(CAPABILITY_LIMITS.LIST_MAX).optional(),
   }),
   [CAPABILITY_MCP_TOOL.INSTALL]: z.strictObject({
     capabilityId: z.string().min(1).max(128).optional().describe('Exact installed capability id when updating; never inferred by name.'),
     bindingId: z.string().min(1).max(128).optional().describe('Exact installed binding id when updating; required with capabilityId.'),
     kind: kind.describe('Portable Agent Skill or MCP service definition.'),
     source: sourceSchema,
-    displayName: z.string().max(CAPABILITY_LIMITS.DISPLAY_NAME_CHARS).optional().describe('Optional display name.'),
+    displayName: z.string().max(CAPABILITY_LIMITS.DISPLAY_NAME_CHARS).optional(),
     scope: scope.describe('Local, account, canonical project, or exact session scope.'),
     scopeId: z.string().max(256).optional().describe('Required canonical ID for project/session scope.'),
     providers: z.array(z.string().min(1).max(64)).max(CAPABILITY_LIMITS.PROVIDERS).optional().describe('Optional provider filters.'),
@@ -78,13 +78,13 @@ export const CAPABILITY_MCP_INPUT_SCHEMAS = {
   }).refine((value) => Boolean(value.capabilityId) === Boolean(value.bindingId), 'capabilityId and bindingId must be supplied together'),
   [CAPABILITY_MCP_TOOL.STATUS]: z.strictObject({
     operationId: z.string().min(1).max(128).optional().describe('Operation id returned by capability_install.'),
-    capabilityId: z.string().min(1).max(128).optional().describe('Installed capability id.'),
+    capabilityId: z.string().min(1).max(128).optional(),
     activate: z.boolean().optional().describe('Resolve bounded instructions for this exact authorized Skill and caller context.'),
   }).refine((value) => Number(Boolean(value.operationId)) + Number(Boolean(value.capabilityId)) === 1
     && (!value.activate || Boolean(value.capabilityId)), 'provide exactly one id; activate requires capabilityId'),
   [CAPABILITY_MCP_TOOL.MANAGE]: z.strictObject({
     action: z.enum(CAPABILITY_AVAILABLE_MANAGEMENT_ACTIONS).describe('Management action currently available through AI management.'),
-    capabilityId: z.string().min(1).max(128).optional().describe('Preferred exact capability id.'),
+    capabilityId: z.string().min(1).max(128).optional(),
     bindingId: z.string().min(1).max(128).optional().describe('Exact binding id for scope-specific lifecycle actions.'),
     operationId: z.string().min(1).max(128).optional().describe('Operation id for cancel_operation.'),
     name: z.string().min(1).max(CAPABILITY_LIMITS.DISPLAY_NAME_CHARS).optional().describe('Fallback display name; ambiguity returns choices.'),

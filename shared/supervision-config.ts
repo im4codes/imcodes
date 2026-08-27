@@ -59,6 +59,18 @@ export const SUPERVISION_TRUSTED_EXECUTION_CONTRACT_IDS = [
   SUPERVISION_CONTRACT_IDS.TASK_REGISTRY,
 ] as const;
 
+/**
+ * How the standing supervision contracts reach the model.
+ *
+ * `reinjectEveryEntrypoint` means every entrypoint RE-ASSERTS the contracts in
+ * force -- not that every entrypoint restates them verbatim. Prompts that run
+ * once per task (preambles, decision) carry the full text; the per-turn prompts
+ * (continue, rework brief) re-assert them by id via
+ * buildSupervisionContractsInForceLine(), because ~6.5KB of fixed prose on every
+ * continuation turn crowds out the task context the contracts exist to protect.
+ * SUPERVISION_PROMPT_ENTRYPOINTS records which form each prompt uses, and that
+ * record is enforced by test rather than trusted.
+ */
 export const SUPERVISION_TRUSTED_CONTRACT_DELIVERY = {
   preferredRoles: ['system', 'developer'],
   fallback: 'fixed_daemon_prefix',
@@ -962,8 +974,13 @@ export function getSessionSupervisionSnapshotIssues(
       if (record.auditMode !== '' && !isSupportedSupervisionAuditMode(String(record.auditMode))) issues.push('invalid_audit_mode');
       else issues.push('legacy_audit_mode_requires_repair');
     }
-    // Automatic audit routing is dynamic. A remembered target is optional
-    // compatibility/UI state and never authorizes or blocks candidate choice.
+    // The Supervisor Brain supplies the exact audit route; the daemon never
+    // selects one. A supervised_audit snapshot carrying no target is therefore
+    // an UNROUTABLE configuration, not a dynamic one: automatic dispatch has
+    // nothing to dispatch to. Flag it for repair instead of letting it reach
+    // the automation and fail there. A present-but-malformed target already
+    // produced invalid_audit_target_name above, so only absence lands here.
+    if (!hasTargetName) issues.push('missing_audit_target');
     if (
       record.maxAuditLoops != null
       && (typeof record.maxAuditLoops !== 'number' || !Number.isFinite(record.maxAuditLoops) || Math.floor(record.maxAuditLoops) < 0)

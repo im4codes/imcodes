@@ -3,6 +3,14 @@ import { mkdir, mkdtemp, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import {
+  MCP_INJECTED_EXECUTION_BLOCK,
+  MCP_INJECTED_SCHEMA_DIALECT,
+  MCP_TOOL_SURFACE_AUTHORED_BUDGET_BYTES,
+  MCP_TOOL_SURFACE_RAW_BUDGET_BYTES,
+  mcpToolSurfaceBytes,
+  projectAuthoredMcpToolSurface,
+} from '../../shared/mcp-tool-surface-budget.js';
 import { describe, expect, it, vi } from 'vitest';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
@@ -203,7 +211,36 @@ describe('memory MCP stdio server', () => {
       // four unified capability-management contracts add safety contracts to
       // the fixed surface. Keep explicit headroom bounded rather than silently
       // dropping those schemas from managed providers.
-      expect(JSON.stringify(listed.tools).length).toBeLessThanOrEqual(40_000);
+      // DUAL ACCOUNTING. See shared/mcp-tool-surface-budget.ts.
+      //
+      // Raw is the literal wire payload. Authored is raw minus the only two
+      // shapes the SDK/JSON-Schema layer injects for us and that registerTool
+      // gives no supported way to suppress. Both are bounded, so neither
+      // authored growth nor protocol growth can hide behind the other.
+      const raw = mcpToolSurfaceBytes(listed.tools);
+      const { authored, removed } = projectAuthoredMcpToolSurface(listed.tools);
+      const authoredBytes = mcpToolSurfaceBytes(authored);
+
+      // Every exclusion must be one of the two KNOWN injected forms. This is
+      // what stops the projection from becoming a way to make the number go
+      // down by quietly dropping real authored content.
+      expect(removed.length).toBeGreaterThan(0);
+      for (const entry of removed) {
+        expect(['$schema', 'execution']).toContain(entry.key);
+        if (entry.key === '$schema') expect(entry.value).toBe(MCP_INJECTED_SCHEMA_DIALECT);
+        else expect(entry.value).toEqual(MCP_INJECTED_EXECUTION_BLOCK);
+      }
+      // Aggregate backstop: the projection may only remove what those two
+      // shapes actually cost. A projection that stripped anything else would
+      // push authoredBytes below this floor.
+      const injectedBytes = raw - authoredBytes;
+      expect(injectedBytes).toBe(removed.reduce(
+        (sum, entry) => sum + JSON.stringify({ [entry.key]: entry.value }).length - 1,
+        0,
+      ));
+
+      expect(raw).toBeLessThanOrEqual(MCP_TOOL_SURFACE_RAW_BUDGET_BYTES);
+      expect(authoredBytes).toBeLessThanOrEqual(MCP_TOOL_SURFACE_AUTHORED_BUDGET_BYTES);
       expect(JSON.stringify(listed)).not.toContain('server-secret');
       expect(JSON.stringify(listed)).not.toContain('api-secret');
     } finally {
