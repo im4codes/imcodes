@@ -8,6 +8,7 @@ import type {
 import { EXECUTION_CLONE_KIND } from '../../../shared/execution-clone.js';
 import { NODE_ROLE, type NodeRole } from '../../../shared/remote-exec.js';
 import { deleteTokenUsageFactsForServer } from './token-usage-queries.js';
+import { insertControlledServerWithNodeId } from '../services/controlled-node-identity.js';
 
 // ── Types ─────────────────────────────────────────────────────────────────
 
@@ -32,6 +33,7 @@ export interface DbPlatformIdentity {
 
 export interface DbServer {
   id: string;
+  node_id?: string | null;
   user_id: string;
   team_id: string | null;
   name: string;
@@ -350,6 +352,21 @@ export async function createServer(
   nodeRole: NodeRole = NODE_ROLE.FULL,
 ): Promise<DbServer> {
   const now = Date.now();
+  if (nodeRole === NODE_ROLE.CONTROLLED) {
+    await insertControlledServerWithNodeId(db, {
+      serverId: id,
+      userId,
+      tokenHash,
+      displayName: name,
+      refName: null,
+      os: null,
+      arch: null,
+      hostServerId: null,
+      boundWithKeyId: keyId ?? null,
+      createdAt: now,
+    });
+    return { id, user_id: userId, team_id: null, name, token_hash: tokenHash, last_heartbeat_at: null, status: 'offline', daemon_version: null, bound_with_key_id: keyId ?? null, created_at: now };
+  }
   await db.execute(
     'INSERT INTO servers (id, user_id, name, token_hash, status, created_at, bound_with_key_id, node_role) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)',
     [id, userId, name, tokenHash, 'offline', now, keyId ?? null, nodeRole],

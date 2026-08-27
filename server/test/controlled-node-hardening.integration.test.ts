@@ -21,6 +21,10 @@ import { REMOTE_DESKTOP_CAPABILITY } from '../../shared/remote-desktop.js';
 import { CONTROLLED_NODE_AUTO_UNLOCK_ERROR } from '../../shared/controlled-node-auto-unlock.js';
 import { REMOTE_DESKTOP_INSTALLABLE_CAPABILITY } from '../../shared/remote-desktop-install.js';
 import { signJwt } from '../src/security/crypto.js';
+import { generateControlledNodeId } from '../src/services/controlled-node-identity.js';
+import { listMachines as decodeMachineList } from '../../src/daemon/machine-exec-client.js';
+import { createDaemonMachineToolDeps } from '../../src/daemon/machine-mcp-deps.js';
+import { MCP_ERROR_REASONS } from '../../shared/memory-mcp-errors.js';
 
 let db: Database;
 const JWT_KEY = 'test-signing-key-32chars-padding!!';
@@ -77,10 +81,14 @@ describe('D-A transactional / idempotent redeem', () => {
 
     const r1 = await app.request('/api/enroll/v2/redeem', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload) });
     expect(r1.status).toBe(200);
-    const b1 = await r1.json() as { serverId: string; token?: string; refName: string; nodeRole: string };
+    const b1 = await r1.json() as { serverId: string; token?: string; refName?: string; nodeRole: string };
     expect(b1.nodeRole).toBe(NODE_ROLE.CONTROLLED);
     expect(b1.token).toBeUndefined(); // D-A: server does not return an unrecoverable raw token
-    expect(b1.refName).toMatch(/^[\p{L}\p{N}._-]{1,40}$/u);
+    expect(b1.refName).toBeUndefined();
+    expect(await db.queryOne<{ ref_name: string | null }>(
+      'SELECT ref_name FROM servers WHERE id = $1',
+      [b1.serverId],
+    )).toEqual({ ref_name: null });
 
     const r2 = await app.request('/api/enroll/v2/redeem', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload) });
     expect(r2.status).toBe(200);
@@ -146,16 +154,16 @@ describe('revocation kill-switch', () => {
 });
 
 describe('owner-scoped machine rename', () => {
-  it('updates display_name while preserving the stable ref_name', async () => {
+  it('updates display_name while preserving a deprecated legacy ref_name', async () => {
     const app = buildApp();
     const userId = `u_${hex(4)}`;
     await createUser(db, userId);
     const owner = await fullCredential(userId);
     const controlledId = `ctl_${hex(8)}`;
     await db.execute(
-      `INSERT INTO servers (id, user_id, name, token_hash, status, created_at, node_role, exec_enabled, ref_name, display_name, os)
-       VALUES ($1,$2,'controlled',$3,'offline',$4,$5,true,'stable-ref','Old name','linux')`,
-      [controlledId, userId, sha256(hex(16)), Date.now(), NODE_ROLE.CONTROLLED],
+      `INSERT INTO servers (id, user_id, name, token_hash, status, created_at, node_role, exec_enabled, ref_name, display_name, os, node_id)
+       VALUES ($1,$2,'controlled',$3,'offline',$4,$5,true,'stable-ref','Old name','linux',$6)`,
+      [controlledId, userId, sha256(hex(16)), Date.now(), NODE_ROLE.CONTROLLED, generateControlledNodeId()],
     );
 
     const response = await app.request(`/api/machines/${controlledId}/display-name`, {
@@ -185,9 +193,9 @@ describe('owner-scoped machine rename', () => {
     const otherOwner = await fullCredential(otherUserId);
     const controlledId = `ctl_${hex(8)}`;
     await db.execute(
-      `INSERT INTO servers (id, user_id, name, token_hash, status, created_at, node_role, exec_enabled, ref_name, display_name, os)
-       VALUES ($1,$2,'controlled',$3,'offline',$4,$5,true,'stable-ref','Old name','linux')`,
-      [controlledId, userId, sha256(hex(16)), Date.now(), NODE_ROLE.CONTROLLED],
+      `INSERT INTO servers (id, user_id, name, token_hash, status, created_at, node_role, exec_enabled, ref_name, display_name, os, node_id)
+       VALUES ($1,$2,'controlled',$3,'offline',$4,$5,true,'stable-ref','Old name','linux',$6)`,
+      [controlledId, userId, sha256(hex(16)), Date.now(), NODE_ROLE.CONTROLLED, generateControlledNodeId()],
     );
     const headers = {
       'X-Server-Id': owner.serverId,
@@ -227,10 +235,10 @@ describe('auto unlock capability gate', () => {
     const controlledId = `ctl_${hex(8)}`;
     // Advertises remote desktop but not auto unlock: an older Windows build.
     await db.execute(
-      `INSERT INTO servers (id, user_id, name, token_hash, status, created_at, node_role, exec_enabled, ref_name, display_name, os, controlled_capabilities)
-       VALUES ($1,$2,'controlled',$3,'online',$4,$5,true,'win-ref','Win box','win',$6)`,
+      `INSERT INTO servers (id, user_id, name, token_hash, status, created_at, node_role, exec_enabled, ref_name, display_name, os, controlled_capabilities, node_id)
+       VALUES ($1,$2,'controlled',$3,'online',$4,$5,true,'win-ref','Win box','win',$6,$7)`,
       [controlledId, userId, sha256(hex(16)), Date.now(), NODE_ROLE.CONTROLLED,
-        JSON.stringify([REMOTE_DESKTOP_CAPABILITY])],
+        JSON.stringify([REMOTE_DESKTOP_CAPABILITY]), generateControlledNodeId()],
     );
 
     const started = Date.now();
@@ -271,10 +279,10 @@ describe('remote desktop worker quick install', () => {
     await db.execute(
       `INSERT INTO servers
          (id, user_id, name, token_hash, status, last_heartbeat_at, created_at,
-          node_role, exec_enabled, ref_name, display_name, os, daemon_version, controlled_capabilities)
-       VALUES ($1,$2,'controlled',$3,'online',$4,$4,$5,true,'win-ref','Win box','win','2026.8.4000-dev.1',$6)`,
+          node_role, exec_enabled, ref_name, display_name, os, daemon_version, controlled_capabilities, node_id)
+       VALUES ($1,$2,'controlled',$3,'online',$4,$4,$5,true,'win-ref','Win box','win','2026.8.4000-dev.1',$6,$7)`,
       [controlledId, userId, sha256(hex(16)), Date.now(), NODE_ROLE.CONTROLLED,
-        JSON.stringify([REMOTE_DESKTOP_INSTALLABLE_CAPABILITY])],
+        JSON.stringify([REMOTE_DESKTOP_INSTALLABLE_CAPABILITY]), generateControlledNodeId()],
     );
     const bridge = WsBridge.get(controlledId);
     const install = vi.spyOn(bridge, 'tryInstallControlledNodeRemoteDesktopWorker')
@@ -383,6 +391,62 @@ describe('owner-scoped machine listing (DB presence)', () => {
     expect(((await theirs.json() as { machines: unknown[] }).machines).length).toBe(0);
   });
 
+  it('projects and decodes mixed legacy + post-migration aliases while routing only by canonical nodeId or a non-empty legacy alias', async () => {
+    const app = buildApp();
+    const userId = `u_${hex(4)}`;
+    await createUser(db, userId);
+    const owner = await fullCredential(userId);
+
+    const redeemNode = async (installId: string, hostname: string): Promise<{ serverId: string; nodeId: string }> => {
+      const code = `tok_${hex(6)}`;
+      await seedV2Enrollment(code, userId);
+      const response = await app.request('/api/enroll/v2/redeem', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          version: 2,
+          enrollToken: code,
+          installId,
+          nodeTokenHash: sha256(hex(16)),
+          hostname,
+          os: 'linux',
+          arch: 'x64',
+        }),
+      });
+      expect(response.status).toBe(200);
+      return await response.json() as { serverId: string; nodeId: string };
+    };
+
+    const postMigration = await redeemNode('post-migration', 'new-hostname');
+    const legacy = await redeemNode('legacy-install', 'old-hostname');
+    await db.execute('UPDATE servers SET ref_name = $2 WHERE id = $1', [legacy.serverId, 'legacy-node']);
+
+    const fetchFromApp = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = new URL(typeof input === 'string' || input instanceof URL ? input : input.url);
+      return app.request(`${url.pathname}${url.search}`, init);
+    }) as typeof fetch;
+    const exec = vi.fn(async () => ({ outcome: 'completed' as const }));
+    const deps = createDaemonMachineToolDeps({
+      loadCredential: async () => ({ serverUrl: 'https://control-plane.test', ...owner }),
+      listMachines: (options) => decodeMachineList({ ...options, fetchImpl: fetchFromApp }),
+      execRemote: exec,
+    });
+
+    await expect(deps.listMachines({ includeOffline: true })).resolves.toEqual(expect.arrayContaining([
+      expect.objectContaining({ name: postMigration.nodeId }),
+      expect.objectContaining({ name: legacy.nodeId }),
+    ]));
+    expect(await deps.execRemote({ machine: postMigration.nodeId, command: 'canonical' }))
+      .toMatchObject({ outcome: 'completed' });
+    expect(exec).toHaveBeenLastCalledWith(expect.objectContaining({ targetServerId: postMigration.serverId }));
+    expect(await deps.execRemote({ machine: 'legacy-node', command: 'legacy' }))
+      .toMatchObject({ outcome: 'completed' });
+    expect(exec).toHaveBeenLastCalledWith(expect.objectContaining({ targetServerId: legacy.serverId }));
+    expect(await deps.execRemote({ machine: '', command: 'must-not-dispatch' }))
+      .toMatchObject({ outcome: 'not_dispatched', reason: MCP_ERROR_REASONS.MACHINE_NOT_FOUND });
+    expect(exec).toHaveBeenCalledTimes(2);
+  });
+
   it('returns exactly max owner machines with canonical OS and role', async () => {
     const app = buildApp();
     const userId = `u_${hex(4)}`;
@@ -392,9 +456,9 @@ describe('owner-scoped machine listing (DB presence)', () => {
     for (let i = 0; i < MACHINE_LIST_MAX_ITEMS; i++) {
       const id = `ctl_${hex(8)}_${i}`;
       await db.execute(
-        `INSERT INTO servers (id, user_id, name, token_hash, status, created_at, node_role, exec_enabled, ref_name, display_name, os)
-         VALUES ($1,$2,$3,$4,'offline',$5,$6,true,$3,$3,$7)`,
-        [id, userId, `ctl-${String(i).padStart(3, '0')}`, sha256(hex(16)), now, NODE_ROLE.CONTROLLED, i === 0 ? 'plan9' : 'mac'],
+        `INSERT INTO servers (id, user_id, name, token_hash, status, created_at, node_role, exec_enabled, ref_name, display_name, os, node_id)
+         VALUES ($1,$2,$3,$4,'offline',$5,$6,true,$3,$3,$7,$8)`,
+        [id, userId, `ctl-${String(i).padStart(3, '0')}`, sha256(hex(16)), now, NODE_ROLE.CONTROLLED, i === 0 ? 'plan9' : 'mac', generateControlledNodeId()],
       );
     }
     const response = await app.request('/api/machines', { headers: { 'X-Server-Id': owner.serverId, authorization: `Bearer ${owner.token}` } });
@@ -415,9 +479,9 @@ describe('owner-scoped machine listing (DB presence)', () => {
     for (let i = 0; i < MACHINE_LIST_MAX_ITEMS + 1; i++) {
       const id = `ctl_${hex(8)}_${i}`;
       await db.execute(
-        `INSERT INTO servers (id, user_id, name, token_hash, status, created_at, node_role, exec_enabled, ref_name, display_name, os)
-         VALUES ($1,$2,$3,$4,'offline',$5,$6,true,$3,$3,$7)`,
-        [id, userId, `ctl-over-${String(i).padStart(3, '0')}`, sha256(hex(16)), now, NODE_ROLE.CONTROLLED, 'linux'],
+        `INSERT INTO servers (id, user_id, name, token_hash, status, created_at, node_role, exec_enabled, ref_name, display_name, os, node_id)
+         VALUES ($1,$2,$3,$4,'offline',$5,$6,true,$3,$3,$7,$8)`,
+        [id, userId, `ctl-over-${String(i).padStart(3, '0')}`, sha256(hex(16)), now, NODE_ROLE.CONTROLLED, 'linux', generateControlledNodeId()],
       );
     }
     const response = await app.request('/api/machines', { headers: { 'X-Server-Id': owner.serverId, authorization: `Bearer ${owner.token}` } });

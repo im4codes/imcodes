@@ -7,6 +7,7 @@ import type { ControlledNodeCapability } from '../../../shared/controlled-node-c
 
 export interface ControlledMachineAccessRow {
   id: string;
+  node_id: string | null;
   user_id: string;
   ref_name: string | null;
   display_name: string | null;
@@ -29,7 +30,7 @@ export interface ControlledMachineAccessRow {
 }
 
 const CONTROLLED_MACHINE_ACCESS_SELECT = `
-  SELECT s.id, s.user_id, s.ref_name, s.display_name, s.status, s.node_role, s.host_server_id,
+  SELECT s.id, s.user_id, s.node_id, s.ref_name, s.display_name, s.status, s.node_role, s.host_server_id,
          s.last_heartbeat_at, s.exec_enabled, s.os, s.daemon_version, s.revoked_at,
          s.auto_unlock_configured, s.controlled_capabilities,
          rdhe.host_id AS remote_desktop_host_id,

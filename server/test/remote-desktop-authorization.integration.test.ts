@@ -9,6 +9,7 @@ import { createUser } from '../src/db/queries.js';
 import { ensureCanonicalHostForServer } from '../src/services/remote-desktop-host-identity.js';
 import { createOrUpdateShare } from '../src/db/tab-sharing.js';
 import { RemoteDesktopRouter } from '../src/ws/remote-desktop-router.js';
+import { generateControlledNodeId } from '../src/services/controlled-node-identity.js';
 
 const hex = (bytes: number) => randomBytes(bytes).toString('hex');
 const sha256 = (value: string) => createHash('sha256').update(value).digest('hex');
@@ -27,9 +28,9 @@ async function createControlledNode(ownerId: string): Promise<string> {
     `INSERT INTO servers
        (id, user_id, name, token_hash, status, created_at, last_heartbeat_at,
         node_role, exec_enabled, revoked_at, ref_name, display_name, os,
-        controlled_capabilities)
+        controlled_capabilities, node_id)
      VALUES ($1,$2,'remote-desktop',$3,'online',$4,$4,$5,true,NULL,$6,
-             'Remote desktop test','win',$7::jsonb)`,
+             'Remote desktop test','win',$7::jsonb,$8)`,
     [
       serverId,
       ownerId,
@@ -38,6 +39,7 @@ async function createControlledNode(ownerId: string): Promise<string> {
       NODE_ROLE.CONTROLLED,
       `rd-ref-${hex(4)}`,
       JSON.stringify([REMOTE_DESKTOP_CAPABILITY]),
+      generateControlledNodeId(),
     ],
   );
   await ensureCanonicalHostForServer({ db, serverId, now: Date.now() });
@@ -70,6 +72,7 @@ function fixture(serverId: string) {
     database: () => db,
     daemonAvailable: () => true,
     daemonSupportsRemoteDesktop: () => true,
+    daemonRemoteDesktopCapabilities: () => [REMOTE_DESKTOP_CAPABILITY],
     featureEnabled: () => true,
     daemonGeneration: () => 7,
     iceServers: () => ({ iceServers: [] }),

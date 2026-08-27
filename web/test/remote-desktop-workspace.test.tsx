@@ -4,6 +4,14 @@ import { resolve } from 'node:path';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/preact';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { ComponentChildren } from 'preact';
+import { REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY } from '@shared/remote-desktop-access.js';
+import { REMOTE_DESKTOP_CAPABILITY } from '@shared/remote-desktop.js';
+import {
+  REMOTE_DESKTOP_CAPTURE_CAPABILITY,
+  REMOTE_DESKTOP_ENCODER_CAPABILITY,
+  REMOTE_DESKTOP_PLATFORM_CAPABILITY,
+  REMOTE_DESKTOP_SESSION_CAPABILITY,
+} from '@shared/remote-desktop-platform.js';
 
 const api = vi.hoisted(() => ({
   listControllableMachines: vi.fn(),
@@ -41,7 +49,6 @@ vi.mock('../src/components/FloatingPanel.js', () => ({
 }));
 
 vi.mock('../src/components/RemoteDesktopPanel.js', () => ({
-  canOpenRemoteDesktop: (machine: { online: boolean }) => machine.online,
   RemoteDesktopPanel: ({ machine, active, inputActive }: {
     machine: { serverId: string };
     active: boolean;
@@ -75,7 +82,24 @@ function machine(serverId: string) {
     online: true,
     execEnabled: true,
     accessRole: 'owner' as const,
-    capabilities: ['remote-desktop-v1' as const],
+    capabilities: [REMOTE_DESKTOP_CAPABILITY],
+  };
+}
+
+function macMachine(serverId: string, complete: boolean) {
+  return {
+    ...machine(serverId),
+    os: complete ? 'mac' : 'win',
+    capabilities: complete ? [
+      REMOTE_DESKTOP_SESSION_CAPABILITY,
+      REMOTE_DESKTOP_PLATFORM_CAPABILITY.MACOS,
+      REMOTE_DESKTOP_CAPTURE_CAPABILITY.MACOS_SCREEN_CAPTURE_KIT,
+      REMOTE_DESKTOP_ENCODER_CAPABILITY.H264,
+      REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY,
+    ] : [
+      REMOTE_DESKTOP_SESSION_CAPABILITY,
+      REMOTE_DESKTOP_PLATFORM_CAPABILITY.MACOS,
+    ],
   };
 }
 
@@ -276,6 +300,55 @@ describe('RemoteDesktopWorkspace', () => {
     await waitFor(() => expect(screen.getByRole('button', { name: /C/ })).toBeDefined());
     fireEvent.click(screen.getByRole('button', { name: /C/ }));
     expect(openHost).toHaveBeenCalledWith(expect.objectContaining({ serverId: 'c' }));
+  });
+
+  it('uses the real capability gate for complete and incomplete macOS profiles', async () => {
+    api.listControllableMachines.mockResolvedValue([
+      macMachine('mac-complete', true),
+      macMachine('mac-incomplete', false),
+    ]);
+    const { manager } = setupManager();
+    const openHost = vi.fn();
+    const state = openRemoteDesktopWorkspaceHost(createRemoteDesktopWorkspaceState(), machine('a'));
+    render(<RemoteDesktopWorkspace
+      state={state}
+      manager={manager}
+      onOpenHost={openHost}
+      onActivateTab={vi.fn()}
+      onCloseHost={vi.fn()}
+      onReorderHost={vi.fn()}
+      onCloseWorkspace={vi.fn()}
+    />);
+
+    fireEvent.click(screen.getByRole('button', { name: 'remote_desktop.workspace_add' }));
+    const complete = await screen.findByRole('button', { name: /MAC-COMPLETE/ });
+    expect(screen.queryByRole('button', { name: /MAC-INCOMPLETE/ })).toBeNull();
+    fireEvent.click(complete);
+    expect(openHost).toHaveBeenCalledWith(expect.objectContaining({ serverId: 'mac-complete' }));
+  });
+
+  it('renders canonical nodeId in the picker without exposing raw serverId', async () => {
+    api.listControllableMachines.mockResolvedValue([{
+      ...machine('internal-routing-secret'),
+      nodeId: '1000000007',
+      refName: '',
+      displayName: 'Public workstation',
+    }]);
+    const { manager } = setupManager();
+    const state = openRemoteDesktopWorkspaceHost(createRemoteDesktopWorkspaceState(), machine('a'));
+    const result = render(<RemoteDesktopWorkspace
+      state={state}
+      manager={manager}
+      onOpenHost={vi.fn()}
+      onActivateTab={vi.fn()}
+      onCloseHost={vi.fn()}
+      onReorderHost={vi.fn()}
+      onCloseWorkspace={vi.fn()}
+    />);
+    fireEvent.click(screen.getByRole('button', { name: 'remote_desktop.workspace_add' }));
+    await waitFor(() => expect(result.container.textContent).toContain('1000000007'));
+    expect(result.container.textContent).toContain('Public workstation');
+    expect(result.container.textContent).not.toContain('internal-routing-secret');
   });
 
   it('renders only the compact tab strip and keeps the add control adjacent to it', () => {

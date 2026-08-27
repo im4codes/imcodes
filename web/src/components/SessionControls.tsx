@@ -32,6 +32,7 @@ import { useMachines } from '../hooks/useMachines.js';
 import { insertMachineMarkerAtCaret } from '../util/machine-insert.js';
 import { buildMachineSendExtra } from '../util/machine-send.js';
 import { matchInlineMachineTrigger, stripInlineMachineTrigger } from '../util/machine-trigger.js';
+import { MACHINE_IDENTITY_UNAVAILABLE } from '@shared/machine-reference.js';
 import { parseAliasMarkers } from '@shared/alias-types.js';
 import { CODEX_FAST_OFF_COMMAND, isCodexFastServiceTier } from '@shared/codex-service-tier.js';
 import { isInsufficientCapacityError } from '../upload-error.js';
@@ -2754,7 +2755,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   }, [publishComposerText, syncMobileComposerMetrics]);
 
   /**
-   * Insert a `^^(refName)-(displayName)` machine reference at the caret via the
+   * Insert a `^^(nodeId)-(displayName)` machine reference at the caret via the
    * shared helper (stable marker plus render-only note; never resolves or sends),
    * mirroring `insertAliasMarker`.
    * When the inline `^query` fragment is still present at the end of the composer
@@ -2762,7 +2763,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
    * stray `^dep` before the inserted marker. Used by both the inline picker and
    * the `@machine` category.
    */
-  const insertMachineMarker = useCallback((refName: string, displayName: string) => {
+  const insertMachineMarker = useCallback((nodeId: string, displayName: string) => {
     const el = divRef.current;
     if (el) {
       const current = readComposerElementText(el);
@@ -2781,7 +2782,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       } catch { /* jsdom lacks Selection API */ }
       el.focus();
     }
-    insertMachineMarkerAtCaret(refName, displayName);
+    insertMachineMarkerAtCaret(nodeId, displayName);
     const nextText = el ? readComposerElementText(el) : '';
     setHasText(!!nextText.trim());
     publishComposerText(nextText);
@@ -4470,7 +4471,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         setMachineQuery('');
         machineJustClosedRef.current = true;
         setTimeout(() => { machineJustClosedRef.current = false; }, 150);
-        if (chosen) insertMachineMarker(chosen.refName, chosen.displayName);
+        if (chosen?.nodeId) insertMachineMarker(chosen.nodeId, chosen.displayName);
         return;
       }
     }
@@ -6516,7 +6517,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                     key={m.serverId}
                     role="option"
                     aria-selected={hl ? 'true' : 'false'}
-                    data-machine-ref={m.refName}
+                    data-machine-node-id={m.nodeId}
                     data-machine-online={m.online ? 'true' : 'false'}
                     data-hl={hl ? 'true' : undefined}
                     style={hl ? aliasPickerItemHighlightStyle : aliasPickerItemStyle}
@@ -6525,7 +6526,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                       e.preventDefault();
                       setMachinePickerOpen(false);
                       setMachineQuery('');
-                      insertMachineMarker(m.refName, m.displayName);
+                      if (m.nodeId) insertMachineMarker(m.nodeId, m.displayName);
                     }}
                     onMouseEnter={() => setMachineHighlightIdx(idx)}
                   >
@@ -6540,7 +6541,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                       title={m.online ? undefined : t('machine.offline')}
                     />
                     <span style={{ fontWeight: 500, color: '#e2e8f0' }}>{m.displayName}</span>
-                    <span style={aliasPickerDimStyle}>{m.refName}</span>
+                    <span style={aliasPickerDimStyle}>{m.nodeId ?? MACHINE_IDENTITY_UNAVAILABLE}</span>
                     {!m.online && <span style={aliasPickerDimStyle}>{t('machine.offline_hint')}</span>}
                   </div>
                 );

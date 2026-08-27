@@ -1,10 +1,11 @@
 import { describe, it, expect, vi } from 'vitest';
 import { createDaemonMachineToolDeps } from '../../src/daemon/machine-mcp-deps.js';
 import { MCP_ERROR_REASONS } from '../../shared/memory-mcp-errors.js';
+import { CONTROLLED_NODE_ID_MIN, CONTROLLED_NODE_ID_MAX } from '../../shared/controlled-node-identity.js';
 
 const creds = { serverUrl: 'https://relay.example', serverId: 's1', token: 't1' };
-type ClientMachine = { serverId: string; name: string; refName: string; displayName: string; os?: string; online: boolean; nodeRole: 'controlled'; execEnabled: boolean };
-const m = (over: Partial<ClientMachine>): ClientMachine => ({ serverId: 'x', name: 'x', refName: 'x', displayName: 'X', online: true, nodeRole: 'controlled', execEnabled: true, ...over });
+type ClientMachine = { serverId: string; nodeId: string; name: string; refName: string; displayName: string; os?: string; online: boolean; nodeRole: 'controlled'; execEnabled: boolean };
+const m = (over: Partial<ClientMachine>): ClientMachine => ({ serverId: 'x', nodeId: CONTROLLED_NODE_ID_MIN, name: 'x', refName: 'x', displayName: 'X', online: true, nodeRole: 'controlled', execEnabled: true, ...over });
 
 describe('daemon machine tool deps — fail-closed resolution (10.12 / 10.11)', () => {
   it('unbound daemon: exec → FEATURE_DISABLED, list throws an unbound-kind control-plane error (not an empty list)', async () => {
@@ -16,13 +17,46 @@ describe('daemon machine tool deps — fail-closed resolution (10.12 / 10.11)', 
     void MachineControlPlaneError;
   });
 
-  it('maps client machines to ref_name-keyed summaries', async () => {
+  it('maps client machines to canonical nodeId-keyed summaries', async () => {
     const deps = createDaemonMachineToolDeps({
       loadCredential: async () => creds,
       listMachines: async () => [m({ serverId: 'srvA', refName: 'mac-a1b2', displayName: 'My Mac', os: 'darwin' })],
       execRemote: async () => ({ outcome: 'completed' }),
     });
-    expect(await deps.listMachines({ includeOffline: true })).toEqual([{ name: 'mac-a1b2', displayName: 'My Mac', os: 'darwin', online: true, execEnabled: true, role: 'controlled' }]);
+    expect(await deps.listMachines({ includeOffline: true })).toEqual([{ name: CONTROLLED_NODE_ID_MIN, displayName: 'My Mac', os: 'darwin', online: true, execEnabled: true, role: 'controlled' }]);
+  });
+
+  it('resolves canonical nodeId directly and never falls back to a colliding legacy alias', async () => {
+    const exec = vi.fn(async () => ({ outcome: 'completed' as const }));
+    const deps = createDaemonMachineToolDeps({
+      loadCredential: async () => creds,
+      listMachines: async () => [
+        m({ serverId: 'canonical', nodeId: CONTROLLED_NODE_ID_MIN, refName: 'legacy-canonical' }),
+        m({ serverId: 'legacy-collision', nodeId: CONTROLLED_NODE_ID_MAX, refName: CONTROLLED_NODE_ID_MIN }),
+      ],
+      execRemote: exec,
+    });
+    await deps.execRemote({ machine: CONTROLLED_NODE_ID_MIN, command: 'x' });
+    expect(exec).toHaveBeenCalledWith(expect.objectContaining({ targetServerId: 'canonical' }));
+  });
+
+  it('matches a post-migration node by canonical nodeId while its empty alias never resolves', async () => {
+    const exec = vi.fn(async () => ({ outcome: 'completed' as const }));
+    const deps = createDaemonMachineToolDeps({
+      loadCredential: async () => creds,
+      listMachines: async () => [
+        m({ serverId: 'post-migration', nodeId: CONTROLLED_NODE_ID_MIN, refName: '' }),
+        m({ serverId: 'legacy', nodeId: CONTROLLED_NODE_ID_MAX, refName: 'legacy-node' }),
+      ],
+      execRemote: exec,
+    });
+
+    expect(await deps.execRemote({ machine: CONTROLLED_NODE_ID_MIN, command: 'canonical' }))
+      .toMatchObject({ outcome: 'completed' });
+    expect(exec).toHaveBeenLastCalledWith(expect.objectContaining({ targetServerId: 'post-migration' }));
+    expect(await deps.execRemote({ machine: '', command: 'must-not-dispatch' }))
+      .toMatchObject({ outcome: 'not_dispatched', reason: MCP_ERROR_REASONS.MACHINE_NOT_FOUND });
+    expect(exec).toHaveBeenCalledTimes(1);
   });
 
   it('a control-plane failure during exec name-resolution surfaces as control_plane_unavailable, NOT machine_not_found', async () => {

@@ -11,6 +11,7 @@ import {
   REMOTE_EXEC_MAX_OUTPUT_BYTES,
   type RemoteExecResult,
 } from '../../shared/remote-exec.js';
+import { CONTROLLED_NODE_ID_MIN } from '../../shared/controlled-node-identity.js';
 
 // Build a valid server envelope exactly as the server route encodes it.
 function envelope(outcome: Parameters<typeof encodeMachineExecHttpEnvelope>[0], result?: RemoteExecResult): typeof fetch {
@@ -183,7 +184,10 @@ describe('listMachines client — bounded strict, typed control-plane failure', 
     { serverId: 'a', name: 'a', refName: 'a', displayName: 'A', online: true, nodeRole: 'controlled', execEnabled: true, os: 'linux' },
     { serverId: 'b', name: 'b', refName: 'b', displayName: 'B', online: false, nodeRole: 'controlled', execEnabled: true },
     { serverId: 'c', name: 'c', refName: 'c', displayName: 'C', online: true, nodeRole: 'controlled', execEnabled: false },
-  ];
+  ].map((item, index) => ({
+    ...item,
+    nodeId: String(BigInt(CONTROLLED_NODE_ID_MIN) + BigInt(index)),
+  }));
   const list200 = (machines: unknown) => (async () => new Response(JSON.stringify({ machines }), { status: 200 })) as unknown as typeof fetch;
   const opts = { serverUrl: base.serverUrl, sourceServerId: 's1', sourceToken: 't1' };
   it('excludes offline + exec-disabled by default; forwards canonical os', async () => {
@@ -192,6 +196,17 @@ describe('listMachines client — bounded strict, typed control-plane failure', 
   });
   it('includes all when includeOffline is set', async () => {
     expect((await listMachines({ ...opts, includeOffline: true, fetchImpl: list200(items) })).length).toBe(3);
+  });
+  it('accepts a mixed legacy + post-migration list where empty refName means no deprecated alias', async () => {
+    const mixed = [
+      { ...items[0], refName: '' },
+      { ...items[1], refName: 'legacy-node' },
+    ];
+    await expect(listMachines({
+      ...opts,
+      includeOffline: true,
+      fetchImpl: list200(mixed),
+    })).resolves.toEqual(mixed);
   });
   it('accepts access roles from a new server and rejects unknown roles', async () => {
     const shared = [{ ...items[0], accessRole: 'participant' }];
@@ -225,6 +240,8 @@ describe('listMachines client — bounded strict, typed control-plane failure', 
     await expect(listMachines({ ...opts, fetchImpl: list200([{ ...items[0], bogus: 1 }]) })).rejects.toBeInstanceOf(MachineControlPlaneError);
     await expect(listMachines({ ...opts, fetchImpl: list200([{ ...items[0], os: 'solaris' }]) })).rejects.toBeInstanceOf(MachineControlPlaneError);
     await expect(listMachines({ ...opts, fetchImpl: list200([{ ...items[0], nodeRole: 'full' }]) })).rejects.toBeInstanceOf(MachineControlPlaneError);
+    await expect(listMachines({ ...opts, fetchImpl: list200([{ ...items[0], nodeId: 1234567890 }]) })).rejects.toBeInstanceOf(MachineControlPlaneError);
+    await expect(listMachines({ ...opts, fetchImpl: list200([{ ...items[0], nodeId: '0123456789' }]) })).rejects.toBeInstanceOf(MachineControlPlaneError);
     await expect(listMachines({ ...opts, fetchImpl: list200([{ ...items[0], refName: 'bad target' }]) })).rejects.toBeInstanceOf(MachineControlPlaneError);
     const tooMany = Array.from({ length: MACHINE_LIST_MAX_ITEMS + 1 }, (_v, i) => ({ ...items[0], serverId: `s${i}`, refName: `r${i}` }));
     await expect(listMachines({ ...opts, fetchImpl: list200(tooMany) })).rejects.toBeInstanceOf(MachineControlPlaneError);

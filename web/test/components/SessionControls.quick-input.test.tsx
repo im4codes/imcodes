@@ -4,6 +4,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { h } from 'preact';
 import { cleanup, fireEvent, render, screen } from '@testing-library/preact';
+import { CONTROLLED_NODE_ID_MAX, CONTROLLED_NODE_ID_MIN } from '@shared/controlled-node-identity.js';
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
@@ -46,14 +47,16 @@ vi.mock('../../src/hooks/useSwipeBack.js', () => ({
 vi.mock('../../src/hooks/useMachines.js', () => ({
   useMachines: (query = '') => {
     const machines = [
-      { serverId: 'srv-online', refName: 'online-node', displayName: 'Online Node', os: 'windows', online: true, execEnabled: true },
-      { serverId: 'srv-offline', refName: 'offline-node', displayName: 'Offline Node', os: 'windows', online: false, execEnabled: true },
+      { serverId: 'srv-online', nodeId: CONTROLLED_NODE_ID_MIN, refName: 'online-node', displayName: 'Online Node', os: 'windows', online: true, execEnabled: true },
+      { serverId: 'srv-offline', nodeId: CONTROLLED_NODE_ID_MAX, refName: '', displayName: 'Offline Node', os: 'windows', online: false, execEnabled: true },
     ];
     const normalized = query.toLocaleLowerCase();
     return {
       machines,
       filtered: machines.filter((machine) => (
-        machine.refName.includes(normalized) || machine.displayName.toLocaleLowerCase().includes(normalized)
+        machine.nodeId.includes(normalized)
+          || machine.refName.includes(normalized)
+          || machine.displayName.toLocaleLowerCase().includes(normalized)
       )),
       loaded: true,
       loading: false,
@@ -377,7 +380,11 @@ describe('SessionControls quick input integration', () => {
     range.collapse(false);
     selection?.removeAllRanges();
     selection?.addRange(range);
-    const offline = container.querySelector('[data-machine-ref="offline-node"]') as HTMLElement;
+    const offline = container.querySelector(`[data-machine-node-id="${CONTROLLED_NODE_ID_MAX}"]`) as HTMLElement;
+    expect(offline).toBeTruthy();
+    expect(offline.getAttribute('data-machine-node-id')).toBe(CONTROLLED_NODE_ID_MAX);
+    expect(offline.getAttribute('data-machine-node-id')).not.toBe('srv-offline');
+    expect(container.querySelector('[data-machine-ref]')).toBeNull();
     expect(offline.getAttribute('data-machine-online')).toBe('false');
     expect(offline.getAttribute('aria-disabled')).toBeNull();
     fireEvent.mouseDown(offline);

@@ -36,6 +36,8 @@ export type InstallFailureCause =
 
 export interface InstallSuccessFacts {
   displayName?: string;
+  nodeId?: string;
+  /** Deprecated compatibility alias. */
   refName?: string;
   serverUrl: string;
   /**
@@ -168,13 +170,14 @@ const RULE = '──────────────────────
  */
 export function formatInstallSuccess(locale: string, facts: InstallSuccessFacts): string {
   const zh = isChinese(locale);
-  const name = facts.displayName || facts.refName || '';
+  const name = facts.displayName || facts.nodeId || facts.refName || '';
   const lines = zh
     ? [
       RULE,
       '✅ IM.codes 注册成功',
       '',
       ...(name ? [`   设备名称：${name}`] : []),
+      ...(facts.nodeId ? [`   节点 ID： ${facts.nodeId}`] : []),
       `   服务器：  ${facts.serverUrl}`,
       '',
       '   这台机器已经注册，后台服务已安装并会开机自启。',
@@ -192,6 +195,7 @@ export function formatInstallSuccess(locale: string, facts: InstallSuccessFacts)
       '✅ IM.codes registered successfully',
       '',
       ...(name ? [`   Device:  ${name}`] : []),
+      ...(facts.nodeId ? [`   Node ID: ${facts.nodeId}`] : []),
       `   Server:  ${facts.serverUrl}`,
       '',
       '   This machine is registered. The background service is installed',

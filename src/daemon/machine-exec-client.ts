@@ -34,6 +34,7 @@ import {
   type MachineSummary,
 } from '../../shared/remote-exec.js';
 import { isValidMachineName } from '../../shared/machine-reference.js';
+import { isControlledNodeId } from '../../shared/controlled-node-identity.js';
 
 export interface ExecRemoteOptions {
   serverUrl: string;
@@ -237,10 +238,10 @@ export async function execRemote(opts: ExecRemoteOptions): Promise<ExecRemoteRes
   return resultFromEnvelope(decoded.value);
 }
 
-type MachineListItem = MachineSummary & { refName: string; displayName: string; execEnabled: boolean };
+export type MachineListItem = MachineSummary & { nodeId: string; refName: string; displayName: string; execEnabled: boolean };
 
 const MACHINE_LIST_ITEM_KEYS: ReadonlySet<string> = new Set([
-  'serverId', 'name', 'refName', 'displayName', 'online', 'nodeRole', 'execEnabled', 'os', 'lastSeenMs', 'accessRole',
+  'serverId', 'nodeId', 'name', 'refName', 'displayName', 'online', 'nodeRole', 'execEnabled', 'os', 'lastSeenMs', 'accessRole',
   'daemonVersion', 'updateAvailable', 'autoUnlockConfigured',
 ]);
 
@@ -250,8 +251,9 @@ function isValidMachineListItem(v: unknown): v is MachineListItem {
   const m = v as Record<string, unknown>;
   for (const key of Object.keys(m)) if (!MACHINE_LIST_ITEM_KEYS.has(key)) return false;
   if (typeof m.serverId !== 'string' || m.serverId.length === 0
+    || !isControlledNodeId(m.nodeId)
     || typeof m.name !== 'string' || m.name.length === 0
-    || typeof m.refName !== 'string' || !isValidMachineName(m.refName)
+    || typeof m.refName !== 'string' || (m.refName.length > 0 && !isValidMachineName(m.refName))
     || typeof m.displayName !== 'string') return false;
   if (typeof m.online !== 'boolean' || typeof m.execEnabled !== 'boolean') return false;
   if (m.nodeRole !== NODE_ROLE.CONTROLLED) return false;

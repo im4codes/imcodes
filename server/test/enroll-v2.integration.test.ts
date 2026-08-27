@@ -15,7 +15,7 @@ import { describe, it, expect, beforeAll, afterAll, beforeEach, vi } from 'vites
 import { Hono } from 'hono';
 import { randomBytes, createHash } from 'node:crypto';
 import { gunzipSync } from 'node:zlib';
-import { mkdtemp, writeFile, mkdir, rm, readdir, rename, symlink } from 'node:fs/promises';
+import { mkdtemp, readFile, writeFile, mkdir, rm, readdir, rename, symlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createDatabase, type Database } from '../src/db/client.js';
@@ -28,6 +28,14 @@ import {
   type ArtifactCatalog,
 } from '../src/services/controlled-node-artifact-catalog.js';
 import { NODE_ROLE, decodeEnrollmentTrailer, decodeEnrollmentTrailerWithRange } from '../../shared/remote-exec.js';
+import {
+  CONTROLLED_NODE_ID_MIN,
+  isControlledNodeId,
+} from '../../shared/controlled-node-identity.js';
+import {
+  generateControlledNodeId,
+  type SecureRandomBytes,
+} from '../src/services/controlled-node-identity.js';
 import { inspectWindowsAuthenticodeEnrollmentContainer } from '../../shared/windows-authenticode-enrollment.js';
 import {
   ACCEPT_ENCODING_HEADER,
@@ -37,6 +45,7 @@ import {
 import { AUTH_IDENTITY_ERRORS } from '../../shared/auth-identity.js';
 import {
   CONTROLLED_NODE_ARTIFACT_COMPRESSION_ENCODING,
+  CONTROLLED_NODE_ARTIFACT_ASSETS,
   CONTROLLED_NODE_ARTIFACT_HEADERS,
   CONTROLLED_NODE_TICKET_DELIVERY,
   CONTROLLED_NODE_TICKET_MAX_CONSUMES,
@@ -46,6 +55,18 @@ import {
 import { controlledNodeInstallCommandRoutes } from '../src/routes/controlled-node-install.js';
 import {
   REMOTE_DESKTOP_LEGACY_UPGRADE_PROTOCOL_VERSION,
+  REMOTE_DESKTOP_MACOS_COMPONENT_ORDER,
+  REMOTE_DESKTOP_MACOS_DISCLOSURE_FILENAME,
+  REMOTE_DESKTOP_MACOS_LAUNCH_AGENT_FILENAME,
+  REMOTE_DESKTOP_MACOS_MANIFEST_FILENAME,
+  REMOTE_DESKTOP_MACOS_TEAM_ID,
+  REMOTE_DESKTOP_MACOS_VIRTUAL_DISPLAY_HELPER_FILENAME,
+  REMOTE_DESKTOP_MACOS_WORKER_ARTIFACT_KIND,
+  REMOTE_DESKTOP_MACOS_WORKER_FILENAME,
+  REMOTE_DESKTOP_MACOS_WORKER_MANIFEST_VERSION,
+  decodeRemoteDesktopMacosComponentSetPrefix,
+  REMOTE_DESKTOP_MACOS_COMPONENT_SET_PREFIX_BYTES,
+  remoteDesktopMacosComponentSetFilename,
   REMOTE_DESKTOP_WORKER_FILENAME,
   REMOTE_DESKTOP_WORKER_MANIFEST_SUFFIX,
 } from '../../shared/remote-desktop-worker.js';
@@ -153,6 +174,101 @@ async function writeRemoteDesktopRelease(workerVersion: string): Promise<{
   return { workerBytes, virtualDisplayBytes, workerManifest, workerManifestBytes };
 }
 
+type MacosComponentKind = typeof REMOTE_DESKTOP_MACOS_COMPONENT_ORDER[number];
+
+async function writeMacosRemoteDesktopRelease(
+  arch: 'arm64' | 'x64',
+  workerVersion = '2026.7.1234-dev.5',
+): Promise<{ manifestBytes: Buffer; components: Record<MacosComponentKind, Buffer> }> {
+  const directory = join(exeDir, 'remote-desktop-worker', `darwin-${arch}`);
+  await mkdir(directory, { recursive: true });
+  // EVERY map below is typed against the shared canonical order, so omitting a
+  // component is a COMPILE error rather than a `join(directory, undefined)` at
+  // runtime. That is exactly how this fixture drifted to three components while
+  // the shared runtime already required four.
+  const components: Record<MacosComponentKind, Buffer> = {
+    worker: Buffer.from(`signed-${arch}-worker`),
+    launchAgent: Buffer.from(`signed-${arch}-launch-agent`),
+    disclosure: Buffer.from(`signed-${arch}-disclosure`),
+    virtualDisplayHelper: Buffer.from(`signed-${arch}-virtual-display-helper`),
+  };
+  const fileNames: Record<MacosComponentKind, string> = {
+    worker: REMOTE_DESKTOP_MACOS_WORKER_FILENAME,
+    launchAgent: REMOTE_DESKTOP_MACOS_LAUNCH_AGENT_FILENAME,
+    disclosure: REMOTE_DESKTOP_MACOS_DISCLOSURE_FILENAME,
+    virtualDisplayHelper: REMOTE_DESKTOP_MACOS_VIRTUAL_DISPLAY_HELPER_FILENAME,
+  };
+  // Use the same pinned release identity as the production validator. A
+  // shape-valid foreign Team ID is intentionally rejected by that boundary.
+  const teamId = REMOTE_DESKTOP_MACOS_TEAM_ID;
+  const bundleIdentifiers: Record<MacosComponentKind, string> = {
+    worker: 'cc.imcodes.node.remote-desktop-worker',
+    launchAgent: 'cc.imcodes.node.remote-desktop-agent',
+    disclosure: 'cc.imcodes.node.remote-desktop-disclosure',
+    virtualDisplayHelper: 'cc.imcodes.node.remote-desktop-virtual-display-helper',
+  };
+  const notarizationSeeds: Record<MacosComponentKind, string> = {
+    worker: 'a', launchAgent: 'b', disclosure: 'c', virtualDisplayHelper: 'd',
+  };
+  const component = (kind: MacosComponentKind, seed: string) => ({
+    fileName: fileNames[kind],
+    size: components[kind].length,
+    sha256: sha256(components[kind]),
+    notarization: {
+      status: 'accepted',
+      submissionId: '123e4567-e89b-42d3-a456-426614174000',
+      ticketSha256: seed.repeat(64),
+      stapled: true,
+      stapleValidated: true,
+    },
+  });
+  const manifest = {
+    manifestVersion: REMOTE_DESKTOP_MACOS_WORKER_MANIFEST_VERSION,
+    artifactKind: REMOTE_DESKTOP_MACOS_WORKER_ARTIFACT_KIND,
+    workerVersion,
+    protocolVersion: 2,
+    ipcVersion: 1,
+    os: 'darwin',
+    arch,
+    // Built FROM the shared canonical order. A second hand-written list here is
+    // what allowed the three/four split in the first place.
+    components: Object.fromEntries(REMOTE_DESKTOP_MACOS_COMPONENT_ORDER.map(
+      (kind) => [kind, component(kind, notarizationSeeds[kind])],
+    )) as Record<MacosComponentKind, ReturnType<typeof component>>,
+    libwebrtcRevision: WINDOWS_REMOTE_DESKTOP_QUALIFICATION_PLAN.mediaStackDecision.libwebrtcRevision,
+    minimumOsVersion: '13.0',
+    codeSignature: {
+      teamId,
+      bundles: Object.fromEntries(REMOTE_DESKTOP_MACOS_COMPONENT_ORDER.map((kind) => [kind, {
+        bundleIdentifier: bundleIdentifiers[kind],
+        designatedRequirement: `identifier "${bundleIdentifiers[kind]}" and anchor apple generic and certificate leaf[subject.OU] = "${teamId}"`,
+        hardenedRuntime: true,
+      }])),
+    },
+    toolchain: { xcode: '16.4', macosSdk: '15.5', clang: '17.0.0' },
+  };
+  // LOAD-BEARING anti-drift guard. The two failures this fixture caused were
+  // `join(directory, undefined)` -- a fixture that silently wrote three files
+  // while the shared runtime demanded four. Assert the produced manifest and
+  // the files about to be written both cover the canonical set EXACTLY, so a
+  // future component addition fails here with a readable message instead of an
+  // undefined path deep inside writeFile.
+  expect(Object.keys(manifest.components).sort())
+    .toEqual([...REMOTE_DESKTOP_MACOS_COMPONENT_ORDER].sort());
+  expect(Object.keys(fileNames).sort())
+    .toEqual([...REMOTE_DESKTOP_MACOS_COMPONENT_ORDER].sort());
+  expect(new Set(Object.values(fileNames)).size)
+    .toBe(REMOTE_DESKTOP_MACOS_COMPONENT_ORDER.length);
+  const manifestBytes = Buffer.from(JSON.stringify(manifest));
+  await Promise.all([
+    writeFile(join(directory, REMOTE_DESKTOP_MACOS_MANIFEST_FILENAME), manifestBytes),
+    ...REMOTE_DESKTOP_MACOS_COMPONENT_ORDER.map((kind) => (
+      writeFile(join(directory, fileNames[kind]), components[kind])
+    )),
+  ]);
+  return { manifestBytes, components };
+}
+
 beforeAll(async () => {
   process.env.NODE_ENV = 'development'; // default for HTTPS-off tests; per-test overrides
   db = createDatabase(process.env.TEST_DATABASE_URL!);
@@ -194,7 +310,11 @@ beforeEach(async () => {
   process.env.NODE_ENV = 'development';
 });
 
-function buildApp(options: { serverUrl?: string | null; artifactCatalog?: ArtifactCatalog } = {}) {
+function buildApp(options: {
+  serverUrl?: string | null;
+  artifactCatalog?: ArtifactCatalog;
+  controlledNodeIdRandomBytes?: SecureRandomBytes;
+} = {}) {
   const app = new Hono();
   app.use('*', async (c, next) => {
     const serverUrl = options.serverUrl === undefined ? 'http://localhost' : options.serverUrl;
@@ -208,7 +328,9 @@ function buildApp(options: { serverUrl?: string | null; artifactCatalog?: Artifa
     };
     await next();
   });
-  app.route('/api/enroll', createEnrollRoutes(options.artifactCatalog ?? artifactCatalog));
+  app.route('/api/enroll', createEnrollRoutes(options.artifactCatalog ?? artifactCatalog, {
+    controlledNodeIdRandomBytes: options.controlledNodeIdRandomBytes,
+  }));
   return app;
 }
 
@@ -1149,6 +1271,26 @@ describe('GET|POST /api/enroll/v2/download (ticket + streaming)', () => {
 // ─────────────────────────── POST /v2/redeem ───────────────────────────
 
 describe('POST /api/enroll/v2/redeem (atomic claim + idempotent + mismatch → 409)', () => {
+  it('rejects caller-supplied nodeId instead of allowing a claim', async () => {
+    const app = buildApp();
+    const r = await app.request('/api/enroll/v2/redeem', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        version: 2,
+        enrollToken: `missing-${hex(8)}`,
+        installId: `inst-${hex(4)}`,
+        nodeTokenHash: sha256(hex(16)),
+        hostname: 'caller-host',
+        os: 'linux',
+        arch: 'x64',
+        nodeId: '1234567890',
+      }),
+    });
+    expect(r.status).toBe(400);
+    expect(await r.json()).toEqual({ error: 'invalid_body' });
+  });
+
   it('unknown enroll token returns the same generic redeem failure', async () => {
     const app = buildApp();
     const r = await app.request('/api/enroll/v2/redeem', {
@@ -1204,10 +1346,17 @@ describe('POST /api/enroll/v2/redeem (atomic claim + idempotent + mismatch → 4
       }),
     });
     expect(r.status).toBe(200);
-    const body = await r.json() as { serverId: string; version: number; nodeRole: string; token?: string };
+    const body = await r.json() as { serverId: string; nodeId: string; refName?: string; version: number; nodeRole: string; token?: string };
     expect(body.version).toBe(2);
     expect(body.token).toBeUndefined(); // audit: no raw token returned
     expect(body.nodeRole).toBe('controlled');
+    expect(isControlledNodeId(body.nodeId)).toBe(true);
+    expect(body.refName).toBeUndefined();
+    const storedIdentity = await db.queryOne<{ ref_name: string | null; display_name: string | null }>(
+      'SELECT ref_name, display_name FROM servers WHERE id = $1',
+      [body.serverId],
+    );
+    expect(storedIdentity).toEqual({ ref_name: null, display_name: 'h (linux)' });
 
     const installer = await db.queryOne<{ reusable: boolean; expires_at: string | null; used_at: string | null }>(
       'SELECT reusable, expires_at, used_at FROM controlled_node_enrollments_v2 LIMIT 1',
@@ -1223,7 +1372,7 @@ describe('POST /api/enroll/v2/redeem (atomic claim + idempotent + mismatch → 4
     expect(bound?.redeemed_server_id).toBe(body.serverId);
   });
 
-  it('idempotent: same installId + same nodeTokenHash replay returns same serverId', async () => {
+  it('keeps nodeId independent of hostname, never mints/reuses an alias, and replays the same identity', async () => {
     const app = buildApp();
     const userId = `u_${hex(4)}`;
     await createUser(db, userId);
@@ -1238,29 +1387,198 @@ describe('POST /api/enroll/v2/redeem (atomic claim + idempotent + mismatch → 4
 
     const installId = `inst-${hex(4)}`;
     const nodeTokenHash = sha256(hex(16));
+    const legacyServerId = hex(8);
+    await db.execute(
+      `INSERT INTO servers
+         (id, user_id, name, token_hash, status, created_at, node_role, exec_enabled,
+          os, arch, node_id, ref_name, display_name)
+       VALUES ($1, $2, 'legacy-controlled', $3, 'offline', $4, $5, TRUE,
+               'linux', 'x64', $6, 'h', 'Legacy H')`,
+      [legacyServerId, userId, sha256(hex(16)), Date.now(), NODE_ROLE.CONTROLLED, generateControlledNodeId()],
+    );
     const payload = {
       version: 2 as const, enrollToken: enrollCode, installId, nodeTokenHash,
       hostname: 'h', os: 'linux', arch: 'x64',
     };
 
     const r1 = await app.request('/api/enroll/v2/redeem', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload) });
-    const r2 = await app.request('/api/enroll/v2/redeem', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload) });
-    const r3 = await app.request('/api/enroll/v2/redeem', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload) });
+    const changedHostnamePayload = { ...payload, hostname: 'completely-different-host' };
+    const r2 = await app.request('/api/enroll/v2/redeem', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(changedHostnamePayload) });
+    const r3 = await app.request('/api/enroll/v2/redeem', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ ...payload, hostname: '另一台机器' }) });
     expect(r1.status).toBe(200);
     expect(r2.status).toBe(200);
     expect(r3.status).toBe(200);
-    const b1 = await r1.json() as { serverId: string };
-    const b2 = await r2.json() as { serverId: string };
-    const b3 = await r3.json() as { serverId: string };
+    const b1 = await r1.json() as { serverId: string; nodeId: string; refName?: string; displayName: string };
+    const b2 = await r2.json() as { serverId: string; nodeId: string; refName?: string; displayName: string };
+    const b3 = await r3.json() as { serverId: string; nodeId: string; refName?: string; displayName: string };
     expect(b2.serverId).toBe(b1.serverId);
     expect(b3.serverId).toBe(b1.serverId);
+    expect(isControlledNodeId(b1.nodeId)).toBe(true);
+    expect(b2.nodeId).toBe(b1.nodeId);
+    expect(b3.nodeId).toBe(b1.nodeId);
+    expect([b1.refName, b2.refName, b3.refName]).toEqual([undefined, undefined, undefined]);
+    expect([b1.displayName, b2.displayName, b3.displayName]).toEqual(['h (linux)', 'h (linux)', 'h (linux)']);
 
-    // Only ONE controlled server exists for this user.
+    const identities = await db.query<{ id: string; node_id: string; ref_name: string | null }>(
+      `SELECT id, node_id, ref_name FROM servers
+        WHERE user_id = $1 AND node_role = 'controlled'
+        ORDER BY id`,
+      [userId],
+    );
+    expect(identities.find((row) => row.id === legacyServerId)?.ref_name).toBe('h');
+    expect(identities.find((row) => row.id === b1.serverId)?.ref_name).toBeNull();
+
+    // A pre-migration alias is read-only compatibility data: replay may report
+    // it, but the caller's new hostname neither replaces nor retargets it.
+    await db.execute('UPDATE servers SET ref_name = $2 WHERE id = $1', [b1.serverId, 'old-host-alias']);
+    const legacyReplay = await app.request('/api/enroll/v2/redeem', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ ...payload, hostname: 'caller-cannot-retarget-alias' }),
+    });
+    expect(legacyReplay.status).toBe(200);
+    expect(await legacyReplay.json()).toMatchObject({
+      serverId: b1.serverId,
+      nodeId: b1.nodeId,
+      refName: 'old-host-alias',
+    });
+    expect(await db.queryOne<{ ref_name: string | null }>(
+      'SELECT ref_name FROM servers WHERE id = $1',
+      [b1.serverId],
+    )).toEqual({ ref_name: 'old-host-alias' });
+
+    // Replays created only one new server alongside the seeded legacy node.
     const count = await db.queryOne<{ n: string }>(
       "SELECT COUNT(*)::text AS n FROM servers WHERE user_id = $1 AND node_role = 'controlled'",
       [userId],
     );
-    expect(count?.n).toBe('1');
+    expect(count?.n).toBe('2');
+  });
+
+  it('fails closed when an idempotent replay encounters a NULL or malformed stored nodeId', async () => {
+    const app = buildApp();
+    const userId = `u_${hex(4)}`;
+    await createUser(db, userId);
+    const o = await owner(userId);
+    await app.request('/api/enroll/v2/ticket', {
+      method: 'POST', headers: ticketHeaders(userId, o),
+      body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
+    });
+    const { decryptBotConfig } = await import('../src/security/crypto.js');
+    const enrollment = await db.queryOne<{ encrypted_code: string }>(
+      'SELECT encrypted_code FROM controlled_node_enrollments_v2 LIMIT 1',
+    );
+    const payload = {
+      version: 2 as const,
+      enrollToken: decryptBotConfig(enrollment!.encrypted_code, TEST_ENCRYPTION_KEY).enrollCode,
+      installId: `corrupt-${hex(4)}`,
+      nodeTokenHash: sha256(hex(16)),
+      hostname: 'corrupt-replay-host',
+      os: 'linux',
+      arch: 'x64',
+    };
+    const created = await app.request('/api/enroll/v2/redeem', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload),
+    });
+    expect(created.status).toBe(200);
+    const identity = await created.json() as { serverId: string; nodeId: string };
+    const migration086 = await readFile(
+      new URL('../src/db/migrations/086_controlled_node_identity_not_null.sql', import.meta.url),
+      'utf8',
+    );
+
+    // Simulate a database serving between deployed 085 and 086. The production
+    // invariant is restored in finally; the route must reject both corrupt
+    // representations rather than echoing equality-to-self as a valid replay.
+    await db.execute('ALTER TABLE servers DROP CONSTRAINT servers_controlled_node_id_check');
+    try {
+      for (const storedNodeId of [null, 'not-a-node-id']) {
+        await db.execute('UPDATE servers SET node_id = $2 WHERE id = $1', [identity.serverId, storedNodeId]);
+        const replay = await app.request('/api/enroll/v2/redeem', {
+          method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload),
+        });
+        expect(replay.status).toBe(500);
+        expect(await replay.json()).toEqual({ error: 'redeem_failed' });
+      }
+    } finally {
+      await db.execute('UPDATE servers SET node_id = $2 WHERE id = $1', [identity.serverId, identity.nodeId]);
+      await db.execute(migration086);
+    }
+  });
+
+  it('rolls back the real redeem transaction when all bounded nodeId attempts collide', async () => {
+    const normalApp = buildApp();
+    const userId = `u_${hex(4)}`;
+    await createUser(db, userId);
+    const o = await owner(userId);
+    await normalApp.request('/api/enroll/v2/ticket', {
+      method: 'POST', headers: ticketHeaders(userId, o),
+      body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
+    });
+    const { decryptBotConfig } = await import('../src/security/crypto.js');
+    const enrollment = await db.queryOne<{
+      id: string;
+      encrypted_code: string;
+      used_at: string | null;
+      install_id: string | null;
+      node_token_hash: string | null;
+      redeemed_server_id: string | null;
+    }>(
+      `SELECT id, encrypted_code, used_at, install_id, node_token_hash, redeemed_server_id
+         FROM controlled_node_enrollments_v2 LIMIT 1`,
+    );
+    await db.execute(
+      `INSERT INTO servers
+         (id, user_id, name, token_hash, status, created_at, node_role, node_id)
+       VALUES ($1, $2, 'collision-sentinel', 'hash', 'offline', $3, $4, $5)`,
+      [`collision_${hex(6)}`, userId, Date.now(), NODE_ROLE.CONTROLLED, CONTROLLED_NODE_ID_MIN],
+    );
+    const beforeServers = await db.queryOne<{ count: number }>(
+      'SELECT count(*)::int AS count FROM servers WHERE user_id = $1', [userId],
+    );
+    const beforeInstalls = await db.queryOne<{ count: number }>(
+      'SELECT count(*)::int AS count FROM controlled_node_enrollment_installs WHERE enrollment_id = $1',
+      [enrollment!.id],
+    );
+    const collidingApp = buildApp({
+      controlledNodeIdRandomBytes: (size) => new Uint8Array(size),
+    });
+    const response = await collidingApp.request('/api/enroll/v2/redeem', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        version: 2,
+        enrollToken: decryptBotConfig(enrollment!.encrypted_code, TEST_ENCRYPTION_KEY).enrollCode,
+        installId: `exhaust-${hex(4)}`,
+        nodeTokenHash: sha256(hex(16)),
+        hostname: 'collision-host',
+        os: 'linux',
+        arch: 'x64',
+      }),
+    });
+    expect(response.status).toBe(500);
+    expect(await response.json()).toEqual({ error: 'redeem_failed' });
+    expect(await db.queryOne<{ count: number }>(
+      'SELECT count(*)::int AS count FROM servers WHERE user_id = $1', [userId],
+    )).toEqual(beforeServers);
+    expect(await db.queryOne<{ count: number }>(
+      'SELECT count(*)::int AS count FROM controlled_node_enrollment_installs WHERE enrollment_id = $1',
+      [enrollment!.id],
+    )).toEqual(beforeInstalls);
+    expect(await db.queryOne<{
+      used_at: string | null;
+      install_id: string | null;
+      node_token_hash: string | null;
+      redeemed_server_id: string | null;
+    }>(
+      `SELECT used_at, install_id, node_token_hash, redeemed_server_id
+         FROM controlled_node_enrollments_v2 WHERE id = $1`,
+      [enrollment!.id],
+    )).toEqual({
+      used_at: enrollment!.used_at,
+      install_id: enrollment!.install_id,
+      node_token_hash: enrollment!.node_token_hash,
+      redeemed_server_id: enrollment!.redeemed_server_id,
+    });
   });
 
   it('serializes concurrent redemption of the same installer/install identity', async () => {
@@ -1287,10 +1605,14 @@ describe('POST /api/enroll/v2/redeem (atomic claim + idempotent + mismatch → 4
       method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload),
     })));
     expect(responses.every((response) => response.status === 200)).toBe(true);
-    const serverIds = new Set(await Promise.all(responses.map(async (response) => (
-      (await response.json() as { serverId: string }).serverId
-    ))));
+    const identities = await Promise.all(responses.map(async (response) => (
+      await response.json() as { serverId: string; nodeId: string }
+    )));
+    const serverIds = new Set(identities.map((identity) => identity.serverId));
+    const nodeIds = new Set(identities.map((identity) => identity.nodeId));
     expect(serverIds.size).toBe(1);
+    expect(nodeIds.size).toBe(1);
+    expect(isControlledNodeId(identities[0]?.nodeId)).toBe(true);
     const count = await db.queryOne<{ n: string }>(
       'SELECT COUNT(*)::text AS n FROM controlled_node_enrollment_installs',
     );
@@ -1829,9 +2151,9 @@ describe('GET /api/enroll/v2/node-artifact (controlled-node self-upgrade)', () =
     const token = hex(16);
     const serverId = hex(8);
     await db.execute(
-      `INSERT INTO servers (id, user_id, name, token_hash, status, created_at, node_role, exec_enabled, os, arch)
-       VALUES ($1, $2, 'controlled-linux', $3, 'online', $4, $5, TRUE, 'linux', 'x64')`,
-      [serverId, userId, sha256(token), Date.now(), NODE_ROLE.CONTROLLED],
+      `INSERT INTO servers (id, user_id, name, token_hash, status, created_at, node_role, exec_enabled, os, arch, node_id)
+       VALUES ($1, $2, 'controlled-linux', $3, 'online', $4, $5, TRUE, 'linux', 'x64', $6)`,
+      [serverId, userId, sha256(token), Date.now(), NODE_ROLE.CONTROLLED, generateControlledNodeId()],
     );
     const path = `/api/enroll/v2/node-artifact?serverId=${serverId}&os=linux&arch=x64`;
     const headers = { authorization: `Bearer ${token}`, 'X-Server-Id': serverId };
@@ -1859,6 +2181,157 @@ describe('GET /api/enroll/v2/node-artifact (controlled-node self-upgrade)', () =
     expect(await revoked.text()).toBe(await unknown.text());
   });
 
+  it('streams one exact authenticated macOS component set and rejects revocation, cross-arch, and mixed releases', async () => {
+    const app = buildApp();
+    await rm(join(exeDir, 'imcodes-node-macos'), { recursive: true, force: true });
+    await writeFile(join(exeDir, 'imcodes-node-macos'), FAKE_BINARY);
+    await writeManifest('imcodes-node-macos', 'darwin', 'universal', FAKE_BINARY);
+    const release = await writeMacosRemoteDesktopRelease('arm64');
+    const userId = `u_${hex(4)}`;
+    await createUser(db, userId);
+    const token = hex(16);
+    const serverId = hex(8);
+    await db.execute(
+      `INSERT INTO servers (id, user_id, name, token_hash, status, created_at, node_role, exec_enabled, os, arch, node_id)
+       VALUES ($1, $2, 'controlled-mac-arm', $3, 'online', $4, $5, TRUE, 'mac', 'arm64', $6)`,
+      [serverId, userId, sha256(token), Date.now(), NODE_ROLE.CONTROLLED, generateControlledNodeId()],
+    );
+    const headers = {
+      authorization: `Bearer ${token}`,
+      'X-Server-Id': serverId,
+      [CONTROLLED_NODE_ARTIFACT_HEADERS.REMOTE_DESKTOP_PROTOCOL_VERSION]: '2',
+    };
+    const requestPath = (arch: 'arm64' | 'x64') => (
+      `/api/enroll/v2/node-artifact?serverId=${serverId}&os=mac&arch=${arch}`
+      + `&asset=${CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_MACOS_COMPONENT_SET}`
+    );
+
+    const response = await app.request(requestPath('arm64'), { headers });
+    expect(response.status).toBe(200);
+    const archive = Buffer.from(await response.arrayBuffer());
+    expect(response.headers.get(CONTROLLED_NODE_ARTIFACT_HEADERS.FILENAME))
+      .toBe(remoteDesktopMacosComponentSetFilename('arm64'));
+    expect(response.headers.get(CONTROLLED_NODE_ARTIFACT_HEADERS.VERSION))
+      .toBe('2026.7.1234-dev.5');
+    expect(response.headers.get(CONTROLLED_NODE_ARTIFACT_HEADERS.SIZE_BYTES))
+      .toBe(String(archive.length));
+    expect(response.headers.get(CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256))
+      .toBe(sha256(archive));
+
+    const decoded = decodeRemoteDesktopMacosComponentSetPrefix(
+      archive.subarray(0, REMOTE_DESKTOP_MACOS_COMPONENT_SET_PREFIX_BYTES),
+    );
+    expect(decoded).not.toBeNull();
+    let offset = REMOTE_DESKTOP_MACOS_COMPONENT_SET_PREFIX_BYTES;
+    expect(archive.subarray(offset, offset + decoded!.manifestSize)).toEqual(release.manifestBytes);
+    offset += decoded!.manifestSize;
+    for (const kind of REMOTE_DESKTOP_MACOS_COMPONENT_ORDER) {
+      const component = release.components[kind];
+      expect(archive.subarray(offset, offset + component.length)).toEqual(component);
+      offset += component.length;
+    }
+    expect(offset).toBe(archive.length);
+
+    const crossArch = await app.request(requestPath('x64'), { headers });
+    expect(crossArch.status).toBe(403);
+    await crossArch.arrayBuffer();
+
+    await db.execute('UPDATE servers SET revoked_at = $1 WHERE id = $2', [Date.now(), serverId]);
+    const revoked = await app.request(requestPath('arm64'), { headers });
+    const unknownId = hex(8);
+    const unknown = await app.request(
+      `/api/enroll/v2/node-artifact?serverId=${unknownId}&os=mac&arch=arm64`
+        + `&asset=${CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_MACOS_COMPONENT_SET}`,
+      {
+        headers: {
+          authorization: `Bearer ${hex(16)}`,
+          'X-Server-Id': unknownId,
+          [CONTROLLED_NODE_ARTIFACT_HEADERS.REMOTE_DESKTOP_PROTOCOL_VERSION]: '2',
+        },
+      },
+    );
+    expect(revoked.status).toBe(401);
+    expect(unknown.status).toBe(401);
+    expect(await revoked.text()).toBe(await unknown.text());
+
+    await db.execute('UPDATE servers SET revoked_at = NULL WHERE id = $1', [serverId]);
+    await writeMacosRemoteDesktopRelease('arm64', '2026.7.1234-dev.6');
+    const mixedVersion = await app.request(requestPath('arm64'), { headers });
+    expect(mixedVersion.status).toBe(503);
+    expect(await mixedVersion.json()).toEqual({ error: 'macos_release_version_mismatch' });
+  });
+
+  it('fails closed for missing, extra, duplicate-name, or hash-mismatched macOS component sets', async () => {
+    const app = buildApp();
+    await rm(join(exeDir, 'imcodes-node-macos'), { recursive: true, force: true });
+    await writeFile(join(exeDir, 'imcodes-node-macos'), FAKE_BINARY);
+    await writeManifest('imcodes-node-macos', 'darwin', 'universal', FAKE_BINARY);
+    const userId = `u_${hex(4)}`;
+    await createUser(db, userId);
+    const token = hex(16);
+    const serverId = hex(8);
+    await db.execute(
+      `INSERT INTO servers (id, user_id, name, token_hash, status, created_at, node_role, exec_enabled, os, arch, node_id)
+       VALUES ($1, $2, 'controlled-mac-arm', $3, 'online', $4, $5, TRUE, 'mac', 'arm64', $6)`,
+      [serverId, userId, sha256(token), Date.now(), NODE_ROLE.CONTROLLED, generateControlledNodeId()],
+    );
+    const path = `/api/enroll/v2/node-artifact?serverId=${serverId}&os=mac&arch=arm64`
+      + `&asset=${CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_MACOS_COMPONENT_SET}`;
+    const headers = {
+      authorization: `Bearer ${token}`,
+      [CONTROLLED_NODE_ARTIFACT_HEADERS.REMOTE_DESKTOP_PROTOCOL_VERSION]: '2',
+    };
+
+    await writeMacosRemoteDesktopRelease('arm64');
+    await rm(
+      join(exeDir, 'remote-desktop-worker', 'darwin-arm64', REMOTE_DESKTOP_MACOS_DISCLOSURE_FILENAME),
+    );
+    const missing = await app.request(path, { headers });
+    expect(missing.status).toBe(503);
+    await missing.arrayBuffer();
+
+    await writeMacosRemoteDesktopRelease('arm64');
+    await rm(
+      join(exeDir, 'remote-desktop-worker', 'darwin-arm64', REMOTE_DESKTOP_MACOS_VIRTUAL_DISPLAY_HELPER_FILENAME),
+    );
+    const missingFourthComponent = await app.request(path, { headers });
+    expect(missingFourthComponent.status).toBe(503);
+    await missingFourthComponent.arrayBuffer();
+
+    await writeMacosRemoteDesktopRelease('arm64');
+    await writeFile(
+      join(exeDir, 'remote-desktop-worker', 'darwin-arm64', 'unexpected-component'),
+      Buffer.from('not-in-the-canonical-set'),
+    );
+    const extra = await app.request(path, { headers });
+    expect(extra.status).toBe(503);
+    await extra.arrayBuffer();
+    await rm(join(exeDir, 'remote-desktop-worker', 'darwin-arm64', 'unexpected-component'));
+
+    const duplicateRelease = await writeMacosRemoteDesktopRelease('arm64');
+    const duplicateManifest = JSON.parse(duplicateRelease.manifestBytes.toString('utf8')) as {
+      components: Record<MacosComponentKind, { fileName: string }>;
+    };
+    duplicateManifest.components.virtualDisplayHelper.fileName =
+      duplicateManifest.components.disclosure.fileName;
+    await writeFile(
+      join(exeDir, 'remote-desktop-worker', 'darwin-arm64', REMOTE_DESKTOP_MACOS_MANIFEST_FILENAME),
+      JSON.stringify(duplicateManifest),
+    );
+    const duplicate = await app.request(path, { headers });
+    expect(duplicate.status).toBe(503);
+    await duplicate.arrayBuffer();
+
+    await writeMacosRemoteDesktopRelease('arm64');
+    await writeFile(
+      join(exeDir, 'remote-desktop-worker', 'darwin-arm64', REMOTE_DESKTOP_MACOS_WORKER_FILENAME),
+      Buffer.from('tampered-worker'),
+    );
+    const mismatched = await app.request(path, { headers });
+    expect(mismatched.status).toBe(503);
+    await mismatched.arrayBuffer();
+  });
+
   it('gzip-encodes self-upgrade bytes on demand while retaining decoded size and digest metadata', async () => {
     const app = buildApp();
     await writeFile(join(exeDir, 'imcodes-node-linux'), COMPRESSIBLE_FAKE_BINARY);
@@ -1868,9 +2341,9 @@ describe('GET /api/enroll/v2/node-artifact (controlled-node self-upgrade)', () =
     const token = hex(16);
     const serverId = hex(8);
     await db.execute(
-      `INSERT INTO servers (id, user_id, name, token_hash, status, created_at, node_role, exec_enabled, os, arch)
-       VALUES ($1, $2, 'controlled-linux', $3, 'online', $4, $5, TRUE, 'linux', 'x64')`,
-      [serverId, userId, sha256(token), Date.now(), NODE_ROLE.CONTROLLED],
+      `INSERT INTO servers (id, user_id, name, token_hash, status, created_at, node_role, exec_enabled, os, arch, node_id)
+       VALUES ($1, $2, 'controlled-linux', $3, 'online', $4, $5, TRUE, 'linux', 'x64', $6)`,
+      [serverId, userId, sha256(token), Date.now(), NODE_ROLE.CONTROLLED, generateControlledNodeId()],
     );
 
     const response = await app.request(`/api/enroll/v2/node-artifact?serverId=${serverId}&os=linux&arch=x64`, {
@@ -1895,9 +2368,9 @@ describe('GET /api/enroll/v2/node-artifact (controlled-node self-upgrade)', () =
     const token = hex(16);
     const serverId = hex(8);
     await db.execute(
-      `INSERT INTO servers (id, user_id, name, token_hash, status, created_at, node_role, exec_enabled, os, arch)
-       VALUES ($1, $2, 'controlled-win', $3, 'online', $4, $5, TRUE, 'win', 'x64')`,
-      [serverId, userId, sha256(token), Date.now(), NODE_ROLE.CONTROLLED],
+      `INSERT INTO servers (id, user_id, name, token_hash, status, created_at, node_role, exec_enabled, os, arch, node_id)
+       VALUES ($1, $2, 'controlled-win', $3, 'online', $4, $5, TRUE, 'win', 'x64', $6)`,
+      [serverId, userId, sha256(token), Date.now(), NODE_ROLE.CONTROLLED, generateControlledNodeId()],
     );
 
     const missingWorkerResponse = await app.request(`/api/enroll/v2/node-artifact?serverId=${serverId}&os=win&arch=x64`, {
@@ -1992,9 +2465,9 @@ describe('GET /api/enroll/v2/node-artifact (controlled-node self-upgrade)', () =
     const macToken = hex(16);
     const macServerId = hex(8);
     await db.execute(
-      `INSERT INTO servers (id, user_id, name, token_hash, status, created_at, node_role, exec_enabled, os, arch)
-       VALUES ($1, $2, 'controlled-mac-arm', $3, 'online', $4, $5, TRUE, 'mac', 'arm64')`,
-      [macServerId, userId, sha256(macToken), Date.now(), NODE_ROLE.CONTROLLED],
+      `INSERT INTO servers (id, user_id, name, token_hash, status, created_at, node_role, exec_enabled, os, arch, node_id)
+       VALUES ($1, $2, 'controlled-mac-arm', $3, 'online', $4, $5, TRUE, 'mac', 'arm64', $6)`,
+      [macServerId, userId, sha256(macToken), Date.now(), NODE_ROLE.CONTROLLED, generateControlledNodeId()],
     );
     const macArchiveBytes = Buffer.from('SIGNED_OPEN_COMPUTER_USE_APP_ARCHIVE');
     await mkdir(join(exeDir, 'computer-use-helper', 'darwin-universal'), { recursive: true });
@@ -2044,9 +2517,9 @@ describe('GET /api/enroll/v2/node-artifact (controlled-node self-upgrade)', () =
     const token = hex(16);
     const serverId = hex(8);
     await db.execute(
-      `INSERT INTO servers (id, user_id, name, token_hash, status, created_at, node_role, exec_enabled, os, arch)
-       VALUES ($1, $2, 'controlled-linux', $3, 'online', $4, $5, TRUE, 'linux', 'x64')`,
-      [serverId, userId, sha256(token), Date.now(), NODE_ROLE.CONTROLLED],
+      `INSERT INTO servers (id, user_id, name, token_hash, status, created_at, node_role, exec_enabled, os, arch, node_id)
+       VALUES ($1, $2, 'controlled-linux', $3, 'online', $4, $5, TRUE, 'linux', 'x64', $6)`,
+      [serverId, userId, sha256(token), Date.now(), NODE_ROLE.CONTROLLED, generateControlledNodeId()],
     );
     const mismatch = await app.request(`/api/enroll/v2/node-artifact?serverId=${serverId}&os=win&arch=x64`, {
       headers: { authorization: `Bearer ${token}` },

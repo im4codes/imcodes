@@ -3,7 +3,7 @@ import { isAllowedServerUrl } from '../security/server-url.js';
 import { controlledNodeInstallCommand } from '../services/controlled-node-install-command.js';
 import { compress } from 'hono/compress';
 import { z } from 'zod';
-import { lstat, open, type FileHandle } from 'node:fs/promises';
+import { lstat, open, readdir, type FileHandle } from 'node:fs/promises';
 import { createHash, randomBytes } from 'node:crypto';
 import { join } from 'node:path';
 import type { Env } from '../env.js';
@@ -17,12 +17,13 @@ import { EXPECTED_USER_ID_HEADER } from '../../../shared/http-header-names.js';
 import { NODE_ROLE, encodeEnrollmentTrailer, isEnrollmentNodeTokenHash } from '../../../shared/remote-exec.js';
 import { REMOTE_DESKTOP_PROTOCOL_VERSION } from '../../../shared/remote-desktop.js';
 import { buildWindowsAuthenticodeEnrollmentPlan } from '../../../shared/windows-authenticode-enrollment.js';
-import { deriveRefName, deriveDisplayName } from '../../../shared/machine-reference.js';
+import { classifyMachineTarget, deriveDisplayName } from '../../../shared/machine-reference.js';
 import {
   isCanonicalControlledNodePair,
   CONTROLLED_NODE_ARTIFACT_COMPRESSION_ENCODING,
   CONTROLLED_NODE_ARTIFACT_ASSETS,
   CONTROLLED_NODE_ARTIFACT_HEADERS,
+  CONTROLLED_NODE_OS_MAC,
   CONTROLLED_NODE_OS_WIN,
   CONTROLLED_NODE_TICKET_DELIVERY,
   CONTROLLED_NODE_TICKET_DELIVERY_VALUES,
@@ -44,9 +45,19 @@ import {
 } from '../../../shared/controlled-node-artifacts.js';
 import {
   REMOTE_DESKTOP_LEGACY_UPGRADE_PROTOCOL_VERSION,
+  REMOTE_DESKTOP_MACOS_ARCHITECTURES,
+  REMOTE_DESKTOP_MACOS_COMPONENT_ORDER,
+  REMOTE_DESKTOP_MACOS_COMPONENT_SET_MANIFEST_MAX_BYTES,
+  REMOTE_DESKTOP_MACOS_MANIFEST_FILENAME,
+  encodeRemoteDesktopMacosComponentSetPrefix,
+  remoteDesktopMacosComponentSetFilename,
+  remoteDesktopMacosComponentSetSize,
   REMOTE_DESKTOP_WORKER_FILENAME,
   REMOTE_DESKTOP_WORKER_MANIFEST_SUFFIX,
   REMOTE_DESKTOP_VIRTUAL_DISPLAY_ARCHIVE_FILENAME,
+  validateRemoteDesktopWorkerReleaseManifest,
+  type RemoteDesktopMacosArchitecture,
+  type RemoteDesktopMacosWorkerManifest,
   validateRemoteDesktopWorkerManifest,
 } from '../../../shared/remote-desktop-worker.js';
 import {
@@ -54,6 +65,11 @@ import {
   defaultArtifactCatalog,
   type ArtifactCatalog,
 } from '../services/controlled-node-artifact-catalog.js';
+import {
+  insertControlledServerWithNodeId,
+  type SecureRandomBytes,
+} from '../services/controlled-node-identity.js';
+import { parseControlledNodeId } from '../../../shared/controlled-node-identity.js';
 
 function resolveTicketEncryptionKey(c: { env: Env }): string {
   const key = c.env.BOT_ENCRYPTION_KEY;
@@ -139,6 +155,7 @@ const TICKET_BODY = z
 
 export function createEnrollRoutes(
   artifactCatalog: ArtifactCatalog = createArtifactCatalog(),
+  dependencies: { controlledNodeIdRandomBytes?: SecureRandomBytes } = {},
 ): EnrollRouter {
   const enrollRoutes: EnrollRouter = new Hono();
 
@@ -763,6 +780,7 @@ const NODE_ARTIFACT_QUERY = z.object({
     CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER,
     CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER_MANIFEST,
     CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_VIRTUAL_DISPLAY,
+    CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_MACOS_COMPONENT_SET,
   ])
     .default(CONTROLLED_NODE_ARTIFACT_ASSETS.NODE),
 }).strict();
@@ -1000,6 +1018,172 @@ async function openRemoteDesktopWorkerArtifact(
   }
 }
 
+interface OpenedMacosRemoteDesktopComponentSet {
+  prefix: Buffer;
+  manifestBytes: Buffer;
+  handles: Readonly<Record<typeof REMOTE_DESKTOP_MACOS_COMPONENT_ORDER[number], FileHandle>>;
+  manifest: RemoteDesktopMacosWorkerManifest;
+  filename: string;
+  sizeBytes: number;
+  sha256: string;
+  close: () => Promise<void>;
+}
+
+async function openMacosRemoteDesktopComponentSet(
+  dir: string,
+  arch: RemoteDesktopMacosArchitecture,
+): Promise<OpenedMacosRemoteDesktopComponentSet | null> {
+  const componentDirectory = join(dir, 'remote-desktop-worker', `darwin-${arch}`);
+  const manifestPath = join(componentDirectory, REMOTE_DESKTOP_MACOS_MANIFEST_FILENAME);
+  const handles = new Map<typeof REMOTE_DESKTOP_MACOS_COMPONENT_ORDER[number], FileHandle>();
+  let manifestHandle: FileHandle | null = null;
+  let closed = false;
+  let completed = false;
+  const close = async (): Promise<void> => {
+    if (closed) return;
+    closed = true;
+    await Promise.all([
+      manifestHandle?.close().catch(() => {}),
+      ...[...handles.values()].map((handle) => handle.close().catch(() => {})),
+    ]);
+    handles.clear();
+    manifestHandle = null;
+  };
+  try {
+    const manifestPathStat = await lstat(manifestPath);
+    if (!manifestPathStat.isFile() || manifestPathStat.isSymbolicLink()
+      || manifestPathStat.size <= 0
+      || manifestPathStat.size > REMOTE_DESKTOP_MACOS_COMPONENT_SET_MANIFEST_MAX_BYTES) return null;
+    manifestHandle = await open(manifestPath, 'r');
+    const manifestStat = await manifestHandle.stat();
+    if (!manifestStat.isFile()
+      || manifestStat.size !== manifestPathStat.size
+      || manifestStat.mtimeMs !== manifestPathStat.mtimeMs
+      || manifestStat.ctimeMs !== manifestPathStat.ctimeMs) return null;
+    const manifestBytes = await manifestHandle.readFile();
+    await manifestHandle.close();
+    manifestHandle = null;
+    const manifest = validateRemoteDesktopWorkerReleaseManifest(
+      JSON.parse(manifestBytes.toString('utf8')),
+      { os: 'darwin', arch },
+    );
+    if (!manifest || manifest.os !== 'darwin' || manifest.arch !== arch) return null;
+
+    // The validated manifest is the single component-name authority. Keep the
+    // directory admission set mechanically tied to the same canonical order
+    // used for hashing and streaming, so a newly shipped component cannot be
+    // silently rejected by a stale hand-maintained three-file list.
+    const componentNames = REMOTE_DESKTOP_MACOS_COMPONENT_ORDER.map(
+      (kind) => manifest.components[kind].fileName,
+    );
+    const expectedNames = new Set<string>([
+      REMOTE_DESKTOP_MACOS_MANIFEST_FILENAME,
+      ...componentNames,
+    ]);
+    if (expectedNames.size !== REMOTE_DESKTOP_MACOS_COMPONENT_ORDER.length + 1) return null;
+    const entries = await readdir(componentDirectory, { withFileTypes: true });
+    if (entries.length !== expectedNames.size
+      || entries.some((entry) => !entry.isFile() || !expectedNames.has(entry.name))) return null;
+
+    const prefix = Buffer.from(encodeRemoteDesktopMacosComponentSetPrefix(manifestBytes.length));
+    const archiveHash = createHash('sha256').update(prefix).update(manifestBytes);
+    for (const kind of REMOTE_DESKTOP_MACOS_COMPONENT_ORDER) {
+      const descriptor = manifest.components[kind];
+      const path = join(componentDirectory, descriptor.fileName);
+      const pathStat = await lstat(path);
+      if (!pathStat.isFile() || pathStat.isSymbolicLink() || pathStat.size !== descriptor.size) return null;
+      const handle = await open(path, 'r');
+      handles.set(kind, handle);
+      const handleStat = await handle.stat();
+      if (!handleStat.isFile()
+        || handleStat.size !== pathStat.size
+        || handleStat.mtimeMs !== pathStat.mtimeMs
+        || handleStat.ctimeMs !== pathStat.ctimeMs) return null;
+      const componentHash = createHash('sha256');
+      const buffer = Buffer.alloc(64 * 1024);
+      let position = 0;
+      while (position < descriptor.size) {
+        const { bytesRead } = await handle.read(
+          buffer,
+          0,
+          Math.min(buffer.length, descriptor.size - position),
+          position,
+        );
+        if (bytesRead <= 0) return null;
+        const bytes = buffer.subarray(0, bytesRead);
+        componentHash.update(bytes);
+        archiveHash.update(bytes);
+        position += bytesRead;
+      }
+      if (componentHash.digest('hex') !== descriptor.sha256) return null;
+    }
+    completed = true;
+    return {
+      prefix,
+      manifestBytes,
+      handles: Object.freeze(Object.fromEntries(handles) as Record<
+        typeof REMOTE_DESKTOP_MACOS_COMPONENT_ORDER[number],
+        FileHandle
+      >),
+      manifest,
+      filename: remoteDesktopMacosComponentSetFilename(arch),
+      sizeBytes: remoteDesktopMacosComponentSetSize(manifest, manifestBytes.length),
+      sha256: archiveHash.digest('hex'),
+      close,
+    };
+  } catch {
+    return null;
+  } finally {
+    if (!completed) await close();
+  }
+}
+
+function buildMacosRemoteDesktopComponentSetStream(
+  opened: OpenedMacosRemoteDesktopComponentSet,
+): ReadableStream<Uint8Array> {
+  const headers = [opened.prefix, opened.manifestBytes];
+  let headerIndex = 0;
+  let componentIndex = 0;
+  let componentPosition = 0;
+  const buffer = Buffer.alloc(64 * 1024);
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        if (headerIndex < headers.length) {
+          controller.enqueue(Buffer.from(headers[headerIndex++]!));
+          return;
+        }
+        if (componentIndex < REMOTE_DESKTOP_MACOS_COMPONENT_ORDER.length) {
+          const kind = REMOTE_DESKTOP_MACOS_COMPONENT_ORDER[componentIndex]!;
+          const size = opened.manifest.components[kind].size;
+          const { bytesRead } = await opened.handles[kind].read(
+            buffer,
+            0,
+            Math.min(buffer.length, size - componentPosition),
+            componentPosition,
+          );
+          if (bytesRead <= 0) throw new Error('artifact_stream_ended_early');
+          componentPosition += bytesRead;
+          controller.enqueue(Buffer.from(buffer.subarray(0, bytesRead)));
+          if (componentPosition === size) {
+            componentIndex += 1;
+            componentPosition = 0;
+          }
+          return;
+        }
+        await opened.close();
+        controller.close();
+      } catch (error) {
+        await opened.close();
+        controller.error(error);
+      }
+    },
+    async cancel() {
+      await opened.close();
+    },
+  });
+}
+
 /**
  * GET /api/enroll/v2/node-artifact — runtime self-upgrade download for an
  * already-enrolled controlled node. Auth uses the node's existing server token;
@@ -1022,6 +1206,16 @@ enrollRoutes.get('/v2/node-artifact', async (c) => {
   });
   if (!parsed.success) return c.json({ error: 'invalid_query' }, 400);
   const { serverId, os, arch, asset } = parsed.data;
+  const requestedMacosComponentArch = asset
+      === CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_MACOS_COMPONENT_SET
+    && os === 'mac'
+    && REMOTE_DESKTOP_MACOS_ARCHITECTURES.some((candidate) => candidate === arch)
+    ? arch as RemoteDesktopMacosArchitecture
+    : null;
+  if (asset === CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_MACOS_COMPONENT_SET
+    && requestedMacosComponentArch === null) {
+    return c.json({ error: 'invalid_query' }, 400);
+  }
   const artifactTarget = normalizeControlledNodeArtifactPair(os, arch);
   if (!artifactTarget) {
     return c.json({ error: 'invalid_query' }, 400);
@@ -1063,6 +1257,17 @@ enrollRoutes.get('/v2/node-artifact', async (c) => {
     && asset !== CONTROLLED_NODE_ARTIFACT_ASSETS.NODE) {
     return c.json({ error: 'forbidden' }, 403);
   }
+  if (asset === CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_MACOS_COMPONENT_SET
+    && server.node_role !== null
+    && server.node_role !== NODE_ROLE.FULL
+    && server.node_role !== NODE_ROLE.CONTROLLED) {
+    return c.json({ error: 'forbidden' }, 403);
+  }
+  if (asset === CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_MACOS_COMPONENT_SET
+    && ((server.os !== null && server.os !== CONTROLLED_NODE_OS_MAC)
+      || (server.arch !== null && server.arch !== requestedMacosComponentArch))) {
+    return c.json({ error: 'forbidden' }, 403);
+  }
   if ((server.os && server.arch
       && !isControlledNodeArtifactCompatibleWithRuntime(artifactTarget.os, artifactTarget.arch, server.os, server.arch))
     || (server.os && !server.arch && server.os !== artifactTarget.os)
@@ -1086,6 +1291,52 @@ enrollRoutes.get('/v2/node-artifact', async (c) => {
     c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.SIZE_BYTES, String(openedHelper.sizeBytes));
     c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.FILENAME, openedHelper.filename);
     return c.body(buildBareArtifactStream(openedHelper.handle, openedHelper.sizeBytes, openedHelper.close) as unknown as ReadableStream, 200);
+  }
+  if (asset === CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_MACOS_COMPONENT_SET) {
+    const requestedProtocol = c.req.header(
+      CONTROLLED_NODE_ARTIFACT_HEADERS.REMOTE_DESKTOP_PROTOCOL_VERSION,
+    );
+    if (requestedProtocol !== String(REMOTE_DESKTOP_PROTOCOL_VERSION)) {
+      return c.json({ error: 'remote_desktop_protocol_unsupported' }, 409);
+    }
+    // Verify the release carrier before pinning any component handles. Apart
+    // from preserving the main-release/version binding, this ordering avoids
+    // leaking a complete-set handle if catalog verification ever throws.
+    const nodeRelease = await artifactCatalog.ensureVerified(dir, 'mac', 'universal');
+    if (!nodeRelease.ok) {
+      return c.json({ error: 'macos_release_version_mismatch' }, 503);
+    }
+    const openedSet = await openMacosRemoteDesktopComponentSet(
+      dir,
+      requestedMacosComponentArch!,
+    );
+    if (!openedSet) {
+      return c.json({
+        error: 'remote_desktop_worker_not_built',
+        os,
+        arch: requestedMacosComponentArch,
+      }, 503);
+    }
+    if (nodeRelease.descriptor.version !== openedSet.manifest.workerVersion) {
+      await openedSet.close();
+      return c.json({ error: 'macos_release_version_mismatch' }, 503);
+    }
+    c.header('Content-Length', String(openedSet.sizeBytes));
+    c.header('Content-Type', 'application/octet-stream');
+    c.header('Content-Disposition', `attachment; filename="${openedSet.filename}"`);
+    c.header('Cache-Control', 'private, no-store');
+    c.header('Vary', CONTROLLED_NODE_ARTIFACT_HEADERS.REMOTE_DESKTOP_PROTOCOL_VERSION);
+    c.header('Referrer-Policy', 'no-referrer');
+    c.header('X-Content-Type-Options', 'nosniff');
+    c.header('Accept-Ranges', 'none');
+    c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256, openedSet.sha256);
+    c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.SIZE_BYTES, String(openedSet.sizeBytes));
+    c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.FILENAME, openedSet.filename);
+    c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.VERSION, openedSet.manifest.workerVersion);
+    return c.body(
+      buildMacosRemoteDesktopComponentSetStream(openedSet) as unknown as ReadableStream,
+      200,
+    );
   }
   if (isRemoteDesktopArtifactAsset(asset)) {
     if (artifactTarget.os !== 'win' || artifactTarget.arch !== 'x64') {
@@ -1242,20 +1493,29 @@ async function insertControlledServer(
   os: string,
   arch: string,
   hostServerId: string | null = null,
-): Promise<{ refName: string; displayName: string }> {
-  const refName = deriveRefName(hostname, serverId);
+  secureRandomBytes?: SecureRandomBytes,
+): Promise<{ nodeId: string; displayName: string }> {
   const displayName = deriveDisplayName(hostname, os);
-  await tx.execute(
-    `INSERT INTO servers (id, user_id, name, token_hash, status, created_at, node_role, exec_enabled, ref_name, display_name, os, arch, host_server_id)
-     VALUES ($1, $2, $3, $4, 'offline', $5, $6, true, $7, $8, $9, $10, $11)`,
-    [serverId, userId, displayName, tokenHash, Date.now(), NODE_ROLE.CONTROLLED, refName, displayName, os, arch, hostServerId],
-  );
-  return { refName, displayName };
+  const input = {
+    serverId,
+    userId,
+    tokenHash,
+    displayName,
+    refName: null,
+    os,
+    arch,
+    hostServerId,
+    createdAt: Date.now(),
+  };
+  const nodeId = secureRandomBytes
+    ? await insertControlledServerWithNodeId(tx, input, secureRandomBytes)
+    : await insertControlledServerWithNodeId(tx, input);
+  return { nodeId, displayName };
 }
 
 type RedeemResult =
-  | { kind: 'created'; serverId: string; ticketId: string; userId: string; refName: string; displayName: string }
-  | { kind: 'idempotent'; serverId: string; ticketId: string; userId: string; refName: string; displayName: string }
+  | { kind: 'created'; serverId: string; ticketId: string; userId: string; nodeId: string; displayName: string }
+  | { kind: 'idempotent'; serverId: string; ticketId: string; userId: string; nodeId: string; refName?: string; displayName: string }
   | { kind: 'mismatch'; ticketId?: string }
   | { kind: 'denied' };
 
@@ -1310,11 +1570,12 @@ enrollRoutes.post('/v2/redeem', async (c) => {
       const existing = await tx.queryOne<{
         node_token_hash: string;
         redeemed_server_id: string;
+        node_id: string | null;
         ref_name: string | null;
         display_name: string | null;
       }>(
         `SELECT install.node_token_hash, install.redeemed_server_id,
-                server.ref_name, server.display_name
+                server.node_id, server.ref_name, server.display_name
            FROM controlled_node_enrollment_installs AS install
            JOIN servers AS server ON server.id = install.redeemed_server_id
           WHERE install.enrollment_id = $1 AND install.install_id = $2`,
@@ -1324,12 +1585,21 @@ enrollRoutes.post('/v2/redeem', async (c) => {
         if (existing.node_token_hash !== nodeTokenHash) {
           return { kind: 'mismatch' as const, ticketId: row.id };
         }
+        const existingNodeId = parseControlledNodeId(existing.node_id);
+        if (!existingNodeId) throw new Error('controlled_node_redeem_stored_node_id_invalid');
+        const legacyTarget = existing.ref_name == null
+          ? null
+          : classifyMachineTarget(existing.ref_name);
+        if (existing.ref_name != null && legacyTarget?.kind !== 'legacy_ref_name') {
+          throw new Error('controlled_node_redeem_stored_ref_name_invalid');
+        }
         return {
           kind: 'idempotent' as const,
           serverId: existing.redeemed_server_id,
           ticketId: row.id,
           userId: row.owner_user_id,
-          refName: existing.ref_name ?? '',
+          nodeId: existingNodeId,
+          ...(legacyTarget ? { refName: legacyTarget.value } : {}),
           displayName: existing.display_name ?? '',
         };
       }
@@ -1350,9 +1620,10 @@ enrollRoutes.post('/v2/redeem', async (c) => {
       if (reusedToken) return { kind: 'mismatch' as const, ticketId: row.id };
 
       const serverId = randomHex(16);
-      const { refName, displayName } = await insertControlledServer(
+      const { nodeId, displayName } = await insertControlledServer(
         tx, serverId, row.owner_user_id, nodeTokenHash, hostname, os, arch,
         row.host_server_id,
+        dependencies.controlledNodeIdRandomBytes,
       );
       await tx.execute(
         `INSERT INTO controlled_node_enrollment_installs
@@ -1382,7 +1653,7 @@ enrollRoutes.post('/v2/redeem', async (c) => {
         serverId,
         ticketId: row.id,
         userId: row.owner_user_id,
-        refName,
+        nodeId,
         displayName,
       };
     });
@@ -1413,9 +1684,10 @@ enrollRoutes.post('/v2/redeem', async (c) => {
   }, c.env.DB).catch(() => {});
   return c.json({
     serverId: result.serverId,
+    nodeId: result.nodeId,
     ticketId: result.ticketId,
     nodeRole: NODE_ROLE.CONTROLLED,
-    refName: result.refName,
+    ...('refName' in result && result.refName ? { refName: result.refName } : {}),
     displayName: result.displayName,
     version: 2,
   });

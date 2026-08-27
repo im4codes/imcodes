@@ -46,7 +46,7 @@ function node(overrides: Partial<MachineListItem>): MachineListItem {
 }
 
 describe('ControlledNodeQuickMenu', () => {
-  it('lists every node and opens an eligible desktop without management', async () => {
+  it('lists every node and resolves eligibility without trusting OS metadata', async () => {
     const online = node({});
     machines = [
       online,
@@ -69,7 +69,9 @@ describe('ControlledNodeQuickMenu', () => {
     expect(remoteButtons).toHaveLength(3);
     expect((remoteButtons[0] as HTMLButtonElement).disabled).toBe(false);
     expect((remoteButtons[1] as HTMLButtonElement).disabled).toBe(true);
-    expect((remoteButtons[2] as HTMLButtonElement).disabled).toBe(true);
+    // A reported OS label is descriptive. The legacy capability itself is the
+    // understood Windows profile, so contradictory metadata cannot revoke it.
+    expect((remoteButtons[2] as HTMLButtonElement).disabled).toBe(false);
 
     fireEvent.click(remoteButtons[0]);
     expect(onOpenRemoteDesktop).toHaveBeenCalledWith(online);

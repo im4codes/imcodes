@@ -18,6 +18,7 @@ import {
   type EnrollmentBlob,
   type EnrollmentTrailerRange,
 } from '../../shared/remote-exec.js';
+import { isControlledNodeId } from '../../shared/controlled-node-identity.js';
 import {
   inspectWindowsAuthenticodeEnrollmentContainer,
   WINDOWS_AUTHENTICODE_ENROLLMENT_OVERHEAD_MAX,
@@ -32,6 +33,8 @@ import {
 
 export interface ControlledNodeCredential {
   serverId: string;
+  /** Server-minted public identity. Optional only for pre-migration credentials. */
+  nodeId?: string;
   token: string;
   serverUrl: string;
   nodeRole: typeof NODE_ROLE.CONTROLLED;
@@ -567,7 +570,8 @@ export async function loadCredential(
     // On Windows tool absence or malformed ACL output rejects the load.
     await assertSecretPathProtected(path, 'credential', options);
     const value = JSON.parse(await readFile(path, 'utf8')) as Partial<ControlledNodeCredential>;
-    if (value.nodeRole !== NODE_ROLE.CONTROLLED || !value.serverId || !value.token || !value.serverUrl) {
+  if (value.nodeRole !== NODE_ROLE.CONTROLLED || !value.serverId || !value.token || !value.serverUrl
+    || (value.nodeId !== undefined && !isControlledNodeId(value.nodeId))) {
       throw new Error('credential_invalid');
     }
     return value as ControlledNodeCredential;
@@ -640,9 +644,12 @@ export async function redeemEnrollmentV2(
   if (!response.ok) throw new Error(`enrollment_redeem_failed:${response.status}`);
   const value = await response.json() as EnrollRedeemV2Response & { token?: string };
   if ('token' in value && value.token) throw new Error('enrollment_redeem_v2_returned_raw_token');
-  if (value.nodeRole !== NODE_ROLE.CONTROLLED || !value.serverId) throw new Error('enrollment_redeem_invalid_response');
+  if (value.nodeRole !== NODE_ROLE.CONTROLLED || !value.serverId || !isControlledNodeId(value.nodeId)) {
+    throw new Error('enrollment_redeem_invalid_response');
+  }
   return {
     serverId: value.serverId,
+    nodeId: value.nodeId,
     token: identity.nodeToken,
     serverUrl: expectedOrigin,
     nodeRole: NODE_ROLE.CONTROLLED,

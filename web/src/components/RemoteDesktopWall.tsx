@@ -13,10 +13,11 @@ import {
 } from '../remote-desktop-connection-manager.js';
 import { mutateRemoteDesktopWallWithOneReplay } from '../remote-desktop-wall-store.js';
 import type { RemoteDesktopWorkspaceMachine } from '../remote-desktop-workspace-state.js';
+import { canOpenRemoteDesktopMachine } from '../remote-desktop-profile.js';
 import { FloatingPanel } from './FloatingPanel.js';
-import { canOpenRemoteDesktop } from './RemoteDesktopPanel.js';
 import { RemoteDesktopWallTile } from './RemoteDesktopWallTile.js';
 import './remote-desktop-workspace.css';
+import { MACHINE_IDENTITY_UNAVAILABLE } from '@shared/machine-reference.js';
 
 export const REMOTE_DESKTOP_WALL_WINDOW_ID = 'remote-desktop-wall';
 const REMOTE_DESKTOP_WALL_MOBILE_COLUMNS_KEY = 'imcodes.remoteDesktopWall.mobileColumns';
@@ -117,7 +118,7 @@ export function RemoteDesktopWall({
     let active = true;
     setPickerError(false);
     void listControllableMachines().then((machines) => {
-      if (active) setPickerMachines(machines.filter(canOpenRemoteDesktop));
+      if (active) setPickerMachines(machines.filter(canOpenRemoteDesktopMachine));
     }).catch(() => {
       if (active) setPickerError(true);
     });
@@ -280,7 +281,7 @@ export function RemoteDesktopWall({
             {!pickerError && availableMachines.length === 0 && <p>{t('remote_desktop.workspace_picker_empty')}</p>}
             {availableMachines.map((machine) => (
               <button type="button" key={machine.serverId} onClick={() => { void addHost(machine); }}>
-                <strong>{machine.displayName}</strong><span>{machine.refName}</span>
+                <strong>{machine.displayName}</strong><span>{machine.nodeId ?? MACHINE_IDENTITY_UNAVAILABLE}</span>
               </button>
             ))}
           </div>

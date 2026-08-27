@@ -15,6 +15,7 @@ import { useP2pCustomCombos } from './p2p-combos.js';
 import { isImeComposingKeyEvent } from '../ime-keyboard.js';
 import { useAliases } from '../hooks/useAliases.js';
 import { useMachines } from '../hooks/useMachines.js';
+import { MACHINE_IDENTITY_UNAVAILABLE } from '@shared/machine-reference.js';
 
 interface SessionEntry {
   name: string;
@@ -47,8 +48,8 @@ interface AtPickerProps {
   onSelectDelegateAgent: (session: string) => void;
   /** Insert the `;;(name)` marker for the chosen alias (never the value). */
   onSelectAlias?: (name: string) => void;
-  /** Insert the stable machine marker plus its human-readable display note. */
-  onSelectMachine?: (refName: string, displayName: string) => void;
+  /** Insert the canonical nodeId marker plus its human-readable display note. */
+  onSelectMachine?: (nodeId: string, displayName: string) => void;
   onSelectAllConfig?: (config: P2pSavedConfig, rounds: number, modeOverride: string) => void;
   /** Launch a Team discussion directly with the chosen combo/mode and round count. */
   onLaunchTeam?: (modeKey: string, rounds: number) => void;
@@ -372,7 +373,7 @@ export function AtPicker({
         if ((e.key === 'Enter' || e.key === 'Tab') && count > 0) {
           e.preventDefault(); e.stopPropagation();
           const m = machineResults[Math.min(highlightIdx, count - 1)];
-          if (m) onSelectMachine?.(m.refName, m.displayName);
+          if (m?.nodeId) onSelectMachine?.(m.nodeId, m.displayName);
           return;
         }
         return;
@@ -561,7 +562,7 @@ export function AtPicker({
               key={m.serverId}
               data-hl={hl ? 'true' : undefined}
               style={hl ? itemHighlightStyle : itemStyle}
-              onClick={() => onSelectMachine?.(m.refName, m.displayName)}
+              onClick={() => { if (m.nodeId) onSelectMachine?.(m.nodeId, m.displayName); }}
               onMouseEnter={() => setHighlightIdx(idx)}
             >
               <span
@@ -575,7 +576,7 @@ export function AtPicker({
                 title={m.online ? undefined : t('machine.offline')}
               />
               <span style={{ fontWeight: 500, color: '#e2e8f0' }}>{m.displayName}</span>
-              <span style={dimStyle}>{m.refName}</span>
+              <span style={dimStyle}>{m.nodeId ?? MACHINE_IDENTITY_UNAVAILABLE}</span>
               {!m.online && <span style={dimStyle}>{t('machine.offline_hint')}</span>}
             </div>
           );

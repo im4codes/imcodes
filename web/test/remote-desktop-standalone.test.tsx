@@ -1,6 +1,14 @@
 /** @vitest-environment jsdom */
 import { act, cleanup, render, waitFor } from '@testing-library/preact';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY } from '@shared/remote-desktop-access.js';
+import { REMOTE_DESKTOP_CAPABILITY } from '@shared/remote-desktop.js';
+import {
+  REMOTE_DESKTOP_CAPTURE_CAPABILITY,
+  REMOTE_DESKTOP_ENCODER_CAPABILITY,
+  REMOTE_DESKTOP_PLATFORM_CAPABILITY,
+  REMOTE_DESKTOP_SESSION_CAPABILITY,
+} from '@shared/remote-desktop-platform.js';
 
 const { listControllableMachines } = vi.hoisted(() => ({
   listControllableMachines: vi.fn(),
@@ -15,7 +23,6 @@ vi.mock('../src/api/machines.js', () => ({
 }));
 
 vi.mock('../src/components/RemoteDesktopPanel.js', () => ({
-  canOpenRemoteDesktop: (machine: { online: boolean }) => machine.online,
   RemoteDesktopPanel: ({ machine, standalone, onClose }: {
     machine: { displayName: string };
     standalone: boolean;
@@ -32,6 +39,14 @@ import {
   isRemoteDesktopWallWindow,
   readRemoteDesktopWindowServerId,
 } from '../src/remote-desktop-window.js';
+
+const MAC_COMPLETE = [
+  REMOTE_DESKTOP_SESSION_CAPABILITY,
+  REMOTE_DESKTOP_PLATFORM_CAPABILITY.MACOS,
+  REMOTE_DESKTOP_CAPTURE_CAPABILITY.MACOS_SCREEN_CAPTURE_KIT,
+  REMOTE_DESKTOP_ENCODER_CAPABILITY.H264,
+  REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY,
+] as const;
 
 afterEach(() => {
   cleanup();
@@ -60,6 +75,7 @@ describe('remote desktop standalone window', () => {
       displayName: 'Desktop One',
       online: true,
       execEnabled: true,
+      capabilities: [REMOTE_DESKTOP_CAPABILITY],
     }]);
     const close = vi.spyOn(window, 'close').mockImplementation(() => undefined);
     const result = render(<RemoteDesktopStandalone serverId="desktop-1" />);
@@ -69,6 +85,39 @@ describe('remote desktop standalone window', () => {
 
     act(() => result.getByText('stop-standalone').click());
     expect(close).toHaveBeenCalledTimes(1);
+  });
+
+  it('uses the real capability gate for complete and incomplete macOS profiles', async () => {
+    listControllableMachines.mockResolvedValue([{
+      serverId: 'mac-complete',
+      refName: 'mac-complete',
+      displayName: 'Mac Complete',
+      os: 'mac',
+      online: true,
+      execEnabled: true,
+      capabilities: MAC_COMPLETE,
+    }, {
+      serverId: 'mac-incomplete',
+      refName: 'mac-incomplete',
+      displayName: 'Mac Incomplete',
+      os: 'mac',
+      online: true,
+      execEnabled: true,
+      capabilities: [
+        REMOTE_DESKTOP_SESSION_CAPABILITY,
+        REMOTE_DESKTOP_PLATFORM_CAPABILITY.MACOS,
+      ],
+    }]);
+
+    const complete = render(<RemoteDesktopStandalone serverId="mac-complete" />);
+    await waitFor(() => expect(complete.getByTestId('standalone-desktop').textContent)
+      .toContain('Mac Complete:full-panel'));
+    complete.unmount();
+
+    const incomplete = render(<RemoteDesktopStandalone serverId="mac-incomplete" />);
+    await waitFor(() => expect(incomplete.getByRole('alert').textContent)
+      .toBe('controlled_nodes.error_generic'));
+    expect(incomplete.queryByTestId('standalone-desktop')).toBeNull();
   });
 
   it('fails closed when the requested machine is unavailable', async () => {

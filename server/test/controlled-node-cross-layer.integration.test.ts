@@ -30,6 +30,7 @@ import { MachineExecWorker } from '../../src/node/machine-exec-worker.js';
 import { createDatabase, type Database } from '../src/db/client.js';
 import { runMigrations } from '../src/db/migrate.js';
 import { createServer, createUser } from '../src/db/queries.js';
+import { generateControlledNodeId } from '../src/services/controlled-node-identity.js';
 import {
   __setMachineExecRelayDeadlineBufferMsForTests,
   createMachineExecRoutes,
@@ -44,7 +45,7 @@ const stubCaller = {} as unknown as McpRuntimeCaller;
 
 let db: Database;
 let source: { serverId: string; token: string };
-let target: { serverId: string; token: string };
+let target: { serverId: string; token: string; nodeId: string };
 let app: Hono;
 let bridge: WsBridge;
 let socket: ControlledLoopbackSocket;
@@ -179,6 +180,7 @@ function machineDeps(overrides: { token?: string; unbound?: boolean; listFailure
       if (overrides.listFailure) throw new MachineControlPlaneError('http_status', 'machines API returned http_503');
       return [{
         serverId: target.serverId,
+        nodeId: target.nodeId,
         name: 'controlled-node',
         refName: 'node-linux',
         displayName: 'Linux Node',
@@ -216,12 +218,12 @@ beforeAll(async () => {
   const userId = `cross_${hex(5)}`;
   await createUser(db, userId);
   source = { serverId: `full_${hex(5)}`, token: hex(16) };
-  target = { serverId: `ctl_${hex(5)}`, token: hex(16) };
+  target = { serverId: `ctl_${hex(5)}`, token: hex(16), nodeId: generateControlledNodeId() };
   await createServer(db, source.serverId, userId, 'full', sha256(source.token));
   await db.execute(
-    `INSERT INTO servers (id, user_id, name, token_hash, status, created_at, node_role, exec_enabled, revoked_at, ref_name, display_name, os)
-     VALUES ($1,$2,'controlled',$3,'online',$4,$5,true,NULL,'node-linux','Linux Node','linux')`,
-    [target.serverId, userId, sha256(target.token), Date.now(), NODE_ROLE.CONTROLLED],
+    `INSERT INTO servers (id, user_id, name, token_hash, status, created_at, node_role, exec_enabled, revoked_at, ref_name, display_name, os, node_id)
+     VALUES ($1,$2,'controlled',$3,'online',$4,$5,true,NULL,'node-linux','Linux Node','linux',$6)`,
+    [target.serverId, userId, sha256(target.token), Date.now(), NODE_ROLE.CONTROLLED, target.nodeId],
   );
 
   app = new Hono();
@@ -286,7 +288,7 @@ describe('controlled-node cross-layer product path', () => {
     const listed = await client.callTool({ name: MEMORY_MCP_TOOL_NAMES.LIST_MACHINES, arguments: {} });
     expect(listed.structuredContent).toMatchObject({
       status: 'ok',
-      machines: [{ name: 'node-linux', os: 'linux', role: NODE_ROLE.CONTROLLED, online: true, execEnabled: true }],
+      machines: [{ name: target.nodeId, os: 'linux', role: NODE_ROLE.CONTROLLED, online: true, execEnabled: true }],
     });
     const result = await callExec(client, 'nonzero');
     expect(result.isError).toBeFalsy();

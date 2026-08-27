@@ -4,8 +4,8 @@
  * read from the DB (F1), so no `serverId` is sent — `apiFetch` handles cookie
  * credentials + CSRF automatically, mirroring `api/aliases.ts`.
  *
- * Returns the composer-facing machine DTO used by the `^^(name)` quick-reference
- * (ref_name key + render-only display name + online/exec-enabled flags). Offline
+ * Returns the composer-facing machine DTO used by the `^^(nodeId)` quick-reference
+ * (canonical nodeId + deprecated refName alias + render-only display name). Offline
  * machines are included for display; the picker renders them non-selectable.
  */
 import {
@@ -28,7 +28,8 @@ import {
   type ControlledNodeOs,
   type ControlledNodeTicketDelivery,
 } from '@shared/controlled-node-artifacts.js';
-import { MACHINE_API_PATH } from '@shared/machine-reference.js';
+import { MACHINE_API_PATH, MACHINE_IDENTITY_UNAVAILABLE } from '@shared/machine-reference.js';
+import { isControlledNodeId } from '@shared/controlled-node-identity.js';
 import { REMOTE_DESKTOP_CAPABILITY } from '@shared/remote-desktop.js';
 import { isMachineAccessRole, type MachineAccessRole } from '@shared/remote-exec.js';
 import {
@@ -51,8 +52,9 @@ export type { ControlledNodeArtifactArch, ControlledNodeOs };
  * The daemon is not a controlled node, so it has no row in the machine list —
  * but `RemoteDesktopPanel` is keyed by `serverId` and needs a `MachineListItem`.
  * The fields the panel gates on are asserted here because the daemon already
- * proved them by advertising the remote-desktop capability, which it only does
- * on Windows x64 with a verified worker installed.
+ * proved them by advertising a complete remote-desktop capability profile.
+ * OS metadata is deliberately absent: it is descriptive and must not become
+ * launch authority.
  */
 export function daemonRemoteDesktopMachine(
   serverId: string,
@@ -60,9 +62,8 @@ export function daemonRemoteDesktopMachine(
 ): MachineListItem {
   return {
     serverId,
-    refName: serverId,
-    displayName: displayName ?? serverId,
-    os: 'win',
+    refName: '',
+    displayName: displayName?.trim() || MACHINE_IDENTITY_UNAVAILABLE,
     online: true,
     execEnabled: true,
     accessRole: 'owner',
@@ -72,6 +73,8 @@ export function daemonRemoteDesktopMachine(
 
 export interface MachineListItem {
   serverId: string;
+  /** Canonical controlled-node public identity; absent only for synthetic full-daemon hosts. */
+  nodeId?: string;
   /** Canonical physical-host identity. Required for Owner guest-access management. */
   remoteDesktopHostId?: string;
   refName: string;
@@ -264,16 +267,18 @@ export function buildControlledNodeDownloadTargets(res: ControlledNodeAvailabili
 function normalizeMachine(raw: unknown): MachineListItem | null {
   if (!isRecord(raw)) return null;
   const serverId = typeof raw.serverId === 'string' ? raw.serverId : '';
+  const nodeId = isControlledNodeId(raw.nodeId) ? raw.nodeId : null;
   const refName = typeof raw.refName === 'string' ? raw.refName : '';
-  if (!serverId || !refName) return null;
+  if (!serverId || !nodeId) return null;
   const capabilities = validateControlledNodeCapabilities(raw.capabilities);
   return {
     serverId,
+    nodeId,
     ...(typeof raw.remoteDesktopHostId === 'string' && raw.remoteDesktopHostId
       ? { remoteDesktopHostId: raw.remoteDesktopHostId }
       : {}),
     refName,
-    displayName: typeof raw.displayName === 'string' && raw.displayName ? raw.displayName : refName,
+    displayName: typeof raw.displayName === 'string' && raw.displayName ? raw.displayName : nodeId,
     ...(typeof raw.os === 'string' && raw.os ? { os: raw.os } : {}),
     online: raw.online === true,
     execEnabled: raw.execEnabled === true,

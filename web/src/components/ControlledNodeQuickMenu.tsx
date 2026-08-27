@@ -3,7 +3,8 @@ import { useCallback, useEffect, useRef, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import type { MachineListItem } from '../api/machines.js';
 import { useMachines } from '../hooks/useMachines.js';
-import { canOpenRemoteDesktop } from './RemoteDesktopPanel.js';
+import { canOpenRemoteDesktopMachine } from '../remote-desktop-profile.js';
+import { MACHINE_IDENTITY_UNAVAILABLE } from '@shared/machine-reference.js';
 
 interface ControlledNodeQuickMenuProps {
   onOpenRemoteDesktop(machine: MachineListItem): void;
@@ -120,7 +121,7 @@ export function ControlledNodeQuickMenu({ onOpenRemoteDesktop, onOpenRemoteDeskt
       {machines.length > 0 && (
         <ul class="controlled-node-quick-list">
           {machines.map((machine) => {
-            const available = canOpenRemoteDesktop(machine);
+            const available = canOpenRemoteDesktopMachine(machine);
             return (
               <li key={machine.serverId} class="controlled-node-quick-row" role="none">
                 <span
@@ -129,7 +130,7 @@ export function ControlledNodeQuickMenu({ onOpenRemoteDesktop, onOpenRemoteDeskt
                 />
                 <span class="controlled-node-quick-identity">
                   <strong>{machine.displayName}</strong>
-                  <code>{machine.refName}</code>
+                  <code>{machine.nodeId ?? MACHINE_IDENTITY_UNAVAILABLE}</code>
                 </span>
                 <button
                   type="button"

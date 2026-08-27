@@ -4,6 +4,14 @@ import { resolve } from 'node:path';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/preact';
 import type { ComponentChildren } from 'preact';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY } from '@shared/remote-desktop-access.js';
+import { REMOTE_DESKTOP_CAPABILITY } from '@shared/remote-desktop.js';
+import {
+  REMOTE_DESKTOP_CAPTURE_CAPABILITY,
+  REMOTE_DESKTOP_ENCODER_CAPABILITY,
+  REMOTE_DESKTOP_PLATFORM_CAPABILITY,
+  REMOTE_DESKTOP_SESSION_CAPABILITY,
+} from '@shared/remote-desktop-platform.js';
 
 const api = vi.hoisted(() => ({
   listControllableMachines: vi.fn(),
@@ -26,9 +34,6 @@ vi.mock('../src/api/remote-desktop-wall.js', async (importOriginal) => ({
 }));
 vi.mock('../src/components/FloatingPanel.js', () => ({
   FloatingPanel: ({ id, children }: { id: string; children: ComponentChildren }) => <div data-testid={id}>{children}</div>,
-}));
-vi.mock('../src/components/RemoteDesktopPanel.js', () => ({
-  canOpenRemoteDesktop: (machine: { online: boolean }) => machine.online,
 }));
 vi.mock('../src/components/RemoteDesktopWallTile.js', () => ({
   RemoteDesktopWallTile: ({ host, retryGeneration, onRetryableChange, onOpen, onRemove }: {
@@ -57,7 +62,24 @@ function machine(id: string) {
   return {
     hostId: id, remoteDesktopHostId: id, serverId: id, refName: id,
     displayName: id.toUpperCase(), online: true, execEnabled: true,
-    accessRole: 'owner' as const, capabilities: ['remote-desktop-v1' as const],
+    accessRole: 'owner' as const, capabilities: [REMOTE_DESKTOP_CAPABILITY],
+  };
+}
+
+function macMachine(id: string, complete: boolean) {
+  return {
+    ...machine(id),
+    os: complete ? 'mac' : 'win',
+    capabilities: complete ? [
+      REMOTE_DESKTOP_SESSION_CAPABILITY,
+      REMOTE_DESKTOP_PLATFORM_CAPABILITY.MACOS,
+      REMOTE_DESKTOP_CAPTURE_CAPABILITY.MACOS_SCREEN_CAPTURE_KIT,
+      REMOTE_DESKTOP_ENCODER_CAPABILITY.H264,
+      REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY,
+    ] : [
+      REMOTE_DESKTOP_SESSION_CAPABILITY,
+      REMOTE_DESKTOP_PLATFORM_CAPABILITY.MACOS,
+    ],
   };
 }
 
@@ -123,6 +145,24 @@ describe('RemoteDesktopWall', () => {
 
     fireEvent.click(screen.getByText('remove:A'));
     await waitFor(() => expect(manager.stop).toHaveBeenCalledWith('a'));
+  });
+
+  it('uses the real capability gate: complete macOS opens and incomplete macOS stays absent', async () => {
+    api.listControllableMachines.mockResolvedValue([
+      macMachine('mac-complete', true),
+      macMachine('mac-incomplete', false),
+    ]);
+    render(<RemoteDesktopWall
+      manager={{ stop: vi.fn() } as unknown as RemoteDesktopConnectionManager}
+      retainedHostKeys={new Set()}
+      onOpenHost={vi.fn()}
+      onHostKeysChange={vi.fn()}
+      onClose={vi.fn()}
+    />);
+
+    fireEvent.click((await screen.findAllByRole('button', { name: 'remote_desktop.wall_add' }))[0]);
+    expect(await screen.findByRole('button', { name: /MAC-COMPLETE/ })).toBeDefined();
+    expect(screen.queryByRole('button', { name: /MAC-INCOMPLETE/ })).toBeNull();
   });
 
   it('enables global retry only for tiles that reported a retryable disconnect', async () => {

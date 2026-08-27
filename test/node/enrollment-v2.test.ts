@@ -98,10 +98,11 @@ describe('controlled node enrollment v2', () => {
   it('redeemEnrollmentV2 builds credential from local nodeToken when response has no token', async () => {
     const blob = { serverUrl: 'https://im.example', enrollToken: 'tok' };
     const identity = generateInstallIdentity();
-    const fetchFn = vi.fn(async () => redeemResponse({ serverId: 's1', nodeRole: NODE_ROLE.CONTROLLED, refName: 'box-1234' })) as unknown as typeof fetch;
+    const fetchFn = vi.fn(async () => redeemResponse({ serverId: 's1', nodeId: '1234567890', nodeRole: NODE_ROLE.CONTROLLED, refName: 'box-1234' })) as unknown as typeof fetch;
     const cred = await redeemEnrollmentV2(blob, identity, fetchFn);
     expect(cred.token).toBe(identity.nodeToken);
     expect(cred.serverId).toBe('s1');
+    expect(cred.nodeId).toBe('1234567890');
     expect(fetchFn).toHaveBeenCalledOnce();
     expect(fetchFn.mock.calls[0]?.[0]).toBe('https://im.example/api/enroll/v2/redeem');
     const body = JSON.parse(String((fetchFn.mock.calls[0] as [string, RequestInit])[1]?.body));
@@ -109,6 +110,18 @@ describe('controlled node enrollment v2', () => {
     expect(body.nodeTokenHash).toBe(identity.nodeTokenHash);
     expect(body.version).toBe(2);
     expect((fetchFn.mock.calls[0] as [string, RequestInit])[1].redirect).toBe('error');
+  });
+
+  it.each([1234567890, '0123456789', '0000000001', '１２３４５６７８９０'])
+  ('rejects a non-canonical redeem nodeId %j', async (nodeId) => {
+    const fetchFn = vi.fn(async () => redeemResponse({
+      serverId: 's1', nodeId, nodeRole: NODE_ROLE.CONTROLLED,
+    })) as unknown as typeof fetch;
+    await expect(redeemEnrollmentV2(
+      { serverUrl: 'https://im.example', enrollToken: 'tok' },
+      generateInstallIdentity(),
+      fetchFn,
+    )).rejects.toThrow(/invalid_response/);
   });
 
   it('permits HTTP only for explicitly enabled local development origins', () => {

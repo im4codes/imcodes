@@ -1,10 +1,11 @@
+import { isControlledNodeId, type ControlledNodeId } from './controlled-node-identity.js';
+
 // Machine quick-reference protocol shared by daemon, server, and web.
 //
-// A controlled machine is referenced in the composer with a `^^(name)` marker,
-// mirroring the alias `;;(name)` mechanics but for a machine target rather than
-// a secret value. The reference KEY is a server-derived `ref_name` slug that is
-// guaranteed to match the marker grammar and be account-unique; the untrusted
-// redeemed hostname is only used to compute a render-only `display_name`.
+// A controlled machine is referenced in the composer with a `^^(name)` marker.
+// New markers carry the server-minted canonical nodeId. Historical noncanonical
+// `ref_name` slugs remain owner-scoped compatibility aliases only; hostname/OS
+// never determine canonical identity and are render-only display inputs.
 
 /**
  * Valid `ref_name` grammar: letters/digits/`._-`, NFC, 1..40 code points. Mirrors
@@ -15,7 +16,7 @@
 export const MACHINE_REF_NAME_MAX = 40;
 const MACHINE_NAME_FRAGMENT = `[\\p{L}\\p{N}._-]{1,${MACHINE_REF_NAME_MAX}}`;
 export const MACHINE_NAME_PATTERN = new RegExp(`^${MACHINE_NAME_FRAGMENT}$`, 'u');
-/** Action-tool targets accept either a bare ref_name or its complete ^^(ref_name) marker. */
+/** Action-tool targets accept a canonical nodeId or deprecated alias, bare or marked. */
 export const MACHINE_TARGET_MAX = MACHINE_REF_NAME_MAX + 4;
 export const MACHINE_TARGET_PATTERN = new RegExp(
   `^(?:${MACHINE_NAME_FRAGMENT}|\\^\\^\\(${MACHINE_NAME_FRAGMENT}\\))$`,
@@ -23,6 +24,8 @@ export const MACHINE_TARGET_PATTERN = new RegExp(
 );
 const MACHINE_TARGET_MARKER_PATTERN = new RegExp(`^\\^\\^\\((${MACHINE_NAME_FRAGMENT})\\)$`, 'u');
 export const MACHINE_DISPLAY_NAME_MAX = 120;
+/** Bounded render fallback for endpoints that have no public node identity. */
+export const MACHINE_IDENTITY_UNAVAILABLE = '—';
 
 /** Owner-scoped controllable-machine list endpoint (DB-backed presence, F1). */
 export const MACHINE_API_PATH = '/api/machines';
@@ -48,10 +51,10 @@ export function isValidMachineName(raw: string): boolean {
 }
 
 /**
- * Normalize an action-tool target to its bare stable ref_name.
+ * Normalize an action-tool target to its bare canonical nodeId or legacy alias.
  *
  * This deliberately accepts only a complete marker, never a marker embedded in
- * surrounding text. List/output contracts continue to use bare ref_names only.
+ * surrounding text. List/output contracts use canonical nodeIds as primary.
  */
 export function normalizeMachineTarget(raw: string): string | null {
   const normalized = nfc(raw);
@@ -60,9 +63,22 @@ export function normalizeMachineTarget(raw: string): string | null {
   return marker && isValidMachineName(marker[1]) ? nfc(marker[1]) : null;
 }
 
-/** True when an action-tool target is a bare ref_name or a complete marker. */
+/** True when an action-tool target is a bare identity or a complete marker. */
 export function isValidMachineTarget(raw: string): boolean {
   return normalizeMachineTarget(raw) !== null;
+}
+
+export type MachineTargetIdentity =
+  | { kind: 'node_id'; value: ControlledNodeId }
+  | { kind: 'legacy_ref_name'; value: string };
+
+/** Canonical grammar wins; a canonical target is never retried as a legacy alias. */
+export function classifyMachineTarget(raw: string): MachineTargetIdentity | null {
+  const value = normalizeMachineTarget(raw);
+  if (value === null) return null;
+  return isControlledNodeId(value)
+    ? { kind: 'node_id', value }
+    : { kind: 'legacy_ref_name', value };
 }
 
 /** Build the reference marker a composer surface inserts (marker only, never a value). */
@@ -98,7 +114,7 @@ export function buildMachineComposerReference(name: string, displayName?: string
 export const MACHINE_MARKER_REGEX = /\^\^\(([^()]*)\)/g;
 
 /**
- * Extract distinct valid machine `ref_name`s referenced by `^^(name)` markers,
+ * Extract distinct valid machine identities referenced by `^^(name)` markers,
  * in first-occurrence order. Invalid markers (spaces, inner `(`, empty, too long,
  * disallowed chars) are ignored and left literal.
  */
@@ -119,12 +135,15 @@ export function parseMachineMarkers(text: string): string[] {
 /** A machine as referenced in the composer resolution list. */
 export interface MachineRef {
   serverId: string;
+  /** Primary public identity. Optional only for rolling-compatibility fixtures. */
+  nodeId?: string;
+  /** Deprecated compatibility alias; never consulted for canonical-ID grammar. */
   refName: string;
   online: boolean;
 }
 
 /**
- * Out-of-band map carried with a sent message: marker `ref_name` → target
+ * Out-of-band map carried with a sent message: marker identity → target
  * `serverId`. Unknown/ambiguous names are omitted (marker stays literal/visible).
  * The receiver MUST treat this as a hint and re-validate each `serverId` against
  * the owner's controlled-machine list — it is never an authorization input.
@@ -133,7 +152,7 @@ export type SendMachineResolution = Record<string, string>;
 
 /**
  * Compute the compose-time machine resolution for `text` against `machines`.
- * Pure. A `ref_name` that matches exactly one machine maps to its `serverId`;
+ * Pure. An identity that matches exactly one machine maps to its `serverId`;
  * unknown or ambiguous names are skipped (left literal). The `^^(name)` marker
  * text is intentionally NOT expanded — it stays visible so the agent sees the
  * referenced machine.
@@ -148,15 +167,24 @@ export function buildResolvedMachines(
   const unresolved: string[] = [];
   if (names.length === 0) return { text, resolvedMachines, ambiguous, unresolved };
 
+  const byNodeId = new Map<string, string[]>();
   const byRef = new Map<string, string[]>();
   for (const m of machines) {
+    if (isControlledNodeId(m.nodeId)) {
+      const nodeIds = byNodeId.get(m.nodeId) ?? [];
+      nodeIds.push(m.serverId);
+      byNodeId.set(m.nodeId, nodeIds);
+    }
     const key = nfc(m.refName);
     const list = byRef.get(key) ?? [];
     list.push(m.serverId);
     byRef.set(key, list);
   }
   for (const name of names) {
-    const ids = byRef.get(name);
+    const target = classifyMachineTarget(name);
+    const ids = target?.kind === 'node_id'
+      ? byNodeId.get(target.value)
+      : byRef.get(name);
     if (!ids || ids.length === 0) unresolved.push(name);
     else if (ids.length > 1) ambiguous.push(name);
     else resolvedMachines[name] = ids[0];
@@ -164,44 +192,21 @@ export function buildResolvedMachines(
   return { text, resolvedMachines, ambiguous, unresolved };
 }
 
-// ── Server-derived identity (ref_name + display_name) ────────────────────────
+// ── Deprecated compatibility alias + mutable display name ───────────────────
 
 const CONTROL_BIDI_RE = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u;
 const CONTROL_BIDI_GLOBAL_RE = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu;
 
 /**
- * Normalize an owner-supplied render-only machine name. The stable `ref_name`
- * is deliberately not changed by rename operations, so existing `^^(name)`
- * references remain valid.
+ * Normalize an owner-supplied render-only machine name. A deprecated legacy
+ * `ref_name`, when present, is deliberately not changed by rename operations,
+ * so historical `^^(name)` references remain valid.
  */
 export function normalizeMachineDisplayName(raw: string): string | null {
   const normalized = nfc(raw).trim();
   if (!normalized || [...normalized].length > MACHINE_DISPLAY_NAME_MAX) return null;
   if (CONTROL_BIDI_RE.test(normalized)) return null;
   return normalized;
-}
-
-/** Sanitize an untrusted hostname to the `ref_name` allowlist (may be empty). */
-function slugifyHostname(hostname: string): string {
-  return nfc(hostname)
-    .toLowerCase()
-    .replace(/[^\p{L}\p{N}]+/gu, '-') // collapse runs of disallowed chars to '-'
-    .replace(/^-+|-+$/g, '')
-    .slice(0, MACHINE_REF_NAME_MAX - 8); // leave room for '-' + 6-char suffix
-}
-
-/**
- * Derive a unique, grammar-valid `ref_name` from an UNTRUSTED hostname plus a
- * short `serverId` suffix. Always returns a value matching MACHINE_NAME_PATTERN;
- * two machines with the same hostname get distinct keys via the suffix.
- */
-export function deriveRefName(hostname: string, serverId: string): string {
-  const suffix = nfc(serverId).replace(/[^\p{L}\p{N}]/gu, '').slice(0, 6) || 'node';
-  const base = slugifyHostname(hostname) || 'host';
-  const candidate = `${base}-${suffix}`.slice(0, MACHINE_REF_NAME_MAX);
-  // Guarantee validity even if slicing produced a trailing separator / empty base.
-  const cleaned = candidate.replace(/^[._-]+|[._-]+$/g, '') || `host-${suffix}`;
-  return MACHINE_NAME_PATTERN.test(cleaned) ? cleaned : `host-${suffix}`.slice(0, MACHINE_REF_NAME_MAX);
 }
 
 /** Derive a render-only display name from untrusted hostname/os (control/bidi stripped). */

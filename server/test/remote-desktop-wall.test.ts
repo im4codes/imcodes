@@ -11,9 +11,18 @@ import {
   RemoteDesktopWallConflictError,
   RemoteDesktopWallMutationError,
 } from '../src/services/remote-desktop-wall.js';
+import { CONTROLLED_NODE_ID_MIN } from '../../shared/controlled-node-identity.js';
 
 interface StoredWall { hostIds: string[]; revision: number; }
-interface HostFixture { hostId: string; serverId: string; accessible: boolean; }
+interface HostFixture {
+  hostId: string;
+  serverId: string;
+  accessible: boolean;
+  nodeRole?: 'controlled' | 'full';
+  nodeId?: string | null;
+  refName?: string | null;
+  displayName?: string | null;
+}
 const id = (value: number) => `00000000-0000-4000-8000-${String(value).padStart(12, '0')}`;
 
 function fakeDb(initial: StoredWall, fixtures: HostFixture[]): { db: Database; wall: StoredWall } {
@@ -33,13 +42,16 @@ function fakeDb(initial: StoredWall, fixtures: HostFixture[]): { db: Database; w
         return {
           host_id: fixture.hostId,
           server_id: fixture.serverId,
-          ref_name: fixture.serverId,
-          display_name: fixture.hostId,
+          node_id: fixture.nodeId === undefined
+            ? String(BigInt(CONTROLLED_NODE_ID_MIN) + BigInt(fixtures.indexOf(fixture)))
+            : fixture.nodeId,
+          ref_name: fixture.refName === undefined ? fixture.serverId : fixture.refName,
+          display_name: fixture.displayName === undefined ? fixture.hostId : fixture.displayName,
           status: 'online',
           last_heartbeat_at: Number(params[2]) - 100,
           exec_enabled: true,
           os: 'win',
-          node_role: 'controlled',
+          node_role: fixture.nodeRole ?? 'controlled',
           access_role: 'owner',
           controlled_capabilities: ['remote.desktop.windows.h264.v2'],
         } as T;
@@ -91,6 +103,25 @@ describe('remote desktop wall persistence', () => {
       hostIds: [id(1), id(101)],
     }, 20_000);
     expect(snapshot).toMatchObject({ revision: 4, hostIds: [id(1)] });
+  });
+
+  it('never substitutes an internal serverId into wall-visible identity fields', async () => {
+    const controlledNodeId = CONTROLLED_NODE_ID_MIN;
+    const fixture = fakeDb({ hostIds: [id(1), id(2)], revision: 1 }, [
+      {
+        hostId: id(1), serverId: 'controlled-routing-secret', accessible: true,
+        nodeId: controlledNodeId, refName: null, displayName: null,
+      },
+      {
+        hostId: id(2), serverId: 'full-routing-secret', accessible: true,
+        nodeRole: 'full', nodeId: null, refName: null, displayName: null,
+      },
+    ]);
+    const snapshot = await getRemoteDesktopWall(fixture.db, 'user-1', 25_000);
+    expect(snapshot.hosts.map(({ refName, displayName }) => ({ refName, displayName }))).toEqual([
+      { refName: '', displayName: controlledNodeId },
+      { refName: '', displayName: '—' },
+    ]);
   });
 
   it('makes authorization loss win by compacting the snapshot before stale mutation', async () => {

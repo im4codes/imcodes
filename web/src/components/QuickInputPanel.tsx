@@ -18,6 +18,7 @@ import type { WsClient } from '../ws-client.js';
 import type { MachineListItem } from '../api/machines.js';
 import type { JSX, RefObject } from 'preact';
 import { DEFAULT_QUICK_PHRASES, getDefaultQuickCommands } from '../quick-commands.js';
+import { MACHINE_IDENTITY_UNAVAILABLE } from '@shared/machine-reference.js';
 
 export interface QuickData {
   history: string[];                        // cross-session
@@ -409,8 +410,8 @@ interface Props {
   onInsertAlias?: (name: string) => void;
   /** Controlled nodes shown in the optional machine tab. */
   machines?: readonly MachineListItem[];
-  /** Insert a stable machine marker plus its human-readable display note. */
-  onInsertMachine?: (refName: string, displayName: string) => void;
+  /** Insert a canonical nodeId marker plus its human-readable display note. */
+  onInsertMachine?: (nodeId: string, displayName: string) => void;
   anchorRef?: RefObject<HTMLElement>;
 }
 
@@ -728,8 +729,8 @@ export function QuickInputPanel({
           )}
         </div>
 
-        {/* Controlled-node tab — display names are mutable, ref names are
-            stable. Connectivity is informational: an offline node can still
+        {/* Controlled-node tab — display names are mutable, canonical node IDs
+            are stable. Connectivity is informational: an offline node can still
             be referenced in a task and resolve once it reconnects. */}
         {activeTab === 'machines' && machines.length > 0 && (
           <div class="qp-machine-items" role="listbox" aria-label={t('quick_input.tab_machines')}>
@@ -739,16 +740,16 @@ export function QuickInputPanel({
                 key={machine.serverId}
                 type="button"
                 class={`qp-machine-item${machine.online ? '' : ' is-offline'}`}
-                disabled={!onInsertMachine}
+                disabled={!onInsertMachine || !machine.nodeId}
                 title={machine.online ? machine.displayName : t('machine.offline_hint')}
                 onClick={() => {
-                  onInsertMachine?.(machine.refName, machine.displayName);
+                  if (machine.nodeId) onInsertMachine?.(machine.nodeId, machine.displayName);
                   onClose();
                 }}
               >
                 <span class="qp-machine-item-main">
                   <strong>{machine.displayName}</strong>
-                  <code>^^({machine.refName})</code>
+                  <code>^^({machine.nodeId ?? MACHINE_IDENTITY_UNAVAILABLE})</code>
                 </span>
                 <span class={`qp-machine-status ${machine.online ? 'is-online' : 'is-offline'}`}>
                   {machine.online ? t('machine.online') : t('machine.offline')}

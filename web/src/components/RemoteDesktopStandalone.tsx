@@ -3,7 +3,8 @@ import { useTranslation } from 'react-i18next';
 import { listControllableMachines, type MachineListItem } from '../api/machines.js';
 import { dismissHtmlSplashForDirectEntry } from '../html-splash.js';
 import { RemoteDesktopConnectionManager } from '../remote-desktop-connection-manager.js';
-import { canOpenRemoteDesktop, RemoteDesktopPanel } from './RemoteDesktopPanel.js';
+import { canOpenRemoteDesktopMachine } from '../remote-desktop-profile.js';
+import { RemoteDesktopPanel } from './RemoteDesktopPanel.js';
 
 export function RemoteDesktopStandalone({ serverId }: { serverId: string }) {
   const { t } = useTranslation();
@@ -22,7 +23,7 @@ export function RemoteDesktopStandalone({ serverId }: { serverId: string }) {
       .then((machines) => {
         if (!active) return;
         const selected = machines.find((candidate) => candidate.serverId === serverId);
-        if (!selected || !canOpenRemoteDesktop(selected)) {
+        if (!selected || !canOpenRemoteDesktopMachine(selected)) {
           setFailed(true);
           return;
         }

@@ -11,6 +11,7 @@ import {
   formatInstallSuccess,
   isInstallerLaunch,
 } from '../../src/node/install-report.js';
+import { CONTROLLED_NODE_ID_MIN } from '../../shared/controlled-node-identity.js';
 
 describe('controlled-node install reporting', () => {
   it('treats a source outside the staged path as an installer launch on all three platforms', () => {
@@ -124,10 +125,11 @@ describe('controlled-node install reporting', () => {
 
   it('reports success with the name the machine will show in the web app', () => {
     const zh = formatInstallSuccess('zh-CN', {
-      displayName: 'MRBIG-PC', refName: 'mrbig_pc', serverUrl: 'https://im.zhinet.work',
+      displayName: 'MRBIG-PC', nodeId: CONTROLLED_NODE_ID_MIN, refName: 'mrbig_pc', serverUrl: 'https://im.zhinet.work',
     });
     expect(zh).toContain('注册成功');
     expect(zh).toContain('MRBIG-PC');
+    expect(zh).toContain(CONTROLLED_NODE_ID_MIN);
     expect(zh).toContain('https://im.zhinet.work');
 
     const en = formatInstallSuccess('en-US', { serverUrl: 'https://im.zhinet.work' });

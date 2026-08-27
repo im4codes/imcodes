@@ -31,7 +31,6 @@ vi.mock('../src/components/FloatingPanel.js', async () => {
 vi.mock('../src/components/RemoteDesktopPanel.js', async () => {
   const { h: createElement } = await import('preact');
   return {
-    canOpenRemoteDesktop: () => true,
     RemoteDesktopPanel: ({ active, machine }: {
       active: boolean;
       machine: { serverId: string };

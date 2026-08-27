@@ -210,15 +210,6 @@ function activeRemoteDesktopConnectionStep(
   }
 }
 
-export function canOpenRemoteDesktop(machine: MachineListItem): boolean {
-  const role = machine.accessRole ?? 'owner';
-  return machine.os === 'win'
-    && machine.online
-    && machine.execEnabled
-    && (role === 'owner' || role === 'participant')
-    && Boolean(machine.capabilities?.includes(REMOTE_DESKTOP_CAPABILITY));
-}
-
 export interface RemoteDesktopPanelProps {
   machine: MachineListItem;
   connectionManager?: RemoteDesktopConnectionManager;

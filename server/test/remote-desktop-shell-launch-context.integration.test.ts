@@ -21,6 +21,7 @@ import {
   getPrivacyState,
 } from '../src/services/remote-desktop-management-privacy.js';
 import { REMOTE_DESKTOP_PRESENTATION_SOURCE } from '../../shared/remote-desktop-access.js';
+import { generateControlledNodeId } from '../src/services/controlled-node-identity.js';
 
 const NOW = 1_700_000_000_000;
 let db: Database;
@@ -73,9 +74,9 @@ async function seedHostEndpoint(ownerUserId: string, hostId: string, serverId: s
   );
   await db.execute(
     `INSERT INTO servers
-       (id, user_id, name, token_hash, status, last_heartbeat_at, created_at, node_role)
-     VALUES ($1, $2, 'controlled shell test', $3, 'online', $4, $4, 'controlled')`,
-    [serverId, ownerUserId, createHash('sha256').update(serverId).digest('hex'), NOW],
+       (id, user_id, name, token_hash, status, last_heartbeat_at, created_at, node_role, node_id)
+     VALUES ($1, $2, 'controlled shell test', $3, 'online', $4, $4, 'controlled', $5)`,
+    [serverId, ownerUserId, createHash('sha256').update(serverId).digest('hex'), NOW, generateControlledNodeId()],
   );
   await db.execute(
     `INSERT INTO remote_desktop_host_endpoints

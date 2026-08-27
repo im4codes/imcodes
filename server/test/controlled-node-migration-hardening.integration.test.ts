@@ -17,6 +17,7 @@ import { createDatabase, type Database } from '../src/db/client.js';
 import { runMigrations } from '../src/db/migrate.js';
 import { createServer, createUser } from '../src/db/queries.js';
 import { NODE_ROLE } from '../../shared/remote-exec.js';
+import { generateControlledNodeId } from '../src/services/controlled-node-identity.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const migFile = (name: string) => join(__dirname, '..', 'src', 'db', 'migrations', name);
@@ -109,14 +110,14 @@ describe('058 controlled-node execution default', () => {
     const defaultedId = `ctl_default_${hex(6)}`;
     const disabledId = `ctl_disabled_${hex(6)}`;
     await db.execute(
-      `INSERT INTO servers (id, user_id, name, token_hash, status, created_at, node_role)
-       VALUES ($1, $2, 'default-enabled', $3, 'offline', $4, $5)`,
-      [defaultedId, userId, hex(16), Date.now(), NODE_ROLE.CONTROLLED],
+      `INSERT INTO servers (id, user_id, name, token_hash, status, created_at, node_role, node_id)
+       VALUES ($1, $2, 'default-enabled', $3, 'offline', $4, $5, $6)`,
+      [defaultedId, userId, hex(16), Date.now(), NODE_ROLE.CONTROLLED, generateControlledNodeId()],
     );
     await db.execute(
-      `INSERT INTO servers (id, user_id, name, token_hash, status, created_at, node_role, exec_enabled)
-       VALUES ($1, $2, 'explicitly-disabled', $3, 'offline', $4, $5, false)`,
-      [disabledId, userId, hex(16), Date.now(), NODE_ROLE.CONTROLLED],
+      `INSERT INTO servers (id, user_id, name, token_hash, status, created_at, node_role, exec_enabled, node_id)
+       VALUES ($1, $2, 'explicitly-disabled', $3, 'offline', $4, $5, false, $6)`,
+      [disabledId, userId, hex(16), Date.now(), NODE_ROLE.CONTROLLED, generateControlledNodeId()],
     );
 
     const sql = await readFile(migFile(MIGRATION_058), 'utf8');

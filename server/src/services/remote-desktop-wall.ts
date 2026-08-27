@@ -7,10 +7,13 @@ import {
 import { NODE_ROLE, MACHINE_PRESENCE_STALENESS_MS, type MachineAccessRole } from '../../../shared/remote-exec.js';
 import { validateControlledNodeCapabilities, type ControlledNodeCapability } from '../../../shared/controlled-node-capabilities.js';
 import type { Database } from '../db/client.js';
+import { isControlledNodeId } from '../../../shared/controlled-node-identity.js';
+import { MACHINE_IDENTITY_UNAVAILABLE } from '../../../shared/machine-reference.js';
 
 export interface RemoteDesktopWallHost {
   hostId: string;
   serverId: string;
+  nodeId?: string;
   refName: string;
   displayName: string;
   online: boolean;
@@ -31,6 +34,8 @@ interface WallRow { host_ids: unknown; revision: number; }
 interface HostRow {
   host_id: string;
   server_id: string;
+  node_id: string | null;
+  node_role: string | null;
   ref_name: string | null;
   display_name: string | null;
   status: string | null;
@@ -64,7 +69,7 @@ async function resolveHost(
   now: number,
 ): Promise<RemoteDesktopWallHost | null> {
   const row = await db.queryOne<HostRow>(
-    `SELECT h.id AS host_id, endpoint.server_id, s.ref_name, s.display_name,
+    `SELECT h.id AS host_id, endpoint.server_id, s.node_id, s.ref_name, s.display_name,
             s.status, s.last_heartbeat_at, s.exec_enabled, s.os, s.node_role,
             s.controlled_capabilities,
             CASE WHEN s.user_id = $1 THEN 'owner' ELSE sh.role END AS access_role
@@ -86,13 +91,15 @@ async function resolveHost(
       LIMIT 1`,
     [userId, identity, now, NODE_ROLE.CONTROLLED],
   );
-  if (!row) return null;
+  if (!row || (row.node_role === NODE_ROLE.CONTROLLED && !isControlledNodeId(row.node_id))) return null;
   const capabilities = validateControlledNodeCapabilities(row.controlled_capabilities);
   return {
     hostId: row.host_id,
     serverId: row.server_id,
-    refName: row.ref_name ?? row.server_id,
-    displayName: row.display_name ?? row.ref_name ?? row.server_id,
+    ...(isControlledNodeId(row.node_id) ? { nodeId: row.node_id } : {}),
+    refName: row.ref_name ?? '',
+    displayName: row.display_name
+      ?? (isControlledNodeId(row.node_id) ? row.node_id : MACHINE_IDENTITY_UNAVAILABLE),
     online: row.status === 'online'
       && typeof row.last_heartbeat_at === 'number'
       && now - row.last_heartbeat_at < MACHINE_PRESENCE_STALENESS_MS,

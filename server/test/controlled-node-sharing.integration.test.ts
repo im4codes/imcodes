@@ -13,6 +13,7 @@ import { signJwt } from '../src/security/crypto.js';
 import { COOKIE_SESSION } from '../../shared/cookie-names.js';
 import { NODE_ROLE } from '../../shared/remote-exec.js';
 import { REMOTE_DESKTOP_CAPABILITY } from '../../shared/remote-desktop.js';
+import { generateControlledNodeId } from '../src/services/controlled-node-identity.js';
 
 const JWT_KEY = 'controlled-machine-sharing-test-key';
 const hex = (bytes: number) => randomBytes(bytes).toString('hex');
@@ -53,9 +54,9 @@ async function controlledNode(userId: string) {
   await db.execute(
     `INSERT INTO servers
        (id, user_id, name, token_hash, status, created_at, node_role,
-        exec_enabled, ref_name, display_name, os)
-     VALUES ($1,$2,'controlled',$3,'online',$4,$5,true,$6,'Shared machine','linux')`,
-    [serverId, userId, sha256(hex(16)), Date.now(), NODE_ROLE.CONTROLLED, `ref-${hex(4)}`],
+        exec_enabled, ref_name, display_name, os, node_id)
+     VALUES ($1,$2,'controlled',$3,'online',$4,$5,true,$6,'Shared machine','linux',$7)`,
+    [serverId, userId, sha256(hex(16)), Date.now(), NODE_ROLE.CONTROLLED, `ref-${hex(4)}`, generateControlledNodeId()],
   );
   return serverId;
 }

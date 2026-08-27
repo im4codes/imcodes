@@ -264,14 +264,14 @@ export function computerUseDocs(topic: ComputerUseDocTopic): string {
       return [
         'Computer Use controls GUI apps either on the current full imcodes daemon host (machine=local) or on a controlled machine through a typed helper running in the active user desktop session.',
         'The agent never receives shell access for this surface: call computer_use_call with one named tool and JSON arguments.',
-        'Target controlled machines accept either their stable ref_name or the complete ^^(ref_name) marker. When the message already contains a marker, pass either form without calling list_machines first; use list_machines only for discovery or an explicit status request. On full imcodes daemons, machine=local/localhost/self/this controls the daemon host directly. Results are bounded text/image MCP-style content.',
+        'Target controlled machines use their canonical 10-digit nodeId or complete ^^(nodeId) marker. A deprecated noncanonical legacy ref_name remains accepted only for migration compatibility. When the message already contains a marker, pass either form without calling list_machines first; use list_machines only for discovery or an explicit status request. On full imcodes daemons, machine=local/localhost/self/this controls the daemon host directly. Results are bounded text/image MCP-style content.',
         'When the user asks to use a browser on the daemon host, call computer_use_call with machine=local and the built-in CDP-backed browser_* tools; do not probe for or install a separate Playwright runtime through a shell.',
         'Open Computer Use (OCU) supplies the integrated cross-platform desktop-app control path; browser_* is IM.codes\' separate CDP implementation and should be preferred over coordinate GUI control for web pages.',
       ].join('\n');
     case 'workflow':
       return [
         'Recommended workflow:',
-        '1. Use machine=local/localhost/self/this for this daemon host. For a controlled node, pass either a known stable ref_name or the complete ^^(ref_name) marker directly; call list_machines only when no exact target is available or the user asks for status.',
+        '1. Use machine=local/localhost/self/this for this daemon host. For a controlled node, pass its canonical 10-digit nodeId or complete ^^(nodeId) marker directly; a deprecated noncanonical legacy ref_name is compatibility-only. Call list_machines only when no exact target is available or the user asks for status.',
         '2. computer_use_docs for the relevant topic/tool details only.',
         '3. computer_use_call tool=list_apps to discover app ids.',
         '4. For element/index actions, call computer_use_call tool=get_app_state first to discover stable element indexes; pure coordinate click can use the fast path directly when the target is known.',

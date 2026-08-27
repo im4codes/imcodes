@@ -128,6 +128,8 @@ export interface RemoteExecResult {
 /** A controllable machine as surfaced to the source agent (list_machines). */
 export interface MachineSummary {
   serverId: string;
+  /** Canonical public identity. Present for every controlled-node projection. */
+  nodeId?: string;
   name: string;
   os?: EnrollmentOs;
   online: boolean;
@@ -217,6 +219,7 @@ export interface EnrollRedeemV2Request {
 /** Server response for D-A v2 — MUST NOT include a recoverable raw token. */
 export interface EnrollRedeemV2Response {
   serverId: string;
+  nodeId: string;
   nodeRole: typeof NODE_ROLE.CONTROLLED;
   refName?: string;
   displayName?: string;

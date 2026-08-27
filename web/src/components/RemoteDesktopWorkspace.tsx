@@ -14,9 +14,11 @@ import {
   type RemoteDesktopWorkspaceState,
   type RemoteDesktopWorkspaceTabId,
 } from '../remote-desktop-workspace-state.js';
+import { canOpenRemoteDesktopMachine } from '../remote-desktop-profile.js';
 import { FloatingPanel } from './FloatingPanel.js';
-import { canOpenRemoteDesktop, RemoteDesktopPanel } from './RemoteDesktopPanel.js';
+import { RemoteDesktopPanel } from './RemoteDesktopPanel.js';
 import './remote-desktop-workspace.css';
+import { MACHINE_IDENTITY_UNAVAILABLE } from '@shared/machine-reference.js';
 
 export interface RemoteDesktopWorkspaceProps {
   state: RemoteDesktopWorkspaceState;
@@ -63,7 +65,7 @@ export function RemoteDesktopWorkspace({
     let active = true;
     setPickerError(false);
     void listControllableMachines().then((machines) => {
-      if (active) setPickerMachines(machines.filter(canOpenRemoteDesktop));
+      if (active) setPickerMachines(machines.filter(canOpenRemoteDesktopMachine));
     }).catch(() => {
       if (active) setPickerError(true);
     });
@@ -204,7 +206,7 @@ export function RemoteDesktopWorkspace({
               onClick={() => selectHost(machine)}
             >
               <strong>{machine.displayName}</strong>
-              <span>{machine.refName}</span>
+              <span>{machine.nodeId ?? MACHINE_IDENTITY_UNAVAILABLE}</span>
             </button>
           ))}
           {hosts.length >= REMOTE_DESKTOP_WORKSPACE_MAX_HOSTS && (

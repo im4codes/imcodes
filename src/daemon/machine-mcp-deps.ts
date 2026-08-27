@@ -3,7 +3,8 @@
 // daemon's own bound credential (~/.imcodes/server.json) using the source-side
 // machine-exec-client. Name→serverId resolution is FAIL-CLOSED: an unknown,
 // ambiguous or exec-disabled target returns a typed shared MCP error. DB-backed
-// `online` is advisory and MUST NOT block dispatch; each target route performs
+// Canonical nodeId resolves first; deprecated noncanonical ref_name resolution
+// remains explicit and ambiguity-fail-closed. `online` is advisory and MUST NOT block dispatch; each target route performs
 // the authoritative live-socket check. All I/O is injectable so the resolution
 // logic is unit-testable without disk or network.
 import { randomBytes } from 'node:crypto';
@@ -19,6 +20,8 @@ import { computerUseCall as clientComputerUseCall } from './computer-use-client.
 import { fetchFileFromMachine as clientFetchFileFromMachine, sendFileToMachine as clientSendFileToMachine } from './machine-file-client.js';
 import { runComputerUseTool } from '../node/computer-use-runner.js';
 import type { ComputerUseToolResult, MachineFileToolResult, MachineToolDeps, MachineSummaryForTool, MachineExecToolResult } from './memory-mcp-tools.js';
+import { classifyMachineTarget } from '../../shared/machine-reference.js';
+import type { MachineListItem } from './machine-exec-client.js';
 
 export interface DaemonCredential {
   serverUrl: string;
@@ -55,6 +58,14 @@ function isLocalComputerUseTarget(machine: string, creds: DaemonCredential | nul
   return LOCAL_COMPUTER_USE_ALIASES.has(normalized) || Boolean(creds?.serverId && machine === creds.serverId);
 }
 
+function matchingMachines(all: readonly MachineListItem[], machine: string): MachineListItem[] {
+  const target = classifyMachineTarget(machine);
+  if (!target) return [];
+  return target.kind === 'node_id'
+    ? all.filter((candidate) => candidate.nodeId === target.value)
+    : all.filter((candidate) => candidate.refName === target.value);
+}
+
 async function defaultLocalComputerUseCall(input: { tool: Parameters<NonNullable<MachineToolDeps['computerUseCall']>>[0]['tool']; arguments?: Record<string, unknown>; timeoutMs?: number; signal?: AbortSignal }): Promise<ComputerUseToolResult> {
   if (input.signal?.aborted) return { outcome: 'not_dispatched', reason: MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, error: 'computer use call aborted' };
   const result = await runComputerUseTool({
@@ -77,7 +88,7 @@ export function createDaemonMachineToolDeps(overrides: DaemonMachineToolDepsOver
   const localComputerUse = overrides.localComputerUseCall ?? defaultLocalComputerUseCall;
 
   const toSummary = (m: Awaited<ReturnType<typeof clientListMachines>>[number]): MachineSummaryForTool => ({
-    name: m.refName,
+    name: m.nodeId,
     displayName: m.displayName,
     ...(m.os ? { os: m.os } : {}),
     online: m.online,
@@ -102,7 +113,7 @@ export function createDaemonMachineToolDeps(overrides: DaemonMachineToolDepsOver
         : MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE;
       return { ok: false, result: { ok: false, reason, error: 'machine control plane unavailable' } };
     }
-    const matches = all.filter((candidate) => candidate.refName === machine);
+    const matches = matchingMachines(all, machine);
     if (matches.length === 0) return { ok: false, result: { ok: false, reason: MCP_ERROR_REASONS.MACHINE_NOT_FOUND, error: `no controllable machine named "${machine}"` } };
     if (matches.length > 1) return { ok: false, result: { ok: false, reason: MCP_ERROR_REASONS.MACHINE_AMBIGUOUS, error: `more than one machine named "${machine}"` } };
     const target = matches[0]!;
@@ -155,7 +166,7 @@ export function createDaemonMachineToolDeps(overrides: DaemonMachineToolDepsOver
     async execRemote({ machine, command, shell, timeoutMs, signal, onOutput }): Promise<MachineExecToolResult> {
       const creds = await load();
       if (!creds) return { outcome: 'not_dispatched', reason: MCP_ERROR_REASONS.FEATURE_DISABLED, error: 'daemon is not bound to a server' };
-      // Resolve the ref_name against the FULL machine list (offline included) so
+      // Resolve the canonical nodeId or deprecated alias against the FULL list so
       // "unknown" is distinguished from "offline". A control-plane failure here
       // must surface as CONTROL_PLANE_UNAVAILABLE, never as MACHINE_NOT_FOUND.
       let all: Awaited<ReturnType<typeof list>>;
@@ -168,7 +179,7 @@ export function createDaemonMachineToolDeps(overrides: DaemonMachineToolDepsOver
         }
         throw err;
       }
-      const matches = all.filter((m) => m.refName === machine);
+      const matches = matchingMachines(all, machine);
       if (matches.length === 0) return { outcome: 'not_dispatched', reason: MCP_ERROR_REASONS.MACHINE_NOT_FOUND, error: `no controllable machine named "${machine}"` };
       if (matches.length > 1) return { outcome: 'not_dispatched', reason: MCP_ERROR_REASONS.MACHINE_AMBIGUOUS, error: `more than one machine named "${machine}"` };
       const target = matches[0]!;
@@ -245,7 +256,7 @@ export function createDaemonMachineToolDeps(overrides: DaemonMachineToolDepsOver
         }
         throw err;
       }
-      const matches = all.filter((m) => m.refName === machine);
+      const matches = matchingMachines(all, machine);
       if (matches.length === 0) return { outcome: 'not_dispatched', reason: MCP_ERROR_REASONS.MACHINE_NOT_FOUND, error: `no controllable machine named "${machine}"` };
       if (matches.length > 1) return { outcome: 'not_dispatched', reason: MCP_ERROR_REASONS.MACHINE_AMBIGUOUS, error: `more than one machine named "${machine}"` };
       const target = matches[0]!;

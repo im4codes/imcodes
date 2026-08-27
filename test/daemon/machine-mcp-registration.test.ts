@@ -7,6 +7,7 @@ import type { McpRuntimeCaller } from '../../src/daemon/memory-mcp-caller.js';
 import { MEMORY_MCP_TOOL_CONTRACTS, MEMORY_MCP_TOOL_NAMES } from '../../shared/memory-mcp-contracts.js';
 import { MACHINE_LIST_MAX_ITEMS, NODE_ROLE, REMOTE_EXEC_MAX_COMMAND_BYTES } from '../../shared/remote-exec.js';
 import { FILE_TRANSFER_LIMITS } from '../../shared/transport/file-transfer.js';
+import { CONTROLLED_NODE_ID_MIN } from '../../shared/controlled-node-identity.js';
 
 // Machine tool handlers never touch the runtime caller; a bare stub is enough.
 const stubCaller = {} as unknown as McpRuntimeCaller;
@@ -21,7 +22,7 @@ async function connect(machineDeps: MachineToolDeps): Promise<Client> {
 }
 
 const okDeps: MachineToolDeps = {
-  listMachines: () => [{ name: 'win-1', displayName: 'Win Box', os: 'win', online: true, execEnabled: true, role: NODE_ROLE.CONTROLLED }],
+  listMachines: () => [{ name: CONTROLLED_NODE_ID_MIN, displayName: 'Win Box', os: 'win', online: true, execEnabled: true, role: NODE_ROLE.CONTROLLED }],
   execRemote: () => ({ outcome: 'completed', ok: true, exitCode: 7, stdout: 'ok', stderr: '', timedOut: false, truncated: false, durationMs: 3 }),
   sendFileToMachine: () => ({ ok: true, remotePath: '/var/lib/imcodes/uploads/a.txt', attachmentId: 'a'.repeat(32), size: 5, transport: 'direct' }),
   fetchFileFromMachine: ({ destinationPath }) => ({ ok: true, destinationPath, attachmentId: 'b'.repeat(32), size: 7, transport: 'relay' }),
@@ -354,7 +355,7 @@ describe('machine MCP tools — in-process discovery + call parity', () => {
     const res = await client.callTool({ name: MEMORY_MCP_TOOL_NAMES.LIST_MACHINES, arguments: {} });
     expect(res.isError).toBeFalsy();
     const machines = (res.structuredContent as { machines: Array<Record<string, unknown>> }).machines;
-    expect(machines[0]).toMatchObject({ name: 'win-1', role: 'controlled', os: 'win', online: true });
+    expect(machines[0]).toMatchObject({ name: CONTROLLED_NODE_ID_MIN, role: 'controlled', os: 'win', online: true });
     await client.close();
   });
 

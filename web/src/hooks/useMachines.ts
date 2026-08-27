@@ -23,7 +23,7 @@ const machineResource = createSharedResource<MachineListItem[]>({
 
 function matchesQuery(m: MachineListItem, needle: string): boolean {
   if (!needle) return true;
-  const haystack = `${nfc(m.refName)}\n${nfc(m.displayName)}`;
+  const haystack = `${nfc(m.nodeId ?? '')}\n${nfc(m.refName)}\n${nfc(m.displayName)}`;
   return haystack.includes(needle);
 }
 

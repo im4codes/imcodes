@@ -11,8 +11,15 @@ import { act, render, cleanup, fireEvent, waitFor } from '@testing-library/preac
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { ControlledNodeAvailability, MachineListItem } from '../src/api/machines.js';
 import { REMOTE_DESKTOP_CAPABILITY } from '@shared/remote-desktop.js';
+import { CONTROLLED_NODE_ID_MIN } from '@shared/controlled-node-identity.js';
 import { CONTROLLED_NODE_AUTO_UNLOCK_CAPABILITY } from '@shared/controlled-node-auto-unlock.js';
 import { REMOTE_DESKTOP_INSTALLABLE_CAPABILITY } from '@shared/remote-desktop-install.js';
+import { REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY } from '@shared/remote-desktop-access.js';
+import {
+  REMOTE_DESKTOP_ENCODER_CAPABILITY,
+  REMOTE_DESKTOP_PLATFORM_CAPABILITY,
+  REMOTE_DESKTOP_SESSION_CAPABILITY,
+} from '@shared/remote-desktop-platform.js';
 
 const translate = (key: string, options?: Record<string, string>) =>
   key === 'controlled_nodes.artifact_meta' && options?.detail ? options.detail : key;
@@ -129,7 +136,7 @@ afterEach(() => {
   refetch.mockResolvedValue(null);
 });
 
-const machine = (over: Partial<MachineListItem>): MachineListItem => ({ serverId: 's', refName: 'r', displayName: 'D', online: true, execEnabled: false, ...over });
+const machine = (over: Partial<MachineListItem>): MachineListItem => ({ serverId: 's', nodeId: CONTROLLED_NODE_ID_MIN, refName: 'r', displayName: 'D', online: true, execEnabled: false, ...over });
 
 function rejectRefreshAfterInitialLoad(): void {
   refetch
@@ -231,8 +238,8 @@ describe('ControlledNodesPanel (12.3)', () => {
 
     expect(container.querySelector('.controlled-nodes-hero')).toBeTruthy();
     expect(Array.from(container.querySelectorAll('.controlled-nodes-metric strong')).map((node) => node.textContent)).toEqual(['2', '1', '1']);
-    expect(container.querySelector('.controlled-nodes-machine-row.is-online code')?.textContent).toBe('win-edge');
-    expect(container.querySelector('.controlled-nodes-machine-row.is-offline code')?.textContent).toBe('linux-edge');
+    expect(container.querySelector('.controlled-nodes-machine-row.is-online code')?.textContent).toBe(CONTROLLED_NODE_ID_MIN);
+    expect(container.querySelector('.controlled-nodes-machine-row.is-offline code')?.textContent).toBe(CONTROLLED_NODE_ID_MIN);
     expect(container.querySelector('.controlled-nodes-exec-toggle.is-enabled')?.getAttribute('aria-pressed')).toBe('true');
   });
 
@@ -260,25 +267,39 @@ describe('ControlledNodesPanel (12.3)', () => {
     expect(rows[2]?.textContent).toContain('controlled_nodes.version_unknown');
   });
 
-  it('offers auto unlock only on a node whose worker can hold the secret', async () => {
+  it('offers auto unlock only from explicit capability evidence, never OS metadata', async () => {
     machines = [
       machine({
-        serverId: 'win-capable',
+        serverId: 'capable-contradictory-os',
         refName: 'w1',
-        displayName: 'Windows box',
-        os: 'win',
+        displayName: 'Capability says yes',
+        os: 'linux',
         capabilities: [REMOTE_DESKTOP_CAPABILITY, CONTROLLED_NODE_AUTO_UNLOCK_CAPABILITY],
       }),
-      // Same OS, older build: no advertisement, so no promise of the feature.
-      machine({ serverId: 'win-old', refName: 'w2', displayName: 'Old Windows', os: 'win', capabilities: [REMOTE_DESKTOP_CAPABILITY] }),
-      machine({ serverId: 'linux', refName: 'l1', displayName: 'Linux box', os: 'linux' }),
+      machine({
+        serverId: 'capable-no-os',
+        refName: 'w2',
+        displayName: 'Capability without metadata',
+        os: undefined,
+        capabilities: [REMOTE_DESKTOP_CAPABILITY, CONTROLLED_NODE_AUTO_UNLOCK_CAPABILITY],
+      }),
+      // A Windows label is descriptive and cannot synthesize authority.
+      machine({ serverId: 'win-old', refName: 'w3', displayName: 'Old Windows', os: 'win', capabilities: [REMOTE_DESKTOP_CAPABILITY] }),
+      machine({
+        serverId: 'shared-capable',
+        refName: 'w4',
+        displayName: 'Shared capable',
+        os: 'win',
+        accessRole: 'participant',
+        capabilities: [CONTROLLED_NODE_AUTO_UNLOCK_CAPABILITY],
+      }),
     ];
     const { container } = render(<ControlledNodesPanel />);
-    await waitFor(() => expect(container.textContent).toContain('Windows box'));
+    await waitFor(() => expect(container.textContent).toContain('Capability says yes'));
 
     const rows = Array.from(container.querySelectorAll('.controlled-nodes-machine-row'));
     expect(rows.map((row) => Boolean(row.querySelector('.controlled-nodes-auto-unlock'))))
-      .toEqual([true, false, false]);
+      .toEqual([true, true, false, false]);
   });
 
   it('offers one download button per canonical (os, arch) artifact', async () => {
@@ -630,7 +651,7 @@ describe('ControlledNodesPanel (12.3)', () => {
     expect(container.textContent).toContain('controlled_nodes.exec_on');
   });
 
-  it('shows Remote Desktop only for an operable Windows Owner or Participant with the exact capability', async () => {
+  it('shows Remote Desktop only for an operable Owner or Participant with a resolved profile', async () => {
     machines = [
       machine({ serverId: 'owner-ready', displayName: 'Owner Ready', os: 'win', accessRole: 'owner', execEnabled: true, capabilities: [REMOTE_DESKTOP_CAPABILITY] }),
       machine({ serverId: 'participant-ready', displayName: 'Participant Ready', os: 'win', accessRole: 'participant', execEnabled: true, capabilities: [REMOTE_DESKTOP_CAPABILITY] }),
@@ -638,7 +659,7 @@ describe('ControlledNodesPanel (12.3)', () => {
       machine({ serverId: 'disabled', displayName: 'Disabled', os: 'win', accessRole: 'owner', execEnabled: false, capabilities: [REMOTE_DESKTOP_CAPABILITY] }),
       machine({ serverId: 'offline', displayName: 'Offline', os: 'win', accessRole: 'owner', online: false, execEnabled: true, capabilities: [REMOTE_DESKTOP_CAPABILITY] }),
       machine({ serverId: 'old-node', displayName: 'Old Node', os: 'win', accessRole: 'owner', execEnabled: true }),
-      machine({ serverId: 'linux', displayName: 'Linux', os: 'linux', accessRole: 'owner', execEnabled: true, capabilities: [REMOTE_DESKTOP_CAPABILITY] }),
+      machine({ serverId: 'incomplete', displayName: 'Incomplete', os: 'win', accessRole: 'owner', execEnabled: true, capabilities: [REMOTE_DESKTOP_SESSION_CAPABILITY] }),
     ];
     const { container } = render(<ControlledNodesPanel />);
     await waitFor(() => expect(container.textContent).toContain('Owner Ready'));
@@ -649,12 +670,13 @@ describe('ControlledNodesPanel (12.3)', () => {
     expect(buttons[1]?.closest('li')?.textContent).toContain('Participant Ready');
   });
 
-  it('offers quick worker installation only for an online supported Owner node', async () => {
+  it('offers worker installation from explicit capability evidence, never OS metadata', async () => {
     machines = [
       machine({ serverId: 'missing', displayName: 'Missing Worker', os: 'win', accessRole: 'owner', online: true, capabilities: [REMOTE_DESKTOP_INSTALLABLE_CAPABILITY] }),
+      machine({ serverId: 'metadata-linux', displayName: 'Metadata Linux', os: 'linux', accessRole: 'owner', online: true, capabilities: [REMOTE_DESKTOP_INSTALLABLE_CAPABILITY] }),
+      machine({ serverId: 'metadata-only', displayName: 'Windows Without Evidence', os: 'win', accessRole: 'owner', online: true, capabilities: [] }),
       machine({ serverId: 'viewer', displayName: 'Shared Viewer', os: 'win', accessRole: 'viewer', online: true, capabilities: [REMOTE_DESKTOP_INSTALLABLE_CAPABILITY] }),
       machine({ serverId: 'offline', displayName: 'Offline Win', os: 'win', accessRole: 'owner', online: false, capabilities: [REMOTE_DESKTOP_INSTALLABLE_CAPABILITY] }),
-      machine({ serverId: 'linux', displayName: 'Linux', os: 'linux', accessRole: 'owner', online: true, capabilities: [REMOTE_DESKTOP_INSTALLABLE_CAPABILITY] }),
       machine({ serverId: 'already-ready', displayName: 'Already Ready', os: 'win', accessRole: 'owner', online: true, capabilities: [REMOTE_DESKTOP_INSTALLABLE_CAPABILITY, REMOTE_DESKTOP_CAPABILITY] }),
       machine({ serverId: 'updating', displayName: 'Updating', os: 'win', accessRole: 'owner', online: true, updateAvailable: true, capabilities: [REMOTE_DESKTOP_INSTALLABLE_CAPABILITY] }),
     ];
@@ -665,8 +687,13 @@ describe('ControlledNodesPanel (12.3)', () => {
       return candidate;
     });
 
-    expect(container.querySelectorAll('.controlled-nodes-install-worker')).toHaveLength(1);
+    const installButtons = container.querySelectorAll('.controlled-nodes-install-worker');
+    expect(installButtons).toHaveLength(2);
     expect(button.closest('li')?.textContent).toContain('Missing Worker');
+    expect(installButtons[1]?.closest('li')?.textContent).toContain('Metadata Linux');
+    expect(container.textContent).toContain('Windows Without Evidence');
+    expect(installButtons[0]?.closest('li')?.textContent).not.toContain('Windows Without Evidence');
+    expect(installButtons[1]?.closest('li')?.textContent).not.toContain('Windows Without Evidence');
     expect(button.textContent).toBe('remote_desktop.install_worker');
     fireEvent.click(button);
     await waitFor(() => expect(installMachineRemoteDesktopWorker).toHaveBeenCalledWith('missing'));
@@ -717,6 +744,47 @@ describe('ControlledNodesPanel (12.3)', () => {
       displayName: 'Desktop Ready',
     }));
     expect(container.querySelector('.remote-desktop-panel')).toBeNull();
+  });
+
+  it('explains macOS Screen Recording readiness from capabilities without trusting OS metadata', async () => {
+    machines = [
+      machine({
+        serverId: 'mac-capture-missing',
+        refName: 'mac-capture-missing',
+        displayName: 'Capture Missing',
+        // Deliberately contradictory descriptive metadata: readiness must come
+        // from the advertised profile, not this field.
+        os: 'win',
+        online: true,
+        execEnabled: true,
+        capabilities: [
+          REMOTE_DESKTOP_SESSION_CAPABILITY,
+          REMOTE_DESKTOP_PLATFORM_CAPABILITY.MACOS,
+          REMOTE_DESKTOP_ENCODER_CAPABILITY.H264,
+          REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY,
+        ],
+      }),
+      machine({
+        serverId: 'legacy-on-mac-metadata',
+        refName: 'legacy-on-mac-metadata',
+        displayName: 'Legacy Ready',
+        os: 'mac',
+        online: true,
+        execEnabled: true,
+        capabilities: [REMOTE_DESKTOP_CAPABILITY],
+      }),
+    ];
+    const { container } = render(<ControlledNodesPanel onOpenRemoteDesktop={vi.fn()} />);
+    await waitFor(() => expect(container.textContent).toContain('Capture Missing'));
+
+    const rows = [...container.querySelectorAll('.controlled-nodes-machine-row')];
+    const missing = rows.find((row) => row.textContent?.includes('Capture Missing'))!;
+    const legacy = rows.find((row) => row.textContent?.includes('Legacy Ready'))!;
+    expect(missing.querySelector('[data-readiness="screen_recording_required"]')).not.toBeNull();
+    expect(missing.textContent).toContain('remote_desktop.macos_screen_recording_guidance');
+    expect(missing.querySelector('.controlled-nodes-remote-desktop')).toBeNull();
+    expect(legacy.querySelector('.remote-desktop-readiness')).toBeNull();
+    expect(legacy.querySelector('.controlled-nodes-remote-desktop')).not.toBeNull();
   });
 
   it('keeps one Share entry and opens Owner invitations inside that dialog without connecting', async () => {
@@ -776,7 +844,7 @@ describe('ControlledNodesPanel (12.3)', () => {
 
     await waitFor(() => expect(renameMachine).toHaveBeenCalledWith('srv-rename', 'New display name'));
     expect(refetch).toHaveBeenCalled();
-    expect(container.textContent).toContain('stable-ref');
+    expect(container.textContent).toContain(CONTROLLED_NODE_ID_MIN);
   });
 
   it('does not report a successful rename as failed when its refresh fails', async () => {

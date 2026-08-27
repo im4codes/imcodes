@@ -690,6 +690,27 @@ describe('memory MCP tool schema firewall', () => {
     expect(cronList).toHaveBeenCalled();
   });
 
+  it('keeps self out of send_list_targets while returning only the bound caller from session_runtime_identity_get', async () => {
+    const self = sessionRecord({
+      sessionInstanceId: 'self-instance', runtimeEpoch: 'self-epoch', activeModel: 'gpt-5.6', requestedModel: 'gpt-5.6', runtimeType: 'transport', providerId: 'codex',
+    });
+    const peer = sessionRecord({ name: 'deck_proj_w1', role: 'w1', sessionInstanceId: 'peer-instance', runtimeEpoch: 'peer-epoch', activeModel: 'opus[1M]', agentType: 'claude-code-sdk', runtimeType: 'transport', providerId: 'claude', userCreated: true });
+    const handlers = createMemoryMcpToolHandlers(caller(), { sendDeps: { listSessions: () => [self, peer] } });
+    const targets = await handlers[MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS]({});
+    expect(targets).toMatchObject({ status: 'ok', items: [expect.objectContaining({ target: 'deck_proj_w1' })] });
+    expect((targets as { items: Array<{ target: string }> }).items.some((item) => item.target === 'deck_proj_brain')).toBe(false);
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.SESSION_RUNTIME_IDENTITY_GET]({})).resolves.toMatchObject({
+      status: 'ok',
+      identity: {
+        sessionName: 'deck_proj_brain', sessionInstanceId: 'self-instance', runtimeEpoch: 'self-epoch',
+        agentType: 'codex-sdk', runtimeType: 'transport', providerFamily: 'openai',
+        normalizedModelId: 'gpt-5.6', effectiveModelId: 'gpt-5.6', modelMetadataState: 'known',
+        modelMetadataSource: 'active_model', modelMetadataConfidence: 'daemon_observed',
+      },
+    });
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.SESSION_RUNTIME_IDENTITY_GET]({ sessionName: 'deck_proj_w1', model: 'opus' })).resolves.toMatchObject({ status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED });
+  });
+
   it('does not forward forged cron identity fields to the cron client', async () => {
     const cronCreate = vi.fn(async () => ({ status: 'ok', body: { id: 'job-1' } }));
     const handlers = createMemoryMcpToolHandlers(caller(), {

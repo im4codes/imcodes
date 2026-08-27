@@ -26,12 +26,13 @@ describe('computer use protocol', () => {
     expect(computerUseDocs('browser')).toContain('Chrome DevTools Protocol');
   });
 
-  it('uses known machine refs directly instead of prescribing list_machines preflight', () => {
+  it('presents canonical nodeId as primary without prescribing list_machines preflight', () => {
     const overview = computerUseDocs('overview');
     const workflow = computerUseDocs('workflow');
     expect(overview).toContain('pass either form without calling list_machines first');
-    expect(workflow).toContain('pass either a known stable ref_name');
-    expect(workflow).toContain('call list_machines only when no exact target is available');
+    expect(workflow).toContain('pass its canonical 10-digit nodeId');
+    expect(workflow).toContain('deprecated noncanonical legacy ref_name is compatibility-only');
+    expect(workflow).toMatch(/call list_machines only when no exact target is available/i);
     expect(workflow).not.toContain('list_machines to choose');
   });
 });

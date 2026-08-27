@@ -6,6 +6,7 @@ import { ApiError, apiFetch } from '../api.js';
 import { validateControlledNodeCapabilities } from '@shared/controlled-node-capabilities.js';
 import { isMachineAccessRole } from '@shared/remote-exec.js';
 import type { RemoteDesktopWorkspaceMachine } from '../remote-desktop-workspace-state.js';
+import { isControlledNodeId } from '@shared/controlled-node-identity.js';
 
 export interface RemoteDesktopWallHost extends RemoteDesktopWorkspaceMachine {
   hostId: string;
@@ -35,6 +36,7 @@ function decodeHost(value: unknown): RemoteDesktopWallHost | null {
   if (!isRecord(value)
     || typeof value.hostId !== 'string'
     || typeof value.serverId !== 'string'
+    || (value.nodeId !== undefined && !isControlledNodeId(value.nodeId))
     || typeof value.refName !== 'string'
     || typeof value.displayName !== 'string'
     || typeof value.online !== 'boolean'
@@ -47,6 +49,7 @@ function decodeHost(value: unknown): RemoteDesktopWallHost | null {
     hostId: value.hostId,
     remoteDesktopHostId: value.hostId,
     serverId: value.serverId,
+    ...(isControlledNodeId(value.nodeId) ? { nodeId: value.nodeId } : {}),
     refName: value.refName,
     displayName: value.displayName,
     online: value.online,

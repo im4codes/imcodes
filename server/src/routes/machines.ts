@@ -42,6 +42,7 @@ import {
 } from '../ws/auto-unlock-registry.js';
 import { REMOTE_DESKTOP_INSTALLABLE_CAPABILITY } from '../../../shared/remote-desktop-install.js';
 import { backfillCanonicalHosts } from '../services/remote-desktop-host-identity.js';
+import { isControlledNodeId } from '../../../shared/controlled-node-identity.js';
 
 /** A node only has to reach its own disk, so this stays short. */
 const AUTO_UNLOCK_TIMEOUT_MS = 15_000;
@@ -53,6 +54,7 @@ export const machinesRoutes = new Hono<{
 
 interface ControlledRow {
   id: string;
+  node_id: string | null;
   ref_name: string | null;
   display_name: string | null;
   status: string | null;
@@ -77,6 +79,7 @@ export async function listControlledMachines(
   userId: string,
   nowMs: number,
 ): Promise<{ machines: (MachineSummary & {
+  nodeId: string;
   refName: string;
   displayName: string;
   execEnabled: boolean;
@@ -91,6 +94,9 @@ export async function listControlledMachines(
   );
   const overLimit = rows.length > MACHINE_LIST_MAX_ITEMS;
   const machines = rows.slice(0, MACHINE_LIST_MAX_ITEMS).map((r) => {
+    if (!isControlledNodeId(r.node_id)) {
+      throw new Error(`controlled_node_missing_canonical_node_id:${r.id}`);
+    }
     const online = r.status === 'online'
       && typeof r.last_heartbeat_at === 'number'
       && nowMs - r.last_heartbeat_at < MACHINE_PRESENCE_STALENESS_MS;
@@ -103,9 +109,10 @@ export async function listControlledMachines(
       : null;
     return {
       serverId: r.id,
-      name: r.display_name ?? r.ref_name ?? r.id,
-      refName: r.ref_name ?? r.id,
-      displayName: r.display_name ?? r.ref_name ?? r.id,
+      nodeId: r.node_id,
+      name: r.display_name ?? r.node_id,
+      refName: r.ref_name ?? '',
+      displayName: r.display_name ?? r.node_id,
       online,
       nodeRole: NODE_ROLE.CONTROLLED,
       // Viewers may inspect bounded metadata only. Projecting false here also
@@ -176,7 +183,7 @@ machinesRoutes.get('/', requireAuth(), async (c) => {
 });
 
 // POST /api/machines/:serverId/display-name — owner-controlled render name.
-// `ref_name` remains immutable so existing ^^(refName) markers stay valid.
+// A deprecated legacy `ref_name` remains immutable so historical markers stay valid.
 machinesRoutes.post('/:serverId/display-name', requireAuth(), async (c) => {
   const userId = c.get('userId' as never) as string;
   const serverId = c.req.param('serverId');
