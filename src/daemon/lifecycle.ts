@@ -78,6 +78,29 @@ import { createCapabilitySyncRuntime } from '../capability/capability-sync-runti
 import { CapabilitySyncFrameHandler } from '../capability/capability-sync-handler.js';
 import { CapabilitySourceConvergenceStore } from '../capability/capability-source-convergence.js';
 import { cleanupAbandonedCapabilityQuarantine } from '../capability/skill-acquisition.js';
+import { DatabaseSync } from 'node:sqlite';
+import { join } from 'node:path';
+import { homedir } from 'node:os';
+import { mkdirSync } from 'node:fs';
+import {
+  createSupervisionConsoleBinding,
+  type SupervisionConsoleBinding,
+} from './supervision-console-binding.js';
+import { isValidImcodesSessionName } from '../../shared/session-scope.js';
+
+let supervisionConsole: SupervisionConsoleBinding | undefined;
+
+/** Same ~/.imcodes home the rest of the daemon state uses. */
+function supervisionConsoleDbPath(): string {
+  const dir = join(homedir(), '.imcodes');
+  mkdirSync(dir, { recursive: true });
+  return join(dir, 'supervision-tasks.db');
+}
+
+/** Exposed for diagnostics/tests; undefined until the link is bound. */
+export function getSupervisionConsoleBinding(): SupervisionConsoleBinding | undefined {
+  return supervisionConsole;
+}
 
 function latestAssistantTextFromEvents(events: Array<{ type?: unknown; payload?: unknown }>): string | undefined {
   for (let i = events.length - 1; i >= 0; i--) {
@@ -1308,6 +1331,24 @@ export async function startup(): Promise<DaemonContext> {
 
   supervisionAutomation.init();
   supervisionAutomation.setServerLink(serverLink);
+
+  // Supervision task console: durable SQLite projection -> outbox -> this link.
+  // Capability injection, no process-global registry: the binding receives the
+  // link and its own database and owns nothing ambient. A failure here must not
+  // take the daemon down, so it is logged and the rest of startup continues.
+  try {
+    if (!serverLink) throw new Error('no server link');
+    supervisionConsole = createSupervisionConsoleBinding({
+      serverLink,
+      database: new DatabaseSync(supervisionConsoleDbPath()) as never,
+      // Only the coordinator that owns a project scope may subscribe to it.
+      authorize: (scope) => isValidImcodesSessionName(scope.coordinatorSessionName),
+    });
+    logger.info({ epoch: supervisionConsole.projectionEpoch }, 'supervision console bound');
+  } catch (err) {
+    supervisionConsole = undefined;
+    logger.warn({ err }, 'supervision console binding failed');
+  }
 
   ctx = { config, serverLink, persistBinding, removeBinding, sendSessionEvent };
   setupSignalHandlers();

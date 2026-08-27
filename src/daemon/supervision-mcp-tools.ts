@@ -1,0 +1,301 @@
+/**
+ * Production MCP registration for the supervision registry.
+ *
+ * This is the module the audited state machine reaches production through. It
+ * follows the established separate-module pattern (capability-mcp-tools,
+ * message-pin-mcp-tools) and registers onto the same MCP server, so it needs no
+ * edit to shared/memory-mcp-contracts.ts or src/daemon/memory-mcp-tools.ts.
+ *
+ * Every schema enum is spread from the SAME constant the state machine uses, so
+ * the published tool surface cannot drift from the transition table.
+ */
+import { z } from 'zod';
+import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
+import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import {
+  SUPERVISION_MCP_TOOLS,
+  SUPERVISION_MCP_REGISTERED_TOOLS,
+  type SupervisionMcpToolName,
+} from '../../shared/supervision-mcp-tools.js';
+import {
+  SUPERVISION_INTENTS,
+  resolveSupervisionIntent,
+  type SupervisionIntent,
+} from './supervision-intent-ops.js';
+import {
+  SUPERVISION_TASK_LIFECYCLE_STATUSES,
+  isSupervisionTaskLifecycleStatus,
+  type SupervisionTaskLifecycleStatus,
+} from '../../shared/supervision-config.js';
+import { SUPERVISION_CONSOLE_VALIDATION_STATES } from '../../shared/supervision-task-console.js';
+import type { McpRuntimeCaller } from './memory-mcp-caller.js';
+
+type ToolResult = Record<string, unknown>;
+
+/**
+ * Statuses an administrative recovery may target.
+ *
+ * Narrow on purpose: recovery exists to un-wedge a task, not to hand an
+ * operator a way to declare arbitrary completion. `finalized`/`pushed` are
+ * absent so recovery can never fabricate a shipped state.
+ */
+export const SUPERVISION_RECOVERY_TARGET_STATUSES = ['recovered', 'blocked', 'cancelled'] as const;
+export type SupervisionRecoveryTargetStatus = typeof SUPERVISION_RECOVERY_TARGET_STATUSES[number];
+
+/** Recovery may not resurrect a task that already reached a shipped terminal. */
+const RECOVERY_FORBIDDEN_SOURCES: readonly SupervisionTaskLifecycleStatus[] =
+  Object.freeze(['finalized', 'pushed', 'cancelled']);
+
+/**
+ * Minimal shape the visibility guards need. Mirrors the registry snapshot so no
+ * conversion layer can quietly drop the participant list.
+ */
+export interface SupervisionVisibilityItem {
+  taskId?: string;
+  assignments?: ReadonlyArray<{ identity?: { sessionName?: string } }>;
+}
+
+/**
+ * Who may see a task: any session holding an assignment on it.
+ *
+ * Absence of an assignment list is NOT read as "open to everyone" -- it yields
+ * an empty participant set, so the caller is refused.
+ */
+export function supervisionTaskParticipants(item: SupervisionVisibilityItem | undefined): string[] {
+  if (!item || !Array.isArray(item.assignments)) return [];
+  return item.assignments
+    .map((assignment) => assignment?.identity?.sessionName)
+    .filter((name): name is string => typeof name === 'string' && name.length > 0);
+}
+
+export function supervisionCallerParticipates(
+  item: SupervisionVisibilityItem | undefined,
+  callerSessionName: string,
+): boolean {
+  if (!callerSessionName) return false;
+  return supervisionTaskParticipants(item).includes(callerSessionName);
+}
+
+export type SupervisionOwnerScope =
+  | { ok: true; ownerSessionName: string; source: 'target' | 'ownerSessionName' | 'caller_default' }
+  | { ok: false; reason: 'conflicting_owner_filter' };
+
+/**
+ * Resolve the owner filter.
+ *
+ * `target` is the legacy published alias of `ownerSessionName`. If BOTH are
+ * supplied they must agree: silently preferring one would let a caller believe
+ * it filtered by the other. With neither, the scope defaults to the caller --
+ * the same default the legacy handler used, so a caller never accidentally
+ * enumerates the whole registry.
+ */
+export function resolveSupervisionOwnerScope(input: {
+  target?: string;
+  ownerSessionName?: string;
+  callerSessionName: string;
+}): SupervisionOwnerScope {
+  const target = input.target?.trim() || undefined;
+  const owner = input.ownerSessionName?.trim() || undefined;
+  if (target && owner && target !== owner) return { ok: false, reason: 'conflicting_owner_filter' };
+  if (owner) return { ok: true, ownerSessionName: owner, source: 'ownerSessionName' };
+  if (target) return { ok: true, ownerSessionName: target, source: 'target' };
+  return { ok: true, ownerSessionName: input.callerSessionName, source: 'caller_default' };
+}
+
+export interface SupervisionRegistryPort {
+  getStatus(taskId: string): string | undefined;
+  applyIntent(input: {
+    taskId: string;
+    intent: SupervisionIntent;
+    toStatus: SupervisionTaskLifecycleStatus | null;
+    validationState?: string;
+    note?: string;
+  }): void;
+  list(filter: { status?: string; topLevelTaskId?: string; ownerSessionName?: string }): SupervisionVisibilityItem[];
+  get(taskId: string): SupervisionVisibilityItem | undefined;
+  recover(input: { taskId: string; toStatus: SupervisionRecoveryTargetStatus; reason: string }): void;
+}
+
+export interface SupervisionMcpToolDeps {
+  /** Injected in tests; production supplies the real registry. */
+  registry?: SupervisionRegistryPort;
+  /** Fail-closed administrative gate for recover. */
+  isAdmin?: (caller: McpRuntimeCaller) => boolean;
+}
+
+function ok(value: ToolResult): ToolResult { return { status: 'ok', ...value }; }
+function err(reason: string, detail?: string): ToolResult {
+  return detail ? { status: 'error', reason, detail } : { status: 'error', reason };
+}
+
+/**
+ * Published input schemas.
+ *
+ * The intent tool has NO status property at all — a model cannot express a
+ * lifecycle string here even malformed, and `.strict()` rejects one smuggled in
+ * as an extra key.
+ */
+export const SUPERVISION_MCP_TOOL_SHAPES = {
+  [SUPERVISION_MCP_TOOLS.INTENT]: {
+    intent: z.enum([...SUPERVISION_INTENTS] as [string, ...string[]]),
+    taskId: z.string().min(1),
+    assignmentId: z.string().min(1).optional(),
+    validationState: z.enum([...SUPERVISION_CONSOLE_VALIDATION_STATES] as [string, ...string[]]).optional(),
+    note: z.string().max(2000).optional(),
+  },
+  [SUPERVISION_MCP_TOOLS.LIST]: {
+    status: z.enum([...SUPERVISION_TASK_LIFECYCLE_STATUSES] as [string, ...string[]]).optional(),
+    topLevelTaskId: z.string().min(1).optional(),
+    ownerSessionName: z.string().min(1).optional(),
+    /** Legacy published alias of ownerSessionName; kept for compatibility. */
+    target: z.string().min(1).optional(),
+  },
+  [SUPERVISION_MCP_TOOLS.GET]: {
+    taskId: z.string().min(1),
+  },
+  [SUPERVISION_MCP_TOOLS.RECOVER]: {
+    taskId: z.string().min(1),
+    toStatus: z.enum([...SUPERVISION_RECOVERY_TARGET_STATUSES] as [string, ...string[]]),
+    reason: z.string().min(1).max(2000),
+  },
+} as const;
+
+const DESCRIPTIONS: Record<SupervisionMcpToolName, string> = {
+  // Kept terse on purpose: every byte here is published to every MCP client and
+  // the shared tool surface is already over its size budget.
+  [SUPERVISION_MCP_TOOLS.INTENT]: 'Advance a supervision task by intent; the daemon owns the status.',
+  [SUPERVISION_MCP_TOOLS.LIST]: 'List supervision tasks you participate in.',
+  [SUPERVISION_MCP_TOOLS.GET]: 'Read one supervision task you participate in.',
+  [SUPERVISION_MCP_TOOLS.RECOVER]: 'Admin recovery to a restricted status.',
+};
+
+export function createSupervisionMcpToolHandlers(
+  caller: McpRuntimeCaller,
+  deps: SupervisionMcpToolDeps = {},
+): Record<SupervisionMcpToolName, (args?: unknown) => Promise<ToolResult>> {
+  const registry = deps.registry;
+  const isAdmin = deps.isAdmin ?? (() => false);
+  // Fail closed: no caller session means no default scope and no participation.
+  const callerSession = typeof (caller as { sessionName?: unknown })?.sessionName === 'string'
+    ? (caller as { sessionName: string }).sessionName
+    : '';
+  const need = (): SupervisionRegistryPort | undefined => registry;
+
+  return {
+    async [SUPERVISION_MCP_TOOLS.INTENT](args) {
+      const input = (args ?? {}) as Record<string, unknown>;
+      const reg = need();
+      if (!reg) return err('unavailable', 'supervision registry not bound');
+      // Delegates to the audited pure state machine; the status-rejection and
+      // transition table live there, not restated here.
+      const outcome = resolveSupervisionIntent({
+        request: {
+          intent: String(input.intent ?? ''),
+          taskId: String(input.taskId ?? ''),
+          assignmentId: input.assignmentId === undefined ? undefined : String(input.assignmentId),
+          validationState: input.validationState === undefined ? undefined : String(input.validationState),
+          note: input.note === undefined ? undefined : String(input.note),
+          status: input.status,
+        },
+        currentStatus: reg.getStatus(String(input.taskId ?? '')),
+      });
+      if (!outcome.ok) return err(outcome.refusal ?? 'refused', outcome.detail);
+      reg.applyIntent({
+        taskId: String(input.taskId),
+        intent: outcome.intent!,
+        toStatus: outcome.toStatus ?? null,
+        validationState: outcome.validationState,
+        note: input.note === undefined ? undefined : String(input.note),
+      });
+      return ok({
+        intent: outcome.intent, fromStatus: outcome.fromStatus,
+        toStatus: outcome.toStatus ?? null, validationState: outcome.validationState,
+      });
+    },
+
+    async [SUPERVISION_MCP_TOOLS.LIST](args) {
+      const input = (args ?? {}) as Record<string, unknown>;
+      const reg = need();
+      if (!reg) return err('unavailable', 'supervision registry not bound');
+      const status = input.status === undefined ? undefined : String(input.status);
+      // Fail closed even though zod already constrains it: a caller reaching the
+      // handler directly must not be able to widen the filter.
+      if (status !== undefined && !isSupervisionTaskLifecycleStatus(status)) {
+        return err('invalid_status', 'status must be a fixed lifecycle id');
+      }
+      const scope = resolveSupervisionOwnerScope({
+        target: input.target === undefined ? undefined : String(input.target),
+        ownerSessionName: input.ownerSessionName === undefined ? undefined : String(input.ownerSessionName),
+        callerSessionName: callerSession,
+      });
+      if (!scope.ok) return err(scope.reason, 'target and ownerSessionName disagree');
+      const rows = reg.list({
+        status,
+        topLevelTaskId: input.topLevelTaskId === undefined ? undefined : String(input.topLevelTaskId),
+        ownerSessionName: scope.ownerSessionName,
+      });
+      // Post-filter: an explicit owner filter must never widen visibility beyond
+      // the tasks this caller actually participates in.
+      return ok({
+        tasks: rows.filter((row) => supervisionCallerParticipates(row, callerSession)),
+        ownerScope: scope.source,
+      });
+    },
+
+    async [SUPERVISION_MCP_TOOLS.GET](args) {
+      const input = (args ?? {}) as Record<string, unknown>;
+      const reg = need();
+      if (!reg) return err('unavailable', 'supervision registry not bound');
+      const task = reg.get(String(input.taskId ?? ''));
+      // Deliberately the SAME refusal for "does not exist" and "exists but you
+      // are not a participant". Distinguishing them would turn this tool into an
+      // existence oracle for other coordinators' task ids.
+      if (!task || !supervisionCallerParticipates(task, callerSession)) {
+        return err('identity_rejected', 'task is not visible to this caller');
+      }
+      return ok({ task });
+    },
+
+    async [SUPERVISION_MCP_TOOLS.RECOVER](args) {
+      const input = (args ?? {}) as Record<string, unknown>;
+      const reg = need();
+      if (!reg) return err('unavailable', 'supervision registry not bound');
+      if (!isAdmin(caller)) return err('forbidden', 'administrative recovery is not authorized for this caller');
+      const target = String(input.toStatus ?? '');
+      if (!(SUPERVISION_RECOVERY_TARGET_STATUSES as readonly string[]).includes(target)) {
+        return err('invalid_target_status', 'recovery target must be a restricted enum member');
+      }
+      const current = reg.getStatus(String(input.taskId ?? ''));
+      if (!current || !isSupervisionTaskLifecycleStatus(current)) return err('unknown_task');
+      if (RECOVERY_FORBIDDEN_SOURCES.includes(current)) {
+        return err('illegal_transition', `recovery cannot move a ${current} task`);
+      }
+      const reason = String(input.reason ?? '').trim();
+      if (!reason) return err('reason_required');
+      reg.recover({ taskId: String(input.taskId), toStatus: target as SupervisionRecoveryTargetStatus, reason });
+      return ok({ taskId: String(input.taskId), fromStatus: current, toStatus: target });
+    },
+  };
+}
+
+function toolResult(result: ToolResult): CallToolResult {
+  return {
+    structuredContent: result,
+    content: [{ type: 'text', text: JSON.stringify(result) }],
+    isError: result.status === 'error',
+  };
+}
+
+export function registerSupervisionMcpTools(
+  server: McpServer,
+  caller: McpRuntimeCaller,
+  deps: SupervisionMcpToolDeps = {},
+): void {
+  const handlers = createSupervisionMcpToolHandlers(caller, deps);
+  for (const name of SUPERVISION_MCP_REGISTERED_TOOLS) {
+    server.registerTool(name, {
+      description: DESCRIPTIONS[name],
+      inputSchema: SUPERVISION_MCP_TOOL_SHAPES[name],
+    }, async (args: unknown) => toolResult(await handlers[name](args)));
+  }
+}

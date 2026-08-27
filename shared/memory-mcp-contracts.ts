@@ -30,11 +30,13 @@ import {
 import { FILE_TRANSFER_PATH_MAX_BYTES } from './transport/file-transfer.js';
 import { MACHINE_FILE_TRANSFER_TRANSPORT } from './machine-direct-file-transfer.js';
 import {
-  MACHINE_NAME_PATTERN,
-  MACHINE_REF_NAME_MAX,
   MACHINE_TARGET_MAX,
   MACHINE_TARGET_PATTERN,
 } from './machine-reference.js';
+import {
+  CONTROLLED_NODE_ID_LENGTH,
+  CONTROLLED_NODE_ID_PATTERN_SOURCE,
+} from './controlled-node-identity.js';
 import {
   PEER_AUDIT_FINDINGS_BYTES,
   PEER_AUDIT_VALIDATION_COUNT,
@@ -47,6 +49,10 @@ import {
   AGENT_DELEGATION_PURPOSES,
   AGENT_DELEGATION_REPLY_RESULT_BYTES,
 } from './agent-delegation.js';
+import {
+  SUPERVISION_TASK_CLASSIFICATIONS,
+  SUPERVISION_TASK_FILE_OPERATIONS,
+} from './supervision-config.js';
 import {
   MEMORY_MCP_SEND_DELIVERY_MODES,
   type MemoryMcpSendDeliveryMode,
@@ -70,7 +76,12 @@ export const MEMORY_MCP_TOOL_NAMES = {
   PEER_AUDIT_REPLY: 'peer_audit_reply',
   DELEGATION_REPLY: 'delegation_reply',
   SEND_LIST_TARGETS: 'send_list_targets',
+  SESSION_RUNTIME_IDENTITY_GET: 'session_runtime_identity_get',
   SEND_MESSAGE: 'send_message',
+  SUPERVISION_TASK_START: 'supervision_task_start',
+  SUPERVISION_TASK_UPDATE: 'supervision_task_update',
+  SUPERVISION_TASK_FINISH: 'supervision_task_finish',
+  SUPERVISION_TASK_FILE_EVENT: 'supervision_task_file_event',
   SEND_STOP: 'send_stop',
   DESTROY_EXECUTION_CLONE: 'destroy_execution_clone',
   CRON_CREATE_SELF: 'cron_create_self',
@@ -105,7 +116,12 @@ export const MEMORY_MCP_TOOL_NAME_LIST = [
   MEMORY_MCP_TOOL_NAMES.PEER_AUDIT_REPLY,
   MEMORY_MCP_TOOL_NAMES.DELEGATION_REPLY,
   MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS,
+  MEMORY_MCP_TOOL_NAMES.SESSION_RUNTIME_IDENTITY_GET,
   MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE,
+  MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_START,
+  MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_UPDATE,
+  MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_FINISH,
+  MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_FILE_EVENT,
   MEMORY_MCP_TOOL_NAMES.SEND_STOP,
   MEMORY_MCP_TOOL_NAMES.DESTROY_EXECUTION_CLONE,
   MEMORY_MCP_TOOL_NAMES.CRON_CREATE_SELF,
@@ -420,6 +436,12 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
     }),
     outputSchema: statusSchema,
   },
+  [MEMORY_MCP_TOOL_NAMES.SESSION_RUNTIME_IDENTITY_GET]: {
+    name: MEMORY_MCP_TOOL_NAMES.SESSION_RUNTIME_IDENTITY_GET,
+    description: 'Return the daemon-observed runtime identity for the bound MCP caller only. Takes no session/model arguments and cannot enumerate peers. Model metadata is evidence, not self-reported authorization; schedulers independently revalidate the same live SessionRecord before assignment.',
+    inputSchema: objectSchema({}),
+    outputSchema: statusSchema,
+  },
   [MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE]: {
     name: MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE,
     description: 'Send a plain-text request to an exact send_list_targets target, for example asking a CC session to audit. The caller session is not a valid target; an empty send_list_targets result means none exists. deliveryMode defaults to append: a busy compatible provider receives the message by direct non-preemptive append at its next safe boundary, while unsupported, racing, or temporarily unready targets retain delivery through the ordinary durable queue. Set deliveryMode=queue to always retain the message in ordinary durable FIFO instead of inserting it into the active turn. It does not start a structured Team/P2P discussion run. Files are project-root path references, not bytes. Returns dispatch/message ids and delivery status.',
@@ -438,6 +460,25 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
         maxItems: MEMORY_MCP_CAPS.SEND_FILES_MAX_COUNT,
       },
       reply: booleanSchema('Optional request for correlated replies to the runtime-bound caller session. Set true for audit/review reports or discussion invites; the target receives an opaque delegation id and bounded capability that may send multiple replies until expiry, and each structured reply is delivered through the caller provider’s active-turn notification path when supported. Do not poll session state, logs, transcripts, or the target after a reply-enabled send.'),
+      task: {
+        ...objectSchema({
+          taskId: stringSchema('Optional stable task id; omitted means daemon generates one.'),
+          topLevelTaskId: stringSchema('Optional top-level task id.'),
+          sliceId: stringSchema('Optional slice id.'),
+          classification: { type: 'string', enum: [...SUPERVISION_TASK_CLASSIFICATIONS], description: 'Task classification.' },
+          objective: stringSchema('Task objective/title.'),
+          acceptance: { type: 'array', items: stringSchema('Acceptance item.'), description: 'Acceptance criteria.' },
+          ownedFiles: { type: 'array', items: stringSchema('Repo-relative owned path.'), description: 'Owned files.' },
+          sharedFiles: { type: 'array', items: stringSchema('Repo-relative shared path.'), description: 'Shared files.' },
+          dependencies: { type: 'array', items: stringSchema('Task dependencies.'), description: 'Dependencies.' },
+          integrationOwner: stringSchema('Integration owner assignment/session reference.'),
+          baseRevision: stringSchema('Base revision.'),
+          currentRevision: stringSchema('Current revision.'),
+          auditAttemptId: stringSchema('Matching audit attempt id.'),
+          auditRevision: stringSchema('Matching audit revision.'),
+        }),
+        description: 'Optional daemon-authoritative supervision task metadata. When present, accepted result returns taskId and assignmentId; idempotency replay must reuse both.',
+      },
       audit: {
         ...objectSchema({
           kind: {
@@ -461,6 +502,64 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
         description: 'Optional strict execution-clone request. When present, the message is routed to a freshly created ephemeral clone of the resolved target template (never the target directly) and the result includes clone.target; broadcast is not allowed with clone.',
       },
     }, ['target', 'message']),
+    outputSchema: statusSchema,
+  },
+
+  [MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_START]: {
+    name: MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_START,
+    description: 'Start or bind a daemon-authoritative supervision task assignment. Creates durable SQLite task/assignment state; free text is not a completion signal.',
+    inputSchema: objectSchema({
+      taskId: stringSchema('Optional stable task id. Omit to let daemon generate one.'),
+      topLevelTaskId: stringSchema('Optional top-level task id. Defaults to taskId.'),
+      classification: { type: 'string', enum: [...SUPERVISION_TASK_CLASSIFICATIONS], description: 'Task classification.' },
+      role: { type: 'string', enum: ['coordinator', 'integration_owner', 'implementer', 'auditor'], description: 'Assignment role for the caller session.' },
+      objective: stringSchema('Short objective/title.'),
+      acceptance: { type: 'array', items: stringSchema('Acceptance item.'), description: 'Acceptance criteria.' },
+      scopeFiles: { type: 'array', items: stringSchema('Repo-relative owned/shared path.'), description: 'Assignment scope paths.' },
+      claimMode: { type: 'string', enum: ['exclusive', 'shared', 'read_only'], description: 'File claim mode. Auditors are forced read_only.' },
+      idempotencyKey: stringSchema('Retry key; replay returns the same taskId/assignmentId.'),
+    }, ['role', 'objective']),
+    outputSchema: statusSchema,
+  },
+  [MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_UPDATE]: {
+    name: MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_UPDATE,
+    description: 'Heartbeat/update the caller’s bound assignment. The daemon derives lifecycle status from a semantic intent; callers cannot name a destination status. Transition gates, revision and audit-attempt checks are enforced by SQLite registry.',
+    inputSchema: objectSchema({
+      assignmentId: stringSchema('Assignment id bound to this caller runtime.'),
+      revision: stringSchema('Current/audit revision for stale-update rejection.'),
+      auditAttemptId: stringSchema('Matching audit attempt id, when updating audit state.'),
+      auditRevision: stringSchema('Matching audit revision.'),
+      verdict: stringSchema('Audit verdict when applicable.'),
+      blocker: stringSchema('Blocker reason when applicable.'),
+      externalRunId: stringSchema('External run id, e.g. CI run.'),
+      externalHeadSha: stringSchema('External run head SHA.'),
+      externalTaskId: stringSchema('External task/workflow id.'),
+    }, ['assignmentId']),
+    outputSchema: statusSchema,
+  },
+  [MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_FINISH]: {
+    name: MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_FINISH,
+    description: 'Finish only the caller’s assignment (validated/ready_for_audit/ready_for_integration/blocked/cancelled/etc.); it never closes the whole task by prose and does not automatically scan files or Git state.',
+    inputSchema: objectSchema({
+      assignmentId: stringSchema('Assignment id bound to this caller runtime.'),
+      revision: stringSchema('Current revision.'),
+      evidence: stringSchema('Bounded evidence summary.'),
+    }, ['assignmentId']),
+    outputSchema: statusSchema,
+  },
+  [MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_FILE_EVENT]: {
+    name: MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_FILE_EVENT,
+    description: 'Record a caller-reported append-only file event for the caller’s assignment. No automatic provider Edit/Write/apply_patch hook and no filesystem/Git scanner are wired. The path must already be in the assignment claim scope; outside-scope reports block the task. Reconciliation compares only caller-supplied path observations and cannot detect omitted or unreported shell writes.',
+    inputSchema: objectSchema({
+      assignmentId: stringSchema('Assignment id bound to this caller runtime.'),
+      filePath: stringSchema('Normalized repo-relative path.'),
+      operation: { type: 'string', enum: [...SUPERVISION_TASK_FILE_OPERATIONS], description: 'File operation.' },
+      beforeHash: stringSchema('Optional before content hash.'),
+      afterHash: stringSchema('Optional after content hash.'),
+      tool: stringSchema('Tool name, e.g. apply_patch/Edit/Write/shell.'),
+      source: stringSchema('Caller/tool source.'),
+      idempotencyKey: stringSchema('Retry key for duplicate caller-reported delivery.'),
+    }, ['assignmentId', 'filePath', 'operation']),
     outputSchema: statusSchema,
   },
   [MEMORY_MCP_TOOL_NAMES.SEND_STOP]: {
@@ -584,7 +683,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   [MEMORY_MCP_TOOL_NAMES.LIST_MACHINES]: {
     name: MEMORY_MCP_TOOL_NAMES.LIST_MACHINES,
     description:
-      'Discover ref_names or inspect advisory availability; do not call it as a preflight when an exact ref_name or ^^(name) is known. Action routes check live state. FULL nodes only.',
+      'Discover canonical controlled-node nodeIds or inspect advisory availability; do not call it as a preflight when an exact nodeId or ^^(nodeId) is known. Action routes check live state. FULL nodes only.',
     inputSchema: objectSchema({
       includeOffline: booleanSchema('Include offline and exec-disabled machines; default false. Presence is advisory.'),
     }),
@@ -595,7 +694,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
         description: 'Controllable machines for the account.',
         maxItems: MACHINE_LIST_MAX_ITEMS,
         items: objectSchema({
-          name: stringSchema('Stable ref_name for machine tools and ^^(name).', { minLength: 1, maxLength: MACHINE_REF_NAME_MAX, pattern: MACHINE_NAME_PATTERN.source }),
+          name: stringSchema('Canonical controlled-node nodeId for machine tools and ^^(nodeId).', { minLength: CONTROLLED_NODE_ID_LENGTH, maxLength: CONTROLLED_NODE_ID_LENGTH, pattern: CONTROLLED_NODE_ID_PATTERN_SOURCE }),
           displayName: stringSchema('Render-only display name (sanitized).'),
           os: stringSchema('Canonical OS (win | mac | linux); advisory, absent if unknown.', { enum: [...ENROLLMENT_OSES] }),
           online: booleanSchema('Advisory DB-heartbeat presence.'),
@@ -608,9 +707,9 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   [MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE]: {
     name: MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE,
     description:
-      'Run one command on a machine. Pass either the bare ref_name or the complete ^^(ref_name) marker; both normalize to the same target, without list_machines. not_dispatched is retry-safe; dispatched_no_result may have run, so never auto-retry non-idempotent work. FULL nodes only.',
+      'Run one command on a controlled node. Pass its canonical 10-digit nodeId or complete ^^(nodeId) marker without list_machines. A deprecated noncanonical legacy ref_name remains accepted only for migration compatibility. not_dispatched is retry-safe; dispatched_no_result may have run, so never auto-retry non-idempotent work. FULL nodes only.',
     inputSchema: objectSchema({
-      machine: stringSchema('Bare stable ref_name or complete ^^(ref_name) marker.', { minLength: 1, maxLength: MACHINE_TARGET_MAX, pattern: MACHINE_TARGET_PATTERN.source }),
+      machine: stringSchema('Canonical nodeId or complete ^^(nodeId) marker; deprecated noncanonical legacy ref_name is also accepted.', { minLength: 1, maxLength: MACHINE_TARGET_MAX, pattern: MACHINE_TARGET_PATTERN.source }),
       command: stringSchema(`Command to run, up to ${REMOTE_EXEC_MAX_COMMAND_BYTES} UTF-8 bytes.`),
       shell: stringSchema(`Optional shell; one of ${REMOTE_EXEC_SHELLS.join(', ')}.`, { enum: [...REMOTE_EXEC_SHELLS] }),
       timeoutMs: numberSchema(`Optional timeout in ms; defaults to ${REMOTE_EXEC_DEFAULT_TIMEOUT_MS}, in [${REMOTE_EXEC_MIN_TIMEOUT_MS}, ${REMOTE_EXEC_MAX_TIMEOUT_MS}].`, { minimum: REMOTE_EXEC_MIN_TIMEOUT_MS, maximum: REMOTE_EXEC_MAX_TIMEOUT_MS }),
@@ -630,9 +729,9 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   },
   [MEMORY_MCP_TOOL_NAMES.SEND_FILE_TO_MACHINE]: {
     name: MEMORY_MCP_TOOL_NAMES.SEND_FILE_TO_MACHINE,
-    description: 'Direct→relay; reports mode. Relay≤2GiB. Resolve without list_machines. Unsafe/credential paths rejected.',
+    description: 'Direct→relay file send to a canonical 10-digit nodeId or ^^(nodeId), with deprecated noncanonical legacy ref_name compatibility only. Resolve without list_machines. Reports mode; Relay≤2GiB; unsafe/credential paths rejected.',
     inputSchema: objectSchema({
-      machine: stringSchema('Bare stable ref_name or complete ^^(ref_name) marker.', { minLength: 1, maxLength: MACHINE_TARGET_MAX, pattern: MACHINE_TARGET_PATTERN.source }),
+      machine: stringSchema('Canonical nodeId or complete ^^(nodeId) marker; deprecated noncanonical legacy ref_name is also accepted.', { minLength: 1, maxLength: MACHINE_TARGET_MAX, pattern: MACHINE_TARGET_PATTERN.source }),
       sourcePath: stringSchema(`Path ≤${FILE_TRANSFER_PATH_MAX_BYTES} UTF-8 bytes.`),
     }, ['machine', 'sourcePath']),
     outputSchema: objectSchema({
@@ -646,16 +745,16 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   },
   [MEMORY_MCP_TOOL_NAMES.FETCH_FILE_FROM_MACHINE]: {
     name: MEMORY_MCP_TOOL_NAMES.FETCH_FILE_FROM_MACHINE,
-    description: 'Direct-first controlled file fetch, then relay. Pass ref_name or ^^(ref_name) without list_machines. Reports mode; atomic commit; overwrite=false; FULL only.',
+    description: 'Direct-first controlled file fetch, then relay. Pass the canonical 10-digit nodeId or ^^(nodeId) without list_machines; deprecated noncanonical legacy ref_name is compatibility-only. Reports mode; atomic commit; overwrite=false; FULL only.',
     inputSchema: objectSchema({
-      machine: stringSchema('Bare stable ref_name or complete ^^(ref_name) marker.', { minLength: 1, maxLength: MACHINE_TARGET_MAX, pattern: MACHINE_TARGET_PATTERN.source }),
+      machine: stringSchema('Canonical nodeId or complete ^^(nodeId) marker; deprecated noncanonical legacy ref_name is also accepted.', { minLength: 1, maxLength: MACHINE_TARGET_MAX, pattern: MACHINE_TARGET_PATTERN.source }),
       sourcePath: stringSchema(`Explicit controlled-node regular-file path, up to ${FILE_TRANSFER_PATH_MAX_BYTES} UTF-8 bytes.`),
       destinationPath: stringSchema(`Explicit local destination path, up to ${FILE_TRANSFER_PATH_MAX_BYTES} UTF-8 bytes.`),
       overwrite: booleanSchema('Replace an existing regular destination file; default false.'),
     }, ['machine', 'sourcePath', 'destinationPath']),
     outputSchema: objectSchema({
       status: stringSchema('Always ok for a successful transfer.', { enum: ['ok'] }),
-      machine: stringSchema('Resolved machine ref_name.'),
+      machine: stringSchema('Resolved canonical nodeId or deprecated legacy ref_name.'),
       destinationPath: stringSchema('Exact committed local destination path.'),
       attachmentId: stringSchema('Relay attachment id or direct transfer id.'),
       size: numberSchema('Transferred byte count.', { minimum: 0, maximum: Number.MAX_SAFE_INTEGER }),
@@ -676,9 +775,9 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   },
   [MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL]: {
     name: MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL,
-    description: 'Use Computer Use on this daemon host (machine=local) or a controlled machine. Open Computer Use (OCU) provides the integrated cross-platform desktop-app control path; IM.codes provides separate built-in CDP-backed browser_* tools. For browser work, prefer machine=local with browser_open/browser_snapshot instead of probing or installing Playwright through a shell. Browser results expose a loopback cdpEndpoint/host/port so local Python or Node scripts can reuse the same browser; pass includeImage=true only when visual inspection is needed. Pass a controlled machine bare ref_name or complete ^^(ref_name) marker without list_machines. exec_remote is session-0/SYSTEM; shell_session1 is active-user. FULL nodes only.',
+    description: 'Use Computer Use on this daemon host (machine=local) or a controlled machine. Open Computer Use (OCU) provides the integrated cross-platform desktop-app control path; IM.codes provides separate built-in CDP-backed browser_* tools. For browser work, prefer machine=local with browser_open/browser_snapshot instead of probing or installing Playwright through a shell. Browser results expose a loopback cdpEndpoint/host/port so local Python or Node scripts can reuse the same browser; pass includeImage=true only when visual inspection is needed. Pass a controlled machine canonical 10-digit nodeId or complete ^^(nodeId) marker without list_machines; deprecated noncanonical legacy ref_name is compatibility-only. exec_remote is session-0/SYSTEM; shell_session1 is active-user. FULL nodes only.',
     inputSchema: objectSchema({
-      machine: stringSchema('Bare stable ref_name, complete ^^(ref_name) marker, or local/localhost/self/this.', { minLength: 1, maxLength: MACHINE_TARGET_MAX, pattern: MACHINE_TARGET_PATTERN.source }),
+      machine: stringSchema('Canonical nodeId, complete ^^(nodeId) marker, deprecated noncanonical legacy ref_name, or local/localhost/self/this.', { minLength: 1, maxLength: MACHINE_TARGET_MAX, pattern: MACHINE_TARGET_PATTERN.source }),
       tool: stringSchema(`Typed method name; one of ${COMPUTER_USE_TOOLS.join(', ')}.`, { enum: [...COMPUTER_USE_TOOLS] }),
       arguments: { type: 'object', description: `JSON object arguments for the selected method, up to ${COMPUTER_USE_MAX_ARGUMENT_BYTES} UTF-8 bytes. Windows coordinate drag additionally accepts duration_ms=${COMPUTER_USE_DRAG_DURATION_MIN_MS}..${COMPUTER_USE_DRAG_DURATION_MAX_MS}.`, additionalProperties: true },
       timeoutMs: numberSchema(`Optional timeout in ms. GUI/browser methods allow [${COMPUTER_USE_MIN_TIMEOUT_MS}, ${COMPUTER_USE_MAX_TIMEOUT_MS}]; shell_session1 allows [${COMPUTER_USE_MIN_TIMEOUT_MS}, ${COMPUTER_USE_SHELL_SESSION1_MAX_TIMEOUT_MS}].`, { minimum: COMPUTER_USE_MIN_TIMEOUT_MS, maximum: COMPUTER_USE_SHELL_SESSION1_MAX_TIMEOUT_MS }),

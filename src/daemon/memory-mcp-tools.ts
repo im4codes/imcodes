@@ -65,10 +65,17 @@ import {
 } from '../../shared/computer-use.js';
 import { FILE_TRANSFER_LIMITS, FILE_TRANSFER_PATH_MAX_BYTES } from '../../shared/transport/file-transfer.js';
 import { MACHINE_FILE_TRANSFER_TRANSPORT, type MachineFileTransferTransport } from '../../shared/machine-direct-file-transfer.js';
-import { isValidMachineName, isValidMachineTarget, normalizeMachineTarget } from '../../shared/machine-reference.js';
+import { isValidMachineTarget, normalizeMachineTarget } from '../../shared/machine-reference.js';
+import { isControlledNodeId } from '../../shared/controlled-node-identity.js';
 import { MEMORY_PROJECT_SCOPE_REASON } from '../../shared/memory-project-scope.js';
 import { sanitizeMcpErrorMessage } from '../../shared/mcp-error-sanitize.js';
 import { resolveEffectiveProjectName, resolveRuntimeScope } from '../../shared/session-scope.js';
+import { isDiscoverableInterAgentSession } from '../../shared/session-scope.js';
+import { isDelegationReplyCapableAgentType } from '../../shared/agent-delegation.js';
+import { getSessionRuntimeType } from '../../shared/agent-types.js';
+import { resolveEffectiveSessionModel } from '../../shared/session-model.js';
+import { DAEMON_VERSION } from '../util/version.js';
+import { resolvePeerAuditNormalizedModelId, resolvePeerAuditProviderFamily } from './peer-audit-candidates.js';
 import {
   MCP_FEATURE_FLAGS_BY_NAME,
   isMcpFeatureEnabled,
@@ -88,6 +95,16 @@ import {
   PEER_AUDIT_VALIDATION_OUTCOMES,
   type PeerAuditReplyEnvelope,
 } from '../../shared/peer-audit.js';
+import {
+  SUPERVISION_TASK_CLASSIFICATIONS,
+  SUPERVISION_TASK_FILE_OPERATIONS,
+  SUPERVISION_TASK_LIFECYCLE_STATUSES,
+  type SupervisionTaskMetadata,
+} from '../../shared/supervision-config.js';
+import {
+  normalizeSupervisionEconomyTaskPolicy,
+  normalizeSupervisionExecutionConfig,
+} from '../../shared/supervision-execution-pool.js';
 import {
   AGENT_DELEGATION_PURPOSES,
   AGENT_DELEGATION_REPLY_VERSION,
@@ -111,6 +128,7 @@ import { getMemoryFeatureConfigStoreDiagnostics, getPersistedMemoryFeatureFlagVa
 import { getContextStoreClient } from '../store/context-store-worker-client.js';
 import { listSessions as listStoredSessions, loadStore, type SessionRecord } from '../store/session-store.js';
 import { dispatchDestroyExecutionClone, dispatchSendMessage, dispatchSendStop, listSendTargets, type SendMessageCloneRequest, type SendToolDeps } from './send-tool.js';
+import { getSupervisionTaskRegistry, type PersistedSupervisionTaskAssignmentIdentity } from './supervision-state-store.js';
 import { cronMcpCreate, cronMcpCreateSelf, cronMcpDelete, cronMcpList, cronMcpUpdate, cronMcpUpdateSelf, type CronMcpClientOptions } from './cron-mcp-client.js';
 import {
   registerMemoryShortRef,
@@ -122,6 +140,8 @@ import {
 const AMBIGUOUS_REF_CANDIDATE_CAP = 4;
 import { GitOriginRepositoryIdentityService } from '../agent/repository-identity-service.js';
 import { ALIAS_DESCRIPTION_MAX, ALIAS_MCP_TOOLS, toAliasMetadata, type AliasMcpToolName } from '../../shared/alias-types.js';
+import { mapLegacySupervisionUpdate, mapLegacySupervisionFinish } from './supervision-compat-shims.js';
+import { resolveSupervisionIntent } from './supervision-intent-ops.js';
 import {
   aliasMcpList,
   aliasMcpResolve,
@@ -215,7 +235,7 @@ export interface MemoryMcpToolDeps {
   nodeRole?: NodeRole;
 }
 
-/** One machine in the `list_machines` result (agent-facing, ref_name-keyed). */
+/** One machine in the `list_machines` result (agent-facing, canonical-nodeId keyed). */
 export interface MachineSummaryForTool {
   name: string;
   displayName?: string;
@@ -302,16 +322,16 @@ export type MachineExecToolSuccess = Record<string, unknown> & (
   | ({ status: 'ok'; outcome: 'spawn_error'; ok: false; exitCode: null; timedOut: false; error: string } & MachineExecTerminalFields)
 );
 
-const machineRefNameRuntimeSchema = z.string().refine(isValidMachineName, {
-  message: 'must be a valid bare stable machine ref_name',
+const controlledNodeIdRuntimeSchema = z.string().refine(isControlledNodeId, {
+  message: 'must be a canonical controlled-node nodeId',
 });
 
 const machineTargetRuntimeSchema = z.string().refine(isValidMachineTarget, {
-  message: 'must be a valid stable machine ref_name or complete ^^(ref_name) marker',
+  message: 'must be a canonical nodeId/^^(nodeId) or deprecated noncanonical legacy alias',
 });
 
 const machineSummaryShape = {
-  name: machineRefNameRuntimeSchema,
+  name: controlledNodeIdRuntimeSchema,
   displayName: z.string().optional(),
   os: z.enum(ENROLLMENT_OSES).optional(),
   online: z.boolean(),
@@ -494,6 +514,47 @@ function parseCloneArg(value: unknown): SendMessageCloneRequest | undefined | 'i
     ephemeral: true,
     parentRunId: record.parentRunId,
     parentStage: record.parentStage,
+  };
+}
+
+
+const TASK_ARG_ALLOWED_KEYS: ReadonlySet<string> = new Set([
+  'taskId', 'topLevelTaskId', 'sliceId', 'classification', 'objective', 'acceptance',
+  'ownedFiles', 'sharedFiles', 'dependencies', 'integrationOwner', 'baseRevision',
+  'currentRevision', 'auditAttemptId', 'auditRevision', 'executionPool',
+  'requestedExecutionType', 'economyPolicy',
+]);
+
+function parseTaskArg(value: unknown): SupervisionTaskMetadata | undefined | 'invalid' {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== 'object' || Array.isArray(value)) return 'invalid';
+  const record = value as Record<string, unknown>;
+  if (Object.keys(record).some((key) => !TASK_ARG_ALLOWED_KEYS.has(key))) return 'invalid';
+  const stringField = (key: string): string | undefined => typeof record[key] === 'string' && record[key].trim() ? record[key].trim() : undefined;
+  const arrayField = (key: string): string[] | undefined => Array.isArray(record[key]) ? (record[key] as unknown[]).filter((item): item is string => typeof item === 'string') : undefined;
+  const requestedExecutionType = normalizeSupervisionExecutionConfig(record.requestedExecutionType);
+  const economyPolicy = normalizeSupervisionEconomyTaskPolicy(record.economyPolicy);
+  if (record.requestedExecutionType != null && !requestedExecutionType) return 'invalid';
+  if (record.economyPolicy != null && !economyPolicy) return 'invalid';
+  if (record.executionPool != null && record.executionPool !== 'primary' && record.executionPool !== 'economy') return 'invalid';
+  return {
+    taskId: stringField('taskId'),
+    topLevelTaskId: stringField('topLevelTaskId'),
+    sliceId: stringField('sliceId'),
+    classification: typeof record.classification === 'string' ? record.classification as never : undefined,
+    objective: stringField('objective'),
+    acceptance: arrayField('acceptance'),
+    ownedFiles: arrayField('ownedFiles'),
+    sharedFiles: arrayField('sharedFiles'),
+    dependencies: arrayField('dependencies'),
+    integrationOwner: stringField('integrationOwner'),
+    baseRevision: stringField('baseRevision'),
+    currentRevision: stringField('currentRevision'),
+    auditAttemptId: stringField('auditAttemptId'),
+    auditRevision: stringField('auditRevision'),
+    executionPool: record.executionPool as 'primary' | 'economy' | undefined,
+    ...(requestedExecutionType ? { requestedExecutionType } : {}),
+    ...(economyPolicy ? { economyPolicy } : {}),
   };
 }
 
@@ -927,6 +988,21 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
 
   const memoryCaller = () => deriveMemoryToolCaller(scopedCallerForDeps(caller, deps));
 
+
+  const supervisionTaskIdentity = async (): Promise<PersistedSupervisionTaskAssignmentIdentity | undefined> => {
+    if (!caller.sessionName) return undefined;
+    const sessions = await sendSessions();
+    const record = sessions.find((session) => session.name === caller.sessionName);
+    if (!record?.sessionInstanceId || !record.runtimeEpoch) return undefined;
+    return {
+      sessionName: record.name,
+      sessionInstanceId: record.sessionInstanceId,
+      runtimeEpoch: record.runtimeEpoch,
+      agentType: record.agentType,
+      providerFamily: record.providerId ?? record.agentType,
+    };
+  };
+
   return wrapHandlers({
     [MEMORY_MCP_TOOL_NAMES.SEARCH_MEMORY]: async (input) => {
       const gate = memoryGate(deps, MEMORY_FEATURE_FLAGS_BY_NAME.quickSearch, MEMORY_MCP_DISABLED_FLAGS.QUICK_SEARCH, { items: [] });
@@ -1237,13 +1313,56 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         isDispatchEnabled: () => deps.sendDeps?.isDispatchEnabled?.() ?? true,
       })) as unknown as ToolResult;
     },
+    [MEMORY_MCP_TOOL_NAMES.SESSION_RUNTIME_IDENTITY_GET]: async (input) => {
+      if (input && typeof input === 'object' && !Array.isArray(input) && Object.keys(input as Record<string, unknown>).length > 0) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'session_runtime_identity_get takes no arguments');
+      if (!caller.sessionName) return error(MCP_ERROR_REASONS.IDENTITY_REJECTED, 'bound caller session is unavailable');
+      const sessions = await sendSessions();
+      const session = sessions.find((candidate) => candidate.name === caller.sessionName);
+      if (!session || !session.sessionInstanceId || !session.runtimeEpoch) return error(MCP_ERROR_REASONS.IDENTITY_REJECTED, 'live caller runtime identity is unavailable');
+      const effectiveModel = resolveEffectiveSessionModel(session);
+      const normalizedModelId = resolvePeerAuditNormalizedModelId(session);
+      const modelSource = session.activeModel ? 'active_model'
+        : session.requestedModel ? 'requested_model'
+          : session.modelDisplay ? 'model_display'
+            : session.qwenModel ? 'qwen_model' : 'unknown';
+      return {
+        status: 'ok',
+        identity: {
+          sessionName: session.name,
+          sessionInstanceId: session.sessionInstanceId,
+          runtimeEpoch: session.runtimeEpoch,
+          agentType: session.agentType,
+          runtimeType: session.runtimeType ?? getSessionRuntimeType(session.agentType),
+          providerId: session.providerId ?? null,
+          providerFamily: resolvePeerAuditProviderFamily(session),
+          normalizedModelId: normalizedModelId === 'unknown' ? null : normalizedModelId,
+          effectiveModelId: effectiveModel ?? null,
+          activeModel: session.activeModel ?? null,
+          requestedModel: session.requestedModel ?? null,
+          modelDisplay: session.modelDisplay ?? null,
+          qwenModel: session.qwenModel ?? null,
+          modelMetadataState: effectiveModel ? 'known' : 'unknown',
+          modelMetadataSource: modelSource,
+          modelMetadataConfidence: session.activeModel ? 'daemon_observed' : effectiveModel ? 'configured' : 'none',
+          ...(effectiveModel ? {} : { unknownReason: 'no_daemon_model_metadata' }),
+          daemonVersion: DAEMON_VERSION,
+          daemonBuildRevision: process.env.IMCODES_BUILD_REVISION ?? process.env.GIT_COMMIT ?? null,
+          state: session.state,
+          replyCapable: isDelegationReplyCapableAgentType(session.agentType),
+          discoverable: isDiscoverableInterAgentSession(session),
+          projectName: resolveEffectiveProjectName(session, sessions) ?? null,
+        },
+      };
+    },
     [MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE]: async (input) => {
       const sessions = await sendSessions();
-      const args = pickAllowedMcpArgs(input, ['target', 'message', 'files', 'reply', 'audit', 'broadcast', 'idempotencyKey', 'deliveryMode', 'clone']);
+      const args = pickAllowedMcpArgs(input, ['target', 'message', 'files', 'reply', 'audit', 'task', 'broadcast', 'idempotencyKey', 'deliveryMode', 'clone']);
       const clone = parseCloneArg(args.clone);
       if (clone === 'invalid') return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'clone request is invalid');
       const audit = parseAuditArg(args.audit);
       if (audit === 'invalid') return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'audit request is invalid');
+      const task = parseTaskArg(args.task);
+      if (task === 'invalid') return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'task metadata is invalid');
       const deliveryMode = sendDeliveryModeArg(args.deliveryMode);
       if (deliveryMode === 'invalid') return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'deliveryMode is invalid');
       return dispatchSendMessage(caller, {
@@ -1252,6 +1371,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         files: stringArrayArg(args, 'files'),
         reply: boolArg(args, 'reply'),
         ...(audit ? { audit } : {}),
+        ...(task ? { task } : {}),
         broadcast: boolArg(args, 'broadcast'),
         idempotencyKey: stringArg(args, 'idempotencyKey'),
         ...(deliveryMode ? { deliveryMode } : {}),
@@ -1270,6 +1390,94 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       }, sendDepsWithSessions(sessions, {
         isDispatchEnabled: () => deps.sendDeps?.isDispatchEnabled?.() ?? true,
       })) as unknown as Promise<ToolResult>;
+    },
+
+    [MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_START]: async (input) => {
+      const args = pickAllowedMcpArgs(input, ['taskId', 'topLevelTaskId', 'classification', 'role', 'objective', 'acceptance', 'scopeFiles', 'claimMode', 'idempotencyKey']);
+      const identity = await supervisionTaskIdentity();
+      if (!identity) return error(MCP_ERROR_REASONS.IDENTITY_REJECTED, 'supervision task caller identity is unavailable');
+      const registry = getSupervisionTaskRegistry();
+      const task = registry.createOrGet({
+        taskId: stringArg(args, 'taskId'),
+        topLevelTaskId: stringArg(args, 'topLevelTaskId'),
+        classification: typeof args.classification === 'string' ? args.classification as never : undefined,
+        objective: stringArg(args, 'objective'),
+        acceptance: stringArrayArg(args, 'acceptance'),
+        idempotencyKey: stringArg(args, 'idempotencyKey'),
+      });
+      if (!task.ok) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `task_start rejected: ${task.reason}`);
+      const assignment = registry.createAssignment({
+        taskId: task.value.taskId,
+        role: typeof args.role === 'string' ? args.role as never : 'implementer',
+        identity,
+        scopeFiles: stringArrayArg(args, 'scopeFiles'),
+        claimMode: typeof args.claimMode === 'string' ? args.claimMode as never : undefined,
+        idempotencyKey: stringArg(args, 'idempotencyKey'),
+      });
+      if (!assignment.ok) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `assignment rejected: ${assignment.reason}`);
+      return { status: 'ok', taskId: task.value.taskId, assignmentId: assignment.value.assignmentId, idempotentReplay: task.replay === true || assignment.replay === true };
+    },
+    [MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_UPDATE]: async (input) => {
+      // Intent-only compatibility shim: the caller supplies metadata, never a
+      // lifecycle destination. The daemon derives the status from the intent.
+      const mapped = mapLegacySupervisionUpdate(input);
+      if (!mapped.ok) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, mapped.detail);
+      const identity = await supervisionTaskIdentity();
+      if (!identity) return error(MCP_ERROR_REASONS.IDENTITY_REJECTED, 'supervision task caller identity is unavailable');
+      const registry = getSupervisionTaskRegistry();
+      const existing = registry.getAssignment(mapped.assignmentId);
+      if (!existing) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'task_update rejected: not_found');
+      const outcome = resolveSupervisionIntent({
+        request: { intent: mapped.intent, taskId: existing.taskId, assignmentId: mapped.assignmentId },
+        currentStatus: existing.status,
+      });
+      if (!outcome.ok) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `task_update rejected: ${outcome.refusal}`);
+      const updated = registry.updateAssignment({
+        assignmentId: mapped.assignmentId, identity,
+        status: (outcome.toStatus ?? existing.status) as never,
+        revision: mapped.metadata.revision,
+        auditAttemptId: mapped.metadata.auditAttemptId,
+        auditRevision: mapped.metadata.auditRevision,
+        verdict: mapped.metadata.verdict,
+        blocker: mapped.metadata.blocker,
+        externalRunId: mapped.metadata.externalRunId,
+        externalHeadSha: mapped.metadata.externalHeadSha,
+        externalTaskId: mapped.metadata.externalTaskId,
+      });
+      return updated.ok ? { status: 'ok', item: updated.value } : error(MCP_ERROR_REASONS.VALIDATION_FAILED, `task_update rejected: ${updated.reason}`);
+    },
+    [MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_FINISH]: async (input) => {
+      // Maps to the fixed `finish` intent; the destination comes from the
+      // transition table, never from the payload.
+      const mapped = mapLegacySupervisionFinish(input);
+      if (!mapped.ok) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, mapped.detail);
+      const identity = await supervisionTaskIdentity();
+      if (!identity) return error(MCP_ERROR_REASONS.IDENTITY_REJECTED, 'supervision task caller identity is unavailable');
+      const registry = getSupervisionTaskRegistry();
+      const existing = registry.getAssignment(mapped.assignmentId);
+      if (!existing) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'task_finish rejected: not_found');
+      const outcome = resolveSupervisionIntent({
+        request: { intent: mapped.intent, taskId: existing.taskId, assignmentId: mapped.assignmentId },
+        currentStatus: existing.status,
+      });
+      if (!outcome.ok) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `task_finish rejected: ${outcome.refusal}`);
+      const updated = registry.updateAssignment({
+        assignmentId: mapped.assignmentId, identity,
+        status: (outcome.toStatus ?? existing.status) as never,
+        revision: mapped.metadata.revision, blocker: mapped.metadata.evidence,
+      });
+      return updated.ok ? { status: 'ok', item: updated.value } : error(MCP_ERROR_REASONS.VALIDATION_FAILED, `task_finish rejected: ${updated.reason}`);
+    },
+    [MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_FILE_EVENT]: async (input) => {
+      const args = pickAllowedMcpArgs(input, ['assignmentId', 'filePath', 'operation', 'beforeHash', 'afterHash', 'tool', 'source', 'idempotencyKey']);
+      const identity = await supervisionTaskIdentity();
+      if (!identity) return error(MCP_ERROR_REASONS.IDENTITY_REJECTED, 'supervision task caller identity is unavailable');
+      const assignmentId = stringArg(args, 'assignmentId');
+      const path = stringArg(args, 'filePath');
+      const operation = stringArg(args, 'operation');
+      if (!assignmentId || !path || !operation) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'assignmentId, filePath and operation are required');
+      const recorded = getSupervisionTaskRegistry().recordFileEvent({ assignmentId, path, operation: operation as never, identity, beforeHash: stringArg(args, 'beforeHash'), afterHash: stringArg(args, 'afterHash'), tool: stringArg(args, 'tool'), source: stringArg(args, 'source'), idempotencyKey: stringArg(args, 'idempotencyKey') });
+      return recorded.ok ? { status: 'ok', item: recorded.value } : error(MCP_ERROR_REASONS.VALIDATION_FAILED, `task_file_event rejected: ${recorded.reason}`);
     },
     [MEMORY_MCP_TOOL_NAMES.SEND_STOP]: async (input) => {
       const sessions = await sendSessions();
@@ -1504,7 +1712,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       const args = pickAllowedMcpArgs(input, ['machine', 'command', 'shell', 'timeoutMs']);
       const machine = machineArg(args);
       const command = stringArg(args, 'command');
-      if (!machine) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'machine must be a valid stable ref_name');
+      if (!machine) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'machine must be a canonical nodeId or deprecated legacy alias');
       if (!command) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'command is required');
       if (utf8ByteLength(command) > REMOTE_EXEC_MAX_COMMAND_BYTES) {
         return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `command must be at most ${REMOTE_EXEC_MAX_COMMAND_BYTES} UTF-8 bytes`);
@@ -1546,7 +1754,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       const args = pickAllowedMcpArgs(input, ['machine', 'sourcePath']);
       const machine = machineArg(args);
       const sourcePath = stringArg(args, 'sourcePath');
-      if (!machine || !sourcePath) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'a valid machine ref_name and sourcePath are required');
+      if (!machine || !sourcePath) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'a canonical nodeId (or deprecated legacy alias) and sourcePath are required');
       if (utf8ByteLength(sourcePath) > FILE_TRANSFER_PATH_MAX_BYTES) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'sourcePath is too long');
       const result = await deps.machineDeps.sendFileToMachine({
         machine,
@@ -1565,7 +1773,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       const sourcePath = stringArg(args, 'sourcePath');
       const destinationPath = stringArg(args, 'destinationPath');
       const overwrite = boolArg(args, 'overwrite') ?? false;
-      if (!machine || !sourcePath || !destinationPath) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'a valid machine ref_name, sourcePath, and destinationPath are required');
+      if (!machine || !sourcePath || !destinationPath) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'a canonical nodeId (or deprecated legacy alias), sourcePath, and destinationPath are required');
       if (utf8ByteLength(sourcePath) > FILE_TRANSFER_PATH_MAX_BYTES || utf8ByteLength(destinationPath) > FILE_TRANSFER_PATH_MAX_BYTES) {
         return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'file path is too long');
       }
@@ -1601,7 +1809,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       const args = pickAllowedMcpArgs(input, ['machine', 'tool', 'arguments', 'timeoutMs']);
       const machine = machineArg(args);
       const toolRaw = stringArg(args, 'tool');
-      if (!machine) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'machine must be a valid stable ref_name or local alias');
+      if (!machine) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'machine must be a canonical nodeId, deprecated legacy alias, or local alias');
       if (!toolRaw || !(COMPUTER_USE_TOOLS as readonly string[]).includes(toolRaw)) {
         return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `tool must be one of ${COMPUTER_USE_TOOLS.join(', ')}`);
       }
@@ -1679,6 +1887,7 @@ function computerUseTopLevelContent(result: ToolResult): CallToolResult['content
       )),
     },
   };
+
   return [
     { type: 'text', text: JSON.stringify(textResult) },
     ...images.map((item) => ({ type: 'image' as const, data: item.data, mimeType: item.mimeType })),
@@ -1764,6 +1973,7 @@ const schemas = {
     query: z.string().optional().describe('Case-insensitive name/display-label filter.'),
     limit: z.number().int().min(1).max(100).optional().describe('Maximum targets.'),
   }),
+  [MEMORY_MCP_TOOL_NAMES.SESSION_RUNTIME_IDENTITY_GET]: z.object({}).strict(),
   [MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE]: z.object({
     target: z.string().describe('Exact send_list_targets target; never the caller.'),
     message: z.string().describe('Complete task/request and expected output.'),
@@ -1772,6 +1982,11 @@ const schemas = {
       .describe('append (default) or ordinary durable queue.'),
     files: z.array(z.string()).optional().describe('Project-root path refs; no file bytes.'),
     reply: z.boolean().optional().describe('Request a reply/report.'),
+    task: z.object({
+      taskId: z.string().optional(), topLevelTaskId: z.string().optional(), sliceId: z.string().optional(), classification: z.enum(SUPERVISION_TASK_CLASSIFICATIONS).optional(),
+      objective: z.string().optional(), acceptance: z.array(z.string()).optional(), ownedFiles: z.array(z.string()).optional(), sharedFiles: z.array(z.string()).optional(), dependencies: z.array(z.string()).optional(),
+      integrationOwner: z.string().optional(), baseRevision: z.string().optional(), currentRevision: z.string().optional(), auditAttemptId: z.string().optional(), auditRevision: z.string().optional(),
+    }).strict().optional().describe('Optional daemon-authoritative supervision task metadata; accepted result returns taskId/assignmentId.'),
     audit: z.object({
       kind: z.literal(AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT),
       attemptId: z.string().min(1),
@@ -1789,6 +2004,15 @@ const schemas = {
     target: z.string().describe('Exact result.clone.target.'),
     idempotencyKey: z.string().optional().describe('Accepted-destroy replay key.'),
   }),
+
+  [MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_START]: z.object({
+    taskId: z.string().optional(), topLevelTaskId: z.string().optional(), classification: z.enum(SUPERVISION_TASK_CLASSIFICATIONS).optional(),
+    role: z.enum(['coordinator', 'integration_owner', 'implementer', 'auditor']), objective: z.string(), acceptance: z.array(z.string()).optional(),
+    scopeFiles: z.array(z.string()).optional(), claimMode: z.enum(['exclusive', 'shared', 'read_only']).optional(), idempotencyKey: z.string().optional(),
+  }),
+  [MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_UPDATE]: z.object({ assignmentId: z.string(), revision: z.string().optional(), auditAttemptId: z.string().optional(), auditRevision: z.string().optional(), verdict: z.string().optional(), blocker: z.string().optional(), externalRunId: z.string().optional(), externalHeadSha: z.string().optional(), externalTaskId: z.string().optional() }),
+  [MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_FINISH]: z.object({ assignmentId: z.string(), revision: z.string().optional(), evidence: z.string().optional() }),
+  [MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_FILE_EVENT]: z.object({ assignmentId: z.string(), filePath: z.string(), operation: z.enum(SUPERVISION_TASK_FILE_OPERATIONS), beforeHash: z.string().optional(), afterHash: z.string().optional(), tool: z.string().optional(), source: z.string().optional(), idempotencyKey: z.string().optional() }),
   [MEMORY_MCP_TOOL_NAMES.SEND_STOP]: z.object({
     target: z.string().optional().describe('Exact sibling target; required unless broadcast.'),
     broadcast: z.boolean().optional().describe('Stop all sendable siblings.'),
@@ -1866,17 +2090,17 @@ const schemas = {
     includeOffline: z.boolean().optional().describe('Include offline and exec-disabled machines; default false. Presence is advisory.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE]: z.strictObject({
-    machine: machineTargetRuntimeSchema.describe('Bare stable ref_name or complete ^^(ref_name) marker; no list_machines preflight when known.'),
+    machine: machineTargetRuntimeSchema.describe('Canonical 10-digit nodeId or ^^(nodeId); deprecated noncanonical legacy alias is compatibility-only. No list_machines preflight when known.'),
     command: z.string().describe('One shell command.'),
     shell: z.enum(REMOTE_EXEC_SHELLS).optional().describe('Shell.'),
     timeoutMs: z.number().int().min(REMOTE_EXEC_MIN_TIMEOUT_MS).max(REMOTE_EXEC_MAX_TIMEOUT_MS).optional().describe('Timeout ms.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.SEND_FILE_TO_MACHINE]: z.strictObject({
-    machine: machineTargetRuntimeSchema.describe('Bare stable ref_name or complete ^^(ref_name) marker.'),
+    machine: machineTargetRuntimeSchema.describe('Canonical 10-digit nodeId or ^^(nodeId); deprecated noncanonical legacy alias is compatibility-only.'),
     sourcePath: boundedUtf8String(FILE_TRANSFER_PATH_MAX_BYTES),
   }),
   [MEMORY_MCP_TOOL_NAMES.FETCH_FILE_FROM_MACHINE]: z.strictObject({
-    machine: machineTargetRuntimeSchema.describe('Bare stable ref_name or complete ^^(ref_name) marker.'),
+    machine: machineTargetRuntimeSchema.describe('Canonical 10-digit nodeId or ^^(nodeId); deprecated noncanonical legacy alias is compatibility-only.'),
     sourcePath: boundedUtf8String(FILE_TRANSFER_PATH_MAX_BYTES),
     destinationPath: boundedUtf8String(FILE_TRANSFER_PATH_MAX_BYTES),
     overwrite: z.boolean().optional(),
@@ -1885,7 +2109,7 @@ const schemas = {
     topic: z.enum(COMPUTER_USE_DOC_TOPICS).describe('Documentation topic.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL]: z.strictObject({
-    machine: machineTargetRuntimeSchema.describe('Bare stable ref_name, complete ^^(ref_name) marker, or local/localhost/self/this; do not preflight list_machines when known.'),
+    machine: machineTargetRuntimeSchema.describe('Canonical 10-digit nodeId, ^^(nodeId), deprecated noncanonical legacy alias, or local/localhost/self/this; do not preflight list_machines when known.'),
     tool: z.enum(COMPUTER_USE_TOOLS).describe('Method name.'),
     arguments: z.record(z.string(), z.unknown()).optional().describe(`Method arguments. Windows coordinate drag additionally accepts duration_ms=${COMPUTER_USE_DRAG_DURATION_MIN_MS}..${COMPUTER_USE_DRAG_DURATION_MAX_MS}.`),
     timeoutMs: z.number().int().min(COMPUTER_USE_MIN_TIMEOUT_MS).max(COMPUTER_USE_SHELL_SESSION1_MAX_TIMEOUT_MS).optional().describe('Timeout ms; GUI/browser max 120000, shell_session1 max 900000.'),

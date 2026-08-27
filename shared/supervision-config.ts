@@ -21,6 +21,13 @@ import {
   type PeerAuditTargetFingerprint,
 } from './peer-audit.js';
 import { isValidImcodesSessionName } from './session-scope.js';
+import {
+  migrateLegacySupervisionExecutionPools,
+  type SupervisionEconomyTaskPolicy,
+  type SupervisionExecutionConfig,
+  type SupervisionExecutionPoolKind,
+  type SupervisionExecutionPoolsConfig,
+} from './supervision-execution-pool.js';
 
 export const SUPERVISION_CONTRACT_IDS = {
   DECISION: 'supervision_decision_v1',
@@ -31,13 +38,34 @@ export const SUPERVISION_CONTRACT_IDS = {
   CONTEXTUAL_AUDIT: 'contextual_audit_v1',
   REWORK_BRIEF: 'rework_brief_v1',
   WAITING_HEARTBEAT: 'supervision_waiting_heartbeat_v1',
+  AUDIT_HEARTBEAT: 'supervision_audit_heartbeat_v1',
   AUDIT_TARGET_RECOVERY: 'supervision_audit_target_recovery_v1',
   AUDIT_MARKER_CORRECTION: 'supervision_audit_marker_correction_v1',
+  ORCHESTRATOR_CONTEXT: 'supervision_orchestrator_context_v1',
+  TASK_FINALIZATION: 'supervision_task_finalization_v1',
+  DELEGATION_ELIGIBILITY: 'supervision_delegation_eligibility_v1',
+  TASK_REGISTRY: 'supervision_task_registry_v1',
 } as const;
 
 export const SUPERVISION_AUDIT_TARGET_RECOVERY_AUTOMATION_KIND = 'supervision-audit-target-recovery' as const;
 export const SUPERVISION_AUDIT_MARKER_CORRECTION_AUTOMATION_KIND = 'supervision-audit-marker-correction' as const;
 export const SUPERVISION_WAITING_HEARTBEAT_AUTOMATION_KIND = 'supervision-waiting-heartbeat' as const;
+export const SUPERVISION_AUDIT_HEARTBEAT_AUTOMATION_KIND = 'supervision-audit-heartbeat' as const;
+
+export const SUPERVISION_TRUSTED_EXECUTION_CONTRACT_IDS = [
+  SUPERVISION_CONTRACT_IDS.ORCHESTRATOR_CONTEXT,
+  SUPERVISION_CONTRACT_IDS.TASK_FINALIZATION,
+  SUPERVISION_CONTRACT_IDS.DELEGATION_ELIGIBILITY,
+  SUPERVISION_CONTRACT_IDS.TASK_REGISTRY,
+] as const;
+
+export const SUPERVISION_TRUSTED_CONTRACT_DELIVERY = {
+  preferredRoles: ['system', 'developer'],
+  fallback: 'fixed_daemon_prefix',
+  reinjectEveryEntrypoint: true,
+  modelTextIsNonAuthoritative: true,
+  hardGateAuthority: ['delegation_eligibility', 'audit_reply_capability', 'matching_pass', 'stage_manifest_exact_set'],
+} as const;
 
 export const SUPERVISION_MODE = {
   OFF: 'off',
@@ -104,6 +132,465 @@ export const TASK_RUN_STATUS_MARKERS = {
   NEEDS_INPUT: '<!-- IMCODES_TASK_RUN: NEEDS_INPUT -->',
   BLOCKED: '<!-- IMCODES_TASK_RUN: BLOCKED -->',
 } as const;
+
+export const SUPERVISION_ORCHESTRATOR_STATUS_STATES = [
+  'planned',
+  'delegated',
+  'implementing',
+  'retrying_external_ci',
+  'validated',
+  'auditing',
+  'rework',
+  'passed',
+  'ready_for_integration',
+  'integrating',
+  'final_audit',
+  'committed',
+  'pushed',
+  'recovered',
+  'finalized',
+  'limited',
+  'blocker',
+] as const;
+export type SupervisionOrchestratorStatusState = typeof SUPERVISION_ORCHESTRATOR_STATUS_STATES[number];
+
+/**
+ * The ONE authoritative task lifecycle enum.
+ *
+ * Everything status-shaped derives from this array: registry columns, MCP
+ * schemas, prompts and the transition table. `file_event` and `scope_violation`
+ * are deliberately absent -- they are append-only EVENT types
+ * (see SUPERVISION_TASK_REGISTRY_EVENT_TYPES) and a task may never hold either
+ * as a status. Adding a member (`checkpointed`, `re_audit_required`, ...) is an
+ * explicit contract-version migration, never an ad-hoc text edit.
+ *
+ * The readable string IS the stable, versioned status id. UI labels and
+ * localization are separate mutable display data and must never be persisted
+ * or compared in place of these ids.
+ */
+export const SUPERVISION_TASK_LIFECYCLE_STATUSES = [
+  'planned',
+  'delegated',
+  'implementing',
+  'retrying_external_ci',
+  'validated',
+  'ready_for_audit',
+  'auditing',
+  'rework',
+  'passed',
+  'ready_for_integration',
+  'integrating',
+  'final_audit',
+  'finalizing',
+  'committed',
+  'pushed',
+  'recovered',
+  'finalized',
+  'blocked',
+  'cancelled',
+] as const;
+export type SupervisionTaskLifecycleStatus = typeof SUPERVISION_TASK_LIFECYCLE_STATUSES[number];
+
+/**
+ * @deprecated Historical name. Identical to SUPERVISION_TASK_LIFECYCLE_STATUSES
+ * by construction, so the two can no longer drift.
+ */
+export const SUPERVISION_TASK_FINALIZATION_STATES = SUPERVISION_TASK_LIFECYCLE_STATUSES;
+export type SupervisionTaskFinalizationState = SupervisionTaskLifecycleStatus;
+
+/** Bump only alongside a schema migration that maps every prior status forward. */
+export const SUPERVISION_TASK_STATUS_CONTRACT_VERSION = 1;
+
+export const SUPERVISION_TASK_FINALIZATION_FIELDS = [
+  'taskId', 'topLevelTaskId', 'acceptance', 'integrationBoundary', 'sliceId', 'ownerSession',
+  'integrationOwnerSession', 'revision', 'state', 'ownedFiles', 'dependencies', 'sharedFiles',
+  'overlappingFiles', 'integrationTaskId', 'integrationManifest', 'auditAttemptId', 'auditRevision',
+  'verdict', 'overallAuditAttemptId', 'overallAuditRevision', 'commitSha', 'pushResult',
+  'pushRemoteRef', 'stagedPaths', 'conflictedPaths', 'untrackedOtherOwnerPaths',
+] as const;
+export type SupervisionTaskFinalizationField = typeof SUPERVISION_TASK_FINALIZATION_FIELDS[number];
+
+export const SUPERVISION_TASK_FINALIZATION_FORBIDDEN_GIT_ADD = ['git add .', 'git add -A'] as const;
+export const SUPERVISION_TASK_FINALIZATION_FORBIDDEN_STAGE_PREFIXES = ['openspec/', 'docs/'] as const;
+
+export const SUPERVISION_TASK_FINALIZATION_CONTRACT = {
+  contractId: SUPERVISION_CONTRACT_IDS.TASK_FINALIZATION,
+  states: SUPERVISION_TASK_FINALIZATION_STATES,
+  fields: SUPERVISION_TASK_FINALIZATION_FIELDS,
+  forbiddenGitAdd: SUPERVISION_TASK_FINALIZATION_FORBIDDEN_GIT_ADD,
+  forbiddenStagePrefixes: SUPERVISION_TASK_FINALIZATION_FORBIDDEN_STAGE_PREFIXES,
+} as const;
+
+export interface SupervisionTaskFinalizationRecord {
+  taskId?: string | null;
+  topLevelTaskId?: string | null;
+  acceptance?: readonly string[] | null;
+  integrationBoundary?: string | null;
+  sliceId?: string | null;
+  ownerSession?: string | null;
+  integrationOwnerSession?: string | null;
+  revision?: string | number | null;
+  state?: SupervisionTaskFinalizationState | null;
+  ownedFiles?: readonly string[] | null;
+  dependencies?: readonly string[] | null;
+  sharedFiles?: readonly string[] | null;
+  overlappingFiles?: readonly string[] | null;
+  integrationTaskId?: string | null;
+  integrationManifest?: readonly SupervisionTaskFinalizationRecord[] | null;
+  auditAttemptId?: string | null;
+  auditRevision?: string | number | null;
+  verdict?: 'PASS' | 'REWORK' | string | null;
+  overallAuditAttemptId?: string | null;
+  overallAuditRevision?: string | number | null;
+  commitSha?: string | null;
+  pushResult?: string | null;
+  pushRemoteRef?: string | null;
+  stagedPaths?: readonly string[] | null;
+  conflictedPaths?: readonly string[] | null;
+  untrackedOtherOwnerPaths?: readonly string[] | null;
+}
+
+export interface SupervisionTaskFinalizationReleaseInput {
+  attemptId: string;
+  revision: string | number;
+  verdict: 'PASS' | 'REWORK' | string;
+  globalGateBlocked?: boolean;
+  pathspecs?: readonly string[] | null;
+  stagedPaths?: readonly string[] | null;
+  conflictedPaths?: readonly string[] | null;
+  untrackedOtherOwnerPaths?: readonly string[] | null;
+}
+
+export type SupervisionStageManifestIssue =
+  | 'invalid_pathspec'
+  | 'missing_manifest'
+  | 'missing_staged_paths'
+  | 'staged_extra'
+  | 'staged_missing'
+  | 'owned_files_mismatch'
+  | 'shared_file_without_integration_owner'
+  | 'staged_conflict'
+  | 'untracked_other_owner';
+
+export interface SupervisionStageManifestValidationInput {
+  pathspecs?: readonly string[] | null;
+  stagedPaths?: readonly string[] | null;
+  integrationManifest?: readonly SupervisionTaskFinalizationRecord[] | null;
+  ownedFiles?: readonly string[] | null;
+  conflictedPaths?: readonly string[] | null;
+  untrackedOtherOwnerPaths?: readonly string[] | null;
+}
+
+function normalizeSupervisionPathSet(paths: readonly string[] | null | undefined): string[] {
+  return [...new Set((paths ?? [])
+    .filter((value): value is string => typeof value === 'string')
+    .map((value) => value.trim())
+    .filter(Boolean))]
+    .sort();
+}
+
+function supervisionPathspecContains(pathspec: string, file: string): boolean {
+  const trimmed = pathspec.trim();
+  if (!trimmed) return false;
+  if (trimmed.endsWith('/')) return file.startsWith(trimmed);
+  return file === trimmed;
+}
+
+function sameSupervisionPathSet(a: readonly string[], b: readonly string[]): boolean {
+  return a.length === b.length && a.every((value, index) => value === b[index]);
+}
+
+export function isValidSupervisionOwnedPathspecs(paths: readonly string[] | null | undefined): boolean {
+  if (!paths || paths.length === 0) return false;
+  return paths.every((pathspec) => {
+    if (typeof pathspec !== 'string') return false;
+    const trimmed = pathspec.trim();
+    if (!trimmed || trimmed === '.' || trimmed === '-A') return false;
+    if ((SUPERVISION_TASK_FINALIZATION_FORBIDDEN_GIT_ADD as readonly string[]).includes(`git add ${trimmed}`)) return false;
+    return !(SUPERVISION_TASK_FINALIZATION_FORBIDDEN_STAGE_PREFIXES as readonly string[])
+      .some((prefix) => trimmed === prefix.slice(0, -1) || trimmed.startsWith(prefix));
+  });
+}
+
+export function validateSupervisionStageManifest(
+  input: SupervisionStageManifestValidationInput,
+): { ok: true } | { ok: false; issue: SupervisionStageManifestIssue; path?: string } {
+  if (!isValidSupervisionOwnedPathspecs(input.pathspecs)) return { ok: false, issue: 'invalid_pathspec' };
+  const pathspecSet = normalizeSupervisionPathSet(input.pathspecs);
+  const conflicted = normalizeSupervisionPathSet(input.conflictedPaths);
+  if (conflicted.length) return { ok: false, issue: 'staged_conflict', path: conflicted[0] };
+  for (const untracked of normalizeSupervisionPathSet(input.untrackedOtherOwnerPaths)) {
+    if (pathspecSet.some((pathspec) => supervisionPathspecContains(pathspec, untracked))) {
+      return { ok: false, issue: 'untracked_other_owner', path: untracked };
+    }
+  }
+  const manifest = input.integrationManifest ?? [];
+  if (manifest.length === 0) return { ok: false, issue: 'missing_manifest' };
+  const expected: string[] = [];
+  const seen = new Set<string>();
+  for (const slice of manifest) {
+    const files = normalizeSupervisionPathSet(slice.ownedFiles);
+    if (!files.length) return { ok: false, issue: 'missing_manifest' };
+    for (const file of files) {
+      if (seen.has(file)) return { ok: false, issue: 'shared_file_without_integration_owner', path: file };
+      seen.add(file);
+      expected.push(file);
+    }
+  }
+  const expectedSet = normalizeSupervisionPathSet(expected);
+  const ownedSet = normalizeSupervisionPathSet(input.ownedFiles);
+  if (!sameSupervisionPathSet(ownedSet, expectedSet)) return { ok: false, issue: 'owned_files_mismatch' };
+  const stagedSet = normalizeSupervisionPathSet(input.stagedPaths);
+  if (!stagedSet.length) return { ok: false, issue: 'missing_staged_paths' };
+  for (const staged of stagedSet) {
+    if (!isValidSupervisionOwnedPathspecs([staged])) return { ok: false, issue: 'invalid_pathspec', path: staged };
+    if (!expectedSet.includes(staged)) return { ok: false, issue: 'staged_extra', path: staged };
+  }
+  for (const expectedPath of expectedSet) {
+    if (!stagedSet.includes(expectedPath)) return { ok: false, issue: 'staged_missing', path: expectedPath };
+  }
+  return { ok: true };
+}
+
+export function canMarkSupervisionSliceReadyForIntegration(
+  slice: SupervisionTaskFinalizationRecord,
+  pass: SupervisionTaskFinalizationReleaseInput,
+): boolean {
+  if (pass.globalGateBlocked) return false;
+  if (pass.verdict !== 'PASS') return false;
+  if (!slice.ownerSession) return false;
+  if (!slice.topLevelTaskId) return false;
+  if (slice.auditAttemptId !== pass.attemptId) return false;
+  if (String(slice.revision ?? '') !== String(pass.revision)) return false;
+  if (String(slice.auditRevision ?? '') !== String(pass.revision)) return false;
+  if (!isValidSupervisionOwnedPathspecs(slice.ownedFiles)) return false;
+  return true;
+}
+
+export function canReleaseSupervisionTaskFinalization(
+  task: SupervisionTaskFinalizationRecord,
+  pass: SupervisionTaskFinalizationReleaseInput,
+): boolean {
+  if (pass.globalGateBlocked) return false;
+  if (pass.verdict !== 'PASS') return false;
+  const auditAttemptId = task.overallAuditAttemptId ?? task.auditAttemptId;
+  const auditRevision = task.overallAuditRevision ?? task.auditRevision;
+  if (auditAttemptId !== pass.attemptId) return false;
+  if (String(task.revision ?? '') !== String(pass.revision)) return false;
+  if (String(auditRevision ?? '') !== String(pass.revision)) return false;
+  if (!task.integrationOwnerSession) return false;
+  if (!task.topLevelTaskId || !task.integrationBoundary || !task.acceptance?.length) return false;
+  if (!task.integrationManifest || task.integrationManifest.length === 0) return false;
+  if (!task.integrationManifest.every((slice) => canMarkSupervisionSliceReadyForIntegration(slice, {
+    attemptId: String(slice.auditAttemptId ?? ''),
+    revision: slice.revision ?? '',
+    verdict: 'PASS',
+  }))) return false;
+  return validateSupervisionStageManifest({
+    pathspecs: pass.pathspecs,
+    stagedPaths: pass.stagedPaths,
+    conflictedPaths: pass.conflictedPaths,
+    untrackedOtherOwnerPaths: pass.untrackedOtherOwnerPaths,
+    integrationManifest: task.integrationManifest,
+    ownedFiles: task.ownedFiles,
+  }).ok === true;
+}
+
+export const SUPERVISION_DELEGATION_ELIGIBILITY_FORBIDDEN_AGENT_TYPES = ['shell', 'script'] as const;
+export type SupervisionDelegationEligibilityForbiddenAgentType = typeof SUPERVISION_DELEGATION_ELIGIBILITY_FORBIDDEN_AGENT_TYPES[number];
+
+export const SUPERVISION_DELEGATION_ELIGIBILITY_REQUIRED_TARGET_FIELDS = [
+  'targetSession', 'agentType', 'providerFamily', 'availability', 'limitGroup', 'replyCapable',
+] as const;
+export type SupervisionDelegationEligibilityRequiredTargetField = typeof SUPERVISION_DELEGATION_ELIGIBILITY_REQUIRED_TARGET_FIELDS[number];
+
+export const SUPERVISION_DELEGATION_ELIGIBILITY_DECISIONS = [
+  'eligible', 'queue_only', 'limited', 'offline', 'missing_fields', 'forbidden_agent_type',
+  'not_reply_capable', 'same_family_degraded', 'no_cross_vendor_blocker', 'daemon_fixed_target',
+] as const;
+export type SupervisionDelegationEligibilityDecision = typeof SUPERVISION_DELEGATION_ELIGIBILITY_DECISIONS[number];
+
+export const SUPERVISION_DELEGATION_ELIGIBILITY_TASK_LIST_FIELDS = [
+  'targetSession', 'targetAgentType', 'providerFamily', 'availability', 'limitGroup', 'replyCapable',
+  'eligibilityDecision', 'limitedReason', 'degradedReason',
+] as const;
+export type SupervisionDelegationEligibilityTaskListField = typeof SUPERVISION_DELEGATION_ELIGIBILITY_TASK_LIST_FIELDS[number];
+
+export const SUPERVISION_DELEGATION_ELIGIBILITY_POLICY = {
+  contractId: SUPERVISION_CONTRACT_IDS.DELEGATION_ELIGIBILITY,
+  forbiddenAgentTypes: SUPERVISION_DELEGATION_ELIGIBILITY_FORBIDDEN_AGENT_TYPES,
+  requiredTargetFields: SUPERVISION_DELEGATION_ELIGIBILITY_REQUIRED_TARGET_FIELDS,
+  decisions: SUPERVISION_DELEGATION_ELIGIBILITY_DECISIONS,
+  taskListFields: SUPERVISION_DELEGATION_ELIGIBILITY_TASK_LIST_FIELDS,
+} as const;
+
+export interface SupervisionDelegationEligibilityCandidate {
+  targetSession?: string | null;
+  agentType?: string | null;
+  providerFamily?: string | null;
+  availability?: 'ready' | 'busy' | 'limited' | 'offline' | 'unknown' | 'missing' | string | null;
+  limitGroup?: string | null;
+  replyCapable?: boolean | null;
+}
+
+export interface SupervisionDelegationEligibilityInput {
+  candidate: SupervisionDelegationEligibilityCandidate;
+  implementerProviderFamily?: string | null;
+  crossVendorReadyAvailable?: boolean;
+  daemonFixedAttemptTarget?: boolean;
+}
+
+export function evaluateSupervisionDelegationEligibility(
+  input: SupervisionDelegationEligibilityInput,
+): SupervisionDelegationEligibilityDecision {
+  if (input.daemonFixedAttemptTarget) return 'daemon_fixed_target';
+  const candidate = input.candidate;
+  if (!candidate.targetSession || !candidate.agentType || !candidate.providerFamily
+    || !candidate.availability || !candidate.limitGroup || typeof candidate.replyCapable !== 'boolean') {
+    return 'missing_fields';
+  }
+  if ((SUPERVISION_DELEGATION_ELIGIBILITY_FORBIDDEN_AGENT_TYPES as readonly string[]).includes(candidate.agentType)) return 'forbidden_agent_type';
+  if (!candidate.replyCapable) return 'not_reply_capable';
+  if (candidate.availability === 'limited') return 'limited';
+  if (candidate.availability === 'offline') return 'offline';
+  if (candidate.availability !== 'ready' && candidate.availability !== 'busy') return 'missing_fields';
+  if (candidate.availability === 'busy') return 'queue_only';
+  if (input.implementerProviderFamily && candidate.providerFamily === input.implementerProviderFamily) {
+    return input.crossVendorReadyAvailable ? 'same_family_degraded' : 'no_cross_vendor_blocker';
+  }
+  return 'eligible';
+}
+
+export const SUPERVISION_TASK_REGISTRY_VERSION = 1 as const;
+
+export const SUPERVISION_TASK_CLASSIFICATIONS = [
+  'independent_top_level',
+  'integration_slice',
+  'integration_task',
+] as const;
+export type SupervisionTaskClassification = typeof SUPERVISION_TASK_CLASSIFICATIONS[number];
+
+export const SUPERVISION_TASK_FILE_OPERATIONS = ['create', 'modify', 'delete', 'rename'] as const;
+export type SupervisionTaskFileOperation = typeof SUPERVISION_TASK_FILE_OPERATIONS[number];
+
+export const SUPERVISION_TASK_FILE_TRACKING_MODE = 'caller_reported_only' as const;
+export const SUPERVISION_TASK_SCOPE_RECONCILIATION_MODE = 'caller_supplied_observations_only' as const;
+
+export const SUPERVISION_TASK_REGISTRY_EVENT_TYPES = [
+  'created',
+  'delegated',
+  'implementing',
+  'retrying_external_ci',
+  'validated',
+  'ready_for_audit',
+  'audit_requested',
+  'audit_replied',
+  'rework',
+  'passed',
+  'ready_for_integration',
+  'finalizing',
+  'committed',
+  'pushed',
+  'recovered',
+  'finalized',
+  'blocked',
+  'cancelled',
+  'file_event',
+  'scope_violation',
+] as const;
+export type SupervisionTaskRegistryEventType = typeof SUPERVISION_TASK_REGISTRY_EVENT_TYPES[number];
+
+export interface SupervisionTaskOwnerIdentity {
+  sessionName: string;
+  sessionInstanceId: string;
+  runtimeEpoch: string;
+  agentType: string;
+  providerFamily: string;
+}
+
+export interface SupervisionTaskScopeReconciliation {
+  trackedPaths?: readonly string[] | null;
+  untrackedPaths?: readonly string[] | null;
+  deletedPaths?: readonly string[] | null;
+  currentRevision?: string | null;
+}
+
+export interface SupervisionTaskMetadata {
+  topLevelTaskId?: string | null;
+  taskId?: string | null;
+  sliceId?: string | null;
+  classification?: SupervisionTaskClassification | null;
+  objective?: string | null;
+  acceptance?: readonly string[] | null;
+  ownedFiles?: readonly string[] | null;
+  sharedFiles?: readonly string[] | null;
+  dependencies?: readonly string[] | null;
+  integrationOwner?: string | null;
+  baseRevision?: string | null;
+  currentRevision?: string | null;
+  auditAttemptId?: string | null;
+  auditRevision?: string | number | null;
+  executionPool?: SupervisionExecutionPoolKind | null;
+  requestedExecutionType?: SupervisionExecutionConfig | null;
+  economyPolicy?: SupervisionEconomyTaskPolicy | null;
+}
+
+export const SUPERVISION_TASK_REGISTRY_CONTRACT = {
+  contractId: SUPERVISION_CONTRACT_IDS.TASK_REGISTRY,
+  version: SUPERVISION_TASK_REGISTRY_VERSION,
+  classifications: SUPERVISION_TASK_CLASSIFICATIONS,
+  statuses: SUPERVISION_TASK_LIFECYCLE_STATUSES,
+  eventTypes: SUPERVISION_TASK_REGISTRY_EVENT_TYPES,
+  fileOperations: SUPERVISION_TASK_FILE_OPERATIONS,
+  fileTracking: {
+    mode: SUPERVISION_TASK_FILE_TRACKING_MODE,
+    automaticProviderToolHook: false,
+    filesystemOrGitScanner: false,
+    reconciliationMode: SUPERVISION_TASK_SCOPE_RECONCILIATION_MODE,
+    detectsUnreportedWrites: false,
+  },
+} as const;
+
+export function isSupervisionTaskClassification(value: unknown): value is SupervisionTaskClassification {
+  return typeof value === 'string' && (SUPERVISION_TASK_CLASSIFICATIONS as readonly string[]).includes(value);
+}
+
+export function isSupervisionTaskLifecycleStatus(value: unknown): value is SupervisionTaskLifecycleStatus {
+  return typeof value === 'string' && (SUPERVISION_TASK_LIFECYCLE_STATUSES as readonly string[]).includes(value);
+}
+
+export function isTerminalSupervisionTaskStatus(value: SupervisionTaskLifecycleStatus): boolean {
+  return value === 'pushed' || value === 'finalized' || value === 'blocked' || value === 'cancelled';
+}
+
+const SUPERVISION_TASK_ALLOWED_TRANSITIONS: Readonly<Record<SupervisionTaskLifecycleStatus, readonly SupervisionTaskLifecycleStatus[]>> = {
+  planned: ['delegated', 'implementing', 'blocked', 'cancelled'],
+  delegated: ['implementing', 'retrying_external_ci', 'validated', 'ready_for_audit', 'auditing', 'rework', 'ready_for_integration', 'blocked', 'cancelled'],
+  implementing: ['retrying_external_ci', 'validated', 'ready_for_audit', 'blocked', 'cancelled'],
+  retrying_external_ci: ['implementing', 'recovered', 'validated', 'ready_for_audit', 'blocked', 'cancelled'],
+  validated: ['ready_for_audit', 'auditing', 'blocked', 'cancelled'],
+  ready_for_audit: ['auditing', 'blocked', 'cancelled'],
+  auditing: ['rework', 'passed', 'ready_for_integration', 'blocked', 'cancelled'],
+  rework: ['implementing', 'validated', 'ready_for_audit', 'auditing', 'ready_for_integration', 'blocked', 'cancelled'],
+  passed: ['ready_for_integration', 'finalizing', 'blocked', 'cancelled'],
+  ready_for_integration: ['integrating', 'finalizing', 'blocked', 'cancelled'],
+  integrating: ['final_audit', 'validated', 'blocked', 'cancelled'],
+  final_audit: ['rework', 'passed', 'finalizing', 'blocked', 'cancelled'],
+  finalizing: ['committed', 'blocked', 'cancelled'],
+  committed: ['pushed', 'blocked'],
+  pushed: ['finalized'],
+  recovered: ['finalized', 'validated', 'ready_for_audit', 'blocked', 'cancelled'],
+  finalized: [],
+  blocked: [],
+  cancelled: [],
+};
+
+export function canTransitionSupervisionTaskStatus(
+  from: SupervisionTaskLifecycleStatus,
+  to: SupervisionTaskLifecycleStatus,
+): boolean {
+  return from === to || (SUPERVISION_TASK_ALLOWED_TRANSITIONS[from] as readonly SupervisionTaskLifecycleStatus[]).includes(to);
+}
 
 export const SUPERVISION_EXECUTION_STATUS_MARKERS = {
   ADVANCE: '<!-- IMCODES_EXEC: ADVANCE -->',
@@ -183,6 +670,8 @@ export interface SupervisorDefaultConfig {
   backupBackend?: SharedContextRuntimeBackend;
   backupModel?: string;
   backupPreset?: string;
+  /** Exactly two user-configured execution pools. Legacy/unconfigured is fail-closed. */
+  executionPools: SupervisionExecutionPoolsConfig;
 }
 
 export interface SessionSupervisionSnapshot extends SupervisorDefaultConfig {
@@ -328,6 +817,11 @@ export function normalizeSupervisorDefaultConfig(
     promptVersion: trimString(merged.promptVersion) ?? SUPERVISION_DEFAULT_PROMPT_VERSION,
     maxAutoContinueStreak: normalizeNonNegativeInteger(merged.maxAutoContinueStreak, SUPERVISION_DEFAULT_MAX_AUTO_CONTINUE_STREAK),
     maxAutoContinueTotal: normalizeNonNegativeInteger(merged.maxAutoContinueTotal, SUPERVISION_DEFAULT_MAX_AUTO_CONTINUE_TOTAL),
+    executionPools: migrateLegacySupervisionExecutionPools({
+      backend: normalizedBackend,
+      model,
+      executionPools: merged.executionPools,
+    }),
     ...(customInstructions ? { customInstructions } : {}),
     ...(preset ? { preset } : {}),
     ...(backup.backend && backup.model ? {
@@ -468,7 +962,8 @@ export function getSessionSupervisionSnapshotIssues(
       if (record.auditMode !== '' && !isSupportedSupervisionAuditMode(String(record.auditMode))) issues.push('invalid_audit_mode');
       else issues.push('legacy_audit_mode_requires_repair');
     }
-    if (!hasTargetName) issues.push('missing_audit_target');
+    // Automatic audit routing is dynamic. A remembered target is optional
+    // compatibility/UI state and never authorizes or blocks candidate choice.
     if (
       record.maxAuditLoops != null
       && (typeof record.maxAuditLoops !== 'number' || !Number.isFinite(record.maxAuditLoops) || Math.floor(record.maxAuditLoops) < 0)

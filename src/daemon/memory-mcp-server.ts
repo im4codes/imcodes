@@ -10,6 +10,7 @@ import {
 } from './memory-mcp-caller.js';
 import { registerAliasMcpTools, registerMemoryMcpTools, type MemoryMcpToolDeps } from './memory-mcp-tools.js';
 import { registerMessagePinMcpTools, type MessagePinMcpToolDeps } from './message-pin-mcp-tools.js';
+import { registerSupervisionMcpTools, type SupervisionMcpToolDeps } from './supervision-mcp-tools.js';
 import { createDaemonMachineToolDeps } from './machine-mcp-deps.js';
 import { loadStore, type SessionRecord } from '../store/session-store.js';
 import { isDaemonCapabilityAdvertised } from './server-link.js';
@@ -40,6 +41,7 @@ export function createMemoryMcpServer(
   caller: McpRuntimeCaller,
   toolDeps: MemoryMcpToolDeps = {},
   messagePinToolDeps: MessagePinMcpToolDeps = {},
+  supervisionToolDeps: SupervisionMcpToolDeps = {},
 ): McpServer {
   const server = new McpServer({
     name: IMCODES_MEMORY_MCP_SERVER_NAME,
@@ -53,6 +55,9 @@ export function createMemoryMcpServer(
   // the fuzzy-memory contract list and schema firewall.
   registerAliasMcpTools(server, caller);
   registerMessagePinMcpTools(server, caller, messagePinToolDeps);
+  // Supervision registry: exact server-backed operations, same separation as
+  // alias/message-pin tools -- outside the fuzzy-memory contract + firewall.
+  registerSupervisionMcpTools(server, caller, supervisionToolDeps);
   return server;
 }
 
