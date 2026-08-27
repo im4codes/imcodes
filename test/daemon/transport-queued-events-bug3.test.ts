@@ -20,16 +20,14 @@
  * to a state-string-only comparison, this test fails immediately.
  *
  * Coverage anchors:
- *   - `src/daemon/timeline-emitter.ts:emit` — dedup gate must allow
- *     payload-mutation broadcasts.
- *   - `src/daemon/command-handler.ts:3348-3354` — queued emission shape
- *     (pendingCount + pendingMessages + pendingMessageEntries) is the
- *     contract this test mirrors.
+ *   - `src/daemon/transport-queue-projection.ts` — the canonical SQLite
+ *     snapshot projection derives pendingCount from authoritative entries.
+ *   - `src/daemon/timeline-emitter.ts:emit` — dedup gate must allow complete
+ *     queue-authority mutations while rejecting legacy flat queue fields.
  *
  * The test deliberately bypasses `handleSend` itself (which has many
- * orthogonal dependencies) and emits the same payload shape directly.
- * The dedup logic operates purely on emitter payload — bypassing
- * handleSend is sufficient and keeps the test focused.
+ * orthogonal dependencies), but uses the production snapshot projector so it
+ * cannot drift back to a legacy pendingCount-only payload.
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
@@ -45,6 +43,34 @@ vi.mock('../../src/daemon/timeline-store.js', () => ({
 }));
 
 import { TimelineEmitter } from '../../src/daemon/timeline-emitter.js';
+import { transportQueueSnapshotToPayload } from '../../src/daemon/transport-queue-projection.js';
+import type { QueueSnapshot } from '../../shared/transport-queue-types.js';
+
+function queueSnapshot(
+  sessionName: string,
+  pendingMessageVersion: number,
+  ids: string[],
+): QueueSnapshot {
+  return {
+    type: 'transport.queue.snapshot',
+    sessionName,
+    queueEpoch: `epoch-${sessionName}`,
+    queueAuthorityId: `authority-${sessionName}`,
+    pendingMessageVersion,
+    pendingMessageEntries: ids.map((clientMessageId, ordinal) => ({
+      clientMessageId,
+      commandId: `cmd-${clientMessageId}`,
+      text: clientMessageId,
+      status: 'queued',
+      placement: 'normal',
+      ordinal,
+      createdAt: ordinal + 1,
+      updatedAt: pendingMessageVersion,
+    })),
+    failedMessageEntries: [],
+    source: 'test',
+  };
+}
 
 describe('bug 3 end-to-end: queued session.state snapshots reach UI handler (audit f395d49c-78c)', () => {
   let emitter: TimelineEmitter;
@@ -70,40 +96,25 @@ describe('bug 3 end-to-end: queued session.state snapshots reach UI handler (aud
   });
 
   it('T7: connecting 3 sends while runtime is busy produces 3 distinct queued events with pendingCount 1/2/3', () => {
-    // Simulate the exact emission shape `handleSend` produces at
-    // `command-handler.ts:3348-3354` when `runtime.send()` returns
-    // 'queued' three times in a row. Each emission carries the
-    // CURRENT snapshot of runtime.pendingEntries (growing as more
-    // messages are queued).
+    // Simulate the exact canonical projection `handleSend` emits when
+    // `runtime.send()` returns `queued` three times in a row. Each event owns a
+    // complete queue authority and the CURRENT SQLite snapshot.
     const sessionName = 'deck_bug3_brain';
 
     // After msg-1 arrives during an in-flight turn:
     emitter.emit(sessionName, 'session.state', {
       state: 'queued',
-      pendingCount: 1,
-      pendingMessages: ['msg-1'],
-      pendingMessageEntries: [{ clientMessageId: 'cmd-1', text: 'msg-1' }],
+      ...transportQueueSnapshotToPayload(queueSnapshot(sessionName, 1, ['cmd-1'])),
     });
     // msg-2 arrives next:
     emitter.emit(sessionName, 'session.state', {
       state: 'queued',
-      pendingCount: 2,
-      pendingMessages: ['msg-1', 'msg-2'],
-      pendingMessageEntries: [
-        { clientMessageId: 'cmd-1', text: 'msg-1' },
-        { clientMessageId: 'cmd-2', text: 'msg-2' },
-      ],
+      ...transportQueueSnapshotToPayload(queueSnapshot(sessionName, 2, ['cmd-1', 'cmd-2'])),
     });
     // msg-3 arrives last:
     emitter.emit(sessionName, 'session.state', {
       state: 'queued',
-      pendingCount: 3,
-      pendingMessages: ['msg-1', 'msg-2', 'msg-3'],
-      pendingMessageEntries: [
-        { clientMessageId: 'cmd-1', text: 'msg-1' },
-        { clientMessageId: 'cmd-2', text: 'msg-2' },
-        { clientMessageId: 'cmd-3', text: 'msg-3' },
-      ],
+      ...transportQueueSnapshotToPayload(queueSnapshot(sessionName, 3, ['cmd-1', 'cmd-2', 'cmd-3'])),
     });
 
     // Before the NF1 fix only the FIRST event would reach the handler.
@@ -113,9 +124,7 @@ describe('bug 3 end-to-end: queued session.state snapshots reach UI handler (aud
     expect(received[1].pendingCount).toBe(2);
     expect(received[2].pendingCount).toBe(3);
     expect(received[2].entries?.map((entry) => entry.clientMessageId)).toEqual([
-      'cmd-1',
-      'cmd-2',
-      'cmd-3',
+      'cmd-1', 'cmd-2', 'cmd-3',
     ]);
   });
 
@@ -130,8 +139,7 @@ describe('bug 3 end-to-end: queued session.state snapshots reach UI handler (aud
     emitter.emit(sessionName, 'session.state', { state: 'running' });
     emitter.emit(sessionName, 'session.state', {
       state: 'running',
-      pendingCount: 0,
-      pendingMessageEntries: [],
+      ...transportQueueSnapshotToPayload(queueSnapshot(sessionName, 4, [])),
     });
 
     expect(received).toHaveLength(2);

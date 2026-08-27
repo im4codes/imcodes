@@ -45,6 +45,8 @@ export type TransportQueueSnapshotPayload = {
   queueEpoch: QueueSnapshot['queueEpoch'];
   queueAuthorityId: QueueSnapshot['queueAuthorityId'];
   pendingMessageVersion: QueueSnapshot['pendingMessageVersion'];
+  /** Exact diagnostic alias; authority still requires epoch + authority id + version. */
+  pendingCount: number;
   pendingMessageEntries: QueueSnapshot['pendingMessageEntries'];
   failedMessageEntries: QueueSnapshot['failedMessageEntries'];
   resetReason?: QueueSnapshot['resetReason'];
@@ -82,6 +84,7 @@ export function transportQueueSnapshotToPayload(snapshot: QueueSnapshot): Transp
     queueEpoch: snapshot.queueEpoch,
     queueAuthorityId: snapshot.queueAuthorityId,
     pendingMessageVersion: snapshot.pendingMessageVersion,
+    pendingCount: snapshot.pendingMessageEntries.length,
     pendingMessageEntries: snapshot.pendingMessageEntries,
     failedMessageEntries: snapshot.failedMessageEntries,
     ...(snapshot.resetReason ? { resetReason: snapshot.resetReason } : {}),

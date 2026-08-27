@@ -96,24 +96,26 @@ export class TimelineEmitter {
     // Deduplicate session.state — skip repeated same-state events to avoid UI flicker,
     // but still return a synthetic event so callers (store updates, idle callbacks) proceed.
     //
-    // Structured queue authority fields bypass state-only dedupe. Legacy
-    // diagnostic fields such as pendingCount/pendingMessages must not trigger
-    // queue mutation delivery.
+    // Only a complete structured queue authority can bypass state-only dedupe.
+    // Individual queue-looking fields are not authoritative: accepting an
+    // entries array, epoch, authority id, or version by itself lets a partial
+    // legacy/stale payload masquerade as a live queue mutation. Legacy
+    // diagnostic fields such as pendingCount/pendingMessages are likewise not
+    // queue authority. Session errors remain independently deliverable.
     if (type === 'session.state') {
       const state = String(payload.state ?? '');
-      const hasQueueMutation = Array.isArray(payload.pendingMessageEntries)
-        || Array.isArray(payload.transportPendingMessageEntries)
-        || Array.isArray(payload.failedMessageEntries)
-        || typeof payload.queueEpoch === 'string'
-        || typeof payload.queueAuthorityId === 'string'
-        || typeof payload.pendingMessageVersion === 'number'
-        || typeof payload.transportPendingMessageVersion === 'number'
-        || typeof payload.resetReason === 'string'
-        || typeof payload.dropReason === 'string'
-        || typeof payload.degradedReason === 'string'
-        || typeof payload.queueError === 'string'
-        || 'error' in payload;
-      if (!hasQueueMutation && this.lastSessionState.get(sessionId) === state) {
+      const pendingMessageVersion = typeof payload.pendingMessageVersion === 'number'
+        ? payload.pendingMessageVersion
+        : payload.transportPendingMessageVersion;
+      const hasStructuredQueueMutation = typeof payload.queueEpoch === 'string'
+        && payload.queueEpoch.trim().length > 0
+        && typeof payload.queueAuthorityId === 'string'
+        && payload.queueAuthorityId.trim().length > 0
+        && typeof pendingMessageVersion === 'number'
+        && Number.isFinite(pendingMessageVersion);
+      const hasErrorMutation = 'error' in payload;
+      if (!hasStructuredQueueMutation && !hasErrorMutation
+        && this.lastSessionState.get(sessionId) === state) {
         // State unchanged AND no queue/error snapshot — don't emit to
         // handlers/UI, but still return synthetic event for caller.
         finishTrace('synthetic');
