@@ -2224,7 +2224,14 @@ describe('handleWebCommand transport queue behavior', () => {
 
   it('acks ordinary transport sends before provider send-start settles', async () => {
     vi.stubEnv('IMCODES_TRANSPORT_PROVIDER_SEND_TIMEOUT_MS', '30');
-    const providerSend = vi.fn(() => new Promise(() => {}));
+    let settleProviderSend!: () => void;
+    let providerSendSettled = false;
+    const providerSend = vi.fn(() => new Promise<void>((resolve) => {
+      settleProviderSend = () => {
+        providerSendSettled = true;
+        resolve();
+      };
+    }));
     const runtime = new TransportSessionRuntime(makeRuntimeProvider(providerSend), 'deck_transport_brain');
     await runtime.initialize({
       sessionKey: 'deck_transport_brain',
@@ -2239,22 +2246,38 @@ describe('handleWebCommand transport queue behavior', () => {
       text: 'ordinary provider send-start should not hold ack',
       commandId: 'cmd-provider-start-hang',
     }, serverLink as any);
-    await flushAsync();
-    await flushAsync();
+    try {
+      await waitForAsync(() => providerSend.mock.calls.length === 1);
 
-    expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'command.ack', {
-      commandId: 'cmd-provider-start-hang',
-      status: 'accepted',
-    });
-    expect(providerSend).toHaveBeenCalledWith('sess-1', expect.objectContaining({
-      userMessage: 'ordinary provider send-start should not hold ack',
-    }));
-    const ackOrder = firstInvocationOrder((call) =>
-      call[0] === 'deck_transport_brain'
-      && call[1] === 'command.ack'
-      && (call[2] as Record<string, unknown>)?.commandId === 'cmd-provider-start-hang',
-    );
-    expect(ackOrder).toBeLessThan(providerSend.mock.invocationCallOrder[0]);
+      expect(providerSendSettled).toBe(false);
+      expect(runtime.sending).toBe(true);
+      expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'command.ack', {
+        commandId: 'cmd-provider-start-hang',
+        status: 'accepted',
+      });
+      expect(providerSend).toHaveBeenCalledWith('sess-1', expect.objectContaining({
+        userMessage: 'ordinary provider send-start should not hold ack',
+      }));
+      const ackOrder = firstInvocationOrder((call) =>
+        call[0] === 'deck_transport_brain'
+        && call[1] === 'command.ack'
+        && (call[2] as Record<string, unknown>)?.commandId === 'cmd-provider-start-hang',
+      );
+      expect(ackOrder).toBeLessThan(providerSend.mock.invocationCallOrder[0]);
+    } finally {
+      // Do not leave a deliberately unresolved provider send, its watchdog,
+      // and an active runtime turn alive after this test. Under a loaded test
+      // worker that leaked work can be starved far beyond the 50ms bounded
+      // timeout and make an unrelated file-level run look deterministically
+      // hung. The deferred still proves the receipt ACK while send-start is
+      // unsettled; explicit settlement makes the test lifecycle bounded.
+      settleProviderSend?.();
+      await flushAsync();
+      await runtime.kill();
+    }
+
+    expect(providerSendSettled).toBe(true);
+    expect(runtime.sending).toBe(false);
   });
 
   it('acks before bootstrap/recall finish and still sends the SDK turn without recall after failures', async () => {
