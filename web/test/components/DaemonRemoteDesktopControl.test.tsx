@@ -105,12 +105,16 @@ describe('DaemonRemoteDesktopControl', () => {
     expect(button.getAttribute('title')).toBe('remote_desktop.daemon_control');
     fireEvent.click(button);
     expect(onOpen).toHaveBeenCalledTimes(1);
-    // The panel is keyed by serverId, and gates on these fields.
-    expect(onOpen.mock.calls[0]![0]).toMatchObject({
+    // The panel is keyed by serverId and capability authority. Pin the whole
+    // synthetic daemon projection so descriptive OS metadata cannot return as
+    // an implicit launch gate.
+    expect(onOpen.mock.calls[0]![0]).toEqual({
       serverId: 'server_1',
-      os: 'win',
+      refName: '',
+      displayName: 'winbox',
       online: true,
       execEnabled: true,
+      accessRole: 'owner',
       capabilities: [REMOTE_DESKTOP_CAPABILITY],
     });
   });
