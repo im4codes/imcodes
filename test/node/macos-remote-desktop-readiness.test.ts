@@ -101,19 +101,22 @@ describe('macOS remote-desktop runtime readiness', () => {
     expect(advertised).not.toContain(REMOTE_DESKTOP_CAPTURE_CAPABILITY.LINUX_PORTAL_PIPEWIRE);
   });
 
-  it('advertises display control and LoginWindow only after their real local seams are ready', () => {
-    const qualified = resolveMacosRemoteDesktopRuntimeProfile({
+  it('does not widen authority from partial virtual-display or LoginWindow probe evidence', () => {
+    const partialLocalEvidence = resolveMacosRemoteDesktopRuntimeProfile({
       ...READY,
       virtualDisplay: true,
       loginWindow: true,
     });
-    const advertised = [...qualified.sessionCapabilities, ...qualified.adapterCapabilities];
-    expect(advertised).toContain(REMOTE_DESKTOP_DISPLAY_CONTROL_CAPABILITY);
-    expect(advertised).toContain(REMOTE_DESKTOP_LOCK_SCREEN_CAPABILITY);
+    const advertised = [
+      ...partialLocalEvidence.sessionCapabilities,
+      ...partialLocalEvidence.adapterCapabilities,
+    ];
+    expect(advertised).not.toContain(REMOTE_DESKTOP_DISPLAY_CONTROL_CAPABILITY);
+    expect(advertised).not.toContain(REMOTE_DESKTOP_LOCK_SCREEN_CAPABILITY);
     expect(resolveRemoteDesktopSessionProfile(advertised)).toMatchObject({
       platform: 'macos',
-      displayControl: true,
-      lockScreen: true,
+      displayControl: false,
+      lockScreen: false,
     });
 
     const viewOnly = resolveMacosRemoteDesktopRuntimeProfile({

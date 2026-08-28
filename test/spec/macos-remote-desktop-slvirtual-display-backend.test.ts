@@ -7,6 +7,29 @@ import { describe, expect, it } from 'vitest';
 const ROOT = resolve(__dirname, '..', '..');
 const NATIVE = resolve(ROOT, 'native', 'macos-remote-desktop');
 const FIXTURE = resolve(__dirname, 'macos-remote-desktop-slvirtual-display-backend-test.cc');
+const VERIFIED_PRODUCT_VERSION = '26.2';
+const VERIFIED_DARWIN_BUILD = '25C56';
+
+interface TargetHostIdentity {
+  productVersion: string;
+  darwinBuild: string;
+}
+
+async function targetHostIdentity(): Promise<TargetHostIdentity> {
+  const productVersion = await runNative('sw_vers', ['-productVersion'], {});
+  const darwinBuild = await runNative('sw_vers', ['-buildVersion'], {});
+  expect(productVersion.status, productVersion.stderr).toBe(0);
+  expect(darwinBuild.status, darwinBuild.stderr).toBe(0);
+  return {
+    productVersion: productVersion.stdout.trim(),
+    darwinBuild: darwinBuild.stdout.trim(),
+  };
+}
+
+function isVerifiedTargetHost(identity: TargetHostIdentity): boolean {
+  return identity.productVersion === VERIFIED_PRODUCT_VERSION &&
+    identity.darwinBuild === VERIFIED_DARWIN_BUILD;
+}
 
 async function compiler(): Promise<string> {
   for (const candidate of ['clang++', 'g++']) {
@@ -71,6 +94,18 @@ BOOL ImcodesApplyEncodingImp(id object, SEL command, id settings,
 }  // namespace
 
 namespace imcodes::remote_desktop::macos {
+extern "C" int ImcodesSLHostGateProbe() {
+  const NSOperatingSystemVersion verified = {26, 2, 0};
+  const NSOperatingSystemVersion newer_unverified = {26, 5, 2};
+  if (!IsVerifiedRuntimeHost(verified, "25C56"))
+    return 30;
+  if (IsVerifiedRuntimeHost(newer_unverified, "25F84"))
+    return 31;
+  if (IsVerifiedRuntimeHost(verified, "25C57"))
+    return 32;
+  return 0;
+}
+
 extern "C" int ImcodesSLAbiProbe() {
 #if defined(__arm64__)
   const char* valid = "B32@0:8@16^@24";
@@ -161,6 +196,7 @@ async function buildRuntimeProbe(
   writeFileSync(probe, [
     '#include <cstdio>',
     '#include "macos_slvirtual_display_backend.h"',
+    'extern "C" int ImcodesSLHostGateProbe();',
     'extern "C" int ImcodesSLAbiProbe();',
     'extern "C" int ImcodesSLPostInitMismatchProbe();',
     'int main() {',
@@ -168,6 +204,11 @@ async function buildRuntimeProbe(
     '  if (abi != 0) {',
     '    std::fprintf(stderr, "ABI encoding probe failed: %d\\n", abi);',
     '    return 100 + abi;',
+    '  }',
+    '  const int host_gate = ImcodesSLHostGateProbe();',
+    '  if (host_gate != 0) {',
+    '    std::fprintf(stderr, "verified-host gate counterexample failed: %d\\n", host_gate);',
+    '    return 130 + host_gate;',
     '  }',
     '  const int cleanup = ImcodesSLPostInitMismatchProbe();',
     '  if (cleanup != 0) {',
@@ -177,7 +218,7 @@ async function buildRuntimeProbe(
     '  auto backend = imcodes::remote_desktop::macos::CreateSLVirtualDisplayBackend();',
     '  if (backend->ProbeSupport() !=',
     '      imcodes::remote_desktop::common::ReadinessState::kReady) {',
-    '    std::fprintf(stderr, "target-host read-only runtime probe failed\\n");',
+    '    std::fprintf(stderr, "target-host read-only runtime probe unavailable on this OS/build\\n");',
     '    return 2;',
     '  }',
     '  return 0;',
@@ -306,14 +347,59 @@ describe('SLVirtualDisplay exact-instance destroy backend', () => {
     async () => {
       const directory = mkdtempSync(join(tmpdir(), 'imcodes-slvirtual-runtime-'));
       try {
+        const identity = await targetHostIdentity();
+        const expectedStatus = isVerifiedTargetHost(identity) ? 0 : 2;
         for (const arch of ['arm64', 'x86_64'] as const) {
           const { executable, build } = await buildRuntimeProbe(
             runtime, arch, directory, 'baseline',
           );
           expect(build.status, `${arch}\n${build.stdout}\n${build.stderr}`).toBe(0);
           const run = await runArchitecture(executable, arch);
-          expect(run.status, `${arch}\n${run.stdout}\n${run.stderr}`).toBe(0);
+          expect(
+            run.status,
+            `${arch} on macOS ${identity.productVersion} build ${identity.darwinBuild}` +
+              `\n${run.stdout}\n${run.stderr}`,
+          ).toBe(expectedStatus);
+          if (expectedStatus === 2) {
+            expect(`${run.stdout}\n${run.stderr}`).toContain(
+              'target-host read-only runtime probe unavailable on this OS/build',
+            );
+          }
         }
+      } finally {
+        rmSync(directory, { recursive: true, force: true });
+      }
+    },
+    120_000,
+  );
+
+  it.skipIf(process.platform !== 'darwin')(
+    'behaviorally REDs a compile-clean global verified-host substitution',
+    async () => {
+      const mutant = runtime.replace(
+        [
+          '  return version.majorVersion == 26 && version.minorVersion == 2 &&',
+          '         darwin_build == kVerifiedDarwinBuild;',
+        ].join('\n'),
+        [
+          '  (void)version;',
+          '  (void)darwin_build;',
+          '  (void)kVerifiedDarwinBuild;',
+          '  return true; /* mutant: every macOS host is globally verified */',
+        ].join('\n'),
+      );
+      expect(mutant).not.toBe(runtime);
+      const directory = mkdtempSync(join(tmpdir(), 'imcodes-slvirtual-host-mutant-'));
+      try {
+        const { executable, build } = await buildRuntimeProbe(
+          mutant, 'arm64', directory, 'global-host-mutant',
+        );
+        expect(build.status, `${build.stdout}\n${build.stderr}`).toBe(0);
+        const run = await runArchitecture(executable, 'arm64');
+        expect(run.status).not.toBe(0);
+        expect(`${run.stdout}\n${run.stderr}`).toContain(
+          'verified-host gate counterexample failed',
+        );
       } finally {
         rmSync(directory, { recursive: true, force: true });
       }

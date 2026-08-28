@@ -166,6 +166,12 @@ std::string DarwinBuild() {
   return build;
 }
 
+bool IsVerifiedRuntimeHost(const NSOperatingSystemVersion& version,
+                           const std::string& darwin_build) {
+  return version.majorVersion == 26 && version.minorVersion == 2 &&
+         darwin_build == kVerifiedDarwinBuild;
+}
+
 id TransferInitialized(__unsafe_unretained id value) {
   return value == nil ? nil : (__bridge_transfer id)(__bridge void*)value;
 }
@@ -191,8 +197,7 @@ class SystemSLVirtualDisplayRuntime final : public SLVirtualDisplayRuntime {
         return false;
       const NSOperatingSystemVersion version =
           NSProcessInfo.processInfo.operatingSystemVersion;
-      if (version.majorVersion != 26 || version.minorVersion != 2 ||
-          DarwinBuild() != kVerifiedDarwinBuild) {
+      if (!IsVerifiedRuntimeHost(version, DarwinBuild())) {
         *error = "SLVirtualDisplay is verified only on macOS 26.2 build 25C56";
         return false;
       }

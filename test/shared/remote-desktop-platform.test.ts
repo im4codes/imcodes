@@ -97,12 +97,33 @@ describe('cross-platform remote desktop session profiles', () => {
     ]],
     ['clipboard without input', [...MAC_VIEW, REMOTE_DESKTOP_EXPLICIT_CLIPBOARD_CAPABILITY]],
     ['legacy Windows alias on macOS', [...MAC_VIEW, REMOTE_DESKTOP_CAPABILITY]],
-    ['unsupported macOS lock screen', [...MAC_VIEW, REMOTE_DESKTOP_ADAPTER_CAPABILITY.LOCK_SCREEN]],
     ['unsupported macOS capture privacy', [...MAC_VIEW, REMOTE_DESKTOP_ADAPTER_CAPABILITY.CAPTURE_PRIVACY]],
-    ['unsupported macOS display control', [...MAC_VIEW, REMOTE_DESKTOP_DISPLAY_CONTROL_CAPABILITY]],
     ['unknown remote desktop capability', [...MAC_VIEW, 'remote.desktop.platform.plan9.v1']],
   ] as const)('fails closed for %s', (_label, capabilities) => {
     expect(resolveRemoteDesktopSessionProfile(capabilities)).toBeNull();
+  });
+
+  it.each([
+    ['lock screen', REMOTE_DESKTOP_ADAPTER_CAPABILITY.LOCK_SCREEN],
+    ['display control', REMOTE_DESKTOP_DISPLAY_CONTROL_CAPABILITY],
+  ] as const)('fails closed for a macOS %s claim without input authority', (_label, action) => {
+    const parsed = parseAdvertisedControlledNodeCapabilities([...MAC_VIEW, action]);
+    expect(parsed).toEqual({ ok: true, value: [...MAC_VIEW, action] });
+    expect(parsed.ok && resolveRemoteDesktopSessionProfile(parsed.value)).toBeNull();
+  });
+
+  it('accepts probe-backed macOS action refinements only on an input-capable profile', () => {
+    expect(resolveRemoteDesktopSessionProfile([
+      ...MAC_VIEW,
+      REMOTE_DESKTOP_ADAPTER_CAPABILITY.INPUT,
+      REMOTE_DESKTOP_ADAPTER_CAPABILITY.LOCK_SCREEN,
+      REMOTE_DESKTOP_DISPLAY_CONTROL_CAPABILITY,
+    ])).toMatchObject({
+      platform: 'macos',
+      input: true,
+      lockScreen: true,
+      displayControl: true,
+    });
   });
 
   it('ignores unrelated controlled-node capabilities but produces stable identity material', () => {

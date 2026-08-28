@@ -198,11 +198,13 @@ export function resolveRemoteDesktopSessionProfile(
   const capturePrivacy = known.has(REMOTE_DESKTOP_CAPTURE_PRIVACY_CAPABILITY);
   const lockScreen = known.has(REMOTE_DESKTOP_LOCK_SCREEN_CAPABILITY);
   const displayControl = known.has(REMOTE_DESKTOP_DISPLAY_CONTROL_CAPABILITY);
-  // macOS lock-screen and display-control support are explicit adapter
-  // advertisements and therefore safe only when their local probes succeed.
-  // Capture privacy and signed shell remain unsupported and fail closed.
+  // The macOS runtime advertises lock-screen and display-control refinements
+  // only after their local probes succeed, and both refine an input-capable
+  // session. Refuse orphan action claims at ingress rather than widening a
+  // View-only profile. Capture privacy and signed shell remain unsupported.
   if (platform === 'macos' && (capturePrivacy
-    || known.has(REMOTE_DESKTOP_SIGNED_SHELL_CAPABILITY))) return null;
+    || known.has(REMOTE_DESKTOP_SIGNED_SHELL_CAPABILITY)
+    || (!input && (lockScreen || displayControl)))) return null;
 
   return {
     kind: 'common_v3',

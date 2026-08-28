@@ -197,6 +197,10 @@ jobs:
         run: npx vitest run test/util/windows-stale-watchdog-cleanup.test.ts
         env:
           IMCODES_MUX: wezterm
+      - name: Run full Windows remote-desktop worker-host gate
+        run: npx vitest run test/node/remote-desktop-worker-host.test.ts test/node/remote-desktop-worker-host-core.test.ts test/node/remote-desktop-worker-test-endpoint.test.ts --reporter=verbose
+        env:
+          IMCODES_MUX: wezterm
 
   windows-conpty-tests:
     name: Unit Tests (Windows ConPTY)

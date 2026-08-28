@@ -2,14 +2,12 @@ import {
   REMOTE_DESKTOP_CANONICAL_BRANDING_CAPABILITY,
   REMOTE_DESKTOP_INPUT_CAPABILITY,
   REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY,
-  REMOTE_DESKTOP_LOCK_SCREEN_CAPABILITY,
   type RemoteDesktopAdapterCapability,
 } from '../../shared/remote-desktop-access.js';
 import {
   REMOTE_DESKTOP_CAPTURE_CAPABILITY,
   REMOTE_DESKTOP_ENCODER_CAPABILITY,
   REMOTE_DESKTOP_EXPLICIT_CLIPBOARD_CAPABILITY,
-  REMOTE_DESKTOP_DISPLAY_CONTROL_CAPABILITY,
   REMOTE_DESKTOP_PLATFORM_CAPABILITY,
   REMOTE_DESKTOP_SESSION_CAPABILITY,
   resolveRemoteDesktopSessionProfile,
@@ -33,9 +31,9 @@ export interface MacosRemoteDesktopReadinessInput {
   accessibility: boolean;
   clipboard: boolean;
   disclosure: boolean;
-  /** A real create/apply/online/destroy probe of the built-in virtual display. */
+  /** Local evidence only; it does not authorize the unqualified display-control profile. */
   virtualDisplay?: boolean;
-  /** A qualified LoginWindow capture/input path, not OS-version inference. */
+  /** Local evidence only; it does not authorize the unqualified lock-screen profile. */
   loginWindow?: boolean;
 }
 
@@ -75,15 +73,11 @@ export function resolveMacosRemoteDesktopRuntimeProfile(
     ...(control && input.clipboard
       ? [REMOTE_DESKTOP_EXPLICIT_CLIPBOARD_CAPABILITY]
       : []),
-    ...(control && input.virtualDisplay
-      ? [REMOTE_DESKTOP_DISPLAY_CONTROL_CAPABILITY]
-      : []),
   ] as const;
   const adapterCapabilities: readonly RemoteDesktopAdapterCapability[] = Object.freeze([
     REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY,
     REMOTE_DESKTOP_CANONICAL_BRANDING_CAPABILITY,
     ...(control ? [REMOTE_DESKTOP_INPUT_CAPABILITY] : []),
-    ...(control && input.loginWindow ? [REMOTE_DESKTOP_LOCK_SCREEN_CAPABILITY] : []),
   ]);
   if (resolveRemoteDesktopSessionProfile([
     ...sessionCapabilities,

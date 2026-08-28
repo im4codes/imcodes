@@ -167,7 +167,7 @@ describe('remote desktop Web session profile', () => {
     });
   });
 
-  it('fails closed for incomplete, contradictory and unsupported macOS actions', () => {
+  it('fails closed for incomplete and unsupported macOS profiles', () => {
     expect(resolveRemoteDesktopWebProfile([
       REMOTE_DESKTOP_SESSION_CAPABILITY,
       REMOTE_DESKTOP_PLATFORM_CAPABILITY.MACOS,
@@ -175,18 +175,42 @@ describe('remote desktop Web session profile', () => {
     expect(resolveRemoteDesktopWebProfile([
       ...MAC_VIEW,
       REMOTE_DESKTOP_INPUT_CAPABILITY,
-      REMOTE_DESKTOP_LOCK_SCREEN_CAPABILITY,
-    ])).toBeNull();
-    expect(resolveRemoteDesktopWebProfile([
-      ...MAC_VIEW,
-      REMOTE_DESKTOP_INPUT_CAPABILITY,
       REMOTE_DESKTOP_CAPTURE_PRIVACY_CAPABILITY,
     ])).toBeNull();
-    expect(resolveRemoteDesktopWebProfile([
+  });
+
+  it.each([
+    ['lock screen', REMOTE_DESKTOP_LOCK_SCREEN_CAPABILITY],
+    ['display control', REMOTE_DESKTOP_DISPLAY_CONTROL_CAPABILITY],
+  ])('fails closed for a macOS %s claim without input authority', (_label, action) => {
+    expect(resolveRemoteDesktopWebProfile([...MAC_VIEW, action])).toBeNull();
+    expect(canOpenRemoteDesktopMachine({
+      online: true,
+      execEnabled: true,
+      accessRole: 'owner',
+      capabilities: [...MAC_VIEW, action],
+    })).toBe(false);
+  });
+
+  it('projects probe-backed macOS actions only with input authority', () => {
+    const capabilities = [
       ...MAC_VIEW,
       REMOTE_DESKTOP_INPUT_CAPABILITY,
+      REMOTE_DESKTOP_LOCK_SCREEN_CAPABILITY,
       REMOTE_DESKTOP_DISPLAY_CONTROL_CAPABILITY,
-    ])).toBeNull();
+    ];
+    expect(resolveRemoteDesktopWebProfile(capabilities)).toMatchObject({
+      profile: { platform: 'macos', input: true },
+      input: true,
+      lockScreen: true,
+      displayControl: true,
+    });
+    expect(canOpenRemoteDesktopMachine({
+      online: true,
+      execEnabled: true,
+      accessRole: 'owner',
+      capabilities,
+    })).toBe(true);
   });
 
   it('changes authority when profile capabilities mutate, but not when reordered', () => {

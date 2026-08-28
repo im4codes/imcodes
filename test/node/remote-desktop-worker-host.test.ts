@@ -47,6 +47,7 @@ import {
   launchWindowsActiveUserElevatedCommand,
   launchWindowsRemoteDesktopCommand,
 } from '../../src/node/windows-user-session.js';
+import { createRemoteDesktopWorkerTestEndpoint } from './remote-desktop-worker-test-endpoint.js';
 
 const requestId = 'request_12345678';
 const sessionId = 'session_12345678';
@@ -94,6 +95,12 @@ let cleanup: (() => void | Promise<void>)[] = [];
 afterEach(async () => {
   for (const fn of cleanup.splice(0).reverse()) await fn();
 });
+
+function workerTestPipePath(namespace: string): string {
+  const endpoint = createRemoteDesktopWorkerTestEndpoint(namespace);
+  cleanup.push(endpoint.cleanup);
+  return endpoint.path;
+}
 
 function quotedArgs(argsLine: string): string[] {
   return [...argsLine.matchAll(/"([^"]*)"/g)].map((match) => match[1]!);
@@ -153,10 +160,66 @@ describe('remote desktop worker artifact and IPC host', () => {
     expect(core.pushInbound('true}\n', generation).events).toEqual([]);
   });
 
+  it('releases a portable endpoint before a replacement host binds the same address', async () => {
+    const temp = await mkdtemp(join(tmpdir(), 'imcodes-rd-host-endpoint-reuse-'));
+    cleanup.push(() => rm(temp, { recursive: true, force: true }));
+    const pipePath = workerTestPipePath(temp);
+    const helpers: net.Socket[] = [];
+    const hosts: RemoteDesktopWorkerHost[] = [];
+    cleanup.push(() => {
+      for (const host of hosts) host.close();
+      for (const helper of helpers) helper.destroy();
+    });
+
+    const startHost = async (pid: number): Promise<RemoteDesktopWorkerHost> => {
+      const host = new RemoteDesktopWorkerHost(() => {}, {
+        ...trustedHostOptions,
+        platform: 'win32',
+        artifact,
+        pipePath,
+        allowPipeClients: () => {},
+        launch: (_executable, _argsLine, _secure, args) => {
+          const actual = [...(args ?? [])];
+          const helper = net.createConnection(pipePath, () => {
+            helper.write(`${JSON.stringify({
+              type: REMOTE_DESKTOP_WORKER_HELLO_TYPE,
+              ipcVersion: REMOTE_DESKTOP_WORKER_IPC_VERSION,
+              nonce: actual[actual.indexOf('--nonce') + 1],
+              pid,
+            })}\n`);
+          });
+          helpers.push(helper);
+        },
+      });
+      hosts.push(host);
+      await expect(host.sendConsentFrame({
+        type: WORKER_CONSENT_FRAME.SURFACE_QUERY,
+      })).resolves.toBe(true);
+      return host;
+    };
+
+    const first = await startHost(801);
+    const firstServer = Reflect.get(first, 'server') as net.Server;
+    const firstServerClosed = new Promise<void>((resolveClosed) => {
+      firstServer.once('close', resolveClosed);
+    });
+    first.close();
+    helpers[0]!.destroy();
+    await expect(Promise.race([
+      firstServerClosed,
+      new Promise<never>((_resolve, reject) => {
+        setTimeout(() => reject(new Error('worker_test_endpoint_cleanup_timeout')), 1_000);
+      }),
+    ])).resolves.toBeUndefined();
+
+    const replacement = await startHost(802);
+    expect(replacement).toBeInstanceOf(RemoteDesktopWorkerHost);
+  });
+
   it('launches a prompt-only worker before PREPARE and replaces it before session authority', async () => {
     const temp = await mkdtemp(join(tmpdir(), 'imcodes-rd-consent-only-'));
     cleanup.push(() => rm(temp, { recursive: true, force: true }));
-    const pipePath = join(temp, 'worker.sock');
+    const pipePath = workerTestPipePath(temp);
     const helpers: net.Socket[] = [];
     const receivedByLaunch: string[] = [];
     const launches: string[][] = [];
@@ -221,7 +284,7 @@ describe('remote desktop worker artifact and IPC host', () => {
   it('cold-starts a privacy-only Worker and promotes that exact process for PREPARE', async () => {
     const temp = await mkdtemp(join(tmpdir(), 'imcodes-rd-privacy-before-prepare-'));
     cleanup.push(() => rm(temp, { recursive: true, force: true }));
-    const pipePath = join(temp, 'worker.sock');
+    const pipePath = workerTestPipePath(temp);
     const received: string[] = [];
     const launches: string[][] = [];
     const helperSockets: net.Socket[] = [];
@@ -506,7 +569,7 @@ describe('remote desktop worker artifact and IPC host', () => {
   it('authenticates one active-user worker and forwards only strict bounded envelopes', async () => {
     const temp = await mkdtemp(join(tmpdir(), 'imcodes-rd-host-test-'));
     cleanup.push(() => rm(temp, { recursive: true, force: true }));
-    const pipePath = join(temp, 'worker.sock');
+    const pipePath = workerTestPipePath(temp);
     const received: RemoteDesktopDaemonMessage[] = [];
     let helper: net.Socket | null = null;
     let helperBuffer = '';
@@ -607,7 +670,7 @@ describe('remote desktop worker artifact and IPC host', () => {
   it('kills and reports a worker that never completes PREPARE, so the panel can retry', async () => {
     const temp = await mkdtemp(join(tmpdir(), 'imcodes-rd-host-prepare-watchdog-'));
     cleanup.push(() => rm(temp, { recursive: true, force: true }));
-    const pipePath = join(temp, 'worker.sock');
+    const pipePath = workerTestPipePath(temp);
     const received: RemoteDesktopDaemonMessage[] = [];
     const terminated: number[] = [];
     const timedOut = vi.fn();
@@ -668,7 +731,7 @@ describe('remote desktop worker artifact and IPC host', () => {
   it('does not arm a late PREPARE watchdog after an immediate MODE_STATE', async () => {
     const temp = await mkdtemp(join(tmpdir(), 'imcodes-rd-host-prepare-ready-'));
     cleanup.push(() => rm(temp, { recursive: true, force: true }));
-    const pipePath = join(temp, 'worker.sock');
+    const pipePath = workerTestPipePath(temp);
     const received: RemoteDesktopDaemonMessage[] = [];
     const terminated: number[] = [];
     let helper: net.Socket | null = null;
@@ -732,7 +795,7 @@ describe('remote desktop worker artifact and IPC host', () => {
   it('recycles the authenticated worker when PREPARE completes but OFFER never gets an ANSWER', async () => {
     const temp = await mkdtemp(join(tmpdir(), 'imcodes-rd-host-offer-watchdog-'));
     cleanup.push(() => rm(temp, { recursive: true, force: true }));
-    const pipePath = join(temp, 'worker.sock');
+    const pipePath = workerTestPipePath(temp);
     const received: RemoteDesktopDaemonMessage[] = [];
     const terminated: number[] = [];
     const timedOut = vi.fn();
@@ -815,7 +878,7 @@ describe('remote desktop worker artifact and IPC host', () => {
   it('replaces a worker that answers PREPARE with protected_desktop, exactly once', async () => {
     const temp = await mkdtemp(join(tmpdir(), 'imcodes-rd-host-desktop-'));
     cleanup.push(() => rm(temp, { recursive: true, force: true }));
-    const pipePath = join(temp, 'worker.sock');
+    const pipePath = workerTestPipePath(temp);
     const received: RemoteDesktopDaemonMessage[] = [];
     const helpers: net.Socket[] = [];
     const forced: (boolean | undefined)[] = [];
@@ -893,7 +956,7 @@ describe('remote desktop worker artifact and IPC host', () => {
   it('sends the replacement to the user desktop when the privileged worker reports the switch', async () => {
     const temp = await mkdtemp(join(tmpdir(), 'imcodes-rd-host-unlock-'));
     cleanup.push(() => rm(temp, { recursive: true, force: true }));
-    const pipePath = join(temp, 'worker.sock');
+    const pipePath = workerTestPipePath(temp);
     const received: RemoteDesktopDaemonMessage[] = [];
     const helpers: net.Socket[] = [];
     const forced: (boolean | undefined)[] = [];
@@ -1013,7 +1076,7 @@ describe('remote desktop worker artifact and IPC host', () => {
   it('surfaces a native worker crash frame and ignores forged ones', async () => {
     const temp = await mkdtemp(join(tmpdir(), 'imcodes-rd-host-fault-'));
     cleanup.push(() => rm(temp, { recursive: true, force: true }));
-    const pipePath = join(temp, 'worker.sock');
+    const pipePath = workerTestPipePath(temp);
     const received: RemoteDesktopDaemonMessage[] = [];
     const crashes: RemoteDesktopWorkerCrash[] = [];
     let helper: net.Socket | null = null;
@@ -1088,7 +1151,7 @@ describe('remote desktop worker artifact and IPC host', () => {
   it('launches a content-free release-only recovery after an active worker crashes', async () => {
     const temp = await mkdtemp(join(tmpdir(), 'imcodes-rd-host-crash-'));
     cleanup.push(() => rm(temp, { recursive: true, force: true }));
-    const pipePath = join(temp, 'worker.sock');
+    const pipePath = workerTestPipePath(temp);
     let helper: net.Socket | null = null;
     const launch = vi.fn((_executable: string, argsLine: string) => {
       if (argsLine.includes('--release-all-input')) return;
@@ -1148,7 +1211,7 @@ describe('remote desktop worker artifact and IPC host', () => {
   it('discards a poisoned worker pipe after a failed write and cold-starts the next session', async () => {
     const temp = await mkdtemp(join(tmpdir(), 'imcodes-rd-host-write-failure-'));
     cleanup.push(() => rm(temp, { recursive: true, force: true }));
-    const pipePath = join(temp, 'worker.sock');
+    const pipePath = workerTestPipePath(temp);
     const helpers: net.Socket[] = [];
     const launch = vi.fn((_executable: string, argsLine: string) => {
       if (argsLine.includes('--release-all-input')) return;
@@ -1233,7 +1296,7 @@ describe('remote desktop worker artifact and IPC host', () => {
   it('transparently replaces a stale idle worker pipe before admitting the next session', async () => {
     const temp = await mkdtemp(join(tmpdir(), 'imcodes-rd-host-idle-write-failure-'));
     cleanup.push(() => rm(temp, { recursive: true, force: true }));
-    const pipePath = join(temp, 'worker.sock');
+    const pipePath = workerTestPipePath(temp);
     const helpers: net.Socket[] = [];
     const helperBuffers: string[] = [];
     const launch = vi.fn((_executable: string, argsLine: string) => {
@@ -1316,7 +1379,7 @@ describe('remote desktop worker artifact and IPC host', () => {
     // cold-start a replacement, not end the session the browser just opened.
     const temp = await mkdtemp(join(tmpdir(), 'imcodes-rd-host-idle-close-'));
     cleanup.push(() => rm(temp, { recursive: true, force: true }));
-    const pipePath = join(temp, 'worker.sock');
+    const pipePath = workerTestPipePath(temp);
     const helpers: net.Socket[] = [];
     const helperBuffers: string[] = [];
     const launch = vi.fn((_executable: string, argsLine: string) => {
@@ -1407,7 +1470,7 @@ describe('remote desktop worker artifact and IPC host', () => {
     // skips this very recovery.
     const temp = await mkdtemp(join(tmpdir(), 'imcodes-rd-host-recovery-fail-'));
     cleanup.push(() => rm(temp, { recursive: true, force: true }));
-    const pipePath = join(temp, 'worker.sock');
+    const pipePath = workerTestPipePath(temp);
     const received: RemoteDesktopDaemonMessage[] = [];
     const host = new RemoteDesktopWorkerHost((message) => received.push(message), {
       ...trustedHostOptions,
@@ -1450,7 +1513,7 @@ describe('remote desktop worker artifact and IPC host', () => {
     // launch their own worker.
     const temp = await mkdtemp(join(tmpdir(), 'imcodes-rd-host-single-flight-'));
     cleanup.push(() => rm(temp, { recursive: true, force: true }));
-    const pipePath = join(temp, 'worker.sock');
+    const pipePath = workerTestPipePath(temp);
     const helpers: net.Socket[] = [];
     const launch = vi.fn((_executable: string, argsLine: string) => {
       const args = quotedArgs(argsLine);
@@ -1507,7 +1570,7 @@ describe('remote desktop worker artifact and IPC host', () => {
     // it holds the listener's connection count up and the next start with it.
     const temp = await mkdtemp(join(tmpdir(), 'imcodes-rd-host-handshake-'));
     cleanup.push(() => rm(temp, { recursive: true, force: true }));
-    const pipePath = join(temp, 'worker.sock');
+    const pipePath = workerTestPipePath(temp);
     const silent: net.Socket[] = [];
     const tricklers: ReturnType<typeof setInterval>[] = [];
     cleanup.push(() => { for (const timer of tricklers) clearInterval(timer); });
@@ -1568,7 +1631,7 @@ describe('remote desktop worker artifact and IPC host', () => {
     // session that was seconds away from working.
     const temp = await mkdtemp(join(tmpdir(), 'imcodes-rd-host-offer-race-'));
     cleanup.push(() => rm(temp, { recursive: true, force: true }));
-    const pipePath = join(temp, 'worker.sock');
+    const pipePath = workerTestPipePath(temp);
     const helpers: net.Socket[] = [];
     const helperBuffers: string[] = [];
     const timers: ReturnType<typeof setTimeout>[] = [];
@@ -1646,7 +1709,7 @@ describe('remote desktop worker artifact and IPC host', () => {
   it('recycles an idle warm worker before every new session', async () => {
     const temp = await mkdtemp(join(tmpdir(), 'imcodes-rd-host-reconnect-'));
     cleanup.push(() => rm(temp, { recursive: true, force: true }));
-    const pipePath = join(temp, 'worker.sock');
+    const pipePath = workerTestPipePath(temp);
     const helpers: net.Socket[] = [];
     const launch = vi.fn((_executable: string, argsLine: string) => {
       const args = quotedArgs(argsLine);
@@ -1711,7 +1774,7 @@ describe('remote desktop worker artifact and IPC host', () => {
   it('adds a shared virtual display only after an explicit headless result', async () => {
     const temp = await mkdtemp(join(tmpdir(), 'imcodes-rd-host-headless-'));
     cleanup.push(() => rm(temp, { recursive: true, force: true }));
-    const pipePath = join(temp, 'worker.sock');
+    const pipePath = workerTestPipePath(temp);
     let helper: net.Socket | null = null;
     let helperBuffer = '';
     const controller = new EventEmitter() as EventEmitter & {
@@ -1850,7 +1913,7 @@ describe('remote desktop worker artifact and IPC host', () => {
   it('cancels an in-flight virtual display start when its only session stops', async () => {
     const temp = await mkdtemp(join(tmpdir(), 'imcodes-rd-host-cancel-headless-'));
     cleanup.push(() => rm(temp, { recursive: true, force: true }));
-    const pipePath = join(temp, 'worker.sock');
+    const pipePath = workerTestPipePath(temp);
     let helper: net.Socket | null = null;
     let releaseVirtualVerification: (() => void) | undefined;
     const virtualVerification = new Promise<void>((resolve) => {
@@ -1931,7 +1994,7 @@ describe('remote desktop worker artifact and IPC host', () => {
   it('shares one headless controller across concurrent sessions and removes it only after the last session', async () => {
     const temp = await mkdtemp(join(tmpdir(), 'imcodes-rd-host-shared-headless-'));
     cleanup.push(() => rm(temp, { recursive: true, force: true }));
-    const pipePath = join(temp, 'worker.sock');
+    const pipePath = workerTestPipePath(temp);
     let helper: net.Socket | null = null;
     let helperBuffer = '';
     const controller = new EventEmitter() as EventEmitter & {
@@ -2029,7 +2092,7 @@ describe('remote desktop worker artifact and IPC host', () => {
   it('does not loop virtual-display recovery after the shared controller crashes', async () => {
     const temp = await mkdtemp(join(tmpdir(), 'imcodes-rd-host-controller-crash-'));
     cleanup.push(() => rm(temp, { recursive: true, force: true }));
-    const pipePath = join(temp, 'worker.sock');
+    const pipePath = workerTestPipePath(temp);
     let helper: net.Socket | null = null;
     let helperBuffer = '';
     const controller = new EventEmitter() as EventEmitter & {
@@ -2104,7 +2167,7 @@ describe('remote desktop worker artifact and IPC host', () => {
   it('keeps the Windows launch and authenticated envelope contract after core extraction', async () => {
     const temp = await mkdtemp(join(tmpdir(), 'imcodes-rd-host-core-equivalence-'));
     cleanup.push(() => rm(temp, { recursive: true, force: true }));
-    const pipePath = join(temp, 'worker.sock');
+    const pipePath = workerTestPipePath(temp);
     const workerCommands: Record<string, unknown>[] = [];
     const serverMessages: RemoteDesktopDaemonMessage[] = [];
     let helper: net.Socket | null = null;
