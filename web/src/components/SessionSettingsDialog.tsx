@@ -42,6 +42,15 @@ import {
   type SupervisionMode,
 } from '@shared/supervision-config.js';
 import {
+  buildSupervisionExecutionCapabilityId,
+  isExcludedDevelopmentModel,
+  normalizeSupervisionExecutionModel,
+  normalizeSupervisionExecutionPools,
+  type SupervisionExecutionConfig,
+  type SupervisionExecutionPoolKind,
+  type SupervisionExecutionPoolsConfig,
+} from '@shared/supervision-execution-pool.js';
+import {
   PEER_AUDIT_CANDIDATE_REASONS,
   PEER_AUDIT_PROMPT_VERSION,
   PEER_AUDIT_UNKNOWN_IDENTITY,
@@ -215,6 +224,7 @@ type SupervisionRuntimeDraft = Pick<
   backupBackend?: SharedContextRuntimeBackend;
   backupModel?: string;
   backupPreset?: string;
+  executionPools?: SupervisionExecutionPoolsConfig;
 };
 
 type CcPresetSummary = RuntimeModelPresetEntry;
@@ -467,6 +477,122 @@ function SupervisionRuntimeFields({
       )}
     </div>
   );
+}
+
+function buildPoolConfig(backend: SharedContextRuntimeBackend, model: string): SupervisionExecutionConfig {
+  const canonicalModel = normalizeSupervisionExecutionModel(backend, model);
+  const runtimeType = getSessionRuntimeType(backend);
+  const providerFamily = resolvePeerAuditProviderFamily({ agentType: backend });
+  return {
+    agentType: backend,
+    providerFamily,
+    runtimeType,
+    model: canonicalModel,
+    capabilityId: buildSupervisionExecutionCapabilityId({
+      agentType: backend,
+      providerFamily,
+      runtimeType,
+      model: canonicalModel,
+    }),
+  };
+}
+
+function builtInPoolConfigs(): SupervisionExecutionConfig[] {
+  return getSupportedSupervisionBackendOptions().flatMap((backend) =>
+    getSupervisionModelOptions(backend).map((model) => buildPoolConfig(backend, model)));
+}
+
+/**
+ * Bootstrap only from the Brain itself, never from whatever sibling sessions
+ * happen to be alive when Settings opens.  This keeps the pool a durable model
+ * selection while making the common case immediately usable: the Brain's own
+ * model is checked in the primary development/audit pool, and the user can add
+ * more models (or explicitly move it to the economy pool) afterwards.
+ */
+function withBrainPrimaryPoolDefault(input: {
+  pools: SupervisionExecutionPoolsConfig;
+  brainAgentType: string;
+  brainModel: string;
+}): SupervisionExecutionPoolsConfig {
+  if (input.pools.state === 'configured'
+    || !isSupportedSupervisionBackend(input.brainAgentType)
+    || !input.brainModel
+    || input.brainModel === PEER_AUDIT_UNKNOWN_IDENTITY
+    || isExcludedDevelopmentModel(input.brainModel)) {
+    return input.pools;
+  }
+  const config = buildPoolConfig(input.brainAgentType, input.brainModel);
+  return {
+    ...input.pools,
+    state: 'configured',
+    primaryDevelopmentPool: {
+      ...input.pools.primaryDevelopmentPool,
+      configs: [config],
+    },
+  };
+}
+
+function SupervisionExecutionPoolsEditor({
+  t,
+  saving,
+  pools,
+  onChange,
+}: {
+  t: (key: string, params?: Record<string, unknown>) => string;
+  saving: boolean;
+  pools: SupervisionExecutionPoolsConfig;
+  onChange: (pools: SupervisionExecutionPoolsConfig) => void;
+}) {
+  const configured = [...pools.primaryDevelopmentPool.configs, ...pools.economyTaskPool.configs];
+  const options = [...new Map([...builtInPoolConfigs(), ...configured]
+    .map((config) => [config.capabilityId, config])).values()];
+  const selected = (pool: SupervisionExecutionPoolKind, capabilityId: string): boolean => (
+    (pool === 'primary' ? pools.primaryDevelopmentPool : pools.economyTaskPool)
+      .configs.some((config) => config.capabilityId === capabilityId)
+  );
+  const toggle = (pool: SupervisionExecutionPoolKind, config: SupervisionExecutionConfig): void => {
+    const primary = pools.primaryDevelopmentPool.configs.filter((item) => item.capabilityId !== config.capabilityId);
+    const economy = pools.economyTaskPool.configs.filter((item) => item.capabilityId !== config.capabilityId);
+    const wasSelected = selected(pool, config.capabilityId);
+    if (!wasSelected) (pool === 'primary' ? primary : economy).push(config);
+    onChange({
+      ...pools,
+      state: 'configured',
+      primaryDevelopmentPool: { ...pools.primaryDevelopmentPool, configs: primary },
+      economyTaskPool: { ...pools.economyTaskPool, configs: economy },
+    });
+  };
+  const renderPool = (pool: SupervisionExecutionPoolKind) => {
+    const primary = pool === 'primary';
+    const eligibleOptions = primary
+      ? options.filter((config) => !isExcludedDevelopmentModel(config.model))
+      : options;
+    return (
+      <div class="session-settings-subsection" data-testid={`supervision-execution-pool-${pool}`}>
+        <div class="session-settings-subtitle">
+          {t(primary ? 'session.supervision.primaryDevelopmentPool' : 'session.supervision.economyTaskPool')}
+        </div>
+        <div class="session-settings-muted">
+          {t(primary ? 'session.supervision.primaryDevelopmentPoolHelp' : 'session.supervision.economyTaskPoolHelp')}
+        </div>
+        <div class="session-settings-grid" style={{ marginTop: 8 }}>
+          {eligibleOptions.map((config) => (
+            <label key={`${pool}:${config.capabilityId}`} class="session-settings-field" style={{ display: 'flex', flexDirection: 'row', gap: 8, alignItems: 'center' }}>
+              <input
+                type="checkbox"
+                aria-label={`${pool}:${config.agentType}:${config.model}`}
+                checked={selected(pool, config.capabilityId)}
+                onChange={() => toggle(pool, config)}
+                disabled={saving}
+              />
+              <span>{labelForBackend(t, config.agentType as SharedContextRuntimeBackend)} · {config.model}</span>
+            </label>
+          ))}
+        </div>
+      </div>
+    );
+  };
+  return <>{renderPool('primary')}{renderPool('economy')}</>;
 }
 
 export function SessionSettingsDialog({
@@ -741,6 +867,14 @@ export function SessionSettingsDialog({
   const supervisorDefaultsBackupBackend = normalizeBackendValue(String(supervisorDefaults.backupBackend ?? ''));
   const supervisorDefaultsBackupModel = typeof supervisorDefaults.backupModel === 'string' ? supervisorDefaults.backupModel : '';
   const supervisorDefaultsBackupPreset = typeof supervisorDefaults.backupPreset === 'string' ? supervisorDefaults.backupPreset : '';
+  const brainExecutionModel = resolvePeerAuditNormalizedModelId({ activeModel, requestedModel });
+  const supervisorDefaultsExecutionPools = useMemo(() => withBrainPrimaryPoolDefault({
+    pools: supervisorDefaults.executionPools ?? normalizeSupervisionExecutionPools(undefined),
+    // A sub-session's model is not the Brain model and must never silently
+    // become an account-wide primary-pool authorization.
+    brainAgentType: parentSession ? '' : type,
+    brainModel: brainExecutionModel,
+  }), [brainExecutionModel, parentSession, supervisorDefaults.executionPools, type]);
   const supervisorDefaultsBackupPresetEntry = ccPresets.find((p) => p.name === supervisorDefaultsBackupPreset.trim());
   const supervisorDefaultsBackupPresetModelOptions = getPresetModelOptions(ccPresets, supervisorDefaultsBackupPreset);
   const supervisorDefaultsBackupDynamicModels = useTransportModels(
@@ -799,6 +933,7 @@ export function SessionSettingsDialog({
     } : {}),
     timeoutMs: supervisorDefaultsTimeout,
     promptVersion: supervisorDefaultsPromptVersion,
+    executionPools: supervisorDefaultsExecutionPools,
     customInstructions: supervisionCustomInstructions.trim() || undefined,
     // Only write the flag when true to keep default payloads minimal.
     ...(supervisionCustomInstructionsOverride ? { customInstructionsOverride: true } : {}),
@@ -847,6 +982,7 @@ export function SessionSettingsDialog({
     supervisorDefaultsPreset,
     supervisorDefaultsPromptVersion,
     supervisorDefaultsTimeout,
+    supervisorDefaultsExecutionPools,
     supervisorDefaultsCustomInstructions,
     taskRunPromptVersion,
     transportConfig,
@@ -868,9 +1004,13 @@ export function SessionSettingsDialog({
     type,
   ]);
 
-  const hasGlobalDefaultsChanges = useMemo(() => JSON.stringify(supervisorDefaults) !== JSON.stringify(initialSupervisorDefaults), [
+  const hasGlobalDefaultsChanges = useMemo(() => JSON.stringify({
+    ...supervisorDefaults,
+    executionPools: supervisorDefaultsExecutionPools,
+  }) !== JSON.stringify(initialSupervisorDefaults), [
     initialSupervisorDefaults,
     supervisorDefaults,
+    supervisorDefaultsExecutionPools,
   ]);
 
   const hasChanges = hasSessionChanges || hasGlobalDefaultsChanges;
@@ -1007,6 +1147,7 @@ export function SessionSettingsDialog({
               ? { backupPreset: supervisorDefaultsBackupPreset.trim() }
               : {}),
           } : {}),
+          executionPools: supervisorDefaultsExecutionPools,
         });
       }
 
@@ -1073,6 +1214,8 @@ export function SessionSettingsDialog({
       ) return false;
     }
     if (supervisorDefaultsTimeout < SUPERVISION_MIN_TIMEOUT_MS) return false;
+    if (supervisorDefaultsExecutionPools.state !== 'configured'
+      || supervisorDefaultsExecutionPools.primaryDevelopmentPool.configs.length === 0) return false;
     return true;
   }, [
     isSupportedTransport,
@@ -1083,6 +1226,7 @@ export function SessionSettingsDialog({
     supervisorDefaultsModel,
     supervisorDefaultsPreset,
     supervisorDefaultsTimeout,
+    supervisorDefaultsExecutionPools,
   ]);
 
   const supervisionPanel = isSupportedTransport ? (
@@ -1158,6 +1302,19 @@ export function SessionSettingsDialog({
             }))}
           />
         </div>
+
+        <SupervisionExecutionPoolsEditor
+          t={t}
+          saving={saving}
+          pools={supervisorDefaultsExecutionPools}
+          onChange={(executionPools) => updateSupervisorDefaultsFromUser((prev) => ({ ...prev, executionPools }))}
+        />
+
+        {supervisorDefaultsExecutionPools.primaryDevelopmentPool.configs.length === 0 && (
+          <div style={{ color: '#fbbf24', fontSize: 12 }}>
+            {t('session.supervision.validation.modelRequired')}
+          </div>
+        )}
 
         <div class="session-settings-grid">
           <div class="session-settings-field">

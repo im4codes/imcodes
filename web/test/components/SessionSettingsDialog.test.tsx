@@ -249,6 +249,7 @@ describe('SessionSettingsDialog supervision', () => {
         description="desc"
         cwd="/proj"
         type="codex-sdk"
+        activeModel={CODEX_MODEL_IDS[0]}
         sessionInstanceId="brain-instance-1"
         runtimeEpoch="brain-runtime-1"
         ws={ws}
@@ -307,6 +308,7 @@ describe('SessionSettingsDialog supervision', () => {
         description="desc"
         cwd="/proj"
         type="codex-sdk"
+        activeModel={CODEX_MODEL_IDS[0]}
         peerAuditSessions={[makePeerAuditSession({ sessionInstanceId: null, runtimeEpoch: null })]}
         transportConfig={null}
         openIntent={{ supervisionMode: 'supervised_audit', focus: 'peer-audit-target' }}
@@ -321,6 +323,80 @@ describe('SessionSettingsDialog supervision', () => {
       expect(screen.queryByText('backendRequired')).toBeNull();
       expect(screen.getByText(`summaryBackendModel:codex_sdk:${DEFAULT_CODEX_AUTOMATION_MODEL}`)).toBeDefined();
       expect((screen.getByRole('button', { name: /save/i }) as HTMLButtonElement).disabled).toBe(false);
+    });
+  });
+
+  it('persists the default Brain model to account defaults without another pool interaction', async () => {
+    render(
+      <SessionSettingsDialog
+        serverId="srv-1"
+        sessionName="deck_proj_brain"
+        label="Brain"
+        description="desc"
+        cwd="/proj"
+        type="codex-sdk"
+        activeModel={CODEX_MODEL_IDS[0]}
+        transportConfig={null}
+        onClose={vi.fn()}
+        onSaved={vi.fn()}
+      />,
+    );
+
+    const primary = screen.getByTestId('supervision-execution-pool-primary');
+    const economy = screen.getByTestId('supervision-execution-pool-economy');
+    expect(within(primary).getByLabelText(`primary:codex-sdk:${CODEX_MODEL_IDS[0]}`)).toHaveProperty('checked', true);
+    expect(within(primary).queryByLabelText('primary:codex-sdk:gpt-5.3-codex-spark')).toBeNull();
+    expect(within(economy).getByLabelText('economy:codex-sdk:gpt-5.3-codex-spark')).toHaveProperty('checked', false);
+
+    fireEvent.click(screen.getByRole('button', { name: /save/i }));
+
+    await waitFor(() => {
+      expect(saveSupervisorDefaultsMock).toHaveBeenCalledWith(expect.objectContaining({
+        executionPools: expect.objectContaining({
+          state: 'configured',
+          primaryDevelopmentPool: expect.objectContaining({
+            configs: [expect.objectContaining({ model: CODEX_MODEL_IDS[0] })],
+          }),
+          economyTaskPool: expect.objectContaining({ configs: [] }),
+        }),
+      }));
+      expect(patchSessionMock).not.toHaveBeenCalled();
+    });
+  });
+
+  it('allows adding a low-tier model to the economy pool', async () => {
+    render(
+      <SessionSettingsDialog
+        serverId="srv-1"
+        sessionName="deck_proj_brain"
+        label="Brain"
+        description="desc"
+        cwd="/proj"
+        type="codex-sdk"
+        activeModel={CODEX_MODEL_IDS[0]}
+        transportConfig={null}
+        onClose={vi.fn()}
+        onSaved={vi.fn()}
+      />,
+    );
+
+    const economy = screen.getByTestId('supervision-execution-pool-economy');
+    const economySpark = within(economy).getByLabelText('economy:codex-sdk:gpt-5.3-codex-spark');
+    fireEvent.click(economySpark);
+    fireEvent.click(screen.getByRole('button', { name: /save/i }));
+
+    await waitFor(() => {
+      expect(saveSupervisorDefaultsMock).toHaveBeenCalledWith(expect.objectContaining({
+        executionPools: expect.objectContaining({
+          state: 'configured',
+          primaryDevelopmentPool: expect.objectContaining({
+            configs: [expect.objectContaining({ model: CODEX_MODEL_IDS[0] })],
+          }),
+          economyTaskPool: expect.objectContaining({
+            configs: [expect.objectContaining({ model: 'gpt-5.3-codex-spark' })],
+          }),
+        }),
+      }));
     });
   });
 
