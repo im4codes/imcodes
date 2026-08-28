@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { DAEMON_MSG } from '../../shared/daemon-events.js';
 import {
+  SUPERVISION_CONSOLE_UNAVAILABLE_REASONS,
   SUPERVISION_TASK_CONSOLE_MSG,
   SUPERVISION_TASK_CONSOLE_SCHEMA_VERSION,
   type SupervisionTaskConsoleScope,
@@ -120,13 +121,13 @@ describe('SupervisionTaskConsoleController', () => {
       type: SUPERVISION_TASK_CONSOLE_MSG.UNAVAILABLE,
       subscriptionId: subscribe.subscriptionId,
       scope: SCOPE,
-      reason: 'projection_unavailable',
+      reason: SUPERVISION_CONSOLE_UNAVAILABLE_REASONS.PROJECTION_UNAVAILABLE,
       retryable: true,
     });
 
     expect(controller.getState()).toMatchObject({
       phase: SUPERVISION_TASK_CONSOLE_PHASE.ERROR,
-      error: 'projection_unavailable',
+      error: SUPERVISION_CONSOLE_UNAVAILABLE_REASONS.PROJECTION_UNAVAILABLE,
     });
   });
 
@@ -140,7 +141,7 @@ describe('SupervisionTaskConsoleController', () => {
       type: SUPERVISION_TASK_CONSOLE_MSG.UNAVAILABLE,
       subscriptionId: subscribe.subscriptionId,
       scope: SCOPE,
-      reason: 'projection_unavailable',
+      reason: SUPERVISION_CONSOLE_UNAVAILABLE_REASONS.PROJECTION_UNAVAILABLE,
       retryable: true,
     } as const;
 

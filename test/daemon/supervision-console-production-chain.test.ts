@@ -13,7 +13,10 @@ import {
   type SupervisionConsoleLink,
 } from '../../src/daemon/supervision-console-binding.js';
 import { SupervisionTaskRegistry } from '../../src/daemon/supervision-state-store.js';
-import { SUPERVISION_TASK_CONSOLE_MSG } from '../../shared/supervision-task-console.js';
+import {
+  SUPERVISION_CONSOLE_UNAVAILABLE_REASONS,
+  SUPERVISION_TASK_CONSOLE_MSG,
+} from '../../shared/supervision-task-console.js';
 import type { EffectiveCoverage, ShareTarget } from '../../server/src/ws/share-policy.js';
 
 class LoopbackWs extends EventEmitter {
@@ -155,7 +158,7 @@ describe('browser -> server bridge -> daemon registry -> browser task-console ch
         type: SUPERVISION_TASK_CONSOLE_MSG.UNAVAILABLE,
         subscriptionId: 'viewer-projection-failure',
         scope,
-        reason: 'projection_unavailable',
+        reason: SUPERVISION_CONSOLE_UNAVAILABLE_REASONS.PROJECTION_UNAVAILABLE,
         retryable: true,
       }]);
       binding.close();

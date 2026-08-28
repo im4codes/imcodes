@@ -41,6 +41,7 @@ import {
   SUPERVISION_EXECUTION_POOL_KINDS,
   type SupervisionExecutionPoolKind,
 } from './supervision-execution-pool.js';
+import { TIMELINE_HISTORY_ERROR_REASONS } from './timeline-history-errors.js';
 
 /** Bump only with a migration that maps every prior console payload forward. */
 export const SUPERVISION_TASK_CONSOLE_SCHEMA_VERSION = 1;
@@ -151,7 +152,7 @@ export interface SupervisionTaskConsoleResyncRequired {
 }
 
 export const SUPERVISION_CONSOLE_UNAVAILABLE_REASONS = {
-  PROJECTION_UNAVAILABLE: 'projection_unavailable',
+  PROJECTION_UNAVAILABLE: TIMELINE_HISTORY_ERROR_REASONS.PROJECTION_UNAVAILABLE,
 } as const;
 export type SupervisionConsoleUnavailableReason =
   typeof SUPERVISION_CONSOLE_UNAVAILABLE_REASONS[keyof typeof SUPERVISION_CONSOLE_UNAVAILABLE_REASONS];

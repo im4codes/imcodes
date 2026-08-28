@@ -11,6 +11,7 @@ import {
 import { SupervisionTaskRegistry } from '../../src/daemon/supervision-state-store.js';
 import type { SupervisionMigrationDb } from '../../src/daemon/supervision-store-migrations.js';
 import {
+  SUPERVISION_CONSOLE_UNAVAILABLE_REASONS,
   SUPERVISION_TASK_CONSOLE_MSG, SUPERVISION_TASK_CONSOLE_SCHEMA_VERSION,
   evaluateSupervisionConsoleCursor, initialSupervisionConsoleCursor,
   isStaleSupervisionConsoleResponse, isValidSupervisionTaskConsoleEvent,
@@ -368,7 +369,7 @@ describe('production registry database composition', () => {
       type: SUPERVISION_TASK_CONSOLE_MSG.UNAVAILABLE,
       subscriptionId: 'sub-wrong-db',
       scope: SCOPE,
-      reason: 'projection_unavailable',
+      reason: SUPERVISION_CONSOLE_UNAVAILABLE_REASONS.PROJECTION_UNAVAILABLE,
       retryable: true,
     }]);
     expect(sent.some((frame) => (
