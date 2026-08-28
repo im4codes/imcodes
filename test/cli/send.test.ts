@@ -66,10 +66,30 @@ describe('detectSenderSession', () => {
   });
 
   it('falls through TMUX_PANE on tmux query failure when CLAUDECODE is set', async () => {
-    // In CI/Claude Code, tmux is unavailable — should throw gracefully
+    // Previously this assumed tmux is absent ("In CI/Claude Code, tmux is
+    // unavailable"). That is not true on a developer machine with tmux running:
+    // the query for pane %99 can actually resolve to a real session, and the
+    // test then failed with "promise resolved ... instead of rejecting".
+    // Force the failure instead of hoping the environment supplies it.
+    vi.resetModules();
+    vi.doMock('child_process', async (importOriginal) => {
+      const actual = await importOriginal<typeof import('child_process')>();
+      return {
+        ...actual,
+        execFile: (_file: string, _args: readonly string[], cb: (e: Error | null, so: string, se: string) => void) => {
+          cb(new Error('tmux unavailable'), '', '');
+          return undefined as never;
+        },
+      };
+    });
+    const mod = await import('../../src/util/detect-session.js');
     process.env.TMUX_PANE = '%99';
-    // The execFile call to tmux will fail, so detectSenderSession should throw
-    await expect(detectSenderSession()).rejects.toThrow('Cannot detect session identity');
+    try {
+      await expect(mod.detectSenderSession()).rejects.toThrow('Cannot detect session identity');
+    } finally {
+      vi.doUnmock('child_process');
+      vi.resetModules();
+    }
   });
 });
 

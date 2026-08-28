@@ -9,7 +9,7 @@ import type { ServerLink } from './server-link.js';
 import { EXECUTION_CLONE_KIND, type ExecutionCloneMetadata } from '../../shared/execution-clone.js';
 import logger from '../util/logger.js';
 import type { QueueSnapshot } from '../../shared/transport-queue-types.js';
-import { buildTransportQueueSnapshotPayload, type TransportQueueSnapshotPayload } from './transport-queue-projection.js';
+import { buildTransportQueueSnapshotPayloadWithoutLegacyCounters, type TransportQueueSnapshotPayload } from './transport-queue-projection.js';
 
 /**
  * Runtime-identity fields that MUST NOT replicate to Postgres for an execution
@@ -94,9 +94,9 @@ export async function buildSubSessionSyncPayload(
   // claude-code-sdk sub-session. null → fall back to the rate_limit_event quota.
   const usageQuota = isClaudeSdkSession(r.agentType) ? await getClaudeUsageQuota().catch(() => null) : null;
   void options;
-  let transportQueue: TransportQueueSnapshotPayload | null = null;
+  let transportQueue: Omit<TransportQueueSnapshotPayload, 'pendingCount'> | null = null;
   if (r.runtimeType === 'transport') {
-    transportQueue = buildTransportQueueSnapshotPayload(sessionName, 'subsession_sync');
+    transportQueue = buildTransportQueueSnapshotPayloadWithoutLegacyCounters(sessionName, 'subsession_sync');
   }
 
   // Execution clones inherit runtime CONFIG but NEVER runtime IDENTITY. Null out

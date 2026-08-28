@@ -95,6 +95,26 @@ export function transportQueueSnapshotToPayload(snapshot: QueueSnapshot): Transp
   };
 }
 
+/** Projection without legacy scalar counters: same queue identity and entries, minus the legacy
+ *  scalar `pendingCount`. Clients derive the count from `pendingMessageEntries`;
+ *  emitting both let the two drift, and session.state is the copy that goes to
+ *  every viewer, so it is the one kept minimal. */
+export function transportQueueSnapshotWithoutLegacyCounters(
+  snapshot: QueueSnapshot,
+): Omit<TransportQueueSnapshotPayload, 'pendingCount'> {
+  const { pendingCount: _pendingCount, ...rest } = transportQueueSnapshotToPayload(snapshot);
+  return rest;
+}
+
+/** Variant of buildTransportQueueSnapshotPayload that omits the legacy
+ *  scalar `pendingCount` so session.state stays the minimal projection. */
+export function buildTransportQueueSnapshotPayloadWithoutLegacyCounters(
+  sessionName: string,
+  source: TransportQueueSnapshotSource,
+): Omit<TransportQueueSnapshotPayload, 'pendingCount'> {
+  return transportQueueSnapshotWithoutLegacyCounters(buildTransportQueueSnapshot(sessionName, source));
+}
+
 export function buildTransportQueueSnapshotPayload(
   sessionName: string,
   source: TransportQueueSnapshotSource,

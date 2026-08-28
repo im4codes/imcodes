@@ -38,7 +38,7 @@ import { TIMELINE_HISTORY_CONTENT_TYPES, TIMELINE_HISTORY_STATE_TYPES, type Memo
 import { emitSessionInlineError } from './session-error.js';
 import { enqueueResend, getResendEntries, clearResend } from './transport-resend-queue.js';
 import { preserveTransportRuntimeQueuesToResend } from './transport-resend-preservation.js';
-import { buildTransportQueueSnapshotPayload, transportQueueSnapshotToPayload } from './transport-queue-projection.js';
+import { buildTransportQueueSnapshotPayloadWithoutLegacyCounters, buildTransportQueueSnapshotPayload, transportQueueSnapshotToPayload, transportQueueSnapshotWithoutLegacyCounters } from './transport-queue-projection.js';
 import { observeTransportQueueRevision, getTransportQueueRevision } from './transport-queue-revision.js';
 import { getTransportQueueStore } from './transport-queue-store.js';
 import {
@@ -1062,7 +1062,7 @@ function buildTransportQueueSessionStatePayload(
 ): Record<string, unknown> {
   return {
     state,
-    ...buildTransportQueueSnapshotPayload(sessionName, source),
+    ...buildTransportQueueSnapshotPayloadWithoutLegacyCounters(sessionName, source),
   };
 }
 
@@ -4936,7 +4936,7 @@ async function handleEditQueuedTransportMessage(cmd: Record<string, unknown>, se
     }
     timelineEmitter.emit(sessionName, 'session.state', {
       state: runtime.pendingCount > 0 ? 'queued' : (runtime.sending ? 'running' : 'idle'),
-      ...transportQueueSnapshotToPayload(queueSnapshot),
+      ...transportQueueSnapshotWithoutLegacyCounters(queueSnapshot),
     }, { source: 'daemon', confidence: 'high' });
     timelineEmitter.emit(sessionName, 'command.ack', { commandId, status: 'accepted' });
     emitCommandAckReliable(serverLink, { commandId, sessionName, status: 'accepted' });
@@ -5001,7 +5001,7 @@ async function handleUndoQueuedTransportMessage(cmd: Record<string, unknown>, se
     }
     timelineEmitter.emit(sessionName, 'session.state', {
       state: runtime.pendingCount > 0 ? 'queued' : (runtime.sending ? 'running' : 'idle'),
-      ...transportQueueSnapshotToPayload(queueSnapshot),
+      ...transportQueueSnapshotWithoutLegacyCounters(queueSnapshot),
     }, { source: 'daemon', confidence: 'high' });
     timelineEmitter.emit(sessionName, 'command.ack', { commandId, status: 'accepted' });
     emitCommandAckReliable(serverLink, { commandId, sessionName, status: 'accepted' });
@@ -5085,7 +5085,7 @@ async function handleAppendQueuedTransportMessages(cmd: Record<string, unknown>,
     }
     timelineEmitter.emit(sessionName, 'session.state', {
       state: runtime.pendingCount > 0 ? 'queued' : (runtime.sending ? 'running' : 'idle'),
-      ...transportQueueSnapshotToPayload(result.queueSnapshot),
+      ...transportQueueSnapshotWithoutLegacyCounters(result.queueSnapshot),
     }, { source: 'daemon', confidence: 'high' });
     timelineEmitter.emit(sessionName, 'command.ack', { commandId, status: 'accepted' });
     emitCommandAckReliable(serverLink, { commandId, sessionName, status: 'accepted' });
