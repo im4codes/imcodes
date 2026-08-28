@@ -108,6 +108,7 @@ COPY --from=builder /app/web/dist ./web/dist
 COPY server/controlled-node-artifacts/ ./controlled-node-executables/
 COPY scripts/node-exe-artifacts.mjs ./scripts/node-exe-artifacts.mjs
 COPY scripts/remote-desktop-worker-artifacts.mjs ./scripts/remote-desktop-worker-artifacts.mjs
+COPY shared/remote-desktop-macos-identity.json ./shared/remote-desktop-macos-identity.json
 COPY shared/remote-desktop-native-pins.json ./shared/remote-desktop-native-pins.json
 
 # Copy landing page

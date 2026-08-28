@@ -310,6 +310,23 @@ describe('controlled-node executable release wiring', () => {
     expect(dockerfile).toContain('COPY server/controlled-node-artifacts/ ./controlled-node-executables/');
     expect(dockerfile).toContain('COPY scripts/node-exe-artifacts.mjs ./scripts/node-exe-artifacts.mjs');
     expect(dockerfile).toContain('COPY scripts/remote-desktop-worker-artifacts.mjs ./scripts/remote-desktop-worker-artifacts.mjs');
+
+    // DERIVED, not hand-listed. The previous version asserted a fixed set of COPY
+    // lines, so when remote-desktop-worker-artifacts.mjs gained an import of
+    // shared/remote-desktop-macos-identity.json nothing noticed, and the runtime
+    // image failed at startup with ERR_MODULE_NOT_FOUND. Every relative import of
+    // a script we copy must itself be copied.
+    const copiedScripts = [...dockerfile.matchAll(/^COPY (scripts\/[\w.-]+\.mjs) /gmu)].map((m) => m[1]);
+    expect(copiedScripts.length).toBeGreaterThan(0);
+    for (const script of copiedScripts) {
+      const body = readFileSync(script, 'utf8');
+      const relativeImports = [...body.matchAll(/from '(\.\.?\/[^']+)'/gu)].map((m) => m[1]);
+      for (const spec of relativeImports) {
+        const resolved = spec.replace(/^\.\.\//u, '').replace(/^\.\//u, '');
+        expect(dockerfile, `${script} imports ${spec}; the runtime stage must COPY ${resolved}`)
+          .toContain(`COPY ${resolved} ./${resolved}`);
+      }
+    }
     expect(dockerfile).toContain('COPY shared/remote-desktop-native-pins.json ./shared/remote-desktop-native-pins.json');
     expect(dockerfile).toContain('ENV IMCODES_NODE_EXE_DIR=/app/controlled-node-executables');
   });
