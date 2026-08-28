@@ -136,15 +136,50 @@ if ($Mode -eq 'Sign') {
 }
 
 $Signature = Get-AuthenticodeSignature -LiteralPath $ResolvedArtifact
-if ($Signature.Status -ne [System.Management.Automation.SignatureStatus]::Valid -or
-    $null -eq $Signature.SignerCertificate) {
+if ($null -eq $Signature.SignerCertificate) {
+  throw "Windows release-artifact Authenticode verification failed: $($Signature.Status)"
+}
+
+# Exact signer pinning below proves which certificate signed the bytes, but it
+# says nothing about whether an ordinary customer machine trusts that signer.
+# In particular, importing a self-signed release leaf into TrustedPeople on a
+# CI runner makes Get-AuthenticodeSignature and SignTool look green while the
+# same executable remains an unknown publisher everywhere else. Endpoint
+# security products can then deny privileged child operations (for example
+# Task Scheduler registration) even though the PE contains a signature.
+#
+# Reject a self-issued leaf explicitly even if somebody has locally trusted it,
+# then build the normal Windows certificate chain without custom trust. NoCheck
+# disables only revocation network access; it does not relax root trust.
+$Signer = $Signature.SignerCertificate
+if ($Signer.Subject -ceq $Signer.Issuer) {
+  throw 'Windows release-artifact signer is self-signed; a publicly trusted Authenticode chain is required.'
+}
+$Chain = [System.Security.Cryptography.X509Certificates.X509Chain]::new()
+try {
+  $Chain.ChainPolicy.RevocationMode = [System.Security.Cryptography.X509Certificates.X509RevocationMode]::NoCheck
+  $Chain.ChainPolicy.VerificationFlags = [System.Security.Cryptography.X509Certificates.X509VerificationFlags]::NoFlag
+  if (-not $Chain.Build($Signer)) {
+    $Statuses = @($Chain.ChainStatus | ForEach-Object { $_.Status.ToString() }) -join ','
+    throw "Windows release-artifact signer chain is not trusted by the machine: $Statuses"
+  }
+  $Root = $Chain.ChainElements[$Chain.ChainElements.Count - 1].Certificate
+  if ($Chain.ChainElements.Count -lt 2 -or
+      $Root.Thumbprint -ceq $Signer.Thumbprint -or
+      $Root.Subject -cne $Root.Issuer) {
+    throw 'Windows release-artifact signer is peer-trusted without a public root chain.'
+  }
+} finally {
+  $Chain.Dispose()
+}
+if ($Signature.Status -ne [System.Management.Automation.SignatureStatus]::Valid) {
   throw "Windows release-artifact Authenticode verification failed: $($Signature.Status)"
 }
 
 $Sha256 = [System.Security.Cryptography.SHA256]::Create()
 try {
   $ActualSignerSha256 = [BitConverter]::ToString(
-    $Sha256.ComputeHash($Signature.SignerCertificate.RawData)
+    $Sha256.ComputeHash($Signer.RawData)
   ).Replace('-', '').ToLowerInvariant()
 } finally {
   $Sha256.Dispose()

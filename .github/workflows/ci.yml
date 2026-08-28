@@ -702,19 +702,25 @@ jobs:
           $pfxPath = Join-Path $env:RUNNER_TEMP 'imcodes-windows-release-signing.pfx'
           [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:IMCODES_WINDOWS_SIGNING_PFX_BASE64))
           $password = ConvertTo-SecureString $env:IMCODES_WINDOWS_SIGNING_PFX_PASSWORD -AsPlainText -Force
-          $certificate = Import-PfxCertificate -FilePath $pfxPath -CertStoreLocation Cert:\CurrentUser\My -Password $password
-          if (-not $certificate -or -not $certificate.HasPrivateKey) { throw 'Imported signing certificate has no private key.' }
+          $importedCertificates = @(Import-PfxCertificate -FilePath $pfxPath -CertStoreLocation Cert:\CurrentUser\My -Password $password)
+          "IMCODES_WINDOWS_IMPORTED_CERT_THUMBPRINTS=$($importedCertificates.Thumbprint -join ',')" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          $signingCertificates = @($importedCertificates | Where-Object { $_.HasPrivateKey })
+          if ($signingCertificates.Count -ne 1) { throw 'Signing PFX must contain exactly one certificate with a private key.' }
+          $certificate = $signingCertificates[0]
           Remove-Item -LiteralPath $pfxPath -Force
-          $publicCertificatePath = Join-Path $env:RUNNER_TEMP 'imcodes-windows-release-signing.cer'
-          Export-Certificate -Cert $certificate -FilePath $publicCertificatePath -Force | Out-Null
-          Import-Certificate -FilePath $publicCertificatePath -CertStoreLocation Cert:\LocalMachine\TrustedPeople | Out-Null
-          Import-Certificate -FilePath $publicCertificatePath -CertStoreLocation Cert:\LocalMachine\TrustedPublisher | Out-Null
           "IMCODES_WINDOWS_SIGNING_CERT_THUMBPRINT=$($certificate.Thumbprint)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           $sha256 = [System.Security.Cryptography.SHA256]::Create()
           try { $signerSha256 = [BitConverter]::ToString($sha256.ComputeHash($certificate.RawData)).Replace('-', '').ToLowerInvariant() } finally { $sha256.Dispose() }
           "IMCODES_WINDOWS_SIGNING_CERT_SHA256=$signerSha256" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       - name: Build controlled-node executable
         run: npm run build:node-exe
+      - name: Reject self-signed or untrusted Windows release identity
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          & .\scripts\test-windows-release-signing-trust.ps1 `
+            -ConfiguredArtifactPath 'dist-node-exe\imcodes-node.exe' `
+            -ExpectedSignerSha256 $env:IMCODES_WINDOWS_SIGNING_CERT_SHA256
       - name: Resolve fixed libwebrtc SDK release
         if: runner.os == 'Windows'
         id: libwebrtc_sdk
@@ -810,21 +816,33 @@ jobs:
         shell: powershell
         run: |
           $certificatePaths = @()
-          if ($env:IMCODES_WINDOWS_SIGNING_CERT_THUMBPRINT) {
-            $certificatePaths = @(
-              "Cert:\CurrentUser\My\$env:IMCODES_WINDOWS_SIGNING_CERT_THUMBPRINT",
-              "Cert:\LocalMachine\TrustedPeople\$env:IMCODES_WINDOWS_SIGNING_CERT_THUMBPRINT",
-              "Cert:\LocalMachine\TrustedPublisher\$env:IMCODES_WINDOWS_SIGNING_CERT_THUMBPRINT"
-            )
-            $certificatePaths | ForEach-Object { Remove-Item -LiteralPath $_ -Force -ErrorAction SilentlyContinue }
+          $cleanupErrors = @()
+          if ($env:IMCODES_WINDOWS_IMPORTED_CERT_THUMBPRINTS) {
+            $certificatePaths = @($env:IMCODES_WINDOWS_IMPORTED_CERT_THUMBPRINTS.Split(',') | Where-Object { $_ } | ForEach-Object {
+              "Cert:\CurrentUser\My\$_"
+            })
+            foreach ($certificatePath in $certificatePaths) {
+              if (Test-Path -LiteralPath $certificatePath) {
+                try { Remove-Item -LiteralPath $certificatePath -DeleteKey -Force -ErrorAction Stop }
+                catch { $cleanupErrors += "${certificatePath}: $($_.Exception.Message)" }
+              }
+              if (Test-Path -LiteralPath $certificatePath) {
+                $cleanupErrors += "${certificatePath}: certificate/private key still exists after cleanup"
+              }
+            }
           }
           $materialPaths = @(
-            (Join-Path $env:RUNNER_TEMP 'imcodes-windows-release-signing.pfx'),
-            (Join-Path $env:RUNNER_TEMP 'imcodes-windows-release-signing.cer')
+            (Join-Path $env:RUNNER_TEMP 'imcodes-windows-release-signing.pfx')
           )
-          $materialPaths | ForEach-Object { Remove-Item -LiteralPath $_ -Force -ErrorAction SilentlyContinue }
+          foreach ($materialPath in $materialPaths) {
+            if (Test-Path -LiteralPath $materialPath) {
+              try { Remove-Item -LiteralPath $materialPath -Force -ErrorAction Stop }
+              catch { $cleanupErrors += "${materialPath}: $($_.Exception.Message)" }
+            }
+          }
           $leftovers = @(($certificatePaths + $materialPaths) | Where-Object { Test-Path -LiteralPath $_ })
-          if ($leftovers.Count -gt 0) { throw 'Windows release-signing material cleanup was incomplete.' }
+          if ($leftovers.Count -gt 0) { $cleanupErrors += "Windows release-signing material cleanup was incomplete: $($leftovers -join ',')" }
+          if ($cleanupErrors.Count -gt 0) { throw "Windows release-signing certificate/private-key cleanup failed: $($cleanupErrors -join '; ')" }
 
   # ── Build & push Docker image ─────────────────────────────────────────────
 
