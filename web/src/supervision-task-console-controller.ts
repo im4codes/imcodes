@@ -1,6 +1,7 @@
 import { DAEMON_MSG } from '@shared/daemon-events.js';
 import {
   SUPERVISION_CONSOLE_RESYNC_REASONS,
+  SUPERVISION_CONSOLE_UNAVAILABLE_REASONS,
   SUPERVISION_TASK_CONSOLE_MSG,
   initialSupervisionConsoleCursor,
   type SupervisionConsoleResyncReason,
@@ -9,6 +10,7 @@ import {
   type SupervisionTaskConsoleScope,
   type SupervisionTaskConsoleSubscribe,
   type SupervisionTaskConsoleUnsubscribe,
+  type SupervisionTaskConsoleUnavailable,
 } from '@shared/supervision-task-console.js';
 import {
   SUPERVISION_TASK_CONSOLE_PHASE,
@@ -49,6 +51,27 @@ function parseResyncRequired(value: unknown): SupervisionTaskConsoleResyncRequir
   if (typeof value.subscriptionId !== 'string' || !isRecord(value.scope) || !isResyncReason(value.reason)) return null;
   if (typeof value.scope.projectName !== 'string' || typeof value.scope.coordinatorSessionName !== 'string') return null;
   return value as unknown as SupervisionTaskConsoleResyncRequired;
+}
+
+function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
+  const actual = Object.keys(value).sort();
+  const expected = [...keys].sort();
+  return actual.length === expected.length && actual.every((key, index) => key === expected[index]);
+}
+
+function parseUnavailable(value: unknown): SupervisionTaskConsoleUnavailable | null {
+  if (!isRecord(value) || !hasExactKeys(value, [
+    'type', 'subscriptionId', 'scope', 'reason', 'retryable',
+  ])) return null;
+  if (value.type !== SUPERVISION_TASK_CONSOLE_MSG.UNAVAILABLE
+    || typeof value.subscriptionId !== 'string'
+    || !isRecord(value.scope)
+    || !hasExactKeys(value.scope, ['projectName', 'coordinatorSessionName'])
+    || typeof value.scope.projectName !== 'string'
+    || typeof value.scope.coordinatorSessionName !== 'string'
+    || value.reason !== SUPERVISION_CONSOLE_UNAVAILABLE_REASONS.PROJECTION_UNAVAILABLE
+    || value.retryable !== true) return null;
+  return value as unknown as SupervisionTaskConsoleUnavailable;
 }
 
 /**
@@ -198,6 +221,14 @@ export class SupervisionTaskConsoleController {
         return;
       }
       this.apply({ type: 'server_resync_required', reason: control.reason });
+      return;
+    }
+    if (message.type === SUPERVISION_TASK_CONSOLE_MSG.UNAVAILABLE) {
+      const unavailable = parseUnavailable(message);
+      if (!unavailable || !this.state.subscriptionId
+        || unavailable.subscriptionId !== this.state.subscriptionId
+        || !sameScope(unavailable.scope, this.scope)) return;
+      this.apply({ type: 'transport_error', error: unavailable.reason });
       return;
     }
     if (message.type === SUPERVISION_TASK_CONSOLE_MSG.SNAPSHOT) {

@@ -1,4 +1,7 @@
-import { buildAgentDelegationAuditEnvelope } from '../../shared/agent-delegation.js';
+import {
+  AGENT_DELEGATION_BLOCKER_ESCALATION_PROMPT,
+  buildAgentDelegationAuditEnvelope,
+} from '../../shared/agent-delegation.js';
 import {
   SUPERVISION_CONTRACT_IDS,
   SUPERVISION_TRUSTED_EXECUTION_CONTRACT_IDS,
@@ -19,6 +22,7 @@ import {
   SUPERVISION_TRUSTED_CONTRACT_DELIVERY,
   TASK_RUN_STATUS_MARKERS,
   classifySupervisionCustomInstructions,
+  isAutomaticSupervisionEnabled,
   resolveSupervisionCustomInstructionsDetail,
   type SessionSupervisionSnapshot,
   type SupervisionCustomInstructionsDetail,
@@ -77,6 +81,7 @@ function boundSupervisionRules(text: string): { text: string; truncated: boolean
 
 type ExecutionPromptCopy = {
   auditPreamble: string;
+  auditEvidencePolicy: string;
   reworkLoop: string;
   continueTask: string;
   executionMode: string;
@@ -98,6 +103,7 @@ type ExecutionPromptCopy = {
 const EXECUTION_PROMPT_COPY: Record<SupervisionUiLocale, ExecutionPromptCopy> = {
   en: {
     auditPreamble: 'Peer-audit mode: finish implementation and validation, but DO NOT stage, commit, push, merge, release, publish, or deploy before PASS.',
+    auditEvidencePolicy: 'Audit evidence policy: briefs must say EVIDENCE ACCEPTANCE FIRST. After exact binding and coherence review, trust the implementer\'s frozen manifest, commands, exit codes, logs, and test results. Never request an unconditional full test/typecheck/build rerun; permit only a minimal targeted counterexample for missing, conflicting, contaminated, irreproducible, or concretely high-risk evidence, and require rerunReason.',
     reworkLoop: 'On REWORK, fix and validate immediately, then send the instructed reply-enabled re-audit; repeat until PASS or an exact blocker.',
     continueTask: 'Continue the same task.', executionMode: 'Execution mode', actionHint: 'Supervisor hint (verify first)', gapHint: 'Reported gap (advisory)', reasonHint: 'Rationale (advisory)',
     ownContext: 'Use your own context: advance safe unfinished work now; do not stop at a summary or repeat completed work.',
@@ -108,6 +114,7 @@ const EXECUTION_PROMPT_COPY: Record<SupervisionUiLocale, ExecutionPromptCopy> = 
   },
   'zh-CN': {
     auditPreamble: '同伴审计模式：先完成实现与验证；PASS 前不得暂存、提交、推送、合并、发布或部署。',
+    auditEvidencePolicy: '审计证据策略：审计说明必须要求“先验收证据”。精确绑定并核对一致性后，默认信任实现者提交的冻结 manifest、命令、退出码、日志和测试结果；禁止无条件重跑完整测试/typecheck/build。仅当证据缺失、冲突、污染、不可复现或出现具体高风险缺口时，才允许最小定向反例，并必须记录 rerunReason。',
     reworkLoop: '收到 REWORK 后立即修复并验证，再按指示发送可回执复审；循环至 PASS 或明确阻断。',
     continueTask: '继续同一任务。', executionMode: '执行模式', actionHint: '监督提示（先核对）', gapHint: '监督报告缺口（仅供参考）', reasonHint: '监督理由（仅供参考）',
     ownContext: '以你自己的上下文为准：本轮立即推进可安全处理的未完成项；不要只做总结或重复已完成工作。',
@@ -118,6 +125,7 @@ const EXECUTION_PROMPT_COPY: Record<SupervisionUiLocale, ExecutionPromptCopy> = 
   },
   'zh-TW': {
     auditPreamble: '同伴審計模式：先完成實作與驗證；PASS 前不得暫存、提交、推送、合併、發佈或部署。',
+    auditEvidencePolicy: '審計證據策略：審計說明必須要求「先驗收證據」。精確綁定並核對一致性後，預設信任實作者提交的凍結 manifest、命令、退出碼、日誌與測試結果；禁止無條件重跑完整測試/typecheck/build。僅在證據缺失、衝突、污染、不可重現或有具體高風險缺口時，才允許最小定向反例，並必須記錄 rerunReason。',
     reworkLoop: '收到 REWORK 後立即修復並驗證，再依指示發送可回執複審；循環至 PASS 或明確阻斷。',
     continueTask: '繼續同一任務。', executionMode: '執行模式', actionHint: '監督提示（先核對）', gapHint: '監督回報缺口（僅供參考）', reasonHint: '監督理由（僅供參考）',
     ownContext: '以你自己的上下文為準：本輪立即推進可安全處理的未完成項；不要只做摘要或重複已完成工作。',
@@ -128,6 +136,7 @@ const EXECUTION_PROMPT_COPY: Record<SupervisionUiLocale, ExecutionPromptCopy> = 
   },
   es: {
     auditPreamble: 'Modo de auditoría: termina implementación y validación; antes de PASS no prepares, confirmes, envíes, fusiones, publiques ni despliegues.',
+    auditEvidencePolicy: 'Política de evidencia: el informe debe exigir EVIDENCE ACCEPTANCE FIRST. Tras enlazar exactamente y revisar coherencia, acepta el manifiesto congelado, comandos, códigos de salida, registros y resultados del implementador. No ordenes repetir incondicionalmente toda la matriz de tests/typecheck/build; permite solo un contraejemplo mínimo y dirigido ante evidencia ausente, contradictoria, contaminada, irreproducible o un riesgo concreto, registrando rerunReason.',
     reworkLoop: 'Tras REWORK, corrige y valida de inmediato; luego envía la nueva auditoría con respuesta hasta PASS o un bloqueo exacto.',
     continueTask: 'Continúa la misma tarea.', executionMode: 'Modo de ejecución', actionHint: 'Sugerencia del supervisor (verifica primero)', gapHint: 'Falta informada (orientativa)', reasonHint: 'Motivo (orientativo)',
     ownContext: 'Usa tu propio contexto: avanza ahora el trabajo pendiente seguro; no te detengas en un resumen ni repitas lo completado.',
@@ -138,6 +147,7 @@ const EXECUTION_PROMPT_COPY: Record<SupervisionUiLocale, ExecutionPromptCopy> = 
   },
   ru: {
     auditPreamble: 'Режим аудита: завершите реализацию и проверку; до PASS нельзя индексировать, коммитить, отправлять, сливать, публиковать или развёртывать.',
+    auditEvidencePolicy: 'Политика доказательств: brief должен требовать EVIDENCE ACCEPTANCE FIRST. После точной привязки и проверки согласованности принимайте замороженный manifest, команды, коды выхода, журналы и результаты тестов исполнителя. Не требуйте безусловного повтора полного набора tests/typecheck/build; допускайте только минимальный направленный контрпример при отсутствии, конфликте, загрязнении, невоспроизводимости или конкретном высоком риске и фиксируйте rerunReason.',
     reworkLoop: 'После REWORK сразу исправьте и проверьте, затем отправьте указанную повторную проверку с ответом; повторяйте до PASS или точной блокировки.',
     continueTask: 'Продолжайте ту же задачу.', executionMode: 'Режим выполнения', actionHint: 'Подсказка надзора (сначала проверьте)', gapHint: 'Указанный пробел (справочно)', reasonHint: 'Причина (справочно)',
     ownContext: 'Опирайтесь на свой контекст: сейчас продвигайте безопасную незавершённую работу; не останавливайтесь на отчёте и не повторяйте готовое.',
@@ -148,6 +158,7 @@ const EXECUTION_PROMPT_COPY: Record<SupervisionUiLocale, ExecutionPromptCopy> = 
   },
   ja: {
     auditPreamble: 'ピア監査モード：実装と検証を完了し、PASS 前はステージ、コミット、プッシュ、マージ、公開、デプロイをしないでください。',
+    auditEvidencePolicy: '監査証拠ポリシー：brief は EVIDENCE ACCEPTANCE FIRST を要求します。正確な binding と整合性確認後、実装者の凍結 manifest、command、exit code、log、test result を証拠として受理します。full test/typecheck/build の無条件再実行は禁止し、欠落・矛盾・汚染・再現不能または具体的な高リスクがある場合だけ最小の定向反例を許可し、rerunReason を記録します。',
     reworkLoop: 'REWORK 後は直ちに修正・検証し、指示された返信可能な再監査を送信してください。PASS または明確な障害まで繰り返します。',
     continueTask: '同じタスクを続行してください。', executionMode: '実行モード', actionHint: '監督ヒント（先に確認）', gapHint: '報告された不足（参考）', reasonHint: '理由（参考）',
     ownContext: '自分の文脈を優先し、安全に進められる未完了作業を今すぐ進めてください。要約だけで止まらず、完了済み作業を繰り返さないでください。',
@@ -158,6 +169,7 @@ const EXECUTION_PROMPT_COPY: Record<SupervisionUiLocale, ExecutionPromptCopy> = 
   },
   ko: {
     auditPreamble: '동료 감사 모드: 구현과 검증을 완료하고 PASS 전에는 스테이징, 커밋, 푸시, 병합, 게시, 배포하지 마세요.',
+    auditEvidencePolicy: '감사 증거 정책: brief는 EVIDENCE ACCEPTANCE FIRST를 요구해야 합니다. 정확한 binding과 일관성 검토 후 구현자가 제출한 동결 manifest, command, exit code, log, test result를 증거로 수용합니다. 전체 test/typecheck/build의 무조건 재실행은 금지하며, 증거 누락·충돌·오염·재현 불가 또는 구체적 고위험이 있을 때만 최소 정향 반례를 허용하고 rerunReason을 기록합니다.',
     reworkLoop: 'REWORK 후 즉시 수정·검증하고 안내된 회신 가능 재감사를 보내세요. PASS 또는 명확한 차단 사유까지 반복합니다.',
     continueTask: '같은 작업을 계속하세요.', executionMode: '실행 모드', actionHint: '감독 힌트(먼저 확인)', gapHint: '보고된 누락(참고)', reasonHint: '이유(참고)',
     ownContext: '자신의 문맥을 기준으로 지금 안전한 미완료 작업을 진행하세요. 요약만 하고 멈추거나 완료한 작업을 반복하지 마세요.',
@@ -267,13 +279,13 @@ export function buildSupervisionDelegationEligibilityPolicy(locale?: Supervision
   const decisions = SUPERVISION_DELEGATION_ELIGIBILITY_DECISIONS.join('/');
   const taskListFields = SUPERVISION_DELEGATION_ELIGIBILITY_TASK_LIST_FIELDS.join(', ');
   const lines: Record<SupervisionUiLocale, string> = {
-    en: `Delegation eligibility policy (machine-checkable): do not rely on memory/prose or historical names. Before NEW delegation or audit target selection, call send_list_targets and require fields {${requiredFields}}. Forbidden agentType values by current product policy: ${forbiddenTypes}; OpenCode/OC is NOT globally forbidden and is decided only by structured runtime availability/capability. Target must be isDelegationReplyCapableAgentType/replyCapable. limited/offline/missing/unknown or missing fields => no delegation; busy => queue_only, never ready. Independent audit should prefer a different providerFamily from the implementer; if none is available, mark degraded/blocker and report it, never silently same-family self-audit. Fixed daemon audit/recovery target is the only exception: when attempt-bound, use the exact bound target without re-routing. Task-list projection MUST record {${taskListFields}} and decision ${decisions}.`,
-    'zh-CN': `委派资格策略（机器可检查）：不得依赖 memory/口头规则。新委派或新审计目标选择前必须调用 send_list_targets，并要求字段 {${requiredFields}}。按当前产品策略禁止 agentType：${forbiddenTypes}；OpenCode/OC 不全局封禁，只按结构化运行时 availability/capability 判定。目标必须满足 isDelegationReplyCapableAgentType/replyCapable。limited/offline/missing/unknown 或缺字段 => 不委派；busy 只能 queue_only，绝不能冒充 ready。独立审计应优先选择与实现者不同 providerFamily；没有可用跨厂商时标记 degraded/blocker 并报告，绝不静默同族自审。daemon 固定审计/恢复目标是唯一例外：attempt 已绑定时直接使用精确目标，不再二次路由。任务列表投影必须记录 {${taskListFields}} 与决策 ${decisions}。`,
-    'zh-TW': `委派資格策略（機器可檢查）：不得依賴 memory/口頭規則。新委派或新審計目標選擇前必須呼叫 send_list_targets，並要求欄位 {${requiredFields}}。依目前產品策略禁止 agentType：${forbiddenTypes}；OpenCode/OC 不全域封禁，只按結構化 runtime availability/capability 判定。目標必須滿足 isDelegationReplyCapableAgentType/replyCapable。limited/offline/missing/unknown 或缺欄位 => 不委派；busy 只能 queue_only，絕不能冒充 ready。獨立審計應優先選擇與實作者不同 providerFamily；沒有可用跨廠商時標記 degraded/blocker 並回報，絕不靜默同族自審。daemon 固定審計/恢復目標是唯一例外：attempt 已綁定時直接使用精確目標，不再二次路由。任務列表投影必須記錄 {${taskListFields}} 與決策 ${decisions}。`,
-    es: `Política de elegibilidad (verificable): no dependas de memoria/prosa. Antes de NUEVA delegación o selección de auditor llama send_list_targets y exige {${requiredFields}}. agentType prohibidos por política actual: ${forbiddenTypes}; OpenCode/OC NO está prohibido globalmente y se decide por availability/capability estructurada. El destino debe ser isDelegationReplyCapableAgentType/replyCapable. limited/offline/missing/unknown o campos ausentes => no delegar; busy => queue_only, nunca ready. La auditoría independiente prefiere otro providerFamily; si no existe, marca degraded/blocker e informa, nunca autoauditoría silenciosa de la misma familia. Excepción: destino fijo daemon ya vinculado al attempt, úsalo exacto sin re-ruteo. La lista proyecta {${taskListFields}} y decisión ${decisions}.`,
-    ru: `Политика eligibility (проверяемая): не полагайтесь на memory/prose. Перед НОВОЙ делегацией или выбором аудитора вызовите send_list_targets и требуйте {${requiredFields}}. Запрещённые текущей политикой agentType: ${forbiddenTypes}; OpenCode/OC НЕ запрещён глобально и решается только structured availability/capability. Цель должна быть isDelegationReplyCapableAgentType/replyCapable. limited/offline/missing/unknown или нет поля => не делегировать; busy => только queue_only, не ready. Независимый аудит предпочитает другой providerFamily; если его нет, отметьте degraded/blocker и сообщите, без тихого same-family self-audit. Исключение: фиксированная daemon цель, уже связанная с attempt; используйте точный target без reroute. Task-list проецирует {${taskListFields}} и decision ${decisions}.`,
-    ja: `委任 eligibility ポリシー（機械検査可能）：memory/prose に依存しません。新規委任または監査先選択前に send_list_targets を呼び {${requiredFields}} を必須にします。現在の製品ポリシーで禁止 agentType: ${forbiddenTypes}; OpenCode/OC はグローバル禁止ではなく structured availability/capability のみで判断します。対象は isDelegationReplyCapableAgentType/replyCapable 必須。limited/offline/missing/unknown または欠落フィールド => 委任禁止；busy は queue_only で ready 扱い禁止。独立監査は実装者と異なる providerFamily を優先；無ければ degraded/blocker として報告し、same-family self-audit を黙って行わない。例外は attempt に紐付く daemon 固定監査/復旧 target のみで、再ルーティングせず正確な target を使います。タスクリストは {${taskListFields}} と decision ${decisions} を投影します。`,
-    ko: `위임 eligibility 정책(기계 검증 가능): memory/prose에 의존하지 마세요. 새 위임 또는 감사 대상 선택 전 send_list_targets를 호출하고 {${requiredFields}}를 요구하세요. 현재 제품 정책상 금지 agentType: ${forbiddenTypes}; OpenCode/OC는 전역 금지가 아니며 structured availability/capability로만 판단합니다. 대상은 isDelegationReplyCapableAgentType/replyCapable이어야 합니다. limited/offline/missing/unknown 또는 필드 누락 => 위임 금지; busy는 queue_only이며 ready로 가장할 수 없습니다. 독립 감사는 구현자와 다른 providerFamily를 우선; 없으면 degraded/blocker로 표시·보고하고 same-family self-audit를 조용히 하지 마세요. 예외는 attempt에 바인딩된 daemon 고정 감사/복구 target뿐이며 재라우팅 없이 정확한 target을 사용합니다. task list는 {${taskListFields}}와 decision ${decisions}를 투영합니다.`,
+    en: `Delegation eligibility policy (machine-checkable): do not rely on memory/prose or historical names. Before NEW delegation or audit target selection, call send_list_targets and require fields {${requiredFields}}. Forbidden agentType values by current product policy: ${forbiddenTypes}; OpenCode/OC is NOT globally forbidden and is decided only by structured runtime availability/capability. Target must be isDelegationReplyCapableAgentType/replyCapable. limited/offline/missing/unknown or missing fields => no delegation; busy => queue_only, never ready. Independent audit should prefer a different providerFamily from the implementer; if none is available, degrade explicitly to a different eligible session in the same providerFamily and record same_family_degraded plus degradedReason; block only when no distinct eligible session exists, or when the user explicitly requires cross-vendor. Never self-audit. Fixed daemon audit/recovery target is the only exception: when attempt-bound, use the exact bound target without re-routing. Task-list projection MUST record {${taskListFields}} and decision ${decisions}.`,
+    'zh-CN': `委派资格策略（机器可检查）：不得依赖 memory/口头规则。新委派或新审计目标选择前必须调用 send_list_targets，并要求字段 {${requiredFields}}。按当前产品策略禁止 agentType：${forbiddenTypes}；OpenCode/OC 不全局封禁，只按结构化运行时 availability/capability 判定。目标必须满足 isDelegationReplyCapableAgentType/replyCapable。limited/offline/missing/unknown 或缺字段 => 不委派；busy 只能 queue_only，绝不能冒充 ready。独立审计应优先选择与实现者不同 providerFamily；没有可用跨厂商时，显式降级到同 providerFamily 的另一合格会话，并记录 same_family_degraded 与 degradedReason；只有不存在不同合格会话，或用户明确要求必须跨厂商时才 blocker。实现者绝不能自审。daemon 固定审计/恢复目标是唯一例外：attempt 已绑定时直接使用精确目标，不再二次路由。任务列表投影必须记录 {${taskListFields}} 与决策 ${decisions}。`,
+    'zh-TW': `委派資格策略（機器可檢查）：不得依賴 memory/口頭規則。新委派或新審計目標選擇前必須呼叫 send_list_targets，並要求欄位 {${requiredFields}}。依目前產品策略禁止 agentType：${forbiddenTypes}；OpenCode/OC 不全域封禁，只按結構化 runtime availability/capability 判定。目標必須滿足 isDelegationReplyCapableAgentType/replyCapable。limited/offline/missing/unknown 或缺欄位 => 不委派；busy 只能 queue_only，絕不能冒充 ready。獨立審計應優先選擇與實作者不同 providerFamily；沒有可用跨廠商時，明確降級到同 providerFamily 的另一個合格工作階段，並記錄 same_family_degraded 與 degradedReason；只有不存在不同合格工作階段，或使用者明確要求必須跨廠商時才 blocker。實作者絕不能自審。daemon 固定審計/恢復目標是唯一例外：attempt 已綁定時直接使用精確目標，不再二次路由。任務列表投影必須記錄 {${taskListFields}} 與決策 ${decisions}。`,
+    es: `Política de elegibilidad (verificable): no dependas de memoria/prosa. Antes de NUEVA delegación o selección de auditor llama send_list_targets y exige {${requiredFields}}. agentType prohibidos por política actual: ${forbiddenTypes}; OpenCode/OC NO está prohibido globalmente y se decide por availability/capability estructurada. El destino debe ser isDelegationReplyCapableAgentType/replyCapable. limited/offline/missing/unknown o campos ausentes => no delegar; busy => queue_only, nunca ready. La auditoría independiente prefiere otro providerFamily; si no existe, degrada explícitamente a otra sesión elegible de la misma providerFamily y registra same_family_degraded más degradedReason; bloquea solo si no existe una sesión distinta o el usuario exige cross-vendor. Nunca permitas autoauditoría. Excepción: destino fijo daemon ya vinculado al attempt, úsalo exacto sin re-ruteo. La lista proyecta {${taskListFields}} y decisión ${decisions}.`,
+    ru: `Политика eligibility (проверяемая): не полагайтесь на memory/prose. Перед НОВОЙ делегацией или выбором аудитора вызовите send_list_targets и требуйте {${requiredFields}}. Запрещённые текущей политикой agentType: ${forbiddenTypes}; OpenCode/OC НЕ запрещён глобально и решается только structured availability/capability. Цель должна быть isDelegationReplyCapableAgentType/replyCapable. limited/offline/missing/unknown или нет поля => не делегировать; busy => только queue_only, не ready. Независимый аудит предпочитает другой providerFamily; если его нет, явно используйте другую допустимую сессию той же providerFamily и запишите same_family_degraded и degradedReason; блокируйте только если другой сессии нет или пользователь требует cross-vendor. Самоаудит запрещён. Исключение: фиксированная daemon цель, уже связанная с attempt; используйте точный target без reroute. Task-list проецирует {${taskListFields}} и decision ${decisions}.`,
+    ja: `委任 eligibility ポリシー（機械検査可能）：memory/prose に依存しません。新規委任または監査先選択前に send_list_targets を呼び {${requiredFields}} を必須にします。現在の製品ポリシーで禁止 agentType: ${forbiddenTypes}; OpenCode/OC はグローバル禁止ではなく structured availability/capability のみで判断します。対象は isDelegationReplyCapableAgentType/replyCapable 必須。limited/offline/missing/unknown または欠落フィールド => 委任禁止；busy は queue_only で ready 扱い禁止。独立監査は実装者と異なる providerFamily を優先；無ければ同じ providerFamily の別の適格セッションへ明示的に降格し、same_family_degraded と degradedReason を記録します。別セッションが無い場合、またはユーザーが cross-vendor を必須指定した場合だけブロックし、自己監査は禁止します。例外は attempt に紐付く daemon 固定監査/復旧 target のみで、再ルーティングせず正確な target を使います。タスクリストは {${taskListFields}} と decision ${decisions} を投影します。`,
+    ko: `위임 eligibility 정책(기계 검증 가능): memory/prose에 의존하지 마세요. 새 위임 또는 감사 대상 선택 전 send_list_targets를 호출하고 {${requiredFields}}를 요구하세요. 현재 제품 정책상 금지 agentType: ${forbiddenTypes}; OpenCode/OC는 전역 금지가 아니며 structured availability/capability로만 판단합니다. 대상은 isDelegationReplyCapableAgentType/replyCapable이어야 합니다. limited/offline/missing/unknown 또는 필드 누락 => 위임 금지; busy는 queue_only이며 ready로 가장할 수 없습니다. 독립 감사는 구현자와 다른 providerFamily를 우선; 없으면 같은 providerFamily의 다른 적격 세션으로 명시적으로 강등하고 same_family_degraded와 degradedReason을 기록하세요. 다른 세션이 없거나 사용자가 cross-vendor를 필수로 요구한 경우만 차단하며 자기 감사는 금지합니다. 예외는 attempt에 바인딩된 daemon 고정 감사/복구 target뿐이며 재라우팅 없이 정확한 target을 사용합니다. task list는 {${taskListFields}}와 decision ${decisions}를 투영합니다.`,
   };
   return [
     `[Contract: ${SUPERVISION_CONTRACT_IDS.DELEGATION_ELIGIBILITY}]`,
@@ -367,6 +379,8 @@ export function buildSupervisedAuditExecutionPreamble(locale?: SupervisionUiLoca
     buildSupervisionTaskRegistryContract(locale),
     buildSupervisionDelegationEligibilityPolicy(locale),
     copy.auditPreamble,
+    copy.auditEvidencePolicy,
+    AGENT_DELEGATION_BLOCKER_ESCALATION_PROMPT,
     copy.reworkLoop,
     buildExecutionStatusContract(locale),
   ].join('\n');
@@ -386,21 +400,20 @@ export function buildSupervisionExecutionPreamble(locale?: SupervisionUiLocale):
 }
 
 export function buildSupervisionWaitingHeartbeatPrompt(
-  waitedMinutes: number,
+  snapshot: Pick<SessionSupervisionSnapshot, 'mode'> | null | undefined,
   locale?: SupervisionUiLocale,
 ): string {
-  const normalizedMinutes = Math.max(1, Math.floor(waitedMinutes));
-  return [
-    `[Contract: ${SUPERVISION_CONTRACT_IDS.WAITING_HEARTBEAT}]`,
-    buildSupervisionOrchestratorContext(locale),
-    buildSupervisionTaskFinalizationContract(locale),
-    buildSupervisionTaskRegistryContract(locale),
-    buildSupervisionDelegationEligibilityPolicy(locale),
-    resolveExecutionPromptCopy(locale).waitingHeartbeat(
-      normalizedMinutes,
-      SUPERVISION_EXECUTION_STATUS_MARKERS,
-    ),
-  ].join('\n');
+  if (!isAutomaticSupervisionEnabled(snapshot)) return '';
+  const lines: Record<SupervisionUiLocale, string> = {
+    en: `Check the current task state. Continue any safe work now. If waiting for a receipt, remain waiting and check again on the next heartbeat. Return ${SUPERVISION_EXECUTION_STATUS_MARKERS.NEEDS_INPUT} only when real human input is required.`,
+    'zh-CN': `检查当前任务状态；有安全工作就继续推进；等待回执则保持等待并在下次心跳继续检查。只有确需人工输入时才返回 ${SUPERVISION_EXECUTION_STATUS_MARKERS.NEEDS_INPUT}。`,
+    'zh-TW': `檢查目前任務狀態；有安全工作就繼續推進；等待回執則保持等待並在下次心跳繼續檢查。只有確需人工輸入時才回傳 ${SUPERVISION_EXECUTION_STATUS_MARKERS.NEEDS_INPUT}。`,
+    es: `Comprueba el estado actual. Continúa cualquier trabajo seguro. Si esperas un recibo, sigue esperando y comprueba de nuevo en el próximo latido. Devuelve ${SUPERVISION_EXECUTION_STATUS_MARKERS.NEEDS_INPUT} solo si hace falta intervención humana real.`,
+    ru: `Проверьте текущее состояние задачи. Продолжайте безопасную работу. Если ждёте квитанцию, продолжайте ждать и проверьте снова при следующем heartbeat. Возвращайте ${SUPERVISION_EXECUTION_STATUS_MARKERS.NEEDS_INPUT} только когда действительно нужен человек.`,
+    ja: `現在のタスク状態を確認し、安全に進められる作業を続行してください。回执待ちなら待機を維持し、次の heartbeat で再確認します。人の入力が本当に必要な場合だけ ${SUPERVISION_EXECUTION_STATUS_MARKERS.NEEDS_INPUT} を返してください。`,
+    ko: `현재 작업 상태를 확인하고 안전한 작업은 계속 진행하세요. 영수증을 기다리는 중이면 대기를 유지하고 다음 heartbeat에서 다시 확인하세요. 실제 사람 입력이 필요한 경우에만 ${SUPERVISION_EXECUTION_STATUS_MARKERS.NEEDS_INPUT}을 반환하세요.`,
+  };
+  return `[Contract: ${SUPERVISION_CONTRACT_IDS.WAITING_HEARTBEAT}]\n${lines[locale ?? 'en']}`;
 }
 
 export type SupervisionAuditHeartbeatAction =
@@ -488,6 +501,7 @@ export function buildAutomaticAuditTaskPrompt(options: {
   uiLocale?: SupervisionUiLocale;
 }): string {
   const markerLine = `${PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS.PASS} / ${PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS.REWORK}`;
+  const evidencePolicy = resolveExecutionPromptCopy(options.uiLocale).auditEvidencePolicy;
   const common = {
     attempt: options.attemptId,
     target: options.targetSession,
@@ -577,6 +591,8 @@ export function buildAutomaticAuditTaskPrompt(options: {
     buildSupervisionTaskFinalizationContract(options.uiLocale),
     buildSupervisionTaskRegistryContract(options.uiLocale),
     buildSupervisionDelegationEligibilityPolicy(options.uiLocale),
+    evidencePolicy,
+    AGENT_DELEGATION_BLOCKER_ESCALATION_PROMPT,
   ].filter(Boolean).join('\n');
 }
 
@@ -649,6 +665,8 @@ export interface PeerAuditBriefV1Input {
   changePath?: string;
   changedPaths?: readonly string[];
   validations?: readonly PeerAuditValidationItem[];
+  /** Explicit producer assessment that the submitted evidence bundle is complete. */
+  evidenceComplete?: boolean;
   /** Optional broker context; explicitly non-authoritative in the brief. */
   supervisorRationale?: string;
   /** When true, scope the audit to the diff and its direct blast radius. */
@@ -777,14 +795,27 @@ export function buildPeerAuditBriefV1(input: PeerAuditBriefV1Input): string {
   const priorFindings = input.priorReworkFindings
     ? sanitizePeerAuditText(input.priorReworkFindings, PEER_AUDIT_PRIOR_FINDINGS_BYTES)
     : '';
+  const evidenceComplete = input.evidenceComplete === true
+    || (input.validations?.some((item) => item.outcome === 'passed') ?? false);
+  const evidencePolicy = evidenceComplete
+    ? [
+        'EVIDENCE ACCEPTANCE FIRST: the implementer supplied executable evidence. Start by binding the frozen manifest/revision and accepting the reported commands, exit codes, logs, and test results as evidence; verify their coherence with the reviewed bytes.',
+        'Do NOT unconditionally repeat a full test, typecheck, lint, or build suite. Run only a minimal targeted counterexample when a concrete evidence gap, conflict, contamination, irreproducibility, or high-risk code finding makes it necessary. If you rerun anything, record `rerunReason=<specific trigger>` with that validation.',
+      ]
+    : [
+        'EVIDENCE GAP: no passed executable validation was supplied in the structured evidence summary. Run only the smallest bounded check needed to resolve that gap; do not default to the full matrix.',
+        'Every rerun must record `rerunReason=<missing/conflicting/high-risk evidence>` in its validation summary.',
+      ];
 
   const brief = [
     `[Contract: ${PEER_AUDIT_PROMPT_VERSION}]`,
     'You are the independently selected peer auditor. Audit the completed result against the request and acceptance criteria below.',
+    AGENT_DELEGATION_BLOCKER_ESCALATION_PROMPT,
     'This is a lightweight, single-pass audit. Do not start Team/P2P rounds, create a discussion, poll another session, or bulk-read OpenSpec artifact bodies.',
     'Prioritize the highest-value checks within 15 minutes. Separate observed evidence from inference.',
-    'Use every applicable existing means for NON-DESTRUCTIVE verification; static code review alone is insufficient when relevant executable validation is available.',
-    'You MAY run focused/unit/integration tests, typecheck, lint, build, read-only tools, and explicitly isolated test fixtures. You MAY use already-authorized devices/environments only for read-only checks or isolated fixture operations.',
+    ...evidencePolicy,
+    'The normal audit is exact binding, code review, command/result acceptance, and only the necessary minimal directed counterexample. Submitted evidence is not invalid merely because the auditor did not personally rerun it.',
+    'When the evidence policy above permits a rerun, you MAY use focused tests, typecheck, lint, build, read-only tools, and explicitly isolated fixtures. You MAY use already-authorized devices/environments only for read-only checks or isolated fixture operations.',
     'You MUST NOT modify tracked source, commit, push, deploy, mutate production, or alter persistent external/product state. Do not run reset/clean. Inspect worktree state before and after, preserve pre-existing changes, and stop/report if validation creates an unexpected tracked diff.',
     'Report exact commands/tools/devices/environments and observed outcomes. Explain unavailable checks; never invent a result.',
     '',
@@ -811,7 +842,7 @@ export function buildPeerAuditBriefV1(input: PeerAuditBriefV1Input): string {
       'Previous REWORK findings:',
       priorFindings] : []),
     '',
-    'Submit exactly one structured reply. PASS requires at least one observed passed validation when an executable relevant check exists; otherwise list each unavailable check specifically. Empty/static-only PASS is rejected.',
+    'Submit exactly one structured reply. PASS requires at least one accepted, exact-bound passed validation when an executable relevant check exists; an implementer result satisfies this after coherence/binding review and does not need a duplicate run. Otherwise list each unavailable check specifically. Empty/static-only PASS is rejected.',
     'Prefer the available peer_audit_reply MCP tool with these exact fields:',
     `{ "attemptId": "${input.attemptId}", "replyCapability": "${input.replyCapability}", "verdict": "PASS|REWORK", "findings": "<bounded findings>", "validations": [{ "kind": "test", "label": "<check>", "outcome": "passed|failed|unavailable", "summary": "<exact result or reason>" }] }`,
     'If that MCP tool is unavailable, write findings and validations JSON to disposable local files, then invoke:',
@@ -1312,11 +1343,11 @@ export const SUPERVISION_PROMPT_ENTRYPOINTS = [
   {
     id: 'waitingHeartbeat',
     builderName: 'buildSupervisionWaitingHeartbeatPrompt',
-    includesOrchestratorContext: true,
-    includesTaskFinalizationContract: true,
-    includesTaskRegistryContract: true,
-    includesDelegationEligibilityPolicy: true,
-    render: () => buildSupervisionWaitingHeartbeatPrompt(10),
+    includesOrchestratorContext: false,
+    includesTaskFinalizationContract: false,
+    includesTaskRegistryContract: false,
+    includesDelegationEligibilityPolicy: false,
+    render: () => buildSupervisionWaitingHeartbeatPrompt({ mode: SUPERVISION_MODE.SUPERVISED }),
   },
   {
     id: 'auditHeartbeat',

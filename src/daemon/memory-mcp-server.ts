@@ -230,6 +230,27 @@ export function mergeDefaultToolDeps(caller: McpRuntimeCaller, toolDeps: MemoryM
     machineDeps: toolDeps.machineDeps ?? createDaemonMachineToolDeps(),
     sendDeps: {
       ...toolDeps.sendDeps,
+      // The stdio MCP runs in a child process, so its local transport/tmux
+      // maps cannot prove whether a session omitted by a sessions.json refresh
+      // is still alive. Query the main daemon's authoritative directory once
+      // instead of turning a transient omission into `target not found`.
+      isSessionAuthoritativelyActive:
+        toolDeps.sendDeps?.isSessionAuthoritativelyActive
+        ?? (async (candidate: SessionRecord) => {
+          const port = await resolveLiveHookPort();
+          if (!port) return false;
+          try {
+            const response = await postHookSend(port, {}, '/sessions/live', caller.sessionName ?? undefined, 2_000);
+            const sessions = Array.isArray(response.sessions) ? response.sessions : [];
+            const current = sessions.find((entry) => (
+              entry && typeof entry === 'object'
+              && (entry as { name?: unknown }).name === candidate.name
+            )) as { state?: unknown } | undefined;
+            return Boolean(current && current.state !== 'stopped' && current.state !== 'error');
+          } catch {
+            return false;
+          }
+        }),
       // Production stdio MCP consults the daemon's static capability
       // advertisement for the execution-clone send/destroy gate instead of
       // defaulting to enabled. An explicitly-injected override (tests) wins —

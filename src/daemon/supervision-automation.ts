@@ -29,6 +29,7 @@ import {
   SUPERVISION_MODE,
   SUPERVISION_UNAVAILABLE_REASONS,
   extractSessionSupervisionSnapshot,
+  isAutomaticSupervisionEnabled,
   normalizeSessionSupervisionSnapshot,
   parseSupervisionExecutionStateDetailsFromText,
   resolveSupervisionCustomInstructionsDetail,
@@ -139,7 +140,6 @@ const SUPERVISION_PARKED_LABEL = 'Supervised: parked until the pending reply arr
  * only for the case where that reply never comes — without it, a lost audit
  * would strand the run silently instead of surfacing to the human.
  */
-const SUPERVISION_WAITING_TIMEOUT_MS = 30 * 60_000;
 const SUPERVISION_WAITING_HEARTBEAT_MS = 10 * 60_000;
 const AUDIT_TARGET_MAX_RECOVERY_CONTINUES = 2;
 /**
@@ -865,12 +865,20 @@ class SupervisionAutomation {
   private recoveredImplicitCompletionKeys: string[] = [];
   private recoveredImplicitCompletionKeySet = new Set<string>();
   private recoverySuppressedUntilNextUser = new Set<string>();
+  private heartbeatPausedForNeedsInput = new Set<string>();
   private emittedAuditResultAttemptIds: string[] = [];
   private emittedAuditResultAttemptIdSet = new Set<string>();
   /** Monotonic even across cancellation, so an old async verdict cannot match a replacement run. */
   private nextRunGeneration = 0;
   private initialized = false;
   private eventSequence = 0;
+  /** Test-only compatibility seam for the retired daemon-owned audit driver. */
+  private automaticPeerAuditCompatibilityForTests = false;
+
+  __setAutomaticPeerAuditCompatibilityForTests(enabled: boolean): void {
+    if (process.env.NODE_ENV !== 'test') return;
+    this.automaticPeerAuditCompatibilityForTests = enabled;
+  }
 
   private emitWarning(sessionName: string, text: string): void {
     timelineEmitter.emit(
@@ -938,19 +946,22 @@ class SupervisionAutomation {
       this.handleTimelineEvent(event);
     });
     onDelegationReplyDelivered((record) => {
-      this.handleStructuredDelegationReplyDelivered(record);
+      if (this.automaticPeerAuditCompatibilityForTests) {
+        this.handleStructuredDelegationReplyDelivered(record);
+      }
     });
     this.restorePersistedWaitStates();
   }
 
   setServerLink(_serverLink: ServerLink | null): void {
-    // Kept as a compatibility hook for lifecycle wiring. Lightweight peer
-    // audit dispatch is daemon-local and does not use the P2P server link.
+    // Kept as a compatibility hook for lifecycle wiring. The daemon no longer
+    // owns peer-audit lifecycle; Brain dispatches audits explicitly.
   }
 
   cancelSession(sessionName: string): void {
     const state = this.activeRuns.get(sessionName);
-    if (state?.phase === 'auditing' && state.auditAttemptId) {
+    if (this.automaticPeerAuditCompatibilityForTests
+      && state?.phase === 'auditing' && state.auditAttemptId) {
       this.clearAuditDeadline(state);
       this.clearAuditTargetRecovery(state);
       this.emitOrchestratedAuditResult(state, 'cancelled', 'session_supervision_cancelled');
@@ -976,13 +987,10 @@ class SupervisionAutomation {
   /**
    * Stand supervision down because the user pressed STOP on `sessionName`.
    *
-   * STOP has to mean "everything driving this session stops", not just "this
-   * session's own run stops". A supervised-audit run lives on the *supervisor*
-   * session and drives its `auditTargetSessionName`, so cancelling only the
-   * stopped session left the driver armed: it kept waking on its deadline and
-   * re-sending continue prompts at the session the user had just stopped.
-   * Sweep the drivers too — their awaited reply can never arrive now, so the
-   * honest outcome is a cancelled audit rather than a timeout much later.
+   * STOP has to mean "everything driving this session stops". Legacy daemon
+   * versions may leave an in-memory audit-target reference, so sweep it
+   * silently; cancellation/result notices belong to Brain's explicit audit
+   * lifecycle and must not be injected into ordinary chat.
    */
   cancelForUserStop(sessionName: string): void {
     this.cancelSession(sessionName);
@@ -990,9 +998,10 @@ class SupervisionAutomation {
     for (const run of [...this.activeRuns.values()]) {
       if (run.sessionName === sessionName) continue;
       if (run.snapshot.auditTargetSessionName !== sessionName) continue;
-      if (run.phase === 'auditing' && run.auditAttemptId) {
-        this.clearAuditDeadline(run);
-        this.clearAuditTargetRecovery(run);
+      this.clearAuditDeadline(run);
+      this.clearAuditTargetRecovery(run);
+      if (this.automaticPeerAuditCompatibilityForTests
+        && run.phase === 'auditing' && run.auditAttemptId) {
         this.emitOrchestratedAuditResult(run, 'cancelled', 'audit_target_user_stopped');
       }
       this.clearWaitingTimers(run);
@@ -1000,20 +1009,26 @@ class SupervisionAutomation {
       this.activeRuns.delete(run.sessionName);
       this.deletePersistedWaitState(run.sessionName);
       this.clearStatus(run.sessionName);
-      this.emitWarning(
-        run.sessionName,
-        `Supervision stopped: ${sessionName} was stopped by the user, so its audit cannot complete.`,
-      );
+      if (this.automaticPeerAuditCompatibilityForTests) {
+        this.emitWarning(
+          run.sessionName,
+          `Supervision stopped: ${sessionName} was stopped by the user, so its audit cannot complete.`,
+        );
+      }
     }
   }
 
   applySnapshotUpdate(sessionName: string, snapshot: SessionSupervisionSnapshot | null | undefined): void {
+    // Quick Peer Audit remains user-invoked. Automatic supervision must never
+    // enable/disable, start, cancel, or recover its audit controller.
     peerAuditService.applyAutomaticConfiguration(
       sessionName,
-      Boolean(snapshot && snapshot.mode === SUPERVISION_MODE.SUPERVISED_AUDIT
-        && snapshot.auditTargetSessionName),
+      this.automaticPeerAuditCompatibilityForTests
+        && Boolean(snapshot && snapshot.mode === SUPERVISION_MODE.SUPERVISED_AUDIT
+          && snapshot.auditTargetSessionName),
     );
-    if (!snapshot || snapshot.mode === SUPERVISION_MODE.OFF) {
+    if (!isAutomaticSupervisionEnabled(snapshot)) {
+      this.heartbeatPausedForNeedsInput.delete(sessionName);
       this.cancelSession(sessionName);
       return;
     }
@@ -1304,7 +1319,7 @@ class SupervisionAutomation {
     sessionName: string,
     snapshot: SessionSupervisionSnapshot,
   ): boolean {
-    if (snapshot.mode === SUPERVISION_MODE.OFF) return false;
+    if (!isAutomaticSupervisionEnabled(snapshot)) return false;
     const recovered = this.findRecoverableImplicitCompletion(sessionName);
     if (!recovered) return false;
     this.recentTaskCandidates.set(sessionName, recovered.candidate);
@@ -1374,7 +1389,7 @@ class SupervisionAutomation {
     sessionName: string,
     snapshot: SessionSupervisionSnapshot | null | undefined,
   ): void {
-    if (!snapshot || snapshot.mode === SUPERVISION_MODE.OFF) return;
+    if (!isAutomaticSupervisionEnabled(snapshot)) return;
     const candidate = this.recentTaskCandidates.get(sessionName);
     if (!candidate) return;
     this.recentTaskCandidates.delete(sessionName);
@@ -1387,7 +1402,7 @@ class SupervisionAutomation {
     text: string,
     snapshot: SessionSupervisionSnapshot,
   ): void {
-    if (snapshot.mode === SUPERVISION_MODE.OFF) return;
+    if (!isAutomaticSupervisionEnabled(snapshot)) return;
     this.cancelSession(sessionName);
     this.pendingTaskIntents.set(sessionName, { commandId, text, snapshot });
   }
@@ -1410,14 +1425,17 @@ class SupervisionAutomation {
     text: string,
     snapshot: SessionSupervisionSnapshot,
   ): ActiveTaskRunState | null {
-    if (snapshot.mode === SUPERVISION_MODE.OFF) return null;
+    if (!isAutomaticSupervisionEnabled(snapshot)) return null;
+    this.heartbeatPausedForNeedsInput.delete(sessionName);
     this.clearImplicitCompletionGrace(sessionName);
     this.recoverySuppressedUntilNextUser.delete(sessionName);
     const existing = this.activeRuns.get(sessionName);
-    if (existing?.phase === 'auditing' && existing.auditAttemptId) {
+    if (existing?.phase === 'auditing') {
       this.clearAuditDeadline(existing);
       this.clearAuditTargetRecovery(existing);
-      this.emitOrchestratedAuditResult(existing, 'cancelled', 'new_task_intent_replaced_existing_audit');
+      if (this.automaticPeerAuditCompatibilityForTests && existing.auditAttemptId) {
+        this.emitOrchestratedAuditResult(existing, 'cancelled', 'new_task_intent_replaced_existing_audit');
+      }
     }
     if (existing) {
       this.clearWaitingTimers(existing);
@@ -1553,12 +1571,20 @@ class SupervisionAutomation {
       const ownerRecord = getSession(persisted.owner.sessionName);
       const snapshot = normalizeSessionSupervisionSnapshot(persisted.snapshot);
       if (!persistedIdentityMatches(persisted.owner, ownerRecord)
-        || !snapshot
-        || snapshot.mode === SUPERVISION_MODE.OFF) {
+        || !isAutomaticSupervisionEnabled(snapshot)) {
         this.deletePersistedWaitState(persisted.owner.sessionName);
         continue;
       }
+      // Upgrade boundary: old daemons persisted automatic audit attempts.
+      // Never recover, cancel, time out, or chat-notify those attempts. Brain
+      // owns any still-relevant structured audit state and can resume it
+      // explicitly; the automation store is only authoritative for waiting
+      // heartbeat state now.
       if (persisted.phase === 'auditing') {
+        if (!this.automaticPeerAuditCompatibilityForTests) {
+          this.deletePersistedWaitState(persisted.owner.sessionName);
+          continue;
+        }
         const targetRecord = persisted.auditTarget ? getSession(persisted.auditTarget.sessionName) : undefined;
         if (!persisted.auditAttemptId
           || !persisted.auditTarget
@@ -1621,26 +1647,24 @@ class SupervisionAutomation {
           : {}),
       };
       this.activeRuns.set(run.sessionName, run);
-      if (persisted.phase === 'waiting') {
-        if (run.waitingEvaluationPending) {
-          run.evaluating = true;
-          this.emitCheckingState(run.sessionName);
-          queueMicrotask(() => {
-            void this.evaluateExecutionTurn(run).catch((error) => {
-              logger.warn({ session: run.sessionName, err: error }, 'Restored supervision waiting evaluation failed');
-              this.finishRun(run.sessionName, 'needs_input');
-            });
-          });
-        } else {
-          this.emitStatus(run.sessionName, 'supervision_parked', SUPERVISION_PARKED_LABEL);
-          this.armWaitingTimers(run, { preserveSchedule: true });
-        }
-      } else {
+      if (persisted.phase === 'auditing') {
         this.emitStatus(run.sessionName, 'supervision_audit_waiting', SUPERVISION_AUDIT_WAITING_LABEL);
         this.armAuditDeadline(run, { preserveDeadline: true });
         if (run.auditReplyObserved && run.sawAssistantOutput) {
           queueMicrotask(() => this.handleOrchestratedAuditCompletion(run, { settledWithoutIdle: true }));
         }
+      } else if (run.waitingEvaluationPending) {
+        run.evaluating = true;
+        this.emitCheckingState(run.sessionName);
+        queueMicrotask(() => {
+          void this.evaluateExecutionTurn(run).catch((error) => {
+            logger.warn({ session: run.sessionName, err: error }, 'Restored supervision waiting evaluation failed');
+            this.finishRun(run.sessionName, 'needs_input');
+          });
+        });
+      } else {
+        this.emitStatus(run.sessionName, 'supervision_parked', SUPERVISION_PARKED_LABEL);
+        this.armWaitingTimers(run, { preserveSchedule: true });
       }
     }
   }
@@ -2154,49 +2178,26 @@ class SupervisionAutomation {
 
   /**
    * Keep a parked run observable without turning the heartbeat into normal
-   * task advancement. The ten-minute prompt does not consume continue-loop
-   * budgets. Its 30-minute hard deadline is anchored to the FIRST WAITING
-   * result and is persisted in SQLite, so repeated WAITING replies or daemon
-   * restarts cannot silently grant a fresh window.
+   * task advancement. The bounded-rate prompt does not consume continue-loop
+   * budgets and its next-send time is persisted across daemon restarts. WAITING
+   * remains recurrent until a real NEEDS_INPUT result pauses the lifecycle.
    */
   private armWaitingTimers(
     run: ActiveTaskRunState,
     options: { preserveSchedule?: boolean } = {},
   ): void {
     this.clearWaitingTimers(run, { preserveWindow: true });
+    if (!isAutomaticSupervisionEnabled(run.snapshot)) return;
     const now = Date.now();
     run.waitingStartedAt ??= now;
-    run.waitingDeadlineAt ??= run.waitingStartedAt + SUPERVISION_WAITING_TIMEOUT_MS;
+    // There is deliberately no terminal wall-clock deadline. WAITING is a
+    // durable state, not an implicit request for human input. Only a real
+    // NEEDS_INPUT outcome pauses automatic heartbeats.
+    run.waitingDeadlineAt = undefined;
     if (!options.preserveSchedule || run.waitingNextHeartbeatAt === undefined) {
-      run.waitingNextHeartbeatAt = Math.min(
-        run.waitingStartedAt + SUPERVISION_WAITING_HEARTBEAT_MS,
-        run.waitingDeadlineAt,
-      );
+      run.waitingNextHeartbeatAt = now + SUPERVISION_WAITING_HEARTBEAT_MS;
     }
-    const generation = run.generation;
-    const phase = run.phase;
-    let timer: NodeJS.Timeout;
-    timer = setTimeout(() => {
-      const latest = this.activeRuns.get(run.sessionName);
-      // Identity is the timer handle. `generation` restarts at 1 whenever a run
-      // is cancelled rather than replaced, so gen+phase alone let a stale timer
-      // from a cancelled run terminate an unrelated later one.
-      if (!latest || latest.waitingTimeoutTimer !== timer) return;
-      if (latest.generation !== generation || latest.phase !== phase) return;
-      // An evaluation already in flight owns this run's fate; killing it here
-      // would drop the verdict the parked run was waiting for.
-      if (latest.evaluating) return;
-      latest.waitingTimeoutTimer = undefined;
-      this.emitWarning(
-        latest.sessionName,
-        'The awaited reply did not arrive within the parked-wait limit; handing control back to the human.',
-      );
-      this.finishRun(latest.sessionName, 'needs_input');
-    }, Math.max(0, run.waitingDeadlineAt - now));
-    timer.unref?.();
-    run.waitingTimeoutTimer = timer;
-
-    this.armNextWaitingHeartbeat(run, generation, phase);
+    this.armNextWaitingHeartbeat(run);
     this.persistWaitState(run, 'waiting');
   }
 
@@ -2208,8 +2209,7 @@ class SupervisionAutomation {
     if (run.waitingHeartbeatTimer) clearTimeout(run.waitingHeartbeatTimer);
     run.waitingHeartbeatTimer = undefined;
     if (run.waitingNextHeartbeatAt === undefined
-      || run.waitingDeadlineAt === undefined
-      || run.waitingNextHeartbeatAt >= run.waitingDeadlineAt) return;
+      || !isAutomaticSupervisionEnabled(run.snapshot)) return;
     let heartbeatTimer: NodeJS.Timeout;
     heartbeatTimer = setTimeout(() => {
       const latest = this.activeRuns.get(run.sessionName);
@@ -2225,15 +2225,12 @@ class SupervisionAutomation {
   private dispatchWaitingHeartbeat(run: ActiveTaskRunState): void {
     const current = this.activeRuns.get(run.sessionName);
     if (!current || current.generation !== run.generation || current.phase !== 'execution') return;
+    if (!isAutomaticSupervisionEnabled(current.snapshot)) return;
     const now = Date.now();
-    if (!current.waitingStartedAt || !current.waitingDeadlineAt || now >= current.waitingDeadlineAt) return;
-    const waitedMinutes = Math.max(1, Math.floor((now - current.waitingStartedAt) / 60_000));
-    const heartbeatPrompt = buildSupervisionWaitingHeartbeatPrompt(waitedMinutes, current.snapshot.uiLocale);
+    if (!current.waitingStartedAt) return;
+    const heartbeatPrompt = buildSupervisionWaitingHeartbeatPrompt(current.snapshot, current.snapshot.uiLocale);
     const heartbeatId = `${SUPERVISION_WAITING_HEARTBEAT_AUTOMATION_KIND}:${current.generation}:${now}`;
-    current.waitingNextHeartbeatAt = Math.min(
-      now + SUPERVISION_WAITING_HEARTBEAT_MS,
-      current.waitingDeadlineAt,
-    );
+    current.waitingNextHeartbeatAt = now + SUPERVISION_WAITING_HEARTBEAT_MS;
     current.sawAssistantOutput = false;
     current.lastAssistantText = undefined;
     current.terminalState = undefined;
@@ -2264,7 +2261,7 @@ class SupervisionAutomation {
       runtime.send(heartbeatPrompt, heartbeatId);
       this.emitAutomationNote(
         current.sessionName,
-        `Auto: requested a waiting-status update after ${waitedMinutes} minutes; the original deadline was preserved.`,
+        'Auto: checked the supervised task state; waiting remains active until a real NEEDS_INPUT result.',
         SUPERVISION_WAITING_HEARTBEAT_AUTOMATION_KIND,
       );
     } catch (error) {
@@ -2336,7 +2333,9 @@ class SupervisionAutomation {
   }
 
   private handleTimelineEvent(event: TimelineEvent): void {
-    this.handleAuditTargetTimelineEvent(event);
+    if (this.automaticPeerAuditCompatibilityForTests) {
+      this.handleAuditTargetTimelineEvent(event);
+    }
     const sequence = ++this.eventSequence;
 
     if (event.type === 'user.message') {
@@ -2349,15 +2348,15 @@ class SupervisionAutomation {
       const uiLocale = normalizeSupervisionUiLocale(event.payload.uiLocale);
       const activeRun = this.activeRuns.get(event.sessionId);
       // Structured delegation replies are injected into the origin session as
-      // trusted runtime notifications before the delivery event opens the
-      // audit verdict gate. They are control-plane input, not a new user task.
-      // Caching one here makes the PASS/REWORK response look like its assistant
-      // answer, so the next idle starts a duplicate supervision/audit run.
+      // trusted runtime notifications. They are control-plane input, not a new
+      // user task. Brain consumes their structured state; automation neither
+      // adopts the audit nor injects lifecycle chat around it.
       const delegationCompletionNotification = Boolean(
         !automation && isDelegationCompletionNotificationText(text),
       );
       const delegatedReply = Boolean(
-        !automation
+        this.automaticPeerAuditCompatibilityForTests
+        && !automation
         && activeRun?.phase === 'auditing'
         && !activeRun.auditDelegationId
         && isDelegatedAuditReplyText(text),
@@ -2374,6 +2373,10 @@ class SupervisionAutomation {
         this.emitAutomationNote(activeRun.sessionName, 'Auto: the delegated audit reply arrived; waiting for this session to produce the final PASS/REWORK judgment.', 'supervision-audit-reply-received');
       }
       if (!automation && !queueAppended && !delegatedReply && !delegationCompletionNotification && text && !text.startsWith('/')) {
+        const liveSnapshot = extractSessionSupervisionSnapshot(getSession(event.sessionId)?.transportConfig ?? null);
+        if (isAutomaticSupervisionEnabled(liveSnapshot)) {
+          this.heartbeatPausedForNeedsInput.delete(event.sessionId);
+        }
         this.clearImplicitCompletionGrace(event.sessionId);
         this.recoverySuppressedUntilNextUser.delete(event.sessionId);
         if (!isBareSupervisionContinueText(text)) {
@@ -2408,7 +2411,7 @@ class SupervisionAutomation {
           const snapshot = record?.agentType
             ? extractSessionSupervisionSnapshot(record.transportConfig ?? null)
             : null;
-          if (snapshot && snapshot.mode !== SUPERVISION_MODE.OFF) {
+          if (isAutomaticSupervisionEnabled(snapshot)) {
             this.clearImplicitCompletionGrace(event.sessionId);
             if (!this.tryStartImplicitRun(event.sessionId, snapshot)) {
               this.tryRecoverImplicitRunFromTimeline(event.sessionId, snapshot);
@@ -2484,11 +2487,11 @@ class SupervisionAutomation {
         const snapshot = record?.agentType
           ? extractSessionSupervisionSnapshot(record.transportConfig ?? null)
           : null;
-        if (candidate && snapshot && snapshot.mode !== SUPERVISION_MODE.OFF) {
+        if (candidate && isAutomaticSupervisionEnabled(snapshot)) {
           if (!this.tryStartImplicitRun(event.sessionId, snapshot)) {
             this.armImplicitCompletionGrace(event.sessionId, snapshot, candidate);
           }
-        } else if (snapshot && snapshot.mode !== SUPERVISION_MODE.OFF) {
+        } else if (isAutomaticSupervisionEnabled(snapshot)) {
           this.tryRecoverImplicitRunFromTimeline(event.sessionId, snapshot);
         }
         // Intentionally: do NOT delete the candidate when supervision is OFF
@@ -2628,16 +2631,18 @@ class SupervisionAutomation {
           latest.snapshot.mode === SUPERVISION_MODE.SUPERVISED_AUDIT
           && latest.requiresAudit
         ) {
-          await this.startAudit(latest);
+          await this.continueBrainOwnedLifecycle(latest);
         } else {
           const auditSkipped = latest.snapshot.mode === SUPERVISION_MODE.SUPERVISED_AUDIT
             && !latest.requiresAudit;
           this.emitAutomationNote(
             run.sessionName,
-            auditSkipped
+            this.automaticPeerAuditCompatibilityForTests && auditSkipped
               ? 'Auto: task looks complete; the supervisor determined that no new peer audit is needed.'
               : 'Auto: task looks complete.',
-            auditSkipped ? 'supervision-audit-skipped' : 'supervision-complete',
+            this.automaticPeerAuditCompatibilityForTests && auditSkipped
+              ? 'supervision-audit-skipped'
+              : 'supervision-complete',
           );
           this.emitTerminalStatus(run.sessionName, 'supervision_complete', SUPERVISION_COMPLETE_LABEL);
           this.finishRun(run.sessionName, 'complete', { preserveStatus: true });
@@ -2655,14 +2660,12 @@ class SupervisionAutomation {
           && NEW_AUDIT_DELEGATION_RE.test(continueText)
           && !FORBIDS_NEW_AUDIT_RE.test(continueText)
         ) {
-          // The supervisor model is not allowed to route an audit through a
-          // normal continue turn (including legacy P2P audit>plan wording).
-          // Audit selection and reply authority belong to startAudit(), whose
-          // dedicated prompt tells this current session exactly whom to
-          // contact. Normalize model drift into that state transition.
+          // Audit routing belongs to Brain, never to daemon automation.
+          // Normalize model drift into the same bounded coordinator heartbeat
+          // used for every other unfinished lifecycle decision.
           this.deferRepositoryFinalizationIfPresent(latest, decision, continueText);
           latest.terminalState = 'complete';
-          await this.startAudit(latest);
+          await this.continueBrainOwnedLifecycle(latest);
           return;
         }
         // A completed turn can already contain a clearly stated independent
@@ -2672,11 +2675,13 @@ class SupervisionAutomation {
         // not bypass a REWORK gate and does not suppress concrete remaining
         // implementation/validation work.
         if (reportedAuditPass && requestsOnlyRedundantAudit(decision)) {
-          this.emitAutomationNote(
-            run.sessionName,
-            'Auto: the completed turn already reports an independent audit PASS; skipped the duplicate audit request.',
-            'supervision-audit-already-passed',
-          );
+          if (this.automaticPeerAuditCompatibilityForTests) {
+            this.emitAutomationNote(
+              run.sessionName,
+              'Auto: the completed turn already reports an independent audit PASS; skipped the duplicate audit request.',
+              'supervision-audit-already-passed',
+            );
+          }
           this.emitTerminalStatus(run.sessionName, 'supervision_complete', SUPERVISION_COMPLETE_LABEL);
           this.finishRun(run.sessionName, 'complete', { preserveStatus: true });
           return;
@@ -2699,7 +2704,7 @@ class SupervisionAutomation {
             ...(decision.gap ? { gap: decision.gap } : {}),
           };
           latest.terminalState = 'complete';
-          await this.startAudit(latest);
+          await this.continueBrainOwnedLifecycle(latest);
           return;
         }
         // Forward the full decision so the continue prompt can lead with
@@ -2733,16 +2738,13 @@ class SupervisionAutomation {
           && latest.snapshot.mode === SUPERVISION_MODE.SUPERVISED_AUDIT
           && WAITING_FOR_PEER_AUDIT_RE.test(waitingText);
         if (waitingForUndispatchedAudit) {
-          // `waiting` is valid only after a real reply-enabled delegation has
-          // moved this run into `auditing`. If the run is still in execution,
-          // the model merely inferred that an audit ought to exist. Parking
-          // here deadlocks the task: no auditor was contacted and the target
-          // session is simultaneously forbidden from finalizing. Start the
-          // daemon-owned audit handoff instead, which explicitly instructs
-          // this current session to prepare and send the addressed brief.
+          // The model inferred that an external lifecycle action is pending,
+          // but daemon automation must not manufacture it. Wake Brain through
+          // the bounded coordinator heartbeat instead of parking forever or
+          // contacting an auditor itself.
           this.deferRepositoryFinalizationIfPresent(latest, decision, waitingText);
           latest.terminalState = 'complete';
-          await this.startAudit(latest);
+          await this.continueBrainOwnedLifecycle(latest);
           return;
         }
         // Park: no continue contract, no finishRun. The run stays alive so the
@@ -2755,6 +2757,8 @@ class SupervisionAutomation {
           `Auto: parked while waiting — ${decision.reason}`,
           'supervision-parked',
         );
+        this.clearCompletionGrace(latest);
+        latest.ignoreIdleUntilPostAuditTurnActivity = true;
         latest.waitingEvaluationPending = false;
         latest.sawAssistantOutput = false;
         latest.lastAssistantText = undefined;
@@ -2802,7 +2806,7 @@ class SupervisionAutomation {
         } else if (current.snapshot.mode === SUPERVISION_MODE.SUPERVISED_AUDIT) {
           current.requiresAudit = true;
           current.auditDepth = current.freshAuditRequiredAfterRework ? 'standard' : current.auditDepth ?? 'standard';
-          await this.startAudit(current);
+          await this.continueBrainOwnedLifecycle(current);
         } else if (hasExplicitRepositoryFinalizationRequirement([
           current.userText,
           resolveSupervisionCustomInstructionsDetail(
@@ -2828,6 +2832,8 @@ class SupervisionAutomation {
       case 'waiting':
         this.emitStatus(current.sessionName, 'supervision_parked', SUPERVISION_PARKED_LABEL);
         this.emitAutomationNote(current.sessionName, 'Auto: parked on the executing session\'s reported external reply.', 'supervision-parked');
+        this.clearCompletionGrace(current);
+        current.ignoreIdleUntilPostAuditTurnActivity = true;
         current.waitingEvaluationPending = false;
         current.sawAssistantOutput = false;
         current.lastAssistantText = undefined;
@@ -2866,6 +2872,26 @@ class SupervisionAutomation {
   }
 
   /**
+   * Audit selection, verdict interpretation, REWORK routing and integration
+   * are Brain responsibilities. Automation may only keep Brain moving through
+   * the existing de-duplicated/rate-limited continue channel.
+   */
+  private async continueBrainOwnedLifecycle(run: ActiveTaskRunState): Promise<void> {
+    const current = this.activeRuns.get(run.sessionName);
+    if (!current || current.generation !== run.generation || current.phase !== 'execution') return;
+    if (this.automaticPeerAuditCompatibilityForTests) {
+      await this.startAudit(current);
+      return;
+    }
+    current.requiresAudit = false;
+    current.terminalState = undefined;
+    await this.dispatchContinueWithinLimits(current, {
+      reason: 'A coordinator-owned lifecycle decision remains after the completed work.',
+      nextAction: 'Review the current structured task state and continue the next safe coordinator-owned step.',
+    });
+  }
+
+  /**
    * End a run that has no usable audit route.
    *
    * One method for BOTH the missing-route and ineligible-route paths, because
@@ -2896,6 +2922,7 @@ class SupervisionAutomation {
     this.clearImplicitCompletionGrace(sessionName);
     this.deletePersistedWaitState(sessionName);
     run.terminalState = state;
+    if (state === 'needs_input') this.heartbeatPausedForNeedsInput.add(sessionName);
     this.activeRuns.delete(sessionName);
     if (!options.preserveStatus) this.clearStatus(sessionName);
   }
@@ -3305,10 +3332,14 @@ class SupervisionAutomation {
     try {
       transportRuntime.send(continuePrompt, `supervision-continue-${run.generation}-${current.continueLoops}`);
       if (postAuditFinalization) {
-        this.emitAutomationNote(run.sessionName, '✅ Peer audit passed. Auto is now running the deferred commit/push finalization.', 'supervision-post-audit-finalization-status');
+        if (this.automaticPeerAuditCompatibilityForTests) {
+          this.emitAutomationNote(run.sessionName, '✅ Peer audit passed. Auto is now running the deferred commit/push finalization.', 'supervision-post-audit-finalization-status');
+        }
         this.emitTerminalStatus(run.sessionName, 'supervision_post_audit_finalizing', SUPERVISION_FINALIZING_LABEL);
       } else {
-        this.emitAutomationNote(run.sessionName, 'Auto: sent a continue prompt to keep the task moving.', 'supervision-continue-status');
+        if (this.automaticPeerAuditCompatibilityForTests) {
+          this.emitAutomationNote(run.sessionName, 'Auto: sent a continue prompt to keep the task moving.', 'supervision-continue-status');
+        }
         this.emitTerminalStatus(run.sessionName, 'supervision_continue_sent', SUPERVISION_CONTINUE_LABEL);
       }
     } catch (error) {

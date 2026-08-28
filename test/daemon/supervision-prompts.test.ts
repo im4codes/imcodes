@@ -54,6 +54,8 @@ describe('supervision prompts', () => {
   it('keeps the supervised-audit execution preamble wording stable', () => {
     expect(SUPERVISED_AUDIT_EXECUTION_PREAMBLE).toContain('DO NOT stage, commit, push, merge, release, publish, or deploy before PASS');
     expect(SUPERVISED_AUDIT_EXECUTION_PREAMBLE).toContain('On REWORK, fix and validate immediately');
+    expect(SUPERVISED_AUDIT_EXECUTION_PREAMBLE).toContain('immediately use its authenticated reply-capable channel');
+    expect(SUPERVISED_AUDIT_EXECUTION_PREAMBLE).toContain('A child-only NEEDS_INPUT message is not a report');
     expect(SUPERVISED_AUDIT_EXECUTION_PREAMBLE).toContain('<!-- IMCODES_EXEC: AUDIT_READY -->');
     expect(SUPERVISED_AUDIT_EXECUTION_PREAMBLE).not.toContain('enforced in code');
 
@@ -102,38 +104,34 @@ describe('supervision prompts', () => {
       ja: '既知の次作業をすべて他セッションに委任した場合は',
       ko: '알려진 후속 작업을 모두 다른 세션에 맡겼다면',
     } satisfies Record<(typeof SUPERVISION_SUPPORTED_UI_LOCALES)[number], string>;
-    const heartbeatNeedles = {
-      en: 'A delegate still working is not',
-      'zh-CN': '对方仍在工作不算',
-      'zh-TW': '對方仍在工作不算',
-      es: 'Que el delegado siga trabajando no es',
-      ru: 'Работающий исполнитель — не',
-      ja: '委任先が作業中でも',
-      ko: '위임 대상이 작업 중인 것은',
-    } satisfies Record<(typeof SUPERVISION_SUPPORTED_UI_LOCALES)[number], string>;
 
     for (const locale of SUPERVISION_SUPPORTED_UI_LOCALES) {
       const prompt = buildSupervisionExecutionPreamble(locale);
-      const heartbeat = buildSupervisionWaitingHeartbeatPrompt(10, locale);
+      const heartbeat = buildSupervisionWaitingHeartbeatPrompt({ mode: SUPERVISION_MODE.SUPERVISED }, locale);
       expect(prompt).toContain(actionNeedles[locale]);
       expect(prompt).toContain(statusNeedles[locale]);
       expect(prompt).toContain(waitingPriorityNeedles[locale]);
       expect(prompt).toContain(SUPERVISION_EXECUTION_STATUS_MARKERS.ADVANCE);
       expect(prompt).toContain(SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING);
-      expect(heartbeat).toContain(heartbeatNeedles[locale]);
-      expect(heartbeat).toContain(SUPERVISION_EXECUTION_STATUS_MARKERS.ADVANCE);
-      expect(heartbeat).toContain(SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING);
+      expect(heartbeat).toContain(SUPERVISION_EXECUTION_STATUS_MARKERS.NEEDS_INPUT);
     }
   });
 
-  it('localizes waiting heartbeats and automatic audit instructions', () => {
-    const heartbeat = buildSupervisionWaitingHeartbeatPrompt(10, 'zh-CN');
+  it('keeps waiting heartbeat payload fixed, short, mode-gated, and free of standing contracts', () => {
+    const heartbeat = buildSupervisionWaitingHeartbeatPrompt({ mode: SUPERVISION_MODE.SUPERVISED }, 'zh-CN');
     expect(heartbeat).toContain('[Contract: supervision_waiting_heartbeat_v1]');
-    expect(heartbeat).toContain('已等待 10 分钟');
-    expect(heartbeat).toContain('仍未到但当前会话有独立安全工作就现在执行');
-    expect(heartbeat).toContain('对方仍在工作不算');
-    expect(heartbeat).toContain('<!-- IMCODES_EXEC: WAITING -->');
-    expect(heartbeat).not.toContain('Waiting check');
+    expect(heartbeat).toContain('检查当前任务状态');
+    expect(heartbeat).toContain('有安全工作就继续推进');
+    expect(heartbeat).toContain('等待回执则保持等待并在下次心跳继续检查');
+    expect(heartbeat).toContain(SUPERVISION_EXECUTION_STATUS_MARKERS.NEEDS_INPUT);
+    expect(Buffer.byteLength(heartbeat, 'utf8')).toBeLessThanOrEqual(420);
+    for (const forbidden of [
+      SUPERVISION_CONTRACT_IDS.ORCHESTRATOR_CONTEXT,
+      SUPERVISION_CONTRACT_IDS.TASK_FINALIZATION,
+      SUPERVISION_CONTRACT_IDS.TASK_REGISTRY,
+      SUPERVISION_CONTRACT_IDS.DELEGATION_ELIGIBILITY,
+    ]) expect(heartbeat).not.toContain(forbidden);
+    expect(buildSupervisionWaitingHeartbeatPrompt({ mode: SUPERVISION_MODE.OFF }, 'zh-CN')).toBe('');
 
     const audit = buildAutomaticAuditTaskPrompt({
       attemptId: 'attempt-zh',
@@ -163,16 +161,54 @@ describe('supervision prompts', () => {
     });
 
     expect(prompt).toContain('[Contract: supervision_peer_audit_v1]');
-    expect(prompt).toContain('focused/unit/integration tests, typecheck, lint, build');
+    expect(prompt).toContain('focused tests, typecheck, lint, build');
     expect(prompt).toContain('already-authorized devices/environments');
     expect(prompt).toContain('MUST NOT modify tracked source, commit, push, deploy, mutate production');
     expect(prompt).toContain('Inspect worktree state before and after');
     expect(prompt).toContain('Report exact commands/tools/devices/environments and observed outcomes');
+    expect(prompt).toContain('taskId, assignmentId, exactError, completedSafeWork, and recommendedNextAction');
     expect(prompt).toContain('imcodes audit-reply --attempt-id attempt_1');
     expect(prompt).toContain('--capability ' + 'A'.repeat(32));
     expect(prompt).not.toContain('P2P_VERDICT');
     expect(prompt).not.toContain('Selected automation audit mode');
     expect(peerAuditByteLength(prompt)).toBeLessThanOrEqual(PEER_AUDIT_BRIEF_TOTAL_BYTES);
+  });
+
+  it('accepts complete bound evidence first and never instructs an unconditional full-suite rerun', () => {
+    const prompt = buildPeerAuditBriefV1({
+      attemptId: 'attempt_evidence_complete',
+      replyCapability: 'E'.repeat(32),
+      taskRequest: 'Review the frozen revision',
+      completedResult: 'Manifest frozen; command and exit-code receipt attached.',
+      acceptanceCriteria: ['Bind exact bytes and assess the result'],
+      validations: [
+        { kind: 'test', label: 'focused', outcome: 'passed', summary: 'exit=0; 48 passed' },
+        { kind: 'build', label: 'typecheck', outcome: 'passed', summary: 'exit=0' },
+      ],
+    });
+
+    expect(prompt).toContain('EVIDENCE ACCEPTANCE FIRST');
+    expect(prompt).toContain('Do NOT unconditionally repeat a full test, typecheck, lint, or build suite');
+    expect(prompt).toContain('rerunReason=<specific trigger>');
+    expect(prompt).not.toContain('EVIDENCE GAP:');
+    expect(prompt).not.toMatch(/(?:must|required to|always) (?:re-?run|repeat) (?:the )?full/iu);
+  });
+
+  it('generates only a bounded rerun instruction when executable evidence is missing', () => {
+    const prompt = buildPeerAuditBriefV1({
+      attemptId: 'attempt_evidence_gap',
+      replyCapability: 'G'.repeat(32),
+      taskRequest: 'Review the frozen revision',
+      completedResult: 'Implementation claimed complete without an executable receipt.',
+      acceptanceCriteria: ['Verify the concrete gap'],
+      validations: [{ kind: 'test', label: 'focused', outcome: 'unavailable', summary: 'no receipt supplied' }],
+    });
+
+    expect(prompt).toContain('EVIDENCE GAP:');
+    expect(prompt).toContain('smallest bounded check needed to resolve that gap');
+    expect(prompt).toContain('rerunReason=<missing/conflicting/high-risk evidence>');
+    expect(prompt).toContain('do not default to the full matrix');
+    expect(prompt).not.toContain('EVIDENCE ACCEPTANCE FIRST');
   });
 
   it('redacts secrets before UTF-8 truncation and omits provider metadata', () => {

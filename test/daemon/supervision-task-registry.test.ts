@@ -20,16 +20,24 @@ import { buildSupervisionExecutionCapabilityId } from '../../shared/supervision-
 import { createSupervisionMcpToolHandlers } from '../../src/daemon/supervision-mcp-tools.js';
 import { SUPERVISION_MCP_TOOLS } from '../../shared/supervision-mcp-tools.js';
 import { resolvePeerAuditProviderFamily } from '../../shared/peer-audit.js';
+import { AGENT_DELEGATION_PURPOSES } from '../../shared/agent-delegation.js';
+import { createSupervisionRegistryPort } from '../../src/daemon/supervision-registry-port.js';
 
 /** Adapts the real registry to the audited handler port. */
 function supervisionRegistryPort() {
-  const registry = getSupervisionTaskRegistry();
   return {
-    getStatus: (taskId: string) => registry.get(taskId)?.status,
-    applyIntent: () => {},
-    list: (filter: never) => registry.list(filter) as never,
-    get: (taskId: string) => registry.get(taskId) as never,
-    recover: () => {},
+    getStatus: (taskId: string) => getSupervisionTaskRegistry().get(taskId)?.status,
+    applyIntent: (input: Parameters<SupervisionTaskRegistry['applyTaskIntent']>[0]) => getSupervisionTaskRegistry().applyTaskIntent(input),
+    finishAssignment: ({ assignmentId, callerSessionName }: { assignmentId: string; callerSessionName: string }) => {
+      const registry = getSupervisionTaskRegistry();
+      const assignment = registry.getAssignment(assignmentId);
+      if (!assignment) return { ok: false as const, reason: 'not_found' };
+      if (assignment.identity.sessionName !== callerSessionName) return { ok: false as const, reason: 'owner_mismatch' };
+      return registry.finishAssignment({ assignmentId, identity: assignment.identity });
+    },
+    list: (filter: never) => getSupervisionTaskRegistry().list(filter) as never,
+    get: (taskId: string) => getSupervisionTaskRegistry().get(taskId) as never,
+    recover: (input: Parameters<SupervisionTaskRegistry['recoverTask']>[0]) => getSupervisionTaskRegistry().recoverTask(input),
   };
 }
 
@@ -99,6 +107,166 @@ beforeEach(() => {
 });
 
 describe('SupervisionTaskRegistry', () => {
+  it('repairs a legacy cancelled task with delegated lease and twelve retained claims on reopen', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'imcodes-cancelled-reconcile-'));
+    const dbPath = join(dir, 'supervision-state.sqlite');
+    const paths = Array.from({ length: 12 }, (_, index) => `src/legacy-claim-${index + 1}.ts`);
+    try {
+      let registry = new SupervisionTaskRegistry({ dbPath });
+      expect(registry.createOrGet({
+        taskId: 'task-legacy-cancelled', projectName: 'alpha', objective: 'legacy stale cancellation',
+      }).ok).toBe(true);
+      const delegated = registry.createAssignment({
+        assignmentId: 'assignment-legacy-delegated', taskId: 'task-legacy-cancelled', role: 'implementer',
+        identity: identity('deck_alpha_stale'), scopeFiles: paths, claimMode: 'exclusive',
+      });
+      expect(delegated).toMatchObject({ ok: true, value: { status: 'delegated', leaseId: expect.any(String) } });
+
+      // Reproduce the old non-atomic write: task cancellation committed while
+      // assignment/lease/claims remained untouched.
+      expect(registry.updateTask({ taskId: 'task-legacy-cancelled', status: 'cancelled' }).ok).toBe(true);
+      expect(registry.get('task-legacy-cancelled')).toMatchObject({
+        status: 'cancelled',
+        assignments: [expect.objectContaining({ status: 'delegated', leaseId: expect.any(String) })],
+      });
+      expect(registry.listFileClaims('task-legacy-cancelled')).toHaveLength(12);
+      registry.close();
+
+      registry = new SupervisionTaskRegistry({ dbPath });
+      expect(registry.getAssignment('assignment-legacy-delegated')).toMatchObject({
+        status: 'cancelled', leaseId: '',
+      });
+      expect(registry.listFileClaims('task-legacy-cancelled')).toEqual([]);
+      const repairedEventCount = registry.listEvents('task-legacy-cancelled').length;
+      registry.close();
+
+      // A second startup is a true no-op, and the released paths can be
+      // claimed immediately by replacement work.
+      registry = new SupervisionTaskRegistry({ dbPath });
+      expect(registry.listEvents('task-legacy-cancelled')).toHaveLength(repairedEventCount);
+      expect(registry.createOrGet({
+        taskId: 'task-replacement', projectName: 'alpha', objective: 'replacement work',
+      }).ok).toBe(true);
+      expect(registry.createAssignment({
+        assignmentId: 'assignment-replacement', taskId: 'task-replacement', role: 'implementer',
+        identity: identity('deck_alpha_replacement'), scopeFiles: paths, claimMode: 'exclusive',
+      })).toMatchObject({ ok: true, value: { status: 'delegated' } });
+      registry.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('makes administrative cancel atomically clear unfinished assignments, leases, and claims', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'imcodes-admin-cancel-'));
+    const dbPath = join(dir, 'supervision-state.sqlite');
+    try {
+      let registry = new SupervisionTaskRegistry({ dbPath });
+      expect(registry.createOrGet({
+        taskId: 'task-admin-cancel', projectName: 'alpha', objective: 'admin cancellation',
+      }).ok).toBe(true);
+      expect(registry.createAssignment({
+        assignmentId: 'assignment-admin-cancel', taskId: 'task-admin-cancel', role: 'implementer',
+        identity: identity('deck_alpha_blocked'), scopeFiles: ['src/reusable.ts'], claimMode: 'exclusive',
+      }).ok).toBe(true);
+
+      // Admin recovery must also repair an already-cancelled task written by
+      // the legacy task-only path; `status === cancelled` is not a no-op while
+      // assignment resources remain live.
+      expect(registry.updateTask({ taskId: 'task-admin-cancel', status: 'cancelled' }).ok).toBe(true);
+      expect(registry.recoverTask({
+        taskId: 'task-admin-cancel', toStatus: 'cancelled', reason: 'operator recovery',
+      })).toMatchObject({ ok: true, value: { status: 'cancelled' } });
+      expect(registry.getAssignment('assignment-admin-cancel')).toMatchObject({
+        status: 'cancelled', leaseId: '', blocker: 'operator recovery',
+      });
+      expect(registry.listFileClaims('task-admin-cancel')).toEqual([]);
+      expect(registry.recoverTask({
+        taskId: 'task-admin-cancel', toStatus: 'cancelled', reason: 'operator recovery',
+      })).toMatchObject({ ok: true, replay: true });
+      registry.close();
+
+      registry = new SupervisionTaskRegistry({ dbPath });
+      expect(registry.getAssignment('assignment-admin-cancel')).toMatchObject({ status: 'cancelled', leaseId: '' });
+      expect(registry.listFileClaims('task-admin-cancel')).toEqual([]);
+      registry.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('persists matching PASS receipts and advances a stale delegated assignment after restart', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'imcodes-matching-audit-'));
+    const dbPath = join(dir, 'supervision-state.sqlite');
+    try {
+      let registry = new SupervisionTaskRegistry({ dbPath });
+      expect(registry.createOrGet({
+        taskId: 'task-matching-pass', projectName: 'alpha', objective: 'receipt projection',
+        currentRevision: 'rev-pass-1',
+      }).ok).toBe(true);
+      const implementer = registry.createAssignment({
+        assignmentId: 'assignment-implementer', taskId: 'task-matching-pass', role: 'implementer',
+        identity: identity('deck_alpha_w1'), scopeFiles: ['src/a.ts'],
+      });
+      const auditor = registry.createAssignment({
+        assignmentId: 'assignment-auditor', taskId: 'task-matching-pass', role: 'auditor',
+        identity: identity('deck_alpha_cc1', 'claude-code-sdk'), scopeFiles: ['src/a.ts'],
+        auditAttemptId: 'attempt-pass-1', auditRevision: 'rev-pass-1',
+      });
+      expect(implementer.ok && auditor.ok).toBe(true);
+
+      const applied = registry.applyMatchingAuditReceipt({
+        attemptId: 'attempt-pass-1', revision: 'rev-pass-1', verdict: 'PASS',
+        auditedSessionName: 'deck_alpha_w1', auditorSessionName: 'deck_alpha_cc1',
+        findings: 'matching revision passed', now: 50,
+      });
+      expect(applied).toMatchObject({
+        ok: true,
+        value: { assignmentId: 'assignment-implementer', status: 'ready_for_integration', verdict: 'PASS' },
+      });
+      expect(registry.getAssignment('assignment-auditor')).toMatchObject({ status: 'passed', verdict: 'PASS' });
+      expect(registry.get('task-matching-pass')).toMatchObject({ status: 'ready_for_integration' });
+      expect(registry.applyMatchingAuditReceipt({
+        attemptId: 'attempt-pass-1', revision: 'rev-pass-1', verdict: 'PASS',
+        auditedSessionName: 'deck_alpha_w1', auditorSessionName: 'deck_alpha_cc1', now: 51,
+      })).toMatchObject({ ok: true, replay: true });
+      registry.close();
+
+      registry = new SupervisionTaskRegistry({ dbPath });
+      expect(registry.getAssignment('assignment-implementer')).toMatchObject({
+        status: 'ready_for_integration', auditAttemptId: 'attempt-pass-1', auditRevision: 'rev-pass-1',
+      });
+      expect(registry.get('task-matching-pass')).toMatchObject({ status: 'ready_for_integration' });
+      registry.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects an old audit revision without advancing the registry projection', () => {
+    const registry = makeRegistry();
+    registry.createOrGet({
+      taskId: 'task-old-audit', projectName: 'alpha', objective: 'old receipt', currentRevision: 'rev-current',
+    });
+    registry.createAssignment({
+      assignmentId: 'assignment-current', taskId: 'task-old-audit', role: 'implementer',
+      identity: identity('deck_alpha_w1'), scopeFiles: ['src/current.ts'],
+    });
+    registry.createAssignment({
+      assignmentId: 'assignment-old-auditor', taskId: 'task-old-audit', role: 'auditor',
+      identity: identity('deck_alpha_cc1', 'claude-code-sdk'), scopeFiles: ['src/current.ts'],
+      auditAttemptId: 'attempt-old', auditRevision: 'rev-old',
+    });
+
+    expect(registry.applyMatchingAuditReceipt({
+      attemptId: 'attempt-old', revision: 'rev-old', verdict: 'PASS',
+      auditedSessionName: 'deck_alpha_w1', auditorSessionName: 'deck_alpha_cc1',
+    })).toEqual({ ok: false, reason: 'old_revision' });
+    expect(registry.getAssignment('assignment-current')?.status).toBe('delegated');
+    expect(registry.get('task-old-audit')?.status).toBe('delegated');
+    registry.close();
+  });
+
   it('scopes task rows and idempotency keys by project', () => {
     const registry = makeRegistry();
     const alpha = registry.createOrGet({ projectName: 'alpha', objective: 'same request', idempotencyKey: 'same-key' });
@@ -398,23 +566,141 @@ describe('SupervisionTaskRegistry', () => {
 
   it('send_message task metadata creates one assignment and idempotency replay reuses it', async () => {
     const sessions = [session('deck_alpha_brain'), session('deck_alpha_w1')];
+    const dispatchMessage = vi.fn(async () => undefined);
     const result = await dispatchSendMessage({ userId: 'u', sessionName: 'deck_alpha_brain', projectName: 'alpha', projectRoot: '/work/alpha' }, {
       target: 'deck_alpha_w1', message: 'do task', idempotencyKey: 'same', task: { topLevelTaskId: 'top', objective: 'task via send', ownedFiles: ['src/a.ts'] },
-    }, { listSessions: () => sessions, dispatchMessage: async () => undefined, exactTargetOnly: true });
+    }, { listSessions: () => sessions, dispatchMessage, exactTargetOnly: true });
     const replay = await dispatchSendMessage({ userId: 'u', sessionName: 'deck_alpha_brain', projectName: 'alpha', projectRoot: '/work/alpha' }, {
       target: 'deck_alpha_w1', message: 'do task', idempotencyKey: 'same', task: { topLevelTaskId: 'top', objective: 'task via send', ownedFiles: ['src/a.ts'] },
-    }, { listSessions: () => sessions, dispatchMessage: async () => undefined, exactTargetOnly: true });
+    }, { listSessions: () => sessions, dispatchMessage, exactTargetOnly: true });
     if (result.status !== 'accepted' || replay.status !== 'accepted') throw new Error('expected accepted');
     expect(result.taskId).toBeTruthy();
     expect(result.assignmentId).toBeTruthy();
     expect(replay.idempotentReplay).toBe(true);
     expect(replay.taskId).toBe(result.taskId);
     expect(replay.assignmentId).toBe(result.assignmentId);
+    expect(result.deliveries[0]).toMatchObject({ delegationId: expect.any(String) });
+    const sent = String(dispatchMessage.mock.calls[0]?.[1] ?? '');
+    expect(sent).toContain('Use the delegation_reply tool');
+    expect(sent).toContain('[Delegated blocker escalation contract]');
+    expect(sent).toContain(`taskId=${JSON.stringify(result.taskId)}`);
+    expect(sent).toContain(`assignmentId=${JSON.stringify(result.assignmentId)}`);
+    expect(sent).toContain('exactError, completedSafeWork, recommendedNextAction');
+    expect(dispatchMessage).toHaveBeenCalledTimes(1);
     expect(getSupervisionTaskRegistry().get(result.taskId!)?.assignments[0]?.executionBinding).toMatchObject({
       pool: 'primary',
       requested: { providerFamily: 'openai', model: 'gpt-5.6' },
       actual: { sessionName: 'deck_alpha_w1', sessionInstanceId: 'instance-deck_alpha_w1', runtimeEpoch: 'epoch-deck_alpha_w1', model: 'gpt-5.6' },
       origin: 'reused',
+    });
+  });
+
+  it('send_message provisions before dispatch and durably projects the selected pool/config/session evidence', async () => {
+    const brain = session('deck_alpha_brain');
+    const worker = session('deck_sub_auto_worker');
+    worker.parentSession = brain.name;
+    worker.label = 'Auto primary';
+    const sessions = [brain, worker];
+    const selectedConfig = {
+      agentType: 'codex-sdk', providerFamily: 'openai', runtimeType: 'transport' as const, model: 'gpt-5.6',
+      capabilityId: buildSupervisionExecutionCapabilityId({
+        agentType: 'codex-sdk', providerFamily: 'openai', runtimeType: 'transport', model: 'gpt-5.6',
+      }),
+    };
+    const dispatchMessage = vi.fn(async () => undefined);
+    const provisionSupervisionTarget = vi.fn(async () => ({
+      ok: true as const,
+      target: worker,
+      evidence: {
+        selectedPool: 'primary' as const,
+        selectedConfig,
+        provisionAttemptId: 'supervision_provision_test',
+        createdSessionName: worker.name,
+      },
+    }));
+
+    const sent = await dispatchSendMessage(
+      { userId: 'u', sessionName: brain.name, projectName: 'alpha', projectRoot: '/work/alpha' },
+      {
+        message: 'provision then dispatch',
+        idempotencyKey: 'auto-provision-task',
+        task: { autoProvision: true, executionPool: 'primary', objective: 'automatic capacity' },
+      },
+      { listSessions: () => sessions, dispatchMessage, exactTargetOnly: true, provisionSupervisionTarget },
+    );
+
+    expect(provisionSupervisionTarget).toHaveBeenCalledTimes(1);
+    expect(dispatchMessage).toHaveBeenCalledWith(worker, expect.stringContaining('provision then dispatch'), expect.any(Object));
+    expect(sent).toMatchObject({
+      status: 'accepted',
+      provisioning: { selectedPool: 'primary', provisionAttemptId: 'supervision_provision_test', createdSessionName: worker.name },
+    });
+    if (sent.status !== 'accepted' || !sent.assignmentId) throw new Error('expected provisioned assignment');
+    expect(getSupervisionTaskRegistry().getAssignment(sent.assignmentId)).toMatchObject({
+      executionBinding: { origin: 'spawned', actual: { sessionName: worker.name } },
+      provisioning: { selectedConfig, createdSessionName: worker.name },
+    });
+  });
+
+  it('persists an availability-driven same-family audit degradation without changing the Brain-named route', async () => {
+    const brain = session('deck_alpha_brain');
+    const audited = session('deck_sub_audited');
+    audited.parentSession = brain.name;
+    const reviewer = session('deck_sub_reviewer');
+    reviewer.parentSession = brain.name;
+    const sessions = [brain, audited, reviewer];
+    const selectedConfig = {
+      agentType: 'codex-sdk', providerFamily: 'openai', runtimeType: 'transport' as const, model: 'gpt-5.6',
+      capabilityId: buildSupervisionExecutionCapabilityId({
+        agentType: 'codex-sdk', providerFamily: 'openai', runtimeType: 'transport', model: 'gpt-5.6',
+      }),
+    };
+    const dispatchMessage = vi.fn(async () => undefined);
+
+    const sent = await dispatchSendMessage(
+      { userId: 'u', sessionName: brain.name, projectName: 'alpha', projectRoot: '/work/alpha' },
+      {
+        message: 'independent degraded audit',
+        reply: true,
+        idempotencyKey: 'audit-degraded-once',
+        audit: {
+          kind: AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT,
+          attemptId: 'attempt-degraded-12345678',
+          auditedSessionName: audited.name,
+        },
+        task: { autoProvision: true, objective: 'audit the implementation' },
+      },
+      {
+        listSessions: () => sessions,
+        dispatchMessage,
+        exactTargetOnly: true,
+        provisionSupervisionTarget: async () => ({
+          ok: true,
+          target: reviewer,
+          auditRoutingReason: 'same_family_degraded',
+          auditDegradedReason: 'cross_vendor_provision_failed',
+          evidence: {
+            selectedPool: 'audit', selectedConfig,
+            failureReason: 'launch_failed', degradedReason: 'cross_vendor_provision_failed',
+          },
+        }),
+      },
+    );
+
+    expect(sent).toMatchObject({
+      status: 'accepted',
+      auditRoutingReason: 'same_family_degraded',
+      auditDegradedReason: 'cross_vendor_provision_failed',
+      provisioning: { selectedPool: 'audit', failureReason: 'launch_failed' },
+    });
+    expect(dispatchMessage).toHaveBeenCalledWith(reviewer, expect.any(String), expect.any(Object));
+    if (sent.status !== 'accepted' || !sent.assignmentId) throw new Error('expected degraded audit assignment');
+    expect(getSupervisionTaskRegistry().getAssignment(sent.assignmentId)).toMatchObject({
+      role: 'auditor',
+      identity: { sessionName: reviewer.name },
+      auditRoutingReason: 'same_family_degraded',
+      auditDegradedReason: 'cross_vendor_provision_failed',
+      provisioning: { failureReason: 'launch_failed', degradedReason: 'cross_vendor_provision_failed' },
     });
   });
 
@@ -500,6 +786,106 @@ describe('SupervisionTaskRegistry', () => {
       revision: 'revision-2',
       evidence: 'delegate completed',
     })).toMatchObject({ status: 'ok', item: { status: 'finalized' } });
+  });
+
+  it('synchronizes intent lifecycle and closes matching PASS assignments without treating read-only scope as evidence', async () => {
+    const registry = getSupervisionTaskRegistry();
+    const revision = 'task-worktree-core-r2';
+    expect(registry.createOrGet({
+      projectName: 'alpha', taskId: 'matching-pass-close', objective: 'close reachable lifecycle', currentRevision: revision,
+    }).ok).toBe(true);
+    const implementerIdentity = identity('deck_alpha_w1');
+    const auditorIdentity = identity('deck_alpha_w2', 'claude-code-sdk');
+    const implementationFiles = ['src/a.ts', 'src/b.ts', 'src/c.ts', 'src/d.ts', 'src/e.ts'];
+    const auditScope = [...implementationFiles, 'test/a.test.ts', 'test/b.test.ts'];
+    const implementer = registry.createAssignment({
+      taskId: 'matching-pass-close', role: 'implementer', identity: implementerIdentity,
+      scopeFiles: implementationFiles, claimMode: 'exclusive',
+    });
+    const auditor = registry.createAssignment({
+      taskId: 'matching-pass-close', role: 'auditor', identity: auditorIdentity,
+      scopeFiles: auditScope, claimMode: 'read_only', auditAttemptId: 'audit-attempt-exact', auditRevision: revision,
+    });
+    if (!implementer.ok || !auditor.ok) throw new Error('expected assignments');
+
+    const ownerIntent = createSupervisionMcpToolHandlers(
+      { sessionName: implementerIdentity.sessionName } as never,
+      { registry: createSupervisionRegistryPort() },
+    );
+    expect(await ownerIntent[SUPERVISION_MCP_TOOLS.INTENT]({
+      intent: 'start', taskId: 'matching-pass-close', assignmentId: implementer.value.assignmentId,
+    })).toMatchObject({ status: 'ok', fromStatus: 'delegated', toStatus: 'implementing' });
+    expect(registry.get('matching-pass-close')).toMatchObject({
+      status: 'implementing',
+      assignments: expect.arrayContaining([expect.objectContaining({ assignmentId: implementer.value.assignmentId, status: 'implementing' })]),
+    });
+    expect(await ownerIntent[SUPERVISION_MCP_TOOLS.INTENT]({
+      intent: 'record_validation', validationState: 'passed',
+      taskId: 'matching-pass-close', assignmentId: implementer.value.assignmentId,
+    })).toMatchObject({ status: 'ok', fromStatus: 'implementing', toStatus: 'validated' });
+    expect(registry.get('matching-pass-close')).toMatchObject({
+      status: 'validated',
+      assignments: expect.arrayContaining([expect.objectContaining({ assignmentId: implementer.value.assignmentId, status: 'validated' })]),
+    });
+    expect(await ownerIntent[SUPERVISION_MCP_TOOLS.INTENT]({
+      intent: 'open_audit', taskId: 'matching-pass-close', assignmentId: implementer.value.assignmentId,
+    })).toMatchObject({ status: 'ok', fromStatus: 'validated', toStatus: 'ready_for_audit' });
+
+    // A persisted structured verdict is the evidence. The auditor can still be
+    // in the legacy delegated state and can hold seven read-only claims; neither
+    // status skew nor claim count may erase/substitute the exact revision bind.
+    expect(registry.updateAssignment({
+      assignmentId: auditor.value.assignmentId,
+      identity: auditorIdentity,
+      status: 'delegated',
+      auditAttemptId: 'audit-attempt-exact',
+      auditRevision: revision,
+      verdict: 'PASS',
+    })).toMatchObject({ ok: true });
+
+    const ownerTaskTools = createMemoryMcpToolHandlers(
+      { userId: 'u', sessionName: implementerIdentity.sessionName, projectName: 'alpha', projectRoot: '/work/alpha' },
+      { sendDeps: { listSessions: () => [session('deck_alpha_brain'), session(implementerIdentity.sessionName), session(auditorIdentity.sessionName, 'alpha', 'claude-code-sdk')] } },
+    );
+    await expect(ownerTaskTools[MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_FINISH]({
+      assignmentId: implementer.value.assignmentId,
+      revision: 'wrong-revision',
+    })).resolves.toMatchObject({ status: 'error' });
+    expect(registry.getAssignment(implementer.value.assignmentId)).toMatchObject({
+      status: 'ready_for_audit', leaseId: expect.stringMatching(/^supervision_lease_/),
+    });
+    expect(registry.listFileClaims('matching-pass-close').filter((claim) => claim.assignmentId === implementer.value.assignmentId)).toHaveLength(5);
+
+    await expect(ownerTaskTools[MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_FINISH]({
+      assignmentId: implementer.value.assignmentId,
+      revision,
+      evidence: 'matching PASS accepted',
+    })).resolves.toMatchObject({
+      status: 'ok',
+      item: {
+        status: 'ready_for_integration', leaseId: '', verdict: 'PASS',
+        auditAttemptId: 'audit-attempt-exact', auditRevision: revision,
+      },
+    });
+    expect(registry.get('matching-pass-close')).toMatchObject({ status: 'ready_for_integration' });
+    expect(registry.listFileClaims('matching-pass-close').filter((claim) => claim.assignmentId === implementer.value.assignmentId)).toEqual([]);
+    expect(registry.listFileClaims('matching-pass-close').filter((claim) => claim.assignmentId === auditor.value.assignmentId)).toHaveLength(7);
+
+    const auditorIntent = createSupervisionMcpToolHandlers(
+      { sessionName: auditorIdentity.sessionName } as never,
+      { registry: createSupervisionRegistryPort() },
+    );
+    await expect(auditorIntent[SUPERVISION_MCP_TOOLS.INTENT]({
+      intent: 'finish', taskId: 'matching-pass-close', assignmentId: auditor.value.assignmentId,
+    })).resolves.toMatchObject({ status: 'ok', toStatus: 'finalized' });
+    expect(registry.getAssignment(auditor.value.assignmentId)).toMatchObject({ status: 'finalized', leaseId: '' });
+    expect(registry.listFileClaims('matching-pass-close')).toEqual([]);
+
+    // Replaying the implementer finish through the intent path is idempotent
+    // and cannot recreate claims or a lease.
+    await expect(ownerIntent[SUPERVISION_MCP_TOOLS.INTENT]({
+      intent: 'finish', taskId: 'matching-pass-close', assignmentId: implementer.value.assignmentId,
+    })).resolves.toMatchObject({ status: 'ok', toStatus: 'ready_for_integration', idempotentReplay: true });
   });
 
   it('send_message binds a visible existing task and idempotency replay keeps the same assignment', async () => {
@@ -656,5 +1042,108 @@ describe('SupervisionTaskRegistry', () => {
     });
     expect(registry.get('missing-start-task')).toBeUndefined();
     expect(registry.list()).toHaveLength(2);
+  });
+
+  it('atomically cancels unfinished assignments, revokes leases/claims, and frees files after SQLite reopen', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'supervision-cancel-release-'));
+    const dbPath = join(dir, 'registry.sqlite');
+    let registry = new SupervisionTaskRegistry({ dbPath });
+    try {
+      expect(registry.createOrGet({ projectName: 'alpha', taskId: 'cancel-me', objective: 'cancel safely' }).ok).toBe(true);
+      const owner = identity('deck_alpha_w1');
+      const assignment = registry.createAssignment({
+        taskId: 'cancel-me', role: 'implementer', identity: owner,
+        scopeFiles: ['src/shared-after-cancel.ts'], claimMode: 'exclusive',
+      });
+      if (!assignment.ok) throw new Error(assignment.reason);
+
+      expect(registry.createOrGet({ projectName: 'alpha', taskId: 'unrelated', objective: 'must survive' }).ok).toBe(true);
+      const unrelated = registry.createAssignment({
+        taskId: 'unrelated', role: 'implementer', identity: identity('deck_alpha_w2'),
+        scopeFiles: ['src/unrelated.ts'], claimMode: 'exclusive',
+      });
+      if (!unrelated.ok) throw new Error(unrelated.reason);
+
+      const port = () => ({
+        getStatus: (taskId: string) => registry.get(taskId)?.status,
+        applyIntent: (input: Parameters<SupervisionTaskRegistry['applyTaskIntent']>[0]) => {
+          const applied = registry.applyTaskIntent(input);
+          if (!applied.ok) throw new Error(applied.reason);
+        },
+        list: (filter: never) => registry.list(filter) as never,
+        get: (taskId: string) => registry.get(taskId) as never,
+        recover: () => {},
+      });
+      const handlers = createSupervisionMcpToolHandlers(
+        { sessionName: owner.sessionName } as never,
+        { registry: port() },
+      );
+      expect(await handlers[SUPERVISION_MCP_TOOLS.INTENT]({ intent: 'start', taskId: 'cancel-me' }))
+        .toMatchObject({ status: 'ok', toStatus: 'implementing' });
+      expect(await handlers[SUPERVISION_MCP_TOOLS.INTENT]({ intent: 'open_audit', taskId: 'cancel-me' }))
+        .toMatchObject({ status: 'ok', toStatus: 'ready_for_audit' });
+      expect(await handlers[SUPERVISION_MCP_TOOLS.INTENT]({
+        intent: 'cancel', taskId: 'cancel-me', assignmentId: assignment.value.assignmentId,
+        note: 'superseded by integration',
+      })).toMatchObject({ status: 'ok', fromStatus: 'ready_for_audit', toStatus: 'cancelled' });
+
+      let cancelled = registry.get('cancel-me');
+      expect(cancelled).toMatchObject({
+        status: 'cancelled',
+        assignments: [expect.objectContaining({
+          assignmentId: assignment.value.assignmentId,
+          status: 'cancelled',
+          leaseId: '',
+        })],
+        fileClaims: [],
+      });
+      expect(registry.get('unrelated')).toMatchObject({
+        status: 'delegated',
+        assignments: [expect.objectContaining({
+          assignmentId: unrelated.value.assignmentId,
+          status: 'delegated',
+          leaseId: expect.stringMatching(/^supervision_lease_/),
+        })],
+        fileClaims: [expect.objectContaining({ path: 'src/unrelated.ts' })],
+      });
+
+      const eventsAfterFirstCancel = registry.listEvents('cancel-me').length;
+      expect(await handlers[SUPERVISION_MCP_TOOLS.INTENT]({ intent: 'cancel', taskId: 'cancel-me' }))
+        .toMatchObject({ status: 'ok', fromStatus: 'cancelled', toStatus: 'cancelled' });
+      expect(registry.listEvents('cancel-me')).toHaveLength(eventsAfterFirstCancel);
+
+      registry.close();
+      registry = new SupervisionTaskRegistry({ dbPath });
+      cancelled = registry.get('cancel-me');
+      expect(cancelled?.fileClaims).toEqual([]);
+      expect(cancelled?.assignments[0]).toMatchObject({ status: 'cancelled', leaseId: '' });
+
+      expect(registry.createOrGet({ projectName: 'alpha', taskId: 'integration-now', objective: 'claim released file' }).ok).toBe(true);
+      expect(registry.createAssignment({
+        taskId: 'integration-now', role: 'integration_owner', identity: identity('deck_alpha_brain'),
+        scopeFiles: ['src/shared-after-cancel.ts'], claimMode: 'exclusive',
+      })).toMatchObject({ ok: true });
+      expect(registry.createAssignment({
+        taskId: 'integration-now', role: 'implementer', identity: identity('deck_alpha_w3'),
+        scopeFiles: ['src/unrelated.ts'], claimMode: 'exclusive',
+      })).toEqual({ ok: false, reason: 'shared_file_conflict' });
+
+      // The restricted admin recovery path must close the same stale-resource
+      // shape rather than changing only the task row.
+      expect(registry.createOrGet({ projectName: 'alpha', taskId: 'admin-stale', objective: 'recover stale owner' }).ok).toBe(true);
+      const stale = registry.createAssignment({
+        taskId: 'admin-stale', role: 'implementer', identity: identity('deck_alpha_stale'),
+        scopeFiles: ['src/admin-released.ts'], claimMode: 'exclusive',
+      });
+      if (!stale.ok) throw new Error(stale.reason);
+      expect(registry.recoverTask({
+        taskId: 'admin-stale', toStatus: 'cancelled', reason: 'owner process ended',
+      })).toMatchObject({ ok: true, value: { status: 'cancelled' } });
+      expect(registry.getAssignment(stale.value.assignmentId)).toMatchObject({ status: 'cancelled', leaseId: '' });
+      expect(registry.listFileClaims('admin-stale')).toEqual([]);
+    } finally {
+      registry.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

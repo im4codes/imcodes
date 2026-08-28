@@ -13,8 +13,10 @@ import {
 import type { SupervisionAuditDepth } from './supervision-broker.js';
 import type {
   SupervisionAuditRoutingReason,
+  SupervisionAuditDegradedReason,
   SupervisionEconomyTaskPolicy,
   SupervisionExecutionBinding,
+  SupervisionProvisioningEvidence,
 } from '../../shared/supervision-execution-pool.js';
 import { mayFinalizeEconomyAssignment } from '../../shared/supervision-execution-pool.js';
 import { suppressSqliteExperimentalWarning } from '../util/suppress-sqlite-warning.js';
@@ -35,6 +37,21 @@ type DatabaseSyncInstance = InstanceType<typeof DatabaseSync>;
 
 const DEFAULT_DB_PATH = join(homedir(), '.imcodes', 'supervision-state.sqlite');
 export const SUPERVISION_STATE_VERSION = 1;
+
+/**
+ * Single path authority for the supervision task registry database.
+ *
+ * The live task console is a read/projection surface over this registry.  It
+ * must open this exact database rather than inventing a second similarly named
+ * SQLite file: migrations can add projection tables to an empty database, but
+ * they cannot conjure the authoritative task/assignment rows into it.
+ */
+export function resolveSupervisionTaskRegistryDbPath(
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  return env.IMCODES_SUPERVISION_STATE_DB_PATH?.trim()
+    || (env.VITEST ? ':memory:' : DEFAULT_DB_PATH);
+}
 
 export type PersistedSupervisionWaitPhase = 'waiting' | 'auditing';
 
@@ -143,8 +160,7 @@ export class SupervisionStateStore implements SupervisionWaitStateStore {
       db = options.database;
     } else {
       const dbPath = options.dbPath?.trim()
-        || process.env.IMCODES_SUPERVISION_STATE_DB_PATH?.trim()
-        || (process.env.VITEST ? ':memory:' : DEFAULT_DB_PATH);
+        || resolveSupervisionTaskRegistryDbPath();
       if (dbPath !== ':memory:') mkdirSync(dirname(dbPath), { recursive: true });
       db = new DatabaseSync(dbPath);
       ownsDb = true;
@@ -189,7 +205,7 @@ export class SupervisionStateStore implements SupervisionWaitStateStore {
   upsert(state: PersistedSupervisionWaitState): void {
     if (this.#closed) throw new Error('supervision state store is closed');
     const deadlineAt = state.phase === 'waiting'
-      ? state.waitingDeadlineAt
+      ? state.waitingNextHeartbeatAt
       : state.auditNextHeartbeatAt ?? state.auditDeadlineAt;
     if (!isFiniteTimestamp(deadlineAt)) throw new Error('supervision wait state requires a finite deadline');
     this.#db.prepare(`
@@ -332,6 +348,8 @@ export interface PersistedSupervisionTaskAssignment {
   primaryReviewPassed?: boolean;
   crossVendorAuditPassed?: boolean;
   auditRoutingReason?: SupervisionAuditRoutingReason;
+  auditDegradedReason?: SupervisionAuditDegradedReason;
+  provisioning?: SupervisionProvisioningEvidence;
   createdAt: number;
   updatedAt: number;
 }
@@ -403,6 +421,8 @@ export interface SupervisionTaskAssignmentInput {
   executionBinding?: SupervisionExecutionBinding | null;
   economyPolicy?: SupervisionEconomyTaskPolicy | null;
   auditRoutingReason?: SupervisionAuditRoutingReason | null;
+  auditDegradedReason?: SupervisionAuditDegradedReason | null;
+  provisioning?: SupervisionProvisioningEvidence | null;
   idempotencyKey?: string | null;
   now?: number;
 }
@@ -425,6 +445,16 @@ export interface SupervisionTaskAssignmentUpdateInput {
   now?: number;
 }
 
+export interface SupervisionMatchingAuditReceiptInput {
+  attemptId: string;
+  revision: string;
+  verdict: 'PASS' | 'REWORK';
+  auditedSessionName: string;
+  auditorSessionName: string;
+  findings?: string;
+  now?: number;
+}
+
 export interface SupervisionTaskUpdateInput {
   taskId: string;
   status?: import('../../shared/supervision-config.js').SupervisionTaskLifecycleStatus;
@@ -432,6 +462,14 @@ export interface SupervisionTaskUpdateInput {
   commitSha?: string | null;
   pushRemoteRef?: string | null;
   blocker?: string | null;
+  now?: number;
+}
+
+export interface SupervisionTaskAssignmentFinishInput {
+  assignmentId: string;
+  identity: PersistedSupervisionTaskAssignmentIdentity;
+  revision?: string | null;
+  evidence?: string | null;
   now?: number;
 }
 
@@ -537,9 +575,7 @@ export class SupervisionTaskRegistry {
     if (options.database) { this.#db = options.database; this.#ownsDb = false; }
     else {
       const dbPath = options.dbPath?.trim()
-        || process.env.IMCODES_SUPERVISION_TASK_REGISTRY_DB_PATH?.trim()
-        || process.env.IMCODES_SUPERVISION_STATE_DB_PATH?.trim()
-        || (process.env.VITEST ? ':memory:' : DEFAULT_DB_PATH);
+        || resolveSupervisionTaskRegistryDbPath();
       if (dbPath !== ':memory:') mkdirSync(dirname(dbPath), { recursive: true });
       this.#db = new DatabaseSync(dbPath);
       this.#ownsDb = true;
@@ -636,6 +672,19 @@ export class SupervisionTaskRegistry {
         assignment_id TEXT,
         created_at INTEGER NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS supervision_audit_attestations (
+        attempt_id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL,
+        assignment_id TEXT NOT NULL,
+        revision TEXT NOT NULL,
+        verdict TEXT NOT NULL CHECK (verdict IN ('PASS','REWORK')),
+        auditor_session_name TEXT NOT NULL,
+        findings TEXT,
+        event_id INTEGER,
+        created_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS supervision_audit_attestations_task_idx
+        ON supervision_audit_attestations(task_id, created_at);
     `);
     const taskColumns = new Set((this.#db.prepare('PRAGMA table_info(supervision_tasks)').all() as Array<{ name?: unknown }>)
       .map((row) => String(row.name ?? '')));
@@ -643,7 +692,62 @@ export class SupervisionTaskRegistry {
       this.#db.exec('ALTER TABLE supervision_tasks ADD COLUMN project_name TEXT;');
     }
     this.#db.exec('CREATE INDEX IF NOT EXISTS supervision_tasks_project_idx ON supervision_tasks(project_name, updated_at);');
+    this.#reconcileCancelledTaskResources();
   }
+
+  /** Atomically repair rows left by the legacy task-only cancel write. */
+  #reconcileCancelledTaskResources(): void {
+    const taskIds = (this.#db.prepare(
+      "SELECT task_id AS taskId FROM supervision_tasks WHERE status = 'cancelled' ORDER BY task_id",
+    ).all() as Array<{ taskId?: unknown }>)
+      .map((row) => typeof row.taskId === 'string' ? row.taskId : '')
+      .filter(Boolean);
+    if (taskIds.length === 0) return;
+    const terminal = new Set<SupervisionTaskLifecycleStatus>(['finalized', 'pushed', 'cancelled']);
+    const now = Date.now();
+    this.#db.exec('BEGIN IMMEDIATE');
+    try {
+      for (const taskId of taskIds) {
+        const task = this.getTaskRecord(taskId);
+        if (!task) continue;
+        const assignments = this.listAssignments(taskId);
+        const claims = this.listFileClaims(taskId);
+        const staleAssignments = assignments.filter((assignment) => (
+          assignment.leaseId || !terminal.has(assignment.status)
+        ));
+        if (staleAssignments.length === 0 && claims.length === 0 && task.status === 'cancelled') continue;
+        for (const assignment of staleAssignments) {
+          const status = terminal.has(assignment.status) ? assignment.status : 'cancelled';
+          this.#writeAssignment({
+            ...assignment,
+            status,
+            leaseId: '',
+            ...(status === 'cancelled' && !assignment.blocker
+              ? { blocker: 'reconciled_cancelled_task' }
+              : {}),
+            updatedAt: now,
+          }, 'cancelled', {
+            source: 'startup_cancel_reconcile',
+            leaseRevoked: true,
+            assignmentStatusPreserved: status !== 'cancelled',
+          });
+        }
+        if (claims.length > 0) {
+          this.#db.prepare('DELETE FROM supervision_task_file_claims WHERE task_id = ?').run(taskId);
+        }
+        this.#writeTask({ ...task, status: 'cancelled', updatedAt: now }, 'cancelled', {
+          source: 'startup_cancel_reconcile',
+          assignmentsCancelled: staleAssignments.filter((assignment) => !terminal.has(assignment.status)).length,
+          claimsReleased: claims.length,
+        });
+      }
+      this.#db.exec('COMMIT');
+    } catch (error) {
+      this.#db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
 
   close(): void { if (this.#ownsDb && !this.#closed) this.#db.close(); this.#closed = true; }
 
@@ -861,6 +965,8 @@ export class SupervisionTaskRegistry {
       ...(input.executionBinding ? { executionBinding: input.executionBinding } : {}),
       ...(input.economyPolicy ? { economyPolicy: input.economyPolicy } : {}),
       ...(input.auditRoutingReason ? { auditRoutingReason: input.auditRoutingReason } : {}),
+      ...(input.auditDegradedReason ? { auditDegradedReason: input.auditDegradedReason } : {}),
+      ...(input.provisioning ? { provisioning: input.provisioning } : {}),
       createdAt: now,
       updatedAt: now,
     };
@@ -945,6 +1051,229 @@ export class SupervisionTaskRegistry {
     return { ok: true, value: record };
   }
 
+  /**
+   * Close the caller's assignment through the machine-observed audit edge.
+   *
+   * The compatibility `task_finish` tool used to apply the generic `finish`
+   * intent to the assignment's stale `delegated` status even when the task and
+   * a matching auditor PASS had advanced. That edge was unreachable forever.
+   * This method binds the exact revision/attempt, derives the role-specific
+   * destination, and revokes this assignment's lease + claims in one SQLite
+   * transaction. It never treats a read-only scope count as audit evidence.
+   */
+  finishAssignment(input: SupervisionTaskAssignmentFinishInput): SupervisionTaskRegistryResult<PersistedSupervisionTaskAssignment> {
+    const existing = this.getAssignment(input.assignmentId);
+    if (!existing) return { ok: false, reason: 'not_found' };
+    if (!identityMatches(existing.identity, input.identity)) return { ok: false, reason: 'owner_mismatch' };
+    const task = this.getTaskRecord(existing.taskId);
+    if (!task) return { ok: false, reason: 'not_found' };
+    const requestedRevision = normalizeTaskString(input.revision);
+    const assignments = this.listAssignments(existing.taskId);
+
+    let targetStatus: SupervisionTaskLifecycleStatus;
+    let matchingAudit: PersistedSupervisionTaskAssignment | undefined;
+    if (existing.role === 'auditor') {
+      const verdict = existing.verdict?.trim().toUpperCase();
+      if ((verdict !== 'PASS' && verdict !== 'REWORK')
+        || !existing.auditAttemptId || !existing.auditRevision
+        || (requestedRevision && requestedRevision !== existing.auditRevision)) {
+        return { ok: false, reason: requestedRevision ? 'old_revision' : 'invalid_transition' };
+      }
+      targetStatus = 'finalized';
+    } else if (existing.status === 'pushed') {
+      targetStatus = 'finalized';
+    } else {
+      const revision = requestedRevision ?? normalizeTaskString(task.currentRevision);
+      if (!revision) return { ok: false, reason: 'old_revision' };
+      matchingAudit = assignments.find((assignment) => (
+        assignment.role === 'auditor'
+        && assignment.verdict?.trim().toUpperCase() === 'PASS'
+        && Boolean(assignment.auditAttemptId)
+        && assignment.auditRevision === revision
+      ));
+      if (!matchingAudit) return { ok: false, reason: 'old_revision' };
+      if (!mayFinalizeEconomyAssignment({
+        pool: existing.executionBinding?.pool,
+        primaryReviewPassed: existing.primaryReviewPassed === true,
+        crossVendorAuditPassed: true,
+      })) return { ok: false, reason: 'economy_requires_primary_review' };
+      targetStatus = 'ready_for_integration';
+    }
+
+    const claims = this.listFileClaims(existing.taskId)
+      .filter((claim) => claim.assignmentId === existing.assignmentId);
+    const alreadyApplied = existing.status === targetStatus && !existing.leaseId && claims.length === 0;
+    if (alreadyApplied) return { ok: true, value: existing, replay: true };
+
+    const now = input.now ?? Date.now();
+    const record: PersistedSupervisionTaskAssignment = {
+      ...existing,
+      status: targetStatus,
+      leaseId: '',
+      ...(matchingAudit ? {
+        auditAttemptId: matchingAudit.auditAttemptId,
+        auditRevision: matchingAudit.auditRevision,
+        verdict: 'PASS',
+        crossVendorAuditPassed: true,
+      } : {}),
+      updatedAt: now,
+    };
+    this.#db.exec('BEGIN IMMEDIATE');
+    try {
+      this.#writeAssignment(record, targetStatus === 'ready_for_integration' ? 'ready_for_integration' : 'finalized', {
+        source: 'assignment_finish',
+        leaseRevoked: true,
+        claimsReleased: claims.length,
+        ...(matchingAudit ? {
+          matchingAuditAssignmentId: matchingAudit.assignmentId,
+          auditAttemptId: matchingAudit.auditAttemptId,
+          auditRevision: matchingAudit.auditRevision,
+        } : {}),
+        ...(normalizeTaskString(input.evidence) ? { evidence: normalizeTaskString(input.evidence) } : {}),
+      });
+      this.#db.prepare('DELETE FROM supervision_task_file_claims WHERE task_id = ? AND assignment_id = ?')
+        .run(existing.taskId, existing.assignmentId);
+      this.#deriveTaskStatus(existing.taskId, now);
+      this.#db.exec('COMMIT');
+      return { ok: true, value: record };
+    } catch (error) {
+      this.#db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  /**
+   * Persist a capability-validated, revision-matching peer-audit receipt.
+   *
+   * This is the authority bridge the old implementation lacked: the audit
+   * controller could report PASS while the registry assignment remained
+   * `delegated` forever. The receipt locates its auditor assignment by the
+   * daemon-minted attempt id, binds the audited live session and exact revision,
+   * records one durable attestation, and advances the audited assignment through
+   * every legal lifecycle edge. UI code never derives or guesses this state.
+   */
+  applyMatchingAuditReceipt(
+    input: SupervisionMatchingAuditReceiptInput,
+  ): SupervisionTaskRegistryResult<PersistedSupervisionTaskAssignment> {
+    if (this.#closed) return { ok: false, reason: 'invalid' };
+    const attemptId = normalizeTaskString(input.attemptId);
+    const revision = normalizeTaskString(input.revision);
+    const auditedSessionName = normalizeTaskString(input.auditedSessionName);
+    const auditorSessionName = normalizeTaskString(input.auditorSessionName);
+    if (!attemptId || !revision || !auditedSessionName || !auditorSessionName) {
+      return { ok: false, reason: 'invalid' };
+    }
+    const auditRows = this.#db.prepare(
+      'SELECT assignment_id AS assignmentId FROM supervision_task_assignments WHERE audit_attempt_id = ? AND role = \'auditor\'',
+    ).all(attemptId) as Array<{ assignmentId?: unknown }>;
+    if (auditRows.length === 0) return { ok: false, reason: 'not_found' };
+    if (auditRows.length !== 1 || typeof auditRows[0]?.assignmentId !== 'string') {
+      return { ok: false, reason: 'ambiguous_assignment' };
+    }
+    const auditAssignment = this.getAssignment(auditRows[0].assignmentId);
+    if (!auditAssignment || auditAssignment.role !== 'auditor'
+      || auditAssignment.identity.sessionName !== auditorSessionName) {
+      return { ok: false, reason: 'owner_mismatch' };
+    }
+    const task = this.getTaskRecord(auditAssignment.taskId);
+    if (!task) return { ok: false, reason: 'not_found' };
+    const candidates = this.listAssignments(task.taskId).filter((assignment) => (
+      assignment.role !== 'auditor'
+      && assignment.identity.sessionName === auditedSessionName
+    ));
+    if (candidates.length === 0) return { ok: false, reason: 'not_found' };
+    if (candidates.length !== 1) return { ok: false, reason: 'ambiguous_assignment' };
+    const target = candidates[0]!;
+    const expectedRevision = auditAssignment.auditRevision ?? target.auditRevision ?? task.currentRevision;
+    if (!expectedRevision || expectedRevision !== revision
+      || (auditAssignment.auditRevision !== undefined && auditAssignment.auditRevision !== revision)
+      || (target.auditRevision !== undefined && target.auditRevision !== revision)
+      || (task.currentRevision !== undefined && task.currentRevision !== revision)) {
+      return { ok: false, reason: 'old_revision' };
+    }
+    if (target.executionBinding?.pool === 'economy' && target.primaryReviewPassed !== true) {
+      return { ok: false, reason: 'economy_requires_primary_review' };
+    }
+
+    const attestation = this.#db.prepare(
+      'SELECT task_id AS taskId, assignment_id AS assignmentId, revision, verdict FROM supervision_audit_attestations WHERE attempt_id = ?',
+    ).get(attemptId) as Record<string, unknown> | undefined;
+    if (attestation) {
+      if (attestation.taskId !== task.taskId || attestation.assignmentId !== target.assignmentId
+        || attestation.revision !== revision || attestation.verdict !== input.verdict) {
+        return { ok: false, reason: 'old_audit_attempt' };
+      }
+      const replay = this.getAssignment(target.assignmentId);
+      return replay ? { ok: true, value: replay, replay: true } : { ok: false, reason: 'not_found' };
+    }
+
+    const now = input.now ?? Date.now();
+    const toAuditing: Partial<Record<SupervisionTaskLifecycleStatus, SupervisionTaskLifecycleStatus[]>> = {
+      delegated: ['auditing'],
+      implementing: ['validated', 'ready_for_audit', 'auditing'],
+      retrying_external_ci: ['validated', 'ready_for_audit', 'auditing'],
+      validated: ['ready_for_audit', 'auditing'],
+      ready_for_audit: ['auditing'],
+      rework: ['auditing'],
+      auditing: [],
+    };
+    const transition = (
+      assignment: PersistedSupervisionTaskAssignment,
+      terminal: 'passed' | 'ready_for_integration' | 'rework',
+    ): PersistedSupervisionTaskAssignment | undefined => {
+      let current = assignment;
+      const steps = [...(toAuditing[current.status] ?? [])];
+      if (terminal === 'ready_for_integration') {
+        if (current.status === 'passed') steps.push('ready_for_integration');
+        else if (current.status !== 'ready_for_integration') steps.push('passed', 'ready_for_integration');
+      } else if (current.status !== terminal) {
+        steps.push(terminal);
+      }
+      for (const status of steps) {
+        if (!canTransitionSupervisionTaskStatus(current.status, status)) return undefined;
+        current = {
+          ...current,
+          status,
+          auditAttemptId: attemptId,
+          auditRevision: revision,
+          verdict: input.verdict,
+          ...(input.verdict === 'PASS' ? { crossVendorAuditPassed: true } : {}),
+          blocker: status === 'rework' ? normalizeTaskString(input.findings) : undefined,
+          updatedAt: now,
+        };
+        const eventType = status === 'auditing' ? 'audit_requested'
+          : status === 'passed' || status === 'rework' ? 'audit_replied'
+            : status;
+        this.#writeAssignment(current, eventType as SupervisionTaskRegistryEventType, {
+          source: 'matching_audit_receipt', attemptId, revision,
+        });
+      }
+      return current;
+    };
+
+    this.#db.exec('BEGIN IMMEDIATE');
+    try {
+      const audited = transition(target, input.verdict === 'PASS' ? 'ready_for_integration' : 'rework');
+      const audit = transition(auditAssignment, input.verdict === 'PASS' ? 'passed' : 'rework');
+      if (!audited || !audit) {
+        this.#db.exec('ROLLBACK');
+        return { ok: false, reason: 'invalid_transition' };
+      }
+      this.#db.prepare(
+        `INSERT INTO supervision_audit_attestations
+          (attempt_id, task_id, assignment_id, revision, verdict, auditor_session_name, findings, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(attemptId, task.taskId, audited.assignmentId, revision, input.verdict,
+        auditorSessionName, normalizeTaskString(input.findings) ?? null, now);
+      this.#deriveTaskStatus(task.taskId, now);
+      this.#db.exec('COMMIT');
+      return { ok: true, value: audited };
+    } catch (error) {
+      try { this.#db.exec('ROLLBACK'); } catch { /* transaction already closed */ }
+      throw error;
+    }
+  }
+
   #deriveTaskStatus(taskId: string, now: number): void {
     const task = this.getTaskRecord(taskId);
     if (!task) return;
@@ -1005,6 +1334,7 @@ export class SupervisionTaskRegistry {
    */
   applyTaskIntent(input: {
     taskId: string;
+    assignmentId?: string;
     intent: string;
     toStatus: SupervisionTaskLifecycleStatus | null;
     validationState?: string;
@@ -1012,20 +1342,115 @@ export class SupervisionTaskRegistry {
   }): SupervisionTaskRegistryResult<PersistedSupervisionTaskRecord> {
     const task = this.getTaskRecord(input.taskId);
     if (!task) return { ok: false, reason: 'not_found' };
-    // Intents such as heartbeat/claim carry no destination; they are a no-op on
-    // status by design rather than an error.
-    if (!input.toStatus || input.toStatus === task.status) return { ok: true, value: task };
-    const record: PersistedSupervisionTaskRecord = {
-      ...task, status: input.toStatus, updatedAt: Date.now(),
-    };
-    this.#writeTask(record, this.#taskEventFor(input.toStatus), {
-      source: 'task_intent',
-      intent: input.intent,
-      status: input.toStatus,
-      ...(input.validationState ? { validationState: input.validationState } : {}),
-      ...(input.note ? { note: input.note } : {}),
-    });
-    return { ok: true, value: record };
+    if (input.intent === 'cancel' && input.toStatus === 'cancelled') {
+      const now = Date.now();
+      this.#db.exec('BEGIN IMMEDIATE');
+      try {
+        const current = this.getTaskRecord(input.taskId);
+        if (!current) {
+          this.#db.exec('ROLLBACK');
+          return { ok: false, reason: 'not_found' };
+        }
+        const assignments = this.listAssignments(input.taskId);
+        const claims = this.listFileClaims(input.taskId);
+        const terminal = new Set<SupervisionTaskLifecycleStatus>(['finalized', 'pushed', 'cancelled']);
+        let changed = current.status !== 'cancelled' || claims.length > 0;
+        for (const assignment of assignments) {
+          const nextStatus = terminal.has(assignment.status) ? assignment.status : 'cancelled';
+          if (assignment.leaseId || assignment.status !== nextStatus) {
+            changed = true;
+            this.#writeAssignment({
+              ...assignment,
+              status: nextStatus,
+              leaseId: '',
+              ...(nextStatus === 'cancelled' && input.note?.trim()
+                ? { blocker: input.note.trim() }
+                : {}),
+              updatedAt: now,
+            }, 'cancelled', {
+              source: 'task_cancel',
+              leaseRevoked: true,
+              assignmentStatusPreserved: nextStatus !== 'cancelled',
+            });
+          }
+        }
+        if (claims.length > 0) {
+          this.#db.prepare('DELETE FROM supervision_task_file_claims WHERE task_id = ?').run(input.taskId);
+        }
+        const record: PersistedSupervisionTaskRecord = changed
+          ? { ...current, status: 'cancelled', updatedAt: now }
+          : current;
+        if (changed) {
+          this.#writeTask(record, 'cancelled', {
+            source: 'task_intent',
+            intent: input.intent,
+            status: 'cancelled',
+            assignmentsCancelled: assignments.filter((assignment) => !terminal.has(assignment.status)).length,
+            claimsReleased: claims.length,
+            ...(input.note ? { note: input.note } : {}),
+          });
+        }
+        this.#db.exec('COMMIT');
+        return { ok: true, value: record, ...(changed ? {} : { replay: true }) };
+      } catch (error) {
+        this.#db.exec('ROLLBACK');
+        throw error;
+      }
+    }
+    const assignment = input.assignmentId ? this.getAssignment(input.assignmentId) : undefined;
+    if (input.assignmentId && (!assignment || assignment.taskId !== input.taskId)) {
+      return { ok: false, reason: 'not_found' };
+    }
+    const assignmentTarget: SupervisionTaskLifecycleStatus | null = assignment
+      ? input.intent === 'record_validation' && input.validationState === 'passed'
+        ? 'validated'
+        : input.intent === 'start' || input.intent === 'claim' || input.intent === 'open_audit'
+          ? input.toStatus
+          : null
+      : null;
+    const taskChanges = Boolean(input.toStatus && input.toStatus !== task.status);
+    const assignmentChanges = Boolean(assignment && assignmentTarget && assignmentTarget !== assignment.status);
+    // Heartbeat/checkpoint and an already-applied synchronized intent are true
+    // idempotent no-ops.
+    if (!taskChanges && !assignmentChanges) return { ok: true, value: task, replay: true };
+
+    if (assignment && assignmentTarget && assignmentTarget !== assignment.status) {
+      const staleRepair = assignment.status === 'delegated'
+        && ((assignmentTarget === 'validated' && ['implementing', 'validated', 'ready_for_audit'].includes(task.status))
+          || (assignmentTarget === 'ready_for_audit' && ['validated', 'ready_for_audit'].includes(task.status)));
+      if (!canTransitionSupervisionTaskStatus(assignment.status, assignmentTarget) && !staleRepair) {
+        return { ok: false, reason: 'invalid_transition' };
+      }
+    }
+
+    const now = Date.now();
+    const record: PersistedSupervisionTaskRecord = taskChanges
+      ? { ...task, status: input.toStatus!, updatedAt: now }
+      : task;
+    this.#db.exec('BEGIN IMMEDIATE');
+    try {
+      if (assignment && assignmentTarget && assignmentTarget !== assignment.status) {
+        this.#writeAssignment({ ...assignment, status: assignmentTarget, updatedAt: now }, this.#taskEventFor(assignmentTarget), {
+          source: 'task_intent_assignment_sync',
+          intent: input.intent,
+          validationState: input.validationState,
+        });
+      }
+      if (taskChanges) {
+        this.#writeTask(record, this.#taskEventFor(input.toStatus!), {
+          source: 'task_intent',
+          intent: input.intent,
+          status: input.toStatus,
+          ...(input.validationState ? { validationState: input.validationState } : {}),
+          ...(input.note ? { note: input.note } : {}),
+        });
+      }
+      this.#db.exec('COMMIT');
+      return { ok: true, value: record };
+    } catch (error) {
+      this.#db.exec('ROLLBACK');
+      throw error;
+    }
   }
 
   /**
@@ -1042,6 +1467,17 @@ export class SupervisionTaskRegistry {
   }): SupervisionTaskRegistryResult<PersistedSupervisionTaskRecord> {
     const task = this.getTaskRecord(input.taskId);
     if (!task) return { ok: false, reason: 'not_found' };
+    // Administrative cancellation is also a resource-recovery operation. Use
+    // the same atomic path as a participant cancel so stale delegated leases
+    // and claims cannot survive after the task itself is terminal.
+    if (input.toStatus === 'cancelled') {
+      return this.applyTaskIntent({
+        taskId: input.taskId,
+        intent: 'cancel',
+        toStatus: 'cancelled',
+        note: input.reason,
+      });
+    }
     const record: PersistedSupervisionTaskRecord = {
       ...task,
       status: input.toStatus,
@@ -1113,7 +1549,7 @@ export class SupervisionTaskRegistry {
 
   clear(): void {
     if (this.#closed) return;
-    this.#db.exec('DELETE FROM supervision_task_events; DELETE FROM supervision_task_file_events; DELETE FROM supervision_task_file_claims; DELETE FROM supervision_task_idempotency; DELETE FROM supervision_task_assignments; DELETE FROM supervision_tasks;');
+    this.#db.exec('DELETE FROM supervision_audit_attestations; DELETE FROM supervision_task_events; DELETE FROM supervision_task_file_events; DELETE FROM supervision_task_file_claims; DELETE FROM supervision_task_idempotency; DELETE FROM supervision_task_assignments; DELETE FROM supervision_tasks;');
   }
 }
 

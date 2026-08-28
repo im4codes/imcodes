@@ -33,6 +33,7 @@ import { MSG_COMMAND_ACK } from '../../shared/ack-protocol.js';
 import { TRANSPORT_QUEUE_COMMANDS } from '../../shared/transport-queue-types.js';
 import { OPENSPEC_AUTO_DELIVER_MSG } from '../../shared/openspec-auto-deliver-constants.js';
 import { CC_PRESET_MSG } from '../../shared/cc-presets.js';
+import { SUPERVISION_TASK_CONSOLE_MSG } from '../../shared/supervision-task-console.js';
 
 class MockWs extends EventEmitter {
   sent: Array<string | Buffer> = [];
@@ -305,6 +306,83 @@ describe('WsBridge share-scoped sockets', () => {
       runtimeType: 'transport',
       projectDir: '/owner/project',
     }]);
+  });
+
+  it('bridges task-console reads only for shared MAIN viewers and participants', async () => {
+    const bridge = WsBridge.get(serverId);
+    const mainTarget: ShareTarget = { kind: 'main', serverId, sessionName: 'deck_proj_brain' };
+    bridge.setShareCoverageResolverForTests(async ({ target }) => coverage(target, 'viewer', now));
+    const daemon = new MockWs();
+    const db = makeDb();
+    bridge.handleDaemonConnection(daemon as never, db, {} as never);
+    daemon.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+    await flushAsync();
+    daemon.sent.length = 0;
+
+    const viewer = new MockWs();
+    bridge.handleShareBrowserConnection(viewer as never, 'viewer-user', db, {
+      ticketId: 'task-console-viewer',
+      target: mainTarget,
+      snapshot: coverage(mainTarget, 'viewer', now),
+    });
+    const participant = new MockWs();
+    bridge.handleShareBrowserConnection(participant as never, 'participant-user', db, {
+      ticketId: 'task-console-participant',
+      target: mainTarget,
+      snapshot: coverage(mainTarget, 'participant', now),
+    });
+    const serverTarget: ShareTarget = { kind: 'server', serverId };
+    const serverShare = new MockWs();
+    bridge.handleShareBrowserConnection(serverShare as never, 'server-share-user', db, {
+      ticketId: 'task-console-server',
+      target: serverTarget,
+      snapshot: coverage(serverTarget, 'viewer', now),
+    });
+    const subTarget: ShareTarget = { kind: 'subsession', serverId, subSessionId: 'child' };
+    const subShare = new MockWs();
+    bridge.handleShareBrowserConnection(subShare as never, 'sub-share-user', db, {
+      ticketId: 'task-console-sub',
+      target: subTarget,
+      snapshot: coverage(subTarget, 'participant', now),
+    });
+
+    const subscribe = {
+      type: SUPERVISION_TASK_CONSOLE_MSG.SUBSCRIBE,
+      subscriptionId: 'task-console-subscription',
+      scope: { projectName: 'proj', coordinatorSessionName: 'deck_proj_brain' },
+      afterEventId: null,
+      reason: 'initial',
+    };
+    viewer.emit('message', JSON.stringify(subscribe));
+    participant.emit('message', JSON.stringify({ ...subscribe, subscriptionId: 'participant-subscription' }));
+    serverShare.emit('message', JSON.stringify({ ...subscribe, subscriptionId: 'server-subscription' }));
+    subShare.emit('message', JSON.stringify({ ...subscribe, subscriptionId: 'subsession-subscription' }));
+    await flushAsync();
+
+    expect(daemon.sentJson.filter((msg) => msg.type === SUPERVISION_TASK_CONSOLE_MSG.SUBSCRIBE))
+      .toEqual(expect.arrayContaining([
+        expect.objectContaining({ subscriptionId: 'task-console-subscription' }),
+        expect.objectContaining({ subscriptionId: 'participant-subscription' }),
+      ]));
+    expect(daemon.sentJson.some((msg) => (
+      msg.subscriptionId === 'server-subscription' || msg.subscriptionId === 'subsession-subscription'
+    ))).toBe(false);
+
+    daemon.emit('message', JSON.stringify({
+      type: SUPERVISION_TASK_CONSOLE_MSG.SNAPSHOT,
+      subscriptionId: 'task-console-subscription',
+      scope: subscribe.scope,
+      projectionVersion: 0,
+      tasks: [],
+      assignments: [],
+      pools: [],
+    }));
+    await flushAsync();
+
+    expect(viewer.sentJson.some((msg) => msg.type === SUPERVISION_TASK_CONSOLE_MSG.SNAPSHOT)).toBe(true);
+    expect(participant.sentJson.some((msg) => msg.type === SUPERVISION_TASK_CONSOLE_MSG.SNAPSHOT)).toBe(true);
+    expect(serverShare.sentJson.some((msg) => msg.type === SUPERVISION_TASK_CONSOLE_MSG.SNAPSHOT)).toBe(false);
+    expect(subShare.sentJson.some((msg) => msg.type === SUPERVISION_TASK_CONSOLE_MSG.SNAPSHOT)).toBe(false);
   });
 
   it('persists and broadcasts share discussion comments without daemon relay', async () => {

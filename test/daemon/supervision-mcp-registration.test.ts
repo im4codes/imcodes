@@ -39,6 +39,7 @@ class FakeRegistry implements SupervisionRegistryPort {
   item(taskId: string) {
     return {
       taskId,
+      projectName: 'codedeck',
       assignments: (this.participants.get(taskId) ?? []).map((sessionName) => ({ identity: { sessionName } })),
     };
   }
@@ -170,6 +171,19 @@ describe('list/get visibility guards', () => {
     expect(out.ownerScope).toBe('caller_default');
     expect(out.tasks.map((t: any) => t.taskId)).toEqual(['tsk_a']);
     expect(registry.listCalls[0]).toMatchObject({ ownerSessionName: 'deck_cd_brain' });
+  });
+
+  it('gives the live project Brain the project-wide authority used by the console snapshot', async () => {
+    const brain = createSupervisionMcpToolHandlers(CALLER, {
+      registry,
+      isProjectBrain: () => true,
+    });
+    const listed: any = await brain[SUPERVISION_MCP_TOOLS.LIST]({});
+    expect(listed).toMatchObject({ status: 'ok', ownerScope: 'project_brain' });
+    expect(listed.tasks.map((task: any) => task.taskId).sort()).toEqual(['tsk_a', 'tsk_other']);
+    expect(registry.listCalls.at(-1)).toMatchObject({ projectName: 'codedeck' });
+    expect(await brain[SUPERVISION_MCP_TOOLS.GET]({ taskId: 'tsk_other' }))
+      .toMatchObject({ status: 'ok', task: { taskId: 'tsk_other', projectName: 'codedeck' } });
   });
 
   it('LIST with an explicit target the caller does not participate in returns NOTHING', async () => {

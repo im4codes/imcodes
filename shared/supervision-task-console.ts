@@ -53,6 +53,7 @@ export const SUPERVISION_TASK_CONSOLE_MSG = {
   /** Client-side durable cursor ack; lets the daemon prune its outbox. */
   ACK: 'supervision.task_console.ack',
   RESYNC_REQUIRED: 'supervision.task_console.resync_required',
+  UNAVAILABLE: 'supervision.task_console.unavailable',
 } as const;
 export type SupervisionTaskConsoleMessageType =
   typeof SUPERVISION_TASK_CONSOLE_MSG[keyof typeof SUPERVISION_TASK_CONSOLE_MSG];
@@ -147,6 +148,25 @@ export interface SupervisionTaskConsoleResyncRequired {
   subscriptionId: string;
   scope: SupervisionTaskConsoleScope;
   reason: SupervisionConsoleResyncReason;
+}
+
+export const SUPERVISION_CONSOLE_UNAVAILABLE_REASONS = {
+  PROJECTION_UNAVAILABLE: 'projection_unavailable',
+} as const;
+export type SupervisionConsoleUnavailableReason =
+  typeof SUPERVISION_CONSOLE_UNAVAILABLE_REASONS[keyof typeof SUPERVISION_CONSOLE_UNAVAILABLE_REASONS];
+
+/**
+ * Correlated terminal response when the authority cannot build a snapshot.
+ * It carries no projection rows, so a failure can never be mistaken for an
+ * authoritative empty snapshot.
+ */
+export interface SupervisionTaskConsoleUnavailable {
+  type: typeof SUPERVISION_TASK_CONSOLE_MSG.UNAVAILABLE;
+  subscriptionId: string;
+  scope: SupervisionTaskConsoleScope;
+  reason: SupervisionConsoleUnavailableReason;
+  retryable: true;
 }
 
 /**

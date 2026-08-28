@@ -29,6 +29,7 @@ import {
 import { TRANSPORT_QUEUE_COMMANDS } from '../../../shared/transport-queue-types.js';
 import { OPENSPEC_AUTO_DELIVER_MSG } from '../../../shared/openspec-auto-deliver-constants.js';
 import { CC_PRESET_MSG } from '../../../shared/cc-presets.js';
+import { SUPERVISION_TASK_CONSOLE_MSG } from '../../../shared/supervision-task-console.js';
 
 export { shareTargetKey };
 export type { EffectiveCoverage, ShareTarget };
@@ -73,6 +74,7 @@ export type ShareCommandDecision =
 
 type ShareCommandPolicy =
   | { kind: 'allow-covered-read'; requireTarget: boolean }
+  | { kind: 'allow-main-covered-read' }
   | { kind: 'participant-covered-action' }
   | { kind: 'participant-bound-action' }
   | { kind: 'participant-discussion-start' }
@@ -158,6 +160,9 @@ export const SHARE_WS_COMMAND_POLICY_INVENTORY: readonly ShareBridgeCommandInven
   { bridgeCommand: 'subsession.set_model', sharedCommand: SHARE_BROWSER_COMMANDS.SESSION_MODEL_SWITCH, policy: { kind: 'participant-model-switch' } },
   { bridgeCommand: TRANSPORT_MSG.LIST_MODELS, sharedCommand: SHARE_BROWSER_COMMANDS.SESSION_MODEL_LIST, policy: { kind: 'participant-model-list' } },
   { bridgeCommand: CC_PRESET_MSG.LIST, sharedCommand: SHARE_BROWSER_COMMANDS.SESSION_PRESET_LIST, policy: { kind: 'participant-preset-list' } },
+  { bridgeCommand: SUPERVISION_TASK_CONSOLE_MSG.SUBSCRIBE, sharedCommand: SHARE_BROWSER_COMMANDS.SUPERVISION_TASK_CONSOLE_READ, policy: { kind: 'allow-main-covered-read' } },
+  { bridgeCommand: SUPERVISION_TASK_CONSOLE_MSG.UNSUBSCRIBE, sharedCommand: SHARE_BROWSER_COMMANDS.SUPERVISION_TASK_CONSOLE_READ, policy: { kind: 'allow-main-covered-read' } },
+  { bridgeCommand: SUPERVISION_TASK_CONSOLE_MSG.ACK, sharedCommand: SHARE_BROWSER_COMMANDS.SUPERVISION_TASK_CONSOLE_READ, policy: { kind: 'allow-main-covered-read' } },
   { bridgeCommand: DAEMON_COMMAND_TYPES.SESSION_CANCEL, sharedCommand: SHARE_BROWSER_COMMANDS.SESSION_CANCEL, policy: { kind: 'participant-cancel' } },
   { bridgeCommand: 'discussion.comment', sharedCommand: SHARE_BROWSER_COMMANDS.DISCUSSION_COMMENT, policy: { kind: 'allow-covered-read', requireTarget: false } },
   { bridgeCommand: 'fs.ls', sharedCommand: SHARE_BROWSER_COMMANDS.FILE_BROWSE, policy: { kind: 'allow-covered-read', requireTarget: true } },
@@ -230,6 +235,12 @@ function assertShareCommandInventoryEntry(entry: ShareBridgeCommandInventoryEntr
     }
     return;
   }
+  if (entry.policy.kind === 'allow-main-covered-read') {
+    if (sharedPolicy.scope !== 'concrete-tab' || sharedPolicy.minRole !== undefined) {
+      throw new Error(`Task console read ${entry.bridgeCommand} must be a viewer-readable concrete-tab policy`);
+    }
+    return;
+  }
   if (entry.policy.kind === 'direct-file-lease' || entry.policy.kind === 'direct-file-bound-operation') {
     if (sharedPolicy.minRole !== undefined) {
       throw new Error(`Inert/bound direct-file frame ${entry.bridgeCommand} must not grant participant-only file access`);
@@ -273,6 +284,8 @@ type DaemonMessagePolicy = {
    * sessions the receiving socket may have no share for at all.
    */
   scopesServerTargetInRedact?: true;
+  /** Task-console authority is visible only through an exact MAIN tab share. */
+  mainShareOnly?: true;
 };
 
 export const SHARE_SCOPED_DAEMON_MESSAGE_POLICY = new Map<string, DaemonMessagePolicy>([
@@ -292,6 +305,10 @@ export const SHARE_SCOPED_DAEMON_MESSAGE_POLICY = new Map<string, DaemonMessageP
   ['timeline.event', {
     target: timelineEventTarget,
   }],
+  [SUPERVISION_TASK_CONSOLE_MSG.SNAPSHOT, { target: supervisionTaskConsoleTarget, mainShareOnly: true }],
+  [SUPERVISION_TASK_CONSOLE_MSG.DELTA, { target: supervisionTaskConsoleTarget, mainShareOnly: true }],
+  [SUPERVISION_TASK_CONSOLE_MSG.RESYNC_REQUIRED, { target: supervisionTaskConsoleTarget, mainShareOnly: true }],
+  [SUPERVISION_TASK_CONSOLE_MSG.UNAVAILABLE, { target: supervisionTaskConsoleTarget, mainShareOnly: true }],
   [TRANSPORT_MSG.CHAT_HISTORY, {
     target: sessionIdFieldTarget,
     redact: redactTransportHistory,
@@ -411,6 +428,13 @@ export function evaluateShareCommand(input: {
         : { allowed: true };
     }
     return shareStateCoversSession(input.state, sessionName)
+      ? { allowed: true }
+      : { allowed: false, reason: SHARE_REASONS.DIRECT_SURFACE_DENIED };
+  }
+  if (policy.kind === 'allow-main-covered-read') {
+    return input.state.target.kind === 'main'
+      && !!sessionName
+      && input.state.target.sessionName === sessionName
       ? { allowed: true }
       : { allowed: false, reason: SHARE_REASONS.DIRECT_SURFACE_DENIED };
   }
@@ -623,6 +647,13 @@ export function commandSessionName(msg: Record<string, unknown>): string | null 
     const value = msg[key];
     if (typeof value === 'string' && value.trim()) return value.trim();
   }
+  const scope = msg.scope;
+  if (scope && typeof scope === 'object' && !Array.isArray(scope)) {
+    const coordinatorSessionName = (scope as Record<string, unknown>).coordinatorSessionName;
+    if (typeof coordinatorSessionName === 'string' && coordinatorSessionName.trim()) {
+      return coordinatorSessionName.trim();
+    }
+  }
   return null;
 }
 
@@ -667,6 +698,7 @@ export function filterShareDaemonMessage(
   if (!policy) return null;
   const target = policy.target(msg);
   if (!target) return null;
+  if (policy.mainShareOnly && state.target.kind !== 'main') return null;
   if (target.serverId && target.serverId !== state.target.serverId) return null;
   if (target.kind === 'server') {
     // A server-scoped target names no session, so per-session coverage cannot
@@ -785,6 +817,16 @@ function timelineEventTarget(msg: Record<string, unknown>): ShareTarget | null {
   const event = msg.event && typeof msg.event === 'object' ? msg.event as Record<string, unknown> : null;
   const sessionId = typeof event?.sessionId === 'string' ? event.sessionId : '';
   return sessionId ? sessionNameToShareTarget('', sessionId) : null;
+}
+
+function supervisionTaskConsoleTarget(msg: Record<string, unknown>): ShareTarget | null {
+  const scope = msg.scope && typeof msg.scope === 'object' && !Array.isArray(msg.scope)
+    ? msg.scope as Record<string, unknown>
+    : null;
+  const coordinatorSessionName = typeof scope?.coordinatorSessionName === 'string'
+    ? scope.coordinatorSessionName.trim()
+    : '';
+  return coordinatorSessionName ? sessionNameToShareTarget('', coordinatorSessionName) : null;
 }
 
 function sharedActorTarget(msg: Record<string, unknown>): ShareTarget | null {

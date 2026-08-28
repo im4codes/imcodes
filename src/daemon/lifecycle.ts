@@ -78,24 +78,13 @@ import { createCapabilitySyncRuntime } from '../capability/capability-sync-runti
 import { CapabilitySyncFrameHandler } from '../capability/capability-sync-handler.js';
 import { CapabilitySourceConvergenceStore } from '../capability/capability-source-convergence.js';
 import { cleanupAbandonedCapabilityQuarantine } from '../capability/skill-acquisition.js';
-import { DatabaseSync } from 'node:sqlite';
-import { join } from 'node:path';
-import { homedir } from 'node:os';
-import { mkdirSync } from 'node:fs';
 import {
-  createSupervisionConsoleBinding,
+  createProductionSupervisionConsoleBinding,
   isAuthorizedSupervisionConsoleScope,
   type SupervisionConsoleBinding,
 } from './supervision-console-binding.js';
 
 let supervisionConsole: SupervisionConsoleBinding | undefined;
-
-/** Same ~/.imcodes home the rest of the daemon state uses. */
-function supervisionConsoleDbPath(): string {
-  const dir = join(homedir(), '.imcodes');
-  mkdirSync(dir, { recursive: true });
-  return join(dir, 'supervision-tasks.db');
-}
 
 /** Exposed for diagnostics/tests; undefined until the link is bound. */
 export function getSupervisionConsoleBinding(): SupervisionConsoleBinding | undefined {
@@ -1338,11 +1327,11 @@ export async function startup(): Promise<DaemonContext> {
   // take the daemon down, so it is logged and the rest of startup continues.
   try {
     if (!serverLink) throw new Error('no server link');
-    supervisionConsole = createSupervisionConsoleBinding({
+    supervisionConsole = createProductionSupervisionConsoleBinding({
       serverLink,
-      database: new DatabaseSync(supervisionConsoleDbPath()) as never,
       // Only the coordinator that owns a project scope may subscribe to it.
       authorize: (scope) => isAuthorizedSupervisionConsoleScope(scope, listSessions()),
+      onError: (error) => logger.warn({ error }, 'supervision console projection unavailable'),
     });
     logger.info({ epoch: supervisionConsole.projectionEpoch }, 'supervision console bound');
   } catch (err) {

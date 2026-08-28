@@ -38,13 +38,18 @@ export const SUPERVISION_INTENT_TRANSITIONS: Readonly<Record<SupervisionIntent, 
   start: { from: ['planned', 'delegated', 'rework'], to: 'implementing' },
   claim: { from: ['planned', 'delegated'], to: 'implementing' },
   heartbeat: { from: [...SUPERVISION_TASK_LIFECYCLE_STATUSES], to: null },
-  record_validation: { from: ['implementing', 'retrying_external_ci', 'rework'], to: null },
+  // A passed validation is a lifecycle edge, not merely an annotation. The
+  // resolver keeps failed/unavailable observations non-advancing below.
+  record_validation: { from: ['implementing', 'retrying_external_ci', 'rework'], to: 'validated' },
   open_audit: { from: ['implementing', 'validated'], to: 'ready_for_audit' },
   checkpoint: { from: [...SUPERVISION_TASK_LIFECYCLE_STATUSES], to: null },
   finish: { from: ['integrating', 'finalizing', 'committed', 'pushed'], to: 'finalized' },
   cancel: {
     from: SUPERVISION_TASK_LIFECYCLE_STATUSES.filter(
-      (status) => !['finalized', 'pushed', 'cancelled'].includes(status),
+      // Repeated cancel is an idempotent cleanup request. This matters for
+      // durable registries upgraded from versions that marked the task
+      // cancelled but left assignment leases and file claims behind.
+      (status) => !['finalized', 'pushed'].includes(status),
     ),
     to: 'cancelled',
   },
@@ -122,7 +127,8 @@ export function resolveSupervisionIntent(input: {
       return { ok: false, refusal: 'invalid_validation_state', intent: request.intent, fromStatus: current };
     }
     return {
-      ok: true, intent: request.intent, fromStatus: current, toStatus: null,
+      ok: true, intent: request.intent, fromStatus: current,
+      toStatus: state === 'passed' ? rule.to : null,
       validationState: state as SupervisionConsoleValidationState,
     };
   }

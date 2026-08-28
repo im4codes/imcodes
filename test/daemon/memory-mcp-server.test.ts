@@ -965,6 +965,17 @@ describe('memory MCP stdio server', () => {
     await writeSessionStore(home);
     const hookBodies: Array<Record<string, unknown>> = [];
     const hookServer = createServer((req, res) => {
+      if (req.method === 'POST' && req.url === '/sessions/live') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          ok: true,
+          sessions: [
+            { name: 'deck_sub_worker', state: 'idle', live: true },
+            { name: 'deck_sub_peer', state: 'idle', live: true },
+          ],
+        }));
+        return;
+      }
       if (req.method !== 'POST' || req.url !== '/send') {
         res.writeHead(404);
         res.end();

@@ -446,7 +446,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
     name: MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE,
     description: 'Send plain text to an exact send_list_targets target. Callers and labels are invalid targets. append (default) joins the active turn, with durable FIFO fallback when unsupported or racing; queue always uses FIFO. Not a Team/P2P run. Files are project-root paths, not bytes. Returns ids and delivered/queued/failed status.',
     inputSchema: objectSchema({
-      target: stringSchema('Required exact target session value. For an ordinary peer, use the exact send_list_targets.target value. For a follow-up to an execution clone you created, use the exact result.clone.target from the originating clone send — execution clones are NOT returned by send_list_targets and only their creator may address them. Always use the exact target name; never a label or agentType value.'),
+      target: stringSchema('Exact target session. May be omitted only when task.autoProvision=true, which authorizes the daemon to reuse/provision from the configured pool.'),
       message: stringSchema(`Required complete task/request text to deliver, up to ${MEMORY_MCP_CAPS.SEND_MESSAGE_MAX_BYTES} UTF-8 bytes. Include the desired role and output, such as audit findings, discussion input, plan, implementation request, or verification result.`),
       deliveryMode: {
         type: 'string',
@@ -476,6 +476,15 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
           currentRevision: stringSchema('Current revision.'),
           auditAttemptId: stringSchema('Matching audit attempt id.'),
           auditRevision: stringSchema('Matching audit revision.'),
+          executionPool: { type: 'string', enum: ['primary', 'economy'], description: 'Configured execution pool.' },
+          autoProvision: { type: 'boolean', description: 'When true, reuse or provision a pool-selected sub-session if target is omitted.' },
+          requestedExecutionType: objectSchema({
+            capabilityId: stringSchema('Exact configured capability id.'),
+            agentType: stringSchema('Configured SDK agent type.'),
+            providerFamily: stringSchema('Canonical provider family.'),
+            runtimeType: { type: 'string', enum: ['process', 'transport'] },
+            model: stringSchema('Canonical selected model.'),
+          }, ['capabilityId', 'agentType', 'providerFamily', 'runtimeType', 'model']),
         }),
         description: 'Optional daemon-authoritative supervision task metadata. When present, accepted result returns taskId and assignmentId; idempotency replay must reuse both.',
       },
@@ -488,6 +497,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
           },
           attemptId: stringSchema('Exact automatic supervision audit attempt id supplied by the orchestration request.'),
           auditedSessionName: stringSchema('Exact session being audited, chosen by the Supervisor Brain. The daemon never infers it.'),
+          strictCrossVendor: booleanSchema('Set true only when the user explicitly requires cross-vendor and forbids same-family degradation.'),
         }, ['kind', 'attemptId', 'auditedSessionName']),
         description: 'Strict automatic-supervision metadata. Requires reply=true, one exact target, no broadcast, and no clone.',
       },
@@ -502,7 +512,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
         }, ['kind', 'ephemeral', 'parentRunId', 'parentStage']),
         description: 'Optional execution-clone request. Routes to a fresh ephemeral clone of the resolved target, never the target itself, and returns clone.target. Cannot be combined with broadcast.',
       },
-    }, ['target', 'message']),
+    }, ['message']),
     outputSchema: statusSchema,
   },
 

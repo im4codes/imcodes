@@ -55,7 +55,11 @@ describe('intent resolution', () => {
     for (const state of SUPERVISION_CONSOLE_VALIDATION_STATES) {
       expect(resolveSupervisionIntent({
         request: { intent: 'record_validation', taskId: 't', validationState: state }, currentStatus: 'implementing',
-      }), state).toMatchObject({ ok: true, validationState: state, toStatus: null });
+      }), state).toMatchObject({
+        ok: true,
+        validationState: state,
+        toStatus: state === 'passed' ? 'validated' : null,
+      });
     }
     for (const bad of [undefined, 'maybe', 'PASSED', ' passed']) {
       expect(resolveSupervisionIntent({
@@ -64,11 +68,13 @@ describe('intent resolution', () => {
     }
   });
 
-  it('never advances a terminal task via cancel', () => {
-    for (const status of ['finalized', 'pushed', 'cancelled'] as const) {
+  it('never advances a shipped terminal task and treats repeated cancel as cleanup replay', () => {
+    for (const status of ['finalized', 'pushed'] as const) {
       expect(resolveSupervisionIntent({ request: { intent: 'cancel', taskId: 't' }, currentStatus: status }).refusal, status)
         .toBe('illegal_transition');
     }
+    expect(resolveSupervisionIntent({ request: { intent: 'cancel', taskId: 't' }, currentStatus: 'cancelled' }))
+      .toMatchObject({ ok: true, fromStatus: 'cancelled', toStatus: 'cancelled' });
     expect(resolveSupervisionIntent({ request: { intent: 'cancel', taskId: 't' }, currentStatus: 'implementing' }))
       .toMatchObject({ ok: true, toStatus: 'cancelled' });
   });

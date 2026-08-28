@@ -523,7 +523,7 @@ const TASK_ARG_ALLOWED_KEYS: ReadonlySet<string> = new Set([
   'taskId', 'topLevelTaskId', 'sliceId', 'classification', 'objective', 'acceptance',
   'ownedFiles', 'sharedFiles', 'dependencies', 'integrationOwner', 'baseRevision',
   'currentRevision', 'auditAttemptId', 'auditRevision', 'executionPool',
-  'requestedExecutionType', 'economyPolicy',
+  'autoProvision', 'requestedExecutionType', 'economyPolicy',
 ]);
 
 function parseTaskArg(value: unknown): SupervisionTaskMetadata | undefined | 'invalid' {
@@ -538,6 +538,7 @@ function parseTaskArg(value: unknown): SupervisionTaskMetadata | undefined | 'in
   if (record.requestedExecutionType != null && !requestedExecutionType) return 'invalid';
   if (record.economyPolicy != null && !economyPolicy) return 'invalid';
   if (record.executionPool != null && record.executionPool !== 'primary' && record.executionPool !== 'economy') return 'invalid';
+  if (record.autoProvision !== undefined && record.autoProvision !== true) return 'invalid';
   return {
     taskId: stringField('taskId'),
     topLevelTaskId: stringField('topLevelTaskId'),
@@ -554,12 +555,13 @@ function parseTaskArg(value: unknown): SupervisionTaskMetadata | undefined | 'in
     auditAttemptId: stringField('auditAttemptId'),
     auditRevision: stringField('auditRevision'),
     executionPool: record.executionPool as 'primary' | 'economy' | undefined,
+    autoProvision: record.autoProvision === true ? true : undefined,
     ...(requestedExecutionType ? { requestedExecutionType } : {}),
     ...(economyPolicy ? { economyPolicy } : {}),
   };
 }
 
-const AUDIT_ARG_ALLOWED_KEYS: ReadonlySet<string> = new Set(['kind', 'attemptId', 'auditedSessionName']);
+const AUDIT_ARG_ALLOWED_KEYS: ReadonlySet<string> = new Set(['kind', 'attemptId', 'auditedSessionName', 'strictCrossVendor']);
 
 /**
  * Parse the strict supervision-audit envelope.
@@ -579,11 +581,13 @@ export function parseAuditArg(value: unknown): AgentDelegationAuditRequest | und
     || record.kind !== AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT
     || !isAgentDelegationOpaqueId(record.attemptId)
     || !auditedSessionName
-    || auditedSessionName !== record.auditedSessionName) return 'invalid';
+    || auditedSessionName !== record.auditedSessionName
+    || (record.strictCrossVendor !== undefined && record.strictCrossVendor !== true)) return 'invalid';
   return {
     kind: AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT,
     attemptId: record.attemptId,
     auditedSessionName,
+    ...(record.strictCrossVendor === true ? { strictCrossVendor: true } : {}),
   };
 }
 
@@ -609,8 +613,6 @@ function localUnavailableToolFields(result: Pick<MemoryMcpSearchResult, 'degrade
   return { reason: degradedReasons[0] ?? MEMORY_MCP_DEGRADED_REASON.LOCAL_CONTEXT_STORE_UNAVAILABLE, degradedReasons };
 }
 
-const SEND_SESSION_SNAPSHOT_FALLBACK_TTL_MS = 30_000;
-
 function sendVisibleSiblingCount(caller: McpRuntimeCaller, sessions: SessionRecord[]): number {
   if (!caller.sessionName) return 0;
   const callerProjectName = resolveRuntimeScope(caller, sessions).projectName;
@@ -627,17 +629,31 @@ function hasSendCaller(caller: McpRuntimeCaller, sessions: SessionRecord[]): boo
   return Boolean(caller.sessionName && sessions.some((session) => session.name === caller.sessionName));
 }
 
-function shouldUsePreviousSendSessions(
-  caller: McpRuntimeCaller,
+async function defaultSessionAuthorityActive(session: SessionRecord): Promise<boolean> {
+  if (session.state === 'stopped' || session.state === 'error') return false;
+  const runtimeType = session.runtimeType ?? getSessionRuntimeType(session.agentType);
+  if (runtimeType === 'transport') {
+    const { getTransportRuntime } = await import('../agent/session-manager.js');
+    return Boolean(getTransportRuntime(session.name));
+  }
+  const { sessionExists } = await import('../agent/tmux.js');
+  return sessionExists(session.name).catch(() => false);
+}
+
+async function mergeAuthoritativelyActiveSendSessions(
   current: SessionRecord[],
-  previous: SessionRecord[] | null,
-  previousAt: number,
-  now: number,
-): previous is SessionRecord[] {
-  if (!previous || previous.length === 0) return false;
-  if (now - previousAt > SEND_SESSION_SNAPSHOT_FALLBACK_TTL_MS) return false;
-  if (hasSendCaller(caller, previous) && !hasSendCaller(caller, current)) return true;
-  return sendVisibleSiblingCount(caller, previous) > 0 && sendVisibleSiblingCount(caller, current) === 0;
+  priorCandidates: SessionRecord[],
+  active: (session: SessionRecord) => boolean | Promise<boolean>,
+): Promise<SessionRecord[]> {
+  const byName = new Map(current.map((session) => [session.name, session]));
+  for (const candidate of priorCandidates) {
+    // An explicit current record is authoritative, including stopped/error.
+    // Only absence is eligible for recovery from a prior directory snapshot.
+    if (byName.has(candidate.name)) continue;
+    if (candidate.state === 'stopped' || candidate.state === 'error') continue;
+    if (await active(candidate)) byName.set(candidate.name, candidate);
+  }
+  return [...byName.values()];
 }
 
 function memoryGate(
@@ -943,22 +959,26 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
   const searchMemory = deps.searchMemory ?? searchMcpMemoryRecall;
   const listMemorySummaries = deps.listMemorySummaries ?? listMcpMemorySummaries;
   let lastGoodSendSessions: SessionRecord[] | null = null;
-  let lastGoodSendSessionsAt = 0;
   const sendSessions = async (): Promise<SessionRecord[]> => {
-    if (deps.sendDeps?.listSessions) return deps.sendDeps.listSessions();
-    await loadStore({ probe: false });
-    const current = listStoredSessions();
-    const now = Date.now();
-    const selected = shouldUsePreviousSendSessions(
-      caller,
+    // Keep the in-memory directory before disk refresh. A valid but stale
+    // sessions.json snapshot can omit one live SDK/tmux session without being
+    // empty or malformed; replacing the whole store made that target vanish
+    // from both list and send until a later writer restored it.
+    const beforeRefresh = deps.sendDeps?.listSessions
+      ? []
+      : listStoredSessions();
+    if (!deps.sendDeps?.listSessions) await loadStore({ probe: false });
+    const current = deps.sendDeps?.listSessions
+      ? deps.sendDeps.listSessions()
+      : listStoredSessions();
+    const priorCandidates = [...beforeRefresh, ...(lastGoodSendSessions ?? [])];
+    const selected = await mergeAuthoritativelyActiveSendSessions(
       current,
-      lastGoodSendSessions,
-      lastGoodSendSessionsAt,
-      now,
-    ) ? lastGoodSendSessions : current;
+      priorCandidates,
+      deps.sendDeps?.isSessionAuthoritativelyActive ?? defaultSessionAuthorityActive,
+    );
     if (hasSendCaller(caller, selected) || sendVisibleSiblingCount(caller, selected) > 0) {
       lastGoodSendSessions = selected;
-      lastGoodSendSessionsAt = now;
     }
     return selected;
   };
@@ -1486,15 +1506,11 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       const registry = getSupervisionTaskRegistry();
       const existing = registry.getAssignment(mapped.assignmentId);
       if (!existing) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'task_finish rejected: not_found');
-      const outcome = resolveSupervisionIntent({
-        request: { intent: mapped.intent, taskId: existing.taskId, assignmentId: mapped.assignmentId },
-        currentStatus: existing.status,
-      });
-      if (!outcome.ok) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `task_finish rejected: ${outcome.refusal}`);
-      const updated = registry.updateAssignment({
-        assignmentId: mapped.assignmentId, identity,
-        status: (outcome.toStatus ?? existing.status) as never,
-        revision: mapped.metadata.revision, blocker: mapped.metadata.evidence,
+      const updated = registry.finishAssignment({
+        assignmentId: mapped.assignmentId,
+        identity,
+        revision: mapped.metadata.revision,
+        evidence: mapped.metadata.evidence,
       });
       return updated.ok ? { status: 'ok', item: updated.value } : error(MCP_ERROR_REASONS.VALIDATION_FAILED, `task_finish rejected: ${updated.reason}`);
     },
@@ -2005,7 +2021,7 @@ const schemas = {
   }),
   [MEMORY_MCP_TOOL_NAMES.SESSION_RUNTIME_IDENTITY_GET]: z.object({}).strict(),
   [MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE]: z.object({
-    target: z.string().describe('Exact send_list_targets target, not the caller.'),
+    target: z.string().optional().describe('Exact send_list_targets target. May be omitted only with task.autoProvision=true.'),
     message: z.string().describe('The task and the expected output.'),
     deliveryMode: z.enum(Object.values(MEMORY_MCP_SEND_DELIVERY_MODES) as [MemoryMcpSendDeliveryMode, ...MemoryMcpSendDeliveryMode[]])
       .optional()
@@ -2016,11 +2032,14 @@ const schemas = {
       taskId: z.string().optional(), topLevelTaskId: z.string().optional(), sliceId: z.string().optional(), classification: z.enum(SUPERVISION_TASK_CLASSIFICATIONS).optional(),
       objective: z.string().optional(), acceptance: z.array(z.string()).optional(), ownedFiles: z.array(z.string()).optional(), sharedFiles: z.array(z.string()).optional(), dependencies: z.array(z.string()).optional(),
       integrationOwner: z.string().optional(), baseRevision: z.string().optional(), currentRevision: z.string().optional(), auditAttemptId: z.string().optional(), auditRevision: z.string().optional(),
+      executionPool: z.enum(['primary', 'economy']).optional(), autoProvision: z.literal(true).optional(),
+      requestedExecutionType: z.object({ capabilityId: z.string(), agentType: z.string(), providerFamily: z.string(), runtimeType: z.enum(['process', 'transport']), model: z.string() }).strict().optional(),
     }).strict().optional().describe('Optional supervision task metadata; result returns taskId/assignmentId.'),
     audit: z.object({
       kind: z.literal(AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT),
       attemptId: z.string().min(1),
       auditedSessionName: z.string().min(1).describe('Session under audit; not the caller or target.'),
+      strictCrossVendor: z.literal(true).optional().describe('Set only when the user explicitly forbids same-family degradation.'),
     }).strict().optional().describe('Supervision audit metadata; needs reply=true and one exact target.'),
     broadcast: z.boolean().optional().describe('Only when the user says all sessions.'),
     idempotencyKey: z.string().optional().describe('Accepted-send replay key.'),

@@ -77,6 +77,47 @@ export interface AgentDelegationReplyAuthority {
   audit?: AgentDelegationAuditRequest;
 }
 
+export const AGENT_DELEGATION_BLOCKER_REPORT_FIELDS = [
+  'taskId',
+  'assignmentId',
+  'exactError',
+  'completedSafeWork',
+  'recommendedNextAction',
+] as const;
+
+export interface AgentDelegationBlockerContext {
+  taskId: string;
+  assignmentId: string;
+}
+
+export const AGENT_DELEGATION_BLOCKER_ESCALATION_PROMPT =
+  'Delegated blocker escalation: if a worker or auditor encounters a blocker, illegal_transition, contract contradiction, needs Brain adjudication, or cannot safely continue, it must immediately use its authenticated reply-capable channel to report taskId, assignmentId, exactError, completedSafeWork, and recommendedNextAction before waiting. A child-only NEEDS_INPUT message is not a report. The daemon only supplies deduplicated heartbeat/continue reminders and never substitutes audit-result chat.' as const;
+
+/**
+ * Machine-facing escalation contract for delegated work.
+ *
+ * A child session must not turn a local NEEDS_INPUT/illegal-transition into a
+ * silent wait that is visible only after somebody opens that session. The
+ * reply capability is the authenticated return path to the coordinating Brain;
+ * this instruction pins both durable ids so a report cannot be detached from
+ * the assignment that encountered the blocker.
+ */
+export function buildAgentDelegationBlockerReportInstruction(
+  context: AgentDelegationBlockerContext,
+): string {
+  const taskId = context.taskId.trim();
+  const assignmentId = context.assignmentId.trim();
+  if (!taskId || !assignmentId) return '';
+  return [
+    '[Delegated blocker escalation contract]',
+    AGENT_DELEGATION_BLOCKER_ESCALATION_PROMPT,
+    'Do not merely print "needs takeover" in this child session and wait; the user must not have to open child sessions to discover blockers.',
+    `The report result must be one JSON object with exactly these fields: ${AGENT_DELEGATION_BLOCKER_REPORT_FIELDS.join(', ')}.`,
+    `Use taskId=${JSON.stringify(taskId)} and assignmentId=${JSON.stringify(assignmentId)}; exactError must preserve the precise refusal/error, completedSafeWork must list only work safely completed, and recommendedNextAction must request the concrete Brain adjudication or next step.`,
+    'For an audit, peer_audit_reply remains the only PASS/REWORK verdict channel; delegation_reply may be used for this blocker report but must never claim a verdict.',
+  ].join('\n');
+}
+
 export const AGENT_DELEGATION_PURPOSES = {
   SUPERVISION_AUDIT: 'supervision_audit',
 } as const;
@@ -86,6 +127,8 @@ export type AgentDelegationPurpose =
 export interface AgentDelegationAuditRequest {
   kind: typeof AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT;
   attemptId: string;
+  /** Only an explicit user requirement may disable same-family degradation. */
+  strictCrossVendor?: boolean;
   /**
    * The session being audited. REQUIRED for a supervision audit.
    *
@@ -108,6 +151,7 @@ export interface AgentDelegationAuditRequest {
 export function buildAgentDelegationAuditEnvelope(input: {
   attemptId: string;
   auditedSessionName: string;
+  strictCrossVendor?: boolean;
 }): AgentDelegationAuditRequest {
   // Runtime guard, not belt-and-braces. The type alone does NOT make omission
   // impossible: the root tsconfig excludes `test/`, and vitest strips types
@@ -122,6 +166,7 @@ export function buildAgentDelegationAuditEnvelope(input: {
     kind: AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT,
     attemptId: input.attemptId,
     auditedSessionName: input.auditedSessionName,
+    ...(input.strictCrossVendor === true ? { strictCrossVendor: true } : {}),
   };
 }
 

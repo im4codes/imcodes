@@ -3997,6 +3997,39 @@ describe('handleWebCommand transport queue behavior', () => {
     }));
   });
 
+  it('keeps ordinary Brain execution free of automatic supervision contracts while mode is off', async () => {
+    const transportSend = vi.fn(() => 'sent');
+    getSessionMock.mockReturnValue({
+      name: 'deck_transport_brain',
+      projectName: 'transport',
+      role: 'brain',
+      agentType: 'claude-code-sdk',
+      runtimeType: 'transport',
+      state: 'running',
+      transportConfig: { supervision: { mode: 'off' } },
+    });
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'route-transport',
+      send: transportSend,
+      pendingCount: 0,
+    });
+
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_transport_brain',
+      text: 'implement this directly',
+      commandId: 'cmd-supervision-off',
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(transportSend).toHaveBeenCalled();
+    const args = transportSend.mock.calls[0] ?? [];
+    expect(args.map(String).join('\n')).not.toContain('supervision_orchestrator_context_v1');
+    expect(args.map(String).join('\n')).not.toContain('IMCODES_EXEC');
+    expect(registerTaskIntentMock).not.toHaveBeenCalled();
+    expect(queueTaskIntentMock).not.toHaveBeenCalled();
+  });
+
   it('registers eligible supervised task messages immediately when the transport send dispatches now', async () => {
     const transportSend = vi.fn(() => 'sent');
     getSessionMock.mockReturnValue({

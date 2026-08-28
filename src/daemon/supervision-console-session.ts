@@ -12,6 +12,7 @@
 import {
   SUPERVISION_TASK_CONSOLE_MSG,
   SUPERVISION_TASK_CONSOLE_SCHEMA_VERSION,
+  SUPERVISION_CONSOLE_UNAVAILABLE_REASONS,
   isSupervisionTaskConsoleMessageType,
   type SupervisionConsoleResyncReason,
   type SupervisionTaskConsoleDelta,
@@ -26,6 +27,7 @@ export interface SupervisionConsoleSessionDeps {
   /** Fail-closed: absent means deny. */
   authorize: (scope: SupervisionTaskConsoleScope) => boolean;
   now?: () => number;
+  onError?: (error: unknown) => void;
 }
 
 interface ActiveSubscription {
@@ -106,42 +108,54 @@ export class SupervisionConsoleSessionRegistry {
     const afterEventId = typeof record.afterEventId === 'number' && Number.isFinite(record.afterEventId)
       ? record.afterEventId
       : null;
-    if (afterEventId === null) return this.#sendSnapshot(scope, subscriptionId);
+    try {
+      if (afterEventId === null) return this.#sendSnapshot(scope, subscriptionId);
 
-    const clientVersion = typeof record.projectionVersion === 'number' ? record.projectionVersion : 0;
-    const clientEpoch = typeof record.projectionEpoch === 'string' ? record.projectionEpoch : '';
-    const cursor = this.#deps.producer.restoreCursor(scope);
+      const clientVersion = typeof record.projectionVersion === 'number' ? record.projectionVersion : 0;
+      const clientEpoch = typeof record.projectionEpoch === 'string' ? record.projectionEpoch : '';
+      const cursor = this.#deps.producer.restoreCursor(scope);
 
-    if (typeof record.schemaVersion === 'number' && record.schemaVersion !== SUPERVISION_TASK_CONSOLE_SCHEMA_VERSION) {
-      return this.#demandResync(scope, subscriptionId, 'schema_mismatch');
-    }
-    if (typeof record.statusContractVersion === 'number'
-      && record.statusContractVersion !== SUPERVISION_TASK_STATUS_CONTRACT_VERSION) {
-      return this.#demandResync(scope, subscriptionId, 'status_contract_mismatch');
-    }
-    if (clientEpoch !== cursor.projectionEpoch) {
-      return this.#demandResync(scope, subscriptionId, 'authority_epoch_changed');
-    }
+      if (typeof record.schemaVersion === 'number' && record.schemaVersion !== SUPERVISION_TASK_CONSOLE_SCHEMA_VERSION) {
+        return this.#demandResync(scope, subscriptionId, 'schema_mismatch');
+      }
+      if (typeof record.statusContractVersion === 'number'
+        && record.statusContractVersion !== SUPERVISION_TASK_STATUS_CONTRACT_VERSION) {
+        return this.#demandResync(scope, subscriptionId, 'status_contract_mismatch');
+      }
+      if (clientEpoch !== cursor.projectionEpoch) {
+        return this.#demandResync(scope, subscriptionId, 'authority_epoch_changed');
+      }
 
-    const owed = this.#deps.producer.pendingFrames(scope)
-      .filter((row) => row.eventId > afterEventId)
-      .sort((left, right) => left.projectionVersion - right.projectionVersion);
+      const owed = this.#deps.producer.pendingFrames(scope)
+        .filter((row) => row.eventId > afterEventId)
+        .sort((left, right) => left.projectionVersion - right.projectionVersion);
 
-    // Nothing owed: explicitly confirm the current projection. The browser has
-    // already moved to SUBSCRIBING for this new subscription id; silence here
-    // leaves it there forever even though its cursor is current. A snapshot is
-    // the existing authenticated/current acknowledgement and also makes a
-    // restart robust when the browser retained rows but the socket did not.
-    if (owed.length === 0) return this.#sendSnapshot(scope, subscriptionId);
-    // The oldest thing we still hold must be exactly the client's next version.
-    // If the outbox has already been pruned past it we cannot patch the hole.
-    if (owed[0]!.projectionVersion !== clientVersion + 1) {
-      return this.#demandResync(scope, subscriptionId, 'outbox_truncated');
+      // Nothing owed: explicitly confirm the current projection. The browser has
+      // already moved to SUBSCRIBING for this new subscription id; silence here
+      // leaves it there forever even though its cursor is current. A snapshot is
+      // the existing authenticated/current acknowledgement and also makes a
+      // restart robust when the browser retained rows but the socket did not.
+      if (owed.length === 0) return this.#sendSnapshot(scope, subscriptionId);
+      // The oldest thing we still hold must be exactly the client's next version.
+      // If the outbox has already been pruned past it we cannot patch the hole.
+      if (owed[0]!.projectionVersion !== clientVersion + 1) {
+        return this.#demandResync(scope, subscriptionId, 'outbox_truncated');
+      }
+      for (const row of owed) {
+        this.#deps.send({ ...row.frame, subscriptionId });
+      }
+      return true;
+    } catch (error) {
+      this.#deps.onError?.(error);
+      this.#deps.send({
+        type: SUPERVISION_TASK_CONSOLE_MSG.UNAVAILABLE,
+        subscriptionId,
+        scope,
+        reason: SUPERVISION_CONSOLE_UNAVAILABLE_REASONS.PROJECTION_UNAVAILABLE,
+        retryable: true,
+      });
+      return true;
     }
-    for (const row of owed) {
-      this.#deps.send({ ...row.frame, subscriptionId });
-    }
-    return true;
   }
 
   #handleAck(record: Record<string, unknown>): boolean {

@@ -45,6 +45,7 @@ import { emitPeerAuditResult, emitPeerAuditStatus, peerAuditResultEventId } from
 import { PEER_AUDIT_TERMINAL_OUTCOMES } from '../../shared/peer-audit.js';
 import { buildPeerAuditBriefV1 } from './supervision-prompts.js';
 import { cancelQueuedPeerAuditMessage, dispatchPeerAuditMessage } from './session-dispatch.js';
+import { getSupervisionTaskRegistry } from './supervision-state-store.js';
 
 interface AttemptContext {
   brief: string;
@@ -674,6 +675,22 @@ export class PeerAuditService {
       onInvalidReply: () => { controller.invalidReply({ attemptId: envelope.attemptId }); },
       onDeadline: () => { controller.timeout({ attemptId: pending.attemptId, occurredAt: receivedAt }); },
       reduce: (reply) => {
+        const persisted = getSupervisionTaskRegistry().applyMatchingAuditReceipt({
+          attemptId: reply.attemptId,
+          revision: pending.candidateRevision,
+          verdict: reply.verdict,
+          auditedSessionName: pending.auditedSessionName,
+          auditorSessionName: pending.auditorSessionName,
+          findings: reply.findings,
+          now: reply.receivedAt,
+        });
+        // Not every peer audit is attached to a registry task. Missing is the
+        // only benign case; a bound task whose attempt/revision/state fails
+        // validation must reject the structured receipt rather than emit a
+        // PASS that the authoritative registry could not persist.
+        if (!persisted.ok && persisted.reason !== 'not_found') {
+          return { accepted: false };
+        }
         const transition = controller.replyAccepted({
           attemptId: pending.attemptId,
           attemptRevision: reply.controllerRevision,

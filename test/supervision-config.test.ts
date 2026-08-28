@@ -27,6 +27,7 @@ import {
   hasInvalidSessionSupervisionSnapshot,
   getSupportedSupervisionAuditModes,
   isSupportedSupervisionAuditMode,
+  isAutomaticSupervisionEnabled,
   mergeSupervisionCustomInstructions,
   mergeTransportConfigPreservingSupervision,
   normalizeSessionSupervisionSnapshot,
@@ -40,6 +41,14 @@ import {
 } from '../shared/supervision-config.js';
 
 describe('supervision config helpers', () => {
+  it('uses one fail-closed authority for automatic supervision mode', () => {
+    expect(isAutomaticSupervisionEnabled(null)).toBe(false);
+    expect(isAutomaticSupervisionEnabled(undefined)).toBe(false);
+    expect(isAutomaticSupervisionEnabled(SUPERVISION_MODE.OFF)).toBe(false);
+    expect(isAutomaticSupervisionEnabled({ mode: SUPERVISION_MODE.OFF })).toBe(false);
+    expect(isAutomaticSupervisionEnabled(SUPERVISION_MODE.SUPERVISED)).toBe(true);
+    expect(isAutomaticSupervisionEnabled({ mode: SUPERVISION_MODE.SUPERVISED_AUDIT })).toBe(true);
+  });
   it('accepts only the seven supported UI locales for supervision output', () => {
     expect(normalizeSupervisionUiLocale('zh-CN')).toBe('zh-CN');
     expect(normalizeSupervisionUiLocale(' ja ')).toBe('ja');

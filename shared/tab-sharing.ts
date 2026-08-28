@@ -147,6 +147,8 @@ export const SHARE_BROWSER_COMMANDS = {
   SESSION_MODEL_LIST: 'session.model_list',
   SESSION_PRESET_LIST: 'session.preset_list',
   SESSION_SUPERVISION: 'session.supervision',
+  /** Read-only live task projection for one shared MAIN coordinator tab. */
+  SUPERVISION_TASK_CONSOLE_READ: 'supervision.task_console.read',
   SESSION_CANCEL: 'session.cancel',
   SESSION_STOP: 'session.stop',
   SESSION_START: 'session.start',
@@ -219,6 +221,7 @@ export const SHARE_SCOPED_COMMAND_POLICY = {
   [SHARE_BROWSER_COMMANDS.SESSION_MODEL_LIST]: allowParticipant('concrete-tab'),
   [SHARE_BROWSER_COMMANDS.SESSION_PRESET_LIST]: allowParticipant('concrete-tab'),
   [SHARE_BROWSER_COMMANDS.SESSION_SUPERVISION]: allowParticipant('concrete-tab'),
+  [SHARE_BROWSER_COMMANDS.SUPERVISION_TASK_CONSOLE_READ]: allow('concrete-tab'),
   [SHARE_BROWSER_COMMANDS.SESSION_CANCEL]: {
     ...allowParticipant('concrete-tab'),
     requiresObservedDispatchId: true,
@@ -384,6 +387,10 @@ export const SHARE_DAEMON_MESSAGE_TYPES = {
   P2P_RUN_ERROR: 'p2p.run_error',
   P2P_CANCEL_RESPONSE: 'p2p.cancel_response',
   QUEUE_STATE: 'queue.state',
+  SUPERVISION_TASK_CONSOLE_SNAPSHOT: 'supervision.task_console.snapshot',
+  SUPERVISION_TASK_CONSOLE_DELTA: 'supervision.task_console.delta',
+  SUPERVISION_TASK_CONSOLE_RESYNC_REQUIRED: 'supervision.task_console.resync_required',
+  SUPERVISION_TASK_CONSOLE_UNAVAILABLE: 'supervision.task_console.unavailable',
 } as const;
 
 export type ShareDaemonMessageType = (typeof SHARE_DAEMON_MESSAGE_TYPES)[keyof typeof SHARE_DAEMON_MESSAGE_TYPES];
@@ -415,6 +422,10 @@ export const SHARE_SCOPED_DAEMON_MESSAGE_POLICY = {
   [SHARE_DAEMON_MESSAGE_TYPES.P2P_RUN_ERROR]: daemonAllow('server', true),
   [SHARE_DAEMON_MESSAGE_TYPES.P2P_CANCEL_RESPONSE]: daemonAllow('server', true),
   [SHARE_DAEMON_MESSAGE_TYPES.QUEUE_STATE]: daemonAllow('main', true),
+  [SHARE_DAEMON_MESSAGE_TYPES.SUPERVISION_TASK_CONSOLE_SNAPSHOT]: daemonAllow('main', true),
+  [SHARE_DAEMON_MESSAGE_TYPES.SUPERVISION_TASK_CONSOLE_DELTA]: daemonAllow('main', true),
+  [SHARE_DAEMON_MESSAGE_TYPES.SUPERVISION_TASK_CONSOLE_RESYNC_REQUIRED]: daemonAllow('main', true),
+  [SHARE_DAEMON_MESSAGE_TYPES.SUPERVISION_TASK_CONSOLE_UNAVAILABLE]: daemonAllow('main', true),
 } as const satisfies Record<ShareDaemonMessageType, ShareDaemonMessagePolicyEntry>;
 
 export const SHARE_DAEMON_RELAY_INVENTORY = Object.values(SHARE_DAEMON_MESSAGE_TYPES);

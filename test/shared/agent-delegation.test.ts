@@ -19,6 +19,7 @@ import {
   INVALID_DELEGATION_TARGET,
   MIXED_DELEGATION_P2P_FIELDS,
   buildAgentDelegationOrchestrationPrompt,
+  buildAgentDelegationBlockerReportInstruction,
   buildAgentDelegationReplyInstruction,
   buildQuickAgentDelegationTask,
   decodeAgentDelegationReplyEnvelope,
@@ -241,6 +242,22 @@ describe('agent delegation shared contract', () => {
       result: 'ok',
       forged: true,
     })).toEqual({ ok: false, error: 'unknown_field' });
+  });
+
+  it('pins blocker escalation to the durable task and assignment identities', () => {
+    const instruction = buildAgentDelegationBlockerReportInstruction({
+      taskId: 'supervision_task_exact',
+      assignmentId: 'supervision_assignment_exact',
+    });
+    expect(instruction).toContain('blocker, illegal_transition, contract contradiction');
+    expect(instruction).toContain('must immediately use its authenticated reply-capable channel');
+    expect(instruction).toContain('taskId="supervision_task_exact"');
+    expect(instruction).toContain('assignmentId="supervision_assignment_exact"');
+    for (const field of ['exactError', 'completedSafeWork', 'recommendedNextAction']) {
+      expect(instruction).toContain(field);
+    }
+    expect(instruction).toContain('must never claim a verdict');
+    expect(buildAgentDelegationBlockerReportInstruction({ taskId: '', assignmentId: 'a' })).toBe('');
   });
 
   it('renders supervision-audit reply authorities as peer_audit_reply instructions, not free-text delegation replies', () => {

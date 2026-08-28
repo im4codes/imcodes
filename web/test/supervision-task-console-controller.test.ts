@@ -109,6 +109,53 @@ describe('SupervisionTaskConsoleController', () => {
     });
   });
 
+  it('surfaces a strictly correlated projection-unavailable response instead of spinning forever', () => {
+    const socket = new FakeSocket();
+    const controller = new SupervisionTaskConsoleController(socket, SCOPE);
+    controller.start();
+    controller.setConnected(true);
+    const subscribe = latest<{ subscriptionId: string }>(socket, SUPERVISION_TASK_CONSOLE_MSG.SUBSCRIBE);
+
+    socket.emit({
+      type: SUPERVISION_TASK_CONSOLE_MSG.UNAVAILABLE,
+      subscriptionId: subscribe.subscriptionId,
+      scope: SCOPE,
+      reason: 'projection_unavailable',
+      retryable: true,
+    });
+
+    expect(controller.getState()).toMatchObject({
+      phase: SUPERVISION_TASK_CONSOLE_PHASE.ERROR,
+      error: 'projection_unavailable',
+    });
+  });
+
+  it('ignores stale, cross-scope, and non-canonical unavailable frames', () => {
+    const socket = new FakeSocket();
+    const controller = new SupervisionTaskConsoleController(socket, SCOPE);
+    controller.start();
+    controller.setConnected(true);
+    const subscribe = latest<{ subscriptionId: string }>(socket, SUPERVISION_TASK_CONSOLE_MSG.SUBSCRIBE);
+    const unavailable = {
+      type: SUPERVISION_TASK_CONSOLE_MSG.UNAVAILABLE,
+      subscriptionId: subscribe.subscriptionId,
+      scope: SCOPE,
+      reason: 'projection_unavailable',
+      retryable: true,
+    } as const;
+
+    socket.emit({ ...unavailable, subscriptionId: 'stale-subscription' });
+    socket.emit({ ...unavailable, scope: { ...SCOPE, projectName: 'other' } });
+    socket.emit({ ...unavailable, extra: true });
+    socket.emit({ ...unavailable, retryable: false });
+
+    expect(controller.getState()).toMatchObject({
+      phase: SUPERVISION_TASK_CONSOLE_PHASE.SUBSCRIBING,
+      subscriptionId: subscribe.subscriptionId,
+      error: null,
+    });
+  });
+
   it('surfaces daemon/browser disconnects and recovers only after authority reconnects', () => {
     const socket = new FakeSocket();
     const controller = new SupervisionTaskConsoleController(socket, SCOPE);

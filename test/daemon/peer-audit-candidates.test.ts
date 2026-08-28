@@ -2,10 +2,12 @@ import { describe, expect, it } from 'vitest';
 import { EXECUTION_CLONE_KIND } from '../../shared/execution-clone.js';
 import type { SessionRecord } from '../../src/store/session-store.js';
 import {
+  evaluateBrainAuditRoutePolicy,
   resolvePeerAuditCandidate,
   resolvePeerAuditCandidateList,
   revalidatePeerAuditCandidateSelection,
 } from '../../src/daemon/peer-audit-candidates.js';
+import { DELEGATION_AVAILABILITY } from '../../shared/delegation-availability.js';
 
 function session(name: string, patch: Partial<SessionRecord> = {}): SessionRecord {
   const isMain = name.endsWith('_brain');
@@ -41,6 +43,56 @@ function candidate(
 }
 
 describe('peer-audit candidate authority', () => {
+  it('prefers a usable cross-vendor candidate but permits a distinct same-family fallback when none is routable', () => {
+    const main = session('deck_proj_brain');
+    const audited = session('deck_sub_audited', { parentSession: main.name, providerId: 'openai' });
+    const same = session('deck_sub_same', { parentSession: main.name, providerId: 'openai' });
+    const cross = session('deck_sub_cross', { parentSession: main.name, providerId: 'anthropic', agentType: 'claude-code-sdk' });
+    const all = [main, audited, same, cross];
+
+    expect(evaluateBrainAuditRoutePolicy({
+      auditedSessionName: audited.name,
+      targetName: same.name,
+      allSessions: all,
+      availability: new Map([
+        [same.name, { availability: DELEGATION_AVAILABILITY.READY, limitGroup: 'codex' }],
+        [cross.name, { availability: DELEGATION_AVAILABILITY.READY, limitGroup: 'claude' }],
+      ]),
+    })).toEqual({ ok: true, auditRoutingReason: 'brain_selected_same_family' });
+
+    expect(evaluateBrainAuditRoutePolicy({
+      auditedSessionName: audited.name,
+      targetName: same.name,
+      allSessions: all,
+      availability: new Map([
+        [same.name, { availability: DELEGATION_AVAILABILITY.READY, limitGroup: 'codex' }],
+        [cross.name, { availability: DELEGATION_AVAILABILITY.LIMITED, limitGroup: 'claude' }],
+      ]),
+    })).toEqual({ ok: true, auditRoutingReason: 'same_family_degraded', degradedReason: 'cross_vendor_limited' });
+  });
+
+  it('blocks same-family degradation in strict mode and always rejects self-audit', () => {
+    const main = session('deck_proj_brain');
+    const audited = session('deck_sub_audited', { parentSession: main.name, providerId: 'openai' });
+    const same = session('deck_sub_same', { parentSession: main.name, providerId: 'openai' });
+    const all = [main, audited, same];
+    const availability = new Map([[same.name, { availability: DELEGATION_AVAILABILITY.READY, limitGroup: 'codex' as const }]]);
+
+    expect(evaluateBrainAuditRoutePolicy({
+      auditedSessionName: audited.name,
+      targetName: same.name,
+      allSessions: all,
+      availability,
+      strictCrossVendor: true,
+    })).toMatchObject({ ok: false, degradedReason: 'no_cross_vendor_configured' });
+    expect(evaluateBrainAuditRoutePolicy({
+      auditedSessionName: audited.name,
+      targetName: audited.name,
+      allSessions: all,
+      availability,
+    })).toMatchObject({ ok: false, degradedReason: 'no_independent_session' });
+  });
+
   it('accepts main-to-direct-child and sub-to-sibling relationships', () => {
     const main = session('deck_proj_brain');
     const child = session('deck_sub_child', { parentSession: main.name });

@@ -10,7 +10,7 @@ import {
   parseTaskRunTerminalStateFromText,
   SUPERVISION_DEFAULT_TIMEOUT_MS,
   SUPERVISION_MIN_TIMEOUT_MS,
-  SUPERVISION_MODE,
+  isAutomaticSupervisionEnabled,
   SUPERVISION_UNAVAILABLE_REASONS,
   type SessionSupervisionSnapshot,
   type SupervisionUnavailableReason,
@@ -470,7 +470,7 @@ export class SupervisionBroker {
 
   async decide(request: SupervisionBrokerRequest): Promise<SupervisionDecision> {
     const snapshot = request.snapshot;
-    if (!snapshot || snapshot.mode === SUPERVISION_MODE.OFF) {
+    if (!isAutomaticSupervisionEnabled(snapshot)) {
       return askHuman('supervision disabled');
     }
     if (!snapshot.backend || !snapshot.model) {

@@ -32,10 +32,12 @@ export const MCP_TOOL_SURFACE_RAW_BUDGET_BYTES = 45_000;
  * runtime-identity and exact-alias bootstrap in
  * MCP_TOOL_DISCOVERY_DEFAULT_ACTIVE. All other schemas are explicit-on-demand.
  * The bound is intentionally tight so a new eager schema cannot quietly erase
- * the lazy-loading reduction. Full-surface authored/raw dual accounting below is
- * unchanged and continues to guard the complete activated catalog.
+ * the lazy-loading reduction. The 23k ceiling includes send_message's required
+ * automatic-pool execution identity: that metadata is part of the core dispatch
+ * contract and cannot be hidden without making supervised dispatch fail before
+ * discovery. Full-surface authored/raw dual accounting below remains unchanged.
  */
-export const MCP_TOOL_SURFACE_BOOTSTRAP_BUDGET_BYTES = 22_000;
+export const MCP_TOOL_SURFACE_BOOTSTRAP_BUDGET_BYTES = 23_000;
 
 export interface McpSurfaceRemoval {
   /** Dotted path of the containing object, for diagnosis when an assert fails. */

@@ -1,9 +1,14 @@
 import { DatabaseSync } from 'node:sqlite';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { beforeEach, describe, expect, it } from 'vitest';
 import {
-  createSupervisionConsoleBinding, isAuthorizedSupervisionConsoleScope, resolveSupervisionProjectionEpoch,
+  createProductionSupervisionConsoleBinding, createSupervisionConsoleBinding,
+  isAuthorizedSupervisionConsoleScope, resolveSupervisionProjectionEpoch,
   type SupervisionConsoleLink,
 } from '../../src/daemon/supervision-console-binding.js';
+import { SupervisionTaskRegistry } from '../../src/daemon/supervision-state-store.js';
 import type { SupervisionMigrationDb } from '../../src/daemon/supervision-store-migrations.js';
 import {
   SUPERVISION_TASK_CONSOLE_MSG, SUPERVISION_TASK_CONSOLE_SCHEMA_VERSION,
@@ -223,6 +228,153 @@ describe('producer -> link -> browser E2E', () => {
     expect(browser.applied).toEqual([]);
     expect(browser.resyncs).toEqual([]);
     expect(binding.sessions.refusedCount).toBe(1);
+  });
+});
+
+describe('production registry database composition', () => {
+  function subscribeToProduction(databasePath: string | undefined, subscriptionId: string) {
+    const sent: unknown[] = [];
+    const handlers: Array<(message: unknown) => void> = [];
+    const production = createProductionSupervisionConsoleBinding({
+      ...(databasePath ? { databasePath } : {}),
+      serverLink: {
+        send: (message) => { sent.push(message); },
+        onMessage: (handler) => { handlers.push(handler); },
+      },
+      authorize: () => true,
+      now: () => 7,
+      newEpoch: () => 'production-epoch',
+    });
+    for (const handler of handlers) {
+      handler({
+        type: SUPERVISION_TASK_CONSOLE_MSG.SUBSCRIBE,
+        subscriptionId,
+        scope: SCOPE,
+        afterEventId: null,
+        reason: 'initial',
+      });
+    }
+    return { production, sent };
+  }
+
+  it('uses the state-store path authority without a second lifecycle filename', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'imcodes-console-canonical-path-'));
+    const databasePath = join(dir, 'supervision-state.sqlite');
+    const previousPath = process.env.IMCODES_SUPERVISION_STATE_DB_PATH;
+    process.env.IMCODES_SUPERVISION_STATE_DB_PATH = databasePath;
+    try {
+      const registry = new SupervisionTaskRegistry();
+      expect(registry.createOrGet({
+        taskId: 'task-canonical-path', projectName: SCOPE.projectName, objective: 'single path seam',
+      }).ok).toBe(true);
+      registry.close();
+
+      const { production, sent } = subscribeToProduction(undefined, 'sub-canonical-path');
+      expect(production.databasePath).toBe(databasePath);
+      expect(sent).toEqual([expect.objectContaining({
+        type: SUPERVISION_TASK_CONSOLE_MSG.SNAPSHOT,
+        tasks: [expect.objectContaining({ taskId: 'task-canonical-path' })],
+      })]);
+      production.close();
+    } finally {
+      if (previousPath === undefined) delete process.env.IMCODES_SUPERVISION_STATE_DB_PATH;
+      else process.env.IMCODES_SUPERVISION_STATE_DB_PATH = previousPath;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('returns an authoritative version-0 empty snapshot from the real registry database', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'imcodes-console-empty-'));
+    const databasePath = join(dir, 'supervision-state.sqlite');
+    try {
+      const registry = new SupervisionTaskRegistry({ dbPath: databasePath });
+      registry.close();
+
+      const { production, sent } = subscribeToProduction(databasePath, 'sub-empty');
+      expect(sent).toEqual([expect.objectContaining({
+        type: SUPERVISION_TASK_CONSOLE_MSG.SNAPSHOT,
+        subscriptionId: 'sub-empty',
+        scope: SCOPE,
+        projectionVersion: 0,
+        lastDurableEventId: null,
+        tasks: [],
+        assignments: [],
+      })]);
+      production.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('projects non-empty authoritative registry rows from that same database', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'imcodes-console-nonempty-'));
+    const databasePath = join(dir, 'supervision-state.sqlite');
+    try {
+      const registry = new SupervisionTaskRegistry({ dbPath: databasePath });
+      const created = registry.createOrGet({
+        taskId: 'task-authoritative',
+        projectName: SCOPE.projectName,
+        objective: 'authoritative console row',
+      });
+      expect(created.ok).toBe(true);
+      registry.close();
+
+      const { production, sent } = subscribeToProduction(databasePath, 'sub-nonempty');
+      expect(sent).toHaveLength(1);
+      expect(sent[0]).toMatchObject({
+        type: SUPERVISION_TASK_CONSOLE_MSG.SNAPSHOT,
+        subscriptionId: 'sub-nonempty',
+        tasks: [expect.objectContaining({ taskId: 'task-authoritative' })],
+      });
+      production.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('answers a wrong-database projection failure with a correlated unavailable frame', () => {
+    const wrongDatabase = new DatabaseSync(':memory:');
+    new SupervisionTaskRegistry({ database: wrongDatabase });
+    const sent: unknown[] = [];
+    const errors: unknown[] = [];
+    const handlers: Array<(message: unknown) => void> = [];
+    const wrongBinding = createSupervisionConsoleBinding({
+      database: wrongDatabase as unknown as SupervisionMigrationDb,
+      serverLink: {
+        send: (message) => { sent.push(message); },
+        onMessage: (handler) => { handlers.push(handler); },
+      },
+      authorize: () => true,
+      onError: (error) => { errors.push(error); },
+    });
+    // Reproduce the shipped failure at the real fault boundary: startup has a
+    // migration-shaped database, but the subscribe-time authority query lands
+    // on a file without the registry table. The old broad link catch swallowed
+    // this `no such table` error and left the browser SUBSCRIBING forever.
+    wrongDatabase.exec('DROP TABLE supervision_tasks;');
+
+    for (const handler of handlers) {
+      handler({
+        type: SUPERVISION_TASK_CONSOLE_MSG.SUBSCRIBE,
+        subscriptionId: 'sub-wrong-db',
+        scope: SCOPE,
+        afterEventId: null,
+        reason: 'initial',
+      });
+    }
+
+    expect(errors).toHaveLength(1);
+    expect(sent).toEqual([{
+      type: SUPERVISION_TASK_CONSOLE_MSG.UNAVAILABLE,
+      subscriptionId: 'sub-wrong-db',
+      scope: SCOPE,
+      reason: 'projection_unavailable',
+      retryable: true,
+    }]);
+    expect(sent.some((frame) => (
+      (frame as { type?: unknown }).type === SUPERVISION_TASK_CONSOLE_MSG.SNAPSHOT
+    ))).toBe(false);
+    wrongDatabase.close();
   });
 });
 

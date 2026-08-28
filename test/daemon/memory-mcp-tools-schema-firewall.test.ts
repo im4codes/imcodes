@@ -711,6 +711,54 @@ describe('memory MCP tool schema firewall', () => {
     await expect(handlers[MEMORY_MCP_TOOL_NAMES.SESSION_RUNTIME_IDENTITY_GET]({ sessionName: 'deck_proj_w1', model: 'opus' })).resolves.toMatchObject({ status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED });
   });
 
+  it('retains an omitted live target from the authoritative directory but rejects an explicit stopped record', async () => {
+    const self = sessionRecord({
+      sessionInstanceId: 'self-instance', runtimeEpoch: 'self-epoch', runtimeType: 'transport',
+    });
+    const peer = sessionRecord({
+      name: 'deck_proj_w1', role: 'w1', sessionInstanceId: 'peer-instance', runtimeEpoch: 'peer-epoch',
+      agentType: 'claude-code-sdk', runtimeType: 'transport', userCreated: true,
+    });
+    let snapshot = [self, peer];
+    const dispatchMessage = vi.fn(async () => undefined);
+    const authoritative = vi.fn(async (candidate: SessionRecord) => candidate.name === peer.name);
+    const handlers = createMemoryMcpToolHandlers(caller(), {
+      sendDeps: {
+        listSessions: () => snapshot,
+        dispatchMessage,
+        isSessionAuthoritativelyActive: authoritative,
+      },
+    });
+
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS]({})).resolves.toMatchObject({
+      status: 'ok', items: [expect.objectContaining({ target: peer.name })],
+    });
+
+    // Deterministic snapshot race: the directory refresh omits only the live
+    // peer. No timer is advanced; authority answers synchronously from the
+    // runtime directory and both list + send retain the same target.
+    snapshot = [self];
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS]({})).resolves.toMatchObject({
+      status: 'ok', items: [expect.objectContaining({ target: peer.name })],
+    });
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE]({
+      target: peer.name, message: 'continue after snapshot race',
+    })).resolves.toMatchObject({ status: 'accepted' });
+    expect(dispatchMessage).toHaveBeenCalledTimes(1);
+    expect(authoritative).toHaveBeenCalledWith(expect.objectContaining({ name: peer.name }));
+
+    // An explicit stopped record is newer authority, not an omission. It must
+    // never be resurrected by the previous-good snapshot.
+    snapshot = [self, { ...peer, state: 'stopped' as const }];
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS]({})).resolves.toMatchObject({
+      status: 'ok', items: [],
+    });
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE]({
+      target: peer.name, message: 'must reject stopped',
+    })).resolves.toMatchObject({ status: 'error' });
+    expect(dispatchMessage).toHaveBeenCalledTimes(1);
+  });
+
   it('does not forward forged cron identity fields to the cron client', async () => {
     const cronCreate = vi.fn(async () => ({ status: 'ok', body: { id: 'job-1' } }));
     const handlers = createMemoryMcpToolHandlers(caller(), {

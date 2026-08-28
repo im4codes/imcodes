@@ -16,6 +16,8 @@ import { resolveExactDelegationTarget } from './session-dispatch.js';
 import type { SessionRecord } from '../store/session-store.js';
 import { CODEBUDDY_PROVIDER_IDS } from '../../shared/codebuddy.js';
 import { HERMES_AGENT_PROVIDER_ID } from '../../shared/hermes-agent.js';
+import { DELEGATION_AVAILABILITY, type DelegationTargetAvailability } from '../../shared/delegation-availability.js';
+import type { SupervisionAuditDegradedReason } from '../../shared/supervision-execution-pool.js';
 
 const UNKNOWN_DIMENSION = PEER_AUDIT_UNKNOWN_IDENTITY;
 
@@ -362,6 +364,72 @@ export type BrainAuditRouteRefusal =
 export type BrainAuditRouteResult =
   | { ok: true }
   | { ok: false; refusal: BrainAuditRouteRefusal; detail: string };
+
+export type BrainAuditRoutePolicyResult =
+  | { ok: true; auditRoutingReason: 'cross_vendor_preferred' }
+  | { ok: true; auditRoutingReason: 'same_family_degraded'; degradedReason: SupervisionAuditDegradedReason }
+  | { ok: true; auditRoutingReason: 'brain_selected_same_family' }
+  | { ok: false; detail: string; degradedReason: SupervisionAuditDegradedReason };
+
+function unavailableCrossVendorReason(
+  candidates: readonly PeerAuditCandidate[],
+  availability: ReadonlyMap<string, DelegationTargetAvailability>,
+): SupervisionAuditDegradedReason {
+  if (candidates.length === 0) return 'no_cross_vendor_configured';
+  const states = candidates.map((candidate) => availability.get(candidate.name)?.availability ?? DELEGATION_AVAILABILITY.UNKNOWN);
+  if (states.every((state) => state === DELEGATION_AVAILABILITY.LIMITED)) return 'cross_vendor_limited';
+  if (states.every((state) => state === DELEGATION_AVAILABILITY.OFFLINE)) return 'cross_vendor_offline';
+  return 'cross_vendor_unavailable';
+}
+
+/**
+ * Classify the exact Brain-selected route without selecting a target.
+ * Cross-vendor is preferred; same-family is accepted only when every eligible
+ * cross-vendor session is unavailable. The decision is returned for durable
+ * task/receipt projection and is never rendered into ordinary chat.
+ */
+export function evaluateBrainAuditRoutePolicy(input: {
+  auditedSessionName: string;
+  targetName: string;
+  allSessions: readonly SessionRecord[];
+  availability: ReadonlyMap<string, DelegationTargetAvailability>;
+  strictCrossVendor?: boolean;
+}): BrainAuditRoutePolicyResult {
+  const audited = input.allSessions.find((session) => session.name === input.auditedSessionName);
+  const target = input.allSessions.find((session) => session.name === input.targetName);
+  if (!audited || !target || audited.name === target.name) {
+    return { ok: false, detail: 'no independent auditor session is available', degradedReason: 'no_independent_session' };
+  }
+  const auditedFamily = resolvePeerAuditProviderFamily(audited);
+  if (resolvePeerAuditProviderFamily(target) !== auditedFamily) {
+    return { ok: true, auditRoutingReason: 'cross_vendor_preferred' };
+  }
+
+  const listed = resolvePeerAuditCandidateList({ auditedSessionName: audited.name, allSessions: input.allSessions });
+  if (!listed.ok) {
+    return { ok: false, detail: 'audit candidate authority is unavailable', degradedReason: 'cross_vendor_unavailable' };
+  }
+  const crossVendor = listed.list.candidates.filter((candidate) => (
+    candidate.eligible && candidate.providerFamily !== auditedFamily
+  ));
+  const usableCrossVendor = crossVendor.filter((candidate) => {
+    const state = input.availability.get(candidate.name)?.availability;
+    return state === DELEGATION_AVAILABILITY.READY || state === DELEGATION_AVAILABILITY.BUSY;
+  });
+  const degradedReason = unavailableCrossVendorReason(crossVendor, input.availability);
+  if (input.strictCrossVendor) {
+    return { ok: false, detail: 'the user required a cross-vendor auditor', degradedReason };
+  }
+  if (usableCrossVendor.length > 0) {
+    // The daemon may never substitute the target the Brain named. An explicit
+    // same-family route remains deliverable for manual/Quick audit, but it is
+    // projected distinctly so it cannot masquerade as an availability-driven
+    // degradation. Pool auto-routing never takes this branch: it selects the
+    // usable cross-vendor target before calling the exact-route validator.
+    return { ok: true, auditRoutingReason: 'brain_selected_same_family' };
+  }
+  return { ok: true, auditRoutingReason: 'same_family_degraded', degradedReason };
+}
 
 /**
  * Validate the EXACT audit route the Supervisor Brain supplied.

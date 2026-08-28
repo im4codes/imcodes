@@ -297,6 +297,7 @@ import { GitOriginRepositoryIdentityService } from '../agent/repository-identity
 import {
   SUPERVISION_MODE,
   extractSessionSupervisionSnapshot,
+  isAutomaticSupervisionEnabled,
   isSupportedSupervisionTargetSessionType,
   normalizeSupervisionUiLocale,
 } from '../../shared/supervision-config.js';
@@ -3942,8 +3943,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   const supervisionSnapshot = persistedSupervisionSnapshot && requestedUiLocale
     ? { ...persistedSupervisionSnapshot, uiLocale: requestedUiLocale }
     : persistedSupervisionSnapshot;
-  const shouldTrackSupervisionTaskRun = supervisionSnapshot != null
-    && supervisionSnapshot.mode !== SUPERVISION_MODE.OFF
+  const shouldTrackSupervisionTaskRun = isAutomaticSupervisionEnabled(supervisionSnapshot)
     && isEligibleSupervisionTaskText(displayText);
   const agentMessagePreamble = mergeAgentMessagePreambles(
     preferenceMessagePreamble,

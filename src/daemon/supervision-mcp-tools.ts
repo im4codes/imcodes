@@ -52,7 +52,11 @@ const RECOVERY_FORBIDDEN_SOURCES: readonly SupervisionTaskLifecycleStatus[] =
  */
 export interface SupervisionVisibilityItem {
   taskId?: string;
-  assignments?: ReadonlyArray<{ identity?: { sessionName?: string } }>;
+  status?: string;
+  assignments?: ReadonlyArray<{
+    assignmentId?: string;
+    identity?: { sessionName?: string };
+  }>;
 }
 
 /**
@@ -106,12 +110,17 @@ export interface SupervisionRegistryPort {
   getStatus(taskId: string): string | undefined;
   applyIntent(input: {
     taskId: string;
+    assignmentId?: string;
     intent: SupervisionIntent;
     toStatus: SupervisionTaskLifecycleStatus | null;
     validationState?: string;
     note?: string;
-  }): void;
-  list(filter: { status?: string; topLevelTaskId?: string; ownerSessionName?: string }): SupervisionVisibilityItem[];
+  }): void | { ok: true; value?: unknown; replay?: boolean } | { ok: false; reason: string };
+  finishAssignment?(input: {
+    assignmentId: string;
+    callerSessionName: string;
+  }): { ok: true; value: unknown; replay?: boolean } | { ok: false; reason: string };
+  list(filter: { projectName?: string; status?: string; topLevelTaskId?: string; ownerSessionName?: string }): SupervisionVisibilityItem[];
   get(taskId: string): SupervisionVisibilityItem | undefined;
   recover(input: { taskId: string; toStatus: SupervisionRecoveryTargetStatus; reason: string }): void;
 }
@@ -121,6 +130,8 @@ export interface SupervisionMcpToolDeps {
   registry?: SupervisionRegistryPort;
   /** Fail-closed administrative gate for recover. */
   isAdmin?: (caller: McpRuntimeCaller) => boolean;
+  /** Live daemon identity gate; caller fields alone never establish Brain authority. */
+  isProjectBrain?: (caller: McpRuntimeCaller) => boolean;
 }
 
 function ok(value: ToolResult): ToolResult { return { status: 'ok', ...value }; }
@@ -164,8 +175,8 @@ const DESCRIPTIONS: Record<SupervisionMcpToolName, string> = {
   // Kept terse on purpose: every byte here is published to every MCP client and
   // the shared tool surface is already over its size budget.
   [SUPERVISION_MCP_TOOLS.INTENT]: 'Advance a supervision task by intent; the daemon owns the status.',
-  [SUPERVISION_MCP_TOOLS.LIST]: 'List supervision tasks you participate in.',
-  [SUPERVISION_MCP_TOOLS.GET]: 'Read one supervision task you participate in.',
+  [SUPERVISION_MCP_TOOLS.LIST]: 'List project tasks for its Brain, otherwise tasks you participate in.',
+  [SUPERVISION_MCP_TOOLS.GET]: 'Read a project task as its Brain, otherwise a task you participate in.',
   [SUPERVISION_MCP_TOOLS.RECOVER]: 'Admin recovery to a restricted status.',
 };
 
@@ -175,6 +186,7 @@ export function createSupervisionMcpToolHandlers(
 ): Record<SupervisionMcpToolName, (args?: unknown) => Promise<ToolResult>> {
   const registry = deps.registry;
   const isAdmin = deps.isAdmin ?? (() => false);
+  const isProjectBrain = deps.isProjectBrain ?? (() => false);
   // Fail closed: no caller session means no default scope and no participation.
   const callerSession = typeof (caller as { sessionName?: unknown })?.sessionName === 'string'
     ? (caller as { sessionName: string }).sessionName
@@ -186,6 +198,33 @@ export function createSupervisionMcpToolHandlers(
       const input = (args ?? {}) as Record<string, unknown>;
       const reg = need();
       if (!reg) return err('unavailable', 'supervision registry not bound');
+      const taskId = String(input.taskId ?? '');
+      const task = reg.get(taskId);
+      const requestedAssignmentId = input.assignmentId === undefined ? undefined : String(input.assignmentId);
+      const callerAssignments = (task?.assignments ?? []).filter(
+        (assignment) => assignment.identity?.sessionName === callerSession && assignment.assignmentId,
+      );
+      const boundAssignmentId = requestedAssignmentId
+        ? callerAssignments.find((assignment) => assignment.assignmentId === requestedAssignmentId)?.assignmentId
+        : callerAssignments.length === 1 ? callerAssignments[0]?.assignmentId : undefined;
+      if (requestedAssignmentId && !boundAssignmentId) {
+        return err('identity_rejected', 'assignment is not visible to this caller');
+      }
+      // `finish` is assignment-scoped. A matching structured audit may have
+      // arrived while the durable task was still ready_for_audit (or a legacy
+      // task/assignment pair was desynchronised), so applying the task-level
+      // transition table first made the only valid terminal edge unreachable.
+      // The registry verifies the exact audit revision/attempt and atomically
+      // revokes this assignment's lease and claims.
+      if (String(input.intent ?? '') === 'finish' && boundAssignmentId && reg.finishAssignment) {
+        if (input.status !== undefined) {
+          return err('model_supplied_status', 'Lifecycle status is daemon-owned; send an intent instead.');
+        }
+        const finished = reg.finishAssignment({ assignmentId: boundAssignmentId, callerSessionName: callerSession });
+        return finished.ok
+          ? ok({ intent: 'finish', fromStatus: task?.status ?? reg.getStatus(taskId), toStatus: (finished.value as { status?: unknown }).status ?? null, item: finished.value, idempotentReplay: finished.replay === true })
+          : err(finished.reason, `task finish rejected: ${finished.reason}`);
+      }
       // Delegates to the audited pure state machine; the status-rejection and
       // transition table live there, not restated here.
       const outcome = resolveSupervisionIntent({
@@ -197,16 +236,18 @@ export function createSupervisionMcpToolHandlers(
           note: input.note === undefined ? undefined : String(input.note),
           status: input.status,
         },
-        currentStatus: reg.getStatus(String(input.taskId ?? '')),
+        currentStatus: reg.getStatus(taskId),
       });
       if (!outcome.ok) return err(outcome.refusal ?? 'refused', outcome.detail);
-      reg.applyIntent({
-        taskId: String(input.taskId),
+      const applied = reg.applyIntent({
+        taskId,
+        ...(boundAssignmentId ? { assignmentId: boundAssignmentId } : {}),
         intent: outcome.intent!,
         toStatus: outcome.toStatus ?? null,
         validationState: outcome.validationState,
         note: input.note === undefined ? undefined : String(input.note),
       });
+      if (applied && !applied.ok) return err(applied.reason, `task intent rejected: ${applied.reason}`);
       return ok({
         intent: outcome.intent, fromStatus: outcome.fromStatus,
         toStatus: outcome.toStatus ?? null, validationState: outcome.validationState,
@@ -222,6 +263,25 @@ export function createSupervisionMcpToolHandlers(
       // handler directly must not be able to widen the filter.
       if (status !== undefined && !isSupervisionTaskLifecycleStatus(status)) {
         return err('invalid_status', 'status must be a fixed lifecycle id');
+      }
+      const projectName = caller.projectName?.trim() || '';
+      if (projectName && isProjectBrain(caller)) {
+        const explicitOwner = input.ownerSessionName === undefined
+          ? input.target === undefined ? undefined : String(input.target)
+          : String(input.ownerSessionName);
+        if (input.target !== undefined && input.ownerSessionName !== undefined
+          && String(input.target) !== String(input.ownerSessionName)) {
+          return err('conflicting_owner_filter', 'target and ownerSessionName disagree');
+        }
+        return ok({
+          tasks: reg.list({
+            projectName,
+            status,
+            topLevelTaskId: input.topLevelTaskId === undefined ? undefined : String(input.topLevelTaskId),
+            ...(explicitOwner ? { ownerSessionName: explicitOwner } : {}),
+          }),
+          ownerScope: 'project_brain',
+        });
       }
       const scope = resolveSupervisionOwnerScope({
         target: input.target === undefined ? undefined : String(input.target),
@@ -250,7 +310,12 @@ export function createSupervisionMcpToolHandlers(
       // Deliberately the SAME refusal for "does not exist" and "exists but you
       // are not a participant". Distinguishing them would turn this tool into an
       // existence oracle for other coordinators' task ids.
-      if (!task || !supervisionCallerParticipates(task, callerSession)) {
+      const taskProjectName = typeof (task as { projectName?: unknown } | undefined)?.projectName === 'string'
+        ? String((task as { projectName: string }).projectName)
+        : '';
+      const brainMayRead = Boolean(task && caller.projectName && isProjectBrain(caller)
+        && taskProjectName === caller.projectName);
+      if (!task || (!brainMayRead && !supervisionCallerParticipates(task, callerSession))) {
         return err('identity_rejected', 'task is not visible to this caller');
       }
       return ok({ task });

@@ -8,6 +8,7 @@ import { SUPERVISION_MODE, normalizeSessionSupervisionSnapshot } from '../../sha
 import {
   SUPERVISION_STATE_VERSION,
   SupervisionStateStore,
+  SupervisionTaskRegistry,
   getSupervisionStateStore,
   resetSupervisionStateStoreForTests,
   type PersistedSupervisionWaitState,
@@ -68,6 +69,32 @@ function state(overrides: Partial<PersistedSupervisionWaitState> = {}): Persiste
 }
 
 describe('SupervisionStateStore', () => {
+  it('shares one canonical database path with the authoritative task registry', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'imcodes-supervision-authority-'));
+    const dbPath = join(dir, 'supervision-state.sqlite');
+    const previousPath = process.env.IMCODES_SUPERVISION_STATE_DB_PATH;
+    process.env.IMCODES_SUPERVISION_STATE_DB_PATH = dbPath;
+    try {
+      const waitStore = new SupervisionStateStore();
+      const taskRegistry = new SupervisionTaskRegistry();
+      waitStore.upsert(state());
+      expect(taskRegistry.createOrGet({
+        taskId: 'task-one-db', projectName: 'codedeck', objective: 'one database authority',
+      }).ok).toBe(true);
+      waitStore.close();
+      taskRegistry.close();
+
+      const database = new DatabaseSync(dbPath);
+      expect(database.prepare('SELECT COUNT(*) AS count FROM supervision_wait_states').get()).toEqual({ count: 1 });
+      expect(database.prepare('SELECT COUNT(*) AS count FROM supervision_tasks').get()).toEqual({ count: 1 });
+      database.close();
+    } finally {
+      if (previousPath === undefined) delete process.env.IMCODES_SUPERVISION_STATE_DB_PATH;
+      else process.env.IMCODES_SUPERVISION_STATE_DB_PATH = previousPath;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('degrades to a no-op store instead of crashing startup on a corrupt database', () => {
     const dir = mkdtempSync(join(tmpdir(), 'imcodes-supervision-corrupt-'));
     const dbPath = join(dir, 'state.sqlite');

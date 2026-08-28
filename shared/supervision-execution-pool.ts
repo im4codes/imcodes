@@ -15,8 +15,48 @@ export const SUPERVISION_AUDIT_ROUTING_REASONS = [
   'cross_vendor_preferred',
   'no_cross_vendor_available',
   'same_family_degraded',
+  'brain_selected_same_family',
 ] as const;
 export type SupervisionAuditRoutingReason = typeof SUPERVISION_AUDIT_ROUTING_REASONS[number];
+
+export const SUPERVISION_AUDIT_DEGRADED_REASONS = [
+  'no_cross_vendor_configured',
+  'cross_vendor_limited',
+  'cross_vendor_offline',
+  'cross_vendor_unavailable',
+  'cross_vendor_provision_failed',
+  'cross_vendor_provision_timeout',
+  'no_independent_session',
+] as const;
+export type SupervisionAuditDegradedReason = typeof SUPERVISION_AUDIT_DEGRADED_REASONS[number];
+
+export const SUPERVISION_PROVISION_POOLS = ['primary', 'economy', 'audit'] as const;
+export type SupervisionProvisionPool = typeof SUPERVISION_PROVISION_POOLS[number];
+
+export const SUPERVISION_PROVISION_FAILURE_REASONS = [
+  'pool_unconfigured',
+  'no_selected_config',
+  'unsupported_config',
+  'provider_limited',
+  'provider_offline',
+  'max_spawned',
+  'cooldown',
+  'launch_failed',
+  'readiness_timeout',
+  'identity_collision',
+  'parent_unavailable',
+  'audited_unavailable',
+] as const;
+export type SupervisionProvisionFailureReason = typeof SUPERVISION_PROVISION_FAILURE_REASONS[number];
+
+export interface SupervisionProvisioningEvidence {
+  selectedPool: SupervisionProvisionPool;
+  selectedConfig?: SupervisionExecutionConfig;
+  provisionAttemptId?: string;
+  createdSessionName?: string;
+  failureReason?: SupervisionProvisionFailureReason;
+  degradedReason?: SupervisionAuditDegradedReason;
+}
 
 export const SUPERVISION_ECONOMY_TASK_KINDS = [
   'read_only_inventory',

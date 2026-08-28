@@ -615,6 +615,8 @@ export interface SupervisionTaskMetadata {
   auditAttemptId?: string | null;
   auditRevision?: string | number | null;
   executionPool?: SupervisionExecutionPoolKind | null;
+  /** Explicit Brain request to reuse/provision from the configured pool. */
+  autoProvision?: boolean | null;
   requestedExecutionType?: SupervisionExecutionConfig | null;
   economyPolicy?: SupervisionEconomyTaskPolicy | null;
 }
@@ -650,10 +652,13 @@ export function isTerminalSupervisionTaskStatus(value: SupervisionTaskLifecycleS
 const SUPERVISION_TASK_ALLOWED_TRANSITIONS: Readonly<Record<SupervisionTaskLifecycleStatus, readonly SupervisionTaskLifecycleStatus[]>> = {
   planned: ['delegated', 'implementing', 'blocked', 'cancelled'],
   delegated: ['implementing', 'retrying_external_ci', 'validated', 'ready_for_audit', 'auditing', 'rework', 'ready_for_integration', 'blocked', 'cancelled'],
-  implementing: ['retrying_external_ci', 'validated', 'ready_for_audit', 'blocked', 'cancelled'],
+  implementing: ['retrying_external_ci', 'validated', 'ready_for_audit', 'ready_for_integration', 'blocked', 'cancelled'],
   retrying_external_ci: ['implementing', 'recovered', 'validated', 'ready_for_audit', 'blocked', 'cancelled'],
-  validated: ['ready_for_audit', 'auditing', 'blocked', 'cancelled'],
-  ready_for_audit: ['auditing', 'blocked', 'cancelled'],
+  validated: ['ready_for_audit', 'auditing', 'ready_for_integration', 'blocked', 'cancelled'],
+  // ready_for_integration is legal only when the registry has an exact
+  // matching PASS assignment. The generic intent surface cannot manufacture
+  // that evidence; finishAssignment owns this observed-audit edge.
+  ready_for_audit: ['auditing', 'ready_for_integration', 'blocked', 'cancelled'],
   auditing: ['rework', 'passed', 'ready_for_integration', 'blocked', 'cancelled'],
   rework: ['implementing', 'validated', 'ready_for_audit', 'auditing', 'ready_for_integration', 'blocked', 'cancelled'],
   passed: ['ready_for_integration', 'finalizing', 'blocked', 'cancelled'],
@@ -684,6 +689,22 @@ export const SUPERVISION_EXECUTION_STATUS_MARKERS = {
 } as const;
 
 export type SupervisionMode = typeof SUPERVISION_MODE[keyof typeof SUPERVISION_MODE];
+
+/**
+ * Single mode authority for every daemon-owned automatic supervision action.
+ * Unknown, absent, and explicit OFF inputs all fail closed. Manual, explicitly
+ * requested delegation does not call this predicate and never changes mode.
+ */
+export function isAutomaticSupervisionEnabled<T extends Pick<SessionSupervisionSnapshot, 'mode'>>(
+  input: T | null | undefined,
+): input is T;
+export function isAutomaticSupervisionEnabled(input: SupervisionMode | null | undefined): boolean;
+export function isAutomaticSupervisionEnabled(
+  input: SupervisionMode | Pick<SessionSupervisionSnapshot, 'mode'> | null | undefined,
+): boolean {
+  const mode = typeof input === 'string' ? input : input?.mode;
+  return mode === SUPERVISION_MODE.SUPERVISED || mode === SUPERVISION_MODE.SUPERVISED_AUDIT;
+}
 export type SupervisionAuditMode = 'audit' | 'review' | 'audit>plan' | 'review>plan' | 'audit>review>plan';
 export type TaskRunStatusMarker = keyof typeof TASK_RUN_STATUS_MARKERS;
 export type TaskRunTerminalState = 'complete' | 'needs_input' | 'blocked';

@@ -31,6 +31,7 @@ import { resolveDelegationTargets } from '../../shared/delegation-availability.j
 import { isDiscoverableInterAgentSession, resolveEffectiveProjectName, resolveRuntimeScope } from '../../shared/session-scope.js';
 import {
   AGENT_DELEGATION_PURPOSES,
+  buildAgentDelegationBlockerReportInstruction,
   isAgentDelegationOpaqueId,
   isDelegationReplyCapableAgentType,
   type AgentDelegationAuditRequest,
@@ -43,9 +44,19 @@ import {
   type SupervisionObservedExecutionIdentity,
 } from '../../shared/supervision-execution-pool.js';
 import {
+  evaluateBrainAuditRoutePolicy,
   resolvePeerAuditProviderFamily,
   validateBrainAuditRoute as validateBrainAuditRouteAuthority,
 } from './peer-audit-candidates.js';
+import type {
+  SupervisionAuditDegradedReason,
+  SupervisionAuditRoutingReason,
+  SupervisionProvisioningEvidence,
+} from '../../shared/supervision-execution-pool.js';
+import type {
+  SupervisionAutoProvisionRequest,
+  SupervisionAutoProvisionResult,
+} from './supervision-auto-provision.js';
 import { supervisionCallerParticipates } from './supervision-mcp-tools.js';
 import {
   EXECUTION_CLONE_KIND,
@@ -232,6 +243,9 @@ export type SendMessageResult =
       clone?: { target: string; sessionName: string; hardTimeoutAt: number };
       taskId?: string;
       assignmentId?: string;
+      auditRoutingReason?: SupervisionAuditRoutingReason;
+      auditDegradedReason?: SupervisionAuditDegradedReason;
+      provisioning?: SupervisionProvisioningEvidence;
     }
   | { status: 'disabled'; reason: typeof MCP_ERROR_REASONS.FEATURE_DISABLED; disabledFlag: typeof SEND_MCP_DISPATCH_FEATURE_FLAG }
   | {
@@ -247,6 +261,9 @@ export type SendMessageResult =
        * feature exists to stop.
        */
       limited?: SendTargetLimitedInfo;
+      auditRoutingReason?: 'no_cross_vendor_available';
+      auditDegradedReason?: SupervisionAuditDegradedReason;
+      provisioning?: SupervisionProvisioningEvidence;
     };
 
 /**
@@ -332,6 +349,14 @@ export interface SendToolDeps {
   createExecutionClone?: (req: CreateExecutionCloneDepRequest) => Promise<CreateExecutionCloneDepResult>;
   /** Destroy an execution clone. Injected for tests; default delegates to `destroyExecutionClone`. */
   destroyExecutionClone?: (req: DestroyExecutionCloneDepRequest) => Promise<void>;
+  /** Explicit Brain-authorized pool reuse/provisioning. Ordinary sends never call it. */
+  provisionSupervisionTarget?: (req: SupervisionAutoProvisionRequest) => Promise<SupervisionAutoProvisionResult>;
+  /**
+   * Authoritative liveness check used when a refresh snapshot momentarily
+   * omits a previously routable session. The MCP directory uses this to retain
+   * only genuinely live omissions; explicit stopped/error records still win.
+   */
+  isSessionAuthoritativelyActive?: (session: SessionRecord) => boolean | Promise<boolean>;
 }
 
 /** Request passed to the injectable {@link SendToolDeps.createExecutionClone} hook. */
@@ -458,6 +483,11 @@ async function defaultDestroyExecutionClone(req: DestroyExecutionCloneDepRequest
   await destroyExecutionClone(req);
 }
 
+async function defaultProvisionSupervisionTarget(req: SupervisionAutoProvisionRequest): Promise<SupervisionAutoProvisionResult> {
+  const { provisionSupervisionTarget } = await import('./supervision-auto-provision.js');
+  return provisionSupervisionTarget(req);
+}
+
 /** Narrow an unknown error to its `ExecutionCloneError.code` when present. */
 function executionCloneErrorCode(err: unknown): ExecutionCloneErrorCode | null {
   if (err && typeof err === 'object' && 'code' in err) {
@@ -548,13 +578,21 @@ export async function dispatchSendMessage(
   if (!caller.sessionName) {
     return { status: 'error', reason: MCP_ERROR_REASONS.SCOPE_FORBIDDEN, error: 'send_message requires a scoped caller' };
   }
-  const allSessions = d.listSessions();
+  let allSessions = d.listSessions();
   const callerProjectName = effectiveCallerProjectName(caller, allSessions);
   if (!callerProjectName) {
     return { status: 'error', reason: MCP_ERROR_REASONS.SCOPE_FORBIDDEN, error: 'send_message requires a scoped caller' };
   }
-  if (!input.target && !input.broadcast) {
+  const autoProvision = input.task?.autoProvision === true;
+  if (!input.target && !input.broadcast && !autoProvision) {
     return { status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED, error: 'target is required unless broadcast is true' };
+  }
+  if (autoProvision && (input.target || input.broadcast || input.clone || !input.idempotencyKey?.trim())) {
+    return {
+      status: 'error',
+      reason: MCP_ERROR_REASONS.VALIDATION_FAILED,
+      error: 'task.autoProvision requires no target/broadcast/clone and a non-empty idempotencyKey',
+    };
   }
   if (!input.message || input.message.trim().length === 0) {
     return { status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED, error: 'message is required' };
@@ -569,6 +607,7 @@ export async function dispatchSendMessage(
   if (input.audit && (
     input.audit.kind !== AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT
     || !isAgentDelegationOpaqueId(input.audit.attemptId)
+    || (input.audit.strictCrossVendor !== undefined && input.audit.strictCrossVendor !== true)
     || input.reply !== true
     || input.broadcast === true
     || Boolean(input.clone)
@@ -601,7 +640,10 @@ export async function dispatchSendMessage(
   }
 
   const idempotencyKey = typeof input.idempotencyKey === 'string' ? input.idempotencyKey.trim() : '';
-  const idempotencyTarget = input.broadcast ? '*' : input.target ?? '';
+  const idempotencyTarget = input.broadcast ? '*'
+    : autoProvision
+      ? `@pool:${input.audit ? 'audit' : input.task?.executionPool ?? 'primary'}:${input.task?.requestedExecutionType?.capabilityId ?? '*'}`
+      : input.target ?? '';
   const cacheKey = idempotencyKey ? `${caller.userId}\0${caller.sessionName}\0${idempotencyTarget}\0${idempotencyKey}` : '';
   const now = d.now();
   if (cacheKey) {
@@ -610,11 +652,41 @@ export async function dispatchSendMessage(
     if (cached) idempotencyCache.delete(cacheKey);
   }
 
+  let resolvedInput = input;
+  let provisioning: SupervisionProvisioningEvidence | undefined;
+  let auditRoutingReason: SupervisionAuditRoutingReason | undefined;
+  let auditDegradedReason: SupervisionAuditDegradedReason | undefined;
+  if (autoProvision) {
+    const provision = await (deps?.provisionSupervisionTarget ?? defaultProvisionSupervisionTarget)({
+      parentSessionName: caller.sessionName,
+      pool: input.task?.executionPool ?? 'primary',
+      requestedCapabilityId: input.task?.requestedExecutionType?.capabilityId,
+      idempotencyKey,
+      auditedSessionName: input.audit?.auditedSessionName,
+      strictCrossVendor: input.audit?.strictCrossVendor,
+    });
+    provisioning = provision.evidence;
+    auditDegradedReason = provision.auditDegradedReason;
+    if (!provision.ok) {
+      return {
+        status: 'error',
+        reason: MCP_ERROR_REASONS.VALIDATION_FAILED,
+        error: `supervision target provisioning blocked: ${provision.reason}`,
+        auditRoutingReason: input.audit ? 'no_cross_vendor_available' : undefined,
+        ...(provision.auditDegradedReason ? { auditDegradedReason: provision.auditDegradedReason } : {}),
+        provisioning: provision.evidence,
+      };
+    }
+    auditRoutingReason = provision.auditRoutingReason;
+    resolvedInput = { ...input, target: provision.target.name };
+    allSessions = d.listSessions();
+  }
+
   // Ordinary exact send: an exact `target === clone.name` may resolve to an
   // execution clone, but ONLY for that clone's creator (`exactCreatorOnly`).
   // Clones are never matched by label/agentType; normal sibling resolution is
   // unchanged (clones are excluded from the discoverable sibling set).
-  const targets = resolveScopedTargets({ ...caller, projectName: callerProjectName }, input, allSessions, d.exactTargetOnly, 'exactCreatorOnly');
+  const targets = resolveScopedTargets({ ...caller, projectName: callerProjectName }, resolvedInput, allSessions, d.exactTargetOnly, 'exactCreatorOnly');
   if (!targets.ok) return { status: 'error', reason: targets.reason, error: targets.error };
 
   // ── Provider-limit gate ────────────────────────────────────────────────
@@ -623,7 +695,7 @@ export async function dispatchSendMessage(
   // the whole point: a message dropped into a limited session's FIFO looks
   // accepted and then sits there, so the orchestrator learns nothing and waits.
   const gate = evaluateDelegationAdmission(allSessions, targets.targets, now, {
-    newWorkload: input.newWorkload === true,
+    newWorkload: input.newWorkload === true || Boolean(input.audit) || autoProvision,
   });
   const blockedTargets = gate.blocked;
   const dispatchable = gate.dispatchable;
@@ -683,6 +755,32 @@ export async function dispatchSendMessage(
     if (!auditTarget) return { status: 'error', reason: MCP_ERROR_REASONS.IDENTITY_REJECTED, error: 'audit target is unavailable' };
     const routeCheck = validateBrainAuditRoute(auditTarget);
     if (!routeCheck.ok) return { status: 'error', reason: routeCheck.reason, error: routeCheck.error };
+    // Explicit pool provisioning already evaluated cross-vendor preference,
+    // quota/offline evidence, strict mode and the configured-pool boundary.
+    // Re-running the account-wide candidate policy here would incorrectly let
+    // an unselected historical session override the user's pool configuration.
+    if (!provisioning || !auditRoutingReason) {
+      const policy = evaluateBrainAuditRoutePolicy({
+        auditedSessionName: input.audit.auditedSessionName,
+        targetName: auditTarget.name,
+        allSessions,
+        availability: gate.availability,
+        strictCrossVendor: input.audit.strictCrossVendor,
+      });
+      if (!policy.ok) {
+        return {
+          status: 'error',
+          reason: MCP_ERROR_REASONS.VALIDATION_FAILED,
+          error: policy.detail,
+          auditRoutingReason: 'no_cross_vendor_available',
+          auditDegradedReason: policy.degradedReason,
+          ...(provisioning ? { provisioning } : {}),
+        };
+      }
+      auditRoutingReason = policy.auditRoutingReason;
+      auditDegradedReason = policy.auditRoutingReason === 'same_family_degraded'
+        ? policy.degradedReason : undefined;
+    }
   }
 
   let supervisedTaskId: string | undefined;
@@ -694,7 +792,6 @@ export async function dispatchSendMessage(
     const targetIdentity = supervisionTaskIdentityForTarget(targetRecord);
     if (!targetIdentity) return { status: 'error', reason: MCP_ERROR_REASONS.IDENTITY_REJECTED, error: 'task target identity is unavailable' };
     let executionBinding: SupervisionExecutionBinding | undefined;
-    let auditRoutingReason: import('../../shared/supervision-execution-pool.js').SupervisionAuditRoutingReason | undefined;
     if (!input.audit) {
       const callerRecord = allSessions.find((session) => session.name === caller.sessionName);
       const model = resolveEffectiveSessionModel(targetRecord);
@@ -717,7 +814,12 @@ export async function dispatchSendMessage(
         economyPolicy: input.task.economyPolicy ?? undefined,
       });
       if (!checked.ok) return { status: 'error', reason: MCP_ERROR_REASONS.IDENTITY_REJECTED, error: `development execution pool rejected target: ${checked.reason}` };
-      executionBinding = { pool, requested: checked.requested, actual: actual as SupervisionObservedExecutionIdentity, origin: 'reused' };
+      executionBinding = {
+        pool,
+        requested: checked.requested,
+        actual: actual as SupervisionObservedExecutionIdentity,
+        origin: provisioning?.createdSessionName ? 'spawned' : 'reused',
+      };
       supervisedExecutionBinding = executionBinding;
     } else {
       // Same single validator as the audit-only path above; already run.
@@ -768,6 +870,8 @@ export async function dispatchSendMessage(
       ...(executionBinding ? { executionBinding } : {}),
       ...(input.task.economyPolicy ? { economyPolicy: input.task.economyPolicy } : {}),
       ...(auditRoutingReason ? { auditRoutingReason } : {}),
+      ...(auditDegradedReason ? { auditDegradedReason } : {}),
+      ...(provisioning ? { provisioning } : {}),
       idempotencyKey: idempotencyKey ? `send:${idempotencyKey}` : undefined,
       now,
     });
@@ -793,7 +897,13 @@ export async function dispatchSendMessage(
 
   for (const target of dispatchable) {
     const messageId = createSendMessageId();
-    const replyAuthority = input.reply
+    // A registered task must always have an authenticated return path. Without
+    // this, a worker that hits illegal_transition or a contract contradiction
+    // can only print NEEDS_INPUT in its own transcript and silently strand the
+    // coordinating Brain. Ordinary untracked messages keep their opt-in reply
+    // behavior.
+    const replyRequired = input.reply === true || Boolean(supervisedTaskId && supervisedAssignmentId);
+    const replyAuthority = replyRequired
       ? createDelegationReplyAuthority({
           origin: callerRecord,
           target,
@@ -803,7 +913,7 @@ export async function dispatchSendMessage(
           now,
         })
       : null;
-    if (input.reply && !replyAuthority) {
+    if (replyRequired && !replyAuthority) {
       deliveries.push({
         target: target.name,
         status: 'failed',
@@ -811,21 +921,28 @@ export async function dispatchSendMessage(
       });
       continue;
     }
-    const assignmentMessage = supervisedExecutionBinding
-      ? [
+    const taskBlockerContract = supervisedTaskId && supervisedAssignmentId
+      ? buildAgentDelegationBlockerReportInstruction({
+          taskId: supervisedTaskId,
+          assignmentId: supervisedAssignmentId,
+        })
+      : '';
+    const assignmentMessage = [
+      ...(supervisedExecutionBinding ? [
           '[Daemon-resolved development assignment]',
           `Pool: ${supervisedExecutionBinding.pool}`,
           `Requested config: ${JSON.stringify(supervisedExecutionBinding.requested)}`,
           `Observed runtime identity: ${JSON.stringify(supervisedExecutionBinding.actual)}`,
           'Eligibility was decided by the coordinator from daemon evidence. Start the task directly; do not self-report or guess your model.',
           '',
-          input.message,
-        ].join('\n')
-      : input.message;
+        ] : []),
+      input.message,
+      ...(taskBlockerContract ? ['', taskBlockerContract] : []),
+    ].join('\n');
     const message = buildSessionDispatchMessage({
       message: assignmentMessage,
       files: fileRefs.files,
-      replyTo: input.reply ? caller.sessionName : null,
+      replyTo: replyRequired ? caller.sessionName : null,
       ...(replyAuthority ? { replyAuthority: replyAuthority.authority } : {}),
     });
     try {
@@ -866,6 +983,9 @@ export async function dispatchSendMessage(
     deliveries,
     ...(supervisedTaskId ? { taskId: supervisedTaskId } : {}),
     ...(supervisedAssignmentId ? { assignmentId: supervisedAssignmentId } : {}),
+    ...(auditRoutingReason ? { auditRoutingReason } : {}),
+    ...(auditDegradedReason ? { auditDegradedReason } : {}),
+    ...(provisioning ? { provisioning } : {}),
     ...(failed > 0 ? { partial: true } : {}),
   };
   if (cacheKey && failed === 0) idempotencyCache.set(cacheKey, { expiresAt: now + SEND_IDEMPOTENCY_WINDOW_MS, result: accepted });
