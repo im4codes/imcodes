@@ -1,3 +1,4 @@
+import { MCP_TOOL_DISCOVERY_DEFAULT_ACTIVE } from '../../shared/mcp-tool-discovery.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -115,7 +116,12 @@ describe('memory MCP interface e2e', () => {
       // The MCP process hosts memory plus exact server-backed alias and pin
       // stores; assert each independent surface is present
       // (order-independent). Mirrors test/daemon/memory-mcp-server.test.ts.
-      expect(listedNames).toEqual(expect.arrayContaining([...MEMORY_MCP_TOOL_NAME_LIST]));
+      // Core tools are listed without a discovery round-trip; only the heavy
+      // controlled-machine / file-transfer / computer-use surfaces stay lazy, so
+      // assert both directions rather than the whole catalog.
+      expect(listedNames).toEqual(expect.arrayContaining([...MCP_TOOL_DISCOVERY_DEFAULT_ACTIVE]));
+      expect(listedNames).not.toContain(MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE);
+      expect(listedNames).not.toContain(MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL);
       expect(listedNames).toEqual(expect.arrayContaining([
         ALIAS_MCP_TOOLS.RESOLVE,
         ALIAS_MCP_TOOLS.LIST,

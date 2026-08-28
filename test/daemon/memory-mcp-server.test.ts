@@ -206,8 +206,9 @@ describe('memory MCP stdio server', () => {
       // shrunken allowlist and a leaked non-core tool both fail here.
       const bootstrapNames = bootstrap.tools.map((tool) => tool.name).sort();
       expect(bootstrapNames).toEqual([MCP_TOOL_DISCOVERY_NAME, ...MCP_TOOL_DISCOVERY_DEFAULT_ACTIVE].sort());
-      expect(bootstrapNames).not.toContain(MEMORY_MCP_TOOL_NAMES.CRON_LIST);
       expect(bootstrapNames).not.toContain(MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE);
+      expect(bootstrapNames).not.toContain(MEMORY_MCP_TOOL_NAMES.LIST_MACHINES);
+      expect(bootstrapNames).not.toContain(MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL);
       expect(mcpToolSurfaceBytes(bootstrap.tools)).toBeLessThanOrEqual(MCP_TOOL_SURFACE_BOOTSTRAP_BUDGET_BYTES);
       expect(client.getInstructions()).not.toContain('HIGHEST-PRIORITY IM.codes SERVICE ROUTING POLICY');
       expect(client.getInstructions()?.length).toBeLessThanOrEqual(240);
@@ -330,20 +331,27 @@ describe('memory MCP stdio server', () => {
         ...MCP_TOOL_DISCOVERY_DEFAULT_ACTIVE,
       ].sort());
 
+      // Replacement is only observable between two LAZY tools now that cron and
+      // memory are core: activate one, then search another and require the first
+      // to be retired.
+      await client.callTool({
+        name: MCP_TOOL_DISCOVERY_NAME,
+        arguments: { query: MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL },
+      });
       const cronSearch = await client.callTool({
         name: MCP_TOOL_DISCOVERY_NAME,
-        arguments: { query: 'cron' },
+        arguments: { query: MEMORY_MCP_TOOL_NAMES.LIST_MACHINES },
       });
       expect(cronSearch.structuredContent).toMatchObject({
-        activated: expect.arrayContaining([MEMORY_MCP_TOOL_NAMES.CRON_LIST, MEMORY_MCP_TOOL_NAMES.CRON_CREATE]),
+        activated: expect.arrayContaining([MEMORY_MCP_TOOL_NAMES.LIST_MACHINES]),
       });
       const cronNames = (await client.listTools()).tools.map((tool) => tool.name);
       expect(cronNames).toContain(MCP_TOOL_DISCOVERY_NAME);
-      expect(cronNames).toContain(MEMORY_MCP_TOOL_NAMES.CRON_LIST);
-      // send_message is core, so it survives an unrelated cron search.
+      expect(cronNames).toContain(MEMORY_MCP_TOOL_NAMES.LIST_MACHINES);
+      // send_message is core, so it survives an unrelated search.
       expect(cronNames).toContain(MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE);
-      // ...while a previously discovered non-core tool is retired as designed.
-      expect(cronNames).not.toContain(MEMORY_MCP_TOOL_NAMES.LIST_MACHINES);
+      // ...while the previously discovered lazy tool is retired as designed.
+      expect(cronNames).not.toContain(MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL);
     } finally {
       await client.close();
     }

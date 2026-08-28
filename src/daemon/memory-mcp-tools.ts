@@ -2005,31 +2005,31 @@ const schemas = {
   }),
   [MEMORY_MCP_TOOL_NAMES.SESSION_RUNTIME_IDENTITY_GET]: z.object({}).strict(),
   [MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE]: z.object({
-    target: z.string().describe('Exact send_list_targets target; never the caller.'),
-    message: z.string().describe('Complete task/request and expected output.'),
+    target: z.string().describe('Exact send_list_targets target, not the caller.'),
+    message: z.string().describe('The task and the expected output.'),
     deliveryMode: z.enum(Object.values(MEMORY_MCP_SEND_DELIVERY_MODES) as [MemoryMcpSendDeliveryMode, ...MemoryMcpSendDeliveryMode[]])
       .optional()
-      .describe('append (default) or ordinary durable queue.'),
-    files: z.array(z.string()).optional().describe('Project-root path refs; no file bytes.'),
+      .describe('append (default) or durable queue.'),
+    files: z.array(z.string()).optional().describe('Project-root paths, not bytes.'),
     reply: z.boolean().optional(),
     task: z.object({
       taskId: z.string().optional(), topLevelTaskId: z.string().optional(), sliceId: z.string().optional(), classification: z.enum(SUPERVISION_TASK_CLASSIFICATIONS).optional(),
       objective: z.string().optional(), acceptance: z.array(z.string()).optional(), ownedFiles: z.array(z.string()).optional(), sharedFiles: z.array(z.string()).optional(), dependencies: z.array(z.string()).optional(),
       integrationOwner: z.string().optional(), baseRevision: z.string().optional(), currentRevision: z.string().optional(), auditAttemptId: z.string().optional(), auditRevision: z.string().optional(),
-    }).strict().optional().describe('Optional daemon-authoritative supervision task metadata; accepted result returns taskId/assignmentId.'),
+    }).strict().optional().describe('Optional supervision task metadata; result returns taskId/assignmentId.'),
     audit: z.object({
       kind: z.literal(AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT),
       attemptId: z.string().min(1),
-      auditedSessionName: z.string().min(1).describe('Session under audit; never the caller or target.'),
-    }).strict().optional().describe('Automatic supervision audit metadata; requires reply=true and one exact target.'),
-    broadcast: z.boolean().optional().describe('Only when the user asks every/all sessions.'),
+      auditedSessionName: z.string().min(1).describe('Session under audit; not the caller or target.'),
+    }).strict().optional().describe('Supervision audit metadata; needs reply=true and one exact target.'),
+    broadcast: z.boolean().optional().describe('Only when the user says all sessions.'),
     idempotencyKey: z.string().optional().describe('Accepted-send replay key.'),
     clone: z.object({
       kind: z.literal(EXECUTION_CLONE_KIND),
       ephemeral: z.literal(true).describe('Always true.'),
       parentRunId: z.string().min(1),
       parentStage: z.enum(EXECUTION_CLONE_PARENT_STAGES),
-    }).strict().optional().describe('Route to a new ephemeral target clone; returns clone.target; forbids broadcast.'),
+    }).strict().optional().describe('Route to a fresh ephemeral clone; returns clone.target; no broadcast.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.DESTROY_EXECUTION_CLONE]: z.object({
     target: z.string().describe('Exact result.clone.target.'),
@@ -2118,20 +2118,20 @@ const schemas = {
     force: z.boolean().optional().describe('Required for agent deletion of recurring jobs.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.LIST_MACHINES]: z.strictObject({
-    includeOffline: z.boolean().optional().describe('Include offline and exec-disabled machines; default false. Presence is advisory.'),
+    includeOffline: z.boolean().optional().describe('Include offline/exec-disabled machines; default false, advisory only.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE]: z.strictObject({
-    machine: machineTargetRuntimeSchema.describe('Canonical 10-digit nodeId or ^^(nodeId); deprecated noncanonical legacy alias is compatibility-only. No list_machines preflight when known.'),
+    machine: machineTargetRuntimeSchema.describe('10-digit nodeId or ^^(nodeId); legacy alias is compatibility-only. No list_machines preflight.'),
     command: z.string(),
     shell: z.enum(REMOTE_EXEC_SHELLS).optional(),
     timeoutMs: z.number().int().min(REMOTE_EXEC_MIN_TIMEOUT_MS).max(REMOTE_EXEC_MAX_TIMEOUT_MS).optional(),
   }),
   [MEMORY_MCP_TOOL_NAMES.SEND_FILE_TO_MACHINE]: z.strictObject({
-    machine: machineTargetRuntimeSchema.describe('Canonical 10-digit nodeId or ^^(nodeId); deprecated noncanonical legacy alias is compatibility-only.'),
+    machine: machineTargetRuntimeSchema.describe('10-digit nodeId or ^^(nodeId); legacy alias is compatibility-only.'),
     sourcePath: boundedUtf8String(FILE_TRANSFER_PATH_MAX_BYTES),
   }),
   [MEMORY_MCP_TOOL_NAMES.FETCH_FILE_FROM_MACHINE]: z.strictObject({
-    machine: machineTargetRuntimeSchema.describe('Canonical 10-digit nodeId or ^^(nodeId); deprecated noncanonical legacy alias is compatibility-only.'),
+    machine: machineTargetRuntimeSchema.describe('10-digit nodeId or ^^(nodeId); legacy alias is compatibility-only.'),
     sourcePath: boundedUtf8String(FILE_TRANSFER_PATH_MAX_BYTES),
     destinationPath: boundedUtf8String(FILE_TRANSFER_PATH_MAX_BYTES),
     overwrite: z.boolean().optional(),
@@ -2140,7 +2140,7 @@ const schemas = {
     topic: z.enum(COMPUTER_USE_DOC_TOPICS),
   }),
   [MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL]: z.strictObject({
-    machine: machineTargetRuntimeSchema.describe('Canonical 10-digit nodeId, ^^(nodeId), deprecated noncanonical legacy alias, or local/localhost/self/this; do not preflight list_machines when known.'),
+    machine: machineTargetRuntimeSchema.describe('10-digit nodeId, ^^(nodeId), legacy alias, or local/self; no list_machines preflight.'),
     tool: z.enum(COMPUTER_USE_TOOLS).describe('Method name.'),
     arguments: z.record(z.string(), z.unknown()).optional().describe(`Method arguments. Windows coordinate drag additionally accepts duration_ms=${COMPUTER_USE_DRAG_DURATION_MIN_MS}..${COMPUTER_USE_DRAG_DURATION_MAX_MS}.`),
     timeoutMs: z.number().int().min(COMPUTER_USE_MIN_TIMEOUT_MS).max(COMPUTER_USE_SHELL_SESSION1_MAX_TIMEOUT_MS).optional().describe('Timeout ms; GUI/browser max 120000, shell_session1 max 900000.'),

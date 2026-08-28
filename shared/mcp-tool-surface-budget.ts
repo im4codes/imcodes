@@ -32,11 +32,13 @@ export const MCP_TOOL_SURFACE_RAW_BUDGET_BYTES = 45_000;
  *
  * Core tools are deliberately NOT lazy: hiding them would make every agent
  * depend on a discovery round-trip first, and any client holding a cached tool
- * list would get `Tool <name> disabled` instead. Measured 13,936 bytes at the
- * time of writing against a full catalog of ~45,300, so the bound keeps most of
- * the saving while leaving little room for the core set to grow unnoticed.
+ * list would get `Tool <name> disabled` instead. Memory, aliases and cron are core too, so the
+ * default set is 38 tools measuring 28,490 bytes against a ~45,300 full catalog:
+ * a 37% reduction, not the 69% a minimal core would give. That trade is
+ * deliberate -- a half-lazy memory or scheduling API is worse than none, because
+ * the model cannot tell which half it currently has.
  */
-export const MCP_TOOL_SURFACE_BOOTSTRAP_BUDGET_BYTES = 15_000;
+export const MCP_TOOL_SURFACE_BOOTSTRAP_BUDGET_BYTES = 30_000;
 
 export interface McpSurfaceRemoval {
   /** Dotted path of the containing object, for diagnosis when an assert fails. */

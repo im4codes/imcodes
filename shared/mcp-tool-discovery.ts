@@ -18,8 +18,9 @@ export const MCP_TOOL_DISCOVERY_SERVER_INSTRUCTIONS =
  * first. Delegation, the supervision task registry, and basic memory are used on
  * essentially every turn, and a client that cached an older tool list or calls by
  * name would hit `Tool <name> disabled` instead. Those stay on; everything else
- * (cron, machines, file transfer, computer-use, capability, alias, message pins,
- * memory administration) is discovered on demand.
+ * Only the genuinely heavy or rare surfaces stay lazy: controlled-machine exec,
+ * file transfer, computer-use, capability management, message pins and execution
+ * clones.
  */
 export const MCP_TOOL_DISCOVERY_DEFAULT_ACTIVE: readonly string[] = Object.freeze([
   // delegation + audit receipts
@@ -36,10 +37,38 @@ export const MCP_TOOL_DISCOVERY_DEFAULT_ACTIVE: readonly string[] = Object.freez
   'supervision_task_get',
   'supervision_task_intent',
   'supervision_task_file_event',
-  // memory basics + identity
+  // memory: the whole surface, not just reads. Recall, provenance and curation
+  // are used constantly, and a half-lazy memory API is worse than none because
+  // the model cannot tell which half it has.
   'search_memory',
   'save_observation',
   'save_preference',
+  'list_memory_summaries',
+  'get_memory_sources',
+  'archive_memory',
+  'restore_memory',
+  'delete_memory',
+  'update_memory',
+  'memory_feedback',
+  // aliases: tiny schemas, referenced inline in ordinary work
+  'save_alias',
+  'list_aliases',
+  'resolve_alias',
+  'delete_alias',
+  // scheduling: self-wakeup drives loops; a hidden cron tool silently breaks them
+  'cron_create_self',
+  'cron_update_self',
+  'cron_cancel_self',
+  'cron_create',
+  'cron_list',
+  'cron_update',
+  'cron_delete',
+  // message pins: four tiny CRUD schemas, used inline like aliases
+  'pin_message',
+  'list_message_pins',
+  'get_message_pin',
+  'delete_message_pin',
+  // identity
   'session_runtime_identity_get',
 ]);
 
