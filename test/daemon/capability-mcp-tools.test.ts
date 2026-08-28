@@ -3,11 +3,14 @@ import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { describe, expect, it, vi } from 'vitest';
 import type { CapabilityService } from '../../shared/capability-management.js';
 import {
-  CAPABILITY_AI_SYSTEM_INSTRUCTIONS,
   CAPABILITY_ERROR,
   CAPABILITY_MCP_TOOL_CONTRACTS,
   CAPABILITY_MCP_TOOL_NAMES,
 } from '../../shared/capability-management.js';
+import {
+  MCP_TOOL_DISCOVERY_NAME,
+  MCP_TOOL_DISCOVERY_SERVER_INSTRUCTIONS,
+} from '../../shared/mcp-tool-discovery.js';
 import { createMemoryMcpServer } from '../../src/daemon/memory-mcp-server.js';
 import { parseMcpRuntimeCallerFromEnv, type McpRuntimeCaller } from '../../src/daemon/memory-mcp-caller.js';
 import { getDefaultMcpServers } from '../../src/agent/providers/getDefaultMcpServers.js';
@@ -53,6 +56,7 @@ async function withClient(
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
   try {
+    await client.callTool({ name: MCP_TOOL_DISCOVERY_NAME, arguments: { query: '*' } });
     await run(client);
   } finally {
     await client.close();
@@ -64,12 +68,8 @@ describe('capability MCP tools', () => {
   it('advertises exactly the four capability tools on a registered FULL node', async () => {
     await withClient(caller(), service(), async (client) => {
       const tools = (await client.listTools()).tools;
-      expect(client.getInstructions()).toBe(CAPABILITY_AI_SYSTEM_INSTRUCTIONS);
-      expect(client.getInstructions()).toMatch(/^HIGHEST-PRIORITY IM\.codes SERVICE ROUTING POLICY:/);
-      expect(client.getInstructions()).toContain('JSON schema, enum, required parameter');
-      expect(client.getInstructions()).toContain('user asks in chat');
-      expect(client.getInstructions()).toContain('source.kind=mcp_config');
-      expect(client.getInstructions()).toContain('do not require an installer URL');
+      expect(client.getInstructions()).toBe(MCP_TOOL_DISCOVERY_SERVER_INSTRUCTIONS);
+      expect(client.getInstructions()).not.toContain('HIGHEST-PRIORITY IM.codes SERVICE ROUTING POLICY');
       const names = tools.map((tool) => tool.name);
       expect(names.filter((name) => name.startsWith('capability_'))).toEqual([...CAPABILITY_MCP_TOOL_NAMES]);
       for (const name of CAPABILITY_MCP_TOOL_NAMES) {
@@ -121,6 +121,7 @@ describe('capability MCP tools', () => {
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
     await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
     try {
+      await client.callTool({ name: MCP_TOOL_DISCOVERY_NAME, arguments: { query: '*' } });
       expect((await client.listTools()).tools.map((tool) => tool.name))
         .toEqual(expect.arrayContaining([...CAPABILITY_MCP_TOOL_NAMES]));
       await expect(client.callTool({ name: 'capability_list', arguments: {} })).resolves.toMatchObject({
@@ -165,6 +166,7 @@ describe('capability MCP tools', () => {
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
     await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
     try {
+      await client.callTool({ name: MCP_TOOL_DISCOVERY_NAME, arguments: { query: '*' } });
       expect((await client.listTools()).tools.map((tool) => tool.name))
         .toEqual(expect.arrayContaining([...CAPABILITY_MCP_TOOL_NAMES]));
       await expect(client.callTool({ name: 'capability_list', arguments: {} })).resolves.toMatchObject({

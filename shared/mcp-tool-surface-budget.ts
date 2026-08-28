@@ -26,6 +26,17 @@ export const MCP_INJECTED_EXECUTION_BLOCK = Object.freeze({ taskSupport: 'forbid
 
 export const MCP_TOOL_SURFACE_AUTHORED_BUDGET_BYTES = 40_000;
 export const MCP_TOOL_SURFACE_RAW_BUDGET_BYTES = 45_000;
+/**
+ * Default model-visible surface: the discovery tool plus the core delegation /
+ * supervision-task / memory tools listed in MCP_TOOL_DISCOVERY_DEFAULT_ACTIVE.
+ *
+ * Core tools are deliberately NOT lazy: hiding them would make every agent
+ * depend on a discovery round-trip first, and any client holding a cached tool
+ * list would get `Tool <name> disabled` instead. Measured 13,936 bytes at the
+ * time of writing against a full catalog of ~45,300, so the bound keeps most of
+ * the saving while leaving little room for the core set to grow unnoticed.
+ */
+export const MCP_TOOL_SURFACE_BOOTSTRAP_BUDGET_BYTES = 15_000;
 
 export interface McpSurfaceRemoval {
   /** Dotted path of the containing object, for diagnosis when an assert fails. */

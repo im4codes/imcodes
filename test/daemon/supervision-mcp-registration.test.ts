@@ -7,6 +7,7 @@ import {
   SUPERVISION_MCP_PENDING_CONSOLIDATION, SUPERVISION_MCP_FORBIDDEN_ARG_NAMES,
 } from '../../shared/supervision-mcp-tools.js';
 import { MEMORY_MCP_TOOL_NAMES, MEMORY_MCP_TOOL_NAME_LIST } from '../../shared/memory-mcp-contracts.js';
+import { MCP_TOOL_DISCOVERY_NAME } from '../../shared/mcp-tool-discovery.js';
 import {
   SUPERVISION_RECOVERY_TARGET_STATUSES,
   createSupervisionMcpToolHandlers,
@@ -63,6 +64,7 @@ async function connect(isAdmin = true) {
   client = new Client({ name: 'supervision-reg-test', version: '0.1.0' });
   const [clientT, serverT] = InMemoryTransport.createLinkedPair();
   await Promise.all([client.connect(clientT), server.connect(serverT)]);
+  await client.callTool({ name: MCP_TOOL_DISCOVERY_NAME, arguments: { query: '*' } });
 }
 
 async function call(name: string, args: Record<string, unknown>) {

@@ -11,7 +11,7 @@
  */
 import { z } from 'zod';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
-import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import type { McpServer, RegisteredTool } from '@modelcontextprotocol/sdk/server/mcp.js';
 import {
   SUPERVISION_MCP_TOOLS,
   SUPERVISION_MCP_REGISTERED_TOOLS,
@@ -290,12 +290,14 @@ export function registerSupervisionMcpTools(
   server: McpServer,
   caller: McpRuntimeCaller,
   deps: SupervisionMcpToolDeps = {},
-): void {
+): ReadonlyMap<string, RegisteredTool> {
   const handlers = createSupervisionMcpToolHandlers(caller, deps);
+  const registered = new Map<string, RegisteredTool>();
   for (const name of SUPERVISION_MCP_REGISTERED_TOOLS) {
-    server.registerTool(name, {
+    registered.set(name, server.registerTool(name, {
       description: DESCRIPTIONS[name],
       inputSchema: SUPERVISION_MCP_TOOL_SHAPES[name],
-    }, async (args: unknown) => toolResult(await handlers[name](args)));
+    }, async (args: unknown) => toolResult(await handlers[name](args))));
   }
+  return registered;
 }

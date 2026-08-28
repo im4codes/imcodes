@@ -106,14 +106,16 @@ describe('styles.css regression contracts', () => {
     expect(mobileButtonRule).toMatch(/width:\s*auto/);
   });
 
-  it('keeps long delegation replies readable by scrolling after forty lines instead of clipping text', () => {
+  it('keeps delegation replies readable by scrolling after ten lines instead of clipping text', () => {
     const cardRule = cssWithoutComments.match(/\.delegation-reply-card\s*\{[^}]*\}/)?.[0];
     expect(cardRule).toBeTruthy();
     expect(cardRule).toMatch(/flex:\s*0\s+0\s+auto/);
 
     const bodyRule = cssWithoutComments.match(/\.delegation-reply-card-body\s*\{[^}]*\}/)?.[0];
     expect(bodyRule).toBeTruthy();
-    expect(bodyRule).toMatch(/max-height:\s*calc\(1\.5em \* 40\)/);
+    expect(bodyRule).toMatch(/font-size:\s*12px/);
+    expect(bodyRule).toMatch(/line-height:\s*1\.5/);
+    expect(bodyRule).toMatch(/max-height:\s*calc\(1\.5em \* 10\)/);
     expect(bodyRule).toMatch(/overflow-y:\s*auto/);
     expect(bodyRule).not.toMatch(/overscroll-behavior/);
   });

@@ -7,19 +7,23 @@ import {
   MCP_INJECTED_EXECUTION_BLOCK,
   MCP_INJECTED_SCHEMA_DIALECT,
   MCP_TOOL_SURFACE_AUTHORED_BUDGET_BYTES,
+  MCP_TOOL_SURFACE_BOOTSTRAP_BUDGET_BYTES,
   MCP_TOOL_SURFACE_RAW_BUDGET_BYTES,
   mcpToolSurfaceBytes,
   projectAuthoredMcpToolSurface,
 } from '../../shared/mcp-tool-surface-budget.js';
+import { MCP_TOOL_DISCOVERY_DEFAULT_ACTIVE, MCP_TOOL_DISCOVERY_NAME } from '../../shared/mcp-tool-discovery.js';
 import { describe, expect, it, vi } from 'vitest';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { MEMORY_MCP_ENV_KEYS, buildMemoryMcpServerEnv } from '../../shared/memory-mcp-env.js';
-import { MEMORY_MCP_TOOL_NAME_LIST } from '../../shared/memory-mcp-contracts.js';
+import { MEMORY_MCP_TOOL_NAME_LIST, MEMORY_MCP_TOOL_NAMES } from '../../shared/memory-mcp-contracts.js';
 import { ALIAS_MCP_TOOLS } from '../../shared/alias-types.js';
 import { AGENT_DELEGATION_REPLY_ERRORS } from '../../shared/agent-delegation.js';
 import {
   createMemoryMcpServerFromEnv,
+  createMemoryMcpServer,
   mergeDefaultToolDeps,
   postHookSend,
 } from '../../src/daemon/memory-mcp-server.js';
@@ -128,6 +132,15 @@ function mcpEnv(home: string): Record<string, string | undefined> {
   });
 }
 
+async function callLazyTool(client: Client, name: string, args: Record<string, unknown>) {
+  const activation = await client.callTool({
+    name: MCP_TOOL_DISCOVERY_NAME,
+    arguments: { query: name },
+  });
+  expect(activation.isError).not.toBe(true);
+  return client.callTool({ name, arguments: args });
+}
+
 describe('memory MCP stdio server', () => {
   it('starts with local defaults when env identity is absent and rejects invalid namespace', async () => {
     expect(createMemoryMcpServerFromEnv({ env: {} }).isConnected()).toBe(false);
@@ -187,8 +200,26 @@ describe('memory MCP stdio server', () => {
 
     try {
       await client.connect(transport);
+      const bootstrap = await client.listTools();
+      // Core tools must be usable WITHOUT a discovery round-trip; only the long
+      // tail is hidden. Asserting the exact set both ways keeps this honest: a
+      // shrunken allowlist and a leaked non-core tool both fail here.
+      const bootstrapNames = bootstrap.tools.map((tool) => tool.name).sort();
+      expect(bootstrapNames).toEqual([MCP_TOOL_DISCOVERY_NAME, ...MCP_TOOL_DISCOVERY_DEFAULT_ACTIVE].sort());
+      expect(bootstrapNames).not.toContain(MEMORY_MCP_TOOL_NAMES.CRON_LIST);
+      expect(bootstrapNames).not.toContain(MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE);
+      expect(mcpToolSurfaceBytes(bootstrap.tools)).toBeLessThanOrEqual(MCP_TOOL_SURFACE_BOOTSTRAP_BUDGET_BYTES);
+      expect(client.getInstructions()).not.toContain('HIGHEST-PRIORITY IM.codes SERVICE ROUTING POLICY');
+      expect(client.getInstructions()?.length).toBeLessThanOrEqual(240);
+
+      const activation = await client.callTool({
+        name: MCP_TOOL_DISCOVERY_NAME,
+        arguments: { query: '*' },
+      });
+      expect(activation.isError).not.toBe(true);
       const listed = await client.listTools();
       const listedNames = listed.tools.map((tool) => tool.name);
+      expect(listedNames).toContain(MCP_TOOL_DISCOVERY_NAME);
       // Memory tools plus the full alias CRUD tool set share the same server surface.
       expect(listedNames).toEqual(expect.arrayContaining([...MEMORY_MCP_TOOL_NAME_LIST]));
       expect(listedNames).toEqual(expect.arrayContaining([
@@ -267,12 +298,129 @@ describe('memory MCP stdio server', () => {
       await client.connect(transport);
       const listed = await client.listTools();
       const listedNames = listed.tools.map((tool) => tool.name);
-      expect(listedNames).toEqual(expect.arrayContaining([...MEMORY_MCP_TOOL_NAME_LIST]));
-      expect(listedNames).toEqual(expect.arrayContaining([
-        ALIAS_MCP_TOOLS.RESOLVE,
-        ALIAS_MCP_TOOLS.LIST,
-        ALIAS_MCP_TOOLS.SAVE,
-        ALIAS_MCP_TOOLS.DELETE,
+      expect(listedNames).toEqual(expect.arrayContaining([MCP_TOOL_DISCOVERY_NAME, ...MCP_TOOL_DISCOVERY_DEFAULT_ACTIVE]));
+    } finally {
+      await client.close();
+    }
+  });
+
+  it('activates only matching tools and replaces the previous lazy result set', async () => {
+    const client = new Client({ name: 'memory-mcp-lazy-tools-test', version: '0.1.0' });
+    const transport = new StdioClientTransport({
+      command: process.execPath,
+      args: ['--import', 'tsx', 'src/index.ts', 'memory', 'mcp'],
+      cwd: process.cwd(),
+      env: { PATH: process.env.PATH ?? '', HOME: process.env.HOME ?? '' },
+      stderr: 'pipe',
+    });
+
+    try {
+      await client.connect(transport);
+      expect((await client.listTools()).tools.map((tool) => tool.name)).toEqual(expect.arrayContaining([MCP_TOOL_DISCOVERY_NAME, ...MCP_TOOL_DISCOVERY_DEFAULT_ACTIVE]));
+
+      const sendSearch = await client.callTool({
+        name: MCP_TOOL_DISCOVERY_NAME,
+        arguments: { query: MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE },
+      });
+      expect(sendSearch.structuredContent).toMatchObject({ activated: [MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE] });
+      // Replacement applies to the DISCOVERED tail only: core tools are never
+      // retired by a later search, or an agent would lose delegation mid-workflow.
+      expect((await client.listTools()).tools.map((tool) => tool.name).sort()).toEqual([
+        MCP_TOOL_DISCOVERY_NAME,
+        ...MCP_TOOL_DISCOVERY_DEFAULT_ACTIVE,
+      ].sort());
+
+      const cronSearch = await client.callTool({
+        name: MCP_TOOL_DISCOVERY_NAME,
+        arguments: { query: 'cron' },
+      });
+      expect(cronSearch.structuredContent).toMatchObject({
+        activated: expect.arrayContaining([MEMORY_MCP_TOOL_NAMES.CRON_LIST, MEMORY_MCP_TOOL_NAMES.CRON_CREATE]),
+      });
+      const cronNames = (await client.listTools()).tools.map((tool) => tool.name);
+      expect(cronNames).toContain(MCP_TOOL_DISCOVERY_NAME);
+      expect(cronNames).toContain(MEMORY_MCP_TOOL_NAMES.CRON_LIST);
+      // send_message is core, so it survives an unrelated cron search.
+      expect(cronNames).toContain(MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE);
+      // ...while a previously discovered non-core tool is retired as designed.
+      expect(cronNames).not.toContain(MEMORY_MCP_TOOL_NAMES.LIST_MACHINES);
+    } finally {
+      await client.close();
+    }
+  });
+
+  // Must observe a NON-core tool: core tools are already enabled at bootstrap, so
+  // activating one is a no-op and emits no tools/list_changed at all.
+  // Blind spot in the original lazy-tools change: nothing covered what happens
+  // when a client calls a tool WITHOUT searching first. That is the exact path a
+  // cached tool list or a hard-coded call takes, so both outcomes are pinned.
+  it('serves core tools without discovery and rejects a hidden one', async () => {
+    const client = new Client({ name: 'memory-mcp-no-discovery-test', version: '0.1.0' }, {});
+    const server = createMemoryMcpServer({
+      transport: 'in_process',
+      userId: 'user-1',
+      namespace,
+      sessionName: 'deck_proj_brain',
+      projectName: 'proj',
+      projectRoot: '/tmp/proj',
+    });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    try {
+      await Promise.all([client.connect(clientTransport), server.connect(serverTransport)]);
+      // Core: callable with no discovery round-trip at all.
+      const core = await client.callTool({
+        name: MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS,
+        arguments: {},
+      });
+      expect(core.isError).not.toBe(true);
+      // Non-core: still hidden, and the failure is explicit rather than silent.
+      const hidden = await client.callTool({
+        name: MEMORY_MCP_TOOL_NAMES.LIST_MACHINES,
+        arguments: {},
+      });
+      // Surfaces as an error RESULT, not a thrown rejection: a caller that
+      // ignores isError would read this as success, which is why it is pinned.
+      expect(hidden.isError).toBe(true);
+      expect(JSON.stringify(hidden.content)).toMatch(/disabled/i);
+    } finally {
+      await client.close();
+    }
+  });
+
+  it('publishes a refreshed tool list when discovery changes the active set', async () => {
+    let resolveChanged: ((names: string[]) => void) | undefined;
+    const changed = new Promise<string[]>((resolve) => { resolveChanged = resolve; });
+    const client = new Client({ name: 'memory-mcp-list-changed-test', version: '0.1.0' }, {
+      listChanged: {
+        tools: {
+          debounceMs: 0,
+          onChanged: (error, tools) => {
+            if (!error && tools?.some((tool) => tool.name === MEMORY_MCP_TOOL_NAMES.LIST_MACHINES)) {
+              resolveChanged?.(tools.map((tool) => tool.name));
+            }
+          },
+        },
+      },
+    });
+    const server = createMemoryMcpServer({
+      transport: 'in_process',
+      userId: 'user-1',
+      namespace,
+      sessionName: 'deck_proj_brain',
+      projectName: 'proj',
+      projectRoot: '/tmp/proj',
+    });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+
+    try {
+      await Promise.all([client.connect(clientTransport), server.connect(serverTransport)]);
+      await client.callTool({
+        name: MCP_TOOL_DISCOVERY_NAME,
+        arguments: { query: MEMORY_MCP_TOOL_NAMES.LIST_MACHINES },
+      });
+      await expect(changed).resolves.toEqual(expect.arrayContaining([
+        MCP_TOOL_DISCOVERY_NAME,
+        MEMORY_MCP_TOOL_NAMES.LIST_MACHINES,
       ]));
     } finally {
       await client.close();
@@ -294,7 +442,7 @@ describe('memory MCP stdio server', () => {
 
     try {
       await client.connect(transport);
-      const result = await client.callTool({ name: 'send_list_targets', arguments: {} });
+      const result = await callLazyTool(client, 'send_list_targets', {});
       expect(result.structuredContent).toMatchObject({
         status: 'ok',
         items: [
@@ -311,7 +459,7 @@ describe('memory MCP stdio server', () => {
       expect(JSON.stringify(result.structuredContent)).not.toContain('deck_sub_worker');
 
       await writeSessionStore(home, { includeLatePeer: true });
-      const refreshed = await client.callTool({ name: 'send_list_targets', arguments: { query: 'Late' } });
+      const refreshed = await callLazyTool(client, 'send_list_targets', { query: 'Late' });
       expect(refreshed.structuredContent).toMatchObject({
         status: 'ok',
         items: [expect.objectContaining({ target: 'deck_sub_late', label: 'Late' })],
@@ -360,12 +508,9 @@ describe('memory MCP stdio server', () => {
 
     try {
       await client.connect(transport);
-      const result = await client.callTool({
-        name: 'send_message',
-        arguments: {
+      const result = await callLazyTool(client, 'send_message', {
           target: 'deck_sub_peer',
           message: 'hello from stdio mcp',
-        },
       });
 
       expect(result.structuredContent).toMatchObject({
@@ -380,13 +525,10 @@ describe('memory MCP stdio server', () => {
         deliveryMode: 'append',
       }]);
 
-      const queuedResult = await client.callTool({
-        name: 'send_message',
-        arguments: {
+      const queuedResult = await callLazyTool(client, 'send_message', {
           target: 'deck_sub_peer',
           message: 'queue this from stdio mcp',
           deliveryMode: 'queue',
-        },
       });
       expect(queuedResult.structuredContent).toMatchObject({
         status: 'accepted',
@@ -401,12 +543,9 @@ describe('memory MCP stdio server', () => {
       });
 
       await writeSessionStore(home, { includeLatePeer: true });
-      const refreshedSend = await client.callTool({
-        name: 'send_message',
-        arguments: {
+      const refreshedSend = await callLazyTool(client, 'send_message', {
           target: 'deck_sub_late',
           message: 'hello late peer',
-        },
       });
       expect(refreshedSend.structuredContent).toMatchObject({
         status: 'accepted',
@@ -460,15 +599,12 @@ describe('memory MCP stdio server', () => {
     });
     try {
       await client.connect(transport);
-      const result = await client.callTool({
-        name: 'peer_audit_reply',
-        arguments: {
+      const result = await callLazyTool(client, 'peer_audit_reply', {
           attemptId: 'attempt_12345678',
           replyCapability: 'A'.repeat(32),
           verdict: 'PASS',
           findings: 'Focused checks passed.',
           validations: [{ kind: 'test', label: 'focused', outcome: 'passed', summary: '12 passed' }],
-        },
       });
       expect(result.structuredContent).toEqual({ status: 'ok', accepted: true });
       expect(received).toEqual([{
@@ -526,13 +662,10 @@ describe('memory MCP stdio server', () => {
     });
     try {
       await client.connect(transport);
-      const result = await client.callTool({
-        name: 'delegation_reply',
-        arguments: {
+      const result = await callLazyTool(client, 'delegation_reply', {
           delegationId: 'delegation_identity_1234567890',
           replyCapability: 'reply_capability_1234567890_ABCDEFG',
           result: 'Completed with exact evidence.',
-        },
       });
       expect(result.structuredContent).toEqual({
         status: 'ok',
@@ -615,10 +748,7 @@ describe('memory MCP stdio server', () => {
 
     try {
       await client.connect(transport);
-      const listed = await client.callTool({
-        name: 'send_list_targets',
-        arguments: { query: 'claude-opus' },
-      });
+      const listed = await callLazyTool(client, 'send_list_targets', { query: 'claude-opus' });
       expect(listed.structuredContent).toMatchObject({
         status: 'ok',
         items: [expect.objectContaining({
@@ -630,12 +760,9 @@ describe('memory MCP stdio server', () => {
 
       await writeFile(join(home, '.imcodes', 'sessions.json'), JSON.stringify({ sessions: {} }), 'utf8');
 
-      const sent = await client.callTool({
-        name: 'send_message',
-        arguments: {
+      const sent = await callLazyTool(client, 'send_message', {
           target: 'deck_sub_peer',
           message: 'hello after transient empty store',
-        },
       });
 
       expect(sent.structuredContent).toMatchObject({
@@ -710,7 +837,10 @@ describe('createMemoryMcpServerFromEnv supervision wiring', () => {
     vi.resetModules();
     const seen: unknown[] = [];
     vi.doMock('../../src/daemon/supervision-mcp-tools.js', () => ({
-      registerSupervisionMcpTools: (_s: unknown, _c: unknown, deps: unknown) => { seen.push(deps); },
+      registerSupervisionMcpTools: (_s: unknown, _c: unknown, deps: unknown) => {
+        seen.push(deps);
+        return new Map();
+      },
     }));
     const mod = await import('../../src/daemon/memory-mcp-server.js');
     const marker = { boundRegistry: Symbol('registry') };

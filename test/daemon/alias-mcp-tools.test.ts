@@ -3,6 +3,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import type { ContextNamespace } from '../../shared/context-types.js';
 import { ALIAS_MCP_TOOLS, ALIAS_REASONS, type AliasEntry } from '../../shared/alias-types.js';
+import { MCP_TOOL_DISCOVERY_NAME } from '../../shared/mcp-tool-discovery.js';
 import { createMemoryMcpServer } from '../../src/daemon/memory-mcp-server.js';
 import {
   createAliasMcpToolHandlers,
@@ -224,6 +225,7 @@ describe('alias MCP tools', () => {
       const client = new Client({ name: 'alias-mcp-test', version: '0.1.0' });
       try {
         await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+        await client.callTool({ name: MCP_TOOL_DISCOVERY_NAME, arguments: { query: '*' } });
         const listed = await client.listTools();
         const names = listed.tools.map((tool) => tool.name);
 

@@ -14,6 +14,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { MEMORY_MCP_ENV_KEYS } from '../../shared/memory-mcp-env.js';
 import { SUPERVISION_MCP_TOOLS } from '../../shared/supervision-mcp-tools.js';
+import { MCP_TOOL_DISCOVERY_NAME } from '../../shared/mcp-tool-discovery.js';
 import { createMemoryMcpServerFromEnv } from '../../src/daemon/memory-mcp-server.js';
 import { createSupervisionRegistryPort } from '../../src/daemon/supervision-registry-port.js';
 import {
@@ -40,6 +41,10 @@ async function connectProductionServer() {
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   const client = new Client({ name: 'supervision-binding-test', version: '0.1.0' });
   await Promise.all([client.connect(clientTransport), server.connect(serverTransport)]);
+  await client.callTool({
+    name: MCP_TOOL_DISCOVERY_NAME,
+    arguments: { query: SUPERVISION_MCP_TOOLS.LIST },
+  });
   return { client, close: () => client.close() };
 }
 

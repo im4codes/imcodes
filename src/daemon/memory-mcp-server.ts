@@ -24,10 +24,11 @@ import {
 import { createServerCapabilityService } from '../capability/server-capability-service.js';
 import { activateCapabilitySkill } from '../capability/capability-skill-activation.js';
 import {
-  CAPABILITY_AI_SYSTEM_INSTRUCTIONS,
   CAPABILITY_ERROR,
   type CapabilityErrorResult,
 } from '../../shared/capability-management.js';
+import { MCP_TOOL_DISCOVERY_SERVER_INSTRUCTIONS } from '../../shared/mcp-tool-discovery.js';
+import { registerMcpToolDiscovery } from './mcp-tool-discovery.js';
 import { isMemoryScope, validateMemoryScopeIdentity } from '../../shared/memory-scope.js';
 import type { ContextNamespace } from '../../shared/context-types.js';
 import { MEMORY_MCP_SEND_DELIVERY_MODES } from '../../shared/memory-mcp-contracts.js';
@@ -50,17 +51,23 @@ export function createMemoryMcpServer(
     name: IMCODES_MEMORY_MCP_SERVER_NAME,
     version: '0.1.0',
   }, {
-    instructions: CAPABILITY_AI_SYSTEM_INSTRUCTIONS,
+    // The full capability policy is already injected once by
+    // transport-runtime-assembly. Keep MCP-local instructions bootstrap-sized
+    // so hosts do not repeat the same policy for every exposed tool.
+    instructions: MCP_TOOL_DISCOVERY_SERVER_INSTRUCTIONS,
   });
-  registerMemoryMcpTools(server, caller, toolDeps);
-  registerCapabilityMcpTools(server, caller, toolDeps);
+  const registered = new Map([
+    ...registerMemoryMcpTools(server, caller, toolDeps),
+    ...registerCapabilityMcpTools(server, caller, toolDeps),
+  ]);
   // Exact server-backed stores share this MCP server surface but stay outside
   // the fuzzy-memory contract list and schema firewall.
-  registerAliasMcpTools(server, caller);
-  registerMessagePinMcpTools(server, caller, messagePinToolDeps);
+  for (const [name, tool] of registerAliasMcpTools(server, caller)) registered.set(name, tool);
+  for (const [name, tool] of registerMessagePinMcpTools(server, caller, messagePinToolDeps)) registered.set(name, tool);
   // Supervision registry: exact server-backed operations, same separation as
   // alias/message-pin tools -- outside the fuzzy-memory contract + firewall.
-  registerSupervisionMcpTools(server, caller, supervisionToolDeps);
+  for (const [name, tool] of registerSupervisionMcpTools(server, caller, supervisionToolDeps)) registered.set(name, tool);
+  registerMcpToolDiscovery(server, registered);
   return server;
 }
 

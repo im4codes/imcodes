@@ -2,7 +2,7 @@
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/preact';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
 import {
   SUPERVISION_TASK_LIFECYCLE_STATUSES,
 } from '@shared/supervision-config.js';
@@ -19,6 +19,40 @@ import {
   createSupervisionTaskConsoleState,
   type SupervisionTaskConsoleReducerState,
 } from '../../src/supervision-task-console-reducer.js';
+
+// Preact chooses the native lowercase event name only when the DOM advertises
+// `onpointerdown`. jsdom does not, so without this capability marker Preact
+// registers a case-sensitive `PointerDown` listener and a realistic
+// `pointerdown` never reaches production code.
+const originalOnPointerDown = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'onpointerdown');
+Object.defineProperty(HTMLElement.prototype, 'onpointerdown', {
+  configurable: true,
+  writable: true,
+  value: null,
+});
+
+function dispatchPointerEvent(
+  target: EventTarget,
+  type: 'pointerdown' | 'pointermove' | 'pointerup',
+  init: MouseEventInit & { pointerId: number },
+): MouseEvent & { pointerId: number } {
+  // jsdom has no PointerEvent constructor. Testing Library therefore falls
+  // back to Event and silently drops button/clientX/pointerId. A MouseEvent
+  // retains the real coordinates; pointerId is the only pointer-specific
+  // field the production handler needs.
+  const event = new MouseEvent(type, { bubbles: true, cancelable: true, ...init }) as MouseEvent & { pointerId: number };
+  Object.defineProperty(event, 'pointerId', { configurable: true, value: init.pointerId });
+  fireEvent(target, event);
+  return event;
+}
+
+afterAll(() => {
+  if (originalOnPointerDown) {
+    Object.defineProperty(HTMLElement.prototype, 'onpointerdown', originalOnPointerDown);
+  } else {
+    delete (HTMLElement.prototype as HTMLElement & { onpointerdown?: unknown }).onpointerdown;
+  }
+});
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
@@ -191,10 +225,16 @@ describe('SupervisionTaskConsole', () => {
     const handle = screen.getByRole('separator', { name: 'supervision_task_console.resize' });
     expect(handle.getAttribute('aria-valuemax')).toBe(String(supervisionConsoleMaxWidth(1000)));
 
-    fireEvent.pointerDown(handle, { button: 0, pointerId: 7, clientX: 500 });
-    fireEvent.pointerMove(document, { pointerId: 7, clientX: -10_000 });
+    const addListenerSpy = vi.spyOn(document, 'addEventListener');
+    dispatchPointerEvent(handle, 'pointerdown', { button: 0, pointerId: 7, clientX: 500 });
+    expect(addListenerSpy).toHaveBeenCalledWith('pointermove', expect.any(Function));
+    dispatchPointerEvent(document, 'pointermove', { pointerId: 99, clientX: -10_000 });
+    expect(handle.getAttribute('aria-valuenow')).toBe('420');
+    const acceptedMove = dispatchPointerEvent(document, 'pointermove', { pointerId: 7, clientX: -10_000 });
+    expect(acceptedMove.clientX).toBe(-10_000);
     expect(handle.getAttribute('aria-valuenow')).toBe('650');
-    fireEvent.pointerUp(document, { pointerId: 7 });
+    dispatchPointerEvent(document, 'pointerup', { pointerId: 7 });
+    addListenerSpy.mockRestore();
 
     Object.defineProperty(window, 'innerWidth', { configurable: true, value: 800, writable: true });
     fireEvent(window, new Event('resize'));

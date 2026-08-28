@@ -1,4 +1,4 @@
-import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { McpServer, type RegisteredTool } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
 import {
@@ -119,12 +119,13 @@ export function registerCapabilityMcpTools(
   server: McpServer,
   caller: McpRuntimeCaller,
   deps: CapabilityMcpToolDeps,
-): void {
-  if (!canRegisterCapabilityMcpTools(caller, deps)) return;
+): ReadonlyMap<string, RegisteredTool> {
+  const registered = new Map<string, RegisteredTool>();
+  if (!canRegisterCapabilityMcpTools(caller, deps)) return registered;
   const service = deps.capabilityService!;
   for (const name of CAPABILITY_MCP_TOOL_NAMES) {
     const contract = CAPABILITY_MCP_TOOL_CONTRACTS[name];
-    const tool = server.registerTool(name, {
+    registered.set(name, server.registerTool(name, {
       description: contract.description,
       inputSchema: CAPABILITY_MCP_INPUT_SCHEMAS[name],
     }, async (raw: unknown) => {
@@ -151,6 +152,7 @@ export function registerCapabilityMcpTools(
       } catch {
         return toolResult(error(CAPABILITY_ERROR.INTERNAL_ERROR, 'capability service failed safely', true));
       }
-    });
+    }));
   }
+  return registered;
 }

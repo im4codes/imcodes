@@ -5166,6 +5166,27 @@ function countHardLines(text: string): number {
   return text.replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n').length;
 }
 
+/**
+ * Measure visual line overflow from the browser's rendered box. `scrollHeight`
+ * includes soft-wrapped content even while the element is capped, so this
+ * catches long paragraphs without guessing from character count.
+ */
+export function renderedUserMessageExceedsLineLimit(
+  element: HTMLElement,
+  lineLimit = USER_MESSAGE_COLLAPSE_LINE_LIMIT,
+): boolean | null {
+  const style = window.getComputedStyle(element);
+  const fontSize = Number.parseFloat(style.fontSize);
+  const rawLineHeight = Number.parseFloat(style.lineHeight);
+  const lineHeight = style.lineHeight.endsWith('px')
+    ? rawLineHeight
+    : Number.isFinite(rawLineHeight) && Number.isFinite(fontSize)
+      ? rawLineHeight * fontSize
+      : Number.NaN;
+  if (!Number.isFinite(lineHeight) || lineHeight <= 0 || element.scrollHeight <= 0) return null;
+  return element.scrollHeight > (lineHeight * lineLimit) + 0.5;
+}
+
 function UserMessageText({
   text,
   onPathClick,
@@ -5184,14 +5205,53 @@ function UserMessageText({
   onOpenLocalWebPreview?: ChatLocalWebPreviewOpenHandler;
 }) {
   const { t } = useTranslation();
-  const lineCount = countHardLines(text);
-  const shouldFold = lineCount > USER_MESSAGE_COLLAPSE_LINE_LIMIT;
+  const contentRef = useRef<HTMLDivElement>(null);
+  const hardLineOverflow = countHardLines(text) > USER_MESSAGE_COLLAPSE_LINE_LIMIT;
+  const [renderedOverflow, setRenderedOverflow] = useState<boolean | null>(
+    hardLineOverflow ? true : null,
+  );
   const [expanded, setExpanded] = useState(false);
+  const shouldFold = renderedOverflow === true;
+  const measuring = renderedOverflow === null;
   const folded = shouldFold && !expanded;
 
+  useLayoutEffect(() => {
+    const content = contentRef.current;
+    if (!content) return;
+    let active = true;
+    const measure = () => {
+      const measured = renderedUserMessageExceedsLineLimit(content);
+      const next = hardLineOverflow || measured;
+      if (!active || next === null) return;
+      setRenderedOverflow((current) => current === next ? current : next);
+    };
+
+    measure();
+    const observer = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(measure);
+    observer?.observe(content);
+    if (content.parentElement) observer?.observe(content.parentElement);
+    window.addEventListener('resize', measure);
+
+    const fonts = document.fonts;
+    fonts?.addEventListener?.('loadingdone', measure);
+    void fonts?.ready.then(() => {
+      if (active) measure();
+    });
+
+    return () => {
+      active = false;
+      observer?.disconnect();
+      window.removeEventListener('resize', measure);
+      fonts?.removeEventListener?.('loadingdone', measure);
+    };
+  }, [hardLineOverflow, text]);
+
   return (
-    <div class={`chat-user-message-fold${shouldFold ? ' is-foldable' : ''}${folded ? ' is-folded' : ''}`}>
-      <div class={`chat-bubble-content chat-user-message-fold-content${folded ? ' is-folded' : ''}`}>
+    <div class={`chat-user-message-fold${shouldFold ? ' is-foldable' : ''}${folded ? ' is-folded' : ''}${measuring ? ' is-measuring' : ''}`}>
+      <div
+        ref={contentRef}
+        class={`chat-bubble-content chat-user-message-fold-content${folded ? ' is-folded' : ''}${measuring ? ' is-measuring' : ''}`}
+      >
         {splitPathsAndUrls(text, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'), onOpenLocalWebPreview)}
       </div>
       {shouldFold && (

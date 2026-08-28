@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import type { CallToolResult, ServerNotification, ServerRequest } from '@modelcontextprotocol/sdk/types.js';
-import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import type { McpServer, RegisteredTool } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { RequestHandlerExtra } from '@modelcontextprotocol/sdk/shared/protocol.js';
 import {
   MEMORY_FEATURE_FLAGS,
@@ -2237,14 +2237,19 @@ export function listMemoryMcpToolDescriptors(role: NodeRole = NODE_ROLE.FULL) {
   return advertisedMcpToolNames(role).map((name) => MEMORY_MCP_TOOL_CONTRACTS[name]);
 }
 
-export function registerMemoryMcpTools(server: McpServer, caller: McpRuntimeCaller, deps: MemoryMcpToolDeps = {}): void {
+export function registerMemoryMcpTools(
+  server: McpServer,
+  caller: McpRuntimeCaller,
+  deps: MemoryMcpToolDeps = {},
+): ReadonlyMap<string, RegisteredTool> {
   const handlers = createMemoryMcpToolHandlers(caller, deps);
+  const registered = new Map<string, RegisteredTool>();
   // Role-gate the advertised surface: a controlled node never registers the
   // FULL-only machine tools, so its daemon.hello / tools/list excludes them (10.12).
   for (const name of advertisedMcpToolNames(deps.nodeRole ?? NODE_ROLE.FULL)) {
     const contract = MEMORY_MCP_TOOL_CONTRACTS[name];
     const outputSchema = machineToolOutputSchemas[name];
-    server.registerTool(name, {
+    registered.set(name, server.registerTool(name, {
       description: contract.description,
       inputSchema: schemas[name],
       // Machine tools publish an output schema so the SDK validates structuredContent
@@ -2267,8 +2272,9 @@ export function registerMemoryMcpTools(server: McpServer, caller: McpRuntimeCall
         };
       }
       return toolResult(await handlers[name](args, context), name);
-    });
+    }));
   }
+  return registered;
 }
 
 // ---------------------------------------------------------------------------
@@ -2404,12 +2410,18 @@ export function createAliasMcpToolHandlers(
   return wrapped;
 }
 
-export function registerAliasMcpTools(server: McpServer, caller: McpRuntimeCaller, deps: AliasMcpToolDeps = {}): void {
+export function registerAliasMcpTools(
+  server: McpServer,
+  caller: McpRuntimeCaller,
+  deps: AliasMcpToolDeps = {},
+): ReadonlyMap<string, RegisteredTool> {
   const handlers = createAliasMcpToolHandlers(caller, deps);
+  const registered = new Map<string, RegisteredTool>();
   for (const name of ALIAS_MCP_TOOL_NAME_LIST) {
-    server.registerTool(name, {
+    registered.set(name, server.registerTool(name, {
       description: ALIAS_MCP_TOOL_DESCRIPTIONS[name],
       inputSchema: aliasSchemas[name],
-    }, async (args: unknown) => toolResult(await handlers[name](args)));
+    }, async (args: unknown) => toolResult(await handlers[name](args))));
   }
+  return registered;
 }
