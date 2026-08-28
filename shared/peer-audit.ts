@@ -24,6 +24,8 @@ export const PEER_AUDIT_REPLY_VERSION = 'peer_audit_reply_v1' as const;
 /** Umbrella contract version for candidate/result/command payloads. */
 export const PEER_AUDIT_CONTRACT_VERSION = 'peer_audit_v1' as const;
 export const PEER_AUDIT_COMPLETED_TURN_PAYLOAD_FIELD = 'peerAuditCompletedTurn' as const;
+/** Trusted result status delivered to the coordinating session for manual audits. */
+export const PEER_AUDIT_DELEGATED_REPLY_STATUS = 'peer_audit_completed' as const;
 export const PEER_AUDIT_MESSAGES = {
   CANDIDATES: 'peer_audit.candidates',
   QUICK_RESULT: 'peer_audit.quick_result',

@@ -33,6 +33,8 @@ describe('DelegationReplyStore', () => {
       messageId: 'message_1',
       purpose: AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT,
       auditAttemptId: 'audit_attempt_1',
+      auditRevision: 'revision-1',
+      auditedSessionName: origin.sessionName,
       now: 1_000,
     });
 
@@ -40,6 +42,8 @@ describe('DelegationReplyStore', () => {
       status: AGENT_DELEGATION_REPLY_STATUSES.PENDING,
       purpose: AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT,
       auditAttemptId: 'audit_attempt_1',
+      auditRevision: 'revision-1',
+      auditedSessionName: origin.sessionName,
     });
     expect(created.record.capabilityHash).not.toBe(created.replyCapability);
     expect(store.matchPendingAuthority({
@@ -118,6 +122,46 @@ describe('DelegationReplyStore', () => {
       replay: true,
       record: { status: AGENT_DELEGATION_REPLY_STATUSES.DELIVERED },
     });
+    store.close();
+    database.close();
+  });
+
+  it('resolves a manual audit capability only by exact attempt, target identity, and token', () => {
+    const database = new DatabaseSync(':memory:');
+    const store = new DelegationReplyStore({ database });
+    const created = store.create({
+      origin,
+      target,
+      dispatchId: 'dispatch-audit',
+      messageId: 'message-audit',
+      purpose: AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT,
+      auditAttemptId: 'attempt-audit-1',
+      now: 100,
+    });
+    expect(store.matchPendingAuditAuthority({
+      auditAttemptId: 'attempt-audit-1',
+      replyCapability: created.replyCapability,
+      sender: target,
+      now: 101,
+    })?.delegationId).toBe(created.record.delegationId);
+    expect(store.matchPendingAuditAuthority({
+      auditAttemptId: 'attempt-audit-other',
+      replyCapability: created.replyCapability,
+      sender: target,
+      now: 101,
+    })).toBeUndefined();
+    expect(store.matchPendingAuditAuthority({
+      auditAttemptId: 'attempt-audit-1',
+      replyCapability: `${created.replyCapability}x`,
+      sender: target,
+      now: 101,
+    })).toBeUndefined();
+    expect(store.matchPendingAuditAuthority({
+      auditAttemptId: 'attempt-audit-1',
+      replyCapability: created.replyCapability,
+      sender: origin,
+      now: 101,
+    })).toBeUndefined();
     store.close();
     database.close();
   });

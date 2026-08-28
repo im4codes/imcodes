@@ -116,6 +116,8 @@ export type PeerAuditReplyIngressHandler = (input: {
   receivedAt: number;
 }) => PeerAuditReplyIngressHandlerResult | Promise<PeerAuditReplyIngressHandlerResult>;
 
+export type DelegatedPeerAuditReplyIngressHandler = PeerAuditReplyIngressHandler;
+
 export interface PeerAuditReplyBoundIdentity {
   sessionName: string;
   sessionInstanceId: string;
@@ -174,10 +176,18 @@ export interface PeerAuditReplyAuthorityPipelineInput<T> {
 }
 
 let activeHandler: PeerAuditReplyIngressHandler | null = null;
+let delegatedAuditHandler: DelegatedPeerAuditReplyIngressHandler | null = null;
 const ingressRateLimiter = new PeerAuditReplyRateLimiter();
 
 export function registerPeerAuditReplyIngressHandler(handler: PeerAuditReplyIngressHandler | null): void {
   activeHandler = handler;
+}
+
+/** Register the durable `send_message` audit-capability bridge. */
+export function registerDelegatedPeerAuditReplyIngressHandler(
+  handler: DelegatedPeerAuditReplyIngressHandler | null,
+): void {
+  delegatedAuditHandler = handler;
 }
 
 export function clearPeerAuditReplyIngressRateLimits(): void {
@@ -318,8 +328,19 @@ export async function submitPeerAuditReply(input: {
   }, now)) {
     return { ok: false, error: PEER_AUDIT_REPLY_ERRORS.RATE_LIMITED };
   }
-  if (!activeHandler) return { ok: false, error: 'ingress_unavailable' };
-  const handled = await activeHandler({ envelope: decoded.value, sender, receivedAt: now });
+  const request = { envelope: decoded.value, sender, receivedAt: now };
+  const handled = activeHandler
+    ? await activeHandler(request)
+    : { ok: false as const, error: 'ingress_unavailable' as const };
+  if (!handled.ok
+    && (handled.error === PEER_AUDIT_REPLY_ERRORS.INVALID_CAPABILITY
+      || handled.error === 'ingress_unavailable')
+    && delegatedAuditHandler) {
+    const delegated = await delegatedAuditHandler(request);
+    if (delegated.ok || delegated.error !== PEER_AUDIT_REPLY_ERRORS.INVALID_CAPABILITY) {
+      return delegated.ok ? { ok: true } : { ok: false, error: delegated.error };
+    }
+  }
   // Internal reasons are deliberately not part of the public daemon response.
   return handled.ok ? { ok: true } : { ok: false, error: handled.error };
 }

@@ -866,7 +866,7 @@ export async function dispatchSendMessage(
       scopeFiles: [...(input.task.ownedFiles ?? []), ...(input.task.sharedFiles ?? [])],
       claimMode: input.audit ? 'read_only' : 'exclusive',
       auditAttemptId: input.task.auditAttemptId ?? input.audit?.attemptId,
-      auditRevision: input.task.auditRevision,
+      auditRevision: input.task.auditRevision ?? input.task.currentRevision,
       ...(executionBinding ? { executionBinding } : {}),
       ...(input.task.economyPolicy ? { economyPolicy: input.task.economyPolicy } : {}),
       ...(auditRoutingReason ? { auditRoutingReason } : {}),
@@ -880,6 +880,9 @@ export async function dispatchSendMessage(
     supervisedAssignmentId = assignment.value.assignmentId;
   }
 
+  const delegatedAuditRevision = input.task
+    ? String(input.task.auditRevision ?? input.task.currentRevision ?? '').trim()
+    : '';
   const dispatchId = createSendDispatchId();
   const callerRecord = allSessions.find((session) => session.name === caller.sessionName);
   const deliveries: SendMessageDelivery[] = [];
@@ -910,6 +913,9 @@ export async function dispatchSendMessage(
           dispatchId,
           messageId,
           ...(input.audit ? { audit: input.audit } : {}),
+          ...(input.audit && delegatedAuditRevision
+            ? { auditRevision: delegatedAuditRevision }
+            : {}),
           now,
         })
       : null;

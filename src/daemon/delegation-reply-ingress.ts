@@ -12,12 +12,22 @@ import { isValidImcodesSessionName } from '../../shared/session-scope.js';
 import { ensureTransportRuntimeAvailable, getTransportRuntime } from '../agent/session-manager.js';
 import { getSession, type SessionRecord } from '../store/session-store.js';
 import {
+  PEER_AUDIT_REPLY_ERRORS,
+  PEER_AUDIT_DELEGATED_REPLY_STATUS,
+  validatePeerAuditPassEvidence,
+  type PeerAuditReplyEnvelope,
+} from '../../shared/peer-audit.js';
+import {
   getDelegationReplyStore,
   type DelegationReplyBoundIdentity,
   type DelegationReplyRecord,
 } from './delegation-reply-store.js';
-import { PeerAuditReplyRateLimiter } from './peer-audit-reply-ingress.js';
+import {
+  PeerAuditReplyRateLimiter,
+  registerDelegatedPeerAuditReplyIngressHandler,
+} from './peer-audit-reply-ingress.js';
 import { emitDelegationReplyDelivered } from './delegation-reply-events.js';
+import { getSupervisionTaskRegistry } from './supervision-state-store.js';
 import { timelineEmitter } from './timeline-emitter.js';
 import logger from '../util/logger.js';
 
@@ -111,6 +121,69 @@ function emitDelegationReplyTimeline(record: DelegationReplyRecord): void {
     },
   );
 }
+
+function delegatedPeerAuditResult(envelope: PeerAuditReplyEnvelope): string {
+  return JSON.stringify({
+    status: PEER_AUDIT_DELEGATED_REPLY_STATUS,
+    attemptId: envelope.attemptId,
+    verdict: envelope.verdict,
+    findings: envelope.findings,
+    validations: envelope.validations,
+  });
+}
+
+async function submitDelegatedPeerAuditReply(input: {
+  envelope: PeerAuditReplyEnvelope;
+  sender: SessionRecord;
+  receivedAt: number;
+}): Promise<{ ok: true } | { ok: false; error: typeof PEER_AUDIT_REPLY_ERRORS[keyof typeof PEER_AUDIT_REPLY_ERRORS] }> {
+  const senderIdentity = boundIdentity(input.sender);
+  if (!senderIdentity) return { ok: false, error: PEER_AUDIT_REPLY_ERRORS.INVALID_CAPABILITY };
+  const authority = getDelegationReplyStore().matchPendingAuditAuthority({
+    auditAttemptId: input.envelope.attemptId,
+    replyCapability: input.envelope.replyCapability,
+    sender: senderIdentity,
+    now: input.receivedAt,
+  });
+  if (!authority) return { ok: false, error: PEER_AUDIT_REPLY_ERRORS.INVALID_CAPABILITY };
+  const evidence = validatePeerAuditPassEvidence(
+    input.envelope.verdict,
+    input.envelope.validations,
+  );
+  if (!evidence.ok) {
+    return { ok: false, error: PEER_AUDIT_REPLY_ERRORS.INSUFFICIENT_VALIDATION_EVIDENCE };
+  }
+  if (authority.auditRevision && authority.auditedSessionName) {
+    const persisted = getSupervisionTaskRegistry().applyMatchingAuditReceipt({
+      attemptId: input.envelope.attemptId,
+      revision: authority.auditRevision,
+      verdict: input.envelope.verdict,
+      auditedSessionName: authority.auditedSessionName,
+      auditorSessionName: input.sender.name,
+      findings: input.envelope.findings,
+      now: input.receivedAt,
+    });
+    // An audit may be intentionally unbound to a registry task. Every other
+    // failure means a daemon-minted attempt no longer matches its authoritative
+    // task/revision and must not be delivered as an accepted result.
+    if (!persisted.ok && persisted.reason !== 'not_found') {
+      return { ok: false, error: PEER_AUDIT_REPLY_ERRORS.INVALID_CAPABILITY };
+    }
+  }
+  const received = getDelegationReplyStore().receive({
+    delegationId: authority.delegationId,
+    replyCapability: input.envelope.replyCapability,
+    result: delegatedPeerAuditResult(input.envelope),
+    sender: senderIdentity,
+    now: input.receivedAt,
+  });
+  if (!received.ok) return { ok: false, error: PEER_AUDIT_REPLY_ERRORS.INVALID_CAPABILITY };
+  if (!received.replay) emitDelegationReplyTimeline(received.record);
+  startBackgroundDelivery(received.record);
+  return { ok: true };
+}
+
+registerDelegatedPeerAuditReplyIngressHandler(submitDelegatedPeerAuditReply);
 
 function scheduleRetry(delegationId: string, notificationId: string, delayMs: number): void {
   if (retryTimers.has(notificationId)) return;

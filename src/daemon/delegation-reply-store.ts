@@ -5,6 +5,7 @@ import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 
 import {
+  AGENT_DELEGATION_PURPOSES,
   AGENT_DELEGATION_REPLY_STATUSES,
   AGENT_DELEGATION_REPLY_MAX_MESSAGES,
   AGENT_DELEGATION_REPLY_TTL_MS,
@@ -36,6 +37,8 @@ export interface DelegationReplyRecord {
   notificationId: string;
   purpose?: AgentDelegationPurpose;
   auditAttemptId?: string;
+  auditRevision?: string;
+  auditedSessionName?: string;
   status: AgentDelegationReplyStatus;
   result?: string;
   createdAt: number;
@@ -51,6 +54,8 @@ export interface CreateDelegationReplyInput {
   messageId: string;
   purpose?: AgentDelegationPurpose;
   auditAttemptId?: string;
+  auditRevision?: string;
+  auditedSessionName?: string;
   now?: number;
 }
 
@@ -106,6 +111,12 @@ function parseRow(row: Record<string, unknown>): DelegationReplyRecord {
   const auditAttemptId = typeof row.auditAttemptId === 'string' && row.auditAttemptId
     ? row.auditAttemptId
     : undefined;
+  const auditRevision = typeof row.auditRevision === 'string' && row.auditRevision
+    ? row.auditRevision
+    : undefined;
+  const auditedSessionName = typeof row.auditedSessionName === 'string' && row.auditedSessionName
+    ? row.auditedSessionName
+    : undefined;
   return {
     delegationId: rowString(row, 'delegationId'),
     capabilityHash: rowString(row, 'capabilityHash'),
@@ -124,6 +135,8 @@ function parseRow(row: Record<string, unknown>): DelegationReplyRecord {
     notificationId: rowString(row, 'notificationId'),
     ...(purpose ? { purpose } : {}),
     ...(auditAttemptId ? { auditAttemptId } : {}),
+    ...(auditRevision ? { auditRevision } : {}),
+    ...(auditedSessionName ? { auditedSessionName } : {}),
     status: rowString(row, 'status') as AgentDelegationReplyStatus,
     ...(result !== undefined ? { result } : {}),
     createdAt: Number(row.createdAt ?? 0),
@@ -168,6 +181,8 @@ export class DelegationReplyStore {
         notification_id TEXT NOT NULL,
         purpose TEXT,
         audit_attempt_id TEXT,
+        audit_revision TEXT,
+        audited_session_name TEXT,
         status TEXT NOT NULL,
         result TEXT,
         created_at INTEGER NOT NULL,
@@ -199,6 +214,12 @@ export class DelegationReplyStore {
     }
     if (!names.has('audit_attempt_id')) {
       this.#db.exec('ALTER TABLE delegation_replies ADD COLUMN audit_attempt_id TEXT');
+    }
+    if (!names.has('audit_revision')) {
+      this.#db.exec('ALTER TABLE delegation_replies ADD COLUMN audit_revision TEXT');
+    }
+    if (!names.has('audited_session_name')) {
+      this.#db.exec('ALTER TABLE delegation_replies ADD COLUMN audited_session_name TEXT');
     }
     // Preserve durable replies created by versions that stored the single
     // message directly on the authority row.
@@ -248,9 +269,10 @@ export class DelegationReplyStore {
         delegation_id, capability_hash,
         origin_session_name, origin_session_instance_id, origin_runtime_epoch,
         target_session_name, target_session_instance_id, target_runtime_epoch,
-        dispatch_id, message_id, notification_id, purpose, audit_attempt_id, status,
+        dispatch_id, message_id, notification_id, purpose, audit_attempt_id,
+        audit_revision, audited_session_name, status,
         created_at, expires_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       delegationId,
       capabilityHash(replyCapability),
@@ -265,6 +287,8 @@ export class DelegationReplyStore {
       notificationId,
       input.purpose ?? null,
       input.auditAttemptId ?? null,
+      input.auditRevision ?? null,
+      input.auditedSessionName ?? null,
       AGENT_DELEGATION_REPLY_STATUSES.PENDING,
       now,
       now + AGENT_DELEGATION_REPLY_TTL_MS,
@@ -291,6 +315,8 @@ export class DelegationReplyStore {
         notification_id AS notificationId,
         purpose,
         audit_attempt_id AS auditAttemptId,
+        audit_revision AS auditRevision,
+        audited_session_name AS auditedSessionName,
         status,
         result,
         created_at AS createdAt,
@@ -318,6 +344,8 @@ export class DelegationReplyStore {
         message.notification_id AS notificationId,
         authority.purpose,
         authority.audit_attempt_id AS auditAttemptId,
+        authority.audit_revision AS auditRevision,
+        authority.audited_session_name AS auditedSessionName,
         message.status,
         message.result,
         authority.created_at AS createdAt,
@@ -354,6 +382,42 @@ export class DelegationReplyStore {
       || now >= current.expiresAt
       || !capabilityMatches(current.capabilityHash, input.replyCapability)) return undefined;
     return current;
+  }
+
+  /**
+   * Resolve the reply authority minted by `send_message({ audit: ... })`.
+   *
+   * Manual supervision audits intentionally expose `peer_audit_reply`, not
+   * `delegation_reply`, but their capability is stored in this durable table.
+   * Binding by attempt + exact target identity + capability keeps that bridge
+   * fail closed without turning the attempt id into an existence oracle.
+   */
+  matchPendingAuditAuthority(input: {
+    auditAttemptId: string;
+    replyCapability: string;
+    sender: DelegationReplyBoundIdentity;
+    now?: number;
+  }): DelegationReplyRecord | undefined {
+    const rows = this.#db.prepare(`
+      SELECT delegation_id AS delegationId
+      FROM delegation_replies
+      WHERE purpose = ? AND audit_attempt_id = ?
+    `).all(
+      AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT,
+      input.auditAttemptId,
+    ) as Array<{ delegationId?: unknown }>;
+    if (rows.length !== 1 || typeof rows[0]?.delegationId !== 'string') return undefined;
+    const current = this.matchPendingAuthority({
+      delegationId: rows[0].delegationId,
+      replyCapability: input.replyCapability,
+      now: input.now,
+    });
+    return current
+      && current.purpose === AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT
+      && current.auditAttemptId === input.auditAttemptId
+      && identityMatches(current.target, input.sender)
+      ? current
+      : undefined;
   }
 
   receive(input: {

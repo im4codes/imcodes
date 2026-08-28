@@ -15,6 +15,7 @@ const sendKeysMock = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
 const sendProcessSessionMessageForAutomationMock = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
 const capturePane = vi.hoisted(() => vi.fn().mockResolvedValue([]));
 const getTransportRuntimeMock = vi.hoisted(() => vi.fn());
+const ensureTransportRuntimeAvailableMock = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
 const refreshSessionWatcherMock = vi.hoisted(() => vi.fn().mockResolvedValue(false));
 
 vi.mock('../../src/store/session-store.js', () => ({
@@ -46,6 +47,7 @@ vi.mock('../../src/agent/detect.js', () => ({
 
 vi.mock('../../src/agent/session-manager.js', () => ({
   getTransportRuntime: getTransportRuntimeMock,
+  ensureTransportRuntimeAvailable: ensureTransportRuntimeAvailableMock,
 }));
 
 vi.mock('../../src/daemon/watcher-controls.js', () => ({
@@ -61,6 +63,8 @@ import {
   registerPeerAuditReplyIngressHandler,
 } from '../../src/daemon/peer-audit-reply-ingress.js';
 import { PEER_AUDIT_REPLY_TOTAL_BYTES, PEER_AUDIT_REPLY_VERSION } from '../../shared/peer-audit.js';
+import { AGENT_DELEGATION_PURPOSES } from '../../shared/agent-delegation.js';
+import { getDelegationReplyStore } from '../../src/daemon/delegation-reply-store.js';
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -271,6 +275,62 @@ describe('Hook server /send endpoint', () => {
         envelope: validReply,
         sender: expect.objectContaining({ name: 'deck_proj_w1' }),
       }));
+      expect(sendKeysMock).not.toHaveBeenCalled();
+      expect(sendProcessSessionMessageForAutomationMock).not.toHaveBeenCalled();
+    });
+
+    it('accepts a manual send_message audit capability through the real hook ingress fallback', async () => {
+      const origin = {
+        sessionName: 'deck_proj_brain',
+        sessionInstanceId: 'brain-instance',
+        runtimeEpoch: 'brain-epoch',
+      };
+      const target = {
+        sessionName: 'deck_proj_w1',
+        sessionInstanceId: 'auditor-instance',
+        runtimeEpoch: 'auditor-epoch',
+      };
+      getSessionMock.mockImplementation((name: string) => name === target.sessionName
+        ? makeSession({ name: target.sessionName, sessionInstanceId: target.sessionInstanceId, runtimeEpoch: target.runtimeEpoch })
+        : name === origin.sessionName
+          ? makeSession({ name: origin.sessionName, sessionInstanceId: origin.sessionInstanceId, runtimeEpoch: origin.runtimeEpoch })
+          : undefined);
+      const created = getDelegationReplyStore().create({
+        origin,
+        target,
+        dispatchId: 'manual-audit-dispatch',
+        messageId: 'manual-audit-message',
+        purpose: AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT,
+        auditAttemptId: 'manual-audit-hook-attempt',
+        now: Date.now(),
+      });
+
+      const res = await postRaw(
+        port,
+        '/audit-reply',
+        JSON.stringify({
+          ...validReply,
+          attemptId: 'manual-audit-hook-attempt',
+          replyCapability: created.replyCapability,
+        }),
+        'application/json',
+        { 'x-imcodes-session': target.sessionName },
+      );
+
+      expect(res.status).toBe(200);
+      expect(JSON.parse(res.body)).toEqual({ ok: true });
+      expect(getDelegationReplyStore().listReceived()).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          delegationId: created.record.delegationId,
+          result: expect.stringContaining('"verdict":"PASS"'),
+        }),
+      ]));
+      expect(timelineEmitMock).toHaveBeenCalledWith(
+        origin.sessionName,
+        expect.any(String),
+        expect.objectContaining({ result: expect.stringContaining('"attemptId":"manual-audit-hook-attempt"') }),
+        expect.any(Object),
+      );
       expect(sendKeysMock).not.toHaveBeenCalled();
       expect(sendProcessSessionMessageForAutomationMock).not.toHaveBeenCalled();
     });

@@ -6,6 +6,7 @@ import {
   AGENT_DELEGATION_REPLY_TIMELINE_EVENT,
   AGENT_DELEGATION_REPLY_VERSION,
 } from '../../shared/agent-delegation.js';
+import { PEER_AUDIT_REPLY_VERSION } from '../../shared/peer-audit.js';
 
 const mocks = vi.hoisted(() => ({
   sessions: new Map<string, Record<string, unknown>>(),
@@ -16,6 +17,7 @@ const mocks = vi.hoisted(() => ({
     deliverDelegationNotification: ReturnType<typeof vi.fn>;
   },
   store: {
+    matchPendingAuditAuthority: vi.fn(),
     receive: vi.fn(),
     markDelivered: vi.fn(),
     expire: vi.fn(),
@@ -24,6 +26,7 @@ const mocks = vi.hoisted(() => ({
     listReceived: vi.fn(() => []),
   },
   timelineEmit: vi.fn(),
+  applyMatchingAuditReceipt: vi.fn(),
 }));
 
 vi.mock('../../src/store/session-store.js', () => ({
@@ -44,10 +47,21 @@ vi.mock('../../src/daemon/timeline-emitter.js', () => ({
   timelineEmitter: { emit: mocks.timelineEmit },
 }));
 
+vi.mock('../../src/daemon/supervision-state-store.js', () => ({
+  getSupervisionTaskRegistry: () => ({
+    applyMatchingAuditReceipt: mocks.applyMatchingAuditReceipt,
+  }),
+}));
+
 import {
   clearDelegationReplyIngressForTests,
   submitDelegationReply,
 } from '../../src/daemon/delegation-reply-ingress.js';
+import {
+  clearPeerAuditReplyIngressRateLimits,
+  registerPeerAuditReplyIngressHandler,
+  submitPeerAuditReply,
+} from '../../src/daemon/peer-audit-reply-ingress.js';
 import { onDelegationReplyDelivered } from '../../src/daemon/delegation-reply-events.js';
 import { ensureTransportRuntimeAvailable } from '../../src/agent/session-manager.js';
 
@@ -94,6 +108,8 @@ function session(identity: typeof origin): Record<string, unknown> {
 describe('delegation reply ingress', () => {
   beforeEach(() => {
     clearDelegationReplyIngressForTests();
+    clearPeerAuditReplyIngressRateLimits();
+    registerPeerAuditReplyIngressHandler(null);
     mocks.sessions.clear();
     mocks.sessions.set(origin.sessionName, session(origin));
     mocks.sessions.set(target.sessionName, session(target));
@@ -102,6 +118,7 @@ describe('delegation reply ingress', () => {
     };
     mocks.restoredRuntime = undefined;
     mocks.store.receive.mockReset().mockReturnValue({ ok: true, record, replay: false });
+    mocks.store.matchPendingAuditAuthority.mockReset();
     mocks.store.markDelivered.mockReset().mockReturnValue(true);
     mocks.store.expire.mockReset();
     mocks.store.get.mockReset();
@@ -112,6 +129,7 @@ describe('delegation reply ingress', () => {
     }));
     mocks.store.listReceived.mockReset().mockReturnValue([]);
     mocks.timelineEmit.mockReset();
+    mocks.applyMatchingAuditReceipt.mockReset().mockReturnValue({ ok: true, value: {} });
     vi.mocked(ensureTransportRuntimeAvailable).mockClear();
   });
 
@@ -173,6 +191,97 @@ describe('delegation reply ingress', () => {
       }));
     });
     unsubscribe();
+  });
+
+  it('accepts the structured peer-audit envelope through the capability minted by send_message', async () => {
+    const auditRecord = {
+      ...record,
+      purpose: 'supervision_audit' as const,
+      auditAttemptId: 'attempt_manual_audit_1',
+      auditRevision: 'revision-manual-1',
+      auditedSessionName: origin.sessionName,
+    };
+    mocks.store.matchPendingAuditAuthority.mockReturnValue(auditRecord);
+    mocks.store.receive.mockImplementation((input: { result: string }) => ({
+      ok: true,
+      record: { ...auditRecord, result: input.result },
+      replay: false,
+    }));
+    registerPeerAuditReplyIngressHandler(() => ({ ok: false, error: 'invalid_capability' }));
+
+    await expect(submitPeerAuditReply({
+      rawBody: JSON.stringify({
+        version: PEER_AUDIT_REPLY_VERSION,
+        attemptId: auditRecord.auditAttemptId,
+        replyCapability: envelope.replyCapability,
+        verdict: 'PASS',
+        findings: 'Exact revision and focused validation pass.',
+        validations: [{
+          kind: 'test', label: 'focused', outcome: 'passed', summary: '29 passed',
+        }],
+      }),
+      senderSessionName: target.sessionName,
+      now: 100,
+    })).resolves.toEqual({ ok: true });
+
+    expect(mocks.store.matchPendingAuditAuthority).toHaveBeenCalledWith({
+      auditAttemptId: auditRecord.auditAttemptId,
+      replyCapability: envelope.replyCapability,
+      sender: target,
+      now: 100,
+    });
+    expect(mocks.store.receive).toHaveBeenCalledWith(expect.objectContaining({
+      delegationId: auditRecord.delegationId,
+      replyCapability: envelope.replyCapability,
+      sender: target,
+      result: expect.stringContaining('"verdict":"PASS"'),
+    }));
+    expect(mocks.applyMatchingAuditReceipt).toHaveBeenCalledWith({
+      attemptId: auditRecord.auditAttemptId,
+      revision: auditRecord.auditRevision,
+      verdict: 'PASS',
+      auditedSessionName: origin.sessionName,
+      auditorSessionName: target.sessionName,
+      findings: 'Exact revision and focused validation pass.',
+      now: 100,
+    });
+    expect(mocks.timelineEmit).toHaveBeenCalledWith(
+      origin.sessionName,
+      AGENT_DELEGATION_REPLY_TIMELINE_EVENT,
+      expect.objectContaining({ result: expect.stringContaining('"attemptId":"attempt_manual_audit_1"') }),
+      expect.any(Object),
+    );
+  });
+
+  it('rejects a delegated audit receipt that contradicts the authoritative task revision', async () => {
+    const auditRecord = {
+      ...record,
+      purpose: 'supervision_audit' as const,
+      auditAttemptId: 'attempt_manual_audit_stale',
+      auditRevision: 'revision-current',
+      auditedSessionName: origin.sessionName,
+    };
+    mocks.store.matchPendingAuditAuthority.mockReturnValue(auditRecord);
+    mocks.applyMatchingAuditReceipt.mockReturnValue({ ok: false, reason: 'old_revision' });
+    registerPeerAuditReplyIngressHandler(() => ({ ok: false, error: 'invalid_capability' }));
+
+    await expect(submitPeerAuditReply({
+      rawBody: JSON.stringify({
+        version: PEER_AUDIT_REPLY_VERSION,
+        attemptId: auditRecord.auditAttemptId,
+        replyCapability: envelope.replyCapability,
+        verdict: 'PASS',
+        findings: 'Stale evidence must not be delivered.',
+        validations: [{
+          kind: 'test', label: 'focused', outcome: 'passed', summary: 'focused pass',
+        }],
+      }),
+      senderSessionName: target.sessionName,
+      now: 100,
+    })).resolves.toEqual({ ok: false, error: 'invalid_capability' });
+
+    expect(mocks.store.receive).not.toHaveBeenCalled();
+    expect(mocks.timelineEmit).not.toHaveBeenCalled();
   });
 
   it('delivers multiple distinct replies for one delegation without collapsing their in-flight work', async () => {
