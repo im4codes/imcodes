@@ -203,7 +203,14 @@ describe('memory MCP stdio server', () => {
       // four unified capability-management contracts add safety contracts to
       // the fixed surface. Keep explicit headroom bounded rather than silently
       // dropping those schemas from managed providers.
-      expect(JSON.stringify(listed.tools).length).toBeLessThanOrEqual(40_000);
+      // Budget raised 40_000 -> 48_000 by explicit operator directive to unblock the
+      // eligibility/task-registry work. This is a deliberate, recorded decision, not drift:
+      // 40_000 had become physically unreachable — an earlier reduction pass measured that
+      // surrendering every owned lever (tool enums, descriptions, aliases) still left ~44_400,
+      // so no amount of description trimming could satisfy it. Actual at the time of raising:
+      // 45_316. The remaining ~2.7KB of headroom is intentionally small so the next growth
+      // still trips this guard; a structural reduction (merging/removing tools) is still owed.
+      expect(JSON.stringify(listed.tools).length).toBeLessThanOrEqual(48_000);
       expect(JSON.stringify(listed)).not.toContain('server-secret');
       expect(JSON.stringify(listed)).not.toContain('api-secret');
     } finally {
@@ -653,5 +660,35 @@ describe('mergeDefaultToolDeps per-field composition', () => {
   it('keeps capability management absent when the scoped daemon identity is unavailable', () => {
     const merged = mergeDefaultToolDeps({ ...caller, serverId: null }, {});
     expect(merged.capabilityService).toBeUndefined();
+  });
+});
+
+describe('createMemoryMcpServerFromEnv supervision wiring', () => {
+  // Regression: createMemoryMcpServer takes four parameters, but FromEnv passed
+  // only three, so supervisionToolDeps silently fell back to {} and every
+  // task-registry call failed with "registry not bound" on every start. No crash
+  // was needed for the symptom, which is why it survived unnoticed.
+  //
+  // This asserts the ACTUAL forwarded argument. An earlier attempt only checked
+  // the options type with `as never` casts and stayed green when the fix was
+  // reverted, i.e. it proved nothing.
+  it('forwards supervisionToolDeps to registerSupervisionMcpTools', async () => {
+    vi.resetModules();
+    const seen: unknown[] = [];
+    vi.doMock('../../src/daemon/supervision-mcp-tools.js', () => ({
+      registerSupervisionMcpTools: (_s: unknown, _c: unknown, deps: unknown) => { seen.push(deps); },
+    }));
+    const mod = await import('../../src/daemon/memory-mcp-server.js');
+    const marker = { boundRegistry: Symbol('registry') };
+    mod.createMemoryMcpServerFromEnv({
+      env: { IMCODES_MCP_CALLER_SERVER_ID: 's1', IMCODES_MCP_CALLER_SESSION_NAME: 'deck_x' },
+      supervisionToolDeps: marker as never,
+    });
+    vi.doUnmock('../../src/daemon/supervision-mcp-tools.js');
+    vi.resetModules();
+    expect(seen).toHaveLength(1);
+    // Reverting the wiring makes this undefined (deps default to {}), so the
+    // assertion is load-bearing rather than decorative.
+    expect(seen[0]).toBe(marker);
   });
 });

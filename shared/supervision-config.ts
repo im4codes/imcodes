@@ -67,6 +67,69 @@ export const SUPERVISION_TRUSTED_CONTRACT_DELIVERY = {
   hardGateAuthority: ['delegation_eligibility', 'audit_reply_capability', 'matching_pass', 'stage_manifest_exact_set'],
 } as const;
 
+/**
+ * User authority over supervision contracts.
+ *
+ * Agent/model text stays non-authoritative (see
+ * SUPERVISION_TRUSTED_CONTRACT_DELIVERY.modelTextIsNonAuthoritative). A directive
+ * from the HUMAN user is different: it is absolute and may override any contract
+ * clause or gate, including the pre-matching-PASS stage/commit/push prohibition.
+ *
+ * The override is deliberately PER-ACTION, not a sticky session mode: contracts
+ * keep driving automated work by default, and the user opts out one action at a
+ * time so a forgotten switch cannot silently disarm every later change.
+ */
+export const SUPERVISION_USER_OVERRIDE = {
+  authority: 'absolute',
+  granularity: 'per_action',
+  /** Must be an explicit user directive; never inferred from ambiguity or silence. */
+  requiresExplicitUserDirective: true,
+  /** Never persists past the single action it authorised. */
+  sticky: false,
+  /** Every gate below may be waived by an explicit user directive. */
+  overridableGates: [
+    'delegation_eligibility',
+    'audit_reply_capability',
+    'matching_pass',
+    'stage_manifest_exact_set',
+    'pre_pass_stage_commit_push',
+  ],
+  /** Recorded for attribution; the user owns the outcome of an overridden action. */
+  mustRecord: ['who', 'what', 'when', 'gateWaived', 'userDirectiveText'],
+} as const;
+
+/**
+ * Proportionality: the contract must exercise its own judgement instead of
+ * applying one ceremony to every change. Auditing a comment typo with the same
+ * loop as a native ABI change is waste, not rigour.
+ *
+ * A change qualifies as trivial ONLY if it satisfies EVERY condition in
+ * `trivialRequiresAll` and matches NONE of `neverTrivial`. Anything unmatched or
+ * uncertain falls back to the full gated path — the tier is a narrow, checkable
+ * exemption, not a judgement call an agent may argue itself into.
+ */
+export const SUPERVISION_CHANGE_PROPORTIONALITY = {
+  tiers: ['trivial', 'standard', 'gated'],
+  trivialRequiresAll: [
+    'no_production_byte_change',
+    'single_owner_no_shared_files',
+    'no_manifest_bound_landing_row',
+    'reversible_by_single_revert',
+  ],
+  /** Any match forces the full gated path regardless of size. */
+  neverTrivial: [
+    'native_abi_or_build_graph',
+    'security_auth_permission_or_credential',
+    'cross_owner_or_cross_platform_surface',
+    'public_contract_schema_or_protocol',
+    'release_packaging_or_signing',
+  ],
+  /** Trivial tier skips the matching cross-vendor audit loop. */
+  trivialSkipsMatchingAudit: true,
+  /** It never skips these: correctness still has to be demonstrated. */
+  trivialStillRequires: ['typecheck', 'affected_tests', 'attribution_record'],
+} as const;
+
 export const SUPERVISION_MODE = {
   OFF: 'off',
   SUPERVISED: 'supervised',

@@ -35,6 +35,9 @@ export interface MemoryMcpServerOptions {
   env?: Record<string, string | undefined>;
   toolDeps?: MemoryMcpToolDeps;
   messagePinToolDeps?: MessagePinMcpToolDeps;
+  /** Without this, supervision tools register with empty deps and every
+   *  task-registry call fails with "registry not bound". */
+  supervisionToolDeps?: SupervisionMcpToolDeps;
 }
 
 export function createMemoryMcpServer(
@@ -278,6 +281,7 @@ export function createMemoryMcpServerFromEnv(options: MemoryMcpServerOptions = {
     caller,
     mergeDefaultToolDeps(caller, options.toolDeps ?? {}),
     options.messagePinToolDeps,
+    options.supervisionToolDeps,
   );
 }
 
