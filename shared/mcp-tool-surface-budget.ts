@@ -28,13 +28,14 @@ export const MCP_TOOL_SURFACE_AUTHORED_BUDGET_BYTES = 40_000;
 export const MCP_TOOL_SURFACE_RAW_BUDGET_BYTES = 45_000;
 /**
  * Default model-visible surface: one discovery tool plus the stable minimal
- * delegation, supervision-task, basic-memory and runtime-identity bootstrap in
+ * delegation, supervision-task, basic-memory/source-expansion, scheduling,
+ * runtime-identity and exact-alias bootstrap in
  * MCP_TOOL_DISCOVERY_DEFAULT_ACTIVE. All other schemas are explicit-on-demand.
  * The bound is intentionally tight so a new eager schema cannot quietly erase
  * the lazy-loading reduction. Full-surface authored/raw dual accounting below is
  * unchanged and continues to guard the complete activated catalog.
  */
-export const MCP_TOOL_SURFACE_BOOTSTRAP_BUDGET_BYTES = 16_000;
+export const MCP_TOOL_SURFACE_BOOTSTRAP_BUDGET_BYTES = 22_000;
 
 export interface McpSurfaceRemoval {
   /** Dotted path of the containing object, for diagnosis when an assert fails. */

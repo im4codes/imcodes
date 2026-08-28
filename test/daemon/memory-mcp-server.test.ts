@@ -214,14 +214,19 @@ describe('memory MCP stdio server', () => {
       // shrunken allowlist and a leaked non-core tool both fail here.
       const bootstrapNames = bootstrap.tools.map((tool) => tool.name).sort();
       expect(bootstrapNames).toEqual([MCP_TOOL_DISCOVERY_NAME, ...MCP_TOOL_DISCOVERY_DEFAULT_ACTIVE].sort());
-      expect(bootstrap.tools).toHaveLength(20);
+      expect(bootstrap.tools).toHaveLength(29);
       expect(new Set(bootstrapNames).size).toBe(bootstrapNames.length);
       expect(bootstrapNames).not.toContain(MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE);
       expect(bootstrapNames).not.toContain(MEMORY_MCP_TOOL_NAMES.LIST_MACHINES);
       expect(bootstrapNames).not.toContain(MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL);
-      expect(bootstrapNames).not.toContain(MEMORY_MCP_TOOL_NAMES.GET_MEMORY_SOURCES);
-      expect(bootstrapNames).not.toContain(MEMORY_MCP_TOOL_NAMES.CRON_LIST);
-      expect(bootstrapNames).not.toContain(ALIAS_MCP_TOOLS.LIST);
+      expect(bootstrapNames).toContain(MEMORY_MCP_TOOL_NAMES.GET_MEMORY_SOURCES);
+      expect(bootstrapNames).toEqual(expect.arrayContaining([
+        MEMORY_MCP_TOOL_NAMES.CRON_CREATE,
+        MEMORY_MCP_TOOL_NAMES.CRON_LIST,
+        MEMORY_MCP_TOOL_NAMES.CRON_UPDATE,
+        MEMORY_MCP_TOOL_NAMES.CRON_DELETE,
+      ]));
+      expect(bootstrapNames).toEqual(expect.arrayContaining(Object.values(ALIAS_MCP_TOOLS)));
       expect(bootstrapNames).toEqual(expect.arrayContaining([
         MEMORY_MCP_TOOL_NAMES.CRON_CREATE_SELF,
         MEMORY_MCP_TOOL_NAMES.CRON_UPDATE_SELF,
@@ -406,12 +411,21 @@ describe('memory MCP stdio server', () => {
       projectName: 'proj',
       projectRoot: '/tmp/proj',
     }, {}, {
+      listAliases: vi.fn(async () => ({ status: 'ok' as const, aliases: [] })),
       listPins: vi.fn(async () => ({ status: 'ok' as const, pins: [] })),
     });
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
     try {
       await Promise.all([client.connect(clientTransport), server.connect(serverTransport)]);
       const publish = vi.spyOn(server, 'sendToolListChanged');
+
+      // Aliases are core and callable before any discovery round-trip; only
+      // the pin half of this compatibility group starts hidden.
+      expect((await client.listTools()).tools.map((tool) => tool.name)).toContain(ALIAS_MCP_TOOLS.LIST);
+      await expect(client.callTool({ name: ALIAS_MCP_TOOLS.LIST, arguments: {} })).resolves.toMatchObject({
+        structuredContent: expect.objectContaining({ status: 'ok' }),
+      });
+      expect((await client.listTools()).tools.map((tool) => tool.name)).not.toContain(MESSAGE_PIN_MCP_TOOLS.LIST);
 
       const preview = await client.callTool({
         name: MCP_TOOL_DISCOVERY_NAME,
@@ -461,14 +475,21 @@ describe('memory MCP stdio server', () => {
       });
       expect(publish).toHaveBeenCalledTimes(2);
       const replacementNames = (await client.listTools()).tools.map((tool) => tool.name);
-      expect(replacementNames).toContain(MEMORY_MCP_TOOL_NAMES.CRON_LIST);
       expect(replacementNames).toEqual(expect.arrayContaining([
+        MEMORY_MCP_TOOL_NAMES.GET_MEMORY_SOURCES,
         MEMORY_MCP_TOOL_NAMES.CRON_CREATE_SELF,
         MEMORY_MCP_TOOL_NAMES.CRON_UPDATE_SELF,
         MEMORY_MCP_TOOL_NAMES.CRON_CANCEL_SELF,
+        MEMORY_MCP_TOOL_NAMES.CRON_CREATE,
+        MEMORY_MCP_TOOL_NAMES.CRON_LIST,
+        MEMORY_MCP_TOOL_NAMES.CRON_UPDATE,
+        MEMORY_MCP_TOOL_NAMES.CRON_DELETE,
       ]));
-      expect(replacementNames).not.toContain(ALIAS_MCP_TOOLS.LIST);
-      expect((await client.callTool({ name: ALIAS_MCP_TOOLS.LIST, arguments: {} })).isError).toBe(true);
+      expect(replacementNames).toContain(ALIAS_MCP_TOOLS.LIST);
+      expect(replacementNames).not.toContain(MESSAGE_PIN_MCP_TOOLS.LIST);
+      await expect(client.callTool({ name: ALIAS_MCP_TOOLS.LIST, arguments: {} })).resolves.toMatchObject({
+        structuredContent: expect.objectContaining({ status: 'ok' }),
+      });
     } finally {
       await client.close();
       await server.close();
@@ -534,6 +555,8 @@ describe('memory MCP stdio server', () => {
       sessionName: 'deck_proj_brain',
       projectName: 'proj',
       projectRoot: '/tmp/proj',
+    }, {}, {
+      listPins: vi.fn(async () => ({ status: 'ok' as const, pins: [] })),
     });
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
     try {
@@ -541,15 +564,15 @@ describe('memory MCP stdio server', () => {
 
       const activation = await client.callTool({
         name: MCP_TOOL_DISCOVERY_NAME,
-        arguments: { query: ALIAS_MCP_TOOLS.LIST },
+        arguments: { query: MESSAGE_PIN_MCP_TOOLS.LIST },
       });
       expect(activation.structuredContent).toMatchObject({
         status: 'ok',
-        activated: [ALIAS_MCP_TOOLS.LIST],
-        matches: [expect.objectContaining({ name: ALIAS_MCP_TOOLS.LIST, active: true })],
+        activated: [MESSAGE_PIN_MCP_TOOLS.LIST],
+        matches: [expect.objectContaining({ name: MESSAGE_PIN_MCP_TOOLS.LIST, active: true })],
       });
-      expect((await client.listTools()).tools.map((tool) => tool.name)).toContain(ALIAS_MCP_TOOLS.LIST);
-      await expect(client.callTool({ name: ALIAS_MCP_TOOLS.LIST, arguments: {} })).resolves.toMatchObject({
+      expect((await client.listTools()).tools.map((tool) => tool.name)).toContain(MESSAGE_PIN_MCP_TOOLS.LIST);
+      await expect(client.callTool({ name: MESSAGE_PIN_MCP_TOOLS.LIST, arguments: {} })).resolves.toMatchObject({
         isError: false,
         structuredContent: expect.objectContaining({ status: 'ok' }),
       });

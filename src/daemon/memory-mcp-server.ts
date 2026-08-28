@@ -8,7 +8,12 @@ import {
   parseMcpRuntimeCallerFromEnv,
   type McpRuntimeCaller,
 } from './memory-mcp-caller.js';
-import { registerAliasMcpTools, registerMemoryMcpTools, type MemoryMcpToolDeps } from './memory-mcp-tools.js';
+import {
+  registerAliasMcpTools,
+  registerMemoryMcpTools,
+  type AliasMcpToolDeps,
+  type MemoryMcpToolDeps,
+} from './memory-mcp-tools.js';
 import { registerMessagePinMcpTools, type MessagePinMcpToolDeps } from './message-pin-mcp-tools.js';
 import { registerSupervisionMcpTools, type SupervisionMcpToolDeps } from './supervision-mcp-tools.js';
 import { createSupervisionMcpToolDeps } from './supervision-registry-port.js';
@@ -40,10 +45,12 @@ export interface MemoryMcpServerOptions {
   supervisionToolDeps?: SupervisionMcpToolDeps;
 }
 
+type ExactStoreMcpToolDeps = MessagePinMcpToolDeps & AliasMcpToolDeps;
+
 export function createMemoryMcpServer(
   caller: McpRuntimeCaller,
   toolDeps: MemoryMcpToolDeps = {},
-  messagePinToolDeps: MessagePinMcpToolDeps = {},
+  exactStoreToolDeps: ExactStoreMcpToolDeps = {},
   supervisionToolDeps: SupervisionMcpToolDeps = {},
 ): McpServer {
   const server = new McpServer({
@@ -56,8 +63,8 @@ export function createMemoryMcpServer(
   ]);
   // Exact server-backed stores share this MCP server surface but stay outside
   // the fuzzy-memory contract list and schema firewall.
-  for (const [name, tool] of registerAliasMcpTools(server, caller)) registered.set(name, tool);
-  for (const [name, tool] of registerMessagePinMcpTools(server, caller, messagePinToolDeps)) registered.set(name, tool);
+  for (const [name, tool] of registerAliasMcpTools(server, caller, exactStoreToolDeps)) registered.set(name, tool);
+  for (const [name, tool] of registerMessagePinMcpTools(server, caller, exactStoreToolDeps)) registered.set(name, tool);
   // Supervision registry: exact server-backed operations, same separation as
   // alias/message-pin tools -- outside the fuzzy-memory contract + firewall.
   for (const [name, tool] of registerSupervisionMcpTools(server, caller, supervisionToolDeps)) registered.set(name, tool);

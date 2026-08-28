@@ -96,9 +96,10 @@ export const MCP_TOOL_GROUPS: readonly McpToolGroupDefinition[] = Object.freeze(
  *
  * The stable bootstrap is deliberately limited to the tools needed to discover
  * peers, report delegated/audit work, operate the supervision state machine, and
- * perform basic memory recall/recording. Administration, scheduling, aliases,
- * pins, machines, file transfer, computer use, capability management and other
- * long-tail surfaces require an explicit discovery round-trip.
+ * perform basic memory recall/recording/source expansion. Scheduling and exact
+ * aliases are also core because agents rely on them across ordinary turns and
+ * cached tool lists. Pins, machines, file transfer, computer use, capability
+ * management and memory administration remain explicit-on-demand.
  */
 export const MCP_TOOL_DISCOVERY_DEFAULT_ACTIVE: readonly string[] = Object.freeze([
   // delegation + audit receipts
@@ -119,11 +120,21 @@ export const MCP_TOOL_DISCOVERY_DEFAULT_ACTIVE: readonly string[] = Object.freez
   MEMORY_MCP_TOOL_NAMES.SEARCH_MEMORY,
   MEMORY_MCP_TOOL_NAMES.SAVE_OBSERVATION,
   MEMORY_MCP_TOOL_NAMES.SAVE_PREFERENCE,
+  MEMORY_MCP_TOOL_NAMES.GET_MEMORY_SOURCES,
   MEMORY_MCP_TOOL_NAMES.SESSION_RUNTIME_IDENTITY_GET,
-  // Existing self-wakeup loops may hold a cached tool list across requests.
+  // Scheduling must work from cached tool lists and before a discovery turn.
   MEMORY_MCP_TOOL_NAMES.CRON_CREATE_SELF,
   MEMORY_MCP_TOOL_NAMES.CRON_UPDATE_SELF,
   MEMORY_MCP_TOOL_NAMES.CRON_CANCEL_SELF,
+  MEMORY_MCP_TOOL_NAMES.CRON_CREATE,
+  MEMORY_MCP_TOOL_NAMES.CRON_LIST,
+  MEMORY_MCP_TOOL_NAMES.CRON_UPDATE,
+  MEMORY_MCP_TOOL_NAMES.CRON_DELETE,
+  // Exact aliases are a normal prompt/reference primitive, not administration.
+  ALIAS_MCP_TOOLS.SAVE,
+  ALIAS_MCP_TOOLS.LIST,
+  ALIAS_MCP_TOOLS.RESOLVE,
+  ALIAS_MCP_TOOLS.DELETE,
 ]);
 
 export function isDefaultActiveMcpTool(name: string): boolean {
