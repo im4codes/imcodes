@@ -1,4 +1,9 @@
 import { describe, expect, it } from 'vitest';
+import {
+  SUPERVISION_CHANGE_PROPORTIONALITY,
+  SUPERVISION_GATE_ENFORCEMENT,
+  SUPERVISION_MODE,
+} from '../shared/supervision-config.js';
 import { CODEX_MODEL_IDS, DEFAULT_CODEX_AUTOMATION_MODEL } from '../src/shared/models/options.js';
 import { DEFAULT_PRIMARY_CONTEXT_MODEL } from '../shared/context-model-defaults.js';
 import { PEER_AUDIT_PROMPT_VERSION } from '../shared/peer-audit.js';
@@ -621,5 +626,31 @@ describe('supervision config helpers', () => {
       expect(resolveEffectiveCustomInstructions(null)).toBe('');
       expect(resolveEffectiveCustomInstructions({})).toBe('');
     });
+  });
+});
+
+describe('supervision gate scope and change proportionality', () => {
+  it('binds gates only under supervision and treats them as advice when it is off', () => {
+    // A gate that blocks a human working by hand is an obstacle, not quality
+    // control; a gate that stops binding under automation is useless. Both ends
+    // are asserted so neither can drift alone.
+    expect(SUPERVISION_GATE_ENFORCEMENT.bindingModes).toContain(SUPERVISION_MODE.SUPERVISED);
+    expect(SUPERVISION_GATE_ENFORCEMENT.bindingModes).toContain(SUPERVISION_MODE.SUPERVISED_AUDIT);
+    expect(SUPERVISION_GATE_ENFORCEMENT.advisoryModes).toContain(SUPERVISION_MODE.OFF);
+    expect(SUPERVISION_GATE_ENFORCEMENT.bindingModes).not.toContain(SUPERVISION_MODE.OFF);
+    // Advisory still leaves a trace, but the daemon derives it: asking the user
+    // who they are, to waive a gate, would bill them for what the runtime knows.
+    expect(SUPERVISION_GATE_ENFORCEMENT.advisoryBehaviour).toBe('warn_once_then_proceed');
+    expect(SUPERVISION_GATE_ENFORCEMENT.identityFromRuntimeCaller).toBe(true);
+    expect(SUPERVISION_GATE_ENFORCEMENT.neverPromptUserForWaiverDetails).toBe(true);
+  });
+
+  it('lets documentation skip audit while any behaviour change is always audited', () => {
+    expect(SUPERVISION_CHANGE_PROPORTIONALITY.docOnlySkipsAuditEvenWhenSupervised).toBe(true);
+    expect(SUPERVISION_CHANGE_PROPORTIONALITY.docOnlyShapes).toContain('no_executable_line_changed');
+    // The floor: this must stay true no matter how small the change looks.
+    expect(SUPERVISION_CHANGE_PROPORTIONALITY.functionalChangeAlwaysAudited).toBe(true);
+    // ...and the trivial tier can never be reached by a production-byte change.
+    expect(SUPERVISION_CHANGE_PROPORTIONALITY.trivialRequiresAll).toContain('no_production_byte_change');
   });
 });

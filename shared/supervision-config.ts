@@ -136,10 +136,56 @@ export const SUPERVISION_CHANGE_PROPORTIONALITY = {
     'public_contract_schema_or_protocol',
     'release_packaging_or_signing',
   ],
+  /**
+   * Documentation-shaped work skips the audit loop even under automation. A
+   * comment, README, changelog or translated string cannot change behaviour, so
+   * auditing it spends review budget that a real behaviour change then does not
+   * get. This is the "is it worth auditing" judgement, made explicit rather than
+   * left to whoever is impatient that day.
+   */
+  docOnlySkipsAuditEvenWhenSupervised: true,
+  docOnlyShapes: [
+    'markdown_or_text_only',
+    'code_comment_only',
+    'changelog_or_release_notes',
+    'translation_string_only',
+    'no_executable_line_changed',
+  ],
+  /**
+   * The hard floor: anything that changes what the software DOES is audited, at
+   * any size. A one-line behaviour change is exactly the kind that slips through,
+   * and "it was only one line" is not evidence of safety.
+   */
+  functionalChangeAlwaysAudited: true,
   /** Trivial tier skips the matching cross-vendor audit loop. */
   trivialSkipsMatchingAudit: true,
   /** It never skips these: correctness still has to be demonstrated. */
   trivialStillRequires: ['typecheck', 'affected_tests', 'attribution_record'],
+} as const;
+
+/**
+ * Where the hard gates actually bind.
+ *
+ * Under supervision (automated multi-agent development) the gates are machine
+ * enforcement: nothing else is watching, so pre-PASS stage/commit/push stays
+ * blocked. With supervision off a human is driving and owns the outcome, so the
+ * same rules are ADVICE: surface the risk once, then do what the user asked.
+ * A gate that blocks an operator working by hand is not quality control, it is
+ * an obstacle wearing its badge.
+ */
+export const SUPERVISION_GATE_ENFORCEMENT = {
+  bindingModes: ['supervised', 'supervised_audit'],
+  advisoryModes: ['off'],
+  /** In advisory mode: warn once, do not refuse, then proceed. */
+  advisoryBehaviour: 'warn_once_then_proceed',
+  /**
+   * Logged automatically. The daemon already knows the caller from the runtime
+   * session, so NEVER ask the user to state who they are or to justify a waiver:
+   * that is friction billed to the user for information the system already has.
+   */
+  recordedAutomatically: ['gate', 'waivedAt'],
+  identityFromRuntimeCaller: true,
+  neverPromptUserForWaiverDetails: true,
 } as const;
 
 export const SUPERVISION_MODE = {

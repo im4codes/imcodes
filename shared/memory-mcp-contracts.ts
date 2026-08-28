@@ -278,7 +278,7 @@ const statusSchema = objectSchema({
 export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, MemoryMcpToolContract>> = {
   [MEMORY_MCP_TOOL_NAMES.SEARCH_MEMORY]: {
     name: MEMORY_MCP_TOOL_NAMES.SEARCH_MEMORY,
-    description: 'Search caller-bound memory when prior project or user context may matter. Returns compact hits with a typed sourceLookup; use those fields for source expansion when a relevant summary is insufficient. The query is text; vectorization is internal.',
+    description: 'Search caller-bound memory when prior project or user context may matter. Returns compact hits with a typed sourceLookup; use those fields for source expansion when a summary is not enough. Query is text; vectorization is internal.',
     inputSchema: objectSchema({
       query: stringSchema('Required text query to search for. Do not send embeddings, vectors, identity, or namespace fields.'),
       limit: numberSchema(`Optional maximum hit count; defaults to ${MEMORY_MCP_CAPS.SEARCH_MEMORY_DEFAULT_LIMIT} and is clamped to ${MEMORY_MCP_CAPS.SEARCH_MEMORY_MAX_LIMIT}.`, { minimum: 1, maximum: MEMORY_MCP_CAPS.SEARCH_MEMORY_MAX_LIMIT }),
@@ -304,7 +304,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   },
   [MEMORY_MCP_TOOL_NAMES.GET_MEMORY_SOURCES]: {
     name: MEMORY_MCP_TOOL_NAMES.GET_MEMORY_SOURCES,
-    description: 'Fetch source snippets by projection id, observation id, or compact ref. Use it after a memory-search result or startup memory for exact prior facts and provenance-sensitive answers. Missing and cross-namespace ids return the same empty list. Rarely a ref denotes more than one record; the reply then sets ambiguousRef with `sources` empty and up to four expanded matches under `candidates` (each with its own projectionId / observationId and sources). candidateCount is how many records the ref actually covers and truncated says whether some were omitted, so do not assume `candidates` is exhaustive. Do NOT read that empty `sources` as "no memory" — decide which candidate answers the question and cite it by its own id, never by the ambiguous ref.',
+    description: 'Fetch source snippets by projection id, observation id, or compact ref, after a memory-search result or startup memory. Missing and cross-namespace ids both return an empty list. An ambiguous ref sets ambiguousRef with empty sources and up to four candidates; candidateCount and truncated say how many exist. That empty sources is not no memory: pick a candidate and cite its own id.',
     inputSchema: objectSchema({
       projectionId: stringSchema('Projection id from a memory-search result sourceLookup. Caller identity and namespace are runtime-bound.'),
       observationId: stringSchema('Observation id from a memory-search result sourceLookup. Caller identity and namespace are runtime-bound.'),
@@ -419,7 +419,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   },
   [MEMORY_MCP_TOOL_NAMES.DELEGATION_REPLY]: {
     name: MEMORY_MCP_TOOL_NAMES.DELEGATION_REPLY,
-    description: 'Submit a structured reply for a reply-enabled delegation. Use only the delegation id and bounded capability supplied in that delegation brief. The same capability may submit multiple replies until it expires; the daemon correlates each reply and notifies the originating session directly. Do not also call send_message for the same reply.',
+    description: 'Reply to a reply-enabled delegation using only the id and capability from its brief. The same capability may submit multiple replies until it expires; the daemon notifies the origin. Do not also send_message for the same reply.',
     inputSchema: objectSchema({
       delegationId: stringSchema('Opaque delegation id supplied by the reply-enabled brief.'),
       replyCapability: stringSchema('Bounded reply capability supplied by the brief. It remains valid until expiry; never repeat it inside result.'),
@@ -429,7 +429,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   },
   [MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS]: {
     name: MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS,
-    description: 'List sendable caller-project siblings for delegation, for example "ask CC to audit" or "invite a reviewer to discuss". The current caller session and stopped sessions are excluded; if this returns no items, send_message cannot run. Results include agentType plus concrete model metadata when known. Filter by display label, name, type, or model, then use the exact target; labels are not targets. If no match exists, report that no such running peer session is available.',
+    description: 'List sendable caller-project siblings for delegation. The current caller session and stopped sessions are excluded; if this returns no items, send_message cannot run. Includes agentType and model when known. Filter by label, name, type or model, then send to the exact target.',
     inputSchema: objectSchema({
       query: stringSchema('Optional case-insensitive text filter over target display labels, names, agent types, and model metadata, such as "cc", "codex", "gpt-5", "reviewer", or a session label mentioned by the user.'),
       limit: numberSchema('Optional maximum number of targets to return; implementations may clamp it.'),
@@ -438,13 +438,13 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   },
   [MEMORY_MCP_TOOL_NAMES.SESSION_RUNTIME_IDENTITY_GET]: {
     name: MEMORY_MCP_TOOL_NAMES.SESSION_RUNTIME_IDENTITY_GET,
-    description: 'Return the daemon-observed runtime identity for the bound MCP caller only. Takes no session/model arguments and cannot enumerate peers. Model metadata is evidence, not self-reported authorization; schedulers independently revalidate the same live SessionRecord before assignment.',
+    description: 'Runtime identity of the bound MCP caller only. No arguments, cannot enumerate peers. Model metadata is evidence, not authorization; schedulers revalidate the live SessionRecord before assigning.',
     inputSchema: objectSchema({}),
     outputSchema: statusSchema,
   },
   [MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE]: {
     name: MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE,
-    description: 'Send a plain-text request to an exact send_list_targets target, for example asking a CC session to audit. Callers and labels are invalid targets; an empty send_list_targets result means none exists. deliveryMode append (default) sends by direct non-preemptive append when supported, while unsupported, racing, or temporarily unready targets retain delivery through the ordinary durable FIFO fallback. deliveryMode=queue always uses FIFO, retaining the message in ordinary durable storage instead of inserting it into the active turn. It does not start a structured Team/P2P discussion run. Files are project-root path references, not bytes. Returns dispatch/message ids and delivered/queued/failed status.',
+    description: 'Send plain text to an exact send_list_targets target. Callers and labels are invalid targets. append (default) joins the active turn, with durable FIFO fallback when unsupported or racing; queue always uses FIFO. Not a Team/P2P run. Files are project-root paths, not bytes. Returns ids and delivered/queued/failed status.',
     inputSchema: objectSchema({
       target: stringSchema('Required exact target session value. For an ordinary peer, use the exact send_list_targets.target value. For a follow-up to an execution clone you created, use the exact result.clone.target from the originating clone send — execution clones are NOT returned by send_list_targets and only their creator may address them. Always use the exact target name; never a label or agentType value.'),
       message: stringSchema(`Required complete task/request text to deliver, up to ${MEMORY_MCP_CAPS.SEND_MESSAGE_MAX_BYTES} UTF-8 bytes. Include the desired role and output, such as audit findings, discussion input, plan, implementation request, or verification result.`),
@@ -500,7 +500,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
           parentRunId: stringSchema('Non-empty id of the parent run that owns the created clone.'),
           parentStage: { type: 'string', enum: [...EXECUTION_CLONE_PARENT_STAGES], description: 'Execution entry-point stage creating the clone; one of the fixed parent stages.' },
         }, ['kind', 'ephemeral', 'parentRunId', 'parentStage']),
-        description: 'Optional strict execution-clone request. When present, the message is routed to a freshly created ephemeral clone of the resolved target template (never the target directly) and the result includes clone.target; broadcast is not allowed with clone.',
+        description: 'Optional execution-clone request. Routes to a fresh ephemeral clone of the resolved target, never the target itself, and returns clone.target. Cannot be combined with broadcast.',
       },
     }, ['target', 'message']),
     outputSchema: statusSchema,
@@ -524,7 +524,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   },
   [MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_UPDATE]: {
     name: MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_UPDATE,
-    description: 'Heartbeat/update the caller’s bound assignment. The daemon derives lifecycle status from a semantic intent; callers cannot name a destination status. Transition gates, revision and audit-attempt checks are enforced by SQLite registry.',
+    description: 'Heartbeat or update the caller bound assignment. The daemon derives lifecycle status from a semantic intent; callers cannot name a target status. Gates, revision and audit-attempt checks are enforced by the registry.',
     inputSchema: objectSchema({
       assignmentId: stringSchema('Assignment id bound to this caller runtime.'),
       revision: stringSchema('Current/audit revision for stale-update rejection.'),
@@ -550,7 +550,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   },
   [MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_FILE_EVENT]: {
     name: MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_FILE_EVENT,
-    description: 'Record a caller-reported append-only file event for the caller’s assignment. No automatic provider Edit/Write/apply_patch hook and no filesystem/Git scanner are wired. The path must already be in the assignment claim scope; outside-scope reports block the task. Reconciliation compares only caller-supplied path observations and cannot detect omitted or unreported shell writes.',
+    description: 'Record a caller-reported file event for the caller assignment. Nothing is auto-detected: no editor hook, no filesystem or Git scanner. The path must already be in the claim scope; outside-scope reports block the task. Unreported writes stay invisible.',
     inputSchema: objectSchema({
       assignmentId: stringSchema('Assignment id bound to this caller runtime.'),
       filePath: stringSchema('Normalized repo-relative path.'),
@@ -616,7 +616,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   },
   [MEMORY_MCP_TOOL_NAMES.CRON_CANCEL_SELF]: {
     name: MEMORY_MCP_TOOL_NAMES.CRON_CANCEL_SELF,
-    description: 'Cancel a current-session self-wakeup job by id or unique name; use all=true to cancel all. Recurring jobs require force=true and should be force-cancelled only after an explicit user request. until_complete jobs may self-cancel when their overall goal is complete.',
+    description: 'Cancel a current session self-wakeup job by id or unique name, or all=true for every one. Recurring jobs need force=true, only on explicit user request. until_complete jobs may self-cancel when done.',
     inputSchema: objectSchema({
       id: stringSchema('Exact job id; exclusive with name and all.'),
       name: stringSchema('Unique exact job name; exclusive with id and all.'),
@@ -746,7 +746,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   },
   [MEMORY_MCP_TOOL_NAMES.FETCH_FILE_FROM_MACHINE]: {
     name: MEMORY_MCP_TOOL_NAMES.FETCH_FILE_FROM_MACHINE,
-    description: 'Direct-first controlled file fetch, then relay. Pass the canonical 10-digit nodeId or ^^(nodeId) without list_machines; deprecated noncanonical legacy ref_name is compatibility-only. Reports mode; atomic commit; overwrite=false; FULL only.',
+    description: 'Direct-then-relay file fetch from a canonical 10-digit nodeId or ^^(nodeId), without list_machines; deprecated noncanonical legacy ref_name is compatibility-only. Reports mode; atomic commit; overwrite=false. FULL nodes only.',
     inputSchema: objectSchema({
       machine: stringSchema('Canonical nodeId or complete ^^(nodeId) marker; deprecated noncanonical legacy ref_name is also accepted.', { minLength: 1, maxLength: MACHINE_TARGET_MAX, pattern: MACHINE_TARGET_PATTERN.source }),
       sourcePath: stringSchema(`Explicit controlled-node regular-file path, up to ${FILE_TRANSFER_PATH_MAX_BYTES} UTF-8 bytes.`),
@@ -776,7 +776,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   },
   [MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL]: {
     name: MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL,
-    description: 'Use Computer Use on this daemon host (machine=local) or a controlled machine. Open Computer Use (OCU) provides the integrated cross-platform desktop-app control path; IM.codes provides separate built-in CDP-backed browser_* tools. For browser work, prefer machine=local with browser_open/browser_snapshot instead of probing or installing Playwright through a shell. Browser results expose a loopback cdpEndpoint/host/port so local Python or Node scripts can reuse the same browser; pass includeImage=true only when visual inspection is needed. Pass a controlled machine canonical 10-digit nodeId or complete ^^(nodeId) marker without list_machines; deprecated noncanonical legacy ref_name is compatibility-only. exec_remote is session-0/SYSTEM; shell_session1 is active-user. FULL nodes only.',
+    description: 'GUI/browser control on this host (machine=local) or a controlled machine. Prefer machine=local with browser_open/browser_snapshot over installing Playwright; includeImage=true only when you must see it. Pass a canonical 10-digit nodeId or ^^(nodeId) without list_machines; deprecated noncanonical legacy ref_name is compatibility-only. exec_remote is SYSTEM, shell_session1 is active-user. GUI/browser max 120000, shell_session1 max 900000. FULL nodes only.',
     inputSchema: objectSchema({
       machine: stringSchema('Canonical nodeId, complete ^^(nodeId) marker, deprecated noncanonical legacy ref_name, or local/localhost/self/this.', { minLength: 1, maxLength: MACHINE_TARGET_MAX, pattern: MACHINE_TARGET_PATTERN.source }),
       tool: stringSchema(`Typed method name; one of ${COMPUTER_USE_TOOLS.join(', ')}.`, { enum: [...COMPUTER_USE_TOOLS] }),
