@@ -449,8 +449,8 @@ describe('stock macOS remote-desktop production dependency factory', () => {
   it('traverses the stock factory, bootstrap socket, exact grant, IPC ACK and readiness socket', async () => {
     const verified = bootstrapArtifact();
     const storeRoot = await trustedStore(verified.releaseName!);
-    const runtimeRoot = await mkdtemp('/private/tmp/ird-production-e2e-');
-    const bootstrapDirectory = await mkdtemp('/private/tmp/ird-bootstrap-e2e-');
+    const runtimeRoot = await mkdtemp(join(tmpdir(), 'ird-production-e2e-'));
+    const bootstrapDirectory = await mkdtemp(join(tmpdir(), 'ird-bootstrap-e2e-'));
     productionRoots.push(runtimeRoot, bootstrapDirectory);
     const bootstrapSocketPath = join(bootstrapDirectory, 'bootstrap.sock');
     const uid = process.getuid?.() || 501;
@@ -583,7 +583,7 @@ describe('stock macOS remote-desktop production dependency factory', () => {
   it('rolls back install and closes the listener when activation fails', async () => {
     const verified = bootstrapArtifact();
     const storeRoot = await trustedStore(verified.releaseName!);
-    const directory = await mkdtemp('/private/tmp/ird-bootstrap-rollback-');
+    const directory = await mkdtemp(join(tmpdir(), 'ird-bootstrap-rollback-'));
     productionRoots.push(directory);
     const socketPath = join(directory, 'bootstrap.sock');
     const rollback = vi.fn(async () => undefined);
