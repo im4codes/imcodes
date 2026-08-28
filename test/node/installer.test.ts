@@ -27,6 +27,8 @@ import {
   LINUX_UNIT_PATH,
   isProcessElevated,
   assertProcessElevated,
+  windowsPowerShellExecutablePath,
+  windowsSchtasksExecutablePath,
   installDefinition,
   inspectDefinition,
   inspectServiceState,
@@ -37,6 +39,7 @@ import {
 const EXE = '/opt/imcodes-node/imcodes-node';
 const WINDOWS_EXE = 'C:\\ProgramData\\imcodes-node\\imcodes-node.exe';
 const WINDOWS_WATCHDOG_NOW = new Date(2026, 6, 14, 11, 36, 7);
+const WINDOWS_SCHTASKS = 'C:\\Windows\\System32\\schtasks.exe';
 
 describe('controlled-node installer artifacts (4.1-4.4)', () => {
   it('detects POSIX root without attempting privilege escalation', () => {
@@ -60,6 +63,21 @@ describe('controlled-node installer artifacts (4.1-4.4)', () => {
     })).toBe(true);
     expect(seen).toHaveLength(1);
     expect(seen[0]).toMatch(/System32[\\/]WindowsPowerShell[\\/]v1\.0[\\/]powershell\.exe$/i);
+  });
+
+  it('resolves trusted Windows system executables without consulting PATH', () => {
+    expect(windowsSchtasksExecutablePath({
+      SystemRoot: 'D:\\TrustedWindows',
+      WINDIR: 'E:\\IgnoredWindows',
+    })).toBe('D:\\TrustedWindows\\System32\\schtasks.exe');
+    expect(windowsSchtasksExecutablePath({
+      WINDIR: 'E:\\Windows',
+    })).toBe('E:\\Windows\\System32\\schtasks.exe');
+    expect(windowsSchtasksExecutablePath({})).toBe(WINDOWS_SCHTASKS);
+    expect(windowsPowerShellExecutablePath({
+      SystemRoot: 'D:\\TrustedWindows',
+      WINDIR: 'E:\\IgnoredWindows',
+    })).toBe('D:\\TrustedWindows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe');
   });
 
   it('falls back to the PATH name when the absolute probe cannot run', () => {
@@ -172,7 +190,7 @@ describe('controlled-node installer artifacts (4.1-4.4)', () => {
         watchdogScript = content;
       },
       runCommand: (file, args) => {
-        expect(file).toBe('schtasks');
+        expect(file).toBe(WINDOWS_SCHTASKS);
         if (args[0] === '/Create') {
           const taskName = String(args[2]);
           const expectedArgs = taskName === CONTROLLED_NODE_SERVICE.WINDOWS_TASK
@@ -426,7 +444,7 @@ describe('controlled-node installer artifacts (4.1-4.4)', () => {
       readWindowsWatchdogScript: async () => windowsControlledNodeHealthWatchdogScript(action),
       runCommand: (file, args) => {
         calls.push({ file, args: [...args] });
-        if (file !== 'schtasks') return 'Running';
+        if (file !== WINDOWS_SCHTASKS) return 'Running';
         return args.includes(CONTROLLED_NODE_SERVICE.WINDOWS_WATCHDOG_TASK) ? watchdogXml : xml;
       },
     });
@@ -445,7 +463,7 @@ describe('controlled-node installer artifacts (4.1-4.4)', () => {
       runState: 'running',
       errors: [],
     });
-    expect(calls.map(({ file }) => file)).toEqual(['schtasks', 'schtasks', 'powershell.exe']);
+    expect(calls.map(({ file }) => file)).toEqual([WINDOWS_SCHTASKS, WINDOWS_SCHTASKS, 'powershell.exe']);
     expect(calls.flatMap(({ args }) => args)).not.toContain('/Create');
     expect(calls.flatMap(({ args }) => args)).not.toContain('/Run');
   });
@@ -471,7 +489,7 @@ describe('controlled-node installer artifacts (4.1-4.4)', () => {
       platform: 'win32',
       readWindowsWatchdogScript: async () => windowsControlledNodeHealthWatchdogScript(action),
       runCommand: (file, args) => {
-        if (file !== 'schtasks') return 'Running';
+        if (file !== WINDOWS_SCHTASKS) return 'Running';
         return args.includes(CONTROLLED_NODE_SERVICE.WINDOWS_WATCHDOG_TASK)
           ? normalizedWatchdog
           : normalized;
@@ -516,7 +534,7 @@ describe('controlled-node installer artifacts (4.1-4.4)', () => {
       platform: 'win32',
       readWindowsWatchdogScript: async () => watchdogScript,
       runCommand: (file, args) => {
-        if (file !== 'schtasks') return 'Running';
+        if (file !== WINDOWS_SCHTASKS) return 'Running';
         if (args.includes(CONTROLLED_NODE_SERVICE.WINDOWS_WATCHDOG_TASK)) {
           if (watchdogTaskXml === undefined) throw new Error('watchdog missing');
           return watchdogTaskXml;
@@ -568,7 +586,7 @@ describe('controlled-node installer artifacts (4.1-4.4)', () => {
       platform: 'win32',
       readWindowsWatchdogScript: async () => windowsControlledNodeHealthWatchdogScript(receiptAction),
       runCommand: (file, args) => {
-        if (file !== 'schtasks') return 'Running';
+        if (file !== WINDOWS_SCHTASKS) return 'Running';
         return args.includes(CONTROLLED_NODE_SERVICE.WINDOWS_WATCHDOG_TASK) ? watchdogXml : staleXml;
       },
     });
