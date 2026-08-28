@@ -1,7 +1,7 @@
 import { EventEmitter, once } from 'node:events';
 import net from 'node:net';
 import type { ChildProcess } from 'node:child_process';
-import { chmod, mkdir, mkdtemp, readFile, rm } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, realpath, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -449,7 +449,7 @@ describe('stock macOS remote-desktop production dependency factory', () => {
   it('traverses the stock factory, bootstrap socket, exact grant, IPC ACK and readiness socket', async () => {
     const verified = bootstrapArtifact();
     const storeRoot = await trustedStore(verified.releaseName!);
-    const runtimeRoot = await mkdtemp(join(tmpdir(), 'ird-production-e2e-'));
+    const runtimeRoot = await realpath(await mkdtemp(join(tmpdir(), 'rd-')));
     const bootstrapDirectory = await mkdtemp(join(tmpdir(), 'ird-bootstrap-e2e-'));
     productionRoots.push(runtimeRoot, bootstrapDirectory);
     const bootstrapSocketPath = join(bootstrapDirectory, 'bootstrap.sock');
