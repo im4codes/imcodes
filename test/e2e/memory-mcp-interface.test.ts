@@ -1,4 +1,9 @@
-import { MCP_TOOL_DISCOVERY_DEFAULT_ACTIVE } from '../../shared/mcp-tool-discovery.js';
+import {
+  MCP_TOOL_DISCOVERY_DEFAULT_ACTIVE,
+  MCP_TOOL_DISCOVERY_NAME,
+  MCP_TOOL_GROUP_QUERY_PREFIX,
+  MCP_TOOL_GROUPS,
+} from '../../shared/mcp-tool-discovery.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -63,6 +68,15 @@ async function withStdioClient(
   }
 }
 
+async function activateToolGroup(client: Client, toolName: string): Promise<Record<string, unknown>> {
+  const group = MCP_TOOL_GROUPS.find((candidate) => candidate.tools.includes(toolName));
+  if (!group) throw new Error(`no MCP tool group contains ${toolName}`);
+  return structured(await client.callTool({
+    name: MCP_TOOL_DISCOVERY_NAME,
+    arguments: { query: `${MCP_TOOL_GROUP_QUERY_PREFIX}${group.id}` },
+  }));
+}
+
 describe('memory MCP interface e2e', () => {
   let tempDbDir: string;
   let projectRoot: string;
@@ -117,7 +131,7 @@ describe('memory MCP interface e2e', () => {
       // stores; assert each independent surface is present
       // (order-independent). Mirrors test/daemon/memory-mcp-server.test.ts.
       // Core tools are listed without a discovery round-trip; only the heavy
-      // controlled-machine / file-transfer / computer-use surfaces stay lazy, so
+      // pins, controlled-machine, file-transfer and computer-use surfaces stay lazy, so
       // assert both directions rather than the whole catalog.
       expect(listedNames).toEqual(expect.arrayContaining([...MCP_TOOL_DISCOVERY_DEFAULT_ACTIVE]));
       expect(listedNames).not.toContain(MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE);
@@ -127,6 +141,22 @@ describe('memory MCP interface e2e', () => {
         ALIAS_MCP_TOOLS.LIST,
         ALIAS_MCP_TOOLS.SAVE,
         ALIAS_MCP_TOOLS.DELETE,
+      ]));
+      expect(listedNames).not.toContain(MESSAGE_PIN_MCP_TOOLS.LIST);
+
+      const activated = await activateToolGroup(client, MESSAGE_PIN_MCP_TOOLS.LIST);
+      expect(activated).toMatchObject({
+        status: 'ok',
+        activated: expect.arrayContaining([
+          MESSAGE_PIN_MCP_TOOLS.LIST,
+          MESSAGE_PIN_MCP_TOOLS.GET,
+          MESSAGE_PIN_MCP_TOOLS.SAVE,
+          MESSAGE_PIN_MCP_TOOLS.DELETE,
+        ]),
+      });
+      const expandedNames = (await client.listTools()).tools.map((tool) => tool.name);
+      expect(expandedNames).toEqual(expect.arrayContaining([
+        ...MCP_TOOL_DISCOVERY_DEFAULT_ACTIVE,
         MESSAGE_PIN_MCP_TOOLS.LIST,
         MESSAGE_PIN_MCP_TOOLS.GET,
         MESSAGE_PIN_MCP_TOOLS.SAVE,
@@ -363,6 +393,11 @@ describe('memory MCP interface e2e', () => {
         ],
       });
 
+      const activated = await activateToolGroup(client, MEMORY_MCP_TOOL_NAMES.ARCHIVE_MEMORY);
+      expect(activated).toMatchObject({
+        status: 'ok',
+        activated: expect.arrayContaining([MEMORY_MCP_TOOL_NAMES.ARCHIVE_MEMORY]),
+      });
       const archived = structured(await client.callTool({
         name: MEMORY_MCP_TOOL_NAMES.ARCHIVE_MEMORY,
         arguments: { ref: manageableRef },
@@ -388,6 +423,11 @@ describe('memory MCP interface e2e', () => {
     });
 
     await withStdioClient(childEnv(), async (client) => {
+      const activated = await activateToolGroup(client, MEMORY_MCP_TOOL_NAMES.LIST_MEMORY_SUMMARIES);
+      expect(activated).toMatchObject({
+        status: 'ok',
+        activated: expect.arrayContaining([MEMORY_MCP_TOOL_NAMES.LIST_MEMORY_SUMMARIES]),
+      });
       const listed = structured(await client.callTool({
         name: MEMORY_MCP_TOOL_NAMES.LIST_MEMORY_SUMMARIES,
         arguments: {
