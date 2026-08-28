@@ -696,3 +696,33 @@ describe('mergeDefaultToolDeps per-field composition', () => {
     expect(merged.capabilityService).toBeUndefined();
   });
 });
+
+describe('createMemoryMcpServerFromEnv supervision wiring', () => {
+  // Regression: createMemoryMcpServer takes four parameters, but FromEnv passed
+  // only three, so supervisionToolDeps silently fell back to {} and every
+  // task-registry call failed with "registry not bound" on every start. No crash
+  // was needed for the symptom, which is why it survived unnoticed.
+  //
+  // This asserts the ACTUAL forwarded argument. An earlier attempt only checked
+  // the options type with `as never` casts and stayed green when the fix was
+  // reverted, i.e. it proved nothing.
+  it('forwards supervisionToolDeps to registerSupervisionMcpTools', async () => {
+    vi.resetModules();
+    const seen: unknown[] = [];
+    vi.doMock('../../src/daemon/supervision-mcp-tools.js', () => ({
+      registerSupervisionMcpTools: (_s: unknown, _c: unknown, deps: unknown) => { seen.push(deps); },
+    }));
+    const mod = await import('../../src/daemon/memory-mcp-server.js');
+    const marker = { boundRegistry: Symbol('registry') };
+    mod.createMemoryMcpServerFromEnv({
+      env: { IMCODES_MCP_CALLER_SERVER_ID: 's1', IMCODES_MCP_CALLER_SESSION_NAME: 'deck_x' },
+      supervisionToolDeps: marker as never,
+    });
+    vi.doUnmock('../../src/daemon/supervision-mcp-tools.js');
+    vi.resetModules();
+    expect(seen).toHaveLength(1);
+    // Reverting the wiring makes this undefined (deps default to {}), so the
+    // assertion is load-bearing rather than decorative.
+    expect(seen[0]).toBe(marker);
+  });
+});
