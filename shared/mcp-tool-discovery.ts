@@ -1,79 +1,137 @@
+import { ALIAS_MCP_TOOLS } from './alias-types.js';
+import { CAPABILITY_MCP_TOOL_NAMES } from './capability-management.js';
+import { MEMORY_MCP_TOOL_NAMES } from './memory-mcp-contracts.js';
+import { MESSAGE_PIN_MCP_TOOLS } from './message-pins.js';
+import { SUPERVISION_MCP_TOOLS } from './supervision-mcp-tools.js';
+
 /** Protocol constants for the minimal MCP lazy-tool bootstrap surface. */
 export const MCP_TOOL_DISCOVERY_NAME = 'mcp_tool_search' as const;
 
 /**
- * MCP-server-local bootstrap guidance. The full capability routing policy is
- * already injected once by transport-runtime-assembly; repeating it here makes
- * clients prepend the same policy to every exposed tool.
+ * One model-visible routing hint, attached to the discovery tool only.
+ *
+ * Do not publish this as MCP server instructions: some hosts compose server
+ * instructions into every exposed tool definition, multiplying the same text
+ * by the bootstrap tool count on every request.
  */
-export const MCP_TOOL_DISCOVERY_SERVER_INSTRUCTIONS =
-  'Core delegation, supervision-task and memory tools are listed by default. Use mcp_tool_search to activate any other tool by task or name; the server will publish the updated tool list.';
+export const MCP_TOOL_DISCOVERY_DESCRIPTION =
+  'Use mcp_tool_search to inspect or activate hidden tool groups; inactive tools fail closed and publish when enabled.';
+
+export const MCP_TOOL_GROUP_QUERY_PREFIX = 'group:' as const;
+
+export interface McpToolGroupDefinition {
+  id: string;
+  summary: string;
+  tools: readonly string[];
+}
+
+/** Stable capability bundles. Search results expose only this bounded metadata. */
+export const MCP_TOOL_GROUPS: readonly McpToolGroupDefinition[] = Object.freeze([
+  Object.freeze({
+    id: 'supervision',
+    summary: 'Delegate work, report audits, and operate the supervised task lifecycle.',
+    tools: Object.freeze([
+      MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE, MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS,
+      MEMORY_MCP_TOOL_NAMES.SEND_STOP, MEMORY_MCP_TOOL_NAMES.DELEGATION_REPLY,
+      MEMORY_MCP_TOOL_NAMES.PEER_AUDIT_REPLY, MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_START,
+      MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_UPDATE, MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_FINISH,
+      SUPERVISION_MCP_TOOLS.LIST, SUPERVISION_MCP_TOOLS.GET, SUPERVISION_MCP_TOOLS.INTENT,
+      MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_FILE_EVENT, SUPERVISION_MCP_TOOLS.RECOVER,
+    ]),
+  }),
+  Object.freeze({
+    id: 'memory-curation',
+    summary: 'Recall, inspect, curate, archive, restore, update, and give feedback on memory.',
+    tools: Object.freeze([
+      MEMORY_MCP_TOOL_NAMES.SEARCH_MEMORY, MEMORY_MCP_TOOL_NAMES.SAVE_OBSERVATION,
+      MEMORY_MCP_TOOL_NAMES.SAVE_PREFERENCE, MEMORY_MCP_TOOL_NAMES.LIST_MEMORY_SUMMARIES,
+      MEMORY_MCP_TOOL_NAMES.GET_MEMORY_SOURCES, MEMORY_MCP_TOOL_NAMES.ARCHIVE_MEMORY,
+      MEMORY_MCP_TOOL_NAMES.RESTORE_MEMORY, MEMORY_MCP_TOOL_NAMES.DELETE_MEMORY,
+      MEMORY_MCP_TOOL_NAMES.UPDATE_MEMORY, MEMORY_MCP_TOOL_NAMES.MEMORY_FEEDBACK,
+      MEMORY_MCP_TOOL_NAMES.SESSION_RUNTIME_IDENTITY_GET,
+    ]),
+  }),
+  Object.freeze({
+    id: 'scheduling',
+    summary: 'Create, inspect, update, and cancel self-wake or targeted scheduled work.',
+    tools: Object.freeze([
+      MEMORY_MCP_TOOL_NAMES.CRON_CREATE_SELF, MEMORY_MCP_TOOL_NAMES.CRON_UPDATE_SELF,
+      MEMORY_MCP_TOOL_NAMES.CRON_CANCEL_SELF, MEMORY_MCP_TOOL_NAMES.CRON_CREATE,
+      MEMORY_MCP_TOOL_NAMES.CRON_LIST, MEMORY_MCP_TOOL_NAMES.CRON_UPDATE,
+      MEMORY_MCP_TOOL_NAMES.CRON_DELETE,
+    ]),
+  }),
+  Object.freeze({
+    id: 'aliases-pins',
+    summary: 'Manage exact aliases and persistent message pins without fuzzy-memory lookup.',
+    tools: Object.freeze([
+      ALIAS_MCP_TOOLS.SAVE, ALIAS_MCP_TOOLS.LIST, ALIAS_MCP_TOOLS.RESOLVE, ALIAS_MCP_TOOLS.DELETE,
+      MESSAGE_PIN_MCP_TOOLS.SAVE, MESSAGE_PIN_MCP_TOOLS.LIST,
+      MESSAGE_PIN_MCP_TOOLS.GET, MESSAGE_PIN_MCP_TOOLS.DELETE,
+    ]),
+  }),
+  Object.freeze({
+    id: 'managed-machines',
+    summary: 'List authorized managed machines and execute bounded remote commands.',
+    tools: Object.freeze([MEMORY_MCP_TOOL_NAMES.LIST_MACHINES, MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE]),
+  }),
+  Object.freeze({
+    id: 'file-transfer-computer-use',
+    summary: 'Transfer explicit files and inspect or operate authorized remote computer-use sessions.',
+    tools: Object.freeze([
+      MEMORY_MCP_TOOL_NAMES.SEND_FILE_TO_MACHINE, MEMORY_MCP_TOOL_NAMES.FETCH_FILE_FROM_MACHINE,
+      MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_DOCS, MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL,
+    ]),
+  }),
+  Object.freeze({
+    id: 'capability-management',
+    summary: 'List, install, inspect, activate, update, disable, restore, or uninstall managed capabilities.',
+    tools: Object.freeze([...CAPABILITY_MCP_TOOL_NAMES]),
+  }),
+]);
 
 
 /**
  * Core tools stay listed and callable WITHOUT a discovery round-trip.
  *
- * Lazy-loading the whole catalog shrinks the default tool surface, but it also
- * makes multi-agent orchestration depend on every client remembering to search
- * first. Delegation, the supervision task registry, and basic memory are used on
- * essentially every turn, and a client that cached an older tool list or calls by
- * name would hit `Tool <name> disabled` instead. Those stay on; everything else
- * Only the genuinely heavy or rare surfaces stay lazy: controlled-machine exec,
- * file transfer, computer-use, capability management, message pins and execution
- * clones.
+ * The stable bootstrap is deliberately limited to the tools needed to discover
+ * peers, report delegated/audit work, operate the supervision state machine, and
+ * perform basic memory recall/recording. Administration, scheduling, aliases,
+ * pins, machines, file transfer, computer use, capability management and other
+ * long-tail surfaces require an explicit discovery round-trip.
  */
 export const MCP_TOOL_DISCOVERY_DEFAULT_ACTIVE: readonly string[] = Object.freeze([
   // delegation + audit receipts
-  'send_message',
-  'send_list_targets',
-  'send_stop',
-  'delegation_reply',
-  'peer_audit_reply',
+  MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE,
+  MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS,
+  MEMORY_MCP_TOOL_NAMES.SEND_STOP,
+  MEMORY_MCP_TOOL_NAMES.DELEGATION_REPLY,
+  MEMORY_MCP_TOOL_NAMES.PEER_AUDIT_REPLY,
   // supervision task registry
-  'supervision_task_start',
-  'supervision_task_update',
-  'supervision_task_finish',
-  'supervision_task_list',
-  'supervision_task_get',
-  'supervision_task_intent',
-  'supervision_task_file_event',
-  // memory: the whole surface, not just reads. Recall, provenance and curation
-  // are used constantly, and a half-lazy memory API is worse than none because
-  // the model cannot tell which half it has.
-  'search_memory',
-  'save_observation',
-  'save_preference',
-  'list_memory_summaries',
-  'get_memory_sources',
-  'archive_memory',
-  'restore_memory',
-  'delete_memory',
-  'update_memory',
-  'memory_feedback',
-  // aliases: tiny schemas, referenced inline in ordinary work
-  'save_alias',
-  'list_aliases',
-  'resolve_alias',
-  'delete_alias',
-  // scheduling: self-wakeup drives loops; a hidden cron tool silently breaks them
-  'cron_create_self',
-  'cron_update_self',
-  'cron_cancel_self',
-  'cron_create',
-  'cron_list',
-  'cron_update',
-  'cron_delete',
-  // message pins: four tiny CRUD schemas, used inline like aliases
-  'pin_message',
-  'list_message_pins',
-  'get_message_pin',
-  'delete_message_pin',
-  // identity
-  'session_runtime_identity_get',
+  MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_START,
+  MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_UPDATE,
+  MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_FINISH,
+  SUPERVISION_MCP_TOOLS.LIST,
+  SUPERVISION_MCP_TOOLS.GET,
+  SUPERVISION_MCP_TOOLS.INTENT,
+  MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_FILE_EVENT,
+  // memory basics + identity
+  MEMORY_MCP_TOOL_NAMES.SEARCH_MEMORY,
+  MEMORY_MCP_TOOL_NAMES.SAVE_OBSERVATION,
+  MEMORY_MCP_TOOL_NAMES.SAVE_PREFERENCE,
+  MEMORY_MCP_TOOL_NAMES.SESSION_RUNTIME_IDENTITY_GET,
+  // Existing self-wakeup loops may hold a cached tool list across requests.
+  MEMORY_MCP_TOOL_NAMES.CRON_CREATE_SELF,
+  MEMORY_MCP_TOOL_NAMES.CRON_UPDATE_SELF,
+  MEMORY_MCP_TOOL_NAMES.CRON_CANCEL_SELF,
 ]);
 
 export function isDefaultActiveMcpTool(name: string): boolean {
   return MCP_TOOL_DISCOVERY_DEFAULT_ACTIVE.includes(name);
+}
+
+export function getMcpToolGroupById(id: string): McpToolGroupDefinition | undefined {
+  return MCP_TOOL_GROUPS.find((group) => group.id === id);
 }
 
 export const MCP_TOOL_DISCOVERY_LIMITS = Object.freeze({

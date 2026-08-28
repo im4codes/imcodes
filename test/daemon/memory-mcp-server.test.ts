@@ -12,7 +12,12 @@ import {
   mcpToolSurfaceBytes,
   projectAuthoredMcpToolSurface,
 } from '../../shared/mcp-tool-surface-budget.js';
-import { MCP_TOOL_DISCOVERY_DEFAULT_ACTIVE, MCP_TOOL_DISCOVERY_NAME } from '../../shared/mcp-tool-discovery.js';
+import {
+  MCP_TOOL_DISCOVERY_DEFAULT_ACTIVE,
+  MCP_TOOL_DISCOVERY_DESCRIPTION,
+  MCP_TOOL_DISCOVERY_NAME,
+  MCP_TOOL_GROUPS,
+} from '../../shared/mcp-tool-discovery.js';
 import { describe, expect, it, vi } from 'vitest';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
@@ -20,6 +25,9 @@ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { MEMORY_MCP_ENV_KEYS, buildMemoryMcpServerEnv } from '../../shared/memory-mcp-env.js';
 import { MEMORY_MCP_TOOL_NAME_LIST, MEMORY_MCP_TOOL_NAMES } from '../../shared/memory-mcp-contracts.js';
 import { ALIAS_MCP_TOOLS } from '../../shared/alias-types.js';
+import { MESSAGE_PIN_MCP_TOOLS } from '../../shared/message-pins.js';
+import { CAPABILITY_MCP_TOOL_NAMES } from '../../shared/capability-management.js';
+import { SUPERVISION_MCP_REGISTERED_TOOLS } from '../../shared/supervision-mcp-tools.js';
 import { AGENT_DELEGATION_REPLY_ERRORS } from '../../shared/agent-delegation.js';
 import {
   createMemoryMcpServerFromEnv,
@@ -206,12 +214,24 @@ describe('memory MCP stdio server', () => {
       // shrunken allowlist and a leaked non-core tool both fail here.
       const bootstrapNames = bootstrap.tools.map((tool) => tool.name).sort();
       expect(bootstrapNames).toEqual([MCP_TOOL_DISCOVERY_NAME, ...MCP_TOOL_DISCOVERY_DEFAULT_ACTIVE].sort());
+      expect(bootstrap.tools).toHaveLength(20);
+      expect(new Set(bootstrapNames).size).toBe(bootstrapNames.length);
       expect(bootstrapNames).not.toContain(MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE);
       expect(bootstrapNames).not.toContain(MEMORY_MCP_TOOL_NAMES.LIST_MACHINES);
       expect(bootstrapNames).not.toContain(MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL);
+      expect(bootstrapNames).not.toContain(MEMORY_MCP_TOOL_NAMES.GET_MEMORY_SOURCES);
+      expect(bootstrapNames).not.toContain(MEMORY_MCP_TOOL_NAMES.CRON_LIST);
+      expect(bootstrapNames).not.toContain(ALIAS_MCP_TOOLS.LIST);
+      expect(bootstrapNames).toEqual(expect.arrayContaining([
+        MEMORY_MCP_TOOL_NAMES.CRON_CREATE_SELF,
+        MEMORY_MCP_TOOL_NAMES.CRON_UPDATE_SELF,
+        MEMORY_MCP_TOOL_NAMES.CRON_CANCEL_SELF,
+      ]));
       expect(mcpToolSurfaceBytes(bootstrap.tools)).toBeLessThanOrEqual(MCP_TOOL_SURFACE_BOOTSTRAP_BUDGET_BYTES);
-      expect(client.getInstructions()).not.toContain('HIGHEST-PRIORITY IM.codes SERVICE ROUTING POLICY');
-      expect(client.getInstructions()?.length).toBeLessThanOrEqual(240);
+      expect(client.getInstructions()).toBeUndefined();
+      const bootstrapDescriptions = bootstrap.tools.map((tool) => tool.description ?? '').join('\n');
+      expect(bootstrapDescriptions.split(MCP_TOOL_DISCOVERY_DESCRIPTION)).toHaveLength(2);
+      expect(bootstrapDescriptions.match(/mcp_tool_search/g)).toHaveLength(1);
 
       const activation = await client.callTool({
         name: MCP_TOOL_DISCOVERY_NAME,
@@ -220,6 +240,20 @@ describe('memory MCP stdio server', () => {
       expect(activation.isError).not.toBe(true);
       const listed = await client.listTools();
       const listedNames = listed.tools.map((tool) => tool.name);
+      const expectedFullNames = new Set([
+        MCP_TOOL_DISCOVERY_NAME,
+        ...MEMORY_MCP_TOOL_NAME_LIST,
+        ...Object.values(ALIAS_MCP_TOOLS),
+        ...Object.values(MESSAGE_PIN_MCP_TOOLS),
+        ...SUPERVISION_MCP_REGISTERED_TOOLS,
+        ...CAPABILITY_MCP_TOOL_NAMES,
+      ]);
+      expect(new Set(listedNames)).toEqual(expectedFullNames);
+      expect(activation.structuredContent).toMatchObject({
+        activated: expect.arrayContaining([...expectedFullNames].filter((name) => name !== MCP_TOOL_DISCOVERY_NAME)),
+      });
+      expect((activation.structuredContent as { activated: unknown[] }).activated)
+        .toHaveLength(expectedFullNames.size - 1);
       expect(listedNames).toContain(MCP_TOOL_DISCOVERY_NAME);
       // Memory tools plus the full alias CRUD tool set share the same server surface.
       expect(listedNames).toEqual(expect.arrayContaining([...MEMORY_MCP_TOOL_NAME_LIST]));
@@ -331,9 +365,8 @@ describe('memory MCP stdio server', () => {
         ...MCP_TOOL_DISCOVERY_DEFAULT_ACTIVE,
       ].sort());
 
-      // Replacement is only observable between two LAZY tools now that cron and
-      // memory are core: activate one, then search another and require the first
-      // to be retired.
+      // Replacement is observable between two lazy tools: activate one, then
+      // search another and require the first to be retired.
       await client.callTool({
         name: MCP_TOOL_DISCOVERY_NAME,
         arguments: { query: MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL },
@@ -352,8 +385,195 @@ describe('memory MCP stdio server', () => {
       expect(cronNames).toContain(MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE);
       // ...while the previously discovered lazy tool is retired as designed.
       expect(cronNames).not.toContain(MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL);
+      // Cached self-wakeup loops survive every replacement without searching.
+      expect(cronNames).toEqual(expect.arrayContaining([
+        MEMORY_MCP_TOOL_NAMES.CRON_CREATE_SELF,
+        MEMORY_MCP_TOOL_NAMES.CRON_UPDATE_SELF,
+        MEMORY_MCP_TOOL_NAMES.CRON_CANCEL_SELF,
+      ]));
     } finally {
       await client.close();
+    }
+  });
+
+  it('previews and atomically activates a named group for multiple authoritative calls', async () => {
+    const client = new Client({ name: 'memory-mcp-group-activation-test', version: '0.1.0' }, {});
+    const server = createMemoryMcpServer({
+      transport: 'in_process',
+      userId: 'user-1',
+      namespace,
+      sessionName: 'deck_proj_brain',
+      projectName: 'proj',
+      projectRoot: '/tmp/proj',
+    }, {}, {
+      listPins: vi.fn(async () => ({ status: 'ok' as const, pins: [] })),
+    });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    try {
+      await Promise.all([client.connect(clientTransport), server.connect(serverTransport)]);
+      const publish = vi.spyOn(server, 'sendToolListChanged');
+
+      const preview = await client.callTool({
+        name: MCP_TOOL_DISCOVERY_NAME,
+        arguments: { query: 'group:aliases-pins', activate: false },
+      });
+      expect(preview.structuredContent).toMatchObject({
+        status: 'ok',
+        activated: [],
+        activatedGroups: [],
+        groups: [expect.objectContaining({
+          id: 'aliases-pins', name: 'aliases-pins', toolCount: 8, active: false,
+          tools: expect.arrayContaining([ALIAS_MCP_TOOLS.LIST, MESSAGE_PIN_MCP_TOOLS.LIST]),
+        })],
+      });
+      expect(JSON.stringify(preview.structuredContent)).not.toMatch(/inputSchema|properties|additionalProperties/);
+      expect(publish).not.toHaveBeenCalled();
+
+      const activation = await client.callTool({
+        name: MCP_TOOL_DISCOVERY_NAME,
+        arguments: { query: 'group:aliases-pins' },
+      });
+      expect(activation.structuredContent).toMatchObject({
+        status: 'ok',
+        activatedGroups: ['aliases-pins'],
+        activated: expect.arrayContaining([
+          ALIAS_MCP_TOOLS.LIST, ALIAS_MCP_TOOLS.RESOLVE,
+          MESSAGE_PIN_MCP_TOOLS.LIST, MESSAGE_PIN_MCP_TOOLS.SAVE,
+        ]),
+        groups: [expect.objectContaining({ id: 'aliases-pins', toolCount: 8, active: true })],
+      });
+      expect(publish).toHaveBeenCalledTimes(1);
+
+      await expect(client.callTool({ name: ALIAS_MCP_TOOLS.LIST, arguments: {} })).resolves.toMatchObject({
+        structuredContent: expect.objectContaining({ status: 'ok' }),
+      });
+      await expect(client.callTool({ name: MESSAGE_PIN_MCP_TOOLS.LIST, arguments: {} })).resolves.toMatchObject({
+        structuredContent: expect.objectContaining({ status: 'ok', pins: [] }),
+      });
+
+      const replacement = await client.callTool({
+        name: MCP_TOOL_DISCOVERY_NAME,
+        arguments: { query: 'group:scheduling' },
+      });
+      expect(replacement.structuredContent).toMatchObject({
+        activatedGroups: ['scheduling'],
+        groups: [expect.objectContaining({ id: 'scheduling', toolCount: 7, active: true })],
+      });
+      expect(publish).toHaveBeenCalledTimes(2);
+      const replacementNames = (await client.listTools()).tools.map((tool) => tool.name);
+      expect(replacementNames).toContain(MEMORY_MCP_TOOL_NAMES.CRON_LIST);
+      expect(replacementNames).toEqual(expect.arrayContaining([
+        MEMORY_MCP_TOOL_NAMES.CRON_CREATE_SELF,
+        MEMORY_MCP_TOOL_NAMES.CRON_UPDATE_SELF,
+        MEMORY_MCP_TOOL_NAMES.CRON_CANCEL_SELF,
+      ]));
+      expect(replacementNames).not.toContain(ALIAS_MCP_TOOLS.LIST);
+      expect((await client.callTool({ name: ALIAS_MCP_TOOLS.LIST, arguments: {} })).isError).toBe(true);
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+
+  it('matches task phrases to groups and fails closed for unknown or unauthorized groups', async () => {
+    const client = new Client({ name: 'memory-mcp-group-authority-test', version: '0.1.0' }, {});
+    const server = createMemoryMcpServer({
+      transport: 'in_process',
+      userId: 'user-1',
+      namespace,
+      sessionName: 'deck_proj_brain',
+      projectName: 'proj',
+      projectRoot: '/tmp/proj',
+    });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    try {
+      await Promise.all([client.connect(clientTransport), server.connect(serverTransport)]);
+      expect(MCP_TOOL_GROUPS.every((group) => group.summary.length <= 180)).toBe(true);
+
+      const phrase = await client.callTool({
+        name: MCP_TOOL_DISCOVERY_NAME,
+        arguments: { query: 'scheduled work', activate: false },
+      });
+      expect(phrase.structuredContent).toMatchObject({
+        groups: [expect.objectContaining({ id: 'scheduling', toolCount: 7 })],
+      });
+
+      const unknown = await client.callTool({
+        name: MCP_TOOL_DISCOVERY_NAME,
+        arguments: { query: 'group:not-real' },
+      });
+      expect(unknown).toMatchObject({ isError: true, structuredContent: {
+        status: 'error', reason: 'validation_failed',
+      } });
+
+      // The capability group exists, but an unbound node registers none of its
+      // members. Group discovery must neither disclose nor manufacture them.
+      const unauthorized = await client.callTool({
+        name: MCP_TOOL_DISCOVERY_NAME,
+        arguments: { query: 'group:capability-management' },
+      });
+      expect(unauthorized.structuredContent).toMatchObject({
+        status: 'ok', activated: [], activatedGroups: ['capability-management'],
+        groups: [expect.objectContaining({
+          id: 'capability-management', toolCount: 0, tools: [], active: false,
+        })],
+      });
+      expect((await client.callTool({ name: 'capability_install', arguments: {} })).isError).toBe(true);
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+
+  it('atomically activates a hidden tool, preserves handler scope, and rejects unknown or unavailable tools', async () => {
+    const client = new Client({ name: 'memory-mcp-activation-authority-test', version: '0.1.0' }, {});
+    const server = createMemoryMcpServer({
+      transport: 'in_process',
+      userId: 'user-1',
+      namespace,
+      sessionName: 'deck_proj_brain',
+      projectName: 'proj',
+      projectRoot: '/tmp/proj',
+    });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    try {
+      await Promise.all([client.connect(clientTransport), server.connect(serverTransport)]);
+
+      const activation = await client.callTool({
+        name: MCP_TOOL_DISCOVERY_NAME,
+        arguments: { query: ALIAS_MCP_TOOLS.LIST },
+      });
+      expect(activation.structuredContent).toMatchObject({
+        status: 'ok',
+        activated: [ALIAS_MCP_TOOLS.LIST],
+        matches: [expect.objectContaining({ name: ALIAS_MCP_TOOLS.LIST, active: true })],
+      });
+      expect((await client.listTools()).tools.map((tool) => tool.name)).toContain(ALIAS_MCP_TOOLS.LIST);
+      await expect(client.callTool({ name: ALIAS_MCP_TOOLS.LIST, arguments: {} })).resolves.toMatchObject({
+        isError: false,
+        structuredContent: expect.objectContaining({ status: 'ok' }),
+      });
+
+      const unknown = await client.callTool({
+        name: MCP_TOOL_DISCOVERY_NAME,
+        arguments: { query: 'definitely_not_an_imcodes_tool' },
+      });
+      expect(unknown.structuredContent).toMatchObject({ status: 'ok', matches: [], activated: [] });
+      const unknownCall = await client.callTool({ name: 'definitely_not_an_imcodes_tool', arguments: {} });
+      expect(unknownCall.isError).toBe(true);
+
+      // Capability tools are not even registered without an authorized node
+      // service. Discovery cannot manufacture authority or a callable schema.
+      const unauthorized = await client.callTool({
+        name: MCP_TOOL_DISCOVERY_NAME,
+        arguments: { query: 'capability_install' },
+      });
+      expect(unauthorized.structuredContent).toMatchObject({ status: 'ok', matches: [], activated: [] });
+      const unauthorizedCall = await client.callTool({ name: 'capability_install', arguments: {} });
+      expect(unauthorizedCall.isError).toBe(true);
+    } finally {
+      await client.close();
+      await server.close();
     }
   });
 

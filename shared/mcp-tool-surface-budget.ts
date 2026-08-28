@@ -27,18 +27,14 @@ export const MCP_INJECTED_EXECUTION_BLOCK = Object.freeze({ taskSupport: 'forbid
 export const MCP_TOOL_SURFACE_AUTHORED_BUDGET_BYTES = 40_000;
 export const MCP_TOOL_SURFACE_RAW_BUDGET_BYTES = 45_000;
 /**
- * Default model-visible surface: the discovery tool plus the core delegation /
- * supervision-task / memory tools listed in MCP_TOOL_DISCOVERY_DEFAULT_ACTIVE.
- *
- * Core tools are deliberately NOT lazy: hiding them would make every agent
- * depend on a discovery round-trip first, and any client holding a cached tool
- * list would get `Tool <name> disabled` instead. Memory, aliases and cron are core too, so the
- * default set is 39 tools measuring 27,117 bytes against a 36,700 full catalog:
- * a 26% reduction, not the 69% a minimal core would give. That trade is
- * deliberate -- a half-lazy memory or scheduling API is worse than none, because
- * the model cannot tell which half it currently has.
+ * Default model-visible surface: one discovery tool plus the stable minimal
+ * delegation, supervision-task, basic-memory and runtime-identity bootstrap in
+ * MCP_TOOL_DISCOVERY_DEFAULT_ACTIVE. All other schemas are explicit-on-demand.
+ * The bound is intentionally tight so a new eager schema cannot quietly erase
+ * the lazy-loading reduction. Full-surface authored/raw dual accounting below is
+ * unchanged and continues to guard the complete activated catalog.
  */
-export const MCP_TOOL_SURFACE_BOOTSTRAP_BUDGET_BYTES = 28_000;
+export const MCP_TOOL_SURFACE_BOOTSTRAP_BUDGET_BYTES = 16_000;
 
 export interface McpSurfaceRemoval {
   /** Dotted path of the containing object, for diagnosis when an assert fails. */
