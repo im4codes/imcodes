@@ -42,7 +42,10 @@ vi.mock('../../src/api.js', () => ({
   onUserPrefChanged: () => () => undefined,
 }));
 
-import { SessionSettingsDialog } from '../../src/components/SessionSettingsDialog.js';
+import {
+  SessionSettingsDialog,
+  buildSupervisionExecutionPoolCandidates,
+} from '../../src/components/SessionSettingsDialog.js';
 
 function inputForLabel(label: string, index = 0): HTMLInputElement {
   const labels = screen.getAllByText(label);
@@ -113,7 +116,15 @@ describe('SessionSettingsDialog supervision', () => {
         description="desc"
         cwd="/proj"
         type="codex-sdk"
-        transportConfig={null}
+        transportConfig={{
+          supervision: {
+            mode: 'supervised',
+            backend: 'codex-sdk',
+            model: CODEX_MODEL_IDS[0],
+            timeoutMs: 30_000,
+            promptVersion: 'supervision_decision_v1',
+          },
+        }}
         onClose={vi.fn()}
         onSaved={vi.fn()}
       />,
@@ -344,9 +355,9 @@ describe('SessionSettingsDialog supervision', () => {
 
     const primary = screen.getByTestId('supervision-execution-pool-primary');
     const economy = screen.getByTestId('supervision-execution-pool-economy');
-    expect(within(primary).getByLabelText(`primary:codex-sdk:${CODEX_MODEL_IDS[0]}`)).toHaveProperty('checked', true);
-    expect(within(primary).queryByLabelText('primary:codex-sdk:gpt-5.3-codex-spark')).toBeNull();
-    expect(within(economy).getByLabelText('economy:codex-sdk:gpt-5.3-codex-spark')).toHaveProperty('checked', false);
+    expect(within(primary).getByLabelText(`primary:configured:codex-sdk:${CODEX_MODEL_IDS[0]}`)).toHaveProperty('checked', true);
+    expect(within(primary).getByTestId('supervision-execution-pool-primary-empty')).toBeDefined();
+    expect(within(economy).getByTestId('supervision-execution-pool-economy-empty')).toBeDefined();
 
     fireEvent.click(screen.getByRole('button', { name: /save/i }));
 
@@ -374,14 +385,28 @@ describe('SessionSettingsDialog supervision', () => {
         cwd="/proj"
         type="codex-sdk"
         activeModel={CODEX_MODEL_IDS[0]}
-        transportConfig={null}
+        peerAuditSessions={[makePeerAuditSession({
+          sessionName: 'deck_sub_spark',
+          label: 'Spark helper',
+          activeModel: DEFAULT_CODEX_AUTOMATION_MODEL,
+          requestedModel: DEFAULT_CODEX_AUTOMATION_MODEL,
+        })]}
+        transportConfig={{
+          supervision: {
+            mode: 'supervised',
+            backend: 'codex-sdk',
+            model: CODEX_MODEL_IDS[0],
+            timeoutMs: 30_000,
+            promptVersion: 'supervision_decision_v1',
+          },
+        }}
         onClose={vi.fn()}
         onSaved={vi.fn()}
       />,
     );
 
     const economy = screen.getByTestId('supervision-execution-pool-economy');
-    const economySpark = within(economy).getByLabelText('economy:codex-sdk:gpt-5.3-codex-spark');
+    const economySpark = within(economy).getByLabelText('economy:deck_sub_spark');
     fireEvent.click(economySpark);
     fireEvent.click(screen.getByRole('button', { name: /save/i }));
 
@@ -397,7 +422,138 @@ describe('SessionSettingsDialog supervision', () => {
           }),
         }),
       }));
+      expect(patchSessionMock).toHaveBeenCalledWith('srv-1', 'deck_proj_brain', expect.objectContaining({
+        transportConfig: expect.objectContaining({
+          supervision: expect.objectContaining({
+            executionPools: expect.objectContaining({
+              economyTaskPool: expect.objectContaining({
+                configs: [expect.objectContaining({ model: DEFAULT_CODEX_AUTOMATION_MODEL })],
+              }),
+            }),
+          }),
+        }),
+      }));
     });
+  });
+
+  it('derives pool candidates only from open reply-capable sub-sessions with known models', () => {
+    const candidates = buildSupervisionExecutionPoolCandidates({
+      sessionName: 'deck_proj_brain',
+      sessions: [
+        makePeerAuditSession({ sessionName: 'deck_sub_ready', label: 'Ready', state: 'idle', activeModel: 'gpt-5.6' }),
+        makePeerAuditSession({ sessionName: 'deck_sub_starting', label: 'Starting', state: 'starting', activeModel: 'gpt-5.5' }),
+        makePeerAuditSession({ sessionName: 'deck_sub_stopped', state: 'stopped' }),
+        makePeerAuditSession({ sessionName: 'deck_sub_closed', closedAt: Date.now() }),
+        makePeerAuditSession({ sessionName: 'deck_sub_shell', type: 'shell' }),
+        makePeerAuditSession({ sessionName: 'deck_sub_unknown', activeModel: null, requestedModel: null, modelDisplay: null }),
+        makePeerAuditSession({ sessionName: 'deck_sub_other', parentSession: 'deck_other_brain' }),
+      ],
+    });
+
+    expect(candidates.map((candidate) => candidate.sessionName)).toEqual([
+      'deck_sub_ready',
+      'deck_sub_starting',
+    ]);
+    expect(candidates[0]).toMatchObject({
+      label: 'Ready',
+      config: {
+        agentType: 'codex-sdk',
+        providerFamily: 'openai',
+        runtimeType: 'transport',
+        model: 'gpt-5.6',
+      },
+    });
+  });
+
+  it('shows session, SDK, and model and keeps primary/economy selection mutually exclusive', () => {
+    render(
+      <SessionSettingsDialog
+        serverId="srv-1"
+        sessionName="deck_proj_brain"
+        label="Brain"
+        description="desc"
+        cwd="/proj"
+        type="codex-sdk"
+        activeModel={CODEX_MODEL_IDS[0]}
+        peerAuditSessions={[makePeerAuditSession({
+          sessionName: 'deck_sub_worker',
+          label: 'Integration worker',
+          activeModel: 'gpt-5.6',
+          requestedModel: 'gpt-5.6',
+        })]}
+        transportConfig={null}
+        onClose={vi.fn()}
+        onSaved={vi.fn()}
+      />,
+    );
+
+    const primary = screen.getByTestId('supervision-execution-pool-primary');
+    const economy = screen.getByTestId('supervision-execution-pool-economy');
+    const primaryWorker = within(primary).getByLabelText('primary:deck_sub_worker') as HTMLInputElement;
+    const economyWorker = within(economy).getByLabelText('economy:deck_sub_worker') as HTMLInputElement;
+    expect(primary.textContent).toContain('Integration worker');
+    expect(primary.textContent).toContain('deck_sub_worker');
+    expect(primary.textContent).toContain('codex_sdk · gpt-5.6');
+
+    fireEvent.click(primaryWorker);
+    expect(primaryWorker.checked).toBe(true);
+    expect(economyWorker.checked).toBe(false);
+    fireEvent.click(economyWorker);
+    expect(primaryWorker.checked).toBe(false);
+    expect(economyWorker.checked).toBe(true);
+    fireEvent.click(primaryWorker);
+    expect(primaryWorker.checked).toBe(true);
+    expect(economyWorker.checked).toBe(false);
+  });
+
+  it('routes each pool add button to the existing sub-session launcher and accepts the new starting session immediately', () => {
+    const onAddPoolSession = vi.fn();
+    const view = render(
+      <SessionSettingsDialog
+        serverId="srv-1"
+        sessionName="deck_proj_brain"
+        label="Brain"
+        description="desc"
+        cwd="/proj"
+        type="codex-sdk"
+        activeModel={CODEX_MODEL_IDS[0]}
+        peerAuditSessions={[]}
+        transportConfig={null}
+        onAddPoolSession={onAddPoolSession}
+        onClose={vi.fn()}
+        onSaved={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(within(screen.getByTestId('supervision-execution-pool-primary'))
+      .getByRole('button', { name: 'addPoolSession' }));
+    expect(onAddPoolSession).toHaveBeenCalledWith('primary');
+
+    view.rerender(
+      <SessionSettingsDialog
+        serverId="srv-1"
+        sessionName="deck_proj_brain"
+        label="Brain"
+        description="desc"
+        cwd="/proj"
+        type="codex-sdk"
+        activeModel={CODEX_MODEL_IDS[0]}
+        peerAuditSessions={[makePeerAuditSession({
+          sessionName: 'deck_sub_new',
+          label: 'New provider',
+          state: 'starting',
+          activeModel: 'gpt-5.5',
+          requestedModel: 'gpt-5.5',
+        })]}
+        transportConfig={null}
+        onAddPoolSession={onAddPoolSession}
+        onClose={vi.fn()}
+        onSaved={vi.fn()}
+      />,
+    );
+
+    expect(within(screen.getByTestId('supervision-execution-pool-primary'))
+      .getByLabelText('primary:deck_sub_new')).toBeDefined();
   });
 
   it('portals above control overlays and always keeps Close and Cancel actionable', () => {

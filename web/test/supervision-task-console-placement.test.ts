@@ -60,29 +60,38 @@ describe('supervision task console toolbar placement', () => {
     expect(block.match(/triggerRef=\{supervisionTaskConsoleToggleRef\}/g)).toHaveLength(1);
   });
 
-  it('scopes the desktop toggle to a non-share coordinator session', () => {
+  it('routes the desktop toggle through the shared visibility decision', () => {
     const block = desktopToolbarBlock();
     const toggle = block.indexOf('<SupervisionTaskConsoleToggle');
     const props = block.slice(toggle, toggle + 400);
-    // A share target is another operator's session; the console projects THIS
-    // coordinator's registry, so it must not offer itself there.
-    expect(props).toContain('selectedShareTarget ? null : activeSessionInfo');
+    expect(props).toContain('visibility={supervisionTaskConsoleVisibility}');
   });
 
-  it('scopes the real mobile toggle to the local coordinator, never a share target', () => {
+  it('routes the real mobile toggle through the same shared visibility decision', () => {
     const block = mobileToolbarBlock();
     const toggle = block.indexOf('<SupervisionTaskConsoleToggle');
     const props = block.slice(toggle, toggle + 400);
-    expect(props).toContain('session={selectedShareTarget ? null : activeSessionInfo}');
+    expect(props).toContain('visibility={supervisionTaskConsoleVisibility}');
   });
 
-  it('gates the console panel itself on a brain session and no share target', () => {
+  it('gates the panel with the shared visibility helper and never duplicates a local role predicate', () => {
     const workspace = boundedBlock(
       '<div class="supervision-task-console-workspace">',
       '{/* Desktop floating file browser */}',
     );
-    expect(workspace.match(/showSupervisionTaskConsole && activeSessionInfo\?\.role === 'brain' && !selectedShareTarget/g))
-      .toHaveLength(1);
+    expect(app).toContain('const canViewTaskConsole = canViewSupervisionTaskConsole(supervisionTaskConsoleVisibility);');
+    expect(app).toMatch(/sharedAccessRole: selectedShareTarget\s*\? \(activeSessionInfo\?\.sharedState\?\.effectiveRole \?\? null\)\s*: null/);
+    expect(workspace.match(/showSupervisionTaskConsole && canViewTaskConsole && activeSessionInfo/g)).toHaveLength(1);
+    expect(workspace).not.toMatch(/role === 'brain'/);
+    expect(workspace).toContain("readOnly={sharedAccessRole === 'viewer'}");
     expect(app.match(/<SupervisionTaskConsole(?=\s)/g)).toHaveLength(1);
+  });
+
+  it('restores and persists panel open state through the shared preferences helper', () => {
+    expect(app).toMatch(/useState\(\s*\(\) => loadSupervisionTaskConsolePreferences\(supervisionTaskConsolePreferenceBounds\(\)\)\.open/);
+    expect(app).toContain('saveSupervisionTaskConsolePreferences({ ...preferences, open: nextOpen }, bounds);');
+    expect(app).toContain('saveSupervisionTaskConsolePreferences({ ...preferences, open: false }, bounds);');
+    expect(app.match(/onToggle=\{toggleSupervisionTaskConsole\}/g)).toHaveLength(2);
+    expect(app).toContain('onClose={closeSupervisionTaskConsole}');
   });
 });

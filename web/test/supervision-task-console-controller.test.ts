@@ -55,7 +55,31 @@ function snapshot(subscriptionId: string): SupervisionTaskConsoleSnapshot {
   };
 }
 
+function emptySnapshot(subscriptionId: string): SupervisionTaskConsoleSnapshot {
+  return {
+    ...snapshot(subscriptionId),
+    projectionVersion: 0,
+    lastDurableEventId: null,
+    tasks: [],
+    assignments: [],
+  };
+}
+
 describe('SupervisionTaskConsoleController', () => {
+  it('does not leave an initially offline console in IDLE/loading', () => {
+    const socket = new FakeSocket();
+    const controller = new SupervisionTaskConsoleController(socket, SCOPE);
+    controller.start();
+
+    controller.setConnected(false);
+
+    expect(controller.getState()).toMatchObject({
+      phase: SUPERVISION_TASK_CONSOLE_PHASE.ERROR,
+      error: 'transport_disconnected',
+    });
+    expect(socket.sent).toEqual([]);
+  });
+
   it('subscribes on the authenticated socket, hydrates, and acks the durable cursor', () => {
     const socket = new FakeSocket();
     const controller = new SupervisionTaskConsoleController(socket, SCOPE);
@@ -66,6 +90,53 @@ describe('SupervisionTaskConsoleController', () => {
     socket.emit(snapshot(subscribe.subscriptionId));
     expect(controller.getState().projectionVersion).toBe(7);
     expect(latest<{ type: string; lastDurableEventId: number | null }>(socket, SUPERVISION_TASK_CONSOLE_MSG.ACK).lastDurableEventId).toBe(41);
+  });
+
+  it('treats an authoritative empty first snapshot as READY instead of waiting forever', () => {
+    const socket = new FakeSocket();
+    const controller = new SupervisionTaskConsoleController(socket, SCOPE);
+    controller.start();
+    controller.setConnected(true);
+    const subscribe = latest<{ subscriptionId: string }>(socket, SUPERVISION_TASK_CONSOLE_MSG.SUBSCRIBE);
+
+    socket.emit(emptySnapshot(subscribe.subscriptionId));
+
+    expect(controller.getState()).toMatchObject({
+      phase: SUPERVISION_TASK_CONSOLE_PHASE.READY,
+      projectionVersion: 0,
+      lastDurableEventId: null,
+      tasks: {},
+    });
+  });
+
+  it('surfaces daemon/browser disconnects and recovers only after authority reconnects', () => {
+    const socket = new FakeSocket();
+    const controller = new SupervisionTaskConsoleController(socket, SCOPE);
+    controller.start();
+    controller.setConnected(true);
+    const initial = latest<{ subscriptionId: string }>(socket, SUPERVISION_TASK_CONSOLE_MSG.SUBSCRIBE);
+
+    socket.emit({ type: DAEMON_MSG.DISCONNECTED });
+    expect(controller.getState()).toMatchObject({
+      phase: SUPERVISION_TASK_CONSOLE_PHASE.ERROR,
+      error: 'daemon_disconnected',
+    });
+
+    socket.emit({ type: DAEMON_MSG.RECONNECTED });
+    const retry = latest<{ subscriptionId: string; afterEventId: number | null }>(socket, SUPERVISION_TASK_CONSOLE_MSG.SUBSCRIBE);
+    expect(retry.subscriptionId).not.toBe(initial.subscriptionId);
+    expect(retry.afterEventId).toBeNull();
+    socket.emit(emptySnapshot(retry.subscriptionId));
+    expect(controller.getState().phase).toBe(SUPERVISION_TASK_CONSOLE_PHASE.READY);
+
+    controller.setConnected(false);
+    expect(controller.getState()).toMatchObject({
+      phase: SUPERVISION_TASK_CONSOLE_PHASE.ERROR,
+      error: 'transport_disconnected',
+    });
+    const sendsBeforeDisconnectedRetry = socket.sent.length;
+    socket.emit({ type: DAEMON_MSG.RECONNECTED });
+    expect(socket.sent).toHaveLength(sendsBeforeDisconnectedRetry);
   });
 
   it('uses the latest cursor for browser reconnect and daemon restart catch-up', () => {
@@ -156,7 +227,8 @@ describe('SupervisionTaskConsoleController', () => {
     controller.setConnected(false);
     socket.emit(snapshot(subscribe.subscriptionId));
     expect(controller.getState().projectionVersion).toBe(0);
-    expect(controller.getState().phase).toBe(SUPERVISION_TASK_CONSOLE_PHASE.SUBSCRIBING);
+    expect(controller.getState().phase).toBe(SUPERVISION_TASK_CONSOLE_PHASE.ERROR);
+    expect(controller.getState().error).toBe('transport_disconnected');
     expect(socket.sent.some((message) => (
       (message as { type?: unknown }).type === SUPERVISION_TASK_CONSOLE_MSG.ACK
     ))).toBe(false);

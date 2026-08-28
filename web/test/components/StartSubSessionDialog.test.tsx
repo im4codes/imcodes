@@ -90,6 +90,30 @@ describe('StartSubSessionDialog', () => {
     expect(screen.getByText('qwen_provider_hint')).toBeDefined();
   });
 
+  it('can reuse the launcher for a supervision pool without exposing unsupported session types', () => {
+    const { container } = render(
+      <StartSubSessionDialog
+        ws={makeWs() as any}
+        defaultCwd="/tmp"
+        allowedAgentTypes={['claude-code-sdk', 'codex-sdk', 'qwen', 'openclaw']}
+        overlayClassName="session-settings-child-overlay"
+        isProviderConnected={() => false}
+        getRemoteSessions={() => []}
+        refreshSessions={vi.fn()}
+        onStart={vi.fn()}
+        onClose={vi.fn()}
+      />,
+    );
+
+    expect(container.querySelector('.session-settings-child-overlay')).toBeTruthy();
+    expect(screen.getByRole('button', { name: /claude_code_sdk/i })).toBeDefined();
+    expect(screen.getByRole('button', { name: /codex_sdk/i })).toBeDefined();
+    expect(screen.getByRole('button', { name: /^qwen$/i })).toBeDefined();
+    expect(screen.getByRole('button', { name: /^openclaw$/i })).toBeDefined();
+    expect(screen.queryByRole('button', { name: /qoder_sdk/i })).toBeNull();
+    expect(screen.queryByRole('button', { name: /codex_cli/i })).toBeNull();
+  });
+
   it('defaults level to high for supported transports', () => {
     render(
       <StartSubSessionDialog

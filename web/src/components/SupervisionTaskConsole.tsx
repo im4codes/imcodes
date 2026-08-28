@@ -1,4 +1,4 @@
-import type { RefObject } from 'preact';
+import type { ComponentChildren, RefObject } from 'preact';
 import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import {
@@ -9,14 +9,22 @@ import {
   type SupervisionTaskConsoleTaskRow,
 } from '@shared/supervision-task-console.js';
 import { isSupervisionTaskLifecycleStatus } from '@shared/supervision-config.js';
-import type { SessionInfo } from '../types.js';
 import type { WsClient } from '../ws-client.js';
 import { useSupervisionTaskConsole } from '../hooks/useSupervisionTaskConsole.js';
+import {
+  loadSupervisionTaskConsolePreferences,
+  saveSupervisionTaskConsolePreferences,
+  type SupervisionTaskConsoleWidthBounds,
+} from '../supervision-task-console-preferences.js';
 import {
   SUPERVISION_TASK_CONSOLE_PHASE,
   type SupervisionTaskConsoleEventEvidence,
   type SupervisionTaskConsoleReducerState,
 } from '../supervision-task-console-reducer.js';
+import {
+  canViewSupervisionTaskConsole,
+  type SupervisionTaskConsoleVisibilityInput,
+} from '../supervision-task-console-visibility.js';
 
 export const SUPERVISION_TASK_CONSOLE_STALE_HEARTBEAT_MS = 2 * 60_000;
 const DESKTOP_MIN_WIDTH = 320;
@@ -25,6 +33,16 @@ const DESKTOP_MAX_WIDTH = 720;
 
 export function supervisionConsoleMaxWidth(viewportWidth: number): number {
   return Math.max(DESKTOP_MIN_WIDTH, Math.min(DESKTOP_MAX_WIDTH, Math.floor(viewportWidth * 0.65)));
+}
+
+export function supervisionTaskConsolePreferenceBounds(
+  viewportWidth = Number.POSITIVE_INFINITY,
+): SupervisionTaskConsoleWidthBounds {
+  return {
+    minWidth: DESKTOP_MIN_WIDTH,
+    maxWidth: supervisionConsoleMaxWidth(viewportWidth),
+    defaultWidth: DESKTOP_DEFAULT_WIDTH,
+  };
 }
 
 /** Apply the fixed desktop range and the shared 65vw split cap. */
@@ -41,20 +59,14 @@ const FOCUSABLE_SELECTOR = [
   '[tabindex]:not([tabindex="-1"])',
 ].join(',');
 
-export function shouldShowSupervisionTaskConsoleToggle(
-  session: Pick<SessionInfo, 'role'> | null | undefined,
-): boolean {
-  return session?.role === 'brain';
-}
-
 export function SupervisionTaskConsoleToggle(props: {
-  session: Pick<SessionInfo, 'role'> | null | undefined;
+  visibility: SupervisionTaskConsoleVisibilityInput;
   open: boolean;
   onToggle: () => void;
   triggerRef?: RefObject<HTMLButtonElement>;
 }) {
   const { t } = useTranslation();
-  if (!shouldShowSupervisionTaskConsoleToggle(props.session)) return null;
+  if (!canViewSupervisionTaskConsole(props.visibility)) return null;
   return (
     <button
       type="button"
@@ -282,6 +294,8 @@ function TaskCard(props: {
 export function SupervisionTaskConsoleView(props: {
   state: SupervisionTaskConsoleReducerState;
   mobile: boolean;
+  readOnly?: boolean;
+  mutationControls?: ComponentChildren;
   now?: number;
   width?: number;
   maxWidth?: number;
@@ -373,6 +387,7 @@ export function SupervisionTaskConsoleView(props: {
       role={props.mobile ? 'dialog' : 'complementary'}
       aria-modal={props.mobile ? 'true' : undefined}
       aria-label={t('supervision_task_console.title')}
+      data-read-only={props.readOnly ? 'true' : 'false'}
       onKeyDown={onKeyDown}
       style={!props.mobile && props.width ? { width: `${props.width}px` } : undefined}
     >
@@ -397,6 +412,7 @@ export function SupervisionTaskConsoleView(props: {
         </div>
         <button ref={closeRef} type="button" class="supervision-task-console-close" onClick={closeAndReturnFocus} aria-label={t('common.close')}>×</button>
       </header>
+      {!props.readOnly && props.mutationControls}
       <div class="supervision-task-console-cursor" aria-live="polite">
         <span>{t('supervision_task_console.projection', { version: props.state.projectionVersion })}</span>
         <span>{t('supervision_task_console.event', { id: props.state.lastDurableEventId ?? '—' })}</span>
@@ -453,12 +469,15 @@ export function SupervisionTaskConsole(props: {
   projectName: string;
   coordinatorSessionName: string;
   mobile: boolean;
+  readOnly: boolean;
   onClose: () => void;
   onNavigateSession: (sessionName: string) => void;
   returnFocusRef?: RefObject<HTMLButtonElement>;
 }) {
-  const [width, setWidth] = useState(DESKTOP_DEFAULT_WIDTH);
   const [viewportWidth, setViewportWidth] = useState(() => window.innerWidth);
+  const [width, setWidth] = useState(() => loadSupervisionTaskConsolePreferences(
+    supervisionTaskConsolePreferenceBounds(window.innerWidth),
+  ).width);
   const state = useSupervisionTaskConsole({
     ws: props.ws,
     connected: props.connected,
@@ -477,6 +496,14 @@ export function SupervisionTaskConsole(props: {
     return () => window.removeEventListener('resize', handleViewportResize);
   }, []);
 
+  const persistWidth = (next: number) => {
+    const bounds = supervisionTaskConsolePreferenceBounds(window.innerWidth);
+    const clamped = clampSupervisionConsoleWidth(next, window.innerWidth);
+    const current = loadSupervisionTaskConsolePreferences(bounds);
+    saveSupervisionTaskConsolePreferences({ ...current, width: clamped }, bounds);
+    setWidth(clamped);
+  };
+
   const startResize = (event: PointerEvent) => {
     if (props.mobile || event.button !== 0) return;
     const startX = event.clientX;
@@ -485,7 +512,7 @@ export function SupervisionTaskConsole(props: {
     target.setPointerCapture?.(event.pointerId);
     const move = (moveEvent: PointerEvent) => {
       if (moveEvent.pointerId !== event.pointerId) return;
-      setWidth(clampSupervisionConsoleWidth(startWidth + startX - moveEvent.clientX, window.innerWidth));
+      persistWidth(startWidth + startX - moveEvent.clientX);
     };
     const stop = (stopEvent: PointerEvent) => {
       if (stopEvent.pointerId !== event.pointerId) return;
@@ -503,13 +530,14 @@ export function SupervisionTaskConsole(props: {
     if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
     event.preventDefault();
     const delta = event.key === 'ArrowLeft' ? 24 : -24;
-    setWidth((current) => clampSupervisionConsoleWidth(current + delta, window.innerWidth));
+    persistWidth(width + delta);
   };
 
   return (
     <SupervisionTaskConsoleView
       state={state}
       mobile={props.mobile}
+      readOnly={props.readOnly}
       width={width}
       maxWidth={supervisionConsoleMaxWidth(viewportWidth)}
       onResizeStart={startResize}

@@ -102,7 +102,14 @@ export class SupervisionTaskConsoleController {
   }
 
   setConnected(connected: boolean): void {
-    if (this.connected === connected) return;
+    if (this.connected === connected) {
+      // The controller starts disconnected. Its first React effect must still
+      // leave a terminal, visible state instead of preserving IDLE/loading.
+      if (!connected && this.state.phase !== SUPERVISION_TASK_CONSOLE_PHASE.ERROR) {
+        this.apply({ type: 'transport_disconnected' });
+      }
+      return;
+    }
     this.connected = connected;
     if (!connected) {
       this.apply({ type: 'transport_disconnected' });
@@ -174,6 +181,10 @@ export class SupervisionTaskConsoleController {
   private handleMessage(message: unknown): void {
     if (!this.connected) return;
     if (!isRecord(message)) return;
+    if (message.type === DAEMON_MSG.DISCONNECTED) {
+      this.apply({ type: 'transport_error', error: 'daemon_disconnected' });
+      return;
+    }
     if (message.type === DAEMON_MSG.RECONNECTED) {
       this.requestSubscription('initial', false);
       return;

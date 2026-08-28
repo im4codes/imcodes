@@ -97,6 +97,31 @@ function delta(overrides: Partial<SupervisionTaskConsoleDelta> = {}): Supervisio
 }
 
 describe('supervision task console reducer', () => {
+  it('accepts an authoritative empty snapshot as a completed initial load', () => {
+    const empty = supervisionTaskConsoleReducer(subscribingState(), {
+      type: 'snapshot_received',
+      payload: snapshot({
+        projectionVersion: 0,
+        lastDurableEventId: null,
+        tasks: [],
+        assignments: [],
+        pools: [],
+      }),
+    });
+    expect(empty.phase).toBe(SUPERVISION_TASK_CONSOLE_PHASE.READY);
+    expect(empty.tasks).toEqual({});
+  });
+
+  it('turns a transport disconnect into a terminal visible error state', () => {
+    const disconnected = supervisionTaskConsoleReducer(subscribingState(), {
+      type: 'transport_disconnected',
+    });
+    expect(disconnected).toMatchObject({
+      phase: SUPERVISION_TASK_CONSOLE_PHASE.ERROR,
+      error: 'transport_disconnected',
+    });
+  });
+
   it('hydrates an authoritative snapshot and replaces it after daemon restart', () => {
     const first = readyState();
     const restarted = supervisionTaskConsoleReducer(first, {

@@ -5921,6 +5921,8 @@ html.native-ios-mac .chat-dl-btn {
    component itself is portaled after the invoking controls so it receives
    pointer/touch events instead of an older invisible backdrop. */
 .session-settings-overlay { z-index: 2147483647; }
+.session-settings-overlay.has-child-dialog { z-index: 2147483646; }
+.session-settings-child-overlay { z-index: 2147483647; }
 .dialog {
   background: #1e293b; border: 1px solid #334155; border-radius: 8px;
   width: 100%;
@@ -6198,6 +6200,70 @@ html.native-ios-mac .chat-dl-btn {
   font-size: 11px;
   font-weight: 700;
   letter-spacing: 0.035em;
+}
+.session-settings-pool-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+.session-settings-pool-add {
+  display: inline-grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  flex: 0 0 28px;
+  padding: 0;
+  color: #9ee8f5;
+  background: rgba(8, 24, 40, 0.72);
+  border: 1px solid rgba(103, 232, 249, 0.28);
+  border-radius: 9px;
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+}
+.session-settings-pool-add:hover:not(:disabled) {
+  color: #e0faff;
+  border-color: rgba(103, 232, 249, 0.52);
+  background: rgba(14, 40, 62, 0.88);
+}
+.session-settings-pool-add:disabled { opacity: 0.48; cursor: default; }
+.session-settings-pool-options {
+  display: grid;
+  gap: 7px;
+}
+.session-settings-pool-option {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: start;
+  gap: 9px;
+  padding: 9px 10px;
+  color: #bfd3e3;
+  background: rgba(5, 15, 28, 0.42);
+  border: 1px solid rgba(125, 211, 252, 0.1);
+  border-radius: 10px;
+}
+.session-settings-pool-option.is-configured-only { opacity: 0.76; }
+.session-settings-pool-option input { margin-top: 3px; }
+.session-settings-pool-option-copy {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 10px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+.session-settings-pool-option-copy strong { color: #d9edf7; font-size: 11px; }
+.session-settings-pool-option-copy span { color: #708aa1; }
+.session-settings-pool-empty {
+  padding: 9px 10px;
+  color: #6f879f;
+  background: rgba(5, 14, 27, 0.34);
+  border: 1px dashed rgba(125, 211, 252, 0.14);
+  border-radius: 10px;
+  font-size: 11px;
+  line-height: 1.45;
 }
 .session-settings-subsection {
   display: flex;

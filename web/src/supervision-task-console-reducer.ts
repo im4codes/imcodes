@@ -317,8 +317,8 @@ export function supervisionTaskConsoleReducer(
     case 'transport_disconnected':
       return {
         ...state,
-        phase: SUPERVISION_TASK_CONSOLE_PHASE.SUBSCRIBING,
-        error: null,
+        phase: SUPERVISION_TASK_CONSOLE_PHASE.ERROR,
+        error: 'transport_disconnected',
       };
   }
 }

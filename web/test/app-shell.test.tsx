@@ -5,6 +5,7 @@ import { readFileSync } from 'node:fs';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/preact';
 import { P2P_WORKFLOW_MSG } from '@shared/p2p-workflow-messages.js';
+import { SUPERVISION_TASK_CONSOLE_PREFERENCES_STORAGE_KEY } from '../src/supervision-task-console-preferences.js';
 
 const {
   apiFetchMock,
@@ -614,8 +615,8 @@ vi.mock('../src/components/NewSessionDialog.js', () => ({
   ),
 }));
 vi.mock('../src/components/StartSubSessionDialog.js', () => ({
-  StartSubSessionDialog: ({ onClose, onStart }: any) => (
-    <div>
+  StartSubSessionDialog: ({ onClose, onStart, allowedAgentTypes, overlayClassName }: any) => (
+    <div data-allowed-agent-types={allowedAgentTypes?.join(',') ?? ''} data-overlay-class={overlayClassName ?? ''}>
       start-sub-session-dialog
       <button onClick={() => void onStart?.('codex-sdk', '/bin/bash', '/work/alpha', 'Helper', {})}>start-sub-start</button>
       <button onClick={onClose}>start-sub-close</button>
@@ -623,9 +624,10 @@ vi.mock('../src/components/StartSubSessionDialog.js', () => ({
   ),
 }));
 vi.mock('../src/components/SessionSettingsDialog.js', () => ({
-  SessionSettingsDialog: ({ onClose, onSaved }: any) => (
-    <div>
+  SessionSettingsDialog: ({ onClose, onSaved, onAddPoolSession, poolSessionDialogOpen }: any) => (
+    <div data-child-dialog-open={String(Boolean(poolSessionDialogOpen))}>
       session-settings-dialog
+      <button onClick={() => onAddPoolSession?.('economy')}>settings-pool-add</button>
       <button onClick={() => onSaved?.({ label: 'Saved', type: 'codex-sdk', cwd: '/work/saved', transportConfig: {} })}>settings-save</button>
       <button onClick={onClose}>settings-close</button>
     </div>
@@ -847,12 +849,16 @@ function sessionList() {
   };
 }
 
-function sharedMainOpenResult(shareId: string, activeDispatchId: string) {
+function sharedMainOpenResult(
+  shareId: string,
+  activeDispatchId: string,
+  effectiveRole: 'viewer' | 'participant' = 'participant',
+) {
   return {
     server: { id: 'srv-shared', name: 'Shared Server', status: 'online', lastHeartbeatAt: Date.now() },
     target: { kind: 'main', serverId: 'srv-shared', sessionName: 'deck_beta_brain' },
     coverage: {
-      effectiveRole: 'participant',
+      effectiveRole,
       historyCutoffAt: 0,
       nextCoverageRecheckAt: null,
       coveringShareIds: [shareId],
@@ -1667,6 +1673,30 @@ describe('App shell', () => {
     expect(screen.getByText('featureAnnouncements.messagePins')).toBeTruthy();
     fireEvent.click(screen.getByText('featureAnnouncements.dismiss'));
     await waitFor(() => expect(screen.queryByTestId('feature-announcement')).toBeNull());
+  }, 20_000);
+
+  it('restores the task panel open state and persists close and toggle changes across refreshes', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    localStorage.setItem(SUPERVISION_TASK_CONSOLE_PREFERENCES_STORAGE_KEY, JSON.stringify({
+      version: 1,
+      open: true,
+      width: 584,
+    }));
+
+    const { App } = await importApp();
+    render(<App />);
+
+    expect(await screen.findByRole('complementary', { name: 'supervision_task_console.title' })).toBeTruthy();
+    const close = screen.getByRole('button', { name: 'common.close' });
+    fireEvent.click(close);
+    await waitFor(() => expect(screen.queryByRole('complementary', { name: 'supervision_task_console.title' })).toBeNull());
+    expect(JSON.parse(localStorage.getItem(SUPERVISION_TASK_CONSOLE_PREFERENCES_STORAGE_KEY)!).open).toBe(false);
+
+    fireEvent.click(screen.getAllByRole('button', { name: 'supervision_task_console.toggle' })[0]!);
+    expect(await screen.findByRole('complementary', { name: 'supervision_task_console.title' })).toBeTruthy();
+    expect(JSON.parse(localStorage.getItem(SUPERVISION_TASK_CONSOLE_PREFERENCES_STORAGE_KEY)!).open).toBe(true);
   }, 20_000);
 
   it('opens the session named by an all-pins navigation request', async () => {
@@ -3707,6 +3737,12 @@ describe('App shell', () => {
 
     fireEvent.click(screen.getByText('pane-settings'));
     expect(await screen.findByText('session-settings-dialog')).toBeTruthy();
+    fireEvent.click(screen.getByText('settings-pool-add'));
+    const poolLauncher = await screen.findByText('start-sub-session-dialog');
+    expect(poolLauncher.getAttribute('data-allowed-agent-types')).toBe('claude-code-sdk,codex-sdk,qwen,openclaw');
+    expect(poolLauncher.getAttribute('data-overlay-class')).toBe('session-settings-child-overlay');
+    expect(screen.getByText('session-settings-dialog').getAttribute('data-child-dialog-open')).toBe('true');
+    fireEvent.click(screen.getByText('start-sub-close'));
     fireEvent.click(screen.getByText('settings-save'));
     fireEvent.click(screen.getByText('settings-close'));
 
@@ -3917,6 +3953,7 @@ describe('App shell', () => {
     localStorage.setItem('rcc_server', 'srv-1');
     localStorage.setItem('rcc_server_name', 'Alpha Server');
     localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    localStorage.setItem(SUPERVISION_TASK_CONSOLE_PREFERENCES_STORAGE_KEY, JSON.stringify({ version: 1, open: true, width: 584 }));
     const sharedEntry = {
       id: 'share-refresh-1',
       serverId: 'srv-shared',
@@ -3977,7 +4014,40 @@ describe('App shell', () => {
     await waitFor(() => {
       expect(wsInstances.some((instance) => instance.options?.shareTarget === sharedEntry.target)).toBe(true);
     });
+    expect(screen.getByRole('complementary', { name: 'supervision_task_console.title' }).getAttribute('data-read-only')).toBe('false');
     expect(apiFetchMock).not.toHaveBeenCalledWith('/api/server/srv-shared/sessions', expect.anything());
+  }, 20_000);
+
+  it('keeps the shared-main task console visible but read-only for a viewer', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    localStorage.setItem(SUPERVISION_TASK_CONSOLE_PREFERENCES_STORAGE_KEY, JSON.stringify({ version: 1, open: true, width: 584 }));
+    const sharedEntry = {
+      id: 'share-task-console-viewer',
+      serverId: 'srv-shared',
+      serverName: 'Shared Server',
+      role: 'viewer',
+      status: 'active',
+      targetLabel: 'Shared Viewer Brain',
+      target: { kind: 'main', serverId: 'srv-shared', sessionName: 'deck_beta_brain' },
+    } as const;
+    discoverSharedEntriesMock.mockResolvedValue([sharedEntry]);
+    openSharedEntryMock.mockResolvedValue(sharedMainOpenResult(
+      'share-task-console-viewer',
+      'dispatch-task-console-viewer',
+      'viewer',
+    ));
+
+    const { App } = await importApp();
+    render(<App />);
+
+    fireEvent.click((await screen.findByText('Shared Viewer Brain')).closest('button')!);
+    expect(await screen.findByTestId('session-pane-deck_beta_brain')).toBeTruthy();
+    await waitFor(() => {
+      expect(screen.getByRole('complementary', { name: 'supervision_task_console.title' }).getAttribute('data-read-only')).toBe('true');
+    });
+    expect(screen.getAllByRole('button', { name: 'supervision_task_console.toggle' }).length).toBeGreaterThan(0);
   }, 20_000);
 
   it('restores the exact shared tab after refresh even when its server is also in the server list', async () => {

@@ -94,6 +94,10 @@ interface Props {
    * it must not start a second daemon candidate-list RPC just to populate UI.
    */
   peerAuditSessions?: readonly PeerAuditSettingsSession[];
+  /** Opens the existing sub-session launcher for a new pool candidate. */
+  onAddPoolSession?: (pool: SupervisionExecutionPoolKind) => void;
+  /** Lowers this overlay only while the reused child launcher is open. */
+  poolSessionDialogOpen?: boolean;
   openIntent?: SessionSettingsOpenIntent;
   /**
    * Optional WebSocket client. When supplied, the supervision dialog subscribes
@@ -119,6 +123,7 @@ export interface PeerAuditSettingsSession {
   requestedModel?: string | null;
   modelDisplay?: string | null;
   providerId?: string | null;
+  closedAt?: number | null;
 }
 
 export type PeerAuditSettingsCandidate = PeerAuditCandidate;
@@ -250,6 +255,15 @@ function labelForBackend(t: (key: string, params?: Record<string, unknown>) => s
     'copilot-sdk': 'session.agentType.copilot_sdk',
     'cursor-headless': 'session.agentType.cursor_headless',
   }[backend]);
+}
+
+function labelForPoolAgentType(
+  t: (key: string, params?: Record<string, unknown>) => string,
+  agentType: string,
+): string {
+  return isSupportedSupervisionBackend(agentType)
+    ? labelForBackend(t, agentType)
+    : agentType;
 }
 
 function labelForMode(t: (key: string, params?: Record<string, unknown>) => string, mode: SupervisionMode): string {
@@ -497,11 +511,6 @@ function buildPoolConfig(backend: SharedContextRuntimeBackend, model: string): S
   };
 }
 
-function builtInPoolConfigs(): SupervisionExecutionConfig[] {
-  return getSupportedSupervisionBackendOptions().flatMap((backend) =>
-    getSupervisionModelOptions(backend).map((model) => buildPoolConfig(backend, model)));
-}
-
 /**
  * Bootstrap only from the Brain itself, never from whatever sibling sessions
  * happen to be alive when Settings opens.  This keeps the pool a durable model
@@ -532,60 +541,189 @@ function withBrainPrimaryPoolDefault(input: {
   };
 }
 
+const SUPERVISION_POOL_OPEN_SESSION_STATES = new Set([
+  'starting',
+  'queued',
+  'running',
+  'idle',
+]);
+
+export interface SupervisionExecutionPoolCandidate {
+  sessionName: string;
+  label: string;
+  config: SupervisionExecutionConfig;
+}
+
+/**
+ * Build pool choices only from live ordinary sub-sessions in the current
+ * Brain group. Closed/history rows, execution-incompatible runtimes and
+ * sessions without a concrete model all fail closed instead of becoming a
+ * durable account authorization merely because their metadata exists.
+ *
+ * Provider quota/availability is deliberately rechecked by the daemon when a
+ * task is dispatched. The settings projection owns only the narrower, stable
+ * question: is this an open reply-capable session with an observed model that
+ * can represent a supervision execution capability?
+ */
+export function buildSupervisionExecutionPoolCandidates(input: {
+  sessionName: string;
+  parentSession?: string | null;
+  sessions: readonly PeerAuditSettingsSession[];
+}): SupervisionExecutionPoolCandidate[] {
+  const owningMainSession = input.parentSession?.trim() || input.sessionName;
+  const seen = new Set<string>();
+  const candidates: SupervisionExecutionPoolCandidate[] = [];
+
+  for (const session of input.sessions) {
+    if (session.parentSession !== owningMainSession
+      || session.closedAt != null
+      || !SUPERVISION_POOL_OPEN_SESSION_STATES.has(session.state ?? '')
+      || !isDelegationReplyCapableAgentType(session.type)
+      || !isSupportedSupervisionBackend(session.type)
+      || seen.has(session.sessionName)) {
+      continue;
+    }
+    const model = resolvePeerAuditNormalizedModelId({
+      activeModel: session.activeModel,
+      requestedModel: session.requestedModel,
+      configuredModel: session.modelDisplay,
+    });
+    if (!model || model === PEER_AUDIT_UNKNOWN_IDENTITY) continue;
+    const providerFamily = resolvePeerAuditProviderFamily({
+      providerId: session.providerId,
+      agentType: session.type,
+    });
+    if (!providerFamily || providerFamily === PEER_AUDIT_UNKNOWN_IDENTITY) continue;
+    const runtimeType = session.runtimeType ?? getSessionRuntimeType(session.type);
+    const canonicalModel = normalizeSupervisionExecutionModel(session.type, model);
+    const config: SupervisionExecutionConfig = {
+      agentType: session.type,
+      providerFamily,
+      runtimeType,
+      model: canonicalModel,
+      capabilityId: buildSupervisionExecutionCapabilityId({
+        agentType: session.type,
+        providerFamily,
+        runtimeType,
+        model: canonicalModel,
+      }),
+    };
+    seen.add(session.sessionName);
+    candidates.push({
+      sessionName: session.sessionName,
+      label: session.label?.trim() || session.sessionName,
+      config,
+    });
+  }
+
+  return candidates.sort((left, right) => left.label.localeCompare(right.label)
+    || left.sessionName.localeCompare(right.sessionName));
+}
+
+function updateExecutionPoolSelection(
+  pools: SupervisionExecutionPoolsConfig,
+  pool: SupervisionExecutionPoolKind,
+  config: SupervisionExecutionConfig,
+): SupervisionExecutionPoolsConfig {
+  const primary = pools.primaryDevelopmentPool.configs.filter((item) => item.capabilityId !== config.capabilityId);
+  const economy = pools.economyTaskPool.configs.filter((item) => item.capabilityId !== config.capabilityId);
+  const selectedPool = pool === 'primary' ? pools.primaryDevelopmentPool : pools.economyTaskPool;
+  if (!selectedPool.configs.some((item) => item.capabilityId === config.capabilityId)) {
+    (pool === 'primary' ? primary : economy).push(config);
+  }
+  return {
+    ...pools,
+    state: 'configured',
+    primaryDevelopmentPool: { ...pools.primaryDevelopmentPool, configs: primary },
+    economyTaskPool: { ...pools.economyTaskPool, configs: economy },
+  };
+}
+
 function SupervisionExecutionPoolsEditor({
   t,
   saving,
   pools,
+  candidates,
+  onAddPoolSession,
   onChange,
 }: {
   t: (key: string, params?: Record<string, unknown>) => string;
   saving: boolean;
   pools: SupervisionExecutionPoolsConfig;
+  candidates: readonly SupervisionExecutionPoolCandidate[];
+  onAddPoolSession?: (pool: SupervisionExecutionPoolKind) => void;
   onChange: (pools: SupervisionExecutionPoolsConfig) => void;
 }) {
-  const configured = [...pools.primaryDevelopmentPool.configs, ...pools.economyTaskPool.configs];
-  const options = [...new Map([...builtInPoolConfigs(), ...configured]
-    .map((config) => [config.capabilityId, config])).values()];
   const selected = (pool: SupervisionExecutionPoolKind, capabilityId: string): boolean => (
     (pool === 'primary' ? pools.primaryDevelopmentPool : pools.economyTaskPool)
       .configs.some((config) => config.capabilityId === capabilityId)
   );
   const toggle = (pool: SupervisionExecutionPoolKind, config: SupervisionExecutionConfig): void => {
-    const primary = pools.primaryDevelopmentPool.configs.filter((item) => item.capabilityId !== config.capabilityId);
-    const economy = pools.economyTaskPool.configs.filter((item) => item.capabilityId !== config.capabilityId);
-    const wasSelected = selected(pool, config.capabilityId);
-    if (!wasSelected) (pool === 'primary' ? primary : economy).push(config);
-    onChange({
-      ...pools,
-      state: 'configured',
-      primaryDevelopmentPool: { ...pools.primaryDevelopmentPool, configs: primary },
-      economyTaskPool: { ...pools.economyTaskPool, configs: economy },
-    });
+    onChange(updateExecutionPoolSelection(pools, pool, config));
   };
   const renderPool = (pool: SupervisionExecutionPoolKind) => {
     const primary = pool === 'primary';
-    const eligibleOptions = primary
-      ? options.filter((config) => !isExcludedDevelopmentModel(config.model))
-      : options;
+    const eligibleCandidates = primary
+      ? candidates.filter((candidate) => !isExcludedDevelopmentModel(candidate.config.model))
+      : candidates;
+    const candidateCapabilityIds = new Set(candidates.map((candidate) => candidate.config.capabilityId));
+    const configuredOnly = (primary ? pools.primaryDevelopmentPool : pools.economyTaskPool).configs
+      .filter((config) => !candidateCapabilityIds.has(config.capabilityId));
+    const titleKey = primary ? 'session.supervision.primaryDevelopmentPool' : 'session.supervision.economyTaskPool';
     return (
       <div class="session-settings-subsection" data-testid={`supervision-execution-pool-${pool}`}>
-        <div class="session-settings-subtitle">
-          {t(primary ? 'session.supervision.primaryDevelopmentPool' : 'session.supervision.economyTaskPool')}
+        <div class="session-settings-pool-heading">
+          <div class="session-settings-subtitle">{t(titleKey)}</div>
+          {onAddPoolSession && (
+            <button
+              type="button"
+              class="session-settings-pool-add"
+              aria-label={t('session.supervision.addPoolSession', { pool: t(titleKey) })}
+              title={t('session.supervision.addPoolSession', { pool: t(titleKey) })}
+              onClick={() => onAddPoolSession(pool)}
+              disabled={saving}
+            >+</button>
+          )}
         </div>
         <div class="session-settings-muted">
           {t(primary ? 'session.supervision.primaryDevelopmentPoolHelp' : 'session.supervision.economyTaskPoolHelp')}
         </div>
-        <div class="session-settings-grid" style={{ marginTop: 8 }}>
-          {eligibleOptions.map((config) => (
-            <label key={`${pool}:${config.capabilityId}`} class="session-settings-field" style={{ display: 'flex', flexDirection: 'row', gap: 8, alignItems: 'center' }}>
+        {eligibleCandidates.length === 0 && (
+          <div class="session-settings-pool-empty" data-testid={`supervision-execution-pool-${pool}-empty`}>
+            {t('session.supervision.noPoolSessions')}
+          </div>
+        )}
+        <div class="session-settings-pool-options" style={{ marginTop: 8 }}>
+          {eligibleCandidates.map((candidate) => (
+            <label key={`${pool}:${candidate.sessionName}`} class="session-settings-pool-option">
               <input
                 type="checkbox"
-                aria-label={`${pool}:${config.agentType}:${config.model}`}
-                checked={selected(pool, config.capabilityId)}
+                aria-label={`${pool}:${candidate.sessionName}`}
+                checked={selected(pool, candidate.config.capabilityId)}
+                onChange={() => toggle(pool, candidate.config)}
+                disabled={saving}
+              />
+              <span class="session-settings-pool-option-copy">
+                <strong>{candidate.label}</strong>
+                <span>{candidate.sessionName}</span>
+                <span>{labelForPoolAgentType(t, candidate.config.agentType)} · {candidate.config.model}</span>
+              </span>
+            </label>
+          ))}
+          {configuredOnly.map((config) => (
+            <label key={`${pool}:configured:${config.capabilityId}`} class="session-settings-pool-option is-configured-only">
+              <input
+                type="checkbox"
+                aria-label={`${pool}:configured:${config.agentType}:${config.model}`}
+                checked
                 onChange={() => toggle(pool, config)}
                 disabled={saving}
               />
-              <span>{labelForBackend(t, config.agentType as SharedContextRuntimeBackend)} · {config.model}</span>
+              <span class="session-settings-pool-option-copy">
+                <strong>{t('session.supervision.configuredPoolModel')}</strong>
+                <span>{labelForPoolAgentType(t, config.agentType)} · {config.model}</span>
+                <span>{t('session.supervision.configuredPoolModelUnavailable')}</span>
+              </span>
             </label>
           ))}
         </div>
@@ -607,6 +745,8 @@ export function SessionSettingsDialog({
   activeModel,
   requestedModel,
   peerAuditSessions = [],
+  onAddPoolSession,
+  poolSessionDialogOpen = false,
   parentSession,
   openIntent,
   ws,
@@ -815,6 +955,11 @@ export function SessionSettingsDialog({
     sessions: peerAuditSessions,
   }), [parentSession, peerAuditSessions, sessionName]);
   const peerAuditCandidates = loadedPeerAuditCandidates;
+  const executionPoolCandidates = useMemo(() => buildSupervisionExecutionPoolCandidates({
+    sessionName,
+    parentSession,
+    sessions: peerAuditSessions,
+  }), [parentSession, peerAuditSessions, sessionName]);
   const selectedPeerAuditCandidate = peerAuditCandidates.find((candidate) => candidate.name === peerAuditTargetName);
   const selectedPeerAuditDisplayLabel = selectedPeerAuditCandidate
     ? peerAuditCandidateDisplayLabel(selectedPeerAuditCandidate)
@@ -1307,6 +1452,8 @@ export function SessionSettingsDialog({
           t={t}
           saving={saving}
           pools={supervisorDefaultsExecutionPools}
+          candidates={executionPoolCandidates}
+          onAddPoolSession={onAddPoolSession}
           onChange={(executionPools) => updateSupervisorDefaultsFromUser((prev) => ({ ...prev, executionPools }))}
         />
 
@@ -1649,7 +1796,7 @@ export function SessionSettingsDialog({
   }, [globalDefaultsValid, hasSupervision, isAuditMode, isSupportedTransport, peerAuditTargetName, selectedPeerAuditCandidate, supervisionAuditLoops]);
 
   const dialog = (
-    <div class="dialog-overlay session-settings-overlay" onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}>
+    <div class={`dialog-overlay session-settings-overlay${poolSessionDialogOpen ? ' has-child-dialog' : ''}`} onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}>
       <div class="dialog session-settings-dialog">
         <div class="dialog-header session-settings-header">
           <span class="session-settings-title">{t('session.settings')}</span>

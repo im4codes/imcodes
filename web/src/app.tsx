@@ -38,7 +38,13 @@ import { SessionPane } from './components/SessionPane.js';
 import {
   SupervisionTaskConsole,
   SupervisionTaskConsoleToggle,
+  supervisionTaskConsolePreferenceBounds,
 } from './components/SupervisionTaskConsole.js';
+import {
+  loadSupervisionTaskConsolePreferences,
+  saveSupervisionTaskConsolePreferences,
+} from './supervision-task-console-preferences.js';
+import { canViewSupervisionTaskConsole } from './supervision-task-console-visibility.js';
 import { ShareSessionDialog } from './components/ShareSessionDialog.js';
 import { SharedEntriesPanel } from './components/SharedEntriesPanel.js';
 import { SharedStateIndicator } from './components/SharedStateIndicator.js';
@@ -138,6 +144,8 @@ import {
 } from './daemon-upgrade-blocked.js';
 import { safeLocalStorageRemoveItem, safeLocalStorageSetItem } from './local-storage-quota.js';
 import { getSessionRuntimeType } from '@shared/agent-types.js';
+import { getSupportedSupervisionBackendOptions } from '@shared/supervision-config.js';
+import type { SupervisionExecutionPoolKind } from '@shared/supervision-execution-pool.js';
 import { EXECUTION_CLONE_KIND } from '@shared/execution-clone.js';
 import {
   isNavigableMainSession,
@@ -777,7 +785,24 @@ export function App() {
   const autoEntryRunRef = useRef(0);
   const [showMobileServerMenu, setShowMobileServerMenu] = useState(false);
   const [showMobileFileBrowser, setShowMobileFileBrowser] = useState(false);
-  const [showSupervisionTaskConsole, setShowSupervisionTaskConsole] = useState(false);
+  const [showSupervisionTaskConsole, setShowSupervisionTaskConsole] = useState(
+    () => loadSupervisionTaskConsolePreferences(supervisionTaskConsolePreferenceBounds()).open,
+  );
+  const toggleSupervisionTaskConsole = useCallback(() => {
+    setShowSupervisionTaskConsole((open) => {
+      const nextOpen = !open;
+      const bounds = supervisionTaskConsolePreferenceBounds();
+      const preferences = loadSupervisionTaskConsolePreferences(bounds);
+      saveSupervisionTaskConsolePreferences({ ...preferences, open: nextOpen }, bounds);
+      return nextOpen;
+    });
+  }, []);
+  const closeSupervisionTaskConsole = useCallback(() => {
+    const bounds = supervisionTaskConsolePreferenceBounds();
+    const preferences = loadSupervisionTaskConsolePreferences(bounds);
+    saveSupervisionTaskConsolePreferences({ ...preferences, open: false }, bounds);
+    setShowSupervisionTaskConsole(false);
+  }, []);
   const supervisionTaskConsoleToggleRef = useRef<HTMLButtonElement>(null);
   const [shareDialogTarget, setShareDialogTarget] = useState<ShareDialogTarget | null>(null);
   const [selectedShareTarget, setSelectedShareTarget] = useState<ShareTarget | null>(null);
@@ -1903,6 +1928,7 @@ export function App() {
   }, []);
 
   const [showSubDialog, setShowSubDialog] = useState(false);
+  const [poolAddTarget, setPoolAddTarget] = useState<SupervisionExecutionPoolKind | null>(null);
   const [settingsTarget, setSettingsTarget] = useState<{ sessionName: string; sessionInstanceId?: string; runtimeEpoch?: string; activeModel?: string | null; requestedModel?: string | null; providerId?: string | null; subId?: string; label: string; description: string; cwd: string; type: string; parentSession?: string | null; transportConfig?: Record<string, unknown> | null; openIntent?: SessionSettingsOpenIntent } | null>(null);
   const [cloneSessionTarget, setCloneSessionTarget] = useState<SessionInfo | null>(null);
 
@@ -5097,6 +5123,14 @@ export function App() {
   const sharedAccessRole = selectedShareTarget
     ? (activeSessionInfo?.sharedState?.effectiveRole ?? 'viewer')
     : null;
+  const supervisionTaskConsoleVisibility = {
+    session: activeSessionInfo,
+    shareTargetKind: selectedShareTarget?.kind ?? null,
+    sharedAccessRole: selectedShareTarget
+      ? (activeSessionInfo?.sharedState?.effectiveRole ?? null)
+      : null,
+  };
+  const canViewTaskConsole = canViewSupervisionTaskConsole(supervisionTaskConsoleVisibility);
   const canCreateSubSession = !selectedShareTarget
     || (sharedAccessRole === 'participant' && selectedShareTarget.kind !== 'subsession');
 
@@ -5344,6 +5378,7 @@ export function App() {
       requestedModel: session.requestedModel,
       modelDisplay: session.modelDisplay,
       providerId: session.providerId,
+      closedAt: session.closedAt,
     })), [detectedModels, subSessions, subUsages]);
   const openShareDialogForSession = useCallback((session: SessionInfo, subSessionId?: string | null) => {
     if (!selectedServerId) return;
@@ -5920,10 +5955,10 @@ export function App() {
                   🌐
                 </button>
                 <SupervisionTaskConsoleToggle
-                  session={selectedShareTarget ? null : activeSessionInfo}
+                  visibility={supervisionTaskConsoleVisibility}
                   open={showSupervisionTaskConsole}
                   triggerRef={supervisionTaskConsoleToggleRef}
-                  onToggle={() => setShowSupervisionTaskConsole((open) => !open)}
+                  onToggle={toggleSupervisionTaskConsole}
                 />
                 {!isTransportSession && (
                   <button class="view-toggle" data-onboarding="view-toggle" onClick={toggleViewMode}>
@@ -6042,10 +6077,10 @@ export function App() {
                   🌐
                 </button>
                 <SupervisionTaskConsoleToggle
-                  session={selectedShareTarget ? null : activeSessionInfo}
+                  visibility={supervisionTaskConsoleVisibility}
                   open={showSupervisionTaskConsole}
                   triggerRef={supervisionTaskConsoleToggleRef}
-                  onToggle={() => setShowSupervisionTaskConsole((open) => !open)}
+                  onToggle={toggleSupervisionTaskConsole}
                 />
                 <DesktopWindowMaximizeButton
                   class="view-toggle desktop-main-maximize-toggle"
@@ -6144,19 +6179,20 @@ export function App() {
               </div>
               )}
               </div>
-              {showSupervisionTaskConsole && activeSessionInfo?.role === 'brain' && !selectedShareTarget && (
+              {showSupervisionTaskConsole && canViewTaskConsole && activeSessionInfo && (
                 <SupervisionTaskConsole
                   key={`${activeSessionInfo.project}:${activeSessionInfo.name}`}
                   ws={wsRef.current}
-                  connected={connected}
+                  connected={connected && daemonOnline}
                   projectName={activeSessionInfo.project}
                   coordinatorSessionName={activeSessionInfo.name}
                   mobile={isMobile}
-                  onClose={() => setShowSupervisionTaskConsole(false)}
+                  readOnly={sharedAccessRole === 'viewer'}
+                  onClose={closeSupervisionTaskConsole}
                   returnFocusRef={supervisionTaskConsoleToggleRef}
                   onNavigateSession={(sessionName) => {
                     navigateToSession(sessionName);
-                    if (isMobile) setShowSupervisionTaskConsole(false);
+                    if (isMobile) closeSupervisionTaskConsole();
                   }}
                 />
               )}
@@ -7100,19 +7136,25 @@ export function App() {
         <StartSubSessionDialog
           ws={wsRef.current}
           defaultCwd={activeSessionInfo?.projectDir}
+          allowedAgentTypes={poolAddTarget ? getSupportedSupervisionBackendOptions() : undefined}
+          overlayClassName={poolAddTarget ? 'session-settings-child-overlay' : undefined}
           isProviderConnected={isProviderConnected}
           getRemoteSessions={getRemoteSessions}
           refreshSessions={refreshSessions}
           onToast={showSuccessToast}
           onStart={async (type, shellBin, cwd, label, extra) => {
             setShowSubDialog(false);
+            setPoolAddTarget(null);
             const sub = await createSubSession(type, shellBin, cwd, label, extra);
             if (sub) {
               setOpenSubIds((prev) => new Set([...prev, sub.id]));
               bringSubToFront(sub.id);
             }
           }}
-          onClose={() => setShowSubDialog(false)}
+          onClose={() => {
+            setShowSubDialog(false);
+            setPoolAddTarget(null);
+          }}
         />
       )}
 
@@ -7133,6 +7175,11 @@ export function App() {
           requestedModel={settingsTarget.requestedModel}
           providerId={settingsTarget.providerId}
           peerAuditSessions={peerAuditSettingsSessions}
+          poolSessionDialogOpen={poolAddTarget != null}
+          onAddPoolSession={canCreateSubSession ? (pool) => {
+            setPoolAddTarget(pool);
+            setShowSubDialog(true);
+          } : undefined}
           openIntent={settingsTarget.openIntent}
           ws={wsRef.current}
           onClose={() => setSettingsTarget(null)}

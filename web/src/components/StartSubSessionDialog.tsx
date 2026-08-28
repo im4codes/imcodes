@@ -59,6 +59,10 @@ const responsiveDialogStyle = {
 interface Props {
   ws: WsClient | null;
   defaultCwd?: string;
+  /** Optional consumer-owned filter. The ordinary launcher remains unchanged. */
+  allowedAgentTypes?: readonly string[];
+  /** Lets a caller place the reused launcher above another modal. */
+  overlayClassName?: string;
   isProviderConnected: (id: string) => boolean;
   getRemoteSessions: (providerId: string) => RemoteSession[];
   refreshSessions: (providerId: string) => void;
@@ -69,7 +73,7 @@ interface Props {
 
 type OpenClawMode = 'new' | 'bind';
 
-export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _isProviderConnected, getRemoteSessions, refreshSessions, onStart, onClose, onToast }: Props) {
+export function StartSubSessionDialog({ ws, defaultCwd, allowedAgentTypes, overlayClassName, isProviderConnected: _isProviderConnected, getRemoteSessions, refreshSessions, onStart, onClose, onToast }: Props) {
   const { t } = useTranslation();
   const [type, setType] = useState('claude-code-sdk');
   const [lastUnlockedType, setLastUnlockedType] = useState('claude-code-sdk');
@@ -192,6 +196,16 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
   const ocRemoteSessions = getRemoteSessions('openclaw');
 
   const agentGroups = getSessionAgentGroups('sub-session');
+  const allowedAgentTypeSet = useMemo(
+    () => allowedAgentTypes ? new Set(allowedAgentTypes) : null,
+    [allowedAgentTypes],
+  );
+
+  useEffect(() => {
+    if (!allowedAgentTypeSet || allowedAgentTypeSet.has(type)) return;
+    const fallback = allowedAgentTypes?.[0];
+    if (fallback) setType(fallback);
+  }, [allowedAgentTypeSet, allowedAgentTypes, type]);
 
   // Load saved shell preference from server
   const defaultShellPref = usePref<string>(PREF_KEY_DEFAULT_SHELL, { parse: parseString });
@@ -389,7 +403,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
   }, [type, modelSuggestions, transportModels.defaultModel]);
 
   return (
-    <div class="dialog-overlay">
+    <div class={`dialog-overlay${overlayClassName ? ` ${overlayClassName}` : ''}`}>
       <div class="dialog session-launch-dialog" style={responsiveDialogStyle}>
         <div class="dialog-header">
           <span>{t('subsessionBar.new_sub_session')}</span>
@@ -402,9 +416,12 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
             <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 8 }}>{t('session.type')}</div>
             <div class="session-agent-groups">
               {agentGroups.map((group) => {
-                const visibleItems = customProviderSdk
-                  ? group.items.filter((choice) => CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(choice.id))
+                const allowedItems = allowedAgentTypeSet
+                  ? group.items.filter((choice) => allowedAgentTypeSet.has(choice.id))
                   : group.items;
+                const visibleItems = customProviderSdk
+                  ? allowedItems.filter((choice) => CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(choice.id))
+                  : allowedItems;
                 if (visibleItems.length === 0) return null;
                 return (
                   <div key={group.id} class="session-agent-group">

@@ -14,6 +14,7 @@ import {
   clampSupervisionConsoleWidth,
   supervisionConsoleMaxWidth,
 } from '../../src/components/SupervisionTaskConsole.js';
+import { SUPERVISION_TASK_CONSOLE_PREFERENCES_STORAGE_KEY } from '../../src/supervision-task-console-preferences.js';
 import {
   SUPERVISION_TASK_CONSOLE_PHASE,
   createSupervisionTaskConsoleState,
@@ -153,6 +154,7 @@ function state(
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
+  window.localStorage.clear();
   Object.defineProperty(window, 'innerWidth', {
     configurable: true,
     value: ORIGINAL_INNER_WIDTH,
@@ -161,24 +163,29 @@ afterEach(() => {
 });
 
 describe('SupervisionTaskConsole', () => {
-  it('offers the compact toggle only for a main coordinator session', () => {
+  it('offers the compact toggle to an original Brain and shared-main viewers without elevating other roles', () => {
     const onToggle = vi.fn();
-    const view = render(<SupervisionTaskConsoleToggle session={{ role: 'brain' }} open={false} onToggle={onToggle} />);
+    const view = render(<SupervisionTaskConsoleToggle visibility={{ session: { role: 'brain' }, shareTargetKind: null, sharedAccessRole: null }} open={false} onToggle={onToggle} />);
     const button = screen.getByRole('button', { name: 'supervision_task_console.toggle' });
     expect(button.getAttribute('aria-pressed')).toBe('false');
     fireEvent.click(button);
     expect(onToggle).toHaveBeenCalledTimes(1);
 
-    view.rerender(<SupervisionTaskConsoleToggle session={{ role: 'w1' }} open={false} onToggle={onToggle} />);
+    view.rerender(<SupervisionTaskConsoleToggle visibility={{ session: { role: 'brain' }, shareTargetKind: 'main', sharedAccessRole: 'viewer' }} open={false} onToggle={onToggle} />);
+    expect(screen.getByRole('button', { name: 'supervision_task_console.toggle' })).toBeTruthy();
+
+    view.rerender(<SupervisionTaskConsoleToggle visibility={{ session: { role: 'w1' }, shareTargetKind: 'main', sharedAccessRole: 'participant' }} open={false} onToggle={onToggle} />);
     expect(screen.queryByRole('button', { name: 'supervision_task_console.toggle' })).toBeNull();
   });
 
-  it('hides the toggle whenever there is no coordinator session to scope it to', () => {
-    render(<SupervisionTaskConsoleToggle session={null} open={false} onToggle={() => {}} />);
+  it('hides the toggle for unresolved, server-shared, and sub-session-shared scopes', () => {
+    const view = render(<SupervisionTaskConsoleToggle visibility={{ session: null, shareTargetKind: 'main', sharedAccessRole: 'viewer' }} open={false} onToggle={() => {}} />);
     expect(screen.queryByRole('button', { name: 'supervision_task_console.toggle' })).toBeNull();
 
-    cleanup();
-    render(<SupervisionTaskConsoleToggle session={undefined} open={false} onToggle={() => {}} />);
+    view.rerender(<SupervisionTaskConsoleToggle visibility={{ session: { role: 'brain' }, shareTargetKind: 'server', sharedAccessRole: 'participant' }} open={false} onToggle={() => {}} />);
+    expect(screen.queryByRole('button', { name: 'supervision_task_console.toggle' })).toBeNull();
+
+    view.rerender(<SupervisionTaskConsoleToggle visibility={{ session: { role: 'brain' }, shareTargetKind: 'subsession', sharedAccessRole: 'viewer' }} open={false} onToggle={() => {}} />);
     expect(screen.queryByRole('button', { name: 'supervision_task_console.toggle' })).toBeNull();
   });
 
@@ -218,6 +225,7 @@ describe('SupervisionTaskConsole', () => {
         projectName="alpha"
         coordinatorSessionName="deck_alpha_brain"
         mobile={false}
+        readOnly={false}
         onClose={() => {}}
         onNavigateSession={() => {}}
       />,
@@ -245,6 +253,112 @@ describe('SupervisionTaskConsole', () => {
     for (let index = 0; index < 30; index += 1) fireEvent.keyDown(handle, { key: 'ArrowLeft' });
     expect(handle.getAttribute('aria-valuenow')).toBe('520');
     view.unmount();
+  });
+
+  it('persists pointer and keyboard widths and restores the exact desktop split after remount', () => {
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 1200, writable: true });
+    const renderConsole = () => render(
+      <SupervisionTaskConsole
+        ws={null}
+        connected={false}
+        projectName="alpha"
+        coordinatorSessionName="deck_alpha_brain"
+        mobile={false}
+        readOnly={false}
+        onClose={() => {}}
+        onNavigateSession={() => {}}
+      />,
+    );
+
+    let view = renderConsole();
+    let handle = screen.getByRole('separator', { name: 'supervision_task_console.resize' });
+    dispatchPointerEvent(handle, 'pointerdown', { button: 0, pointerId: 11, clientX: 500 });
+    dispatchPointerEvent(document, 'pointermove', { pointerId: 11, clientX: 340 });
+    dispatchPointerEvent(document, 'pointerup', { pointerId: 11 });
+    expect(handle.getAttribute('aria-valuenow')).toBe('580');
+    expect(JSON.parse(window.localStorage.getItem(SUPERVISION_TASK_CONSOLE_PREFERENCES_STORAGE_KEY)!).width).toBe(580);
+
+    view.unmount();
+    view = renderConsole();
+    handle = screen.getByRole('separator', { name: 'supervision_task_console.resize' });
+    expect(handle.getAttribute('aria-valuenow')).toBe('580');
+    fireEvent.keyDown(handle, { key: 'ArrowLeft' });
+    expect(handle.getAttribute('aria-valuenow')).toBe('604');
+    expect(JSON.parse(window.localStorage.getItem(SUPERVISION_TASK_CONSOLE_PREFERENCES_STORAGE_KEY)!).width).toBe(604);
+
+    view.unmount();
+    renderConsole();
+    expect(screen.getByRole('separator', { name: 'supervision_task_console.resize' }).getAttribute('aria-valuenow')).toBe('604');
+  });
+
+  it('falls back for malformed width storage and clamps restored width to the current 65vw cap', () => {
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 1000, writable: true });
+    window.localStorage.setItem(SUPERVISION_TASK_CONSOLE_PREFERENCES_STORAGE_KEY, '{bad json');
+    const props = {
+      ws: null,
+      connected: false,
+      projectName: 'alpha',
+      coordinatorSessionName: 'deck_alpha_brain',
+      mobile: false,
+      readOnly: false,
+      onClose: () => {},
+      onNavigateSession: () => {},
+    };
+    const view = render(<SupervisionTaskConsole {...props} />);
+    expect(screen.getByRole('separator', { name: 'supervision_task_console.resize' }).getAttribute('aria-valuenow')).toBe('420');
+
+    view.unmount();
+    window.localStorage.setItem(SUPERVISION_TASK_CONSOLE_PREFERENCES_STORAGE_KEY, JSON.stringify({ version: 1, open: true, width: 700 }));
+    render(<SupervisionTaskConsole {...props} />);
+    expect(screen.getByRole('separator', { name: 'supervision_task_console.resize' }).getAttribute('aria-valuenow')).toBe('650');
+  });
+
+  it('keeps the mobile panel full-screen regardless of a persisted desktop width', () => {
+    window.localStorage.setItem(SUPERVISION_TASK_CONSOLE_PREFERENCES_STORAGE_KEY, JSON.stringify({ version: 1, open: true, width: 680 }));
+    render(
+      <SupervisionTaskConsole
+        ws={null}
+        connected={false}
+        projectName="alpha"
+        coordinatorSessionName="deck_alpha_brain"
+        mobile
+        readOnly
+        onClose={() => {}}
+        onNavigateSession={() => {}}
+      />,
+    );
+    const panel = screen.getByRole('dialog', { name: 'supervision_task_console.title' });
+    expect(panel.getAttribute('style')).toBeNull();
+    expect(screen.queryByRole('separator', { name: 'supervision_task_console.resize' })).toBeNull();
+  });
+
+  it('suppresses mutation controls for viewers while retaining them for participants', () => {
+    const mutationControl = <button type="button">mutate-task</button>;
+    const view = render(
+      <SupervisionTaskConsoleView
+        state={state()}
+        mobile={false}
+        readOnly
+        mutationControls={mutationControl}
+        onClose={() => {}}
+        onNavigateSession={() => {}}
+      />,
+    );
+    expect(screen.getByRole('complementary').getAttribute('data-read-only')).toBe('true');
+    expect(screen.queryByRole('button', { name: 'mutate-task' })).toBeNull();
+
+    view.rerender(
+      <SupervisionTaskConsoleView
+        state={state()}
+        mobile={false}
+        readOnly={false}
+        mutationControls={mutationControl}
+        onClose={() => {}}
+        onNavigateSession={() => {}}
+      />,
+    );
+    expect(screen.getByRole('complementary').getAttribute('data-read-only')).toBe('false');
+    expect(screen.getByRole('button', { name: 'mutate-task' })).toBeTruthy();
   });
 
   it('renders grouped real-time evidence, two pools, stale heartbeat, and canonical owner navigation', () => {
@@ -381,5 +495,6 @@ describe('SupervisionTaskConsole', () => {
     expect(css).toMatch(/@media \(prefers-reduced-motion: reduce\)[\s\S]*?\.supervision-task-console-transition\s*\{\s*animation:\s*none/);
     const app = readFileSync(resolve(import.meta.dirname, '../../src/app.tsx'), 'utf8');
     expect(app).toMatch(/onNavigateSession=\{\(sessionName\) => \{\s*navigateToSession\(sessionName\);/);
+    expect(app).toMatch(/<SupervisionTaskConsole[\s\S]*?connected=\{connected && daemonOnline\}/);
   });
 });
