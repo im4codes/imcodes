@@ -38,6 +38,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -50,6 +51,7 @@
 
 #include "../remote-desktop-common/data_channel_payload.h"
 #include "../remote-desktop-common/json_protocol.h"
+#include "macos_authenticated_session_readiness.h"
 #include "macos_disclosure_control.h"
 #include "cg_display_stream_backend.h"
 #include "macos_host_command_dispatch.h"
@@ -84,6 +86,10 @@ constexpr std::size_t kReadChunkBytes = 8 * 1024;
 // Matches MACOS_VIRTUAL_DISPLAY_PROXY_TIMEOUT_MS on the daemon side. A silent
 // agent is a false answer, so the wait is bounded on both ends.
 constexpr std::uint32_t kDaemonDisplayTimeoutMs = 5'000;
+// A graphical bootstrap is not authority until the daemon has authenticated
+// the exact socket peer. Waiting is bounded so a silent or partially writing
+// daemon cannot keep a LoginWindow worker resident indefinitely.
+constexpr std::uint32_t kGraphicalAuthenticationTimeoutMs = 5'000;
 constexpr char kDisclosureFileName[] = "imcodes-remote-desktop-disclosure";
 constexpr char kVirtualDisplayHelperFileName[] = "imcodes-virtual-display-helper";
 // The component manifest name and the executable-directory lookup were the
@@ -935,6 +941,46 @@ bool WriteFrame(int descriptor, const std::string& frame) {
   return true;
 }
 
+// Reads exactly one newline-delimited frame without consuming any byte of the
+// following command. A local FrameReader would have to hand its buffered tail
+// to DaemonDisplayChannel; reading one byte at a time keeps one authoritative
+// reader boundary instead. Timeout, EOF, an empty frame, or an oversized frame
+// are all terminal authentication failures.
+bool ReadAuthenticationFrame(int descriptor, std::string* out) {
+  if (descriptor < 0 || out == nullptr) return false;
+  std::string frame;
+  frame.reserve(512);
+  const auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::milliseconds(
+                            kGraphicalAuthenticationTimeoutMs);
+  while (frame.size() < macos::kIpcMaxFrameBytes) {
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= deadline) return false;
+    const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+        deadline - now);
+    pollfd pending{descriptor, POLLIN, 0};
+    const int ready = ::poll(
+        &pending, 1,
+        static_cast<int>(std::max<std::int64_t>(1, remaining.count())));
+    if (ready < 0 && errno == EINTR) continue;
+    if (ready <= 0 ||
+        (pending.revents & (POLLIN | POLLHUP | POLLERR)) == 0) {
+      return false;
+    }
+    char byte = 0;
+    const ssize_t count = ::recv(descriptor, &byte, 1, 0);
+    if (count < 0 && errno == EINTR) continue;
+    if (count != 1) return false;
+    if (byte == '\n') {
+      if (frame.empty()) return false;
+      *out = std::move(frame);
+      return true;
+    }
+    frame.push_back(byte);
+  }
+  return false;
+}
+
 // Emits one WORKER_MESSAGE envelope. A message that cannot be framed is a
 // local fault, so it terminates the loop rather than being dropped silently.
 bool EmitWorkerMessage(int descriptor,
@@ -1532,16 +1578,21 @@ void WorkerTransportSink::OnDataChannelMessage(
 // ScreenCaptureKit or libwebrtc.
 class SessionSeamAdapter final : public macos::HostCommandSessionSeam {
  public:
+  using ReadinessAttestor =
+      std::function<bool(const rd::common::CapabilityReadiness&)>;
+
   SessionSeamAdapter(macos::MacosRemoteDesktopSession* session,
                      macos::MacosTransportSessionAdapter* transport,
                      std::uint64_t worker_generation,
                      WorkerSocketEmitter* emitter,
-                     WorkerTransportSink* transport_sink) noexcept
+                     WorkerTransportSink* transport_sink,
+                     ReadinessAttestor readiness_attestor = {}) noexcept
       : session_(session),
         transport_(transport),
         worker_generation_(worker_generation),
         emitter_(emitter),
-        transport_sink_(transport_sink) {}
+        transport_sink_(transport_sink),
+        readiness_attestor_(std::move(readiness_attestor)) {}
 
   bool Prepare(const imcodes::rd::Authority& authority,
                std::int64_t now_unix_ms,
@@ -1560,6 +1611,15 @@ class SessionSeamAdapter final : public macos::HostCommandSessionSeam {
     request.authority_now = {now_unix_ms, now_monotonic_ms};
     if (!session_->Start(request))
       return false;
+    // Start is the production composition boundary: it probes the owned
+    // capture/encoder/input/display/disclosure/session-monitor adapters and
+    // commits that observation to session->readiness(). LoginWindow readiness
+    // cannot be authored before this point or inferred by the daemon.
+    if (readiness_attestor_ &&
+        !readiness_attestor_(session_->readiness())) {
+      session_->Stop();
+      return false;
+    }
     authority_ = authority;
     active_ = true;
     if (emitter_ != nullptr)
@@ -1641,6 +1701,7 @@ class SessionSeamAdapter final : public macos::HostCommandSessionSeam {
   std::uint64_t worker_generation_;
   WorkerSocketEmitter* emitter_;
   WorkerTransportSink* transport_sink_;
+  ReadinessAttestor readiness_attestor_;
   imcodes::rd::Authority authority_;
   bool active_ = false;
 };
@@ -1915,6 +1976,28 @@ int RunLaunchAgentSession(const macos::WorkerLaunchContext& context) {
     return EX_PROTOCOL;
   }
 
+  const bool graphical_bootstrap =
+      macos::IsGraphicalBootstrapLaunchContext(context);
+  if (context.session_type == macos::kSessionTypeLoginWindow &&
+      !graphical_bootstrap) {
+    ::close(descriptor);
+    std::cerr << "macos_remote_desktop_worker_loginwindow_bootstrap_required\n";
+    return EX_NOPERM;
+  }
+  std::optional<macos::IpcAuthenticationAcknowledgement> authenticated_peer;
+  if (graphical_bootstrap) {
+    std::string acknowledgement;
+    macos::IpcAuthenticationAcknowledgement parsed;
+    if (!ReadAuthenticationFrame(descriptor, &acknowledgement) ||
+        !macos::ParseIpcAuthenticationAcknowledgement(
+            acknowledgement, context, &parsed)) {
+      ::close(descriptor);
+      std::cerr << "macos_remote_desktop_worker_ipc_authentication_failed\n";
+      return EX_NOPERM;
+    }
+    authenticated_peer = std::move(parsed);
+  }
+
   auto backend = macos::CreatePinnedLibwebrtcTransportBackend();
   if (backend == nullptr) {
     ::close(descriptor);
@@ -2105,8 +2188,35 @@ int RunLaunchAgentSession(const macos::WorkerLaunchContext& context) {
     return EX_UNAVAILABLE;
   }
   sink.Bind(session.get(), adapter.get(), &emitter);
+  SessionSeamAdapter::ReadinessAttestor readiness_attestor;
+  if (session_binding.session_type == macos::kSessionTypeLoginWindow) {
+    if (!authenticated_peer.has_value()) {
+      disclosure_process.Terminate();
+      session->Stop();
+      ::close(descriptor);
+      std::cerr << "macos_remote_desktop_worker_readiness_authentication_missing\n";
+      return EX_NOPERM;
+    }
+    const macos::AuthenticatedGraphicalPeer peer{
+        .uid = authenticated_peer->uid,
+        .audit_session_id = authenticated_peer->audit_session_id,
+        .pid_version = authenticated_peer->pid_version,
+        .worker_generation = authenticated_peer->worker_generation,
+        .session_type = authenticated_peer->session_type,
+        .launch_challenge = authenticated_peer->launch_challenge,
+    };
+    readiness_attestor =
+        [descriptor, binding = session_binding, peer](
+            const rd::common::CapabilityReadiness& observed) {
+          std::string frame;
+          return macos::BuildAuthenticatedGraphicalReadinessFrame(
+                     binding, peer, observed, true, &frame) &&
+                 WriteFrame(descriptor, frame);
+        };
+  }
   SessionSeamAdapter command_session(
-      session.get(), adapter.get(), context.worker_generation, &emitter, &sink);
+      session.get(), adapter.get(), context.worker_generation, &emitter, &sink,
+      std::move(readiness_attestor));
 
   // Cleanup commands arrive as fresh sibling processes, so this generation
   // must be reachable over the per-user control socket for as long as it owns

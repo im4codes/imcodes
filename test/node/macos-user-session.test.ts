@@ -3,7 +3,10 @@ import type { ChildProcess } from 'node:child_process';
 import { describe, expect, it, vi } from 'vitest';
 import {
   launchMacosRemoteDesktopUserSession,
+  macosRemoteDesktopGraphicalSessionPaths,
   macosRemoteDesktopUserSessionPaths,
+  MACOS_REMOTE_DESKTOP_GLOBAL_LAUNCH_AGENT_PATH,
+  MACOS_REMOTE_DESKTOP_GRAPHICAL_RUNTIME_ROOT,
   MACOS_REMOTE_DESKTOP_LAUNCH_AGENT_IDENTITY,
   MACOS_REMOTE_DESKTOP_RUNTIME_ROOT,
 } from '../../src/node/macos-user-session.js';
@@ -40,6 +43,25 @@ describe('macOS remote-desktop user-session groundwork', () => {
   it('rejects a runtime root that would overflow Darwin sockaddr_un', () => {
     expect(() => macosRemoteDesktopUserSessionPaths(USER, `/private/${'x'.repeat(100)}`))
       .toThrow('macos_remote_desktop_socket_path_too_long');
+  });
+
+  it('derives graphical-instance paths from uid plus audit session, never HOME', () => {
+    const first = macosRemoteDesktopGraphicalSessionPaths({
+      uid: 501,
+      auditSessionId: 100003,
+    });
+    const successor = macosRemoteDesktopGraphicalSessionPaths({
+      uid: 501,
+      auditSessionId: 100004,
+    });
+    expect(first).toEqual({
+      runtimeDirectory: `${MACOS_REMOTE_DESKTOP_GRAPHICAL_RUNTIME_ROOT}/501/100003`,
+      socketPath: `${MACOS_REMOTE_DESKTOP_GRAPHICAL_RUNTIME_ROOT}/501/100003/remote-desktop-agent.sock`,
+    });
+    expect(successor.socketPath).not.toBe(first.socketPath);
+    expect(JSON.stringify({ first, successor })).not.toContain(USER.home);
+    expect(MACOS_REMOTE_DESKTOP_GLOBAL_LAUNCH_AGENT_PATH)
+      .toBe('/Library/LaunchAgents/cc.imcodes.node.remote-desktop-agent.plist');
   });
 
   it('launches with only remote-desktop paths and no Computer Use or request authority', () => {

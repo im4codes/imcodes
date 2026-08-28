@@ -24,10 +24,17 @@ import {
   type MacosRemoteDesktopIpcServerOptions,
 } from '../../src/node/macos-remote-desktop-ipc-server.js';
 import {
+  MACOS_REMOTE_DESKTOP_GRAPHICAL_READINESS_MESSAGE,
+} from '../../src/node/macos-remote-desktop-graphical-readiness.js';
+import {
   MACOS_REMOTE_DESKTOP_LAUNCH_AGENT_IDENTITY,
+  macosRemoteDesktopGraphicalSessionPaths,
   macosRemoteDesktopUserSessionPaths,
 } from '../../src/node/macos-user-session.js';
-import type { MacosUserSession } from '../../src/node/user-session-launcher.js';
+import type {
+  MacosRemoteDesktopGraphicalSessionAuthority,
+  MacosUserSession,
+} from '../../src/node/user-session-launcher.js';
 
 const NOW = 1_800_000_000_000;
 const TEAM_ID = 'ABCDE12345';
@@ -221,9 +228,37 @@ async function authenticate(
   server: MacosRemoteDesktopIpcServer,
   authenticated: ReturnType<typeof deferred<MacosRemoteDesktopIpcLaunch>>,
   launch: MacosRemoteDesktopIpcLaunch,
+  graphical = false,
+  expectedPeer: {
+    uid: number;
+    auditSessionId: number;
+    pidVersion: number;
+    sessionType: 'Aqua' | 'LoginWindow';
+  } = {
+    uid: currentUser().uid,
+    auditSessionId: 100_003,
+    pidVersion: 5,
+    sessionType: 'Aqua',
+  },
 ): Promise<Socket> {
   const socket = await connect(launch.socketPath);
   socket.write(`${hello(launch)}\n`);
+  const acknowledgement = JSON.parse(await readLine(socket)) as Record<string, unknown>;
+  expect(acknowledgement).toEqual({
+    type: MACOS_REMOTE_DESKTOP_IPC_MESSAGE.AUTHENTICATED,
+    ipcVersion: REMOTE_DESKTOP_WORKER_IPC_VERSION,
+    workerGeneration: launch.workerGeneration,
+    uid: expectedPeer.uid,
+    auditSessionId: expectedPeer.auditSessionId,
+    pidVersion: expectedPeer.pidVersion,
+    sessionType: expectedPeer.sessionType,
+    launchChallenge: launch.challenge,
+  });
+  if (graphical) {
+    socket.write(`${JSON.stringify({
+      type: MACOS_REMOTE_DESKTOP_GRAPHICAL_READINESS_MESSAGE,
+    })}\n`);
+  }
   await authenticated.promise;
   return socket;
 }
@@ -382,6 +417,172 @@ describe('macOS remote-desktop virtual-display production chain', () => {
 });
 
 describe('macOS remote-desktop bounded Unix IPC transport', () => {
+  it('creates a LoginWindow socket from uid/asid only and pins the verified pid generation', async () => {
+    const runtimeRoot = await temporaryRoot();
+    const user = currentUser();
+    const principal: MacosRemoteDesktopGraphicalSessionAuthority = Object.freeze({
+      kind: 'loginwindow_bootstrap',
+      sessionType: 'LoginWindow',
+      uid: user.uid,
+      auditSessionId: 100_004,
+      pidVersion: 7,
+    });
+    const expectedCodeIdentity = {
+      bundleIdentifier: MACOS_REMOTE_DESKTOP_LAUNCH_AGENT_IDENTITY.bundleIdentifier,
+      teamId: TEAM_ID,
+      designatedRequirement: DESIGNATED_REQUIREMENT,
+    } as const;
+    const authority = new MacosRemoteDesktopIpcAuthorityHost({
+      principal,
+      expectedCodeIdentity,
+      runtimeRoot,
+      randomChallenge: () => Buffer.alloc(32, 0x4c),
+    });
+    const authenticated = deferred<MacosRemoteDesktopIpcLaunch>();
+    const sessions: unknown[] = [];
+    const server = new MacosRemoteDesktopIpcServer({
+      authority,
+      principal,
+      expectedCodeIdentity,
+      runtimeRoot,
+      inspectPeerGraphicalSession: async () => ({
+        kind: 'loginwindow_bootstrap',
+        sessionType: 'LoginWindow',
+      }),
+      inspectPeerUid: async () => principal.uid,
+      verifyPeerCodeIdentity: async () => ({
+        ...expectedCodeIdentity,
+        auditSessionId: principal.auditSessionId,
+        pidVersion: principal.pidVersion,
+      }),
+      onPeerAuthenticated: (launch, session) => {
+        sessions.push(session);
+        authenticated.resolve(launch);
+      },
+      onGraphicalReadinessAttestation: () => undefined,
+      onWorkerMessage: () => undefined,
+    });
+    servers.push(server);
+
+    const launch = await server.start();
+    const paths = macosRemoteDesktopGraphicalSessionPaths(principal, runtimeRoot);
+    expect(launch.socketPath).toBe(paths.socketPath);
+    const socket = await authenticate(server, authenticated, launch, true, {
+      uid: principal.uid,
+      auditSessionId: principal.auditSessionId,
+      pidVersion: principal.pidVersion,
+      sessionType: principal.sessionType,
+    });
+    expect(sessions).toEqual([{
+      workerGeneration: launch.workerGeneration,
+      socketPath: launch.socketPath,
+      principal: {
+        kind: 'loginwindow_bootstrap',
+        sessionType: 'LoginWindow',
+        uid: principal.uid,
+        auditSessionId: principal.auditSessionId,
+        pidVersion: principal.pidVersion,
+      },
+      launchNonce: launch.challenge,
+    }]);
+    expect(JSON.stringify({ launch, sessions })).not.toMatch(/name|HOME|TMPDIR|Users\//u);
+    socket.destroy();
+  });
+
+  it('rejects a signed LoginWindow successor whose verified asid is not the granted one', async () => {
+    const runtimeRoot = await temporaryRoot();
+    const user = currentUser();
+    const principal: MacosRemoteDesktopGraphicalSessionAuthority = Object.freeze({
+      kind: 'loginwindow_bootstrap',
+      sessionType: 'LoginWindow',
+      uid: user.uid,
+      auditSessionId: 100_004,
+      pidVersion: 7,
+    });
+    const expectedCodeIdentity = {
+      bundleIdentifier: MACOS_REMOTE_DESKTOP_LAUNCH_AGENT_IDENTITY.bundleIdentifier,
+      teamId: TEAM_ID,
+      designatedRequirement: DESIGNATED_REQUIREMENT,
+    } as const;
+    const authority = new MacosRemoteDesktopIpcAuthorityHost({
+      principal, expectedCodeIdentity, runtimeRoot,
+    });
+    const outcome = deferred<MacosRemoteDesktopIpcDisconnectReason | 'authenticated'>();
+    const server = new MacosRemoteDesktopIpcServer({
+      authority,
+      principal,
+      expectedCodeIdentity,
+      runtimeRoot,
+      inspectPeerGraphicalSession: async () => ({
+        kind: 'loginwindow_bootstrap',
+        sessionType: 'LoginWindow',
+      }),
+      inspectPeerUid: async () => principal.uid,
+      verifyPeerCodeIdentity: async () => ({
+        ...expectedCodeIdentity,
+        auditSessionId: principal.auditSessionId + 1,
+        pidVersion: principal.pidVersion,
+      }),
+      onWorkerMessage: () => undefined,
+      onPeerAuthenticated: () => outcome.resolve('authenticated'),
+      onDisconnect: (reason) => outcome.resolve(reason),
+    });
+    servers.push(server);
+    const launch = await server.start();
+    const socket = await connect(launch.socketPath);
+    socket.write(`${hello(launch)}\n`);
+    await expect(outcome.promise).resolves.toBe('authentication_failed');
+    socket.destroy();
+  });
+
+  it('rejects a signed LoginWindow peer observed in the wrong graphical session type', async () => {
+    const runtimeRoot = await temporaryRoot();
+    const user = currentUser();
+    const principal: MacosRemoteDesktopGraphicalSessionAuthority = Object.freeze({
+      kind: 'loginwindow_bootstrap',
+      sessionType: 'LoginWindow',
+      uid: user.uid,
+      auditSessionId: 100_004,
+      pidVersion: 7,
+    });
+    const expectedCodeIdentity = {
+      bundleIdentifier: MACOS_REMOTE_DESKTOP_LAUNCH_AGENT_IDENTITY.bundleIdentifier,
+      teamId: TEAM_ID,
+      designatedRequirement: DESIGNATED_REQUIREMENT,
+    } as const;
+    const authority = new MacosRemoteDesktopIpcAuthorityHost({
+      principal, expectedCodeIdentity, runtimeRoot,
+    });
+    const outcome = deferred<MacosRemoteDesktopIpcDisconnectReason | 'authenticated'>();
+    const server = new MacosRemoteDesktopIpcServer({
+      authority,
+      principal,
+      expectedCodeIdentity,
+      runtimeRoot,
+      // Authenticated observed evidence is deliberately independent from the
+      // expected LoginWindow principal and must fail closed when it disagrees.
+      inspectPeerGraphicalSession: async () => ({
+        kind: 'loginwindow_bootstrap',
+        sessionType: 'Aqua',
+      }),
+      inspectPeerUid: async () => principal.uid,
+      verifyPeerCodeIdentity: async () => ({
+        ...expectedCodeIdentity,
+        auditSessionId: principal.auditSessionId,
+        pidVersion: principal.pidVersion,
+      }),
+      onWorkerMessage: () => undefined,
+      onPeerAuthenticated: () => outcome.resolve('authenticated'),
+      onDisconnect: (reason) => outcome.resolve(reason),
+    });
+    servers.push(server);
+    const launch = await server.start();
+    const socket = await connect(launch.socketPath);
+    socket.write(`${hello(launch)}\n`);
+    await expect(outcome.promise).resolves.toBe('authentication_failed');
+    socket.destroy();
+  });
+
   it('creates an exact-mode socket, authenticates from injected native evidence and routes both directions', async () => {
     const fixture = await createFixture();
     const launch = await fixture.server.start();

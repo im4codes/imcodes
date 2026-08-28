@@ -4,6 +4,7 @@ import { isAbsolute } from 'node:path';
 import { REMOTE_DESKTOP_MACOS_TEAM_ID } from '../../shared/remote-desktop-worker.js';
 import type { MacosRemoteDesktopExpectedCodeIdentity } from './macos-remote-desktop-ipc.js';
 import type { MacosRemoteDesktopVerifiedCodeIdentity } from './macos-remote-desktop-ipc-server.js';
+import type { MacosRemoteDesktopGraphicalSessionType } from './macos-remote-desktop-global-agent-bootstrap.js';
 
 const DEFAULT_TIMEOUT_MS = 5_000;
 const MIN_TIMEOUT_MS = 10;
@@ -28,6 +29,8 @@ export interface MacosRemoteDesktopVerifiedNativePeer
    * reused, and on a busy machine that is a matter of time.
    */
   pidVersion: number;
+  /** Native window-server classification in the authenticated audit session. */
+  sessionType: MacosRemoteDesktopGraphicalSessionType;
 }
 
 export interface MacosRemoteDesktopNativePeerVerifierOptions {
@@ -117,7 +120,7 @@ function parseVerifiedPeer(
   }
   if (!value || typeof value !== 'object' || Array.isArray(value)) fail();
   const record = value as Record<string, unknown>;
-  if (Object.keys(record).length !== 7
+  if (Object.keys(record).length !== 8
     || record.version !== 1
     || !Number.isSafeInteger(record.uid)
     || record.uid !== options.expectedUid
@@ -128,6 +131,7 @@ function parseVerifiedPeer(
     || (record.auditSessionId as number) <= 0
     || !Number.isSafeInteger(record.pidVersion)
     || (record.pidVersion as number) <= 0
+    || (record.sessionType !== 'Aqua' && record.sessionType !== 'LoginWindow')
     || (options.expectedAuditSessionId !== undefined
       && record.auditSessionId !== options.expectedAuditSessionId)
     || record.bundleIdentifier !== options.expectedCodeIdentity.bundleIdentifier
@@ -144,6 +148,7 @@ function parseVerifiedPeer(
     uid: record.uid as number,
     auditSessionId: record.auditSessionId as number,
     pidVersion: record.pidVersion as number,
+    sessionType: record.sessionType as MacosRemoteDesktopGraphicalSessionType,
     bundleIdentifier: record.bundleIdentifier as string,
     teamId: record.teamId as string,
     designatedRequirement: record.designatedRequirement as string,

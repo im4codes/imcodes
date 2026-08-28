@@ -320,6 +320,9 @@ describe('macOS remote-desktop build spike contract', () => {
         // execs the worker: one plist serves both Aqua and LoginWindow, so the
         // installed artifact cannot carry the answer.
         resolve(NATIVE, 'macos_session_identity.mm'),
+        // Global LaunchAgent one-shot bootstrap and legacy rollback context
+        // share the worker's exact bounded frame parser.
+        resolve(NATIVE, 'macos_worker_ipc_client.cc'),
         // The resident agent loop and its authority link: the agent is the
         // supervisor, so these are part of its executable, not the worker's.
         resolve(NATIVE, 'macos_virtual_display_resident_loop.cc'),
@@ -355,6 +358,12 @@ describe('macOS remote-desktop build spike contract', () => {
       writeFileSync(worker, '#!/bin/sh\nprintf "worker:%s\\n" "$*"\n');
       chmodSync(worker, 0o755);
       const normal = await runNative(output, ['--macos-remote-desktop-launch-agent', 'generation-7'], {
+        env: {
+          ...process.env,
+          IMCODES_REMOTE_DESKTOP_SOCKET: '/tmp/imcodes-build-test.sock',
+          IMCODES_REMOTE_DESKTOP_LAUNCH_CHALLENGE: 'C'.repeat(43),
+          IMCODES_REMOTE_DESKTOP_WORKER_GENERATION: '7',
+        },
       });
       expect(normal.status, normal.stderr).toBe(0);
       expect(normal.stdout).toContain('worker:--macos-remote-desktop-launch-agent generation-7');

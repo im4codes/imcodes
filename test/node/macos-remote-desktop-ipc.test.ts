@@ -23,9 +23,13 @@ import {
 } from '../../src/node/macos-remote-desktop-ipc.js';
 import {
   MACOS_REMOTE_DESKTOP_LAUNCH_AGENT_IDENTITY,
+  macosRemoteDesktopGraphicalSessionPaths,
   macosRemoteDesktopUserSessionPaths,
 } from '../../src/node/macos-user-session.js';
-import type { MacosUserSession } from '../../src/node/user-session-launcher.js';
+import type {
+  MacosRemoteDesktopGraphicalSessionAuthority,
+  MacosUserSession,
+} from '../../src/node/user-session-launcher.js';
 
 const NOW = 1_800_000_000_000;
 const USER: MacosUserSession = {
@@ -44,6 +48,15 @@ const DESIGNATED_REQUIREMENT = [
 const REQUEST_ID = 'request_123456789';
 const SESSION_ID = 'session_123456789';
 const CAPABILITY = 'capability_12345678901234567890123456789012';
+const AUDIT_SESSION_ID = 100_003;
+const PID_VERSION = 5;
+const LOGINWINDOW: MacosRemoteDesktopGraphicalSessionAuthority = Object.freeze({
+  kind: 'loginwindow_bootstrap',
+  sessionType: 'LoginWindow',
+  uid: 88,
+  auditSessionId: 100_004,
+  pidVersion: 7,
+});
 
 function frame(value: unknown): string {
   return JSON.stringify(value);
@@ -77,6 +90,10 @@ function socketSecurity(
 function peer(overrides: Partial<MacosRemoteDesktopVerifiedPeerIdentity> = {}): MacosRemoteDesktopVerifiedPeerIdentity {
   return {
     uid: USER.uid,
+    auditSessionId: AUDIT_SESSION_ID,
+    pidVersion: PID_VERSION,
+    kind: 'aqua_user',
+    sessionType: 'Aqua',
     bundleIdentifier: MACOS_REMOTE_DESKTOP_LAUNCH_AGENT_IDENTITY.bundleIdentifier,
     teamId: TEAM_ID,
     designatedRequirement: DESIGNATED_REQUIREMENT,
@@ -94,6 +111,37 @@ function host(challengeByte = 0x41): MacosRemoteDesktopIpcAuthorityHost {
     },
     randomChallenge: () => Buffer.alloc(32, challengeByte),
   });
+}
+
+function loginWindowHost(challengeByte = 0x4c): MacosRemoteDesktopIpcAuthorityHost {
+  let launchCount = 0;
+  return new MacosRemoteDesktopIpcAuthorityHost({
+    principal: LOGINWINDOW,
+    expectedCodeIdentity: {
+      bundleIdentifier: MACOS_REMOTE_DESKTOP_LAUNCH_AGENT_IDENTITY.bundleIdentifier,
+      teamId: TEAM_ID,
+      designatedRequirement: DESIGNATED_REQUIREMENT,
+    },
+    randomChallenge: () => Buffer.alloc(32, challengeByte + launchCount++),
+  });
+}
+
+function loginWindowSocketSecurity(): MacosRemoteDesktopSocketSecurityEvidence {
+  const paths = macosRemoteDesktopGraphicalSessionPaths(LOGINWINDOW);
+  return {
+    runtimeDirectory: {
+      path: paths.runtimeDirectory,
+      uid: LOGINWINDOW.uid,
+      mode: 0o040000 | MACOS_REMOTE_DESKTOP_RUNTIME_DIRECTORY_MODE,
+      kind: 'directory',
+    },
+    socket: {
+      path: paths.socketPath,
+      uid: LOGINWINDOW.uid,
+      mode: 0o140000 | MACOS_REMOTE_DESKTOP_SOCKET_MODE,
+      kind: 'socket',
+    },
+  };
 }
 
 function hello(launch: MacosRemoteDesktopIpcLaunch, overrides: Record<string, unknown> = {}): string {
@@ -204,9 +252,119 @@ describe('macOS remote-desktop authenticated local IPC contract', () => {
     expect(authority.authenticate(hello(launch), peer(), socketSecurity())).toEqual({
       workerGeneration: launch.workerGeneration,
       socketPath: macosRemoteDesktopUserSessionPaths(USER).socketPath,
+      principal: {
+        kind: 'aqua_user',
+        sessionType: 'Aqua',
+        uid: USER.uid,
+        auditSessionId: AUDIT_SESSION_ID,
+        pidVersion: PID_VERSION,
+      },
+      launchNonce: launch.challenge,
     });
     expect(() => authority.authenticate(hello(launch), peer(), socketSecurity()))
       .toThrow('macos_remote_desktop_ipc_authentication_failed');
+  });
+
+  it('authenticates LoginWindow as an explicit graphical principal without user environment', () => {
+    const authority = loginWindowHost();
+    const launch = authority.beginLaunch();
+    const session = authority.authenticate(hello(launch), peer({
+      uid: LOGINWINDOW.uid,
+      auditSessionId: LOGINWINDOW.auditSessionId,
+      pidVersion: LOGINWINDOW.pidVersion,
+      kind: LOGINWINDOW.kind,
+      sessionType: LOGINWINDOW.sessionType,
+    }), loginWindowSocketSecurity());
+
+    expect(launch.socketPath).toBe(macosRemoteDesktopGraphicalSessionPaths(LOGINWINDOW).socketPath);
+    expect(session).toEqual({
+      workerGeneration: launch.workerGeneration,
+      socketPath: launch.socketPath,
+      principal: {
+        kind: 'loginwindow_bootstrap',
+        sessionType: 'LoginWindow',
+        uid: LOGINWINDOW.uid,
+        auditSessionId: LOGINWINDOW.auditSessionId,
+        pidVersion: LOGINWINDOW.pidVersion,
+      },
+      launchNonce: launch.challenge,
+    });
+    expect(JSON.stringify({ launch, session })).not.toMatch(/name|HOME|TMPDIR|Users\//u);
+  });
+
+  it('rejects non-kernel graphical principal identifiers before minting a launch', () => {
+    for (const principal of [
+      { ...LOGINWINDOW, uid: 0 },
+      { ...LOGINWINDOW, auditSessionId: 0 },
+      { ...LOGINWINDOW, auditSessionId: 0x1_0000_0000 },
+      { ...LOGINWINDOW, pidVersion: 0 },
+      { ...LOGINWINDOW, pidVersion: 0x1_0000_0000 },
+    ]) {
+      expect(() => new MacosRemoteDesktopIpcAuthorityHost({
+        principal: principal as MacosRemoteDesktopGraphicalSessionAuthority,
+        expectedCodeIdentity: {
+          bundleIdentifier: MACOS_REMOTE_DESKTOP_LAUNCH_AGENT_IDENTITY.bundleIdentifier,
+          teamId: TEAM_ID,
+          designatedRequirement: DESIGNATED_REQUIREMENT,
+        },
+      })).toThrow('macos_remote_desktop_ipc_invalid_graphical_principal');
+    }
+  });
+
+  it.each([
+    ['wrong uid', { uid: LOGINWINDOW.uid + 1 }],
+    ['wrong principal kind', { kind: 'aqua_user' as const }],
+    ['wrong session type', { sessionType: 'Aqua' as const }],
+    ['stale audit session', { auditSessionId: LOGINWINDOW.auditSessionId - 1 }],
+    ['successor audit session', { auditSessionId: LOGINWINDOW.auditSessionId + 1 }],
+    ['reused pid generation', { pidVersion: LOGINWINDOW.pidVersion - 1 }],
+    ['successor pid generation', { pidVersion: LOGINWINDOW.pidVersion + 1 }],
+  ])('rejects a LoginWindow %s before route authority exists', (_label, override) => {
+    const authority = loginWindowHost();
+    const launch = authority.beginLaunch();
+    expect(() => authority.authenticate(hello(launch), peer({
+      uid: LOGINWINDOW.uid,
+      auditSessionId: LOGINWINDOW.auditSessionId,
+      pidVersion: LOGINWINDOW.pidVersion,
+      kind: LOGINWINDOW.kind,
+      sessionType: LOGINWINDOW.sessionType,
+      ...override,
+    }), loginWindowSocketSecurity())).toThrow('macos_remote_desktop_ipc_authentication_failed');
+  });
+
+  it('spends the LoginWindow nonce once and fences the predecessor session on replacement', () => {
+    const authority = loginWindowHost();
+    const first = authority.beginLaunch();
+    const verified = peer({
+      uid: LOGINWINDOW.uid,
+      auditSessionId: LOGINWINDOW.auditSessionId,
+      pidVersion: LOGINWINDOW.pidVersion,
+      kind: LOGINWINDOW.kind,
+      sessionType: LOGINWINDOW.sessionType,
+    });
+    const firstSession = authority.authenticate(
+      hello(first), verified, loginWindowSocketSecurity(),
+    );
+    expect(() => authority.authenticate(hello(first), verified, loginWindowSocketSecurity()))
+      .toThrow('macos_remote_desktop_ipc_authentication_failed');
+
+    authority.cleanup();
+    const replacement = authority.beginLaunch();
+    expect(replacement.workerGeneration).toBeGreaterThan(first.workerGeneration);
+    expect(replacement.challenge).not.toBe(first.challenge);
+    expect(() => authority.acceptHostFrame(
+      firstSession,
+      hostCommand(first, prepare()),
+      NOW,
+    )).toThrow('macos_remote_desktop_ipc_stale_session');
+    expect(() => authority.authenticate(
+      hello(replacement, { challenge: first.challenge }),
+      verified,
+      loginWindowSocketSecurity(),
+    )).toThrow('macos_remote_desktop_ipc_authentication_failed');
+    expect(() => authority.authenticate(
+      hello(replacement), verified, loginWindowSocketSecurity(),
+    )).not.toThrow();
   });
 
   it.each([

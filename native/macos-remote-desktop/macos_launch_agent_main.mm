@@ -8,6 +8,8 @@
 #include "macos_worker_ipc_client.h"
 
 #include <sys/wait.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 
 #include <bsm/audit.h>
 #include <bsm/audit_session.h>
@@ -78,6 +80,134 @@ bool DeclareSessionIdentity() {
   const std::string session_value(session_type);
   return ::setenv(macos::kEnvSessionType, session_value.c_str(), 1) == 0
       && ::setenv(macos::kEnvAuditSessionId, audit_session, 1) == 0;
+}
+
+std::string RandomInstanceNonce() {
+  constexpr char alphabet[] =
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+  unsigned char bytes[32] = {};
+  arc4random_buf(bytes, sizeof(bytes));
+  std::string encoded;
+  encoded.reserve(43);
+  std::uint32_t accumulator = 0;
+  int bits = 0;
+  for (const unsigned char byte : bytes) {
+    accumulator = (accumulator << 8) | byte;
+    bits += 8;
+    while (bits >= 6) {
+      bits -= 6;
+      encoded.push_back(alphabet[(accumulator >> bits) & 0x3f]);
+    }
+  }
+  if (bits != 0) encoded.push_back(alphabet[(accumulator << (6 - bits)) & 0x3f]);
+  return encoded;
+}
+
+bool WriteAll(int descriptor, std::string_view value) {
+  std::size_t offset = 0;
+  while (offset < value.size()) {
+    const ssize_t wrote = ::send(descriptor, value.data() + offset,
+                                 value.size() - offset, MSG_NOSIGNAL);
+    if (wrote > 0) {
+      offset += static_cast<std::size_t>(wrote);
+      continue;
+    }
+    if (wrote < 0 && errno == EINTR) continue;
+    return false;
+  }
+  return true;
+}
+
+bool ReadOneBoundedLine(int descriptor, std::string* line) {
+  line->clear();
+  const auto deadline_ms = 5'000;
+  int remaining_ms = deadline_ms;
+  while (remaining_ms > 0 && line->size() < 16 * 1024) {
+    struct pollfd poll_entry = {};
+    poll_entry.fd = descriptor;
+    poll_entry.events = POLLIN;
+    const int ready = ::poll(&poll_entry, 1, remaining_ms);
+    if (ready <= 0) return false;
+    char buffer[1024];
+    const ssize_t count = ::recv(descriptor, buffer, sizeof(buffer), 0);
+    if (count <= 0) return false;
+    for (ssize_t index = 0; index < count; ++index) {
+      if (buffer[index] == '\n') return !line->empty();
+      if (buffer[index] == '\r' || buffer[index] == '\0') return false;
+      line->push_back(buffer[index]);
+      if (line->size() >= 16 * 1024) return false;
+    }
+    // poll's timeout is an upper bound for the entire exchange; a peer that
+    // drip-feeds bytes cannot reset it indefinitely.
+    remaining_ms = 0;
+  }
+  return false;
+}
+
+/**
+ * Obtain worker authority only after this exact graphical LaunchAgent instance
+ * has connected to the daemon's stable bootstrap socket.
+ *
+ * Legacy Aqua definitions that already carry a complete valid context remain
+ * accepted for rollback compatibility. A partial legacy context never falls
+ * through as authority: the global path requires its own exact handshake.
+ */
+bool EnsureWorkerLaunchGrant() {
+  namespace macos = imcodes::remote_desktop::macos;
+  macos::WorkerLaunchContext existing;
+  if (macos::ReadWorkerLaunchContext(
+          +[](const char* name) -> const char* { return std::getenv(name); },
+          &existing)) {
+    return true;
+  }
+
+  const char* bootstrap_path = std::getenv(macos::kEnvBootstrapSocket);
+  if (bootstrap_path == nullptr ||
+      std::strcmp(bootstrap_path, macos::kGlobalBootstrapSocketPath) != 0) {
+    std::cerr << "macos_launch_agent_bootstrap_path_invalid\n";
+    return false;
+  }
+  const char* session_type = std::getenv(macos::kEnvSessionType);
+  const char* audit_session = std::getenv(macos::kEnvAuditSessionId);
+  if (session_type == nullptr || audit_session == nullptr) return false;
+
+  char* end = nullptr;
+  errno = 0;
+  const unsigned long audit = std::strtoul(audit_session, &end, 10);
+  if (errno != 0 || end == audit_session || *end != '\0' || audit == 0 ||
+      audit > 0xffff'ffffUL) {
+    return false;
+  }
+  macos::BootstrapHelloContext hello;
+  hello.uid = static_cast<std::uint32_t>(::getuid());
+  hello.audit_session_id = static_cast<std::uint32_t>(audit);
+  hello.session_type = session_type;
+  hello.instance_nonce = RandomInstanceNonce();
+  std::string hello_frame;
+  if (!macos::BuildBootstrapHelloFrame(hello, &hello_frame)) return false;
+  hello_frame.push_back('\n');
+
+  const int descriptor = ::socket(AF_UNIX, SOCK_STREAM, 0);
+  if (descriptor < 0) return false;
+  struct sockaddr_un address = {};
+  address.sun_family = AF_UNIX;
+  std::strncpy(address.sun_path, macos::kGlobalBootstrapSocketPath,
+               sizeof(address.sun_path) - 1);
+  const bool connected = ::connect(
+      descriptor, reinterpret_cast<const struct sockaddr*>(&address),
+      sizeof(address)) == 0;
+  std::string grant_frame;
+  const bool exchanged = connected && WriteAll(descriptor, hello_frame) &&
+                         ReadOneBoundedLine(descriptor, &grant_frame);
+  ::close(descriptor);
+  if (!exchanged) return false;
+
+  macos::BootstrapGrant grant;
+  if (!macos::ParseBootstrapGrantFrame(grant_frame, hello, &grant)) return false;
+  const std::string generation = std::to_string(grant.worker_generation);
+  return ::setenv(macos::kEnvSocketPath, grant.socket_path.c_str(), 1) == 0 &&
+      ::setenv(macos::kEnvLaunchChallenge, grant.challenge.c_str(), 1) == 0 &&
+      ::setenv(macos::kEnvWorkerGeneration, generation.c_str(), 1) == 0;
 }
 
 int ExecVerifiedSiblingWorker(int argc, const char* const argv[]) {
@@ -325,6 +455,10 @@ int main(int argc, const char* argv[]) {
   for (int index = 1; index < argc; ++index) {
     if (argv[index] != nullptr &&
         std::strcmp(argv[index], kSessionModeArgument) == 0) {
+      if (!EnsureWorkerLaunchGrant()) {
+        std::cerr << "macos_launch_agent_bootstrap_refused\n";
+        return EX_NOPERM;
+      }
       return RunResidentAgent(argc, argv);
     }
   }

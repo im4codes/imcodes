@@ -17,6 +17,9 @@ import {
   MACOS_REMOTE_DESKTOP_LAUNCH_AGENT_ENVIRONMENT,
   MACOS_REMOTE_DESKTOP_LAUNCH_AGENT_ERROR,
   MacosRemoteDesktopLaunchAgentSupervisor,
+  buildMacosRemoteDesktopGlobalLaunchAgentDefinition,
+  loadMacosRemoteDesktopGlobalLaunchAgent,
+  validateMacosRemoteDesktopGlobalLaunchAgentFilesystemEvidence,
   buildMacosRemoteDesktopLaunchAgentDefinition,
   macosRemoteDesktopLaunchctlArgs,
   type MacosRemoteDesktopLaunchAgentDefinition,
@@ -26,6 +29,7 @@ import {
 } from '../../src/node/macos-remote-desktop-launch-agent.js';
 import {
   MACOS_REMOTE_DESKTOP_LAUNCH_AGENT_IDENTITY,
+  MACOS_REMOTE_DESKTOP_GLOBAL_LAUNCH_AGENT_PATH,
   macosRemoteDesktopUserSessionPaths,
 } from '../../src/node/macos-user-session.js';
 import type { MacosUserSession } from '../../src/node/user-session-launcher.js';
@@ -278,6 +282,118 @@ function harness(
 }
 
 describe('macOS remote-desktop LaunchAgent definition', () => {
+  it('loads the installed global definition only into a verified Aqua domain and unloads once', async () => {
+    const definition = buildMacosRemoteDesktopGlobalLaunchAgentDefinition(artifact());
+    const calls: string[][] = [];
+    const runLaunchctl = vi.fn(async (args: readonly string[]) => {
+      calls.push([...args]);
+    });
+    const receipt = await loadMacosRemoteDesktopGlobalLaunchAgent(definition, {
+      resolveAquaUser: async () => USER,
+      runLaunchctl,
+    });
+    expect(receipt.loaded).toBe(true);
+    expect(calls).toEqual([
+      ['bootout', 'gui/501/cc.imcodes.node.remote-desktop-agent'],
+      ['bootstrap', 'gui/501', MACOS_REMOTE_DESKTOP_GLOBAL_LAUNCH_AGENT_PATH],
+      ['kickstart', '-k', 'gui/501/cc.imcodes.node.remote-desktop-agent'],
+    ]);
+    await receipt.unload();
+    await receipt.unload();
+    expect(calls.at(-1)).toEqual([
+      'bootout', 'gui/501/cc.imcodes.node.remote-desktop-agent',
+    ]);
+    expect(runLaunchctl).toHaveBeenCalledTimes(4);
+  });
+
+  it('does not forge an Aqua domain when LoginWindow has no active user', async () => {
+    const runLaunchctl = vi.fn();
+    const receipt = await loadMacosRemoteDesktopGlobalLaunchAgent(
+      buildMacosRemoteDesktopGlobalLaunchAgentDefinition(artifact()),
+      {
+        resolveAquaUser: async () => {
+          throw new Error('computer_use_no_active_gui_session');
+        },
+        runLaunchctl,
+      },
+    );
+    expect(receipt.loaded).toBe(false);
+    expect(runLaunchctl).not.toHaveBeenCalled();
+    await expect(receipt.unload()).resolves.toBeUndefined();
+  });
+
+  it('does not mask an invalid graphical resolver as LoginWindow absence', async () => {
+    const runLaunchctl = vi.fn();
+    await expect(loadMacosRemoteDesktopGlobalLaunchAgent(
+      buildMacosRemoteDesktopGlobalLaunchAgentDefinition(artifact()),
+      {
+        resolveAquaUser: async () => {
+          throw new Error('macos_user_session_invalid_command');
+        },
+        runLaunchctl,
+      },
+    )).rejects.toThrow('macos_user_session_invalid_command');
+    expect(runLaunchctl).not.toHaveBeenCalled();
+  });
+
+  it('unloads a partial load when kickstart fails', async () => {
+    const calls: string[][] = [];
+    const runLaunchctl = vi.fn(async (args: readonly string[]) => {
+      calls.push([...args]);
+      if (args[0] === 'kickstart') throw new Error('kickstart_failed');
+    });
+    await expect(loadMacosRemoteDesktopGlobalLaunchAgent(
+      buildMacosRemoteDesktopGlobalLaunchAgentDefinition(artifact()),
+      { resolveAquaUser: async () => USER, runLaunchctl },
+    )).rejects.toThrow('kickstart_failed');
+    expect(calls.slice(-2)).toEqual([
+      ['kickstart', '-k', 'gui/501/cc.imcodes.node.remote-desktop-agent'],
+      ['bootout', 'gui/501/cc.imcodes.node.remote-desktop-agent'],
+    ]);
+  });
+
+  it('builds one root-installable global plist with no session or worker authority', () => {
+    const definition = buildMacosRemoteDesktopGlobalLaunchAgentDefinition(artifact());
+    expect(definition.plistPath).toBe(MACOS_REMOTE_DESKTOP_GLOBAL_LAUNCH_AGENT_PATH);
+    expect(definition.programArguments).toEqual([
+      '/Library/Application Support/IM.codes/remote-desktop/release/imcodes-remote-desktop-launch-agent',
+      '--macos-remote-desktop-launch-agent',
+    ]);
+    expect(definition.plist).toContain(
+      '<key>LimitLoadToSessionType</key>\n  <array>\n    <string>Aqua</string>\n'
+      + '    <string>LoginWindow</string>\n  </array>',
+    );
+    expect(definition.plist).toContain('<key>RunAtLoad</key>\n  <true/>');
+    expect(definition.plist).toContain('<key>KeepAlive</key>\n  <true/>');
+    const serialized = JSON.stringify(definition);
+    expect(serialized).toContain('/private/var/run/imcodes-node/remote-desktop-bootstrap.sock');
+    expect(serialized).not.toContain(USER.home);
+    expect(serialized).not.toContain(USER.tempDir);
+    expect(serialized).not.toContain('/501/');
+    expect(serialized).not.toContain('A'.repeat(43));
+    expect(serialized).not.toMatch(/WORKER_GENERATION|LAUNCH_CHALLENGE|RUNTIME_DIR|REMOTE_DESKTOP_SOCKET"/u);
+  });
+
+  it('requires root:wheel and least-privilege bytes for the global install', () => {
+    const valid = {
+      directory: { kind: 'directory' as const, uid: 0, gid: 0, mode: 0o40755 },
+      file: { kind: 'file' as const, uid: 0, gid: 0, mode: 0o100644 },
+    };
+    expect(validateMacosRemoteDesktopGlobalLaunchAgentFilesystemEvidence(valid)).toBe(true);
+    for (const evidence of [
+      { ...valid, directory: { ...valid.directory, kind: 'symlink' as const } },
+      { ...valid, directory: { ...valid.directory, mode: 0o40777 } },
+      { ...valid, file: { ...valid.file, uid: 501 } },
+      { ...valid, file: { ...valid.file, gid: 20 } },
+      { ...valid, file: { ...valid.file, mode: 0o100600 } },
+      { ...valid, file: { ...valid.file, mode: 0o100666 } },
+      { ...valid, file: { ...valid.file, kind: 'symlink' as const } },
+    ]) {
+      expect(validateMacosRemoteDesktopGlobalLaunchAgentFilesystemEvidence(evidence))
+        .toBe(false);
+    }
+  });
+
   it('builds a deterministic per-user plist and binds exact uid, bundle, generation, challenge and socket', () => {
     const definition = buildMacosRemoteDesktopLaunchAgentDefinition(USER, artifact(), launch(USER, 7));
 

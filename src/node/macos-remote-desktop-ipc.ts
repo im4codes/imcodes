@@ -16,10 +16,16 @@ import {
   remoteDesktopUtf8Bytes,
 } from '../../shared/remote-desktop-contract-primitives.js';
 import {
+  MACOS_REMOTE_DESKTOP_GRAPHICAL_RUNTIME_ROOT,
   MACOS_REMOTE_DESKTOP_LAUNCH_AGENT_IDENTITY,
+  macosRemoteDesktopGraphicalSessionPaths,
   macosRemoteDesktopUserSessionPaths,
 } from './macos-user-session.js';
-import { assertMacosUserSession, type MacosUserSession } from './user-session-launcher.js';
+import {
+  assertMacosUserSession,
+  type MacosRemoteDesktopGraphicalSessionAuthority,
+  type MacosUserSession,
+} from './user-session-launcher.js';
 import {
   validateVirtualDisplayProxyRequest,
   type MacosVirtualDisplayProxyReply,
@@ -28,6 +34,7 @@ import {
 
 export const MACOS_REMOTE_DESKTOP_IPC_MESSAGE = Object.freeze({
   HELLO: 'remote_desktop.macos_ipc.hello',
+  AUTHENTICATED: 'remote_desktop.macos_ipc.authenticated',
   HOST_COMMAND: 'remote_desktop.macos_ipc.host_command',
   WORKER_MESSAGE: 'remote_desktop.macos_ipc.worker_message',
   /**
@@ -64,6 +71,11 @@ export interface MacosRemoteDesktopExpectedCodeIdentity {
  */
 export interface MacosRemoteDesktopVerifiedPeerIdentity {
   uid: number;
+  auditSessionId: number;
+  pidVersion: number;
+  /** Independently observed from the authenticated graphical peer boundary. */
+  kind: MacosRemoteDesktopIpcPrincipalBinding['kind'];
+  sessionType: MacosRemoteDesktopIpcPrincipalBinding['sessionType'];
   bundleIdentifier: string;
   teamId: string;
   designatedRequirement: string;
@@ -92,6 +104,18 @@ export interface MacosRemoteDesktopIpcHello {
   ipcVersion: typeof REMOTE_DESKTOP_WORKER_IPC_VERSION;
   workerGeneration: number;
   challenge: string;
+}
+
+/** Daemon-authored proof returned only after kernel and code-identity checks. */
+export interface MacosRemoteDesktopIpcAuthenticated {
+  type: typeof MACOS_REMOTE_DESKTOP_IPC_MESSAGE.AUTHENTICATED;
+  ipcVersion: typeof REMOTE_DESKTOP_WORKER_IPC_VERSION;
+  workerGeneration: number;
+  uid: number;
+  auditSessionId: number;
+  pidVersion: number;
+  sessionType: MacosRemoteDesktopIpcPrincipalBinding['sessionType'];
+  launchChallenge: string;
 }
 
 export interface MacosRemoteDesktopIpcHostCommand {
@@ -127,6 +151,7 @@ export interface MacosRemoteDesktopIpcVirtualDisplayReply {
 
 export type MacosRemoteDesktopIpcFrame =
   | MacosRemoteDesktopIpcHello
+  | MacosRemoteDesktopIpcAuthenticated
   | MacosRemoteDesktopIpcHostCommand
   | MacosRemoteDesktopIpcWorkerMessage
   | MacosRemoteDesktopIpcVirtualDisplayRequest
@@ -136,6 +161,18 @@ export type MacosRemoteDesktopIpcFrame =
 export interface MacosRemoteDesktopIpcSession {
   readonly workerGeneration: number;
   readonly socketPath: string;
+  /** The exact kernel graphical principal admitted for this launch. */
+  readonly principal: MacosRemoteDesktopIpcPrincipalBinding;
+  /** Per-launch challenge, retained so a successor cannot adopt this session. */
+  readonly launchNonce: string;
+}
+
+export interface MacosRemoteDesktopIpcPrincipalBinding {
+  readonly kind: 'aqua_user' | 'loginwindow_bootstrap';
+  readonly sessionType: 'Aqua' | 'LoginWindow';
+  readonly uid: number;
+  readonly auditSessionId: number;
+  readonly pidVersion: number;
 }
 
 interface TrackedRoute {
@@ -148,12 +185,22 @@ interface TrackedRoute {
   leaseExpiresAt: number;
 }
 
-export interface MacosRemoteDesktopIpcHostOptions {
-  user: MacosUserSession;
+interface MacosRemoteDesktopIpcHostCommonOptions {
   expectedCodeIdentity: MacosRemoteDesktopExpectedCodeIdentity;
   runtimeRoot?: string;
   randomChallenge?: () => Buffer;
 }
+
+/**
+ * New global-agent callers provide the explicit graphical principal. The
+ * user-only arm is retained for the existing Aqua launcher until its outer
+ * production caller moves to the global bootstrap; it still pins the native
+ * peer's asid/pidVersion at authentication time.
+ */
+export type MacosRemoteDesktopIpcHostOptions = MacosRemoteDesktopIpcHostCommonOptions & (
+  | { principal: MacosRemoteDesktopGraphicalSessionAuthority; user?: never }
+  | { user: MacosUserSession; principal?: never }
+);
 
 function fail(code: string): never {
   throw new Error(code);
@@ -161,6 +208,59 @@ function fail(code: string): never {
 
 function isSafePositiveInteger(value: unknown): value is number {
   return typeof value === 'number' && Number.isSafeInteger(value) && value > 0;
+}
+
+function isPositiveUint32(value: unknown): value is number {
+  return isSafePositiveInteger(value) && value <= 0xffff_ffff;
+}
+
+function assertGraphicalPrincipal(
+  principal: MacosRemoteDesktopGraphicalSessionAuthority,
+): void {
+  if (!isPositiveUint32(principal.auditSessionId)
+    || !isPositiveUint32(principal.pidVersion)) {
+    fail('macos_remote_desktop_ipc_invalid_graphical_principal');
+  }
+  if (principal.kind === 'aqua_user') {
+    if (principal.sessionType !== 'Aqua') {
+      fail('macos_remote_desktop_ipc_invalid_graphical_principal');
+    }
+    assertMacosUserSession(principal.user);
+    return;
+  }
+  if (principal.kind !== 'loginwindow_bootstrap'
+    || principal.sessionType !== 'LoginWindow'
+    || !isPositiveUint32(principal.uid)) {
+    fail('macos_remote_desktop_ipc_invalid_graphical_principal');
+  }
+}
+
+export function macosRemoteDesktopIpcPrincipalBinding(
+  principal: MacosRemoteDesktopGraphicalSessionAuthority,
+): MacosRemoteDesktopIpcPrincipalBinding {
+  assertGraphicalPrincipal(principal);
+  return Object.freeze({
+    kind: principal.kind,
+    sessionType: principal.sessionType,
+    uid: principal.kind === 'aqua_user' ? principal.user.uid : principal.uid,
+    auditSessionId: principal.auditSessionId,
+    pidVersion: principal.pidVersion,
+  });
+}
+
+export function macosRemoteDesktopIpcPrincipalPaths(
+  value: MacosRemoteDesktopGraphicalSessionAuthority | MacosUserSession,
+  runtimeRoot?: string,
+): { runtimeDirectory: string; socketPath: string } {
+  if ('kind' in value) {
+    const binding = macosRemoteDesktopIpcPrincipalBinding(value);
+    return macosRemoteDesktopGraphicalSessionPaths(
+      binding,
+      runtimeRoot ?? MACOS_REMOTE_DESKTOP_GRAPHICAL_RUNTIME_ROOT,
+    );
+  }
+  assertMacosUserSession(value);
+  return macosRemoteDesktopUserSessionPaths(value, runtimeRoot);
 }
 
 function equalSecret(left: string, right: string): boolean {
@@ -194,20 +294,22 @@ function unixMode(mode: number): number {
 
 export function validateMacosRemoteDesktopSocketSecurity(
   evidence: MacosRemoteDesktopSocketSecurityEvidence,
-  user: MacosUserSession,
+  principal: MacosRemoteDesktopGraphicalSessionAuthority | MacosUserSession,
   runtimeRoot?: string,
 ): boolean {
   try {
-    assertMacosUserSession(user);
-    const paths = macosRemoteDesktopUserSessionPaths(user, runtimeRoot);
+    const uid = 'kind' in principal
+      ? macosRemoteDesktopIpcPrincipalBinding(principal).uid
+      : principal.uid;
+    const paths = macosRemoteDesktopIpcPrincipalPaths(principal, runtimeRoot);
     return evidence.runtimeDirectory.kind === 'directory'
       && evidence.runtimeDirectory.path === paths.runtimeDirectory
-      && evidence.runtimeDirectory.uid === user.uid
+      && evidence.runtimeDirectory.uid === uid
       && unixMode(evidence.runtimeDirectory.mode) === MACOS_REMOTE_DESKTOP_RUNTIME_DIRECTORY_MODE
       && evidence.socket.kind === 'socket'
       && evidence.socket.path === paths.socketPath
       && dirname(evidence.socket.path) === evidence.runtimeDirectory.path
-      && evidence.socket.uid === user.uid
+      && evidence.socket.uid === uid
       && unixMode(evidence.socket.mode) === MACOS_REMOTE_DESKTOP_SOCKET_MODE;
   } catch {
     return false;
@@ -321,9 +423,18 @@ export class MacosRemoteDesktopIpcAuthorityHost {
   private activeSession: MacosRemoteDesktopIpcSession | null = null;
   private readonly routes = new Map<string, TrackedRoute>();
   private readonly randomChallenge: () => Buffer;
+  private readonly expectedPrincipal: MacosRemoteDesktopIpcPrincipalBinding | null;
+  private readonly principalSource: MacosRemoteDesktopGraphicalSessionAuthority | MacosUserSession;
 
   constructor(private readonly options: MacosRemoteDesktopIpcHostOptions) {
-    assertMacosUserSession(options.user);
+    if (options.principal) {
+      this.expectedPrincipal = macosRemoteDesktopIpcPrincipalBinding(options.principal);
+      this.principalSource = options.principal;
+    } else {
+      assertMacosUserSession(options.user);
+      this.expectedPrincipal = null;
+      this.principalSource = options.user;
+    }
     validateExpectedCodeIdentity(options.expectedCodeIdentity);
     this.randomChallenge = options.randomChallenge ?? (() => randomBytes(CHALLENGE_BYTES));
   }
@@ -334,7 +445,10 @@ export class MacosRemoteDesktopIpcAuthorityHost {
     if (!Buffer.isBuffer(challengeBytes) || challengeBytes.length !== CHALLENGE_BYTES) {
       fail('macos_remote_desktop_ipc_invalid_challenge_source');
     }
-    const paths = macosRemoteDesktopUserSessionPaths(this.options.user, this.options.runtimeRoot);
+    const paths = macosRemoteDesktopIpcPrincipalPaths(
+      this.principalSource,
+      this.options.runtimeRoot,
+    );
     const launch = Object.freeze({
       workerGeneration: this.workerGeneration,
       challenge: challengeBytes.toString('base64url'),
@@ -351,13 +465,34 @@ export class MacosRemoteDesktopIpcAuthorityHost {
   ): MacosRemoteDesktopIpcSession {
     const launch = this.activeLaunch;
     const hello = parseHello(decodeMacosRemoteDesktopIpcFrame(frame));
+    const actualPrincipal: MacosRemoteDesktopIpcPrincipalBinding = Object.freeze({
+      kind: peer.kind,
+      sessionType: peer.sessionType,
+      uid: peer.uid,
+      auditSessionId: peer.auditSessionId,
+      pidVersion: peer.pidVersion,
+    });
     if (!launch || !hello
       || this.activeSession !== null
-      || peer.uid !== this.options.user.uid
+      || !isPositiveUint32(peer.uid)
+      || !isPositiveUint32(peer.auditSessionId)
+      || !isPositiveUint32(peer.pidVersion)
+      || (peer.kind !== 'aqua_user' && peer.kind !== 'loginwindow_bootstrap')
+      || (peer.sessionType !== 'Aqua' && peer.sessionType !== 'LoginWindow')
+      || (this.expectedPrincipal !== null
+        && (actualPrincipal.uid !== this.expectedPrincipal.uid
+          || actualPrincipal.auditSessionId !== this.expectedPrincipal.auditSessionId
+          || actualPrincipal.pidVersion !== this.expectedPrincipal.pidVersion
+          || actualPrincipal.kind !== this.expectedPrincipal.kind
+          || actualPrincipal.sessionType !== this.expectedPrincipal.sessionType))
+      || (this.expectedPrincipal === null
+        && (peer.uid !== (this.principalSource as MacosUserSession).uid
+          || peer.kind !== 'aqua_user'
+          || peer.sessionType !== 'Aqua'))
       || !matchesCodeIdentity(peer, this.options.expectedCodeIdentity)
       || !validateMacosRemoteDesktopSocketSecurity(
         filesystem,
-        this.options.user,
+        this.principalSource,
         this.options.runtimeRoot,
       )
       || hello.workerGeneration !== launch.workerGeneration
@@ -367,6 +502,8 @@ export class MacosRemoteDesktopIpcAuthorityHost {
     const session = Object.freeze({
       workerGeneration: launch.workerGeneration,
       socketPath: launch.socketPath,
+      principal: actualPrincipal,
+      launchNonce: launch.challenge,
     });
     this.activeSession = session;
     return session;

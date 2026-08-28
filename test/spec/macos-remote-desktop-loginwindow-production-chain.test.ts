@@ -123,10 +123,54 @@ describe('macOS LoginWindow production chain', () => {
   it('supervises both session types from one installed plist', async () => {
     const launchAgent = read('src/node/macos-remote-desktop-launch-agent.ts');
     expect(launchAgent).toContain('MACOS_REMOTE_DESKTOP_LAUNCH_AGENT_SESSION_TYPES');
+    expect(launchAgent).toContain('MACOS_REMOTE_DESKTOP_GLOBAL_LAUNCH_AGENT_PATH');
+    expect(launchAgent).toContain('await handle.chown(0, 0)');
+    expect(launchAgent).toContain('evidence.file.uid === 0');
+    expect(launchAgent).toContain('evidence.file.gid === 0');
+    expect(launchAgent).toContain('MACOS_REMOTE_DESKTOP_GLOBAL_LAUNCH_AGENT_FILE_MODE');
+    const userSession = read('src/node/macos-user-session.ts');
+    expect(userSession).toContain(
+      "'/Library/LaunchAgents/cc.imcodes.node.remote-desktop-agent.plist'",
+    );
     const sessionType = read('src/node/macos-remote-desktop-session-type.ts');
     for (const value of Object.values(MACOS_REMOTE_DESKTOP_SESSION_TYPE)) {
       expect(sessionType, value).toContain(`'${value}'`);
     }
+  });
+
+  it('bootstraps authority after launch from the exact graphical instance', () => {
+    const clientHeader = read('native/macos-remote-desktop/macos_worker_ipc_client.h');
+    const client = read('native/macos-remote-desktop/macos_worker_ipc_client.cc');
+    expect(agent).toContain('EnsureWorkerLaunchGrant');
+    expect(agent).toContain('BuildBootstrapHelloFrame');
+    expect(agent).toContain('ParseBootstrapGrantFrame');
+    expect(agent).toMatch(/if \(!EnsureWorkerLaunchGrant\(\)\)[\s\S]{0,160}return EX_NOPERM/u);
+    expect(clientHeader).toContain(
+      '/private/var/run/imcodes-node/remote-desktop-bootstrap.sock',
+    );
+    expect(client).toContain('expected.uid');
+    expect(client).toContain('expected.audit_session_id');
+    expect(client).toContain('expected.instance_nonce');
+    expect(client).toContain('expected_socket');
+  });
+
+  it('orders LoginWindow advertisement after peer auth, identity, composition, and session readiness', () => {
+    const run = worker.slice(worker.indexOf('int RunLaunchAgentSession'));
+    const auth = run.indexOf('ReadAuthenticationFrame');
+    const identity = run.indexOf('MacosSessionIdentityMatches');
+    const composition = run.indexOf('ComposeSessionCapture');
+    const session = run.indexOf('auto session =');
+    const attestor = run.indexOf('ReadinessAttestor readiness_attestor');
+    expect(auth).toBeGreaterThanOrEqual(0);
+    expect(identity).toBeGreaterThan(auth);
+    expect(composition).toBeGreaterThan(identity);
+    expect(session).toBeGreaterThan(composition);
+    expect(attestor).toBeGreaterThan(session);
+    expect(worker).toMatch(
+      /session_->Start\(request\)[\s\S]{0,520}readiness_attestor_\(session_->readiness\(\)\)/u,
+    );
+    expect(run).toContain('macos_remote_desktop_worker_loginwindow_bootstrap_required');
+    expect(run).not.toContain('MACOS_REMOTE_DESKTOP_NATIVE_COMMAND.readiness');
   });
 
   it('runs the production-chain counterfactual under ASan and UBSan', async () => {
@@ -140,6 +184,7 @@ describe('macOS LoginWindow production chain', () => {
         '-Wall', '-Wextra', '-Werror',
         '-I', NATIVE, '-I', COMMON,
         resolve(NATIVE, 'macos_login_window_capture.cc'),
+        resolve(NATIVE, 'macos_authenticated_session_readiness.cc'),
         resolve(NATIVE, 'screen_capture_kit_limits.cc'),
         resolve(NATIVE, 'macos_worker_ipc_client.cc'),
         resolve(NATIVE, 'macos_session_identity.mm'),

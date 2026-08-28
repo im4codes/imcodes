@@ -1,10 +1,14 @@
 #include "macos_peer_verifier_command.h"
 
 #include "macos_peer_identity.h"
+#include "macos_session_identity.h"
 
 #include <bsm/audit.h>
+#include <bsm/audit_session.h>
+#include <mach/mach.h>
 
 #include <charconv>
+#include <cerrno>
 #include <iostream>
 #include <limits>
 #include <string>
@@ -85,6 +89,52 @@ int Reject(const MacosPeerIdentityError& error) {
   return kRejectedExit;
 }
 
+int RejectSessionEvidence(int system_error) {
+  std::cerr << "macos_peer_session_evidence_rejected system="
+            << system_error << '\n';
+  return kRejectedExit;
+}
+
+std::string_view ClassifyAuthenticatedPeerSession(
+    const MacosVerifiedPeerIdentity& verified, int* system_error) {
+  if (system_error == nullptr || verified.audit_session_id <= 0) return {};
+#if defined(IMCODES_MACOS_PEER_VERIFIER_STANDALONE)
+  // The narrow usage/argument probe intentionally links no graphical
+  // classifier. If somebody invokes its verifier mode it must refuse, not
+  // substitute the peer's declaration for missing native evidence.
+  return {};
+#else
+  *system_error = 0;
+  mach_port_name_t session_port = MACH_PORT_NULL;
+  if (audit_session_port(verified.audit_session_id, &session_port) != 0 ||
+      session_port == MACH_PORT_NULL) {
+    *system_error = errno;
+    return {};
+  }
+  const au_asid_t joined = audit_session_join(session_port);
+  const kern_return_t release =
+      mach_port_deallocate(mach_task_self(), session_port);
+  if (joined != verified.audit_session_id || release != KERN_SUCCESS) {
+    *system_error = joined != verified.audit_session_id
+        ? errno
+        : static_cast<int>(release);
+    return {};
+  }
+
+  // This verifier is a short-lived root-daemon child. Joining only changes
+  // this disposable process, after the socket peer has already been fully
+  // authenticated. The window-server observation is therefore re-read in the
+  // exact authenticated audit session instead of trusting the peer's hello.
+  const MacosSessionIdentityObservation observation =
+      ObserveMacosSessionIdentity();
+  if (observation.audit_session_id !=
+      static_cast<std::uint32_t>(verified.audit_session_id)) {
+    return {};
+  }
+  return ClassifyMacosSessionType(observation);
+#endif
+}
+
 }  // namespace
 
 MacosPeerVerifierCommandResult MaybeRunMacosPeerVerifierCommand(
@@ -149,6 +199,13 @@ MacosPeerVerifierCommandResult MaybeRunMacosPeerVerifierCommand(
                                            &error)) {
     return {.handled = true, .exit_code = Reject(error)};
   }
+  int session_evidence_error = 0;
+  const std::string_view session_type =
+      ClassifyAuthenticatedPeerSession(verified, &session_evidence_error);
+  if (session_type.empty()) {
+    return {.handled = true,
+            .exit_code = RejectSessionEvidence(session_evidence_error)};
+  }
 
   // The audit session and the process-id VERSION are emitted so the caller can
   // bind a capability to this exact session and this exact process incarnation.
@@ -157,6 +214,7 @@ MacosPeerVerifierCommandResult MaybeRunMacosPeerVerifierCommand(
   std::cout << "{\"version\":1,\"uid\":" << verified.uid
             << ",\"auditSessionId\":" << verified.audit_session_id
             << ",\"pidVersion\":" << verified.pid_version
+            << ",\"sessionType\":" << JsonString(session_type)
             << ",\"bundleIdentifier\":"
             << JsonString(verified.bundle_identifier)
             << ",\"teamId\":" << JsonString(verified.team_id)

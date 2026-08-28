@@ -7,6 +7,7 @@
 // failure this slice exists to prevent is a worker that quietly composes the
 // ordinary Aqua session at a login window and reports success.
 
+#include "macos_authenticated_session_readiness.h"
 #include "macos_login_window_capture.h"
 #include "macos_session_identity.h"
 #include "macos_worker_ipc_client.h"
@@ -101,6 +102,67 @@ void ParserCounterfactuals() {
   ResetEnvironment("LoginWindow", "notanumber");
   Check(!macos::ReadWorkerLaunchContext(LookupEnvironment, &context),
         "a non-numeric audit session is refused");
+}
+
+void BootstrapCounterfactuals() {
+  macos::BootstrapHelloContext hello;
+  hello.uid = 88;
+  hello.audit_session_id = 100000;
+  hello.session_type = "LoginWindow";
+  hello.instance_nonce =
+      "LLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLL";
+  std::string encoded;
+  Check(macos::BuildBootstrapHelloFrame(hello, &encoded),
+        "a LoginWindow instance can author a bootstrap hello without an Aqua user");
+  Check(encoded.find("HOME") == std::string::npos &&
+            encoded.find("TMPDIR") == std::string::npos &&
+            encoded.find("challenge") == std::string::npos &&
+            encoded.find("workerGeneration") == std::string::npos,
+        "the bootstrap hello carries no inherited user or worker authority");
+
+  const std::string socket =
+      "/private/var/run/imcodes-node/graphical-sessions/88/100000/"
+      "remote-desktop-agent.sock";
+  const std::string grant =
+      "{\"type\":\"remote_desktop.macos_bootstrap.grant\","
+      "\"bootstrapVersion\":1,\"uid\":88,\"auditSessionId\":100000,"
+      "\"sessionType\":\"LoginWindow\","
+      "\"instanceNonce\":\"LLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLL\","
+      "\"workerGeneration\":7,"
+      "\"challenge\":\"CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC\","
+      "\"socketPath\":\"" + socket + "\"}";
+  macos::BootstrapGrant parsed;
+  Check(macos::ParseBootstrapGrantFrame(grant, hello, &parsed),
+        "the exact session-bound grant is accepted");
+  Check(parsed.socket_path == socket && parsed.worker_generation == 7,
+        "the accepted grant carries the isolated socket and generation");
+
+  const auto replace_once = [](std::string value, const std::string& before,
+                               const std::string& after) {
+    const std::size_t at = value.find(before);
+    if (at != std::string::npos) value.replace(at, before.size(), after);
+    return value;
+  };
+  Check(!macos::ParseBootstrapGrantFrame(
+            replace_once(grant, "\"uid\":88", "\"uid\":501"), hello,
+            &parsed),
+        "a mismatched uid grant is refused");
+  Check(!macos::ParseBootstrapGrantFrame(
+            replace_once(grant, "\"auditSessionId\":100000",
+                          "\"auditSessionId\":100001"),
+            hello, &parsed),
+        "a successor audit-session grant is refused by the predecessor");
+  Check(!macos::ParseBootstrapGrantFrame(
+            replace_once(grant, hello.instance_nonce,
+                          "RRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRR"),
+            hello, &parsed),
+        "a replayed grant for another process nonce is refused");
+  Check(!macos::ParseBootstrapGrantFrame(
+            replace_once(grant, socket,
+                          "/private/var/run/imcodes-node/graphical-sessions/"
+                          "88/99999/remote-desktop-agent.sock"),
+            hello, &parsed),
+        "a previous graphical-session socket is refused");
 }
 
 // ---------------------------------------------------------------------------
@@ -403,6 +465,74 @@ void ProfileCounterfactuals() {
 }
 
 // ---------------------------------------------------------------------------
+// Authenticated readiness: the post-composition evidence the daemon consumes.
+// ---------------------------------------------------------------------------
+
+void AuthenticatedReadinessCounterfactuals() {
+  macos::WorkerLaunchContext launch{
+      .socket_path =
+          "/private/var/run/imcodes-node/graphical-sessions/88/100000/"
+          "remote-desktop-agent.sock",
+      .challenge = "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+      .worker_generation = 7,
+      .session_type = "LoginWindow",
+      .audit_session_id = 100000,
+      .uid = 88,
+  };
+  const std::string acknowledgement =
+      "{\"type\":\"remote_desktop.macos_ipc.authenticated\","
+      "\"ipcVersion\":1,\"workerGeneration\":7,\"uid\":88,"
+      "\"auditSessionId\":100000,\"pidVersion\":44,"
+      "\"sessionType\":\"LoginWindow\","
+      "\"launchChallenge\":"
+      "\"CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC\"}";
+  macos::IpcAuthenticationAcknowledgement peer_ack;
+  Check(macos::IsGraphicalBootstrapLaunchContext(launch) &&
+            macos::ParseIpcAuthenticationAcknowledgement(
+                acknowledgement, launch, &peer_ack),
+        "the exact graphical socket and authenticated peer admit readiness");
+
+  macos::CaptureSessionBinding binding{
+      .session_type = launch.session_type,
+      .audit_session_id = launch.audit_session_id,
+      .uid = launch.uid,
+      .launch_challenge = launch.challenge,
+      .worker_generation = launch.worker_generation,
+  };
+  macos::AuthenticatedGraphicalPeer peer{
+      .uid = peer_ack.uid,
+      .audit_session_id = peer_ack.audit_session_id,
+      .pid_version = peer_ack.pid_version,
+      .worker_generation = peer_ack.worker_generation,
+      .session_type = peer_ack.session_type,
+      .launch_challenge = peer_ack.launch_challenge,
+  };
+  imcodes::remote_desktop::common::CapabilityReadiness readiness{
+      .capture = imcodes::remote_desktop::common::ReadinessState::kReady,
+      .encoder = imcodes::remote_desktop::common::ReadinessState::kReady,
+      .input = imcodes::remote_desktop::common::ReadinessState::kReady,
+      .clipboard = imcodes::remote_desktop::common::ReadinessState::kUnavailable,
+      .display = imcodes::remote_desktop::common::ReadinessState::kReady,
+      .disclosure = imcodes::remote_desktop::common::ReadinessState::kReady,
+      .graphical_session = imcodes::remote_desktop::common::ReadinessState::kReady,
+  };
+  std::string frame;
+  Check(macos::BuildAuthenticatedGraphicalReadinessFrame(
+            binding, peer, readiness, true, &frame),
+        "the authenticated post-composition readiness frame is authored");
+  peer.audit_session_id = 100001;
+  Check(!macos::BuildAuthenticatedGraphicalReadinessFrame(
+            binding, peer, readiness, true, &frame),
+        "a successor graphical session cannot reuse readiness");
+  peer.audit_session_id = binding.audit_session_id;
+  readiness.clipboard =
+      imcodes::remote_desktop::common::ReadinessState::kReady;
+  Check(!macos::BuildAuthenticatedGraphicalReadinessFrame(
+            binding, peer, readiness, true, &frame),
+        "a widened LoginWindow composition is refused rather than masked");
+}
+
+// ---------------------------------------------------------------------------
 // Live probe: the dictionary keys themselves.
 //
 // Every case above builds its observation by hand, so none of them can tell
@@ -473,9 +603,11 @@ void LiveProbeCounterfactual() {
 
 int main() {
   ParserCounterfactuals();
+  BootstrapCounterfactuals();
   IdentityCounterfactuals();
   CompositionCounterfactuals();
   ProfileCounterfactuals();
+  AuthenticatedReadinessCounterfactuals();
   LiveProbeCounterfactual();
   if (g_failures != 0) {
     std::fprintf(stderr, "%d production-chain counterfactual(s) failed\n",

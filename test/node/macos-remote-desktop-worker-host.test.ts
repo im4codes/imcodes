@@ -33,6 +33,8 @@ import type { VerifiedMacosRemoteDesktopArtifact } from '../../src/node/macos-re
 import type {
   MacosRemoteDesktopIpcLaunch,
   MacosRemoteDesktopExpectedCodeIdentity,
+  MacosRemoteDesktopIpcPrincipalBinding,
+  MacosRemoteDesktopIpcSession,
 } from '../../src/node/macos-remote-desktop-ipc.js';
 import type { MacosRemoteDesktopIpcServerOptions } from '../../src/node/macos-remote-desktop-ipc-server.js';
 import type {
@@ -48,7 +50,10 @@ import {
   MacosRemoteDesktopWorkerHost,
   type MacosRemoteDesktopWorkerHostOptions,
 } from '../../src/node/macos-remote-desktop-worker-host.js';
-import type { MacosUserSession } from '../../src/node/user-session-launcher.js';
+import type {
+  MacosRemoteDesktopGraphicalSessionAuthority,
+  MacosUserSession,
+} from '../../src/node/user-session-launcher.js';
 
 const NOW = 1_800_000_000_000;
 const TEAM_ID = 'ABCDE12345';
@@ -59,6 +64,13 @@ const USER: MacosUserSession = {
   name: 'desktop-user', uid: 501, gid: 20,
   home: '/Users/desktop-user', tempDir: '/private/var/folders/test/T/',
 };
+const LOGINWINDOW: MacosRemoteDesktopGraphicalSessionAuthority = Object.freeze({
+  kind: 'loginwindow_bootstrap',
+  sessionType: 'LoginWindow',
+  uid: 88,
+  auditSessionId: 100_004,
+  pidVersion: 7,
+});
 
 function requirement(bundleIdentifier: string): string {
   return `identifier "${bundleIdentifier}" and anchor apple generic and certificate leaf[subject.OU] = "${TEAM_ID}"`;
@@ -133,7 +145,10 @@ interface Harness {
   host: MacosRemoteDesktopWorkerHost;
   sent: RemoteDesktopDaemonCommand[];
   messages: RemoteDesktopDaemonMessage[];
-  authenticate(): boolean;
+  authenticate(
+    overrides?: Partial<MacosRemoteDesktopIpcPrincipalBinding>,
+    sessionOverrides?: Partial<MacosRemoteDesktopIpcSession>,
+  ): boolean;
   workerMessage(message: RemoteDesktopDaemonMessage): void;
   lifecycle: Lifecycle;
   stopped: ReturnType<typeof vi.fn>;
@@ -194,9 +209,42 @@ function harness(overrides: Partial<MacosRemoteDesktopWorkerHostOptions> = {}): 
   const host = new MacosRemoteDesktopWorkerHost((message) => messages.push(message), options);
   return {
     host, sent, messages, lifecycle, stopped, serverStarts,
-    authenticate: () => {
+    authenticate: (overrides = {}, sessionOverrides = {}) => {
       if (!serverOptions || !activeLaunch) return false;
-      serverOptions.onPeerAuthenticated?.(activeLaunch);
+      const explicit = serverOptions.principal;
+      const principal: MacosRemoteDesktopIpcPrincipalBinding = explicit
+        ? {
+          kind: explicit.kind,
+          sessionType: explicit.sessionType,
+          uid: explicit.kind === 'aqua_user' ? explicit.user.uid : explicit.uid,
+          auditSessionId: explicit.auditSessionId,
+          pidVersion: explicit.pidVersion,
+          ...overrides,
+        }
+        : {
+          kind: 'aqua_user',
+          sessionType: 'Aqua',
+          uid: serverOptions.user!.uid,
+          auditSessionId: 100_003,
+          pidVersion: 5,
+          ...overrides,
+        };
+      const session = {
+        workerGeneration: activeLaunch.workerGeneration,
+        socketPath: activeLaunch.socketPath,
+        principal,
+        launchNonce: activeLaunch.challenge,
+        ...sessionOverrides,
+      };
+      if (explicit?.kind === 'loginwindow_bootstrap') {
+        void Promise.resolve(serverOptions.onGraphicalReadinessAttestation?.(
+          'authenticated-readiness',
+          activeLaunch,
+          session,
+        )).then(() => serverOptions?.onPeerAuthenticated?.(activeLaunch!, session));
+      } else {
+        serverOptions.onPeerAuthenticated?.(activeLaunch, session);
+      }
       return true;
     },
     workerMessage: (message) => { void serverOptions?.onWorkerMessage(message); },
@@ -210,6 +258,107 @@ async function startAuthenticated(value: Harness): Promise<void> {
 }
 
 describe('macOS remote-desktop worker host', () => {
+  it('delivers LoginWindow generation/nonce through the explicit principal path without Aqua data', async () => {
+    const resolveUserSession = vi.fn(async () => USER);
+    const graphicalLaunches: unknown[] = [];
+    const value = harness({
+      resolveUserSession,
+      resolveGraphicalSessionAuthority: async () => LOGINWINDOW,
+      inspectGraphicalReadiness: async (_artifact, principal) => {
+        expect(principal).toBe(LOGINWINDOW);
+        return {
+          screenRecording: true,
+          encoder: true,
+          accessibility: true,
+          clipboard: false,
+          disclosure: true,
+        };
+      },
+      onGraphicalIpcLaunch: (principal, launch) => {
+        graphicalLaunches.push({ principal, launch });
+      },
+      inspectPeerGraphicalSession: async () => ({
+        kind: 'loginwindow_bootstrap',
+        sessionType: 'LoginWindow',
+      }),
+    });
+
+    await startAuthenticated(value);
+
+    expect(resolveUserSession).not.toHaveBeenCalled();
+    expect(graphicalLaunches).toHaveLength(1);
+    expect(graphicalLaunches[0]).toMatchObject({
+      principal: LOGINWINDOW,
+      launch: {
+        workerGeneration: 1,
+        challenge: 'A'.repeat(43),
+      },
+    });
+    expect(JSON.stringify(graphicalLaunches)).not.toMatch(/name|HOME|TMPDIR|Users\//u);
+    expect(value.host.available()).toBe(true);
+  });
+
+  it.each([
+    ['stale predecessor', { auditSessionId: LOGINWINDOW.auditSessionId - 1 }, {}],
+    ['successor session', { auditSessionId: LOGINWINDOW.auditSessionId + 1 }, {}],
+    ['replayed process generation', { pidVersion: LOGINWINDOW.pidVersion - 1 }, {}],
+    ['stale worker generation', {}, { workerGeneration: 99 }],
+    ['replayed launch nonce', {}, { launchNonce: 'Z'.repeat(43) }],
+  ])('refuses a %s session returned by the IPC boundary', async (
+    _label,
+    mismatch,
+    sessionMismatch,
+  ) => {
+    const errors: unknown[] = [];
+    const value = harness({
+      resolveGraphicalSessionAuthority: async () => LOGINWINDOW,
+      inspectGraphicalReadiness: async () => ({
+        screenRecording: true,
+        encoder: true,
+        accessibility: true,
+        clipboard: false,
+        disclosure: true,
+      }),
+      onGraphicalIpcLaunch: () => undefined,
+      inspectPeerGraphicalSession: async () => ({
+        kind: 'loginwindow_bootstrap',
+        sessionType: 'LoginWindow',
+      }),
+      onBackgroundError: (error) => errors.push(error),
+    });
+    const starting = value.host.start();
+    await vi.waitFor(() => expect(value.authenticate(mismatch, sessionMismatch)).toBe(true));
+    await starting;
+    expect(value.host.available()).toBe(false);
+    expect(errors).toContainEqual(expect.objectContaining({
+      message: 'macos_remote_desktop_worker_host_graphical_principal_mismatch',
+    }));
+  });
+
+  it('fails closed when an explicit graphical principal has no independent observer', async () => {
+    const errors: unknown[] = [];
+    const value = harness({
+      resolveGraphicalSessionAuthority: async () => LOGINWINDOW,
+      inspectGraphicalReadiness: async () => ({
+        screenRecording: true,
+        encoder: true,
+        accessibility: true,
+        clipboard: false,
+        disclosure: true,
+      }),
+      onGraphicalIpcLaunch: () => undefined,
+      onBackgroundError: (error) => errors.push(error),
+    });
+
+    await value.host.start();
+
+    expect(value.host.available()).toBe(false);
+    expect(value.serverStarts).not.toHaveBeenCalled();
+    expect(errors).toContainEqual(expect.objectContaining({
+      message: 'macos_remote_desktop_worker_host_graphical_peer_observer_unavailable',
+    }));
+  });
+
   it.each([
     ['artifact', { resolveVerifiedArtifact: async () => null }],
     ['active user', { resolveUserSession: async () => { throw new Error('no_aqua_user'); } }],

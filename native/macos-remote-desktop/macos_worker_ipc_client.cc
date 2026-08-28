@@ -367,6 +367,135 @@ bool BuildHelloFrame(const WorkerLaunchContext& context, std::string* out) {
   return true;
 }
 
+bool BuildBootstrapHelloFrame(const BootstrapHelloContext& context,
+                              std::string* out) {
+  if (out == nullptr || context.uid == 0 || context.audit_session_id == 0 ||
+      (context.session_type != "Aqua" &&
+       context.session_type != "LoginWindow") ||
+      !ValidChallenge(context.instance_nonce)) {
+    return false;
+  }
+  std::string frame;
+  frame.reserve(256);
+  frame.append("{\"type\":\"").append(kBootstrapMessageHello).append("\"");
+  frame.append(",\"bootstrapVersion\":")
+      .append(std::to_string(kBootstrapVersion));
+  frame.append(",\"uid\":").append(std::to_string(context.uid));
+  frame.append(",\"auditSessionId\":")
+      .append(std::to_string(context.audit_session_id));
+  frame.append(",\"sessionType\":\"").append(context.session_type).append("\"");
+  frame.append(",\"instanceNonce\":\"")
+      .append(context.instance_nonce).append("\"}");
+  if (frame.size() >= kIpcMaxFrameBytes) return false;
+  *out = std::move(frame);
+  return true;
+}
+
+bool ParseBootstrapGrantFrame(std::string_view frame,
+                              const BootstrapHelloContext& expected,
+                              BootstrapGrant* out) {
+  if (out == nullptr || frame.empty() || frame.size() >= kIpcMaxFrameBytes ||
+      frame.front() != '{' || frame.back() != '}' ||
+      ContainsControlCharacter(frame) || expected.uid == 0 ||
+      expected.audit_session_id == 0 ||
+      !ValidChallenge(expected.instance_nonce) ||
+      (expected.session_type != "Aqua" &&
+       expected.session_type != "LoginWindow") ||
+      !ObjectHasExactKeys(frame,
+          {"type", "bootstrapVersion", "uid", "auditSessionId",
+           "sessionType", "instanceNonce", "workerGeneration", "challenge",
+           "socketPath"})) {
+    return false;
+  }
+  std::string type;
+  std::string session_type;
+  std::string nonce;
+  std::string challenge;
+  std::string socket_path;
+  MemberString(frame, "type", &type);
+  MemberString(frame, "sessionType", &session_type);
+  MemberString(frame, "instanceNonce", &nonce);
+  MemberString(frame, "challenge", &challenge);
+  MemberString(frame, "socketPath", &socket_path);
+  const std::uint64_t version = MemberUnsigned(frame, "bootstrapVersion");
+  const std::uint64_t uid = MemberUnsigned(frame, "uid");
+  const std::uint64_t audit_session = MemberUnsigned(frame, "auditSessionId");
+  const std::uint64_t generation = MemberUnsigned(frame, "workerGeneration");
+  const std::string expected_socket =
+      std::string(kGraphicalRuntimeRoot) + "/" + std::to_string(expected.uid) +
+      "/" + std::to_string(expected.audit_session_id) +
+      "/remote-desktop-agent.sock";
+  if (type != kBootstrapMessageGrant || version != kBootstrapVersion ||
+      uid != expected.uid || audit_session != expected.audit_session_id ||
+      session_type != expected.session_type || nonce != expected.instance_nonce ||
+      generation == 0 || generation > kMaxWorkerGeneration ||
+      !ValidChallenge(challenge) || socket_path != expected_socket) {
+    return false;
+  }
+  out->uid = expected.uid;
+  out->audit_session_id = expected.audit_session_id;
+  out->session_type = expected.session_type;
+  out->instance_nonce = expected.instance_nonce;
+  out->worker_generation = generation;
+  out->challenge = std::move(challenge);
+  out->socket_path = std::move(socket_path);
+  return true;
+}
+
+bool IsGraphicalBootstrapLaunchContext(const WorkerLaunchContext& context) {
+  if (context.uid == 0 || context.audit_session_id == 0 ||
+      (context.session_type != "Aqua" &&
+       context.session_type != "LoginWindow")) {
+    return false;
+  }
+  const std::string expected_socket =
+      std::string(kGraphicalRuntimeRoot) + "/" + std::to_string(context.uid) +
+      "/" + std::to_string(context.audit_session_id) +
+      "/remote-desktop-agent.sock";
+  return context.socket_path == expected_socket;
+}
+
+bool ParseIpcAuthenticationAcknowledgement(
+    std::string_view frame,
+    const WorkerLaunchContext& expected,
+    IpcAuthenticationAcknowledgement* out) {
+  if (out == nullptr || !IsGraphicalBootstrapLaunchContext(expected) ||
+      frame.empty() || frame.size() >= kIpcMaxFrameBytes ||
+      frame.front() != '{' || frame.back() != '}' ||
+      ContainsControlCharacter(frame) ||
+      !ObjectHasExactKeys(frame,
+          {"type", "ipcVersion", "workerGeneration", "uid",
+           "auditSessionId", "pidVersion", "sessionType",
+           "launchChallenge"})) {
+    return false;
+  }
+  std::string type;
+  std::string session_type;
+  std::string challenge;
+  MemberString(frame, "type", &type);
+  MemberString(frame, "sessionType", &session_type);
+  MemberString(frame, "launchChallenge", &challenge);
+  const std::uint64_t version = MemberUnsigned(frame, "ipcVersion");
+  const std::uint64_t generation = MemberUnsigned(frame, "workerGeneration");
+  const std::uint64_t uid = MemberUnsigned(frame, "uid");
+  const std::uint64_t audit_session = MemberUnsigned(frame, "auditSessionId");
+  const std::uint64_t pid_version = MemberUnsigned(frame, "pidVersion");
+  if (type != kIpcMessageAuthenticated || version != kWorkerIpcVersion ||
+      generation != expected.worker_generation || uid != expected.uid ||
+      audit_session != expected.audit_session_id || pid_version == 0 ||
+      pid_version > 0xffff'ffffULL || session_type != expected.session_type ||
+      challenge != expected.challenge || !ValidChallenge(challenge)) {
+    return false;
+  }
+  out->uid = expected.uid;
+  out->audit_session_id = expected.audit_session_id;
+  out->pid_version = static_cast<std::uint32_t>(pid_version);
+  out->worker_generation = expected.worker_generation;
+  out->session_type = expected.session_type;
+  out->launch_challenge = expected.challenge;
+  return true;
+}
+
 bool BuildWorkerMessageFrame(std::uint64_t worker_generation,
                              std::string_view message_json, std::string* out) {
   if (out == nullptr) return false;

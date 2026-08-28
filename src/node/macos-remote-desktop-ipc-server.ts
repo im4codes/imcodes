@@ -22,18 +22,28 @@ import {
   MACOS_REMOTE_DESKTOP_RUNTIME_DIRECTORY_MODE,
   MACOS_REMOTE_DESKTOP_SOCKET_MODE,
   MacosRemoteDesktopIpcAuthorityHost,
+  macosRemoteDesktopIpcPrincipalBinding,
+  macosRemoteDesktopIpcPrincipalPaths,
   type MacosRemoteDesktopExpectedCodeIdentity,
   type MacosRemoteDesktopFilesystemEntry,
   type MacosRemoteDesktopIpcLaunch,
+  type MacosRemoteDesktopIpcAuthenticated,
   type MacosRemoteDesktopIpcSession,
   type MacosRemoteDesktopSocketSecurityEvidence,
   type MacosRemoteDesktopVerifiedPeerIdentity,
 } from './macos-remote-desktop-ipc.js';
 import {
+  MACOS_REMOTE_DESKTOP_GRAPHICAL_READINESS_MESSAGE,
+} from './macos-remote-desktop-graphical-readiness.js';
+import {
+  MACOS_REMOTE_DESKTOP_GRAPHICAL_RUNTIME_ROOT,
   MACOS_REMOTE_DESKTOP_RUNTIME_ROOT,
-  macosRemoteDesktopUserSessionPaths,
 } from './macos-user-session.js';
-import { assertMacosUserSession, type MacosUserSession } from './user-session-launcher.js';
+import {
+  assertMacosUserSession,
+  type MacosRemoteDesktopGraphicalSessionAuthority,
+  type MacosUserSession,
+} from './user-session-launcher.js';
 import {
   proxyVirtualDisplayRequest,
   type MacosVirtualDisplayProxyLease,
@@ -90,11 +100,17 @@ export interface MacosRemoteDesktopPinnedPeer {
   readonly auditSessionId: number;
   readonly pidVersion: number;
   readonly workerGeneration: number;
+  readonly sessionType: 'Aqua' | 'LoginWindow';
+  readonly launchNonce: string;
 }
 
-export interface MacosRemoteDesktopIpcServerOptions {
+export type MacosRemoteDesktopObservedGraphicalPeer = Pick<
+  MacosRemoteDesktopVerifiedPeerIdentity,
+  'kind' | 'sessionType'
+>;
+
+interface MacosRemoteDesktopIpcServerCommonOptions {
   authority: MacosRemoteDesktopIpcAuthorityHost;
-  user: MacosUserSession;
   expectedCodeIdentity: MacosRemoteDesktopExpectedCodeIdentity;
   runtimeRoot?: string;
   /** Native getpeereid/LOCAL_PEERCRED boundary. Never derive this from JSON. */
@@ -113,7 +129,20 @@ export interface MacosRemoteDesktopIpcServerOptions {
    */
   virtualDisplayLease?: () => MacosVirtualDisplayProxyLease | null;
   virtualDisplaySeams?: MacosVirtualDisplayProxySeams;
-  onPeerAuthenticated?(launch: MacosRemoteDesktopIpcLaunch): void | Promise<void>;
+  onPeerAuthenticated?(
+    launch: MacosRemoteDesktopIpcLaunch,
+    session: MacosRemoteDesktopIpcSession,
+  ): void | Promise<void>;
+  /**
+   * First post-ACK frame for a LoginWindow peer. Production must bind this
+   * native post-composition attestation to the current bootstrap grant before
+   * the peer is reported authenticated.
+   */
+  onGraphicalReadinessAttestation?(
+    encoded: string,
+    launch: MacosRemoteDesktopIpcLaunch,
+    session: MacosRemoteDesktopIpcSession,
+  ): void | Promise<void>;
   onDisconnect?(reason: MacosRemoteDesktopIpcDisconnectReason, error?: Error): void | Promise<void>;
   now?: () => number;
   handshakeTimeoutMs?: number;
@@ -124,12 +153,29 @@ export interface MacosRemoteDesktopIpcServerOptions {
   maxPendingOutboundBytes?: number;
 }
 
+export type MacosRemoteDesktopIpcServerOptions = MacosRemoteDesktopIpcServerCommonOptions & (
+  | {
+    principal: MacosRemoteDesktopGraphicalSessionAuthority;
+    user?: never;
+    /** Authenticated observation; it must not be copied from `principal`. */
+    inspectPeerGraphicalSession(
+      socket: Socket,
+    ): Promise<MacosRemoteDesktopObservedGraphicalPeer>;
+  }
+  | {
+    user: MacosUserSession;
+    principal?: never;
+    inspectPeerGraphicalSession?: never;
+  }
+);
+
 interface ConnectionState {
   socket: Socket;
   buffer: Buffer;
   lines: string[];
   pumping: boolean;
   authenticated: boolean;
+  graphicalReadinessAccepted: boolean;
   session: MacosRemoteDesktopIpcSession | null;
   /** Pinned at hello and never re-derived from a later frame. */
   peer: MacosRemoteDesktopPinnedPeer | null;
@@ -239,7 +285,7 @@ async function ensureAbsoluteDirectoryChain(path: string, mode: number): Promise
 async function ensureRuntimeDirectory(
   runtimeRoot: string,
   runtimeDirectory: string,
-  user: MacosUserSession,
+  owner: { uid: number; gid: number | null },
 ): Promise<void> {
   const canonicalRoot = resolve(runtimeRoot);
   const canonicalRuntime = resolve(runtimeDirectory);
@@ -255,10 +301,10 @@ async function ensureRuntimeDirectory(
     cursor = join(cursor, component);
     await ensureDirectory(cursor, MACOS_REMOTE_DESKTOP_RUNTIME_DIRECTORY_MODE);
   }
-  await chown(canonicalRuntime, user.uid, user.gid);
+  await chown(canonicalRuntime, owner.uid, owner.gid ?? -1);
   await chmod(canonicalRuntime, MACOS_REMOTE_DESKTOP_RUNTIME_DIRECTORY_MODE);
   const secured = await assertDirectory(canonicalRuntime);
-  if (secured.uid !== user.uid
+  if (secured.uid !== owner.uid
     || modeOf(secured) !== MACOS_REMOTE_DESKTOP_RUNTIME_DIRECTORY_MODE) {
     fail(MACOS_REMOTE_DESKTOP_IPC_SERVER_ERROR.UNSAFE_RUNTIME_PATH);
   }
@@ -394,9 +440,25 @@ export class MacosRemoteDesktopIpcServer {
   private teardownPromise: Promise<void> | null = null;
   private outboundTail: Promise<void> = Promise.resolve();
   private pendingOutboundBytes = 0;
+  private readonly principalSource: MacosRemoteDesktopGraphicalSessionAuthority | MacosUserSession;
+  private readonly owner: { uid: number; gid: number | null };
+  private readonly runtimeRoot: string;
 
   constructor(private readonly options: MacosRemoteDesktopIpcServerOptions) {
-    assertMacosUserSession(options.user);
+    if (options.principal) {
+      const binding = macosRemoteDesktopIpcPrincipalBinding(options.principal);
+      this.principalSource = options.principal;
+      this.owner = {
+        uid: binding.uid,
+        gid: options.principal.kind === 'aqua_user' ? options.principal.user.gid : null,
+      };
+      this.runtimeRoot = options.runtimeRoot ?? MACOS_REMOTE_DESKTOP_GRAPHICAL_RUNTIME_ROOT;
+    } else {
+      assertMacosUserSession(options.user);
+      this.principalSource = options.user;
+      this.owner = { uid: options.user.uid, gid: options.user.gid };
+      this.runtimeRoot = options.runtimeRoot ?? MACOS_REMOTE_DESKTOP_RUNTIME_ROOT;
+    }
     this.handshakeTimeoutMs = timeoutValue(options.handshakeTimeoutMs, DEFAULT_HANDSHAKE_TIMEOUT_MS);
     this.frameTimeoutMs = timeoutValue(options.frameTimeoutMs, DEFAULT_FRAME_TIMEOUT_MS);
     this.callbackTimeoutMs = timeoutValue(options.callbackTimeoutMs, DEFAULT_CALLBACK_TIMEOUT_MS);
@@ -421,24 +483,26 @@ export class MacosRemoteDesktopIpcServer {
     const launch = this.options.authority.beginLaunch();
     this.launch = launch;
     this.generationActive = true;
-    const runtimeRoot = this.options.runtimeRoot ?? MACOS_REMOTE_DESKTOP_RUNTIME_ROOT;
-    const expectedPaths = macosRemoteDesktopUserSessionPaths(this.options.user, runtimeRoot);
+    const expectedPaths = macosRemoteDesktopIpcPrincipalPaths(
+      this.principalSource,
+      this.runtimeRoot,
+    );
 
     try {
       if (launch.socketPath !== expectedPaths.socketPath) {
         fail(MACOS_REMOTE_DESKTOP_IPC_SERVER_ERROR.UNSAFE_RUNTIME_PATH);
       }
-      await ensureRuntimeDirectory(runtimeRoot, expectedPaths.runtimeDirectory, this.options.user);
+      await ensureRuntimeDirectory(this.runtimeRoot, expectedPaths.runtimeDirectory, this.owner);
       await removeStaleSocket(launch.socketPath);
       const server = net.createServer((socket) => this.accept(socket));
       server.maxConnections = 2;
       this.server = server;
       await listen(server, launch.socketPath);
-      await chown(launch.socketPath, this.options.user.uid, this.options.user.gid);
+      await chown(launch.socketPath, this.owner.uid, this.owner.gid ?? -1);
       await chmod(launch.socketPath, MACOS_REMOTE_DESKTOP_SOCKET_MODE);
       const evidence = await readSocketSecurity(expectedPaths.runtimeDirectory, launch.socketPath);
-      if (evidence.runtimeDirectory.uid !== this.options.user.uid
-        || evidence.socket.uid !== this.options.user.uid
+      if (evidence.runtimeDirectory.uid !== this.owner.uid
+        || evidence.socket.uid !== this.owner.uid
         || modeOf(await lstat(launch.socketPath)) !== MACOS_REMOTE_DESKTOP_SOCKET_MODE) {
         fail(MACOS_REMOTE_DESKTOP_IPC_SERVER_ERROR.UNSAFE_RUNTIME_PATH);
       }
@@ -509,6 +573,7 @@ export class MacosRemoteDesktopIpcServer {
       lines: [],
       pumping: false,
       authenticated: false,
+      graphicalReadinessAccepted: false,
       session: null,
       peer: null,
       handshakeTimer: null,
@@ -591,6 +656,27 @@ export class MacosRemoteDesktopIpcServer {
         }
         const session = state.session;
         if (!session) fail(MACOS_REMOTE_DESKTOP_IPC_SERVER_ERROR.PEER_REJECTED);
+        if (this.options.principal?.kind === 'loginwindow_bootstrap'
+          && !state.graphicalReadinessAccepted) {
+          if (peekFrameType(line) !== MACOS_REMOTE_DESKTOP_GRAPHICAL_READINESS_MESSAGE
+            || !this.options.onGraphicalReadinessAttestation) {
+            fail(MACOS_REMOTE_DESKTOP_IPC_SERVER_ERROR.PEER_REJECTED);
+          }
+          const launch = this.launch;
+          if (!launch) fail(MACOS_REMOTE_DESKTOP_IPC_SERVER_ERROR.PEER_REJECTED);
+          await withDeadline(
+            Promise.resolve(this.options.onGraphicalReadinessAttestation(
+              line,
+              launch,
+              session,
+            )),
+            this.callbackTimeoutMs,
+            MACOS_REMOTE_DESKTOP_IPC_SERVER_ERROR.CALLBACK_TIMEOUT,
+          );
+          state.graphicalReadinessAccepted = true;
+          await this.notifyPeerAuthenticated(launch, session);
+          continue;
+        }
         // Two envelopes share this stream. Routing every frame to the worker
         // message parser meant a virtual-display request threw and took the
         // connection with it -- the worker asking about a display was
@@ -637,14 +723,21 @@ export class MacosRemoteDesktopIpcServer {
     if (!launch || this.candidate !== state) {
       fail(MACOS_REMOTE_DESKTOP_IPC_SERVER_ERROR.PEER_REJECTED);
     }
-    const paths = macosRemoteDesktopUserSessionPaths(
-      this.options.user,
-      this.options.runtimeRoot ?? MACOS_REMOTE_DESKTOP_RUNTIME_ROOT,
+    const paths = macosRemoteDesktopIpcPrincipalPaths(
+      this.principalSource,
+      this.runtimeRoot,
     );
-    const [uid, codeIdentity, filesystem] = await withDeadline(
+    const observedGraphicalPeer = this.options.principal
+      ? this.options.inspectPeerGraphicalSession(state.socket)
+      : Promise.resolve<MacosRemoteDesktopObservedGraphicalPeer>({
+        kind: 'aqua_user',
+        sessionType: 'Aqua',
+      });
+    const [uid, codeIdentity, graphicalPeer, filesystem] = await withDeadline(
       Promise.all([
         this.options.inspectPeerUid(state.socket),
         this.options.verifyPeerCodeIdentity(state.socket, this.options.expectedCodeIdentity),
+        observedGraphicalPeer,
         readSocketSecurity(paths.runtimeDirectory, paths.socketPath),
       ]),
       this.handshakeTimeoutMs,
@@ -663,6 +756,10 @@ export class MacosRemoteDesktopIpcServer {
     }
     const peer: MacosRemoteDesktopVerifiedPeerIdentity = {
       uid,
+      auditSessionId: codeIdentity.auditSessionId,
+      pidVersion: codeIdentity.pidVersion,
+      kind: graphicalPeer.kind,
+      sessionType: graphicalPeer.sessionType,
       bundleIdentifier: codeIdentity.bundleIdentifier,
       teamId: codeIdentity.teamId,
       designatedRequirement: codeIdentity.designatedRequirement,
@@ -673,33 +770,44 @@ export class MacosRemoteDesktopIpcServer {
     }
     state.session = session;
     state.peer = {
-      uid,
-      auditSessionId: codeIdentity.auditSessionId,
-      pidVersion: codeIdentity.pidVersion,
+      uid: session.principal.uid,
+      auditSessionId: session.principal.auditSessionId,
+      pidVersion: session.principal.pidVersion,
       workerGeneration: session.workerGeneration,
+      sessionType: session.principal.sessionType,
+      launchNonce: session.launchNonce,
     };
+    const acknowledgement: MacosRemoteDesktopIpcAuthenticated = {
+      type: MACOS_REMOTE_DESKTOP_IPC_MESSAGE.AUTHENTICATED,
+      ipcVersion: REMOTE_DESKTOP_WORKER_IPC_VERSION,
+      workerGeneration: session.workerGeneration,
+      uid: session.principal.uid,
+      auditSessionId: session.principal.auditSessionId,
+      pidVersion: session.principal.pidVersion,
+      sessionType: session.principal.sessionType,
+      launchChallenge: session.launchNonce,
+    };
+    await this.write(state.socket, `${JSON.stringify(acknowledgement)}\n`);
     state.authenticated = true;
     this.candidate = null;
     this.active = state;
     if (state.handshakeTimer) clearTimeout(state.handshakeTimer);
     state.handshakeTimer = null;
-    if (this.options.onPeerAuthenticated) {
-      try {
-        await withDeadline(
-          Promise.resolve(this.options.onPeerAuthenticated(launch)),
-          this.callbackTimeoutMs,
-          MACOS_REMOTE_DESKTOP_IPC_SERVER_ERROR.CALLBACK_TIMEOUT,
-        );
-      } catch (error) {
-        this.reject(
-          state,
-          MACOS_REMOTE_DESKTOP_IPC_SERVER_ERROR.CALLBACK_TIMEOUT,
-          error,
-          'callback_failed',
-        );
-        throw error;
-      }
+    if (this.options.principal?.kind !== 'loginwindow_bootstrap') {
+      await this.notifyPeerAuthenticated(launch, session);
     }
+  }
+
+  private async notifyPeerAuthenticated(
+    launch: MacosRemoteDesktopIpcLaunch,
+    session: MacosRemoteDesktopIpcSession,
+  ): Promise<void> {
+    if (!this.options.onPeerAuthenticated) return;
+    await withDeadline(
+      Promise.resolve(this.options.onPeerAuthenticated(launch, session)),
+      this.callbackTimeoutMs,
+      MACOS_REMOTE_DESKTOP_IPC_SERVER_ERROR.CALLBACK_TIMEOUT,
+    );
   }
 
   /**

@@ -562,6 +562,24 @@ source_set("macos_worker_ipc_client") {
   public = [ "macos_worker_ipc_client.h" ]
 }
 
+# Exact LoginWindow readiness attestation, authored only after the worker has
+# received the daemon's peer-authentication acknowledgement and the production
+# session has completed adapter composition/readiness. This target owns no IPC
+# authority and is not in a default/shipped auto-unlock graph.
+source_set("macos_authenticated_session_readiness") {
+  sources = [
+    "macos_authenticated_session_readiness.cc",
+    "macos_authenticated_session_readiness.h",
+  ]
+
+  public = [ "macos_authenticated_session_readiness.h" ]
+  deps = [ ":macos_worker_ipc_client" ]
+  public_deps = [
+    ":macos_login_window_capture",
+    "../remote-desktop-common:remote_desktop_common",
+  ]
+}
+
 # HOST_COMMAND dispatch. Deliberately free of ScreenCaptureKit, libwebrtc and
 # any OS framework: the standalone native test binary links this target to prove
 # what each command emits and refuses, which is impossible from inside the
@@ -947,6 +965,7 @@ rtc_executable("imcodes_remote_desktop_worker") {
   deps = [
     # Real caller: SessionSeamAdapter::Prepare mints the one-shot authority.
     ":macos_disclosure_control",
+    ":macos_authenticated_session_readiness",
     ":macos_media_sender_binder",
     ":macos_native_command_v1",
     ":macos_permission_onboarding",

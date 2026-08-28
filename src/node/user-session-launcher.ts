@@ -22,6 +22,41 @@ export interface MacosUserSession {
   tempDir: string;
 }
 
+export type MacosRemoteDesktopGraphicalSessionAuthority =
+  | {
+    readonly kind: 'aqua_user';
+    readonly sessionType: 'Aqua';
+    readonly auditSessionId: number;
+    readonly pidVersion: number;
+    readonly user: Readonly<MacosUserSession>;
+  }
+  | {
+    /**
+     * LoginWindow is an authenticated graphical process, not an active user.
+     * It deliberately has no name/HOME/TMPDIR fields and therefore cannot be
+     * passed to ordinary user-session launch helpers by structural accident.
+     */
+    readonly kind: 'loginwindow_bootstrap';
+    readonly sessionType: 'LoginWindow';
+    readonly uid: number;
+    readonly auditSessionId: number;
+    readonly pidVersion: number;
+  };
+
+export interface MacosRemoteDesktopVerifiedGraphicalPeer {
+  readonly uid: number;
+  readonly auditSessionId: number;
+  readonly pidVersion: number;
+  /** Native classification bound to this exact audit session, not the declaration. */
+  readonly sessionType: 'Aqua' | 'LoginWindow';
+}
+
+export interface MacosRemoteDesktopGraphicalSessionDeclaration {
+  readonly uid: number;
+  readonly auditSessionId: number;
+  readonly sessionType: 'Aqua' | 'LoginWindow';
+}
+
 export interface MacosUserSessionCommand {
   executable: string;
   args?: readonly string[];
@@ -147,6 +182,54 @@ export async function resolveMacosUserSession(
   }
 
   return { name, uid, gid, home, tempDir };
+}
+
+/**
+ * Convert already kernel-verified peer evidence into explicit authority.
+ *
+ * This does not relax resolveMacosUserSession: ordinary callers still reject
+ * root/loginwindow/no-console. LoginWindow gets a separate type with no user
+ * environment; Aqua must still resolve the active console user and match it.
+ */
+export async function resolveMacosRemoteDesktopGraphicalSessionAuthority(
+  peer: MacosRemoteDesktopVerifiedGraphicalPeer,
+  declaration: MacosRemoteDesktopGraphicalSessionDeclaration,
+  options: { resolveAquaUser?: () => Promise<MacosUserSession> } = {},
+): Promise<MacosRemoteDesktopGraphicalSessionAuthority> {
+  if (!Number.isSafeInteger(peer.uid) || peer.uid <= 0 || peer.uid > MACOS_MAX_USER_ID
+    || !Number.isSafeInteger(peer.auditSessionId) || peer.auditSessionId <= 0
+    || peer.auditSessionId > 0xffff_ffff
+    || !Number.isSafeInteger(peer.pidVersion) || peer.pidVersion <= 0
+    || peer.pidVersion > 0xffff_ffff
+    || (peer.sessionType !== 'Aqua' && peer.sessionType !== 'LoginWindow')
+    || declaration.uid !== peer.uid
+    || declaration.auditSessionId !== peer.auditSessionId
+    || declaration.sessionType !== peer.sessionType
+    || (declaration.sessionType !== 'Aqua'
+      && declaration.sessionType !== 'LoginWindow')) {
+    throw new Error(MACOS_USER_SESSION_ERROR.INVALID_CONSOLE_USER);
+  }
+  if (declaration.sessionType === 'LoginWindow') {
+    return Object.freeze({
+      kind: 'loginwindow_bootstrap',
+      sessionType: 'LoginWindow',
+      uid: peer.uid,
+      auditSessionId: peer.auditSessionId,
+      pidVersion: peer.pidVersion,
+    });
+  }
+  const user = await (options.resolveAquaUser ?? resolveMacosUserSession)();
+  assertMacosUserSession(user);
+  if (user.uid !== peer.uid) {
+    throw new Error(MACOS_USER_SESSION_ERROR.INVALID_CONSOLE_USER);
+  }
+  return Object.freeze({
+    kind: 'aqua_user',
+    sessionType: 'Aqua',
+    auditSessionId: peer.auditSessionId,
+    pidVersion: peer.pidVersion,
+    user: Object.freeze({ ...user }),
+  });
 }
 
 function assertMacosUserSessionCommand(command: MacosUserSessionCommand): void {

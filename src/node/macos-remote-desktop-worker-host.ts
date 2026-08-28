@@ -20,12 +20,16 @@ import {
 import type { VerifiedMacosRemoteDesktopArtifact } from './macos-remote-desktop-artifact.js';
 import {
   MacosRemoteDesktopIpcAuthorityHost,
+  macosRemoteDesktopIpcPrincipalBinding,
   type MacosRemoteDesktopExpectedCodeIdentity,
   type MacosRemoteDesktopIpcLaunch,
+  type MacosRemoteDesktopIpcPrincipalBinding,
+  type MacosRemoteDesktopIpcSession,
 } from './macos-remote-desktop-ipc.js';
 import {
   MacosRemoteDesktopIpcServer,
   type MacosRemoteDesktopIpcServerOptions,
+  type MacosRemoteDesktopObservedGraphicalPeer,
   type MacosRemoteDesktopVerifiedCodeIdentity,
 } from './macos-remote-desktop-ipc-server.js';
 import {
@@ -49,7 +53,11 @@ import { MACOS_REMOTE_DESKTOP_LAUNCH_AGENT_IDENTITY } from './macos-user-session
 import {
   RemoteDesktopWorkerHostCore,
 } from './remote-desktop-worker-host-core.js';
-import { assertMacosUserSession, type MacosUserSession } from './user-session-launcher.js';
+import {
+  assertMacosUserSession,
+  type MacosRemoteDesktopGraphicalSessionAuthority,
+  type MacosUserSession,
+} from './user-session-launcher.js';
 
 const DEFAULT_AUTHENTICATION_TIMEOUT_MS = 15_000;
 const DEFAULT_READINESS_POLL_MS = 1_000;
@@ -113,11 +121,40 @@ export interface MacosRemoteDesktopWorkerHostOptions {
   resolveVerifiedArtifact(): Promise<VerifiedMacosRemoteDesktopArtifact | null>;
   /** Must resolve the exact active Aqua user and reject root/headless/session mismatch. */
   resolveUserSession(): Promise<MacosUserSession>;
+  /**
+   * Global-LaunchAgent path. When present, this explicit kernel-bound
+   * principal replaces user discovery and may represent LoginWindow without a
+   * fabricated username, HOME or TMPDIR.
+   */
+  resolveGraphicalSessionAuthority?(): Promise<MacosRemoteDesktopGraphicalSessionAuthority>;
   /** Reads effective TCC/encoder/disclosure readiness without prompting or OS inference. */
   inspectReadiness(
     artifact: VerifiedMacosRemoteDesktopArtifact,
     user: MacosUserSession,
   ): Promise<LocalReadiness>;
+  /** Required for LoginWindow; may also specialize global Aqua readiness. */
+  inspectGraphicalReadiness?(
+    artifact: VerifiedMacosRemoteDesktopArtifact,
+    principal: MacosRemoteDesktopGraphicalSessionAuthority,
+    graphicalAttestation?: string,
+  ): Promise<LocalReadiness>;
+  /**
+   * Delivers the freshly minted generation/nonce/socket to the authenticated
+   * global bootstrap. It must complete before this host waits for the worker
+   * hello, otherwise the two handshakes would deadlock.
+   */
+  onGraphicalIpcLaunch?(
+    principal: MacosRemoteDesktopGraphicalSessionAuthority,
+    launch: MacosRemoteDesktopIpcLaunch,
+  ): void | Promise<void>;
+  /**
+   * Independent authenticated observation of the connected graphical peer.
+   * Required for the explicit global-principal path; never derive it from the
+   * expected principal passed to `onGraphicalIpcLaunch`.
+   */
+  inspectPeerGraphicalSession?(
+    socket: Socket,
+  ): Promise<MacosRemoteDesktopObservedGraphicalPeer>;
   /** Optional test seam; production derives both checks from the verified LaunchAgent executable. */
   inspectPeerUid?(socket: Socket): Promise<number>;
   /** Optional test seam; production derives both checks from the verified LaunchAgent executable. */
@@ -311,6 +348,7 @@ export class MacosRemoteDesktopWorkerHost {
   private closed = false;
   private activeArtifact: VerifiedMacosRemoteDesktopArtifact | null = null;
   private activeUser: MacosUserSession | null = null;
+  private activePrincipal: MacosRemoteDesktopGraphicalSessionAuthority | null = null;
   private readinessTimer: NodeJS.Timeout | null = null;
 
   constructor(
@@ -438,8 +476,16 @@ export class MacosRemoteDesktopWorkerHost {
         platform: process.platform,
         arch: process.arch,
       });
-      const user = await this.options.resolveUserSession();
-      assertMacosUserSession(user);
+      const principal = this.options.resolveGraphicalSessionAuthority
+        ? await this.options.resolveGraphicalSessionAuthority()
+        : null;
+      const principalBinding = principal
+        ? macosRemoteDesktopIpcPrincipalBinding(principal)
+        : null;
+      const user = principal
+        ? principal.kind === 'aqua_user' ? principal.user : null
+        : await this.options.resolveUserSession();
+      if (user) assertMacosUserSession(user);
       if (!this.isCurrent(generation)) return;
       const explicitPeerSeams = this.options.inspectPeerUid && this.options.verifyPeerCodeIdentity
         ? {
@@ -451,11 +497,17 @@ export class MacosRemoteDesktopWorkerHost {
         !== (this.options.verifyPeerCodeIdentity === undefined)) {
         throw new Error('macos_remote_desktop_worker_host_incomplete_peer_verifier');
       }
+      if (principal && !this.options.inspectPeerGraphicalSession) {
+        throw new Error('macos_remote_desktop_worker_host_graphical_peer_observer_unavailable');
+      }
       const peerSeams = explicitPeerSeams
         ?? (this.options.createPeerVerificationSeams
           ?? createMacosRemoteDesktopNativePeerVerificationSeams)({
           executablePath: artifact.components.launchAgent.executablePath,
-          expectedUid: user.uid,
+          expectedUid: principalBinding?.uid ?? user!.uid,
+          ...(principalBinding
+            ? { expectedAuditSessionId: principalBinding.auditSessionId }
+            : {}),
           expectedCodeIdentity: identity,
         });
       // PHASE 1 -- PREFLIGHT. Only the items that are independent of the
@@ -463,15 +515,19 @@ export class MacosRemoteDesktopWorkerHost {
       // qualified user. Display control is deliberately absent, because the
       // only thing that can answer it truthfully is an agent that does not
       // exist yet. This profile is a fail-fast gate; it is NEVER advertised.
-      const localReadiness = await this.options.inspectReadiness(artifact, user);
-      const preflightProfile = resolveMacosRemoteDesktopRuntimeProfile({
-        artifactVerified: true,
-        activeUserQualified: true,
-        ...localReadiness,
-        virtualDisplay: false,
-      });
-      if (preflightProfile.mode === MACOS_REMOTE_DESKTOP_READINESS_MODE.UNAVAILABLE
-        || !this.isCurrent(generation)) return;
+      let localReadiness = principal?.kind === 'loginwindow_bootstrap'
+        ? null
+        : await this.inspectLocalReadiness(artifact, principal, user);
+      if (localReadiness) {
+        const preflightProfile = resolveMacosRemoteDesktopRuntimeProfile({
+          artifactVerified: true,
+          activeUserQualified: true,
+          ...localReadiness,
+          virtualDisplay: false,
+        });
+        if (preflightProfile.mode === MACOS_REMOTE_DESKTOP_READINESS_MODE.UNAVAILABLE
+          || !this.isCurrent(generation)) return;
+      }
       if (this.options.lifecycleSource && this.unsubscribeLifecycle === null) {
         this.unsubscribeLifecycle = this.options.lifecycleSource.subscribe((event) => {
           this.handleLifecycleEvent(event);
@@ -479,7 +535,7 @@ export class MacosRemoteDesktopWorkerHost {
       }
 
       const authority = new MacosRemoteDesktopIpcAuthorityHost({
-        user,
+        ...(principal ? { principal } : { user: user! }),
         expectedCodeIdentity: identity,
         runtimeRoot: this.options.runtimeRoot,
       });
@@ -499,19 +555,36 @@ export class MacosRemoteDesktopWorkerHost {
       // an unhandled rejection while the supervisor is still transitioning.
       void authenticationWait.catch(() => undefined);
       this.pendingAuthentication = { generation, reject: rejectAuthenticated };
-      const server = (this.options.createIpcServer
-        ?? ((serverOptions) => new MacosRemoteDesktopIpcServer(serverOptions)))({
+      const commonServerOptions = {
         authority,
-        user,
         expectedCodeIdentity: identity,
         runtimeRoot: this.options.runtimeRoot,
         inspectPeerUid: peerSeams.inspectPeerUid,
         verifyPeerCodeIdentity: peerSeams.verifyPeerCodeIdentity,
-        onPeerAuthenticated: (launch) => {
+        onPeerAuthenticated: (launch, session) => {
           if (!this.isCurrent(generation)) return;
+          if (principalBinding
+            && !this.sessionMatchesGraphicalLaunch(session, launch, principalBinding)) {
+            rejectAuthenticated(new Error(
+              'macos_remote_desktop_worker_host_graphical_principal_mismatch',
+            ));
+            return;
+          }
           this.connectionGeneration = this.core.beginConnection();
           resolveAuthenticated(launch);
         },
+        onGraphicalReadinessAttestation: principal?.kind === 'loginwindow_bootstrap'
+          ? async (encoded: string) => {
+            if (!this.options.inspectGraphicalReadiness) {
+              throw new Error('macos_remote_desktop_loginwindow_readiness_unavailable');
+            }
+            localReadiness = await this.options.inspectGraphicalReadiness(
+              artifact,
+              principal,
+              encoded,
+            );
+          }
+          : undefined,
         onWorkerMessage: (message) => this.onWorkerMessage(message, generation),
         // Injected, so a display request reaches the agent instead of being
         // answered `agent_unavailable` by a server with no lease to ask.
@@ -532,14 +605,24 @@ export class MacosRemoteDesktopWorkerHost {
           );
           this.invalidateForLifecycle(generation, restart);
         },
-      });
+      } satisfies Omit<MacosRemoteDesktopIpcServerOptions,
+        'principal' | 'user' | 'inspectPeerGraphicalSession'>;
+      const serverOptions: MacosRemoteDesktopIpcServerOptions = principal
+        ? {
+          ...commonServerOptions,
+          principal,
+          inspectPeerGraphicalSession: this.options.inspectPeerGraphicalSession!,
+        }
+        : { ...commonServerOptions, user: user! };
+      const server = (this.options.createIpcServer
+        ?? ((options) => new MacosRemoteDesktopIpcServer(options)))(serverOptions);
       this.authority = authority;
       this.ipcServer = server;
       // Started BEFORE the worker is launched, so the agent's lease and grant
       // exist by the time a worker can ask anything. Failing to start it is not
       // fatal to the session: capture and input still work, and display
       // requests refuse rather than the whole generation dying.
-      if (this.options.startVirtualDisplayAuthority) {
+      if (this.options.startVirtualDisplayAuthority && user) {
         try {
           this.virtualDisplayAuthority =
             await this.options.startVirtualDisplayAuthority({
@@ -579,24 +662,31 @@ export class MacosRemoteDesktopWorkerHost {
       if (!this.isCurrent(generation)) return;
       this.activeWorkerGeneration = launch.workerGeneration;
 
-      const supervisor = (this.options.createLaunchAgentSupervisor
-        ?? ((dependencies) => new MacosRemoteDesktopLaunchAgentSupervisor(dependencies)))({
-        artifact,
-        resolveUserSession: async () => user,
-        beginIpcLaunch: () => launch,
-        // Server owns this generation. Supervisor invalidation only retires
-        // route/UI state; host lifecycle cleanup revokes the IPC authority.
-        markAuthorityUnavailable: () => this.clearAdvertisedProfile(),
-        releaseInput: () => ({ ok: true }),
-        stopCapture: () => ({ ok: true }),
-        invalidateRoutes: () => this.failTrackedRoutes(),
-        onBackgroundError: this.options.onBackgroundError,
-      });
-      this.supervisor = supervisor;
-      const snapshot = await supervisor.start();
-      if (snapshot.workerGeneration !== launch.workerGeneration
-        || snapshot.socketPath !== launch.socketPath) {
-        throw new Error('macos_remote_desktop_worker_host_generation_mismatch');
+      if (principal) {
+        if (!this.options.onGraphicalIpcLaunch) {
+          throw new Error('macos_remote_desktop_worker_host_graphical_launch_unavailable');
+        }
+        await this.options.onGraphicalIpcLaunch(principal, launch);
+      } else {
+        const supervisor = (this.options.createLaunchAgentSupervisor
+          ?? ((dependencies) => new MacosRemoteDesktopLaunchAgentSupervisor(dependencies)))({
+          artifact,
+          resolveUserSession: async () => user!,
+          beginIpcLaunch: () => launch,
+          // Server owns this generation. Supervisor invalidation only retires
+          // route/UI state; host lifecycle cleanup revokes the IPC authority.
+          markAuthorityUnavailable: () => this.clearAdvertisedProfile(),
+          releaseInput: () => ({ ok: true }),
+          stopCapture: () => ({ ok: true }),
+          invalidateRoutes: () => this.failTrackedRoutes(),
+          onBackgroundError: this.options.onBackgroundError,
+        });
+        this.supervisor = supervisor;
+        const snapshot = await supervisor.start();
+        if (snapshot.workerGeneration !== launch.workerGeneration
+          || snapshot.socketPath !== launch.socketPath) {
+          throw new Error('macos_remote_desktop_worker_host_generation_mismatch');
+        }
       }
       const peerLaunch = await authenticationWait;
       if (this.pendingAuthentication?.generation === generation) {
@@ -605,8 +695,12 @@ export class MacosRemoteDesktopWorkerHost {
       if (!this.isCurrent(generation)
         || peerLaunch.workerGeneration !== launch.workerGeneration
         || peerLaunch.socketPath !== launch.socketPath) return;
+      if (!localReadiness) {
+        throw new Error('macos_remote_desktop_loginwindow_readiness_unavailable');
+      }
       this.activeArtifact = artifact;
       this.activeUser = user;
+      this.activePrincipal = principal;
       // Re-assert the live worker generation. It is first set before the
       // supervisor starts, but `markAuthorityUnavailable` runs during that
       // start and clears the advertised profile -- which also zeroed this
@@ -653,6 +747,33 @@ export class MacosRemoteDesktopWorkerHost {
     return this.isCurrent(generation) && this.authenticated;
   }
 
+  private sessionMatchesGraphicalLaunch(
+    session: MacosRemoteDesktopIpcSession,
+    launch: MacosRemoteDesktopIpcLaunch,
+    expected: MacosRemoteDesktopIpcPrincipalBinding,
+  ): boolean {
+    return session.workerGeneration === launch.workerGeneration
+      && session.socketPath === launch.socketPath
+      && session.launchNonce === launch.challenge
+      && session.principal.kind === expected.kind
+      && session.principal.sessionType === expected.sessionType
+      && session.principal.uid === expected.uid
+      && session.principal.auditSessionId === expected.auditSessionId
+      && session.principal.pidVersion === expected.pidVersion;
+  }
+
+  private async inspectLocalReadiness(
+    artifact: VerifiedMacosRemoteDesktopArtifact,
+    principal: MacosRemoteDesktopGraphicalSessionAuthority | null,
+    user: MacosUserSession | null,
+  ): Promise<LocalReadiness> {
+    if (principal && this.options.inspectGraphicalReadiness) {
+      return await this.options.inspectGraphicalReadiness(artifact, principal);
+    }
+    if (user) return await this.options.inspectReadiness(artifact, user);
+    throw new Error('macos_remote_desktop_loginwindow_readiness_unavailable');
+  }
+
   /**
    * Route admission re-probes the local disclosure/TCC boundary. A generation
    * may narrow from Control to View, but it never widens after its Server auth
@@ -664,11 +785,13 @@ export class MacosRemoteDesktopWorkerHost {
   ): Promise<boolean> {
     const artifact = this.activeArtifact;
     const user = this.activeUser;
-    if (!artifact || !user || !this.isCurrent(generation) || !this.authenticated) return false;
+    const principal = this.activePrincipal;
+    if (!artifact || (!user && !principal)
+      || !this.isCurrent(generation) || !this.authenticated) return false;
 
     let next: MacosRemoteDesktopRuntimeProfile;
     try {
-      const localReadiness = await this.options.inspectReadiness(artifact, user);
+      const localReadiness = await this.inspectLocalReadiness(artifact, principal, user);
       // The same two phases on every refresh. Recomputing from the preflight
       // items alone would drop display control on the first poll after it was
       // advertised, and a profile that narrows is treated as a readiness loss
@@ -889,6 +1012,7 @@ export class MacosRemoteDesktopWorkerHost {
     this.setAdvertisedProfile(EMPTY_PROFILE);
     this.activeArtifact = null;
     this.activeUser = null;
+    this.activePrincipal = null;
     this.activeWorkerGeneration = 0;
   }
 

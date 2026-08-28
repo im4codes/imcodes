@@ -46,6 +46,7 @@ function peerPayload(overrides: Record<string, unknown> = {}): Record<string, un
     uid: process.getuid!(),
     auditSessionId: 100003,
     pidVersion: 7,
+    sessionType: 'Aqua',
     bundleIdentifier: EXPECTED.bundleIdentifier,
     teamId: EXPECTED.teamId,
     designatedRequirement: EXPECTED.designatedRequirement,
@@ -73,6 +74,10 @@ process.stdout.write(JSON.stringify({
   // caller named one.
   auditSessionId: Number(args['expected-audit-session-id'] ?? 100003),
   pidVersion: 7,
+  // The production native child joins the authenticated audit session and
+  // classifies the window-server dictionary there. This fixture represents
+  // that independent result rather than echoing a hello field.
+  sessionType: 'Aqua',
   bundleIdentifier: args['bundle-id'],
   teamId: args['team-id'],
   designatedRequirement: args['designated-requirement'],
@@ -116,9 +121,10 @@ describe.skipIf(process.platform !== 'darwin')('macOS native peer verifier bridg
         expectedUid: process.getuid!(),
         expectedCodeIdentity: expected,
       });
-      const [uid, identity] = await Promise.all([
+      const [uid, identity, peer] = await Promise.all([
         seams.inspectPeerUid(sockets.peer),
         seams.verifyPeerCodeIdentity(sockets.peer, expected),
+        seams.verifyPeer!(sockets.peer),
       ]);
       expect(uid).toBe(process.getuid!());
       expect(identity).toMatchObject(expected);
@@ -127,6 +133,7 @@ describe.skipIf(process.platform !== 'darwin')('macOS native peer verifier bridg
       // cannot tell a relaunched peer from the live one.
       expect(identity.auditSessionId).toBeGreaterThan(0);
       expect(identity.pidVersion).toBeGreaterThan(0);
+      expect(peer.sessionType).toBe('Aqua');
       expect(await readFile(helper.calls, 'utf8')).toBe('call\n');
     } finally {
       sockets.peer.destroy();
@@ -203,6 +210,7 @@ describe.skipIf(process.platform !== 'darwin')('macOS native peer verifier bridg
       ['negative audit session', emits(peerPayload({ auditSessionId: -1 }))],
       // Pids are reused; the version is what makes one an identity.
       ['zero pid version', emits(peerPayload({ pidVersion: 0 }))],
+      ['unknown graphical session type', emits(peerPayload({ sessionType: 'Console' }))],
       ['version mismatch', emits(peerPayload({ version: 2 }))],
       ['extra key', emits({ ...peerPayload(), privileged: true })],
       ['missing key', emits((() => {

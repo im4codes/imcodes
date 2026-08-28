@@ -21,6 +21,13 @@ inline constexpr char kIpcMessageVirtualDisplayReply[] =
     "remote_desktop.macos_ipc.virtual_display_reply";
 inline constexpr char kIpcMessageWorkerMessage[] =
     "remote_desktop.macos_ipc.worker_message";
+inline constexpr char kIpcMessageAuthenticated[] =
+    "remote_desktop.macos_ipc.authenticated";
+inline constexpr char kBootstrapMessageHello[] =
+    "remote_desktop.macos_bootstrap.hello";
+inline constexpr char kBootstrapMessageGrant[] =
+    "remote_desktop.macos_bootstrap.grant";
+inline constexpr std::int64_t kBootstrapVersion = 1;
 
 inline constexpr char kEnvRuntimeDirectory[] =
     "IMCODES_REMOTE_DESKTOP_RUNTIME_DIR";
@@ -37,6 +44,12 @@ inline constexpr char kEnvTeamId[] = "IMCODES_REMOTE_DESKTOP_TEAM_ID";
 inline constexpr char kEnvSessionType[] = "IMCODES_REMOTE_DESKTOP_SESSION_TYPE";
 inline constexpr char kEnvAuditSessionId[] =
     "IMCODES_REMOTE_DESKTOP_AUDIT_SESSION_ID";
+inline constexpr char kEnvBootstrapSocket[] =
+    "IMCODES_REMOTE_DESKTOP_BOOTSTRAP_SOCKET";
+inline constexpr char kGlobalBootstrapSocketPath[] =
+    "/private/var/run/imcodes-node/remote-desktop-bootstrap.sock";
+inline constexpr char kGraphicalRuntimeRoot[] =
+    "/private/var/run/imcodes-node/graphical-sessions";
 
 // Mirrors REMOTE_DESKTOP_WORKER_IPC_VERSION.
 inline constexpr std::int64_t kWorkerIpcVersion = 1;
@@ -66,6 +79,49 @@ struct WorkerLaunchContext {
   std::uint32_t audit_session_id = 0;
   std::uint32_t uid = 0;
 };
+
+struct BootstrapHelloContext {
+  std::uint32_t uid = 0;
+  std::uint32_t audit_session_id = 0;
+  std::string session_type;
+  std::string instance_nonce;
+};
+
+struct BootstrapGrant {
+  std::uint32_t uid = 0;
+  std::uint32_t audit_session_id = 0;
+  std::string session_type;
+  std::string instance_nonce;
+  std::uint64_t worker_generation = 0;
+  std::string challenge;
+  std::string socket_path;
+};
+
+struct IpcAuthenticationAcknowledgement {
+  std::uint32_t uid = 0;
+  std::uint32_t audit_session_id = 0;
+  std::uint32_t pid_version = 0;
+  std::uint64_t worker_generation = 0;
+  std::string session_type;
+  std::string launch_challenge;
+};
+
+/** Exact one-shot global-agent bootstrap frames. */
+[[nodiscard]] bool BuildBootstrapHelloFrame(
+    const BootstrapHelloContext& context, std::string* out);
+[[nodiscard]] bool ParseBootstrapGrantFrame(
+    std::string_view frame, const BootstrapHelloContext& expected,
+    BootstrapGrant* out);
+
+/** True only for the uid/asid path minted by the global bootstrap ledger. */
+[[nodiscard]] bool IsGraphicalBootstrapLaunchContext(
+    const WorkerLaunchContext& context);
+
+/** Exact daemon acknowledgement following native IPC peer verification. */
+[[nodiscard]] bool ParseIpcAuthenticationAcknowledgement(
+    std::string_view frame,
+    const WorkerLaunchContext& expected,
+    IpcAuthenticationAcknowledgement* out);
 
 // Reads the fixed environment the LaunchAgent plist installs. Every field is
 // required and validated; a missing or malformed value is a hard failure
