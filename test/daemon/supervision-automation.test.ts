@@ -4327,6 +4327,71 @@ describe('SupervisionAutomation', () => {
     }
   });
 
+  it('keeps manually projected heartbeat client ids single across queued reconnect drain', async () => {
+    const snapshot = await seedSession('supervised', false, 2, { uiLocale: 'zh-CN' });
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    try {
+      supervisionAutomation.init();
+      supervisionAutomation.registerTaskIntent(
+        'deck_supervision_brain',
+        'cmd-heartbeat-queue-dedupe',
+        '等待外部回执',
+        snapshot,
+      );
+      beginRun('cmd-heartbeat-queue-dedupe', '等待外部回执');
+      completeTurn(`已发出外部请求。\n${SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING}`);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      await new Promise<void>((resolve) => setImmediate(resolve));
+
+      // A busy transport queues two independently scheduled heartbeats. Their
+      // bodies are intentionally identical, but their clientMessageIds are not.
+      await vi.advanceTimersByTimeAsync(20 * 60_000);
+      expect(mockTransportRuntime.send).toHaveBeenCalledTimes(2);
+      const queued = mockTransportRuntime.send.mock.calls.map((call) => ({
+        text: String(call[0]),
+        clientMessageId: String(call[1]),
+        metadata: call[4] as { timelineCommitted?: boolean } | undefined,
+      }));
+      expect(queued[0]?.text).toBe(queued[1]?.text);
+      expect(queued[0]?.clientMessageId).not.toBe(queued[1]?.clientMessageId);
+      expect(queued.map((entry) => entry.metadata?.timelineCommitted)).toEqual([true, true]);
+
+      // Model the production FIFO reconnect/drain boundary: only entries that
+      // have not already been committed are projected as transport-user rows.
+      // Removing the production timelineCommitted flag makes this exact
+      // counterexample append two duplicate logical rows and fail below.
+      for (const entry of queued) {
+        if (entry.metadata?.timelineCommitted === true) continue;
+        timelineEmitter.emit(
+          'deck_supervision_brain',
+          'user.message',
+          {
+            text: entry.text,
+            clientMessageId: entry.clientMessageId,
+            allowDuplicate: true,
+          },
+          {
+            source: 'daemon',
+            confidence: 'high',
+            eventId: `transport-user:${entry.clientMessageId}`,
+          },
+        );
+      }
+
+      const heartbeatRows = timelineEmitter.replay('deck_supervision_brain', 0).events.filter(
+        (event) => event.type === 'user.message'
+          && String(event.payload.clientMessageId ?? '').startsWith('supervision-waiting-heartbeat:'),
+      );
+      expect(heartbeatRows).toHaveLength(2);
+      expect(heartbeatRows.map((event) => event.payload.clientMessageId)).toEqual(
+        queued.map((entry) => entry.clientMessageId),
+      );
+      expect(new Set(heartbeatRows.map((event) => event.payload.clientMessageId)).size).toBe(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('keeps rate-limited heartbeats alive when replies remain WAITING', async () => {
     const snapshot = await seedSession('supervised');
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });

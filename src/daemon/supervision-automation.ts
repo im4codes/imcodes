@@ -2258,7 +2258,14 @@ class SupervisionAutomation {
       return;
     }
     try {
-      runtime.send(heartbeatPrompt, heartbeatId);
+      runtime.send(heartbeatPrompt, heartbeatId, undefined, undefined, {
+        // The automation row above is already the durable, user-visible
+        // projection for this logical clientMessageId. If the runtime is busy,
+        // its durable FIFO must retain and deliver the heartbeat without
+        // projecting a second `transport-user:<clientMessageId>` row when the
+        // queue later drains (often several heartbeats at the same timestamp).
+        timelineCommitted: true,
+      });
       this.emitAutomationNote(
         current.sessionName,
         'Auto: checked the supervised task state; waiting remains active until a real NEEDS_INPUT result.',
