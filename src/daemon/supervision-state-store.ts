@@ -1087,10 +1087,12 @@ export class SupervisionTaskRegistry {
     const task = this.getTaskRecord(existing.taskId);
     if (!task) return { ok: false, reason: 'not_found' };
     const requestedRevision = normalizeTaskString(input.revision);
+    const taskRevision = normalizeTaskString(task.currentRevision);
     const assignments = this.listAssignments(existing.taskId);
 
     let targetStatus: SupervisionTaskLifecycleStatus;
     let matchingAudit: PersistedSupervisionTaskAssignment | undefined;
+    let resolvedRevision: string | undefined;
     if (existing.role === 'auditor') {
       const verdict = existing.verdict?.trim().toUpperCase();
       if ((verdict !== 'PASS' && verdict !== 'REWORK')
@@ -1102,13 +1104,19 @@ export class SupervisionTaskRegistry {
     } else if (existing.status === 'pushed') {
       targetStatus = 'finalized';
     } else {
-      const revision = requestedRevision ?? normalizeTaskString(task.currentRevision);
-      if (!revision) return { ok: false, reason: 'old_revision' };
+      const assignmentRevision = normalizeTaskString(existing.auditRevision);
+      resolvedRevision = requestedRevision ?? assignmentRevision ?? taskRevision;
+      if (!resolvedRevision
+        || (requestedRevision && assignmentRevision && requestedRevision !== assignmentRevision)
+        || (requestedRevision && taskRevision && requestedRevision !== taskRevision)
+        || (assignmentRevision && taskRevision && assignmentRevision !== taskRevision)) {
+        return { ok: false, reason: 'old_revision' };
+      }
       matchingAudit = assignments.find((assignment) => (
         assignment.role === 'auditor'
         && assignment.verdict?.trim().toUpperCase() === 'PASS'
         && Boolean(assignment.auditAttemptId)
-        && assignment.auditRevision === revision
+        && assignment.auditRevision === resolvedRevision
       ));
       if (!matchingAudit) return { ok: false, reason: 'old_revision' };
       if (!mayFinalizeEconomyAssignment({
@@ -1120,7 +1128,8 @@ export class SupervisionTaskRegistry {
     }
 
     const alreadyApplied = existing.status === targetStatus && !existing.leaseId;
-    if (alreadyApplied) return { ok: true, value: existing, replay: true };
+    const bindMissingTaskRevision = Boolean(matchingAudit && resolvedRevision && !taskRevision);
+    if (alreadyApplied && !bindMissingTaskRevision) return { ok: true, value: existing, replay: true };
 
     const now = input.now ?? Date.now();
     const record: PersistedSupervisionTaskAssignment = {
@@ -1137,19 +1146,29 @@ export class SupervisionTaskRegistry {
     };
     this.#db.exec('BEGIN IMMEDIATE');
     try {
-      this.#writeAssignment(record, targetStatus === 'ready_for_integration' ? 'ready_for_integration' : 'finalized', {
-        source: 'assignment_finish',
-        leaseRevoked: true,
-        ...(matchingAudit ? {
-          matchingAuditAssignmentId: matchingAudit.assignmentId,
-          auditAttemptId: matchingAudit.auditAttemptId,
-          auditRevision: matchingAudit.auditRevision,
-        } : {}),
-        ...(normalizeTaskString(input.evidence) ? { evidence: normalizeTaskString(input.evidence) } : {}),
-      });
+      if (!alreadyApplied) {
+        this.#writeAssignment(record, targetStatus === 'ready_for_integration' ? 'ready_for_integration' : 'finalized', {
+          source: 'assignment_finish',
+          leaseRevoked: true,
+          ...(matchingAudit ? {
+            matchingAuditAssignmentId: matchingAudit.assignmentId,
+            auditAttemptId: matchingAudit.auditAttemptId,
+            auditRevision: matchingAudit.auditRevision,
+          } : {}),
+          ...(normalizeTaskString(input.evidence) ? { evidence: normalizeTaskString(input.evidence) } : {}),
+        });
+      }
+      if (bindMissingTaskRevision) {
+        this.#writeTask({ ...task, currentRevision: resolvedRevision, updatedAt: now }, this.#taskEventFor(task.status), {
+          source: 'assignment_finish',
+          revisionBound: true,
+          auditAttemptId: matchingAudit?.auditAttemptId,
+          auditRevision: resolvedRevision,
+        });
+      }
       this.#deriveTaskStatus(existing.taskId, now);
       this.#db.exec('COMMIT');
-      return { ok: true, value: record };
+      return { ok: true, value: record, ...(alreadyApplied ? { replay: true } : {}) };
     } catch (error) {
       this.#db.exec('ROLLBACK');
       throw error;

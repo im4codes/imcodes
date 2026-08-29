@@ -24,20 +24,21 @@ import { AGENT_DELEGATION_PURPOSES } from '../../shared/agent-delegation.js';
 import { createSupervisionRegistryPort } from '../../src/daemon/supervision-registry-port.js';
 
 /** Adapts the real registry to the audited handler port. */
-function supervisionRegistryPort() {
+function supervisionRegistryPort(registryOverride?: SupervisionTaskRegistry) {
+  const registry = () => registryOverride ?? getSupervisionTaskRegistry();
   return {
-    getStatus: (taskId: string) => getSupervisionTaskRegistry().get(taskId)?.status,
-    applyIntent: (input: Parameters<SupervisionTaskRegistry['applyTaskIntent']>[0]) => getSupervisionTaskRegistry().applyTaskIntent(input),
+    getStatus: (taskId: string) => registry().get(taskId)?.status,
+    applyIntent: (input: Parameters<SupervisionTaskRegistry['applyTaskIntent']>[0]) => registry().applyTaskIntent(input),
     finishAssignment: ({ assignmentId, callerSessionName }: { assignmentId: string; callerSessionName: string }) => {
-      const registry = getSupervisionTaskRegistry();
-      const assignment = registry.getAssignment(assignmentId);
+      const current = registry();
+      const assignment = current.getAssignment(assignmentId);
       if (!assignment) return { ok: false as const, reason: 'not_found' };
       if (assignment.identity.sessionName !== callerSessionName) return { ok: false as const, reason: 'owner_mismatch' };
-      return registry.finishAssignment({ assignmentId, identity: assignment.identity });
+      return current.finishAssignment({ assignmentId, identity: assignment.identity });
     },
-    list: (filter: never) => getSupervisionTaskRegistry().list(filter) as never,
-    get: (taskId: string) => getSupervisionTaskRegistry().get(taskId) as never,
-    recover: (input: Parameters<SupervisionTaskRegistry['recoverTask']>[0]) => getSupervisionTaskRegistry().recoverTask(input),
+    list: (filter: never) => registry().list(filter) as never,
+    get: (taskId: string) => registry().get(taskId) as never,
+    recover: (input: Parameters<SupervisionTaskRegistry['recoverTask']>[0]) => registry().recoverTask(input),
   };
 }
 
@@ -1020,6 +1021,138 @@ describe('SupervisionTaskRegistry', () => {
     await expect(ownerIntent[SUPERVISION_MCP_TOOLS.INTENT]({
       intent: 'finish', taskId: 'matching-pass-close', assignmentId: implementer.value.assignmentId,
     })).resolves.toMatchObject({ status: 'ok', toStatus: 'ready_for_integration', idempotentReplay: true });
+  });
+
+  it('recovers an exact PASS revision after legacy finish cleared the lease without binding the task revision', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'imcodes-finish-revision-recovery-'));
+    const dbPath = join(dir, 'supervision-state.sqlite');
+    const revision = 'integration-revision-r1';
+    const roles = ['coordinator', 'integration_owner', 'implementer'] as const;
+    const targets: Array<{
+      taskId: string;
+      assignmentId: string;
+      owner: PersistedSupervisionTaskAssignmentIdentity;
+    }> = [];
+    try {
+      let registry = new SupervisionTaskRegistry({ dbPath });
+      for (const role of roles) {
+        const taskId = `finish-revision-${role}`;
+        const owner = identity(`deck_alpha_${role}`);
+        const auditorIdentity = identity(`deck_alpha_${role}_auditor`, 'claude-code-sdk');
+        expect(registry.createOrGet({
+          taskId, projectName: 'alpha', objective: `finish ${role}`, currentRevision: revision,
+        }).ok).toBe(true);
+        const target = registry.createAssignment({ taskId, role, identity: owner });
+        const auditor = registry.createAssignment({
+          taskId, role: 'auditor', identity: auditorIdentity,
+          auditAttemptId: `attempt-${role}`, auditRevision: revision,
+        });
+        const staleAuditorIdentity = identity(`deck_alpha_${role}_stale_auditor`, 'claude-code-sdk');
+        const staleAuditor = registry.createAssignment({
+          taskId, role: 'auditor', identity: staleAuditorIdentity,
+          auditAttemptId: `stale-attempt-${role}`, auditRevision: 'older-revision',
+        });
+        if (!target.ok || !auditor.ok || !staleAuditor.ok) throw new Error('expected finalization assignments');
+
+        for (const status of ['implementing', 'validated', 'ready_for_audit', 'auditing', 'passed', 'ready_for_integration'] as const) {
+          expect(registry.updateAssignment({
+            assignmentId: target.value.assignmentId,
+            identity: owner,
+            status,
+            auditAttemptId: `attempt-${role}`,
+            auditRevision: revision,
+            ...(status === 'passed' || status === 'ready_for_integration'
+              ? { verdict: 'PASS', crossVendorAuditPassed: true }
+              : {}),
+          }).ok, `${role}:${status}`).toBe(true);
+        }
+        for (const status of ['auditing', 'passed'] as const) {
+          expect(registry.updateAssignment({
+            assignmentId: auditor.value.assignmentId,
+            identity: auditorIdentity,
+            status,
+            auditAttemptId: `attempt-${role}`,
+            auditRevision: revision,
+            ...(status === 'passed' ? { verdict: 'PASS', crossVendorAuditPassed: true } : {}),
+          }).ok, `${role}:auditor:${status}`).toBe(true);
+        }
+        for (const status of ['auditing', 'passed'] as const) {
+          expect(registry.updateAssignment({
+            assignmentId: staleAuditor.value.assignmentId,
+            identity: staleAuditorIdentity,
+            status,
+            auditAttemptId: `stale-attempt-${role}`,
+            auditRevision: 'older-revision',
+            ...(status === 'passed' ? { verdict: 'PASS', crossVendorAuditPassed: true } : {}),
+          }).ok, `${role}:stale-auditor:${status}`).toBe(true);
+        }
+        expect(registry.finishAssignment({
+          assignmentId: target.value.assignmentId, identity: owner, revision,
+        })).toMatchObject({ ok: true, value: { status: 'ready_for_integration', leaseId: '' } });
+        targets.push({ taskId, assignmentId: target.value.assignmentId, owner });
+      }
+      registry.close();
+
+      // Reproduce the persisted production defect exactly: a prior finish
+      // durably copied the matching audit onto the assignment and revoked its
+      // lease, but left task.currentRevision NULL. Two accepted exact revision
+      // updates validate the assignment bind without repairing that task row.
+      const db = new DatabaseSync(dbPath);
+      for (const { taskId } of targets) {
+        const row = db.prepare('SELECT payload_json AS payloadJson FROM supervision_tasks WHERE task_id = ?')
+          .get(taskId) as { payloadJson: string };
+        const payload = JSON.parse(row.payloadJson) as Record<string, unknown>;
+        delete payload.currentRevision;
+        db.prepare('UPDATE supervision_tasks SET current_revision = NULL, payload_json = ? WHERE task_id = ?')
+          .run(JSON.stringify(payload), taskId);
+      }
+      db.close();
+
+      registry = new SupervisionTaskRegistry({ dbPath });
+      for (const target of targets) {
+        expect(registry.getTaskRecord(target.taskId)?.currentRevision).toBeUndefined();
+        for (let retry = 0; retry < 2; retry += 1) {
+          expect(registry.updateAssignment({
+            assignmentId: target.assignmentId,
+            identity: target.owner,
+            status: 'ready_for_integration',
+            revision,
+          }), `${target.taskId}:rebind:${retry}`).toMatchObject({ ok: true });
+        }
+        expect(registry.finishAssignment({
+          assignmentId: target.assignmentId, identity: target.owner, revision: 'older-revision',
+        })).toEqual({ ok: false, reason: 'old_revision' });
+        const intent = createSupervisionMcpToolHandlers(
+          { sessionName: target.owner.sessionName } as never,
+          { registry: supervisionRegistryPort(registry) },
+        );
+        await expect(intent[SUPERVISION_MCP_TOOLS.INTENT]({
+          intent: 'finish', taskId: target.taskId, assignmentId: target.assignmentId,
+        })).resolves.toMatchObject({
+          status: 'ok',
+          intent: 'finish',
+          toStatus: 'ready_for_integration',
+          idempotentReplay: true,
+          item: { status: 'ready_for_integration', leaseId: '', auditRevision: revision, verdict: 'PASS' },
+        });
+        expect(registry.getTaskRecord(target.taskId)?.currentRevision).toBe(revision);
+        expect(registry.finishAssignment({
+          assignmentId: target.assignmentId, identity: target.owner, revision: 'newer-revision',
+        })).toEqual({ ok: false, reason: 'old_revision' });
+      }
+      registry.close();
+
+      registry = new SupervisionTaskRegistry({ dbPath });
+      for (const target of targets) {
+        expect(registry.getTaskRecord(target.taskId)?.currentRevision).toBe(revision);
+        expect(registry.finishAssignment({
+          assignmentId: target.assignmentId, identity: target.owner,
+        })).toMatchObject({ ok: true, replay: true });
+      }
+      registry.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it('send_message binds a visible existing task and idempotency replay keeps the same assignment', async () => {
