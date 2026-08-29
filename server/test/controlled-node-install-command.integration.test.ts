@@ -16,7 +16,11 @@ import { randomBytes, createHash } from 'node:crypto';
 import { createDatabase, type Database } from '../src/db/client.js';
 import { runMigrations } from '../src/db/migrate.js';
 import { createUser } from '../src/db/queries.js';
-import { controlledNodeInstallCommandRoutes } from '../src/routes/controlled-node-install.js';
+import {
+  controlledNodeInstallCommandRoutes,
+  createControlledNodeInstallCommandRoutes,
+} from '../src/routes/controlled-node-install.js';
+import { createArtifactCatalog } from '../src/services/controlled-node-artifact-catalog.js';
 import {
   CONTROLLED_NODE_INSTALL_CODE_ALPHABET,
   CONTROLLED_NODE_INSTALL_CODE_LENGTH,
@@ -33,8 +37,10 @@ import {
 
 let db: Database;
 const hex = (n: number) => randomBytes(n).toString('hex');
-const sha256 = (s: string) => createHash('sha256').update(s).digest('hex');
+const sha256 = (s: string | Buffer) => createHash('sha256').update(s).digest('hex');
 const SERVER_URL = 'https://im.example.test';
+const WINDOWS_SIGNER_SHA256 = '5aedf20057238b95a27f714a1c8d7b038f42a0233189625d2f2c1fa251870b9a';
+const WINDOWS_ARTIFACT = Buffer.from('signed-windows-artifact-fixture');
 
 beforeAll(async () => {
   db = createDatabase(process.env.TEST_DATABASE_URL!);
@@ -42,7 +48,7 @@ beforeAll(async () => {
 });
 afterAll(async () => { await db.close(); });
 
-function buildApp() {
+function buildApp(routes = controlledNodeInstallCommandRoutes) {
   const app = new Hono();
   app.use('*', async (c, next) => {
     (c as unknown as { env: Record<string, unknown> }).env = {
@@ -50,13 +56,39 @@ function buildApp() {
     };
     await next();
   });
-  app.route('/i', controlledNodeInstallCommandRoutes);
+  app.route('/i', routes);
   return app;
+}
+
+async function windowsArtifactFixture(input: {
+  signerSha256?: string;
+} = {}): Promise<{ dir: string; sha256: string }> {
+  const dir = await mkdtemp(join(tmpdir(), 'imcodes-install-command-win-'));
+  const filename = 'imcodes-node.exe';
+  await writeFile(join(dir, filename), WINDOWS_ARTIFACT);
+  await writeFile(join(dir, `${filename}.manifest.json`), JSON.stringify({
+    schemaVersion: 1,
+    artifact: {
+      fileName: filename,
+      os: 'win32',
+      arch: 'x64',
+      size: WINDOWS_ARTIFACT.length,
+      sha256: sha256(WINDOWS_ARTIFACT),
+      ...(input.signerSha256 === undefined
+        ? { authenticodeSignerSha256: WINDOWS_SIGNER_SHA256 }
+        : input.signerSha256
+          ? { authenticodeSignerSha256: input.signerSha256 }
+          : {}),
+    },
+    build: { version: '2026.8.3752-dev.4196' },
+  }));
+  return { dir, sha256: sha256(WINDOWS_ARTIFACT) };
 }
 
 /** Seed an enrolment addressable by a known install code. */
 async function seedInstallCode(opts: {
   code: string; os?: string; arch?: string; expiresInMs?: number; revoked?: boolean;
+  artifactSha256?: string;
 }): Promise<void> {
   const now = Date.now();
   const ownerUserId = `u_${hex(4)}`;
@@ -69,7 +101,7 @@ async function seedInstallCode(opts: {
      VALUES ($1, $2, $3, $4, $5, $6, 'test-only', 0, $7, $8, NULL, TRUE, $9, $10, $11)`,
     [
       sha256(hex(16)), sha256(hex(16)), ownerUserId,
-      opts.os ?? 'linux', opts.arch ?? 'x64', sha256(hex(32)),
+      opts.os ?? 'linux', opts.arch ?? 'x64', opts.artifactSha256 ?? sha256(hex(32)),
       CONTROLLED_NODE_TICKET_MAX_CONSUMES[CONTROLLED_NODE_TICKET_DELIVERY.INSTALL_COMMAND],
       now + (opts.expiresInMs ?? 60_000), now,
       sha256(opts.code), opts.revoked ? now : null,
@@ -117,6 +149,7 @@ describe('rendered installer script', () => {
     for (const os of ['linux', 'mac', 'win'] as const) {
       const { body } = renderControlledNodeInstallScript({
         serverUrl: SERVER_URL, installCode: code, os, arch: 'x64',
+        ...(os === 'win' ? { windowsAuthenticodeSignerSha256: WINDOWS_SIGNER_SHA256 } : {}),
       });
       const invocation = os === 'win' ? 'Invoke-ImcodesInstall' : 'imcodes_install';
       const lines = body.trimEnd().split('\n');
@@ -135,12 +168,52 @@ describe('rendered installer script', () => {
 
     const win = renderControlledNodeInstallScript({
       serverUrl: SERVER_URL, installCode: code, os: 'win', arch: 'x64',
+      windowsAuthenticodeSignerSha256: WINDOWS_SIGNER_SHA256,
     }).body;
     expect(win).toContain('-Verb RunAs');
     // The new console must not close over the result before it can be read.
     expect(win).toContain('-NoExit');
     // A freshly downloaded exe is blocked by the Mark of the Web otherwise.
     expect(win).toContain('Unblock-File');
+  });
+
+  it('installs and validates the ticket-bound self-signed publisher before executing the SEA', () => {
+    const win = renderControlledNodeInstallScript({
+      serverUrl: SERVER_URL,
+      installCode: code,
+      os: 'win',
+      arch: 'x64',
+      windowsAuthenticodeSignerSha256: WINDOWS_SIGNER_SHA256,
+    }).body;
+
+    expect(win).toContain(`$expected = '${WINDOWS_SIGNER_SHA256}'`);
+    expect(win).toContain("$anchorStoreNames = @('TrustedPeople', 'TrustedPublisher')");
+    expect(win).toContain("foreach ($requiredStoreName in @('TrustedPeople', 'TrustedPublisher'))");
+    expect(win).toContain('Test-AnchoredCertificateInStore $requiredStoreName');
+    expect(win).toContain("throw ('release publisher trust installation did not anchor ' + $requiredStoreName)");
+    expect(win).toContain('X509Certificates.OpenFlags]::ReadWrite');
+    expect(win).toContain('SignatureStatus]::Valid');
+    expect(win).toContain("throw 'release signer does not match the compiled trust anchor'");
+    expect(win).toContain("throw 'release signer is not valid for code signing'");
+    expect(win).not.toContain('LocalMachine\\Root');
+
+    const unblock = win.indexOf('Unblock-File -LiteralPath $binary');
+    const signerPin = win.indexOf(`$expected = '${WINDOWS_SIGNER_SHA256}'`);
+    const finalValidation = win.indexOf('$trusted = Get-AuthenticodeSignature');
+    const execute = win.indexOf('& $binary');
+    expect(unblock).toBeGreaterThan(-1);
+    expect(signerPin).toBeGreaterThan(unblock);
+    expect(finalValidation).toBeGreaterThan(signerPin);
+    expect(execute).toBeGreaterThan(finalValidation);
+  });
+
+  it('fails closed when a Windows signer pin is absent or non-canonical', () => {
+    const base = { serverUrl: SERVER_URL, installCode: code, os: 'win' as const, arch: 'x64' as const };
+    expect(() => renderControlledNodeInstallScript(base)).toThrow('invalid_windows_release_signer_sha256');
+    expect(() => renderControlledNodeInstallScript({
+      ...base,
+      windowsAuthenticodeSignerSha256: WINDOWS_SIGNER_SHA256.toUpperCase(),
+    })).toThrow('invalid_windows_release_signer_sha256');
   });
 
   /**
@@ -198,6 +271,7 @@ describe('rendered installer script', () => {
     expect(linux).toContain("imcodes_expect_os='linux'");
     const win = renderControlledNodeInstallScript({
       serverUrl: SERVER_URL, installCode: code, os: 'win', arch: 'arm64',
+      windowsAuthenticodeSignerSha256: WINDOWS_SIGNER_SHA256,
     }).body;
     expect(win).toContain("$expectArch = 'ARM64'");
   });
@@ -220,11 +294,79 @@ describe('GET /i/:code', () => {
   });
 
   it('serves PowerShell for a windows code', async () => {
-    const app = buildApp();
+    const fixture = await windowsArtifactFixture();
+    const app = buildApp(createControlledNodeInstallCommandRoutes(
+      createArtifactCatalog(),
+      () => fixture.dir,
+    ));
     const code = freshCode();
-    await seedInstallCode({ code, os: 'win' });
-    const body = await (await app.request(`/i/${code}`)).text();
-    expect(body).toContain('Invoke-ImcodesInstall');
+    try {
+      await seedInstallCode({ code, os: 'win', artifactSha256: fixture.sha256 });
+      const response = await app.request(`/i/${code}`);
+      expect(response.status).toBe(200);
+      const body = await response.text();
+      expect(body).toContain('Invoke-ImcodesInstall');
+      expect(body).toContain(`$expected = '${WINDOWS_SIGNER_SHA256}'`);
+    } finally {
+      await rm(fixture.dir, { recursive: true, force: true });
+    }
+  });
+
+  it('binds the rendered trust pin to the verified manifest signer, not a server constant', async () => {
+    const alternateSigner = 'd'.repeat(64);
+    const fixture = await windowsArtifactFixture({ signerSha256: alternateSigner });
+    const app = buildApp(createControlledNodeInstallCommandRoutes(
+      createArtifactCatalog(),
+      () => fixture.dir,
+    ));
+    const code = freshCode();
+    try {
+      await seedInstallCode({ code, os: 'win', artifactSha256: fixture.sha256 });
+      const response = await app.request(`/i/${code}`);
+      expect(response.status).toBe(200);
+      const body = await response.text();
+      expect(body).toContain(`$expected = '${alternateSigner}'`);
+      expect(body).not.toContain(`$expected = '${WINDOWS_SIGNER_SHA256}'`);
+    } finally {
+      await rm(fixture.dir, { recursive: true, force: true });
+    }
+  });
+
+  it('refuses Windows scripts when the ticket SHA cannot bind the verified artifact', async () => {
+    const fixture = await windowsArtifactFixture();
+    const app = buildApp(createControlledNodeInstallCommandRoutes(
+      createArtifactCatalog(),
+      () => fixture.dir,
+    ));
+    const code = freshCode();
+    try {
+      await seedInstallCode({ code, os: 'win', artifactSha256: 'f'.repeat(64) });
+      const response = await app.request(`/i/${code}`);
+      expect(response.status).toBe(404);
+      expect(await response.text()).toBe('not found\n');
+    } finally {
+      await rm(fixture.dir, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    ['missing', ''],
+    ['malformed', 'g'.repeat(64)],
+  ])('refuses Windows scripts with a %s manifest signer', async (_label, signerSha256) => {
+    const fixture = await windowsArtifactFixture({ signerSha256 });
+    const app = buildApp(createControlledNodeInstallCommandRoutes(
+      createArtifactCatalog(),
+      () => fixture.dir,
+    ));
+    const code = freshCode();
+    try {
+      await seedInstallCode({ code, os: 'win', artifactSha256: fixture.sha256 });
+      const response = await app.request(`/i/${code}`);
+      expect(response.status).toBe(404);
+      expect(await response.text()).toBe('not found\n');
+    } finally {
+      await rm(fixture.dir, { recursive: true, force: true });
+    }
   });
 
   it('accepts the code as it would be retyped', async () => {

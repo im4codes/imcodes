@@ -5,6 +5,10 @@ import { sha256Hex } from '../security/crypto.js';
 import { resolveCanonicalServerUrl } from './enroll.js';
 import { renderControlledNodeInstallScript } from '../services/controlled-node-install-command.js';
 import {
+  defaultArtifactCatalog,
+  type ArtifactCatalog,
+} from '../services/controlled-node-artifact-catalog.js';
+import {
   isControlledNodeArtifactArch,
   isControlledNodeOs,
   normalizeControlledNodeInstallCode,
@@ -31,37 +35,63 @@ import {
  *    ticket nor distinguish a real code from an invented one: unknown, expired
  *    and revoked all answer with the same 404.
  */
-export const controlledNodeInstallCommandRoutes = new Hono<{ Bindings: Env }>();
+const SHA256_RE = /^[a-f0-9]{64}$/;
 
-controlledNodeInstallCommandRoutes.get('/:code', async (c) => {
-  const serverUrl = resolveCanonicalServerUrl(c);
-  if (!serverUrl) return c.text('not found\n', 404);
+export function createControlledNodeInstallCommandRoutes(
+  artifactCatalog: ArtifactCatalog = defaultArtifactCatalog,
+  artifactDirectory: () => string | undefined = () => process.env.IMCODES_NODE_EXE_DIR,
+): Hono<{ Bindings: Env }> {
+  const routes = new Hono<{ Bindings: Env }>();
 
-  // Fold the hand-typed forms (lowercase, l-for-1, O-for-0) before validating.
-  const installCode = normalizeControlledNodeInstallCode(c.req.param('code') ?? '');
-  if (!installCode) return c.text('not found\n', 404);
+  routes.get('/:code', async (c) => {
+    const serverUrl = resolveCanonicalServerUrl(c);
+    if (!serverUrl) return c.text('not found\n', 404);
 
-  const row = await (c.env.DB as Database).queryOne<{ os: string; arch: string }>(
-    `SELECT os, arch
+    // Fold the hand-typed forms (lowercase, l-for-1, O-for-0) before validating.
+    const installCode = normalizeControlledNodeInstallCode(c.req.param('code') ?? '');
+    if (!installCode) return c.text('not found\n', 404);
+
+    const row = await (c.env.DB as Database).queryOne<{ os: string; arch: string; artifact_sha256: string }>(
+      `SELECT os, arch, artifact_sha256
        FROM controlled_node_enrollments_v2
       WHERE install_code_hash = $1
         AND revoked_at IS NULL
         AND ticket_expires_at > $2`,
-    [sha256Hex(installCode), Date.now()],
-  );
-  if (!row || !isControlledNodeOs(row.os) || !isControlledNodeArtifactArch(row.arch)) {
-    return c.text('not found\n', 404);
-  }
+      [sha256Hex(installCode), Date.now()],
+    );
+    if (!row || !isControlledNodeOs(row.os) || !isControlledNodeArtifactArch(row.arch)) {
+      return c.text('not found\n', 404);
+    }
 
-  const script = renderControlledNodeInstallScript({
-    serverUrl,
-    installCode,
-    os: row.os,
-    arch: row.arch,
+    let windowsAuthenticodeSignerSha256: string | undefined;
+    if (row.os === 'win') {
+      const dir = artifactDirectory();
+      if (!dir) return c.text('not found\n', 404);
+      const verified = await artifactCatalog.ensureVerified(dir, row.os, row.arch);
+      if (!verified.ok
+        || verified.descriptor.sha256 !== row.artifact_sha256
+        || !verified.descriptor.authenticodeSignerSha256
+        || !SHA256_RE.test(verified.descriptor.authenticodeSignerSha256)) {
+        return c.text('not found\n', 404);
+      }
+      windowsAuthenticodeSignerSha256 = verified.descriptor.authenticodeSignerSha256;
+    }
+
+    const script = renderControlledNodeInstallScript({
+      serverUrl,
+      installCode,
+      os: row.os,
+      arch: row.arch,
+      windowsAuthenticodeSignerSha256,
+    });
+    c.header('Content-Type', script.contentType);
+    c.header('Cache-Control', 'no-store, no-cache, must-revalidate, private, max-age=0');
+    c.header('Referrer-Policy', 'no-referrer');
+    c.header('X-Content-Type-Options', 'nosniff');
+    return c.body(script.body, 200);
   });
-  c.header('Content-Type', script.contentType);
-  c.header('Cache-Control', 'no-store, no-cache, must-revalidate, private, max-age=0');
-  c.header('Referrer-Policy', 'no-referrer');
-  c.header('X-Content-Type-Options', 'nosniff');
-  return c.body(script.body, 200);
-});
+
+  return routes;
+}
+
+export const controlledNodeInstallCommandRoutes = createControlledNodeInstallCommandRoutes();

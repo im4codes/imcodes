@@ -24,6 +24,9 @@ import {
   type ControlledNodeArtifactArch,
   type ControlledNodeOs,
 } from '../../../shared/controlled-node-artifacts.js';
+import { buildWindowsReleasePublisherTrustScriptForVariable } from '../../../shared/windows-release-publisher-trust.js';
+
+const SHA256_RE = /^[a-f0-9]{64}$/;
 
 /** Path the pasted command hits. Short because it is typed and dictated. */
 export const CONTROLLED_NODE_INSTALL_COMMAND_PATH = '/i';
@@ -194,8 +197,22 @@ function renderPowerShellScript(
   serverUrl: string,
   installCode: string,
   arch: ControlledNodeArtifactArch,
+  expectedSignerSha256: string,
 ): string {
+  if (!SHA256_RE.test(expectedSignerSha256)) {
+    throw new Error('invalid_windows_release_signer_sha256');
+  }
   const expectArch = arch === CONTROLLED_NODE_ARCH_ARM64 ? 'ARM64' : 'AMD64';
+  const publisherTrustScript = buildWindowsReleasePublisherTrustScriptForVariable(
+    'binary',
+    expectedSignerSha256,
+  ) + String.raw`
+foreach ($requiredStoreName in @('TrustedPeople', 'TrustedPublisher')) {
+  if (-not (Test-AnchoredCertificateInStore $requiredStoreName)) {
+    throw ('release publisher trust installation did not anchor ' + $requiredStoreName)
+  }
+}
+`;
   return String.raw`# IM.codes controlled-node installer.
 function Invoke-ImcodesInstall {
   $ErrorActionPreference = 'Stop'
@@ -246,6 +263,7 @@ function Invoke-ImcodesInstall {
     # Strip the Mark of the Web, or Windows treats the freshly downloaded
     # binary as untrusted and blocks it before it can report anything.
     Unblock-File -LiteralPath $binary -ErrorAction SilentlyContinue
+__PUBLISHER_TRUST_SCRIPT__
     Write-Host 'IM.codes: installing...'
     & $binary
   } finally {
@@ -258,6 +276,7 @@ Invoke-ImcodesInstall
     .replace(/__SERVER_URL__/g, serverUrl)
     .replace(/__INSTALL_CODE__/g, installCode)
     .replace(/__EXPECT_ARCH__/g, expectArch)
+    .replace('__PUBLISHER_TRUST_SCRIPT__', publisherTrustScript)
     .replace(/__DOWNLOAD_PATH__/g, DOWNLOAD_PATH);
 }
 
@@ -273,11 +292,18 @@ export function renderControlledNodeInstallScript(input: {
   installCode: string;
   os: ControlledNodeOs;
   arch: ControlledNodeArtifactArch;
+  /** Required only for Windows; obtained from the ticket-pinned release manifest. */
+  windowsAuthenticodeSignerSha256?: string;
 }): InstallCommandScript {
   assertRenderable(input.serverUrl, input.installCode);
   return input.os === 'win'
     ? {
-      body: renderPowerShellScript(input.serverUrl, input.installCode, input.arch),
+      body: renderPowerShellScript(
+        input.serverUrl,
+        input.installCode,
+        input.arch,
+        input.windowsAuthenticodeSignerSha256 ?? '',
+      ),
       contentType: 'text/plain; charset=utf-8',
     }
     : {
