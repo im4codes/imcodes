@@ -214,6 +214,14 @@ export function createSupervisionMcpToolHandlers(
       if (requestedAssignmentId && !boundAssignmentId) {
         return err('identity_rejected', 'assignment is not visible to this caller');
       }
+      // `cancel` is the one intent with both task- and assignment-scoped forms.
+      // Only an explicit assignmentId selects the narrow form. Inferring the
+      // caller's sole assignment here made a task-level cancel report success
+      // while leaving the durable task row unchanged when that assignment was
+      // already retired.
+      const intentAssignmentId = String(input.intent ?? '') === 'cancel' && !requestedAssignmentId
+        ? undefined
+        : boundAssignmentId;
       // `finish` is assignment-scoped. A matching structured audit may have
       // arrived while the durable task was still ready_for_audit (or a legacy
       // task/assignment pair was desynchronised), so applying the task-level
@@ -245,7 +253,7 @@ export function createSupervisionMcpToolHandlers(
       if (!outcome.ok) return err(outcome.refusal ?? 'refused', outcome.detail);
       const applied = reg.applyIntent({
         taskId,
-        ...(boundAssignmentId ? { assignmentId: boundAssignmentId } : {}),
+        ...(intentAssignmentId ? { assignmentId: intentAssignmentId } : {}),
         intent: outcome.intent!,
         toStatus: outcome.toStatus ?? null,
         validationState: outcome.validationState,

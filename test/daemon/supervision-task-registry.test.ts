@@ -1586,4 +1586,59 @@ describe('SupervisionTaskRegistry', () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  it('persists task-level cancel when every required assignment is already cancelled', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'supervision-task-level-cancel-'));
+    const dbPath = join(dir, 'registry.sqlite');
+    let registry = new SupervisionTaskRegistry({ dbPath });
+    try {
+      const taskId = 'validated-with-retired-assignments';
+      expect(registry.createOrGet({
+        projectName: 'alpha', taskId, objective: 'cancel the durable task row',
+      }).ok).toBe(true);
+
+      const assignments = [
+        { role: 'coordinator' as const, owner: identity('deck_alpha_brain') },
+        { role: 'implementer' as const, owner: identity('deck_alpha_w1') },
+        { role: 'integration_owner' as const, owner: identity('deck_alpha_owner') },
+      ].map(({ role, owner }) => {
+        const created = registry.createAssignment({ taskId, role, identity: owner, scopeFiles: [] });
+        if (!created.ok) throw new Error(created.reason);
+        expect(registry.applyTaskIntent({
+          taskId, assignmentId: created.value.assignmentId,
+          intent: 'cancel', toStatus: 'cancelled',
+        })).toMatchObject({ ok: true });
+        return created.value;
+      });
+
+      expect(registry.updateTask({ taskId, status: 'validated' })).toMatchObject({
+        ok: true, value: { status: 'validated' },
+      });
+      expect(registry.get(taskId)?.assignments).toEqual(expect.arrayContaining(
+        assignments.map((assignment) => expect.objectContaining({
+          assignmentId: assignment.assignmentId, status: 'cancelled', leaseId: '',
+        })),
+      ));
+
+      const handlers = createSupervisionMcpToolHandlers(
+        { sessionName: 'deck_alpha_brain', projectName: 'alpha' } as never,
+        { registry: supervisionRegistryPort(registry) },
+      );
+      expect(await handlers[SUPERVISION_MCP_TOOLS.INTENT]({ intent: 'cancel', taskId }))
+        .toMatchObject({ status: 'ok', fromStatus: 'validated', toStatus: 'cancelled' });
+      expect(registry.get(taskId)).toMatchObject({ status: 'cancelled' });
+
+      registry.close();
+      registry = new SupervisionTaskRegistry({ dbPath });
+      expect(registry.get(taskId)).toMatchObject({
+        status: 'cancelled',
+        assignments: expect.arrayContaining(assignments.map((assignment) => expect.objectContaining({
+          assignmentId: assignment.assignmentId, status: 'cancelled', leaseId: '',
+        }))),
+      });
+    } finally {
+      registry.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
