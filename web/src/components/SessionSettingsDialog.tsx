@@ -131,6 +131,8 @@ export interface PeerAuditSettingsSession {
   ccPresetId?: string | null;
   executionCloneKind?: string | null;
   parentRunId?: string | null;
+  /** Server-filtered owner-group candidate projection for shared participants. */
+  ownerCatalog?: true;
 }
 
 export type PeerAuditSettingsCandidate = PeerAuditCandidate;
@@ -587,7 +589,7 @@ export function buildSupervisionExecutionPoolCandidates(input: {
     if (!session.sessionName.trim()
       || session.parentSession !== owningMainSession
       || session.closedAt != null
-      || !SUPERVISION_POOL_OPEN_SESSION_STATES.has(session.state ?? '')
+      || (session.ownerCatalog !== true && !SUPERVISION_POOL_OPEN_SESSION_STATES.has(session.state ?? ''))
       || !isDelegationReplyCapableAgentType(session.type)
       || session.executionCloneKind != null
       || session.parentRunId != null
@@ -989,11 +991,23 @@ export function SessionSettingsDialog({
     sessions: peerAuditSessions,
   }), [parentSession, peerAuditSessions, sessionName]);
   const peerAuditCandidates = loadedPeerAuditCandidates;
+  const executionPoolSessions = useMemo(() => {
+    const merged = new Map(peerAuditSessions.map((session) => [session.sessionName, session]));
+    for (const session of supervisorDefaultsPref.executionPoolSessions) {
+      // The owner-authoritative catalog deliberately replaces a participant's
+      // incomplete local projection of the same session.
+      merged.set(session.sessionName, session);
+    }
+    return [...merged.values()];
+  }, [peerAuditSessions, supervisorDefaultsPref.executionPoolSessions]);
+  const executionPoolParentSession = parentSession?.trim()
+    || supervisorDefaultsPref.executionPoolSessions[0]?.parentSession
+    || null;
   const executionPoolCandidates = useMemo(() => buildSupervisionExecutionPoolCandidates({
     sessionName,
-    parentSession,
-    sessions: peerAuditSessions,
-  }), [parentSession, peerAuditSessions, sessionName]);
+    parentSession: executionPoolParentSession,
+    sessions: executionPoolSessions,
+  }), [executionPoolParentSession, executionPoolSessions, sessionName]);
   const selectedPeerAuditCandidate = peerAuditCandidates.find((candidate) => candidate.name === peerAuditTargetName);
   const selectedPeerAuditDisplayLabel = selectedPeerAuditCandidate
     ? peerAuditCandidateDisplayLabel(selectedPeerAuditCandidate)

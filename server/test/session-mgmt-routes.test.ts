@@ -715,6 +715,72 @@ describe('session-mgmt persistence routes', () => {
     }));
   });
 
+  it('projects every valid owner-group execution candidate to a participant even when both pools are empty', async () => {
+    mockResolveHttpShareAccessForCoveredSession.mockResolvedValue({
+      actor: {
+        kind: 'share',
+        effectiveActorRole: 'participant',
+        coverage: {
+          target: { kind: 'main', serverId: 'srv-1', sessionName: 'deck_proj_brain' },
+          effectiveRole: 'participant',
+        },
+      },
+    });
+    mockGetSubSessionsByServer.mockResolvedValue([
+      {
+        id: 'cx_one', parent_session: 'deck_proj_brain', type: 'codex-sdk', runtime_type: 'transport',
+        provider_id: 'openai', active_model: 'gpt-5.6', requested_model: null, cc_preset_id: null, label: 'Cx one',
+      },
+      {
+        id: 'cx_two', parent_session: 'deck_proj_brain', type: 'codex-sdk', runtime_type: 'transport',
+        provider_id: 'openai', active_model: 'gpt-5.6', requested_model: null, cc_preset_id: null, label: 'Cx two',
+      },
+      {
+        id: 'cc_preset', parent_session: 'deck_proj_brain', type: 'claude-code-sdk', runtime_type: 'transport',
+        provider_id: 'anthropic', active_model: 'MiniMax-M3', requested_model: null, cc_preset_id: 'preset-a', label: 'CC preset',
+      },
+      {
+        id: 'shell', parent_session: 'deck_proj_brain', type: 'shell', runtime_type: 'process',
+        provider_id: null, active_model: 'shell', requested_model: null, cc_preset_id: null, label: 'Shell',
+      },
+      {
+        id: 'bad_preset', parent_session: 'deck_proj_brain', type: 'claude-code-sdk', runtime_type: 'transport',
+        provider_id: 'anthropic', active_model: 'MiniMax-M3', requested_model: null, cc_preset_id: ' preset-a', label: 'Bad',
+      },
+      {
+        id: 'other', parent_session: 'deck_other_brain', type: 'codex-sdk', runtime_type: 'transport',
+        provider_id: 'openai', active_model: 'gpt-5.6', requested_model: null, cc_preset_id: null, label: 'Other',
+      },
+    ]);
+    const app = await buildApp();
+
+    const response = await app.request('/api/server/srv-1/sessions/deck_proj_brain/supervision/execution-pool-catalog');
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({
+      sessions: [
+        expect.objectContaining({
+          sessionName: 'deck_sub_cx_one',
+          parentSession: 'deck_proj_brain',
+          capabilityId: 'supervision-exec-v1:transport:codex-sdk:openai:gpt-5.6',
+          ownerCatalog: true,
+        }),
+        expect.objectContaining({
+          sessionName: 'deck_sub_cx_two',
+          capabilityId: 'supervision-exec-v1:transport:codex-sdk:openai:gpt-5.6',
+          ownerCatalog: true,
+        }),
+        expect.objectContaining({
+          sessionName: 'deck_sub_cc_preset',
+          ccPresetId: 'preset-a',
+          capabilityId: 'supervision-exec-v1-cc-preset:transport:claude-code-sdk:anthropic:preset-a:minimax-m3',
+          ownerCatalog: true,
+        }),
+      ],
+    });
+    expect(mockGetSubSessionsByServer).toHaveBeenCalledWith(mockDb, 'srv-1', { includeExecutionClones: false });
+    expect(mockGetUserPref).not.toHaveBeenCalled();
+  });
+
   it('denies viewers access to the machine owner supervision defaults', async () => {
     mockResolveHttpShareAccessForCoveredSession.mockResolvedValue({
       actor: { kind: 'share', effectiveActorRole: 'viewer' },
@@ -726,10 +792,24 @@ describe('session-mgmt persistence routes', () => {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ defaults: { backend: 'qwen', model: 'qwen3-coder-plus' } }),
     });
+    const catalog = await app.request('/api/server/srv-1/sessions/deck_proj_brain/supervision/execution-pool-catalog');
     expect(read.status).toBe(403);
     expect(write.status).toBe(403);
+    expect(catalog.status).toBe(403);
     expect(mockGetUserPref).not.toHaveBeenCalled();
     expect(mockSetUserPref).not.toHaveBeenCalled();
+    expect(mockGetSubSessionsByServer).not.toHaveBeenCalled();
+  });
+
+  it('fails the owner execution catalog closed for inactive shares and malformed sub-session targets', async () => {
+    mockResolveHttpShareAccessForCoveredSession.mockResolvedValue({ actor: { kind: 'none' } });
+    const app = await buildApp();
+
+    const inactive = await app.request('/api/server/srv-1/sessions/deck_proj_brain/supervision/execution-pool-catalog');
+    const malformed = await app.request('/api/server/srv-1/sessions/deck_sub_/supervision/execution-pool-catalog');
+    expect(inactive.status).toBe(403);
+    expect(malformed.status).toBe(400);
+    expect(mockGetSubSessionsByServer).not.toHaveBeenCalled();
   });
 
   it('POST /session/send allows share participants and stamps a server-authored sharedActor', async () => {

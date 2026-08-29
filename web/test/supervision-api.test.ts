@@ -12,6 +12,7 @@ import { CODEX_MODEL_IDS } from '../../src/shared/models/options.js';
 import {
   fetchSupervisorDefaults,
   fetchSessionSupervisorDefaults,
+  fetchSessionSupervisorExecutionPoolCatalog,
   patchSession,
   patchSessionSupervision,
   patchSubSession,
@@ -143,6 +144,56 @@ describe('supervision API helpers', () => {
     }));
     expect(fetchMock).toHaveBeenCalledWith(
       '/api/server/srv%20owner/sessions/deck_proj_brain/supervision/defaults',
+      expect.objectContaining({ credentials: 'include' }),
+    );
+  });
+
+  it('loads only canonical owner execution-pool catalog rows and rejects malformed authority evidence', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({
+      sessions: [
+        {
+          sessionName: 'deck_sub_cx',
+          parentSession: 'deck_proj_brain',
+          type: 'codex-sdk',
+          runtimeType: 'transport',
+          label: 'Cx',
+          activeModel: 'gpt-5.6',
+          providerId: 'openai',
+          ccPresetId: null,
+          capabilityId: 'supervision-exec-v1:transport:codex-sdk:openai:gpt-5.6',
+          ownerCatalog: true,
+        },
+        {
+          sessionName: 'deck_sub_bad',
+          parentSession: 'deck_proj_brain',
+          type: 'codex-sdk',
+          runtimeType: 'transport',
+          label: 'Bad',
+          activeModel: 'gpt-5.6',
+          providerId: 'openai',
+          ccPresetId: null,
+          capabilityId: 'forged-capability',
+          ownerCatalog: true,
+        },
+        {
+          sessionName: 'deck_sub_unmarked',
+          parentSession: 'deck_proj_brain',
+          type: 'codex-sdk',
+          runtimeType: 'transport',
+          label: 'Unmarked',
+          activeModel: 'gpt-5.6',
+          providerId: 'openai',
+          ccPresetId: null,
+          capabilityId: 'supervision-exec-v1:transport:codex-sdk:openai:gpt-5.6',
+        },
+      ],
+    }));
+
+    await expect(fetchSessionSupervisorExecutionPoolCatalog('srv owner', 'deck/project brain')).resolves.toEqual([
+      expect.objectContaining({ sessionName: 'deck_sub_cx', ownerCatalog: true }),
+    ]);
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/server/srv%20owner/sessions/deck%2Fproject%20brain/supervision/execution-pool-catalog',
       expect.objectContaining({ credentials: 'include' }),
     );
   });

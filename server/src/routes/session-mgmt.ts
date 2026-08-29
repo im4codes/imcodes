@@ -31,7 +31,21 @@ import {
 } from '../../../shared/worker-session-snapshot.js';
 import { evaluateSharedCommandRateLimit } from '../share/share-rate-limit.js';
 import { getPodIdentity } from '../util/pod-identity.js';
-import { isSessionAgentType } from '../../../shared/agent-types.js';
+import { getSessionRuntimeType, isSessionAgentType } from '../../../shared/agent-types.js';
+import { isDelegationReplyCapableAgentType } from '../../../shared/agent-delegation.js';
+import {
+  PEER_AUDIT_UNKNOWN_IDENTITY,
+  resolvePeerAuditNormalizedModelId,
+  resolvePeerAuditProviderFamily,
+} from '../../../shared/peer-audit.js';
+import {
+  buildSupervisionExecutionCapabilityId,
+  normalizeSupervisionExecutionModel,
+} from '../../../shared/supervision-execution-pool.js';
+import {
+  doesSharedContextBackendSupportPresets,
+  normalizeSharedContextRuntimeBackend,
+} from '../../../shared/shared-context-runtime-config.js';
 import { DAEMON_COMMAND_TYPES } from '../../../shared/daemon-command-types.js';
 import { isKnownTestSessionLike } from '../../../shared/test-session-guard.js';
 import { sanitizeProjectName } from '../../../shared/sanitize-project-name.js';
@@ -397,7 +411,7 @@ sessionMgmtRoutes.patch('/:id/sessions/:name/supervision', async (c) => {
 async function resolveSupervisorDefaultsOwner(
   c: Context<{ Bindings: Env; Variables: { userId: string; role: string } }>,
 ): Promise<
-  | { ok: true; ownerUserId: string }
+  | { ok: true; ownerUserId: string; target: Exclude<ShareTarget, { kind: 'server' }> }
   | { ok: false; response: Response }
 > {
   const userId = c.get('userId' as never) as string;
@@ -416,7 +430,59 @@ async function resolveSupervisorDefaultsOwner(
   }
   const server = await getServerById(c.env.DB, serverId);
   if (!server) return { ok: false, response: c.json({ error: 'not_found' }, 404) };
-  return { ok: true, ownerUserId: server.user_id };
+  return { ok: true, ownerUserId: server.user_id, target };
+}
+
+async function buildOwnerExecutionPoolCatalog(
+  c: Context<{ Bindings: Env; Variables: { userId: string; role: string } }>,
+  target: Exclude<ShareTarget, { kind: 'server' }>,
+) {
+  const parentSession = target.kind === 'main'
+    ? target.sessionName
+    : (await getSubSessionById(c.env.DB, target.subSessionId, target.serverId))?.parent_session;
+  if (!parentSession) return [];
+
+  const rows = await getSubSessionsByServer(c.env.DB, target.serverId, { includeExecutionClones: false });
+  return rows.flatMap((row) => {
+    if (row.parent_session !== parentSession || !isDelegationReplyCapableAgentType(row.type)) return [];
+    const rawModel = row.active_model?.trim() || row.requested_model?.trim();
+    if (!rawModel) return [];
+    const providerFamily = resolvePeerAuditProviderFamily({
+      providerId: row.provider_id,
+      agentType: row.type,
+    });
+    if (providerFamily === PEER_AUDIT_UNKNOWN_IDENTITY) return [];
+    const runtimeType = row.runtime_type === 'process' || row.runtime_type === 'transport'
+      ? row.runtime_type
+      : getSessionRuntimeType(row.type);
+    const observedModel = resolvePeerAuditNormalizedModelId({ activeModel: rawModel });
+    if (observedModel === PEER_AUDIT_UNKNOWN_IDENTITY) return [];
+    const model = normalizeSupervisionExecutionModel(row.type, observedModel);
+    const ccPresetId = row.cc_preset_id == null ? undefined : row.cc_preset_id.trim();
+    const backend = normalizeSharedContextRuntimeBackend(row.type);
+    if (row.cc_preset_id != null
+      && (!ccPresetId || ccPresetId !== row.cc_preset_id
+        || !backend || !doesSharedContextBackendSupportPresets(backend))) return [];
+    const identity = {
+      agentType: row.type,
+      providerFamily,
+      runtimeType,
+      model,
+      ...(ccPresetId ? { ccPresetId } : {}),
+    };
+    return [{
+      sessionName: `deck_sub_${row.id}`,
+      parentSession,
+      type: row.type,
+      runtimeType,
+      label: row.label?.trim() || `deck_sub_${row.id}`,
+      activeModel: model,
+      providerId: providerFamily,
+      ccPresetId: ccPresetId ?? null,
+      capabilityId: buildSupervisionExecutionCapabilityId(identity),
+      ownerCatalog: true as const,
+    }];
+  });
 }
 
 /**
@@ -436,6 +502,12 @@ sessionMgmtRoutes.get('/:id/sessions/:name/supervision/defaults', async (c) => {
   } catch {
     return c.json({ defaults: null });
   }
+});
+
+sessionMgmtRoutes.get('/:id/sessions/:name/supervision/execution-pool-catalog', async (c) => {
+  const resolved = await resolveSupervisorDefaultsOwner(c);
+  if (!resolved.ok) return resolved.response;
+  return c.json({ sessions: await buildOwnerExecutionPoolCatalog(c, resolved.target) });
 });
 
 sessionMgmtRoutes.put('/:id/sessions/:name/supervision/defaults', async (c) => {

@@ -9,10 +9,12 @@ import {
   CODEX_MODEL_IDS,
   DEFAULT_CODEX_AUTOMATION_MODEL,
 } from '../../../src/shared/models/options.js';
+import { DEFAULT_SUPERVISION_EXECUTION_POOL_CONTROLS } from '../../../shared/supervision-execution-pool.js';
 
 const patchSessionMock = vi.fn();
 const patchSubSessionMock = vi.fn();
 const fetchSupervisorDefaultsMock = vi.fn();
+const fetchExecutionPoolCatalogMock = vi.fn();
 const saveSupervisorDefaultsMock = vi.fn();
 
 vi.mock('react-i18next', () => ({
@@ -35,6 +37,7 @@ vi.mock('../../src/api.js', () => ({
   patchSubSession: (...args: unknown[]) => patchSubSessionMock(...args),
   fetchSupervisorDefaults: (...args: unknown[]) => fetchSupervisorDefaultsMock(...args),
   fetchSessionSupervisorDefaults: (...args: unknown[]) => fetchSupervisorDefaultsMock(...args),
+  fetchSessionSupervisorExecutionPoolCatalog: (...args: unknown[]) => fetchExecutionPoolCatalogMock(...args),
   saveSessionSupervisorDefaults: (_serverId: string, _sessionName: string, value: unknown) => saveSupervisorDefaultsMock(value),
   saveSupervisorDefaults: (...args: unknown[]) => saveSupervisorDefaultsMock(...args),
   getUserPref: () => fetchSupervisorDefaultsMock(),
@@ -100,6 +103,7 @@ describe('SessionSettingsDialog supervision', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     fetchSupervisorDefaultsMock.mockRejectedValue(new Error('no defaults'));
+    fetchExecutionPoolCatalogMock.mockResolvedValue([]);
     saveSupervisorDefaultsMock.mockResolvedValue(undefined);
   });
 
@@ -589,6 +593,119 @@ describe('SessionSettingsDialog supervision', () => {
       ccPresetId: 'preset-a',
     });
     expect(preset).not.toHaveProperty('sessionName');
+  });
+
+  it('shows an owner-authoritative empty-pool catalog to a participant once per constraint and leaves it unchecked', async () => {
+    fetchSupervisorDefaultsMock.mockResolvedValue({
+      backend: 'codex-sdk',
+      model: CODEX_MODEL_IDS[0],
+      executionPools: {
+        state: 'configured',
+        primaryDevelopmentPool: { configs: [], controls: DEFAULT_SUPERVISION_EXECUTION_POOL_CONTROLS.primary },
+        economyTaskPool: { configs: [], controls: DEFAULT_SUPERVISION_EXECUTION_POOL_CONTROLS.economy },
+      },
+    });
+    fetchExecutionPoolCatalogMock.mockResolvedValue([
+      {
+        sessionName: 'deck_sub_cx_one', parentSession: 'deck_proj_brain', type: 'codex-sdk', runtimeType: 'transport',
+        label: 'Cx one', activeModel: 'gpt-5.6', providerId: 'openai', ccPresetId: null,
+        capabilityId: 'supervision-exec-v1:transport:codex-sdk:openai:gpt-5.6', ownerCatalog: true,
+      },
+      {
+        sessionName: 'deck_sub_cx_two', parentSession: 'deck_proj_brain', type: 'codex-sdk', runtimeType: 'transport',
+        label: 'Cx two', activeModel: 'gpt-5.6', providerId: 'openai', ccPresetId: null,
+        capabilityId: 'supervision-exec-v1:transport:codex-sdk:openai:gpt-5.6', ownerCatalog: true,
+      },
+      {
+        sessionName: 'deck_sub_cc_preset', parentSession: 'deck_proj_brain', type: 'claude-code-sdk', runtimeType: 'transport',
+        label: 'CC preset', activeModel: 'minimax-m3', providerId: 'anthropic', ccPresetId: 'preset-a',
+        capabilityId: 'supervision-exec-v1-cc-preset:transport:claude-code-sdk:anthropic:preset-a:minimax-m3', ownerCatalog: true,
+      },
+    ]);
+    render(
+      <SessionSettingsDialog
+        serverId="srv-1"
+        sessionName="deck_proj_brain"
+        label="Brain"
+        description="desc"
+        cwd="/proj"
+        type="codex-sdk"
+        activeModel={CODEX_MODEL_IDS[0]}
+        peerAuditSessions={[]}
+        transportConfig={null}
+        onClose={vi.fn()}
+        onSaved={vi.fn()}
+      />,
+    );
+
+    const primary = screen.getByTestId('supervision-execution-pool-primary');
+    const economy = screen.getByTestId('supervision-execution-pool-economy');
+    const primaryCx = await within(primary).findByLabelText('primary:deck_sub_cx_one,deck_sub_cx_two') as HTMLInputElement;
+    const economyCx = within(economy).getByLabelText('economy:deck_sub_cx_one,deck_sub_cx_two') as HTMLInputElement;
+    const economyPreset = within(economy).getByLabelText('economy:deck_sub_cc_preset') as HTMLInputElement;
+    expect(primaryCx.checked).toBe(false);
+    expect(economyCx.checked).toBe(false);
+    expect(economyPreset.checked).toBe(false);
+    expect(primary.textContent).toContain('×2');
+    await waitFor(() => expect(primary.querySelectorAll('input[type="checkbox"]')).toHaveLength(2));
+
+    fireEvent.click(economyPreset);
+    fireEvent.click(screen.getByRole('button', { name: /save/i }));
+    await waitFor(() => expect(saveSupervisorDefaultsMock).toHaveBeenCalled());
+    const saved = saveSupervisorDefaultsMock.mock.calls.at(-1)?.[0] as {
+      executionPools?: {
+        primaryDevelopmentPool?: { configs?: Array<Record<string, unknown>> };
+        economyTaskPool?: { configs?: Array<Record<string, unknown>> };
+      };
+    };
+    expect(saved.executionPools?.primaryDevelopmentPool?.configs).toEqual([]);
+    expect(saved.executionPools?.economyTaskPool?.configs).toEqual([
+      expect.objectContaining({ ccPresetId: 'preset-a' }),
+    ]);
+  });
+
+  it('clears an owner catalog immediately when the covered session scope changes and the replacement load fails', async () => {
+    fetchSupervisorDefaultsMock.mockResolvedValue(null);
+    fetchExecutionPoolCatalogMock
+      .mockResolvedValueOnce([{
+        sessionName: 'deck_sub_old', parentSession: 'deck_proj_brain', type: 'codex-sdk', runtimeType: 'transport',
+        label: 'Old owner candidate', activeModel: 'gpt-5.6', providerId: 'openai', ccPresetId: null,
+        capabilityId: 'supervision-exec-v1:transport:codex-sdk:openai:gpt-5.6', ownerCatalog: true,
+      }])
+      .mockRejectedValueOnce(new Error('new owner denied'));
+    const view = render(
+      <SessionSettingsDialog
+        serverId="srv-1"
+        sessionName="deck_proj_brain"
+        label="Brain"
+        description="desc"
+        cwd="/proj"
+        type="codex-sdk"
+        peerAuditSessions={[]}
+        transportConfig={null}
+        onClose={vi.fn()}
+        onSaved={vi.fn()}
+      />,
+    );
+    await waitFor(() => expect(screen.getAllByText('Old owner candidate')).toHaveLength(2));
+
+    view.rerender(
+      <SessionSettingsDialog
+        serverId="srv-2"
+        sessionName="deck_other_brain"
+        label="Other"
+        description="desc"
+        cwd="/other"
+        type="codex-sdk"
+        peerAuditSessions={[]}
+        transportConfig={null}
+        onClose={vi.fn()}
+        onSaved={vi.fn()}
+      />,
+    );
+    expect(screen.queryAllByText('Old owner candidate')).toHaveLength(0);
+    await waitFor(() => expect(fetchExecutionPoolCatalogMock).toHaveBeenCalledWith('srv-2', 'deck_other_brain'));
+    expect(screen.queryAllByText('Old owner candidate')).toHaveLength(0);
   });
 
   it('routes each pool add button to the existing sub-session launcher and accepts the new starting session immediately', () => {

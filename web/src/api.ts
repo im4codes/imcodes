@@ -27,6 +27,7 @@ import {
   type SessionSupervisionSnapshot,
   type SupervisorDefaultConfig,
 } from '@shared/supervision-config.js';
+import { normalizeSupervisionExecutionConfig } from '@shared/supervision-execution-pool.js';
 import type { ShareGrantSummary, ShareRole, ShareTarget } from './tab-sharing-ui.js';
 
 let _baseUrl = '';
@@ -1095,6 +1096,79 @@ export async function fetchSessionSupervisorDefaults(
     `/api/server/${encodeURIComponent(serverId)}/sessions/${encodeURIComponent(sessionName)}/supervision/defaults`,
   );
   return parseSupervisorDefaultConfig(response.defaults);
+}
+
+export interface SessionSupervisorExecutionPoolCatalogSession {
+  sessionName: string;
+  parentSession: string;
+  type: string;
+  runtimeType: 'process' | 'transport';
+  label: string;
+  activeModel: string;
+  providerId: string;
+  ccPresetId: string | null;
+  capabilityId: string;
+  ownerCatalog: true;
+}
+
+function parseSessionSupervisorExecutionPoolCatalogSession(
+  value: unknown,
+): SessionSupervisorExecutionPoolCatalogSession | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const source = value as Record<string, unknown>;
+  const exactText = (input: unknown): string | null => (
+    typeof input === 'string' && input.length > 0 && input.trim() === input ? input : null
+  );
+  const sessionName = exactText(source.sessionName);
+  const parentSession = exactText(source.parentSession);
+  const type = exactText(source.type);
+  const label = exactText(source.label);
+  const activeModel = exactText(source.activeModel);
+  const providerId = exactText(source.providerId);
+  const capabilityId = exactText(source.capabilityId);
+  const runtimeType = source.runtimeType === 'process' || source.runtimeType === 'transport'
+    ? source.runtimeType
+    : null;
+  const ccPresetId = source.ccPresetId === null
+    ? null
+    : exactText(source.ccPresetId);
+  if (!sessionName || !parentSession || !type || !label || !activeModel || !providerId
+    || !capabilityId || !runtimeType || source.ownerCatalog !== true
+    || (source.ccPresetId !== null && !ccPresetId)) return null;
+  const config = normalizeSupervisionExecutionConfig({
+    capabilityId,
+    agentType: type,
+    providerFamily: providerId,
+    runtimeType,
+    model: activeModel,
+    ...(ccPresetId ? { ccPresetId } : {}),
+  });
+  if (!config) return null;
+  return {
+    sessionName,
+    parentSession,
+    type,
+    runtimeType,
+    label,
+    activeModel: config.model,
+    providerId,
+    ccPresetId,
+    capabilityId,
+    ownerCatalog: true,
+  };
+}
+
+export async function fetchSessionSupervisorExecutionPoolCatalog(
+  serverId: string,
+  sessionName: string,
+): Promise<SessionSupervisorExecutionPoolCatalogSession[]> {
+  const response = await apiFetch<{ sessions: unknown }>(
+    `/api/server/${encodeURIComponent(serverId)}/sessions/${encodeURIComponent(sessionName)}/supervision/execution-pool-catalog`,
+  );
+  if (!Array.isArray(response.sessions)) return [];
+  return response.sessions
+    .map(parseSessionSupervisorExecutionPoolCatalogSession)
+    .filter((session): session is SessionSupervisorExecutionPoolCatalogSession => session !== null);
 }
 
 export async function saveSessionSupervisorDefaults(
