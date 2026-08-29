@@ -1424,6 +1424,11 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const isShareScopedSession = !!sharedState;
   const canSharedSessionSend = !isShareScopedSession
     || (sharedState?.status === 'active' && sharedState.effectiveRole === 'participant');
+  // Session settings mutate the owner session, so shared access is a positive
+  // role grant rather than a consequence of the menu being reachable. Active
+  // participants use the owner's existing settings surface; viewers and stale
+  // shares remain read-only.
+  const canOpenSessionSettings = canSharedSessionSend;
   // A share viewer cannot dispatch anything, so appending is denied at the
   // bridge too. Offering the control would only produce a rollback plus a raw
   // denial code; participants and owners keep it.
@@ -5264,7 +5269,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                 >
                   {quickSupervisionMode === SUPERVISION_MODE.SUPERVISED_AUDIT ? '● ' : '○ '}{t('session.supervision.mode.supervised_audit')}
                 </button>
-                {!!onSettings && !isShareScopedSession && (
+                {!!onSettings && canOpenSessionSettings && (
                   <>
                     <div class="menu-divider" />
                     <button
@@ -6900,7 +6905,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                 <SessionActionMenuIcon kind="rename" />
                 <span class="session-action-menu-label">{t('session.rename_plain')}</span>
               </button>
-              {onSettings && (
+              {onSettings && canOpenSessionSettings && (
                 <button
                   class="menu-item session-action-menu-item"
                   onClick={() => { onSettings(); setMenuOpen(false); }}
