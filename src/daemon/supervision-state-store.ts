@@ -505,7 +505,7 @@ export interface SupervisionTaskSnapshot extends PersistedSupervisionTaskRecord 
 
 export type SupervisionTaskRegistryResult<T> =
   | { ok: true; value: T; replay?: boolean }
-  | { ok: false; reason: 'invalid' | 'duplicate_task' | 'duplicate_assignment' | 'not_found' | 'invalid_transition' | 'owner_mismatch' | 'old_revision' | 'old_audit_attempt' | 'shared_file_conflict' | 'manifest_mismatch' | 'role_forbidden' | 'ambiguous_assignment' | 'economy_requires_primary_review' };
+  | { ok: false; reason: 'invalid' | 'duplicate_task' | 'duplicate_assignment' | 'not_found' | 'invalid_transition' | 'owner_mismatch' | 'old_revision' | 'old_audit_attempt' | 'manifest_mismatch' | 'role_forbidden' | 'ambiguous_assignment' | 'economy_requires_primary_review' };
 
 function stableTaskId(): string { return `supervision_task_${randomUUID()}`; }
 function stableAssignmentId(): string { return `supervision_assignment_${randomUUID()}`; }
@@ -692,6 +692,10 @@ export class SupervisionTaskRegistry {
       this.#db.exec('ALTER TABLE supervision_tasks ADD COLUMN project_name TEXT;');
     }
     this.#db.exec('CREATE INDEX IF NOT EXISTS supervision_tasks_project_idx ON supervision_tasks(project_name, updated_at);');
+    // File claims predate per-assignment worktrees. They are retained as a
+    // compatibility table so older databases still open, but they are no
+    // longer an admission authority and must not survive into projections.
+    this.#db.exec('DELETE FROM supervision_task_file_claims;');
     this.#reconcileCancelledTaskResources();
   }
 
@@ -711,11 +715,10 @@ export class SupervisionTaskRegistry {
         const task = this.getTaskRecord(taskId);
         if (!task) continue;
         const assignments = this.listAssignments(taskId);
-        const claims = this.listFileClaims(taskId);
         const staleAssignments = assignments.filter((assignment) => (
           assignment.leaseId || !terminal.has(assignment.status)
         ));
-        if (staleAssignments.length === 0 && claims.length === 0 && task.status === 'cancelled') continue;
+        if (staleAssignments.length === 0 && task.status === 'cancelled') continue;
         for (const assignment of staleAssignments) {
           const status = terminal.has(assignment.status) ? assignment.status : 'cancelled';
           this.#writeAssignment({
@@ -732,13 +735,9 @@ export class SupervisionTaskRegistry {
             assignmentStatusPreserved: status !== 'cancelled',
           });
         }
-        if (claims.length > 0) {
-          this.#db.prepare('DELETE FROM supervision_task_file_claims WHERE task_id = ?').run(taskId);
-        }
         this.#writeTask({ ...task, status: 'cancelled', updatedAt: now }, 'cancelled', {
           source: 'startup_cancel_reconcile',
           assignmentsCancelled: staleAssignments.filter((assignment) => !terminal.has(assignment.status)).length,
-          claimsReleased: claims.length,
         });
       }
       this.#db.exec('COMMIT');
@@ -828,9 +827,8 @@ export class SupervisionTaskRegistry {
   }
 
   listFileClaims(taskId: string): PersistedSupervisionTaskFileClaim[] {
-    if (this.#closed) return [];
-    return (this.#db.prepare('SELECT task_id AS taskId, assignment_id AS assignmentId, file_path AS path, claim_mode AS claimMode FROM supervision_task_file_claims WHERE task_id = ? ORDER BY file_path, assignment_id').all(taskId) as Array<Record<string, unknown>>)
-      .map((row) => ({ taskId: String(row.taskId ?? ''), assignmentId: String(row.assignmentId ?? ''), path: String(row.path ?? ''), claimMode: String(row.claimMode ?? 'exclusive') as PersistedSupervisionTaskFileClaim['claimMode'] }));
+    void taskId;
+    return [];
   }
 
   listEvents(taskId: string): PersistedSupervisionTaskEvent[] {
@@ -854,9 +852,8 @@ export class SupervisionTaskRegistry {
   }
 
   findByFile(filePath: string): SupervisionTaskSnapshot[] {
-    if (this.#closed) return [];
-    const rows = this.#db.prepare('SELECT DISTINCT task_id AS taskId FROM supervision_task_file_claims WHERE file_path = ? ORDER BY task_id ASC').all(filePath) as Array<{ taskId?: unknown }>;
-    return rows.map((row) => typeof row.taskId === 'string' ? this.get(row.taskId) : undefined).filter((record): record is SupervisionTaskSnapshot => record !== undefined);
+    void filePath;
+    return [];
   }
 
   createOrGet(input: SupervisionTaskCreateInput): SupervisionTaskRegistryResult<PersistedSupervisionTaskRecord> {
@@ -938,17 +935,6 @@ export class SupervisionTaskRegistry {
     if (!['coordinator','integration_owner','implementer','auditor'].includes(input.role)) return { ok: false, reason: 'invalid' };
     const scopeFiles = normalizeTaskArray(input.scopeFiles);
     if (!scopeFiles.every(validRepoPath)) return { ok: false, reason: 'invalid' };
-    const claimMode = input.role === 'auditor' ? 'read_only' : input.claimMode ?? 'exclusive';
-    if (!['exclusive','shared','read_only'].includes(claimMode)) return { ok: false, reason: 'invalid' };
-    for (const file of scopeFiles) {
-      const existingClaims = this.#db.prepare('SELECT claim_mode AS claimMode FROM supervision_task_file_claims WHERE file_path = ?').all(file) as Array<{ claimMode?: unknown }>;
-      const modes = existingClaims.map((row) => String(row.claimMode ?? ''));
-      if (claimMode === 'exclusive' && modes.length > 0) return { ok: false, reason: 'shared_file_conflict' };
-      if (claimMode === 'shared' && modes.includes('exclusive')) return { ok: false, reason: 'shared_file_conflict' };
-    }
-    if (claimMode === 'shared' && !this.listAssignments(task.taskId).some((assignment) => assignment.role === 'integration_owner')) {
-      return { ok: false, reason: 'shared_file_conflict' };
-    }
     const record: PersistedSupervisionTaskAssignment = {
       version: SUPERVISION_TASK_REGISTRY_DB_VERSION,
       assignmentId,
@@ -973,8 +959,6 @@ export class SupervisionTaskRegistry {
     this.#db.exec('BEGIN IMMEDIATE');
     try {
       this.#writeAssignment(record, 'delegated', { source: 'assignment_start' });
-      const insertClaim = this.#db.prepare('INSERT INTO supervision_task_file_claims (task_id, assignment_id, file_path, claim_mode, created_at) VALUES (?, ?, ?, ?, ?)');
-      for (const file of scopeFiles) insertClaim.run(task.taskId, assignmentId, file, claimMode, now);
       if (record.role === 'integration_owner' && !task.integrationOwnerAssignmentId) {
         this.#writeTask({ ...task, integrationOwnerAssignmentId: assignmentId, status: task.status === 'planned' ? 'delegated' : task.status, updatedAt: now }, 'delegated', { source: 'integration_owner_assignment' });
       } else if (task.status === 'planned') {
@@ -1058,8 +1042,8 @@ export class SupervisionTaskRegistry {
    * intent to the assignment's stale `delegated` status even when the task and
    * a matching auditor PASS had advanced. That edge was unreachable forever.
    * This method binds the exact revision/attempt, derives the role-specific
-   * destination, and revokes this assignment's lease + claims in one SQLite
-   * transaction. It never treats a read-only scope count as audit evidence.
+   * destination and revokes this assignment's lease in one SQLite transaction.
+   * Scope metadata is never treated as audit evidence or an admission lock.
    */
   finishAssignment(input: SupervisionTaskAssignmentFinishInput): SupervisionTaskRegistryResult<PersistedSupervisionTaskAssignment> {
     const existing = this.getAssignment(input.assignmentId);
@@ -1100,9 +1084,7 @@ export class SupervisionTaskRegistry {
       targetStatus = 'ready_for_integration';
     }
 
-    const claims = this.listFileClaims(existing.taskId)
-      .filter((claim) => claim.assignmentId === existing.assignmentId);
-    const alreadyApplied = existing.status === targetStatus && !existing.leaseId && claims.length === 0;
+    const alreadyApplied = existing.status === targetStatus && !existing.leaseId;
     if (alreadyApplied) return { ok: true, value: existing, replay: true };
 
     const now = input.now ?? Date.now();
@@ -1123,7 +1105,6 @@ export class SupervisionTaskRegistry {
       this.#writeAssignment(record, targetStatus === 'ready_for_integration' ? 'ready_for_integration' : 'finalized', {
         source: 'assignment_finish',
         leaseRevoked: true,
-        claimsReleased: claims.length,
         ...(matchingAudit ? {
           matchingAuditAssignmentId: matchingAudit.assignmentId,
           auditAttemptId: matchingAudit.auditAttemptId,
@@ -1131,8 +1112,6 @@ export class SupervisionTaskRegistry {
         } : {}),
         ...(normalizeTaskString(input.evidence) ? { evidence: normalizeTaskString(input.evidence) } : {}),
       });
-      this.#db.prepare('DELETE FROM supervision_task_file_claims WHERE task_id = ? AND assignment_id = ?')
-        .run(existing.taskId, existing.assignmentId);
       this.#deriveTaskStatus(existing.taskId, now);
       this.#db.exec('COMMIT');
       return { ok: true, value: record };
@@ -1352,9 +1331,8 @@ export class SupervisionTaskRegistry {
           return { ok: false, reason: 'not_found' };
         }
         const assignments = this.listAssignments(input.taskId);
-        const claims = this.listFileClaims(input.taskId);
         const terminal = new Set<SupervisionTaskLifecycleStatus>(['finalized', 'pushed', 'cancelled']);
-        let changed = current.status !== 'cancelled' || claims.length > 0;
+        let changed = current.status !== 'cancelled';
         for (const assignment of assignments) {
           const nextStatus = terminal.has(assignment.status) ? assignment.status : 'cancelled';
           if (assignment.leaseId || assignment.status !== nextStatus) {
@@ -1374,9 +1352,6 @@ export class SupervisionTaskRegistry {
             });
           }
         }
-        if (claims.length > 0) {
-          this.#db.prepare('DELETE FROM supervision_task_file_claims WHERE task_id = ?').run(input.taskId);
-        }
         const record: PersistedSupervisionTaskRecord = changed
           ? { ...current, status: 'cancelled', updatedAt: now }
           : current;
@@ -1386,7 +1361,6 @@ export class SupervisionTaskRegistry {
             intent: input.intent,
             status: 'cancelled',
             assignmentsCancelled: assignments.filter((assignment) => !terminal.has(assignment.status)).length,
-            claimsReleased: claims.length,
             ...(input.note ? { note: input.note } : {}),
           });
         }
@@ -1467,9 +1441,9 @@ export class SupervisionTaskRegistry {
   }): SupervisionTaskRegistryResult<PersistedSupervisionTaskRecord> {
     const task = this.getTaskRecord(input.taskId);
     if (!task) return { ok: false, reason: 'not_found' };
-    // Administrative cancellation is also a resource-recovery operation. Use
-    // the same atomic path as a participant cancel so stale delegated leases
-    // and claims cannot survive after the task itself is terminal.
+    // Administrative cancellation uses the same atomic lifecycle path as a
+    // participant cancel so stale delegated leases cannot survive after the
+    // task itself is terminal.
     if (input.toStatus === 'cancelled') {
       return this.applyTaskIntent({
         taskId: input.taskId,
@@ -1497,7 +1471,6 @@ export class SupervisionTaskRegistry {
     if (assignment.role === 'auditor') return { ok: false, reason: 'role_forbidden' };
     const path = normalizeTaskString(input.path);
     if (!path || !validRepoPath(path)) return { ok: false, reason: 'invalid' };
-    const claim = this.listFileClaims(assignment.taskId).find((item) => item.assignmentId === assignment.assignmentId && item.path === path);
     const now = input.now ?? Date.now();
     const key = normalizeTaskString(input.idempotencyKey);
     const idem = key ? `file_event\0${assignment.assignmentId}\0${key}` : '';
@@ -1505,16 +1478,10 @@ export class SupervisionTaskRegistry {
       const row = this.#db.prepare('SELECT assignment_id AS assignmentId FROM supervision_task_idempotency WHERE idempotency_key = ?').get(idem) as { assignmentId?: unknown } | undefined;
       if (typeof row?.assignmentId === 'string') return { ok: true, value: assignment, replay: true };
     }
-    if (!claim || claim.claimMode === 'read_only') {
-      const blocked = { ...assignment, status: 'blocked' as const, blocker: `scope_violation:${path}`, updatedAt: now };
-      this.#writeAssignment(blocked, 'scope_violation', { path, operation: input.operation, source: input.source ?? input.tool ?? 'unknown' });
-      const task = this.getTaskRecord(assignment.taskId);
-      if (task && task.status !== 'blocked') this.#writeTask({ ...task, status: 'blocked', blocker: `scope_violation:${path}`, updatedAt: now }, 'scope_violation', { assignmentId: assignment.assignmentId, path });
-      return { ok: false, reason: 'manifest_mismatch' };
-    }
+    const declaredInAssignment = assignment.scopeFiles.includes(path);
     this.#db.prepare(`INSERT INTO supervision_task_file_events (task_id, assignment_id, file_path, operation, before_hash, after_hash, tool, source, session_name, session_instance_id, runtime_epoch, agent_type, provider_family, payload_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-      .run(assignment.taskId, assignment.assignmentId, path, input.operation, normalizeTaskString(input.beforeHash) ?? null, normalizeTaskString(input.afterHash) ?? null, normalizeTaskString(input.tool) ?? null, normalizeTaskString(input.source) ?? null, input.identity.sessionName, input.identity.sessionInstanceId, input.identity.runtimeEpoch, input.identity.agentType, input.identity.providerFamily, JSON.stringify({ claimMode: claim.claimMode }), now);
-    this.#appendEvent(assignment.taskId, assignment.assignmentId, 'file_event', assignment.status, { path, operation: input.operation, claimMode: claim.claimMode }, now);
+      .run(assignment.taskId, assignment.assignmentId, path, input.operation, normalizeTaskString(input.beforeHash) ?? null, normalizeTaskString(input.afterHash) ?? null, normalizeTaskString(input.tool) ?? null, normalizeTaskString(input.source) ?? null, input.identity.sessionName, input.identity.sessionInstanceId, input.identity.runtimeEpoch, input.identity.agentType, input.identity.providerFamily, JSON.stringify({ declaredInAssignment }), now);
+    this.#appendEvent(assignment.taskId, assignment.assignmentId, 'file_event', assignment.status, { path, operation: input.operation, declaredInAssignment }, now);
     if (idem) this.#db.prepare('INSERT INTO supervision_task_idempotency (idempotency_key, task_id, assignment_id, created_at) VALUES (?, ?, ?, ?)').run(idem, assignment.taskId, assignment.assignmentId, now);
     return { ok: true, value: { ...assignment, updatedAt: now } };
   }
@@ -1522,8 +1489,7 @@ export class SupervisionTaskRegistry {
   reconcileScope(input: SupervisionTaskScopeReconcileInput): SupervisionTaskRegistryResult<SupervisionTaskSnapshot> {
     const task = this.getTaskRecord(input.taskId);
     if (!task) return { ok: false, reason: 'not_found' };
-    const claims = this.listFileClaims(task.taskId);
-    const declared = new Set(claims.map((claim) => claim.path));
+    const declared = new Set(this.listAssignments(task.taskId).flatMap((assignment) => assignment.scopeFiles));
     const actual = normalizeTaskArray([...(input.trackedPaths ?? []), ...(input.untrackedPaths ?? []), ...(input.deletedPaths ?? [])]);
     const extra = actual.find((path) => !declared.has(path));
     const now = input.now ?? Date.now();

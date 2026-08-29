@@ -54,7 +54,7 @@ async function callList(client: Client): Promise<Record<string, unknown>> {
 }
 
 /** A task the caller participates in, so LIST has something real to project. */
-function seedTaskOwnedByCaller(taskKey: string): string {
+function seedTaskOwnedByCaller(taskKey: string, scopeFiles: string[] = []): string {
   const registry = getSupervisionTaskRegistry();
   const task = registry.createOrGet({ objective: `objective ${taskKey}`, idempotencyKey: taskKey });
   if (!task.ok) throw new Error(`seed failed: ${task.reason}`);
@@ -68,6 +68,7 @@ function seedTaskOwnedByCaller(taskKey: string): string {
       agentType: 'codex-sdk',
       providerFamily: 'codex',
     },
+    scopeFiles,
     idempotencyKey: taskKey,
   });
   if (!assignment.ok) throw new Error(`assignment failed: ${assignment.reason}`);
@@ -111,5 +112,24 @@ describe('supervision registry binding', () => {
     // Reading it through the port at all is the point -- a stale handle could
     // not answer.
     expect(port.getStatus(reseededTaskId)).toBe('delegated');
+  });
+
+  it('keeps the production registry bound while overlapping scopes remain claim-free', async () => {
+    const firstTaskId = seedTaskOwnedByCaller('overlap-first', ['src/shared.ts']);
+    const secondTaskId = seedTaskOwnedByCaller('overlap-second', ['src/shared.ts']);
+    const registry = getSupervisionTaskRegistry();
+    expect(registry.get(firstTaskId)?.fileClaims).toEqual([]);
+    expect(registry.get(secondTaskId)?.fileClaims).toEqual([]);
+    expect(registry.findByFile('src/shared.ts')).toEqual([]);
+
+    const { client, close } = await connectProductionServer();
+    try {
+      const result = await callList(client);
+      expect(result.status).toBe('ok');
+      expect((result.tasks as { taskId: string }[]).map((task) => task.taskId))
+        .toEqual(expect.arrayContaining([firstTaskId, secondTaskId]));
+    } finally {
+      await close();
+    }
   });
 });

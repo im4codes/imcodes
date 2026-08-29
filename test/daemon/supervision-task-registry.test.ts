@@ -107,7 +107,7 @@ beforeEach(() => {
 });
 
 describe('SupervisionTaskRegistry', () => {
-  it('repairs a legacy cancelled task with delegated lease and twelve retained claims on reopen', () => {
+  it('retires legacy claim rows while repairing a cancelled task with a delegated lease on reopen', () => {
     const dir = mkdtempSync(join(tmpdir(), 'imcodes-cancelled-reconcile-'));
     const dbPath = join(dir, 'supervision-state.sqlite');
     const paths = Array.from({ length: 12 }, (_, index) => `src/legacy-claim-${index + 1}.ts`);
@@ -123,14 +123,25 @@ describe('SupervisionTaskRegistry', () => {
       expect(delegated).toMatchObject({ ok: true, value: { status: 'delegated', leaseId: expect.any(String) } });
 
       // Reproduce the old non-atomic write: task cancellation committed while
-      // assignment/lease/claims remained untouched.
+      // the assignment/lease remained untouched.
       expect(registry.updateTask({ taskId: 'task-legacy-cancelled', status: 'cancelled' }).ok).toBe(true);
       expect(registry.get('task-legacy-cancelled')).toMatchObject({
         status: 'cancelled',
         assignments: [expect.objectContaining({ status: 'delegated', leaseId: expect.any(String) })],
       });
-      expect(registry.listFileClaims('task-legacy-cancelled')).toHaveLength(12);
       registry.close();
+
+      // Seed rows using the retired on-disk format. New assignments no longer
+      // write these rows and public queries never expose them as authority.
+      const legacyDb = new DatabaseSync(dbPath);
+      const insertLegacyClaim = legacyDb.prepare(
+        'INSERT INTO supervision_task_file_claims (task_id, assignment_id, file_path, claim_mode, created_at) VALUES (?, ?, ?, ?, ?)',
+      );
+      for (const path of paths) {
+        insertLegacyClaim.run('task-legacy-cancelled', 'assignment-legacy-delegated', path, 'exclusive', 1);
+      }
+      expect((legacyDb.prepare('SELECT COUNT(*) AS count FROM supervision_task_file_claims').get() as { count: number }).count).toBe(12);
+      legacyDb.close();
 
       registry = new SupervisionTaskRegistry({ dbPath });
       expect(registry.getAssignment('assignment-legacy-delegated')).toMatchObject({
@@ -140,8 +151,8 @@ describe('SupervisionTaskRegistry', () => {
       const repairedEventCount = registry.listEvents('task-legacy-cancelled').length;
       registry.close();
 
-      // A second startup is a true no-op, and the released paths can be
-      // claimed immediately by replacement work.
+      // A second startup is a true no-op, and overlapping replacement work is
+      // admitted because its worktree, not this legacy table, is authoritative.
       registry = new SupervisionTaskRegistry({ dbPath });
       expect(registry.listEvents('task-legacy-cancelled')).toHaveLength(repairedEventCount);
       expect(registry.createOrGet({
@@ -328,30 +339,35 @@ describe('SupervisionTaskRegistry', () => {
 
     const item = registry.get('task-top');
     expect(item?.assignments.map((assignment) => assignment.identity.sessionName)).toEqual(['deck_sub_a', 'deck_sub_b']);
-    expect(item?.fileClaims.map((claim) => `${claim.path}:${claim.claimMode}`)).toEqual(['src/a.ts:exclusive', 'src/b.ts:exclusive']);
+    expect(item?.fileClaims).toEqual([]);
     registry.close();
   });
 
-  it('rejects illegal exclusive overlaps but permits explicit shared claims with an integration owner', () => {
-    const registry = makeRegistry();
+  it('admits overlapping assignment metadata without creating or exposing file claims', () => {
+    const database = new DatabaseSync(':memory:');
+    const registry = new SupervisionTaskRegistry({ database });
     registry.createOrGet({ taskId: 'task-shared', topLevelTaskId: 'top', objective: 'shared file', classification: 'integration_task' });
     registry.createAssignment({ taskId: 'task-shared', role: 'integration_owner', identity: identity('deck_brain'), required: true });
     expect(registry.createAssignment({ taskId: 'task-shared', role: 'implementer', identity: identity('deck_sub_a'), scopeFiles: ['shared/x.ts'], claimMode: 'shared' }).ok).toBe(true);
     expect(registry.createAssignment({ taskId: 'task-shared', role: 'implementer', identity: identity('deck_sub_b'), scopeFiles: ['shared/x.ts'], claimMode: 'shared' }).ok).toBe(true);
-    expect(registry.findByFile('shared/x.ts')?.[0]?.fileClaims).toHaveLength(2);
+    expect(registry.findByFile('shared/x.ts')).toEqual([]);
+    expect(registry.listFileClaims('task-shared')).toEqual([]);
 
     registry.createOrGet({ taskId: 'task-exclusive', topLevelTaskId: 'top2', objective: 'exclusive', classification: 'integration_slice' });
     expect(registry.createAssignment({ taskId: 'task-exclusive', role: 'implementer', identity: identity('deck_sub_c'), scopeFiles: ['src/y.ts'], claimMode: 'exclusive' }).ok).toBe(true);
-    expect(registry.createAssignment({ taskId: 'task-exclusive', role: 'implementer', identity: identity('deck_sub_d'), scopeFiles: ['src/y.ts'], claimMode: 'exclusive' })).toEqual({ ok: false, reason: 'shared_file_conflict' });
+    expect(registry.createAssignment({ taskId: 'task-exclusive', role: 'implementer', identity: identity('deck_sub_d'), scopeFiles: ['src/y.ts'], claimMode: 'exclusive' })).toMatchObject({ ok: true });
+    expect(registry.listFileClaims('task-exclusive')).toEqual([]);
+    expect((database.prepare('SELECT COUNT(*) AS count FROM supervision_task_file_claims').get() as { count: number }).count).toBe(0);
     registry.close();
+    database.close();
   });
 
-  it('binds file events to assignment runtime, blocks auditor writes, stale runtime and outside-scope drift', () => {
+  it('binds file events to assignment runtime without using scope claims as a write gate', () => {
     const registry = makeRegistry();
     registry.createOrGet({ taskId: 'task-files', objective: 'file hooks' });
     const implementer = identity('deck_sub_impl');
     const auditor = identity('deck_sub_audit', 'claude-code-sdk');
-    const impl = registry.createAssignment({ taskId: 'task-files', role: 'implementer', identity: implementer, scopeFiles: ['src/ok.ts'], claimMode: 'exclusive' });
+    const impl = registry.createAssignment({ taskId: 'task-files', role: 'implementer', identity: implementer, scopeFiles: ['src/ok.ts'], claimMode: 'read_only' });
     const audit = registry.createAssignment({ taskId: 'task-files', role: 'auditor', identity: auditor, scopeFiles: ['src/ok.ts'] });
     if (!impl.ok || !audit.ok) throw new Error('assignments should create');
 
@@ -362,8 +378,8 @@ describe('SupervisionTaskRegistry', () => {
     expect(first.ok).toBe(true);
     expect(replay).toMatchObject({ ok: true, replay: true });
     expect(registry.listFileEvents('task-files')).toHaveLength(1);
-    expect(registry.recordFileEvent({ assignmentId: impl.value.assignmentId, identity: implementer, path: 'src/out.ts', operation: 'create' })).toEqual({ ok: false, reason: 'manifest_mismatch' });
-    expect(registry.get('task-files')?.status).toBe('blocked');
+    expect(registry.recordFileEvent({ assignmentId: impl.value.assignmentId, identity: implementer, path: 'src/out.ts', operation: 'create' })).toMatchObject({ ok: true });
+    expect(registry.get('task-files')).toMatchObject({ status: 'delegated', touchedFiles: ['src/ok.ts', 'src/out.ts'] });
     registry.close();
   });
 
@@ -435,7 +451,7 @@ describe('SupervisionTaskRegistry', () => {
     const parent = registry.get('cc1-complete-macos-build-graph');
     expect(slice?.status).toBe('ready_for_integration');
     expect(slice?.assignments[0]).toMatchObject({ status: 'ready_for_integration', auditAttemptId: 'macos-auto-unlock-isolation-audit-20260827-cx6-r3-1947bf', verdict: 'PASS' });
-    expect(slice?.fileClaims).toHaveLength(7);
+    expect(slice?.fileClaims).toEqual([]);
     expect(parent?.status).toBe('delegated');
     expect(parent?.assignments[0]?.role).toBe('integration_owner');
     registry.close();
@@ -510,9 +526,9 @@ describe('SupervisionTaskRegistry', () => {
     const one = registry.createAssignment({ taskId: 'task-one', role: 'implementer', identity: same, scopeFiles: ['src/one.ts'], idempotencyKey: 'one' });
     const two = registry.createAssignment({ taskId: 'task-two', role: 'implementer', identity: same, scopeFiles: ['src/two.ts'], idempotencyKey: 'two' });
     if (!one.ok || !two.ok) throw new Error('assignments should create');
-    expect(registry.recordFileEvent({ assignmentId: one.value.assignmentId, identity: same, path: 'src/two.ts', operation: 'modify' })).toEqual({ ok: false, reason: 'manifest_mismatch' });
+    expect(registry.recordFileEvent({ assignmentId: one.value.assignmentId, identity: same, path: 'src/two.ts', operation: 'modify' })).toMatchObject({ ok: true });
     expect(registry.recordFileEvent({ assignmentId: two.value.assignmentId, identity: same, path: 'src/two.ts', operation: 'modify' }).ok).toBe(true);
-    expect(registry.get('task-one')?.status).toBe('blocked');
+    expect(registry.get('task-one')).toMatchObject({ status: 'delegated', touchedFiles: ['src/two.ts'] });
     expect(registry.get('task-two')?.touchedFiles).toEqual(['src/two.ts']);
     registry.close();
   });
@@ -832,8 +848,8 @@ describe('SupervisionTaskRegistry', () => {
     })).toMatchObject({ status: 'ok', fromStatus: 'validated', toStatus: 'ready_for_audit' });
 
     // A persisted structured verdict is the evidence. The auditor can still be
-    // in the legacy delegated state and can hold seven read-only claims; neither
-    // status skew nor claim count may erase/substitute the exact revision bind.
+    // in the legacy delegated state; status skew and scope metadata cannot
+    // erase/substitute the exact revision bind.
     expect(registry.updateAssignment({
       assignmentId: auditor.value.assignmentId,
       identity: auditorIdentity,
@@ -854,7 +870,7 @@ describe('SupervisionTaskRegistry', () => {
     expect(registry.getAssignment(implementer.value.assignmentId)).toMatchObject({
       status: 'ready_for_audit', leaseId: expect.stringMatching(/^supervision_lease_/),
     });
-    expect(registry.listFileClaims('matching-pass-close').filter((claim) => claim.assignmentId === implementer.value.assignmentId)).toHaveLength(5);
+    expect(registry.listFileClaims('matching-pass-close')).toEqual([]);
 
     await expect(ownerTaskTools[MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_FINISH]({
       assignmentId: implementer.value.assignmentId,
@@ -868,8 +884,7 @@ describe('SupervisionTaskRegistry', () => {
       },
     });
     expect(registry.get('matching-pass-close')).toMatchObject({ status: 'ready_for_integration' });
-    expect(registry.listFileClaims('matching-pass-close').filter((claim) => claim.assignmentId === implementer.value.assignmentId)).toEqual([]);
-    expect(registry.listFileClaims('matching-pass-close').filter((claim) => claim.assignmentId === auditor.value.assignmentId)).toHaveLength(7);
+    expect(registry.listFileClaims('matching-pass-close')).toEqual([]);
 
     const auditorIntent = createSupervisionMcpToolHandlers(
       { sessionName: auditorIdentity.sessionName } as never,
@@ -1044,7 +1059,7 @@ describe('SupervisionTaskRegistry', () => {
     expect(registry.list()).toHaveLength(2);
   });
 
-  it('atomically cancels unfinished assignments, revokes leases/claims, and frees files after SQLite reopen', async () => {
+  it('atomically cancels unfinished assignments and revokes leases without claim authority after SQLite reopen', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'supervision-cancel-release-'));
     const dbPath = join(dir, 'registry.sqlite');
     let registry = new SupervisionTaskRegistry({ dbPath });
@@ -1104,7 +1119,7 @@ describe('SupervisionTaskRegistry', () => {
           status: 'delegated',
           leaseId: expect.stringMatching(/^supervision_lease_/),
         })],
-        fileClaims: [expect.objectContaining({ path: 'src/unrelated.ts' })],
+        fileClaims: [],
       });
 
       const eventsAfterFirstCancel = registry.listEvents('cancel-me').length;
@@ -1126,7 +1141,7 @@ describe('SupervisionTaskRegistry', () => {
       expect(registry.createAssignment({
         taskId: 'integration-now', role: 'implementer', identity: identity('deck_alpha_w3'),
         scopeFiles: ['src/unrelated.ts'], claimMode: 'exclusive',
-      })).toEqual({ ok: false, reason: 'shared_file_conflict' });
+      })).toMatchObject({ ok: true });
 
       // The restricted admin recovery path must close the same stale-resource
       // shape rather than changing only the task row.
