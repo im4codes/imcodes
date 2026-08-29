@@ -62,7 +62,7 @@ export function createSupervisionRegistryPort(): SupervisionRegistryPort {
     list: (filter) => getSupervisionTaskRegistry().list(filter as never) as never,
     get: (taskId) => getSupervisionTaskRegistry().get(taskId) as never,
     recover: (input) => {
-      getSupervisionTaskRegistry().recoverTask(input);
+      return getSupervisionTaskRegistry().recoverTask(input);
     },
   };
 }

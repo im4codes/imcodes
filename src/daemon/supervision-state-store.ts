@@ -1325,7 +1325,9 @@ export class SupervisionTaskRegistry {
   #deriveTaskStatus(taskId: string, now: number): void {
     const task = this.getTaskRecord(taskId);
     if (!task) return;
-    const required = this.listAssignments(taskId).filter((assignment) => assignment.required && assignment.role !== 'auditor');
+    const required = this.listAssignments(taskId).filter((assignment) => (
+      assignment.required && assignment.role !== 'auditor' && assignment.status !== 'cancelled'
+    ));
     if (required.length === 0) return;
     const next = required.every((assignment) => assignment.status === 'finalized')
       ? 'finalized'
@@ -1390,6 +1392,58 @@ export class SupervisionTaskRegistry {
   }): SupervisionTaskRegistryResult<PersistedSupervisionTaskRecord> {
     const task = this.getTaskRecord(input.taskId);
     if (!task) return { ok: false, reason: 'not_found' };
+    if (input.intent === 'cancel' && input.toStatus === 'cancelled' && input.assignmentId) {
+      const assignment = this.getAssignment(input.assignmentId);
+      if (!assignment || assignment.taskId !== input.taskId) return { ok: false, reason: 'not_found' };
+      if (assignment.status === 'finalized' || assignment.status === 'pushed') {
+        return { ok: false, reason: 'invalid_transition' };
+      }
+      const alreadyCancelled = assignment.status === 'cancelled' && !assignment.leaseId;
+      if (alreadyCancelled) return { ok: true, value: task, replay: true };
+
+      const now = Date.now();
+      this.#db.exec('BEGIN IMMEDIATE');
+      try {
+        this.#writeAssignment({
+          ...assignment,
+          status: 'cancelled',
+          leaseId: '',
+          ...(input.note?.trim() ? { blocker: input.note.trim() } : {}),
+          updatedAt: now,
+        }, 'cancelled', {
+          source: 'assignment_cancel',
+          leaseRevoked: true,
+        });
+
+        const currentTask = this.getTaskRecord(input.taskId)!;
+        if (currentTask.integrationOwnerAssignmentId === assignment.assignmentId) {
+          const replacements = this.listAssignments(input.taskId)
+            .filter((candidate) => candidate.role === 'integration_owner'
+              && candidate.assignmentId !== assignment.assignmentId
+              && candidate.status !== 'cancelled')
+            .sort((left, right) => right.createdAt - left.createdAt
+              || right.assignmentId.localeCompare(left.assignmentId));
+          const replacement = replacements[0];
+          this.#writeTask({
+            ...currentTask,
+            integrationOwnerAssignmentId: replacement?.assignmentId,
+            updatedAt: now,
+          }, this.#taskEventFor(currentTask.status), {
+            source: 'assignment_cancel',
+            cancelledAssignmentId: assignment.assignmentId,
+            ...(replacement ? { replacementIntegrationOwnerAssignmentId: replacement.assignmentId } : {}),
+          });
+        }
+        // A cancelled assignment is retired from the aggregate; it must not
+        // erase a replacement owner's completed state or its audit evidence.
+        this.#deriveTaskStatus(input.taskId, now);
+        this.#db.exec('COMMIT');
+        return { ok: true, value: this.getTaskRecord(input.taskId)! };
+      } catch (error) {
+        this.#db.exec('ROLLBACK');
+        throw error;
+      }
+    }
     if (input.intent === 'cancel' && input.toStatus === 'cancelled') {
       const now = Date.now();
       this.#db.exec('BEGIN IMMEDIATE');
@@ -1510,6 +1564,71 @@ export class SupervisionTaskRegistry {
   }): SupervisionTaskRegistryResult<PersistedSupervisionTaskRecord> {
     const task = this.getTaskRecord(input.taskId);
     if (!task) return { ok: false, reason: 'not_found' };
+    const reason = normalizeTaskString(input.reason);
+    if (!reason) return { ok: false, reason: 'invalid' };
+    if (task.status === 'cancelled' && input.toStatus === 'recovered') {
+      const revision = normalizeTaskString(task.currentRevision);
+      if (!revision) return { ok: false, reason: 'old_revision' };
+      const assignments = this.listAssignments(task.taskId);
+      const exactPassAudits = assignments.filter((assignment) => (
+        assignment.role === 'auditor'
+        && assignment.status === 'finalized'
+        && assignment.verdict?.trim().toUpperCase() === 'PASS'
+        && assignment.auditRevision === revision
+        && Boolean(assignment.auditAttemptId)
+      ));
+      const candidates = assignments.filter((assignment) => (
+        assignment.role === 'integration_owner'
+        && assignment.required
+        && assignment.status === 'cancelled'
+        && !assignment.leaseId
+        && assignment.verdict?.trim().toUpperCase() === 'PASS'
+        && assignment.auditRevision === revision
+        && assignment.crossVendorAuditPassed === true
+        && exactPassAudits.some((audit) => audit.auditAttemptId === assignment.auditAttemptId)
+      )).sort((left, right) => right.createdAt - left.createdAt
+        || right.assignmentId.localeCompare(left.assignmentId));
+      const replacement = candidates[0];
+      if (!replacement) return { ok: false, reason: 'old_revision' };
+      if (candidates[1]?.createdAt === replacement.createdAt) {
+        return { ok: false, reason: 'ambiguous_assignment' };
+      }
+
+      const now = Date.now();
+      this.#db.exec('BEGIN IMMEDIATE');
+      try {
+        this.#writeAssignment({
+          ...replacement,
+          status: 'ready_for_integration',
+          blocker: undefined,
+          updatedAt: now,
+        }, 'recovered', {
+          source: 'cancelled_task_evidence_recovery',
+          reason,
+          revision,
+          auditAttemptId: replacement.auditAttemptId,
+        });
+        const recovered: PersistedSupervisionTaskRecord = {
+          ...task,
+          integrationOwnerAssignmentId: replacement.assignmentId,
+          status: 'ready_for_integration',
+          blocker: undefined,
+          updatedAt: now,
+        };
+        this.#writeTask(recovered, 'recovered', {
+          source: 'cancelled_task_evidence_recovery',
+          reason,
+          replacementIntegrationOwnerAssignmentId: replacement.assignmentId,
+          revision,
+          auditAttemptId: replacement.auditAttemptId,
+        });
+        this.#db.exec('COMMIT');
+        return { ok: true, value: recovered };
+      } catch (error) {
+        this.#db.exec('ROLLBACK');
+        throw error;
+      }
+    }
     // Administrative cancellation uses the same atomic lifecycle path as a
     // participant cancel so stale delegated leases cannot survive after the
     // task itself is terminal.
@@ -1518,17 +1637,17 @@ export class SupervisionTaskRegistry {
         taskId: input.taskId,
         intent: 'cancel',
         toStatus: 'cancelled',
-        note: input.reason,
+        note: reason,
       });
     }
     const record: PersistedSupervisionTaskRecord = {
       ...task,
       status: input.toStatus,
       updatedAt: Date.now(),
-      ...(input.toStatus === 'blocked' ? { blocker: input.reason } : {}),
+      ...(input.toStatus === 'blocked' ? { blocker: reason } : {}),
     };
     this.#writeTask(record, this.#taskEventFor(input.toStatus), {
-      source: 'admin_recovery', reason: input.reason, status: input.toStatus,
+      source: 'admin_recovery', reason, status: input.toStatus,
     });
     return { ok: true, value: record };
   }

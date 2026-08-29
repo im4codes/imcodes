@@ -42,9 +42,9 @@ type ToolResult = Record<string, unknown>;
 export const SUPERVISION_RECOVERY_TARGET_STATUSES = ['recovered', 'blocked', 'cancelled'] as const;
 export type SupervisionRecoveryTargetStatus = typeof SUPERVISION_RECOVERY_TARGET_STATUSES[number];
 
-/** Recovery may not resurrect a task that already reached a shipped terminal. */
+/** Recovery may not move a shipped terminal. Cancelled recovery is evidence-derived below. */
 const RECOVERY_FORBIDDEN_SOURCES: readonly SupervisionTaskLifecycleStatus[] =
-  Object.freeze(['finalized', 'pushed', 'cancelled']);
+  Object.freeze(['finalized', 'pushed']);
 
 /**
  * Minimal shape the visibility guards need. Mirrors the registry snapshot so no
@@ -52,6 +52,7 @@ const RECOVERY_FORBIDDEN_SOURCES: readonly SupervisionTaskLifecycleStatus[] =
  */
 export interface SupervisionVisibilityItem {
   taskId?: string;
+  projectName?: string;
   status?: string;
   assignments?: ReadonlyArray<{
     assignmentId?: string;
@@ -122,7 +123,10 @@ export interface SupervisionRegistryPort {
   }): { ok: true; value: unknown; replay?: boolean } | { ok: false; reason: string };
   list(filter: { projectName?: string; status?: string; topLevelTaskId?: string; ownerSessionName?: string }): SupervisionVisibilityItem[];
   get(taskId: string): SupervisionVisibilityItem | undefined;
-  recover(input: { taskId: string; toStatus: SupervisionRecoveryTargetStatus; reason: string }): void;
+  recover(input: { taskId: string; toStatus: SupervisionRecoveryTargetStatus; reason: string }):
+    | void
+    | { ok: true; value?: { status?: string }; replay?: boolean }
+    | { ok: false; reason: string };
 }
 
 export interface SupervisionMcpToolDeps {
@@ -177,7 +181,7 @@ const DESCRIPTIONS: Record<SupervisionMcpToolName, string> = {
   [SUPERVISION_MCP_TOOLS.INTENT]: 'Advance a supervision task by intent; the daemon owns the status.',
   [SUPERVISION_MCP_TOOLS.LIST]: 'List project tasks for its Brain, otherwise tasks you participate in.',
   [SUPERVISION_MCP_TOOLS.GET]: 'Read a project task as its Brain, otherwise a task you participate in.',
-  [SUPERVISION_MCP_TOOLS.RECOVER]: 'Admin recovery to a restricted status.',
+  [SUPERVISION_MCP_TOOLS.RECOVER]: 'Restricted task recovery.',
 };
 
 export function createSupervisionMcpToolHandlers(
@@ -325,20 +329,32 @@ export function createSupervisionMcpToolHandlers(
       const input = (args ?? {}) as Record<string, unknown>;
       const reg = need();
       if (!reg) return err('unavailable', 'supervision registry not bound');
-      if (!isAdmin(caller)) return err('forbidden', 'administrative recovery is not authorized for this caller');
       const target = String(input.toStatus ?? '');
       if (!(SUPERVISION_RECOVERY_TARGET_STATUSES as readonly string[]).includes(target)) {
         return err('invalid_target_status', 'recovery target must be a restricted enum member');
       }
-      const current = reg.getStatus(String(input.taskId ?? ''));
+      const taskId = String(input.taskId ?? '');
+      const current = reg.getStatus(taskId);
+      const task = reg.get(taskId);
+      const taskProjectName = typeof task?.projectName === 'string' ? task.projectName : '';
+      const evidenceRecovery = current === 'cancelled' && target === 'recovered';
+      const projectBrainMayRecover = evidenceRecovery
+        && Boolean(caller.projectName)
+        && caller.projectName === taskProjectName
+        && isProjectBrain(caller);
+      if (!isAdmin(caller) && !projectBrainMayRecover) {
+        return err('forbidden', 'administrative recovery is not authorized for this caller');
+      }
       if (!current || !isSupervisionTaskLifecycleStatus(current)) return err('unknown_task');
       if (RECOVERY_FORBIDDEN_SOURCES.includes(current)) {
         return err('illegal_transition', `recovery cannot move a ${current} task`);
       }
       const reason = String(input.reason ?? '').trim();
       if (!reason) return err('reason_required');
-      reg.recover({ taskId: String(input.taskId), toStatus: target as SupervisionRecoveryTargetStatus, reason });
-      return ok({ taskId: String(input.taskId), fromStatus: current, toStatus: target });
+      const recovered = reg.recover({ taskId, toStatus: target as SupervisionRecoveryTargetStatus, reason });
+      if (recovered && !recovered.ok) return err(recovered.reason, `task recovery rejected: ${recovered.reason}`);
+      const actualStatus = recovered?.value?.status ?? target;
+      return ok({ taskId, fromStatus: current, toStatus: actualStatus });
     },
   };
 }

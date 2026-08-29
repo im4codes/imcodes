@@ -108,6 +108,170 @@ beforeEach(() => {
 });
 
 describe('SupervisionTaskRegistry', () => {
+  function createReplacementOwnerPassShape(registry: SupervisionTaskRegistry, taskId: string) {
+    const revision = 'overall-pass-r1';
+    const attemptId = 'overall-pass-attempt-r1';
+    const sessionName = 'deck_alpha_brain';
+    const oldOwnerIdentity = {
+      ...identity(sessionName), sessionInstanceId: 'old-instance', runtimeEpoch: 'old-epoch',
+    };
+    const replacementIdentity = {
+      ...identity(sessionName), sessionInstanceId: 'current-instance', runtimeEpoch: 'current-epoch',
+    };
+    const auditorIdentity = identity('deck_alpha_auditor');
+    expect(registry.createOrGet({
+      taskId, projectName: 'alpha', objective: 'replacement owner recovery', currentRevision: revision, now: 1,
+    }).ok).toBe(true);
+    const oldOwner = registry.createAssignment({
+      assignmentId: `${taskId}-old-owner`, taskId, role: 'integration_owner', identity: oldOwnerIdentity,
+      scopeFiles: [], now: 10,
+    });
+    const replacement = registry.createAssignment({
+      assignmentId: `${taskId}-replacement`, taskId, role: 'integration_owner', identity: replacementIdentity,
+      scopeFiles: [], now: 20,
+    });
+    const auditor = registry.createAssignment({
+      assignmentId: `${taskId}-auditor`, taskId, role: 'auditor', identity: auditorIdentity,
+      scopeFiles: [], auditAttemptId: attemptId, auditRevision: revision, now: 30,
+    });
+    if (!oldOwner.ok || !replacement.ok || !auditor.ok) throw new Error('fixture creation failed');
+
+    expect(registry.updateAssignment({
+      assignmentId: auditor.value.assignmentId, identity: auditorIdentity, status: 'auditing',
+      auditAttemptId: attemptId, auditRevision: revision, now: 40,
+    }).ok).toBe(true);
+    expect(registry.updateAssignment({
+      assignmentId: auditor.value.assignmentId, identity: auditorIdentity, status: 'passed',
+      auditAttemptId: attemptId, auditRevision: revision, verdict: 'PASS', crossVendorAuditPassed: true, now: 50,
+    }).ok).toBe(true);
+    expect(registry.finishAssignment({
+      assignmentId: auditor.value.assignmentId, identity: auditorIdentity, revision, now: 60,
+    })).toMatchObject({ ok: true, value: { status: 'finalized', verdict: 'PASS' } });
+
+    expect(registry.updateAssignment({
+      assignmentId: replacement.value.assignmentId, identity: replacementIdentity, status: 'ready_for_audit',
+      auditAttemptId: attemptId, auditRevision: revision, now: 70,
+    }).ok).toBe(true);
+    expect(registry.updateTask({ taskId, status: 'ready_for_audit', currentRevision: revision, now: 80 }).ok).toBe(true);
+    expect(registry.finishAssignment({
+      assignmentId: replacement.value.assignmentId, identity: replacementIdentity, revision, now: 90,
+    })).toMatchObject({
+      ok: true,
+      value: {
+        status: 'ready_for_integration', auditAttemptId: attemptId, auditRevision: revision,
+        verdict: 'PASS', crossVendorAuditPassed: true,
+      },
+    });
+    return { revision, attemptId, sessionName, oldOwner, replacement, auditor };
+  }
+
+  it('cancels only a superseded integration owner and preserves the replacement PASS aggregate', async () => {
+    const registry = makeRegistry();
+    const shape = createReplacementOwnerPassShape(registry, 'task-replacement-owner-cancel');
+    const handlers = createSupervisionMcpToolHandlers(
+      { sessionName: shape.sessionName, projectName: 'alpha' } as never,
+      { registry: supervisionRegistryPort(registry) },
+    );
+
+    expect(await handlers[SUPERVISION_MCP_TOOLS.INTENT]({
+      intent: 'cancel', taskId: 'task-replacement-owner-cancel',
+      assignmentId: shape.oldOwner.value.assignmentId, note: 'superseded runtime epoch',
+    })).toMatchObject({ status: 'ok', fromStatus: 'ready_for_audit', toStatus: 'cancelled' });
+
+    expect(registry.get('task-replacement-owner-cancel')).toMatchObject({
+      status: 'ready_for_integration',
+      currentRevision: shape.revision,
+      integrationOwnerAssignmentId: shape.replacement.value.assignmentId,
+      assignments: expect.arrayContaining([
+        expect.objectContaining({
+          assignmentId: shape.oldOwner.value.assignmentId, status: 'cancelled', leaseId: '',
+        }),
+        expect.objectContaining({
+          assignmentId: shape.replacement.value.assignmentId, status: 'ready_for_integration',
+          auditAttemptId: shape.attemptId, auditRevision: shape.revision, verdict: 'PASS',
+        }),
+        expect.objectContaining({
+          assignmentId: shape.auditor.value.assignmentId, status: 'finalized',
+          auditAttemptId: shape.attemptId, auditRevision: shape.revision, verdict: 'PASS',
+        }),
+      ]),
+    });
+  });
+
+  it('explicitly recovers a legacy-cascaded cancelled task from exact replacement PASS evidence', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'supervision-cancelled-evidence-recovery-'));
+    const dbPath = join(dir, 'registry.sqlite');
+    let registry = new SupervisionTaskRegistry({ dbPath });
+    try {
+      const shape = createReplacementOwnerPassShape(registry, 'task-cancelled-evidence-recovery');
+      expect(registry.applyTaskIntent({
+        taskId: 'task-cancelled-evidence-recovery', intent: 'cancel', toStatus: 'cancelled',
+        note: 'legacy task-wide cascade',
+      })).toMatchObject({ ok: true, value: { status: 'cancelled' } });
+      expect(registry.getAssignment(shape.replacement.value.assignmentId)).toMatchObject({
+        status: 'cancelled', leaseId: '', auditAttemptId: shape.attemptId, auditRevision: shape.revision,
+      });
+      registry.close();
+      registry = new SupervisionTaskRegistry({ dbPath });
+
+      const handlers = createSupervisionMcpToolHandlers(
+        { sessionName: shape.sessionName, projectName: 'alpha' } as never,
+        { registry: supervisionRegistryPort(registry), isProjectBrain: () => true },
+      );
+      expect(await handlers[SUPERVISION_MCP_TOOLS.RECOVER]({
+        taskId: 'task-cancelled-evidence-recovery', toStatus: 'recovered',
+        reason: 'repair legacy assignment-cancel cascade',
+      })).toEqual({
+        status: 'ok', taskId: 'task-cancelled-evidence-recovery',
+        fromStatus: 'cancelled', toStatus: 'ready_for_integration',
+      });
+      expect(registry.get('task-cancelled-evidence-recovery')).toMatchObject({
+        status: 'ready_for_integration', currentRevision: shape.revision,
+        integrationOwnerAssignmentId: shape.replacement.value.assignmentId,
+        assignments: expect.arrayContaining([
+          expect.objectContaining({ assignmentId: shape.oldOwner.value.assignmentId, status: 'cancelled' }),
+          expect.objectContaining({
+            assignmentId: shape.replacement.value.assignmentId, status: 'ready_for_integration',
+            verdict: 'PASS', auditAttemptId: shape.attemptId, auditRevision: shape.revision,
+          }),
+          expect.objectContaining({ assignmentId: shape.auditor.value.assignmentId, status: 'finalized' }),
+        ]),
+      });
+      expect(registry.listEvents('task-cancelled-evidence-recovery')).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          eventType: 'recovered', status: 'ready_for_integration',
+          payload: expect.objectContaining({
+            source: 'cancelled_task_evidence_recovery',
+            replacementIntegrationOwnerAssignmentId: shape.replacement.value.assignmentId,
+            revision: shape.revision,
+            auditAttemptId: shape.attemptId,
+          }),
+        }),
+      ]));
+    } finally {
+      registry.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('fails closed when cancelled-task recovery lacks exact revision-bound PASS evidence', async () => {
+    const registry = makeRegistry();
+    expect(registry.createOrGet({
+      taskId: 'task-cancelled-without-pass', projectName: 'alpha', objective: 'no evidence',
+    }).ok).toBe(true);
+    expect(registry.createAssignment({
+      assignmentId: 'task-cancelled-without-pass-owner', taskId: 'task-cancelled-without-pass',
+      role: 'integration_owner', identity: identity('deck_alpha_brain'), scopeFiles: [],
+    }).ok).toBe(true);
+    expect(registry.applyTaskIntent({
+      taskId: 'task-cancelled-without-pass', intent: 'cancel', toStatus: 'cancelled',
+    }).ok).toBe(true);
+    expect(registry.recoverTask({
+      taskId: 'task-cancelled-without-pass', toStatus: 'recovered', reason: 'must refuse',
+    })).toEqual({ ok: false, reason: 'old_revision' });
+    expect(registry.get('task-cancelled-without-pass')).toMatchObject({ status: 'cancelled' });
+  });
+
   it('retires legacy claim rows while repairing a cancelled task with a delegated lease on reopen', () => {
     const dir = mkdtempSync(join(tmpdir(), 'imcodes-cancelled-reconcile-'));
     const dbPath = join(dir, 'supervision-state.sqlite');
@@ -1356,7 +1520,7 @@ describe('SupervisionTaskRegistry', () => {
 
       let cancelled = registry.get('cancel-me');
       expect(cancelled).toMatchObject({
-        status: 'cancelled',
+        status: 'ready_for_audit',
         assignments: [expect.objectContaining({
           assignmentId: assignment.value.assignmentId,
           status: 'cancelled',
@@ -1374,10 +1538,19 @@ describe('SupervisionTaskRegistry', () => {
         fileClaims: [],
       });
 
-      const eventsAfterFirstCancel = registry.listEvents('cancel-me').length;
+      const eventsAfterScopedCancel = registry.listEvents('cancel-me').length;
+      expect(await handlers[SUPERVISION_MCP_TOOLS.INTENT]({
+        intent: 'cancel', taskId: 'cancel-me', assignmentId: assignment.value.assignmentId,
+      })).toMatchObject({ status: 'ok', fromStatus: 'ready_for_audit', toStatus: 'cancelled' });
+      expect(registry.listEvents('cancel-me')).toHaveLength(eventsAfterScopedCancel);
+
+      expect(registry.applyTaskIntent({
+        intent: 'cancel', taskId: 'cancel-me', toStatus: 'cancelled', note: 'cancel whole task',
+      })).toMatchObject({ ok: true, value: { status: 'cancelled' } });
+      const eventsAfterTaskCancel = registry.listEvents('cancel-me').length;
       expect(await handlers[SUPERVISION_MCP_TOOLS.INTENT]({ intent: 'cancel', taskId: 'cancel-me' }))
         .toMatchObject({ status: 'ok', fromStatus: 'cancelled', toStatus: 'cancelled' });
-      expect(registry.listEvents('cancel-me')).toHaveLength(eventsAfterFirstCancel);
+      expect(registry.listEvents('cancel-me')).toHaveLength(eventsAfterTaskCancel);
 
       registry.close();
       registry = new SupervisionTaskRegistry({ dbPath });

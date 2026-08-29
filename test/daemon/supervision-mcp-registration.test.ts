@@ -247,6 +247,51 @@ describe('administrative recover', () => {
     expect(registry.recovered).toEqual([]);
   });
 
+  it('allows only the live same-project Brain to request evidence-derived cancelled recovery', async () => {
+    registry.statuses.set('tsk_a', 'cancelled');
+    registry.recover = (input: any) => {
+      registry.recovered.push(input);
+      registry.statuses.set(input.taskId, 'ready_for_integration');
+      return { ok: true as const, value: { status: 'ready_for_integration' } };
+    };
+    const participant = createSupervisionMcpToolHandlers(CALLER, { registry });
+    expect(await participant[SUPERVISION_MCP_TOOLS.RECOVER]({
+      taskId: 'tsk_a', toStatus: 'recovered', reason: 'repair cascade',
+    })).toMatchObject({ status: 'error', reason: 'forbidden' });
+    const projectBrain = createSupervisionMcpToolHandlers(CALLER, {
+      registry, isProjectBrain: () => true,
+    });
+    expect(await projectBrain[SUPERVISION_MCP_TOOLS.RECOVER]({
+      taskId: 'tsk_a', toStatus: 'recovered', reason: 'repair cascade',
+    })).toEqual({
+      status: 'ok', taskId: 'tsk_a', fromStatus: 'cancelled', toStatus: 'ready_for_integration',
+    });
+    expect(registry.recovered).toEqual([{
+      taskId: 'tsk_a', toStatus: 'recovered', reason: 'repair cascade',
+    }]);
+  });
+
+  it('does not let a project Brain use cancelled recovery across project scope', async () => {
+    registry.statuses.set('tsk_a', 'cancelled');
+    registry.item = (taskId: string) => ({
+      taskId,
+      projectName: 'other-project',
+      assignments: [{ identity: { sessionName: 'deck_cd_brain' } }],
+    });
+    const projectBrain = createSupervisionMcpToolHandlers(CALLER, {
+      registry, isProjectBrain: () => true,
+    });
+    expect(await projectBrain[SUPERVISION_MCP_TOOLS.RECOVER]({
+      taskId: 'tsk_a', toStatus: 'recovered', reason: 'must not cross project',
+    })).toMatchObject({ status: 'error', reason: 'forbidden' });
+    expect(await projectBrain[SUPERVISION_MCP_TOOLS.RECOVER]({
+      taskId: 'missing-task', toStatus: 'recovered', reason: 'must not reveal existence',
+    })).toEqual(await projectBrain[SUPERVISION_MCP_TOOLS.RECOVER]({
+      taskId: 'tsk_a', toStatus: 'recovered', reason: 'must not cross project',
+    }));
+    expect(registry.recovered).toEqual([]);
+  });
+
   it('cannot fabricate a shipped state', async () => {
     for (const bad of ['finalized', 'pushed', 'passed', 'implementing']) {
       const res: any = await client.callTool({
