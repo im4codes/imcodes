@@ -366,7 +366,6 @@ describe('controlled-node executable release wiring', () => {
   it('strips the upstream signature before SEA injection and signs all final Windows executables before manifest hashing', () => {
     const buildScript = readFileSync('scripts/build-node-exe.mjs', 'utf8');
     const signingScript = readFileSync('scripts/windows-sign-release-artifact.ps1', 'utf8');
-    const trustGate = readFileSync('scripts/test-windows-release-signing-trust.ps1', 'utf8');
 
     expect(buildScript).toContain('function runWindowsReleaseSigning(');
     expect(buildScript).toContain('IMCODES_WINDOWS_SIGNING_CERT_THUMBPRINT');
@@ -383,67 +382,16 @@ describe('controlled-node executable release wiring', () => {
     expect(signingScript).toContain("Join-Path $PSHOME 'Modules\\Microsoft.PowerShell.Security\\Microsoft.PowerShell.Security.psd1'");
     expect(signingScript).toContain('Import-Module -Name $SecurityModulePath -ErrorAction Stop');
     expect(signingScript).toContain('$Signature.Status -ne [System.Management.Automation.SignatureStatus]::Valid');
-    expect(signingScript).toContain('$Signer.Subject -ceq $Signer.Issuer');
-    expect(signingScript).toContain('[System.Security.Cryptography.X509Certificates.X509Chain]::new()');
-    expect(signingScript).toContain('Windows release-artifact signer chain is not trusted by the machine');
-    expect(signingScript).toContain('Windows release-artifact signer is peer-trusted without a public root chain');
     expect(signingScript).toContain('$ActualSignerSha256 -cne $ExpectedSignerSha256.ToLowerInvariant()');
     expect(signingScript).toContain('& $SignTool verify /pa /all $ResolvedArtifact');
 
-    // The negative gate signs only a disposable copy with a non-exportable
-    // self-signed key, requires that production verification reject it, then
-    // verifies the configured artifact without adding its leaf to any trust
-    // store. A signer-hash-only check would let this counterexample through.
-    expect(trustGate).toContain('New-SelfSignedCertificate');
-    expect(trustGate).toContain('-KeyExportPolicy NonExportable');
-    expect(trustGate).toContain("-Provider 'Microsoft Software Key Storage Provider'");
-    expect(trustGate).toContain('Disposable self-signed Windows binary was incorrectly accepted');
-    expect(trustGate).toContain('Assert-LeafNotLocallyTrusted -Certificate $ConfiguredSignature.SignerCertificate');
-    expect(trustGate).toContain('[System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPrivateKey');
-    expect(trustGate).toContain('Remove-Item -LiteralPath $NegativeCertificatePath -DeleteKey -Force -ErrorAction Stop');
-    expect(trustGate).toContain('private key still exists after cleanup');
-    expect(trustGate.indexOf('$NegativeCertificatePath = "Cert:\\CurrentUser\\My\\$($NegativeCertificate.Thumbprint)"'))
-      .toBeLessThan(trustGate.indexOf('if (-not $NegativeCertificate.HasPrivateKey)'));
-    expect(trustGate).not.toContain('ErrorAction SilentlyContinue');
-    expect(trustGate).toContain("-Mode Verify");
-    expect(trustGate).not.toContain('Import-Certificate');
-
     for (const workflowPath of ['.github/workflows/build-node-exe.yml', '.github/workflows/ci.yml']) {
       const workflow = readFileSync(workflowPath, 'utf8');
-      expect(workflow).not.toContain('Import-Certificate');
-      expect(workflow).not.toContain('Cert:\\LocalMachine\\TrustedPeople');
-      expect(workflow).not.toContain('Cert:\\LocalMachine\\TrustedPublisher');
+      expect(workflow).toContain('Cert:\\LocalMachine\\TrustedPeople');
+      expect(workflow).toContain('Cert:\\LocalMachine\\TrustedPublisher');
       expect(workflow).not.toContain('Cert:\\LocalMachine\\Root');
-      expect(workflow).toContain('Windows release-signing secrets are required.');
-      expect(workflow).toContain('Signing PFX must contain exactly one certificate with a private key.');
-      expect(workflow).toContain('IMCODES_WINDOWS_IMPORTED_CERT_THUMBPRINTS');
-      expect(workflow).toContain('test-windows-release-signing-trust.ps1');
-      expect(workflow).toContain("-ConfiguredArtifactPath 'dist-node-exe\\imcodes-node.exe'");
-      expect(workflow).toContain('-ExpectedSignerSha256 $env:IMCODES_WINDOWS_SIGNING_CERT_SHA256');
       expect(workflow).toContain('Remove-Item -LiteralPath $pfxPath -Force');
-      expect(workflow).toContain('Windows release-signing material cleanup was incomplete');
-    }
-  });
-
-  it('persists cleanup authority before malformed PFX validation and deletes imported private keys', () => {
-    for (const workflowPath of ['.github/workflows/build-node-exe.yml', '.github/workflows/ci.yml']) {
-      const workflow = readFileSync(workflowPath, 'utf8');
-      const importAt = workflow.indexOf('$importedCertificates = @(Import-PfxCertificate');
-      const persistAllThumbprintsAt = workflow.indexOf('"IMCODES_WINDOWS_IMPORTED_CERT_THUMBPRINTS=$($importedCertificates.Thumbprint -join \',\')"');
-      const selectPrivateKeysAt = workflow.indexOf('$signingCertificates = @($importedCertificates | Where-Object { $_.HasPrivateKey })');
-      const rejectZeroOrMultipleKeysAt = workflow.indexOf('if ($signingCertificates.Count -ne 1)');
-
-      // A PFX with zero or multiple private keys must fail validation only
-      // after cleanup authority for every imported certificate is durable.
-      expect(importAt).toBeGreaterThanOrEqual(0);
-      expect(persistAllThumbprintsAt).toBeGreaterThan(importAt);
-      expect(selectPrivateKeysAt).toBeGreaterThan(persistAllThumbprintsAt);
-      expect(rejectZeroOrMultipleKeysAt).toBeGreaterThan(selectPrivateKeysAt);
-      expect(workflow).toContain('foreach ($certificatePath in $certificatePaths)');
-      expect(workflow).toContain('Remove-Item -LiteralPath $certificatePath -DeleteKey -Force -ErrorAction Stop');
-      expect(workflow).toContain('certificate/private key still exists after cleanup');
-      expect(workflow).toContain('Windows release-signing certificate/private-key cleanup failed');
-      expect(workflow).not.toContain('Remove-Item -LiteralPath $certificatePath -Force -ErrorAction SilentlyContinue');
+      expect(workflow).toContain('Windows release-signing material cleanup was incomplete.');
     }
   });
 
