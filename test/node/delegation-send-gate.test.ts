@@ -584,6 +584,15 @@ describe('delegation send gate', () => {
     if (!created.taskId) throw new Error('expected auto-provisioned task');
     expect(provisionSupervisionTarget).toHaveBeenCalledTimes(1);
 
+    const registry = getSupervisionTaskRegistry();
+    expect(registry.get(created.taskId)?.assignments).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        role: 'coordinator',
+        required: false,
+        identity: expect.objectContaining({ sessionName: brain.name }),
+      }),
+    ]));
+
     const continued = await dispatchSendMessage(caller, {
       target: worker.name,
       message: 'continue the same task',
@@ -591,7 +600,6 @@ describe('delegation send gate', () => {
     }, deps(sessions, dispatchMessage));
     expect(continued).toMatchObject({ status: 'accepted', taskId: created.taskId });
 
-    const registry = getSupervisionTaskRegistry();
     const assignmentCount = registry.get(created.taskId)?.assignments.length;
     const participantCaller = {
       ...caller,
@@ -626,6 +634,53 @@ describe('delegation send gate', () => {
       status: 'error', reason: 'identity_rejected', error: 'task is not visible to this caller',
     });
     expect(registry.get(created.taskId)?.assignments).toHaveLength(assignmentCount ?? 0);
+  });
+
+  it('does not let a same-project Brain adopt another coordinator task by opaque id', async () => {
+    const selectedConfig = executionConfigFor('codex-sdk', 'gpt-5.6-sol');
+    const brain = supervisedBrain([selectedConfig]);
+    const worker = supervisedChild({
+      name: 'deck_alpha_worker', role: 'w1', agentType: 'codex-sdk', model: 'gpt-5.6-sol',
+    });
+    const otherCoordinator = supervisedChild({
+      name: 'deck_alpha_other', role: 'w2', agentType: 'codex-sdk', model: 'gpt-5.6-sol',
+    });
+    const registry = getSupervisionTaskRegistry();
+    const task = registry.createOrGet({
+      projectName: 'alpha', taskId: 'other-owner-task', objective: 'private task',
+    });
+    expect(task.ok).toBe(true);
+    expect(registry.createAssignment({
+      taskId: 'other-owner-task',
+      role: 'coordinator',
+      identity: {
+        sessionName: otherCoordinator.name,
+        sessionInstanceId: otherCoordinator.sessionInstanceId!,
+        runtimeEpoch: otherCoordinator.runtimeEpoch!,
+        agentType: otherCoordinator.agentType,
+        providerFamily: 'openai',
+      },
+      scopeFiles: [],
+      required: false,
+    }).ok).toBe(true);
+
+    const createAssignment = vi.spyOn(registry, 'createAssignment');
+    const createReplyAuthority = vi.spyOn(getDelegationReplyStore(), 'create');
+    const dispatchMessage = vi.fn(async () => {});
+    const result = await dispatchSendMessage(caller, {
+      target: worker.name,
+      message: 'must not adopt another owner task',
+      reply: true,
+      task: { taskId: 'other-owner-task', objective: 'private task', executionPool: 'primary' },
+    }, deps([brain, worker, otherCoordinator], dispatchMessage));
+
+    expect(result).toEqual({
+      status: 'error', reason: 'identity_rejected', error: 'task is not visible to this caller',
+    });
+    expect(createAssignment).not.toHaveBeenCalled();
+    expect(createReplyAuthority).not.toHaveBeenCalled();
+    expect(dispatchMessage).not.toHaveBeenCalled();
+    expect(registry.get('other-owner-task')?.assignments).toHaveLength(1);
   });
 
   it('does not apply supervision pool membership to an ordinary exact-target message', async () => {

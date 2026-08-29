@@ -915,18 +915,23 @@ export async function dispatchSendMessage(
     }
     const registry = getSupervisionTaskRegistry();
     const requestedTaskId = input.task.taskId?.trim();
+    const newTaskCoordinatorIdentity = !requestedTaskId && callerRecord?.role === 'brain'
+      ? supervisionTaskIdentityForTarget(callerRecord)
+      : undefined;
+    if (!requestedTaskId && callerRecord?.role === 'brain' && !newTaskCoordinatorIdentity) {
+      return { status: 'error', reason: MCP_ERROR_REASONS.IDENTITY_REJECTED, error: 'task coordinator identity is unavailable' };
+    }
     let taskId: string;
     if (requestedTaskId) {
       const existing = registry.get(requestedTaskId);
-      const projectBrainMayManage = Boolean(existing
-        && callerRecord?.role === 'brain'
-        && existing.projectName === callerProjectName);
       // Explicit task ids are references, never create requests. Keep missing
       // and unauthorized indistinguishable so send_message is not a task-id
-      // existence oracle.
+      // existence oracle. Project/role alone is not ownership: even a Brain
+      // may continue only a task to which the registry authoritatively binds
+      // its exact session identity.
       if (!existing
         || existing.projectName !== callerProjectName
-        || (!projectBrainMayManage && !supervisionCallerParticipates(existing, caller.sessionName))) {
+        || !supervisionCallerParticipates(existing, caller.sessionName)) {
         return {
           status: 'error',
           reason: MCP_ERROR_REASONS.IDENTITY_REJECTED,
@@ -948,6 +953,29 @@ export async function dispatchSendMessage(
       });
       if (!task.ok) return { status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED, error: `task registry rejected task: ${task.reason}` };
       taskId = task.value.taskId;
+
+      // Bind the creating Brain as a non-blocking coordinator. This is the
+      // durable attribution that permits a later explicit-task continuation;
+      // without it, widening visibility to every same-project Brain turns an
+      // opaque task id into authority over another owner's task. Reuse the
+      // send idempotency key so a post-restart replay cannot mint duplicates.
+      if (newTaskCoordinatorIdentity) {
+        const coordinator = registry.createAssignment({
+          taskId,
+          role: 'coordinator',
+          identity: newTaskCoordinatorIdentity,
+          scopeFiles: [],
+          required: false,
+          idempotencyKey: idempotencyKey ? `send:${idempotencyKey}` : undefined,
+          // Registry snapshots order by createdAt. Keep the delegated target
+          // as the primary/first assignment for existing consumers while
+          // recording coordinator attribution immediately after it.
+          now: now + 1,
+        });
+        if (!coordinator.ok) {
+          return { status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED, error: `task registry rejected coordinator attribution: ${coordinator.reason}` };
+        }
+      }
     }
     const assignment = registry.createAssignment({
       taskId,
@@ -966,6 +994,7 @@ export async function dispatchSendMessage(
       now,
     });
     if (!assignment.ok) return { status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED, error: `task registry rejected assignment: ${assignment.reason}` };
+
     supervisedTaskId = taskId;
     supervisedAssignmentId = assignment.value.assignmentId;
   }
