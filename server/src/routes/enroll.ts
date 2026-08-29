@@ -70,6 +70,7 @@ import {
   type SecureRandomBytes,
 } from '../services/controlled-node-identity.js';
 import { parseControlledNodeId } from '../../../shared/controlled-node-identity.js';
+import { buildControlledNodeBootstrapPage } from './controlled-node-bootstrap-page.js';
 
 function resolveTicketEncryptionKey(c: { env: Env }): string {
   const key = c.env.BOT_ENCRYPTION_KEY;
@@ -342,7 +343,10 @@ interface DownloadCommit {
   ip: string;
 }
 
-/** Reserve one of the ticket's three slots in a short row-locked transaction. */
+/**
+ * Reserve a bounded ticket slot, or a time/revocation-bounded remote-link
+ * attempt, in a short row-locked transaction.
+ */
 async function reserveAttempt(
   db: Database,
   ticketHash: string,
@@ -368,15 +372,19 @@ async function reserveAttempt(
     );
     if (!candidate) return null;
 
+    // SQL NULL is the deliberate remote-link no-count-limit contract. Spell
+    // that branch out: relying on `count < NULL` would evaluate to UNKNOWN and
+    // reject a live link by accident.
     const capacity = await tx.queryOne<{ admitted: boolean }>(
       `SELECT (
-         enrollment.consumed_count + (
-           SELECT count(*)::int
-             FROM controlled_node_download_attempts AS attempt
-            WHERE attempt.ticket_id = enrollment.id
-              AND attempt.state = 'reserved'
-              AND attempt.lease_expires_at >= $2
-         ) < enrollment.max_consumes
+         enrollment.max_consumes IS NULL
+         OR enrollment.consumed_count + (
+              SELECT count(*)::int
+                FROM controlled_node_download_attempts AS attempt
+               WHERE attempt.ticket_id = enrollment.id
+                 AND attempt.state = 'reserved'
+                 AND attempt.lease_expires_at >= $2
+            ) < enrollment.max_consumes
        ) AS admitted
          FROM controlled_node_enrollments_v2 AS enrollment
         WHERE enrollment.id = $1`,
@@ -411,15 +419,20 @@ async function commitAttempt(db: Database, reservation: DownloadCommit, now: num
   return db.transaction(async (tx) => {
     // Lock/revalidate the parent first. reserveAttempt uses the same lock
     // order, so admission and commitment cannot oversubscribe max_consumes.
+    // Expiry and revocation remain authoritative for every mode. Only the
+    // consume threshold is absent for max_consumes=NULL remote links.
     const parent = await tx.queryOne<{ consumed_count: number }>(
       `UPDATE controlled_node_enrollments_v2
           SET consumed_count = consumed_count + 1,
-              consumed_at = CASE WHEN consumed_count + 1 >= max_consumes THEN $2 ELSE consumed_at END,
+              consumed_at = CASE
+                WHEN max_consumes IS NOT NULL AND consumed_count + 1 >= max_consumes THEN $2
+                ELSE consumed_at
+              END,
               last_consume_ip = $3
         WHERE id = $1
           AND revoked_at IS NULL
           AND ticket_expires_at > $2
-          AND consumed_count < max_consumes
+          AND (max_consumes IS NULL OR consumed_count < max_consumes)
         RETURNING consumed_count`,
       [reservation.ticketId, now, reservation.ip],
     );
@@ -1437,39 +1450,14 @@ enrollRoutes.get('/v2/bootstrap', async (c) => {
     `default-src 'none'; ` +
     `script-src 'nonce-${nonce}'; ` +
     `style-src 'nonce-${nonce}'; ` +
+    `connect-src 'self'; ` +
     `form-action 'self'; ` +
     `base-uri 'none'; ` +
     `frame-ancestors 'none'; ` +
-    `navigate-to 'self'`,
+    `navigate-to 'self' blob:`,
   );
   c.header('X-Content-Type-Options', 'nosniff');
-
-  const scriptBody =
-    "(function(){"
-    + "var p=location.hash.slice(1);"
-    + "var m=p.match(/(?:^|&)ticket=([A-Za-z0-9_-]+)/);"
-    + "if(!m){document.body.textContent='missing ticket';return}"
-    + "var t=m[1];"
-    + "try{history.replaceState(null,'',location.pathname+location.search)}catch(e){}"
-    + "var f=document.createElement('form');"
-    + "f.method='POST';"
-    + "f.action='/api/enroll/v2/download';"
-    + "f.style.display='none';"
-    + "var i=document.createElement('input');"
-    + "i.type='hidden';"
-    + "i.name='ticket';"
-    + "i.value=t;"
-    + "f.appendChild(i);"
-    + "document.body.appendChild(f);"
-    + "f.submit();"
-    + "})();";
-
-  const html =
-    `<!doctype html><html><head><meta charset="utf-8"><title>Download</title></head>` +
-    `<body><noscript>This endpoint requires JavaScript.</noscript>` +
-    `<script nonce="${nonce}">${scriptBody}</script>` +
-    `</body></html>`;
-  return c.body(html, 200);
+  return c.body(buildControlledNodeBootstrapPage(nonce), 200);
 });
 
 const REDEEM_BODY = z

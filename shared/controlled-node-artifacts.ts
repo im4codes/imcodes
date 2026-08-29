@@ -227,8 +227,9 @@ export function compareControlledNodeArtifactPairs(
  *   which is add a machine to the owner's account, never read from it.
  *
  * The ticket itself is identical in kind; only its lifetime and download budget
- * differ. All stay reusable up to `max_consumes` so a failed first attempt is
- * recoverable.
+ * differ. Browser tickets and install commands retain bounded budgets. A remote
+ * link instead admits any number of downloads during its fixed 24-hour window;
+ * expiry and explicit revocation remain its hard authority boundaries.
  */
 export const CONTROLLED_NODE_TICKET_DELIVERY = {
   BROWSER: 'browser',
@@ -265,19 +266,21 @@ export const CONTROLLED_NODE_TICKET_TTL_MS: Readonly<
 /**
  * How many downloads a ticket admits, per delivery mode.
  *
- * `browser` and `remote_link` enrol one machine, with spare attempts so a
- * failed download is recoverable. The install command is the opposite case: one
- * command, pasted on machine after machine, so its budget has to cover a fleet.
- * It is bounded rather than unlimited so a leaked command cannot be used to
- * manufacture entries without end.
+ * `browser` enrols one machine, with spare attempts so a failed download is
+ * recoverable. `remote_link` uses `null` deliberately: it may be carried to any
+ * number of machines during its 24-hour lifetime and must never fail because a
+ * consume counter crossed an arbitrary threshold. The install command is a
+ * separate, ten-year credential whose bounded fleet budget remains unchanged.
+ *
+ * `null` is persisted as SQL NULL. Do not replace it with a very large integer:
+ * doing so would only hide a finite limit and eventually make an otherwise-live
+ * link fail for the wrong reason.
  */
-export const CONTROLLED_NODE_TICKET_MAX_CONSUMES: Readonly<
-  Record<ControlledNodeTicketDelivery, number>
-> = {
+export const CONTROLLED_NODE_TICKET_MAX_CONSUMES = {
   [CONTROLLED_NODE_TICKET_DELIVERY.BROWSER]: 3,
-  [CONTROLLED_NODE_TICKET_DELIVERY.REMOTE_LINK]: 3,
+  [CONTROLLED_NODE_TICKET_DELIVERY.REMOTE_LINK]: null,
   [CONTROLLED_NODE_TICKET_DELIVERY.INSTALL_COMMAND]: 500,
-};
+} as const satisfies Readonly<Record<ControlledNodeTicketDelivery, number | null>>;
 
 /**
  * Alphabet for the install code that appears in the pasted command.
@@ -340,8 +343,13 @@ export function controlledNodeTicketTtlMs(delivery?: ControlledNodeTicketDeliver
     : CONTROLLED_NODE_TICKET_TTL_MS[CONTROLLED_NODE_TICKET_DELIVERY.BROWSER];
 }
 
-/** Download budget for a delivery mode, validated for the same reason as the TTL. */
-export function controlledNodeTicketMaxConsumes(delivery?: ControlledNodeTicketDelivery): number {
+/**
+ * Download budget for a delivery mode, validated for the same reason as the
+ * TTL. `null` is the explicit no-count-limit contract for a remote link.
+ */
+export function controlledNodeTicketMaxConsumes(
+  delivery?: ControlledNodeTicketDelivery,
+): number | null {
   return isControlledNodeTicketDelivery(delivery)
     ? CONTROLLED_NODE_TICKET_MAX_CONSUMES[delivery]
     : CONTROLLED_NODE_TICKET_MAX_CONSUMES[CONTROLLED_NODE_TICKET_DELIVERY.BROWSER];

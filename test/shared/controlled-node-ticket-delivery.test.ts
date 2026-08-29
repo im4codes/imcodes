@@ -4,6 +4,7 @@ import {
   CONTROLLED_NODE_TICKET_DELIVERY_VALUES,
   CONTROLLED_NODE_TICKET_TTL_MS,
   CONTROLLED_NODE_TICKET_MAX_CONSUMES,
+  controlledNodeTicketMaxConsumes,
   controlledNodeTicketTtlMs,
   isControlledNodeTicketDelivery,
 } from '../../shared/controlled-node-artifacts.js';
@@ -49,14 +50,20 @@ describe('controlled-node download ticket delivery', () => {
       .toEqual(['browser', 'install_command', 'remote_link']);
   });
 
-  it('has a TTL and a download budget for every declared mode', () => {
+  it('uses a real no-count-limit contract only for the 24-hour remote link', () => {
     for (const mode of CONTROLLED_NODE_TICKET_DELIVERY_VALUES) {
       expect(Number.isSafeInteger(CONTROLLED_NODE_TICKET_TTL_MS[mode])).toBe(true);
       expect(CONTROLLED_NODE_TICKET_TTL_MS[mode]).toBeGreaterThan(0);
-      // A mode without a budget would index the map with undefined and admit
-      // NaN comparisons into the consume check.
-      expect(Number.isSafeInteger(CONTROLLED_NODE_TICKET_MAX_CONSUMES[mode])).toBe(true);
-      expect(CONTROLLED_NODE_TICKET_MAX_CONSUMES[mode]).toBeGreaterThan(0);
+    }
+    expect(CONTROLLED_NODE_TICKET_MAX_CONSUMES[CONTROLLED_NODE_TICKET_DELIVERY.BROWSER]).toBe(3);
+    expect(CONTROLLED_NODE_TICKET_MAX_CONSUMES[CONTROLLED_NODE_TICKET_DELIVERY.REMOTE_LINK]).toBeNull();
+    expect(CONTROLLED_NODE_TICKET_MAX_CONSUMES[CONTROLLED_NODE_TICKET_DELIVERY.INSTALL_COMMAND]).toBe(500);
+    expect(controlledNodeTicketMaxConsumes(CONTROLLED_NODE_TICKET_DELIVERY.REMOTE_LINK)).toBeNull();
+
+    // Unknown input must still fail toward the historical browser budget, not
+    // accidentally inherit the unlimited remote-link contract.
+    for (const bogus of ['forever', '', null, 0, {}]) {
+      expect(controlledNodeTicketMaxConsumes(bogus as never)).toBe(3);
     }
   });
 });
