@@ -1,8 +1,8 @@
 import { execFileSync, spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { chmod, lstat, mkdir, mkdtemp, opendir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { basename, dirname, join, win32 as pathWin32 } from 'node:path';
+import { basename, dirname, join, resolve, win32 as pathWin32 } from 'node:path';
 import {
   CONTROLLED_NODE_ARCH_X64,
   CONTROLLED_NODE_ARTIFACT_ARCH_UNIVERSAL,
@@ -49,6 +49,26 @@ import {
 import { defaultCredentialPath, defaultStagedExecutablePath, type ControlledNodeCredential } from './enrollment.js';
 import { loadInstallJournal, INSTALL_JOURNAL_VERSION } from './install-journal.js';
 import { WINDOWS_COMPILED_RELEASE_SIGNER_SHA256 } from './windows-artifact-trust.js';
+import logger from '../util/logger.js';
+
+export const CONTROLLED_NODE_UPGRADE_DIR_PREFIX = 'imcodes-node-upgrade-';
+export const CONTROLLED_NODE_UPGRADE_OWNERSHIP_MARKER = '.imcodes-controlled-node-upgrade.json';
+export const CONTROLLED_NODE_UPGRADE_STALE_AFTER_MS = 24 * 60 * 60 * 1_000;
+const CONTROLLED_NODE_UPGRADE_MAX_ENUMERATE = 128;
+const CONTROLLED_NODE_UPGRADE_MAX_LSTAT = 64;
+const CONTROLLED_NODE_UPGRADE_MAX_MARKER_READ = 32;
+const CONTROLLED_NODE_UPGRADE_MAX_DELETE = 8;
+const CONTROLLED_NODE_UPGRADE_PRODUCT = 'imcodes-controlled-node-upgrade';
+const CONTROLLED_NODE_UPGRADE_DIR_PATTERN = /^imcodes-node-upgrade-[A-Za-z0-9_-]{6,128}$/;
+const CONTROLLED_NODE_UPGRADE_TOKEN_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const activeControlledNodeUpgradeDirs = new Set<string>();
+
+export interface ControlledNodeUpgradeCleanupDiagnostic {
+  event: 'controlled_node_upgrade_cleanup';
+  phase: 'pre_handoff' | 'stale_scavenge';
+  outcome: 'removed' | 'failed';
+  code: string;
+}
 
 export interface ControlledNodeArtifactTarget {
   os: ControlledNodeOs;
@@ -66,6 +86,12 @@ export interface ControlledNodeSelfUpgradeDeps {
   tmpdir?: () => string;
   now?: () => number;
   journalPath?: string;
+  writeUpgradeFile?: typeof writeFile;
+  removeUpgradeDir?: (path: string) => Promise<void>;
+  isProcessAlive?: (pid: number) => boolean;
+  onCleanupDiagnostic?: (diagnostic: ControlledNodeUpgradeCleanupDiagnostic) => void;
+  onStaleScavengeOperation?: (operation: 'enumerate' | 'lstat' | 'marker_read' | 'delete') => void;
+  beforeStaleCandidateRevalidation?: (candidatePath: string) => Promise<void>;
 }
 
 export interface ControlledNodeSelfUpgradeResult {
@@ -82,6 +108,214 @@ function psQuote(value: string): string {
 
 function shQuote(value: string): string {
   return `'${value.replaceAll("'", `'"'"'`)}'`;
+}
+
+interface ControlledNodeUpgradeOwnershipMarker {
+  schemaVersion: 1;
+  product: typeof CONTROLLED_NODE_UPGRADE_PRODUCT;
+  directoryName: string;
+  ownerToken: string;
+  createdAt: number;
+  pid: number;
+}
+
+function cleanupErrorCode(error: unknown): string {
+  const code = error && typeof error === 'object' && 'code' in error ? String(error.code) : 'unknown';
+  return /^[A-Z0-9_]{1,48}$/.test(code) ? code : 'unknown';
+}
+
+function emitCleanupDiagnostic(
+  diagnostic: ControlledNodeUpgradeCleanupDiagnostic,
+  deps: Pick<ControlledNodeSelfUpgradeDeps, 'onCleanupDiagnostic'>,
+): void {
+  if (deps.onCleanupDiagnostic) {
+    try { deps.onCleanupDiagnostic(diagnostic); } catch { /* diagnostics never affect upgrade authority */ }
+    return;
+  }
+  try { logger.warn(diagnostic, 'controlled node self-upgrade cleanup'); } catch { /* ENOSPC-safe diagnostics */ }
+}
+
+function defaultIsProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return !!(error && typeof error === 'object' && 'code' in error && error.code !== 'ESRCH');
+  }
+}
+
+function parseUpgradeOwnershipMarker(value: string): ControlledNodeUpgradeOwnershipMarker | null {
+  try {
+    // Windows PowerShell 5.1's `Set-Content -Encoding utf8` writes a BOM. The
+    // helper atomically refreshes pid ownership with that command, so recovery
+    // must accept that one encoding difference without weakening the schema.
+    const marker = JSON.parse(value.charCodeAt(0) === 0xfeff ? value.slice(1) : value) as Partial<ControlledNodeUpgradeOwnershipMarker>;
+    if (marker.schemaVersion !== 1
+      || marker.product !== CONTROLLED_NODE_UPGRADE_PRODUCT
+      || typeof marker.directoryName !== 'string'
+      || !CONTROLLED_NODE_UPGRADE_DIR_PATTERN.test(marker.directoryName)
+      || typeof marker.ownerToken !== 'string'
+      || !CONTROLLED_NODE_UPGRADE_TOKEN_PATTERN.test(marker.ownerToken)
+      || typeof marker.createdAt !== 'number'
+      || !Number.isSafeInteger(marker.createdAt)
+      || marker.createdAt <= 0
+      || typeof marker.pid !== 'number'
+      || !Number.isSafeInteger(marker.pid)
+      || marker.pid <= 0) return null;
+    return marker as ControlledNodeUpgradeOwnershipMarker;
+  } catch {
+    return null;
+  }
+}
+
+async function removeUpgradeDirBestEffort(
+  path: string,
+  phase: ControlledNodeUpgradeCleanupDiagnostic['phase'],
+  deps: Pick<ControlledNodeSelfUpgradeDeps, 'removeUpgradeDir' | 'onCleanupDiagnostic'>,
+): Promise<boolean> {
+  try {
+    const removeUpgradeDir = deps.removeUpgradeDir ?? (async (ownedPath: string) => {
+      await rm(ownedPath, { recursive: true, force: true });
+    });
+    await removeUpgradeDir(path);
+    emitCleanupDiagnostic({ event: 'controlled_node_upgrade_cleanup', phase, outcome: 'removed', code: 'ok' }, deps);
+    return true;
+  } catch (error) {
+    emitCleanupDiagnostic({
+      event: 'controlled_node_upgrade_cleanup',
+      phase,
+      outcome: 'failed',
+      code: cleanupErrorCode(error),
+    }, deps);
+    return false;
+  }
+}
+
+/**
+ * Conservatively remove only old, directly-owned upgrade staging directories.
+ * Every refusal is fail-open: an upgrade may continue, but unknown Temp content
+ * is never traversed or deleted.
+ */
+export async function scavengeStaleControlledNodeUpgradeDirs(
+  tempRoot: string,
+  deps: Pick<ControlledNodeSelfUpgradeDeps,
+    | 'now'
+    | 'removeUpgradeDir'
+    | 'isProcessAlive'
+    | 'onCleanupDiagnostic'
+    | 'onStaleScavengeOperation'
+    | 'beforeStaleCandidateRevalidation'> = {},
+): Promise<number> {
+  const now = deps.now?.() ?? Date.now();
+  const cutoff = now - CONTROLLED_NODE_UPGRADE_STALE_AFTER_MS;
+  const canonicalRoot = resolve(tempRoot);
+  let removed = 0;
+  let deleteAttempts = 0;
+  let enumerated = 0;
+  let lstatOperations = 0;
+  let markerReads = 0;
+  const isProcessAlive = deps.isProcessAlive ?? defaultIsProcessAlive;
+  const recordOperation = (operation: 'enumerate' | 'lstat' | 'marker_read' | 'delete'): void => {
+    try { deps.onStaleScavengeOperation?.(operation); } catch { /* test/telemetry seam is non-authoritative */ }
+  };
+  const boundedLstat = async (path: string) => {
+    if (lstatOperations >= CONTROLLED_NODE_UPGRADE_MAX_LSTAT) return null;
+    lstatOperations += 1;
+    recordOperation('lstat');
+    return lstat(path);
+  };
+  const boundedMarkerRead = async (path: string): Promise<string | null> => {
+    if (markerReads >= CONTROLLED_NODE_UPGRADE_MAX_MARKER_READ) return null;
+    markerReads += 1;
+    recordOperation('marker_read');
+    return readFile(path, 'utf8');
+  };
+  const sameIdentity = (left: Awaited<ReturnType<typeof lstat>>, right: Awaited<ReturnType<typeof lstat>>): boolean => (
+    left.dev === right.dev
+    && left.ino === right.ino
+    && left.birthtimeMs === right.birthtimeMs
+    && left.ctimeMs === right.ctimeMs
+  );
+
+  try {
+    const directory = await opendir(canonicalRoot);
+    for await (const entry of directory) {
+      if (enumerated >= CONTROLLED_NODE_UPGRADE_MAX_ENUMERATE
+        || deleteAttempts >= CONTROLLED_NODE_UPGRADE_MAX_DELETE) break;
+      enumerated += 1;
+      recordOperation('enumerate');
+      if (!CONTROLLED_NODE_UPGRADE_DIR_PATTERN.test(entry.name)) continue;
+      const candidate = resolve(canonicalRoot, entry.name);
+      // The candidate is accepted only as the exact direct child returned by
+      // this directory iterator. No user-controlled traversal is canonicalized.
+      if (dirname(candidate) !== canonicalRoot || basename(candidate) !== entry.name
+        || activeControlledNodeUpgradeDirs.has(candidate)) continue;
+      try {
+        const directoryStat = await boundedLstat(candidate);
+        if (!directoryStat || !directoryStat.isDirectory() || directoryStat.isSymbolicLink()
+          || directoryStat.mtimeMs > cutoff) continue;
+        const markerPath = resolve(candidate, CONTROLLED_NODE_UPGRADE_OWNERSHIP_MARKER);
+        if (dirname(markerPath) !== candidate) continue;
+        const markerStat = await boundedLstat(markerPath);
+        if (!markerStat || !markerStat.isFile() || markerStat.isSymbolicLink() || markerStat.mtimeMs > cutoff) continue;
+        const markerText = await boundedMarkerRead(markerPath);
+        if (markerText === null) continue;
+        const marker = parseUpgradeOwnershipMarker(markerText);
+        if (!marker || marker.directoryName !== entry.name || marker.createdAt > cutoff) continue;
+        let alive = true;
+        try { alive = isProcessAlive(marker.pid); } catch { alive = true; }
+        if (alive) continue;
+
+        await deps.beforeStaleCandidateRevalidation?.(candidate);
+
+        // Final adjacent revalidation repeats every admission fact. Identity
+        // equality binds the final lstat results to the same directory/marker
+        // initially inspected. Node's rm unlinks a replacement root symlink;
+        // it does not traverse it, while any detectable replacement is refused.
+        if (resolve(canonicalRoot, entry.name) !== candidate
+          || dirname(candidate) !== canonicalRoot
+          || basename(candidate) !== entry.name
+          || activeControlledNodeUpgradeDirs.has(candidate)) continue;
+        const currentDirectoryStat = await boundedLstat(candidate);
+        if (!currentDirectoryStat
+          || !currentDirectoryStat.isDirectory() || currentDirectoryStat.isSymbolicLink()
+          || !sameIdentity(directoryStat, currentDirectoryStat)
+          || currentDirectoryStat.mtimeMs > cutoff) continue;
+        const currentMarkerStat = await boundedLstat(markerPath);
+        if (!currentMarkerStat
+          || !currentMarkerStat.isFile() || currentMarkerStat.isSymbolicLink()
+          || !sameIdentity(markerStat, currentMarkerStat)
+          || currentMarkerStat.mtimeMs > cutoff) continue;
+        const currentMarkerText = await boundedMarkerRead(markerPath);
+        const currentMarker = currentMarkerText === null ? null : parseUpgradeOwnershipMarker(currentMarkerText);
+        if (!currentMarker
+          || currentMarkerText !== markerText
+          || currentMarker.ownerToken !== marker.ownerToken
+          || currentMarker.directoryName !== entry.name
+          || currentMarker.createdAt > cutoff) continue;
+        try { alive = isProcessAlive(currentMarker.pid); } catch { alive = true; }
+        if (alive || activeControlledNodeUpgradeDirs.has(candidate)) continue;
+        // Consume the budget before calling an authority-external remover.
+        // Failed/throwing attempts count just like successful removals, so a
+        // full or hostile filesystem cannot turn fail-open cleanup into an
+        // unbounded retry loop.
+        deleteAttempts += 1;
+        recordOperation('delete');
+        if (await removeUpgradeDirBestEffort(candidate, 'stale_scavenge', deps)) removed += 1;
+      } catch {
+        // A racing, malformed, unreadable, or unowned entry is a refusal, not a
+        // cleanup failure. Do not surface paths or recurse into it.
+      }
+    }
+  } catch (error) {
+    emitCleanupDiagnostic({
+      event: 'controlled_node_upgrade_cleanup',
+      phase: 'stale_scavenge',
+      outcome: 'failed',
+      code: cleanupErrorCode(error),
+    }, deps);
+  }
+  return removed;
 }
 
 export function controlledNodeArtifactTarget(
@@ -366,6 +600,11 @@ export function buildWindowsControlledNodeUpgradeScript(input: {
   destinationManifestPath: string;
   destinationJournalPath?: string;
   upgradeTaskName?: string;
+  stagingOwnership?: {
+    directoryPath: string;
+    markerPath: string;
+    ownerToken: string;
+  };
 }): string {
   const checkedAclCommand = (entry: readonly string[], optional: boolean): string => {
     const [target, ...args] = entry;
@@ -401,7 +640,25 @@ export function buildWindowsControlledNodeUpgradeScript(input: {
     .map((entry) => checkedAclCommand(entry, false))
     .join('\r\n');
   const upgradeTaskCleanup = input.upgradeTaskName
-    ? `Unregister-ScheduledTask -TaskName ${psQuote(input.upgradeTaskName)} -Confirm:$false -ErrorAction SilentlyContinue\r\n`
+    ? `try { Unregister-ScheduledTask -TaskName ${psQuote(input.upgradeTaskName)} -Confirm:$false -ErrorAction Stop } catch { Write-Warning 'IMCODES_UPGRADE_CLEANUP_FAILED phase=helper_finally code=task_unregister_failed' }\r\n`
+    : '';
+  const stagingCleanup = input.stagingOwnership
+    ? `try {\r\n`
+      + `  $stagingItem = Get-Item -LiteralPath $stagingDir -Force -ErrorAction Stop\r\n`
+      + `  $stagingMarkerItem = Get-Item -LiteralPath $stagingOwnershipMarker -Force -ErrorAction Stop\r\n`
+      + `  $stagingMarker = Get-Content -LiteralPath $stagingOwnershipMarker -Raw -ErrorAction Stop | ConvertFrom-Json\r\n`
+      + `  if (-not $stagingItem.PSIsContainer -or ($stagingItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -or $stagingMarkerItem.PSIsContainer -or ($stagingMarkerItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -or $stagingItem.Name -cnotmatch '^imcodes-node-upgrade-[A-Za-z0-9_-]{6,128}$' -or [int]$stagingMarker.schemaVersion -ne 1 -or [string]$stagingMarker.product -cne ${psQuote(CONTROLLED_NODE_UPGRADE_PRODUCT)} -or [string]$stagingMarker.directoryName -cne $stagingItem.Name -or [string]$stagingMarker.ownerToken -cne $stagingOwnerToken) { throw 'staging ownership refused' }\r\n`
+      + `  Remove-Item -LiteralPath $stagingDir -Recurse -Force -ErrorAction Stop\r\n`
+      + `} catch { Write-Warning 'IMCODES_UPGRADE_CLEANUP_FAILED phase=helper_finally code=cleanup_refused_or_failed' }\r\n`
+    : '';
+  const stagingActivation = input.stagingOwnership
+    ? `$stagingItem = Get-Item -LiteralPath $stagingDir -Force -ErrorAction Stop\r\n`
+      + `$stagingMarkerItem = Get-Item -LiteralPath $stagingOwnershipMarker -Force -ErrorAction Stop\r\n`
+      + `$stagingMarkerState = Get-Content -LiteralPath $stagingOwnershipMarker -Raw -ErrorAction Stop | ConvertFrom-Json\r\n`
+      + `if (-not $stagingItem.PSIsContainer -or ($stagingItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -or $stagingMarkerItem.PSIsContainer -or ($stagingMarkerItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -or $stagingItem.Name -cnotmatch '^imcodes-node-upgrade-[A-Za-z0-9_-]{6,128}$' -or [int]$stagingMarkerState.schemaVersion -ne 1 -or [string]$stagingMarkerState.product -cne ${psQuote(CONTROLLED_NODE_UPGRADE_PRODUCT)} -or [string]$stagingMarkerState.directoryName -cne $stagingItem.Name -or [string]$stagingMarkerState.ownerToken -cne $stagingOwnerToken) { throw 'staging ownership activation refused' }\r\n`
+      + `$stagingMarkerState.pid = $PID\r\n`
+      + `$stagingMarkerTemp = "$stagingOwnershipMarker.active-$PID"\r\n`
+      + `try { $stagingMarkerState | ConvertTo-Json -Compress | Set-Content -LiteralPath $stagingMarkerTemp -Encoding utf8 -ErrorAction Stop; Move-Item -LiteralPath $stagingMarkerTemp -Destination $stagingOwnershipMarker -Force -ErrorAction Stop } finally { Remove-Item -LiteralPath $stagingMarkerTemp -Force -ErrorAction SilentlyContinue }\r\n`
     : '';
   const powershellModulePreflight = WINDOWS_POWERSHELL_SECURITY_MODULE_PREFLIGHT
     + WINDOWS_POWERSHELL_UTILITY_MODULE_PREFLIGHT;
@@ -541,6 +798,7 @@ export function buildWindowsControlledNodeUpgradeScript(input: {
       ? `if (Test-Path -LiteralPath $dstRemoteDesktop) { $rollbackRemoteDesktopPlatform = Join-Path $dstRemoteDesktop 'win32-x64'; $rollbackRemoteDesktopExe = Join-Path $rollbackRemoteDesktopPlatform ${psQuote(REMOTE_DESKTOP_WORKER_FILENAME)}; $rollbackRemoteDesktopManifest = "$rollbackRemoteDesktopExe${REMOTE_DESKTOP_WORKER_MANIFEST_SUFFIX}"; $rollbackRemoteDesktopArchive = Join-Path $rollbackRemoteDesktopPlatform ${psQuote(REMOTE_DESKTOP_VIRTUAL_DISPLAY_ARCHIVE_FILENAME)}; $rollbackRemoteDesktopWorkerHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $rollbackRemoteDesktopExe).Hash.ToLowerInvariant(); $rollbackRemoteDesktopManifestHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $rollbackRemoteDesktopManifest).Hash.ToLowerInvariant(); $rollbackRemoteDesktopArchiveHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $rollbackRemoteDesktopArchive).Hash.ToLowerInvariant(); & $verifyRemoteDesktopArtifactSet $dstRemoteDesktop $rollbackRemoteDesktopWorkerHash $rollbackRemoteDesktopManifestHash $rollbackRemoteDesktopArchiveHash $trustedReleaseSigner }\r\n`
       : '');
   const releasePreflightGuard = `try {\r\n`
+      + stagingActivation
       + powershellModulePreflight
       + releaseArtifactPreflight
       + remoteDesktopPreflight
@@ -551,6 +809,7 @@ export function buildWindowsControlledNodeUpgradeScript(input: {
       + `if ($failureMessage.Length -gt 240) { $failureMessage = $failureMessage.Substring(0, 240) }\r\n`
       + `try { @{ status = ${psQuote(CONTROLLED_NODE_WINDOWS_UPGRADE_PREFLIGHT_FAILED)}; reason = $failureMessage; completedAt = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() } | ConvertTo-Json -Compress | Set-Content -LiteralPath $upgradeResult -Encoding utf8 } catch { }\r\n`
       + upgradeTaskCleanup
+      + stagingCleanup
       + `throw\r\n`
       + `}\r\n`
   ;
@@ -577,6 +836,11 @@ export function buildWindowsControlledNodeUpgradeScript(input: {
     + `$src = ${psQuote(input.stagedArtifactPath)}\r\n`
     + `$dstManifest = ${psQuote(input.destinationManifestPath)}\r\n`
     + `$srcManifest = ${psQuote(input.stagedManifestPath)}\r\n`
+    + (input.stagingOwnership
+      ? `$stagingDir = ${psQuote(input.stagingOwnership.directoryPath)}\r\n`
+        + `$stagingOwnershipMarker = ${psQuote(input.stagingOwnership.markerPath)}\r\n`
+        + `$stagingOwnerToken = ${psQuote(input.stagingOwnership.ownerToken)}\r\n`
+      : '')
     + `$upgradeResult = "$src.upgrade-result.json"\r\n`
     + `Remove-Item -Force $upgradeResult -ErrorAction SilentlyContinue\r\n`
     + `$healthLease = Join-Path (Split-Path -Parent $dst) 'health-lease.json'\r\n`
@@ -671,6 +935,7 @@ export function buildWindowsControlledNodeUpgradeScript(input: {
     + `Remove-Item -Force -LiteralPath $upgradeMarker -ErrorAction SilentlyContinue\r\n`
     + `Start-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue\r\n`
     + upgradeTaskCleanup
+    + stagingCleanup
     + `}\r\n`;
 }
 
@@ -820,6 +1085,7 @@ export function scheduleWindowsControlledNodeUpgrade(
   runCommand: (file: string, args: readonly string[]) => void = (file, args) => {
     execFileSync(file, [...args], { windowsHide: true, stdio: 'ignore' });
   },
+  onCleanupFailure?: (error: unknown) => void,
 ): void {
   runCommand('schtasks.exe', ['/Create', '/TN', taskName, '/XML', taskXmlPath, '/F']);
   try {
@@ -827,8 +1093,9 @@ export function scheduleWindowsControlledNodeUpgrade(
   } catch (error) {
     try {
       runCommand('schtasks.exe', ['/Delete', '/TN', taskName, '/F']);
-    } catch {
+    } catch (cleanupError) {
       // Preserve the authoritative /Run failure; the triggerless task is inert.
+      try { onCleanupFailure?.(cleanupError); } catch { /* diagnostics never replace /Run authority */ }
     }
     throw error;
   }
@@ -871,89 +1138,130 @@ export async function startControlledNodeSelfUpgrade(
   if (!fetchImpl) return { ok: false, targetVersion, reason: 'fetch_unavailable' };
 
   const tempRoot = deps.tmpdir?.() ?? tmpdir();
-  const updateDir = await mkdtemp(join(tempRoot, 'imcodes-node-upgrade-'));
-  const downloaded = await downloadArtifact({
-    credential,
-    target,
-    dir: updateDir,
-    fetchImpl,
-    ...(targetVersion === DAEMON_UPGRADE_TARGET_LATEST ? {} : { expectedVersion: targetVersion }),
-  });
-  if (!downloaded.version) throw new Error('missing_artifact_version');
-  const helper = await downloadControlledNodeComputerUseHelper({ credential, target, dir: updateDir, fetchImpl });
-  // A Windows release is one publication unit. Installing the runtime without
-  // its same-version worker bundle strands the node after its runtime version
-  // converges, because version-based auto-upgrade will no longer retry.
-  const remoteDesktopWorker = await downloadControlledNodeRemoteDesktopWorker({
-    credential,
-    target,
-    dir: updateDir,
-    fetchImpl,
-    expectedVersion: downloaded.version,
-  });
-  const destinationPath = deps.execPath ?? defaultStagedExecutablePath(platform);
-  const destinationManifestPath = `${destinationPath}.manifest.json`;
-  const destinationJournalPath = deps.journalPath ?? join(dirname(defaultCredentialPath(platform)), 'install-journal.json');
-  const stagedJournalPath = await prepareUpgradeJournal({
-    currentJournalPath: destinationJournalPath,
-    outputJournalPath: join(updateDir, 'install-journal.json'),
-    destinationPath,
-    stagedArtifactPath: downloaded.artifactPath,
-    artifactSha256: downloaded.sha256,
-    artifactSizeBytes: downloaded.sizeBytes,
-    now: deps.now?.() ?? Date.now(),
-  });
-  const scriptPath = platform === 'win32'
-    ? join(updateDir, 'upgrade.ps1')
-    : join(updateDir, 'upgrade.sh');
-  const windowsUpgradeTaskName = platform === 'win32'
-    ? `${CONTROLLED_NODE_WINDOWS_UPGRADE_TASK_PREFIX}${randomUUID()}`
-    : undefined;
-  const script = platform === 'win32'
-    ? buildWindowsControlledNodeUpgradeScript({
-      stagedArtifactPath: downloaded.artifactPath,
-      stagedManifestPath: downloaded.manifestPath,
-      stagedComputerUseHelperDir: helper?.helperDir,
-      // Swap the platform-root as one directory so the installed layout stays
-      // remote-desktop-worker/win32-x64/<worker+manifest>, matching both the
-      // packaged dist layout and the worker resolver.
-      stagedRemoteDesktopWorkerDir: remoteDesktopWorker
-        ? dirname(remoteDesktopWorker.workerDir)
-        : undefined,
-      stagedJournalPath,
-      destinationPath,
-      destinationManifestPath,
-      destinationJournalPath,
-      upgradeTaskName: windowsUpgradeTaskName,
-    })
-    : buildPosixControlledNodeUpgradeScript({
-      platform: platform === 'darwin' ? 'darwin' : 'linux',
-      stagedArtifactPath: downloaded.artifactPath,
-      stagedManifestPath: downloaded.manifestPath,
-      stagedComputerUseHelperDir: helper?.helperDir,
-      stagedJournalPath,
-      destinationPath,
-      destinationManifestPath,
-      destinationJournalPath,
-    });
-  await writeFile(scriptPath, script, { mode: 0o700 });
-  if (platform !== 'win32') await chmod(scriptPath, 0o700).catch(() => {});
   if (platform === 'win32') {
-    const taskXmlPath = join(updateDir, 'upgrade-task.xml');
-    await writeFile(taskXmlPath, encodeWindowsScheduledTaskXml(windowsControlledNodeUpgradeTaskXml(scriptPath)));
-    const scheduleWindowsUpgrade = deps.scheduleWindowsUpgrade ?? scheduleWindowsControlledNodeUpgrade;
-    scheduleWindowsUpgrade(windowsUpgradeTaskName!, taskXmlPath);
-  } else if (platform === 'linux') {
-    const scheduleLinuxUpgrade = deps.scheduleLinuxUpgrade ?? scheduleLinuxControlledNodeUpgrade;
-    scheduleLinuxUpgrade(`${CONTROLLED_NODE_SERVICE.LINUX_UNIT.replace(/\.service$/, '')}-upgrade-${randomUUID()}`, scriptPath);
-  } else {
-    const spawnDetached = deps.spawnDetached ?? defaultSpawnDetached;
-    spawnDetached('/bin/sh', [scriptPath], {});
+    // Crash recovery is deliberately best-effort. It runs before allocating a
+    // new directory and can only inspect bounded, direct, owned children.
+    await scavengeStaleControlledNodeUpgradeDirs(tempRoot, deps);
   }
-  return {
-    ok: true,
-    targetVersion: targetVersion || DAEMON_UPGRADE_TARGET_LATEST,
-    artifactSha256: downloaded.sha256,
-    scriptPath,
-  };
+
+  let updateDir: string | undefined;
+  try {
+    updateDir = resolve(await mkdtemp(join(tempRoot, CONTROLLED_NODE_UPGRADE_DIR_PREFIX)));
+    activeControlledNodeUpgradeDirs.add(updateDir);
+    const ownership: ControlledNodeUpgradeOwnershipMarker = {
+      schemaVersion: 1,
+      product: CONTROLLED_NODE_UPGRADE_PRODUCT,
+      directoryName: basename(updateDir),
+      ownerToken: randomUUID(),
+      createdAt: deps.now?.() ?? Date.now(),
+      pid: process.pid,
+    };
+    const ownershipMarkerPath = join(updateDir, CONTROLLED_NODE_UPGRADE_OWNERSHIP_MARKER);
+    const writeUpgradeFile = deps.writeUpgradeFile ?? writeFile;
+    await writeUpgradeFile(ownershipMarkerPath, `${JSON.stringify(ownership)}\n`, { mode: 0o600 });
+
+    const downloaded = await downloadArtifact({
+      credential,
+      target,
+      dir: updateDir,
+      fetchImpl,
+      ...(targetVersion === DAEMON_UPGRADE_TARGET_LATEST ? {} : { expectedVersion: targetVersion }),
+    });
+    if (!downloaded.version) throw new Error('missing_artifact_version');
+    const helper = await downloadControlledNodeComputerUseHelper({ credential, target, dir: updateDir, fetchImpl });
+    // A Windows release is one publication unit. Installing the runtime without
+    // its same-version worker bundle strands the node after its runtime version
+    // converges, because version-based auto-upgrade will no longer retry.
+    const remoteDesktopWorker = await downloadControlledNodeRemoteDesktopWorker({
+      credential,
+      target,
+      dir: updateDir,
+      fetchImpl,
+      expectedVersion: downloaded.version,
+    });
+    const destinationPath = deps.execPath ?? defaultStagedExecutablePath(platform);
+    const destinationManifestPath = `${destinationPath}.manifest.json`;
+    const destinationJournalPath = deps.journalPath ?? join(dirname(defaultCredentialPath(platform)), 'install-journal.json');
+    const stagedJournalPath = await prepareUpgradeJournal({
+      currentJournalPath: destinationJournalPath,
+      outputJournalPath: join(updateDir, 'install-journal.json'),
+      destinationPath,
+      stagedArtifactPath: downloaded.artifactPath,
+      artifactSha256: downloaded.sha256,
+      artifactSizeBytes: downloaded.sizeBytes,
+      now: deps.now?.() ?? Date.now(),
+    });
+    const scriptPath = platform === 'win32'
+      ? join(updateDir, 'upgrade.ps1')
+      : join(updateDir, 'upgrade.sh');
+    const windowsUpgradeTaskName = platform === 'win32'
+      ? `${CONTROLLED_NODE_WINDOWS_UPGRADE_TASK_PREFIX}${randomUUID()}`
+      : undefined;
+    const script = platform === 'win32'
+      ? buildWindowsControlledNodeUpgradeScript({
+        stagedArtifactPath: downloaded.artifactPath,
+        stagedManifestPath: downloaded.manifestPath,
+        stagedComputerUseHelperDir: helper?.helperDir,
+        // Swap the platform-root as one directory so the installed layout stays
+        // remote-desktop-worker/win32-x64/<worker+manifest>, matching both the
+        // packaged dist layout and the worker resolver.
+        stagedRemoteDesktopWorkerDir: remoteDesktopWorker
+          ? dirname(remoteDesktopWorker.workerDir)
+          : undefined,
+        stagedJournalPath,
+        destinationPath,
+        destinationManifestPath,
+        destinationJournalPath,
+        upgradeTaskName: windowsUpgradeTaskName,
+        stagingOwnership: {
+          directoryPath: updateDir,
+          markerPath: ownershipMarkerPath,
+          ownerToken: ownership.ownerToken,
+        },
+      })
+      : buildPosixControlledNodeUpgradeScript({
+        platform: platform === 'darwin' ? 'darwin' : 'linux',
+        stagedArtifactPath: downloaded.artifactPath,
+        stagedManifestPath: downloaded.manifestPath,
+        stagedComputerUseHelperDir: helper?.helperDir,
+        stagedJournalPath,
+        destinationPath,
+        destinationManifestPath,
+        destinationJournalPath,
+      });
+    await writeUpgradeFile(scriptPath, script, { mode: 0o700 });
+    if (platform !== 'win32') await chmod(scriptPath, 0o700).catch(() => {});
+    if (platform === 'win32') {
+      const taskXmlPath = join(updateDir, 'upgrade-task.xml');
+      await writeUpgradeFile(taskXmlPath, encodeWindowsScheduledTaskXml(windowsControlledNodeUpgradeTaskXml(scriptPath)));
+      const scheduleWindowsUpgrade = deps.scheduleWindowsUpgrade ?? ((taskName: string, taskXmlPath: string) => {
+        scheduleWindowsControlledNodeUpgrade(taskName, taskXmlPath, undefined, (error) => {
+          emitCleanupDiagnostic({
+            event: 'controlled_node_upgrade_cleanup',
+            phase: 'pre_handoff',
+            outcome: 'failed',
+            code: cleanupErrorCode(error),
+          }, deps);
+        });
+      });
+      scheduleWindowsUpgrade(windowsUpgradeTaskName!, taskXmlPath);
+    } else if (platform === 'linux') {
+      const scheduleLinuxUpgrade = deps.scheduleLinuxUpgrade ?? scheduleLinuxControlledNodeUpgrade;
+      scheduleLinuxUpgrade(`${CONTROLLED_NODE_SERVICE.LINUX_UNIT.replace(/\.service$/, '')}-upgrade-${randomUUID()}`, scriptPath);
+    } else {
+      const spawnDetached = deps.spawnDetached ?? defaultSpawnDetached;
+      spawnDetached('/bin/sh', [scriptPath], {});
+    }
+    return {
+      ok: true,
+      targetVersion: targetVersion || DAEMON_UPGRADE_TARGET_LATEST,
+      artifactSha256: downloaded.sha256,
+      scriptPath,
+    };
+  } catch (error) {
+    if (updateDir) await removeUpgradeDirBestEffort(updateDir, 'pre_handoff', deps);
+    throw error;
+  } finally {
+    if (updateDir) activeControlledNodeUpgradeDirs.delete(updateDir);
+  }
 }
