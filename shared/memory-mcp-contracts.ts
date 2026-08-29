@@ -430,7 +430,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   },
   [MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS]: {
     name: MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS,
-    description: 'List sendable caller-project siblings. With no executionPool, preserves the complete scoped discovery surface for ordinary messages and discussion. Set executionPool=primary or economy only when selecting new supervised implementation/audit work; that filter is fail-closed against the caller current configured pool and canonical observed identity. The current caller session and stopped sessions are excluded; if this returns no items for a requested pool, no currently discovered sibling satisfies that pool. Availability, limitGroup, replyCapable, eligiblePools and dispatchMode are machine evidence; send_message revalidates task/audit targets and never trusts the list as authority.',
+    description: 'List scoped sendable siblings; current caller session and stopped sessions are excluded. Omit executionPool for ordinary discovery; primary/economy filters by caller pool/live identity; if this returns no items, no matching sibling exists. Returned availability/limitGroup/replyCapable/eligiblePools/dispatchMode are evidence; send_message revalidates authority.',
     inputSchema: objectSchema({
       query: stringSchema('Optional case-insensitive text filter over target display labels, names, agent types, and model metadata, such as "cc", "codex", "gpt-5", "reviewer", or a session label mentioned by the user.'),
       limit: numberSchema('Optional maximum number of targets to return; implementations may clamp it.'),
@@ -492,7 +492,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   },
   [MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE]: {
     name: MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE,
-    description: 'Send plain text to an exact send_list_targets target. Callers and labels are invalid targets. append (default) joins the active turn, with durable FIFO fallback when unsupported or racing; queue always uses FIFO. Not a Team/P2P run. Files are project-root paths, not bytes. Returns ids and delivered/queued/failed status.',
+    description: 'Send text to an exact send_list_targets target. Callers and labels are invalid targets. append (default) joins the active turn with durable FIFO fallback; queue always uses FIFO. Not Team/P2P. Files are project-root paths, not bytes. Returns delivered/queued/failed status.',
     inputSchema: objectSchema({
       target: stringSchema('Exact target session. May be omitted only when task.autoProvision=true, which authorizes the daemon to reuse/provision from the configured pool.'),
       message: stringSchema(`Required complete task/request text to deliver, up to ${MEMORY_MCP_CAPS.SEND_MESSAGE_MAX_BYTES} UTF-8 bytes. Include the desired role and output, such as audit findings, discussion input, plan, implementation request, or verification result.`),
