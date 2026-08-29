@@ -45,6 +45,34 @@ function modeState(overrides: Record<string, unknown> = {}): Record<string, unkn
 }
 
 describe('RemoteDesktopWorkerHostCore', () => {
+  it('reports PREPARE_READY, OFFER_SENT, and ANSWER from authenticated protocol transitions', () => {
+    const stages: string[] = [];
+    const core = new RemoteDesktopWorkerHostCore<null>({
+      nonce: 'nonce-core-12345678',
+      onWatchdogTimeout: () => {},
+      onPrepareReady: () => stages.push('prepare_ready'),
+      onOfferSent: () => stages.push('offer_sent'),
+      onAnswer: () => stages.push('answer'),
+    });
+    const generation = core.beginConnection();
+    core.track(prepare, null);
+
+    core.pushInbound(`${JSON.stringify(modeState())}\n`, generation);
+    core.markOfferPending(sessionId, {
+      connectionGeneration: generation,
+      workerPid: 41,
+    });
+    core.pushInbound(`${JSON.stringify({
+      type: REMOTE_DESKTOP_MSG.ANSWER,
+      requestId,
+      sessionId,
+      capability,
+      sdp: 'redacted-by-the-host-diagnostic-schema',
+    })}\n`, generation);
+
+    expect(stages).toEqual(['prepare_ready', 'offer_sent', 'answer']);
+  });
+
   it('frames split envelopes and authenticates them against the tracked authority', () => {
     const core = new RemoteDesktopWorkerHostCore<{ platform: string }>({
       nonce: 'nonce-core-12345678',

@@ -78,6 +78,18 @@ export interface RemoteDesktopWorkerHostCoreOptions<Metadata> {
   offerAnswerTimeoutMs?: number;
   maxLineBytes?: number;
   onWatchdogTimeout: (event: RemoteDesktopWorkerWatchdogEvent<Metadata>) => void;
+  onPrepareReady?: (
+    authority: RemoteDesktopTrackedAuthority<Metadata>,
+    connectionGeneration: number,
+  ) => void;
+  onOfferSent?: (
+    authority: RemoteDesktopTrackedAuthority<Metadata>,
+    connectionGeneration: number,
+  ) => void;
+  onAnswer?: (
+    authority: RemoteDesktopTrackedAuthority<Metadata>,
+    connectionGeneration: number,
+  ) => void;
   onAuthorityRemoved?: () => void;
 }
 
@@ -305,10 +317,18 @@ export class RemoteDesktopWorkerHostCore<Metadata> {
       const wasPrepareReady = authority.prepareReady;
       authority.prepareReady = true;
       this.clearPrepareReadyTimer(authority);
+      if (!wasPrepareReady) {
+        try {
+          this.options.onPrepareReady?.(authority, connectionGeneration);
+        } catch { /* diagnostics cannot affect signaling */ }
+      }
       if (parsed.value.type === REMOTE_DESKTOP_MSG.ANSWER) {
         authority.offerPending = false;
         authority.offerContext = null;
         this.clearOfferAnswerTimer(authority);
+        try {
+          this.options.onAnswer?.(authority, connectionGeneration);
+        } catch { /* diagnostics cannot affect signaling */ }
       } else if (!wasPrepareReady && authority.offerPending && authority.offerContext) {
         this.armOfferAnswerTimer(authority, authority.offerContext);
       }
@@ -348,6 +368,9 @@ export class RemoteDesktopWorkerHostCore<Metadata> {
     authority.offerContext = context;
     this.clearOfferAnswerTimer(authority);
     if (authority.prepareReady) this.armOfferAnswerTimer(authority, context);
+    try {
+      this.options.onOfferSent?.(authority, context.connectionGeneration);
+    } catch { /* diagnostics cannot affect signaling */ }
   }
 
   clearTrackedTimers(authority: RemoteDesktopTrackedAuthority<Metadata>): void {
