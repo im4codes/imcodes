@@ -1,6 +1,10 @@
 import { getSessionRuntimeType, isClaudeCodeFamily } from './agent-types.js';
 import { resolvePeerAuditProviderFamily } from './peer-audit.js';
 import { normalizeClaudeCodeModelId } from '../src/shared/models/options.js';
+import {
+  doesSharedContextBackendSupportPresets,
+  normalizeSharedContextRuntimeBackend,
+} from './shared-context-runtime-config.js';
 
 export const SUPERVISION_EXECUTION_POOL_KINDS = ['primary', 'economy'] as const;
 export type SupervisionExecutionPoolKind = typeof SUPERVISION_EXECUTION_POOL_KINDS[number];
@@ -98,6 +102,7 @@ export interface SupervisionExecutionConfig {
   providerFamily: string;
   runtimeType: 'process' | 'transport';
   model: string;
+  ccPresetId?: string;
 }
 
 export interface SupervisionExecutionPoolControls {
@@ -127,6 +132,7 @@ export interface SupervisionObservedExecutionIdentity {
   providerFamily: string;
   runtimeType: 'process' | 'transport';
   model: string;
+  ccPresetId?: string;
 }
 
 export interface SupervisionExecutionBinding {
@@ -197,7 +203,17 @@ export function normalizeSupervisionExecutionModel(agentType: string, model: str
 
 export function buildSupervisionExecutionCapabilityId(input: Omit<SupervisionExecutionConfig, 'capabilityId'>): string {
   const model = normalizeSupervisionExecutionModel(input.agentType, input.model);
-  return `supervision-exec-v1:${input.runtimeType}:${input.agentType}:${input.providerFamily}:${model}`;
+  const base = `supervision-exec-v1:${input.runtimeType}:${input.agentType}:${input.providerFamily}:${model}`;
+  if (input.ccPresetId === undefined) return base;
+  const backend = normalizeSharedContextRuntimeBackend(input.agentType);
+  if (!backend || !doesSharedContextBackendSupportPresets(backend)
+    || !input.ccPresetId || input.ccPresetId.trim() !== input.ccPresetId) {
+    throw new Error('invalid_supervision_execution_cc_preset');
+  }
+  // Preset-backed constraints use a disjoint namespace. Appending to the
+  // legacy id would let an ordinary model containing the suffix grammar alias
+  // a preset-backed capability.
+  return `supervision-exec-v1-cc-preset:${input.runtimeType}:${input.agentType}:${input.providerFamily}:${encodeURIComponent(input.ccPresetId)}:${model}`;
 }
 
 export function isExcludedDevelopmentModel(model: string): boolean {
@@ -214,10 +230,14 @@ export function normalizeSupervisionExecutionConfig(value: unknown): Supervision
   const model = text(source.model);
   const runtimeType = source.runtimeType === 'process' || source.runtimeType === 'transport' ? source.runtimeType : undefined;
   if (!agentType || !providerFamily || !model || !runtimeType) return undefined;
+  const ccPresetId = source.ccPresetId === undefined ? undefined : text(source.ccPresetId);
+  const backend = normalizeSharedContextRuntimeBackend(agentType);
+  if (source.ccPresetId !== undefined
+    && (!ccPresetId || !backend || !doesSharedContextBackendSupportPresets(backend))) return undefined;
   const canonical = normalizeSupervisionExecutionModel(agentType, model);
-  const expected = buildSupervisionExecutionCapabilityId({ agentType, providerFamily, runtimeType, model: canonical });
+  const expected = buildSupervisionExecutionCapabilityId({ agentType, providerFamily, runtimeType, model: canonical, ccPresetId });
   if (source.capabilityId !== expected) return undefined;
-  return { capabilityId: expected, agentType, providerFamily, runtimeType, model: canonical };
+  return { capabilityId: expected, agentType, providerFamily, runtimeType, model: canonical, ...(ccPresetId ? { ccPresetId } : {}) };
 }
 
 function positive(value: unknown, fallback: number): number {
@@ -317,11 +337,20 @@ export function evaluateSupervisionObservedIdentity(input: {
   }
   // Compare in the canonical namespace: `actual.model` is the daemon-OBSERVED id
   // (e.g. `claude-opus-5`), configs hold the picker id (`opus[1M]`).
+  const canonicalConfig = normalizeSupervisionExecutionConfig(input.config);
+  if (!canonicalConfig) return { ok: false, reason: 'identity_mismatch' };
   const observedModel = normalizeSupervisionExecutionModel(input.actual.agentType, input.actual.model);
-  if (input.config.agentType !== input.actual.agentType
-    || input.config.providerFamily !== input.actual.providerFamily
-    || input.config.runtimeType !== input.actual.runtimeType
-    || input.config.model !== observedModel) {
+  const observedPreset = input.actual.ccPresetId === undefined ? undefined : text(input.actual.ccPresetId);
+  const observedBackend = normalizeSharedContextRuntimeBackend(input.actual.agentType);
+  if (input.actual.ccPresetId !== undefined
+    && (!observedPreset || !observedBackend || !doesSharedContextBackendSupportPresets(observedBackend))) {
+    return { ok: false, reason: 'identity_mismatch' };
+  }
+  if (canonicalConfig.agentType !== input.actual.agentType
+    || canonicalConfig.providerFamily !== input.actual.providerFamily
+    || canonicalConfig.runtimeType !== input.actual.runtimeType
+    || canonicalConfig.model !== observedModel
+    || canonicalConfig.ccPresetId !== observedPreset) {
     return { ok: false, reason: 'identity_mismatch' };
   }
   return { ok: true };
@@ -344,7 +373,8 @@ export function evaluateSupervisionExecutionBinding(input: {
     : '';
   const requested = pool.configs.find((config) => config.capabilityId === input.requestedCapabilityId)
     ?? (!input.requestedCapabilityId ? pool.configs.find((config) => config.agentType === input.actual.agentType
-      && config.providerFamily === input.actual.providerFamily && config.runtimeType === input.actual.runtimeType && config.model === observedModel) : undefined);
+      && config.providerFamily === input.actual.providerFamily && config.runtimeType === input.actual.runtimeType
+      && config.model === observedModel && config.ccPresetId === input.actual.ccPresetId) : undefined);
   // Order matters: a caller naming a capability that is not in the pool gets
   // `unselected_config`, which must not be masked by an identity reason.
   const preCheck = evaluateSupervisionObservedIdentity({

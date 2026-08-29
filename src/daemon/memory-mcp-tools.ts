@@ -102,8 +102,10 @@ import {
   type SupervisionTaskMetadata,
 } from '../../shared/supervision-config.js';
 import {
+  SUPERVISION_EXECUTION_POOL_KINDS,
   normalizeSupervisionEconomyTaskPolicy,
   normalizeSupervisionExecutionConfig,
+  type SupervisionExecutionPoolKind,
 } from '../../shared/supervision-execution-pool.js';
 import {
   AGENT_DELEGATION_PURPOSES,
@@ -1338,11 +1340,19 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
           };
     },
     [MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS]: async (input) => {
+      const args = pickAllowedMcpArgs(input, ['query', 'limit', 'executionPool']);
+      const rawExecutionPool = args.executionPool;
+      if (rawExecutionPool !== undefined
+        && (typeof rawExecutionPool !== 'string'
+          || !(SUPERVISION_EXECUTION_POOL_KINDS as readonly string[]).includes(rawExecutionPool))) {
+        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'executionPool must be primary or economy');
+      }
+      const executionPoolValue = rawExecutionPool as SupervisionExecutionPoolKind | undefined;
       const sessions = await sendSessions();
-      const args = pickAllowedMcpArgs(input, ['query', 'limit']);
       return listSendTargets(caller, {
         query: stringArg(args, 'query'),
         limit: numberArg(args, 'limit'),
+        executionPool: executionPoolValue,
       }, sendDepsWithSessions(sessions, {
         isDispatchEnabled: () => deps.sendDeps?.isDispatchEnabled?.() ?? true,
       })) as unknown as ToolResult;
@@ -2018,6 +2028,8 @@ const schemas = {
   [MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS]: z.object({
     query: z.string().optional().describe('Case-insensitive name/display-label filter.'),
     limit: z.number().int().min(1).max(100).optional().describe('Maximum targets.'),
+    executionPool: z.enum(SUPERVISION_EXECUTION_POOL_KINDS).optional()
+      .describe('Optional configured supervision pool filter; omitted lists every scoped sibling for ordinary messaging.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.SESSION_RUNTIME_IDENTITY_GET]: z.object({}).strict(),
   [MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE]: z.object({
@@ -2033,7 +2045,14 @@ const schemas = {
       objective: z.string().optional(), acceptance: z.array(z.string()).optional(), ownedFiles: z.array(z.string()).optional(), sharedFiles: z.array(z.string()).optional(), dependencies: z.array(z.string()).optional(),
       integrationOwner: z.string().optional(), baseRevision: z.string().optional(), currentRevision: z.string().optional(), auditAttemptId: z.string().optional(), auditRevision: z.string().optional(),
       executionPool: z.enum(['primary', 'economy']).optional(), autoProvision: z.literal(true).optional(),
-      requestedExecutionType: z.object({ capabilityId: z.string(), agentType: z.string(), providerFamily: z.string(), runtimeType: z.enum(['process', 'transport']), model: z.string() }).strict().optional(),
+      requestedExecutionType: z.object({
+        capabilityId: z.string(),
+        agentType: z.string(),
+        providerFamily: z.string(),
+        runtimeType: z.enum(['process', 'transport']),
+        model: z.string(),
+        ccPresetId: z.string().min(1).optional(),
+      }).strict().optional(),
     }).strict().optional().describe('Optional supervision task metadata; result returns taskId/assignmentId.'),
     audit: z.object({
       kind: z.literal(AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT),

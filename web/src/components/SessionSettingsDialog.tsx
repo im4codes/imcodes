@@ -14,7 +14,11 @@ import { CODEBUDDY_PROVIDER_IDS } from '@shared/codebuddy.js';
 import { HERMES_AGENT_PROVIDER_ID } from '@shared/hermes-agent.js';
 import { isDelegationReplyCapableAgentType } from '@shared/agent-delegation.js';
 import type { SharedContextRuntimeBackend } from '@shared/context-types.js';
-import { doesSharedContextBackendSupportPresets, isKnownSharedContextModelForBackend } from '@shared/shared-context-runtime-config.js';
+import {
+  doesSharedContextBackendSupportPresets,
+  isKnownSharedContextModelForBackend,
+  normalizeSharedContextRuntimeBackend,
+} from '@shared/shared-context-runtime-config.js';
 import {
   CC_PRESET_MSG,
   getCcPresetAvailableModelIds,
@@ -124,6 +128,9 @@ export interface PeerAuditSettingsSession {
   modelDisplay?: string | null;
   providerId?: string | null;
   closedAt?: number | null;
+  ccPresetId?: string | null;
+  executionCloneKind?: string | null;
+  parentRunId?: string | null;
 }
 
 export type PeerAuditSettingsCandidate = PeerAuditCandidate;
@@ -549,7 +556,9 @@ const SUPERVISION_POOL_OPEN_SESSION_STATES = new Set([
 ]);
 
 export interface SupervisionExecutionPoolCandidate {
-  sessionName: string;
+  sessionNames: string[];
+  labels: string[];
+  matchingSessionCount: number;
   label: string;
   config: SupervisionExecutionConfig;
 }
@@ -571,16 +580,18 @@ export function buildSupervisionExecutionPoolCandidates(input: {
   sessions: readonly PeerAuditSettingsSession[];
 }): SupervisionExecutionPoolCandidate[] {
   const owningMainSession = input.parentSession?.trim() || input.sessionName;
-  const seen = new Set<string>();
-  const candidates: SupervisionExecutionPoolCandidate[] = [];
+  const seenSessionNames = new Set<string>();
+  const candidatesByCapability = new Map<string, SupervisionExecutionPoolCandidate>();
 
   for (const session of input.sessions) {
-    if (session.parentSession !== owningMainSession
+    if (!session.sessionName.trim()
+      || session.parentSession !== owningMainSession
       || session.closedAt != null
       || !SUPERVISION_POOL_OPEN_SESSION_STATES.has(session.state ?? '')
       || !isDelegationReplyCapableAgentType(session.type)
-      || !isSupportedSupervisionBackend(session.type)
-      || seen.has(session.sessionName)) {
+      || session.executionCloneKind != null
+      || session.parentRunId != null
+      || seenSessionNames.has(session.sessionName)) {
       continue;
     }
     const model = resolvePeerAuditNormalizedModelId({
@@ -596,28 +607,51 @@ export function buildSupervisionExecutionPoolCandidates(input: {
     if (!providerFamily || providerFamily === PEER_AUDIT_UNKNOWN_IDENTITY) continue;
     const runtimeType = session.runtimeType ?? getSessionRuntimeType(session.type);
     const canonicalModel = normalizeSupervisionExecutionModel(session.type, model);
+    const ccPresetId = session.ccPresetId == null ? undefined : session.ccPresetId.trim();
+    const backend = normalizeSharedContextRuntimeBackend(session.type);
+    if (session.ccPresetId != null
+      && (!ccPresetId || ccPresetId !== session.ccPresetId
+        || !backend || !doesSharedContextBackendSupportPresets(backend))) continue;
     const config: SupervisionExecutionConfig = {
       agentType: session.type,
       providerFamily,
       runtimeType,
       model: canonicalModel,
+      ...(ccPresetId ? { ccPresetId } : {}),
       capabilityId: buildSupervisionExecutionCapabilityId({
         agentType: session.type,
         providerFamily,
         runtimeType,
         model: canonicalModel,
+        ...(ccPresetId ? { ccPresetId } : {}),
       }),
     };
-    seen.add(session.sessionName);
-    candidates.push({
-      sessionName: session.sessionName,
-      label: session.label?.trim() || session.sessionName,
+    seenSessionNames.add(session.sessionName);
+    const label = session.label?.trim() || session.sessionName;
+    const existing = candidatesByCapability.get(config.capabilityId);
+    if (existing) {
+      existing.sessionNames.push(session.sessionName);
+      existing.matchingSessionCount = existing.sessionNames.length;
+      if (!existing.labels.includes(label)) existing.labels.push(label);
+      continue;
+    }
+    candidatesByCapability.set(config.capabilityId, {
+      sessionNames: [session.sessionName],
+      labels: [label],
+      matchingSessionCount: 1,
+      label,
       config,
     });
   }
 
+  const candidates = [...candidatesByCapability.values()];
+  for (const candidate of candidates) {
+    candidate.sessionNames.sort((left, right) => left.localeCompare(right));
+    candidate.labels.sort((left, right) => left.localeCompare(right));
+    candidate.label = candidate.labels.join(', ');
+  }
   return candidates.sort((left, right) => left.label.localeCompare(right.label)
-    || left.sessionName.localeCompare(right.sessionName));
+    || left.config.capabilityId.localeCompare(right.config.capabilityId));
 }
 
 function updateExecutionPoolSelection(
@@ -695,17 +729,17 @@ function SupervisionExecutionPoolsEditor({
         )}
         <div class="session-settings-pool-options" style={{ marginTop: 8 }}>
           {eligibleCandidates.map((candidate) => (
-            <label key={`${pool}:${candidate.sessionName}`} class="session-settings-pool-option">
+            <label key={`${pool}:${candidate.config.capabilityId}`} class="session-settings-pool-option">
               <input
                 type="checkbox"
-                aria-label={`${pool}:${candidate.sessionName}`}
+                aria-label={`${pool}:${candidate.sessionNames.join(',')}`}
                 checked={selected(pool, candidate.config.capabilityId)}
                 onChange={() => toggle(pool, candidate.config)}
                 disabled={saving}
               />
               <span class="session-settings-pool-option-copy">
                 <strong>{candidate.label}</strong>
-                <span>{candidate.sessionName}</span>
+                <span>{candidate.sessionNames.join(', ')} · ×{candidate.matchingSessionCount}</span>
                 <span>{labelForPoolAgentType(t, candidate.config.agentType)} · {candidate.config.model}</span>
               </span>
             </label>

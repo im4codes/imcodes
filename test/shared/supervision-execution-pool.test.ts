@@ -4,6 +4,7 @@ import {
   evaluateSupervisionExecutionBinding,
   mayFinalizeEconomyAssignment,
   migrateLegacySupervisionExecutionPools,
+  normalizeSupervisionExecutionConfig,
   normalizeSupervisionExecutionModel,
   normalizeSupervisionExecutionPools,
   planSupervisionExecutionCapacity,
@@ -12,9 +13,16 @@ import {
   type SupervisionExecutionConfig,
 } from '../../shared/supervision-execution-pool.js';
 
-function config(agentType: string, providerFamily: string, model: string): SupervisionExecutionConfig {
+function config(agentType: string, providerFamily: string, model: string, ccPresetId?: string): SupervisionExecutionConfig {
   const runtimeType = 'transport' as const;
-  return { agentType, providerFamily, model, runtimeType, capabilityId: buildSupervisionExecutionCapabilityId({ agentType, providerFamily, model, runtimeType }) };
+  return {
+    agentType,
+    providerFamily,
+    model,
+    runtimeType,
+    ...(ccPresetId ? { ccPresetId } : {}),
+    capabilityId: buildSupervisionExecutionCapabilityId({ agentType, providerFamily, model, runtimeType, ...(ccPresetId ? { ccPresetId } : {}) }),
+  };
 }
 const opus = config('claude-code-sdk', 'anthropic', 'opus[1M]');
 const gpt56 = config('codex-sdk', 'openai', 'gpt-5.6');
@@ -26,6 +34,7 @@ const pools = normalizeSupervisionExecutionPools({
 const actual = (entry: SupervisionExecutionConfig, overrides = {}) => ({
   sessionName: 'deck_alpha_w1', sessionInstanceId: 'instance-1', runtimeEpoch: 'epoch-1',
   agentType: entry.agentType, providerFamily: entry.providerFamily, runtimeType: entry.runtimeType, model: entry.model,
+  ...(entry.ccPresetId ? { ccPresetId: entry.ccPresetId } : {}),
   ...overrides,
 });
 
@@ -76,6 +85,49 @@ describe('supervision execution pools', () => {
     expect(normalizeSupervisionExecutionModel('cursor-headless', 'claude-sonnet-9')).toBe('claude-sonnet-9');
     expect(buildSupervisionExecutionCapabilityId({ agentType: 'deepseek-harness', providerFamily: 'deepseek-harness', runtimeType: 'transport', model: 'claude-opus-5' }))
       .toContain('claude-opus-5');
+  });
+
+  it('keeps ordinary capability ids stable and binds CC presets as a distinct canonical axis', () => {
+    expect(gpt56.capabilityId).toBe('supervision-exec-v1:transport:codex-sdk:openai:gpt-5.6');
+    const presetA = config('claude-code-sdk', 'anthropic', 'MiniMax-M3', 'preset-a');
+    const presetB = config('claude-code-sdk', 'anthropic', 'MiniMax-M3', 'preset-b');
+    expect(presetA.capabilityId).not.toBe(presetB.capabilityId);
+    expect(presetA.capabilityId).toContain('supervision-exec-v1-cc-preset:transport:claude-code-sdk:anthropic:preset-a:');
+    expect(normalizeSupervisionExecutionConfig(presetA)).toEqual(presetA);
+    expect(normalizeSupervisionExecutionPools({
+      state: 'configured',
+      primaryDevelopmentPool: { configs: [presetA, { ...presetA }] },
+      economyTaskPool: { configs: [presetB] },
+    })).toMatchObject({
+      primaryDevelopmentPool: { configs: [presetA] },
+      economyTaskPool: { configs: [presetB] },
+    });
+  });
+
+  it('fails closed for malformed, unsupported, missing, or mismatched CC preset identity', () => {
+    const preset = config('claude-code-sdk', 'anthropic', 'MiniMax-M3', 'preset-a');
+    for (const ccPresetId of ['', ' preset-a', 'preset-a ', null, 7]) {
+      expect(normalizeSupervisionExecutionConfig({ ...preset, ccPresetId }), String(ccPresetId)).toBeUndefined();
+    }
+    expect(() => buildSupervisionExecutionCapabilityId({
+      agentType: 'codex-sdk', providerFamily: 'openai', runtimeType: 'transport', model: 'gpt-5.6', ccPresetId: 'preset-a',
+    })).toThrow('invalid_supervision_execution_cc_preset');
+    expect(normalizeSupervisionExecutionConfig({ ...preset, capabilityId: opus.capabilityId })).toBeUndefined();
+
+    expect(evaluateSupervisionObservedIdentity({ config: preset, actual: actual(preset), pool: 'primary' }))
+      .toEqual({ ok: true });
+    for (const ccPresetId of [undefined, 'preset-b', ' preset-a']) {
+      expect(evaluateSupervisionObservedIdentity({
+        config: preset,
+        actual: { ...actual(preset), ccPresetId } as never,
+        pool: 'primary',
+      }), String(ccPresetId)).toEqual({ ok: false, reason: 'identity_mismatch' });
+    }
+    expect(evaluateSupervisionObservedIdentity({
+      config: opus,
+      actual: { ...actual(opus), ccPresetId: 'preset-a' },
+      pool: 'primary',
+    })).toEqual({ ok: false, reason: 'identity_mismatch' });
   });
 
   it('never folds a third-party model hosted on claude-code-sdk into a Claude bucket', () => {

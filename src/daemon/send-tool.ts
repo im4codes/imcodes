@@ -40,7 +40,10 @@ import { readSupervisionSnapshotFromTransportConfig, type SupervisionTaskMetadat
 import { getSessionRuntimeType } from '../../shared/agent-types.js';
 import {
   evaluateSupervisionExecutionBinding,
+  evaluateSupervisionObservedIdentity,
   type SupervisionExecutionBinding,
+  type SupervisionExecutionPoolKind,
+  type SupervisionExecutionPoolsConfig,
   type SupervisionObservedExecutionIdentity,
 } from '../../shared/supervision-execution-pool.js';
 import {
@@ -163,6 +166,15 @@ export interface SendTargetInfo {
    */
   providerFamily: string;
   availability: DelegationAvailability;
+  /**
+   * Configured supervision pools whose canonical identity constraints match
+   * this target. Present for configured callers only. An empty list means the
+   * sibling remains discoverable for ordinary messaging but cannot receive a
+   * task/audit send.
+   */
+  eligiblePools?: SupervisionExecutionPoolKind[];
+  /** New supervised work may start now, queue behind a busy turn, or not use it. */
+  dispatchMode?: 'new_work' | 'queue_only' | 'unavailable';
   /** Sessions sharing one upstream account share a group, and share its limit. */
   limitGroup: DelegationLimitGroup;
   replyCapable: boolean;
@@ -174,7 +186,12 @@ export interface SendTargetInfo {
 export type SendToolErrorReason = (typeof SEND_TOOL_ERROR_REASONS)[keyof typeof SEND_TOOL_ERROR_REASONS];
 
 export type SendListTargetsResult =
-  | { status: 'ok'; items: SendTargetInfo[] }
+  | {
+      status: 'ok';
+      items: SendTargetInfo[];
+      executionPoolsState: SupervisionExecutionPoolsConfig['state'];
+      appliedExecutionPool?: SupervisionExecutionPoolKind;
+    }
   | { status: 'disabled'; reason: typeof MCP_ERROR_REASONS.FEATURE_DISABLED; disabledFlag: typeof SEND_MCP_DISPATCH_FEATURE_FLAG; items: [] }
   | { status: 'error'; reason: SendToolErrorReason; error: string; items: [] };
 
@@ -500,7 +517,7 @@ function executionCloneErrorCode(err: unknown): ExecutionCloneErrorCode | null {
 
 export function listSendTargets(
   caller: SendRuntimeCaller,
-  input: { query?: string; limit?: number } = {},
+  input: { query?: string; limit?: number; executionPool?: SupervisionExecutionPoolKind } = {},
   deps?: SendToolDeps,
 ): SendListTargetsResult {
   const d = depsWithDefaults(deps);
@@ -519,18 +536,30 @@ export function listSendTargets(
   const query = typeof input.query === 'string' ? input.query.trim().toLowerCase() : '';
   const rawLimit = typeof input.limit === 'number' && Number.isFinite(input.limit) ? Math.floor(input.limit) : DEFAULT_TARGET_LIST_LIMIT;
   const limit = Math.max(0, Math.min(MAX_TARGET_LIST_LIMIT, rawLimit));
-  const candidates = getSiblingSessions({ ...caller, projectName: callerProjectName }, allSessions);
+  const callerRecord = allSessions.find((session) => session.name === caller.sessionName);
+  const executionPools = readSupervisionSnapshotFromTransportConfig(callerRecord?.transportConfig).executionPools;
+  const requestedPool = input.executionPool;
+  // Default discovery remains the ordinary-messaging surface: every scoped,
+  // discoverable sibling. Pool filtering is explicit and fail-closed for a
+  // legacy-unconfigured caller; supervised sends independently revalidate the
+  // exact target below and never trust this projection as authority.
+  const candidates = getSiblingSessions({ ...caller, projectName: callerProjectName }, allSessions)
+    .map((target) => ({
+      target,
+      eligiblePools: eligibleSupervisionPoolsForTarget(executionPools, target),
+    }))
+    .filter(({ eligiblePools }) => requestedPool === undefined || eligiblePools.includes(requestedPool));
   const filtered = query
-    ? candidates.filter((s) => [
-        s.name,
-        s.label,
-        s.role,
-        s.agentType,
-        resolveEffectiveSessionModel(s),
-        s.activeModel,
-        s.requestedModel,
-        s.modelDisplay,
-        s.qwenModel,
+    ? candidates.filter(({ target }) => [
+        target.name,
+        target.label,
+        target.role,
+        target.agentType,
+        resolveEffectiveSessionModel(target),
+        target.activeModel,
+        target.requestedModel,
+        target.modelDisplay,
+        target.qwenModel,
       ].some((value) => String(value ?? '').toLowerCase().includes(query)))
     : candidates;
 
@@ -543,14 +572,59 @@ export function listSendTargets(
   const availability = resolveDelegationTargets(delegationTargetInputs(allSessions), d.now());
   return {
     status: 'ok',
-    items: filtered.slice(0, limit).map((s) => toTargetInfo(
-      s,
-      availability.get(s.name) ?? {
+    executionPoolsState: executionPools.state,
+    ...(requestedPool === undefined ? {} : { appliedExecutionPool: requestedPool }),
+    items: filtered.slice(0, limit).map(({ target, eligiblePools }) => toTargetInfo(
+      target,
+      availability.get(target.name) ?? {
         availability: DELEGATION_AVAILABILITY.UNKNOWN,
-        limitGroup: delegationLimitGroup(s.agentType),
+        limitGroup: delegationLimitGroup(target.agentType),
       },
+      executionPools.state === 'configured' ? eligiblePools : undefined,
     )),
   };
+}
+
+function supervisionObservedIdentityForTarget(
+  target: SessionRecord,
+): Partial<SupervisionObservedExecutionIdentity> {
+  return {
+    sessionName: target.name,
+    sessionInstanceId: target.sessionInstanceId,
+    runtimeEpoch: target.runtimeEpoch,
+    agentType: target.agentType,
+    providerFamily: resolvePeerAuditProviderFamily(target),
+    runtimeType: target.runtimeType ?? getSessionRuntimeType(target.agentType),
+    model: resolveEffectiveSessionModel(target),
+    ccPresetId: target.ccPreset,
+  };
+}
+
+function targetMatchesConfiguredSupervisionPool(
+  pools: SupervisionExecutionPoolsConfig,
+  pool: SupervisionExecutionPoolKind,
+  target: SessionRecord,
+  actual = supervisionObservedIdentityForTarget(target),
+): boolean {
+  if (pools.state !== 'configured') return false;
+  const definition = pool === 'primary'
+    ? pools.primaryDevelopmentPool
+    : pools.economyTaskPool;
+  return definition.configs.some((config) => evaluateSupervisionObservedIdentity({
+    config,
+    actual,
+    pool,
+  }).ok);
+}
+
+function eligibleSupervisionPoolsForTarget(
+  pools: SupervisionExecutionPoolsConfig,
+  target: SessionRecord,
+): SupervisionExecutionPoolKind[] {
+  if (pools.state !== 'configured') return [];
+  return (['primary', 'economy'] as const).filter((pool) => (
+    targetMatchesConfiguredSupervisionPool(pools, pool, target)
+  ));
 }
 
 
@@ -695,7 +769,7 @@ export async function dispatchSendMessage(
   // the whole point: a message dropped into a limited session's FIFO looks
   // accepted and then sits there, so the orchestrator learns nothing and waits.
   const gate = evaluateDelegationAdmission(allSessions, targets.targets, now, {
-    newWorkload: input.newWorkload === true || Boolean(input.audit) || autoProvision,
+    newWorkload: input.newWorkload === true || Boolean(input.task) || Boolean(input.audit) || autoProvision,
   });
   const blockedTargets = gate.blocked;
   const dispatchable = gate.dispatchable;
@@ -715,6 +789,20 @@ export async function dispatchSendMessage(
         ? `target ${blockedTargets[0]!.target} is ${blockedTargets[0]!.reason}`
         : `every resolved target is unavailable (${refusal.reason})`,
       limited: refusal,
+    };
+  }
+
+  // An UNKNOWN provider/runtime state remains list-visible for diagnostics,
+  // but it is not evidence that a new supervised workload can start. The
+  // shared admission service already removes limited/offline targets; close
+  // the final unknown-state gap here before any registry or reply side effect.
+  if (input.task && dispatchable.some((target) => (
+    gate.availability.get(target.name)?.availability === DELEGATION_AVAILABILITY.UNKNOWN
+  ))) {
+    return {
+      status: 'error',
+      reason: MCP_ERROR_REASONS.TARGET_UNAVAILABLE,
+      error: 'task target availability is unknown',
     };
   }
 
@@ -791,37 +879,36 @@ export async function dispatchSendMessage(
     const targetRecord = dispatchable[0]!;
     const targetIdentity = supervisionTaskIdentityForTarget(targetRecord);
     if (!targetIdentity) return { status: 'error', reason: MCP_ERROR_REASONS.IDENTITY_REJECTED, error: 'task target identity is unavailable' };
-    let executionBinding: SupervisionExecutionBinding | undefined;
-    if (!input.audit) {
-      const callerRecord = allSessions.find((session) => session.name === caller.sessionName);
-      const model = resolveEffectiveSessionModel(targetRecord);
-      const runtimeType = targetRecord.runtimeType ?? getSessionRuntimeType(targetRecord.agentType);
-      const actual: Partial<SupervisionObservedExecutionIdentity> = {
-        sessionName: targetRecord.name,
-        sessionInstanceId: targetRecord.sessionInstanceId,
-        runtimeEpoch: targetRecord.runtimeEpoch,
-        agentType: targetRecord.agentType,
-        providerFamily: resolvePeerAuditProviderFamily(targetRecord),
-        runtimeType,
-        model,
+    // Task metadata turns both implementation AND audit sends into supervised
+    // execution. Validate the exact target against the caller's current pool
+    // before touching the registry, claims, reply authority or transport.
+    // Audit eligibility is an additional gate below, never a pool bypass.
+    const callerRecord = allSessions.find((session) => session.name === caller.sessionName);
+    const actual = supervisionObservedIdentityForTarget(targetRecord);
+    const pool = input.task.executionPool ?? 'primary';
+    const pools = readSupervisionSnapshotFromTransportConfig(callerRecord?.transportConfig).executionPools;
+    const checked = evaluateSupervisionExecutionBinding({
+      pools,
+      pool,
+      actual,
+      requestedCapabilityId: input.task.requestedExecutionType?.capabilityId,
+      economyPolicy: input.task.economyPolicy ?? undefined,
+    });
+    if (!targetMatchesConfiguredSupervisionPool(pools, pool, targetRecord, actual) || !checked.ok) {
+      return {
+        status: 'error',
+        reason: MCP_ERROR_REASONS.IDENTITY_REJECTED,
+        error: `task execution pool rejected target: ${checked.ok ? 'unselected_config' : checked.reason}`,
       };
-      const pool = input.task.executionPool ?? 'primary';
-      const checked = evaluateSupervisionExecutionBinding({
-        pools: readSupervisionSnapshotFromTransportConfig(callerRecord?.transportConfig).executionPools,
-        pool,
-        actual,
-        requestedCapabilityId: input.task.requestedExecutionType?.capabilityId,
-        economyPolicy: input.task.economyPolicy ?? undefined,
-      });
-      if (!checked.ok) return { status: 'error', reason: MCP_ERROR_REASONS.IDENTITY_REJECTED, error: `development execution pool rejected target: ${checked.reason}` };
-      executionBinding = {
-        pool,
-        requested: checked.requested,
-        actual: actual as SupervisionObservedExecutionIdentity,
-        origin: provisioning?.createdSessionName ? 'spawned' : 'reused',
-      };
-      supervisedExecutionBinding = executionBinding;
-    } else {
+    }
+    const executionBinding: SupervisionExecutionBinding = {
+      pool,
+      requested: checked.requested,
+      actual: actual as SupervisionObservedExecutionIdentity,
+      origin: provisioning?.createdSessionName ? 'spawned' : 'reused',
+    };
+    supervisedExecutionBinding = executionBinding;
+    if (input.audit) {
       // Same single validator as the audit-only path above; already run.
       const taskRouteCheck = validateBrainAuditRoute(targetRecord);
       if (!taskRouteCheck.ok) return { status: 'error', reason: taskRouteCheck.reason, error: taskRouteCheck.error };
@@ -831,12 +918,15 @@ export async function dispatchSendMessage(
     let taskId: string;
     if (requestedTaskId) {
       const existing = registry.get(requestedTaskId);
+      const projectBrainMayManage = Boolean(existing
+        && callerRecord?.role === 'brain'
+        && existing.projectName === callerProjectName);
       // Explicit task ids are references, never create requests. Keep missing
       // and unauthorized indistinguishable so send_message is not a task-id
       // existence oracle.
       if (!existing
         || existing.projectName !== callerProjectName
-        || !supervisionCallerParticipates(existing, caller.sessionName)) {
+        || (!projectBrainMayManage && !supervisionCallerParticipates(existing, caller.sessionName))) {
         return {
           status: 'error',
           reason: MCP_ERROR_REASONS.IDENTITY_REJECTED,
@@ -1516,7 +1606,11 @@ function optionalModelField(value: string | null | undefined): string | undefine
   return trimmed ? trimmed : undefined;
 }
 
-function toTargetInfo(s: SessionRecord, availability: DelegationTargetAvailability): SendTargetInfo {
+function toTargetInfo(
+  s: SessionRecord,
+  availability: DelegationTargetAvailability,
+  eligiblePools?: SupervisionExecutionPoolKind[],
+): SendTargetInfo {
   const model = resolveEffectiveSessionModel(s);
   const activeModel = optionalModelField(s.activeModel);
   const requestedModel = optionalModelField(s.requestedModel);
@@ -1537,6 +1631,16 @@ function toTargetInfo(s: SessionRecord, availability: DelegationTargetAvailabili
     lastActiveAt: s.updatedAt,
     providerFamily: resolvePeerAuditProviderFamily(s),
     availability: availability.availability,
+    ...(eligiblePools === undefined ? {} : {
+      eligiblePools,
+      dispatchMode: eligiblePools.length === 0
+        ? 'unavailable' as const
+        : availability.availability === DELEGATION_AVAILABILITY.READY
+          ? 'new_work' as const
+          : availability.availability === DELEGATION_AVAILABILITY.BUSY
+            ? 'queue_only' as const
+            : 'unavailable' as const,
+    }),
     limitGroup: availability.limitGroup,
     replyCapable: isDelegationReplyCapableAgentType(s.agentType),
     ...(availability.limitedAt === undefined ? {} : { limitedAt: availability.limitedAt }),

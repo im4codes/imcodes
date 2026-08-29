@@ -10,6 +10,18 @@ import {
   dispatchSendStop,
   listSendTargets,
 } from '../../src/daemon/send-tool.js';
+import { resolvePeerAuditCandidateList } from '../../src/daemon/peer-audit-candidates.js';
+import {
+  getSupervisionTaskRegistry,
+  resetSupervisionTaskRegistryForTests,
+} from '../../src/daemon/supervision-state-store.js';
+import {
+  getDelegationReplyStore,
+  resetDelegationReplyStoreForTests,
+} from '../../src/daemon/delegation-reply-store.js';
+import { AGENT_DELEGATION_PURPOSES } from '../../shared/agent-delegation.js';
+import { buildSupervisionExecutionCapabilityId } from '../../shared/supervision-execution-pool.js';
+import { resolvePeerAuditProviderFamily } from '../../shared/peer-audit.js';
 import {
   DELEGATION_AVAILABILITY,
   DELEGATION_LIMIT_FALLBACK_TTL_MS,
@@ -67,6 +79,73 @@ const deps = (sessions: SessionRecord[], dispatchMessage = vi.fn(async () => {})
   dispatchMessage,
 });
 
+function executionConfig(
+  agentType: string,
+  providerFamily: string,
+  model: string,
+  ccPresetId?: string,
+) {
+  const config = {
+    agentType,
+    providerFamily,
+    runtimeType: 'transport' as const,
+    model,
+    ...(ccPresetId === undefined ? {} : { ccPresetId }),
+  };
+  return { ...config, capabilityId: buildSupervisionExecutionCapabilityId(config) };
+}
+
+function executionConfigFor(agentType: string, model: string) {
+  return executionConfig(
+    agentType,
+    resolvePeerAuditProviderFamily({ agentType }),
+    model,
+  );
+}
+
+function supervisedBrain(
+  primaryConfigs: ReturnType<typeof executionConfig>[],
+  economyConfigs: ReturnType<typeof executionConfig>[] = [],
+): SessionRecord {
+  return session({
+    name: 'deck_alpha_brain',
+    projectName: 'alpha',
+    role: 'brain',
+    agentType: 'codex-sdk',
+    activeModel: 'gpt-5.6-sol',
+    runtimeType: 'transport',
+    transportConfig: {
+      supervision: {
+        mode: 'off',
+        executionPools: {
+          state: 'configured',
+          primaryDevelopmentPool: { configs: primaryConfigs },
+          economyTaskPool: { configs: economyConfigs },
+        },
+      },
+    },
+  });
+}
+
+function supervisedChild(input: {
+  name: string;
+  role: SessionRecord['role'];
+  agentType: string;
+  model: string;
+  ccPreset?: string;
+}): SessionRecord {
+  return session({
+    ...input,
+    projectName: 'alpha',
+    parentSession: 'deck_alpha_brain',
+    label: input.name,
+    activeModel: input.model,
+    requestedModel: input.model,
+    runtimeType: 'transport',
+    ...(input.ccPreset === undefined ? {} : { ccPreset: input.ccPreset }),
+  });
+}
+
 /**
  * The CONSUMERS of the provider-limit chain.
  *
@@ -79,6 +158,536 @@ const deps = (sessions: SessionRecord[], dispatchMessage = vi.fn(async () => {})
 describe('delegation send gate', () => {
   beforeEach(() => {
     clearSendIdempotencyCacheForTests();
+    resetSupervisionTaskRegistryForTests();
+    resetDelegationReplyStoreForTests();
+  });
+
+  it('rejects a peer-audit-eligible CC target outside the caller primary pool before every side effect', async () => {
+    const brain = supervisedBrain([
+      executionConfig('codex-sdk', 'openai', 'gpt-5.6-sol'),
+    ]);
+    const audited = supervisedChild({
+      name: 'deck_alpha_impl',
+      role: 'w1',
+      agentType: 'codex-sdk',
+      model: 'gpt-5.6-sol',
+    });
+    const outsideAuditor = supervisedChild({
+      name: 'deck_alpha_cc_auditor',
+      role: 'w2',
+      agentType: 'claude-code-sdk',
+      model: 'opus[1M]',
+    });
+    const sessions = [brain, audited, outsideAuditor];
+    const listed = listSendTargets(caller, {}, deps(sessions));
+    expect(listed.items.map((item) => item.sessionName)).toContain(outsideAuditor.name);
+    expect(listSendTargets(caller, { executionPool: 'primary' }, deps(sessions))
+      .items.map((item) => item.sessionName)).not.toContain(outsideAuditor.name);
+    const candidates = resolvePeerAuditCandidateList({
+      auditedSessionName: audited.name,
+      allSessions: sessions,
+    });
+    expect(candidates).toMatchObject({
+      ok: true,
+      list: {
+        candidates: expect.arrayContaining([
+          expect.objectContaining({ name: outsideAuditor.name, eligible: true }),
+        ]),
+      },
+    });
+
+    const registry = getSupervisionTaskRegistry();
+    const createTask = vi.spyOn(registry, 'createOrGet');
+    const createAssignment = vi.spyOn(registry, 'createAssignment');
+    const createReplyAuthority = vi.spyOn(getDelegationReplyStore(), 'create');
+    const dispatchMessage = vi.fn(async () => {});
+    const result = await dispatchSendMessage(caller, {
+      target: outsideAuditor.name,
+      message: 'audit the implementation',
+      reply: true,
+      audit: {
+        kind: AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT,
+        attemptId: 'pool_outside_audit_attempt_1',
+        auditedSessionName: audited.name,
+      },
+      task: {
+        objective: 'audit the implementation',
+        executionPool: 'primary',
+        ownedFiles: ['src/owned.ts'],
+      },
+    }, deps(sessions, dispatchMessage));
+
+    expect(result).toMatchObject({
+      status: 'error',
+      reason: 'identity_rejected',
+      error: expect.stringContaining('task execution pool rejected target: unselected_config'),
+    });
+    expect(createTask).not.toHaveBeenCalled();
+    expect(createAssignment).not.toHaveBeenCalled();
+    expect(createReplyAuthority).not.toHaveBeenCalled();
+    expect(registry.list()).toEqual([]);
+    expect(dispatchMessage).not.toHaveBeenCalled();
+  });
+
+  it('keeps default discovery complete and filters only when a configured pool is explicitly requested', () => {
+    const selected = supervisedChild({
+      name: 'deck_alpha_selected',
+      role: 'w1',
+      agentType: 'codex-sdk',
+      model: 'gpt-5.6-sol',
+    });
+    const foreign = [
+      supervisedChild({
+        name: 'deck_alpha_foreign_1',
+        role: 'w2',
+        agentType: 'deepseek-harness',
+        model: 'deepseek-v4',
+      }),
+      supervisedChild({
+        name: 'deck_alpha_foreign_2',
+        role: 'w3',
+        agentType: 'cursor-headless',
+        model: 'cursor-default',
+      }),
+      supervisedChild({
+        name: 'deck_alpha_foreign_3',
+        role: 'w4',
+        agentType: 'claude-code-sdk',
+        model: 'opus[1M]',
+      }),
+    ];
+    const configured = supervisedBrain([
+      executionConfigFor('codex-sdk', 'gpt-5.6-sol'),
+    ]);
+    const sessions = [configured, selected, ...foreign];
+
+    const all = listSendTargets(caller, {}, deps(sessions));
+    expect(all.items.map((item) => item.sessionName)).toEqual([
+      selected.name,
+      ...foreign.map((target) => target.name),
+    ]);
+    expect(all.items.find((item) => item.sessionName === selected.name)).toMatchObject({
+      eligiblePools: ['primary'],
+      dispatchMode: 'new_work',
+      availability: DELEGATION_AVAILABILITY.READY,
+      limitGroup: expect.any(String),
+      replyCapable: true,
+    });
+    expect(all.items.find((item) => item.sessionName === foreign[0]!.name)).toMatchObject({
+      eligiblePools: [],
+      dispatchMode: 'unavailable',
+    });
+
+    const primary = listSendTargets(caller, { executionPool: 'primary' }, deps(sessions));
+    expect(primary).toMatchObject({
+      status: 'ok',
+      executionPoolsState: 'configured',
+      appliedExecutionPool: 'primary',
+      items: [expect.objectContaining({ sessionName: selected.name, eligiblePools: ['primary'] })],
+    });
+
+    const removed = listSendTargets(caller, {}, deps([
+      supervisedBrain([]),
+      selected,
+      ...foreign,
+    ]));
+    expect(removed.items).toHaveLength(4);
+    expect(removed.items.every((item) => item.eligiblePools?.length === 0)).toBe(true);
+    expect(listSendTargets(caller, { executionPool: 'primary' }, deps([
+      supervisedBrain([]), selected, ...foreign,
+    ])).items).toEqual([]);
+  });
+
+  it('filters primary and economy independently, composes query after pool membership, and retains availability evidence', () => {
+    const codexConfig = executionConfigFor('codex-sdk', 'gpt-5.6-sol');
+    const qwenConfig = executionConfigFor('qwen', 'qwen3-coder-plus');
+    const brain = supervisedBrain([codexConfig, codexConfig], [qwenConfig]);
+    const primaryA = supervisedChild({ name: 'deck_alpha_primary_a', role: 'w1', agentType: 'codex-sdk', model: 'gpt-5.6-sol' });
+    const primaryB = supervisedChild({ name: 'deck_alpha_primary_b', role: 'w2', agentType: 'codex-sdk', model: 'gpt-5.6-sol' });
+    primaryB.state = 'running';
+    const economy = supervisedChild({ name: 'deck_alpha_economy', role: 'w3', agentType: 'qwen', model: 'qwen3-coder-plus' });
+    const outside = supervisedChild({ name: 'deck_alpha_outside', role: 'w4', agentType: 'cursor-headless', model: 'cursor-default' });
+    const sessions = [brain, primaryA, primaryB, economy, outside];
+
+    const primary = listSendTargets(caller, { executionPool: 'primary' }, deps(sessions));
+    expect(primary.items.map((item) => item.sessionName)).toEqual([primaryA.name, primaryB.name]);
+    expect(primary.items).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        sessionName: primaryA.name,
+        eligiblePools: ['primary'],
+        availability: DELEGATION_AVAILABILITY.READY,
+        dispatchMode: 'new_work',
+        limitGroup: expect.any(String),
+        replyCapable: true,
+      }),
+      expect.objectContaining({
+        sessionName: primaryB.name,
+        eligiblePools: ['primary'],
+        availability: DELEGATION_AVAILABILITY.BUSY,
+        dispatchMode: 'queue_only',
+      }),
+    ]));
+
+    const economyOnly = listSendTargets(caller, { executionPool: 'economy' }, deps(sessions));
+    expect(economyOnly.items.map((item) => item.sessionName)).toEqual([economy.name]);
+    expect(economyOnly.items[0]).toMatchObject({ eligiblePools: ['economy'] });
+
+    expect(listSendTargets(caller, {
+      executionPool: 'primary',
+      query: 'primary_b',
+    }, deps(sessions)).items.map((item) => item.sessionName)).toEqual([primaryB.name]);
+    expect(listSendTargets(caller, {
+      executionPool: 'economy',
+      query: 'primary',
+    }, deps(sessions)).items).toEqual([]);
+  });
+
+  it('uses canonical ccPresetId membership for list and audit-with-task admission while legacy configs remain ordinary', async () => {
+    const presetA = executionConfig('claude-code-sdk', 'anthropic', 'opus[1M]', 'preset-a');
+    const brain = supervisedBrain([presetA]);
+    const audited = supervisedChild({
+      name: 'deck_alpha_impl', role: 'w1', agentType: 'codex-sdk', model: 'gpt-5.6-sol',
+    });
+    const matching = supervisedChild({
+      name: 'deck_alpha_preset_a', role: 'w2', agentType: 'claude-code-sdk', model: 'opus[1M]', ccPreset: 'preset-a',
+    });
+    const mismatched = supervisedChild({
+      name: 'deck_alpha_preset_b', role: 'w3', agentType: 'claude-code-sdk', model: 'opus[1M]', ccPreset: 'preset-b',
+    });
+    const missingPreset = supervisedChild({
+      name: 'deck_alpha_legacy_cc', role: 'w4', agentType: 'claude-code-sdk', model: 'opus[1M]',
+    });
+    const sessions = [brain, audited, matching, mismatched, missingPreset];
+
+    expect(listSendTargets(caller, { executionPool: 'primary' }, deps(sessions))
+      .items.map((item) => item.sessionName)).toEqual([matching.name]);
+    const defaultByName = new Map(listSendTargets(caller, {}, deps(sessions))
+      .items.map((item) => [item.sessionName, item]));
+    expect(defaultByName.get(matching.name)?.eligiblePools).toEqual(['primary']);
+    expect(defaultByName.get(mismatched.name)?.eligiblePools).toEqual([]);
+    expect(defaultByName.get(missingPreset.name)?.eligiblePools).toEqual([]);
+
+    const registry = getSupervisionTaskRegistry();
+    const createTask = vi.spyOn(registry, 'createOrGet');
+    const createAssignment = vi.spyOn(registry, 'createAssignment');
+    const createReplyAuthority = vi.spyOn(getDelegationReplyStore(), 'create');
+    const dispatchMessage = vi.fn(async () => {});
+    await expect(dispatchSendMessage(caller, {
+      target: mismatched.name,
+      message: 'audit with the wrong preset',
+      reply: true,
+      audit: {
+        kind: AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT,
+        attemptId: 'preset_mismatch_audit_attempt_1',
+        auditedSessionName: audited.name,
+      },
+      task: { objective: 'preset mismatch audit', executionPool: 'primary' },
+    }, deps(sessions, dispatchMessage))).resolves.toMatchObject({
+      status: 'error',
+      reason: 'identity_rejected',
+      error: expect.stringContaining('task execution pool rejected target'),
+    });
+    expect(createTask).not.toHaveBeenCalled();
+    expect(createAssignment).not.toHaveBeenCalled();
+    expect(createReplyAuthority).not.toHaveBeenCalled();
+    expect(dispatchMessage).not.toHaveBeenCalled();
+
+    const legacyConfig = executionConfig('claude-code-sdk', 'anthropic', 'opus[1M]');
+    const legacyBrain = supervisedBrain([legacyConfig]);
+    const legacySessions = [legacyBrain, matching, missingPreset];
+    expect(listSendTargets(caller, { executionPool: 'primary' }, deps(legacySessions))
+      .items.map((item) => item.sessionName)).toEqual([missingPreset.name]);
+  });
+
+  it('marks pool members as new-work, queue-only, or unavailable from authoritative availability', () => {
+    const target = supervisedChild({
+      name: 'deck_alpha_selected',
+      role: 'w1',
+      agentType: 'codex-sdk',
+      model: 'gpt-5.6-sol',
+    });
+    const brain = supervisedBrain([
+      executionConfigFor('codex-sdk', 'gpt-5.6-sol'),
+    ]);
+    const listed = (overrides: Partial<SessionRecord>, now = NOW) => listSendTargets(
+      caller,
+      { executionPool: 'primary' },
+      {
+        ...deps([brain, { ...target, ...overrides } as SessionRecord]),
+        now: () => now,
+      },
+    ).items[0];
+
+    expect(listed({ state: 'idle' })).toMatchObject({
+      availability: DELEGATION_AVAILABILITY.READY,
+      dispatchMode: 'new_work',
+    });
+    expect(listed({ state: 'running' })).toMatchObject({
+      availability: DELEGATION_AVAILABILITY.BUSY,
+      dispatchMode: 'queue_only',
+    });
+    expect(listed({ providerLimit: limit({ agentType: 'codex-sdk' }) })).toMatchObject({
+      availability: DELEGATION_AVAILABILITY.LIMITED,
+      dispatchMode: 'unavailable',
+    });
+    expect(listed({ state: 'error' })).toMatchObject({
+      availability: DELEGATION_AVAILABILITY.OFFLINE,
+      dispatchMode: 'unavailable',
+    });
+    expect(listed(
+      { providerLimit: limit({ agentType: 'codex-sdk', retryAt: NOW - 1 }) },
+      NOW + 24 * 60 * 60_000,
+    )).toMatchObject({
+      availability: DELEGATION_AVAILABILITY.UNKNOWN,
+      dispatchMode: 'unavailable',
+    });
+  });
+
+  it('keeps legacy-unconfigured default discovery compatible but fails closed for explicit pool filtering', () => {
+    const legacyBrain = session({
+      name: 'deck_alpha_brain',
+      projectName: 'alpha',
+      role: 'brain',
+    });
+    const target = session({
+      name: 'deck_alpha_w1',
+      projectName: 'alpha',
+      role: 'w1',
+    });
+
+    expect(listSendTargets(caller, {}, deps([legacyBrain, target]))).toMatchObject({
+      status: 'ok',
+      executionPoolsState: 'legacy_unconfigured',
+      items: [expect.objectContaining({ sessionName: target.name })],
+    });
+    expect(listSendTargets(caller, { executionPool: 'primary' }, deps([legacyBrain, target]))).toMatchObject({
+      status: 'ok',
+      executionPoolsState: 'legacy_unconfigured',
+      appliedExecutionPool: 'primary',
+      items: [],
+    });
+  });
+
+  it('accepts a different-session auditor selected by the caller primary pool and keeps audit eligibility gates', async () => {
+    const claude = executionConfig('claude-code-sdk', 'anthropic', 'opus[1M]');
+    const brain = supervisedBrain([claude]);
+    const audited = supervisedChild({
+      name: 'deck_alpha_impl',
+      role: 'w1',
+      agentType: 'codex-sdk',
+      model: 'gpt-5.6-sol',
+    });
+    const auditor = supervisedChild({
+      name: 'deck_alpha_cc_auditor',
+      role: 'w2',
+      agentType: 'claude-code-sdk',
+      model: 'opus[1M]',
+    });
+    const sessions = [brain, audited, auditor];
+    const dispatchMessage = vi.fn(async () => {});
+    const result = await dispatchSendMessage(caller, {
+      target: auditor.name,
+      message: 'audit the implementation',
+      reply: true,
+      audit: {
+        kind: AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT,
+        attemptId: 'pool_member_audit_attempt_1',
+        auditedSessionName: audited.name,
+      },
+      task: {
+        objective: 'audit the implementation',
+        executionPool: 'primary',
+        currentRevision: 'revision-under-audit',
+        ownedFiles: ['src/owned.ts'],
+      },
+    }, deps(sessions, dispatchMessage));
+
+    expect(result).toMatchObject({
+      status: 'accepted',
+      taskId: expect.any(String),
+      assignmentId: expect.any(String),
+      deliveries: [expect.objectContaining({ target: auditor.name, status: 'delivered' })],
+    });
+    if (result.status !== 'accepted' || !result.assignmentId) throw new Error('expected accepted audit');
+    expect(getSupervisionTaskRegistry().getAssignment(result.assignmentId)).toMatchObject({
+      role: 'auditor',
+      identity: { sessionName: auditor.name },
+      executionBinding: {
+        pool: 'primary',
+        requested: claude,
+        actual: {
+          sessionName: auditor.name,
+          agentType: 'claude-code-sdk',
+          providerFamily: 'anthropic',
+          model: 'opus[1M]',
+        },
+      },
+    });
+    expect(dispatchMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects an ordinary supervised task target outside the caller primary pool', async () => {
+    const brain = supervisedBrain([
+      executionConfig('codex-sdk', 'openai', 'gpt-5.6-sol'),
+    ]);
+    const outsideWorker = supervisedChild({
+      name: 'deck_alpha_cc_worker',
+      role: 'w1',
+      agentType: 'claude-code-sdk',
+      model: 'opus[1M]',
+    });
+    const dispatchMessage = vi.fn(async () => {});
+    const result = await dispatchSendMessage(caller, {
+      target: outsideWorker.name,
+      message: 'implement the task',
+      task: {
+        objective: 'implement the task',
+        executionPool: 'primary',
+        ownedFiles: ['src/owned.ts'],
+      },
+    }, deps([brain, outsideWorker], dispatchMessage));
+
+    expect(result).toMatchObject({
+      status: 'error',
+      reason: 'identity_rejected',
+      error: expect.stringContaining('task execution pool rejected target: unselected_config'),
+    });
+    expect(getSupervisionTaskRegistry().list()).toEqual([]);
+    expect(dispatchMessage).not.toHaveBeenCalled();
+  });
+
+  it('lets only the authoritative same-project Brain continue an auto-provisioned task by returned taskId', async () => {
+    const selectedConfig = executionConfigFor('codex-sdk', 'gpt-5.6-sol');
+    const brain = supervisedBrain([selectedConfig]);
+    const worker = supervisedChild({
+      name: 'deck_alpha_worker', role: 'w1', agentType: 'codex-sdk', model: 'gpt-5.6-sol',
+    });
+    const unassignedParticipant = supervisedChild({
+      name: 'deck_alpha_peer', role: 'w2', agentType: 'codex-sdk', model: 'gpt-5.6-sol',
+    });
+    unassignedParticipant.transportConfig = brain.transportConfig;
+    const sessions = [brain, worker, unassignedParticipant];
+    const dispatchMessage = vi.fn(async () => {});
+    const provisionSupervisionTarget = vi.fn(async () => ({
+      ok: true as const,
+      target: worker,
+      evidence: { selectedPool: 'primary' as const, selectedConfig },
+    }));
+
+    const created = await dispatchSendMessage(caller, {
+      message: 'start provisioned work',
+      idempotencyKey: 'provisioned-work-visibility-1',
+      task: { objective: 'provisioned work', autoProvision: true, executionPool: 'primary' },
+    }, { ...deps(sessions, dispatchMessage), provisionSupervisionTarget });
+    if (created.status !== 'accepted') throw new Error(`auto-provision failed: ${JSON.stringify(created)}`);
+    expect(created).toMatchObject({ status: 'accepted', taskId: expect.any(String) });
+    if (!created.taskId) throw new Error('expected auto-provisioned task');
+    expect(provisionSupervisionTarget).toHaveBeenCalledTimes(1);
+
+    const continued = await dispatchSendMessage(caller, {
+      target: worker.name,
+      message: 'continue the same task',
+      task: { taskId: created.taskId, objective: 'provisioned work', executionPool: 'primary' },
+    }, deps(sessions, dispatchMessage));
+    expect(continued).toMatchObject({ status: 'accepted', taskId: created.taskId });
+
+    const registry = getSupervisionTaskRegistry();
+    const assignmentCount = registry.get(created.taskId)?.assignments.length;
+    const participantCaller = {
+      ...caller,
+      sessionName: unassignedParticipant.name,
+    };
+    await expect(dispatchSendMessage(participantCaller, {
+      target: worker.name,
+      message: 'participant must not adopt the task',
+      task: { taskId: created.taskId, objective: 'provisioned work', executionPool: 'primary' },
+    }, deps(sessions, dispatchMessage))).resolves.toMatchObject({
+      status: 'error', reason: 'identity_rejected', error: 'task is not visible to this caller',
+    });
+
+    const betaBrain = {
+      ...supervisedBrain([selectedConfig]),
+      name: 'deck_beta_brain', projectName: 'beta', projectDir: '/work/beta',
+    } as SessionRecord;
+    const betaWorker = {
+      ...supervisedChild({ name: 'deck_beta_worker', role: 'w1', agentType: 'codex-sdk', model: 'gpt-5.6-sol' }),
+      projectName: 'beta', projectDir: '/work/beta', parentSession: betaBrain.name,
+    } as SessionRecord;
+    await expect(dispatchSendMessage({
+      userId: caller.userId,
+      sessionName: betaBrain.name,
+      projectName: 'beta',
+      projectRoot: '/work/beta',
+    }, {
+      target: betaWorker.name,
+      message: 'cross-project Brain must not adopt the task',
+      task: { taskId: created.taskId, objective: 'provisioned work', executionPool: 'primary' },
+    }, deps([betaBrain, betaWorker], dispatchMessage))).resolves.toMatchObject({
+      status: 'error', reason: 'identity_rejected', error: 'task is not visible to this caller',
+    });
+    expect(registry.get(created.taskId)?.assignments).toHaveLength(assignmentCount ?? 0);
+  });
+
+  it('does not apply supervision pool membership to an ordinary exact-target message', async () => {
+    const brain = supervisedBrain([
+      executionConfig('codex-sdk', 'openai', 'gpt-5.6-sol'),
+    ]);
+    const outsidePeer = supervisedChild({
+      name: 'deck_alpha_cc_discussion',
+      role: 'w1',
+      agentType: 'claude-code-sdk',
+      model: 'opus[1M]',
+    });
+    const dispatchMessage = vi.fn(async () => {});
+
+    const result = await dispatchSendMessage(caller, {
+      target: outsidePeer.name,
+      message: 'discuss this without creating supervised work',
+    }, deps([brain, outsidePeer], dispatchMessage));
+
+    expect(result).toMatchObject({
+      status: 'accepted',
+      deliveries: [expect.objectContaining({ target: outsidePeer.name, status: 'delivered' })],
+    });
+    expect(getSupervisionTaskRegistry().list()).toEqual([]);
+    expect(dispatchMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it('refuses unknown pool-member task availability before registry, reply authority, or dispatch', async () => {
+    const brain = supervisedBrain([
+      executionConfigFor('codex-sdk', 'gpt-5.6-sol'),
+    ]);
+    const unknownWorker = supervisedChild({
+      name: 'deck_alpha_unknown_worker',
+      role: 'w1',
+      agentType: 'codex-sdk',
+      model: 'gpt-5.6-sol',
+    });
+    unknownWorker.providerLimit = limit({ agentType: 'codex-sdk', retryAt: NOW - 1 });
+    const sessions = [brain, unknownWorker];
+    const registry = getSupervisionTaskRegistry();
+    const createTask = vi.spyOn(registry, 'createOrGet');
+    const createAssignment = vi.spyOn(registry, 'createAssignment');
+    const createReplyAuthority = vi.spyOn(getDelegationReplyStore(), 'create');
+    const dispatchMessage = vi.fn(async () => {});
+    const result = await dispatchSendMessage(caller, {
+      target: unknownWorker.name,
+      message: 'implement new work',
+      task: { objective: 'new work', executionPool: 'primary' },
+    }, {
+      ...deps(sessions, dispatchMessage),
+      now: () => NOW + 24 * 60 * 60_000,
+    });
+
+    expect(result).toMatchObject({
+      status: 'error',
+      reason: 'target_unavailable',
+      error: 'task target availability is unknown',
+    });
+    expect(createTask).not.toHaveBeenCalled();
+    expect(createAssignment).not.toHaveBeenCalled();
+    expect(createReplyAuthority).not.toHaveBeenCalled();
+    expect(dispatchMessage).not.toHaveBeenCalled();
   });
 
   it('refuses a send to a limited target instead of queueing it', async () => {

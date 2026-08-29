@@ -5379,6 +5379,9 @@ export function App() {
       modelDisplay: session.modelDisplay,
       providerId: session.providerId,
       closedAt: session.closedAt,
+      ccPresetId: session.ccPresetId,
+      executionCloneKind: session.executionCloneKind,
+      parentRunId: session.parentRunId,
     })), [detectedModels, subSessions, subUsages]);
   const openShareDialogForSession = useCallback((session: SessionInfo, subSessionId?: string | null) => {
     if (!selectedServerId) return;

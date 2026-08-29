@@ -405,7 +405,9 @@ describe('SessionSettingsDialog supervision', () => {
       />,
     );
 
+    const primary = screen.getByTestId('supervision-execution-pool-primary');
     const economy = screen.getByTestId('supervision-execution-pool-economy');
+    expect(within(primary).queryByLabelText('primary:deck_sub_spark')).toBeNull();
     const economySpark = within(economy).getByLabelText('economy:deck_sub_spark');
     fireEvent.click(economySpark);
     fireEvent.click(screen.getByRole('button', { name: /save/i }));
@@ -450,9 +452,9 @@ describe('SessionSettingsDialog supervision', () => {
       ],
     });
 
-    expect(candidates.map((candidate) => candidate.sessionName)).toEqual([
-      'deck_sub_ready',
-      'deck_sub_starting',
+    expect(candidates.map((candidate) => candidate.sessionNames)).toEqual([
+      ['deck_sub_ready'],
+      ['deck_sub_starting'],
     ]);
     expect(candidates[0]).toMatchObject({
       label: 'Ready',
@@ -463,6 +465,45 @@ describe('SessionSettingsDialog supervision', () => {
         model: 'gpt-5.6',
       },
     });
+  });
+
+  it('deduplicates canonical constraints while retaining Cx, CC preset, Cursor, and Ds live evidence', () => {
+    const candidates = buildSupervisionExecutionPoolCandidates({
+      sessionName: 'deck_proj_brain',
+      sessions: [
+        makePeerAuditSession({ sessionName: 'deck_sub_cx1', label: 'Cx1', activeModel: 'gpt-5.6' }),
+        makePeerAuditSession({ sessionName: 'deck_sub_cx2', label: 'Cx2', activeModel: 'gpt-5.6' }),
+        makePeerAuditSession({ sessionName: 'deck_sub_cursor', label: 'Cursor', type: 'cursor-headless', providerId: 'cursor', activeModel: 'cursor-large' }),
+        makePeerAuditSession({ sessionName: 'deck_sub_ds', label: 'Ds', type: 'deepseek-harness', providerId: 'deepseek', activeModel: 'deepseek-reasoner' }),
+        makePeerAuditSession({ sessionName: 'deck_sub_cc_a1', label: 'CC A1', type: 'claude-code-sdk', providerId: 'anthropic', activeModel: 'MiniMax-M3', ccPresetId: 'preset-a' }),
+        makePeerAuditSession({ sessionName: 'deck_sub_cc_a2', label: 'CC A2', type: 'claude-code-sdk', providerId: 'anthropic', activeModel: 'MiniMax-M3', ccPresetId: 'preset-a' }),
+        makePeerAuditSession({ sessionName: 'deck_sub_cc_b', label: 'CC B', type: 'claude-code-sdk', providerId: 'anthropic', activeModel: 'MiniMax-M3', ccPresetId: 'preset-b' }),
+        makePeerAuditSession({ sessionName: 'deck_sub_bad_preset', type: 'codex-sdk', ccPresetId: 'preset-a' }),
+        makePeerAuditSession({ sessionName: 'deck_sub_clone', executionCloneKind: 'supervision-execution', parentRunId: 'run-1' }),
+        makePeerAuditSession({ sessionName: 'deck_sub_parent_run', parentRunId: 'run-2' }),
+        makePeerAuditSession({ sessionName: 'deck_sub_stopped', state: 'stopped' }),
+        makePeerAuditSession({ sessionName: 'deck_sub_unknown', activeModel: null, requestedModel: null, modelDisplay: null }),
+        makePeerAuditSession({ sessionName: 'deck_sub_shell', type: 'shell' }),
+      ],
+    });
+
+    expect(candidates).toHaveLength(5);
+    expect(candidates.find((candidate) => candidate.config.agentType === 'codex-sdk')).toMatchObject({
+      sessionNames: ['deck_sub_cx1', 'deck_sub_cx2'],
+      labels: ['Cx1', 'Cx2'],
+      matchingSessionCount: 2,
+      config: { providerFamily: 'openai', model: 'gpt-5.6' },
+    });
+    expect(candidates.map((candidate) => candidate.config.agentType)).toEqual(expect.arrayContaining([
+      'cursor-headless', 'deepseek-harness', 'claude-code-sdk',
+    ]));
+    const presets = candidates
+      .filter((candidate) => candidate.config.agentType === 'claude-code-sdk')
+      .sort((left, right) => (left.config.ccPresetId ?? '').localeCompare(right.config.ccPresetId ?? ''));
+    expect(presets.map((candidate) => [candidate.config.ccPresetId, candidate.sessionNames])).toEqual([
+      ['preset-a', ['deck_sub_cc_a1', 'deck_sub_cc_a2']],
+      ['preset-b', ['deck_sub_cc_b']],
+    ]);
   });
 
   it('shows session, SDK, and model and keeps primary/economy selection mutually exclusive', () => {
@@ -504,6 +545,50 @@ describe('SessionSettingsDialog supervision', () => {
     fireEvent.click(primaryWorker);
     expect(primaryWorker.checked).toBe(true);
     expect(economyWorker.checked).toBe(false);
+  });
+
+  it('persists a CC preset constraint without binding it to a live session', async () => {
+    render(
+      <SessionSettingsDialog
+        serverId="srv-1"
+        sessionName="deck_proj_brain"
+        label="Brain"
+        description="desc"
+        cwd="/proj"
+        type="codex-sdk"
+        activeModel={CODEX_MODEL_IDS[0]}
+        peerAuditSessions={[makePeerAuditSession({
+          sessionName: 'deck_sub_cc_preset',
+          label: 'CC preset worker',
+          type: 'claude-code-sdk',
+          providerId: 'anthropic',
+          activeModel: 'MiniMax-M3',
+          requestedModel: 'MiniMax-M3',
+          ccPresetId: 'preset-a',
+        })]}
+        transportConfig={null}
+        onClose={vi.fn()}
+        onSaved={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(within(screen.getByTestId('supervision-execution-pool-primary'))
+      .getByLabelText('primary:deck_sub_cc_preset'));
+    fireEvent.click(screen.getByRole('button', { name: /save/i }));
+
+    await waitFor(() => expect(saveSupervisorDefaultsMock).toHaveBeenCalled());
+    const saved = saveSupervisorDefaultsMock.mock.calls.at(-1)?.[0] as {
+      executionPools?: { primaryDevelopmentPool?: { configs?: Array<Record<string, unknown>> } };
+    };
+    const preset = saved.executionPools?.primaryDevelopmentPool?.configs
+      ?.find((config) => config.ccPresetId === 'preset-a');
+    expect(preset).toMatchObject({
+      agentType: 'claude-code-sdk',
+      providerFamily: 'anthropic',
+      model: 'minimax-m3',
+      ccPresetId: 'preset-a',
+    });
+    expect(preset).not.toHaveProperty('sessionName');
   });
 
   it('routes each pool add button to the existing sub-session launcher and accepts the new starting session immediately', () => {

@@ -53,6 +53,7 @@ import {
   SUPERVISION_TASK_CLASSIFICATIONS,
   SUPERVISION_TASK_FILE_OPERATIONS,
 } from './supervision-config.js';
+import { SUPERVISION_EXECUTION_POOL_KINDS } from './supervision-execution-pool.js';
 import {
   MEMORY_MCP_SEND_DELIVERY_MODES,
   type MemoryMcpSendDeliveryMode,
@@ -429,12 +430,59 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   },
   [MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS]: {
     name: MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS,
-    description: 'List sendable caller-project siblings for delegation. The current caller session and stopped sessions are excluded; if this returns no items, send_message cannot run. Includes agentType and model when known. Filter by label, name, type or model, then send to the exact target.',
+    description: 'List sendable caller-project siblings. With no executionPool, preserves the complete scoped discovery surface for ordinary messages and discussion. Set executionPool=primary or economy only when selecting new supervised implementation/audit work; that filter is fail-closed against the caller current configured pool and canonical observed identity. The current caller session and stopped sessions are excluded; if this returns no items for a requested pool, no currently discovered sibling satisfies that pool. Availability, limitGroup, replyCapable, eligiblePools and dispatchMode are machine evidence; send_message revalidates task/audit targets and never trusts the list as authority.',
     inputSchema: objectSchema({
       query: stringSchema('Optional case-insensitive text filter over target display labels, names, agent types, and model metadata, such as "cc", "codex", "gpt-5", "reviewer", or a session label mentioned by the user.'),
       limit: numberSchema('Optional maximum number of targets to return; implementations may clamp it.'),
+      executionPool: {
+        type: 'string',
+        enum: [...SUPERVISION_EXECUTION_POOL_KINDS],
+        description: 'Optional supervision pool filter. Omit to list every scoped/discoverable sibling for ordinary messaging. A legacy-unconfigured caller gets an empty result when a pool filter is requested.',
+      },
     }),
-    outputSchema: statusSchema,
+    outputSchema: objectSchema({
+      status: stringSchema('ok, disabled, or error.'),
+      reason: stringSchema('Machine-readable reason for disabled/error results.'),
+      error: stringSchema('Sanitized error detail for error results.'),
+      executionPoolsState: {
+        type: 'string',
+        enum: ['configured', 'legacy_unconfigured'],
+        description: 'Caller execution-pool configuration state on an ok result.',
+      },
+      appliedExecutionPool: {
+        type: 'string',
+        enum: [...SUPERVISION_EXECUTION_POOL_KINDS],
+        description: 'Echoed only when the caller requested an executionPool filter.',
+      },
+      items: {
+        type: 'array',
+        description: 'Scoped target projections after optional pool, query, and limit filtering.',
+        items: objectSchema({
+          target: stringSchema('Exact target accepted by send_message.'),
+          label: { type: ['string', 'null'], description: 'Human display label when present.' },
+          sessionName: stringSchema('Canonical target session name.'),
+          role: stringSchema('Observed session role.'),
+          agentType: stringSchema('Observed runtime agent type.'),
+          model: stringSchema('Effective model when known.'),
+          status: stringSchema('Observed session runtime state.'),
+          lastActiveAt: numberSchema('Last observed session activity timestamp.'),
+          providerFamily: stringSchema('Observed provider family used by audit/task policy.'),
+          availability: stringSchema('Authoritative delegation availability.'),
+          eligiblePools: {
+            type: 'array',
+            items: { type: 'string', enum: [...SUPERVISION_EXECUTION_POOL_KINDS] },
+            description: 'Configured pools whose canonical identity constraints match this target. Absent for legacy-unconfigured callers.',
+          },
+          dispatchMode: {
+            type: 'string',
+            enum: ['new_work', 'queue_only', 'unavailable'],
+            description: 'Configured-caller new-work disposition derived from availability.',
+          },
+          limitGroup: stringSchema('Provider quota group shared by sibling sessions.'),
+          replyCapable: booleanSchema('Whether the runtime supports structured replies.'),
+        }),
+      },
+    }),
   },
   [MEMORY_MCP_TOOL_NAMES.SESSION_RUNTIME_IDENTITY_GET]: {
     name: MEMORY_MCP_TOOL_NAMES.SESSION_RUNTIME_IDENTITY_GET,
@@ -484,6 +532,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
             providerFamily: stringSchema('Canonical provider family.'),
             runtimeType: { type: 'string', enum: ['process', 'transport'] },
             model: stringSchema('Canonical selected model.'),
+            ccPresetId: stringSchema('Optional canonical Claude Code preset identity.', { minLength: 1 }),
           }, ['capabilityId', 'agentType', 'providerFamily', 'runtimeType', 'model']),
         }),
         description: 'Optional daemon-authoritative supervision task metadata. When present, accepted result returns taskId and assignmentId; idempotency replay must reuse both.',

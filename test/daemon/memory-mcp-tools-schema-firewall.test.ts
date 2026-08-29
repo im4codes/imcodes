@@ -1,12 +1,20 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ContextNamespace, ProcessedContextProjection } from '../../shared/context-types.js';
 import { MCP_FEATURE_FLAGS_BY_NAME } from '../../shared/memory-mcp-feature-flags.js';
 import { MEMORY_FEATURE_FLAGS_BY_NAME, type MemoryFeatureFlag } from '../../shared/feature-flags.js';
-import { MEMORY_MCP_DISABLED_FLAGS, MEMORY_MCP_TOOL_NAMES } from '../../shared/memory-mcp-contracts.js';
+import {
+  MEMORY_MCP_DISABLED_FLAGS,
+  MEMORY_MCP_TOOL_CONTRACTS,
+  MEMORY_MCP_TOOL_NAMES,
+} from '../../shared/memory-mcp-contracts.js';
 import { MCP_ERROR_REASONS } from '../../shared/memory-mcp-errors.js';
+import { buildSupervisionExecutionCapabilityId } from '../../shared/supervision-execution-pool.js';
+import { createMemoryMcpServer } from '../../src/daemon/memory-mcp-server.js';
 import { CRON_COMPLETION_POLICY } from '../../shared/cron-types.js';
 import { MEMORY_MCP_DEGRADED_REASON } from '../../shared/memory-ws.js';
 import { createMemoryMcpToolHandlers } from '../../src/daemon/memory-mcp-tools.js';
@@ -709,6 +717,208 @@ describe('memory MCP tool schema firewall', () => {
       },
     });
     await expect(handlers[MEMORY_MCP_TOOL_NAMES.SESSION_RUNTIME_IDENTITY_GET]({ sessionName: 'deck_proj_w1', model: 'opus' })).resolves.toMatchObject({ status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED });
+  });
+
+  it('threads the optional executionPool contract through MCP ingress without changing default discovery', async () => {
+    const codexConfig = {
+      agentType: 'codex-sdk', providerFamily: 'openai', runtimeType: 'transport' as const, model: 'gpt-5.6',
+    };
+    const qwenConfig = {
+      agentType: 'qwen', providerFamily: 'alibaba', runtimeType: 'transport' as const, model: 'qwen3-coder-plus',
+    };
+    const self = sessionRecord({
+      sessionInstanceId: 'self-instance', runtimeEpoch: 'self-epoch', activeModel: 'gpt-5.6', runtimeType: 'transport',
+      transportConfig: {
+        supervision: {
+          mode: 'off',
+          executionPools: {
+            state: 'configured',
+            primaryDevelopmentPool: { configs: [{ ...codexConfig, capabilityId: buildSupervisionExecutionCapabilityId(codexConfig) }] },
+            economyTaskPool: { configs: [{ ...qwenConfig, capabilityId: buildSupervisionExecutionCapabilityId(qwenConfig) }] },
+          },
+        },
+      },
+    });
+    const primary = sessionRecord({
+      name: 'deck_proj_codex', role: 'w1', parentSession: self.name, userCreated: true,
+      sessionInstanceId: 'codex-instance', runtimeEpoch: 'codex-epoch',
+      agentType: codexConfig.agentType, activeModel: codexConfig.model, runtimeType: 'transport',
+    });
+    const economy = sessionRecord({
+      name: 'deck_proj_qwen', role: 'w2', parentSession: self.name, userCreated: true,
+      sessionInstanceId: 'qwen-instance', runtimeEpoch: 'qwen-epoch',
+      agentType: qwenConfig.agentType, activeModel: qwenConfig.model, runtimeType: 'transport',
+    });
+    const outside = sessionRecord({
+      name: 'deck_proj_cc', role: 'w3', parentSession: self.name, userCreated: true,
+      sessionInstanceId: 'cc-instance', runtimeEpoch: 'cc-epoch',
+      agentType: 'claude-code-sdk', activeModel: 'opus[1M]', runtimeType: 'transport',
+    });
+    const handlers = createMemoryMcpToolHandlers(caller(), {
+      sendDeps: { listSessions: () => [self, primary, economy, outside] },
+    });
+
+    const contract = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS];
+    expect(contract.inputSchema.properties?.executionPool).toMatchObject({ enum: ['primary', 'economy'] });
+    expect(contract.outputSchema.properties).toHaveProperty('executionPoolsState');
+    expect(contract.outputSchema.properties).toHaveProperty('items');
+
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS]({})).resolves.toMatchObject({
+      status: 'ok',
+      executionPoolsState: 'configured',
+      items: [
+        expect.objectContaining({ target: primary.name, eligiblePools: ['primary'] }),
+        expect.objectContaining({ target: economy.name, eligiblePools: ['economy'] }),
+        expect.objectContaining({ target: outside.name, eligiblePools: [] }),
+      ],
+    });
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS]({ executionPool: 'primary' })).resolves.toMatchObject({
+      status: 'ok', appliedExecutionPool: 'primary', items: [expect.objectContaining({ target: primary.name })],
+    });
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS]({ executionPool: 'economy' })).resolves.toMatchObject({
+      status: 'ok', appliedExecutionPool: 'economy', items: [expect.objectContaining({ target: economy.name })],
+    });
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS]({ executionPool: 'audit' })).resolves.toMatchObject({
+      status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED,
+    });
+  });
+
+  it('publishes and preserves optional ccPresetId through the real send_message MCP ingress', async () => {
+    const presetConfig = {
+      agentType: 'claude-code-sdk',
+      providerFamily: 'anthropic',
+      runtimeType: 'transport' as const,
+      model: 'opus[1M]',
+      ccPresetId: 'preset-a',
+    };
+    const requestedExecutionType = {
+      ...presetConfig,
+      capabilityId: buildSupervisionExecutionCapabilityId(presetConfig),
+    };
+    const legacyConfig = {
+      agentType: 'codex-sdk',
+      providerFamily: 'openai',
+      runtimeType: 'transport' as const,
+      model: 'gpt-5.6',
+    };
+    const legacyRequestedExecutionType = {
+      ...legacyConfig,
+      capabilityId: buildSupervisionExecutionCapabilityId(legacyConfig),
+    };
+    const self = sessionRecord({
+      sessionInstanceId: 'self-instance', runtimeEpoch: 'self-epoch', activeModel: 'gpt-5.6', runtimeType: 'transport',
+      transportConfig: {
+        supervision: {
+          mode: 'off',
+          executionPools: {
+            state: 'configured',
+            primaryDevelopmentPool: { configs: [requestedExecutionType, legacyRequestedExecutionType] },
+            economyTaskPool: { configs: [] },
+          },
+        },
+      },
+    });
+    const presetPeer = sessionRecord({
+      name: 'deck_proj_cc_preset', role: 'w1', parentSession: self.name, userCreated: true,
+      sessionInstanceId: 'preset-instance', runtimeEpoch: 'preset-epoch',
+      agentType: presetConfig.agentType, providerId: 'anthropic', activeModel: presetConfig.model,
+      runtimeType: presetConfig.runtimeType, ccPreset: presetConfig.ccPresetId,
+    });
+    const legacyPeer = sessionRecord({
+      name: 'deck_proj_codex_legacy', role: 'w2', parentSession: self.name, userCreated: true,
+      sessionInstanceId: 'legacy-instance', runtimeEpoch: 'legacy-epoch',
+      agentType: legacyConfig.agentType, providerId: 'openai', activeModel: legacyConfig.model,
+      runtimeType: legacyConfig.runtimeType,
+    });
+    const dispatchMessage = vi.fn(async () => undefined);
+    const server = createMemoryMcpServer(caller(), {
+      sendDeps: { listSessions: () => [self, presetPeer, legacyPeer], dispatchMessage },
+    });
+    const client = new Client({ name: 'cc-preset-ingress-test', version: '1' });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+    try {
+      const contractTask = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE]
+        .inputSchema.properties?.task as { properties?: Record<string, unknown> };
+      const contractRequested = contractTask.properties?.requestedExecutionType as {
+        properties?: Record<string, unknown>;
+        required?: string[];
+      };
+      expect(contractRequested.properties?.ccPresetId).toMatchObject({ type: 'string', minLength: 1 });
+      expect(contractRequested.required).not.toContain('ccPresetId');
+
+      const advertised = (await client.listTools()).tools
+        .find((tool) => tool.name === MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE);
+      const advertisedTask = advertised?.inputSchema.properties?.task as {
+        properties?: Record<string, unknown>;
+      };
+      const advertisedRequested = advertisedTask.properties?.requestedExecutionType as {
+        properties?: Record<string, unknown>;
+        required?: string[];
+      };
+      expect(advertisedRequested.properties?.ccPresetId).toMatchObject({ minLength: 1 });
+      expect(advertisedRequested.required).not.toContain('ccPresetId');
+
+      const exact = await client.callTool({
+        name: MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE,
+        arguments: {
+          target: presetPeer.name,
+          message: 'preset-bound task',
+          task: {
+            taskId: 'supervision_task_missing_preset_ingress',
+            executionPool: 'primary',
+            requestedExecutionType,
+          },
+        },
+      });
+      expect(exact.structuredContent).toMatchObject({
+        status: 'error',
+        reason: MCP_ERROR_REASONS.IDENTITY_REJECTED,
+        error: 'task is not visible to this caller',
+      });
+
+      const legacy = await client.callTool({
+        name: MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE,
+        arguments: {
+          target: legacyPeer.name,
+          message: 'legacy task without preset identity',
+          task: {
+            taskId: 'supervision_task_missing_legacy_ingress',
+            executionPool: 'primary',
+            requestedExecutionType: legacyRequestedExecutionType,
+          },
+        },
+      });
+      expect(legacy.structuredContent).toMatchObject({
+        status: 'error',
+        reason: MCP_ERROR_REASONS.IDENTITY_REJECTED,
+        error: 'task is not visible to this caller',
+      });
+
+      const { ccPresetId: _omitted, ...missingPreset } = requestedExecutionType;
+      for (const malformed of [missingPreset, { ...requestedExecutionType, ccPresetId: 'preset-b' }]) {
+        const rejected = await client.callTool({
+          name: MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE,
+          arguments: {
+            target: presetPeer.name,
+            message: 'malformed preset identity',
+            task: {
+              taskId: 'supervision_task_missing_preset_ingress',
+              executionPool: 'primary',
+              requestedExecutionType: malformed,
+            },
+          },
+        });
+        expect(rejected.structuredContent).toMatchObject({
+          status: 'error',
+          reason: MCP_ERROR_REASONS.VALIDATION_FAILED,
+        });
+      }
+      expect(dispatchMessage).not.toHaveBeenCalled();
+    } finally {
+      await client.close();
+      await server.close();
+    }
   });
 
   it('retains an omitted live target from the authoritative directory but rejects an explicit stopped record', async () => {
